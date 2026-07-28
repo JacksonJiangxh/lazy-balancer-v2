@@ -1,4 +1,4 @@
-FROM alpine:3.19@sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1 as base
+FROM alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40 as base
 RUN apk add --no-cache ca-certificates curl
 
 FROM golang:1.26.1-alpine@sha256:2389ebfa5b7f43eeafbd6be0c3700cc46690ef842ad962f6c5bd6be49ed82039 AS xcaddy-builder
@@ -30,7 +30,7 @@ COPY web/ ./
 RUN npm run build
 
 # Final image
-FROM alpine:3.19@sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1
+FROM alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
 ARG VERSION=2.0.5
 ENV APP_VERSION=${VERSION}
 RUN apk add --no-cache ca-certificates shadow sqlite tzdata
