@@ -878,7 +878,7 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 			return
 		}
 		defer confirmed.Body.Close()
-		// 历史 S-12: 移除 404/405 fallback 兼容（v2.0.8+ 主节点均支持 confirm 端点）。
+		// 历史 S-12: 移除 404/405 fallback 兼容（v2.0.9+ 主节点均支持 confirm 端点）。
 		// 历史 历史问题: 任何 4xx/5xx 不再静默重试。累计失败达到上限后停止注册循环，
 		// 持久化错误并提示用户人工处理（在 UI 重新注册或提升为主节点）。
 		if confirmed.StatusCode >= http.StatusBadRequest {
