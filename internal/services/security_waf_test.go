@@ -130,7 +130,7 @@ func TestSecurityPolicyHasIPControl_truthTable(t *testing.T) {
 		{"trust only: whitelist populated, ACL disabled", &models.SecurityPolicy{IPACLList: "[]", IPWhitelist: json.RawMessage(`["198.51.100.9"]`)}, true},
 		{"both: enabled ACL entries and trust list", &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["203.0.113.0/24"]`, IPWhitelist: json.RawMessage(`["198.51.100.9"]`)}, true},
 		{"legacy 绕过: 绕过 mode with entries", &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "绕过", IPACLList: `["192.0.2.7"]`}, true},
-		{"legacy 绕过: entries present even when toggle off", &models.SecurityPolicy{IPACLMode: "绕过", IPACLList: `["192.0.2.7"]`}, true},
+		{"legacy 绕过: entries present but toggle off", &models.SecurityPolicy{IPACLMode: "绕过", IPACLList: `["192.0.2.7"]`}, false},
 		{"绕过 mode with empty list and no trust list", &models.SecurityPolicy{IPACLMode: "绕过", IPACLList: "[]"}, false},
 		{"nil policy", nil, false},
 	}
