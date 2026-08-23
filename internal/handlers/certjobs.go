@@ -156,13 +156,15 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 		if j.ExpiresAt.Valid {
 			remaining := j.ExpiresAt.Time.Sub(now)
 			if !now.Before(j.ExpiresAt.Time) {
-				// 历史问题 D-N4：过期天数向零取整（-int(Ceil(-x))），与 certinfo.go 的
-				// int() 截断口径对齐——此前 floor 对负值向远离零取整（过期 1 天
-				// 3 小时报 -2），同一证书在两端口径不一致。
-				j.DaysRemaining = -int(math.Ceil(-remaining.Hours() / 24))
+				// 历史问题 D-N4/历史问题 D-2：过期天数与 certinfo.go 同表达式（int() 向零截断）。
+				// 历史问题 的 -int(Ceil(-x)) 与 floor(x) 逐值恒等（空操作），两端口径
+				// 不一致原样保留；历史问题 改为真截断（过期 1 天 3 小时：-1，不再 -2）。
+				j.DaysRemaining = int(remaining.Hours() / 24)
 				j.CertificateStatus = "expired"
 			} else {
-				j.DaysRemaining = int(math.Ceil(remaining.Hours() / 24))
+				// 历史问题 D-2：非过期分支同步截断（原 Ceil 使 23h 报 1 天，certinfo 报 0）
+				// ——两端口径完全一致。
+				j.DaysRemaining = int(remaining.Hours() / 24)
 				if remaining <= time.Duration(expiryDays)*24*time.Hour {
 					j.CertificateStatus = "expiring"
 				} else {
