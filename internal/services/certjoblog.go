@@ -171,6 +171,10 @@ func WriteCertJobLogByRule(ruleID, level, stage, message string) {
 }
 
 func RemoveCertJobLogFiles(ruleID string) error {
+	// Cert-新1(历史):持写锁——写路径 历史问题 串行化写与轮转,但删除路径
+	// 此前无锁:删除时在途签发 goroutine 尾部日志重建孤儿文件(certjob-<rule>.log)。
+	lockCertJobLog(ruleID).Lock()
+	defer lockCertJobLog(ruleID).Unlock()
 	path := CertJobLogPath(ruleID)
 	var cleanupErrors []error
 	for index := 0; index <= maxRotatedFiles; index++ {
