@@ -163,7 +163,7 @@ func TestRefreshBrandingMirror_skipsInvalidJSON(t *testing.T) {
 	}
 }
 
-// 历史问题-1(历史):无白名单 Key 快照同步——主端 ” → 从端必须落 ”
+// 历史问题-1(历史):无白名单 Key 快照同步——主端 '' → 从端必须落 ''
 // 而非 json.Marshal(nil) 的字面量 "null"(中间件把非空当白名单配置,
 // Unmarshal null 成功但 0 CIDR → 全来源 403)。
 func TestApplySnapshot_emptyWhitelistLandsEmptyString(t *testing.T) {

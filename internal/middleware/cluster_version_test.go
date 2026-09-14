@@ -549,7 +549,7 @@ func TestClusterVersionTriggers_refreshCachedSnapshotWhenCertificateEntersAndLea
 
 	// Then
 	if got := clusterVersion(t, database); got != 1 {
-		t.Fatalf("version after disabled=%d, want 2", got)
+		t.Fatalf("version after disabled=%d, want 1 (disabled exception, 历史问题)", got)
 	}
 	if len(disabledSnapshot.Certs) != 0 {
 		t.Fatalf("disabled snapshot certificates=%+v, want none", disabledSnapshot.Certs)

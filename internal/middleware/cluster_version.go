@@ -124,7 +124,10 @@ func installClusterVersionTriggers(database *sql.DB) error {
 					}
 					// 历史问题 补充:disabled 例外——证书下线(OLD 成员→NEW disabled)
 					// 必须从端感知(从端停止加载该证书),虽仅 status 变化也 bump。
+					// 历史问题-1(历史):双向化——恢复方向(disabled→成员态)
+					// 同须 bump,否则从端定格「规则启用+证书缺席」。
 					valueChange = append(valueChange, "(OLD.status<>'disabled' AND NEW.status='disabled')")
+					valueChange = append(valueChange, "(OLD.status='disabled' AND NEW.status<>'disabled')")
 					whenClause += " AND (" + strings.Join(valueChange, " OR ") + ")"
 				case "DELETE":
 					whenClause += " AND " + oldCertificateMember
