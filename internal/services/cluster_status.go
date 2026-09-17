@@ -134,11 +134,13 @@ func (s *ClusterService) Status(ctx context.Context) (models.ClusterStatus, erro
 		&isMaster, &status.ClusterVersion, &status.MasterURL, &status.SyncInterval, &status.SyncGlobalConfig, &status.SyncUsers, &status.SyncRules, &status.SyncWafFiles, &status.SyncSecurity, &clusterToken, &status.AppliedVersion, &lastSync, &storedSyncError)
 	if err != nil {
 		return models.ClusterStatus{}, fmt.Errorf("读取集群状态: %w", err)
-		// 历史问题-1(历史):展示口径与运行时 clamp 对齐(cluster_sync.go:
-		// 1387-1389,<10 → 60)——存量脏值(0/负/1-9s)不再原样展示与运行时分叉。
-		if status.SyncInterval < 10 {
-			status.SyncInterval = 60
-		}
+	}
+	// 历史问题-1(历史)/历史问题-1(历史幻影修复修正——clamp 曾被误插
+	// 在上方 return 之后不可达,go vet unreachable 实证):展示口径与运行时 clamp
+	// 对齐(cluster_sync.go:1387-1389,<10 → 60)——存量脏值(0/负/1-9s)不再
+	// 原样展示与运行时分叉。
+	if status.SyncInterval < 10 {
+		status.SyncInterval = 60
 	}
 	status.LastSyncError, status.SyncErrorCode = decodeSyncError(storedSyncError)
 	status.NodeMode = "slave"
