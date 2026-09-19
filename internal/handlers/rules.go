@@ -683,10 +683,21 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxCreateRuleBodyBytes)
 	// 历史 B2: io.ReadAll(c.Request.Body) 在 ShouldBindJSON 之后调用永远读到空。
 	// 改为先读原始 body 再放回，确保错误日志能记录到导致解析失败的实际请求内容。
-	rawBody, _ := io.ReadAll(c.Request.Body)
+	rawBody, readErr := io.ReadAll(c.Request.Body)
 	c.Request.Body = io.NopCloser(bytes.NewReader(rawBody))
+	// 历史问题(历史):MaxBytesReader 截断(chunked/未知 ContentLength 时快路径
+	// 不触发)映射 413,与 PutCaddyConfig/导入路径同口径——预读会吞掉
+	// MaxBytesError 让 bind 落在「unexpected EOF」的 400 上,须在预读处判。
+	if isRequestBodyTooLarge(readErr) {
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
+		return
+	}
 	var req models.CreateRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		if isRequestBodyTooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
+			return
+		}
 		// 历史 问题: 截断 body 日志避免敏感信息（TLS 私钥/密码）泄漏。
 		bodyPreview := string(rawBody)
 		if len(bodyPreview) > 512 {
@@ -1066,6 +1077,12 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxUpdateRuleBodyBytes)
 	var req models.UpdateRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		// 历史问题(历史):MaxBytesReader 超限(chunked/未知长度)映射 413,
+		// 与 CreateRule/PutCaddyConfig/导入路径口径一致。
+		if isRequestBodyTooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
+			return
+		}
 		services.Logf("error", "UpdateRule bind error for caddy_id=%s: %v", caddyID, err)
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的请求: " + err.Error()})
 		return
@@ -1422,7 +1439,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 
 	// Load existing upstreams if not provided in request
-	if len(req.Upstreams) == 0 {
+	// 历史问题(历史):nil 判定区分「省略」与「显式空数组」——len==0 会把显式
+	// [] 归并进保留存量,与 updateRuleFeatures(:87 按 nil 判空)的校验输入分叉。
+	// 显式 []=清空(零上游为合法形态:渲染整跳过,历史 历史问题 特判)。
+	if req.Upstreams == nil {
 		req.Upstreams = oldUpstreams
 	}
 	if protocolChanged {
@@ -2252,6 +2272,9 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		rule.TLSSource = "manual"
 		rule.TLSCert, rule.TLSKey = "", ""
 		rule.ACMEConfigID = 0
+		// 历史问题(历史):TCP 死形态归一补齐 CAProviderID——CreateRule(:890)
+		// 与 UpdateRule(:1296)两入口均已清零,复制路径漏清会把源行遗留死形态放大到副本。
+		rule.CAProviderID = 0
 	}
 
 	userIDInt := contextUserID(c)
