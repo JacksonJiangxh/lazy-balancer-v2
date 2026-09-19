@@ -279,8 +279,8 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	// 历史问题-2(历史):复用 getContextUserIDInt(消除三连手写)。
-	userIDInt := getContextUserIDInt(c)
+	// 历史问题-2(历史):复用 contextUserID(消除三连手写)。
+	userIDInt := int(contextUserID(c))
 
 	if userIDInt == id {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "不能删除当前登录用户"})
@@ -375,7 +375,7 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 	// SYSRENDE历史问题-3(历史):自禁用防护——禁用自己=当前会话立即
 	// 失效,与 DeleteUser 自保护(历史问题-2)不对称。UI 已挡/API 未挡。
 	if !req.IsEnabled {
-		if userIDInt := getContextUserIDInt(c); userIDInt == id {
+		if userIDInt := int(contextUserID(c)); userIDInt == id {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "不能禁用当前登录用户"})
 			return
 		}
