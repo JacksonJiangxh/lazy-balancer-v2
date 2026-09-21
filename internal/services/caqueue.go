@@ -1188,9 +1188,10 @@ func markJobWaitingCA(jobID int, retryAfter time.Duration) {
 		return
 	}
 
+	// 历史问题：available 已是 UTC（上方 历史问题 口径），不再重复 .UTC()。
 	err := transitionJob(db.DB, jobID, nonTerminalJobStatuses, "waiting_ca", map[string]any{
 		"message":            "等待 CA 频率限制冷却",
-		"ca_available_after": available.UTC().Format("2006-01-02 15:04:05"),
+		"ca_available_after": available.Format("2006-01-02 15:04:05"),
 		"last_error_code":    "429",
 		"renewal_attempts":   attempts,
 	})
