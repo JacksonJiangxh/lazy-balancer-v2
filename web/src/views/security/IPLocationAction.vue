@@ -31,6 +31,13 @@
     <el-alert v-else-if="policiesError" type="error" :closable="false" title="策略列表加载失败" />
     <template v-else-if="rows.length > 0">
       <div v-if="groupedRows.offstage > 0" class="ipo-tip">另有 {{ groupedRows.offstage }} 条限流/WAF 策略不涉及 IP 管控</div>
+      <!-- 阶段 0 空态（第 60 轮用户裁定）：无信任策略时引导创建而非静默隐藏 -->
+      <div v-if="groupedRows.stage0.length === 0 && rows.length > 0" class="ipo-sec">
+        <div class="ipo-sec-title">阶段 0 · 信任名单</div>
+        <div class="ipo-card">
+          <div class="ipo-status">未绑定信任策略——如需信任此 IP，请先到「安全防护 → 安全策略」创建阶段 0 策略并绑定到对应规则</div>
+        </div>
+      </div>
       <div v-for="group in visibleGroups" :key="group.key" class="ipo-sec">
         <div class="ipo-sec-title">{{ group.title }}</div>
         <div v-for="row in group.rows" :key="row.policy.id" class="ipo-card">
@@ -388,7 +395,9 @@ const rowView = (policy: PolicyRow): RowView => {
   // 第 59 轮验收复查：信任豁免为全局生效（预检 DetectionOnly 事务级）——IP 已被
   // 任一策略信任时，「信任此 IP」按钮冗余（再加只是重复豁免，且会使策略类型
   // 内容漂移），不再显示；主动作归「取消信任」（豁免方策略卡上）。
-  view.canAddTrust = !view.inTrust && !policies.value.some((p) => mergedTrustEntries(p).includes(props.ip))
+  const isStage0OrMixed = policyTypeOf(policy) === 'stage0' || policyTypeOf(policy) === 'mixed'
+  view.canAddTrust = isStage0OrMixed && !view.inTrust
+    && !policies.value.some((p) => mergedTrustEntries(p).includes(props.ip))
   view.canRemoveTrust = view.inTrust && view.trustEnabled && view.inTrustInline
   view.trustDead = view.inTrust && !view.trustEnabled
   view.canClearDeadTrust = view.trustDead && view.inTrustInline
@@ -546,7 +555,10 @@ interface RowAction { key: string; label: string; type: 'primary' | 'success' | 
 const rowActions = (row: RowView): RowAction[] => {
   const acts: RowAction[] = []
   const pid = row.policy.id
-  if (row.inTrust && row.trustEnabled) {
+  // 第 60 轮用户裁定：信任动作只出现在 stage0/mixed 卡——单职模型下信任归
+  // 阶段 0，阶段 1 卡出信任按钮会导致类型内容漂移且语义混乱
+  const trustAllowed = policyTypeOf(row.policy) === 'stage0' || policyTypeOf(row.policy) === 'mixed'
+  if (trustAllowed && row.inTrust && row.trustEnabled) {
     // 组合语义（第 59 轮）：信任生效中——主动作=取消信任（使名单/规则恢复拦截）
     acts.push({
       key: 'cancel-trust',
@@ -557,7 +569,7 @@ const rowActions = (row: RowView): RowAction[] => {
       run: () => { void cancelTrustAll(row) },
     })
   }
-  if (row.canAddTrust) {
+  if (trustAllowed && row.canAddTrust) {
     const list = resolveSideList(row.policy, 'trust')
     acts.push({
       key: 'trust',
@@ -605,13 +617,13 @@ const rowActions = (row: RowView): RowAction[] => {
       },
     })
   }
-  for (const m of row.removableTrustRefLists) {
+  if (trustAllowed) for (const m of row.removableTrustRefLists) {
     acts.push({ key: `unt-${m.id}`, label: `从「${m.name}」移除信任`, type: 'success', run: () => { void removeFromSideRef(m, props.ip.trim()) } })
   }
-  if (row.canRemoveTrust) {
+  if (trustAllowed && row.canRemoveTrust) {
     acts.push({ key: 'unt-in', label: '从内联信任移除', type: 'success', loading: isBusy(pid, 'untrust'), run: () => { void removeTrust(row.policy) } })
   }
-  if (row.canClearDeadTrust) {
+  if (trustAllowed && row.canClearDeadTrust) {
     acts.push({ key: 'dead', label: '清除条目', type: 'success', tip: '该 IP 的信任条目存在但信任名单已关闭，可一键清除', loading: isBusy(pid, 'untrust'), run: () => { void removeTrust(row.policy) } })
   }
   return acts
