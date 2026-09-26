@@ -216,6 +216,10 @@ func (m *ThreatUpdateManager) run(trigger string) {
 	var isMaster bool
 	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
 		AppendThreatUpdateLog("WARN", "skipped", "当前节点为从节点，终止威胁情报库更新")
+		m.mu.Lock()
+		m.lastFinishedAt = time.Now().UTC().Format(crsTimeLayout) // 第 60 轮：早退同样落终态
+		m.lastTaskOutcome = "skipped"
+		m.mu.Unlock()
 		return
 	}
 	m.mu.Lock()

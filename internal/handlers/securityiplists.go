@@ -718,6 +718,10 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 // 无害）；成功移除 200 {removed:true}。移除/追加经 finishTxApply 同链触发
 // 引用策略重载。
 func (h *Handlers) RemoveIPFromList(c *gin.Context) {
+	// 第 60 轮 P3：家族 3 写路径统一持锁（同文件 Create/Update/Delete/Add 均持，
+	// 唯本端点第 57 轮新增时漂移漏锁——apply 与持锁写并发交错可丢配置更新）
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	id := c.Param("id")
 	var req models.AddIPToListRequest
 	if !guardConfiguredJSONBody(c) {

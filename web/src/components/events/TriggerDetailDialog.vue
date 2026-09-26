@@ -184,7 +184,7 @@ const kind = computed<Kind>(() => {
   // 第 59 轮 R59-P3：合成自定义（1 开头 ≥7 位）与遗留共享 GeoIP id:8 归族——
   // 与后端 stageCategorizeAttack/categorizeAttack 三侧同口径（旧形态落 acl 误标）。
   if (/^1\d{6,}$/.test(t)) return 'waf-custom'
-  if (t === '8') return 'geo'
+  // id:8 历史共享 GeoIP——列表列（isIpAclFamily 含 8）归「IP 访问控制」，弹框同口径
   return 'acl'
 })
 
@@ -301,6 +301,9 @@ const heroHitSource = computed(() => {
 const loading = ref(false)
 const policyMissing = ref(false)
 const loadError = ref(false)
+// 弹框会话序号（第 60 轮 P3）：快速关开换行时丢弃在途响应（同文件 crsDialogSeq
+// / IPLocationAction loadPoliciesSeq 同仓模式）
+let loadSeq = 0
 interface PolicyRow {
   id: number
   name: string
@@ -332,10 +335,12 @@ const entriesCache = ref<Record<number, string[]>>({})
 const loadAll = async (): Promise<void> => {
   const row = props.row
   if (!row) return
+  const seq = ++loadSeq
   loading.value = true
   policyMissing.value = false
   loadError.value = false
   policy.value = null
+  enabledPolicies.value = []
   lists.value = []
   entriesCache.value = {}
   try {
@@ -359,6 +364,7 @@ const loadAll = async (): Promise<void> => {
       request.get<APIResponse<PolicyRow[]>>('/security/policies?enabled=true', { silent: true } as never),
       request.get<APIResponse<Array<{ id: number; name: string; system?: number | boolean }>>>('/security/ip-lists', { silent: true } as never),
     ])
+    if (seq !== loadSeq) return
     if (polRes.status === 'fulfilled') enabledPolicies.value = polRes.value.data || []
     lists.value = listRes.status === 'fulfilled' ? listRes.value.data || [] : []
     const refIds = new Set<number>()
@@ -376,9 +382,10 @@ const loadAll = async (): Promise<void> => {
         cache[r.value.data.id] = (r.value.data.entries || []).map((e) => e.value.trim()).filter((v) => v !== '')
       }
     })
+    if (seq !== loadSeq) return
     entriesCache.value = cache
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
@@ -588,12 +595,6 @@ watch(() => props.modelValue, (v) => {
 
 /* ① 命中概览（trg-hero）：类型着色同来源卡 + 三行结构 */
 .trg-hero { border: 1px solid var(--el-color-danger-light-7); background: var(--el-color-danger-light-9); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
-.trg-hero--geo { border-color: var(--el-color-warning-light-7); background: var(--el-color-warning-light-9); }
-.trg-hero--threat { border-color: var(--el-color-danger-light-7); background: var(--el-color-danger-light-9); }
-.trg-hero--trust { border-color: var(--el-color-success-light-7); background: var(--el-color-success-light-9); }
-.trg-hero--acl { border-color: var(--el-color-danger-light-7); background: var(--el-color-danger-light-9); }
-.trg-hero--waf-crs, .trg-hero--waf-custom { border-color: var(--el-color-primary-light-7); background: var(--el-color-primary-light-9); }
-.trg-hero--body { border-color: var(--el-color-info-light-7); background: var(--el-color-info-light-9); }
 .trg-hero-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .trg-hero-stage { font-weight: 700; font-size: 14px; }
 .trg-hero-ip { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 700; }

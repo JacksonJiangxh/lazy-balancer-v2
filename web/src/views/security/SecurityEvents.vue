@@ -411,7 +411,8 @@ const applyFilters = () => {
   const range = filters.value.timeRange
   if (range?.[0] && range?.[1] && range[0] > range[1]) {
     ElMessage.warning('开始时间不能晚于结束时间')
-    filters.value.timeRange = null
+    // 第 60 轮 P5：只清 end 保留已填的 start（原清空整个区间丢两侧输入）
+    filters.value.timeRange = [range[0], '']
   }
   page.value = 1
   fetchEvents()

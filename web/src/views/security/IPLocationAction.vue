@@ -1,5 +1,5 @@
 <template>
-  <el-popover v-if="canManage" :width="400" trigger="click" popper-class="ip-location-popper" @before-enter="onPopoverShow">
+  <el-popover v-if="canManage" ref="popoverRef" :width="400" trigger="click" popper-class="ip-location-popper" @before-enter="onPopoverShow">
     <template #reference>
       <span
         class="ip-cell ip-clickable"
@@ -7,8 +7,8 @@
         tabindex="0"
         :aria-label="`IP 处置：${ip}`"
         :title="location ? `${ip} · ${location}` : ip"
-        @keydown.enter.prevent="onPopoverShow"
-        @keydown.space.prevent="onPopoverShow"
+        @keydown.enter.prevent="openPopover"
+        @keydown.space.prevent="openPopover"
       >
         <span class="ip-text">{{ ip }}</span>
         <span v-if="location" class="ip-loc" :title="location">{{ compactLocation }}</span>
@@ -162,6 +162,15 @@ const loadEventCount = async (): Promise<void> => {
 }
 
 const onPopoverShow = (): void => { void loadPolicies(); void loadEventCount() }
+
+// 键盘激活（第 60 轮 P3）：Enter/Space 不仅要预取数据，还须真正打开弹层——
+// trigger=click 的 el-popover 在非原生 button 上不合成 click，须持 ref 调 open。
+import { ref as vueRef } from 'vue'
+const popoverRef = vueRef<{ open: () => void } | null>(null)
+const openPopover = (): void => {
+  onPopoverShow()
+  popoverRef.value?.open()
+}
 
 // —— 信任直接动作（第 58 轮统一模型）：与触发详情弹框共享实现。
 // 信任此 IP 不再依赖顶部列表选择：策略已有信任用途列表→直接加入；
@@ -474,7 +483,7 @@ const rowView = (policy: PolicyRow): RowView => {
       view.statusLabel = inInline ? '✅ 已在白名单中' : `✅ 已在白名单中${view.aclHitSourceLabel}`
       view.canRemove = inInline
     } else {
-      view.statusClass = td1Owner ? 'is-warn' : 'is-warn'
+      view.statusClass = 'is-warn'
       // allow 交集外 = id:7 拒绝形态：无信任时确实无法访问；信任豁免中放行（记检测）
       view.statusLabel = (td1Owner || td0Owner ? '⚠️ 不在白名单中' : '⚠️ 不在白名单中（当前无法访问）') + exemptHitSuffix + passthruSuffix
       view.canAssociateAllow = true
@@ -515,7 +524,8 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
     ElMessage.success(`已取消 ${props.ip} 对「${row.policy.name}」的信任`)
     await loadPolicies()
   } catch {
-    // 失败提示由全局拦截器弹出
+    // 失败提示由全局拦截器弹出；部分移除也刷新到实际状态（第 60 轮 P5）
+    await loadPolicies()
   } finally {
     unlockBusy(row.policy.id, 'untrust')
   }

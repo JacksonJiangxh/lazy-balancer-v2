@@ -1198,6 +1198,17 @@ const removeCondition = (idx: number) => {
     else if (n > idx) next[n - 1] = prev[n]
   }
   regexTestStrings.value = next
+  // 第 60 轮 P5：折叠态键同步重排（同 regexTestStrings 口径，否则删除后整体错位）
+  for (const src of [uaCollapsed, regexCollapsed]) {
+    const p = src.value
+    const n2: Record<number, boolean> = {}
+    for (const k of Object.keys(p)) {
+      const n = Number(k)
+      if (n < idx) n2[n] = p[n]
+      else if (n > idx) n2[n - 1] = p[n]
+    }
+    src.value = n2
+  }
 }
 // 搜索提交先回到第 1 页:高页码叠加收窄后的结果集会落在空页上
 const searchRules = () => { page.value = 1; fetchRules() }
