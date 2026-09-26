@@ -144,7 +144,7 @@
                 </div>
               </el-collapse-transition>
             </div>
-            <div class="flow-panel-footnote">信任 IP 命中后跳过全部后续安全阶段；「直通上游」模式不产生任何安全事件（故无计数 chip），「保留检测记录」模式事件动作记为检测</div>
+            <div class="flow-panel-footnote">「直通上游」模式：信任 IP 命中后跳过全部后续安全阶段，不产生任何安全事件（故无计数 chip）；「保留检测记录」模式：继续评估后续全部阶段但不拦截，命中事件动作记为检测</div>
             </template>
             <div v-else class="flow-detail-line">未启用——未绑定信任名单策略，请求直接进入阶段 1</div>
           </div>
@@ -241,7 +241,7 @@
               </template>
               <div v-else class="flow-stage-empty">该阶段未启用（无策略配置对应能力）</div>
               <div class="flow-panel-footnote">
-                {{ typedStageByKey(node.key)!.stage === 1 ? '信任名单归阶段 0 独立生效（拦截判定前）；本阶段未通过即终止' : `未通过即终止${typedStageByKey(node.key)!.footnote ? `；${typedStageByKey(node.key)!.footnote}` : ''}` }}
+                {{ typedStageByKey(node.key)!.stage === 1 ? stage1Footnote : `未通过即终止${typedStageByKey(node.key)!.footnote ? `；${typedStageByKey(node.key)!.footnote}` : ''}` }}
               </div>
           </div>
         </el-collapse-transition>
@@ -621,8 +621,18 @@ const flowNodes = computed<FlowNode[]>(() => {
   return nodes
 })
 
+// 阶段 1 脚注（第 59 轮文案修正）：合并预检真实链序（信任 DetectionOnly →
+// 黑名单 → 遗留黑名单 → 白名单外拒绝 → 白名单命中豁免地域 → 地域拦截）；
+// 绑定「保留检测」信任策略时命中降级为检测不终止——原「拦截判定前/未通过即
+// 终止」两处与管线语义不符（保留检测不跳过评估、命中不终止）。
+const stage1Footnote = computed(() => {
+  const base = '多策略合并预检：信任（阶段 0）→ 黑名单 → 白名单外拒绝（白名单命中豁免地域拦截）→ 地域拦截；未通过即终止'
+  const td1Bound = props.policies.some((p) => p.policy_type === 'stage0' && p.enabled && p.ip_whitelist_enabled && p.trust_detection === true)
+  return td1Bound ? `${base}；绑定「保留检测」信任策略时命中降级为检测事件，不终止` : base
+})
+
 const stageSub = (stage: 1 | 2 | 3): string => {
-  if (stage === 1) return 'IP 名单 · 地域拦截'
+  if (stage === 1) return 'IP 名单 · 地域 · 威胁库'
   if (stage === 2) return '速率限制'
   return '自定义 · CRS'
 }

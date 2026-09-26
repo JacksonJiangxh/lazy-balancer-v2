@@ -535,7 +535,7 @@ export const buildStageModel = (
         enabled: stage2Groups.length > 0,
         override: null,
         groups: stage2Groups,
-        footnote: '限流拦截恒为 429',
+        footnote: '限流拦截恒为 429（不产生安全事件，计数见规则指标）',
       },
       {
         stage: 3,
