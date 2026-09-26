@@ -253,6 +253,7 @@ import { Aim, DataAnalysis, TrendCharts, PieChart, Location, Warning, Odometer, 
 import { request } from '@/utils/api'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
 import { formatDate } from '@/utils/date'
+import { compareVersion } from '@/utils/securityStages'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
 import { BarChart, PieChart as PieSeries } from 'echarts/charts'
@@ -437,10 +438,11 @@ const threatSourcesStatus = ref('')
 const fetchThreatLib = async () => {
   try {
     const res = await request.get<APIResponse<{ sources: { version: string; update_status: string }[]; total_entries?: number }>>('/security/threat-lib')
-    threatLatestVersion.value = (res.data?.sources || []).map(s => s.version).filter(Boolean).sort().pop() || ''
+    threatLatestVersion.value = (res.data?.sources || []).map(s => s.version).filter(Boolean).sort(compareVersion).pop() || ''
     threatRunning.value = (res.data?.sources || []).some(s => s.update_status === 'running')
     const statuses = (res.data?.sources || []).map(s => s.update_status)
-    threatSourcesStatus.value = statuses.some(x => x === 'failed') ? 'failed' : ''
+    // running 优先于 failed：与 SecurityRules libRows 聚合同口径
+    threatSourcesStatus.value = statuses.some(x => x === 'running') ? '' : (statuses.some(x => x === 'failed') ? 'failed' : '')
     threatError.value = false
   } catch {
     threatError.value = true

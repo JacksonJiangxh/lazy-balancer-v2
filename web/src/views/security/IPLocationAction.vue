@@ -177,7 +177,12 @@ const openPopover = (): void => {
 // 没有→自动创建「{策略名}-信任」并关联+加入。
 const trustApi = useTrustAssociation({
   getList: () => ipLists.value,
-  onChanged: () => loadPolicies(),
+  // 第 60 轮验收：写入后必须清条目缓存——loadIpLists 只拉缓存缺失 ID（B3-P5
+  // 优化），已缓存列表的新增条目不可见导致「拦截此 IP」按钮在加入后仍显示
+  onChanged: () => {
+    ipListEntries.value = {}
+    return loadPolicies()
+  },
 })
 const { busyTrust, creating: trustCreating, resolveSideList, ensureListAndJoin, removeFromSideRef } = trustApi
 
@@ -522,9 +527,11 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
       await request.post(`/security/ip-lists/${m.id}/remove-ip`, { value: props.ip })
     }
     ElMessage.success(`已取消 ${props.ip} 对「${row.policy.name}」的信任`)
+    ipListEntries.value = {}
     await loadPolicies()
   } catch {
     // 失败提示由全局拦截器弹出；部分移除也刷新到实际状态（第 60 轮 P5）
+    ipListEntries.value = {}
     await loadPolicies()
   } finally {
     unlockBusy(row.policy.id, 'untrust')

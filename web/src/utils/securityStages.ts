@@ -766,3 +766,20 @@ export const inferPolicyType = (p: SecurityPolicyTypeInput): SecurityPolicyType 
   if (s2) return 'stage2'
   return 'stage3'
 }
+
+// compareVersion 语义化版本比较（第 60 轮）：日期形态（2026.09.24）与
+// semver（v2.3.3）均可——逐段数值比较，非数值段字典序兜底。
+export const compareVersion = (a: string, b: string): number => {
+  const pa = a.replace(/^v/, '').split(/[.-]/)
+  const pb = b.replace(/^v/, '').split(/[.-]/)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = Number(pa[i]); const nb = Number(pb[i])
+    if (!Number.isNaN(na) && !Number.isNaN(nb)) {
+      if (na !== nb) return na - nb
+    } else {
+      const sa = pa[i] ?? ''; const sb = pb[i] ?? ''
+      if (sa !== sb) return sa < sb ? -1 : 1
+    }
+  }
+  return 0
+}

@@ -330,7 +330,11 @@ const policy = ref<PolicyRow | null>(null)
 // 为事务级全局，命中策略与豁免信任策略可以是两条不同策略）
 const enabledPolicies = ref<PolicyRow[]>([])
 const lists = ref<Array<{ id: number; name: string; system?: number | boolean }>>([])
-const entriesCache = ref<Record<number, string[]>>({})
+// 模块级条目缓存（第 60 轮性能修复）：跨弹框会话共享——同会话反复打开不重拉
+// 全部引用名单条目（三源全引 1.5-2MB/次）。快捷弹框写入动作清空本缓存（见
+// IPLocationAction onChanged），下次打开自动重拉。
+const sharedEntriesCache: Record<number, string[]> = {}
+const entriesCache = ref<Record<number, string[]>>(sharedEntriesCache)
 
 const loadAll = async (): Promise<void> => {
   const row = props.row
@@ -342,7 +346,7 @@ const loadAll = async (): Promise<void> => {
   policy.value = null
   enabledPolicies.value = []
   lists.value = []
-  entriesCache.value = {}
+  entriesCache.value = { ...sharedEntriesCache } // 从共享缓存起步，只补拉缺失
   try {
     if (row.policy_id > 0) {
       try {
@@ -383,6 +387,7 @@ const loadAll = async (): Promise<void> => {
       }
     })
     if (seq !== loadSeq) return
+    Object.assign(sharedEntriesCache, cache) // 写回共享缓存
     entriesCache.value = cache
   } finally {
     if (seq === loadSeq) loading.value = false
