@@ -41,7 +41,7 @@
               size="small" type="success" plain
               :loading="creatingStage0"
               @click="createStage0AndTrust"
-            >创建信任策略并信任此 IP</el-button>
+            >信任此 IP（创建「IP 信任」）</el-button>
           </div>
         </div>
       </div>
@@ -568,24 +568,35 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
 const creatingStage0 = ref(false)
 const createStage0AndTrust = async (): Promise<void> => {
   if (creatingStage0.value) return
+  let listName: string
+  let policyName: string
   try {
-    await ElMessageBox.confirm(
-      `将创建阶段 0 信任策略「IP 信任」（保留检测记录）+ 地址列表「IP-信任」，绑定到当前规则并加入 ${props.ip}。是否继续？`,
-      '创建信任策略',
-      { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' },
+    const { value } = await ElMessageBox.prompt(
+      '将创建阶段 0 信任策略（保留检测记录）并绑定到当前规则，可自定义名称：',
+      `信任此 IP（创建策略并加入 ${props.ip}）`,
+      {
+        confirmButtonText: '创建并信任',
+        cancelButtonText: '取消',
+        type: 'info',
+        inputValue: 'IP 信任',
+        inputPattern: /\S+/,
+        inputErrorMessage: '策略名不能为空',
+      },
     )
+    policyName = value.trim()
+    listName = `${policyName}-信任`
   } catch { return }
   creatingStage0.value = true
   try {
     // 1) 创建地址列表
     const listRes = await request.post<APIResponse<{ id: number }>>('/security/ip-lists', {
-      name: 'IP-信任', category: 'custom', entries: '[]',
+      name: listName, category: 'custom', entries: '[]',
     } as never)
     const listId = listRes.data?.id
     if (!listId) { ElMessage.error('创建地址列表失败'); return }
     // 2) 创建 stage0 策略（td=1 保留检测）
     const policyRes = await request.post<APIResponse<{ id: number }>>('/security/policies', {
-      name: 'IP 信任', policy_type: 'stage0', enabled: true,
+      name: policyName, policy_type: 'stage0', enabled: true,
       ip_whitelist_enabled: true, trust_detection: true,
       ip_whitelist: '[]', ip_whitelist_refs: JSON.stringify([listId]),
       ip_blacklist: '[]',
@@ -600,7 +611,7 @@ const createStage0AndTrust = async (): Promise<void> => {
         rule_ids: [props.ruleCaddyId], policy_ids: [policyId],
       } as never)
     }
-    ElMessage.success(`已创建「IP 信任」策略并信任 ${props.ip}`)
+    ElMessage.success(`已创建「${policyName}」策略并信任 ${props.ip}`)
     ipListEntries.value = {}
     await loadPolicies()
   } catch {
