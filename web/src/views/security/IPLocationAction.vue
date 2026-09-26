@@ -34,9 +34,7 @@
       <!-- 阶段 0 空态（第 60 轮用户裁定：提示创建，不自动代建） -->
       <div v-if="groupedRows.stage0.length === 0 && rows.length > 0" class="ipo-sec">
         <div class="ipo-sec-title">阶段 0 · 信任名单</div>
-        <div class="ipo-card">
-          <div class="ipo-status">该规则未绑定信任策略——请到「安全防护 → 安全策略」创建阶段 0 策略并绑定后，再从此弹框信任此 IP</div>
-        </div>
+        <div class="ipo-tip">未绑定信任策略——到「安全防护 → 安全策略」创建并绑定后可信任此 IP</div>
       </div>
       <div v-for="group in visibleGroups" :key="group.key" class="ipo-sec">
         <div class="ipo-sec-title">{{ group.title }}</div>
@@ -56,8 +54,8 @@
           <div v-if="row.inLegacy && group.key !== 'stage0'" class="ipo-legacy">该 IP 还存在于旧版独立黑名单字段，可经 API 更新策略（ip_blacklist）清理</div>
           <div v-if="group.key === 'mixed'" class="ipo-legacy">混合策略（兼容旧版）· 仅可更新迁移——到「安全防护 → 安全策略」页对该策略执行「更新迁移」拆分为单职策略</div>
           <div v-if="row.trustDead" class="ipo-legacy">该 IP 的信任条目存在，但策略的信任名单已关闭——条目暂不生效</div>
-          <div v-if="rowActions(row).length > 0" class="ipo-acts">
-            <template v-for="act in rowActions(row)" :key="act.key">
+          <div v-if="actionsFor(row).length > 0" class="ipo-acts">
+            <template v-for="act in actionsFor(row)" :key="act.key">
               <span v-if="!act.run" class="ipo-act-hint">{{ act.label }}</span>
               <el-tooltip v-else-if="act.tip" :content="act.tip" placement="top">
                 <el-button size="small" :type="act.type" plain :loading="act.loading" @click="act.run()">{{ act.label }}</el-button>
@@ -303,6 +301,7 @@ const policyTypeOf = (p: PolicyRow): SecurityPolicyType =>
 
 let loadPoliciesSeq = 0
 const loadPolicies = async (): Promise<void> => {
+  rowActionsCache.clear() // 策略数据变更后动作缓存失效
   // 每次 @show 都强制重新拉取——同一策略绑定多条规则时，从规则 A 弹窗
   // 加入黑名单后，打开规则 B 弹窗需要看到最新 ACL 状态（无陈旧缓存）。
   // 地址列表选项同节奏刷新（含引用条目缓存）；等两者就绪后再渲染行，
@@ -553,6 +552,16 @@ const rows = computed<RowView[]>(() => policies.value.map(rowView))
 // 行内上下文动作（第 58 轮交互重构）：按行状态只出现该出现的动作。
 // 顺序 = 信任（绿）→ 黑名单移除（红）→ 关联拦截/放行（红/蓝）→ 信任移除（绿）。
 interface RowAction { key: string; label: string; type: 'primary' | 'success' | 'warning' | 'danger' | 'info'; loading?: boolean; tip?: string; run?: () => void }
+
+// 动作缓存（模板渲染优化）：同一行在同一渲染周期内只计算一次
+const rowActionsCache = new Map<number, RowAction[]>()
+const actionsFor = (row: RowView): RowAction[] => {
+  const cached = rowActionsCache.get(row.policy.id)
+  if (cached) return cached
+  const acts = rowActions(row)
+  rowActionsCache.set(row.policy.id, acts)
+  return acts
+}
 const rowActions = (row: RowView): RowAction[] => {
   const acts: RowAction[] = []
   const pid = row.policy.id
