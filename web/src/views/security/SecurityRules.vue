@@ -949,7 +949,8 @@ const saveIpList = async () => {
       : '存在未填写条目值的行，请补全或删除空行')
     return
   }
-  if (entries.length === 0) { ElMessage.warning('至少添加一条 IP/CIDR 条目'); return }
+  // 允许空列表保存（第 60 轮用户裁定）：后端 validateIPListShape 不要求非空；
+  // allow 模式策略引用的清空由后端 N1 守卫 409 拦截（fail-open 防护）
   if (entries.length > 500) { ElMessage.warning('每个列表最多 500 条条目'); return }
   const action = editingIpListId.value ? '保存' : '创建'
   try {
