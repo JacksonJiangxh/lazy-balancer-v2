@@ -20,6 +20,6 @@ func dbQueryNotFound(c *gin.Context, err error, notFoundMessage, operation strin
 		return true
 	}
 	services.Logf("error", "%s: %v", operation, err)
-	c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Database error"})
+	c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
 	return true
 }

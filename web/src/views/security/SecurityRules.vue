@@ -75,7 +75,7 @@
       <el-tabs v-model="activeTab">
         <el-tab-pane label="CRS 规则" name="rules">
           <div class="table-toolbar">
-            <el-input v-model="searchQuery" placeholder="搜索规则文件名或分类" clearable :prefix-icon="Search" class="search-input" @clear="fetchRules" @keyup.enter="searchRules" />
+            <el-input v-model="searchQuery" placeholder="搜索规则文件名或分类" clearable :prefix-icon="Search" class="search-input" @clear="searchRules" @keyup.enter="searchRules" />
           </div>
           <el-table :data="rules" v-loading="loadingRules" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="" @row-click="openRuleContent" style="cursor: pointer">
             <template #empty><el-empty description="暂无规则文件" :image-size="60" /></template>
