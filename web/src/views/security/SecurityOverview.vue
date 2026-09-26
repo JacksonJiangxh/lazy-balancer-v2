@@ -236,7 +236,11 @@
         <el-table-column prop="detected" label="检测" width="80" align="center">
           <template #default="{ row }"><el-tag type="warning" size="small" effect="plain">{{ row.detected }}</el-tag></template>
         </el-table-column>
-        <el-table-column prop="attack_type" label="攻击类型" min-width="180" show-overflow-tooltip />
+        <el-table-column label="攻击类型" min-width="180" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span>{{ topIpAttackLabel(row) }}</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="last_time" label="最后攻击" width="170" :formatter="(row: TopIP) => formatDate(row.last_time)" />
       </el-table>
     </el-card>
@@ -306,6 +310,23 @@ function statusTagType(status: string): TagType {
 }
 
 const attackByStage = ref(true)
+
+// Top 10 攻击类型列与分布图「按阶段展示」勾选联动（第 59 轮微调）：勾选时把
+// 具体 family（joinDistinctFamilies 产物）映射到阶段五桶去重展示，取消勾选
+// 恢复具体分类文本——与分布图同口径（后端 stageCategorizeAttack 的 family 版）。
+const WAF_FAMILIES = new Set(['自定义规则', 'SQL注入', 'XSS', '文件包含', '文件读取', '命令注入', 'PHP注入', '通用攻击', '协议异常', '协议攻击', '方法限制', '协议攻击（CRS v3 遗留标签）', '请求体限制', '扫描探测', '会话固定', '通用排除（CRS 后）', 'Java 攻击', '响应信息泄露', '响应 SQL 泄露', '响应 PHP 泄露', '响应阻断评估', '请求阻断评估'])
+const familyToStage = (f: string): string => {
+  if (f === '信任名单') return '信任名单'
+  if (f === '请求体异常') return '请求体异常'
+  if (f === 'IP 访问控制' || f === '威胁情报库' || f === '地域拦截') return 'IP 访问控制'
+  if (WAF_FAMILIES.has(f)) return 'WAF'
+  return '其他'
+}
+const topIpAttackLabel = (row: TopIP): string => {
+  if (!attackByStage.value) return row.attack_type || '—'
+  const stages = [...new Set((row.attack_type || '').split('、').filter(Boolean).map(familyToStage))]
+  return stages.length > 0 ? stages.join('、') : '—'
+}
 const overview = ref<Overview>({ today_blocked: 0, today_detected: 0, active_policies: 0, crs_version: '', trend: [], top_ips: [], attack_types: [], attack_types_stage: [] })
 // 分布图展示模式：勾选=按阶段五桶（默认，与触发阶段口径一致）；取消=具体分类
 // 总览加载失败（如 metrics 库故障导致后端 500）时置位：避免把全零面板

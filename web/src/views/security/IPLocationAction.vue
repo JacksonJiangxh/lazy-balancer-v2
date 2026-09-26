@@ -18,9 +18,11 @@
     <div class="ipo-head">
       <div class="ipo-ip-row">
         <span class="ipo-ip">{{ ip }}</span>
-        <el-tag v-if="eventCount !== null" size="small" :type="eventCount > 0 ? 'warning' : 'success'" effect="plain" round>
-          30天事件 {{ eventCount }}
-        </el-tag>
+        <el-tooltip v-if="eventCount !== null" content="统计窗口：近 30 天（事件页/Top 10 卡片为近 7 天口径）" placement="top">
+          <el-tag size="small" :type="eventCount > 0 ? 'warning' : 'success'" effect="plain" round>
+            30天事件 {{ eventCount }}
+          </el-tag>
+        </el-tooltip>
       </div>
       <div v-if="location" class="ipo-loc-line">{{ location }}</div>
     </div>
