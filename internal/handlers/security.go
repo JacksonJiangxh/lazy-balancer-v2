@@ -3327,6 +3327,7 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 				active++
 			}
 		}
+		trackErr(policyRows.Err()) // 历史：迭代失败显式报错（历史问题 F2 同族漏点）
 		policyRows.Close()
 		overview.ActivePolicies = active
 	}
