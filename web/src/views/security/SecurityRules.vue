@@ -538,6 +538,7 @@
 import { ref, onMounted, onUnmounted, computed, nextTick, watch } from 'vue'
 import { Aim, Filter, List, Location, Lock, Search, Notebook, Plus, WarningFilled } from '@element-plus/icons-vue'
 import { formatDate } from '@/utils/date'
+import { compareVersion } from '@/utils/securityStages'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import RuleLibScheduleEditor from '@/components/RuleLibScheduleEditor.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -624,7 +625,7 @@ const libRows = computed<LibRow[]>(() => {
   if (threatSources.value.length > 0) {
     const srcs = threatSources.value
     const totalEntries = srcs.reduce((sum, x) => sum + x.entry_count, 0)
-    const latestVersion = srcs.map(x => x.version).filter(Boolean).sort().pop() || ''
+    const latestVersion = srcs.map(x => x.version).filter(Boolean).sort(compareVersion).pop() || ''
     const anyFailed = srcs.find(x => x.update_status === 'failed')
     const anyRunning = srcs.some(x => x.update_status === 'running')
     const status = anyRunning ? 'running' : anyFailed ? 'failed' : latestVersion ? 'success' : 'idle'
