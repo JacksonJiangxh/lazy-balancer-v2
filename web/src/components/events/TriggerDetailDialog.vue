@@ -41,14 +41,14 @@
 
         <!-- 命中的地址列表与内联名单（只读信息） -->
         <template v-if="kind === 'acl' || kind === 'geo' || kind === 'threat'">
-          <div v-for="m in memberLists" :key="m.id" class="trg-kv">
+          <div v-for="m in allHitLists" :key="m.id" class="trg-kv">
             <span class="k">命中列表</span>
             <span>{{ m.name }}<el-tag v-if="m.system" size="small" effect="plain" style="margin-left: 6px">内置只读</el-tag></span>
           </div>
           <div v-if="inlineAclHit" class="trg-kv"><span class="k">命中位置</span><span>策略内联{{ policy?.ip_acl_mode === 'allow' ? '白' : '黑' }}名单</span></div>
           <div v-if="trustHitNote" class="trg-kv"><span class="k">信任豁免</span><span>{{ trustHitNote }}</span></div>
           <div v-if="memberSystemTip" class="trg-tip">{{ memberSystemTip }}</div>
-          <div v-if="memberLists.length === 0 && !inlineAclHit && kind === 'acl'" class="trg-tip">未定位到命中的地址列表（策略名单可能已变更；事件为历史记录）</div>
+          <div v-if="allHitLists.length === 0 && !inlineAclHit && kind === 'acl' && !isAllowOutside" class="trg-tip">未定位到命中的地址列表（策略名单可能已变更；事件为历史记录）</div>
         </template>
 
         <!-- 信任名单：直通/保留检测语义说明 -->
@@ -205,16 +205,28 @@ const sourceTagType = computed(() =>
       : kind.value === 'trust' ? 'success'
         : kind.value === 'waf-custom' || kind.value === 'acl' ? 'danger' : 'info')
 
-
 // 命中概览（用户裁定：一眼可读）——阶段名 / 命中源
 const formatTriggerTime = (v: string): string => formatDate(v)
 
-// 组合语义说明（第 59 轮）：logged 事件的「为什么不拦」——检测模式策略 或 信任保留检测。
+// 组合语义说明（第 59 轮）：logged 事件的「为什么不拦」——检测模式策略 或
+// 信任保留检测（含跨策略豁免：预检 DetectionOnly 为事务级全局，命中策略与
+// 豁免信任策略可以是两条不同策略——「黑名单命中但被另一策略的信任放行为检测」）。
+const exemptingTrustPolicy = computed<string | null>(() => {
+  if (!props.row || props.row.action === 'blocked') return null
+  const ip = props.row.client_ip.trim()
+  for (const p of [policy.value, ...enabledPolicies.value].filter((x): x is PolicyRow => !!x)) {
+    if (!p.ip_whitelist_enabled || p.trust_detection !== true) continue
+    if (parseIPList(p.ip_whitelist).includes(ip)) return p.name
+    const refs = parseRefIds(p.ip_whitelist_refs)
+    if (refs.some((id) => (entriesCache.value[id] ?? []).includes(ip))) return p.name
+  }
+  return null
+})
 const detectionNote = computed<string>(() => {
   if (!props.row || props.row.action === 'blocked') return ''
   if (kind.value === 'trust') return ''
   if (policy.value?.mode === 'detection') return '所属策略为检测模式：命中只记录，不拦截'
-  if (policy.value?.ip_whitelist_enabled && policy.value?.trust_detection) return '信任保留检测：命中记录为检测事件'
+  if (exemptingTrustPolicy.value) return `信任保留检测（跨策略豁免）：由策略「${exemptingTrustPolicy.value}」的信任名单放行，命中记录为检测`
   return ''
 })
 
@@ -258,14 +270,16 @@ const heroHitSource = computed(() => {
   if (!ev) return '—'
   switch (kind.value) {
     case 'acl': {
+      if (isAllowOutside.value) return '不在白名单中（白名单模式：仅名单内 IP 放行）'
       if (inlineAclHit.value) return `策略内联${policy.value?.ip_acl_mode === 'allow' ? '白' : '黑'}名单（规则 id:${ev.rule_triggered}）`
-      if (memberLists.value.length > 0) return memberLists.value.map((m) => `地址列表「${m.name}」`).join('、')
+      if (allHitLists.value.length > 0) return allHitLists.value.map((m) => `地址列表「${m.name}」${m.system ? '（内置）' : ''}`).join('、')
+      if (ev.rule_triggered === '4') return `遗留独立黑名单字段（id:4）${ev.rule_name ? ` · ${ev.rule_name}` : ''}`
       return `规则 id:${ev.rule_triggered}${ev.rule_name ? ` · ${ev.rule_name}` : ''}`
     }
     case 'geo':
       return `地域拦截规则 id:${ev.rule_triggered}（区域：${geoLabel.value || '未知'}）`
     case 'threat': {
-      const names = threatSourceLists.value.map((l) => `「${l.name}」`)
+      const names = allHitLists.value.filter((l) => l.system).map((l) => `「${l.name}」`)
       return names.length > 0 ? `威胁情报库 ${names.join('、')}` : `威胁情报库预检（id:${ev.rule_triggered}）`
     }
     case 'trust': {
@@ -309,6 +323,9 @@ interface PolicyRow {
   trust_detection?: boolean
 }
 const policy = ref<PolicyRow | null>(null)
+// 全部启用策略（第 59 轮追加修复：跨策略信任豁免判定——预检 DetectionOnly
+// 为事务级全局，命中策略与豁免信任策略可以是两条不同策略）
+const enabledPolicies = ref<PolicyRow[]>([])
 const lists = ref<Array<{ id: number; name: string; system?: number | boolean }>>([])
 const entriesCache = ref<Record<number, string[]>>({})
 
@@ -336,13 +353,19 @@ const loadAll = async (): Promise<void> => {
     } else {
       policyMissing.value = true
     }
-    // 名单/条目：ACL 与信任 refs 的条目缓存（成员判定信息展示用）
-    const listRes = await request.get<APIResponse<Array<{ id: number; name: string; system?: number | boolean }>>>('/security/ip-lists')
-    lists.value = listRes.data || []
+    // 全部启用策略 + 名单/条目：ACL 与信任 refs 的条目缓存（信息展示用 +
+    // 跨策略信任成员判定——第 59 轮追加修复）
+    const [polRes, listRes] = await Promise.allSettled([
+      request.get<APIResponse<PolicyRow[]>>('/security/policies?enabled=true', { silent: true } as never),
+      request.get<APIResponse<Array<{ id: number; name: string; system?: number | boolean }>>>('/security/ip-lists', { silent: true } as never),
+    ])
+    if (polRes.status === 'fulfilled') enabledPolicies.value = polRes.value.data || []
+    lists.value = listRes.status === 'fulfilled' ? listRes.value.data || [] : []
     const refIds = new Set<number>()
-    if (policy.value) {
-      for (const id of parseRefIds(policy.value.ip_acl_list_refs)) refIds.add(id)
-      for (const id of parseRefIds(policy.value.ip_whitelist_refs)) refIds.add(id)
+    const allPolicies = [policy.value, ...enabledPolicies.value].filter((p): p is PolicyRow => !!p)
+    for (const p of allPolicies) {
+      for (const id of parseRefIds(p.ip_acl_list_refs)) refIds.add(id)
+      for (const id of parseRefIds(p.ip_whitelist_refs)) refIds.add(id)
     }
     const results = await Promise.allSettled(
       [...refIds].map((id) => request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`)),
@@ -358,7 +381,6 @@ const loadAll = async (): Promise<void> => {
     loading.value = false
   }
 }
-
 
 const geoLabel = computed(() => {
   try {
@@ -414,22 +436,23 @@ const wafSummary = computed(() => {
 // —— 来源语义行 ——
 
 // —— ACL/威胁/信任命中明细（只读信息） ——
-const threatSourceLists = computed(() => {
-  const p = policy.value
-  if (!p || kind.value !== 'threat') return []
-  return lists.value
-    .filter((l) => l.system && parseRefIds(p.ip_acl_list_refs).includes(l.id))
-    .filter((l) => (entriesCache.value[l.id] ?? []).includes(props.row?.client_ip.trim() ?? ''))
-})
-const memberLists = computed(() => {
+// 全部命中列表（第 59 轮补漏1）：自定义 + 内置威胁名单（只读展示名单名，
+// 原实现只对自定义列表出「命中列表」行、内置名单仅泛化 tip——同一 IP 同时
+// 命中 测试列表+中科大恶意IP名单 时内置侧不可见）。
+const allHitLists = computed(() => {
   const p = policy.value
   if (!p) return []
   const refs = parseRefIds(p.ip_acl_list_refs)
   const ip = props.row?.client_ip.trim() ?? ''
-  return lists.value
-    .filter((l) => refs.includes(l.id) && !l.system)
-    .filter((l) => (entriesCache.value[l.id] ?? []).includes(ip))
+  return lists.value.filter((l) => refs.includes(l.id) && (entriesCache.value[l.id] ?? []).includes(ip))
 })
+// 白名单外拒绝形态（第 59 轮补漏2）：id:5/7 = allow 交集外——IP 不在任何名单
+// 中，「命中列表」恒空是正确语义，须显式说明而非「未定位到」。
+const isAllowOutside = computed(() => {
+  const n = Number(props.row?.rule_triggered)
+  return kind.value === 'acl' && (n === 5 || n === 7)
+})
+
 const inlineAclHit = computed(() => {
   const p = policy.value
   return !!p && parseIPList(p.ip_acl_list).includes(props.row?.client_ip.trim() ?? '')
@@ -506,9 +529,6 @@ const crsSnippetFetched = ref(false)
 const crsSnippetError = ref(false)
 // 弹框会话序号：关闭/重开丢弃在途的索引与源码返回
 
-
-
-
 const extractRuleSnippet = (content: string, ruleId: string): string => {
   const needles = [`id:${ruleId}`, `id: ${ruleId}`, `id:'${ruleId}'`, `id:"${ruleId}"`]
   const lines = content.split('\n')
@@ -516,7 +536,6 @@ const extractRuleSnippet = (content: string, ruleId: string): string => {
   if (idx === -1) return ''
   return lines.slice(Math.max(0, idx - 10), Math.min(lines.length, idx + 11)).join('\n')
 }
-
 
 const toggleCrsSnippet = async (): Promise<void> => {
   crsSnippetExpanded.value = !crsSnippetExpanded.value
@@ -540,7 +559,6 @@ const toggleCrsSnippet = async (): Promise<void> => {
     if (seq === crsDialogSeq) crsSnippetLoading.value = false
   }
 }
-
 
 // —— 装载编排 ——
 watch(() => props.modelValue, (v) => {

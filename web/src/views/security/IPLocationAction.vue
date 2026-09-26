@@ -43,6 +43,9 @@
           </div>
           <div v-if="group.key === 'stage0'" class="ipo-mode-line">{{ row.trustDetectionLabel }}</div>
           <div class="ipo-status" :class="row.statusClass">{{ row.statusLabel }}</div>
+          <!-- 区域+列表组合（第 59 轮枚举补全）：ACL 评估之外地域拦截同样在链上，
+               名单未命中不代表放行（区域命中仍拦）——卡片显式列出区域维度 -->
+          <div v-if="row.geoActive && group.key !== 'stage0'" class="ipo-mode-line">另启用地域拦截 · {{ row.policy.geoip_mode === 'allow' ? '仅允许' : '拦截' }}区域：{{ row.geoRegions }}</div>
           <div v-if="row.inLegacy && group.key !== 'stage0'" class="ipo-legacy">该 IP 还存在于旧版独立黑名单字段，可经 API 更新策略（ip_blacklist）清理</div>
           <div v-if="group.key === 'mixed'" class="ipo-legacy">混合策略（兼容旧版）· 仅可更新迁移——到「安全防护 → 安全策略」页对该策略执行「更新迁移」拆分为单职策略</div>
           <div v-if="row.trustDead" class="ipo-legacy">该 IP 的信任条目存在，但策略的信任名单已关闭——条目暂不生效</div>
@@ -100,6 +103,7 @@ interface PolicyRow {
   mode?: string
   rate_limit_enabled?: boolean
   geoip_enabled?: boolean
+  geoip_mode?: string
   geoip_countries?: string
   has_geoip?: boolean
   has_rate_limit?: boolean
@@ -438,29 +442,24 @@ const rowView = (policy: PolicyRow): RowView => {
     .filter((l) => !l.system && parseRefIds(policy.ip_acl_list_refs).includes(l.id))
     .filter((l) => (ipListEntries.value[l.id] ?? []).includes(props.ip.trim()))
     .map((l) => ({ id: l.id, name: l.name }))
-  // 信任豁免组合态（第 59 轮组合语义，跨策略口径）：预检信任 DetectionOnly
-  // 是事务级全局（R48 裁定：信任 IP 对全部策略放行）——任一策略的信任侧
-  // 命中（td=1 保留检测）即本策略名单/规则命中不拦截、事件记为检测；td=0
-  // 直通则 subroute 短路全部安全阶段。自身信任（stage0/mixed）与跨策略信任
-  // 同权重呈现。
-  const globalTrustTd1 = policies.value.some((p) => mergedTrustEntries(p).includes(props.ip) && p.trust_detection === true)
-  const globalTrustTd0 = policies.value.some((p) => mergedTrustEntries(p).includes(props.ip) && p.trust_detection === false && p.ip_whitelist_enabled)
-  const trustExempting = (view.inTrust && view.trustEnabled) || globalTrustTd1 || globalTrustTd0
-  const trustExemptSuffix = trustExempting
-    ? (globalTrustTd0 && !(view.inTrust && view.trustEnabled && policy.trust_detection === true)
-        ? ' · 信任直通中：跳过全部安全阶段（不产生事件）'
-        : ' · 信任豁免中：命中不拦截，事件记为检测')
-    : ''
+  // 信任豁免组合态（第 59 轮组合语义复查）：预检信任 DetectionOnly 是事务级
+  // 全局——但后缀只对「实际命中」形态有意义（deny 命中 / allow 交集外被 id:7
+  // 拒），未命中本来就不拦、allow 名单内本来合法放行，挂后缀反而误导；同时
+  // 点名豁免策略（跨策略时用户需要知道去哪取消）。
+  const td1Owner = policies.value.find((p) => p.ip_whitelist_enabled && p.trust_detection === true && mergedTrustEntries(p).includes(props.ip))
+  const td0Owner = policies.value.find((p) => p.ip_whitelist_enabled && p.trust_detection === false && mergedTrustEntries(p).includes(props.ip))
+  const exemptHitSuffix = td1Owner ? ` · 信任豁免中（由「${td1Owner.name}」放行）：命中不拦截，事件记为检测` : ''
+  const passthruSuffix = !td1Owner && td0Owner ? ' · 信任直通中：跳过全部安全阶段，不产生事件' : ''
   if (policy.ip_acl_mode === 'deny') {
     view.tagType = 'danger'
     view.tagLabel = '黑名单'
     view.countLabel = `${list.length} 条`
     if (inList) {
-      view.statusClass = trustExempting ? 'is-warn' : 'is-ok'
-      view.statusLabel = (inInline ? '✅ 已在黑名单中' : `✅ 已在黑名单中${view.aclHitSourceLabel}`) + trustExemptSuffix
+      view.statusClass = td1Owner ? 'is-warn' : 'is-ok'
+      view.statusLabel = (inInline ? '✅ 已在黑名单中' : `✅ 已在黑名单中${view.aclHitSourceLabel}`) + exemptHitSuffix + passthruSuffix
       view.canRemove = inInline
     } else {
-      view.statusLabel = `拒绝列表 · ${list.length} 条` + trustExemptSuffix
+      view.statusLabel = `拒绝列表 · ${list.length} 条`
       view.canAssociate = true
     }
   } else if (policy.ip_acl_mode === 'allow') {
@@ -469,11 +468,12 @@ const rowView = (policy: PolicyRow): RowView => {
     view.countLabel = `${list.length} 条`
     if (inList) {
       view.statusClass = 'is-ok'
-      view.statusLabel = (inInline ? '✅ 已在白名单中' : `✅ 已在白名单中${view.aclHitSourceLabel}`) + trustExemptSuffix
+      view.statusLabel = inInline ? '✅ 已在白名单中' : `✅ 已在白名单中${view.aclHitSourceLabel}`
       view.canRemove = inInline
     } else {
-      view.statusClass = 'is-warn'
-      view.statusLabel = '⚠️ 不在白名单中（当前无法访问）' + trustExemptSuffix
+      view.statusClass = td1Owner ? 'is-warn' : 'is-warn'
+      // allow 交集外 = id:7 拒绝形态：无信任时确实无法访问；信任豁免中放行（记检测）
+      view.statusLabel = (td1Owner || td0Owner ? '⚠️ 不在白名单中' : '⚠️ 不在白名单中（当前无法访问）') + exemptHitSuffix + passthruSuffix
       view.canAssociateAllow = true
     }
   } else if (policy.ip_acl_mode === 'bypass') {
