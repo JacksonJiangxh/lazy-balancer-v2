@@ -140,7 +140,7 @@ import { ArrowRight } from '@element-plus/icons-vue'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import { request } from '@/utils/api'
 import { formatDate } from '@/utils/date'
-import { parseIPList, parseRefIds } from '@/utils/securityStages'
+import { parseIPList, parseRefIds, entryMatchesIp } from '@/utils/securityStages'
 import { useCrsRuleIndex } from '@/composables/useCrsRuleIndex'
 import type { APIResponse } from '@/types'
 
@@ -456,7 +456,9 @@ const allHitLists = computed(() => {
   if (!p) return []
   const refs = parseRefIds(p.ip_acl_list_refs)
   const ip = props.row?.client_ip.trim() ?? ''
-  return lists.value.filter((l) => refs.includes(l.id) && (entriesCache.value[l.id] ?? []).includes(ip))
+  // 第 60 轮用户验收：CIDR 感知匹配——威胁库条目为 CIDR（如 45.148.10.0/24），
+  // 精确串匹配漏报导致「未定位到命中的地址列表」误显
+  return lists.value.filter((l) => refs.includes(l.id) && (entriesCache.value[l.id] ?? []).some((e) => entryMatchesIp(e, ip)))
 })
 // 白名单外拒绝形态（第 59 轮补漏2）：id:5/7 = allow 交集外——IP 不在任何名单
 // 中，「命中列表」恒空是正确语义，须显式说明而非「未定位到」。

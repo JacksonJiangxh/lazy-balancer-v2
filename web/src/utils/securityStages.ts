@@ -783,3 +783,30 @@ export const compareVersion = (a: string, b: string): number => {
   }
   return 0
 }
+
+// —— CIDR 感知 IP 匹配（第 60 轮用户验收：威胁库条目为 CIDR，精确串匹配漏报） ——
+const ipv4ToLong = (ip: string): number => {
+  const parts = ip.split('.').map(Number)
+  if (parts.length !== 4 || parts.some(p => Number.isNaN(p) || p < 0 || p > 255)) return -1
+  return (((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0)
+}
+
+export const ipInCidr = (ip: string, cidr: string): boolean => {
+  const idx = cidr.indexOf('/')
+  if (idx < 0) return false
+  const base = cidr.slice(0, idx)
+  const bits = Number(cidr.slice(idx + 1))
+  if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false
+  const ipLong = ipv4ToLong(ip)
+  const baseLong = ipv4ToLong(base)
+  if (ipLong < 0 || baseLong < 0) return false
+  const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0
+  return (ipLong & mask) === (baseLong & mask)
+}
+
+/** 条目匹配：精确 IP 或 CIDR 包含 */
+export const entryMatchesIp = (entry: string, ip: string): boolean => {
+  if (entry === ip) return true
+  if (entry.includes('/')) return ipInCidr(ip, entry)
+  return false
+}

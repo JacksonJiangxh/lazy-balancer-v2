@@ -84,7 +84,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useTrustAssociation } from '@/composables/useTrustAssociation'
 import type { IpListOption } from '@/composables/useIpListAdd'
 // 分组类型路由（U8-2）：inferPolicyType 为策略类型单一实现（securityStages 导出，禁第二实现）
-import { inferPolicyType, parseIPList, parseRefIds } from '@/utils/securityStages'
+import { inferPolicyType, parseIPList, parseRefIds, entryMatchesIp } from '@/utils/securityStages'
 import type { SecurityPolicyType, SecurityPolicyTypeInput } from '@/utils/securityStages'
 import type { APIResponse } from '@/types'
 
@@ -407,13 +407,13 @@ const rowView = (policy: PolicyRow): RowView => {
   const trustRefIds = parseRefIds(policy.ip_whitelist_refs)
   view.removableTrustRefLists = ipLists.value
     .filter((l) => trustRefIds.includes(l.id) && !l.system)
-    .filter((l) => (ipListEntries.value[l.id] ?? []).includes(props.ip.trim()))
+    .filter((l) => (ipListEntries.value[l.id] ?? []).some((e) => entryMatchesIp(e, props.ip.trim())))
     .map((l) => ({ id: l.id, name: l.name }))
   // ACL 引用命中（第 58 轮补）：黑/白名单状态行标注具体来源名单名
   const aclRefIds = parseRefIds(policy.ip_acl_list_refs)
   const aclHitNames = ipLists.value
     .filter((l) => aclRefIds.includes(l.id) && !l.system)
-    .filter((l) => (ipListEntries.value[l.id] ?? []).includes(props.ip.trim()))
+    .filter((l) => (ipListEntries.value[l.id] ?? []).some((e) => entryMatchesIp(e, props.ip.trim())))
     .map((l) => l.name)
   const srcTag = (names: string[]): string =>
     names.length > 0 ? `（来自引用列表「${names.join('」「')}」）` : '（来自引用列表）'
@@ -462,11 +462,11 @@ const rowView = (policy: PolicyRow): RowView => {
   // （PUT 仅写内联 ip_acl_list），移除按钮仅对内联命中开放
   const list = mergedAclEntries(policy)
   const inInline = parseIPList(policy.ip_acl_list).includes(props.ip)
-  const inList = list.includes(props.ip)
+  const inList = list.some((e) => entryMatchesIp(e, props.ip.trim()))
 
   view.removableRefLists = ipLists.value
     .filter((l) => !l.system && parseRefIds(policy.ip_acl_list_refs).includes(l.id))
-    .filter((l) => (ipListEntries.value[l.id] ?? []).includes(props.ip.trim()))
+    .filter((l) => (ipListEntries.value[l.id] ?? []).some((e) => entryMatchesIp(e, props.ip.trim())))
     .map((l) => ({ id: l.id, name: l.name }))
   // 信任豁免组合态（第 59 轮组合语义复查）：预检信任 DetectionOnly 是事务级
   // 全局——但后缀只对「实际命中」形态有意义（deny 命中 / allow 交集外被 id:7
