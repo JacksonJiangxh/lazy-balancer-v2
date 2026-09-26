@@ -568,7 +568,13 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
 const creatingStage0 = ref(false)
 const createStage0AndTrust = async (): Promise<void> => {
   if (creatingStage0.value) return
-  const policyName = 'IP 信任'
+  // 名称冲突防御（第 60 轮）：已有同名时自动后缀去重/复用
+  const basePolicyName = 'IP 信任'
+  let policyName = basePolicyName
+  let n = 2
+  while (policies.value.some((p) => p.name === policyName)) {
+    policyName = `${basePolicyName} ${n++}`
+  }
   const listName = 'IP-信任'
   try {
     await ElMessageBox.confirm(
@@ -579,11 +585,15 @@ const createStage0AndTrust = async (): Promise<void> => {
   } catch { return }
   creatingStage0.value = true
   try {
-    // 1) 创建地址列表
-    const listRes = await request.post<APIResponse<{ id: number }>>('/security/ip-lists', {
-      name: listName, category: 'custom', entries: '[]',
-    } as never)
-    const listId = listRes.data?.id
+    // 1) 地址列表：已有同名则复用，否则创建（避免重复列表）
+    const existingList = ipLists.value.find((l) => l.name === listName && !l.system)
+    let listId = existingList?.id
+    if (!listId) {
+      const listRes = await request.post<APIResponse<{ id: number }>>('/security/ip-lists', {
+        name: listName, category: 'custom', entries: '[]',
+      } as never)
+      listId = listRes.data?.id
+    }
     if (!listId) { ElMessage.error('创建地址列表失败'); return }
     // 2) 创建 stage0 策略（td=1 保留检测）
     const policyRes = await request.post<APIResponse<{ id: number }>>('/security/policies', {
@@ -629,7 +639,8 @@ const rowActions = (row: RowView): RowAction[] => {
   // 阶段 0，阶段 1 卡出信任按钮会导致类型内容漂移且语义混乱
   const trustAllowed = policyTypeOf(row.policy) === 'stage0' || policyTypeOf(row.policy) === 'mixed'
   if (trustAllowed && row.inTrust && row.trustEnabled) {
-    // 组合语义（第 59 轮）：信任生效中——主动作=取消信任（使名单/规则恢复拦截）
+    // 组合语义（第 59 轮）：信任生效中——唯一动作=取消信任（从全部位置移除）；
+    // 逐列表/内联移除按钮在此形态下冗余且有歧义（第 60 轮用户验收裁定）
     acts.push({
       key: 'cancel-trust',
       label: '取消信任（恢复拦截）',
@@ -639,6 +650,9 @@ const rowActions = (row: RowView): RowAction[] => {
       run: () => { void cancelTrustAll(row) },
     })
   }
+  // 逐列表/内联信任移除仅在「无取消信任按钮」时出现（trustDead 条目清理场景
+  // 或信任关闭时的残留清理——cancel-trust 不覆盖这些形态）
+  const granularTrustRemove = trustAllowed && !(row.inTrust && row.trustEnabled)
   if (trustAllowed && row.canAddTrust) {
     const list = resolveSideList(row.policy, 'trust')
     acts.push({
@@ -687,10 +701,10 @@ const rowActions = (row: RowView): RowAction[] => {
       },
     })
   }
-  if (trustAllowed) for (const m of row.removableTrustRefLists) {
+  if (granularTrustRemove) for (const m of row.removableTrustRefLists) {
     acts.push({ key: `unt-${m.id}`, label: `从「${m.name}」移除信任`, type: 'success', run: () => { void removeFromSideRef(m, props.ip.trim()) } })
   }
-  if (trustAllowed && row.canRemoveTrust) {
+  if (granularTrustRemove && row.canRemoveTrust) {
     acts.push({ key: 'unt-in', label: '从内联信任移除', type: 'success', loading: isBusy(pid, 'untrust'), run: () => { void removeTrust(row.policy) } })
   }
   if (trustAllowed && row.canClearDeadTrust) {
