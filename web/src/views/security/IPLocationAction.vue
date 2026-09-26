@@ -371,7 +371,10 @@ const rowView = (policy: PolicyRow): RowView => {
     geoActive: false,
     geoRegions: '',
   }
-  view.canAddTrust = !view.inTrust
+  // 第 59 轮验收复查：信任豁免为全局生效（预检 DetectionOnly 事务级）——IP 已被
+  // 任一策略信任时，「信任此 IP」按钮冗余（再加只是重复豁免，且会使策略类型
+  // 内容漂移），不再显示；主动作归「取消信任」（豁免方策略卡上）。
+  view.canAddTrust = !view.inTrust && !policies.value.some((p) => mergedTrustEntries(p).includes(props.ip))
   view.canRemoveTrust = view.inTrust && view.trustEnabled && view.inTrustInline
   view.trustDead = view.inTrust && !view.trustEnabled
   view.canClearDeadTrust = view.trustDead && view.inTrustInline
@@ -551,7 +554,7 @@ const rowActions = (row: RowView): RowAction[] => {
     })
   }
   if (row.canRemove) {
-    acts.push({ key: 'rm-inline', label: '从内联黑名单移除', type: 'danger', loading: isBusy(pid, 'remove'), run: () => { void removeFromAcl(row.policy) } })
+    acts.push({ key: 'rm-inline', label: `从内联${row.policy.ip_acl_mode === 'allow' ? '白' : '黑'}名单移除`, type: 'danger', loading: isBusy(pid, 'remove'), run: () => { void removeFromAcl(row.policy) } })
   }
   for (const m of row.removableRefLists) {
     acts.push({ key: `rm-${m.id}`, label: `从「${m.name}」移除`, type: 'danger', loading: isBusy(pid, `remove-ref-${m.id}`), run: () => { void removeFromSideRef(m, props.ip.trim()) } })
@@ -676,7 +679,7 @@ const removeFromAcl = async (policy: PolicyRow): Promise<void> => {
       return
     }
     const mode = detail.ip_acl_mode
-    const listLabel = mode === 'allow' ? '白名单' : '拒绝列表'
+    const listLabel = mode === 'allow' ? '白名单' : '黑名单'  // 与按钮/标签同词（原「拒绝列表」口径不一）
     let tip: string
     if (!detail.ip_acl_enabled) {
       tip = 'IP 访问控制当前未启用，仅清理列表条目。'
