@@ -31,12 +31,28 @@
     <el-alert v-else-if="policiesError" type="error" :closable="false" title="策略列表加载失败" />
     <template v-else-if="rows.length > 0">
       <div v-if="groupedRows.offstage > 0" class="ipo-tip">另有 {{ groupedRows.offstage }} 条限流/WAF 策略不涉及 IP 管控</div>
-      <!-- 阶段 0 空态（第 60 轮用户裁定）：无信任策略时引导创建而非静默隐藏 -->
+      <!-- 阶段 0 空态（第 60 轮用户裁定）：无信任策略时提供一键「创建并信任」入口 -->
       <div v-if="groupedRows.stage0.length === 0 && rows.length > 0" class="ipo-sec">
         <div class="ipo-sec-title">阶段 0 · 信任名单</div>
         <div class="ipo-card">
-          <div class="ipo-status">未绑定信任策略——如需信任此 IP，请先到「安全防护 → 安全策略」创建阶段 0 策略并绑定到对应规则</div>
+          <div class="ipo-status">该规则未绑定信任策略</div>
+          <div class="ipo-acts">
+            <el-button
+              size="small" type="success" plain
+              :loading="creatingStage0"
+              @click="createStage0AndTrust"
+            >创建信任策略并信任此 IP</el-button>
+          </div>
         </div>
+      </div>
+
+      <!-- 阶段 0 有策略但无信任地址列表：提示创建列表并加入 -->
+      <div v-for="group in visibleGroups" :key="'empty-' + group.key">
+        <template v-if="group.key === 'stage0'">
+          <div v-for="row in group.rows.filter(r => !r.inTrust && r.trustCount === 0)" :key="'et' + row.policy.id" class="ipo-tip" style="padding: 0 10px 4px;">
+            <el-button size="small" type="success" plain :loading="busyTrust || trustCreating" @click="createTrustListAndJoin(row.policy)">创建「{{ row.policy.name }}-信任」并加入此 IP</el-button>
+          </div>
+        </template>
       </div>
       <div v-for="group in visibleGroups" :key="group.key" class="ipo-sec">
         <div class="ipo-sec-title">{{ group.title }}</div>
@@ -545,6 +561,58 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
   } finally {
     unlockBusy(row.policy.id, 'untrust')
   }
+}
+
+// —— 阶段 0 空态一键创建（第 60 轮用户裁定）：无 stage0 策略时直接创建
+// 「IP 信任」策略（stage0, td=1 保留检测）+ 信任列表 + 绑定到当前规则 + 加入 IP。
+const creatingStage0 = ref(false)
+const createStage0AndTrust = async (): Promise<void> => {
+  if (creatingStage0.value) return
+  try {
+    await ElMessageBox.confirm(
+      `将创建阶段 0 信任策略「IP 信任」（保留检测记录）+ 地址列表「IP-信任」，绑定到当前规则并加入 ${props.ip}。是否继续？`,
+      '创建信任策略',
+      { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' },
+    )
+  } catch { return }
+  creatingStage0.value = true
+  try {
+    // 1) 创建地址列表
+    const listRes = await request.post<APIResponse<{ id: number }>>('/security/ip-lists', {
+      name: 'IP-信任', category: 'custom', entries: '[]',
+    } as never)
+    const listId = listRes.data?.id
+    if (!listId) { ElMessage.error('创建地址列表失败'); return }
+    // 2) 创建 stage0 策略（td=1 保留检测）
+    const policyRes = await request.post<APIResponse<{ id: number }>>('/security/policies', {
+      name: 'IP 信任', policy_type: 'stage0', enabled: true,
+      ip_whitelist_enabled: true, trust_detection: true,
+      ip_whitelist: '[]', ip_whitelist_refs: JSON.stringify([listId]),
+      ip_blacklist: '[]',
+    } as never)
+    const policyId = policyRes.data?.id
+    if (!policyId) { ElMessage.error('创建策略失败'); return }
+    // 3) 加入 IP
+    await request.post(`/security/ip-lists/${listId}/ips`, { value: props.ip })
+    // 4) 绑定到当前规则
+    if (props.ruleCaddyId) {
+      await request.post('/security/policies/batch-bind', {
+        rule_ids: [props.ruleCaddyId], policy_ids: [policyId],
+      } as never)
+    }
+    ElMessage.success(`已创建「IP 信任」策略并信任 ${props.ip}`)
+    ipListEntries.value = {}
+    await loadPolicies()
+  } catch {
+    // 失败提示由全局拦截器弹出
+  } finally {
+    creatingStage0.value = false
+  }
+}
+
+// 阶段 0 有策略但无信任列表：创建列表并关联+加入
+const createTrustListAndJoin = async (policy: PolicyRow): Promise<void> => {
+  await ensureListAndJoin(policy, props.ip.trim(), 'trust')
 }
 
 const rows = computed<RowView[]>(() => policies.value.map(rowView))
