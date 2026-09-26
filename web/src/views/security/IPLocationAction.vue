@@ -31,28 +31,12 @@
     <el-alert v-else-if="policiesError" type="error" :closable="false" title="策略列表加载失败" />
     <template v-else-if="rows.length > 0">
       <div v-if="groupedRows.offstage > 0" class="ipo-tip">另有 {{ groupedRows.offstage }} 条限流/WAF 策略不涉及 IP 管控</div>
-      <!-- 阶段 0 空态（第 60 轮用户裁定）：无信任策略时提供一键「创建并信任」入口 -->
+      <!-- 阶段 0 空态（第 60 轮用户裁定：提示创建，不自动代建） -->
       <div v-if="groupedRows.stage0.length === 0 && rows.length > 0" class="ipo-sec">
         <div class="ipo-sec-title">阶段 0 · 信任名单</div>
         <div class="ipo-card">
-          <div class="ipo-status">该规则未绑定信任策略</div>
-          <div class="ipo-acts">
-            <el-button
-              size="small" type="success" plain
-              :loading="creatingStage0"
-              @click="createStage0AndTrust"
-            >信任此 IP（创建「IP 信任」）</el-button>
-          </div>
+          <div class="ipo-status">该规则未绑定信任策略——请到「安全防护 → 安全策略」创建阶段 0 策略并绑定后，再从此弹框信任此 IP</div>
         </div>
-      </div>
-
-      <!-- 阶段 0 有策略但无信任地址列表：提示创建列表并加入 -->
-      <div v-for="group in visibleGroups" :key="'empty-' + group.key">
-        <template v-if="group.key === 'stage0'">
-          <div v-for="row in group.rows.filter(r => !r.inTrust && r.trustCount === 0)" :key="'et' + row.policy.id" class="ipo-tip" style="padding: 0 10px 4px;">
-            <el-button size="small" type="success" plain :loading="busyTrust || trustCreating" @click="createTrustListAndJoin(row.policy)">创建「{{ row.policy.name }}-信任」并加入此 IP</el-button>
-          </div>
-        </template>
       </div>
       <div v-for="group in visibleGroups" :key="group.key" class="ipo-sec">
         <div class="ipo-sec-title">{{ group.title }}</div>
@@ -74,7 +58,8 @@
           <div v-if="row.trustDead" class="ipo-legacy">该 IP 的信任条目存在，但策略的信任名单已关闭——条目暂不生效</div>
           <div v-if="rowActions(row).length > 0" class="ipo-acts">
             <template v-for="act in rowActions(row)" :key="act.key">
-              <el-tooltip v-if="act.tip" :content="act.tip" placement="top">
+              <span v-if="!act.run" class="ipo-act-hint">{{ act.label }}</span>
+              <el-tooltip v-else-if="act.tip" :content="act.tip" placement="top">
                 <el-button size="small" :type="act.type" plain :loading="act.loading" @click="act.run()">{{ act.label }}</el-button>
               </el-tooltip>
               <el-button v-else size="small" :type="act.type" plain :loading="act.loading" @click="act.run()">{{ act.label }}</el-button>
@@ -563,75 +548,11 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
   }
 }
 
-// —— 阶段 0 空态一键创建（第 60 轮用户裁定）：无 stage0 策略时直接创建
-// 「IP 信任」策略（stage0, td=1 保留检测）+ 信任列表 + 绑定到当前规则 + 加入 IP。
-const creatingStage0 = ref(false)
-const createStage0AndTrust = async (): Promise<void> => {
-  if (creatingStage0.value) return
-  // 名称冲突防御（第 60 轮）：已有同名时自动后缀去重/复用
-  const basePolicyName = 'IP 信任'
-  let policyName = basePolicyName
-  let n = 2
-  while (policies.value.some((p) => p.name === policyName)) {
-    policyName = `${basePolicyName} ${n++}`
-  }
-  const listName = 'IP-信任'
-  try {
-    await ElMessageBox.confirm(
-      `将创建阶段 0 信任策略「${policyName}」（保留检测记录）+ 地址列表「${listName}」，绑定到当前规则并加入 ${props.ip}。创建后可到安全策略页修改名称。`,
-      `信任此 IP（创建「${policyName}」）`,
-      { confirmButtonText: '创建并信任', cancelButtonText: '取消', type: 'info' },
-    )
-  } catch { return }
-  creatingStage0.value = true
-  try {
-    // 1) 地址列表：已有同名则复用，否则创建（避免重复列表）
-    const existingList = ipLists.value.find((l) => l.name === listName && !l.system)
-    let listId = existingList?.id
-    if (!listId) {
-      const listRes = await request.post<APIResponse<{ id: number }>>('/security/ip-lists', {
-        name: listName, category: 'custom', entries: '[]',
-      } as never)
-      listId = listRes.data?.id
-    }
-    if (!listId) { ElMessage.error('创建地址列表失败'); return }
-    // 2) 创建 stage0 策略（td=1 保留检测）
-    const policyRes = await request.post<APIResponse<{ id: number }>>('/security/policies', {
-      name: policyName, policy_type: 'stage0', enabled: true,
-      ip_whitelist_enabled: true, trust_detection: true,
-      ip_whitelist: '[]', ip_whitelist_refs: JSON.stringify([listId]),
-      ip_blacklist: '[]',
-    } as never)
-    const policyId = policyRes.data?.id
-    if (!policyId) { ElMessage.error('创建策略失败'); return }
-    // 3) 加入 IP
-    await request.post(`/security/ip-lists/${listId}/ips`, { value: props.ip })
-    // 4) 绑定到当前规则
-    if (props.ruleCaddyId) {
-      await request.post('/security/policies/batch-bind', {
-        rule_ids: [props.ruleCaddyId], policy_ids: [policyId],
-      } as never)
-    }
-    ElMessage.success(`已创建「${policyName}」策略并信任 ${props.ip}`)
-    ipListEntries.value = {}
-    await loadPolicies()
-  } catch {
-    // 失败提示由全局拦截器弹出
-  } finally {
-    creatingStage0.value = false
-  }
-}
-
-// 阶段 0 有策略但无信任列表：创建列表并关联+加入
-const createTrustListAndJoin = async (policy: PolicyRow): Promise<void> => {
-  await ensureListAndJoin(policy, props.ip.trim(), 'trust')
-}
-
 const rows = computed<RowView[]>(() => policies.value.map(rowView))
 
 // 行内上下文动作（第 58 轮交互重构）：按行状态只出现该出现的动作。
 // 顺序 = 信任（绿）→ 黑名单移除（红）→ 关联拦截/放行（红/蓝）→ 信任移除（绿）。
-interface RowAction { key: string; label: string; type: 'primary' | 'success' | 'warning' | 'danger' | 'info'; loading?: boolean; tip?: string; run: () => void }
+interface RowAction { key: string; label: string; type: 'primary' | 'success' | 'warning' | 'danger' | 'info'; loading?: boolean; tip?: string; run?: () => void }
 const rowActions = (row: RowView): RowAction[] => {
   const acts: RowAction[] = []
   const pid = row.policy.id
@@ -655,16 +576,24 @@ const rowActions = (row: RowView): RowAction[] => {
   const granularTrustRemove = trustAllowed && !(row.inTrust && row.trustEnabled)
   if (trustAllowed && row.canAddTrust) {
     const list = resolveSideList(row.policy, 'trust')
-    acts.push({
-      key: 'trust',
-      label: list ? `信任此 IP（加入「${list.name}」）` : `信任此 IP（创建「${row.policy.name}-信任」）`,
-      type: 'success',
-      // trustCreating 无 policy 维度：任一行创建期间全部 trust 按钮同转——
-      // 创建流程有确认弹框阻塞、窗口极短，接受现状（第 59 轮 R59-P5 备查）。
-      loading: busyTrust.value || trustCreating.value,
-      tip: row.trustEnabled ? undefined : '该策略信任名单已关闭：加入后暂不生效，启用后自动生效',
-      run: () => { void ensureListAndJoin(row.policy, props.ip.trim(), 'trust') },
-    })
+    if (list) {
+      // 已有信任用途列表：单击加入
+      acts.push({
+        key: 'trust',
+        label: `信任此 IP（加入「${list.name}」）`,
+        type: 'success',
+        loading: busyTrust.value || trustCreating.value,
+        tip: row.trustEnabled ? undefined : '该策略信任名单已关闭：加入后暂不生效，启用后自动生效',
+        run: () => { void ensureListAndJoin(row.policy, props.ip.trim(), 'trust') },
+      })
+    } else {
+      // 无信任列表：提示用户到安全策略页创建（第 60 轮用户裁定：不自动代建）
+      acts.push({
+        key: 'trust-hint',
+        label: '该策略未关联信任地址列表——请到「安全防护 → 安全策略」编辑该策略并添加信任列表后操作',
+        type: 'info',
+      })
+    }
   }
   if (row.canRemove) {
     acts.push({ key: 'rm-inline', label: `从内联${row.policy.ip_acl_mode === 'allow' ? '白' : '黑'}名单移除`, type: 'danger', loading: isBusy(pid, 'remove'), run: () => { void removeFromAcl(row.policy) } })
@@ -675,31 +604,48 @@ const rowActions = (row: RowView): RowAction[] => {
   const aclOffTip = row.policy.ip_acl_enabled === false ? '该策略 IP 访问控制未启用：加入后暂不拦截，启用后生效' : undefined
   if (row.canAssociate) {
     const list = resolveSideList(row.policy, 'deny')
-    acts.push({
-      key: 'assoc',
-      label: list ? `拦截此 IP（加入「${list.name}」）` : `拦截此 IP（创建「${row.policy.name}-黑名单」）`,
-      type: 'danger',
-      loading: isBusy(pid, 'associate'),
-      tip: aclOffTip,
-      run: () => {
-        if (!lockBusy(pid, 'associate')) return
-        void ensureListAndJoin(row.policy, props.ip.trim(), 'deny').finally(() => unlockBusy(pid, 'associate'))
-      },
-    })
+    if (list) {
+      acts.push({
+        key: 'assoc',
+        label: `拦截此 IP（加入「${list.name}」）`,
+        type: 'danger',
+        loading: isBusy(pid, 'associate'),
+        tip: aclOffTip,
+        run: () => {
+          if (!lockBusy(pid, 'associate')) return
+          void ensureListAndJoin(row.policy, props.ip.trim(), 'deny').finally(() => unlockBusy(pid, 'associate'))
+        },
+      })
+    } else {
+      // 无黑名单列表：提示（第 60 轮用户裁定：不自动代建）
+      acts.push({
+        key: 'deny-hint',
+        label: '该策略未关联黑名单地址列表——请到「安全防护 → 安全策略」编辑该策略并添加黑名单列表后操作',
+        type: 'info',
+      })
+    }
   }
   if (row.canAssociateAllow) {
     const list = resolveSideList(row.policy, 'allow')
-    acts.push({
-      key: 'assoc-a',
-      label: list ? `放行此 IP（加入「${list.name}」）` : `放行此 IP（创建「${row.policy.name}-白名单」）`,
-      type: 'primary',
-      loading: isBusy(pid, 'associate-allow'),
-      tip: aclOffTip,
-      run: () => {
-        if (!lockBusy(pid, 'associate-allow')) return
-        void ensureListAndJoin(row.policy, props.ip.trim(), 'allow').finally(() => unlockBusy(pid, 'associate-allow'))
-      },
-    })
+    if (list) {
+      acts.push({
+        key: 'assoc-a',
+        label: `放行此 IP（加入「${list.name}」）`,
+        type: 'primary',
+        loading: isBusy(pid, 'associate-allow'),
+        tip: aclOffTip,
+        run: () => {
+          if (!lockBusy(pid, 'associate-allow')) return
+          void ensureListAndJoin(row.policy, props.ip.trim(), 'allow').finally(() => unlockBusy(pid, 'associate-allow'))
+        },
+      })
+    } else {
+      acts.push({
+        key: 'allow-hint',
+        label: '该策略未关联白名单地址列表——请到「安全防护 → 安全策略」编辑该策略并添加白名单列表后操作',
+        type: 'info',
+      })
+    }
   }
   if (granularTrustRemove) for (const m of row.removableTrustRefLists) {
     acts.push({ key: `unt-${m.id}`, label: `从「${m.name}」移除信任`, type: 'success', run: () => { void removeFromSideRef(m, props.ip.trim()) } })
@@ -895,5 +841,6 @@ const removeTrust = async (policy: PolicyRow): Promise<void> => {
 /* 动作区：语义配色按钮流 */
 .ip-location-popper .ipo-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .ip-location-popper .ipo-acts .el-button { margin-left: 0; }
+.ip-location-popper .ipo-act-hint { font-size: 11px; color: var(--el-text-color-secondary); flex-basis: 100%; }
 .ip-location-popper .ipo-tip { font-size: 12px; color: var(--text-secondary, #909399); padding: 4px 0; }
 </style>
