@@ -568,23 +568,14 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
 const creatingStage0 = ref(false)
 const createStage0AndTrust = async (): Promise<void> => {
   if (creatingStage0.value) return
-  let listName: string
-  let policyName: string
+  const policyName = 'IP 信任'
+  const listName = 'IP-信任'
   try {
-    const { value } = await ElMessageBox.prompt(
-      '将创建阶段 0 信任策略（保留检测记录）并绑定到当前规则，可自定义名称：',
-      `信任此 IP（创建策略并加入 ${props.ip}）`,
-      {
-        confirmButtonText: '创建并信任',
-        cancelButtonText: '取消',
-        type: 'info',
-        inputValue: 'IP 信任',
-        inputPattern: /\S+/,
-        inputErrorMessage: '策略名不能为空',
-      },
+    await ElMessageBox.confirm(
+      `将创建阶段 0 信任策略「${policyName}」（保留检测记录）+ 地址列表「${listName}」，绑定到当前规则并加入 ${props.ip}。创建后可到安全策略页修改名称。`,
+      `信任此 IP（创建「${policyName}」）`,
+      { confirmButtonText: '创建并信任', cancelButtonText: '取消', type: 'info' },
     )
-    policyName = value.trim()
-    listName = `${policyName}-信任`
   } catch { return }
   creatingStage0.value = true
   try {
