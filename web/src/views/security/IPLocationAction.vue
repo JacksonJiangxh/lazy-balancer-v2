@@ -192,7 +192,7 @@ const trustApi = useTrustAssociation({
     return loadPolicies()
   },
 })
-const { busyTrust, creating: trustCreating, resolveSideList, ensureListAndJoin, removeFromSideRef } = trustApi
+const { busyTrust, creating: trustCreating, resolveSideLists, joinSpecificList, removeFromSideRef } = trustApi
 
 const policies = ref<PolicyRow[]>([])
 const policiesLoading = ref(false)
@@ -575,19 +575,20 @@ const rowActions = (row: RowView): RowAction[] => {
   // 或信任关闭时的残留清理——cancel-trust 不覆盖这些形态）
   const granularTrustRemove = trustAllowed && !(row.inTrust && row.trustEnabled)
   if (trustAllowed && row.canAddTrust) {
-    const list = resolveSideList(row.policy, 'trust')
-    if (list) {
-      // 已有信任用途列表：单击加入
-      acts.push({
-        key: 'trust',
-        label: `信任此 IP（加入「${list.name}」）`,
-        type: 'success',
-        loading: busyTrust.value || trustCreating.value,
-        tip: row.trustEnabled ? undefined : '该策略信任名单已关闭：加入后暂不生效，启用后自动生效',
-        run: () => { void ensureListAndJoin(row.policy, props.ip.trim(), 'trust') },
-      })
+    const trustLists = resolveSideLists(row.policy, 'trust')
+    if (trustLists.length > 0) {
+      // 逐列表出按钮（第 60 轮用户验收：多列表绑定时各出一个，不再只取第一个）
+      for (const list of trustLists) {
+        acts.push({
+          key: `trust-${list.id}`,
+          label: `信任此 IP（加入「${list.name}」）`,
+          type: 'success',
+          loading: busyTrust.value || trustCreating.value,
+          tip: row.trustEnabled ? undefined : '该策略信任名单已关闭：加入后暂不生效，启用后自动生效',
+          run: () => { void joinSpecificList(list, props.ip.trim(), '信任') },
+        })
+      }
     } else {
-      // 无信任列表：提示用户到安全策略页创建（第 60 轮用户裁定：不自动代建）
       acts.push({
         key: 'trust-hint',
         label: '该策略未关联信任地址列表——请到「安全防护 → 安全策略」编辑该策略并添加信任列表后操作',
@@ -603,21 +604,22 @@ const rowActions = (row: RowView): RowAction[] => {
   }
   const aclOffTip = row.policy.ip_acl_enabled === false ? '该策略 IP 访问控制未启用：加入后暂不拦截，启用后生效' : undefined
   if (row.canAssociate) {
-    const list = resolveSideList(row.policy, 'deny')
-    if (list) {
-      acts.push({
-        key: 'assoc',
-        label: `拦截此 IP（加入「${list.name}」）`,
-        type: 'danger',
-        loading: isBusy(pid, 'associate'),
-        tip: aclOffTip,
-        run: () => {
-          if (!lockBusy(pid, 'associate')) return
-          void ensureListAndJoin(row.policy, props.ip.trim(), 'deny').finally(() => unlockBusy(pid, 'associate'))
-        },
-      })
+    const denyLists = resolveSideLists(row.policy, 'deny')
+    if (denyLists.length > 0) {
+      for (const list of denyLists) {
+        acts.push({
+          key: `assoc-${list.id}`,
+          label: `拦截此 IP（加入「${list.name}」）`,
+          type: 'danger',
+          loading: isBusy(pid, `associate-${list.id}`),
+          tip: aclOffTip,
+          run: () => {
+            if (!lockBusy(pid, `associate-${list.id}`)) return
+            void joinSpecificList(list, props.ip.trim(), '拦截').finally(() => unlockBusy(pid, `associate-${list.id}`))
+          },
+        })
+      }
     } else {
-      // 无黑名单列表：提示（第 60 轮用户裁定：不自动代建）
       acts.push({
         key: 'deny-hint',
         label: '该策略未关联黑名单地址列表——请到「安全防护 → 安全策略」编辑该策略并添加黑名单列表后操作',
@@ -626,19 +628,21 @@ const rowActions = (row: RowView): RowAction[] => {
     }
   }
   if (row.canAssociateAllow) {
-    const list = resolveSideList(row.policy, 'allow')
-    if (list) {
-      acts.push({
-        key: 'assoc-a',
-        label: `放行此 IP（加入「${list.name}」）`,
-        type: 'primary',
-        loading: isBusy(pid, 'associate-allow'),
-        tip: aclOffTip,
-        run: () => {
-          if (!lockBusy(pid, 'associate-allow')) return
-          void ensureListAndJoin(row.policy, props.ip.trim(), 'allow').finally(() => unlockBusy(pid, 'associate-allow'))
-        },
-      })
+    const allowLists = resolveSideLists(row.policy, 'allow')
+    if (allowLists.length > 0) {
+      for (const list of allowLists) {
+        acts.push({
+          key: `assoc-a-${list.id}`,
+          label: `放行此 IP（加入「${list.name}」）`,
+          type: 'primary',
+          loading: isBusy(pid, `associate-a-${list.id}`),
+          tip: aclOffTip,
+          run: () => {
+            if (!lockBusy(pid, `associate-a-${list.id}`)) return
+            void joinSpecificList(list, props.ip.trim(), '放行').finally(() => unlockBusy(pid, `associate-a-${list.id}`))
+          },
+        })
+      }
     } else {
       acts.push({
         key: 'allow-hint',

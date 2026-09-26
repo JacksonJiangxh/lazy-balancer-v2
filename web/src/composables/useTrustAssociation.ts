@@ -39,6 +39,7 @@ export interface TrustPolicyLike {
 export interface TrustListRef {
   id: number
   name: string
+  entry_count?: number
   /** system=内置威胁名单（只读）——两种组件来源的类型宽窄不一，故此处放宽 */
   system?: number | boolean
 }
@@ -59,6 +60,21 @@ export const useTrustAssociation = (options: {
   }
   /** 兼容别名：信任侧列表解析 */
   const resolveTrustList = (policy: TrustPolicyLike): TrustListRef | null => resolveSideList(policy, 'trust')
+
+  /** 同侧全部非系统列表（第 60 轮用户验收：多列表绑定时逐列表出按钮，不再只取第一个） */
+  const resolveSideLists = (policy: TrustPolicyLike, side: ListSide): IpListOption[] => {
+    const refs = parseRefIds(policy[SIDE_CONFIG[side].refField])
+    return options.getList()
+      .filter((l) => refs.includes(l.id) && !l.system)
+      .map((l) => ({ id: l.id, name: l.name, entry_count: l.entry_count ?? 0 }))
+  }
+
+  /** 加入指定列表（确认+幂等+反馈，第 60 轮暴露供逐列表按钮直调） */
+  const joinSpecificList = async (list: IpListOption, ip: string, verb = '加入'): Promise<boolean> => {
+    const done = await addIpToList(ip, list, { verb, successText: `已${verb}——已加入列表「${list.name}」` })
+    if (done) await options.onChanged?.()
+    return done
+  }
 
   /** 单击动作：把 IP 加入策略指定侧的列表（自动解析/创建目标列表并关联） */
   const ensureListAndJoin = async (policy: TrustPolicyLike, ip: string, side: ListSide): Promise<void> => {
@@ -146,5 +162,5 @@ export const useTrustAssociation = (options: {
     await removeFromSideRef(list, ip)
   }
 
-  return { busyTrust: adding, creating, resolveTrustList, resolveSideList, ensureListAndJoin, joinTrust, removeFromSideRef, removeFromTrustRef }
+  return { busyTrust: adding, creating, resolveTrustList, resolveSideList, resolveSideLists, joinSpecificList, ensureListAndJoin, joinTrust, removeFromSideRef, removeFromTrustRef }
 }
