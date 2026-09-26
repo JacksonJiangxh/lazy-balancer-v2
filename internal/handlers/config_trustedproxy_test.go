@@ -80,6 +80,11 @@ func TestUpdateConfig_trustedProxy_rejectsOverwideRanges(t *testing.T) {
 		{"v4 /0", `["0.0.0.0/0"]`},
 		{"v6 /95", `["2001:db8::/95"]`},
 		{"v6 /0", `["::/0"]`},
+		// 第 59 轮 R59-P3（U4-1）：/8 恰好等于下限但覆盖整个 IPv4 空间——
+		// 「信任全体 IPv4」形态必须拒绝；v4-mapped /96 同义（Is6 含 mapped，
+		// 内嵌全零 v4 = 全体 IPv4）。
+		{"v4 全空间 /8", `["0.0.0.0/8"]`},
+		{"v4-mapped 全空间 /96", `["::ffff:0:0/96"]`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := `{"source":"caddy","trusted_proxy_enabled":true,"trusted_proxy_ranges":"` +

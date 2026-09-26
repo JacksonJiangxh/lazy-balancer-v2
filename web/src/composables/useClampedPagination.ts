@@ -10,7 +10,7 @@ export function useClampedPagination<T>(items: Ref<T[]> | ComputedRef<T[]>, page
   const maxPage = computed(() => Math.max(1, Math.ceil(items.value.length / pageSize.value)))
   watch(maxPage, () => {
     if (page.value > maxPage.value) page.value = maxPage.value
-  })
+  }, { immediate: true }) // 第 59 轮 R59-P5：恢复态初始 page>maxPage 立即夹紧
   const pagedItems = computed(() => {
     const start = (page.value - 1) * pageSize.value
     return items.value.slice(start, start + pageSize.value)

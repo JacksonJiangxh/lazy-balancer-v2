@@ -263,3 +263,34 @@ func TestBuildCorazaDirectives_multiPolicyAllowSelfTrustExclusion(t *testing.T) 
 		t.Fatalf("信任排除文件=%q, want 仅 10.0.0.1/32", got)
 	}
 }
+
+// 第 59 轮 R59-P3（U5-2）：a==b 字面捷径不得免检——两条 allow 名单含同一坏
+// 条目（集群同步/带外改库可注入，保存面校验不覆盖存量行）时，交集被坏条目
+// 顶成非空，恒拒规则（id:7 @rx .*）不发射、改发含坏行投影 → @ipListFast
+// 构建期 fail-closed 整份渲染失败。与聚合面「不可解析不参与匹配」同口径：
+// 非法元素返回 ""（不参与交集）。
+func TestCidrIntersectEntry_equalButInvalidDropped(t *testing.T) {
+	if got := cidrIntersectEntry("not-an-ip", "not-an-ip"); got != "" {
+		t.Fatalf("字面相等但非法的条目应丢弃: got=%q", got)
+	}
+	// 合法相等条目保持原样返回
+	if got := cidrIntersectEntry("203.0.113.7", "203.0.113.7"); got != "203.0.113.7" {
+		t.Fatalf("合法相等条目应保留: got=%q", got)
+	}
+	if got := cidrIntersectEntry("10.0.0.0/24", "10.0.0.0/24"); got != "10.0.0.0/24" {
+		t.Fatalf("合法相等 CIDR 应保留: got=%q", got)
+	}
+}
+
+// 全链形状：两条 allow 名单共享同一坏条目时，交集不得因坏条目变非空。
+func TestIntersectIPLists_badEntryDoesNotFabricateIntersection(t *testing.T) {
+	got := intersectIPLists([][]string{
+		{"1.2.3.4", "garbage-entry"},
+		{"garbage-entry"},
+	})
+	for _, e := range got {
+		if e == "garbage-entry" {
+			t.Fatalf("交集不得含坏条目: %v", got)
+		}
+	}
+}

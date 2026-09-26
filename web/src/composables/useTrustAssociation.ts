@@ -82,19 +82,29 @@ export const useTrustAssociation = (options: {
     }
     creating.value = true
     try {
-      const created = await request.post<APIResponse<{ id: number }>>('/security/ip-lists', {
-        name: `${policy.name}${cfg.suffix}`,
-        category: 'custom',
-        entries: '[]',
-      } as never)
-      const newId = created.data?.id
-      if (!newId) return
+      // 第 59 轮 R59-P5：同侧已有同名未引用列表（历史创建后解绑）时复用而非
+      // 重复创建——按名称在现有列表中查找（category 无关，仅看名字精确相等）。
+      const wantName = `${policy.name}${cfg.suffix}`
+      const sameName = options.getList().find((l) => l.name === wantName && !l.system)
+      let newId: number | undefined = sameName?.id
+      if (!newId) {
+        const created = await request.post<APIResponse<{ id: number }>>('/security/ip-lists', {
+          name: wantName,
+          category: 'custom',
+          entries: '[]',
+        } as never)
+        newId = created.data?.id
+      }
+      if (!newId) {
+        ElMessage.error(`列表「${wantName}」创建响应异常，请重试`)
+        return
+      }
       const refs = parseRefIds(policy[cfg.refField])
       if (!refs.includes(newId)) {
         await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...refs, newId]) })
       }
       const added = await request.post<APIResponse<{ added: boolean }>>(`/security/ip-lists/${newId}/ips`, { value: ip })
-      showSaveResult(added as unknown as { message?: string }, `已创建「${policy.name}${cfg.suffix}」并加入 ${ip}`)
+      showSaveResult(added as unknown as { message?: string }, `已${sameName ? '关联既有' : '创建'}「${policy.name}${cfg.suffix}」并加入 ${ip}`)
       await options.onChanged?.()
     } catch {
       // 失败提示由全局拦截器弹出

@@ -68,6 +68,7 @@ func ResetThreatUpdateManagerForTest() {
 		threatUpdateManager.StopScheduler()
 	}
 	threatUpdateManager = &ThreatUpdateManager{}
+	threatReloadPending = false
 }
 
 func (m *ThreatUpdateManager) IsRunning() bool {
@@ -101,6 +102,12 @@ func (m *ThreatUpdateManager) StatusSnapshot() ThreatTaskStatus {
 // 引用名单的策略渲染产物（@ipListFast 文件）随新内容收敛，否则更新「成功」
 // 但拦截面不变。
 var threatReloader func() error
+
+// threatReloadPending 上一轮重载失败标记（第 59 轮 R59-P2 自愈）：失败后置位，
+// 下一轮即使全部源内容未变也强制重载一次（哈希已持久化，「unchanged」快路径
+// 永不再触发重载的缺口由本标记闭合）；成功即清位。进程重启后启动应用从 DB
+// 渲染，天然收敛，无需持久化。
+var threatReloadPending bool
 
 // SetThreatReloader 注册重载回调（nil=清除，测试用）。
 func SetThreatReloader(fn func() error) {
@@ -202,16 +209,33 @@ func threatListEmpty(source string) bool {
 }
 
 func (m *ThreatUpdateManager) run(trigger string) {
+	// 起点角色复查（第 59 轮 R59-P3，R54-N5 家族收敛）：调度器 tick 的 is_master
+	// 守卫与更新启动之间存在 demote 竞态窗口——从节点继续执行会写
+	// security_ip_lists 并触发重载，打破只读不变量。NULL 兜底归一为 1（同
+	// crsupdate/ip2regionupdate 口径）。
+	var isMaster bool
+	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
+		AppendThreatUpdateLog("WARN", "skipped", "当前节点为从节点，终止威胁情报库更新")
+		return
+	}
 	m.mu.Lock()
 	m.lastTrigger = trigger
 	m.lastStartedAt = time.Now().UTC().Format(crsTimeLayout)
 	m.mu.Unlock()
 	sources, err := threatDueSources(trigger)
+	finishWith := func(outcome string) {
+		m.mu.Lock()
+		m.lastFinishedAt = time.Now().UTC().Format(crsTimeLayout)
+		m.lastTaskOutcome = outcome
+		m.mu.Unlock()
+	}
 	if err != nil {
 		Logf("error", "威胁情报库: 读取源列表失败: %v", err)
+		finishWith("failed") // 第 59 轮 R59-P5：早退路径同样落终态，状态端点不失真
 		return
 	}
 	if len(sources) == 0 {
+		finishWith("success")
 		return
 	}
 	AppendThreatUpdateLog("INFO", "checking", fmt.Sprintf("开始更新威胁情报库（%d 个启用源）", len(sources)))
@@ -237,19 +261,27 @@ func (m *ThreatUpdateManager) run(trigger string) {
 	// 名单内容变化 → 一次重载（引用名单的策略渲染随新内容收敛）。
 	// 重载门（2026-09-24 用户裁定）：变化的名单须被启用策略引用才重载——
 	// 无引用方的变化不打扰在役配置。
-	if len(changedIDs) == 0 {
+	forceReload := threatReloadPending
+	if len(changedIDs) == 0 && !forceReload {
 		AppendThreatUpdateLog("INFO", "unchanged", "全部源名单内容未变化，不重载 Caddy 配置")
-	} else if !threatListsReferencedByEnabledPolicy(changedIDs) {
+	} else if !forceReload && !threatListsReferencedByEnabledPolicy(changedIDs) {
 		AppendThreatUpdateLog("INFO", "unchanged", "名单内容已变化但无启用策略引用，不重载 Caddy 配置")
 	} else if threatReloader != nil {
-		AppendThreatUpdateLog("INFO", "reloading", "名单内容已变化且被策略引用，重载 Caddy 配置")
+		if forceReload {
+			AppendThreatUpdateLog("INFO", "reloading", "上一轮重载失败，强制重载 Caddy 配置（自愈重试）")
+		} else {
+			AppendThreatUpdateLog("INFO", "reloading", "名单内容已变化且被策略引用，重载 Caddy 配置")
+		}
 		err := threatReloader()
 		// 数据类更新触发的重载统一留操作日志（2026-09-24 用户裁定补齐——
 		// 与 crs_update/ip2region_update 同口径，此前威胁库重载无审计）
 		recordSystemReloadAudit("threat_update", err)
 		if err != nil {
-			Logf("error", "威胁情报库: 名单变化后重载失败: %v", err)
+			threatReloadPending = true
+			Logf("error", "威胁情报库: 名单变化后重载失败（下轮将强制重试）: %v", err)
 			AppendThreatUpdateLog("ERROR", "reloading", fmt.Sprintf("重载 Caddy 配置失败: %v", err))
+		} else {
+			threatReloadPending = false
 		}
 	}
 }
@@ -487,6 +519,9 @@ func downloadAndParseThreatSource(source threatSourceRow) ([]string, string, err
 	ctx, cancel := context.WithTimeout(context.Background(), threatDownloadTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source.url, nil)
+	if err == nil {
+		req.Header.Set("User-Agent", "lazy-balancer-v2") // 第 59 轮 R59-P5：空 UA 可能被源拒绝/插页（对齐 crshttp 同口径）
+	}
 	if err != nil {
 		return nil, "", fmt.Errorf("构造请求失败: %w", err)
 	}

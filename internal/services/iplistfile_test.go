@@ -1,6 +1,9 @@
 package services
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -187,5 +190,36 @@ func TestGCStaleIPListFiles_prunesStaleRefEntries(t *testing.T) {
 	}
 	if !freshOK {
 		t.Fatal("未超龄引用条目被误 prune")
+	}
+}
+
+// 第 59 轮 R59-P3（U5-1）：writeIPListFile 不得使用确定性 .tmp 路径——并发渲染
+// 同一 (scope,内容) 时 WriteFile(O_TRUNC)+Rename 交错会把半截文件暴露到内容
+// 寻址正式路径。确定性 RED：预占旧确定性 tmp 路径为目录（WriteFile 恒失败），
+// 修复后（CreateTemp 唯一临时名）不受占位影响照常成功。
+func TestWriteIPListFile_uniqueTempNotBlockedByStalePath(t *testing.T) {
+	entries := []string{"198.51.100.9"}
+	sum := sha256.Sum256([]byte(strings.Join(wafiplist.AggregateIPEntries(entries), "\n")))
+	name := fmt.Sprintf("%s-%s.txt", "r59tmp", hex.EncodeToString(sum[:])[:12])
+	stalePath := filepath.Join(IPListDataDir, name+".tmp")
+	if err := os.MkdirAll(stalePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(stalePath) })
+
+	path, err := writeIPListFile("r59tmp", entries)
+	if err != nil {
+		t.Fatalf("旧确定性 tmp 被占位不应阻塞写入（唯一临时名）: %v", err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(content), "198.51.100.9") {
+		t.Fatalf("正式路径内容不完整: %v %q", err, content)
+	}
+	// 成功路径不得遗留 .tmp 文件（占位目录本身不计）
+	matches, _ := filepath.Glob(filepath.Join(IPListDataDir, "r59tmp-*.tmp"))
+	for _, m := range matches {
+		if info, err := os.Stat(m); err == nil && !info.IsDir() {
+			t.Fatalf("成功写入不得遗留 tmp: %v", matches)
+		}
 	}
 }

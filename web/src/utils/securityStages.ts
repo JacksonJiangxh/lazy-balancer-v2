@@ -314,9 +314,13 @@ export const hasIPACLControl = (p: {
   ip_acl_list_refs?: string
   ip_blacklist?: string
 }): boolean => {
-  // 原始字段齐备时按定义判定；缺失（如精简绑定载荷）回退摘要标志
+  // 原始字段齐备时按定义判定（第 59 轮 R59-P5 对齐后端 G1：ACL 启用且
+  // 内联∪引用非空，或黑名单非空——旧形态「启用即算」会使启用但空名单的
+  // 策略在兜底推断路径归 stage1、后端归 stage3，SecurityBindingEditor 组位
+  // 分叉）；缺失（如精简绑定载荷）回退摘要标志。
   if (p.ip_acl_enabled !== undefined || p.ip_blacklist !== undefined || p.ip_acl_list !== undefined) {
-    return p.ip_acl_enabled === true || parseIPList(p.ip_blacklist).length > 0
+    const hasEntries = parseIPList(p.ip_acl_list ?? '').length > 0 || parseRefIds(p.ip_acl_list_refs ?? '').length > 0
+    return (p.ip_acl_enabled === true && hasEntries) || parseIPList(p.ip_blacklist ?? '').length > 0
   }
   return p.has_ip_control === true
 }
@@ -329,7 +333,7 @@ export const hasGeoIPControl = (p: {
   geoip_countries?: string
 }): boolean => {
   if (p.geoip_mode !== undefined || p.geoip_countries !== undefined) {
-    return p.geoip_mode !== 'off' && parseGeoipCountryCount(p.geoip_countries ?? '') > 0
+    return p.geoip_mode !== '' && p.geoip_mode !== 'off' && parseGeoipCountryCount(p.geoip_countries ?? '') > 0
   }
   return p.has_geoip === true
 }

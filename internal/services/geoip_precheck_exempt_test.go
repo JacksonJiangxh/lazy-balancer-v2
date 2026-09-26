@@ -118,3 +118,37 @@ func TestEngineGate_allowExemptWithGeoChain(t *testing.T) {
 	}
 	compileForEngineGate(t, mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{allowPolicy, geoPolicy}, 0)))
 }
+
+// 第 59 轮 R59-P5（U5-F6）：deny 并集（id:2/4）须先于 allow 交集外拒绝（id:7）
+// 发射——同在 deny 名单与 allow 交集外的 IP，事件归因应为「IP 黑名单拒绝」
+// （deny 侧精确策略语义）而非「IP 白名单拒绝」。拦截结果不变（同 deny+status），
+// 仅消息与归因策略修正。
+func TestBuildIPPrecheckDirectives_denyPrecedesAllowDeny(t *testing.T) {
+	denyPolicy := &models.SecurityPolicy{
+		ID:           23,
+		PolicyType:   models.PolicyTypeStage1,
+		Mode:         "off",
+		IPACLEnabled: true,
+		IPACLMode:    "deny",
+		IPACLList:    `["198.51.100.9"]`,
+	}
+	allowPolicy := &models.SecurityPolicy{
+		ID:           21,
+		PolicyType:   models.PolicyTypeStage1,
+		Mode:         "off",
+		IPACLEnabled: true,
+		IPACLMode:    "allow",
+		IPACLList:    `["203.0.113.10"]`,
+	}
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{denyPolicy, allowPolicy}, 0))
+	idxDeny := strings.Index(directives, `id:2,phase:1,deny`)
+	idxBlacklist := strings.Index(directives, `id:4,phase:1,deny`)
+	idxAllow := strings.Index(directives, `id:7,phase:1,deny`)
+	if idxDeny < 0 || idxAllow < 0 {
+		t.Fatalf("missing anchor rules (deny=%d allow=%d):\n%s", idxDeny, idxAllow, directives)
+	}
+	if idxDeny > idxAllow {
+		t.Fatalf("deny 并集须先于 allow 交集外拒绝发射（deny=%d allow=%d）:\n%s", idxDeny, idxAllow, directives)
+	}
+	_ = idxBlacklist
+}

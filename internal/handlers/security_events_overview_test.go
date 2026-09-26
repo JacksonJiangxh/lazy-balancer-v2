@@ -265,7 +265,10 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 		{"ip whitelist via msg", "", "命中 IP 白名单", "IP 访问控制"},
 		{"ip acl via msg", "", "触发 IP 访问控制", "IP 访问控制"},
 		{"ip acl via id 2", "2", "", "IP 访问控制"},
-		{"ip acl via id 3", "3", "", "IP 访问控制"},
+		// 第 59 轮 R59-P5：id:3/12 对齐 family 表/stage 桶归「信任名单」（发射
+		// 为 pass,nolog 永不产事件——防御性归族，三侧同口径）
+		{"trust precheck id 3", "3", "", "信任名单"},
+		{"trust precheck id 12", "12", "", "信任名单"},
 		{"ip acl via id 4", "4", "", "IP 访问控制"},
 		{"ip trust list via id 5", "5", "", "IP 访问控制"},
 		{"geoip legacy id 8", "8", "", "地域拦截"},

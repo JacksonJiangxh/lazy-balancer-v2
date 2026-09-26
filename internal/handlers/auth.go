@@ -341,7 +341,9 @@ func (h *Handlers) GetCurrentUser(c *gin.Context) {
 	`, userIDInt).Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &mfaEnabled, &authProvider)
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "用户不存在或已被删除"})
+		// 第 59 轮 R59-P5：基础设施故障与用户不存在不可混同（本查询按主键取行，
+		// ErrNoRows 已在鉴权层拦截）——与同文件其余 DB 失败分支统一「数据库错误」。
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
 		return
 	}
 

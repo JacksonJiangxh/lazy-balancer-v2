@@ -17,15 +17,24 @@
           <span v-if="geoLabel" class="trg-source-geo">{{ geoLabel }}</span>
         </div>
         <div class="trg-hero-policy">
-          <span class="trg-hero-policy-name">{{ policy?.name ?? '（策略已删除）' }}</span>
+          <span class="trg-hero-policy-name">{{ policy?.name ?? (policyMissing ? '（策略已删除）' : '（策略信息不可用）') }}</span>
           <el-tag size="small" :type="policy?.enabled ? 'success' : 'info'" effect="plain">
             {{ policy?.enabled ? '已启用' : '已禁用' }}
           </el-tag>
         </div>
         <div class="trg-hero-hit">{{ heroHitSource }}</div>
+        <div v-if="row?.event_time" class="trg-hero-time">事件时间 · {{ formatTriggerTime(row.event_time) }}</div>
+        <div class="trg-hero-meta">
+          <span>来源 IP {{ row?.client_ip }}</span>
+          <el-tag size="small" :type="row?.action === 'blocked' ? 'danger' : 'warning'" effect="plain">
+            {{ row?.action === 'blocked' ? '已拦截' : '已记录（检测）' }}
+          </el-tag>
+          <span v-if="detectionNote">{{ detectionNote }}</span>
+        </div>
       </div>
 
       <!-- ② 策略配置与命中明细（仅展示与本次触发相关的维度；零操作，处置在 IP 快捷弹框） -->
+      <el-alert v-if="loadError" type="error" :closable="false" show-icon title="策略信息加载失败，请关闭后重试" style="margin-bottom: 12px" />
       <div class="trg-card">
         <div class="trg-card-title">策略配置 · {{ dimensionTitle }}</div>
         <div class="trg-kv"><span class="k">当前配置</span><span>{{ relevantSummary }}</span></div>
@@ -70,12 +79,12 @@
             :closable="false"
             show-icon
             :title="crsIndexReady
-              ? '此规则已从当前 CRS 移除，无法加入排除（存量排除条目仍生效）'
-              : '当前 CRS 索引加载失败，仍可将其加入排除'"
+              ? '此规则已从当前 CRS 移除（存量排除条目仍生效）；排除管理请前往 安全防护 → 安全策略 → 策略编辑 → 排除规则'
+              : '当前 CRS 索引加载失败，无法展示规则详情'"
             style="margin-top: 10px"
           />
           <template v-if="crsEntry">
-            <div class="crs-snippet-toggle" @click="toggleCrsSnippet">
+            <div class="crs-snippet-toggle" role="button" tabindex="0" @click="toggleCrsSnippet" @keydown.enter.prevent="toggleCrsSnippet" @keydown.space.prevent="toggleCrsSnippet">
               <el-icon class="crs-snippet-toggle-icon" :class="{ 'is-expanded': crsSnippetExpanded }"><ArrowRight /></el-icon>
               <span>{{ crsSnippetExpanded ? '收起规则源码' : '展开规则源码' }}</span>
               <span class="crs-snippet-toggle-file">{{ crsEntry.file }} · id:{{ row?.rule_triggered }} 所在行 ±10 行</span>
@@ -130,15 +139,18 @@ import { computed, ref, watch } from 'vue'
 import { ArrowRight } from '@element-plus/icons-vue'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import { request } from '@/utils/api'
+import { formatDate } from '@/utils/date'
 import { parseIPList, parseRefIds } from '@/utils/securityStages'
 import { useCrsRuleIndex } from '@/composables/useCrsRuleIndex'
 import type { APIResponse } from '@/types'
 
 // 第 58 轮（用户裁定）：统一触发详情弹框——全部触发类型（IP 黑白名单/地域/威胁
 // 情报库/信任/WAF·CRS/WAF·自定义/请求体异常）共用同一风格与交互；信息优先，
-// IP 处置动作收敛到 IP 快捷弹框。CRS 快捷排除为规则级误报治理动作，保留于此。
+// IP 处置动作收敛到 IP 快捷弹框（第 59 轮裁定：触发详情零操作，
+// CRS 排除管理位于 安全防护 → 安全策略 → 策略编辑 → 排除规则）。
 interface TriggerRow {
   id: number
+  event_time?: string
   rule_caddy_id: string
   rule_name: string
   policy_id: number
@@ -169,6 +181,10 @@ const kind = computed<Kind>(() => {
   if (t === '11') return 'body'
   if (/^9\d{5}$/.test(t)) return 'waf-crs'
   if (/^\d{5}$/.test(t)) return 'waf-custom'
+  // 第 59 轮 R59-P3：合成自定义（1 开头 ≥7 位）与遗留共享 GeoIP id:8 归族——
+  // 与后端 stageCategorizeAttack/categorizeAttack 三侧同口径（旧形态落 acl 误标）。
+  if (/^1\d{6,}$/.test(t)) return 'waf-custom'
+  if (t === '8') return 'geo'
   return 'acl'
 })
 
@@ -191,6 +207,17 @@ const sourceTagType = computed(() =>
 
 
 // 命中概览（用户裁定：一眼可读）——阶段名 / 命中源
+const formatTriggerTime = (v: string): string => formatDate(v)
+
+// 组合语义说明（第 59 轮）：logged 事件的「为什么不拦」——检测模式策略 或 信任保留检测。
+const detectionNote = computed<string>(() => {
+  if (!props.row || props.row.action === 'blocked') return ''
+  if (kind.value === 'trust') return ''
+  if (policy.value?.mode === 'detection') return '所属策略为检测模式：命中只记录，不拦截'
+  if (policy.value?.ip_whitelist_enabled && policy.value?.trust_detection) return '信任保留检测：命中记录为检测事件'
+  return ''
+})
+
 const heroStage = computed(() => {
   switch (kind.value) {
     case 'trust': return '阶段 0 · 信任名单'
@@ -231,7 +258,7 @@ const heroHitSource = computed(() => {
   if (!ev) return '—'
   switch (kind.value) {
     case 'acl': {
-      if (inlineAclHit.value) return `策略内联黑名单（规则 id:${ev.rule_triggered}）`
+      if (inlineAclHit.value) return `策略内联${policy.value?.ip_acl_mode === 'allow' ? '白' : '黑'}名单（规则 id:${ev.rule_triggered}）`
       if (memberLists.value.length > 0) return memberLists.value.map((m) => `地址列表「${m.name}」`).join('、')
       return `规则 id:${ev.rule_triggered}${ev.rule_name ? ` · ${ev.rule_name}` : ''}`
     }
@@ -259,6 +286,7 @@ const heroHitSource = computed(() => {
 // —— 策略与地址列表装载（直取策略详情，禁用/删除态可见）——
 const loading = ref(false)
 const policyMissing = ref(false)
+const loadError = ref(false)
 interface PolicyRow {
   id: number
   name: string
@@ -289,12 +317,22 @@ const loadAll = async (): Promise<void> => {
   if (!row) return
   loading.value = true
   policyMissing.value = false
+  loadError.value = false
   policy.value = null
+  lists.value = []
+  entriesCache.value = {}
   try {
     if (row.policy_id > 0) {
-      const res = await request.get<APIResponse<{ policy: PolicyRow }>>(`/security/policies/${row.policy_id}`, { silent: true } as never)
-      policy.value = res.data?.policy ?? null
-      if (!res.data?.policy) policyMissing.value = true
+      try {
+        const res = await request.get<APIResponse<{ policy: PolicyRow }>>(`/security/policies/${row.policy_id}`, { silent: true } as never)
+        policy.value = res.data?.policy ?? null
+        if (!res.data?.policy) policyMissing.value = true
+      } catch (err) {
+        // 第 59 轮 R59-P3：网络/5xx 与「策略已删除」不可混同——404 归缺失，
+        // 其余按加载失败提示（hero 不误标「已删除」）。
+        policyMissing.value = err instanceof Error && 'status' in err && (err as { status?: number }).status === 404
+        if (!policyMissing.value) loadError.value = true
+      }
     } else {
       policyMissing.value = true
     }
@@ -523,7 +561,6 @@ watch(() => props.modelValue, (v) => {
 
 <style scoped>
 /* ① 来源卡：类型着色（全类型同构，仅色相区分） */
-.trg-source { border: 1px solid var(--el-color-danger-light-7); background: var(--el-color-danger-light-9); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
 .trg-source--geo { border-color: var(--el-color-warning-light-7); background: var(--el-color-warning-light-9); }
 .trg-source--threat { border-color: var(--el-color-danger-light-7); background: var(--el-color-danger-light-9); }
 .trg-source--trust { border-color: var(--el-color-success-light-7); background: var(--el-color-success-light-9); }
@@ -545,16 +582,12 @@ watch(() => props.modelValue, (v) => {
 .trg-hero-policy { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
 .trg-hero-policy-name { font-weight: 600; font-size: 13px; }
 .trg-hero-hit { font-size: 13px; margin-top: 4px; color: var(--el-text-color-primary); }
-.trg-source-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
-.trg-source-ip { font-weight: 700; font-size: 14px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.trg-hero-time { font-size: 12px; margin-top: 4px; color: var(--el-text-color-secondary); }
+.trg-hero-meta { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--el-text-color-secondary); flex-wrap: wrap; }
 .trg-source-geo { color: var(--el-text-color-secondary); font-size: 12px; }
-.trg-source-line { font-size: 13px; color: var(--el-text-color-primary); }
 /* ②③ 信息卡：统一标题+分隔线+KV 行 */
 .trg-card { border: 1px solid var(--el-border-color); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
 .trg-card-title { font-size: 13px; font-weight: 600; padding-bottom: 6px; margin-bottom: 8px; border-bottom: 1px dashed var(--el-border-color-lighter); }
-.trg-policy-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-.trg-policy-name { font-weight: 600; }
-.trg-policy-body { display: grid; gap: 4px; }
 .trg-kv { display: flex; gap: 8px; font-size: 13px; padding: 3px 0; }
 .trg-kv .k { color: var(--el-text-color-secondary); flex-shrink: 0; width: 96px; }
 .trg-cond { font-size: 13px; }
@@ -566,8 +599,4 @@ watch(() => props.modelValue, (v) => {
 .crs-snippet-toggle-file { color: var(--el-text-color-secondary); }
 .crs-snippet-body { margin-top: 8px; border: 1px solid var(--el-border-color-lighter); border-radius: 6px; padding: 8px; max-height: 260px; overflow: auto; background: var(--el-fill-color-light); }
 .crs-snippet-empty { font-size: 12px; color: var(--el-text-color-secondary); }
-.crs-action-group { border-top: 1px dashed var(--el-border-color-lighter); margin-top: 10px; padding-top: 8px; }
-.crs-action-group-title { font-size: 12px; font-weight: 600; color: var(--el-text-color-regular); margin-bottom: 8px; }
-.crs-action-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.crs-exclude-submit { margin-left: auto; }
 </style>

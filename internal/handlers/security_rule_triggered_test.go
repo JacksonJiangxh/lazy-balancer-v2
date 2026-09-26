@@ -76,8 +76,10 @@ func TestRuleTriggeredMultiFilterSQL_partialFamilyPrefix(t *testing.T) {
 		}
 		return false
 	}
-	if !hasArg("949%") || !hasArg("959%") {
-		t.Errorf("partial family prefix must put 949%%/959%% into args: %v", args)
+	// 第 59 轮 R59-P5：3 字符前缀族锚定 6 位（949___/959___）——不再交叉命中
+	// 5 位自定义发射 id（94900-94999 等）。
+	if !hasArg("949___") || !hasArg("959___") {
+		t.Errorf("partial family prefix must put 949___/959___ into args: %v", args)
 	}
 	if !strings.Contains(got, " OR ") {
 		t.Errorf("partial family: parts must be OR-joined: %q", got)
@@ -197,5 +199,35 @@ func TestRuleTriggeredFilterSQL_geoipPrecheckSegmentFamily(t *testing.T) {
 	}
 	if !crs["942100"] || !crs["900000"] {
 		t.Errorf("WAF 规则（CRS）family 必须命中 9xxxxx CRS id: %v", crs)
+	}
+}
+
+// 第 59 轮 R59-P5：3 字符前缀族（920/921/949/959）筛选不得交叉命中 5 位自定义
+// 规则发射 id（crID≥82000 时发射 92000-99999）——categorizeAttack len==5 先行
+// 归「自定义规则」，筛选族与分类口径对齐：LIKE 追加三个下划线锚定总长 6 位。
+func TestRuleTriggeredFilter_3CharPrefixAnchorsSixDigits(t *testing.T) {
+	for _, family := range []string{"协议异常", "协议攻击", "评分拦截"} {
+		var args []any
+		_ = ruleTriggeredFilterSQL(family, &args)
+		for _, a := range args {
+			pat, ok := a.(string)
+			if !ok {
+				continue
+			}
+			if strings.HasSuffix(pat, "%") && !strings.HasSuffix(pat, "___%") {
+				t.Fatalf("族 %q 的 LIKE 模式 %q 未锚定 6 位长度（前缀族不得交叉命中 5 位自定义发射 id）", family, pat)
+			}
+		}
+	}
+	var args []any
+	sql := ruleTriggeredFilterSQL("协议异常", &args)
+	found := false
+	for _, a := range args {
+		if pat, ok := a.(string); ok && strings.HasSuffix(pat, "___") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("协议异常族应含 6 位锚定模式（920___）: sql=%q args=%v", sql, args)
 	}
 }

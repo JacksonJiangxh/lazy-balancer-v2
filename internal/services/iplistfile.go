@@ -61,17 +61,30 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 	if err := EnsureIPListDir(); err != nil {
 		return "", err
 	}
-	tmp := path + ".tmp"
+	// 唯一临时名（第 59 轮 R59-P3）：并发渲染同一 (scope,内容) 命中同一正式路径
+	// 时，确定性 .tmp 会让 O_TRUNC 互踩对方的半截内容后 rename 出厂；CreateTemp
+	// 使每次写入独占临时文件，rename 串行原子生效。失败路径清理临时文件。
 	var sb strings.Builder
 	for _, entry := range merged {
 		sb.WriteString(entry)
 		sb.WriteString("\n")
 	}
-	if err := os.WriteFile(tmp, []byte(sb.String()), 0o644); err != nil {
+	tmp, err := os.CreateTemp(IPListDataDir, scope+"-*.tmp")
+	if err != nil {
+		return "", fmt.Errorf("创建 IP 名单临时文件失败 %s: %w", name, err)
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.WriteString(sb.String()); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("写入 IP 名单文件失败 %s: %w", name, err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return "", fmt.Errorf("关闭 IP 名单临时文件失败 %s: %w", name, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("原子替换 IP 名单文件失败 %s: %w", name, err)
 	}
 	return path, nil
@@ -160,6 +173,21 @@ func gcStaleIPListFiles(now time.Time, maxAge time.Duration) (removed int) {
 			continue
 		}
 		deleted = append(deleted, full)
+	}
+	// 第 59 轮 R59-P5：顺带清理超龄崩溃残留的投影临时文件（CreateTemp 半截
+	// .tmp 无引用语义，超龄即可删；在役写入的 .tmp 恒新鲜，不受影响）。
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tmp") {
+			continue
+		}
+		tmpFull := filepath.Join(IPListDataDir, entry.Name())
+		info, err := entry.Info()
+		if err != nil || now.Sub(info.ModTime()) < maxAge {
+			continue
+		}
+		if err := os.Remove(tmpFull); err == nil {
+			deleted = append(deleted, tmpFull)
+		}
 	}
 	if len(deleted) > 0 {
 		wafiplist.EvictIPListCache(deleted...)

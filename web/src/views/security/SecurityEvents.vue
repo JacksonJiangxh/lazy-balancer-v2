@@ -33,7 +33,7 @@
              服务端筛选（rule_name/rule_triggered/policy_name LIKE）。 -->
         <el-input v-model="filters.rule_name" placeholder="负载规则" clearable style="width: 100px" @keyup.enter="applyFilters" />
         <!-- 触发规则筛选：多选 + 头部全选（勾的就是看的，统一正向心智）。
-             全选（6 类别全中且无自定义 tag）或空选 = 不过滤，不发送参数；子集或含
+             全选（四类全中且无自定义 tag）或空选 = 不过滤，不发送参数；子集或含
              自定义 tag 时全部选中值英文逗号连接发送 rule_triggered（后端逐段按
              family/前缀/纯数字 ID 解析，OR 连接）。filterable + allow-create：可直接
              输入 CRS 规则 ID（如 942100）等自定义 tag 混入同一参数；自定义 tag 不参与
@@ -247,15 +247,19 @@ interface SecurityEvent { id: number; event_time: string; rule_caddy_id: string;
 // '8' 为地域拦截，'14' 为威胁情报库预检拦截，'11' 为请求体解析失败，949 为异常评分评估拦截，920/921 为协议异常/攻击，其余为 CRS 规则 ID
 // 触发阶段分类（第 57 轮追加需求，用户裁定）：IP ACL 族=黑白名单/信任/地域/
 // 威胁库预检，统一展示「IP 访问控制」；WAF 含 CRS 与自定义两源；请求体异常独立。
+// 注：id 3/12 虽列于此族字面量，但 stageCategory 的 trust 分支先于本谓词判定
+// （模板 else-if 顺序保证信任优先）——本谓词仅供 ACL 族兜底，不构成信任归类。
 const isIpAclFamily = (row: SecurityEvent): boolean => {
   const t = row.rule_triggered
   if (!t) return false
   const n = Number(t)
-  if ([2, 3, 4, 5, 7, 14].includes(n)) return true
+  if ([2, 3, 4, 5, 7, 8, 14].includes(n)) return true
   return n >= 800000 && n < 900000
 }
 const isWafCrs = (row: SecurityEvent): boolean => /^9\d{5}$/.test(row.rule_triggered ?? '')
-const isWafCustom = (row: SecurityEvent): boolean => /^\d{5}$/.test(row.rule_triggered ?? '')
+// 第 59 轮 R59-P3：合成自定义（1 开头 ≥7 位，旧版无 id 规则形态）同属 WAF——
+// 与后端 stageCategorizeAttack/categorizeAttack 三侧同口径。
+const isWafCustom = (row: SecurityEvent): boolean => /^\d{5}$/.test(row.rule_triggered ?? '') || /^1\d{6,}$/.test(row.rule_triggered ?? '')
 
 const stageCategory = (row: SecurityEvent): 'trust' | 'acl' | 'waf' | 'body' | 'other' => {
   const t = row.rule_triggered
@@ -442,15 +446,19 @@ const fetchEvents = async () => {
     if (filters.value.action) p.set('action', filters.value.action)
     if (filters.value.ip) p.set('ip', filters.value.ip)
     if (filters.value.rule_name) p.set('rule_name', filters.value.rule_name)
-    // 触发规则：全选（6 类别全中且无自定义 tag）或空选 = 不过滤，不发送参数；
+    // 触发规则：全选（四类全中且无自定义 tag）或空选 = 不过滤，不发送参数；
     // 子集（1~5 个类别）或含自定义 tag 时，全部选中值英文逗号连接发送 rule_triggered
     //（后端逐段独立解析、OR 连接；含逗号的消息关键词会整串回退为消息搜索，前端只管连接）
-    const triggeredSelected = filters.value.rule_triggered.filter((v): v is TriggeredCategory =>
+    // 第 59 轮 R59-P2：allow-create 自定义 tag（如 CRS 规则 ID 942100）原样
+    // 并入发送段（后端逐段独立解析 OR）；免发送条件=四类全中且无自定义 tag。
+    const triggeredSelected = filters.value.rule_triggered
+    const categorySelected = triggeredSelected.filter((v): v is TriggeredCategory =>
       (TRIGGERED_CATEGORIES as readonly string[]).includes(v))
-    const triggeredAllHit = TRIGGERED_CATEGORIES.every((c) => triggeredSelected.includes(c))
-    if (triggeredSelected.length > 0 && !triggeredAllHit) {
-      const segments = triggeredSelected.flatMap((c) => TRIGGERED_FAMILY_SEGMENTS[c])
-      p.set('rule_triggered', segments.join(','))
+    const customTags = triggeredSelected.filter((v) => !(TRIGGERED_CATEGORIES as readonly string[]).includes(v))
+    const triggeredAllHit = TRIGGERED_CATEGORIES.every((c) => categorySelected.includes(c))
+    if (triggeredSelected.length > 0 && (!triggeredAllHit || customTags.length > 0)) {
+      const segments = categorySelected.flatMap((c) => TRIGGERED_FAMILY_SEGMENTS[c])
+      p.set('rule_triggered', [...segments, ...customTags].join(','))
     }
     if (filters.value.policy_name) p.set('policy_name', filters.value.policy_name)
     if (filters.value.uri) p.set('uri', filters.value.uri)
@@ -531,6 +539,6 @@ onMounted(fetchEvents)
 .triggered-filter-popper .el-select-dropdown__header .el-checkbox { display: flex; height: unset; margin-right: 0; }
 .triggered-filter-popper .el-select-dropdown__header .el-checkbox .el-checkbox__label { padding-left: 8px; }
 /* 选中项不加粗：EP 2.14 多选下拉 is-selected 默认 font-weight:bold，该筛选常态
-   全选（6 类别全勾）导致整列粗体，覆写回 normal（选中色与右侧 ✓ 保留） */
+   全选（四类全勾）导致整列粗体，覆写回 normal（选中色与右侧 ✓ 保留） */
 .triggered-filter-popper .el-select-dropdown__item.is-selected { font-weight: normal; }
 </style>

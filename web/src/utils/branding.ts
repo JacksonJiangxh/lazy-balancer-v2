@@ -31,7 +31,7 @@ export const footerHtml = computed(() => {
 
 export async function loadBranding(): Promise<void> {
   try {
-    const res = await request.get<BrandingResponse>('/branding')
+    const res = await request.get<BrandingResponse>('/branding', { silent: true } as never) // 第 59 轮 R59-P5：装饰性预取失败不弹全局错误 toast
     if (res.data?.app_name) appName.value = res.data.app_name
     if (res.data?.version) appVersion.value = res.data.version
     footerUsesDefault.value = res.data?.footer_uses_default !== false

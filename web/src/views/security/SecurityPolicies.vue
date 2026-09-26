@@ -353,7 +353,7 @@
                   size="small"
                   type="info"
                   effect="plain"
-                  :closable="!crsFieldsOff"
+                  :closable="!crsFieldsOff && !isReadOnly"
                   :disable-transitions="true"
                   :title="opt.title"
                   @close="removeCrsGroupValue(opt.value)"
@@ -972,7 +972,7 @@ import { useClampedPagination } from '@/composables/useClampedPagination'
 import type { CrsExcludedRow, CrsRuleOptionView } from '@/composables/useCrsRuleIndex'
 import type { APIResponse, UserListItem } from '@/types'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
-import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, buildStageModel, formatAclModeDetail, hasTrustEntries, inferPolicyType, mergeIpEntryCount, parseRefIds } from '@/utils/securityStages'
+import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, buildStageModel, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, parseRefIds } from '@/utils/securityStages'
 import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy } from '@/utils/securityStages'
 
 interface PolicyDetail { id: number; name: string; description: string; mode: string; anomaly_threshold: number; ip_acl_mode: string; ip_acl_list: string; ip_acl_enabled: boolean; ip_whitelist: string; ip_whitelist_enabled?: boolean; ip_blacklist?: string; ip_acl_list_refs?: string; ip_whitelist_refs?: string; rate_limit_enabled: boolean; rate_limit_rps: number; rate_limit_burst: number; crs_rule_groups: string; crs_excluded_rules: string; custom_rules: string; block_page_id: number; block_status_code: number; enabled: boolean; updated_at: string; geoip_mode?: string; geoip_countries?: string; waf_check_response?: boolean; log_request_body?: boolean; trust_detection?: boolean }
@@ -1086,7 +1086,6 @@ const { pagedItems: pagedPolicies } = useClampedPagination(filteredPolicies, pol
 // 三阶段启用 chips 谓词：阶段 1=IP 访问控制||地域拦截、阶段 2=限流、
 // 阶段 3=后端 G3 口径（has_waf=CRS 生效 ∪ custom_only ∪ 自定义规则数>0；
 // has_custom_rules 带 S7 off 门且不含 custom_only 空规则形，不再直接消费）
-const stage1ChipOn = (row: PolicySummary): boolean => hasIpControl(row) || hasGeoControl(row)
 const stage3ChipOn = (row: PolicySummary): boolean => row.has_waf || row.mode === 'custom_only' || row.custom_rules_count > 0
 
 
@@ -1201,7 +1200,10 @@ const migrateChildTypes = computed<SecurityPolicyType[]>(() => {
   const types: SecurityPolicyType[] = []
   // 含信任名单 → 产出「原名（阶段 0）」子策略（后端 trust_detection 恒 1=保留检测，行为保持）
   if (hasTrustEntries(p)) types.push('stage0')
-  if (stage1ChipOn(p)) types.push('stage1')
+  // 第 59 轮 R59-P2：改用 securityStages 单一事实源（ACL 启用即算，2026-09-25
+  // 用户实证口径）——旧本地谓词要求「条目非空」且 migrate 路径不拉条目缓存，
+  // 仅靠引用列表的混合策略预演恒漏报阶段 1。
+  if (hasIPACLControl(p) || hasGeoIPControl(p)) types.push('stage1')
   if (p.has_rate_limit) types.push('stage2')
   if (stage3ChipOn(p)) types.push('stage3')
   return types
@@ -2075,15 +2077,9 @@ const aclListTip = computed(() => ACL_MODE_TIPS[form.value.ip_acl_mode] ?? '')
 // 与后端口径一致：ACL 启用且列表非空，或黑名单非空（内联与引用列表合并计数）。
 // 2026-09-21：信任名单（ip_whitelist）不再计入——信任恒归独立阶段 0（用户裁定），
 // 计入会把纯信任策略误判为跨阶段 mixed 并在阶段 1 投出空行。
-const hasIpControl = (row: PolicySummary): boolean => {
-  const aclCount = mergeIpEntries(parseJsonList(row.ip_acl_list), parseRefIds(row.ip_acl_list_refs)).length
-  return (row.ip_acl_enabled && aclCount > 0) || parseJsonList(row.ip_blacklist).length > 0
-}
 // 地域拦截启用口径与后端 PolicyHasGeoIP 一致：geoip_mode !== 'off' 且区域名单非空
 //（off 为关闭哨兵：区域保留不清单，重开即复用）
 const geoipRegionCount = (row: PolicySummary): number => parseJsonList(row.geoip_countries).length
-const hasGeoControl = (row: PolicySummary): boolean =>
-  row.has_geoip ?? ((row.geoip_mode ?? 'off') !== 'off' && geoipRegionCount(row) > 0)
 
 
 // /security/bindings 以 rule_caddy_id 为键（v2.2.0 起值为绑定数组，policy_id ASC），
@@ -2934,6 +2930,16 @@ const handleSave = async () => {
     ElMessage.error('阶段 0 · 信任名单策略必须配置至少一个信任 IP（内联或引用列表）')
     currentStep.value = WIZARD_STEP.TRUST
     return
+  }
+  // 第 59 轮 R59-P3：stage0 信任内联条目此前绕过 CIDR 前置校验（开关门恒
+  // false、typeAllowsStage(1) 恒 false）——逐条前置，报错带定位（后端 400 兜底）。
+  if (typeAllowsStage(0)) {
+    const bad = ipWhitelist.value.find((v) => !isValidCidr(v))
+    if (bad !== undefined) {
+      ElMessage.error(`信任名单条目「${bad}」不是合法的 IP/CIDR`)
+      currentStep.value = WIZARD_STEP.TRUST
+      return
+    }
   }
   if (typeAllowsStage(1) && !validateIpAclList()) {
     currentStep.value = WIZARD_STEP.IP_ACL

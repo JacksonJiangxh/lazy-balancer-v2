@@ -231,6 +231,14 @@ func (h *Handlers) UpdateSecurityCustomRule(c *gin.Context) {
 }
 
 func (h *Handlers) DeleteSecurityCustomRule(c *gin.Context) {
+	// 非规范数字 id 一律 400（第 59 轮 R59-P3）：SQLite 数值亲和使 '5.0' 等
+	// 形态仍命中 id=5 行——Atoi 失败若放行会跳过下方引用检查后照常删除
+	// （与 DeleteIPList 的 ParseInt 门同族口径）。
+	listID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || listID <= 0 {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的规则 ID"})
+		return
+	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 
@@ -2819,8 +2827,12 @@ func appendFamilyPrefixCondition(ors *[]string, args *[]any, prefix string) {
 		*args = append(*args, prefix)
 		return
 	}
+	// 3 字符前缀族（920/921/949/959）恒对应 6 位 CRS id——LIKE 前缀不约束长度会
+	// 交叉命中 5 位自定义规则发射 id（crID≥82000 时发射 92000-99999，第 59 轮
+	// R59-P5 与 categorizeAttack「len==5 先行归自定义」对齐）：追加三个下划线
+	// 锚定总长 6 位。
 	*ors = append(*ors, "rule_triggered LIKE ?")
-	*args = append(*args, prefix+"%")
+	*args = append(*args, prefix+"___")
 }
 
 const customRuleFamilyCondition = "(rule_triggered GLOB '[0-9][0-9][0-9][0-9][0-9]' OR rule_triggered GLOB '1[0-9][0-9][0-9][0-9][0-9][0-9]*')"
@@ -3211,8 +3223,14 @@ func categorizeAttack(ruleTriggered, ruleMsg string) string {
 		// 800000+policyID（阶段化模型，buildIPPrecheckDirectives 逐策略链）。
 		return "地域拦截"
 	case strings.Contains(ruleMsg, "IP 黑名单") || strings.Contains(ruleMsg, "IP 白名单") || strings.Contains(ruleMsg, "IP 访问控制") ||
-		ruleTriggered == "2" || ruleTriggered == "3" || ruleTriggered == "4" || ruleTriggered == "5" || ruleTriggered == "7":
+		ruleTriggered == "2" || ruleTriggered == "4" || ruleTriggered == "5" || ruleTriggered == "7":
 		return "IP 访问控制"
+	// 信任预检 id:3/12（第 59 轮 R59-P5 对齐 family 表/stage 桶三侧口径）——
+	// 置于 msg 门之后：带「IP 黑/白名单」消息的 id:3 历史行仍归 IP 访问控制
+	// （既有钉），裸 id 形态（当前发射为 pass,nolog 永不产事件——防御性归族）
+	// 归信任名单。
+	case ruleTriggered == "3" || ruleTriggered == "12":
+		return "信任名单"
 	default:
 		return "其他"
 	}
@@ -3315,6 +3333,17 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 
 	// 7-day trend: always the full today-6 … today slice (local dates), zero-filled.
 	// 时区偏移在 Go 侧拼好（负偏移如 America/New_York 为 "-240 minutes"）；SQLite 的
+	// MetricsDB 未装配：主库字段（活跃策略/库状态）照常返回，metrics 面板零值
+	// 200 而非 panic（第 59 轮 R59-P3，对齐 P5-4 家族：ListSecurityEvents/
+	// GetIPEventCount/GetRuleStageStats 同口径）。
+	if db.MetricsDB == nil {
+		overview.Trend = []models.SecurityTrendPoint{}
+		overview.TopIPs = []models.SecurityTopIP{}
+		overview.AttackTypes = []models.SecurityAttackType{}
+		overview.AttackTypesStage = []models.SecurityAttackType{}
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: overview})
+		return
+	}
 	// printf('+%d', -240) 会产出非法修饰符 "+-240" 使 date() 返回 NULL，导致趋势全零。
 	tzModifier := fmt.Sprintf("%+d minutes", offsetMinutes)
 	trendByDate := map[string]models.SecurityTrendPoint{}

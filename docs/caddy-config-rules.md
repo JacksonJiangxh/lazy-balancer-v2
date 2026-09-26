@@ -166,12 +166,14 @@ for i, d := range domainHosts {
 
 ### Handle Chain 顺序
 1. **headers**（X-LB-Rule-ID 注入）：HTTP 规则绑定安全策略时链首注入归因头（供预检与 coraza 事务消费，reverse_proxy 前无条件剥离，不直达上游）
-2. **IP 预检**：多策略绑定时合并全部绑定策略 deny 侧 IP 控制的极简 coraza 预检查器（先于全部 rate_limit/waf）
-3. **encode**（压缩）：如果启用压缩且有 gzip/zstd——位于全部 waf 处理器之外侧（SR11-F3 同步：R1 裁定，coraza 响应拦截器需包在 encode 内侧）
-4. **request_body**：配置了请求体上限时——先于全部 waf 处理器（新-1 裁定，body 解析需在 WAF 前）
-5. **rate_limit / waf**：按绑定策略 policy_id ASC 依次编入各策略的处理器组（限流先于 WAF）
-6. **headers**（Server 头隐藏）：server_tokens_hidden 时 deferred 删除 Server 响应头（须推迟到上游响应写入之后）。2026-09-06 裁定（T-3）：规则级 `server_tokens_hidden`（0=随全局 / 1=隐藏 / 2=显示）为 **API/MCP 预留字段，无 UI 入口、不作为产品功能维护**；管理面板仅提供全局开关（基础设置），UI 规则编辑仅透传保留 API 已设值
-7. **reverse_proxy**（反向代理）：主要处理逻辑；HostHeader 折入 reverse_proxy 的 request.headers（set Host），不再单独发射 headers 处理器
+2. **geoip2region 标签层**：规则任意绑定策略启用地域拦截时，先于 IP 预检为每请求标注 `X-GeoIP-Loc` 归属地头（供 GeoIP 预检链第二段匹配；伪造头先剥后设）
+3. **IP 预检**：多策略绑定时合并全部绑定策略 deny 侧 IP 控制的极简 coraza 预检查器（先于全部 rate_limit/waf）——链序：信任（id:3/12 DetectionOnly）→ deny 并集（id:2）→ 遗留黑名单（id:4）→ allow 交集外拒绝（id:7）→ allow 命中豁免 GeoIP（id:13，第 58 轮裁定）→ 逐策略 GeoIP 链（800000+policyID）
+4. **阶段 0 信任直通包裹**：绑定含 stage0 直通策略（trust_detection=0）且命中信任 IP 时，以 subroute 短路后续全部安全阶段（不产生事件）；保留检测（td=1）不包裹——走 DetectionOnly 全评估不拦但全记录
+5. **encode**（压缩）：如果启用压缩且有 gzip/zstd——位于全部 waf 处理器之外侧（SR11-F3 同步：R1 裁定，coraza 响应拦截器需包在 encode 内侧）
+6. **request_body**：配置了请求体上限时——先于全部 waf 处理器（新-1 裁定，body 解析需在 WAF 前）
+7. **rate_limit / waf**：按绑定策略 policy_id ASC 依次编入各策略的处理器组（限流先于 WAF）
+8. **headers**（Server 头隐藏）：server_tokens_hidden 时 deferred 删除 Server 响应头（须推迟到上游响应写入之后）。2026-09-06 裁定（T-3）：规则级 `server_tokens_hidden`（0=随全局 / 1=隐藏 / 2=显示）为 **API/MCP 预留字段，无 UI 入口、不作为产品功能维护**；管理面板仅提供全局开关（基础设置），UI 规则编辑仅透传保留 API 已设值
+9. **reverse_proxy**（反向代理）：主要处理逻辑；HostHeader 折入 reverse_proxy 的 request.headers（set Host），不再单独发射 headers 处理器
 
 ### 上游服务器配置
 

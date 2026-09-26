@@ -209,6 +209,18 @@ func (s *SyncService) doWithTLSUpgradeRedirect(req *http.Request) (*http.Respons
 			return nil, fmt.Errorf("重放 https 升级请求: %w", err)
 		}
 		retry.Body = body
+	} else if req.Body != nil {
+		// 无 GetBody 的带体请求不可重放（R55 P5-4 家族收敛，第 59 轮 R59-P5：
+		// cluster_control.go 已修同型，此处为漏点）——body 已被首次请求消费，
+		// 重放会发送空/残缺载荷；按原响应返回，不让调用方拿到残缺重放结果。
+		// 注：原 301 响应 body 已 Close，此处不可再用——返回无重定向的空壳响应。
+		return &http.Response{
+			StatusCode: http.StatusMovedPermanently,
+			Status:     "301 Moved Permanently",
+			Header:     resp.Header.Clone(),
+			Body:       http.NoBody,
+			Request:    req,
+		}, nil
 	}
 	return s.client.Do(retry)
 }

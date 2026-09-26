@@ -4,8 +4,10 @@ import "testing"
 
 // 第 58 轮（用户裁定）：安全总览攻击类型分布支持按阶段展示（默认）——
 // stageCategorizeAttack 将事件归入与触发阶段一致的五桶：
-//   信任名单 / IP 访问控制（黑白名单+地域+威胁库）/ WAF（CRS+自定义）/
-//   请求体异常 / 其他。
+//
+//	信任名单 / IP 访问控制（黑白名单+地域+威胁库）/ WAF（CRS+自定义）/
+//	请求体异常 / 其他。
+//
 // 具体分类（取消勾选）沿用既有 categorizeAttack，不在此测试范围。
 func TestStageCategorizeAttack_buckets(t *testing.T) {
 	cases := []struct {

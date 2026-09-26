@@ -514,25 +514,6 @@ func RouteIDBelongsToRule(routeID, ruleID string) bool {
 	return ruleID != "" && (routeID == ruleID || strings.HasPrefix(routeID, ruleID+"_"))
 }
 
-func (s *CaddyService) applyConfigRaw(config map[string]interface{}) error {
-	data, err := json.Marshal(config)
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
-	}
-
-	resp, err := s.client.Post(s.adminURL+"/config/", "application/json", bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("failed to apply config: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("config apply failed: %s", string(readCaddyErrorBody(resp.Body)))
-	}
-
-	return nil
-}
-
 // GetConfig gets current Caddy configuration
 func (s *CaddyService) GetConfig() (map[string]interface{}, error) {
 	resp, err := s.client.Get(s.adminURL + "/config/")
@@ -3112,18 +3093,20 @@ func decodePathUpstreams(raw string) ([]UpstreamConfig, error) {
 // 事务内生成可见未提交的策略变更。
 func buildBlockPageErrorRoute(ruleCaddyID string, domainHosts []string, securityCtx *securityPolicyContext) map[string]interface{} {
 	policies := policiesForRule(securityCtx, ruleCaddyID)
+	// 第 59 轮 R59-P5（U8-F3）：首个绑定拦截页的策略若页面内容为空（页面行已
+	// 删除），不得遮蔽后续仍有效页的策略——按绑定序取首个「内容非空」的页。
 	var pagePolicy *models.SecurityPolicy
+	var content string
 	for _, policy := range policies {
 		if policy.BlockPageID > 0 {
-			pagePolicy = policy
-			break
+			if c := securityCtx.blockPageByID[policy.BlockPageID]; c != "" {
+				pagePolicy = policy
+				content = c
+				break
+			}
 		}
 	}
 	if pagePolicy == nil {
-		return nil
-	}
-	content := securityCtx.blockPageByID[pagePolicy.BlockPageID]
-	if content == "" {
 		return nil
 	}
 	statusCode := pagePolicy.BlockStatusCode
@@ -3164,20 +3147,22 @@ func buildBlockPageErrorRoute(ruleCaddyID string, domainHosts []string, security
 func buildRateLimitErrorRoute(ruleCaddyID string, domainHosts []string, securityCtx *securityPolicyContext) map[string]interface{} {
 	policies := policiesForRule(securityCtx, ruleCaddyID)
 	rateLimited := false
+	// 第 59 轮 R59-P5（U8-F3）：同 buildBlockPageErrorRoute——空内容页不遮蔽
+	// 后续有效页。
 	var pagePolicy *models.SecurityPolicy
+	var content string
 	for _, policy := range policies {
 		if policy.RateLimitEnabled {
 			rateLimited = true
 		}
 		if pagePolicy == nil && policy.BlockPageID > 0 {
-			pagePolicy = policy
+			if c := securityCtx.blockPageByID[policy.BlockPageID]; c != "" {
+				pagePolicy = policy
+				content = c
+			}
 		}
 	}
 	if !rateLimited || pagePolicy == nil {
-		return nil
-	}
-	content := securityCtx.blockPageByID[pagePolicy.BlockPageID]
-	if content == "" {
 		return nil
 	}
 	// 限流拦截恒 429（不再取策略 BlockStatusCode）：429 Too Many Requests 是

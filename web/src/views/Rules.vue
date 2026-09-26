@@ -2616,6 +2616,23 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
+  // 第 59 轮 R59-P3：step 标题可点击跳步绕过步进校验——提交前镜像 BASIC 步
+  // 的 domain/端口前置（后端 400 兜底仍在，但报错晚且不带定位）。
+  if (wizardForm.protocol === 'http' && !wizardForm.domain) {
+    ElMessage.warning('HTTP 协议必须填写域名')
+    saving.value = false
+    return
+  }
+  if (!wizardForm.listen_port) {
+    ElMessage.warning('请输入监听端口')
+    saving.value = false
+    return
+  }
+  if (portWarning.value) {
+    ElMessage.warning(portWarning.value)
+    saving.value = false
+    return
+  }
   if (wizardForm.upstreams.length === 0) {
     ElMessage.warning('请至少添加一个上游服务器')
     saving.value = false

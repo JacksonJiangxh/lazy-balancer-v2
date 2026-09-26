@@ -2,6 +2,7 @@ package services
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -566,5 +567,100 @@ func TestThreatListsReferenced_parseableRefsMiss(t *testing.T) {
 	}
 	if !threatListsReferencedByEnabledPolicy([]int{8}) {
 		t.Fatal("可解析 refs 含目标 id 时应为 true")
+	}
+}
+
+// 第 59 轮 R59-P2：重载失败必须自愈——失败后置 pending，下一轮即使内容未变
+// 也强制重载一次（对齐 CRS restoreBackup+failed / ip2region rollback+fail 家族；
+// 哈希已持久化使「unchanged」快路径永不再触发重载的缺口）。成功后清 pending，
+// 后续轮次恢复「内容未变不重载」口径。
+func TestThreatUpdate_reloadFailureRetriedOnNextRun(t *testing.T) {
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	failReload := true
+	var reloads int
+	SetThreatReloader(func() error {
+		reloads++
+		if failReload {
+			return errors.New("reload boom")
+		}
+		return nil
+	})
+	t.Cleanup(func() { SetThreatReloader(nil) })
+
+	mgr := GetThreatUpdateManager()
+	// 轮 1：建名单（无引用，不重载）
+	if err := mgr.RunUpdate("manual"); err != nil {
+		t.Fatalf("run1: %v", err)
+	}
+	if reloads != 0 {
+		t.Fatalf("run1 不应重载: %d", reloads)
+	}
+	seedThreatPolicyRefForSource(t, 900, "ustc")
+	// 轮 2：内容变化 + 引用 → 重载#1 失败
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("192.0.2.99\n"))
+	}))
+	t.Cleanup(srv.Close)
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name='ustc'`, srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.RunUpdate("manual"); err != nil {
+		t.Fatalf("run2: %v", err)
+	}
+	if reloads != 1 {
+		t.Fatalf("run2 应尝试重载一次: %d", reloads)
+	}
+	// 轮 3：内容未变——失败自愈：必须强制重载（#2 成功）
+	failReload = false
+	if err := mgr.RunUpdate("manual"); err != nil {
+		t.Fatalf("run3: %v", err)
+	}
+	if reloads != 2 {
+		t.Fatalf("run3 应自愈重试重载: %d", reloads)
+	}
+	// 轮 4：pending 已清——内容未变不再重载
+	if err := mgr.RunUpdate("manual"); err != nil {
+		t.Fatalf("run4: %v", err)
+	}
+	if reloads != 2 {
+		t.Fatalf("run4 不应重载: %d", reloads)
+	}
+}
+
+// 第 59 轮 R59-P3（U6-1）：run() 起点 is_master 复查（R54-N5 家族收敛——
+// crsupdate/ip2regionupdate 均有，威胁库为漏点）：tick 守卫与任务发出之间的
+// demote 竞态窗口内，从节点继续执行会写 security_ip_lists 并触发重载，
+// 打破从节点只读不变量。
+func TestThreatUpdate_runRejectedOnSlave(t *testing.T) {
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+		t.Fatalf("从节点 RunUpdate 应静默返回而非报错: %v", err)
+	}
+	// 从节点不得写内置名单内容（种子行恒存在——断言条目仍为空、源状态未被改写）
+	rows, err := db.DB.Query(`SELECT entries FROM security_ip_lists WHERE system=1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var entries string
+		if err := rows.Scan(&entries); err != nil {
+			t.Fatal(err)
+		}
+		if entries != "[]" {
+			t.Fatalf("从节点不得写入内置名单条目: entries=%s", entries)
+		}
+	}
+	var touched int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_threat_sources WHERE last_checked IS NOT NULL`).Scan(&touched); err != nil {
+		t.Fatal(err)
+	}
+	if touched != 0 {
+		t.Fatalf("从节点不得改写源状态: touched=%d", touched)
 	}
 }

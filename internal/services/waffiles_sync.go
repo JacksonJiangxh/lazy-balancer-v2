@@ -203,9 +203,11 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged bool, err
 			}
 			tmp := ip2regionLivePath + ".sync"
 			if err := os.WriteFile(tmp, bundle.Xdb, 0644); err != nil {
+				_ = os.Remove(tmp) // 第 59 轮 R59-P5：ENOSPC 等中途失败不遗留半截 .sync
 				return crsChanged, xdbChanged, fmt.Errorf("写入同步 IP2Region数据库: %w", err)
 			}
 			if err := os.Rename(tmp, ip2regionLivePath); err != nil {
+				_ = os.Remove(tmp)
 				return crsChanged, xdbChanged, fmt.Errorf("落盘同步 IP2Region数据库: %w", err)
 			}
 			if tagErr := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", bundle.IP2RegionTag); tagErr != nil {

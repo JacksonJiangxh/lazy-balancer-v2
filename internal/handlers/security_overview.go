@@ -71,7 +71,7 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 			return
 		}
 		n, convErr := strconv.Atoi(triggered)
-		if convErr == nil && (n == 2 || n == 4 || n == 7 || n == 8 || n == 14 || services.IsGeoIPPrecheckID(n)) {
+		if convErr == nil && services.IsStage1PrecheckID(n) { // 第 59 轮收敛：五元组单一事实源
 			stage1 += count
 		} else {
 			stage3 += count

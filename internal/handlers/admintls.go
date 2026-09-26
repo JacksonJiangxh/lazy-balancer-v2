@@ -343,9 +343,13 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		return
 	}
 
+	modePart := ""
+	if mode != "" { // 禁用路径未提交 mode——空值段不拼（第 59 轮 R59-P5）
+		modePart = "证书来源：" + mode
+	}
 	recordAudit(c, "更新", "基础设置", services.FormatAuditDetail(
 		map[bool]string{true: "启用", false: "禁用"}[enabled],
-		"证书来源："+mode,
+		modePart,
 		services.AuditResultPart("success"),
 	))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已保存，服务正在重启以应用 HTTPS 配置"})

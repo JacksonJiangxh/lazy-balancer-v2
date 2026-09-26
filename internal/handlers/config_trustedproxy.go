@@ -60,6 +60,19 @@ func normalizeTrustedProxyRanges(raw string) (string, error) {
 			}
 			prefix = netip.PrefixFrom(addr, bits)
 		}
+		// 第 59 轮 R59-P3（U4-1）：全空间形态显式拒绝——/8 的 0.0.0.0/8 覆盖整个
+		// IPv4；v4-mapped ::ffff:0:0/96（Is6 含 mapped）内嵌全零 v4 同义。两者
+		// 均等同「信任任意来源的伪造头」，与最小前缀长度门的目的相悖。
+		allSpace := map[string]bool{
+			"0.0.0.0/8":         true, // 整个 IPv4
+			"0.0.0.0/0":         true,
+			"::/0":              true,
+			"::ffff:0.0.0.0/96": true, // v4-mapped 规范形态：内嵌全零 v4
+			"::ffff:0:0/96":     true, // 同义的紧凑写法
+		}
+		if allSpace[prefix.String()] {
+			return "", fmt.Errorf("受信代理网段过宽（%s）：该网段覆盖全部地址空间，等同信任任意来源，请收窄到该 CDN 的回源网段", prefix.String())
+		}
 		minBits := 8
 		if prefix.Addr().Is6() {
 			minBits = 96

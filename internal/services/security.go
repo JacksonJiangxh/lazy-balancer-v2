@@ -897,6 +897,18 @@ func IsGeoIPPrecheckID(n int) bool {
 	return n >= geoipPrecheckRuleBase && n < geoipPrecheckRuleBase+100000
 }
 
+// IsStage1PrecheckID 判定事件触发 id 是否属阶段 1 预检族（第 59 轮 R59-P5
+// 收敛：{2,4,7,8,14} 五元组此前在 services 谓词与 handlers/security_overview
+// 两处独立字面量维护——阶段 1 新增预检 id 时两处漏改即分叉。单一事实源在此，
+// 消费方改调本函数）。
+func IsStage1PrecheckID(n int) bool {
+	switch n {
+	case 2, 4, 7, 8, 14:
+		return true
+	}
+	return IsGeoIPPrecheckID(n)
+}
+
 // intersectIPLists 返回多组 IP/CIDR 名单的网络感知交集（裁定 2026-09-07 S2）：
 // 对每对条目判断 CIDR 包含关系，保留更具体的一方（10.0.0.0/8 ∩ 10.1.0.5
 // = 10.1.0.5）。字符串精确匹配兼容（相同文本=同网络）。空交集返回 nil。
@@ -939,8 +951,17 @@ func intersectIPLists(lists [][]string) []string {
 
 // cidrIntersectEntry 判断两个 IP/CIDR 条目的网络包含关系，返回更具体的一方。
 func cidrIntersectEntry(a, b string) string {
+	// 第 59 轮 R59-P3（U5-2）：字面相等仍须过合法性门——坏条目字面相等会让
+	// allow 交集凭空非空（恒拒规则失效→渲染 fail-closed）。与聚合面「不可
+	// 解析不参与匹配」同口径：非法返回 ""（不参与交集）。
 	if a == b {
-		return a
+		if net.ParseIP(a) != nil {
+			return a
+		}
+		if _, _, err := net.ParseCIDR(a); err == nil {
+			return a
+		}
+		return ""
 	}
 	_, anet, aErr := net.ParseCIDR(a)
 	_, bnet, bErr := net.ParseCIDR(b)
@@ -1070,21 +1091,6 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 	if denyStatus <= 0 {
 		denyStatus = 403
 	}
-	var allowIntersection []string
-	if len(allowLists) > 0 {
-		allowIntersection = aggregateIPEntries(intersectIPLists(allowLists))
-		// 多条 allow 名单互不相交（交集为空）= 逐策略顺序评估下任意 IP 都会被
-		// 某个名单拒绝：恒拒规则等价表达（REMOTE_ADDR 恒非空）。
-		if len(allowIntersection) == 0 {
-			sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"@rx .*\" \"id:%d,phase:1,deny,status:%d,log,msg:'IP 白名单拒绝',skipAfter:SECURITY_RULES_END\"\n", ipPrecheckAllowRuleID, denyStatus))
-		} else {
-			operand, err := ipListRuleOperand("u-allow", allowIntersection, true)
-			if err != nil {
-				return "", err
-			}
-			sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:%d,phase:1,deny,status:%d,log,msg:'IP 白名单拒绝',skipAfter:SECURITY_RULES_END\"\n", operand, ipPrecheckAllowRuleID, denyStatus))
-		}
-	}
 	if len(denyUnion) > 0 {
 		operand, err := ipListRuleOperand("u-deny", denyUnion, false)
 		if err != nil {
@@ -1098,6 +1104,25 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 			return "", err
 		}
 		sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:4,phase:1,deny,status:%d,log,msg:'IP 黑名单',skipAfter:SECURITY_RULES_END\"\n", operand, denyStatus))
+	}
+	var allowIntersection []string
+	// allow 交集外拒绝（id:7，第 59 轮 R59-P5 后移）：置于 deny 并集/黑名单之后
+	// ——同在 deny 名单与 allow 交集外的 IP 先被 id:2/4 拒绝，事件归因「IP 黑名单
+	// 拒绝」（deny 侧精确语义）；id:7 只对「未被显式 deny 且不在 allow 交集」的
+	// IP 生效。拦截结果与既有语义等价（同 deny+status+skipAfter）。
+	if len(allowLists) > 0 {
+		allowIntersection = aggregateIPEntries(intersectIPLists(allowLists))
+		// 多条 allow 名单互不相交（交集为空）= 逐策略顺序评估下任意 IP 都会被
+		// 某个名单拒绝：恒拒规则等价表达（REMOTE_ADDR 恒非空）。
+		if len(allowIntersection) == 0 {
+			sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"@rx .*\" \"id:%d,phase:1,deny,status:%d,log,msg:'IP 白名单拒绝',skipAfter:SECURITY_RULES_END\"\n", ipPrecheckAllowRuleID, denyStatus))
+		} else {
+			operand, err := ipListRuleOperand("u-allow", allowIntersection, true)
+			if err != nil {
+				return "", err
+			}
+			sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:%d,phase:1,deny,status:%d,log,msg:'IP 白名单拒绝',skipAfter:SECURITY_RULES_END\"\n", operand, ipPrecheckAllowRuleID, denyStatus))
+		}
 	}
 	// allow 白名单豁免（第 58 轮用户裁定）：交集命中 = pass + 跳过后续 GeoIP
 	// 逐策略链（VIP 豁免语义）。置于 deny/blacklist 之后——显式 deny 命中照常
