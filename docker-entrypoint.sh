@@ -46,6 +46,14 @@ fi
   # caddy run 返回非零时杀死监督器本身(实测:kill -9 后监督器变僵尸不自愈)
   set +e
   echo $$ > /tmp/lazy-balancer-caddy-supervisor.pid
+  # 监督器日志双写: stdout(docker logs) + lazy-balancer.log(运行日志弹框可见,
+  # 时间戳格式与 services.Logf 对齐)——用户在基础设置→运行日志可看完整自愈链
+  APP_LOG="${LOG_FILE:-/app/logs/lazy-balancer.log}"
+  sup_log() {
+    LINE="$(date '+%Y/%m/%d %H:%M:%S') [caddy-supervisor] $1"
+    echo "$LINE"
+    echo "$LINE" >> "$APP_LOG" 2>/dev/null
+  }
   CRASHES=0
   while true; do
     # 暂停等待环(admin stop 后持 pause;startCaddy 删除后 ≤1s 退出本环)
@@ -53,7 +61,7 @@ fi
       sleep 1
     done
 
-    echo "[caddy-supervisor] Starting Caddy..."
+    sup_log "Starting Caddy..."
     caddy run --config /app/config/Caddyfile --adapter caddyfile &
     CADDY_PID=$!
 
@@ -65,9 +73,9 @@ fi
           if wget -q -O /dev/null -T 5 --header="Content-Type: application/json" \
             --post-file=/app/data/last_good_caddy_config.json \
             http://localhost:2019/load 2>/dev/null; then
-            echo "[caddy-supervisor] Re-applied last known good config"
+            sup_log "Re-applied last known good config (last_good 快照)"
           else
-            echo "[caddy-supervisor] WARN: last-good config re-apply failed"
+            sup_log "WARN: last-good config re-apply failed"
           fi
         fi
         # trigger 文件:lazy-balancer 侧监听后走与启动完全相同的 DB 渲染→校验→
@@ -81,11 +89,11 @@ fi
     # 等待 Caddy 退出(wait 同时回收进程——零僵尸)
     wait $CADDY_PID
     CODE=$?
-    echo "[caddy-supervisor] Caddy exited (code $CODE)"
+    sup_log "Caddy exited (code $CODE)"
 
     # admin 停止(pause 已建)→ 不重启,回等待环
     if [ -f "$CADDY_PAUSE_FILE" ]; then
-      echo "[caddy-supervisor] Admin stop detected, standing by..."
+      sup_log "Admin stop detected, standing by..."
       CRASHES=0
       continue
     fi
@@ -93,10 +101,10 @@ fi
     # 崩溃 → 退避重启
     CRASHES=$((CRASHES+1))
     if [ "$CRASHES" -lt 5 ]; then
-      echo "[caddy-supervisor] Crash #$CRASHES, restarting in 1s"
+      sup_log "Crash #$CRASHES, restarting in 1s"
       sleep 1
     else
-      echo "[caddy-supervisor] Crash #$CRASHES, backing off 30s"
+      sup_log "Crash #$CRASHES, backing off 30s"
       sleep 30
       CRASHES=0
     fi
