@@ -42,6 +42,9 @@ fi
 #   • startCaddy handler 删 pause 后监督器 ≤1s 检测并启动(等待环 1s 粒度)
 #   • 容器 stop:PID1(lazy-balancer)退出 → 容器 teardown 杀全部进程(含监督器)
 (
+  # set +e: 监督器必须扛住 Caddy 的非零退出(被杀/崩溃)——外层 set -e 会在
+  # caddy run 返回非零时杀死监督器本身(实测:kill -9 后监督器变僵尸不自愈)
+  set +e
   echo $$ > /tmp/lazy-balancer-caddy-supervisor.pid
   CRASHES=0
   while true; do
