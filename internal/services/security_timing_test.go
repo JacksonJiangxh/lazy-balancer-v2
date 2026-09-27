@@ -59,12 +59,14 @@ func TestSecurityTimingLoad_parsesAndTruncates(t *testing.T) {
 func TestSecurityTimingLoad_missingFileSilentDegradation(t *testing.T) {
 	origPath := securityTimingLogPath
 	securityTimingLogPath = filepath.Join(t.TempDir(), "nonexistent.log")
-	defer func() { securityTimingLogPath = origPath }()
+	securityTimingTickMap = nil // 隔离前测残留(合并语义下 map 跨 load 保活)
+	defer func() { securityTimingLogPath = origPath; securityTimingTickMap = nil }()
 
 	securityTimingLoad()
 
-	if securityTimingTickMap != nil {
-		t.Errorf("tick map = %v; want nil on missing file", securityTimingTickMap)
+	// 合并语义(2026-09-27):首启动即建空 map(非 nil),查表 miss 即耗时 0
+	if securityTimingTickMap == nil || len(securityTimingTickMap) != 0 {
+		t.Errorf("tick map = %v; want empty non-nil map on missing file", securityTimingTickMap)
 	}
 	if _, ok := securityTimingLookup("anything"); ok {
 		t.Error("lookup should miss on nil map")
