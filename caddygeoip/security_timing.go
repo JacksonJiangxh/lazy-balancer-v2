@@ -35,7 +35,7 @@ var (
 
 // AppendSecurityTiming 追加一行「<id> <ms>」到耗时侧车日志(写侧:blocked_counter)。
 // 任何 I/O 失败静默降级——耗时是增强信息,不产生任何请求路径错误。
-func AppendSecurityTiming(id string, durationMs int64) {
+func AppendSecurityTiming(id string, durationUs int64) {
 	if id == "" {
 		return
 	}
@@ -49,7 +49,7 @@ func AppendSecurityTiming(id string, durationMs int64) {
 		}
 		securityTimingFd = f
 	}
-	_, _ = fmt.Fprintf(securityTimingFd, "%s %d\n", id, durationMs)
+	_, _ = fmt.Fprintf(securityTimingFd, "%s %d\n", id, durationUs)
 }
 
 // securityTimingID 生成 8 字符随机 hex 作 timing 关联 ID(碰撞概率 1/16^8≈

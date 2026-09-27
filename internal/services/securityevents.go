@@ -52,7 +52,7 @@ type securityEventRecord struct {
 	RuleMsg           string
 	Action            string
 	AnomalyScore      int
-	DurationMs        int64
+	DurationUs        int64
 	RequestHeaders    string
 	RequestBody       string
 }
@@ -174,7 +174,7 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 	// (历史条目/竞态先于写侧)保持 0,UI 显示为「—」。
 	if tid := securityEventsFirstHeader(tx.Request.Headers, "x-lb-security-timing-id"); tid != "" {
 		if dur, ok := securityTimingLookup(tid); ok {
-			rec.DurationMs = dur
+			rec.DurationUs = dur
 		}
 	}
 	rec.RequestHeaders = securityEventsSerializeHeaders(tx.Request.Headers)
@@ -1130,7 +1130,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 		return offset, fmt.Errorf("security events: begin insert transaction: %w", err)
 	}
 	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO security_events
-		(event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, anomaly_score, rule_name, policy_name, transaction_id, duration_ms, request_headers, request_body)
+		(event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, anomaly_score, rule_name, policy_name, transaction_id, duration_us, request_headers, request_body)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
@@ -1282,7 +1282,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 			policyID, policyName := securityEventsAttributePolicy(rule.caddyID, rec.RuleTriggered, rec.Action, rec.ClientIP, policyByID, bindings)
 			if _, ierr := stmt.Exec(rec.EventTime, rule.caddyID, policyID, rec.ClientIP, rec.Method, rec.URI,
 				rec.EventType, rec.RuleTriggered, rec.RuleMsg, rec.Action, rec.AnomalyScore,
-				rule.name, policyName, rec.TransactionID, rec.DurationMs, rec.RequestHeaders, rec.RequestBody); ierr != nil {
+				rule.name, policyName, rec.TransactionID, rec.DurationUs, rec.RequestHeaders, rec.RequestBody); ierr != nil {
 				_ = stmt.Close()
 				_ = tx.Rollback()
 				return committedOffset, fmt.Errorf("security events: insert event: %w", ierr)
@@ -1299,7 +1299,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 					return committedOffset, fmt.Errorf("security events: begin batch transaction: %w", err)
 				}
 				stmt, err = tx.Prepare(`INSERT OR IGNORE INTO security_events
-				(event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, anomaly_score, rule_name, policy_name, transaction_id, duration_ms, request_headers, request_body)
+				(event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, anomaly_score, rule_name, policy_name, transaction_id, duration_us, request_headers, request_body)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 				if err != nil {
 					tx.Rollback()
@@ -1458,7 +1458,7 @@ var securityTimingTickMap map[string]int64
 // const 是为了测试可覆写(同 auditLogPath 模式)。
 var securityTimingLogPath = "/app/logs/waf-audit/security-timing.log"
 
-// securityTimingLoad 全量读入耗时侧车文件到 tick 级 map(覆盖式重建)。
+// securityTimingLoad 全量读入耗时侧车文件(微秒)到 tick 级 map(覆盖式重建)。
 // 文件量级:数秒消费窗口 × <30B/行,常态 <100KB;全量重读成本可忽略。
 func securityTimingLoad() {
 	securityTimingTickMap = nil
