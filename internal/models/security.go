@@ -292,6 +292,10 @@ type SecurityTopIP struct {
 	Detected   int    `json:"detected"`
 	LastTime   string `json:"last_time"`
 	AttackType string `json:"attack_type"`
+	// AttackTypeStage 是该 IP 的阶段化攻击类型(F62-8:后端 stageCategorizeAttack
+	// 单源产出,消除前端 familyToStage 硬编码映射——后端新增 family 时不再静默
+	// 落「其他」)。
+	AttackTypeStage string `json:"attack_type_stage"`
 }
 
 type SecurityAttackType struct {

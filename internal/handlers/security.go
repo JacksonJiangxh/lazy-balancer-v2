@@ -3394,6 +3394,7 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 		ipRows.Close()
 	}
 	familyCountsByIP := map[string]map[string]int{}
+	stageFamilyCountsByIP := map[string]map[string]int{} // F62-8:阶段化双轨
 	// R63 B-N4：攻击族查询按 Top-10 结果收窄（替换原全量 GROUP BY + LIMIT 5000）——
 	// 高基数攻击洪峰下组合数超限会使部分 Top-IP 的攻击类型标签静默缺失
 	// （「数对、标签少」）；收窄后组合数有界（10 × 该 IP 的规则/消息数），无需截断。
@@ -3417,6 +3418,12 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 				familyCountsByIP[ip] = counts
 			}
 			counts[categorizeAttack(ruleTriggered, ruleMsg)] += cnt
+			stageCounts := stageFamilyCountsByIP[ip]
+			if stageCounts == nil {
+				stageCounts = map[string]int{}
+				stageFamilyCountsByIP[ip] = stageCounts
+			}
+			stageCounts[stageCategorizeAttack(ruleTriggered, ruleMsg)] += cnt
 		}
 		if famRows != nil {
 			trackErr(famRows.Err()) // 迭代中途失败同样显式报错，与 D3 标准一致（R36 F2）
@@ -3426,12 +3433,13 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 	overview.TopIPs = make([]models.SecurityTopIP, 0, len(topRows))
 	for _, row := range topRows {
 		overview.TopIPs = append(overview.TopIPs, models.SecurityTopIP{
-			IP:         row.ip,
-			IPLocation: enrichIPLocation(row.ip),
-			Blocked:    row.blocked,
-			Detected:   row.detected,
-			LastTime:   row.lastTime,
-			AttackType: joinDistinctFamilies(familyCountsByIP[row.ip]),
+			IP:              row.ip,
+			IPLocation:      enrichIPLocation(row.ip),
+			Blocked:         row.blocked,
+			Detected:        row.detected,
+			LastTime:        row.lastTime,
+			AttackType:      joinDistinctFamilies(familyCountsByIP[row.ip]),
+			AttackTypeStage: joinDistinctFamilies(stageFamilyCountsByIP[row.ip]),
 		})
 	}
 

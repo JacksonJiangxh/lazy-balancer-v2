@@ -264,7 +264,8 @@ import type { APIResponse } from '@/types'
 use([CanvasRenderer, BarChart, PieSeries, GridComponent, TooltipComponent, LegendComponent])
 
 interface TrendPoint { date: string; blocked: number; detected: number }
-interface TopIP { ip: string; ip_location: string; blocked: number; detected: number; last_time: string; attack_type: string }
+interface TopIP { ip: string; ip_location: string; blocked: number; detected: number; last_time: string; attack_type: string; attack_type_stage?: string
+}
 interface AttackType { name: string; value: number }
 interface Overview { today_blocked: number; today_detected: number; active_policies: number; crs_version: string; crs_available?: boolean; ip2region_available?: boolean; update_status?: string; trend: TrendPoint[]; top_ips: TopIP[]; attack_types: AttackType[]; attack_types_stage: AttackType[] }
 interface SecurityEvent { id: number; event_time: string; client_ip: string; rule_caddy_id: string; rule_name: string; policy_name: string; ip_location?: string }
@@ -315,18 +316,11 @@ const attackByStage = ref(true)
 // Top 10 攻击类型列与分布图「按阶段展示」勾选联动（第 59 轮微调）：勾选时把
 // 具体 family（joinDistinctFamilies 产物）映射到阶段五桶去重展示，取消勾选
 // 恢复具体分类文本——与分布图同口径（后端 stageCategorizeAttack 的 family 版）。
-const WAF_FAMILIES = new Set(['自定义规则', 'SQL注入', 'XSS', '文件包含', '文件读取', '命令注入', 'PHP注入', '通用攻击', '协议异常', '协议攻击', '方法限制', '协议攻击（CRS v3 遗留标签）', '请求体限制', '扫描探测', '会话固定', '通用排除（CRS 后）', 'Java 攻击', '响应信息泄露', '响应 SQL 泄露', '响应 PHP 泄露', '响应阻断评估', '请求阻断评估'])
-const familyToStage = (f: string): string => {
-  if (f === '信任名单') return '信任名单'
-  if (f === '请求体异常') return '请求体异常'
-  if (f === 'IP 访问控制' || f === '威胁情报库' || f === '地域拦截') return 'IP 访问控制'
-  if (WAF_FAMILIES.has(f)) return 'WAF'
-  return '其他'
-}
+// F62-8:阶段视图直接消费后端 attack_type_stage(后端 stageCategorizeAttack
+// 单源产出)——原前端 familyToStage 硬编码映射已删,后端新增 family 不再静默落「其他」
 const topIpAttackLabel = (row: TopIP): string => {
   if (!attackByStage.value) return row.attack_type || '—'
-  const stages = [...new Set((row.attack_type || '').split('、').filter(Boolean).map(familyToStage))]
-  return stages.length > 0 ? stages.join('、') : '—'
+  return row.attack_type_stage || '—'
 }
 const overview = ref<Overview>({ today_blocked: 0, today_detected: 0, active_policies: 0, crs_version: '', trend: [], top_ips: [], attack_types: [], attack_types_stage: [] })
 // 分布图展示模式：勾选=按阶段五桶（默认，与触发阶段口径一致）；取消=具体分类
