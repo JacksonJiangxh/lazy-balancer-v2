@@ -884,6 +884,15 @@ const fetchRuleHealth = async (currentRules: Rule[], version: number) => {
     const res = await request.get<APIResponse<HealthResponse>>('/config/health', { signal: dashboardPolling.signal, silent: true })
     if (disposed || version !== rulesVersion) return
     const healthData = res.data || {}
+    // F62-24(第 62 轮):healthData 是 {server: {hostPort: health}} 嵌套——
+    // 预展平为 Map<hostPort, health>一次遍历,消除 rule×upstream×server 三重
+    // 嵌套扫描(原每上游遍历全部 server 健康组,15s 轮询全量执行)。
+    const healthByHostPort = new Map<string, NonNullable<HealthResponse[string]>[string]>()
+    for (const serverHealth of Object.values(healthData)) {
+      for (const [key, upHealth] of Object.entries(serverHealth || {})) {
+        if (upHealth && !healthByHostPort.has(key)) healthByHostPort.set(key, upHealth)
+      }
+    }
     const nextRuleHealth: Record<string, RuleHealth> = {}
     currentRules.forEach((rule: Rule) => {
       const enabledUpstreams = rule.upstreams?.filter((upstream) => upstream.enabled !== false) || []
@@ -895,22 +904,16 @@ const fetchRuleHealth = async (currentRules: Rule[], version: number) => {
 
         enabledUpstreams.forEach((u) => {
           const key = hostPortKey(u.host, u.port)
-          let found = false
-          for (const serverHealth of Object.values(healthData)) {
-            const upHealth = serverHealth?.[key]
-            if (upHealth) {
-              found = true
-              if (upHealth.unknown) {
-                hasUnknown = true
-              } else if (!upHealth.healthy) {
-                hasUnhealthy = true
-              } else if (upHealth.degraded) {
-                hasDegraded = true
-              }
-              break
-            }
+          const upHealth = healthByHostPort.get(key)
+          if (!upHealth) {
+            hasUnknown = true
+          } else if (upHealth.unknown) {
+            hasUnknown = true
+          } else if (!upHealth.healthy) {
+            hasUnhealthy = true
+          } else if (upHealth.degraded) {
+            hasDegraded = true
           }
-          if (!found) hasUnknown = true
         })
 
         if (hasUnhealthy) status = 'unhealthy'

@@ -916,6 +916,9 @@ func intersectIPLists(lists [][]string) []string {
 	if len(lists) == 0 {
 		return nil
 	}
+	// F62-20(第 62 轮):预解析缓存——原实现每对条目都重新 ParseCIDR/ParseIP,
+	// 64 份满额 allow 名单最坏 ~1575 万次解析;缓存后每唯一条目只解析一次。
+	cache := make(map[string]*parsedEntry, 512)
 	candidate := make(map[string]struct{}, len(lists[0]))
 	for _, entry := range lists[0] {
 		if entry != "" {
@@ -929,7 +932,7 @@ func intersectIPLists(lists [][]string) []string {
 				if inner == "" {
 					continue
 				}
-				if hit := cidrIntersectEntry(outer, inner); hit != "" {
+				if hit := cidrIntersectParsed(parseEntryCached(outer, cache), parseEntryCached(inner, cache)); hit != "" {
 					next[hit] = struct{}{}
 				}
 			}
@@ -947,6 +950,67 @@ func intersectIPLists(lists [][]string) []string {
 	}
 	sort.Strings(intersection)
 	return intersection
+}
+
+// parsedEntry 是 IP/CIDR 条目的一次解析结果(F62-20 预解析缓存条目)。
+type parsedEntry struct {
+	raw   string     // 原始条目串(交集结果须返回原始形态)
+	ip    net.IP     // 非 nil = 纯 IP 条目
+	net   *net.IPNet // 非 nil = CIDR 条目
+	ones  int        // CIDR 掩码长度
+	valid bool       // 合法条目(IP 或 CIDR)
+}
+
+// parseEntryCached 带缓存解析(同一条目在整次交集内只解析一次)。
+func parseEntryCached(s string, cache map[string]*parsedEntry) *parsedEntry {
+	if p, ok := cache[s]; ok {
+		return p
+	}
+	p := &parsedEntry{raw: s}
+	if ip := net.ParseIP(s); ip != nil {
+		p.ip = ip
+		p.valid = true
+	} else if _, ipnet, err := net.ParseCIDR(s); err == nil {
+		p.net = ipnet
+		p.ones, _ = ipnet.Mask.Size()
+		p.valid = true
+	}
+	cache[s] = p
+	return p
+}
+
+// cidrIntersectParsed 与 cidrIntersectEntry 同语义,但消费预解析条目(免重复
+// ParseCIDR/ParseIP);a 保留原串供返回(交集结果须是原始字符串形态)。
+func cidrIntersectParsed(pa, b *parsedEntry) string {
+	if !pa.valid || !b.valid {
+		return ""
+	}
+	// 字面相等且合法(与 cidrIntersectEntry 的 a==b 快路径同口径)
+	if pa.raw == b.raw {
+		return pa.raw
+	}
+	if pa.net != nil && b.net != nil {
+		if pa.net.Contains(b.net.IP) && pa.ones <= b.ones {
+			return b.raw
+		}
+		if b.net.Contains(pa.net.IP) && b.ones <= pa.ones {
+			return pa.raw
+		}
+		return ""
+	}
+	if pa.net != nil && b.ip != nil {
+		if pa.net.Contains(b.ip) {
+			return b.raw
+		}
+		return ""
+	}
+	if pa.ip != nil && b.net != nil {
+		if b.net.Contains(pa.ip) {
+			return pa.raw
+		}
+		return ""
+	}
+	return ""
 }
 
 // cidrIntersectEntry 判断两个 IP/CIDR 条目的网络包含关系，返回更具体的一方。

@@ -535,20 +535,20 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, nextTick, watch } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { Aim, Filter, List, Location, Lock, Search, Notebook, Plus, WarningFilled } from '@element-plus/icons-vue'
 import { formatDate } from '@/utils/date'
 import { compareVersion, IP_LIST_CATEGORIES} from '@/utils/securityStages'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import RuleLibScheduleEditor from '@/components/RuleLibScheduleEditor.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { request, ApiRequestError, mfaAwareSuccess, formatBytes } from '@/utils/api'
+import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
 import { showSaveResult } from '@/utils/saveResult'
 import { isValidCidr } from '@/utils/ruleValidation'
 import { useAuthStore } from '@/stores/auth'
 
-import { usePollingTask } from '@/composables/usePollingTask'
 import { useClampedPagination } from '@/composables/useClampedPagination'
+import { useLibUpdateDialog } from '@/composables/useLibUpdateDialog'
 import type { APIResponse, UserListItem } from '@/types'
 // —— 威胁情报库（v2.3.x 第二张规则来源卡）——
 interface ThreatSource {
@@ -698,78 +698,31 @@ const openLibDialog = (row: LibRow) => {
   } else if (row.key === 'ip2region') {
     manualIP2RegionUpdate()
   } else if (row.key === 'threat') {
-    threatRequestSeq++
-    threatUpdateInfo.value = null
-    threatUpdateLog.value = ''
-    threatUpdateDialogVisible.value = true
+    threatDialog.open()
   }
 }
 
 
-// —— 威胁库更新弹框（与 CRS/IP 库同款：状态 + 日志流 + 立即更新）——
-const threatUpdateDialogVisible = ref(false)
-const threatUpdateInfo = ref<{ running: boolean; trigger: string; started_at: string; finished_at: string; outcome: string } | null>(null)
-const threatUpdateLog = ref('')
+// —— 威胁库更新弹框（useLibUpdateDialog 统一范式，F62-11；状态/日志拉取失败静默，与原实现一致）——
 const threatUpdateLogRef = ref<HTMLDivElement | null>(null)
-const startingThreatUpdate = ref(false)
-let threatRequestSeq = 0
-
-const threatUpdateRunning = computed(() => threatUpdateInfo.value?.running === true)
-
-const refreshThreatUpdateStatus = async () => {
-  if (!threatUpdateDialogVisible.value) return
-  const requestSeq = ++threatRequestSeq
-  const [statusResult, logsResult] = await Promise.allSettled([
-    request.get<APIResponse<{ running: boolean; trigger: string; started_at: string; finished_at: string; outcome: string }>>('/security/threat-lib/update/status', { silent: true }),
-    request.get<APIResponse<{ content: string }>>('/security/threat-lib/update/logs', { silent: true }),
-  ])
-  if (!threatUpdateDialogVisible.value || requestSeq !== threatRequestSeq) return
-  if (statusResult.status === 'fulfilled') {
-    threatUpdateInfo.value = statusResult.value.data || null
-  }
-  if (logsResult.status === 'fulfilled') {
-    threatUpdateLog.value = logsResult.value.data?.content || ''
-    await nextTick()
-    if (threatUpdateLogRef.value) threatUpdateLogRef.value.scrollTop = threatUpdateLogRef.value.scrollHeight
-  }
-  if (!threatUpdateRunning.value && threatUpdateInfo.value) {
-    stopThreatPolling()
-    if (threatUpdateInfo.value.outcome === 'success') fetchThreatLib()
-  }
-}
-
-const threatUpdatePolling = usePollingTask(async () => { await refreshThreatUpdateStatus() }, { interval: 2000 })
-const startThreatPolling = () => { threatUpdatePolling.resume() }
-const stopThreatPolling = () => { threatUpdatePolling.pause() }
-
-const onThreatUpdateDialogOpened = async () => {
-  ensureScheduleTz()
-  await refreshThreatUpdateStatus()
-  if (threatUpdateRunning.value) startThreatPolling()
-}
-const onThreatUpdateDialogClosed = () => {
-  threatRequestSeq++
-  stopThreatPolling()
-  threatUpdateInfo.value = null
-  threatUpdateLog.value = ''
-}
-
-const confirmThreatUpdate = async () => {
-  startingThreatUpdate.value = true
-  try {
-    await request.post('/security/threat-lib/update', undefined, { silent: true })
-  } catch (error) {
-    if (!(error instanceof ApiRequestError && error.status === 409)) {
-      ElMessage.error(error instanceof Error ? error.message : '触发更新失败')
-    }
-  } finally {
-    startingThreatUpdate.value = false
-  }
-  if (!threatUpdateDialogVisible.value) return
-  await refreshThreatUpdateStatus()
-  if (!threatUpdateDialogVisible.value) return
-  startThreatPolling()
-}
+const threatDialog = useLibUpdateDialog<ThreatUpdateInfo>({
+  apiPrefix: '/security/threat-lib',
+  logContainer: threatUpdateLogRef,
+  isRunning: (info) => info?.running === true,
+  isFinished: (info) => info.running !== true,
+  isSuccess: (info) => info.outcome === 'success',
+  onSuccess: fetchThreatLib,
+  onOpen: () => { ensureScheduleTz() },
+})
+const {
+  visible: threatUpdateDialogVisible,
+  logs: threatUpdateLog,
+  updating: threatUpdateRunning,
+  starting: startingThreatUpdate,
+  onOpened: onThreatUpdateDialogOpened,
+  onClosed: onThreatUpdateDialogClosed,
+  confirmUpdate: confirmThreatUpdate,
+} = threatDialog
 interface CRSRuleFile { filename: string; category: string; size: number; updated_at: string }
 interface CustomRuleCondition { target: string; operator: string; pattern: string }
 interface CustomRule { id: number; name: string; description: string; conditions: CustomRuleCondition[]; action: string; score: number; enabled: boolean; updated_at: string; updated_by: number }
@@ -778,6 +731,7 @@ interface IPListRefPolicy { id: number; name: string }
 interface IPListRow { id: number; name: string; description: string; category: string; entries: IPListEntry[]; entry_count: number; ref_count: number; ref_policies: IPListRefPolicy[]; created_by: number; created_at: string; updated_by: number; updated_at: string; system: boolean }
 interface CRSUpdateInfo { readonly status: string; readonly trigger: string; readonly started_at: string; readonly finished_at: string; readonly message: string; readonly version: string }
 interface IP2RegionUpdateInfo { readonly status: string; readonly trigger: string; readonly started_at: string; readonly finished_at: string; readonly message: string; readonly version: string }
+interface ThreatUpdateInfo { running: boolean; trigger: string; started_at: string; finished_at: string; outcome: string }
 
 const authStore = useAuthStore()
 const isSlaveNode = computed(() => authStore.nodeMode === 'slave')
@@ -1289,208 +1243,51 @@ const saveThreatSchedule = async ({ days, time }: { days: number[]; time: string
   } catch { /* 全局拦截器已 toast */ } finally { savingThreatSchedule.value = false }
 }
 
-const updateDialogVisible = ref(false)
-const updateInfo = ref<CRSUpdateInfo | null>(null)
-const updateLog = ref('')
+// —— CRS 规则库更新弹框（useLibUpdateDialog 统一范式，F62-11）——
 const updateLogRef = ref<HTMLDivElement | null>(null)
-let updateRequestSeq = 0
-
-const startingUpdate = ref(false)
-const crsUpdateRunning = computed(() => {
-  const s = updateInfo.value?.status || ''
-  return s === 'checking' || s === 'downloading' || s === 'installing' || s === 'reloading'
+const crsDialog = useLibUpdateDialog<CRSUpdateInfo>({
+  apiPrefix: '/security/crs',
+  logContainer: updateLogRef,
+  errorLabel: 'CRS',
+  isRunning: (info) => ['checking', 'downloading', 'installing', 'reloading'].includes(info?.status || ''),
+  isFinished: (info) => info.status === 'success' || info.status === 'failed',
+  isSuccess: (info) => info.status === 'success',
+  onSuccess: () => { fetchCRS(); fetchRules() },
+  onOpen: () => { ensureScheduleTz() },
 })
+const {
+  visible: updateDialogVisible,
+  logs: updateLog,
+  updating: crsUpdateRunning,
+  starting: startingUpdate,
+  open: manualUpdate,
+  onOpened: onUpdateDialogOpened,
+  onClosed: onUpdateDialogClosed,
+  confirmUpdate,
+} = crsDialog
 
-const manualUpdate = () => {
-  updateRequestSeq++
-  updateInfo.value = null
-  updateLog.value = ''
-  updateDialogVisible.value = true
-}
-
-// 打开弹框只拉取一次当前状态与既有日志；若有任务在跑则继续实时轮询
-const onUpdateDialogOpened = async () => {
-  ensureScheduleTz()
-  await refreshUpdateStatus()
-  if (crsUpdateRunning.value) {
-    startUpdatePolling()
-  }
-}
-
-// 确认触发更新：409 表示已有任务在运行，跳过触发直接轮询进度
-const confirmUpdate = async () => {
-  startingUpdate.value = true
-  try {
-    await request.post<APIResponse<{ status: string; trigger: string }>>('/security/crs/update', undefined, { silent: true })
-  } catch (error) {
-    if (!(error instanceof ApiRequestError && error.status === 409)) {
-      ElMessage.error(error instanceof Error ? error.message : '触发更新失败')
-    }
-  } finally {
-    startingUpdate.value = false
-  }
-  if (!updateDialogVisible.value) return
-  await refreshUpdateStatus()
-  if (!updateDialogVisible.value) return
-  startUpdatePolling()
-}
-
-const onUpdateDialogClosed = () => {
-  updateRequestSeq++
-  stopUpdatePolling()
-  updateInfo.value = null
-  updateLog.value = ''
-}
-
-// SR15-P3④:手写 setInterval → usePollingTask(后台标签页暂停/自动清理,
-// 与 Dashboard 同源;两套重复裸轮询一并收敛)。
-const crsUpdatePolling = usePollingTask(async () => { await refreshUpdateStatus() }, { interval: 2000 })
-
-const startUpdatePolling = () => {
-  crsUpdatePolling.resume()
-}
-
-const stopUpdatePolling = () => {
-  // F-1:弹框会话级暂停(非终态)——stop 会永久 disposed,重开弹框即失效;
-  // 组件卸载的终态清理由 usePollingTask 内置 onUnmounted 兜底。
-  crsUpdatePolling.pause()
-}
-
-const refreshUpdateStatus = async () => {
-  if (!updateDialogVisible.value) return
-  const requestSeq = ++updateRequestSeq
-  const [statusResult, logsResult] = await Promise.allSettled([
-    request.get<APIResponse<CRSUpdateInfo>>('/security/crs/update/status', { silent: true }),
-    request.get<APIResponse<{ content: string }>>('/security/crs/update/logs', { silent: true }),
-  ])
-  if (!updateDialogVisible.value || requestSeq !== updateRequestSeq) return
-  if (statusResult.status === 'fulfilled') {
-    updateInfo.value = statusResult.value.data || null
-  } else {
-    console.error('Failed to fetch CRS update status:', statusResult.reason)
-  }
-  if (logsResult.status === 'fulfilled') {
-    updateLog.value = logsResult.value.data?.content || ''
-    await scrollUpdateLogToBottom()
-  } else {
-    console.error('Failed to fetch CRS update logs:', logsResult.reason)
-  }
-  const status = updateInfo.value?.status
-  if (status === 'success' || status === 'failed') {
-    stopUpdatePolling()
-    if (status === 'success') {
-      fetchCRS()
-      fetchRules()
-    }
-  }
-}
-
-const scrollUpdateLogToBottom = async () => {
-  await nextTick()
-  if (updateLogRef.value) {
-    updateLogRef.value.scrollTop = updateLogRef.value.scrollHeight
-  }
-}
-
-const ip2regionUpdateDialogVisible = ref(false)
-const ip2regionUpdateInfo = ref<IP2RegionUpdateInfo | null>(null)
-const ip2regionUpdateLog = ref('')
+// —— IP2Region 库更新弹框（useLibUpdateDialog 统一范式，F62-11）——
 const ip2regionUpdateLogRef = ref<HTMLDivElement | null>(null)
-let ip2regionRequestSeq = 0
-
-const startingIP2RegionUpdate = ref(false)
-const ip2regionUpdateRunning = computed(() => {
-  const s = ip2regionUpdateInfo.value?.status || ''
-  return s === 'checking' || s === 'downloading' || s === 'installing' || s === 'reloading'
+const ip2regionDialog = useLibUpdateDialog<IP2RegionUpdateInfo>({
+  apiPrefix: '/security/ip2region',
+  logContainer: ip2regionUpdateLogRef,
+  errorLabel: 'IP2Region',
+  isRunning: (info) => ['checking', 'downloading', 'installing', 'reloading'].includes(info?.status || ''),
+  isFinished: (info) => info.status === 'success' || info.status === 'failed',
+  isSuccess: (info) => info.status === 'success',
+  onSuccess: fetchIP2RegionInfo,
+  onOpen: () => { ensureScheduleTz() },
 })
-
-const manualIP2RegionUpdate = () => {
-  ip2regionRequestSeq++
-  ip2regionUpdateInfo.value = null
-  ip2regionUpdateLog.value = ''
-  ip2regionUpdateDialogVisible.value = true
-}
-
-// 打开弹框只拉取一次当前状态与既有日志；若有任务在跑则继续实时轮询
-const onIP2RegionUpdateDialogOpened = async () => {
-  ensureScheduleTz()
-  await refreshIP2RegionUpdateStatus()
-  if (ip2regionUpdateRunning.value) {
-    startIP2RegionPolling()
-  }
-}
-
-// 确认触发更新：409 表示已有任务在运行，跳过触发直接轮询进度
-const confirmIP2RegionUpdate = async () => {
-  startingIP2RegionUpdate.value = true
-  try {
-    await request.post<APIResponse<{ status: string; trigger: string }>>('/security/ip2region/update', undefined, { silent: true })
-  } catch (error) {
-    if (!(error instanceof ApiRequestError && error.status === 409)) {
-      ElMessage.error(error instanceof Error ? error.message : '触发更新失败')
-    }
-  } finally {
-    startingIP2RegionUpdate.value = false
-  }
-  if (!ip2regionUpdateDialogVisible.value) return
-  await refreshIP2RegionUpdateStatus()
-  if (!ip2regionUpdateDialogVisible.value) return
-  startIP2RegionPolling()
-}
-
-const onIP2RegionUpdateDialogClosed = () => {
-  ip2regionRequestSeq++
-  stopIP2RegionPolling()
-  ip2regionUpdateInfo.value = null
-  ip2regionUpdateLog.value = ''
-}
-
-// SR15-P3④:同 CRS 侧收敛。
-const ip2regionUpdatePolling = usePollingTask(async () => { await refreshIP2RegionUpdateStatus() }, { interval: 2000 })
-
-const startIP2RegionPolling = () => {
-  ip2regionUpdatePolling.resume()
-}
-
-const stopIP2RegionPolling = () => {
-  // F-1:同 CRS 侧,弹框会话级暂停。
-  ip2regionUpdatePolling.pause()
-}
-
-const refreshIP2RegionUpdateStatus = async () => {
-  if (!ip2regionUpdateDialogVisible.value) return
-  const requestSeq = ++ip2regionRequestSeq
-  const [statusResult, logsResult] = await Promise.allSettled([
-    request.get<APIResponse<IP2RegionUpdateInfo>>('/security/ip2region/update/status', { silent: true }),
-    request.get<APIResponse<{ content: string }>>('/security/ip2region/update/logs', { silent: true }),
-  ])
-  if (!ip2regionUpdateDialogVisible.value || requestSeq !== ip2regionRequestSeq) return
-  if (statusResult.status === 'fulfilled') {
-    ip2regionUpdateInfo.value = statusResult.value.data || null
-  } else {
-    console.error('Failed to fetch IP2Region update status:', statusResult.reason)
-  }
-  if (logsResult.status === 'fulfilled') {
-    ip2regionUpdateLog.value = logsResult.value.data?.content || ''
-    await scrollIP2RegionUpdateLogToBottom()
-  } else {
-    console.error('Failed to fetch IP2Region update logs:', logsResult.reason)
-  }
-  const status = ip2regionUpdateInfo.value?.status
-  if (status === 'success' || status === 'failed') {
-    stopIP2RegionPolling()
-    if (status === 'success') {
-      fetchIP2RegionInfo()
-    }
-  }
-}
-
-const scrollIP2RegionUpdateLogToBottom = async () => {
-  await nextTick()
-  if (ip2regionUpdateLogRef.value) {
-    ip2regionUpdateLogRef.value.scrollTop = ip2regionUpdateLogRef.value.scrollHeight
-  }
-}
+const {
+  visible: ip2regionUpdateDialogVisible,
+  logs: ip2regionUpdateLog,
+  updating: ip2regionUpdateRunning,
+  starting: startingIP2RegionUpdate,
+  open: manualIP2RegionUpdate,
+  onOpened: onIP2RegionUpdateDialogOpened,
+  onClosed: onIP2RegionUpdateDialogClosed,
+  confirmUpdate: confirmIP2RegionUpdate,
+} = ip2regionDialog
 
 const openRuleDialog = (row?: CustomRule) => {
   editingRuleId.value = row?.id ?? null
@@ -1551,10 +1348,9 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  updateRequestSeq++
-  stopUpdatePolling()
-  ip2regionRequestSeq++
-  stopIP2RegionPolling()
+  // 作废在途响应并暂停轮询（轮询终态清理由 usePollingTask 内置 onUnmounted 兜底）
+  crsDialog.dispose()
+  ip2regionDialog.dispose()
 })
 </script>
 
