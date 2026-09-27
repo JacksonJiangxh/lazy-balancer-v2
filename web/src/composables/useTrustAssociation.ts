@@ -58,8 +58,6 @@ export const useTrustAssociation = (options: {
     const refs = parseRefIds(policy[SIDE_CONFIG[side].refField])
     return options.getList().find((l) => refs.includes(l.id) && !l.system) ?? null
   }
-  /** 兼容别名：信任侧列表解析 */
-  const resolveTrustList = (policy: TrustPolicyLike): TrustListRef | null => resolveSideList(policy, 'trust')
 
   /** 同侧全部非系统列表（第 60 轮用户验收：多列表绑定时逐列表出按钮，不再只取第一个） */
   const resolveSideLists = (policy: TrustPolicyLike, side: ListSide): IpListOption[] => {
@@ -129,10 +127,6 @@ export const useTrustAssociation = (options: {
     }
   }
 
-  /** 兼容别名：信任侧加入 */
-  const joinTrust = async (policy: TrustPolicyLike, ip: string): Promise<void> => {
-    await ensureListAndJoin(policy, ip, 'trust')
-  }
 
   /** 从引用列表移除 IP（关联保留） */
   const removeFromSideRef = async (list: TrustListRef, ip: string): Promise<void> => {
@@ -157,10 +151,6 @@ export const useTrustAssociation = (options: {
     }
   }
 
-  /** 兼容别名：信任侧移除 */
-  const removeFromTrustRef = async (list: TrustListRef, ip: string): Promise<void> => {
-    await removeFromSideRef(list, ip)
-  }
 
-  return { busyTrust: adding, creating, resolveTrustList, resolveSideList, resolveSideLists, joinSpecificList, ensureListAndJoin, joinTrust, removeFromSideRef, removeFromTrustRef }
+  return { busyTrust: adding, creating, resolveSideList, resolveSideLists, joinSpecificList, ensureListAndJoin, removeFromSideRef }
 }

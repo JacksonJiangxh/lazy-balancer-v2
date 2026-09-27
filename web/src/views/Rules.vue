@@ -2633,6 +2633,16 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
+  // 第 61 轮 P3：TLS 步校验镜像（跳步绕过 nextStep 时提交前兜底）
+  if (wizardForm.enable_tls && wizardForm.protocol === 'http') {
+    if (!wizardForm.tls_cert || !wizardForm.tls_key) {
+      if (wizardForm.tls_source === 'manual') {
+        ElMessage.warning('TLS 手动模式须上传证书与私钥')
+        saving.value = false
+        return
+      }
+    }
+  }
   if (wizardForm.upstreams.length === 0) {
     ElMessage.warning('请至少添加一个上游服务器')
     saving.value = false

@@ -712,7 +712,7 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 	})
 }
 
-// RemoveIPFromList DELETE /security/ip-lists/:id/ips：从地址列表移除单条 IP
+// RemoveIPFromList POST /security/ip-lists/:id/remove-ip：从地址列表移除单条 IP
 // （第 57 轮弹框重构配套端点，用户裁定：加入/移除统一走地址列表，内置威胁
 // 名单只读）。与追加幂等对称：值不在名单时 200 {removed:false}（重复移除
 // 无害）；成功移除 200 {removed:true}。移除/追加经 finishTxApply 同链触发

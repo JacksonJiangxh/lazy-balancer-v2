@@ -506,7 +506,7 @@ func SeedDefaultBlockPage(dataDir string) (bool, error) {
 	content := renderDefaultBlockPage(cfg)
 	// 默认页 Content-Type 恒 html（带外改库漂移自愈；白名单类型不影响——
 	// 渲染处空值回退与写侧白名单把守，此处仅归位默认页）。
-	result, err := db.DB.Exec(`UPDATE security_block_pages SET content=?, content_type=?, updated_at=datetime('now') WHERE is_default=1 AND (content != ? OR COALESCE(content_type,'') != ?)`, content, models.DefaultBlockPageContentType, content, models.DefaultBlockPageContentType)
+	result, err := db.DB.Exec(`UPDATE security_block_pages SET content=?, content_type=?, updated_at=datetime('now') WHERE is_default=1 AND (COALESCE(content,'') != ? OR COALESCE(content_type,'') != ?) /* 第 61 轮 P3：content=NULL 行 != ? 为 NULL 不命中——COALESCE 同 content_type 侧 */`, content, models.DefaultBlockPageContentType, content, models.DefaultBlockPageContentType)
 	if err != nil {
 		return false, fmt.Errorf("更新默认拦截页面内容: %w", err)
 	}

@@ -769,6 +769,8 @@ export const inferPolicyType = (p: SecurityPolicyTypeInput): SecurityPolicyType 
 
 // compareVersion 语义化版本比较（第 60 轮）：日期形态（2026.09.24）与
 // semver（v2.3.3）均可——逐段数值比较，非数值段字典序兜底。
+// 注意：预发布段（如 -beta vs 空）按字典序判 beta > 正式版（semver 反直觉）——
+// 当前消费方只比较日期/纯数字形态，无预发布版本号，无实际影响（第 61 轮声明）。
 export const compareVersion = (a: string, b: string): number => {
   const pa = a.replace(/^v/, '').split(/[.-]/)
   const pb = b.replace(/^v/, '').split(/[.-]/)
@@ -809,4 +811,11 @@ export const entryMatchesIp = (entry: string, ip: string): boolean => {
   if (entry === ip) return true
   if (entry.includes('/')) return ipInCidr(ip, entry)
   return false
+}
+
+// —— 跨组件共享条目缓存（第 61 轮 P2-2）：IPLocationAction 与 TriggerDetailDialog
+// 共用，写入动作（useTrustAssociation/useIpListAdd 链路）调用 invalidate 清空 ——
+export const sharedEntriesCache: Record<number, string[]> = {}
+export const invalidateSharedEntriesCache = (): void => {
+  for (const k of Object.keys(sharedEntriesCache)) delete sharedEntriesCache[Number(k)]
 }

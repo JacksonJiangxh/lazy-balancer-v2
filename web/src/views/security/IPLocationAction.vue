@@ -54,8 +54,8 @@
           <div v-if="row.inLegacy && group.key !== 'stage0'" class="ipo-legacy">该 IP 还存在于旧版独立黑名单字段，可经 API 更新策略（ip_blacklist）清理</div>
           <div v-if="group.key === 'mixed'" class="ipo-legacy">混合策略（兼容旧版）· 仅可更新迁移——到「安全防护 → 安全策略」页对该策略执行「更新迁移」拆分为单职策略</div>
           <div v-if="row.trustDead" class="ipo-legacy">该 IP 的信任条目存在，但策略的信任名单已关闭——条目暂不生效</div>
-          <div v-if="actionsFor(row).length > 0" class="ipo-acts">
-            <template v-for="act in actionsFor(row)" :key="act.key">
+          <div v-if="rowActions(row).length > 0" class="ipo-acts">
+            <template v-for="act in rowActions(row)" :key="act.key">
               <span v-if="!act.run" class="ipo-act-hint">{{ act.label }}</span>
               <el-tooltip v-else-if="act.tip" :content="act.tip" placement="top">
                 <el-button size="small" :type="act.type" plain :loading="act.loading" @click="act.run()">{{ act.label }}</el-button>
@@ -84,7 +84,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useTrustAssociation } from '@/composables/useTrustAssociation'
 import type { IpListOption } from '@/composables/useIpListAdd'
 // 分组类型路由（U8-2）：inferPolicyType 为策略类型单一实现（securityStages 导出，禁第二实现）
-import { inferPolicyType, parseIPList, parseRefIds, entryMatchesIp } from '@/utils/securityStages'
+import { inferPolicyType, parseIPList, parseRefIds, entryMatchesIp, invalidateSharedEntriesCache } from '@/utils/securityStages'
 import type { SecurityPolicyType, SecurityPolicyTypeInput } from '@/utils/securityStages'
 import type { APIResponse } from '@/types'
 
@@ -187,6 +187,7 @@ const trustApi = useTrustAssociation({
   // 优化），已缓存列表的新增条目不可见导致「拦截此 IP」按钮在加入后仍显示
   onChanged: () => {
     ipListEntries.value = {}
+    invalidateSharedEntriesCache() // 第 61 轮 P2-2：同步清空 TriggerDetailDialog 共享缓存
     return loadPolicies()
   },
 })
@@ -301,7 +302,6 @@ const policyTypeOf = (p: PolicyRow): SecurityPolicyType =>
 
 let loadPoliciesSeq = 0
 const loadPolicies = async (): Promise<void> => {
-  rowActionsCache.clear() // 策略数据变更后动作缓存失效
   // 每次 @show 都强制重新拉取——同一策略绑定多条规则时，从规则 A 弹窗
   // 加入黑名单后，打开规则 B 弹窗需要看到最新 ACL 状态（无陈旧缓存）。
   // 地址列表选项同节奏刷新（含引用条目缓存）；等两者就绪后再渲染行，
@@ -553,15 +553,7 @@ const rows = computed<RowView[]>(() => policies.value.map(rowView))
 // 顺序 = 信任（绿）→ 黑名单移除（红）→ 关联拦截/放行（红/蓝）→ 信任移除（绿）。
 interface RowAction { key: string; label: string; type: 'primary' | 'success' | 'warning' | 'danger' | 'info'; loading?: boolean; tip?: string; run?: () => void }
 
-// 动作缓存（模板渲染优化）：同一行在同一渲染周期内只计算一次
-const rowActionsCache = new Map<number, RowAction[]>()
-const actionsFor = (row: RowView): RowAction[] => {
-  const cached = rowActionsCache.get(row.policy.id)
-  if (cached) return cached
-  const acts = rowActions(row)
-  rowActionsCache.set(row.policy.id, acts)
-  return acts
-}
+
 const rowActions = (row: RowView): RowAction[] => {
   const acts: RowAction[] = []
   const pid = row.policy.id
@@ -732,7 +724,18 @@ const fetchDetail = async (id: number): Promise<PolicyRow | null> => {
 const refreshRow = async (id: number): Promise<void> => {
   try {
     const fresh = await fetchDetail(id)
-    if (fresh) policies.value = policies.value.map((p) => (p.id === fresh.id ? { ...p, ...fresh } : p))
+    if (fresh) {
+      // 第 61 轮 P2-5：详情接口不携带摘要标志——直接 spread 会用 undefined 覆写
+      // 列表摘要值使分组路由退化；逐字段只合并非 undefined
+      policies.value = policies.value.map((x) => {
+        if (x.id !== fresh.id) return x
+        const merged = { ...x } as Record<string, unknown>
+        for (const [k, v] of Object.entries(fresh as unknown as Record<string, unknown>)) {
+          if (v !== undefined) merged[k] = v
+        }
+        return merged as typeof x
+      })
+    }
   } catch {
     // 刷新失败保持现有展示，下次打开弹窗会重新加载
   }

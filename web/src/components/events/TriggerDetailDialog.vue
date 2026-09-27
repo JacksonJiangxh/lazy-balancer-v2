@@ -17,9 +17,9 @@
           <span v-if="geoLabel" class="trg-source-geo">{{ geoLabel }}</span>
         </div>
         <div class="trg-hero-policy">
-          <span class="trg-hero-policy-name">{{ policy?.name ?? (policyMissing ? '（策略已删除）' : '（策略信息不可用）') }}</span>
+          <span class="trg-hero-policy-name">{{ policy?.name ?? (loading ? '加载中…' : policyMissing ? '（策略已删除）' : '（策略信息不可用）') }}</span>
           <el-tag size="small" :type="policy?.enabled ? 'success' : 'info'" effect="plain">
-            {{ policy?.enabled ? '已启用' : '已禁用' }}
+            {{ loading ? '…' : policy?.enabled ? '已启用' : '已禁用' }}
           </el-tag>
         </div>
         <div class="trg-hero-hit">{{ heroHitSource }}</div>
@@ -216,9 +216,9 @@ const exemptingTrustPolicy = computed<string | null>(() => {
   const ip = props.row.client_ip.trim()
   for (const p of [policy.value, ...enabledPolicies.value].filter((x): x is PolicyRow => !!x)) {
     if (!p.ip_whitelist_enabled || p.trust_detection !== true) continue
-    if (parseIPList(p.ip_whitelist).includes(ip)) return p.name
+    if (parseIPList(p.ip_whitelist).some((e) => entryMatchesIp(e, ip))) return p.name
     const refs = parseRefIds(p.ip_whitelist_refs)
-    if (refs.some((id) => (entriesCache.value[id] ?? []).includes(ip))) return p.name
+    if (refs.some((id) => (entriesCache.value[id] ?? []).some((e) => entryMatchesIp(e, ip)))) return p.name
   }
   return null
 })
@@ -330,11 +330,11 @@ const policy = ref<PolicyRow | null>(null)
 // 为事务级全局，命中策略与豁免信任策略可以是两条不同策略）
 const enabledPolicies = ref<PolicyRow[]>([])
 const lists = ref<Array<{ id: number; name: string; system?: number | boolean }>>([])
-// 模块级条目缓存（第 60 轮性能修复）：跨弹框会话共享——同会话反复打开不重拉
-// 全部引用名单条目（三源全引 1.5-2MB/次）。快捷弹框写入动作清空本缓存（见
-// IPLocationAction onChanged），下次打开自动重拉。
-const sharedEntriesCache: Record<number, string[]> = {}
-const entriesCache = ref<Record<number, string[]>>(sharedEntriesCache)
+// 跨组件共享条目缓存（第 61 轮 P2-2 修复：提升到 securityStages 模块级，
+// IPLocationAction 写入动作经 invalidateSharedEntriesCache 清空——原实现
+// 缓存在本组件 setup 内，快捷弹框的 onChanged 清不到它导致展示恒陈旧）
+import { sharedEntriesCache } from '@/utils/securityStages'
+const entriesCache = ref<Record<number, string[]>>({ ...sharedEntriesCache })
 
 const loadAll = async (): Promise<void> => {
   const row = props.row
@@ -351,6 +351,7 @@ const loadAll = async (): Promise<void> => {
     if (row.policy_id > 0) {
       try {
         const res = await request.get<APIResponse<{ policy: PolicyRow }>>(`/security/policies/${row.policy_id}`, { silent: true } as never)
+        if (seq !== loadSeq) return // 第 61 轮 P2-4：首个 await 同样需竞态守卫
         policy.value = res.data?.policy ?? null
         if (!res.data?.policy) policyMissing.value = true
       } catch (err) {
@@ -378,7 +379,7 @@ const loadAll = async (): Promise<void> => {
       for (const id of parseRefIds(p.ip_whitelist_refs)) refIds.add(id)
     }
     const results = await Promise.allSettled(
-      [...refIds].map((id) => request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`)),
+      [...refIds].map((id) => request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`, { silent: true } as never)),
     )
     const cache: Record<number, string[]> = {}
     results.forEach((r) => {
@@ -388,7 +389,7 @@ const loadAll = async (): Promise<void> => {
     })
     if (seq !== loadSeq) return
     Object.assign(sharedEntriesCache, cache) // 写回共享缓存
-    entriesCache.value = cache
+    entriesCache.value = { ...sharedEntriesCache }
   } finally {
     if (seq === loadSeq) loading.value = false
   }
@@ -469,7 +470,8 @@ const isAllowOutside = computed(() => {
 
 const inlineAclHit = computed(() => {
   const p = policy.value
-  return !!p && parseIPList(p.ip_acl_list).includes(props.row?.client_ip.trim() ?? '')
+  // 第 61 轮 P2-3：CIDR 感知（内联名单位 CIDR 条目命中实际 IP）
+  return !!p && parseIPList(p.ip_acl_list).some((e) => entryMatchesIp(e, props.row?.client_ip.trim() ?? ''))
 })
 const trustHitListsText = computed(() => {
   const p = policy.value
@@ -477,7 +479,7 @@ const trustHitListsText = computed(() => {
   const ip = props.row?.client_ip.trim() ?? ''
   const refs = parseRefIds(p.ip_whitelist_refs)
   const hit = lists.value
-    .filter((l) => refs.includes(l.id) && (entriesCache.value[l.id] ?? []).includes(ip))
+    .filter((l) => refs.includes(l.id) && (entriesCache.value[l.id] ?? []).some((e) => entryMatchesIp(e, ip)))
     .map((l) => l.name)
   return hit.join('、')
 })
@@ -486,15 +488,16 @@ const trustHitNote = computed(() => {
   if (!p || kind.value === 'trust') return ''
   const ip = props.row?.client_ip.trim() ?? ''
   const refs = parseRefIds(p.ip_whitelist_refs)
-  const trusted = parseIPList(p.ip_whitelist).includes(ip)
-    || refs.some((id) => (entriesCache.value[id] ?? []).includes(ip))
+  if (p.ip_whitelist_enabled === false) return '' // 第 61 轮 P3：信任已关闭时条目不生效（trustDead 同口径）
+  const trusted = parseIPList(p.ip_whitelist).some((e) => entryMatchesIp(e, ip))
+    || refs.some((id) => (entriesCache.value[id] ?? []).some((e) => entryMatchesIp(e, ip)))
   return trusted ? '该 IP 在策略信任名单中（DetectionOnly：全评估不拦但全记录）' : ''
 })
 const memberSystemTip = computed(() => {
   const p = policy.value
   if (!p) return ''
   const ip = props.row?.client_ip.trim() ?? ''
-  const sysRefs = lists.value.filter((l) => l.system && parseRefIds(p.ip_acl_list_refs).includes(l.id) && (entriesCache.value[l.id] ?? []).includes(ip))
+  const sysRefs = lists.value.filter((l) => l.system && parseRefIds(p.ip_acl_list_refs).includes(l.id) && (entriesCache.value[l.id] ?? []).some((e) => entryMatchesIp(e, ip)))
   return sysRefs.length > 0 ? '内置威胁名单为只读来源；误报可将该 IP 加入信任名单豁免。' : ''
 })
 
@@ -513,7 +516,7 @@ const customDbId = computed(() => {
   const n = Number(props.row?.rule_triggered)
   return Number.isFinite(n) && n >= 10000 ? n - 10000 : NaN
 })
-const ACTION_LABELS: Record<string, string> = { block: '拦截', log: '仅记录', score: '计分' }
+const ACTION_LABELS: Record<string, string> = { block: '拦截', log: '仅记录', score: '计分', pass: '放行' } // 第 61 轮 P3：补 pass（后端合法三态含 pass）
 const customActionLabel = computed(() => {
   const a = customRule.value?.action ?? ''
   return ACTION_LABELS[a] ?? a

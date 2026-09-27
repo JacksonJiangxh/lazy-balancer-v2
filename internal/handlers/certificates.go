@@ -684,7 +684,8 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		cooldownNote = fmt.Sprintf("，%d 个任务处于冷却期已跳过", skippedCooldown)
 	}
 	recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, fmt.Sprintf("入队 %d 个任务%s", queued, cooldownNote), services.AuditResultPart("requested")))
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: fmt.Sprintf("已创建 %d 个签发任务", queued) + cooldownNote + h.caddyApplyNote(c), Data: gin.H{"queued": queued, "skipped_cooldown": skippedCooldown}})
+	// 第 61 轮 P3：入队后渲染输入零变化——签发完成由 worker 链路自行应用，去掉强制重载
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: fmt.Sprintf("已创建 %d 个签发任务", queued), Data: gin.H{"queued": queued, "skipped_cooldown": skippedCooldown}})
 }
 
 func (h *Handlers) ParseCertificate(c *gin.Context) {

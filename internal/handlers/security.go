@@ -3260,11 +3260,14 @@ func stageCategorizeAttack(ruleTriggered, ruleMsg string) string {
 		return "IP 访问控制"
 	case ruleTriggered == "8" || (len(ruleTriggered) == 6 && strings.HasPrefix(ruleTriggered, "8")) || strings.Contains(ruleMsg, "GeoIP 区域拦截"):
 		return "IP 访问控制"
-	case ruleTriggered == "3" || ruleTriggered == "12":
-		return "信任名单"
+	// 第 61 轮 P3：msg 门先行（与 categorizeAttack 同构——带 IP 黑/白名单消息的
+	// id:3 历史行归 IP 访问控制，裸 id 形态归信任名单；原信任分支前置使同一事件
+	// 在两视图归不同桶，attack_types 与 attack_types_stage 总量对不齐）
 	case strings.Contains(ruleMsg, "IP 黑名单") || strings.Contains(ruleMsg, "IP 白名单") || strings.Contains(ruleMsg, "IP 访问控制") ||
 		ruleTriggered == "2" || ruleTriggered == "4" || ruleTriggered == "5" || ruleTriggered == "7":
 		return "IP 访问控制"
+	case ruleTriggered == "3" || ruleTriggered == "12":
+		return "信任名单"
 	default:
 		return "其他"
 	}
