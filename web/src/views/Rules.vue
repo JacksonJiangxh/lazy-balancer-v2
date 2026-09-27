@@ -1006,12 +1006,15 @@
 
     <el-dialog
       v-model="ruleLogDialogVisible"
-      :title="`访问日志 - ${ruleLogRuleName}`"
       width="min(1100px, 94vw)"
+      top="5vh"
       destroy-on-close
       @opened="onRuleLogDialogOpened"
       @close="onRuleLogDialogClosed"
     >
+      <template #header>
+        <DialogHeader :icon="Tickets" :title="`访问日志 - ${ruleLogRuleName}`" subtitle="负载均衡规则请求访问日志" />
+      </template>
       <el-tabs v-model="ruleLogTab" @tab-change="onRuleLogTabChange">
         <el-tab-pane label="日志" name="log">
           <div class="log-toolbar">
@@ -1109,7 +1112,7 @@
 import { ref, reactive, onMounted, onUnmounted, computed, watch, nextTick } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { request, mfaAwareSuccess } from '@/utils/api'
-import { Plus, Operation, Delete, InfoFilled, Lock, Connection, Guide, Check, ArrowLeft, ArrowRight, Document, CircleCheckFilled, CircleCloseFilled, QuestionFilled, Setting, RefreshRight, Search, WarningFilled, Location, Monitor, Link } from '@element-plus/icons-vue'
+import { Plus, Operation, Delete, InfoFilled, Lock, Connection, Guide, Check, ArrowLeft, ArrowRight, Document, CircleCheckFilled, CircleCloseFilled, QuestionFilled, Setting, RefreshRight, Search, WarningFilled, Location, Monitor, Link, Tickets } from '@element-plus/icons-vue'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import axios from 'axios'
 import { ansiToHtml } from '@/utils/ansi'
@@ -3886,9 +3889,9 @@ onUnmounted(() => {
 .stats-card-header .el-icon { color: var(--el-color-primary); }
 .stats-count { color: var(--el-color-primary); font-weight: 600; }
 .rule-log-viewer {
-  height: 60vh;
+  height: 55vh;
   min-height: 300px;
-  max-height: 700px;
+  max-height: 650px;
   overflow: auto;
   padding: 12px 16px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;

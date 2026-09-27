@@ -95,13 +95,16 @@
 
   <el-dialog
     v-model="logDialogVisible"
-    :title="`证书日志 - ${currentJob?.domain || ''}`"
     width="min(1100px, 94vw)"
+    top="5vh"
     class="cert-log-dialog"
     destroy-on-close
     @opened="onLogDialogOpened"
     @closed="onLogDialogClosed"
   >
+    <template #header>
+      <DialogHeader :icon="Timer" :title="`证书日志 - ${currentJob?.domain || ''}`" subtitle="ACME 签发任务实时日志" />
+    </template>
     <div ref="logContainerRef" class="log-container">
       <pre v-if="logHtml" class="log-content" v-html="logHtml" />
       <el-empty v-else description="暂无日志" :image-size="60" />
@@ -118,6 +121,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue'
+import { Timer } from '@element-plus/icons-vue'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import { formatDate } from '@/utils/date'

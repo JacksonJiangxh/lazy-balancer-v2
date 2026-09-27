@@ -214,7 +214,7 @@
     <input ref="tlsCertFileInput" type="file" accept=".crt,.pem,.cer" style="display: none" @change="(e) => onTlsFile(e, 'cert')" />
     <input ref="tlsKeyFileInput" type="file" accept=".key,.pem" style="display: none" @change="(e) => onTlsFile(e, 'key')" />
 
-    <el-dialog v-model="appLogVisible" width="min(1100px, 94vw)" destroy-on-close @opened="onAppLogOpened" @closed="onAppLogClosed">
+    <el-dialog v-model="appLogVisible" width="min(1100px, 94vw)" top="5vh" destroy-on-close @opened="onAppLogOpened" @closed="onAppLogClosed">
       <template #header>
         <DialogHeader :icon="Document" title="Lazy Balancer 运行日志" subtitle="实时查看应用运行日志与自愈事件（最近 500 行）" />
       </template>
@@ -1514,7 +1514,7 @@ const handleSave = async () => {
 .import-input { display: none; }
 .backup-tip { display: block; margin-top: 8px; line-height: 1.5; }
 .log-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-.log-viewer { height: 60vh; min-height: 320px; overflow: auto; padding: 12px 16px; background: #0f172a; border-radius: var(--radius-sm, 6px); }
+.log-viewer { height: 55vh; min-height: 320px; overflow: auto; padding: 12px 16px; background: #0f172a; border-radius: var(--radius-sm, 6px); }
 .log-viewer pre { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; line-height: 1.7; color: #e2e8f0; white-space: pre-wrap; word-break: break-all; }
 .import-picker { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .import-filename { font-size: 13px; color: var(--el-text-color-primary); }
