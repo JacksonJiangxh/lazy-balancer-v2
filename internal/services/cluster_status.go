@@ -66,7 +66,7 @@ func (s *ClusterService) UpdateSettings(ctx context.Context, req models.ClusterS
 		return err
 	}
 	if req.SyncInterval != nil && !isMaster {
-		return errors.New("从节点不能修改同步间隔，由主节点统一下发")
+		return ErrSlaveReadOnly
 	}
 	// sync_interval 无下限校验会让从节点 run 循环 waitDelay(0) 进入零间隔
 	// Pull 风暴（主节点被持续高压请求打满）；上限 86400 防误填（R42 发现1）。
@@ -91,7 +91,7 @@ func (s *ClusterService) UpdateSettings(ctx context.Context, req models.ClusterS
 			return fmt.Errorf("读取同步间隔更新结果: %w", err)
 		}
 		if updated != 1 {
-			return errors.New("从节点不能修改同步间隔，由主节点统一下发")
+			return ErrSlaveReadOnly
 		}
 	}
 	// 系统数据恒同步(2026-09-11 裁定):users/api_keys/ACME 等确保系统基本
@@ -121,7 +121,7 @@ func (s *ClusterService) UpdateSettings(ctx context.Context, req models.ClusterS
 			return fmt.Errorf("读取 %s 更新结果: %w", sw.name, err)
 		}
 		if updated != 1 {
-			return errors.New("从节点不能修改同步开关，请在主节点操作")
+			return ErrSlaveReadOnly
 		}
 	}
 	if err := tx.Commit(); err != nil {

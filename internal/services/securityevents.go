@@ -1371,7 +1371,9 @@ func securityEventsIngestDeltaFrom(path string, from int64, archive bool) error 
 		return fmt.Errorf("security events: open delta source: %w", err)
 	}
 	defer f.Close()
+	securityTimingLoadReadOnly() // F64-B1-2:补采路径也需加载侧车耗时(只读不截断)
 	rules, bindings, policyByID, err := securityEventsLoadMappings()
+	securityEventsLoadMappings()
 	if err != nil {
 		return err
 	}
@@ -1504,6 +1506,35 @@ func securityTimingLoad() {
 	// (读→截断微秒级)新写入的行会丢——下轮读到(合并 map 跨 tick 保活,
 	// 已读条目不丢);仅读后写入且截断先于下轮的极端窗口丢一行,可接受。
 	_ = os.Truncate(securityTimingLogPath, 0)
+}
+
+// securityTimingLoadReadOnly 只读加载侧车文件到 tick map(不截断)——供
+// 补采路径使用(截断权归 tick 路径,补采只补齐冷启动后首窗口的查表数据)。
+func securityTimingLoadReadOnly() {
+	if securityTimingTickMap == nil {
+		securityTimingTickMap = make(map[string]int64, 64)
+	} else if len(securityTimingTickMap) > 5000 {
+		return
+	}
+	data, err := os.ReadFile(securityTimingLogPath)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		id, us, ok := strings.Cut(line, " ")
+		if !ok || id == "" {
+			continue
+		}
+		v, err := strconv.ParseInt(us, 10, 64)
+		if err != nil || v < 0 {
+			continue
+		}
+		securityTimingTickMap[id] = v
+	}
 }
 
 // securityTimingLookup 按 timing ID 查本 tick 的耗时(读侧——ParseTransaction 消费)。

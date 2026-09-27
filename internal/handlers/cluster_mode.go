@@ -131,7 +131,7 @@ func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
 			status = http.StatusBadRequest
 			msg = err.Error()
 		default:
-			if strings.Contains(err.Error(), "从节点不能修改") {
+			if errors.Is(err, services.ErrSlaveReadOnly) {
 				status = http.StatusForbidden
 				msg = err.Error()
 			}

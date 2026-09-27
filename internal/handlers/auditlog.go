@@ -199,7 +199,7 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 
 	var total int64
 	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log"+where, args...).Scan(&total); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to query audit logs"})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询操作日志失败"})
 		return
 	}
 
@@ -214,7 +214,7 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 		FROM audit_log`+where+`
 		ORDER BY id DESC LIMIT ? OFFSET ?`, append(args, pageSize, offset)...)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to query audit logs"})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询操作日志失败"})
 		return
 	}
 	defer rows.Close()
