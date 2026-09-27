@@ -18,11 +18,11 @@
           <el-option label="warn" value="warn" />
           <el-option label="error" value="error" />
         </el-select>
-        <el-text type="info" size="small" class="tip-inline">生产环境建议 info；debug 会产生大量日志</el-text>
+        <el-text type="info" size="small" class="tip-inline">建议 info；debug 日志量大</el-text>
       </el-form-item>
       <el-form-item label="日志大小">
         <el-input-number v-model="settings.caddy_log_size_mb" :disabled="isReadOnly" :min="100" :max="10240" controls-position="right" class="number-input" />
-        <el-text type="info" size="small" class="tip-inline tip-nowrap">MB，单文件超限后滚动归档并保留 5 个；建议 100；同时控制规则访问日志</el-text>
+        <el-text type="info" size="small" class="tip-inline tip-nowrap">MB，超限归档保留 5 份</el-text>
       </el-form-item>
       <el-form-item label="运行日志">
         <el-button size="small" :icon="View" @click="openLogDialog">查看日志</el-button>
@@ -32,23 +32,23 @@
       <el-divider content-position="left">请求与超时</el-divider>
       <el-form-item label="请求体大小">
         <el-input-number v-model="settings.request_body_max_size_mb" :disabled="isReadOnly" :min="0" :max="4096" controls-position="right" class="number-input" />
-        <el-text type="info" size="small" class="tip-inline tip-nowrap">MB，请求体体积上限（WAF/代理流量/管理接口）；0 = 使用默认 128（保存后显示为实际生效值）</el-text>
+        <el-text type="info" size="small" class="tip-inline tip-nowrap">MB，请求体上限；0 = 默认 128</el-text>
       </el-form-item>
       <el-form-item label="读取超时">
         <el-input-number v-model="settings.http_read_timeout" :disabled="isReadOnly" :min="0" :max="86400" controls-position="right" class="number-input" />
-        <el-text type="info" size="small" class="tip-inline tip-nowrap">秒，读取完整请求的最长时间；0 = Caddy 默认（无超时），建议 60</el-text>
+        <el-text type="info" size="small" class="tip-inline tip-nowrap">秒，读请求超时；0 = 无超时</el-text>
       </el-form-item>
       <el-form-item label="写入超时">
         <el-input-number v-model="settings.http_write_timeout" :disabled="isReadOnly" :min="0" :max="86400" controls-position="right" class="number-input" />
-        <el-text type="info" size="small" class="tip-inline">秒，向客户端写入响应的最长时间；0 = Caddy 默认（无超时）。常规建议 60</el-text>
+        <el-text type="info" size="small" class="tip-inline">秒，写响应超时；0 = 无超时</el-text>
       </el-form-item>
       <el-form-item label="空闲超时">
         <el-input-number v-model="settings.http_idle_timeout" :disabled="isReadOnly" :min="0" :max="86400" controls-position="right" class="number-input" />
-        <el-text type="info" size="small" class="tip-inline">秒，客户端到 Caddy 的 Keep-Alive 连接空闲多久后关闭；0 = Caddy 默认。常规建议 120</el-text>
+        <el-text type="info" size="small" class="tip-inline">秒，Keep-Alive 空闲超时；0 = 默认</el-text>
       </el-form-item>
       <el-form-item label="上游 Keepalive">
         <el-input-number v-model="settings.upstream_keepalive_timeout" :disabled="isReadOnly" :min="0" :max="86400" controls-position="right" class="number-input" />
-        <el-text type="info" size="small" class="tip-inline">秒，空闲上游连接保持时长；0 = 默认（2 分钟）。SSE/WebSocket 建议保持 0</el-text>
+        <el-text type="info" size="small" class="tip-inline">秒，上游空闲保持；0 = 默认 2 分钟</el-text>
       </el-form-item>
 
       <el-divider content-position="left">代理超时</el-divider>
@@ -57,14 +57,14 @@
       <el-divider content-position="left">响应头</el-divider>
       <el-form-item label="Server Tokens">
         <el-switch v-model="settings.server_tokens_hidden" :disabled="isReadOnly" active-text="开启" inactive-text="关闭" />
-        <el-text type="info" size="small" class="tip-inline">开启后在响应头中隐藏 Server 字段，减少服务器指纹暴露</el-text>
+        <el-text type="info" size="small" class="tip-inline">隐藏响应 Server 头，减少指纹暴露</el-text>
       </el-form-item>
 
       <el-divider content-position="left">安全防护</el-divider>
       <el-form-item label="受信代理">
         <div class="trusted-toggle">
           <el-switch v-model="settings.trusted_proxy_enabled" :disabled="isReadOnly" active-text="开启" inactive-text="关闭" />
-          <el-text type="info" size="small" class="tip-block">站点经 CDN/前置代理回源时开启：按网段+请求头取真实客户端 IP（IP 名单/地域/限流随之按真实 IP 判定）</el-text>
+          <el-text type="info" size="small" class="tip-block">CDN/前置代理回源时开启，按真实客户端 IP 判定名单/地域/限流</el-text>
         </div>
       </el-form-item>
       <template v-if="settings.trusted_proxy_enabled">

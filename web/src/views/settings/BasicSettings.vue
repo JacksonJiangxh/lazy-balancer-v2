@@ -9,9 +9,9 @@
           </div>
         </div>
       </template>
-        <el-form :model="settings" label-width="120px" class="settings-form" :disabled="isReadOnly">
+        <el-form :model="settings" label-width="120px" class="settings-form">
           <el-form-item label="日志级别">
-            <el-select v-model="settings.log_level" style="width: 140px">
+            <el-select v-model="settings.log_level" :disabled="isReadOnly" style="width: 140px">
               <el-option label="Debug" value="debug" />
               <el-option label="Info" value="info" />
               <el-option label="Warning" value="warn" />
@@ -20,27 +20,27 @@
             <el-text type="info" size="small" class="tip-inline">控制 Lazy Balancer 自身日志详细程度</el-text>
           </el-form-item>
           <el-form-item label="任务日志大小">
-            <el-input-number v-model="settings.cert_job_log_size_mb" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
+            <el-input-number v-model="settings.cert_job_log_size_mb" :disabled="isReadOnly" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
             <el-text type="info" size="small" class="tip-inline">MB，任务与库更新日志轮转阈值</el-text>
           </el-form-item>
           <el-form-item label="审计日志大小">
-          <el-input-number v-model="settings.audit_log_size_mb" :min="1" :max="512" controls-position="right" style="width: 120px;" />
+          <el-input-number v-model="settings.audit_log_size_mb" :disabled="isReadOnly" :min="1" :max="512" controls-position="right" style="width: 120px;" />
             <el-text type="info" size="small" class="tip-inline">MB，WAF 审计日志轮转阈值</el-text>
           </el-form-item>
           <el-form-item label="运行日志大小">
-            <el-input-number v-model="settings.runtime_log_size_mb" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
+            <el-input-number v-model="settings.runtime_log_size_mb" :disabled="isReadOnly" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
             <el-text type="info" size="small" class="tip-inline">MB，轮转阈值</el-text>
           </el-form-item>
           <el-form-item label="日志保留">
-            <el-input-number v-model="settings.audit_retention_months" :min="1" :max="12" controls-position="right" style="width: 120px;" />
+            <el-input-number v-model="settings.audit_retention_months" :disabled="isReadOnly" :min="1" :max="12" controls-position="right" style="width: 120px;" />
             <el-text type="info" size="small" class="tip-inline">个月，超期自动清理</el-text>
           </el-form-item>
           <el-form-item label="登录过期">
-            <el-input-number v-model="settings.jwt_expire_minutes" :min="1" :max="1440" controls-position="right" style="width: 120px;" />
+            <el-input-number v-model="settings.jwt_expire_minutes" :disabled="isReadOnly" :min="1" :max="1440" controls-position="right" style="width: 120px;" />
             <el-text type="info" size="small" class="tip-inline">分钟，登录令牌有效期</el-text>
           </el-form-item>
           <el-form-item label="时区">
-            <el-select v-model="settings.timezone" filterable class="compact-select">
+            <el-select v-model="settings.timezone" :disabled="isReadOnly" filterable class="compact-select">
               <el-option label="Asia/Shanghai (UTC+8)" value="Asia/Shanghai" />
               <el-option label="Asia/Hong_Kong (UTC+8)" value="Asia/Hong_Kong" />
               <el-option label="Asia/Tokyo (UTC+9)" value="Asia/Tokyo" />
@@ -64,7 +64,7 @@
             <el-text type="info" size="small" class="tip-block">影响日志时间戳与证书时间；标注夏令时的时区会随夏令时自动偏移；仅 Caddy 日志需重启服务生效</el-text>
           </el-form-item>
           <el-form-item label="GitHub 加速">
-            <el-select v-model="githubProxyUrl" style="width: 160px">
+            <el-select v-model="githubProxyUrl" :disabled="isReadOnly" style="width: 160px">
               <el-option
                 v-for="option in githubProxyOptions"
                 :key="option.value"
@@ -89,16 +89,16 @@
             <div class="form-tip-line">可选 GITHUB_TOKEN：令牌认证后 GitHub API 限流由 60 提升至 5000 次/小时，缓解规则库自动更新 403；令牌仅随 GitHub 直连发送，不经第三方代理；点「清除」可撤销已配置令牌（保存后生效）。<el-link type="primary" href="https://github.com/settings/tokens" target="_blank" rel="noopener">前往 GitHub 创建令牌</el-link>（只需公共仓库只读权限，无需勾选任何 scope）</div>
           </el-form-item>
           <el-form-item label="写操作验证">
-            <el-switch v-model="settings.mfa_write_guard" />
+            <el-switch v-model="settings.mfa_write_guard" :disabled="isReadOnly" />
             <el-text type="info" size="small" class="tip-inline">写操作需 1 分钟内的 MFA 验证</el-text>
             <el-link type="info" underline="never" size="small" class="tip-link" style="margin-left: 6px" @click="mfaScopeVisible = true">支持的操作</el-link>
           </el-form-item>
           <el-form-item label="登录失败锁定">
-            <el-switch v-model="settings.mfa_lockout_enabled" />
+            <el-switch v-model="settings.mfa_lockout_enabled" :disabled="isReadOnly" />
             <el-text type="info" size="small" class="tip-inline">密码或验证码失败 5 次锁 10 分钟（关闭则不锁定）</el-text>
           </el-form-item>
           <el-form-item label="强制 HTTPS">
-            <el-switch v-model="adminTls.enabled" @change="onAdminTlsToggle" />
+            <el-switch v-model="adminTls.enabled" :disabled="isReadOnly" @change="onAdminTlsToggle" />
             <el-button v-if="adminTls.enabled" size="small" style="margin-left: 8px;" @click="openAdminTlsDialog">配置证书</el-button>
             <el-text v-if="adminTlsDirty" type="warning" size="small" class="tip-inline">已暂存，点击下方保存后生效</el-text>
             <el-text v-else type="info" size="small" class="tip-inline">启用后 :8000 仅经 HTTPS 访问，需重启服务生效</el-text>
