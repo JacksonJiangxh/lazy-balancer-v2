@@ -53,8 +53,11 @@ type securityEventRecord struct {
 	Action            string
 	AnomalyScore      int
 	DurationUs        int64
-	RequestHeaders    string
-	RequestBody       string
+	// PrecheckUs 是该请求预检段耗时快照(µs)——WAF 事件的触发详情弹框显示
+	// 「预检+WAF」完整分解;预检事件与 DurationUs 同值。
+	PrecheckUs     int64
+	RequestHeaders string
+	RequestBody    string
 }
 
 // securityEventsAuditMessage 是一条审计消息：message 为宏展开后的规则 msg，
@@ -175,6 +178,11 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 	// :end-:pre(隔离 WAF 评估成本,不含预检开销)。未命中保持 0,UI 显示「—」。
 	if tid := securityEventsFirstHeader(tx.Request.Headers, "x-lb-security-timing-id"); tid != "" {
 		rec.DurationUs = securityEventsStageDuration(tid, rec.RuleTriggered)
+		if v, ok := securityTimingLookup(tid + ":pre"); ok {
+			rec.PrecheckUs = v
+		} else if securityEventsIsPrecheckRule(rec.RuleTriggered) {
+			rec.PrecheckUs = rec.DurationUs // 预检拦:链未到 pre 收点,duration 即预检耗时
+		}
 	}
 	rec.RequestHeaders = securityEventsSerializeHeaders(tx.Request.Headers)
 	rec.RequestBody = securityEventsEncodeBody(tx.Request.Body)
@@ -1129,8 +1137,8 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 		return offset, fmt.Errorf("security events: begin insert transaction: %w", err)
 	}
 	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO security_events
-		(event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, anomaly_score, rule_name, policy_name, transaction_id, duration_us, request_headers, request_body)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		(event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, anomaly_score, rule_name, policy_name, transaction_id, duration_us, precheck_us, request_headers, request_body)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return committedOffset, fmt.Errorf("security events: prepare insert: %w", err)
@@ -1281,7 +1289,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 			policyID, policyName := securityEventsAttributePolicy(rule.caddyID, rec.RuleTriggered, rec.Action, rec.ClientIP, policyByID, bindings)
 			if _, ierr := stmt.Exec(rec.EventTime, rule.caddyID, policyID, rec.ClientIP, rec.Method, rec.URI,
 				rec.EventType, rec.RuleTriggered, rec.RuleMsg, rec.Action, rec.AnomalyScore,
-				rule.name, policyName, rec.TransactionID, rec.DurationUs, rec.RequestHeaders, rec.RequestBody); ierr != nil {
+				rule.name, policyName, rec.TransactionID, rec.DurationUs, rec.PrecheckUs, rec.RequestHeaders, rec.RequestBody); ierr != nil {
 				_ = stmt.Close()
 				_ = tx.Rollback()
 				return committedOffset, fmt.Errorf("security events: insert event: %w", ierr)
@@ -1298,8 +1306,8 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 					return committedOffset, fmt.Errorf("security events: begin batch transaction: %w", err)
 				}
 				stmt, err = tx.Prepare(`INSERT OR IGNORE INTO security_events
-				(event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, anomaly_score, rule_name, policy_name, transaction_id, duration_us, request_headers, request_body)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+				(event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, anomaly_score, rule_name, policy_name, transaction_id, duration_us, precheck_us, request_headers, request_body)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 				if err != nil {
 					tx.Rollback()
 					return committedOffset, fmt.Errorf("security events: prepare batch insert: %w", err)

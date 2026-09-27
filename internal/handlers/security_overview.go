@@ -118,9 +118,38 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 			}
 		}
 	}
+	// 分段平均处理耗时（2026-09-27 用户裁定）：security_events.duration_us 按
+	// 预检/WAF 段分桶平均（摄取管道已按规则归属选段值——预检事件=纯预检耗时,
+	// WAF 事件=隔离预检后的 WAF 耗时）。24h 窗口对齐计数口径;duration_us>0 过滤
+	// 历史行/未命中行;高并发下 GROUP BY 走 idx_security_events_rule+time 索引。
+	preAvg, preCnt, wafAvg, wafCnt := 0.0, 0, 0.0, 0
+	// 预检平均用 precheck_us 全样本(含 WAF 事件的预检快照,样本更大更准);
+	// WAF 平均只用 WAF 段事件的 duration_us(已隔离预检开销)。
+	if trows, terr := db.MetricsDB.Query(`SELECT rule_triggered, AVG(CASE WHEN rule_triggered IN ('2','3','4','5','7','8','12','14') OR (LENGTH(rule_triggered)=6 AND rule_triggered LIKE '8%') THEN precheck_us ELSE duration_us END), COUNT(*) FROM security_events WHERE rule_caddy_id=? AND event_time >= datetime('now','-1 day') AND duration_us > 0 GROUP BY rule_triggered`, ruleCaddyID); terr == nil {
+		for trows.Next() {
+			var triggered string
+			var avg float64
+			var cnt int
+			if serr := trows.Scan(&triggered, &avg, &cnt); serr != nil {
+				break
+			}
+			if n, cerr := strconv.Atoi(triggered); cerr == nil && services.IsStage1PrecheckID(n) {
+				preAvg = (preAvg*float64(preCnt) + avg*float64(cnt)) / float64(preCnt+cnt)
+				preCnt += cnt
+			} else {
+				wafAvg = (wafAvg*float64(wafCnt) + avg*float64(cnt)) / float64(wafCnt+cnt)
+				wafCnt += cnt
+			}
+		}
+		trows.Close()
+	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
 		"stage1_blocked_24h":      stage1,
 		"stage3_blocked_24h":      stage3,
 		"ratelimit_blocks_reload": ratelimit,
+		"precheck_avg_us":         preAvg,
+		"precheck_samples":        preCnt,
+		"waf_avg_us":              wafAvg,
+		"waf_samples":             wafCnt,
 	}})
 }

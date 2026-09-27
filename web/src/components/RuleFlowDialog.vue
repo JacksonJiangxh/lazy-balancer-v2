@@ -41,6 +41,7 @@
             <span class="tl-card-head">
               <span class="tl-title">{{ node.title }}</span>
               <span v-if="node.chip" class="tl-chip">{{ node.chip }}<em v-if="node.chipCaption" class="tl-chip-caption">{{ node.chipCaption }}</em></span>
+              <span v-if="node.timing" class="tl-chip tl-chip--timing">{{ node.timing }}</span>
             </span>
             <span class="tl-sub">{{ node.subtitle }}</span>
           </button>
@@ -331,7 +332,7 @@ import { request } from '@/utils/api'
 import type { APIResponse } from '@/types'
 import type { RuleFlowPathRule } from '@/types/rules'
 import { hostPortKey } from '@/utils/upstreamKeys'
-import { STAGE_TITLES, attachStageDetails, inferPolicyType, mergeIpEntries, parseIPList, parseRefIds } from '@/utils/securityStages'
+import { STAGE_TITLES, attachStageDetails, formatDurationUs, inferPolicyType, mergeIpEntries, parseIPList, parseRefIds } from '@/utils/securityStages'
 import type {
   CrsRuleFileOption,
   RuleFlowTarget,
@@ -365,6 +366,12 @@ interface StageStats {
   stage1_blocked_24h: number
   stage3_blocked_24h: number
   ratelimit_blocks_reload: number
+  // 分段平均处理耗时（µs,2026-09-27）:预检段=信任+IP ACL+GeoIP(同一 coraza
+  // handler 不可分);WAF 段=隔离预检后的评估成本(含限流,纳秒级可忽略)。
+  precheck_avg_us?: number
+  precheck_samples?: number
+  waf_avg_us?: number
+  waf_samples?: number
 }
 
 interface FlowCertInfo {
@@ -559,6 +566,20 @@ const upstreamWeightPercent = (upstreams: readonly RuleFlowUpstream[], row: Rule
 const pathMatchLabel = (matchType: string): string => (matchType === 'exact' ? '精确' : '前缀')
 
 // 计数 chip：静默拉取（未到数不渲染 chip；绝不渲染加载态字面）；
+// 分段平均耗时(µs):阶段 1=预检段,阶段 3=WAF 段;无数据返回 0(不渲染 chip)
+// 面板耗时行:有采样时显示「· 平均耗时 X（N 次采样)」
+const stageTimingText = (stage: 1 | 3): string => {
+  const us = stageTimingUs(stage)
+  if (us <= 0) return ''
+  const samples = stage === 1 ? (stats.value?.precheck_samples ?? 0) : (stats.value?.waf_samples ?? 0)
+  return ` · 平均耗时 ${formatDurationUs(us)}（近 24 小时 ${samples} 次采样）`
+}
+
+const stageTimingUs = (stage: 1 | 3): number => {
+  if (!stats.value || isTcp.value) return 0
+  return stage === 1 ? (stats.value.precheck_avg_us ?? 0) : (stats.value.waf_avg_us ?? 0)
+}
+
 const stageChip = (stage: 1 | 2 | 3): { chip?: string; caption?: string } => {
   if (!props.target?.caddyId || isTcp.value || !statsSettled.value) return {}
   if (!stats.value) return { chip: '—' }
@@ -570,9 +591,9 @@ const stageChip = (stage: 1 | 2 | 3): { chip?: string; caption?: string } => {
 // 面板统计行：同样静默口径（无数据不占行，绝不渲染加载态文本）
 const stageStatsText = (stage: 0 | 1 | 2 | 3): string => {
   if (stage === 0 || !props.target?.caddyId || isTcp.value || !statsSettled.value || !stats.value) return ''
-  if (stage === 1) return `近 24 小时本阶段拦截 ${stats.value.stage1_blocked_24h} 次`
+  if (stage === 1) return `近 24 小时本阶段拦截 ${stats.value.stage1_blocked_24h} 次${stageTimingText(1)}`
   if (stage === 2) return `自最近重载以来限流拦截 ${stats.value.ratelimit_blocks_reload} 次（恒 429）`
-  return `近 24 小时本阶段拦截 ${stats.value.stage3_blocked_24h} 次`
+  return `近 24 小时本阶段拦截 ${stats.value.stage3_blocked_24h} 次${stageTimingText(3)}`
 }
 
 interface FlowNode {
@@ -584,6 +605,7 @@ interface FlowNode {
   disabled?: boolean
   chip?: string
   chipCaption?: string
+  timing?: string
 }
 
 const flowNodes = computed<FlowNode[]>(() => {
@@ -615,6 +637,11 @@ const flowNodes = computed<FlowNode[]>(() => {
       disabled: !stage.enabled,
       chip,
       chipCaption: caption,
+      // 平均处理耗时 chip:阶段 1=预检段(信任+IP ACL 共用),阶段 3=WAF 段;
+      // 阶段 2 限流纳秒级不挂;无样本(24h 无命中)不挂——不误导。
+      timing: stageNo === 1 && stageTimingUs(1) > 0 ? `平均耗时 ${formatDurationUs(stageTimingUs(1))}`
+        : stageNo === 3 && stageTimingUs(3) > 0 ? `平均耗时 ${formatDurationUs(stageTimingUs(3))}`
+        : undefined,
     })
   }
   nodes.push(upstream)
@@ -757,6 +784,12 @@ const onDialogOpen = (): void => {
   white-space: nowrap;
 }
 .tl-chip-caption { font-style: normal; color: #9ca3af; margin-left: 4px; }
+.tl-chip--timing {
+  background: color-mix(in srgb, var(--el-color-success) 10%, transparent);
+  color: var(--el-color-success);
+  border-color: color-mix(in srgb, var(--el-color-success) 30%, transparent);
+  font-variant-numeric: tabular-nums;
+}
 .tl-sub { font-size: 12px; color: #6b7280; }
 
 /* 卡片+面板同列容器：面板展开时整行撑高，轨道连接线随之连续（用户报告：面板

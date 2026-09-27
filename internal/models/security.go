@@ -251,6 +251,9 @@ type SecurityEvent struct {
 	// DurationUs：安全链处理耗时（微秒;blocked_counter 注入 timing ID → 侧车
 	// 文件关联;历史行/未命中为 0，前端显示为「—」;亚毫秒精度 0.xxx ms 展示）。
 	DurationUs int64 `json:"duration_us"`
+	// PrecheckUs：该请求预检段耗时快照（µs）——WAF 事件的触发详情弹框显示
+	// 「预检+WAF」完整分解;预检事件与 DurationUs 同值。
+	PrecheckUs int64 `json:"precheck_us"`
 	// RequestHeaders：事件请求的完整头（JSON 文本，8KB 截断）——摄入恒落库；
 	// RequestBody：仅策略开 log_request_body 后有值（64KB 截断，非 UTF-8 转
 	// base64 并带标记前缀）。敏感头掩码是前端展示层姿态，库内为原文。

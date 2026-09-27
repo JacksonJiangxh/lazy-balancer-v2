@@ -274,6 +274,7 @@ func initMetricsSchema(db *sql.DB) error {
 		policy_name TEXT DEFAULT '',
 		transaction_id TEXT DEFAULT '',
 		duration_us INTEGER DEFAULT 0,
+		precheck_us INTEGER DEFAULT 0,
 		request_headers TEXT DEFAULT '',
 		request_body TEXT DEFAULT ''
 	);
@@ -307,8 +308,12 @@ func initMetricsSchema(db *sql.DB) error {
 	}
 	// 幂等迁移：安全处理耗时列（v2.3.3 安全处理耗时）——blocked_counter 在链首
 	// 注入 timing ID 请求头（coraza 审计日志收录），摄取管道按 ID 查耗时表写入；
-	// 历史行与未命中行保持 0（UI 显示「—」）。新库由上方建表语句直接带出。
 	if err := migrateSecurityEventsDuration(db); err != nil {
+		return fmt.Errorf("failed to migrate metrics database schema: %w", err)
+	}
+	// 幂等迁移：预检段耗时快照列（v2.3.3 分段计时）——WAF 事件的触发详情弹框
+	// 显示「预检+WAF」完整分解;流程弹框预检平均用全样本(含 WAF 事件的快照)。
+	if err := migrateSecurityEventsPrecheckUs(db); err != nil {
 		return fmt.Errorf("failed to migrate metrics database schema: %w", err)
 	}
 	return nil
@@ -323,6 +328,20 @@ func migrateSecurityEventsDuration(db *sql.DB) error {
 	if colCount == 0 {
 		if _, err := db.Exec("ALTER TABLE security_events ADD COLUMN duration_us INTEGER DEFAULT 0"); err != nil {
 			return fmt.Errorf("failed to add security_events.duration_us: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrateSecurityEventsPrecheckUs 幂等补齐 security_events.precheck_us 列。
+func migrateSecurityEventsPrecheckUs(db *sql.DB) error {
+	var colCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('security_events') WHERE name='precheck_us'").Scan(&colCount); err != nil {
+		return fmt.Errorf("failed to check security_events.precheck_us: %w", err)
+	}
+	if colCount == 0 {
+		if _, err := db.Exec("ALTER TABLE security_events ADD COLUMN precheck_us INTEGER DEFAULT 0"); err != nil {
+			return fmt.Errorf("failed to add security_events.precheck_us: %w", err)
 		}
 	}
 	return nil

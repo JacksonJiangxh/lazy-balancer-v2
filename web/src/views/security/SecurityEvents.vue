@@ -179,6 +179,7 @@
           </el-descriptions-item>
           <el-descriptions-item label="异常评分">{{ ctxEvent.anomaly_score > 0 ? ctxEvent.anomaly_score : '—' }}</el-descriptions-item>
           <el-descriptions-item label="处理耗时">{{ formatDurationUs(ctxEvent.duration_us) }}</el-descriptions-item>
+          <el-descriptions-item v-if="ctxEvent.precheck_us > 0 && ctxEvent.duration_us > ctxEvent.precheck_us" label="耗时分解">预检 {{ formatDurationUs(ctxEvent.precheck_us) }} + 本阶段 {{ formatDurationUs(ctxEvent.duration_us - ctxEvent.precheck_us) }}</el-descriptions-item>
         </el-descriptions>
 
         <div class="ctx-section-title">请求头</div>
@@ -243,7 +244,7 @@ import IPLocationAction from '@/views/security/IPLocationAction.vue'
 import { formatDate } from '@/utils/date'
 import type { APIResponse } from '@/types'
 
-interface SecurityEvent { id: number; event_time: string; rule_caddy_id: string; rule_name: string; policy_id: number; policy_name: string; client_ip: string; ip_location: string; method: string; uri: string; event_type: string; rule_triggered: string; rule_msg: string; action: string; anomaly_score: number; duration_us: number; request_headers: string; request_body: string }
+interface SecurityEvent { id: number; event_time: string; rule_caddy_id: string; rule_name: string; policy_id: number; policy_name: string; client_ip: string; ip_location: string; method: string; uri: string; event_type: string; rule_triggered: string; rule_msg: string; action: string; anomaly_score: number; duration_us: number; precheck_us: number; request_headers: string; request_body: string }
 
 // 触发规则 family 映射：'2'-'5' 与 '7'（允许模式预检拒绝，IP 白名单拒绝）为 IP 访问控制拦截，
 // '8' 为地域拦截，'14' 为威胁情报库预检拦截，'11' 为请求体解析失败，949 为异常评分评估拦截，920/921 为协议异常/攻击，其余为 CRS 规则 ID
