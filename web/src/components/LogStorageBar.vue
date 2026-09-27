@@ -83,11 +83,20 @@ const sizeText = computed(() => {
 const noteText = computed(() => {
   const i = info.value
   if (!i) return ''
-  if (i.limit_bytes && i.keep_count > 0) return `满 ${humanSize(i.limit_bytes)} 轮转${i.rotated_count > 0 ? `，已归档 ${i.rotated_count}/${i.keep_count} 份` : `，保留 ${i.keep_count} 份`}${i.rotated_bytes > 0 ? `（副本 ${humanSize(i.rotated_bytes)}）` : ''}`
-  if (i.limit_bytes) return `满 ${humanSize(i.limit_bytes)} 轮转${i.retention_note ? `，${i.retention_note}` : ''}${i.rotated_bytes > 0 ? `（副本 ${humanSize(i.rotated_bytes)}）` : ''}`
-  // 上限数字已在 sizes（rows/limit_rows）中展示,行内不重复——精简文案
+  // 条数上限形态(安全事件)
   if (i.limit_rows) return `满额自动裁最旧${i.retention_note ? '，' + i.retention_note : ''}`
-  return i.retention_note || ''
+  const parts: string[] = []
+  if (i.limit_bytes) parts.push(`满 ${humanSize(i.limit_bytes)} 轮转`)
+  if (i.keep_count > 0) {
+    // 固定份数上限(Caddy/certjob/audit 等):已归档时 N/M,未归档时「暂无归档，保留 M 份」
+    parts.push(i.rotated_count > 0 ? `已归档 ${i.rotated_count}/${i.keep_count} 份` : `暂无归档（满额保留 ${i.keep_count} 份）`)
+  } else if (i.rotated_count > 0) {
+    // 时间戳轮转族(运行日志):无固定份数上限,按保留期清理
+    parts.push(`已归档 ${i.rotated_count} 份`)
+  }
+  if (i.rotated_bytes > 0) parts.push(`副本 ${humanSize(i.rotated_bytes)}`)
+  if (i.keep_count === 0 && i.rotated_count === 0 && i.retention_note) parts.push(i.retention_note)
+  return parts.join('，')
 })
 
 const tooltipContent = computed(() => `${info.value?.config_source || ''}${info.value?.retention_note ? ' · ' + info.value.retention_note : ''}`)
