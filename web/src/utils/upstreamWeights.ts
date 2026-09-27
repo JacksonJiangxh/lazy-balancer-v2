@@ -68,6 +68,9 @@ export const redistributeWeight = <Item extends WeightedItem>(items: Item[], cha
   distributeWeight(otherItems, 100 - changed.weight)
 }
 
+// ⚠ 变异契约(历史 历史问题 文档化):participatingItems 及依赖它的函数会
+// **就地改写** items[].weight——禁用行与超出 MAX_UPSTREAM_ROWS 的行被写 0。
+// 当前调用方(编辑器草稿态)依赖此行为;未来在只读场景复用时须先剥离副作用。
 // weightPercent 权重百分比展示(历史 历史问题 收敛——原 RuleFlowDialog/Rules 两份
 // 同口径复刻)。签名:(upstreams, row)→0-100 整数;禁用行 0;总和≤0 时 0。
 export const weightPercent = (
