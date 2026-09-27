@@ -403,27 +403,26 @@ func TestAuditGenericRoutesExhaustive(t *testing.T) {
 	}
 }
 
-// TestAuditPolicyListsEqual 双 Explicit 清单集合相等绊线（R66 D-N3）：
-// auditRoutePolicies（Explicit 子集）与 HasExplicitAuditEvent 的 switch 清单是
-// 两份手工维护的重复清单——任一侧漂移（漏删/漏加）即：前者漏→中间件按 Skip
-// 不记录且 handler 以为被短路（零审计）；后者漏→中间件不短路，若 FormatAuditAction
-// 有映射即双条。AST 提取 switch 的 case 字面量做双向集合相等断言。
+// TestAuditPolicyListsEqual F63-B5e2-4 后语义:HasExplicitAuditEvent 已从
+// auditRoutePolicies 派生(原双清单 switch 已删)——本测试退化为「派生源
+// 非空且含已知 Explicit 路由」的活性钉(防策略表被清空后 Explicit 全静默
+// 降级为 Generic)。
 func TestAuditPolicyListsEqual(t *testing.T) {
-	switchSet := extractHasExplicitAuditEventCases(t)
-	explicitSet := make(map[string]bool)
+	explicitCount := 0
 	for route, policy := range auditRoutePolicies {
 		if policy == AuditPolicyExplicit {
-			explicitSet[route] = true
+			explicitCount++
+			_ = route
 		}
 	}
-	for route := range explicitSet {
-		if !switchSet[route] {
-			t.Errorf("策略清单含 %s 但 HasExplicitAuditEvent switch 不含——中间件不短路，映射复活即双条", route)
-		}
+	if explicitCount < 10 {
+		t.Fatalf("auditRoutePolicies Explicit 条目=%d,期望 ≥10——策略表被清空/损坏将使 HasExplicitAuditEvent 恒 false", explicitCount)
 	}
-	for route := range switchSet {
-		if !explicitSet[route] {
-			t.Errorf("HasExplicitAuditEvent switch 含 %s 但策略清单不含——该路由零审计（中间件 Skip 且无 handler 记录约定）", route)
+	// 抽样验证已知 Explicit 路由
+	known := []string{"POST /api/v1/auth/login", "POST /api/v1/auth/logout"}
+	for _, k := range known {
+		if !HasExplicitAuditEvent(k[:strings.Index(k, " ")], k[strings.Index(k, " ")+1:]) {
+			t.Errorf("known Explicit route %q not derived as Explicit", k)
 		}
 	}
 }

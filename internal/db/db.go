@@ -661,7 +661,7 @@ func createTables() error {
 			return fmt.Errorf("failed to seed threat source %s: %w", seed[0], err)
 		}
 		// 存量行 display_name 专业化跟进（2026-09-24 用户裁定；name 为定位键不变）
-		if _, err := DB.Exec(`UPDATE security_threat_sources SET display_name=? WHERE name=?`, seed[1], seed[0]); err != nil {
+		if _, err := DB.Exec(`UPDATE security_threat_sources SET display_name=? WHERE name=? AND COALESCE(display_name,'')<>?`, seed[1], seed[0], seed[1]); err != nil {
 			return fmt.Errorf("failed to refresh threat source display_name %s: %w", seed[0], err)
 		}
 	}

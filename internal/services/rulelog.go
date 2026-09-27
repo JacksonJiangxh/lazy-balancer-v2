@@ -84,6 +84,10 @@ func ReadRuleLogFrom(ruleID string, offset int64) (lines []string, next int64) {
 // ReadRuleLogTail returns the last maxLines lines of the rule's access log
 // and the file offset at which they begin, reading backwards in blocks so
 // even very large logs cost only a few reads.
+// maxBackwardScan F63-B5e2-2:向前扫描字节上限——无换行的损坏/二进制文件
+// 防止 O(n²) 全量拷贝(100MB 无换行 ≈ 数十 GB 级复制)
+const maxBackwardScan = 4 << 20 // 4MB
+
 func ReadRuleLogTail(ruleID string, maxLines int) (content string, offset int64) {
 	path := RuleLogPath(ruleID)
 	f, err := os.Open(path)

@@ -8,7 +8,9 @@ export interface CurrentUser {
   auth_provider?: string
 }
 
-export interface UserListItem extends Omit<CurrentUser, 'is_enabled'> {
+export interface UserListItem extends CurrentUser {
+  // F63-B7-5:原 Omit<CurrentUser,'is_enabled'> + 立即重加 is_enabled 是
+  // 无操作变换——直接 extends 消除冗余
   is_enabled: boolean
   mfa_enabled?: boolean
   created_at?: string | null

@@ -83,4 +83,4 @@ lazy-balancer://docs/ops-playbook
 | 400 | 请求体不可读 |
 | 413 | 请求体超过 1 MiB |
 | 401 | API Key 无效 |
-| 403 | MCP 未启用 / IP 不在白名单 / 只读 Key 调写工具 |
+| 403 | MCP 未启用 / IP 不在白名单 / 只读 Key 调写工具 ；非 admin 属主的写工具 403；从节点非集群写工具 403 |

@@ -53,6 +53,7 @@ func TestSeedDefaultBlockPage_seedsAndRepairsBuiltinPages(t *testing.T) {
 		t.Fatalf("内置限流页未随 schema 播种: %v", err)
 	}
 	if !ratelimitBuiltin || !strings.Contains(ratelimitContent, "429 Too Many Requests") || !strings.Contains(ratelimitContent, "min(560px") {
+		t.Fatalf("F63-B5d-1: builtin 429 page missing or content wrong (builtin=%v)", ratelimitBuiltin)
 	}
 	if err := db.DB.QueryRow(`SELECT COALESCE(is_builtin,0) FROM security_block_pages WHERE id=9002`).Scan(&maintenanceBuiltin); err != nil || !maintenanceBuiltin {
 		t.Fatalf("内置维护页未随 schema 播种: builtin=%v err=%v", maintenanceBuiltin, err)
