@@ -54,7 +54,29 @@ fi
     done
 
     echo "[caddy-supervisor] Starting Caddy..."
-    caddy run --config /app/config/Caddyfile --adapter caddyfile
+    caddy run --config /app/config/Caddyfile --adapter caddyfile &
+    CADDY_PID=$!
+
+    # 等 admin 就绪后重应用 last-good 配置(重启后 Caddy 只有 Caddyfile 的
+    # 基础形态,443 规则等需经 admin API /load 重放——否则崩溃自愈后 HTTPS 缺失)
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      if wget -q -O /dev/null -T 1 http://localhost:2019/config/ 2>/dev/null; then
+        if [ -s /app/data/last_good_caddy_config.json ]; then
+          if wget -q -O /dev/null -T 5 --header="Content-Type: application/json" \
+            --post-file=/app/data/last_good_caddy_config.json \
+            http://localhost:2019/load 2>/dev/null; then
+            echo "[caddy-supervisor] Re-applied last known good config"
+          else
+            echo "[caddy-supervisor] WARN: last-good config re-apply failed"
+          fi
+        fi
+        break
+      fi
+      sleep 1
+    done
+
+    # 等待 Caddy 退出(wait 同时回收进程——零僵尸)
+    wait $CADDY_PID
     CODE=$?
     echo "[caddy-supervisor] Caddy exited (code $CODE)"
 
