@@ -90,12 +90,12 @@ const noteText = computed(() => {
   if (i.keep_count > 0) {
     // 固定份数上限(Caddy/certjob/audit 等):已归档时 N/M,未归档时「暂无归档，保留 M 份」
     parts.push(i.rotated_count > 0 ? `已归档 ${i.rotated_count}/${i.keep_count} 份` : `暂无归档（满额保留 ${i.keep_count} 份）`)
-  } else if (i.rotated_count > 0) {
-    // 时间戳轮转族(运行日志):无固定份数上限,按保留期清理
-    parts.push(`已归档 ${i.rotated_count} 份`)
+  } else {
+    // 时间戳轮转族(运行日志):无固定份数上限——归档数恒显示(含 0)
+    parts.push(i.rotated_count > 0 ? `已归档 ${i.rotated_count} 份` : '暂无归档')
   }
   if (i.rotated_bytes > 0) parts.push(`副本 ${humanSize(i.rotated_bytes)}`)
-  if (i.keep_count === 0 && i.rotated_count === 0 && i.retention_note) parts.push(i.retention_note)
+  if (i.keep_count === 0 && i.retention_note) parts.push(i.retention_note)
   return parts.join('，')
 })
 
