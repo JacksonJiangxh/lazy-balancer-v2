@@ -73,7 +73,7 @@ func TestSecurityTimingLoad_missingFileSilentDegradation(t *testing.T) {
 
 // Given: 审计条目请求头含 timing ID 且耗时表有该 ID
 // When: securityEventsParseTransaction
-// Then: DurationMs 命中写入 record
+// Then: DurationUs 命中写入 record
 func TestSecurityEventsParseTransaction_durationFromTimingHeader(t *testing.T) {
 	const auditJSON = `{"transaction":{"unix_timestamp":1790452183279764883,"id":"ABtibGJndZlGPDP1","client_ip":"::1","server_id":"test.example.com","request":{"method":"GET","uri":"/","headers":{"host":["test.example.com"],"x-lb-rule-id":["lb_test"],"x-lb-security-timing-id":["abc12345"]}},"is_interrupted":true},"messages":[{"message":"test","data":{"id":"942100","raw":""}}]}`
 
@@ -91,8 +91,8 @@ func TestSecurityEventsParseTransaction_durationFromTimingHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.DurationMs != 42 {
-		t.Errorf("DurationMs = %d; want 42", rec.DurationMs)
+	if rec.DurationUs != 42 {
+		t.Errorf("DurationUs = %d; want 42", rec.DurationUs)
 	}
 	if rec.Action != "blocked" {
 		t.Errorf("Action = %q; want blocked", rec.Action)
@@ -101,7 +101,7 @@ func TestSecurityEventsParseTransaction_durationFromTimingHeader(t *testing.T) {
 
 // Given: 审计条目无 timing 头(历史条目/Caddy 旧版本)
 // When: securityEventsParseTransaction
-// Then: DurationMs 保持 0(不报错)
+// Then: DurationUs 保持 0(不报错)
 func TestSecurityEventsParseTransaction_noTimingHeaderZeroDuration(t *testing.T) {
 	const auditJSON = `{"transaction":{"unix_timestamp":1790452183279764883,"id":"ABtibGJndZlGPDP1","client_ip":"::1","server_id":"test.example.com","request":{"method":"GET","uri":"/","headers":{"host":["test.example.com"]}},"is_interrupted":true},"messages":[{"message":"test","data":{"id":"942100","raw":""}}]}`
 
@@ -109,7 +109,7 @@ func TestSecurityEventsParseTransaction_noTimingHeaderZeroDuration(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.DurationMs != 0 {
-		t.Errorf("DurationMs = %d; want 0 (no header)", rec.DurationMs)
+	if rec.DurationUs != 0 {
+		t.Errorf("DurationUs = %d; want 0 (no header)", rec.DurationUs)
 	}
 }

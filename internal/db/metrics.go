@@ -273,7 +273,7 @@ func initMetricsSchema(db *sql.DB) error {
 		rule_name TEXT DEFAULT '',
 		policy_name TEXT DEFAULT '',
 		transaction_id TEXT DEFAULT '',
-		duration_ms INTEGER DEFAULT 0,
+		duration_us INTEGER DEFAULT 0,
 		request_headers TEXT DEFAULT '',
 		request_body TEXT DEFAULT ''
 	);
@@ -314,15 +314,15 @@ func initMetricsSchema(db *sql.DB) error {
 	return nil
 }
 
-// migrateSecurityEventsDuration 幂等补齐 security_events.duration_ms 列。
+// migrateSecurityEventsDuration 幂等补齐 security_events.duration_us 列。
 func migrateSecurityEventsDuration(db *sql.DB) error {
 	var colCount int
-	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('security_events') WHERE name='duration_ms'").Scan(&colCount); err != nil {
-		return fmt.Errorf("failed to check security_events.duration_ms: %w", err)
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('security_events') WHERE name='duration_us'").Scan(&colCount); err != nil {
+		return fmt.Errorf("failed to check security_events.duration_us: %w", err)
 	}
 	if colCount == 0 {
-		if _, err := db.Exec("ALTER TABLE security_events ADD COLUMN duration_ms INTEGER DEFAULT 0"); err != nil {
-			return fmt.Errorf("failed to add security_events.duration_ms: %w", err)
+		if _, err := db.Exec("ALTER TABLE security_events ADD COLUMN duration_us INTEGER DEFAULT 0"); err != nil {
+			return fmt.Errorf("failed to add security_events.duration_us: %w", err)
 		}
 	}
 	return nil

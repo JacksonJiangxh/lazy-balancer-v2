@@ -819,3 +819,13 @@ export const sharedEntriesCache: Record<number, string[]> = {}
 export const invalidateSharedEntriesCache = (): void => {
   for (const k of Object.keys(sharedEntriesCache)) delete sharedEntriesCache[Number(k)]
 }
+
+// formatDurationUs 安全处理耗时格式化(微秒→人类可读,分级精度):
+// <1ms 用微秒精度(0.042ms);1-10ms 一位小数(1.5ms);≥10ms 整数毫秒(42ms/329ms)。
+export const formatDurationUs = (us: number | undefined): string => {
+  const v = us ?? 0
+  if (v <= 0) return '—'
+  if (v < 1000) return (v / 1000).toFixed(3) + 'ms'
+  if (v < 10000) return (v / 1000).toFixed(1) + 'ms'
+  return Math.round(v / 1000) + 'ms'
+}

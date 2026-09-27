@@ -3122,7 +3122,7 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 
 	queryArgs := append(args, pageSize, offset)
 	rows, err := db.MetricsDB.Query(`SELECT e.id, e.event_time, e.rule_caddy_id, e.policy_id, e.client_ip, e.method, e.uri, e.event_type, e.rule_triggered, e.rule_msg, e.action, e.anomaly_score,
-		e.rule_name, e.policy_name, e.duration_ms, e.request_headers, e.request_body
+		e.rule_name, e.policy_name, e.duration_us, e.request_headers, e.request_body
 		FROM security_events e`+where+" ORDER BY e.event_time DESC, e.id DESC LIMIT ? OFFSET ?", queryArgs...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
@@ -3134,7 +3134,7 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 	for rows.Next() {
 		var e models.SecurityEvent
 		// Scan 失败必须中止：否则部分零值的事件行会被当作真实事件返回（R35 D3）
-		if err := rows.Scan(&e.ID, &e.EventTime, &e.RuleCaddyID, &e.PolicyID, &e.ClientIP, &e.Method, &e.URI, &e.EventType, &e.RuleTriggered, &e.RuleMsg, &e.Action, &e.AnomalyScore, &e.RuleName, &e.PolicyName, &e.DurationMs, &e.RequestHeaders, &e.RequestBody); err != nil {
+		if err := rows.Scan(&e.ID, &e.EventTime, &e.RuleCaddyID, &e.PolicyID, &e.ClientIP, &e.Method, &e.URI, &e.EventType, &e.RuleTriggered, &e.RuleMsg, &e.Action, &e.AnomalyScore, &e.RuleName, &e.PolicyName, &e.DurationUs, &e.RequestHeaders, &e.RequestBody); err != nil {
 			services.Logf("error", "security events: scan failed: %v", err)
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "安全事件查询失败"})
 			return

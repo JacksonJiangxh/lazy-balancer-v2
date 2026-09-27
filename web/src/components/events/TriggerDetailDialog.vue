@@ -26,7 +26,7 @@
         <div v-if="row?.event_time" class="trg-hero-time">事件时间 · {{ formatTriggerTime(row.event_time) }}</div>
         <div class="trg-hero-meta">
           <span>来源 IP {{ row?.client_ip }}</span>
-          <span v-if="(row?.duration_ms ?? 0) > 0">处理耗时 {{ row?.duration_ms }}ms</span>
+          <span v-if="(row?.duration_us ?? 0) > 0">处理耗时 {{ formatDurationUs(row?.duration_us) }}</span>
           <el-tag size="small" :type="row?.action === 'blocked' ? 'danger' : 'warning'" effect="plain">
             {{ row?.action === 'blocked' ? '已拦截' : '已记录（检测）' }}
           </el-tag>
@@ -162,7 +162,7 @@ interface TriggerRow {
   rule_triggered: string
   rule_msg: string
   action: string
-  duration_ms?: number
+  duration_us?: number
 }
 
 const props = defineProps<{
@@ -335,7 +335,7 @@ const lists = ref<Array<{ id: number; name: string; system?: number | boolean }>
 // 跨组件共享条目缓存（第 61 轮 P2-2 修复：提升到 securityStages 模块级，
 // IPLocationAction 写入动作经 invalidateSharedEntriesCache 清空——原实现
 // 缓存在本组件 setup 内，快捷弹框的 onChanged 清不到它导致展示恒陈旧）
-import { sharedEntriesCache } from '@/utils/securityStages'
+import { sharedEntriesCache, formatDurationUs } from '@/utils/securityStages'
 const entriesCache = ref<Record<number, string[]>>({ ...sharedEntriesCache })
 
 const loadAll = async (): Promise<void> => {

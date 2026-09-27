@@ -126,7 +126,7 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	// 的 SecurityTimingEnd 处理器记录(此处 next 返回值混入上游代理往返,
 	// 不能用——实测 329ms 中主要是上游响应时间而非 WAF 评估)。
 	if timingID != "" && isSecurityBlock {
-		AppendSecurityTiming(timingID, time.Since(start).Milliseconds())
+		AppendSecurityTiming(timingID, time.Since(start).Microseconds())
 	}
 
 	if isSecurityBlock {
