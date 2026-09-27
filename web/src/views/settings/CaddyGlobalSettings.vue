@@ -146,13 +146,22 @@
 
   <el-dialog
     v-model="logDialogVisible"
-    title="Caddy 日志"
     width="min(1100px, 94vw)"
-    class="log-dialog"
+    class="log-dialog backup-dialog dialog-body-inset"
     destroy-on-close
     @opened="onLogDialogOpened"
     @close="onLogDialogClosed"
   >
+    <template #header>
+      <div class="backup-dialog-header">
+        <el-icon class="backup-dialog-icon"><Tickets /></el-icon>
+        <div>
+          <div class="backup-dialog-title">Caddy 日志</div>
+          <div class="backup-dialog-subtitle">运行时 / TLS / HTTP 服务器 / 反向代理四通道实时日志</div>
+        </div>
+      </div>
+    </template>
+    <LogStorageBar log-key="caddy" style="margin-bottom: 10px" />
     <el-tabs v-model="activeLogTab" @tab-change="onLogTabChange">
       <el-tab-pane label="运行时" name="runtime" />
       <el-tab-pane label="TLS" name="tls" />
