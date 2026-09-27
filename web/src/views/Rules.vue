@@ -3665,7 +3665,7 @@ onUnmounted(() => {
 /* Operation buttons */
 .operation-buttons {
   display: flex;
-  gap: 2px;
+  gap: 5px;
   justify-content: center;
 }
 .operation-buttons .el-button {
