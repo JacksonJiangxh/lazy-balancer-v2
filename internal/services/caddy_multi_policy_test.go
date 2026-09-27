@@ -186,8 +186,8 @@ func TestMultiPolicy_RouteComposition_OrderAndHandlerGroups(t *testing.T) {
 	// （耗时双头的剥离走 proxyRequestHeaders 删除清单，与 X-LB-Rule-ID
 	// 同机制，不额外占位。）
 	names := handlerNames(t, mainRoute)
-	if len(names) != 10 || names[0] != "headers" || names[1] != "lb_rule_metrics" || names[2] != "lb_security_blocked_counter" || names[3] != "waf" || names[4] != "request_body" || names[5] != "rate_limit" || names[6] != "waf" || names[7] != "waf" || names[8] != "lb_security_timing_end" {
-		t.Fatalf("main chain=%v, want [headers(X-LB-Rule-ID), lb_rule_metrics, lb_security_blocked_counter, waf(precheck), request_body, rate_limit(p2), waf(p2), waf(p3), lb_security_timing_end, reverse_proxy]", names)
+	if len(names) != 11 || names[0] != "headers" || names[1] != "lb_rule_metrics" || names[2] != "lb_security_blocked_counter" || names[3] != "waf" || names[4] != "lb_security_timing_pre" || names[5] != "request_body" || names[6] != "rate_limit" || names[7] != "waf" || names[8] != "waf" || names[9] != "lb_security_timing_end" {
+		t.Fatalf("main chain=%v, want [headers, lb_rule_metrics, lb_security_blocked_counter, waf(precheck), lb_security_timing_pre, request_body, rate_limit(p2), waf(p2), waf(p3), lb_security_timing_end, reverse_proxy]", names)
 	}
 	if names[len(names)-1] != "reverse_proxy" {
 		t.Fatalf("main chain last handler=%v, want reverse_proxy", names)
@@ -527,8 +527,9 @@ func TestMultiPolicy_IPPrecheckHandlerPrecedesAllSecurityHandlers(t *testing.T) 
 	// 方案 B(2026-09-15):counter 在 headers 之后、precheck 之前——包 precheck
 	// +全部策略 waf(IP 预检的 IP ACL/GeoIP 中断也计入)。
 	// D40-2-1:request_body 恒发射,位于 precheck waf 之后、策略 waf 之前。
-	if names[0] != "headers" || names[1] != "lb_rule_metrics" || names[2] != "lb_security_blocked_counter" || names[3] != "waf" || names[4] != "request_body" || names[5] != "waf" || names[6] != "waf" {
-		t.Fatalf("main chain=%v, want [headers(X-LB-Rule-ID), lb_security_blocked_counter, waf(precheck), request_body, waf, waf, ...]", names)
+	// (v2.3.3 分段计时:waf(precheck) 之后是 lb_security_timing_pre 收点)
+	if names[0] != "headers" || names[1] != "lb_rule_metrics" || names[2] != "lb_security_blocked_counter" || names[3] != "waf" || names[4] != "lb_security_timing_pre" || names[5] != "request_body" || names[6] != "waf" || names[7] != "waf" {
+		t.Fatalf("main chain=%v, want [headers(X-LB-Rule-ID), lb_security_blocked_counter, waf(precheck), lb_security_timing_pre, request_body, waf, waf, ...]", names)
 	}
 	// 注入头值=规则 caddy id 且覆盖客户端伪造（F3 归因信号本身的断言）
 	inject := mustMap(t, handlers[0], "X-LB-Rule-ID inject handler")

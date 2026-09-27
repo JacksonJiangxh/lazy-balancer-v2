@@ -3368,6 +3368,13 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		if precheckHandler != nil {
 			securityChain = append(securityChain, precheckHandler)
 		}
+		// 预检段耗时收点(2026-09-27 分段计时):预检之后、body/限流/WAF 之前——
+		// 摄取管道预检段事件取 :pre,WAF 段取 :end-:pre(隔离 WAF 评估成本)。
+		if rule.Protocol == "http" {
+			securityChain = append(securityChain, map[string]interface{}{
+				"handler": "lb_security_timing_pre",
+			})
+		}
 	}
 
 	// R1(2026-09-10 审计):规则级压缩必须位于全部 waf 处理器之外侧(链序在前)

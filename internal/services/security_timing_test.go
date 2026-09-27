@@ -79,7 +79,7 @@ func TestSecurityEventsParseTransaction_durationFromTimingHeader(t *testing.T) {
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "security-timing.log")
-	if err := os.WriteFile(path, []byte("abc12345 42\n"), 0644); err != nil {
+	if err := os.WriteFile(path, []byte("abc12345:pre 100\nabc12345:end 5000\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	origPath := securityTimingLogPath
@@ -91,8 +91,9 @@ func TestSecurityEventsParseTransaction_durationFromTimingHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.DurationUs != 42 {
-		t.Errorf("DurationUs = %d; want 42", rec.DurationUs)
+	// 审计条目规则 942100=WAF 段→end-pre=5000-100=4900
+	if rec.DurationUs != 4900 {
+		t.Errorf("DurationUs = %d; want 4900 (end 5000 - pre 100, WAF 段隔离)", rec.DurationUs)
 	}
 	if rec.Action != "blocked" {
 		t.Errorf("Action = %q; want blocked", rec.Action)
@@ -111,5 +112,40 @@ func TestSecurityEventsParseTransaction_noTimingHeaderZeroDuration(t *testing.T)
 	}
 	if rec.DurationUs != 0 {
 		t.Errorf("DurationUs = %d; want 0 (no header)", rec.DurationUs)
+	}
+}
+
+// Given: 预检段规则(id:2 IP ACL)事件 + 侧车 :pre/:end 并存
+// When: securityEventsStageDuration
+// Then: 预检段取 :pre(100),不取 :end(5000)
+func TestSecurityEventsStageDuration_precheckRuleTakesPre(t *testing.T) {
+	securityTimingTickMap = map[string]int64{
+		"tid1:pre": 100,
+		"tid1:end": 5000,
+	}
+	defer func() { securityTimingTickMap = nil }()
+	if v := securityEventsStageDuration("tid1", "2"); v != 100 {
+		t.Errorf("precheck rule duration = %d; want 100 (:pre)", v)
+	}
+	if v := securityEventsStageDuration("tid1", "942100"); v != 4900 {
+		t.Errorf("WAF rule duration = %d; want 4900 (:end-:pre)", v)
+	}
+}
+
+// Given: 预检拦截(:pre 未写,仅 :end)——预检段规则回退 :end
+func TestSecurityEventsStageDuration_precheckBlockFallback(t *testing.T) {
+	securityTimingTickMap = map[string]int64{"tid2:end": 350}
+	defer func() { securityTimingTickMap = nil }()
+	if v := securityEventsStageDuration("tid2", "2"); v != 350 {
+		t.Errorf("precheck block duration = %d; want 350 (:end fallback)", v)
+	}
+}
+
+// Given: WAF 段事件 :pre 竞态 miss——回退 :end 全链值
+func TestSecurityEventsStageDuration_wafPreMissFallback(t *testing.T) {
+	securityTimingTickMap = map[string]int64{"tid3:end": 6475}
+	defer func() { securityTimingTickMap = nil }()
+	if v := securityEventsStageDuration("tid3", "942100"); v != 6475 {
+		t.Errorf("WAF pre-miss duration = %d; want 6475 (:end fallback)", v)
 	}
 }

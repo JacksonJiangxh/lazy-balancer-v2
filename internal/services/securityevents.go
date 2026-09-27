@@ -168,14 +168,13 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 		Action:        "logged",
 	}
 	rec.AttributionRuleID = securityEventsFirstHeader(tx.Request.Headers, "x-lb-rule-id")
-	// 安全处理耗时（2026-09-27）：blocked_counter 注入的 timing ID 在请求头里,
-	// coraza 审计日志天然收录——按 ID 查摄取管道本 tick 加载的耗时侧车文件
-	// (跨进程:写侧在 Caddy 二进制 blocked_counter,读侧在本进程);未命中
-	// (历史条目/竞态先于写侧)保持 0,UI 显示为「—」。
+	// 安全处理耗时（2026-09-27 分段计时）：blocked_counter 注入的 timing ID 在
+	// 请求头里,coraza 审计日志天然收录——按 ID+分段键查侧车文件。选值规则:
+	// 预检段规则(IP ACL/GeoIP/信任/威胁,id 1-14 与 800xxx)取 :pre(预检拦时
+	// :pre 未写,回退 :end=预检耗时);WAF 段规则(CRS 9xxxxx/自定义)取
+	// :end-:pre(隔离 WAF 评估成本,不含预检开销)。未命中保持 0,UI 显示「—」。
 	if tid := securityEventsFirstHeader(tx.Request.Headers, "x-lb-security-timing-id"); tid != "" {
-		if dur, ok := securityTimingLookup(tid); ok {
-			rec.DurationUs = dur
-		}
+		rec.DurationUs = securityEventsStageDuration(tid, rec.RuleTriggered)
 	}
 	rec.RequestHeaders = securityEventsSerializeHeaders(tx.Request.Headers)
 	rec.RequestBody = securityEventsEncodeBody(tx.Request.Body)
@@ -1498,4 +1497,40 @@ func securityTimingLookup(id string) (int64, bool) {
 	}
 	v, ok := securityTimingTickMap[id]
 	return v, ok
+}
+
+// securityEventsIsPrecheckRule 判定规则 ID 是否预检段——IP ACL(2/4/5/7)、
+// 信任(3/12)、GeoIP(8)、威胁情报(14)与 GeoIP 区域规则(800xxx,6 位 8 开头)。
+// 与 stageCategorizeAttack 的预检分支同口径。
+func securityEventsIsPrecheckRule(ruleID string) bool {
+	switch ruleID {
+	case "2", "3", "4", "5", "7", "8", "12", "14":
+		return true
+	}
+	return len(ruleID) == 6 && strings.HasPrefix(ruleID, "8")
+}
+
+// securityEventsStageDuration 按 timing ID+规则归属选分段耗时(µs)。
+// 预检段: :pre 优先(链到达 pre 收点),miss 回退 :end(预检拦:链未到 pre 收点,
+// blocked_counter 写的 :end 即预检耗时)。
+// WAF 段: :end-:pre(两端都有时隔离 WAF 成本);:pre miss(老形态/竞态)回退 :end。
+func securityEventsStageDuration(timingID, ruleID string) int64 {
+	if securityEventsIsPrecheckRule(ruleID) {
+		if v, ok := securityTimingLookup(timingID + ":pre"); ok {
+			return v
+		}
+		if v, ok := securityTimingLookup(timingID + ":end"); ok {
+			return v
+		}
+		return 0
+	}
+	endV, endOK := securityTimingLookup(timingID + ":end")
+	preV, preOK := securityTimingLookup(timingID + ":pre")
+	if endOK && preOK && endV >= preV {
+		return endV - preV
+	}
+	if endOK {
+		return endV
+	}
+	return 0
 }
