@@ -70,6 +70,9 @@ fi
             echo "[caddy-supervisor] WARN: last-good config re-apply failed"
           fi
         fi
+        # trigger 文件:lazy-balancer 侧监听后走与启动完全相同的 DB 渲染→校验→
+        # 应用流程(权威修正——last_good 只是快速恢复桥,可能滞后于 DB)
+        echo restarted > /tmp/caddy-restarted
         break
       fi
       sleep 1

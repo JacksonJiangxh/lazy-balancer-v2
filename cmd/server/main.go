@@ -162,6 +162,9 @@ func run() error {
 	if err := h.ApplyConfigOnStartup(); err != nil {
 		services.Logf("error", "failed to apply Caddy config on startup: %v", err)
 	}
+	// F62-28:Caddy 重启监听——监督器触发后走与启动相同的 DB 渲染→应用流程
+	// (修正 last_good 快照可能滞后于 DB 的窗口)。
+	h.StartCaddyRestartWatcher()
 	// 配置一致性看门狗：周期比对 DB 规则与 Caddy 运行配置，不一致时三通道告知
 	// （系统日志/操作日志/前端横幅），恢复由用户手动重启完成。
 	services.StartConfigWatchdog(cfg.CaddyAdminURL)

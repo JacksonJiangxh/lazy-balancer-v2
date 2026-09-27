@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -683,6 +684,32 @@ func clampAuditRetentionMonthsOnStartup() {
 		return
 	}
 	services.Logf("info", "日志保留月数 %d 超出 1-12 范围，已钳位为 %d", months, clamped)
+}
+
+// caddyRestartTriggerFile 是监督器(entrypoint)在 Caddy 进程重启后写入的
+// 触发标记——本 watcher 检测到后调用 ApplyConfigOnStartup 走与容器启动完全
+// 相同的配置载入流程(DB 渲染→校验→admin API 应用),修正 last_good 快照可能
+// 滞后于 DB 的窗口(F62-28 用户裁定:自愈配置恢复须与启动初始化同一流程)。
+const caddyRestartTriggerFile = "/tmp/caddy-restarted"
+
+// StartCaddyRestartWatcher 启动 Caddy 重启监听(2s 轮询 trigger 文件)。
+// 幂等(已运行不重启);main.go 在启动应用完成后调用。
+func (h *Handlers) StartCaddyRestartWatcher() {
+	go func() {
+		for {
+			time.Sleep(2 * time.Second)
+			if _, err := os.Stat(caddyRestartTriggerFile); err != nil {
+				continue
+			}
+			_ = os.Remove(caddyRestartTriggerFile)
+			services.Logf("info", "检测到 Caddy 进程重启，走启动配置流程重新应用（DB 渲染）")
+			if err := h.ApplyConfigOnStartup(); err != nil {
+				services.Logf("error", "Caddy 重启后配置重应用失败: %v", err)
+			} else {
+				services.Logf("info", "Caddy 重启后配置重应用完成（与启动流程同源）")
+			}
+		}
+	}()
 }
 
 func (h *Handlers) ApplyConfigOnStartup() error {
