@@ -18,7 +18,7 @@ import (
 func (h *Handlers) ListCAProviders(c *gin.Context) {
 	list, err := h.caProviderService.ListCAProviders()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to list CA providers"})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询 CA 提供商列表失败"})
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: list})
@@ -27,7 +27,7 @@ func (h *Handlers) ListCAProviders(c *gin.Context) {
 func (h *Handlers) GetCAProvider(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid id parameter"})
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的 ID 参数"})
 		return
 	}
 
@@ -37,7 +37,7 @@ func (h *Handlers) GetCAProvider(c *gin.Context) {
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "CA provider not found"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to get CA provider"})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询 CA 提供商失败"})
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: p})
@@ -54,7 +54,7 @@ func credentialsMeaningfullyChanged(newCredentials, oldCredentials string) bool 
 func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid id parameter"})
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的 ID 参数"})
 		return
 	}
 
@@ -76,7 +76,7 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 			return
 		}
 		services.Logf("error", "Failed to query CA provider %d: %v", id, err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to query CA provider"})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询 CA 提供商失败"})
 		return
 	}
 	changed := []string{}
@@ -136,7 +136,7 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 	} else {
 		recordAudit(c, "更新", "CA提供商", services.FormatAuditDetail(fmt.Sprintf("提供商 %d", id), oldName, fmt.Sprintf("变更：%s", strings.Join(changed, "、"))))
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "CA provider updated"})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "CA 提供商已更新"})
 }
 
 func (h *Handlers) TestCAProvider(c *gin.Context) {
@@ -152,7 +152,7 @@ func (h *Handlers) TestCAProvider(c *gin.Context) {
 			return
 		}
 		services.Logf("error", "Failed to query CA provider %d before test: %v", id, err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to query CA provider"})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询 CA 提供商失败"})
 		return
 	}
 

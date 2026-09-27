@@ -73,6 +73,10 @@ var ErrClusterPinMismatch = errClusterPinMismatch
 // errSyncPullStopped 是 beginPull 在停机竞态（Stop 期间）下的哨兵错误：该路径
 // 不得落库覆盖 apply_ok_reload_failed 标记（见 recordSyncError），错误本身仍
 // 返回给调用方（含手动 Pull 的 API 响应）。
+// ErrSlaveReadOnly 从节点尝试修改设置时的哨兵错误（F64:替代字符串匹配，
+// 改文案不再静默破坏 403 判定）。
+var ErrSlaveReadOnly = errors.New("从节点不能修改集群设置")
+
 var errSyncPullStopped = errors.New("集群同步已停止")
 
 // errSyncTokenRevoked 表示主节点以 401/403 拒绝了本节点的快照拉取：
