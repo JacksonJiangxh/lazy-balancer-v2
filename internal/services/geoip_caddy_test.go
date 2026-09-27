@@ -106,7 +106,7 @@ func geoipRuleLine(t *testing.T, directives string) string {
 // TestBuildIPPrecheckDirectives_geoipChain：GeoIP 地域拦截从策略引擎迁入阶段 1
 // 合并预检引擎（阶段化执行模型）——纯 GeoIP 策略（off 无 IP 控制无自定义）也
 // 发射预检；链首内网放行（!@ipMatch 全量私网段 + id:800000+policyID + deny
-// 不带 status + skipAfter 终点），续段锚定正则匹配 X-GeoIP-Loc（与旧 id:8
+// 不带 status + skipAfter 终点），续段锚定正则匹配 X-LB-GeoIP-Loc（与旧 id:8
 // 同构两段链）。
 func TestBuildIPPrecheckDirectives_geoipChain(t *testing.T) {
 	policy := &models.SecurityPolicy{
@@ -131,13 +131,13 @@ func TestBuildIPPrecheckDirectives_geoipChain(t *testing.T) {
 	if strings.Contains(starter, "status:") {
 		t.Fatalf("precheck geoip deny must not carry a status action:\n%s", starter)
 	}
-	if !strings.Contains(directives, ` SecRule REQUEST_HEADERS:X-GeoIP-Loc "@rx ^(?:海外)$" "t:none"`) {
+	if !strings.Contains(directives, ` SecRule REQUEST_HEADERS:X-LB-GeoIP-Loc "@rx ^(?:海外)$" "t:none"`) {
 		t.Fatalf("child rule missing anchored overseas match:\n%s", directives)
 	}
 }
 
 // TestBuildIPPrecheckDirectives_geoipProvincesJoinedAlternation：纯省条目附加
-// (?:/.*)?——省内城市段（省/市 形态的 X-GeoIP-Loc）同样命中（整省语义）。
+// (?:/.*)?——省内城市段（省/市 形态的 X-LB-GeoIP-Loc）同样命中（整省语义）。
 // 形状自旧策略引擎 id:8 段逐字迁入预检。
 func TestBuildIPPrecheckDirectives_geoipProvincesJoinedAlternation(t *testing.T) {
 	policy := &models.SecurityPolicy{
@@ -196,13 +196,13 @@ func TestBuildIPPrecheckDirectives_geoipMultiPolicyOrderAndTrust(t *testing.T) {
 	if idx1 < 0 || idx2 < 0 || markerIdx < 0 || !(idx1 < idx2 && idx2 < markerIdx) {
 		t.Fatalf("geoip chains must be ordered p1 < p2 < SecMarker:\n%s", directives)
 	}
-	// p1 信任续段：紧随其 X-GeoIP-Loc 续段之后、p2 链之前。
-	locIdx := strings.Index(directives, ` SecRule REQUEST_HEADERS:X-GeoIP-Loc "@rx ^(?:海外)$" "t:none"`)
+	// p1 信任续段：紧随其 X-LB-GeoIP-Loc 续段之后、p2 链之前。
+	locIdx := strings.Index(directives, ` SecRule REQUEST_HEADERS:X-LB-GeoIP-Loc "@rx ^(?:海外)$" "t:none"`)
 	// v2.3.x：信任续段名单经 @ipListFast 文件投影（p%d-trust scope）。
 	trust := `SecRule REMOTE_ADDR "!@ipListFast `
 	trustIdx := strings.Index(directives, trust)
 	if locIdx < 0 || trustIdx < 0 || trustIdx < locIdx || trustIdx > idx2 {
-		t.Fatalf("p1 trust continuation must follow its X-GeoIP-Loc segment and precede p2 chain:\n%s", directives)
+		t.Fatalf("p1 trust continuation must follow its X-LB-GeoIP-Loc segment and precede p2 chain:\n%s", directives)
 	}
 	if got := readRenderedIPList(t, directives[trustIdx:], "-trust"); got != "1.2.3.4/32\n" {
 		t.Fatalf("信任续段名单文件=%q, want 仅 1.2.3.4/32", got)
@@ -548,8 +548,8 @@ func TestPolicyHasGeoIP_modeGate(t *testing.T) {
 // 同时拦截 geoip 关闭时客户端伪造同名头直达后端。与 HostHeader set 并存。
 func TestBuildHTTPHandleChain_stripsGeoIPHeadersBeforeUpstream(t *testing.T) {
 	wantStrip := []string{
-		"X-GeoIP-Country", "X-GeoIP-Country-Code", "X-GeoIP-Region",
-		"X-GeoIP-Province", "X-GeoIP-City", "X-GeoIP-Loc",
+		"X-LB-GeoIP-Country", "X-LB-GeoIP-Country-Code", "X-LB-GeoIP-Region",
+		"X-LB-GeoIP-Province", "X-LB-GeoIP-City", "X-LB-GeoIP-Loc",
 	}
 	upstreams := []UpstreamConfig{{Host: "127.0.0.1", Port: 8080, Weight: 1, Enabled: true}}
 

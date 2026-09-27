@@ -68,7 +68,7 @@ func TestEngineBehavior_PrecheckTrustDetectionOnlyExemptsGeoIPDeny(t *testing.T)
 		defer func() { _ = tx.Close() }()
 		tx.ProcessConnection(clientIP, 12345, "127.0.0.1", 443)
 		tx.ProcessURI("/", "GET", "HTTP/1.1")
-		tx.AddRequestHeader("X-GeoIP-Loc", geoLoc)
+		tx.AddRequestHeader("X-LB-GeoIP-Loc", geoLoc)
 		return tx.ProcessRequestHeaders()
 	}
 

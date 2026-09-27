@@ -110,7 +110,7 @@ func TestEngineGate_customRuleIDCollisionSkipped(t *testing.T) {
 }
 
 // 阶段化模型（GeoIP 迁入预检）：预检含逐策略 GeoIP 链（链首 deny+skipAfter+
-// chain、X-GeoIP-Loc 续段、信任续段）的新形状必须被 coraza v3.7.0 接受——
+// chain、X-LB-GeoIP-Loc 续段、信任续段）的新形状必须被 coraza v3.7.0 接受——
 // 「disruptive 动作仅允许链首段」约束只经编译可见（R-10）。
 func TestEngineGate_precheckGeoipChainShapes(t *testing.T) {
 	p1 := &models.SecurityPolicy{
