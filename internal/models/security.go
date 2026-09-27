@@ -248,6 +248,9 @@ type SecurityEvent struct {
 	AnomalyScore  int    `json:"anomaly_score"`
 	RuleName      string `json:"rule_name"`
 	PolicyName    string `json:"policy_name"`
+	// DurationMs：安全链处理耗时（blocked_counter 注入 timing ID → 侧车文件关联；
+	// 历史行/未命中为 0，前端显示为「—」）。
+	DurationMs int64 `json:"duration_ms"`
 	// RequestHeaders：事件请求的完整头（JSON 文本，8KB 截断）——摄入恒落库；
 	// RequestBody：仅策略开 log_request_body 后有值（64KB 截断，非 UTF-8 转
 	// base64 并带标记前缀）。敏感头掩码是前端展示层姿态，库内为原文。

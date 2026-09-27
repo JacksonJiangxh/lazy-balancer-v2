@@ -52,6 +52,7 @@ type securityEventRecord struct {
 	RuleMsg           string
 	Action            string
 	AnomalyScore      int
+	DurationMs        int64
 	RequestHeaders    string
 	RequestBody       string
 }
@@ -167,6 +168,15 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 		Action:        "logged",
 	}
 	rec.AttributionRuleID = securityEventsFirstHeader(tx.Request.Headers, "x-lb-rule-id")
+	// 安全处理耗时（2026-09-27）：blocked_counter 注入的 timing ID 在请求头里,
+	// coraza 审计日志天然收录——按 ID 查摄取管道本 tick 加载的耗时侧车文件
+	// (跨进程:写侧在 Caddy 二进制 blocked_counter,读侧在本进程);未命中
+	// (历史条目/竞态先于写侧)保持 0,UI 显示为「—」。
+	if tid := securityEventsFirstHeader(tx.Request.Headers, "x-lb-security-timing-id"); tid != "" {
+		if dur, ok := securityTimingLookup(tid); ok {
+			rec.DurationMs = dur
+		}
+	}
 	rec.RequestHeaders = securityEventsSerializeHeaders(tx.Request.Headers)
 	rec.RequestBody = securityEventsEncodeBody(tx.Request.Body)
 	if tx.IsInterrupted {
@@ -1077,6 +1087,10 @@ func (t *securityEventsTailer) securityEventsTick() error {
 	if err != nil {
 		return err
 	}
+	// 安全处理耗时（2026-09-27）：每 pass 加载耗时侧车文件到 tick 级 map——
+	// audit 新增字节才走到这里（空闲 tick 在上方提前返回），侧车文件同样只在
+	// 有新请求时增长,量级匹配。
+	securityTimingLoad()
 	f, err := os.Open(t.logPath)
 	if err != nil {
 		return fmt.Errorf("security events: open audit log: %w", err)
@@ -1116,8 +1130,8 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 		return offset, fmt.Errorf("security events: begin insert transaction: %w", err)
 	}
 	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO security_events
-		(event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, anomaly_score, rule_name, policy_name, transaction_id, request_headers, request_body)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		(event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, anomaly_score, rule_name, policy_name, transaction_id, duration_ms, request_headers, request_body)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return committedOffset, fmt.Errorf("security events: prepare insert: %w", err)
@@ -1268,7 +1282,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 			policyID, policyName := securityEventsAttributePolicy(rule.caddyID, rec.RuleTriggered, rec.Action, rec.ClientIP, policyByID, bindings)
 			if _, ierr := stmt.Exec(rec.EventTime, rule.caddyID, policyID, rec.ClientIP, rec.Method, rec.URI,
 				rec.EventType, rec.RuleTriggered, rec.RuleMsg, rec.Action, rec.AnomalyScore,
-				rule.name, policyName, rec.TransactionID, rec.RequestHeaders, rec.RequestBody); ierr != nil {
+				rule.name, policyName, rec.TransactionID, rec.DurationMs, rec.RequestHeaders, rec.RequestBody); ierr != nil {
 				_ = stmt.Close()
 				_ = tx.Rollback()
 				return committedOffset, fmt.Errorf("security events: insert event: %w", ierr)
@@ -1285,8 +1299,8 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 					return committedOffset, fmt.Errorf("security events: begin batch transaction: %w", err)
 				}
 				stmt, err = tx.Prepare(`INSERT OR IGNORE INTO security_events
-				(event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, anomaly_score, rule_name, policy_name, transaction_id, request_headers, request_body)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+				(event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, anomaly_score, rule_name, policy_name, transaction_id, duration_ms, request_headers, request_body)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 				if err != nil {
 					tx.Rollback()
 					return committedOffset, fmt.Errorf("security events: prepare batch insert: %w", err)
@@ -1427,4 +1441,61 @@ func runSecurityEventsIngestionLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 	}
+}
+
+// —— 安全处理耗时侧车文件（2026-09-27 用户裁定）——
+// 跨进程通信:写侧在 Caddy 二进制(caddygeoip/blocked_counter 经
+// AppendSecurityTiming 追加「<id> <ms>」行),读侧在本进程(每 audit pass 前
+// securityTimingLoad 全量读入 tick 级 map);关联键=blocked_counter 注入请求头
+// X-Lb-Security-Timing-Id(coraza 审计日志 request.headers 天然收录)。
+// 生命周期:tick 级 map(pass 结束后下轮 Load 重建,旧条目自然丢弃);文件由
+// 写侧 SweepSecurityTiming 守护超限(10MB 截断),正常量级(数秒内消费的
+// <30B/行)远不触界。读失败(首启动/权限)静默降级——耗时缺失不阻断摄取。
+var securityTimingTickMap map[string]int64
+
+// securityTimingLogPath 与 caddygeoip.securityTimingLogPath 同值——两模块
+// 跨二进制,路径各自持有(约定见 caddygeoip/security_timing.go);var 而非
+// const 是为了测试可覆写(同 auditLogPath 模式)。
+var securityTimingLogPath = "/app/logs/waf-audit/security-timing.log"
+
+// securityTimingLoad 全量读入耗时侧车文件到 tick 级 map(覆盖式重建)。
+// 文件量级:数秒消费窗口 × <30B/行,常态 <100KB;全量重读成本可忽略。
+func securityTimingLoad() {
+	securityTimingTickMap = nil
+	data, err := os.ReadFile(securityTimingLogPath)
+	if err != nil {
+		return // 首启动/权限/无安全流量——静默,查表全部 miss(耗时 0)
+	}
+	m := make(map[string]int64, 64)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		id, ms, ok := strings.Cut(line, " ")
+		if !ok || id == "" {
+			continue
+		}
+		v, err := strconv.ParseInt(ms, 10, 64)
+		if err != nil || v < 0 {
+			continue
+		}
+		m[id] = v
+	}
+	if len(m) > 0 {
+		securityTimingTickMap = m
+	}
+	// 读后截断:O_APPEND 语义下 Caddy 侧写句柄恒写文件尾,截断安全;窗口内
+	// (读→截断微秒级)新写入的行会丢——对应事件耗时报「—」,增强信息可接受。
+	// 不截断则文件单调增长(每请求 ~30B,10MB 守护只是兜底不是常态路径)。
+	_ = os.Truncate(securityTimingLogPath, 0)
+}
+
+// securityTimingLookup 按 timing ID 查本 tick 的耗时(读侧——ParseTransaction 消费)。
+func securityTimingLookup(id string) (int64, bool) {
+	if securityTimingTickMap == nil {
+		return 0, false
+	}
+	v, ok := securityTimingTickMap[id]
+	return v, ok
 }

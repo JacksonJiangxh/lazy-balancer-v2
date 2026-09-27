@@ -26,6 +26,7 @@
         <div v-if="row?.event_time" class="trg-hero-time">事件时间 · {{ formatTriggerTime(row.event_time) }}</div>
         <div class="trg-hero-meta">
           <span>来源 IP {{ row?.client_ip }}</span>
+          <span v-if="(row?.duration_ms ?? 0) > 0">处理耗时 {{ row?.duration_ms }}ms</span>
           <el-tag size="small" :type="row?.action === 'blocked' ? 'danger' : 'warning'" effect="plain">
             {{ row?.action === 'blocked' ? '已拦截' : '已记录（检测）' }}
           </el-tag>
@@ -161,6 +162,7 @@ interface TriggerRow {
   rule_triggered: string
   rule_msg: string
   action: string
+  duration_ms?: number
 }
 
 const props = defineProps<{
