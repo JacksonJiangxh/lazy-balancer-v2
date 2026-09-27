@@ -238,11 +238,11 @@ func securityEventsHostWithoutPort(hostport string) string {
 }
 
 const (
-	securityEventsHeadersCap = 8192
+	securityEventsHeadersCap = 65536 // 64KB(2026-09-28 用户裁定:service mesh 用户携带大量 x-b3/x-envoy 等追踪头,8KB 截断影响调试体验;此上限仅约束事件详情弹框存储,不影响请求本身)
 	securityEventsBodyCap    = 65536
 )
 
-// securityEventsSerializeHeaders 落库事件请求头：JSON 文本，8KB 上限——超限按
+// securityEventsSerializeHeaders 落库事件请求头：JSON 文本，64KB 上限——超限按
 // 值体积从大到小逐条丢弃，并以 _lb_dropped_headers 键记录丢弃条数（始终保持合法 JSON，
 // 前端无需容错解析）。头名/值原文保留，敏感值掩码是展示层姿态。
 func securityEventsSerializeHeaders(headers map[string][]string) string {

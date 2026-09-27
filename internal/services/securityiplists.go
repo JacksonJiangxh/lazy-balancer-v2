@@ -96,6 +96,9 @@ func expandPolicyIPRefs(p *models.SecurityPolicy, listsByID map[int64][]string) 
 // loadIPListEntries 在给定 store 上以一次（或分块）查询取回 id → 条目值列表
 // 映射：只解析 entries 的 value，remark 不参与生成；行缺失（悬空引用）与
 // entries 畸形行跳过——与自定义规则悬空引用仅留痕口径一致。
+// loadIPListEntries 与 loadIPListEntriesVia 是有意双实现(F64-P5 声明):
+// 前者供降级路径(渲染容忍缺失列表),后者供严格校验(refs 必须全部存在)。
+// 错误通道语义不同是设计意图,非冗余——合并需逐调用方审计错误处理链。
 func loadIPListEntries(store caddyConfigStore, ids []int64) map[int64][]string {
 	if len(ids) == 0 || store == nil {
 		return nil

@@ -105,13 +105,7 @@
       @opened="fetchMCPTools"
     >
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon"><el-icon :size="18"><SetUp /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">MCP 接入文档</div>
-            <div class="dialog-header__subtitle">服务地址与接入配置，供 AI 客户端（Claude / Cursor 等）连接</div>
-          </div>
-        </div>
+        <DialogHeader :icon="SetUp" title="MCP 接入文档" subtitle="服务地址与接入配置，供 AI 客户端（Claude / Cursor 等）连接" />
       </template>
       <el-form label-position="top">
         <el-form-item label="MCP 服务地址（Streamable HTTP）">
@@ -239,13 +233,7 @@
       @closed="resetCreateForm"
     >
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon dialog-header__icon--warning"><el-icon :size="18"><Key /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">创建 API 密钥</div>
-            <div class="dialog-header__subtitle">lb_sk_ 前缀凭证，创建后仅显示一次</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Key" title="创建 API 密钥" subtitle="lb_sk_ 前缀凭证，创建后仅显示一次" tone="warning" />
       </template>
       <el-form label-width="110px" :disabled="creating">
         <el-form-item label="密钥名称" :error="createNameError">
@@ -312,13 +300,7 @@
       @closed="resetFeatureForm"
     >
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon"><el-icon :size="18"><Setting /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">功能配置</div>
-            <div class="dialog-header__subtitle">目标密钥：{{ featureTarget?.name || '' }}</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Setting" title="功能配置" subtitle="目标密钥：{{ featureTarget?.name || '' }}" />
       </template>
       <el-form label-width="110px" :disabled="featureSaving">
         <el-divider content-position="left" class="section-divider">权限</el-divider>
@@ -366,13 +348,7 @@
       @closed="createdKey = ''"
     >
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon dialog-header__icon--success"><el-icon :size="18"><CircleCheckFilled /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">API 密钥已创建</div>
-            <div class="dialog-header__subtitle">仅显示一次，请立即复制并妥善保存</div>
-          </div>
-        </div>
+        <DialogHeader :icon="CircleCheckFilled" title="API 密钥已创建" subtitle="仅显示一次，请立即复制并妥善保存" tone="success" />
       </template>
       <el-alert
         title="此密钥仅显示一次，请立即复制并妥善保存。"
@@ -404,6 +380,7 @@ import { copyText } from '@/utils/copy'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { CircleCheckFilled, Connection, CopyDocument, Delete, Document, Key, Plus, Setting, SetUp, SwitchButton, VideoPlay } from '@element-plus/icons-vue'
 import type { APIKey, APIResponse, CreateAPIKeyInput, MCPToolSpec, UpdateAPIKeyInput } from '@/types'
+import DialogHeader from '@/components/DialogHeader.vue'
 
 interface CreateAPIKeyResponse {
   readonly data?: {
