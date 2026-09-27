@@ -241,6 +241,10 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		{Key: "threat_update", Name: "威胁库更新日志", LimitBytes: sizeLimitMB("cert_job_log_size_mb", 10), KeepCount: 5, ConfigSource: "基础设置 · 任务日志大小"},
 		{Key: "runtime", Name: "运行日志", LimitBytes: sizeLimitMB("runtime_log_size_mb", 100), KeepCount: 0, RetentionNote: "时间戳轮转，按保留期清理（份数随保留期）", ConfigSource: "基础设置 · 运行日志大小"},
 		{Key: "caddy", Name: "Caddy 运行日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
+		{Key: "caddy_runtime", Name: "Caddy 运行时日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
+		{Key: "caddy_tls", Name: "Caddy TLS 日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
+		{Key: "caddy_server", Name: "Caddy HTTP 服务器日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
+		{Key: "caddy_proxy", Name: "Caddy 反向代理日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
 		{Key: "rule_access", Name: "规则访问日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
 		{Key: "coraza_audit", Name: "Coraza 审计日志", LimitBytes: sizeLimitMB("audit_log_size_mb", 10), KeepCount: 5, ConfigSource: "基础设置 · 审计日志大小"},
 	}
@@ -285,6 +289,17 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	if info := byKey("runtime"); info != nil {
 		rtA, rtR, rtC := dirBytes(runtimePath)
 		info.SizeBytes, info.RotatedBytes, info.RotatedCount = rtA, rtR, rtC
+	}
+	for _, entry := range []struct{ key, file string }{
+		{"caddy_runtime", "caddy.log"},
+		{"caddy_tls", "caddy-tls.log"},
+		{"caddy_server", "caddy-server.log"},
+		{"caddy_proxy", "caddy-proxy.log"},
+	} {
+		if info := byKey(entry.key); info != nil {
+			a, r, c := dirBytes(filepath.Join(fixedLogsDir, entry.file))
+			info.SizeBytes, info.RotatedBytes, info.RotatedCount = a, r, c
+		}
 	}
 	if info := byKey("caddy"); info != nil {
 		var active, rotated int64
