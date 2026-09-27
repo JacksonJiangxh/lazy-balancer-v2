@@ -2398,8 +2398,8 @@ func TestSecurityEventsSerializeHeaders_dropsLargestUntilFits(t *testing.T) {
 	if roundTrip["Host"][0] != "a.example.com" || roundTrip["User-Agent"][0] != "probe" {
 		t.Errorf("small headers must be kept: %v", roundTrip)
 	}
-	if len(roundTrip["_dropped"]) != 1 || roundTrip["_dropped"][0] != "1" {
-		t.Errorf("_dropped marker=%v, want [\"1\"]", roundTrip["_dropped"])
+	if len(roundTrip["_lb_dropped_headers"]) != 1 || roundTrip["_lb_dropped_headers"][0] != "1" {
+		t.Errorf("_dropped marker=%v, want [\"1\"]", roundTrip["_lb_dropped_headers"])
 	}
 }
 

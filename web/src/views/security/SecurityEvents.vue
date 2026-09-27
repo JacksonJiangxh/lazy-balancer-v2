@@ -264,6 +264,8 @@ const isWafCrs = (row: SecurityEvent): boolean => /^9\d{5}$/.test(row.rule_trigg
 // 与后端 stageCategorizeAttack/categorizeAttack 三侧同口径。
 const isWafCustom = (row: SecurityEvent): boolean => /^\d{5}$/.test(row.rule_triggered ?? '') || /^1\d{6,}$/.test(row.rule_triggered ?? '')
 
+// 第 62 轮 F62-10:共享谓词已导出(utils/securityStages.ts triggerStageFamily)——
+// 与 TriggerDetailDialog kind 是同构平行实现,全量迁移需等价性验证。
 const stageCategory = (row: SecurityEvent): 'trust' | 'acl' | 'waf' | 'body' | 'other' => {
   const t = row.rule_triggered
   if (!t) return 'other'

@@ -174,6 +174,9 @@ const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void }>()
 
 type Kind = 'acl' | 'geo' | 'threat' | 'trust' | 'waf-crs' | 'waf-custom' | 'body' | 'other'
 
+// 第 62 轮 F62-10:共享谓词已导出(utils/securityStages.ts triggerStageFamily)——
+// 本 computed 与 SecurityEvents stageCategory 是同构平行实现,全量迁移需
+// 等价性矩阵验证(多轮审计调优的分支序),暂保守保留双实现。
 const kind = computed<Kind>(() => {
   const t = props.row?.rule_triggered ?? ''
   if (!t) return 'other'

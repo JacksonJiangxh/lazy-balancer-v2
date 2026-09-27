@@ -477,6 +477,7 @@ const ensureDetails = async (): Promise<void> => {
         ? request.get<APIResponse<SecurityStagePolicyDetail[]>>(`/security/rules/${encodeURIComponent(caddyId)}/policy`, { silent: true })
         : Promise.resolve<APIResponse<SecurityStagePolicyDetail[]>>({ code: 0, data: [] }),
       request.get<APIResponse<SecurityStageCustomRule[]>>('/security/custom-rules', { silent: true }),
+      // 第 62 轮 F62-26:50=CRS 文件数假设(当前远小于 50;超页宽时组名映射静默回退裸组码)
       request.get<APIResponse<{ rules: CrsRuleFileOption[] }>>('/security/crs/rules?page_size=50', { silent: true }),
     ])
     // 续体落地前校验会话序号：弹框已切换（onDialogOpen ++）或更新一次拉取已发起

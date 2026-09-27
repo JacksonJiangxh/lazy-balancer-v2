@@ -14,7 +14,7 @@ import (
 // 进程的摄取管道按行读「<timing_id>:<pre|end> <duration_us>」与审计条目按
 // timing ID 关联(读侧 tick 级合并 map,见 securityevents.go securityTimingLoad)。跨进程经文件通信(caddygeoip 编译进 Caddy 二进制,摄取管道在
 // lazy-balancer 二进制——不同进程,内存共享不可达)。
-const securityTimingLogPath = "/app/logs/waf-audit/security-timing.log"
+var securityTimingLogPath = "/app/logs/waf-audit/security-timing.log"
 
 // securityTimingHeader 是耗时关联头——blocked_counter 注入、coraza 审计日志
 // request.headers 收录、摄取管道读出后查耗时侧车文件。渲染链在该头抵达
@@ -52,11 +52,11 @@ func AppendSecurityTiming(id string, durationUs int64) {
 	_, _ = fmt.Fprintf(securityTimingFd, "%s %d\n", id, durationUs)
 }
 
-// securityTimingID 生成 8 字符随机 hex 作 timing 关联 ID(碰撞概率 1/16^8≈
-// 2.3e-10,侧车文件数秒内消费,万级在途量下可忽略;rand 失败返回空串=该请求
-// 不计耗时,静默降级)。
+// securityTimingID 生成 16 字符随机 hex 作 timing 关联 ID(第 62 轮 F62-29:
+// 原 4 字节生日界下 1 万在途即 ~1.2% 任意对碰撞概率——扩到 8 字节对齐
+// coraza tx.ID 长度,碰撞面消除;rand 失败返回空串=该请求不计耗时,静默降级)。
 func securityTimingID() string {
-	b := make([]byte, 4)
+	b := make([]byte, 8)
 	if _, err := cryptorand.Read(b); err != nil {
 		return ""
 	}

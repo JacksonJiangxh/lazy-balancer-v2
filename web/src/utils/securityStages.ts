@@ -833,3 +833,23 @@ export const formatDurationUs = (us: number | undefined): string => {
 // IP 地址列表分类预设——SecurityRules「提取为列表」与 SecurityPolicies 分类
 // 选择共用同一组选项(第 62 轮 F62 双源收敛,原两文件各自定义)。
 export const IP_LIST_CATEGORIES = ['搜索引擎爬虫', 'CDN 节点', '云服务商', '办公网络', '数据中心', '可信地址', '恶意 IP', '其他'] as const
+
+// triggerStageFamily 触发 id→阶段族归类(第 62 轮 F62-10 收敛——原
+// TriggerDetailDialog kind 与 SecurityEvents stageCategory 两份平行实现)。
+// 返回: 'trust'|'ipAcl'|'geoip'|'wafCustom'|'wafCrs'|'other'
+// 与后端 stageCategorizeAttack/categorizeAttack 同口径(msg 门先于裸 id 判定)。
+export const triggerStageFamily = (ruleTriggered: string, ruleMsg: string): string => {
+  const id = ruleTriggered
+  // WAF 自定义规则(5 位 id)先于前缀判定
+  if (id.length === 5) return 'wafCustom'
+  // msg 门(带 IP 黑/白名单消息的 id:3 历史行归 IP 访问控制——两视图一致)
+  if (ruleMsg.includes('IP 黑名单') || ruleMsg.includes('IP 白名单') || ruleMsg.includes('IP 访问控制')) return 'ipAcl'
+  if (ruleMsg.includes('GeoIP 区域拦截') || ruleMsg.includes('威胁情报库拦截')) return 'ipAcl'
+  if (id === '2' || id === '4' || id === '5' || id === '7' || id === '14') return 'ipAcl'
+  if (id === '8' || (id.length === 6 && id.startsWith('8'))) return 'geoip'
+  if (id === '3' || id === '12') return 'trust'
+  if (id === '11') return 'other'
+  if (id.length === 6 && id.startsWith('9')) return 'wafCrs'
+  if (id.length >= 7) return 'wafCrs'
+  return 'other'
+}
