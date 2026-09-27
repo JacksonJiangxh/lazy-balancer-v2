@@ -3,6 +3,7 @@ package caddygeoip
 import (
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -88,8 +89,28 @@ func (h *SecurityBlockedCounter) Provision(ctx caddy.Context) error {
 // ServeHTTP 调用链下游处理器,只读检查返回错误:安全层中断(HandlerError 且
 // 4xx status,且 len(ID)==16[coraza tx.ID] 或 status==429[限流])时按规则计数;
 // 上游 4xx 不产 HandlerError(反向代理直写响应)不误计;返回值原样透传。
+//
+// 安全处理耗时(2026-09-27 用户裁定):请求进入时注入 X-Lb-Security-Timing-Id
+// 请求头(coraza 审计日志的 request.headers 天然收录该头——摄取管道从审计
+// 条目读出同一 ID 即可对上),next 返回后记录耗时到共享表——弹框「处理耗时」
+// 的数据源。写侧在本方法(链外层),读侧在 internal/services/securityevents.go
+// 的 PopSecurityTiming(一次性消费,消费即删)。
 func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	// 安全处理耗时:注入 timing ID 供审计条目关联(coraza 在链内,能看到此头)
+	timingID := securityTimingID()
+	if timingID != "" {
+		r.Header.Set(securityTimingHeader, timingID)
+	}
+	start := time.Now()
+
 	err := next.ServeHTTP(w, r)
+
+	// 安全处理耗时:next 返回即安全链(IP 预检+全部策略引擎)已走完——
+	// 拦截(HandlerError 返回)与放行(评估完继续下游)都在此之后记录
+	if timingID != "" {
+		AppendSecurityTiming(timingID, time.Since(start).Milliseconds())
+	}
+
 	var herr caddyhttp.HandlerError
 	// P3-2(第 28.5 轮审计):「ID 非空+4xx」误纳非安全 4xx——caddyhttp.Error
 	// 恒生成 ID(randString 9 字符),proxy 499/request_body 413 也被计入。

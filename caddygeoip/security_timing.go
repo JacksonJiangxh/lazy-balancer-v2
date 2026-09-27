@@ -1,0 +1,79 @@
+package caddygeoip
+
+import (
+	cryptorand "crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+)
+
+// securityTimingLogPath 是耗时侧车日志路径——与 coraza 审计日志同目录
+// (auditLogPath = /app/logs/waf-audit/audit.log 的同族约定),lazy-balancer
+// 进程的摄取管道按行读「<timing_id> <duration_ms>」与审计条目按 timing ID
+// 关联。跨进程经文件通信(caddygeoip 编译进 Caddy 二进制,摄取管道在
+// lazy-balancer 二进制——不同进程,内存共享不可达)。
+const securityTimingLogPath = "/app/logs/waf-audit/security-timing.log"
+
+// securityTimingHeader 是耗时关联头——blocked_counter 注入、coraza 审计日志
+// request.headers 收录、摄取管道读出后查耗时侧车文件。渲染链在该头抵达
+// reverse_proxy 前删除(caddy.go 渲染层),不上泄上游。
+const securityTimingHeader = "X-Lb-Security-Timing-Id"
+
+// securityTimingFileMu/Fd 惰性打开的追加写句柄——首写时 OpenFile,进程生命周期
+// 复用;打开失败静默降级(耗时缺失,不阻断请求);目录不存在时 MkdirAll 兜底。
+var (
+	securityTimingMu sync.Mutex
+	securityTimingFd *os.File
+)
+
+// AppendSecurityTiming 追加一行「<id> <ms>」到耗时侧车日志(写侧:blocked_counter)。
+// 任何 I/O 失败静默降级——耗时是增强信息,不产生任何请求路径错误。
+func AppendSecurityTiming(id string, durationMs int64) {
+	if id == "" {
+		return
+	}
+	securityTimingMu.Lock()
+	defer securityTimingMu.Unlock()
+	if securityTimingFd == nil {
+		_ = os.MkdirAll(filepath.Dir(securityTimingLogPath), 0755)
+		f, err := os.OpenFile(securityTimingLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return
+		}
+		securityTimingFd = f
+	}
+	_, _ = fmt.Fprintf(securityTimingFd, "%s %d\n", id, durationMs)
+}
+
+// securityTimingID 生成 8 字符随机 hex 作 timing 关联 ID(碰撞概率 1/16^8≈
+// 2.3e-10,侧车文件数秒内消费,万级在途量下可忽略;rand 失败返回空串=该请求
+// 不计耗时,静默降级)。
+func securityTimingID() string {
+	b := make([]byte, 4)
+	if _, err := cryptorand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
+}
+
+// TimingSweeper 启动耗时侧车文件的大小守护(由 lazy-balancer 侧持有并 Close)——
+// 文件超限(10MB)时截断。Caddy 侧不启动 goroutine(进程生命周期管理在宿主),
+// 摄取管道的消费即天然清理,守护仅兜底「Caddy 活、摄取停」的极端形态。
+const securityTimingSweepBytes = 10 << 20
+
+// SweepSecurityTiming 检查并截断超限的耗时侧车文件(由摄取管道周期调用)。
+func SweepSecurityTiming() {
+	st, err := os.Stat(securityTimingLogPath)
+	if err != nil || st.Size() < securityTimingSweepBytes {
+		return
+	}
+	securityTimingMu.Lock()
+	defer securityTimingMu.Unlock()
+	if securityTimingFd != nil {
+		_ = securityTimingFd.Close()
+		securityTimingFd = nil
+	}
+	_ = os.Truncate(securityTimingLogPath, 0)
+}
