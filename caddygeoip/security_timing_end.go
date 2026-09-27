@@ -42,7 +42,7 @@ func (h *SecurityTimingEnd) ServeHTTP(w http.ResponseWriter, r *http.Request, ne
 	startNsStr := r.Header.Get(securityTimingStartHeader)
 	if timingID != "" && startNsStr != "" {
 		if startNs, perr := strconv.ParseInt(startNsStr, 10, 64); perr == nil {
-			AppendSecurityTiming(timingID, time.Now().UnixNano()-startNs)
+			AppendSecurityTiming(timingID, (time.Now().UnixNano()-startNs)/1000) // ns→µs
 		}
 	}
 	return next.ServeHTTP(w, r)
