@@ -46,7 +46,7 @@
           collapse-tags
           collapse-tags-tooltip
           :max-collapse-tags="1"
-          placeholder="触发阶段"
+          placeholder="触发阶段 / 规则 ID"
           style="width: 170px"
           popper-class="triggered-filter-popper"
         >

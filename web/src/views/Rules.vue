@@ -566,7 +566,7 @@
                   {{ wizardForm.protocol === 'tcp' ? '最大连接' : '最大请求数' }}
                   <el-tooltip placement="top" :content="wizardForm.protocol === 'tcp'
                     ? '该上游并发连接数上限（HTTP 规则映射为 reverse_proxy 每上游并发请求数 max_requests；TCP 规则映射为 caddy-l4 max_connections），0 为不限制'
-                    : '该上游同时处理的请求数达到上限后判定不可用并移出负载（Caddy max_requests 语义），0 为不限制——HTTP 反代无逐上游并发连接限制'" >
+                    : '该上游同时处理的请求数达到上限后判定不可用并移出负载，0 为不限制——HTTP 反代无逐上游并发连接限制'" >
                     <el-icon class="upstream-unknown"><QuestionFilled /></el-icon>
                   </el-tooltip>
                 </template>
@@ -1146,7 +1146,7 @@ import ProxyTimeoutFields from '@/components/rules/ProxyTimeoutFields.vue'
 import { validatePathRules } from '@/utils/ruleValidation'
 import { getStrategyLabel } from '@/utils/strategyLabels'
 import { hostPortKey } from '@/utils/upstreamKeys'
-import { MAX_UPSTREAM_ROWS, normalizeWeights, redistributeWeight } from '@/utils/upstreamWeights'
+import { MAX_UPSTREAM_ROWS, normalizeWeights, redistributeWeight, weightPercent } from '@/utils/upstreamWeights'
 import { certJobStatusLabel } from '@/utils/certJobStatus'
 import type { CertJobStatus } from '@/utils/certJobStatus'
 import { usePollingTask } from '@/composables/usePollingTask'
@@ -2452,13 +2452,7 @@ const validateEnabledUpstreams = (): string => {
   return ''
 }
 
-const weightPercent = (upstreams: readonly (Upstream | UpstreamInput)[] | undefined, row: Upstream | UpstreamInput): number => {
-  if (!upstreams?.length) return 0
-  if (row.enabled === false) return 0
-  const sum = upstreams.filter((upstream) => upstream.enabled !== false).reduce((s, u) => s + (u.weight || 0), 0)
-  if (sum <= 0) return 0
-  return Math.round(((row.weight || 0) / sum) * 100)
-}
+
 
 const addUpstream = () => {
   if (wizardForm.upstreams.length >= MAX_UPSTREAM_ROWS) return

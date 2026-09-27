@@ -1,13 +1,9 @@
+import { escapeHtml } from '@/utils/escape'
+
+export { escapeHtml }
 /**
  * Escape HTML special characters.
  */
-export function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-}
 
 /**
  * Convert ANSI escape sequences in a string to HTML.

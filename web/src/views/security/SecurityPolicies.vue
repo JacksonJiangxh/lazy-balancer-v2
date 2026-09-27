@@ -132,10 +132,10 @@
           type="warning"
           :closable="false"
           show-icon
-          :title="`上限风险：${migrateCapRisk.map((r) => r.name).join('、')} 迁移后将超过每条规则 ${MAX_POLICIES_PER_RULE} 条绑定上限——这些规则保持原绑定并进入 skipped 清单`"
+          :title="`上限风险：${migrateCapRisk.map((r) => r.name).join('、')} 迁移后将超过每条规则 ${MAX_POLICIES_PER_RULE} 条绑定上限——这些规则保持原绑定并进入跳过清单`"
           class="migrate-preview-alert"
         />
-        <div class="info-note-bar" style="margin-top: 2px"><span class="info-note-desc">全部规则重映射成功后原策略将被删除；存在 skipped 规则时原策略保留（因仍在使用）</span></div>
+        <div class="info-note-bar" style="margin-top: 2px"><span class="info-note-desc">全部规则重映射成功后原策略将被删除；存在被跳过的规则时原策略保留（因仍在使用）</span></div>
       </div>
       <template #footer>
         <el-button @click="migrateVisible = false">取消</el-button>
@@ -968,7 +968,7 @@ import { useClampedPagination } from '@/composables/useClampedPagination'
 import type { CrsExcludedRow, CrsRuleOptionView } from '@/composables/useCrsRuleIndex'
 import type { APIResponse, UserListItem } from '@/types'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
-import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, buildStageModel, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, parseRefIds } from '@/utils/securityStages'
+import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, buildStageModel, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, parseRefIds, IP_LIST_CATEGORIES} from '@/utils/securityStages'
 import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy } from '@/utils/securityStages'
 
 interface PolicyDetail { id: number; name: string; description: string; mode: string; anomaly_threshold: number; ip_acl_mode: string; ip_acl_list: string; ip_acl_enabled: boolean; ip_whitelist: string; ip_whitelist_enabled?: boolean; ip_blacklist?: string; ip_acl_list_refs?: string; ip_whitelist_refs?: string; rate_limit_enabled: boolean; rate_limit_rps: number; rate_limit_burst: number; crs_rule_groups: string; crs_excluded_rules: string; custom_rules: string; block_page_id: number; block_status_code: number; enabled: boolean; updated_at: string; geoip_mode?: string; geoip_countries?: string; waf_check_response?: boolean; log_request_body?: boolean; trust_detection?: boolean }
@@ -987,7 +987,7 @@ interface BlockPage { id: number; name: string; content?: string }
 
 const blockPages = ref<BlockPage[]>([])
 
-interface PolicySummary { id: number; name: string; mode: string; enabled: boolean; rule_count: number; has_waf: boolean; has_ip_control: boolean; has_rate_limit: boolean; has_custom_rules: boolean; anomaly_threshold: number; ip_acl_mode: string; ip_acl_list: string; ip_whitelist: string; ip_whitelist_enabled?: boolean; ip_blacklist: string; ip_acl_list_refs?: string; ip_whitelist_refs?: string; rate_limit_rps: number; rate_limit_burst: number; crs_excluded_count: number; custom_rules_count: number; ip_acl_enabled: boolean; updated_by: number; updated_at: string; crs_rule_groups?: string | string[]; has_geoip?: boolean; geoip_countries?: string; geoip_mode?: string; policy_type?: string; trust_detection?: boolean; blocked_24h?: number; trigger_24h?: number }
+interface PolicySummary { id: number; name: string; mode: string; enabled: boolean; rule_count: number; has_waf: boolean; has_ip_control: boolean; has_rate_limit: boolean; has_custom_rules: boolean; anomaly_threshold: number; ip_acl_mode: string; ip_acl_list: string; ip_whitelist: string; ip_whitelist_enabled?: boolean; ip_blacklist: string; ip_acl_list_refs?: string; ip_whitelist_refs?: string; rate_limit_rps: number; rate_limit_burst: number; crs_excluded_count: number; custom_rules_count: number; ip_acl_enabled: boolean; updated_by: number; updated_at: string; crs_rule_groups?: string | string[]; has_geoip?: boolean; geoip_countries?: string; geoip_mode?: string; policy_type?: string; trust_detection?: boolean; trigger_24h?: number }
 
 
 
@@ -1436,7 +1436,7 @@ const ensureIpListDetails = async (ids: number[], seq?: number): Promise<void> =
   })
   ipListDetails.value = next
 }
-const IP_LIST_CATEGORIES = ['搜索引擎爬虫', 'CDN 节点', '云服务商', '办公网络', '数据中心', '可信地址', '恶意 IP', '其他']
+
 const fetchIpLists = async (seq?: number): Promise<void> => {
   try {
     const res = await request.get<APIResponse<IPListRefOption[]>>('/security/ip-lists')
