@@ -49,7 +49,7 @@ func TestCallClusterServiceControl_followsSameHostTLSUpgradeRedirect(t *testing.
 	handler := &Handlers{cfg: &config.Config{DataDir: t.TempDir()}}
 
 	// When the master calls the slave via the plaintext address
-	message, err := handler.callClusterServiceControl(context.Background(), plaintext.URL, models.ClusterServiceActionStopCaddy, "ticket-x")
+	message, err := handler.callClusterServiceControl(context.Background(), plaintext.URL, models.ClusterServiceActionStopCaddy, "ticket-x", "")
 
 	// Then the request is replayed over https and the slave response relayed
 	if err != nil {
@@ -93,7 +93,7 @@ func TestCallClusterServiceControl_doesNotFollowCrossHostRedirect(t *testing.T) 
 	handler := &Handlers{cfg: &config.Config{DataDir: t.TempDir()}}
 
 	// When the master calls the slave via the plaintext address
-	_, err := handler.callClusterServiceControl(context.Background(), plaintext.URL, models.ClusterServiceActionStopCaddy, "ticket-x")
+	_, err := handler.callClusterServiceControl(context.Background(), plaintext.URL, models.ClusterServiceActionStopCaddy, "ticket-x", "")
 
 	// Then the redirect is not followed（301 空 body 解析失败即返回错误，票据不外泄）
 	if err == nil {

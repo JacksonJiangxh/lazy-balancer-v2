@@ -21,23 +21,23 @@
           </el-form-item>
           <el-form-item label="任务日志大小">
             <el-input-number v-model="settings.cert_job_log_size_mb" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
-            <el-text type="info" size="small" class="tip-inline">MB，证书任务与 CRS/IP 库/威胁库更新日志轮转阈值（建议 10-50）</el-text>
+            <el-text type="info" size="small" class="tip-inline">MB，任务与库更新日志轮转阈值</el-text>
           </el-form-item>
           <el-form-item label="审计日志大小">
           <el-input-number v-model="settings.audit_log_size_mb" :min="1" :max="512" controls-position="right" style="width: 120px;" />
-            <el-text type="info" size="small" class="tip-inline">MB，WAF 审计日志轮转阈值（建议 10-100）</el-text>
+            <el-text type="info" size="small" class="tip-inline">MB，WAF 审计日志轮转阈值</el-text>
           </el-form-item>
           <el-form-item label="运行日志大小">
             <el-input-number v-model="settings.runtime_log_size_mb" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
-            <el-text type="info" size="small" class="tip-inline">MB，轮转阈值（建议 50-200）</el-text>
+            <el-text type="info" size="small" class="tip-inline">MB，轮转阈值</el-text>
           </el-form-item>
           <el-form-item label="日志保留">
             <el-input-number v-model="settings.audit_retention_months" :min="1" :max="12" controls-position="right" style="width: 120px;" />
-            <el-text type="info" size="small" class="tip-inline">个月，操作/运行/安全事件日志超期清理（建议 3-6）</el-text>
+            <el-text type="info" size="small" class="tip-inline">个月，超期自动清理</el-text>
           </el-form-item>
           <el-form-item label="登录过期">
             <el-input-number v-model="settings.jwt_expire_minutes" :min="1" :max="1440" controls-position="right" style="width: 120px;" />
-            <el-text type="info" size="small" class="tip-inline">分钟，登录令牌有效期（默认 20）</el-text>
+            <el-text type="info" size="small" class="tip-inline">分钟，登录令牌有效期</el-text>
           </el-form-item>
           <el-form-item label="时区">
             <el-select v-model="settings.timezone" filterable class="compact-select">

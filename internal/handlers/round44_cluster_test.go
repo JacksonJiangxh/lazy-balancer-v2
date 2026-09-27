@@ -56,7 +56,7 @@ func TestCL44_4_callClusterServiceControl_returnsActionableErrorOnRedirect(t *te
 	handler := &Handlers{cfg: &config.Config{DataDir: t.TempDir()}}
 
 	// When
-	_, err := handler.callClusterServiceControl(context.Background(), slave.URL, models.ClusterServiceActionStopCaddy, "ticket-x")
+	_, err := handler.callClusterServiceControl(context.Background(), slave.URL, models.ClusterServiceActionStopCaddy, "ticket-x", "")
 
 	// Then：含 https 指引的重定向错误，而非 JSON 解析错误
 	if err == nil || !strings.Contains(err.Error(), "https://") || !strings.Contains(err.Error(), "重定向") {

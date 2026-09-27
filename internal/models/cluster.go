@@ -72,6 +72,9 @@ type ClusterNodeServiceRequest struct {
 type ClusterServiceControlRequest struct {
 	Action string `json:"action" binding:"required"`
 	Ticket string `json:"ticket" binding:"required"`
+	// Operator 是主节点侧实际操作人用户名(经票据保护的转发链传递,从节点
+	// 审计记录真实操作人而非「system」;空串回退「主节点」)。
+	Operator string `json:"operator,omitempty"`
 }
 
 // ClusterServiceControlClaims 服务控制票据载荷。

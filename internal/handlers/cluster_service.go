@@ -76,7 +76,7 @@ func (h *Handlers) ControlClusterNodeService(c *gin.Context) {
 		clusterError(c, status, "签发服务控制票据失败", err)
 		return
 	}
-	message, err := h.callClusterServiceControl(c.Request.Context(), issued.URL, req.Action, issued.Ticket)
+	message, err := h.callClusterServiceControl(c.Request.Context(), issued.URL, req.Action, issued.Ticket, currentUsername(c))
 	result := "成功"
 	if err != nil {
 		result = "失败"
@@ -102,8 +102,8 @@ func (h *Handlers) ControlClusterNodeService(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message})
 }
 
-func (h *Handlers) callClusterServiceControl(ctx context.Context, baseURL, action, ticket string) (string, error) {
-	payload, err := json.Marshal(models.ClusterServiceControlRequest{Action: action, Ticket: ticket})
+func (h *Handlers) callClusterServiceControl(ctx context.Context, baseURL, action, ticket, operator string) (string, error) {
+	payload, err := json.Marshal(models.ClusterServiceControlRequest{Action: action, Ticket: ticket, Operator: operator})
 	if err != nil {
 		return "", fmt.Errorf("编码服务控制请求: %w", err)
 	}
@@ -186,11 +186,11 @@ func (h *Handlers) ClusterServiceControl(c *gin.Context) {
 	}
 	message, err := h.executeClusterCaddyAction(req.Action)
 	if err != nil {
-		recordClusterServiceControlAudit(c, req.Action, "失败："+err.Error())
+		recordClusterServiceControlAuditBy(c, req.Action, "失败："+err.Error(), req.Operator)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: http.StatusInternalServerError, Message: err.Error()})
 		return
 	}
-	recordClusterServiceControlAudit(c, req.Action, "成功")
+	recordClusterServiceControlAuditBy(c, req.Action, "成功", req.Operator)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message})
 }
 
@@ -207,7 +207,7 @@ func (h *Handlers) executeClusterCaddyAction(action string) (string, error) {
 		if note := h.caddyApplyNoteLocked(); note != "" {
 			return "", errors.New("Caddy 已启动" + note)
 		}
-		return "Caddy 已启动", nil
+		return "Caddy 已启动（配置已从数据库载入）", nil
 	case models.ClusterServiceActionStopCaddy:
 		if err := stopCaddy(h.cfg.CaddyAdminURL); err != nil {
 			return "", err
@@ -223,14 +223,31 @@ func (h *Handlers) executeClusterCaddyAction(action string) (string, error) {
 		if note := h.caddyApplyNoteLocked(); note != "" {
 			return "", errors.New("Caddy 已重启" + note)
 		}
-		return "Caddy 已重启", nil
+		return "Caddy 已重启（配置已从数据库载入）", nil
 	}
 	return "", fmt.Errorf("不支持的服务控制动作：%s", action)
 }
 
 func recordClusterServiceControlAudit(c *gin.Context, action, result string) {
-	// CL44-3（第 44 轮审计）：action 来自未认证请求体，须先经 registerAuditField
-	// 清洗（去控制字符、截断 128B，同注册端点）再拼接，防伪造换行/超长注入审计详情。
-	services.RecordAuditLog("system", "服务控制", "节点服务",
+	recordClusterServiceControlAuditBy(c, action, result, "")
+}
+
+// recordClusterServiceControlAuditBy 带 operator 版——从节点审计记录主节点侧
+// 实际操作人(经票据保护的转发链传递);空串回退「主节点」(兼容旧主节点)。
+func recordClusterServiceControlAuditBy(c *gin.Context, action, result, operator string) {
+	// CL44-3（第 44 轮审计）：action/operator 来自请求体，须先经 registerAuditField
+	// 清洗（去控制字符、截断 128B）再拼接，防伪造换行/超长注入审计详情。
+	op := registerAuditField(operator)
+	if op == "" {
+		op = "主节点"
+	}
+	services.RecordAuditLog(op, "服务控制", "节点服务",
 		services.FormatAuditDetail("来源：主节点", "操作："+registerAuditField(action), "结果："+result), c.ClientIP())
+}
+
+// currentUsername 从 gin context 取 JWT/API Key 中间件注入的操作人用户名。
+func currentUsername(c *gin.Context) string {
+	username, _ := c.Get("username")
+	s, _ := username.(string)
+	return s
 }
