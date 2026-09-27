@@ -12,7 +12,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -65,10 +64,6 @@ func NewHandlers(deps Dependencies) *Handlers {
 
 func compensationContext(requestCtx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(requestCtx), compensationTimeout)
-}
-
-func passwordTooShort(password string) bool {
-	return password != "" && utf8.RuneCountInString(password) < minimumPasswordLength
 }
 
 type EnableCertJobAction int

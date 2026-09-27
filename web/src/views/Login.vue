@@ -15,7 +15,7 @@
         <el-form v-if="setupMode" ref="setupFormRef" :model="setupForm" :rules="setupRules" @submit.prevent="handleSetup" class="login-form">
           <div class="info-note-bar"><span class="info-note-desc">首次启动，请创建管理员账号</span></div>
           <el-form-item prop="username">
-            <el-input v-model="setupForm.username" name="username" autocomplete="username" placeholder="管理员用户名" size="large" :prefix-icon="User" maxlength="50" clearable />
+            <el-input v-model="setupForm.username" name="username" autocomplete="username" placeholder="管理员用户名（小写英文开头，仅限小写字母和数字）" size="large" :prefix-icon="User" maxlength="50" clearable />
           </el-form-item>
           <el-form-item prop="display_name">
             <el-input v-model="setupForm.display_name" placeholder="显示名（选填）" size="large" :prefix-icon="Postcard" maxlength="50" clearable />
@@ -182,7 +182,7 @@ const rules: FormRules = {
   ],
   password: [
     { required: true, message: '请输入密码', trigger: 'blur' },
-    { min: 6, message: '密码至少6位', trigger: 'blur' },
+    { min: 8, message: '密码至少8位', trigger: 'blur' },
   ],
 }
 
@@ -197,7 +197,7 @@ const setupRules: FormRules = {
   ],
   password: [
     { required: true, message: '请输入密码', trigger: 'blur' },
-    { min: 6, message: '密码至少6位', trigger: 'blur' },
+    { min: 8, message: '密码至少8位', trigger: 'blur' },
   ],
   confirm: [
     { required: true, message: '请再次输入密码', trigger: 'blur' },
