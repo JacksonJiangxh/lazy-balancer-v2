@@ -120,8 +120,8 @@ func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 // X-GeoIP-Loc），这些头是 geoip.* 变量的镜像；客户端伪造的同名头在
 // ServeHTTP 入口无条件删除（先删后设，防伪造绕过/误伤）。
 var geoipCorazaHeaders = []string{
-	"X-GeoIP-Country", "X-GeoIP-Country-Code", "X-GeoIP-Region",
-	"X-GeoIP-Province", "X-GeoIP-City", "X-GeoIP-Loc",
+	"X-LB-GeoIP-Country", "X-LB-GeoIP-Country-Code", "X-LB-GeoIP-Region",
+	"X-LB-GeoIP-Province", "X-LB-GeoIP-City", "X-LB-GeoIP-Loc",
 }
 
 // ServeHTTP publishes the client country and always delegates to the next
@@ -141,7 +141,7 @@ func (h *GeoIPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		// 匹配（rule.go evaluate 按值循环）——不置哨兵则 deny/allow 两模式的
 		// id:8 恒不命中，地域拦截静默 fail-open。与查询失败同口径发「海外」，
 		// 恢复文档化 fail-closed 语义。
-		r.Header.Set("X-GeoIP-Loc", "海外")
+		r.Header.Set("X-LB-GeoIP-Loc", "海外")
 	}
 	return next.ServeHTTP(w, r)
 }
@@ -171,11 +171,11 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	caddyhttp.SetVar(ctx, "geoip.region", "")
 	caddyhttp.SetVar(ctx, "geoip.province", "")
 	caddyhttp.SetVar(ctx, "geoip.city", "")
-	r.Header.Set("X-GeoIP-Country", "")
-	r.Header.Set("X-GeoIP-Region", "")
-	r.Header.Set("X-GeoIP-Province", "")
-	r.Header.Set("X-GeoIP-City", "")
-	r.Header.Set("X-GeoIP-Loc", "海外")
+	r.Header.Set("X-LB-GeoIP-Country", "")
+	r.Header.Set("X-LB-GeoIP-Region", "")
+	r.Header.Set("X-LB-GeoIP-Province", "")
+	r.Header.Set("X-LB-GeoIP-City", "")
+	r.Header.Set("X-LB-GeoIP-Loc", "海外")
 	province, city := "", ""
 	ip := realClientIP(r)
 	if ip == "" {
@@ -191,8 +191,8 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	}
 	caddyhttp.SetVar(ctx, "geoip.country_name", fields[0])
 	caddyhttp.SetVar(ctx, "geoip.region", region)
-	r.Header.Set("X-GeoIP-Country", fields[0])
-	r.Header.Set("X-GeoIP-Region", region)
+	r.Header.Set("X-LB-GeoIP-Country", fields[0])
+	r.Header.Set("X-LB-GeoIP-Region", region)
 	// SEC44-2(第 44 轮):上方 :179 已保证 len(fields)>=5,原两处 len>=3 守卫
 	// 恒真,直接执行块内逻辑。
 	if raw := fields[1]; raw != "" && raw != "0" {
@@ -203,7 +203,7 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 		province = normalizeProvince(raw)
 	}
 	caddyhttp.SetVar(ctx, "geoip.province", province)
-	r.Header.Set("X-GeoIP-Province", province)
+	r.Header.Set("X-LB-GeoIP-Province", province)
 	// R72 二十三次：市级粒度——region 第 3 列为城市；无效值（空/0）置空串，
 	// 使 CEL {http.vars.geoip.city} == X 对无城市段恒不命中。
 	// R72 二十五次：城市列经 normalizeCity 规范化——xdb 部分段城市列为拼音/
@@ -217,17 +217,17 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 		city = normalizeCity(c)
 	}
 	caddyhttp.SetVar(ctx, "geoip.city", city)
-	r.Header.Set("X-GeoIP-City", city)
+	r.Header.Set("X-LB-GeoIP-City", city)
 	// X-GeoIP-Loc：地域规则匹配键（coraza SecRule 的锚定正则全值目标）。
 	// 国家列非「中国」（含空/0/海外国名，与 D1 fail-closed 哨兵同口径）→
 	// 「海外」；国内 → 省 或 省/市（均为规范化值，与策略选项树同源，
 	// BuildCorazaDirectives 的 geoipLocOperator 按同形态编译条目）。
 	if fields[0] != "中国" {
-		r.Header.Set("X-GeoIP-Loc", "海外")
+		r.Header.Set("X-LB-GeoIP-Loc", "海外")
 	} else if city != "" {
-		r.Header.Set("X-GeoIP-Loc", province+"/"+city)
+		r.Header.Set("X-LB-GeoIP-Loc", province+"/"+city)
 	} else {
-		r.Header.Set("X-GeoIP-Loc", province)
+		r.Header.Set("X-LB-GeoIP-Loc", province)
 	}
 }
 

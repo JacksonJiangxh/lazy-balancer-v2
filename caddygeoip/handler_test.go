@@ -148,8 +148,8 @@ func geoipTestNext(t *testing.T, captured **http.Request) caddyhttp.HandlerFunc 
 }
 
 // TestServeHTTP_stripsSpoofedGeoIPHeaders_evenWithoutXdb：防伪造+fail-closed——客户端
-// 伪造的 X-GeoIP-* 头必须在入口剥除（伪造 X-GeoIP-Loc 可绕过 allow 模式地域
-// 拦截或制造误拦）；xdb 缺失（searcher nil）时伪造值不得残留，且 X-GeoIP-Loc
+// 伪造的 X-GeoIP-* 头必须在入口剥除（伪造 X-LB-GeoIP-Loc 可绕过 allow 模式地域
+// 拦截或制造误拦）；xdb 缺失（searcher nil）时伪造值不得残留，且 X-LB-GeoIP-Loc
 // 由「海外」哨兵覆盖——缺失变量会让 coraza 地域规则恒不命中（fail-open），
 // 哨兵恢复 deny/allow 两模式的 fail-closed 语义。
 func TestServeHTTP_stripsSpoofedGeoIPHeaders_evenWithoutXdb(t *testing.T) {
@@ -168,12 +168,12 @@ func TestServeHTTP_stripsSpoofedGeoIPHeaders_evenWithoutXdb(t *testing.T) {
 	req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
 	req.RemoteAddr = "114.114.114.114:53981"
 	for name, value := range map[string]string{
-		"X-GeoIP-Country":      "中国",
-		"X-GeoIP-Country-Code": "CN",
-		"X-GeoIP-Region":       "中国|0|广东省|深圳市|4403",
-		"X-GeoIP-Province":     "广东省",
-		"X-GeoIP-City":         "深圳市",
-		"X-GeoIP-Loc":          "广东省/深圳市",
+		"X-LB-GeoIP-Country":      "中国",
+		"X-LB-GeoIP-Country-Code": "CN",
+		"X-LB-GeoIP-Region":       "中国|0|广东省|深圳市|4403",
+		"X-LB-GeoIP-Province":     "广东省",
+		"X-LB-GeoIP-City":         "深圳市",
+		"X-LB-GeoIP-Loc":          "广东省/深圳市",
 	} {
 		req.Header.Set(name, value)
 	}
@@ -182,11 +182,11 @@ func TestServeHTTP_stripsSpoofedGeoIPHeaders_evenWithoutXdb(t *testing.T) {
 	if err := h.ServeHTTP(httptest.NewRecorder(), req, geoipTestNext(t, &downstream)); err != nil {
 		t.Fatalf("serve: %v", err)
 	}
-	if got := downstream.Header.Get("X-GeoIP-Loc"); got != "海外" {
-		t.Fatalf("X-GeoIP-Loc must be the fail-closed sentinel 海外 (not the spoofed value), got %q", got)
+	if got := downstream.Header.Get("X-LB-GeoIP-Loc"); got != "海外" {
+		t.Fatalf("X-LB-GeoIP-Loc must be the fail-closed sentinel 海外 (not the spoofed value), got %q", got)
 	}
 	for _, name := range geoipCorazaHeaders {
-		if name == "X-GeoIP-Loc" {
+		if name == "X-LB-GeoIP-Loc" {
 			continue
 		}
 		if got := downstream.Header.Get(name); got != "" {
@@ -217,8 +217,8 @@ func TestServeHTTP_setsCorazaHeaders_forKnownIP(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
 	req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
 	req.RemoteAddr = "114.114.114.114:53981" // Chinese ISP DNS, present in the v4 xdb
-	req.Header.Set("X-GeoIP-Country", "ELBOWLAND")
-	req.Header.Set("X-GeoIP-Loc", "海外")
+	req.Header.Set("X-LB-GeoIP-Country", "ELBOWLAND")
+	req.Header.Set("X-LB-GeoIP-Loc", "海外")
 
 	var downstream *http.Request
 	vars := map[string]any{}
@@ -227,26 +227,26 @@ func TestServeHTTP_setsCorazaHeaders_forKnownIP(t *testing.T) {
 		t.Fatalf("serve: %v", err)
 	}
 
-	if got := downstream.Header.Get("X-GeoIP-Country"); got != "中国" {
-		t.Fatalf("X-GeoIP-Country = %q, want 中国（spoofed value must be overwritten）", got)
+	if got := downstream.Header.Get("X-LB-GeoIP-Country"); got != "中国" {
+		t.Fatalf("X-LB-GeoIP-Country = %q, want 中国（spoofed value must be overwritten）", got)
 	}
-	// F49-P5-6：X-GeoIP-Country-Code 头发射已删除（ISP 列语义错位死发射）；
+	// F49-P5-6：X-LB-GeoIP-Country-Code 头发射已删除（ISP 列语义错位死发射）；
 	// 剥离清单保留（防伪造）但模块自身不再产出该头。
-	if got := downstream.Header.Get("X-GeoIP-Country-Code"); got != "" {
-		t.Fatalf("X-GeoIP-Country-Code = %q, want not emitted", got)
+	if got := downstream.Header.Get("X-LB-GeoIP-Country-Code"); got != "" {
+		t.Fatalf("X-LB-GeoIP-Country-Code = %q, want not emitted", got)
 	}
-	province := downstream.Header.Get("X-GeoIP-Province")
+	province := downstream.Header.Get("X-LB-GeoIP-Province")
 	if province == "" {
-		t.Fatal("X-GeoIP-Province empty for a known Chinese IP")
+		t.Fatal("X-LB-GeoIP-Province empty for a known Chinese IP")
 	}
-	city := downstream.Header.Get("X-GeoIP-City")
-	loc := downstream.Header.Get("X-GeoIP-Loc")
+	city := downstream.Header.Get("X-LB-GeoIP-City")
+	loc := downstream.Header.Get("X-LB-GeoIP-Loc")
 	wantLoc := province
 	if city != "" {
 		wantLoc = province + "/" + city
 	}
 	if loc != wantLoc {
-		t.Fatalf("X-GeoIP-Loc = %q, want %q（province[/city] 组合）", loc, wantLoc)
+		t.Fatalf("X-LB-GeoIP-Loc = %q, want %q（province[/city] 组合）", loc, wantLoc)
 	}
 	// 变量与头同源：province 变量与头一致（镜像不变量）
 	if pv, _ := vars["geoip.province"].(string); pv != province {
@@ -255,7 +255,7 @@ func TestServeHTTP_setsCorazaHeaders_forKnownIP(t *testing.T) {
 }
 
 // TestServeHTTP_overseasSentinels_forUnresolvableClient：fail-closed 哨兵——
-// 不可解析客户端（IPv6 对 v4-only xdb 查询失败）全头发空串、X-GeoIP-Loc 恒
+// 不可解析客户端（IPv6 对 v4-only xdb 查询失败）全头发空串、X-LB-GeoIP-Loc 恒
 // 「海外」（deny 模式海外策略对其拦截，与 D1 裁决一致）。
 func TestServeHTTP_overseasSentinels_forUnresolvableClient(t *testing.T) {
 	xdb := findTestXdb()
@@ -284,13 +284,13 @@ func TestServeHTTP_overseasSentinels_forUnresolvableClient(t *testing.T) {
 		t.Fatalf("serve: %v", err)
 	}
 
-	for _, name := range []string{"X-GeoIP-Country", "X-GeoIP-Region", "X-GeoIP-Province", "X-GeoIP-City"} {
+	for _, name := range []string{"X-LB-GeoIP-Country", "X-LB-GeoIP-Region", "X-LB-GeoIP-Province", "X-LB-GeoIP-City"} {
 		if got := downstream.Header.Get(name); got != "" {
 			t.Fatalf("%s = %q, want empty sentinel", name, got)
 		}
 	}
-	if got := downstream.Header.Get("X-GeoIP-Loc"); got != "海外" {
-		t.Fatalf("X-GeoIP-Loc = %q, want 海外 sentinel（fail-closed）", got)
+	if got := downstream.Header.Get("X-LB-GeoIP-Loc"); got != "海外" {
+		t.Fatalf("X-LB-GeoIP-Loc = %q, want 海外 sentinel（fail-closed）", got)
 	}
 }
 

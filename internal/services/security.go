@@ -351,7 +351,7 @@ func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crs
 	// （buildIPPrecheckDirectives，id=800000+policyID 精确归因段）在全部
 	// rate_limit/waf 之前统一评估——单/多策略链形状同构，事件归因从共享
 	// id:8（「首个 geoip 启用策略」）精确化为直接解码属主策略。caddygeoip
-	// pass route 门不变（PolicyHasGeoIP 保留），X-GeoIP-Loc 头由 pass route
+	// pass route 门不变（PolicyHasGeoIP 保留），X-LB-GeoIP-Loc 头由 pass route
 	// 设置、预检 phase:1 读取。
 
 	// 自定义规则仅在 custom_only/detection/blocking 发射(2026-09-09 裁定:
@@ -576,12 +576,12 @@ func emitBodyProcessorRules(sb *strings.Builder) {
 	sb.WriteString(`SecRule REQBODY_PROCESSOR_ERROR "@eq 1" "id:11,phase:2,pass,log,setvar:tx.inbound_anomaly_score_pl1=+5,msg:'请求体解析失败'"` + "\n")
 }
 
-// geoipLocOverseas 是 X-GeoIP-Loc 的海外哨兵值：caddygeoip 对国家列非「中国」
+// geoipLocOverseas 是 X-LB-GeoIP-Loc 的海外哨兵值：caddygeoip 对国家列非「中国」
 // （含空/0/海外国名，fail-closed）的客户端发射此值。
 const geoipLocOverseas = "海外"
 
-// geoipLocOperator 把策略 geoip_countries 条目编译为 REQUEST_HEADERS:X-GeoIP-Loc
-// 的 coraza 匹配算子。锚定正则（^(?:...)$）做全值匹配：X-GeoIP-Loc 的空串形态
+// geoipLocOperator 把策略 geoip_countries 条目编译为 REQUEST_HEADERS:X-LB-GeoIP-Loc
+// 的 coraza 匹配算子。锚定正则（^(?:...)$）做全值匹配：X-LB-GeoIP-Loc 的空串形态
 // （国内段省份不可解析）恒不命中（deny 模式不误伤）；allow 模式取反后空串反向
 // 命中 → 拦截（fail-closed，与既有 CEL 语义逐案等价）。条目形态与
 // caddygeoip 发射的 X-GeoIP-Loc 同构：海外 → 字面「海外」；省 → 整省，附加
@@ -1201,7 +1201,7 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 	}
 	// 逐策略 GeoIP 链（阶段 1：GeoIP 自策略引擎 id:8 迁入预检，id=800000+policyID
 	// 精确归因段）。链首 deny+skipAfter+chain（disruptive 动作仅允许链首段，
-	// SECLB33-1），续段 X-GeoIP-Loc 匹配策略 geoip_countries（caddygeoip pass
+	// SECLB33-1），续段 X-LB-GeoIP-Loc 匹配策略 geoip_countries（caddygeoip pass
 	// route 先于本预检设置该头）；策略有启用信任名单时追加第三续段——预检信任∪
 	// DetectionOnly 是事务级全局的（2026-09-20 用户裁定：信任 IP 对全部策略的
 	// GeoIP 全局放行，取代旧引擎层「跨策略信任不豁免」边界），此续段仅抑制
@@ -1231,7 +1231,7 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 			continue
 		}
 		sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"!@ipMatch %s\" \"id:%d,phase:1,deny%s,log,msg:'GeoIP 区域拦截',skipAfter:SECURITY_RULES_END,chain\"\n", strings.Join(geoipPrivateRanges, ","), geoipPrecheckRuleBase+p.ID, geoipStatusFragment))
-		sb.WriteString(fmt.Sprintf(" SecRule REQUEST_HEADERS:X-GeoIP-Loc \"%s\" \"t:none\"\n", escapeCorazaPattern(geoipLocOperator(geoipCountries(p), p.GeoIPMode == "allow"))))
+		sb.WriteString(fmt.Sprintf(" SecRule REQUEST_HEADERS:X-LB-GeoIP-Loc \"%s\" \"t:none\"\n", escapeCorazaPattern(geoipLocOperator(geoipCountries(p), p.GeoIPMode == "allow"))))
 		if p.IPWhitelistEnabled {
 			if trusted := mergedWhitelist(p); len(trusted) > 0 {
 				operand, err := ipListRuleOperand(fmt.Sprintf("p%d-trust", p.ID), trusted, true)

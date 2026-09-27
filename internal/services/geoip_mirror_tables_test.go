@@ -11,7 +11,7 @@ import (
 // GeoIP 规范化表（叶子 Caddy 模块不可 import internal 包，只能手工双份维护）——
 //   provinceAliases / cityPinyinFixes / autonomousPrefectures：本包侧构建策略
 //   「区域选择」选项树（regionTreeFromXDB → GetIP2RegionRegions），caddygeoip 侧
-//   用于发射 X-GeoIP-Loc 匹配键；taiwanCities：两侧同判「台湾城市误入省列」。
+//   用于发射 X-LB-GeoIP-Loc 匹配键；taiwanCities：两侧同判「台湾城市误入省列」。
 // 漂移失效形态：选项树提供某省/市而发射变量发另一形态（或反之）→ 城市级地域
 // 规则（coraza 锚定正则全值匹配）对受影响段静默恒不命中且无任何报错——历史
 // 已发生一次（R72 二十六次 W3-4：provinceAliases 曾缺 11 条）。两侧表修改必须
@@ -109,6 +109,6 @@ func assertMirrorStringMap(t *testing.T, name string, mirror, local map[string]s
 		}
 	}
 	if diff {
-		t.Errorf("%s 两模块镜像表发生漂移——选项树（services 侧）与 X-GeoIP-Loc 发射变量（caddygeoip 侧）将不一致，城市级地域规则对受影响段静默恒不命中；请两侧同步修改 caddygeoip/handler.go 与 internal/services/ip2region.go", name)
+		t.Errorf("%s 两模块镜像表发生漂移——选项树（services 侧）与 X-LB-GeoIP-Loc 发射变量（caddygeoip 侧）将不一致，城市级地域规则对受影响段静默恒不命中；请两侧同步修改 caddygeoip/handler.go 与 internal/services/ip2region.go", name)
 	}
 }

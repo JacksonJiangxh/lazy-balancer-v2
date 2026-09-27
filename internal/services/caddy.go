@@ -3649,8 +3649,8 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	//（F3）仅供 coraza 事务内消费，同口径无条件剥离。
 	proxyRequestHeaders := map[string]interface{}{
 		"delete": []string{
-			"X-GeoIP-Country", "X-GeoIP-Country-Code", "X-GeoIP-Region",
-			"X-GeoIP-Province", "X-GeoIP-City", "X-GeoIP-Loc",
+			"X-LB-GeoIP-Country", "X-LB-GeoIP-Country-Code", "X-LB-GeoIP-Region",
+			"X-LB-GeoIP-Province", "X-LB-GeoIP-City", "X-LB-GeoIP-Loc",
 			"X-LB-Rule-ID",
 			// 安全处理耗时关联头（v2.3.3）：blocked_counter 注入供 coraza 审计
 			// 日志收录,摄取管道按 ID 关联侧车文件耗时——coraza 之后链路不再
