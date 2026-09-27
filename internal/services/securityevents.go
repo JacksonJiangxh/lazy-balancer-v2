@@ -1468,12 +1468,19 @@ var securityTimingLogPath = "/app/logs/waf-audit/security-timing.log"
 // securityTimingLoad 全量读入耗时侧车文件(微秒)到 tick 级 map(覆盖式重建)。
 // 文件量级:数秒消费窗口 × <30B/行,常态 <100KB;全量重读成本可忽略。
 func securityTimingLoad() {
-	securityTimingTickMap = nil
+	// 合并式加载(2026-09-27 竞态修复): :pre 与 :end 可能落在不同截断周期——
+	// 替换式 map 会让先到的 :pre 随上轮截断丢失、后到的 :end 单独在场,查表
+	// miss 出 duration=0(实测 3 请求 2 miss)。合并进既有 map 跨 tick 保活,
+	// 超量(>5000)时清空——数秒消费窗口外的条目已无人查询,清空无副作用。
+	if securityTimingTickMap == nil {
+		securityTimingTickMap = make(map[string]int64, 64)
+	} else if len(securityTimingTickMap) > 5000 {
+		securityTimingTickMap = make(map[string]int64, 64)
+	}
 	data, err := os.ReadFile(securityTimingLogPath)
 	if err != nil {
-		return // 首启动/权限/无安全流量——静默,查表全部 miss(耗时 0)
+		return // 首启动/权限/无安全流量——静默,查表 miss(耗时 0)
 	}
-	m := make(map[string]int64, 64)
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -1487,14 +1494,11 @@ func securityTimingLoad() {
 		if err != nil || v < 0 {
 			continue
 		}
-		m[id] = v
-	}
-	if len(m) > 0 {
-		securityTimingTickMap = m
+		securityTimingTickMap[id] = v
 	}
 	// 读后截断:O_APPEND 语义下 Caddy 侧写句柄恒写文件尾,截断安全;窗口内
-	// (读→截断微秒级)新写入的行会丢——对应事件耗时报「—」,增强信息可接受。
-	// 不截断则文件单调增长(每请求 ~30B,10MB 守护只是兜底不是常态路径)。
+	// (读→截断微秒级)新写入的行会丢——下轮读到(合并 map 跨 tick 保活,
+	// 已读条目不丢);仅读后写入且截断先于下轮的极端窗口丢一行,可接受。
 	_ = os.Truncate(securityTimingLogPath, 0)
 }
 
