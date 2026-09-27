@@ -214,23 +214,21 @@
     <input ref="tlsCertFileInput" type="file" accept=".crt,.pem,.cer" style="display: none" @change="(e) => onTlsFile(e, 'cert')" />
     <input ref="tlsKeyFileInput" type="file" accept=".key,.pem" style="display: none" @change="(e) => onTlsFile(e, 'key')" />
 
-    <el-dialog v-model="appLogVisible" width="min(1100px, 94vw)" destroy-on-close class="backup-dialog dialog-body-inset" @opened="onAppLogOpened" @closed="onAppLogClosed">
+    <el-dialog v-model="appLogVisible" width="min(1100px, 94vw)" destroy-on-close @opened="onAppLogOpened" @closed="onAppLogClosed">
       <template #header>
-        <div class="backup-dialog-header">
-          <el-icon class="backup-dialog-icon"><Document /></el-icon>
-          <div>
-            <div class="backup-dialog-title">Lazy Balancer 运行日志</div>
-            <div class="backup-dialog-subtitle">实时查看应用运行日志与自愈事件（最近 500 行）</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Document" title="Lazy Balancer 运行日志" subtitle="实时查看应用运行日志与自愈事件（最近 500 行）" />
       </template>
-      <LogStorageBar log-key="runtime" style="margin-bottom: 10px" />
       <div class="log-toolbar">
         <el-switch v-model="appLogAutoRefresh" active-text="自动刷新" />
         <el-button size="small" :loading="appLogLoading" @click="fetchAppLogs">刷新</el-button>
       </div>
       <div ref="appLogContainer" class="log-viewer"><pre>{{ appLogContent || '暂无日志' }}</pre></div>
-      <template #footer><el-button @click="appLogVisible = false">关闭</el-button></template>
+      <template #footer>
+        <div style="display: flex; align-items: center;">
+          <LogStorageBar log-key="runtime" style="margin-right: auto" />
+          <el-button @click="appLogVisible = false">关闭</el-button>
+        </div>
+      </template>
     </el-dialog>
 
     <el-dialog v-model="importDialogVisible" width="min(720px, 92vw)" :close-on-click-modal="false" class="backup-dialog dialog-body-inset" @close="onImportDialogClosed">
@@ -479,7 +477,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
 import { reloadAfterRestart } from '@/utils/restart'
 import { formatDate } from '@/utils/date'
-import { Setting, InfoFilled, Check, View, Upload, Download, Timer, Lock } from '@element-plus/icons-vue'
+import { Setting, InfoFilled, Check, View, Upload, Download, Timer, Lock, Document } from '@element-plus/icons-vue'
 import type { SystemInfo } from '@/types'
 
 const authStore = useAuthStore()

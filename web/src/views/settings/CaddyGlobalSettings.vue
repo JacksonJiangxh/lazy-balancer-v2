@@ -147,21 +147,14 @@
   <el-dialog
     v-model="logDialogVisible"
     width="min(1100px, 94vw)"
-    class="log-dialog backup-dialog dialog-body-inset"
+    class="log-dialog"
     destroy-on-close
     @opened="onLogDialogOpened"
     @close="onLogDialogClosed"
   >
     <template #header>
-      <div class="backup-dialog-header">
-        <el-icon class="backup-dialog-icon"><Tickets /></el-icon>
-        <div>
-          <div class="backup-dialog-title">Caddy 日志</div>
-          <div class="backup-dialog-subtitle">运行时 / TLS / HTTP 服务器 / 反向代理四通道实时日志</div>
-        </div>
-      </div>
+      <DialogHeader :icon="Tickets" title="Caddy 日志" subtitle="运行时 / TLS / HTTP 服务器 / 反向代理四通道实时日志" />
     </template>
-    <LogStorageBar log-key="caddy" style="margin-bottom: 10px" />
     <el-tabs v-model="activeLogTab" @tab-change="onLogTabChange">
       <el-tab-pane label="运行时" name="runtime" />
       <el-tab-pane label="TLS" name="tls" />
@@ -175,14 +168,19 @@
       </el-button>
     </div>
     <div ref="logContainerRef" class="log-viewer" v-html="logHtml" />
-    <template #footer><el-button @click="logDialogVisible = false">关闭</el-button></template>
+    <template #footer>
+      <div style="display: flex; align-items: center;">
+        <LogStorageBar :key="activeLogTab" :log-key="caddyTabLogKey" style="margin-right: auto" />
+        <el-button @click="logDialogVisible = false">关闭</el-button>
+      </div>
+    </template>
   </el-dialog>
 </template>
 
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { RefreshRight, Setting, View } from '@element-plus/icons-vue'
+import { RefreshRight, Setting, Tickets, View } from '@element-plus/icons-vue'
 import { useAuthStore } from '@/stores/auth'
 import { ansiToHtml } from '@/utils/ansi'
 import { request, mfaAwareSuccess } from '@/utils/api'
@@ -288,6 +286,14 @@ const applyTrustedPreset = (label: string): void => {
 const reloading = ref(false)
 const logDialogVisible = ref(false)
 const logContent = ref('')
+// 分通道统计:tab 切换时 LogStorageBar 随之切到对应通道的独立统计
+const caddyTabLogKey = computed(() => ({
+  runtime: 'caddy_runtime',
+  tls: 'caddy_tls',
+  server: 'caddy_server',
+  proxy: 'caddy_proxy',
+} as Record<string, string>)[activeLogTab.value] ?? 'caddy_runtime')
+
 const activeLogTab = ref('runtime')
 const logHtml = computed(() => ansiToHtml(logContent.value))
 const logLoading = ref(false)
