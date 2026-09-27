@@ -24,6 +24,7 @@ type LogStorageInfo struct {
 	Name          string `json:"name"`
 	SizeBytes     int64  `json:"size_bytes"`
 	RotatedBytes  int64  `json:"rotated_bytes"`
+	RotatedCount  int    `json:"rotated_count"` // 当前归档份数(与 keep_count 上限对照)
 	LimitBytes    *int64 `json:"limit_bytes,omitempty"`
 	LimitRows     *int64 `json:"limit_rows,omitempty"`
 	DBBytes       *int64 `json:"db_bytes,omitempty"`
@@ -58,23 +59,35 @@ func isTimberjackRotationCopy(name string) bool {
 	return trimmed[idx+1] >= '0' && trimmed[idx+1] <= '9'
 }
 
-func dirBytes(path string) (int64, int64) {
+func dirBytes(path string) (int64, int64, int) {
 	var active, rotated int64
+	count := 0
 	if st, err := os.Stat(path); err == nil && !st.IsDir() {
 		active = st.Size()
 	}
 	for i := 1; i <= 9; i++ {
 		if st, err := os.Stat(path + "." + strconv.Itoa(i)); err == nil {
 			rotated += st.Size()
+			count++
 		}
 	}
-	rotated += timestampedRotations(path)
-	return active, rotated
+	rotBytes, rotCount := timestampedRotationStats(path)
+	rotated += rotBytes
+	count += rotCount
+	return active, rotated, count
 }
 
 // timestampedRotations 统计同目录下以「去扩展名 base + 分隔符 + 时间戳」命名的
 // 轮转副本:运行日志族 base.20260902-150405;timberjack 族 base-<ts>-size.log。
 func timestampedRotations(path string) int64 {
+	return mustSecond(timestampedRotationStats(path))
+}
+
+func mustSecond(b int64, _ int) int64 { return b }
+
+// timestampedRotationStats 是 timestampedRotations 的计数增强版(同时返回
+// 字节数与份数)——dirBytes 消费,供 LogStorageBar「已归档 N/M 份」展示。
+func timestampedRotationStats(path string) (int64, int) {
 	dir := filepath.Dir(path)
 	// Sys-N1 根因(第 3 轮审计):运行日志 path=/app/logs/lazy-balancer.log,
 	// TrimSuffix 去 .log 后 base=lazy-balancer,而轮转副本实际是
@@ -86,9 +99,10 @@ func timestampedRotations(path string) int64 {
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return 0
+		return 0, 0
 	}
 	var total int64
+	var cnt int
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -100,6 +114,7 @@ func timestampedRotations(path string) int64 {
 			if len(rest) == 16 && rest[0] == '.' && isDigits(rest[1:9]) && rest[9] == '-' && isDigits(rest[10:]) {
 				if info, err := e.Info(); err == nil {
 					total += info.Size()
+					cnt++
 				}
 				continue
 			}
@@ -123,7 +138,7 @@ func timestampedRotations(path string) int64 {
 			}
 		}
 	}
-	return total
+	return total, cnt
 }
 
 func isDigits(s string) bool {
@@ -262,34 +277,40 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	// 虚标——日志文件与 coraza_audit 同目录同口径,DBBytes 单独展示库容量)。
 	// U2-4:security_events 与 coraza_audit 两行共用同一文件——一次 dirBytes
 	// 两行复用(原先每次响应各调一次,重复全目录 ReadDir)。
-	auditActive, auditRotated := dirBytes(wafAuditLogFile)
+	auditActive, auditRotated, auditRotCount := dirBytes(wafAuditLogFile)
 	if info := byKey("security_events"); info != nil {
-		info.SizeBytes, info.RotatedBytes = auditActive, auditRotated
+		info.SizeBytes, info.RotatedBytes, info.RotatedCount = auditActive, auditRotated, auditRotCount
 	}
 
 	if info := byKey("runtime"); info != nil {
-		info.SizeBytes, info.RotatedBytes = dirBytes(runtimePath)
+		rtA, rtR, rtC := dirBytes(runtimePath)
+		info.SizeBytes, info.RotatedBytes, info.RotatedCount = rtA, rtR, rtC
 	}
 	if info := byKey("caddy"); info != nil {
 		var active, rotated int64
+		var rotCount int
 		for _, name := range []string{"caddy.log", "caddy-tls.log", "caddy-server.log", "caddy-proxy.log"} {
-			a, r := dirBytes(filepath.Join(fixedLogsDir, name))
+			a, r, c := dirBytes(filepath.Join(fixedLogsDir, name))
 			active += a
 			rotated += r
+			rotCount += c
 		}
-		info.SizeBytes, info.RotatedBytes = active, rotated
+		info.SizeBytes, info.RotatedBytes, info.RotatedCount = active, rotated, rotCount
 	}
 	if info := byKey("coraza_audit"); info != nil {
-		info.SizeBytes, info.RotatedBytes = auditActive, auditRotated
+		info.SizeBytes, info.RotatedBytes, info.RotatedCount = auditActive, auditRotated, auditRotCount
 	}
 	if info := byKey("crs_update"); info != nil {
-		info.SizeBytes, info.RotatedBytes = dirBytes(filepath.Join(fixedLogsDir, "crs-update.log"))
+		cA, cR, cC := dirBytes(filepath.Join(fixedLogsDir, "crs-update.log"))
+		info.SizeBytes, info.RotatedBytes, info.RotatedCount = cA, cR, cC
 	}
 	if info := byKey("ip2region_update"); info != nil {
-		info.SizeBytes, info.RotatedBytes = dirBytes(filepath.Join(fixedLogsDir, "ip2region-update.log"))
+		iA, iR, iC := dirBytes(filepath.Join(fixedLogsDir, "ip2region-update.log"))
+		info.SizeBytes, info.RotatedBytes, info.RotatedCount = iA, iR, iC
 	}
 	if info := byKey("threat_update"); info != nil {
-		info.SizeBytes, info.RotatedBytes = dirBytes(filepath.Join(fixedLogsDir, "threat-update.log"))
+		tA, tR, tC := dirBytes(filepath.Join(fixedLogsDir, "threat-update.log"))
+		info.SizeBytes, info.RotatedBytes, info.RotatedCount = tA, tR, tC
 	}
 
 	ruleID := strings.TrimSpace(c.Query("caddy_id"))
@@ -304,7 +325,8 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	}
 	if info := byKey("certjob"); info != nil {
 		if ruleID != "" {
-			info.SizeBytes, info.RotatedBytes = dirBytes(filepath.Join(fixedLogsDir, "certjob-"+ruleID+".log"))
+			cjA, cjR, cjC := dirBytes(filepath.Join(fixedLogsDir, "certjob-"+ruleID+".log"))
+			info.SizeBytes, info.RotatedBytes, info.RotatedCount = cjA, cjR, cjC
 			info.Name = "证书任务日志 #" + ruleID
 		} else if entries, err := os.ReadDir(fixedLogsDir); err == nil {
 			var active, rotated int64
@@ -315,7 +337,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 				if isTimberjackRotationCopy(e.Name()) {
 					continue
 				}
-				a, r := dirBytes(filepath.Join(fixedLogsDir, e.Name()))
+				a, r, _ := dirBytes(filepath.Join(fixedLogsDir, e.Name()))
 				active += a
 				rotated += r
 			}
@@ -324,7 +346,8 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	}
 	if info := byKey("rule_access"); info != nil {
 		if ruleID != "" {
-			info.SizeBytes, info.RotatedBytes = dirBytes(filepath.Join(fixedLogsDir, "rules", ruleID+".log"))
+			raA, raR, raC := dirBytes(filepath.Join(fixedLogsDir, "rules", ruleID+".log"))
+			info.SizeBytes, info.RotatedBytes, info.RotatedCount = raA, raR, raC
 			info.Name = "访问日志 #" + ruleID
 		} else if entries, err := os.ReadDir(filepath.Join(fixedLogsDir, "rules")); err == nil {
 			var active, rotated int64
@@ -335,7 +358,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 				if isTimberjackRotationCopy(e.Name()) {
 					continue
 				}
-				a, r := dirBytes(filepath.Join(fixedLogsDir, "rules", e.Name()))
+				a, r, _ := dirBytes(filepath.Join(fixedLogsDir, "rules", e.Name()))
 				active += a
 				rotated += r
 			}

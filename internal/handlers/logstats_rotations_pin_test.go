@@ -79,7 +79,7 @@ func TestTimestampedRotations_familyShapes(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			active, rotated := dirBytes(filepath.Join(dir, tc.base))
+			active, rotated, _ := dirBytes(filepath.Join(dir, tc.base))
 			if active != tc.wantActive || rotated != tc.wantRotated {
 				t.Fatalf("dirBytes(%s)=(active=%d, rotated=%d), want (active=%d, rotated=%d)",
 					tc.base, active, rotated, tc.wantActive, tc.wantRotated)

@@ -30,6 +30,7 @@ interface LogStorageInfo {
   name: string
   size_bytes: number
   rotated_bytes: number
+  rotated_count: number
   limit_bytes?: number | null
   limit_rows?: number | null
   db_bytes?: number | null
@@ -82,7 +83,7 @@ const sizeText = computed(() => {
 const noteText = computed(() => {
   const i = info.value
   if (!i) return ''
-  if (i.limit_bytes && i.keep_count > 0) return `满 ${humanSize(i.limit_bytes)} 轮转，保留 ${i.keep_count} 份${i.rotated_bytes > 0 ? `（副本 ${humanSize(i.rotated_bytes)}）` : ''}`
+  if (i.limit_bytes && i.keep_count > 0) return `满 ${humanSize(i.limit_bytes)} 轮转${i.rotated_count > 0 ? `，已归档 ${i.rotated_count}/${i.keep_count} 份` : `，保留 ${i.keep_count} 份`}${i.rotated_bytes > 0 ? `（副本 ${humanSize(i.rotated_bytes)}）` : ''}`
   if (i.limit_bytes) return `满 ${humanSize(i.limit_bytes)} 轮转${i.retention_note ? `，${i.retention_note}` : ''}${i.rotated_bytes > 0 ? `（副本 ${humanSize(i.rotated_bytes)}）` : ''}`
   // 上限数字已在 sizes（rows/limit_rows）中展示,行内不重复——精简文案
   if (i.limit_rows) return `满额自动裁最旧${i.retention_note ? '，' + i.retention_note : ''}`
