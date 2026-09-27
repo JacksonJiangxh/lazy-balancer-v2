@@ -36,6 +36,15 @@ var caddyStopCommand = func(adminURL string) *exec.Cmd {
 	return exec.Command("caddy", "stop", "--address", address)
 }
 
+// caddyPauseFile 与 docker-entrypoint.sh 的 Caddy 监督器协调(F62-28):
+// stopCaddy 建文件 → 监督器见文件不重启(admin 停止是用户意图);
+// startCaddy 删文件 → 监督器 ≤1s 检测并启动;handler 等 admin 就绪。
+const caddyPauseFile = "/tmp/lazy-balancer-caddy-paused"
+
+// caddySupervisorPidFile 是监督器在位标记(entrypoint 子 shell 启动时写入)——
+// startCaddy 仅在标记在场时走监督器委托路径;测试环境(无监督器)直启不等待。
+const caddySupervisorPidFile = "/tmp/lazy-balancer-caddy-supervisor.pid"
+
 // caddyProcRoot 是进程状态读取的根目录（生产=/proc；测试指向临时伪 /proc 目录）。
 var caddyProcRoot = "/proc"
 
@@ -96,6 +105,18 @@ func caddyAdminReady(adminURL string) bool {
 }
 
 func startCaddy(adminURL string) error {
+	// F62-28:监督器在场(标记文件)时优先委托(删 pause → 监督器 ≤1s 启动),
+	// 5s 等 admin 就绪;超时或标记不在场(测试环境/监督器死亡)直接 spawn。
+	if _, err := os.Stat(caddySupervisorPidFile); err == nil {
+		_ = os.Remove(caddyPauseFile)
+		supervisorDeadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(supervisorDeadline) {
+			if caddyAdminReady(adminURL) {
+				return nil
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
 	cmd := caddyRunCommand()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -130,7 +151,10 @@ func startCaddy(adminURL string) error {
 }
 
 func stopCaddy(adminURL string) error {
+	// F62-28:先建 pause 再停——防监督器在 admin stop 与进程退出之间竞态重启
+	_ = os.WriteFile(caddyPauseFile, nil, 0o644)
 	if err := caddyStopCommand(adminURL).Run(); err != nil {
+		_ = os.Remove(caddyPauseFile) // 停止失败回滚 pause(监督器继续看护)
 		return err
 	}
 	deadline := time.Now().Add(3 * time.Second)
