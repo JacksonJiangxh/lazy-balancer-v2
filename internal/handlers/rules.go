@@ -122,7 +122,7 @@ func (h *Handlers) GetRuleCaddyConfig(c *gin.Context) {
 
 	if err != nil {
 		services.Logf("error", "GetRuleCaddyConfig: query/scan error for rule caddy_id=%s: %v", caddyID, err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "获取规则失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "规则 Caddy 配置查询失败"})
 		return
 	}
 

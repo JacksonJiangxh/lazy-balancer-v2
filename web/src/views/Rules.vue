@@ -2473,6 +2473,7 @@ const customRoutesPreview = (): string => {
 }
 
 const removeUpstream = (index: number) => {
+  upstreamTouched.value.splice(index, 1) // 历史问题-2:touched 数组同步重排(防行索引漂移)
   wizardForm.upstreams.splice(index, 1)
   const lastEnabled = wizardForm.upstreams.findIndex(u => u.enabled)
   if (lastEnabled >= 0) {

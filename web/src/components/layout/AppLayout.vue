@@ -20,7 +20,7 @@
         background-color="#ffffff"
         text-color="#6b7280"
         active-text-color="#3b82f6"
-        border-right="none"
+       
       >
         <el-menu-item index="dashboard" @click="goPage('dashboard')">
           <el-icon><DataAnalysis /></el-icon>
