@@ -176,14 +176,6 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 	// 预检段规则(IP ACL/GeoIP/信任/威胁,id 1-14 与 800xxx)取 :pre(预检拦时
 	// :pre 未写,回退 :end=预检耗时);WAF 段规则(CRS 9xxxxx/自定义)取
 	// :end-:pre(隔离 WAF 评估成本,不含预检开销)。未命中保持 0,UI 显示「—」。
-	if tid := securityEventsFirstHeader(tx.Request.Headers, "x-lb-security-timing-id"); tid != "" {
-		rec.DurationUs = securityEventsStageDuration(tid, rec.RuleTriggered)
-		if v, ok := securityTimingLookup(tid + ":pre"); ok {
-			rec.PrecheckUs = v
-		} else if securityEventsIsPrecheckRule(rec.RuleTriggered) {
-			rec.PrecheckUs = rec.DurationUs // 预检拦:链未到 pre 收点,duration 即预检耗时
-		}
-	}
 	rec.RequestHeaders = securityEventsSerializeHeaders(tx.Request.Headers)
 	rec.RequestBody = securityEventsEncodeBody(tx.Request.Body)
 	if tx.IsInterrupted {
@@ -197,6 +189,17 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 		rec.RuleMsg = doc.Messages[0].Message
 	}
 	rec.AnomalyScore = securityEventsExtractAnomalyScore(doc.Messages)
+	// 安全处理耗时查表必须在 RuleTriggered 赋值之后——分段选值
+	// (securityEventsStageDuration)按规则归属选 :pre 或 :end-:pre,
+	// 空规则 ID 会恒走 WAF 分支(实测 rule 2 事件拿到 WAF 段值)。
+	if tid := securityEventsFirstHeader(tx.Request.Headers, "x-lb-security-timing-id"); tid != "" {
+		rec.DurationUs = securityEventsStageDuration(tid, rec.RuleTriggered)
+		if v, ok := securityTimingLookup(tid + ":pre"); ok {
+			rec.PrecheckUs = v
+		} else if securityEventsIsPrecheckRule(rec.RuleTriggered) {
+			rec.PrecheckUs = rec.DurationUs // 预检拦:链未到 pre 收点,duration 即预检耗时
+		}
+	}
 	return rec, nil
 }
 
