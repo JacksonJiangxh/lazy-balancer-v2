@@ -793,11 +793,7 @@
             </el-form-item>
             <el-form-item v-if="editorPolicyType !== 'stage2'" label="返回状态码">
               <el-select v-model="form.block_status_code" style="width: 200px">
-                <el-option :value="400" label="400 Bad Request" />
-                <el-option :value="401" label="401 Unauthorized" />
-                <el-option :value="403" label="403 Forbidden" />
-                <el-option :value="404" label="404 Not Found" />
-                <el-option :value="503" label="503 Service Unavailable" />
+                <el-option v-for="opt in STAGE_BLOCK_STATUS_OPTIONS" :key="opt.value" :value="opt.value" :label="opt.label" />
               </el-select>
               <span class="form-tip-inline">WAF、IP ACL 拦截使用此状态码；限流拦截恒为 429（便于指标单独计量）</span>
             </el-form-item>
@@ -972,7 +968,7 @@ import { useClampedPagination } from '@/composables/useClampedPagination'
 import type { CrsExcludedRow, CrsRuleOptionView } from '@/composables/useCrsRuleIndex'
 import type { APIResponse, UserListItem } from '@/types'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
-import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, buildStageModel, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, parseRefIds } from '@/utils/securityStages'
+import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, buildStageModel, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, parseRefIds } from '@/utils/securityStages'
 import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy } from '@/utils/securityStages'
 
 interface PolicyDetail { id: number; name: string; description: string; mode: string; anomaly_threshold: number; ip_acl_mode: string; ip_acl_list: string; ip_acl_enabled: boolean; ip_whitelist: string; ip_whitelist_enabled?: boolean; ip_blacklist?: string; ip_acl_list_refs?: string; ip_whitelist_refs?: string; rate_limit_enabled: boolean; rate_limit_rps: number; rate_limit_burst: number; crs_rule_groups: string; crs_excluded_rules: string; custom_rules: string; block_page_id: number; block_status_code: number; enabled: boolean; updated_at: string; geoip_mode?: string; geoip_countries?: string; waf_check_response?: boolean; log_request_body?: boolean; trust_detection?: boolean }
