@@ -3327,7 +3327,10 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 全部 coraza handler(IP 预检的 IP ACL/GeoIP 中断也在内),检测 coraza
 	// 中断(HandlerError 携 ID+4xx)按规则计数;限流 429 经 status==429
 	// 分支计入(424a400e 后;非 coraza tx.ID 但 caddyhttp.Error 生成 ID)。
-	if rule.Protocol == "http" && len(policies) > 0 {
+	securityLibsOK := SecurityLibrariesAvailable()
+	// 第 62 轮 F62-6:补 securityLibsOK(与 timing_pre/end 同口径)——库缺失时
+	// 链上无 coraza 收点,counter 的 timing ID 注入与拦截计数均无意义。
+	if securityLibsOK && rule.Protocol == "http" && len(policies) > 0 {
 		handleChain = append(handleChain, map[string]interface{}{
 			"handler": "lb_security_blocked_counter",
 			"rule":    rule.CaddyID,
@@ -3350,7 +3353,6 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 缺库降级（2026-09-24 用户裁定）：CRS/IP2Region 库缺失时全部安全规则不
 	// 渲染（预检/ACL/限流/WAF/GeoIP 一并缺席），告警日志提示补库——coraza
 	// Include 缺失文件会使整份配置被 caddy validate 拒绝，负载均衡也被拖死。
-	securityLibsOK := SecurityLibrariesAvailable()
 	var detectionTrust []string
 	var passthroughUnion []string
 	if securityLibsOK {

@@ -11,8 +11,8 @@ import (
 
 // securityTimingLogPath 是耗时侧车日志路径——与 coraza 审计日志同目录
 // (auditLogPath = /app/logs/waf-audit/audit.log 的同族约定),lazy-balancer
-// 进程的摄取管道按行读「<timing_id> <duration_ms>」与审计条目按 timing ID
-// 关联。跨进程经文件通信(caddygeoip 编译进 Caddy 二进制,摄取管道在
+// 进程的摄取管道按行读「<timing_id>:<pre|end> <duration_us>」与审计条目按
+// timing ID 关联(读侧 tick 级合并 map,见 securityevents.go securityTimingLoad)。跨进程经文件通信(caddygeoip 编译进 Caddy 二进制,摄取管道在
 // lazy-balancer 二进制——不同进程,内存共享不可达)。
 const securityTimingLogPath = "/app/logs/waf-audit/security-timing.log"
 
@@ -33,7 +33,7 @@ var (
 	securityTimingFd *os.File
 )
 
-// AppendSecurityTiming 追加一行「<id> <ms>」到耗时侧车日志(写侧:blocked_counter)。
+// AppendSecurityTiming 追加一行「<id> <us>」到耗时侧车日志(写侧:blocked_counter/timing_pre/timing_end 三点)。
 // 任何 I/O 失败静默降级——耗时是增强信息,不产生任何请求路径错误。
 func AppendSecurityTiming(id string, durationUs int64) {
 	if id == "" {
@@ -61,24 +61,4 @@ func securityTimingID() string {
 		return ""
 	}
 	return hex.EncodeToString(b)
-}
-
-// TimingSweeper 启动耗时侧车文件的大小守护(由 lazy-balancer 侧持有并 Close)——
-// 文件超限(10MB)时截断。Caddy 侧不启动 goroutine(进程生命周期管理在宿主),
-// 摄取管道的消费即天然清理,守护仅兜底「Caddy 活、摄取停」的极端形态。
-const securityTimingSweepBytes = 10 << 20
-
-// SweepSecurityTiming 检查并截断超限的耗时侧车文件(由摄取管道周期调用)。
-func SweepSecurityTiming() {
-	st, err := os.Stat(securityTimingLogPath)
-	if err != nil || st.Size() < securityTimingSweepBytes {
-		return
-	}
-	securityTimingMu.Lock()
-	defer securityTimingMu.Unlock()
-	if securityTimingFd != nil {
-		_ = securityTimingFd.Close()
-		securityTimingFd = nil
-	}
-	_ = os.Truncate(securityTimingLogPath, 0)
 }

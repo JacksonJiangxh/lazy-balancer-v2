@@ -6,7 +6,7 @@
           <el-icon class="title-icon"><Notebook /></el-icon>
           规则集
         </h2>
-        <p class="page-desc">管理 WAF 规则来源：OWASP CRS 规则库、IP2Region IP 库、威胁情报库、自定义规则与 IP 地址列表</p>
+        <p class="page-desc">管理 WAF 规则来源：OWASP CRS 规则库、IP 地理库、威胁情报库、自定义规则与 IP 地址列表</p>
       </div>
     </div>
 
@@ -538,7 +538,7 @@
 import { ref, onMounted, onUnmounted, computed, nextTick, watch } from 'vue'
 import { Aim, Filter, List, Location, Lock, Search, Notebook, Plus, WarningFilled } from '@element-plus/icons-vue'
 import { formatDate } from '@/utils/date'
-import { compareVersion } from '@/utils/securityStages'
+import { compareVersion, IP_LIST_CATEGORIES} from '@/utils/securityStages'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import RuleLibScheduleEditor from '@/components/RuleLibScheduleEditor.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -611,7 +611,7 @@ const libRows = computed<LibRow[]>(() => {
       nextUpdate: formatDate(crsInfo.value.next_update) || '—',
     },
     {
-      key: 'ip2region', icon: Location, iconClass: 'lib-icon--ip', name: 'IP2Region IP 库', sub: 'IP 地理归属数据库',
+      key: 'ip2region', icon: Location, iconClass: 'lib-icon--ip', name: 'IP 地理库', sub: 'IP 地理归属数据库',
       version: ip2regionInfo.value.available === false ? '未安装' : ip2regionVersionLabel.value,
       count: ip2regionInfo.value.db_size && ip2regionInfo.value.version && ip2regionInfo.value.version !== 'unknown' && ip2regionInfo.value.version !== 'bundled' ? ip2regionInfo.value.db_size.toLocaleString() : '—',
       status: ip2regionInfo.value.available === false ? 'missing' : (ip2regionStatusForTag.value === 'not-installed' ? 'idle' : ip2regionStatusForTag.value),
@@ -653,8 +653,8 @@ const libHealthTags = computed<Array<{ label: string; type: 'success' | 'danger'
       ? { label: 'CRS 规则库 · 缺失', type: 'danger' }
       : { label: 'CRS 规则库 · 正常', type: 'success' },
     ip2regionInfo.value.available === false
-      ? { label: 'IP 地址库 · 缺失', type: 'danger' }
-      : { label: 'IP 地址库 · 正常', type: 'success' },
+      ? { label: 'IP 地理库 · 缺失', type: 'danger' }
+      : { label: 'IP 地理库 · 正常', type: 'success' },
   ]
   const threatFail = threatSources.value.filter(x => x.update_status === 'failed').length
   tags.push(threatFail > 0
@@ -796,9 +796,9 @@ const crsStageLabels: Record<string, string> = {
   downloading: '下载规则库',
   installing: '安装规则库',
   reloading: '重载配置',
-  success: '更新成功',
+  success: '已最新',
   failed: '更新失败',
-  idle: '空闲',
+  idle: '已最新',
 }
 const crsStatusLabel = (s: string): string => s === 'missing' ? '缺失' : (crsStageLabels[s] || s || '—')
 
@@ -806,7 +806,7 @@ const crsStatusTagType = (s: string): 'success' | 'warning' | 'danger' | 'info' 
   if (s === 'missing') return 'danger'
   if (!s || s === 'idle') return 'info'
   if (s === 'checking' || s === 'downloading' || s === 'installing' || s === 'reloading' || s === 'running') return 'warning'
-  if (s === 'success' || s === '已最新' || s === '更新成功') return 'success'
+  if (s === 'success' || s === '已最新' || s === '已最新') return 'success'
   if (s === 'failed' || s === '更新失败') return 'danger'
   if (s.includes('失败') || s.includes('错误')) return 'danger'
   if (s.includes('最新')) return 'success'
@@ -864,7 +864,7 @@ const customActionView = (action: string): { label: string; type: 'danger' | 'in
 
 // —— 可复用 IP 地址列表（第三个标签页）——
 // 分类预设：与安全策略「提取为列表」共用同一组选项
-const IP_LIST_CATEGORIES = ['搜索引擎爬虫', 'CDN 节点', '云服务商', '办公网络', '数据中心', '可信地址', '恶意 IP', '其他']
+
 const ipLists = ref<IPListRow[]>([])
 const loadingIpLists = ref(false)
 const ipListSearch = ref('')

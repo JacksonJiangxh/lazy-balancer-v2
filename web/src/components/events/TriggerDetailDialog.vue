@@ -115,7 +115,7 @@
             <div class="trg-kv"><span class="k">状态</span><span>{{ customRule.enabled ? '启用' : '禁用' }}</span></div>
           </template>
           <div v-else-if="!loading" class="trg-tip">未找到该自定义规则（可能已被删除；事件为历史记录）</div>
-          <div class="trg-tip">自定义规则 id {{ customDbId }}（事件携带的触发 id = 规则 id + 10000）。编辑请前往 安全防护 → 自定义规则。</div>
+          <div class="trg-tip">自定义规则 id {{ customDbId }}（事件携带的触发 id = 规则 id + 10000）。编辑请前往 安全防护 → 规则集 → 自定义规则。</div>
         </template>
 
         <!-- 请求体异常 -->
@@ -528,11 +528,23 @@ const customConditions = computed<Array<{ target: string; operator: string; patt
   // 后端列表接口 conditions 已是结构化数组（非 JSON 字符串）
   return (customRule.value?.conditions ?? []).filter((c) => !!c && typeof c.target === 'string')
 })
+// 第 62 轮 F62-2:补会话序号守卫(同 crsDialogSeq 范式)+try/catch——
+// 快速关开弹框时在途响应晚到不再覆盖当前;加载失败不再误标「规则已删除」
+const customRuleSeq = ref(0)
+const customRuleLoadError = ref(false)
 const loadCustomRule = async (): Promise<void> => {
   customRule.value = null
+  customRuleLoadError.value = false
   if (!Number.isFinite(customDbId.value)) return
-  const res = await request.get<APIResponse<CustomRule[]>>('/security/custom-rules', { silent: true } as never)
-  customRule.value = (res.data || []).find((r) => r.id === customDbId.value) ?? null
+  const seq = ++customRuleSeq.value
+  try {
+    const res = await request.get<APIResponse<CustomRule[]>>('/security/custom-rules', { silent: true } as never)
+    if (seq !== customRuleSeq.value) return
+    customRule.value = (res.data || []).find((r) => r.id === customDbId.value) ?? null
+  } catch {
+    if (seq !== customRuleSeq.value) return
+    customRuleLoadError.value = true
+  }
 }
 
 // —— WAF · CRS：索引 + 源码片段 + 快捷排除（自 SecurityEvents CRS 弹框整体迁入）——

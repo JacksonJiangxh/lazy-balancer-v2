@@ -67,3 +67,16 @@ export const redistributeWeight = <Item extends WeightedItem>(items: Item[], cha
   changed.weight = Math.min(100 - otherMinimum, normalizedWeight(changed))
   distributeWeight(otherItems, 100 - changed.weight)
 }
+
+// weightPercent 权重百分比展示(第 62 轮 F62-15 收敛——原 RuleFlowDialog/Rules 两份
+// 同口径复刻)。签名:(upstreams, row)→0-100 整数;禁用行 0;总和≤0 时 0。
+export const weightPercent = (
+  upstreams: ReadonlyArray<{ weight?: number; enabled?: boolean }> | undefined,
+  row: { weight?: number; enabled?: boolean }
+): number => {
+  if (!upstreams?.length) return 0
+  if (row.enabled === false) return 0
+  const sum = upstreams.filter((u) => u.enabled !== false).reduce((s, u) => s + (u.weight || 0), 0)
+  if (sum <= 0) return 0
+  return Math.round(((row.weight || 0) / sum) * 100)
+}

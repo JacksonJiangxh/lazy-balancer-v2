@@ -54,10 +54,8 @@ export const useTrustAssociation = (options: {
   const creating = ref(false)
 
   /** 策略既有同侧列表：对应 refs 字段中第一个非系统列表 */
-  const resolveSideList = (policy: TrustPolicyLike, side: ListSide): TrustListRef | null => {
-    const refs = parseRefIds(policy[SIDE_CONFIG[side].refField])
-    return options.getList().find((l) => refs.includes(l.id) && !l.system) ?? null
-  }
+  const resolveSideList = (policy: TrustPolicyLike, side: ListSide): TrustListRef | null =>
+    resolveSideLists(policy, side)[0] ?? null
 
   /** 同侧全部非系统列表（第 60 轮用户验收：多列表绑定时逐列表出按钮，不再只取第一个） */
   const resolveSideLists = (policy: TrustPolicyLike, side: ListSide): IpListOption[] => {

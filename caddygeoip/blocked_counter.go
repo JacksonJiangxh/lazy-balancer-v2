@@ -94,8 +94,9 @@ func (h *SecurityBlockedCounter) Provision(ctx caddy.Context) error {
 // 安全处理耗时(2026-09-27 用户裁定):请求进入时注入 X-Lb-Security-Timing-Id
 // 请求头(coraza 审计日志的 request.headers 天然收录该头——摄取管道从审计
 // 条目读出同一 ID 即可对上),next 返回后记录耗时到共享表——弹框「处理耗时」
-// 的数据源。写侧在本方法(链外层),读侧在 internal/services/securityevents.go
-// 的 PopSecurityTiming(一次性消费,消费即删)。
+// 的数据源。写侧在本方法(拦截事件)+security_timing_pre/end(放行事件);
+// 读侧在 internal/services/securityevents.go 的 securityTimingLoad(tick 级
+// 合并 map+读后截断)。
 func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	// 安全处理耗时:注入 timing ID + 起始纳秒双头(coraza 审计日志收录 ID;
 	// SecurityTimingEnd 处理器在安全链末尾读起始头计算 passed 事件的纯评估

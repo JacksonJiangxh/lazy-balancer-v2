@@ -23,7 +23,6 @@ services:
       # 自动备份落盘目录（v2.3.x，仅主节点调度写入；测试环境两容器共享目录无竞争）
       - ./backup:/app/backup
     environment:
-      - TZ=Asia/Shanghai
       - NODE_NAME=master
       - LOG_FILE=/app/logs/lazy-balancer.log
     restart: unless-stopped
@@ -64,7 +63,6 @@ services:
       # 与主节点共享备份目录：从节点不调度写入，仅目录存在以保配置路径一致
       - ./backup:/app/backup
     environment:
-      - TZ=Asia/Shanghai
       - NODE_NAME=slave-test
       - LOG_FILE=/app/logs/lazy-balancer.log
     ulimits:

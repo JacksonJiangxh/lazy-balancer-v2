@@ -3,6 +3,7 @@ package handlers
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -125,7 +126,8 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 	preAvg, preCnt, wafAvg, wafCnt := 0.0, 0, 0.0, 0
 	// 预检平均用 precheck_us 全样本(含 WAF 事件的预检快照,样本更大更准);
 	// WAF 平均只用 WAF 段事件的 duration_us(已隔离预检开销)。
-	if trows, terr := db.MetricsDB.Query(`SELECT rule_triggered, AVG(CASE WHEN rule_triggered IN ('2','3','4','5','7','8','12','14') OR (LENGTH(rule_triggered)=6 AND rule_triggered LIKE '8%') THEN precheck_us ELSE duration_us END), COUNT(*) FROM security_events WHERE rule_caddy_id=? AND event_time >= datetime('now','-1 day') AND duration_us > 0 GROUP BY rule_triggered`, ruleCaddyID); terr == nil {
+	stageTimingSQL := fmt.Sprintf(`SELECT rule_triggered, AVG(CASE WHEN rule_triggered IN %s OR (LENGTH(rule_triggered)=6 AND rule_triggered LIKE '8%%') THEN precheck_us ELSE duration_us END), COUNT(*) FROM security_events WHERE rule_caddy_id=? AND event_time >= datetime('now','-1 day') AND duration_us > 0 GROUP BY rule_triggered`, services.Stage1PrecheckIDSQLList)
+	if trows, terr := db.MetricsDB.Query(stageTimingSQL, ruleCaddyID); terr == nil {
 		for trows.Next() {
 			var triggered string
 			var avg float64
@@ -142,6 +144,10 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 			}
 		}
 		trows.Close()
+	} else {
+		// 第 62 轮 F62-21:查询失败不再静默——留 warn 便于排查(响应仍 200,
+		// 耗时为增强信息,与计数/429 的 500 纪律不同——已声明口径)
+		services.Logf("warn", "stage-stats timing query failed for %s: %v", ruleCaddyID, terr)
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
 		"stage1_blocked_24h":      stage1,

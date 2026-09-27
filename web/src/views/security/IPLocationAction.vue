@@ -18,7 +18,7 @@
     <div class="ipo-head">
       <div class="ipo-ip-row">
         <span class="ipo-ip">{{ ip }}</span>
-        <el-tooltip v-if="eventCount !== null" content="统计窗口：近 30 天（事件页/Top 10 卡片为近 7 天口径）" placement="top">
+        <el-tooltip v-if="eventCount !== null" content="统计窗口：近 30 天（安全总览 Top 10 卡片为近 7 天口径）" placement="top">
           <el-tag size="small" :type="eventCount > 0 ? 'warning' : 'success'" effect="plain" round>
             30天事件 {{ eventCount }}
           </el-tag>
@@ -461,7 +461,8 @@ const rowView = (policy: PolicyRow): RowView => {
   // 生效名单 = 内联 ∪ 引用列表条目；引用命中的条目无法在本弹窗移除
   // （PUT 仅写内联 ip_acl_list），移除按钮仅对内联命中开放
   const list = mergedAclEntries(policy)
-  const inInline = parseIPList(policy.ip_acl_list).includes(props.ip)
+  // 第 62 轮 F62-9:CIDR 感知(内联 CIDR 条目命中实际 IP;第 61 轮 P2-3 只改了弹框侧)
+  const inInline = parseIPList(policy.ip_acl_list).some((e) => entryMatchesIp(e, props.ip.trim()))
   const inList = list.some((e) => entryMatchesIp(e, props.ip.trim()))
 
   view.removableRefLists = ipLists.value
@@ -485,7 +486,7 @@ const rowView = (policy: PolicyRow): RowView => {
       view.statusLabel = (inInline ? '✅ 已在黑名单中' : `✅ 已在黑名单中${view.aclHitSourceLabel}`) + exemptHitSuffix + passthruSuffix
       view.canRemove = inInline
     } else {
-      view.statusLabel = `拒绝列表 · ${list.length} 条`
+      view.statusLabel = `黑名单 · ${list.length} 条`
       view.canAssociate = true
     }
   } else if (policy.ip_acl_mode === 'allow') {
@@ -839,10 +840,6 @@ const removeTrust = async (policy: PolicyRow): Promise<void> => {
 .ip-location-popper .ipo-sec { margin-top: 12px; }
 .ip-location-popper .ipo-sec-title { font-size: 12px; font-weight: 600; color: var(--el-text-color-regular, #606266); padding-bottom: 6px; border-bottom: 1px solid var(--el-border-color-lighter, #ebeef5); margin-bottom: 8px; }
 /* 快速处置：存入一行 + 新建一行 */
-.ip-location-popper .ipo-save-row { display: flex; align-items: center; gap: 8px; }
-.ip-location-popper .ipo-list-select { flex: 1; min-width: 0; }
-.ip-location-popper .ipo-save-new { display: flex; margin-top: 8px; }
-.ip-location-popper .ipo-save-new .el-input { flex: 1; }
 /* 策略生效卡 */
 .ip-location-popper .ipo-card { border: 1px solid var(--el-border-color-lighter, #ebeef5); border-radius: 8px; padding: 8px 10px; margin-top: 8px; background: var(--el-fill-color-blank, #fff); }
 .ip-location-popper .ipo-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

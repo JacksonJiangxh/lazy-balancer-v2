@@ -210,9 +210,13 @@ func backendAuditActions(t *testing.T) map[string]string {
 var (
 	auditTagColorLineRe  = regexp.MustCompile(`return '(success|warning|danger|info)'`)
 	auditTagActionLineRe = regexp.MustCompile(`action === '([^']+)'`)
+	// 第 62 轮 F62-13:表驱动形态条目行
+	auditTagTableEntryRe = regexp.MustCompile(`'([^']+)':\s*'(success|warning|danger|info)',`)
 )
 
-// frontendAuditTagMapping 解析 AuditLog.vue 的 actionTagType：逐行匹配
+// frontendAuditTagMapping 解析 AuditLog.vue 的 actionTagType：支持两种形态——
+// 旧 if 链与新表驱动(第 62 轮 F62-13 后 ACTION_TAG_TABLE),返回 动作→颜色。
+// frontendAuditTagMapping 旧注释：逐行匹配
 // `action === '...' || ... return '<color>'` 形态的白名单 if 行，返回 动作 → 颜色。
 func frontendAuditTagMapping(t *testing.T) map[string]string {
 	t.Helper()
@@ -230,6 +234,13 @@ func frontendAuditTagMapping(t *testing.T) map[string]string {
 		line := rawLine
 		if idx := strings.Index(line, "//"); idx >= 0 {
 			line = line[:idx]
+		}
+		if tm := auditTagTableEntryRe.FindStringSubmatch(line); tm != nil {
+			if _, dup := mapping[tm[1]]; !dup {
+				colors[tm[2]] = true
+			}
+			mapping[tm[1]] = tm[2]
+			continue
 		}
 		colorMatch := auditTagColorLineRe.FindStringSubmatch(line)
 		if colorMatch == nil || !strings.Contains(line, "action ===") {

@@ -829,3 +829,7 @@ export const formatDurationUs = (us: number | undefined): string => {
   if (v < 10000) return (v / 1000).toFixed(1) + 'ms'
   return Math.round(v / 1000) + 'ms'
 }
+
+// IP 地址列表分类预设——SecurityRules「提取为列表」与 SecurityPolicies 分类
+// 选择共用同一组选项(第 62 轮 F62 双源收敛,原两文件各自定义)。
+export const IP_LIST_CATEGORIES = ['搜索引擎爬虫', 'CDN 节点', '云服务商', '办公网络', '数据中心', '可信地址', '恶意 IP', '其他'] as const
