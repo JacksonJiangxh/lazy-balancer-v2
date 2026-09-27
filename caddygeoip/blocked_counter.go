@@ -3,6 +3,7 @@ package caddygeoip
 import (
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -96,20 +97,17 @@ func (h *SecurityBlockedCounter) Provision(ctx caddy.Context) error {
 // 的数据源。写侧在本方法(链外层),读侧在 internal/services/securityevents.go
 // 的 PopSecurityTiming(一次性消费,消费即删)。
 func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	// 安全处理耗时:注入 timing ID 供审计条目关联(coraza 在链内,能看到此头)
+	// 安全处理耗时:注入 timing ID + 起始纳秒双头(coraza 审计日志收录 ID;
+	// SecurityTimingEnd 处理器在安全链末尾读起始头计算 passed 事件的纯评估
+	// 耗时)。起始头与 ID 头均在 proxyRequestHeaders 删除清单剥离,不上泄上游。
 	timingID := securityTimingID()
 	if timingID != "" {
 		r.Header.Set(securityTimingHeader, timingID)
+		r.Header.Set(securityTimingStartHeader, strconv.FormatInt(time.Now().UnixNano(), 10))
 	}
 	start := time.Now()
 
 	err := next.ServeHTTP(w, r)
-
-	// 安全处理耗时:next 返回即安全链(IP 预检+全部策略引擎)已走完——
-	// 拦截(HandlerError 返回)与放行(评估完继续下游)都在此之后记录
-	if timingID != "" {
-		AppendSecurityTiming(timingID, time.Since(start).Milliseconds())
-	}
 
 	var herr caddyhttp.HandlerError
 	// P3-2(第 28.5 轮审计):「ID 非空+4xx」误纳非安全 4xx——caddyhttp.Error
@@ -119,9 +117,19 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	// proxy 499/request_body 413/其他 caddyhttp.Error 4xx(全 9 字符)。
 	// 脆弱点:coraza 若改 tx.ID 长度→断;但 v2.x 一直 16 且 coraza 由
 	// Dockerfile pin+构建断言控制——可控。
-	if err != nil && errors.As(err, &herr) &&
+	isSecurityBlock := err != nil && errors.As(err, &herr) &&
 		herr.StatusCode >= 400 && herr.StatusCode < 500 &&
-		(len(herr.ID) == 16 || herr.StatusCode == http.StatusTooManyRequests) {
+		(len(herr.ID) == 16 || herr.StatusCode == http.StatusTooManyRequests)
+
+	// 安全处理耗时——双点计时的「拦截点」:安全中断(HandlerError 返回)时
+	// 链未到 reverse_proxy,此处耗时=纯安全评估;放行事件的耗时由安全链末尾
+	// 的 SecurityTimingEnd 处理器记录(此处 next 返回值混入上游代理往返,
+	// 不能用——实测 329ms 中主要是上游响应时间而非 WAF 评估)。
+	if timingID != "" && isSecurityBlock {
+		AppendSecurityTiming(timingID, time.Since(start).Milliseconds())
+	}
+
+	if isSecurityBlock {
 		// F1(第 28.6 轮审计):P3-2 判定丢失 4xx 约束——coraza 引擎 500
 		// (16 字符 tx.ID)被误计为安全拦截且吃掉一个合法 4xx。恢复 4xx 约束。
 		if h.metrics != nil {

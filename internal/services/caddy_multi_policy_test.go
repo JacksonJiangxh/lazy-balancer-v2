@@ -181,12 +181,13 @@ func TestMultiPolicy_RouteComposition_OrderAndHandlerGroups(t *testing.T) {
 	// 主路由处理器链（阶段化模型）：headers(X-LB-Rule-ID 注入，F3) →
 	// lb_rule_metrics → lb_security_blocked_counter → 阶段 1 预检 waf（p1/p3
 	// GeoIP 链）→ request_body → 阶段 2 rate_limit(p2) → 阶段 3 waf(p2
-	// blocking) → waf(p3 detection，不含 GeoIP) → reverse_proxy。
-	// （耗时头 X-Lb-Security-Timing-Id 的剥离走 proxyRequestHeaders 删除清单，
-	// 与 X-LB-Rule-ID 同机制，不占链位——v2.3.3。）
+	// blocking) → waf(p3 detection，不含 GeoIP) → lb_security_timing_end
+	// (放行事件耗时收点,v2.3.3 双点计时) → reverse_proxy。
+	// （耗时双头的剥离走 proxyRequestHeaders 删除清单，与 X-LB-Rule-ID
+	// 同机制，不额外占位。）
 	names := handlerNames(t, mainRoute)
-	if len(names) != 9 || names[0] != "headers" || names[1] != "lb_rule_metrics" || names[2] != "lb_security_blocked_counter" || names[3] != "waf" || names[4] != "request_body" || names[5] != "rate_limit" || names[6] != "waf" || names[7] != "waf" {
-		t.Fatalf("main chain=%v, want [headers(X-LB-Rule-ID), lb_rule_metrics, lb_security_blocked_counter, waf(precheck), request_body, rate_limit(p2), waf(p2), waf(p3), reverse_proxy]", names)
+	if len(names) != 10 || names[0] != "headers" || names[1] != "lb_rule_metrics" || names[2] != "lb_security_blocked_counter" || names[3] != "waf" || names[4] != "request_body" || names[5] != "rate_limit" || names[6] != "waf" || names[7] != "waf" || names[8] != "lb_security_timing_end" {
+		t.Fatalf("main chain=%v, want [headers(X-LB-Rule-ID), lb_rule_metrics, lb_security_blocked_counter, waf(precheck), request_body, rate_limit(p2), waf(p2), waf(p3), lb_security_timing_end, reverse_proxy]", names)
 	}
 	if names[len(names)-1] != "reverse_proxy" {
 		t.Fatalf("main chain last handler=%v, want reverse_proxy", names)

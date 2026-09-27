@@ -21,6 +21,11 @@ const securityTimingLogPath = "/app/logs/waf-audit/security-timing.log"
 // reverse_proxy 前删除(caddy.go 渲染层),不上泄上游。
 const securityTimingHeader = "X-Lb-Security-Timing-Id"
 
+// securityTimingStartHeader 是起始纳秒时间戳头——blocked_counter 注入,
+// SecurityTimingEnd 在安全链末尾读取计算 passed 事件的纯评估耗时(不含
+// reverse_proxy 上游往返)。与 timing ID 头同清单剥离。
+const securityTimingStartHeader = "X-Lb-Security-Timing-Start-Ns"
+
 // securityTimingFileMu/Fd 惰性打开的追加写句柄——首写时 OpenFile,进程生命周期
 // 复用;打开失败静默降级(耗时缺失,不阻断请求);目录不存在时 MkdirAll 兜底。
 var (

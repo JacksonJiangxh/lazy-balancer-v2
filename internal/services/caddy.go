@@ -3439,6 +3439,14 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			}
 		}
 	}
+	// 安全处理耗时收点(2026-09-27 双点计时):放行事件的纯评估耗时在此记录
+	// (blocked_counter 只计拦截事件——其 next 返回值混入上游代理往返不可用)。
+	// 置于安全链末尾、reverse_proxy 之前;信任直通时随 subroute 整体跳过。
+	if securityLibsOK && rule.Protocol == "http" && len(securityChain) > 0 {
+		securityChain = append(securityChain, map[string]interface{}{
+			"handler": "lb_security_timing_end",
+		})
+	}
 	// 直通包裹（阶段 0）：subroute 内层顺序与展平形态逐字节一致——非信任
 	// 流量行为零漂移，信任流量短路到 reverse_proxy。
 	if rule.Protocol == "http" && len(passthroughUnion) > 0 && len(securityChain) > 0 {
@@ -3639,6 +3647,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			// 日志收录,摄取管道按 ID 关联侧车文件耗时——coraza 之后链路不再
 			// 需要,与 X-LB-Rule-ID 同机制剥离,不上泄上游。
 			"X-Lb-Security-Timing-Id",
+			"X-Lb-Security-Timing-Start-Ns",
 		},
 	}
 	if rule.HostHeader != "" {
