@@ -11,7 +11,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 密码策略 8-32 可打印 ASCII(2026-09-28 用户裁定)，超限密码在绑定层以 400 拒绝，
+// 密码策略 8-24 可打印 ASCII(2026-09-28 用户裁定)，超限密码在绑定层以 400 拒绝，
 // 不能先落库再让用户以被截断的密码登录失败。
 func TestUserPasswordEndpoints_reject_passwords_over_32_chars(t *testing.T) {
 	longPassword := strings.Repeat("a", 33)

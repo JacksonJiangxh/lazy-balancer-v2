@@ -61,6 +61,10 @@ func (h *Handlers) CreateUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "角色无效"})
 		return
 	}
+	if err := validateUsernamePolicy(req.Username); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		return
+	}
 	if err := validatePasswordPolicy(req.Password); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return

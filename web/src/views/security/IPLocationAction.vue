@@ -282,6 +282,7 @@ const normalizeRow = (p: PolicyRow): PolicyRow => ({
   mode: p.mode,
   rate_limit_enabled: p.rate_limit_enabled,
   geoip_enabled: p.geoip_enabled,
+  geoip_mode: p.geoip_mode || 'off', // F64-B1-1:F63 修复字段被本投影白名单遗漏(geoActive 恒 false 回归)
   geoip_countries: p.geoip_countries || '[]',
   has_geoip: p.has_geoip,
   has_rate_limit: p.has_rate_limit,

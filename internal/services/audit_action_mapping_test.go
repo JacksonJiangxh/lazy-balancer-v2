@@ -463,51 +463,6 @@ func TestAuditExplicitHandlersRecord(t *testing.T) {
 	}
 }
 
-// extractHasExplicitAuditEventCases AST 解析 auditpolicy.go 的
-// HasExplicitAuditEvent switch，提取全部 "METHOD /path" case 字面量。
-func extractHasExplicitAuditEventCases(t *testing.T) map[string]bool {
-	t.Helper()
-	path := filepath.Join(".", "auditpolicy.go")
-	src, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read auditpolicy.go: %v", err)
-	}
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, path, src, 0)
-	if err != nil {
-		t.Fatalf("parse auditpolicy.go: %v", err)
-	}
-	cases := make(map[string]bool)
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != "HasExplicitAuditEvent" {
-			continue
-		}
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			stmt, ok := n.(*ast.SwitchStmt)
-			if !ok {
-				return true
-			}
-			for _, clause := range stmt.Body.List {
-				cc, ok := clause.(*ast.CaseClause)
-				if !ok {
-					continue
-				}
-				for _, expr := range cc.List {
-					if lit, ok := expr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-						cases[strings.Trim(lit.Value, "`\"")] = true
-					}
-				}
-			}
-			return false
-		})
-	}
-	if len(cases) == 0 {
-		t.Fatal("未能从 HasExplicitAuditEvent 提取任何 case——函数重命名或重构请同步更新提取器")
-	}
-	return cases
-}
-
 // extractRouteHandlerRegistry AST 解析 middleware.go 的路由注册
 // （METHOD("/path", h.Handler) 形态，v1 组前缀 /api/v1），构建
 // "METHOD /api/v1/path" → handler 函数名 映射。

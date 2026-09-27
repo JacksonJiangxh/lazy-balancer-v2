@@ -125,20 +125,19 @@
           </el-input>
         </el-form-item>
         <el-form-item label="MCP 客户端配置 JSON（粘贴到客户端，替换 <YOUR_API_KEY> 为密钥全文）">
-          <el-input
-            class="mcp-config-json"
-            type="textarea"
-            :model-value="mcpConfigJSON"
-            readonly
-            :rows="13"
-          >
-            <template #append>
-              <el-button aria-label="复制 MCP 配置" @click="copyMCPConfig">
-                <el-icon><CopyDocument /></el-icon>
-                复制
-              </el-button>
-            </template>
-          </el-input>
+          <div style="position: relative">
+            <el-input
+              class="mcp-config-json"
+              type="textarea"
+              :model-value="mcpConfigJSON"
+              readonly
+              :rows="13"
+            />
+            <el-button aria-label="复制 MCP 配置" size="small" style="position: absolute; top: 8px; right: 8px; z-index: 1" @click="copyMCPConfig">
+              <el-icon><CopyDocument /></el-icon>
+              复制
+            </el-button>
+          </div>
           <div class="mcp-config-hints">
             如客户端报证书错误，处置方式见下方「AI Agent 接入指南」自签证书段。密钥需保持 MCP 开启，只读 Key 仅暴露只读工具。
           </div>

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -357,7 +358,7 @@ func (h *Handlers) GetCurrentUser(c *gin.Context) {
 type UpdateCurrentUserRequest struct {
 	DisplayName *string `json:"display_name" binding:"omitempty,max=50"`
 	// bcrypt 的字节上限 72——x/crypto v0.55+ 超出即返回 ErrPasswordTooLong
-	// (密码策略:8-32 可打印 ASCII,四类字符)
+	// (密码策略:8-24 可打印 ASCII,四类字符)
 	Password string `json:"password" binding:"omitempty,max=24"`
 	// M5（用户已批准契约）：提交新密码时必须携带当前密码过共享确认门——此前仅凭
 	// 会话即可改密，劫持会话可直接置换密码把原主锁在门外。仅改昵称不要求。
@@ -394,6 +395,18 @@ func validatePasswordPolicy(password string) error {
 		if r < 32 || r > 126 {
 			return errors.New("密码仅支持数字、大小写字母和特殊字符，不允许汉字或其他非 ASCII 字符")
 		}
+	}
+	return nil
+}
+
+// validateUsernamePolicy 用户名策略（2026-09-28 用户裁定）：仅允许小写英文
+// 开头，字符只允许小写字母或小写字母+数字——不允许大写、汉字、特殊字符、
+// 下划线、连字符。长度 3-50 由 binding 层覆盖。
+var usernamePolicyRe = regexp.MustCompile(`^[a-z][a-z0-9]*$`)
+
+func validateUsernamePolicy(username string) error {
+	if !usernamePolicyRe.MatchString(username) {
+		return errors.New("用户名仅允许小写英文开头，字符只允许小写字母或小写字母+数字")
 	}
 	return nil
 }
@@ -568,7 +581,11 @@ func (h *Handlers) SetupAdmin(c *gin.Context) {
 		return
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "用户名至少 3 位，密码至少 6 位"})
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "用户名至少 3 位，密码至少 8 位"})
+		return
+	}
+	if err := validateUsernamePolicy(req.Username); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
 	if err := validatePasswordPolicy(req.Password); err != nil {

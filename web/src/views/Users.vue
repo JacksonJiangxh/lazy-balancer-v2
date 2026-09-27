@@ -387,7 +387,7 @@ const handleSubmit = async () => {
     ElMessage.warning('用户名长度需为 3-50 位')
     return
   }
-  if ((!editingUser.value && !form.value.password) || (form.value.password && form.value.password.length < 6)) {
+  if ((!editingUser.value && !form.value.password) || (form.value.password && form.value.password.length < 8)) {
     ElMessage.warning('密码长度8-24位，仅限数字、大小写字母和特殊字符')
     return
   }
@@ -541,8 +541,8 @@ function lbCancel() {
 function lbConfirm() {
   const mode = lbDialog.spec?.mode
   if (mode === 'reset-pwd') {
-    if (!lbDialog.newPwd || lbDialog.newPwd.length < 6) { ElMessage.error('密码长度8-24位，仅限数字、大小写字母和特殊字符'); return }
-    if (lbDialog.newPwd.length > 72) { ElMessage.error('密码长度不能超过72位'); return }
+    if (!lbDialog.newPwd || lbDialog.newPwd.length < 8) { ElMessage.error('密码长度8-24位，仅限数字、大小写字母和特殊字符'); return }
+    if (lbDialog.newPwd.length > 24) { ElMessage.error('密码长度不能超过72位'); return }
     if (lbDialog.newPwd !== lbDialog.newPwd2) { ElMessage.error('两次输入的新密码不一致'); return }
   } else if (mode === 'mfa-code') {
     if (!validateMfaCodeInput(lbDialog.code)) { ElMessage.error('请输入验证码或恢复代码'); return }

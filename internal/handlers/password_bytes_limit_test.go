@@ -11,7 +11,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 密码策略（2026-09-28 用户裁定）：8-32 个可打印 ASCII 字符。
+// 密码策略（2026-09-28 用户裁定）：8-24 个可打印 ASCII 字符。
 // 汉字/非 ASCII 在策略层以 400 拒绝（bcrypt 之前）；超长(>32)同理。
 func TestUserPasswordEndpoints_reject_passwords_over_24_chars(t *testing.T) {
 	// 40 个中文 rune = 120 字节——超限且含非 ASCII,策略层双违反
@@ -66,7 +66,7 @@ func TestUserPasswordEndpoints_reject_passwords_over_24_chars(t *testing.T) {
 	}
 }
 
-// 恰好 32 个可打印 ASCII 字符的密码应被接受(边界上界)。
+// 恰好 24 个可打印 ASCII 字符的密码应被接受(边界上界)。
 func TestCreateUser_accepts_password_of_exactly_24_chars(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	router := gin.New()

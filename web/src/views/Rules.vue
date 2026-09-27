@@ -2633,7 +2633,9 @@ const submitWizard = async () => {
   }
   // 第 61 轮 P3：TLS 步校验镜像（跳步绕过 nextStep 时提交前兜底）
   if (wizardForm.enable_tls && wizardForm.protocol === 'http') {
-    if (!wizardForm.tls_cert || !wizardForm.tls_key) {
+    // F64-B2-1:补 tlsKeySet 豁免(与 nextStep TLS 步同款条件——掩码私钥未粘贴
+    // 新私钥时允许通过,F50-7 契约:空 key+tlsKeySet=保留原私钥)
+    if (!wizardForm.tls_cert?.trim() || (!wizardForm.tls_key?.trim() && !wizardForm.tlsKeySet)) {
       if (wizardForm.tls_source === 'manual') {
         ElMessage.warning('TLS 手动模式须上传证书与私钥')
         saving.value = false

@@ -194,10 +194,10 @@
             <el-input v-model="profileForm.display_name" :disabled="isReadOnly" placeholder="选填" maxlength="50" />
           </el-form-item>
           <el-form-item label="新密码">
-            <el-input v-model="profileForm.password" :disabled="isReadOnly" type="password" minlength="6" maxlength="72" placeholder="如不修改请留空（至少6位）" show-password />
+            <el-input v-model="profileForm.password" :disabled="isReadOnly" type="password" minlength="8" maxlength="24" placeholder="如不修改请留空（8-24位）" show-password />
           </el-form-item>
           <el-form-item label="确认新密码">
-            <el-input v-model="profileForm.passwordConfirm" :disabled="isReadOnly" type="password" minlength="6" maxlength="72" placeholder="再次输入新密码" show-password />
+            <el-input v-model="profileForm.passwordConfirm" :disabled="isReadOnly" type="password" minlength="8" maxlength="24" placeholder="再次输入新密码" show-password />
           </el-form-item>
           <el-form-item label="当前密码">
             <el-input v-model="profileForm.currentPassword" :disabled="isReadOnly" type="password" maxlength="72" :placeholder="profileForm.password ? '修改密码时必填' : '填写新密码后需确认'" show-password />
@@ -317,7 +317,7 @@ const closeProfile = (): void => {
 const saveProfile = async () => {
   if (isReadOnly.value || saving.value) return
   if (profileForm.value.password && profileForm.value.password.length < 6) {
-    authStore.showToast('warning', '密码长度至少6位')
+    authStore.showToast('warning', '密码长度至少8位（8-24位，仅限数字、大小写字母和特殊字符）')
     return
   }
   // M5：提交新密码必须携带当前密码（后端密码确认门），不改密码时不需要。
