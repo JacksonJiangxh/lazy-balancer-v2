@@ -24,7 +24,7 @@ func TestLogin_lockedMessageReflectsRemainingMinutes(t *testing.T) {
 		INSERT INTO global_config VALUES (1, 1)`); err != nil {
 		t.Fatalf("create global config: %v", err)
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatal(err)
 	}

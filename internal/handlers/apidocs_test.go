@@ -391,7 +391,7 @@ func TestCreateUser_returnsConflict_whenUsernameAlreadyExists(t *testing.T) {
 	seedUserAuditTest(t, 1, "duplicate", "admin", true)
 
 	// When
-	response := serveUserMutation(h, http.MethodPost, "/users", `{"username":"duplicate","password":"secret","role":"user"}`, 1, h.CreateUser)
+	response := serveUserMutation(h, http.MethodPost, "/users", `{"username":"duplicate","password":"Secret1!","role":"user"}`, 1, h.CreateUser)
 
 	// Then
 	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "用户名已存在") {

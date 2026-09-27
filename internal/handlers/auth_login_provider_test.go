@@ -23,7 +23,7 @@ import (
 
 func TestLogin_responseCarriesAuthProvider(t *testing.T) {
 	database := setupAuthTestDB(t)
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestLogin_responseCarriesAuthProvider(t *testing.T) {
 	router.POST("/auth/login", h.Login)
 
 	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"secret123"}`)))
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"Secret123!"}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("login: status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -74,7 +74,7 @@ func TestMFAVerifyLogin_responseCarriesAuthProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatal(err)
 	}

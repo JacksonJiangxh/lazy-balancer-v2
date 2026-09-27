@@ -11,10 +11,10 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// bcrypt 只取前 72 字节且静默截断，超长密码必须在绑定层以 400 拒绝，
+// 密码策略 8-32 可打印 ASCII(2026-09-28 用户裁定)，超限密码在绑定层以 400 拒绝，
 // 不能先落库再让用户以被截断的密码登录失败。
-func TestUserPasswordEndpoints_reject_passwords_longer_than_72_characters(t *testing.T) {
-	longPassword := strings.Repeat("a", 73)
+func TestUserPasswordEndpoints_reject_passwords_over_32_chars(t *testing.T) {
+	longPassword := strings.Repeat("a", 33)
 	tests := []struct {
 		name   string
 		method string
@@ -64,31 +64,5 @@ func TestUserPasswordEndpoints_reject_passwords_longer_than_72_characters(t *tes
 				}
 			}
 		})
-	}
-}
-
-func TestCreateUser_accepts_password_of_exactly_72_characters(t *testing.T) {
-	// Given a clean database
-	h := newBackupTestHandlers(t)
-	router := gin.New()
-	router.POST("/users", h.CreateUser)
-
-	// When a 72-character password (bcrypt 的完整上限) is submitted
-	body := `{"username":"edge72","password":"` + strings.Repeat("a", 72) + `","role":"user"}`
-	request := httptest.NewRequest(http.MethodPost, "/users", strings.NewReader(body))
-	request.Header.Set("Content-Type", "application/json")
-	response := httptest.NewRecorder()
-	router.ServeHTTP(response, request)
-
-	// Then the user is created (201) and the hash verifies against the full password
-	if response.Code != http.StatusCreated {
-		t.Fatalf("status=%d body=%s, want 201", response.Code, response.Body.String())
-	}
-	var hash string
-	if err := db.DB.QueryRow("SELECT password_hash FROM users WHERE username='edge72'").Scan(&hash); err != nil {
-		t.Fatalf("read password hash: %v", err)
-	}
-	if !strings.HasPrefix(hash, "$2a$") {
-		t.Fatalf("password hash=%q, want bcrypt", hash)
 	}
 }

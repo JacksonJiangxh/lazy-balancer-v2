@@ -24,7 +24,7 @@ import (
 func TestLogin_unknownUserAndWrongPassword_returnIdentical401(t *testing.T) {
 	// Given 存在用户 root（真实 bcrypt 哈希，DefaultCost 与生产一致）
 	database := setupAuthTestDB(t)
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.DefaultCost)
 	if err != nil {
 		t.Fatalf("hash password: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestLogin_locksAccountAfterFiveFailures(t *testing.T) {
 	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,20,1)`); err != nil {
 		t.Fatalf("create global config: %v", err)
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("hash password: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestLogin_locksAccountAfterFiveFailures(t *testing.T) {
 	}
 
 	// Then 第 6 次（即使密码正确）→ 429 账户已锁定
-	rec := post(`{"username":"root","password":"secret123"}`)
+	rec := post(`{"username":"root","password":"Secret123!"}`)
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("attempt 6 (correct password while locked): status=%d body=%s, want 429", rec.Code, rec.Body.String())
 	}
@@ -115,7 +115,7 @@ func TestLogin_successClearsLockoutCounter(t *testing.T) {
 	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,20,1)`); err != nil {
 		t.Fatalf("create global config: %v", err)
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("hash password: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestLogin_successClearsLockoutCounter(t *testing.T) {
 	}
 
 	// When 正确密码
-	rec := post(`{"username":"root","password":"secret123"}`)
+	rec := post(`{"username":"root","password":"Secret123!"}`)
 
 	// Then 200 + 计数清零
 	if rec.Code != http.StatusOK {
@@ -161,7 +161,7 @@ func TestLogin_lockoutDisabledBySwitch(t *testing.T) {
 	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,20,0)`); err != nil {
 		t.Fatalf("create global config: %v", err)
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("hash password: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestLogin_lockoutDisabledBySwitch(t *testing.T) {
 			t.Fatalf("attempt %d: status=%d, want 401（开关关闭不锁定）", i, code)
 		}
 	}
-	if code := post(`{"username":"root","password":"secret123"}`); code != http.StatusOK {
+	if code := post(`{"username":"root","password":"Secret123!"}`); code != http.StatusOK {
 		t.Fatalf("correct password after 6 failures: status=%d, want 200（开关关闭无锁定）", code)
 	}
 	var attempts int

@@ -61,12 +61,8 @@ func (h *Handlers) CreateUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "角色无效"})
 		return
 	}
-	if passwordTooShort(req.Password) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "密码至少 6 位"})
-		return
-	}
-	if passwordTooLong(req.Password) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "密码长度超过 72 字节限制"})
+	if err := validatePasswordPolicy(req.Password); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
@@ -100,7 +96,7 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 
 	var req struct {
 		Username    *string `json:"username" binding:"omitempty,min=3,max=50"`
-		Password    *string `json:"password" binding:"omitempty,max=72"`
+		Password    *string `json:"password" binding:"omitempty,max=24"`
 		Role        *string `json:"role"`
 		DisplayName *string `json:"display_name" binding:"omitempty,max=50"`
 	}
@@ -136,13 +132,11 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 			return
 		}
 	}
-	if req.Password != nil && passwordTooShort(*req.Password) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "密码至少 6 位"})
-		return
-	}
-	if req.Password != nil && passwordTooLong(*req.Password) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "密码长度超过 72 字节限制"})
-		return
+	if req.Password != nil {
+		if err := validatePasswordPolicy(*req.Password); err != nil {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+			return
+		}
 	}
 	var passwordHash string
 	if req.Password != nil && *req.Password != "" {
@@ -468,7 +462,7 @@ func (h *Handlers) ResetUserPassword(c *gin.Context) {
 	}
 
 	var req struct {
-		NewPassword string `json:"new_password" binding:"omitempty,max=72"`
+		NewPassword string `json:"new_password" binding:"omitempty,max=24"`
 	}
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -488,12 +482,8 @@ func (h *Handlers) ResetUserPassword(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "OIDC 用户的密码由认证服务管理，无法本地重置"})
 		return
 	}
-	if req.NewPassword == "" || passwordTooShort(req.NewPassword) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "密码至少 6 位"})
-		return
-	}
-	if passwordTooLong(req.NewPassword) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "密码长度超过 72 字节限制"})
+	if err := validatePasswordPolicy(req.NewPassword); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
 

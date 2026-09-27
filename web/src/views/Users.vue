@@ -50,10 +50,10 @@
             <!-- v2.3.0:OIDC 用户密码/显示名源自 IdP,不可本地改(用户裁定) -->
             <template v-if="!editingIsOIDC">
               <el-form-item :label="editingUser ? '新密码' : '密码'">
-                <el-input v-model="form.password" type="password" show-password minlength="6" maxlength="72" :placeholder="editingUser ? '留空则不修改密码（至少6位）' : '请输入至少6位密码'" />
+                <el-input v-model="form.password" type="password" show-password minlength="8" maxlength="24" :placeholder="editingUser ? '留空则不修改密码（8-24位，仅限数字、大小写字母和特殊字符）' : '请输入8-24位，仅限数字、大小写字母和特殊字符密码'" />
               </el-form-item>
               <el-form-item label="确认新密码">
-                <el-input v-model="form.password_confirm" type="password" show-password minlength="6" maxlength="72" placeholder="再次输入新密码" />
+                <el-input v-model="form.password_confirm" type="password" show-password minlength="8" maxlength="24" placeholder="再次输入新密码" />
               </el-form-item>
             </template>
             <el-form-item v-else label="数据来源">
@@ -267,11 +267,11 @@
       <div v-if="lbDialog.spec?.mode === 'reset-pwd'" class="lb-fields">
         <div class="lb-field">
           <div class="lb-field__label">新密码</div>
-          <el-input v-model="lbDialog.newPwd" type="password" show-password maxlength="72" placeholder="至少 6 位，最长 72 位" />
+          <el-input v-model="lbDialog.newPwd" type="password" show-password maxlength="24" placeholder="8-24位，仅限数字、大小写字母和特殊字符，最长 24 位" />
         </div>
         <div class="lb-field">
           <div class="lb-field__label">确认新密码</div>
-          <el-input v-model="lbDialog.newPwd2" type="password" show-password maxlength="72" placeholder="再次输入新密码" />
+          <el-input v-model="lbDialog.newPwd2" type="password" show-password maxlength="24" placeholder="再次输入新密码" />
         </div>
       </div>
       <div v-else-if="lbDialog.spec?.mode === 'mfa-code'" class="lb-fields">
@@ -388,7 +388,7 @@ const handleSubmit = async () => {
     return
   }
   if ((!editingUser.value && !form.value.password) || (form.value.password && form.value.password.length < 6)) {
-    ElMessage.warning('密码长度至少6位')
+    ElMessage.warning('密码长度8-24位，仅限数字、大小写字母和特殊字符')
     return
   }
   if (form.value.password && form.value.password !== form.value.password_confirm) {
@@ -541,7 +541,7 @@ function lbCancel() {
 function lbConfirm() {
   const mode = lbDialog.spec?.mode
   if (mode === 'reset-pwd') {
-    if (!lbDialog.newPwd || lbDialog.newPwd.length < 6) { ElMessage.error('密码长度至少6位'); return }
+    if (!lbDialog.newPwd || lbDialog.newPwd.length < 6) { ElMessage.error('密码长度8-24位，仅限数字、大小写字母和特殊字符'); return }
     if (lbDialog.newPwd.length > 72) { ElMessage.error('密码长度不能超过72位'); return }
     if (lbDialog.newPwd !== lbDialog.newPwd2) { ElMessage.error('两次输入的新密码不一致'); return }
   } else if (mode === 'mfa-code') {

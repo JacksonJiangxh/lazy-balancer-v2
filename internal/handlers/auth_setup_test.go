@@ -65,7 +65,7 @@ func TestLogin_returns_created_at_and_new_last_login_as_nullable_values(t *testi
 	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER); INSERT INTO global_config VALUES (1,1,20)`); err != nil {
 		t.Fatalf("create global config: %v", err)
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("hash password: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestLogin_returns_created_at_and_new_last_login_as_nullable_values(t *testi
 	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
 	router := gin.New()
 	router.POST("/auth/login", h.Login)
-	request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"secret123"}`))
+	request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"Secret123!"}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	before := time.Now().Add(-time.Second)
@@ -108,7 +108,7 @@ func TestLogin_signs_password_version_claim(t *testing.T) {
 	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER); INSERT INTO global_config VALUES (1,1,20)`); err != nil {
 		t.Fatalf("create global config: %v", err)
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("hash password: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestLogin_signs_password_version_claim(t *testing.T) {
 	}
 	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"secret123"}`))
+	request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"Secret123!"}`))
 	request.Header.Set("Content-Type", "application/json")
 	context, _ := gin.CreateTestContext(response)
 	context.Request = request
@@ -148,7 +148,7 @@ func TestLogin_clamps_excessive_jwt_expiration(t *testing.T) {
 	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER); INSERT INTO global_config VALUES (1,1,999999)`); err != nil {
 		t.Fatalf("create global config: %v", err)
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("hash password: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestLogin_clamps_excessive_jwt_expiration(t *testing.T) {
 	}
 	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"secret123"}`))
+	request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"Secret123!"}`))
 	request.Header.Set("Content-Type", "application/json")
 	context, _ := gin.CreateTestContext(response)
 	context.Request = request
@@ -184,7 +184,7 @@ func TestLogin_clamps_excessive_jwt_expiration(t *testing.T) {
 func TestLogin_returns_error_when_last_login_update_fails(t *testing.T) {
 	// Given
 	database := setupAuthTestDB(t)
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("hash password: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestLogin_returns_error_when_last_login_update_fails(t *testing.T) {
 	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
 	router := gin.New()
 	router.POST("/auth/login", h.Login)
-	request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"secret123"}`))
+	request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"Secret123!"}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
@@ -232,7 +232,7 @@ func TestSetupAdmin_first_run_flow(t *testing.T) {
 
 	// When: create first admin
 	response = httptest.NewRecorder()
-	request = httptest.NewRequest(http.MethodPost, "/auth/setup", strings.NewReader(`{"username":"root","password":"secret123","display_name":"管理员"}`))
+	request = httptest.NewRequest(http.MethodPost, "/auth/setup", strings.NewReader(`{"username":"root","password":"Secret123!","display_name":"管理员"}`))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(response, request)
 
@@ -243,7 +243,7 @@ func TestSetupAdmin_first_run_flow(t *testing.T) {
 
 	// When: setup again -> forbidden
 	response = httptest.NewRecorder()
-	request = httptest.NewRequest(http.MethodPost, "/auth/setup", strings.NewReader(`{"username":"other","password":"secret123"}`))
+	request = httptest.NewRequest(http.MethodPost, "/auth/setup", strings.NewReader(`{"username":"other","password":"Secret123!"}`))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(response, request)
 
@@ -254,7 +254,7 @@ func TestSetupAdmin_first_run_flow(t *testing.T) {
 
 	// When: login with created admin
 	response = httptest.NewRecorder()
-	request = httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"secret123"}`))
+	request = httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"Secret123!"}`))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(response, request)
 
