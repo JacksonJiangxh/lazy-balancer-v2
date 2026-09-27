@@ -182,47 +182,10 @@ func (s *SyncService) do(req *http.Request) (*http.Response, error) {
 // (凭证不出原主机;TOFU transport 对自签证书自动钉扎);跨主机重定向一律
 // 不跟随(凭证外泄防护,见 doesNotFollowHTTPRedirect 契约测试)。
 func (s *SyncService) doWithTLSUpgradeRedirect(req *http.Request) (*http.Response, error) {
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusMovedPermanently && resp.StatusCode != http.StatusPermanentRedirect {
-		return resp, nil
-	}
-	location := resp.Header.Get("Location")
-	if location == "" {
-		return resp, nil
-	}
-	target, err := url.Parse(location)
-	if err != nil || target.Scheme != "https" || target.Hostname() != req.URL.Hostname() {
-		return resp, nil
-	}
-	resp.Body.Close()
-	retry := req.Clone(req.Context())
-	retry.URL = target
-	if target.RawQuery == "" && req.URL.RawQuery != "" {
-		retry.URL.RawQuery = req.URL.RawQuery
-	}
-	if req.GetBody != nil {
-		body, err := req.GetBody()
-		if err != nil {
-			return nil, fmt.Errorf("重放 https 升级请求: %w", err)
-		}
-		retry.Body = body
-	} else if req.Body != nil {
-		// 无 GetBody 的带体请求不可重放（R55 P5-4 家族收敛，第 59 轮 R59-P5：
-		// cluster_control.go 已修同型，此处为漏点）——body 已被首次请求消费，
-		// 重放会发送空/残缺载荷；按原响应返回，不让调用方拿到残缺重放结果。
-		// 注：原 301 响应 body 已 Close，此处不可再用——返回无重定向的空壳响应。
-		return &http.Response{
-			StatusCode: http.StatusMovedPermanently,
-			Status:     "301 Moved Permanently",
-			Header:     resp.Header.Clone(),
-			Body:       http.NoBody,
-			Request:    req,
-		}, nil
-	}
-	return s.client.Do(retry)
+	// F63-B3-P5-3 合并:委托导出函数(原两份近乎逐字重复的实现——方法版与
+	// cluster_control.go 函数版;合并后单一事实源,行为取方法版的合成空响应
+	// 语义——函数版原实现有「已 Close 的 body 返回调用方」缺陷)
+	return DoWithSameHostTLSUpgradeRedirect(s.client, req)
 }
 
 // verifyClusterPinIfPresent 校验 pin 文件与已验证指纹一致；文件缺失返回 nil

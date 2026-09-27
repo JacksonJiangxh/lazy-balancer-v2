@@ -357,23 +357,45 @@ func (h *Handlers) GetCurrentUser(c *gin.Context) {
 type UpdateCurrentUserRequest struct {
 	DisplayName *string `json:"display_name" binding:"omitempty,max=50"`
 	// bcrypt 的字节上限 72——x/crypto v0.55+ 超出即返回 ErrPasswordTooLong
-	// (非静默截断);max=72 按 rune 计数,多字节超长由 passwordTooLong 字节级预检 400
-	Password string `json:"password" binding:"omitempty,max=72"`
+	// (密码策略:8-32 可打印 ASCII,四类字符)
+	Password string `json:"password" binding:"omitempty,max=24"`
 	// M5（用户已批准契约）：提交新密码时必须携带当前密码过共享确认门——此前仅凭
 	// 会话即可改密，劫持会话可直接置换密码把原主锁在门外。仅改昵称不要求。
 	// M5（2026-09 裁定保留，登录后唯一密码确认例外）：提交新密码时必须携带当前密码。
-	CurrentPassword string `json:"current_password" binding:"omitempty,max=72"`
+	CurrentPassword string `json:"current_password" binding:"omitempty,max=24"`
 }
 
 // maxPasswordBytes 是 bcrypt 的字节上限：v0.55 起对 >72 字节的密码返回
 // ErrPasswordTooLong。binding 的 max=72 按 rune 计数（validator v10），25-72 个
-// 多字节字符（>72 字节）可穿过绑定层——各密码端点须在 bcrypt 之前用
-// passwordTooLong 做字节级预检并 400（S-2，2026-09-05 审计裁定）。
-const maxPasswordBytes = 72
+// 密码策略（2026-09-28 用户裁定，F63-B5a-1）：8-24 个可打印 ASCII 字符，
+// 仅限数字、大小写字母、特殊字符(可打印 ASCII)——不强制四类全含，
+// 不允许汉字或其他非 ASCII 字符。仅适用于设置/修改/重置——登录不做策略校验（存量密码可能在
+// 旧策略下设置）。
+const (
+	minPasswordLength = 8
+	maxPasswordLength = 24
+)
 
-// passwordTooLong 字节级密码上限预检（与 binding 的 rune 级 max=72 互补）。
-func passwordTooLong(password string) bool {
-	return len(password) > maxPasswordBytes
+// validatePasswordPolicy 密码策略校验（设置/修改/重置时调用）。
+// 2026-09-28 用户裁定（修正）:仅限 8-24 个可打印 ASCII 字符(数字/大小写
+// 字母/特殊字符),不允许汉字或其他非 ASCII——不强制四类字符必须全含。
+func validatePasswordPolicy(password string) error {
+	if password == "" {
+		return nil // 空密码=不修改(UpdateCurrentUser/UpdateUser 的 omitempty 场景;
+		// CreateUser/ResetUserPassword 由 binding required 拦截空值)
+	}
+	if len(password) < minPasswordLength {
+		return fmt.Errorf("密码长度不能少于 %d 位", minPasswordLength)
+	}
+	if len(password) > maxPasswordLength {
+		return fmt.Errorf("密码长度不能超过 %d 位", maxPasswordLength)
+	}
+	for _, r := range password {
+		if r < 32 || r > 126 {
+			return errors.New("密码仅支持数字、大小写字母和特殊字符，不允许汉字或其他非 ASCII 字符")
+		}
+	}
+	return nil
 }
 
 func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
@@ -407,12 +429,8 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 			return
 		}
 	}
-	if passwordTooShort(req.Password) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "密码至少 6 位"})
-		return
-	}
-	if passwordTooLong(req.Password) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "密码长度超过 72 字节限制"})
+	if err := validatePasswordPolicy(req.Password); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
 	if req.Password != "" {
@@ -543,7 +561,7 @@ func (h *Handlers) SetupAdmin(c *gin.Context) {
 	}
 	var req struct {
 		Username    string `json:"username" binding:"required,min=3,max=50"`
-		Password    string `json:"password" binding:"required,min=6,max=72"`
+		Password    string `json:"password" binding:"required,min=8,max=24"`
 		DisplayName string `json:"display_name" binding:"max=50"`
 	}
 	if !guardAuthJSONBody(c) {
@@ -553,8 +571,8 @@ func (h *Handlers) SetupAdmin(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "用户名至少 3 位，密码至少 6 位"})
 		return
 	}
-	if passwordTooLong(req.Password) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "密码长度超过 72 字节限制"})
+	if err := validatePasswordPolicy(req.Password); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)

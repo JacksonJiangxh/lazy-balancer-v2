@@ -51,7 +51,7 @@ func seedMFAChallengeLoginFixture(t *testing.T, challengeToken string, consumed 
 	if err != nil {
 		t.Fatal(err)
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatal(err)
 	}

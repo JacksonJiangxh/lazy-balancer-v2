@@ -252,7 +252,7 @@ func TestOIDCUser_cannotModifyDisplayNameOrPassword(t *testing.T) {
 		t.Fatalf("self display_name: status=%d body=%s, want 400 OIDC 提示", rec.Code, rec.Body.String())
 	}
 	// When: OIDC 用户自助改密码(带当前密码,空哈希恒败故先绕过密码门——直接断言 OIDC 门先拦)→ 400
-	rec = serveUserMutation(h, http.MethodPatch, "/users/7", `{"password":"newpass123","current_password":"x"}`, 7, h.UpdateCurrentUser)
+	rec = serveUserMutation(h, http.MethodPatch, "/users/7", `{"password":"Newpass123!","current_password":"x"}`, 7, h.UpdateCurrentUser)
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "OIDC") {
 		t.Fatalf("self password: status=%d body=%s, want 400 OIDC 提示", rec.Code, rec.Body.String())
 	}
@@ -264,7 +264,7 @@ func TestOIDCUser_cannotModifyDisplayNameOrPassword(t *testing.T) {
 	// When: 管理员重置 OIDC 用户密码 → 400
 	pwRec := httptest.NewRecorder()
 	pwCtx, _ := gin.CreateTestContext(pwRec)
-	pwCtx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"new_password":"reset123"}`))
+	pwCtx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"new_password":"Reset123!"}`))
 	pwCtx.Request.Header.Set("Content-Type", "application/json")
 	pwCtx.Params = gin.Params{{Key: "id", Value: "7"}}
 	pwCtx.Set("user_id", 1)
@@ -298,7 +298,7 @@ func TestUserMutations_rejectWhenIdentityUnreadable(t *testing.T) {
 
 	pwRec := httptest.NewRecorder()
 	pwCtx, _ := gin.CreateTestContext(pwRec)
-	pwCtx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"new_password":"reset123"}`))
+	pwCtx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"new_password":"Reset123!"}`))
 	pwCtx.Request.Header.Set("Content-Type", "application/json")
 	pwCtx.Params = gin.Params{{Key: "id", Value: "7"}}
 	pwCtx.Set("user_id", 1)
@@ -331,7 +331,7 @@ func TestResetUserPassword_clearsLoginLockout(t *testing.T) {
 
 	pwRec := httptest.NewRecorder()
 	pwCtx, _ := gin.CreateTestContext(pwRec)
-	pwCtx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"new_password":"fresh123"}`))
+	pwCtx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"new_password":"Fresh123!"}`))
 	pwCtx.Request.Header.Set("Content-Type", "application/json")
 	pwCtx.Params = gin.Params{{Key: "id", Value: "7"}}
 	pwCtx.Set("user_id", 1)
@@ -358,11 +358,11 @@ func TestCreateUser_configuredBodyLimit413(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE global_config SET request_body_max_size_mb=1 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	big := `{"username":"u` + strings.Repeat("a", 2<<20) + `","password":"secret123","role":"user"}`
+	big := `{"username":"u` + strings.Repeat("a", 2<<20) + `","password":"Secret123!","role":"user"}`
 	if response := serveUserMutation(h, http.MethodPost, "/users", big, 1, h.CreateUser); response.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status=%d body=%.200s, want 413", response.Code, response.Body.String())
 	}
-	if response := serveUserMutation(h, http.MethodPost, "/users", `{"username":"newuser1","password":"secret123","role":"user"}`, 1, h.CreateUser); response.Code != http.StatusCreated {
+	if response := serveUserMutation(h, http.MethodPost, "/users", `{"username":"newuser1","password":"Secret123!","role":"user"}`, 1, h.CreateUser); response.Code != http.StatusCreated {
 		t.Fatalf("status=%d body=%.200s, want 201(配置上限下小 body 不受影响)", response.Code, response.Body.String())
 	}
 }

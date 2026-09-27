@@ -65,7 +65,7 @@ func TestAuthEndpoints_reject_oversized_body(t *testing.T) {
 	t.Run("合法小 body 仍走业务分支", func(t *testing.T) {
 		router := gin.New()
 		router.POST("/auth/login", h.Login)
-		request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"secret123"}`))
+		request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"Secret123!"}`))
 		request.Header.Set("Content-Type", "application/json")
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)

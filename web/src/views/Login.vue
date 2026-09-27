@@ -21,10 +21,10 @@
             <el-input v-model="setupForm.display_name" placeholder="显示名（选填）" size="large" :prefix-icon="Postcard" maxlength="50" clearable />
           </el-form-item>
           <el-form-item prop="password">
-            <el-input v-model="setupForm.password" type="password" name="new-password" autocomplete="new-password" placeholder="密码（至少 6 位）" size="large" :prefix-icon="Lock" maxlength="72" show-password />
+            <el-input v-model="setupForm.password" type="password" name="new-password" autocomplete="new-password" placeholder="密码（8-24 位，仅限数字、大小写字母和特殊字符）" size="large" :prefix-icon="Lock" maxlength="24" show-password />
           </el-form-item>
           <el-form-item prop="confirm">
-            <el-input v-model="setupForm.confirm" type="password" name="new-password-confirm" autocomplete="new-password" placeholder="确认密码" size="large" :prefix-icon="Lock" maxlength="72" show-password />
+            <el-input v-model="setupForm.confirm" type="password" name="new-password-confirm" autocomplete="new-password" placeholder="确认密码" size="large" :prefix-icon="Lock" maxlength="24" show-password />
           </el-form-item>
           <el-alert v-if="error" :title="error" type="error" show-icon :closable="false" class="login-error" />
           <el-form-item>
@@ -105,7 +105,7 @@
               placeholder="请输入密码"
               size="large"
               :prefix-icon="Lock"
-              maxlength="72"
+              maxlength="24"
               show-password
             />
           </el-form-item>

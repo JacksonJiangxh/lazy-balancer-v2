@@ -18,7 +18,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-func TestUserPasswordEndpoints_reject_passwords_shorter_than_six_characters(t *testing.T) {
+func TestUserPasswordEndpoints_reject_passwords_shorter_than_policy(t *testing.T) {
 	tests := []struct {
 		name   string
 		method string
@@ -81,7 +81,7 @@ func TestUpdateCurrentUser_rolls_back_display_name_when_password_update_fails(t 
 	}
 	router := gin.New()
 	router.PUT("/me", func(c *gin.Context) { c.Set("user_id", 1); h.UpdateCurrentUser(c) })
-	request := httptest.NewRequest(http.MethodPut, "/me", strings.NewReader(`{"display_name":"After","password":"secret1","current_password":"old-secret"}`))
+	request := httptest.NewRequest(http.MethodPut, "/me", strings.NewReader(`{"display_name":"After","password":"secret12","current_password":"old-secret"}`))
 	response := httptest.NewRecorder()
 
 	// When
@@ -110,8 +110,8 @@ func TestUserMutationEndpoints_validate_ID_and_return_not_found(t *testing.T) {
 	}{
 		{name: "toggle invalid id", path: "/users/not-a-number/status", body: `{"is_enabled":false}`, mount: func(r *gin.Engine, h *Handlers) { r.PUT("/users/:id/status", h.ToggleUserStatus) }, wantStatus: http.StatusBadRequest},
 		{name: "toggle missing user", path: "/users/999/status", body: `{"is_enabled":false}`, mount: func(r *gin.Engine, h *Handlers) { r.PUT("/users/:id/status", h.ToggleUserStatus) }, wantStatus: http.StatusNotFound},
-		{name: "reset invalid id", path: "/users/not-a-number/password", body: `{"new_password":"secret1"}`, mount: func(r *gin.Engine, h *Handlers) { r.PUT("/users/:id/password", h.ResetUserPassword) }, wantStatus: http.StatusBadRequest},
-		{name: "reset missing user", path: "/users/999/password", body: `{"new_password":"secret1"}`, mount: func(r *gin.Engine, h *Handlers) { r.PUT("/users/:id/password", h.ResetUserPassword) }, wantStatus: http.StatusNotFound},
+		{name: "reset invalid id", path: "/users/not-a-number/password", body: `{"new_password":"secret12"}`, mount: func(r *gin.Engine, h *Handlers) { r.PUT("/users/:id/password", h.ResetUserPassword) }, wantStatus: http.StatusBadRequest},
+		{name: "reset missing user", path: "/users/999/password", body: `{"new_password":"secret12"}`, mount: func(r *gin.Engine, h *Handlers) { r.PUT("/users/:id/password", h.ResetUserPassword) }, wantStatus: http.StatusNotFound},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

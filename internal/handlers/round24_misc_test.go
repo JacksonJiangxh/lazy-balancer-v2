@@ -61,7 +61,7 @@ func TestCreateUser_rejectsShortUsername(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/users", handler.CreateUser)
-	request := httptest.NewRequest(http.MethodPost, "/users", strings.NewReader(`{"username":"ab","password":"secret123","role":"user"}`))
+	request := httptest.NewRequest(http.MethodPost, "/users", strings.NewReader(`{"username":"ab","password":"Secret123!","role":"user"}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
@@ -97,8 +97,8 @@ func TestResetUserPassword_shortPasswordMessage(t *testing.T) {
 	handler.ResetUserPassword(context)
 
 	// Then
-	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "密码至少 6 位") {
-		t.Fatalf("reset short password status=%d body=%s, want 400 with 密码至少 6 位", response.Code, response.Body.String())
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "密码长度不能少于 8 位") {
+		t.Fatalf("reset short password status=%d body=%s, want 400 with 密码长度不能少于 8 位", response.Code, response.Body.String())
 	}
 	var hash string
 	if err := db.DB.QueryRow("SELECT password_hash FROM users WHERE id=9").Scan(&hash); err != nil {

@@ -30,7 +30,7 @@ func setupLoginAuditDB(t *testing.T) {
 // 登录成功审计详情含完整用户标识「用户 N（username）」,非裸数字 ID(2026-09-11 裁定)。
 func TestLogin_successAuditDetailContainsUsername(t *testing.T) {
 	setupLoginAuditDB(t)
-	hash, _ := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
+	hash, _ := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	createdAt := time.Now().UTC().Format("2006-01-02 15:04:05")
 	if _, err := db.DB.Exec(`INSERT INTO users (username,password_hash,role,is_enabled,created_at) VALUES ('zhang',?,'admin',1,?)`, string(hash), createdAt); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -38,7 +38,7 @@ func TestLogin_successAuditDetailContainsUsername(t *testing.T) {
 	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
 	router := gin.New()
 	router.POST("/auth/login", h.Login)
-	request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"zhang","password":"secret123"}`))
+	request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"zhang","password":"Secret123!"}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
@@ -57,7 +57,7 @@ func TestLogin_successAuditDetailContainsUsername(t *testing.T) {
 // 登录失败(账户锁定)审计详情同样含完整用户标识。
 func TestLogin_lockedAuditDetailContainsUsername(t *testing.T) {
 	setupLoginAuditDB(t)
-	hash, _ := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.MinCost)
+	hash, _ := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	createdAt := time.Now().UTC().Format("2006-01-02 15:04:05")
 	if _, err := db.DB.Exec(`INSERT INTO users (username,password_hash,role,is_enabled,created_at) VALUES ('zhang',?,'admin',1,?)`, string(hash), createdAt); err != nil {
 		t.Fatalf("seed: %v", err)

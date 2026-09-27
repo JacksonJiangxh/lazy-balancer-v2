@@ -48,7 +48,7 @@ func TestSetupAdmin_slaveNodeGate(t *testing.T) {
 
 	// When / Then 2:SetupAdmin 必须 403 且不落用户
 	response = httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/auth/setup", strings.NewReader(`{"username":"root","password":"secret123"}`))
+	request := httptest.NewRequest(http.MethodPost, "/auth/setup", strings.NewReader(`{"username":"root","password":"Secret123!"}`))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusForbidden {

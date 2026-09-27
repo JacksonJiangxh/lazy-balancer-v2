@@ -1541,12 +1541,22 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if (*req.EnableTLS || req.TLSCert != "" || req.TLSKey != "") && req.TLSSource == "manual" {
 		tlsCert := req.TLSCert
 		tlsKey := req.TLSKey
-		// If cert/key not provided in request, get from DB
-		if tlsCert == "" {
-			tlsCert = existingRule.TLSCert
-		}
-		if tlsKey == "" {
-			tlsKey = existingRule.TLSKey
+		// F63-B2-1（用户裁定）:从 acme_dns 切换到 manual 时必须提供新的证书
+		// 和私钥——不允许静默沿用 ACME 签发的旧证书（用户以为换了新证书，
+		// 实际在用旧证书）；仅同为 manual 且未修改证书时允许 DB 回退。
+		if existingRule.TLSSource == "acme_dns" {
+			if strings.TrimSpace(req.TLSCert) == "" || strings.TrimSpace(req.TLSKey) == "" {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "从自动签发切换到手动模式必须上传或填写新的证书和私钥，不能沿用自动签发的旧证书"})
+				return
+			}
+		} else {
+			// If cert/key not provided in request, get from DB (same-mode fallback)
+			if tlsCert == "" {
+				tlsCert = existingRule.TLSCert
+			}
+			if tlsKey == "" {
+				tlsKey = existingRule.TLSKey
+			}
 		}
 		if *req.EnableTLS && (strings.TrimSpace(tlsCert) == "" || strings.TrimSpace(tlsKey) == "") {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "手动证书模式下必须提供 TLS 证书和私钥"})
@@ -1585,6 +1595,20 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		services.Logf("error", "UpdateRule runtime snapshot failed for caddy_id=%s: %v", caddyID, snapErr)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "备份当前运行配置失败"})
 		return
+	}
+
+	// F63-B2-1: acme→manual 切换时清理 ACME 关联——取消在途/排队的证书
+	// 任务,清零 acme_config_id(渲染层不再引用 ACME 配置)
+	switchingFromACME := existingRule.TLSSource == "acme_dns" && req.TLSSource == "manual"
+	if switchingFromACME {
+		req.ACMEConfigID = 0
+		if qm := services.GetCAQueueManager(); qm != nil {
+			ctx, cancel := context.WithTimeout(c.Request.Context(), cancelRuleJobsTimeout)
+			if err := cancelRuleJobs(ctx, qm, caddyID); err != nil {
+				services.Logf("warn", "UpdateRule acme→manual: cancel cert jobs for %s failed: %v (continuing)", caddyID, err)
+			}
+			cancel()
+		}
 	}
 
 	// Build dynamic update for lb_rules table

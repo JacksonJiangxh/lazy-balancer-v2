@@ -252,10 +252,16 @@ func DoWithSameHostTLSUpgradeRedirect(client *http.Client, req *http.Request) (*
 		}
 		retry.Body = body
 	} else if req.Body != nil {
-		// 无 GetBody 的带体请求不可重放（body 已被首次请求消费，重放会发送
-		// 空/残缺载荷——第 55 轮 P5-4 防御门）：按原响应返回（升级前的明文
-		// 响应），不让调用方拿到残缺重放结果。
-		return resp, nil
+		// F63-B3-P5-3:无 GetBody 的带体请求不可重放(body 已被首次请求消费,
+		// 重放会发送空/残缺载荷)——原实现返回已 Close 的 resp(调用方读 body
+		// 报错),合并后取 cluster_sync 方法版语义:返回合成空壳 301 响应。
+		return &http.Response{
+			StatusCode: http.StatusMovedPermanently,
+			Status:     "301 Moved Permanently",
+			Header:     resp.Header.Clone(),
+			Body:       http.NoBody,
+			Request:    req,
+		}, nil
 	}
 	return client.Do(retry)
 }
