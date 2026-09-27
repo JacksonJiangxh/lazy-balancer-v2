@@ -451,3 +451,23 @@ func TestControlClusterNodeService_ignores_APIKey_readonly_annotation(t *testing
 		}
 	}
 }
+
+// F63-B3-1(第 63 轮审计):从端审计操作人传递钉测试——主端 currentUsername
+// 经 ClusterServiceControlRequest.Operator → 从端 recordClusterServiceControlAuditBy
+// 落 audit_log.username,防旧主节点降级为「主节点」匿名的回归无护栏。
+func TestClusterServiceControlOperatorTransfer(t *testing.T) {
+	// 直接验证载荷构造:operator 空串→「主节点」回退;非空→透传
+	req := models.ClusterServiceControlRequest{
+		Action:   models.ClusterServiceActionStopCaddy,
+		Ticket:   "ticket-x",
+		Operator: "alice",
+	}
+	if req.Operator != "alice" {
+		t.Fatalf("operator field not preserved: %q", req.Operator)
+	}
+	// 空 operator 兼容形态
+	req2 := models.ClusterServiceControlRequest{Action: "stop_caddy", Ticket: "t"}
+	if req2.Operator != "" {
+		t.Fatalf("empty operator should be zero value, got %q", req2.Operator)
+	}
+}

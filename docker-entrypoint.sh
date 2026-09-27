@@ -20,11 +20,9 @@ fi
 
 # Generate Caddyfile if not exists
 if [ ! -f /app/config/Caddyfile ]; then
-    if [ -f /app/config/Caddyfile.dist ]; then
-        cp /app/config/Caddyfile.dist /app/config/Caddyfile
-    else
-        echo ":2019" > /app/config/Caddyfile
-    fi
+    # F63-B8-1:镜像内恒有出厂 config/Caddyfile(COPY 进镜像),挂载空目录
+    # 覆盖时直接写最小合法配置(admin 端口);原 .dist 分支为死路径(无该文件)
+    echo ":2019" > /app/config/Caddyfile
 fi
 
 # Set timezone from database if available

@@ -96,6 +96,7 @@ RUN n=0; until apk add --no-cache curl; do \
     mkdir -p /tmp/crs-src && \
     (curl -sfL -o /tmp/crs.tar.gz "https://ghfast.top/https://github.com/coreruleset/coreruleset/archive/refs/tags/${CRS_VERSION}.tar.gz" || \
      curl -sfL -o /tmp/crs.tar.gz "https://github.com/coreruleset/coreruleset/archive/refs/tags/${CRS_VERSION}.tar.gz") && \
+    echo "d8acc96f25ad07c8e3a595a23c797324f6d77e59ddf9e26e90dd95ebd2e676ce  /tmp/crs.tar.gz" | sha256sum -c - && \
     tar xzf /tmp/crs.tar.gz --strip-components=1 -C /tmp/crs-src && \
     cp -r /tmp/crs-src/rules /app/waf/crs/rules && \
     cp /tmp/crs-src/crs-setup.conf.example /app/waf/crs/crs-setup.conf && \
@@ -114,6 +115,7 @@ RUN n=0; until apk add --no-cache curl; do \
     done && \
     (curl -sfL -o /app/waf.dist/ip2region.xdb "https://ghfast.top/https://raw.githubusercontent.com/lionsoul2014/ip2region/v3.17.0/data/ip2region_v4.xdb" || \
      curl -sfL -o /app/waf.dist/ip2region.xdb "https://raw.githubusercontent.com/lionsoul2014/ip2region/v3.17.0/data/ip2region_v4.xdb") && \
+    echo "6307a9696f5711f84bcb8b25f07894de68a64a0ed4a1cc7e990562dd3084f210  /app/waf.dist/ip2region.xdb" | sha256sum -c - && \
     apk del curl
 # 容器以 root 运行（无 USER/降权，与常见 Caddy 镜像同态）；如需非 root，需
 # 同时给 80/443 加 CAP_NET_BIND_SERVICE 并预置 bind 挂载属主（第 47 轮 F-47-29）

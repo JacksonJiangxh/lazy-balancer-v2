@@ -133,6 +133,7 @@ func timestampedRotationStats(path string) (int64, int) {
 				if len(rest2) > 1 && rest2[1] >= '0' && rest2[1] <= '9' {
 					if info, err := e.Info(); err == nil {
 						total += info.Size()
+						cnt++ // F63-B5b-1:timberjack 族份数同计(原漏)
 					}
 				}
 			}

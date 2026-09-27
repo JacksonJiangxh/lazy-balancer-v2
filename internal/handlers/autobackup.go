@@ -235,6 +235,8 @@ func (h *Handlers) RunAutoBackupOnce(trigger, operator string) (autoBackupRowVie
 	// 备份下会取到他人行（第 56 轮 F4 展示竞态，此处从根上消除）。
 	view, verr := scanAutoBackupRowView(db.DB.QueryRow(`SELECT `+autoBackupRowColumns+` FROM auto_backups WHERE id=?`, id))
 	if verr != nil {
+		// F63-B5b-2:留 warn(备份已落盘,视图扫描失败不再静默)
+		services.Logf("warn", "自动备份行视图扫描失败(备份已落盘): %v", verr)
 		return autoBackupRowView{}, nil
 	}
 	return view, nil

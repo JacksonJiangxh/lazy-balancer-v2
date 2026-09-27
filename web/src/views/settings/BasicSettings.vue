@@ -1163,9 +1163,13 @@ const githubProxyUrl = computed<string>({
 
 // 父级 Settings.vue 的 applyBasicKeys 仅合并其已知键，此键由本卡片自行拉取回填
 // （同 loadAdminTls 先例），保证整页刷新后已保存的非默认代理不回落为默认值
+// F63-B5b-3:补 seq 守卫(原无——慢响应晚到覆盖用户刚保存的新值)
+  let githubProxySeq = 0
 const loadGithubProxyUrl = async (): Promise<void> => {
+  const seq = ++githubProxySeq
   try {
     const res = await request.get<{ data?: { github_proxy_url?: string } }>('/config')
+    if (seq !== githubProxySeq) return // F63-B5b-3:竞态守卫
     settings.value.github_proxy_url = res.data?.github_proxy_url || DEFAULT_GITHUB_PROXY_URL
   } catch {
     // 拉取失败保持默认值，保存时仍会提交当前选择
@@ -1181,9 +1185,12 @@ const clearGithubToken = () => {
   githubTokenInput.value = ''
   githubTokenClearPending.value = true
 }
+let githubTokenSeq = 0
 const loadGithubTokenState = async (): Promise<void> => {
+  const seq = ++githubTokenSeq
   try {
     const res = await request.get<{ data?: { has_github_token?: boolean } }>('/config')
+    if (seq !== githubTokenSeq) return // F63-B5b-3:竞态守卫
     settings.value.has_github_token = res.data?.has_github_token ?? false
   } catch { /* 拉取失败按未配置展示，不影响保存语义 */ }
 }

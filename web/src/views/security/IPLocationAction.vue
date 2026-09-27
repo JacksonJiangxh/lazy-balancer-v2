@@ -442,7 +442,9 @@ const rowView = (policy: PolicyRow): RowView => {
     const regions: unknown = JSON.parse(policy.geoip_countries ?? '[]')
     if (Array.isArray(regions)) regionCount = regions.length
   } catch { /* 畸形按 0 处理 */ }
-  const geoActive = (policy.geoip_enabled ?? false) && regionCount > 0
+  // F63-B1-1:geoip_enabled 后端不下发(接口零处),恒 undefined→false;
+  // 改用 geoip_mode !== 'off' 判定(后端实际下发)
+  const geoActive = (policy.geoip_mode ?? 'off') !== 'off' && regionCount > 0
   view.geoActive = geoActive
   view.geoRegions = regionCount > 0 ? (JSON.parse(policy.geoip_countries ?? '[]') as string[]).join('、') : '' 
   if (!policy.ip_acl_enabled) {
