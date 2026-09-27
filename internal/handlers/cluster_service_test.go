@@ -456,18 +456,43 @@ func TestControlClusterNodeService_ignores_APIKey_readonly_annotation(t *testing
 // 经 ClusterServiceControlRequest.Operator → 从端 recordClusterServiceControlAuditBy
 // 落 audit_log.username,防旧主节点降级为「主节点」匿名的回归无护栏。
 func TestClusterServiceControlOperatorTransfer(t *testing.T) {
-	// 直接验证载荷构造:operator 空串→「主节点」回退;非空→透传
-	req := models.ClusterServiceControlRequest{
-		Action:   models.ClusterServiceActionStopCaddy,
-		Ticket:   "ticket-x",
-		Operator: "alice",
+	// F64 升级为端到端钉(原弱钉仅测字段零/非零——同义反复):
+	// ①验证 recordClusterServiceControlAuditBy 在 operator 非空时
+	//   将 operator 作为 audit username 落库
+	// ②operator 空串时回退「主节点」
+	h := newBackupTestHandlers(t)
+	_ = h // DB 初始化副作用
+	router := gin.New()
+	// 模拟从节点服务控制端点(票据校验失败路径——测试 operator 传递,
+	// 不需要真实票据)
+	router.POST("/cluster/service-control", func(c *gin.Context) {
+		var req models.ClusterServiceControlRequest
+		_ = c.ShouldBindJSON(&req)
+		recordClusterServiceControlAuditBy(c, req.Action, "测试结果", req.Operator)
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0})
+	})
+
+	// 用例 1: 非空 operator → audit username = operator
+	body := `{"action":"stop_caddy","ticket":"fake","operator":"alice"}`
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/cluster/service-control", strings.NewReader(body)))
+	var username string
+	if err := db.AuditDB.QueryRow("SELECT username FROM audit_log ORDER BY id DESC LIMIT 1").Scan(&username); err != nil {
+		t.Fatalf("read audit: %v", err)
 	}
-	if req.Operator != "alice" {
-		t.Fatalf("operator field not preserved: %q", req.Operator)
+	if username != "alice" {
+		t.Fatalf("audit username=%q, want %q (operator transfer broken)", username, "alice")
 	}
-	// 空 operator 兼容形态
-	req2 := models.ClusterServiceControlRequest{Action: "stop_caddy", Ticket: "t"}
-	if req2.Operator != "" {
-		t.Fatalf("empty operator should be zero value, got %q", req2.Operator)
+
+	// 用例 2: 空 operator → 回退「主节点」
+	body2 := `{"action":"stop_caddy","ticket":"fake"}`
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/cluster/service-control", strings.NewReader(body2)))
+	var username2 string
+	if err := db.AuditDB.QueryRow("SELECT username FROM audit_log ORDER BY id DESC LIMIT 1").Scan(&username2); err != nil {
+		t.Fatalf("read audit 2: %v", err)
+	}
+	if username2 != "主节点" {
+		t.Fatalf("audit username=%q, want %q (empty operator fallback broken)", username2, "主节点")
 	}
 }
