@@ -201,6 +201,15 @@ func (e *Engine) SetAsKind(id string, as Kind) {
 	}
 }
 
+// SetManualRun 补设手动触发语义（注册后批量标定）。
+func (e *Engine) SetManualRun(id string, ok bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if r, exist := e.regs[id]; exist {
+		r.desc.ManualRun = ok
+	}
+}
+
 // Unregister 摘除注册。
 func (e *Engine) Unregister(id string) {
 	e.mu.Lock()
