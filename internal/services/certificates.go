@@ -665,34 +665,91 @@ func (s *CertificateService) Start() {
 	defer manualTicker.Stop()
 	defer waitingCATicker.Stop()
 	defer reconcileTicker.Stop()
+	certSelfDriven := func() bool { return TaskEngine() == nil } // 引擎在场:四循环由引擎节拍驱动(单轮体 CertXxxOnce),原生 ticker 让位
 	for {
 		select {
 		case <-initialRenewal.C:
-			s.renewExpiringCertificates()
-		case <-renewalTicker.C:
-			s.renewExpiringCertificates()
-		case <-manualTicker.C:
-			s.checkManualCertExpiration()
-		case <-waitingCATicker.C:
-			s.requeueWaitingCAJobs()
-			// R45 发现1：滞行执行退出后任务停在 'queued' 且不在任何队列中，Resume
-			// 之外的巡检均不覆盖纯 'queued'；借 30s 节拍补扫重入队，滞停窗口收敛到
-			// 30s。只动 'queued'，不碰 waiting_ca 冷却语义。
-			if qm := GetCAQueueManager(); qm != nil {
-				qm.requeueStrandedQueuedJobs()
+			if certSelfDriven() {
+				s.renewExpiringCertificates()
 			}
-			// CL21-1(第 21 轮审计):部署重试链瞬时断裂(raw-error 断链点×3:
-			// 证书加载/确认/落库失败只记日志不重排)后任务停 'downloaded' 无
-			// timer,原自愈仅靠重启/Resume/Unblock。借 30s 节拍补扫,断链窗口
-			// 收敛到 30s;已持活跃 timer 的任务由 rescan 内守卫跳过。
-			s.rescanDroppedDeploymentRetries()
+		case <-renewalTicker.C:
+			if certSelfDriven() {
+				s.renewExpiringCertificates()
+			}
+		case <-manualTicker.C:
+			if certSelfDriven() {
+				s.checkManualCertExpiration()
+			}
+		case <-waitingCATicker.C:
+			// R45/CL21-1：滞留 queued 补扫 + 部署断链重排——引擎在场由
+			// CertWaitingCATickOnce 单轮体统一驱动（含全部补扫），原生分支让位。
+			if certSelfDriven() {
+				s.requeueWaitingCAJobs()
+				if qm := GetCAQueueManager(); qm != nil {
+					qm.requeueStrandedQueuedJobs()
+				}
+				s.rescanDroppedDeploymentRetries()
+			}
 		case <-reconcileTicker.C:
-			reconcileMissingCertFiles(db.DB)
-			sweepOrphanedCertJobs(s.ctx)
+			if certSelfDriven() {
+				reconcileMissingCertFiles(db.DB)
+				sweepOrphanedCertJobs(s.ctx)
+			}
 		case <-s.ctx.Done():
 			return
 		}
 	}
+}
+
+// activeCertService 当前证书服务实例（引擎单轮 tick 消费；lifecycle 启动时注入）。
+var activeCertService struct {
+	sync.Mutex
+	svc *CertificateService
+}
+
+// SetActiveCertificateService 注入活动实例（nil 清除）。
+func SetActiveCertificateService(svc *CertificateService) {
+	activeCertService.Lock()
+	defer activeCertService.Unlock()
+	activeCertService.svc = svc
+}
+
+func withActiveCertService(fn func(s *CertificateService)) {
+	activeCertService.Lock()
+	svc := activeCertService.svc
+	activeCertService.Unlock()
+	if svc != nil {
+		fn(svc)
+	}
+}
+
+// —— 引擎单轮 tick（certificates.go 四 ticker 的循环体；引擎接管节拍）——
+
+// CertRenewalScanOnce 续期扫描（临期证书入队）。
+func CertRenewalScanOnce() {
+	withActiveCertService(func(s *CertificateService) { s.renewExpiringCertificates() })
+}
+
+// CertManualCheckOnce 手动证书到期检查。
+func CertManualCheckOnce() {
+	withActiveCertService(func(s *CertificateService) { s.checkManualCertExpiration() })
+}
+
+// CertWaitingCATickOnce CA 等待/滞留补扫（30s 节拍）。
+func CertWaitingCATickOnce() {
+	withActiveCertService(func(s *CertificateService) {
+		s.requeueWaitingCAJobs()
+		if qm := GetCAQueueManager(); qm != nil {
+			qm.requeueStrandedQueuedJobs()
+		}
+		s.rescanDroppedDeploymentRetries()
+	})
+}
+
+// CertReconcileOnce 状态对账（缺失证书文件/孤儿任务清理）。
+func CertReconcileOnce() {
+	reconcileMissingCertFiles(db.DB)
+	sweepOrphanedCertJobs(context.Background())
 }
 
 // requeueWaitingCAJobs re-enqueues cert jobs parked in 'waiting_ca' once

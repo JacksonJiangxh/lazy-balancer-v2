@@ -53,9 +53,18 @@ type Descriptor struct {
 	Category    string
 	Kind        Kind
 
-	// 调度声明：IntervalFn 动态间隔（常驻/高频）；ScheduleSpec 排程槽
-	//（M3 接入三更新族时启用——引擎 tick 内计算到期）。二者均空=OnDemand。
+	// 调度声明（终态统一）：IntervalFn 动态间隔（常驻/高频/探测轮）；
+	// NextSlotFn 返回下一排程槽（排程族展示用——调度仍由探测轮体内
+	// due 逻辑驱动）。二者均空=OnDemand。
 	IntervalFn func() time.Duration
+	// NextSlotFn 下一排程槽（本地时区展示串；空=无）。
+	NextSlotFn func() string
+	// EnabledFn 调度开关（族配置：总闸/auto_update 等——引擎统一读取，
+	// 监控统一展示；nil=恒开）。
+	EnabledFn func() bool
+	// StatusFn 运行态镜像（更新族→manager 快照/队列族→业务表）；
+	// 返回空串=用引擎默认态。探针族在运行间隙返回空闲。
+	StatusFn func() string
 
 	Run                func(RunContext) error
 	CancelHook         func() bool // 可选：取消委托（如更新族 manager.CancelRunning——引擎内部 ctx 只覆盖单轮探测体）
@@ -489,4 +498,77 @@ func RecordRunFinish(runID int64, status string, durMs int64, message string) {
 		return
 	}
 	_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=datetime('now'), duration_ms=? WHERE id=?`, status, durMs, runID)
+}
+
+// TaskMeta 引擎注册面元数据（任务监控统一数据源）。
+type TaskMeta struct {
+	ID           string `json:"id"`
+	Family       string `json:"family"`
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	Category     string `json:"category"`
+	Kind         Kind   `json:"kind"`
+	IntervalSec  int    `json:"interval_sec"`  // IntervalFn 秒值（0=无固定间隔）
+	NextSlot     string `json:"next_slot"`     // NextSlotFn 结果（展示串）
+	Enabled      bool   `json:"enabled"`       // EnabledFn 结果（nil=恒开）
+	StatusMirror string `json:"status_mirror"` // StatusFn 结果（空=引擎默认态）
+	Controllable bool   `json:"controllable"`
+	Cancelable   bool   `json:"cancelable"`
+	LoopOn       bool   `json:"loop_on"` // 常驻循环当前启用态
+}
+
+// DescribeAll 导出全部注册任务元数据（含循环启停态）。
+func (e *Engine) DescribeAll() []TaskMeta {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]TaskMeta, 0, len(e.regs))
+	for id, r := range e.regs {
+		m := TaskMeta{ID: id, Family: r.desc.Family, Name: r.desc.Name,
+			Description: r.desc.Description, Category: r.desc.Category, Kind: r.desc.Kind,
+			Controllable: r.desc.Kind == KindContinuous, Cancelable: r.desc.Cancelable,
+			Enabled: true}
+		if r.desc.IntervalFn != nil {
+			m.IntervalSec = int(r.desc.IntervalFn().Seconds())
+		}
+		if r.desc.NextSlotFn != nil {
+			m.NextSlot = r.desc.NextSlotFn()
+		}
+		if r.desc.EnabledFn != nil {
+			m.Enabled = r.desc.EnabledFn()
+		}
+		if r.desc.StatusFn != nil {
+			m.StatusMirror = r.desc.StatusFn()
+		}
+		r.mu.Lock()
+		m.LoopOn = r.loopEnabled
+		r.mu.Unlock()
+		_ = id
+		out = append(out, m)
+	}
+	return out
+}
+
+// TaskRunsStats 24h 统计（成功/失败/总数）。
+type TaskRunsStats struct{ Runs, Success, Fail int }
+
+// Stats24h 按任务统计近 24h task_runs（真实执行）。
+func (e *Engine) Stats24h(taskID string) TaskRunsStats {
+	var st TaskRunsStats
+	if db.DB == nil {
+		return st
+	}
+	_ = db.DB.QueryRow(`SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0)
+		FROM task_runs WHERE task_id=? AND started_at > datetime(?, '-1 day')`, taskID, engineNowStr()).Scan(&st.Runs, &st.Success, &st.Fail)
+	return st
+}
+
+// LatestRun 最近一次真实运行。
+func (e *Engine) LatestRun(taskID string) *RunRecord {
+	runs := e.History(taskID, 1)
+	if len(runs) == 0 {
+		return nil
+	}
+	return &runs[0]
 }

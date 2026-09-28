@@ -17,6 +17,14 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
+func initTaskEngineForTest(t *testing.T) {
+	t.Helper()
+	if services.TaskEngine() == nil {
+		services.InitTaskEngine("", "")
+		t.Cleanup(func() { services.StopTaskEngine() })
+	}
+}
+
 func taskMonitorRouter() (*gin.Engine, *Handlers) {
 	gin.SetMode(gin.TestMode)
 	h := &Handlers{}
@@ -32,6 +40,7 @@ func taskMonitorRouter() (*gin.Engine, *Handlers) {
 // Then 聚合返回全部 8 个任务族，字段形状完整，threat 含三源摘要。
 func TestListSystemTasks_allFamiliesPresent(t *testing.T) {
 	newBackupTestHandlers(t)
+	initTaskEngineForTest(t)
 	r, _ := taskMonitorRouter()
 	resp := httptest.NewRecorder()
 	r.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/system/tasks", nil))
