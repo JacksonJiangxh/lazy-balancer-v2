@@ -208,6 +208,9 @@ const submitRegistration = async (): Promise<void> => {
 </script>
 
 <style scoped>
+.registration-warnings :deep(.el-alert__icon) {
+  font-size: 14px;
+}
 .registration-warnings {
   display: flex;
   flex-direction: column;
