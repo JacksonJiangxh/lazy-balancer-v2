@@ -29,6 +29,7 @@ func stubUpdateRetrySleep(t *testing.T) {
 // Given：fetchLatestTag 连续 2 次瞬断、第 3 次成功（且 tag 更新）。
 // When：执行一次更新。Then：任务内重试后成功（共 3 次尝试），版本推进。
 func TestCRSRun_inTaskRetry_succeedsAfterTransientFailures(t *testing.T) {
+	overrideWafDirForTest(t)
 	stubUpdateRetrySleep(t)
 	m := newTestCRSManager(t)
 	seedCRSVersionRow(t, "v4.14.0", true)
@@ -59,6 +60,7 @@ func TestCRSRun_inTaskRetry_succeedsAfterTransientFailures(t *testing.T) {
 // When：执行一次更新。Then：尝试 3 次后失败落定，next_update 保持排程槽
 // （失败退避不改写——下一运行=下一排程槽，非 now+1h）。
 func TestCRSRun_inTaskRetry_exhaustedKeepsScheduleSlot(t *testing.T) {
+	overrideWafDirForTest(t)
 	stubUpdateRetrySleep(t)
 	m := newTestCRSManager(t)
 	seedCRSVersionRow(t, "v4.14.0", true)
@@ -91,6 +93,7 @@ func TestCRSRun_inTaskRetry_exhaustedKeepsScheduleSlot(t *testing.T) {
 // When：schedulerTick 完成整个生命周期。Then：next_update 保持 tick 预写的
 // 排程槽（rearm 失败退避重写已撤除——用户裁定下次更新=真实排程触发时间）。
 func TestCRSSchedulerTick_failedRunKeepsScheduleSlot(t *testing.T) {
+	overrideWafDirForTest(t)
 	stubUpdateRetrySleep(t)
 	m := newTestCRSManager(t)
 	seedCRSVersionRow(t, "v4.14.0", true)
@@ -133,6 +136,7 @@ func TestCRSSchedulerTick_failedRunKeepsScheduleSlot(t *testing.T) {
 // Given：IP2Region fetchLatestTag 恒失败。When：执行一次更新。
 // Then：尝试 3 次后失败落定，next_update 保持排程槽。
 func TestIP2RegionRun_inTaskRetry_exhaustedKeepsScheduleSlot(t *testing.T) {
+	overrideWafDirForTest(t)
 	stubUpdateRetrySleep(t)
 	m := newTestIP2RegionManager(t)
 	seedIP2RegionVersionRow(t, "v3.17.0", true)
@@ -167,6 +171,7 @@ func TestIP2RegionRun_inTaskRetry_exhaustedKeepsScheduleSlot(t *testing.T) {
 // Given：威胁源下载前 2 次 500、第 3 次 200 返回合法名单。
 // When：更新该源。Then：任务内重试后成功（共 3 次请求）。
 func TestThreatUpdateOneSource_inTaskRetry_succeedsAfterTransientFailures(t *testing.T) {
+	overrideWafDirForTest(t)
 	stubUpdateRetrySleep(t)
 	newClusterTestService(t)
 
@@ -198,6 +203,7 @@ func TestThreatUpdateOneSource_inTaskRetry_succeedsAfterTransientFailures(t *tes
 
 // Given：威胁源失败落库。Then：next_update=下一排程槽（非失败退避点）。
 func TestThreatFailSource_nextUpdateIsScheduleSlot(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	want := threatNextSlot(time.Now().UTC())
 
@@ -215,6 +221,7 @@ func TestThreatFailSource_nextUpdateIsScheduleSlot(t *testing.T) {
 // Given：失败退避形态的 CRS 版本行。When：保存新排程。
 // Then：next_update 一律重排为新槽（失败行不再保留退避——退避机制已撤除）。
 func TestSetCRSSchedule_failedRowRearmedToSlot(t *testing.T) {
+	overrideWafDirForTest(t)
 	newTestCRSManager(t)
 	loc := useShanghaiLocation(t)
 	seedCRSVersionRow(t, "v4.14.0", true)
@@ -236,6 +243,7 @@ func TestSetCRSSchedule_failedRowRearmedToSlot(t *testing.T) {
 // Given：失败退避形态的威胁源。When：保存威胁库排程。
 // Then：全部启用源（含失败源）重排到新槽。
 func TestSetThreatSchedule_failedSourceRearmedToSlot(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	loc := useShanghaiLocation(t)
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='failed', next_update='2026-01-01 01:00:00' WHERE name='ustc'`); err != nil {

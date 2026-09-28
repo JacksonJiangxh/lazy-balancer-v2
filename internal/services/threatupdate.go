@@ -21,6 +21,13 @@ import (
 
 var wafDir = "/app/waf"
 
+// OverrideThreatWafDirForTest 测试注入临时 waf 目录（macOS 无 /app）。
+func OverrideThreatWafDirForTest(dir string) (restore func()) {
+	old := wafDir
+	wafDir = dir
+	return func() { wafDir = old }
+}
+
 // 威胁情报库（v2.3.2 名单化重构）：三个内置只读源（USTC/FireHOL level1/ET
 // Compromised）的单一顺序更新任务。内容落 security_ip_lists 的 system=1
 // 内置名单行（策略经 ip_acl_list_refs/ip_whitelist_refs 引用生效——
@@ -496,11 +503,11 @@ func writeThreatSystemList(source string, entries []string) (bool, error) {
 		Logf("warn", "威胁情报库: 内置名单 %q 已重建为新 id，原策略引用已失效，需重新绑定", name)
 		RecordAuditLog("system", "重建", "威胁情报库", fmt.Sprintf("内置名单 %s 重建为新 id，原策略引用已失效，需重新绑定", name), "")
 	} else {
-		if _, err := db.DB.Exec(`UPDATE security_ip_lists SET entries='', entry_count=?, updated_at=datetime('now') WHERE name=? AND system=1`, entryCount, name); err != nil {
+		if _, err := db.DB.Exec(`UPDATE security_ip_lists SET entries='', updated_at=datetime('now') WHERE name=? AND system=1`, name); err != nil {
 			return false, fmt.Errorf("更新内置名单元数据失败: %w", err)
 		}
 	}
-	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET content_hash=? WHERE name=?`, hash, source); err != nil {
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET content_hash=?, entry_count=? WHERE name=?`, hash, entryCount, source); err != nil {
 		return false, fmt.Errorf("写源哈希失败: %w", err)
 	}
 	return true, nil
@@ -589,6 +596,9 @@ func downloadAndParseThreatSource(source threatSourceRow) ([]string, string, err
 // writeThreatIplist 将威胁库条目写为 .iplist 纯文本文件（原子写）。
 // 格式：每行一个 IP/CIDR，供导出/调试/从节点编译。
 func writeThreatIplist(path string, entries []string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
 	content := strings.Join(entries, "\n") + "\n"
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
