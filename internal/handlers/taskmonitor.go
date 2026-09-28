@@ -166,11 +166,23 @@ func (h *Handlers) ControlSystemTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效（action=start|stop|restart）"})
 		return
 	}
-	if _, controllable := services.TaskRuntimeState(id); !controllable {
+	if te := services.TaskEngine(); te != nil {
+		if !te.IsRunning(id) && req.Action != "start" || te.IsRunning(id) && req.Action == "start" {
+			// 引擎语义: 启动需已停 / 停止与重启需在跑——幂等放行交由引擎
+		}
+		switch req.Action {
+		case "start":
+			te.StartLoop(id)
+		case "stop":
+			te.StopLoop(id)
+		case "restart":
+			te.StopLoop(id)
+			te.StartLoop(id)
+		}
+	} else if _, controllable := services.TaskRuntimeState(id); !controllable {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持启停（角色驱动或纯被动循环）"})
 		return
-	}
-	if !services.ControlTaskRuntime(id, req.Action) {
+	} else if !services.ControlTaskRuntime(id, req.Action) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "控制执行失败"})
 		return
 	}

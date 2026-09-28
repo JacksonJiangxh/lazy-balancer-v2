@@ -461,8 +461,14 @@ func nextAutoBackupSlot(now time.Time) (time.Time, bool) {
 	return due, ok
 }
 
-// continuousStatus 常驻任务真实运行态（有控制面用其状态，否则 running）。
+// continuousStatus 常驻任务真实运行态（M2：引擎优先，TaskRuntime 回退）。
 func continuousStatus(id string) TaskStatus {
+	if te := TaskEngine(); te != nil {
+		if te.IsRunning(id) {
+			return TaskStatusRunning
+		}
+		return TaskStatusIdle
+	}
 	if r, ok := TaskRuntimeState(id); ok {
 		if r {
 			return TaskStatusRunning
@@ -474,6 +480,9 @@ func continuousStatus(id string) TaskStatus {
 
 // scheduledRuntimeStatus 日清理类任务的运行态（调度循环在跑=running）。
 func scheduledRuntimeStatus(id string) TaskStatus {
+	if te := TaskEngine(); te != nil && te.IsRunning(id) {
+		return TaskStatusRunning
+	}
 	if r, ok := TaskRuntimeState(id); ok && r {
 		return TaskStatusRunning
 	}

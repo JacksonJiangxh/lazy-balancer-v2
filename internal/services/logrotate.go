@@ -180,6 +180,42 @@ func StartRuntimeLogCleanup(logFile string) {
 	StartRuntimeLogCleanupContext(context.Background(), logFile)
 }
 
+// RuntimeLogCleanupOnce 单轮过期日志清理（引擎每日节拍调用）。
+func RuntimeLogCleanupOnce(logFile string) {
+	months := 3
+	database := db.GetDB()
+	if database == nil {
+		return
+	}
+	if err := database.QueryRow("SELECT COALESCE(audit_retention_months,3) FROM global_config WHERE id=1").Scan(&months); err != nil || months < 1 {
+		months = 3
+	}
+	cutoff := time.Now().AddDate(0, -months, 0)
+
+	dir := filepath.Dir(logFile)
+	base := filepath.Base(logFile) + "."
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), base) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
+				Logf("error", "清理过期运行日志失败 %s: %v", e.Name(), err)
+			} else {
+				Logf("info", "已清理过期运行日志 %s", e.Name())
+			}
+		}
+	}
+}
+
 func StartRuntimeLogCleanupContext(ctx context.Context, logFile string) <-chan struct{} {
 	runtimeLogCleanup.Lock()
 	defer runtimeLogCleanup.Unlock()
@@ -191,40 +227,7 @@ func StartRuntimeLogCleanupContext(ctx context.Context, logFile string) <-chan s
 	done := make(chan struct{})
 	runtimeLogCleanup.cancel = cancel
 	runtimeLogCleanup.done = done
-	cleanup := func() {
-		months := 3
-		database := db.GetDB()
-		if database == nil {
-			return
-		}
-		if err := database.QueryRow("SELECT COALESCE(audit_retention_months,3) FROM global_config WHERE id=1").Scan(&months); err != nil || months < 1 {
-			months = 3
-		}
-		cutoff := time.Now().AddDate(0, -months, 0)
-
-		dir := filepath.Dir(logFile)
-		base := filepath.Base(logFile) + "."
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			return
-		}
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasPrefix(e.Name(), base) {
-				continue
-			}
-			info, err := e.Info()
-			if err != nil {
-				continue
-			}
-			if info.ModTime().Before(cutoff) {
-				if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
-					Logf("error", "清理过期运行日志失败 %s: %v", e.Name(), err)
-				} else {
-					Logf("info", "已清理过期运行日志 %s", e.Name())
-				}
-			}
-		}
-	}
+	cleanup := func() { RuntimeLogCleanupOnce(logFile) }
 
 	cleanup()
 	go func() {
