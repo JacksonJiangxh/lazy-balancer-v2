@@ -33,8 +33,9 @@ const (
 	TaskStatusCancelled TaskStatus = "cancelled"
 	TaskStatusDisabled  TaskStatus = "disabled"
 	TaskStatusQueued    TaskStatus = "queued"
-	TaskStatusPassive   TaskStatus = "passive" // 常驻无显式运行态（看门狗/清理）
+	TaskStatusPassive   TaskStatus = "passive" // 常驻无显式运行态（角色驱动/引擎外）
 	TaskStatusNoRuns    TaskStatus = "no_runs" // 从未运行
+	TaskStatusStopped   TaskStatus = "stopped" // 常驻可控循环已停止
 )
 
 // TaskInfo 是单任务族的聚合视图。
@@ -467,6 +468,9 @@ func continuousStatus(id string) TaskStatus {
 		if te.IsRunning(id) {
 			return TaskStatusRunning
 		}
+		if _, ctrl := TaskRuntimeState(id); ctrl || engineControllable(id) {
+			return TaskStatusStopped // 可控常驻停止（区别于空闲——可再启动）
+		}
 		return TaskStatusIdle
 	}
 	if r, ok := TaskRuntimeState(id); ok {
@@ -496,4 +500,17 @@ func collectCaddyAccessLogRotation() TaskInfo {
 	sizeMB := 100
 	_ = db.DB.QueryRow("SELECT COALESCE(caddy_log_size_mb,100) FROM global_config WHERE id=1").Scan(&sizeMB)
 	return TaskInfo{ID: "caddy-access-log-rotation", Name: "Caddy 访问日志轮转", Description: "由 Caddy 引擎内置执行（非面板进程任务）：访问日志超过大小上限即轮转，保留 5 份；上限在基础设置的 Caddy 日志大小中调整", Cadence: fmt.Sprintf("持续（超过 %d MB 轮转）", sizeMB), Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusPassive}
+}
+
+// engineControllable 引擎注册面是否提供该族启停控制。
+func engineControllable(id string) bool {
+	te := TaskEngine()
+	if te == nil {
+		return false
+	}
+	switch id {
+	case "config-watchdog", "security-events-ingestion", "log-cleanup":
+		return true
+	}
+	return false
 }

@@ -5,6 +5,7 @@ package taskengine
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -196,4 +197,38 @@ func TestEngine_HistoryRecordShape(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("应有一条 success 历史: %+v", e.History("t-hist", 1))
+}
+
+// Given SilentProbes/RecordFailuresOnly 任务各执行一次成功。
+// Then task_runs 零新增（探测与成功高频轮均静默——防 4.3 万行/天噪音回归）。
+func TestEngine_RecordPoliciesSilentOnSuccess(t *testing.T) {
+	e := newTestEngine(t)
+	e.Register(Descriptor{ID: "t-silent", Family: "t", Singleton: true, SilentProbes: true,
+		Run: func(rc RunContext) error { return nil }})
+	e.Register(Descriptor{ID: "t-failonly", Family: "t", Singleton: true, RecordFailuresOnly: true,
+		Run: func(rc RunContext) error { return nil }})
+	if err := e.Trigger("t-silent", "manual"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Trigger("t-failonly", "manual"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := len(e.History("t-silent", 10)) + len(e.History("t-failonly", 10)); got != 0 {
+		t.Fatalf("成功轮不应落库, got %d 行", got)
+	}
+	// 失败轮补一行
+	e.Register(Descriptor{ID: "t-failonly", Family: "t", Singleton: true, RecordFailuresOnly: true,
+		Run: func(rc RunContext) error { return errors.New("boom") }})
+	if err := e.Trigger("t-failonly", "manual"); err == nil {
+		t.Fatal("应返回错误")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if runs := e.History("t-failonly", 5); len(runs) == 1 && runs[0].Status == "failed" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("失败轮应留痕 1 行 failed: %+v", e.History("t-failonly", 5))
 }

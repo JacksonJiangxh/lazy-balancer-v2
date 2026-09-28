@@ -332,7 +332,9 @@ func (e *Engine) runNow(id, trigger string) error {
 	r.mu.Unlock()
 
 	runID := int64(0)
-	if !r.desc.SilentProbes {
+	// 落库策略：探测族(SilentProbes)与失败留痕族(RecordFailuresOnly)
+	// 不预插——后者仅非 success 终态时补插。
+	if !r.desc.SilentProbes && !r.desc.RecordFailuresOnly {
 		runID = globalInsertRun(id, r.desc.Family, trigger)
 	}
 	rc := RunContext{Ctx: ctx, Trigger: trigger, RunID: runID,
