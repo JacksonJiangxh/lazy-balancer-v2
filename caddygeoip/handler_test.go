@@ -148,7 +148,7 @@ func geoipTestNext(t *testing.T, captured **http.Request) caddyhttp.HandlerFunc 
 }
 
 // TestServeHTTP_stripsSpoofedGeoIPHeaders_evenWithoutXdb：防伪造+fail-closed——客户端
-// 伪造的 X-GeoIP-* 头必须在入口剥除（伪造 X-LB-GeoIP-Loc 可绕过 allow 模式地域
+// 伪造的 X-LB-GeoIP-* 头必须在入口剥除（伪造 X-LB-GeoIP-Loc 可绕过 allow 模式地域
 // 拦截或制造误拦）；xdb 缺失（searcher nil）时伪造值不得残留，且 X-LB-GeoIP-Loc
 // 由「海外」哨兵覆盖——缺失变量会让 coraza 地域规则恒不命中（fail-open），
 // 哨兵恢复 deny/allow 两模式的 fail-closed 语义。
@@ -195,7 +195,7 @@ func TestServeHTTP_stripsSpoofedGeoIPHeaders_evenWithoutXdb(t *testing.T) {
 	}
 }
 
-// TestServeHTTP_setsCorazaHeaders_forKnownIP：xdb 可用时 X-GeoIP-* 头镜像
+// TestServeHTTP_setsCorazaHeaders_forKnownIP：xdb 可用时 X-LB-GeoIP-* 头镜像
 // geoip.* 变量（国内 IP：Country=中国、Loc=省 或 省/市，与 Province/City 头
 // 同源组合）；伪造头先被剥除再以解析值覆盖。
 func TestServeHTTP_setsCorazaHeaders_forKnownIP(t *testing.T) {

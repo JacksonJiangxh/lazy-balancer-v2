@@ -542,7 +542,7 @@ function lbConfirm() {
   const mode = lbDialog.spec?.mode
   if (mode === 'reset-pwd') {
     if (!lbDialog.newPwd || lbDialog.newPwd.length < 8) { ElMessage.error('密码长度8-24位，仅限数字、大小写字母和特殊字符'); return }
-    if (lbDialog.newPwd.length > 24) { ElMessage.error('密码长度不能超过72位'); return }
+    if (lbDialog.newPwd.length > 24) { ElMessage.error('密码长度不能超过24位'); return }
     if (lbDialog.newPwd !== lbDialog.newPwd2) { ElMessage.error('两次输入的新密码不一致'); return }
   } else if (mode === 'mfa-code') {
     if (!validateMfaCodeInput(lbDialog.code)) { ElMessage.error('请输入验证码或恢复代码'); return }
