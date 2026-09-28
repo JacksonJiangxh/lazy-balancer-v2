@@ -207,15 +207,33 @@ func TestEngine_RecordPoliciesSilentOnSuccess(t *testing.T) {
 		Run: func(rc RunContext) error { return nil }})
 	e.Register(Descriptor{ID: "t-failonly", Family: "t", Singleton: true, RecordFailuresOnly: true,
 		Run: func(rc RunContext) error { return nil }})
-	if err := e.Trigger("t-silent", "manual"); err != nil {
+	// auto 触发(探测语义)静默;manual 恒落库(用户显式动作留痕)——v2.3.4 裁定
+	if err := e.runNow("t-silent", "auto"); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Trigger("t-failonly", "manual"); err != nil {
+	if err := e.runNow("t-failonly", "auto"); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(200 * time.Millisecond)
 	if got := len(e.History("t-silent", 10)) + len(e.History("t-failonly", 10)); got != 0 {
-		t.Fatalf("成功轮不应落库, got %d 行", got)
+		t.Fatalf("成功探测轮不应落库, got %d 行", got)
+	}
+	if got := len(e.History("t-silent", 10)); true {
+		_ = got
+	}
+	// manual 触发恒落库
+	if err := e.runNow("t-silent", "manual"); err != nil {
+		t.Fatal(err)
+	}
+	deadlineM := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadlineM) {
+		if runs := e.History("t-silent", 5); len(runs) >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := len(e.History("t-silent", 10)); got != 1 {
+		t.Fatalf("manual 应落 1 行, got %d", got)
 	}
 	// 失败轮补一行
 	e.Register(Descriptor{ID: "t-failonly", Family: "t", Singleton: true, RecordFailuresOnly: true,

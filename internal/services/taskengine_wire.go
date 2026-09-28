@@ -237,6 +237,13 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			return ""
 		},
 		Run: func(rc taskengine.RunContext) error {
+			if rc.Trigger == "manual" {
+				exec := currentAutoBackupExecutor()
+				if exec == nil {
+					return errors.New("备份执行器未就绪")
+				}
+				return exec("manual", "任务监控") // engine manual 恒落库——历史由引擎记
+			}
 			AutoBackupSchedulerTickOnce()
 			return nil
 		},
@@ -373,7 +380,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 
 	// 手动触发语义：更新族 Run 内含 manual 分支；清理/证书循环 Run 即单轮
 	// 工作；看门狗/摄取单轮检查；系统配置载入 manual=重渲染重应用。
-	for _, id := range []string{"threat", "crs", "ip2region", "log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca", "config-watchdog", "security-events-ingestion", "startup:config-load"} {
+	// 手动触发语义（仅定时性质族——常驻族无「立即执行」概念，启停即可）：
+	// 更新族 Run 内含 manual 分支；清理/证书循环 Run 即单轮工作；自动备份
+	// manual=直接执行一轮备份；系统配置载入 manual=重渲染重应用。
+	for _, id := range []string{"threat", "crs", "ip2region", "log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "auto-backup", "startup:config-load"} {
 		taskEngine.SetManualRun(id, true)
 	}
 
