@@ -11,6 +11,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"lazy-balancer-v2/internal/services"
@@ -38,10 +42,11 @@ type lbbakManifest struct {
 }
 
 const (
-	lbbakEntryManifest = "manifest.json"
-	lbbakEntryConfig   = "config.json"
-	lbbakEntryCRS      = "waf/crs.tar.gz"
-	lbbakEntryXdb      = "waf/ip2region.xdb"
+	lbbakEntryManifest     = "manifest.json"
+	lbbakEntryConfig       = "config.json"
+	lbbakEntryCRS          = "waf/crs.tar.gz"
+	lbbakEntryXdb          = "waf/ip2region.xdb"
+	lbbakEntryThreatPrefix = "threat/"
 )
 
 // buildLbbakPayload 组包:backupJSON 为已序列化的 V2 备份;bundle 为活动文件
@@ -56,6 +61,14 @@ func buildLbbakPayload(backupJSON []byte, bundle *services.WafFileBundle) ([]byt
 		}
 		if len(bundle.Xdb) > 0 {
 			entries[lbbakEntryXdb] = bundle.Xdb
+		}
+	}
+	// RDB: 威胁库 .iplist 源文件
+	if bundle != nil {
+		for _, tf := range bundle.ThreatFiles {
+			if data := services.ReadThreatIplistBySource(tf.Name); len(data) > 0 {
+				entries[lbbakEntryThreatPrefix+tf.Name+".iplist"] = data
+			}
 		}
 	}
 	manifest := lbbakManifest{Format: "lbbak", Checksum: map[string]string{}}
@@ -88,6 +101,23 @@ func buildLbbakPayload(backupJSON []byte, bundle *services.WafFileBundle) ([]byt
 			return nil, err
 		}
 	}
+	// RDB: 威胁库 .iplist 条目(源名排序保证产物确定性)
+	threatNames := make([]string, 0, len(entries))
+	for name := range entries {
+		if strings.HasPrefix(name, lbbakEntryThreatPrefix) {
+			threatNames = append(threatNames, name)
+		}
+	}
+	sort.Strings(threatNames)
+	for _, name := range threatNames {
+		data := entries[name]
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(data))}); err != nil {
+			return nil, err
+		}
+		if _, err := tw.Write(data); err != nil {
+			return nil, err
+		}
+	}
 	if err := tw.Close(); err != nil {
 		return nil, err
 	}
@@ -104,6 +134,8 @@ type lbbakPayload struct {
 	Xdb        []byte
 	CRSSha256  string
 	XdbSha256  string
+	// RDB 文件化：威胁库 .iplist 源文件（源名→内容）
+	ThreatIplists map[string][]byte
 }
 
 // 解压放大防护(BE-C1-1):请求体上限只约束压缩字节(48MB,gzip 最高 ~1032:1
@@ -185,6 +217,20 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 		payload.Xdb = data
 		payload.XdbSha256 = manifest.Checksum[lbbakEntryXdb]
 	}
+	// RDB: 提取威胁库 .iplist 源文件
+	for name, data := range entries {
+		if !strings.HasPrefix(name, lbbakEntryThreatPrefix) || !strings.HasSuffix(name, ".iplist") {
+			continue
+		}
+		source := strings.TrimSuffix(strings.TrimPrefix(name, lbbakEntryThreatPrefix), ".iplist")
+		if source == "" || strings.Contains(source, "/") {
+			return nil, fmt.Errorf("lbbak 威胁库条目名非法: %s", name)
+		}
+		if payload.ThreatIplists == nil {
+			payload.ThreatIplists = map[string][]byte{}
+		}
+		payload.ThreatIplists[source] = data
+	}
 	return payload, nil
 }
 
@@ -193,7 +239,7 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 // .version 伴生文件,破坏「文件与版本记录同批」不变量。
 // R39-13:落盘失败返回警告文本(调用方注入响应 warnings),不再仅审计静默。
 func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip2regionTag string) string {
-	if payload.CRSTarGz == nil && payload.Xdb == nil {
+	if payload.CRSTarGz == nil && payload.Xdb == nil && len(payload.ThreatIplists) == 0 {
 		return ""
 	}
 	bundle := &services.WafFileBundle{IP2RegionTag: ip2regionTag}
@@ -204,6 +250,26 @@ func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip
 	if payload.Xdb != nil {
 		bundle.IP2RegionSha = payload.XdbSha256
 		bundle.Xdb = payload.Xdb
+	}
+	// RDB: 威胁库 .iplist 落盘 + 编译 .fast（先于 CRS/Xdb 处理，失败仅警告不阻断）
+	for source, data := range payload.ThreatIplists {
+		iplistPath := filepath.Join(services.WafDir(), "threat-"+source+".iplist")
+		if err := os.MkdirAll(filepath.Dir(iplistPath), 0755); err != nil {
+			services.Logf("error", "lbbak 导入威胁库 %s: mkdir 失败: %v", source, err)
+			recordAudit(c, action+"警告", "配置备份", "威胁库 "+source+" 落盘失败: "+err.Error())
+			continue
+		}
+		if err := os.WriteFile(iplistPath, data, 0644); err != nil {
+			services.Logf("error", "lbbak 导入威胁库 %s: 写文件失败: %v", source, err)
+			recordAudit(c, action+"警告", "配置备份", "威胁库 "+source+" 落盘失败: "+err.Error())
+			continue
+		}
+		if err := services.CompileFromIplistFile(iplistPath); err != nil {
+			services.Logf("error", "lbbak 导入威胁库 %s: 编译 .fast 失败: %v", source, err)
+			recordAudit(c, action+"警告", "配置备份", "威胁库 "+source+" 编译失败: "+err.Error())
+			continue
+		}
+		services.AppendThreatUpdateLog("INFO", "success", "威胁库 "+source+" 已随备份导入(.iplist 落盘 + .fast 编译)")
 	}
 	if crsChanged, xdbChanged, err := services.ApplyWafFileBundle(bundle); err != nil {
 		services.Logf("error", "lbbak 导入落盘规则库文件失败: %v", err)

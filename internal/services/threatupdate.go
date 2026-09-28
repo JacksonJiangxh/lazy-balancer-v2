@@ -606,3 +606,6 @@ func writeThreatIplist(path string, entries []string) error {
 	}
 	return os.Rename(tmp, path)
 }
+
+// WafDir 返回 waf 目录路径（导入/导出用）。
+func WafDir() string { return wafDir }

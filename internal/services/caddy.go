@@ -998,7 +998,8 @@ func loadSecurityPolicyContext(store caddyConfigStore) (*securityPolicyContext, 
 	}
 	for ruleCaddyID, policyIDs := range rulePolicyIDs {
 		for _, policyID := range policyIDs {
-			if policy := policiesByID[policyID]; policy != nil {
+			if policy := policiesByID[policyID]; policy != nil && !policy.IPRefMissing {
+				// RDB 严格模式：IPRefMissing 策略（威胁库文件缺失）不参与渲染
 				ctx.policyByRule[ruleCaddyID] = append(ctx.policyByRule[ruleCaddyID], policy)
 			}
 		}

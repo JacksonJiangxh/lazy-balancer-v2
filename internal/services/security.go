@@ -1566,7 +1566,7 @@ func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entr
 			refIDs = append(refIDs, id)
 		}
 	}
-	listsByID, err := loadIPListEntriesVia(store, refIDs)
+	listsByID, _, err := loadIPListEntriesVia(store, refIDs)
 	if err != nil {
 		Logf("warn", "解析作用域排除引用的 IP 列表失败（策略 %q）: %v", p.Name, err)
 		listsByID = map[int64][]string{}

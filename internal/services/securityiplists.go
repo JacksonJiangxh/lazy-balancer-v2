@@ -149,15 +149,17 @@ func loadIPListEntries(store caddyConfigStore, ids []int64) map[int64][]string {
 // ids 为空或数据库未初始化时返回空映射；缺失的 id 不出现在结果中。
 // loadIPListEntriesVia：store 感知装载（审计 U1-F3）——store 非-nil（v2 导入
 // 事务视图）经其查询，nil 回退 db.DB。镜像 resolvePolicyIPListRefs 的回退逻辑。
-func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]string, error) {
+func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]string, map[int64]bool, error) {
 	if store == nil {
-		return LoadIPListEntriesByID(ids)
+		m, err := LoadIPListEntriesByID(ids)
+		return m, nil, err
 	}
 	// RDB 文件化：system=1（威胁库）条目读 .iplist 文件，system=0（自定义）
 	// 读 DB entries——查询加 system+source 列路由。
 	entries := make(map[int64][]string, len(ids))
+	failed := make(map[int64]bool) // RDB 严格模式：文件读取失败的列表 id
 	if len(ids) == 0 {
-		return entries, nil
+		return entries, failed, nil
 	}
 	var firstErr error
 	for start := 0; start < len(ids); start += ipListChunkSize {
@@ -177,6 +179,9 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 			if firstErr == nil {
 				firstErr = fmt.Errorf("store 查询 security_ip_lists: %w", err)
 			}
+			for _, id := range chunk {
+				failed[id] = true
+			}
 			continue
 		}
 		for rows.Next() {
@@ -191,7 +196,8 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 				// 威胁库：读 .iplist 文件（RDB 源文件）
 				vals, ferr := readThreatIplistEntries(name)
 				if ferr != nil {
-					Logf("error", "渲染: 威胁库 %q 文件读取失败: %v（引用该列表的策略将缺失条目）", name, ferr)
+					Logf("error", "渲染: 威胁库 %q 文件读取失败: %v（严格模式：引用该列表的策略将被跳过渲染）", name, ferr)
+					failed[id] = true
 					if firstErr == nil {
 						firstErr = ferr
 					}
@@ -216,9 +222,9 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 		rows.Close()
 	}
 	if firstErr != nil {
-		return entries, firstErr
+		return entries, failed, firstErr
 	}
-	return entries, nil
+	return entries, failed, nil
 }
 
 // readThreatIplistEntries 按列表名读 .iplist 文件条目（渲染层消费）。
@@ -260,7 +266,8 @@ func LoadIPListEntriesByID(ids []int64) (map[int64][]string, error) {
 	}
 	// SLB12-P3-6(第 12 轮审计):db 分支错误上抛(对齐 store 分支 V3-S1 契约)
 	// ——委托 loadIPListEntriesVia(分块+错误通道),不再吞错返回恒 nil error。
-	return loadIPListEntriesVia(db.DB, ids)
+	entries, _, err := loadIPListEntriesVia(db.DB, ids)
+	return entries, err
 }
 
 // resolvePolicyIPListRefs 在策略加载路径上完成引用解析：跨整个已加载批次收集
@@ -302,12 +309,35 @@ func resolvePolicyIPListRefs(policies []*models.SecurityPolicy, store caddyConfi
 	if effective == nil {
 		return
 	}
-	listsByID := loadIPListEntries(effective, refIDs)
-	if len(listsByID) == 0 {
+	listsByID, failedIDs, err := loadIPListEntriesVia(effective, refIDs)
+	if len(listsByID) == 0 && len(failedIDs) == 0 {
 		return
 	}
 	for _, p := range policies {
 		if p == nil {
+			continue
+		}
+		// RDB 严格模式：策略引用的任一列表装载失败（威胁库 .iplist 缺失）→
+		// 标记跳过渲染，绝不以空集静默收窄 ACL 保护面。
+		for _, id := range parseIPListRefs(p.IPACLListRefs) {
+			if failedIDs[id] {
+				p.IPRefMissing = true
+				Logf("error", "策略 %q 引用的威胁库列表(id=%d)装载失败——该策略将被跳过渲染", p.Name, id)
+				RecordAuditLog("system", "渲染跳过", "安全策略", fmt.Sprintf("策略 %q 引用的威胁库列表(id=%d)装载失败，已跳过该策略渲染: %v", p.Name, id, err), "")
+				break
+			}
+		}
+		if !p.IPRefMissing {
+			for _, id := range parseIPListRefs(p.IPWhitelistRefs) {
+				if failedIDs[id] {
+					p.IPRefMissing = true
+					Logf("error", "策略 %q 引用的威胁库列表(id=%d)装载失败——该策略将被跳过渲染", p.Name, id)
+					RecordAuditLog("system", "渲染跳过", "安全策略", fmt.Sprintf("策略 %q 引用的威胁库列表(id=%d)装载失败，已跳过该策略渲染: %v", p.Name, id, err), "")
+					break
+				}
+			}
+		}
+		if p.IPRefMissing {
 			continue
 		}
 		exp := expandPolicyIPRefs(p, listsByID)
@@ -337,4 +367,40 @@ func mergedWhitelist(p *models.SecurityPolicy) []string {
 	var list []string
 	json.Unmarshal(p.IPWhitelist, &list)
 	return aggregateIPEntries(list)
+}
+
+// ReadThreatIplistForUI 供 UI 预览调用：按列表名读 .iplist 文件条目。
+// 文件不存在返回空集（禁用/未更新源）。
+func ReadThreatIplistForUI(listName string) ([]string, error) {
+	source := threatSourceByListName(listName)
+	if source == "" {
+		return nil, nil // 非威胁库列表——调用方处理
+	}
+	path := filepath.Join(wafDir, "threat-"+source+".iplist")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var vals []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			vals = append(vals, line)
+		}
+	}
+	return vals, nil
+}
+
+// ReadThreatIplistBySource 按源名读 .iplist 原始内容（导出用）。
+func ReadThreatIplistBySource(source string) []byte {
+	if source == "" {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(wafDir, "threat-"+source+".iplist"))
+	if err != nil {
+		return nil
+	}
+	return data
 }
