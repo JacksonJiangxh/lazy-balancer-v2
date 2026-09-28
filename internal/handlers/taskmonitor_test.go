@@ -66,13 +66,13 @@ func TestListSystemTasks_allFamiliesPresent(t *testing.T) {
 	for _, tk := range payload.Data.Tasks {
 		got[tk.ID] = tk.Category
 	}
-	want := []string{"threat", "crs", "ip2region", "cert-queue", "auto-backup", "cluster-sync", "config-watchdog", "audit-retention"}
+	want := []string{"threat", "crs", "ip2region", "auto-backup", "cluster-sync", "config-watchdog", "audit-retention", "security-events-ingestion", "log-cleanup", "cert-renewal-scan", "startup:config-load"}
 	for _, id := range want {
 		if _, ok := got[id]; !ok {
 			t.Fatalf("任务族 %s 缺失; got=%v", id, got)
 		}
 	}
-	if got["threat"] != "安全防护" || got["cert-queue"] != "证书" {
+	if got["threat"] != "安全防护" || got["cert-renewal-scan"] != "证书" || got["startup:config-load"] != "触发" {
 		t.Fatalf("分类错配: %v", got)
 	}
 }

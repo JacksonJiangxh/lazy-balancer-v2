@@ -99,7 +99,7 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 	for _, m := range te.DescribeAll() {
 		ti := TaskInfo{
 			ID: m.ID, Name: m.Name, Description: m.Description,
-			Category: m.Category, Kind: TaskKind(m.Kind),
+			Category: m.Category, Kind: TaskKind(m.AsKind), // 性质口径（定时≠探测轮常驻）
 			Controllable: m.Controllable, Cancellable: m.Cancelable,
 			Enabled: m.Enabled, DetailHint: m.Family,
 		}
@@ -108,11 +108,13 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		} else if m.IntervalSec > 0 {
 			ti.Cadence = "每 " + humanInterval(m.IntervalSec)
 		}
-		// 状态：镜像优先 → 常驻循环态 → 最近运行终态
-		switch {
-		case m.StatusMirror != "":
+		// 状态按「任务性质」分流（探测轮循环态只对真常驻有意义）：
+		// · 镜像优先（manager 运行中/队列计数/角色）
+		// · 定时性质 → 最近真实运行终态（空闲/失败/运行中），循环态不外露
+		// · 常驻性质 → 引擎循环态（运行中/已停止）
+		if m.StatusMirror != "" {
 			ti.Status = TaskStatus(m.StatusMirror)
-		case m.Kind == taskengine.KindContinuous:
+		} else if m.AsKind == taskengine.KindContinuous {
 			if te.IsRunning(m.ID) {
 				ti.Status = TaskStatusRunning
 			} else if m.Controllable {
@@ -120,10 +122,15 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			} else {
 				ti.Status = TaskStatusPassive
 			}
-		default:
+		} else {
 			ti.Status = TaskStatusIdle
-			if lr := te.LatestRun(m.ID); lr != nil && lr.Status == "failed" {
-				ti.Status = TaskStatusFailed
+			if lr := te.LatestRun(m.ID); lr != nil {
+				switch lr.Status {
+				case "failed":
+					ti.Status = TaskStatusFailed
+				case "running":
+					ti.Status = TaskStatusRunning
+				}
 			}
 		}
 		if !m.Enabled && ti.Status == TaskStatusIdle {

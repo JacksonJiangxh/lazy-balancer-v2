@@ -74,6 +74,9 @@ type Descriptor struct {
 	Cancelable         bool
 	MasterOnly         bool // Trigger/排程仅主节点（Run 侧门）
 	RunsOn             Role // 循环角色门（默认 any）
+	// AsKind 任务性质（展示口径——区别于驱动节拍 Kind：排程族由引擎 1min
+	// 探测轮驱动但性质是「定时」而非「常驻」；空=同 Kind）。
+	AsKind Kind
 }
 
 // RunRecord task_runs 行视图。
@@ -183,6 +186,15 @@ func (e *Engine) Register(d Descriptor) error {
 	defer e.mu.Unlock()
 	e.regs[d.ID] = &registration{desc: d}
 	return nil
+}
+
+// SetAsKind 补设任务性质（注册后统一批量标定——绕开结构体字面量对齐问题）。
+func (e *Engine) SetAsKind(id string, as Kind) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if r, ok := e.regs[id]; ok {
+		r.desc.AsKind = as
+	}
 }
 
 // Unregister 摘除注册。
@@ -508,6 +520,7 @@ type TaskMeta struct {
 	Description  string `json:"description"`
 	Category     string `json:"category"`
 	Kind         Kind   `json:"kind"`
+	AsKind       Kind   `json:"as_kind"`       // 任务性质（展示口径；探测驱动≠常驻）
 	IntervalSec  int    `json:"interval_sec"`  // IntervalFn 秒值（0=无固定间隔）
 	NextSlot     string `json:"next_slot"`     // NextSlotFn 结果（展示串）
 	Enabled      bool   `json:"enabled"`       // EnabledFn 结果（nil=恒开）
@@ -523,10 +536,16 @@ func (e *Engine) DescribeAll() []TaskMeta {
 	defer e.mu.RUnlock()
 	out := make([]TaskMeta, 0, len(e.regs))
 	for id, r := range e.regs {
+		asKind := r.desc.AsKind
+		if asKind == "" {
+			asKind = r.desc.Kind
+		}
 		m := TaskMeta{ID: id, Family: r.desc.Family, Name: r.desc.Name,
 			Description: r.desc.Description, Category: r.desc.Category, Kind: r.desc.Kind,
-			Controllable: r.desc.Kind == KindContinuous, Cancelable: r.desc.Cancelable,
-			Enabled: true}
+			AsKind:       asKind,
+			Controllable: r.desc.AsKind == KindContinuous || (r.desc.AsKind == "" && r.desc.Kind == KindContinuous),
+			Cancelable:   r.desc.Cancelable,
+			Enabled:      true}
 		if r.desc.IntervalFn != nil {
 			m.IntervalSec = int(r.desc.IntervalFn().Seconds())
 		}
