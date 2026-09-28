@@ -722,6 +722,26 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 				return fmt.Errorf("写入威胁库源行: %w", err)
 			}
 		}
+		// F65:从节点威胁情报库同步日志(与 CRS/IP2Region 的 AppendCRSUpdateLog 同构)
+		if len(threatSources) > 0 {
+			threatEnabled := 0
+			entryTotal := 0
+			var sourceNames []string
+			for _, row := range threatSources {
+				if row["apply_enabled"] == 1 || row["apply_enabled"] == true {
+					threatEnabled++
+					entryTotal += int(toFloat64(row["entry_count"]))
+					if name, ok := row["display_name"].(string); ok && name != "" {
+						sourceNames = append(sourceNames, name)
+					}
+				}
+			}
+			if threatEnabled > 0 {
+				AppendThreatUpdateLog("INFO", "synced", fmt.Sprintf("从主节点同步威胁情报库（%d 个源启用，共 %d 条条目：%s）",
+					threatEnabled, entryTotal, strings.Join(sourceNames, "、")))
+			}
+		}
+
 	}
 	var policies []map[string]interface{}
 	if len(snapshot.SecurityPolicies) > 0 {
@@ -1180,4 +1200,19 @@ func snapshotSecurityVersionRowsDiffer(ctx context.Context, tx *sql.Tx, snapshot
 		}
 	}
 	return snapJSON(localCRS) != wantCRS || snapJSON(localIP2R) != wantIP2R
+}
+
+// toFloat64 将 map[string]interface{} 中的数值安全转为 float64(JSON 解析
+// 数字默认 float64;int 直转)。
+func toFloat64(v interface{}) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	default:
+		return 0
+	}
 }
