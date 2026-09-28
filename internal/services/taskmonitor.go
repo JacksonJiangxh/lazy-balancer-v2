@@ -41,7 +41,9 @@ const (
 type TaskInfo struct {
 	ID          string       `json:"id"`
 	Name        string       `json:"name"`
-	Category    string       `json:"category"` // 安全防护/证书/备份/集群/系统
+	Description string       `json:"description,omitempty"` // 任务作用说明（任务名 hover 提示）
+	Cadence     string       `json:"cadence,omitempty"`     // 运行节奏（如「每 6 小时」；非下次时间）
+	Category    string       `json:"category"`              // 安全防护/证书/备份/集群/系统
 	Kind        TaskKind     `json:"kind"`
 	Status      TaskStatus   `json:"status"`
 	Enabled     bool         `json:"enabled"`     // 自动调度开关
@@ -106,7 +108,7 @@ func taskRunFromCrsLayout(startedAt, finishedAt, trigger, result, message string
 
 // collectThreatTask 威胁情报库更新（任务级单条；源级明细在 message 汇总）。
 func collectThreatTask() TaskInfo {
-	ti := TaskInfo{ID: "threat", Name: "威胁情报库更新", Category: "安全防护", Kind: TaskKindScheduled, DetailHint: "threat"}
+	ti := TaskInfo{ID: "threat", Name: "威胁情报库更新", Description: "每日从 USTC/FireHOL/ET 三源下载恶意 IP 名单，聚合去重后写入威胁库文件并同步从节点——引用名单的安全策略据此拦截", Cadence: "排程槽（可配置星期/时刻）", Category: "安全防护", Kind: TaskKindScheduled, DetailHint: "threat"}
 	// 源级汇总（展示名/条数/状态）
 	type srcRow struct {
 		name, display, status string
@@ -179,7 +181,7 @@ func earliestThreatNextUpdate() string {
 
 // collectCRSTask CRS 规则库更新。
 func collectCRSTask() TaskInfo {
-	ti := TaskInfo{ID: "crs", Name: "CRS 规则库更新", Category: "安全防护", Kind: TaskKindScheduled, DetailHint: "crs"}
+	ti := TaskInfo{ID: "crs", Name: "CRS 规则库更新", Description: "检查并更新 OWASP CoreRuleSet 规则集到最新版本（保留用户 overrides），供 WAF 拦截模式消费", Cadence: "排程槽（可配置）", Category: "安全防护", Kind: TaskKindScheduled, DetailHint: "crs"}
 	var enabled int
 	var next string
 	if err := db.DB.QueryRow("SELECT COALESCE(auto_update,1), COALESCE(next_update,'') FROM security_crs_version WHERE id=1").Scan(&enabled, &next); err != nil {
@@ -212,7 +214,7 @@ func collectCRSTask() TaskInfo {
 
 // collectIP2RegionTask IP2Region 地理库更新。
 func collectIP2RegionTask() TaskInfo {
-	ti := TaskInfo{ID: "ip2region", Name: "IP2Region 地理库更新", Category: "安全防护", Kind: TaskKindScheduled, DetailHint: "ip2region"}
+	ti := TaskInfo{ID: "ip2region", Name: "IP2Region 地理库更新", Description: "更新 IP 地理位置离线库（xdb），供 GeoIP 地域拦截与归属地展示使用", Cadence: "排程槽（可配置）", Category: "安全防护", Kind: TaskKindScheduled, DetailHint: "ip2region"}
 	var enabled int
 	var status, message, finished, next string
 	err := db.DB.QueryRow(`SELECT COALESCE(auto_update,1), COALESCE(update_status,''), COALESCE(message,''), COALESCE(finished_at,''), COALESCE(next_update,'') FROM security_ip2region_version WHERE id=1`).Scan(&enabled, &status, &message, &finished, &next)
@@ -242,7 +244,7 @@ func collectIP2RegionTask() TaskInfo {
 // 动作的 job 各一行——每证书/规则一个任务，非聚合黑箱）+ 四个内部调度循环。
 func collectCertTasks() []TaskInfo {
 	var out []TaskInfo
-	summary := TaskInfo{ID: "cert-queue", Name: "ACME 证书任务队列", Category: "证书", Kind: TaskKindQueue, Enabled: true, Status: TaskStatusIdle, DetailHint: "certificates"}
+	summary := TaskInfo{ID: "cert-queue", Name: "ACME 证书任务队列", Description: "ACME 签发/续签任务的处理引擎：按证书配置入队，DNS 挑战、验证、签发、部署全流程状态机", Cadence: "按需入队", Category: "证书", Kind: TaskKindQueue, Enabled: true, Status: TaskStatusIdle, DetailHint: "certificates"}
 	var queued, running, failed, issued int
 	if err := db.DB.QueryRow(`SELECT
 		(SELECT COUNT(*) FROM cert_jobs WHERE status IN ('queued','pending')),
@@ -279,12 +281,13 @@ func collectCertTasks() []TaskInfo {
 			}
 			trigger, startedAt, finishedAt := "auto", createdAt, updatedAt
 			ti := TaskInfo{
-				ID:       fmt.Sprintf("cert-job:%d", id),
-				Name:     "ACME · " + domain,
-				Category: "证书",
-				Kind:     TaskKindQueue,
-				Enabled:  true,
-				Status:   TaskStatusIdle,
+				ID:          fmt.Sprintf("cert-job:%d", id),
+				Name:        "ACME · " + domain,
+				Description: "单证书签发/续签任务（规则 " + ruleID + "，阶段 " + status + "）",
+				Category:    "证书",
+				Kind:        TaskKindQueue,
+				Enabled:     true,
+				Status:      TaskStatusIdle,
 			}
 			switch status {
 			case "failed":
@@ -313,10 +316,10 @@ func collectCertTasks() []TaskInfo {
 
 	// 证书族内部调度循环（certificates.go 四 ticker——无 DB 状态面，常驻展示）
 	out = append(out,
-		TaskInfo{ID: "cert-renewal-scan", Name: "证书续期扫描", Category: "证书", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, NextRunAt: "每 6 小时"},
-		TaskInfo{ID: "cert-reconcile", Name: "证书状态对账", Category: "证书", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, NextRunAt: "每 6 小时"},
-		TaskInfo{ID: "cert-manual-poll", Name: "手动证书任务轮询", Category: "证书", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, NextRunAt: "每 10 分钟"},
-		TaskInfo{ID: "cert-waiting-ca", Name: "CA 等待轮询", Category: "证书", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, NextRunAt: "每 30 秒"},
+		TaskInfo{ID: "cert-renewal-scan", Name: "证书续期扫描", Description: "扫描全部证书配置的到期时间，临期证书自动入队续签", Cadence: "每 6 小时", Category: "证书", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive},
+		TaskInfo{ID: "cert-reconcile", Name: "证书状态对账", Description: "核对证书文件与数据库状态一致性，修复中断任务残留的中间态", Cadence: "每 6 小时", Category: "证书", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive},
+		TaskInfo{ID: "cert-manual-poll", Name: "手动证书任务轮询", Description: "处理手工触发或重试的证书任务", Cadence: "每 10 分钟", Category: "证书", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive},
+		TaskInfo{ID: "cert-waiting-ca", Name: "CA 等待轮询", Description: "轮询等待 CA 完成验证/签发的异步订单（LE/ZeroSSL 等）", Cadence: "每 30 秒", Category: "证书", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive},
 	)
 	return out
 }
@@ -330,7 +333,7 @@ func orDefault(v, def string) string {
 
 // collectAutoBackupTask 自动备份。
 func collectAutoBackupTask() TaskInfo {
-	ti := TaskInfo{ID: "auto-backup", Name: "自动备份", Category: "备份", Kind: TaskKindScheduled, Enabled: true, DetailHint: "backup"}
+	ti := TaskInfo{ID: "auto-backup", Name: "自动备份", Description: "按排程把全量配置打包为 lbbak 落盘 backup 目录（含 CRS/IP2Region/威胁库数据文件），保留份数自动清理", Cadence: "按备份排程（日/周/月）", Category: "备份", Kind: TaskKindScheduled, Enabled: true, DetailHint: "backup"}
 	var filename, status, trigger, created string
 	var size int64
 	row := db.DB.QueryRow(`SELECT filename, status, trigger_type, COALESCE(created_at,''), COALESCE(size_bytes,0) FROM auto_backups ORDER BY id DESC LIMIT 1`)
@@ -354,7 +357,7 @@ func collectAutoBackupTask() TaskInfo {
 
 // collectClusterSyncTask 集群同步（从节点常驻循环；主节点为签发方）。
 func collectClusterSyncTask() TaskInfo {
-	ti := TaskInfo{ID: "cluster-sync", Name: "集群同步（主节点签发）", Category: "集群", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusPassive, DetailHint: "cluster"}
+	ti := TaskInfo{ID: "cluster-sync", Name: "集群同步（主节点签发）", Description: "主节点向从节点签发配置快照与规则库数据（CRS/IP2Region/威胁库 .fast）", Category: "集群", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusPassive, DetailHint: "cluster"}
 	var isMaster int
 	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
 		ti.Status = TaskStatusNoRuns
@@ -364,6 +367,8 @@ func collectClusterSyncTask() TaskInfo {
 		return ti
 	}
 	ti.Name = "集群同步（从节点回放）"
+	ti.Description = "从节点按同步间隔轮询主节点快照，增量回放数据库与规则库数据"
+	ti.Cadence = "按同步间隔设置"
 	ti.Status = TaskStatusRunning // 常驻循环按间隔轮询视为运行中
 	// 最近一次实际应用（304 短路不刷新——last_sync 只记全量应用）
 	var applied, clusterVer int
@@ -387,17 +392,15 @@ func collectClusterSyncTask() TaskInfo {
 
 // collectWatchdogTask 配置漂移看门狗（60s 常驻）。
 func collectWatchdogTask() TaskInfo {
-	return TaskInfo{ID: "config-watchdog", Name: "配置漂移看门狗", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusPassive, DetailHint: "watchdog"}
+	return TaskInfo{ID: "config-watchdog", Name: "配置漂移看门狗", Description: "每 60 秒比对运行中 Caddy 配置与数据库期望配置，漂移时面板横幅告警并触发对账", Cadence: "每 60 秒", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusPassive, DetailHint: "watchdog"}
 }
 
 // collectAuditRetentionTask 审计日志保留清理。
 func collectAuditRetentionTask() TaskInfo {
-	ti := TaskInfo{ID: "audit-retention", Name: "审计日志保留清理", Category: "系统", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, DetailHint: "audit"}
+	ti := TaskInfo{ID: "audit-retention", Name: "审计日志保留清理", Description: "按「审计保留月数」配置删除 audit 库过期操作日志（基础设置可调）", Cadence: "每日", Category: "系统", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, DetailHint: "audit"}
 	var months int
-	if err := db.DB.QueryRow("SELECT COALESCE(audit_retention_months,3) FROM global_config WHERE id=1").Scan(&months); err == nil {
-		if months > 0 {
-			ti.NextRunAt = "每日 03:00（保留 " + fmt.Sprint(months) + " 个月）"
-		}
+	if err := db.DB.QueryRow("SELECT COALESCE(audit_retention_months,3) FROM global_config WHERE id=1").Scan(&months); err == nil && months > 0 {
+		ti.Cadence = fmt.Sprintf("每日（保留 %d 个月）", months)
 	}
 	return ti
 }
@@ -405,21 +408,21 @@ func collectAuditRetentionTask() TaskInfo {
 // collectSecurityEventsIngestion 安全事件采集（coraza audit 尾读摄取+轮转，
 // 2s tick——安全总览/事件页数据源）。
 func collectSecurityEventsIngestion() TaskInfo {
-	return TaskInfo{ID: "security-events-ingestion", Name: "安全事件采集", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusRunning, NextRunAt: "每 2 秒", DetailHint: "security-events"}
+	return TaskInfo{ID: "security-events-ingestion", Name: "安全事件采集", Description: "尾读 coraza WAF 审计日志并摄取为安全事件（安全总览/事件页的数据源），含审计日志轮转跟随", Cadence: "每 2 秒", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusRunning, DetailHint: "security-events"}
 }
 
 // collectLogRotateTask 运行日志尺寸轮转（30s 检查 + 超限 copytruncate）。
 func collectLogRotateTask() TaskInfo {
-	return TaskInfo{ID: "log-rotate", Name: "运行日志尺寸轮转", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusRunning, NextRunAt: "每 30 秒"}
+	return TaskInfo{ID: "log-rotate", Name: "运行日志尺寸轮转", Description: "按「日志大小上限」设置检查应用运行日志，超限即轮转（copytruncate，不丢正在写入的行）", Cadence: "每 30 秒", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusRunning}
 }
 
 // collectLogCleanupTask 旧日志文件清理（每日——logrotate 保留窗清理）。
 func collectLogCleanupTask() TaskInfo {
-	return TaskInfo{ID: "log-cleanup", Name: "旧日志文件清理", Category: "系统", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, NextRunAt: "每日"}
+	return TaskInfo{ID: "log-cleanup", Name: "运行日志轮转副本清理", Description: "删除超过保留期（与审计保留月数同配置）的应用日志轮转副本（app.log.*）——Caddy 访问日志与安全事件/审计库的清理由各自独立任务负责", Cadence: "每日", Category: "系统", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive}
 }
 
 // collectSecurityEventsRetention 安全事件保留清理（每日——security_events
 // 保留期清理）。
 func collectSecurityEventsRetention() TaskInfo {
-	return TaskInfo{ID: "security-events-retention", Name: "安全事件保留清理", Category: "系统", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, NextRunAt: "每日", DetailHint: "security-events"}
+	return TaskInfo{ID: "security-events-retention", Name: "安全事件保留清理", Description: "按保留期配置删除 metrics 库中过期的安全事件记录", Cadence: "每日", Category: "系统", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, DetailHint: "security-events"}
 }
