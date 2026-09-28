@@ -24,6 +24,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	if taskEngine != nil {
 		return taskEngine
 	}
+	taskengine.SetLocation(CurrentLocation()) // 引擎时间遵循基础设置时区
 	taskEngine = taskengine.NewEngine(taskengine.Options{})
 	_ = taskEngine.RecoverOrphans()
 

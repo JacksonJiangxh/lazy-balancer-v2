@@ -303,7 +303,7 @@ func (e *Engine) History(id string, limit int) []RunRecord {
 
 // RecoverOrphans 崩溃恢复：把残留 running 行改标 interrupted，返回行数。
 func (e *Engine) RecoverOrphans() int64 {
-	res, err := db.DB.Exec(`UPDATE task_runs SET status='interrupted', finished_at=datetime('now'), message=COALESCE(message,'')||'（进程重启回收）' WHERE status='running'`)
+	res, err := db.DB.Exec(`UPDATE task_runs SET status='interrupted', finished_at=?, message=COALESCE(message,'')||'（进程重启回收）' WHERE status='running'`, engineNowStr())
 	if err != nil {
 		return 0
 	}
@@ -383,7 +383,7 @@ func globalInsertRun(taskID, family, trigger string) int64 {
 	if db.DB == nil {
 		return 0
 	}
-	res, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, trigger, status) VALUES (?,?,?,'running')`, taskID, family, trigger)
+	res, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, trigger, status, started_at) VALUES (?,?,?,'running',?)`, taskID, family, trigger, engineNowStr())
 	if err != nil {
 		return 0
 	}
@@ -458,6 +458,19 @@ func (e *Engine) roleAllows(role Role) bool {
 }
 
 var _ = fmt.Sprintf // 保留 fmt（M3 排程槽使用）
+
+// location 引擎写库时区（配置时区——services 启动/变更时 SetLocation 注入；
+// 未注入回退本地）。所有 task_runs 时间字符串按此时区格式化。
+var engineLoc = time.Local
+
+// SetLocation 注入配置时区（基础设置 timezone 项）。
+func SetLocation(loc *time.Location) {
+	if loc != nil {
+		engineLoc = loc
+	}
+}
+
+func engineNowStr() string { return time.Now().In(engineLoc).Format("2006-01-02 15:04:05") }
 
 // RecordRunStart 族侧真实运行开跑落库（返回 run ID；0=跳过）。
 // 引擎探测 SilentProbes 的族（更新族等），真实任务体由族 manager 在

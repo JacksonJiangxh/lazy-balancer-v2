@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"lazy-balancer-v2/internal/taskengine"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -100,6 +101,7 @@ func ConfigureLocation(name string) (*time.Location, error) {
 	if err != nil {
 		return nil, err
 	}
+	taskengine.SetLocation(loc) // 任务引擎时间遵循配置时区（启动+设置变更双路径）
 	currentLocation.Store(loc)
 	return loc, nil
 }
