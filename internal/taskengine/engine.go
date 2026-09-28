@@ -57,13 +57,14 @@ type Descriptor struct {
 	//（M3 接入三更新族时启用——引擎 tick 内计算到期）。二者均空=OnDemand。
 	IntervalFn func() time.Duration
 
-	Run          func(RunContext) error
-	CancelHook   func() bool // 可选：取消委托（如更新族 manager.CancelRunning——引擎内部 ctx 只覆盖单轮探测体）
-	SilentProbes bool        // 探测型 Run（如 1min due 探测）不落 task_runs——真实运行由族侧 RecordRun 记录
-	Singleton    bool
-	Cancelable   bool
-	MasterOnly   bool // Trigger/排程仅主节点（Run 侧门）
-	RunsOn       Role // 循环角色门（默认 any）
+	Run                func(RunContext) error
+	CancelHook         func() bool // 可选：取消委托（如更新族 manager.CancelRunning——引擎内部 ctx 只覆盖单轮探测体）
+	SilentProbes       bool        // 探测型 Run（如 1min due 探测）不落 task_runs——真实运行由族侧 RecordRun 记录
+	RecordFailuresOnly bool        // 高频真实工作轮（摄取/看门狗）：成功静默，仅失败/取消留痕
+	Singleton          bool
+	Cancelable         bool
+	MasterOnly         bool // Trigger/排程仅主节点（Run 侧门）
+	RunsOn             Role // 循环角色门（默认 any）
 }
 
 // RunRecord task_runs 行视图。
@@ -350,6 +351,11 @@ func (e *Engine) runNow(id, trigger string) error {
 	runErr := r.desc.Run(rc)
 	status := terminalStatus(ctx, runErr)
 	dur := time.Since(start).Milliseconds()
+	// 高频工作轮失败才补落库（成功轮静默——2s 摄取/60s 看门狗每轮落库
+	// 即每天 4.3 万/1440 行噪音）
+	if runID == 0 && r.desc.RecordFailuresOnly && status != "success" {
+		runID = globalInsertRun(id, r.desc.Family, trigger)
+	}
 
 	r.mu.Lock()
 	r.running = false

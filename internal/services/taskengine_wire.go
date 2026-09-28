@@ -30,13 +30,14 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// 看门狗：60s 单轮一致性检查（引擎节拍；原生自循环进程不再启动）
 	watchdogAdminURLValue = watchdogAdminURL
 	taskEngine.Register(taskengine.Descriptor{
-		ID:          "config-watchdog",
-		Family:      "system",
-		Name:        "配置漂移看门狗",
-		Description: "每 60 秒比对运行中 Caddy 配置与数据库期望配置，漂移时面板横幅告警并触发对账",
-		Category:    "系统",
-		Kind:        taskengine.KindContinuous,
-		IntervalFn:  func() time.Duration { return 60 * time.Second },
+		ID:                 "config-watchdog",
+		Family:             "system",
+		Name:               "配置漂移看门狗",
+		Description:        "每 60 秒比对运行中 Caddy 配置与数据库期望配置，漂移时面板横幅告警并触发对账",
+		Category:           "系统",
+		Kind:               taskengine.KindContinuous,
+		RecordFailuresOnly: true,
+		IntervalFn:         func() time.Duration { return 60 * time.Second },
 		Run: func(rc taskengine.RunContext) error {
 			WatchdogCheckOnce()
 			return nil
@@ -45,13 +46,14 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 
 	// 安全事件摄取：2s 单轮（先采集后轮转——tailer 跨轮复用保 offset 连续）
 	taskEngine.Register(taskengine.Descriptor{
-		ID:          "security-events-ingestion",
-		Family:      "system",
-		Name:        "安全事件采集",
-		Description: "尾读 coraza WAF 审计日志并摄取为安全事件（安全总览/事件页的数据源），含审计日志轮转跟随",
-		Category:    "系统",
-		Kind:        taskengine.KindContinuous,
-		IntervalFn:  func() time.Duration { return 2 * time.Second },
+		ID:                 "security-events-ingestion",
+		Family:             "system",
+		Name:               "安全事件采集",
+		Description:        "尾读 coraza WAF 审计日志并摄取为安全事件（安全总览/事件页的数据源），含审计日志轮转跟随",
+		Category:           "系统",
+		Kind:               taskengine.KindContinuous,
+		RecordFailuresOnly: true,
+		IntervalFn:         func() time.Duration { return 2 * time.Second },
 		Run: func(rc taskengine.RunContext) error {
 			SecurityEventsPollOnce()
 			return nil
