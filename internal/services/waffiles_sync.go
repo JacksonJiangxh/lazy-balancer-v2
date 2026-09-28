@@ -186,30 +186,30 @@ func wafFilesRefMatchesBundle(r *models.ClusterWafFilesRef, b *WafFileBundle) bo
 // what is already live. It is idempotent: matching content is a no-op, so a
 // re-sync without rule changes costs only a hash comparison. Per-component
 // changed flags let callers report exactly which dataset was updated.
-func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged bool, err error) {
+func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatChanged bool, err error) {
 	if bundle == nil {
-		return false, false, nil
+		return false, false, false, nil
 	}
 	// CL40-C1-1:反向防御——声明哈希非空但未携带内容(主端瞬态 IO 读失败
 	// 时 BuildWafFileBundle 会产出该形状):从端应用「无操作」后漂移判定
 	// 永不收敛,必须拒绝(主端恢复后下轮同步自愈)。
 	if bundle.CRSSha256 != "" && len(bundle.CRSTarGz) == 0 {
-		return crsChanged, xdbChanged, errors.New("同步包声明 CRS 哈希非空但未携带内容，拒绝应用该同步包")
+		return crsChanged, xdbChanged, threatChanged, errors.New("同步包声明 CRS 哈希非空但未携带内容，拒绝应用该同步包")
 	}
 	if bundle.IP2RegionSha != "" && len(bundle.Xdb) == 0 {
-		return crsChanged, xdbChanged, errors.New("同步包声明 IP2Region 哈希非空但未携带内容，拒绝应用该同步包")
+		return crsChanged, xdbChanged, threatChanged, errors.New("同步包声明 IP2Region 哈希非空但未携带内容，拒绝应用该同步包")
 	}
 	if len(bundle.CRSTarGz) > 0 {
 		// 声明哈希为空但携带内容：合法主节点 BuildWafFileBundle 恒成对设置，
 		// 仅恶意/损坏主节点可构造——与 xdb 侧同纵深防御；untarGzTo 在
 		// expectSum=="" 时跳过整树哈希校验，必须拒绝而非裸写未验证字节。
 		if bundle.CRSSha256 == "" {
-			return crsChanged, xdbChanged, errors.New("同步 CRS规则库缺少声明哈希，已拒绝落盘")
+			return crsChanged, xdbChanged, threatChanged, errors.New("同步 CRS规则库缺少声明哈希，已拒绝落盘")
 		}
 		liveSum, liveErr := tarGzDirSum(crsLiveDir)
 		if liveErr != nil || liveSum != bundle.CRSSha256 {
 			if err := untarGzTo(bundle.CRSTarGz, crsLiveDir, bundle.CRSSha256); err != nil {
-				return crsChanged, xdbChanged, fmt.Errorf("写入同步 CRS 规则文件: %w", err)
+				return crsChanged, xdbChanged, threatChanged, fmt.Errorf("写入同步 CRS 规则文件: %w", err)
 			}
 			// VERSION 随 tar 包以原始字节落盘（R46-E1）：不得以 TrimSpace 后的
 			// bundle.CRSVersion 覆写——上游发布包的 VERSION 自带尾换行，主端
@@ -223,31 +223,31 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged bool, err
 		// 仅恶意/损坏主节点可构造——与 CRS 侧 F-3 同纵深防御，拒绝整包而非
 		// 裸写原始字节。
 		if bundle.IP2RegionSha == "" {
-			return crsChanged, xdbChanged, errors.New("同步 IP2Region数据库缺少声明哈希，已拒绝落盘")
+			return crsChanged, xdbChanged, threatChanged, errors.New("同步 IP2Region数据库缺少声明哈希，已拒绝落盘")
 		}
 		liveSum := fileSha256(ip2regionLivePath)
 		// R57 A-#4：xdb 未变化也要校验/补写 .version——.version 丢失或写失败
 		// 会让本地 ref 的 tag 为空，wafFilesDrifted 每轮误判漂移且全量重拉
 		// 走不到本分支的自愈（重拉时 sha 相同），从节点永久假警报。
 		if tagErr := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", bundle.IP2RegionTag); tagErr != nil {
-			return crsChanged, xdbChanged, fmt.Errorf("写入同步 IP2Region数据库版本标记: %w", tagErr)
+			return crsChanged, xdbChanged, threatChanged, fmt.Errorf("写入同步 IP2Region数据库版本标记: %w", tagErr)
 		}
 		if liveSum != bundle.IP2RegionSha {
 			sum := sha256.Sum256(bundle.Xdb)
 			if got := hex.EncodeToString(sum[:]); got != bundle.IP2RegionSha {
-				return crsChanged, xdbChanged, fmt.Errorf("同步 IP2Region数据库哈希不匹配（声明 %s，实际 %s），已拒绝落盘", bundle.IP2RegionSha, got)
+				return crsChanged, xdbChanged, threatChanged, fmt.Errorf("同步 IP2Region数据库哈希不匹配（声明 %s，实际 %s），已拒绝落盘", bundle.IP2RegionSha, got)
 			}
 			tmp := ip2regionLivePath + ".sync"
 			if err := os.WriteFile(tmp, bundle.Xdb, 0644); err != nil {
 				_ = os.Remove(tmp) // 第 59 轮 R59-P5：ENOSPC 等中途失败不遗留半截 .sync
-				return crsChanged, xdbChanged, fmt.Errorf("写入同步 IP2Region数据库: %w", err)
+				return crsChanged, xdbChanged, threatChanged, fmt.Errorf("写入同步 IP2Region数据库: %w", err)
 			}
 			if err := os.Rename(tmp, ip2regionLivePath); err != nil {
 				_ = os.Remove(tmp)
-				return crsChanged, xdbChanged, fmt.Errorf("落盘同步 IP2Region数据库: %w", err)
+				return crsChanged, xdbChanged, threatChanged, fmt.Errorf("落盘同步 IP2Region数据库: %w", err)
 			}
 			if tagErr := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", bundle.IP2RegionTag); tagErr != nil {
-				return crsChanged, xdbChanged, fmt.Errorf("写入同步 IP2Region数据库版本标记: %w", tagErr)
+				return crsChanged, xdbChanged, threatChanged, fmt.Errorf("写入同步 IP2Region数据库版本标记: %w", tagErr)
 			}
 			xdbChanged = true
 		}
@@ -261,16 +261,17 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged bool, err
 		if fileSha256(fastPath) == tf.Sha256 {
 			continue // 哈希一致跳过
 		}
+		threatChanged = true
 		tmp := fastPath + ".tmp"
 		if err := os.WriteFile(tmp, tf.Content, 0644); err != nil {
-			return crsChanged, xdbChanged, fmt.Errorf("写威胁库 .fast %s: %w", tf.Name, err)
+			return crsChanged, xdbChanged, threatChanged, fmt.Errorf("写威胁库 .fast %s: %w", tf.Name, err)
 		}
 		if err := os.Rename(tmp, fastPath); err != nil {
 			os.Remove(tmp)
-			return crsChanged, xdbChanged, fmt.Errorf("rename 威胁库 .fast %s: %w", tf.Name, err)
+			return crsChanged, xdbChanged, threatChanged, fmt.Errorf("rename 威胁库 .fast %s: %w", tf.Name, err)
 		}
 	}
-	return crsChanged, xdbChanged, nil
+	return crsChanged, xdbChanged, threatChanged, nil
 }
 
 // skipWafSyncTransient 判断相对路径是否为不得进入 waf 同步打包的瞬态文件

@@ -32,7 +32,7 @@ func TestApplyWafFileBundle_rejectsHashWithoutContent(t *testing.T) {
 	writeTestFile(t, xdbPath, "LOCAL-XDB")
 
 	bundle := &WafFileBundle{IP2RegionSha: "deadbeef", IP2RegionTag: "v1"}
-	if _, _, err := ApplyWafFileBundle(bundle); err == nil || !strings.Contains(err.Error(), "未携带内容") {
+	if _, _, _, err := ApplyWafFileBundle(bundle); err == nil || !strings.Contains(err.Error(), "未携带内容") {
 		t.Fatalf("hash-without-content must be rejected, got %v", err)
 	}
 	gotRaw, rerr := osReadFileForTest(t, xdbPath)
@@ -41,7 +41,7 @@ func TestApplyWafFileBundle_rejectsHashWithoutContent(t *testing.T) {
 	}
 
 	crsBundle := &WafFileBundle{CRSSha256: "deadbeef"}
-	if _, _, err := ApplyWafFileBundle(crsBundle); err == nil || !strings.Contains(err.Error(), "未携带内容") {
+	if _, _, _, err := ApplyWafFileBundle(crsBundle); err == nil || !strings.Contains(err.Error(), "未携带内容") {
 		t.Fatalf("crs hash-without-content must be rejected, got %v", err)
 	}
 	_ = crsDir

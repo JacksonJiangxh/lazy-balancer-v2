@@ -191,12 +191,14 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 			// 完整链形态,与自动更新器 failed 同款 stage)。
 			AppendCRSUpdateLog("ERROR", "failed", fmt.Sprintf("从主节点拉取安全数据失败: %v", ferr))
 			AppendIP2RegionUpdateLog("ERROR", "failed", fmt.Sprintf("从主节点拉取安全数据失败: %v", ferr))
-		} else if crsChanged, xdbChanged, aerr := ApplyWafFileBundle(bundle); aerr != nil {
+			AppendThreatUpdateLog("ERROR", "failed", fmt.Sprintf("从主节点拉取安全数据失败: %v", ferr))
+		} else if crsChanged, xdbChanged, threatChanged, aerr := ApplyWafFileBundle(bundle); aerr != nil {
 			Logf("error", "落盘同步安全数据失败: %v", aerr)
 			RecordAuditLog("system", "同步失败", "安全数据", fmt.Sprintf("落盘安全数据失败: %v", aerr), "")
 			AppendCRSUpdateLog("ERROR", "failed", fmt.Sprintf("落盘主节点安全数据失败: %v", aerr))
 			AppendIP2RegionUpdateLog("ERROR", "failed", fmt.Sprintf("落盘主节点安全数据失败: %v", aerr))
-		} else if crsChanged || xdbChanged {
+			AppendThreatUpdateLog("ERROR", "failed", fmt.Sprintf("落盘主节点安全数据失败: %v", aerr))
+		} else if crsChanged || xdbChanged || threatChanged {
 			detail := wafBundleSyncDetail(bundle, crsChanged, xdbChanged)
 			RecordAuditLog("system", "同步", "安全数据", detail, "")
 			// 同步有变动=完整更新流程(与自动更新器同款阶段流水)
@@ -211,6 +213,9 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 					tag = "未知版本"
 				}
 				AppendIP2RegionUpdateLog("INFO", "success", fmt.Sprintf("ip2region 已随主节点同步更新到 %s", tag))
+			}
+			if threatChanged {
+				AppendThreatUpdateLog("INFO", "success", "威胁情报库已随主节点同步更新(.fast 落盘)")
 			}
 			if crsChanged {
 				AppendCRSUpdateLog("INFO", "installing", "校验并落盘主节点 CRS 规则")
@@ -228,6 +233,9 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 			}
 			if bundle.IP2RegionTag != "" || bundle.Xdb != nil {
 				AppendIP2RegionUpdateLog("INFO", "success", "主节点 IP2Region 数据无更新，无需同步")
+			}
+			if len(bundle.ThreatFiles) > 0 {
+				AppendThreatUpdateLog("INFO", "success", "主节点威胁情报库数据无更新，无需同步")
 			}
 		}
 	}

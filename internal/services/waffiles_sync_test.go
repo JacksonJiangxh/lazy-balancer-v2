@@ -76,7 +76,7 @@ func TestWafFileBundleRoundTrip(t *testing.T) {
 	os.RemoveAll(filepath.Join(src, "crs"))
 	os.MkdirAll(filepath.Join(src, "crs"), 0755)
 	os.Remove(ip2regionLivePath)
-	crsChanged, xdbChanged, err := ApplyWafFileBundle(bundle)
+	crsChanged, xdbChanged, _, err := ApplyWafFileBundle(bundle)
 	if err != nil || !crsChanged || !xdbChanged {
 		t.Fatalf("first apply crsChanged=%v xdbChanged=%v err=%v", crsChanged, xdbChanged, err)
 	}
@@ -91,7 +91,7 @@ func TestWafFileBundleRoundTrip(t *testing.T) {
 	if wafFilesRefDiffers(ref) {
 		t.Fatalf("identical files must not be re-fetched")
 	}
-	crsChanged, xdbChanged, err = ApplyWafFileBundle(bundle)
+	crsChanged, xdbChanged, _, err = ApplyWafFileBundle(bundle)
 	if err != nil || crsChanged || xdbChanged {
 		t.Fatalf("idempotent apply crsChanged=%v xdbChanged=%v err=%v", crsChanged, xdbChanged, err)
 	}
@@ -136,7 +136,7 @@ func TestApplyWafFileBundleRejectsTamperedBytes(t *testing.T) {
 	}
 	tampered.CRSTarGz = data
 	tampered.Xdb = nil
-	if _, _, err := ApplyWafFileBundle(&tampered); err == nil {
+	if _, _, _, err := ApplyWafFileBundle(&tampered); err == nil {
 		t.Fatalf("tampered CRS must be rejected")
 	}
 	if _, err := os.Stat(filepath.Join(dstRules, "a.conf")); !os.IsNotExist(err) {
@@ -148,7 +148,7 @@ func TestApplyWafFileBundleRejectsTamperedBytes(t *testing.T) {
 	tamperedXdb.CRSTarGz = nil
 	tamperedXdb.Xdb = append([]byte(nil), bundle.Xdb...)
 	tamperedXdb.Xdb[0] ^= 0xFF
-	if _, _, err := ApplyWafFileBundle(&tamperedXdb); err == nil {
+	if _, _, _, err := ApplyWafFileBundle(&tamperedXdb); err == nil {
 		t.Fatalf("tampered xdb must be rejected")
 	}
 	if _, err := os.Stat(ip2regionLivePath); !os.IsNotExist(err) {
@@ -156,7 +156,7 @@ func TestApplyWafFileBundleRejectsTamperedBytes(t *testing.T) {
 	}
 
 	// Untampered bundle still applies cleanly.
-	crsChanged, xdbChanged, err := ApplyWafFileBundle(bundle)
+	crsChanged, xdbChanged, _, err := ApplyWafFileBundle(bundle)
 	if err != nil || !crsChanged || !xdbChanged {
 		t.Fatalf("valid bundle apply crsChanged=%v xdbChanged=%v err=%v", crsChanged, xdbChanged, err)
 	}
@@ -264,7 +264,7 @@ func TestApplyWafFileBundle_rejectsCRSWithoutDeclaredHash(t *testing.T) {
 	crsLiveDir, ip2regionLivePath = filepath.Join(dst, "crs"), filepath.Join(dst, "ip2region.xdb")
 	defer func() { crsLiveDir, ip2regionLivePath = oldLive, oldXdb }()
 	bundle := &WafFileBundle{CRSTarGz: rawTarGz(t, []tarEntry{{name: "rules/evil.conf", body: []byte("SecRule X EVIL")}}), CRSSha256: ""}
-	if _, _, err := ApplyWafFileBundle(bundle); err == nil || !strings.Contains(err.Error(), "缺少声明哈希") {
+	if _, _, _, err := ApplyWafFileBundle(bundle); err == nil || !strings.Contains(err.Error(), "缺少声明哈希") {
 		t.Fatalf("error=%v, want missing declared hash rejection", err)
 	}
 	if _, err := os.Stat(filepath.Join(crsLiveDir, "rules", "evil.conf")); !os.IsNotExist(err) {
@@ -334,7 +334,7 @@ func TestApplyWafFileBundle_rejectsXdbWithoutDeclaredHash(t *testing.T) {
 	crsLiveDir, ip2regionLivePath = filepath.Join(dst, "crs"), filepath.Join(dst, "ip2region.xdb")
 	defer func() { crsLiveDir, ip2regionLivePath = oldLive, oldXdb }()
 	bundle := &WafFileBundle{Xdb: []byte("raw-bytes"), IP2RegionSha: ""}
-	if _, _, err := ApplyWafFileBundle(bundle); err == nil || !strings.Contains(err.Error(), "缺少声明哈希") {
+	if _, _, _, err := ApplyWafFileBundle(bundle); err == nil || !strings.Contains(err.Error(), "缺少声明哈希") {
 		t.Fatalf("error=%v, want missing declared hash rejection", err)
 	}
 	if _, err := os.Stat(ip2regionLivePath); !os.IsNotExist(err) {
@@ -368,7 +368,7 @@ func TestApplyWafFileBundle_preservesVersionFileRawBytes(t *testing.T) {
 	defer func() { crsLiveDir, ip2regionLivePath = oldLive, oldXdb }()
 	os.MkdirAll(crsLiveDir, 0755)
 
-	crsChanged, _, err := ApplyWafFileBundle(bundle)
+	crsChanged, _, _, err := ApplyWafFileBundle(bundle)
 	if err != nil || !crsChanged {
 		t.Fatalf("apply crsChanged=%v err=%v", crsChanged, err)
 	}
@@ -673,7 +673,7 @@ func TestApplyWafFileBundle_emptyMasterTagConvergesSectionHash(t *testing.T) {
 	os.WriteFile(ip2regionLivePath, []byte("same-xdb-bytes"), 0644)
 	os.WriteFile(ip2regionLivePath+".version", []byte("v3.16.0"), 0644)
 
-	if _, _, err := ApplyWafFileBundle(bundle); err != nil {
+	if _, _, _, err := ApplyWafFileBundle(bundle); err != nil {
 		t.Fatalf("apply bundle with empty master tag: %v", err)
 	}
 	if _, err := os.Stat(ip2regionLivePath + ".version"); !errors.Is(err, os.ErrNotExist) {
@@ -771,7 +771,7 @@ func TestWafFileBundleThreatFastRoundTrip(t *testing.T) {
 
 	// 从节点：清掉 .fast 模拟未同步，再 Apply 落盘
 	os.Remove(fastPath)
-	if _, _, err := ApplyWafFileBundle(bundle); err != nil {
+	if _, _, _, err := ApplyWafFileBundle(bundle); err != nil {
 		t.Fatalf("ApplyWafFileBundle: %v", err)
 	}
 	if _, err := os.Stat(fastPath); err != nil {
@@ -779,7 +779,7 @@ func TestWafFileBundleThreatFastRoundTrip(t *testing.T) {
 	}
 
 	// 幂等：再次 Apply 不报错
-	if _, _, err := ApplyWafFileBundle(bundle); err != nil {
+	if _, _, _, err := ApplyWafFileBundle(bundle); err != nil {
 		t.Fatalf("幂等 Apply: %v", err)
 	}
 }
