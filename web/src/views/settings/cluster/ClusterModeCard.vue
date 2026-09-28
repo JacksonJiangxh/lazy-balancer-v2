@@ -49,21 +49,12 @@
         <DialogHeader :icon="Connection" title="注册为从节点" subtitle="连接主节点，本节点将定期同步主节点数据" tone="warning" />
       </template>
       <div class="registration-warnings">
-        <el-alert
-          title="切换后本地数据将被主节点全覆盖"
-          description="负载规则、安全策略、用户与系统设置等全部数据以主节点为准，本地已有的差异化配置将丢失"
-          type="error"
-          :closable="false"
-          show-icon
-        />
-        <el-alert
-          v-if="usesPlainHttp"
-          title="证书私钥将经明文 HTTP 传输"
-          description="当前主节点地址为 HTTP，同步链路中的证书私钥等敏感数据未加密，建议主节点启用 HTTPS"
-          type="warning"
-          :closable="false"
-          show-icon
-        />
+        <el-alert type="error" :closable="false" show-icon>
+          切换后本地数据将被主节点全覆盖，本地已有的差异化配置将丢失
+        </el-alert>
+        <el-alert v-if="usesPlainHttp" type="warning" :closable="false" show-icon>
+          主节点地址为 HTTP，证书私钥等敏感数据将明文传输，建议启用 HTTPS
+        </el-alert>
       </div>
       <el-form ref="dialogFormRef" :model="form" :rules="rules" label-width="100px" :disabled="readOnly" style="margin-top: 16px">
         <el-form-item label="主节点地址" prop="master_url">
