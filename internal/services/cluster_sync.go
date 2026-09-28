@@ -94,6 +94,10 @@ func (err *SnapshotSchemaTooNewError) Error() string {
 }
 
 type SyncService struct {
+	// F65:lastSyncNoChange 跟踪上次 sync 是否 304(无变化)——仅首次
+	// 304(从有变化→无变化的转换)写三类库「无变化」日志,后续连续 304
+	// 静默(避免每 sync_interval 刷屏)。
+	lastSyncNoChange       bool
 	db                     *sql.DB
 	cfg                    *config.Config
 	caddy                  *CaddyService
@@ -759,8 +763,18 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotModified {
+		// F65:首次 304(上次有变化本次无变化)时写三类库「无变化」日志——
+		// 与主节点 scheduled update 的 unchanged 日志同构;后续连续 304 静默
+		if !s.lastSyncNoChange {
+			AppendCRSUpdateLog("INFO", "unchanged", "集群同步检查完成，CRS 规则库与主节点一致，无需同步")
+			AppendIP2RegionUpdateLog("INFO", "unchanged", "集群同步检查完成，IP2Region 库与主节点一致，无需同步")
+			AppendThreatUpdateLog("INFO", "unchanged", "集群同步检查完成，威胁情报库与主节点一致，无需同步")
+			s.lastSyncNoChange = true
+		}
 		return SyncResult{AppliedVersion: appliedVersion}, nil
 	}
+	// 有变化:清除 no-change 标记(下次 304 会重新记录转换)
+	s.lastSyncNoChange = false
 	// 未跟随的重定向(跨主机):给可行动错误,而非让空 body 落进 JSON 解析报
 	//「unexpected end of JSON input」(2026-09-18 用户实测踩坑)
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
