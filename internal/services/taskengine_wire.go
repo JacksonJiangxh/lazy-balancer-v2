@@ -75,7 +75,76 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		})
 	}
 
-	for _, id := range []string{"config-watchdog", "security-events-ingestion", "log-cleanup"} {
+	// M3：三更新族排程探测（1min 单轮；内部自带 due/总闸/单飞门；
+	// master-only——引擎角色门与族内 is_master 检查双保险）
+	taskEngine.Register(taskengine.Descriptor{
+		ID: "threat", Family: "security", Name: "威胁情报库更新",
+		Description: "每日从 USTC/FireHOL/ET 三源下载恶意 IP 名单，聚合去重后写入威胁库文件并同步从节点——引用名单的安全策略据此拦截",
+		Category:    "安全防护", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
+		IntervalFn: func() time.Duration { return time.Minute },
+		CancelHook: func() bool { return GetThreatUpdateManager() != nil && GetThreatUpdateManager().CancelRunning() },
+		Run: func(rc taskengine.RunContext) error {
+			ThreatSchedulerTickOnce()
+			return nil
+		},
+	})
+	taskEngine.Register(taskengine.Descriptor{
+		ID: "crs", Family: "security", Name: "CRS 规则库更新",
+		Description: "检查并更新 OWASP CoreRuleSet 规则集到最新版本（保留用户 overrides），供 WAF 拦截模式消费",
+		Category:    "安全防护", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
+		IntervalFn: func() time.Duration { return time.Minute },
+		CancelHook: func() bool { return GetCRSUpdateManager().CancelRunning() },
+		Run: func(rc taskengine.RunContext) error {
+			CRSSchedulerTickOnce()
+			return nil
+		},
+	})
+	taskEngine.Register(taskengine.Descriptor{
+		ID: "ip2region", Family: "security", Name: "IP2Region 地理库更新",
+		Description: "更新 IP 地理位置离线库（xdb），供 GeoIP 地域拦截与归属地展示使用",
+		Category:    "安全防护", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
+		IntervalFn: func() time.Duration { return time.Minute },
+		CancelHook: func() bool { return GetIP2RegionUpdateManager() != nil && GetIP2RegionUpdateManager().CancelRunning() },
+		Run: func(rc taskengine.RunContext) error {
+			IP2RegionSchedulerTickOnce()
+			return nil
+		},
+	})
+
+	// M4：自动备份（1min 探测，master-only——补跑/槽判定在体内）+ 两个
+	// 每日清理族（本节点本地表，与角色无关）。
+	taskEngine.Register(taskengine.Descriptor{
+		ID: "auto-backup", Family: "backup", Name: "自动备份",
+		Description: "按排程把全量配置打包为 lbbak 落盘 backup 目录（含 CRS/IP2Region/威胁库数据文件），保留份数自动清理",
+		Category:    "备份", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
+		IntervalFn: func() time.Duration { return time.Minute },
+		Run: func(rc taskengine.RunContext) error {
+			AutoBackupSchedulerTickOnce()
+			return nil
+		},
+	})
+	taskEngine.Register(taskengine.Descriptor{
+		ID: "audit-retention", Family: "system", Name: "审计日志保留清理",
+		Description: "按「审计保留月数」配置删除 audit 库过期操作日志（基础设置可调）",
+		Category:    "系统", Kind: taskengine.KindContinuous,
+		IntervalFn: func() time.Duration { return 24 * time.Hour },
+		Run: func(rc taskengine.RunContext) error {
+			CleanupAuditLogs()
+			return nil
+		},
+	})
+	taskEngine.Register(taskengine.Descriptor{
+		ID: "security-events-retention", Family: "system", Name: "安全事件保留清理",
+		Description: "按保留期配置删除 metrics 库中过期的安全事件记录",
+		Category:    "系统", Kind: taskengine.KindContinuous,
+		IntervalFn: func() time.Duration { return 24 * time.Hour },
+		Run: func(rc taskengine.RunContext) error {
+			SecurityEventsRetentionCleanupOnce()
+			return nil
+		},
+	})
+
+	for _, id := range []string{"config-watchdog", "security-events-ingestion", "log-cleanup", "threat", "crs", "ip2region", "auto-backup", "audit-retention", "security-events-retention"} {
 		if id == "log-cleanup" && runtimeLogFile == "" {
 			continue
 		}

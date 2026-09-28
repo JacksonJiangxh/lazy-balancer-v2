@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lazy-balancer-v2/internal/taskengine"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -239,9 +240,18 @@ func (m *ThreatUpdateManager) run(trigger string) {
 		return
 	}
 	runCtx, runCancel := context.WithCancel(context.Background())
+	runStarted := time.Now().UTC()
+	histRun := taskengine.RecordRunStart("threat", "security", trigger)
+	defer func() {
+		dur := time.Since(runStarted).Milliseconds()
+		m.mu.Lock()
+		outcome := m.lastTaskOutcome
+		m.mu.Unlock()
+		taskengine.RecordRunFinish(histRun, outcome, dur, "")
+	}()
 	m.mu.Lock()
 	m.lastTrigger = trigger
-	m.lastStartedAt = time.Now().UTC().Format(crsTimeLayout)
+	m.lastStartedAt = runStarted.Format(crsTimeLayout)
 	m.lastCancelled = false
 	m.runCancel = runCancel
 	m.mu.Unlock()

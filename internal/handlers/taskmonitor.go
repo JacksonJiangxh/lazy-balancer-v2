@@ -14,6 +14,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 // ListSystemTasks 聚合全部任务族状态（全员可见）。
@@ -166,7 +167,8 @@ func (h *Handlers) ControlSystemTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效（action=start|stop|restart）"})
 		return
 	}
-	if te := services.TaskEngine(); te != nil {
+	engineControllable := map[string]bool{"config-watchdog": true, "security-events-ingestion": true, "log-cleanup": true}
+	if te := services.TaskEngine(); te != nil && engineControllable[id] {
 		if !te.IsRunning(id) && req.Action != "start" || te.IsRunning(id) && req.Action == "start" {
 			// 引擎语义: 启动需已停 / 停止与重启需在跑——幂等放行交由引擎
 		}
@@ -197,4 +199,19 @@ func (h *Handlers) ControlSystemTask(c *gin.Context) {
 		recordAudit(c, "重启", "任务监控", "常驻任务 "+id+" 重启")
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已重启任务 " + id})
 	}
+}
+
+// GetSystemTaskHistory 任务运行历史（task_runs，时间倒序）。
+func (h *Handlers) GetSystemTaskHistory(c *gin.Context) {
+	id := c.Param("id")
+	limit := 50
+	if te := services.TaskEngine(); te != nil {
+		runs := te.History(id, limit)
+		if runs == nil {
+			runs = []taskengine.RunRecord{}
+		}
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"runs": runs}})
+		return
+	}
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"runs": []struct{}{}}})
 }

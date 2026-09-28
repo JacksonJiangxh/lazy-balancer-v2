@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"lazy-balancer-v2/internal/taskengine"
 	"sync"
 	"time"
 
@@ -219,6 +220,12 @@ func (m *CRSUpdateManager) setStage(status CRSUpdateStatus, message string) {
 
 // run executes the full update pipeline synchronously.
 func (m *CRSUpdateManager) run(trigger string) {
+	runStarted := time.Now().UTC()
+	histRun := taskengine.RecordRunStart("crs", "security", trigger)
+	defer func() {
+		status := string(m.StatusSnapshot().Status)
+		taskengine.RecordRunFinish(histRun, status, time.Since(runStarted).Milliseconds(), "")
+	}()
 	runCtx, runCancel := context.WithCancel(context.Background())
 	m.mu.Lock()
 	m.runCancel = runCancel
