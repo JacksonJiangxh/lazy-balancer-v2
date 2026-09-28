@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
 )
 
 // fastFileMagic 是 .fast 二进制格式的魔数（Lazy Balancer Fast v1）。
@@ -51,6 +52,9 @@ func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 	}
 
 	// 原子写（与 @ipListFast 投影同模式）
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("fastfile mkdir: %w", err)
+	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, buf, 0644); err != nil {
 		return fmt.Errorf("fastfile tmp write: %w", err)

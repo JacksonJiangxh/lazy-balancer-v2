@@ -1,12 +1,12 @@
 package services
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +14,16 @@ import (
 
 	"lazy-balancer-v2/internal/db"
 )
+
+func overrideWafDirForTest(t *testing.T) {
+	t.Helper()
+	restoreWaf := OverrideThreatWafDirForTest(t.TempDir())
+	restoreLog := SetUpdateLogDirForTest(t.TempDir())
+	t.Cleanup(func() {
+		restoreWaf()
+		restoreLog()
+	})
+}
 
 // 威胁情报库名单化（v2.3.2 重构）测试基座：三源指向 httptest 桩；
 // 内容与行状态分离——条目写 security_ip_lists 的 system=1 内置名单行，
@@ -62,23 +72,26 @@ func readThreatListEntries(t *testing.T, source string) []string {
 	if name == "" {
 		t.Fatalf("未登记的源: %s", source)
 	}
-	var entriesJSON string
 	var system int
-	if err := db.DB.QueryRow(`SELECT COALESCE(entries,'[]'), system FROM security_ip_lists WHERE name=?`, name).Scan(&entriesJSON, &system); err != nil {
+	if err := db.DB.QueryRow(`SELECT system FROM security_ip_lists WHERE name=?`, name).Scan(&system); err != nil {
 		t.Fatalf("内置名单缺失 %q: %v", name, err)
 	}
 	if system != 1 {
 		t.Fatalf("名单 %q system=%d, want 1", name, system)
 	}
-	var entries []struct {
-		Value string `json:"value"`
+	// RDB: 系统列表条目从 .iplist 文件读取（不存在=未更新,返回空）
+	raw, ferr := os.ReadFile(filepath.Join(wafDir, "threat-"+source+".iplist"))
+	if ferr != nil {
+		if os.IsNotExist(ferr) {
+			return nil // 禁用/未更新源无文件——等价旧 DB entries 空
+		}
+		t.Fatalf("读 .iplist %s: %v", source, ferr)
 	}
-	if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
-		t.Fatal(err)
-	}
-	out := make([]string, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, e.Value)
+	var out []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			out = append(out, line)
+		}
 	}
 	return out
 }
@@ -86,6 +99,7 @@ func readThreatListEntries(t *testing.T, source string) []string {
 // 单任务按 id 升序执行全部启用源；条目聚合后写入内置名单行；
 // 行状态 success、entry_count=解析条数、version=成功日期。
 func TestThreatUpdate_runsEnabledSourcesInOrder(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	var mu sync.Mutex
 	var order []string
@@ -132,6 +146,7 @@ func TestThreatUpdate_runsEnabledSourcesInOrder(t *testing.T) {
 // 单源失败不中断其余源；失败源行 failed+message+consecutive_failures+1；
 // 失败源名单内容保持上次成功值（不被清空）。
 func TestThreatUpdate_sourceFailureKeepsOldListAndContinues(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
 
@@ -176,6 +191,7 @@ func TestThreatUpdate_sourceFailureKeepsOldListAndContinues(t *testing.T) {
 
 // 解析守卫：可解析行比例 <50% 判失败（防错页/HTML 劫持）；条目 >200000 拒绝。
 func TestThreatUpdate_parseGuards(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, map[string]string{
 		"ustc": "<html><body>not a list</body></html>\n203.0.113.1\n", // 1/2 可解析=50% 边界 → 通过
@@ -212,6 +228,7 @@ func TestThreatUpdate_parseGuards(t *testing.T) {
 
 // update_enabled=0 的源被跳过（不下载、不动行、不写名单）。
 func TestThreatUpdate_updateDisabledSourceSkipped(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=0 WHERE name='firehol_l1'`); err != nil {
@@ -231,6 +248,7 @@ func TestThreatUpdate_updateDisabledSourceSkipped(t *testing.T) {
 // 名单内容变化且被启用策略引用时触发一次 Caddy 重载（引用方渲染随新内容
 // 收敛）；内容未变化不重载；无引用方的变化同样不重载（2026-09-24 裁定）。
 func TestThreatUpdate_listChangeTriggersReload(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
 	var reloads int
@@ -283,6 +301,7 @@ func seedThreatPolicyRefForSource(t *testing.T, policyID int, source string) {
 // 重载门（2026-09-24 用户裁定）：名单变化且**被启用策略引用**才重载 Caddy——
 // 未被引用的源即使内容变化也不重载（重载只服务引用方的渲染收敛）。
 func TestThreatUpdate_reloadsOnlyWhenChangedListReferenced(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
 	var reloads int
@@ -344,6 +363,7 @@ func TestThreatUpdate_reloadsOnlyWhenChangedListReferenced(t *testing.T) {
 
 // 重复触发返回 ErrThreatUpdateRunning（409 语义由 handler 映射）。
 func TestThreatUpdate_duplicateStartRejected(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
 	block := make(chan struct{})
@@ -369,6 +389,7 @@ func TestThreatUpdate_duplicateStartRejected(t *testing.T) {
 // 名单为空视为到期（升级窗口：旧版写文件新版写名单——next_update 未到期但
 // 名单空的源必须进 auto 任务；名单有内容且未到期才跳过）。
 func TestThreatDueSources_emptyListIsDue(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	// Given：三源 next_update 全在未来
 	future := time.Now().UTC().Add(24 * time.Hour).Format(crsTimeLayout)
@@ -407,6 +428,7 @@ func TestThreatDueSources_emptyListIsDue(t *testing.T) {
 // security_threat_sources.content_hash；同集乱序（USTC 源实测每次请求乱序
 // 返回同一集合）不得判变化；重载须留操作日志审计。
 func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
 	t.Cleanup(SetUpdateLogDirForTest(t.TempDir()))
@@ -505,6 +527,7 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 // 走跳过分支标 success——必须记错并继续完整聚合/写库路径（本测试用 DROP
 // TABLE 使 COUNT 与后续写库一并失败，可观察终态=failed 而非 success）。
 func TestThreatUpdate_listExistenceQueryErrorNotFastPathSuccess(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
 
@@ -541,6 +564,7 @@ func TestThreatUpdate_listExistenceQueryErrorNotFastPathSuccess(t *testing.T) {
 // P5-10（第 50 轮审计）：策略 refs JSON 解析失败按「可能被引用」处理——与
 // 同函数查询失败口径一致（宁可多一次重载，不欠引用方的渲染收敛）。
 func TestThreatListsReferenced_invalidRefsTreatedAsReferenced(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	// Given：启用策略持有不可解析的 refs JSON
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id, name, mode, ip_acl_enabled, ip_acl_mode, ip_acl_list_refs, policy_type, enabled)
@@ -556,6 +580,7 @@ func TestThreatListsReferenced_invalidRefsTreatedAsReferenced(t *testing.T) {
 
 // 回归形状：可解析且不含目标 id 的 refs 不受影响（false）。
 func TestThreatListsReferenced_parseableRefsMiss(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id, name, mode, ip_acl_enabled, ip_acl_mode, ip_acl_list_refs, policy_type, enabled)
 		VALUES (902, '正常引用策略', 'blocking', 1, 'deny', '[7,8]', 'stage1', 1)`); err != nil {
@@ -575,6 +600,7 @@ func TestThreatListsReferenced_parseableRefsMiss(t *testing.T) {
 // 哈希已持久化使「unchanged」快路径永不再触发重载的缺口）。成功后清 pending，
 // 后续轮次恢复「内容未变不重载」口径。
 func TestThreatUpdate_reloadFailureRetriedOnNextRun(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
 	failReload := true
@@ -633,6 +659,7 @@ func TestThreatUpdate_reloadFailureRetriedOnNextRun(t *testing.T) {
 // demote 竞态窗口内，从节点继续执行会写 security_ip_lists 并触发重载，
 // 打破从节点只读不变量。
 func TestThreatUpdate_runRejectedOnSlave(t *testing.T) {
+	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {

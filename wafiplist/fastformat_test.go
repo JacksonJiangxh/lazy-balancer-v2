@@ -82,7 +82,10 @@ func TestFastFile_Truncated(t *testing.T) {
 	// header 声称 100 条 v4 但数据只有 10 字节
 	header := make([]byte, 16)
 	copy(header[0:4], fastFileMagic)
-	header[4] = 0; header[5] = 0; header[6] = 0; header[7] = 100 // v4_count=100
+	header[4] = 0
+	header[5] = 0
+	header[6] = 0
+	header[7] = 100 // v4_count=100
 	os.WriteFile(path, append(header, make([]byte, 10)...), 0644)
 	if _, err := ReadFastFile(path); err == nil {
 		t.Fatal("expected error for truncated file")
