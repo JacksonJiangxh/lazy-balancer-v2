@@ -371,6 +371,15 @@ type ClusterWafFilesRef struct {
 	CRSSha256    string `json:"crs_sha256"`
 	IP2RegionTag string `json:"ip2region_version"`
 	IP2RegionSha string `json:"ip2region_sha256"`
+	// RDB 文件化：威胁库 .fast 二进制文件哈希（源名 → sha256）
+	ThreatSha256s map[string]string `json:"threat_sha256s,omitempty"`
+}
+
+// ThreatFileEntry 是单个威胁库 .fast 文件条目（bundle 内嵌传输用）。
+type ThreatFileEntry struct {
+	Name    string `json:"name"` // 源名（ustc/firehol1/et_compromised）
+	Sha256  string `json:"sha256"`
+	Content []byte `json:"content,omitempty"` // .fast 二进制内容
 }
 
 type ClusterSecurityCRSVersion struct {
