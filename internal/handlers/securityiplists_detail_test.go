@@ -204,3 +204,40 @@ func TestGetIPList_systemListReadsIplistFile(t *testing.T) {
 		t.Fatalf("文件缺失 entry_count=0: %s", resp2.Body.String()[:min(300, len(resp2.Body.String()))])
 	}
 }
+
+// RDB 文件化回归（v2.3.4）：system=1 行 entries=”（空串非 NULL）时
+// ListIPLists 不得因 json_array_length(”) 报 500；威胁库条数改由
+// security_threat_sources.entry_count 供给。
+func TestListIPLists_emptyEntriesOnSystemRows(t *testing.T) {
+	newBackupTestHandlers(t) // 迁移已种子三源内置名单与 threat_sources 行
+	// RDB 形态：system 行 entries 置空串（非 NULL——COALESCE 不会替换）
+	if _, err := db.DB.Exec(`UPDATE security_ip_lists SET entries='' WHERE system=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET entry_count=14189 WHERE name='ustc'`); err != nil {
+		t.Fatal(err)
+	}
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists", h.ListIPLists)
+
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/ip-lists", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("entries='' 的 system 行不得 500: status=%d body=%s", resp.Code, resp.Body.String()[:min(200, len(resp.Body.String()))])
+	}
+	var payload struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range payload.Data {
+		if row["system"] == true && strings.Contains(row["name"].(string), "USTC") {
+			if row["entry_count"] != float64(14189) {
+				t.Fatalf("威胁库 entry_count 须取自 threat_sources: got %v want 14189", row["entry_count"])
+			}
+		}
+	}
+}

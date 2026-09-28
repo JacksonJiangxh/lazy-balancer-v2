@@ -297,7 +297,10 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 	// entry_count 走 SQL 侧 json_array_length（第 53 轮补充轮 P3-1）——不再全量
 	// 读+逐行解析 entries 仅为计数（万条名单 ≈460KB/行 的 CPU/内存开销归零）；
 	// 畸形 JSON 同样报错 500（json_array_length 解析失败→rows.Err），口径不变。
-	rows, err := db.DB.Query("SELECT id, name, COALESCE(description,''), COALESCE(category,''), json_array_length(COALESCE(entries,'[]')), COALESCE(created_by,0), COALESCE(created_at,''), COALESCE(updated_by,0), COALESCE(updated_at,''), COALESCE(system,0) FROM security_ip_lists ORDER BY id")
+	// RDB 文件化：system=1 行 entries=''（空串非 NULL，COALESCE 不替换），
+	// json_array_length('') 会抛 malformed JSON → 500。空串归 0；威胁库真实
+	// 条数在下方由 security_threat_sources.entry_count 覆写。
+	rows, err := db.DB.Query("SELECT id, name, COALESCE(description,''), COALESCE(category,''), CASE WHEN COALESCE(entries,'')='' THEN 0 ELSE json_array_length(COALESCE(entries,'[]')) END, COALESCE(created_by,0), COALESCE(created_at,''), COALESCE(updated_by,0), COALESCE(updated_at,''), COALESCE(system,0) FROM security_ip_lists ORDER BY id")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
@@ -308,6 +311,20 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
+	// RDB 文件化：威胁库条数以 threat_sources 为准（DB entries 恒空）
+	threatCounts := map[string]int{}
+	if trows, terr := db.DB.Query(`SELECT name, COALESCE(entry_count,0) FROM security_threat_sources`); terr == nil {
+		for trows.Next() {
+			var src string
+			var cnt int
+			if trows.Scan(&src, &cnt) == nil {
+				if listName := db.ThreatListNameBySource(src); listName != "" {
+					threatCounts[listName] = cnt
+				}
+			}
+		}
+		trows.Close()
+	}
 	lists := []ipListRow{}
 	for rows.Next() {
 		var row ipListRow
@@ -317,6 +334,9 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 		}
 		// v2.3.2 弹框性能重构：列表载荷不再内联 entries（大名单 1.4 万条
 		// 会背 ~460KB/行）；弹框经 GET /security/ip-lists/:id 按需拉取。
+		if row.System {
+			row.EntryCount = threatCounts[row.Name] // 条数以 threat_sources 为准
+		}
 		row.RefPolicies = refs[int64(row.ID)]
 		if row.RefPolicies == nil {
 			row.RefPolicies = []ipListRefPolicy{}
