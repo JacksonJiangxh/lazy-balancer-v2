@@ -434,6 +434,7 @@ import { ElMessageBox } from 'element-plus'
 import { Monitor, Cpu, Document, Loading, CircleCheck, Odometer, TrendCharts, DataLine, List } from '@element-plus/icons-vue'
 import type { APIResponse, SystemInfo, SystemMetrics, CaddyMetrics, Rule, RuleMetrics, HostMetrics, MetricsOverview } from '@/types'
 import { usePollingTask } from '@/composables/usePollingTask'
+import { httpStatusColors } from '@/utils/chartTheme'
 
 use([CanvasRenderer, LineChart, GridComponent, TooltipComponent, LegendComponent])
 
@@ -636,12 +637,12 @@ const historyChartBase = (legend: string[], series: LineSeriesOption[], valueFor
 const ruleRequestsChartOption = computed<EChartsOption>(() => {
   const mk = (name: string, key: keyof RuleHistoryDelta, color: string): LineSeriesOption => ({ name, type: 'line', color, data: ruleHistoryDeltas.value.deltas.map((row) => row === null ? null : row[key]), sampling: 'lttb', connectNulls: false, smooth: true, showSymbol: false, lineStyle: { color, width: 2 }, areaStyle: { color: `${color}1a` } })
   return historyChartBase(['总请求', '2xx', '3xx', '4xx', '5xx', 'Block'], [
-    mk('总请求', 'requests', '#3b82f6'),
-    mk('2xx', 'status2xx', '#10b981'),
-    mk('3xx', 'status3xx', '#f59e0b'),
-    mk('4xx', 'status4xx', '#f97316'),
-    mk('5xx', 'status5xx', '#ef4444'),
-    mk('Block', 'blocked', '#7c3aed'),
+    mk('总请求', 'requests', httpStatusColors.requests),
+    mk('2xx', 'status2xx', httpStatusColors.s2xx),
+    mk('3xx', 'status3xx', httpStatusColors.s3xx),
+    mk('4xx', 'status4xx', httpStatusColors.s4xx),
+    mk('5xx', 'status5xx', httpStatusColors.s5xx),
+    mk('Block', 'blocked', httpStatusColors.blocked),
   ])
 })
 

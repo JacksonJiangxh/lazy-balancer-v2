@@ -81,6 +81,10 @@
             <el-icon><Key /></el-icon>
             <template #title>API 密钥</template>
           </el-menu-item>
+          <el-menu-item index="settings-tasks" @click="goPage('settings-tasks')">
+            <el-icon><Timer /></el-icon>
+            <template #title>任务监控</template>
+          </el-menu-item>
           <el-menu-item index="users" @click="goPage('users')">
             <el-icon><User /></el-icon>
             <template #title>用户认证</template>
@@ -220,7 +224,7 @@ import { useAuthStore } from '@/stores/auth'
 import type { PageId } from '@/stores/auth'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { ElMessageBox } from 'element-plus'
-import { DataAnalysis, List, Setting, Cpu, User, Connection, Lock, Key, Document, Warning, Notebook } from '@element-plus/icons-vue'
+import {Timer,  DataAnalysis, List, Setting, Cpu, User, Connection, Lock, Key, Document, Warning, Notebook } from '@element-plus/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import { appName, footerHtml } from '@/utils/branding'
 import { reloadAfterRestart } from '@/utils/restart'
@@ -252,6 +256,7 @@ const pageTitle: Record<string, string> = {
   users: '系统设置 / 用户认证',
   'audit-log': '操作日志',
   'settings-basic': '系统设置 / 基础设置',
+  'settings-tasks': '系统设置 / 任务监控',
   'settings-cluster': '系统设置 / 集群管理',
   'settings-certificates': '系统设置 / 免费证书',
   'settings-apikeys': '系统设置 / API 密钥',

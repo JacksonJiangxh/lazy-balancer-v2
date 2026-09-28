@@ -260,6 +260,7 @@ import { BarChart, PieChart as PieSeries } from 'echarts/charts'
 import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
 import type { APIResponse } from '@/types'
+import { securityActionColors } from '@/utils/chartTheme'
 
 use([CanvasRenderer, BarChart, PieSeries, GridComponent, TooltipComponent, LegendComponent])
 
@@ -339,8 +340,8 @@ const trendChartOption = computed(() => {
     xAxis: { type: 'category', data: dates },
     yAxis: { type: 'value' },
     series: [
-      { name: '拦截', type: 'bar', data: blocked, itemStyle: { color: '#f56c6c' }, stack: 'total' },
-      { name: '检测', type: 'bar', data: detected, itemStyle: { color: '#e6a23c' }, stack: 'total' },
+      { name: '拦截', type: 'bar', data: blocked, itemStyle: { color: securityActionColors.blocked }, stack: 'total' },
+      { name: '检测', type: 'bar', data: detected, itemStyle: { color: securityActionColors.detected }, stack: 'total' },
     ],
   }
 })

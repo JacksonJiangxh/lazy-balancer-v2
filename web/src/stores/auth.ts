@@ -19,6 +19,7 @@ const pages = [
   'settings-cluster',
   'settings-certificates',
   'settings-apikeys',
+  'settings-tasks',
 ] as const
 export type PageId = (typeof pages)[number]
 const validPages: ReadonlySet<string> = new Set(pages)
