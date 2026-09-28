@@ -22,7 +22,6 @@ import (
 )
 
 const compensationTimeout = 10 * time.Second
-const minimumPasswordLength = 6
 
 type Handlers struct {
 	cfg               *config.Config

@@ -316,7 +316,7 @@ const closeProfile = (): void => {
 
 const saveProfile = async () => {
   if (isReadOnly.value || saving.value) return
-  if (profileForm.value.password && profileForm.value.password.length < 6) {
+  if (profileForm.value.password && profileForm.value.password.length < 8) {
     authStore.showToast('warning', '密码长度至少8位（8-24位，仅限数字、大小写字母和特殊字符）')
     return
   }

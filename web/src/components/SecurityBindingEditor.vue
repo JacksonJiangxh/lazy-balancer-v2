@@ -8,7 +8,7 @@
     @open="onOpen"
   >
     <template #header>
-      <DialogHeader :icon="Lock" title="{{ mode === 'rule' ? '安全策略绑定' : '绑定规则' }}" subtitle="
+      <DialogHeader :icon="Lock" :title="mode === 'rule' ? '安全策略绑定' : '绑定规则'" subtitle="
             {{ mode === 'rule'
               ? `${rule?.name ?? ''} · 按阶段分区选择，多条策略按策略 ID 升序执行`
               : `${policyName ?? ''} · 选择要绑定该策略的 HTTP 规则（全量重置该策略的绑定集）` }}

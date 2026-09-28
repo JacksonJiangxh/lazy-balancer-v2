@@ -1,7 +1,7 @@
 // Package caddygeoip provides a Caddy HTTP handler module that resolves the
 // client IP against an ip2region xdb database and publishes the resulting
 // country as placeholders for downstream handlers and matchers, mirrored as
-// X-GeoIP-* request headers for downstream coraza SecRules (v2.2.0 GeoIP
+// X-LB-GeoIP-* request headers for downstream coraza SecRules (v2.2.0 GeoIP
 // 区域拦截匹配目标；同名客户端头在入口剥离，防伪造）。
 package caddygeoip
 
@@ -117,7 +117,7 @@ func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 
 // geoipCorazaHeaders lists the request headers this module owns. v2.2.0 地域
 // 拦截改走 coraza（BuildCorazaDirectives 的 GeoIP SecRule 在 phase:1 读取
-// X-GeoIP-Loc），这些头是 geoip.* 变量的镜像；客户端伪造的同名头在
+// X-LB-GeoIP-Loc），这些头是 geoip.* 变量的镜像；客户端伪造的同名头在
 // ServeHTTP 入口无条件删除（先删后设，防伪造绕过/误伤）。
 var geoipCorazaHeaders = []string{
 	"X-LB-GeoIP-Country", "X-LB-GeoIP-Country-Code", "X-LB-GeoIP-Region",
@@ -127,9 +127,9 @@ var geoipCorazaHeaders = []string{
 // ServeHTTP publishes the client country and always delegates to the next
 // handler in the chain.
 func (h *GeoIPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	// 无论 xdb 是否可用都先剥掉客户端伪造的 X-GeoIP-* 头：xdb 缺失时
+	// 无论 xdb 是否可用都先剥掉客户端伪造的 X-LB-GeoIP-* 头：xdb 缺失时
 	// setGeoIPPlaceholders 不执行，伪造头若残留会直接喂给下游 coraza 的
-	// 地域规则（伪造 X-GeoIP-Loc=某 allow 名单省份即可绕过 allow 模式拦截）。
+	// 地域规则（伪造 X-LB-GeoIP-Loc=某 allow 名单省份即可绕过 allow 模式拦截）。
 	for _, name := range geoipCorazaHeaders {
 		r.Header.Del(name)
 	}
@@ -137,7 +137,7 @@ func (h *GeoIPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		h.setGeoIPPlaceholders(r)
 	} else {
 		// xdb 缺失/损坏（Provision 降级 pass-through）：coraza 的地域规则读
-		// REQUEST_HEADERS:X-GeoIP-Loc，缺失变量在 coraza 连取反算子都不产生
+		// REQUEST_HEADERS:X-LB-GeoIP-Loc，缺失变量在 coraza 连取反算子都不产生
 		// 匹配（rule.go evaluate 按值循环）——不置哨兵则 deny/allow 两模式的
 		// id:8 恒不命中，地域拦截静默 fail-open。与查询失败同口径发「海外」，
 		// 恢复文档化 fail-closed 语义。
@@ -156,8 +156,8 @@ func (h *GeoIPHandler) Cleanup() error {
 
 // setGeoIPPlaceholders resolves the client IP against the database and
 // publishes the country fields on the request replacer. v2.2.0 起同值镜像为
-// X-GeoIP-* 请求头（含 fail-closed 空串哨兵），供下游 coraza 的 GeoIP
-// SecRule 匹配；X-GeoIP-Loc 是地域规则匹配键：海外/省/省-市（详见下方）。
+// X-LB-GeoIP-* 请求头（含 fail-closed 空串哨兵），供下游 coraza 的 GeoIP
+// SecRule 匹配；X-LB-GeoIP-Loc 是地域规则匹配键：海外/省/省-市（详见下方）。
 func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	ctx := r.Context()
 	// R72 二十六次 D1（裁决：fail-closed 哨兵）：不可解析客户端（全部 IPv6 流量、
@@ -165,7 +165,7 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	// 错 → match=false → deny 模式地域拦截对 IPv6 静默零强制。现恒发全部变量，
 	// 空串哨兵下：海外项 country_name != "中国" 对空串成立（IPv6 按海外处理，
 	// 与 R57 fail-closed 立场一致）；省/市项对空串恒不匹配（不误伤）。
-	// 头镜像同语义：X-GeoIP-Loc 哨兵恒为「海外」（承载 fail-closed 海外裁决），
+	// 头镜像同语义：X-LB-GeoIP-Loc 哨兵恒为「海外」（承载 fail-closed 海外裁决），
 	// 省/市空串对 coraza 锚定正则（^(?:...)$）恒不匹配。
 	caddyhttp.SetVar(ctx, "geoip.country_name", "")
 	caddyhttp.SetVar(ctx, "geoip.region", "")
@@ -218,7 +218,7 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	}
 	caddyhttp.SetVar(ctx, "geoip.city", city)
 	r.Header.Set("X-LB-GeoIP-City", city)
-	// X-GeoIP-Loc：地域规则匹配键（coraza SecRule 的锚定正则全值目标）。
+	// X-LB-GeoIP-Loc：地域规则匹配键（coraza SecRule 的锚定正则全值目标）。
 	// 国家列非「中国」（含空/0/海外国名，与 D1 fail-closed 哨兵同口径）→
 	// 「海外」；国内 → 省 或 省/市（均为规范化值，与策略选项树同源，
 	// BuildCorazaDirectives 的 geoipLocOperator 按同形态编译条目）。

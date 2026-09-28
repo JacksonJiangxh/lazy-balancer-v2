@@ -2842,9 +2842,9 @@ func generateHTTPRouteObjects(rule SingleRuleConfig, securityCtx ...*securityPol
 
 	routes := make([]map[string]interface{}, 0, len(rule.PathRules)+2)
 	// GeoIP pass route runs before path rules and the main route: it resolves the
-	// client region into {http.vars.geoip.*} placeholders AND X-GeoIP-* request
+	// client region into {http.vars.geoip.*} placeholders AND X-LB-GeoIP-* request
 	// headers. v2.2.0 地域拦截改走 coraza——BuildCorazaDirectives 的 GeoIP
-	// SecRule（id:8）读取 X-GeoIP-Loc，被拦请求产生 audit.log → 安全事件管线
+	// SecRule（id:8）读取 X-LB-GeoIP-Loc，被拦请求产生 audit.log → 安全事件管线
 	// （此前 Caddy 原生 block 路由 CEL+static_response 完全绕过 coraza，事件
 	// 盲区）。pass 路由必须保留且先于主路由的 coraza 处理器执行，否则 headers
 	// 未设置、地域规则恒不命中。至多一条（任一绑定启用策略带 geoip 即存在，
@@ -3642,7 +3642,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		}
 		proxyConfig["transport"] = transportConfig
 	}
-	// X-GeoIP-* 是 caddygeoip→coraza 的进程内控制头（coraza 在本 handler 之前
+	// X-LB-GeoIP-* 是 caddygeoip→coraza 的进程内控制头（coraza 在本 handler 之前
 	// 执行，已消费完毕），绝不允许透传上游后端。无条件剥离：geoip 关闭的规则
 	// 同时防客户端伪造同名头直达后端。头名清单与 caddygeoip/handler.go 的
 	// headerNames 同源，变更需双侧同步。X-LB-Rule-ID 同型：链首注入的归因头

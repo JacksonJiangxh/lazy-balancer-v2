@@ -300,7 +300,7 @@
       @closed="resetFeatureForm"
     >
       <template #header>
-        <DialogHeader :icon="Setting" title="功能配置" subtitle="目标密钥：{{ featureTarget?.name || '' }}" />
+        <DialogHeader :icon="Setting" title="功能配置" :subtitle="`目标密钥：${featureTarget?.name || ''}`" />
       </template>
       <el-form label-width="110px" :disabled="featureSaving">
         <el-divider content-position="left" class="section-divider">权限</el-divider>

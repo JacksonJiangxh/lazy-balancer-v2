@@ -235,7 +235,7 @@ func TestBuildCorazaDirectives_geoipMovedToPrecheck(t *testing.T) {
 }
 
 // TestGenerateHTTPRouteObjects_geoip_passRouteOnlyNoBlockRoutes：路由层只剩
-// pass 路由（设置 X-GeoIP-* headers 供下游 coraza），不再有 Caddy 原生 block
+// pass 路由（设置 X-LB-GeoIP-* headers 供下游 coraza），不再有 Caddy 原生 block
 // 路由；地域拦截在主路由的 coraza 处理器内评估。
 func TestGenerateHTTPRouteObjects_geoip_passRouteOnlyNoBlockRoutes(t *testing.T) {
 	stubSecurityLibsAvailable(t) // 缺库降级：安全链渲染断言前先桩库可用
@@ -528,7 +528,7 @@ func TestBuildCorazaDirectives_geoipModeOff_noEmission(t *testing.T) {
 }
 
 // TestPolicyHasGeoIP_modeGate：活跃判定 = mode!='off' 且名单非空。mode 门失效
-// 会使 caddygeoip handler 在开关关闭后照常注入（X-GeoIP-* 头继续被打到请求上）。
+// 会使 caddygeoip handler 在开关关闭后照常注入（X-LB-GeoIP-* 头继续被打到请求上）。
 func TestPolicyHasGeoIP_modeGate(t *testing.T) {
 	countries := json.RawMessage(`["海外"]`)
 	if PolicyHasGeoIP(&models.SecurityPolicy{GeoIPMode: "off", GeoIPCountries: countries}) {
@@ -542,7 +542,7 @@ func TestPolicyHasGeoIP_modeGate(t *testing.T) {
 	}
 }
 
-// TestBuildHTTPHandleChain_stripsGeoIPHeadersBeforeUpstream：X-GeoIP-* 是
+// TestBuildHTTPHandleChain_stripsGeoIPHeadersBeforeUpstream：X-LB-GeoIP-* 是
 // caddygeoip→coraza 的进程内控制头，绝不允许透传上游后端。reverse_proxy 必须在
 // headers.request.delete 中剥离全部 6 个头；无条件剥离（不依赖安全策略绑定），
 // 同时拦截 geoip 关闭时客户端伪造同名头直达后端。与 HostHeader set 并存。

@@ -186,11 +186,13 @@ const rules: FormRules = {
   ],
 }
 
+const usernamePolicyRe = /^[a-z][a-z0-9]*$/
 const setupRules: FormRules = {
   username: [
     { required: true, message: '请输入管理员用户名', trigger: 'blur' },
     { min: 3, message: '用户名至少3位', trigger: 'blur' },
     { max: 50, message: '用户名最多50位', trigger: 'blur' },
+    { pattern: usernamePolicyRe, message: '用户名仅允许小写英文开头，字符只允许小写字母和数字', trigger: 'blur' },
   ],
   display_name: [
     { max: 50, message: '显示名最多50位', trigger: 'blur' },

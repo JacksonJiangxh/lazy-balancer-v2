@@ -166,7 +166,7 @@ for i, d := range domainHosts {
 
 ### Handle Chain 顺序
 1. **headers**（X-LB-Rule-ID 注入）：HTTP 规则绑定安全策略时链首注入归因头（供预检与 coraza 事务消费，reverse_proxy 前无条件剥离，不直达上游）
-2. **geoip2region 标签层**：规则任意绑定策略启用地域拦截时，先于 IP 预检为每请求标注 `X-GeoIP-Loc` 归属地头（供 GeoIP 预检链第二段匹配；伪造头先剥后设）
+2. **geoip2region 标签层**：规则任意绑定策略启用地域拦截时，先于 IP 预检为每请求标注 `X-LB-GeoIP-Loc` 归属地头（供 GeoIP 预检链第二段匹配；伪造头先剥后设）
 3. **IP 预检**：多策略绑定时合并全部绑定策略 deny 侧 IP 控制的极简 coraza 预检查器（先于全部 rate_limit/waf）——链序：信任（id:3/12 DetectionOnly）→ deny 并集（id:2）→ 遗留黑名单（id:4）→ allow 交集外拒绝（id:7）→ allow 命中豁免 GeoIP（id:13，第 58 轮裁定）→ 逐策略 GeoIP 链（800000+policyID）
 4. **阶段 0 信任直通包裹**：绑定含 stage0 直通策略（trust_detection=0）且命中信任 IP 时，以 subroute 短路后续全部安全阶段（不产生事件）；保留检测（td=1）不包裹——走 DetectionOnly 全评估不拦但全记录
 5. **encode**（压缩）：如果启用压缩且有 gzip/zstd——位于全部 waf 处理器之外侧（SR11-F3 同步：R1 裁定，coraza 响应拦截器需包在 encode 内侧）
