@@ -195,7 +195,7 @@ func threatDueSources(trigger string) ([]threatSourceRow, error) {
 		// v2.3.4 RDB 文件化：.iplist 文件缺失同此语义（哈希命中会跳过写
 		// 文件，不补这条则升级后文件永不落地、严格渲染持续跳过策略）。
 		if trigger != "manual" && nextUpdate != "" {
-			isEmpty := threatListEmpty(s.name) || threatIplistMissing(s.name)
+			isEmpty := threatListEmpty(s.name)
 			gated := !isEmpty || consecutiveFailures > 0
 			if gated {
 				if due, err := time.Parse(crsTimeLayout, nextUpdate); err == nil && now.Before(due) {
@@ -208,17 +208,13 @@ func threatDueSources(trigger string) ([]threatSourceRow, error) {
 	return sources, rows.Err()
 }
 
-// threatListEmpty 报告源对应内置名单是否为空（缺失/[] 视为空）。
+// threatListEmpty 报告源是否「未装载」（排程到期判定用）。
+// v2.3.4 RDB 文件化（稳态修复）：system 列表条目已迁至文件，DB entries=”
+// 是**正常态**而非空信号——若按 DB 判空则每个调度 tick 都视为到期，主节点
+// 每分钟空转更新（USTC 内容逐请求漂移 → .fast 每轮变化 → 从节点每轮
+// 「已同步」刷屏）。判据改为文件物化状态：.iplist 缺失 = 未装载。
 func threatListEmpty(source string) bool {
-	name := db.ThreatListNameBySource(source)
-	if name == "" {
-		return true
-	}
-	var entries string
-	if err := db.DB.QueryRow(`SELECT COALESCE(entries,'[]') FROM security_ip_lists WHERE name=?`, name).Scan(&entries); err != nil {
-		return true
-	}
-	return entries == "" || entries == "[]"
+	return threatIplistMissing(source)
 }
 
 func (m *ThreatUpdateManager) run(trigger string) {
