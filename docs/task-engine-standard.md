@@ -1,0 +1,78 @@
+# 统一任务引擎标准（lazy-task-engine SPEC v1）
+
+**裁定日**: 2026-09-29 · **适用**: v2.3.4+ 全部任务族
+
+## 1. 原则
+
+1. **单一事实源**：任务的身份/调度/状态/历史/日志/控制只有引擎一个定义点。面板、API、MCP、审计全部消费引擎产出，禁止平行任务实现。
+2. **引擎管生命周期，任务体管业务**：调度、单飞、取消、启停、历史、日志、审计框架归引擎；业务编舞（哈希/重试/回滚/竞态守卫）归任务体，原样保留。
+3. **手动 ≡ 自动**（2026-09-29 用户裁定）：同一任务体、同一审计、同一日志、同一历史；触发源仅是记录维度，不得产生行为分叉。
+4. **标准、通用、可拔插**：任务注册即接入全部能力（UI/API/MCP/审计/历史/日志）；摘除注册即干净退出，不残留。
+5. **业务解耦**：任务体经 `Descriptor` 声明接入，禁止任务代码反向依赖面板/handler；引擎不 import 业务包（业务经 wire 层组装闭包注入）。
+
+## 2. 职责边界
+
+| 面 | 引擎 | 任务体（业务） | 面板/Handler |
+|---|---|---|---|
+| 身份/类型/分类 | Descriptor 定义 | — | 只读展示 |
+| 调度 | tick 驱动、间隔/探测轮 | 排程槽 due 判定（探测体内） | 开关透传 |
+| 执行 | 单飞/主节点门/角色门 | Run 编舞 | — |
+| 取消 | ctx 管道+CancelHook | 检查点响应 | 确认弹框 |
+| 历史 | task_runs（策略见 §6） | — | 只读 |
+| 日志 | tasks/{id}.log 生命周期行 | TeeTaskLog 分阶段流水 | 暗色终端弹框 |
+| 审计 | — | **体内自记**（手动≡自动） | 人机操作（启停/暂停）才补记 |
+| 状态 | 循环态/最近终态 | StatusFn 镜像 | — |
+
+## 3. 类型（Kind = 驱动节拍；AsKind = 展示性质）
+
+| Kind | 驱动 | 用途 |
+|---|---|---|
+| Continuous | IntervalFn 动态间隔 | 常驻循环/探测轮 |
+| Scheduled | 经 Continuous 探测轮实现 | 排程槽族（AsKind=Scheduled） |
+| Queue | 无（镜像） | 队列状态镜像 |
+| Oneshot | 无 | 单次触发（启动/手动） |
+| Info | 无 | 引擎外信息行 |
+
+## 4. 状态机
+
+`running / idle / queued / failed / cancelled / stopped / disabled / passive / no_runs / interrupted`
+- 定时族：StatusFn 镜像 > 最近 task_runs 终态；循环态不外露
+- 常驻族：循环态（running/stopped）；工作感知族（CA 等待轮询）叠加有活判定
+- 下次执行：排程槽族以槽为权威（禁探测兜底）；间隔族 last+interval；未启用/常驻/队列/单发 → `—`
+
+## 5. 调度策略
+
+- 排程槽（周/时刻）：NextSlotFn 声明式读取族配置；调度正确性由探测轮体内 due 逻辑保证
+- 固定间隔：IntervalFn（动态，配置热生效经 Reschedule）
+- 探测轮：1min，SilentProbes（不落历史）
+- 角色门：RunsOn（master-only/slave-only/any）+ demote 竞态守卫留在任务体
+
+## 6. 记录策略（统一）
+
+| 记录面 | 策略 |
+|---|---|
+| task_runs 历史 | 真实运行全记；探测轮静默；高频成功轮 RecordFailuresOnly；**manual 恒记**；保留 90 天 |
+| 任务日志 tasks/{id}.log | 生命周期行 + 业务 tee；与历史同策略（静默成功轮零行）；>5MB rotate 保 .1；保留期同审计月数 |
+| 审计 | 任务体自记（更新/载入/备份等业务事件）；清理/循环轮不进审计（task_runs 即记录）；人机操作（启停/暂停/触发确认）由 handler 记 |
+| 时区 | 全部写入/展示按基础设置 timezone（engineLoc 注入） |
+
+## 7. 可拔插契约
+
+注册 = `Register(Descriptor)` + 可选 `SetAsKind/SetManualRun`；摘除 = `Unregister`。任务清单、监控页、MCP、apidocs 自动收敛。动态行（cert-job:*）经收集器并入视图，同一 TaskInfo 形状。
+
+## 8. 合规核对矩阵（16 族 + 队列卡 + 动态行）
+
+| 族 | Kind/AsKind | 状态口径 | 下次时间 | 历史 | 日志 | 审计 | 手动≡自动 | 结论 |
+|---|---|---|---|---|---|---|---|---|
+| threat/crs/ip2region | Continuous/Scheduled | 镜像>终态 | 槽✓ | ✓ | tee✓ | 体自记✓ | ✓ | 合规 |
+| auto-backup | Continuous/Scheduled | 终态 | 槽✓ | ✓(executor 记) | tee?→补 | 体自记✓ | ✓ | 日志 tee 缺 |
+| watchdog/ingestion | Continuous/Continuous | 循环态 | —✓ | 失败留痕 | 生命周期行 | 不进✓ | n/a | 合规 |
+| log-cleanup/audit/events-retention | Continuous/Scheduled | 终态 | last+24h✓ | ✓ | 生命周期行 | 不进✓ | ✓ | 合规 |
+| cert-renewal/reconcile | Continuous/Scheduled | 终态 | last+6h✓ | ✓ | 生命周期行 | 不进✓ | ✓ | 合规 |
+| cert-manual/waiting-ca | Continuous/Scheduled | 工作感知 | CA 可用时间✓ | 失败留痕 | 生命周期行 | 不进✓ | ✓ | 合规 |
+| config-load | Oneshot/Oneshot | 终态 | —✓ | ✓ | 生命周期行✓ | 体自记✓ | ✓(共享体) | 合规 |
+| cluster-sync | Info/Scheduled | 角色镜像 | last+间隔✓ | 边界(快照) | 边界 | 边界 | n/a | 声明边界 |
+| caddy 轮转 | 未注册（非任务） | — | — | — | — | — | n/a | 合规裁定 |
+| cert-job:* 动态行 | Queue | 作业状态 | —✓ | cert_jobs | 作业日志端点 | 队列域 | n/a | 合规 |
+
+**缺口清单**：auto-backup 任务日志 tee 缺失（executor 链无 TeeTaskLine）——审计项 A。
