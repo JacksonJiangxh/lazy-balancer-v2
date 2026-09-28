@@ -70,7 +70,14 @@
         </div>
       </template>
       <div class="tm-cert-body">
-        <v-chart v-if="certQueue.loaded" :option="certQueueOption" autoresize class="tm-cert-chart" />
+        <template v-if="certQueue.loaded && certQueue.total > 0">
+          <v-chart :option="certQueueOption" autoresize class="tm-cert-chart" />
+        </template>
+        <div v-else-if="certQueue.loaded" class="tm-cert-empty">
+          <el-icon :size="28" color="#34d399"><CircleCheck /></el-icon>
+          <div class="tm-cert-empty-title">队列空闲</div>
+          <div class="tm-cert-empty-sub">无签发 / 续签任务——临期证书由「证书续期扫描」自动入队</div>
+        </div>
         <div v-else class="tm-cert-chart tm-skeleton"></div>
         <div class="tm-cert-jobs" v-if="certQueue.jobs.length">
           <div class="tm-cert-jobs-title">最近任务</div>
@@ -128,8 +135,14 @@
         </el-table-column>
         <el-table-column label="调度" width="72">
           <template #default="{ row }">
-            <el-tag v-if="row.kind === 'continuous' || row.kind === 'queue'" size="small" type="info" effect="plain">常开</el-tag>
-            <el-switch v-else :model-value="row.enabled" :disabled="!canOperate || !toggleable(row.id)" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
+            <el-switch
+              v-if="row.controllable"
+              :model-value="row.status === 'running'"
+              :disabled="!isAdmin"
+              @change="() => onControl(row)"
+            />
+            <el-switch v-else-if="toggleable(row.id)" :model-value="row.enabled" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
+            <el-switch v-else :model-value="false" disabled />
           </template>
         </el-table-column>
         <el-table-column label="执行时间" width="180">
@@ -271,7 +284,7 @@ import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/compon
 import type { EChartsOption } from 'echarts'
 import VChart from 'vue-echarts'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Loading, PieChart as PieChartIcon, DataLine, List, Monitor, Lock, Box } from '@element-plus/icons-vue'
+import { Refresh, Loading, PieChart as PieChartIcon, DataLine, List, Monitor, Lock, Box, CircleCheck } from '@element-plus/icons-vue'
 import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
@@ -604,6 +617,9 @@ const fmtDuration = (ms?: number) => {
 .tm-pagination { display: flex; justify-content: flex-end; margin-top: 12px; }
 .tm-cert-body { display: flex; gap: 20px; }
 .tm-cert-chart { height: 200px; width: 300px; flex-shrink: 0; }
+.tm-cert-empty { height: 200px; width: 300px; flex-shrink: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; background: #f9fafb; border-radius: 8px; }
+.tm-cert-empty-title { font-size: 14px; font-weight: 600; color: #111827; }
+.tm-cert-empty-sub { font-size: 12px; color: #6b7280; max-width: 240px; text-align: center; line-height: 1.5; }
 .tm-cert-jobs { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
 .tm-cert-jobs-title { font-size: 12px; color: #6b7280; margin-bottom: 2px; }
 .tm-cert-job { display: flex; justify-content: space-between; font-size: 12.5px; padding: 6px 10px; background: #f9fafb; border-radius: 6px; }
@@ -621,7 +637,7 @@ const fmtDuration = (ms?: number) => {
 .tm-detail { display: flex; flex-direction: column; gap: 14px; }
 .tm-detail-desc { font-size: 13px; color: var(--el-text-color-regular); line-height: 1.7; background: var(--el-fill-color-lighter); border-radius: 8px; padding: 10px 14px; }
 .tm-detail-descs :deep(.el-descriptions__label) { white-space: nowrap; }
-.tm-detail-descs :deep(.el-descriptions__content) { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.tm-detail-descs :deep(.el-descriptions__content .el-tag) { vertical-align: middle; margin-left: 4px; }
 .tm-detail-msg { font-size: 12.5px; color: var(--el-text-color-secondary); }
 .tm-detail-section { font-size: 13px; font-weight: 600; color: var(--el-text-color-primary); margin-top: 4px; padding-top: 12px; border-top: 1px solid var(--el-border-color-lighter); }
 

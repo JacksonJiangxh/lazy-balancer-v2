@@ -23,6 +23,7 @@ const (
 	KindScheduled  Kind = "scheduled"  // 排程槽驱动
 	KindContinuous Kind = "continuous" // 常驻间隔循环
 	KindQueue      Kind = "queue"      // 队列驱动（引擎只镜像状态）
+	KindOneshot    Kind = "oneshot"    // 单次触发（启动阶段等——无循环无排程）
 	KindInfo       Kind = "info"       // 引擎外信息行（只读展示）
 )
 

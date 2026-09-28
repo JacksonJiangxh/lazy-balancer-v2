@@ -103,8 +103,11 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			Controllable: m.Controllable, Cancellable: m.Cancelable,
 			Enabled: m.Enabled, DetailHint: m.Family,
 		}
+		slotBased := false
 		if c, ok := cadences[m.ID]; ok {
 			ti.Cadence = c
+			slotBased = true // 排程槽族：下一时间以槽为权威（运行瞬间槽空/旧
+			// 不得用探测 interval 兜底——60s 探测 ≠ 下次执行，显示了就是错的）
 		} else if m.IntervalSec > 0 {
 			ti.Cadence = "每 " + humanInterval(m.IntervalSec)
 		}
@@ -142,8 +145,8 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		if lr := te.LatestRun(m.ID); lr != nil {
 			ti.LastRun = &TaskRunInfo{StartedAt: lr.StartedAt, FinishedAt: lr.FinishedAt,
 				DurationMs: lr.DurationMs, Trigger: lr.Trigger, Result: lr.Status, Message: lr.Message}
-			// 固定间隔族兜底：last + interval
-			if ti.NextRunAt == "" && m.IntervalSec > 0 && m.Enabled {
+			// 固定间隔族兜底：last + interval（排程槽族不兜底——见 slotBased）
+			if ti.NextRunAt == "" && m.IntervalSec > 0 && m.Enabled && !slotBased {
 				if t, err := time.ParseInLocation("2006-01-02 15:04:05", lr.StartedAt, CurrentLocation()); err == nil {
 					ti.NextRunAt = t.Add(time.Duration(m.IntervalSec) * time.Second).Format("2006-01-02 15:04:05")
 				}
