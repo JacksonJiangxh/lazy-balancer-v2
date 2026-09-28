@@ -91,6 +91,20 @@ func CollectSystemTasks() []TaskInfo {
 	return tasks
 }
 
+// localDisplayUTC 把 DB datetime('now')/crsTimeLayout 的 UTC 时间串转为
+// 配置时区展示（引擎 task_runs 已按配置时区写入——勿二次转换）。
+func localDisplayUTC(ts string) string {
+	if ts == "" {
+		return ts
+	}
+	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339} {
+		if t, err := time.Parse(layout, ts); err == nil {
+			return t.In(CurrentLocation()).Format("2006-01-02 15:04:05")
+		}
+	}
+	return ts
+}
+
 // taskRunFromCrsLayout 用 crsTimeLayout 时间串构造最近运行（无终态=进行中，
 // 时长计到当前时刻）。
 func taskRunFromCrsLayout(startedAt, finishedAt, trigger, result, message string) *TaskRunInfo {
@@ -153,12 +167,12 @@ func collectThreatTask() TaskInfo {
 		ti.Status = TaskStatusDisabled
 	}
 	if snap.StartedAt != "" {
-		ti.LastRun = taskRunFromCrsLayout(snap.StartedAt, snap.FinishedAt, snap.Trigger, snap.Outcome, "")
+		ti.LastRun = taskRunFromCrsLayout(localDisplayUTC(snap.StartedAt), localDisplayUTC(snap.FinishedAt), snap.Trigger, snap.Outcome, "")
 	} else {
 		// 进程重启后内存态为空——回退 DB 源行终态（最近完成源时间）
 		var lastFinished, lastStatus, lastTrigger string
 		if err := db.DB.QueryRow(`SELECT COALESCE(MAX(NULLIF(finished_at,'')),''), COALESCE(MAX(NULLIF(update_status,'')),''), COALESCE(MAX(NULLIF(trigger,'')),'') FROM security_threat_sources`).Scan(&lastFinished, &lastStatus, &lastTrigger); err == nil && lastFinished != "" {
-			ti.LastRun = taskRunFromCrsLayout(lastFinished, lastFinished, lastTrigger, lastStatus, "")
+			ti.LastRun = taskRunFromCrsLayout(localDisplayUTC(lastFinished), localDisplayUTC(lastFinished), lastTrigger, lastStatus, "")
 		}
 	}
 	// message：源级摘要 + 下次执行取最早源槽
@@ -170,7 +184,7 @@ func collectThreatTask() TaskInfo {
 		ti.LastRun.Message = strings.Join(parts, "；")
 	}
 	if next := earliestThreatNextUpdate(); next != "" {
-		ti.NextRunAt = next
+		ti.NextRunAt = localDisplayUTC(next)
 	}
 	return ti
 }
@@ -208,11 +222,11 @@ func collectCRSTask() TaskInfo {
 	if !ti.Enabled && ti.Status == TaskStatusIdle {
 		ti.Status = TaskStatusDisabled
 	}
-	ti.LastRun = taskRunFromCrsLayout(snap.StartedAt, snap.FinishedAt, snap.Trigger, snap.Status, snap.Message)
+	ti.LastRun = taskRunFromCrsLayout(localDisplayUTC(snap.StartedAt), localDisplayUTC(snap.FinishedAt), snap.Trigger, snap.Status, snap.Message)
 	if snap.Version != "" && ti.LastRun != nil {
 		ti.LastRun.Message = strings.TrimSpace("v" + strings.TrimPrefix(snap.Version, "v") + " " + ti.LastRun.Message)
 	}
-	ti.NextRunAt = next
+	ti.NextRunAt = localDisplayUTC(next)
 	return ti
 }
 
@@ -239,8 +253,8 @@ func collectIP2RegionTask() TaskInfo {
 	if !ti.Enabled && ti.Status == TaskStatusIdle {
 		ti.Status = TaskStatusDisabled
 	}
-	ti.LastRun = taskRunFromCrsLayout("", finished, "auto", status, message)
-	ti.NextRunAt = next
+	ti.LastRun = taskRunFromCrsLayout("", localDisplayUTC(finished), "auto", status, message)
+	ti.NextRunAt = localDisplayUTC(next)
 	return ti
 }
 
@@ -312,7 +326,7 @@ func collectCertTasks() []TaskInfo {
 			if end == "" {
 				end = updatedAt
 			}
-			ti.LastRun = &TaskRunInfo{StartedAt: start, FinishedAt: end, Trigger: orDefault(trigger, "auto"), Result: status, Message: message}
+			ti.LastRun = &TaskRunInfo{StartedAt: localDisplayUTC(start), FinishedAt: localDisplayUTC(end), Trigger: orDefault(trigger, "auto"), Result: status, Message: message}
 			ti.DetailHint = "certificates"
 			out = append(out, ti)
 		}
@@ -349,7 +363,7 @@ func collectAutoBackupTask() TaskInfo {
 	if status == "failed" {
 		ti.Status = TaskStatusFailed
 	}
-	ti.LastRun = &TaskRunInfo{StartedAt: created, FinishedAt: created, Trigger: trigger, Result: status, Message: fmt.Sprintf("%s (%d KB)", filename, size/1024)}
+	ti.LastRun = &TaskRunInfo{StartedAt: localDisplayUTC(created), FinishedAt: localDisplayUTC(created), Trigger: trigger, Result: status, Message: fmt.Sprintf("%s (%d KB)", filename, size/1024)}
 	// 下次执行：按排程参数算下一槽（daily/weekly/monthly）
 	if next, ok := nextAutoBackupSlot(time.Now()); ok {
 		ti.NextRunAt = next.UTC().Format(crsTimeLayout)
@@ -393,7 +407,7 @@ func collectClusterSyncTask() TaskInfo {
 		if lastSync.Valid {
 			at = lastSync.String
 		}
-		ti.LastRun = &TaskRunInfo{StartedAt: at, FinishedAt: at, Trigger: "slave-sync", Result: "success", Message: msg}
+		ti.LastRun = &TaskRunInfo{StartedAt: localDisplayUTC(at), FinishedAt: localDisplayUTC(at), Trigger: "slave-sync", Result: "success", Message: msg}
 	}
 	return ti
 }
