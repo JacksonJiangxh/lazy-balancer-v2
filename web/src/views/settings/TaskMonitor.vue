@@ -45,8 +45,8 @@
           <el-button :icon="Refresh" circle size="small" :loading="refreshing" @click="refreshNow" title="立即刷新" />
         </div>
       </template>
-      <el-table :data="pagedTasks" v-loading="!loaded" size="default" row-key="id">
-        <el-table-column label="任务" min-width="220">
+      <el-table :data="pagedTasks" v-loading="!loaded" size="default" row-key="id" class="tm-nowrap-table">
+        <el-table-column label="任务" min-width="200" show-overflow-tooltip>
           <template #default="{ row }">
             <el-tooltip
               :disabled="!row.description"
@@ -94,7 +94,7 @@
             <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="执行时间" width="175">
+        <el-table-column label="执行时间" width="170">
           <template #default="{ row }">
             <el-tooltip :disabled="!row.last_run" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <template #content>
@@ -179,6 +179,27 @@
         <el-descriptions-item v-if="detailTask.last_run?.message" label="信息" :span="2">{{ detailTask.last_run.message }}</el-descriptions-item>
         <el-descriptions-item label="24h 成功/失败" :span="2">{{ detailTask.success_24h }} / {{ detailTask.fail_24h }}</el-descriptions-item>
       </el-descriptions>
+
+      <div v-if="history.length" class="tm-history">
+        <div class="tm-history-title">最近运行</div>
+        <el-table :data="history" size="small" max-height="260" class="tm-nowrap-table">
+          <el-table-column prop="started_at" label="开始" width="165">
+            <template #default="{ row }">{{ fmtTime(row.started_at) }}</template>
+          </el-table-column>
+          <el-table-column prop="duration_ms" label="耗时" width="80">
+            <template #default="{ row }">{{ fmtDuration(row.duration_ms) }}</template>
+          </el-table-column>
+          <el-table-column prop="trigger" label="触发" width="80">
+            <template #default="{ row }">{{ triggerLabel(row.trigger) }}</template>
+          </el-table-column>
+          <el-table-column prop="status" label="结果" width="90">
+            <template #default="{ row }">
+              <el-tag size="small" :type="resultTagType(row.status)">{{ row.status }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="message" label="信息" min-width="160" show-overflow-tooltip />
+        </el-table>
+      </div>
     </el-dialog>
 
     <!-- 更新日志抽屉 -->
@@ -284,9 +305,20 @@ const pagedTasks = computed(() => {
 // 详情弹框
 const detailVisible = ref(false)
 const detailTask = ref<TaskInfo | null>(null)
-const openDetail = (row: TaskInfo) => {
+interface RunRecord {
+  id: number; task_id: string; family: string; trigger: string; status: string
+  started_at: string; finished_at: string; duration_ms: number
+  stage?: string; message?: string; entry_count?: number
+}
+const history = ref<RunRecord[]>([])
+const openDetail = async (row: TaskInfo) => {
   detailTask.value = row
   detailVisible.value = true
+  history.value = []
+  try {
+    const res = await request.get<APIResponse<{ runs: RunRecord[] }>>(`/system/tasks/${row.id}/history`, { silent: true })
+    history.value = res.data?.runs || []
+  } catch { /* 无历史族静默 */ }
 }
 const resultTagType = (r: string): 'success' | 'danger' | 'info' | 'warning' =>
   r === 'success' || r === 'issued' ? 'success' : r === 'failed' ? 'danger' : r === 'cancelled' ? 'warning' : 'info'
@@ -521,6 +553,9 @@ const fmtDuration = (ms?: number) => {
 .tm-logs-loading { display: flex; align-items: center; gap: 8px; color: var(--el-text-color-secondary); padding: 16px 0; }
 .tm-log-stage { font-size: 11px; color: var(--el-text-color-secondary); margin-bottom: 2px; text-transform: uppercase; letter-spacing: .5px; }
 .tm-pagination { display: flex; justify-content: flex-end; margin-top: 12px; }
+:deep(.tm-nowrap-table .cell) { white-space: nowrap; }
+.tm-history { margin-top: 16px; }
+.tm-history-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
 :global(.tm-name-tip) { max-width: 380px; }
 .tm-tip-title { font-weight: 600; margin-bottom: 4px; }
 .tm-tip-sep { height: 6px; }

@@ -198,7 +198,10 @@ func run() error {
 		ip2RegionManager.SetMasterRole(isMaster)
 	}
 	// 事件保留清理针对本节点本地表，与集群角色无关（从节点也摄入事件）
-	services.StartSecurityEventsRetention(context.Background())
+	// M4：任务引擎在场由引擎每日驱动；测试环境（无引擎）回退原生启动器
+	if services.TaskEngine() == nil {
+		services.StartSecurityEventsRetention(context.Background())
+	}
 	// 审计日志轮转由事件摄入循环驱动（先采集后轮转），此处无需独立启动器
 	// 安全事件采集已由任务引擎接管（InitTaskEngine 注册 2s 循环）
 	// 自动备份执行体无条件注入(断 services→handlers 反向依赖环,与角色无关);
@@ -210,7 +213,9 @@ func run() error {
 	})
 	if isMaster {
 		lifecycle.StartACME()
-		services.StartAutoBackupScheduler(context.Background())
+		if services.TaskEngine() == nil {
+			services.StartAutoBackupScheduler(context.Background())
+		}
 	} else {
 		lifecycle.StopACME()
 		lifecycle.StartSync()

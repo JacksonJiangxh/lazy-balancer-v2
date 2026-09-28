@@ -16,6 +16,11 @@ import (
 
 // SetMasterRole 按集群角色启停调度器（镜像 ip2region 同族语义）。
 func (m *ThreatUpdateManager) SetMasterRole(isMaster bool) {
+	// M3：任务引擎在场时角色切换直达引擎（调度循环由引擎驱动）
+	if TaskEngine() != nil {
+		TaskEngine().SetRole(isMaster)
+		return
+	}
 	if isMaster {
 		m.StartScheduler()
 		return
@@ -76,6 +81,14 @@ func (m *ThreatUpdateManager) StopScheduler() {
 	if stop != nil {
 		close(stop)
 		<-done
+	}
+}
+
+// ThreatSchedulerTickOnce 单轮调度探测（引擎 1min 节拍调用——到期源才
+// 启动任务；内部自带 is_master/总闸/单飞门）。
+func ThreatSchedulerTickOnce() {
+	if m := GetThreatUpdateManager(); m != nil {
+		m.schedulerTick(time.Now().UTC())
 	}
 }
 

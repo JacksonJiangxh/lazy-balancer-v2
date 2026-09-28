@@ -146,6 +146,10 @@ func loadAutoBackupSettings() (autoBackupSettingsRow, error) {
 }
 
 // autoBackupTick 执行单轮到期判定：未启用/未到期/参数非法均安全跳过。
+// AutoBackupSchedulerTickOnce 单轮备份调度探测（引擎 1min 节拍——内部
+// 自带 enabled/due 槽/last_run 补跑判定）。
+func AutoBackupSchedulerTickOnce() { autoBackupTick(time.Now()) }
+
 func autoBackupTick(now time.Time) {
 	row, err := loadAutoBackupSettings()
 	if err != nil {

@@ -57,11 +57,13 @@ type Descriptor struct {
 	//（M3 接入三更新族时启用——引擎 tick 内计算到期）。二者均空=OnDemand。
 	IntervalFn func() time.Duration
 
-	Run        func(RunContext) error
-	Singleton  bool
-	Cancelable bool
-	MasterOnly bool // Trigger/排程仅主节点（Run 侧门）
-	RunsOn     Role // 循环角色门（默认 any）
+	Run          func(RunContext) error
+	CancelHook   func() bool // 可选：取消委托（如更新族 manager.CancelRunning——引擎内部 ctx 只覆盖单轮探测体）
+	SilentProbes bool        // 探测型 Run（如 1min due 探测）不落 task_runs——真实运行由族侧 RecordRun 记录
+	Singleton    bool
+	Cancelable   bool
+	MasterOnly   bool // Trigger/排程仅主节点（Run 侧门）
+	RunsOn       Role // 循环角色门（默认 any）
 }
 
 // RunRecord task_runs 行视图。
@@ -214,6 +216,9 @@ func (e *Engine) Cancel(id string) bool {
 	if r == nil || !r.desc.Cancelable {
 		return false
 	}
+	if r.desc.CancelHook != nil {
+		return r.desc.CancelHook()
+	}
 	r.mu.Lock()
 	c := r.cancel
 	running := r.running
@@ -325,7 +330,10 @@ func (e *Engine) runNow(id, trigger string) error {
 	r.cancel = cancel
 	r.mu.Unlock()
 
-	runID := e.insertRun(id, r.desc.Family, trigger)
+	runID := int64(0)
+	if !r.desc.SilentProbes {
+		runID = globalInsertRun(id, r.desc.Family, trigger)
+	}
 	rc := RunContext{Ctx: ctx, Trigger: trigger, RunID: runID,
 		Progress: func(stage, msg string) {
 			r.mu.Lock()
@@ -363,7 +371,7 @@ func terminalStatus(ctx context.Context, err error) string {
 	return "success"
 }
 
-func (e *Engine) insertRun(taskID, family, trigger string) int64 {
+func globalInsertRun(taskID, family, trigger string) int64 {
 	if db.DB == nil {
 		return 0
 	}
@@ -442,3 +450,22 @@ func (e *Engine) roleAllows(role Role) bool {
 }
 
 var _ = fmt.Sprintf // 保留 fmt（M3 排程槽使用）
+
+// RecordRunStart 族侧真实运行开跑落库（返回 run ID；0=跳过）。
+// 引擎探测 SilentProbes 的族（更新族等），真实任务体由族 manager 在
+// run() 首尾调用 RecordRunStart/RecordRunFinish——历史与引擎同表同口径。
+func RecordRunStart(taskID, family, trigger string) int64 {
+	return globalInsertRun(taskID, family, trigger)
+}
+
+// RecordRunFinish 族侧终态落库。
+func RecordRunFinish(runID int64, status string, durMs int64, message string) {
+	if runID <= 0 {
+		return
+	}
+	if message != "" {
+		_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=datetime('now'), duration_ms=?, message=? WHERE id=?`, status, durMs, message, runID)
+		return
+	}
+	_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=datetime('now'), duration_ms=? WHERE id=?`, status, durMs, runID)
+}

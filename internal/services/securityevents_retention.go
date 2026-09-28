@@ -58,6 +58,9 @@ func securityEventsRetentionSettings() (days, max int) {
 // N-4：批间让出写锁的等待同时检查 ctx——Stop（cancel 后等待 worker 退出）
 // 得以在大批量首遍（如数据恢复后的百万行）中及时中止，不再被拖到 docker
 // SIGKILL 跳过 db.Close。
+// SecurityEventsRetentionCleanupOnce 单轮过期事件清理（引擎每日节拍）。
+func SecurityEventsRetentionCleanupOnce() { securityEventsRetentionCleanup(context.Background()) }
+
 func securityEventsRetentionCleanup(ctx context.Context) {
 	database := db.MetricsDB
 	if database == nil {

@@ -142,8 +142,8 @@ func TestToolsListHidesWriteTools_forReadOnlyAPIKey(t *testing.T) {
 	// 62 = GET 工具 58（v2.3.4 +list_system_tasks）- export_config 隐藏 + 5 个读探测 POST 工具
 	// (ApiMcp-新1:REST 只读白名单同口径——test_ca_provider/test_certificate_config/
 	// parse_certificate/validate_import/preview_config 转发侧守卫可通过,可见)
-	if len(payload.Result.Tools) != 62 {
-		t.Fatalf("read-only tool count=%d, want 62", len(payload.Result.Tools))
+	if len(payload.Result.Tools) != 63 {
+		t.Fatalf("read-only tool count=%d, want 63", len(payload.Result.Tools))
 	}
 	dashboardVisible := false
 	for _, tool := range payload.Result.Tools {

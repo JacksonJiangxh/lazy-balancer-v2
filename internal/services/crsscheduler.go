@@ -107,11 +107,22 @@ func (m *CRSUpdateManager) StopScheduler() {
 // 下载 5min + reload 30s），其版本行写入由 waf_files 差分门控重放覆盖
 // （2026-09-11 版本行归位；文件态由 wafFilesDrifted 兜底自愈）。
 func (m *CRSUpdateManager) SetMasterRole(isMaster bool) {
+	if TaskEngine() != nil {
+		TaskEngine().SetRole(isMaster)
+		return
+	}
 	if isMaster {
 		m.StartScheduler()
 		return
 	}
 	m.StopScheduler()
+}
+
+// CRSSchedulerTickOnce 单轮调度探测（引擎 1min 节拍调用）。
+func CRSSchedulerTickOnce() {
+	if m := GetCRSUpdateManager(); m != nil {
+		m.schedulerTick(time.Now().UTC(), make(chan struct{}))
+	}
 }
 
 func (m *CRSUpdateManager) schedulerTick(now time.Time, stop <-chan struct{}) {

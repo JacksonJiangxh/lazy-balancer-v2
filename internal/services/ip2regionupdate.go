@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"lazy-balancer-v2/internal/taskengine"
 	"os"
 	"path/filepath"
 	"sync"
@@ -175,6 +176,13 @@ func (m *IP2RegionUpdateManager) setStage(status IP2RegionUpdateStatus, message 
 
 // run executes the full update pipeline synchronously.
 func (m *IP2RegionUpdateManager) run(trigger string) {
+	runStarted := time.Now().UTC()
+	histRun := taskengine.RecordRunStart("ip2region", "security", trigger)
+	defer func() {
+		var status string
+		_ = db.DB.QueryRow("SELECT COALESCE(update_status,'success') FROM security_ip2region_version WHERE id=1").Scan(&status)
+		taskengine.RecordRunFinish(histRun, status, time.Since(runStarted).Milliseconds(), "")
+	}()
 	runCtx, runCancel := context.WithCancel(context.Background())
 	m.mu.Lock()
 	m.runCancel = runCancel
