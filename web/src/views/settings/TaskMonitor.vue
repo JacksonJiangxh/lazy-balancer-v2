@@ -1,40 +1,58 @@
 <template>
   <div class="tm-root">
-    <!-- 顶部图表区 -->
-    <div class="tm-charts">
-      <div class="tm-chart-card">
-        <div class="tm-chart-title">任务状态分布</div>
-        <v-chart v-if="loaded" :option="statusPieOption" autoresize class="tm-chart" />
-        <div v-else class="tm-chart tm-skeleton"></div>
-      </div>
-      <div class="tm-chart-card">
-        <div class="tm-chart-title">最近执行耗时（毫秒）</div>
-        <v-chart v-if="loaded" :option="durationBarOption" autoresize class="tm-chart" />
-        <div v-else class="tm-chart tm-skeleton"></div>
-      </div>
-      <div class="tm-chart-card">
-        <div class="tm-chart-title">24 小时执行统计</div>
-        <v-chart v-if="loaded" :option="statsBarOption" autoresize class="tm-chart" />
-        <div v-else class="tm-chart tm-skeleton"></div>
-      </div>
-    </div>
+    <!-- 顶部图表区（el-card 与仪表盘/安全总览同构） -->
+    <el-row :gutter="20" class="tm-charts">
+      <el-col :xs="24" :md="8">
+        <el-card>
+          <template #header>
+            <div class="card-header">
+              <div class="card-title"><el-icon class="title-icon"><PieChartIcon /></el-icon><span>任务状态分布</span></div>
+            </div>
+          </template>
+          <v-chart v-if="loaded" :option="statusPieOption" autoresize class="tm-chart" />
+          <div v-else class="tm-chart tm-skeleton"></div>
+        </el-card>
+      </el-col>
+      <el-col :xs="24" :md="8">
+        <el-card>
+          <template #header>
+            <div class="card-header">
+              <div class="card-title"><el-icon class="title-icon"><Timer /></el-icon><span>最近执行耗时</span></div>
+            </div>
+          </template>
+          <v-chart v-if="loaded" :option="durationBarOption" autoresize class="tm-chart" />
+          <div v-else class="tm-chart tm-skeleton"></div>
+        </el-card>
+      </el-col>
+      <el-col :xs="24" :md="8">
+        <el-card>
+          <template #header>
+            <div class="card-header">
+              <div class="card-title"><el-icon class="title-icon"><DataLine /></el-icon><span>24 小时执行统计</span></div>
+            </div>
+          </template>
+          <v-chart v-if="loaded" :option="statsBarOption" autoresize class="tm-chart" />
+          <div v-else class="tm-chart tm-skeleton"></div>
+        </el-card>
+      </el-col>
+    </el-row>
 
     <!-- 任务列表 -->
-    <div class="tm-table-card">
-      <div class="tm-table-head">
-        <div>
-          <h3 class="tm-table-title">全部任务</h3>
-          <p class="tm-table-desc">系统全部定时与后台任务族——排程、执行、完成与下次触发时间；下载类任务运行中可手动取消</p>
+    <el-card>
+      <template #header>
+        <div class="card-header">
+          <div class="card-title"><el-icon class="title-icon"><List /></el-icon><span>全部任务</span></div>
+          <el-button :icon="Refresh" circle size="small" :loading="refreshing" @click="refreshNow" title="立即刷新" />
         </div>
-        <el-button :icon="Refresh" circle :loading="refreshing" @click="refreshNow" title="立即刷新" />
-      </div>
+      </template>
       <el-table :data="pagedTasks" v-loading="!loaded" size="default" row-key="id">
         <el-table-column label="任务" min-width="220">
           <template #default="{ row }">
             <el-tooltip
               :disabled="!row.description"
-              placement="right"
-              :show-after="200"
+              placement="top"
+              :offset="4"
+              :show-after="150"
               popper-class="tm-name-tip"
             >
               <template #content>
@@ -42,11 +60,13 @@
                 <div v-if="row.cadence" class="tm-tip-cadence">节奏：{{ row.cadence }}</div>
                 <div class="tm-tip-desc">{{ row.description }}</div>
               </template>
-              <div class="tm-task-name">
-                <span>{{ row.name }}</span>
-                <span class="tm-cat">{{ row.category }}</span>
-              </div>
+              <div class="tm-task-name">{{ row.name }}</div>
             </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="所属分类" width="110" :filters="categoryFilters" :filter-method="filterCategory">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain" :type="categoryTagType(row.category)">{{ row.category }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="类型" width="86">
@@ -73,29 +93,22 @@
             <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="最近执行" width="160">
+        <el-table-column label="执行时间" width="175">
           <template #default="{ row }">
-            <span v-if="row.last_run?.started_at">{{ fmtTime(row.last_run.started_at) }}</span>
-            <span v-else class="tm-dim">—</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="完成时间" width="160">
-          <template #default="{ row }">
-            <span v-if="row.last_run?.finished_at">{{ fmtTime(row.last_run.finished_at) }}</span>
-            <span v-else-if="row.status === 'running'" class="tm-running-text">进行中</span>
-            <span v-else class="tm-dim">—</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="耗时" width="90">
-          <template #default="{ row }">
-            <span v-if="row.last_run?.duration_ms > 0">{{ fmtDuration(row.last_run.duration_ms) }}</span>
-            <span v-else class="tm-dim">—</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="下次执行" width="160">
-          <template #default="{ row }">
-            <span v-if="row.next_run_at">{{ row.next_run_at }}</span>
-            <span v-else class="tm-dim">—</span>
+            <el-tooltip :disabled="!row.last_run && !row.next_run_at" placement="top" :offset="4" :show-after="150">
+              <template #content>
+                <div class="tm-tip-title">最近执行</div>
+                <div>{{ fmtTime(row.last_run?.started_at) || '—' }}<template v-if="row.last_run?.duration_ms > 0">（耗时 {{ fmtDuration(row.last_run.duration_ms) }}）</template></div>
+                <div class="tm-tip-sep"></div>
+                <div class="tm-tip-title">完成时间</div>
+                <div>{{ row.status === 'running' ? '进行中' : fmtTime(row.last_run?.finished_at) || '—' }}</div>
+                <div class="tm-tip-sep"></div>
+                <div class="tm-tip-title">下次执行</div>
+                <div>{{ row.next_run_at || '—' }}</div>
+              </template>
+              <span v-if="row.last_run?.started_at">{{ fmtTime(row.last_run.started_at) }}</span>
+              <span v-else class="tm-dim">—</span>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="24h 成功/失败" width="120">
@@ -133,7 +146,7 @@
           @size-change="(s: number) => pageSize = s"
         />
       </div>
-    </div>
+    </el-card>
 
     <!-- 任务详情弹框 -->
     <el-dialog v-model="detailVisible" :title="`任务详情 · ${detailTask?.name || ''}`" width="560px">
@@ -184,7 +197,7 @@ import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/compon
 import type { EChartsOption } from 'echarts'
 import VChart from 'vue-echarts'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Loading } from '@element-plus/icons-vue'
+import { Refresh, Loading, PieChart as PieChartIcon, Timer, DataLine, List } from '@element-plus/icons-vue'
 import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
@@ -230,6 +243,14 @@ const canOperate = computed(() => isAdmin.value && !isSlave.value)
 const triggerableIds = new Set(['threat', 'crs', 'ip2region'])
 const toggleableIds = new Set(['threat', 'crs', 'ip2region'])
 const triggerable = (id: string) => triggerableIds.has(id)
+
+// 分类筛选（el-table 列过滤）
+const categoryFilters = computed(() =>
+  [...new Set(tasks.value.map((t) => t.category))].map((c) => ({ text: c, value: c })))
+const filterCategory = (value: string, row: TaskInfo) => row.category === value
+const categoryTagType = (c: string): 'primary' | 'success' | 'warning' | 'info' =>
+  c === '安全防护' ? 'primary' : c === '证书' ? 'success' : c === '备份' ? 'warning' : 'info'
+
 const toggleable = (id: string) => toggleableIds.has(id)
 
 // 分页(客户端)
@@ -439,19 +460,15 @@ const fmtDuration = (ms?: number) => {
 </script>
 
 <style scoped>
-.tm-root { display: flex; flex-direction: column; gap: 16px; }
-.tm-charts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-.tm-chart-card { background: var(--el-bg-color); border: 1px solid var(--el-border-color-lighter); border-radius: 10px; padding: 14px 16px 8px; }
-.tm-chart-title { font-size: 13px; font-weight: 600; color: var(--el-text-color-primary); margin-bottom: 4px; }
+.tm-root { display: flex; flex-direction: column; gap: 20px; max-width: 1500px; margin: 0 auto; width: 100%; }
+.tm-charts { margin-bottom: 0 !important; }
+.card-header { display: flex; justify-content: space-between; align-items: center; }
+.card-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: #111827; }
+.title-icon { font-size: 16px; color: #3b82f6; }
 .tm-chart { height: 210px; width: 100%; }
 .tm-skeleton { background: linear-gradient(90deg, rgba(0,0,0,.03) 25%, rgba(0,0,0,.06) 50%, rgba(0,0,0,.03) 75%); background-size: 200% 100%; animation: tm-shimmer 1.2s infinite; border-radius: 8px; }
 @keyframes tm-shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
-.tm-table-card { background: var(--el-bg-color); border: 1px solid var(--el-border-color-lighter); border-radius: 10px; padding: 16px; }
-.tm-table-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
-.tm-table-title { margin: 0; font-size: 15px; font-weight: 600; }
-.tm-table-desc { margin: 4px 0 0; font-size: 12px; color: var(--el-text-color-secondary); }
-.tm-task-name { display: flex; flex-direction: column; gap: 2px; font-weight: 500; }
-.tm-cat { font-size: 11px; color: var(--el-text-color-secondary); }
+.tm-task-name { font-weight: 500; }
 .tm-status { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; }
 .tm-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--tm-c, #9aa0b5); box-shadow: 0 0 6px var(--tm-c, transparent); }
 .tm-status[data-status="running"] { --tm-c: #4f8cff; }
@@ -472,6 +489,7 @@ const fmtDuration = (ms?: number) => {
 .tm-pagination { display: flex; justify-content: flex-end; margin-top: 12px; }
 :global(.tm-name-tip) { max-width: 380px; }
 .tm-tip-title { font-weight: 600; margin-bottom: 4px; }
+.tm-tip-sep { height: 6px; }
 .tm-tip-cadence { font-size: 12px; opacity: .85; margin-bottom: 2px; }
 .tm-tip-desc { font-size: 12px; line-height: 1.6; }
 .tm-running-text { color: #4f8cff; font-size: 12px; }
