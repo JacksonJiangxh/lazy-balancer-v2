@@ -620,6 +620,23 @@ func createTables() error {
 		app_version TEXT NOT NULL DEFAULT ''
 	);
 	CREATE INDEX IF NOT EXISTS idx_auto_backups_created_at ON auto_backups(created_at);
+	-- 统一任务引擎（v2.3.4 lazy-task-engine）：全部任务族的运行历史。
+	-- 304 空轮/纯镜像不落库；仅真实执行与终态。保留随安全事件保留清理族。
+	CREATE TABLE IF NOT EXISTS task_runs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id TEXT NOT NULL,
+		family TEXT NOT NULL,
+		trigger TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running','success','failed','cancelled','skipped','interrupted')),
+		started_at TEXT NOT NULL DEFAULT (datetime('now')),
+		finished_at TEXT DEFAULT '',
+		duration_ms INTEGER DEFAULT 0,
+		stage TEXT DEFAULT '',
+		message TEXT DEFAULT '',
+		entry_count INTEGER DEFAULT 0
+	);
+	CREATE INDEX IF NOT EXISTS idx_task_runs_task_time ON task_runs(task_id, started_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_task_runs_time ON task_runs(started_at DESC);
 	-- 威胁情报库（v2.3.x）：三个内置只读源，双开关（更新/应用）默认开；
 	-- 版本=成功更新日期（YYYY.MM.DD），状态机镜像 CRS/IP2Region 更新族。
 	CREATE TABLE IF NOT EXISTS security_threat_sources (
