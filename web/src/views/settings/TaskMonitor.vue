@@ -28,7 +28,7 @@
         </div>
         <el-button :icon="Refresh" circle :loading="refreshing" @click="refreshNow" title="立即刷新" />
       </div>
-      <el-table :data="tasks" v-loading="!loaded" size="default" row-key="id">
+      <el-table :data="pagedTasks" v-loading="!loaded" size="default" row-key="id">
         <el-table-column label="任务" min-width="220">
           <template #default="{ row }">
             <div class="tm-task-name">
@@ -61,20 +61,23 @@
             <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="最近执行" min-width="250">
+        <el-table-column label="最近执行" width="150">
           <template #default="{ row }">
-            <div v-if="row.last_run" class="tm-run">
-              <div class="tm-run-line">
-                <span class="tm-dim">开始</span> {{ fmtTime(row.last_run.started_at) || '—' }}
-                <span class="tm-dim">耗时</span> {{ fmtDuration(row.last_run.duration_ms) }}
-              </div>
-              <div class="tm-run-line">
-                <span class="tm-dim">触发</span> {{ triggerLabel(row.last_run.trigger) }}
-                <span class="tm-dim">完成</span> {{ fmtTime(row.last_run.finished_at) || '—' }}
-              </div>
-              <div v-if="row.last_run.message" class="tm-run-msg" :title="row.last_run.message">{{ row.last_run.message }}</div>
-            </div>
-            <span v-else class="tm-dim">从未执行</span>
+            <span v-if="row.last_run?.started_at">{{ fmtTime(row.last_run.started_at) }}</span>
+            <span v-else class="tm-dim">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="完成时间" width="150">
+          <template #default="{ row }">
+            <span v-if="row.last_run?.finished_at">{{ fmtTime(row.last_run.finished_at) }}</span>
+            <span v-else-if="row.status === 'running'" class="tm-running-text">进行中</span>
+            <span v-else class="tm-dim">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="耗时" width="90">
+          <template #default="{ row }">
+            <span v-if="row.last_run?.duration_ms > 0">{{ fmtDuration(row.last_run.duration_ms) }}</span>
+            <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
         <el-table-column label="下次执行" min-width="150">
@@ -88,7 +91,7 @@
             <span class="tm-ok">{{ row.success_24h }}</span> / <span :class="{ 'tm-bad': row.fail_24h > 0 }">{{ row.fail_24h }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="200" fixed="right">
+        <el-table-column label="操作" width="230" fixed="right">
           <template #default="{ row }">
             <el-button
               v-if="triggerable(row.id)"
@@ -99,6 +102,7 @@
               v-if="row.id === 'threat' || row.id === 'crs' || row.id === 'ip2region'"
               link type="info" size="small" @click="openLogs(row)"
             >日志</el-button>
+            <el-button link type="info" size="small" @click="openDetail(row)">详情</el-button>
             <el-button
               v-if="row.cancellable"
               link type="danger" size="small" :disabled="!isAdmin"
@@ -107,7 +111,38 @@
           </template>
         </el-table-column>
       </el-table>
+      <div class="tm-pagination">
+        <el-pagination
+          v-model:current-page="page"
+          :page-size="pageSize"
+          :page-sizes="[10, 20, 50]"
+          :total="tasks.length"
+          layout="total, sizes, prev, pager, next"
+          @size-change="(s: number) => pageSize = s"
+        />
+      </div>
     </div>
+
+    <!-- 任务详情弹框 -->
+    <el-dialog v-model="detailVisible" :title="`任务详情 · ${detailTask?.name || ''}`" width="560px">
+      <el-descriptions v-if="detailTask" :column="2" border size="small">
+        <el-descriptions-item label="任务 ID">{{ detailTask.id }}</el-descriptions-item>
+        <el-descriptions-item label="分类">{{ detailTask.category }}</el-descriptions-item>
+        <el-descriptions-item label="类型">{{ kindLabel(detailTask.kind) }}</el-descriptions-item>
+        <el-descriptions-item label="状态">{{ statusLabel(detailTask.status) }}</el-descriptions-item>
+        <el-descriptions-item label="自动调度">{{ detailTask.kind === 'continuous' ? '常驻' : detailTask.enabled ? '开启' : '暂停' }}</el-descriptions-item>
+        <el-descriptions-item label="下次执行">{{ detailTask.next_run_at || '—' }}</el-descriptions-item>
+        <el-descriptions-item v-if="detailTask.last_run" label="开始时间" :span="1">{{ fmtTime(detailTask.last_run.started_at) || '—' }}</el-descriptions-item>
+        <el-descriptions-item v-if="detailTask.last_run" label="完成时间">{{ fmtTime(detailTask.last_run.finished_at) || '进行中' }}</el-descriptions-item>
+        <el-descriptions-item v-if="detailTask.last_run" label="耗时">{{ fmtDuration(detailTask.last_run.duration_ms) }}</el-descriptions-item>
+        <el-descriptions-item v-if="detailTask.last_run" label="触发源">{{ triggerLabel(detailTask.last_run.trigger) }}</el-descriptions-item>
+        <el-descriptions-item v-if="detailTask.last_run" label="执行结果" :span="2">
+          <el-tag size="small" :type="resultTagType(detailTask.last_run.result)">{{ detailTask.last_run.result || '—' }}</el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item v-if="detailTask.last_run?.message" label="信息" :span="2">{{ detailTask.last_run.message }}</el-descriptions-item>
+        <el-descriptions-item label="24h 成功/失败" :span="2">{{ detailTask.success_24h }} / {{ detailTask.fail_24h }}</el-descriptions-item>
+      </el-descriptions>
+    </el-dialog>
 
     <!-- 更新日志抽屉 -->
     <el-drawer v-model="logsVisible" :title="`更新日志 · ${logsTask?.name || ''}`" size="520px">
@@ -180,6 +215,24 @@ const triggerableIds = new Set(['threat', 'crs', 'ip2region'])
 const toggleableIds = new Set(['threat', 'crs', 'ip2region'])
 const triggerable = (id: string) => triggerableIds.has(id)
 const toggleable = (id: string) => toggleableIds.has(id)
+
+// 分页(客户端)
+const page = ref(1)
+const pageSize = ref(20)
+const pagedTasks = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return tasks.value.slice(start, start + pageSize.value)
+})
+
+// 详情弹框
+const detailVisible = ref(false)
+const detailTask = ref<TaskInfo | null>(null)
+const openDetail = (row: TaskInfo) => {
+  detailTask.value = row
+  detailVisible.value = true
+}
+const resultTagType = (r: string): 'success' | 'danger' | 'info' | 'warning' =>
+  r === 'success' || r === 'issued' ? 'success' : r === 'failed' ? 'danger' : r === 'cancelled' ? 'warning' : 'info'
 
 const fetchTasks = async () => {
   const res = await request.get<APIResponse<{ tasks: TaskInfo[] }>>('/system/tasks', { silent: true })
@@ -392,5 +445,7 @@ const fmtDuration = (ms?: number) => {
 .tm-bad { color: #f87171; font-weight: 600; }
 .tm-logs-loading { display: flex; align-items: center; gap: 8px; color: var(--el-text-color-secondary); padding: 16px 0; }
 .tm-log-stage { font-size: 11px; color: var(--el-text-color-secondary); margin-bottom: 2px; text-transform: uppercase; letter-spacing: .5px; }
+.tm-pagination { display: flex; justify-content: flex-end; margin-top: 12px; }
+.tm-running-text { color: #4f8cff; font-size: 12px; }
 @media (max-width: 1100px) { .tm-charts { grid-template-columns: 1fr; } }
 </style>
