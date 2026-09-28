@@ -141,7 +141,7 @@ func (m *CRSUpdateManager) cleanupLegacyCRSTransient() {
 	}
 }
 
-func (m *CRSUpdateManager) downloadAndInstall(tag string) error {
+func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string) error {
 	// 每次运行重置：restoreBackup 仅消费本运行创建的 overrides 备份（R39 1.1）。
 	m.overridesBakCreated = false
 	m.setStage(CRSStatusDownloading, fmt.Sprintf("下载 %s", tag))
@@ -158,7 +158,7 @@ func (m *CRSUpdateManager) downloadAndInstall(tag string) error {
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
 	defer cancel()
 	tarball := filepath.Join(staging, "crs.tar.gz")
 	if err := m.downloadTarballLogged(ctx, tag, tarball); err != nil {

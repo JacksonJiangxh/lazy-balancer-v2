@@ -101,9 +101,9 @@ func TestMCPEndpointAuthenticationGatesAndProtocol(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	// 129 = 全量工具数（export_config 已恢复：HTTP 层对只读 Key 403、只读可见性对其隐藏；GET 工具随版本递增——含 get_ip_list（F50-2，第 50 轮审计），与 server_test 的只读 61 同步维护）
-	if len(payload.Result.Tools) != 129 {
-		t.Fatalf("tool count=%d, want 129", len(payload.Result.Tools))
+	// 133 = 全量工具数（v2.3.4 +4 任务监控工具：list_system_tasks/trigger/toggle/cancel；与 server_test 只读 62 同步维护）
+	if len(payload.Result.Tools) != 133 {
+		t.Fatalf("tool count=%d, want 133", len(payload.Result.Tools))
 	}
 }
 

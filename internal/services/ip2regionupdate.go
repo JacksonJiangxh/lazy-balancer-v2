@@ -48,7 +48,9 @@ type IP2RegionUpdateManager struct {
 
 	reloader       func() error
 	fetchLatestTag func(ctx context.Context) (tag string, err error)
-	downloadXDB    func(ctx context.Context, tag, destPath string, progress downloadProgressFunc) error
+	// runCancel 取消当前运行中的下载阶段（任务监控手动取消，v2.3.4）。
+	runCancel   context.CancelFunc
+	downloadXDB func(ctx context.Context, tag, destPath string, progress downloadProgressFunc) error
 
 	schedulerMu       sync.Mutex
 	schedulerStop     chan struct{}
@@ -173,7 +175,12 @@ func (m *IP2RegionUpdateManager) setStage(status IP2RegionUpdateStatus, message 
 
 // run executes the full update pipeline synchronously.
 func (m *IP2RegionUpdateManager) run(trigger string) {
+	runCtx, runCancel := context.WithCancel(context.Background())
+	m.mu.Lock()
+	m.runCancel = runCancel
+	m.mu.Unlock()
 	defer func() {
+		runCancel()
 		m.mu.Lock()
 		m.running = false
 		m.mu.Unlock()
@@ -205,7 +212,7 @@ func (m *IP2RegionUpdateManager) run(trigger string) {
 	var tag string
 	err := runWithInTaskRetry(func() error {
 		var ferr error
-		tag, ferr = m.fetchLatestTag(context.Background())
+		tag, ferr = m.fetchLatestTag(runCtx)
 		if _, dbErr := db.DB.Exec("UPDATE security_ip2region_version SET last_checked=datetime('now') WHERE id=1"); dbErr != nil {
 			Logf("error", "ip2region update: failed to record last_checked: %v", dbErr)
 		}
@@ -254,7 +261,7 @@ func (m *IP2RegionUpdateManager) run(trigger string) {
 
 	var installErr error
 	_ = runWithInTaskRetry(func() error {
-		installErr = m.downloadAndInstall(tag)
+		installErr = m.downloadAndInstall(runCtx, tag)
 		// errIP2RegionReload=内存热换失败（fail-open 回滚路径），非瞬断——不重试。
 		if errors.Is(installErr, errIP2RegionReload) {
 			return nil
@@ -381,7 +388,7 @@ func (m *IP2RegionUpdateManager) fail(cause error) {
 }
 
 // downloadAndInstall downloads, validates and atomically swaps in the new xdb.
-func (m *IP2RegionUpdateManager) downloadAndInstall(tag string) error {
+func (m *IP2RegionUpdateManager) downloadAndInstall(parent context.Context, tag string) error {
 	m.setStage(IP2RegionStatusDownloading, fmt.Sprintf("下载 %s", tag))
 	stagingDir := filepath.Join(filepath.Dir(ip2regionLivePath), ".staging")
 	if err := os.RemoveAll(stagingDir); err != nil {
@@ -396,7 +403,7 @@ func (m *IP2RegionUpdateManager) downloadAndInstall(tag string) error {
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 15*time.Minute)
 	defer cancel()
 	staged := filepath.Join(stagingDir, "ip2region_v4.xdb")
 	if err := m.downloadXDBLogged(ctx, tag, staged); err != nil {
@@ -599,4 +606,17 @@ func validateIP2RegionXDB(path string) error {
 		return fmt.Errorf("校验 ip2region xdb 搜索失败: %w", err)
 	}
 	return nil
+}
+
+// CancelRunning 取消当前运行中的更新（下载阶段中断）。无运行中任务返回 false。
+func (m *IP2RegionUpdateManager) CancelRunning() bool {
+	m.mu.Lock()
+	cancel := m.runCancel
+	running := m.running
+	m.mu.Unlock()
+	if cancel == nil || !running {
+		return false
+	}
+	cancel()
+	return true
 }

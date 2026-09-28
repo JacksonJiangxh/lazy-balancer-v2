@@ -242,6 +242,8 @@ const ACTION_TAG_TABLE: Record<string, string> = {
   '测试成功': 'success',
   '登录成功': 'success',
   '恢复': 'success',
+  '暂停': 'warning',
+  '取消': 'warning',
   '配置恢复': 'success',
   '载入': 'success',
   '校验成功': 'success',

@@ -32,6 +32,8 @@ type toolSpec struct {
 	schema      string
 }
 
+const toggleTaskSchema = `{"type":"object","required":["enabled"],"properties":{"enabled":{"type":"boolean","description":"true=恢复 false=暂停"}}}`
+
 var tools = []toolSpec{
 	{"list_rules", "列出全部负载均衡规则", http.MethodGet, "/rules", nil, nil, emptySchema},
 	{"get_rule", "获取指定负载均衡规则详情", http.MethodGet, "/rules/{caddy_id}", []string{"caddy_id"}, nil, idSchema("caddy_id", "规则 Caddy ID", "string")},
@@ -123,6 +125,11 @@ var tools = []toolSpec{
 	{"set_cluster_mode", "注册并切换为从节点（standalone/master → slave，需主节点审批）", http.MethodPost, "/cluster/mode", nil, nil, bodySchema},
 	{"promote_cluster", "将从节点提升为主节点", http.MethodPost, "/cluster/promote", nil, nil, emptySchema},
 	{"pull_sync", "手动触发从节点同步", http.MethodPost, "/cluster/sync/pull", nil, nil, emptySchema},
+	// 任务监控（v2.3.4）：聚合视图 + 三操作
+	{"list_system_tasks", "任务监控聚合视图（全部定时/后台任务族状态）", http.MethodGet, "/system/tasks", nil, nil, emptySchema},
+	{"trigger_system_task", "手动触发任务（threat/crs/ip2region）", http.MethodPost, "/system/tasks/{id}/trigger", []string{"id"}, nil, idSchema("id", "任务 ID（threat/crs/ip2region）", "string")},
+	{"toggle_system_task", "暂停/恢复任务自动调度", http.MethodPost, "/system/tasks/{id}/toggle", []string{"id"}, nil, toggleTaskSchema},
+	{"cancel_system_task", "取消运行中任务（仅下载类）", http.MethodPost, "/system/tasks/{id}/cancel", []string{"id"}, nil, idSchema("id", "任务 ID", "string")},
 	{"update_cluster_settings", "更新集群同步设置", http.MethodPut, "/cluster/settings", nil, nil, bodySchema},
 	{"list_certificate_configs", "列出全部 DNS 证书配置", http.MethodGet, "/certificate-configs", nil, nil, emptySchema},
 	{"create_certificate_config", "创建 DNS 证书配置", http.MethodPost, "/certificate-configs", nil, nil, bodySchema},

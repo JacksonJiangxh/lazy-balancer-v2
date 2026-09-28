@@ -51,6 +51,10 @@ type ThreatUpdateManager struct {
 	runDone       chan struct{}
 	schedulerStop chan struct{}
 	schedulerDone chan struct{}
+	// runCancel 取消当前运行中的下载阶段（任务监控手动取消，v2.3.4）。
+	runCancel context.CancelFunc
+	// lastCancelled 标记最近一次运行被手动取消（区分 failed）。
+	lastCancelled bool
 	// lastTrigger/lastFinishedAt 为任务级状态（status 端点 + 弹框展示）。
 	lastTrigger     string
 	lastStartedAt   string
@@ -95,17 +99,20 @@ type ThreatTaskStatus struct {
 	StartedAt  string `json:"started_at"`
 	FinishedAt string `json:"finished_at"`
 	Outcome    string `json:"outcome"`
+	// Cancellable: 运行中且支持手动取消（任务监控，v2.3.4）。
+	Cancellable bool `json:"cancellable"`
 }
 
 func (m *ThreatUpdateManager) StatusSnapshot() ThreatTaskStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return ThreatTaskStatus{
-		Running:    m.running,
-		Trigger:    m.lastTrigger,
-		StartedAt:  m.lastStartedAt,
-		FinishedAt: m.lastFinishedAt,
-		Outcome:    m.lastTaskOutcome,
+		Running:     m.running,
+		Trigger:     m.lastTrigger,
+		StartedAt:   m.lastStartedAt,
+		FinishedAt:  m.lastFinishedAt,
+		Outcome:     m.lastTaskOutcome,
+		Cancellable: m.running,
 	}
 }
 
@@ -231,10 +238,14 @@ func (m *ThreatUpdateManager) run(trigger string) {
 		m.mu.Unlock()
 		return
 	}
+	runCtx, runCancel := context.WithCancel(context.Background())
 	m.mu.Lock()
 	m.lastTrigger = trigger
 	m.lastStartedAt = time.Now().UTC().Format(crsTimeLayout)
+	m.lastCancelled = false
+	m.runCancel = runCancel
 	m.mu.Unlock()
+	defer runCancel()
 	sources, err := threatDueSources(trigger)
 	finishWith := func(outcome string) {
 		m.mu.Lock()
@@ -254,8 +265,14 @@ func (m *ThreatUpdateManager) run(trigger string) {
 	AppendThreatUpdateLog("INFO", "checking", fmt.Sprintf("开始更新威胁情报库（%d 个启用源）", len(sources)))
 	var changedIDs []int // 内容真实变化的名单 id（重载门的判定面）
 	anyFailed := false
+	cancelled := false
 	for _, source := range sources {
-		changed, failed := m.updateOneSource(source, trigger)
+		if runCtx.Err() != nil {
+			cancelled = true
+			AppendThreatUpdateLog("WARN", "cancelled", "威胁情报库更新已被手动取消（已完成源的结果保留）")
+			break
+		}
+		changed, failed := m.updateOneSource(runCtx, source, trigger)
 		if changed {
 			if id := threatListIDBySource(source.name); id > 0 {
 				changedIDs = append(changedIDs, id)
@@ -265,7 +282,10 @@ func (m *ThreatUpdateManager) run(trigger string) {
 	}
 	m.mu.Lock()
 	m.lastFinishedAt = time.Now().UTC().Format(crsTimeLayout)
-	if anyFailed {
+	if cancelled {
+		m.lastTaskOutcome = "cancelled"
+		m.lastCancelled = true
+	} else if anyFailed {
 		m.lastTaskOutcome = "failed"
 	} else {
 		m.lastTaskOutcome = "success"
@@ -348,7 +368,7 @@ func threatListsReferencedByEnabledPolicy(listIDs []int) bool {
 
 // updateOneSource 下载→解析→写内置名单→更新行状态；失败仅影响该源。
 // 返回（名单内容是否变化， 是否失败）。
-func (m *ThreatUpdateManager) updateOneSource(source threatSourceRow, trigger string) (bool, bool) {
+func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threatSourceRow, trigger string) (bool, bool) {
 	now := time.Now().UTC()
 	nowStr := now.Format(crsTimeLayout)
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='running', message='', trigger=?, started_at=?, last_checked=?, updated_at=datetime('now') WHERE id=?`,
@@ -364,7 +384,7 @@ func (m *ThreatUpdateManager) updateOneSource(source threatSourceRow, trigger st
 	var rawHash string
 	err := runWithInTaskRetry(func() error {
 		var derr error
-		entries, rawHash, derr = downloadAndParseThreatSource(source)
+		entries, rawHash, derr = downloadAndParseThreatSourceCtx(ctx, source)
 		return derr
 	}, func(nextAttempt int, wait time.Duration, rerr error) {
 		AppendThreatUpdateLog("WARN", "retry", fmt.Sprintf("源 %s 下载失败: %v；等待 %s 重试，第 %d 次，共 %d 次", source.name, rerr, wait, nextAttempt, updateMaxAttempts))
@@ -547,7 +567,12 @@ func failSourceRow(id int, finished string, cause error) {
 // 返回原始字节 sha256（两层哈希第一层快速路径，2026-09-24 用户裁定）：
 // 原始一致即内容必然未变，调用方跳过聚合/写库；原始不同才走聚合规范哈希终判。
 func downloadAndParseThreatSource(source threatSourceRow) ([]string, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), threatDownloadTimeout)
+	return downloadAndParseThreatSourceCtx(context.Background(), source)
+}
+
+// downloadAndParseThreatSourceCtx 下载并解析单源（ctx 可被任务监控取消）。
+func downloadAndParseThreatSourceCtx(parent context.Context, source threatSourceRow) ([]string, string, error) {
+	ctx, cancel := context.WithTimeout(parent, threatDownloadTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source.url, nil)
 	if err == nil {
@@ -619,3 +644,16 @@ func writeThreatIplist(path string, entries []string) error {
 
 // WafDir 返回 waf 目录路径（导入/导出用）。
 func WafDir() string { return wafDir }
+
+// CancelRunning 取消当前运行中的更新（下载阶段中断，已完成源结果保留）。
+// 无运行中任务时返回 false。
+func (m *ThreatUpdateManager) CancelRunning() bool {
+	m.mu.Lock()
+	cancel := m.runCancel
+	m.mu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}

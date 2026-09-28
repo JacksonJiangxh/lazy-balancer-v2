@@ -78,7 +78,11 @@ var auditRoutePolicies = map[string]AuditPolicy{
 	"PUT /api/v1/admin-tls":                AuditPolicyExplicit,
 	"POST /api/v1/admin-tls/inspect":       AuditPolicySkip,
 	"POST /api/v1/system/restart":          AuditPolicyGeneric,
-	"POST /api/v1/config/reload":           AuditPolicyGeneric,
+	// 任务监控（v2.3.4）：三操作 handler 均显式留痕
+	"POST /api/v1/system/tasks/:id/trigger": AuditPolicyExplicit,
+	"POST /api/v1/system/tasks/:id/toggle":  AuditPolicyExplicit,
+	"POST /api/v1/system/tasks/:id/cancel":  AuditPolicyExplicit,
+	"POST /api/v1/config/reload":            AuditPolicyGeneric,
 	// R69 C-N3-c：validate 经 /load 真实加载候选配置（handler 成功后回弹权威
 	// 配置）——不再豁免审计，handler 显式记录校验三态。
 	"POST /api/v1/config/validate":                        AuditPolicyExplicit,
