@@ -39,21 +39,22 @@ const (
 
 // TaskInfo 是单任务族的聚合视图。
 type TaskInfo struct {
-	ID          string       `json:"id"`
-	Name        string       `json:"name"`
-	Description string       `json:"description,omitempty"` // 任务作用说明（任务名 hover 提示）
-	Cadence     string       `json:"cadence,omitempty"`     // 运行节奏（如「每 6 小时」；非下次时间）
-	Category    string       `json:"category"`              // 安全防护/证书/备份/集群/系统
-	Kind        TaskKind     `json:"kind"`
-	Status      TaskStatus   `json:"status"`
-	Enabled     bool         `json:"enabled"`     // 自动调度开关
-	Cancellable bool         `json:"cancellable"` // 运行中可手动取消（仅下载类）
-	LastRun     *TaskRunInfo `json:"last_run,omitempty"`
-	NextRunAt   string       `json:"next_run_at,omitempty"`
-	Runs24h     int          `json:"runs_24h"`
-	Success24h  int          `json:"success_24h"`
-	Fail24h     int          `json:"fail_24h"`
-	DetailHint  string       `json:"detail_hint,omitempty"` // 前端详情跳转提示
+	ID           string       `json:"id"`
+	Name         string       `json:"name"`
+	Description  string       `json:"description,omitempty"` // 任务作用说明（任务名 hover 提示）
+	Cadence      string       `json:"cadence,omitempty"`     // 运行节奏（如「每 6 小时」；非下次时间）
+	Category     string       `json:"category"`              // 安全防护/证书/备份/集群/系统
+	Kind         TaskKind     `json:"kind"`
+	Status       TaskStatus   `json:"status"`
+	Enabled      bool         `json:"enabled"`      // 自动调度开关
+	Cancellable  bool         `json:"cancellable"`  // 运行中可手动取消（仅下载类）
+	Controllable bool         `json:"controllable"` // 常驻循环可启停（start/stop/restart）
+	LastRun      *TaskRunInfo `json:"last_run,omitempty"`
+	NextRunAt    string       `json:"next_run_at,omitempty"`
+	Runs24h      int          `json:"runs_24h"`
+	Success24h   int          `json:"success_24h"`
+	Fail24h      int          `json:"fail_24h"`
+	DetailHint   string       `json:"detail_hint,omitempty"` // 前端详情跳转提示
 }
 
 // TaskRunInfo 最近一次运行。
@@ -83,6 +84,7 @@ func CollectSystemTasks() []TaskInfo {
 		collectLogCleanupTask(),
 		collectSecurityEventsRetention(),
 		collectAuditRetentionTask(),
+		collectCaddyAccessLogRotation(),
 	)
 	return tasks
 }
@@ -346,6 +348,10 @@ func collectAutoBackupTask() TaskInfo {
 		ti.Status = TaskStatusFailed
 	}
 	ti.LastRun = &TaskRunInfo{StartedAt: created, FinishedAt: created, Trigger: trigger, Result: status, Message: fmt.Sprintf("%s (%d KB)", filename, size/1024)}
+	// 下次执行：按排程参数算下一槽（daily/weekly/monthly）
+	if next, ok := nextAutoBackupSlot(time.Now()); ok {
+		ti.NextRunAt = next.UTC().Format(crsTimeLayout)
+	}
 	var runs, fails int
 	if err := db.DB.QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0) FROM auto_backups WHERE created_at > datetime('now','-1 day')`).Scan(&runs, &fails); err == nil {
 		ti.Runs24h = runs
@@ -392,7 +398,16 @@ func collectClusterSyncTask() TaskInfo {
 
 // collectWatchdogTask 配置漂移看门狗（60s 常驻）。
 func collectWatchdogTask() TaskInfo {
-	return TaskInfo{ID: "config-watchdog", Name: "配置漂移看门狗", Description: "每 60 秒比对运行中 Caddy 配置与数据库期望配置，漂移时面板横幅告警并触发对账", Cadence: "每 60 秒", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusPassive, DetailHint: "watchdog"}
+	rt, _ := TaskRuntimeState("config-watchdog")
+	sts := TaskStatusPassive
+	if r, ctrl := TaskRuntimeState("config-watchdog"); ctrl {
+		sts = TaskStatusIdle
+		if r {
+			sts = TaskStatusRunning
+		}
+	}
+	_ = rt
+	return TaskInfo{ID: "config-watchdog", Name: "配置漂移看门狗", Description: "每 60 秒比对运行中 Caddy 配置与数据库期望配置，漂移时面板横幅告警并触发对账", Cadence: "每 60 秒", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: sts, Controllable: true, DetailHint: "watchdog"}
 }
 
 // collectAuditRetentionTask 审计日志保留清理。
@@ -408,12 +423,12 @@ func collectAuditRetentionTask() TaskInfo {
 // collectSecurityEventsIngestion 安全事件采集（coraza audit 尾读摄取+轮转，
 // 2s tick——安全总览/事件页数据源）。
 func collectSecurityEventsIngestion() TaskInfo {
-	return TaskInfo{ID: "security-events-ingestion", Name: "安全事件采集", Description: "尾读 coraza WAF 审计日志并摄取为安全事件（安全总览/事件页的数据源），含审计日志轮转跟随", Cadence: "每 2 秒", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusRunning, DetailHint: "security-events"}
+	return TaskInfo{ID: "security-events-ingestion", Name: "安全事件采集", Description: "尾读 coraza WAF 审计日志并摄取为安全事件（安全总览/事件页的数据源），含审计日志轮转跟随", Cadence: "每 2 秒", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: continuousStatus("security-events-ingestion"), Controllable: true, DetailHint: "security-events"}
 }
 
 // collectLogRotateTask 运行日志尺寸轮转（30s 检查 + 超限 copytruncate）。
 func collectLogRotateTask() TaskInfo {
-	return TaskInfo{ID: "log-rotate", Name: "运行日志尺寸轮转", Description: "按「日志大小上限」设置检查应用运行日志，超限即轮转（copytruncate，不丢正在写入的行）", Cadence: "每 30 秒", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusRunning}
+	return TaskInfo{ID: "log-rotate", Name: "运行日志尺寸轮转", Description: "按「日志大小上限」设置检查应用运行日志，超限即轮转（copytruncate，不丢正在写入的行）", Cadence: "每 30 秒", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusPassive}
 }
 
 // collectLogCleanupTask 旧日志文件清理（每日——logrotate 保留窗清理）。
@@ -425,4 +440,51 @@ func collectLogCleanupTask() TaskInfo {
 // 保留期清理）。
 func collectSecurityEventsRetention() TaskInfo {
 	return TaskInfo{ID: "security-events-retention", Name: "安全事件保留清理", Description: "按保留期配置删除 metrics 库中过期的安全事件记录", Cadence: "每日", Category: "系统", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, DetailHint: "security-events"}
+}
+
+// nextAutoBackupSlot 计算自动备份的下一执行槽（复用 autoBackupDueSlot
+// 逐槽推进语义；禁用或参数非法返回 false）。
+func nextAutoBackupSlot(now time.Time) (time.Time, bool) {
+	row, err := loadAutoBackupSettings()
+	if err != nil || !row.enabled {
+		return time.Time{}, false
+	}
+	loc := CurrentLocation()
+	due, ok := autoBackupDueSlot(now.In(loc), row.freq, row.hhmm, row.day, loc)
+	if !ok {
+		return time.Time{}, false
+	}
+	if !due.After(now.In(loc)) {
+		// 当前槽已触发（last_run 已吃掉）——推进一天再算
+		due, ok = autoBackupDueSlot(now.In(loc).Add(24*time.Hour), row.freq, row.hhmm, row.day, loc)
+	}
+	return due, ok
+}
+
+// continuousStatus 常驻任务真实运行态（有控制面用其状态，否则 running）。
+func continuousStatus(id string) TaskStatus {
+	if r, ok := TaskRuntimeState(id); ok {
+		if r {
+			return TaskStatusRunning
+		}
+		return TaskStatusIdle
+	}
+	return TaskStatusRunning
+}
+
+// scheduledRuntimeStatus 日清理类任务的运行态（调度循环在跑=running）。
+func scheduledRuntimeStatus(id string) TaskStatus {
+	if r, ok := TaskRuntimeState(id); ok && r {
+		return TaskStatusRunning
+	}
+	return TaskStatusPassive
+}
+
+// collectCaddyAccessLogRotation Caddy 访问日志轮转（引擎内置——非本进程
+// goroutine，随生成的 Caddy 日志配置生效：roll_size_mb=日志大小上限设置、
+// roll_keep=5；被动信息行）。
+func collectCaddyAccessLogRotation() TaskInfo {
+	sizeMB := 100
+	_ = db.DB.QueryRow("SELECT COALESCE(caddy_log_size_mb,100) FROM global_config WHERE id=1").Scan(&sizeMB)
+	return TaskInfo{ID: "caddy-access-log-rotation", Name: "Caddy 访问日志轮转", Description: "由 Caddy 引擎内置执行（非面板进程任务）：访问日志超过大小上限即轮转，保留 5 份；上限在基础设置的 Caddy 日志大小中调整", Cadence: fmt.Sprintf("持续（超过 %d MB 轮转）", sizeMB), Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusPassive}
 }

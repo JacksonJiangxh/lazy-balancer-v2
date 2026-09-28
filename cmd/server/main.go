@@ -86,7 +86,9 @@ func run() error {
 	// 品牌载入留痕(2026-09-11 裁定):操作日志+系统日志记录各字段自定义/默认。
 	handlers.StartupBrandingLog(cfg.DataDir)
 	if runtimeLogFile != "" {
-		services.StartRuntimeLogCleanup(runtimeLogFile)
+		logCleanupRT := services.MakeLogCleanupRuntime(runtimeLogFile)
+		logCleanupRT.Start()
+		services.RegisterTaskRuntime("log-cleanup", logCleanupRT)
 	}
 
 	if *initDB {
@@ -168,6 +170,7 @@ func run() error {
 	// 配置一致性看门狗：周期比对 DB 规则与 Caddy 运行配置，不一致时三通道告知
 	// （系统日志/操作日志/前端横幅），恢复由用户手动重启完成。
 	services.StartConfigWatchdog(cfg.CaddyAdminURL)
+	services.RegisterTaskRuntime("config-watchdog", services.MakeWatchdogRuntime(cfg.CaddyAdminURL))
 
 	// Setup router
 	router := middleware.SetupRouter(h, cfg)
@@ -197,8 +200,11 @@ func run() error {
 	// 事件保留清理针对本节点本地表，与集群角色无关（从节点也摄入事件）
 	services.StartSecurityEventsRetention(context.Background())
 	// 审计日志轮转由事件摄入循环驱动（先采集后轮转），此处无需独立启动器
-	eventsIngestCtx, stopEventsIngestion := context.WithCancel(context.Background())
-	eventsIngestWait := services.StartSecurityEventsIngestion(eventsIngestCtx)
+	// 安全事件采集经任务运行时注册表启动（任务监控启停/状态消费同一控制面）
+	eventsIngestRT := services.MakeSecurityEventsIngestionRuntime()
+	eventsIngestRT.Start()
+	services.RegisterTaskRuntime("security-events-ingestion", eventsIngestRT)
+	stopEventsIngestion := eventsIngestRT.Stop
 	// 自动备份执行体无条件注入(断 services→handlers 反向依赖环,与角色无关);
 	// 调度器仅主节点运行——启动装配在本分支,promote 路径(services/cluster.go)
 	// 对称拉起,demote(BecomeSlave)停止,全程无需重启进程。
@@ -217,7 +223,7 @@ func run() error {
 		// 审计 A5-S2：事件摄入与其余 worker 同生命周期——db.Close 前 cancel，
 		// 否则退出窗口内每 2s 对已关闭 MetricsDB 刷 "database is closed" 告警。
 		stopEventsIngestion()
-		eventsIngestWait()
+		_ = stopEventsIngestion
 		metricsService.Stop()
 		<-metricsDone
 		crsManager.StopScheduler()

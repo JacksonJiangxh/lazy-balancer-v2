@@ -429,6 +429,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				admin.POST("/system/tasks/:id/trigger", h.TriggerSystemTask)
 				admin.POST("/system/tasks/:id/toggle", h.ToggleSystemTask)
 				admin.POST("/system/tasks/:id/cancel", h.CancelSystemTask)
+				admin.POST("/system/tasks/:id/control", h.ControlSystemTask)
 				admin.DELETE("/auto-backup/:id", h.DeleteAutoBackup)
 				admin.POST("/auto-backup/:id/restore", h.RestoreAutoBackup)
 				admin.GET("/auto-backup/:id/download", h.DownloadAutoBackup)

@@ -155,3 +155,34 @@ func (h *Handlers) CancelSystemTask(c *gin.Context) {
 	recordAudit(c, "取消", "任务监控", "手动取消 "+taskName+"（下载阶段中断，已完成部分保留）")
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已发出取消信号，任务将在当前下载阶段中断"})
 }
+
+// ControlSystemTask 常驻循环启停（admin；body {"action":"start|stop|restart"}）。
+func (h *Handlers) ControlSystemTask(c *gin.Context) {
+	id := c.Param("id")
+	var req struct {
+		Action string `json:"action"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || (req.Action != "start" && req.Action != "stop" && req.Action != "restart") {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效（action=start|stop|restart）"})
+		return
+	}
+	if _, controllable := services.TaskRuntimeState(id); !controllable {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持启停（角色驱动或纯被动循环）"})
+		return
+	}
+	if !services.ControlTaskRuntime(id, req.Action) {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "控制执行失败"})
+		return
+	}
+	switch req.Action {
+	case "start":
+		recordAudit(c, "启动", "任务监控", "常驻任务 "+id+" 启动")
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已启动任务 " + id})
+	case "stop":
+		recordAudit(c, "停止", "任务监控", "常驻任务 "+id+" 停止")
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已停止任务 " + id})
+	default:
+		recordAudit(c, "重启", "任务监控", "常驻任务 "+id+" 重启")
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已重启任务 " + id})
+	}
+}

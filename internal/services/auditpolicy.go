@@ -82,6 +82,7 @@ var auditRoutePolicies = map[string]AuditPolicy{
 	"POST /api/v1/system/tasks/:id/trigger": AuditPolicyExplicit,
 	"POST /api/v1/system/tasks/:id/toggle":  AuditPolicyExplicit,
 	"POST /api/v1/system/tasks/:id/cancel":  AuditPolicyExplicit,
+	"POST /api/v1/system/tasks/:id/control": AuditPolicyExplicit,
 	"POST /api/v1/config/reload":            AuditPolicyGeneric,
 	// R69 C-N3-c：validate 经 /load 真实加载候选配置（handler 成功后回弹权威
 	// 配置）——不再豁免审计，handler 显式记录校验三态。
