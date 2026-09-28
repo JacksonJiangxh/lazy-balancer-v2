@@ -31,10 +31,22 @@
       <el-table :data="pagedTasks" v-loading="!loaded" size="default" row-key="id">
         <el-table-column label="任务" min-width="220">
           <template #default="{ row }">
-            <div class="tm-task-name">
-              <span>{{ row.name }}</span>
-              <span class="tm-cat">{{ row.category }}</span>
-            </div>
+            <el-tooltip
+              :disabled="!row.description"
+              placement="right"
+              :show-after="200"
+              popper-class="tm-name-tip"
+            >
+              <template #content>
+                <div class="tm-tip-title">{{ row.name }}</div>
+                <div v-if="row.cadence" class="tm-tip-cadence">节奏：{{ row.cadence }}</div>
+                <div class="tm-tip-desc">{{ row.description }}</div>
+              </template>
+              <div class="tm-task-name">
+                <span>{{ row.name }}</span>
+                <span class="tm-cat">{{ row.category }}</span>
+              </div>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="类型" width="86">
@@ -61,13 +73,13 @@
             <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="最近执行" width="150">
+        <el-table-column label="最近执行" width="160">
           <template #default="{ row }">
             <span v-if="row.last_run?.started_at">{{ fmtTime(row.last_run.started_at) }}</span>
             <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="完成时间" width="150">
+        <el-table-column label="完成时间" width="160">
           <template #default="{ row }">
             <span v-if="row.last_run?.finished_at">{{ fmtTime(row.last_run.finished_at) }}</span>
             <span v-else-if="row.status === 'running'" class="tm-running-text">进行中</span>
@@ -80,7 +92,7 @@
             <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="下次执行" min-width="150">
+        <el-table-column label="下次执行" width="160">
           <template #default="{ row }">
             <span v-if="row.next_run_at">{{ row.next_run_at }}</span>
             <span v-else class="tm-dim">—</span>
@@ -128,13 +140,15 @@
       <el-descriptions v-if="detailTask" :column="2" border size="small">
         <el-descriptions-item label="任务 ID">{{ detailTask.id }}</el-descriptions-item>
         <el-descriptions-item label="分类">{{ detailTask.category }}</el-descriptions-item>
+        <el-descriptions-item v-if="detailTask.cadence" label="运行节奏">{{ detailTask.cadence }}</el-descriptions-item>
+        <el-descriptions-item v-if="detailTask.last_run" label="耗时">{{ fmtDuration(detailTask.last_run.duration_ms) }}</el-descriptions-item>
+        <el-descriptions-item v-if="detailTask.description" label="作用说明" :span="2">{{ detailTask.description }}</el-descriptions-item>
         <el-descriptions-item label="类型">{{ kindLabel(detailTask.kind) }}</el-descriptions-item>
         <el-descriptions-item label="状态">{{ statusLabel(detailTask.status) }}</el-descriptions-item>
         <el-descriptions-item label="自动调度">{{ detailTask.kind === 'continuous' ? '常驻' : detailTask.enabled ? '开启' : '暂停' }}</el-descriptions-item>
         <el-descriptions-item label="下次执行">{{ detailTask.next_run_at || '—' }}</el-descriptions-item>
         <el-descriptions-item v-if="detailTask.last_run" label="开始时间" :span="1">{{ fmtTime(detailTask.last_run.started_at) || '—' }}</el-descriptions-item>
         <el-descriptions-item v-if="detailTask.last_run" label="完成时间">{{ fmtTime(detailTask.last_run.finished_at) || '进行中' }}</el-descriptions-item>
-        <el-descriptions-item v-if="detailTask.last_run" label="耗时">{{ fmtDuration(detailTask.last_run.duration_ms) }}</el-descriptions-item>
         <el-descriptions-item v-if="detailTask.last_run" label="触发源">{{ triggerLabel(detailTask.last_run.trigger) }}</el-descriptions-item>
         <el-descriptions-item v-if="detailTask.last_run" label="执行结果" :span="2">
           <el-tag size="small" :type="resultTagType(detailTask.last_run.result)">{{ detailTask.last_run.result || '—' }}</el-tag>
@@ -190,6 +204,8 @@ interface TaskRunInfo {
 interface TaskInfo {
   id: string
   name: string
+  description?: string
+  cadence?: string
   category: string
   kind: 'scheduled' | 'continuous' | 'queue'
   status: string
@@ -403,11 +419,16 @@ const kindTag = (k: string): 'primary' | 'success' | 'warning' =>
 const triggerLabels: Record<string, string> = { manual: '手动', auto: '自动', schedule: '排程', queue: '队列', 'slave-sync': '从节点同步' }
 const triggerLabel = (t: string) => triggerLabels[t] || t || '—'
 
+// 完整时间显示: 优先 ISO(2026-09-28T13:38:07Z→本地时区), 否则原样(已是
+// datetime('now') 形态的 "2026-09-28 13:38:07")
 const fmtTime = (s?: string) => {
   if (!s) return ''
-  const m = s.match(/(\d{2}:\d{2}:\d{2})/)
-  const d = s.match(/(\d{2}-\d{2})/)?.[1] || ''
-  return m ? `${d ? d + ' ' : ''}${m[1]}` : s
+  const t = new Date(s)
+  if (!isNaN(t.getTime()) && /\d{4}-\d{2}-\d{2}T/.test(s)) {
+    const p = (n: number) => String(n).padStart(2, '0')
+    return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}`
+  }
+  return s.replace('T', ' ').replace(/\.\d+/g, '').replace(/Z$/, '')
 }
 const fmtDuration = (ms?: number) => {
   if (!ms || ms <= 0) return '—'
@@ -449,6 +470,10 @@ const fmtDuration = (ms?: number) => {
 .tm-logs-loading { display: flex; align-items: center; gap: 8px; color: var(--el-text-color-secondary); padding: 16px 0; }
 .tm-log-stage { font-size: 11px; color: var(--el-text-color-secondary); margin-bottom: 2px; text-transform: uppercase; letter-spacing: .5px; }
 .tm-pagination { display: flex; justify-content: flex-end; margin-top: 12px; }
+:global(.tm-name-tip) { max-width: 380px; }
+.tm-tip-title { font-weight: 600; margin-bottom: 4px; }
+.tm-tip-cadence { font-size: 12px; opacity: .85; margin-bottom: 2px; }
+.tm-tip-desc { font-size: 12px; line-height: 1.6; }
 .tm-running-text { color: #4f8cff; font-size: 12px; }
 @media (max-width: 1100px) { .tm-charts { grid-template-columns: 1fr; } }
 </style>
