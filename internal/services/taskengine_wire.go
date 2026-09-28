@@ -236,11 +236,12 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	})
 	taskEngine.Register(taskengine.Descriptor{
 		ID: "audit-retention", Family: "system", Name: "审计日志保留清理",
-		Description: "按「审计保留月数」配置删除 audit 库过期操作日志（基础设置可调）",
+		Description: "按「审计保留月数」配置删除 audit 库过期操作日志（基础设置可调）；并清理 90 天前的任务运行历史（task_runs）",
 		Category:    "系统", Kind: taskengine.KindContinuous,
 		IntervalFn: func() time.Duration { return 24 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
 			CleanupAuditLogs()
+			taskengine.PurgeTaskRuns(90) // 运行历史保留 90 天（API 只显 50 次，表内超期自动清理）
 			return nil
 		},
 	})
