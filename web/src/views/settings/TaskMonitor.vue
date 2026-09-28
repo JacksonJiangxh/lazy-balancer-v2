@@ -1,7 +1,7 @@
 <template>
   <div class="tm-root">
     <!-- 顶部概览条 -->
-    <el-card class="tm-hero" shadow="never">
+    <el-card class="tm-hero">
       <div class="tm-hero-inner">
         <div class="tm-hero-stats">
           <div class="tm-hero-stat">
@@ -34,7 +34,7 @@
     <!-- 图表区（引擎真实数据） -->
     <el-row :gutter="20">
       <el-col :xs="24" :md="10">
-        <el-card shadow="never">
+        <el-card>
           <template #header>
             <div class="card-header">
               <div class="card-title"><el-icon class="title-icon"><PieChartIcon /></el-icon><span>任务状态分布</span></div>
@@ -45,7 +45,7 @@
         </el-card>
       </el-col>
       <el-col :xs="24" :md="14">
-        <el-card shadow="never">
+        <el-card>
           <template #header>
             <div class="card-header">
               <div class="card-title"><el-icon class="title-icon"><DataLine /></el-icon><span>近 24 小时执行（成功 / 失败）</span></div>
@@ -57,8 +57,33 @@
       </el-col>
     </el-row>
 
+    <!-- 证书队列独立状态卡（非任务——签发/续签编舞经上方四个证书任务驱动） -->
+    <el-card class="tm-cert-card">
+      <template #header>
+        <div class="card-header">
+          <div class="card-title"><el-icon class="title-icon"><Lock /></el-icon><span>ACME 证书任务队列</span>
+            <span class="tm-count">{{ certQueue.total }} 个任务</span>
+          </div>
+          <el-tag v-if="certQueue.running > 0" type="primary" size="small" effect="plain">签发进行中</el-tag>
+          <el-tag v-else-if="certQueue.queued > 0" type="warning" size="small" effect="plain">排队中</el-tag>
+          <el-tag v-else type="success" size="small" effect="plain">空闲</el-tag>
+        </div>
+      </template>
+      <div class="tm-cert-body">
+        <v-chart v-if="certQueue.loaded" :option="certQueueOption" autoresize class="tm-cert-chart" />
+        <div v-else class="tm-cert-chart tm-skeleton"></div>
+        <div class="tm-cert-jobs" v-if="certQueue.jobs.length">
+          <div class="tm-cert-jobs-title">最近任务</div>
+          <div v-for="j in certQueue.jobs" :key="j.id" class="tm-cert-job">
+            <span class="tm-cert-domain">{{ j.domain }}</span>
+            <span class="tm-cert-info">{{ fmtTime(j.updated_at || '') || '—' }} · {{ j.status }}</span>
+          </div>
+        </div>
+      </div>
+    </el-card>
+
     <!-- 任务列表 -->
-    <el-card shadow="never">
+    <el-card>
       <template #header>
         <div class="card-header">
           <div class="card-title"><el-icon class="title-icon"><List /></el-icon><span>全部任务</span>
@@ -69,12 +94,12 @@
             <el-radio-button value="scheduled">定时</el-radio-button>
             <el-radio-button value="continuous">常驻</el-radio-button>
             <el-radio-button value="queue">队列</el-radio-button>
-            <el-radio-button value="oneshot">启动</el-radio-button>
+            <el-radio-button value="oneshot">触发</el-radio-button>
           </el-radio-group>
         </div>
       </template>
       <el-table :data="pagedTasks" v-loading="!loaded" size="default" row-key="id" class="tm-nowrap-table">
-        <el-table-column label="任务" min-width="150" show-overflow-tooltip>
+        <el-table-column label="任务" min-width="128" show-overflow-tooltip>
           <template #default="{ row }">
             <el-tooltip :disabled="!row.description" placement="top" :offset="8" :show-after="150" :show-arrow="false" popper-class="tm-name-tip">
               <template #content>
@@ -107,7 +132,7 @@
             <el-switch v-else :model-value="row.enabled" :disabled="!canOperate || !toggleable(row.id)" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
           </template>
         </el-table-column>
-        <el-table-column label="执行时间" width="162">
+        <el-table-column label="执行时间" width="180">
           <template #default="{ row }">
             <el-tooltip :disabled="!row.last_run" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <template #content>
@@ -122,7 +147,7 @@
             </el-tooltip>
           </template>
         </el-table-column>
-        <el-table-column label="下次执行" width="162">
+        <el-table-column label="下次执行" width="180">
           <template #default="{ row }">
             <span v-if="row.next_run_at">{{ row.next_run_at }}</span>
             <span v-else class="tm-dim">—</span>
@@ -286,6 +311,46 @@ const polling = usePollingTask(async () => fetchTasks(), {
   interval: 10000,
   onError: (e) => console.error('task monitor poll failed:', e),
 })
+// ===== 证书队列状态（独立卡——非任务族） =====
+interface CertJobRow { id: number; domain: string; status: string; updated_at: string }
+const certQueue = ref<{ loaded: boolean; queued: number; running: number; waiting: number; failed: number; issued24h: number; total: number; jobs: CertJobRow[] }>({
+  loaded: false, queued: 0, running: 0, waiting: 0, failed: 0, issued24h: 0, total: 0, jobs: [],
+})
+const fetchCertQueue = async () => {
+  try {
+    const res = await request.get<APIResponse<{ list: CertJobRow[]; total: number }>>('/certificates/jobs', { params: { page: 1, page_size: 50 }, silent: true })
+    const jobs = res.data?.list || []
+    const count = (pred: (j: CertJobRow) => boolean) => jobs.filter(pred).length
+    certQueue.value = {
+      loaded: true,
+      total: jobs.length,
+      queued: count(j => ['queued', 'pending'].includes(j.status)),
+      running: count(j => !['queued', 'pending', 'issued', 'failed', 'disabled'].includes(j.status)),
+      waiting: count(j => j.status === 'waiting_ca'),
+      failed: count(j => j.status === 'failed'),
+      issued24h: 0,
+      jobs: jobs.slice(0, 6),
+    }
+  } catch { certQueue.value.loaded = true }
+}
+const certQueueOption = computed<EChartsOption>((): EChartsOption => ({
+  tooltip: { trigger: 'item' },
+  legend: { bottom: 0, type: 'scroll' },
+  series: [{
+    type: 'pie',
+    radius: ['52%', '74%'],
+    center: ['50%', '44%'],
+    itemStyle: { borderRadius: 4, borderColor: '#fff', borderWidth: 2 },
+    label: { show: false },
+    data: [
+      { name: '排队', value: certQueue.value.queued, itemStyle: { color: '#fbbf24' } },
+      { name: '进行中', value: certQueue.value.running, itemStyle: { color: '#4f8cff' } },
+      { name: '等 CA', value: certQueue.value.waiting, itemStyle: { color: '#38e1ff' } },
+      { name: '失败', value: certQueue.value.failed, itemStyle: { color: '#f87171' } },
+    ].filter(d => d.value > 0),
+  }],
+}))
+
 const fetchClusterState = async () => {
   try {
     const res = await request.get<APIResponse<{ node_mode: string }>>('/cluster/status', { silent: true })
@@ -294,12 +359,13 @@ const fetchClusterState = async () => {
 }
 const refreshNow = async () => {
   refreshing.value = true
-  try { await Promise.all([fetchTasks(), fetchClusterState()]) } finally { refreshing.value = false }
+  try { await Promise.all([fetchTasks(), fetchClusterState(), fetchCertQueue()]) } finally { refreshing.value = false }
 }
 onMounted(() => {
   void polling.run() // 首跑立即（start() 只设定时器）
   polling.start()
   fetchClusterState()
+  fetchCertQueue()
 })
 onUnmounted(() => polling.stop())
 
@@ -310,10 +376,14 @@ const fail24h = computed(() => tasks.value.reduce((s, t) => s + (t.fail_24h || 0
 
 // ===== 筛选 + 分页 =====
 const kindFilter = ref('all')
-const filteredTasks = computed(() => kindFilter.value === 'all' ? tasks.value : tasks.value.filter(t => {
-  if (kindFilter.value === 'oneshot') return t.id.startsWith('startup:')
-  return t.kind === kindFilter.value
-}))
+const filteredTasks = computed(() => {
+  const list = kindFilter.value === 'all' ? tasks.value : tasks.value.filter(t => {
+    if (kindFilter.value === 'oneshot') return t.id.startsWith('startup:')
+    return t.kind === kindFilter.value
+  })
+  // 默认按分类排序（安全防护→证书→备份→集群→系统→触发），类内稳定
+  return [...list].sort((a, b) => (categoryOrder[a.category] ?? 9) - (categoryOrder[b.category] ?? 9))
+})
 const page = ref(1)
 const pageSize = ref(20)
 const pagedTasks = computed(() => filteredTasks.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
@@ -463,12 +533,13 @@ const statusLabels: Record<string, string> = {
   disabled: '已暂停', passive: '常驻', no_runs: '未运行', stopped: '已停止',
 }
 const statusLabel = (s: string) => statusLabels[s] || s
-const kindLabels: Record<string, string> = { scheduled: '定时', continuous: '常驻', queue: '队列', info: '内置', oneshot: '启动' }
+const kindLabels: Record<string, string> = { scheduled: '定时', continuous: '常驻', queue: '队列', info: '内置', oneshot: '触发' }
 const kindLabel = (k: string) => kindLabels[k] || k
 const kindTag = (k: string): 'primary' | 'success' | 'warning' | 'info' =>
   k === 'scheduled' ? 'primary' : k === 'continuous' ? 'success' : k === 'oneshot' ? 'warning' : 'info'
+const categoryOrder: Record<string, number> = { '安全防护': 0, '证书': 1, '备份': 2, '集群': 3, '系统': 4, '触发': 5 }
 const categoryTagType = (c: string): 'primary' | 'success' | 'warning' | 'info' =>
-  c === '安全防护' ? 'primary' : c === '证书' ? 'success' : c === '备份' ? 'warning' : 'info'
+  c === '安全防护' ? 'primary' : c === '证书' ? 'success' : c === '备份' ? 'warning' : c === '触发' ? 'info' : 'info'
 const triggerLabels: Record<string, string> = { manual: '手动', auto: '自动', schedule: '排程', queue: '队列', 'slave-sync': '从节点同步', startup: '启动' }
 const triggerLabel = (t: string) => triggerLabels[t] || t || '—'
 const statusResultLabel = (r: string): string => ({ success: '成功', failed: '失败', cancelled: '已取消', interrupted: '中断', running: '运行中' }[r] || r)
@@ -531,6 +602,13 @@ const fmtDuration = (ms?: number) => {
 .tm-ok { color: #34d399; font-weight: 600; }
 .tm-bad { color: #f87171; font-weight: 600; }
 .tm-pagination { display: flex; justify-content: flex-end; margin-top: 12px; }
+.tm-cert-body { display: flex; gap: 20px; }
+.tm-cert-chart { height: 200px; width: 300px; flex-shrink: 0; }
+.tm-cert-jobs { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.tm-cert-jobs-title { font-size: 12px; color: #6b7280; margin-bottom: 2px; }
+.tm-cert-job { display: flex; justify-content: space-between; font-size: 12.5px; padding: 6px 10px; background: #f9fafb; border-radius: 6px; }
+.tm-cert-domain { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tm-cert-info { color: #6b7280; flex-shrink: 0; }
 
 /* tooltip 提示 */
 :global(.tm-name-tip) { max-width: 380px; }

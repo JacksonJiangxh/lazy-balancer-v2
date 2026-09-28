@@ -42,6 +42,21 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 	if !requireMasterNode(c) {
 		return
 	}
+	// 终态：触发全经任务引擎（单飞/主节点门/历史统一；更新编舞为 Run 体）
+	if te := services.TaskEngine(); te != nil {
+		switch id {
+		case "threat", "crs", "ip2region":
+			go func() {
+				_ = te.Trigger(id, "manual") // 异步触发——编舞耗时由 task_runs 记录
+			}()
+			recordAudit(c, "更新", "任务监控", "手动触发 "+id)
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
+			return
+		}
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发"})
+		return
+	}
+	// 回退（测试环境无引擎）：直调 manager
 	switch id {
 	case "threat":
 		mgr := services.GetThreatUpdateManager()
@@ -67,7 +82,7 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 			respondTaskStartErr(c, err)
 			return
 		}
-		recordAudit(c, "更新", "任务监控", "手动触发 IP2Region 更新")
+		recordAudit(c, "更新", "任务监控", "手动触发 IP2Region 更启")
 	default:
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发"})
 		return

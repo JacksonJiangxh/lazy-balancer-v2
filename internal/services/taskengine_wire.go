@@ -101,8 +101,15 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			return ""
 		},
 		SilentProbes: true,
+		MasterOnly:   true,
 		CancelHook:   func() bool { return GetThreatUpdateManager() != nil && GetThreatUpdateManager().CancelRunning() },
 		Run: func(rc taskengine.RunContext) error {
+			if rc.Trigger == "manual" {
+				if m := GetThreatUpdateManager(); m != nil {
+					return m.RunUpdate("manual") // 同步全量——manager 编舞原样
+				}
+				return nil
+			}
 			ThreatSchedulerTickOnce()
 			return nil
 		},
@@ -138,8 +145,21 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			return "running"
 		},
 		SilentProbes: true,
+		MasterOnly:   true,
 		CancelHook:   func() bool { m := GetCRSUpdateManager(); return m != nil && m.CancelRunning() },
 		Run: func(rc taskengine.RunContext) error {
+			if rc.Trigger == "manual" {
+				m := GetCRSUpdateManager()
+				if m == nil {
+					return nil
+				}
+				done, err := m.StartUpdate("manual")
+				if err != nil {
+					return err
+				}
+				<-done // 等编舞完成——历史耗时真实
+				return nil
+			}
 			CRSSchedulerTickOnce()
 			return nil
 		},
@@ -172,8 +192,21 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			return "running"
 		},
 		SilentProbes: true,
+		MasterOnly:   true,
 		CancelHook:   func() bool { return GetIP2RegionUpdateManager() != nil && GetIP2RegionUpdateManager().CancelRunning() },
 		Run: func(rc taskengine.RunContext) error {
+			if rc.Trigger == "manual" {
+				m := GetIP2RegionUpdateManager()
+				if m == nil {
+					return nil
+				}
+				done, err := m.StartUpdate("manual")
+				if err != nil {
+					return err
+				}
+				<-done
+				return nil
+			}
 			IP2RegionSchedulerTickOnce()
 			return nil
 		},
@@ -251,25 +284,6 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		IntervalFn: func() time.Duration { return 30 * time.Second },
 		Run:        func(rc taskengine.RunContext) error { CertWaitingCATickOnce(); return nil },
 	})
-	taskEngine.Register(taskengine.Descriptor{
-		ID: "cert-queue", Family: "certificates", Name: "ACME 证书任务队列",
-		Description: "ACME 签发/续签任务的处理引擎：按证书配置入队，DNS 挑战、验证、签发、部署全流程状态机",
-		Category:    "证书", Kind: taskengine.KindQueue,
-		StatusFn: func() string {
-			var queued, running int
-			_ = db.DB.QueryRow(`SELECT
-				(SELECT COUNT(*) FROM cert_jobs WHERE status IN ('queued','pending')),
-				(SELECT COUNT(*) FROM cert_jobs WHERE status NOT IN ('queued','pending','issued','failed','disabled'))`).Scan(&queued, &running)
-			if running > 0 {
-				return "running"
-			}
-			if queued > 0 {
-				return "queued"
-			}
-			return ""
-		},
-		Run: nil, // 队列引擎自带 100ms worker——状态镜像，不由引擎节拍驱动
-	})
 	// —— 集群同步（角色驱动循环：身份入册，执行留集群服务——promote/demote 生命周期） ——
 	taskEngine.Register(taskengine.Descriptor{
 		ID: "cluster-sync", Family: "cluster", Name: "集群同步",
@@ -286,32 +300,23 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			return "running"
 		},
 	})
-	// —— Caddy 访问日志轮转（引擎内置，信息行） ——
+	// —— 系统配置载入（oneshot：规则库/证书/Caddy 渲染三段合一——完成于
+	// 面板监听之前，载入完成前系统不可达（强于只读）；db-init 与引擎启动
+	// 为前置设施不入册 ——） ——
 	taskEngine.Register(taskengine.Descriptor{
-		ID: "caddy-access-log-rotation", Family: "system", Name: "Caddy 访问日志轮转",
-		Description: "由 Caddy 引擎内置执行（非面板进程任务）：访问日志超过大小上限即轮转，保留 5 份；上限在基础设置的 Caddy 日志大小中调整",
-		Category:    "系统", Kind: taskengine.KindInfo,
-		StatusFn: func() string { return "passive" },
-		IntervalFn: func() time.Duration {
-			sizeMB := 100
-			_ = db.DB.QueryRow("SELECT COALESCE(caddy_log_size_mb,100) FROM global_config WHERE id=1").Scan(&sizeMB)
-			return time.Duration(sizeMB) * 0 // 0=非间隔驱动；仅读上限展示
-		},
+		ID:          "startup:config-load",
+		Family:      "startup",
+		Name:        "系统配置载入",
+		Description: "启动时从数据库装载运行态：规则库（CRS 种子/对账）→ 证书文件物化 → Caddy 配置渲染与应用（失败回退最后已知正确配置）。完成前面板不监听",
+		Category:    "触发",
+		Kind:        taskengine.KindQueue, // 展示类 oneshot（每次重启一行历史）
+		Run:         nil,
 	})
-	// —— 启动阶段（oneshot：已由 startupPhase 记录，入册供统一展示） ——
-	for _, ph := range []struct{ id, name, desc string }{
-		{"startup:db-init", "启动 · 数据库初始化", "数据目录三库（主/审计/metrics）建库与全部迁移"},
-		{"startup:rule-libraries", "启动 · 规则库装载", "CRS 规则种子与状态对账（waf 目录就绪）"},
-		{"startup:certs", "启动 · 证书装载", "从 DB 物化全部证书文件到 certs 目录"},
-		{"startup:caddy-render", "启动 · Caddy 配置渲染", "DB 期望配置渲染并应用至运行 Caddy（失败回退最后已知正确配置）"},
-		{"startup:engine", "启动 · 任务引擎", "恢复孤儿运行记录、注册任务族并启动调度循环"},
-	} {
-		ph := ph
-		taskEngine.Register(taskengine.Descriptor{
-			ID: ph.id, Family: "startup", Name: ph.name, Description: ph.desc,
-			Category: "启动", Kind: taskengine.KindQueue, // 展示类 oneshot（复用 queue 无调度语义）
-			Run: nil,
-		})
+
+	// 任务性质批量标定（展示口径）：排程/固定间隔族由探测轮或间隔驱动，
+	// 但性质是「定时」——只有真常驻循环（看门狗/事件摄取）是「常驻」。
+	for _, id := range []string{"threat", "crs", "ip2region", "auto-backup", "log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca"} {
+		taskEngine.SetAsKind(id, taskengine.KindScheduled)
 	}
 
 	for _, id := range []string{"config-watchdog", "security-events-ingestion", "log-cleanup", "threat", "crs", "ip2region", "auto-backup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca"} {

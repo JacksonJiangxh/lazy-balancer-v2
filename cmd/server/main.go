@@ -75,10 +75,8 @@ func run() error {
 	}
 	log.SetOutput(services.NewApplicationLogWriter(&tzLogWriter{w: logWriter}))
 
-	// Initialize database（启动阶段①——失败留痕后原样致命）
-	if err := startupPhase("startup:db-init", "数据库初始化与迁移", func() error {
-		return db.Initialize(cfg.DataDir)
-	}); err != nil {
+	// Initialize database（前置设施——非任务，不入 task_runs）
+	if err := db.Initialize(cfg.DataDir); err != nil {
 		return fmt.Errorf("initialize database: %w", err)
 	}
 	defer func() {
@@ -170,19 +168,15 @@ func run() error {
 	if err := services.EnsureIPListDir(); err != nil {
 		services.Logf("error", "初始化 IP 名单目录失败: %v", err)
 	}
-	_ = startupPhase("startup:rule-libraries", "规则库装载（CRS 种子/状态对账）", func() error {
+	// 系统配置载入（单一 oneshot 任务：规则库→证书→Caddy 渲染三段；完成于
+	// 面板监听之前——载入完成前系统不可达（强于只读））
+	if err := startupPhase("startup:config-load", "系统配置载入", func() error {
 		services.SeedCRSRules()
 		services.ReconcileCRSState()
-		return nil
-	})
-	// 归一 R50 前落库的安全策略枚举空串行（发射端零产出 + Update 拒修的
-	// 遗留状态），有实际变更时主节点递增集群版本让从节点收敛。
-	services.NormalizeLegacySecurityPolicyEnums(context.Background())
-	_ = startupPhase("startup:certs", "证书文件装载", func() error {
+		// 归一 R50 前落库的安全策略枚举空串行（发射端零产出 + Update 拒修的
+		// 遗留状态），有实际变更时主节点递增集群版本让从节点收敛。
+		services.NormalizeLegacySecurityPolicyEnums(context.Background())
 		services.MaterializeAllCertsFromDB()
-		return nil
-	})
-	if err := startupPhase("startup:caddy-render", "Caddy 配置渲染与应用（DB→运行配置）", func() error {
 		return h.ApplyConfigOnStartup()
 	}); err != nil {
 		services.Logf("error", "failed to apply Caddy config on startup: %v", err)
@@ -194,10 +188,7 @@ func run() error {
 	// （系统日志/操作日志/前端横幅），恢复由用户手动重启完成。
 	// M2 统一任务引擎：看门狗/安全事件摄取/运行日志清理三常驻族迁入
 	// （单轮体+引擎节拍；原生自循环与 TaskRuntime 注册表退役）。
-	_ = startupPhase("startup:engine", "任务引擎启动（恢复运行/注册任务族）", func() error {
-		services.InitTaskEngine(cfg.CaddyAdminURL, runtimeLogFile)
-		return nil
-	})
+	services.InitTaskEngine(cfg.CaddyAdminURL, runtimeLogFile) // 前置设施——非任务
 	defer services.StopTaskEngine()
 
 	// Setup router
