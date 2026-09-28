@@ -57,36 +57,37 @@
       </el-col>
     </el-row>
 
-    <!-- 证书队列独立状态卡（非任务——签发/续签编舞经上方四个证书任务驱动） -->
-    <el-card class="tm-cert-card">
+    <!-- 证书队列独立状态卡（非任务——签发/续签编舞经四个证书任务驱动） -->
+    <el-card shadow="never">
       <template #header>
         <div class="card-header">
-          <div class="card-title"><el-icon class="title-icon"><Lock /></el-icon><span>ACME 证书任务队列</span>
-            <span class="tm-count">{{ certQueue.total }} 个任务</span>
-          </div>
+          <div class="card-title"><el-icon class="title-icon"><Lock /></el-icon><span>ACME 证书任务队列</span></div>
           <el-tag v-if="certQueue.running > 0" type="primary" size="small" effect="plain">签发进行中</el-tag>
           <el-tag v-else-if="certQueue.queued > 0" type="warning" size="small" effect="plain">排队中</el-tag>
           <el-tag v-else type="success" size="small" effect="plain">空闲</el-tag>
         </div>
       </template>
-      <div class="tm-cert-body">
-        <template v-if="certQueue.loaded && certQueue.total > 0">
-          <v-chart :option="certQueueOption" autoresize class="tm-cert-chart" />
-        </template>
-        <div v-else-if="certQueue.loaded" class="tm-cert-empty">
-          <el-icon :size="28" color="#34d399"><CircleCheck /></el-icon>
-          <div class="tm-cert-empty-title">队列空闲</div>
-          <div class="tm-cert-empty-sub">无签发 / 续签任务——临期证书由「证书续期扫描」自动入队</div>
+      <div v-if="!certQueue.loaded" class="tm-cert-skeleton-row tm-skeleton"></div>
+      <template v-else>
+        <div class="tm-cert-stats">
+          <div class="tm-cert-stat"><span class="tm-cert-num">{{ certQueue.queued }}</span><span class="tm-cert-lab">排队</span></div>
+          <div class="tm-cert-stat"><span class="tm-cert-num tm-c-run">{{ certQueue.running }}</span><span class="tm-cert-lab">进行中</span></div>
+          <div class="tm-cert-stat"><span class="tm-cert-num tm-c-wait">{{ certQueue.waiting }}</span><span class="tm-cert-lab">等 CA</span></div>
+          <div class="tm-cert-stat"><span class="tm-cert-num tm-c-fail">{{ certQueue.failed }}</span><span class="tm-cert-lab">失败</span></div>
+          <div class="tm-cert-stat"><span class="tm-cert-num tm-c-ok">{{ certQueue.issued7d }}</span><span class="tm-cert-lab">7 天签发</span></div>
         </div>
-        <div v-else class="tm-cert-chart tm-skeleton"></div>
-        <div class="tm-cert-jobs" v-if="certQueue.jobs.length">
-          <div class="tm-cert-jobs-title">最近任务</div>
-          <div v-for="j in certQueue.jobs" :key="j.id" class="tm-cert-job">
+        <div v-if="certQueue.jobs.length" class="tm-cert-list">
+          <div class="tm-cert-row tm-cert-row-head">
+            <span>域名</span><span>状态</span><span>更新时间</span>
+          </div>
+          <div v-for="j in certQueue.jobs" :key="j.id" class="tm-cert-row">
             <span class="tm-cert-domain">{{ j.domain }}</span>
-            <span class="tm-cert-info">{{ fmtTime(j.updated_at || '') || '—' }} · {{ j.status }}</span>
+            <span><el-tag size="small" :type="certJobTagType(j.status)" effect="plain">{{ j.status }}</el-tag></span>
+            <span class="tm-cert-time">{{ fmtTime(j.updated_at || '') || '—' }}</span>
           </div>
         </div>
-      </div>
+        <div v-else class="tm-cert-none">无签发 / 续签任务——临期证书由「证书续期扫描」自动入队</div>
+      </template>
     </el-card>
 
     <!-- 任务列表 -->
@@ -137,12 +138,12 @@
           <template #default="{ row }">
             <el-switch
               v-if="row.controllable"
-              :model-value="row.status === 'running'"
+              :model-value="row.enabled"
               :disabled="!isAdmin"
               @change="() => onControl(row)"
             />
             <el-switch v-else-if="toggleable(row.id)" :model-value="row.enabled" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
-            <el-switch v-else :model-value="false" disabled />
+            <el-switch v-else :model-value="row.enabled" disabled />
           </template>
         </el-table-column>
         <el-table-column label="执行时间" width="180">
@@ -162,7 +163,7 @@
         </el-table-column>
         <el-table-column label="下次执行" width="180">
           <template #default="{ row }">
-            <span v-if="row.next_run_at">{{ row.next_run_at }}</span>
+            <span v-if="row.next_run_at && row.enabled">{{ row.next_run_at }}</span>
             <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
@@ -194,10 +195,7 @@
               :disabled="!isAdmin"
               @click="onControl(row)"
             >{{ row.status === 'running' ? '停止' : '启动' }}</el-button>
-            <el-button
-              v-if="row.id === 'threat' || row.id === 'crs' || row.id === 'ip2region'"
-              link type="info" size="small" @click="openLogs(row)"
-            >日志</el-button>
+            <el-button link type="info" size="small" @click="openLogs(row)">日志</el-button>
             <el-button link type="info" size="small" @click="openDetail(row)">详情</el-button>
           </template>
         </el-table-column>
@@ -261,16 +259,10 @@
       </div>
     </el-dialog>
 
-    <!-- 更新日志抽屉 -->
-    <el-drawer v-model="logsVisible" :title="`更新日志 · ${logsTask?.name || ''}`" size="520px">
+    <!-- 任务日志抽屉（文本流——与其他日志弹框同形态） -->
+    <el-drawer v-model="logsVisible" :title="`日志 · ${logsTask?.name || ''}`" size="560px">
       <div v-if="logsLoading" class="tm-logs-loading"><el-icon class="is-loading"><Loading /></el-icon> 加载中…</div>
-      <el-timeline v-else-if="logs.length">
-        <el-timeline-item v-for="(l, i) in logs" :key="i" :type="logTimelineType(l.level)" :timestamp="l.time" placement="top">
-          <div class="tm-log-stage">{{ l.stage }}</div>
-          <div>{{ l.message }}</div>
-        </el-timeline-item>
-      </el-timeline>
-      <el-empty v-else description="暂无更新日志" />
+      <pre v-else class="tm-log-pre">{{ logsText || '暂无日志' }}</pre>
     </el-drawer>
   </div>
 </template>
@@ -284,7 +276,7 @@ import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/compon
 import type { EChartsOption } from 'echarts'
 import VChart from 'vue-echarts'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Loading, PieChart as PieChartIcon, DataLine, List, Monitor, Lock, Box, CircleCheck } from '@element-plus/icons-vue'
+import { Refresh, Loading, PieChart as PieChartIcon, DataLine, List, Monitor, Lock, Box } from '@element-plus/icons-vue'
 import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
@@ -320,50 +312,6 @@ const fetchTasks = async () => {
   tasks.value = res.data?.tasks || []
   loaded.value = true
 }
-const polling = usePollingTask(async () => fetchTasks(), {
-  interval: 10000,
-  onError: (e) => console.error('task monitor poll failed:', e),
-})
-// ===== 证书队列状态（独立卡——非任务族） =====
-interface CertJobRow { id: number; domain: string; status: string; updated_at: string }
-const certQueue = ref<{ loaded: boolean; queued: number; running: number; waiting: number; failed: number; issued24h: number; total: number; jobs: CertJobRow[] }>({
-  loaded: false, queued: 0, running: 0, waiting: 0, failed: 0, issued24h: 0, total: 0, jobs: [],
-})
-const fetchCertQueue = async () => {
-  try {
-    const res = await request.get<APIResponse<{ list: CertJobRow[]; total: number }>>('/certificates/jobs', { params: { page: 1, page_size: 50 }, silent: true })
-    const jobs = res.data?.list || []
-    const count = (pred: (j: CertJobRow) => boolean) => jobs.filter(pred).length
-    certQueue.value = {
-      loaded: true,
-      total: jobs.length,
-      queued: count(j => ['queued', 'pending'].includes(j.status)),
-      running: count(j => !['queued', 'pending', 'issued', 'failed', 'disabled'].includes(j.status)),
-      waiting: count(j => j.status === 'waiting_ca'),
-      failed: count(j => j.status === 'failed'),
-      issued24h: 0,
-      jobs: jobs.slice(0, 6),
-    }
-  } catch { certQueue.value.loaded = true }
-}
-const certQueueOption = computed<EChartsOption>((): EChartsOption => ({
-  tooltip: { trigger: 'item' },
-  legend: { bottom: 0, type: 'scroll' },
-  series: [{
-    type: 'pie',
-    radius: ['52%', '74%'],
-    center: ['50%', '44%'],
-    itemStyle: { borderRadius: 4, borderColor: '#fff', borderWidth: 2 },
-    label: { show: false },
-    data: [
-      { name: '排队', value: certQueue.value.queued, itemStyle: { color: '#fbbf24' } },
-      { name: '进行中', value: certQueue.value.running, itemStyle: { color: '#4f8cff' } },
-      { name: '等 CA', value: certQueue.value.waiting, itemStyle: { color: '#38e1ff' } },
-      { name: '失败', value: certQueue.value.failed, itemStyle: { color: '#f87171' } },
-    ].filter(d => d.value > 0),
-  }],
-}))
-
 const fetchClusterState = async () => {
   try {
     const res = await request.get<APIResponse<{ node_mode: string }>>('/cluster/status', { silent: true })
@@ -380,6 +328,36 @@ onMounted(() => {
   fetchClusterState()
   fetchCertQueue()
 })
+onUnmounted(() => polling.stop())
+
+const polling = usePollingTask(async () => fetchTasks(), {
+  interval: 10000,
+  onError: (e) => console.error('task monitor poll failed:', e),
+})
+// ===== 证书队列状态（独立卡——非任务族） =====
+interface CertJobRow { id: number; domain: string; status: string; updated_at: string }
+const certQueue = ref<{ loaded: boolean; queued: number; running: number; waiting: number; failed: number; issued7d: number; total: number; jobs: CertJobRow[] }>({
+  loaded: false, queued: 0, running: 0, waiting: 0, failed: 0, issued7d: 0, total: 0, jobs: [],
+})
+const certJobTagType = (st: string): 'primary' | 'success' | 'warning' | 'danger' | 'info' =>
+  ['issued'].includes(st) ? 'success' : st === 'failed' ? 'danger' : ['queued', 'pending'].includes(st) ? 'warning' : ['waiting_ca'].includes(st) ? 'info' : 'primary'
+const fetchCertQueue = async () => {
+  try {
+    const res = await request.get<APIResponse<{ list: CertJobRow[]; total: number }>>('/certificates/jobs', { params: { page: 1, page_size: 50 }, silent: true })
+    const jobs = res.data?.list || []
+    const count = (pred: (j: CertJobRow) => boolean) => jobs.filter(pred).length
+    certQueue.value = {
+      loaded: true,
+      total: jobs.length,
+      queued: count(j => ['queued', 'pending'].includes(j.status)),
+      running: count(j => !['queued', 'pending', 'issued', 'failed', 'disabled'].includes(j.status)),
+      waiting: count(j => j.status === 'waiting_ca'),
+      failed: count(j => j.status === 'failed'),
+      issued7d: count(j => j.status === 'issued' && !!j.updated_at && Date.now() - new Date(j.updated_at as string).getTime() < 7 * 86400000),
+      jobs: jobs.slice(0, 5),
+    }
+  } catch { certQueue.value.loaded = true }
+}
 onUnmounted(() => polling.stop())
 
 // ===== 概览统计 =====
@@ -504,7 +482,7 @@ const openDetail = async (row: TaskInfo) => {
 // ===== 日志抽屉（content 纯文本解析） =====
 const logsVisible = ref(false)
 const logsLoading = ref(false)
-const logs = ref<{ time: string; level: string; stage: string; message: string }[]>([])
+const logsText = ref('')
 const logsTask = ref<TaskInfo | null>(null)
 const logEndpoints: Record<string, string> = {
   threat: '/security/threat-lib/update/logs',
@@ -515,28 +493,25 @@ const openLogs = async (row: TaskInfo) => {
   logsTask.value = row
   logsVisible.value = true
   logsLoading.value = true
-  logs.value = []
+  logsText.value = ''
   try {
-    const res = await request.get<APIResponse<{ content: string }>>(logEndpoints[row.id], { silent: true })
-    // 端点返回纯文本（content）——按行解析 "2026/09/28 20:49:42 [LEVEL] stage - message"
-    const text = res.data?.content || ''
-    const parsed: { time: string; level: string; stage: string; message: string }[] = []
-    for (const line of text.split('\n')) {
-      const m = line.match(/^(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2})\s*\[(\w+)\]\s*(\S+)\s*-\s*(.*)$/)
-      if (m) {
-        parsed.push({ time: m[1].replace(/\//g, '-'), level: m[2], stage: m[3], message: m[4] })
-      } else if (line.trim()) {
-        parsed.push({ time: '', level: 'INFO', stage: '', message: line.trim() })
-      }
+    if (logEndpoints[row.id]) {
+      const res = await request.get<APIResponse<{ content: string }>>(logEndpoints[row.id], { silent: true })
+      logsText.value = (res.data?.content || '').trim()
+    } else {
+      const res = await request.get<APIResponse<{ runs: RunRecord[] }>>(`/system/tasks/${row.id}/history`, { params: { limit: 50 }, silent: true })
+      const runs = res.data?.runs || []
+      logsText.value = runs.map(r =>
+        `${fmtTime(r.started_at) || '?'} [${statusResultLabel(r.status)}] ${fmtDuration(r.duration_ms)} ${triggerLabel(r.trigger)}${r.message ? ' · ' + r.message : ''}`
+      ).join('\n')
     }
-    logs.value = parsed.reverse().slice(0, 120)
   } catch {
-    ElMessage.error('日志加载失败')
+    logsText.value = '日志加载失败'
   } finally {
     logsLoading.value = false
   }
 }
-const logTimelineType = (level: string) => (level === 'ERROR' || level === 'WARN' ? 'danger' : level === 'success' || level === 'unchanged' ? 'success' : 'primary')
+
 
 // ===== 文案 =====
 const statusLabels: Record<string, string> = {
@@ -613,16 +588,18 @@ const fmtDuration = (ms?: number) => {
 .tm-ok { color: #34d399; font-weight: 600; }
 .tm-bad { color: #f87171; font-weight: 600; }
 .tm-pagination { display: flex; justify-content: flex-end; margin-top: 12px; }
-.tm-cert-body { display: flex; gap: 20px; }
-.tm-cert-chart { height: 200px; width: 300px; flex-shrink: 0; }
-.tm-cert-empty { height: 200px; width: 300px; flex-shrink: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; background: #f9fafb; border-radius: 8px; }
-.tm-cert-empty-title { font-size: 14px; font-weight: 600; color: #111827; }
-.tm-cert-empty-sub { font-size: 12px; color: #6b7280; max-width: 240px; text-align: center; line-height: 1.5; }
-.tm-cert-jobs { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
-.tm-cert-jobs-title { font-size: 12px; color: #6b7280; margin-bottom: 2px; }
-.tm-cert-job { display: flex; justify-content: space-between; font-size: 12.5px; padding: 6px 10px; background: #f9fafb; border-radius: 6px; }
+.tm-cert-skeleton-row { height: 90px; border-radius: 8px; }
+.tm-cert-stats { display: flex; gap: 32px; padding: 6px 4px 14px; }
+.tm-cert-stat { display: flex; align-items: baseline; gap: 6px; }
+.tm-cert-num { font-size: 22px; font-weight: 700; color: #111827; }
+.tm-c-run { color: #4f8cff; } .tm-c-wait { color: #38e1ff; } .tm-c-fail { color: #f87171; } .tm-c-ok { color: #34d399; }
+.tm-cert-lab { font-size: 12px; color: #6b7280; }
+.tm-cert-list { border-top: 1px solid #f3f4f6; }
+.tm-cert-row { display: grid; grid-template-columns: 1fr 150px 160px; align-items: center; padding: 8px 4px; font-size: 12.5px; border-bottom: 1px solid #f9fafb; }
+.tm-cert-row-head { font-size: 12px; color: #6b7280; border-bottom: 1px solid #e5e7eb; }
 .tm-cert-domain { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tm-cert-info { color: #6b7280; flex-shrink: 0; }
+.tm-cert-time { color: #6b7280; text-align: right; }
+.tm-cert-none { font-size: 12.5px; color: #6b7280; padding: 10px 4px; }
 
 /* tooltip 提示 */
 :global(.tm-name-tip) { max-width: 380px; }
@@ -641,5 +618,6 @@ const fmtDuration = (ms?: number) => {
 
 /* 日志 */
 .tm-logs-loading { display: flex; align-items: center; gap: 8px; color: var(--el-text-color-secondary); padding: 16px 0; }
+.tm-log-pre { margin: 0; padding: 12px 14px; background: #f9fafb; border-radius: 8px; font-size: 12px; line-height: 1.8; font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-all; color: #374151; max-height: calc(100vh - 160px); overflow: auto; }
 .tm-log-stage { font-size: 11px; color: var(--el-text-color-secondary); margin-bottom: 2px; text-transform: uppercase; letter-spacing: .5px; }
 </style>

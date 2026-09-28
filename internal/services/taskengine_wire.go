@@ -7,6 +7,7 @@ package services
 // 原 StartConfigWatchdog / StartSecurityEventsIngestion / StartRuntimeLogCleanup。
 
 import (
+	"errors"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -14,6 +15,12 @@ import (
 )
 
 var taskEngine *taskengine.Engine
+
+// configLoadRerun 系统配置载入手动重载钩子（main 注入：DB 渲染→强制应用）。
+var configLoadRerun func() error
+
+// SetConfigLoadRerun 注入手动重载实现。
+func SetConfigLoadRerun(fn func() error) { configLoadRerun = fn }
 
 // TaskEngine 返回全局引擎实例（未初始化返回 nil——测试环境）。
 func TaskEngine() *taskengine.Engine { return taskEngine }
@@ -128,7 +135,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 		NextSlotFn: func() string {
 			var next string
-			if err := db.DB.QueryRow("SELECT COALESCE(NULLIF(next_update,'','') FROM security_crs_version WHERE id=1").Scan(&next); err == nil && next != "" {
+			if err := db.DB.QueryRow("SELECT COALESCE(NULLIF(next_update,''),'') FROM security_crs_version WHERE id=1").Scan(&next); err == nil && next != "" {
 				return localDisplayUTC(next)
 			}
 			return ""
@@ -178,7 +185,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 		NextSlotFn: func() string {
 			var next string
-			if err := db.DB.QueryRow("SELECT COALESCE(NULLIF(next_update,'','') FROM security_ip2region_version WHERE id=1").Scan(&next); err == nil && next != "" {
+			if err := db.DB.QueryRow("SELECT COALESCE(NULLIF(next_update,''),'') FROM security_ip2region_version WHERE id=1").Scan(&next); err == nil && next != "" {
 				return localDisplayUTC(next)
 			}
 			return ""
@@ -307,18 +314,33 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	})
 	// —— 集群同步（角色驱动循环：身份入册，执行留集群服务——promote/demote 生命周期） ——
 	taskEngine.Register(taskengine.Descriptor{
-		ID: "cluster-sync", Family: "cluster", Name: "集群同步",
-		Description: "从节点按同步间隔轮询主节点快照并增量回放；主节点为签发方（被动）",
-		Category:    "集群", Kind: taskengine.KindInfo,
-		StatusFn: func() string {
+		ID:          "cluster-sync",
+		Family:      "cluster",
+		Name:        "集群同步",
+		Description: "从节点按用户配置的同步间隔轮询主节点快照并增量回放；主节点为签发方（空闲）",
+		Category:    "集群",
+		Kind:        taskengine.KindInfo,
+		StatusFn: func() string { // 定时语义：从节点回放中=运行中/主节点签发方=空闲
 			var isMaster int
 			if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
 				return ""
 			}
 			if isMaster == 1 {
-				return "passive"
+				return "idle"
 			}
 			return "running"
+		},
+		NextSlotFn: func() string { // 从节点：最近同步 + 间隔（自适应退避期如实按基准间隔展示）
+			var isMaster int
+			var interval int
+			var lastSync string
+			if err := db.DB.QueryRow("SELECT COALESCE(is_master,1), COALESCE(sync_interval,60), COALESCE(last_sync,'') FROM global_config WHERE id=1").Scan(&isMaster, &interval, &lastSync); err != nil || isMaster == 1 || lastSync == "" {
+				return ""
+			}
+			if t, err := time.Parse(time.RFC3339, lastSync); err == nil {
+				return t.Add(time.Duration(interval) * time.Second).In(CurrentLocation()).Format("2006-01-02 15:04:05")
+			}
+			return ""
 		},
 	})
 	// —— 系统配置载入（oneshot：规则库/证书/Caddy 渲染三段合一——完成于
@@ -330,14 +352,29 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Name:        "系统配置载入",
 		Description: "启动时从数据库装载运行态：规则库（CRS 种子/对账）→ 证书文件物化 → Caddy 配置渲染与应用（失败回退最后已知正确配置）。完成前面板不监听",
 		Category:    "系统",
-		Kind:        taskengine.KindOneshot, // 类型「触发」——单次执行（每次重启一行历史）
-		Run:         nil,
+		Kind:        taskengine.KindOneshot, // 类型「触发」——启动单次+可手动重载
+		ManualRun:   true,
+		Run: func(rc taskengine.RunContext) error {
+			if rc.Trigger != "manual" {
+				return nil // 启动执行由 main startupPhase 记录——引擎 Run 仅承载手动重载
+			}
+			if configLoadRerun == nil {
+				return errors.New("配置重载未接线")
+			}
+			return configLoadRerun()
+		},
 	})
 
 	// 任务性质批量标定（展示口径）：排程/固定间隔族由探测轮或间隔驱动，
 	// 但性质是「定时」——只有真常驻循环（看门狗/事件摄取）是「常驻」。
-	for _, id := range []string{"threat", "crs", "ip2region", "auto-backup", "log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll"} {
+	for _, id := range []string{"threat", "crs", "ip2region", "auto-backup", "log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cluster-sync"} {
 		taskEngine.SetAsKind(id, taskengine.KindScheduled)
+	}
+
+	// 手动触发语义：更新族 Run 内含 manual 分支；清理/证书循环 Run 即单轮
+	// 工作；看门狗/摄取单轮检查；系统配置载入 manual=重渲染重应用。
+	for _, id := range []string{"threat", "crs", "ip2region", "log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca", "config-watchdog", "security-events-ingestion", "startup:config-load"} {
+		taskEngine.SetManualRun(id, true)
 	}
 
 	for _, id := range []string{"config-watchdog", "security-events-ingestion", "log-cleanup", "threat", "crs", "ip2region", "auto-backup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca"} {

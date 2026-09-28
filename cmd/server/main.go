@@ -188,6 +188,7 @@ func run() error {
 	// （系统日志/操作日志/前端横幅），恢复由用户手动重启完成。
 	// M2 统一任务引擎：看门狗/安全事件摄取/运行日志清理三常驻族迁入
 	// （单轮体+引擎节拍；原生自循环与 TaskRuntime 注册表退役）。
+	services.SetConfigLoadRerun(func() error { return caddyService.GenerateAndApplyConfigForce() })
 	services.InitTaskEngine(cfg.CaddyAdminURL, runtimeLogFile) // 前置设施——非任务
 	defer services.StopTaskEngine()
 

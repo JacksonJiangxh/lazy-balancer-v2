@@ -112,6 +112,12 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		} else if m.IntervalSec > 0 {
 			ti.Cadence = "每 " + humanInterval(m.IntervalSec)
 		}
+		if m.ID == "cluster-sync" {
+			var iv int
+			if err := db.DB.QueryRow("SELECT COALESCE(sync_interval,60) FROM global_config WHERE id=1").Scan(&iv); err == nil {
+				ti.Cadence = fmt.Sprintf("每 %d 秒（用户配置同步间隔）", iv)
+			}
+		}
 		// 状态按「任务性质」分流（探测轮循环态只对真常驻有意义）：
 		// · 镜像优先（manager 运行中/队列计数/角色）
 		// · 定时性质 → 最近真实运行终态（空闲/失败/运行中），循环态不外露
