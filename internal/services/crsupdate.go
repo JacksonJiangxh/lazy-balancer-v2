@@ -220,6 +220,17 @@ func (m *CRSUpdateManager) setStage(status CRSUpdateStatus, message string) {
 
 // run executes the full update pipeline synchronously.
 func (m *CRSUpdateManager) run(trigger string) {
+	// 任务自记审计：手动/自动同一审计（用户裁定 2026-09-29）
+	defer func() {
+		snap := m.StatusSnapshot()
+		detail := fmt.Sprintf("更新%s（触发：%s）%s", snap.Status, trigger, snap.Message)
+		if snap.Status == string(CRSStatusFailed) {
+			RecordAuditLog("system", "更新失败", "CRS规则库", detail, "")
+		} else {
+			RecordAuditLog("system", "更新", "CRS规则库", detail, "")
+		}
+	}()
+
 	runStarted := time.Now().UTC()
 	histRun := taskengine.RecordRunStart("crs", "security", trigger)
 	defer func() {

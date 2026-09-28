@@ -176,6 +176,18 @@ func (m *IP2RegionUpdateManager) setStage(status IP2RegionUpdateStatus, message 
 
 // run executes the full update pipeline synchronously.
 func (m *IP2RegionUpdateManager) run(trigger string) {
+	// 任务自记审计：手动/自动同一审计（用户裁定 2026-09-29）
+	defer func() {
+		var status, message string
+		_ = db.DB.QueryRow("SELECT COALESCE(update_status,'success'), COALESCE(message,'') FROM security_ip2region_version WHERE id=1").Scan(&status, &message)
+		detail := fmt.Sprintf("更新%s（触发：%s）%s", status, trigger, message)
+		if status == "failed" {
+			RecordAuditLog("system", "更新失败", "IP2Region数据库", detail, "")
+		} else {
+			RecordAuditLog("system", "更新", "IP2Region数据库", detail, "")
+		}
+	}()
+
 	runStarted := time.Now().UTC()
 	histRun := taskengine.RecordRunStart("ip2region", "security", trigger)
 	defer func() {
