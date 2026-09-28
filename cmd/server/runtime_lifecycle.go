@@ -40,6 +40,9 @@ func (l *runtimeLifecycle) StartACME() {
 	worker := l.certFactory()
 	done := make(chan struct{})
 	l.certService = worker
+	if cs, ok := worker.(*services.CertificateService); ok {
+		services.SetActiveCertificateService(cs) // 任务引擎证书循环单轮 tick 消费
+	}
 	l.certDone = done
 	go func() {
 		defer close(done)
