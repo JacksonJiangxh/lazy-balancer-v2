@@ -621,6 +621,7 @@ const fmtDuration = (ms?: number) => {
 .tm-detail { display: flex; flex-direction: column; gap: 14px; }
 .tm-detail-desc { font-size: 13px; color: var(--el-text-color-regular); line-height: 1.7; background: var(--el-fill-color-lighter); border-radius: 8px; padding: 10px 14px; }
 .tm-detail-descs :deep(.el-descriptions__label) { white-space: nowrap; }
+.tm-detail-descs :deep(.el-descriptions__content) { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .tm-detail-msg { font-size: 12.5px; color: var(--el-text-color-secondary); }
 .tm-detail-section { font-size: 13px; font-weight: 600; color: var(--el-text-color-primary); margin-top: 4px; padding-top: 12px; border-top: 1px solid var(--el-border-color-lighter); }
 

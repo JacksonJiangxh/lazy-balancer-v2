@@ -274,15 +274,32 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "cert-manual-poll", Family: "certificates", Name: "手动证书任务轮询",
 		Description: "处理手工触发或重试的证书任务",
 		Category:    "证书", Kind: taskengine.KindContinuous,
-		IntervalFn: func() time.Duration { return 10 * time.Minute },
-		Run:        func(rc taskengine.RunContext) error { CertManualCheckOnce(); return nil },
+		RecordFailuresOnly: true,
+		IntervalFn:         func() time.Duration { return 10 * time.Minute },
+		Run:                func(rc taskengine.RunContext) error { CertManualCheckOnce(); return nil },
 	})
 	taskEngine.Register(taskengine.Descriptor{
 		ID: "cert-waiting-ca", Family: "certificates", Name: "CA 等待轮询",
 		Description: "轮询等待 CA 完成验证/签发的异步订单（LE/ZeroSSL 等），含滞留/断链补扫",
 		Category:    "证书", Kind: taskengine.KindContinuous,
-		IntervalFn: func() time.Duration { return 30 * time.Second },
-		Run:        func(rc taskengine.RunContext) error { CertWaitingCATickOnce(); return nil },
+		RecordFailuresOnly: true, // 30s 补扫成功静默——仅断链/失败留痕
+		IntervalFn:         func() time.Duration { return 30 * time.Second },
+		StatusFn: func() string { // 有等待/滞留任务才「运行中」——空闲不空转显示
+			var n int
+			_ = db.DB.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE status IN ('waiting_ca','queued','pending')`).Scan(&n)
+			if n > 0 {
+				return "running"
+			}
+			return ""
+		},
+		NextSlotFn: func() string { // 有等待任务时展示最近 CA 可用时间
+			var at string
+			if err := db.DB.QueryRow(`SELECT COALESCE(MIN(NULLIF(ca_available_after,'','') FROM cert_jobs WHERE status='waiting_ca'`).Scan(&at); err == nil && at != "" {
+				return localDisplayUTC(at)
+			}
+			return ""
+		},
+		Run: func(rc taskengine.RunContext) error { CertWaitingCATickOnce(); return nil },
 	})
 	// —— 集群同步（角色驱动循环：身份入册，执行留集群服务——promote/demote 生命周期） ——
 	taskEngine.Register(taskengine.Descriptor{
