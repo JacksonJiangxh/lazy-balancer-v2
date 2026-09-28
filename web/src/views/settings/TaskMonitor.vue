@@ -158,47 +158,80 @@
       </div>
     </el-card>
 
-    <!-- 任务详情弹框 -->
-    <el-dialog v-model="detailVisible" :title="`任务详情 · ${detailTask?.name || ''}`" width="560px">
-      <el-descriptions v-if="detailTask" :column="2" border size="small">
-        <el-descriptions-item label="任务 ID">{{ detailTask.id }}</el-descriptions-item>
-        <el-descriptions-item label="分类">{{ detailTask.category }}</el-descriptions-item>
-        <el-descriptions-item v-if="detailTask.cadence" label="运行节奏">{{ detailTask.cadence }}</el-descriptions-item>
-        <el-descriptions-item v-if="detailTask.last_run" label="耗时">{{ fmtDuration(detailTask.last_run.duration_ms) }}</el-descriptions-item>
-        <el-descriptions-item v-if="detailTask.description" label="作用说明" :span="2">{{ detailTask.description }}</el-descriptions-item>
-        <el-descriptions-item label="类型">{{ kindLabel(detailTask.kind) }}</el-descriptions-item>
-        <el-descriptions-item label="状态">{{ statusLabel(detailTask.status) }}</el-descriptions-item>
-        <el-descriptions-item label="自动调度">{{ detailTask.kind === 'continuous' ? '常驻' : detailTask.enabled ? '开启' : '暂停' }}</el-descriptions-item>
-        <el-descriptions-item label="下次执行">{{ detailTask.next_run_at || '—' }}</el-descriptions-item>
-        <el-descriptions-item v-if="detailTask.last_run" label="开始时间" :span="1">{{ fmtTime(detailTask.last_run.started_at) || '—' }}</el-descriptions-item>
-        <el-descriptions-item v-if="detailTask.last_run" label="完成时间">{{ fmtTime(detailTask.last_run.finished_at) || '进行中' }}</el-descriptions-item>
-        <el-descriptions-item v-if="detailTask.last_run" label="触发源">{{ triggerLabel(detailTask.last_run.trigger) }}</el-descriptions-item>
-        <el-descriptions-item v-if="detailTask.last_run" label="执行结果" :span="2">
-          <el-tag size="small" :type="resultTagType(detailTask.last_run.result)">{{ detailTask.last_run.result || '—' }}</el-tag>
-        </el-descriptions-item>
-        <el-descriptions-item v-if="detailTask.last_run?.message" label="信息" :span="2">{{ detailTask.last_run.message }}</el-descriptions-item>
-        <el-descriptions-item label="24h 成功/失败" :span="2">{{ detailTask.success_24h }} / {{ detailTask.fail_24h }}</el-descriptions-item>
-      </el-descriptions>
+    <!-- 任务详情弹框（DialogHeader 统一范式） -->
+    <el-dialog v-model="detailVisible" width="620px" top="8vh">
+      <template #header>
+        <DialogHeader
+          :icon="detailIcon" :title="detailTask?.name || ''"
+          :subtitle="detailTask ? `${detailTask.category} · ${kindLabel(detailTask.kind)} · ${statusLabel(detailTask.status)}` : ''"
+          :tone="detailTone"
+        />
+      </template>
+      <div v-if="detailTask" class="tm-detail">
+        <div v-if="detailTask.description" class="tm-detail-desc">{{ detailTask.description }}</div>
 
-      <div v-if="history.length" class="tm-history">
-        <div class="tm-history-title">最近运行</div>
-        <el-table :data="history" size="small" max-height="260" class="tm-nowrap-table">
-          <el-table-column prop="started_at" label="开始" width="165">
-            <template #default="{ row }">{{ fmtTime(row.started_at) }}</template>
-          </el-table-column>
-          <el-table-column prop="duration_ms" label="耗时" width="80">
-            <template #default="{ row }">{{ fmtDuration(row.duration_ms) }}</template>
-          </el-table-column>
-          <el-table-column prop="trigger" label="触发" width="80">
-            <template #default="{ row }">{{ triggerLabel(row.trigger) }}</template>
-          </el-table-column>
-          <el-table-column prop="status" label="结果" width="90">
-            <template #default="{ row }">
-              <el-tag size="small" :type="resultTagType(row.status)">{{ row.status }}</el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column prop="message" label="信息" min-width="160" show-overflow-tooltip />
-        </el-table>
+        <div class="tm-detail-grid">
+          <div class="tm-detail-item">
+            <div class="tm-detail-label">运行节奏</div>
+            <div class="tm-detail-value">{{ detailTask.cadence || '—' }}</div>
+          </div>
+          <div class="tm-detail-item">
+            <div class="tm-detail-label">自动调度</div>
+            <div class="tm-detail-value">{{ detailTask.kind === 'continuous' ? '常驻循环' : detailTask.enabled ? '开启' : '已暂停' }}</div>
+          </div>
+          <div class="tm-detail-item">
+            <div class="tm-detail-label">下次执行</div>
+            <div class="tm-detail-value">{{ detailTask.next_run_at || '—' }}</div>
+          </div>
+          <div class="tm-detail-item">
+            <div class="tm-detail-label">24h 成功 / 失败</div>
+            <div class="tm-detail-value"><span class="tm-ok">{{ detailTask.success_24h }}</span> / <span :class="{ 'tm-bad': detailTask.fail_24h > 0 }">{{ detailTask.fail_24h }}</span></div>
+          </div>
+        </div>
+
+        <template v-if="detailTask.last_run">
+          <div class="tm-detail-section">最近一次执行</div>
+          <div class="tm-detail-grid">
+            <div class="tm-detail-item">
+              <div class="tm-detail-label">开始时间</div>
+              <div class="tm-detail-value">{{ fmtTime(detailTask.last_run.started_at) || '—' }}</div>
+            </div>
+            <div class="tm-detail-item">
+              <div class="tm-detail-label">完成时间</div>
+              <div class="tm-detail-value">{{ detailTask.status === 'running' ? '进行中' : fmtTime(detailTask.last_run.finished_at) || '—' }}</div>
+            </div>
+            <div class="tm-detail-item">
+              <div class="tm-detail-label">耗时</div>
+              <div class="tm-detail-value">{{ fmtDuration(detailTask.last_run.duration_ms) }}</div>
+            </div>
+            <div class="tm-detail-item">
+              <div class="tm-detail-label">触发源 / 结果</div>
+              <div class="tm-detail-value">{{ triggerLabel(detailTask.last_run.trigger) }} · <el-tag size="small" :type="resultTagType(detailTask.last_run.result)">{{ detailTask.last_run.result || '—' }}</el-tag></div>
+            </div>
+          </div>
+          <div v-if="detailTask.last_run.message" class="tm-detail-msg">{{ detailTask.last_run.message }}</div>
+        </template>
+
+        <template v-if="history.length">
+          <div class="tm-detail-section">最近运行（{{ history.length }} 次）</div>
+          <el-table :data="history" size="small" max-height="240" class="tm-nowrap-table">
+            <el-table-column prop="started_at" label="开始" width="158">
+              <template #default="{ row }">{{ fmtTime(row.started_at) }}</template>
+            </el-table-column>
+            <el-table-column prop="duration_ms" label="耗时" width="76">
+              <template #default="{ row }">{{ fmtDuration(row.duration_ms) }}</template>
+            </el-table-column>
+            <el-table-column prop="trigger" label="触发" width="70">
+              <template #default="{ row }">{{ triggerLabel(row.trigger) }}</template>
+            </el-table-column>
+            <el-table-column prop="status" label="结果" width="86">
+              <template #default="{ row }">
+                <el-tag size="small" :type="resultTagType(row.status)">{{ statusResultLabel(row.status) }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="message" label="信息" min-width="140" show-overflow-tooltip />
+          </el-table>
+        </template>
       </div>
     </el-dialog>
 
@@ -228,20 +261,14 @@ import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/compon
 import type { EChartsOption } from 'echarts'
 import VChart from 'vue-echarts'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Loading, PieChart as PieChartIcon, Timer, DataLine, List } from '@element-plus/icons-vue'
+import { Refresh, Loading, PieChart as PieChartIcon, Timer, DataLine, List, Monitor, Lock, Box } from '@element-plus/icons-vue'
 import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
+import DialogHeader from '@/components/DialogHeader.vue'
 import { seriesColors, statusColor } from '@/utils/chartTheme'
 
-// 图表基底与仪表盘/安全总览同款（白底提示/底部图例/浅轴）
-const chartBase = {
-  tooltip: { trigger: 'item', backgroundColor: 'rgba(255,255,255,0.95)', borderColor: '#e5e7eb', textStyle: { color: '#374151', fontSize: 12 } },
-  legend: { bottom: 0, textStyle: { fontSize: 11, color: '#6b7280' } },
-  grid: { left: 55, right: 15, top: 15, bottom: 40 },
-  xAxis: { axisLine: { lineStyle: { color: '#e5e7eb' } }, axisLabel: { fontSize: 10, color: '#9ca3af' } },
-  yAxis: { axisLine: { show: false }, axisLabel: { fontSize: 10, color: '#9ca3af' }, splitLine: { lineStyle: { color: '#f3f4f6' } } },
-}
+// 图表风格与安全总览同款：ECharts 默认浅色主题 + 极简覆盖
 import type { APIResponse } from '@/types'
 
 use([CanvasRenderer, PieChart, BarChart, GridComponent, TooltipComponent, LegendComponent])
@@ -320,6 +347,16 @@ const openDetail = async (row: TaskInfo) => {
     history.value = res.data?.runs || []
   } catch { /* 无历史族静默 */ }
 }
+const detailIcon = computed(() => (detailTask.value?.category === '证书' ? Lock : detailTask.value?.category === '备份' ? Box : Monitor))
+const detailTone = computed((): 'primary' | 'success' | 'warning' | 'danger' | undefined => {
+  const st = detailTask.value?.status
+  if (st === 'failed') return 'danger'
+  if (st === 'running') return 'primary'
+  if (st === 'stopped' || st === 'disabled') return 'warning'
+  return undefined
+})
+const statusResultLabel = (r: string): string => ({ success: '成功', failed: '失败', cancelled: '已取消', interrupted: '中断', running: '运行中' }[r] || r)
+
 const resultTagType = (r: string): 'success' | 'danger' | 'info' | 'warning' =>
   r === 'success' || r === 'issued' ? 'success' : r === 'failed' ? 'danger' : r === 'cancelled' ? 'warning' : 'info'
 
@@ -367,17 +404,16 @@ const statusPieOption = computed<EChartsOption>((): EChartsOption => {
   for (const t of tasks.value) counts.set(t.status, (counts.get(t.status) || 0) + 1)
   const labels: Record<string, string> = {
     running: '运行中', idle: '空闲', queued: '排队', failed: '失败', cancelled: '已取消',
-    disabled: '已暂停', passive: '常驻', no_runs: '未运行',
+    disabled: '已暂停', passive: '常驻', no_runs: '未运行', stopped: '已停止',
   }
   return {
-    ...chartBase,
-    tooltip: { ...chartBase.tooltip, trigger: 'item' as const },
-    legend: { ...chartBase.legend, icon: 'circle', itemWidth: 8, itemHeight: 8 },
+    tooltip: { trigger: 'item' },
+    legend: { bottom: 0, type: 'scroll' },
     series: [{
       type: 'pie',
       radius: ['52%', '74%'],
       center: ['50%', '44%'],
-      itemStyle: { borderRadius: 5, borderColor: '#fff', borderWidth: 2 },
+      itemStyle: { borderRadius: 4, borderColor: '#fff', borderWidth: 2 },
       label: { show: false },
       data: [...counts.entries()].map(([k, v]) => ({
         name: labels[k] || k,
@@ -392,10 +428,10 @@ const durationBarOption = computed<EChartsOption>((): EChartsOption => {
   const rows = tasks.value.filter((t) => t.last_run && t.last_run.duration_ms > 0)
     .sort((a, b) => (b.last_run!.duration_ms) - (a.last_run!.duration_ms)).slice(0, 8)
   return {
-    tooltip: { ...chartBase.tooltip, trigger: 'axis', axisPointer: { type: 'shadow' } },
-    grid: { ...chartBase.grid },
-    xAxis: { type: 'value', ...chartBase.xAxis },
-    yAxis: { type: 'category', data: rows.map((t) => t.name.replace(/（.*）/, '')), ...chartBase.yAxis, axisLabel: { ...chartBase.yAxis.axisLabel, width: 84, overflow: 'truncate' } },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    grid: { left: 8, right: 16, top: 12, bottom: 8, containLabel: true },
+    xAxis: { type: 'value' },
+    yAxis: { type: 'category', data: rows.map((t) => t.name.replace(/（.*）/, '')), axisLabel: { width: 84, overflow: 'truncate' } },
     series: [{
       type: 'bar',
       data: rows.map((t) => ({
@@ -410,11 +446,11 @@ const durationBarOption = computed<EChartsOption>((): EChartsOption => {
 const statsBarOption = computed<EChartsOption>((): EChartsOption => {
   const rows = tasks.value.filter((t) => t.runs_24h > 0 || t.fail_24h > 0).slice(0, 8)
   return {
-    tooltip: { ...chartBase.tooltip, trigger: 'axis', axisPointer: { type: 'shadow' } },
-    legend: { ...chartBase.legend, icon: 'circle', itemWidth: 8, itemHeight: 8, bottom: undefined, top: 0, right: 0 },
-    grid: { ...chartBase.grid },
-    xAxis: { type: 'category', data: rows.map((t) => t.name.replace(/（.*）/, '')), ...chartBase.xAxis, axisLabel: { ...chartBase.xAxis.axisLabel, interval: 0, width: 76, overflow: 'truncate' } },
-    yAxis: { type: 'value', ...chartBase.yAxis, minInterval: 1 },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    legend: { top: 0, itemGap: 24 },
+    grid: { left: 8, right: 12, top: 36, bottom: 8, containLabel: true },
+    xAxis: { type: 'category', data: rows.map((t) => t.name.replace(/（.*）/, '')), axisLabel: { interval: 0, width: 76, overflow: 'truncate' } },
+    yAxis: { type: 'value', minInterval: 1 },
     series: [
       { name: '成功', type: 'bar', data: rows.map((t) => t.success_24h), itemStyle: { color: '#34d399', borderRadius: [4, 4, 0, 0] }, barMaxWidth: 14 },
       { name: '失败', type: 'bar', data: rows.map((t) => t.fail_24h), itemStyle: { color: '#f87171', borderRadius: [4, 4, 0, 0] }, barMaxWidth: 14 },
@@ -496,7 +532,7 @@ const logTimelineType = (level: string) => {
 // ===== 文案 =====
 const statusLabels: Record<string, string> = {
   running: '运行中', idle: '空闲', queued: '排队中', failed: '失败', cancelled: '已取消',
-  disabled: '已暂停', passive: '常驻', no_runs: '未运行',
+  disabled: '已暂停', passive: '常驻', no_runs: '未运行', stopped: '已停止',
 }
 const statusLabel = (s: string) => statusLabels[s] || s
 const kindLabels: Record<string, string> = { scheduled: '定时', continuous: '常驻', queue: '队列' }
@@ -543,6 +579,7 @@ const fmtDuration = (ms?: number) => {
 .tm-status[data-status="cancelled"] { --tm-c: #8b5cf6; }
 .tm-status[data-status="disabled"] { --tm-c: #62687f; }
 .tm-status[data-status="idle"], .tm-status[data-status="no_runs"] { --tm-c: #9aa0b5; }
+.tm-status[data-status="stopped"] { --tm-c: #f87171; }
 .tm-status[data-status="passive"] { --tm-c: #38e1ff; }
 .tm-run { display: flex; flex-direction: column; gap: 2px; font-size: 12.5px; }
 .tm-run-line { color: var(--el-text-color-regular); }
@@ -555,6 +592,14 @@ const fmtDuration = (ms?: number) => {
 .tm-pagination { display: flex; justify-content: flex-end; margin-top: 12px; }
 :deep(.tm-nowrap-table .cell) { white-space: nowrap; }
 .tm-history { margin-top: 16px; }
+.tm-detail { display: flex; flex-direction: column; gap: 14px; }
+.tm-detail-desc { font-size: 13px; color: var(--el-text-color-regular); line-height: 1.7; background: var(--el-fill-color-lighter); border-radius: 8px; padding: 10px 14px; }
+.tm-detail-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 24px; }
+.tm-detail-item { display: flex; flex-direction: column; gap: 3px; }
+.tm-detail-label { font-size: 12px; color: var(--el-text-color-secondary); }
+.tm-detail-value { font-size: 13.5px; color: var(--el-text-color-primary); }
+.tm-detail-section { font-size: 13px; font-weight: 600; color: var(--el-text-color-primary); margin-top: 4px; padding-top: 12px; border-top: 1px solid var(--el-border-color-lighter); }
+.tm-detail-msg { font-size: 12.5px; color: var(--el-text-color-secondary); }
 .tm-history-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
 :global(.tm-name-tip) { max-width: 380px; }
 .tm-tip-title { font-weight: 600; margin-bottom: 4px; }

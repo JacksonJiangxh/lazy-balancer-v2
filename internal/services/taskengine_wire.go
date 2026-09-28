@@ -83,8 +83,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "threat", Family: "security", Name: "威胁情报库更新",
 		Description: "每日从 USTC/FireHOL/ET 三源下载恶意 IP 名单，聚合去重后写入威胁库文件并同步从节点——引用名单的安全策略据此拦截",
 		Category:    "安全防护", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
-		IntervalFn: func() time.Duration { return time.Minute },
-		CancelHook: func() bool { return GetThreatUpdateManager() != nil && GetThreatUpdateManager().CancelRunning() },
+		IntervalFn:   func() time.Duration { return time.Minute },
+		SilentProbes: true,
+		CancelHook:   func() bool { return GetThreatUpdateManager() != nil && GetThreatUpdateManager().CancelRunning() },
 		Run: func(rc taskengine.RunContext) error {
 			ThreatSchedulerTickOnce()
 			return nil
@@ -94,8 +95,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "crs", Family: "security", Name: "CRS 规则库更新",
 		Description: "检查并更新 OWASP CoreRuleSet 规则集到最新版本（保留用户 overrides），供 WAF 拦截模式消费",
 		Category:    "安全防护", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
-		IntervalFn: func() time.Duration { return time.Minute },
-		CancelHook: func() bool { return GetCRSUpdateManager().CancelRunning() },
+		IntervalFn:   func() time.Duration { return time.Minute },
+		SilentProbes: true,
+		CancelHook:   func() bool { return GetCRSUpdateManager().CancelRunning() },
 		Run: func(rc taskengine.RunContext) error {
 			CRSSchedulerTickOnce()
 			return nil
@@ -105,8 +107,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "ip2region", Family: "security", Name: "IP2Region 地理库更新",
 		Description: "更新 IP 地理位置离线库（xdb），供 GeoIP 地域拦截与归属地展示使用",
 		Category:    "安全防护", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
-		IntervalFn: func() time.Duration { return time.Minute },
-		CancelHook: func() bool { return GetIP2RegionUpdateManager() != nil && GetIP2RegionUpdateManager().CancelRunning() },
+		IntervalFn:   func() time.Duration { return time.Minute },
+		SilentProbes: true,
+		CancelHook:   func() bool { return GetIP2RegionUpdateManager() != nil && GetIP2RegionUpdateManager().CancelRunning() },
 		Run: func(rc taskengine.RunContext) error {
 			IP2RegionSchedulerTickOnce()
 			return nil
@@ -118,7 +121,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	taskEngine.Register(taskengine.Descriptor{
 		ID: "auto-backup", Family: "backup", Name: "自动备份",
 		Description: "按排程把全量配置打包为 lbbak 落盘 backup 目录（含 CRS/IP2Region/威胁库数据文件），保留份数自动清理",
-		Category:    "备份", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
+		Category:    "备份", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, SilentProbes: true,
 		IntervalFn: func() time.Duration { return time.Minute },
 		Run: func(rc taskengine.RunContext) error {
 			AutoBackupSchedulerTickOnce()
