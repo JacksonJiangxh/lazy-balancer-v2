@@ -591,3 +591,15 @@ func (e *Engine) LatestRun(taskID string) *RunRecord {
 	}
 	return &runs[0]
 }
+
+// PurgeTaskRuns 清理 N 天前的任务运行历史（每日清理族调用——防无界增长；
+// 静默策略已抑制成功轮落库，此为终态兜底）。
+func PurgeTaskRuns(days int) {
+	if db.DB == nil || days <= 0 {
+		return
+	}
+	if _, err := db.DB.Exec(`DELETE FROM task_runs WHERE started_at < datetime('now', ?)`, fmt.Sprintf("-%d days", days)); err != nil {
+		return
+	}
+	_ = days
+}
