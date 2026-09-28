@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // fastFileMagic 是 .fast 二进制格式的魔数（Lazy Balancer Fast v1）。
@@ -24,6 +25,12 @@ type FastFileState struct {
 // WriteFastFile 将排序前缀集序列化为 .fast 二进制格式并原子写入。
 // 输入必须已排序且不相交（CIDR 聚合后）——本函数不做排序/聚合。
 func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
+	// 防御性排序：.fast 的二分查询契约要求升序不相交。调用方（生产路径
+	// AggregatePrefixes）已排序，此处兜底防静默损坏——乱序输入会产出
+	// 「可加载但查询错误」的文件，是最坏形态的静默腐化。已序输入的排序
+	// 开销近似线性。
+	sort.Slice(v4, func(i, j int) bool { return v4[i].Addr().Compare(v4[j].Addr()) < 0 })
+	sort.Slice(v6, func(i, j int) bool { return v6[i].Addr().Compare(v6[j].Addr()) < 0 })
 	// 计算总大小
 	size := fastFileHeaderSize + len(v4)*5 + len(v6)*17
 	buf := make([]byte, size)

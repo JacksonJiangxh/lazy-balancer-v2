@@ -8,12 +8,14 @@ package services
 import (
 	"database/sql"
 	"encoding/json"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/wafiplist"
 )
 
 // rdbStrictSeedThreatList 播种一条威胁库列表行（system=1, entries 空——
@@ -128,5 +130,36 @@ func TestRDBStrictRender_threatFilePresentRendersNormally(t *testing.T) {
 	routes, mainRoute := mpGenRoutes(t, database, rule)
 	if mainRoute == nil && len(routes) == 0 {
 		t.Fatal("路由必须正常生成")
+	}
+}
+
+// 从节点形状（RDB）：.iplist 文本缺失但 .fast 在场（waf_files 通道同步产物）
+// → 回退展开 .fast 前缀集，策略照常渲染（match-set 等价）。
+func TestRDBStrictRender_slaveShape_fastOnlyRenders(t *testing.T) {
+	stubSecurityLibsAvailable(t)
+	wafDir := t.TempDir()
+	restoreWaf := OverrideThreatWafDirForTest(wafDir)
+	defer restoreWaf()
+	_, database := newClusterTestService(t)
+	seedHTTPRuleForGeneration(t, database, "lb_rdb3", "rdb3.example.test", 8080)
+
+	listID := rdbStrictSeedThreatList(t, database, "ustc")
+	// 只写 .fast（模拟从节点：waf_files 通道只带二进制）
+	v4 := []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
+	if err := wafiplist.WriteFastFile(wafiplist.FastPath(filepath.Join(wafDir, "threat-ustc.iplist")), v4, nil); err != nil {
+		t.Fatal(err)
+	}
+	refs, _ := json.Marshal([]int64{listID})
+	rdbStrictBindRefPolicy(t, database, "lb_rdb3", "rdb-slave", string(refs))
+	mpGenBindPolicy(t, database, "lb_rdb3", "rdb-slave-p2", mpGenPolicySpec{
+		mode: "blocking", enabled: true, geoCountries: `["海外"]`,
+	})
+
+	rule := mpGenHTTPRule("lb_rdb3", "rdb3.example.test")
+	routes, mainRoute := mpGenRoutes(t, database, rule)
+
+	dump, _ := json.Marshal(map[string]interface{}{"routes": routes, "main": mainRoute})
+	if !strings.Contains(string(dump), "GeoIP 区域拦截") {
+		t.Fatalf("从节点 .fast 回退：未受影响策略必须照常渲染")
 	}
 }
