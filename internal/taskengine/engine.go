@@ -10,6 +10,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -381,13 +383,23 @@ func (e *Engine) runNow(id, trigger string) error {
 				_, _ = db.DB.Exec(`UPDATE task_runs SET stage=?, message=? WHERE id=?`, stage, msg, runID)
 			}
 		},
-		Logger: func(level, msg string) { /* M1 结构化日志直通应用日志 */ },
+		Logger: func(level, msg string) { taskLogAppend(id, "["+level+"] "+msg) },
 	}
 
 	start := time.Now()
+	if trigger == "manual" {
+		taskLogAppend(id, "[start] 手动触发")
+	}
 	runErr := r.desc.Run(rc)
 	status := terminalStatus(ctx, runErr)
 	dur := time.Since(start).Milliseconds()
+	if trigger == "manual" || status != "success" || runID > 0 {
+		msg := fmt.Sprintf("[done] %s 耗时=%dms 触发=%s", status, dur, trigger)
+		if status == "failed" && runErr != nil {
+			msg += " 错误=" + runErr.Error()
+		}
+		taskLogAppend(id, msg)
+	}
 	// 高频工作轮失败才补落库（成功轮静默——2s 摄取/60s 看门狗每轮落库
 	// 即每天 4.3 万/1440 行噪音）
 	if runID == 0 && r.desc.RecordFailuresOnly && status != "success" {
@@ -507,6 +519,37 @@ func SetLocation(loc *time.Location) {
 
 func engineNowStr() string { return time.Now().In(engineLoc).Format("2006-01-02 15:04:05") }
 
+// taskLogDir 任务文本日志目录（/app/logs/tasks/{task_id}.log——统一任务
+// 引擎管理；运行日志轮转副本清理任务统一 rotate/清理）。
+var taskLogDir string
+
+// SetLogDir 注入任务日志目录（services 启动时）。
+func SetLogDir(dir string) { taskLogDir = dir }
+
+// TaskLogPath 任务日志文件路径（日志端点消费；空目录返回空）。
+func TaskLogPath(taskID string) string {
+	if taskLogDir == "" {
+		return ""
+	}
+	return filepath.Join(taskLogDir, taskID+".log")
+}
+
+// taskLogAppend 追加一行任务日志（与 task_runs 落库同策略：manual/失败/
+// 真实运行才写——静默成功轮零噪音）。
+func taskLogAppend(taskID, line string) {
+	path := TaskLogPath(taskID)
+	if path == "" {
+		return
+	}
+	_ = os.MkdirAll(taskLogDir, 0755)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s %s\n", engineNowStr(), line)
+}
+
 // RecordRunStart 族侧真实运行开跑落库（返回 run ID；0=跳过）。
 // 引擎探测 SilentProbes 的族（更新族等），真实任务体由族 manager 在
 // run() 首尾调用 RecordRunStart/RecordRunFinish——历史与引擎同表同口径。
@@ -618,4 +661,19 @@ func PurgeTaskRuns(days int) {
 		return
 	}
 	_ = days
+}
+
+// TeeTaskLog 业务侧（更新族分阶段流水）tee 到任务日志——统一文本日志面。
+func TeeTaskLog(taskID, timestamp, level, stage, message string) {
+	path := TaskLogPath(taskID)
+	if path == "" {
+		return
+	}
+	_ = os.MkdirAll(taskLogDir, 0755)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s [%s] %s - %s\n", timestamp, level, stage, message)
 }

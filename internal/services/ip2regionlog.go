@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"lazy-balancer-v2/internal/taskengine"
 	"os"
 	"path/filepath"
 	"time"
@@ -38,5 +39,8 @@ func writeIP2RegionUpdateLog(level, stage, message string) {
 
 // AppendIP2RegionUpdateLog 同 AppendCRSUpdateLog(lbbak 导入/集群同步留痕)。
 func AppendIP2RegionUpdateLog(level, stage, message string) {
+	// 统一任务引擎文本日志 tee（任务监控「日志」端点同源消费）
+	taskengine.TeeTaskLog("ip2region", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
+
 	writeIP2RegionUpdateLog(level, stage, message)
 }

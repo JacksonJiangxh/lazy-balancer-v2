@@ -11,10 +11,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"bytes"
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 	"lazy-balancer-v2/internal/taskengine"
+	"os"
 )
 
 // ListSystemTasks 聚合全部任务族状态（全员可见）。
@@ -234,4 +236,29 @@ func (h *Handlers) GetSystemTaskHistory(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"runs": []struct{}{}}})
+}
+
+// GetSystemTaskLogs 任务文本日志（统一任务引擎管理——tasks/{id}.log；
+// 更新族含分阶段流水 tee）。
+func (h *Handlers) GetSystemTaskLogs(c *gin.Context) {
+	id := c.Param("id")
+	path := taskengine.TaskLogPath(id)
+	if path == "" {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"content": ""}})
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"content": ""}})
+		return
+	}
+	// 尾部 256KB（日志弹框消费口径，防超长载荷）
+	const tail = 256 << 10
+	if len(data) > tail {
+		data = data[len(data)-tail:]
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			data = data[i+1:]
+		}
+	}
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"content": string(data)}})
 }

@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"lazy-balancer-v2/internal/taskengine"
 	"os"
 	"path/filepath"
 	"time"
@@ -39,5 +40,8 @@ func writeCRSUpdateLog(level, stage, message string) {
 // ——更新弹框的「更新日志」直接读该文件,文件变更必须在此留痕(用户裁定
 // 2026-09-18:同步/导入有变动也要走完整流程并记录日志)。
 func AppendCRSUpdateLog(level, stage, message string) {
+	// 统一任务引擎文本日志 tee（任务监控「日志」端点同源消费）
+	taskengine.TeeTaskLog("crs", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
+
 	writeCRSUpdateLog(level, stage, message)
 }
