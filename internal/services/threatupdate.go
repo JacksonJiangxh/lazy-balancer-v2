@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,8 @@ import (
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/wafiplist"
 )
+
+var wafDir = "/app/waf"
 
 // 威胁情报库（v2.3.2 名单化重构）：三个内置只读源（USTC/FireHOL level1/ET
 // Compromised）的单一顺序更新任务。内容落 security_ip_lists 的 system=1
@@ -469,19 +473,31 @@ func writeThreatSystemList(source string, entries []string) (bool, error) {
 	if listExists > 0 && storedHash == hash && storedHash != "" {
 		return false, nil
 	}
+	// RDB 文件化：条目写 .iplist 文件 + 编译 .fast，DB entries 恒空
+	iplistPath := filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist", source))
+	entryStrs := make([]string, len(payload))
+	for i, e := range payload {
+		entryStrs[i] = e.Value
+	}
+	if err := writeThreatIplist(iplistPath, entryStrs); err != nil {
+		return false, fmt.Errorf("写 .iplist 文件失败: %w", err)
+	}
+	if err := CompileFromIplistFile(iplistPath); err != nil {
+		return false, fmt.Errorf("编译 .fast 失败: %w", err)
+	}
+	entryCount := len(entryStrs)
 	if listExists == 0 {
 		// 行缺失自愈补建
 		if _, ierr := db.DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at)
-			VALUES (?, ?, '恶意 IP', ?, 1, datetime('now'), datetime('now'))`, name, threatListDescription(source), string(encoded)); ierr != nil {
+			VALUES (?, ?, '恶意 IP', '', 1, datetime('now'), datetime('now'))`, name, threatListDescription(source)); ierr != nil {
 			return false, fmt.Errorf("补建内置名单失败: %w", ierr)
 		}
-		// F49-P5-4：补建产生新 id——策略经 ip_acl_list_refs/ip_whitelist_refs
-		// 持有的旧 id 引用已失效，必须响亮留痕引导重新绑定。
+		// F49-P5-4：补建产生新 id
 		Logf("warn", "威胁情报库: 内置名单 %q 已重建为新 id，原策略引用已失效，需重新绑定", name)
 		RecordAuditLog("system", "重建", "威胁情报库", fmt.Sprintf("内置名单 %s 重建为新 id，原策略引用已失效，需重新绑定", name), "")
 	} else {
-		if _, err := db.DB.Exec(`UPDATE security_ip_lists SET entries=?, updated_at=datetime('now') WHERE name=? AND system=1`, string(encoded), name); err != nil {
-			return false, fmt.Errorf("更新内置名单失败: %w", err)
+		if _, err := db.DB.Exec(`UPDATE security_ip_lists SET entries='', entry_count=?, updated_at=datetime('now') WHERE name=? AND system=1`, entryCount, name); err != nil {
+			return false, fmt.Errorf("更新内置名单元数据失败: %w", err)
 		}
 	}
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET content_hash=? WHERE name=?`, hash, source); err != nil {
@@ -568,4 +584,15 @@ func downloadAndParseThreatSource(source threatSourceRow) ([]string, string, err
 		return nil, "", fmt.Errorf("条目数 %d 超过 200000 上限", len(entries))
 	}
 	return entries, rawHash, nil
+}
+
+// writeThreatIplist 将威胁库条目写为 .iplist 纯文本文件（原子写）。
+// 格式：每行一个 IP/CIDR，供导出/调试/从节点编译。
+func writeThreatIplist(path string, entries []string) error {
+	content := strings.Join(entries, "\n") + "\n"
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
