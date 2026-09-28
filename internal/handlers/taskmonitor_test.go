@@ -72,7 +72,7 @@ func TestListSystemTasks_allFamiliesPresent(t *testing.T) {
 			t.Fatalf("任务族 %s 缺失; got=%v", id, got)
 		}
 	}
-	if got["threat"] != "安全防护" || got["cert-renewal-scan"] != "证书" || got["startup:config-load"] != "触发" {
+	if got["threat"] != "安全防护" || got["cert-renewal-scan"] != "证书" || got["startup:config-load"] != "系统" {
 		t.Fatalf("分类错配: %v", got)
 	}
 }

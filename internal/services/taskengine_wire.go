@@ -281,17 +281,20 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	})
 	taskEngine.Register(taskengine.Descriptor{
 		ID: "cert-waiting-ca", Family: "certificates", Name: "CA 等待轮询",
-		Description: "轮询等待 CA 完成验证/签发的异步订单（LE/ZeroSSL 等），含滞留/断链补扫",
+		Description: "证书任务在途时的兜底补扫：CA 冷却到期重排、滞留 queued 重入队、断链部署重试重建。门控——有非终态任务才扫描，全部完成即静默；可经调度开关停用",
 		Category:    "证书", Kind: taskengine.KindContinuous,
 		RecordFailuresOnly: true, // 30s 补扫成功静默——仅断链/失败留痕
 		IntervalFn:         func() time.Duration { return 30 * time.Second },
-		StatusFn: func() string { // 有等待/滞留任务才「运行中」——空闲不空转显示
+		StatusFn: func() string { // 有活=运行中/无活=空闲/关停=已停止（门控后零空转）
 			var n int
-			_ = db.DB.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE status IN ('waiting_ca','queued','pending')`).Scan(&n)
+			_ = db.DB.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE status NOT IN ('issued','failed','disabled')`).Scan(&n)
 			if n > 0 {
 				return "running"
 			}
-			return ""
+			if te := TaskEngine(); te != nil && te.IsRunning("cert-waiting-ca") {
+				return "idle"
+			}
+			return "stopped"
 		},
 		NextSlotFn: func() string { // 有等待任务时展示最近 CA 可用时间
 			var at string
@@ -333,7 +336,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 
 	// 任务性质批量标定（展示口径）：排程/固定间隔族由探测轮或间隔驱动，
 	// 但性质是「定时」——只有真常驻循环（看门狗/事件摄取）是「常驻」。
-	for _, id := range []string{"threat", "crs", "ip2region", "auto-backup", "log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca"} {
+	for _, id := range []string{"threat", "crs", "ip2region", "auto-backup", "log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll"} {
 		taskEngine.SetAsKind(id, taskengine.KindScheduled)
 	}
 
