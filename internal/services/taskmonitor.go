@@ -399,16 +399,7 @@ func collectClusterSyncTask() TaskInfo {
 
 // collectWatchdogTask 配置漂移看门狗（60s 常驻）。
 func collectWatchdogTask() TaskInfo {
-	rt, _ := TaskRuntimeState("config-watchdog")
-	sts := TaskStatusPassive
-	if r, ctrl := TaskRuntimeState("config-watchdog"); ctrl {
-		sts = TaskStatusIdle
-		if r {
-			sts = TaskStatusRunning
-		}
-	}
-	_ = rt
-	return TaskInfo{ID: "config-watchdog", Name: "配置漂移看门狗", Description: "每 60 秒比对运行中 Caddy 配置与数据库期望配置，漂移时面板横幅告警并触发对账", Cadence: "每 60 秒", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: sts, Controllable: true, DetailHint: "watchdog"}
+	return TaskInfo{ID: "config-watchdog", Name: "配置漂移看门狗", Description: "每 60 秒比对运行中 Caddy 配置与数据库期望配置，漂移时面板横幅告警并触发对账", Cadence: "每 60 秒", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: continuousStatus("config-watchdog"), Controllable: true, DetailHint: "watchdog"}
 }
 
 // collectAuditRetentionTask 审计日志保留清理。
