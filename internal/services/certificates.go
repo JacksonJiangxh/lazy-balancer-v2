@@ -735,8 +735,23 @@ func CertManualCheckOnce() {
 	withActiveCertService(func(s *CertificateService) { s.checkManualCertExpiration() })
 }
 
+// certJobsActive 报告是否存在非终态证书任务（issued/failed/disabled 之外）——
+// 含 stranded queued / 断链 downloaded / 停车 waiting_ca 全部孤儿形态。
+func certJobsActive() bool {
+	var n int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE status NOT IN ('issued','failed','disabled')`).Scan(&n); err != nil {
+		return true // 判定失败按有活处理——宁扫勿漏（安全网语义）
+	}
+	return n > 0
+}
+
 // CertWaitingCATickOnce CA 等待/滞留补扫（30s 节拍）。
+// 门控（2026-09-29 用户裁定）：无非终态证书任务即退出——零扫描零动作；
+// 孤儿任务均为非终态，门控天然覆盖，不漏扫。
 func CertWaitingCATickOnce() {
+	if !certJobsActive() {
+		return
+	}
 	withActiveCertService(func(s *CertificateService) {
 		s.requeueWaitingCAJobs()
 		if qm := GetCAQueueManager(); qm != nil {
