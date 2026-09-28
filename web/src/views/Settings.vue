@@ -14,6 +14,10 @@
       </div>
     </div>
 
+    <div v-if="activeTab === 'tasks'" class="task-monitor-wrap">
+      <TaskMonitor />
+    </div>
+
     <div v-if="activeTab === 'basic'" class="basic-settings-grid">
       <BasicSettings
         v-model:settings="settings"
@@ -46,6 +50,7 @@ import CaddyGlobalSettings from './settings/CaddyGlobalSettings.vue'
 import ClusterSettings from './settings/ClusterSettings.vue'
 import FreeCertificates from './settings/FreeCertificates.vue'
 import APIKeys from '@/views/Keys.vue'
+import TaskMonitor from './settings/TaskMonitor.vue'
 
 const authStore = useAuthStore()
 
@@ -112,6 +117,7 @@ const titles: Record<string, string> = {
   cluster: '集群管理',
   certificates: '免费证书',
   apikeys: 'API 密钥',
+  tasks: '任务监控',
 }
 
 const descs: Record<string, string> = {
@@ -119,6 +125,7 @@ const descs: Record<string, string> = {
   cluster: '配置主从节点模式和同步策略',
   certificates: '配置 ACME 邮箱、DNS 提供商和证书签发任务',
   apikeys: '管理 API 访问密钥',
+  tasks: '全部定时与后台任务的运行监控、手动触发与取消',
 }
 
 const pageTitle = computed(() => titles[activeTab.value] || '系统设置')
@@ -222,6 +229,7 @@ const syncActiveTabFromPage = () => {
     'settings-cluster': 'cluster',
     'settings-certificates': 'certificates',
     'settings-apikeys': 'apikeys',
+    'settings-tasks': 'tasks',
   }
   activeTab.value = map[authStore.currentPage] || 'basic'
 }
