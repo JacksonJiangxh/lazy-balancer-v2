@@ -51,8 +51,9 @@
             <el-tooltip
               :disabled="!row.description"
               placement="top"
-              :offset="4"
+              :offset="8"
               :show-after="150"
+              :show-arrow="false"
               popper-class="tm-name-tip"
             >
               <template #content>
@@ -95,20 +96,23 @@
         </el-table-column>
         <el-table-column label="执行时间" width="175">
           <template #default="{ row }">
-            <el-tooltip :disabled="!row.last_run && !row.next_run_at" placement="top" :offset="4" :show-after="150">
+            <el-tooltip :disabled="!row.last_run" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <template #content>
                 <div class="tm-tip-title">最近执行</div>
                 <div>{{ fmtTime(row.last_run?.started_at) || '—' }}<template v-if="row.last_run?.duration_ms > 0">（耗时 {{ fmtDuration(row.last_run.duration_ms) }}）</template></div>
                 <div class="tm-tip-sep"></div>
                 <div class="tm-tip-title">完成时间</div>
                 <div>{{ row.status === 'running' ? '进行中' : fmtTime(row.last_run?.finished_at) || '—' }}</div>
-                <div class="tm-tip-sep"></div>
-                <div class="tm-tip-title">下次执行</div>
-                <div>{{ row.next_run_at || '—' }}</div>
               </template>
               <span v-if="row.last_run?.started_at">{{ fmtTime(row.last_run.started_at) }}</span>
               <span v-else class="tm-dim">—</span>
             </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="下次执行" width="165">
+          <template #default="{ row }">
+            <span v-if="row.next_run_at">{{ row.next_run_at }}</span>
+            <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
         <el-table-column label="24h 成功/失败" width="120">
@@ -128,6 +132,12 @@
               link type="info" size="small" @click="openLogs(row)"
             >日志</el-button>
             <el-button link type="info" size="small" @click="openDetail(row)">详情</el-button>
+            <el-button
+              v-if="row.controllable"
+              link :type="row.status === 'running' ? 'danger' : 'success'" size="small"
+              :disabled="!isAdmin"
+              @click="onControl(row)"
+            >{{ row.status === 'running' ? '停止' : '启动' }}</el-button>
             <el-button
               v-if="row.cancellable"
               link type="danger" size="small" :disabled="!isAdmin"
@@ -201,7 +211,16 @@ import { Refresh, Loading, PieChart as PieChartIcon, Timer, DataLine, List } fro
 import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
-import { seriesColors, statusColor, baseGrid, baseTooltip, baseAxis } from '@/utils/chartTheme'
+import { seriesColors, statusColor } from '@/utils/chartTheme'
+
+// 图表基底与仪表盘/安全总览同款（白底提示/底部图例/浅轴）
+const chartBase = {
+  tooltip: { trigger: 'item', backgroundColor: 'rgba(255,255,255,0.95)', borderColor: '#e5e7eb', textStyle: { color: '#374151', fontSize: 12 } },
+  legend: { bottom: 0, textStyle: { fontSize: 11, color: '#6b7280' } },
+  grid: { left: 55, right: 15, top: 15, bottom: 40 },
+  xAxis: { axisLine: { lineStyle: { color: '#e5e7eb' } }, axisLabel: { fontSize: 10, color: '#9ca3af' } },
+  yAxis: { axisLine: { show: false }, axisLabel: { fontSize: 10, color: '#9ca3af' }, splitLine: { lineStyle: { color: '#f3f4f6' } } },
+}
 import type { APIResponse } from '@/types'
 
 use([CanvasRenderer, PieChart, BarChart, GridComponent, TooltipComponent, LegendComponent])
@@ -219,6 +238,7 @@ interface TaskInfo {
   name: string
   description?: string
   cadence?: string
+  controllable?: boolean
   category: string
   kind: 'scheduled' | 'continuous' | 'queue'
   status: string
@@ -310,7 +330,7 @@ onMounted(() => {
 onUnmounted(() => polling.stop())
 
 // ===== 图表 =====
-const statusPieOption = computed<EChartsOption>(() => {
+const statusPieOption = computed<EChartsOption>((): EChartsOption => {
   const counts = new Map<string, number>()
   for (const t of tasks.value) counts.set(t.status, (counts.get(t.status) || 0) + 1)
   const labels: Record<string, string> = {
@@ -318,8 +338,9 @@ const statusPieOption = computed<EChartsOption>(() => {
     disabled: '已暂停', passive: '常驻', no_runs: '未运行',
   }
   return {
-    tooltip: { ...baseTooltip, trigger: 'item' },
-    legend: { bottom: 0, icon: 'circle', itemWidth: 8, itemHeight: 8, textStyle: { color: '#6b7280', fontSize: 11 } },
+    ...chartBase,
+    tooltip: { ...chartBase.tooltip, trigger: 'item' as const },
+    legend: { ...chartBase.legend, icon: 'circle', itemWidth: 8, itemHeight: 8 },
     series: [{
       type: 'pie',
       radius: ['52%', '74%'],
@@ -335,14 +356,14 @@ const statusPieOption = computed<EChartsOption>(() => {
   }
 })
 
-const durationBarOption = computed<EChartsOption>(() => {
+const durationBarOption = computed<EChartsOption>((): EChartsOption => {
   const rows = tasks.value.filter((t) => t.last_run && t.last_run.duration_ms > 0)
     .sort((a, b) => (b.last_run!.duration_ms) - (a.last_run!.duration_ms)).slice(0, 8)
   return {
-    tooltip: { ...baseTooltip, trigger: 'axis', axisPointer: { type: 'shadow' } },
-    grid: { ...baseGrid, left: 8 },
-    xAxis: { type: 'value', ...baseAxis },
-    yAxis: { type: 'category', data: rows.map((t) => t.name.replace(/（.*）/, '')), ...baseAxis, axisLabel: { ...baseAxis.axisLabel, width: 84, overflow: 'truncate' } },
+    tooltip: { ...chartBase.tooltip, trigger: 'axis', axisPointer: { type: 'shadow' } },
+    grid: { ...chartBase.grid },
+    xAxis: { type: 'value', ...chartBase.xAxis },
+    yAxis: { type: 'category', data: rows.map((t) => t.name.replace(/（.*）/, '')), ...chartBase.yAxis, axisLabel: { ...chartBase.yAxis.axisLabel, width: 84, overflow: 'truncate' } },
     series: [{
       type: 'bar',
       data: rows.map((t) => ({
@@ -354,14 +375,14 @@ const durationBarOption = computed<EChartsOption>(() => {
   }
 })
 
-const statsBarOption = computed<EChartsOption>(() => {
+const statsBarOption = computed<EChartsOption>((): EChartsOption => {
   const rows = tasks.value.filter((t) => t.runs_24h > 0 || t.fail_24h > 0).slice(0, 8)
   return {
-    tooltip: { ...baseTooltip, trigger: 'axis', axisPointer: { type: 'shadow' } },
-    legend: { top: 0, right: 0, icon: 'circle', itemWidth: 8, itemHeight: 8, textStyle: { color: '#6b7280', fontSize: 11 } },
-    grid: { ...baseGrid, left: 8 },
-    xAxis: { type: 'category', data: rows.map((t) => t.name.replace(/（.*）/, '')), ...baseAxis, axisLabel: { ...baseAxis.axisLabel, interval: 0, width: 76, overflow: 'truncate' } },
-    yAxis: { type: 'value', ...baseAxis, minInterval: 1 },
+    tooltip: { ...chartBase.tooltip, trigger: 'axis', axisPointer: { type: 'shadow' } },
+    legend: { ...chartBase.legend, icon: 'circle', itemWidth: 8, itemHeight: 8, bottom: undefined, top: 0, right: 0 },
+    grid: { ...chartBase.grid },
+    xAxis: { type: 'category', data: rows.map((t) => t.name.replace(/（.*）/, '')), ...chartBase.xAxis, axisLabel: { ...chartBase.xAxis.axisLabel, interval: 0, width: 76, overflow: 'truncate' } },
+    yAxis: { type: 'value', ...chartBase.yAxis, minInterval: 1 },
     series: [
       { name: '成功', type: 'bar', data: rows.map((t) => t.success_24h), itemStyle: { color: '#34d399', borderRadius: [4, 4, 0, 0] }, barMaxWidth: 14 },
       { name: '失败', type: 'bar', data: rows.map((t) => t.fail_24h), itemStyle: { color: '#f87171', borderRadius: [4, 4, 0, 0] }, barMaxWidth: 14 },
@@ -382,6 +403,19 @@ const onTrigger = async (row: TaskInfo) => {
 const onToggle = async (row: TaskInfo, enabled: boolean) => {
   const res = await request.post<APIResponse>(`/system/tasks/${row.id}/toggle`, { enabled })
   ElMessage.success(res.message || '已更新')
+  fetchTasks()
+}
+
+const onControl = async (row: TaskInfo) => {
+  const action = row.status === 'running' ? 'stop' : 'start'
+  const label = row.status === 'running' ? '停止' : '启动'
+  if (action === 'stop') {
+    try {
+      await ElMessageBox.confirm(`确认${label}「${row.name}」？停止后相关功能将中断，可随时重新启动。`, '常驻任务控制', { type: 'warning', confirmButtonText: label })
+    } catch { return }
+  }
+  const res = await request.post<APIResponse>(`/system/tasks/${row.id}/control`, { action })
+  ElMessage.success(res.message || `已${label}`)
   fetchTasks()
 }
 

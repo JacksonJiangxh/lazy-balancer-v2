@@ -32,6 +32,8 @@ type toolSpec struct {
 	schema      string
 }
 
+const controlTaskSchema = `{"type":"object","required":["action"],"properties":{"action":{"type":"string","enum":["start","stop","restart"],"description":"启动/停止/重启"}}}`
+
 const toggleTaskSchema = `{"type":"object","required":["enabled"],"properties":{"enabled":{"type":"boolean","description":"true=恢复 false=暂停"}}}`
 
 var tools = []toolSpec{
@@ -130,6 +132,7 @@ var tools = []toolSpec{
 	{"trigger_system_task", "手动触发任务（threat/crs/ip2region）", http.MethodPost, "/system/tasks/{id}/trigger", []string{"id"}, nil, idSchema("id", "任务 ID（threat/crs/ip2region）", "string")},
 	{"toggle_system_task", "暂停/恢复任务自动调度", http.MethodPost, "/system/tasks/{id}/toggle", []string{"id"}, nil, toggleTaskSchema},
 	{"cancel_system_task", "取消运行中任务（仅下载类）", http.MethodPost, "/system/tasks/{id}/cancel", []string{"id"}, nil, idSchema("id", "任务 ID", "string")},
+	{"control_system_task", "常驻循环任务启停（config-watchdog/security-events-ingestion/log-cleanup）", http.MethodPost, "/system/tasks/{id}/control", []string{"id"}, nil, controlTaskSchema},
 	{"update_cluster_settings", "更新集群同步设置", http.MethodPut, "/cluster/settings", nil, nil, bodySchema},
 	{"list_certificate_configs", "列出全部 DNS 证书配置", http.MethodGet, "/certificate-configs", nil, nil, emptySchema},
 	{"create_certificate_config", "创建 DNS 证书配置", http.MethodPost, "/certificate-configs", nil, nil, bodySchema},

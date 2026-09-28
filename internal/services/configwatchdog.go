@@ -104,6 +104,12 @@ func StartConfigWatchdog(adminURL string) {
 }
 
 // StopConfigWatchdog 终止看门狗 goroutine 并等待其退出；未运行时调用为 no-op。
+func ConfigWatchdogRunning() bool {
+	configWatchdogMu.Lock()
+	defer configWatchdogMu.Unlock()
+	return configWatchdogDone != nil
+}
+
 func StopConfigWatchdog() {
 	configWatchdogMu.Lock()
 	cancel := configWatchdogCancel

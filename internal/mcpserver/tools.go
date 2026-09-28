@@ -119,6 +119,7 @@ var toolUsage = map[string]string{
 	"list_system_tasks":            "查看系统全部定时/后台任务的运行状态、最近执行与下次排程（任务监控聚合视图）",
 	"trigger_system_task":          "手动触发指定任务（id=threat/crs/ip2region）——仅主节点管理员",
 	"toggle_system_task":           "暂停/恢复指定任务的自动调度（enabled 布尔）",
+	"control_system_task":          "启动/停止/重启常驻循环任务（看门狗、安全事件采集、运行日志清理；停止前请确认影响）",
 	"cancel_system_task":           "取消运行中的下载类任务（威胁库/CRS/IP2Region；已完成部分保留）",
 	"promote_cluster":              "将从节点提升为独立主节点（脱离集群）",
 	"pull_sync":                    "手动触发从节点立即拉取主节点快照",
