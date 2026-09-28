@@ -117,6 +117,9 @@ func TestThreatLib_flagsOnlyToggleUpdateEnabled(t *testing.T) {
 }
 
 func TestThreatLib_updateAcceptedWithStatusAndLogs(t *testing.T) {
+	restoreWaf := services.OverrideThreatWafDirForTest(t.TempDir())
+	restoreLog := services.SetUpdateLogDirForTest(t.TempDir())
+	t.Cleanup(func() { restoreWaf(); restoreLog() })
 	// Given：源指向快速本地桩（避免真网下载）
 	router := newThreatTestRouter(t)
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
