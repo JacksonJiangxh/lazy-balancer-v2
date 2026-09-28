@@ -1,40 +1,37 @@
 <template>
   <div class="tm-root">
-    <!-- 顶部概览条 -->
-    <el-card class="tm-hero">
-      <div class="tm-hero-inner">
-        <div class="tm-hero-stats">
-          <div class="tm-hero-stat">
-            <div class="tm-hero-num">{{ tasks.length }}</div>
-            <div class="tm-hero-label">任务族</div>
-          </div>
-          <div class="tm-hero-sep"></div>
-          <div class="tm-hero-stat">
-            <div class="tm-hero-num tm-run">{{ runningCount }}</div>
-            <div class="tm-hero-label">运行中</div>
-          </div>
-          <div class="tm-hero-sep"></div>
-          <div class="tm-hero-stat">
-            <div class="tm-hero-num">{{ total24h }}</div>
-            <div class="tm-hero-label">24h 执行</div>
-          </div>
-          <div class="tm-hero-sep"></div>
-          <div class="tm-hero-stat">
-            <div class="tm-hero-num" :class="{ 'tm-bad': fail24h > 0 }">{{ fail24h }}</div>
-            <div class="tm-hero-label">24h 失败</div>
-          </div>
-        </div>
-        <div class="tm-hero-actions">
-          <span v-if="isSlave" class="tm-hero-badge"><el-icon><Lock /></el-icon> 从节点只读</span>
-          <el-button :icon="Refresh" circle size="small" :loading="refreshing" @click="refreshNow" title="立即刷新" />
-        </div>
-      </div>
-    </el-card>
+    <!-- KPI 概览（四卡） -->
+    <el-row :gutter="20" class="tm-kpis">
+      <el-col :xs="12" :md="6">
+        <el-card shadow="never" class="tm-kpi">
+          <div class="tm-kpi-num">{{ tasks.length }}</div>
+          <div class="tm-kpi-label">任务族</div>
+        </el-card>
+      </el-col>
+      <el-col :xs="12" :md="6">
+        <el-card shadow="never" class="tm-kpi">
+          <div class="tm-kpi-num tm-kpi-run">{{ runningCount }}</div>
+          <div class="tm-kpi-label">运行中</div>
+        </el-card>
+      </el-col>
+      <el-col :xs="12" :md="6">
+        <el-card shadow="never" class="tm-kpi">
+          <div class="tm-kpi-num">{{ total24h }}</div>
+          <div class="tm-kpi-label">24h 执行</div>
+        </el-card>
+      </el-col>
+      <el-col :xs="12" :md="6">
+        <el-card shadow="never" class="tm-kpi">
+          <div class="tm-kpi-num" :class="{ 'tm-kpi-bad': fail24h > 0 }">{{ fail24h }}</div>
+          <div class="tm-kpi-label">24h 失败 <el-icon v-if="isSlave" class="tm-kpi-lock"><Lock /></el-icon></div>
+        </el-card>
+      </el-col>
+    </el-row>
 
-    <!-- 图表区（引擎真实数据） -->
+    <!-- 图表行：状态分布 + 24h 执行 -->
     <el-row :gutter="20">
-      <el-col :xs="24" :md="10">
-        <el-card>
+      <el-col :xs="24" :md="8">
+        <el-card shadow="never">
           <template #header>
             <div class="card-header">
               <div class="card-title"><el-icon class="title-icon"><PieChartIcon /></el-icon><span>任务状态分布</span></div>
@@ -44,42 +41,42 @@
           <div v-else class="tm-chart tm-skeleton"></div>
         </el-card>
       </el-col>
-      <el-col :xs="24" :md="14">
-        <el-card class="tm-cq-card">
+      <el-col :xs="24" :md="16">
+        <el-card shadow="never">
           <template #header>
             <div class="card-header">
-              <div class="card-title"><el-icon class="title-icon"><Lock /></el-icon><span>ACME 证书任务队列</span>
-                <span class="tm-cq-live">排队 {{ certQueue.queued }} · 进行中 {{ certQueue.running }} · 等 CA {{ certQueue.waiting }}</span>
-              </div>
-              <el-tag v-if="certQueue.running > 0" type="primary" size="small" effect="plain">签发进行中</el-tag>
-              <el-tag v-else type="success" size="small" effect="plain">空闲</el-tag>
+              <div class="card-title"><el-icon class="title-icon"><DataLine /></el-icon><span>近 24 小时执行（成功 / 失败）</span></div>
+              <el-button :icon="Refresh" circle size="small" :loading="refreshing" @click="refreshNow" title="立即刷新" />
             </div>
           </template>
-          <div v-if="!certQueue.loaded" class="tm-cq-body tm-skeleton"></div>
-          <div v-else-if="certQueue.jobs.length" class="tm-cq-body">
-            <div v-for="j in certQueue.jobs" :key="j.id" class="tm-cq-live-row">
-              <span class="tm-cert-domain">{{ j.domain }}</span>
-              <el-tag size="small" :type="certJobTagType(j.status)" effect="plain">{{ certJobStatusLabel(j.status) }}</el-tag>
-            </div>
-            <div v-if="certQueue.total > certQueue.jobs.length" class="tm-cq-more">还有 {{ certQueue.total - certQueue.jobs.length }} 个…</div>
-          </div>
-          <div v-else class="tm-cq-body tm-cq-empty">
-            <el-icon :size="22" color="#34d399"><Lock /></el-icon>
-            <span>队列空闲——临期证书由「证书续期扫描」自动入队</span>
-          </div>
+          <v-chart v-if="loaded" :option="statsBarOption" autoresize class="tm-chart" />
+          <div v-else class="tm-chart tm-skeleton"></div>
         </el-card>
       </el-col>
     </el-row>
 
-    <!-- 行2：24h 执行统计（全宽） -->
-    <el-card>
-      <template #header>
-        <div class="card-header">
-          <div class="card-title"><el-icon class="title-icon"><DataLine /></el-icon><span>近 24 小时执行（成功 / 失败）</span></div>
+    <!-- 证书队列横幅（实时——非任务） -->
+    <el-card shadow="never" class="tm-cq-banner">
+      <div class="tm-cq-banner-inner">
+        <div class="tm-cq-banner-title"><el-icon class="title-icon"><Lock /></el-icon><span>ACME 证书任务队列</span></div>
+        <div class="tm-cq-banner-stats">
+          <span class="tm-cq-chip">排队 <b>{{ certQueue.queued }}</b></span>
+          <span class="tm-cq-chip">进行中 <b class="tm-c-run">{{ certQueue.running }}</b></span>
+          <span class="tm-cq-chip">等 CA <b class="tm-c-wait">{{ certQueue.waiting }}</b></span>
         </div>
-      </template>
-      <v-chart v-if="loaded" :option="statsBarOption" autoresize style="height: 200px; width: 100%" />
-      <div v-else style="height: 200px" class="tm-skeleton"></div>
+        <div class="tm-cq-banner-live">
+          <template v-if="certQueue.jobs.length">
+            <span v-for="j in certQueue.jobs.slice(0, 4)" :key="j.id" class="tm-cq-domain-chip">
+              {{ j.domain }}<i :class="'tm-cq-dot tm-cq-dot--' + j.status" />
+            </span>
+            <span v-if="certQueue.total > 4" class="tm-cq-more">+{{ certQueue.total - 4 }}</span>
+          </template>
+          <span v-else class="tm-cq-idle">空闲——临期证书由「证书续期扫描」自动入队</span>
+        </div>
+        <el-tag :type="certQueue.running > 0 ? 'primary' : 'success'" size="small" effect="plain">
+          {{ certQueue.running > 0 ? '签发进行中' : '空闲' }}
+        </el-tag>
+      </div>
     </el-card>
 
     <!-- 任务列表 -->
@@ -342,9 +339,6 @@ interface CertJobRow { id: number; domain: string; status: string; updated_at?: 
 const certQueue = ref<{ loaded: boolean; queued: number; running: number; waiting: number; failed: number; issued7d: number; total: number; jobs: CertJobRow[] }>({
   loaded: false, queued: 0, running: 0, waiting: 0, failed: 0, issued7d: 0, total: 0, jobs: [],
 })
-const certJobStatusLabel = (st: string): string => ({ queued: '排队', pending: '待处理', waiting_ca: '等 CA 冷却', waiting_propagation: '等 DNS 生效', issued: '已签发', failed: '失败', disabled: '已禁用' }[st] || st)
-const certJobTagType = (st: string): 'primary' | 'success' | 'warning' | 'danger' | 'info' =>
-  ['issued'].includes(st) ? 'success' : st === 'failed' ? 'danger' : ['queued', 'pending'].includes(st) ? 'warning' : ['waiting_ca'].includes(st) ? 'info' : 'primary'
 const fetchCertQueue = async () => {
   try {
     const res = await request.get<APIResponse<{ list: CertJobRow[]; total: number }>>('/certificates/jobs', { params: { page: 1, page_size: 50 }, silent: true })
@@ -556,17 +550,30 @@ const fmtDuration = (ms?: number) => {
 .card-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: #111827; }
 .title-icon { font-size: 16px; color: #3b82f6; }
 
-/* 概览条 */
-.tm-hero :deep(.el-card__body) { padding: 14px 20px; }
-.tm-hero-inner { display: flex; justify-content: space-between; align-items: center; }
-.tm-hero-stats { display: flex; align-items: center; gap: 24px; }
-.tm-hero-stat { text-align: center; min-width: 64px; }
-.tm-hero-num { font-size: 26px; font-weight: 700; color: #111827; line-height: 1.2; }
-.tm-hero-num.tm-run { color: #3b82f6; }
-.tm-hero-label { font-size: 12px; color: #6b7280; margin-top: 2px; }
-.tm-hero-sep { width: 1px; height: 32px; background: #e5e7eb; }
-.tm-hero-actions { display: flex; align-items: center; gap: 12px; }
-.tm-hero-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: #b45309; background: #fffbeb; border: 1px solid #fde68a; padding: 4px 10px; border-radius: 999px; }
+/* KPI 四卡 */
+.tm-kpis { margin-bottom: 0; }
+.tm-kpi { text-align: center; }
+.tm-kpi :deep(.el-card__body) { padding: 18px 12px; }
+.tm-kpi-num { font-size: 30px; font-weight: 800; color: #111827; line-height: 1.1; }
+.tm-kpi-run { color: #3b82f6; }
+.tm-kpi-bad { color: #f87171; }
+.tm-kpi-label { font-size: 12.5px; color: #6b7280; margin-top: 6px; display: flex; align-items: center; justify-content: center; gap: 4px; }
+.tm-kpi-lock { font-size: 12px; color: #b45309; }
+
+/* 队列横幅 */
+.tm-cq-banner :deep(.el-card__body) { padding: 12px 20px; }
+.tm-cq-banner-inner { display: flex; align-items: center; gap: 16px; }
+.tm-cq-banner-title { display: flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 600; color: #111827; white-space: nowrap; }
+.tm-cq-banner-stats { display: flex; gap: 12px; }
+.tm-cq-chip { font-size: 12.5px; color: #6b7280; white-space: nowrap; }
+.tm-cq-chip b { font-weight: 700; color: #111827; margin-left: 2px; }
+.tm-c-run { color: #4f8cff !important; } .tm-c-wait { color: #38e1ff !important; } .tm-c-fail { color: #f87171 !important; } .tm-c-ok { color: #34d399 !important; }
+.tm-cq-banner-live { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; overflow: hidden; }
+.tm-cq-domain-chip { font-size: 12px; color: #374151; background: #f3f4f6; border-radius: 999px; padding: 3px 10px; white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; }
+.tm-cq-dot { width: 6px; height: 6px; border-radius: 50%; background: #4f8cff; }
+.tm-cq-dot--queued, .tm-cq-dot--pending { background: #fbbf24; }
+.tm-cq-dot--waiting_ca { background: #38e1ff; }
+.tm-cq-idle { font-size: 12.5px; color: #9aa0b5; }
 
 .tm-chart { height: 230px; width: 100%; }
 .tm-skeleton { background: linear-gradient(90deg, rgba(0,0,0,.03) 25%, rgba(0,0,0,.06) 50%, rgba(0,0,0,.03) 75%); background-size: 200% 100%; animation: tm-shimmer 1.2s infinite; border-radius: 8px; }
