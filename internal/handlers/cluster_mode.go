@@ -108,6 +108,15 @@ func (h *Handlers) PromoteClusterNode(c *gin.Context) {
 	//（M13① 后 do() 不再以内存指纹回写，此处清空保持内存/磁盘 TOFU 生命周期
 	// 对齐）。与 R64 A-N4 的 Resume() 同点位：角色切换的完整收尾。
 	h.syncService.ForgetClusterPins()
+	// RDB Step 9：修复 Promote 调度器生命周期——提升后重启三类规则库
+	// 调度器（原缺失，需进程重启才恢复，预存 bug）
+	if tm := services.GetThreatUpdateManager(); tm != nil {
+		tm.SetMasterRole(true)
+	}
+	services.GetCRSUpdateManager().SetMasterRole(true)
+	if ip2r := services.GetIP2RegionUpdateManager(); ip2r != nil {
+		ip2r.SetMasterRole(true)
+	}
 	recordAudit(c, "提升", "集群模式", services.FormatAuditDetail("从节点 → 主节点", services.AuditResultPart("success")))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已提升为主节点"})
 }

@@ -3,6 +3,8 @@ package services
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"lazy-balancer-v2/internal/db"
@@ -151,8 +153,8 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 	if store == nil {
 		return LoadIPListEntriesByID(ids)
 	}
-	// 与 loadIPListEntries 同构(仅查询经 store);SLB12-P4-12:补 ipListChunkSize
-	// 分块(>32766 去重 id 的 SQLite 绑定变量上限防线,同文件 :12-15)。
+	// RDB 文件化：system=1（威胁库）条目读 .iplist 文件，system=0（自定义）
+	// 读 DB entries——查询加 system+source 列路由。
 	entries := make(map[int64][]string, len(ids))
 	if len(ids) == 0 {
 		return entries, nil
@@ -170,7 +172,7 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 		for i, id := range chunk {
 			args[i] = id
 		}
-		rows, err := store.Query("SELECT id, COALESCE(entries,'[]') FROM security_ip_lists WHERE id IN ("+placeholders+")", args...)
+		rows, err := store.Query("SELECT id, COALESCE(entries,'[]'), COALESCE(system,0), COALESCE(name,'') FROM security_ip_lists WHERE id IN ("+placeholders+")", args...)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("store 查询 security_ip_lists: %w", err)
@@ -180,20 +182,36 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 		for rows.Next() {
 			var id int64
 			var raw string
-			if err := rows.Scan(&id, &raw); err != nil {
+			var system int
+			var name string
+			if err := rows.Scan(&id, &raw, &system, &name); err != nil {
 				continue
 			}
-			var list []models.IPListEntry
-			if err := json.Unmarshal([]byte(raw), &list); err != nil {
-				continue
-			}
-			vals := make([]string, 0, len(list))
-			for _, e := range list {
-				if v := strings.TrimSpace(e.Value); v != "" {
-					vals = append(vals, v)
+			if system == 1 {
+				// 威胁库：读 .iplist 文件（RDB 源文件）
+				vals, ferr := readThreatIplistEntries(name)
+				if ferr != nil {
+					Logf("error", "渲染: 威胁库 %q 文件读取失败: %v（引用该列表的策略将缺失条目）", name, ferr)
+					if firstErr == nil {
+						firstErr = ferr
+					}
+					continue
 				}
+				entries[id] = vals
+			} else {
+				// 自定义列表：读 DB entries JSON
+				var list []models.IPListEntry
+				if err := json.Unmarshal([]byte(raw), &list); err != nil {
+					continue
+				}
+				vals := make([]string, 0, len(list))
+				for _, e := range list {
+					if v := strings.TrimSpace(e.Value); v != "" {
+						vals = append(vals, v)
+					}
+				}
+				entries[id] = vals
 			}
-			entries[id] = vals
 		}
 		rows.Close()
 	}
@@ -201,6 +219,39 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 		return entries, firstErr
 	}
 	return entries, nil
+}
+
+// readThreatIplistEntries 按列表名读 .iplist 文件条目（渲染层消费）。
+// 文件路径: /app/waf/threat-{source_name}.iplist
+func readThreatIplistEntries(listName string) ([]string, error) {
+	source := threatSourceByListName(listName)
+	if source == "" {
+		return nil, fmt.Errorf("列表 %q 不映射到任何威胁源", listName)
+	}
+	path := filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist", source))
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s: %w", path, err)
+	}
+	var vals []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		vals = append(vals, line)
+	}
+	return vals, nil
+}
+
+// threatSourceByListName 列表名 → 威胁源名（反向映射 ThreatListNameBySource）。
+func threatSourceByListName(listName string) string {
+	for _, sl := range db.ThreatSystemLists {
+		if sl.Name == listName {
+			return sl.Source
+		}
+	}
+	return ""
 }
 
 func LoadIPListEntriesByID(ids []int64) (map[int64][]string, error) {

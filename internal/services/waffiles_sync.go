@@ -32,6 +32,8 @@ type WafFileBundle struct {
 	// 以原始字节入 tar 条目）——字段名已去 B64 后缀（第 53 轮补充轮 U6B-6）。
 	CRSTarGz []byte `json:"crs_tar_gz,omitempty"`
 	Xdb      []byte `json:"xdb,omitempty"`
+	// RDB 文件化：威胁库 .fast 文件（主节点编译产物，从节点直接使用零编译）
+	ThreatFiles []models.ThreatFileEntry `json:"threat_files,omitempty"`
 }
 
 // BuildWafFileRef computes the live rule-file hashes without file content;
@@ -59,10 +61,33 @@ func BuildWafFileRef() *models.ClusterWafFilesRef {
 		// waf_files 节哈希两端永不对齐，从端永久节流重拉（E5 IMP-1）。
 		ref.IP2RegionTag = sanitizeBundleVersion(strings.TrimSpace(string(v)))
 	}
+	// RDB 文件化：扫描威胁库 .fast 文件哈希
+	threatFast := scanThreatFastFiles()
+	if len(threatFast) > 0 {
+		ref.ThreatSha256s = threatFast
+		seen = true
+	}
 	if !seen {
 		return nil
 	}
 	return ref
+}
+
+// scanThreatFastFiles 扫描 /app/waf/threat-*.iplist.fast 文件，返回源名→sha256 映射。
+func scanThreatFastFiles() map[string]string {
+	result := make(map[string]string)
+	matches, _ := filepath.Glob(filepath.Join(wafDir, "threat-*.iplist.fast"))
+	for _, path := range matches {
+		base := filepath.Base(path)
+		source := strings.TrimSuffix(strings.TrimPrefix(base, "threat-"), ".iplist.fast")
+		if source == "" {
+			continue
+		}
+		if sum := fileSha256(path); sum != "" {
+			result[source] = sum
+		}
+	}
+	return result
 }
 
 // BuildWafFileBundle collects the live rule files with content; served by the
@@ -86,6 +111,17 @@ func BuildWafFileBundle() *WafFileBundle {
 	if ref.IP2RegionSha != "" {
 		if data, err := os.ReadFile(ip2regionLivePath); err == nil {
 			bundle.Xdb = data
+		}
+	}
+	// RDB 文件化：附带威胁库 .fast 文件内容
+	for source := range ref.ThreatSha256s {
+		fastPath := filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist.fast", source))
+		if data, err := os.ReadFile(fastPath); err == nil {
+			bundle.ThreatFiles = append(bundle.ThreatFiles, models.ThreatFileEntry{
+				Name:    source,
+				Sha256:  fileSha256(fastPath),
+				Content: data,
+			})
 		}
 	}
 	return bundle
@@ -214,6 +250,24 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged bool, err
 				return crsChanged, xdbChanged, fmt.Errorf("写入同步 IP2Region数据库版本标记: %w", tagErr)
 			}
 			xdbChanged = true
+		}
+	}
+	// RDB 文件化：从节点写威胁库 .fast 文件（直接使用，零编译）
+	for _, tf := range bundle.ThreatFiles {
+		if len(tf.Content) == 0 {
+			continue
+		}
+		fastPath := filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist.fast", tf.Name))
+		if fileSha256(fastPath) == tf.Sha256 {
+			continue // 哈希一致跳过
+		}
+		tmp := fastPath + ".tmp"
+		if err := os.WriteFile(tmp, tf.Content, 0644); err != nil {
+			return crsChanged, xdbChanged, fmt.Errorf("写威胁库 .fast %s: %w", tf.Name, err)
+		}
+		if err := os.Rename(tmp, fastPath); err != nil {
+			os.Remove(tmp)
+			return crsChanged, xdbChanged, fmt.Errorf("rename 威胁库 .fast %s: %w", tf.Name, err)
 		}
 	}
 	return crsChanged, xdbChanged, nil
