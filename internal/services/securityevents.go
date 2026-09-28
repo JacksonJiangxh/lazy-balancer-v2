@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -1430,6 +1431,33 @@ func StartSecurityEventsIngestion(ctx context.Context) (waitExited func()) {
 		runSecurityEventsIngestionLoop(ctx)
 	}()
 	return func() { <-ingestionDone }
+}
+
+// securityEventsPollState 引擎驱动的单轮摄取状态（tailer 跨轮复用——
+// offset 连续性依赖同一 tailer 实例）。
+var securityEventsPollState struct {
+	sync.Mutex
+	tailer *securityEventsTailer
+	inited bool
+}
+
+// SecurityEventsPollOnce 单轮摄取（先采集后轮转——引擎 2s 节拍调用）。
+// 与原生循环体同序：tailer.securityEventsTick + rotateAuditLogIfNeeded。
+func SecurityEventsPollOnce() {
+	securityEventsPollState.Lock()
+	defer securityEventsPollState.Unlock()
+	if !securityEventsPollState.inited {
+		securityEventsPollState.tailer = securityEventsNewTailer(auditLogPath, securityEventsOffsetPath)
+		if err := ensureAuditLogDir(); err != nil {
+			Logf("warn", "security events ingestion: create audit log dir %s failed: %v", filepath.Dir(auditLogPath), err)
+		}
+		securityEventsPollState.inited = true
+		Logf("info", "security events ingestion(engine) started: audit_log=%s", auditLogPath)
+	}
+	if err := securityEventsPollState.tailer.securityEventsTick(); err != nil {
+		securityEventsPollState.tailer.securityEventsRateLimitedWarn(err)
+	}
+	rotateAuditLogIfNeeded()
 }
 
 func runSecurityEventsIngestionLoop(ctx context.Context) {

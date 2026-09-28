@@ -60,7 +60,24 @@ func CurrentConfigDrift() ConfigDriftStatus {
 // 才置状态（防配置应用窗口的瞬时误报）。从节点不运行——同步链路已有 drift 检测与
 // 重载失败标记自愈覆盖。恢复由用户手动重启完成（横幅入口），不做自动重应用。
 // 重复调用幂等（已运行时不重启）；停止路径为 StopConfigWatchdog（main.go 优雅退出）。
+// watchdogAdminURLOnce 引擎驱动单轮检查的 admin 地址（首次启动钉定）。
+var watchdogAdminURLValue string
+
+// WatchdogCheckOnce 单轮一致性检查（panic 留痕——看门狗是唯一消费者，
+// goroutine 静默死亡是最坏形态；引擎 60s 节拍调用）。
+func WatchdogCheckOnce() {
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				Logf("error", "配置一致性看门狗：检查 panic: %v", r)
+			}
+		}()
+		checkConfigConsistency(watchdogAdminURLValue)
+	}()
+}
+
 func StartConfigWatchdog(adminURL string) {
+	watchdogAdminURLValue = adminURL
 	configWatchdogMu.Lock()
 	if configWatchdogDone != nil {
 		configWatchdogMu.Unlock()
