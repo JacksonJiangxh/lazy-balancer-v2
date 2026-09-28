@@ -87,6 +87,7 @@ func CollectSystemTasks() []TaskInfo {
 		collectAuditRetentionTask(),
 		collectCaddyAccessLogRotation(),
 	)
+	tasks = append(tasks, collectStartupPhases()...)
 	return tasks
 }
 
@@ -504,4 +505,36 @@ func engineControllable(id string) bool {
 		return true
 	}
 	return false
+}
+
+// collectStartupPhases 启动阶段任务（oneshot——main 启动序列各阶段，
+// 执行同步有序不变，此处只读 task_runs 最近一次 startup 记录做展示）。
+func collectStartupPhases() []TaskInfo {
+	type phaseDef struct{ id, name, desc string }
+	defs := []phaseDef{
+		{"startup:db-init", "启动 · 数据库初始化", "数据目录三库（主/审计/metrics）建库与全部迁移"},
+		{"startup:rule-libraries", "启动 · 规则库装载", "CRS 规则种子与状态对账（waf 目录就绪）"},
+		{"startup:certs", "启动 · 证书装载", "从 DB 物化全部证书文件到 certs 目录"},
+		{"startup:caddy-render", "启动 · Caddy 配置渲染", "DB 期望配置渲染并应用至运行 Caddy（失败回退最后已知正确配置）"},
+		{"startup:engine", "启动 · 任务引擎", "恢复孤儿运行记录、注册任务族并启动调度循环"},
+	}
+	var out []TaskInfo
+	for _, d := range defs {
+		ti := TaskInfo{ID: d.id, Name: d.name, Description: d.desc, Category: "启动", Kind: "oneshot", Enabled: false, Status: TaskStatusNoRuns}
+		// 最近一次 startup 触发的运行
+		var st, started, finished string
+		var dur int64
+		if err := db.DB.QueryRow(`SELECT status, started_at, COALESCE(finished_at,''), duration_ms FROM task_runs WHERE task_id=? AND trigger='startup' ORDER BY id DESC LIMIT 1`, d.id).Scan(&st, &started, &finished, &dur); err == nil {
+			ti.Status = TaskStatus(st)
+			ti.LastRun = taskRunFromCrsLayout(started, finished, "startup", st, "")
+			// SQLite datetime 形态直存
+			if ti.LastRun != nil {
+				ti.LastRun.StartedAt = started
+				ti.LastRun.FinishedAt = finished
+				ti.LastRun.DurationMs = dur
+			}
+		}
+		out = append(out, ti)
+	}
+	return out
 }

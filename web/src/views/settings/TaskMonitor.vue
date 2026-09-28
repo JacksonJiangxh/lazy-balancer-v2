@@ -322,7 +322,7 @@ const categoryFilters = computed(() =>
   [...new Set(tasks.value.map((t) => t.category))].map((c) => ({ text: c, value: c })))
 const filterCategory = (value: string, row: TaskInfo) => row.category === value
 const categoryTagType = (c: string): 'primary' | 'success' | 'warning' | 'info' =>
-  c === '安全防护' ? 'primary' : c === '证书' ? 'success' : c === '备份' ? 'warning' : 'info'
+  c === '安全防护' ? 'primary' : c === '证书' ? 'success' : c === '备份' ? 'warning' : c === '启动' ? 'info' : 'info'
 
 const toggleable = (id: string) => toggleableIds.has(id)
 
@@ -540,11 +540,11 @@ const statusLabels: Record<string, string> = {
   disabled: '已暂停', passive: '常驻', no_runs: '未运行', stopped: '已停止',
 }
 const statusLabel = (s: string) => statusLabels[s] || s
-const kindLabels: Record<string, string> = { scheduled: '定时', continuous: '常驻', queue: '队列' }
+const kindLabels: Record<string, string> = { scheduled: '定时', continuous: '常驻', queue: '队列', oneshot: '启动' }
 const kindLabel = (k: string) => kindLabels[k] || k
-const kindTag = (k: string): 'primary' | 'success' | 'warning' =>
-  k === 'scheduled' ? 'primary' : k === 'continuous' ? 'success' : 'warning'
-const triggerLabels: Record<string, string> = { manual: '手动', auto: '自动', schedule: '排程', queue: '队列', 'slave-sync': '从节点同步' }
+const kindTag = (k: string): 'primary' | 'success' | 'warning' | 'info' =>
+  k === 'scheduled' ? 'primary' : k === 'continuous' ? 'success' : k === 'oneshot' ? 'info' : 'warning'
+const triggerLabels: Record<string, string> = { manual: '手动', auto: '自动', schedule: '排程', queue: '队列', 'slave-sync': '从节点同步', startup: '启动' }
 const triggerLabel = (t: string) => triggerLabels[t] || t || '—'
 
 // 完整时间显示: 优先 ISO(2026-09-28T13:38:07Z→本地时区), 否则原样(已是
