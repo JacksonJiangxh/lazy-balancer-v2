@@ -406,8 +406,12 @@ func TestThreatDueSources_emptyListIsDue(t *testing.T) {
 		t.Fatalf("名单为空时应全部到期, got %d", len(due))
 	}
 
-	// ustc 名单填内容 → 仅剩 2 个到期
+	// ustc 名单填内容 + 落地 .iplist 文件（RDB 文件化：文件缺失=升级引导
+	// 到期语义）→ 仅剩 2 个到期
 	if _, err := db.DB.Exec(`UPDATE security_ip_lists SET entries='[{"value":"203.0.113.1/32","remark":""}]' WHERE name=?`, db.ThreatListNameBySource("ustc")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("203.0.113.1/32\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	due, err = threatDueSources("auto")

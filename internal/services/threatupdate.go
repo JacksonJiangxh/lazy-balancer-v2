@@ -192,8 +192,10 @@ func threatDueSources(trigger string) ([]threatSourceRow, error) {
 		// 不补这条则升级后最长 24h 名单为空、引用策略零拦截）——但仅限
 		// 「从未失败」形态（consecutive_failures=0，第 55 轮 P3-2，用户裁
 		// 定）：持续产不出条目的失败源按排程门控，不再每分钟整任务重跑。
+		// v2.3.4 RDB 文件化：.iplist 文件缺失同此语义（哈希命中会跳过写
+		// 文件，不补这条则升级后文件永不落地、严格渲染持续跳过策略）。
 		if trigger != "manual" && nextUpdate != "" {
-			isEmpty := threatListEmpty(s.name)
+			isEmpty := threatListEmpty(s.name) || threatIplistMissing(s.name)
 			gated := !isEmpty || consecutiveFailures > 0
 			if gated {
 				if due, err := time.Parse(crsTimeLayout, nextUpdate); err == nil && now.Before(due) {
@@ -394,6 +396,10 @@ func (m *ThreatUpdateManager) updateOneSource(source threatSourceRow, trigger st
 			// F49-4：存在性判定失败不得按「存在」跳过（名单可能已缺失，
 			// 跳过快照=拦截面静默为空）——记错并继续完整聚合/写库路径。
 			Logf("error", "威胁情报库: 检查源 %s 内置名单存在性失败: %v", source.name, err)
+		case listExists > 0 && threatIplistMissing(source.name):
+			// RDB 文件化升级引导：名单行在但 .iplist 缺失（v2.3.3 升级、
+			// 内容未变形态）——穿透快速路径照常写盘，否则文件永不落地。
+			Logf("info", "威胁情报库: 源 %s 原始哈希一致但 .iplist 文件缺失，执行落盘（升级引导）", source.name)
 		case listExists > 0:
 			AppendThreatUpdateLog("INFO", "unchanged", fmt.Sprintf("源 %s 名单内容未变化（原始内容哈希一致），跳过解析写入", source.name))
 			markSourceSuccess(source.id, len(entries), finished)
@@ -477,7 +483,9 @@ func writeThreatSystemList(source string, entries []string) (bool, error) {
 	if err := db.DB.QueryRow(`SELECT COALESCE(content_hash,'') FROM security_threat_sources WHERE name=?`, source).Scan(&storedHash); err != nil {
 		return false, fmt.Errorf("读源哈希失败: %w", err)
 	}
-	if listExists > 0 && storedHash == hash && storedHash != "" {
+	// RDB 文件化：文件缺失时哈希命中不得跳过（升级引导——v2.3.3 升上来
+	// 内容未变，但 .iplist/.fast 尚未落地，须照常写盘）。
+	if listExists > 0 && storedHash == hash && storedHash != "" && !threatIplistMissing(source) {
 		return false, nil
 	}
 	// RDB 文件化：条目写 .iplist 文件 + 编译 .fast，DB entries 恒空
@@ -591,6 +599,12 @@ func downloadAndParseThreatSource(source threatSourceRow) ([]string, string, err
 		return nil, "", fmt.Errorf("条目数 %d 超过 200000 上限", len(entries))
 	}
 	return entries, rawHash, nil
+}
+
+// threatIplistMissing 报告源的 .iplist 文件是否缺失（升级引导窗口用）。
+func threatIplistMissing(source string) bool {
+	_, err := os.Stat(filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist", source)))
+	return err != nil
 }
 
 // writeThreatIplist 将威胁库条目写为 .iplist 纯文本文件（原子写）。
