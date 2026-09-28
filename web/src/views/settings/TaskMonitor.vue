@@ -264,6 +264,9 @@ const refreshNow = async () => {
 }
 
 onMounted(() => {
+  // 首跑立即——usePollingTask.start() 只设定时器，首轮要等满 interval（10s），
+  // 页面会空转圈整轮（用户实测 network 全快但仍转圈的根因）。
+  void polling.run()
   polling.start()
   fetchClusterState()
 })
