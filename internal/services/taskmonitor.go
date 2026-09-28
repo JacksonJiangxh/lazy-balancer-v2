@@ -49,6 +49,7 @@ type TaskInfo struct {
 	Enabled      bool         `json:"enabled"`      // 自动调度开关
 	Cancellable  bool         `json:"cancellable"`  // 运行中可手动取消（仅下载类）
 	Controllable bool         `json:"controllable"` // 常驻循环可启停（start/stop/restart）
+	Triggerable  bool         `json:"triggerable"`  // 支持手动触发（ManualRun 语义族）
 	LastRun      *TaskRunInfo `json:"last_run,omitempty"`
 	NextRunAt    string       `json:"next_run_at,omitempty"`
 	Runs24h      int          `json:"runs_24h"`
@@ -100,7 +101,7 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		ti := TaskInfo{
 			ID: m.ID, Name: m.Name, Description: m.Description,
 			Category: m.Category, Kind: TaskKind(m.AsKind), // 性质口径（定时≠探测轮常驻）
-			Controllable: m.Controllable, Cancellable: m.Cancelable,
+			Controllable: m.Controllable, Cancellable: m.Cancelable, Triggerable: m.CanTrigger,
 			Enabled: m.Enabled, DetailHint: m.Family,
 		}
 		slotBased := false

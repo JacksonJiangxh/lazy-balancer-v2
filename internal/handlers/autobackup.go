@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"lazy-balancer-v2/internal/taskengine"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -169,7 +170,18 @@ func pruneAutoBackups(dir string, keepSuccess, keepFailed int) {
 // 调度与手动同时触发时后到者立即报错，不排队。
 // operator 为审计操作者:调度路径传 system,手动触发传当前登录用户
 // (2026-09-20 用户反馈:手动备份审计恒 system,看不出是谁点的)。
-func (h *Handlers) RunAutoBackupOnce(trigger, operator string) (autoBackupRowView, error) {
+func (h *Handlers) RunAutoBackupOnce(trigger, operator string) (row autoBackupRowView, err error) {
+	// 引擎运行历史：手动备份同落 task_runs（与调度执行同口径）
+	histRun := taskengine.RecordRunStart("auto-backup", "backup", trigger)
+	histT0 := time.Now()
+	defer func() {
+		status, msg := "success", ""
+		if err != nil {
+			status, msg = "failed", err.Error()
+		}
+		taskengine.RecordRunFinish(histRun, status, time.Since(histT0).Milliseconds(), msg)
+	}()
+
 	if !autoBackupRunMu.TryLock() {
 		return autoBackupRowView{}, errors.New("已有备份任务正在执行，请稍后重试")
 	}

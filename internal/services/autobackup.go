@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"lazy-balancer-v2/internal/taskengine"
 	"strconv"
 	"strings"
 	"sync"
@@ -173,9 +174,16 @@ func autoBackupTick(now time.Time) {
 	if exec == nil {
 		return
 	}
-	if err := exec("schedule", "system"); err != nil {
-		Logf("error", "自动备份执行失败: %v", err)
+	// 引擎运行历史：真实备份执行落 task_runs（探测轮静默，此处才是任务本体）
+	runID := taskengine.RecordRunStart("auto-backup", "backup", "auto")
+	t0 := time.Now()
+	execErr := exec("schedule", "system")
+	status, msg := "success", ""
+	if execErr != nil {
+		status, msg = "failed", execErr.Error()
+		Logf("error", "自动备份执行失败: %v", execErr)
 	}
+	taskengine.RecordRunFinish(runID, status, time.Since(t0).Milliseconds(), msg)
 	// 成败均推进 last_run——失败已由执行器落 failed 行+审计，此处防重试风暴
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_last_run=? WHERE id=1`, dueSlot.Format(time.RFC3339)); err != nil {
 		Logf("warn", "自动备份：更新 auto_backup_last_run 失败: %v", err)
