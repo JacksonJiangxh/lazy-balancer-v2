@@ -163,6 +163,7 @@ const ACTION_TAG_TABLE: Record<string, string> = {
   '登录失败': 'danger',
   '同步失败': 'danger',
   '重载失败': 'danger',
+  '渲染跳过': 'danger',
   '写入失败': 'danger',
   '恢复失败': 'danger',
   '切换失败': 'danger',

@@ -114,6 +114,10 @@ type SecurityPolicy struct {
 	//（无引用或非生成路径加载），发射端回退 inline-only。不参与 JSON 序列化。
 	MergedACLList   []string `json:"-"`
 	MergedWhitelist []string `json:"-"`
+	// IPRefMissing（RDB 文件化严格模式）：引用的威胁库 .iplist 文件缺失时置位，
+	// 渲染发射端跳过该策略并记 ERROR+审计——宁缺勿假（绝不以空条目集静默收窄
+	// ACL 保护面）。不参与 JSON 序列化。
+	IPRefMissing bool `json:"-"`
 	// PolicyType：策略类型（单职化分组元数据，见 InferPolicyType 注释）；''
 	// 为待推断存量态（读侧各入口/backfill 归一，不得长期滞留）。
 	PolicyType string `json:"policy_type"`

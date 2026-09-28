@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"lazy-balancer-v2/internal/services"
 	"net/http"
 	"strconv"
 	"strings"
@@ -345,13 +346,29 @@ func (h *Handlers) GetIPList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	var entries []models.IPListEntry
-	if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: fmt.Sprintf("IP 列表 %s 的条目解析失败: %v", id, err)})
-		return
+	if row.System {
+		// RDB 文件化: 系统列表条目从 .iplist 文件读取
+		vals, ferr := services.ReadThreatIplistForUI(row.Name)
+		if ferr != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: ferr.Error()})
+			return
+		}
+		entries := make([]models.IPListEntry, len(vals))
+		for i, v := range vals {
+			entries[i] = models.IPListEntry{Value: v}
+		}
+		encoded, _ := json.Marshal(entries)
+		row.Entries = json.RawMessage(encoded)
+		row.EntryCount = len(entries)
+	} else {
+		var entries []models.IPListEntry
+		if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: fmt.Sprintf("IP 列表 %s 的条目解析失败: %v", id, err)})
+			return
+		}
+		row.Entries = json.RawMessage(entriesJSON)
+		row.EntryCount = len(entries)
 	}
-	row.Entries = json.RawMessage(entriesJSON)
-	row.EntryCount = len(entries)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: row})
 }
 
