@@ -34,13 +34,21 @@ import (
 // 仅向 task_runs 落「startup」触发的一行记录——任务监控「启动」分类数据源。
 func startupPhase(id, name string, fn func() error) error {
 	runID := taskengine.RecordRunStart(id, "startup", "startup")
+	taskengine.LogTaskLine(id, "[start] 启动触发 "+name)
 	t0 := time.Now()
 	err := fn()
 	status, msg := "success", ""
 	if err != nil {
 		status, msg = "failed", err.Error()
 	}
-	taskengine.RecordRunFinish(runID, status, time.Since(t0).Milliseconds(), msg)
+	dur := time.Since(t0).Milliseconds()
+	taskengine.RecordRunFinish(runID, status, dur, msg)
+	taskengine.LogTaskLine(id, fmt.Sprintf("[done] %s 耗时=%dms 触发=startup%s", status, dur, func() string {
+		if msg != "" {
+			return " 错误=" + msg
+		}
+		return ""
+	}()))
 	return err
 }
 
@@ -170,7 +178,10 @@ func run() error {
 	}
 	// 系统配置载入（单一 oneshot 任务：规则库→证书→Caddy 渲染三段；完成于
 	// 面板监听之前——载入完成前系统不可达（强于只读））
-	if err := startupPhase("startup:config-load", "系统配置载入", func() error {
+	// runConfigLoad 为共享执行体——启动与任务监控手动触发走同一函数
+	// （2026-09-29 用户裁定：任务逻辑迁入任务后，手动执行与系统启动触发
+	// 效果必须一致，含「载入」审计与全部前置物化步骤）。
+	runConfigLoad := func() error {
 		services.SeedCRSRules()
 		services.ReconcileCRSState()
 		// 归一 R50 前落库的安全策略枚举空串行（发射端零产出 + Update 拒修的
@@ -178,7 +189,8 @@ func run() error {
 		services.NormalizeLegacySecurityPolicyEnums(context.Background())
 		services.MaterializeAllCertsFromDB()
 		return h.ApplyConfigOnStartup()
-	}); err != nil {
+	}
+	if err := startupPhase("startup:config-load", "系统配置载入", runConfigLoad); err != nil {
 		services.Logf("error", "failed to apply Caddy config on startup: %v", err)
 	}
 	// F62-28:Caddy 重启监听——监督器触发后走与启动相同的 DB 渲染→应用流程
@@ -188,7 +200,7 @@ func run() error {
 	// （系统日志/操作日志/前端横幅），恢复由用户手动重启完成。
 	// M2 统一任务引擎：看门狗/安全事件摄取/运行日志清理三常驻族迁入
 	// （单轮体+引擎节拍；原生自循环与 TaskRuntime 注册表退役）。
-	services.SetConfigLoadRerun(func() error { return caddyService.GenerateAndApplyConfigForce() })
+	services.SetConfigLoadRerun(runConfigLoad)                 // 手动重载=同一执行体（含载入审计）
 	services.InitTaskEngine(cfg.CaddyAdminURL, runtimeLogFile) // 前置设施——非任务
 	defer services.StopTaskEngine()
 

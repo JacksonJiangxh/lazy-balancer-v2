@@ -55,7 +55,8 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 				go func(tid string) {
 					_ = te.Trigger(tid, "manual") // 异步——耗时由 task_runs 记录
 				}(id)
-				recordAudit(c, "更新", "任务监控", "手动触发 "+id)
+				// 审计由任务体自记（手动/自动同一审计——2026-09-29 用户裁定）；
+				// 清理/证书循环族的执行记录在任务运行历史与任务日志。
 				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 				return
 			}

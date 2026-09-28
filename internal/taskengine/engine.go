@@ -677,3 +677,6 @@ func TeeTaskLog(taskID, timestamp, level, stage, message string) {
 	defer f.Close()
 	fmt.Fprintf(f, "%s [%s] %s - %s\n", timestamp, level, stage, message)
 }
+
+// LogTaskLine 业务/启动侧直接追加任务日志行（startupPhase 等消费）。
+func LogTaskLine(taskID, line string) { taskLogAppend(taskID, line) }

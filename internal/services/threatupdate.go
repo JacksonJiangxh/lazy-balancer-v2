@@ -292,6 +292,21 @@ func (m *ThreatUpdateManager) run(trigger string) {
 	}
 	m.mu.Lock()
 	m.lastFinishedAt = time.Now().UTC().Format(crsTimeLayout)
+	// 任务自记审计（2026-09-29 用户裁定）：执行语义归任务体——手动/自动
+	// 同一审计，触发源入详情；触发方(handler)不再补记。
+	defer func() {
+		m.mu.Lock()
+		outcome := m.lastTaskOutcome
+		m.mu.Unlock()
+		detail := fmt.Sprintf("更新%s（触发：%s）", map[string]string{
+			"success": "成功", "failed": "失败", "cancelled": "已取消", "skipped": "跳过",
+		}[outcome], trigger)
+		if outcome == "failed" || outcome == "cancelled" {
+			RecordAuditLog("system", "更新失败", "威胁情报库", detail, "")
+		} else {
+			RecordAuditLog("system", "更新", "威胁情报库", detail, "")
+		}
+	}()
 	if cancelled {
 		m.lastTaskOutcome = "cancelled"
 		m.lastCancelled = true
