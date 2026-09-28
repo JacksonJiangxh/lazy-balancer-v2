@@ -46,7 +46,7 @@
         </div>
       </template>
       <el-table :data="pagedTasks" v-loading="!loaded" size="default" row-key="id" class="tm-nowrap-table">
-        <el-table-column label="任务" min-width="200" show-overflow-tooltip>
+        <el-table-column label="任务" min-width="150" show-overflow-tooltip>
           <template #default="{ row }">
             <el-tooltip
               :disabled="!row.description"
@@ -65,24 +65,24 @@
             </el-tooltip>
           </template>
         </el-table-column>
-        <el-table-column label="所属分类" width="110" :filters="categoryFilters" :filter-method="filterCategory">
+        <el-table-column label="分类" width="92" :filters="categoryFilters" :filter-method="filterCategory">
           <template #default="{ row }">
             <el-tag size="small" effect="plain" :type="categoryTagType(row.category)">{{ row.category }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="类型" width="86">
+        <el-table-column label="类型" width="72">
           <template #default="{ row }">
             <el-tag size="small" :type="kindTag(row.kind)" effect="plain">{{ kindLabel(row.kind) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="96">
+        <el-table-column label="状态" width="88">
           <template #default="{ row }">
             <span class="tm-status" :data-status="row.status">
               <span class="tm-dot"></span>{{ statusLabel(row.status) }}
             </span>
           </template>
         </el-table-column>
-        <el-table-column label="自动调度" width="88">
+        <el-table-column label="调度" width="72">
           <template #default="{ row }">
             <el-tag v-if="row.kind === 'continuous'" size="small" type="info" effect="plain">常驻</el-tag>
             <el-switch
@@ -94,7 +94,7 @@
             <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="执行时间" width="170">
+        <el-table-column label="执行时间" width="162">
           <template #default="{ row }">
             <el-tooltip :disabled="!row.last_run" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <template #content>
@@ -109,13 +109,18 @@
             </el-tooltip>
           </template>
         </el-table-column>
-        <el-table-column label="下次执行" width="165">
+        <el-table-column label="下次执行" width="162">
           <template #default="{ row }">
             <span v-if="row.next_run_at">{{ row.next_run_at }}</span>
             <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="24h 成功/失败" width="120">
+        <el-table-column width="104">
+          <template #header>
+            <el-tooltip content="近 24 小时成功 / 失败次数（完整统计见详情）" placement="top" :show-arrow="false">
+              <span>成功/失败 ⓘ</span>
+            </el-tooltip>
+          </template>
           <template #default="{ row }">
             <span class="tm-ok">{{ row.success_24h }}</span> / <span :class="{ 'tm-bad': row.fail_24h > 0 }">{{ row.fail_24h }}</span>
           </template>
@@ -131,13 +136,13 @@
               v-if="row.id === 'threat' || row.id === 'crs' || row.id === 'ip2region'"
               link type="info" size="small" @click="openLogs(row)"
             >日志</el-button>
-            <el-button link type="info" size="small" @click="openDetail(row)">详情</el-button>
             <el-button
               v-if="row.controllable"
               link :type="row.status === 'running' ? 'danger' : 'success'" size="small"
               :disabled="!isAdmin"
               @click="onControl(row)"
             >{{ row.status === 'running' ? '停止' : '启动' }}</el-button>
+            <el-button link type="info" size="small" @click="openDetail(row)">详情</el-button>
             <el-button
               v-if="row.cancellable"
               link type="danger" size="small" :disabled="!isAdmin"
