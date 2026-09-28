@@ -729,3 +729,57 @@ func TestFetchWafFiles_rejectsOversizeBundleBody(t *testing.T) {
 		t.Fatalf("error must name the 64MB cap explicitly, got: %v", err)
 	}
 }
+
+// RDB 文件化（v2.3.4）：威胁库 .fast 随 waf_files 通道同步——主节点
+// BuildWafFileBundle 附带内容 + 哈希进 ref，从节点 ApplyWafFileBundle 落盘
+// 幂等（哈希一致跳过）。
+func TestWafFileBundleThreatFastRoundTrip(t *testing.T) {
+	wafDir := t.TempDir()
+	restoreWaf := OverrideThreatWafDirForTest(wafDir)
+	defer restoreWaf()
+
+	// 主节点产物：threat-ustc.iplist + .fast
+	iplistPath := filepath.Join(wafDir, "threat-ustc.iplist")
+	if err := os.WriteFile(iplistPath, []byte("192.0.2.0/24\n198.51.100.7\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CompileFromIplistFile(iplistPath); err != nil {
+		t.Fatal(err)
+	}
+	fastPath := iplistPath + ".fast"
+
+	bundle := BuildWafFileBundle()
+	if bundle == nil {
+		t.Fatal("bundle 必须非 nil（含威胁文件时）")
+	}
+	found := false
+	for _, tf := range bundle.ThreatFiles {
+		if tf.Name == "ustc" {
+			found = true
+			if len(tf.Content) == 0 {
+				t.Fatal("ustc .fast 内容必须随 bundle 携带")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("bundle.ThreatFiles 必须含 ustc: %+v", bundle.ThreatFiles)
+	}
+	ref := BuildWafFileRef()
+	if ref == nil || ref.ThreatSha256s["ustc"] == "" {
+		t.Fatalf("ref.ThreatSha256s 必须含 ustc: %+v", ref)
+	}
+
+	// 从节点：清掉 .fast 模拟未同步，再 Apply 落盘
+	os.Remove(fastPath)
+	if _, _, err := ApplyWafFileBundle(bundle); err != nil {
+		t.Fatalf("ApplyWafFileBundle: %v", err)
+	}
+	if _, err := os.Stat(fastPath); err != nil {
+		t.Fatalf("从节点必须落盘 .fast: %v", err)
+	}
+
+	// 幂等：再次 Apply 不报错
+	if _, _, err := ApplyWafFileBundle(bundle); err != nil {
+		t.Fatalf("幂等 Apply: %v", err)
+	}
+}

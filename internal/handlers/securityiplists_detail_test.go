@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 // IP 列表弹框性能重构（v2.3.2）：列表接口不再内联 entries（大名单载荷瘦身），
@@ -153,5 +156,51 @@ func TestCreatePolicy_rejectsBuiltinListOutsideACLDeny(t *testing.T) {
 	}
 	if resp := post(fmt.Sprintf(`{"name":"t4","policy_type":"stage0","ip_whitelist_refs":"[%d]"}`, userID)); resp.Code != http.StatusOK {
 		t.Fatalf("信任名单引用自建名单应放行, got %d: %s", resp.Code, resp.Body.String())
+	}
+}
+
+// RDB 文件化（v2.3.4）：system=1 威胁库详情条目从 .iplist 文件读取
+// （DB entries 已恒空）；system=0 仍读 DB entries（回归形状）。
+func TestGetIPList_systemListReadsIplistFile(t *testing.T) {
+	newBackupTestHandlers(t)
+	wafDir := t.TempDir()
+	restoreWaf := services.OverrideThreatWafDirForTest(wafDir)
+	defer restoreWaf()
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("192.0.2.0/24\n198.51.100.7\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 内置威胁名单行（迁移已种子；DB entries 恒空）
+	var id int64
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE system=1 AND name=?`, db.ThreatListNameBySource("ustc")).Scan(&id); err != nil {
+		t.Fatalf("种子威胁名单缺失: %v", err)
+	}
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists/:id", h.GetIPList)
+
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/ip-lists/"+strconv.Itoa(int(id)), nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	body := resp.Body.String()
+	if !strings.Contains(body, "192.0.2.0/24") || !strings.Contains(body, "198.51.100.7") {
+		t.Fatalf("详情须含 .iplist 文件条目: %s", body[:min(300, len(body))])
+	}
+	if !strings.Contains(body, `"entry_count":2`) {
+		t.Fatalf("entry_count 必须=2: %s", body[:min(300, len(body))])
+	}
+
+	// 文件缺失（禁用/未更新）→ 空集不报错
+	os.Remove(filepath.Join(wafDir, "threat-ustc.iplist"))
+	resp2 := httptest.NewRecorder()
+	router.ServeHTTP(resp2, httptest.NewRequest(http.MethodGet, "/security/ip-lists/"+strconv.Itoa(int(id)), nil))
+	if resp2.Code != http.StatusOK {
+		t.Fatalf("文件缺失应返回空集 200, got %d", resp2.Code)
+	}
+	if !strings.Contains(resp2.Body.String(), `"entry_count":0`) {
+		t.Fatalf("文件缺失 entry_count=0: %s", resp2.Body.String()[:min(300, len(resp2.Body.String()))])
 	}
 }

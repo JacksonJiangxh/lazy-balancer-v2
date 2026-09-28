@@ -3,6 +3,7 @@ package services
 import (
 	"encoding/json"
 	"fmt"
+	"lazy-balancer-v2/wafiplist"
 	"os"
 	"path/filepath"
 	"strings"
@@ -234,18 +235,33 @@ func readThreatIplistEntries(listName string) ([]string, error) {
 	if source == "" {
 		return nil, fmt.Errorf("列表 %q 不映射到任何威胁源", listName)
 	}
-	path := filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist", source))
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("读取 %s: %w", path, err)
-	}
-	var vals []string
-	for _, line := range strings.Split(string(raw), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
+	iplistPath := filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist", source))
+	if raw, err := os.ReadFile(iplistPath); err == nil {
+		// 主节点/备份导入路径：文本源文件在场，逐行解析
+		var vals []string
+		for _, line := range strings.Split(string(raw), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+				continue
+			}
+			vals = append(vals, line)
 		}
-		vals = append(vals, line)
+		return vals, nil
+	}
+	// 从节点路径：waf_files 通道只同步 .fast 二进制（零编译裁定）——文本
+	// 缺失时展开 .fast 前缀集（已聚合排序，match-set 等价）。两个文件都
+	// 缺失才报错（严格模式由调用方跳过策略）。
+	fastPath := wafiplist.FastPath(iplistPath)
+	set, err := wafiplist.ReadFastFile(fastPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s 与 %s 均失败: %w", iplistPath, fastPath, err)
+	}
+	vals := make([]string, 0, len(set.V4)+len(set.V6))
+	for _, p := range set.V4 {
+		vals = append(vals, p.String())
+	}
+	for _, p := range set.V6 {
+		vals = append(vals, p.String())
 	}
 	return vals, nil
 }
