@@ -367,8 +367,9 @@ func (e *Engine) runNow(id, trigger string) error {
 
 	runID := int64(0)
 	// 落库策略：探测族(SilentProbes)与失败留痕族(RecordFailuresOnly)
-	// 不预插——后者仅非 success 终态时补插。
-	if !r.desc.SilentProbes && !r.desc.RecordFailuresOnly {
+	// 不预插——后者仅非 success 终态时补插；manual 触发恒落库（用户显式
+	// 动作必留痕，如自动备份手动执行）。
+	if trigger == "manual" || (!r.desc.SilentProbes && !r.desc.RecordFailuresOnly) {
 		runID = globalInsertRun(id, r.desc.Family, trigger)
 	}
 	rc := RunContext{Ctx: ctx, Trigger: trigger, RunID: runID,

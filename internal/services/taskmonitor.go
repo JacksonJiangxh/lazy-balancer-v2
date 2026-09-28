@@ -104,11 +104,11 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			Controllable: m.Controllable, Cancellable: m.Cancelable, Triggerable: m.CanTrigger,
 			Enabled: m.Enabled, DetailHint: m.Family,
 		}
-		slotBased := false
+		// 排程槽族（下一时间以槽为权威，禁探测兜底）——仅这四个有用户排程槽；
+		// 清理族虽在 cadences 有文案但本质是固定间隔（last+interval 兜底有效）。
+		slotBased := m.ID == "threat" || m.ID == "crs" || m.ID == "ip2region" || m.ID == "auto-backup"
 		if c, ok := cadences[m.ID]; ok {
 			ti.Cadence = c
-			slotBased = true // 排程槽族：下一时间以槽为权威（运行瞬间槽空/旧
-			// 不得用探测 interval 兜底——60s 探测 ≠ 下次执行，显示了就是错的）
 		} else if m.IntervalSec > 0 {
 			ti.Cadence = "每 " + humanInterval(m.IntervalSec)
 		}
@@ -171,7 +171,7 @@ func humanInterval(sec int) string {
 	case sec%86400 == 0:
 		d := sec / 86400
 		if d == 1 {
-			return "天"
+			return "24 小时"
 		}
 		return fmt.Sprintf("%d 天", d)
 	case sec%3600 == 0:

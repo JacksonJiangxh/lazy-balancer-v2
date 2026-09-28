@@ -62,27 +62,31 @@
       <template #header>
         <div class="card-header">
           <div class="card-title"><el-icon class="title-icon"><Lock /></el-icon><span>ACME 证书任务队列</span></div>
-          <el-tag v-if="certQueue.running > 0" type="primary" size="small" effect="plain">签发进行中</el-tag>
-          <el-tag v-else-if="certQueue.queued > 0" type="warning" size="small" effect="plain">排队中</el-tag>
-          <el-tag v-else type="success" size="small" effect="plain">空闲</el-tag>
+          <div class="tm-cq-summary">
+            <span class="tm-cq-item">排队 <b>{{ certQueue.queued }}</b></span>
+            <span class="tm-cq-sep">·</span>
+            <span class="tm-cq-item">进行中 <b class="tm-c-run">{{ certQueue.running }}</b></span>
+            <span class="tm-cq-sep">·</span>
+            <span class="tm-cq-item">等 CA <b class="tm-c-wait">{{ certQueue.waiting }}</b></span>
+            <span class="tm-cq-sep">·</span>
+            <span class="tm-cq-item">失败 <b class="tm-c-fail">{{ certQueue.failed }}</b></span>
+            <span class="tm-cq-sep">·</span>
+            <span class="tm-cq-item">7 天签发 <b class="tm-c-ok">{{ certQueue.issued7d }}</b></span>
+            <el-tag class="tm-cq-tag" v-if="certQueue.running > 0" type="primary" size="small" effect="plain">签发进行中</el-tag>
+            <el-tag class="tm-cq-tag" v-else type="success" size="small" effect="plain">空闲</el-tag>
+          </div>
         </div>
       </template>
-      <div v-if="!certQueue.loaded" class="tm-cert-skeleton-row tm-skeleton"></div>
+      <div v-if="!certQueue.loaded" class="tm-cq-skeleton tm-skeleton"></div>
       <template v-else>
-        <div class="tm-cert-stats">
-          <div class="tm-cert-stat"><span class="tm-cert-num">{{ certQueue.queued }}</span><span class="tm-cert-lab">排队</span></div>
-          <div class="tm-cert-stat"><span class="tm-cert-num tm-c-run">{{ certQueue.running }}</span><span class="tm-cert-lab">进行中</span></div>
-          <div class="tm-cert-stat"><span class="tm-cert-num tm-c-wait">{{ certQueue.waiting }}</span><span class="tm-cert-lab">等 CA</span></div>
-          <div class="tm-cert-stat"><span class="tm-cert-num tm-c-fail">{{ certQueue.failed }}</span><span class="tm-cert-lab">失败</span></div>
-          <div class="tm-cert-stat"><span class="tm-cert-num tm-c-ok">{{ certQueue.issued7d }}</span><span class="tm-cert-lab">7 天签发</span></div>
-        </div>
-        <div v-if="certQueue.jobs.length" class="tm-cert-list">
-          <div class="tm-cert-row tm-cert-row-head">
-            <span>域名</span><span>状态</span><span>更新时间</span>
+        <div v-if="certQueue.jobs.length" class="tm-cq-table">
+          <div class="tm-cq-row tm-cq-row-head">
+            <span>域名</span><span>状态</span><span>CA</span><span>更新时间</span>
           </div>
-          <div v-for="j in certQueue.jobs" :key="j.id" class="tm-cert-row">
+          <div v-for="j in certQueue.jobs" :key="j.id" class="tm-cq-row">
             <span class="tm-cert-domain">{{ j.domain }}</span>
-            <span><el-tag size="small" :type="certJobTagType(j.status)" effect="plain">{{ j.status }}</el-tag></span>
+            <span><el-tag size="small" :type="certJobTagType(j.status)" effect="plain">{{ certJobStatusLabel(j.status) }}</el-tag></span>
+            <span class="tm-cq-ca">{{ j.ca_provider_name || '—' }}</span>
             <span class="tm-cert-time">{{ fmtTime(j.updated_at || '') || '—' }}</span>
           </div>
         </div>
@@ -335,10 +339,11 @@ const polling = usePollingTask(async () => fetchTasks(), {
   onError: (e) => console.error('task monitor poll failed:', e),
 })
 // ===== 证书队列状态（独立卡——非任务族） =====
-interface CertJobRow { id: number; domain: string; status: string; updated_at: string }
+interface CertJobRow { id: number; domain: string; status: string; updated_at?: string | null; ca_provider_name?: string }
 const certQueue = ref<{ loaded: boolean; queued: number; running: number; waiting: number; failed: number; issued7d: number; total: number; jobs: CertJobRow[] }>({
   loaded: false, queued: 0, running: 0, waiting: 0, failed: 0, issued7d: 0, total: 0, jobs: [],
 })
+const certJobStatusLabel = (st: string): string => ({ queued: '排队', pending: '待处理', waiting_ca: '等 CA 冷却', waiting_propagation: '等 DNS 生效', issued: '已签发', failed: '失败', disabled: '已禁用' }[st] || st)
 const certJobTagType = (st: string): 'primary' | 'success' | 'warning' | 'danger' | 'info' =>
   ['issued'].includes(st) ? 'success' : st === 'failed' ? 'danger' : ['queued', 'pending'].includes(st) ? 'warning' : ['waiting_ca'].includes(st) ? 'info' : 'primary'
 const fetchCertQueue = async () => {
@@ -588,18 +593,19 @@ const fmtDuration = (ms?: number) => {
 .tm-ok { color: #34d399; font-weight: 600; }
 .tm-bad { color: #f87171; font-weight: 600; }
 .tm-pagination { display: flex; justify-content: flex-end; margin-top: 12px; }
-.tm-cert-skeleton-row { height: 90px; border-radius: 8px; }
-.tm-cert-stats { display: flex; gap: 32px; padding: 6px 4px 14px; }
-.tm-cert-stat { display: flex; align-items: baseline; gap: 6px; }
-.tm-cert-num { font-size: 22px; font-weight: 700; color: #111827; }
-.tm-c-run { color: #4f8cff; } .tm-c-wait { color: #38e1ff; } .tm-c-fail { color: #f87171; } .tm-c-ok { color: #34d399; }
-.tm-cert-lab { font-size: 12px; color: #6b7280; }
-.tm-cert-list { border-top: 1px solid #f3f4f6; }
-.tm-cert-row { display: grid; grid-template-columns: 1fr 150px 160px; align-items: center; padding: 8px 4px; font-size: 12.5px; border-bottom: 1px solid #f9fafb; }
-.tm-cert-row-head { font-size: 12px; color: #6b7280; border-bottom: 1px solid #e5e7eb; }
+.tm-cq-summary { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: #6b7280; }
+.tm-cq-item b { font-weight: 700; color: #111827; margin-left: 2px; }
+.tm-c-run { color: #4f8cff !important; } .tm-c-wait { color: #38e1ff !important; } .tm-c-fail { color: #f87171 !important; } .tm-c-ok { color: #34d399 !important; }
+.tm-cq-sep { color: #d1d5db; }
+.tm-cq-tag { margin-left: 8px; }
+.tm-cq-skeleton { height: 60px; border-radius: 8px; }
+.tm-cq-row { display: grid; grid-template-columns: 1fr 130px 120px 170px; align-items: center; padding: 9px 4px; font-size: 12.5px; }
+.tm-cq-row-head { font-size: 12px; color: #6b7280; border-bottom: 1px solid #e5e7eb; }
+.tm-cq-table > .tm-cq-row:not(.tm-cq-row-head) { border-bottom: 1px solid #f9fafb; }
 .tm-cert-domain { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tm-cq-ca { color: #6b7280; }
 .tm-cert-time { color: #6b7280; text-align: right; }
-.tm-cert-none { font-size: 12.5px; color: #6b7280; padding: 10px 4px; }
+.tm-cert-none { font-size: 12.5px; color: #6b7280; padding: 12px 4px; }
 
 /* tooltip 提示 */
 :global(.tm-name-tip) { max-width: 380px; }
