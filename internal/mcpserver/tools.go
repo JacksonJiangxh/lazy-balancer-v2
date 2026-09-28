@@ -116,6 +116,7 @@ var toolUsage = map[string]string{
 	"forget_cluster_node_pin":      "清除主节点对指定从节点的证书指纹钉（服务控制持续 PinMismatch 时的单节点重钉），无钉时幂等成功",
 	"forget_cluster_pins":          "从节点清除对主节点的全部证书指纹钉（PinMismatch 自救后下次同步重新钉扎）；主节点调用返回 400",
 	"set_cluster_mode":             "将本节点注册到主节点并切换为从节点，等待审批后开始同步；提升为主节点请使用 promote_cluster",
+	"get_system_task_logs":         "查看指定任务的文本运行日志（分阶段流水/生命周期行,尾部 256KB）",
 	"get_system_task_history":      "查看指定任务的最近 50 次真实运行（开始/耗时/触发/结果）——1 分钟探测轮静默不落库",
 	"list_system_tasks":            "查看系统全部定时/后台任务的运行状态、最近执行与下次排程（任务监控聚合视图）",
 	"trigger_system_task":          "手动触发指定任务（id=threat/crs/ip2region）——仅主节点管理员",

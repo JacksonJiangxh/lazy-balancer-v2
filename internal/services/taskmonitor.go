@@ -79,7 +79,57 @@ func CollectSystemTasks() []TaskInfo {
 	if te == nil {
 		return []TaskInfo{}
 	}
-	return collectEngineFamilies(te)
+	tasks := collectEngineFamilies(te)
+	// 证书签发任务动态行（实时非终态 + 24h 内终态——执行状态进任务列表，
+	// 队列卡只展示实时队列内容）
+	tasks = append(tasks, collectCertJobRows()...)
+	return tasks
+}
+
+// collectCertJobRows 逐签发任务行：非终态（实时队列内容）+ 24h 内终态
+// （结果可见）；id=cert-job:{jobID}，日志走 /certificates/jobs/{id}/logs。
+func collectCertJobRows() []TaskInfo {
+	rows, err := db.DB.Query(`SELECT id, domain, status, COALESCE(message,''), COALESCE(updated_at,created_at)
+		FROM cert_jobs
+		WHERE status NOT IN ('issued','failed','disabled') OR COALESCE(updated_at,created_at) > datetime('now','-1 day')
+		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT 20`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []TaskInfo
+	for rows.Next() {
+		var id int
+		var domain, status, message, updatedAt string
+		if err := rows.Scan(&id, &domain, &status, &message, &updatedAt); err != nil {
+			continue
+		}
+		ti := TaskInfo{
+			ID:         fmt.Sprintf("cert-job:%d", id),
+			Name:       "ACME 签发 · " + domain,
+			Category:   "证书",
+			Kind:       TaskKindQueue,
+			Enabled:    true,
+			DetailHint: "certificates",
+			LastRun: &TaskRunInfo{StartedAt: localDisplayUTC(updatedAt), FinishedAt: localDisplayUTC(updatedAt),
+				Trigger: "queue", Result: status, Message: message},
+		}
+		ti.Status = TaskStatusIdle
+		switch status {
+		case "failed":
+			ti.Status = TaskStatusFailed
+		case "issued":
+			ti.Status = TaskStatusIdle
+		case "queued", "pending":
+			ti.Status = TaskStatusQueued
+		case "disabled":
+			ti.Status = TaskStatusDisabled
+		default:
+			ti.Status = TaskStatusRunning // 处理中各阶段
+		}
+		out = append(out, ti)
+	}
+	return out
 }
 
 // collectEngineFamilies 引擎注册族统一视图（终态：零特化零收集器——

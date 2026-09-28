@@ -8,6 +8,8 @@ package services
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -33,6 +35,13 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		return taskEngine
 	}
 	taskengine.SetLocation(CurrentLocation()) // 引擎时间遵循基础设置时区
+	logsDir := "/app/logs"
+	if runtimeLogFile != "" {
+		logsDir = filepath.Dir(runtimeLogFile)
+	}
+	tasksLogDir := filepath.Join(logsDir, "tasks")
+	_ = os.MkdirAll(tasksLogDir, 0755)
+	taskengine.SetLogDir(tasksLogDir) // 每任务文本日志（统一管理）
 	taskEngine = taskengine.NewEngine(taskengine.Options{})
 	_ = taskEngine.RecoverOrphans()
 

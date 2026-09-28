@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"lazy-balancer-v2/internal/taskengine"
 	"os"
 	"path/filepath"
 	"time"
@@ -26,6 +27,9 @@ func ThreatUpdateLogPath() string {
 
 // AppendThreatUpdateLog 写一条威胁库更新日志（更新任务与同步/导入路径共用）。
 func AppendThreatUpdateLog(level, stage, message string) {
+	// 统一任务引擎文本日志 tee（任务监控「日志」端点同源消费）
+	taskengine.TeeTaskLog("threat", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
+
 	path := ThreatUpdateLogPath()
 	if info, err := os.Stat(path); err == nil && info.Size() >= getCertJobLogSizeBytes() {
 		if rerr := rotateCertJobLogFiles(path); rerr != nil {

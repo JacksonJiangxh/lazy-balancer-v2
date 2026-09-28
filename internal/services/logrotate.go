@@ -180,8 +180,11 @@ func StartRuntimeLogCleanup(logFile string) {
 	StartRuntimeLogCleanupContext(context.Background(), logFile)
 }
 
-// RuntimeLogCleanupOnce 单轮过期日志清理（引擎每日节拍调用）。
+// RuntimeLogCleanupOnce(logFile) 单轮过期日志清理（引擎每日节拍调用）：
+// ①应用日志轮转副本（app.log.*）按保留期删除；②任务日志（tasks/*.log，
+// 统一任务引擎管理）同保留期删除 + 超 5MB 轮转（保 .1 一份）。
 func RuntimeLogCleanupOnce(logFile string) {
+	taskLogsHousekeeping(logFile)
 	months := 3
 	database := db.GetDB()
 	if database == nil {
@@ -256,4 +259,39 @@ func StopRuntimeLogCleanup() {
 	<-runtimeLogCleanup.done
 	runtimeLogCleanup.cancel = nil
 	runtimeLogCleanup.done = nil
+}
+
+// taskLogsHousekeeping 任务日志统一清理与轮转（log-cleanup 任务体）。
+func taskLogsHousekeeping(logFile string) {
+	dir := filepath.Join(filepath.Dir(logFile), "tasks")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	months := 3
+	if database := db.GetDB(); database != nil {
+		var m int
+		if err := database.QueryRow("SELECT COALESCE(audit_retention_months,3) FROM global_config WHERE id=1").Scan(&m); err == nil && m >= 1 {
+			months = m
+		}
+	}
+	cutoff := time.Now().AddDate(0, -months, 0)
+	const sizeCap = int64(5 << 20) // 5MB
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		if info.ModTime().Before(cutoff) {
+			_ = os.Remove(path)
+			continue
+		}
+		if info.Size() > sizeCap {
+			_ = os.Rename(path, path+".1") // 轮转保一份
+		}
+	}
 }

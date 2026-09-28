@@ -45,53 +45,41 @@
         </el-card>
       </el-col>
       <el-col :xs="24" :md="14">
-        <el-card>
+        <el-card class="tm-cq-card">
           <template #header>
             <div class="card-header">
-              <div class="card-title"><el-icon class="title-icon"><DataLine /></el-icon><span>近 24 小时执行（成功 / 失败）</span></div>
+              <div class="card-title"><el-icon class="title-icon"><Lock /></el-icon><span>ACME 证书任务队列</span>
+                <span class="tm-cq-live">排队 {{ certQueue.queued }} · 进行中 {{ certQueue.running }} · 等 CA {{ certQueue.waiting }}</span>
+              </div>
+              <el-tag v-if="certQueue.running > 0" type="primary" size="small" effect="plain">签发进行中</el-tag>
+              <el-tag v-else type="success" size="small" effect="plain">空闲</el-tag>
             </div>
           </template>
-          <v-chart v-if="loaded" :option="statsBarOption" autoresize class="tm-chart" />
-          <div v-else class="tm-chart tm-skeleton"></div>
+          <div v-if="!certQueue.loaded" class="tm-cq-body tm-skeleton"></div>
+          <div v-else-if="certQueue.jobs.length" class="tm-cq-body">
+            <div v-for="j in certQueue.jobs" :key="j.id" class="tm-cq-live-row">
+              <span class="tm-cert-domain">{{ j.domain }}</span>
+              <el-tag size="small" :type="certJobTagType(j.status)" effect="plain">{{ certJobStatusLabel(j.status) }}</el-tag>
+            </div>
+            <div v-if="certQueue.total > certQueue.jobs.length" class="tm-cq-more">还有 {{ certQueue.total - certQueue.jobs.length }} 个…</div>
+          </div>
+          <div v-else class="tm-cq-body tm-cq-empty">
+            <el-icon :size="22" color="#34d399"><Lock /></el-icon>
+            <span>队列空闲——临期证书由「证书续期扫描」自动入队</span>
+          </div>
         </el-card>
       </el-col>
     </el-row>
 
-    <!-- 证书队列独立状态卡（非任务——签发/续签编舞经四个证书任务驱动） -->
-    <el-card shadow="never">
+    <!-- 行2：24h 执行统计（全宽） -->
+    <el-card>
       <template #header>
         <div class="card-header">
-          <div class="card-title"><el-icon class="title-icon"><Lock /></el-icon><span>ACME 证书任务队列</span></div>
-          <div class="tm-cq-summary">
-            <span class="tm-cq-item">排队 <b>{{ certQueue.queued }}</b></span>
-            <span class="tm-cq-sep">·</span>
-            <span class="tm-cq-item">进行中 <b class="tm-c-run">{{ certQueue.running }}</b></span>
-            <span class="tm-cq-sep">·</span>
-            <span class="tm-cq-item">等 CA <b class="tm-c-wait">{{ certQueue.waiting }}</b></span>
-            <span class="tm-cq-sep">·</span>
-            <span class="tm-cq-item">失败 <b class="tm-c-fail">{{ certQueue.failed }}</b></span>
-            <span class="tm-cq-sep">·</span>
-            <span class="tm-cq-item">7 天签发 <b class="tm-c-ok">{{ certQueue.issued7d }}</b></span>
-            <el-tag class="tm-cq-tag" v-if="certQueue.running > 0" type="primary" size="small" effect="plain">签发进行中</el-tag>
-            <el-tag class="tm-cq-tag" v-else type="success" size="small" effect="plain">空闲</el-tag>
-          </div>
+          <div class="card-title"><el-icon class="title-icon"><DataLine /></el-icon><span>近 24 小时执行（成功 / 失败）</span></div>
         </div>
       </template>
-      <div v-if="!certQueue.loaded" class="tm-cq-skeleton tm-skeleton"></div>
-      <template v-else>
-        <div v-if="certQueue.jobs.length" class="tm-cq-table">
-          <div class="tm-cq-row tm-cq-row-head">
-            <span>域名</span><span>状态</span><span>CA</span><span>更新时间</span>
-          </div>
-          <div v-for="j in certQueue.jobs" :key="j.id" class="tm-cq-row">
-            <span class="tm-cert-domain">{{ j.domain }}</span>
-            <span><el-tag size="small" :type="certJobTagType(j.status)" effect="plain">{{ certJobStatusLabel(j.status) }}</el-tag></span>
-            <span class="tm-cq-ca">{{ j.ca_provider_name || '—' }}</span>
-            <span class="tm-cert-time">{{ fmtTime(j.updated_at || '') || '—' }}</span>
-          </div>
-        </div>
-        <div v-else class="tm-cert-none">无签发 / 续签任务——临期证书由「证书续期扫描」自动入队</div>
-      </template>
+      <v-chart v-if="loaded" :option="statsBarOption" autoresize style="height: 200px; width: 100%" />
+      <div v-else style="height: 200px" class="tm-skeleton"></div>
     </el-card>
 
     <!-- 任务列表 -->
@@ -167,7 +155,7 @@
         </el-table-column>
         <el-table-column label="下次执行" width="180">
           <template #default="{ row }">
-            <span v-if="row.next_run_at && row.enabled">{{ row.next_run_at }}</span>
+            <span v-if="row.next_run_at && row.enabled && row.kind !== 'continuous'">{{ row.next_run_at }}</span>
             <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
@@ -263,16 +251,27 @@
       </div>
     </el-dialog>
 
-    <!-- 任务日志抽屉（文本流——与其他日志弹框同形态） -->
-    <el-drawer v-model="logsVisible" :title="`日志 · ${logsTask?.name || ''}`" size="560px">
-      <div v-if="logsLoading" class="tm-logs-loading"><el-icon class="is-loading"><Loading /></el-icon> 加载中…</div>
-      <pre v-else class="tm-log-pre">{{ logsText || '暂无日志' }}</pre>
-    </el-drawer>
+    <!-- 任务日志弹框（与证书日志同款：暗色终端流） -->
+    <el-dialog v-model="logsVisible" width="680px" top="8vh" destroy-on-close @closed="closeLogs">
+      <template #header>
+        <DialogHeader :icon="Timer" :title="`任务日志 · ${logsTask?.name || ''}`" subtitle="统一任务引擎文本日志（实时刷新）" />
+      </template>
+      <div ref="logContainerRef" class="tm-log-container">
+        <pre v-if="logsText" class="tm-log-content">{{ logsText }}</pre>
+        <el-empty v-else description="暂无日志" :image-size="60" />
+      </div>
+      <template #footer>
+        <div style="display: flex; align-items: center;">
+          <span style="font-size: 12px; color: #9aa0b5; margin-right: auto;">每 5 秒自动刷新</span>
+          <el-button @click="logsVisible = false">关闭</el-button>
+        </div>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
 import { PieChart, BarChart } from 'echarts/charts'
@@ -280,7 +279,7 @@ import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/compon
 import type { EChartsOption } from 'echarts'
 import VChart from 'vue-echarts'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Loading, PieChart as PieChartIcon, DataLine, List, Monitor, Lock, Box } from '@element-plus/icons-vue'
+import { Refresh, PieChart as PieChartIcon, DataLine, List, Monitor, Lock, Box, Timer } from '@element-plus/icons-vue'
 import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
@@ -349,17 +348,17 @@ const certJobTagType = (st: string): 'primary' | 'success' | 'warning' | 'danger
 const fetchCertQueue = async () => {
   try {
     const res = await request.get<APIResponse<{ list: CertJobRow[]; total: number }>>('/certificates/jobs', { params: { page: 1, page_size: 50 }, silent: true })
-    const jobs = res.data?.list || []
-    const count = (pred: (j: CertJobRow) => boolean) => jobs.filter(pred).length
+    // 实时队列 = 非终态（签发执行状态/结果在任务列表 cert-job 行）
+    const live = (res.data?.list || []).filter(j => !['issued', 'failed', 'disabled'].includes(j.status))
+    const count = (pred: (j: CertJobRow) => boolean) => live.filter(pred).length
     certQueue.value = {
       loaded: true,
-      total: jobs.length,
+      total: live.length,
       queued: count(j => ['queued', 'pending'].includes(j.status)),
-      running: count(j => !['queued', 'pending', 'issued', 'failed', 'disabled'].includes(j.status)),
+      running: live.length - count(j => ['queued', 'pending'].includes(j.status)),
       waiting: count(j => j.status === 'waiting_ca'),
-      failed: count(j => j.status === 'failed'),
-      issued7d: count(j => j.status === 'issued' && !!j.updated_at && Date.now() - new Date(j.updated_at as string).getTime() < 7 * 86400000),
-      jobs: jobs.slice(0, 5),
+      failed: 0, issued7d: 0,
+      jobs: live.slice(0, 6),
     }
   } catch { certQueue.value.loaded = true }
 }
@@ -486,36 +485,33 @@ const openDetail = async (row: TaskInfo) => {
 
 // ===== 日志抽屉（content 纯文本解析） =====
 const logsVisible = ref(false)
-const logsLoading = ref(false)
 const logsText = ref('')
 const logsTask = ref<TaskInfo | null>(null)
-const logEndpoints: Record<string, string> = {
-  threat: '/security/threat-lib/update/logs',
-  crs: '/security/crs/update/logs',
-  ip2region: '/security/ip2region/update/logs',
-}
+const logContainerRef = ref<HTMLElement | null>(null)
+let logsTimer: ReturnType<typeof setInterval> | null = null
+const taskLogEndpoint = (id: string): string =>
+  id.startsWith('cert-job:') ? `/certificates/jobs/${id.slice(9)}/logs` : `/system/tasks/${id}/logs`
 const openLogs = async (row: TaskInfo) => {
   logsTask.value = row
   logsVisible.value = true
-  logsLoading.value = true
-  logsText.value = ''
-  try {
-    if (logEndpoints[row.id]) {
-      const res = await request.get<APIResponse<{ content: string }>>(logEndpoints[row.id], { silent: true })
-      logsText.value = (res.data?.content || '').trim()
-    } else {
-      const res = await request.get<APIResponse<{ runs: RunRecord[] }>>(`/system/tasks/${row.id}/history`, { params: { limit: 50 }, silent: true })
-      const runs = res.data?.runs || []
-      logsText.value = runs.map(r =>
-        `${fmtTime(r.started_at) || '?'} [${statusResultLabel(r.status)}] ${fmtDuration(r.duration_ms)} ${triggerLabel(r.trigger)}${r.message ? ' · ' + r.message : ''}`
-      ).join('\n')
-    }
-  } catch {
-    logsText.value = '日志加载失败'
-  } finally {
-    logsLoading.value = false
-  }
+  await refreshLogs()
+  logsTimer = setInterval(refreshLogs, 5000)
 }
+const refreshLogs = async () => {
+  if (!logsTask.value) return
+  try {
+    const res = await request.get<APIResponse<{ content: string }>>(taskLogEndpoint(logsTask.value.id), { silent: true })
+    logsText.value = (res.data?.content || '').trim()
+    await nextTick(() => {
+      if (logContainerRef.value) logContainerRef.value.scrollTop = logContainerRef.value.scrollHeight
+    })
+  } catch { /* 静默 */ }
+}
+const closeLogs = () => {
+  if (logsTimer) { clearInterval(logsTimer); logsTimer = null }
+}
+onUnmounted(closeLogs)
+
 
 
 // ===== 文案 =====
@@ -624,6 +620,13 @@ const fmtDuration = (ms?: number) => {
 
 /* 日志 */
 .tm-logs-loading { display: flex; align-items: center; gap: 8px; color: var(--el-text-color-secondary); padding: 16px 0; }
-.tm-log-pre { margin: 0; padding: 12px 14px; background: #f9fafb; border-radius: 8px; font-size: 12px; line-height: 1.8; font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-all; color: #374151; max-height: calc(100vh - 160px); overflow: auto; }
+.tm-log-container { max-height: 520px; overflow: auto; background: #0f172a; border-radius: 8px; padding: 16px; border: 1px solid #1e293b; }
+.tm-log-content { margin: 0; color: #e2e8f0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; line-height: 1.7; white-space: pre-wrap; }
 .tm-log-stage { font-size: 11px; color: var(--el-text-color-secondary); margin-bottom: 2px; text-transform: uppercase; letter-spacing: .5px; }
 </style>
+.tm-cq-card :deep(.el-card__body) { padding: 10px 16px; }
+.tm-cq-body { display: flex; flex-direction: column; gap: 4px; height: 186px; overflow: auto; }
+.tm-cq-live { font-size: 12px; color: #6b7280; font-weight: 400; margin-left: 10px; }
+.tm-cq-live-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 12.5px; padding: 5px 8px; background: #f9fafb; border-radius: 6px; }
+.tm-cq-more { font-size: 12px; color: #9aa0b5; text-align: center; padding-top: 4px; }
+.tm-cq-empty { align-items: center; justify-content: center; color: #6b7280; font-size: 12.5px; gap: 8px; }

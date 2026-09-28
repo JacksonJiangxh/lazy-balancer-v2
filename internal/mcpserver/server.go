@@ -129,6 +129,7 @@ var tools = []toolSpec{
 	{"pull_sync", "手动触发从节点同步", http.MethodPost, "/cluster/sync/pull", nil, nil, emptySchema},
 	// 任务监控（v2.3.4）：聚合视图 + 三操作
 	{"list_system_tasks", "任务监控聚合视图（全部定时/后台任务族状态）", http.MethodGet, "/system/tasks", nil, nil, emptySchema},
+	{"get_system_task_logs", "任务文本日志（尾部 256KB）", http.MethodGet, "/system/tasks/{id}/logs", []string{"id"}, nil, idSchema("id", "任务 ID", "string")},
 	{"get_system_task_history", "任务运行历史（task_runs 时间倒序）", http.MethodGet, "/system/tasks/{id}/history", []string{"id"}, nil, idSchema("id", "任务 ID", "string")},
 	{"trigger_system_task", "手动触发任务（threat/crs/ip2region）", http.MethodPost, "/system/tasks/{id}/trigger", []string{"id"}, nil, idSchema("id", "任务 ID（threat/crs/ip2region）", "string")},
 	{"toggle_system_task", "暂停/恢复任务自动调度", http.MethodPost, "/system/tasks/{id}/toggle", []string{"id"}, nil, toggleTaskSchema},
