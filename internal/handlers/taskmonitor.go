@@ -42,16 +42,21 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 	if !requireMasterNode(c) {
 		return
 	}
-	// 终态：触发全经任务引擎（单飞/主节点门/历史统一；更新编舞为 Run 体）
+	// 终态：触发全经任务引擎（CanTrigger 语义族——单飞/主节点门/历史统一）
 	if te := services.TaskEngine(); te != nil {
-		switch id {
-		case "threat", "crs", "ip2region":
-			go func() {
-				_ = te.Trigger(id, "manual") // 异步触发——编舞耗时由 task_runs 记录
-			}()
-			recordAudit(c, "更新", "任务监控", "手动触发 "+id)
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
-			return
+		for _, m := range te.DescribeAll() {
+			if m.ID == id {
+				if !m.CanTrigger {
+					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发（探测型/专属端点/镜像族）"})
+					return
+				}
+				go func(tid string) {
+					_ = te.Trigger(tid, "manual") // 异步——耗时由 task_runs 记录
+				}(id)
+				recordAudit(c, "更新", "任务监控", "手动触发 "+id)
+				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
+				return
+			}
 		}
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发"})
 		return

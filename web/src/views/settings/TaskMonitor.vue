@@ -179,12 +179,12 @@
         <el-table-column label="操作" width="225" fixed="right">
           <template #default="{ row }">
             <el-button
-              v-if="triggerable(row.id)"
+              v-if="row.triggerable"
               link type="primary" size="small" :disabled="!canOperate || row.status === 'running'"
               @click="onTrigger(row)"
             >立即执行</el-button>
             <el-button
-              v-if="row.cancellable"
+              v-if="row.cancellable && row.status === 'running'"
               link type="danger" size="small" :disabled="!isAdmin"
               @click="onCancel(row)"
             >取消</el-button>
@@ -298,7 +298,7 @@ interface TaskRunInfo { started_at: string; finished_at: string; duration_ms: nu
 interface TaskInfo {
   id: string; name: string; description?: string; cadence?: string; category: string
   kind: 'scheduled' | 'continuous' | 'queue' | 'info' | 'oneshot'
-  status: string; enabled: boolean; cancellable: boolean; controllable?: boolean
+  status: string; enabled: boolean; cancellable: boolean; controllable?: boolean; triggerable?: boolean
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
 }
 interface RunRecord {
@@ -442,9 +442,7 @@ const statsBarOption = computed<EChartsOption>((): EChartsOption => {
 })
 
 // ===== 操作 =====
-const triggerableIds = new Set(['threat', 'crs', 'ip2region'])
 const toggleableIds = new Set(['threat', 'crs', 'ip2region'])
-const triggerable = (id: string) => triggerableIds.has(id)
 const toggleable = (id: string) => toggleableIds.has(id)
 
 const onTrigger = async (row: TaskInfo) => {

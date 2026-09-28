@@ -326,8 +326,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Family:      "startup",
 		Name:        "系统配置载入",
 		Description: "启动时从数据库装载运行态：规则库（CRS 种子/对账）→ 证书文件物化 → Caddy 配置渲染与应用（失败回退最后已知正确配置）。完成前面板不监听",
-		Category:    "触发",
-		Kind:        taskengine.KindOneshot, // 单次触发（每次重启一行历史）
+		Category:    "系统",
+		Kind:        taskengine.KindOneshot, // 类型「触发」——单次执行（每次重启一行历史）
 		Run:         nil,
 	})
 

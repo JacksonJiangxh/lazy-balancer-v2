@@ -78,6 +78,9 @@ type Descriptor struct {
 	// AsKind 任务性质（展示口径——区别于驱动节拍 Kind：排程族由引擎 1min
 	// 探测轮驱动但性质是「定时」而非「常驻」；空=同 Kind）。
 	AsKind Kind
+	// ManualRun Run 体支持 manual 触发语义（排程族 Run 内分支处理/清理与
+	// 循环族 Run 即单轮工作；探测-only 族走专属端点）。
+	ManualRun bool
 }
 
 // RunRecord task_runs 行视图。
@@ -528,7 +531,8 @@ type TaskMeta struct {
 	StatusMirror string `json:"status_mirror"` // StatusFn 结果（空=引擎默认态）
 	Controllable bool   `json:"controllable"`
 	Cancelable   bool   `json:"cancelable"`
-	LoopOn       bool   `json:"loop_on"` // 常驻循环当前启用态
+	LoopOn       bool   `json:"loop_on"`     // 常驻循环当前启用态
+	CanTrigger   bool   `json:"can_trigger"` // 支持手动触发（ManualRun）
 }
 
 // DescribeAll 导出全部注册任务元数据（含循环启停态）。
@@ -544,6 +548,7 @@ func (e *Engine) DescribeAll() []TaskMeta {
 		m := TaskMeta{ID: id, Family: r.desc.Family, Name: r.desc.Name,
 			Description: r.desc.Description, Category: r.desc.Category, Kind: r.desc.Kind,
 			AsKind:       asKind,
+			CanTrigger:   r.desc.ManualRun,
 			Controllable: r.desc.AsKind == KindContinuous || (r.desc.AsKind == "" && r.desc.Kind == KindContinuous),
 			Cancelable:   r.desc.Cancelable,
 			Enabled:      true}
