@@ -87,3 +87,36 @@ func TestThreatRDBBootstrap_hashHitStillWritesFiles(t *testing.T) {
 		t.Fatalf("哈希命中但文件缺失时必须重编译 .fast: %v", err)
 	}
 }
+
+// RDB 稳态（v2.3.4 修复回归）：entries 恒空是 system 列表的**正常态**而非
+// 「未装载」信号——若 threatListEmpty 仍按 DB entries 判空，则每个调度 tick
+// 都视为到期 → 主节点每分钟真跑更新（USTC 内容逐请求漂移 → .fast 每轮变化
+// → 从节点每轮「已同步更新」刷屏 + 带宽/Caddy 重载churn）。稳态判据必须是
+// 文件物化状态：.iplist 在场 = 已装载。
+func TestThreatRDBSteadyState_emptyDBEntriesWithFileIsNotDue(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+
+	// 稳态形状：RDB 后正常态（entries=''）+ 文件已物化 + 未到期 + 从未失败
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("192.0.2.0/24\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE security_ip_lists SET entries='' WHERE name=?`, db.ThreatListNameBySource("ustc")); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().UTC().Add(6 * time.Hour).Format(crsTimeLayout)
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET next_update=? WHERE name='ustc'`, future); err != nil {
+		t.Fatal(err)
+	}
+
+	due, err := threatDueSources("auto")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range due {
+		if s.name == "ustc" {
+			t.Fatal("稳态死循环: entries=''+文件在场+未到期 却仍视为到期——主节点会每分钟空转更新")
+		}
+	}
+}
