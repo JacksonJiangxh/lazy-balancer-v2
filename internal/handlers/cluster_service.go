@@ -190,7 +190,9 @@ func (h *Handlers) ClusterServiceControl(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: http.StatusInternalServerError, Message: err.Error()})
 		return
 	}
-	recordClusterServiceControlAuditBy(c, req.Action, "成功", req.Operator)
+	// F65:成功消息一并落审计——从节点操作日志可见「配置已从数据库载入」等
+	// 实际执行细节(原仅记「成功」,消息只回传主节点不落从节点审计)
+	recordClusterServiceControlAuditBy(c, req.Action, "成功："+message, req.Operator)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message})
 }
 
