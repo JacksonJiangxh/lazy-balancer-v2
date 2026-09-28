@@ -271,7 +271,7 @@ func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip
 		}
 		services.AppendThreatUpdateLog("INFO", "success", "威胁库 "+source+" 已随备份导入(.iplist 落盘 + .fast 编译)")
 	}
-	if crsChanged, xdbChanged, err := services.ApplyWafFileBundle(bundle); err != nil {
+	if crsChanged, xdbChanged, _, err := services.ApplyWafFileBundle(bundle); err != nil {
 		services.Logf("error", "lbbak 导入落盘规则库文件失败: %v", err)
 		recordAudit(c, action+"警告", "配置备份", "规则库文件落盘失败: "+err.Error())
 		return "规则库文件落盘失败: " + err.Error()
