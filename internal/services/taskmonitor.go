@@ -70,12 +70,18 @@ func CollectSystemTasks() []TaskInfo {
 		collectThreatTask(),
 		collectCRSTask(),
 		collectIP2RegionTask(),
-		collectCertQueueTask(),
+	}
+	tasks = append(tasks, collectCertTasks()...)
+	tasks = append(tasks,
 		collectAutoBackupTask(),
 		collectClusterSyncTask(),
 		collectWatchdogTask(),
+		collectSecurityEventsIngestion(),
+		collectLogRotateTask(),
+		collectLogCleanupTask(),
+		collectSecurityEventsRetention(),
 		collectAuditRetentionTask(),
-	}
+	)
 	return tasks
 }
 
@@ -232,30 +238,94 @@ func collectIP2RegionTask() TaskInfo {
 	return ti
 }
 
-// collectCertQueueTask ACME 证书任务队列。
-func collectCertQueueTask() TaskInfo {
-	ti := TaskInfo{ID: "cert-queue", Name: "ACME 证书任务队列", Category: "证书", Kind: TaskKindQueue, Enabled: true, Status: TaskStatusIdle, DetailHint: "certificates"}
+// collectCertTasks 证书族：任务队列摘要 + 逐证书任务行（活跃或 24h 内有
+// 动作的 job 各一行——每证书/规则一个任务，非聚合黑箱）+ 四个内部调度循环。
+func collectCertTasks() []TaskInfo {
+	var out []TaskInfo
+	summary := TaskInfo{ID: "cert-queue", Name: "ACME 证书任务队列", Category: "证书", Kind: TaskKindQueue, Enabled: true, Status: TaskStatusIdle, DetailHint: "certificates"}
 	var queued, running, failed, issued int
-	err1 := db.DB.QueryRow(`SELECT
+	if err := db.DB.QueryRow(`SELECT
 		(SELECT COUNT(*) FROM cert_jobs WHERE status IN ('queued','pending')),
 		(SELECT COUNT(*) FROM cert_jobs WHERE status NOT IN ('queued','pending','issued','failed','disabled')),
 		(SELECT COUNT(*) FROM cert_jobs WHERE status='failed' AND COALESCE(updated_at,created_at) > datetime('now','-1 day')),
-		(SELECT COUNT(*) FROM cert_jobs WHERE status='issued' AND COALESCE(updated_at,created_at) > datetime('now','-1 day'))`).Scan(&queued, &running, &failed, &issued)
-	if err1 == nil {
+		(SELECT COUNT(*) FROM cert_jobs WHERE status='issued' AND COALESCE(updated_at,created_at) > datetime('now','-1 day'))`).Scan(&queued, &running, &failed, &issued); err == nil {
 		switch {
 		case running > 0:
-			ti.Status = TaskStatusRunning
+			summary.Status = TaskStatusRunning
 		case queued > 0:
-			ti.Status = TaskStatusQueued
+			summary.Status = TaskStatusQueued
 		}
-		ti.Runs24h = issued + failed
-		ti.Success24h = issued
-		ti.Fail24h = failed
-		if msg := fmt.Sprintf("待处理 %d · 运行中 %d · 24h 签发 %d / 失败 %d", queued, running, issued, failed); ti.LastRun != nil || true {
-			ti.LastRun = &TaskRunInfo{Trigger: "queue", Result: string(ti.Status), Message: msg}
+		summary.Runs24h = issued + failed
+		summary.Success24h = issued
+		summary.Fail24h = failed
+		summary.LastRun = &TaskRunInfo{Trigger: "queue", Result: string(summary.Status),
+			Message: fmt.Sprintf("待处理 %d · 运行中 %d · 24h 签发 %d / 失败 %d", queued, running, issued, failed)}
+	}
+	out = append(out, summary)
+
+	// 逐任务行：活跃(queued/运行中) 或 24h 内有终态的 job
+	// cert_jobs 无 trigger/started_at/finished_at 列——时间面用 created/updated
+	rows, err := db.DB.Query(`SELECT id, rule_id, domain, status, COALESCE(message,''), COALESCE(created_at,''), COALESCE(updated_at,created_at)
+		FROM cert_jobs
+		WHERE status NOT IN ('issued','failed','disabled') OR COALESCE(updated_at,created_at) > datetime('now','-1 day')
+		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT 20`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var id int
+			var ruleID, domain, status, message, createdAt, updatedAt string
+			if err := rows.Scan(&id, &ruleID, &domain, &status, &message, &createdAt, &updatedAt); err != nil {
+				continue
+			}
+			trigger, startedAt, finishedAt := "auto", createdAt, updatedAt
+			ti := TaskInfo{
+				ID:       fmt.Sprintf("cert-job:%d", id),
+				Name:     "ACME · " + domain,
+				Category: "证书",
+				Kind:     TaskKindQueue,
+				Enabled:  true,
+				Status:   TaskStatusIdle,
+			}
+			switch status {
+			case "failed":
+				ti.Status = TaskStatusFailed
+			case "issued":
+				ti.Status = TaskStatusIdle
+			default:
+				ti.Status = TaskStatusRunning // 队列/处理中的全部运行态细分
+				if status == "queued" || status == "pending" {
+					ti.Status = TaskStatusQueued
+				}
+			}
+			start := startedAt
+			if start == "" {
+				start = updatedAt
+			}
+			end := finishedAt
+			if end == "" {
+				end = updatedAt
+			}
+			ti.LastRun = &TaskRunInfo{StartedAt: start, FinishedAt: end, Trigger: orDefault(trigger, "auto"), Result: status, Message: message}
+			ti.DetailHint = "certificates"
+			out = append(out, ti)
 		}
 	}
-	return ti
+
+	// 证书族内部调度循环（certificates.go 四 ticker——无 DB 状态面，常驻展示）
+	out = append(out,
+		TaskInfo{ID: "cert-renewal-scan", Name: "证书续期扫描", Category: "证书", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, NextRunAt: "每 6 小时"},
+		TaskInfo{ID: "cert-reconcile", Name: "证书状态对账", Category: "证书", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, NextRunAt: "每 6 小时"},
+		TaskInfo{ID: "cert-manual-poll", Name: "手动证书任务轮询", Category: "证书", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, NextRunAt: "每 10 分钟"},
+		TaskInfo{ID: "cert-waiting-ca", Name: "CA 等待轮询", Category: "证书", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, NextRunAt: "每 30 秒"},
+	)
+	return out
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
 }
 
 // collectAutoBackupTask 自动备份。
@@ -330,4 +400,26 @@ func collectAuditRetentionTask() TaskInfo {
 		}
 	}
 	return ti
+}
+
+// collectSecurityEventsIngestion 安全事件采集（coraza audit 尾读摄取+轮转，
+// 2s tick——安全总览/事件页数据源）。
+func collectSecurityEventsIngestion() TaskInfo {
+	return TaskInfo{ID: "security-events-ingestion", Name: "安全事件采集", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusRunning, NextRunAt: "每 2 秒", DetailHint: "security-events"}
+}
+
+// collectLogRotateTask 运行日志尺寸轮转（30s 检查 + 超限 copytruncate）。
+func collectLogRotateTask() TaskInfo {
+	return TaskInfo{ID: "log-rotate", Name: "运行日志尺寸轮转", Category: "系统", Kind: TaskKindContinuous, Enabled: true, Status: TaskStatusRunning, NextRunAt: "每 30 秒"}
+}
+
+// collectLogCleanupTask 旧日志文件清理（每日——logrotate 保留窗清理）。
+func collectLogCleanupTask() TaskInfo {
+	return TaskInfo{ID: "log-cleanup", Name: "旧日志文件清理", Category: "系统", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, NextRunAt: "每日"}
+}
+
+// collectSecurityEventsRetention 安全事件保留清理（每日——security_events
+// 保留期清理）。
+func collectSecurityEventsRetention() TaskInfo {
+	return TaskInfo{ID: "security-events-retention", Name: "安全事件保留清理", Category: "系统", Kind: TaskKindScheduled, Enabled: true, Status: TaskStatusPassive, NextRunAt: "每日", DetailHint: "security-events"}
 }
