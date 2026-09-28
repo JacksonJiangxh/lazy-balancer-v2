@@ -142,6 +142,12 @@ func collectThreatTask() TaskInfo {
 	}
 	if snap.StartedAt != "" {
 		ti.LastRun = taskRunFromCrsLayout(snap.StartedAt, snap.FinishedAt, snap.Trigger, snap.Outcome, "")
+	} else {
+		// 进程重启后内存态为空——回退 DB 源行终态（最近完成源时间）
+		var lastFinished, lastStatus, lastTrigger string
+		if err := db.DB.QueryRow(`SELECT COALESCE(MAX(NULLIF(finished_at,'')),''), COALESCE(MAX(NULLIF(update_status,'')),''), COALESCE(MAX(NULLIF(trigger,'')),'') FROM security_threat_sources`).Scan(&lastFinished, &lastStatus, &lastTrigger); err == nil && lastFinished != "" {
+			ti.LastRun = taskRunFromCrsLayout(lastFinished, lastFinished, lastTrigger, lastStatus, "")
+		}
 	}
 	// message：源级摘要 + 下次执行取最早源槽
 	var parts []string

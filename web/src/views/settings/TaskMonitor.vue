@@ -194,8 +194,8 @@ const polling = usePollingTask(async () => fetchTasks(), {
 
 const fetchClusterState = async () => {
   try {
-    const res = await request.get<APIResponse<{ is_master: boolean }>>('/cluster/status', { silent: true })
-    isSlave.value = res.data?.is_master === false
+    const res = await request.get<APIResponse<{ node_mode: string }>>('/cluster/status', { silent: true })
+    isSlave.value = res.data?.node_mode === 'slave'
   } catch {
     isSlave.value = false
   }
