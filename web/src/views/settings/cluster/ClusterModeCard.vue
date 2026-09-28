@@ -39,33 +39,40 @@
 
     <el-dialog
       v-model="registrationOpen"
-      title="注册为从节点"
-      width="min(520px, 92vw)"
+      width="min(560px, 92vw)"
+      top="5vh"
       :close-on-click-modal="false"
       append-to-body
+      destroy-on-close
     >
-      <el-alert
-        title="切换后本地数据将被主节点全覆盖"
-        type="error"
-        :closable="false"
-        show-icon
-        class="registration-alert"
-      />
-      <el-alert
-        v-if="usesPlainHttp"
-        title="证书私钥将经明文 HTTP 传输，建议使用 HTTPS"
-        type="warning"
-        :closable="false"
-        show-icon
-        class="registration-alert"
-      />
-      <el-form ref="dialogFormRef" :model="form" :rules="rules" label-width="100px" :disabled="readOnly">
+      <template #header>
+        <DialogHeader :icon="Connection" title="注册为从节点" subtitle="连接主节点，本节点将定期同步主节点数据" tone="warning" />
+      </template>
+      <div class="registration-warnings">
+        <el-alert
+          title="切换后本地数据将被主节点全覆盖"
+          description="负载规则、安全策略、用户与系统设置等全部数据以主节点为准，本地已有的差异化配置将丢失"
+          type="error"
+          :closable="false"
+          show-icon
+        />
+        <el-alert
+          v-if="usesPlainHttp"
+          title="证书私钥将经明文 HTTP 传输"
+          description="当前主节点地址为 HTTP，同步链路中的证书私钥等敏感数据未加密，建议主节点启用 HTTPS"
+          type="warning"
+          :closable="false"
+          show-icon
+        />
+      </div>
+      <el-form ref="dialogFormRef" :model="form" :rules="rules" label-width="100px" :disabled="readOnly" style="margin-top: 16px">
         <el-form-item label="主节点地址" prop="master_url">
           <el-input v-model="form.master_url" placeholder="https://master.example.com:8000" />
           <div class="form-tip-line">填写可从当前节点访问的主节点管理地址</div>
         </el-form-item>
         <el-form-item label="注册令牌" prop="register_token">
           <el-input v-model="form.register_token" type="password" show-password placeholder="请输入一次性注册令牌" />
+          <div class="form-tip-line">在主节点「集群管理」页面生成</div>
         </el-form-item>
         <el-form-item label="节点名称" prop="node_name">
           <el-input v-model="form.node_name" placeholder="选填，例如：上海从节点" />
@@ -208,6 +215,14 @@ const submitRegistration = async (): Promise<void> => {
   form.register_token = ''
 }
 </script>
+
+<style scoped>
+.registration-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+</style>
 
 <style scoped>
 .card-header { display: flex; align-items: center; }
