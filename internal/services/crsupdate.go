@@ -54,6 +54,8 @@ type CRSUpdateStatusSnapshot struct {
 	FinishedAt string
 	Message    string
 	Version    string
+	// Cancellable: 运行中且支持手动取消（任务监控，v2.3.4）。
+	Cancellable bool
 }
 
 // CRSUpdateManager runs CRS manual/auto updates single-flight and persists
@@ -72,7 +74,9 @@ type CRSUpdateManager struct {
 	// 每次 downloadAndInstall 开始时重置，迁移分支创建成功后置位。
 	overridesBakCreated bool
 
-	reloader        func() error
+	reloader func() error
+	// runCancel 取消当前运行中的下载阶段（任务监控手动取消，v2.3.4）。
+	runCancel       context.CancelFunc
 	fetchLatestTag  func(ctx context.Context) (string, error)
 	downloadTarball func(ctx context.Context, tag, destPath string, progress downloadProgressFunc) error
 	crsDir          string
@@ -215,7 +219,12 @@ func (m *CRSUpdateManager) setStage(status CRSUpdateStatus, message string) {
 
 // run executes the full update pipeline synchronously.
 func (m *CRSUpdateManager) run(trigger string) {
+	runCtx, runCancel := context.WithCancel(context.Background())
+	m.mu.Lock()
+	m.runCancel = runCancel
+	m.mu.Unlock()
 	defer func() {
+		runCancel()
 		m.mu.Lock()
 		m.running = false
 		m.mu.Unlock()
@@ -246,7 +255,7 @@ func (m *CRSUpdateManager) run(trigger string) {
 	var tag string
 	err := runWithInTaskRetry(func() error {
 		var ferr error
-		tag, ferr = m.fetchLatestTag(context.Background())
+		tag, ferr = m.fetchLatestTag(runCtx)
 		if _, dbErr := db.DB.Exec("UPDATE security_crs_version SET last_checked=datetime('now') WHERE id=1"); dbErr != nil {
 			Logf("error", "crs update: failed to record last_checked: %v", dbErr)
 		}
@@ -289,7 +298,7 @@ func (m *CRSUpdateManager) run(trigger string) {
 
 	var installErr error
 	_ = runWithInTaskRetry(func() error {
-		installErr = m.downloadAndInstall(tag)
+		installErr = m.downloadAndInstall(runCtx, tag)
 		// crsReloadError=安装成功但重载失败（restore 编舞已执行）——非瞬断，不重试
 		// （errIP2RegionReload 同型先例）。
 		var rerr *crsReloadError
@@ -376,6 +385,19 @@ func (m *CRSUpdateManager) downloadTarballLogged(ctx context.Context, tag, destP
 
 // StatusSnapshot returns the in-memory task view, falling back to the stored
 // terminal state when no update has run since process start.
+// CancelRunning 取消当前运行中的更新（下载阶段中断）。无运行中任务返回 false。
+func (m *CRSUpdateManager) CancelRunning() bool {
+	m.mu.Lock()
+	cancel := m.runCancel
+	running := m.running
+	m.mu.Unlock()
+	if cancel == nil || !running {
+		return false
+	}
+	cancel()
+	return true
+}
+
 func (m *CRSUpdateManager) StatusSnapshot() CRSUpdateStatusSnapshot {
 	m.mu.Lock()
 	state := m.state

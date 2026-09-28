@@ -425,6 +425,10 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				admin.GET("/settings/auto-backup", h.AutoBackupSettings)
 				admin.PUT("/settings/auto-backup", h.UpdateAutoBackupSettings)
 				admin.POST("/auto-backup/run", h.RunAutoBackupNow)
+				// 任务监控（v2.3.4）：聚合视图全员可见（business 组），操作管理员
+				admin.POST("/system/tasks/:id/trigger", h.TriggerSystemTask)
+				admin.POST("/system/tasks/:id/toggle", h.ToggleSystemTask)
+				admin.POST("/system/tasks/:id/cancel", h.CancelSystemTask)
 				admin.DELETE("/auto-backup/:id", h.DeleteAutoBackup)
 				admin.POST("/auto-backup/:id/restore", h.RestoreAutoBackup)
 				admin.GET("/auto-backup/:id/download", h.DownloadAutoBackup)
@@ -472,6 +476,8 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 			business := v1.Group("")
 			business.Use(readOnlyGuard(db.DB))
 			{
+				// 任务监控聚合视图（全员可见；从节点经 readOnlyGuard 只读可用）
+				business.GET("/system/tasks", h.ListSystemTasks)
 				// Current user (self)
 				business.GET("/users/me", h.GetCurrentUser)
 				business.PATCH("/users/me", h.UpdateCurrentUser)
