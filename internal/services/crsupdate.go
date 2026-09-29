@@ -168,6 +168,9 @@ func ensureCRSVersionRow() {
 	}
 }
 
+// CurrentCRSVersionForLog 面向日志的当前 CRS 版本（main 载入摘要行消费）。
+func CurrentCRSVersionForLog() string { return currentCRSVersion() }
+
 func currentCRSVersion() string {
 	var version string
 	if err := db.DB.QueryRow("SELECT version FROM security_crs_version WHERE id=1").Scan(&version); err != nil || version == "" {

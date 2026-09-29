@@ -70,9 +70,16 @@ func WatchdogCheckOnce() {
 		defer func() {
 			if r := recover(); r != nil {
 				Logf("error", "配置一致性看门狗：检查 panic: %v", r)
+				TaskLogf("config-watchdog", "check", "检查异常（panic 已拦，明细见运行日志）")
 			}
 		}()
 		checkConfigConsistency(watchdogAdminURLValue)
+		// SPEC §6.5：每轮一行结论入任务日志（task_runs 维持失败留痕不膨胀）。
+		if d := CurrentConfigDrift(); d.Consistent {
+			TaskLogf("config-watchdog", "check", "配置一致（DB 期望 = Caddy 运行态）")
+		} else {
+			TaskLogf("config-watchdog", "check", "配置漂移：缺失 %d 条 / 多余 %d 条（自 %s）", len(d.Missing), len(d.Extra), d.Since)
+		}
 	}()
 }
 
