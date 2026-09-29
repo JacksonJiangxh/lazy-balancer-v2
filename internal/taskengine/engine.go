@@ -138,7 +138,12 @@ type Engine struct {
 	schedStop chan struct{}
 	schedDone chan struct{}
 	stopped   bool
+
+	startedAt time.Time // 引擎（进程）启动时刻——常驻族「启动于」展示位
 }
+
+// StartedAt 引擎启动时刻（常驻任务的循环起点=进程启动）。
+func (e *Engine) StartedAt() time.Time { return e.startedAt }
 
 // Options 引擎选项。
 type Options struct {
@@ -150,7 +155,7 @@ func NewEngine(opts Options) *Engine {
 	if opts.TickInterval <= 0 {
 		opts.TickInterval = time.Second
 	}
-	e := &Engine{opts: opts, regs: map[string]*registration{}, role: true, schedStop: make(chan struct{}), schedDone: make(chan struct{})}
+	e := &Engine{opts: opts, regs: map[string]*registration{}, role: true, schedStop: make(chan struct{}), schedDone: make(chan struct{}), startedAt: time.Now()}
 	go e.scheduleLoop()
 	return e
 }

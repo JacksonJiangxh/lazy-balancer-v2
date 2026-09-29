@@ -3706,7 +3706,9 @@ func readUpdateLogWithRotation(path string) string {
 }
 
 func (h *Handlers) GetCRSUpdateLogs(c *gin.Context) {
-	logPath := services.CRSUpdateLogPath()
+	// 单一日志数据源（2026-09-29 用户裁定）：任务日志文件即更新日志——
+	// 规则集页弹框与任务监控日志弹框同文件同内容（含生命周期行）。
+	logPath := taskengine.TaskLogPath("crs")
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": readUpdateLogWithRotation(logPath)}})
 }
 
@@ -3835,7 +3837,8 @@ func (h *Handlers) GetIP2RegionUpdateStatus(c *gin.Context) {
 }
 
 func (h *Handlers) GetIP2RegionUpdateLogs(c *gin.Context) {
-	logPath := services.IP2RegionUpdateLogPath()
+	// 单一日志数据源：同 GetCRSUpdateLogs。
+	logPath := taskengine.TaskLogPath("ip2region")
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": readUpdateLogWithRotation(logPath)}})
 }
 

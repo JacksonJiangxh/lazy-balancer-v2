@@ -189,6 +189,7 @@ func (h *Handlers) GetThreatLibUpdateStatus(c *gin.Context) {
 
 // GetThreatLibUpdateLogs 更新日志（含上一代轮转文件，镜像 GetCRSUpdateLogs）。
 func (h *Handlers) GetThreatLibUpdateLogs(c *gin.Context) {
-	logPath := services.ThreatUpdateLogPath()
+	// 单一日志数据源：同 GetCRSUpdateLogs。
+	logPath := taskengine.TaskLogPath("threat")
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": readUpdateLogWithRotation(logPath)}})
 }

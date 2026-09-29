@@ -435,6 +435,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	for _, id := range []string{"config-watchdog", "security-events-ingestion", "log-cleanup", "threat", "crs", "ip2region", "auto-backup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca"} {
 		taskEngine.StartLoop(id)
 	}
+	// 常驻静默族启动行（2026-09-29 用户裁定：常驻任务应有启动时间记录+日志
+	// 文件保留）——一次性建文件留痕，后续有事件才追加（静默轮语义不变）。
+	TaskLogf("security-events-ingestion", "start", "安全事件采集已启动（尾读 coraza 审计日志，有事件才追加记录）")
 	return taskEngine
 }
 

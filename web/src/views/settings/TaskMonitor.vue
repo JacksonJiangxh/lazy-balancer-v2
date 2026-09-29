@@ -123,16 +123,18 @@
             <span class="tm-status" :data-status="row.status"><span class="tm-dot"></span>{{ statusLabel(row.status) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="调度" width="72">
+        <el-table-column label="调度" width="92">
           <template #default="{ row }">
-            <el-switch
-              v-if="row.controllable"
-              :model-value="row.enabled"
-              :disabled="!isAdmin"
-              @change="() => onControl(row)"
-            />
-            <el-switch v-else-if="row.toggleable" :model-value="row.enabled" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
-            <el-switch v-else :model-value="row.enabled" disabled />
+            <!-- 常驻族：开关=常驻循环启停（非调度开关），绑定 loop_on 走 control -->
+            <el-tooltip v-if="row.kind === 'continuous'" content="常驻循环启停（非调度开关）" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+              <el-switch :model-value="row.loop_on" :disabled="!isAdmin" @change="() => onControl(row)" />
+            </el-tooltip>
+            <!-- 定时族有调度开关（threat/crs/ip2region）：暂停/恢复自动调度 -->
+            <el-switch v-else-if="row.kind === 'scheduled' && row.toggleable" :model-value="row.enabled" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
+            <!-- 定时族固定间隔（无用户排程槽）：不可暂停调度 -->
+            <el-tag v-else-if="row.kind === 'scheduled'" size="small" type="info" effect="plain">固定间隔</el-tag>
+            <!-- 队列/触发/信息行：无调度语义 -->
+            <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
         <el-table-column label="执行时间" width="180">
@@ -146,6 +148,7 @@
                 <div>{{ row.status === 'running' ? '进行中' : fmtTime(row.last_run?.finished_at) || '—' }}</div>
               </template>
               <span v-if="row.last_run?.started_at">{{ fmtTime(row.last_run.started_at) }}</span>
+              <span v-else-if="row.kind === 'continuous'" class="tm-dim">常驻 · 启动于 {{ fmtTime(row.started_at) || '—' }}</span>
               <span v-else class="tm-dim">—</span>
             </el-tooltip>
           </template>
@@ -227,7 +230,13 @@
         <el-descriptions :column="2" border size="small" class="tm-detail-descs">
           <el-descriptions-item label="运行节奏">{{ detailTask.cadence || '—' }}</el-descriptions-item>
           <el-descriptions-item label="调度开关">
-            <el-tag size="small" :type="detailTask.enabled ? 'success' : 'warning'" effect="plain">{{ detailTask.enabled ? '开启' : '已暂停' }}</el-tag>
+            <!-- 与列表调度列同语义四分支（详情为快照展示，不绑开关） -->
+            <el-tag v-if="detailTask.kind === 'scheduled' && detailTask.toggleable" size="small" :type="detailTask.enabled ? 'success' : 'warning'" effect="plain">{{ detailTask.enabled ? '开启' : '已暂停' }}</el-tag>
+            <el-tag v-else-if="detailTask.kind === 'scheduled'" size="small" type="info" effect="plain">固定间隔</el-tag>
+            <el-tooltip v-else-if="detailTask.kind === 'continuous'" content="常驻循环启停（非调度开关）" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+              <el-tag size="small" :type="detailTask.loop_on ? 'success' : 'warning'" effect="plain">{{ detailTask.loop_on ? '循环运行中' : '循环已停止' }}</el-tag>
+            </el-tooltip>
+            <span v-else class="tm-dim">—</span>
           </el-descriptions-item>
           <el-descriptions-item label="下次执行">{{ detailTask.next_run_at || '—' }}</el-descriptions-item>
           <el-descriptions-item label="24h 成功 / 失败">
@@ -245,6 +254,7 @@
               <span class="tm-ok">{{ detailTask.success_24h }}</span> / <span :class="{ 'tm-bad': detailTask.fail_24h > 0 }">{{ detailTask.fail_24h }}</span>
             </template>
           </el-descriptions-item>
+          <el-descriptions-item v-if="detailTask.kind === 'continuous'" label="启动于">{{ fmtTime(detailTask.started_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="开始时间">{{ fmtTime(detailTask.last_run.started_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="完成时间">{{ detailTask.status === 'running' ? '进行中' : fmtTime(detailTask.last_run.finished_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="耗时">{{ fmtDuration(detailTask.last_run.duration_ms) }}</el-descriptions-item>
@@ -279,6 +289,10 @@
       <template #header>
         <DialogHeader :icon="Timer" :title="`任务日志 · ${logsTask?.name || ''}`" subtitle="统一任务引擎文本日志（实时刷新）" />
       </template>
+      <!-- 日志存储统计栏（tasks 目录聚合：/logs/stats key=tasks；后端未含该键时组件自隐） -->
+      <div class="tm-log-stats">
+        <LogStorageBar log-key="tasks" style="margin-right: auto" />
+      </div>
       <div ref="logContainerRef" class="tm-log-container">
         <pre v-if="logsText" class="tm-log-content">{{ logsText }}</pre>
         <el-empty v-else description="暂无日志" :image-size="60" />
@@ -309,6 +323,7 @@ import { usePollingTask } from '@/composables/usePollingTask'
 import { statusColor } from '@/utils/chartTheme'
 import { certJobStatusLabel, type CertJobStatus } from '@/utils/certJobStatus'
 import DialogHeader from '@/components/DialogHeader.vue'
+import LogStorageBar from '@/components/LogStorageBar.vue'
 import type { APIResponse } from '@/types'
 
 use([CanvasRenderer, PieChart, BarChart, GridComponent, TooltipComponent, LegendComponent])
@@ -320,6 +335,7 @@ interface TaskInfo {
   status: string; enabled: boolean; cancellable: boolean; controllable?: boolean; triggerable?: boolean; toggleable?: boolean
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
   silent_runs?: boolean
+  loop_on?: boolean; started_at?: string // 常驻族：循环启停态（调度列开关绑定值）/ 引擎启动时刻
 }
 interface RunRecord {
   id: number; task_id: string; family: string; trigger: string; status: string
@@ -667,6 +683,7 @@ const fmtDuration = (ms?: number) => {
 .tm-detail-section { font-size: 13px; font-weight: 600; color: var(--el-text-color-primary); margin-top: 4px; padding-top: 12px; border-top: 1px solid var(--el-border-color-lighter); }
 
 /* 日志 */
+.tm-log-stats { display: flex; align-items: center; margin-bottom: 10px; }
 .tm-logs-loading { display: flex; align-items: center; gap: 8px; color: var(--el-text-color-secondary); padding: 16px 0; }
 .tm-log-container { max-height: 520px; overflow: auto; background: #0f172a; border-radius: 8px; padding: 16px; border: 1px solid #1e293b; }
 .tm-log-content { margin: 0; color: #e2e8f0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; line-height: 1.7; white-space: pre-wrap; }

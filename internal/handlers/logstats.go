@@ -59,6 +59,8 @@ func isTimberjackRotationCopy(name string) bool {
 	return trimmed[idx+1] >= '0' && trimmed[idx+1] <= '9'
 }
 
+func sizePtr(b int64) *int64 { return &b }
+
 func dirBytes(path string) (int64, int64, int) {
 	var active, rotated int64
 	count := 0
@@ -235,9 +237,10 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		{Key: "audit", Name: "操作日志", KeepCount: 0, RetentionNote: retentionNote, ConfigSource: "基础设置 · 日志保留（操作/运行/安全事件）"},
 		{Key: "security_events", Name: "安全事件", KeepCount: 0, LimitRows: securityEventsMaxRows(), RetentionNote: retentionNote, ConfigSource: "基础设置 · 日志保留（操作/运行/安全事件）"},
 		{Key: "certjob", Name: "证书任务日志", LimitBytes: sizeLimitMB("cert_job_log_size_mb", 10), KeepCount: 5, ConfigSource: "基础设置 · 任务日志大小"},
-		{Key: "crs_update", Name: "CRS 更新日志", LimitBytes: sizeLimitMB("cert_job_log_size_mb", 10), KeepCount: 5, ConfigSource: "基础设置 · 任务日志大小"},
-		{Key: "ip2region_update", Name: "IP 库更新日志", LimitBytes: sizeLimitMB("cert_job_log_size_mb", 10), KeepCount: 5, ConfigSource: "基础设置 · 任务日志大小"},
-		{Key: "threat_update", Name: "威胁库更新日志", LimitBytes: sizeLimitMB("cert_job_log_size_mb", 10), KeepCount: 5, ConfigSource: "基础设置 · 任务日志大小"},
+		{Key: "tasks", Name: "任务日志", LimitBytes: sizePtr(5 << 20), KeepCount: 1, RetentionNote: "与审计保留月数同配置，运行日志清理任务执行", ConfigSource: "统一任务日志（tasks/*.log）"},
+		{Key: "crs_update", Name: "CRS 更新日志", LimitBytes: sizePtr(5 << 20), KeepCount: 1, ConfigSource: "统一任务日志（tasks/crs.log）"},
+		{Key: "ip2region_update", Name: "IP 库更新日志", LimitBytes: sizePtr(5 << 20), KeepCount: 1, ConfigSource: "统一任务日志（tasks/ip2region.log）"},
+		{Key: "threat_update", Name: "威胁库更新日志", LimitBytes: sizePtr(5 << 20), KeepCount: 1, ConfigSource: "统一任务日志（tasks/threat.log）"},
 		{Key: "runtime", Name: "运行日志", LimitBytes: sizeLimitMB("runtime_log_size_mb", 100), KeepCount: 0, RetentionNote: "时间戳轮转，按保留期清理（份数随保留期）", ConfigSource: "基础设置 · 运行日志大小"},
 		{Key: "caddy", Name: "Caddy 运行日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
 		{Key: "caddy_runtime", Name: "Caddy 运行时日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
@@ -314,17 +317,44 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	if info := byKey("coraza_audit"); info != nil {
 		info.SizeBytes, info.RotatedBytes, info.RotatedCount = auditActive, auditRotated, auditRotCount
 	}
+	// 单一日志数据源（2026-09-29 用户裁定）：三库更新行与任务日志同文件
+	// （tasks/{crs|ip2region|threat}.log）——统计与内容同源。
+	tasksDir := filepath.Join(filepath.Dir(runtimePath), "tasks")
+	taskFileBytes := func(id string) (int64, int64, int) {
+		return dirBytes(filepath.Join(tasksDir, id+".log"))
+	}
 	if info := byKey("crs_update"); info != nil {
-		cA, cR, cC := dirBytes(filepath.Join(fixedLogsDir, "crs-update.log"))
-		info.SizeBytes, info.RotatedBytes, info.RotatedCount = cA, cR, cC
+		info.SizeBytes, info.RotatedBytes, info.RotatedCount = taskFileBytes("crs")
 	}
 	if info := byKey("ip2region_update"); info != nil {
-		iA, iR, iC := dirBytes(filepath.Join(fixedLogsDir, "ip2region-update.log"))
-		info.SizeBytes, info.RotatedBytes, info.RotatedCount = iA, iR, iC
+		info.SizeBytes, info.RotatedBytes, info.RotatedCount = taskFileBytes("ip2region")
 	}
 	if info := byKey("threat_update"); info != nil {
-		tA, tR, tC := dirBytes(filepath.Join(fixedLogsDir, "threat-update.log"))
-		info.SizeBytes, info.RotatedBytes, info.RotatedCount = tA, tR, tC
+		info.SizeBytes, info.RotatedBytes, info.RotatedCount = taskFileBytes("threat")
+	}
+	// 任务日志目录聚合行（任务监控日志弹框统计栏消费）：5MB/保 1 份/
+	// 保留=审计保留月数（taskLogsHousekeeping 口径，log-cleanup 族执行）。
+	if info := byKey("tasks"); info != nil {
+		var total, rotated int64
+		var rotCount int
+		if entries, err := os.ReadDir(tasksDir); err == nil {
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				inf, err := e.Info()
+				if err != nil {
+					continue
+				}
+				if strings.HasSuffix(e.Name(), ".1") {
+					rotated += inf.Size()
+					rotCount++
+				} else {
+					total += inf.Size()
+				}
+			}
+		}
+		info.SizeBytes, info.RotatedBytes, info.RotatedCount = total, rotated, rotCount
 	}
 
 	ruleID := strings.TrimSpace(c.Query("caddy_id"))

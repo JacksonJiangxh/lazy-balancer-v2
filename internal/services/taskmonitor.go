@@ -46,12 +46,14 @@ type TaskInfo struct {
 	Category     string       `json:"category"`              // 安全防护/证书/备份/集群/系统
 	Kind         TaskKind     `json:"kind"`
 	Status       TaskStatus   `json:"status"`
-	Enabled      bool         `json:"enabled"`      // 自动调度开关
-	Cancellable  bool         `json:"cancellable"`  // 运行中可手动取消（仅下载类）
-	Controllable bool         `json:"controllable"` // 常驻循环可启停（start/stop/restart）
-	Triggerable  bool         `json:"triggerable"`  // 支持手动触发（ManualRun 语义族）
-	Toggleable   bool         `json:"toggleable"`   // 调度开关可暂停/恢复（ToggleFn 声明族——U1-P4-2 元数据化）
-	SilentRuns   bool         `json:"silent_runs"`  // 成功轮静默（RecordFailuresOnly）——计数位显示「静默轮」而非 0/0
+	Enabled      bool         `json:"enabled"`              // 自动调度开关
+	Cancellable  bool         `json:"cancellable"`          // 运行中可手动取消（仅下载类）
+	Controllable bool         `json:"controllable"`         // 常驻循环可启停（start/stop/restart）
+	Triggerable  bool         `json:"triggerable"`          // 支持手动触发（ManualRun 语义族）
+	Toggleable   bool         `json:"toggleable"`           // 调度开关可暂停/恢复（ToggleFn 声明族——U1-P4-2 元数据化）
+	SilentRuns   bool         `json:"silent_runs"`          // 成功轮静默（RecordFailuresOnly）——计数位显示「静默轮」而非 0/0
+	StartedAt    string       `json:"started_at,omitempty"` // 常驻族启动时刻（引擎启动）；定时/队列族空
+	LoopOn       bool         `json:"loop_on"`              // 常驻循环当前启用态（调度列常驻开关绑定值）
 	LastRun      *TaskRunInfo `json:"last_run,omitempty"`
 	NextRunAt    string       `json:"next_run_at,omitempty"`
 	Runs24h      int          `json:"runs_24h"`
@@ -106,6 +108,15 @@ func collectCertJobRows() []TaskInfo {
 		if err := rows.Scan(&id, &domain, &status, &message, &updatedAt); err != nil {
 			continue
 		}
+		// 终态计数（2026-09-29 用户反馈：签发成功应成功+1）——24h 窗口内
+		// issued=成功 1、failed=失败 1（作业实例行，无周期 runs 概念）。
+		success, fail := 0, 0
+		switch status {
+		case "issued":
+			success = 1
+		case "failed":
+			fail = 1
+		}
 		ti := TaskInfo{
 			ID:         fmt.Sprintf("cert-job:%d", id),
 			Name:       "ACME 签发 · " + domain,
@@ -116,6 +127,7 @@ func collectCertJobRows() []TaskInfo {
 			LastRun: &TaskRunInfo{StartedAt: localDisplayUTC(updatedAt), FinishedAt: localDisplayUTC(updatedAt),
 				Trigger: "queue", Result: status, Message: message},
 		}
+		ti.Success24h, ti.Fail24h = success, fail
 		ti.Status = TaskStatusIdle
 		switch status {
 		case "failed":
@@ -210,6 +222,11 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		}
 		st := te.Stats24h(m.ID)
 		ti.Runs24h, ti.Success24h, ti.Fail24h = st.Runs, st.Success, st.Fail
+		// 常驻族启动时刻（循环起点=引擎启动）——「常驻 · 启动于」展示位。
+		if m.AsKind == taskengine.KindContinuous {
+			ti.StartedAt = te.StartedAt().In(CurrentLocation()).Format("2006-01-02 15:04:05")
+			ti.LoopOn = m.LoopOn
+		}
 		out = append(out, ti)
 	}
 	return out
