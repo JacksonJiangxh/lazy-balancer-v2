@@ -13,6 +13,7 @@ import (
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/services"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 // 威胁情报库管理面（v2.3.2 名单化重构）：列表+开关+手动更新+状态/日志端点。
@@ -20,8 +21,13 @@ func newThreatTestRouter(t *testing.T) *gin.Engine {
 	t.Helper()
 	testHandlers := newBackupTestHandlers(t)
 	services.ResetThreatUpdateManagerForTest()
-	// 更新日志目录默认 /app/logs（容器路径）——测试指向临时目录
-	t.Cleanup(services.SetUpdateLogDirForTest(t.TempDir()))
+	// 更新日志目录默认 /app/logs（容器路径）——测试指向临时目录；
+	// 任务日志目录同址（单一数据源：更新日志端点读 tasks/threat.log，
+	// tee 与端点须落在同一目录才能端到端可见——生产由 InitTaskEngine 注入）。
+	threatLogDir := t.TempDir()
+	t.Cleanup(services.SetUpdateLogDirForTest(threatLogDir))
+	taskengine.SetLogDir(threatLogDir)
+	t.Cleanup(func() { taskengine.SetLogDir("") })
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.GET("/security/threat-lib", testHandlers.GetThreatLib)
