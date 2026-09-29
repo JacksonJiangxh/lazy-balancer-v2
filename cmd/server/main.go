@@ -184,6 +184,7 @@ func run() error {
 	runConfigLoad := func() error {
 		services.SeedCRSRules()
 		services.ReconcileCRSState()
+		services.TaskLogf("startup:config-load", "libs", "规则库载入完成（CRS %s 对账）", services.CurrentCRSVersionForLog())
 		// 归一 R50 前落库的安全策略枚举空串行（发射端零产出 + Update 拒修的
 		// 遗留状态），有实际变更时主节点递增集群版本让从节点收敛。
 		services.NormalizeLegacySecurityPolicyEnums(context.Background())

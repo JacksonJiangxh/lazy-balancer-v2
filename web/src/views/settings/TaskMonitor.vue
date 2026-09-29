@@ -3,25 +3,25 @@
     <!-- KPI 概览（四卡） -->
     <el-row :gutter="20" class="tm-kpis">
       <el-col :xs="12" :md="6">
-        <el-card shadow="never" class="tm-kpi">
+        <el-card class="tm-kpi">
           <div class="tm-kpi-num">{{ tasks.length }}</div>
           <div class="tm-kpi-label">任务族</div>
         </el-card>
       </el-col>
       <el-col :xs="12" :md="6">
-        <el-card shadow="never" class="tm-kpi">
+        <el-card class="tm-kpi">
           <div class="tm-kpi-num tm-kpi-run">{{ runningCount }}</div>
           <div class="tm-kpi-label">运行中</div>
         </el-card>
       </el-col>
       <el-col :xs="12" :md="6">
-        <el-card shadow="never" class="tm-kpi">
+        <el-card class="tm-kpi">
           <div class="tm-kpi-num">{{ total24h }}</div>
           <div class="tm-kpi-label">24h 执行</div>
         </el-card>
       </el-col>
       <el-col :xs="12" :md="6">
-        <el-card shadow="never" class="tm-kpi">
+        <el-card class="tm-kpi">
           <div class="tm-kpi-num" :class="{ 'tm-kpi-bad': fail24h > 0 }">{{ fail24h }}</div>
           <div class="tm-kpi-label">24h 失败 <el-icon v-if="isSlave" class="tm-kpi-lock"><Lock /></el-icon></div>
         </el-card>
@@ -31,7 +31,7 @@
     <!-- 图表行：状态分布 + 24h 执行 -->
     <el-row :gutter="20">
       <el-col :xs="24" :md="8">
-        <el-card shadow="never">
+        <el-card>
           <template #header>
             <div class="card-header">
               <div class="card-title"><el-icon class="title-icon"><PieChartIcon /></el-icon><span>任务状态分布</span></div>
@@ -42,7 +42,7 @@
         </el-card>
       </el-col>
       <el-col :xs="24" :md="16">
-        <el-card shadow="never">
+        <el-card>
           <template #header>
             <div class="card-header">
               <div class="card-title"><el-icon class="title-icon"><DataLine /></el-icon><span>近 24 小时执行（成功 / 失败）</span></div>
@@ -56,7 +56,7 @@
     </el-row>
 
     <!-- 证书队列横幅（实时——非任务） -->
-    <el-card shadow="never" class="tm-cq-banner">
+    <el-card class="tm-cq-banner">
       <div class="tm-cq-banner-inner">
         <div class="tm-cq-banner-title"><el-icon class="title-icon"><Lock /></el-icon><span>ACME 证书任务队列</span></div>
         <div class="tm-cq-banner-stats">
@@ -163,7 +163,19 @@
             </el-tooltip>
           </template>
           <template #default="{ row }">
-            <span class="tm-ok">{{ row.success_24h }}</span> / <span :class="{ 'tm-bad': row.fail_24h > 0 }">{{ row.fail_24h }}</span>
+            <el-tooltip
+              v-if="row.silent_runs"
+              content="成功轮不落历史与计数=引擎静默策略（防高频噪音）；失败会立即留痕显示"
+              placement="top" :offset="8" :show-after="150" :show-arrow="false"
+            >
+              <span class="tm-silent">
+                <el-tag size="small" type="info" effect="plain">静默轮</el-tag>
+                <span v-if="row.fail_24h > 0" class="tm-bad">{{ row.fail_24h }}</span>
+              </span>
+            </el-tooltip>
+            <template v-else>
+              <span class="tm-ok">{{ row.success_24h }}</span> / <span :class="{ 'tm-bad': row.fail_24h > 0 }">{{ row.fail_24h }}</span>
+            </template>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="225" fixed="right">
@@ -218,7 +230,21 @@
             <el-tag size="small" :type="detailTask.enabled ? 'success' : 'warning'" effect="plain">{{ detailTask.enabled ? '开启' : '已暂停' }}</el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="下次执行">{{ detailTask.next_run_at || '—' }}</el-descriptions-item>
-          <el-descriptions-item label="24h 成功 / 失败"><span class="tm-ok">{{ detailTask.success_24h }}</span> / <span :class="{ 'tm-bad': detailTask.fail_24h > 0 }">{{ detailTask.fail_24h }}</span></el-descriptions-item>
+          <el-descriptions-item label="24h 成功 / 失败">
+            <el-tooltip
+              v-if="detailTask.silent_runs"
+              content="成功轮不落历史与计数=引擎静默策略（防高频噪音）；失败会立即留痕显示"
+              placement="top" :offset="8" :show-after="150" :show-arrow="false"
+            >
+              <span class="tm-silent">
+                <el-tag size="small" type="info" effect="plain">静默轮</el-tag>
+                <span v-if="detailTask.fail_24h > 0" class="tm-bad">{{ detailTask.fail_24h }}</span>
+              </span>
+            </el-tooltip>
+            <template v-else>
+              <span class="tm-ok">{{ detailTask.success_24h }}</span> / <span :class="{ 'tm-bad': detailTask.fail_24h > 0 }">{{ detailTask.fail_24h }}</span>
+            </template>
+          </el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="开始时间">{{ fmtTime(detailTask.last_run.started_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="完成时间">{{ detailTask.status === 'running' ? '进行中' : fmtTime(detailTask.last_run.finished_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="耗时">{{ fmtDuration(detailTask.last_run.duration_ms) }}</el-descriptions-item>
@@ -293,6 +319,7 @@ interface TaskInfo {
   kind: 'scheduled' | 'continuous' | 'queue' | 'info' | 'oneshot'
   status: string; enabled: boolean; cancellable: boolean; controllable?: boolean; triggerable?: boolean; toggleable?: boolean
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
+  silent_runs?: boolean
 }
 interface RunRecord {
   id: number; task_id: string; family: string; trigger: string; status: string
@@ -621,6 +648,7 @@ const fmtDuration = (ms?: number) => {
 .tm-dim { color: var(--el-text-color-placeholder); }
 .tm-ok { color: #34d399; font-weight: 600; }
 .tm-bad { color: #f87171; font-weight: 600; }
+.tm-silent { display: inline-flex; align-items: center; gap: 4px; }
 .tm-pagination { display: flex; justify-content: flex-end; margin-top: 12px; }
 
 /* tooltip 提示 */

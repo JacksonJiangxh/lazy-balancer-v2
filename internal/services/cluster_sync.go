@@ -1438,9 +1438,11 @@ func (s *SyncService) run(ctx context.Context) {
 			}
 			if pullErr != nil || reportErr != nil {
 				s.state.Store(uint32(syncStateDegraded))
+				TaskLogf("cluster-sync", "sync", "同步轮失败：%v / %v（退避重试）", pullErr, reportErr)
 			} else {
 				s.state.Store(uint32(syncStateRunning))
 				retryDelay = time.Second
+				TaskLogf("cluster-sync", "sync", "同步轮完成：快照拉取与应用成功（304 无变化或增量回放）")
 			}
 		}
 		// 存量脏数据兜底：R42 前 sync_interval 无下限校验，库里可能残留 0/负数

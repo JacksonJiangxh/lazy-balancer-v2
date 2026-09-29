@@ -758,6 +758,7 @@ func CertWaitingCATickOnce() {
 			qm.requeueStrandedQueuedJobs()
 		}
 		s.rescanDroppedDeploymentRetries()
+		TaskLogf("cert-waiting-ca", "rescan", "补扫完成：CA 冷却重排/滞留重入队/断链重建一轮（活跃任务明细见 cert_jobs）")
 	})
 }
 
@@ -765,6 +766,7 @@ func CertWaitingCATickOnce() {
 func CertReconcileOnce() {
 	reconcileMissingCertFiles(db.DB)
 	sweepOrphanedCertJobs(context.Background())
+	TaskLogf("cert-reconcile", "reconcile", "状态对账完成：断链文件重建与孤儿任务清理一轮（明细见运行日志）")
 }
 
 // requeueWaitingCAJobs re-enqueues cert jobs parked in 'waiting_ca' once
@@ -1264,8 +1266,14 @@ func (s *CertificateService) renewExpiringCertificates() {
 	jobs := s.CheckExpiration()
 	jobs = append(jobs, s.checkFailedFirstIssuance(maxAttempts)...)
 	if len(jobs) == 0 {
+		TaskLogf("cert-renewal-scan", "scan", "扫描完成：无临期证书、无待重试签发任务")
 		return
 	}
+	domains := make([]string, 0, len(jobs))
+	for _, j := range jobs {
+		domains = append(domains, j.Domain)
+	}
+	TaskLogf("cert-renewal-scan", "scan", "检测到 %d 个临期/待重试证书任务：%s", len(jobs), strings.Join(domains, "、"))
 
 	for _, j := range jobs {
 		if j.RenewalAttempts >= maxAttempts {
@@ -1387,6 +1395,8 @@ func (s *CertificateService) checkManualCertExpiration() {
 
 	if expiredCount > 0 || expiringSoonCount > 0 {
 		Logf("info", "TLS Certificate Check: %d expired, %d expiring within %d days", expiredCount, expiringSoonCount, warnDays)
+		// SPEC §6.5：业务结论镜像到任务日志（cert-manual-poll）。
+		TaskLogf("cert-manual-poll", "check", "手动证书到期检查：%d 张已过期、%d 张临期（阈值 %d 天）", expiredCount, expiringSoonCount, warnDays)
 	}
 }
 

@@ -1030,6 +1030,9 @@ type securityEventsTailer struct {
 	// 用）：失败 pass（F1 停摆、DB 错误）的下一 tick 必须重跑——停摆限流告警与
 	// DB 重试都依赖 2s 周期持续转动，不得被空闲跳过吞掉。
 	lastPassClean bool
+	// lastIngested 上一 pass 摄取事件数（SecurityEventsPollOnce 消费后清零——
+	// SPEC §6.5 业务摘要行：有事件才写任务日志）。
+	lastIngested int
 	// stallOffset/stallCount 是 SECLB35-1 停等状态：最近一次「残缺文档等待
 	// 补写」的偏移与连续失败次数。键为残缺文档起始偏移（每次 pass 从该处
 	// 重启，稳定）；偏移推进即数据已补全/已跳过，下次失败自然重置。
@@ -1159,6 +1162,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 			if cerr := tx.Commit(); cerr != nil {
 				return committedOffset, fmt.Errorf("security events: commit inserts: %w", cerr)
 			}
+			t.lastIngested = count
 			return offset, nil
 		}
 		if err != nil {
@@ -1473,6 +1477,11 @@ func runSecurityEventsIngestionLoop(ctx context.Context) {
 		// 先采集后轮转：copytruncate 前把未摄取内容全部吃进，杜绝轮转窗口丢事件。
 		if err := tailer.securityEventsTick(); err != nil {
 			tailer.securityEventsRateLimitedWarn(err)
+		}
+		// SPEC §6.5：有事件才写（零事件轮零行——静默语义保持）。
+		if tailer.lastIngested > 0 {
+			TaskLogf("security-events-ingestion", "ingest", "摄取 %d 条安全事件", tailer.lastIngested)
+			tailer.lastIngested = 0
 		}
 		rotateAuditLogIfNeeded()
 		select {

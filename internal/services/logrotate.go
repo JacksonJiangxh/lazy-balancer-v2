@@ -183,12 +183,12 @@ func StartRuntimeLogCleanup(logFile string) {
 // RuntimeLogCleanupOnce(logFile) 单轮过期日志清理（引擎每日节拍调用）：
 // ①应用日志轮转副本（app.log.*）按保留期删除；②任务日志（tasks/*.log，
 // 统一任务引擎管理）同保留期删除 + 超 5MB 轮转（保 .1 一份）。
-func RuntimeLogCleanupOnce(logFile string) {
+func RuntimeLogCleanupOnce(logFile string) int {
 	taskLogsHousekeeping(logFile)
 	months := 3
 	database := db.GetDB()
 	if database == nil {
-		return
+		return 0
 	}
 	if err := database.QueryRow("SELECT COALESCE(audit_retention_months,3) FROM global_config WHERE id=1").Scan(&months); err != nil || months < 1 {
 		months = 3
@@ -199,8 +199,9 @@ func RuntimeLogCleanupOnce(logFile string) {
 	base := filepath.Base(logFile) + "."
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return 0
 	}
+	removed := 0
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasPrefix(e.Name(), base) {
 			continue
@@ -213,10 +214,12 @@ func RuntimeLogCleanupOnce(logFile string) {
 			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
 				Logf("error", "清理过期运行日志失败 %s: %v", e.Name(), err)
 			} else {
+				removed++
 				Logf("info", "已清理过期运行日志 %s", e.Name())
 			}
 		}
 	}
+	return removed
 }
 
 func StartRuntimeLogCleanupContext(ctx context.Context, logFile string) <-chan struct{} {

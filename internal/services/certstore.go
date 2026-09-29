@@ -451,6 +451,7 @@ func MaterializeAllCertsFromDB() {
 	if manualRecovered > 0 || acmeRecovered > 0 {
 		RecordAuditLog("system", "恢复", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), fmt.Sprintf("手动证书 %d 个", manualRecovered), fmt.Sprintf("ACME证书 %d 个", acmeRecovered)), "")
 	}
+	TaskLogf("startup:config-load", "certs", "证书物化完成：手动证书 %d 个、ACME 证书 %d 个落盘", manualRecovered, acmeRecovered)
 }
 
 func materializeCertPair(ruleID, certPEM, keyPEM string) error {

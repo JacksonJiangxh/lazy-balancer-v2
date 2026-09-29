@@ -51,6 +51,7 @@ type TaskInfo struct {
 	Controllable bool         `json:"controllable"` // 常驻循环可启停（start/stop/restart）
 	Triggerable  bool         `json:"triggerable"`  // 支持手动触发（ManualRun 语义族）
 	Toggleable   bool         `json:"toggleable"`   // 调度开关可暂停/恢复（ToggleFn 声明族——U1-P4-2 元数据化）
+	SilentRuns   bool         `json:"silent_runs"`  // 成功轮静默（RecordFailuresOnly）——计数位显示「静默轮」而非 0/0
 	LastRun      *TaskRunInfo `json:"last_run,omitempty"`
 	NextRunAt    string       `json:"next_run_at,omitempty"`
 	Runs24h      int          `json:"runs_24h"`
@@ -148,6 +149,7 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			Category: m.Category, Kind: TaskKind(m.AsKind), // 性质口径（定时≠探测轮常驻）
 			Controllable: m.Controllable, Cancellable: m.Cancelable, Triggerable: m.CanTrigger,
 			Toggleable: m.Toggleable, // U1-P4-2：调度开关元数据（曾三族硬编码清单）
+			SilentRuns: m.SilentRuns,
 			Enabled:    m.Enabled, DetailHint: m.Family,
 		}
 		// Cadence 来自描述符声明（U1-P4-2 ⑦：曾本函数内五族 map）；
@@ -211,6 +213,12 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		out = append(out, ti)
 	}
 	return out
+}
+
+// TaskLogf 业务摘要行（SPEC §6.5：每个真实执行轮在 tasks/{id}.log 留业务
+// 结果——「无临期证书/清理 N 条/摄取 N 条」等；时间戳与 tee 流水同形态）。
+func TaskLogf(taskID, stage, format string, args ...any) {
+	taskengine.TeeTaskLogTime(taskID, "INFO", stage, fmt.Sprintf(format, args...))
 }
 
 func humanInterval(sec int) string {

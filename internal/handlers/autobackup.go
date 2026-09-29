@@ -232,6 +232,7 @@ func (h *Handlers) RunAutoBackupOnce(trigger, operator string, engineRunID int64
 	if err != nil {
 		return autoBackupRowView{}, fail("备份构建失败", err)
 	}
+	backupTee("build", fmt.Sprintf("备份构建完成：%s（%d 段）", countsSummary, len(exportedSections)))
 	finalPath := filepath.Join(dir, filename)
 	tmpPath := finalPath + ".tmp"
 	if err := os.WriteFile(tmpPath, payload, 0o600); err != nil {
@@ -255,6 +256,7 @@ func (h *Handlers) RunAutoBackupOnce(trigger, operator string, engineRunID int64
 	// success 按 keep 保留、failed 按 autoBackupFailedRowsKeep=20 保留,
 	// 文件+行同删;裁剪失败仅告警不翻转本次成功结果。
 	pruneAutoBackups(dir, loadAutoBackupKeepSetting(), autoBackupFailedRowsKeep)
+	backupTee("prune", "过期备份裁剪完成（按保留份数设置）")
 	services.Logf("info", "%s完成：文件 %s（%s，%.1f KB）", action, filename, countsSummary, float64(len(payload))/1024)
 	services.RecordAuditLog(operator, action, "配置备份", services.FormatAuditDetail(
 		fmt.Sprintf("备份 #%d", id), "文件："+filename, countsSummary,

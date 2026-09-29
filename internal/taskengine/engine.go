@@ -592,6 +592,7 @@ type TaskMeta struct {
 	ToggleName   string `json:"toggle_name"`   // 调度开关审计名
 	LoopOn       bool   `json:"loop_on"`       // 常驻循环当前启用态
 	CanTrigger   bool   `json:"can_trigger"`   // 支持手动触发（ManualRun）
+	SilentRuns   bool   `json:"silent_runs"`   // RecordFailuresOnly：成功轮不落历史/日志（UI 显示「静默轮」而非 0/0）
 }
 
 // DescribeAll 导出全部注册任务元数据（含循环启停态）。描述符快照在锁内
@@ -630,6 +631,7 @@ func (e *Engine) DescribeAll() []TaskMeta {
 			SingleFlight: s.desc.Singleton,
 			Toggleable:   s.desc.ToggleFn != nil,
 			ToggleName:   s.desc.ToggleName,
+			SilentRuns:   s.desc.RecordFailuresOnly,
 			LoopOn:       s.loopOn,
 			Enabled:      true}
 		if s.desc.IntervalFn != nil {
@@ -676,18 +678,26 @@ func (e *Engine) LatestRun(taskID string) *RunRecord {
 
 // PurgeTaskRuns 清理 N 天前的任务运行历史（每日清理族调用——防无界增长；
 // 静默策略已抑制成功轮落库，此为终态兜底）。
-func PurgeTaskRuns(days int) {
+func PurgeTaskRuns(days int) int64 {
 	if db.DB == nil || days <= 0 {
-		return
+		return 0
 	}
 	// 与 Stats24h 同口径：以配置时区 engineNowStr 为基准对比 started_at
 	// （曾用 datetime('now')=UTC 对比本地串——东八区清理窗口偏 8h）。
-	if _, err := db.DB.Exec(`DELETE FROM task_runs WHERE started_at < datetime(?, ?)`, engineNowStr(), fmt.Sprintf("-%d days", days)); err != nil {
-		return
+	res, err := db.DB.Exec(`DELETE FROM task_runs WHERE started_at < datetime(?, ?)`, engineNowStr(), fmt.Sprintf("-%d days", days))
+	if err != nil {
+		return 0
 	}
+	n, _ := res.RowsAffected()
+	return n
 }
 
 // TeeTaskLog 业务侧（更新族分阶段流水）tee 到任务日志——统一文本日志面。
+// TeeTaskLogTime 带当前时间戳的 tee（TaskLogf 消费——业务摘要行）。
+func TeeTaskLogTime(taskID, level, stage, message string) {
+	TeeTaskLog(taskID, time.Now().In(engineLoc).Format("2006/01/02 15:04:05"), level, stage, message)
+}
+
 func TeeTaskLog(taskID, timestamp, level, stage, message string) {
 	path := TaskLogPath(taskID)
 	if path == "" {

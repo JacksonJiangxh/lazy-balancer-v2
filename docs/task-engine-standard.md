@@ -1,4 +1,4 @@
-# 统一任务引擎标准（lazy-task-engine SPEC v1）
+# 统一任务引擎标准（lazy-task-engine SPEC v1.1）
 
 **裁定日**: 2026-09-29 · **适用**: v2.3.4+ 全部任务族
 
@@ -43,7 +43,7 @@
 ## 5. 调度策略
 
 - 排程槽（周/时刻）：NextSlotFn 声明式读取族配置；调度正确性由探测轮体内 due 逻辑保证
-- 固定间隔：IntervalFn（动态，配置热生效经 Reschedule）
+- 固定间隔：IntervalFn（动态；tick 每秒重读即热生效——Reschedule 已随死构件清理移除，v1.1）
 - 探测轮：1min，SilentProbes（不落历史）
 - 角色门：RunsOn（master-only/slave-only/any）+ demote 竞态守卫留在任务体
 
@@ -69,10 +69,20 @@
 | watchdog/ingestion | Continuous/Continuous | 循环态 | —✓ | 失败留痕 | 生命周期行 | 不进✓ | n/a | 合规 |
 | log-cleanup/audit/events-retention | Continuous/Scheduled | 终态 | last+24h✓ | ✓ | 生命周期行 | 不进✓ | ✓ | 合规 |
 | cert-renewal/reconcile | Continuous/Scheduled | 终态 | last+6h✓ | ✓ | 生命周期行 | 不进✓ | ✓ | 合规 |
-| cert-manual/waiting-ca | Continuous/Scheduled | 工作感知 | CA 可用时间✓ | 失败留痕 | 生命周期行 | 不进✓ | ✓ | 合规 |
+| cert-manual | Continuous/Scheduled | 工作感知 | last+10min✓ | 失败留痕 | 生命周期+摘要行 | 不进✓ | ✓ | 合规 |
+| waiting-ca | Continuous/**Continuous（可控）** | 工作感知（门控） | CA 可用时间✓ | 失败留痕 | 生命周期+有活摘要行 | 不进✓ | ✓ | 合规（v1.1：真正可控——控制面元数据化后 Controllable 派生要求 AsKind=Continuous，描述符「可经调度开关停用」已兑现） |
 | config-load | Oneshot/Oneshot | 终态 | —✓ | ✓ | 生命周期行✓ | 体自记✓ | ✓(共享体) | 合规 |
 | cluster-sync | Info/Scheduled | 角色镜像 | last+间隔✓ | 边界(快照) | 边界 | 边界 | n/a | 声明边界 |
 | caddy 轮转 | 未注册（非任务） | — | — | — | — | — | n/a | 合规裁定 |
 | cert-job:* 动态行 | Queue | 作业状态 | —✓ | cert_jobs | 作业日志端点 | 队列域 | n/a | 合规 |
 
-**缺口清单**：auto-backup 任务日志 tee 缺失（executor 链无 TeeTaskLine）——审计项 A。
+**缺口清单**：~~auto-backup 任务日志 tee 缺失~~（已闭合——Round 62 修复：backupTee 全阶段留痕）。
+
+## 6.5 业务摘要行（v1.1 新增，2026-09-29 用户裁定）
+
+每个**真实执行轮**在 tasks/{id}.log 留 1-3 行业务结果（用户可读结论，非仅生命周期行）：
+- 低频族（证书扫描/对账/清理三族/载入/备份）：每轮一行结论（「无临期证书/清理 N 条/物化 N 个/应用成功 N 规则」）
+- 高频静默族：watchdog 每轮一行结论入日志文件（task_runs 仍失败留痕）；ingestion **有事件才写**（零事件轮零行）；waiting-ca **有活才写**
+- 更新族：既有分阶段流水 tee（write*UpdateLog 挂点）即业务摘要
+- cluster-sync（v1.1 突破 Info 边界，用户裁定）：同步轮成败各一行
+- 写入统一经 services.TaskLogf（时间戳与 tee 流水同形态）

@@ -794,6 +794,7 @@ func (h *Handlers) ApplyConfigOnStartup() error {
 		// DB↔运行配置分叉对看门狗/前端横幅保持可见，等待人工修复。
 		if fbErr := h.caddyService.ApplyLastKnownGood(); fbErr == nil {
 			wrapped := fmt.Sprintf("启动时数据库渲染的配置被 Caddy 拒绝，已回退最后已知正确配置（负载均衡保持可用，运行配置与数据库分叉待修复）：%v", err)
+			services.TaskLogf("startup:config-load", "caddy", "Caddy 应用被拒，已回退最后已知正确配置：%v", err)
 			services.Logf("error", "CRITICAL: %s", wrapped)
 			services.RecordAuditLog("system", "启动警告", "系统配置", wrapped, "")
 			// 2026-09-07 裁定 K1：从节点追加补偿标记——Pull 的 304 分支识别后
@@ -812,6 +813,7 @@ func (h *Handlers) ApplyConfigOnStartup() error {
 		return fmt.Errorf("apply Caddy config on startup: %w", err)
 	}
 	services.Logf("info", "启动：Caddy 配置已载入（启用规则 %d 条）", count)
+	services.TaskLogf("startup:config-load", "caddy", "Caddy 配置渲染应用成功（启用规则 %d 条）", count)
 	services.RecordAuditLog("system", "载入", "系统配置", fmt.Sprintf("从数据库载入配置并应用 Caddy；启用规则 %d 条（触发源见任务运行历史）", count), "")
 
 	return nil

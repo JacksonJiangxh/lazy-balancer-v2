@@ -144,10 +144,11 @@ func AppendAPIKeyAuditDetail(detail string, keyID int, keyName string) string {
 	return fmt.Sprintf("%s；认证方式：API密钥；%s", detail, apiKeyPart)
 }
 
-func CleanupAuditLogs() {
+// CleanupAuditLogs 按保留月数清理审计日志，返回删除条数（SPEC §6.5 摘要行数据源）。
+func CleanupAuditLogs() int {
 	var retentionMonths int
 	if err := db.DB.QueryRow("SELECT COALESCE(audit_retention_months, 3) FROM global_config WHERE id=1").Scan(&retentionMonths); err != nil {
-		return
+		return 0
 	}
 	if retentionMonths < 1 {
 		retentionMonths = 1
@@ -155,11 +156,15 @@ func CleanupAuditLogs() {
 	cutoff := time.Now().UTC().AddDate(0, -retentionMonths, 0).Format("2006-01-02 15:04:05")
 	if db.AuditDB == nil {
 		Logf("warn", "audit log cleanup skipped: audit database is not initialized")
-		return
+		return 0
 	}
-	if _, err := db.AuditDB.Exec("DELETE FROM audit_log WHERE created_at < ?", cutoff); err != nil {
+	res, err := db.AuditDB.Exec("DELETE FROM audit_log WHERE created_at < ?", cutoff)
+	if err != nil {
 		Logf("warn", "audit log cleanup failed: %v", err)
+		return 0
 	}
+	n, _ := res.RowsAffected()
+	return int(n)
 }
 
 func StartAuditCleanup() {
