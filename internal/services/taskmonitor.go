@@ -50,6 +50,7 @@ type TaskInfo struct {
 	Cancellable  bool         `json:"cancellable"`  // 运行中可手动取消（仅下载类）
 	Controllable bool         `json:"controllable"` // 常驻循环可启停（start/stop/restart）
 	Triggerable  bool         `json:"triggerable"`  // 支持手动触发（ManualRun 语义族）
+	Toggleable   bool         `json:"toggleable"`   // 调度开关可暂停/恢复（ToggleFn 声明族——U1-P4-2 元数据化）
 	LastRun      *TaskRunInfo `json:"last_run,omitempty"`
 	NextRunAt    string       `json:"next_run_at,omitempty"`
 	Runs24h      int          `json:"runs_24h"`
@@ -129,37 +130,30 @@ func collectCertJobRows() []TaskInfo {
 		}
 		out = append(out, ti)
 	}
+	if err := rows.Err(); err != nil {
+		// U3-P4-4：迭代失败不再静默部分列表（曾 rows.Err 未查）
+		Logf("warn", "cert 任务行迭代失败: %v", err)
+	}
 	return out
 }
 
 // collectEngineFamilies 引擎注册族统一视图（终态：零特化零收集器——
 // 元数据/开关/下一槽/状态镜像全来自 DescribeAll，最近运行与 24h 统计
 // 来自 task_runs，下次时间兜底 last+interval）。
-// collectEngineFamilies 引擎注册族统一视图（终态：零特化零收集器——
-// 元数据/开关/下一槽/状态镜像全来自 DescribeAll，最近运行与 24h 统计
-// 来自 task_runs，下次时间兜底 last+interval）。
 func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
-	cadences := map[string]string{
-		"threat":          "排程槽（可配置星期/时刻）",
-		"crs":             "排程槽（可配置）",
-		"ip2region":       "排程槽（可配置）",
-		"auto-backup":     "按备份排程（日/周/月）",
-		"audit-retention": "每日（保留月数可配）",
-	}
 	var out []TaskInfo
 	for _, m := range te.DescribeAll() {
 		ti := TaskInfo{
 			ID: m.ID, Name: m.Name, Description: m.Description,
 			Category: m.Category, Kind: TaskKind(m.AsKind), // 性质口径（定时≠探测轮常驻）
 			Controllable: m.Controllable, Cancellable: m.Cancelable, Triggerable: m.CanTrigger,
-			Enabled: m.Enabled, DetailHint: m.Family,
+			Toggleable: m.Toggleable, // U1-P4-2：调度开关元数据（曾三族硬编码清单）
+			Enabled:    m.Enabled, DetailHint: m.Family,
 		}
-		// 排程槽族（下一时间以槽为权威，禁探测兜底）——仅这四个有用户排程槽；
-		// 清理族虽在 cadences 有文案但本质是固定间隔（last+interval 兜底有效）。
-		slotBased := m.ID == "threat" || m.ID == "crs" || m.ID == "ip2region" || m.ID == "auto-backup"
-		if c, ok := cadences[m.ID]; ok {
-			ti.Cadence = c
-		} else if m.IntervalSec > 0 {
+		// Cadence 来自描述符声明（U1-P4-2 ⑦：曾本函数内五族 map）；
+		// cluster-sync 动态节奏（用户同步间隔）按 ID 重算。
+		ti.Cadence = m.Cadence
+		if m.IntervalSec > 0 && ti.Cadence == "" {
 			ti.Cadence = "每 " + humanInterval(m.IntervalSec)
 		}
 		if m.ID == "cluster-sync" {
@@ -168,6 +162,9 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 				ti.Cadence = fmt.Sprintf("每 %d 秒（用户配置同步间隔）", iv)
 			}
 		}
+		// 排程槽族（下一时间以槽为权威，禁探测兜底）——仅这四个有用户排程槽；
+		// 清理族虽声明 Cadence 但本质是固定间隔（last+interval 兜底有效）。
+		slotBased := m.ID == "threat" || m.ID == "crs" || m.ID == "ip2region" || m.ID == "auto-backup"
 		// 状态按「任务性质」分流（探测轮循环态只对真常驻有意义）：
 		// · 镜像优先（manager 运行中/队列计数/角色）
 		// · 定时性质 → 最近真实运行终态（空闲/失败/运行中），循环态不外露
@@ -235,8 +232,6 @@ func humanInterval(sec int) string {
 
 // localDisplayUTC 把 DB datetime('now')/crsTimeLayout 的 UTC 时间串转为
 // 配置时区展示（引擎 task_runs 已按配置时区写入——勿二次转换）。
-// localDisplayUTC 把 DB datetime('now')/crsTimeLayout 的 UTC 时间串转为
-// 配置时区展示（引擎 task_runs 已按配置时区写入——勿二次转换）。
 func localDisplayUTC(ts string) string {
 	if ts == "" {
 		return ts
@@ -249,9 +244,6 @@ func localDisplayUTC(ts string) string {
 	return ts
 }
 
-// taskRunFromCrsLayout 用 crsTimeLayout 时间串构造最近运行（无终态=进行中，
-// 时长计到当前时刻）。
-// collectThreatTask 威胁情报库更新（任务级单条；源级明细在 message 汇总）。
 func earliestThreatNextUpdate() string {
 	var next string
 	if err := db.DB.QueryRow(`SELECT MIN(COALESCE(NULLIF(next_update,''), '9999')) FROM security_threat_sources WHERE update_enabled=1`).Scan(&next); err != nil || next == "9999" {
@@ -260,22 +252,6 @@ func earliestThreatNextUpdate() string {
 	return next
 }
 
-// collectCRSTask CRS 规则库更新。
-// collectIP2RegionTask IP2Region 地理库更新。
-// collectCertTasks 证书族：任务队列摘要 + 逐证书任务行（活跃或 24h 内有
-// 动作的 job 各一行——每证书/规则一个任务，非聚合黑箱）+ 四个内部调度循环。
-// collectAutoBackupTask 自动备份。
-// collectClusterSyncTask 集群同步（从节点常驻循环；主节点为签发方）。
-// collectWatchdogTask 配置漂移看门狗（60s 常驻）。
-// collectAuditRetentionTask 审计日志保留清理。
-// collectSecurityEventsIngestion 安全事件采集（coraza audit 尾读摄取+轮转，
-// 2s tick——安全总览/事件页数据源）。
-// collectLogRotateTask 运行日志尺寸轮转（30s 检查 + 超限 copytruncate）。
-// collectLogCleanupTask 旧日志文件清理（每日——logrotate 保留窗清理）。
-// collectSecurityEventsRetention 安全事件保留清理（每日——security_events
-// 保留期清理）。
-// nextAutoBackupSlot 计算自动备份的下一执行槽（复用 autoBackupDueSlot
-// 逐槽推进语义；禁用或参数非法返回 false）。
 // nextAutoBackupSlot 计算自动备份的下一执行槽（复用 autoBackupDueSlot
 // 逐槽推进语义；禁用或参数非法返回 false）。
 func nextAutoBackupSlot(now time.Time) (time.Time, bool) {
@@ -294,12 +270,3 @@ func nextAutoBackupSlot(now time.Time) (time.Time, bool) {
 	}
 	return due, ok
 }
-
-// continuousStatus 常驻任务真实运行态（M2：引擎优先，TaskRuntime 回退）。
-// scheduledRuntimeStatus 日清理类任务的运行态（调度循环在跑=running）。
-// collectCaddyAccessLogRotation Caddy 访问日志轮转（引擎内置——非本进程
-// goroutine，随生成的 Caddy 日志配置生效：roll_size_mb=日志大小上限设置、
-// roll_keep=5；被动信息行）。
-// engineControllable 引擎注册面是否提供该族启停控制。
-// collectStartupPhases 启动阶段任务（oneshot——main 启动序列各阶段，
-// 执行同步有序不变，此处只读 task_runs 最近一次 startup 记录做展示）。

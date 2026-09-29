@@ -92,13 +92,7 @@
 
     <el-dialog v-model="tokenDialogVisible" width="min(560px, 92vw)" :close-on-click-modal="false" class="register-token-dialog">
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon dialog-header__icon--warning"><el-icon :size="18"><Key /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">一次性注册令牌</div>
-            <div class="dialog-header__subtitle">仅展示一次，请立即复制并妥善保存</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Key" title="一次性注册令牌" subtitle="仅展示一次，请立即复制并妥善保存" tone="warning" />
       </template>
       <div class="token-box">
         <code>{{ registerToken?.token }}</code>
@@ -197,6 +191,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { CopyDocument, Key, Monitor, RefreshRight, Select, VideoPause, VideoPlay } from '@element-plus/icons-vue'
+import DialogHeader from '@/components/DialogHeader.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import { request, mfaAwareSuccess } from '@/utils/api'
@@ -757,16 +752,6 @@ onUnmounted(() => {
 .token-box { display: flex; align-items: center; gap: 12px; margin-top: 4px; padding: 14px; border-radius: var(--radius-md); background: var(--bg-secondary); border: 1px dashed var(--border-color, #dcdfe6); }
 .token-expiry { margin-top: 10px; }
 
-/* ── 通用弹框头部(icon + 标题 + 副标题)── */
-.dialog-header { display: flex; align-items: flex-start; gap: 12px; }
-.dialog-header__icon {
-  flex-shrink: 0; width: 36px; height: 36px; border-radius: 8px;
-  background: #ecf5ff; color: #409eff;
-  display: flex; align-items: center; justify-content: center;
-}
-.dialog-header__icon--warning { background: #fdf6ec; color: #e6a23c; }
-.dialog-header__title { font-size: 16px; font-weight: 600; color: var(--text-primary); line-height: 1.4; }
-.dialog-header__subtitle { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
 .token-box code { flex: 1; min-width: 0; color: var(--text-primary); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; word-break: break-all; }
 
 /* ── 服务控制弹框 ── */

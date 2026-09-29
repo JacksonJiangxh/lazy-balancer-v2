@@ -71,6 +71,9 @@ func LoadAdminTLSConfig() AdminTLSConfig {
 		COALESCE(admin_tls_cert,''), COALESCE(admin_tls_key,'')
 		FROM global_config WHERE id=1`).Scan(&enabled, &mode, &cert, &key)
 	if err != nil {
+		// U8-P5-4：查询失败不得无声吞掉——一次性 warn 留痕后按默认形态返回
+		//（API 形态不变，4 消费点无感；db nil 分支属启动窗口正常路径不告警）。
+		Logf("warn", "LoadAdminTLSConfig: query failed, falling back to selfsigned default: %v", err)
 		return cfg
 	}
 	cfg.Enabled = enabled == 1

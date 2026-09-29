@@ -1,6 +1,6 @@
 <template>
   <div class="dh-header">
-    <div class="dh-icon" :class="toneClass">
+    <div class="dh-icon" :class="iconClass">
       <el-icon :size="18"><component :is="icon" /></el-icon>
     </div>
     <div>
@@ -18,13 +18,15 @@ const props = defineProps<{
   title: string
   subtitle?: string
   tone?: 'primary' | 'success' | 'warning' | 'danger'
+  /** 自定义图标底色类（超出四 tone 的专属色族——消费侧经 :deep() 定义，如 lib-icon--crs） */
+  toneClass?: string
 }>()
 
-const toneClass = computed(() => (props.tone ? `dh-icon--${props.tone}` : ''))
+const iconClass = computed(() => [props.tone ? `dh-icon--${props.tone}` : '', props.toneClass || ''])
 </script>
 
 <style scoped>
-/* 与 BasicSettings.backup-dialog-header 同款视觉（共享组件化消除 scoped 跨文件失效） */
+/* 弹框头统一组件视觉：图标 + 标题 + 副标题（tone 四色 + toneClass 自定义底色） */
 .dh-header { display: flex; align-items: center; gap: 12px; }
 .dh-icon {
   width: 38px; height: 38px; border-radius: 10px;

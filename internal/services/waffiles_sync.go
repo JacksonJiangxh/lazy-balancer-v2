@@ -117,9 +117,13 @@ func BuildWafFileBundle() *WafFileBundle {
 	for source := range ref.ThreatSha256s {
 		fastPath := filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist.fast", source))
 		if data, err := os.ReadFile(fastPath); err == nil {
+			// U2-P5-08a：哈希直接对内存字节计算——fileSha256(fastPath) 的
+			// 二次读盘既浪费一次 IO，又在主端调度器并发重写 .fast 时留下
+			// TOCTOU 窗口（Sha256 与 Content 可能取自不同时刻的两份文件）。
+			sum := sha256.Sum256(data)
 			bundle.ThreatFiles = append(bundle.ThreatFiles, models.ThreatFileEntry{
 				Name:    source,
-				Sha256:  fileSha256(fastPath),
+				Sha256:  hex.EncodeToString(sum[:]),
 				Content: data,
 			})
 		}
@@ -178,6 +182,24 @@ func wafFilesRefMatchesBundle(r *models.ClusterWafFilesRef, b *WafFileBundle) bo
 	}
 	if r.IP2RegionSha != "" && b.IP2RegionSha != r.IP2RegionSha {
 		return false
+	}
+	// U6-P4-1：威胁面交叉核验——ref 逐源声明的 .fast 哈希必须与 bundle 携带
+	// 内容一一对应，缺失或不符都判不匹配（与 CRS/xdb 同纵深），否则威胁面
+	// 与 ref 漂移的 bundle 会被静默放行装进从节点。
+	for source, want := range r.ThreatSha256s {
+		matched := false
+		for _, tf := range b.ThreatFiles {
+			if tf.Name == source {
+				if tf.Sha256 != want {
+					return false
+				}
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
 	}
 	return true
 }
@@ -257,6 +279,18 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 		if len(tf.Content) == 0 {
 			continue
 		}
+		// 声明哈希为空但携带内容：合法主节点 BuildWafFileBundle 恒成对设置，
+		// 仅恶意/损坏主节点可构造——与 CRS/xdb 侧同纵深防御（U6-P4-1），
+		// 拒绝整包而非裸写未验证字节。
+		if tf.Sha256 == "" {
+			return crsChanged, xdbChanged, threatChanged, fmt.Errorf("同步威胁库 %s 缺少声明哈希，已拒绝落盘", tf.Name)
+		}
+		// 写入前内容哈希校验（与 xdb 分支同形，U6-P4-1）：不符说明 bundle
+		// 在主端构造或传输途中被污染，拒绝落盘而非把脏字节装进威胁库。
+		sum := sha256.Sum256(tf.Content)
+		if got := hex.EncodeToString(sum[:]); got != tf.Sha256 {
+			return crsChanged, xdbChanged, threatChanged, fmt.Errorf("同步威胁库 %s 哈希不匹配（声明 %s，实际 %s），已拒绝落盘", tf.Name, tf.Sha256, got)
+		}
 		fastPath := filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist.fast", tf.Name))
 		if fileSha256(fastPath) == tf.Sha256 {
 			continue // 哈希一致跳过
@@ -264,6 +298,7 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 		threatChanged = true
 		tmp := fastPath + ".tmp"
 		if err := os.WriteFile(tmp, tf.Content, 0644); err != nil {
+			_ = os.Remove(tmp) // U6-P5-2：写失败（ENOSPC 等）不遗留半截 .tmp
 			return crsChanged, xdbChanged, threatChanged, fmt.Errorf("写威胁库 .fast %s: %w", tf.Name, err)
 		}
 		if err := os.Rename(tmp, fastPath); err != nil {

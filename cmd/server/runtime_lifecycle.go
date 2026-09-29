@@ -59,6 +59,10 @@ func (l *runtimeLifecycle) StopACME() {
 	done := l.certDone
 	l.certService = nil
 	l.certDone = nil
+	// U1-P3-9/U7-P3-1：与 StartACME 注入对称——停机必须清除任务引擎证书
+	// 单轮体消费的 active 指针，否则 demote/停机后 cert-manual-poll 等循环
+	// 继续驱动已停服务（重复到期日志/无角色门补扫）。
+	services.SetActiveCertificateService(nil)
 	if worker != nil {
 		worker.Stop()
 	}

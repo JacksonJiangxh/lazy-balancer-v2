@@ -57,7 +57,7 @@ func TestCRSUpdateRun_migratesSetupCustomizationsAndInstallsNewStock(t *testing.
 	})
 
 	// When the update runs to completion
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then the new stock setup is installed and recorded as the next baseline
 	_, status, message, _, _, _, _ := crsVersionRow(t)
@@ -118,7 +118,7 @@ func TestCRSUpdateRun_firstMigrationDiffsAgainstDistBaseline(t *testing.T) {
 	})
 
 	// When the update runs
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then only the user line was migrated, proving the dist baseline was used
 	_, status, message, _, _, _, _ := crsVersionRow(t)
@@ -160,7 +160,7 @@ func TestCRSUpdateRun_rollbackRestoresPreviousLiveSetup(t *testing.T) {
 	m.reloader = func() error { reloads++; return nil }
 
 	// When the update fails during the baseline write
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then the previous live setup and rules are restored
 	_, status, _, _, _, _, _ := crsVersionRow(t)
@@ -278,7 +278,7 @@ func TestCRSUpdateRun_staleOverridesBakNotConsumedOnEmptyDiffFailure(t *testing.
 	m.reloader = func() error { return errors.New("注入的重载失败") }
 
 	// When the update fails after installing the new rules (restoreBackup runs)
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then the run failed
 	_, status, _, _, _, _, _ := crsVersionRow(t)
@@ -382,7 +382,7 @@ func TestCRSUpdateRun_installsStockSetupWhenNoneExists(t *testing.T) {
 	})
 
 	// When the update runs
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then the stock setup is installed and recorded as baseline, no overrides
 	_, status, message, _, _, _, _ := crsVersionRow(t)

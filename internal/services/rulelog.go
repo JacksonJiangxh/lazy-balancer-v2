@@ -8,7 +8,9 @@ import (
 	"strings"
 )
 
-const ruleLogDir = "/app/logs/rules"
+// ruleLogDir 规则访问日志目录（写入端写死 /app/logs/rules）。包级 var 仅为
+// 测试注入缝（handlers.wafAuditLogFile 同模式）；生产路径不得改写。
+var ruleLogDir = "/app/logs/rules"
 
 func RuleLogPath(ruleID string) string {
 	return filepath.Join(ruleLogDir, fmt.Sprintf("%s.log", sanitizeRuleLogName(ruleID)))
@@ -104,7 +106,15 @@ func ReadRuleLogTail(ruleID string, maxLines int) (content string, offset int64)
 	var buf []byte
 	end := size
 	newlines := 0
+	scanned := int64(0)
+	capped := false
 	for end > 0 && newlines < maxLines+1 {
+		// maxBackwardScan 接线（U8-P3-1，F63-B5e2-2 补完）：无换行/损坏文件
+		// 不再一路扫到文件头，超限即停并返回部分 tail（一次性 warn 留痕）。
+		if scanned >= maxBackwardScan {
+			capped = true
+			break
+		}
 		start := end - blockSize
 		if start < 0 {
 			start = 0
@@ -114,12 +124,16 @@ func ReadRuleLogTail(ruleID string, maxLines int) (content string, offset int64)
 			break
 		}
 		buf = append(chunk, buf...)
+		scanned += int64(len(chunk))
 		for _, b := range chunk {
 			if b == '\n' {
 				newlines++
 			}
 		}
 		end = start
+	}
+	if capped {
+		Logf("warn", "rule log tail for %s hit %dMB backward scan cap, returning partial tail", ruleID, maxBackwardScan>>20)
 	}
 	// keep only the last maxLines lines; when the log holds fewer lines than
 	// maxLines, cut stays 0 and everything is returned. An unterminated

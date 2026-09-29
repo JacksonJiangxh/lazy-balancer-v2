@@ -155,13 +155,8 @@
          展示原始内容 + 错误说明。宽度/顶距与 crs-event-dialog 一致。 -->
     <el-dialog v-model="ctxDialogVisible" width="min(760px, 94vw)" top="5vh" append-to-body class="ctx-event-dialog dialog-body-inset">
       <template #header>
-        <div class="ctx-dialog-header">
-          <el-icon class="ctx-dialog-icon"><Document /></el-icon>
-          <div>
-            <div class="ctx-dialog-title">请求详情</div>
-            <div class="ctx-dialog-sub">{{ ctxEvent ? formatDate(ctxEvent.event_time) : '—' }} · {{ ctxEvent?.policy_name || '未知策略' }}</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Document" title="请求详情"
+          :subtitle="`${ctxEvent ? formatDate(ctxEvent.event_time) : '—'} · ${ctxEvent?.policy_name || '未知策略'}`" />
       </template>
       <template v-if="ctxEvent">
         <el-descriptions :column="2" border size="small">
@@ -234,6 +229,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { Refresh, Warning, View, Hide, Document } from '@element-plus/icons-vue'
+import DialogHeader from '@/components/DialogHeader.vue'
 import { ElMessage } from 'element-plus'
 import type { CheckboxValueType } from 'element-plus'
 import { request } from '@/utils/api'
@@ -497,11 +493,6 @@ onMounted(fetchEvents)
 
 
 /* —— 请求上下文详情弹框 —— */
-/* 请求详情弹框头部：图标 + 标题 + 副标题（dialog-header 统一范式） */
-.ctx-dialog-header { display: flex; align-items: center; gap: 10px; }
-.ctx-dialog-icon { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 8px; background: var(--el-color-primary-light-9, #ecf5ff); color: var(--el-color-primary, #409eff); font-size: 18px; flex-shrink: 0; }
-.ctx-dialog-title { font-size: 16px; font-weight: 700; color: var(--el-text-color-primary); line-height: 1.3; }
-.ctx-dialog-sub { font-size: 12px; color: var(--el-text-color-secondary); margin-top: 2px; }
 .ctx-section-title { font-size: 13px; font-weight: 600; color: #374151; margin: 16px 0 8px; }
 .ctx-banner { margin-bottom: 8px; }
 .ctx-info-line { font-size: 12px; color: #9ca3af; line-height: 1.6; margin-bottom: 6px; }

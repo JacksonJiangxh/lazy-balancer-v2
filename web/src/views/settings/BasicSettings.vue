@@ -155,13 +155,8 @@
 
     <el-dialog v-model="adminTlsDialogVisible" class="dialog-body-inset" width="min(560px, 92vw)" destroy-on-close @closed="onAdminTlsDialogClose">
       <template #header>
-        <div class="backup-dialog-header">
-          <el-icon class="backup-dialog-icon"><Lock /></el-icon>
-          <div>
-            <div class="backup-dialog-title">HTTPS 证书配置</div>
-            <div class="backup-dialog-sub">管理面板（:8000）强制 HTTPS 使用的证书，保存后服务重启生效</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Lock" title="HTTPS 证书配置"
+          subtitle="管理面板（:8000）强制 HTTPS 使用的证书，保存后服务重启生效" />
       </template>
       <el-form label-width="110px">
         <!-- 自管标签行(ClusterModeCard 范式):el-radio-group 会把组容器 DIV id
@@ -233,13 +228,7 @@
 
     <el-dialog v-model="importDialogVisible" width="min(720px, 92vw)" :close-on-click-modal="false" class="backup-dialog dialog-body-inset" @close="onImportDialogClosed">
       <template #header>
-        <div class="backup-dialog-header">
-          <el-icon class="backup-dialog-icon"><Upload /></el-icon>
-          <div>
-            <div class="backup-dialog-title">导入配置备份</div>
-            <div class="backup-dialog-sub">选择备份文件与要导入的分类</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Upload" title="导入配置备份" subtitle="选择备份文件与要导入的分类" />
       </template>
       <div class="import-picker">
         <el-button :icon="Upload" @click="chooseImportFile">选择备份文件</el-button>
@@ -309,13 +298,7 @@
 
     <el-dialog v-model="exportDialogVisible" width="min(720px, 92vw)" :close-on-click-modal="false" class="backup-dialog dialog-body-inset">
       <template #header>
-        <div class="backup-dialog-header">
-          <el-icon class="backup-dialog-icon"><Download /></el-icon>
-          <div>
-            <div class="backup-dialog-title">导出配置备份</div>
-            <div class="backup-dialog-sub">选择要导出的配置分类</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Download" title="导出配置备份" subtitle="选择要导出的配置分类" />
       </template>
       <div class="section-chips">
         <button
@@ -340,13 +323,7 @@
 
     <el-dialog v-model="autoBackupVisible" width="min(880px, 96vw)" :close-on-click-modal="false" class="backup-dialog dialog-body-inset" destroy-on-close @opened="onAutoBackupOpened">
       <template #header>
-        <div class="backup-dialog-header">
-          <el-icon class="backup-dialog-icon"><Timer /></el-icon>
-          <div>
-            <div class="backup-dialog-title">自动备份</div>
-            <div class="backup-dialog-sub">定时将配置备份到服务器 backup 目录（仅主节点）</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Timer" title="自动备份" subtitle="定时将配置备份到服务器 backup 目录（仅主节点）" />
       </template>
       <el-form label-width="110px" class="auto-backup-form">
         <el-form-item label="启用">
@@ -452,13 +429,7 @@
        解析类只读 POST 与 MFA 自身端点）。 -->
   <el-dialog v-model="mfaScopeVisible" class="dialog-body-inset" width="min(640px, 94vw)">
     <template #header>
-      <div class="backup-dialog-header">
-        <el-icon class="backup-dialog-icon"><Lock /></el-icon>
-        <div>
-          <div class="backup-dialog-title">写操作验证支持的操作</div>
-          <div class="backup-dialog-sub">覆盖全部 RESTful 写端点，与后端实际拦截面一致</div>
-        </div>
-      </div>
+      <DialogHeader :icon="Lock" title="写操作验证支持的操作" subtitle="覆盖全部 RESTful 写端点，与后端实际拦截面一致" />
     </template>
     <div class="info-note-bar"><span class="info-note-desc">开启后，以下操作需要 1 分钟内验证过 MFA（TOTP 同片不可重用，验证后 60 秒内的连续操作免重复弹码）。测试连接、预览、解析类操作不受影响。</span></div>
     <div class="mfa-scope-list">
@@ -478,6 +449,7 @@ import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
 import { reloadAfterRestart } from '@/utils/restart'
 import { formatDate } from '@/utils/date'
 import { Setting, InfoFilled, Check, View, Upload, Download, Timer, Lock, Document } from '@element-plus/icons-vue'
+import DialogHeader from '@/components/DialogHeader.vue'
 import type { SystemInfo } from '@/types'
 
 const authStore = useAuthStore()
@@ -1450,15 +1422,6 @@ const handleSave = async () => {
 </script>
 
 <style scoped>
-.backup-dialog-header { display: flex; align-items: center; gap: 12px; }
-.backup-dialog-icon {
-  width: 38px; height: 38px; border-radius: 10px;
-  display: flex; align-items: center; justify-content: center;
-  background: var(--el-color-primary-light-9); color: var(--el-color-primary);
-  font-size: 18px; flex-shrink: 0;
-}
-.backup-dialog-title { font-size: 16px; font-weight: 600; color: var(--el-text-color-primary); }
-.backup-dialog-sub { font-size: 12.5px; color: var(--el-text-color-secondary); margin-top: 2px; }
 .section-chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .section-chip {
   border: 1px solid var(--el-border-color-lighter);

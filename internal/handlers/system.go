@@ -92,7 +92,9 @@ func (h *Handlers) GetConnectionStats(c *gin.Context) {
 }
 
 func (h *Handlers) GetAppLogs(c *gin.Context) {
-	logPath := h.cfg.LogFile
+	// U4-P5-1(Round 62 审计):运行日志路径经 logPaths 统一口径——LOG_FILE 空串
+	// 时兜底默认运行日志(与 GetLogStats 同源),消除空串路径读出的恒空 200。
+	_, logPath := logPaths(h.cfg)
 	const maxBytes = 128 * 1024
 	const maxLines = 500
 

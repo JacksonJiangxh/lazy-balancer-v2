@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -782,4 +784,92 @@ func TestWafFileBundleThreatFastRoundTrip(t *testing.T) {
 	if _, _, _, err := ApplyWafFileBundle(bundle); err != nil {
 		t.Fatalf("幂等 Apply: %v", err)
 	}
+}
+
+// U6-P4-1（第 62 轮审计）：威胁库 .fast 分支防御奇偶——污染 bundle（声明
+// 哈希与内容不符）必须整包拒绝落盘，与 xdb 分支同形；否则 bundle 在主端
+// 构造或传输途中被污染的字节会直接安装进从节点威胁库（零编译直接消费）。
+func TestApplyWafFileBundle_rejectsTamperedThreatFast(t *testing.T) {
+	dst := t.TempDir()
+	restoreWaf := OverrideThreatWafDirForTest(dst)
+	defer restoreWaf()
+
+	goodSum := sha256.Sum256([]byte("192.0.2.0/24\n198.51.100.7\n"))
+	bundle := &WafFileBundle{
+		ThreatFiles: []models.ThreatFileEntry{{
+			Name:    "ustc",
+			Sha256:  hex.EncodeToString(goodSum[:]),
+			Content: []byte("203.0.113.0/24\nEVIL\n"),
+		}},
+	}
+	_, _, threatChanged, err := ApplyWafFileBundle(bundle)
+	if err == nil || !strings.Contains(err.Error(), "哈希不匹配") {
+		t.Fatalf("error=%v, want threat .fast content hash mismatch rejection", err)
+	}
+	if threatChanged {
+		t.Fatal("tampered threat .fast must not be applied")
+	}
+	fastPath := filepath.Join(dst, "threat-ustc.iplist.fast")
+	if _, statErr := os.Stat(fastPath); !os.IsNotExist(statErr) {
+		t.Fatalf("tampered .fast must not be written to live path, stat err=%v", statErr)
+	}
+	if _, statErr := os.Stat(fastPath + ".tmp"); !os.IsNotExist(statErr) {
+		t.Fatalf("tampered .fast tmp must not be written, stat err=%v", statErr)
+	}
+}
+
+// U6-P4-1：空声明哈希携内容——合法主节点 BuildWafFileBundle 恒成对设置，
+// 仅恶意/损坏主节点可构造；与 CRS/xdb 侧同纵深防御，拒绝而非裸写未验证
+// 字节（原实现会在本地文件缺失时以 fileSha256==""==tf.Sha256 静默跳过或
+// 直接落盘）。
+func TestApplyWafFileBundle_rejectsThreatFastWithoutDeclaredHash(t *testing.T) {
+	dst := t.TempDir()
+	restoreWaf := OverrideThreatWafDirForTest(dst)
+	defer restoreWaf()
+
+	bundle := &WafFileBundle{
+		ThreatFiles: []models.ThreatFileEntry{{Name: "ustc", Sha256: "", Content: []byte("198.51.100.0/24\n")}},
+	}
+	if _, _, _, err := ApplyWafFileBundle(bundle); err == nil || !strings.Contains(err.Error(), "缺少声明哈希") {
+		t.Fatalf("error=%v, want missing declared hash rejection", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dst, "threat-ustc.iplist.fast")); !os.IsNotExist(statErr) {
+		t.Fatalf(".fast must not be written without declared hash, stat err=%v", statErr)
+	}
+}
+
+// U6-P4-1：wafFilesRefMatchesBundle 交叉核验必须覆盖威胁面——bundle 携带
+// 的逐源 .fast 哈希与 ref.ThreatSha256s 不符或缺失都必须判不匹配，否则
+// 威胁面与 ref 漂移的 bundle 会被静默放行装进从节点。
+func TestWafFilesRefMatchesBundle_verifiesThreatSha256s(t *testing.T) {
+	ref := &models.ClusterWafFilesRef{CRSSha256: "crs", IP2RegionSha: "xdb"}
+	baseBundle := WafFileBundle{CRSSha256: "crs", IP2RegionSha: "xdb"}
+
+	t.Run("matching threat hashes pass", func(t *testing.T) {
+		ref.ThreatSha256s = map[string]string{"ustc": "aa", "firehol1": "bb"}
+		b := baseBundle
+		b.ThreatFiles = []models.ThreatFileEntry{
+			{Name: "ustc", Sha256: "aa", Content: []byte("a")},
+			{Name: "firehol1", Sha256: "bb", Content: []byte("b")},
+		}
+		if !wafFilesRefMatchesBundle(ref, &b) {
+			t.Fatal("matching threat hashes must pass")
+		}
+	})
+	t.Run("mismatched threat hash fails", func(t *testing.T) {
+		ref.ThreatSha256s = map[string]string{"ustc": "aa"}
+		b := baseBundle
+		b.ThreatFiles = []models.ThreatFileEntry{{Name: "ustc", Sha256: "zz", Content: []byte("z")}}
+		if wafFilesRefMatchesBundle(ref, &b) {
+			t.Fatal("mismatched threat hash must fail")
+		}
+	})
+	t.Run("missing threat source fails", func(t *testing.T) {
+		ref.ThreatSha256s = map[string]string{"ustc": "aa", "firehol1": "bb"}
+		b := baseBundle
+		b.ThreatFiles = []models.ThreatFileEntry{{Name: "ustc", Sha256: "aa", Content: []byte("a")}}
+		if wafFilesRefMatchesBundle(ref, &b) {
+			t.Fatal("threat source missing from bundle must fail")
+		}
+	})
 }

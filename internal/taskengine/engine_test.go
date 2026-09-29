@@ -42,9 +42,9 @@ func TestEngine_SingletonTriggerRejectedWhileRunning(t *testing.T) {
 			<-release
 			return nil
 		}})
-	go func() { _ = e.Trigger("t-single", "manual") }()
+	go func() { _ = e.Trigger("t-single", "manual", "") }()
 	<-started
-	if err := e.Trigger("t-single", "manual"); err != ErrAlreadyRunning {
+	if err := e.Trigger("t-single", "manual", ""); err != ErrAlreadyRunning {
 		t.Fatalf("want ErrAlreadyRunning, got %v", err)
 	}
 	close(release)
@@ -63,7 +63,7 @@ func TestEngine_CancelMarksCancelled(t *testing.T) {
 			<-rc.Ctx.Done()
 			return context.Canceled
 		}})
-	go func() { done <- e.runNow("t-cancel", "manual") }()
+	go func() { done <- e.runNow("t-cancel", "manual", "") }()
 	<-inRun
 	if !e.Cancel("t-cancel") {
 		t.Fatal("Cancel 应生效")
@@ -119,10 +119,10 @@ func TestEngine_RoleGateSlaveOnlyOnMasterSkips(t *testing.T) {
 	}
 }
 
-// Given 动态间隔任务(interval=50ms)。
-// When Reschedule 后 IntervalFn 返回 20ms。
-// Then 后续按新间隔执行（200ms 内 ≥2 次）。
-func TestEngine_DynamicIntervalReschedule(t *testing.T) {
+// Given 动态间隔任务(interval=500ms)。
+// When IntervalFn 中途返回 20ms（tick 每轮重读间隔——变更自然生效）。
+// Then 后续按新间隔执行（300ms 内 ≥2 次）。
+func TestEngine_DynamicIntervalReread(t *testing.T) {
 	e := newTestEngine(t)
 	mu := make(chan struct{}, 32)
 	var fast atomic.Bool
@@ -138,7 +138,6 @@ func TestEngine_DynamicIntervalReschedule(t *testing.T) {
 	e.SetRole(true)
 	time.Sleep(80 * time.Millisecond) // 慢间隔期(最多1次)
 	fast.Store(true)
-	e.Reschedule("t-dyn")
 	deadline := time.Now().Add(300 * time.Millisecond)
 	count := 0
 	for time.Now().Before(deadline) {
@@ -178,10 +177,9 @@ func TestEngine_HistoryRecordShape(t *testing.T) {
 	e := newTestEngine(t)
 	e.Register(Descriptor{ID: "t-hist", Family: "t", Name: "历史", Singleton: true,
 		Run: func(rc RunContext) error {
-			rc.Progress("downloading", "阶段消息")
 			return nil
 		}})
-	if err := e.Trigger("t-hist", "manual"); err != nil {
+	if err := e.Trigger("t-hist", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -208,10 +206,10 @@ func TestEngine_RecordPoliciesSilentOnSuccess(t *testing.T) {
 	e.Register(Descriptor{ID: "t-failonly", Family: "t", Singleton: true, RecordFailuresOnly: true,
 		Run: func(rc RunContext) error { return nil }})
 	// auto 触发(探测语义)静默;manual 恒落库(用户显式动作留痕)——v2.3.4 裁定
-	if err := e.runNow("t-silent", "auto"); err != nil {
+	if err := e.runNow("t-silent", "auto", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.runNow("t-failonly", "auto"); err != nil {
+	if err := e.runNow("t-failonly", "auto", ""); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -222,7 +220,7 @@ func TestEngine_RecordPoliciesSilentOnSuccess(t *testing.T) {
 		_ = got
 	}
 	// manual 触发恒落库
-	if err := e.runNow("t-silent", "manual"); err != nil {
+	if err := e.runNow("t-silent", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
 	deadlineM := time.Now().Add(2 * time.Second)
@@ -238,7 +236,7 @@ func TestEngine_RecordPoliciesSilentOnSuccess(t *testing.T) {
 	// 失败轮补一行
 	e.Register(Descriptor{ID: "t-failonly", Family: "t", Singleton: true, RecordFailuresOnly: true,
 		Run: func(rc RunContext) error { return errors.New("boom") }})
-	if err := e.Trigger("t-failonly", "manual"); err == nil {
+	if err := e.Trigger("t-failonly", "manual", ""); err == nil {
 		t.Fatal("应返回错误")
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -249,4 +247,175 @@ func TestEngine_RecordPoliciesSilentOnSuccess(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("失败轮应留痕 1 行 failed: %+v", e.History("t-failonly", 5))
+}
+
+// ---- Round 62 审计修复钉（P2-①/P3-8/U1-P3-1/U1-P3-7/U2-P5-08c） ----
+
+func withTestLocation(t *testing.T, loc *time.Location) {
+	t.Helper()
+	old := engineLoc
+	SetLocation(loc)
+	t.Cleanup(func() { SetLocation(old) })
+}
+
+func parseRunTime(s string) time.Time {
+	tt, _ := time.ParseInLocation("2006-01-02 15:04:05", s, time.UTC)
+	return tt
+}
+
+// Given 非 UTC 配置时区（+8）与一次成功的 manual 运行。
+// When 历史落库后读取 started_at/finished_at。
+// Then 完成时间不早于开始时间（P2-①：finished_at 曾误用 UTC datetime('now')，
+// 东八区下恒早 8 小时）。
+func TestEngine_TaskRunsFinishNotBeforeStartWithNonUTCZone(t *testing.T) {
+	e := newTestEngine(t)
+	withTestLocation(t, time.FixedZone("CST", 8*3600))
+	e.Register(Descriptor{ID: "t-tz", Family: "t", Name: "时区", Singleton: true,
+		Run: func(rc RunContext) error { return nil }})
+	if err := e.Trigger("t-tz", "manual", ""); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		runs := e.History("t-tz", 1)
+		if len(runs) == 1 && runs[0].Status == "success" {
+			if parseRunTime(runs[0].FinishedAt).Before(parseRunTime(runs[0].StartedAt)) {
+				t.Fatalf("完成时间早于开始时间（时区分裂）: started=%s finished=%s",
+					runs[0].StartedAt, runs[0].FinishedAt)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("应有一条 success 历史: %+v", e.History("t-tz", 1))
+}
+
+// Given 配置时区 +8，task_runs 存在一行 started_at=配置时区 90 天又 2 小时前。
+// When PurgeTaskRuns(90)。
+// Then 该行被清理（P2-①：清理窗口曾用 UTC 'now' 对比本地串，东八区下
+// 只删 90 天+8h 之前的行）。
+func TestEngine_PurgeTaskRunsHonorsConfiguredTimezone(t *testing.T) {
+	newTestEngine(t) // 仅需 DB
+	withTestLocation(t, time.FixedZone("CST", 8*3600))
+	old := engineNowStr()
+	aged := time.Now().In(engineLoc).Add(-(90*24 + 2) * time.Hour).Format("2006-01-02 15:04:05")
+	if _, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, trigger, status, started_at) VALUES ('t-purge','t','auto','success',?)`, aged); err != nil {
+		t.Fatal(err)
+	}
+	PurgeTaskRuns(90)
+	var n int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM task_runs WHERE task_id='t-purge'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("90 天又 2 小时前的运行行应被清理（时区口径不一致），残留 %d 行", n)
+	}
+	_ = old
+}
+
+// Given DescribeAll 期间某任务 StatusFn 阻塞等待放行。
+// When 并发调用 Stop()。
+// Then Stop 在限定时间内返回（P3-8：DescribeAll 曾持 RLock 调 Fn，
+// writer 排队时嵌套 RLock 互锁——关停挂死）。
+func TestEngine_DescribeAllReleasesLockBeforeFnCalls(t *testing.T) {
+	e := newTestEngine(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	e.Register(Descriptor{ID: "t-block", Family: "t", Name: "阻塞元数据",
+		StatusFn: func() string {
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
+			return ""
+		}})
+	go e.DescribeAll()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StatusFn 未被调用")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		e.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		close(release)
+	case <-time.After(2 * time.Second):
+		close(release) // 先放行避免 cleanup 挂死
+		t.Fatal("DescribeAll 持锁期间 Stop 被阻塞（元数据 Fn 调用未移出锁外）")
+	}
+}
+
+// Given 任务体捕获 RunContext.Operator。
+// When Trigger(id, "manual", "alice")。
+// Then 任务体收到 operator=alice（U1-P3-1：手动操作者身份通道）。
+func TestEngine_TriggerCarriesOperator(t *testing.T) {
+	e := newTestEngine(t)
+	got := make(chan string, 1)
+	e.Register(Descriptor{ID: "t-op", Family: "t", Name: "操作者", Singleton: true,
+		Run: func(rc RunContext) error {
+			got <- rc.Operator
+			return nil
+		}})
+	if err := e.Trigger("t-op", "manual", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case op := <-got:
+		if op != "alice" {
+			t.Fatalf("want operator=alice, got %q", op)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("任务未执行")
+	}
+}
+
+// Given 注册了 Singleton 声明的任务。
+// When DescribeAll。
+// Then 元数据暴露 SingleFlight=true（U1-P3-7：生产描述符补单飞的可观察面）。
+func TestEngine_DescribeAllExposesSingleFlight(t *testing.T) {
+	e := newTestEngine(t)
+	e.Register(Descriptor{ID: "t-sf", Family: "t", Name: "单飞元数据", Singleton: true})
+	for _, m := range e.DescribeAll() {
+		if m.ID == "t-sf" {
+			if !m.SingleFlight {
+				t.Fatal("Singleton 声明应在 DescribeAll 元数据中暴露为 SingleFlight")
+			}
+			return
+		}
+	}
+	t.Fatal("未找到 t-sf")
+}
+
+// Given RecordFailuresOnly 任务运行 100ms 后失败（触发 auto，成功轮静默）。
+// When 失败补插历史行。
+// Then 行 started_at 反映真实开始时刻而非补插时刻（U2-P5-08c：
+// started_at+duration 不越过 finished_at）。
+func TestEngine_RecordFailuresOnlyBackfillStartsAtRealStart(t *testing.T) {
+	e := newTestEngine(t)
+	e.Register(Descriptor{ID: "t-backfill", Family: "t", Singleton: true, RecordFailuresOnly: true,
+		Run: func(rc RunContext) error {
+			time.Sleep(120 * time.Millisecond)
+			return errors.New("boom")
+		}})
+	if err := e.runNow("t-backfill", "auto", ""); err == nil {
+		t.Fatal("应返回错误")
+	}
+	runs := e.History("t-backfill", 1)
+	if len(runs) != 1 {
+		t.Fatalf("应补插 1 行 failed, got %+v", runs)
+	}
+	r := runs[0]
+	if r.DurationMs < 100 {
+		t.Fatalf("duration 应≥100ms, got %d", r.DurationMs)
+	}
+	if end := parseRunTime(r.StartedAt).Add(time.Duration(r.DurationMs) * time.Millisecond); end.After(parseRunTime(r.FinishedAt).Add(2 * time.Second)) {
+		t.Fatalf("started_at 为补插时刻而非真实开始: started=%s duration=%dms finished=%s",
+			r.StartedAt, r.DurationMs, r.FinishedAt)
+	}
 }

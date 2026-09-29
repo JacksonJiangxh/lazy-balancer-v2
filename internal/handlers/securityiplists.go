@@ -313,7 +313,12 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 	}
 	// RDB 文件化：威胁库条数以 threat_sources 为准（DB entries 恒空）
 	threatCounts := map[string]int{}
-	if trows, terr := db.DB.Query(`SELECT name, COALESCE(entry_count,0) FROM security_threat_sources`); terr == nil {
+	trows, terr := db.DB.Query(`SELECT name, COALESCE(entry_count,0) FROM security_threat_sources`)
+	if terr != nil {
+		// U3-P4-4：辅助查询失败记日志（曾静默条数 0——与同域「失败不假绿」纪律冲突）
+		services.Logf("warn", "威胁库条数查询失败（系统名单条数将显示为 0）: %v", terr)
+	}
+	if terr == nil {
 		for trows.Next() {
 			var src string
 			var cnt int

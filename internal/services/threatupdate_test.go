@@ -122,7 +122,7 @@ func TestThreatUpdate_runsEnabledSourcesInOrder(t *testing.T) {
 		}
 	}
 
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run update: %v", err)
 	}
 
@@ -150,7 +150,7 @@ func TestThreatUpdate_sourceFailureKeepsOldListAndContinues(t *testing.T) {
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
 
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
 	// 第二轮：firehol_l1 失败、ustc 换内容
@@ -169,7 +169,7 @@ func TestThreatUpdate_sourceFailureKeepsOldListAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
 
@@ -212,7 +212,7 @@ func TestThreatUpdate_parseGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if status, _, _, _, _ := readThreatRow(t, "ustc"); status != "success" {
@@ -234,7 +234,7 @@ func TestThreatUpdate_updateDisabledSourceSkipped(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=0 WHERE name='firehol_l1'`); err != nil {
 		t.Fatal(err)
 	}
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if status, _, _, _, _ := readThreatRow(t, "firehol_l1"); status != "idle" {
@@ -255,7 +255,7 @@ func TestThreatUpdate_listChangeTriggersReload(t *testing.T) {
 	SetThreatReloader(func() error { reloads++; return nil })
 	t.Cleanup(func() { SetThreatReloader(nil) })
 
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if reloads != 0 {
@@ -263,7 +263,7 @@ func TestThreatUpdate_listChangeTriggersReload(t *testing.T) {
 	}
 	// 引用 ustc 名单后，同内容仍不重载
 	seedThreatPolicyRefForSource(t, 900, "ustc")
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run2: %v", err)
 	}
 	if reloads != 0 {
@@ -276,7 +276,7 @@ func TestThreatUpdate_listChangeTriggersReload(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name='ustc'`, srv.URL); err != nil {
 		t.Fatal(err)
 	}
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run3: %v", err)
 	}
 	if reloads != 1 {
@@ -309,7 +309,7 @@ func TestThreatUpdate_reloadsOnlyWhenChangedListReferenced(t *testing.T) {
 	t.Cleanup(func() { SetThreatReloader(nil) })
 
 	// When 首轮写入全部名单（无任何策略引用）
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run1: %v", err)
 	}
 	// Then 内容新增但零引用 → 不重载
@@ -336,7 +336,7 @@ func TestThreatUpdate_reloadsOnlyWhenChangedListReferenced(t *testing.T) {
 	}
 
 	// When 仅未被引用的源变化
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run2: %v", err)
 	}
 	// Then 仍不重载（变化的名单无人引用）
@@ -352,7 +352,7 @@ func TestThreatUpdate_reloadsOnlyWhenChangedListReferenced(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name='ustc'`, srv2.URL); err != nil {
 		t.Fatal(err)
 	}
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run3: %v", err)
 	}
 	// Then 重载一次（被引用的名单变了）
@@ -375,11 +375,11 @@ func TestThreatUpdate_duplicateStartRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	done1, err := GetThreatUpdateManager().StartUpdate("manual")
+	done1, err := GetThreatUpdateManager().StartUpdate("manual", nil)
 	if err != nil {
 		t.Fatalf("first start: %v", err)
 	}
-	if _, err := GetThreatUpdateManager().StartUpdate("manual"); err == nil {
+	if _, err := GetThreatUpdateManager().StartUpdate("manual", nil); err == nil {
 		t.Fatal("重复启动必须拒绝")
 	}
 	close(block)
@@ -448,7 +448,7 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 		return h
 	}
 	// run1：写入 + 哈希落库（无策略引用 → 不重载）
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run1: %v", err)
 	}
 	h1 := readHash()
@@ -469,7 +469,7 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name='ustc'`, srvNew.URL); err != nil {
 		t.Fatal(err)
 	}
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run1b: %v", err)
 	}
 	if reloads != 1 {
@@ -485,7 +485,7 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 	}
 
 	// run2：同内容（同序）→ 不重载、哈希不变、更新日志留痕「未变化」
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run2: %v", err)
 	}
 	if reloads != 1 {
@@ -516,7 +516,7 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name='ustc'`, shuffled.URL); err != nil {
 		t.Fatal(err)
 	}
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run3: %v", err)
 	}
 	if reloads != 1 {
@@ -536,7 +536,7 @@ func TestThreatUpdate_listExistenceQueryErrorNotFastPathSuccess(t *testing.T) {
 	setupThreatTest(t, nil, nil, nil)
 
 	// Given：run1 成功（raw_hash 落库，名单行存在）
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run1: %v", err)
 	}
 	if status, _, _, _, _ := readThreatRow(t, "ustc"); status != "success" {
@@ -551,7 +551,7 @@ func TestThreatUpdate_listExistenceQueryErrorNotFastPathSuccess(t *testing.T) {
 	}
 
 	// When：同内容 run2 —— 原始哈希一致进入快速路径，COUNT 失败
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run2: %v", err)
 	}
 
@@ -620,7 +620,7 @@ func TestThreatUpdate_reloadFailureRetriedOnNextRun(t *testing.T) {
 
 	mgr := GetThreatUpdateManager()
 	// 轮 1：建名单（无引用，不重载）
-	if err := mgr.RunUpdate("manual"); err != nil {
+	if err := mgr.RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run1: %v", err)
 	}
 	if reloads != 0 {
@@ -635,7 +635,7 @@ func TestThreatUpdate_reloadFailureRetriedOnNextRun(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name='ustc'`, srv.URL); err != nil {
 		t.Fatal(err)
 	}
-	if err := mgr.RunUpdate("manual"); err != nil {
+	if err := mgr.RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run2: %v", err)
 	}
 	if reloads != 1 {
@@ -643,14 +643,14 @@ func TestThreatUpdate_reloadFailureRetriedOnNextRun(t *testing.T) {
 	}
 	// 轮 3：内容未变——失败自愈：必须强制重载（#2 成功）
 	failReload = false
-	if err := mgr.RunUpdate("manual"); err != nil {
+	if err := mgr.RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run3: %v", err)
 	}
 	if reloads != 2 {
 		t.Fatalf("run3 应自愈重试重载: %d", reloads)
 	}
 	// 轮 4：pending 已清——内容未变不再重载
-	if err := mgr.RunUpdate("manual"); err != nil {
+	if err := mgr.RunUpdate("manual", nil); err != nil {
 		t.Fatalf("run4: %v", err)
 	}
 	if reloads != 2 {
@@ -669,7 +669,7 @@ func TestThreatUpdate_runRejectedOnSlave(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatalf("从节点 RunUpdate 应静默返回而非报错: %v", err)
 	}
 	// 从节点不得写内置名单内容（种子行恒存在——断言条目仍为空、源状态未被改写）

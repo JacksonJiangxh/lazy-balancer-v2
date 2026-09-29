@@ -203,7 +203,7 @@ func TestCRSUpdateRun_installFailureRestoresStockBaseline(t *testing.T) {
 	m.reloader = func() error { return errors.New("reload boom") }
 
 	// When 安装失败触发回滚
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then stock 基线恢复到更新前版本，备份被消费
 	stock, err := os.ReadFile(filepath.Join(m.crsDir, "crs-setup.stock.conf"))
@@ -237,7 +237,7 @@ func TestCRSUpdateRun_successRemovesStockBackup(t *testing.T) {
 	m.reloader = func() error { return nil }
 
 	// When 更新成功
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then 新 stock 基线落盘且无备份残留
 	stock, err := os.ReadFile(filepath.Join(m.crsDir, "crs-setup.stock.conf"))
@@ -312,7 +312,7 @@ func TestCRSUpdateRun_slaveAbortsBeforeFetch(t *testing.T) {
 	}
 
 	// When 更新管线在从节点上启动
-	m.run("auto")
+	m.run("auto", nil)
 
 	// Then 起点复查直接终止：不发起 fetch、不写版本行状态
 	if fetchCalled {
@@ -346,7 +346,7 @@ func TestIP2RegionUpdateRun_slaveAbortsBeforeFetch(t *testing.T) {
 	}
 
 	// When 更新管线在从节点上启动
-	m.run("auto")
+	m.run("auto", nil)
 
 	// Then 起点复查直接终止：不发起 fetch、不写版本行状态
 	if fetchCalled {

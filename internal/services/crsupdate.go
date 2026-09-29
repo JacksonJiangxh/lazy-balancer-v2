@@ -181,7 +181,9 @@ func currentCRSVersion() string {
 // ——StartUpdate 返回与 rearm 取锁之间存在微秒级窗口，快失败的 auto run 被手动
 // 更新插队覆盖 m.runDone 时，rearm 会错等手动 run 的完成并按其终态跳过 auto 的
 // 失败退避重写。手动调用方可忽略返回通道。
-func (m *CRSUpdateManager) StartUpdate(trigger string) (chan struct{}, error) {
+// rc 非 nil 且 RunID>0=引擎已预插 task_runs 行（P2-④ 单写方：族体跳过自记，
+// 行终态由引擎 finishRun 按 Run 返回错误落）；Operator 供审计归人（U1-P3-1）。
+func (m *CRSUpdateManager) StartUpdate(trigger string, rc *taskengine.RunContext) (chan struct{}, error) {
 	m.mu.Lock()
 	if m.running {
 		m.mu.Unlock()
@@ -195,7 +197,7 @@ func (m *CRSUpdateManager) StartUpdate(trigger string) (chan struct{}, error) {
 
 	go func() {
 		defer close(done)
-		m.run(trigger)
+		m.run(trigger, rc)
 	}()
 	return done, nil
 }
@@ -219,24 +221,45 @@ func (m *CRSUpdateManager) setStage(status CRSUpdateStatus, message string) {
 }
 
 // run executes the full update pipeline synchronously.
-func (m *CRSUpdateManager) run(trigger string) {
-	// 任务自记审计：手动/自动同一审计（用户裁定 2026-09-29）
+func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
+	operator := "system"
+	if rc != nil && rc.Operator != "" {
+		operator = rc.Operator
+	}
+	// 任务自记审计：手动/自动同一审计（用户裁定 2026-09-29）。manager 内联
+	// 结果审计已撤（U1-P3-2 审计单记——曾是 defer+内联双记）。
 	defer func() {
 		snap := m.StatusSnapshot()
-		detail := fmt.Sprintf("更新%s（触发：%s）%s", snap.Status, trigger, snap.Message)
+		// 状态中文归一（U2-P5-08b：曾混英文 status token，与 threat 族口径不一）
+		statusLabel := map[string]string{
+			string(CRSStatusSuccess): "成功", string(CRSStatusFailed): "失败",
+			string(CRSStatusIdle): "空闲", string(CRSStatusChecking): "检测中",
+		}[snap.Status]
+		if statusLabel == "" {
+			statusLabel = snap.Status
+		}
+		detail := fmt.Sprintf("更新%s（触发：%s）%s", statusLabel, trigger, snap.Message)
 		if snap.Status == string(CRSStatusFailed) {
-			RecordAuditLog("system", "更新失败", "CRS规则库", detail, "")
+			RecordAuditLog(operator, "更新失败", "CRS规则库", detail, "")
 		} else {
-			RecordAuditLog("system", "更新", "CRS规则库", detail, "")
+			RecordAuditLog(operator, "更新", "CRS规则库", detail, "")
 		}
 	}()
 
 	runStarted := time.Now().UTC()
-	histRun := taskengine.RecordRunStart("crs", "security", trigger)
-	defer func() {
-		status := string(m.StatusSnapshot().Status)
-		taskengine.RecordRunFinish(histRun, status, time.Since(runStarted).Milliseconds(), "")
-	}()
+	histRun := int64(0)
+	engineRecorded := rc != nil && rc.RunID > 0
+	if engineRecorded {
+		histRun = rc.RunID // 引擎已记——跳过自记（P2-④ 单写方，行终态由引擎落）
+	} else {
+		histRun = taskengine.RecordRunStart("crs", "security", trigger)
+	}
+	if !engineRecorded {
+		defer func() {
+			status := string(m.StatusSnapshot().Status)
+			taskengine.RecordRunFinish(histRun, status, time.Since(runStarted).Milliseconds(), "")
+		}()
+	}
 	runCtx, runCancel := context.WithCancel(context.Background())
 	m.mu.Lock()
 	m.runCancel = runCancel
@@ -306,7 +329,6 @@ func (m *CRSUpdateManager) run(trigger string) {
 		// 此前从有值退化为空串,状态端点数据不自洽。
 		m.state.version = currentCRSVersion()
 		m.mu.Unlock()
-		RecordAuditLog("system", "更新", "CRS规则库", FormatAuditDetail("已是最新版本 "+tag, AuditResultPart("success")), "")
 		return
 	}
 
@@ -346,7 +368,6 @@ func (m *CRSUpdateManager) run(trigger string) {
 	writeCRSUpdateLog("INFO", string(CRSStatusSuccess), fmt.Sprintf("CRS 已更新到 %s", tag))
 	// 复审裁定 3：清理 M24 之前版本残留在 live 目录的瞬态工件（仅更新成功后执行）
 	m.cleanupLegacyCRSTransient()
-	RecordAuditLog("system", "更新", "CRS规则库", FormatAuditDetail("版本："+tag, AuditResultPart("success")), "")
 }
 
 func (m *CRSUpdateManager) fail(cause error, restore bool) {
@@ -360,10 +381,8 @@ func (m *CRSUpdateManager) fail(cause error, restore bool) {
 			}
 		}
 	}
-	// 连续失败计数 +1：仅首次失败写操作审计，后续重试只写组件日志（R35 I1），
-	// 避免代理持续故障时每小时刷一条操作日志稀释审计线索。
-	// 先读当前计数，审计判定用「当前计数+1」（与 UPDATE 落库同一数值来源）：
-	// UPDATE 失败时判定不会回退到旧计数，避免第 2 次失败重复写审计（R36 F3）。
+	// 连续失败计数 +1（失败趋势可观测；操作审计由 run 的 defer 单记——
+	// U1-P3-2 收敛后内联首败审计已撤）。
 	var failures int
 	if err := db.DB.QueryRow("SELECT consecutive_failures FROM security_crs_version WHERE id=1").Scan(&failures); err != nil {
 		failures = 0 // 计数读取失败时保守按首次失败处理（审计照常写入）
@@ -380,9 +399,6 @@ func (m *CRSUpdateManager) fail(cause error, restore bool) {
 	m.state.finishedAt = time.Now().UTC()
 	m.mu.Unlock()
 	writeCRSUpdateLog("ERROR", string(CRSStatusFailed), cause.Error())
-	if failures+1 <= 1 {
-		RecordAuditLog("system", "更新", "CRS规则库", FormatAuditDetail(cause.Error(), AuditResultPart("failed")), "")
-	}
 }
 
 // downloadTarballLogged 包装下载 seam 写更新日志（R57）：开始行由下载函数的

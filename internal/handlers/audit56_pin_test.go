@@ -30,7 +30,7 @@ func TestGetAuditLogs_invalidTimeFilterRejected(t *testing.T) {
 func TestRunAutoBackupOnce_returnsCreatedRowView(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
 	// When
-	view, err := h.RunAutoBackupOnce("manual", "system")
+	view, err := h.RunAutoBackupOnce("manual", "system", 0)
 	if err != nil {
 		t.Fatalf("RunAutoBackupOnce: %v", err)
 	}

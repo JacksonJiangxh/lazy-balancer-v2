@@ -72,7 +72,7 @@ func TestIP2RegionUpdateRun_success(t *testing.T) {
 	m.reloader = func() error { reloads++; return nil }
 
 	// When a manual update runs to completion
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then the DB row reflects success at the new version
 	version, status, message, finishedAt, _, _, _ := ip2RegionVersionRow(t)
@@ -116,7 +116,7 @@ func TestIP2RegionUpdateRun_skipWhenSameVersion(t *testing.T) {
 	m.reloader = func() error { reloads++; return nil }
 
 	// When an update finds the same commit
-	m.run("auto")
+	m.run("auto", nil)
 
 	// Then nothing is downloaded and no reload happens
 	if downloadCalled {
@@ -145,7 +145,7 @@ func TestIP2RegionUpdateRun_fetchFailure(t *testing.T) {
 	m.reloader = func() error { reloads++; return nil }
 
 	// When the commit check fails
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then the row is marked failed, nothing downloaded or reloaded
 	_, status, message, finishedAt, lastChecked, _, _ := ip2RegionVersionRow(t)
@@ -183,7 +183,7 @@ func TestIP2RegionUpdateRun_invalidDownloadFails(t *testing.T) {
 	m.reloader = func() error { reloads++; return nil }
 
 	// When the downloaded file fails validation
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then the update fails and the old live file is untouched
 	_, status, _, _, _, _, _ := ip2RegionVersionRow(t)
@@ -225,7 +225,7 @@ func TestIP2RegionUpdateRun_reloadFailureRollsBackXDB(t *testing.T) {
 	}
 
 	// When 安装后首次 reload 失败
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then 旧 xdb 已还原、.bak 被回滚消费、reloader 重试一次、状态 failed
 	data, err := os.ReadFile(ip2regionLivePath)
@@ -263,7 +263,7 @@ func TestIP2RegionUpdateRun_staleBakNotConsumedByRollback(t *testing.T) {
 	m.reloader = func() error { reloads++; return errors.New("reload boom") }
 
 	// When 安装成功但 reloader 持续失败
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then 陈旧 .bak 原样保留（未被回滚消费），live 不被还原到陈旧副本；
 	// 无基线可用时按 fail-open 记 success+新 tag（R44 F1）
@@ -321,7 +321,7 @@ func TestIP2RegionUpdateRun_reloadFailureFallsBackToDistOnFreshInstall(t *testin
 	}
 
 	// When 安装成功但 reloader 首次失败
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then dist 基线已复制回 live、reloader 重试一次、DB 记 failed+旧版本
 	// （unknown），磁盘/内存/DB 三方一致（均为「更新前状态」）
@@ -361,7 +361,7 @@ func TestIP2RegionUpdateRun_reloadFailureFailOpenWhenNoBaseline(t *testing.T) {
 	m.reloader = func() error { reloads++; return errors.New("reload boom") }
 
 	// When 安装成功、reloader 持续失败、且无任何基线可回退
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then DB 按成功落库（fail-open），live 保留新库，版本列追上新 tag
 	version, status, message, _, _, _, _ := ip2RegionVersionRow(t)
@@ -411,7 +411,7 @@ func TestIP2RegionUpdateRun_installReloadFailureGoesToRollback(t *testing.T) {
 	m.reloader = func() error { reloads++; return nil }
 
 	// When 安装后内存热换失败
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then 走回滚路径：live 还原为旧库、.bak 被消费、DB 记 failed+旧版本且
 	// message 注明热换失败；reloader 在热换失败时不做无谓的首次调用，仅在
@@ -469,7 +469,7 @@ func TestIP2RegionUpdateRun_rollbackReloadSkippedWhenReloaderNil(t *testing.T) {
 	m.reloader = nil
 
 	// When 安装热换失败 → 回滚 restored 分支（nil reloader 不得 panic）
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then 磁盘回滚、.bak 消费、DB 记 failed+旧版本
 	data, err := os.ReadFile(ip2regionLivePath)
@@ -537,7 +537,7 @@ func TestIP2RegionUpdateRun_rollbackRenameSuccessReloadFailKeepsBaseline(t *test
 	}
 
 	// When 安装后 reloader 首次失败、rename 还原后的热换被注入失败
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then 不升级：live=更新前基线（非 dist 内容）、.bak 被 rename 消费、
 	// reloader 重试一次、DB 记 failed+旧版本（磁盘/DB 一致）
@@ -621,7 +621,7 @@ func TestIP2RegionUpdateRun_rollbackCopySuccessReloadFailKeepsBaseline(t *testin
 	}
 
 	// When 安装后 reloader 首次失败、copy 还原后的热换被注入失败
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then 不升级到 dist：live=更新前基线（非 dist 内容）、.bak 被清理（与
 	// rename 消费语义对齐）、reloader 重试一次、DB 记 failed+旧版本
@@ -695,7 +695,7 @@ func TestIP2RegionUpdateRun_rollbackDistCopySuccessReloadFailKeepsBaseline(t *te
 	m.reloader = func() error { reloads++; return errors.New("reload boom") }
 
 	// When 安装热换失败、dist copy 落盘成功但 dist 级热换失败
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then 不 fail-open：live=dist 基线、DB 记 failed+旧版本（磁盘/DB 一
 	// 致），message 保留热换失败注记；reloader 在回滚后补一次重试
@@ -756,7 +756,7 @@ func TestIP2RegionUpdateRun_rollbackRenameFailureFallsBackToCopy(t *testing.T) {
 	}
 
 	// When 安装后首次 reload 失败、.bak rename 被注入失败
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then copyFile 升级还原成功：live 回到旧库内容、.bak 被清理（与 rename 消
 	// 费语义对齐）、reloader 重试一次、DB 记 failed+旧版本（三方一致）
@@ -818,7 +818,7 @@ func TestIP2RegionUpdateRun_rollbackAllBaselinesFailFailOpen(t *testing.T) {
 	}
 
 	// When 安装成功但 reloader 持续失败、且全部回滚基线均失败
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then 调用方走 fail-open：DB 记 success+新 tag，message 保留重载失败警告
 	// 并注明 Caddy 侧待下次重载生效；.bak 未被消费（保全副本）；fail-open 路径
@@ -861,14 +861,14 @@ func TestStartIP2RegionUpdate_conflictWhenRunning(t *testing.T) {
 	m.downloadXDB = func(context.Context, string, string, downloadProgressFunc) error { return nil }
 
 	// Given a running update
-	if _, err := m.StartUpdate("manual"); err != nil {
+	if _, err := m.StartUpdate("manual", nil); err != nil {
 		t.Fatal(err)
 	}
 	<-entered
 
 	// When a second update is requested
 	// Then it is rejected with ErrIP2RegionUpdateRunning
-	if _, err := m.StartUpdate("manual"); !errors.Is(err, ErrIP2RegionUpdateRunning) {
+	if _, err := m.StartUpdate("manual", nil); !errors.Is(err, ErrIP2RegionUpdateRunning) {
 		t.Fatalf("StartUpdate()=%v, want ErrIP2RegionUpdateRunning", err)
 	}
 	if !m.IsRunning() {
@@ -1017,27 +1017,21 @@ func TestSetIP2RegionAutoUpdate_preservesVersion(t *testing.T) {
 func countIP2RegionFailedAudits(t *testing.T) int {
 	t.Helper()
 	var n int
-	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE resource='IP数据库' AND action='更新' AND detail LIKE '%结果：失败%'").Scan(&n); err != nil {
+	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE resource='IP数据库' AND action='更新失败'").Scan(&n); err != nil {
 		t.Fatalf("count failed audit entries: %v", err)
 	}
 	return n
 }
 
-func TestIP2RegionUpdateFail_auditsOnlyFirstFailure(t *testing.T) {
+// R62 U1-P3-2（2026-09-29 裁定口径）：操作审计由 run() 的 defer 每轮单记——
+// fail() 本体零审计（曾内联「仅首败审计」R35 I1，与 defer 双记已撤）。
+func TestIP2RegionUpdateFail_auditRecordedByRunDeferPerRun(t *testing.T) {
 	m := newTestIP2RegionManager(t)
 	seedIP2RegionVersionRow(t, "v3.0.0", true)
 
-	// Given a first consecutive failure: audited once (counter 0 → 1)
 	m.fail(errors.New("第一次失败"))
-	if got := countIP2RegionFailedAudits(t); got != 1 {
-		t.Fatalf("failed audits after 1st failure = %d, want 1", got)
-	}
-
-	// When the second consecutive failure occurs (counter 1 → 2)
-	// Then no duplicate audit is written (R36 F3)
-	m.fail(errors.New("第二次失败"))
-	if got := countIP2RegionFailedAudits(t); got != 1 {
-		t.Fatalf("failed audits after 2nd failure = %d, want 1 (no duplicate)", got)
+	if got := countIP2RegionFailedAudits(t); got != 0 {
+		t.Fatalf("fail() 直调应零审计, got %d", got)
 	}
 }
 
@@ -1092,7 +1086,7 @@ func TestIP2RegionUpdate_recordsReloadAudit(t *testing.T) {
 	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.1.0", nil }
 	m.downloadXDB = fakeIP2RegionDownload(t, true)
 	m.reloader = func() error { return nil }
-	m.run("manual")
+	m.run("manual", nil)
 
 	var n int
 	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE action='重载' AND resource='Caddy服务' AND detail LIKE '%IP 库更新%'").Scan(&n); err != nil {
@@ -1109,7 +1103,7 @@ func TestIP2RegionUpdate_recordsReloadFailureAudit(t *testing.T) {
 	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.1.0", nil }
 	m.downloadXDB = fakeIP2RegionDownload(t, true)
 	m.reloader = func() error { return errors.New("reload boom") }
-	m.run("manual")
+	m.run("manual", nil)
 
 	// 主重载失败 + 回滚后的恢复重载失败 = 2 行「重载失败」
 	var n int

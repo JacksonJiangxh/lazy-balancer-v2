@@ -202,13 +202,8 @@
 
     <el-dialog v-model="ruleDialogVisible" width="min(760px, 94vw)" class="custom-rule-dialog" top="6vh">
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon dialog-header__icon--danger"><el-icon :size="18"><Filter /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">{{ editingRuleId ? (isReadOnly ? '查看自定义规则' : '编辑自定义规则') : '新建自定义规则' }}</div>
-            <div class="dialog-header__subtitle">按请求特征匹配并执行拦截 / 记录 / 计分动作，多条件为 AND 关系</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Filter" :title="editingRuleId ? (isReadOnly ? '查看自定义规则' : '编辑自定义规则') : '新建自定义规则'"
+          subtitle="按请求特征匹配并执行拦截 / 记录 / 计分动作，多条件为 AND 关系" tone="danger" />
       </template>
       <el-form :model="ruleForm" label-width="80px" label-position="right" :disabled="isReadOnly">
         <el-form-item label="名称" required>
@@ -309,13 +304,8 @@
 
     <el-dialog v-model="ipListDialogVisible" width="min(900px, 94vw)" class="ip-list-dialog" top="6vh">
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon"><el-icon :size="18"><List /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">{{ editingIpListId ? (ipListDialogReadOnly ? '查看 IP 地址列表' : '编辑 IP 地址列表') : '新建 IP 地址列表' }}</div>
-            <div class="dialog-header__subtitle">可复用 IP/CIDR 集合，供安全策略引用（黑白名单 / 信任名单）</div>
-          </div>
-        </div>
+        <DialogHeader :icon="List" :title="editingIpListId ? (ipListDialogReadOnly ? '查看 IP 地址列表' : '编辑 IP 地址列表') : '新建 IP 地址列表'"
+          subtitle="可复用 IP/CIDR 集合，供安全策略引用（黑白名单 / 信任名单）" />
       </template>
       <el-form :model="ipListForm" label-width="80px" label-position="right" :disabled="ipListDialogReadOnly" v-loading="loadingIpListDetail">
         <el-form-item label="名称" required>
@@ -398,13 +388,7 @@
       @closed="onUpdateDialogClosed"
     >
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon lib-icon--crs"><el-icon :size="18"><Lock /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">更新 CRS 规则库</div>
-            <div class="dialog-header__subtitle">OWASP 核心规则集的更新任务与更新日志</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Lock" title="更新 CRS 规则库" subtitle="OWASP 核心规则集的更新任务与更新日志" tone-class="lib-icon--crs" />
       </template>
       <RuleLibScheduleEditor
         :days="crsInfo.schedule_days"
@@ -436,13 +420,7 @@
       @closed="onIP2RegionUpdateDialogClosed"
     >
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon lib-icon--ip"><el-icon :size="18"><Location /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">更新 IP 库</div>
-            <div class="dialog-header__subtitle">IP2Region 地理归属数据库的更新任务与更新日志</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Location" title="更新 IP 库" subtitle="IP2Region 地理归属数据库的更新任务与更新日志" tone-class="lib-icon--ip" />
       </template>
       <RuleLibScheduleEditor
         :days="ip2regionInfo.schedule_days"
@@ -474,13 +452,7 @@
       @closed="onThreatUpdateDialogClosed"
     >
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon lib-icon--threat"><el-icon :size="18"><Aim /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">更新威胁情报库</div>
-            <div class="dialog-header__subtitle">三个内置恶意 IP 源的更新任务与更新日志</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Aim" title="更新威胁情报库" subtitle="三个内置恶意 IP 源的更新任务与更新日志" tone-class="lib-icon--threat" />
       </template>
       <el-table :data="threatSources" size="small" class="threat-source-table">
         <el-table-column label="来源" min-width="260">
@@ -541,6 +513,7 @@ import { formatDate } from '@/utils/date'
 import { compareVersion, IP_LIST_CATEGORIES} from '@/utils/securityStages'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import RuleLibScheduleEditor from '@/components/RuleLibScheduleEditor.vue'
+import DialogHeader from '@/components/DialogHeader.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
 import { showSaveResult } from '@/utils/saveResult'
@@ -1378,16 +1351,10 @@ onUnmounted(() => {
 .rule-condition-row:hover { border-color: #d1d5db; }
 .rule-condition-row .el-button--danger { margin-left: auto; }
 
-/* ── 通用弹框头部(icon + 标题 + 副标题)── */
-.dialog-header { display: flex; align-items: flex-start; gap: 12px; }
-.dialog-header__icon {
-  flex-shrink: 0; width: 36px; height: 36px; border-radius: 8px;
-  background: #ecf5ff; color: #409eff;
-  display: flex; align-items: center; justify-content: center;
-}
-.dialog-header__icon--danger { background: #fef0f0; color: #f56c6c; }
-.dialog-header__title { font-size: 16px; font-weight: 600; color: var(--text-primary, #111827); line-height: 1.4; }
-.dialog-header__subtitle { font-size: 12px; color: var(--text-secondary, #6b7280); margin-top: 2px; }
+/* 弹框头库专属色（DialogHeader tone-class 透传；:deep 穿透子组件——本页弹框未 append-to-body） */
+:deep(.dh-icon.lib-icon--crs) { background: #eff6ff; color: #3b82f6; }
+:deep(.dh-icon.lib-icon--ip) { background: #f0fdfa; color: #0d9488; }
+:deep(.dh-icon.lib-icon--threat) { background: #fff1f2; color: #e11d48; }
 .add-condition-btn { margin-top: 4px; }
 .pattern-col { flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 6px; }
 .pattern-input-row { display: flex; align-items: center; gap: 6px; }

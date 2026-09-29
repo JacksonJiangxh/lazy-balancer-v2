@@ -25,18 +25,18 @@ var (
 	autoBackupDone   chan struct{}
 
 	autoBackupExecMu     sync.Mutex
-	autoBackupExecutor   func(trigger, operator string) error
+	autoBackupExecutor   func(trigger, operator string, engineRunID int64) error
 	autoBackupTickWindow = time.Minute
 )
 
 // SetAutoBackupExecutor 注入备份执行器（main.go 装配 handlers 实现；nil 解除）。
-func SetAutoBackupExecutor(fn func(trigger, operator string) error) {
+func SetAutoBackupExecutor(fn func(trigger, operator string, engineRunID int64) error) {
 	autoBackupExecMu.Lock()
 	autoBackupExecutor = fn
 	autoBackupExecMu.Unlock()
 }
 
-func currentAutoBackupExecutor() func(trigger, operator string) error {
+func currentAutoBackupExecutor() func(trigger, operator string, engineRunID int64) error {
 	autoBackupExecMu.Lock()
 	defer autoBackupExecMu.Unlock()
 	return autoBackupExecutor
@@ -177,7 +177,7 @@ func autoBackupTick(now time.Time) {
 	// 引擎运行历史：真实备份执行落 task_runs（探测轮静默，此处才是任务本体）
 	runID := taskengine.RecordRunStart("auto-backup", "backup", "auto")
 	t0 := time.Now()
-	execErr := exec("schedule", "system")
+	execErr := exec("schedule", "system", runID) // runID=tick 已记行——执行器跳过自记（P2-④ 单写方）
 	status, msg := "success", ""
 	if execErr != nil {
 		status, msg = "failed", execErr.Error()

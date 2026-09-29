@@ -3,13 +3,8 @@
   <el-dialog :model-value="modelValue" width="min(720px, 92vw)" :close-on-click-modal="false"
     destroy-on-close append-to-body class="oidc-dialog" @update:model-value="emit('update:modelValue', $event)">
     <template #header>
-      <div class="oidc-dialog-header">
-        <el-icon class="oidc-dialog-icon"><Connection /></el-icon>
-        <div>
-          <div class="oidc-dialog-title">登录认证（OIDC）</div>
-          <div class="oidc-dialog-sub">{{ configured ? (enabled ? '已启用——登录页展示认证服务入口' : '已配置未启用') : '配置企业认证服务,本地账号登录始终保留' }}</div>
-        </div>
-      </div>
+      <DialogHeader :icon="Connection" title="登录认证（OIDC）"
+        :subtitle="configured ? (enabled ? '已启用——登录页展示认证服务入口' : '已配置未启用') : '配置企业认证服务,本地账号登录始终保留'" />
     </template>
     <div v-if="!configured" class="info-note-bar"><span class="info-note-desc">通过企业认证服务（OIDC）登录——配置仅 3 项，端点自动发现；本地账号登录始终保留。</span></div>
     <el-alert v-else-if="enabled" type="success" :closable="false" class="mb12"
@@ -99,6 +94,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CircleCheckFilled, CircleCloseFilled, Connection } from '@element-plus/icons-vue'
+import DialogHeader from '@/components/DialogHeader.vue'
 import { request, ApiRequestError } from '@/utils/api'
 import { copyText } from '@/utils/copy'
 import { useAuthStore } from '@/stores/auth'
@@ -294,15 +290,6 @@ const copy = async (text: string) => {
 
 <style scoped>
 .mb12 { margin-bottom: 12px; }
-.oidc-dialog-header { display: flex; align-items: center; gap: 12px; }
-.oidc-dialog-icon {
-  width: 38px; height: 38px; border-radius: 10px;
-  display: flex; align-items: center; justify-content: center;
-  background: var(--el-color-primary-light-9); color: var(--el-color-primary);
-  font-size: 18px; flex-shrink: 0;
-}
-.oidc-dialog-title { font-size: 16px; font-weight: 600; color: var(--el-text-color-primary); }
-.oidc-dialog-sub { font-size: 12.5px; color: var(--el-text-color-secondary); margin-top: 2px; }
 .oidc-step {
   display: flex; gap: 10px;
   border: 1px solid var(--el-border-color-lighter); border-radius: 10px;

@@ -1,7 +1,9 @@
 package handlers
 
-// U2-6（第 45 轮审计）基线钉：timestampedRotations/dirBytes 的轮转家族形状判定
+// U2-6（第 45 轮审计）基线钉：timestampedRotationStats/dirBytes 的轮转家族形状判定
 // 当前实现正确，本测试钉住四形状防回归（基线钉，非 RED——报告注明）。
+// （U4-P3-1 改靶：原靶 timestampedRotations/mustSecond 生产死代码已删，
+// 四形状断言经 dirBytes 不变。）
 // 文件名形状按 logstats.go 实读实现构造（R-8 验证源直取）：
 //   - 运行日志族：<base>.YYYYMMDD-HHMMSS（rest 恰 16 字符：. + 8 数字 + - + 6 数字）
 //   - timberjack 族：<stem>-<ts>-size.log[.gz]（ts 首字符为数字）
@@ -14,7 +16,7 @@ import (
 	"testing"
 )
 
-func TestTimestampedRotations_familyShapes(t *testing.T) {
+func TestTimestampedRotationStats_familyShapes(t *testing.T) {
 	cases := []struct {
 		name        string
 		base        string

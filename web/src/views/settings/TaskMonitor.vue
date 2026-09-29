@@ -131,7 +131,7 @@
               :disabled="!isAdmin"
               @change="() => onControl(row)"
             />
-            <el-switch v-else-if="toggleable(row.id)" :model-value="row.enabled" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
+            <el-switch v-else-if="row.toggleable" :model-value="row.enabled" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
             <el-switch v-else :model-value="row.enabled" disabled />
           </template>
         </el-table-column>
@@ -226,7 +226,7 @@
         </el-descriptions>
         <div v-if="detailTask.last_run?.message" class="tm-detail-msg">{{ detailTask.last_run.message }}</div>
         <template v-if="history.length">
-          <div class="tm-detail-section">运行历史（最近 {{ history.length }} 次）</div>
+          <div class="tm-detail-section">{{ historyTitle }}</div>
           <el-table :data="history" size="small" max-height="240" class="tm-nowrap-table">
             <el-table-column prop="started_at" label="开始" width="160">
               <template #default="{ row }">{{ fmtTime(row.started_at) }}</template>
@@ -281,6 +281,7 @@ import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { statusColor } from '@/utils/chartTheme'
+import { certJobStatusLabel, type CertJobStatus } from '@/utils/certJobStatus'
 import DialogHeader from '@/components/DialogHeader.vue'
 import type { APIResponse } from '@/types'
 
@@ -290,7 +291,7 @@ interface TaskRunInfo { started_at: string; finished_at: string; duration_ms: nu
 interface TaskInfo {
   id: string; name: string; description?: string; cadence?: string; category: string
   kind: 'scheduled' | 'continuous' | 'queue' | 'info' | 'oneshot'
-  status: string; enabled: boolean; cancellable: boolean; controllable?: boolean; triggerable?: boolean
+  status: string; enabled: boolean; cancellable: boolean; controllable?: boolean; triggerable?: boolean; toggleable?: boolean
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
 }
 interface RunRecord {
@@ -418,9 +419,6 @@ const statsBarOption = computed<EChartsOption>((): EChartsOption => {
 })
 
 // ===== 操作 =====
-const toggleableIds = new Set(['threat', 'crs', 'ip2region'])
-const toggleable = (id: string) => toggleableIds.has(id)
-
 const onTrigger = async (row: TaskInfo) => {
   try {
     await ElMessageBox.confirm(`立即执行「${row.name}」？`, '手动触发', { type: 'info', confirmButtonText: '执行' })
@@ -467,11 +465,35 @@ const detailTone = computed((): 'primary' | 'success' | 'warning' | 'danger' | u
   if (st === 'stopped' || st === 'disabled') return 'warning'
   return undefined
 })
+const isCertJobRow = (id: string): boolean => id.startsWith('cert-job:')
+// cert-job 动态行无引擎运行历史——历史区域接 cert_jobs 数据源（每规则+域名
+// 单行在册，展示该签发任务当前记录）
+const historyTitle = computed(() =>
+  detailTask.value && isCertJobRow(detailTask.value.id) ? '签发任务记录（cert_jobs）' : `运行历史（最近 ${history.value.length} 次）`)
+// cert-job 详情数据源（GET /certificates/jobs/:id——与 CertJobs 页同源字段）
+interface CertJobDetail { id: number; rule_id: string; domain: string; status: string; message: string; created_at?: string; updated_at?: string | null }
+const fetchCertJobHistory = async (jobId: number): Promise<RunRecord[]> => {
+  const res = await request.get<APIResponse<CertJobDetail>>(`/certificates/jobs/${jobId}`, { silent: true })
+  const j = res.data
+  if (!j) return []
+  const start = j.created_at ? Date.parse(j.created_at) : NaN
+  const end = j.updated_at ? Date.parse(j.updated_at) : NaN
+  return [{
+    id: j.id, task_id: `cert-job:${j.id}`, family: 'cert-job', trigger: 'queue', status: j.status,
+    started_at: j.created_at || '', finished_at: j.updated_at || '',
+    duration_ms: !isNaN(start) && !isNaN(end) && end > start ? end - start : 0,
+    message: j.message || undefined,
+  }]
+}
 const openDetail = async (row: TaskInfo) => {
   detailTask.value = row
   detailVisible.value = true
   history.value = []
   try {
+    if (isCertJobRow(row.id)) {
+      history.value = await fetchCertJobHistory(Number(row.id.slice(9)))
+      return
+    }
     const res = await request.get<APIResponse<{ runs: RunRecord[] }>>(`/system/tasks/${row.id}/history`, { silent: true })
     history.value = res.data?.runs || []
   } catch { /* 无历史族静默 */ }
@@ -523,7 +545,10 @@ const categoryTagType = (c: string): 'primary' | 'success' | 'warning' | 'info' 
   c === '安全防护' ? 'primary' : c === '证书' ? 'success' : c === '备份' ? 'warning' : c === '触发' ? 'info' : 'info'
 const triggerLabels: Record<string, string> = { manual: '手动', auto: '自动', schedule: '排程', queue: '队列', 'slave-sync': '从节点同步', startup: '启动' }
 const triggerLabel = (t: string) => triggerLabels[t] || t || '—'
-const statusResultLabel = (r: string): string => ({ success: '成功', failed: '失败', cancelled: '已取消', interrupted: '中断', running: '运行中' }[r] || r)
+// 结果串双源：引擎 task_runs 结果（success/failed/…/skipped）+ cert-job 动态行
+// 的 cert_jobs 状态机（issued/validating/…）——前者未命中时回退 certJobStatusLabel
+const statusResultLabel = (r: string): string =>
+  ({ success: '成功', failed: '失败', cancelled: '已取消', interrupted: '中断', running: '运行中', skipped: '已跳过' }[r] ?? certJobStatusLabel(r as CertJobStatus))
 const resultTagType = (r: string): 'success' | 'danger' | 'info' | 'warning' =>
   r === 'success' || r === 'issued' ? 'success' : r === 'failed' ? 'danger' : r === 'cancelled' ? 'warning' : 'info'
 
@@ -574,6 +599,7 @@ const fmtDuration = (ms?: number) => {
 .tm-cq-dot--queued, .tm-cq-dot--pending { background: #fbbf24; }
 .tm-cq-dot--waiting_ca { background: #38e1ff; }
 .tm-cq-idle { font-size: 12.5px; color: #9aa0b5; }
+.tm-cq-more { font-size: 12px; color: #9aa0b5; text-align: center; padding-top: 4px; }
 
 .tm-chart { height: 230px; width: 100%; }
 .tm-skeleton { background: linear-gradient(90deg, rgba(0,0,0,.03) 25%, rgba(0,0,0,.06) 50%, rgba(0,0,0,.03) 75%); background-size: 200% 100%; animation: tm-shimmer 1.2s infinite; border-radius: 8px; }
@@ -596,19 +622,6 @@ const fmtDuration = (ms?: number) => {
 .tm-ok { color: #34d399; font-weight: 600; }
 .tm-bad { color: #f87171; font-weight: 600; }
 .tm-pagination { display: flex; justify-content: flex-end; margin-top: 12px; }
-.tm-cq-summary { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: #6b7280; }
-.tm-cq-item b { font-weight: 700; color: #111827; margin-left: 2px; }
-.tm-c-run { color: #4f8cff !important; } .tm-c-wait { color: #38e1ff !important; } .tm-c-fail { color: #f87171 !important; } .tm-c-ok { color: #34d399 !important; }
-.tm-cq-sep { color: #d1d5db; }
-.tm-cq-tag { margin-left: 8px; }
-.tm-cq-skeleton { height: 60px; border-radius: 8px; }
-.tm-cq-row { display: grid; grid-template-columns: 1fr 130px 120px 170px; align-items: center; padding: 9px 4px; font-size: 12.5px; }
-.tm-cq-row-head { font-size: 12px; color: #6b7280; border-bottom: 1px solid #e5e7eb; }
-.tm-cq-table > .tm-cq-row:not(.tm-cq-row-head) { border-bottom: 1px solid #f9fafb; }
-.tm-cert-domain { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tm-cq-ca { color: #6b7280; }
-.tm-cert-time { color: #6b7280; text-align: right; }
-.tm-cert-none { font-size: 12.5px; color: #6b7280; padding: 12px 4px; }
 
 /* tooltip 提示 */
 :global(.tm-name-tip) { max-width: 380px; }
@@ -631,9 +644,4 @@ const fmtDuration = (ms?: number) => {
 .tm-log-content { margin: 0; color: #e2e8f0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; line-height: 1.7; white-space: pre-wrap; }
 .tm-log-stage { font-size: 11px; color: var(--el-text-color-secondary); margin-bottom: 2px; text-transform: uppercase; letter-spacing: .5px; }
 </style>
-.tm-cq-card :deep(.el-card__body) { padding: 10px 16px; }
-.tm-cq-body { display: flex; flex-direction: column; gap: 4px; height: 186px; overflow: auto; }
-.tm-cq-live { font-size: 12px; color: #6b7280; font-weight: 400; margin-left: 10px; }
-.tm-cq-live-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 12.5px; padding: 5px 8px; background: #f9fafb; border-radius: 6px; }
-.tm-cq-more { font-size: 12px; color: #9aa0b5; text-align: center; padding-top: 4px; }
-.tm-cq-empty { align-items: center; justify-content: center; color: #6b7280; font-size: 12.5px; gap: 8px; }
+

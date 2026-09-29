@@ -75,13 +75,8 @@
 
     <el-dialog v-model="dialogVisible" width="min(960px, 94vw)" top="3vh" class="dialog-body-inset">
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon dialog-header__icon--warning"><el-icon :size="18"><Document /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">{{ dialogTitle }}</div>
-            <div class="dialog-header__subtitle">命中拦截规则时返回给客户端的响应页面，支持自定义内容类型</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Document" :title="dialogTitle" tone="warning"
+          subtitle="命中拦截规则时返回给客户端的响应页面，支持自定义内容类型" />
       </template>
       <el-form :model="form" label-width="80px" label-position="right" class="block-page-form">
         <el-form-item label="名称" required>
@@ -129,6 +124,7 @@ import { useAuthStore } from '@/stores/auth'
 import { formatDate } from '@/utils/date'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import CodeEditor from '@/components/CodeEditor.vue'
+import DialogHeader from '@/components/DialogHeader.vue'
 import type { APIResponse, UserListItem } from '@/types'
 interface BlockPage { id: number; name: string; description: string; content: string; content_type?: string; rule_ref_count?: number; is_default: boolean; is_builtin?: boolean; updated_at: string; updated_by: number }
 
@@ -255,18 +251,6 @@ onMounted(fetchData)
 </script>
 
 <style scoped>
-/* ── 通用弹框头部 ── */
-/* 少数据时卡片高度随内容（2026-09-25 用户裁定：撤销 360px 定高——留白过多） */
-.dialog-header { display: flex; align-items: flex-start; gap: 12px; }
-.dialog-header__icon {
-  flex-shrink: 0; width: 36px; height: 36px; border-radius: 8px;
-  background: #ecf5ff; color: #409eff;
-  display: flex; align-items: center; justify-content: center;
-}
-.dialog-header__icon--warning { background: #fdf6ec; color: #e6a23c; }
-.dialog-header__title { font-size: 16px; font-weight: 600; color: var(--text-primary, #111827); line-height: 1.4; }
-.dialog-header__subtitle { font-size: 12px; color: var(--text-secondary, #6b7280); margin-top: 2px; }
-
 .block-content-editor { border: 1px solid #e4e7ed; border-radius: 6px; overflow: hidden; }
 .block-page-form .content-form-item .el-form-item__content { flex: 1; max-width: 100%; }
 

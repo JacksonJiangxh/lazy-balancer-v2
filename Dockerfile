@@ -67,6 +67,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Final image
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 ARG VERSION=v2.3.4
+# 构建机网络受限时经 --build-arg HTTP(S)_PROXY 透传给 RUN 下载步骤
+# （CRS/ip2region 钉版下载）；未传参时为空值，行为不变（官方惯例形态）。
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
 ENV APP_VERSION=${VERSION}
 # 安全修复：显式钉版 openssl=3.5.8-r0（CVE 修复版）——openssl 经 curl 的
 # libssl3/libcrypto3 依赖隐式装入，钉版保证镜像可复现且不携带旧版；

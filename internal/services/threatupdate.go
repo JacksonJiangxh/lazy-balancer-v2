@@ -133,8 +133,8 @@ func SetThreatReloader(fn func() error) {
 	threatReloader = fn
 }
 
-// StartUpdate 异步启动更新任务（单实例在飞）；返回完成通道。
-func (m *ThreatUpdateManager) StartUpdate(trigger string) (chan struct{}, error) {
+// StartUpdate 异步启动更新任务（单实例在飞）；返回完成通道。rc 语义同 CRS。
+func (m *ThreatUpdateManager) StartUpdate(trigger string, rc *taskengine.RunContext) (chan struct{}, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.running {
@@ -145,7 +145,7 @@ func (m *ThreatUpdateManager) StartUpdate(trigger string) (chan struct{}, error)
 	done := m.runDone
 	go func() {
 		defer close(done)
-		m.run(trigger)
+		m.run(trigger, rc)
 		m.mu.Lock()
 		m.running = false
 		m.mu.Unlock()
@@ -153,8 +153,9 @@ func (m *ThreatUpdateManager) StartUpdate(trigger string) (chan struct{}, error)
 	return done, nil
 }
 
-// RunUpdate 同步执行更新任务（测试与内部路径）。
-func (m *ThreatUpdateManager) RunUpdate(trigger string) error {
+// RunUpdate 同步执行更新任务（测试与内部路径）。rc 语义同 CRS StartUpdate
+// （RunID>0=引擎已记跳自记；Operator 审计归人）。
+func (m *ThreatUpdateManager) RunUpdate(trigger string, rc *taskengine.RunContext) error {
 	m.mu.Lock()
 	if m.running {
 		m.mu.Unlock()
@@ -167,7 +168,7 @@ func (m *ThreatUpdateManager) RunUpdate(trigger string) error {
 		m.running = false
 		m.mu.Unlock()
 	}()
-	m.run(trigger)
+	m.run(trigger, rc)
 	return nil
 }
 
@@ -225,7 +226,27 @@ func threatListEmpty(source string) bool {
 	return threatIplistMissing(source)
 }
 
-func (m *ThreatUpdateManager) run(trigger string) {
+func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
+	operator := "system"
+	if rc != nil && rc.Operator != "" {
+		operator = rc.Operator
+	}
+	// 任务自记审计（2026-09-29 用户裁定）：defer 在函数头注册（U2-P3-06——
+	// 曾注册在源循环后，角色早退/源读取失败/零源路径零审计、「skipped」映射
+	// 不可达）。
+	defer func() {
+		m.mu.Lock()
+		outcome := m.lastTaskOutcome
+		m.mu.Unlock()
+		detail := fmt.Sprintf("更新%s（触发：%s）", map[string]string{
+			"success": "成功", "failed": "失败", "cancelled": "已取消", "skipped": "跳过",
+		}[outcome], trigger)
+		if outcome == "failed" || outcome == "cancelled" {
+			RecordAuditLog(operator, "更新失败", "威胁情报库", detail, "")
+		} else {
+			RecordAuditLog(operator, "更新", "威胁情报库", detail, "")
+		}
+	}()
 	// 起点角色复查（第 59 轮 R59-P3，R54-N5 家族收敛）：调度器 tick 的 is_master
 	// 守卫与更新启动之间存在 demote 竞态窗口——从节点继续执行会写
 	// security_ip_lists 并触发重载，打破只读不变量。NULL 兜底归一为 1（同
@@ -241,14 +262,22 @@ func (m *ThreatUpdateManager) run(trigger string) {
 	}
 	runCtx, runCancel := context.WithCancel(context.Background())
 	runStarted := time.Now().UTC()
-	histRun := taskengine.RecordRunStart("threat", "security", trigger)
-	defer func() {
-		dur := time.Since(runStarted).Milliseconds()
-		m.mu.Lock()
-		outcome := m.lastTaskOutcome
-		m.mu.Unlock()
-		taskengine.RecordRunFinish(histRun, outcome, dur, "")
-	}()
+	histRun := int64(0)
+	engineRecorded := rc != nil && rc.RunID > 0
+	if engineRecorded {
+		histRun = rc.RunID // P2-④ 单写方：引擎已记，族体跳过自记与自收尾
+	} else {
+		histRun = taskengine.RecordRunStart("threat", "security", trigger)
+	}
+	if !engineRecorded {
+		defer func() {
+			dur := time.Since(runStarted).Milliseconds()
+			m.mu.Lock()
+			outcome := m.lastTaskOutcome
+			m.mu.Unlock()
+			taskengine.RecordRunFinish(histRun, outcome, dur, "")
+		}()
+	}
 	m.mu.Lock()
 	m.lastTrigger = trigger
 	m.lastStartedAt = runStarted.Format(crsTimeLayout)
@@ -292,21 +321,6 @@ func (m *ThreatUpdateManager) run(trigger string) {
 	}
 	m.mu.Lock()
 	m.lastFinishedAt = time.Now().UTC().Format(crsTimeLayout)
-	// 任务自记审计（2026-09-29 用户裁定）：执行语义归任务体——手动/自动
-	// 同一审计，触发源入详情；触发方(handler)不再补记。
-	defer func() {
-		m.mu.Lock()
-		outcome := m.lastTaskOutcome
-		m.mu.Unlock()
-		detail := fmt.Sprintf("更新%s（触发：%s）", map[string]string{
-			"success": "成功", "failed": "失败", "cancelled": "已取消", "skipped": "跳过",
-		}[outcome], trigger)
-		if outcome == "failed" || outcome == "cancelled" {
-			RecordAuditLog("system", "更新失败", "威胁情报库", detail, "")
-		} else {
-			RecordAuditLog("system", "更新", "威胁情报库", detail, "")
-		}
-	}()
 	if cancelled {
 		m.lastTaskOutcome = "cancelled"
 		m.lastCancelled = true

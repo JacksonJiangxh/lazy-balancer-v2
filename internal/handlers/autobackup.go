@@ -170,16 +170,32 @@ func pruneAutoBackups(dir string, keepSuccess, keepFailed int) {
 // 调度与手动同时触发时后到者立即报错，不排队。
 // operator 为审计操作者:调度路径传 system,手动触发传当前登录用户
 // (2026-09-20 用户反馈:手动备份审计恒 system,看不出是谁点的)。
-func (h *Handlers) RunAutoBackupOnce(trigger, operator string) (row autoBackupRowView, err error) {
-	// 引擎运行历史：手动备份同落 task_runs（与调度执行同口径）
-	histRun := taskengine.RecordRunStart("auto-backup", "backup", trigger)
+// engineRunID>0=调用方（引擎 runNow/调度 tick）已落 task_runs 行——本函数
+// 跳过自记自收尾（P2-④ 单写方，行终态由引擎按返回错误落）。
+func (h *Handlers) RunAutoBackupOnce(trigger, operator string, engineRunID int64) (row autoBackupRowView, err error) {
+	histRun := int64(0)
 	histT0 := time.Now()
+	if engineRunID <= 0 {
+		histRun = taskengine.RecordRunStart("auto-backup", "backup", trigger)
+		defer func() {
+			status, msg := "success", ""
+			if err != nil {
+				status, msg = "failed", err.Error()
+			}
+			taskengine.RecordRunFinish(histRun, status, time.Since(histT0).Milliseconds(), msg)
+		}()
+	}
+	// 任务日志 tee（U1-P3-6：手动/自动备份各阶段在 tasks/auto-backup.log 留痕）
+	backupTee := func(stage, msg string) {
+		taskengine.TeeTaskLog("auto-backup", time.Now().In(services.CurrentLocation()).Format("2006/01/02 15:04:05"), "INFO", stage, msg)
+	}
+	backupTee("backup", "备份开始（触发："+trigger+"）")
 	defer func() {
-		status, msg := "success", ""
 		if err != nil {
-			status, msg = "failed", err.Error()
+			backupTee("backup", "备份失败："+err.Error())
+		} else {
+			backupTee("backup", "备份完成")
 		}
-		taskengine.RecordRunFinish(histRun, status, time.Since(histT0).Milliseconds(), msg)
 	}()
 
 	if !autoBackupRunMu.TryLock() {
@@ -483,7 +499,7 @@ func (h *Handlers) RunAutoBackupNow(c *gin.Context) {
 	}
 	// 行视图由 RunAutoBackupOnce 在 TryLock 持有区内返回（第 56 轮 F4：解锁后
 	// 回查「最新 manual 行」在并发手动备份下会取到他人行）。
-	view, err := h.RunAutoBackupOnce("manual", operator)
+	view, err := h.RunAutoBackupOnce("manual", operator, 0)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "备份执行失败: " + err.Error()})
 		return

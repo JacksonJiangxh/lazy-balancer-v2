@@ -137,7 +137,8 @@ func currentIP2RegionVersion() string {
 // StartUpdate begins an async update; only one may run at a time. 返回本次 run
 // 的完成通道（R64 B-F2，与 CRS 侧同形）：调度器 rearm 须等待该捕获通道而非
 // 回读现行 m.runDone，防手动更新插队覆盖后的错等与误判。手动调用方可忽略。
-func (m *IP2RegionUpdateManager) StartUpdate(trigger string) (chan struct{}, error) {
+// rc 语义同 CRS（RunID>0=引擎已记跳自记；Operator 审计归人）。
+func (m *IP2RegionUpdateManager) StartUpdate(trigger string, rc *taskengine.RunContext) (chan struct{}, error) {
 	m.mu.Lock()
 	if m.running {
 		m.mu.Unlock()
@@ -151,7 +152,7 @@ func (m *IP2RegionUpdateManager) StartUpdate(trigger string) (chan struct{}, err
 
 	go func() {
 		defer close(done)
-		m.run(trigger)
+		m.run(trigger, rc)
 	}()
 	return done, nil
 }
@@ -175,26 +176,50 @@ func (m *IP2RegionUpdateManager) setStage(status IP2RegionUpdateStatus, message 
 }
 
 // run executes the full update pipeline synchronously.
-func (m *IP2RegionUpdateManager) run(trigger string) {
-	// 任务自记审计：手动/自动同一审计（用户裁定 2026-09-29）
+func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) {
+	operator := "system"
+	if rc != nil && rc.Operator != "" {
+		operator = rc.Operator
+	}
+	// 任务自记审计：手动/自动同一审计（用户裁定 2026-09-29）。defer 基准=
+	// 内存 state（U2-P3-05——曾读 DB 行，slave 早退路径不写行导致
+	// 「更新成功<上轮消息>」+task_runs success 双假；CRS 内存基准即正确形）。
 	defer func() {
-		var status, message string
-		_ = db.DB.QueryRow("SELECT COALESCE(update_status,'success'), COALESCE(message,'') FROM security_ip2region_version WHERE id=1").Scan(&status, &message)
-		detail := fmt.Sprintf("更新%s（触发：%s）%s", status, trigger, message)
-		if status == "failed" {
-			RecordAuditLog("system", "更新失败", "IP2Region数据库", detail, "")
+		m.mu.Lock()
+		status, message := string(m.state.status), m.state.message
+		m.mu.Unlock()
+		// 状态中文归一（U2-P5-08b：曾混英文 status token，与 threat 族口径不一）
+		statusLabel := map[string]string{
+			string(IP2RegionStatusSuccess): "成功", string(IP2RegionStatusFailed): "失败",
+			string(IP2RegionStatusIdle): "空闲", string(IP2RegionStatusChecking): "检测中",
+		}[status]
+		if statusLabel == "" {
+			statusLabel = status
+		}
+		detail := fmt.Sprintf("更新%s（触发：%s）%s", statusLabel, trigger, message)
+		if status == string(IP2RegionStatusFailed) {
+			RecordAuditLog(operator, "更新失败", "IP2Region数据库", detail, "")
 		} else {
-			RecordAuditLog("system", "更新", "IP2Region数据库", detail, "")
+			RecordAuditLog(operator, "更新", "IP2Region数据库", detail, "")
 		}
 	}()
 
 	runStarted := time.Now().UTC()
-	histRun := taskengine.RecordRunStart("ip2region", "security", trigger)
-	defer func() {
-		var status string
-		_ = db.DB.QueryRow("SELECT COALESCE(update_status,'success') FROM security_ip2region_version WHERE id=1").Scan(&status)
-		taskengine.RecordRunFinish(histRun, status, time.Since(runStarted).Milliseconds(), "")
-	}()
+	histRun := int64(0)
+	engineRecorded := rc != nil && rc.RunID > 0
+	if engineRecorded {
+		histRun = rc.RunID // P2-④ 单写方：引擎已记，族体跳过自记与自收尾
+	} else {
+		histRun = taskengine.RecordRunStart("ip2region", "security", trigger)
+	}
+	if !engineRecorded {
+		defer func() {
+			m.mu.Lock()
+			status := string(m.state.status)
+			m.mu.Unlock()
+			taskengine.RecordRunFinish(histRun, status, time.Since(runStarted).Milliseconds(), "")
+		}()
+	}
 	runCtx, runCancel := context.WithCancel(context.Background())
 	m.mu.Lock()
 	m.runCancel = runCancel
@@ -271,7 +296,6 @@ func (m *IP2RegionUpdateManager) run(trigger string) {
 		// 此前在「已是最新」时退化为空串（CRS 侧已修，本侧漏同步）。
 		m.state.version = currentIP2RegionVersion()
 		m.mu.Unlock()
-		RecordAuditLog("system", "更新", "IP数据库", FormatAuditDetail("已是最新版本 "+tag, AuditResultPart("success")), "")
 		return
 	}
 
@@ -378,7 +402,6 @@ func (m *IP2RegionUpdateManager) run(trigger string) {
 	m.state.finishedAt = time.Now().UTC()
 	m.mu.Unlock()
 	writeIP2RegionUpdateLog("INFO", string(IP2RegionStatusSuccess), fmt.Sprintf("ip2region 已更新到 %s", tag))
-	RecordAuditLog("system", "更新", "IP数据库", FormatAuditDetail("版本："+tag, AuditResultPart("success")), "")
 }
 
 func (m *IP2RegionUpdateManager) fail(cause error) {
@@ -403,7 +426,6 @@ func (m *IP2RegionUpdateManager) fail(cause error) {
 	m.mu.Unlock()
 	writeIP2RegionUpdateLog("ERROR", string(IP2RegionStatusFailed), cause.Error())
 	if failures+1 <= 1 {
-		RecordAuditLog("system", "更新", "IP数据库", FormatAuditDetail(cause.Error(), AuditResultPart("failed")), "")
 	}
 }
 
@@ -612,7 +634,6 @@ func (m *IP2RegionUpdateManager) successAfterReloadFailOpen(tag string, reloadEr
 	m.state.finishedAt = time.Now().UTC()
 	m.mu.Unlock()
 	writeIP2RegionUpdateLog("INFO", string(IP2RegionStatusSuccess), fmt.Sprintf("ip2region 已更新到 %s（%s）", tag, warn))
-	RecordAuditLog("system", "更新", "IP数据库", FormatAuditDetail("版本："+tag+"（"+warn+"）", AuditResultPart("success")), "")
 }
 
 // validateIP2RegionXDB opens the staged xdb and performs a probe search.

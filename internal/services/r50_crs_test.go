@@ -78,7 +78,7 @@ func TestCRSUpdateRun_successCleansRulesOldResidue(t *testing.T) {
 	})
 
 	// When 更新成功
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then rules.old 残留被成功路径清理
 	_, status, message, _, _, _, _ := crsVersionRow(t)
@@ -153,7 +153,7 @@ func TestIP2RegionUpdateRun_failOpenMessageCarriesRollbackCause(t *testing.T) {
 	}
 
 	// When 安装成功但 reloader 持续失败、且全部回滚基线均失败
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then fail-open 落库的 message 同时携带重载失败警告与回滚失败根因
 	_, status, message, _, _, _, _ := ip2RegionVersionRow(t)

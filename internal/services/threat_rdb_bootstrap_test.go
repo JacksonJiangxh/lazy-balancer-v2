@@ -63,7 +63,7 @@ func TestThreatRDBBootstrap_hashHitStillWritesFiles(t *testing.T) {
 	setupThreatTest(t, bodies, nil, nil)
 
 	// 第一轮：正常写文件
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatal(err)
 	}
 	var storedHash string
@@ -77,7 +77,7 @@ func TestThreatRDBBootstrap_hashHitStillWritesFiles(t *testing.T) {
 	os.Remove(iplistPath + ".fast")
 
 	// 第二轮：内容未变（哈希命中）但文件缺失 → 必须重写文件
-	if err := GetThreatUpdateManager().RunUpdate("manual"); err != nil {
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(iplistPath); err != nil {

@@ -98,13 +98,8 @@
     <!-- 混合策略更新迁移预演：确认前展示将创建的子策略/重映射范围/上限风险 -->
     <el-dialog v-model="migrateVisible" class="dialog-body-inset" width="min(560px, 94vw)" top="10vh" :close-on-click-modal="false">
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon"><el-icon :size="18"><WarningFilled /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">更新迁移预演</div>
-            <div class="dialog-header__subtitle">混合策略「{{ migratePolicy?.name }}」将按阶段迁移为单职子策略（兼容组不再支持新建）</div>
-          </div>
-        </div>
+        <DialogHeader :icon="WarningFilled" title="更新迁移预演"
+          :subtitle="`混合策略「${migratePolicy?.name}」将按阶段迁移为单职子策略（兼容组不再支持新建）`" />
       </template>
       <div v-if="migratePolicy" class="migrate-preview">
         <div class="migrate-preview-section">
@@ -146,13 +141,8 @@
     <!-- 混合策略只读查看：按阶段分组展示全部内容，零可编辑字段，底部唯一操作=更新迁移 -->
     <el-dialog v-model="viewPolicyVisible" width="min(760px, 94vw)" top="6vh">
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon"><el-icon :size="18"><Lock /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">{{ viewPolicyDetail?.name || viewPolicyRow?.name }}</div>
-            <div class="dialog-header__subtitle">混合策略（兼容旧版）· 只读查看——经「更新迁移」拆分为单职策略后可编辑</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Lock" :title="viewPolicyDetail?.name || viewPolicyRow?.name || ''"
+          subtitle="混合策略（兼容旧版）· 只读查看——经「更新迁移」拆分为单职策略后可编辑" />
       </template>
       <div v-loading="viewPolicyLoading" class="view-policy-body">
         <template v-if="viewPolicyDetail">
@@ -182,13 +172,8 @@
     </el-dialog>
     <el-dialog v-model="dialogVisible" width="min(950px, 94vw)" top="5vh" :close-on-click-modal="false" :before-close="beforeWizardClose" @close="resetWizard">
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon dialog-header__icon--primary"><el-icon :size="18"><Lock /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">{{ editingId ? (isReadOnly ? '查看策略' : '编辑策略') : '新建策略' }}</div>
-            <div class="dialog-header__subtitle">{{ EDITOR_SUBTITLES[editorPolicyType] }}</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Lock" :title="editingId ? (isReadOnly ? '查看策略' : '编辑策略') : '新建策略'"
+          :subtitle="EDITOR_SUBTITLES[editorPolicyType]" tone="primary" />
       </template>
       <el-steps :active="visualStepIndex" finish-status="success" align-center class="wizard-steps" :class="{ 'is-clickable': stepsClickable }">
         <el-step
@@ -968,6 +953,7 @@ import { useClampedPagination } from '@/composables/useClampedPagination'
 import type { CrsExcludedRow, CrsRuleOptionView } from '@/composables/useCrsRuleIndex'
 import type { APIResponse, UserListItem } from '@/types'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
+import DialogHeader from '@/components/DialogHeader.vue'
 import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, buildStageModel, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, parseRefIds, IP_LIST_CATEGORIES} from '@/utils/securityStages'
 import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy } from '@/utils/securityStages'
 
@@ -3129,16 +3115,6 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-/* ── 通用弹框头部 ── */
-/* 少数据时卡片高度随内容（2026-09-25 用户裁定：撤销 360px 定高——留白过多） */
-.dialog-header { display: flex; align-items: flex-start; gap: 12px; }
-.dialog-header__icon {
-  flex-shrink: 0; width: 36px; height: 36px; border-radius: 8px;
-  background: #ecf5ff; color: #409eff;
-  display: flex; align-items: center; justify-content: center;
-}
-.dialog-header__title { font-size: 16px; font-weight: 600; color: var(--text-primary, #111827); line-height: 1.4; }
-.dialog-header__subtitle { font-size: 12px; color: var(--text-secondary, #6b7280); margin-top: 2px; }
 .table-toolbar { display: flex; gap: 12px; justify-content: flex-end; margin-bottom: 16px; }
 /* 分页器：与 Rules/SecurityRules/拦截页面 的 .rules-pagination 同款
    （右对齐 + 16px 上距，2026-09-25 用户裁定——模板挂类漏定义致的左对齐修复） */

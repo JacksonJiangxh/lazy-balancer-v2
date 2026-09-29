@@ -17,7 +17,11 @@ var (
 	auditCleanupDone   chan struct{}
 )
 
-var configFieldSections = map[string]string{
+// ConfigFieldSections 配置字段 → 面板卡片段落映射（字段级审计归因用）。
+// 新增 add() 字段（handlers/config_changes.go planConfigChanges）必须同步本表，
+// 否则审计归因落「全局配置」；覆盖清点钉在 handlers/config_field_sections_test.go
+// （U8-P4-1：SYS-2 同族漏点收敛，曾漏 github_token）。
+var ConfigFieldSections = map[string]string{
 	"acme_email":             "ACME配置",
 	"cert_expiry_days":       "ACME配置",
 	"cert_renewal_days":      "ACME配置",
@@ -59,12 +63,15 @@ var configFieldSections = map[string]string{
 	"github_proxy_url":       "基础设置",
 	// SYS-2(2026-09-10 审计):R72 增补的两个安全开关漏同步 section 映射,审计
 	// 归因曾落「全局配置」(实际在基础设置卡片)。
+	// U8-P4-1(2026-09-29 审计):同族漏点收敛——github_token 同批入表,审计归因
+	// 曾落「全局配置」;全字段覆盖清点钉在 handlers/config_field_sections_test.go。
 	"mfa_write_guard":     "基础设置",
 	"mfa_lockout_enabled": "基础设置",
+	"github_token":        "基础设置",
 }
 
 func GetConfigSection(field string) string {
-	if section, ok := configFieldSections[field]; ok {
+	if section, ok := ConfigFieldSections[field]; ok {
 		return section
 	}
 	return "全局配置"

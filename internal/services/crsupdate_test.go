@@ -72,14 +72,14 @@ func TestStartCRSUpdate_conflictWhenRunning(t *testing.T) {
 	}
 
 	// Given a running update
-	if _, err := m.StartUpdate("manual"); err != nil {
+	if _, err := m.StartUpdate("manual", nil); err != nil {
 		t.Fatal(err)
 	}
 	<-entered
 
 	// When a second update is requested
 	// Then it is rejected with ErrCRSUpdateRunning
-	if _, err := m.StartUpdate("manual"); !errors.Is(err, ErrCRSUpdateRunning) {
+	if _, err := m.StartUpdate("manual", nil); !errors.Is(err, ErrCRSUpdateRunning) {
 		t.Fatalf("StartUpdate()=%v, want ErrCRSUpdateRunning", err)
 	}
 	if !m.IsRunning() {
@@ -112,7 +112,7 @@ func TestCRSUpdateRun_success(t *testing.T) {
 	m.reloader = func() error { reloads++; return nil }
 
 	// When a manual update runs to completion
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then the DB row reflects success at the new version
 	version, status, message, finishedAt, _, _, _ := crsVersionRow(t)
@@ -175,7 +175,7 @@ func TestCRSUpdateRun_fetchFailure(t *testing.T) {
 	m.reloader = func() error { reloads++; return nil }
 
 	// When the version check fails
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then the row is marked failed with the cause, live files untouched
 	version, status, message, finishedAt, lastChecked, _, _ := crsVersionRow(t)
@@ -217,7 +217,7 @@ func TestCRSUpdateRun_installFailureRestoresBackup(t *testing.T) {
 	m.reloader = func() error { reloads++; return nil }
 
 	// When installation fails
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then status is failed and the previous tree is restored + reloaded
 	_, status, message, _, _, _, _ := crsVersionRow(t)
@@ -255,7 +255,7 @@ func TestCRSUpdateRun_autoSkipsWhenTagEqualsCurrent(t *testing.T) {
 	}
 
 	// When an auto update finds the same version
-	m.run("auto")
+	m.run("auto", nil)
 
 	// Then nothing is downloaded and the skip is recorded as success
 	if downloadCalled {
@@ -291,7 +291,7 @@ func TestCRSUpdate_manualTriggerAtLatestSkipsDownload(t *testing.T) {
 	m.reloader = func() error { reloads++; return nil }
 
 	// When a manual update finds the same version
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then nothing is downloaded and Caddy is not reloaded
 	if downloadCalled {
@@ -446,27 +446,29 @@ func TestCRSSchedulerTick_slaveSkips(t *testing.T) {
 func countCRSUpdateFailedAudits(t *testing.T) int {
 	t.Helper()
 	var n int
-	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE resource='CRS规则库' AND action='更新' AND detail LIKE '%结果：失败%'").Scan(&n); err != nil {
+	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE resource='CRS规则库' AND action='更新失败'").Scan(&n); err != nil {
 		t.Fatalf("count failed audit entries: %v", err)
 	}
 	return n
 }
 
-func TestCRSUpdateFail_auditsOnlyFirstFailure(t *testing.T) {
+// R62 U1-P3-2（2026-09-29 裁定口径）：操作审计由 run() 的 defer 每轮单记——
+// fail() 本体零审计（曾内联「仅首败审计」R35 I1，与 defer 双记已撤）。
+func TestCRSUpdateFail_auditRecordedByRunDeferPerRun(t *testing.T) {
 	m := newTestCRSManager(t)
 	seedCRSVersionRow(t, "v4.14.0", true)
 
-	// Given a first consecutive failure: audited once (counter 0 → 1)
+	// fail() 直调不产生操作审计（计数器职责保留）
 	m.fail(errors.New("第一次失败"), false)
-	if got := countCRSUpdateFailedAudits(t); got != 1 {
-		t.Fatalf("failed audits after 1st failure = %d, want 1", got)
+	if got := countCRSUpdateFailedAudits(t); got != 0 {
+		t.Fatalf("fail() 直调应零审计, got %d", got)
 	}
 
-	// When the second consecutive failure occurs (counter 1 → 2)
-	// Then no duplicate audit is written (R36 F3)
-	m.fail(errors.New("第二次失败"), false)
+	// 经 run() 的失败轮：每轮恰 1 条（defer 单记——手动/自动同一审计）
+	m.fetchLatestTag = func(context.Context) (string, error) { return "", errors.New("查询失败") }
+	m.run("auto", nil)
 	if got := countCRSUpdateFailedAudits(t); got != 1 {
-		t.Fatalf("failed audits after 2nd failure = %d, want 1 (no duplicate)", got)
+		t.Fatalf("一次失败 run 应 1 条审计, got %d", got)
 	}
 }
 
@@ -557,7 +559,7 @@ func TestCRSRun_successRefreshesNextUpdate(t *testing.T) {
 	seedCRSVersionRow(t, "v4.14.0", true)
 	m.fetchLatestTag = func(context.Context) (string, error) { return "v4.14.0", nil }
 
-	done, err := m.StartUpdate("manual")
+	done, err := m.StartUpdate("manual", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +575,7 @@ func TestCRSRun_successRefreshesNextUpdate(t *testing.T) {
 
 	// auto_update=0：成功不排程
 	seedCRSVersionRow(t, "v4.14.0", false)
-	done, err = m.StartUpdate("manual")
+	done, err = m.StartUpdate("manual", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

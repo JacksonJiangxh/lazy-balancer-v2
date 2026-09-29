@@ -44,7 +44,7 @@ func TestIP2RegionUpdateRun_versionComparisonGate(t *testing.T) {
 			m.reloader = func() error { reloads++; return nil }
 
 			// When the update pipeline runs
-			m.run("auto")
+			m.run("auto", nil)
 
 			// Then the version comparison gate decides skip vs update
 			if downloadCalled != tc.wantDownload {
@@ -79,7 +79,7 @@ func TestIP2RegionUpdateRun_nullIsMasterRunsAsMaster(t *testing.T) {
 	m.downloadXDB = func(context.Context, string, string, downloadProgressFunc) error { downloadCalled = true; return nil }
 
 	// When the update pipeline runs
-	m.run("auto")
+	m.run("auto", nil)
 
 	// Then it executes as master and reaches the latest-version skip branch
 	_, status, message, _, _, _, _ := ip2RegionVersionRow(t)
@@ -104,7 +104,7 @@ func TestIP2RegionUpdateRun_slaveAborts(t *testing.T) {
 	m.downloadXDB = func(context.Context, string, string, downloadProgressFunc) error { downloadCalled = true; return nil }
 
 	// When the update pipeline runs
-	m.run("auto")
+	m.run("auto", nil)
 
 	// Then it aborts before recording any terminal state（行保持种子默认 idle）
 	_, status, _, _, _, _, _ := ip2RegionVersionRow(t)

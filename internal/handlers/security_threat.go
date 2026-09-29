@@ -11,6 +11,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 // 威胁情报库（v2.3.2 名单化重构）：内置只读三源的管理面——状态展示、
@@ -90,9 +91,7 @@ func (h *Handlers) UpdateThreatAutoUpdate(c *gin.Context) {
 	}
 	// F49-P5-7：与 UpdateCRSAutoUpdate 同口径主节点门（R57 B-#4）——从节点
 	// 状态行在集群同步段内，本地写会被下次快照覆盖。
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
-		clusterError(c, http.StatusForbidden, "该操作仅允许在主节点执行", err)
+	if !requireMasterNode(c) {
 		return
 	}
 	if err := services.SetThreatAutoUpdate(*body.AutoUpdate); err != nil {
@@ -138,9 +137,7 @@ func (h *Handlers) UpdateThreatSourceFlags(c *gin.Context) {
 		return
 	}
 	// F49-P5-7：与 UpdateCRSAutoUpdate 同口径主节点门（R57 B-#4）。
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
-		clusterError(c, http.StatusForbidden, "该操作仅允许在主节点执行", err)
+	if !requireMasterNode(c) {
 		return
 	}
 	var name string
@@ -159,9 +156,7 @@ func (h *Handlers) UpdateThreatSourceFlags(c *gin.Context) {
 // StartThreatLibUpdate 手动触发更新（主节点；镜像 StartCRSUpdate 的受理/
 // 重复任务 409 语义）。
 func (h *Handlers) StartThreatLibUpdate(c *gin.Context) {
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
-		clusterError(c, http.StatusForbidden, "该操作仅允许在主节点执行", err)
+	if !requireMasterNode(c) {
 		return
 	}
 	mgr := services.GetThreatUpdateManager()
@@ -169,7 +164,7 @@ func (h *Handlers) StartThreatLibUpdate(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "威胁库更新服务未初始化"})
 		return
 	}
-	if _, err := mgr.StartUpdate("manual"); err != nil {
+	if _, err := mgr.StartUpdate("manual", &taskengine.RunContext{Operator: auditOperator(c)}); err != nil {
 		if errors.Is(err, services.ErrThreatUpdateRunning) {
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: err.Error()})
 			return
@@ -177,7 +172,7 @@ func (h *Handlers) StartThreatLibUpdate(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	recordAudit(c, "手动更新", "威胁情报库", "手动更新 威胁情报库")
+	// 审计由任务体自记（operator 已传入——2026-09-29 裁定单记口径）
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 }
 
@@ -195,9 +190,5 @@ func (h *Handlers) GetThreatLibUpdateStatus(c *gin.Context) {
 // GetThreatLibUpdateLogs 更新日志（含上一代轮转文件，镜像 GetCRSUpdateLogs）。
 func (h *Handlers) GetThreatLibUpdateLogs(c *gin.Context) {
 	logPath := services.ThreatUpdateLogPath()
-	content := readCertJobLogFile(logPath)
-	if oldData := readCertJobLogFile(logPath + ".1"); oldData != "" {
-		content = oldData + content
-	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": content}})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": readUpdateLogWithRotation(logPath)}})
 }

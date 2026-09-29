@@ -49,7 +49,6 @@ func TestExplicitAuditRoutesAreHandledByHandlers(t *testing.T) {
 		{"POST", "/api/v1/security/policies/:id/bind"},
 		{"DELETE", "/api/v1/security/policies/:id/bind/:caddy_id"},
 		{"PUT", "/api/v1/security/crs/auto-update"},
-		{"POST", "/api/v1/security/crs/update"},
 		{"POST", "/api/v1/security/custom-rules"},
 		{"PUT", "/api/v1/security/custom-rules/:id"},
 		{"DELETE", "/api/v1/security/custom-rules/:id"},
@@ -109,7 +108,8 @@ func TestClassifyAuditRouteMatrix(t *testing.T) {
 		{"POST", "/api/v1/security/policies/:id/bind", AuditPolicyExplicit},
 		{"DELETE", "/api/v1/security/policies/:id/bind/:caddy_id", AuditPolicyExplicit},
 		{"PUT", "/api/v1/security/crs/auto-update", AuditPolicyExplicit},
-		{"POST", "/api/v1/security/crs/update", AuditPolicyExplicit},
+		// 三库手动更新：审计由任务体 defer 单记（2026-09-29 裁定+R62 U1-P3-2）。
+		{"POST", "/api/v1/security/crs/update", AuditPolicySkip},
 		{"POST", "/api/v1/security/custom-rules", AuditPolicyExplicit},
 		{"PUT", "/api/v1/security/custom-rules/:id", AuditPolicyExplicit},
 		{"DELETE", "/api/v1/security/custom-rules/:id", AuditPolicyExplicit},

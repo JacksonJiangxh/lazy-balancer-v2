@@ -410,11 +410,6 @@ const submit = async (): Promise<void> => {
 </script>
 
 <style scoped>
-.dialog-header { display: flex; align-items: flex-start; gap: 12px; }
-.dialog-header__icon { flex: 0 0 auto; width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; background: var(--el-color-primary-light-9); color: var(--el-color-primary); }
-.dialog-header__title { font-size: 16px; font-weight: 600; color: #1f2937; line-height: 1.4; }
-.dialog-header__subtitle { font-size: 12px; color: #6b7280; margin-top: 2px; }
-
 .bind-stage-groups { display: flex; flex-direction: column; gap: 16px; }
 .bind-stage-group { border: 1px solid #ebeef5; border-radius: 8px; padding: 10px 12px; }
 .bind-stage-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }

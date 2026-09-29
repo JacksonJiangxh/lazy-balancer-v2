@@ -42,9 +42,8 @@ const (
 type RunContext struct {
 	Ctx      context.Context
 	Trigger  string
-	RunID    int64
-	Progress func(stage, msg string)
-	Logger   func(level, msg string)
+	Operator string // 手动触发操作者（audit 用户名；自动路径为空=任务体按 system 处理）
+	RunID    int64  // 引擎预插的 task_runs 行 ID（>0=引擎已记，族体跳过自记——单写方）
 }
 
 // Descriptor 任务声明（注册即接入 UI/API/MCP/审计/历史）。
@@ -83,6 +82,14 @@ type Descriptor struct {
 	// ManualRun Run 体支持 manual 触发语义（排程族 Run 内分支处理/清理与
 	// 循环族 Run 即单轮工作；探测-only 族走专属端点）。
 	ManualRun bool
+	// ToggleFn 调度开关（暂停/恢复自动调度——族配置 setter；声明即
+	// Toggleable，控制面经 DescribeAll 元数据路由，不再硬编码清单）。
+	ToggleFn func(enabled bool) error
+	// ToggleName 调度开关审计名（如「威胁情报库自动更新」）。
+	ToggleName string
+	// Cadence 运行节奏展示文案（如「排程槽（可配置）」——静态展示，
+	// 动态节奏（cluster-sync 按用户同步间隔）由消费侧重算）。
+	Cadence string
 }
 
 // RunRecord task_runs 行视图。
@@ -113,7 +120,6 @@ type registration struct {
 	mu          sync.Mutex
 	running     bool
 	cancel      context.CancelFunc
-	runID       int64
 	stage       string
 	lastMsg     string
 	lastCheck   time.Time // 最近调度到期判定基准
@@ -212,6 +218,17 @@ func (e *Engine) SetManualRun(id string, ok bool) {
 	}
 }
 
+// Toggle 暂停/恢复任务自动调度（路由到描述符 ToggleFn——配置 setter）。
+func (e *Engine) Toggle(id string, enabled bool) error {
+	e.mu.RLock()
+	r := e.regs[id]
+	e.mu.RUnlock()
+	if r == nil || r.desc.ToggleFn == nil {
+		return ErrNotFound
+	}
+	return r.desc.ToggleFn(enabled)
+}
+
 // Unregister 摘除注册。
 func (e *Engine) Unregister(id string) {
 	e.mu.Lock()
@@ -219,20 +236,9 @@ func (e *Engine) Unregister(id string) {
 	e.mu.Unlock()
 }
 
-// Reschedule 通知引擎重读动态间隔（配置变更热生效）。
-func (e *Engine) Reschedule(id string) {
-	e.mu.RLock()
-	r := e.regs[id]
-	e.mu.RUnlock()
-	if r != nil {
-		r.mu.Lock()
-		r.lastCheck = time.Time{} // 清零触发立即重算
-		r.mu.Unlock()
-	}
-}
-
-// Trigger 手动触发（单飞门 + 主节点门）。
-func (e *Engine) Trigger(id, trigger string) error {
+// Trigger 手动触发（单飞门 + 主节点门）。operator 为操作者用户名
+// （任务体经 RunContext.Operator 消费——审计归人；空=任务体按 system 记）。
+func (e *Engine) Trigger(id, trigger, operator string) error {
 	e.mu.RLock()
 	r := e.regs[id]
 	e.mu.RUnlock()
@@ -242,7 +248,7 @@ func (e *Engine) Trigger(id, trigger string) error {
 	if r.desc.MasterOnly && !e.isMaster() {
 		return errors.New("taskengine: 该操作仅允许在主节点执行")
 	}
-	return e.runNow(id, trigger)
+	return e.runNow(id, trigger, operator)
 }
 
 // Cancel 取消运行中任务（仅 Cancelable 声明的族生效）。
@@ -350,7 +356,7 @@ func (e *Engine) RecoverOrphans() int64 {
 // ---- 内部：执行与调度 ----
 
 // runNow 同步执行一次（带单飞门/历史落库/终态回收）。测试直调入口。
-func (e *Engine) runNow(id, trigger string) error {
+func (e *Engine) runNow(id, trigger, operator string) error {
 	e.mu.RLock()
 	r := e.regs[id]
 	e.mu.RUnlock()
@@ -374,19 +380,10 @@ func (e *Engine) runNow(id, trigger string) error {
 	if trigger == "manual" || (!r.desc.SilentProbes && !r.desc.RecordFailuresOnly) {
 		runID = globalInsertRun(id, r.desc.Family, trigger)
 	}
-	rc := RunContext{Ctx: ctx, Trigger: trigger, RunID: runID,
-		Progress: func(stage, msg string) {
-			r.mu.Lock()
-			r.stage, r.lastMsg = stage, msg
-			r.mu.Unlock()
-			if runID > 0 {
-				_, _ = db.DB.Exec(`UPDATE task_runs SET stage=?, message=? WHERE id=?`, stage, msg, runID)
-			}
-		},
-		Logger: func(level, msg string) { taskLogAppend(id, "["+level+"] "+msg) },
-	}
+	rc := RunContext{Ctx: ctx, Trigger: trigger, Operator: operator, RunID: runID}
 
 	start := time.Now()
+	startStr := engineNowStr() // 回填行的 started_at 用真实开始时刻（U2-P5-08c）
 	if trigger == "manual" {
 		taskLogAppend(id, "[start] 手动触发")
 	}
@@ -403,7 +400,7 @@ func (e *Engine) runNow(id, trigger string) error {
 	// 高频工作轮失败才补落库（成功轮静默——2s 摄取/60s 看门狗每轮落库
 	// 即每天 4.3 万/1440 行噪音）
 	if runID == 0 && r.desc.RecordFailuresOnly && status != "success" {
-		runID = globalInsertRun(id, r.desc.Family, trigger)
+		runID = globalInsertRunAt(id, r.desc.Family, trigger, startStr)
 	}
 
 	r.mu.Lock()
@@ -414,6 +411,9 @@ func (e *Engine) runNow(id, trigger string) error {
 
 	e.finishRun(runID, status, dur)
 	return runErr
+}
+func globalInsertRun(taskID, family, trigger string) int64 {
+	return globalInsertRunAt(taskID, family, trigger, engineNowStr())
 }
 
 func terminalStatus(ctx context.Context, err error) string {
@@ -426,11 +426,12 @@ func terminalStatus(ctx context.Context, err error) string {
 	return "success"
 }
 
-func globalInsertRun(taskID, family, trigger string) int64 {
+// globalInsertRunAt 以显式 started_at 落行（回填行用真实开始时刻）。
+func globalInsertRunAt(taskID, family, trigger, startedAt string) int64 {
 	if db.DB == nil {
 		return 0
 	}
-	res, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, trigger, status, started_at) VALUES (?,?,?,'running',?)`, taskID, family, trigger, engineNowStr())
+	res, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, trigger, status, started_at) VALUES (?,?,?,'running',?)`, taskID, family, trigger, startedAt)
 	if err != nil {
 		return 0
 	}
@@ -442,7 +443,9 @@ func (e *Engine) finishRun(runID int64, status string, durMs int64) {
 	if runID <= 0 || db.DB == nil {
 		return
 	}
-	_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=datetime('now'), duration_ms=? WHERE id=?`, status, durMs, runID)
+	// finished_at 与 started_at 同基准（配置时区 engineNowStr——P2-① 统一，
+	// 曾误用 datetime('now')=UTC 致东八区完成时间恒早 8 小时）。
+	_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=? WHERE id=?`, status, engineNowStr(), durMs, runID)
 }
 
 // scheduleLoop 1s 粒度调度：常驻循环按 IntervalFn 到期投递（角色门+启停门）。
@@ -489,7 +492,7 @@ func (e *Engine) tick() {
 		if !e.roleAllows(r.desc.RunsOn) {
 			continue
 		}
-		go func(rid string) { _ = e.runNow(rid, "auto") }(id)
+		go func(rid string) { _ = e.runNow(rid, "auto", "") }(id)
 	}
 }
 
@@ -503,8 +506,6 @@ func (e *Engine) roleAllows(role Role) bool {
 		return true
 	}
 }
-
-var _ = fmt.Sprintf // 保留 fmt（M3 排程槽使用）
 
 // location 引擎写库时区（配置时区——services 启动/变更时 SetLocation 注入；
 // 未注入回退本地）。所有 task_runs 时间字符串按此时区格式化。
@@ -557,16 +558,17 @@ func RecordRunStart(taskID, family, trigger string) int64 {
 	return globalInsertRun(taskID, family, trigger)
 }
 
-// RecordRunFinish 族侧终态落库。
+// RecordRunFinish 族侧终态落库。finished_at 与 started_at 同基准（配置时区
+// ——P2-① 统一，曾误用 datetime('now')=UTC）。
 func RecordRunFinish(runID int64, status string, durMs int64, message string) {
 	if runID <= 0 {
 		return
 	}
 	if message != "" {
-		_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=datetime('now'), duration_ms=?, message=? WHERE id=?`, status, durMs, message, runID)
+		_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=?, message=? WHERE id=?`, status, engineNowStr(), durMs, message, runID)
 		return
 	}
-	_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=datetime('now'), duration_ms=? WHERE id=?`, status, durMs, runID)
+	_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=? WHERE id=?`, status, engineNowStr(), durMs, runID)
 }
 
 // TaskMeta 引擎注册面元数据（任务监控统一数据源）。
@@ -578,49 +580,70 @@ type TaskMeta struct {
 	Category     string `json:"category"`
 	Kind         Kind   `json:"kind"`
 	AsKind       Kind   `json:"as_kind"`       // 任务性质（展示口径；探测驱动≠常驻）
+	Cadence      string `json:"cadence"`       // 运行节奏展示文案（Descriptor.Cadence）
 	IntervalSec  int    `json:"interval_sec"`  // IntervalFn 秒值（0=无固定间隔）
 	NextSlot     string `json:"next_slot"`     // NextSlotFn 结果（展示串）
 	Enabled      bool   `json:"enabled"`       // EnabledFn 结果（nil=恒开）
 	StatusMirror string `json:"status_mirror"` // StatusFn 结果（空=引擎默认态）
 	Controllable bool   `json:"controllable"`
 	Cancelable   bool   `json:"cancelable"`
-	LoopOn       bool   `json:"loop_on"`     // 常驻循环当前启用态
-	CanTrigger   bool   `json:"can_trigger"` // 支持手动触发（ManualRun）
+	SingleFlight bool   `json:"single_flight"` // Singleton 声明（UI/控制面可观察）
+	Toggleable   bool   `json:"toggleable"`    // 调度开关支持（ToggleFn 声明）
+	ToggleName   string `json:"toggle_name"`   // 调度开关审计名
+	LoopOn       bool   `json:"loop_on"`       // 常驻循环当前启用态
+	CanTrigger   bool   `json:"can_trigger"`   // 支持手动触发（ManualRun）
 }
 
-// DescribeAll 导出全部注册任务元数据（含循环启停态）。
+// DescribeAll 导出全部注册任务元数据（含循环启停态）。描述符快照在锁内
+// 拷贝、动态 Fn（EnabledFn/StatusFn/NextSlotFn/IntervalFn——含 DB 查询）在
+// 锁外调用：P3-8 修复——锁内调 Fn 时 Fn 再入 RLock（如 cert-waiting-ca
+// StatusFn→IsRunning）遇 writer 排队即互锁，关停窗口挂死。
 func (e *Engine) DescribeAll() []TaskMeta {
+	type descSnap struct {
+		id     string
+		desc   Descriptor
+		loopOn bool
+	}
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-	out := make([]TaskMeta, 0, len(e.regs))
+	snaps := make([]descSnap, 0, len(e.regs))
 	for id, r := range e.regs {
-		asKind := r.desc.AsKind
-		if asKind == "" {
-			asKind = r.desc.Kind
-		}
-		m := TaskMeta{ID: id, Family: r.desc.Family, Name: r.desc.Name,
-			Description: r.desc.Description, Category: r.desc.Category, Kind: r.desc.Kind,
-			AsKind:       asKind,
-			CanTrigger:   r.desc.ManualRun,
-			Controllable: r.desc.AsKind == KindContinuous || (r.desc.AsKind == "" && r.desc.Kind == KindContinuous),
-			Cancelable:   r.desc.Cancelable,
-			Enabled:      true}
-		if r.desc.IntervalFn != nil {
-			m.IntervalSec = int(r.desc.IntervalFn().Seconds())
-		}
-		if r.desc.NextSlotFn != nil {
-			m.NextSlot = r.desc.NextSlotFn()
-		}
-		if r.desc.EnabledFn != nil {
-			m.Enabled = r.desc.EnabledFn()
-		}
-		if r.desc.StatusFn != nil {
-			m.StatusMirror = r.desc.StatusFn()
-		}
 		r.mu.Lock()
-		m.LoopOn = r.loopEnabled
+		loopOn := r.loopEnabled
 		r.mu.Unlock()
-		_ = id
+		snaps = append(snaps, descSnap{id: id, desc: r.desc, loopOn: loopOn})
+	}
+	e.mu.RUnlock()
+
+	out := make([]TaskMeta, 0, len(snaps))
+	for _, s := range snaps {
+		asKind := s.desc.AsKind
+		if asKind == "" {
+			asKind = s.desc.Kind
+		}
+		m := TaskMeta{ID: s.id, Family: s.desc.Family, Name: s.desc.Name,
+			Description: s.desc.Description, Category: s.desc.Category, Kind: s.desc.Kind,
+			AsKind:       asKind,
+			Cadence:      s.desc.Cadence,
+			CanTrigger:   s.desc.ManualRun,
+			Controllable: s.desc.AsKind == KindContinuous || (s.desc.AsKind == "" && s.desc.Kind == KindContinuous),
+			Cancelable:   s.desc.Cancelable,
+			SingleFlight: s.desc.Singleton,
+			Toggleable:   s.desc.ToggleFn != nil,
+			ToggleName:   s.desc.ToggleName,
+			LoopOn:       s.loopOn,
+			Enabled:      true}
+		if s.desc.IntervalFn != nil {
+			m.IntervalSec = int(s.desc.IntervalFn().Seconds())
+		}
+		if s.desc.NextSlotFn != nil {
+			m.NextSlot = s.desc.NextSlotFn()
+		}
+		if s.desc.EnabledFn != nil {
+			m.Enabled = s.desc.EnabledFn()
+		}
+		if s.desc.StatusFn != nil {
+			m.StatusMirror = s.desc.StatusFn()
+		}
 		out = append(out, m)
 	}
 	return out
@@ -657,10 +680,11 @@ func PurgeTaskRuns(days int) {
 	if db.DB == nil || days <= 0 {
 		return
 	}
-	if _, err := db.DB.Exec(`DELETE FROM task_runs WHERE started_at < datetime('now', ?)`, fmt.Sprintf("-%d days", days)); err != nil {
+	// 与 Stats24h 同口径：以配置时区 engineNowStr 为基准对比 started_at
+	// （曾用 datetime('now')=UTC 对比本地串——东八区清理窗口偏 8h）。
+	if _, err := db.DB.Exec(`DELETE FROM task_runs WHERE started_at < datetime(?, ?)`, engineNowStr(), fmt.Sprintf("-%d days", days)); err != nil {
 		return
 	}
-	_ = days
 }
 
 // TeeTaskLog 业务侧（更新族分阶段流水）tee 到任务日志——统一文本日志面。

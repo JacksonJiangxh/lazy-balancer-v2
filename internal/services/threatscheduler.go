@@ -109,7 +109,7 @@ func (m *ThreatUpdateManager) schedulerTick(now time.Time) {
 	if err != nil || len(due) == 0 {
 		return
 	}
-	if _, err := m.StartUpdate("auto"); err != nil && !errors.Is(err, ErrThreatUpdateRunning) {
+	if _, err := m.StartUpdate("auto", nil); err != nil && !errors.Is(err, ErrThreatUpdateRunning) {
 		Logf("error", "威胁情报库: 调度启动失败: %v", err)
 	}
 }

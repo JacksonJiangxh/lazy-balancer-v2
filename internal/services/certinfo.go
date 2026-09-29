@@ -33,6 +33,25 @@ func GetCertExpiryThreshold() int {
 	return days
 }
 
+// GetCertRenewalDays returns the configured certificate renewal window in days.
+// U7-P5-2（第 62 轮审计）：cert_renewal_days 读取收敛到本 helper（原四处内联：
+// certificates.go 启动恢复/续签巡检/首发失败重试 + certissuer.go 快速路径）。
+// CERT42-5（第 42 轮审计）：读取失败降级默认值必须告警——静默落 30 天默认会让
+// 配置读取退化无任何可观测痕迹。2026-09-07 C2 核实：UI 输入 min=1，0/负值仅
+// API 直写/导入可达——按默认 30 天兜底（非「禁用续签」语义）。
+func GetCertRenewalDays() int {
+	var days int
+	err := db.DB.QueryRow("SELECT COALESCE(cert_renewal_days, 30) FROM global_config WHERE id = 1").Scan(&days)
+	if err != nil {
+		Logf("error", "GetCertRenewalDays: failed to read global_config, using default 30: %v", err)
+		return 30
+	}
+	if days <= 0 {
+		return 30
+	}
+	return days
+}
+
 // GetCertRenewalAttempts returns the configured max renewal attempts.
 func GetCertRenewalAttempts() int {
 	var attempts int

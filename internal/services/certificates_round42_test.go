@@ -7,9 +7,10 @@ import (
 	"testing"
 )
 
-// CERT42-5（第 42 轮审计）：三处续签天数读取（启动恢复/续签巡检/首发失败重试）
-// 读库失败降级默认值时必须与 certissuer.go 同口径补降级告警——否则配置读取
-// 退化（锁/IO 错误）静默落到 30 天默认，无任何可观测痕迹。
+// CERT42-5（第 42 轮审计）+ U7-P5-2（第 62 轮收敛）：三处续签天数读取（启动恢复/
+// 续签巡检/首发失败重试）已收敛到 GetCertRenewalDays（certinfo.go）——读库失败
+// 降级默认值时必须各自补降级告警（原四处内联与 certissuer.go 同口径，现 helper
+// 统一）——否则配置读取退化（锁/IO 错误）静默落到 30 天默认，无任何可观测痕迹。
 func TestCertificateRenewalDays_logsWarningOnReadFailure(t *testing.T) {
 	// Given a broken global_config read（表被改名，读取必失败）
 	_, database := newClusterTestService(t)
@@ -34,8 +35,8 @@ func TestCertificateRenewalDays_logsWarningOnReadFailure(t *testing.T) {
 		t.Fatalf("requeueNonTerminalCertJobs: %v", err)
 	}
 
-	// Then each degraded read logged the certissuer-pattern warning（默认 30 天行为不变）
-	if got := strings.Count(buf.String(), "read cert_renewal_days failed"); got != 3 {
-		t.Fatalf("warning count=%d, want 3（三处读取各告警一次）\nlog:\n%s", got, buf.String())
+	// Then each degraded read logged exactly one helper alert（默认 30 天行为不变）
+	if got := strings.Count(buf.String(), "GetCertRenewalDays: failed to read global_config"); got != 3 {
+		t.Fatalf("degraded-read alert count=%d, want 3（三处读取各告警一次）\nlog:\n%s", got, buf.String())
 	}
 }

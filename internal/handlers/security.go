@@ -21,6 +21,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
+	"lazy-balancer-v2/internal/taskengine"
 
 	"github.com/gin-gonic/gin"
 )
@@ -3580,9 +3581,7 @@ func (h *Handlers) UpdateCRSAutoUpdate(c *gin.Context) {
 	}
 	// R57 B-#4：与 StartCRSUpdate 同口径主节点门（R46 B-F3）——从节点版本行
 	// 在同步段内，本地写会被下次快照覆盖。
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
-		clusterError(c, http.StatusForbidden, "该操作仅允许在主节点执行", err)
+	if !requireMasterNode(c) {
 		return
 	}
 	if err := services.SetCRSAutoUpdate(req.AutoUpdate); err != nil {
@@ -3622,9 +3621,7 @@ func (h *Handlers) updateLibSchedule(c *gin.Context, save func([]int, string) er
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "时间格式无效（HH:MM）"})
 		return nil, "", false
 	}
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
-		clusterError(c, http.StatusForbidden, "该操作仅允许在主节点执行", err)
+	if !requireMasterNode(c) {
 		return nil, "", false
 	}
 	if err := save(days, req.Time); err != nil {
@@ -3661,9 +3658,7 @@ func (h *Handlers) StartCRSUpdate(c *gin.Context) {
 	// 门控查询失败按非主节点拒绝）。从节点本地更新会造成磁盘/DB 分叉：主节点
 	// 下次集群同步把 version 行覆盖回主节点口径，而从节点的启动对账是
 	// master-only，分叉长期残留。
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
-		clusterError(c, http.StatusForbidden, "该操作仅允许在主节点执行", err)
+	if !requireMasterNode(c) {
 		return
 	}
 	mgr := services.GetCRSUpdateManager()
@@ -3671,7 +3666,7 @@ func (h *Handlers) StartCRSUpdate(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "CRS 更新服务未初始化"})
 		return
 	}
-	if _, err := mgr.StartUpdate("manual"); err != nil {
+	if _, err := mgr.StartUpdate("manual", &taskengine.RunContext{Operator: auditOperator(c)}); err != nil {
 		if errors.Is(err, services.ErrCRSUpdateRunning) {
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: err.Error()})
 			return
@@ -3679,7 +3674,7 @@ func (h *Handlers) StartCRSUpdate(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	recordAudit(c, "更新", "CRS规则库", "手动更新 CRS规则库")
+	// 审计由任务体自记（operator 已传入——2026-09-29 裁定单记口径）
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 }
 
@@ -3700,13 +3695,19 @@ func (h *Handlers) GetCRSUpdateStatus(c *gin.Context) {
 	}})
 }
 
-func (h *Handlers) GetCRSUpdateLogs(c *gin.Context) {
-	logPath := services.CRSUpdateLogPath()
-	content := readCertJobLogFile(logPath)
-	if oldData := readCertJobLogFile(logPath + ".1"); oldData != "" {
+// readUpdateLogWithRotation 读更新日志（含上一代 .1 轮转副本，旧代在前）——
+// CRS/IP2Region/威胁三库更新日志端点共用（U3-P5-1：三份同构收敛）。
+func readUpdateLogWithRotation(path string) string {
+	content := readCertJobLogFile(path)
+	if oldData := readCertJobLogFile(path + ".1"); oldData != "" {
 		content = oldData + content
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": content}})
+	return content
+}
+
+func (h *Handlers) GetCRSUpdateLogs(c *gin.Context) {
+	logPath := services.CRSUpdateLogPath()
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": readUpdateLogWithRotation(logPath)}})
 }
 
 func (h *Handlers) GetIP2RegionInfo(c *gin.Context) {
@@ -3768,9 +3769,7 @@ func (h *Handlers) UpdateIP2RegionAutoUpdate(c *gin.Context) {
 		return
 	}
 	// R57 B-#4：与 StartIP2RegionUpdate 同口径主节点门。
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
-		clusterError(c, http.StatusForbidden, "该操作仅允许在主节点执行", err)
+	if !requireMasterNode(c) {
 		return
 	}
 	if err := services.SetIP2RegionAutoUpdate(req.AutoUpdate); err != nil {
@@ -3798,9 +3797,7 @@ func (h *Handlers) UpdateIP2RegionSchedule(c *gin.Context) {
 
 func (h *Handlers) StartIP2RegionUpdate(c *gin.Context) {
 	// R46 B-F3：同 StartCRSUpdate——手动更新仅限主节点，从节点直接 403。
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
-		clusterError(c, http.StatusForbidden, "该操作仅允许在主节点执行", err)
+	if !requireMasterNode(c) {
 		return
 	}
 	mgr := services.GetIP2RegionUpdateManager()
@@ -3808,7 +3805,7 @@ func (h *Handlers) StartIP2RegionUpdate(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "IP2Region 更新服务未初始化"})
 		return
 	}
-	if _, err := mgr.StartUpdate("manual"); err != nil {
+	if _, err := mgr.StartUpdate("manual", &taskengine.RunContext{Operator: auditOperator(c)}); err != nil {
 		if errors.Is(err, services.ErrIP2RegionUpdateRunning) {
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: err.Error()})
 			return
@@ -3816,7 +3813,7 @@ func (h *Handlers) StartIP2RegionUpdate(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	recordAudit(c, "更新", "IP数据库", "手动更新 IP数据库")
+	// 审计由任务体自记（operator 已传入——2026-09-29 裁定单记口径）
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 }
 
@@ -3839,11 +3836,7 @@ func (h *Handlers) GetIP2RegionUpdateStatus(c *gin.Context) {
 
 func (h *Handlers) GetIP2RegionUpdateLogs(c *gin.Context) {
 	logPath := services.IP2RegionUpdateLogPath()
-	content := readCertJobLogFile(logPath)
-	if oldData := readCertJobLogFile(logPath + ".1"); oldData != "" {
-		content = oldData + content
-	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": content}})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": readUpdateLogWithRotation(logPath)}})
 }
 
 // BuildCorazaDirectives is in services/security.go to avoid circular dependency

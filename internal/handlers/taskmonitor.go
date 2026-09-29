@@ -52,9 +52,9 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发（探测型/专属端点/镜像族）"})
 					return
 				}
-				go func(tid string) {
-					_ = te.Trigger(tid, "manual") // 异步——耗时由 task_runs 记录
-				}(id)
+				go func(tid, operator string) {
+					_ = te.Trigger(tid, "manual", operator) // 异步——耗时由 task_runs 记录；operator 审计归人
+				}(id, auditOperator(c))
 				// 审计由任务体自记（手动/自动同一审计——2026-09-29 用户裁定）；
 				// 清理/证书循环族的执行记录在任务运行历史与任务日志。
 				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
@@ -72,25 +72,23 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "威胁情报库更新服务未初始化"})
 			return
 		}
-		if err := mgr.RunUpdate("manual"); err != nil {
+		if err := mgr.RunUpdate("manual", nil); err != nil {
 			respondTaskStartErr(c, err)
 			return
 		}
 		recordAudit(c, "更新", "任务监控", "手动触发 威胁情报库更新")
 	case "crs":
 		mgr := services.GetCRSUpdateManager()
-		if _, err := mgr.StartUpdate("manual"); err != nil {
+		if _, err := mgr.StartUpdate("manual", &taskengine.RunContext{Operator: auditOperator(c)}); err != nil {
 			respondTaskStartErr(c, err)
 			return
 		}
-		recordAudit(c, "更新", "任务监控", "手动触发 CRS 规则库更新")
 	case "ip2region":
 		mgr := services.GetIP2RegionUpdateManager()
-		if _, err := mgr.StartUpdate("manual"); err != nil {
+		if _, err := mgr.StartUpdate("manual", &taskengine.RunContext{Operator: auditOperator(c)}); err != nil {
 			respondTaskStartErr(c, err)
 			return
 		}
-		recordAudit(c, "更新", "任务监控", "手动触发 IP2Region 更启")
 	default:
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发"})
 		return
@@ -108,6 +106,8 @@ func respondTaskStartErr(c *gin.Context, err error) {
 }
 
 // ToggleSystemTask 暂停/恢复自动调度（admin；body {"enabled": bool}）。
+// U1-P4-2：经 DescribeAll 元数据路由（Toggleable=描述符 ToggleFn 声明），
+// 不再硬编码三族清单——注册即接入。
 func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 	id := c.Param("id")
 	if !requireMasterNode(c) {
@@ -120,6 +120,32 @@ func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效（需 enabled 布尔值）"})
 		return
 	}
+	if te := services.TaskEngine(); te != nil {
+		for _, m := range te.DescribeAll() {
+			if m.ID != id {
+				continue
+			}
+			if !m.Toggleable {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持暂停/恢复"})
+				return
+			}
+			if err := te.Toggle(id, *req.Enabled); err != nil {
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+				return
+			}
+			if *req.Enabled {
+				recordAudit(c, "恢复", "任务监控", m.ToggleName)
+				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已恢复" + m.ToggleName})
+			} else {
+				recordAudit(c, "暂停", "任务监控", m.ToggleName)
+				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已暂停" + m.ToggleName})
+			}
+			return
+		}
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持暂停/恢复"})
+		return
+	}
+	// 回退（测试环境无引擎）：直调配置 setter
 	var setFn func(bool) error
 	var taskName string
 	switch id {
@@ -146,11 +172,23 @@ func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 	}
 }
 
-// CancelSystemTask 取消运行中任务（admin；仅下载类三族）。
+// CancelSystemTask 取消运行中任务（admin；仅 Cancelable 声明族）。
+// U1-P4-2：引擎路径经 te.Cancel（Cancelable+CancelHook 元数据路由），
+// 不再硬编码三族清单；无引擎回退（测试环境）直调 manager。
 func (h *Handlers) CancelSystemTask(c *gin.Context) {
 	id := c.Param("id")
 	// 取消不需要主节点门：从节点只读模式下任务本来不跑；万一在跑（demote 竞态
-	// 窗口内）也应能取消。manager 自身有 running 判定。
+	// 窗口内）也应能取消。manager 自身有 running 判定（路由组 readOnlyGuard
+	// 会先行拦截从节点写——此处语义为纵深注释，见 U3-P4-3 修正）。
+	if te := services.TaskEngine(); te != nil {
+		if !te.Cancel(id) {
+			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务未在运行中或不支持取消"})
+			return
+		}
+		recordAudit(c, "取消", "任务监控", "手动取消任务 "+id+"（下载阶段中断，已完成部分保留）")
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已发出取消信号，任务将在当前下载阶段中断"})
+		return
+	}
 	var cancelFn func() bool
 	var taskName string
 	switch id {
@@ -181,6 +219,9 @@ func (h *Handlers) CancelSystemTask(c *gin.Context) {
 }
 
 // ControlSystemTask 常驻循环启停（admin；body {"action":"start|stop|restart"}）。
+// P2-②：经 DescribeAll 的 Controllable 元数据路由——cert-waiting-ca 等
+// Continuous 族真正可控（曾硬编码三 ID map + TaskRuntime 死回退恒 400）；
+// TaskRuntime 注册表已随 M2 退役删除。
 func (h *Handlers) ControlSystemTask(c *gin.Context) {
 	id := c.Param("id")
 	var req struct {
@@ -190,26 +231,30 @@ func (h *Handlers) ControlSystemTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效（action=start|stop|restart）"})
 		return
 	}
-	engineControllable := map[string]bool{"config-watchdog": true, "security-events-ingestion": true, "log-cleanup": true}
-	if te := services.TaskEngine(); te != nil && engineControllable[id] {
-		if !te.IsRunning(id) && req.Action != "start" || te.IsRunning(id) && req.Action == "start" {
-			// 引擎语义: 启动需已停 / 停止与重启需在跑——幂等放行交由引擎
+	te := services.TaskEngine()
+	if te == nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "任务引擎未初始化"})
+		return
+	}
+	controllable := false
+	for _, m := range te.DescribeAll() {
+		if m.ID == id {
+			controllable = m.Controllable
+			break
 		}
-		switch req.Action {
-		case "start":
-			te.StartLoop(id)
-		case "stop":
-			te.StopLoop(id)
-		case "restart":
-			te.StopLoop(id)
-			te.StartLoop(id)
-		}
-	} else if _, controllable := services.TaskRuntimeState(id); !controllable {
+	}
+	if !controllable {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持启停（角色驱动或纯被动循环）"})
 		return
-	} else if !services.ControlTaskRuntime(id, req.Action) {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "控制执行失败"})
-		return
+	}
+	switch req.Action {
+	case "start":
+		te.StartLoop(id)
+	case "stop":
+		te.StopLoop(id)
+	case "restart":
+		te.StopLoop(id)
+		te.StartLoop(id)
 	}
 	switch req.Action {
 	case "start":
@@ -250,7 +295,13 @@ func (h *Handlers) GetSystemTaskLogs(c *gin.Context) {
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"content": ""}})
+		// U3-P4-4：文件不存在=空内容（任务尚未产生日志）；读失败=500（曾一律 200
+		// 空内容，与不存在不可区分）。
+		if errors.Is(err, os.ErrNotExist) {
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"content": ""}})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
 		return
 	}
 	// 尾部 256KB（日志弹框消费口径，防超长载荷）

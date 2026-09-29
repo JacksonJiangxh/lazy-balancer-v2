@@ -300,16 +300,8 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 		var existingCert, existingKey string
 		// Round 36 I-1: Round 35 误用 context.Background()，Issue 函数本身有 ctx 参数。
 		if err := db.DB.QueryRowContext(ctx, "SELECT COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id=?", jobID).Scan(&existingCert, &existingKey); err == nil && existingCert != "" && existingKey != "" {
-			renewalDays := 30
-			if err := db.DB.QueryRowContext(ctx, "SELECT COALESCE(cert_renewal_days,30) FROM global_config WHERE id=1").Scan(&renewalDays); err != nil {
-				Logf("error", "read cert_renewal_days failed, using default 30: %v", err)
-				renewalDays = 30
-			}
-			// 2026-09-07 C2 核实：UI 输入 min=1（FreeCertificates.vue），0/负值仅 API 直写/导入可达——
-			// 按「无效值→默认 30 天」兜底（非「禁用续签」语义；禁用请移除任务或禁用规则）。
-			if renewalDays <= 0 {
-				renewalDays = 30
-			}
+			// CERT42-5 告警 + C2 非正回退语义收敛于 GetCertRenewalDays（U7-P5-2）。
+			renewalDays := GetCertRenewalDays()
 			if notAfter, perr := parseCertNotAfter(existingCert); perr == nil && time.Until(notAfter) > time.Duration(renewalDays)*24*time.Hour {
 				// 规则 ca_provider_id=0（跟随默认）时不能拿 0 与任务中已解析的具体
 				// 提供商 ID 直接比较而误判为"提供商已切换"；先解析出规则实际使用的

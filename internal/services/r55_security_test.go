@@ -71,7 +71,7 @@ func TestCRSUpdateRun_snapshotPersistFailureIsAudited(t *testing.T) {
 	t.Cleanup(func() { crsSnapshotDir = oldSnapshotDir })
 
 	// When 更新跑完（快照持久化失败）
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then 更新仍按成功落库（磁盘规则树已是新版本）
 	version, status, _, _, _, _, _ := crsVersionRow(t)

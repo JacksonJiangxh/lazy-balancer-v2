@@ -38,9 +38,9 @@ type LogStorageInfo struct {
 // (SYS-1,2026-09-10 审计):自研 .1..9 shift 后缀;时间戳后缀家族——运行日志
 // <path>.YYYYMMDD-HHMMSS(logrotate.go)与 Caddy/timberjack 的 <name>-<ts>-size.log
 // isTimberjackRotationCopy 判定文件名是否为 timberjack 轮转副本
-// (<stem>-<ts>-size.log / .gz,ts 首字符为数字)。与 timestampedRotations
+// (<stem>-<ts>-size.log / .gz,ts 首字符为数字)。与 timestampedRotationStats
 // 的 timberjack 分支同口径(B-2 数字边界校验),聚合枚举时跳过这些副本
-// ——它们已由 base 文件的 timestampedRotations 计入 rotated,
+// ——它们已由 base 文件的 timestampedRotationStats 计入 rotated,
 // 再计入 active 即双计(F-A,第 6 轮审计)。
 func isTimberjackRotationCopy(name string) bool {
 	suffix := ""
@@ -77,16 +77,10 @@ func dirBytes(path string) (int64, int64, int) {
 	return active, rotated, count
 }
 
-// timestampedRotations 统计同目录下以「去扩展名 base + 分隔符 + 时间戳」命名的
-// 轮转副本:运行日志族 base.20260902-150405;timberjack 族 base-<ts>-size.log。
-func timestampedRotations(path string) int64 {
-	return mustSecond(timestampedRotationStats(path))
-}
-
-func mustSecond(b int64, _ int) int64 { return b }
-
-// timestampedRotationStats 是 timestampedRotations 的计数增强版(同时返回
-// 字节数与份数)——dirBytes 消费,供 LogStorageBar「已归档 N/M 份」展示。
+// timestampedRotationStats 统计同目录下以「去扩展名 base + 分隔符 + 时间戳」
+// 命名的轮转副本的字节数与份数——dirBytes 消费,供 LogStorageBar
+// 「已归档 N/M 份」展示。(U4-P3-1:计数弱化版 timestampedRotations/mustSecond
+// 生产零调用,已删。)
 func timestampedRotationStats(path string) (int64, int) {
 	dir := filepath.Dir(path)
 	// Sys-N1 根因(第 3 轮审计):运行日志 path=/app/logs/lazy-balancer.log,
@@ -196,9 +190,13 @@ func sizeLimitMB(column string, def int64) *int64 {
 // 生产值经 services.AuditLogPath() 单一源——SYSRENDER24-2)。
 var wafAuditLogFile = services.AuditLogPath()
 
+// defaultRuntimeLogPath 空 LOG_FILE 下的运行日志兜底路径（写入端写死
+// /app/logs，见 logPaths 注释）。包级 var 支持测试注入（wafAuditLogFile 同模式）。
+var defaultRuntimeLogPath = "/app/logs/lazy-balancer.log"
+
 func logPaths(cfg *config.Config) (fixedDir, runtimePath string) {
 	fixedDir = "/app/logs"
-	runtimePath = "/app/logs/lazy-balancer.log"
+	runtimePath = defaultRuntimeLogPath
 	if cfg == nil {
 		return fixedDir, runtimePath
 	}
@@ -291,27 +289,27 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		rtA, rtR, rtC := dirBytes(runtimePath)
 		info.SizeBytes, info.RotatedBytes, info.RotatedCount = rtA, rtR, rtC
 	}
+	// U4-P5-3:每文件恰好一次 dirBytes——四个体行与「caddy」聚合行共用同一批
+	// 结果(原先聚合行对同 4 文件再次 dirBytes,单响应 8 次 ReadDir,前端轮询放大;
+	// U2-4 security_events/coraza_audit 同模式先例)。
+	var caddyActive, caddyRotated int64
+	var caddyRotCount int
 	for _, entry := range []struct{ key, file string }{
 		{"caddy_runtime", "caddy.log"},
 		{"caddy_tls", "caddy-tls.log"},
 		{"caddy_server", "caddy-server.log"},
 		{"caddy_proxy", "caddy-proxy.log"},
 	} {
+		a, r, c := dirBytes(filepath.Join(fixedLogsDir, entry.file))
 		if info := byKey(entry.key); info != nil {
-			a, r, c := dirBytes(filepath.Join(fixedLogsDir, entry.file))
 			info.SizeBytes, info.RotatedBytes, info.RotatedCount = a, r, c
 		}
+		caddyActive += a
+		caddyRotated += r
+		caddyRotCount += c
 	}
 	if info := byKey("caddy"); info != nil {
-		var active, rotated int64
-		var rotCount int
-		for _, name := range []string{"caddy.log", "caddy-tls.log", "caddy-server.log", "caddy-proxy.log"} {
-			a, r, c := dirBytes(filepath.Join(fixedLogsDir, name))
-			active += a
-			rotated += r
-			rotCount += c
-		}
-		info.SizeBytes, info.RotatedBytes, info.RotatedCount = active, rotated, rotCount
+		info.SizeBytes, info.RotatedBytes, info.RotatedCount = caddyActive, caddyRotated, caddyRotCount
 	}
 	if info := byKey("coraza_audit"); info != nil {
 		info.SizeBytes, info.RotatedBytes, info.RotatedCount = auditActive, auditRotated, auditRotCount

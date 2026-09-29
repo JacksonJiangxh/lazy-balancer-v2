@@ -230,6 +230,11 @@ func expectedRenderedRules() (map[string]string, error) {
 	return expected, nil
 }
 
+// maxAdminConfigBytes 看门狗读取 Caddy 运行配置的解码上限——LB44-4 家族口径
+// 32MB（与 caddy.go:210/565/780 同源；U8-P4-2 对齐，原先 4MB 上限使 >4MB 配置
+// 漂移检测永久静默而 apply 仍工作至 32MB）。
+const maxAdminConfigBytes = 32 << 20
+
 // runningRuleRouteIDs 从 Caddy 运行配置收集规则路由 @id（lb_ 前缀），
 // 覆盖 http 与 layer4 两类服务器。
 func runningRuleRouteIDs(adminURL string) (map[string]bool, error) {
@@ -243,7 +248,7 @@ func runningRuleRouteIDs(adminURL string) (map[string]bool, error) {
 		return nil, fmt.Errorf("caddy admin status %d", resp.StatusCode)
 	}
 	var config map[string]interface{}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&config); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxAdminConfigBytes)).Decode(&config); err != nil {
 		return nil, err
 	}
 	ids := make(map[string]bool)

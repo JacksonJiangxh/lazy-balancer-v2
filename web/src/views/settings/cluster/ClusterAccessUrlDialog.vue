@@ -11,13 +11,7 @@
     @closed="resetForm"
   >
     <template #header>
-      <div class="dialog-header">
-        <div class="dialog-header__icon"><el-icon :size="18"><Link /></el-icon></div>
-        <div class="dialog-header__text">
-          <div class="dialog-header__title">编辑访问地址</div>
-          <div class="dialog-header__subtitle">浏览器可达的节点管理地址，留空回退注册地址</div>
-        </div>
-      </div>
+      <DialogHeader :icon="Link" title="编辑访问地址" subtitle="浏览器可达的节点管理地址，留空回退注册地址" />
     </template>
     <el-form ref="formRef" :model="form" :rules="rules" label-position="top" @submit.prevent="save">
       <el-form-item label="访问地址" prop="access_url">
@@ -45,6 +39,7 @@
 import { nextTick, reactive, ref, watch } from 'vue'
 import type { FormInstance, FormRules, InputInstance } from 'element-plus'
 import { Link } from '@element-plus/icons-vue'
+import DialogHeader from '@/components/DialogHeader.vue'
 import type { ClusterNode } from '@/types'
 
 interface AccessUrlForm {
@@ -140,14 +135,3 @@ const save = async (): Promise<void> => {
   if (valid) emit('save', form.access_url.trim())
 }
 </script>
-
-<style scoped>
-.dialog-header { display: flex; align-items: flex-start; gap: 12px; }
-.dialog-header__icon {
-  flex-shrink: 0; width: 36px; height: 36px; border-radius: 8px;
-  background: #ecf5ff; color: #409eff;
-  display: flex; align-items: center; justify-content: center;
-}
-.dialog-header__title { font-size: 16px; font-weight: 600; color: #111827; line-height: 1.4; }
-.dialog-header__subtitle { font-size: 12px; color: #6b7280; margin-top: 2px; }
-</style>

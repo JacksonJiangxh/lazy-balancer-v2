@@ -22,7 +22,7 @@ func TestCRSUpdateRun_nullIsMasterRunsAsMaster(t *testing.T) {
 	m.downloadTarball = func(context.Context, string, string, downloadProgressFunc) error { downloadCalled = true; return nil }
 
 	// When the update pipeline runs
-	m.run("auto")
+	m.run("auto", nil)
 
 	// Then it executes as master and reaches the latest-version skip branch
 	_, status, message, _, _, _, _ := crsVersionRow(t)
@@ -47,7 +47,7 @@ func TestCRSUpdateRun_slaveAborts(t *testing.T) {
 	m.downloadTarball = func(context.Context, string, string, downloadProgressFunc) error { downloadCalled = true; return nil }
 
 	// When the update pipeline runs
-	m.run("auto")
+	m.run("auto", nil)
 
 	// Then it aborts before recording any terminal state（行保持种子默认 idle）
 	_, status, _, _, _, _, _ := crsVersionRow(t)

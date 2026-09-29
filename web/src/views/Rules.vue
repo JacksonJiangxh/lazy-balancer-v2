@@ -322,13 +322,8 @@
 
     <el-dialog v-model="wizardVisible" width="min(800px, 94vw)" top="5vh" :close-on-click-modal="false" :before-close="beforeWizardClose" @close="resetWizard">
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon"><el-icon :size="18"><Connection /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">{{ editingRule ? '编辑规则' : (isCopyMode ? '复制规则' : '新建规则') }}</div>
-            <div class="dialog-header__subtitle">配置负载均衡规则的监听、TLS、上游与路由行为</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Connection" :title="editingRule ? '编辑规则' : (isCopyMode ? '复制规则' : '新建规则')"
+          subtitle="配置负载均衡规则的监听、TLS、上游与路由行为" />
       </template>
       <el-steps :active="visualStepIndex" finish-status="success" align-center class="wizard-steps" :class="{ 'is-clickable': stepsClickable }">
         <el-step title="基本配置" :icon="InfoFilled" @click="jumpToStep(WIZARD_STEP.BASIC)" />
@@ -916,13 +911,8 @@
     <!-- View Config Dialog -->
     <el-dialog v-model="configDialogVisible" width="min(900px, 94vw)" top="5vh" :close-on-click-modal="true" @close="onConfigDialogClosed">
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon"><el-icon :size="18"><Document /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">Caddy 配置</div>
-            <div class="dialog-header__subtitle">单规则渲染产物的只读预览（规则信息 / JSON / Caddyfile）</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Document" title="Caddy 配置"
+          subtitle="单规则渲染产物的只读预览（规则信息 / JSON / Caddyfile）" />
       </template>
       <div v-if="configLoading" v-loading="configLoading" style="min-height: 200px;"></div>
       <div v-else-if="ruleConfig" class="config-view">
@@ -1113,6 +1103,7 @@ import { ref, reactive, onMounted, onUnmounted, computed, watch, nextTick } from
 import { useAuthStore } from '@/stores/auth'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { Plus, Operation, Delete, InfoFilled, Lock, Connection, Guide, Check, ArrowLeft, ArrowRight, Document, CircleCheckFilled, CircleCloseFilled, QuestionFilled, Setting, RefreshRight, Search, WarningFilled, Location, Monitor, Link, Tickets } from '@element-plus/icons-vue'
+import DialogHeader from '@/components/DialogHeader.vue'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import axios from 'axios'
 import { ansiToHtml } from '@/utils/ansi'
@@ -3480,15 +3471,6 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-/* ── 通用弹框头部 ── */
-.dialog-header { display: flex; align-items: flex-start; gap: 12px; }
-.dialog-header__icon {
-  flex-shrink: 0; width: 36px; height: 36px; border-radius: 8px;
-  background: #ecf5ff; color: #409eff;
-  display: flex; align-items: center; justify-content: center;
-}
-.dialog-header__title { font-size: 16px; font-weight: 600; color: var(--text-primary, #111827); line-height: 1.4; }
-.dialog-header__subtitle { font-size: 12px; color: var(--text-secondary, #6b7280); margin-top: 2px; }
 .table-toolbar { display: flex; justify-content: flex-end; margin-bottom: 16px; }
 /* 表格密度（列宽重排 2026-09-21）：.cell 水平内边距 12→8px，12 列合计省 96px——
    总最小宽收敛进典型容器宽（消除横向滚动条）的前提项 */

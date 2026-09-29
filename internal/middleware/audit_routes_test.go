@@ -28,6 +28,11 @@ func TestSetupRouter_writeRoutesHaveExplicitAuditClassification(t *testing.T) {
 		//（S-8：handler 显式记录「生成/恢复码」），不再属有意跳过。
 		"POST /api/v1/auth/mfa/setup":       {},
 		"POST /api/v1/auth/mfa/verify-step": {},
+		// 三库手动更新：审计由任务体 defer 单记（2026-09-29 用户裁定 + Round 62
+		// U1-P3-2 收敛——handler 补记已撤、operator 经 RunContext 归人）。
+		"POST /api/v1/security/crs/update":        {},
+		"POST /api/v1/security/ip2region/update":  {},
+		"POST /api/v1/security/threat-lib/update": {},
 	}
 	writeMethods := map[string]struct{}{
 		http.MethodPost: {}, http.MethodPut: {}, http.MethodPatch: {}, http.MethodDelete: {},
