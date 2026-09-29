@@ -103,5 +103,5 @@ func (m *IP2RegionUpdateManager) schedulerTick(now time.Time, stop <-chan struct
 	}
 	// 失败退避机器已撤除（2026-09-25 用户裁定，与 CRS 侧同形）：重试在任务内
 	// 完成，next_update 恒为排程槽；手动插队竞态静默忽略。
-	_, _ = m.StartUpdate("auto")
+	_, _ = m.StartUpdate("auto", nil)
 }

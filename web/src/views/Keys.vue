@@ -706,17 +706,6 @@ onMounted(() => {
 </script>
 
 <style scoped>
-/* ── 通用弹框头部 ── */
-.dialog-header { display: flex; align-items: flex-start; gap: 12px; }
-.dialog-header__icon {
-  flex-shrink: 0; width: 36px; height: 36px; border-radius: 8px;
-  background: #ecf5ff; color: #409eff;
-  display: flex; align-items: center; justify-content: center;
-}
-.dialog-header__icon--warning { background: #fdf6ec; color: #e6a23c; }
-.dialog-header__icon--success { background: #f0f9eb; color: #67c23a; }
-.dialog-header__title { font-size: 16px; font-weight: 600; color: var(--text-primary, #111827); line-height: 1.4; }
-.dialog-header__subtitle { font-size: 12px; color: var(--text-secondary, #6b7280); margin-top: 2px; }
 .section-divider { margin: 24px 0 20px; }
 .section-divider :deep(.el-divider__text) { font-size: 14px; color: var(--text-secondary, #6b7280); font-weight: 600; }
 .switch-hint { margin-left: 10px; font-size: 12px; color: var(--text-secondary, #6b7280); }

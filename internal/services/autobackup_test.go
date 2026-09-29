@@ -255,7 +255,7 @@ func setupAutoBackupTestDB(t *testing.T) {
 
 func setAutoBackupTestExecutor(t *testing.T, calls *[]string, err error) {
 	t.Helper()
-	SetAutoBackupExecutor(func(trigger, operator string) error {
+	SetAutoBackupExecutor(func(trigger, operator string, engineRunID int64) error {
 		*calls = append(*calls, trigger+":"+operator)
 		return err
 	})

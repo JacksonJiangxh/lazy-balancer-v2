@@ -201,13 +201,7 @@
          点「启用 MFA」发起绑定：扫码 → 输码 → 恢复码。 -->
     <el-dialog v-model="mfaBinding.visible" width="min(520px, 92vw)" :close-on-click-modal="false" @closed="mfaBindingClosed">
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon dialog-header__icon--primary"><el-icon :size="18"><Lock /></el-icon></div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">启用 MFA（两步验证）</div>
-            <div class="dialog-header__subtitle">扫码绑定验证器 → 输码验证 → 保存恢复码</div>
-          </div>
-        </div>
+        <DialogHeader :icon="Lock" title="启用 MFA（两步验证）" subtitle="扫码绑定验证器 → 输码验证 → 保存恢复码" tone="primary" />
       </template>
       <el-steps :active="mfaBinding.step" simple style="margin-bottom: 18px">
         <el-step title="扫码" />
@@ -253,15 +247,11 @@
          与全站 icon+标题+副标题弹框语言一致)。 -->
     <el-dialog v-model="lbDialog.visible" width="min(500px, 92vw)" :close-on-click-modal="false" @update:model-value="lbCancel()">
       <template #header>
-        <div class="dialog-header">
-          <div class="dialog-header__icon" :class="`dialog-header__icon--${lbDialog.spec?.tone || 'primary'}`">
-            <el-icon :size="18"><component :is="lbDialog.spec?.icon === 'key' ? Key : lbDialog.spec?.icon === 'warning' ? Warning : Lock" /></el-icon>
-          </div>
-          <div class="dialog-header__text">
-            <div class="dialog-header__title">{{ lbDialog.spec?.title }}</div>
-            <div v-if="lbDialog.spec?.subtitle" class="dialog-header__subtitle">{{ lbDialog.spec.subtitle }}</div>
-          </div>
-        </div>
+        <DialogHeader
+          :icon="lbDialog.spec?.icon === 'key' ? Key : lbDialog.spec?.icon === 'warning' ? Warning : Lock"
+          :title="lbDialog.spec?.title || ''" :subtitle="lbDialog.spec?.subtitle"
+          :tone="lbDialog.spec?.tone || 'primary'"
+        />
       </template>
       <div v-if="lbDialog.spec?.message" class="lb-message">{{ lbDialog.spec.message }}</div>
       <div v-if="lbDialog.spec?.mode === 'reset-pwd'" class="lb-fields">
@@ -296,6 +286,7 @@ import { request, mfaAwareSuccess, normalizeMfaCodeInput, validateMfaCodeInput }
 import { formatDate } from '@/utils/date'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { UserFilled, User, Plus, Key, Lock, Warning } from '@element-plus/icons-vue'
+import DialogHeader from '@/components/DialogHeader.vue'
 import QRCode from 'qrcode'
 import type { APIResponse, UserListItem } from '@/types'
 const oidcOpen = ref(false)
@@ -738,17 +729,6 @@ onMounted(() => {
 </script>
 
 <style scoped>
-/* ── 通用弹框头部 ── */
-.dialog-header { display: flex; align-items: flex-start; gap: 12px; }
-.dialog-header__icon {
-  flex-shrink: 0; width: 36px; height: 36px; border-radius: 8px;
-  background: #ecf5ff; color: #409eff;
-  display: flex; align-items: center; justify-content: center;
-}
-.dialog-header__icon--primary { background: #ecf5ff; color: #409eff; }
-.dialog-header__icon--warning { background: #fdf6ec; color: #e6a23c; }
-.dialog-header__title { font-size: 16px; font-weight: 600; color: var(--text-primary, #111827); line-height: 1.4; }
-.dialog-header__subtitle { font-size: 12px; color: var(--text-secondary, #6b7280); margin-top: 2px; }
 .lb-message { font-size: 13.5px; color: var(--text-regular, #374151); line-height: 1.7; margin-bottom: 4px; }
 .lb-fields { display: flex; flex-direction: column; gap: 14px; margin-top: 12px; }
 .lb-field__label { font-size: 13px; color: var(--text-regular, #374151); margin-bottom: 6px; }

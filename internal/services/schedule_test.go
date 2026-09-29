@@ -480,7 +480,7 @@ func TestCRSUpdate_successReschedulesToConfiguredSlot(t *testing.T) {
 	m.fetchLatestTag = func(context.Context) (string, error) { return "v4.14.0", nil }
 
 	// When
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then 成功路径把 next_update 重排到槽位（而非 datetime('now','+24 hours')）
 	want := NextScheduledSlot(time.Now().UTC(), []int{2}, "04:30", loc)
@@ -502,7 +502,7 @@ func TestIP2RegionUpdate_successReschedulesToConfiguredSlot(t *testing.T) {
 	}
 	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.0.0", nil }
 
-	m.run("manual")
+	m.run("manual", nil)
 
 	want := NextScheduledSlot(time.Now().UTC(), []int{2}, "04:30", loc)
 	_, status, _, _, _, nextUpdate, _ := ip2RegionVersionRow(t)

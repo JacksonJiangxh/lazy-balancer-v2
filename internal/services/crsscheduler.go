@@ -159,5 +159,5 @@ func (m *CRSUpdateManager) schedulerTick(now time.Time, stop <-chan struct{}) {
 	// StartUpdate 唯一可预期错误是 ErrXXXUpdateRunning——IsRunning 前置守卫与取锁
 	// 之间的微秒窗口被手动更新插队时返回，属正常竞态，静默忽略（手动 run 的终态
 	// 由操作者直接观察）。
-	_, _ = m.StartUpdate("auto")
+	_, _ = m.StartUpdate("auto", nil)
 }

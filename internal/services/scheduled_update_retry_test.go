@@ -42,7 +42,7 @@ func TestCRSRun_inTaskRetry_succeedsAfterTransientFailures(t *testing.T) {
 		return "v4.14.0", nil
 	}
 
-	m.run("auto")
+	m.run("auto", nil)
 
 	if got := atomic.LoadInt32(&calls); got != 3 {
 		t.Fatalf("fetchLatestTag 调用 %d 次, want 3（任务内重试）", got)
@@ -75,7 +75,7 @@ func TestCRSRun_inTaskRetry_exhaustedKeepsScheduleSlot(t *testing.T) {
 		return "", errors.New("GitHub 返回 403")
 	}
 
-	m.run("auto")
+	m.run("auto", nil)
 
 	if got := atomic.LoadInt32(&calls); got != 3 {
 		t.Fatalf("fetchLatestTag 调用 %d 次, want 3（最多 3 次尝试后落定）", got)
@@ -151,7 +151,7 @@ func TestIP2RegionRun_inTaskRetry_exhaustedKeepsScheduleSlot(t *testing.T) {
 		return "", errors.New("GitHub 返回 403")
 	}
 
-	m.run("auto")
+	m.run("auto", nil)
 
 	if got := atomic.LoadInt32(&calls); got != 3 {
 		t.Fatalf("fetchLatestTag 调用 %d 次, want 3（任务内重试）", got)

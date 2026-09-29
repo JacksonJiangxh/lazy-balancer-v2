@@ -16,6 +16,9 @@ func IP2RegionUpdateLogPath() string {
 }
 
 func writeIP2RegionUpdateLog(level, stage, message string) {
+	// 历史问题-5：运行流水统一 tee 到任务日志（自动更新在 tasks/ip2region.log 留痕——
+	// 曾仅导入/同步 Append* tee，自动更新任务日志零痕迹）。
+	taskengine.TeeTaskLog("ip2region", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
 	path := IP2RegionUpdateLogPath()
 	if info, err := os.Stat(path); err == nil && info.Size() >= getCertJobLogSizeBytes() {
 		// S历史问题-10 同族:复用 rotateCertJobLogFiles(历史问题 错误口径)。

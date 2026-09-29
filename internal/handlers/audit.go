@@ -21,3 +21,12 @@ func recordAudit(c *gin.Context, action, resource, detail string) {
 	}
 	services.RecordAuditLog(usernameStr, action, resource, detail, ip)
 }
+
+// auditOperator 提取当前操作者用户名（空=system——任务体按 system 记）。
+func auditOperator(c *gin.Context) string {
+	username, _ := c.Get("username")
+	if s, ok := username.(string); ok && s != "" {
+		return s
+	}
+	return "system"
+}

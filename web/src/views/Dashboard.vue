@@ -1002,7 +1002,6 @@ const dashboardPolling = usePollingTask(async () => fetchAllData(), {
 })
 
 onMounted(() => {
-  void dashboardPolling.run()
   // 首跑立即（usePollingTask.start() 只设定时器，首轮要等满 interval 5s——
   // 页面会空转圈整轮；与任务监控页同修）
   void dashboardPolling.run()

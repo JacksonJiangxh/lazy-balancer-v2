@@ -320,7 +320,8 @@ func (h *Handlers) GetBranding(c *gin.Context) {
 	// (与 SeedDefaultBlockPage 同模式:主节点限定、异步、幂等)。
 	// 编辑最坏延迟 60s 可见。原始依据：幂等同步在 boot+首请求已完成，稳态
 	// 每请求 ~7 条 SQL 是公开无鉴权端点的残余放大面；门内跳过同步/种子/镜像
-	// （branding.json 为手工编辑的文档化用法，无管理写路径，带外
+	// （branding.json 为手工编辑的文档化用法，无管理写路径，带外手工编辑
+	// 最坏经门内采样延迟 60s 可见，与上方门语义一致）。
 	if brandingSyncGateAllow() {
 		needApply := false
 		if changed, _ := SyncDefaultLandingText(h.cfg.DataDir); changed {

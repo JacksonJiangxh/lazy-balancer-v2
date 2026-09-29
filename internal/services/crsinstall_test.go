@@ -128,7 +128,7 @@ func TestCRSUpdateRun_successWhenRenameUnavailable(t *testing.T) {
 	})
 
 	// When a manual update runs to completion
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then the update succeeds despite rename being unavailable
 	_, status, message, _, _, _, _ := crsVersionRow(t)
@@ -167,7 +167,7 @@ func TestCRSUpdateRun_backupCopyFailureLeavesNoPartialRulesBak(t *testing.T) {
 	m.reloader = func() error { return nil }
 
 	// When 更新在 rules 备份步骤失败
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then 不残留部分 rules.bak（或 tmp 暂存）供 restoreBackup 消费，live
 	// 规则树完整原样保留（两个文件都在——残树搬入 live 会丢掉 901）
@@ -222,7 +222,7 @@ func TestCRSUpdateRun_installFailureRemovesFreshlyCreatedOverrides(t *testing.T)
 	}
 
 	// When installation fails at the reload step
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then the update is failed, the old setup is back, and the freshly created
 	// overrides file is gone——restore 后 reload 成功（第二次重载返回 nil）
@@ -266,7 +266,7 @@ func TestCRSUpdateRun_installFailureRestoresPreexistingOverrides(t *testing.T) {
 	m.reloader = func() error { return errors.New("reload boom") }
 
 	// When installation fails at the reload step
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then the overrides file is back to its pre-update content
 	overrides, err := os.ReadFile(filepath.Join(m.crsDir, "zz-user-overrides.conf"))
@@ -307,7 +307,7 @@ func TestCRSUpdateRun_preservedOverridesBakSurvivesNextRunFailure(t *testing.T) 
 	})
 
 	// When N+1 在创建新 bak 前失败
-	m.run("manual")
+	m.run("manual", nil)
 
 	// Then 保全副本原样保留，overrides 未被本次迁移触碰
 	data, err := os.ReadFile(crsTransientPath(m.crsDir, "zz-user-overrides.conf.bak"))
@@ -334,7 +334,7 @@ func TestCRSUpdate_recordsReloadAudit(t *testing.T) {
 		"coreruleset-4.15.0/rules/" + crsRulesProbeFile: "# init probe\n",
 	})
 	m.reloader = func() error { return nil }
-	m.run("manual")
+	m.run("manual", nil)
 
 	var n int
 	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE action='重载' AND resource='Caddy服务' AND detail LIKE '%CRS 规则库更新%'").Scan(&n); err != nil {
@@ -356,7 +356,7 @@ func TestCRSUpdate_recordsReloadFailureAudit(t *testing.T) {
 		"coreruleset-4.15.0/rules/" + crsRulesProbeFile: "# init probe\n",
 	})
 	m.reloader = func() error { return errors.New("reload boom") }
-	m.run("manual")
+	m.run("manual", nil)
 
 	var n int
 	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE action='重载失败' AND resource='Caddy服务' AND detail LIKE '%CRS 规则库更新%'").Scan(&n); err != nil {
