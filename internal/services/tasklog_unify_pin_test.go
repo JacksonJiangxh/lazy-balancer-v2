@@ -99,3 +99,30 @@ func TestCollectCertJobRows_excludesSyncedMaterialRows(t *testing.T) {
 		t.Fatal("真实签发行应保留显示")
 	}
 }
+
+// Given 超 1 天的 issued 签发任务行。
+// When collectCertJobRows。
+// Then 行存在即显示（2026-10-01 用户裁定——无状态/时间过滤）；但 24h 计数
+// 归零（超窗不计数）。
+func TestCollectCertJobRows_oldTerminalStillShown(t *testing.T) {
+	oldDB, oldM, oldA := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close(); db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA })
+	old := time.Now().UTC().AddDate(0, 0, -3).Format("2006-01-02 15:04:05")
+	db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r9','old.test','issued',?)`, old)
+	rows := collectCertJobRows()
+	found := false
+	for _, r := range rows {
+		if strings.Contains(r.Name, "old.test") {
+			found = true
+			if r.Success24h != 0 {
+				t.Fatalf("超 24h 窗口的 issued 行不应计数, got %d", r.Success24h)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("超 1 天的 issued 行仍应显示（存在即显示）")
+	}
+}
