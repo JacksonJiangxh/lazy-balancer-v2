@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"lazy-balancer-v2/internal/taskengine"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +43,8 @@ func TestExtractSetupDiff(t *testing.T) {
 
 func TestCRSUpdateRun_migratesSetupCustomizationsAndInstallsNewStock(t *testing.T) {
 	// Given a live setup that diverges from the installed stock baseline
+	taskengine.SetLogDir(t.TempDir())
+	t.Cleanup(func() { taskengine.SetLogDir("") })
 	m := newTestCRSManager(t)
 	seedCRSVersionRow(t, "v4.14.0", true)
 	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf"), "SecRule old")
@@ -90,9 +93,9 @@ func TestCRSUpdateRun_migratesSetupCustomizationsAndInstallsNewStock(t *testing.
 	}
 
 	// And the migration was logged with the extracted line count
-	logData, err := os.ReadFile(CRSUpdateLogPath())
+	logData, err := os.ReadFile(taskengine.TaskLogPath("crs"))
 	if err != nil || !strings.Contains(string(logData), "已迁移 2 行用户自定义配置到 zz-user-overrides.conf") {
-		t.Fatalf("crs-update.log=%q,%v, want migration entry with count", logData, err)
+		t.Fatalf("tasks/crs.log=%q,%v, want migration entry with count", logData, err)
 	}
 }
 

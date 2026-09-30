@@ -92,7 +92,14 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Run: func(rc taskengine.RunContext) error {
 			if logFile != "" {
 				removed := RuntimeLogCleanupOnce(logFile)
-				TaskLogf("log-cleanup", "cleanup", "运行日志轮转副本清理完成：删除 %d 个过期副本（保留 %d 月，无过期为 0）", removed, 3)
+				months := 3
+				if database := db.GetDB(); database != nil {
+					var m int
+					if err := database.QueryRow("SELECT COALESCE(audit_retention_months,3) FROM global_config WHERE id=1").Scan(&m); err == nil && m >= 1 {
+						months = m
+					}
+				}
+				TaskLogf("log-cleanup", "cleanup", "运行日志轮转副本清理完成：删除 %d 个过期副本（保留 %d 月，无过期为 0）", removed, months)
 			}
 			return nil
 		},
@@ -304,8 +311,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Category:    "系统", Kind: taskengine.KindContinuous,
 		IntervalFn: func() time.Duration { return 24 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
-			SecurityEventsRetentionCleanupOnce()
-			TaskLogf("security-events-retention", "cleanup", "安全事件保留清理完成（按保留期与条数上限，明细见运行日志）")
+			deleted := SecurityEventsRetentionCleanupOnce()
+			TaskLogf("security-events-retention", "cleanup", "安全事件保留清理完成：删除 %d 条（保留期与条数上限，无过期为 0）", deleted)
 			return nil
 		},
 	})

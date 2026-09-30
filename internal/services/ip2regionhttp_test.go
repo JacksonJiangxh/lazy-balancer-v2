@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"lazy-balancer-v2/internal/taskengine"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -112,6 +113,8 @@ func TestIP2RegionDownloadXDBLogged_startAndCompletionLines(t *testing.T) {
 	defer srv.Close()
 	withGHFastProxy(t, srv.URL+"/")
 
+	taskengine.SetLogDir(t.TempDir())
+	t.Cleanup(func() { taskengine.SetLogDir("") })
 	m := newTestIP2RegionManager(t)
 	dest := filepath.Join(t.TempDir(), "ip2region_v4.xdb")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -128,7 +131,7 @@ func TestIP2RegionDownloadXDBLogged_startAndCompletionLines(t *testing.T) {
 	}
 
 	// And 更新日志包含：开始行（完整代理 URL+预计大小）与完成行（字节+耗时）
-	data, err := os.ReadFile(IP2RegionUpdateLogPath())
+	data, err := os.ReadFile(taskengine.TaskLogPath("ip2region"))
 	if err != nil {
 		t.Fatal(err)
 	}
