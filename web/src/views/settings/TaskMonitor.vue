@@ -126,8 +126,9 @@
         </el-table-column>
         <el-table-column label="调度" width="92">
           <template #default="{ row }">
-            <!-- 定时族统一调度开关：暂停/恢复自动调度 -->
-            <el-switch v-if="row.kind === 'scheduled'" :model-value="row.enabled" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
+            <!-- 调度开关按 Toggleable 元数据判定（/toggle 端点同口径）：
+                 后端全部定时族声明 ToggleFn 即 toggleable=true——一律渲染开关 -->
+            <el-switch v-if="row.toggleable" :model-value="row.enabled" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
             <!-- 常驻族：开关=常驻循环启停（非调度开关），绑定 loop_on 走 control -->
             <el-tooltip v-else-if="row.kind === 'continuous'" content="常驻循环启停（非调度开关）" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <el-switch :model-value="row.loop_on" :disabled="!isAdmin" @change="(v: string | number | boolean) => onControl(row, !!v)" />
@@ -218,8 +219,8 @@
         <el-descriptions :column="2" border size="small" class="tm-detail-descs">
           <el-descriptions-item label="运行节奏">{{ detailTask.cadence || '—' }}</el-descriptions-item>
           <el-descriptions-item label="调度开关">
-            <!-- 与列表调度列同语义三分支（详情为快照展示，不绑开关） -->
-            <el-tag v-if="detailTask.kind === 'scheduled'" size="small" :type="detailTask.enabled ? 'success' : 'warning'" effect="plain">{{ detailTask.enabled ? '开启' : '已暂停' }}</el-tag>
+            <!-- 与列表调度列同语义三分支（详情为快照展示，不绑开关；Toggleable 判定同列） -->
+            <el-tag v-if="detailTask.toggleable" size="small" :type="detailTask.enabled ? 'success' : 'warning'" effect="plain">{{ detailTask.enabled ? '开启' : '已暂停' }}</el-tag>
             <el-tooltip v-else-if="detailTask.kind === 'continuous'" content="常驻循环启停（非调度开关）" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <el-tag size="small" :type="detailTask.loop_on ? 'success' : 'warning'" effect="plain">{{ detailTask.loop_on ? '循环运行中' : '循环已停止' }}</el-tag>
             </el-tooltip>
@@ -308,6 +309,7 @@ interface TaskInfo {
   id: string; name: string; description?: string; cadence?: string; category: string
   kind: 'scheduled' | 'continuous' | 'queue' | 'info' | 'oneshot'
   status: string; enabled: boolean; cancellable: boolean; controllable?: boolean; triggerable?: boolean
+  toggleable: boolean // 调度开关可暂停/恢复（后端 ToggleFn 声明族——调度列开关渲染判据）
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
   loop_on?: boolean; started_at?: string // 常驻族：循环启停态（调度列开关绑定值）/ 引擎启动时刻
 }
