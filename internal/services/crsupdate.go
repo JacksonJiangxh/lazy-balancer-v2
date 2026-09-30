@@ -387,10 +387,6 @@ func (m *CRSUpdateManager) fail(cause error, restore bool) {
 	}
 	// 连续失败计数 +1（失败趋势可观测；操作审计由 run 的 defer 单记——
 	// U1-P3-2 收敛后内联首败审计已撤）。
-	var failures int
-	if err := db.DB.QueryRow("SELECT consecutive_failures FROM security_crs_version WHERE id=1").Scan(&failures); err != nil {
-		failures = 0 // 计数读取失败时保守按首次失败处理（审计照常写入）
-	}
 	if _, err := db.DB.Exec(
 		"UPDATE security_crs_version SET update_status='failed', message=?, finished_at=datetime('now'), consecutive_failures=consecutive_failures+1 WHERE id=1",
 		cause.Error(),

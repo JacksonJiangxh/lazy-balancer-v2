@@ -86,12 +86,6 @@ func (m *ThreatUpdateManager) StopScheduler() {
 
 // ThreatSchedulerTickOnce 单轮调度探测（引擎 1min 节拍调用——到期源才
 // 启动任务；内部自带 is_master/总闸/单飞门）。
-func ThreatSchedulerTickOnce() {
-	if m := GetThreatUpdateManager(); m != nil {
-		m.schedulerTick(time.Now().UTC())
-	}
-}
-
 func (m *ThreatUpdateManager) schedulerTick(now time.Time) {
 	var isMaster bool
 	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {

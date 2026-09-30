@@ -408,10 +408,6 @@ func (m *IP2RegionUpdateManager) fail(cause error) {
 	// 避免代理持续故障时每小时刷一条操作日志稀释审计线索。
 	// 先读当前计数，审计判定用「当前计数+1」（与 UPDATE 落库同一数值来源）：
 	// UPDATE 失败时判定不会回退到旧计数，避免第 2 次失败重复写审计（R36 F3）。
-	var failures int
-	if err := db.DB.QueryRow("SELECT consecutive_failures FROM security_ip2region_version WHERE id=1").Scan(&failures); err != nil {
-		failures = 0 // 计数读取失败时保守按首次失败处理（审计照常写入）
-	}
 	if _, err := db.DB.Exec(
 		"UPDATE security_ip2region_version SET update_status='failed', message=?, finished_at=datetime('now'), consecutive_failures=consecutive_failures+1 WHERE id=1",
 		cause.Error(),
@@ -424,8 +420,6 @@ func (m *IP2RegionUpdateManager) fail(cause error) {
 	m.state.finishedAt = time.Now().UTC()
 	m.mu.Unlock()
 	writeIP2RegionUpdateLog("ERROR", string(IP2RegionStatusFailed), cause.Error())
-	if failures+1 <= 1 {
-	}
 }
 
 // downloadAndInstall downloads, validates and atomically swaps in the new xdb.
