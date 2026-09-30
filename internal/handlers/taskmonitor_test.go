@@ -109,14 +109,16 @@ func TestTriggerSystemTask_gatesAndMapping(t *testing.T) {
 	}
 }
 
-// toggle：threat 关自动 → 200 + 服务层开关翻转。
+// toggle：v2.0 统一调度开关——threat 关调度 → 200 + 引擎循环态翻转
+// （业务自动更新开关不受影响——那是安全设置页的字段）。
 func TestToggleSystemTask_threatSwitch(t *testing.T) {
 	initTaskEngineForTest(t)
 	newBackupTestHandlers(t)
-	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=1 WHERE id=1`); err != nil {
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=1, threat_auto_update=1 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	services.InitThreatUpdateManager()
+	te := services.TaskEngine()
 	r, _ := taskMonitorRouter()
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/system/tasks/threat/toggle", strings.NewReader(`{"enabled":false}`))
@@ -125,13 +127,14 @@ func TestToggleSystemTask_threatSwitch(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("toggle status=%d body=%s", resp.Code, resp.Body.String())
 	}
-	if services.ThreatAutoUpdateEnabled() {
-		t.Fatal("toggle off 后 ThreatAutoUpdateEnabled 须为 false")
+	if te.IsRunning("threat") {
+		t.Fatal("toggle off 后 threat 调度应关闭（IsRunning=false）")
+	}
+	if !services.ThreatAutoUpdateEnabled() {
+		t.Fatal("业务自动更新开关不应被调度开关联动（v2.0 两层独立）")
 	}
 	// 恢复（避免污染其他测试）
-	if _, err := db.DB.Exec(`UPDATE global_config SET threat_auto_update=1 WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
+	te.StartLoop("threat")
 }
 
 // cancel：未运行 → 409；非下载类 → 400。

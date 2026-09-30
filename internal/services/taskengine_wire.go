@@ -1,10 +1,11 @@
 package services
 
-// 任务引擎接线（v2.3.4 M2）：全部任务族（15 描述符）迁入统一引擎——引擎
-// 驱动节拍（单轮体），原生自循环进程退役；TaskRuntime 注册表已删除
-// （引擎 StartLoop/StopLoop/IsRunning 承接，U1-P4-1 退役执行）。
-// main.go 启动顺序变更：InitTaskEngine（含崩溃恢复+注册+启动循环）替代
-// 原 StartConfigWatchdog / StartSecurityEventsIngestion / StartRuntimeLogCleanup。
+// 任务引擎接线（v2.0 四类型标准）：Kind 决定调度/记录/日志——零 flag。
+// 定时(4)：NextSlotFn 排程槽驱动，Run 纯业务（无到期检查）
+// 常驻(3)：Run 阻塞自管理循环，引擎仅管生命周期
+// 循环(8)：IntervalFn 固定间隔，每轮独立执行+记录
+// 触发(1)：仅手动/代码触发
+// cert-waiting-ca：默认调度关闭——cert-renewal-scan 入队时唤醒，全部终态自动停。
 
 import (
 	"errors"
@@ -28,58 +29,55 @@ func SetConfigLoadRerun(fn func() error) { configLoadRerun = fn }
 // TaskEngine 返回全局引擎实例（未初始化返回 nil——测试环境）。
 func TaskEngine() *taskengine.Engine { return taskEngine }
 
-// InitTaskEngine 建引擎、恢复孤儿运行、注册常驻三族并启动循环。幂等。
-// watchdogAdminURL：看门狗检查的 Caddy admin 地址；runtimeLogFile：运行
-// 日志清理的日志文件路径（空则跳过该族注册）。
+// parseUTCSlot 解析 DB 存的 UTC 排程串为 time.Time（crsTimeLayout 与
+// RFC3339 双形态——与 localDisplayUTC 同口径）。
+func parseUTCSlot(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{crsTimeLayout, time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+// InitTaskEngine 建引擎、恢复孤儿运行、注册全部 17 任务并启动默认循环。幂等。
 func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine {
 	if taskEngine != nil {
 		return taskEngine
 	}
-	taskengine.SetLocation(CurrentLocation()) // 引擎时间遵循基础设置时区
+	taskengine.SetLocation(CurrentLocation())
 	logsDir := "/app/logs"
 	if runtimeLogFile != "" {
 		logsDir = filepath.Dir(runtimeLogFile)
 	}
 	tasksLogDir := filepath.Join(logsDir, "tasks")
 	_ = os.MkdirAll(tasksLogDir, 0755)
-	taskengine.SetLogDir(tasksLogDir) // 每任务文本日志（统一管理）
+	taskengine.SetLogDir(tasksLogDir)
 	taskEngine = taskengine.NewEngine(taskengine.Options{})
 	_ = taskEngine.RecoverOrphans()
 
-	// 看门狗：60s 单轮一致性检查（引擎节拍；原生自循环进程不再启动）
+	// ============ 循环（8）============
+
+	// 看门狗：60s 一致性检查（每轮记录——60s 非高频，日志有大小限制）
 	watchdogAdminURLValue = watchdogAdminURL
 	taskEngine.Register(taskengine.Descriptor{
-		ID:                 "config-watchdog",
-		Family:             "system",
-		Name:               "配置漂移看门狗",
-		Description:        "每 60 秒比对运行中 Caddy 配置与数据库期望配置，漂移时面板横幅告警并触发对账",
-		Category:           "系统",
-		Kind:               taskengine.KindContinuous,
-		RecordFailuresOnly: true,
-		IntervalFn:         func() time.Duration { return 60 * time.Second },
+		ID:          "config-watchdog",
+		Family:      "system",
+		Name:        "配置漂移看门狗",
+		Description: "每 60 秒比对运行中 Caddy 配置与数据库期望配置，漂移时面板横幅告警并触发对账",
+		Category:    "系统",
+		Kind:        taskengine.KindPeriodic,
+		IntervalFn:  func() time.Duration { return 60 * time.Second },
 		Run: func(rc taskengine.RunContext) error {
 			WatchdogCheckOnce()
 			return nil
 		},
 	})
 
-	// 安全事件摄取：2s 单轮（先采集后轮转——tailer 跨轮复用保 offset 连续）
-	taskEngine.Register(taskengine.Descriptor{
-		ID:                 "security-events-ingestion",
-		Family:             "system",
-		Name:               "安全事件采集",
-		Description:        "尾读 coraza WAF 审计日志并摄取为安全事件（安全总览/事件页的数据源），含审计日志轮转跟随",
-		Category:           "系统",
-		Kind:               taskengine.KindContinuous,
-		RecordFailuresOnly: true,
-		IntervalFn:         func() time.Duration { return 2 * time.Second },
-		Run: func(rc taskengine.RunContext) error {
-			SecurityEventsPollOnce()
-			return nil
-		},
-	})
-
-	// 运行日志清理：每日单轮（日志文件路径为空时 Run 空转——注册恒在，任务族清单稳定）
+	// 运行日志清理：每日
 	logFile := runtimeLogFile
 	taskEngine.Register(taskengine.Descriptor{
 		ID:          "log-cleanup",
@@ -87,17 +85,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Name:        "运行日志轮转副本清理",
 		Description: "删除超过保留期（与审计保留月数同配置）的应用日志轮转副本（app.log.*）",
 		Category:    "系统",
-		Kind:        taskengine.KindContinuous,
-		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关
-			if enabled {
-				taskEngine.StartLoop("log-cleanup")
-			} else {
-				taskEngine.StopLoop("log-cleanup")
-			}
-			return nil
-		},
-		ToggleName: "运行日志清理",
-		IntervalFn: func() time.Duration { return 24 * time.Hour },
+		Kind:        taskengine.KindPeriodic,
+		IntervalFn:  func() time.Duration { return 24 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
 			if logFile != "" {
 				removed := RuntimeLogCleanupOnce(logFile)
@@ -114,23 +103,172 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	// M3：三更新族排程探测（1min 单轮；内部自带 due/总闸/单飞门；
-	// master-only——引擎角色门与族内 is_master 检查双保险）
 	taskEngine.Register(taskengine.Descriptor{
-		ID: "threat", Family: "security", Name: "威胁情报库更新",
-		Description: "每日从 USTC/FireHOL/ET 三源下载恶意 IP 名单，聚合去重后写入威胁库文件并同步从节点——引用名单的安全策略据此拦截",
-		Category:    "安全防护", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
-		Singleton:    true, // P3-7：任务监控双击窗口防假 failed 行
-		SilentProbes: true, // 探测轮不落库——真实工作 SignalledWork 后引擎补插
-		Cadence:      "排程槽（可配置星期/时刻）",
-		IntervalFn:   func() time.Duration { return time.Minute },
-		EnabledFn:    func() bool { return ThreatAutoUpdateEnabled() },
-		NextSlotFn: func() string {
-			if n := earliestThreatNextUpdate(); n != "" {
-				return localDisplayUTC(n)
+		ID:          "audit-retention",
+		Family:      "system",
+		Name:        "审计日志保留清理",
+		Description: "按「审计保留月数」配置删除 audit 库过期操作日志（基础设置可调）；并清理 90 天前的任务运行历史（task_runs）",
+		Category:    "系统",
+		Kind:        taskengine.KindPeriodic,
+		IntervalFn:  func() time.Duration { return 24 * time.Hour },
+		Run: func(rc taskengine.RunContext) error {
+			auditDeleted := CleanupAuditLogs()
+			runsDeleted := taskengine.PurgeTaskRuns(90)
+			TaskLogf("audit-retention", "cleanup", "清理完成：审计日志 %d 条、任务运行历史 %d 行（无过期数据时为 0）", auditDeleted, runsDeleted)
+			return nil
+		},
+	})
+
+	taskEngine.Register(taskengine.Descriptor{
+		ID:          "security-events-retention",
+		Family:      "system",
+		Name:        "安全事件保留清理",
+		Description: "按保留期配置删除 metrics 库中过期的安全事件记录",
+		Category:    "系统",
+		Kind:        taskengine.KindPeriodic,
+		IntervalFn:  func() time.Duration { return 24 * time.Hour },
+		Run: func(rc taskengine.RunContext) error {
+			deleted := SecurityEventsRetentionCleanupOnce()
+			TaskLogf("security-events-retention", "cleanup", "安全事件保留清理完成：删除 %d 条（保留期与条数上限，无过期为 0）", deleted)
+			return nil
+		},
+	})
+
+	taskEngine.Register(taskengine.Descriptor{
+		ID: "cert-renewal-scan", Family: "certificates", Name: "证书续期扫描",
+		Description: "扫描全部证书配置的到期时间，临期证书自动入队续签；入队时唤醒 CA 等待补扫",
+		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
+		IntervalFn: func() time.Duration { return 6 * time.Hour },
+		Run: func(rc taskengine.RunContext) error {
+			CertRenewalScanOnce()
+			// 入队即唤醒 CA 等待补扫（默认调度关闭——有活自动开启）
+			if certJobsActive() {
+				taskEngine.StartLoop("cert-waiting-ca")
+			}
+			return nil
+		},
+	})
+
+	taskEngine.Register(taskengine.Descriptor{
+		ID: "cert-reconcile", Family: "certificates", Name: "证书状态对账",
+		Description: "核对证书文件与数据库状态一致性，修复中断任务残留的中间态",
+		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
+		IntervalFn: func() time.Duration { return 6 * time.Hour },
+		Run:        func(rc taskengine.RunContext) error { CertReconcileOnce(); return nil },
+	})
+
+	taskEngine.Register(taskengine.Descriptor{
+		ID: "cert-manual-poll", Family: "certificates", Name: "手动证书任务轮询",
+		Description: "处理手工触发或重试的证书任务",
+		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
+		IntervalFn: func() time.Duration { return 10 * time.Minute },
+		Run:        func(rc taskengine.RunContext) error { CertManualCheckOnce(); return nil },
+	})
+
+	taskEngine.Register(taskengine.Descriptor{
+		ID: "cert-waiting-ca", Family: "certificates", Name: "CA 等待补扫",
+		Description: "证书任务在途时的兜底补扫：CA 冷却到期重排、滞留 queued 重入队、断链部署重试重建。默认调度关闭——续期扫描入队时自动开启，全部终态自动停止",
+		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
+		IntervalFn: func() time.Duration { return 30 * time.Second },
+		StatusFn: func() string {
+			if certJobsActive() {
+				return "running"
+			}
+			if te := TaskEngine(); te != nil && te.IsRunning("cert-waiting-ca") {
+				return "idle"
+			}
+			return "stopped"
+		},
+		NextSlotFn: func() time.Time { // 有等待任务时展示最近 CA 可用时间
+			var at string
+			if err := db.DB.QueryRow(`SELECT COALESCE(MIN(NULLIF(ca_available_after,'')),'') FROM cert_jobs WHERE status='waiting_ca'`).Scan(&at); err != nil {
+				return time.Time{}
+			}
+			return parseUTCSlot(at)
+		},
+		Run: func(rc taskengine.RunContext) error {
+			if !certJobsActive() {
+				// 全部终态——自动关闭调度（回到默认关闭态）
+				taskEngine.StopLoop("cert-waiting-ca")
+				TaskLogf("cert-waiting-ca", "idle", "证书任务全部终态，自动停止补扫")
+				return nil
+			}
+			CertWaitingCATickOnce()
+			return nil
+		},
+	})
+
+	// ============ 常驻（3）============
+
+	// 安全事件摄取：自管理 2s 尾读循环（引擎仅管生命周期）
+	taskEngine.Register(taskengine.Descriptor{
+		ID:          "security-events-ingestion",
+		Family:      "system",
+		Name:        "安全事件采集",
+		Description: "尾读 coraza WAF 审计日志并摄取为安全事件（安全总览/事件页的数据源），含审计日志轮转跟随",
+		Category:    "系统",
+		Kind:        taskengine.KindDaemon,
+		Run:         func(rc taskengine.RunContext) error { return runIngestionLoop(rc.Ctx) },
+	})
+
+	// 证书签发：被动守护（CAQueueManager 自管理——Run 阻塞保持运行态）
+	taskEngine.Register(taskengine.Descriptor{
+		ID:          "cert-issuance",
+		Family:      "certificates",
+		Name:        "证书签发",
+		Description: "ACME 证书签发队列——含新签发与续签（由证书任务队列调度，活跃任务显示为动态行）",
+		Category:    "证书",
+		Kind:        taskengine.KindDaemon,
+		Run: func(rc taskengine.RunContext) error {
+			<-rc.Ctx.Done() // CAQueueManager 由 main 启动——此处仅承载运行态
+			return nil
+		},
+		StatusFn: func() string {
+			var n int
+			if err := db.DB.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE status NOT IN ('issued','failed','disabled')`).Scan(&n); err == nil && n > 0 {
+				return "running"
 			}
 			return ""
 		},
+	})
+
+	// 集群同步：被动守护（SyncService 自管理——Run 阻塞保持运行态）
+	taskEngine.Register(taskengine.Descriptor{
+		ID:          "cluster-sync",
+		Family:      "cluster",
+		Name:        "集群同步",
+		Description: "从节点按用户配置的同步间隔轮询主节点快照并增量回放；主节点为签发方（空闲）",
+		Category:    "集群",
+		Kind:        taskengine.KindDaemon,
+		Run: func(rc taskengine.RunContext) error {
+			<-rc.Ctx.Done() // SyncService 由 main 启动——此处仅承载运行态
+			return nil
+		},
+		StatusFn: func() string {
+			var isMaster int
+			if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
+				return ""
+			}
+			if isMaster == 1 {
+				return "idle"
+			}
+			return "running"
+		},
+	})
+
+	// ============ 定时（4）============
+
+	taskEngine.Register(taskengine.Descriptor{
+		ID: "threat", Family: "security", Name: "威胁情报库更新",
+		Description: "每日从 USTC/FireHOL/ET 三源下载恶意 IP 名单，聚合去重后写入威胁库文件并同步从节点——引用名单的安全策略据此拦截",
+		Category:    "安全防护", Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
+		NextSlotFn: func() time.Time {
+			if !ThreatAutoUpdateEnabled() {
+				return time.Time{}
+			}
+			return parseUTCSlot(earliestThreatNextUpdate())
+		},
+		EnabledFn: func() bool { return ThreatAutoUpdateEnabled() }, // 业务开关联动展示（关=已暂停）
 		StatusFn: func() string {
 			if m := GetThreatUpdateManager(); m != nil && m.StatusSnapshot().Running {
 				return "running"
@@ -142,53 +280,32 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ToggleFn:   SetThreatAutoUpdate,
 		ToggleName: "威胁情报库自动更新",
 		Run: func(rc taskengine.RunContext) error {
-			if rc.Trigger == "manual" {
-				if m := GetThreatUpdateManager(); m != nil {
-					return m.RunUpdate("manual", &rc)
-				}
-				return nil
-			}
-			// Auto：探测到期 → 同步执行（R63 单写方：引擎预插行+finishRun）
-			if !ThreatAutoUpdateEnabled() {
-				return nil
-			}
 			m := GetThreatUpdateManager()
-			if m == nil || m.IsRunning() {
+			if m == nil {
 				return nil
 			}
-			due, err := threatDueSources("auto")
-			if err != nil {
-				return err
-			}
-			if len(due) == 0 {
-				return nil // 无到期源——静默（不 SignalledWork，引擎不记行）
-			}
-			rc.SignalledWork()
-			return m.RunUpdate("auto", &rc)
+			// 引擎已在排程槽调用——直接执行（manager 内部自带总闸/单飞/到期源筛选）
+			return m.RunUpdate(rc.Trigger, &rc)
 		},
 	})
 
 	taskEngine.Register(taskengine.Descriptor{
 		ID: "crs", Family: "security", Name: "CRS 规则库更新",
 		Description: "检查并更新 OWASP CoreRuleSet 规则集到最新版本（保留用户 overrides），供 WAF 拦截模式消费",
-		Category:    "安全防护", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
-		Singleton:    true,
-		SilentProbes: true, // 探测轮不落库——真实工作 SignalledWork 后引擎补插
-		Cadence:      "排程槽（可配置）",
-		IntervalFn:   func() time.Duration { return time.Minute },
-		EnabledFn: func() bool {
+		Category:    "安全防护", Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
+		NextSlotFn: func() time.Time {
+			m := GetCRSUpdateManager()
+			if m == nil || !m.AutoUpdateEnabled() {
+				return time.Time{}
+			}
+			return parseUTCSlot(m.NextScheduledSlot())
+		},
+		EnabledFn: func() bool { // 业务开关联动展示（关=已暂停；DB 直读——manager 未初始化窗口也正确）
 			var en int
 			if err := db.DB.QueryRow("SELECT COALESCE(auto_update,1) FROM security_crs_version WHERE id=1").Scan(&en); err != nil {
 				return true
 			}
 			return en == 1
-		},
-		NextSlotFn: func() string {
-			var next string
-			if err := db.DB.QueryRow("SELECT COALESCE(NULLIF(next_update,''),'') FROM security_crs_version WHERE id=1").Scan(&next); err == nil && next != "" {
-				return localDisplayUTC(next)
-			}
-			return ""
 		},
 		StatusFn: func() string {
 			m := GetCRSUpdateManager()
@@ -206,37 +323,11 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ToggleFn:   SetCRSAutoUpdate,
 		ToggleName: "CRS 自动更新",
 		Run: func(rc taskengine.RunContext) error {
-			if rc.Trigger == "manual" {
-				m := GetCRSUpdateManager()
-				if m == nil {
-					return nil
-				}
-				done, err := m.StartUpdate("manual", &rc)
-				if err != nil {
-					return err
-				}
-				<-done
-				if snap := m.StatusSnapshot(); snap.Status == string(CRSStatusFailed) {
-					return fmt.Errorf("CRS 更新失败: %s", snap.Message)
-				}
-				return nil
-			}
-			// Auto：探测到期 → 同步执行（R63 单写方）
 			m := GetCRSUpdateManager()
-			if m == nil || m.IsRunning() {
+			if m == nil {
 				return nil
 			}
-			if !m.AutoUpdateEnabled() {
-				return nil
-			}
-			nextStr := m.NextScheduledSlot()
-			if nextStr != "" {
-				if due, err := time.Parse(crsTimeLayout, nextStr); err == nil && time.Now().UTC().Before(due) {
-					return nil // 未到期——静默
-				}
-			}
-			rc.SignalledWork()
-			done, err := m.StartUpdate("auto", &rc)
+			done, err := m.StartUpdate(rc.Trigger, &rc)
 			if err != nil {
 				return err
 			}
@@ -251,24 +342,20 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	taskEngine.Register(taskengine.Descriptor{
 		ID: "ip2region", Family: "security", Name: "IP2Region 地理库更新",
 		Description: "更新 IP 地理位置离线库（xdb），供 GeoIP 地域拦截与归属地展示使用",
-		Category:    "安全防护", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
-		Singleton:    true,
-		SilentProbes: true, // 探测轮不落库——真实工作 SignalledWork 后引擎补插
-		Cadence:      "排程槽（可配置）",
-		IntervalFn:   func() time.Duration { return time.Minute },
-		EnabledFn: func() bool {
+		Category:    "安全防护", Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
+		NextSlotFn: func() time.Time {
+			m := GetIP2RegionUpdateManager()
+			if m == nil || !m.AutoUpdateEnabled() {
+				return time.Time{}
+			}
+			return parseUTCSlot(m.NextScheduledSlot())
+		},
+		EnabledFn: func() bool { // 业务开关联动展示（关=已暂停；DB 直读）
 			var en int
 			if err := db.DB.QueryRow("SELECT COALESCE(auto_update,1) FROM security_ip2region_version WHERE id=1").Scan(&en); err != nil {
 				return true
 			}
 			return en == 1
-		},
-		NextSlotFn: func() string {
-			var next string
-			if err := db.DB.QueryRow("SELECT COALESCE(NULLIF(next_update,''),'') FROM security_ip2region_version WHERE id=1").Scan(&next); err == nil && next != "" {
-				return localDisplayUTC(next)
-			}
-			return ""
 		},
 		StatusFn: func() string {
 			var status string
@@ -283,34 +370,11 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ToggleFn:   SetIP2RegionAutoUpdate,
 		ToggleName: "IP2Region 自动更新",
 		Run: func(rc taskengine.RunContext) error {
-			if rc.Trigger == "manual" {
-				m := GetIP2RegionUpdateManager()
-				if m == nil {
-					return nil
-				}
-				done, err := m.StartUpdate("manual", &rc)
-				if err != nil {
-					return err
-				}
-				<-done
-				if snap := m.StatusSnapshot(); snap.Status == string(IP2RegionStatusFailed) {
-					return fmt.Errorf("IP2Region 更新失败: %s", snap.Message)
-				}
-				return nil
-			}
-			// Auto：同步执行（R63 单写方）
 			m := GetIP2RegionUpdateManager()
-			if m == nil || m.IsRunning() || !m.AutoUpdateEnabled() {
+			if m == nil {
 				return nil
 			}
-			nextStr := m.NextScheduledSlot()
-			if nextStr != "" {
-				if due, err := time.Parse(crsTimeLayout, nextStr); err == nil && time.Now().UTC().Before(due) {
-					return nil // 未到期——静默
-				}
-			}
-			rc.SignalledWork()
-			done, err := m.StartUpdate("auto", &rc)
+			done, err := m.StartUpdate(rc.Trigger, &rc)
 			if err != nil {
 				return err
 			}
@@ -322,24 +386,19 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	// M4：自动备份（1min 探测，master-only——补跑/槽判定在体内）+ 两个
-	// 每日清理族（本节点本地表，与角色无关）。
 	taskEngine.Register(taskengine.Descriptor{
 		ID: "auto-backup", Family: "backup", Name: "自动备份",
 		Description: "按排程把全量配置打包为 lbbak 落盘 backup 目录（含 CRS/IP2Region/威胁库数据文件），保留份数自动清理",
-		Category:    "备份", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, SilentProbes: true,
-		Singleton:  true,
-		Cadence:    "按备份排程（日/周/月）",
-		IntervalFn: func() time.Duration { return time.Minute },
-		EnabledFn: func() bool {
+		Category:    "备份", Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly,
+		NextSlotFn: func() time.Time {
+			if t, ok := nextAutoBackupSlot(time.Now()); ok {
+				return t
+			}
+			return time.Time{}
+		},
+		EnabledFn: func() bool { // 业务开关联动展示（备份未启用=已暂停）
 			row, err := loadAutoBackupSettings()
 			return err != nil || row.enabled
-		},
-		NextSlotFn: func() string {
-			if next, ok := nextAutoBackupSlot(time.Now()); ok {
-				return next.In(CurrentLocation()).Format(crsTimeLayout)
-			}
-			return ""
 		},
 		Run: func(rc taskengine.RunContext) error {
 			if rc.Trigger == "manual" {
@@ -349,232 +408,19 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 				}
 				return exec("manual", rc.Operator, rc.RunID)
 			}
-			// Auto：探测到期 → 同步执行（R63 单写方——引擎预插行+finishRun）
-			exec := currentAutoBackupExecutor()
-			if exec == nil {
-				return nil
-			}
-			row, err := loadAutoBackupSettings()
-			if err != nil || !row.enabled {
-				return nil
-			}
-			dueSlot, ok := autoBackupDueSlot(time.Now(), row.freq, row.hhmm, row.day, CurrentLocation())
-			if !ok {
-				return nil
-			}
-			if row.lastRun != nil && !dueSlot.After(*row.lastRun) {
-				return nil // 已执行
-			}
-			rc.SignalledWork()
-			// R64-P1-2：引擎统一落 task_runs（SilentProbes+SignalledWork 后置插行）
-			execErr := exec("schedule", "system", 0)
-			if _, err := db.DB.Exec("UPDATE global_config SET auto_backup_last_run=? WHERE id=1", dueSlot.Format(time.RFC3339)); err != nil {
-				Logf("warn", "自动备份：更新 auto_backup_last_run 失败: %v", err)
-			}
-			return execErr
-		},
-	})
-	taskEngine.Register(taskengine.Descriptor{
-		ID: "audit-retention", Family: "system", Name: "审计日志保留清理",
-		Description: "按「审计保留月数」配置删除 audit 库过期操作日志（基础设置可调）；并清理 90 天前的任务运行历史（task_runs）",
-		Category:    "系统", Kind: taskengine.KindContinuous, Cadence: "每日（保留月数可配）",
-
-		IntervalFn: func() time.Duration { return 24 * time.Hour },
-		Run: func(rc taskengine.RunContext) error {
-			auditDeleted := CleanupAuditLogs()
-			runsDeleted := taskengine.PurgeTaskRuns(90) // 运行历史保留 90 天（API 只显 50 次，表内超期自动清理）
-			TaskLogf("audit-retention", "cleanup", "清理完成：审计日志 %d 条、任务运行历史 %d 行（无过期数据时为 0）", auditDeleted, runsDeleted)
-			return nil
-		},
-	})
-	taskEngine.Register(taskengine.Descriptor{
-		ID: "security-events-retention", Family: "system", Name: "安全事件保留清理",
-		Description: "按保留期配置删除 metrics 库中过期的安全事件记录",
-		Category:    "系统", Kind: taskengine.KindContinuous,
-		EnabledFn: func() bool { return taskEngine.IsRunning("security-events-retention") }, // R64-P2-2：读回循环态
-		ToggleFn: func(enabled bool) error {
-			if enabled {
-				taskEngine.StartLoop("security-events-retention")
-			} else {
-				taskEngine.StopLoop("security-events-retention")
-			}
-			return nil
-		},
-		ToggleName: "安全事件清理",
-		IntervalFn: func() time.Duration { return 24 * time.Hour },
-		Run: func(rc taskengine.RunContext) error {
-			deleted := SecurityEventsRetentionCleanupOnce()
-			TaskLogf("security-events-retention", "cleanup", "安全事件保留清理完成：删除 %d 条（保留期与条数上限，无过期为 0）", deleted)
-			return nil
+			return runAutoBackupScheduled(rc.RunID)
 		},
 	})
 
-	// —— 证书族：恒在队列行 + 四内部循环 + CA 等待轮询 ——
-	// cert-issuance：恒在任务列表的证书签发族行（Kind=Queue——由 ACME 队列
-	// 调度实际签发，此行承载状态镜像/到期时间/操作入口）。
-	taskEngine.Register(taskengine.Descriptor{
-		ID:          "cert-issuance",
-		Family:      "certificates",
-		Name:        "证书签发",
-		Description: "ACME 证书签发队列——含新签发与续签（由证书任务队列调度，活跃任务显示为动态行）",
-		Category:    "证书",
-		Kind:        taskengine.KindContinuous,                      // R64 用户裁定：签发=常驻服务（队列驱动——引擎承载状态镜像）
-		IntervalFn:  func() time.Duration { return 24 * time.Hour }, // 名义间隔（Run 空转）
-		Run:         func(rc taskengine.RunContext) error { return nil },
-		StatusFn: func() string {
-			var n int
-			if err := db.DB.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE status NOT IN ('issued','failed','disabled')`).Scan(&n); err != nil || n > 0 {
-				if err == nil {
-					return "running"
-				}
-			}
-			return ""
-		},
-		NextSlotFn: func() string { // 最近证书到期时间（续签触发点）
-			var at string
-			if err := db.DB.QueryRow(`SELECT MIN(expires_at) FROM cert_jobs WHERE status='issued' AND expires_at IS NOT NULL AND expires_at != ''`).Scan(&at); err == nil && at != "" {
-				return localDisplayUTC(at)
-			}
-			return ""
-		},
-	})
+	// ============ 触发（1）============
 
-	// RunsOn=RoleMasterOnly（U7-P3-2）：原生循环时代仅 master 跑（StartACME
-	// 只在主节点/promote 调用）——引擎接管后以显式角色门复刻，消除对
-	// activeCertService=nil 隐性让位的依赖（cert-reconcile 曾在从节点真实执行）。
-	taskEngine.Register(taskengine.Descriptor{
-		ID: "cert-renewal-scan", Family: "certificates", Name: "证书续期扫描",
-		Description: "扫描全部证书配置的到期时间，临期证书自动入队续签",
-		Category:    "证书", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
-		EnabledFn: func() bool { return taskEngine.IsRunning("cert-renewal-scan") }, // R64-P2-2：读回循环态
-		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关
-			if enabled {
-				taskEngine.StartLoop("cert-renewal-scan")
-			} else {
-				taskEngine.StopLoop("cert-renewal-scan")
-			}
-			return nil
-		},
-		ToggleName: "证书续期扫描",
-		IntervalFn: func() time.Duration { return 6 * time.Hour },
-		Run:        func(rc taskengine.RunContext) error { CertRenewalScanOnce(); return nil },
-	})
-	taskEngine.Register(taskengine.Descriptor{
-		ID: "cert-reconcile", Family: "certificates", Name: "证书状态对账",
-		Description: "核对证书文件与数据库状态一致性，修复中断任务残留的中间态",
-		Category:    "证书", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
-		EnabledFn: func() bool { return taskEngine.IsRunning("cert-reconcile") }, // R64-P2-2：读回循环态
-		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关
-			if enabled {
-				taskEngine.StartLoop("cert-reconcile")
-			} else {
-				taskEngine.StopLoop("cert-reconcile")
-			}
-			return nil
-		},
-		ToggleName: "证书状态对账",
-		IntervalFn: func() time.Duration { return 6 * time.Hour },
-		Run:        func(rc taskengine.RunContext) error { CertReconcileOnce(); return nil },
-	})
-	taskEngine.Register(taskengine.Descriptor{
-		ID: "cert-manual-poll", Family: "certificates", Name: "手动证书任务轮询",
-		Description: "处理手工触发或重试的证书任务",
-		Category:    "证书", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
-		RecordFailuresOnly: true,
-		EnabledFn:          func() bool { return taskEngine.IsRunning("cert-manual-poll") }, // R64-P2-2：读回循环态
-		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关
-			if enabled {
-				taskEngine.StartLoop("cert-manual-poll")
-			} else {
-				taskEngine.StopLoop("cert-manual-poll")
-			}
-			return nil
-		},
-		ToggleName: "手动证书任务轮询",
-		IntervalFn: func() time.Duration { return 10 * time.Minute },
-		Run:        func(rc taskengine.RunContext) error { CertManualCheckOnce(); return nil },
-	})
-	taskEngine.Register(taskengine.Descriptor{
-		ID: "cert-waiting-ca", Family: "certificates", Name: "CA 等待轮询",
-		Description: "证书任务在途时的兜底补扫：CA 冷却到期重排、滞留 queued 重入队、断链部署重试重建。门控——有非终态任务才扫描，全部完成即静默；可经调度开关停用",
-		Category:    "证书", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
-		RecordFailuresOnly: true,                                                           // 30s 补扫成功静默——仅断链/失败留痕+boot 启动计数
-		EnabledFn:          func() bool { return taskEngine.IsRunning("cert-waiting-ca") }, // R64-P2-2：读回循环态
-		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关（启停 30s 扫描）
-			if enabled {
-				taskEngine.StartLoop("cert-waiting-ca")
-			} else {
-				taskEngine.StopLoop("cert-waiting-ca")
-			}
-			return nil
-		},
-		ToggleName: "CA 等待轮询",
-		IntervalFn: func() time.Duration { return 30 * time.Second },
-		StatusFn: func() string { // 有活=运行中/无活=空闲/关停=已停止（门控后零空转）
-			if certJobsActive() { // U7-P5-1：复用 certificates.go 单一实现（曾同 COUNT 两处重复）
-				return "running"
-			}
-			if te := TaskEngine(); te != nil && te.IsRunning("cert-waiting-ca") {
-				return "idle"
-			}
-			return "stopped"
-		},
-		NextSlotFn: func() string { // 有等待任务时展示最近 CA 可用时间
-			var at string
-			// P2-③：原 SQL 缺 2 右括号且 NULLIF 误传 3 参（M2 接线笔误）——恒语法
-			// 错误且 err 被吞，「下次 CA 可用时间」上线即恒空。
-			if err := db.DB.QueryRow(`SELECT COALESCE(MIN(NULLIF(ca_available_after,'')),'') FROM cert_jobs WHERE status='waiting_ca'`).Scan(&at); err != nil {
-				Logf("warn", "cert-waiting-ca: 查询下次 CA 可用时间失败: %v", err)
-				return ""
-			}
-			if at != "" {
-				return localDisplayUTC(at)
-			}
-			return ""
-		},
-		Run: func(rc taskengine.RunContext) error { CertWaitingCATickOnce(); return nil },
-	})
-	// —— 集群同步（角色驱动循环：身份入册，执行留集群服务——promote/demote 生命周期） ——
-	taskEngine.Register(taskengine.Descriptor{
-		ID:          "cluster-sync",
-		Family:      "cluster",
-		Name:        "集群同步",
-		Description: "从节点按用户配置的同步间隔轮询主节点快照并增量回放；主节点为签发方（空闲）",
-		Category:    "集群",
-		Kind:        taskengine.KindInfo,
-		StatusFn: func() string { // 定时语义：从节点回放中=运行中/主节点签发方=空闲
-			var isMaster int
-			if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
-				return ""
-			}
-			if isMaster == 1 {
-				return "idle"
-			}
-			return "running"
-		},
-		NextSlotFn: func() string { // 从节点：最近同步 + 间隔（自适应退避期如实按基准间隔展示）
-			var isMaster int
-			var interval int
-			var lastSync string
-			if err := db.DB.QueryRow("SELECT COALESCE(is_master,1), COALESCE(sync_interval,60), COALESCE(last_sync,'') FROM global_config WHERE id=1").Scan(&isMaster, &interval, &lastSync); err != nil || isMaster == 1 || lastSync == "" {
-				return ""
-			}
-			if t, err := time.Parse(time.RFC3339, lastSync); err == nil {
-				return t.Add(time.Duration(interval) * time.Second).In(CurrentLocation()).Format("2006-01-02 15:04:05")
-			}
-			return ""
-		},
-	})
-	// —— 系统配置载入（oneshot：规则库/证书/Caddy 渲染三段合一——完成于
-	// 面板监听之前，载入完成前系统不可达（强于只读）；db-init 与引擎启动
-	// 为前置设施不入册 ——） ——
 	taskEngine.Register(taskengine.Descriptor{
 		ID:          "startup:config-load",
 		Family:      "startup",
 		Name:        "系统配置载入",
 		Description: "启动时从数据库装载运行态：规则库（CRS 种子/对账）→ 证书文件物化 → Caddy 配置渲染与应用（失败回退最后已知正确配置）。完成前面板不监听",
 		Category:    "系统",
-		Kind:        taskengine.KindOneshot, // 类型「触发」——启动单次+可手动重载
+		Kind:        taskengine.KindOneshot,
 		ManualRun:   true,
 		Run: func(rc taskengine.RunContext) error {
 			if rc.Trigger != "manual" {
@@ -587,25 +433,25 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	// 任务性质批量标定（展示口径）：排程/固定间隔族由探测轮或间隔驱动，
-	// 但性质是「定时」——只有真常驻循环（看门狗/事件摄取）是「常驻」。
-	for _, id := range []string{"threat", "crs", "ip2region", "auto-backup", "log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca", "cluster-sync"} {
-		taskEngine.SetAsKind(id, taskengine.KindScheduled)
-	}
+	// ============ 手动触发语义 + 默认调度启动 ============
 
-	// 手动触发语义（仅定时性质族——常驻族无「立即执行」概念，启停即可）：
-	// 更新族 Run 内含 manual 分支；清理/证书循环 Run 即单轮工作；自动备份
-	// manual=直接执行一轮备份；系统配置载入 manual=重渲染重应用。
-	for _, id := range []string{"threat", "crs", "ip2region", "log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "auto-backup", "startup:config-load"} {
+	// 手动触发（定时/循环/触发允许；常驻无「立即执行」——启停即可）
+	for _, id := range []string{"threat", "crs", "ip2region", "auto-backup", "log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca", "startup:config-load"} {
 		taskEngine.SetManualRun(id, true)
 	}
 
-	for _, id := range []string{"config-watchdog", "security-events-ingestion", "log-cleanup", "threat", "crs", "ip2region", "auto-backup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca", "cert-issuance"} {
+	// 默认调度启动：
+	// - 循环 8 个全启动（cert-waiting-ca 除外——默认关闭，续期扫描唤醒）
+	// - 常驻 3 个全启动（系统启动即运行；关闭调度=启动也不运行）
+	// - 定时 4 个启动排程（EnabledFn/NextSlotFn 内含开关判断）
+	for _, id := range []string{
+		"config-watchdog", "log-cleanup", "audit-retention", "security-events-retention",
+		"cert-renewal-scan", "cert-reconcile", "cert-manual-poll",
+		"security-events-ingestion", "cert-issuance", "cluster-sync",
+		"threat", "crs", "ip2region", "auto-backup",
+	} {
 		taskEngine.StartLoop(id)
 	}
-	// 常驻静默族启动行（2026-09-29 用户裁定：常驻任务应有启动时间记录+日志
-	// 文件保留）——一次性建文件留痕，后续有事件才追加（静默轮语义不变）。
-	TaskLogf("security-events-ingestion", "start", "安全事件采集已启动（尾读 coraza 审计日志，有事件才追加记录）")
 	return taskEngine
 }
 

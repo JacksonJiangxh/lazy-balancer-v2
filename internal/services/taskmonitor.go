@@ -14,13 +14,14 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
-// TaskKind 任务类型。
+// TaskKind 任务类型（v2.0 四类型标准）。
 type TaskKind string
 
 const (
-	TaskKindScheduled  TaskKind = "scheduled"  // 排程驱动（周/时刻槽）
-	TaskKindContinuous TaskKind = "continuous" // 常驻循环（间隔轮询/看门狗）
-	TaskKindQueue      TaskKind = "queue"      // 队列驱动（按需入队）
+	TaskKindScheduled TaskKind = "scheduled" // 定时：排程槽驱动
+	TaskKindDaemon    TaskKind = "daemon"    // 常驻：自管理循环
+	TaskKindPeriodic  TaskKind = "periodic"  // 循环：固定间隔
+	TaskKindOneshot   TaskKind = "oneshot"   // 触发：手动/代码触发
 )
 
 // TaskStatus 任务当前状态。
@@ -51,11 +52,10 @@ type TaskInfo struct {
 	Cancellable  bool         `json:"cancellable"`          // 运行中可手动取消（仅下载类）
 	Controllable bool         `json:"controllable"`         // 常驻循环可启停（start/stop/restart）
 	Triggerable  bool         `json:"triggerable"`          // 支持手动触发（ManualRun 语义族）
-	Toggleable   bool         `json:"toggleable"`           // 调度开关可暂停/恢复（ToggleFn 声明族——U1-P4-2 元数据化）
-	SilentRuns   bool         `json:"silent_runs"`          // 成功轮静默（RecordFailuresOnly）——计数位显示「静默轮」而非 0/0
-	StartedAt    string       `json:"started_at,omitempty"` // 常驻族启动时刻（引擎启动）；定时/队列族空
+	Toggleable   bool         `json:"toggleable"`           // 调度开关可暂停/恢复（ToggleFn 声明族）
+	StartedAt    string       `json:"started_at,omitempty"` // 常驻族启动时刻；其他类型空
 	LogSizeBytes int64        `json:"log_size_bytes"`       // 本任务日志文件大小（字节）
-	LoopOn       bool         `json:"loop_on"`              // 常驻循环当前启用态（调度列常驻开关绑定值）
+	LoopOn       bool         `json:"loop_on"`              // 调度开关当前态（定时/循环/常驻调度列绑定值）
 	LastRun      *TaskRunInfo `json:"last_run,omitempty"`
 	NextRunAt    string       `json:"next_run_at,omitempty"`
 	Runs24h      int          `json:"runs_24h"`
@@ -123,7 +123,7 @@ func collectCertJobRows() []TaskInfo {
 			ID:         fmt.Sprintf("cert-job:%d", id),
 			Name:       "ACME 签发 · " + domain,
 			Category:   "证书",
-			Kind:       TaskKindQueue,
+			Kind:       TaskKindOneshot, // 动态签发行=按需触发的工作项
 			Enabled:    true,
 			DetailHint: "certificates",
 			LastRun: &TaskRunInfo{StartedAt: localDisplayUTC(updatedAt), FinishedAt: localDisplayUTC(updatedAt),
@@ -160,17 +160,21 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 	for _, m := range te.DescribeAll() {
 		ti := TaskInfo{
 			ID: m.ID, Name: m.Name, Description: m.Description,
-			Category: m.Category, Kind: TaskKind(m.AsKind), // 性质口径（定时≠探测轮常驻）
+			Category: m.Category, Kind: TaskKind(m.Kind),
 			Controllable: m.Controllable, Cancellable: m.Cancelable, Triggerable: m.CanTrigger,
-			Toggleable: m.Toggleable, // U1-P4-2：调度开关元数据（曾三族硬编码清单）
-			SilentRuns: m.SilentRuns,
-			Enabled:    m.Enabled, DetailHint: m.Family,
+			Toggleable: m.Toggleable, Enabled: m.Enabled, DetailHint: m.Family,
+			LoopOn: m.LoopOn,
 		}
-		// Cadence 来自描述符声明（U1-P4-2 ⑦：曾本函数内五族 map）；
-		// cluster-sync 动态节奏（用户同步间隔）按 ID 重算。
-		ti.Cadence = m.Cadence
-		if m.IntervalSec > 0 && ti.Cadence == "" {
-			ti.Cadence = "每 " + humanInterval(m.IntervalSec)
+		// 节奏：循环=间隔，定时=排程槽，常驻=自管理，触发=手动
+		switch m.Kind {
+		case taskengine.KindPeriodic:
+			if m.IntervalSec > 0 {
+				ti.Cadence = "每 " + humanInterval(m.IntervalSec)
+			}
+		case taskengine.KindDaemon:
+			ti.Cadence = "常驻自管理"
+		case taskengine.KindOneshot:
+			ti.Cadence = "手动触发"
 		}
 		if m.ID == "cluster-sync" {
 			var iv int
@@ -178,22 +182,17 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 				ti.Cadence = fmt.Sprintf("每 %d 秒（用户配置同步间隔）", iv)
 			}
 		}
-		// 排程槽族（下一时间以槽为权威，禁探测兜底）——仅这四个有用户排程槽；
-		// 清理族虽声明 Cadence 但本质是固定间隔（last+interval 兜底有效）。
-		slotBased := m.ID == "threat" || m.ID == "crs" || m.ID == "ip2region" || m.ID == "auto-backup"
-		// 状态按「任务性质」分流（探测轮循环态只对真常驻有意义）：
-		// · 镜像优先（manager 运行中/队列计数/角色）
-		// · 定时性质 → 最近真实运行终态（空闲/失败/运行中），循环态不外露
-		// · 常驻性质 → 引擎循环态（运行中/已停止）
+		// 状态分流（v2.0 四类型）：
+		// · 镜像优先（manager 运行中/队列计数/角色/cert-waiting-ca 门控）
+		// · 常驻 → 调度开关态（运行中/已停止）
+		// · 定时/循环/触发 → 最近真实运行终态（空闲/失败/运行中）
 		if m.StatusMirror != "" {
 			ti.Status = TaskStatus(m.StatusMirror)
-		} else if m.AsKind == taskengine.KindContinuous {
-			if te.IsRunning(m.ID) {
+		} else if m.Kind == taskengine.KindDaemon {
+			if m.LoopOn {
 				ti.Status = TaskStatusRunning
-			} else if m.Controllable {
-				ti.Status = TaskStatusStopped
 			} else {
-				ti.Status = TaskStatusPassive
+				ti.Status = TaskStatusStopped
 			}
 		} else {
 			ti.Status = TaskStatusIdle
@@ -206,32 +205,32 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 				}
 			}
 		}
-		if !m.Enabled && ti.Status == TaskStatusIdle {
-			ti.Status = TaskStatusDisabled
+		if !m.LoopOn && m.Kind != taskengine.KindOneshot && ti.Status == TaskStatusIdle {
+			ti.Status = TaskStatusDisabled // 调度关闭（如 cert-waiting-ca 默认态）
 		}
-		// 下一槽（排程族声明式）
+		if !m.Enabled && ti.Status == TaskStatusIdle {
+			ti.Status = TaskStatusDisabled // 业务开关联动（自动更新关闭/备份未启用——2026-10-01 用户裁定）
+		}
+		// 下一槽：定时=NextSlotFn（声明式）；循环=last+interval 兜底
 		ti.NextRunAt = m.NextSlot
-		// 最近运行 + 24h 统计（task_runs）
 		if lr := te.LatestRun(m.ID); lr != nil {
 			ti.LastRun = &TaskRunInfo{StartedAt: lr.StartedAt, FinishedAt: lr.FinishedAt,
 				DurationMs: lr.DurationMs, Trigger: lr.Trigger, Result: lr.Status, Message: lr.Message}
-			// 固定间隔族兜底：last + interval（排程槽族不兜底——见 slotBased）
-			if ti.NextRunAt == "" && m.IntervalSec > 0 && m.Enabled && !slotBased {
+			if ti.NextRunAt == "" && m.IntervalSec > 0 && m.LoopOn && m.Kind == taskengine.KindPeriodic {
 				if t, err := time.ParseInLocation("2006-01-02 15:04:05", lr.StartedAt, CurrentLocation()); err == nil {
 					ti.NextRunAt = t.Add(time.Duration(m.IntervalSec) * time.Second).Format("2006-01-02 15:04:05")
 				}
 			}
 		}
-		// R64：每任务日志文件大小（tasks/{id}.log stat）
+		// 每任务日志文件大小（tasks/{id}.log stat）
 		if info, err := os.Stat(taskengine.TaskLogPath(m.ID)); err == nil {
 			ti.LogSizeBytes = info.Size()
 		}
 		st := te.Stats24h(m.ID)
 		ti.Runs24h, ti.Success24h, ti.Fail24h = st.Runs, st.Success, st.Fail
-		// 常驻族启动时刻（循环起点=引擎启动）——「常驻 · 启动于」展示位。
-		if m.AsKind == taskengine.KindContinuous {
+		// 常驻族启动时刻——「常驻 · 启动于」展示位
+		if m.Kind == taskengine.KindDaemon {
 			ti.StartedAt = te.StartedAt().In(CurrentLocation()).Format("2006-01-02 15:04:05")
-			ti.LoopOn = m.LoopOn
 		}
 		out = append(out, ti)
 	}
@@ -296,7 +295,12 @@ func nextAutoBackupSlot(now time.Time) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	if !due.After(now.In(loc)) {
-		// 当前槽已触发（last_run 已吃掉）——按周期步进到下一槽
+		// 漏跑追补：最近过去的槽未被 last_run 覆盖 → 返回该槽（≤now——
+		// v2.0 Scheduled 引擎到点立即触发=跨停机窗口补跑）
+		if row.lastRun == nil || due.After(*row.lastRun) {
+			return due, true
+		}
+		// 已执行——步进到下一未来槽
 		// （R63-P2-4：曾恒 +24h——weekly/monthly 时追不上下一槽，下次执行恒显示过去时刻）
 		step := now.In(loc).Add(24 * time.Hour)
 		switch row.freq {

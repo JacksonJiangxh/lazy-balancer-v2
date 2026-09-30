@@ -5,7 +5,6 @@ package services
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -1098,29 +1097,20 @@ func TestSecurityEventsTick_reportsErrorBeyondScanWindow(t *testing.T) {
 		t.Fatalf("offset=%d, want advanced past the first document", offset)
 	}
 
-	// When：启动与生产一致的摄取循环（tick 失败走 warn 路径）
+	// When：经 v2.0 常驻路径单轮摄取（PollOnce——tick 失败走 warn 路径）
 	oldAuditLog, oldAuditOffset := auditLogPath, securityEventsOffsetPath
 	auditLogPath, securityEventsOffsetPath = logPath, offsetPath
+	resetSecurityEventsPollState(t)
 	t.Cleanup(func() { auditLogPath, securityEventsOffsetPath = oldAuditLog, oldAuditOffset })
 	var buf syncBuffer
 	oldWriter := log.Writer()
 	log.SetOutput(&buf)
 	t.Cleanup(func() { log.SetOutput(oldWriter) })
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		StartSecurityEventsIngestion(ctx)
-		close(done)
-	}()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && !strings.Contains(buf.String(), "tick failed") {
-		time.Sleep(20 * time.Millisecond)
-	}
-	cancel()
-	<-done
+	SecurityEventsPollOnce()
+
 	// Then：停摆以 warn 暴露（日志含 "tick failed"），而非静默打转
 	if !strings.Contains(buf.String(), "tick failed") {
-		t.Fatalf("ingestion loop must log warn for stalled tick, captured: %s", buf.String())
+		t.Fatalf("ingestion must log warn for stalled tick, captured: %s", buf.String())
 	}
 }
 
@@ -1243,27 +1233,19 @@ func TestSecurityEventsTick_warnRateLimitedPerOffset(t *testing.T) {
 		t.Fatal(err)
 	}
 	// R65 B-S4：审计日志路径收敛为单一 auditLogPath（原 securityEventsAuditLogPath 双 var 已删）。
-	oldAuditLog, oldOffsetPath, oldInterval := auditLogPath, securityEventsOffsetPath, securityEventsPollInterval
+	oldAuditLog, oldOffsetPath := auditLogPath, securityEventsOffsetPath
 	auditLogPath, securityEventsOffsetPath = logPath, offsetPath
-	securityEventsPollInterval = 100 * time.Millisecond
-	t.Cleanup(func() {
-		auditLogPath, securityEventsOffsetPath, securityEventsPollInterval = oldAuditLog, oldOffsetPath, oldInterval
-	})
+	t.Cleanup(func() { auditLogPath, securityEventsOffsetPath = oldAuditLog, oldOffsetPath })
 	var buf bytes.Buffer
 	oldWriter := log.Writer()
 	log.SetOutput(&buf)
 	t.Cleanup(func() { log.SetOutput(oldWriter) })
 
-	// When：摄取循环运行多个 tick（同一偏移反复 F1，旧行为每 tick 一条 warn）
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		StartSecurityEventsIngestion(ctx)
-		close(done)
-	}()
-	time.Sleep(1200 * time.Millisecond) // ≥ 10 个 tick
-	cancel()
-	<-done
+	// When：单轮摄取连续执行 10 次（同一 pollState 尾读器——同偏移反复 F1，旧行为每轮一条 warn）
+	resetSecurityEventsPollState(t)
+	for i := 0; i < 10; i++ { // ≥ 10 轮——同一 pollState 尾读器跨轮复用
+		SecurityEventsPollOnce()
+	}
 
 	// Then：同一偏移的停摆告警只出现一条（按偏移限流），而非每 tick 刷屏
 	warns := strings.Count(buf.String(), "tick failed")
@@ -3285,4 +3267,20 @@ func TestSecurityEventsAttribution_Stage0PassthroughTrustDoesNotOwnLoggedIPEvent
 		t.Fatalf("attribution=(%d,%q), want (1,p-stage0-passthrough) — stage0 保留检测"+
 			"（trust_detection=1）经 id:12 真实降级事务，能力面必须保留", pid, pname)
 	}
+}
+
+// resetSecurityEventsPollState 重置摄取单轮状态（测试隔离——pollState 为
+// 进程级单例，跨用例复用会带着上一用例的 tailer/offset 污染）。
+func resetSecurityEventsPollState(t *testing.T) {
+	t.Helper()
+	securityEventsPollState.Lock()
+	securityEventsPollState.tailer = nil
+	securityEventsPollState.inited = false
+	securityEventsPollState.Unlock()
+	t.Cleanup(func() {
+		securityEventsPollState.Lock()
+		securityEventsPollState.tailer = nil
+		securityEventsPollState.inited = false
+		securityEventsPollState.Unlock()
+	})
 }

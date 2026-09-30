@@ -1,96 +1,148 @@
-# 统一任务引擎标准（lazy-task-engine SPEC v1.1）
+# 任务引擎标准 v2.0（四类型）
 
-**裁定日**: 2026-09-29 · **适用**: v2.3.4+ 全部任务族
+> 2026-10-01 用户裁定重构。任务类型决定一切——调度方式、记录策略、日志行为、控制面。
+> 零 flag、零补丁、零特判；任务体只写业务逻辑，引擎处理全部基础设施。
 
-## 1. 原则
+## 1. 四类型定义
 
-1. **单一事实源**：任务的身份/调度/状态/历史/日志/控制只有引擎一个定义点。面板、API、MCP、审计全部消费引擎产出，禁止平行任务实现。
-2. **引擎管生命周期，任务体管业务**：调度、单飞、取消、启停、历史、日志、审计框架归引擎；业务编舞（哈希/重试/回滚/竞态守卫）归任务体，原样保留。
-3. **手动 ≡ 自动**（2026-09-29 用户裁定）：同一任务体、同一审计、同一日志、同一历史；触发源仅是记录维度，不得产生行为分叉。
-4. **标准、通用、可拔插**：任务注册即接入全部能力（UI/API/MCP/审计/历史/日志）；摘除注册即干净退出，不残留。
-5. **业务解耦**：任务体经 `Descriptor` 声明接入，禁止任务代码反向依赖面板/handler；引擎不 import 业务包（业务经 wire 层组装闭包注入）。
+| 维度 | 定时 Scheduled | 常驻 Daemon | 循环 Periodic | 触发 Oneshot |
+|---|---|---|---|---|
+| **调度方式** | `NextSlotFn() → time.Time` 引擎每 tick 重读，槽到点执行 | `Run(ctx)` 引擎启动时调用一次，阻塞直到 ctx 取消 | `IntervalFn() → Duration` 每间隔执行一次 | 仅 `Trigger()`（手动/代码） |
+| **中间空窗** | **零活动**（零执行/零 task_runs/零日志） | Run 持续运行，引擎不干预 | 间隔等待 | 空闲 |
+| **task_runs** | 每次排程执行 1 行 | 每生命周期 1 行（boot 落行，终态随停止更新） | 每轮 1 行 | 每次触发 1 行 |
+| **日志（tasks/{id}.log）** | [done]+业务行 | [start]+[done]+失败行+业务行 | 每轮 [done]+业务行 | [start]/[done]+业务行 |
+| **调度开关** | ✅ 暂停/恢复排程 | ✅ 启停自管理循环 | ✅ 暂停/恢复循环 | ❌ 显示禁用开关（页面一致性） |
+| **手动触发** | ✅ | ❌（启停即可） | ✅ | ✅（唯一执行方式） |
+| **取消** | ✅ 执行中可取消 | 用停止代替 | 每轮自动完成 | 每次自动完成 |
 
-## 2. 职责边界
+### 1.1 引擎调度循环（每 1s tick）
 
-| 面 | 引擎 | 任务体（业务） | 面板/Handler |
-|---|---|---|---|
-| 身份/类型/分类 | Descriptor 定义 | — | 只读展示 |
-| 调度 | tick 驱动、间隔/探测轮 | 排程槽 due 判定（探测体内） | 开关透传 |
-| 执行 | 单飞/主节点门/角色门 | Run 编舞 | — |
-| 取消 | ctx 管道+CancelHook | 检查点响应 | 确认弹框 |
-| 历史 | task_runs（策略见 §6） | — | 只读 |
-| 日志 | tasks/{id}.log 生命周期行 | TeeTaskLog 分阶段流水 | 暗色终端弹框 |
-| 审计 | — | **体内自记**（手动≡自动） | 人机操作（启停/暂停）才补记 |
-| 状态 | 循环态/最近终态 | StatusFn 镜像 | — |
+```
+Scheduled: loopEnabled && !running && NextSlotFn() ≤ now → Run（每 tick 重读槽——µs 级 SELECT）
+Periodic : loopEnabled && !running && now-lastCheck ≥ IntervalFn() → Run
+Daemon   : 不进 tick——StartLoop 启动 Run 一次（阻塞）；StopLoop 取消 ctx
+Oneshot  : 不进 tick——仅 Trigger
+```
 
-## 3. 类型（Kind = 驱动节拍；AsKind = 展示性质）
+单飞：引擎 CAS 强制（in-flight 拒绝重入，全部 Kind 统一）。
 
-| Kind | 驱动 | 用途 |
+### 1.2 Descriptor 接口
+
+```go
+type Descriptor struct {
+    ID, Family, Name, Description, Category string
+    Kind Kind // Scheduled | Daemon | Periodic | Oneshot
+    NextSlotFn func() time.Time      // Scheduled：返回下次执行时间（zero=无配置）
+    IntervalFn func() time.Duration  // Periodic：固定间隔
+    Run        func(RunContext) error // Daemon: 阻塞直到 ctx.Done()
+    CancelHook func() bool; EnabledFn func() bool
+    StatusFn func() string; ToggleFn func(bool) error
+    ToggleName string; ManualRun, Cancelable bool
+    RunsOn Role; MasterOnly bool
+}
+```
+
+已删除：`SilentProbes`/`RecordFailuresOnly`/`SignalledWork`/`AsKind`/`Cadence`/`Singleton`——Kind 单独决定全部行为。
+
+## 2. 任务清单（17 注册任务）
+
+### 定时（4）——排程槽驱动，Run 纯业务
+
+| 任务 | NextSlotFn 数据源 | Run 体 |
 |---|---|---|
-| Continuous | IntervalFn 动态间隔 | 常驻循环/探测轮 |
-| Scheduled | 经 Continuous 探测轮实现 | 排程槽族（AsKind=Scheduled） |
-| Queue | 无（镜像） | 队列状态镜像 |
-| Oneshot | 无 | 单次触发（启动/手动） |
-| Info | 无 | 引擎外信息行 |
+| threat | `security_threat_sources.next_update` 最早值（UTC） | `m.RunUpdate(trigger)` 直达 |
+| crs | `security_crs_version.next_update` | `StartUpdate`+wait |
+| ip2region | `security_ip2region_version.next_update` | `StartUpdate`+wait |
+| auto-backup | `nextAutoBackupSlot()`（last_run 感知——漏跑追补/已跑步进） | `runAutoBackupScheduled` |
 
-## 4. 状态机
+到期检查全部移出 Run 体——引擎保证在排程槽调用，Run 只执行业务。
 
-`running / idle / queued / failed / cancelled / stopped / disabled / passive / no_runs / interrupted`
-- 定时族：StatusFn 镜像 > 最近 task_runs 终态；循环态不外露
-- 常驻族：循环态（running/stopped）；工作感知族（CA 等待轮询）叠加有活判定
-- 下次执行：排程槽族以槽为权威（禁探测兜底）；间隔族 last+interval；未启用/常驻/队列/单发 → `—`
+### 常驻（3）——Run 阻塞自管理循环
 
-## 5. 调度策略
+| 任务 | Run 体 | 实际工作 |
+|---|---|---|
+| security-events-ingestion | `runIngestionLoop(ctx)`（内部 2s ticker） | 尾读 coraza 审计日志 |
 
-- 排程槽（周/时刻）：NextSlotFn 声明式读取族配置；调度正确性由探测轮体内 due 逻辑保证
-- 固定间隔：IntervalFn（动态；tick 每秒重读即热生效——Reschedule 已随死构件清理移除，v1.1）
-- 探测轮：1min，SilentProbes（不落历史）
-- 角色门：RunsOn（master-only/slave-only/any）+ demote 竞态守卫留在任务体
+| cert-issuance | `<-ctx.Done()`（被动守护） | CAQueueManager（main 启动） |
+| cluster-sync | `<-ctx.Done()`（被动守护） | SyncService（自管理） |
 
-## 6. 记录策略（统一）
+系统启动即运行（默认 StartLoop）；关闭调度=启动也不运行；允许手动停止和启用。
 
-| 记录面 | 策略 |
+### 循环（8）——固定间隔，每轮独立执行+记录
+
+| 任务 | 间隔 |
 |---|---|
-| task_runs 历史 | 真实运行全记；探测轮静默；高频成功轮 RecordFailuresOnly；**manual 恒记**；保留 90 天 |
-| 任务日志 tasks/{id}.log | 生命周期行 + 业务 tee；与历史同策略（静默成功轮零行）；>cert_job_log_size_mb（默认 10MB） rotate 保 .1；保留期同审计月数 |
-| 审计 | 任务体自记（更新/载入/备份等业务事件）；清理/循环轮不进审计（task_runs 即记录）；人机操作（启停/暂停/触发确认）由 handler 记 |
-| 时区 | 全部写入/展示按基础设置 timezone（engineLoc 注入） |
+| config-watchdog | 60s |
+| cert-renewal-scan | 6h（入队时唤醒 cert-waiting-ca） |
+| cert-reconcile | 6h |
+| cert-manual-poll | 10min |
+| cert-waiting-ca | 30s（**默认调度关闭**——见 §3） |
+| log-cleanup | 24h |
+| audit-retention | 24h |
+| security-events-retention | 24h |
 
-## 7. 可拔插契约
+### 触发（1）
 
-注册 = `Register(Descriptor)` + 可选 `SetAsKind/SetManualRun`；摘除 = `Unregister`。任务清单、监控页、MCP、apidocs 自动收敛。动态行（cert-job:*）经收集器并入视图，同一 TaskInfo 形状。
+| 任务 | 说明 |
+|---|---|
+| startup:config-load | 启动单次（main 记录）+手动重载 |
 
-**调度列语义（2026-09-29 用户裁定）**：调度开关仅属于定时族（ToggleFn 声明者可操作；无排程槽的固定间隔族显示「固定间隔」标识）；常驻族显示**循环启停**（绑 loop_on）；Info/Queue 显示「—」。cert-job 动态行计数=终态映射（issued→成功+1/failed→失败+1）。
+另：cert-job 动态行（`cert_jobs` 表逐单镜像）为签发工作项视图，不入引擎注册表。
 
-## 8. 合规核对矩阵（16 族 + 队列卡 + 动态行）
+## 3. cert-waiting-ca 特例（默认关闭 + 唤醒/自停）
 
-| 族 | Kind/AsKind | 状态口径 | 下次时间 | 历史 | 日志 | 审计 | 手动≡自动 | 结论 |
-|---|---|---|---|---|---|---|---|---|
-| threat/crs/ip2region | Continuous/Scheduled | 镜像>终态 | 槽✓ | ✓ | tee✓ | 体自记✓ | ✓ | 合规 |
-| auto-backup | Continuous/Scheduled | 终态 | 槽✓ | ✓(executor 记) | tee?→补 | 体自记✓ | ✓ | 日志 tee 缺 |
-| watchdog/ingestion | Continuous/Continuous | 循环态 | —✓ | 失败留痕 | 生命周期行 | 不进✓ | n/a | 合规 |
-| log-cleanup/audit/events-retention | Continuous/Scheduled | 终态 | last+24h✓ | ✓ | 生命周期行 | 不进✓ | ✓ | 合规 |
-| cert-renewal/reconcile | Continuous/Scheduled | 终态 | last+6h✓ | ✓ | 生命周期行 | 不进✓ | ✓ | 合规 |
-| cert-manual | Continuous/Scheduled | 工作感知 | last+10min✓ | 失败留痕 | 生命周期+摘要行 | 不进✓ | ✓ | 合规 |
-| waiting-ca | Continuous/**Continuous（可控）** | 工作感知（门控） | CA 可用时间✓ | 失败留痕 | 生命周期+有活摘要行 | 不进✓ | ✓ | 合规（v1.1：真正可控——控制面元数据化后 Controllable 派生要求 AsKind=Continuous，描述符「可经调度开关停用」已兑现） |
-| config-load | Oneshot/Oneshot | 终态 | —✓ | ✓ | 生命周期行✓ | 体自记✓ | ✓(共享体) | 合规 |
-| cluster-sync | Info/Scheduled | 角色镜像 | last+间隔✓ | 边界(快照) | 边界 | 边界 | n/a | 声明边界 |
-| caddy 轮转 | 未注册（非任务） | — | — | — | — | — | n/a | 合规裁定 |
-| cert-job:* 动态行 | Queue | 作业状态 | —✓ | cert_jobs | 作业日志端点 | 队列域 | n/a | 合规 |
+```
+默认：调度关闭（不在默认 StartLoop 清单）——引擎不 tick，页面显示「已暂停」
+唤醒：cert-renewal-scan 入队证书任务 → StartLoop("cert-waiting-ca")
+      手动签发/重试入队 → 同上（cert 任务创建路径）
+自停：Run 体发现 certJobsActive()==false → StopLoop（回到默认关闭态）
+```
 
-**缺口清单**：~~auto-backup 任务日志 tee 缺失~~（已闭合——Round 62 修复：backupTee 全阶段留痕）。
+30s 循环为循环任务正常定义；调度关闭期间零执行零记录。
 
-### 6.4 任务日志统一口径（2026-09-29 用户裁定）
+## 4. 控制面（API + 页面）
 
-- **同一目录**：全部任务日志唯一存在于 tasks/{id}.log——每个任务的日志没有第二种文件，所有依赖方（任务监控弹框/规则集更新日志弹框/日志统计栏）读同一文件
-- **统一 rotate**：5MB→保 .1 一份；过期按「审计保留月数」配置清理；由「运行日志轮转副本清理」任务族每轮执行（taskLogsHousekeeping）
-- **统计栏**：/logs/stats 提供任务日志聚合行（key=tasks）与三库更新行（同文件测量）——全部日志弹框显示 LogStorageBar
+| 操作 | 端点 | 语义 |
+|---|---|---|
+| 手动触发 | `POST /system/tasks/{id}/trigger` | 定时/循环/触发类；单飞由引擎 CAS |
+| 调度开关 | `POST /system/tasks/{id}/toggle` `{enabled}` | 统一路由 StartLoop/StopLoop（按 Kind 分语义）；触发类 400 |
+| 重启 | `POST /system/tasks/{id}/control` `{action:"restart"}` | 仅常驻族 |
+| 取消 | `POST /system/tasks/{id}/cancel` | 仅 Cancelable 声明族 |
 
-## 6.5 业务摘要行（v1.1 新增，2026-09-29 用户裁定）
+页面（任务监控）：
+- 类型标签四色：定时(蓝)/常驻(绿)/循环(青)/触发(橙)
+- 筛选：全部/定时/常驻/循环/触发
+- 调度列：非触发类=开关（绑定 loop_on）；触发类=禁用开关（一致性）；cert-job 动态行=「—」
+- 常驻族停止需确认弹框；操作列常驻族有「重启」
 
-每个**真实执行轮**在 tasks/{id}.log 留 1-3 行业务结果（用户可读结论，非仅生命周期行）：
-- 低频族（证书扫描/对账/清理三族/载入/备份）：每轮一行结论（「无临期证书/清理 N 条/物化 N 个/应用成功 N 规则」）
-- 高频静默族：watchdog 每轮一行结论入日志文件（task_runs 仍失败留痕）；ingestion **有事件才写**（零事件轮零行）；waiting-ca **有活才写**
-- 更新族：既有分阶段流水 tee（write*UpdateLog 挂点）即业务摘要
-- cluster-sync（v1.1 突破 Info 边界，用户裁定）：同步轮成败各一行
-- 写入统一经 services.TaskLogf（时间戳与 tee 流水同形态）
+### 4.1 业务开关联动（2026-10-01 用户裁定）
+
+四个定时任务的**业务开关**（安全设置页的 threat/CRS/IP2Region 自动更新、备份设置页的自动备份启用）与任务监控联动：
+
+- EnabledFn（DB 直读）暴露业务开关态 → 视图 `enabled=false` 且 status=**已暂停**（非「空闲」）
+- NextSlotFn 同源判断——业务关=零调度零下次执行
+- 引擎调度开关（loop_on）与业务开关两层独立：调度开关暂停=引擎不投递；业务开关关闭=无排程槽可投递
+
+## 5. 记录与日志口径
+
+| 场景 | task_runs | 日志 |
+|---|---|---|
+| 定时槽间隙 | 0 行 | 0 行 |
+| 定时执行 | 1 行（引擎预插 running→终态） | [done]+业务 |
+| 常驻生命周期 | 1 行（boot 插入，停止时更新终态） | [start]+[done] |
+| 循环每轮 | 1 行 | [done]+业务 |
+| 触发执行 | 1 行 | [start]/[done]+业务 |
+| 手动触发 | 1 行（trigger=manual） | 同上 |
+| 崩溃恢复 | 残留 running → interrupted | — |
+
+task_runs 保留 90 天（audit-retention 每日清理）。
+
+## 6. 业务侧 helper
+
+- `TaskLogf(taskID, stage, format, ...)` — 业务摘要行（tee 到任务日志）
+- `taskengine.TeeTaskLog` — 分阶段流水
+- `RecordRunStart/RecordRunFinish` — legacy 直调路径（引擎外执行）
+
+## 7. 修订记录
+
+- v2.0（2026-10-01）：四类型标准重构。Kind 枚举 4 值替代 Continuous/Queue/Info；删除 SilentProbes/RecordFailuresOnly/SignalledWork/Singleton/AsKind/Cadence；NextSlotFn 返回 time.Time；Daemon 生命周期（StartLoop 调 Run 一次+阻塞）；cert-waiting-ca 默认调度关闭+唤醒/自停；自动备份遗留 1min 调度器删除（追补语义移入 nextAutoBackupSlot 的 last_run 感知）；ingestion 改自管理循环。

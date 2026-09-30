@@ -96,24 +96,39 @@ func TestTaskLogf_WatchdogSummaryShape(t *testing.T) {
 	}
 }
 
-// Given SilentRuns 元数据（RecordFailuresOnly 族）。
+// Given v2.0 四类型标准全量注册。
 // When DescribeAll。
-// Then watchdog/ingestion/cert-manual-poll/cert-waiting-ca silent_runs=true；
-// threat 族 false（UI「静默轮」徽标数据源）。
-func TestTaskEngineWire_SilentRunsFlags(t *testing.T) {
+// Then Kind 映射：定时 4（threat/crs/ip2region/auto-backup）、循环 8、
+// 常驻 3（ingestion/cert-issuance/cluster-sync）、触发 1（startup:config-load）；
+// cert-waiting-ca 默认 LoopOn=false（调度关闭——续期扫描唤醒）。
+func TestTaskEngineWire_KindMapping(t *testing.T) {
 	te := newWireTestEngine(t)
-	got := map[string]bool{}
+	got := map[string]taskengine.TaskMeta{}
 	for _, m := range te.DescribeAll() {
-		got[m.ID] = m.SilentRuns
+		got[m.ID] = m
 	}
-	for _, id := range []string{"config-watchdog", "security-events-ingestion", "cert-manual-poll", "cert-waiting-ca"} {
-		if !got[id] {
-			t.Errorf("%s 应 SilentRuns=true", id)
+	want := map[string]taskengine.Kind{
+		"threat": taskengine.KindScheduled, "crs": taskengine.KindScheduled,
+		"ip2region": taskengine.KindScheduled, "auto-backup": taskengine.KindScheduled,
+		"config-watchdog": taskengine.KindPeriodic, "log-cleanup": taskengine.KindPeriodic,
+		"audit-retention": taskengine.KindPeriodic, "security-events-retention": taskengine.KindPeriodic,
+		"cert-renewal-scan": taskengine.KindPeriodic, "cert-reconcile": taskengine.KindPeriodic,
+		"cert-manual-poll": taskengine.KindPeriodic, "cert-waiting-ca": taskengine.KindPeriodic,
+		"security-events-ingestion": taskengine.KindDaemon, "cert-issuance": taskengine.KindDaemon,
+		"cluster-sync":        taskengine.KindDaemon,
+		"startup:config-load": taskengine.KindOneshot,
+	}
+	for id, kind := range want {
+		m, ok := got[id]
+		if !ok {
+			t.Errorf("%s 未注册", id)
+			continue
+		}
+		if m.Kind != kind {
+			t.Errorf("%s Kind=%s, want %s", id, m.Kind, kind)
 		}
 	}
-	for _, id := range []string{"threat", "crs", "auto-backup", "cert-renewal-scan"} {
-		if got[id] {
-			t.Errorf("%s 应 SilentRuns=false", id)
-		}
+	if m, ok := got["cert-waiting-ca"]; ok && m.LoopOn {
+		t.Error("cert-waiting-ca 默认调度应关闭（LoopOn=false，续期扫描唤醒）")
 	}
 }

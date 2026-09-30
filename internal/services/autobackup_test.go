@@ -262,23 +262,21 @@ func setAutoBackupTestExecutor(t *testing.T, calls *[]string, err error) {
 	t.Cleanup(func() { SetAutoBackupExecutor(nil) })
 }
 
-func TestAutoBackupTick_runsWhenDueAndAdvancesLastRun(t *testing.T) {
-	// Given: 启用 daily 03:00,last_run 为空,执行器注入
+func TestAutoBackupScheduled_execsAndAdvancesLastRun(t *testing.T) {
+	// Given: 引擎在排程槽调用（v2.0 Scheduled）——runAutoBackupScheduled 直接执行
 	setupAutoBackupTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1, auto_backup_frequency='daily', auto_backup_time='03:00' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	var calls []string
 	setAutoBackupTestExecutor(t, &calls, nil)
-	now := time.Date(2026, 9, 20, 15, 0, 0, 0, time.UTC)
 
 	// When
-	autoBackupTick(now)
-	// 同槽再 tick 一次(模拟下一分钟)
-	autoBackupTick(now.Add(time.Minute))
+	if err := runAutoBackupScheduled(0); err != nil {
+		t.Fatalf("run: %v", err)
+	}
 
-	// Then: 仅执行一次,trigger=schedule,last_run=当日槽
-	// 调度路径操作者恒为 system(手动路径记登录用户,handlers 层钉住)
+	// Then: trigger=schedule, 操作者恒为 system, last_run=当日最近槽
 	if len(calls) != 1 || calls[0] != "schedule:system" {
 		t.Fatalf("calls=%v, want single schedule:system", calls)
 	}
@@ -290,71 +288,65 @@ func TestAutoBackupTick_runsWhenDueAndAdvancesLastRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("last_run 非 RFC3339 形态 %q: %v", lastRun, err)
 	}
-	if want := time.Date(2026, 9, 20, 3, 0, 0, 0, time.UTC); !got.Equal(want) {
-		t.Fatalf("last_run=%v, want %v", got, want)
+	// 最近槽=测试运行当日 03:00（UTC）——只需断言形态与时点结构
+	if got.Hour() != 3 || got.Minute() != 0 {
+		t.Fatalf("last_run=%v, want 当日 03:00 槽", got)
 	}
 }
 
-func TestAutoBackupTick_skipsWhenDisabled(t *testing.T) {
-	// Given: 未启用,last_run 为空
+func TestAutoBackupNextSlot_disabledReturnsZero(t *testing.T) {
+	// Given: 未启用
 	setupAutoBackupTestDB(t)
-	var calls []string
-	setAutoBackupTestExecutor(t, &calls, nil)
 
 	// When
-	autoBackupTick(time.Date(2026, 9, 20, 15, 0, 0, 0, time.UTC))
+	_, ok := nextAutoBackupSlot(time.Date(2026, 9, 20, 15, 0, 0, 0, time.UTC))
 
 	// Then
-	if len(calls) != 0 {
-		t.Fatalf("calls=%v, want none", calls)
+	if ok {
+		t.Fatal("未启用应无槽（引擎零调度）")
 	}
 }
 
-func TestAutoBackupTick_skipsWhenLastRunCoversSlot(t *testing.T) {
-	// Given: last_run 恰等于最近槽(已跑过本槽)
+func TestAutoBackupNextSlot_coveredStepsToFuture(t *testing.T) {
+	// Given: last_run 恰等于最近槽（已跑过本槽）
 	setupAutoBackupTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1, auto_backup_frequency='daily', auto_backup_time='03:00', auto_backup_last_run='2026-09-20T03:00:00Z' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	var calls []string
-	setAutoBackupTestExecutor(t, &calls, nil)
 
 	// When
-	autoBackupTick(time.Date(2026, 9, 20, 15, 0, 0, 0, time.UTC))
+	slot, ok := nextAutoBackupSlot(time.Date(2026, 9, 20, 15, 0, 0, 0, time.UTC))
 
-	// Then
-	if len(calls) != 0 {
-		t.Fatalf("calls=%v, want none", calls)
+	// Then: 步进到明日槽（未来时刻——引擎睡到点）
+	if !ok {
+		t.Fatal("已启用应有下一槽")
+	}
+	if want := time.Date(2026, 9, 21, 3, 0, 0, 0, time.UTC); !slot.Equal(want) {
+		t.Fatalf("slot=%v, want 明日 %v", slot, want)
 	}
 }
 
-func TestAutoBackupTick_catchesUpAcrossMissedSlots(t *testing.T) {
-	// Given: 停机跨槽——last_run=昨日槽,now 已过今日槽
+func TestAutoBackupNextSlot_catchesUpPastSlot(t *testing.T) {
+	// Given: 停机跨槽——last_run=昨日槽, now 已过今日槽
 	setupAutoBackupTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1, auto_backup_frequency='daily', auto_backup_time='03:00', auto_backup_last_run='2026-09-19T03:00:00Z' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	var calls []string
-	setAutoBackupTestExecutor(t, &calls, nil)
 
 	// When
-	autoBackupTick(time.Date(2026, 9, 21, 8, 0, 0, 0, time.UTC))
+	slot, ok := nextAutoBackupSlot(time.Date(2026, 9, 21, 8, 0, 0, 0, time.UTC))
 
-	// Then: 补跑一次(20 日与 21 日槽合并为最近槽 21 日,单次执行)
-	if len(calls) != 1 {
-		t.Fatalf("calls=%v, want single catch-up run", calls)
+	// Then: 返回过去槽（≤now——引擎到点立即触发=跨停机窗口补跑）
+	if !ok {
+		t.Fatal("漏跑应有追补槽")
 	}
-	var lastRun string
-	if err := db.DB.QueryRow(`SELECT auto_backup_last_run FROM global_config WHERE id=1`).Scan(&lastRun); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := time.Parse(time.RFC3339, lastRun); !got.Equal(time.Date(2026, 9, 21, 3, 0, 0, 0, time.UTC)) {
-		t.Fatalf("last_run=%s, want 2026-09-21T03:00:00Z", lastRun)
+	if want := time.Date(2026, 9, 21, 3, 0, 0, 0, time.UTC); !slot.Equal(want) {
+		t.Fatalf("slot=%v, want 最近漏跑槽 %v", slot, want)
 	}
 }
 
-func TestAutoBackupTick_advancesLastRunEvenWhenExecutorFails(t *testing.T) {
-	// Given: 到期但执行器失败——last_run 仍推进(失败已落 failed 行,不重试风暴)
+func TestAutoBackupScheduled_advancesLastRunEvenWhenExecutorFails(t *testing.T) {
+	// Given: 执行器失败——last_run 仍推进(失败已落 failed 行,不重试风暴)
 	setupAutoBackupTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1, auto_backup_frequency='daily', auto_backup_time='03:00' WHERE id=1`); err != nil {
 		t.Fatal(err)
@@ -363,7 +355,7 @@ func TestAutoBackupTick_advancesLastRunEvenWhenExecutorFails(t *testing.T) {
 	setAutoBackupTestExecutor(t, &calls, context.DeadlineExceeded)
 
 	// When
-	autoBackupTick(time.Date(2026, 9, 20, 15, 0, 0, 0, time.UTC))
+	_ = runAutoBackupScheduled(0)
 
 	// Then
 	if len(calls) != 1 {
@@ -371,15 +363,15 @@ func TestAutoBackupTick_advancesLastRunEvenWhenExecutorFails(t *testing.T) {
 	}
 	var lastRun string
 	if err := db.DB.QueryRow(`SELECT auto_backup_last_run FROM global_config WHERE id=1`).Scan(&lastRun); err != nil {
-		t.Fatal(err)
+		t.Fatalf("read last_run: %v", err)
 	}
-	if got, _ := time.Parse(time.RFC3339, lastRun); !got.Equal(time.Date(2026, 9, 20, 3, 0, 0, 0, time.UTC)) {
-		t.Fatalf("last_run=%s, want 2026-09-20T03:00:00Z(失败也推进)", lastRun)
+	if got, _ := time.Parse(time.RFC3339, lastRun); got.IsZero() || got.Hour() != 3 {
+		t.Fatalf("last_run=%s, want 当日 03:00 槽(失败也推进)", lastRun)
 	}
 }
 
-func TestAutoBackupTick_skipsWhenNoExecutorInjected(t *testing.T) {
-	// Given: 到期但执行器未装配(main 装配前的窗口)
+func TestAutoBackupScheduled_skipsWhenNoExecutorInjected(t *testing.T) {
+	// Given: 执行器未装配(main 装配前的窗口)
 	setupAutoBackupTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1, auto_backup_frequency='daily', auto_backup_time='03:00' WHERE id=1`); err != nil {
 		t.Fatal(err)
@@ -387,8 +379,10 @@ func TestAutoBackupTick_skipsWhenNoExecutorInjected(t *testing.T) {
 	SetAutoBackupExecutor(nil)
 	t.Cleanup(func() { SetAutoBackupExecutor(nil) })
 
-	// When: 不 panic、不推进 last_run(装配后下轮 tick 立即补跑)
-	autoBackupTick(time.Date(2026, 9, 20, 15, 0, 0, 0, time.UTC))
+	// When: 不 panic、不推进 last_run
+	if err := runAutoBackupScheduled(0); err != nil {
+		t.Fatalf("未装配应安全跳过: %v", err)
+	}
 
 	// Then
 	var lastRun *string
@@ -398,33 +392,4 @@ func TestAutoBackupTick_skipsWhenNoExecutorInjected(t *testing.T) {
 	if lastRun != nil {
 		t.Fatalf("last_run=%q, want NULL(未装配不推进)", *lastRun)
 	}
-}
-
-func TestAutoBackupScheduler_startStopLifecycle(t *testing.T) {
-	// Given: 重复启动幂等、停止等待退出、停止后再启动可重启
-	setupAutoBackupTestDB(t)
-	StartAutoBackupScheduler(context.Background())
-	first := autoBackupWorkerDone()
-	if first == nil {
-		t.Fatal("首次启动必须拉起 worker")
-	}
-	StartAutoBackupScheduler(context.Background())
-	if second := autoBackupWorkerDone(); second != first {
-		t.Fatal("重复启动不得重启 worker")
-	}
-	StopAutoBackupScheduler()
-	select {
-	case <-first:
-	default:
-		t.Fatal("停止后 worker 必须退出")
-	}
-	if autoBackupWorkerDone() != nil {
-		t.Fatal("停止后 done 通道必须清空")
-	}
-	// 重启
-	StartAutoBackupScheduler(context.Background())
-	if third := autoBackupWorkerDone(); third == nil || third == first {
-		t.Fatal("停止后必须可重新启动")
-	}
-	StopAutoBackupScheduler()
 }

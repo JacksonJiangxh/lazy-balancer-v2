@@ -1,10 +1,7 @@
 package services
 
 import (
-	"context"
 	"database/sql"
-	"errors"
-	"lazy-balancer-v2/internal/taskengine"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,20 +10,13 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 自动备份调度器（v2.3.x）：仅主节点启动（main.go isMaster 分支装配），1 分钟
-// tick。到期判定为纯函数 autoBackupDueSlot——返回 ≤now 的最近调度槽；tick 比对
-// global_config.auto_backup_last_run，「last_run 为空或 dueSlot 晚于 last_run」
-// 即执行并置 last_run=dueSlot（停机跨槽自动补跑一次；失败也推进，防止每分钟
-// 重试风暴——失败已落 auto_backups.failed 行与审计）。执行体由 handlers 包注入
+// 自动备份（v2.0 Scheduled 标准）：引擎在 nextAutoBackupSlot 排程槽调用
+// runAutoBackupScheduled。追补/去重=槽位与 last_run 比对（停机跨槽自动补跑
+// 一次；失败也推进 last_run，防重试风暴）。执行体由 handlers 包注入
 // （services→handlers 直接依赖会成环，装配点在 main.go）。
 var (
-	autoBackupMu     sync.Mutex
-	autoBackupCancel context.CancelFunc
-	autoBackupDone   chan struct{}
-
-	autoBackupExecMu     sync.Mutex
-	autoBackupExecutor   func(trigger, operator string, engineRunID int64) error
-	autoBackupTickWindow = time.Minute
+	autoBackupExecMu   sync.Mutex
+	autoBackupExecutor func(trigger, operator string, engineRunID int64) error
 )
 
 // SetAutoBackupExecutor 注入备份执行器（main.go 装配 handlers 实现；nil 解除）。
@@ -146,107 +136,22 @@ func loadAutoBackupSettings() (autoBackupSettingsRow, error) {
 	return row, nil
 }
 
-// autoBackupTick 执行单轮到期判定：未启用/未到期/参数非法均安全跳过。
-// AutoBackupSchedulerTickOnce 单轮备份调度探测（引擎 1min 节拍——内部
-// 自带 enabled/due 槽/last_run 补跑判定）。
-func AutoBackupSchedulerTickOnce() { autoBackupTick(time.Now()) }
-
-func autoBackupTick(now time.Time) {
-	row, err := loadAutoBackupSettings()
-	if err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			Logf("warn", "自动备份：读取设置失败（本轮跳过）: %v", err)
-		}
-		return
-	}
-	if !row.enabled {
-		return
-	}
-	dueSlot, ok := autoBackupDueSlot(now, row.freq, row.hhmm, row.day, CurrentLocation())
-	if !ok {
-		Logf("warn", "自动备份：调度参数非法（freq=%s time=%s day=%d，本轮跳过）", row.freq, row.hhmm, row.day)
-		return
-	}
-	if row.lastRun != nil && !dueSlot.After(*row.lastRun) {
-		return
-	}
+// runAutoBackupScheduled 定时任务执行体（v2.0 Scheduled 标准——引擎在排程
+// 槽调用；追补/去重判定在 NextSlotFn=nextAutoBackupSlot）。成败均推进
+// last_run（失败已由执行器落 failed 行+审计，防重试风暴）。
+func runAutoBackupScheduled(engineRunID int64) error {
 	exec := currentAutoBackupExecutor()
 	if exec == nil {
-		return
+		return nil // 执行器未注入（测试二进制）——安全跳过
 	}
-	// 引擎运行历史：真实备份执行落 task_runs（探测轮静默，此处才是任务本体）
-	runID := taskengine.RecordRunStart("auto-backup", "backup", "auto")
-	t0 := time.Now()
-	execErr := exec("schedule", "system", runID) // runID=tick 已记行——执行器跳过自记（P2-④ 单写方）
-	status, msg := "success", ""
-	if execErr != nil {
-		status, msg = "failed", execErr.Error()
-		Logf("error", "自动备份执行失败: %v", execErr)
-	}
-	taskengine.RecordRunFinish(runID, status, time.Since(t0).Milliseconds(), msg)
-	// 成败均推进 last_run——失败已由执行器落 failed 行+审计，此处防重试风暴
-	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_last_run=? WHERE id=1`, dueSlot.Format(time.RFC3339)); err != nil {
-		Logf("warn", "自动备份：更新 auto_backup_last_run 失败: %v", err)
-	}
-}
-
-// autoBackupWorkerDone 返回当前 worker 的 done 通道（未运行为 nil；测试用）。
-func autoBackupWorkerDone() <-chan struct{} {
-	autoBackupMu.Lock()
-	defer autoBackupMu.Unlock()
-	return autoBackupDone
-}
-
-// StartAutoBackupScheduler 启动 1 分钟调度循环（已在运行则幂等 no-op）。
-// 启动即先跑一轮 tick——重启后跨槽的备份立即补跑。
-func StartAutoBackupScheduler(ctx context.Context) {
-	autoBackupMu.Lock()
-	if autoBackupDone != nil {
-		autoBackupMu.Unlock()
-		return
-	}
-	runCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	autoBackupCancel = cancel
-	autoBackupDone = done
-	autoBackupMu.Unlock()
-
-	go func() {
-		defer func() {
-			close(done)
-			autoBackupMu.Lock()
-			if autoBackupDone == done {
-				autoBackupCancel = nil
-				autoBackupDone = nil
-			}
-			autoBackupMu.Unlock()
-		}()
-		autoBackupTick(time.Now())
-		ticker := time.NewTicker(autoBackupTickWindow)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-runCtx.Done():
-				return
-			case <-ticker.C:
-				autoBackupTick(time.Now())
+	execErr := exec("schedule", "system", engineRunID) // engineRunID=引擎已记行——执行器跳过自记（单写方）
+	row, err := loadAutoBackupSettings()
+	if err == nil {
+		if dueSlot, ok := autoBackupDueSlot(time.Now(), row.freq, row.hhmm, row.day, CurrentLocation()); ok {
+			if _, uerr := db.DB.Exec(`UPDATE global_config SET auto_backup_last_run=? WHERE id=1`, dueSlot.Format(time.RFC3339)); uerr != nil {
+				Logf("warn", "自动备份：更新 auto_backup_last_run 失败: %v", uerr)
 			}
 		}
-	}()
-}
-
-// StopAutoBackupScheduler 终止调度循环并等待退出；未运行为 no-op。
-func StopAutoBackupScheduler() {
-	autoBackupMu.Lock()
-	cancel := autoBackupCancel
-	done := autoBackupDone
-	autoBackupCancel = nil
-	autoBackupDone = nil
-	autoBackupMu.Unlock()
-	if cancel != nil {
-		cancel()
 	}
-	if done != nil {
-		<-done
-	}
+	return execErr
 }

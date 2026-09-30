@@ -52,12 +52,8 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	if threatMgr := GetThreatUpdateManager(); threatMgr != nil {
 		threatMgr.SetMasterRole(false)
 	}
-	// SYS41-2(第 41 轮审计):与 CRS/IP2Region 同点位——降级一并停自动备份
-	// 调度器,否则从节点本地产出备份文件,打破「调度器仅主节点运行」不变量。
-	// Stop 未运行时为 no-op(幂等),反方向由 Promote/主节点启动分支拉起。
-	if TaskEngine() == nil {
-		StopAutoBackupScheduler()
-	}
+	// 自动备份：v2.0 引擎 Scheduled 驱动（RunsOn=MasterOnly 角色门）——
+	// 降级后由引擎 SetRole 停调度，无需单独停止。
 	ResetConfigDrift()
 	return nil
 }

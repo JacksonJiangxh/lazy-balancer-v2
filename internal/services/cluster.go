@@ -318,13 +318,8 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	if s.lifecycle != nil {
 		s.lifecycle.StartACME()
 	}
-	// CL41-1b(第 41 轮审计):与 lifecycle.StartACME 对称——提升成功后拉起
-	// 自动备份调度器,不再要求重启进程。executor 由 main.go 无条件注入
-	// (未注入时 tick nil 守卫安全跳过)。Background 上下文:调度器生命周期
-	// 随进程,不随本次请求取消;停止由 main.go defer/BecomeSlave 负责。
-	if TaskEngine() == nil { // M4：引擎在场由引擎驱动（角色门）
-		StartAutoBackupScheduler(context.Background())
-	}
+	// 自动备份：v2.0 引擎 Scheduled 驱动（RunsOn=MasterOnly 角色门）——
+	// promote 后由引擎 SetRole 使能，无需单独拉起。
 	if crsManager := GetCRSUpdateManager(); crsManager != nil {
 		crsManager.SetMasterRole(true)
 	}

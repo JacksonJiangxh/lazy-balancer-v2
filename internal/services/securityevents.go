@@ -1409,9 +1409,6 @@ func (t *securityEventsTailer) securityEventsRateLimitedWarn(err error) {
 	}
 }
 
-// StartSecurityEventsIngestion tails the Coraza WAF audit log and ingests new
-// transactions into security_events until ctx is cancelled. Blocking; call
-// from a goroutine.
 // ensureAuditLogDir 创建审计日志所在目录（os.MkdirAll，幂等）。S-2：启动时调用
 // 一次——此前目录缺失时 tick 每 2s 建 audit.log 失败、永久刷屏且从不建目录。
 func ensureAuditLogDir() error {
@@ -1423,18 +1420,6 @@ func ensureAuditLogDir() error {
 // =Provision 致命=/load 拒收。main.go 必须在首次 ApplyConfigOnStartup 前调用。
 func EnsureWafAuditDir() error {
 	return ensureAuditLogDir()
-}
-
-func StartSecurityEventsIngestion(ctx context.Context) (waitExited func()) {
-	// 审计 B5-F3：返回 waitExited（循环退出时关闭的独立 done 通道）——优雅关停
-	// 在 db.Close 前先 cancel 再完整 join，避免在途 tick 与已关闭 DB 竞态刷噪。
-	// 每次调用独立通道，多启（测试）安全。
-	ingestionDone := make(chan struct{})
-	go func() {
-		defer close(ingestionDone)
-		runSecurityEventsIngestionLoop(ctx)
-	}()
-	return func() { <-ingestionDone }
 }
 
 // securityEventsPollState 引擎驱动的单轮摄取状态（tailer 跨轮复用——
@@ -1468,30 +1453,18 @@ func SecurityEventsPollOnce() {
 	rotateAuditLogIfNeeded()
 }
 
-func runSecurityEventsIngestionLoop(ctx context.Context) {
-	tailer := securityEventsNewTailer(auditLogPath, securityEventsOffsetPath)
-	if err := ensureAuditLogDir(); err != nil {
-		// 仅创建失败时告警一次（后续 tick 的同消息失败已由 S-1 限流窗口覆盖）。
-		Logf("warn", "security events ingestion: create audit log dir %s failed: %v", filepath.Dir(auditLogPath), err)
-	}
-	Logf("info", "security events ingestion started: audit_log=%s offset_file=%s", auditLogPath, securityEventsOffsetPath)
-	ticker := time.NewTicker(securityEventsPollInterval)
+// runIngestionLoop 常驻自管理摄取循环（v2.0 Daemon 标准）：2s 节拍尾读 +
+// 轮转跟随，阻塞直到 ctx 取消。引擎 StartLoop 时启动一次（Run=本函数），
+// StopLoop 时 ctx 取消返回。
+func runIngestionLoop(ctx context.Context) error {
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
-		// 先采集后轮转：copytruncate 前把未摄取内容全部吃进，杜绝轮转窗口丢事件。
-		if err := tailer.securityEventsTick(); err != nil {
-			tailer.securityEventsRateLimitedWarn(err)
-		}
-		// SPEC §6.5：有事件才写（零事件轮零行——静默语义保持）。
-		if tailer.lastIngested > 0 {
-			TaskLogf("security-events-ingestion", "ingest", "摄取 %d 条安全事件", tailer.lastIngested)
-			tailer.lastIngested = 0
-		}
-		rotateAuditLogIfNeeded()
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-ticker.C:
+			SecurityEventsPollOnce()
 		}
 	}
 }

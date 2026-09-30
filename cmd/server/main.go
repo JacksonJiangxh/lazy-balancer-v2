@@ -246,9 +246,6 @@ func run() error {
 	})
 	if isMaster {
 		lifecycle.StartACME()
-		if services.TaskEngine() == nil {
-			services.StartAutoBackupScheduler(context.Background())
-		}
 	} else {
 		lifecycle.StopACME()
 		lifecycle.StartSync()
@@ -264,7 +261,6 @@ func run() error {
 			ip2RegionManager.StopScheduler()
 		}
 		services.StopSecurityEventsRetention()
-		services.StopAutoBackupScheduler()
 		services.StopAuditCleanup()
 		services.StopTimezoneRefresh()
 		services.StopLogRotate()

@@ -13,48 +13,10 @@ import (
 // (CRS/IP2Region SetMasterRole(false),TestClusterService_BecomeSlave_
 // stopsUpdateSchedulers)同点位对称;否则降级后调度器继续运行,从节点本地
 // 产出备份文件,打破「调度器仅主节点运行」不变量。
-func TestClusterService_BecomeSlave_stopsAutoBackupScheduler(t *testing.T) {
-	service, _ := newClusterTestService(t)
-	t.Cleanup(StopAutoBackupScheduler)
-	StartAutoBackupScheduler(context.Background())
-	if autoBackupWorkerDone() == nil {
-		t.Fatal("given: 主节点上自动备份调度器必须在运行")
-	}
-
-	// When 节点降级注册进另一集群
-	if err := service.BecomeSlave(context.Background(), "https://master.example", models.ClusterRegistration{RegistrationID: 9, RegistrationSecret: "secret"}); err != nil {
-		t.Fatalf("become slave: %v", err)
-	}
-
-	// Then 自动备份调度器停止
-	if autoBackupWorkerDone() != nil {
-		t.Fatal("降级为从节点后自动备份调度器必须停止")
-	}
-}
-
-// CL41-1b(第 41 轮审计):promote 成功后拉起自动备份调度器(与 lifecycle.
-// StartACME 对称)——此前调度器仅在进程启动的 isMaster 分支装配,从节点
-// 提升后需重启进程才开始自动备份。
-func TestClusterService_Promote_startsAutoBackupScheduler(t *testing.T) {
-	service, database := newClusterTestService(t)
-	t.Cleanup(StopAutoBackupScheduler)
-	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url='' WHERE id=1"); err != nil {
-		t.Fatalf("seed slave state: %v", err)
-	}
-	if autoBackupWorkerDone() != nil {
-		t.Fatal("given: 提升前调度器不得运行")
-	}
-
-	// When 从节点提升为主节点
-	if err := service.Promote(context.Background()); err != nil {
-		t.Fatalf("promote: %v", err)
-	}
-
-	// Then 自动备份调度器启动
-	if autoBackupWorkerDone() == nil {
-		t.Fatal("提升为主节点后自动备份调度器必须启动")
-	}
-}
+// v2.0：promote/demote 与自动备份的调度耦合已消除——引擎 Scheduled +
+// RunsOn=MasterOnly 角色门接管（Promote/BecomeSlave 经 manager SetMasterRole
+// 联动 TaskEngine().SetRole；角色门行为由 engine_test 钉死），此处不再
+// 有独立调度器生命周期可测。
 
 // CL41-1a(第 41 轮审计)快照面:自动备份六设置列(不含 last_run 节点本地
 // 运行态)随 users 节同步——主端装载恒携带(非 nil 指针),线格式六键齐全。

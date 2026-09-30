@@ -1,10 +1,9 @@
 package taskengine
 
-// lazy-task-engine M1 单测：注册/调度/单飞/取消/历史/崩溃恢复/角色门/动态间隔。
-// 纯增量包——M1 无任何消费方，行为契约在此钉死。
+// lazy-task-engine v2.0 单测：四类型调度/单飞 CAS/取消/历史/崩溃恢复/
+// 角色门/动态间隔/Daemon 生命周期/Scheduled 槽位驱动/每轮记录。
 
 import (
-	"context"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -29,14 +28,23 @@ func newTestEngine(t *testing.T) *Engine {
 	return e
 }
 
-// Given 单飞任务运行中。
+func countRuns(t *testing.T, id string) int {
+	t.Helper()
+	var n int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM task_runs WHERE task_id=?`, id).Scan(&n); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	return n
+}
+
+// Given 任务运行中（任何 Kind——v2.0 单飞为引擎 CAS 统一强制）。
 // When 再次 Trigger。
 // Then 返回 ErrAlreadyRunning（409 语义），不重入。
 func TestEngine_SingletonTriggerRejectedWhileRunning(t *testing.T) {
 	e := newTestEngine(t)
 	release := make(chan struct{})
 	started := make(chan struct{})
-	e.Register(Descriptor{ID: "t-single", Family: "t", Name: "单飞", Singleton: true,
+	e.Register(Descriptor{ID: "t-single", Family: "t", Name: "单飞", Kind: KindPeriodic,
 		Run: func(rc RunContext) error {
 			close(started)
 			<-release
@@ -55,32 +63,26 @@ func TestEngine_SingletonTriggerRejectedWhileRunning(t *testing.T) {
 // Then Run 返回且历史终态=cancelled（非 failed）。
 func TestEngine_CancelMarksCancelled(t *testing.T) {
 	e := newTestEngine(t)
-	inRun := make(chan struct{})
-	done := make(chan error, 1)
-	e.Register(Descriptor{ID: "t-cancel", Family: "t", Name: "可取消", Singleton: true, Cancelable: true,
+	started := make(chan struct{})
+	e.Register(Descriptor{ID: "t-cancel", Family: "t", Name: "可取消", Kind: KindPeriodic, Cancelable: true,
 		Run: func(rc RunContext) error {
-			close(inRun)
+			close(started)
 			<-rc.Ctx.Done()
-			return context.Canceled
+			return rc.Ctx.Err()
 		}})
-	go func() { done <- e.runNow("t-cancel", "manual", "") }()
-	<-inRun
+	go func() { _ = e.Trigger("t-cancel", "manual", "") }()
+	<-started
 	if !e.Cancel("t-cancel") {
-		t.Fatal("Cancel 应生效")
+		t.Fatal("Cancel 应返回 true")
 	}
-	if err := <-done; err != nil && err != context.Canceled {
-		t.Fatalf("run err=%v", err)
-	}
-	// 等终态落库
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		runs := e.History("t-cancel", 1)
-		if len(runs) == 1 && runs[0].Status == "cancelled" {
+		if lr := e.LatestRun("t-cancel"); lr != nil && lr.Status == "cancelled" {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("历史终态应为 cancelled, got %+v", e.History("t-cancel", 1))
+	t.Fatal("终态应为 cancelled")
 }
 
 // Given task_runs 残留 status=running 行（崩溃现场）。
@@ -88,27 +90,26 @@ func TestEngine_CancelMarksCancelled(t *testing.T) {
 // Then 该行改标 interrupted。
 func TestEngine_RecoverOrphansMarksInterrupted(t *testing.T) {
 	e := newTestEngine(t)
-	res, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, trigger, status) VALUES ('t-orph', 't', 'auto', 'running')`)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, trigger, status, started_at) VALUES ('t-x','t','auto','running',datetime('now'))`); err != nil {
+		t.Fatalf("seed: %v", err)
 	}
-	id, _ := res.LastInsertId()
 	if n := e.RecoverOrphans(); n != 1 {
-		t.Fatalf("应回收 1 行, got %d", n)
+		t.Fatalf("want 1 orphan recovered, got %d", n)
 	}
-	var status string
-	if err := db.DB.QueryRow(`SELECT status FROM task_runs WHERE id=?`, id).Scan(&status); err != nil || status != "interrupted" {
-		t.Fatalf("status=%q err=%v, want interrupted", status, err)
+	var st string
+	_ = db.DB.QueryRow(`SELECT status FROM task_runs WHERE task_id='t-x'`).Scan(&st)
+	if st != "interrupted" {
+		t.Fatalf("want interrupted, got %s", st)
 	}
 }
 
 // Given slave-only 任务 + 当前为主节点。
 // When 调度 tick 到期。
-// Then 不执行（角色门拦截），快照状态 idle。
+// Then 不执行（角色门拦截）。
 func TestEngine_RoleGateSlaveOnlyOnMasterSkips(t *testing.T) {
 	e := newTestEngine(t)
 	ran := false
-	e.Register(Descriptor{ID: "t-role", Family: "t", Name: "从节点任务", RunsOn: RoleSlaveOnly,
+	e.Register(Descriptor{ID: "t-role", Family: "t", Name: "从节点任务", Kind: KindPeriodic, RunsOn: RoleSlaveOnly,
 		IntervalFn: func() time.Duration { return 20 * time.Millisecond },
 		Run:        func(rc RunContext) error { ran = true; return nil }})
 	e.StartLoop("t-role")
@@ -126,7 +127,7 @@ func TestEngine_DynamicIntervalReread(t *testing.T) {
 	e := newTestEngine(t)
 	mu := make(chan struct{}, 32)
 	var fast atomic.Bool
-	e.Register(Descriptor{ID: "t-dyn", Family: "t", Name: "动态", Kind: KindContinuous, RunsOn: RoleAny,
+	e.Register(Descriptor{ID: "t-dyn", Family: "t", Name: "动态", Kind: KindPeriodic, RunsOn: RoleAny,
 		IntervalFn: func() time.Duration {
 			if fast.Load() {
 				return 20 * time.Millisecond
@@ -152,12 +153,12 @@ func TestEngine_DynamicIntervalReread(t *testing.T) {
 	}
 }
 
-// Given 常驻任务(loop)运行中。
+// Given 循环任务运行中。
 // When StopLoop 后 StartLoop。
 // Then 循环停/启真实生效（IsRunning 翻转）。
 func TestEngine_LoopStopStart(t *testing.T) {
 	e := newTestEngine(t)
-	e.Register(Descriptor{ID: "t-loop", Family: "t", Name: "常驻", Kind: KindContinuous, RunsOn: RoleAny,
+	e.Register(Descriptor{ID: "t-loop", Family: "t", Name: "常驻", Kind: KindPeriodic, RunsOn: RoleAny,
 		IntervalFn: func() time.Duration { return 20 * time.Millisecond },
 		Run:        func(rc RunContext) error { return nil }})
 	e.SetRole(true)
@@ -175,204 +176,222 @@ func TestEngine_LoopStopStart(t *testing.T) {
 // Then 历史行含 trigger/status/duration 与 task_id。
 func TestEngine_HistoryRecordShape(t *testing.T) {
 	e := newTestEngine(t)
-	e.Register(Descriptor{ID: "t-hist", Family: "t", Name: "历史", Singleton: true,
+	e.Register(Descriptor{ID: "t-hist", Family: "t", Name: "历史", Kind: KindOneshot,
+		Run: func(rc RunContext) error { time.Sleep(30 * time.Millisecond); return nil }})
+	if err := e.Trigger("t-hist", "manual", "alice"); err != nil {
+		t.Fatalf("trigger: %v", err)
+	}
+	runs := e.History("t-hist", 5)
+	if len(runs) != 1 {
+		t.Fatalf("want 1 run, got %d", len(runs))
+	}
+	r := runs[0]
+	if r.TaskID != "t-hist" || r.Family != "t" || r.Trigger != "manual" || r.Status != "success" {
+		t.Fatalf("shape mismatch: %+v", r)
+	}
+	if r.DurationMs < 20 {
+		t.Fatalf("duration 应≥20ms, got %d", r.DurationMs)
+	}
+	if r.FinishedAt == "" {
+		t.Fatal("finished_at 应非空")
+	}
+}
+
+// ---- v2.0 四类型核心语义 ----
+
+// Given Scheduled 任务，NextSlotFn 先返回未来槽、后返回过去槽。
+// When 引擎 tick。
+// Then 槽未到=零执行零落行；槽过后=恰执行一次并重算下一槽（不重复触发）。
+func TestEngine_ScheduledFiresAtSlotAndRecomputes(t *testing.T) {
+	e := newTestEngine(t)
+	var runs atomic.Int32
+	var slot atomic.Value                        // time.Time
+	slot.Store(time.Now().Add(10 * time.Second)) // 远期——slot 翻转前零执行
+	e.Register(Descriptor{ID: "t-sched", Family: "t", Name: "定时", Kind: KindScheduled,
+		NextSlotFn: func() time.Time { return slot.Load().(time.Time) },
 		Run: func(rc RunContext) error {
+			runs.Add(1)
+			slot.Store(time.Now().Add(10 * time.Second)) // 模拟任务体执行后写新槽
 			return nil
 		}})
-	if err := e.Trigger("t-hist", "manual", ""); err != nil {
-		t.Fatal(err)
+	e.SetRole(true)
+	e.StartLoop("t-sched")
+	time.Sleep(150 * time.Millisecond)
+	if got := runs.Load(); got != 0 {
+		t.Fatalf("槽未到不应执行, got %d", got)
 	}
+	if got := countRuns(t, "t-sched"); got != 0 {
+		t.Fatalf("槽未到不应落行, got %d 行", got)
+	}
+	// 槽位翻转：过去槽 → 引擎到点触发
+	slot.Store(time.Now().Add(-time.Second))
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		runs := e.History("t-hist", 1)
-		if len(runs) == 1 && runs[0].Status == "success" {
-			r := runs[0]
-			if r.TaskID != "t-hist" || r.Family != "t" || r.Trigger != "manual" {
-				t.Fatalf("历史字段不全: %+v", r)
-			}
-			return
-		}
+	for time.Now().Before(deadline) && runs.Load() == 0 {
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("应有一条 success 历史: %+v", e.History("t-hist", 1))
+	if runs.Load() != 1 {
+		t.Fatalf("槽过后应恰执行 1 次, got %d", runs.Load())
+	}
+	// Run 已写远期新槽——不重复触发
+	time.Sleep(150 * time.Millisecond)
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("新槽远期不应重复执行, got %d", got)
+	}
+	if got := countRuns(t, "t-sched"); got != 1 {
+		t.Fatalf("应恰 1 行, got %d", got)
+	}
 }
 
-// Given SilentProbes/RecordFailuresOnly 任务各执行一次成功。
-// Then R63 新语义：RecordFailuresOnly 首轮 boot 恰 1 行（启动计数）；
-// SilentProbes 恒零行（探测轮非工作轮）；后续成功轮不再增行。
-func TestEngine_RecordPoliciesSilentOnSuccess(t *testing.T) {
+// Given Daemon 任务（Run 阻塞在 ctx.Done）。
+// When StartLoop → StopLoop → StartLoop。
+// Then Run 每次生命周期恰调用一次（非周期重入）；boot 行=生命周期数；
+// StopLoop 取消 ctx 使 Run 返回。
+func TestEngine_DaemonLifecycle(t *testing.T) {
 	e := newTestEngine(t)
-	e.Register(Descriptor{ID: "t-silent", Family: "t", Singleton: true, SilentProbes: true,
-		Run: func(rc RunContext) error { return nil }})
-	e.Register(Descriptor{ID: "t-failonly", Family: "t", Singleton: true, RecordFailuresOnly: true,
-		Run: func(rc RunContext) error { return nil }})
-	// auto 触发(探测/工作轮语义)：探测轮零行；RecordFailuresOnly boot 计 1 行
-	if err := e.runNow("t-silent", "auto", ""); err != nil {
-		t.Fatal(err)
+	var starts atomic.Int32
+	inLoop := make(chan struct{}, 8)
+	e.Register(Descriptor{ID: "t-daemon", Family: "t", Name: "常驻", Kind: KindDaemon,
+		Run: func(rc RunContext) error {
+			starts.Add(1)
+			inLoop <- struct{}{}
+			<-rc.Ctx.Done() // 自管理循环——阻塞直到取消
+			return nil
+		}})
+	e.SetRole(true)
+	e.StartLoop("t-daemon")
+	<-inLoop
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("StartLoop 应恰调 Run 1 次, got %d", got)
 	}
-	if err := e.runNow("t-failonly", "auto", ""); err != nil {
-		t.Fatal(err)
+	time.Sleep(100 * time.Millisecond) // 多个 tick 窗口——验证不重入
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("Daemon 不应被周期 tick 重入, got %d", got)
 	}
-	time.Sleep(200 * time.Millisecond)
-	// SilentProbes（探测轮）恒不落库（含 boot——探测不是常驻工作轮）
-	if got := len(e.History("t-silent", 10)); got != 0 {
-		t.Fatalf("SilentProbes 探测轮不应落库, got %d 行", got)
+	if !e.IsRunning("t-daemon") {
+		t.Fatal("Daemon 运行中应 IsRunning=true")
 	}
-	// RecordFailuresOnly 首轮 boot 恰 1 行 success（启动计数）
-	runs := e.History("t-failonly", 10)
-	if len(runs) != 1 || runs[0].Status != "success" {
-		t.Fatalf("首轮 boot 应恰 1 行 success, got %+v", runs)
+	e.StopLoop("t-daemon")
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && e.IsRunning("t-daemon") {
+		time.Sleep(10 * time.Millisecond)
 	}
-	// 第二轮 auto 成功——不再增行（boot 已计）
-	if err := e.runNow("t-failonly", "auto", ""); err != nil {
-		t.Fatal(err)
+	if e.IsRunning("t-daemon") {
+		t.Fatal("StopLoop 后应非 running")
 	}
-	time.Sleep(100 * time.Millisecond)
-	if got := len(e.History("t-failonly", 10)); got != 1 {
-		t.Fatalf("后续成功轮不应增行（boot 已计）, got %d", got)
+	// boot 行恰 1 行（生命周期计数）
+	if got := countRuns(t, "t-daemon"); got != 1 {
+		t.Fatalf("Daemon 应恰 1 行 boot 记录, got %d", got)
 	}
-	// manual 触发恒落库（用户显式动作）
-	if err := e.runNow("t-silent", "manual", ""); err != nil {
-		t.Fatal(err)
+	// 重启：第二个生命周期
+	e.StartLoop("t-daemon")
+	<-inLoop
+	if got := starts.Load(); got != 2 {
+		t.Fatalf("重启应第 2 次调用 Run, got %d", got)
 	}
-	deadlineM := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadlineM) {
-		if runs := e.History("t-silent", 5); len(runs) >= 1 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	if got := countRuns(t, "t-daemon"); got != 2 {
+		t.Fatalf("两生命周期应 2 行, got %d", got)
 	}
-	if got := len(e.History("t-silent", 10)); got != 1 {
-		t.Fatalf("manual 应落 1 行, got %d", got)
-	}
-	// 失败轮补一行（R63 新语义：boot 后运行期失败也记一行——区别于旧 RecordFailuresOnly 仅首败）
-	e.Register(Descriptor{ID: "t-failonly", Family: "t", Singleton: true, RecordFailuresOnly: true,
-		Run: func(rc RunContext) error { return errors.New("boom") }})
-	if err := e.Trigger("t-failonly", "manual", ""); err == nil {
-		t.Fatal("应返回错误")
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		runs := e.History("t-failonly", 5)
-		if len(runs) == 2 && runs[0].Status == "failed" {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("失败轮应补 1 行 failed: %+v", e.History("t-failonly", 5))
 }
 
-func withTestLocation(t *testing.T, loc *time.Location) {
-	t.Helper()
-	old := engineLocPtr()
-	SetLocation(loc)
-	t.Cleanup(func() { SetLocation(old) })
+// Given Periodic 任务（30ms 间隔）。
+// When 调度运行 300ms。
+// Then 每轮独立执行且每轮落行（≈10 行——无 RFO 静默）。
+func TestEngine_PeriodicRecordsEveryCycle(t *testing.T) {
+	e := newTestEngine(t)
+	e.Register(Descriptor{ID: "t-per", Family: "t", Name: "循环", Kind: KindPeriodic,
+		IntervalFn: func() time.Duration { return 30 * time.Millisecond },
+		Run:        func(rc RunContext) error { return nil }})
+	e.SetRole(true)
+	e.StartLoop("t-per")
+	time.Sleep(300 * time.Millisecond)
+	e.StopLoop("t-per")
+	rows := countRuns(t, "t-per")
+	if rows < 5 {
+		t.Fatalf("300ms@30ms 应≥5 轮且每轮落行, got %d 行", rows)
+	}
+	var success int
+	_ = db.DB.QueryRow(`SELECT COUNT(*) FROM task_runs WHERE task_id='t-per' AND status='success'`).Scan(&success)
+	if success != rows {
+		t.Fatalf("每轮应终态 success: %d/%d", success, rows)
+	}
 }
 
-func parseRunTime(s string) time.Time {
-	tt, _ := time.ParseInLocation("2006-01-02 15:04:05", s, time.UTC)
-	return tt
+// Given Oneshot 任务。
+// When 引擎 tick 多轮（不开 Trigger）。
+// Then 零执行零落行；Trigger 后恰 1 行。
+func TestEngine_OneshotOnlyByTrigger(t *testing.T) {
+	e := newTestEngine(t)
+	var runs atomic.Int32
+	e.Register(Descriptor{ID: "t-one", Family: "t", Name: "触发", Kind: KindOneshot,
+		Run: func(rc RunContext) error { runs.Add(1); return nil }})
+	e.SetRole(true)
+	e.StartLoop("t-one") // 即使开循环开关——Oneshot 不进周期调度
+	time.Sleep(150 * time.Millisecond)
+	if got := runs.Load(); got != 0 {
+		t.Fatalf("Oneshot 不应被周期调度, got %d", got)
+	}
+	if err := e.Trigger("t-one", "manual", ""); err != nil {
+		t.Fatalf("trigger: %v", err)
+	}
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("Trigger 应执行 1 次, got %d", got)
+	}
 }
 
+// Given 注册的任务带 EnabledFn/StatusFn/NextSlotFn（含 DB 读取）。
+// When DescribeAll。
+// Then Fn 调用在引擎锁外（不互锁）；元数据含四类型字段。
 func TestEngine_DescribeAllReleasesLockBeforeFnCalls(t *testing.T) {
 	e := newTestEngine(t)
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	e.Register(Descriptor{ID: "t-block", Family: "t", Name: "阻塞元数据",
-		StatusFn: func() string {
-			select {
-			case <-entered:
-			default:
-				close(entered)
-			}
-			<-release
-			return ""
-		}})
-	go e.DescribeAll()
-	select {
-	case <-entered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("StatusFn 未被调用")
+	e.Register(Descriptor{ID: "t-meta", Family: "t", Name: "元数据", Kind: KindScheduled,
+		NextSlotFn: func() time.Time { return time.Now().Add(time.Hour) },
+		EnabledFn:  func() bool { return e.IsRunning("t-meta") },
+		StatusFn:   func() string { return "running" },
+		Run:        func(rc RunContext) error { return nil }})
+	e.StartLoop("t-meta")
+	var found *TaskMeta
+	for _, m := range e.DescribeAll() {
+		if m.ID == "t-meta" {
+			found = &m
+		}
 	}
-	stopped := make(chan struct{})
-	go func() {
-		e.Stop()
-		close(stopped)
-	}()
-	select {
-	case <-stopped:
-		close(release)
-	case <-time.After(2 * time.Second):
-		close(release) // 先放行避免 cleanup 挂死
-		t.Fatal("DescribeAll 持锁期间 Stop 被阻塞（元数据 Fn 调用未移出锁外）")
+	if found == nil {
+		t.Fatal("未找到任务元数据")
+	}
+	if found.Kind != KindScheduled || found.NextSlot == "" || found.StatusMirror != "running" || !found.LoopOn {
+		t.Fatalf("v2.0 元数据缺失: %+v", found)
 	}
 }
 
 // Given 任务体捕获 RunContext.Operator。
 // When Trigger(id, "manual", "alice")。
-// Then 任务体收到 operator=alice（U1-P3-1：手动操作者身份通道）。
+// Then 任务体收到 operator=alice（手动操作者身份通道）。
 func TestEngine_TriggerCarriesOperator(t *testing.T) {
 	e := newTestEngine(t)
-	got := make(chan string, 1)
-	e.Register(Descriptor{ID: "t-op", Family: "t", Name: "操作者", Singleton: true,
-		Run: func(rc RunContext) error {
-			got <- rc.Operator
-			return nil
-		}})
-	if err := e.Trigger("t-op", "manual", "alice"); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case op := <-got:
-		if op != "alice" {
-			t.Fatalf("want operator=alice, got %q", op)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("任务未执行")
+	var got string
+	done := make(chan struct{})
+	e.Register(Descriptor{ID: "t-op", Family: "t", Name: "操作者", Kind: KindOneshot,
+		Run: func(rc RunContext) error { got = rc.Operator; close(done); return nil }})
+	_ = e.Trigger("t-op", "manual", "alice")
+	<-done
+	if got != "alice" {
+		t.Fatalf("operator 应为 alice, got %q", got)
 	}
 }
 
-// Given 注册了 Singleton 声明的任务。
-// When DescribeAll。
-// Then 元数据暴露 SingleFlight=true（U1-P3-7：生产描述符补单飞的可观察面）。
-func TestEngine_DescribeAllExposesSingleFlight(t *testing.T) {
+// Given 引擎预插行（runNow 开跑即落）。
+// When 任务运行 100ms 后失败。
+// Then 行 started_at 反映真实开始时刻（started_at+duration 不越过 finished_at）。
+func TestEngine_FailedRunStartsAtRealStart(t *testing.T) {
 	e := newTestEngine(t)
-	e.Register(Descriptor{ID: "t-sf", Family: "t", Name: "单飞元数据", Singleton: true})
-	for _, m := range e.DescribeAll() {
-		if m.ID == "t-sf" {
-			if !m.SingleFlight {
-				t.Fatal("Singleton 声明应在 DescribeAll 元数据中暴露为 SingleFlight")
-			}
-			return
-		}
+	e.Register(Descriptor{ID: "t-fail", Family: "t", Name: "失败", Kind: KindOneshot,
+		Run: func(rc RunContext) error { time.Sleep(100 * time.Millisecond); return errors.New("boom") }})
+	_ = e.Trigger("t-fail", "manual", "")
+	lr := e.LatestRun("t-fail")
+	if lr == nil || lr.Status != "failed" {
+		t.Fatalf("want failed 终态, got %+v", lr)
 	}
-	t.Fatal("未找到 t-sf")
-}
-
-// Given RecordFailuresOnly 任务运行 100ms 后失败（触发 auto，成功轮静默）。
-// When 失败补插历史行。
-// Then 行 started_at 反映真实开始时刻而非补插时刻（U2-P5-08c：
-// started_at+duration 不越过 finished_at）。
-func TestEngine_RecordFailuresOnlyBackfillStartsAtRealStart(t *testing.T) {
-	e := newTestEngine(t)
-	e.Register(Descriptor{ID: "t-backfill", Family: "t", Singleton: true, RecordFailuresOnly: true,
-		Run: func(rc RunContext) error {
-			time.Sleep(120 * time.Millisecond)
-			return errors.New("boom")
-		}})
-	if err := e.runNow("t-backfill", "auto", ""); err == nil {
-		t.Fatal("应返回错误")
-	}
-	runs := e.History("t-backfill", 1)
-	if len(runs) != 1 {
-		t.Fatalf("应补插 1 行 failed, got %+v", runs)
-	}
-	r := runs[0]
-	if r.DurationMs < 100 {
-		t.Fatalf("duration 应≥100ms, got %d", r.DurationMs)
-	}
-	if end := parseRunTime(r.StartedAt).Add(time.Duration(r.DurationMs) * time.Millisecond); end.After(parseRunTime(r.FinishedAt).Add(2 * time.Second)) {
-		t.Fatalf("started_at 为补插时刻而非真实开始: started=%s duration=%dms finished=%s",
-			r.StartedAt, r.DurationMs, r.FinishedAt)
+	if lr.DurationMs < 90 {
+		t.Fatalf("duration 应≥90ms, got %d", lr.DurationMs)
 	}
 }

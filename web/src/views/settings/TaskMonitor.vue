@@ -89,8 +89,8 @@
           <el-radio-group v-model="kindFilter" size="small">
             <el-radio-button value="all">全部</el-radio-button>
             <el-radio-button value="scheduled">定时</el-radio-button>
-            <el-radio-button value="continuous">常驻</el-radio-button>
-            <el-radio-button value="queue">队列</el-radio-button>
+            <el-radio-button value="daemon">常驻</el-radio-button>
+            <el-radio-button value="periodic">循环</el-radio-button>
             <el-radio-button value="oneshot">触发</el-radio-button>
                       </el-radio-group>
         </div>
@@ -115,7 +115,7 @@
         </el-table-column>
         <el-table-column label="类型" width="72">
           <template #default="{ row }">
-            <el-tag size="small" :type="kindTag(row.kind)" effect="plain">{{ kindLabel(row.kind) }}</el-tag>
+            <el-tag size="small" :type="kindTag(row.kind)" effect="plain" :class="kindTagClass(row.kind)">{{ kindLabel(row.kind) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="88">
@@ -125,14 +125,14 @@
         </el-table-column>
         <el-table-column label="调度" width="92">
           <template #default="{ row }">
-            <!-- 调度开关按 Toggleable 元数据判定（/toggle 端点同口径）：
-                 后端全部定时族声明 ToggleFn 即 toggleable=true——一律渲染开关 -->
-            <el-switch v-if="row.toggleable" :model-value="row.enabled" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
-            <!-- 常驻族：开关=常驻循环启停（非调度开关），绑定 loop_on 走 control -->
-            <el-tooltip v-else-if="row.kind === 'continuous'" content="常驻循环启停（非调度开关）" placement="top" :offset="8" :show-after="150" :show-arrow="false">
-              <el-switch :model-value="row.loop_on" :disabled="!isAdmin" @change="(v: string | number | boolean) => onControl(row, !!v)" />
+            <!-- v2.0 调度开关统一：定时=暂停/恢复排程、循环=暂停/恢复循环、
+                 常驻=启停自管理循环——绑定 loop_on 走 /toggle（后端按 Kind 路由） -->
+            <el-switch v-if="row.kind !== 'oneshot'" :model-value="row.loop_on" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
+            <!-- 触发类（注册任务）：显示禁用开关保持页面一致性——仅手动/代码触发 -->
+            <el-tooltip v-else-if="!row.id.startsWith('cert-job:')" content="触发类任务不可调度——仅手动/代码触发执行" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+              <el-switch :model-value="false" disabled />
             </el-tooltip>
-            <!-- 队列/触发/信息行：无调度语义 -->
+            <!-- cert-job 动态行（签发工作项）：无调度语义 -->
             <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
@@ -147,14 +147,14 @@
                 <div>{{ row.status === 'running' ? '进行中' : fmtTime(row.last_run?.finished_at) || '—' }}</div>
               </template>
               <span v-if="row.last_run?.started_at">{{ fmtTime(row.last_run.started_at) }}</span>
-              <span v-else-if="row.kind === 'continuous'" class="tm-dim">常驻 · 启动于 {{ fmtTime(row.started_at) || '—' }}</span>
+              <span v-else-if="row.kind === 'daemon'" class="tm-dim">常驻 · 启动于 {{ fmtTime(row.started_at) || '—' }}</span>
               <span v-else class="tm-dim">—</span>
             </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="下次执行" width="180">
           <template #default="{ row }">
-            <span v-if="row.next_run_at && row.enabled && row.kind !== 'continuous'">{{ row.next_run_at }}</span>
+            <span v-if="row.next_run_at && row.loop_on && row.kind !== 'daemon'">{{ row.next_run_at }}</span>
             <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
@@ -218,18 +218,17 @@
         <el-descriptions :column="2" border size="small" class="tm-detail-descs">
           <el-descriptions-item label="运行节奏">{{ detailTask.cadence || '—' }}</el-descriptions-item>
           <el-descriptions-item label="调度开关">
-            <!-- 与列表调度列同语义三分支（详情为快照展示，不绑开关；Toggleable 判定同列） -->
-            <el-tag v-if="detailTask.toggleable" size="small" :type="detailTask.enabled ? 'success' : 'warning'" effect="plain">{{ detailTask.enabled ? '开启' : '已暂停' }}</el-tag>
-            <el-tooltip v-else-if="detailTask.kind === 'continuous'" content="常驻循环启停（非调度开关）" placement="top" :offset="8" :show-after="150" :show-arrow="false">
-              <el-tag size="small" :type="detailTask.loop_on ? 'success' : 'warning'" effect="plain">{{ detailTask.loop_on ? '循环运行中' : '循环已停止' }}</el-tag>
+            <!-- v2.0 统一口径：非触发类显示 loop_on 态（定时/循环=排程暂停、常驻=运行/停止） -->
+            <el-tag v-if="detailTask.kind !== 'oneshot'" size="small" :type="detailTask.loop_on ? 'success' : 'warning'" effect="plain">{{ detailTask.loop_on ? '开启' : '已暂停' }}</el-tag>
+            <el-tooltip v-else content="触发类任务不可调度——仅手动/代码触发执行" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+              <el-tag size="small" type="info" effect="plain">不可调度</el-tag>
             </el-tooltip>
-            <span v-else class="tm-dim">—</span>
           </el-descriptions-item>
           <el-descriptions-item label="下次执行">{{ detailTask.next_run_at || '—' }}</el-descriptions-item>
           <el-descriptions-item label="24h 成功 / 失败">
             <span class="tm-ok">{{ detailTask.success_24h }}</span> / <span :class="{ 'tm-bad': detailTask.fail_24h > 0 }">{{ detailTask.fail_24h }}</span>
           </el-descriptions-item>
-          <el-descriptions-item v-if="detailTask.kind === 'continuous'" label="启动于">{{ fmtTime(detailTask.started_at) || '—' }}</el-descriptions-item>
+          <el-descriptions-item v-if="detailTask.kind === 'daemon'" label="启动于">{{ fmtTime(detailTask.started_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="开始时间">{{ fmtTime(detailTask.last_run.started_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="完成时间">{{ detailTask.status === 'running' ? '进行中' : fmtTime(detailTask.last_run.finished_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="耗时">{{ fmtDuration(detailTask.last_run.duration_ms) }}</el-descriptions-item>
@@ -309,7 +308,7 @@ use([CanvasRenderer, PieChart, BarChart, GridComponent, TooltipComponent, Legend
 interface TaskRunInfo { started_at: string; finished_at: string; duration_ms: number; trigger: string; result: string; message?: string }
 interface TaskInfo {
   id: string; name: string; description?: string; cadence?: string; category: string
-  kind: 'scheduled' | 'continuous' | 'queue' | 'info' | 'oneshot'
+  kind: 'scheduled' | 'daemon' | 'periodic' | 'oneshot'
   status: string; enabled: boolean; cancellable: boolean; controllable?: boolean; triggerable?: boolean
   toggleable: boolean // 调度开关可暂停/恢复（后端 ToggleFn 声明族——调度列开关渲染判据）
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
@@ -388,10 +387,7 @@ const fail24h = computed(() => tasks.value.reduce((s, t) => s + (t.fail_24h || 0
 // ===== 筛选 + 分页 =====
 const kindFilter = ref('all')
 const filteredTasks = computed(() => {
-  const list = kindFilter.value === 'all' ? tasks.value : tasks.value.filter(t => {
-    if (kindFilter.value === 'oneshot') return t.id.startsWith('startup:')
-    return t.kind === kindFilter.value
-  })
+  const list = kindFilter.value === 'all' ? tasks.value : tasks.value.filter(t => t.kind === kindFilter.value)
   // 默认按分类排序（安全防护→证书→备份→集群→系统→触发），类内稳定
   return [...list].sort((a, b) => (categoryOrder[a.category] ?? 9) - (categoryOrder[b.category] ?? 9))
 })
@@ -445,6 +441,12 @@ const onTrigger = async (row: TaskInfo) => {
   fetchTasks()
 }
 const onToggle = async (row: TaskInfo, enabled: boolean) => {
+  // 常驻族停止前确认（功能中断影响大——如安全事件采集停摆）
+  if (!enabled && row.kind === 'daemon') {
+    try {
+      await ElMessageBox.confirm(`确认停止「${row.name}」？停止后相关功能将中断，可随时重新启动。`, '常驻任务控制', { type: 'warning', confirmButtonText: '停止' })
+    } catch { return }
+  }
   const res = await request.post<APIResponse>(`/system/tasks/${row.id}/toggle`, { enabled })
   ElMessage.success(res.message || '已更新')
   fetchTasks()
@@ -455,20 +457,6 @@ const onCancel = async (row: TaskInfo) => {
   } catch { return }
   const res = await request.post<APIResponse>(`/system/tasks/${row.id}/cancel`)
   ElMessage.success(res.message || '已发出取消信号')
-  fetchTasks()
-}
-const onControl = async (row: TaskInfo, overrideTarget?: boolean) => {
-  // P2-7：目标态从 loop_on 派生（status=running 判据删除——空闲态也可能是循环开启）
-  const loopOn = overrideTarget ?? !!row.loop_on
-  const action = loopOn ? 'start' : 'stop'  // R64-P1-4：目标 ON→start（曾反转致开关失效）
-  const label = loopOn ? '启动' : '停止'
-  if (action === 'stop') {
-    try {
-      await ElMessageBox.confirm(`确认${label}「${row.name}」？停止后相关功能将中断，可随时重新启动。`, '常驻任务控制', { type: 'warning', confirmButtonText: label })
-    } catch { return }
-  }
-  const res = await request.post<APIResponse>(`/system/tasks/${row.id}/control`, { action })
-  ElMessage.success(res.message || `已${label}`)
   fetchTasks()
 }
 // U5-P4-6e：常驻行操作列「重启」（control restart——启停已由调度列开关承担）
@@ -565,10 +553,12 @@ const statusLabels: Record<string, string> = {
   running: '运行中', idle: '空闲', failed: '失败', stopped: '已停止', disabled: '已暂停',
 }
 const statusLabel = (s: string) => statusLabels[s] || certJobStatusLabel(s as CertJobStatus)
-const kindLabels: Record<string, string> = { scheduled: '定时', continuous: '常驻', queue: '队列', info: '内置', oneshot: '触发' }
+// v2.0 四类型：定时(蓝)/常驻(绿)/循环(青)/触发(橙)
+const kindLabels: Record<string, string> = { scheduled: '定时', daemon: '常驻', periodic: '循环', oneshot: '触发', continuous: '常驻', queue: '触发' }
 const kindLabel = (k: string) => kindLabels[k] || k
-const kindTag = (k: string): 'primary' | 'success' | 'info' =>
-  k === 'scheduled' ? 'primary' : k === 'continuous' ? 'success' : 'info'
+const kindTag = (k: string): 'primary' | 'success' | 'info' | 'warning' =>
+  k === 'scheduled' ? 'primary' : k === 'daemon' || k === 'continuous' ? 'success' : k === 'periodic' ? 'info' : 'warning'
+const kindTagClass = (k: string) => (k === 'periodic' ? 'tm-tag-periodic' : '')
 const categoryOrder: Record<string, number> = { '安全防护': 0, '证书': 1, '备份': 2, '集群': 3, '系统': 4, '触发': 5 }
 const categoryTagType = (c: string): 'primary' | 'success' | 'warning' | 'info' =>
   c === '安全防护' ? 'primary' : c === '证书' ? 'success' : c === '备份' ? 'warning' : c === '触发' ? 'info' : 'info'
@@ -644,6 +634,17 @@ const fmtDuration = (ms?: number) => {
 .tm-status[data-status="failed"] { --tm-c: #f87171; }
 .tm-status[data-status="stopped"], .tm-status[data-status="disabled"] { --tm-c: #62687f; }
 .tm-status[data-status="idle"] { --tm-c: #9aa0b5; }
+.tm-tag-periodic {
+  --el-tag-bg-color: rgba(0, 168, 168, 0.1);
+  --el-tag-border-color: rgba(0, 168, 168, 0.35);
+  --el-tag-text-color: #009393;
+}
+.tm-tag-periodic.el-tag--dark,
+.tm-tag-periodic.el-tag--plain {
+  background-color: var(--el-tag-bg-color);
+  border-color: var(--el-tag-border-color);
+  color: var(--el-tag-text-color);
+}
 .tm-dim { color: var(--el-text-color-placeholder); }
 .tm-ok { color: #34d399; font-weight: 600; }
 .tm-bad { color: #f87171; font-weight: 600; }

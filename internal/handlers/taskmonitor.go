@@ -49,15 +49,11 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 		for _, m := range te.DescribeAll() {
 			if m.ID == id {
 				if !m.CanTrigger {
-					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发（探测型/专属端点/镜像族）"})
+					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发（常驻族启停即可/镜像族）"})
 					return
 				}
-				// R64-P1-3：单飞预检改用 Singleton 声明（IsRunning 对 Continuous 族
-				// 恒 true——循环活着≠任务在跑，曾致常驻族手动触发恒 409）
-				if m.SingleFlight {
-					c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务运行中，请稍后重试"})
-					return
-				}
+				// v2.0：单飞由引擎 CAS 强制（runNow 拒绝并发）——双击第二次被
+				// 静默拒绝，task_runs 只记一次真实执行。
 				go func(tid, operator string) {
 					_ = te.Trigger(tid, "manual", operator) // 异步——耗时由 task_runs 记录；operator 审计归人
 				}(id, auditOperator(c))
@@ -72,7 +68,6 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 	}
 	// R63：无引擎时统一 503（回退 switch 删除）。
 	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 }
 
 func respondTaskStartErr(c *gin.Context, err error) {
@@ -84,9 +79,10 @@ func respondTaskStartErr(c *gin.Context, err error) {
 	c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 }
 
-// ToggleSystemTask 暂停/恢复自动调度（admin；body {"enabled": bool}）。
-// U1-P4-2：经 DescribeAll 元数据路由（Toggleable=描述符 ToggleFn 声明），
-// 不再硬编码三族清单——注册即接入。
+// ToggleSystemTask 调度开关（admin；body {"enabled": bool}）。
+// v2.0：统一路由引擎循环开关（StartLoop/StopLoop）——Kind 决定语义：
+// 定时=暂停/恢复排程；循环=暂停/恢复循环；常驻=启停自管理循环；
+// 触发=不可调度（前端显示禁用开关）。
 func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 	id := c.Param("id")
 	if !requireMasterNode(c) {
@@ -104,27 +100,24 @@ func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 			if m.ID != id {
 				continue
 			}
-			if !m.Toggleable {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持暂停/恢复"})
-				return
-			}
-			if err := te.Toggle(id, *req.Enabled); err != nil {
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+			if m.Kind == taskengine.KindOneshot {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "触发类任务不可调度——仅手动/代码触发执行"})
 				return
 			}
 			if *req.Enabled {
-				recordAudit(c, "恢复", "任务监控", m.ToggleName)
-				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已恢复" + m.ToggleName})
+				te.StartLoop(id)
+				recordAudit(c, "恢复", "任务监控", m.Name+" 调度")
+				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已恢复 " + m.Name + " 调度"})
 			} else {
-				recordAudit(c, "暂停", "任务监控", m.ToggleName)
-				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已暂停" + m.ToggleName})
+				te.StopLoop(id)
+				recordAudit(c, "暂停", "任务监控", m.Name+" 调度")
+				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已暂停 " + m.Name + " 调度"})
 			}
 			return
 		}
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持暂停/恢复"})
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "任务不存在"})
 		return
 	}
-	// R63：无引擎时统一 503（回退 switch 删除）。
 	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
 }
 
