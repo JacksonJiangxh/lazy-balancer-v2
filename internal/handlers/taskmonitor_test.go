@@ -20,8 +20,16 @@ import (
 func initTaskEngineForTest(t *testing.T) {
 	t.Helper()
 	if services.TaskEngine() == nil {
-		services.InitTaskEngine("", "")
-		t.Cleanup(func() { services.StopTaskEngine() })
+		oldDB, oldM, oldA := db.DB, db.MetricsDB, db.AuditDB
+		if err := db.Initialize(t.TempDir()); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			services.StopTaskEngine()
+			_ = db.Close()
+			db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA
+		})
+		services.InitTaskEngine("", t.TempDir()+"/app.log")
 	}
 }
 
@@ -79,6 +87,7 @@ func TestListSystemTasks_allFamiliesPresent(t *testing.T) {
 
 // 不可触发族 → 400；从节点 → 403。
 func TestTriggerSystemTask_gatesAndMapping(t *testing.T) {
+	initTaskEngineForTest(t)
 	newBackupTestHandlers(t)
 	r, _ := taskMonitorRouter()
 
@@ -102,6 +111,7 @@ func TestTriggerSystemTask_gatesAndMapping(t *testing.T) {
 
 // toggle：threat 关自动 → 200 + 服务层开关翻转。
 func TestToggleSystemTask_threatSwitch(t *testing.T) {
+	initTaskEngineForTest(t)
 	newBackupTestHandlers(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=1 WHERE id=1`); err != nil {
 		t.Fatal(err)
@@ -126,14 +136,15 @@ func TestToggleSystemTask_threatSwitch(t *testing.T) {
 
 // cancel：未运行 → 409；非下载类 → 400。
 func TestCancelSystemTask_semantics(t *testing.T) {
+	initTaskEngineForTest(t)
 	newBackupTestHandlers(t)
 	r, _ := taskMonitorRouter()
 
-	// auto-backup 不可取消 → 400
+	// auto-backup Cancelable=false → 引擎 Cancel 返 false → 409
 	resp := httptest.NewRecorder()
 	r.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/system/tasks/auto-backup/cancel", nil))
-	if resp.Code != http.StatusBadRequest {
-		t.Fatalf("auto-backup 取消应 400, got %d", resp.Code)
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("auto-backup 取消（不可取消族）应 409, got %d", resp.Code)
 	}
 
 	// threat 未运行 → 409

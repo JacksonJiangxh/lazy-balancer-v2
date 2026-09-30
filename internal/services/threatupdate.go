@@ -261,26 +261,10 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		return
 	}
 	runCtx, runCancel := context.WithCancel(context.Background())
-	runStarted := time.Now().UTC()
-	histRun := int64(0)
-	engineRecorded := rc != nil && rc.RunID > 0
-	if engineRecorded {
-		histRun = rc.RunID // P2-④ 单写方：引擎已记，族体跳过自记与自收尾
-	} else {
-		histRun = taskengine.RecordRunStart("threat", "security", trigger)
-	}
-	if !engineRecorded {
-		defer func() {
-			dur := time.Since(runStarted).Milliseconds()
-			m.mu.Lock()
-			outcome := m.lastTaskOutcome
-			m.mu.Unlock()
-			taskengine.RecordRunFinish(histRun, outcome, dur, "")
-		}()
-	}
+	// R63 单写方：task_runs 由引擎统一记录。
 	m.mu.Lock()
 	m.lastTrigger = trigger
-	m.lastStartedAt = runStarted.Format(crsTimeLayout)
+	m.lastStartedAt = time.Now().UTC().Format(crsTimeLayout)
 	m.lastCancelled = false
 	m.runCancel = runCancel
 	m.mu.Unlock()

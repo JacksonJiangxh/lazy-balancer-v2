@@ -79,7 +79,8 @@ var auditRoutePolicies = map[string]AuditPolicy{
 	"POST /api/v1/admin-tls/inspect":       AuditPolicySkip,
 	"POST /api/v1/system/restart":          AuditPolicyGeneric,
 	// 任务监控（v2.3.4）：三操作 handler 均显式留痕
-	"POST /api/v1/system/tasks/:id/trigger": AuditPolicyExplicit,
+	// 任务触发：审计由任务体 defer 单记（operator 归人——R63 与三库更新同口径）。
+	"POST /api/v1/system/tasks/:id/trigger": AuditPolicySkip,
 	"POST /api/v1/system/tasks/:id/toggle":  AuditPolicyExplicit,
 	"POST /api/v1/system/tasks/:id/cancel":  AuditPolicyExplicit,
 	"POST /api/v1/system/tasks/:id/control": AuditPolicyExplicit,

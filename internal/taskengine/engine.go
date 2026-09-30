@@ -45,6 +45,16 @@ type RunContext struct {
 	Trigger  string
 	Operator string // 手动触发操作者（audit 用户名；自动路径为空=任务体按 system 处理）
 	RunID    int64  // 引擎预插的 task_runs 行 ID（>0=引擎已记，族体跳过自记——单写方）
+
+	workDone *bool // 引擎内部——Run 体内调 SignalledWork() 标记真实工作已执行
+}
+
+// SignalledWork Run 体内标记本轮有真实工作（非探测轮空转）。
+// 引擎在 Run 返回后读取：有标记→落 task_runs 行；无标记→静默。
+func (rc *RunContext) SignalledWork() {
+	if rc.workDone != nil {
+		*rc.workDone = true
+	}
 }
 
 // Descriptor 任务声明（注册即接入 UI/API/MCP/审计/历史）。
@@ -385,7 +395,8 @@ func (e *Engine) runNow(id, trigger, operator string) error {
 	if trigger == "manual" || (!r.desc.SilentProbes && !r.desc.RecordFailuresOnly) {
 		runID = globalInsertRun(id, r.desc.Family, trigger)
 	}
-	rc := RunContext{Ctx: ctx, Trigger: trigger, Operator: operator, RunID: runID}
+	workDone := false
+	rc := RunContext{Ctx: ctx, Trigger: trigger, Operator: operator, RunID: runID, workDone: &workDone}
 
 	start := time.Now()
 	startStr := engineNowStr() // 回填行的 started_at 用真实开始时刻（U2-P5-08c）
@@ -402,8 +413,7 @@ func (e *Engine) runNow(id, trigger, operator string) error {
 		}
 		taskLogAppend(id, msg)
 	}
-	// R63 常驻任务启动计数（用户裁定 2026-09-30）：常驻任务=守护进程——
-	// 启动记一行（成功/失败），运行期间零行（失败只写日志文件，不入 task_runs）。
+	// R63 常驻任务启动计数：启动记一行，运行期零行（失败只写日志）。
 	if runID == 0 && r.desc.RecordFailuresOnly && trigger == "auto" {
 		r.mu.Lock()
 		first := !r.bootCounted
@@ -412,6 +422,10 @@ func (e *Engine) runNow(id, trigger, operator string) error {
 		if first {
 			runID = globalInsertRunAt(id, r.desc.Family, trigger, startStr)
 		}
+	}
+	// R63 SilentProbes 有工作标记→落行（探测轮空转不落——单写方：引擎统一记录）
+	if runID == 0 && r.desc.SilentProbes && trigger == "auto" && workDone {
+		runID = globalInsertRunAt(id, r.desc.Family, trigger, startStr)
 	}
 
 	r.mu.Lock()

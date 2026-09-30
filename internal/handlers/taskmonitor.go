@@ -69,35 +69,8 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发"})
 		return
 	}
-	// 回退（测试环境无引擎）：直调 manager
-	switch id {
-	case "threat":
-		mgr := services.GetThreatUpdateManager()
-		if mgr == nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "威胁情报库更新服务未初始化"})
-			return
-		}
-		if err := mgr.RunUpdate("manual", nil); err != nil {
-			respondTaskStartErr(c, err)
-			return
-		}
-		recordAudit(c, "更新", "任务监控", "手动触发 威胁情报库更新")
-	case "crs":
-		mgr := services.GetCRSUpdateManager()
-		if _, err := mgr.StartUpdate("manual", &taskengine.RunContext{Operator: auditOperator(c)}); err != nil {
-			respondTaskStartErr(c, err)
-			return
-		}
-	case "ip2region":
-		mgr := services.GetIP2RegionUpdateManager()
-		if _, err := mgr.StartUpdate("manual", &taskengine.RunContext{Operator: auditOperator(c)}); err != nil {
-			respondTaskStartErr(c, err)
-			return
-		}
-	default:
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发"})
-		return
-	}
+	// R63：无引擎时统一 503（回退 switch 删除）。
+	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 }
 
@@ -150,31 +123,8 @@ func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持暂停/恢复"})
 		return
 	}
-	// 回退（测试环境无引擎）：直调配置 setter
-	var setFn func(bool) error
-	var taskName string
-	switch id {
-	case "threat":
-		setFn, taskName = services.SetThreatAutoUpdate, "威胁情报库自动更新"
-	case "crs":
-		setFn, taskName = services.SetCRSAutoUpdate, "CRS 自动更新"
-	case "ip2region":
-		setFn, taskName = services.SetIP2RegionAutoUpdate, "IP2Region 自动更新"
-	default:
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持暂停/恢复"})
-		return
-	}
-	if err := setFn(*req.Enabled); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
-		return
-	}
-	if *req.Enabled {
-		recordAudit(c, "恢复", "任务监控", taskName)
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已恢复" + taskName})
-	} else {
-		recordAudit(c, "暂停", "任务监控", taskName)
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已暂停" + taskName})
-	}
+	// R63：无引擎时统一 503（回退 switch 删除）。
+	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
 }
 
 // CancelSystemTask 取消运行中任务（admin；仅 Cancelable 声明族）。
@@ -194,33 +144,8 @@ func (h *Handlers) CancelSystemTask(c *gin.Context) {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已发出取消信号，任务将在当前下载阶段中断"})
 		return
 	}
-	var cancelFn func() bool
-	var taskName string
-	switch id {
-	case "threat":
-		if m := services.GetThreatUpdateManager(); m != nil {
-			cancelFn, taskName = m.CancelRunning, "威胁情报库更新"
-		}
-	case "crs":
-		cancelFn, taskName = services.GetCRSUpdateManager().CancelRunning, "CRS 更新"
-	case "ip2region":
-		if m := services.GetIP2RegionUpdateManager(); m != nil {
-			cancelFn, taskName = m.CancelRunning, "IP2Region 更新"
-		}
-	default:
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动取消（仅下载类任务可取消）"})
-		return
-	}
-	if cancelFn == nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务服务未初始化"})
-		return
-	}
-	if !cancelFn() {
-		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务未在运行中，无可取消"})
-		return
-	}
-	recordAudit(c, "取消", "任务监控", "手动取消 "+taskName+"（下载阶段中断，已完成部分保留）")
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已发出取消信号，任务将在当前下载阶段中断"})
+	// R63：无引擎时统一 503（回退 switch 删除）。
+	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
 }
 
 // ControlSystemTask 常驻循环启停（admin；body {"action":"start|stop|restart"}）。

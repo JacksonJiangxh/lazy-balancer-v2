@@ -204,6 +204,20 @@ func (m *CRSUpdateManager) StartUpdate(trigger string, rc *taskengine.RunContext
 	return done, nil
 }
 
+// AutoUpdateEnabled CRS 自动更新是否开启（从 wire Run 体到期检查消费）。
+func (m *CRSUpdateManager) AutoUpdateEnabled() bool {
+	var v bool
+	db.DB.QueryRow("SELECT COALESCE(auto_update,0) FROM security_crs_version WHERE id=1").Scan(&v)
+	return v
+}
+
+// NextScheduledSlot 返回下次更新排程槽（空串=未设置）。
+func (m *CRSUpdateManager) NextScheduledSlot() string {
+	var s string
+	db.DB.QueryRow("SELECT COALESCE(next_update,'') FROM security_crs_version WHERE id=1").Scan(&s)
+	return s
+}
+
 func (m *CRSUpdateManager) IsRunning() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -248,20 +262,8 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		}
 	}()
 
-	runStarted := time.Now().UTC()
-	histRun := int64(0)
-	engineRecorded := rc != nil && rc.RunID > 0
-	if engineRecorded {
-		histRun = rc.RunID // 引擎已记——跳过自记（P2-④ 单写方，行终态由引擎落）
-	} else {
-		histRun = taskengine.RecordRunStart("crs", "security", trigger)
-	}
-	if !engineRecorded {
-		defer func() {
-			status := string(m.StatusSnapshot().Status)
-			taskengine.RecordRunFinish(histRun, status, time.Since(runStarted).Milliseconds(), "")
-		}()
-	}
+	// R63 单写方：task_runs 由引擎统一记录（manual 预插/ SilentProbes 有工作标记后插入）
+	// 族体零 RecordRun 调用。
 	runCtx, runCancel := context.WithCancel(context.Background())
 	m.mu.Lock()
 	m.runCancel = runCancel

@@ -157,6 +157,20 @@ func (m *IP2RegionUpdateManager) StartUpdate(trigger string, rc *taskengine.RunC
 	return done, nil
 }
 
+// AutoUpdateEnabled IP 库自动更新是否开启。
+func (m *IP2RegionUpdateManager) AutoUpdateEnabled() bool {
+	var v bool
+	db.DB.QueryRow("SELECT COALESCE(auto_update,0) FROM security_ip2region_version WHERE id=1").Scan(&v)
+	return v
+}
+
+// NextScheduledSlot 返回下次更新排程槽。
+func (m *IP2RegionUpdateManager) NextScheduledSlot() string {
+	var s string
+	db.DB.QueryRow("SELECT COALESCE(next_update,'') FROM security_ip2region_version WHERE id=1").Scan(&s)
+	return s
+}
+
 func (m *IP2RegionUpdateManager) IsRunning() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -204,22 +218,7 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 		}
 	}()
 
-	runStarted := time.Now().UTC()
-	histRun := int64(0)
-	engineRecorded := rc != nil && rc.RunID > 0
-	if engineRecorded {
-		histRun = rc.RunID // P2-④ 单写方：引擎已记，族体跳过自记与自收尾
-	} else {
-		histRun = taskengine.RecordRunStart("ip2region", "security", trigger)
-	}
-	if !engineRecorded {
-		defer func() {
-			m.mu.Lock()
-			status := string(m.state.status)
-			m.mu.Unlock()
-			taskengine.RecordRunFinish(histRun, status, time.Since(runStarted).Milliseconds(), "")
-		}()
-	}
+	// R63 单写方：task_runs 由引擎统一记录。
 	runCtx, runCancel := context.WithCancel(context.Background())
 	m.mu.Lock()
 	m.runCancel = runCancel

@@ -33,6 +33,8 @@ func TestSetupRouter_writeRoutesHaveExplicitAuditClassification(t *testing.T) {
 		"POST /api/v1/security/crs/update":        {},
 		"POST /api/v1/security/ip2region/update":  {},
 		"POST /api/v1/security/threat-lib/update": {},
+		// 任务触发：审计由任务体 defer 单记（operator 归人——R63 同口径）。
+		"POST /api/v1/system/tasks/:id/trigger": {},
 	}
 	writeMethods := map[string]struct{}{
 		http.MethodPost: {}, http.MethodPut: {}, http.MethodPatch: {}, http.MethodDelete: {},

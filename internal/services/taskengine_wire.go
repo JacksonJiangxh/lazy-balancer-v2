@@ -136,20 +136,34 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			}
 			return ""
 		},
-		SilentProbes: true,
-		MasterOnly:   true,
-		CancelHook:   func() bool { return GetThreatUpdateManager() != nil && GetThreatUpdateManager().CancelRunning() },
-		ToggleFn:     SetThreatAutoUpdate, // U1-P4-2：调度开关元数据化（handler 读 DescribeAll 路由）
-		ToggleName:   "威胁情报库自动更新",
+		MasterOnly: true,
+		CancelHook: func() bool { return GetThreatUpdateManager() != nil && GetThreatUpdateManager().CancelRunning() },
+		ToggleFn:   SetThreatAutoUpdate,
+		ToggleName: "威胁情报库自动更新",
 		Run: func(rc taskengine.RunContext) error {
 			if rc.Trigger == "manual" {
 				if m := GetThreatUpdateManager(); m != nil {
-					return m.RunUpdate("manual", &rc) // 同步全量——manager 编舞原样
+					return m.RunUpdate("manual", &rc)
 				}
 				return nil
 			}
-			ThreatSchedulerTickOnce()
-			return nil
+			// Auto：探测到期 → 同步执行（R63 单写方：引擎预插行+finishRun）
+			if !ThreatAutoUpdateEnabled() {
+				return nil
+			}
+			m := GetThreatUpdateManager()
+			if m == nil || m.IsRunning() {
+				return nil
+			}
+			due, err := threatDueSources("auto")
+			if err != nil {
+				return err
+			}
+			if len(due) == 0 {
+				return nil // 无到期源——静默（不 SignalledWork，引擎不记行）
+			}
+			rc.SignalledWork()
+			return m.RunUpdate("auto", &rc)
 		},
 	})
 
@@ -185,11 +199,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			}
 			return "running"
 		},
-		SilentProbes: true,
-		MasterOnly:   true,
-		CancelHook:   func() bool { m := GetCRSUpdateManager(); return m != nil && m.CancelRunning() },
-		ToggleFn:     SetCRSAutoUpdate,
-		ToggleName:   "CRS 自动更新",
+		MasterOnly: true,
+		CancelHook: func() bool { m := GetCRSUpdateManager(); return m != nil && m.CancelRunning() },
+		ToggleFn:   SetCRSAutoUpdate,
+		ToggleName: "CRS 自动更新",
 		Run: func(rc taskengine.RunContext) error {
 			if rc.Trigger == "manual" {
 				m := GetCRSUpdateManager()
@@ -200,15 +213,35 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 				if err != nil {
 					return err
 				}
-				<-done // 等编舞完成——历史耗时真实
-				// 引擎行的终态由 runErr 决定（P2-④ 单写方）——异步编舞失败
-				// 经内存快照映射为错误，防引擎行误记 success。
+				<-done
 				if snap := m.StatusSnapshot(); snap.Status == string(CRSStatusFailed) {
 					return fmt.Errorf("CRS 更新失败: %s", snap.Message)
 				}
 				return nil
 			}
-			CRSSchedulerTickOnce()
+			// Auto：探测到期 → 同步执行（R63 单写方）
+			m := GetCRSUpdateManager()
+			if m == nil || m.IsRunning() {
+				return nil
+			}
+			if !m.AutoUpdateEnabled() {
+				return nil
+			}
+			nextStr := m.NextScheduledSlot()
+			if nextStr != "" {
+				if due, err := time.Parse(crsTimeLayout, nextStr); err == nil && time.Now().UTC().Before(due) {
+					return nil // 未到期——静默
+				}
+			}
+			rc.SignalledWork()
+			done, err := m.StartUpdate("auto", &rc)
+			if err != nil {
+				return err
+			}
+			<-done
+			if snap := m.StatusSnapshot(); snap.Status == string(CRSStatusFailed) {
+				return fmt.Errorf("CRS 更新失败: %s", snap.Message)
+			}
 			return nil
 		},
 	})
@@ -242,11 +275,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			}
 			return "running"
 		},
-		SilentProbes: true,
-		MasterOnly:   true,
-		CancelHook:   func() bool { return GetIP2RegionUpdateManager() != nil && GetIP2RegionUpdateManager().CancelRunning() },
-		ToggleFn:     SetIP2RegionAutoUpdate,
-		ToggleName:   "IP2Region 自动更新",
+		MasterOnly: true,
+		CancelHook: func() bool { return GetIP2RegionUpdateManager() != nil && GetIP2RegionUpdateManager().CancelRunning() },
+		ToggleFn:   SetIP2RegionAutoUpdate,
+		ToggleName: "IP2Region 自动更新",
 		Run: func(rc taskengine.RunContext) error {
 			if rc.Trigger == "manual" {
 				m := GetIP2RegionUpdateManager()
@@ -263,7 +295,26 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 				}
 				return nil
 			}
-			IP2RegionSchedulerTickOnce()
+			// Auto：同步执行（R63 单写方）
+			m := GetIP2RegionUpdateManager()
+			if m == nil || m.IsRunning() || !m.AutoUpdateEnabled() {
+				return nil
+			}
+			nextStr := m.NextScheduledSlot()
+			if nextStr != "" {
+				if due, err := time.Parse(crsTimeLayout, nextStr); err == nil && time.Now().UTC().Before(due) {
+					return nil // 未到期——静默
+				}
+			}
+			rc.SignalledWork()
+			done, err := m.StartUpdate("auto", &rc)
+			if err != nil {
+				return err
+			}
+			<-done
+			if snap := m.StatusSnapshot(); snap.Status == string(IP2RegionStatusFailed) {
+				return fmt.Errorf("IP2Region 更新失败: %s", snap.Message)
+			}
 			return nil
 		},
 	})
@@ -293,12 +344,36 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 				if exec == nil {
 					return errors.New("备份执行器未就绪")
 				}
-				// rc.RunID=引擎预插行——执行器跳过自记（P2-④ 单写方）；
-				// operator 经引擎通道传入（U1-P3-1 手动操作归人）。
 				return exec("manual", rc.Operator, rc.RunID)
 			}
-			AutoBackupSchedulerTickOnce()
-			return nil
+			// Auto：探测到期 → 同步执行（R63 单写方——引擎预插行+finishRun）
+			exec := currentAutoBackupExecutor()
+			if exec == nil {
+				return nil
+			}
+			row, err := loadAutoBackupSettings()
+			if err != nil || !row.enabled {
+				return nil
+			}
+			dueSlot, ok := autoBackupDueSlot(time.Now(), row.freq, row.hhmm, row.day, CurrentLocation())
+			if !ok {
+				return nil
+			}
+			if row.lastRun != nil && !dueSlot.After(*row.lastRun) {
+				return nil // 已执行
+			}
+			rc.SignalledWork()
+			runID := taskengine.RecordRunStart("auto-backup", "backup", "auto")
+			execErr := exec("schedule", "system", runID)
+			status, msg := "success", ""
+			if execErr != nil {
+				status, msg = "failed", execErr.Error()
+			}
+			taskengine.RecordRunFinish(runID, status, time.Since(time.Now()).Milliseconds(), msg)
+			if _, err := db.DB.Exec("UPDATE global_config SET auto_backup_last_run=? WHERE id=1", dueSlot.Format(time.RFC3339)); err != nil {
+				Logf("warn", "自动备份：更新 auto_backup_last_run 失败: %v", err)
+			}
+			return execErr
 		},
 	})
 	taskEngine.Register(taskengine.Descriptor{
