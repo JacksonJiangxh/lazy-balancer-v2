@@ -52,7 +52,7 @@
 | 记录面 | 策略 |
 |---|---|
 | task_runs 历史 | 真实运行全记；探测轮静默；高频成功轮 RecordFailuresOnly；**manual 恒记**；保留 90 天 |
-| 任务日志 tasks/{id}.log | 生命周期行 + 业务 tee；与历史同策略（静默成功轮零行）；>5MB rotate 保 .1；保留期同审计月数 |
+| 任务日志 tasks/{id}.log | 生命周期行 + 业务 tee；与历史同策略（静默成功轮零行）；>cert_job_log_size_mb（默认 10MB） rotate 保 .1；保留期同审计月数 |
 | 审计 | 任务体自记（更新/载入/备份等业务事件）；清理/循环轮不进审计（task_runs 即记录）；人机操作（启停/暂停/触发确认）由 handler 记 |
 | 时区 | 全部写入/展示按基础设置 timezone（engineLoc 注入） |
 
