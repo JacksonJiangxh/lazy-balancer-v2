@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -120,8 +121,6 @@ type registration struct {
 	mu          sync.Mutex
 	running     bool
 	cancel      context.CancelFunc
-	stage       string
-	lastMsg     string
 	lastCheck   time.Time // 最近调度到期判定基准
 	loopEnabled bool      // 常驻循环启停开关（StartLoop/StopLoop）
 }
@@ -514,16 +513,23 @@ func (e *Engine) roleAllows(role Role) bool {
 
 // location 引擎写库时区（配置时区——services 启动/变更时 SetLocation 注入；
 // 未注入回退本地）。所有 task_runs 时间字符串按此时区格式化。
-var engineLoc = time.Local
+// R63-U1-P3-5：atomic 持有消除 SetLocation 与 engineNowStr 的数据竞争窗口。
+var engineLocAtomic atomic.Value // *time.Location
+
+func init() { engineLocAtomic.Store(time.Local) }
 
 // SetLocation 注入配置时区（基础设置 timezone 项）。
 func SetLocation(loc *time.Location) {
 	if loc != nil {
-		engineLoc = loc
+		engineLocAtomic.Store(loc)
 	}
 }
 
-func engineNowStr() string { return time.Now().In(engineLoc).Format("2006-01-02 15:04:05") }
+func engineLoc() time.Location { return *engineLocAtomic.Load().(*time.Location) }
+
+func engineNowStr() string { return time.Now().In(engineLocPtr()).Format("2006-01-02 15:04:05") }
+
+func engineLocPtr() *time.Location { return engineLocAtomic.Load().(*time.Location) }
 
 // taskLogDir 任务文本日志目录（/app/logs/tasks/{task_id}.log——统一任务
 // 引擎管理；运行日志轮转副本清理任务统一 rotate/清理）。
@@ -700,7 +706,7 @@ func PurgeTaskRuns(days int) int64 {
 // TeeTaskLog 业务侧（更新族分阶段流水）tee 到任务日志——统一文本日志面。
 // TeeTaskLogTime 带当前时间戳的 tee（TaskLogf 消费——业务摘要行）。
 func TeeTaskLogTime(taskID, level, stage, message string) {
-	TeeTaskLog(taskID, time.Now().In(engineLoc).Format("2006/01/02 15:04:05"), level, stage, message)
+	TeeTaskLog(taskID, time.Now().In(engineLocPtr()).Format("2006/01/02 15:04:05"), level, stage, message)
 }
 
 func TeeTaskLog(taskID, timestamp, level, stage, message string) {

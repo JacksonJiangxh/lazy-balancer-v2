@@ -1,50 +1,20 @@
 package services
 
 import (
-	"fmt"
 	"lazy-balancer-v2/internal/taskengine"
-	"os"
-	"path/filepath"
 	"time"
 )
 
-// CRSUpdateLogPath returns the update log file path for the log reader endpoint.
-func CRSUpdateLogPath() string {
-	return filepath.Join(crsUpdateLogDir, "crs-update.log")
-}
-
+// writeCRSUpdateLog 规则库变更流水唯一写口（R63-P2-2/P2-3：tee 单点在写口——
+// Append* 包装层不再重复 tee；旧 crs-update.log 已退役——tasks/crs.log 为
+// 唯一数据源，轮转/保留由 taskLogsHousekeeping 统一执行）。
 func writeCRSUpdateLog(level, stage, message string) {
-	// U1-P3-5：运行流水统一 tee 到任务日志（自动更新在 tasks/crs.log 留痕——
-	// 曾仅导入/同步 Append* tee，自动更新任务日志零痕迹）。
 	taskengine.TeeTaskLog("crs", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
-	path := CRSUpdateLogPath()
-	if info, err := os.Stat(path); err == nil && info.Size() >= getCertJobLogSizeBytes() {
-		// SLB12-P3-10:复用 rotateCertJobLogFiles(错误收集上抛,C-11 口径)——
-		// 此前内联轮转吞掉全部错误,轮转失败时最老一代更新日志静默丢失。
-		if rerr := rotateCertJobLogFiles(path); rerr != nil {
-			Logf("error", "crs update log: rotation failed (oldest generation may be lost): %v", rerr)
-		}
-	}
-	if err := os.MkdirAll(crsUpdateLogDir, 0755); err != nil {
-		Logf("error", "crs update log: failed to create dir: %v", err)
-		return
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		Logf("error", "crs update log: failed to open %s: %v", path, err)
-		return
-	}
-	defer f.Close()
-	timestamp := time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05")
-	fmt.Fprintf(f, "%s [%s] %s - %s\n", timestamp, level, stage, message)
 }
 
 // AppendCRSUpdateLog 供非更新器路径(lbbak 导入/集群同步)记录规则库变更日志
-// ——更新弹框的「更新日志」直接读该文件,文件变更必须在此留痕(用户裁定
-// 2026-09-18:同步/导入有变动也要走完整流程并记录日志)。
+// （2026-09-18 用户裁定：同步/导入有变动也要留痕；R63 单源裁定后留痕落
+// tasks/crs.log——经 writeCRSUpdateLog 单点）。
 func AppendCRSUpdateLog(level, stage, message string) {
-	// 统一任务引擎文本日志 tee（任务监控「日志」端点同源消费）
-	taskengine.TeeTaskLog("crs", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
-
 	writeCRSUpdateLog(level, stage, message)
 }

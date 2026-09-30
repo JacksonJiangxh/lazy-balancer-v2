@@ -253,7 +253,7 @@ func TestEngine_RecordPoliciesSilentOnSuccess(t *testing.T) {
 
 func withTestLocation(t *testing.T, loc *time.Location) {
 	t.Helper()
-	old := engineLoc
+	old := engineLocPtr()
 	SetLocation(loc)
 	t.Cleanup(func() { SetLocation(old) })
 }
@@ -298,7 +298,7 @@ func TestEngine_PurgeTaskRunsHonorsConfiguredTimezone(t *testing.T) {
 	newTestEngine(t) // 仅需 DB
 	withTestLocation(t, time.FixedZone("CST", 8*3600))
 	old := engineNowStr()
-	aged := time.Now().In(engineLoc).Add(-(90*24 + 2) * time.Hour).Format("2006-01-02 15:04:05")
+	aged := time.Now().In(engineLocPtr()).Add(-(90*24 + 2) * time.Hour).Format("2006-01-02 15:04:05")
 	if _, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, trigger, status, started_at) VALUES ('t-purge','t','auto','success',?)`, aged); err != nil {
 		t.Fatal(err)
 	}

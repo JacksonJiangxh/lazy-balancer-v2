@@ -290,8 +290,16 @@ func nextAutoBackupSlot(now time.Time) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	if !due.After(now.In(loc)) {
-		// 当前槽已触发（last_run 已吃掉）——推进一天再算
-		due, ok = autoBackupDueSlot(now.In(loc).Add(24*time.Hour), row.freq, row.hhmm, row.day, loc)
+		// 当前槽已触发（last_run 已吃掉）——按周期步进到下一槽
+		// （R63-P2-4：曾恒 +24h——weekly/monthly 时追不上下一槽，下次执行恒显示过去时刻）
+		step := now.In(loc).Add(24 * time.Hour)
+		switch row.freq {
+		case "weekly":
+			step = now.In(loc).Add(7 * 24 * time.Hour)
+		case "monthly":
+			step = now.In(loc).AddDate(0, 1, 0)
+		}
+		due, ok = autoBackupDueSlot(step, row.freq, row.hhmm, row.day, loc)
 	}
 	return due, ok
 }

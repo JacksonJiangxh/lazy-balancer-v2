@@ -162,6 +162,12 @@ func loginRateLimit() gin.HandlerFunc {
 		loginRateBuckets.Lock()
 		bucket, ok := loginRateBuckets.entries[ip]
 		if !ok {
+			// R63-U9-P3-2：容量上限（对齐 securityAuditLimiter 1024——防分布式攻击无界增长）
+			if len(loginRateBuckets.entries) >= 1024 {
+				loginRateBuckets.Unlock()
+				c.Next() // 超限本轮放行（不添桶）——清理周期 1min 内自愈
+				return
+			}
 			bucket = &loginRateBucket{until: now.Add(time.Minute)}
 			loginRateBuckets.entries[ip] = bucket
 		}

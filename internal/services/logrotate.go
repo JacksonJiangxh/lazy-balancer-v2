@@ -176,13 +176,6 @@ func (w *RotatingFileWriter) Close() error {
 // StartRuntimeLogCleanup removes rotated runtime log files older than the
 // configured log retention (shared with the audit log retention setting). It
 // runs once immediately and then daily.
-func StartRuntimeLogCleanup(logFile string) {
-	StartRuntimeLogCleanupContext(context.Background(), logFile)
-}
-
-// RuntimeLogCleanupOnce(logFile) 单轮过期日志清理（引擎每日节拍调用）：
-// ①应用日志轮转副本（app.log.*）按保留期删除；②任务日志（tasks/*.log，
-// 统一任务引擎管理）同保留期删除 + 超 5MB 轮转（保 .1 一份）。
 func RuntimeLogCleanupOnce(logFile string) int {
 	taskLogsHousekeeping(logFile)
 	months := 3
@@ -279,7 +272,9 @@ func taskLogsHousekeeping(logFile string) {
 		}
 	}
 	cutoff := time.Now().AddDate(0, -months, 0)
-	const sizeCap = int64(5 << 20) // 5MB
+	// R63-P2-1：任务日志大小遵循「任务日志大小」配置项（cert_job_log_size_mb，
+	// 默认 10MB——曾硬编码 5MB 与配置/统计三方分裂）。
+	sizeCap := getCertJobLogSizeBytes()
 	for _, e := range entries {
 		if e.IsDir() {
 			continue

@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"lazy-balancer-v2/internal/taskengine"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,9 +18,6 @@ func newTestIP2RegionManager(t *testing.T) *IP2RegionUpdateManager {
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	oldLogDir := ip2RegionUpdateLogDir
-	ip2RegionUpdateLogDir = t.TempDir()
-	t.Cleanup(func() { ip2RegionUpdateLogDir = oldLogDir })
 
 	dir := t.TempDir()
 	live := filepath.Join(dir, "ip2region.xdb")
@@ -1059,22 +1057,22 @@ func TestIP2RegionUpdateFail_counterUpdateFailureDoesNotReaudit(t *testing.T) {
 
 func TestWriteIP2RegionUpdateLog_rotatesAtSize(t *testing.T) {
 	dir := t.TempDir()
-	oldDir := ip2RegionUpdateLogDir
-	ip2RegionUpdateLogDir = dir
-	t.Cleanup(func() { ip2RegionUpdateLogDir = oldDir })
+	taskengine.SetLogDir(dir)
+	t.Cleanup(func() { taskengine.SetLogDir("") })
 
-	path := IP2RegionUpdateLogPath()
-	for i := 0; i < 2000; i++ {
+	path := taskengine.TaskLogPath("ip2region")
+	for i := 0; i < 100; i++ {
 		writeIP2RegionUpdateLog("INFO", "checking", "x")
 	}
 
-	// Then the primary log file exists and the size cap keeps rotation bounded
-	info, err := os.Stat(path)
+	// R63-P2-3：写入落 tasks/ip2region.log（轮转归 taskLogsHousekeeping——
+	// 由 crslog_test.go TestTaskLogsHousekeeping_rotatesAtConfiguredThreshold 钉）
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size() > 2*getCertJobLogSizeBytes() {
-		t.Fatalf("log size=%d exceeds rotation cap", info.Size())
+	if n := strings.Count(string(data), "[INFO] checking - x"); n != 100 {
+		t.Fatalf("100 行写入应恰 100 行（tee 单点），got %d", n)
 	}
 }
 

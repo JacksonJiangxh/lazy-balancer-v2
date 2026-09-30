@@ -523,9 +523,9 @@ func (s *CaddyService) GetConfig() (map[string]interface{}, error) {
 	defer resp.Body.Close()
 
 	var config map[string]interface{}
-	// LB44-4(第 44 轮):响应体 4MB 上限(对齐 configwatchdog.go:218 口径),
-	// 异常对端/代理截获时的无界读取防线。
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&config); err != nil {
+	// R63-P2-6：对齐 32MB 家族口径（与 caddy.go:210/565/780+configwatchdog
+	// 同源——R62 U8-P4-2 修 configwatchdog 时漏收敛此一处，>4MB 配置回读失败）。
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&config); err != nil {
 		return nil, err
 	}
 

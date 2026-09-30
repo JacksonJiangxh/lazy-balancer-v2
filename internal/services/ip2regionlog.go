@@ -1,49 +1,18 @@
 package services
 
 import (
-	"fmt"
 	"lazy-balancer-v2/internal/taskengine"
-	"os"
-	"path/filepath"
 	"time"
 )
 
-var ip2RegionUpdateLogDir = "/app/logs"
-
-// IP2RegionUpdateLogPath returns the update log file path for the log reader endpoint.
-func IP2RegionUpdateLogPath() string {
-	return filepath.Join(ip2RegionUpdateLogDir, "ip2region-update.log")
-}
-
+// writeIP2RegionUpdateLog IP 库变更流水唯一写口（R63-P2-2/P2-3：tee 单点；
+// 旧 ip2region-update.log 已退役——tasks/ip2region.log 唯一数据源）。
 func writeIP2RegionUpdateLog(level, stage, message string) {
-	// U1-P3-5：运行流水统一 tee 到任务日志（自动更新在 tasks/ip2region.log 留痕——
-	// 曾仅导入/同步 Append* tee，自动更新任务日志零痕迹）。
 	taskengine.TeeTaskLog("ip2region", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
-	path := IP2RegionUpdateLogPath()
-	if info, err := os.Stat(path); err == nil && info.Size() >= getCertJobLogSizeBytes() {
-		// SLB12-P3-10 同族:复用 rotateCertJobLogFiles(C-11 错误口径)。
-		if rerr := rotateCertJobLogFiles(path); rerr != nil {
-			Logf("error", "ip2region update log: rotation failed (oldest generation may be lost): %v", rerr)
-		}
-	}
-	if err := os.MkdirAll(ip2RegionUpdateLogDir, 0755); err != nil {
-		Logf("error", "ip2region update log: failed to create dir: %v", err)
-		return
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		Logf("error", "ip2region update log: failed to open %s: %v", path, err)
-		return
-	}
-	defer f.Close()
-	timestamp := time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05")
-	fmt.Fprintf(f, "%s [%s] %s - %s\n", timestamp, level, stage, message)
 }
 
-// AppendIP2RegionUpdateLog 同 AppendCRSUpdateLog(lbbak 导入/集群同步留痕)。
+// AppendIP2RegionUpdateLog 同 AppendCRSUpdateLog(lbbak 导入/集群同步留痕——
+// 经 writeIP2RegionUpdateLog 单点落 tasks/ip2region.log)。
 func AppendIP2RegionUpdateLog(level, stage, message string) {
-	// 统一任务引擎文本日志 tee（任务监控「日志」端点同源消费）
-	taskengine.TeeTaskLog("ip2region", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
-
 	writeIP2RegionUpdateLog(level, stage, message)
 }

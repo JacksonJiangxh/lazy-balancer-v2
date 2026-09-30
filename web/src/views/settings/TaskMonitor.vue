@@ -17,7 +17,11 @@
       <el-col :xs="12" :md="6">
         <el-card class="tm-kpi">
           <div class="tm-kpi-num">{{ total24h }}</div>
-          <div class="tm-kpi-label">24h 执行</div>
+          <div class="tm-kpi-label">
+            <el-tooltip content="静默族成功轮不落库——见「静默轮」标注" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+              <span>24h 执行（留痕） ⓘ</span>
+            </el-tooltip>
+          </div>
         </el-card>
       </el-col>
       <el-col :xs="12" :md="6">
@@ -92,6 +96,7 @@
             <el-radio-button value="continuous">常驻</el-radio-button>
             <el-radio-button value="queue">队列</el-radio-button>
             <el-radio-button value="oneshot">触发</el-radio-button>
+            <el-radio-button value="info">内置</el-radio-button>
           </el-radio-group>
         </div>
       </template>
@@ -120,14 +125,22 @@
         </el-table-column>
         <el-table-column label="状态" width="88">
           <template #default="{ row }">
-            <span class="tm-status" :data-status="row.status"><span class="tm-dot"></span>{{ statusLabel(row.status) }}</span>
+            <!-- 常驻族 idle=循环开启但门控无活（如 cert-waiting-ca StatusFn）——「待命」而非「空闲」；定时/内置族 idle 保持「空闲」 -->
+            <el-tooltip
+              v-if="row.kind === 'continuous' && row.status === 'idle'"
+              content="循环开启 · 当前无待处理任务"
+              placement="top" :offset="8" :show-after="150" :show-arrow="false"
+            >
+              <span class="tm-status" data-status="idle"><span class="tm-dot"></span>待命</span>
+            </el-tooltip>
+            <span v-else class="tm-status" :data-status="row.status"><span class="tm-dot"></span>{{ statusLabel(row.status) }}</span>
           </template>
         </el-table-column>
         <el-table-column label="调度" width="92">
           <template #default="{ row }">
             <!-- 常驻族：开关=常驻循环启停（非调度开关），绑定 loop_on 走 control -->
             <el-tooltip v-if="row.kind === 'continuous'" content="常驻循环启停（非调度开关）" placement="top" :offset="8" :show-after="150" :show-arrow="false">
-              <el-switch :model-value="row.loop_on" :disabled="!isAdmin" @change="() => onControl(row)" />
+              <el-switch :model-value="row.loop_on" :disabled="!isAdmin" @change="(v: string | number | boolean) => onControl(row, !!v)" />
             </el-tooltip>
             <!-- 定时族有调度开关（threat/crs/ip2region）：暂停/恢复自动调度 -->
             <el-switch v-else-if="row.kind === 'scheduled' && row.toggleable" :model-value="row.enabled" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
@@ -193,12 +206,13 @@
               link type="danger" size="small" :disabled="!isAdmin"
               @click="onCancel(row)"
             >取消</el-button>
+            <!-- 常驻行启停已由调度列开关承担（loop_on 同源，U5-P4-6e）——操作列改「重启」 -->
             <el-button
               v-if="row.controllable"
-              link :type="row.status === 'running' ? 'danger' : 'success'" size="small"
+              link type="warning" size="small"
               :disabled="!isAdmin"
-              @click="onControl(row)"
-            >{{ row.status === 'running' ? '停止' : '启动' }}</el-button>
+              @click="onRestart(row)"
+            >重启</el-button>
             <el-button link type="info" size="small" @click="openLogs(row)">日志</el-button>
             <el-button link type="info" size="small" @click="openDetail(row)">详情</el-button>
           </template>
@@ -289,9 +303,9 @@
       <template #header>
         <DialogHeader :icon="Timer" :title="`任务日志 · ${logsTask?.name || ''}`" subtitle="统一任务引擎文本日志（实时刷新）" />
       </template>
-      <!-- 日志存储统计栏（tasks 目录聚合：/logs/stats key=tasks；后端未含该键时组件自隐） -->
+      <!-- 日志存储统计栏（cert-job 行同 CertJobs 页 key=certjob，其余任务族 key=tasks；后端未含该键时组件自隐） -->
       <div class="tm-log-stats">
-        <LogStorageBar log-key="tasks" style="margin-right: auto" />
+        <LogStorageBar :log-key="logsTask && isCertJobRow(logsTask.id) ? 'certjob' : 'tasks'" style="margin-right: auto" />
       </div>
       <div ref="logContainerRef" class="tm-log-container">
         <pre v-if="logsText" class="tm-log-content">{{ logsText }}</pre>
@@ -367,21 +381,23 @@ const refreshNow = async () => {
   try { await Promise.all([fetchTasks(), fetchClusterState(), fetchCertQueue()]) } finally { refreshing.value = false }
 }
 onMounted(() => {
-  void polling.run() // 首跑立即（start() 只设定时器）
+  void polling.run() // 首跑立即（start() 只设定时器；证书队列横幅已入轮询闭包随首跑）
   polling.start()
   fetchClusterState()
-  fetchCertQueue()
 })
 onUnmounted(() => polling.stop())
 
-const polling = usePollingTask(async () => fetchTasks(), {
+const polling = usePollingTask(async () => {
+  // U5-P3-4：证书队列横幅与任务列表同频 10s（曾只在 mounted/手动刷新拉取，横幅最长陈旧一个会话）
+  await Promise.all([fetchTasks(), fetchCertQueue()])
+}, {
   interval: 10000,
   onError: (e) => console.error('task monitor poll failed:', e),
 })
 // ===== 证书队列状态（独立卡——非任务族） =====
 interface CertJobRow { id: number; domain: string; status: string; updated_at?: string | null; ca_provider_name?: string }
-const certQueue = ref<{ loaded: boolean; queued: number; running: number; waiting: number; failed: number; issued7d: number; total: number; jobs: CertJobRow[] }>({
-  loaded: false, queued: 0, running: 0, waiting: 0, failed: 0, issued7d: 0, total: 0, jobs: [],
+const certQueue = ref<{ loaded: boolean; queued: number; running: number; waiting: number; total: number; jobs: CertJobRow[] }>({
+  loaded: false, queued: 0, running: 0, waiting: 0, total: 0, jobs: [],
 })
 const fetchCertQueue = async () => {
   try {
@@ -395,12 +411,10 @@ const fetchCertQueue = async () => {
       queued: count(j => ['queued', 'pending'].includes(j.status)),
       running: live.length - count(j => ['queued', 'pending'].includes(j.status)),
       waiting: count(j => j.status === 'waiting_ca'),
-      failed: 0, issued7d: 0,
       jobs: live.slice(0, 6),
     }
   } catch { certQueue.value.loaded = true }
 }
-onUnmounted(() => polling.stop())
 
 // ===== 概览统计 =====
 const runningCount = computed(() => tasks.value.filter(t => t.status === 'running').length)
@@ -428,8 +442,8 @@ const statusPieOption = computed<EChartsOption>((): EChartsOption => {
   const counts = new Map<string, number>()
   for (const t of tasks.value) counts.set(t.status, (counts.get(t.status) || 0) + 1)
   const labels: Record<string, string> = {
-    running: '运行中', idle: '空闲', queued: '排队', failed: '失败', cancelled: '已取消',
-    disabled: '已暂停', passive: '常驻', no_runs: '未运行', stopped: '已停止',
+    running: '运行中', idle: '空闲', queued: '排队中', failed: '失败', cancelled: '已取消',
+    disabled: '已暂停', no_runs: '未运行', stopped: '已停止',
   }
   return {
     tooltip: { trigger: 'item' },
@@ -483,9 +497,11 @@ const onCancel = async (row: TaskInfo) => {
   ElMessage.success(res.message || '已发出取消信号')
   fetchTasks()
 }
-const onControl = async (row: TaskInfo) => {
-  const action = row.status === 'running' ? 'stop' : 'start'
-  const label = row.status === 'running' ? '停止' : '启动'
+const onControl = async (row: TaskInfo, overrideTarget?: boolean) => {
+  // P2-7：目标态从 loop_on 派生（status=running 判据删除——待命/空闲态也可能是循环开启）
+  const loopOn = overrideTarget ?? !!row.loop_on
+  const action = loopOn ? 'stop' : 'start'
+  const label = loopOn ? '停止' : '启动'
   if (action === 'stop') {
     try {
       await ElMessageBox.confirm(`确认${label}「${row.name}」？停止后相关功能将中断，可随时重新启动。`, '常驻任务控制', { type: 'warning', confirmButtonText: label })
@@ -493,6 +509,15 @@ const onControl = async (row: TaskInfo) => {
   }
   const res = await request.post<APIResponse>(`/system/tasks/${row.id}/control`, { action })
   ElMessage.success(res.message || `已${label}`)
+  fetchTasks()
+}
+// U5-P4-6e：常驻行操作列「重启」（control restart——启停已由调度列开关承担）
+const onRestart = async (row: TaskInfo) => {
+  try {
+    await ElMessageBox.confirm(`确认重启「${row.name}」？重启期间相关功能将短暂中断。`, '常驻任务控制', { type: 'warning', confirmButtonText: '重启' })
+  } catch { return }
+  const res = await request.post<APIResponse>(`/system/tasks/${row.id}/control`, { action: 'restart' })
+  ElMessage.success(res.message || '已重启')
   fetchTasks()
 }
 
@@ -576,13 +601,13 @@ onUnmounted(closeLogs)
 // ===== 文案 =====
 const statusLabels: Record<string, string> = {
   running: '运行中', idle: '空闲', queued: '排队中', failed: '失败', cancelled: '已取消',
-  disabled: '已暂停', passive: '常驻', no_runs: '未运行', stopped: '已停止',
+  disabled: '已暂停', no_runs: '未运行', stopped: '已停止',
 }
 const statusLabel = (s: string) => statusLabels[s] || s
 const kindLabels: Record<string, string> = { scheduled: '定时', continuous: '常驻', queue: '队列', info: '内置', oneshot: '触发' }
 const kindLabel = (k: string) => kindLabels[k] || k
-const kindTag = (k: string): 'primary' | 'success' | 'warning' | 'info' =>
-  k === 'scheduled' ? 'primary' : k === 'continuous' ? 'success' : k === 'oneshot' ? 'warning' : 'info'
+const kindTag = (k: string): 'primary' | 'success' | 'info' =>
+  k === 'scheduled' ? 'primary' : k === 'continuous' ? 'success' : 'info'
 const categoryOrder: Record<string, number> = { '安全防护': 0, '证书': 1, '备份': 2, '集群': 3, '系统': 4, '触发': 5 }
 const categoryTagType = (c: string): 'primary' | 'success' | 'warning' | 'info' =>
   c === '安全防护' ? 'primary' : c === '证书' ? 'success' : c === '备份' ? 'warning' : c === '触发' ? 'info' : 'info'
@@ -635,7 +660,7 @@ const fmtDuration = (ms?: number) => {
 .tm-cq-banner-stats { display: flex; gap: 12px; }
 .tm-cq-chip { font-size: 12.5px; color: #6b7280; white-space: nowrap; }
 .tm-cq-chip b { font-weight: 700; color: #111827; margin-left: 2px; }
-.tm-c-run { color: #4f8cff !important; } .tm-c-wait { color: #38e1ff !important; } .tm-c-fail { color: #f87171 !important; } .tm-c-ok { color: #34d399 !important; }
+.tm-c-run { color: #4f8cff !important; } .tm-c-wait { color: #38e1ff !important; }
 .tm-cq-banner-live { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; overflow: hidden; }
 .tm-cq-domain-chip { font-size: 12px; color: #374151; background: #f3f4f6; border-radius: 999px; padding: 3px 10px; white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; }
 .tm-cq-dot { width: 6px; height: 6px; border-radius: 50%; background: #4f8cff; }
@@ -660,7 +685,6 @@ const fmtDuration = (ms?: number) => {
 .tm-status[data-status="cancelled"] { --tm-c: #8b5cf6; }
 .tm-status[data-status="stopped"], .tm-status[data-status="disabled"] { --tm-c: #62687f; }
 .tm-status[data-status="idle"], .tm-status[data-status="no_runs"] { --tm-c: #9aa0b5; }
-.tm-status[data-status="passive"] { --tm-c: #38e1ff; }
 .tm-dim { color: var(--el-text-color-placeholder); }
 .tm-ok { color: #34d399; font-weight: 600; }
 .tm-bad { color: #f87171; font-weight: 600; }

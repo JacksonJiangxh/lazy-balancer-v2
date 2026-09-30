@@ -3,6 +3,7 @@ package services
 import (
 	"errors"
 	"fmt"
+	"lazy-balancer-v2/internal/taskengine"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -435,7 +436,6 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
-	t.Cleanup(SetUpdateLogDirForTest(t.TempDir()))
 	var reloads int
 	SetThreatReloader(func() error { reloads++; return nil })
 	t.Cleanup(func() { SetThreatReloader(nil) })
@@ -491,7 +491,7 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 	if reloads != 1 {
 		t.Fatalf("同内容不应重载: reloads=%d", reloads)
 	}
-	logRaw, lerr := os.ReadFile(ThreatUpdateLogPath())
+	logRaw, lerr := os.ReadFile(taskengine.TaskLogPath("threat"))
 	if lerr != nil {
 		t.Fatalf("读更新日志: %v", lerr)
 	}

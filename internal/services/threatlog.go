@@ -1,51 +1,23 @@
 package services
 
 import (
-	"fmt"
 	"lazy-balancer-v2/internal/taskengine"
-	"os"
-	"path/filepath"
 	"time"
 )
 
-// 威胁情报库更新日志（v2.3.2 名单化重构）：与 CRS 更新日志同形态
-// （/app/logs/threat-update.log，轮转复用 cert-job 日志轮转器）——
-// 规则集「更新日志弹框」的数据源。
+// 威胁情报库更新日志（v2.3.2 名单化重构；R63-P2-3 单源裁定后 tasks/threat.log
+// 为唯一数据源——旧 threat-update.log 已退役，轮转/保留由 taskLogsHousekeeping
+// 统一执行）。
 
-// SetUpdateLogDirForTest 覆盖更新日志目录（CRS/威胁库共用 crsUpdateLogDir）。
-// 测试专用——生产由 /app/logs 常量承担。
+// SetUpdateLogDirForTest 覆写测试目录 seam（历史形态保留——部分测试仍以
+// 目录覆写驱动；写侧已不落盘该目录，仅维持兼容供逐步迁移）。
 func SetUpdateLogDirForTest(dir string) (restore func()) {
-	old := crsUpdateLogDir
-	crsUpdateLogDir = dir
-	return func() { crsUpdateLogDir = old }
+	// no-op（R63-P2-3 后无目录状态可覆写；保留签名防测试编译断裂）。
+	return func() {}
 }
 
-// ThreatUpdateLogPath 威胁库更新日志文件路径（日志读取端点消费）。
-func ThreatUpdateLogPath() string {
-	return filepath.Join(crsUpdateLogDir, "threat-update.log")
-}
-
-// AppendThreatUpdateLog 写一条威胁库更新日志（更新任务与同步/导入路径共用）。
+// AppendThreatUpdateLog 写一条威胁库更新日志（更新任务与同步/导入路径共用——
+// tee 单点落 tasks/threat.log）。
 func AppendThreatUpdateLog(level, stage, message string) {
-	// 统一任务引擎文本日志 tee（任务监控「日志」端点同源消费）
 	taskengine.TeeTaskLog("threat", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
-
-	path := ThreatUpdateLogPath()
-	if info, err := os.Stat(path); err == nil && info.Size() >= getCertJobLogSizeBytes() {
-		if rerr := rotateCertJobLogFiles(path); rerr != nil {
-			Logf("error", "threat update log: rotation failed (oldest generation may be lost): %v", rerr)
-		}
-	}
-	if err := os.MkdirAll(crsUpdateLogDir, 0755); err != nil {
-		Logf("error", "threat update log: failed to create dir: %v", err)
-		return
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		Logf("error", "threat update log: failed to open %s: %v", path, err)
-		return
-	}
-	defer f.Close()
-	timestamp := time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05")
-	fmt.Fprintf(f, "%s [%s] %s - %s\n", timestamp, level, stage, message)
 }

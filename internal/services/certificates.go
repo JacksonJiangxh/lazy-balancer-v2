@@ -764,9 +764,9 @@ func CertWaitingCATickOnce() {
 
 // CertReconcileOnce 状态对账（缺失证书文件/孤儿任务清理）。
 func CertReconcileOnce() {
-	reconcileMissingCertFiles(db.DB)
-	sweepOrphanedCertJobs(context.Background())
-	TaskLogf("cert-reconcile", "reconcile", "状态对账完成：断链文件重建与孤儿任务清理一轮（明细见运行日志）")
+	rebuilt := reconcileMissingCertFiles(db.DB)
+	swept := sweepOrphanedCertJobs(context.Background())
+	TaskLogf("cert-reconcile", "reconcile", "状态对账完成：断链重建 %d 个、孤儿清理 %d 个（一致时为 0）", rebuilt, swept)
 }
 
 // requeueWaitingCAJobs re-enqueues cert jobs parked in 'waiting_ca' once
@@ -860,7 +860,7 @@ func (s *CertificateService) recoverCertJobs(ctx context.Context) {
 // 证书/私钥文件缺失，则从数据库 cert_pem/key_pem 重建，避免容器重建或磁盘清理后 Caddy
 // 因缺证书文件而拒绝加载。仅覆盖 ACME 任务：手动证书内联在 lb_rules.tls_cert，由启动时
 // MaterializeAllCertsFromDB 物化；本函数随证书服务（仅主节点）每 6 小时对账一次。
-func reconcileMissingCertFiles(dbh *sql.DB) {
+func reconcileMissingCertFiles(dbh *sql.DB) int {
 	// CL23-2(第 23 轮审计):多行规则必须按 certJobRuleApplicable 同语义过滤——
 	// 否则灾备重建内容取决于扫描顺序,可能重建旧域证书且无自愈。
 	rows, err := dbh.Query(`SELECT j.rule_id, j.domain, COALESCE(j.cert_pem,''), COALESCE(j.key_pem,''), COALESCE(r.domain,'') AS rule_domain
@@ -872,7 +872,7 @@ func reconcileMissingCertFiles(dbh *sql.DB) {
 		ORDER BY j.rule_id, j.updated_at DESC, j.id DESC`)
 	if err != nil {
 		Logf("error", "cert reconcile: query issued certificates failed: %v", err)
-		return
+		return 0
 	}
 	defer rows.Close()
 	rebuilt := 0
@@ -913,8 +913,9 @@ func reconcileMissingCertFiles(dbh *sql.DB) {
 	if rebuilt > 0 {
 		RecordAuditLog("system", "重建", "证书文件", FormatAuditDetail(AuditSourcePart("runtime_reconcile"), fmt.Sprintf("重建 %d 个证书文件", rebuilt)), "")
 	}
-}
 
+	return rebuilt
+}
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
@@ -1078,7 +1079,8 @@ func certJobRuleApplicable(ruleBound bool, ruleDomain, jobDomain string) bool {
 // sweepOrphanedCertJobs 禁用规则已不再引用的非终态证书任务（域名迁移/规则停用/删除后
 // 遗留，启动恢复 requeueNonTerminalCertJobs 只在重启时处理一次），随 6 小时对账巡检执行，
 // 避免孤儿任务滞留到重启或被 waiting_ca 重排队白白签发。
-func sweepOrphanedCertJobs(ctx context.Context) {
+func sweepOrphanedCertJobs(ctx context.Context) int {
+	swept := 0
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT j.id, j.rule_id, j.status, COALESCE(j.domain,''), COALESCE(r.domain,''),
 		       CASE WHEN r.caddy_id IS NOT NULL AND r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns' THEN 1 ELSE 0 END
@@ -1088,7 +1090,7 @@ func sweepOrphanedCertJobs(ctx context.Context) {
 	`)
 	if err != nil {
 		Logf("error", "cert sweep: query certificate jobs failed: %v", err)
-		return
+		return 0
 	}
 	type orphanCandidate struct {
 		id         int
@@ -1104,7 +1106,7 @@ func sweepOrphanedCertJobs(ctx context.Context) {
 		if err := rows.Scan(&job.id, &job.ruleID, &job.status, &job.jobDomain, &job.ruleDomain, &job.ruleBound); err != nil {
 			rows.Close()
 			Logf("error", "cert sweep: scan certificate job failed: %v", err)
-			return
+			return 0
 		}
 		if JobIsTerminal(job.status) {
 			continue
@@ -1116,12 +1118,12 @@ func sweepOrphanedCertJobs(ctx context.Context) {
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		Logf("error", "cert sweep: iterate certificate jobs failed: %v", err)
-		return
+		return 0
 	}
 	rows.Close()
 	for _, job := range orphans {
 		if err := ctx.Err(); err != nil {
-			return
+			return 0
 		}
 		if err := transitionJob(db.DB, job.id, nonTerminalJobStatuses, "disabled", map[string]any{"message": "关联规则已不再使用当前 ACME 证书任务"}); err != nil {
 			if errors.Is(err, ErrJobTransitionConflict) {
@@ -1132,8 +1134,9 @@ func sweepOrphanedCertJobs(ctx context.Context) {
 		}
 		RecordAuditLog("system", "禁用", "证书任务", FormatAuditDetail(AuditJobPart(job.id), AuditRulePart(job.ruleID), AuditSourcePart("runtime_sweep")), "")
 	}
-}
 
+	return swept
+}
 func (s *CertificateService) Stop() {
 	s.timerMu.Lock()
 	s.stopping = true
@@ -1397,6 +1400,8 @@ func (s *CertificateService) checkManualCertExpiration() {
 		Logf("info", "TLS Certificate Check: %d expired, %d expiring within %d days", expiredCount, expiringSoonCount, warnDays)
 		// SPEC §6.5：业务结论镜像到任务日志（cert-manual-poll）。
 		TaskLogf("cert-manual-poll", "check", "手动证书到期检查：%d 张已过期、%d 张临期（阈值 %d 天）", expiredCount, expiringSoonCount, warnDays)
+	} else if len(certs) > 0 {
+		TaskLogf("cert-manual-poll", "check", "手动证书到期检查：共 %d 张，无过期无临期（阈值 %d 天）", len(certs), warnDays)
 	}
 }
 

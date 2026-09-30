@@ -30,10 +30,9 @@ const (
 )
 
 var (
-	crsLiveDir      = "/app/waf/crs"
-	crsSnapshotDir  = "/app/data/crs"
-	crsDistDir      = "/app/waf.dist/crs"
-	crsUpdateLogDir = "/app/logs"
+	crsLiveDir     = "/app/waf/crs"
+	crsSnapshotDir = "/app/data/crs"
+	crsDistDir     = "/app/waf.dist/crs"
 )
 
 const crsTimeLayout = "2006-01-02 15:04:05"

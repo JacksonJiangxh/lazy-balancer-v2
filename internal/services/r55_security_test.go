@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"lazy-balancer-v2/internal/taskengine"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,6 +55,8 @@ func TestNormalizeLegacySecurityPolicyEnums_bumpsOnce_whenRowTriggerInstalled(t 
 func TestCRSUpdateRun_snapshotPersistFailureIsAudited(t *testing.T) {
 	// Given 一次可成功的更新 + 不可写的快照目录（父路径是普通文件）
 	m := newTestCRSManager(t)
+	taskengine.SetLogDir(t.TempDir())
+	t.Cleanup(func() { taskengine.SetLogDir("") })
 	seedCRSVersionRow(t, "v4.14.0", true)
 	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf"), "SecRule old")
 	m.fetchLatestTag = func(context.Context) (string, error) { return "v4.15.0", nil }
@@ -84,7 +87,7 @@ func TestCRSUpdateRun_snapshotPersistFailureIsAudited(t *testing.T) {
 	}
 	// And 组件日志行级别/阶段一致（R56 发现2）：ERROR 行必须标 failed 阶段——
 	// 与同 run 末尾的 INFO/success 行并列时，success 阶段的 ERROR 行会误导阶段列。
-	logBytes, err := os.ReadFile(CRSUpdateLogPath())
+	logBytes, err := os.ReadFile(taskengine.TaskLogPath("crs"))
 	if err != nil {
 		t.Fatal(err)
 	}

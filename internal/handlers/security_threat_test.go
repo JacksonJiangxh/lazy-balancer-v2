@@ -25,7 +25,6 @@ func newThreatTestRouter(t *testing.T) *gin.Engine {
 	// 任务日志目录同址（单一数据源：更新日志端点读 tasks/threat.log，
 	// tee 与端点须落在同一目录才能端到端可见——生产由 InitTaskEngine 注入）。
 	threatLogDir := t.TempDir()
-	t.Cleanup(services.SetUpdateLogDirForTest(threatLogDir))
 	taskengine.SetLogDir(threatLogDir)
 	t.Cleanup(func() { taskengine.SetLogDir("") })
 	gin.SetMode(gin.TestMode)
@@ -124,8 +123,7 @@ func TestThreatLib_flagsOnlyToggleUpdateEnabled(t *testing.T) {
 
 func TestThreatLib_updateAcceptedWithStatusAndLogs(t *testing.T) {
 	restoreWaf := services.OverrideThreatWafDirForTest(t.TempDir())
-	restoreLog := services.SetUpdateLogDirForTest(t.TempDir())
-	t.Cleanup(func() { restoreWaf(); restoreLog() })
+	t.Cleanup(restoreWaf)
 	// Given：源指向快速本地桩（避免真网下载）
 	router := newThreatTestRouter(t)
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

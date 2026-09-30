@@ -52,6 +52,11 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发（探测型/专属端点/镜像族）"})
 					return
 				}
+				// R63-P2-7：单飞预检——已在跑立即 409（Trigger 异步 goroutine 曾吞此错）
+				if te.IsRunning(id) {
+					c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务运行中，请稍后重试"})
+					return
+				}
 				go func(tid, operator string) {
 					_ = te.Trigger(tid, "manual", operator) // 异步——耗时由 task_runs 记录；operator 审计归人
 				}(id, auditOperator(c))

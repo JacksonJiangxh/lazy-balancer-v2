@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"lazy-balancer-v2/internal/taskengine"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -352,6 +353,8 @@ func TestCRSDownloadTarballLogged_startProgressCompletionLines(t *testing.T) {
 	defer srv.Close()
 	withGHFastProxy(t, srv.URL+"/")
 
+	taskengine.SetLogDir(t.TempDir())
+	t.Cleanup(func() { taskengine.SetLogDir("") })
 	m := newTestCRSManager(t)
 	dest := filepath.Join(t.TempDir(), "crs.tar.gz")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -368,7 +371,8 @@ func TestCRSDownloadTarballLogged_startProgressCompletionLines(t *testing.T) {
 	}
 
 	// And 更新日志包含：开始行（完整代理 URL+预计大小）、进度行、完成行（字节+耗时）
-	data, err := os.ReadFile(CRSUpdateLogPath())
+	// （R63-P2-3：更新日志=任务日志 tasks/crs.log 唯一数据源）
+	data, err := os.ReadFile(taskengine.TaskLogPath("crs"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -383,7 +383,8 @@ const (
 func validatePasswordPolicy(password string) error {
 	if password == "" {
 		return nil // 空密码=不修改(UpdateCurrentUser/UpdateUser 的 omitempty 场景;
-		// CreateUser/ResetUserPassword 由 binding required 拦截空值)
+		// CreateUser/ResetUserPassword 由 binding required 拦截空值——
+		// R63-P2-5 修复：ResetUserPassword 曾误用 omitempty 致空密码可落库)
 	}
 	if len(password) < minPasswordLength {
 		return fmt.Errorf("密码长度不能少于 %d 位", minPasswordLength)

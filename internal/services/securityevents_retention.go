@@ -59,14 +59,18 @@ func securityEventsRetentionSettings() (days, max int) {
 // 得以在大批量首遍（如数据恢复后的百万行）中及时中止，不再被拖到 docker
 // SIGKILL 跳过 db.Close。
 // SecurityEventsRetentionCleanupOnce 单轮过期事件清理（引擎每日节拍）。
-func SecurityEventsRetentionCleanupOnce() { securityEventsRetentionCleanup(context.Background()) }
+// SecurityEventsRetentionCleanupOnce 按保留期清理安全事件，返回删除条数（§6.5 摘要行数据源）。
+func SecurityEventsRetentionCleanupOnce() int {
+	return securityEventsRetentionCleanup(context.Background())
+}
 
-func securityEventsRetentionCleanup(ctx context.Context) {
+func securityEventsRetentionCleanup(ctx context.Context) int {
 	database := db.MetricsDB
 	if database == nil {
-		return
+		return 0
 	}
 	days, max := securityEventsRetentionSettings()
+	total := 0
 	// 年龄裁剪同样分批执行（与 count 裁剪同口径）：大表单条 DELETE 长时间持
 	// 指标库写锁，阻塞摄取 tick（R34 E）。
 	for {
@@ -76,6 +80,7 @@ func securityEventsRetentionCleanup(ctx context.Context) {
 			break
 		}
 		affected, _ := res.RowsAffected()
+		total += int(affected)
 		if affected == 0 {
 			break
 		}
@@ -83,17 +88,17 @@ func securityEventsRetentionCleanup(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			Logf("info", "security events retention: age-based cleanup canceled mid-pass")
-			return
+			return 0
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return
+		return 0
 	}
 	var count int
 	if err := database.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&count); err != nil {
 		Logf("warn", "security events retention: row count failed: %v", err)
-		return
+		return 0
 	}
 	if overflow := count - max; overflow > 0 {
 		remaining := overflow
@@ -116,11 +121,12 @@ func securityEventsRetentionCleanup(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				Logf("info", "security events retention: count-based cleanup canceled mid-pass")
-				return
+				return 0
 			case <-time.After(10 * time.Millisecond):
 			}
 		}
 	}
+	return total
 }
 
 // StartSecurityEventsRetention launches the daily cleanup worker. It is a no-op

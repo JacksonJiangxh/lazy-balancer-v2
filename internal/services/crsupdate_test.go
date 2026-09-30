@@ -17,9 +17,6 @@ func newTestCRSManager(t *testing.T) *CRSUpdateManager {
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	oldLogDir := crsUpdateLogDir
-	crsUpdateLogDir = t.TempDir()
-	t.Cleanup(func() { crsUpdateLogDir = oldLogDir })
 
 	root := t.TempDir()
 	m := newCRSUpdateManager(func() error { return nil })

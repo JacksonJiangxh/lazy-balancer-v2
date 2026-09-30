@@ -181,6 +181,10 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	sets := make([]string, 0, 5)
 	args := make([]any, 0, 5)
 	if req.Username != nil && *req.Username != "" && *req.Username != oldUsername {
+		if err := validateUsernamePolicy(*req.Username); err != nil { // R63-U4-P3-1：改名须过策略（创建/注册已查、更新曾漏）
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+			return
+		}
 		sets = append(sets, "username = ?")
 		args = append(args, *req.Username)
 		// SLB10-N8:审计记旧→新(角色降权等高敏变更可取证重建;密码只记名)。
@@ -466,7 +470,7 @@ func (h *Handlers) ResetUserPassword(c *gin.Context) {
 	}
 
 	var req struct {
-		NewPassword string `json:"new_password" binding:"omitempty,max=24"`
+		NewPassword string `json:"new_password" binding:"required"`
 	}
 	if !guardConfiguredJSONBody(c) {
 		return
