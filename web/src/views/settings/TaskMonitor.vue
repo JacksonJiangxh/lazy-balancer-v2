@@ -261,7 +261,7 @@
     </el-dialog>
 
     <!-- 任务日志弹框（与证书日志同款：暗色终端流） -->
-    <el-dialog v-model="logsVisible" width="680px" top="8vh" destroy-on-close @closed="closeLogs">
+    <el-dialog v-model="logsVisible" width="min(920px, 92vw)" top="6vh" destroy-on-close @closed="closeLogs">
       <template #header>
         <DialogHeader :icon="Timer" :title="`任务日志 · ${logsTask?.name || ''}`" subtitle="统一任务引擎文本日志（实时刷新）" />
       </template>
@@ -665,7 +665,7 @@ const fmtDuration = (ms?: number) => {
 /* 日志 */
 .tm-log-stats { display: flex; align-items: center; margin-bottom: 10px; }
 .tm-logs-loading { display: flex; align-items: center; gap: 8px; color: var(--el-text-color-secondary); padding: 16px 0; }
-.tm-log-container { max-height: 520px; overflow: auto; background: #0f172a; border-radius: 8px; padding: 16px; border: 1px solid #1e293b; }
+.tm-log-container { max-height: 60vh; overflow: auto; background: #0f172a; border-radius: 8px; padding: 16px; border: 1px solid #1e293b; }
 .tm-log-content { margin: 0; color: #e2e8f0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; line-height: 1.7; white-space: pre-wrap; }
 .tm-log-stage { font-size: 11px; color: var(--el-text-color-secondary); margin-bottom: 2px; text-transform: uppercase; letter-spacing: .5px; }
 </style>

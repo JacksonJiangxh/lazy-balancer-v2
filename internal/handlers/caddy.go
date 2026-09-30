@@ -423,7 +423,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 	// 下限,天文值落库使轮转实效、日志无限增长。2026-09-25 用户裁定：上限收
 	// 窄为 1024（原 10240 过宽），与 UI :max=1024 同口径。
 	if req.CertJobLogSizeMB != nil && (*req.CertJobLogSizeMB <= 0 || *req.CertJobLogSizeMB > 1024) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "证书日志大小需在 1-1024MB 之间"})
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "任务日志大小需在 1-1024MB 之间"})
 		return
 	}
 	if req.RuntimeLogSizeMB != nil && (*req.RuntimeLogSizeMB <= 0 || *req.RuntimeLogSizeMB > 1024) {

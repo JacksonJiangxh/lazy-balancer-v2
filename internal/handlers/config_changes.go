@@ -133,7 +133,7 @@ func planConfigChanges(req models.UpdateConfigRequest, old configSnapshot) confi
 	add("trusted_proxy_ranges", "受信代理网段", req.TrustedProxyRanges != nil && *req.TrustedProxyRanges != old.TrustedProxyRanges)
 	add("trusted_proxy_headers", "受信代理请求头", req.TrustedProxyHeaders != nil && *req.TrustedProxyHeaders != old.TrustedProxyHeaders)
 	add("trusted_proxy_strict", "受信代理严格模式", req.TrustedProxyStrict != nil && *req.TrustedProxyStrict != old.TrustedProxyStrict)
-	add("cert_job_log_size_mb", "证书日志大小", req.CertJobLogSizeMB != nil && *req.CertJobLogSizeMB != old.CertJobLogSizeMB)
+	add("cert_job_log_size_mb", "任务日志大小", req.CertJobLogSizeMB != nil && *req.CertJobLogSizeMB != old.CertJobLogSizeMB)
 	add("audit_log_size_mb", "审计日志大小", req.AuditLogSizeMB != nil && *req.AuditLogSizeMB != old.AuditLogSizeMB)
 	add("runtime_log_size_mb", "运行日志大小", req.RuntimeLogSizeMB != nil && *req.RuntimeLogSizeMB != old.RuntimeLogSizeMB)
 	add("caddy_log_level", "Caddy日志级别", req.CaddyLogLevel != nil && *req.CaddyLogLevel != old.CaddyLogLevel)
