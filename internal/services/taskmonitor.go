@@ -95,7 +95,7 @@ func CollectSystemTasks() []TaskInfo {
 func collectCertJobRows() []TaskInfo {
 	rows, err := db.DB.Query(`SELECT id, domain, status, COALESCE(message,''), COALESCE(updated_at,created_at)
 		FROM cert_jobs
-		WHERE status NOT IN ('issued','failed','disabled') OR COALESCE(updated_at,created_at) > datetime('now','-1 day')
+		WHERE status NOT IN ('issued','disabled') OR (status = 'issued' AND COALESCE(updated_at,created_at) > datetime('now','-1 day'))
 		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT 20`)
 	if err != nil {
 		return nil
