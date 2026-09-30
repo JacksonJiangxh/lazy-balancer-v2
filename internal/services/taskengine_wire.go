@@ -418,7 +418,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Name:        "证书签发",
 		Description: "ACME 证书签发队列——含新签发与续签（由证书任务队列调度，活跃任务显示为动态行）",
 		Category:    "证书",
-		Kind:        taskengine.KindQueue,
+		Kind:        taskengine.KindContinuous,                      // R64 用户裁定：签发=常驻服务（队列驱动——引擎承载状态镜像）
+		IntervalFn:  func() time.Duration { return 24 * time.Hour }, // 名义间隔（Run 空转）
+		Run:         func(rc taskengine.RunContext) error { return nil },
 		StatusFn: func() string {
 			var n int
 			if err := db.DB.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE status NOT IN ('issued','failed','disabled')`).Scan(&n); err != nil || n > 0 {
@@ -598,7 +600,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		taskEngine.SetManualRun(id, true)
 	}
 
-	for _, id := range []string{"config-watchdog", "security-events-ingestion", "log-cleanup", "threat", "crs", "ip2region", "auto-backup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca"} {
+	for _, id := range []string{"config-watchdog", "security-events-ingestion", "log-cleanup", "threat", "crs", "ip2region", "auto-backup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca", "cert-issuance"} {
 		taskEngine.StartLoop(id)
 	}
 	// 常驻静默族启动行（2026-09-29 用户裁定：常驻任务应有启动时间记录+日志

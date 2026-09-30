@@ -268,7 +268,10 @@
       <div class="tm-log-stats">
         <LogStorageBar :log-key="logsTask && isCertJobRow(logsTask.id) ? 'certjob' : 'tasks'" style="margin-right: auto" />
       </div>
-      <div ref="logContainerRef" class="tm-log-container">
+      <div v-if="logsTask?.log_size_bytes != null" style="font-size:12px;color:#6b7280;margin-bottom:6px">
+            本文件 {{ (logsTask.log_size_bytes / 1024).toFixed(1) }} KB
+          </div>
+          <div ref="logContainerRef" class="tm-log-container">
         <pre v-if="logsText" class="tm-log-content">{{ logsText }}</pre>
         <el-empty v-else description="暂无日志" :image-size="60" />
       </div>
