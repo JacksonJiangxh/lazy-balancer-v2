@@ -69,3 +69,33 @@ func TestCollectSystemTasks_ContinuousStartedAtAndLoopOn(t *testing.T) {
 		t.Fatal("cert-waiting-ca 默认调度应关闭（loop_on=false）")
 	}
 }
+
+// Given 从节点证书材料物化行（message=「从主节点同步…」、created_at=同步时刻）。
+// When collectCertJobRows。
+// Then 物化行不进任务监控动态行（非签发任务——从节点禁签发，2026-10-01
+// 用户裁定：幽灵行不得因同步时刻新鲜而显示）。
+func TestCollectCertJobRows_excludesSyncedMaterialRows(t *testing.T) {
+	oldDB, oldM, oldA := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close(); db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA })
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at) VALUES ('r1','ghost.test','issued','从主节点同步，源任务状态：issued',?)`, now)
+	db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at) VALUES ('r2','real.test','issued','',?)`, now)
+	rows := collectCertJobRows()
+	for _, r := range rows {
+		if strings.Contains(r.Name, "ghost.test") {
+			t.Fatal("物化行（从主节点同步）不应出现在任务监控动态行")
+		}
+	}
+	found := false
+	for _, r := range rows {
+		if strings.Contains(r.Name, "real.test") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("真实签发行应保留显示")
+	}
+}

@@ -45,9 +45,14 @@ func parseUTCSlot(s string) time.Time {
 
 // InitTaskEngine 建引擎、恢复孤儿运行、注册全部 17 任务并启动默认循环。幂等。
 func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine {
-	if taskEngine != nil {
-		return taskEngine
+	taskEngine = taskengine.NewEngine(taskengine.Options{})
+	// 角色种子（v2.0 角色门前置）：按 DB 角色初始化——从节点不瞬启
+	// master-only daemon（否则 boot 行噪音：启动→SetRole 停止）
+	var roleMaster int
+	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&roleMaster); err == nil {
+		taskEngine.SetRole(roleMaster == 1)
 	}
+	_ = taskEngine.RecoverOrphans()
 	taskengine.SetLocation(CurrentLocation())
 	logsDir := "/app/logs"
 	if runtimeLogFile != "" {
@@ -82,8 +87,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	taskEngine.Register(taskengine.Descriptor{
 		ID:          "log-cleanup",
 		Family:      "system",
-		Name:        "运行日志轮转副本清理",
-		Description: "删除超过保留期（与审计保留月数同配置）的应用日志轮转副本（app.log.*）",
+		Name:        "日志清理与轮转",
+		Description: "清理超保留期的应用日志轮转副本（app.log.*）；统一清理任务日志（tasks/*.log：超保留期删除、超大小上限轮转保一份）",
 		Category:    "系统",
 		Kind:        taskengine.KindPeriodic,
 		IntervalFn:  func() time.Duration { return 24 * time.Hour },
@@ -97,7 +102,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 						months = m
 					}
 				}
-				TaskLogf("log-cleanup", "cleanup", "运行日志轮转副本清理完成：删除 %d 个过期副本（保留 %d 月，无过期为 0）", removed, months)
+				TaskLogf("log-cleanup", "cleanup", "日志清理完成：删除 %d 个过期副本（保留 %d 月，无过期为 0）；任务日志超期删除/超限轮转", removed, months)
 			}
 			return nil
 		},
@@ -211,14 +216,17 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Run:         func(rc taskengine.RunContext) error { return runIngestionLoop(rc.Ctx) },
 	})
 
-	// 证书签发：被动守护（CAQueueManager 自管理——Run 阻塞保持运行态）
+	// 证书签发：被动守护（CAQueueManager 自管理——Run 阻塞保持运行态）。
+	// RunsOn=MasterOnly：从节点禁签发——daemon 不在从节点启动（promote 经
+	// SetRole 自动拉起），状态显示实态（从节点=空闲）。
 	taskEngine.Register(taskengine.Descriptor{
 		ID:          "cert-issuance",
 		Family:      "certificates",
 		Name:        "证书签发",
-		Description: "ACME 证书签发队列——含新签发与续签（由证书任务队列调度，活跃任务显示为动态行）",
+		Description: "ACME 证书签发队列——含新签发与续签（由证书任务队列调度，活跃任务显示为动态行；仅主节点运行，从节点只读镜像）",
 		Category:    "证书",
 		Kind:        taskengine.KindDaemon,
+		RunsOn:      taskengine.RoleMasterOnly,
 		Run: func(rc taskengine.RunContext) error {
 			<-rc.Ctx.Done() // CAQueueManager 由 main 启动——此处仅承载运行态
 			return nil
@@ -232,27 +240,20 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	// 集群同步：被动守护（SyncService 自管理——Run 阻塞保持运行态）
+	// 集群同步：被动守护（SyncService 自管理——Run 阻塞保持运行态）。
+	// 无 StatusFn：状态由 daemon 实际运行态呈现——主节点（快照签发/接收
+	// 从节点注册）与从节点（轮询回放）都是服务在跑=运行中（2026-10-01
+	// 用户裁定：主节点显示空闲不合理）。
 	taskEngine.Register(taskengine.Descriptor{
 		ID:          "cluster-sync",
 		Family:      "cluster",
 		Name:        "集群同步",
-		Description: "从节点按用户配置的同步间隔轮询主节点快照并增量回放；主节点为签发方（空闲）",
+		Description: "集群同步服务：从节点按配置间隔轮询主节点快照并增量回放；主节点签发快照并接收从节点注册",
 		Category:    "集群",
 		Kind:        taskengine.KindDaemon,
 		Run: func(rc taskengine.RunContext) error {
 			<-rc.Ctx.Done() // SyncService 由 main 启动——此处仅承载运行态
 			return nil
-		},
-		StatusFn: func() string {
-			var isMaster int
-			if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
-				return ""
-			}
-			if isMaster == 1 {
-				return "idle"
-			}
-			return "running"
 		},
 	})
 

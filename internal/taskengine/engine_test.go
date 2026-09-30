@@ -395,3 +395,57 @@ func TestEngine_FailedRunStartsAtRealStart(t *testing.T) {
 		t.Fatalf("duration 应≥90ms, got %d", lr.DurationMs)
 	}
 }
+
+// Given master-only Daemon 任务 + 引擎为从节点角色。
+// When StartLoop → SetRole(true)（promote）→ SetRole(false)（demote）。
+// Then 从节点不启动 Run；promote 自动拉起；demote 停止但 loopEnabled 保留
+// （再次 promote 自动恢复）。
+func TestEngine_DaemonRoleGateLifecycle(t *testing.T) {
+	e := newTestEngine(t)
+	started := make(chan struct{}, 8)
+	e.Register(Descriptor{ID: "t-md", Family: "t", Name: "主节点常驻", Kind: KindDaemon, RunsOn: RoleMasterOnly,
+		Run: func(rc RunContext) error {
+			started <- struct{}{}
+			<-rc.Ctx.Done()
+			return nil
+		}})
+	e.SetRole(false) // 从节点
+	e.StartLoop("t-md")
+	select {
+	case <-started:
+		t.Fatal("从节点不应启动 master-only daemon")
+	case <-time.After(150 * time.Millisecond):
+	}
+	// promote：自动拉起
+	e.SetRole(true)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("promote 后应自动拉起 daemon")
+	}
+	// demote：Run 取消退出
+	e.SetRole(false)
+	deadline := time.Now().Add(time.Second)
+	running := true
+	for time.Now().Before(deadline) {
+		for _, m := range e.DescribeAll() {
+			if m.ID == "t-md" {
+				running = m.Running
+			}
+		}
+		if !running {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if running {
+		t.Fatal("demote 后 daemon Run 应退出")
+	}
+	// loopEnabled 保留（再 promote 恢复）
+	e.SetRole(true)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("再 promote 应恢复 daemon")
+	}
+}

@@ -62,11 +62,15 @@ type Descriptor struct {
 | 任务 | Run 体 | 实际工作 |
 |---|---|---|
 | security-events-ingestion | `runIngestionLoop(ctx)`（内部 2s ticker） | 尾读 coraza 审计日志 |
-
-| cert-issuance | `<-ctx.Done()`（被动守护） | CAQueueManager（main 启动） |
-| cluster-sync | `<-ctx.Done()`（被动守护） | SyncService（自管理） |
+| cert-issuance | `<-ctx.Done()`（被动守护） | CAQueueManager（main 启动）——**RunsOn=MasterOnly**：从节点禁签发 |
+| cluster-sync | `<-ctx.Done()`（被动守护） | SyncService（自管理）——主从都运行（无 StatusFn，实态呈现） |
 
 系统启动即运行（默认 StartLoop）；关闭调度=启动也不运行；允许手动停止和启用。
+
+**Daemon 角色门（2026-10-01 追加）**：StartLoop 仅在 roleAllows 时启动 Run；
+SetRole（promote/demote）自动拉起/停止角色不符的 daemon（loopEnabled 保留——
+再 promote 自动恢复）。显示用实际运行态（TaskMeta.Running）：Run 存活=运行中；
+调度开但角色不符=空闲；调度关=已停止。
 
 ### 循环（8）——固定间隔，每轮独立执行+记录
 
@@ -80,6 +84,11 @@ type Descriptor struct {
 | log-cleanup | 24h |
 | audit-retention | 24h |
 | security-events-retention | 24h |
+
+
+另：cert-job 动态行（`cert_jobs` 表逐单镜像）为签发工作项视图，不入引擎注册表；
+**排除从节点证书材料物化行**（message=「从主节点同步…」——非签发任务，从节点
+禁签发，2026-10-01 裁定）。
 
 ### 触发（1）
 

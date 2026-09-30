@@ -97,7 +97,8 @@ func CollectSystemTasks() []TaskInfo {
 func collectCertJobRows() []TaskInfo {
 	rows, err := db.DB.Query(`SELECT id, domain, status, COALESCE(message,''), COALESCE(updated_at,created_at)
 		FROM cert_jobs
-		WHERE status NOT IN ('issued','disabled') OR (status = 'issued' AND COALESCE(updated_at,created_at) > datetime('now','-1 day'))
+		WHERE (status NOT IN ('issued','disabled') OR (status = 'issued' AND COALESCE(updated_at,created_at) > datetime('now','-1 day')))
+		  AND COALESCE(message,'') NOT LIKE '从主节点同步%'
 		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT 20`)
 	if err != nil {
 		return nil
@@ -189,8 +190,12 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		if m.StatusMirror != "" {
 			ti.Status = TaskStatus(m.StatusMirror)
 		} else if m.Kind == taskengine.KindDaemon {
-			if m.LoopOn {
+			// 实际运行态驱动：Run 存活=运行中；调度开但未跑（角色不符）=空闲；
+			// 调度关=已停止
+			if m.Running {
 				ti.Status = TaskStatusRunning
+			} else if m.LoopOn {
+				ti.Status = TaskStatusIdle
 			} else {
 				ti.Status = TaskStatusStopped
 			}
