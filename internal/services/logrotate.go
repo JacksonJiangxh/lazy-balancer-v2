@@ -176,12 +176,42 @@ func (w *RotatingFileWriter) Close() error {
 // StartRuntimeLogCleanup removes rotated runtime log files older than the
 // configured log retention (shared with the audit log retention setting). It
 // runs once immediately and then daily.
-func RuntimeLogCleanupOnce(logFile string) int {
-	taskLogsHousekeeping(logFile)
+// RuntimeCleanupResult 单轮清理结果（log-cleanup 任务日志展示明细——
+// 2026-10-01 用户裁定：清理了哪个文件必须可见）。
+type RuntimeCleanupResult struct {
+	AppRemoved int // 应用日志过期副本删除数（app.log.*）
+	TaskLogs   TaskLogHousekeepingResult
+}
+
+// TaskLogHousekeepingResult 任务日志清理明细。
+type TaskLogHousekeepingResult struct {
+	Deleted   []string // 超保留期删除（文件名）
+	Rotated   []string // 超大小上限轮转（文件名+大小对比，如 "threat.log 11.3MB>10MB"）
+	SizeCapMB int      // 生效的大小上限（task_log_size_mb）
+}
+
+// Summary 一行明细摘要（列表超 5 个收敛为「等 N 个」；空=「无」）。
+func (r TaskLogHousekeepingResult) Summary() string {
+	list := func(names []string) string {
+		if len(names) == 0 {
+			return "无"
+		}
+		if len(names) > 5 {
+			return strings.Join(names[:5], "、") + fmt.Sprintf(" 等 %d 个", len(names))
+		}
+		return strings.Join(names, "、")
+	}
+	return fmt.Sprintf("任务日志：超期删除 %d 个[%s]、超限轮转 %d 个[%s]（大小上限 %dMB）",
+		len(r.Deleted), list(r.Deleted), len(r.Rotated), list(r.Rotated), r.SizeCapMB)
+}
+
+// runs once immediately and then daily.
+func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
+	result := RuntimeCleanupResult{TaskLogs: taskLogsHousekeeping(logFile)}
 	months := 3
 	database := db.GetDB()
 	if database == nil {
-		return 0
+		return result
 	}
 	if err := database.QueryRow("SELECT COALESCE(audit_retention_months,3) FROM global_config WHERE id=1").Scan(&months); err != nil || months < 1 {
 		months = 3
@@ -192,7 +222,7 @@ func RuntimeLogCleanupOnce(logFile string) int {
 	base := filepath.Base(logFile) + "."
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return 0
+		return result
 	}
 	removed := 0
 	for _, e := range entries {
@@ -212,7 +242,8 @@ func RuntimeLogCleanupOnce(logFile string) int {
 			}
 		}
 	}
-	return removed
+	result.AppRemoved = removed
+	return result
 }
 
 func StartRuntimeLogCleanupContext(ctx context.Context, logFile string) <-chan struct{} {
@@ -257,12 +288,14 @@ func StopRuntimeLogCleanup() {
 	runtimeLogCleanup.done = nil
 }
 
-// taskLogsHousekeeping 任务日志统一清理与轮转（log-cleanup 任务体）。
-func taskLogsHousekeeping(logFile string) {
+// taskLogsHousekeeping 任务日志统一清理与轮转（log-cleanup 任务体）——
+// 返回清理明细（哪个文件被删/轮转——用户可见）。
+func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
+	result := TaskLogHousekeepingResult{SizeCapMB: int(getTaskLogSizeBytes() / 1024 / 1024)}
 	dir := filepath.Join(filepath.Dir(logFile), "tasks")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return result
 	}
 	months := 3
 	if database := db.GetDB(); database != nil {
@@ -285,11 +318,16 @@ func taskLogsHousekeeping(logFile string) {
 		}
 		path := filepath.Join(dir, e.Name())
 		if info.ModTime().Before(cutoff) {
-			_ = os.Remove(path)
+			if os.Remove(path) == nil {
+				result.Deleted = append(result.Deleted, e.Name())
+			}
 			continue
 		}
 		if info.Size() > sizeCap {
-			_ = os.Rename(path, path+".1") // 轮转保一份
+			if os.Rename(path, path+".1") == nil { // 轮转保一份
+				result.Rotated = append(result.Rotated, fmt.Sprintf("%s %.1fMB>%dMB", e.Name(), float64(info.Size())/1024/1024, sizeCap/1024/1024))
+			}
 		}
 	}
+	return result
 }

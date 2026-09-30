@@ -270,6 +270,10 @@ func TestEngine_DaemonLifecycle(t *testing.T) {
 	if !e.IsRunning("t-daemon") {
 		t.Fatal("Daemon 运行中应 IsRunning=true")
 	}
+	// 启动即记 success（2026-10-01 用户裁定：成功列体现启动计数——运行期即 +1）
+	if st := e.Stats24h("t-daemon"); st.Success != 1 || st.Fail != 0 {
+		t.Fatalf("运行期成功列应=1（启动计数）, got %+v", st)
+	}
 	e.StopLoop("t-daemon")
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) && e.IsRunning("t-daemon") {
@@ -278,9 +282,12 @@ func TestEngine_DaemonLifecycle(t *testing.T) {
 	if e.IsRunning("t-daemon") {
 		t.Fatal("StopLoop 后应非 running")
 	}
-	// boot 行恰 1 行（生命周期计数）
+	// 取消停止不增行；boot 行终态=success
 	if got := countRuns(t, "t-daemon"); got != 1 {
-		t.Fatalf("Daemon 应恰 1 行 boot 记录, got %d", got)
+		t.Fatalf("取消停止不应增行, got %d", got)
+	}
+	if lr := e.LatestRun("t-daemon"); lr == nil || lr.Status != "success" {
+		t.Fatalf("boot 行应终态 success, got %+v", lr)
 	}
 	// 重启：第二个生命周期
 	e.StartLoop("t-daemon")
@@ -448,4 +455,32 @@ func TestEngine_DaemonRoleGateLifecycle(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("再 promote 应恢复 daemon")
 	}
+}
+
+// Given 常驻任务 Run 返回错误（非 ctx 取消——异常退出）。
+// When startDaemon 生命周期结束。
+// Then boot success 行之外补记 1 行 failed（真实时长）——失败列可见。
+func TestEngine_DaemonFailureRecordsFailedRow(t *testing.T) {
+	e := newTestEngine(t)
+	booted := make(chan struct{})
+	e.Register(Descriptor{ID: "t-dfail", Family: "t", Name: "异常常驻", Kind: KindDaemon,
+		Run: func(rc RunContext) error {
+			close(booted)
+			time.Sleep(50 * time.Millisecond)
+			return errors.New("daemon crashed") // 主动报错退出（非取消路径）
+		}})
+	e.SetRole(true)
+	e.StartLoop("t-dfail")
+	<-booted
+	if st := e.Stats24h("t-dfail"); st.Success != 1 {
+		t.Fatalf("boot 应即记 success, got %+v", st)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if st := e.Stats24h("t-dfail"); st.Fail == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("Run 错误返回应补记 failed 行, stats=%+v", e.Stats24h("t-dfail"))
 }

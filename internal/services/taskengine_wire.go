@@ -94,7 +94,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		IntervalFn:  func() time.Duration { return 24 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
 			if logFile != "" {
-				removed := RuntimeLogCleanupOnce(logFile)
+				res := RuntimeLogCleanupOnce(logFile)
 				months := 3
 				if database := db.GetDB(); database != nil {
 					var m int
@@ -102,7 +102,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 						months = m
 					}
 				}
-				TaskLogf("log-cleanup", "cleanup", "日志清理完成：删除 %d 个过期副本（保留 %d 月，无过期为 0）；任务日志超期删除/超限轮转", removed, months)
+				TaskLogf("log-cleanup", "cleanup", "日志清理完成：应用日志副本删除 %d 个（保留 %d 月，无过期为 0）；%s", res.AppRemoved, months, res.TaskLogs.Summary())
 			}
 			return nil
 		},
