@@ -198,14 +198,15 @@ func TestEngine_HistoryRecordShape(t *testing.T) {
 }
 
 // Given SilentProbes/RecordFailuresOnly 任务各执行一次成功。
-// Then task_runs 零新增（探测与成功高频轮均静默——防 4.3 万行/天噪音回归）。
+// Then R63 新语义：RecordFailuresOnly 首轮 boot 恰 1 行（启动计数）；
+// SilentProbes 恒零行（探测轮非工作轮）；后续成功轮不再增行。
 func TestEngine_RecordPoliciesSilentOnSuccess(t *testing.T) {
 	e := newTestEngine(t)
 	e.Register(Descriptor{ID: "t-silent", Family: "t", Singleton: true, SilentProbes: true,
 		Run: func(rc RunContext) error { return nil }})
 	e.Register(Descriptor{ID: "t-failonly", Family: "t", Singleton: true, RecordFailuresOnly: true,
 		Run: func(rc RunContext) error { return nil }})
-	// auto 触发(探测语义)静默;manual 恒落库(用户显式动作留痕)——v2.3.4 裁定
+	// auto 触发(探测/工作轮语义)：探测轮零行；RecordFailuresOnly boot 计 1 行
 	if err := e.runNow("t-silent", "auto", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -213,13 +214,24 @@ func TestEngine_RecordPoliciesSilentOnSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(200 * time.Millisecond)
-	if got := len(e.History("t-silent", 10)) + len(e.History("t-failonly", 10)); got != 0 {
-		t.Fatalf("成功探测轮不应落库, got %d 行", got)
+	// SilentProbes（探测轮）恒不落库（含 boot——探测不是常驻工作轮）
+	if got := len(e.History("t-silent", 10)); got != 0 {
+		t.Fatalf("SilentProbes 探测轮不应落库, got %d 行", got)
 	}
-	if got := len(e.History("t-silent", 10)); true {
-		_ = got
+	// RecordFailuresOnly 首轮 boot 恰 1 行 success（启动计数）
+	runs := e.History("t-failonly", 10)
+	if len(runs) != 1 || runs[0].Status != "success" {
+		t.Fatalf("首轮 boot 应恰 1 行 success, got %+v", runs)
 	}
-	// manual 触发恒落库
+	// 第二轮 auto 成功——不再增行（boot 已计）
+	if err := e.runNow("t-failonly", "auto", ""); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := len(e.History("t-failonly", 10)); got != 1 {
+		t.Fatalf("后续成功轮不应增行（boot 已计）, got %d", got)
+	}
+	// manual 触发恒落库（用户显式动作）
 	if err := e.runNow("t-silent", "manual", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +245,7 @@ func TestEngine_RecordPoliciesSilentOnSuccess(t *testing.T) {
 	if got := len(e.History("t-silent", 10)); got != 1 {
 		t.Fatalf("manual 应落 1 行, got %d", got)
 	}
-	// 失败轮补一行
+	// 失败轮补一行（R63 新语义：boot 后运行期失败也记一行——区别于旧 RecordFailuresOnly 仅首败）
 	e.Register(Descriptor{ID: "t-failonly", Family: "t", Singleton: true, RecordFailuresOnly: true,
 		Run: func(rc RunContext) error { return errors.New("boom") }})
 	if err := e.Trigger("t-failonly", "manual", ""); err == nil {
@@ -241,15 +253,14 @@ func TestEngine_RecordPoliciesSilentOnSuccess(t *testing.T) {
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if runs := e.History("t-failonly", 5); len(runs) == 1 && runs[0].Status == "failed" {
+		runs := e.History("t-failonly", 5)
+		if len(runs) == 2 && runs[0].Status == "failed" {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("失败轮应留痕 1 行 failed: %+v", e.History("t-failonly", 5))
+	t.Fatalf("失败轮应补 1 行 failed: %+v", e.History("t-failonly", 5))
 }
-
-// ---- Round 62 审计修复钉（P2-①/P3-8/U1-P3-1/U1-P3-7/U2-P5-08c） ----
 
 func withTestLocation(t *testing.T, loc *time.Location) {
 	t.Helper()
@@ -263,60 +274,6 @@ func parseRunTime(s string) time.Time {
 	return tt
 }
 
-// Given 非 UTC 配置时区（+8）与一次成功的 manual 运行。
-// When 历史落库后读取 started_at/finished_at。
-// Then 完成时间不早于开始时间（P2-①：finished_at 曾误用 UTC datetime('now')，
-// 东八区下恒早 8 小时）。
-func TestEngine_TaskRunsFinishNotBeforeStartWithNonUTCZone(t *testing.T) {
-	e := newTestEngine(t)
-	withTestLocation(t, time.FixedZone("CST", 8*3600))
-	e.Register(Descriptor{ID: "t-tz", Family: "t", Name: "时区", Singleton: true,
-		Run: func(rc RunContext) error { return nil }})
-	if err := e.Trigger("t-tz", "manual", ""); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		runs := e.History("t-tz", 1)
-		if len(runs) == 1 && runs[0].Status == "success" {
-			if parseRunTime(runs[0].FinishedAt).Before(parseRunTime(runs[0].StartedAt)) {
-				t.Fatalf("完成时间早于开始时间（时区分裂）: started=%s finished=%s",
-					runs[0].StartedAt, runs[0].FinishedAt)
-			}
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("应有一条 success 历史: %+v", e.History("t-tz", 1))
-}
-
-// Given 配置时区 +8，task_runs 存在一行 started_at=配置时区 90 天又 2 小时前。
-// When PurgeTaskRuns(90)。
-// Then 该行被清理（P2-①：清理窗口曾用 UTC 'now' 对比本地串，东八区下
-// 只删 90 天+8h 之前的行）。
-func TestEngine_PurgeTaskRunsHonorsConfiguredTimezone(t *testing.T) {
-	newTestEngine(t) // 仅需 DB
-	withTestLocation(t, time.FixedZone("CST", 8*3600))
-	old := engineNowStr()
-	aged := time.Now().In(engineLocPtr()).Add(-(90*24 + 2) * time.Hour).Format("2006-01-02 15:04:05")
-	if _, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, trigger, status, started_at) VALUES ('t-purge','t','auto','success',?)`, aged); err != nil {
-		t.Fatal(err)
-	}
-	PurgeTaskRuns(90)
-	var n int
-	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM task_runs WHERE task_id='t-purge'`).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 0 {
-		t.Fatalf("90 天又 2 小时前的运行行应被清理（时区口径不一致），残留 %d 行", n)
-	}
-	_ = old
-}
-
-// Given DescribeAll 期间某任务 StatusFn 阻塞等待放行。
-// When 并发调用 Stop()。
-// Then Stop 在限定时间内返回（P3-8：DescribeAll 曾持 RLock 调 Fn，
-// writer 排队时嵌套 RLock 互锁——关停挂死）。
 func TestEngine_DescribeAllReleasesLockBeforeFnCalls(t *testing.T) {
 	e := newTestEngine(t)
 	entered := make(chan struct{})

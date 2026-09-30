@@ -88,7 +88,16 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Description: "删除超过保留期（与审计保留月数同配置）的应用日志轮转副本（app.log.*）",
 		Category:    "系统",
 		Kind:        taskengine.KindContinuous,
-		IntervalFn:  func() time.Duration { return 24 * time.Hour },
+		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关
+			if enabled {
+				taskEngine.StartLoop("log-cleanup")
+			} else {
+				taskEngine.StopLoop("log-cleanup")
+			}
+			return nil
+		},
+		ToggleName: "运行日志清理",
+		IntervalFn: func() time.Duration { return 24 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
 			if logFile != "" {
 				removed := RuntimeLogCleanupOnce(logFile)
@@ -309,6 +318,15 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "security-events-retention", Family: "system", Name: "安全事件保留清理",
 		Description: "按保留期配置删除 metrics 库中过期的安全事件记录",
 		Category:    "系统", Kind: taskengine.KindContinuous,
+		ToggleFn: func(enabled bool) error {
+			if enabled {
+				taskEngine.StartLoop("security-events-retention")
+			} else {
+				taskEngine.StopLoop("security-events-retention")
+			}
+			return nil
+		},
+		ToggleName: "安全事件清理",
 		IntervalFn: func() time.Duration { return 24 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
 			deleted := SecurityEventsRetentionCleanupOnce()
@@ -317,7 +335,34 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	// —— 证书族：四内部循环（引擎接管节拍，原生 ticker 让位）+ 队列镜像 ——
+	// —— 证书族：恒在队列行 + 四内部循环 + CA 等待轮询 ——
+	// cert-issuance：恒在任务列表的证书签发族行（Kind=Queue——由 ACME 队列
+	// 调度实际签发，此行承载状态镜像/到期时间/操作入口）。
+	taskEngine.Register(taskengine.Descriptor{
+		ID:          "cert-issuance",
+		Family:      "certificates",
+		Name:        "证书签发",
+		Description: "ACME 证书签发队列——含新签发与续签（由证书任务队列调度，活跃任务显示为动态行）",
+		Category:    "证书",
+		Kind:        taskengine.KindQueue,
+		StatusFn: func() string {
+			var n int
+			if err := db.DB.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE status NOT IN ('issued','failed','disabled')`).Scan(&n); err != nil || n > 0 {
+				if err == nil {
+					return "running"
+				}
+			}
+			return ""
+		},
+		NextSlotFn: func() string { // 最近证书到期时间（续签触发点）
+			var at string
+			if err := db.DB.QueryRow(`SELECT MIN(expires_at) FROM cert_jobs WHERE status='issued' AND expires_at IS NOT NULL AND expires_at != ''`).Scan(&at); err == nil && at != "" {
+				return localDisplayUTC(at)
+			}
+			return ""
+		},
+	})
+
 	// RunsOn=RoleMasterOnly（U7-P3-2）：原生循环时代仅 master 跑（StartACME
 	// 只在主节点/promote 调用）——引擎接管后以显式角色门复刻，消除对
 	// activeCertService=nil 隐性让位的依赖（cert-reconcile 曾在从节点真实执行）。
@@ -325,6 +370,15 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "cert-renewal-scan", Family: "certificates", Name: "证书续期扫描",
 		Description: "扫描全部证书配置的到期时间，临期证书自动入队续签",
 		Category:    "证书", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
+		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关
+			if enabled {
+				taskEngine.StartLoop("cert-renewal-scan")
+			} else {
+				taskEngine.StopLoop("cert-renewal-scan")
+			}
+			return nil
+		},
+		ToggleName: "证书续期扫描",
 		IntervalFn: func() time.Duration { return 6 * time.Hour },
 		Run:        func(rc taskengine.RunContext) error { CertRenewalScanOnce(); return nil },
 	})
@@ -332,6 +386,15 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "cert-reconcile", Family: "certificates", Name: "证书状态对账",
 		Description: "核对证书文件与数据库状态一致性，修复中断任务残留的中间态",
 		Category:    "证书", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
+		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关
+			if enabled {
+				taskEngine.StartLoop("cert-reconcile")
+			} else {
+				taskEngine.StopLoop("cert-reconcile")
+			}
+			return nil
+		},
+		ToggleName: "证书状态对账",
 		IntervalFn: func() time.Duration { return 6 * time.Hour },
 		Run:        func(rc taskengine.RunContext) error { CertReconcileOnce(); return nil },
 	})
@@ -340,15 +403,33 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Description: "处理手工触发或重试的证书任务",
 		Category:    "证书", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
 		RecordFailuresOnly: true,
-		IntervalFn:         func() time.Duration { return 10 * time.Minute },
-		Run:                func(rc taskengine.RunContext) error { CertManualCheckOnce(); return nil },
+		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关
+			if enabled {
+				taskEngine.StartLoop("cert-manual-poll")
+			} else {
+				taskEngine.StopLoop("cert-manual-poll")
+			}
+			return nil
+		},
+		ToggleName: "手动证书任务轮询",
+		IntervalFn: func() time.Duration { return 10 * time.Minute },
+		Run:        func(rc taskengine.RunContext) error { CertManualCheckOnce(); return nil },
 	})
 	taskEngine.Register(taskengine.Descriptor{
 		ID: "cert-waiting-ca", Family: "certificates", Name: "CA 等待轮询",
 		Description: "证书任务在途时的兜底补扫：CA 冷却到期重排、滞留 queued 重入队、断链部署重试重建。门控——有非终态任务才扫描，全部完成即静默；可经调度开关停用",
 		Category:    "证书", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
-		RecordFailuresOnly: true, // 30s 补扫成功静默——仅断链/失败留痕
-		IntervalFn:         func() time.Duration { return 30 * time.Second },
+		RecordFailuresOnly: true, // 30s 补扫成功静默——仅断链/失败留痕+boot 启动计数
+		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关（启停 30s 扫描）
+			if enabled {
+				taskEngine.StartLoop("cert-waiting-ca")
+			} else {
+				taskEngine.StopLoop("cert-waiting-ca")
+			}
+			return nil
+		},
+		ToggleName: "CA 等待轮询",
+		IntervalFn: func() time.Duration { return 30 * time.Second },
 		StatusFn: func() string { // 有活=运行中/无活=空闲/关停=已停止（门控后零空转）
 			if certJobsActive() { // U7-P5-1：复用 certificates.go 单一实现（曾同 COUNT 两处重复）
 				return "running"
@@ -428,7 +509,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 
 	// 任务性质批量标定（展示口径）：排程/固定间隔族由探测轮或间隔驱动，
 	// 但性质是「定时」——只有真常驻循环（看门狗/事件摄取）是「常驻」。
-	for _, id := range []string{"threat", "crs", "ip2region", "auto-backup", "log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cluster-sync"} {
+	for _, id := range []string{"threat", "crs", "ip2region", "auto-backup", "log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca", "cluster-sync"} {
 		taskEngine.SetAsKind(id, taskengine.KindScheduled)
 	}
 

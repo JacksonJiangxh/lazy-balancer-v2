@@ -123,6 +123,7 @@ type registration struct {
 	cancel      context.CancelFunc
 	lastCheck   time.Time // 最近调度到期判定基准
 	loopEnabled bool      // 常驻循环启停开关（StartLoop/StopLoop）
+	bootCounted bool      // RecordFailuresOnly 首轮 boot 成功已记（启动计数——R63 设计）
 }
 
 // Engine 统一任务引擎。
@@ -401,10 +402,16 @@ func (e *Engine) runNow(id, trigger, operator string) error {
 		}
 		taskLogAppend(id, msg)
 	}
-	// 高频工作轮失败才补落库（成功轮静默——2s 摄取/60s 看门狗每轮落库
-	// 即每天 4.3 万/1440 行噪音）
-	if runID == 0 && r.desc.RecordFailuresOnly && status != "success" {
-		runID = globalInsertRunAt(id, r.desc.Family, trigger, startStr)
+	// R63 常驻任务启动计数（用户裁定 2026-09-30）：常驻任务=守护进程——
+	// 启动记一行（成功/失败），运行期间零行（失败只写日志文件，不入 task_runs）。
+	if runID == 0 && r.desc.RecordFailuresOnly && trigger == "auto" {
+		r.mu.Lock()
+		first := !r.bootCounted
+		r.bootCounted = true
+		r.mu.Unlock()
+		if first {
+			runID = globalInsertRunAt(id, r.desc.Family, trigger, startStr)
+		}
 	}
 
 	r.mu.Lock()

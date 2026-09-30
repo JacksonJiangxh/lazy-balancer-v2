@@ -17,11 +17,7 @@
       <el-col :xs="12" :md="6">
         <el-card class="tm-kpi">
           <div class="tm-kpi-num">{{ total24h }}</div>
-          <div class="tm-kpi-label">
-            <el-tooltip content="静默族成功轮不落库——见「静默轮」标注" placement="top" :offset="8" :show-after="150" :show-arrow="false">
-              <span>24h 执行（留痕） ⓘ</span>
-            </el-tooltip>
-          </div>
+          <div class="tm-kpi-label">24h 执行</div>
         </el-card>
       </el-col>
       <el-col :xs="12" :md="6">
@@ -125,27 +121,17 @@
         </el-table-column>
         <el-table-column label="状态" width="88">
           <template #default="{ row }">
-            <!-- 常驻族 idle=循环开启但门控无活（如 cert-waiting-ca StatusFn）——「待命」而非「空闲」；定时/内置族 idle 保持「空闲」 -->
-            <el-tooltip
-              v-if="row.kind === 'continuous' && row.status === 'idle'"
-              content="循环开启 · 当前无待处理任务"
-              placement="top" :offset="8" :show-after="150" :show-arrow="false"
-            >
-              <span class="tm-status" data-status="idle"><span class="tm-dot"></span>待命</span>
-            </el-tooltip>
-            <span v-else class="tm-status" :data-status="row.status"><span class="tm-dot"></span>{{ statusLabel(row.status) }}</span>
+            <span class="tm-status" :data-status="row.status"><span class="tm-dot"></span>{{ statusLabel(row.status) }}</span>
           </template>
         </el-table-column>
         <el-table-column label="调度" width="92">
           <template #default="{ row }">
+            <!-- 定时族统一调度开关：暂停/恢复自动调度 -->
+            <el-switch v-if="row.kind === 'scheduled'" :model-value="row.enabled" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
             <!-- 常驻族：开关=常驻循环启停（非调度开关），绑定 loop_on 走 control -->
-            <el-tooltip v-if="row.kind === 'continuous'" content="常驻循环启停（非调度开关）" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+            <el-tooltip v-else-if="row.kind === 'continuous'" content="常驻循环启停（非调度开关）" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <el-switch :model-value="row.loop_on" :disabled="!isAdmin" @change="(v: string | number | boolean) => onControl(row, !!v)" />
             </el-tooltip>
-            <!-- 定时族有调度开关（threat/crs/ip2region）：暂停/恢复自动调度 -->
-            <el-switch v-else-if="row.kind === 'scheduled' && row.toggleable" :model-value="row.enabled" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
-            <!-- 定时族固定间隔（无用户排程槽）：不可暂停调度 -->
-            <el-tag v-else-if="row.kind === 'scheduled'" size="small" type="info" effect="plain">固定间隔</el-tag>
             <!-- 队列/触发/信息行：无调度语义 -->
             <span v-else class="tm-dim">—</span>
           </template>
@@ -179,19 +165,7 @@
             </el-tooltip>
           </template>
           <template #default="{ row }">
-            <el-tooltip
-              v-if="row.silent_runs"
-              content="成功轮不落历史与计数=引擎静默策略（防高频噪音）；失败会立即留痕显示"
-              placement="top" :offset="8" :show-after="150" :show-arrow="false"
-            >
-              <span class="tm-silent">
-                <el-tag size="small" type="info" effect="plain">静默轮</el-tag>
-                <span v-if="row.fail_24h > 0" class="tm-bad">{{ row.fail_24h }}</span>
-              </span>
-            </el-tooltip>
-            <template v-else>
-              <span class="tm-ok">{{ row.success_24h }}</span> / <span :class="{ 'tm-bad': row.fail_24h > 0 }">{{ row.fail_24h }}</span>
-            </template>
+            <span class="tm-ok">{{ row.success_24h }}</span> / <span :class="{ 'tm-bad': row.fail_24h > 0 }">{{ row.fail_24h }}</span>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="225" fixed="right">
@@ -244,9 +218,8 @@
         <el-descriptions :column="2" border size="small" class="tm-detail-descs">
           <el-descriptions-item label="运行节奏">{{ detailTask.cadence || '—' }}</el-descriptions-item>
           <el-descriptions-item label="调度开关">
-            <!-- 与列表调度列同语义四分支（详情为快照展示，不绑开关） -->
-            <el-tag v-if="detailTask.kind === 'scheduled' && detailTask.toggleable" size="small" :type="detailTask.enabled ? 'success' : 'warning'" effect="plain">{{ detailTask.enabled ? '开启' : '已暂停' }}</el-tag>
-            <el-tag v-else-if="detailTask.kind === 'scheduled'" size="small" type="info" effect="plain">固定间隔</el-tag>
+            <!-- 与列表调度列同语义三分支（详情为快照展示，不绑开关） -->
+            <el-tag v-if="detailTask.kind === 'scheduled'" size="small" :type="detailTask.enabled ? 'success' : 'warning'" effect="plain">{{ detailTask.enabled ? '开启' : '已暂停' }}</el-tag>
             <el-tooltip v-else-if="detailTask.kind === 'continuous'" content="常驻循环启停（非调度开关）" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <el-tag size="small" :type="detailTask.loop_on ? 'success' : 'warning'" effect="plain">{{ detailTask.loop_on ? '循环运行中' : '循环已停止' }}</el-tag>
             </el-tooltip>
@@ -254,19 +227,7 @@
           </el-descriptions-item>
           <el-descriptions-item label="下次执行">{{ detailTask.next_run_at || '—' }}</el-descriptions-item>
           <el-descriptions-item label="24h 成功 / 失败">
-            <el-tooltip
-              v-if="detailTask.silent_runs"
-              content="成功轮不落历史与计数=引擎静默策略（防高频噪音）；失败会立即留痕显示"
-              placement="top" :offset="8" :show-after="150" :show-arrow="false"
-            >
-              <span class="tm-silent">
-                <el-tag size="small" type="info" effect="plain">静默轮</el-tag>
-                <span v-if="detailTask.fail_24h > 0" class="tm-bad">{{ detailTask.fail_24h }}</span>
-              </span>
-            </el-tooltip>
-            <template v-else>
-              <span class="tm-ok">{{ detailTask.success_24h }}</span> / <span :class="{ 'tm-bad': detailTask.fail_24h > 0 }">{{ detailTask.fail_24h }}</span>
-            </template>
+            <span class="tm-ok">{{ detailTask.success_24h }}</span> / <span :class="{ 'tm-bad': detailTask.fail_24h > 0 }">{{ detailTask.fail_24h }}</span>
           </el-descriptions-item>
           <el-descriptions-item v-if="detailTask.kind === 'continuous'" label="启动于">{{ fmtTime(detailTask.started_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="开始时间">{{ fmtTime(detailTask.last_run.started_at) || '—' }}</el-descriptions-item>
@@ -346,9 +307,8 @@ interface TaskRunInfo { started_at: string; finished_at: string; duration_ms: nu
 interface TaskInfo {
   id: string; name: string; description?: string; cadence?: string; category: string
   kind: 'scheduled' | 'continuous' | 'queue' | 'info' | 'oneshot'
-  status: string; enabled: boolean; cancellable: boolean; controllable?: boolean; triggerable?: boolean; toggleable?: boolean
+  status: string; enabled: boolean; cancellable: boolean; controllable?: boolean; triggerable?: boolean
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
-  silent_runs?: boolean
   loop_on?: boolean; started_at?: string // 常驻族：循环启停态（调度列开关绑定值）/ 引擎启动时刻
 }
 interface RunRecord {
@@ -441,10 +401,6 @@ const filterCategory = (value: string, row: TaskInfo) => row.category === value
 const statusPieOption = computed<EChartsOption>((): EChartsOption => {
   const counts = new Map<string, number>()
   for (const t of tasks.value) counts.set(t.status, (counts.get(t.status) || 0) + 1)
-  const labels: Record<string, string> = {
-    running: '运行中', idle: '空闲', queued: '排队中', failed: '失败', cancelled: '已取消',
-    disabled: '已暂停', no_runs: '未运行', stopped: '已停止',
-  }
   return {
     tooltip: { trigger: 'item' },
     legend: { bottom: 0, type: 'scroll' },
@@ -455,7 +411,7 @@ const statusPieOption = computed<EChartsOption>((): EChartsOption => {
       itemStyle: { borderRadius: 4, borderColor: '#fff', borderWidth: 2 },
       label: { show: false },
       data: [...counts.entries()].map(([k, v]) => ({
-        name: labels[k] || k, value: v, itemStyle: { color: statusColor[k] || '#4f8cff' },
+        name: statusLabel(k), value: v, itemStyle: { color: statusColor[k] || '#4f8cff' },
       })),
     }],
   }
@@ -498,7 +454,7 @@ const onCancel = async (row: TaskInfo) => {
   fetchTasks()
 }
 const onControl = async (row: TaskInfo, overrideTarget?: boolean) => {
-  // P2-7：目标态从 loop_on 派生（status=running 判据删除——待命/空闲态也可能是循环开启）
+  // P2-7：目标态从 loop_on 派生（status=running 判据删除——空闲态也可能是循环开启）
   const loopOn = overrideTarget ?? !!row.loop_on
   const action = loopOn ? 'stop' : 'start'
   const label = loopOn ? '停止' : '启动'
@@ -599,11 +555,12 @@ onUnmounted(closeLogs)
 
 
 // ===== 文案 =====
+// 状态五态统一（R63 设计重构）：引擎族只呈现 running/idle/failed/stopped/disabled；
+// cert-job 行的 queued 等队列态经 certJobStatusLabel 回退链显示
 const statusLabels: Record<string, string> = {
-  running: '运行中', idle: '空闲', queued: '排队中', failed: '失败', cancelled: '已取消',
-  disabled: '已暂停', no_runs: '未运行', stopped: '已停止',
+  running: '运行中', idle: '空闲', failed: '失败', stopped: '已停止', disabled: '已暂停',
 }
-const statusLabel = (s: string) => statusLabels[s] || s
+const statusLabel = (s: string) => statusLabels[s] || certJobStatusLabel(s as CertJobStatus)
 const kindLabels: Record<string, string> = { scheduled: '定时', continuous: '常驻', queue: '队列', info: '内置', oneshot: '触发' }
 const kindLabel = (k: string) => kindLabels[k] || k
 const kindTag = (k: string): 'primary' | 'success' | 'info' =>
@@ -681,14 +638,11 @@ const fmtDuration = (ms?: number) => {
 .tm-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--tm-c, #9aa0b5); box-shadow: 0 0 6px var(--tm-c, transparent); }
 .tm-status[data-status="running"] { --tm-c: #4f8cff; }
 .tm-status[data-status="failed"] { --tm-c: #f87171; }
-.tm-status[data-status="queued"] { --tm-c: #fbbf24; }
-.tm-status[data-status="cancelled"] { --tm-c: #8b5cf6; }
 .tm-status[data-status="stopped"], .tm-status[data-status="disabled"] { --tm-c: #62687f; }
-.tm-status[data-status="idle"], .tm-status[data-status="no_runs"] { --tm-c: #9aa0b5; }
+.tm-status[data-status="idle"] { --tm-c: #9aa0b5; }
 .tm-dim { color: var(--el-text-color-placeholder); }
 .tm-ok { color: #34d399; font-weight: 600; }
 .tm-bad { color: #f87171; font-weight: 600; }
-.tm-silent { display: inline-flex; align-items: center; gap: 4px; }
 .tm-pagination { display: flex; justify-content: flex-end; margin-top: 12px; }
 
 /* tooltip 提示 */
