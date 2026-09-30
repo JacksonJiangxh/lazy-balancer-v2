@@ -95,10 +95,12 @@ func CollectSystemTasks() []TaskInfo {
 // collectCertJobRows 逐签发任务行：非终态（实时队列内容）+ 24h 内终态
 // （结果可见）；id=cert-job:{jobID}，日志走 /certificates/jobs/{id}/logs。
 func collectCertJobRows() []TaskInfo {
+	// 2026-10-01 用户裁定：行存在即显示（无状态/时间过滤——曾按
+	// 「issued 超 1 天隐藏」窗口过滤致主节点签发行消失）；仅排除从节点
+	// 材料物化行（非签发任务，从节点禁签发）。
 	rows, err := db.DB.Query(`SELECT id, domain, status, COALESCE(message,''), COALESCE(updated_at,created_at)
 		FROM cert_jobs
-		WHERE (status NOT IN ('issued','disabled') OR (status = 'issued' AND COALESCE(updated_at,created_at) > datetime('now','-1 day')))
-		  AND COALESCE(message,'') NOT LIKE '从主节点同步%'
+		WHERE COALESCE(message,'') NOT LIKE '从主节点同步%'
 		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT 20`)
 	if err != nil {
 		return nil
@@ -111,14 +113,16 @@ func collectCertJobRows() []TaskInfo {
 		if err := rows.Scan(&id, &domain, &status, &message, &updatedAt); err != nil {
 			continue
 		}
-		// 终态计数（2026-09-29 用户反馈：签发成功应成功+1）——24h 窗口内
-		// issued=成功 1、failed=失败 1（作业实例行，无周期 runs 概念）。
+		// 终态计数（24h 窗口内 issued=成功 1、failed=失败 1；超窗行显示
+		// 但不计数——Runs24h 语义为近 24 小时）。
 		success, fail := 0, 0
-		switch status {
-		case "issued":
-			success = 1
-		case "failed":
-			fail = 1
+		if t, perr := time.Parse("2006-01-02 15:04:05", updatedAt); perr == nil && time.Since(t) < 24*time.Hour {
+			switch status {
+			case "issued":
+				success = 1
+			case "failed":
+				fail = 1
+			}
 		}
 		ti := TaskInfo{
 			ID:         fmt.Sprintf("cert-job:%d", id),
