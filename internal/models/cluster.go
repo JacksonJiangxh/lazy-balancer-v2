@@ -187,7 +187,7 @@ type ClusterBasicSettings struct {
 	BrandingJSON               string `json:"branding_json,omitempty"`
 	AccessLogJSON              bool   `json:"access_log_json,omitempty"`
 	AccessLogFormat            string `json:"access_log_format,omitempty"`
-	CertJobLogSizeMB           int    `json:"cert_job_log_size_mb"`
+	TaskLogSizeMB              int    `json:"task_log_size_mb"`
 	AuditLogSizeMB             int    `json:"audit_log_size_mb"`
 	RuntimeLogSizeMB           int    `json:"runtime_log_size_mb"`
 	AuditRetentionMonths       int    `json:"audit_retention_months"`

@@ -29,13 +29,13 @@ func TestWriteCRSUpdateLog_singleSinkNoDoubleTee(t *testing.T) {
 	}
 }
 
-// taskLogsHousekeeping 按配置阈值轮转任务日志（R63-P2-1：cert_job_log_size_mb
+// taskLogsHousekeeping 按配置阈值轮转任务日志（R63-P2-1：task_log_size_mb
 // 贯通到 tasks/*.log——本测试为配置消费的行为钉）。
 func TestTaskLogsHousekeeping_rotatesAtConfiguredThreshold(t *testing.T) {
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.DB.Exec("UPDATE global_config SET cert_job_log_size_mb = 1 WHERE id = 1"); err != nil {
+	if _, err := db.DB.Exec("UPDATE global_config SET task_log_size_mb = 1 WHERE id = 1"); err != nil {
 		t.Fatal(err)
 	}
 	certJobLogSizeCachedAt.Store(0)

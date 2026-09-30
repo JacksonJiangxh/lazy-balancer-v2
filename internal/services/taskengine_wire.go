@@ -120,10 +120,11 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "threat", Family: "security", Name: "威胁情报库更新",
 		Description: "每日从 USTC/FireHOL/ET 三源下载恶意 IP 名单，聚合去重后写入威胁库文件并同步从节点——引用名单的安全策略据此拦截",
 		Category:    "安全防护", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
-		Singleton:  true, // P3-7：任务监控双击窗口防假 failed 行
-		Cadence:    "排程槽（可配置星期/时刻）",
-		IntervalFn: func() time.Duration { return time.Minute },
-		EnabledFn:  func() bool { return ThreatAutoUpdateEnabled() },
+		Singleton:    true, // P3-7：任务监控双击窗口防假 failed 行
+		SilentProbes: true, // 探测轮不落库——真实工作 SignalledWork 后引擎补插
+		Cadence:      "排程槽（可配置星期/时刻）",
+		IntervalFn:   func() time.Duration { return time.Minute },
+		EnabledFn:    func() bool { return ThreatAutoUpdateEnabled() },
 		NextSlotFn: func() string {
 			if n := earliestThreatNextUpdate(); n != "" {
 				return localDisplayUTC(n)
@@ -171,9 +172,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "crs", Family: "security", Name: "CRS 规则库更新",
 		Description: "检查并更新 OWASP CoreRuleSet 规则集到最新版本（保留用户 overrides），供 WAF 拦截模式消费",
 		Category:    "安全防护", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
-		Singleton:  true,
-		Cadence:    "排程槽（可配置）",
-		IntervalFn: func() time.Duration { return time.Minute },
+		Singleton:    true,
+		SilentProbes: true, // 探测轮不落库——真实工作 SignalledWork 后引擎补插
+		Cadence:      "排程槽（可配置）",
+		IntervalFn:   func() time.Duration { return time.Minute },
 		EnabledFn: func() bool {
 			var en int
 			if err := db.DB.QueryRow("SELECT COALESCE(auto_update,1) FROM security_crs_version WHERE id=1").Scan(&en); err != nil {
@@ -250,9 +252,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "ip2region", Family: "security", Name: "IP2Region 地理库更新",
 		Description: "更新 IP 地理位置离线库（xdb），供 GeoIP 地域拦截与归属地展示使用",
 		Category:    "安全防护", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
-		Singleton:  true,
-		Cadence:    "排程槽（可配置）",
-		IntervalFn: func() time.Duration { return time.Minute },
+		Singleton:    true,
+		SilentProbes: true, // 探测轮不落库——真实工作 SignalledWork 后引擎补插
+		Cadence:      "排程槽（可配置）",
+		IntervalFn:   func() time.Duration { return time.Minute },
 		EnabledFn: func() bool {
 			var en int
 			if err := db.DB.QueryRow("SELECT COALESCE(auto_update,1) FROM security_ip2region_version WHERE id=1").Scan(&en); err != nil {
@@ -363,13 +366,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 				return nil // 已执行
 			}
 			rc.SignalledWork()
-			runID := taskengine.RecordRunStart("auto-backup", "backup", "auto")
-			execErr := exec("schedule", "system", runID)
-			status, msg := "success", ""
-			if execErr != nil {
-				status, msg = "failed", execErr.Error()
-			}
-			taskengine.RecordRunFinish(runID, status, time.Since(time.Now()).Milliseconds(), msg)
+			// R64-P1-2：引擎统一落 task_runs（SilentProbes+SignalledWork 后置插行）
+			execErr := exec("schedule", "system", 0)
 			if _, err := db.DB.Exec("UPDATE global_config SET auto_backup_last_run=? WHERE id=1", dueSlot.Format(time.RFC3339)); err != nil {
 				Logf("warn", "自动备份：更新 auto_backup_last_run 失败: %v", err)
 			}
@@ -393,6 +391,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "security-events-retention", Family: "system", Name: "安全事件保留清理",
 		Description: "按保留期配置删除 metrics 库中过期的安全事件记录",
 		Category:    "系统", Kind: taskengine.KindContinuous,
+		EnabledFn: func() bool { return taskEngine.IsRunning("security-events-retention") }, // R64-P2-2：读回循环态
 		ToggleFn: func(enabled bool) error {
 			if enabled {
 				taskEngine.StartLoop("security-events-retention")
@@ -445,6 +444,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "cert-renewal-scan", Family: "certificates", Name: "证书续期扫描",
 		Description: "扫描全部证书配置的到期时间，临期证书自动入队续签",
 		Category:    "证书", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
+		EnabledFn: func() bool { return taskEngine.IsRunning("cert-renewal-scan") }, // R64-P2-2：读回循环态
 		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关
 			if enabled {
 				taskEngine.StartLoop("cert-renewal-scan")
@@ -461,6 +461,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "cert-reconcile", Family: "certificates", Name: "证书状态对账",
 		Description: "核对证书文件与数据库状态一致性，修复中断任务残留的中间态",
 		Category:    "证书", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
+		EnabledFn: func() bool { return taskEngine.IsRunning("cert-reconcile") }, // R64-P2-2：读回循环态
 		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关
 			if enabled {
 				taskEngine.StartLoop("cert-reconcile")
@@ -478,6 +479,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Description: "处理手工触发或重试的证书任务",
 		Category:    "证书", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
 		RecordFailuresOnly: true,
+		EnabledFn:          func() bool { return taskEngine.IsRunning("cert-manual-poll") }, // R64-P2-2：读回循环态
 		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关
 			if enabled {
 				taskEngine.StartLoop("cert-manual-poll")
@@ -494,7 +496,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID: "cert-waiting-ca", Family: "certificates", Name: "CA 等待轮询",
 		Description: "证书任务在途时的兜底补扫：CA 冷却到期重排、滞留 queued 重入队、断链部署重试重建。门控——有非终态任务才扫描，全部完成即静默；可经调度开关停用",
 		Category:    "证书", Kind: taskengine.KindContinuous, RunsOn: taskengine.RoleMasterOnly,
-		RecordFailuresOnly: true, // 30s 补扫成功静默——仅断链/失败留痕+boot 启动计数
+		RecordFailuresOnly: true,                                                           // 30s 补扫成功静默——仅断链/失败留痕+boot 启动计数
+		EnabledFn:          func() bool { return taskEngine.IsRunning("cert-waiting-ca") }, // R64-P2-2：读回循环态
 		ToggleFn: func(enabled bool) error { // R63：定时族统一调度开关（启停 30s 扫描）
 			if enabled {
 				taskEngine.StartLoop("cert-waiting-ca")

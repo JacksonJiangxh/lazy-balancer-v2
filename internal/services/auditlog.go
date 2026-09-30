@@ -54,7 +54,7 @@ var ConfigFieldSections = map[string]string{
 	"access_log_format":     "Caddy配置",
 
 	"log_level":              "基础设置",
-	"cert_job_log_size_mb":   "基础设置",
+	"task_log_size_mb":       "基础设置",
 	"audit_log_size_mb":      "基础设置",
 	"runtime_log_size_mb":    "基础设置",
 	"audit_retention_months": "基础设置",

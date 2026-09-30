@@ -60,7 +60,7 @@ func sanitizePathComponent(value string) string {
 	return string(out)
 }
 
-// Round 35 I-17: 缓存 cert_job_log_size_mb 配置，避免每条日志写入都查 DB。
+// Round 35 I-17: 缓存 task_log_size_mb 配置，避免每条日志写入都查 DB。
 // 缓存有效期 5 分钟，过期后下一次调用触发刷新。
 var (
 	certJobLogSizeCached     atomic.Int64
@@ -69,7 +69,7 @@ var (
 	certJobLogSizeRefreshMu  sync.Mutex
 )
 
-func getCertJobLogSizeBytes() int64 {
+func getTaskLogSizeBytes() int64 {
 	now := time.Now().UnixNano()
 	cachedAt := certJobLogSizeCachedAt.Load()
 	if cachedAt != 0 && now-cachedAt < certJobLogSizeCacheTTLNs {
@@ -82,7 +82,7 @@ func getCertJobLogSizeBytes() int64 {
 		return certJobLogSizeCached.Load()
 	}
 	var sizeMB int
-	if err := db.DB.QueryRow("SELECT COALESCE(cert_job_log_size_mb, 10) FROM global_config WHERE id = 1").Scan(&sizeMB); err != nil {
+	if err := db.DB.QueryRow("SELECT COALESCE(task_log_size_mb, 10) FROM global_config WHERE id = 1").Scan(&sizeMB); err != nil {
 		// B431-1(第 43 轮):读取失败静默降级 10MB 曾无痕——留 warn 含 err
 		// 便于排查配置漂移(与下方 sizeMB<=0 的防御同口径)。
 		Logf("warn", "读取证书任务日志大小配置失败,按 10MB 降级: %v", err)
@@ -105,7 +105,7 @@ func (l *CertJobFileLogger) write(level, stage, message string) {
 
 	path := CertJobLogPath(l.ruleID)
 
-	if info, err := os.Stat(path); err == nil && info.Size() >= getCertJobLogSizeBytes() {
+	if info, err := os.Stat(path); err == nil && info.Size() >= getTaskLogSizeBytes() {
 		// 轮转失败不再吞没（C-11）：留痕告警后继续追加，维持原写入可用性。
 		if err := rotateCertJobLogFiles(path); err != nil {
 			certJobLogWarnf("cert job log: rotate %s failed: %v", path, err)

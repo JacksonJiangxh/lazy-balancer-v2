@@ -52,8 +52,9 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发（探测型/专属端点/镜像族）"})
 					return
 				}
-				// R63-P2-7：单飞预检——已在跑立即 409（Trigger 异步 goroutine 曾吞此错）
-				if te.IsRunning(id) {
+				// R64-P1-3：单飞预检改用 Singleton 声明（IsRunning 对 Continuous 族
+				// 恒 true——循环活着≠任务在跑，曾致常驻族手动触发恒 409）
+				if m.SingleFlight {
 					c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务运行中，请稍后重试"})
 					return
 				}

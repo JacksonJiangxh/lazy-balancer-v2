@@ -192,7 +192,7 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 		       COALESCE(proxy_flush_interval,0) as proxy_flush_interval,
 		       COALESCE(proxy_stream_close_delay,0) as proxy_stream_close_delay,
 		       COALESCE(server_tokens_hidden,FALSE) as server_tokens_hidden,
-		       COALESCE(cert_job_log_size_mb,10) as cert_job_log_size_mb,
+		       COALESCE(task_log_size_mb,10) as task_log_size_mb,
 		       COALESCE(audit_log_size_mb,10) as audit_log_size_mb,
 		       COALESCE(runtime_log_size_mb,100) as runtime_log_size_mb,
 		       COALESCE(access_log_json,TRUE) as access_log_json,
@@ -218,7 +218,7 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 		&cfg.CaddyLogLevel, &cfg.CaddyLogSizeMB,
 		&cfg.RequestBodyMaxSizeMB, &cfg.HTTPReadTimeout, &cfg.HTTPWriteTimeout, &cfg.HTTPIdleTimeout,
 		&cfg.UpstreamKeepaliveTimeout, &cfg.ProxyDialTimeout, &cfg.ProxyResponseHeaderTimeout, &cfg.ProxyReadTimeout, &cfg.ProxyWriteTimeout, &cfg.ProxyStreamTimeout, &cfg.ProxyFlushInterval, &cfg.ProxyStreamCloseDelay,
-		&cfg.ServerTokensHidden, &cfg.CertJobLogSizeMB, &cfg.AuditLogSizeMB, &cfg.RuntimeLogSizeMB, &cfg.AccessLogJSON, &cfg.AccessLogFormat, &cfg.AuditRetentionMonths, &cfg.JWTExpireMinutes, &cfg.Timezone, &cfg.GitHubProxyURL, &cfg.GitHubToken, &cfg.MFAWriteGuard, &cfg.MFALockoutEnabled,
+		&cfg.ServerTokensHidden, &cfg.TaskLogSizeMB, &cfg.AuditLogSizeMB, &cfg.RuntimeLogSizeMB, &cfg.AccessLogJSON, &cfg.AccessLogFormat, &cfg.AuditRetentionMonths, &cfg.JWTExpireMinutes, &cfg.Timezone, &cfg.GitHubProxyURL, &cfg.GitHubToken, &cfg.MFAWriteGuard, &cfg.MFALockoutEnabled,
 		&cfg.TrustedProxyEnabled, &cfg.TrustedProxyRanges, &cfg.TrustedProxyHeaders, &cfg.TrustedProxyStrict,
 		&cfg.IsMaster, &cfg.MasterURL, &cfg.SyncInterval, &cfg.LastSync, &cfg.UpdatedAt)
 
@@ -422,7 +422,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 	// LB42-4:与 caddy_log_size_mb(SYS41-7,100-10240)同族补上限——此前仅 >0
 	// 下限,天文值落库使轮转实效、日志无限增长。2026-09-25 用户裁定：上限收
 	// 窄为 1024（原 10240 过宽），与 UI :max=1024 同口径。
-	if req.CertJobLogSizeMB != nil && (*req.CertJobLogSizeMB <= 0 || *req.CertJobLogSizeMB > 1024) {
+	if req.TaskLogSizeMB != nil && (*req.TaskLogSizeMB <= 0 || *req.TaskLogSizeMB > 1024) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "任务日志大小需在 1-1024MB 之间"})
 		return
 	}
@@ -548,7 +548,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 				proxy_flush_interval = COALESCE(?, proxy_flush_interval),
 				proxy_stream_close_delay = COALESCE(?, proxy_stream_close_delay),
 				server_tokens_hidden = COALESCE(?, server_tokens_hidden),
-				cert_job_log_size_mb = COALESCE(?, cert_job_log_size_mb),
+				task_log_size_mb = COALESCE(?, task_log_size_mb),
 				audit_log_size_mb = COALESCE(?, audit_log_size_mb),
 				runtime_log_size_mb = COALESCE(?, runtime_log_size_mb),
 				access_log_json = COALESCE(?, access_log_json),
@@ -570,7 +570,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		req.CaddyLogLevel, req.CaddyLogSizeMB,
 		req.RequestBodyMaxSizeMB, req.HTTPReadTimeout, req.HTTPWriteTimeout, req.HTTPIdleTimeout,
 		req.UpstreamKeepaliveTimeout, req.ProxyDialTimeout, req.ProxyResponseHeaderTimeout, req.ProxyReadTimeout, req.ProxyWriteTimeout, req.ProxyStreamTimeout, req.ProxyFlushInterval, req.ProxyStreamCloseDelay,
-		req.ServerTokensHidden, req.CertJobLogSizeMB, req.AuditLogSizeMB, req.RuntimeLogSizeMB, req.AccessLogJSON, req.AccessLogFormat, req.AccessLogFormat, req.AuditRetentionMonths, req.JWTExpireMinutes, req.Timezone, req.GitHubProxyURL, req.GitHubToken, req.GitHubToken, req.MFAWriteGuard, req.MFALockoutEnabled,
+		req.ServerTokensHidden, req.TaskLogSizeMB, req.AuditLogSizeMB, req.RuntimeLogSizeMB, req.AccessLogJSON, req.AccessLogFormat, req.AccessLogFormat, req.AuditRetentionMonths, req.JWTExpireMinutes, req.Timezone, req.GitHubProxyURL, req.GitHubToken, req.GitHubToken, req.MFAWriteGuard, req.MFALockoutEnabled,
 		req.TrustedProxyEnabled, req.TrustedProxyRanges, req.TrustedProxyHeaders, req.TrustedProxyStrict)
 	if err != nil {
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("配置写入数据库失败", err.Error(), services.AuditResultPart("failure")))

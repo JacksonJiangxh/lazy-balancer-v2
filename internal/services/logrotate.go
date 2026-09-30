@@ -272,9 +272,9 @@ func taskLogsHousekeeping(logFile string) {
 		}
 	}
 	cutoff := time.Now().AddDate(0, -months, 0)
-	// R63-P2-1：任务日志大小遵循「任务日志大小」配置项（cert_job_log_size_mb，
+	// R63-P2-1：任务日志大小遵循「任务日志大小」配置项（task_log_size_mb，
 	// 默认 10MB——曾硬编码 5MB 与配置/统计三方分裂）。
-	sizeCap := getCertJobLogSizeBytes()
+	sizeCap := getTaskLogSizeBytes()
 	for _, e := range entries {
 		if e.IsDir() {
 			continue

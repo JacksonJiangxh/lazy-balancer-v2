@@ -232,7 +232,7 @@ type GlobalConfig struct {
 	ProxyFlushInterval         int    `json:"proxy_flush_interval"`
 	ProxyStreamCloseDelay      int    `json:"proxy_stream_close_delay"`
 	ServerTokensHidden         bool   `json:"server_tokens_hidden"`
-	CertJobLogSizeMB           int    `json:"cert_job_log_size_mb"`
+	TaskLogSizeMB              int    `json:"task_log_size_mb"`
 	AuditLogSizeMB             int    `json:"audit_log_size_mb"`
 	RuntimeLogSizeMB           int    `json:"runtime_log_size_mb"`
 	AccessLogJSON              bool   `json:"access_log_json"`
@@ -554,7 +554,7 @@ type UpdateConfigRequest struct {
 	ProxyFlushInterval         *int    `json:"proxy_flush_interval"`
 	ProxyStreamCloseDelay      *int    `json:"proxy_stream_close_delay"`
 	ServerTokensHidden         *bool   `json:"server_tokens_hidden"`
-	CertJobLogSizeMB           *int    `json:"cert_job_log_size_mb"`
+	TaskLogSizeMB              *int    `json:"task_log_size_mb"`
 	AuditLogSizeMB             *int    `json:"audit_log_size_mb"`
 	RuntimeLogSizeMB           *int    `json:"runtime_log_size_mb"`
 	AccessLogJSON              *bool   `json:"access_log_json"`

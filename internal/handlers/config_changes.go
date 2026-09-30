@@ -33,7 +33,7 @@ type configSnapshot struct {
 	ServerTokensHidden         bool
 	AccessLogJSON              bool
 	AccessLogFormat            string
-	CertJobLogSizeMB           int
+	TaskLogSizeMB              int
 	AuditLogSizeMB             int
 	RuntimeLogSizeMB           int
 	AuditRetentionMonths       int
@@ -70,7 +70,7 @@ func loadConfigSnapshot() (configSnapshot, error) {
 		COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 		COALESCE(server_tokens_hidden,FALSE),
 		COALESCE(access_log_json,TRUE), COALESCE(access_log_format,''),
-		COALESCE(cert_job_log_size_mb,10), COALESCE(audit_log_size_mb,10), COALESCE(runtime_log_size_mb,100), COALESCE(audit_retention_months,3),
+		COALESCE(task_log_size_mb,10), COALESCE(audit_log_size_mb,10), COALESCE(runtime_log_size_mb,100), COALESCE(audit_retention_months,3),
 		COALESCE(jwt_expire_minutes,20),
 		COALESCE(github_proxy_url,'https://v4.gh-proxy.org/'),
 		COALESCE(github_token,''),
@@ -87,7 +87,7 @@ func loadConfigSnapshot() (configSnapshot, error) {
 		&old.UpstreamKeepaliveTimeout, &old.ProxyDialTimeout, &old.ProxyResponseHeaderTimeout, &old.ProxyReadTimeout, &old.ProxyWriteTimeout, &old.ProxyStreamTimeout, &old.ProxyFlushInterval, &old.ProxyStreamCloseDelay,
 		&old.ServerTokensHidden,
 		&old.AccessLogJSON, &old.AccessLogFormat,
-		&old.CertJobLogSizeMB, &old.AuditLogSizeMB, &old.RuntimeLogSizeMB, &old.AuditRetentionMonths, &old.JWTExpireMinutes,
+		&old.TaskLogSizeMB, &old.AuditLogSizeMB, &old.RuntimeLogSizeMB, &old.AuditRetentionMonths, &old.JWTExpireMinutes,
 		&old.GitHubProxyURL,
 		&old.GitHubToken,
 		&old.MFAWriteGuard, &old.MFALockoutEnabled,
@@ -133,7 +133,7 @@ func planConfigChanges(req models.UpdateConfigRequest, old configSnapshot) confi
 	add("trusted_proxy_ranges", "受信代理网段", req.TrustedProxyRanges != nil && *req.TrustedProxyRanges != old.TrustedProxyRanges)
 	add("trusted_proxy_headers", "受信代理请求头", req.TrustedProxyHeaders != nil && *req.TrustedProxyHeaders != old.TrustedProxyHeaders)
 	add("trusted_proxy_strict", "受信代理严格模式", req.TrustedProxyStrict != nil && *req.TrustedProxyStrict != old.TrustedProxyStrict)
-	add("cert_job_log_size_mb", "任务日志大小", req.CertJobLogSizeMB != nil && *req.CertJobLogSizeMB != old.CertJobLogSizeMB)
+	add("task_log_size_mb", "任务日志大小", req.TaskLogSizeMB != nil && *req.TaskLogSizeMB != old.TaskLogSizeMB)
 	add("audit_log_size_mb", "审计日志大小", req.AuditLogSizeMB != nil && *req.AuditLogSizeMB != old.AuditLogSizeMB)
 	add("runtime_log_size_mb", "运行日志大小", req.RuntimeLogSizeMB != nil && *req.RuntimeLogSizeMB != old.RuntimeLogSizeMB)
 	add("caddy_log_level", "Caddy日志级别", req.CaddyLogLevel != nil && *req.CaddyLogLevel != old.CaddyLogLevel)

@@ -9,7 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// LB42-4(第 42 轮审计):cert_job_log_size_mb 与 runtime_log_size_mb 仅有 >0
+// LB42-4(第 42 轮审计):task_log_size_mb 与 runtime_log_size_mb 仅有 >0
 // 下限,无上限——天文值落库使轮转实效、日志无限增长(caddy_log_size_mb 已在
 // SYS41-7 补 100-10240)。补 1-10240 上限;logstats 消费侧不改。
 // (2026-09-25 用户裁定：上限由 10240 收窄为 1024——10240 过宽、1024 合理,
@@ -22,9 +22,9 @@ func TestUpdateConfig_rejectsExcessiveLogSizeMB(t *testing.T) {
 	router.PUT("/config", handler.UpdateConfig)
 
 	for _, body := range []string{
-		`{"source":"basic","cert_job_log_size_mb":99999}`,
+		`{"source":"basic","task_log_size_mb":99999}`,
 		`{"source":"basic","runtime_log_size_mb":99999}`,
-		`{"source":"basic","cert_job_log_size_mb":1025}`,
+		`{"source":"basic","task_log_size_mb":1025}`,
 		`{"source":"basic","runtime_log_size_mb":1025}`,
 	} {
 		// When
@@ -41,9 +41,9 @@ func TestUpdateConfig_rejectsExcessiveLogSizeMB(t *testing.T) {
 
 	// 回归:边界 1024 与常规值仍 200;0 保持既有 400(下限不变)
 	for _, body := range []string{
-		`{"source":"basic","cert_job_log_size_mb":1024}`,
+		`{"source":"basic","task_log_size_mb":1024}`,
 		`{"source":"basic","runtime_log_size_mb":1024}`,
-		`{"source":"basic","cert_job_log_size_mb":10}`,
+		`{"source":"basic","task_log_size_mb":10}`,
 	} {
 		request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(body))
 		request.Header.Set("Content-Type", "application/json")
@@ -54,7 +54,7 @@ func TestUpdateConfig_rejectsExcessiveLogSizeMB(t *testing.T) {
 		}
 	}
 	for _, body := range []string{
-		`{"source":"basic","cert_job_log_size_mb":0}`,
+		`{"source":"basic","task_log_size_mb":0}`,
 		`{"source":"basic","runtime_log_size_mb":-1}`,
 	} {
 		request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(body))

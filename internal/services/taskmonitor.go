@@ -7,6 +7,7 @@ package services
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -53,6 +54,7 @@ type TaskInfo struct {
 	Toggleable   bool         `json:"toggleable"`           // 调度开关可暂停/恢复（ToggleFn 声明族——U1-P4-2 元数据化）
 	SilentRuns   bool         `json:"silent_runs"`          // 成功轮静默（RecordFailuresOnly）——计数位显示「静默轮」而非 0/0
 	StartedAt    string       `json:"started_at,omitempty"` // 常驻族启动时刻（引擎启动）；定时/队列族空
+	LogSizeBytes int64        `json:"log_size_bytes"`       // 本任务日志文件大小（字节）
 	LoopOn       bool         `json:"loop_on"`              // 常驻循环当前启用态（调度列常驻开关绑定值）
 	LastRun      *TaskRunInfo `json:"last_run,omitempty"`
 	NextRunAt    string       `json:"next_run_at,omitempty"`
@@ -219,6 +221,10 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 					ti.NextRunAt = t.Add(time.Duration(m.IntervalSec) * time.Second).Format("2006-01-02 15:04:05")
 				}
 			}
+		}
+		// R64：每任务日志文件大小（tasks/{id}.log stat）
+		if info, err := os.Stat(taskengine.TaskLogPath(m.ID)); err == nil {
+			ti.LogSizeBytes = info.Size()
 		}
 		st := te.Stats24h(m.ID)
 		ti.Runs24h, ti.Success24h, ti.Fail24h = st.Runs, st.Success, st.Fail
