@@ -36,24 +36,36 @@ func TestCollectCertJobRows_TerminalCounts(t *testing.T) {
 	}
 }
 
-// Given 引擎启动并注册常驻族。
+// Given 引擎启动并按 v2.0 四类型注册。
 // When CollectSystemTasks 视图聚合。
-// Then 常驻族 started_at 非空（引擎启动时刻）且 loop_on=true（调度列常驻开关联动值）；
-// 定时族 started_at 为空。
+// Then 常驻族（Daemon）started_at 非空且 loop_on=true；循环族（Periodic）
+// loop_on=true 但 started_at 为空；定时族（Scheduled）started_at 为空；
+// cert-waiting-ca 默认 loop_on=false（调度关闭）。
 func TestCollectSystemTasks_ContinuousStartedAtAndLoopOn(t *testing.T) {
 	te := newWireTestEngine(t)
 	got := map[string]TaskInfo{}
 	for _, ti := range collectEngineFamilies(te) {
 		got[ti.ID] = ti
 	}
+	for _, id := range []string{"security-events-ingestion", "cert-issuance", "cluster-sync"} {
+		if got[id].StartedAt == "" {
+			t.Fatalf("%s（常驻）started_at 应非空", id)
+		}
+		if !got[id].LoopOn {
+			t.Fatalf("%s（常驻）loop_on 应 true（StartLoop 默认开启）", id)
+		}
+	}
 	w := got["config-watchdog"]
-	if w.StartedAt == "" {
-		t.Fatal("常驻族 started_at 应非空（引擎启动时刻）")
+	if w.StartedAt != "" {
+		t.Fatal("循环族 started_at 应为空（仅常驻族有启动时刻）")
 	}
 	if !w.LoopOn {
-		t.Fatal("常驻族 loop_on 应 true（StartLoop 默认开启）")
+		t.Fatal("循环族 loop_on 应 true")
 	}
 	if got["threat"].StartedAt != "" {
 		t.Fatal("定时族 started_at 应为空")
+	}
+	if got["cert-waiting-ca"].LoopOn {
+		t.Fatal("cert-waiting-ca 默认调度应关闭（loop_on=false）")
 	}
 }
