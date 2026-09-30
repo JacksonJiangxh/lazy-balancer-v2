@@ -184,7 +184,7 @@
             <el-button
               v-if="row.controllable"
               link type="warning" size="small"
-              :disabled="!isAdmin"
+              :disabled="!canOperate"
               @click="onRestart(row)"
             >重启</el-button>
             <el-button link type="info" size="small" @click="openLogs(row)">日志</el-button>

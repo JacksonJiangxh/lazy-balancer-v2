@@ -166,6 +166,35 @@ func (e *Engine) SetRole(isMaster bool) {
 	e.roleMu.Lock()
 	e.role = isMaster
 	e.roleMu.Unlock()
+	// Daemon 生命周期随角色翻转：master-only daemon 在 demote 时停止、
+	// promote 时拉起（loopEnabled 保持用户调度开关语义——重新启用即恢复）
+	e.mu.RLock()
+	daemons := make([]*registration, 0, len(e.regs))
+	for id, r := range e.regs {
+		_ = id
+		if r.desc.Kind == KindDaemon {
+			daemons = append(daemons, r)
+		}
+	}
+	e.mu.RUnlock()
+	for _, r := range daemons {
+		allowed := e.roleAllows(r.desc.RunsOn)
+		r.mu.Lock()
+		loopOn, running := r.loopEnabled, r.running
+		r.mu.Unlock()
+		if loopOn && allowed && !running {
+			e.startDaemon(r.desc.ID, r)
+		} else if running && !allowed {
+			// 角色不符：仅取消 Run（loopEnabled 保留——promote 后自动拉起，
+			// 用户调度开关语义不被角色翻转隐式改写）
+			r.mu.Lock()
+			c := r.cancel
+			r.mu.Unlock()
+			if c != nil {
+				c()
+			}
+		}
+	}
 }
 
 func (e *Engine) isMaster() bool {
@@ -259,8 +288,9 @@ func (e *Engine) StartLoop(id string) {
 	r.lastCheck = time.Time{}
 	r.mu.Unlock()
 
-	// Daemon：启动自管理循环（Run 阻塞直到取消）
-	if r.desc.Kind == KindDaemon && !r.running {
+	// Daemon：启动自管理循环（Run 阻塞直到取消）——角色门内才启动
+	//（master-only daemon 在从节点只挂 loopEnabled，promote 时由 SetRole 拉起）
+	if r.desc.Kind == KindDaemon && !r.running && e.roleAllows(r.desc.RunsOn) {
 		e.startDaemon(id, r)
 	}
 }
@@ -614,22 +644,24 @@ type TaskMeta struct {
 	Toggleable   bool   `json:"toggleable"`
 	ToggleName   string `json:"toggle_name"`
 	LoopOn       bool   `json:"loop_on"`
+	Running      bool   `json:"running"` // Daemon：Run 实际存活（角色门/停止后=false）
 	CanTrigger   bool   `json:"can_trigger"`
 }
 
 func (e *Engine) DescribeAll() []TaskMeta {
 	type snap struct {
-		id     string
-		desc   Descriptor
-		loopOn bool
+		id      string
+		desc    Descriptor
+		loopOn  bool
+		running bool
 	}
 	e.mu.RLock()
 	snaps := make([]snap, 0, len(e.regs))
 	for id, r := range e.regs {
 		r.mu.Lock()
-		loopOn := r.loopEnabled
+		loopOn, running := r.loopEnabled, r.running
 		r.mu.Unlock()
-		snaps = append(snaps, snap{id: id, desc: r.desc, loopOn: loopOn})
+		snaps = append(snaps, snap{id: id, desc: r.desc, loopOn: loopOn, running: running})
 	}
 	e.mu.RUnlock()
 
@@ -643,6 +675,7 @@ func (e *Engine) DescribeAll() []TaskMeta {
 			Toggleable:   s.desc.ToggleFn != nil,
 			ToggleName:   s.desc.ToggleName,
 			LoopOn:       s.loopOn,
+			Running:      s.running,
 			Enabled:      true,
 			Controllable: s.desc.Kind == KindDaemon, // 常驻族可启停
 		}
