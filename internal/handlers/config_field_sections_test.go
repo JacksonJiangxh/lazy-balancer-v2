@@ -34,7 +34,7 @@ var configChangeFieldTokens = []string{
 	"trusted_proxy_ranges",
 	"trusted_proxy_headers",
 	"trusted_proxy_strict",
-	"cert_job_log_size_mb",
+	"task_log_size_mb",
 	"audit_log_size_mb",
 	"runtime_log_size_mb",
 	"caddy_log_level",

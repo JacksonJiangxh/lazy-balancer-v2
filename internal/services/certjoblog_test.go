@@ -12,7 +12,7 @@ import (
 )
 
 // useCertJobLogTestEnv 重定向日志目录到临时目录并直接注入大小阈值（绕过
-// cert_job_log_size_mb 的 DB 读取与 5 分钟缓存），返回后恢复原状。
+// task_log_size_mb 的 DB 读取与 5 分钟缓存），返回后恢复原状。
 func useCertJobLogTestEnv(t *testing.T, thresholdBytes int64) {
 	t.Helper()
 	oldDir := certJobLogDir
