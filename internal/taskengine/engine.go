@@ -335,6 +335,9 @@ func (e *Engine) IsRunning(id string) bool {
 func (e *Engine) startDaemon(id string, r *registration) {
 	runID := globalInsertRun(id, r.desc.Family, "auto")
 	taskLogAppend(id, "[start] 常驻启动")
+	// 2026-10-01 用户裁定：启动即记 success（启动是既成事实——成功列体现
+	// 启动计数；原实现落 running 终态随停止更新，运行期成功列恒 0）
+	e.finishRun(runID, "success", 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	r.mu.Lock()
@@ -345,7 +348,6 @@ func (e *Engine) startDaemon(id string, r *registration) {
 	start := time.Now()
 	go func() {
 		err := r.desc.Run(RunContext{Ctx: ctx, Trigger: "auto", RunID: runID})
-		status := terminalStatus(ctx, err)
 		dur := time.Since(start).Milliseconds()
 
 		r.mu.Lock()
@@ -353,9 +355,14 @@ func (e *Engine) startDaemon(id string, r *registration) {
 		r.cancel = nil
 		r.mu.Unlock()
 
-		msg := fmt.Sprintf("[done] %s 耗时=%dms 触发=auto", status, dur)
-		taskLogAppend(id, msg)
-		e.finishRun(runID, status, dur)
+		if err != nil && ctx.Err() == nil {
+			// 异常退出（非取消）：补记 failed 行（真实时长与错误）
+			failID := globalInsertRunAt(id, r.desc.Family, "auto", start.In(engineLocPtr()).Format("2006-01-02 15:04:05"))
+			e.finishRun(failID, "failed", dur)
+			taskLogAppend(id, fmt.Sprintf("[done] failed 耗时=%dms 触发=auto 错误=%s", dur, err.Error()))
+			return
+		}
+		taskLogAppend(id, fmt.Sprintf("[done] stopped 耗时=%dms 触发=auto（取消/正常退出）", dur))
 	}()
 }
 

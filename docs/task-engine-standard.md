@@ -72,6 +72,10 @@ SetRole（promote/demote）自动拉起/停止角色不符的 daemon（loopEnabl
 再 promote 自动恢复）。显示用实际运行态（TaskMeta.Running）：Run 存活=运行中；
 调度开但角色不符=空闲；调度关=已停止。
 
+**Daemon 启动计数（2026-10-01 用户裁定）**：启动即记 success 1 行（启动是既成
+事实——成功列体现启动计数）；异常退出（Run 返回错误且非 ctx 取消）补记
+failed 行（真实时长与错误）；取消/正常停止不增行。
+
 ### 循环（8）——固定间隔，每轮独立执行+记录
 
 | 任务 | 间隔 |
@@ -139,7 +143,7 @@ SetRole（promote/demote）自动拉起/停止角色不符的 daemon（loopEnabl
 |---|---|---|
 | 定时槽间隙 | 0 行 | 0 行 |
 | 定时执行 | 1 行（引擎预插 running→终态） | [done]+业务 |
-| 常驻生命周期 | 1 行（boot 插入，停止时更新终态） | [start]+[done] |
+| 常驻生命周期 | 启动即记 success；异常退出补 failed 行 | [start]；停止 [done stopped]；失败 [done failed] |
 | 循环每轮 | 1 行 | [done]+业务 |
 | 触发执行 | 1 行 | [start]/[done]+业务 |
 | 手动触发 | 1 行（trigger=manual） | 同上 |
