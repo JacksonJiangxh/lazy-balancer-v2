@@ -119,12 +119,6 @@ func (m *CRSUpdateManager) SetMasterRole(isMaster bool) {
 }
 
 // CRSSchedulerTickOnce 单轮调度探测（引擎 1min 节拍调用）。
-func CRSSchedulerTickOnce() {
-	if m := GetCRSUpdateManager(); m != nil {
-		m.schedulerTick(time.Now().UTC(), make(chan struct{}))
-	}
-}
-
 func (m *CRSUpdateManager) schedulerTick(now time.Time, stop <-chan struct{}) {
 	var isMaster bool
 	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {

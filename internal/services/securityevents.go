@@ -1461,6 +1461,10 @@ func SecurityEventsPollOnce() {
 	if err := securityEventsPollState.tailer.securityEventsTick(); err != nil {
 		securityEventsPollState.tailer.securityEventsRateLimitedWarn(err)
 	}
+	if securityEventsPollState.tailer.lastIngested > 0 {
+		TaskLogf("security-events-ingestion", "ingest", "摄取 %d 条安全事件", securityEventsPollState.tailer.lastIngested)
+		securityEventsPollState.tailer.lastIngested = 0
+	}
 	rotateAuditLogIfNeeded()
 }
 

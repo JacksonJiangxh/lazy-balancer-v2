@@ -66,12 +66,6 @@ func (m *IP2RegionUpdateManager) SetMasterRole(isMaster bool) {
 }
 
 // IP2RegionSchedulerTickOnce 单轮调度探测（引擎 1min 节拍调用）。
-func IP2RegionSchedulerTickOnce() {
-	if m := GetIP2RegionUpdateManager(); m != nil {
-		m.schedulerTick(time.Now().UTC(), make(chan struct{}))
-	}
-}
-
 func (m *IP2RegionUpdateManager) schedulerTick(now time.Time, stop <-chan struct{}) {
 	var isMaster bool
 	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
