@@ -11,7 +11,7 @@ waf/
 # 自动备份产物(含私钥与凭证明文,绝不入镜像)
 backup*/
 bin/
-server
+/server
 ui/
 .git/
 .gitignore

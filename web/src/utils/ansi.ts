@@ -1,6 +1,5 @@
 import { escapeHtml } from '@/utils/escape'
 
-export { escapeHtml }
 /**
  * Escape HTML special characters.
  */

@@ -11,7 +11,7 @@ import (
 )
 
 // mfaTestEnv 建临时库并注入时间可控环境。
-func mfaTestEnv(t *testing.T) *int {
+func mfaTestEnv(t *testing.T) {
 	t.Helper()
 	oldDB := db.DB
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -19,7 +19,6 @@ func mfaTestEnv(t *testing.T) *int {
 	}
 	t.Cleanup(func() { _ = db.Close(); db.DB = oldDB })
 	// Initialize 已种 global_config id=1（caddy_config '{}'）
-	return new(int)
 }
 
 func mfaSeedUser(t *testing.T, id int) {
@@ -43,7 +42,7 @@ func mfaCurrentCode(t *testing.T, secret string, now time.Time) string {
 // —— RFC 6238 契约：真实 TOTP 码往返 ——
 
 func TestMFAValidateTOTP_roundtrip(t *testing.T) {
-	_ = mfaTestEnv(t)
+	mfaTestEnv(t)
 	secret, _, err := MFAGenerateSecret("tester")
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +72,7 @@ func TestMFAValidateTOTP_roundtrip(t *testing.T) {
 // —— 重放防护 ——
 
 func TestMFAVerifyCode_replayRejected(t *testing.T) {
-	_ = mfaTestEnv(t)
+	mfaTestEnv(t)
 	mfaSeedUser(t, 1)
 	secret, _, _ := MFAGenerateSecret("tester")
 	if _, err := db.DB.Exec("UPDATE users SET mfa_enabled=1, mfa_secret=? WHERE id=1", secret); err != nil {
@@ -95,7 +94,7 @@ func TestMFAVerifyCode_replayRejected(t *testing.T) {
 // —— 恢复码：单次消费 ——
 
 func TestMFARecoveryCodes_singleUse(t *testing.T) {
-	_ = mfaTestEnv(t)
+	mfaTestEnv(t)
 	mfaSeedUser(t, 2)
 	secret, _, _ := MFAGenerateSecret("tester")
 	codes, hashes, err := mfaGenerateRecoveryCodes(mfaRecoveryCodeCount)
@@ -130,7 +129,7 @@ func TestMFARecoveryCodes_singleUse(t *testing.T) {
 // —— 绑定流程：pending → activate ——
 
 func TestMFASetupActivateFlow(t *testing.T) {
-	_ = mfaTestEnv(t)
+	mfaTestEnv(t)
 	mfaSeedUser(t, 4)
 	if _, err := db.DB.Exec("UPDATE users SET mfa_pending_secret='junk' WHERE id=4"); err != nil {
 		t.Fatal(err)
@@ -162,7 +161,7 @@ func TestMFASetupActivateFlow(t *testing.T) {
 // —— 挑战：单次 + 过期 ——
 
 func TestMFAChallengeLifecycle(t *testing.T) {
-	_ = mfaTestEnv(t)
+	mfaTestEnv(t)
 	mfaSeedUser(t, 5)
 	tok, err := MFAIssueChallenge(5)
 	if err != nil || tok == "" {
@@ -190,7 +189,7 @@ func TestMFAChallengeLifecycle(t *testing.T) {
 // —— 管理员重置 ——
 
 func TestMFAResetForUser(t *testing.T) {
-	_ = mfaTestEnv(t)
+	mfaTestEnv(t)
 	mfaSeedUser(t, 6)
 	secret, _, _ := MFAGenerateSecret("tester")
 	if _, err := db.DB.Exec("UPDATE users SET mfa_enabled=1, mfa_secret=?, mfa_pending_fails=3 WHERE id=6", secret); err != nil {
@@ -220,7 +219,7 @@ func TestMFAResetForUser(t *testing.T) {
 // —— 全局开关读取 ——
 
 func TestMFAWriteGuardEnabled(t *testing.T) {
-	_ = mfaTestEnv(t)
+	mfaTestEnv(t)
 	if MFAWriteGuardEnabled() {
 		t.Fatal("default must be off")
 	}

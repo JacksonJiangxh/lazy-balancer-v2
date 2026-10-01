@@ -3214,7 +3214,7 @@ func TestSecurityEventsAttribution_Stage0ZeroEmissionSurfaceLock(t *testing.T) {
 // 被编辑 → contains 成员判定落空）把它排在真实 deny 属主之前抢认。
 //
 // 形状对照（security.go:166 引擎门 `IPWhitelistEnabled && PolicyType != stage0`、
-// security.go:990-1005 预检 id:3 并集排除 stage0 / id:12 承载保留检测）：
+// security.go buildIPPrecheckDirectives 预检段：id:3 并集排除 stage0 / id:12 承载保留检测（行号随拆分漂移——按 id 锚定））：
 //   - stage0 + 直通（trust_detection=0）→ 不可产 logged IP 族事件（本测试目标形状）；
 //   - stage0 + 保留检测（=1）→ id:12 DetectionOnly 降级真实存在 → 仍可产（回归形状）；
 //   - 无 policy_type 的存量信任策略（mixed 语义，id:3 并集承载）→ 仍可产（既有钉

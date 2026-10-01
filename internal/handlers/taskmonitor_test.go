@@ -45,7 +45,7 @@ func taskMonitorRouter() (*gin.Engine, *Handlers) {
 }
 
 // Given 空库（迁移种子三威胁源）。
-// Then 聚合返回全部 8 个任务族，字段形状完整，threat 含三源摘要。
+// Then 聚合返回全部任务族，字段形状完整，threat 含三源摘要。
 func TestListSystemTasks_allFamiliesPresent(t *testing.T) {
 	newBackupTestHandlers(t)
 	initTaskEngineForTest(t)
