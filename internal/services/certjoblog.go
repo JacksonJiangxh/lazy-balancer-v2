@@ -11,9 +11,18 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
-var certJobLogDir = "/app/logs"
+// B3（第 65 轮后裁定）：证书任务日志并入任务日志体系——挂靠
+// {任务日志目录}/certjobs/（与 tasks/*.log 同根：大小上限共用
+// task_log_size_mb、保留清理由 log-cleanup housekeeping 统一扫描）。
+var certJobLogDir = func() string {
+	if d := taskengine.LogDir(); d != "" {
+		return filepath.Join(d, "certjobs")
+	}
+	return "/app/logs"
+}()
 
 const maxRotatedFiles = 5
 
@@ -22,7 +31,7 @@ const maxRotatedFiles = 5
 var certJobLogWarnf = log.Printf
 
 // CertJobFileLogger writes certificate issuance logs to
-// /app/logs/certjob-{ruleID}.log with size-based rotation.
+// {任务日志目录}/certjobs/certjob-{ruleID}.log with size-based rotation.
 // Keeps up to 5 rotated backups (.1 through .5).
 type CertJobFileLogger struct {
 	ruleID string

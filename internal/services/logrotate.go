@@ -250,9 +250,35 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 // 返回清理明细（哪个文件被删/轮转——用户可见）。
 func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 	result := TaskLogHousekeepingResult{SizeCapMB: int(getTaskLogSizeBytes() / 1024 / 1024)}
+	// B3：tasks 根 + certjobs 子目录统一扫描（证书任务日志并入任务日志体系）
 	dir := filepath.Join(filepath.Dir(logFile), "tasks")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+	dirs := []string{dir}
+	if cj := filepath.Join(dir, "certjobs"); cj != dir {
+		dirs = append(dirs, cj)
+	}
+	type fileInfo struct {
+		path string
+		name string
+		info os.FileInfo
+	}
+	var all []fileInfo
+	for _, d := range dirs {
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			all = append(all, fileInfo{path: filepath.Join(d, e.Name()), name: e.Name(), info: info})
+		}
+	}
+	if len(all) == 0 {
 		return result
 	}
 	months := 3
@@ -266,24 +292,16 @@ func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 	// R63-P2-1：任务日志大小遵循「任务日志大小」配置项（task_log_size_mb，
 	// 默认 10MB——曾硬编码 5MB 与配置/统计三方分裂）。
 	sizeCap := getTaskLogSizeBytes()
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		path := filepath.Join(dir, e.Name())
-		if info.ModTime().Before(cutoff) {
-			if os.Remove(path) == nil {
-				result.Deleted = append(result.Deleted, e.Name())
+	for _, f := range all {
+		if f.info.ModTime().Before(cutoff) {
+			if os.Remove(f.path) == nil {
+				result.Deleted = append(result.Deleted, f.name)
 			}
 			continue
 		}
-		if info.Size() > sizeCap {
-			if os.Rename(path, path+".1") == nil { // 轮转保一份
-				result.Rotated = append(result.Rotated, fmt.Sprintf("%s %.1fMB>%dMB", e.Name(), float64(info.Size())/1024/1024, sizeCap/1024/1024))
+		if f.info.Size() > sizeCap {
+			if os.Rename(f.path, f.path+".1") == nil { // 轮转保一份
+				result.Rotated = append(result.Rotated, fmt.Sprintf("%s %.1fMB>%dMB", f.name, float64(f.info.Size())/1024/1024, sizeCap/1024/1024))
 			}
 		}
 	}

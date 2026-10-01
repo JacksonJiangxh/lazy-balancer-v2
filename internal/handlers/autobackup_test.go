@@ -29,6 +29,23 @@ func newAutoBackupTestHandlers(t *testing.T) *Handlers {
 	return h
 }
 
+// wireAutoBackupEngineForTest B2（第 65 轮后裁定）：/auto-backup/run 经引擎
+// RunSync——测试环境装配引擎+执行器（镜像 main.go 注入形态）。
+func wireAutoBackupEngineForTest(t *testing.T, h *Handlers) {
+	t.Helper()
+	services.SetAutoBackupExecutor(func(trigger, operator string, engineRunID int64) error {
+		_, err := h.RunAutoBackupOnce(trigger, operator, engineRunID)
+		return err
+	})
+	if services.TaskEngine() == nil {
+		services.InitTaskEngine("", t.TempDir()+"/app.log")
+	}
+	t.Cleanup(func() {
+		services.StopTaskEngine()
+		services.SetAutoBackupExecutor(nil)
+	})
+}
+
 func countAutoBackupAudit(t *testing.T, action string) int {
 	t.Helper()
 	var count int
@@ -408,6 +425,7 @@ func TestAutoBackupSettings_returnsSettingsAndRowsDesc(t *testing.T) {
 
 func TestRunAutoBackupNow_endpointRunsAndRespondsRow(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
+	wireAutoBackupEngineForTest(t, h)
 	response := serveAutoBackupJSON(t, h, http.MethodPost, "/auto-backup/run", "/auto-backup/run", "", h.RunAutoBackupNow)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
@@ -727,6 +745,7 @@ func TestPruneAutoBackups_fileRemovalOutcomes(t *testing.T) {
 func TestRunAutoBackupNow_auditOperatorIsCurrentUser(t *testing.T) {
 	// Given: 主节点 + 已登录用户 operator-zhang
 	h := newAutoBackupTestHandlers(t)
+	wireAutoBackupEngineForTest(t, h)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/auto-backup/run", func(c *gin.Context) {

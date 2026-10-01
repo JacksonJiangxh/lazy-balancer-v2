@@ -24,33 +24,10 @@ import (
 	"lazy-balancer-v2/internal/middleware"
 
 	"lazy-balancer-v2/internal/services"
-	"lazy-balancer-v2/internal/taskengine"
 )
 
 // 版本经 config(APP_VERSION env / Dockerfile ARG 兜底)进入 cfg.Version——
 // 启动日志与 branding API 同源(此前独立 ldflags 变量无注入链,恒 "dev")。
-
-// startupPhase 启动阶段包装：执行顺序与失败语义不变（同步+照旧处理错误），
-// 仅向 task_runs 落「startup」触发的一行记录——任务监控「启动」分类数据源。
-func startupPhase(id, name string, fn func() error) error {
-	runID := taskengine.RecordRunStart(id, "startup", "startup")
-	taskengine.LogTaskLine(id, "[start] 启动触发 "+name)
-	t0 := time.Now()
-	err := fn()
-	status, msg := "success", ""
-	if err != nil {
-		status, msg = "failed", err.Error()
-	}
-	dur := time.Since(t0).Milliseconds()
-	taskengine.RecordRunFinish(runID, status, dur, msg)
-	taskengine.LogTaskLine(id, fmt.Sprintf("[done] %s 耗时=%dms 触发=startup%s", status, dur, func() string {
-		if msg != "" {
-			return " 错误=" + msg
-		}
-		return ""
-	}()))
-	return err
-}
 
 func main() {
 	if err := run(); err != nil {
@@ -191,9 +168,9 @@ func run() error {
 		services.MaterializeAllCertsFromDB()
 		return h.ApplyConfigOnStartup()
 	}
-	if err := startupPhase("startup:config-load", "系统配置载入", runConfigLoad); err != nil {
-		services.Logf("error", "failed to apply Caddy config on startup: %v", err)
-	}
+	// B1（第 65 轮后裁定）：启动执行移入引擎 BootSync（下方 InitTaskEngine 尾部
+	// 同步触发 startup:config-load——面板监听前完成不变量保持；失败语义同旧：
+	// 仅记录不退出）。
 	// F62-28:Caddy 重启监听——监督器触发后走与启动相同的 DB 渲染→应用流程
 	// (修正 last_good 快照可能滞后于 DB 的窗口)。
 	h.StartCaddyRestartWatcher()
@@ -201,7 +178,7 @@ func run() error {
 	// （系统日志/操作日志/前端横幅），恢复由用户手动重启完成。
 	// M2 统一任务引擎：看门狗/安全事件摄取/运行日志清理三常驻族迁入
 	// （单轮体+引擎节拍；原生自循环与 TaskRuntime 注册表退役）。
-	services.SetConfigLoadRerun(runConfigLoad)                 // 手动重载=同一执行体（含载入审计）
+	services.SetConfigLoadRerun(runConfigLoad)                 // 启动 BootSync 与手动重载=同一执行体（含载入审计）
 	services.InitTaskEngine(cfg.CaddyAdminURL, runtimeLogFile) // 前置设施——非任务
 	defer services.StopTaskEngine()
 

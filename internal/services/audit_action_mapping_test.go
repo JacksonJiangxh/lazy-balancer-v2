@@ -432,6 +432,15 @@ func TestAuditPolicyListsEqual(t *testing.T) {
 // METHOD("/path", h.Handler)）解析路由→handler 映射，断言每个 Explicit 路由的
 // handler 函数体（含一层 h.X 委托，如 clusterNodeAction）包含审计记录调用；
 // handler 删除记录或经未登记 helper 绕过时该路由静默零审计，本测试直接红。
+// engineMediatedAuditRoutes B2（第 65 轮后裁定）：handler 经引擎 RunSync 执行
+// ——审计在执行器链（main 注入的 executor→RunAutoBackupOnce 内 RecordAuditLog）
+// 落盘，handler 体内无可达字面量（AST BFS 跨不过 main 装配闭包）。路由→执行
+// 仍恒有审计（RunAutoBackupOnce 内成功/失败双路径），此处豁免的是静态扫
+// 描的字面量可达性，不是审计本身。
+var engineMediatedAuditRoutes = map[string]bool{
+	"POST /api/v1/auto-backup/run": true,
+}
+
 func TestAuditExplicitHandlersRecord(t *testing.T) {
 	registry := extractRouteHandlerRegistry(t)
 	handlersRoot, err := filepath.Abs(filepath.Join("..", "handlers"))
@@ -454,7 +463,7 @@ func TestAuditExplicitHandlersRecord(t *testing.T) {
 			t.Errorf("未找到 handler 函数 %s（路由 %s）——路由→handler 映射过期", handler, route)
 			continue
 		}
-		if !records {
+		if !records && !engineMediatedAuditRoutes[route] {
 			t.Errorf("Explicit 路由 %s 的 handler %s 不含审计记录调用——中间件已短路，该路由零审计", route, handler)
 		}
 	}

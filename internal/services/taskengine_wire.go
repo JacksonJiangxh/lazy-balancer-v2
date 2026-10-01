@@ -455,14 +455,15 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Category:    "系统",
 		Kind:        taskengine.KindOneshot,
 		ManualRun:   true,
+		BootSync:    true, // B1（第 65 轮后裁定）：启动执行=引擎同步触发（面板监听前完成）
 		Run: func(rc taskengine.RunContext) error {
-			if rc.Trigger != "manual" {
-				return nil // 启动执行由 main startupPhase 记录——引擎 Run 仅承载手动重载
+			if rc.Trigger != "manual" && rc.Trigger != "startup" {
+				return nil
 			}
 			if configLoadRerun == nil {
 				return errors.New("配置重载未接线")
 			}
-			return configLoadRerun()
+			return configLoadRerun() // 启动与手动同体（2026-09-29 裁定）
 		},
 	})
 
@@ -485,6 +486,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	} {
 		taskEngine.StartLoop(id)
 	}
+	// B1：BootSync 任务同步执行（startup:config-load——面板监听前完成，
+	// 替代 main.go 直调+legacy startupPhase 记录旁路）
+	taskEngine.RunBootSyncTasks()
 	return taskEngine
 }
 

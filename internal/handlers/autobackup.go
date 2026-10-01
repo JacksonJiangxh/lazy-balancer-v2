@@ -499,14 +499,24 @@ func (h *Handlers) RunAutoBackupNow(c *gin.Context) {
 	if operator == "" {
 		operator = "system"
 	}
-	// 行视图由 RunAutoBackupOnce 在 TryLock 持有区内返回（第 56 轮 F4：解锁后
-	// 回查「最新 manual 行」在并发手动备份下会取到他人行）。
-	view, err := h.RunAutoBackupOnce("manual", operator, 0)
-	if err != nil {
+	// B2（第 65 轮后裁定）：单轨化——经引擎 RunSync（手动执行与任务监控触发
+	// 同一通道；引擎 CAS 单飞使「RunSync 成功返回后最新 manual 行必为本行」，
+	// 第 56 轮 F4 的并发回查竞态在引擎层从根上消除）。
+	te := services.TaskEngine()
+	if te == nil {
+		c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
+		return
+	}
+	if _, err := te.RunSync("auto-backup", "manual", operator); err != nil {
+		if errors.Is(err, taskengine.ErrAlreadyRunning) {
+			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "已有备份任务正在执行，请稍后重试"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "备份执行失败: " + err.Error()})
 		return
 	}
-	if view.Filename == "" {
+	view, verr := scanAutoBackupRowView(db.DB.QueryRow(`SELECT ` + autoBackupRowColumns + ` FROM auto_backups WHERE trigger_type='manual' ORDER BY id DESC LIMIT 1`))
+	if verr != nil || view.Filename == "" {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "手动备份完成"})
 		return
 	}

@@ -67,6 +67,9 @@ type Descriptor struct {
 
 	CancelHook func() bool
 	EnabledFn  func() bool // false=暂停（引擎不调度）
+	// BootSync：Oneshot 任务在引擎初始化尾部同步执行一次（trigger=startup）
+	// ——启动型任务的唯一执行通道（曾 main.go 直调+legacy 记录旁路）。
+	BootSync bool
 	// PassiveCarrier：被动守护 daemon（Run=<-ctx.Done() 仅承载状态，真实服务
 	// 由 lifecycle 独立管理）——控制面（重启按钮/调度开关）不适用于此类任务，
 	// 展示为「仅状态视图」（L1-1 第 65 轮：曾假控制面——「停止集群同步」
@@ -124,10 +127,11 @@ type Engine struct {
 	roleMu sync.RWMutex
 	role   bool
 
-	schedStop chan struct{}
-	schedDone chan struct{}
-	stopped   bool
-	startedAt time.Time
+	schedStop    chan struct{}
+	bootSyncDone atomic.Bool
+	schedDone    chan struct{}
+	stopped      bool
+	startedAt    time.Time
 }
 
 type Options struct {
@@ -277,7 +281,37 @@ func (e *Engine) Trigger(id, trigger, operator string) error {
 	if r.desc.MasterOnly && !e.isMaster() {
 		return errors.New("taskengine: 该操作仅允许在主节点执行")
 	}
+	_, err := e.runNow(id, trigger, operator)
+	return err
+}
+
+// RunSync 同步执行一次并返回 runID（handler 直调入口——响应需要行视图）。
+func (e *Engine) RunSync(id, trigger, operator string) (int64, error) {
 	return e.runNow(id, trigger, operator)
+}
+
+// RunBootSyncTasks 同步执行全部 BootSync Oneshot（InitTaskEngine 尾部调用
+// ——面板监听前完成，保持「载入完成前系统不可达」不变量）。幂等：仅首轮
+// 生效（重复调用零动作——启动执行全局恰一次）。
+func (e *Engine) RunBootSyncTasks() {
+	if !e.bootSyncDone.CompareAndSwap(false, true) {
+		return
+	}
+	e.mu.RLock()
+	type item struct {
+		id string
+		r  *registration
+	}
+	items := make([]item, 0, 4)
+	for id, r := range e.regs {
+		if r.desc.BootSync && r.desc.Kind == KindOneshot {
+			items = append(items, item{id, r})
+		}
+	}
+	e.mu.RUnlock()
+	for _, it := range items {
+		_, _ = e.runNow(it.id, "startup", "")
+	}
 }
 
 func (e *Engine) Cancel(id string) bool {
@@ -451,18 +485,18 @@ func (e *Engine) RecoverOrphans() int64 {
 
 // ---- 执行 ----
 
-func (e *Engine) runNow(id, trigger, operator string) error {
+func (e *Engine) runNow(id, trigger, operator string) (int64, error) {
 	e.mu.RLock()
 	r := e.regs[id]
 	e.mu.RUnlock()
 	if r == nil {
-		return ErrNotFound
+		return 0, ErrNotFound
 	}
 	// 单飞 CAS：全部 Kind 统一拒绝并发（Daemon 无此路径——Trigger 不暴露）
 	r.mu.Lock()
 	if r.running {
 		r.mu.Unlock()
-		return ErrAlreadyRunning
+		return 0, ErrAlreadyRunning
 	}
 	r.running = true
 	ctx, cancel := context.WithCancel(context.Background())
@@ -475,8 +509,8 @@ func (e *Engine) runNow(id, trigger, operator string) error {
 
 	rc := RunContext{Ctx: ctx, Trigger: trigger, Operator: operator, RunID: runID}
 	start := time.Now()
-	if trigger == "manual" {
-		taskLogAppend(id, "[start] 手动触发")
+	if trigger == "manual" || trigger == "startup" {
+		taskLogAppend(id, fmt.Sprintf("[start] %s触发", map[bool]string{true: "启动", false: "手动"}[trigger == "startup"]))
 	}
 	runErr := r.desc.Run(rc)
 	status := terminalStatus(ctx, runErr)
@@ -498,8 +532,20 @@ func (e *Engine) runNow(id, trigger, operator string) error {
 	r.mu.Unlock()
 	cancel()
 
-	e.finishRun(runID, status, dur)
-	return runErr
+	if status == "failed" && runErr != nil {
+		e.finishRunWithMessage(runID, status, dur, truncMsg(runErr))
+	} else {
+		e.finishRun(runID, status, dur)
+	}
+	return runID, runErr
+}
+
+func truncMsg(err error) string {
+	m := err.Error()
+	if len(m) > 500 {
+		m = m[:500]
+	}
+	return m
 }
 
 func terminalStatus(ctx context.Context, err error) string {
@@ -560,7 +606,7 @@ func (e *Engine) tick() {
 			due := !r.nextScheduledTime.IsZero() && now.After(r.nextScheduledTime)
 			r.mu.Unlock()
 			if due && e.roleAllows(r.desc.RunsOn) {
-				go func(rid string) { _ = e.runNow(rid, "auto", "") }(id)
+				go func(rid string) { _, _ = e.runNow(rid, "auto", "") }(id)
 			}
 
 		case KindPeriodic:
@@ -572,7 +618,7 @@ func (e *Engine) tick() {
 			}
 			r.mu.Unlock()
 			if due && e.roleAllows(r.desc.RunsOn) {
-				go func(rid string) { _ = e.runNow(rid, "auto", "") }(id)
+				go func(rid string) { _, _ = e.runNow(rid, "auto", "") }(id)
 			}
 
 		case KindDaemon:
@@ -615,6 +661,9 @@ func engineNowStr() string { return time.Now().In(engineLocPtr()).Format("2006-0
 var taskLogDir string
 
 func SetLogDir(dir string) { taskLogDir = dir }
+
+// LogDir 当前任务日志目录（B3：certjoblog 子目录挂靠点；空串=未初始化）。
+func LogDir() string { return taskLogDir }
 
 func TaskLogPath(taskID string) string {
 	if taskLogDir == "" {
