@@ -178,7 +178,11 @@ func run() error {
 	// （系统日志/操作日志/前端横幅），恢复由用户手动重启完成。
 	// M2 统一任务引擎：看门狗/安全事件摄取/运行日志清理三常驻族迁入
 	// （单轮体+引擎节拍；原生自循环与 TaskRuntime 注册表退役）。
-	services.SetConfigLoadRerun(runConfigLoad)                 // 启动 BootSync 与手动重载=同一执行体（含载入审计）
+	services.SetConfigLoadRerun(runConfigLoad) // 启动 BootSync 与手动重载=同一执行体（含载入审计）
+	// B 完全标准化：常驻服务真实生命周期挂钩（daemon Run start→阻塞→stop；
+	// 幂等守卫吸收 lifecycle 直调与 daemon 挂钩的双调用）
+	services.SetCertIssuanceLifecycleHooks(lifecycle.StartACME, lifecycle.StopACME)
+	services.SetSyncLifecycleHooks(syncService.Start, syncService.Stop)
 	services.InitTaskEngine(cfg.CaddyAdminURL, runtimeLogFile) // 前置设施——非任务
 	defer services.StopTaskEngine()
 
