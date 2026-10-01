@@ -589,3 +589,29 @@ func TestEngine_CancelHookPathLandsCancelled(t *testing.T) {
 	}
 	t.Fatalf("hook 取消路径终态应 cancelled, got %+v", e.LatestRun("t-chk"))
 }
+
+// Given BootSync Oneshot 任务注册后。
+// When RunBootSyncTasks（InitTaskEngine 尾部同型调用）。
+// Then Run 同步执行恰一次、task_runs 记 startup 触发行（B1：启动执行单轨化
+// ——曾 main.go 直调+legacy startupPhase 记录旁路）。
+func TestEngine_BootSyncTasksRunOnceWithStartupRow(t *testing.T) {
+	e := newTestEngine(t)
+	ran := 0
+	done := make(chan struct{})
+	e.Register(Descriptor{ID: "boot-one", Family: "startup", Name: "启动", Kind: KindOneshot, BootSync: true,
+		Run: func(rc RunContext) error { ran++; close(done); return nil }})
+	e.RunBootSyncTasks()
+	<-done
+	if ran != 1 {
+		t.Fatalf("BootSync 应恰执行一次, got %d", ran)
+	}
+	lr := e.LatestRun("boot-one")
+	if lr == nil || lr.Trigger != "startup" || lr.Status != "success" {
+		t.Fatalf("应记 startup/success 行, got %+v", lr)
+	}
+	// 幂等：再次调用不重跑（BootSync 只在引擎装配尾部触发一次）
+	e.RunBootSyncTasks()
+	if ran != 1 {
+		t.Fatalf("重复 RunBootSyncTasks 不应重跑, got %d", ran)
+	}
+}
