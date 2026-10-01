@@ -43,6 +43,20 @@ func SetCertIssuanceLifecycleHooks(start, stop func()) {
 
 // daemonLifecycleRun 常驻生命周期包装：start→阻塞 ctx→stop（nil 挂钩=测试
 // 环境空载体回退）。stop 恒执行（deferred）——StopLoop/角色翻转即真实停服。
+// masterSyncServingStatus 主节点同步任务状态镜像：主节点的同步服务面=
+// 快照签发/注册接收（HTTP 端点随面板常在）→运行中；从节点交由 daemon 实态
+// （真实轮询=运行/开关关=已停止）。
+func masterSyncServingStatus() string {
+	var isMaster int
+	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
+		return ""
+	}
+	if isMaster == 1 {
+		return "running"
+	}
+	return ""
+}
+
 func daemonLifecycleRun(rc taskengine.RunContext, start, stop func()) error {
 	if start != nil {
 		start()
@@ -311,6 +325,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Category:    "集群",
 		Kind:        taskengine.KindDaemon,
 		RunsOn:      taskengine.RoleSlaveOnly,
+		StatusFn:    masterSyncServingStatus, // 主节点=运行中（快照签发/注册接收服务在线——2026-10-01 裁定，B 实施时曾丢失）
 		Run: func(rc taskengine.RunContext) error {
 			return daemonLifecycleRun(rc, syncLifecycleStart, syncLifecycleStop)
 		},
