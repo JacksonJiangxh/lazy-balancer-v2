@@ -62,8 +62,8 @@ type Descriptor struct {
 | 任务 | Run 体 | 实际工作 |
 |---|---|---|
 | security-events-ingestion | `runIngestionLoop(ctx)`（内部 2s ticker） | 尾读 coraza 审计日志 |
-| cert-issuance | `<-ctx.Done()`（被动守护，PassiveCarrier=仅状态视图——L1-1） | CAQueueManager（main 启动）——**RunsOn=MasterOnly**：从节点禁签发 |
-| cluster-sync | `<-ctx.Done()`（被动守护） | SyncService（自管理）——主从都运行（无 StatusFn，实态呈现） |
+| cert-issuance | daemonLifecycleRun（真实 StartACME/StopACME 挂钩——B 完全标准化） | CAQueueManager+证书 worker（引擎 daemon 即生命周期所有者）——**RunsOn=MasterOnly** |
+| cluster-sync | daemonLifecycleRun（真实 SyncService.Start/Stop 挂钩） | SyncService 轮询（引擎 daemon 即生命周期所有者）——**RunsOn=SlaveOnly**（同步=从节点职能；角色翻转真实启停；Halted/Resume 内部状态机保留） |
 
 系统启动即运行（默认 StartLoop）；关闭调度=启动也不运行；允许手动停止和启用。
 

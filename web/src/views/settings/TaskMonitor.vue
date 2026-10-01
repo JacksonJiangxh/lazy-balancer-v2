@@ -127,11 +127,7 @@
           <template #default="{ row }">
             <!-- v2.0 调度开关统一：定时=暂停/恢复排程、循环=暂停/恢复循环、
                  常驻=启停自管理循环——绑定 loop_on 走 /toggle（后端按 Kind 路由） -->
-            <el-switch v-if="row.kind !== 'oneshot' && !row.status_view_only" :model-value="row.loop_on" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
-            <!-- 被动守护（L1-1）：真实服务由集群/签发生命周期管理——控制面不适用，仅状态视图 -->
-            <el-tooltip v-else-if="row.status_view_only" content="被动守护任务：真实服务随集群/签发生命周期运行，此处仅展示状态" placement="top" :offset="8" :show-after="150" :show-arrow="false">
-              <el-tag size="small" type="info" effect="plain">状态视图</el-tag>
-            </el-tooltip>
+            <el-switch v-if="row.kind !== 'oneshot'" :model-value="row.loop_on" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
             <!-- 触发类（注册任务）：显示禁用开关保持页面一致性——仅手动/代码触发 -->
             <el-tooltip v-else-if="!row.id.startsWith('cert-job:')" content="触发类任务不可调度——仅手动/代码触发执行" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <el-switch :model-value="false" disabled />
@@ -186,7 +182,7 @@
             >取消</el-button>
             <!-- 常驻行启停已由调度列开关承担（loop_on 同源，U5-P4-6e）——操作列改「重启」 -->
             <el-button
-              v-if="row.controllable && !row.status_view_only"
+              v-if="row.controllable"
               link type="warning" size="small"
               :disabled="!canOperate"
               @click="onRestart(row)"
@@ -314,7 +310,6 @@ interface TaskInfo {
   id: string; name: string; description?: string; cadence?: string; category: string
   kind: 'scheduled' | 'daemon' | 'periodic' | 'oneshot'
   status: string; cancellable: boolean; controllable?: boolean; triggerable?: boolean
-  status_view_only?: boolean // 被动守护：仅状态视图（L1-1）
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
   loop_on?: boolean; started_at?: string; log_size_bytes?: number; log_size_limit?: number // 常驻族：循环启停态（调度列开关绑定值）/ 引擎启动时刻
 }

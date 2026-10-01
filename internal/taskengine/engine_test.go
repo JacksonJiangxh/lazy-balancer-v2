@@ -615,3 +615,30 @@ func TestEngine_BootSyncTasksRunOnceWithStartupRow(t *testing.T) {
 		t.Fatalf("重复 RunBootSyncTasks 不应重跑, got %d", ran)
 	}
 }
+
+// Given daemon 挂真实生命周期挂钩（B 完全标准化——services 侧
+// daemonLifecycleRun 的引擎级形状：start→阻塞 ctx→stop）。
+func TestEngine_DaemonLifecycleHooksRealStartStop(t *testing.T) {
+	e := newTestEngine(t)
+	started := make(chan struct{}, 1)
+	stopped := make(chan struct{}, 1)
+	e.Register(Descriptor{ID: "hook-d", Family: "t", Name: "挂钩", Kind: KindDaemon,
+		Run: func(rc RunContext) error {
+			started <- struct{}{}
+			<-rc.Ctx.Done()
+			stopped <- struct{}{} // 真实服务的 Stop() 落点（B：deferred stop）
+			return nil
+		}})
+	e.SetRole(true)
+	e.StartLoop("hook-d")
+	<-started
+	if !e.IsTaskInFlight("hook-d") {
+		t.Fatal("运行中应可查在途")
+	}
+	e.StopLoop("hook-d")
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StopLoop 应触发真实 stop 落点（调度开关=真实启停）")
+	}
+}

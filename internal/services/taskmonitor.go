@@ -41,28 +41,27 @@ const (
 
 // TaskInfo 是单任务族的聚合视图。
 type TaskInfo struct {
-	ID             string       `json:"id"`
-	Name           string       `json:"name"`
-	Description    string       `json:"description,omitempty"` // 任务作用说明（任务名 hover 提示）
-	Cadence        string       `json:"cadence,omitempty"`     // 运行节奏（如「每 6 小时」；非下次时间）
-	Category       string       `json:"category"`              // 安全防护/证书/备份/集群/系统
-	Kind           TaskKind     `json:"kind"`
-	Status         TaskStatus   `json:"status"`
-	Enabled        bool         `json:"enabled"`              // 自动调度开关
-	Cancellable    bool         `json:"cancellable"`          // 运行中可手动取消（仅下载类）
-	Controllable   bool         `json:"controllable"`         // 常驻循环可启停（start/stop/restart）
-	Triggerable    bool         `json:"triggerable"`          // 支持手动触发（ManualRun 语义族）
-	Toggleable     bool         `json:"toggleable"`           // 调度开关可暂停/恢复（ToggleFn 声明族）
-	StatusViewOnly bool         `json:"status_view_only"`     // 被动守护：仅状态视图（控制面不适用，L1-1）
-	StartedAt      string       `json:"started_at,omitempty"` // 常驻族启动时刻；其他类型空
-	LogSizeBytes   int64        `json:"log_size_bytes"`       // 本任务日志文件大小（字节）
-	LoopOn         bool         `json:"loop_on"`              // 调度开关当前态（定时/循环/常驻调度列绑定值）
-	LastRun        *TaskRunInfo `json:"last_run,omitempty"`
-	NextRunAt      string       `json:"next_run_at,omitempty"`
-	Runs24h        int          `json:"runs_24h"`
-	Success24h     int          `json:"success_24h"`
-	Fail24h        int          `json:"fail_24h"`
-	DetailHint     string       `json:"detail_hint,omitempty"` // 前端详情跳转提示
+	ID           string       `json:"id"`
+	Name         string       `json:"name"`
+	Description  string       `json:"description,omitempty"` // 任务作用说明（任务名 hover 提示）
+	Cadence      string       `json:"cadence,omitempty"`     // 运行节奏（如「每 6 小时」；非下次时间）
+	Category     string       `json:"category"`              // 安全防护/证书/备份/集群/系统
+	Kind         TaskKind     `json:"kind"`
+	Status       TaskStatus   `json:"status"`
+	Enabled      bool         `json:"enabled"`              // 自动调度开关
+	Cancellable  bool         `json:"cancellable"`          // 运行中可手动取消（仅下载类）
+	Controllable bool         `json:"controllable"`         // 常驻循环可启停（start/stop/restart）
+	Triggerable  bool         `json:"triggerable"`          // 支持手动触发（ManualRun 语义族）
+	Toggleable   bool         `json:"toggleable"`           // 调度开关可暂停/恢复（ToggleFn 声明族）
+	StartedAt    string       `json:"started_at,omitempty"` // 常驻族启动时刻；其他类型空
+	LogSizeBytes int64        `json:"log_size_bytes"`       // 本任务日志文件大小（字节）
+	LoopOn       bool         `json:"loop_on"`              // 调度开关当前态（定时/循环/常驻调度列绑定值）
+	LastRun      *TaskRunInfo `json:"last_run,omitempty"`
+	NextRunAt    string       `json:"next_run_at,omitempty"`
+	Runs24h      int          `json:"runs_24h"`
+	Success24h   int          `json:"success_24h"`
+	Fail24h      int          `json:"fail_24h"`
+	DetailHint   string       `json:"detail_hint,omitempty"` // 前端详情跳转提示
 }
 
 // TaskRunInfo 最近一次运行。
@@ -170,8 +169,7 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			Category: m.Category, Kind: TaskKind(m.Kind),
 			Controllable: m.Controllable, Cancellable: m.Cancelable, Triggerable: m.CanTrigger,
 			Toggleable: m.Toggleable, Enabled: m.Enabled, DetailHint: m.Family,
-			StatusViewOnly: m.StatusViewOnly,
-			LoopOn:         m.LoopOn,
+			LoopOn: m.LoopOn,
 		}
 		// 节奏：循环=间隔，定时=排程槽，常驻=自管理，触发=手动
 		switch m.Kind {

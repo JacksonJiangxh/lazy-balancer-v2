@@ -26,6 +26,34 @@ var configLoadRerun func() error
 // SetConfigLoadRerun 注入手动重载实现。
 func SetConfigLoadRerun(fn func() error) { configLoadRerun = fn }
 
+// B（第 65 轮后裁定·完全标准化）：常驻服务真实生命周期挂钩——daemon Run
+// start→阻塞→deferred stop，调度开关/角色翻转即真实启停服务。
+var (
+	syncLifecycleStart, syncLifecycleStop                 func()
+	certIssuanceLifecycleStart, certIssuanceLifecycleStop func()
+)
+
+// SetSyncLifecycleHooks 注入集群同步真实启停（main: syncService.Start/Stop）。
+func SetSyncLifecycleHooks(start, stop func()) { syncLifecycleStart, syncLifecycleStop = start, stop }
+
+// SetCertIssuanceLifecycleHooks 注入证书签发真实启停（main: lifecycle.StartACME/StopACME）。
+func SetCertIssuanceLifecycleHooks(start, stop func()) {
+	certIssuanceLifecycleStart, certIssuanceLifecycleStop = start, stop
+}
+
+// daemonLifecycleRun 常驻生命周期包装：start→阻塞 ctx→stop（nil 挂钩=测试
+// 环境空载体回退）。stop 恒执行（deferred）——StopLoop/角色翻转即真实停服。
+func daemonLifecycleRun(rc taskengine.RunContext, start, stop func()) error {
+	if start != nil {
+		start()
+	}
+	<-rc.Ctx.Done()
+	if stop != nil {
+		stop()
+	}
+	return nil
+}
+
 // TaskEngine 返回全局引擎实例（未初始化返回 nil——测试环境）。
 func TaskEngine() *taskengine.Engine { return taskEngine }
 
@@ -250,17 +278,17 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// RunsOn=MasterOnly：从节点禁签发——daemon 不在从节点启动（promote 经
 	// SetRole 自动拉起），状态显示实态（从节点=空闲）。
 	taskEngine.Register(taskengine.Descriptor{
-		ID:             "cert-issuance",
-		Family:         "certificates",
-		Name:           "证书签发",
-		Description:    "ACME 证书签发队列——含新签发与续签（由证书任务队列调度，活跃任务显示为动态行；仅主节点运行，从节点只读镜像）",
-		Category:       "证书",
-		Kind:           taskengine.KindDaemon,
-		RunsOn:         taskengine.RoleMasterOnly,
-		PassiveCarrier: true, // L1-1：真实服务=CAQueueManager（lifecycle 管理）——本行仅状态视图
+		ID:          "cert-issuance",
+		Family:      "certificates",
+		Name:        "证书签发",
+		Description: "ACME 证书签发队列——含新签发与续签（由证书任务队列调度，活跃任务显示为动态行；仅主节点运行，从节点只读镜像）",
+		Category:    "证书",
+		Kind:        taskengine.KindDaemon,
+		RunsOn:      taskengine.RoleMasterOnly,
 		Run: func(rc taskengine.RunContext) error {
-			<-rc.Ctx.Done() // CAQueueManager 由 main 启动——此处仅承载运行态
-			return nil
+			// B 完全标准化：真实生命周期挂钩（StartACME/StopACME 语义——队列+
+			// 证书 worker+active 指针；幂等守卫吸收角色链双调用）
+			return daemonLifecycleRun(rc, certIssuanceLifecycleStart, certIssuanceLifecycleStop)
 		},
 		StatusFn: func() string {
 			var n int
@@ -271,21 +299,20 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	// 集群同步：被动守护（SyncService 自管理——Run 阻塞保持运行态）。
-	// 无 StatusFn：状态由 daemon 实际运行态呈现——主节点（快照签发/接收
-	// 从节点注册）与从节点（轮询回放）都是服务在跑=运行中（2026-10-01
-	// 用户裁定：主节点显示空闲不合理）。
+	// 集群同步：真实生命周期常驻（B 完全标准化）。SlaveOnly——同步=从节点
+	// 职能：角色翻转（promote/demote）经引擎 SetRole 真实启停 SyncService；
+	// 调度开关真实启停轮询；内部 Halted/Resume 状态机全保留（幂等守卫吸收
+	// lifecycle 直调与 daemon 挂钩的双调用）。
 	taskEngine.Register(taskengine.Descriptor{
-		ID:             "cluster-sync",
-		Family:         "cluster",
-		Name:           "集群同步",
-		Description:    "集群同步服务：从节点按配置间隔轮询主节点快照并增量回放；主节点签发快照并接收从节点注册",
-		Category:       "集群",
-		Kind:           taskengine.KindDaemon,
-		PassiveCarrier: true, // L1-1：真实服务=SyncService（lifecycle 管理）——本行仅状态视图
+		ID:          "cluster-sync",
+		Family:      "cluster",
+		Name:        "集群同步",
+		Description: "集群同步服务：从节点按配置间隔轮询主节点快照并增量回放（仅从节点运行；启停真实生效）",
+		Category:    "集群",
+		Kind:        taskengine.KindDaemon,
+		RunsOn:      taskengine.RoleSlaveOnly,
 		Run: func(rc taskengine.RunContext) error {
-			<-rc.Ctx.Done() // SyncService 由 main 启动——此处仅承载运行态
-			return nil
+			return daemonLifecycleRun(rc, syncLifecycleStart, syncLifecycleStop)
 		},
 	})
 

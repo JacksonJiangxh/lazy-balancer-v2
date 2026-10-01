@@ -69,19 +69,14 @@ type Descriptor struct {
 	EnabledFn  func() bool // false=暂停（引擎不调度）
 	// BootSync：Oneshot 任务在引擎初始化尾部同步执行一次（trigger=startup）
 	// ——启动型任务的唯一执行通道（曾 main.go 直调+legacy 记录旁路）。
-	BootSync bool
-	// PassiveCarrier：被动守护 daemon（Run=<-ctx.Done() 仅承载状态，真实服务
-	// 由 lifecycle 独立管理）——控制面（重启按钮/调度开关）不适用于此类任务，
-	// 展示为「仅状态视图」（L1-1 第 65 轮：曾假控制面——「停止集群同步」
-	// 实际停不掉 SyncService）。仅 KindDaemon 有效。
-	PassiveCarrier bool
-	StatusFn       func() string    // 状态镜像
-	ToggleFn       func(bool) error // 调度开关 setter
-	ToggleName     string
-	ManualRun      bool
-	Cancelable     bool
-	RunsOn         Role
-	MasterOnly     bool
+	BootSync   bool
+	StatusFn   func() string    // 状态镜像
+	ToggleFn   func(bool) error // 调度开关 setter
+	ToggleName string
+	ManualRun  bool
+	Cancelable bool
+	RunsOn     Role
+	MasterOnly bool
 }
 
 // RunRecord task_runs 行视图。
@@ -737,24 +732,23 @@ func RecordRunFinish(runID int64, status string, durMs int64, message string) {
 // ---- 元数据 ----
 
 type TaskMeta struct {
-	ID             string `json:"id"`
-	Family         string `json:"family"`
-	Name           string `json:"name"`
-	Description    string `json:"description"`
-	Category       string `json:"category"`
-	Kind           Kind   `json:"kind"`
-	IntervalSec    int    `json:"interval_sec"`
-	NextSlot       string `json:"next_slot"`
-	Enabled        bool   `json:"enabled"`
-	StatusMirror   string `json:"status_mirror"`
-	Controllable   bool   `json:"controllable"`
-	Cancelable     bool   `json:"cancelable"`
-	Toggleable     bool   `json:"toggleable"`
-	ToggleName     string `json:"toggle_name"`
-	LoopOn         bool   `json:"loop_on"`
-	Running        bool   `json:"running"` // Daemon：Run 实际存活（角色门/停止后=false）
-	CanTrigger     bool   `json:"can_trigger"`
-	StatusViewOnly bool   `json:"status_view_only"` // 被动守护：仅状态视图（控制面不适用）
+	ID           string `json:"id"`
+	Family       string `json:"family"`
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	Category     string `json:"category"`
+	Kind         Kind   `json:"kind"`
+	IntervalSec  int    `json:"interval_sec"`
+	NextSlot     string `json:"next_slot"`
+	Enabled      bool   `json:"enabled"`
+	StatusMirror string `json:"status_mirror"`
+	Controllable bool   `json:"controllable"`
+	Cancelable   bool   `json:"cancelable"`
+	Toggleable   bool   `json:"toggleable"`
+	ToggleName   string `json:"toggle_name"`
+	LoopOn       bool   `json:"loop_on"`
+	Running      bool   `json:"running"` // Daemon：Run 实际存活（角色门/停止后=false）
+	CanTrigger   bool   `json:"can_trigger"`
 }
 
 // Lookup 单任务元数据（U1-P4-2：handler 为取单字段跑全量 DescribeAll
@@ -772,15 +766,14 @@ func (e *Engine) Lookup(id string) (TaskMeta, bool) {
 	m := TaskMeta{
 		ID: id, Family: r.desc.Family, Name: r.desc.Name,
 		Description: r.desc.Description, Category: r.desc.Category, Kind: r.desc.Kind,
-		CanTrigger:     r.desc.ManualRun,
-		Cancelable:     r.desc.Cancelable,
-		Toggleable:     r.desc.ToggleFn != nil,
-		ToggleName:     r.desc.ToggleName,
-		LoopOn:         loopOn,
-		Running:        running,
-		Enabled:        true,
-		Controllable:   r.desc.Kind == KindDaemon && !r.desc.PassiveCarrier,
-		StatusViewOnly: r.desc.Kind == KindDaemon && r.desc.PassiveCarrier,
+		CanTrigger:   r.desc.ManualRun,
+		Cancelable:   r.desc.Cancelable,
+		Toggleable:   r.desc.ToggleFn != nil,
+		ToggleName:   r.desc.ToggleName,
+		LoopOn:       loopOn,
+		Running:      running,
+		Enabled:      true,
+		Controllable: r.desc.Kind == KindDaemon,
 	}
 	if r.desc.IntervalFn != nil {
 		m.IntervalSec = int(r.desc.IntervalFn().Seconds())
@@ -821,15 +814,14 @@ func (e *Engine) DescribeAll() []TaskMeta {
 		m := TaskMeta{
 			ID: s.id, Family: s.desc.Family, Name: s.desc.Name,
 			Description: s.desc.Description, Category: s.desc.Category, Kind: s.desc.Kind,
-			CanTrigger:     s.desc.ManualRun,
-			Cancelable:     s.desc.Cancelable,
-			Toggleable:     s.desc.ToggleFn != nil,
-			ToggleName:     s.desc.ToggleName,
-			LoopOn:         s.loopOn,
-			Running:        s.running,
-			Enabled:        true,
-			Controllable:   s.desc.Kind == KindDaemon && !s.desc.PassiveCarrier, // 常驻族可启停（被动守护除外=L1-1）
-			StatusViewOnly: s.desc.Kind == KindDaemon && s.desc.PassiveCarrier,
+			CanTrigger:   s.desc.ManualRun,
+			Cancelable:   s.desc.Cancelable,
+			Toggleable:   s.desc.ToggleFn != nil,
+			ToggleName:   s.desc.ToggleName,
+			LoopOn:       s.loopOn,
+			Running:      s.running,
+			Enabled:      true,
+			Controllable: s.desc.Kind == KindDaemon, // 常驻族可启停（真实生命周期挂钩——B 完全标准化）
 		}
 		if s.desc.IntervalFn != nil {
 			m.IntervalSec = int(s.desc.IntervalFn().Seconds())
