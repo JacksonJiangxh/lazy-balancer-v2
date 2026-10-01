@@ -128,12 +128,11 @@
             <!-- v2.0 调度开关统一：定时=暂停/恢复排程、循环=暂停/恢复循环、
                  常驻=启停自管理循环——绑定 loop_on 走 /toggle（后端按 Kind 路由） -->
             <el-switch v-if="row.kind !== 'oneshot'" :model-value="row.loop_on" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
-            <!-- 触发类（注册任务）：显示禁用开关保持页面一致性——仅手动/代码触发 -->
-            <el-tooltip v-else-if="!row.id.startsWith('cert-job:')" content="触发类任务不可调度——仅手动/代码触发执行" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+            <!-- 触发类（含 cert-job 动态行）：统一显示禁用开关保持页面一致性——
+                 仅手动/代码触发执行（2026-10-01 用户裁定；cert-job 特例已消除） -->
+            <el-tooltip v-else content="触发类任务不可调度——仅手动/代码触发执行" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <el-switch :model-value="false" disabled />
             </el-tooltip>
-            <!-- cert-job 动态行（签发工作项）：无调度语义 -->
-            <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
         <el-table-column label="执行时间" width="180">
