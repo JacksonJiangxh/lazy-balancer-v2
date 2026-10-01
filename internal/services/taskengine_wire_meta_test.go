@@ -71,3 +71,24 @@ func TestTaskEngineWire_DaemonsFullyControllable(t *testing.T) {
 		t.Fatal("主节点不应运行集群同步（SlaveOnly 角色门）")
 	}
 }
+
+// Given 主节点角色（is_master=1）——同步 daemon 因 SlaveOnly 不启动。
+// When 状态聚合。
+// Then cluster-sync 显示运行中（主节点服务面=快照签发/注册接收在线——
+// 2026-10-01 裁定，B 实施时曾丢失）；从节点由 daemon 实态呈现。
+func TestTaskEngineWire_MasterSyncShowsServing(t *testing.T) {
+	te := newWireTestEngine(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	te.SetRole(true)
+	for _, ti := range collectEngineFamilies(te) {
+		if ti.ID == "cluster-sync" {
+			if ti.Status != TaskStatusRunning {
+				t.Fatalf("主节点 cluster-sync 应运行中（服务面镜像）, got %s", ti.Status)
+			}
+			return
+		}
+	}
+	t.Fatal("cluster-sync 未注册")
+}
