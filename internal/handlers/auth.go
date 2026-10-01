@@ -21,8 +21,6 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-const revokedTokenTimeFormat = "2006-01-02T15:04:05Z"
-
 // maxAuthJSONBodyBytes 公开 auth 端点（login/setup/ticket-login）的 JSON 请求体
 // 上限（R68 F-B1）。这三条路由无认证，前置 loginRateLimit 只限次数不限体积；
 // encoding/json 在 binding max= 约束生效前就把整个字符串物化进堆——单个超大
@@ -315,7 +313,7 @@ func (h *Handlers) Logout(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "登出失败"})
 		return
 	}
-	if _, err := db.DB.Exec("INSERT INTO revoked_jti (jti_hash,expires_at) VALUES (?,?) ON CONFLICT(jti_hash) DO UPDATE SET expires_at=excluded.expires_at", revocationHash, expiresAtTime.UTC().Format(revokedTokenTimeFormat)); err != nil {
+	if _, err := db.DB.Exec("INSERT INTO revoked_jti (jti_hash,expires_at) VALUES (?,?) ON CONFLICT(jti_hash) DO UPDATE SET expires_at=excluded.expires_at", revocationHash, expiresAtTime.UTC().Format(models.RevokedTokenTimeFormat)); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "登出失败"})
 		return
 	}
@@ -366,12 +364,13 @@ type UpdateCurrentUserRequest struct {
 	CurrentPassword string `json:"current_password" binding:"omitempty,max=24"`
 }
 
-// maxPasswordBytes 是 bcrypt 的字节上限：v0.55 起对 >72 字节的密码返回
-// ErrPasswordTooLong。binding 的 max=72 按 rune 计数（validator v10），25-72 个
+// 密码策略（2026-09-28 用户裁定，F63-B5a-1）：8-24 个
 // 密码策略（2026-09-28 用户裁定，F63-B5a-1）：8-24 个可打印 ASCII 字符，
 // 仅限数字、大小写字母、特殊字符(可打印 ASCII)——不强制四类全含，
-// 不允许汉字或其他非 ASCII 字符。仅适用于设置/修改/重置——登录不做策略校验（存量密码可能在
-// 旧策略下设置）。
+// 不允许汉字或其他非 ASCII 字符。仅适用于设置/修改/重置——登录不做策略校验
+// （存量密码可能在旧策略下设置）。注：bcrypt 字节上限 72（v0.55 起 >72 返回
+// ErrPasswordTooLong）——策略 24 字符 ASCII 上限远低于该界（U6a-5-1：删
+// 陈旧常量名引用）。
 const (
 	minPasswordLength = 8
 	maxPasswordLength = 24

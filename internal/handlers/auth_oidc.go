@@ -8,7 +8,7 @@ package handlers
 //   · 写保护矩阵:绑本地 MFA→TOTP 弹码;OIDC 会话(auth_method=oidc)与本地
 //     MFA 体系完全解耦,经 mfaStepUpGuard 显式直通(v2.3.0 用户裁定);
 //     锁定仅密码路径(OIDC 失败不计入,防「伪造回调锁死账号」DoS)
-//   · 配置随 global_config 集群快照自动同步;从节点回调独立闭环→只读 JWT
+//   · 配置随 global_config 集群快照自动同步;从节点回调独立闭环（注：主端 users 节变更触发重放时会抹除本节点 JIT 行——该行存续期内签发的 JWT 将 401「用户不存在」，经 IdP 重新登录即自愈重建。U6a-4-1 第 65 轮裁定：最小动作=声明，不采用 SC-4 保留模式）→只读 JWT
 
 import (
 	"context"

@@ -46,37 +46,28 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 	}
 	// 终态：触发全经任务引擎（CanTrigger 语义族——单飞/主节点门/历史统一）
 	if te := services.TaskEngine(); te != nil {
-		for _, m := range te.DescribeAll() {
-			if m.ID == id {
-				if !m.CanTrigger {
-					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发（常驻族启停即可/镜像族）"})
-					return
-				}
-				// v2.0：单飞由引擎 CAS 强制（runNow 拒绝并发）——双击第二次被
-				// 静默拒绝，task_runs 只记一次真实执行。
-				go func(tid, operator string) {
-					_ = te.Trigger(tid, "manual", operator) // 异步——耗时由 task_runs 记录；operator 审计归人
-				}(id, auditOperator(c))
-				// 审计由任务体自记（手动/自动同一审计——2026-09-29 用户裁定）；
-				// 清理/证书循环族的执行记录在任务运行历史与任务日志。
-				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
+		if m, ok := te.Lookup(id); ok { // U1-P4-2：单任务元数据（免全量 DescribeAll）
+			if !m.CanTrigger {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发（常驻族启停即可/镜像族）"})
 				return
 			}
+			// v2.0：单飞由引擎 CAS 强制；L1-3（第 65 轮）：在跑任务同步 409
+			// （曾异步吞错恒 200+apidocs 409 不可达——双击假成功）
+			if te.IsTaskInFlight(id) {
+				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务运行中，请稍后重试"})
+				return
+			}
+			go func() {
+				_ = te.Trigger(id, "manual", auditOperator(c)) // 异步——耗时由 task_runs 记录；operator 审计归人
+			}()
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
+			return
 		}
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发"})
 		return
 	}
 	// R63：无引擎时统一 503（回退 switch 删除）。
 	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
-}
-
-func respondTaskStartErr(c *gin.Context, err error) {
-	if errors.Is(err, services.ErrThreatUpdateRunning) || errors.Is(err, services.ErrCRSUpdateRunning) ||
-		errors.Is(err, services.ErrIP2RegionUpdateRunning) {
-		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: err.Error()})
-		return
-	}
-	c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 }
 
 // ToggleSystemTask 调度开关（admin；body {"enabled": bool}）。
@@ -96,10 +87,7 @@ func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 		return
 	}
 	if te := services.TaskEngine(); te != nil {
-		for _, m := range te.DescribeAll() {
-			if m.ID != id {
-				continue
-			}
+		if m, ok := te.Lookup(id); ok {
 			if m.Kind == taskengine.KindOneshot {
 				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "触发类任务不可调度——仅手动/代码触发执行"})
 				return
@@ -160,14 +148,8 @@ func (h *Handlers) ControlSystemTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "任务引擎未初始化"})
 		return
 	}
-	controllable := false
-	for _, m := range te.DescribeAll() {
-		if m.ID == id {
-			controllable = m.Controllable
-			break
-		}
-	}
-	if !controllable {
+	m, ok := te.Lookup(id)
+	if !ok || !m.Controllable {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持启停（角色驱动或纯被动循环）"})
 		return
 	}

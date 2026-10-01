@@ -6,6 +6,10 @@ import (
 	"time"
 )
 
+// RevokedTokenTimeFormat 吊销 JWT 的 expires_at 统一格式（U6a-5-4 收敛：
+// handlers 写侧与 middleware 读侧曾跨包双份定义——单侧改动会静默失配）。
+const RevokedTokenTimeFormat = "2006-01-02T15:04:05Z"
+
 // User represents a user in the system
 type User struct {
 	ID           int            `json:"id"`

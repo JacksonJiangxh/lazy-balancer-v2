@@ -62,7 +62,7 @@ type Descriptor struct {
 | 任务 | Run 体 | 实际工作 |
 |---|---|---|
 | security-events-ingestion | `runIngestionLoop(ctx)`（内部 2s ticker） | 尾读 coraza 审计日志 |
-| cert-issuance | `<-ctx.Done()`（被动守护） | CAQueueManager（main 启动）——**RunsOn=MasterOnly**：从节点禁签发 |
+| cert-issuance | `<-ctx.Done()`（被动守护，PassiveCarrier=仅状态视图——L1-1） | CAQueueManager（main 启动）——**RunsOn=MasterOnly**：从节点禁签发 |
 | cluster-sync | `<-ctx.Done()`（被动守护） | SyncService（自管理）——主从都运行（无 StatusFn，实态呈现） |
 
 系统启动即运行（默认 StartLoop）；关闭调度=启动也不运行；允许手动停止和启用。
@@ -108,7 +108,7 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
 ```
 默认：调度关闭（不在默认 StartLoop 清单）——引擎不 tick，页面显示「已暂停」
 唤醒：cert-renewal-scan 入队证书任务 → StartLoop("cert-waiting-ca")
-      手动签发/重试入队 → 同上（cert 任务创建路径）
+      手动签发/重试入队 → 同上（CreateOrRequeueCertJobWithChange 成功路径单点唤醒——U1-P3-1 已实现）
 自停：Run 体发现 certJobsActive()==false → StopLoop（回到默认关闭态）
 ```
 

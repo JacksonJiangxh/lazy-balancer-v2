@@ -733,7 +733,7 @@ const crsStatusTagType = (s: string): 'success' | 'warning' | 'danger' | 'info' 
   if (s === 'missing') return 'danger'
   if (!s || s === 'idle') return 'info'
   if (s === 'checking' || s === 'downloading' || s === 'installing' || s === 'reloading' || s === 'running') return 'warning'
-  if (s === 'success' || s === '已最新' || s === '已最新') return 'success'
+  if (s === 'success' || s === '已最新') return 'success'
   if (s === 'failed' || s === '更新失败') return 'danger'
   if (s.includes('失败') || s.includes('错误')) return 'danger'
   if (s.includes('最新')) return 'success'
@@ -1324,6 +1324,7 @@ onUnmounted(() => {
   // 作废在途响应并暂停轮询（轮询终态清理由 usePollingTask 内置 onUnmounted 兜底）
   crsDialog.dispose()
   ip2regionDialog.dispose()
+  threatDialog.dispose() // U9-F2（第 65 轮）：与两兄弟对齐（曾缺席）
 })
 </script>
 
@@ -1341,8 +1342,6 @@ onUnmounted(() => {
 
 .crs-card :deep(.el-card__header) .crs-header { display: flex; justify-content: space-between; align-items: center; width: 100%; }
 .crs-card :deep(.el-card__header) .crs-header-title { display: flex; align-items: center; gap: 12px; }
-.crs-card :deep(.el-descriptions__table) { table-layout: fixed; width: 100%; }
-.crs-card :deep(.el-descriptions__cell) { height: 48px; vertical-align: middle; }
 .rule-condition-row {
   display: flex; gap: 10px; margin-bottom: 10px; align-items: flex-start; flex-wrap: wrap;
   padding: 12px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px;

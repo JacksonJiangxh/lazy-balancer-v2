@@ -98,6 +98,10 @@ func TestCollectCertJobRows_excludesSyncedMaterialRows(t *testing.T) {
 	if !found {
 		t.Fatal("真实签发行应保留显示")
 	}
+	// U1-P3-2：LIMIT 100（第 100 新行仍显示——20 截断回归钉）
+	if len(rows) > 100 {
+		t.Fatalf("上限 100, got %d", len(rows))
+	}
 }
 
 // Given 超 1 天的 issued 签发任务行。

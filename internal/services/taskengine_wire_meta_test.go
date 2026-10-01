@@ -148,3 +148,124 @@ func TestTaskEngineWire_BusinessToggleLinksDisabledStatus(t *testing.T) {
 		}
 	}
 }
+
+// Given 从节点 DB 角色（is_master=0）下 InitTaskEngine。
+// When 初始化完成。
+// Then 仅创建一个引擎（无泄漏实例）且角色种子作用于生效引擎——master-only
+// daemon（cert-issuance）零 boot 行（U1-P2-2 钉：曾双 NewEngine 种子落在
+// 被弃引擎上，从节点瞬启一轮幻影行）。
+func TestTaskEngineWire_SingleEngineWithRoleSeedOnSlave(t *testing.T) {
+	oldDB, oldM, oldA := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	t.Cleanup(func() {
+		StopTaskEngine()
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA
+	})
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	te2 := InitTaskEngine("", t.TempDir()+"/app.log")
+	if te2 == nil || te2 != TaskEngine() {
+		t.Fatal("InitTaskEngine 幂等：二次调用应返回同一引擎")
+	}
+	// 生效引擎角色应为从节点（种子作用于本引擎）
+	if te2.DescribeAll() == nil {
+		t.Fatal("引擎应已注册任务")
+	}
+	// 从节点 cert-issuance 不得有 boot 行
+	var n int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM task_runs WHERE task_id='cert-issuance'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("从节点 cert-issuance 应零 boot 行, got %d（双 NewEngine 角色种子失效回归）", n)
+	}
+}
+
+// Given crs 版本行 next_update 停在过去（失败后不推进=2026-09-25 裁定行为）
+// 且该槽已被一次执行覆盖（task_runs 有 started_at≥槽 的行）。
+// When 槽位感知 NextSlot 计算。
+// Then 返回排程配置的下一未来槽（引擎不重触发已覆盖槽——U1-P2-2 重试风暴
+// 修复：管理器语义与 scheduled_update_retry 三钉不动，感知在引擎侧）。
+func TestTaskEngineWire_CoveredPastSlotStepsToNextSchedule(t *testing.T) {
+	oldDB, oldM, oldA := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close(); db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA })
+	// 排程：每天 04:00
+	if _, err := db.DB.Exec(`INSERT OR IGNORE INTO security_crs_version (id, version, auto_update, schedule_days, schedule_time, next_update) VALUES (1,'v',1,'1,2,3,4,5,6,7','04:00',?)`,
+		time.Now().UTC().Add(-2*time.Hour).Format("2006-01-02 15:04:05")); err != nil {
+		t.Fatal(err)
+	}
+	// 覆盖证据：一次执行发生在槽之后（失败尝试）
+	if _, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, trigger, status, started_at) VALUES ('crs','security','auto','failed',?)`,
+		time.Now().Format("2006-01-02 15:04:05")); err != nil {
+		t.Fatal(err)
+	}
+	got := crsNextSlotAware()
+	if !got.After(time.Now()) {
+		t.Fatalf("已覆盖的过去槽应步进到下一未来槽, got %v（重试风暴：引擎将秒级重触发）", got)
+	}
+	// 对照：无覆盖行时 past 槽原样返回（追补语义保留）
+	if _, err := db.DB.Exec(`DELETE FROM task_runs WHERE task_id='crs'`); err != nil {
+		t.Fatal(err)
+	}
+	got2 := crsNextSlotAware()
+	if got2.After(time.Now()) {
+		t.Fatalf("未覆盖的过去槽应原样返回（停机追补）, got %v", got2)
+	}
+}
+
+// Given 引擎在场且 cert-waiting-ca 调度关闭（默认态）。
+// When 手动签发/重试路径入队证书任务（CreateOrRequeueCertJobWithChange）。
+// Then cert-waiting-ca 被唤醒（U1-P3-1：SPEC §3 声称的行为——曾仅 renewal-scan
+// 一处唤醒，手动路径 30s→最长 6h 延迟）。
+func TestTaskEngineWire_ManualCertJobWakesWaitingCA(t *testing.T) {
+	te := newWireTestEngine(t)
+	if te == nil {
+		t.Fatal("engine nil")
+	}
+	// 前置：默认关闭（不在 StartLoop 清单）
+	if te.IsRunning("cert-waiting-ca") {
+		t.Fatal("前置失效：cert-waiting-ca 默认应关闭")
+	}
+	// 手动路径入队（真实队列——InitCAQueueManager 测试目录实例）
+	InitCAQueueManager(nil, t.TempDir())
+	if _, _, err := CreateOrRequeueCertJobWithChange("lb_wake_test", "wake.example.com", 0, GetCAQueueManager()); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if !te.IsRunning("cert-waiting-ca") {
+		t.Fatal("手动入队应唤醒 cert-waiting-ca（U1-P3-1）")
+	}
+	te.StopLoop("cert-waiting-ca")
+}
+
+// Given 引擎完成全量注册。
+// When DescribeAll。
+// Then cert-issuance/cluster-sync 为 status_view_only（L1-1：被动守护退出
+// 控制面——真实服务由 lifecycle 管理）；security-events-ingestion 仍可控。
+func TestTaskEngineWire_PassiveCarrierStatusViewOnly(t *testing.T) {
+	te := newWireTestEngine(t)
+	for _, m := range te.DescribeAll() {
+		switch m.ID {
+		case "cert-issuance", "cluster-sync":
+			if !m.StatusViewOnly {
+				t.Errorf("%s 应 status_view_only=true（被动守护）", m.ID)
+			}
+			if m.Controllable {
+				t.Errorf("%s 应 Controllable=false（控制面不适用）", m.ID)
+			}
+		case "security-events-ingestion":
+			if m.StatusViewOnly {
+				t.Errorf("%s 为真实自管理循环，不应 status_view_only", m.ID)
+			}
+			if !m.Controllable {
+				t.Errorf("%s 应 Controllable=true", m.ID)
+			}
+		}
+	}
+}

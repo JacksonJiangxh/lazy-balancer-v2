@@ -5,6 +5,7 @@ package taskengine
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -483,4 +484,108 @@ func TestEngine_DaemonFailureRecordsFailedRow(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("Run 错误返回应补记 failed 行, stats=%+v", e.Stats24h("t-dfail"))
+}
+
+// Given daemon 任务未运行，N 个并发 StartLoop（HTTP∥SetRole 同型竞态面）。
+// When 全部返回后。
+// Then Run 恰被调用一次（startDaemon CAS——U1-P2-4：曾锁外读+无复查=双启动
+// 双 boot 行+cancel 覆写致其一永不可取消）。
+func TestEngine_StartLoopConcurrentSingleDaemonStart(t *testing.T) {
+	e := newTestEngine(t)
+	starts := make(chan struct{}, 32)
+	e.Register(Descriptor{ID: "t-race", Family: "t", Name: "并发启动", Kind: KindDaemon,
+		Run: func(rc RunContext) error {
+			starts <- struct{}{}
+			<-rc.Ctx.Done()
+			return nil
+		}})
+	e.SetRole(true)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); e.StartLoop("t-race") }()
+	}
+	wg.Wait()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if len(starts) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	var bootRows int
+	_ = dbTestCountRuns(t, "t-race", &bootRows)
+	if bootRows != 1 {
+		t.Fatalf("并发 StartLoop 应恰 1 boot 行, got %d（startDaemon 无 CAS 双启动）", bootRows)
+	}
+	e.StopLoop("t-race")
+}
+
+func dbTestCountRuns(t *testing.T, id string, n *int) error {
+	t.Helper()
+	return db.DB.QueryRow(`SELECT COUNT(*) FROM task_runs WHERE task_id=?`, id).Scan(n)
+}
+
+// Given daemon 运行中。
+// When 背靠背 StopLoop→StartLoop（handlers restart 的精确序列）。
+// Then Run 被第二次调用（U1-P2-3：曾 Run goroutine 异步清 running，StartLoop
+// 即查仍 true→跳过=「重启」静默变「停止」）。
+func TestEngine_DaemonRestartBackToBackStartsSecondRun(t *testing.T) {
+	e := newTestEngine(t)
+	starts := make(chan struct{}, 4)
+	block := make(chan struct{})
+	e.Register(Descriptor{ID: "t-rst", Family: "t", Name: "重启", Kind: KindDaemon,
+		Run: func(rc RunContext) error {
+			starts <- struct{}{}
+			<-rc.Ctx.Done()
+			<-block // 保证第一代 Run 的清理动作可控后行
+			return nil
+		}})
+	e.SetRole(true)
+	e.StartLoop("t-rst")
+	<-starts // 第一代已进 Run
+	// 背靠背 restart：Stop 后立即 Start——此刻第一代仍在跑（running=true）
+	e.StopLoop("t-rst")
+	e.StartLoop("t-rst")
+	// 第一代收到取消后自行退出（Run 体不挂死——真实 Run 语义）
+	close(block)
+	// 契约：第二代必须被自动拉起——不需要任何进一步调用
+	// （U1-P2-3 回归形态：StartLoop 见 running=true 静默跳过→永久停止）
+	select {
+	case <-starts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restart 后第二代 Run 未被拉起（restart 竞态：静默变停止）")
+	}
+	e.StopLoop("t-rst")
+}
+
+// Given Cancelable 任务经 CancelHook 取消（threat/crs/ip2region 三族路径）。
+// When Cancel 成功。
+// Then 终态=cancelled（L1-6：曾 hook 取消后引擎 ctx 不动→落 failed——历史
+// 无法区分用户取消与真失败）。
+func TestEngine_CancelHookPathLandsCancelled(t *testing.T) {
+	e := newTestEngine(t)
+	started := make(chan struct{})
+	hookFired := make(chan struct{}, 1)
+	e.Register(Descriptor{ID: "t-chk", Family: "t", Name: "Hook取消", Cancelable: true,
+		CancelHook: func() bool { hookFired <- struct{}{}; return true },
+		Run: func(rc RunContext) error {
+			close(started)
+			<-rc.Ctx.Done() // hook 取消后引擎 ctx 同步取消（L1-6）
+			return rc.Ctx.Err()
+		}})
+	go func() { _ = e.Trigger("t-chk", "manual", "") }()
+	<-started
+	if !e.Cancel("t-chk") {
+		t.Fatal("Cancel 应成功")
+	}
+	<-hookFired
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if lr := e.LatestRun("t-chk"); lr != nil && lr.Status == "cancelled" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("hook 取消路径终态应 cancelled, got %+v", e.LatestRun("t-chk"))
 }

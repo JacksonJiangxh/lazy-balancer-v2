@@ -15,6 +15,9 @@ import (
 // user customizations carried forward across an update. Comparison trims
 // whitespace, blank lines are skipped, and comments count because they
 // toggle rules.
+// extractSetupDiff returns the lines present in live but not in stock
+// setup.conf (user overrides). Comment lines count because they toggle rules.
+// （U2b F-U2-2：本注释原误挂 mergeOverridesLines——已归位）
 // mergeOverridesLines 生成合并后的 overrides 内容：既有 overrides 的有效行
 // 在前（保留历史自定义），本次迁移 diff 追加在后，按行文本去重（同一行只写
 // 一次，消除 R53 新-2 的重复 SecRule id 顾虑），header 仅保留新的一份。

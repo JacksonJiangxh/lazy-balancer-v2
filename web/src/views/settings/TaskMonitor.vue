@@ -23,7 +23,7 @@
       <el-col :xs="12" :md="6">
         <el-card class="tm-kpi">
           <div class="tm-kpi-num" :class="{ 'tm-kpi-bad': fail24h > 0 }">{{ fail24h }}</div>
-          <div class="tm-kpi-label">24h 失败 <el-icon v-if="isSlave" class="tm-kpi-lock"><Lock /></el-icon></div>
+          <div class="tm-kpi-label">24h 失败 <el-icon v-if="readOnly" class="tm-kpi-lock"><Lock /></el-icon></div>
         </el-card>
       </el-col>
     </el-row>
@@ -127,7 +127,11 @@
           <template #default="{ row }">
             <!-- v2.0 调度开关统一：定时=暂停/恢复排程、循环=暂停/恢复循环、
                  常驻=启停自管理循环——绑定 loop_on 走 /toggle（后端按 Kind 路由） -->
-            <el-switch v-if="row.kind !== 'oneshot'" :model-value="row.loop_on" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
+            <el-switch v-if="row.kind !== 'oneshot' && !row.status_view_only" :model-value="row.loop_on" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
+            <!-- 被动守护（L1-1）：真实服务由集群/签发生命周期管理——控制面不适用，仅状态视图 -->
+            <el-tooltip v-else-if="row.status_view_only" content="被动守护任务：真实服务随集群/签发生命周期运行，此处仅展示状态" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+              <el-tag size="small" type="info" effect="plain">状态视图</el-tag>
+            </el-tooltip>
             <!-- 触发类（注册任务）：显示禁用开关保持页面一致性——仅手动/代码触发 -->
             <el-tooltip v-else-if="!row.id.startsWith('cert-job:')" content="触发类任务不可调度——仅手动/代码触发执行" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <el-switch :model-value="false" disabled />
@@ -177,12 +181,12 @@
             >立即执行</el-button>
             <el-button
               v-if="row.cancellable && row.status === 'running'"
-              link type="danger" size="small" :disabled="!isAdmin"
+              link type="danger" size="small" :disabled="!canOperate"
               @click="onCancel(row)"
             >取消</el-button>
             <!-- 常驻行启停已由调度列开关承担（loop_on 同源，U5-P4-6e）——操作列改「重启」 -->
             <el-button
-              v-if="row.controllable"
+              v-if="row.controllable && !row.status_view_only"
               link type="warning" size="small"
               :disabled="!canOperate"
               @click="onRestart(row)"
@@ -309,8 +313,8 @@ interface TaskRunInfo { started_at: string; finished_at: string; duration_ms: nu
 interface TaskInfo {
   id: string; name: string; description?: string; cadence?: string; category: string
   kind: 'scheduled' | 'daemon' | 'periodic' | 'oneshot'
-  status: string; enabled: boolean; cancellable: boolean; controllable?: boolean; triggerable?: boolean
-  toggleable: boolean // 调度开关可暂停/恢复（后端 ToggleFn 声明族——调度列开关渲染判据）
+  status: string; cancellable: boolean; controllable?: boolean; triggerable?: boolean
+  status_view_only?: boolean // 被动守护：仅状态视图（L1-1）
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
   loop_on?: boolean; started_at?: string; log_size_bytes?: number; log_size_limit?: number // 常驻族：循环启停态（调度列开关绑定值）/ 引擎启动时刻
 }
@@ -325,28 +329,24 @@ const isAdmin = computed(() => authStore.user?.role === 'admin')
 const tasks = ref<TaskInfo[]>([])
 const loaded = ref(false)
 const refreshing = ref(false)
-const isSlave = ref(false)
-const canOperate = computed(() => isAdmin.value && !isSlave.value)
+// L1-2（第 65 轮）：只读判定统一走全局 fail-closed 契约（authStore.
+// readOnlyReason===null=可写；曾本地 isSlave fetch-open 且不随角色切换刷新，
+// 违反 F49-10——全站 14 页唯一偏离者）
+const readOnly = computed(() => authStore.readOnlyReason !== null)
+const canOperate = computed(() => isAdmin.value && !readOnly.value)
 
 const fetchTasks = async () => {
   const res = await request.get<APIResponse<{ tasks: TaskInfo[] }>>('/system/tasks', { silent: true })
   tasks.value = res.data?.tasks || []
   loaded.value = true
 }
-const fetchClusterState = async () => {
-  try {
-    const res = await request.get<APIResponse<{ node_mode: string }>>('/cluster/status', { silent: true })
-    isSlave.value = res.data?.node_mode === 'slave'
-  } catch { isSlave.value = false }
-}
 const refreshNow = async () => {
   refreshing.value = true
-  try { await Promise.all([fetchTasks(), fetchClusterState(), fetchCertQueue()]) } finally { refreshing.value = false }
+  try { await Promise.all([fetchTasks(), fetchCertQueue()]) } finally { refreshing.value = false }
 }
 onMounted(() => {
   void polling.run() // 首跑立即（start() 只设定时器；证书队列横幅已入轮询闭包随首跑）
   polling.start()
-  fetchClusterState()
 })
 onUnmounted(() => polling.stop())
 
@@ -554,10 +554,10 @@ const statusLabels: Record<string, string> = {
 }
 const statusLabel = (s: string) => statusLabels[s] || certJobStatusLabel(s as CertJobStatus)
 // v2.0 四类型：定时(蓝)/常驻(绿)/循环(青)/触发(橙)
-const kindLabels: Record<string, string> = { scheduled: '定时', daemon: '常驻', periodic: '循环', oneshot: '触发', continuous: '常驻', queue: '触发' }
+const kindLabels: Record<string, string> = { scheduled: '定时', daemon: '常驻', periodic: '循环', oneshot: '触发' }
 const kindLabel = (k: string) => kindLabels[k] || k
 const kindTag = (k: string): 'primary' | 'success' | 'info' | 'warning' =>
-  k === 'scheduled' ? 'primary' : k === 'daemon' || k === 'continuous' ? 'success' : k === 'periodic' ? 'info' : 'warning'
+  k === 'scheduled' ? 'primary' : k === 'daemon' ? 'success' : k === 'periodic' ? 'info' : 'warning'
 const kindTagClass = (k: string) => (k === 'periodic' ? 'tm-tag-periodic' : '')
 const categoryOrder: Record<string, number> = { '安全防护': 0, '证书': 1, '备份': 2, '集群': 3, '系统': 4, '触发': 5 }
 const categoryTagType = (c: string): 'primary' | 'success' | 'warning' | 'info' =>
@@ -667,8 +667,6 @@ const fmtDuration = (ms?: number) => {
 
 /* 日志 */
 .tm-log-stats { display: flex; align-items: center; margin-bottom: 10px; }
-.tm-logs-loading { display: flex; align-items: center; gap: 8px; color: var(--el-text-color-secondary); padding: 16px 0; }
-.tm-log-size { font-size: 12px; color: #6b7280; }
 .tm-log-container { max-height: 60vh; overflow: auto; background: #0f172a; border-radius: 8px; padding: 16px; border: 1px solid #1e293b; }
 .tm-log-content { margin: 0; color: #e2e8f0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; line-height: 1.7; white-space: pre-wrap; }
 .tm-log-stage { font-size: 11px; color: var(--el-text-color-secondary); margin-bottom: 2px; text-transform: uppercase; letter-spacing: .5px; }

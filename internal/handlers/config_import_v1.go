@@ -673,6 +673,13 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		}
 		summary := map[string]int{}
 		for table, rows := range backup.Tables {
+			// L6-F2（第 65 轮）：无 waf_files 的备份导入会跳过 WAF 版本两表
+			//（BE-C1-10「只有元数据=不导入」）——预览对齐实际落库（曾预览
+			// 计数比实际多 2 表且跳过 warning 只在导入出现）
+			if !hasWaf && (table == "security_crs_version" || table == "security_ip2region_version") {
+				validateWarnings = append(validateWarnings, fmt.Sprintf("%s：备份未携带规则库数据文件，版本记录将跳过导入", table))
+				continue
+			}
 			summary[table] = len(rows)
 		}
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: true, Type: "v2", Summary: summary, Warnings: validateWarnings, DisabledConflicts: disabledConflicts, HasWafFiles: hasWaf}})

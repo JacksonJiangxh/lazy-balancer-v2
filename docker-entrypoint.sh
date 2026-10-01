@@ -21,8 +21,10 @@ fi
 # Generate Caddyfile if not exists
 if [ ! -f /app/config/Caddyfile ]; then
     # F63-B8-1:镜像内恒有出厂 config/Caddyfile(COPY 进镜像),挂载空目录
-    # 覆盖时直接写最小合法配置(admin 端口);原 .dist 分支为死路径(无该文件)
-    echo ":2019" > /app/config/Caddyfile
+    # 覆盖时直接写最小合法配置。U8b-P4-2(第 65 轮):须写 admin 指令而非
+    # ":2019" 站点块——站点占 2019 端口会使 admin 绑定失败致 caddy run
+    # crash 循环(监督器 1s/30s 退避,面板 PID1 存活但 Caddy 永不可用)。
+    echo "admin 127.0.0.1:2019" > /app/config/Caddyfile
 fi
 
 # Set timezone from database if available

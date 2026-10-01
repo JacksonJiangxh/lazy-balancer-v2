@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"lazy-balancer-v2/internal/models"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -194,7 +195,7 @@ func TestJWTLogout_revocation_usesUTCTextAcrossNegativeTimezoneQueryAndCleanup(t
 		t.Fatal(err)
 	}
 	var cleanupErr error
-	if _, err := db.DB.Exec("DELETE FROM revoked_jti WHERE expires_at<=?", time.Unix(expiresAt+1, 0).UTC().Format(revokedTokenTimeFormat)); err != nil {
+	if _, err := db.DB.Exec("DELETE FROM revoked_jti WHERE expires_at<=?", time.Unix(expiresAt+1, 0).UTC().Format(models.RevokedTokenTimeFormat)); err != nil {
 		cleanupErr = err
 	}
 	var remaining int
@@ -780,5 +781,20 @@ func TestReadOnlyGuard_writeRouteClassificationIsIndependentFromAuditPolicy(t *t
 				t.Fatalf("status=%d, want %d", response.Code, test.wantStatus)
 			}
 		})
+	}
+}
+
+// L5-02（第 65 轮）：从节点 MCP 写工具调用→403 实际接线回归钉（曾仅守卫级
+// 通用测试，无「POST /mcp 经守卫组」端到端形状——v1.POST("/mcp") 注册于
+// adminOnly/readOnlyGuard 组之外，写保护依赖 loopback 转发重入间接达成）。
+func TestReadOnlyGuard_SlaveMcpWriteRouteRejected(t *testing.T) {
+	router := newReadOnlyGuardTestRouter(t, false, "admin")
+	body := `{"jsonrpc":"2.0","method":"tools/call","params":{"name":"create_rule","arguments":{}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rules", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("从节点 MCP 转发目标写路由应 403, got %d body=%s", w.Code, w.Body.String())
 	}
 }

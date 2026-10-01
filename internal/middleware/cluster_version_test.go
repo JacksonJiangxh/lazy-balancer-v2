@@ -9,8 +9,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -959,5 +961,37 @@ func TestClusterVersionTriggers_bumpForTrustedProxyColumns(t *testing.T) {
 	}
 	if got := clusterVersion(t, database); got != 1 {
 		t.Fatalf("version after trusted proxy update=%d, want 1", got)
+	}
+}
+
+// Given loginRateBuckets 已满 1024 桶（容量上限）。
+// When clusterRateLimit 命中新 IP（U6c-P3：曾建桶无检查——分布式攻击可推满
+// 共享 map 使登录限流对新源 fail-open）。
+// Then 新桶不建、请求放行不 panic（与 loginRateLimit 同族语义）。
+func TestClusterRateLimitRespectsBucketCap(t *testing.T) {
+	loginRateBuckets.Lock()
+	for i := 0; i < 1024; i++ {
+		loginRateBuckets.entries[fmt.Sprintf("cap-%d", i)] = &loginRateBucket{until: time.Now().Add(time.Minute), count: 1}
+	}
+	loginRateBuckets.Unlock()
+	t.Cleanup(func() {
+		loginRateBuckets.Lock()
+		for k := range loginRateBuckets.entries {
+			if strings.HasPrefix(k, "cap-") {
+				delete(loginRateBuckets.entries, k)
+			}
+		}
+		loginRateBuckets.Unlock()
+	})
+	h := clusterRateLimit("test", 30, "测试限流")
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/cluster/service-control", nil)
+	c.Request.RemoteAddr = "203.0.113.77:1234"
+	h(c) // 不 panic、不新增桶即通过
+	loginRateBuckets.Lock()
+	_, exists := loginRateBuckets.entries["203.0.113.77|test"]
+	loginRateBuckets.Unlock()
+	if exists {
+		t.Fatal("容量满时应跳过建桶（fail-open 放行——与 loginRateLimit 同族）")
 	}
 }

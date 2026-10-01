@@ -60,7 +60,7 @@ let lastMfaGraceNotice: { close: () => void } | null = null
 //（弹码后重试，用户刚验证过，业务提示不加缀）。
 let mfaGraceLastAt = 0
 let mfaVerifiedJustNowAt = 0
-export const wasRecentMfaGrace = (): boolean =>
+const wasRecentMfaGrace = (): boolean =>
   Date.now() - mfaGraceLastAt < 3_000 && Date.now() - mfaVerifiedJustNowAt > 3_000
 
 // R72 十八次（用户裁决）：写操作成功提示的统一 MFA 装饰——宽限窗内（用户不知情）
@@ -378,4 +378,3 @@ export function isTokenExpired(token: string): boolean {
   }
 }
 
-export default service

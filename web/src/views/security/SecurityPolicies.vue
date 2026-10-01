@@ -1456,9 +1456,13 @@ const mergedIpEntryCount = (inline: string[], refs: number[]): number => {
 // 引用侧合计条数（各列表条目数之和，不去重——去重后的合计在 hint 的「合计」中给出）
 const selectedRefEntryCount = (refs: number[]): number => refs.reduce((sum, id) => sum + (ipLists.value.find((l) => l.id === id)?.entry_count ?? 0), 0)
 const aclMergedCount = computed(() => mergeIpEntries(ipACLList.value, ipACLListRefs.value).length)
+// U9-F1：保存校验用纯计数口径（不依赖按步惰性拉取的条目值——编辑态跳步
+// 直达预览时 mergeIpEntries 会漏未加载列表致假性「名单为空」阻断保存）
+const aclSaveCount = computed(() => mergedIpEntryCount(ipACLList.value, ipACLListRefs.value))
 const aclRefHint = computed(() => `内联 ${ipACLList.value.length} 条 + 引用列表 ${selectedRefEntryCount(ipACLListRefs.value)} 条（合计 ${aclMergedCount.value} 条）`)
 const showAclRefHint = computed(() => ipACLList.value.length > 0 || ipACLListRefs.value.length > 0)
 const whitelistMergedCount = computed(() => mergeIpEntries(ipWhitelist.value, ipWhitelistRefs.value).length)
+const whitelistSaveCount = computed(() => mergedIpEntryCount(ipWhitelist.value, ipWhitelistRefs.value))
 const whitelistRefHint = computed(() => `内联 ${ipWhitelist.value.length} 条 + 引用列表 ${selectedRefEntryCount(ipWhitelistRefs.value)} 条（合计 ${whitelistMergedCount.value} 条）`)
 const showWhitelistRefHint = computed(() => ipWhitelist.value.length > 0 || ipWhitelistRefs.value.length > 0)
 // 本策略既有 ip_blacklist（仅用于跨策略冲突比较；本对话框不编辑该字段，
@@ -2098,7 +2102,7 @@ const jumpToStep = (step: WizardStep): void => {
 
 const validateIpAclList = (): boolean => {
   // 白名单空列表校验采用合并口径：内联为空但已引用列表时，生效名单非空即合法
-  if (form.value.ip_acl_enabled && form.value.ip_acl_mode === 'allow' && aclMergedCount.value === 0) {
+  if (form.value.ip_acl_enabled && form.value.ip_acl_mode === 'allow' && aclSaveCount.value === 0) {
     ElMessage.error('白名单模式下 IP 列表不能为空，否则所有请求将被拒绝')
     return false
   }
@@ -2908,7 +2912,7 @@ const handleSave = async () => {
   }
   // 类型裁剪后的阶段不参与校验（步骤已被裁剪，校验跳转目标不存在）
   // 阶段 0 信任名单策略：名单（内联∪引用合并口径）必须非空
-  if (typeAllowsStage(0) && whitelistMergedCount.value === 0) {
+  if (typeAllowsStage(0) && whitelistSaveCount.value === 0) {
     ElMessage.error('阶段 0 · 信任名单策略必须配置至少一个信任 IP（内联或引用列表）')
     currentStep.value = WIZARD_STEP.TRUST
     return

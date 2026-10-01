@@ -2039,7 +2039,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				// 强制变体（证书文件已在事务外落盘，JSON 相同会被短路）并接线
 				// recordCaddyApplyResult（失败必须进 caddy_apply_error，UI 可见）；
 				// 本函数已持有 caddyOpMu，不可改用 applyCaddyConfigE（重入死锁）。
-				reapplyErr := h.caddyService.GenerateAndApplyConfigForce()
+				reapplyErr := h.caddyService.GenerateAndApplyConfigForceInLock() // 已持锁——InLock 变体防重入死锁
 				h.recordCaddyApplyResult(reapplyErr)
 				if reapplyErr != nil {
 					restoreErr := restoreACMEState()
@@ -3019,7 +3019,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 			//（enabled=0 + certJobsSnapshot 恢复 + 运行时快照恢复）。R72 二十六次
 			// W1-6：强制变体 + recordCaddyApplyResult（已持 caddyOpMu，不可用
 			// applyCaddyConfigE——重入死锁）。
-			reapplyErr := h.caddyService.GenerateAndApplyConfigForce()
+			reapplyErr := h.caddyService.GenerateAndApplyConfigForceInLock() // 已持锁——InLock 变体防重入死锁
 			h.recordCaddyApplyResult(reapplyErr)
 			if reapplyErr != nil {
 				failEnable("恢复证书任务后重载 Caddy 配置失败: " + reapplyErr.Error())

@@ -43,16 +43,39 @@ func parseUTCSlot(s string) time.Time {
 	return time.Time{}
 }
 
-// InitTaskEngine 建引擎、恢复孤儿运行、注册全部 17 任务并启动默认循环。幂等。
-func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine {
-	taskEngine = taskengine.NewEngine(taskengine.Options{})
-	// 角色种子（v2.0 角色门前置）：按 DB 角色初始化——从节点不瞬启
-	// master-only daemon（否则 boot 行噪音：启动→SetRole 停止）
-	var roleMaster int
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&roleMaster); err == nil {
-		taskEngine.SetRole(roleMaster == 1)
+// slotCoveredByRun 排程槽是否已被一次执行覆盖（task_runs 存在 started_at≥槽
+// 的行——started_at 按配置时区落库，槽统一转同格式比较）。
+func slotCoveredByRun(taskID string, slot time.Time) bool {
+	if db.DB == nil || slot.IsZero() {
+		return false
 	}
-	_ = taskEngine.RecoverOrphans()
+	var n int
+	_ = db.DB.QueryRow(`SELECT COUNT(*) FROM task_runs WHERE task_id=? AND started_at >= ?`,
+		taskID, slot.In(CurrentLocation()).Format("2006-01-02 15:04:05")).Scan(&n)
+	return n > 0
+}
+
+// coveredSlotStepPast 已覆盖的过去槽步进到排程配置的下一未来槽；未覆盖原样
+// 返回（停机追补保留）。U1-P2-2 修复：失败不推进 next_update（2026-09-25
+// 裁定保持）时引擎不重触发——感知在引擎侧，管理器与三钉测试零改动。
+func coveredSlotStepPast(taskID, table string, slot time.Time) time.Time {
+	if slot.IsZero() || slot.After(time.Now()) || !slotCoveredByRun(taskID, slot) {
+		return slot
+	}
+	days, hhmm := versionTableSchedule(table)
+	return NextScheduledSlot(time.Now(), days, hhmm, CurrentLocation())
+}
+
+func crsNextSlotAware() time.Time {
+	return coveredSlotStepPast("crs", "security_crs_version", parseUTCSlot(GetCRSUpdateManager().NextScheduledSlot()))
+}
+
+func ip2regionNextSlotAware() time.Time {
+	return coveredSlotStepPast("ip2region", "security_ip2region_version", parseUTCSlot(GetIP2RegionUpdateManager().NextScheduledSlot()))
+}
+
+// InitTaskEngine 建引擎、恢复孤儿运行、注册全部 16 任务并启动默认循环。幂等。
+func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine {
 	taskengine.SetLocation(CurrentLocation())
 	logsDir := "/app/logs"
 	if runtimeLogFile != "" {
@@ -62,6 +85,13 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	_ = os.MkdirAll(tasksLogDir, 0755)
 	taskengine.SetLogDir(tasksLogDir)
 	taskEngine = taskengine.NewEngine(taskengine.Options{})
+	// 角色种子（v2.0 角色门前置）：按 DB 角色初始化——从节点不瞬启
+	// master-only daemon（否则 boot 行噪音：启动→SetRole 停止）。
+	// U1-P2-1 修复：曾在此前多建一个引擎（种子落在被弃实例上失效+泄漏）。
+	var roleMaster int
+	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&roleMaster); err == nil {
+		taskEngine.SetRole(roleMaster == 1)
+	}
 	_ = taskEngine.RecoverOrphans()
 
 	// ============ 循环（8）============
@@ -72,7 +102,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID:          "config-watchdog",
 		Family:      "system",
 		Name:        "配置漂移看门狗",
-		Description: "每 60 秒比对运行中 Caddy 配置与数据库期望配置，漂移时面板横幅告警并触发对账",
+		Description: "每 60 秒比对运行中 Caddy 配置与数据库期望配置，漂移时面板横幅告警（恢复经手动重启）",
 		Category:    "系统",
 		Kind:        taskengine.KindPeriodic,
 		IntervalFn:  func() time.Duration { return 60 * time.Second },
@@ -220,13 +250,14 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// RunsOn=MasterOnly：从节点禁签发——daemon 不在从节点启动（promote 经
 	// SetRole 自动拉起），状态显示实态（从节点=空闲）。
 	taskEngine.Register(taskengine.Descriptor{
-		ID:          "cert-issuance",
-		Family:      "certificates",
-		Name:        "证书签发",
-		Description: "ACME 证书签发队列——含新签发与续签（由证书任务队列调度，活跃任务显示为动态行；仅主节点运行，从节点只读镜像）",
-		Category:    "证书",
-		Kind:        taskengine.KindDaemon,
-		RunsOn:      taskengine.RoleMasterOnly,
+		ID:             "cert-issuance",
+		Family:         "certificates",
+		Name:           "证书签发",
+		Description:    "ACME 证书签发队列——含新签发与续签（由证书任务队列调度，活跃任务显示为动态行；仅主节点运行，从节点只读镜像）",
+		Category:       "证书",
+		Kind:           taskengine.KindDaemon,
+		RunsOn:         taskengine.RoleMasterOnly,
+		PassiveCarrier: true, // L1-1：真实服务=CAQueueManager（lifecycle 管理）——本行仅状态视图
 		Run: func(rc taskengine.RunContext) error {
 			<-rc.Ctx.Done() // CAQueueManager 由 main 启动——此处仅承载运行态
 			return nil
@@ -245,12 +276,13 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// 从节点注册）与从节点（轮询回放）都是服务在跑=运行中（2026-10-01
 	// 用户裁定：主节点显示空闲不合理）。
 	taskEngine.Register(taskengine.Descriptor{
-		ID:          "cluster-sync",
-		Family:      "cluster",
-		Name:        "集群同步",
-		Description: "集群同步服务：从节点按配置间隔轮询主节点快照并增量回放；主节点签发快照并接收从节点注册",
-		Category:    "集群",
-		Kind:        taskengine.KindDaemon,
+		ID:             "cluster-sync",
+		Family:         "cluster",
+		Name:           "集群同步",
+		Description:    "集群同步服务：从节点按配置间隔轮询主节点快照并增量回放；主节点签发快照并接收从节点注册",
+		Category:       "集群",
+		Kind:           taskengine.KindDaemon,
+		PassiveCarrier: true, // L1-1：真实服务=SyncService（lifecycle 管理）——本行仅状态视图
 		Run: func(rc taskengine.RunContext) error {
 			<-rc.Ctx.Done() // SyncService 由 main 启动——此处仅承载运行态
 			return nil
@@ -299,7 +331,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			if m == nil || !m.AutoUpdateEnabled() {
 				return time.Time{}
 			}
-			return parseUTCSlot(m.NextScheduledSlot())
+			return crsNextSlotAware()
 		},
 		EnabledFn: func() bool { // 业务开关联动展示（关=已暂停；DB 直读——manager 未初始化窗口也正确）
 			var en int
@@ -349,7 +381,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			if m == nil || !m.AutoUpdateEnabled() {
 				return time.Time{}
 			}
-			return parseUTCSlot(m.NextScheduledSlot())
+			return ip2regionNextSlotAware()
 		},
 		EnabledFn: func() bool { // 业务开关联动展示（关=已暂停；DB 直读）
 			var en int

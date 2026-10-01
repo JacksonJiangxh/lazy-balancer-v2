@@ -736,7 +736,7 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 			entryTotal := 0
 			var sourceNames []string
 			for _, row := range threatSources {
-				if row["apply_enabled"] == 1 || row["apply_enabled"] == true {
+				if toFloat64(row["apply_enabled"]) >= 1 { // U5-P4（第 65 轮）：json.Unmarshal 产物恒 float64——== 1/== true 双分支恒假
 					threatEnabled++
 					entryTotal += int(toFloat64(row["entry_count"]))
 					if name, ok := row["display_name"].(string); ok && name != "" {

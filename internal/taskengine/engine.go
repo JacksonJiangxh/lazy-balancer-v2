@@ -34,7 +34,7 @@ type Role string
 const (
 	RoleAny        Role = "any"
 	RoleMasterOnly Role = "master-only"
-	RoleSlaveOnly  Role = "slave-only"
+	RoleSlaveOnly  Role = "slave-only" // 仅测试注册使用（U1 P5 备注）
 )
 
 // RunContext 交给任务体的执行上下文。
@@ -66,14 +66,19 @@ type Descriptor struct {
 	Run func(RunContext) error
 
 	CancelHook func() bool
-	EnabledFn  func() bool      // false=暂停（引擎不调度）
-	StatusFn   func() string    // 状态镜像
-	ToggleFn   func(bool) error // 调度开关 setter
-	ToggleName string
-	ManualRun  bool
-	Cancelable bool
-	RunsOn     Role
-	MasterOnly bool
+	EnabledFn  func() bool // false=暂停（引擎不调度）
+	// PassiveCarrier：被动守护 daemon（Run=<-ctx.Done() 仅承载状态，真实服务
+	// 由 lifecycle 独立管理）——控制面（重启按钮/调度开关）不适用于此类任务，
+	// 展示为「仅状态视图」（L1-1 第 65 轮：曾假控制面——「停止集群同步」
+	// 实际停不掉 SyncService）。仅 KindDaemon 有效。
+	PassiveCarrier bool
+	StatusFn       func() string    // 状态镜像
+	ToggleFn       func(bool) error // 调度开关 setter
+	ToggleName     string
+	ManualRun      bool
+	Cancelable     bool
+	RunsOn         Role
+	MasterOnly     bool
 }
 
 // RunRecord task_runs 行视图。
@@ -103,9 +108,10 @@ type registration struct {
 	running            bool
 	cancel             context.CancelFunc
 	lastCheck          time.Time // Periodic：最近到期判定基准
-	nextScheduledTime  time.Time // Scheduled：缓存下一槽（60s 刷新——配置变更响应窗口）
-	nextSlotComputedAt time.Time
-	loopEnabled        bool // 循环/调度开关
+	nextScheduledTime  time.Time // Scheduled：下一槽（每 tick 重读——µs 级 SELECT）
+	nextSlotComputedAt time.Time // 已弃用（保留字段零成本——U1 P5 备注可随下次触碰删）
+	loopEnabled        bool      // 循环/调度开关
+	pendingRestart     bool      // daemon restart 意图：旧 Run 退出后自动拉起新代（U1-P2-3）
 }
 
 // ---- Engine ----
@@ -178,29 +184,68 @@ func (e *Engine) SetRole(isMaster bool) {
 	}
 	e.mu.RUnlock()
 	for _, r := range daemons {
-		allowed := e.roleAllows(r.desc.RunsOn)
-		r.mu.Lock()
-		loopOn, running := r.loopEnabled, r.running
-		r.mu.Unlock()
-		if loopOn && allowed && !running {
-			e.startDaemon(r.desc.ID, r)
-		} else if running && !allowed {
-			// 角色不符：仅取消 Run（loopEnabled 保留——promote 后自动拉起，
-			// 用户调度开关语义不被角色翻转隐式改写）
-			r.mu.Lock()
-			c := r.cancel
-			r.mu.Unlock()
-			if c != nil {
-				c()
+		if e.roleAllows(r.desc.RunsOn) {
+			e.tryStartDaemon(r) // 内含 loopOn&&!running CAS——空闲且调度开才启动
+			// L2-F2（第 65 轮）：promote 后 Periodic 即时首轮——曾 interval
+			// 时钟在从节点照常推进，cert-renewal-scan/reconcile 首轮要等残余
+			// 间隔（最坏 ~6h）。置零 lastCheck 使下一 tick 即到期。
+			if r.desc.Kind == KindPeriodic {
+				r.mu.Lock()
+				r.lastCheck = time.Time{}
+				r.mu.Unlock()
 			}
+			continue
+		}
+		// 角色不符：仅取消 Run（loopEnabled 保留——promote 后自动拉起，
+		// 用户调度开关语义不被角色翻转隐式改写）
+		r.mu.Lock()
+		c := r.cancel
+		r.mu.Unlock()
+		if c != nil {
+			c()
 		}
 	}
+}
+
+// IsTaskInFlight 任务 Run 是否在途（handler 同步单飞预检——L1-3）。
+func (e *Engine) IsTaskInFlight(id string) bool {
+	e.mu.RLock()
+	r := e.regs[id]
+	e.mu.RUnlock()
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.running
 }
 
 func (e *Engine) isMaster() bool {
 	e.roleMu.RLock()
 	defer e.roleMu.RUnlock()
 	return e.role
+}
+
+// tryStartDaemon daemon 空闲且调度开时原子启动（锁内 CAS——并发调用方
+// 只有一个胜出；U1-P2-4 统一入口）。
+func (e *Engine) tryStartDaemon(r *registration) {
+	r.mu.Lock()
+	if !r.loopEnabled {
+		r.mu.Unlock()
+		return
+	}
+	if r.running {
+		// U1-P2-3：在跑但已请求停止（restart 的 Stop 半程）——记意图，
+		// 旧 Run goroutine 退出清理时自动拉起新代
+		if r.cancel != nil {
+			r.pendingRestart = true
+		}
+		r.mu.Unlock()
+		return
+	}
+	r.running = true // 占位：并发者此处被拒
+	r.mu.Unlock()
+	e.startDaemon(r.desc.ID, r)
 }
 
 func (e *Engine) Register(d Descriptor) error {
@@ -220,22 +265,6 @@ func (e *Engine) SetManualRun(id string, ok bool) {
 	if r, exist := e.regs[id]; exist {
 		r.desc.ManualRun = ok
 	}
-}
-
-func (e *Engine) Toggle(id string, enabled bool) error {
-	e.mu.RLock()
-	r := e.regs[id]
-	e.mu.RUnlock()
-	if r == nil || r.desc.ToggleFn == nil {
-		return ErrNotFound
-	}
-	return r.desc.ToggleFn(enabled)
-}
-
-func (e *Engine) Unregister(id string) {
-	e.mu.Lock()
-	delete(e.regs, id)
-	e.mu.Unlock()
 }
 
 func (e *Engine) Trigger(id, trigger, operator string) error {
@@ -258,13 +287,21 @@ func (e *Engine) Cancel(id string) bool {
 	if r == nil || !r.desc.Cancelable {
 		return false
 	}
-	if r.desc.CancelHook != nil {
-		return r.desc.CancelHook()
-	}
 	r.mu.Lock()
 	c := r.cancel
 	running := r.running
 	r.mu.Unlock()
+	hook := r.desc.CancelHook
+	if hook != nil {
+		ok := hook()
+		// L1-6（第 65 轮）：manager 侧取消成功后同步取消引擎 ctx——Run 返回
+		// 时 terminalStatus 判 cancelled（曾 manager 取消路径引擎 ctx 不动，
+		// 终态落 failed，历史无法区分「用户取消」与「真失败」）
+		if ok && c != nil && running {
+			c()
+		}
+		return ok
+	}
 	if c == nil || !running {
 		return false
 	}
@@ -287,11 +324,10 @@ func (e *Engine) StartLoop(id string) {
 	r.loopEnabled = true
 	r.lastCheck = time.Time{}
 	r.mu.Unlock()
-
-	// Daemon：启动自管理循环（Run 阻塞直到取消）——角色门内才启动
-	//（master-only daemon 在从节点只挂 loopEnabled，promote 时由 SetRole 拉起）
-	if r.desc.Kind == KindDaemon && !r.running && e.roleAllows(r.desc.RunsOn) {
-		e.startDaemon(id, r)
+	// Daemon：CAS 启动（U1-P2-4：曾锁外读 running=并发双启动窗口；
+	// SetRole/StartLoop 统一走 tryStartDaemon 单一入口）
+	if r.desc.Kind == KindDaemon && e.roleAllows(r.desc.RunsOn) {
+		e.tryStartDaemon(r)
 	}
 }
 
@@ -333,6 +369,7 @@ func (e *Engine) IsRunning(id string) bool {
 // ---- Daemon 生命周期 ----
 
 func (e *Engine) startDaemon(id string, r *registration) {
+	// 调用方已在锁内置 r.running=true（占位）；此处补 cancel 登记。
 	runID := globalInsertRun(id, r.desc.Family, "auto")
 	taskLogAppend(id, "[start] 常驻启动")
 	// 2026-10-01 用户裁定：启动即记 success（启动是既成事实——成功列体现
@@ -341,7 +378,6 @@ func (e *Engine) startDaemon(id string, r *registration) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	r.mu.Lock()
-	r.running = true
 	r.cancel = cancel
 	r.mu.Unlock()
 
@@ -350,9 +386,15 @@ func (e *Engine) startDaemon(id string, r *registration) {
 		err := r.desc.Run(RunContext{Ctx: ctx, Trigger: "auto", RunID: runID})
 		dur := time.Since(start).Milliseconds()
 
+		restart := false
 		r.mu.Lock()
 		r.running = false
 		r.cancel = nil
+		if r.pendingRestart {
+			r.pendingRestart = false
+			r.running = true // 立即占位防并发窗口
+			restart = true
+		}
 		r.mu.Unlock()
 
 		if err != nil && ctx.Err() == nil {
@@ -360,9 +402,12 @@ func (e *Engine) startDaemon(id string, r *registration) {
 			failID := globalInsertRunAt(id, r.desc.Family, "auto", start.In(engineLocPtr()).Format("2006-01-02 15:04:05"))
 			e.finishRun(failID, "failed", dur)
 			taskLogAppend(id, fmt.Sprintf("[done] failed 耗时=%dms 触发=auto 错误=%s", dur, err.Error()))
-			return
+		} else {
+			taskLogAppend(id, fmt.Sprintf("[done] stopped 耗时=%dms 触发=auto（取消/正常退出）", dur))
 		}
-		taskLogAppend(id, fmt.Sprintf("[done] stopped 耗时=%dms 触发=auto（取消/正常退出）", dur))
+		if restart {
+			e.startDaemon(id, r) // U1-P2-3：restart 意图落地——新代接续
+		}
 	}()
 }
 
@@ -617,6 +662,13 @@ func (e *Engine) finishRun(runID int64, status string, durMs int64) {
 	_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=? WHERE id=?`, status, engineNowStr(), durMs, runID)
 }
 
+func (e *Engine) finishRunWithMessage(runID int64, status string, durMs int64, message string) {
+	if runID <= 0 || db.DB == nil {
+		return
+	}
+	_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=?, message=? WHERE id=?`, status, engineNowStr(), durMs, message, runID)
+}
+
 // RecordRunStart/Finish 族侧记录（legacy 路径：非引擎调用的直接执行）
 func RecordRunStart(taskID, family, trigger string) int64 {
 	return globalInsertRun(taskID, family, trigger)
@@ -636,23 +688,66 @@ func RecordRunFinish(runID int64, status string, durMs int64, message string) {
 // ---- 元数据 ----
 
 type TaskMeta struct {
-	ID           string `json:"id"`
-	Family       string `json:"family"`
-	Name         string `json:"name"`
-	Description  string `json:"description"`
-	Category     string `json:"category"`
-	Kind         Kind   `json:"kind"`
-	IntervalSec  int    `json:"interval_sec"`
-	NextSlot     string `json:"next_slot"`
-	Enabled      bool   `json:"enabled"`
-	StatusMirror string `json:"status_mirror"`
-	Controllable bool   `json:"controllable"`
-	Cancelable   bool   `json:"cancelable"`
-	Toggleable   bool   `json:"toggleable"`
-	ToggleName   string `json:"toggle_name"`
-	LoopOn       bool   `json:"loop_on"`
-	Running      bool   `json:"running"` // Daemon：Run 实际存活（角色门/停止后=false）
-	CanTrigger   bool   `json:"can_trigger"`
+	ID             string `json:"id"`
+	Family         string `json:"family"`
+	Name           string `json:"name"`
+	Description    string `json:"description"`
+	Category       string `json:"category"`
+	Kind           Kind   `json:"kind"`
+	IntervalSec    int    `json:"interval_sec"`
+	NextSlot       string `json:"next_slot"`
+	Enabled        bool   `json:"enabled"`
+	StatusMirror   string `json:"status_mirror"`
+	Controllable   bool   `json:"controllable"`
+	Cancelable     bool   `json:"cancelable"`
+	Toggleable     bool   `json:"toggleable"`
+	ToggleName     string `json:"toggle_name"`
+	LoopOn         bool   `json:"loop_on"`
+	Running        bool   `json:"running"` // Daemon：Run 实际存活（角色门/停止后=false）
+	CanTrigger     bool   `json:"can_trigger"`
+	StatusViewOnly bool   `json:"status_view_only"` // 被动守护：仅状态视图（控制面不适用）
+}
+
+// Lookup 单任务元数据（U1-P4-2：handler 为取单字段跑全量 DescribeAll
+// ~12-18 条 SQL——现仅执行该任务的 Fn）。
+func (e *Engine) Lookup(id string) (TaskMeta, bool) {
+	e.mu.RLock()
+	r := e.regs[id]
+	e.mu.RUnlock()
+	if r == nil {
+		return TaskMeta{}, false
+	}
+	r.mu.Lock()
+	loopOn, running := r.loopEnabled, r.running
+	r.mu.Unlock()
+	m := TaskMeta{
+		ID: id, Family: r.desc.Family, Name: r.desc.Name,
+		Description: r.desc.Description, Category: r.desc.Category, Kind: r.desc.Kind,
+		CanTrigger:     r.desc.ManualRun,
+		Cancelable:     r.desc.Cancelable,
+		Toggleable:     r.desc.ToggleFn != nil,
+		ToggleName:     r.desc.ToggleName,
+		LoopOn:         loopOn,
+		Running:        running,
+		Enabled:        true,
+		Controllable:   r.desc.Kind == KindDaemon && !r.desc.PassiveCarrier,
+		StatusViewOnly: r.desc.Kind == KindDaemon && r.desc.PassiveCarrier,
+	}
+	if r.desc.IntervalFn != nil {
+		m.IntervalSec = int(r.desc.IntervalFn().Seconds())
+	}
+	if r.desc.NextSlotFn != nil {
+		if t := r.desc.NextSlotFn(); !t.IsZero() {
+			m.NextSlot = t.In(engineLocPtr()).Format("2006-01-02 15:04:05")
+		}
+	}
+	if r.desc.EnabledFn != nil {
+		m.Enabled = r.desc.EnabledFn()
+	}
+	if r.desc.StatusFn != nil {
+		m.StatusMirror = r.desc.StatusFn()
+	}
+	return m, true
 }
 
 func (e *Engine) DescribeAll() []TaskMeta {
@@ -677,14 +772,15 @@ func (e *Engine) DescribeAll() []TaskMeta {
 		m := TaskMeta{
 			ID: s.id, Family: s.desc.Family, Name: s.desc.Name,
 			Description: s.desc.Description, Category: s.desc.Category, Kind: s.desc.Kind,
-			CanTrigger:   s.desc.ManualRun,
-			Cancelable:   s.desc.Cancelable,
-			Toggleable:   s.desc.ToggleFn != nil,
-			ToggleName:   s.desc.ToggleName,
-			LoopOn:       s.loopOn,
-			Running:      s.running,
-			Enabled:      true,
-			Controllable: s.desc.Kind == KindDaemon, // 常驻族可启停
+			CanTrigger:     s.desc.ManualRun,
+			Cancelable:     s.desc.Cancelable,
+			Toggleable:     s.desc.ToggleFn != nil,
+			ToggleName:     s.desc.ToggleName,
+			LoopOn:         s.loopOn,
+			Running:        s.running,
+			Enabled:        true,
+			Controllable:   s.desc.Kind == KindDaemon && !s.desc.PassiveCarrier, // 常驻族可启停（被动守护除外=L1-1）
+			StatusViewOnly: s.desc.Kind == KindDaemon && s.desc.PassiveCarrier,
 		}
 		if s.desc.IntervalFn != nil {
 			m.IntervalSec = int(s.desc.IntervalFn().Seconds())

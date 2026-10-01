@@ -815,9 +815,18 @@ export const entryMatchesIp = (entry: string, ip: string): boolean => {
 
 // —— 跨组件共享条目缓存（第 61 轮 P2-2）：IPLocationAction 与 TriggerDetailDialog
 // 共用，写入动作（useTrustAssociation/useIpListAdd 链路）调用 invalidate 清空 ——
+// FE65-1（第 65 轮）：invalidate 同时通知订阅者（已打开弹框的本地副本即时
+// 失效重拷——曾失效触不到本地 ref，开放窗口叠开 IP 处置后徽标滞留旧值）。
 export const sharedEntriesCache: Record<number, string[]> = {}
+type EntriesCacheListener = () => void
+const entriesCacheListeners = new Set<EntriesCacheListener>()
+export const subscribeSharedEntriesCache = (fn: EntriesCacheListener): (() => void) => {
+  entriesCacheListeners.add(fn)
+  return () => entriesCacheListeners.delete(fn)
+}
 export const invalidateSharedEntriesCache = (): void => {
   for (const k of Object.keys(sharedEntriesCache)) delete sharedEntriesCache[Number(k)]
+  for (const fn of entriesCacheListeners) fn()
 }
 
 // formatDurationUs 安全处理耗时格式化(微秒→人类可读,分级精度):

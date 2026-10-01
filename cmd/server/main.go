@@ -260,11 +260,13 @@ func run() error {
 		if ip2RegionManager := services.GetIP2RegionUpdateManager(); ip2RegionManager != nil {
 			ip2RegionManager.StopScheduler()
 		}
+		if threatMgr := services.GetThreatUpdateManager(); threatMgr != nil {
+			threatMgr.StopScheduler() // U8b-P5-7：三调度器对称收尾（曾漏 threat——退出窗口可 tick 关闭库）
+		}
 		services.StopSecurityEventsRetention()
 		services.StopAuditCleanup()
 		services.StopTimezoneRefresh()
 		services.StopLogRotate()
-		services.StopRuntimeLogCleanup()
 		lifecycle.Shutdown()
 	}()
 

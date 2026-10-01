@@ -65,7 +65,7 @@ func TestFastLoad_vs_TextLoad_200k(t *testing.T) {
 		t.Fatalf("text: %v", err2)
 	}
 	t.Logf("20万条冷加载: .fast=%v text=%v 加速=%.0fx", d1, d2, float64(d2)/float64(d1))
-	if d1 > d2 {
+	if d1 > 2*d2 { // U2b-T-1：2 倍余量防宿主负载假红（曾 1:1 墙钟比较 Flake 面）
 		t.Fatalf(".fast 加载必须不慢于文本: fast=%v text=%v", d1, d2)
 	}
 

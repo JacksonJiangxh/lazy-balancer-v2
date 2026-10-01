@@ -98,7 +98,6 @@ func TestBuildIPPrecheckDirectives_denyPrecedesExempt(t *testing.T) {
 	}
 }
 
-// R-10 引擎编译门禁：allow 豁免 + GeoIP 链共存的真实渲染产物必须被 coraza
 // 编译接受（pass+skipAfter 与 deny+chain 混排形状）。
 func TestEngineGate_allowExemptWithGeoChain(t *testing.T) {
 	allowPolicy := &models.SecurityPolicy{
@@ -151,4 +150,19 @@ func TestBuildIPPrecheckDirectives_denyPrecedesAllowDeny(t *testing.T) {
 		t.Fatalf("deny 并集须先于 allow 交集外拒绝发射（deny=%d allow=%d）:\n%s", idxDeny, idxAllow, directives)
 	}
 	_ = idxBlacklist
+}
+
+// U2b-T-2（第 65 轮）：阶段 1 抬码形态（denyStatus=481——id:2/4 带 status:481）
+// 过 R-10 引擎编译门禁——曾全部门禁调用恒传 0，仅编译期可见的形状错误单测拦不住。
+func TestEngineGate_precheckDirectivesWithLiftedStatus481(t *testing.T) {
+	deny := &models.SecurityPolicy{Enabled: true, IPACLMode: "deny", IPACLEnabled: true, IPACLList: `["192.0.2.0/24"]`}
+	policies := []*models.SecurityPolicy{deny}
+	directives, err := buildIPPrecheckDirectives(policies, 481)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if !strings.Contains(directives, "status:481") {
+		t.Fatalf("抬码形态应含 status:481\n%s", directives)
+	}
+	compileForEngineGate(t, directives) // 复用门禁 helper（过滤 SecAuditLog 等环境行）
 }

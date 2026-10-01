@@ -166,7 +166,7 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 		}
 		entryCount++
 		if entryCount > maxLbbakEntryCount {
-			return nil, fmt.Errorf("lbbak 条目数超过上限 %d(合法备份恒为 4 条)", maxLbbakEntryCount)
+			return nil, fmt.Errorf("lbbak 条目数超过上限 %d(合法备份条目数随威胁源数变化（上限 64）)", maxLbbakEntryCount)
 		}
 		totalBytes += hdr.Size
 		if totalBytes > maxLbbakTotalBytes {
@@ -238,10 +238,13 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 // R39-12:ip2regionTag 从备份表区传入——空 tag 会让 ApplyWafFileBundle 删除
 // .version 伴生文件,破坏「文件与版本记录同批」不变量。
 // R39-13:落盘失败返回警告文本(调用方注入响应 warnings),不再仅审计静默。
-func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip2regionTag string) string {
+// 返回 (warning, filesLanded)：filesLanded=有文件真实落盘（L6-F1——commit
+// 失败时据此追加「文件/DB 分裂」可见警告；A40-2-F4 意图补全）。
+func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip2regionTag string) (string, bool) {
 	if payload.CRSTarGz == nil && payload.Xdb == nil && len(payload.ThreatIplists) == 0 {
-		return ""
+		return "", false
 	}
+	threatLanded := false
 	bundle := &services.WafFileBundle{IP2RegionTag: ip2regionTag}
 	if payload.CRSTarGz != nil {
 		bundle.CRSSha256 = payload.CRSSha256
@@ -264,6 +267,7 @@ func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip
 			recordAudit(c, action+"警告", "配置备份", "威胁库 "+source+" 落盘失败: "+err.Error())
 			continue
 		}
+		threatLanded = true
 		if err := services.CompileFromIplistFile(iplistPath); err != nil {
 			services.Logf("error", "lbbak 导入威胁库 %s: 编译 .fast 失败: %v", source, err)
 			recordAudit(c, action+"警告", "配置备份", "威胁库 "+source+" 编译失败: "+err.Error())
@@ -271,11 +275,18 @@ func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip
 		}
 		services.AppendThreatUpdateLog("INFO", "success", "威胁库 "+source+" 已随备份导入(.iplist 落盘 + .fast 编译)")
 	}
-	if crsChanged, xdbChanged, _, err := services.ApplyWafFileBundle(bundle); err != nil {
+	crsChanged, xdbChanged := false, false
+	if _, _, _, err := services.ApplyWafFileBundle(bundle); err != nil {
 		services.Logf("error", "lbbak 导入落盘规则库文件失败: %v", err)
 		recordAudit(c, action+"警告", "配置备份", "规则库文件落盘失败: "+err.Error())
-		return "规则库文件落盘失败: " + err.Error()
-	} else if crsChanged || xdbChanged {
+		return "规则库文件落盘失败: " + err.Error(), threatLanded
+	} else {
+		// ApplyWafFileBundle 内部已判定变更；此处以「有携带即视为可能落盘」
+		// 保守口径（变更判定不外泄——filesLanded 用于失败分裂警告，宁可多报）
+		crsChanged = payload.CRSTarGz != nil
+		xdbChanged = payload.Xdb != nil
+	}
+	if crsChanged || xdbChanged {
 		recordAudit(c, action, "安全数据", services.FormatAuditDetail("规则库数据库(随备份还原/导入)", services.AuditResultPart("success")))
 		// 完整更新流程(与自动更新器同款分阶段流水,来源=lbbak 备份)
 		if xdbChanged {
@@ -292,7 +303,7 @@ func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip
 			services.AppendCRSUpdateLog("INFO", "success", "CRS 已随备份导入更新")
 		}
 	}
-	return ""
+	return "", true
 }
 
 // isLbbakBytes 按魔数识别 tar.gz 备份(gzip 0x1f 0x8b)。

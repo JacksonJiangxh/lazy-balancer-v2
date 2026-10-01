@@ -41,27 +41,28 @@ const (
 
 // TaskInfo 是单任务族的聚合视图。
 type TaskInfo struct {
-	ID           string       `json:"id"`
-	Name         string       `json:"name"`
-	Description  string       `json:"description,omitempty"` // 任务作用说明（任务名 hover 提示）
-	Cadence      string       `json:"cadence,omitempty"`     // 运行节奏（如「每 6 小时」；非下次时间）
-	Category     string       `json:"category"`              // 安全防护/证书/备份/集群/系统
-	Kind         TaskKind     `json:"kind"`
-	Status       TaskStatus   `json:"status"`
-	Enabled      bool         `json:"enabled"`              // 自动调度开关
-	Cancellable  bool         `json:"cancellable"`          // 运行中可手动取消（仅下载类）
-	Controllable bool         `json:"controllable"`         // 常驻循环可启停（start/stop/restart）
-	Triggerable  bool         `json:"triggerable"`          // 支持手动触发（ManualRun 语义族）
-	Toggleable   bool         `json:"toggleable"`           // 调度开关可暂停/恢复（ToggleFn 声明族）
-	StartedAt    string       `json:"started_at,omitempty"` // 常驻族启动时刻；其他类型空
-	LogSizeBytes int64        `json:"log_size_bytes"`       // 本任务日志文件大小（字节）
-	LoopOn       bool         `json:"loop_on"`              // 调度开关当前态（定时/循环/常驻调度列绑定值）
-	LastRun      *TaskRunInfo `json:"last_run,omitempty"`
-	NextRunAt    string       `json:"next_run_at,omitempty"`
-	Runs24h      int          `json:"runs_24h"`
-	Success24h   int          `json:"success_24h"`
-	Fail24h      int          `json:"fail_24h"`
-	DetailHint   string       `json:"detail_hint,omitempty"` // 前端详情跳转提示
+	ID             string       `json:"id"`
+	Name           string       `json:"name"`
+	Description    string       `json:"description,omitempty"` // 任务作用说明（任务名 hover 提示）
+	Cadence        string       `json:"cadence,omitempty"`     // 运行节奏（如「每 6 小时」；非下次时间）
+	Category       string       `json:"category"`              // 安全防护/证书/备份/集群/系统
+	Kind           TaskKind     `json:"kind"`
+	Status         TaskStatus   `json:"status"`
+	Enabled        bool         `json:"enabled"`              // 自动调度开关
+	Cancellable    bool         `json:"cancellable"`          // 运行中可手动取消（仅下载类）
+	Controllable   bool         `json:"controllable"`         // 常驻循环可启停（start/stop/restart）
+	Triggerable    bool         `json:"triggerable"`          // 支持手动触发（ManualRun 语义族）
+	Toggleable     bool         `json:"toggleable"`           // 调度开关可暂停/恢复（ToggleFn 声明族）
+	StatusViewOnly bool         `json:"status_view_only"`     // 被动守护：仅状态视图（控制面不适用，L1-1）
+	StartedAt      string       `json:"started_at,omitempty"` // 常驻族启动时刻；其他类型空
+	LogSizeBytes   int64        `json:"log_size_bytes"`       // 本任务日志文件大小（字节）
+	LoopOn         bool         `json:"loop_on"`              // 调度开关当前态（定时/循环/常驻调度列绑定值）
+	LastRun        *TaskRunInfo `json:"last_run,omitempty"`
+	NextRunAt      string       `json:"next_run_at,omitempty"`
+	Runs24h        int          `json:"runs_24h"`
+	Success24h     int          `json:"success_24h"`
+	Fail24h        int          `json:"fail_24h"`
+	DetailHint     string       `json:"detail_hint,omitempty"` // 前端详情跳转提示
 }
 
 // TaskRunInfo 最近一次运行。
@@ -97,11 +98,12 @@ func CollectSystemTasks() []TaskInfo {
 func collectCertJobRows() []TaskInfo {
 	// 2026-10-01 用户裁定：行存在即显示（无状态/时间过滤——曾按
 	// 「issued 超 1 天隐藏」窗口过滤致主节点签发行消失）；仅排除从节点
-	// 材料物化行（非签发任务，从节点禁签发）。
+	// 材料物化行（非签发任务，从节点禁签发）。LIMIT 100（U1-P3-2 裁定后
+	// 收敛：20 截断「存在即显示」——100 贴近裁定原文且长周期主节点不触顶）。
 	rows, err := db.DB.Query(`SELECT id, domain, status, COALESCE(message,''), COALESCE(updated_at,created_at)
 		FROM cert_jobs
 		WHERE COALESCE(message,'') NOT LIKE '从主节点同步%'
-		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT 20`)
+		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT 100`)
 	if err != nil {
 		return nil
 	}
@@ -168,7 +170,8 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			Category: m.Category, Kind: TaskKind(m.Kind),
 			Controllable: m.Controllable, Cancellable: m.Cancelable, Triggerable: m.CanTrigger,
 			Toggleable: m.Toggleable, Enabled: m.Enabled, DetailHint: m.Family,
-			LoopOn: m.LoopOn,
+			StatusViewOnly: m.StatusViewOnly,
+			LoopOn:         m.LoopOn,
 		}
 		// 节奏：循环=间隔，定时=排程槽，常驻=自管理，触发=手动
 		switch m.Kind {
@@ -187,15 +190,15 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 				ti.Cadence = fmt.Sprintf("每 %d 秒（用户配置同步间隔）", iv)
 			}
 		}
+		// L1-13：LatestRun 单次查询复用（曾每任务两查）
+		latestRun := te.LatestRun(m.ID)
 		// 状态分流（v2.0 四类型）：
 		// · 镜像优先（manager 运行中/队列计数/角色/cert-waiting-ca 门控）
-		// · 常驻 → 调度开关态（运行中/已停止）
+		// · 常驻 → 实际运行态（Run 存活=运行中；调度开未跑=空闲；调度关=已停止）
 		// · 定时/循环/触发 → 最近真实运行终态（空闲/失败/运行中）
 		if m.StatusMirror != "" {
 			ti.Status = TaskStatus(m.StatusMirror)
 		} else if m.Kind == taskengine.KindDaemon {
-			// 实际运行态驱动：Run 存活=运行中；调度开但未跑（角色不符）=空闲；
-			// 调度关=已停止
 			if m.Running {
 				ti.Status = TaskStatusRunning
 			} else if m.LoopOn {
@@ -205,8 +208,8 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			}
 		} else {
 			ti.Status = TaskStatusIdle
-			if lr := te.LatestRun(m.ID); lr != nil {
-				switch lr.Status {
+			if latestRun != nil {
+				switch latestRun.Status {
 				case "failed":
 					ti.Status = TaskStatusFailed
 				case "running":
@@ -222,11 +225,11 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		}
 		// 下一槽：定时=NextSlotFn（声明式）；循环=last+interval 兜底
 		ti.NextRunAt = m.NextSlot
-		if lr := te.LatestRun(m.ID); lr != nil {
-			ti.LastRun = &TaskRunInfo{StartedAt: lr.StartedAt, FinishedAt: lr.FinishedAt,
-				DurationMs: lr.DurationMs, Trigger: lr.Trigger, Result: lr.Status, Message: lr.Message}
+		if latestRun != nil {
+			ti.LastRun = &TaskRunInfo{StartedAt: latestRun.StartedAt, FinishedAt: latestRun.FinishedAt,
+				DurationMs: latestRun.DurationMs, Trigger: latestRun.Trigger, Result: latestRun.Status, Message: latestRun.Message}
 			if ti.NextRunAt == "" && m.IntervalSec > 0 && m.LoopOn && m.Kind == taskengine.KindPeriodic {
-				if t, err := time.ParseInLocation("2006-01-02 15:04:05", lr.StartedAt, CurrentLocation()); err == nil {
+				if t, err := time.ParseInLocation("2006-01-02 15:04:05", latestRun.StartedAt, CurrentLocation()); err == nil {
 					ti.NextRunAt = t.Add(time.Duration(m.IntervalSec) * time.Second).Format("2006-01-02 15:04:05")
 				}
 			}
@@ -237,9 +240,14 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		}
 		st := te.Stats24h(m.ID)
 		ti.Runs24h, ti.Success24h, ti.Fail24h = st.Runs, st.Success, st.Fail
-		// 常驻族启动时刻——「常驻 · 启动于」展示位
+		// 常驻族启动时刻——「常驻 · 启动于」。L1-12（第 65 轮）：用该 daemon
+		// 最近 boot 行时刻（重启后正确更新）——曾恒用进程启动时刻（=uptime
+		// 而非服务启动，标签语义失真）。
 		if m.Kind == taskengine.KindDaemon {
 			ti.StartedAt = te.StartedAt().In(CurrentLocation()).Format("2006-01-02 15:04:05")
+			if latestRun != nil {
+				ti.StartedAt = latestRun.StartedAt
+			}
 		}
 		out = append(out, ti)
 	}

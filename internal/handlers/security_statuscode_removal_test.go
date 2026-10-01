@@ -14,7 +14,7 @@ import (
 
 // newSecurityEntityRouter 注册自定义规则与拦截页面的读写路由，供 status_code 列
 // 移除后的 CRUD 回归测试使用。与 newSecurityRouter 一样注入假的 Caddy 服务，
-// 使 Create/Update 处理器末尾的 caddyApplyNote() 不会空指针。
+// 使 Create/Update 处理器的事务内应用路径 不会空指针。
 func newSecurityEntityRouter(t *testing.T) *gin.Engine {
 	t.Helper()
 	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -1221,6 +1221,11 @@ func CreateOrRequeueCertJobWithChange(ruleID, domains string, caProviderID int, 
 		}
 		return 0, false, fmt.Errorf("CA queue is paused")
 	}
+	// U1-P3-1：任务入队即唤醒 cert-waiting-ca（默认调度关闭——手动签发/
+	// 重试/续期扫描全部创建路径经此单点覆盖；全部终态由 Run 体自停）。
+	if te := TaskEngine(); te != nil && certJobsActive() {
+		te.StartLoop("cert-waiting-ca")
+	}
 	return jobID, true, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"lazy-balancer-v2/internal/models"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -167,7 +168,7 @@ func TestJWTAuthReportsRevokedBeforeMissingUser(t *testing.T) {
 		t.Fatal(err)
 	}
 	hash := sha256.Sum256([]byte(jti))
-	if _, err := database.Exec("INSERT INTO revoked_jti VALUES (?,?)", hex.EncodeToString(hash[:]), time.Now().Add(time.Hour).UTC().Format(revokedTokenTimeFormat)); err != nil {
+	if _, err := database.Exec("INSERT INTO revoked_jti VALUES (?,?)", hex.EncodeToString(hash[:]), time.Now().Add(time.Hour).UTC().Format(models.RevokedTokenTimeFormat)); err != nil {
 		t.Fatal(err)
 	}
 	router := gin.New()

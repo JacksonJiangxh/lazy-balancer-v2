@@ -384,7 +384,9 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 	}
 	recordAudit(c, "更新", "API密钥", services.FormatAuditDetail(fmt.Sprintf("密钥 %d", id), name))
 	// F49-P5-19①：禁用即清扫白名单解析缓存（条目随 Key 失活永不再命中）。
-	if req.IsEnabled != nil && !*req.IsEnabled {
+	// U6a-5-6（第 65 轮）：在位编辑白名单也清扫——缓存键含白名单内容，旧键
+	// 成为孤儿永不再命中（曾仅禁用/删除清扫）。
+	if (req.IsEnabled != nil && !*req.IsEnabled) || req.MCPIPWhitelist != nil {
 		purgeAPIKeyWhitelistCache(id)
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "API 密钥已更新"})

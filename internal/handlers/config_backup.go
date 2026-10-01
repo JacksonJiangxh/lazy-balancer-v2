@@ -2618,8 +2618,9 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	// (ApplyConfigFromTxCertAwareForce)要读到新 CRS 文件;xdb 落盘后立即
 	// 热换内存缓存(完整更新流程,2026-09-18 用户裁定)。
 	wafApplyWarning := ""
+	wafFilesLanded := false
 	if lbbakFiles != nil && sectionTables["security_crs_version"] {
-		wafApplyWarning = applyLbbakWafFiles(c, action, lbbakFiles, services.SanitizeBundleVersion(ip2regionTagFromBackup(backup.Tables)))
+		wafApplyWarning, wafFilesLanded = applyLbbakWafFiles(c, action, lbbakFiles, services.SanitizeBundleVersion(ip2regionTagFromBackup(backup.Tables)))
 	}
 	if err := session.commit(affectedRuleIDs, pendingCertificates); err != nil {
 		status := http.StatusInternalServerError
@@ -2645,6 +2646,11 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 			// A40-2-F4:规则库文件已落盘 live 树而 DB 已回滚——状态分裂必须
 			// 随失败响应可见,不得只在审计侧留痕。
 			failureWarnings = append(append([]string{}, failureWarnings...), wafApplyWarning)
+		} else if wafFilesLanded {
+			// L6-F1（第 65 轮）：文件成功落盘+commit 失败=文件与版本记录分裂
+			//（旧备份 CRS 覆盖新系统等）——曾仅审计可重构、响应对用户静默。
+			failureWarnings = append(append([]string{}, failureWarnings...),
+				"规则库文件已按备份落盘，但数据库已回滚——文件与版本记录已分裂，请重新导入或触发规则库更新以收敛")
 		}
 		c.JSON(status, models.APIResponse{Code: status, Message: message, Data: gin.H{"summary": counts, "disabled_conflicts": disabledConflicts, "warnings": failureWarnings}})
 		return

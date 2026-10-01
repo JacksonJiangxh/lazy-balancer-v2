@@ -10,7 +10,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -19,6 +18,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
+	"sync/atomic"
 )
 
 const compensationTimeout = 10 * time.Second
@@ -31,7 +31,7 @@ type Handlers struct {
 	clusterService    *services.ClusterService
 	caProviderService *services.CAProviderService
 	removeCertFiles   func(string) error
-	caddyOpMu         sync.Mutex
+	caddyOpMu         caddyOpMutex // L5-01：委托 services 共享实例（零值可用——测试直构安全）
 }
 
 type Dependencies struct {
@@ -60,6 +60,15 @@ func NewHandlers(deps Dependencies) *Handlers {
 		caProviderService: deps.CAProviderService,
 	}
 }
+
+// caddyOpMutex 零值锁类型：全部操作委托 services.CaddyOpLock 共享实例
+// （L5-01：后台 Force 重载与 handler 写路径全程互斥；零值可用——测试中
+// &Handlers{...} 直构无需初始化）。
+type caddyOpMutex struct{}
+
+func (caddyOpMutex) Lock()         { services.CaddyOpLock.Lock() }
+func (caddyOpMutex) Unlock()       { services.CaddyOpLock.Unlock() }
+func (caddyOpMutex) TryLock() bool { return services.CaddyOpLock.TryLock() }
 
 func compensationContext(requestCtx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(requestCtx), compensationTimeout)
@@ -149,15 +158,6 @@ func (h *Handlers) recordCaddyApplyResult(err error) {
 //
 // 家族 3 的变体（不经 tx 渲染）：PutCaddyConfig（ApplyConfig 原始载荷）与
 // 备份导入 ×2（协调器内应用）各自在成功尾部补记，同受契约约束。
-func (h *Handlers) caddyApplyNote(c *gin.Context) string {
-	if err := h.applyCaddyConfigE(); err != nil {
-		recordAudit(c, "重载失败", "Caddy服务", err.Error())
-		return "；但 Caddy 配置应用失败：" + err.Error()
-	}
-	recordAudit(c, "重载", "Caddy服务", "配置变更后自动重载")
-	return ""
-}
-
 func (h *Handlers) caddyApplyNoteLocked() string {
 	err := h.caddyService.GenerateAndApplyConfig()
 	if services.IsSameConfig(err) {
@@ -305,7 +305,7 @@ func reloadDetailFor(f txApplyFinish) string {
 func (h *Handlers) applyCaddyConfigE() error {
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
-	err := h.caddyService.GenerateAndApplyConfigForce()
+	err := h.caddyService.GenerateAndApplyConfigForceInLock() // 已持 caddyOpMu（=CaddyOpLock）——重入取锁死锁
 	h.recordCaddyApplyResult(err)
 	return err
 }
@@ -686,9 +686,16 @@ func clampAuditRetentionMonthsOnStartup() {
 // 滞后于 DB 的窗口(F62-28 用户裁定:自愈配置恢复须与启动初始化同一流程)。
 const caddyRestartTriggerFile = "/tmp/caddy-restarted"
 
+// caddyRestartWatcherStarted 幂等守卫（U8b-P5-6：注释曾称幂等但无守卫——
+// 第二调用点会产生双 watcher）。
+var caddyRestartWatcherStarted atomic.Bool
+
 // StartCaddyRestartWatcher 启动 Caddy 重启监听(2s 轮询 trigger 文件)。
 // 幂等(已运行不重启);main.go 在启动应用完成后调用。
 func (h *Handlers) StartCaddyRestartWatcher() {
+	if !caddyRestartWatcherStarted.CompareAndSwap(false, true) {
+		return
+	}
 	go func() {
 		for {
 			time.Sleep(2 * time.Second)

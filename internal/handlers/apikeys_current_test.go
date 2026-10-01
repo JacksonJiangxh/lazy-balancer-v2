@@ -43,8 +43,7 @@ func setupAPIKeyTestDB(t *testing.T) *sql.DB {
 		role VARCHAR(20) NOT NULL DEFAULT 'user',
 		display_name VARCHAR(100),
 		is_enabled BOOLEAN DEFAULT TRUE,
-		last_login DATETIME,
-		mfa_locked_until DATETIME
+		last_login DATETIME
 	);
 	CREATE TABLE api_keys (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,

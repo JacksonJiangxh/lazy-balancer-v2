@@ -2,7 +2,6 @@ package services
 
 import (
 	"bytes"
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,23 +10,6 @@ import (
 
 	"lazy-balancer-v2/internal/db"
 )
-
-func TestRuntimeLogCleanup_stops_when_context_is_canceled(t *testing.T) {
-	// Given
-	ctx, cancel := context.WithCancel(context.Background())
-	done := StartRuntimeLogCleanupContext(ctx, filepath.Join(t.TempDir(), "runtime.log"))
-
-	// When
-	cancel()
-	<-done
-
-	// Then
-	select {
-	case <-done:
-	default:
-		t.Fatal("runtime log cleanup did not stop")
-	}
-}
 
 func TestRotatingFileWriter_Write_returns_rotation_reopen_error(t *testing.T) {
 	// Given

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lazy-balancer-v2/internal/models"
 	"net"
 	"net/http"
 	"strconv"
@@ -38,8 +39,6 @@ var jwtAuthenticationQuery = func(query string, args ...any) *sql.Row {
 // 第 15 轮审计 I-J 的 fail-closed 回归测试需要模拟「瞬时 DB 失败」，真实关闭 DB 会
 // 连带让 jwtAuth 的会话校验先失败（401），无法单独触发守卫分支。
 var mfaUserEnabledCheck = services.MFAUserEnabled
-
-const revokedTokenTimeFormat = "2006-01-02T15:04:05Z"
 
 var recordAuthenticationSecurityAudit = services.RecordAuditLog
 var authenticationSecurityAuditNow = time.Now
@@ -206,6 +205,13 @@ func clusterRateLimit(scope string, limit int, message string) gin.HandlerFunc {
 		loginRateBuckets.Lock()
 		bucket, ok := loginRateBuckets.entries[ip+"|"+scope]
 		if !ok {
+			// U6c-P3：容量上限（与 loginRateLimit 同族 R63-U9-P3-2——曾缺此
+			// 检查：分布式攻击可无界建桶推满共享 map 使登录限流 fail-open）
+			if len(loginRateBuckets.entries) >= 1024 {
+				loginRateBuckets.Unlock()
+				c.Next() // 超限本轮放行（不添桶）——1min 清理周期内自愈
+				return
+			}
 			bucket = &loginRateBucket{until: now.Add(time.Minute)}
 			loginRateBuckets.entries[ip+"|"+scope] = bucket
 		}
@@ -761,7 +767,7 @@ func jwtAuth(cfg *config.Config) gin.HandlerFunc {
 			SELECT EXISTS(SELECT 1 FROM revoked_jti WHERE jti_hash=? AND expires_at>?) AS revoked
 		)
 		SELECT auth_state.revoked, u.username, u.role, COALESCE(u.is_enabled,0), u.password_version
-		FROM auth_state LEFT JOIN users u ON u.id=?`, encodedRevocationHash, now.Format(revokedTokenTimeFormat), int64(userIDFloat)).Scan(&revoked, &dbUsername, &dbRole, &dbEnabled, &passwordVersion)
+		FROM auth_state LEFT JOIN users u ON u.id=?`, encodedRevocationHash, now.Format(models.RevokedTokenTimeFormat), int64(userIDFloat)).Scan(&revoked, &dbUsername, &dbRole, &dbEnabled, &passwordVersion)
 		if queryErr == nil && revoked {
 			recordAuthenticationRejection(c, "jwt_revoked")
 			c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "登录状态已失效，请重新登录"})

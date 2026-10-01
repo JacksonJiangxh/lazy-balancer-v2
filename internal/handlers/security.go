@@ -113,6 +113,13 @@ func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
+	// U3-1（第 65 轮）：全局数量上限（对齐 IP 名单 ipListMaxGlobalCount=200
+	// 双限额口径——曾无上限）
+	var ruleCount int
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_custom_rules").Scan(&ruleCount); err == nil && ruleCount >= 200 {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "自定义规则总数已达上限（200 条），请先清理不再使用的规则"})
+		return
+	}
 	conditionsJSON, _ := json.Marshal(req.Conditions)
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
 	if err != nil {

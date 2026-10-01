@@ -1378,7 +1378,6 @@ func securityEventsIngestDeltaFrom(path string, from int64, archive bool) error 
 	defer f.Close()
 	securityTimingLoadReadOnly() // F64-B1-2:补采路径也需加载侧车耗时(只读不截断)
 	rules, bindings, policyByID, err := securityEventsLoadMappings()
-	securityEventsLoadMappings()
 	if err != nil {
 		return err
 	}

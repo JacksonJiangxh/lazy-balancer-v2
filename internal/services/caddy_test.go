@@ -1,6 +1,8 @@
 package services
 
 import (
+	"time"
+
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -2195,5 +2197,40 @@ func TestGenerateCaddyConfig_wafNamespaceExcludedFromServerLog(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("caddy_server exclude missing http.handlers.waf: %v", excludes)
+	}
+}
+
+// Given 后台 Force 重载与 handler 写路径（原 caddyOpMu——现共享 CaddyOpLock）。
+// When 两类写者并发。
+// Then 全程互斥（L5-01：曾后台仅持 s.mu，apply→commit 边界混合态窗口——
+// 此处钉「同一把锁」的结构事实：Force 持锁期间 handler 侧锁必须等待）。
+func TestCaddyOpLockSharedBetweenForceAndHandlers(t *testing.T) {
+	acquired := make(chan struct{})
+	released := make(chan struct{})
+	go func() {
+		CaddyOpLock.Lock()
+		close(acquired)
+		<-released
+		CaddyOpLock.Unlock()
+	}()
+	<-acquired
+	// handler 侧尝试取锁（带超时证阻塞）
+	locked := make(chan struct{})
+	go func() {
+		CaddyOpLock.Lock()
+		close(locked)
+		CaddyOpLock.Unlock()
+	}()
+	select {
+	case <-locked:
+		close(released)
+		t.Fatal("Force 持锁期间 handler 侧不应获得锁（跨层互斥失效）")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(released)
+	select {
+	case <-locked:
+	case <-time.After(time.Second):
+		t.Fatal("释放后 handler 侧应获得锁")
 	}
 }

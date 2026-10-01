@@ -246,48 +246,6 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 	return result
 }
 
-func StartRuntimeLogCleanupContext(ctx context.Context, logFile string) <-chan struct{} {
-	runtimeLogCleanup.Lock()
-	defer runtimeLogCleanup.Unlock()
-	if runtimeLogCleanup.cancel != nil {
-		runtimeLogCleanup.cancel()
-		<-runtimeLogCleanup.done
-	}
-	workerCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	runtimeLogCleanup.cancel = cancel
-	runtimeLogCleanup.done = done
-	cleanup := func() { RuntimeLogCleanupOnce(logFile) }
-
-	cleanup()
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(24 * time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				cleanup()
-			case <-workerCtx.Done():
-				return
-			}
-		}
-	}()
-	return done
-}
-
-func StopRuntimeLogCleanup() {
-	runtimeLogCleanup.Lock()
-	defer runtimeLogCleanup.Unlock()
-	if runtimeLogCleanup.cancel == nil {
-		return
-	}
-	runtimeLogCleanup.cancel()
-	<-runtimeLogCleanup.done
-	runtimeLogCleanup.cancel = nil
-	runtimeLogCleanup.done = nil
-}
-
 // taskLogsHousekeeping 任务日志统一清理与轮转（log-cleanup 任务体）——
 // 返回清理明细（哪个文件被删/轮转——用户可见）。
 func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {

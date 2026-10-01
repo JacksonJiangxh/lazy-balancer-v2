@@ -181,10 +181,34 @@ func (s *CaddyService) GenerateAndApplyConfig() error {
 // （geoip searcher / coraza WAF / TLS 证书）内存仍停留旧库，更新流程却已报
 // 成功。所有「磁盘数据变化」的重载入口（IP 库/CRS/CA 证书队列）必须走本变体。
 func (s *CaddyService) GenerateAndApplyConfigForce() error {
+	// L5-01（第 65 轮）：后台数据更新（证书/CRS/xdb/威胁）的重载与 handler
+	// 写路径共享跨层互斥（CaddyOpLock）——曾仅持 s.mu，与「caddyOpMu 全程+
+	// 事务提交」的写序存在 apply→commit 边界缺口（混合态+last_good 污染）。
+	CaddyOpLock.Lock()
+	defer CaddyOpLock.Unlock()
+	return s.GenerateAndApplyConfigForceInLock()
+}
+
+// GenerateAndApplyConfigForceInLock 已持有 CaddyOpLock 的调用方使用
+// （handler 路径全程持锁，重入取锁=死锁——rules.go 两处补偿路径同源）。
+func (s *CaddyService) GenerateAndApplyConfigForceInLock() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.applyConfigLockedOpt(generateCaddyConfigFromStore(db.DB), true)
 }
+
+// CaddyOpLock 跨层 Caddy 写互斥（L5-01）：handler 写路径（原 handlers 包
+// caddyOpMu——已别名到此实例）与后台重载（GenerateAndApplyConfigForce）
+// 在此汇合——两类写者的「渲染+/load+落库」全程串行，消除 apply→commit
+// 边界的混合态窗口（后台渲染跨写方提交点读出混合新旧态+last_good 污染）。
+// 单一锁实例、叶操作、无嵌套重入。
+type CaddyWriteLock struct{ mu sync.Mutex }
+
+func (l *CaddyWriteLock) Lock()         { l.mu.Lock() }
+func (l *CaddyWriteLock) Unlock()       { l.mu.Unlock() }
+func (l *CaddyWriteLock) TryLock() bool { return l.mu.TryLock() }
+
+var CaddyOpLock = &CaddyWriteLock{}
 
 // errSameConfig 渲染产物与运行配置字节一致（Caddy changeConfig 同源短路）。
 // 审计真实性裁定（2026-09-25 用户裁定：审计事件必须真实有效）——同字节时
@@ -3646,7 +3670,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// X-LB-GeoIP-* 是 caddygeoip→coraza 的进程内控制头（coraza 在本 handler 之前
 	// 执行，已消费完毕），绝不允许透传上游后端。无条件剥离：geoip 关闭的规则
 	// 同时防客户端伪造同名头直达后端。头名清单与 caddygeoip/handler.go 的
-	// headerNames 同源，变更需双侧同步。X-LB-Rule-ID 同型：链首注入的归因头
+	// geoipCorazaHeaders(caddygeoip/handler.go) 同源，变更需双侧同步。X-LB-Rule-ID 同型：链首注入的归因头
 	//（F3）仅供 coraza 事务内消费，同口径无条件剥离。
 	proxyRequestHeaders := map[string]interface{}{
 		"delete": []string{
