@@ -74,7 +74,7 @@ func TestApplyConfigOnStartup_warnsOnForeignRuleRoutes(t *testing.T) {
 	h.caddyService = services.NewCaddyService(fake.URL)
 
 	// When 启动应用
-	if err := h.ApplyConfigOnStartup(); err != nil {
+	if err := h.ApplyConfigOnStartup(""); err != nil {
 		t.Fatalf("ApplyConfigOnStartup: %v", err)
 	}
 
@@ -105,7 +105,7 @@ func TestApplyConfigOnStartup_noWarningWhenRoutesAllOwn(t *testing.T) {
 	h.caddyService = services.NewCaddyService(fake.URL)
 
 	// When
-	if err := h.ApplyConfigOnStartup(); err != nil {
+	if err := h.ApplyConfigOnStartup(""); err != nil {
 		t.Fatalf("ApplyConfigOnStartup: %v", err)
 	}
 

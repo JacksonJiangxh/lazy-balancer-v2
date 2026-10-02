@@ -456,7 +456,7 @@ func TestCRSSchedulerTick_prewritesConfiguredSlot(t *testing.T) {
 	}
 
 	// When 首个 tick（只排程不启动）
-	m.schedulerTick(now, nil)
+	m.schedulerTick(now)
 
 	// Then 预写=周四 06:00 槽且不启动更新
 	if fetchCalled {

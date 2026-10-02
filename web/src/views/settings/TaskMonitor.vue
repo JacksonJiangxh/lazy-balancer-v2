@@ -304,16 +304,16 @@ import type { APIResponse } from '@/types'
 
 use([CanvasRenderer, PieChart, BarChart, GridComponent, TooltipComponent, LegendComponent])
 
-interface TaskRunInfo { started_at: string; finished_at: string; duration_ms: number; trigger: string; result: string; message?: string }
+interface TaskRunInfo { started_at: string; finished_at: string; duration_ms: number; trigger: string; operator?: string; result: string; message?: string }
 interface TaskInfo {
   id: string; name: string; description?: string; cadence?: string; category: string
   kind: 'scheduled' | 'daemon' | 'periodic' | 'oneshot'
   status: string; cancellable: boolean; controllable?: boolean; triggerable?: boolean
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
-  loop_on?: boolean; started_at?: string; log_size_bytes?: number; log_size_limit?: number // 常驻族：循环启停态（调度列开关绑定值）/ 引擎启动时刻
+  loop_on?: boolean; started_at?: string; log_size_bytes?: number // 常驻族：循环启停态（调度列开关绑定值）/ 引擎启动时刻
 }
 interface RunRecord {
-  id: number; task_id: string; family: string; trigger: string; status: string
+  id: number; task_id: string; family: string; trigger: string; operator?: string; status: string
   started_at: string; finished_at: string; duration_ms: number
   stage?: string; message?: string; entry_count?: number
 }

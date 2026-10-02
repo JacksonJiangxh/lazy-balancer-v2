@@ -8,6 +8,7 @@ import 'prismjs/components/prism-nginx'
 import 'prismjs/components/prism-http'
 import 'prismjs/components/prism-ini'
 import 'prismjs/components/prism-json'
+import { escapeHtml } from '@/utils/escape'
 
 export const highlightCode = (content: string, language: string): string => {
   if (!content) return ''
@@ -16,6 +17,8 @@ export const highlightCode = (content: string, language: string): string => {
   try {
     return Prism.highlight(content, grammar, lang)
   } catch {
-    return content.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    // FE65-9：兜底转义收敛到 utils/escape 的 escapeHtml（含引号转义，与 ansi/
+    // branding 版同口径），HTML 属性上下文复用该输出不再有引号注入面
+    return escapeHtml(content)
   }
 }

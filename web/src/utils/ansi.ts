@@ -1,10 +1,6 @@
 import { escapeHtml } from '@/utils/escape'
 
 /**
- * Escape HTML special characters.
- */
-
-/**
  * Convert ANSI escape sequences in a string to HTML.
  * Handles common SGR codes (reset, text styles, and basic/indexed/RGB colors).
  * Newlines are preserved by the caller via CSS (white-space: pre-wrap).
