@@ -139,7 +139,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 
 	// ============ 循环（8）============
 
-	// 看门狗：60s 一致性检查（每轮记录——60s 非高频，日志有大小限制）
+	// 看门狗：60s 一致性检查（漂移/恢复+小时级心跳——一致轮不逐轮记录）
 	watchdogAdminURLValue = watchdogAdminURL
 	taskEngine.Register(taskengine.Descriptor{
 		ID:          "config-watchdog",

@@ -284,7 +284,25 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	}
 	// 三分类合并:全局配置随 users 节恒同步,不存在「基本设置:开关关闭」
 	// 形态;unchanged 侧由节级审计(哈希一致)正确区分。
-	RecordAuditLog("system", "同步", "集群同步", FormatAuditDetail(fmt.Sprintf("应用版本：%d", snapshot.Version), fmt.Sprintf("规则 %d 条", len(snapshot.Rules)), fmt.Sprintf("用户 %d 个", len(snapshot.Users)), fmt.Sprintf("密钥 %d 个", len(snapshot.APIKeys)), fmt.Sprintf("证书 %d 张", len(snapshot.Certs)), "基本设置：已同步", fmt.Sprintf("Caddy 全局配置：%s", caddySync)), "")
+	// 2026-10-03 用户裁定：汇总行反映节级实际应用面——原内容清单（规则 N
+	// 条/用户 N 个/基本设置：已同步…）与同秒的「哈希一致跳过」自相矛盾，
+	// 读者误以为全部节都已写入。
+	appliedSecs, hashSkipped, disSkipped := sectionOutcomeNames(skip)
+	summaryParts := []string{fmt.Sprintf("应用版本：%d", snapshot.Version)}
+	if len(appliedSecs) > 0 {
+		summaryParts = append(summaryParts, "本轮应用："+strings.Join(appliedSecs, "、"))
+	}
+	if len(hashSkipped) > 0 {
+		summaryParts = append(summaryParts, "跳过（哈希一致）："+strings.Join(hashSkipped, "、"))
+	}
+	if len(disSkipped) > 0 {
+		summaryParts = append(summaryParts, "跳过（开关关闭）："+strings.Join(disSkipped, "、"))
+	}
+	if len(appliedSecs) == 0 {
+		summaryParts = append(summaryParts, "全部节无变化")
+	}
+	summaryParts = append(summaryParts, fmt.Sprintf("Caddy 全局配置：%s", caddySync))
+	RecordAuditLog("system", "同步", "集群同步", FormatAuditDetail(summaryParts...), "")
 	return nil
 }
 
