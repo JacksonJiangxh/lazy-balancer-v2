@@ -300,6 +300,22 @@ func logSectionSyncOutcome(sk *sectionSkips, version int) {
 	}
 }
 
+// sectionOutcomeNames 节级三态命名（2026-10-03 用户裁定：同步汇总审计
+// 反映实际应用面——内容清单与「哈希一致跳过」自相矛盾）。
+func sectionOutcomeNames(sk *sectionSkips) (applied, hashSkipped, disSkipped []string) {
+	for _, sec := range syncSections {
+		switch {
+		case sk.disabled[sec.Key]:
+			disSkipped = append(disSkipped, sec.NewLabel)
+		case sk.unchanged[sec.Key]:
+			hashSkipped = append(hashSkipped, sec.NewLabel)
+		default:
+			applied = append(applied, sec.NewLabel)
+		}
+	}
+	return applied, hashSkipped, disSkipped
+}
+
 func recordAppliedSectionHashes(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *sectionSkips, switches SyncSwitches, localHashes map[string]string) {
 	if dbh == nil {
 		return

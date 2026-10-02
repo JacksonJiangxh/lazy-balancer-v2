@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -714,16 +715,28 @@ func SetActiveCertificateService(svc *CertificateService) {
 	activeCertService.svc = svc
 }
 
+// lastCertServiceMissing 证书服务缺失状态门（三个证书 tick 任务共享——全局
+// 单例服务指针）：false→true 转换记一次跳过行，缺失持续期静默，true→false
+// 转换记一次恢复行（R66 收敛：空转轮逐轮刷行改状态变化行）。
+var lastCertServiceMissing atomic.Bool
+
 // withActiveCertServiceTick 引擎单轮 tick 的活动证书服务执行体（U1-66-11）：
-// 服务未运行时空转轮在任务日志记一行跳过说明（面板任务日志不再静默空转），
-// 随后照常返回——轮次本身按 success 记账。
+// 服务未运行时跳过执行，轮次本身照常按 success 记账。R66 收敛（2026-10-03
+// 裁定）：跳过说明收敛为状态变化行——lastCertServiceMissing false→true 转换
+// 记一次跳过行，缺失持续期静默，恢复（true→false）记一次恢复行；三个证书
+// tick 任务共享同一状态门（全局单例服务指针）。
 func withActiveCertServiceTick(taskID, stage string, fn func(s *CertificateService)) {
 	activeCertService.Lock()
 	svc := activeCertService.svc
 	activeCertService.Unlock()
 	if svc == nil {
-		TaskLogf(taskID, stage, "证书服务未运行，本轮跳过")
+		if lastCertServiceMissing.CompareAndSwap(false, true) {
+			TaskLogf(taskID, stage, "证书服务未运行，跳过本轮（服务恢复后自动继续）")
+		}
 		return
+	}
+	if lastCertServiceMissing.CompareAndSwap(true, false) {
+		TaskLogf(taskID, stage, "证书服务已恢复")
 	}
 	fn(svc)
 }
@@ -1413,10 +1426,10 @@ func (s *CertificateService) checkManualCertExpiration() {
 
 	if expiredCount > 0 || expiringSoonCount > 0 {
 		Logf("info", "TLS Certificate Check: %d expired, %d expiring within %d days", expiredCount, expiringSoonCount, warnDays)
-		// SPEC §6.5：业务结论镜像到任务日志（cert-manual-poll）。
+		// SPEC §6.5：业务结论镜像到任务日志（cert-manual-poll）。R66 收敛：
+		// 仅异常轮（过期或临期>0）记行，全正常轮零日志（原「无过期无临期」
+		// 摘要行删除——R65「日志只记真实执行」延伸）。
 		TaskLogf("cert-manual-poll", "check", "手动证书到期检查：%d 张已过期、%d 张临期（阈值 %d 天）", expiredCount, expiringSoonCount, warnDays)
-	} else if len(certs) > 0 {
-		TaskLogf("cert-manual-poll", "check", "手动证书到期检查：共 %d 张，无过期无临期（阈值 %d 天）", len(certs), warnDays)
 	}
 }
 

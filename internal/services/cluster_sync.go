@@ -634,6 +634,20 @@ func decodeSnapshotEnvelope(body io.Reader) (models.ClusterSnapshot, error) {
 	return envelope.Data, nil
 }
 
+// syncRoundSuccessLines 同步轮成功分支的任务日志行（2026-10-03 用户裁定
+// 零噪音）：304 无变化轮零日志（存活证据=/cluster/status 最近同步时间+
+// UI 轮询）；应用轮记版本；上轮失败后恢复记一次（在前）。
+func syncRoundSuccessLines(prevFailed bool, res SyncResult) []string {
+	var lines []string
+	if prevFailed {
+		lines = append(lines, "同步恢复正常：本轮拉取与应用成功")
+	}
+	if res.Changed {
+		lines = append(lines, fmt.Sprintf("同步轮完成：已应用版本 %d（增量回放）", res.AppliedVersion))
+	}
+	return lines
+}
+
 func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	if err := s.beginPull(); err != nil {
 		err = newSyncFailure(models.SyncErrorCodeValidationFailed, err)
@@ -1349,6 +1363,7 @@ func verifySnapshotConsistency(snapshot models.ClusterSnapshot) error {
 }
 
 func (s *SyncService) run(ctx context.Context) {
+	prevRoundFailed := false // 失败→成功跃迁记一次恢复（零噪音裁定配套）
 	loadState := s.loadRunState
 	if loadState == nil {
 		loadState = func(ctx context.Context) (bool, string, int, error) {
@@ -1405,7 +1420,7 @@ func (s *SyncService) run(ctx context.Context) {
 		} else {
 			// 304「配置无变化」是稳态事件，不留审计（曾按周期刷屏，R24 移除）；
 			// 有意义的状态跃迁（漂移自愈、失败）仍在各自路径留痕。
-			_, pullErr := s.Pull(ctx)
+			pullRes, pullErr := s.Pull(ctx)
 			var schemaTooNew *SnapshotSchemaTooNewError
 			// E-F1：SnapshotSchemaTooOldError（v3 从节点拉到签名合法的旧 schema
 			// 主节点快照）保持非终止——与 verifiedSnapshotIntegrity :1121-1122 同类
@@ -1438,11 +1453,17 @@ func (s *SyncService) run(ctx context.Context) {
 			}
 			if pullErr != nil || reportErr != nil {
 				s.state.Store(uint32(syncStateDegraded))
+				prevRoundFailed = true
 				TaskLogf("cluster-sync", "sync", "同步轮失败：%v / %v（退避重试）", pullErr, reportErr)
 			} else {
 				s.state.Store(uint32(syncStateRunning))
 				retryDelay = time.Second
-				TaskLogf("cluster-sync", "sync", "同步轮完成：快照拉取与应用成功（304 无变化或增量回放）")
+				// 2026-10-03 用户裁定零噪音：304 无变化轮零日志（原每轮刷
+				// 「同步轮完成」且 304/增量回放合并一句，无法区分也无信息量）。
+				for _, line := range syncRoundSuccessLines(prevRoundFailed, pullRes) {
+					TaskLogf("cluster-sync", "sync", "%s", line)
+				}
+				prevRoundFailed = false
 			}
 		}
 		// 存量脏数据兜底：R42 前 sync_interval 无下限校验，库里可能残留 0/负数

@@ -27,6 +27,7 @@ var (
 	configDriftMu          sync.RWMutex
 	configDriftStatus      = ConfigDriftStatus{Consistent: true}
 	configDriftStreak      int
+	configDriftCleanRounds int  // R66 心跳窗口：连续一致轮计数（60s 节拍 × 60 轮 ≈ 1h 一条心跳）
 	configDriftQueryWarned bool // 规则数据读取失败首报留痕
 	configDriftReadWarned  bool // 运行配置读取失败首报留痕
 	configWatchdogMu       sync.Mutex
@@ -41,6 +42,7 @@ func ResetConfigDrift() {
 	defer configDriftMu.Unlock()
 	configDriftStatus = ConfigDriftStatus{Consistent: true}
 	configDriftStreak = 0
+	configDriftCleanRounds = 0
 	configDriftQueryWarned = false
 	configDriftReadWarned = false
 }
@@ -74,12 +76,25 @@ func WatchdogCheckOnce() {
 			}
 		}()
 		checkConfigConsistency(watchdogAdminURLValue)
-		// SPEC §6.5：每轮一行结论入任务日志（task_runs 维持失败留痕不膨胀）。
-		if d := CurrentConfigDrift(); d.Consistent {
-			TaskLogf("config-watchdog", "check", "配置一致（DB 期望 = Caddy 运行态）")
+		// R66 日志收敛（2026-10-03 裁定，R65「日志只记真实执行」延伸）：一致轮
+		// 零逐轮行，每 configWatchdogHeartbeatRounds 轮（60s×60≈1h）一条心跳；
+		// 漂移期逐轮漂移行与恢复事件照旧（task_runs 维持失败留痕不膨胀）。
+		d := CurrentConfigDrift()
+		configDriftMu.Lock()
+		if d.Consistent {
+			configDriftCleanRounds++
 		} else {
-			TaskLogf("config-watchdog", "check", "配置漂移：缺失 %d 条 / 多余 %d 条（自 %s）", len(d.Missing), len(d.Extra), d.Since)
+			configDriftCleanRounds = 0
 		}
+		rounds := configDriftCleanRounds
+		configDriftMu.Unlock()
+		if d.Consistent {
+			if rounds%configWatchdogHeartbeatRounds == 0 {
+				TaskLogf("config-watchdog", "check", "配置一致（心跳，近 60 轮无漂移）")
+			}
+			return
+		}
+		TaskLogf("config-watchdog", "check", "配置漂移：缺失 %d 条 / 多余 %d 条（自 %s）", len(d.Missing), len(d.Extra), d.Since)
 	}()
 }
 
@@ -170,6 +185,10 @@ func expectedRenderedRules() (map[string]string, error) {
 	}
 	return expected, nil
 }
+
+// configWatchdogHeartbeatRounds 一致轮心跳间隔：60s 节拍 × 60 轮 = 每小时一条
+// 「配置一致」心跳（R66 收敛——一致轮不再逐轮记录）。
+const configWatchdogHeartbeatRounds = 60
 
 // maxAdminConfigBytes 看门狗读取 Caddy 运行配置的解码上限——LB44-4 家族口径
 // 32MB（与 caddy.go:210/565/780 同源；U8-P4-2 对齐，原先 4MB 上限使 >4MB 配置

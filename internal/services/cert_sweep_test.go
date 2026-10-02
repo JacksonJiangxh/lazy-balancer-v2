@@ -25,8 +25,10 @@ func useCertSweepTickTestEnv(t *testing.T) {
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
 		taskengine.SetLogDir(oldDir)
 		SetActiveCertificateService(nil)
+		lastCertServiceMissing.Store(false)
 	})
 	SetActiveCertificateService(nil)
+	lastCertServiceMissing.Store(false)
 }
 
 func seedOrphanCertJob(t *testing.T, ruleID, domain, status string) int {
@@ -79,28 +81,53 @@ func TestSweepOrphanedCertJobs_countsDisabledOrphans(t *testing.T) {
 	}
 }
 
-// U1-66-11：证书循环空转轮（活动证书服务未注入）必须在任务日志留一行跳过
-// 说明，面板任务日志不再静默空转。
-func TestCertTicks_logSkipLineWhenServiceNotRunning(t *testing.T) {
+// U1-66-11 + R66 收敛（2026-10-03 裁定）：证书服务缺失行收敛为状态变化——
+// nil 持续期仅 false→true 转换记一次跳过行，持续缺失静默，恢复（true→false）
+// 记一次恢复行；三个证书 tick 任务共享同一状态门（全局单例服务指针）。
+// 设计变更披露：原 U1-66-11「每轮一行跳过说明」按新裁定收敛，非弱化。
+func TestCertTicks_skipAndRecoveryLinesTransitionOnce(t *testing.T) {
 	useCertSweepTickTestEnv(t)
 
+	// 连续两轮 nil：仅一行跳过说明（原每轮一行）
 	CertRenewalScanOnce()
-	CertManualCheckOnce()
+	CertRenewalScanOnce()
+	data, err := os.ReadFile(taskengine.TaskLogPath("cert-renewal-scan"))
+	if err != nil {
+		t.Fatalf("read task log: %v", err)
+	}
+	if got := strings.Count(string(data), "证书服务未运行，跳过本轮"); got != 1 {
+		t.Fatalf("skip lines=%d, want 1（状态门：缺失期只记一次）: %q", got, string(data))
+	}
 
-	for _, id := range []string{"cert-renewal-scan", "cert-manual-poll"} {
-		data, err := os.ReadFile(taskengine.TaskLogPath(id))
-		if err != nil {
-			t.Fatalf("read task log %s: %v", id, err)
-		}
-		if !strings.Contains(string(data), "证书服务未运行，本轮跳过") {
-			t.Fatalf("task log %s 缺少空转跳过行: %q", id, string(data))
-		}
+	// 共享状态：第二个任务同处缺失期，不重复记行
+	CertManualCheckOnce()
+	if data, err := os.ReadFile(taskengine.TaskLogPath("cert-manual-poll")); err == nil && strings.Contains(string(data), "证书服务未运行") {
+		t.Fatalf("共享状态门失效：cert-manual-poll 重复记缺失行: %q", string(data))
+	}
+
+	// 恢复：true→false 转换记一次恢复行，随后正常执行不再记
+	SetActiveCertificateService(NewCertificateService())
+	CertRenewalScanOnce()
+	data, err = os.ReadFile(taskengine.TaskLogPath("cert-renewal-scan"))
+	if err != nil {
+		t.Fatalf("reread task log: %v", err)
+	}
+	if got := strings.Count(string(data), "证书服务已恢复"); got != 1 {
+		t.Fatalf("recovery lines=%d, want 1: %q", got, string(data))
+	}
+	CertRenewalScanOnce()
+	data, err = os.ReadFile(taskengine.TaskLogPath("cert-renewal-scan"))
+	if err != nil {
+		t.Fatalf("reread task log: %v", err)
+	}
+	if got := strings.Count(string(data), "证书服务已恢复"); got != 1 {
+		t.Fatalf("恢复后持续运行不得追加恢复行: got %d", got)
 	}
 }
 
-// U1-66-11（cert-waiting-ca 形态）：门控放行（有非终态任务）但服务未运行时
-// 记跳过行；门控拦截（全部终态）时保持静默（2026-09-29 裁定的零扫描门控
-// 不得被空转日志破坏）。
+// U1-66-11（cert-waiting-ca 形态）+ R66 收敛：门控放行（有非终态任务）但服务
+// 未运行时记一次跳过行（状态门新文案）；门控拦截（全部终态）时保持静默
+// （2026-09-29 裁定的零扫描门控不得被空转日志破坏）。
 func TestCertWaitingCATickOnce_skipLineGatedOnActiveJobs(t *testing.T) {
 	useCertSweepTickTestEnv(t)
 
@@ -111,7 +138,7 @@ func TestCertWaitingCATickOnce_skipLineGatedOnActiveJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read task log: %v", err)
 	}
-	if got := strings.Count(string(data), "证书服务未运行，本轮跳过"); got != 1 {
+	if got := strings.Count(string(data), "证书服务未运行，跳过本轮"); got != 1 {
 		t.Fatalf("skip lines=%d, want 1（有非终态任务且服务未运行须记一行）: %q", got, string(data))
 	}
 
@@ -124,7 +151,7 @@ func TestCertWaitingCATickOnce_skipLineGatedOnActiveJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reread task log: %v", err)
 	}
-	if got := strings.Count(string(data), "证书服务未运行，本轮跳过"); got != 1 {
+	if got := strings.Count(string(data), "证书服务未运行，跳过本轮"); got != 1 {
 		t.Fatalf("skip lines=%d, want 1（全终态时门控静默，不得追加空转行）", got)
 	}
 }

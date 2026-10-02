@@ -2,12 +2,16 @@ package services
 
 // Round 62 用户反馈批次钉（SPEC §6.5 业务摘要行）：每个真实执行轮在
 // tasks/{id}.log 留业务结论——「无临期证书/清理 N 条/摄取 N 条/配置一致」。
+// R66 收敛（2026-10-03 裁定）：一致轮不再逐轮记录，收敛为小时级心跳；
+// 漂移/异常轮照旧逐轮留痕。
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/taskengine"
@@ -79,23 +83,68 @@ func TestTaskLogf_AuditRetentionCleanupSummary(t *testing.T) {
 	}
 }
 
-// Given config-watchdog 已在引擎注册（真实 Run 体：WatchdogCheckOnce——每轮
-// 恰写一行「配置一致/配置漂移」结论）。
-// When 经引擎 Trigger 执行真实 Run 体（U1-66-10 接线钉——watchdog admin 为空
-// 时检查按不可达跳过，结论行形态恒可达：无外部依赖）。
-// Then tasks/config-watchdog.log 含「配置一致」或「配置漂移」结论行。
+// Given config-watchdog 已在引擎注册（真实 Run 体：WatchdogCheckOnce——R66 起
+// 一致轮零逐轮行，每 60 轮一条心跳；漂移轮逐轮行不变）。
+// When 经引擎 Trigger 连打 60 轮真实 Run 体（U1-66-10 接线钉——watchdog admin
+// 为空时检查按不可达跳过、状态维持一致，心跳形态恒可达：无外部依赖）。
+// Then tasks/config-watchdog.log 恰含一条「配置一致（心跳…）」结论行。
 func TestTaskLogf_WatchdogSummaryShape(t *testing.T) {
 	newTaskLogDir(t)
+	resetConfigWatchdogForTest(t)
 	te := newWireTestEngine(t)
-	if err := te.Trigger("config-watchdog", "manual", ""); err != nil {
-		t.Fatalf("trigger config-watchdog: %v", err)
+	for i := 1; i <= 60; i++ {
+		if err := te.Trigger("config-watchdog", "manual", ""); err != nil {
+			t.Fatalf("trigger config-watchdog: %v", err)
+		}
 	}
 	log := readTaskLog(t, "config-watchdog")
-	if !strings.Contains(log, "配置一致") && !strings.Contains(log, "配置漂移") {
-		t.Fatalf("watchdog Run 体结论行缺失（接线断）: %q", log)
+	if got := strings.Count(log, "配置一致（心跳，近 60 轮无漂移）"); got != 1 {
+		t.Fatalf("watchdog 心跳行=%d, want 1（接线断或心跳窗口失准）: %q", got, log)
 	}
 	if !strings.Contains(log, "[INFO]") {
 		t.Fatalf("watchdog 摘要行形态不符: %q", log)
+	}
+}
+
+// R66 收敛（2026-10-03 裁定）：cert-manual-poll 全正常轮（无过期无临期）零任务
+// 日志行；仅异常轮（过期或临期>0）记一行带计数的业务结论行。
+func TestTaskLogf_CertManualPoll_exceptionRoundsOnly(t *testing.T) {
+	_, database := newClusterTestService(t)
+	newTaskLogDir(t)
+	lastCertServiceMissing.Store(false)
+	SetActiveCertificateService(NewCertificateService())
+	t.Cleanup(func() { SetActiveCertificateService(nil) })
+	oldWriter := log.Writer()
+	var buf strings.Builder
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	// Given：一张 3650 天后才过期的手动证书（全正常形态）。
+	farPEM, _ := expiredShapeCertAndKey(t, "manual-far66.test", time.Now().Add(3650*24*time.Hour))
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source,tls_cert) VALUES ('lb_manual_far66','manual-far66','manual-far66.test','http',8080,1,1,'manual',?)`, farPEM); err != nil {
+		t.Fatal(err)
+	}
+
+	// When：全正常轮。Then：零任务日志行（原「共 N 张，无过期无临期」行删除）。
+	CertManualCheckOnce()
+	if data, err := os.ReadFile(taskengine.TaskLogPath("cert-manual-poll")); err == nil && strings.Contains(string(data), "手动证书到期检查") {
+		t.Fatalf("全正常轮不得写任务日志行: %q", string(data))
+	}
+
+	// Given：叠加一张 10 天后过期的手动证书（默认阈值 30 天内 → 临期）。
+	soonPEM, _ := expiredShapeCertAndKey(t, "manual-soon66.test", time.Now().Add(10*24*time.Hour))
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source,tls_cert) VALUES ('lb_manual_soon66','manual-soon66','manual-soon66.test','http',8080,1,1,'manual',?)`, soonPEM); err != nil {
+		t.Fatal(err)
+	}
+
+	// When：异常轮。Then：恰一行带计数结论。
+	CertManualCheckOnce()
+	logStr := readTaskLog(t, "cert-manual-poll")
+	if got := strings.Count(logStr, "手动证书到期检查"); got != 1 {
+		t.Fatalf("异常轮结论行=%d, want 1: %q", got, logStr)
+	}
+	if !strings.Contains(logStr, "0 张已过期、1 张临期") {
+		t.Fatalf("结论行计数不符: %q", logStr)
 	}
 }
 
