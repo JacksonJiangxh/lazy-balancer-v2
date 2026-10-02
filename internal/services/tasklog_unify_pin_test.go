@@ -38,22 +38,31 @@ func TestCollectCertJobRows_TerminalCounts(t *testing.T) {
 
 // Given 引擎启动并按 v2.0 四类型注册。
 // When CollectSystemTasks 视图聚合。
-// Then 常驻族（Daemon）started_at 非空且 loop_on=true；循环族（Periodic）
-// loop_on=true 但 started_at 为空；定时族（Scheduled）started_at 为空；
-// cert-waiting-ca 默认 loop_on=false（调度关闭）。
+// Then 常驻族 started_at=最近 boot 行（真实运行者非空）；从未运行的常驻任务
+// （master 上 cluster-sync——SlaveOnly 角色门）置零值（U1-66-06，UI '—' 兜底）；
+// 循环/定时族 started_at 为空；cert-waiting-ca 默认 loop_on=false。
 func TestCollectSystemTasks_ContinuousStartedAtAndLoopOn(t *testing.T) {
 	te := newWireTestEngine(t)
 	got := map[string]TaskInfo{}
 	for _, ti := range collectEngineFamilies(te) {
 		got[ti.ID] = ti
 	}
-	for _, id := range []string{"security-events-ingestion", "cert-issuance", "cluster-sync"} {
+	// 真实启动的常驻任务（master 上 security-events-ingestion/cert-issuance
+	// 随默认 StartLoop 拉起——boot 行落库）
+	for _, id := range []string{"security-events-ingestion", "cert-issuance"} {
 		if got[id].StartedAt == "" {
-			t.Fatalf("%s（常驻）started_at 应非空", id)
+			t.Fatalf("%s（常驻·已启动）started_at 应非空", id)
 		}
 		if !got[id].LoopOn {
 			t.Fatalf("%s（常驻）loop_on 应 true（StartLoop 默认开启）", id)
 		}
+	}
+	// 从未运行的常驻任务（master 上 cluster-sync——SlaveOnly）：置零值
+	if got["cluster-sync"].StartedAt != "" {
+		t.Fatalf("从未运行的常驻任务 started_at 应为零值（U1-66-06）, got %q", got["cluster-sync"].StartedAt)
+	}
+	if !got["cluster-sync"].LoopOn {
+		t.Fatal("cluster-sync loop_on 应 true（调度开关保留）")
 	}
 	w := got["config-watchdog"]
 	if w.StartedAt != "" {
@@ -67,6 +76,24 @@ func TestCollectSystemTasks_ContinuousStartedAtAndLoopOn(t *testing.T) {
 	}
 	if got["cert-waiting-ca"].LoopOn {
 		t.Fatal("cert-waiting-ca 默认调度应关闭（loop_on=false）")
+	}
+}
+
+// U1-66-06：从未运行的常驻任务 StartedAt 置零值——UI「常驻 · 启动于」已有
+// '—' 兜底；不再回退引擎进程启动时刻（=uptime 语义，与「空闲」状态矛盾）。
+func TestCollectSystemTasks_DaemonNeverRunStartedAtEmpty(t *testing.T) {
+	te := newWireTestEngine(t)
+	got := map[string]TaskInfo{}
+	for _, ti := range collectEngineFamilies(te) {
+		got[ti.ID] = ti
+	}
+	// master 上 cluster-sync（SlaveOnly）从不启动、从未运行（task_runs 零行）
+	cs := got["cluster-sync"]
+	if cs.Kind != TaskKindDaemon {
+		t.Fatalf("cluster-sync 应为常驻族, got %s", cs.Kind)
+	}
+	if cs.StartedAt != "" {
+		t.Fatalf("从未运行的常驻任务 StartedAt 应为零值, got %q（引擎启动时刻=uptime 失真）", cs.StartedAt)
 	}
 }
 

@@ -1597,18 +1597,15 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		return
 	}
 
-	// F63-B2-1: acme→manual 切换时清理 ACME 关联——取消在途/排队的证书
-	// 任务,清零 acme_config_id(渲染层不再引用 ACME 配置)
+	// F63-B2-1: acme→manual 切换时清理 ACME 关联——acme_config_id 清零(渲染层
+	// 不再引用 ACME 配置)。在途/排队任务的收敛分两步(L4-66-01，镜像 DisableRule
+	// 正确序):事务内先把非终态 cert_jobs 翻转为终态(见下方 tx 内翻转——否则主
+	// UPDATE 的 NOT EXISTS 守卫恒 409、queued/waiting_ca 行被 30s 补扫复活重签)，
+	// 事务提交后再取消队列在途签发(见 committed 之后的 cancelRuleJobs——提交前
+	// 取消会在回滚/重试窗口留下「队列已摘、行仍非终态」的复活态)。
 	switchingFromACME := existingRule.TLSSource == "acme_dns" && req.TLSSource == "manual"
 	if switchingFromACME {
 		req.ACMEConfigID = 0
-		if qm := services.GetCAQueueManager(); qm != nil {
-			ctx, cancel := context.WithTimeout(c.Request.Context(), cancelRuleJobsTimeout)
-			if err := cancelRuleJobs(ctx, qm, caddyID); err != nil {
-				services.Logf("warn", "UpdateRule acme→manual: cancel cert jobs for %s failed: %v (continuing)", caddyID, err)
-			}
-			cancel()
-		}
 	}
 
 	// Build dynamic update for lb_rules table
@@ -1765,6 +1762,26 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 	}()
 
+	// L4-66-01：acme→manual 切换第一步——事务内先把非终态 cert_jobs 翻转为终态
+	// （'disabled'，照 DisableRule 用的终态值），使主 UPDATE 的 NOT EXISTS 守卫
+	// 放行、30s 补扫（requeueStrandedQueuedJobs/requeueWaitingCAJobs）不再复活
+	// 该行。事务回滚（应用失败）时翻转一并撤销，队列仍持有任务，语义一致。
+	var switchedCertJobs int64
+	if switchingFromACME {
+		flipResult, flipErr := tx.Exec("UPDATE cert_jobs SET status='disabled', message='规则证书源已切换为手动，任务已取消', updated_at=datetime('now') WHERE rule_id=? AND status NOT IN ('failed','disabled')", caddyID)
+		if flipErr != nil {
+			services.Logf("error", "UpdateRule cert job flip error for caddy_id=%s: %v", caddyID, flipErr)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新证书任务状态失败: " + flipErr.Error()})
+			return
+		}
+		switchedCertJobs, flipErr = flipResult.RowsAffected()
+		if flipErr != nil {
+			services.Logf("error", "UpdateRule cert job flip RowsAffected error for caddy_id=%s: %v", caddyID, flipErr)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "确认证书任务状态失败: " + flipErr.Error()})
+			return
+		}
+	}
+
 	userIDInt := contextUserID(c)
 	query += "updated_at = datetime('now'), updated_by = ? WHERE caddy_id = ? AND NOT EXISTS (SELECT 1 FROM cert_jobs WHERE rule_id = ? AND status NOT IN ('issued','failed','disabled'))"
 	args = append(args, userIDInt, caddyID, caddyID)
@@ -1847,6 +1864,23 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		return
 	}
 	committed = true
+
+	// L4-66-01：acme→manual 切换第二步——提交成功后留痕并取消队列在途签发
+	// （DisableRule 同序：先翻终态后取消）。有界等待；失败仅告警继续——规则
+	// 切换本身已提交，任务行已终态，队列残留由取消的 best-effort 收敛。
+	if switchingFromACME {
+		if switchedCertJobs > 0 {
+			services.WriteCertJobLogByRule(caddyID, "WARN", "cancelled", "规则证书源已切换为手动，证书任务已取消")
+			recordAudit(c, "更新", "证书任务", fmt.Sprintf("规则 %s 证书源已切换为手动，%d 个证书任务状态设为已取消", caddyID, switchedCertJobs))
+		}
+		if qm := services.GetCAQueueManager(); qm != nil {
+			cancelCtx, cancel := context.WithTimeout(c.Request.Context(), cancelRuleJobsTimeout)
+			if err := cancelRuleJobs(cancelCtx, qm, caddyID); err != nil {
+				services.Logf("warn", "UpdateRule acme→manual: cancel cert jobs for %s failed: %v (continuing)", caddyID, err)
+			}
+			cancel()
+		}
+	}
 
 	// SLB12-P3-2(第 12 轮审计):门控放宽到「ACME+http+domain 变化」——迁移
 	// 逻辑与启用态无关;此前 *req.Enabled 门控使禁用态改域绕过迁移,旧域

@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 // 安全事件统计行(2026-09-14 用户裁定):SizeBytes=真实审计日志文件大小
@@ -78,5 +80,58 @@ func TestGetLogStats_securityEventsRow(t *testing.T) {
 	// Then: LimitRows=事件上限 100 万
 	if sec.LimitRows == nil || *sec.LimitRows != 1000000 {
 		t.Fatalf("limit_rows=%v, want 1000000", sec.LimitRows)
+	}
+}
+
+// L1-66-02 读侧同源：certjob 统计跟随 {任务日志目录}/certjobs（与写入端
+// CertJobLogPath 同源）。曾读写死 /app/logs 根——B3 惰性化后写入端已迁
+// tasks/certjobs/，读侧不同源则统计恒 0B。
+func TestGetLogStats_certJobRowFollowsTaskLogDir(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	base := t.TempDir()
+	oldLogDir := taskengine.LogDir()
+	taskengine.SetLogDir(filepath.Join(base, "logs", "tasks"))
+	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
+
+	dir := filepath.Join(base, "logs", "tasks", "certjobs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "certjob-lb_x.log"), make([]byte, 2000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	router := gin.New()
+	router.GET("/logs/stats", h.GetLogStats)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/logs/stats?caddy_id=lb_x", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Data struct {
+			Logs []struct {
+				Key       string `json:"key"`
+				SizeBytes int64  `json:"size_bytes"`
+			} `json:"logs"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	var cj *struct {
+		Key       string `json:"key"`
+		SizeBytes int64  `json:"size_bytes"`
+	}
+	for i := range resp.Data.Logs {
+		if resp.Data.Logs[i].Key == "certjob" {
+			cj = &resp.Data.Logs[i]
+		}
+	}
+	if cj == nil {
+		t.Fatal("certjob row missing")
+	}
+	if cj.SizeBytes != 2000 {
+		t.Fatalf("certjob size_bytes=%d, want 2000（读侧须与写入端同源 tasks/certjobs/）", cj.SizeBytes)
 	}
 }

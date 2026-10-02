@@ -714,25 +714,30 @@ func SetActiveCertificateService(svc *CertificateService) {
 	activeCertService.svc = svc
 }
 
-func withActiveCertService(fn func(s *CertificateService)) {
+// withActiveCertServiceTick 引擎单轮 tick 的活动证书服务执行体（U1-66-11）：
+// 服务未运行时空转轮在任务日志记一行跳过说明（面板任务日志不再静默空转），
+// 随后照常返回——轮次本身按 success 记账。
+func withActiveCertServiceTick(taskID, stage string, fn func(s *CertificateService)) {
 	activeCertService.Lock()
 	svc := activeCertService.svc
 	activeCertService.Unlock()
-	if svc != nil {
-		fn(svc)
+	if svc == nil {
+		TaskLogf(taskID, stage, "证书服务未运行，本轮跳过")
+		return
 	}
+	fn(svc)
 }
 
 // —— 引擎单轮 tick（certificates.go 四 ticker 的循环体；引擎接管节拍）——
 
 // CertRenewalScanOnce 续期扫描（临期证书入队）。
 func CertRenewalScanOnce() {
-	withActiveCertService(func(s *CertificateService) { s.renewExpiringCertificates() })
+	withActiveCertServiceTick("cert-renewal-scan", "scan", func(s *CertificateService) { s.renewExpiringCertificates() })
 }
 
 // CertManualCheckOnce 手动证书到期检查。
 func CertManualCheckOnce() {
-	withActiveCertService(func(s *CertificateService) { s.checkManualCertExpiration() })
+	withActiveCertServiceTick("cert-manual-poll", "check", func(s *CertificateService) { s.checkManualCertExpiration() })
 }
 
 // certJobsActive 报告是否存在非终态证书任务（issued/failed/disabled 之外）——
@@ -752,7 +757,7 @@ func CertWaitingCATickOnce() {
 	if !certJobsActive() {
 		return
 	}
-	withActiveCertService(func(s *CertificateService) {
+	withActiveCertServiceTick("cert-waiting-ca", "rescan", func(s *CertificateService) {
 		s.requeueWaitingCAJobs()
 		if qm := GetCAQueueManager(); qm != nil {
 			qm.requeueStrandedQueuedJobs()
@@ -1132,6 +1137,9 @@ func sweepOrphanedCertJobs(ctx context.Context) int {
 			Logf("error", "cert sweep: disable orphaned certificate job %d failed: %v", job.id, err)
 			continue
 		}
+		// L4-66-02：swept 只计实际收敛的行——消费方 CertReconcileOnce 的
+		// 「孤儿清理 %d 个」任务日志行直接取该值，恒 0 即对账失真。
+		swept++
 		RecordAuditLog("system", "禁用", "证书任务", FormatAuditDetail(AuditJobPart(job.id), AuditRulePart(job.ruleID), AuditSourcePart("runtime_sweep")), "")
 	}
 
@@ -1221,8 +1229,10 @@ func CreateOrRequeueCertJobWithChange(ruleID, domains string, caProviderID int, 
 		}
 		return 0, false, fmt.Errorf("CA queue is paused")
 	}
-	// U1-P3-1：任务入队即唤醒 cert-waiting-ca（默认调度关闭——手动签发/
-	// 重试/续期扫描全部创建路径经此单点覆盖；全部终态由 Run 体自停）。
+	// U1-P3-1：任务入队即唤醒 cert-waiting-ca（默认调度关闭；全部终态由 Run
+	// 体自停）。U1-66-05 勘误：本处不再是「全部创建路径的单点」——规则写路径
+	// （EnableRule 的 Create/Retry/Renew）经此收敛；手动重试与删除失败恢复
+	// 直调 EnqueueIfActive，唤醒点在 handlers/certjobs.go 同批落地。
 	if te := TaskEngine(); te != nil && certJobsActive() {
 		te.StartLoop("cert-waiting-ca")
 	}

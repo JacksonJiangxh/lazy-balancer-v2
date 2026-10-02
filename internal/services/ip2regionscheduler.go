@@ -20,7 +20,7 @@ func (m *IP2RegionUpdateManager) StartScheduler() {
 	m.schedulerDone = done
 	go func() {
 		defer close(done)
-		m.schedulerTick(time.Now().UTC(), stop)
+		m.schedulerTick(time.Now().UTC())
 		ticker := time.NewTicker(m.schedulerInterval)
 		defer ticker.Stop()
 		for {
@@ -28,7 +28,7 @@ func (m *IP2RegionUpdateManager) StartScheduler() {
 			case <-stop:
 				return
 			case now := <-ticker.C:
-				m.schedulerTick(now.UTC(), stop)
+				m.schedulerTick(now.UTC())
 			}
 		}
 	}()
@@ -65,8 +65,10 @@ func (m *IP2RegionUpdateManager) SetMasterRole(isMaster bool) {
 	m.StopScheduler()
 }
 
-// IP2RegionSchedulerTickOnce 单轮调度探测（引擎 1min 节拍调用）。
-func (m *IP2RegionUpdateManager) schedulerTick(now time.Time, stop <-chan struct{}) {
+// schedulerTick 引擎缺位自调度探测（测试兜底）：引擎在场时调度循环由引擎
+// 节拍驱动，本函数仅被 SetMasterRole 直启的本地 ticker 逐分钟调用
+// （U2-66-02：原 IP2RegionSchedulerTickOnce 幽灵注释所指的死函数已删）。
+func (m *IP2RegionUpdateManager) schedulerTick(now time.Time) {
 	var isMaster bool
 	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
 		return

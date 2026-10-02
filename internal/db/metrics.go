@@ -298,7 +298,8 @@ func initMetricsSchema(db *sql.DB) error {
 		return fmt.Errorf("failed to create security_events transaction index: %w", err)
 	}
 	// 幂等迁移：事件请求上下文两列（v2.2.3 安全事件增强）——request_headers 恒由
-	// 摄入落库（8KB 截断），request_body 仅策略开 log_request_body 后有值（64KB
+	// 摄入落库（64KB 截断，2026-09-28 用户裁定上调；本注释第 66 轮纠偏），
+	// request_body 仅策略开 log_request_body 后有值（64KB
 	// 截断）；新库由上方建表语句直接带出。
 	if err := migrateMetricsHistoryBlocked(db); err != nil {
 		return err

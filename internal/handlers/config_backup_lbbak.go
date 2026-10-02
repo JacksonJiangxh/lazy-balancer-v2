@@ -136,6 +136,10 @@ type lbbakPayload struct {
 	XdbSha256  string
 	// RDB 文件化：威胁库 .iplist 源文件（源名→内容）
 	ThreatIplists map[string][]byte
+	// F-B1（第 66 轮审计）：tar 内存在但 manifest 未登记 checksum 的
+	// threat/*.iplist 条目——内容未经完整性校验。老备份兼容照常落盘，
+	// 调用方在响应/审计侧告警。
+	UnregisteredThreatEntries []string
 }
 
 // 解压放大防护(BE-C1-1):请求体上限只约束压缩字节(48MB,gzip 最高 ~1032:1
@@ -218,6 +222,10 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 		payload.XdbSha256 = manifest.Checksum[lbbakEntryXdb]
 	}
 	// RDB: 提取威胁库 .iplist 源文件
+	manifestRegistered := func(name string) bool {
+		_, ok := manifest.Checksum[name]
+		return ok
+	}
 	for name, data := range entries {
 		if !strings.HasPrefix(name, lbbakEntryThreatPrefix) || !strings.HasSuffix(name, ".iplist") {
 			continue
@@ -226,10 +234,18 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 		if source == "" || strings.Contains(source, "/") {
 			return nil, fmt.Errorf("lbbak 威胁库条目名非法: %s", name)
 		}
+		// F-B1：manifest 未登记的条目未经 sha256 校验（合法导出恒登记全部
+		// 条目）——老备份兼容照常携带，登记进告警面由调用方在响应/审计提示。
+		if !manifestRegistered(name) {
+			payload.UnregisteredThreatEntries = append(payload.UnregisteredThreatEntries, name)
+		}
 		if payload.ThreatIplists == nil {
 			payload.ThreatIplists = map[string][]byte{}
 		}
 		payload.ThreatIplists[source] = data
+	}
+	if len(payload.UnregisteredThreatEntries) > 0 {
+		sort.Strings(payload.UnregisteredThreatEntries)
 	}
 	return payload, nil
 }
@@ -238,12 +254,19 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 // R39-12:ip2regionTag 从备份表区传入——空 tag 会让 ApplyWafFileBundle 删除
 // .version 伴生文件,破坏「文件与版本记录同批」不变量。
 // R39-13:落盘失败返回警告文本(调用方注入响应 warnings),不再仅审计静默。
-// 返回 (warning, filesLanded)：filesLanded=有文件真实落盘（L6-F1——commit
-// 失败时据此追加「文件/DB 分裂」可见警告；A40-2-F4 意图补全）。
-func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip2regionTag string) (string, bool) {
+// 返回 (warning, filesLanded, crsApplied)：filesLanded=有文件真实落盘（L6-F1——
+// commit 失败时据此追加「文件/DB 分裂」可见警告；A40-2-F4 意图补全）；
+// crsApplied=CRS 文件已随本导入落盘（L6-66-04——「reloading/success」流水由
+// 调用方在 session.commit 成功后补写，commit 失败不得谎报更新成功）。
+// L6-66-02：本函数是 WAF 数据文件写者（CRS 树交换/xdb/威胁 .iplist+.fast），
+// 全文件相位持 services wafFileMu——与三库更新器串行（调用方已在
+// caddyOpMu 内，wafFileMu 为叶锁不反向嵌套）。
+func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip2regionTag string) (string, bool, bool) {
 	if payload.CRSTarGz == nil && payload.Xdb == nil && len(payload.ThreatIplists) == 0 {
-		return "", false
+		return "", false, false
 	}
+	services.WafFileLock().Lock()
+	defer services.WafFileLock().Unlock()
 	threatLanded := false
 	bundle := &services.WafFileBundle{IP2RegionTag: ip2regionTag}
 	if payload.CRSTarGz != nil {
@@ -279,7 +302,7 @@ func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip
 	if _, _, _, err := services.ApplyWafFileBundle(bundle); err != nil {
 		services.Logf("error", "lbbak 导入落盘规则库文件失败: %v", err)
 		recordAudit(c, action+"警告", "配置备份", "规则库文件落盘失败: "+err.Error())
-		return "规则库文件落盘失败: " + err.Error(), threatLanded
+		return "规则库文件落盘失败: " + err.Error(), threatLanded, false
 	} else {
 		// ApplyWafFileBundle 内部已判定变更；此处以「有携带即视为可能落盘」
 		// 保守口径（变更判定不外泄——filesLanded 用于失败分裂警告，宁可多报）
@@ -298,12 +321,13 @@ func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip
 			services.AppendIP2RegionUpdateLog("INFO", "success", "ip2region 已随备份导入更新")
 		}
 		if crsChanged {
+			// L6-66-04：仅写「installing」（文件确已落盘）；「reloading/success」
+			// 由调用方在 session.commit 成功后补写——commit 失败（Caddy 拒绝
+			// 回滚）时任务日志不得谎报更新成功。
 			services.AppendCRSUpdateLog("INFO", "installing", "校验并落盘备份内 CRS 规则")
-			services.AppendCRSUpdateLog("INFO", "reloading", "重载 Caddy 配置")
-			services.AppendCRSUpdateLog("INFO", "success", "CRS 已随备份导入更新")
 		}
 	}
-	return "", true
+	return "", true, crsChanged
 }
 
 // isLbbakBytes 按魔数识别 tar.gz 备份(gzip 0x1f 0x8b)。

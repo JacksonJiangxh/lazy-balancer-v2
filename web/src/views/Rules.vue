@@ -1139,6 +1139,7 @@ import PathRulesEditor from '@/components/rules/PathRulesEditor.vue'
 import ProxyTimeoutFields from '@/components/rules/ProxyTimeoutFields.vue'
 import { validatePathRules } from '@/utils/ruleValidation'
 import { getStrategyLabel } from '@/utils/strategyLabels'
+import { popperViewportSafe } from '@/utils/popper'
 import { hostPortKey } from '@/utils/upstreamKeys'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, redistributeWeight, weightPercent } from '@/utils/upstreamWeights'
 import { certJobStatusLabel } from '@/utils/certJobStatus'
@@ -1381,20 +1382,9 @@ const setLockPopover = (caddyId: string, el: unknown): void => {
 }
 
 // 第 48 轮（用户反馈）：表格 hover 弹框（锁摘要/TLS/健康）在靠底或靠顶行会被视口裁切
-// ——Element Plus 未显式开启 Popper 的 flip（placement 固定则不回退）且无 preventOverflow。
-// 统一补：flip 多向回退 + preventOverflow（视口内留 8px 余量）；弹框内容超高时由
-// .rule-lock-popper 的 max-height + overflow-y 内部滚动承接。
-// 第 48 轮追加（用户反馈：靠底行仍越界）：回退候选必须含水平方向——摘要弹框可达视口
-// 高度量级（62vh），上下都不够时纯垂直回退无解，Popper 只能保持原 placement 并溢出
-// （实测 620px 视口下靠底行溢出 116px）。锁摘要弹框改以 right-start 为首选（用户裁定：
-// 太靠下时显示在右侧），上下空间充足与否都不再影响其可见性；小弹框（TLS/健康）保持
-// top 首选，回退顺序统一为 右 → 左 → 上 → 下。
-const popperViewportSafe = {
-  modifiers: [
-    { name: 'flip', options: { fallbackPlacements: ['right', 'left', 'top', 'bottom'] } },
-    { name: 'preventOverflow', options: { padding: 8 } },
-  ],
-}
+// popperViewportSafe 已提取至 utils/popper 共享（U9-2/3/4/5 家族：四处弹框统一
+// 视口安全回退——flip 多向回退含水平 + preventOverflow padding 8）。
+// 弹框内容超高时由 .rule-lock-popper 的 max-height + overflow-y 内部滚动承接。
 const openFlowFromLock = (rule: Rule): void => {
   lockPopovers[rule.caddy_id]?.hide()
   openFlowDialog(rule)
@@ -2924,8 +2914,13 @@ const toggleRule = async (rule: Rule) => {
   }
 }
 
+const deletingRuleId = ref<string | null>(null)
 const deleteRule = async (rule: Rule) => {
   if (isReadOnly.value) return
+  // 重入守卫（U9-66-01，同 SecurityPolicies deletingPolicyId 范式）：快速双击
+  // 不再叠加双确认框→双 DELETE 误报
+  if (deletingRuleId.value !== null) return
+  deletingRuleId.value = rule.caddy_id
   try {
     await ElMessageBox.confirm(`确定要删除规则 "${rule.name}" 吗？`, '删除确认', { type: 'warning' })
     await request.delete<APIResponse>(`/rules/${rule.caddy_id}`)
@@ -2934,6 +2929,8 @@ const deleteRule = async (rule: Rule) => {
   } catch (error: unknown) {
     if (error === 'cancel' || error === 'close') return
     console.error('delete rule failed', error)
+  } finally {
+    deletingRuleId.value = null
   }
 }
 

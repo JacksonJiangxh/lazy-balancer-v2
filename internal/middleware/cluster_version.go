@@ -81,11 +81,18 @@ func installClusterVersionTriggers(database *sql.DB) error {
 			if operation == "UPDATE" {
 				// CL-新1(第 6 轮审计):last_checked 是读路径指标(页面浏览即写),
 				// 入 OF 列表会使 CRS/IP2Region 页面浏览触发集群级全量重放+
-				// 各从节点强制 Caddy 重载。从触发列排除(consecutive_failures 同
-				// 型先例:纯运行态计数不入版本)。
+				// 各从节点强制 Caddy 重载,从触发列排除。
+				// U5-66-01(第 66 轮):threat 源的 consecutive_failures 同法排除
+				// ——纯运行态失败计数(failSourceRow 每次失败独立 UPDATE +1),
+				// 入列会使源持续不可达期间每轮失败写都 bump 版本引发全集群快照
+				// 重放;失败路径的状态列(update_status/message/finished_at)仍在
+				// OF 内,真实状态变更照常传播,快照 dump 亦恒携带最新计数值。
 				ofColumns := table.snapshotColumns
 				if table.name == "security_crs_version" || table.name == "security_ip2region_version" || table.name == "security_threat_sources" {
 					ofColumns = strings.Replace(ofColumns, ",last_checked", "", 1)
+				}
+				if table.name == "security_threat_sources" {
+					ofColumns = strings.Replace(ofColumns, ",consecutive_failures", "", 1)
 				}
 				operationClause += " OF " + ofColumns
 			}

@@ -277,6 +277,8 @@ func MFAVerifyTOTPCode(userID int, code string, now time.Time) (bool, error) {
 }
 
 // MFAVerifyPending 绑定向导 activate 步：验证 pending secret 的当前码（无重放状态）。
+// U7a-P5-4（第 66 轮审计）：与 MFAVerifyCode/MFAVerifyTOTPCode 同容错——入口
+// TrimSpace（粘贴带空格验证码此前恒败）。
 func MFAVerifyPending(userID int, code string, now time.Time) (bool, error) {
 	var pending string
 	if err := db.DB.QueryRow("SELECT COALESCE(mfa_pending_secret,'') FROM users WHERE id=?", userID).Scan(&pending); err != nil {
@@ -285,6 +287,7 @@ func MFAVerifyPending(userID int, code string, now time.Time) (bool, error) {
 	if pending == "" {
 		return false, fmt.Errorf("没有待激活的 MFA 密钥，请先调用 setup")
 	}
+	code = strings.TrimSpace(code)
 	_, ok := mfaValidateTOTP(pending, code, now)
 	return ok, nil
 }

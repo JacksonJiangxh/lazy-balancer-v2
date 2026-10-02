@@ -23,7 +23,7 @@ func TestApplyConfigOnStartup_fallsBackToLastKnownGood(t *testing.T) {
 	handler.caddyService.SetLastGoodPath(path)
 
 	// When
-	err := handler.ApplyConfigOnStartup()
+	err := handler.ApplyConfigOnStartup("")
 
 	// Then：启动不报错，第二次 /load 收到的正是 last-good 文件内容
 	if err != nil {

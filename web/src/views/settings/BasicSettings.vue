@@ -1136,18 +1136,21 @@ const githubProxyUrl = computed<string>({
 // 父级 Settings.vue 的 applyBasicKeys 仅合并其已知键，此键由本卡片自行拉取回填
 // （同 loadAdminTls 先例），保证整页刷新后已保存的非默认代理不回落为默认值
 // F63-B5b-3:补 seq 守卫(原无——慢响应晚到覆盖用户刚保存的新值)
-  let githubProxySeq = 0
-const loadGithubProxyUrl = async (): Promise<void> => {
-  const seq = ++githubProxySeq
+// U9-6：代理 URL 与令牌状态原为两次 GET /config 各取一键——合并单次读取；
+// 失败兜底语义不变（代理回落默认值、令牌按未配置展示），保存语义均不受影响
+let githubStateSeq = 0
+const loadGithubRemoteState = async (): Promise<void> => {
+  const seq = ++githubStateSeq
   try {
-    const res = await request.get<{ data?: { github_proxy_url?: string } }>('/config')
-    if (seq !== githubProxySeq) return // F63-B5b-3:竞态守卫
+    const res = await request.get<{ data?: { github_proxy_url?: string; has_github_token?: boolean } }>('/config')
+    if (seq !== githubStateSeq) return // F63-B5b-3:竞态守卫
     settings.value.github_proxy_url = res.data?.github_proxy_url || DEFAULT_GITHUB_PROXY_URL
+    settings.value.has_github_token = res.data?.has_github_token ?? false
   } catch {
-    // 拉取失败保持默认值，保存时仍会提交当前选择
+    // 拉取失败：代理保持默认值，令牌按未配置展示；保存时仍会提交当前选择
   }
 }
-loadGithubProxyUrl()
+loadGithubRemoteState()
 // GitHub 令牌三态（第 52 轮 P2-3）：省略=保持、显式空串（清除钮）=撤销、非空=覆盖；has_github_token 仅显隐占位
 const githubTokenInput = ref('')
 // 清除标记（第 52 轮 P2-3，用户裁定三态语义：nil=保持/空串=清除/非空=覆盖）：
@@ -1157,16 +1160,6 @@ const clearGithubToken = () => {
   githubTokenInput.value = ''
   githubTokenClearPending.value = true
 }
-let githubTokenSeq = 0
-const loadGithubTokenState = async (): Promise<void> => {
-  const seq = ++githubTokenSeq
-  try {
-    const res = await request.get<{ data?: { has_github_token?: boolean } }>('/config')
-    if (seq !== githubTokenSeq) return // F63-B5b-3:竞态守卫
-    settings.value.has_github_token = res.data?.has_github_token ?? false
-  } catch { /* 拉取失败按未配置展示，不影响保存语义 */ }
-}
-loadGithubTokenState()
 
 const saving = ref(false)
 

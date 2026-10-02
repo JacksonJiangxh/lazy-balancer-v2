@@ -228,3 +228,28 @@ func TestMFAWriteGuardEnabled(t *testing.T) {
 		t.Fatal("toggle read failed")
 	}
 }
+
+// U7a-P5-4（第 66 轮审计）：三个 TOTP 验证器输入容错须一致——MFAVerifyCode/
+// MFAVerifyTOTPCode 均先 TrimSpace，MFAVerifyPending 缺失，绑定向导 activate
+// 步粘贴带空格验证码恒失败。
+func TestMFAVerifyPending_trimsWhitespace(t *testing.T) {
+	mfaTestEnv(t)
+	mfaSeedUser(t, 9)
+	secret, _, err := MFAGenerateSecret("tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec("UPDATE users SET mfa_pending_secret=? WHERE id=9", secret); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	code := mfaCurrentCode(t, secret, now)
+
+	ok, err := MFAVerifyPending(9, "  "+code+" \t", now)
+	if err != nil {
+		t.Fatalf("verify pending: %v", err)
+	}
+	if !ok {
+		t.Fatal("padded code must verify（pending 验证须与另两个 TOTP 验证器同容错 TrimSpace）")
+	}
+}

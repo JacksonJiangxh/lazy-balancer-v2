@@ -460,9 +460,14 @@ func (m *IP2RegionUpdateManager) downloadAndInstall(parent context.Context, tag 
 	}
 	// R39 1.2：rename 前备份旧 xdb，reloader 失败时可回滚（镜像 CRS 的
 	// restoreBackup 路径），与 CRS 更新侧保持对称。
+	// L6-66-02：备份+rename 是 wafFileMu 互斥的安装文件段（网络下载在锁外
+	// staging 先行；内存热换在锁外）——与 lbbak 导入直写/集群同步落盘串行，
+	// 杜绝撕裂 xdb 与元数据瞬时错位。
 	liveBak := ip2regionLivePath + ".bak"
+	wafFileMu.Lock()
 	if _, err := os.Stat(ip2regionLivePath); err == nil {
 		if err := copyFile(ip2regionLivePath, liveBak); err != nil {
+			wafFileMu.Unlock()
 			return fmt.Errorf("备份旧 ip2region xdb: %w", err)
 		}
 		m.bakCreated = true
@@ -470,8 +475,10 @@ func (m *IP2RegionUpdateManager) downloadAndInstall(parent context.Context, tag 
 	if err := os.Rename(staged, ip2regionLivePath); err != nil {
 		// 安装未发生：清理备份，避免陈旧 .bak 干扰后续运行的回滚判断。
 		os.Remove(liveBak)
+		wafFileMu.Unlock()
 		return fmt.Errorf("安装 ip2region xdb: %w", err)
 	}
+	wafFileMu.Unlock()
 	// R46 B-F1：rename 后内存热换失败不得静默吞掉——磁盘已是新库而内存仍是旧
 	// 库，必须按安装失败处理（sentinel 标记），由 run() 走与 reloader 失败相同
 	// 的回滚路径。Reload 失败时旧 searcher 保持服役（ip2region.go Reload 语义）。

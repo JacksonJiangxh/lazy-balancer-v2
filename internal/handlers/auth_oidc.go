@@ -8,7 +8,7 @@ package handlers
 //   · 写保护矩阵:绑本地 MFA→TOTP 弹码;OIDC 会话(auth_method=oidc)与本地
 //     MFA 体系完全解耦,经 mfaStepUpGuard 显式直通(v2.3.0 用户裁定);
 //     锁定仅密码路径(OIDC 失败不计入,防「伪造回调锁死账号」DoS)
-//   · 配置随 global_config 集群快照自动同步;从节点回调独立闭环（注：主端 users 节变更触发重放时会抹除本节点 JIT 行——该行存续期内签发的 JWT 将 401「用户不存在」，经 IdP 重新登录即自愈重建。U6a-4-1 第 65 轮裁定：最小动作=声明，不采用 SC-4 保留模式）→只读 JWT
+//   · 配置随 global_config 集群快照自动同步;从节点回调独立闭环（注：主端 users 节变更触发重放时会抹除本节点 JIT 行——该行存续期内签发的 JWT 将 401「用户不存在」，经 IdP 重新登录即自愈重建。L2-66-02 第 66 轮补证：抹除由漂移守卫自触发（本地 users 节哈希分叉→强制重放），首次仅在从节点登录的 OIDC 用户每个同步周期需重认证，直至在主端登录。U6a-4-1 第 65 轮裁定：最小动作=声明，不采用 SC-4 保留模式）→只读 JWT
 
 import (
 	"context"
@@ -460,7 +460,7 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 				break
 			}
 			suffix := fmt.Sprintf("-%d", i)
-			// 后缀去重同按 rune 预算(后缀为 ASCII,字节数=rune 数)
+			// 后缀去重同受 A40-1-3 的 50 字符预算约束(后缀为 ASCII,字节数=rune 数)。
 			baseRunes := []rune(base)
 			if len(baseRunes)+len(suffix) > 50 {
 				budget := 50 - len(suffix)
@@ -529,6 +529,8 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 // issueOIDCJWT 与密码登录的令牌同构(auth.go respondLoginWithMFA 口径),
 // 附加 auth_method=oidc 与 pwd_ver(R39-2:jwtAuth 对缺 pwd_ver 且 DB 版本
 // ≠0 的令牌恒拒——无该声明的 OIDC 会话在导入 bump 后永久 401)。
+// 唯一语义差异:node_mode 的判定错误路径——本函数单测分支查询失败按零值判
+// slave,respondLoginWithMFA 查询失败保持 master(U7a-P5-1,见下方分支注释)。
 func (h *Handlers) issueOIDCJWT(userID int, username, role string, passwordVersion int64) (string, time.Time, error) {
 	expireMinutes := 20
 	if err := db.DB.QueryRow("SELECT COALESCE(jwt_expire_minutes,20) FROM global_config WHERE id=1").Scan(&expireMinutes); err != nil || expireMinutes <= 0 || expireMinutes > 1440 {
@@ -545,7 +547,10 @@ func (h *Handlers) issueOIDCJWT(userID int, username, role string, passwordVersi
 			nodeMode = "slave"
 		}
 	} else {
-		// 单测路径(无集群服务注入):直读全局 is_master,缺省主节点
+		// 单测路径(无集群服务注入):直读全局 is_master。U7a-P5-1(第 66 轮审计):
+		// Scan 失败时 isMasterVal 保持零值 0 → 判 slave——与 respondLoginWithMFA
+		// 的「查询失败保持 master」口径相反,两处各自如实描述,不强行统一;
+		// 行存在时 is_master=1 或 NULL(经 COALESCE 归 1)均判 master。
 		var isMasterVal int
 		_ = db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMasterVal)
 		if isMasterVal == 0 {

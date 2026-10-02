@@ -2103,6 +2103,7 @@ func (h *Handlers) ImportConfigBackup(c *gin.Context) {
 func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bool, filename, action string) {
 	// v2.3.0 lbbak:tar.gz 备份先解包校验,内部 config.json 走既有 V2 流程
 	var lbbakFiles *lbbakPayload
+	var lbbakUnregisteredThreat []string
 	if dataOK {
 		// SYS42-1:v2 JSON 备份带 UTF-8 BOM 时预览端点已剥(见
 		// config_import_v1.go),导入核心同口径——否则同一份备份预览通过、
@@ -2116,6 +2117,9 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 				return
 			}
 			lbbakFiles = payload
+			// F-B1：manifest 未登记的 threat/*.iplist 条目——老备份兼容照常
+			// 落盘，响应/审计侧告警（内容未经 sha256 校验）。
+			lbbakUnregisteredThreat = payload.UnregisteredThreatEntries
 			c.Request.Body = io.NopCloser(bytes.NewReader(payload.ConfigJSON))
 		} else {
 			c.Request.Body = io.NopCloser(bytes.NewReader(data))
@@ -2189,6 +2193,14 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	}
 	if !includeGlobal {
 		backup.Config = nil
+	}
+	// L6-66-01（第 66 轮审计 P2）：users 键存在且为空数组=导入将清空全部账户
+	// （合法导出恒携带 ≥1 启用管理员；键缺席的分类导出已在上方缺席还原时删除，
+	// 不受影响）——校验期硬拒，文案与预览端一致（事务内管理员守卫在 restore
+	// 之后才兜底，错误口径不点名真实原因）。
+	if rows, ok := backup.Tables["users"]; ok && len(rows) == 0 {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份 users 表为空，导入将清空全部账户，已拒绝"})
+		return
 	}
 	// 规则库数据库分类要求文件本体(lbbak):分类选择流(显式携带 sections)
 	// 中无文件却勾选该分类 → 剔除其表并警告,防记录与文件分叉(2026-09-18
@@ -2619,8 +2631,9 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	// 热换内存缓存(完整更新流程,2026-09-18 用户裁定)。
 	wafApplyWarning := ""
 	wafFilesLanded := false
+	wafCrsApplied := false
 	if lbbakFiles != nil && sectionTables["security_crs_version"] {
-		wafApplyWarning, wafFilesLanded = applyLbbakWafFiles(c, action, lbbakFiles, services.SanitizeBundleVersion(ip2regionTagFromBackup(backup.Tables)))
+		wafApplyWarning, wafFilesLanded, wafCrsApplied = applyLbbakWafFiles(c, action, lbbakFiles, services.SanitizeBundleVersion(ip2regionTagFromBackup(backup.Tables)))
 	}
 	if err := session.commit(affectedRuleIDs, pendingCertificates); err != nil {
 		status := http.StatusInternalServerError
@@ -2654,6 +2667,13 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 		}
 		c.JSON(status, models.APIResponse{Code: status, Message: message, Data: gin.H{"summary": counts, "disabled_conflicts": disabledConflicts, "warnings": failureWarnings}})
 		return
+	}
+	// L6-66-04（第 66 轮审计）：CRS「reloading/success」流水在 commit 成功后
+	// 补写——commit 失败路径已在上方 return，任务日志不再出现「重载/更新
+	// 成功」与实际回滚态矛盾的行。
+	if wafCrsApplied {
+		services.AppendCRSUpdateLog("INFO", "reloading", "重载 Caddy 配置")
+		services.AppendCRSUpdateLog("INFO", "success", "CRS 已随备份导入更新")
 	}
 
 	if reseedBlockPageNeeded {
@@ -2726,6 +2746,13 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	}
 	if wafXdbMetadataSkipped {
 		responseWarnings = append(append([]string{}, responseWarnings...), warningWafXdbMetadataSkipped)
+	}
+	// F-B1（第 66 轮审计）：manifest 未登记的威胁库条目——不拒绝（老备份
+	// 兼容），但响应与审计必须可见「内容未经完整性校验」。
+	if len(lbbakUnregisteredThreat) > 0 {
+		unregisteredDetail := fmt.Sprintf("lbbak 含 manifest 未登记的威胁库条目（%s）——内容未经完整性校验，已按原样落盘；建议核实来源后重新导出备份", strings.Join(lbbakUnregisteredThreat, "、"))
+		recordAudit(c, action+"警告", "配置备份", unregisteredDetail)
+		responseWarnings = append(append([]string{}, responseWarnings...), unregisteredDetail)
 	}
 	if wafApplyWarning != "" {
 		responseWarnings = append(append([]string{}, responseWarnings...), wafApplyWarning)

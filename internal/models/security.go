@@ -258,7 +258,9 @@ type SecurityEvent struct {
 	// PrecheckUs：该请求预检段耗时快照（µs）——WAF 事件的触发详情弹框显示
 	// 「预检+WAF」完整分解;预检事件与 DurationUs 同值。
 	PrecheckUs int64 `json:"precheck_us"`
-	// RequestHeaders：事件请求的完整头（JSON 文本，8KB 截断）——摄入恒落库；
+	// RequestHeaders：事件请求的完整头（JSON 文本，64KB 截断——2026-09-28 用户
+	// 裁定由 8KB 上调，见 securityEventsHeadersCap；本注释第 66 轮 L3 项纠偏）——
+	// 摄入恒落库；
 	// RequestBody：仅策略开 log_request_body 后有值（64KB 截断，非 UTF-8 转
 	// base64 并带标记前缀）。敏感头掩码是前端展示层姿态，库内为原文。
 	RequestHeaders string `json:"request_headers"`

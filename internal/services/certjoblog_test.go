@@ -9,22 +9,73 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"lazy-balancer-v2/internal/taskengine"
 )
 
-// useCertJobLogTestEnv 重定向日志目录到临时目录并直接注入大小阈值（绕过
-// task_log_size_mb 的 DB 读取与 5 分钟缓存），返回后恢复原状。
+// useCertJobLogTestEnv 经 taskengine.SetLogDir 注入临时任务日志目录（U1-66-03：
+// 目录已惰性化——旧的 certJobLogDir 变量覆写接缝随 IIFE 一并退役）并直接注入
+// 大小阈值（绕过 task_log_size_mb 的 DB 读取与 5 分钟缓存），返回后恢复原状。
 func useCertJobLogTestEnv(t *testing.T, thresholdBytes int64) {
 	t.Helper()
-	oldDir := certJobLogDir
+	oldDir := taskengine.LogDir()
 	oldCached, oldCachedAt := certJobLogSizeCached.Load(), certJobLogSizeCachedAt.Load()
-	certJobLogDir = t.TempDir()
+	taskengine.SetLogDir(filepath.Join(t.TempDir(), "logs", "tasks"))
 	certJobLogSizeCached.Store(thresholdBytes)
 	certJobLogSizeCachedAt.Store(time.Now().UnixNano())
 	t.Cleanup(func() {
-		certJobLogDir = oldDir
+		taskengine.SetLogDir(oldDir)
 		certJobLogSizeCached.Store(oldCached)
 		certJobLogSizeCachedAt.Store(oldCachedAt)
 	})
+}
+
+// U1-66-03≡L1-66-02：目录惰性求值——SetLogDir 注入后 CertJobLogPath 落
+// {任务日志目录}/certjobs/。曾为包初始化 IIFE 固化（LogDir 注入恒晚于包
+// 初始化），生产恒回退 /app/logs 根、脱离 housekeeping 清理面。
+func TestCertJobLogPath_followsTaskLogDir(t *testing.T) {
+	base := t.TempDir()
+	old := taskengine.LogDir()
+	taskengine.SetLogDir(filepath.Join(base, "logs", "tasks"))
+	t.Cleanup(func() { taskengine.SetLogDir(old) })
+	want := filepath.Join(base, "logs", "tasks", "certjobs", "certjob-lb_x.log")
+	if got := CertJobLogPath("lb_x"); got != want {
+		t.Fatalf("CertJobLogPath=%q, want %q（须随 SetLogDir 注入落 certjobs 子目录）", got, want)
+	}
+}
+
+// 一次性迁移（best-effort）：pre-B3/固化期写入 {LogDir 父目录}（容器=/app/logs）
+// 的 certjob-*.log 搬入新目录——旧文件残留会脱离清理面；目标已存在不覆盖。
+func TestCertJobLogDir_migratesLegacyFilesOnce(t *testing.T) {
+	base := t.TempDir()
+	legacyDir := filepath.Join(base, "logs")
+	tasksDir := filepath.Join(legacyDir, "tasks")
+	if err := os.MkdirAll(tasksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := taskengine.LogDir()
+	oldMigrated := certJobLogMigrated.Load()
+	taskengine.SetLogDir(tasksDir)
+	certJobLogMigrated.Store(false) // 每进程一次的迁移在本测试内重放
+	t.Cleanup(func() {
+		taskengine.SetLogDir(old)
+		certJobLogMigrated.Store(oldMigrated)
+	})
+	legacy := filepath.Join(legacyDir, "certjob-lb_old.log")
+	if err := os.WriteFile(legacy, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := CertJobLogDir()
+	if dir != filepath.Join(tasksDir, "certjobs") {
+		t.Fatalf("CertJobLogDir=%q, want %q", dir, filepath.Join(tasksDir, "certjobs"))
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("旧文件应已迁移出父目录, stat err=%v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(dir, "certjob-lb_old.log")); err != nil || string(data) != "old\n" {
+		t.Fatalf("新目录应收到迁移文件且内容一致: data=%q err=%v", data, err)
+	}
 }
 
 // captureCertJobLogWarns 捕获轮转失败告警（测试缝），返回读取快照的函数。
@@ -53,6 +104,9 @@ func TestCertJobFileLogger_rotation_failure_is_surfaced(t *testing.T) {
 	// Given：阈值 1 字节（现存文件必触发轮转），当前日志已存在，.5 槽位被占
 	useCertJobLogTestEnv(t, 1)
 	base := CertJobLogPath("lb_rotfail")
+	if err := os.MkdirAll(filepath.Dir(base), 0755); err != nil {
+		t.Fatalf("seed dir: %v", err)
+	}
 	if err := os.WriteFile(base, []byte("old line\n"), 0644); err != nil {
 		t.Fatalf("seed current log: %v", err)
 	}

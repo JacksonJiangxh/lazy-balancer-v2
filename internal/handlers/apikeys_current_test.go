@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -569,5 +570,62 @@ func TestUpdateAPIKeyRejectsInvalidMCPWhitelist(t *testing.T) {
 
 	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "MCP IP 白名单无效") {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// U7a-P5-5（第 66 轮审计）：每用户 50 配额的判定与插入必须原子——并发创建
+// 此前 count-then-insert TOCTOU 可越过上限。本测试用生产 DSN（db.Initialize：
+// WAL+busy_timeout+_txlock=immediate）并发轰 55 个创建，总数不得超 50。
+// 注：setupAPIKeyTestDB 的裸 sql.Open 无 busy_timeout，并发下会以 SQLITE_BUSY
+// 500 污染断言，故此处独立搭生产形态环境。
+func TestCreateAPIKey_quotaAtomicUnderConcurrency(t *testing.T) {
+	oldDB, oldAuditDB := db.DB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.AuditDB = oldDB, oldAuditDB
+	})
+	gin.SetMode(gin.TestMode)
+
+	const attempts = 55
+	start := make(chan struct{})
+	codes := make([]int, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			<-start
+			rec := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(rec)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/api-keys", strings.NewReader(`{"name":"quota-key"}`))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			ctx.Set("user_id", 1)
+			ctx.Set("role", "user")
+			ctx.Set("auth_type", "jwt")
+			createAPIKeyForUser(ctx, 1)
+			codes[slot] = rec.Code
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var owned int
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM api_keys WHERE created_by=1").Scan(&owned); err != nil {
+		t.Fatal(err)
+	}
+	if owned > apiKeyMaxPerUser {
+		t.Fatalf("created %d keys for user 1, must never exceed %d（配额判定与插入须原子）", owned, apiKeyMaxPerUser)
+	}
+	created := 0
+	for _, c := range codes {
+		if c == http.StatusCreated {
+			created++
+		}
+	}
+	if created != apiKeyMaxPerUser {
+		t.Fatalf("created=%d, want exactly %d（限额满后其余必须 400 拒绝）", created, apiKeyMaxPerUser)
 	}
 }

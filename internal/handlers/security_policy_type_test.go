@@ -538,3 +538,124 @@ func TestBindWritePaths_rateLimitUniqueness(t *testing.T) {
 		t.Fatalf("batch-bind merge bound=%d skipped=%v, want bound=0 skipped=[lb_rl2]", bound, skipped)
 	}
 }
+
+// U3-F3（第 66 轮）：trust_detection 仅 stage0（信任名单）策略消费——创建
+// stage1/2/3 策略时该开关恒写 0，请求携带 true 不得落库（models.SecurityPolicy
+// 契约「仅 stage0 消费；其他类型恒 0」的写侧强制）。
+func TestCreateSecurityPolicy_zeroesTrustDetectionForNonStage0(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityRouter(t)
+
+	for _, policyType := range []string{"stage1", "stage2", "stage3"} {
+		name := "信任漂移-" + policyType
+		recorder := postJSON(t, router, "/security/policies", map[string]any{
+			"name": name, "policy_type": policyType, "trust_detection": true,
+		})
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s create status=%d body=%s, want 200", policyType, recorder.Code, recorder.Body.String())
+		}
+		var stored int
+		if err := db.DB.QueryRow(`SELECT COALESCE(trust_detection,0) FROM security_policies WHERE name=?`, name).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored != 0 {
+			t.Errorf("%s policy trust_detection=%d, want 0 (non-stage0 must not carry the trust flag)", policyType, stored)
+		}
+	}
+}
+
+// 回归形状：stage0 创建保留 trust_detection=true（保留检测语义）。
+func TestCreateSecurityPolicy_keepsTrustDetectionForStage0(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityRouter(t)
+
+	recorder := postJSON(t, router, "/security/policies", map[string]any{
+		"name": "信任保留", "policy_type": "stage0", "ip_whitelist": `["192.0.2.9"]`, "trust_detection": true,
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("stage0 create status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var stored int
+	if err := db.DB.QueryRow(`SELECT COALESCE(trust_detection,0) FROM security_policies WHERE name='信任保留'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != 1 {
+		t.Fatalf("stage0 policy trust_detection=%d, want 1 (detection-retained is a stage0 semantic)", stored)
+	}
+}
+
+// U3-F3：显式 stage1 类型更新携带 trust_detection=true 恒写 0。
+func TestUpdateSecurityPolicy_zeroesTrustDetectionForExplicitStage1(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityRouter(t)
+	id := createTestPolicy(t, router, map[string]any{"name": "更新信任漂移"})
+
+	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{
+		"policy_type": "stage1", "trust_detection": true,
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var stored int
+	if err := db.DB.QueryRow(`SELECT COALESCE(trust_detection,0) FROM security_policies WHERE id=?`, id).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != 0 {
+		t.Fatalf("stage1 policy trust_detection=%d after update, want 0", stored)
+	}
+}
+
+// U3-F3：存量 stage1 策略缺省类型提交（nil policy_type）显式携带
+// trust_detection=true 同样归零。
+func TestUpdateSecurityPolicy_zeroesTrustDetectionForStoredStage1(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityRouter(t)
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, enabled, policy_type, trust_detection) VALUES ('存量stage1', 'off', 1, 'stage1', 0)`); err != nil {
+		t.Fatal(err)
+	}
+	var id int
+	if err := db.DB.QueryRow(`SELECT id FROM security_policies WHERE name='存量stage1'`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{
+		"trust_detection": true,
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var stored int
+	if err := db.DB.QueryRow(`SELECT COALESCE(trust_detection,0) FROM security_policies WHERE id=?`, id).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != 0 {
+		t.Fatalf("stored stage1 policy trust_detection=%d after update, want 0", stored)
+	}
+}
+
+// 回归形状：stage0 更新保留 trust_detection=true（直通/保留检测二选一仍可改）。
+func TestUpdateSecurityPolicy_keepsTrustDetectionForStage0(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityRouter(t)
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, enabled, policy_type, trust_detection, ip_whitelist, ip_whitelist_enabled) VALUES ('存量stage0', 'off', 1, 'stage0', 0, '["192.0.2.9"]', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	var id int
+	if err := db.DB.QueryRow(`SELECT id FROM security_policies WHERE name='存量stage0'`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{
+		"policy_type": "stage0", "trust_detection": true,
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var stored int
+	if err := db.DB.QueryRow(`SELECT COALESCE(trust_detection,0) FROM security_policies WHERE id=?`, id).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != 1 {
+		t.Fatalf("stage0 policy trust_detection=%d after update, want 1", stored)
+	}
+}

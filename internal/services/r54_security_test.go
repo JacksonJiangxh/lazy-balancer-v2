@@ -325,8 +325,10 @@ func TestCRSUpdateRun_slaveAbortsBeforeFetch(t *testing.T) {
 	m.mu.Lock()
 	state := m.state
 	m.mu.Unlock()
-	if state.status != CRSStatusFailed {
-		t.Fatalf("in-memory status=%q, want failed (aborted on slave)", state.status)
+	// U2-66-05（第 66 轮审计）：从节点中止改为 skipped 终态（对齐威胁族跳过
+	// 语义，非故障）。
+	if state.status != CRSStatusSkipped {
+		t.Fatalf("in-memory status=%q, want skipped (aborted on slave)", state.status)
 	}
 }
 

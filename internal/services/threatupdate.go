@@ -528,16 +528,15 @@ func writeThreatSystemList(source string, entries []string) (bool, error) {
 		return false, nil
 	}
 	// RDB 文件化：条目写 .iplist 文件 + 编译 .fast，DB entries 恒空
+	// L6-66-02：写+编译为 wafFileMu 互斥的原子文件相位（撕裂 .iplist 会让
+	// lbbak 内静默残缺名单——manifest 自洽不可检）。
 	iplistPath := filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist", source))
 	entryStrs := make([]string, len(payload))
 	for i, e := range payload {
 		entryStrs[i] = e.Value
 	}
-	if err := writeThreatIplist(iplistPath, entryStrs); err != nil {
-		return false, fmt.Errorf("写 .iplist 文件失败: %w", err)
-	}
-	if err := CompileFromIplistFile(iplistPath); err != nil {
-		return false, fmt.Errorf("编译 .fast 失败: %w", err)
+	if err := writeThreatIplistCompiled(iplistPath, entryStrs); err != nil {
+		return false, err
 	}
 	entryCount := len(entryStrs)
 	if listExists == 0 {
@@ -663,6 +662,21 @@ func writeThreatIplist(path string, entries []string) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// writeThreatIplistCompiled 威胁库文件相位（L6-66-02）：.iplist 原子写 + .fast
+// 编译在 wafFileMu 互斥段内完成——与 lbbak 导入直写、从节点 .fast 落盘串行，
+// 杜绝并发写者下的撕裂读与半新半旧名单。错误文案与此前两段式返回保持一致。
+func writeThreatIplistCompiled(path string, entries []string) error {
+	wafFileMu.Lock()
+	defer wafFileMu.Unlock()
+	if err := writeThreatIplist(path, entries); err != nil {
+		return fmt.Errorf("写 .iplist 文件失败: %w", err)
+	}
+	if err := CompileFromIplistFile(path); err != nil {
+		return fmt.Errorf("编译 .fast 失败: %w", err)
+	}
+	return nil
 }
 
 // WafDir 返回 waf 目录路径（导入/导出用）。

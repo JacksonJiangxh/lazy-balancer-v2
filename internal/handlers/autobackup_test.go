@@ -770,3 +770,21 @@ func TestRunAutoBackupNow_auditOperatorIsCurrentUser(t *testing.T) {
 		t.Fatalf("手动备份 audit username=%q, want operator-zhang(调度路径才记 system)", username)
 	}
 }
+
+// U7b-F3（第 66 轮审计）：备份目录含私钥/凭证明文文件，目录权限必须 0700
+// （MkdirAll 建目录时生效；指向已存在目录时为 no-op，故指向不存在的子目录）。
+func TestRunAutoBackupOnce_backupDirPerm0700(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	h.cfg.BackupDir = filepath.Join(t.TempDir(), "backup-nested")
+
+	if _, err := h.RunAutoBackupOnce("manual", "system", 0); err != nil {
+		t.Fatalf("RunAutoBackupOnce: %v", err)
+	}
+	info, err := os.Stat(h.cfg.BackupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("backup dir perm=%o, want 700（目录内容含私钥与凭证明文）", perm)
+	}
+}

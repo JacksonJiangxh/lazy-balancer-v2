@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,12 +18,66 @@ import (
 // B3（第 65 轮后裁定）：证书任务日志并入任务日志体系——挂靠
 // {任务日志目录}/certjobs/（与 tasks/*.log 同根：大小上限共用
 // task_log_size_mb、保留清理由 log-cleanup housekeeping 统一扫描）。
-var certJobLogDir = func() string {
-	if d := taskengine.LogDir(); d != "" {
-		return filepath.Join(d, "certjobs")
+// U1-66-03≡L1-66-02：目录**惰性求值**——taskengine.LogDir() 注入恒晚于包
+// 初始化，曾以包级 IIFE 固化致生产恒回退 /app/logs 根（脱离 housekeeping
+// 清理面）。LogDir 未注入（测试环境）回退 /app/logs。
+const legacyCertJobLogRoot = "/app/logs"
+
+// certJobLogMigrated 旧目录一次性迁移门（U1-66-03）：SetLogDir 后首次
+// 使用时把固化期写入旧根的 certjob-*.log（含轮转代 .1-.5/.gz）搬入新目录。
+// atomic 而非 sync.Once：测试可复位重放（Once 值拷贝触发 vet noCopy）。
+var certJobLogMigrated atomic.Bool
+
+// CertJobLogDir 证书任务日志目录（读侧同源入口——logstats 统计与
+// GetCertJobLogs 均经 CertJobLogPath/CertJobLogDir 取值）。
+func CertJobLogDir() string {
+	dir := taskengine.LogDir()
+	if dir == "" {
+		return legacyCertJobLogRoot
 	}
-	return "/app/logs"
-}()
+	target := filepath.Join(dir, "certjobs")
+	if certJobLogMigrated.CompareAndSwap(false, true) {
+		migrateLegacyCertJobLogs(filepath.Dir(dir), target)
+	}
+	return target
+}
+
+// migrateLegacyCertJobLogs 一次性迁移：源=任务日志目录的父目录（容器内即
+// /app/logs——tasks 的宿主根，pre-B3 与固化期 certjob-* 的实际落点）。
+// best-effort：扫描/搬移失败记日志继续（旧文件残留无害——读侧已切新目录，
+// 清理面按新目录扫描）；目标同名文件已存在视为新数据，跳过不覆盖。
+func migrateLegacyCertJobLogs(legacyRoot, target string) {
+	entries, err := os.ReadDir(legacyRoot)
+	if err != nil {
+		return // 旧目录不存在（全新部署）——零迁移
+	}
+	moved := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "certjob-") || !strings.Contains(name, ".log") {
+			continue
+		}
+		if moved == 0 {
+			// 首个待迁文件出现才建目标目录（全新部署零建目录副作用）
+			if mkErr := os.MkdirAll(target, 0o755); mkErr != nil {
+				certJobLogWarnf("cert job log: migrate mkdir %s failed: %v", target, mkErr)
+				return
+			}
+		}
+		dst := filepath.Join(target, name)
+		if _, err := os.Stat(dst); err == nil {
+			continue // 新目录已有同名文件（升级后已写入）——不覆盖
+		}
+		if err := os.Rename(filepath.Join(legacyRoot, name), dst); err != nil {
+			certJobLogWarnf("cert job log: migrate legacy %s failed: %v", name, err)
+			continue
+		}
+		moved++
+	}
+	if moved > 0 {
+		Logf("info", "证书任务日志迁移完成：旧目录 %s → %s 共 %d 个文件", legacyRoot, target, moved)
+	}
+}
 
 const maxRotatedFiles = 5
 
@@ -56,7 +111,7 @@ func NewCertJobFileLogger(ruleID string) *CertJobFileLogger {
 
 // CertJobLogPath returns the log file path for the given rule ID.
 func CertJobLogPath(ruleID string) string {
-	return filepath.Join(certJobLogDir, fmt.Sprintf("certjob-%s.log", sanitizePathComponent(ruleID)))
+	return filepath.Join(CertJobLogDir(), fmt.Sprintf("certjob-%s.log", sanitizePathComponent(ruleID)))
 }
 
 func sanitizePathComponent(value string) string {
@@ -121,7 +176,7 @@ func (l *CertJobFileLogger) write(level, stage, message string) {
 		}
 	}
 
-	if err := os.MkdirAll(certJobLogDir, 0755); err != nil {
+	if err := os.MkdirAll(CertJobLogDir(), 0755); err != nil {
 		Logf("error", "cert job log: failed to create dir: %v", err)
 		return
 	}

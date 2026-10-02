@@ -104,7 +104,7 @@ export const useTrustAssociation = (options: {
           name: wantName,
           category: 'custom',
           entries: '[]',
-        } as never)
+        })
         newId = created.data?.id
       }
       if (!newId) {

@@ -843,22 +843,29 @@ export const formatDurationUs = (us: number | undefined): string => {
 // 选择共用同一组选项(第 62 轮 F62 双源收敛,原两文件各自定义)。
 export const IP_LIST_CATEGORIES = ['搜索引擎爬虫', 'CDN 节点', '云服务商', '办公网络', '数据中心', '可信地址', '恶意 IP', '其他'] as const
 
-// triggerStageFamily 触发 id→阶段族归类(第 62 轮 F62-10 收敛——原
-// TriggerDetailDialog kind 与 SecurityEvents stageCategory 两份平行实现)。
-// 返回: 'trust'|'ipAcl'|'geoip'|'wafCustom'|'wafCrs'|'other'
-// 与后端 stageCategorizeAttack/categorizeAttack 同口径(msg 门先于裸 id 判定)。
-export const triggerStageFamily = (ruleTriggered: string, ruleMsg: string): string => {
-  const id = ruleTriggered
-  // WAF 自定义规则(5 位 id)先于前缀判定
-  if (id.length === 5) return 'wafCustom'
-  // msg 门(带 IP 黑/白名单消息的 id:3 历史行归 IP 访问控制——两视图一致)
-  if (ruleMsg.includes('IP 黑名单') || ruleMsg.includes('IP 白名单') || ruleMsg.includes('IP 访问控制')) return 'ipAcl'
-  if (ruleMsg.includes('GeoIP 区域拦截') || ruleMsg.includes('威胁情报库拦截')) return 'ipAcl'
-  if (id === '2' || id === '4' || id === '5' || id === '7' || id === '14') return 'ipAcl'
-  if (id === '8' || (id.length === 6 && id.startsWith('8'))) return 'geoip'
-  if (id === '3' || id === '12') return 'trust'
-  if (id === '11') return 'other'
-  if (id.length === 6 && id.startsWith('9')) return 'wafCrs'
-  if (id.length >= 7) return 'wafCrs'
+// triggerStageFamily 触发 id→阶段族归类（FE65-2 收敛：TriggerDetailDialog kind 与
+// SecurityEvents stageCategory 的平行实现统一改引本函数——原 F62-10 导出版本带
+// msg 门且与两视图分支序不一致（id:8/11/14、1 开头 ≥7 位合成自定义各执一词），
+// 且当时零消费方，故按两视图一致的观察语义重写为唯一实现）。
+// 返回（细粒度，两视图各自投影）:
+//   'trust'|'ipAcl'|'geoip'|'threat'|'wafCustom'|'wafCrs'|'body'|'other'
+// 视图投影：SecurityEvents —— trust→trust，ipAcl/geoip/threat→acl（阶段 1 合并
+// 口径：黑白名单、地域、威胁情报同列），wafCrs/wafCustom→waf，body→body；
+// TriggerDetailDialog —— geoip→geo、threat→threat、wafCrs→waf-crs、wafCustom→
+// waf-custom，其余同名。分支序与等价性矩阵（两视图原实现对齐验证）：
+//   ''→other；11→body；9\\d{5}→wafCrs；\\d{5}与 1 开头≥7 位→wafCustom（合成
+//   自定义，R59-P3）；3/12→trust；14→threat；800000-899999→geoip；2/4/5/7/8
+//   （含遗留共享 GeoIP id:8，R59-P3 列表列同口径）→ipAcl；其余→other。
+export const triggerStageFamily = (ruleTriggered: string): 'trust' | 'ipAcl' | 'geoip' | 'threat' | 'wafCustom' | 'wafCrs' | 'body' | 'other' => {
+  const t = ruleTriggered ?? ''
+  if (!t) return 'other'
+  if (t === '11') return 'body'
+  if (/^9\d{5}$/.test(t)) return 'wafCrs'
+  if (/^\d{5}$/.test(t) || /^1\d{6,}$/.test(t)) return 'wafCustom'
+  const n = Number(t)
+  if (n === 3 || n === 12) return 'trust'
+  if (n === 14) return 'threat'
+  if (n >= 800000 && n < 900000) return 'geoip'
+  if (n === 2 || n === 4 || n === 5 || n === 7 || n === 8) return 'ipAcl'
   return 'other'
 }

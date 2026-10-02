@@ -3,17 +3,16 @@
 
 const chartPalette = {
   primary: '#4f8cff',
-  cyan: '#38e1ff',
   violet: '#8b5cf6',
-  pink: '#f472b6',
-  green: '#34d399',
   amber: '#fbbf24',
   red: '#f87171',
   slate: '#9aa0b5',
   dim: '#62687f',
 } as const
 
-/** 状态 → 色（任务监控/安全总览共用语义色） */
+/** 状态 → 色（任务监控/安全总览共用语义色）——键=TaskStatus 实际产出值
+ * （running/idle/queued/failed/cancelled/disabled/stopped；passive/no_runs
+ * 曾为零产出死条目，U1-66-08 清理） */
 export const statusColor: Record<string, string> = {
   running: chartPalette.primary,
   idle: chartPalette.slate,
@@ -21,8 +20,6 @@ export const statusColor: Record<string, string> = {
   failed: chartPalette.red,
   cancelled: chartPalette.violet,
   disabled: chartPalette.dim,
-  passive: chartPalette.cyan,
-  no_runs: chartPalette.slate,
   stopped: chartPalette.dim,
 }
 

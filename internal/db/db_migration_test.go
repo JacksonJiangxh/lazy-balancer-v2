@@ -23,6 +23,48 @@ func TestCreateTables_omits_dead_upstream_accessURL_column(t *testing.T) {
 	}
 }
 
+// L1-66-03：存量库补列——task_runs.operator（TEXT NOT NULL DEFAULT ”）。
+// fresh DDL 建表含列；pre-升级库经 runMigrations 幂等补列（schedule_days
+// 曾漏登记致升级安装必报 no such column——同位点回归钉）。
+func TestRunMigrationsAddsTaskRunsOperatorColumn(t *testing.T) {
+	// Given 存量库：task_runs 无 operator 列
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	// runMigrations 的 access-log-format 迁移要求 global_config 行存在（同 TestRunMigrationsCreates… 前置）
+	if _, err := database.Exec("INSERT INTO global_config (id,caddy_config) VALUES (1,'{}')"); err != nil {
+		t.Fatalf("seed global config: %v", err)
+	}
+	if _, err := database.Exec("ALTER TABLE task_runs DROP COLUMN operator"); err != nil {
+		t.Fatalf("simulate legacy task_runs: %v", err)
+	}
+
+	// When
+	if err := runMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	// Then：补列存在，存量行回填默认空串
+	var count int
+	if err := database.QueryRow("SELECT COUNT(*) FROM pragma_table_info('task_runs') WHERE name='operator'").Scan(&count); err != nil {
+		t.Fatalf("query task_runs schema: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("task_runs.operator count=%d, want 1", count)
+	}
+	if _, err := database.Exec("INSERT INTO task_runs (task_id, family) VALUES ('t','f')"); err != nil {
+		t.Fatalf("insert legacy row: %v", err)
+	}
+	var op string
+	if err := database.QueryRow("SELECT operator FROM task_runs WHERE task_id='t'").Scan(&op); err != nil {
+		t.Fatalf("read operator: %v", err)
+	}
+	if op != "" {
+		t.Fatalf("legacy row operator=%q, want empty", op)
+	}
+}
+
 func TestRunMigrationsCreatesAuthenticationAndUpstreamIndexes(t *testing.T) {
 	// Given
 	database := openMigrationTestDB(t)

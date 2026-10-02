@@ -179,12 +179,13 @@ func sizeLimitMB(column string, def int64) *int64 {
 }
 
 // logPaths resolves the two distinct log roots GetLogStats probes:
-//   - fixedDir is the hardcoded writer directory (/app/logs) shared by the five
+//   - fixedDir is the hardcoded writer directory (/app/logs) shared by the
 //     hardcoded-writer log families — caddy 四份日志（caddy.log/caddy-tls.log/
-//     caddy-server.log/caddy-proxy.log）、crs-update.log、ip2region-update.log、
-//     certjob-*.log、rules/*.log。这些写入端写死 /app/logs，与 LOG_FILE 无关，
-//     故其路径拼接必须固定用 /app/logs；若跟随 LogFile 目录推导，自定义
-//     LOG_FILE 时这些日志会全部显示 0B。
+//     caddy-server.log/caddy-proxy.log）、rules/*.log。这些写入端写死 /app/logs，
+//     与 LOG_FILE 无关，故其路径拼接必须固定用 /app/logs；若跟随 LogFile 目录
+//     推导，自定义 LOG_FILE 时这些日志会全部显示 0B。
+//     certjob-*.log 不在此列（U1-66-03≡L1-66-02）：写入端已并入统一任务日志
+//     体系（{任务日志目录}/certjobs/，services.CertJobLogDir 同源）。
 //   - runtimePath is the runtime log path, which follows LogFile
 //     （空 → /app/logs/lazy-balancer.log）。
 //
@@ -332,8 +333,8 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	if info := byKey("threat_update"); info != nil {
 		info.SizeBytes, info.RotatedBytes, info.RotatedCount = taskFileBytes("threat")
 	}
-	// 任务日志目录聚合行（任务监控日志弹框统计栏消费）：5MB/保 1 份/
-	// 保留=审计保留月数（taskLogsHousekeeping 口径，log-cleanup 族执行）。
+	// 任务日志目录聚合行（任务监控日志弹框统计栏消费）：10MB（task_log_size_mb
+	// 默认值）/保 1 份/保留=审计保留月数（taskLogsHousekeeping 口径，log-cleanup 族执行）。
 	if info := byKey("tasks"); info != nil {
 		var total, rotated int64
 		var rotCount int
@@ -368,11 +369,14 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		}
 	}
 	if info := byKey("certjob"); info != nil {
+		// L1-66-02 读侧同源：与写入端 CertJobLogPath 同取 {任务日志目录}/certjobs
+		// （曾读写死 /app/logs 根——B3 惰性化后写入端已迁，不同源恒 0B）。
+		certJobDir := services.CertJobLogDir()
 		if ruleID != "" {
-			cjA, cjR, cjC := dirBytes(filepath.Join(fixedLogsDir, "certjob-"+ruleID+".log"))
+			cjA, cjR, cjC := dirBytes(filepath.Join(certJobDir, "certjob-"+ruleID+".log"))
 			info.SizeBytes, info.RotatedBytes, info.RotatedCount = cjA, cjR, cjC
 			info.Name = "证书任务日志 #" + ruleID
-		} else if entries, err := os.ReadDir(fixedLogsDir); err == nil {
+		} else if entries, err := os.ReadDir(certJobDir); err == nil {
 			var active, rotated int64
 			for _, e := range entries {
 				if e.IsDir() || !strings.HasPrefix(e.Name(), "certjob-") || !strings.HasSuffix(e.Name(), ".log") && !strings.HasSuffix(e.Name(), ".log.gz") {
@@ -381,7 +385,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 				if isTimberjackRotationCopy(e.Name()) {
 					continue
 				}
-				a, r, _ := dirBytes(filepath.Join(fixedLogsDir, e.Name()))
+				a, r, _ := dirBytes(filepath.Join(certJobDir, e.Name()))
 				active += a
 				rotated += r
 			}

@@ -26,7 +26,7 @@
         <div v-if="row?.event_time" class="trg-hero-time">事件时间 · {{ formatTriggerTime(row.event_time) }}</div>
         <div class="trg-hero-meta">
           <span>来源 IP {{ row?.client_ip }}</span>
-          <span v-if="(row?.duration_us ?? 0) > 0">处理耗时 {{ formatDurationUs(row?.duration_us) }}<template v-if="(row?.precheck_us ?? 0) > 0 && (row?.duration_us ?? 0) > (row?.precheck_us ?? 0)">（预检 {{ formatDurationUs(row?.precheck_us) }} + 本阶段 {{ formatDurationUs((row?.duration_us ?? 0) - (row?.precheck_us ?? 0)) }}）</template></span>
+          <span v-if="(row?.duration_us ?? 0) > 0">处理时长 {{ formatDurationUs((row?.duration_us ?? 0) + (row?.precheck_us ?? 0)) }}<template v-if="(row?.precheck_us ?? 0) > 0">（预检 {{ formatDurationUs(row?.precheck_us) }} + WAF 段 {{ formatDurationUs(row?.duration_us) }}）</template></span>
           <el-tag size="small" :type="row?.action === 'blocked' ? 'danger' : 'warning'" effect="plain">
             {{ row?.action === 'blocked' ? '已拦截' : '已记录（检测）' }}
           </el-tag>
@@ -141,7 +141,7 @@ import { ArrowRight } from '@element-plus/icons-vue'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import { request } from '@/utils/api'
 import { formatDate } from '@/utils/date'
-import { parseIPList, parseRefIds, entryMatchesIp } from '@/utils/securityStages'
+import { parseIPList, parseRefIds, entryMatchesIp, triggerStageFamily } from '@/utils/securityStages'
 import { useCrsRuleIndex } from '@/composables/useCrsRuleIndex'
 import type { APIResponse } from '@/types'
 
@@ -174,24 +174,24 @@ const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void }>()
 
 type Kind = 'acl' | 'geo' | 'threat' | 'trust' | 'waf-crs' | 'waf-custom' | 'body' | 'other'
 
-// 第 62 轮 F62-10:共享谓词已导出(utils/securityStages.ts triggerStageFamily)——
-// 本 computed 与 SecurityEvents stageCategory 是同构平行实现,全量迁移需
-// 等价性矩阵验证(多轮审计调优的分支序),暂保守保留双实现。
+// FE65-2：kind 改由共享 triggerStageFamily 投影（securityStages 唯一实现，原
+// F62-10 双实现并存欠账）——细粒度族映射到本弹框展示 Kind（geoip→geo、
+// threat→threat、wafCrs→waf-crs、wafCustom→waf-custom，其余同名）。
+// 空 id 恒 other；未匹配的非空值兜底 acl（历史共享 GeoIP id:8 等归「IP 访问
+// 控制」口径，R59-P3，与列表列一致）。
 const kind = computed<Kind>(() => {
   const t = props.row?.rule_triggered ?? ''
   if (!t) return 'other'
-  const n = Number(t)
-  if (n >= 800000 && n < 900000) return 'geo'
-  if (n === 14) return 'threat'
-  if (n === 3 || n === 12) return 'trust'
-  if (t === '11') return 'body'
-  if (/^9\d{5}$/.test(t)) return 'waf-crs'
-  if (/^\d{5}$/.test(t)) return 'waf-custom'
-  // 第 59 轮 R59-P3：合成自定义（1 开头 ≥7 位）与遗留共享 GeoIP id:8 归族——
-  // 与后端 stageCategorizeAttack/categorizeAttack 三侧同口径（旧形态落 acl 误标）。
-  if (/^1\d{6,}$/.test(t)) return 'waf-custom'
-  // id:8 历史共享 GeoIP——列表列（isIpAclFamily 含 8）归「IP 访问控制」，弹框同口径
-  return 'acl'
+  switch (triggerStageFamily(t)) {
+    case 'trust': return 'trust'
+    case 'ipAcl': return 'acl'
+    case 'geoip': return 'geo'
+    case 'threat': return 'threat'
+    case 'wafCrs': return 'waf-crs'
+    case 'wafCustom': return 'waf-custom'
+    case 'body': return 'body'
+    default: return 'acl'
+  }
 })
 
 const categoryLabel = computed(() => {
@@ -368,7 +368,7 @@ const loadAll = async (): Promise<void> => {
   try {
     if (row.policy_id > 0) {
       try {
-        const res = await request.get<APIResponse<{ policy: PolicyRow }>>(`/security/policies/${row.policy_id}`, { silent: true } as never)
+        const res = await request.get<APIResponse<{ policy: PolicyRow }>>(`/security/policies/${row.policy_id}`, { silent: true })
         if (seq !== loadSeq) return // 第 61 轮 P2-4：首个 await 同样需竞态守卫
         policy.value = res.data?.policy ?? null
         if (!res.data?.policy) policyMissing.value = true
@@ -384,8 +384,8 @@ const loadAll = async (): Promise<void> => {
     // 全部启用策略 + 名单/条目：ACL 与信任 refs 的条目缓存（信息展示用 +
     // 跨策略信任成员判定——第 59 轮追加修复）
     const [polRes, listRes] = await Promise.allSettled([
-      request.get<APIResponse<PolicyRow[]>>('/security/policies?enabled=true', { silent: true } as never),
-      request.get<APIResponse<Array<{ id: number; name: string; system?: number | boolean }>>>('/security/ip-lists', { silent: true } as never),
+      request.get<APIResponse<PolicyRow[]>>('/security/policies?enabled=true', { silent: true }),
+      request.get<APIResponse<Array<{ id: number; name: string; system?: number | boolean }>>>('/security/ip-lists', { silent: true }),
     ])
     if (seq !== loadSeq) return
     if (polRes.status === 'fulfilled') enabledPolicies.value = polRes.value.data || []
@@ -397,7 +397,7 @@ const loadAll = async (): Promise<void> => {
       for (const id of parseRefIds(p.ip_whitelist_refs)) refIds.add(id)
     }
     const results = await Promise.allSettled(
-      [...refIds].map((id) => request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`, { silent: true } as never)),
+      [...refIds].map((id) => request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`, { silent: true })),
     )
     const cache: Record<number, string[]> = {}
     results.forEach((r) => {
@@ -553,7 +553,7 @@ const loadCustomRule = async (): Promise<void> => {
   if (!Number.isFinite(customDbId.value)) return
   const seq = ++customRuleSeq.value
   try {
-    const res = await request.get<APIResponse<CustomRule[]>>('/security/custom-rules', { silent: true } as never)
+    const res = await request.get<APIResponse<CustomRule[]>>('/security/custom-rules', { silent: true })
     if (seq !== customRuleSeq.value) return
     customRule.value = (res.data || []).find((r) => r.id === customDbId.value) ?? null
   } catch {

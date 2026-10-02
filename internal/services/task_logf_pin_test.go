@@ -55,16 +55,14 @@ func TestTaskLogf_CertRenewalScanNoExpiringSummary(t *testing.T) {
 	}
 }
 
-// Given audit-retention Run 在含过期审计行的库上执行。
-// When 清理完成。
-// Then tasks/audit-retention.log 含带删除条数的结论行。
+// Given audit-retention 已在引擎注册（真实 Run 体：CleanupAuditLogs→
+// PurgeTaskRuns→TaskLogf），库中含过期审计行。
+// When 经引擎 Trigger 执行真实 Run 体（U1-66-10 接线钉——曾由测试自调
+// CleanupAuditLogs+自写 TaskLogf，删 Run 体内 TaskLogf 调用不会红）。
+// Then tasks/audit-retention.log 含 Run 体写出的带删除条数的结论行。
 func TestTaskLogf_AuditRetentionCleanupSummary(t *testing.T) {
 	newTaskLogDir(t)
-	oldDB, oldM, oldA := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("initialize: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close(); db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA })
+	te := newWireTestEngine(t)
 	// seed 全局配置行（retention 读取）与过期审计行（audit 库）
 	if _, err := db.DB.Exec(`INSERT OR IGNORE INTO global_config (id) VALUES (1)`); err != nil {
 		t.Fatal(err)
@@ -72,26 +70,31 @@ func TestTaskLogf_AuditRetentionCleanupSummary(t *testing.T) {
 	if _, err := db.AuditDB.Exec(`INSERT INTO audit_log (username, action, resource, detail, ip_address, created_at) VALUES ('u','登录','认证','','','2020-01-01 00:00:00')`); err != nil {
 		t.Fatal(err)
 	}
-	deleted := CleanupAuditLogs()
-	if deleted != 1 {
-		t.Fatalf("清理条数 want 1, got %d", deleted)
+	if err := te.Trigger("audit-retention", "manual", ""); err != nil {
+		t.Fatalf("trigger audit-retention: %v", err)
 	}
-	TaskLogf("audit-retention", "cleanup", "清理完成：审计日志 %d 条、任务运行历史 %d 行（无过期数据时为 0）", deleted, 0)
 	log := readTaskLog(t, "audit-retention")
-	if !strings.Contains(log, "审计日志 1 条") {
-		t.Fatalf("audit-retention 摘要行缺失: %q", log)
+	if !strings.Contains(log, "清理完成：审计日志 1 条") {
+		t.Fatalf("audit-retention Run 体摘要行缺失（接线断）: %q", log)
 	}
 }
 
-// Given watchdog 摘要行（一致态由 CurrentConfigDrift 驱动——空态 Consistent=false
-// 的首启前窗口也应有结论行形态）。
-// When TaskLogf 写入漂移/一致行。
-// Then 行内容含「配置一致」或「配置漂移」结论词（形态钉）。
+// Given config-watchdog 已在引擎注册（真实 Run 体：WatchdogCheckOnce——每轮
+// 恰写一行「配置一致/配置漂移」结论）。
+// When 经引擎 Trigger 执行真实 Run 体（U1-66-10 接线钉——watchdog admin 为空
+// 时检查按不可达跳过，结论行形态恒可达：无外部依赖）。
+// Then tasks/config-watchdog.log 含「配置一致」或「配置漂移」结论行。
 func TestTaskLogf_WatchdogSummaryShape(t *testing.T) {
 	newTaskLogDir(t)
-	TaskLogf("config-watchdog", "check", "配置一致（DB 期望 = Caddy 运行态）")
+	te := newWireTestEngine(t)
+	if err := te.Trigger("config-watchdog", "manual", ""); err != nil {
+		t.Fatalf("trigger config-watchdog: %v", err)
+	}
 	log := readTaskLog(t, "config-watchdog")
-	if !strings.Contains(log, "配置一致") || !strings.Contains(log, "[INFO]") {
+	if !strings.Contains(log, "配置一致") && !strings.Contains(log, "配置漂移") {
+		t.Fatalf("watchdog Run 体结论行缺失（接线断）: %q", log)
+	}
+	if !strings.Contains(log, "[INFO]") {
 		t.Fatalf("watchdog 摘要行形态不符: %q", log)
 	}
 }

@@ -17,7 +17,22 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
+
+// wafFileMu 是 WAF 数据文件写者互斥锁（L6-66-02，第 66 轮审计）：CRS 树
+// （crsinstall 树交换 / lbbak untarGzTo 交换）、威胁库 .iplist+.fast
+// （threatupdate 写编译对 / lbbak 直写）、ip2region xdb（ip2regionupdate
+// 安装段 / ApplyWafFileBundle 直写）四方文件相位在此串行——此前无共享锁，
+// lbbak 导入与三库更新器交错会产生混合/残缺 rules 树（部分防护静默失效
+// fail-open）、撕裂 .iplist（缺条目名单静默残缺）与 xdb 元数据瞬时错位。
+// 锁只包文件相位（staging 先行、网络下载与 Caddy 重载在锁外——锁内取
+// CaddyOpLock 会与导入路径 CaddyOpLock→wafFileMu 的持锁序构成 AB-BA）。
+var wafFileMu sync.Mutex
+
+// WafFileLock 返回 WAF 数据文件写者互斥锁（跨包消费：handlers 侧 lbbak 导入
+// 文件相位与本包三个更新器共用同一实例）。叶操作、无嵌套重入。
+func WafFileLock() sync.Locker { return &wafFileMu }
 
 // WafFileBundle carries the CRS rules tree and GeoIP xdb inside a cluster
 // snapshot so slaves converge on the master's actual rule files, not just the

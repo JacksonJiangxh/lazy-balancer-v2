@@ -676,6 +676,59 @@ func TestSecurityEventsTick_idleTickSkipsMappingLoad(t *testing.T) {
 	}
 }
 
+// L3-66-01（第 66 轮）：空闲 tick 提前返回不得跳过耗时侧车消费——侧车由
+// caddygeoip 中间件逐请求无条件追加（timing pre/end），而 audit log 是
+// RelevantOnly 门控（仅相关事务落盘），静默请求流期间 audit 文件无新增字节、
+// 侧车照常增长。securityTimingLoad（读后截断）必须先于空闲提前返回执行。
+func TestSecurityEventsTick_idleTickConsumesTimingSidecar(t *testing.T) {
+	// Given：首个干净 tick 完成摄取（lastPassClean=true），侧车文件随后写入新行
+	dataDir := t.TempDir()
+	if err := db.Initialize(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitializeMetricsDB(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	offsetPath := filepath.Join(dir, "security_events.offset")
+	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origTimingPath := securityTimingLogPath
+	securityTimingLogPath = filepath.Join(dir, "security-timing.log")
+	origTickMap := securityTimingTickMap
+	t.Cleanup(func() {
+		securityTimingLogPath = origTimingPath
+		securityTimingTickMap = origTickMap
+	})
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	if err := tailer.securityEventsTick(); err != nil {
+		t.Fatalf("first tick: %v", err)
+	}
+	// 静默请求流形态：audit 文件保持无新增字节，侧车写入新行
+	if err := os.WriteFile(securityTimingLogPath, []byte("deadbeef:pre 42\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// When：audit 无新增字节 → 空闲 tick
+	if err := tailer.securityEventsTick(); err != nil {
+		t.Fatalf("idle tick: %v", err)
+	}
+
+	// Then：侧车被消费——读后截断归零，条目进 tick 级 map 可查
+	data, err := os.ReadFile(securityTimingLogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 0 {
+		t.Errorf("timing sidecar size after idle tick=%d, want 0 (read-then-truncate must run before idle early-return)", len(data))
+	}
+	if v, ok := securityTimingLookup("deadbeef:pre"); !ok || v != 42 {
+		t.Errorf("timing lookup after idle tick=(%d,%v), want (42,true)", v, ok)
+	}
+}
+
 func TestSecurityEventsIngestRotatedDelta_recoversRotationWindowEvents(t *testing.T) {
 	// Given: DB with rule go029.com -> lb_rule1, an audit log with transaction A,
 	// and a tick that ingests A and persists its offset

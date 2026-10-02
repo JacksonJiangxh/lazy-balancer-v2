@@ -158,7 +158,8 @@ func run() error {
 	// runConfigLoad 为共享执行体——启动与任务监控手动触发走同一函数
 	// （2026-09-29 用户裁定：任务逻辑迁入任务后，手动执行与系统启动触发
 	// 效果必须一致，含「载入」审计与全部前置物化步骤）。
-	runConfigLoad := func() error {
+	// L1-66-03：operator 透传——手动重载载入审计归因操作者，启动（空）归 system。
+	runConfigLoad := func(operator string) error {
 		services.SeedCRSRules()
 		services.ReconcileCRSState()
 		services.TaskLogf("startup:config-load", "libs", "规则库载入完成（CRS %s 对账）", services.CurrentCRSVersionForLog())
@@ -166,7 +167,7 @@ func run() error {
 		// 遗留状态），有实际变更时主节点递增集群版本让从节点收敛。
 		services.NormalizeLegacySecurityPolicyEnums(context.Background())
 		services.MaterializeAllCertsFromDB()
-		return h.ApplyConfigOnStartup()
+		return h.ApplyConfigOnStartup(operator)
 	}
 	// B1（第 65 轮后裁定）：启动执行移入引擎 BootSync（下方 InitTaskEngine 尾部
 	// 同步触发 startup:config-load——面板监听前完成不变量保持；失败语义同旧：

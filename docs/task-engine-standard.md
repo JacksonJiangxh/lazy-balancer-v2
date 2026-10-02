@@ -44,7 +44,7 @@ type Descriptor struct {
 
 已删除：`SilentProbes`/`RecordFailuresOnly`/`SignalledWork`/`AsKind`/`Cadence`/`Singleton`——Kind 单独决定全部行为。
 
-## 2. 任务清单（17 注册任务）
+## 2. 任务清单（16 注册任务）
 
 ### 定时（4）——排程槽驱动，Run 纯业务
 
@@ -106,9 +106,12 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
 ## 3. cert-waiting-ca 特例（默认关闭 + 唤醒/自停）
 
 ```
-默认：调度关闭（不在默认 StartLoop 清单）——引擎不 tick，页面显示「已暂停」
-唤醒：cert-renewal-scan 入队证书任务 → StartLoop("cert-waiting-ca")
-      手动签发/重试入队 → 同上（CreateOrRequeueCertJobWithChange 成功路径单点唤醒——U1-P3-1 已实现）
+默认：调度关闭（不在默认 StartLoop 清单）——引擎不 tick，页面显示「已停止」
+唤醒（U1-66-05 勘误：非单点——四处入队成功路径各自唤醒）：
+      cert-renewal-scan Run 体入队后 certJobsActive → StartLoop
+      CreateOrRequeueCertJobWithChange 成功路径（规则写路径 Create/Retry/Renew 收敛点）
+      RetryCertJob 成功路径（handlers/certjobs.go）
+      DeleteCertJob 删除失败恢复重入队成功路径（handlers/certjobs.go）
 自停：Run 体发现 certJobsActive()==false → StopLoop（回到默认关闭态）
 ```
 

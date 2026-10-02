@@ -167,7 +167,7 @@
             </el-table-column>
             <el-table-column label="引用" width="90" align="center">
               <template #default="{ row }">
-                <el-tooltip v-if="row.ref_policies.length > 0" placement="top" popper-class="ip-list-refs-popper">
+                <el-tooltip v-if="row.ref_policies.length > 0" placement="top" popper-class="ip-list-refs-popper" :popper-options="popperViewportSafe">
                   <template #content>
                     <div v-for="p in row.ref_policies" :key="p.id">{{ p.name }}</div>
                   </template>
@@ -518,6 +518,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
 import { showSaveResult } from '@/utils/saveResult'
 import { isValidCidr } from '@/utils/ruleValidation'
+import { popperViewportSafe } from '@/utils/popper'
 import { useAuthStore } from '@/stores/auth'
 
 import { useClampedPagination } from '@/composables/useClampedPagination'
@@ -629,10 +630,15 @@ const libHealthTags = computed<Array<{ label: string; type: 'success' | 'danger'
       ? { label: 'IP 地理库 · 缺失', type: 'danger' }
       : { label: 'IP 地理库 · 正常', type: 'success' },
   ]
+  // FR66-3：running 分支补齐（与 libRows 聚合同口径——running 优先于 failed）：
+  // 任一源更新中显示「更新中」warning，不再误标「正常」
+  const threatUpdating = threatSources.value.some(x => x.update_status === 'running')
   const threatFail = threatSources.value.filter(x => x.update_status === 'failed').length
-  tags.push(threatFail > 0
-    ? { label: `威胁情报库 · ${threatFail} 源更新失败`, type: 'warning' }
-    : { label: '威胁情报库 · 正常', type: 'success' })
+  tags.push(threatUpdating
+    ? { label: '威胁情报库 · 更新中', type: 'warning' }
+    : threatFail > 0
+      ? { label: `威胁情报库 · ${threatFail} 源更新失败`, type: 'warning' }
+      : { label: '威胁情报库 · 正常', type: 'success' })
   return tags
 })
 const libSummaryWarn = computed(() => crsInfo.value.available === false || ip2regionInfo.value.available === false)
@@ -834,11 +840,19 @@ const addIpListEntry = (): void => {
   ipListEntryPage.value = Math.ceil(ipListForm.value.entries.length / ipListEntryPageSize)
 }
 
+// FR66-1：乱序响应守卫（镜像同文件 openRuleContent 的 ruleContentSeq 范式）——
+// 快速关开/切换名单时在途详情响应晚到，不再覆盖当前弹框（含「新建」空表单被
+// 旧名单条目覆盖的形态）
+let ipListDetailSeq = 0
 const openIpListDialog = async (row?: IPListRow) => {
+  const requestSeq = ++ipListDetailSeq
   editingIpListSystem.value = row?.system === true
   ipListEntryPage.value = 1
   editingIpListId.value = row?.id ?? null
   if (!row) {
+    // seq 已自增：在途详情响应作废且其 finally 不再清 loading——新建表单自身
+    // 复位，否则继承上一会话的 v-loading 转圈
+    loadingIpListDetail.value = false
     ipListForm.value = { name: '', description: '', category: '', entries: [{ value: '', remark: '' }] }
     ipListDialogVisible.value = true
     return
@@ -849,13 +863,15 @@ const openIpListDialog = async (row?: IPListRow) => {
   loadingIpListDetail.value = true
   try {
     const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${row.id}`)
+    if (requestSeq !== ipListDetailSeq) return
     if (res.data && ipListDialogVisible.value) {
       ipListForm.value.entries = (res.data.entries || []).map((e) => ({ value: e.value, remark: e.remark }))
     }
   } catch {
+    if (requestSeq !== ipListDetailSeq) return
     ElMessage.error('加载列表条目失败')
   } finally {
-    loadingIpListDetail.value = false
+    if (requestSeq === ipListDetailSeq) loadingIpListDetail.value = false
   }
 }
 
@@ -897,13 +913,19 @@ const saveIpList = async () => {
   } finally { savingIpList.value = false }
 }
 
+const deletingIpListId = ref<number | null>(null)
 const deleteIpList = (row: IPListRow) => {
+  // 重入守卫（U9-66-01，同 SecurityPolicies deletingPolicyId 范式）：快速双击
+  // 不再叠加双确认框→双 DELETE 误报
+  if (deletingIpListId.value !== null) return
+  deletingIpListId.value = row.id
   ElMessageBox.confirm(`确定删除 IP 地址列表"${row.name}"？`, '确认', { type: 'warning' })
     .then(async () => {
       // 被策略引用时后端返回 409（含引用策略名的 message 由全局拦截器 toast）
       const del = await request.delete(`/security/ip-lists/${row.id}`)
       showSaveResult(del, '已删除'); fetchIpLists()
-    }).catch(() => {})
+    }).catch(() => { /* 用户取消:不动列表;HTTP 失败已由全局拦截器 toast */ })
+    .finally(() => { deletingIpListId.value = null })
 }
 
 // —— 条目纯前端导入/导出：只修改弹框内条目表，点保存前不落库 ——
@@ -1299,9 +1321,21 @@ const saveCustomRule = async () => {
   } finally { savingRule.value = false }
 }
 
+const deletingCustomRuleId = ref<number | null>(null)
 const deleteCustomRule = (row: CustomRule) => {
+  // 重入守卫（U9-66-01，同 SecurityPolicies deletingPolicyId 范式）：快速双击
+  // 不再叠加双确认框→双 DELETE 误报
+  if (deletingCustomRuleId.value !== null) return
+  deletingCustomRuleId.value = row.id
   ElMessageBox.confirm(`确定删除规则"${row.name}"？`, '确认', { type: 'warning' })
-    .then(async () => { const del = await request.delete(`/security/custom-rules/${row.id}`); showSaveResult(del, '已删除'); fetchCustomRules() }).catch(() => {})
+    .then(async () => { const del = await request.delete(`/security/custom-rules/${row.id}`); showSaveResult(del, '已删除'); fetchCustomRules() })
+    .catch((reason: unknown) => {
+      // 取消与失败分离：ElMessageBox 取消/close 以字符串 reject；其余为真失败
+      // （toast 已由全局拦截器弹出），留痕避免吞错
+      if (reason === 'cancel' || reason === 'close') return
+      console.error('Failed to delete custom rule:', reason)
+    })
+    .finally(() => { deletingCustomRuleId.value = null })
 }
 
 // WAF 文件大小：formatBytes 单一事实源（第 52 轮 P3-9）

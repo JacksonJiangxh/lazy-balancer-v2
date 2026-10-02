@@ -91,11 +91,17 @@ func TestTriggerSystemTask_gatesAndMapping(t *testing.T) {
 	newBackupTestHandlers(t)
 	r, _ := taskMonitorRouter()
 
-	// cert-queue 不支持触发 → 400
+	// config-watchdog（真实注册，ManualRun=false）→ 命中 !m.CanTrigger 分支
+	// → 400「不支持手动触发（常驻族启停即可/镜像族）」。
+	// U1-66-09：曾用未注册 ID「cert-queue」——恒命中 Lookup-miss 分支，
+	// ManualRun=false 门从未被钉（分支文案同前缀，无法区分）。
 	resp := httptest.NewRecorder()
-	r.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/system/tasks/cert-queue/trigger", nil))
+	r.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/system/tasks/config-watchdog/trigger", nil))
 	if resp.Code != http.StatusBadRequest {
-		t.Fatalf("cert-queue 触发应 400, got %d", resp.Code)
+		t.Fatalf("config-watchdog 触发应 400, got %d", resp.Code)
+	}
+	if !strings.Contains(resp.Body.String(), "不支持手动触发（常驻族启停即可/镜像族）") {
+		t.Fatalf("应命中 !CanTrigger 分支文案（非 Lookup-miss）: %s", resp.Body.String())
 	}
 
 	// 从节点 → 403
@@ -137,7 +143,8 @@ func TestToggleSystemTask_threatSwitch(t *testing.T) {
 	te.StartLoop("threat")
 }
 
-// cancel：未运行 → 409；非下载类 → 400。
+// cancel：未运行 → 409；不可取消族 → 409（引擎 Cancel 返 false——handler
+// 不再有 400 分支，R63 回退 switch 已删，无引擎时统一 503）。
 func TestCancelSystemTask_semantics(t *testing.T) {
 	initTaskEngineForTest(t)
 	newBackupTestHandlers(t)

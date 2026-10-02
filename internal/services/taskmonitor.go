@@ -34,8 +34,6 @@ const (
 	TaskStatusCancelled TaskStatus = "cancelled"
 	TaskStatusDisabled  TaskStatus = "disabled"
 	TaskStatusQueued    TaskStatus = "queued"
-	TaskStatusPassive   TaskStatus = "passive" // 常驻无显式运行态（角色驱动/引擎外）
-	TaskStatusNoRuns    TaskStatus = "no_runs" // 从未运行
 	TaskStatusStopped   TaskStatus = "stopped" // 常驻可控循环已停止
 )
 
@@ -69,14 +67,12 @@ type TaskRunInfo struct {
 	StartedAt  string `json:"started_at"`
 	FinishedAt string `json:"finished_at"`
 	DurationMs int64  `json:"duration_ms"`
-	Trigger    string `json:"trigger"` // manual/auto/schedule/queue/slave-sync
-	Result     string `json:"result"`  // success/failed/cancelled/skipped/…
+	Trigger    string `json:"trigger"`            // manual/auto/schedule/queue/slave-sync
+	Operator   string `json:"operator,omitempty"` // 手动触发操作者（manual 触发归人；auto/startup=空）
+	Result     string `json:"result"`             // success/failed/cancelled/skipped/…
 	Message    string `json:"message,omitempty"`
 }
 
-// CollectSystemTasks 聚合全部任务族（终态：引擎唯一事实源——全部任务族
-// 注册于任务引擎，视图=DescribeAll 元数据+task_runs 真实运行/统计；
-// 零收集器零特化）。
 // CollectSystemTasks 聚合全部任务族（终态：引擎唯一事实源——全部任务族
 // 注册于任务引擎，视图=DescribeAll 元数据+task_runs 真实运行/统计；
 // 零收集器零特化）。
@@ -225,7 +221,8 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		ti.NextRunAt = m.NextSlot
 		if latestRun != nil {
 			ti.LastRun = &TaskRunInfo{StartedAt: latestRun.StartedAt, FinishedAt: latestRun.FinishedAt,
-				DurationMs: latestRun.DurationMs, Trigger: latestRun.Trigger, Result: latestRun.Status, Message: latestRun.Message}
+				DurationMs: latestRun.DurationMs, Trigger: latestRun.Trigger, Operator: latestRun.Operator,
+				Result: latestRun.Status, Message: latestRun.Message}
 			if ti.NextRunAt == "" && m.IntervalSec > 0 && m.LoopOn && m.Kind == taskengine.KindPeriodic {
 				if t, err := time.ParseInLocation("2006-01-02 15:04:05", latestRun.StartedAt, CurrentLocation()); err == nil {
 					ti.NextRunAt = t.Add(time.Duration(m.IntervalSec) * time.Second).Format("2006-01-02 15:04:05")
@@ -238,13 +235,15 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		}
 		st := te.Stats24h(m.ID)
 		ti.Runs24h, ti.Success24h, ti.Fail24h = st.Runs, st.Success, st.Fail
-		// 常驻族启动时刻——「常驻 · 启动于」。L1-12（第 65 轮）：用该 daemon
-		// 最近 boot 行时刻（重启后正确更新）——曾恒用进程启动时刻（=uptime
-		// 而非服务启动，标签语义失真）。
+		// 常驻族启动时刻——「常驻 · 启动于」。用该 daemon 最近 boot 行时刻
+		// （重启后正确更新）；从未运行的常驻任务（角色门未获/调度关闭未拉起）
+		// 置零值——UI '—' 兜底（U1-66-06），不再回退引擎进程启动时刻
+		// （=uptime 语义，与「空闲/已停止」状态矛盾）。L1-12（第 65 轮）。
 		if m.Kind == taskengine.KindDaemon {
-			ti.StartedAt = te.StartedAt().In(CurrentLocation()).Format("2006-01-02 15:04:05")
 			if latestRun != nil {
 				ti.StartedAt = latestRun.StartedAt
+			} else if m.Running {
+				ti.StartedAt = te.StartedAt().In(CurrentLocation()).Format("2006-01-02 15:04:05")
 			}
 		}
 		out = append(out, ti)

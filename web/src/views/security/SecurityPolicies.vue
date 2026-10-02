@@ -32,7 +32,7 @@
         </el-table-column>
         <el-table-column label="关联规则" width="100" align="center">
           <template #default="{ row }">
-            <el-tooltip v-if="policyBoundRules(row.id).length > 0" placement="top" popper-class="policy-rules-popper">
+            <el-tooltip v-if="policyBoundRules(row.id).length > 0" placement="top" popper-class="policy-rules-popper" :popper-options="popperViewportSafe">
               <template #content>
                 <div v-for="rule in policyBoundRules(row.id)" :key="rule.caddy_id" class="policy-rule-row" @click="openRuleInNewTab(rule.caddy_id)">
                   {{ rule.name }} ({{ rule.caddy_id }})
@@ -742,7 +742,7 @@
                     </div>
                   </div>
                 </div>
-                <div class="form-tip-line">策略将应用到所选负载均衡规则的入站流量；同一规则绑定多条策略时按策略 ID 升序依次评估</div>
+                <div class="form-tip-line">策略将应用到所选负载均衡规则的入站流量；同一规则绑定多条策略时按阶段 0→3 顺序、同阶段内按策略 ID 升序依次评估</div>
                 <div v-if="editableOverrideStages.length > 0 && !isReadOnly" class="form-tip-line">「阶段 N 拦截页覆盖」是规则级字段（存于规则，非本策略）：改选后随本向导「保存」一并写入；未保存前不影响规则现状</div>
               </div>
             </el-form-item>
@@ -946,6 +946,7 @@ import type { CascaderOption, CascaderProps, CascaderValue, LazyLoad } from 'ele
 import { request, ApiRequestError, mfaAwareSuccess } from '@/utils/api'
 import { showSaveResult } from '@/utils/saveResult'
 import { isValidCidr } from '@/utils/ruleValidation'
+import { popperViewportSafe } from '@/utils/popper'
 import { formatDate } from '@/utils/date'
 import { useAuthStore } from '@/stores/auth'
 import { useCrsRuleIndex, crsRuleLabelView, parseCrsExcludedRules, CRS_EXCLUDED_MAX_ROWS } from '@/composables/useCrsRuleIndex'
@@ -3404,6 +3405,8 @@ onMounted(async () => {
 <!-- el-tooltip popper 挂载到 body， scoped 样式无法命中，单独非 scoped 块 -->
 <style>
 
+/* U9 兜底：关联规则多时 popper 可超视口——flip 回退之外由内部滚动承接 */
+.policy-rules-popper { max-height: 60vh; overflow-y: auto; }
 .policy-rules-popper .policy-rule-row {
   padding: 4px 8px;
   border-radius: 4px;

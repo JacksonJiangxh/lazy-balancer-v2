@@ -789,7 +789,11 @@ func securityEventsIPInList(ip string, list []string) bool {
 
 // securityEventsAttributePolicy v2.2.0 多策略事件归因：rule_triggered → 查该规则
 // ID 属于哪个策略（custom_rules / CRS 组 / IP ACL 拒绝带匹配，IP 族带事件源 IP
-// 成员精确判定），重叠时取绑定顺序第一条（policy_id ASC 的第一个）。策略均未
+// 成员精确判定），重叠时取绑定顺序第一条（policy_id ASC 的第一个）——L3-66-04
+// （第 66 轮）语义声明：多策略 CRS 重叠时实际执行拦截的引擎实例在 coraza 审计
+// 日志中不可恢复（各策略引擎对同一 CRS 规则 ID 均可产出中断），首绑定归因是摄
+// 取期约定的最接近发射现实的稳定口径，是记账语义而非 forensic 判定；事件页与
+// 24h 计数消费同一口径。策略均未
 // 显式包含时走 fallback，两层判定：
 //
 //  1. 能力首选层（2026-09-21 生产事故）：模式/动作门（A34-CORE-F1/F2，
@@ -1080,6 +1084,13 @@ func (t *securityEventsTailer) securityEventsTick() error {
 	if err != nil {
 		return fmt.Errorf("security events: read offset: %w", err)
 	}
+	// 安全处理耗时（2026-09-27 引入；L3-66-01 第 66 轮前置）：每 tick 消费
+	// 耗时侧车文件到 tick 级 map——必须先于下方空闲提前返回。侧车写侧
+	// （caddygeoip timing pre/end）逐请求无条件追加，而 audit log 是
+	// SecAuditEngine RelevantOnly 门控（仅相关事务落盘）——audit 文件无新增
+	// 字节 ≠ 侧车无新增字节；此前加载挂在空闲返回之后的 pass 路径上，静默
+	// 请求流（不产 relevant 事务）会让侧车只增不截。
+	securityTimingLoad()
 	if securityEventsShouldReset(offset, info.Size(), t.lastInfo, info) {
 		Logf("info", "security events ingestion: audit log rotated or truncated, resetting offset to 0")
 		offset = 0
@@ -1101,10 +1112,6 @@ func (t *securityEventsTailer) securityEventsTick() error {
 	if err != nil {
 		return err
 	}
-	// 安全处理耗时（2026-09-27）：每 pass 加载耗时侧车文件到 tick 级 map——
-	// audit 新增字节才走到这里（空闲 tick 在上方提前返回），侧车文件同样只在
-	// 有新请求时增长,量级匹配。
-	securityTimingLoad()
 	f, err := os.Open(t.logPath)
 	if err != nil {
 		return fmt.Errorf("security events: open audit log: %w", err)

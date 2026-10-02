@@ -164,16 +164,8 @@ func createAPIKeyForUser(c *gin.Context, userID int) {
 		return
 	}
 	// 每用户配额 ≤50（第 55 轮 P5-8，用户裁定）：此前无数量上限，普通用户可
-	// 无界增长 api_keys 表（自伤型资源膨胀）。
-	var owned int
-	if err := db.DB.QueryRowContext(c.Request.Context(), "SELECT COUNT(*) FROM api_keys WHERE created_by=?", userID).Scan(&owned); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询 Key 数量失败"})
-		return
-	}
-	if owned >= apiKeyMaxPerUser {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("API Key 数量已达上限（每用户 %d 个），请先删除不再使用的密钥", apiKeyMaxPerUser)})
-		return
-	}
+	// 无界增长 api_keys 表（自伤型资源膨胀）。判定与插入的原子化见下方单语句
+	// 条件插入（U7a-P5-5）。
 	if c.GetString("role") != "admin" {
 		req.ReadOnly = true
 	}
@@ -234,12 +226,26 @@ func createAPIKeyForUser(c *gin.Context, userID int) {
 	if req.ExpiresAt != nil {
 		expiresAt = req.ExpiresAt
 	}
-	result, err := db.DB.Exec(`
+	// U7a-P5-5（第 66 轮审计）：配额判定与插入原子化——此前 count-then-insert
+	// 两步在并发创建下 TOCTOU 越限（55 并发实测 55 全部越过 50 上限）。单语句
+	// 条件插入：计数子查询与写入同语句，SQLite 语句级原子，无判定窗口；
+	// WHERE 不满足时 0 行插入，按超限 400 拒绝。
+	result, err := db.DB.ExecContext(c.Request.Context(), `
 		INSERT INTO api_keys (name, key_hash, key_prefix, created_by, expires_at, mcp_enabled, read_only, mcp_ip_whitelist)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, req.Name, keyHash, keyPrefix, userID, expiresAt, req.MCPEnabled, req.ReadOnly, whitelistJSON)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE (SELECT COUNT(*) FROM api_keys WHERE created_by = ?) < ?
+	`, req.Name, keyHash, keyPrefix, userID, expiresAt, req.MCPEnabled, req.ReadOnly, whitelistJSON, userID, apiKeyMaxPerUser)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "创建 API 密钥失败"})
+		return
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取创建结果失败"})
+		return
+	}
+	if inserted == 0 {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("API Key 数量已达上限（每用户 %d 个），请先删除不再使用的密钥", apiKeyMaxPerUser)})
 		return
 	}
 	id, err := result.LastInsertId()

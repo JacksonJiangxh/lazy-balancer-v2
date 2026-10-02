@@ -286,6 +286,8 @@ function statusLabel(status: string): string {
       return '下载中'
     case 'installing':
       return '安装中'
+    case 'running':
+      return '更新中'
     case 'reloading':
       return '重载中'
     case 'failed':
@@ -303,6 +305,7 @@ function statusTagType(status: string): TagType {
     case 'checking':
     case 'downloading':
     case 'installing':
+    case 'running':
     case 'reloading':
       return 'warning'
     case 'failed':
@@ -422,9 +425,11 @@ const fetchIP2RegionInfo = async () => {
 const threatLatestVersion = ref('')
 const threatRunning = ref(false)
 const threatError = ref(false)
-// 聚合三源状态（与 CRS/IP 库框的常驻状态 tag 同构）：更新中>失败>成功>未更新
+// 聚合三源状态（与 CRS/IP 库框的常驻状态 tag 同构）：更新中>失败>成功>未更新。
+// U9-8：running 为威胁库专用词（「更新中」）——不再借用 reloading（「重载中」
+// 是 Caddy 配置重载语义，威胁库更新过程不重载配置）
 const threatStatus = computed(() => {
-  if (threatRunning.value) return 'reloading'
+  if (threatRunning.value) return 'running'
   if (threatSourcesStatus.value === 'failed') return 'failed'
   if (threatLatestVersion.value) return 'success'
   return ''

@@ -246,7 +246,15 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 落盘，生成期内容比对相等 → 快照为空 → 自动强制不触发；而「仅数据文件
 	// 变化、JSON 字节相同」正是 errSameConfig 短路让从节点插件内存停留旧库的
 	// 场景。applySnapshot 仅在新快照版本时运行，强制无冗余开销。
-	if err := s.caddy.ApplyConfigForce(GenerateCaddyConfig()); err != nil {
+	// L5-66-01（第 66 轮审计）：渲染+强制重载入 CaddyOpLock——此前与重启
+	// watcher（渲染 DB→/load，持锁）交错时，跨同步 commit 点的旧渲染可后到
+	// 覆盖新配置，从节点静默回退上一版本（三通道自愈全探不到）。锁序安全：
+	// 锁内仅 ApplyConfigForce 的 s.mu（叶操作），Pull 路径锁不反向嵌套。
+	CaddyOpLock.Lock()
+	reloadErr := s.caddy.ApplyConfigForce(GenerateCaddyConfig())
+	CaddyOpLock.Unlock()
+	if reloadErr != nil {
+		err := reloadErr
 		Logf("error", "集群同步后重载 Caddy 失败（快照已提交）: %v", err)
 		RecordAuditLog("system", "重载失败", "Caddy服务", fmt.Sprintf("同步应用后自动重载失败: %v", err), "")
 		// 写入标记：运行配置与数据库不一致。304 分支识别该标记并全量重拉补偿重试，

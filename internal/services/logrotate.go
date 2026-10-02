@@ -86,7 +86,8 @@ func StopLogRotate() {
 
 // RotatingFileWriter writes to a log file and rotates it once it exceeds the
 // size limit. Rotated files are suffixed with a timestamp and are subject to
-// retention cleanup (see StartRuntimeLogCleanup).
+// retention cleanup (log-cleanup 任务体的 RuntimeLogCleanupOnce——旧启动器
+// StartRuntimeLogCleanup 已随 M2 任务引擎化退役).
 type RotatingFileWriter struct {
 	path string
 	mu   sync.Mutex
@@ -173,11 +174,9 @@ func (w *RotatingFileWriter) Close() error {
 	return w.file.Close()
 }
 
-// StartRuntimeLogCleanup removes rotated runtime log files older than the
-// configured log retention (shared with the audit log retention setting). It
-// runs once immediately and then daily.
-// RuntimeCleanupResult 单轮清理结果（log-cleanup 任务日志展示明细——
-// 2026-10-01 用户裁定：清理了哪个文件必须可见）。
+// RuntimeCleanupResult 单轮运行日志清理结果（log-cleanup 任务日志展示明细——
+// 2026-10-01 用户裁定：清理了哪个文件必须可见；单轮执行体=
+// RuntimeLogCleanupOnce，由任务引擎 log-cleanup 族按 24h 节拍驱动）。
 type RuntimeCleanupResult struct {
 	AppRemoved int // 应用日志过期副本删除数（app.log.*）
 	TaskLogs   TaskLogHousekeepingResult
@@ -205,7 +204,9 @@ func (r TaskLogHousekeepingResult) Summary() string {
 		len(r.Deleted), list(r.Deleted), len(r.Rotated), list(r.Rotated), r.SizeCapMB)
 }
 
-// runs once immediately and then daily.
+// RuntimeLogCleanupOnce 单轮清理：应用日志过期副本删除 + 任务日志统一
+// 清理轮转（taskLogsHousekeeping）。由任务引擎 log-cleanup 族驱动（M2 起
+// 无独立启动器）。
 func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 	result := RuntimeCleanupResult{TaskLogs: taskLogsHousekeeping(logFile)}
 	months := 3

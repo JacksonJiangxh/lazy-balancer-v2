@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/config"
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/services"
 )
 
@@ -49,6 +50,49 @@ func TestGetCaddyConfig_dialsConfiguredAdminURL(t *testing.T) {
 	}
 }
 
+// L1-66-03：载入审计归因——手动重载（operator 非空）actor=操作者；启动/
+// 自愈（空）actor=system。此前恒 system，且「触发源见任务运行历史」在
+// 历史无 operator 列时归因链落空（列同批修复）。
+func TestApplyConfigOnStartup_auditActorFollowsOperator(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/load" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(fake.Close)
+	h := newBackupTestHandlers(t)
+	h.cfg = &config.Config{CaddyAdminURL: fake.URL}
+	h.caddyService = services.NewCaddyService(fake.URL)
+
+	// When 手动重载（operator=alice）
+	if err := h.ApplyConfigOnStartup("alice"); err != nil {
+		t.Fatalf("ApplyConfigOnStartup(alice): %v", err)
+	}
+	// Then 载入审计 actor=alice
+	var actor string
+	if err := db.AuditDB.QueryRow(`SELECT username FROM audit_log WHERE action='载入' AND resource='系统配置' ORDER BY id DESC LIMIT 1`).Scan(&actor); err != nil {
+		t.Fatalf("载入审计未记录: %v", err)
+	}
+	if actor != "alice" {
+		t.Fatalf("手动重载 actor=%q, want alice", actor)
+	}
+
+	// When 启动/自愈形态（operator 空）
+	if err := h.ApplyConfigOnStartup(""); err != nil {
+		t.Fatalf("ApplyConfigOnStartup(system): %v", err)
+	}
+	// Then actor=system
+	if err := db.AuditDB.QueryRow(`SELECT username FROM audit_log WHERE action='载入' AND resource='系统配置' ORDER BY id DESC LIMIT 1`).Scan(&actor); err != nil {
+		t.Fatalf("载入审计未记录: %v", err)
+	}
+	if actor != "system" {
+		t.Fatalf("启动形态 actor=%q, want system", actor)
+	}
+}
+
 func TestApplyConfigOnStartup_readinessProbeDialsConfiguredAdminURL(t *testing.T) {
 	// Given 假 admin 端点按序记录请求（/config/ GET 与 /load POST 均放行）
 	var mu sync.Mutex
@@ -70,7 +114,7 @@ func TestApplyConfigOnStartup_readinessProbeDialsConfiguredAdminURL(t *testing.T
 	h.caddyService = services.NewCaddyService(fake.URL)
 
 	// When 启动应用（空规则库）
-	if err := h.ApplyConfigOnStartup(); err != nil {
+	if err := h.ApplyConfigOnStartup(""); err != nil {
 		t.Fatalf("ApplyConfigOnStartup: %v", err)
 	}
 

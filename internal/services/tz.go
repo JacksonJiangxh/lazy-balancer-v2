@@ -204,7 +204,9 @@ func (writer *applicationLogWriter) Write(p []byte) (int, error) {
 	if err != nil {
 		return written, err
 	}
-	return len(p), nil
+	// U7b-F5（第 66 轮审计）：短写必须如实返回 sink 的写入量——返回 len(p) 偏离
+	// io.Writer 契约（装饰器不得替 sink 谎报）。
+	return written, nil
 }
 
 func trimLeadingASCIIWhitespace(value []byte) []byte {
@@ -235,6 +237,11 @@ func hasASCIIPrefixFold(value []byte, prefix string) bool {
 	return true
 }
 
+// ApplyLogLevel 读取全局日志级别并应用。main 在 db.Initialize 完成后立即调用，
+// 集群配置导入（users 节）后亦调用——U7b-F2（第 66 轮审计）：此装配点同时执行
+// 一次即时 refreshLocation。init 期启动的刷新 worker 首查时 DB 未就绪恒空转，
+// 配置时区（尤其 DST 时区）此前最长要等 30s ticker 才生效，期间日志时间戳落在
+// FixedZone+8 占位时区；装配点即时刷新消除该窗口，导入新时区亦即时生效。
 func ApplyLogLevel() {
 	level := "info"
 	if db.DB != nil {
@@ -242,5 +249,8 @@ func ApplyLogLevel() {
 	}
 	if err := ConfigureLogLevel(level); err != nil {
 		Logf("error", "apply application log level: %v", err)
+	}
+	if err := refreshLocation(); err != nil {
+		Logf("error", "refresh timezone: %v", err)
 	}
 }

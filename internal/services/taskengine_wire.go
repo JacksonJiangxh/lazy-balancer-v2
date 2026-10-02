@@ -21,10 +21,11 @@ import (
 var taskEngine *taskengine.Engine
 
 // configLoadRerun 系统配置载入手动重载钩子（main 注入：DB 渲染→强制应用）。
-var configLoadRerun func() error
+// operator 透传（L1-66-03）：手动重载归因操作者，启动 BootSync 传空。
+var configLoadRerun func(operator string) error
 
 // SetConfigLoadRerun 注入手动重载实现。
-func SetConfigLoadRerun(fn func() error) { configLoadRerun = fn }
+func SetConfigLoadRerun(fn func(operator string) error) { configLoadRerun = fn }
 
 // B（第 65 轮后裁定·完全标准化）：常驻服务真实生命周期挂钩——daemon Run
 // start→阻塞→deferred stop，调度开关/角色翻转即真实启停服务。
@@ -288,9 +289,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Run:         func(rc taskengine.RunContext) error { return runIngestionLoop(rc.Ctx) },
 	})
 
-	// 证书签发：被动守护（CAQueueManager 自管理——Run 阻塞保持运行态）。
-	// RunsOn=MasterOnly：从节点禁签发——daemon 不在从节点启动（promote 经
-	// SetRole 自动拉起），状态显示实态（从节点=空闲）。
+	// 证书签发：daemonLifecycleRun 真实生命周期挂钩（StartACME/StopACME——
+	// 队列+证书 worker+active 指针随调度开关/角色启停；幂等守卫吸收角色链
+	// 双调用）。RunsOn=MasterOnly：从节点禁签发——daemon 不在从节点启动
+	// （promote 经 SetRole 自动拉起），状态显示实态（从节点=空闲）。
 	taskEngine.Register(taskengine.Descriptor{
 		ID:          "cert-issuance",
 		Family:      "certificates",
@@ -505,7 +507,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			if configLoadRerun == nil {
 				return errors.New("配置重载未接线")
 			}
-			return configLoadRerun() // 启动与手动同体（2026-09-29 裁定）
+			return configLoadRerun(rc.Operator) // 启动与手动同体（2026-09-29 裁定）；operator 归因（L1-66-03）
 		},
 	})
 

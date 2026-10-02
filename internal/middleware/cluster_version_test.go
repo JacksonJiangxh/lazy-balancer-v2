@@ -995,3 +995,44 @@ func TestClusterRateLimitRespectsBucketCap(t *testing.T) {
 		t.Fatal("容量满时应跳过建桶（fail-open 放行——与 loginRateLimit 同族）")
 	}
 }
+
+// U5-66-01（第 66 轮）：threat 源的 consecutive_failures 是纯运行态失败计数
+// （failSourceRow 每次失败独立 UPDATE +1），必须与 last_checked 同法从 UPDATE
+// OF 触发列排除——否则源持续不可达期间每轮失败写都 bump cluster_version，
+// 快照 304 门失效、全集群重放。
+func TestClusterVersionTrigger_threatConsecutiveFailuresExcluded(t *testing.T) {
+	database := newClusterVersionTestDB(t)
+	if err := installClusterVersionTriggers(database); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT OR IGNORE INTO security_threat_sources (id, name) VALUES (1, 'ustc')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	readV := func() int64 {
+		var v int64
+		if err := database.QueryRow("SELECT COALESCE(cluster_version,0) FROM global_config WHERE id=1").Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	base := readV()
+
+	// 写失败计数（failSourceRow 形态：独立 UPDATE consecutive_failures+1）
+	if _, err := database.Exec("UPDATE security_threat_sources SET consecutive_failures=consecutive_failures+1 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if v := readV(); v != base {
+		t.Errorf("consecutive_failures-only update bumped cluster_version %d→%d, want unchanged (excluded from OF list)", base, v)
+	}
+
+	// 回归形状：真实同步列（版本）仍 bump
+	if _, err := database.Exec("UPDATE security_threat_sources SET version='20261003' WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if v := readV(); v != base+1 {
+		t.Errorf("version update should bump cluster_version to %d, got %d", base+1, v)
+	}
+}

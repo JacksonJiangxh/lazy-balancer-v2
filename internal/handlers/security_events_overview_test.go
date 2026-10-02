@@ -666,3 +666,32 @@ func TestCategorizeAttack_bodyProcessorErrorAndNoCrossFamily(t *testing.T) {
 		t.Fatalf("categorizeAttack(82345)=%q, want 自定义规则", got)
 	}
 }
+
+// L3-66-05（第 66 轮）：MetricsDB 未装配的兜底返回必须与成功路径同形状——
+// 键为 events（第 57 轮 P5-4 引入防 panic 时误用 list 键，前端按 events 解析
+// 拿到 undefined 空列表）。
+func TestListSecurityEvents_nilMetricsDBFallbackUsesEventsKey(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityEventsRouter(t)
+	orig := db.MetricsDB
+	db.MetricsDB = nil
+	t.Cleanup(func() { db.MetricsDB = orig })
+
+	recorder := getRequest(t, router, "/security/events")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 (nil MetricsDB must degrade to empty page)", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	eventsRaw, ok := payload.Data["events"]
+	if !ok {
+		t.Fatalf("data keys=%v, want events key (fallback must match success response shape)", payload.Data)
+	}
+	if string(eventsRaw) != "[]" {
+		t.Fatalf("data.events=%s, want []", eventsRaw)
+	}
+}

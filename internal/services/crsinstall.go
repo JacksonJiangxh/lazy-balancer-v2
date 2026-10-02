@@ -275,36 +275,11 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 	// 进程内错误路径执行、不会恢复。属小概率事件且可自愈：下次启动 SeedCRSRules
 	// 从 dist/快照重新播种（见 crsseed.go），影响面仅限 CRS 版本回退；孤立的
 	// .bak 也会在下次安装的 RemoveAll(rulesBak) 中被清理。不改行为，仅说明。
-	if err := os.RemoveAll(rulesPath); err != nil {
-		m.restoreBackup()
-		return fmt.Errorf("清理现有 rules: %w", err)
-	}
-	if err := moveTree(filepath.Join(staging, "rules"), rulesPath); err != nil {
-		m.restoreBackup()
-		return fmt.Errorf("安装新 rules: %w", err)
-	}
-	newSetup := filepath.Join(staging, "crs-setup.conf.example")
-	if err := copyFile(newSetup, setupPath); err != nil {
-		m.restoreBackup()
-		return fmt.Errorf("写入 crs-setup.conf: %w", err)
-	}
-	if err := copyFile(newSetup, filepath.Join(m.crsDir, "crs-setup.stock.conf")); err != nil {
-		m.restoreBackup()
-		return fmt.Errorf("写入 crs-setup.stock.conf 基线: %w", err)
-	}
-	// R53 新-2：overrides 迁移写入推迟到此处（rules 与新 setup 均已落盘）——
-	// 此点之后的崩溃留下「新 stock setup（不含自定义行）+ 旧 overrides」，
-	// 不再有「新 overrides + 旧 setup」重复 SecRule id 的窗口。残余风险
-	//（R54-N2，已接受）：仅当用户曾修改过 stock 规则（修改行 id 跨 CRS v4
-	// 版本稳定）且新版本仍含同 id 时，旧 overrides 与新 stock 组合才会出现
-	// 重复 SecRule id 致配置再生成失败——条件触发而非确定；用户未改过 stock
-	// 规则时 coraza 正常加载，仅丢失自上次更新以来新增的自定义行，下次成功
-	// 更新自愈。
-	if pendingOverrides != nil {
-		if err := os.WriteFile(filepath.Join(m.crsDir, "zz-user-overrides.conf"), pendingOverrides, 0644); err != nil {
-			m.restoreBackup()
-			return fmt.Errorf("写入 zz-user-overrides.conf: %w", err)
-		}
+	// L6-66-02：RemoveAll→overrides 写入的树交换段抽为 swapCRSTreeFromStaging，
+	// 在 wafFileMu 互斥段内执行（lbbak 导入 untarGzTo 交换同一棵树，交错产
+	// 混合/残缺 rules 树）；网络下载与 Caddy 重载在锁外。
+	if err := m.swapCRSTreeFromStaging(staging, setupPath, pendingOverrides); err != nil {
+		return err
 	}
 
 	// Reload BEFORE deleting backups: if reload fails, restoreBackup can still roll back.
@@ -362,6 +337,50 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 		//（重建后 ReconcileCRSState 的版本校正另有审计）。
 		writeCRSUpdateLog("ERROR", string(CRSStatusFailed), fmt.Sprintf("规则快照持久化失败: %v（容器重建后将回退，请检查数据卷磁盘空间）", err))
 		RecordAuditLog("system", "写入失败", "CRS规则库", FormatAuditDetail(fmt.Sprintf("版本：%s 规则快照持久化失败: %v（容器重建后将回退到镜像捆绑版本）", tag, err), AuditResultPart("failed")), "")
+	}
+	return nil
+}
+
+// swapCRSTreeFromStaging 树交换段（L6-66-02）：staging 内新规则树替换 live
+// rules/、落盘新 setup/stock 基线与迁移 overrides。全程持 wafFileMu——与
+// lbbak 导入（untarGzTo 交换同一棵树）、威胁库/ip2region 文件相位串行，杜绝
+// 混合/残缺 rules 树经 waf_files 节传播。失败路径的 restoreBackup（同为树
+// 变更）也在锁内；网络下载与 Caddy 重载不进锁（锁内取 CaddyOpLock 会与
+// 导入路径 CaddyOpLock→wafFileMu 的持锁序构成 AB-BA）。
+func (m *CRSUpdateManager) swapCRSTreeFromStaging(staging, setupPath string, pendingOverrides []byte) error {
+	wafFileMu.Lock()
+	defer wafFileMu.Unlock()
+	rulesPath := filepath.Join(m.crsDir, "rules")
+	if err := os.RemoveAll(rulesPath); err != nil {
+		m.restoreBackup()
+		return fmt.Errorf("清理现有 rules: %w", err)
+	}
+	if err := moveTree(filepath.Join(staging, "rules"), rulesPath); err != nil {
+		m.restoreBackup()
+		return fmt.Errorf("安装新 rules: %w", err)
+	}
+	newSetup := filepath.Join(staging, "crs-setup.conf.example")
+	if err := copyFile(newSetup, setupPath); err != nil {
+		m.restoreBackup()
+		return fmt.Errorf("写入 crs-setup.conf: %w", err)
+	}
+	if err := copyFile(newSetup, filepath.Join(m.crsDir, "crs-setup.stock.conf")); err != nil {
+		m.restoreBackup()
+		return fmt.Errorf("写入 crs-setup.stock.conf 基线: %w", err)
+	}
+	// R53 新-2：overrides 迁移写入推迟到此处（rules 与新 setup 均已落盘）——
+	// 此点之后的崩溃留下「新 stock setup（不含自定义行）+ 旧 overrides」，
+	// 不再有「新 overrides + 旧 setup」重复 SecRule id 的窗口。残余风险
+	//（R54-N2，已接受）：仅当用户曾修改过 stock 规则（修改行 id 跨 CRS v4
+	// 版本稳定）且新版本仍含同 id 时，旧 overrides 与新 stock 组合才会出现
+	// 重复 SecRule id 致配置再生成失败——条件触发而非确定；用户未改过 stock
+	// 规则时 coraza 正常加载，仅丢失自上次更新以来新增的自定义行，下次成功
+	// 更新自愈。
+	if pendingOverrides != nil {
+		if err := os.WriteFile(filepath.Join(m.crsDir, "zz-user-overrides.conf"), pendingOverrides, 0644); err != nil {
+			m.restoreBackup()
+			return fmt.Errorf("写入 zz-user-overrides.conf: %w", err)
+		}
 	}
 	return nil
 }

@@ -97,6 +97,11 @@ func validateSecurityCustomRule(rule *models.SecurityCustomRule) error {
 	return nil
 }
 
+// securityCustomRuleMaxGlobalCount 自定义规则全局数量上限（U3-F1 第 66 轮
+// 常量化——此前 200 以魔数散落在计数判定与文案两处）。与 IP 名单
+// ipListMaxGlobalCount 同阈值的双限额口径（U3-1 第 65 轮引入）。
+const securityCustomRuleMaxGlobalCount = 200
+
 func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
@@ -113,13 +118,6 @@ func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
-	// U3-1（第 65 轮）：全局数量上限（对齐 IP 名单 ipListMaxGlobalCount=200
-	// 双限额口径——曾无上限）
-	var ruleCount int
-	if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_custom_rules").Scan(&ruleCount); err == nil && ruleCount >= 200 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "自定义规则总数已达上限（200 条），请先清理不再使用的规则"})
-		return
-	}
 	conditionsJSON, _ := json.Marshal(req.Conditions)
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
 	if err != nil {
@@ -127,6 +125,19 @@ func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
+	// U3-1（第 65 轮）：全局数量上限（对齐 IP 名单 ipListMaxGlobalCount=200
+	// 双限额口径——曾无上限）。U3-F2（第 66 轮）：计数移入 BEGIN IMMEDIATE
+	// 事务内与插入同锁（消除计数-插入间并发窗口），计数查询失败 fail-closed
+	// 拒绝——此前 `err == nil &&` 判定使 DB 故障静默跳过上限继续创建。
+	var ruleCount int
+	if err := tx.QueryRowContext(c.Request.Context(), "SELECT COUNT(*) FROM security_custom_rules").Scan(&ruleCount); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "统计自定义规则数量失败"})
+		return
+	}
+	if ruleCount >= securityCustomRuleMaxGlobalCount {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("自定义规则总数已达上限（%d 条），请先清理不再使用的规则", securityCustomRuleMaxGlobalCount)})
+		return
+	}
 	result, err := tx.Exec(`INSERT INTO security_custom_rules (name, description, conditions, action, score, enabled, updated_by) VALUES (?,?,?,?,?,?,?)`,
 		req.Name, req.Description, string(conditionsJSON), req.Action, req.Score, req.Enabled, int(contextUserID(c)))
 	if err != nil {
@@ -634,6 +645,9 @@ func (h *Handlers) ListSecurityPolicies(c *gin.Context) {
 	// blocked_24h / trigger_24h：近 24h 每策略事件计数（metrics 库 security_events，
 	// policy_id>0 归因行；走 idx_security_events_action_time 索引范围（action 等值 + event_time 范围），单趟扫描）。
 	// blocked_24h 仅计 blocked；trigger_24h 计 blocked+logged（「24h 触发」列口径）。
+	// 归因口径同 securityEventsAttributePolicy（L3-66-04 第 66 轮声明）：多策略
+	// CRS 重叠时按 policy_id ASC 首绑定归因——实际拦截引擎在审计数据中不可恢复，
+	// 计数是归因记账口径而非引擎级判定。
 	blockedCounts := map[int]int{}
 	triggerCounts := map[int]int{}
 	if db.MetricsDB != nil {
@@ -930,6 +944,12 @@ func (h *Handlers) CreateSecurityPolicy(c *gin.Context) {
 	if typeErr != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: typeErr.Error()})
 		return
+	}
+	// U3-F3（第 66 轮）：trust_detection 仅 stage0（信任名单）策略消费——
+	// 非 stage0 类型（显式或内容推断）恒写 0，写侧强制 models.SecurityPolicy
+	// 「仅 stage0 消费；其他类型恒 0」契约，防跨阶段字段漂移落库。
+	if policyType != models.PolicyTypeStage0 {
+		req.TrustDetection = false
 	}
 	if err := services.ValidateGeoIPCountries(req.GeoIPCountries, req.GeoIPMode); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
@@ -1393,6 +1413,9 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 			req.WAFCheckResponse, req.LogRequestBody = &falseVal, &falseVal
 			req.IPWhitelistEnabled = &falseVal
 			req.IPWhitelist, req.IPWhitelistRefs = &emptyArr, &emptyArr
+			// U3-F3（第 66 轮）：trust_detection 是 stage0 专属——非 stage0
+			// 显式类型提交恒写 0（同阶段外字段指针归一口径）。
+			req.TrustDetection = &falseVal
 		case models.PolicyTypeStage2:
 			req.Mode = &offMode
 			req.CRSRuleGroups, req.CRSExcludedRules, req.CustomRules = &emptyArr, &emptyArr, &emptyArr
@@ -1406,6 +1429,8 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 			// 2026-09-25 用户裁定：stage2 允许配置拦截页（429 路由按其取页渲染）；
 			// 状态码仍归一 0——限流拦截恒 429（指标单独计量），页面由用户选。
 			req.BlockStatusCode = &zeroInt
+			// U3-F3（第 66 轮）：trust_detection 是 stage0 专属，同上归 0。
+			req.TrustDetection = &falseVal
 		case models.PolicyTypeStage3:
 			req.IPACLEnabled = &falseVal
 			req.IPACLList, req.IPACLListRefs = &emptyArr, &emptyArr
@@ -1414,6 +1439,8 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 			req.IPBlacklist = &emptyArr
 			req.GeoIPMode, req.GeoIPCountries = &offMode, &emptyArr
 			req.RateLimitEnabled, req.RateLimitRPS, req.RateLimitBurst = &falseVal, &zeroInt, &zeroInt
+			// U3-F3（第 66 轮）：trust_detection 是 stage0 专属，同上归 0。
+			req.TrustDetection = &falseVal
 		case models.PolicyTypeMixed:
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "混合策略为存量兼容形态，不可显式设置"})
 			return
@@ -1817,6 +1844,18 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 	if req.BlockStatusCode != nil {
 		query += ", block_status_code=?"
 		args = append(args, *req.BlockStatusCode)
+	}
+	// U3-F3（第 66 轮）：缺省类型提交按存量类型归一——存量 stage1/2/3 策略
+	// 显式携带 trust_detection=true 时强制写 0（跨阶段漂移不落库；nil 缺省
+	// 不强制写，保留现值语义不变）。mixed 与 ''（待推断存量态，mixed 语义）
+	// 不在此归一：迁移拆分路径（insertChild）已显式传值，存量行由「更新迁移」
+	// 或重推断收敛。
+	if req.TrustDetection != nil && req.PolicyType == nil && storedFound {
+		switch stored.PolicyType {
+		case models.PolicyTypeStage1, models.PolicyTypeStage2, models.PolicyTypeStage3:
+			falseTD := false
+			req.TrustDetection = &falseTD
+		}
 	}
 	addBool("trust_detection", req.TrustDetection)
 	addBool("enabled", req.Enabled)
@@ -3106,8 +3145,9 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 		return
 	}
 	if db.MetricsDB == nil {
-		// MetricsDB 未装配：返回空列表而非 panic（第 57 轮 P5-4）
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]any{"list": []any{}, "total": 0, "page": 1, "page_size": 20}})
+		// MetricsDB 未装配：返回空列表而非 panic（第 57 轮 P5-4）。键与成功
+		// 路径同形状（events——L3-66-05 第 66 轮修正，此前误用 list 键）。
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]any{"events": []any{}, "total": 0, "page": 1, "page_size": 20}})
 		return
 	}
 	// event_time 恒为 'YYYY-MM-DD HH:MM:SS' UTC 字符串，参数同形 —— 直接字符串比较

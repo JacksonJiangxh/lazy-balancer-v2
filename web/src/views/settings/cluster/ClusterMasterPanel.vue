@@ -67,7 +67,7 @@
       </el-table-column>
       <el-table-column label="配置版本" min-width="170">
         <template #default="{ row }">
-          <el-popover v-if="row.section_sync?.length" placement="top" trigger="hover" :width="460" :show-after="150">
+          <el-popover v-if="row.section_sync?.length" placement="top" trigger="hover" :width="460" :show-after="150" :popper-options="popperViewportSafe">
             <template #reference>
               <div class="version-cell">
                 <span class="version-nums">{{ row.reported_version }}<template v-if="row.reported_version < row.current_version"> → {{ row.current_version }}</template></span>
@@ -143,6 +143,7 @@
 import { computed } from 'vue'
 import { useWindowSize } from '@vueuse/core'
 import { formatDate } from '@/utils/date'
+import { popperViewportSafe } from '@/utils/popper'
 import { List, QuestionFilled, Setting } from '@element-plus/icons-vue'
 import type { ClusterHealth, ClusterNode, ClusterNodeStatus, ClusterStatus } from '@/types'
 

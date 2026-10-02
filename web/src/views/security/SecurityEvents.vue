@@ -37,7 +37,7 @@
              自定义 tag 时全部选中值英文逗号连接发送 rule_triggered（后端逐段按
              family/前缀/纯数字 ID 解析，OR 连接）。filterable + allow-create：可直接
              输入 CRS 规则 ID（如 942100）等自定义 tag 混入同一参数；自定义 tag 不参与
-             全选判定（只看 6 个类别是否全中）。 -->
+             全选判定（只看 4 个类别是否全中）。 -->
         <el-select
           v-model="filters.rule_triggered"
           multiple
@@ -150,7 +150,7 @@
     <!-- 请求上下文详情：策略开启「记录请求体」后，命中规则事件携带的请求头/请求体。
          请求头为 map[string][]string JSON 文本（多值以 ", " 连接；Cookie/Authorization/
          Set-Cookie/Proxy-Authorization 值默认掩码，逐行眼睛图标点击显示）；合成键
-         _dropped 渲染为信息行而非头行。请求体按契约前缀解析：base64-truncated: →
+         _lb_dropped_headers 渲染为信息行而非头行。请求体按契约前缀解析：base64-truncated: →
          base64: → 明文；明文尾部 \n...[TRUNCATED] 标记转为截断横幅；atob 解码失败
          展示原始内容 + 错误说明。宽度/顶距与 crs-event-dialog 一致。 -->
     <el-dialog v-model="ctxDialogVisible" width="min(760px, 94vw)" top="5vh" append-to-body class="ctx-event-dialog dialog-body-inset">
@@ -173,8 +173,8 @@
             </el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="异常评分">{{ ctxEvent.anomaly_score > 0 ? ctxEvent.anomaly_score : '—' }}</el-descriptions-item>
-          <el-descriptions-item label="处理耗时">{{ formatDurationUs(ctxEvent.duration_us) }}</el-descriptions-item>
-          <el-descriptions-item v-if="ctxEvent.precheck_us > 0 && ctxEvent.duration_us > ctxEvent.precheck_us" label="耗时分解">预检 {{ formatDurationUs(ctxEvent.precheck_us) }} + 本阶段 {{ formatDurationUs(ctxEvent.duration_us - ctxEvent.precheck_us) }}</el-descriptions-item>
+          <el-descriptions-item label="处理时长">{{ formatDurationUs(ctxEvent.duration_us + ctxEvent.precheck_us) }}</el-descriptions-item>
+          <el-descriptions-item v-if="ctxEvent.precheck_us > 0" label="耗时分解">预检 {{ formatDurationUs(ctxEvent.precheck_us) }} + WAF 段 {{ formatDurationUs(ctxEvent.duration_us) }}</el-descriptions-item>
         </el-descriptions>
 
         <div class="ctx-section-title">请求头</div>
@@ -183,7 +183,7 @@
           <pre class="ctx-body-pre">{{ ctxEvent.request_headers }}</pre>
         </template>
         <template v-else-if="ctxHeadersParsed.rows.length > 0 || ctxHeadersParsed.dropped > 0">
-          <div v-if="ctxHeadersParsed.dropped > 0" class="ctx-info-line">已隐藏 {{ ctxHeadersParsed.dropped }} 个头（请求头超出 8KB 采集上限）</div>
+          <div v-if="ctxHeadersParsed.dropped > 0" class="ctx-info-line">已隐藏 {{ ctxHeadersParsed.dropped }} 个头（请求头超出 64KB 采集上限）</div>
           <el-table v-if="ctxHeadersParsed.rows.length > 0" :data="ctxHeadersParsed.rows" size="small" :max-height="260" :header-cell-style="{ background: '#f9fafb' }">
             <el-table-column prop="name" label="名称" width="200" show-overflow-tooltip />
             <el-table-column label="值" min-width="380">
@@ -235,15 +235,13 @@ import type { CheckboxValueType } from 'element-plus'
 import { request } from '@/utils/api'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import TriggerDetailDialog from '@/components/events/TriggerDetailDialog.vue'
-import { formatDurationUs } from '@/utils/securityStages'
+import { formatDurationUs, triggerStageFamily } from '@/utils/securityStages'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
 import { formatDate } from '@/utils/date'
 import type { APIResponse } from '@/types'
 
 interface SecurityEvent { id: number; event_time: string; rule_caddy_id: string; rule_name: string; policy_id: number; policy_name: string; client_ip: string; ip_location: string; method: string; uri: string; event_type: string; rule_triggered: string; rule_msg: string; action: string; anomaly_score: number; duration_us: number; precheck_us: number; request_headers: string; request_body: string }
 
-// 触发规则 family 映射：'2'-'5' 与 '7'（允许模式预检拒绝，IP 白名单拒绝）为 IP 访问控制拦截，
-// '8' 为地域拦截，'14' 为威胁情报库预检拦截，'11' 为请求体解析失败，949 为异常评分评估拦截，920/921 为协议异常/攻击，其余为 CRS 规则 ID
 // 触发阶段分类（第 57 轮追加需求，用户裁定）：IP ACL 族=黑白名单/信任/地域/
 // 威胁库预检，统一展示「IP 访问控制」；WAF 含 CRS 与自定义两源；请求体异常独立。
 // 注：id 3/12 虽列于此族字面量，但 stageCategory 的 trust 分支先于本谓词判定
@@ -255,22 +253,21 @@ const isIpAclFamily = (row: SecurityEvent): boolean => {
   if ([2, 3, 4, 5, 7, 8, 14].includes(n)) return true
   return n >= 800000 && n < 900000
 }
-const isWafCrs = (row: SecurityEvent): boolean => /^9\d{5}$/.test(row.rule_triggered ?? '')
-// 第 59 轮 R59-P3：合成自定义（1 开头 ≥7 位，旧版无 id 规则形态）同属 WAF——
-// 与后端 stageCategorizeAttack/categorizeAttack 三侧同口径。
-const isWafCustom = (row: SecurityEvent): boolean => /^\d{5}$/.test(row.rule_triggered ?? '') || /^1\d{6,}$/.test(row.rule_triggered ?? '')
 
-// 第 62 轮 F62-10:共享谓词已导出(utils/securityStages.ts triggerStageFamily)——
-// 与 TriggerDetailDialog kind 是同构平行实现,全量迁移需等价性验证。
+// FE65-2：stageCategory 改由共享 triggerStageFamily 投影（securityStages 唯一
+// 实现，原 F62-10 双实现并存欠账）——本视图五桶 = 细粒度族的合并投影：
+// ipAcl/geoip/threat 同归「IP 访问控制」（阶段 1 合并口径），wafCrs/wafCustom
+// 同归「WAF」；trust/body/other 同名直通。
 const stageCategory = (row: SecurityEvent): 'trust' | 'acl' | 'waf' | 'body' | 'other' => {
   const t = row.rule_triggered
   if (!t) return 'other'
-  const n = Number(t)
-  if (n === 3 || n === 12) return 'trust'
-  if (t === '11') return 'body'
-  if (isWafCrs(row) || isWafCustom(row)) return 'waf'
-  if (isIpAclFamily(row)) return 'acl'
-  return 'other'
+  switch (triggerStageFamily(t)) {
+    case 'trust': return 'trust'
+    case 'ipAcl': case 'geoip': case 'threat': return 'acl'
+    case 'wafCrs': case 'wafCustom': return 'waf'
+    case 'body': return 'body'
+    default: return 'other'
+  }
 }
 const stageLabel = (row: SecurityEvent): string => {
   switch (stageCategory(row)) {
@@ -313,7 +310,7 @@ interface CtxHeaderRow { name: string; value: string; sensitive: boolean }
 interface CtxHeadersParsed { rows: CtxHeaderRow[]; dropped: number; failed: boolean }
 
 // 请求头解析："" → 空态；JSON.parse try/catch 防御（失败展示原始内容 + 错误说明）；
-// 合成键 _dropped: ["N"] 提取为信息行（N = 因 8KB 上限被丢弃的头数），不作为头行渲染；
+// 合成键 _lb_dropped_headers: ["N"] 提取为信息行（N = 因 64KB 上限被丢弃的头数），不作为头行渲染；
 // 多值头以 ", " 连接
 const ctxHeadersParsed = computed<CtxHeadersParsed>(() => {
   const raw = ctxEvent.value?.request_headers ?? ''
@@ -325,7 +322,7 @@ const ctxHeadersParsed = computed<CtxHeadersParsed>(() => {
     let dropped = 0
     for (const [name, values] of Object.entries(parsed as Record<string, unknown>)) {
       const list = Array.isArray(values) ? values.map((v) => String(v)) : [String(values)]
-      if (name === '_dropped') {
+      if (name === '_lb_dropped_headers') {
         const n = Number(list[0] ?? 0)
         if (Number.isFinite(n) && n > 0) dropped = n
         continue

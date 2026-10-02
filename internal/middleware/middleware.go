@@ -1087,6 +1087,26 @@ func mfaStepUpGuard() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		// U7c-3（第 66 轮审计）：从节点短路先于 428——只读门（readOnlyGuard）挂载
+		// 在本守卫之后的 admin 组，从节点 MFA 用户此前先收 428、输码重试后才见
+		// 403 真因。此处按只读门同法查询（COALESCE 兜底）；从节点直接 403，
+		// 查询失败与只读门同语义 fail-closed 500。verify-step/logout 已在上游
+		// 豁免，本判定只影响本将收到 428 的写请求（从节点的敏感 GET 导出不受影响）。
+		var isMaster bool
+		database := db.GetDB()
+		if database == nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "节点角色查询失败"})
+			return
+		}
+		if err := database.QueryRowContext(c.Request.Context(), "SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "节点角色查询失败"})
+			return
+		}
+		if !isMaster {
+			recordAuthenticationRejection(c, "slave_write_denied")
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"code": 403, "message": "从节点只读，请在主节点操作"})
+			return
+		}
 		c.AbortWithStatusJSON(http.StatusPreconditionRequired, gin.H{"code": 428, "message": "MFA_STEP_UP_REQUIRED", "detail": "此操作需要 MFA 验证"})
 	}
 }

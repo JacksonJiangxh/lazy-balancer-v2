@@ -68,7 +68,8 @@ func isReadOnlyGuardWhitelisted(path string) bool {
 	return path == "/api/v1/auth/login" ||
 		path == "/api/v1/auth/logout" ||
 		path == "/api/v1/auth/mfa/verify-step" ||
-		path == "/api/v1/cluster" ||
+		// U7c-4（第 66 轮审计）：原「path == /api/v1/cluster 精确匹配」已删——
+		// 生产路由面无精确注册（全部经 /cluster/ 前缀分支覆盖），永假死分支。
 		strings.HasPrefix(path, "/api/v1/cluster/")
 }
 

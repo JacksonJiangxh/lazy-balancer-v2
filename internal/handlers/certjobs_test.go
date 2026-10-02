@@ -122,6 +122,40 @@ func TestRetryCertJob_concurrent_status_change_returns_refresh_message(t *testin
 	}
 }
 
+// U1-66-05：手动重试成功路径必须唤醒 cert-waiting-ca（默认调度关闭——
+// waiting_ca 重排唯一属主）。此前 retry 直入队无唤醒，任务滞留至多 6h
+// （cert-reconcile 间隔）才被周期路径拾起。
+func TestRetryCertJob_wakesCertWaitingCA(t *testing.T) {
+	initTaskEngineForTest(t)
+	h := newBackupTestHandlers(t)
+	te := services.TaskEngine()
+	te.StopLoop("cert-waiting-ca") // 前置态：默认关闭（Given）
+
+	services.ResetCAQueueManagerForTest()
+	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
+		VALUES ('lb_wake','wake','http','wake.example.test',8080,1,1,'acme_dns');
+		INSERT INTO cert_jobs (rule_id,domain,status,updated_at) VALUES ('lb_wake','wake.example.test','failed',datetime('now','-10 minutes'))`); err != nil {
+		t.Fatalf("seed rule and job: %v", err)
+	}
+	if te.IsRunning("cert-waiting-ca") {
+		t.Fatal("前置态：cert-waiting-ca 应为关闭")
+	}
+
+	router := gin.New()
+	router.POST("/jobs/:id/retry", h.RetryCertJob)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/jobs/1/retry", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	// Then：成功入队即唤醒（StartLoop——调度开）
+	if !te.IsRunning("cert-waiting-ca") {
+		t.Fatal("retry 200 后应唤醒 cert-waiting-ca（StartLoop）——唤醒缺口未修")
+	}
+}
+
 func TestRetryCertJob_accepts_www_first_rule_domain(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()

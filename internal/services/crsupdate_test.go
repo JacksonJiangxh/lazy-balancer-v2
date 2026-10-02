@@ -337,7 +337,7 @@ func TestCRSSchedulerTick_autoOffDoesNothing(t *testing.T) {
 	}
 
 	// When the scheduler ticks with auto_update off
-	m.schedulerTick(time.Now(), nil)
+	m.schedulerTick(time.Now())
 
 	// Then nothing happens and next_update stays empty
 	if fetchCalled {
@@ -361,7 +361,7 @@ func TestCRSSchedulerTick_initializesNextUpdate(t *testing.T) {
 	}
 
 	// When the scheduler ticks with auto on and no next_update recorded
-	m.schedulerTick(now, nil)
+	m.schedulerTick(now)
 
 	// Then next_update is scheduled 24h out without running immediately
 	if fetchCalled {
@@ -397,7 +397,7 @@ func TestCRSSchedulerTick_runsWhenDue(t *testing.T) {
 	}
 
 	// When the scheduler ticks past next_update
-	m.schedulerTick(now, nil)
+	m.schedulerTick(now)
 
 	// Then an auto update starts and next_update is pushed 24h out
 	select {
@@ -428,7 +428,7 @@ func TestCRSSchedulerTick_slaveSkips(t *testing.T) {
 	}
 
 	// When the scheduler ticks on a slave node
-	m.schedulerTick(time.Now(), nil)
+	m.schedulerTick(time.Now())
 
 	// Then it does nothing
 	if fetchCalled {
@@ -580,5 +580,40 @@ func TestCRSRun_successRefreshesNextUpdate(t *testing.T) {
 	_, _, _, _, _, nextUpdate, _ = crsVersionRow(t)
 	if nextUpdate != "" {
 		t.Fatalf("auto_update=0 时成功不应写 next_update（got %q）", nextUpdate)
+	}
+}
+
+// U2-66-05（第 66 轮审计）：demote 竞态从节点中止口径对齐威胁族——起点角色
+// 复查中止须落 skipped 终态并审计「更新跳过」，不得记「更新失败」（从节点
+// 中止是正常语义，非故障）。
+func TestCRSUpdateRun_slaveAbortsSkipSemantics(t *testing.T) {
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.14.0", true)
+	if _, err := db.DB.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v4.14.0", nil }
+
+	// 经 StartUpdate（生产入口）驱动：state 置 trigger 后 StatusSnapshot 读内存
+	// 终态（直调 run() 时 state 无 trigger 会回退行状态，观察不到中止终态）。
+	done, err := m.StartUpdate("auto", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	snap := m.StatusSnapshot()
+	if snap.Status != "skipped" {
+		t.Fatalf("status=%q, want skipped（从节点中止是跳过语义，对齐威胁族）", snap.Status)
+	}
+	var failed, skipped int
+	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE resource='CRS规则库' AND action='更新失败'").Scan(&failed); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE resource='CRS规则库' AND detail LIKE '%更新跳过%'").Scan(&skipped); err != nil {
+		t.Fatal(err)
+	}
+	if failed != 0 || skipped != 1 {
+		t.Fatalf("failed=%d skipped=%d, want 0/1（从节点中止不得记更新失败）", failed, skipped)
 	}
 }

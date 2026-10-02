@@ -106,9 +106,7 @@ func TestCRSSchedulerTick_failedRunKeepsScheduleSlot(t *testing.T) {
 	m.fetchLatestTag = func(context.Context) (string, error) {
 		return "", errors.New("GitHub 返回 403")
 	}
-	stop := make(chan struct{})
-	defer close(stop)
-	m.schedulerTick(now, stop)
+	m.schedulerTick(now)
 
 	deadline := time.Now().Add(5 * time.Second)
 	for m.IsRunning() && time.Now().Before(deadline) {

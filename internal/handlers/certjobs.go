@@ -360,6 +360,12 @@ func (h *Handlers) RetryCertJob(c *gin.Context) {
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务关联规则已禁用、证书配置已变更或队列已暂停"})
 		return
 	}
+	// U1-66-05：手动重试入队成功=有在途证书工作——唤醒 cert-waiting-ca
+	// （默认调度关闭，waiting_ca 冷却重排/滞留重入队的唯一属主；此前重试
+	// 绕过单点唤醒，任务滞留至 cert-reconcile 周期至多 6h）。
+	if te := services.TaskEngine(); te != nil {
+		te.StartLoop("cert-waiting-ca")
+	}
 	recordAudit(c, "重试", "证书任务", services.FormatAuditDetail(services.AuditJobPart(id), services.AuditRulePart(ruleID), domain, fmt.Sprintf("原状态：%s", status), services.AuditResultPart("queued")))
 
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "Retry triggered"})
@@ -554,6 +560,13 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 					restoreErr = errors.Join(restoreErr, failErr)
 				}
 				deleteErr = errors.Join(deleteErr, restoreErr)
+			} else {
+				// U1-66-05：删除失败恢复重入队成功=有在途证书工作——唤醒
+				// cert-waiting-ca（与 RetryCertJob/CreateOrRequeueCertJobWithChange
+				// 同族收敛：全部入队成功路径必须唤醒唯一属主）。
+				if te := services.TaskEngine(); te != nil {
+					te.StartLoop("cert-waiting-ca")
+				}
 			}
 		}
 		services.Logf("error", "DeleteCertJob failed for job %d: %v", id, deleteErr)

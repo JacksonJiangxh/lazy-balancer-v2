@@ -5,6 +5,7 @@ package taskengine
 
 import (
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -347,21 +348,87 @@ func TestEngine_OneshotOnlyByTrigger(t *testing.T) {
 }
 
 // Given 注册的任务带 EnabledFn/StatusFn/NextSlotFn（含 DB 读取）。
-// When DescribeAll。
-// Then Fn 调用在引擎锁外（不互锁）；元数据含四类型字段。
+// When DescribeAll 在「跨 goroutine 写者就位」的强制碰撞形态下枚举：
+// EnabledFn 首次调用时暂停在探针点，等写者 goroutine 真实 pending 在引擎
+// 写锁上再放行——若 DescribeAll 持读锁跨 Fn 调用，写者待命会使 EnabledFn 内
+// 的 RLock（IsRunning）永久阻塞（Go RWMutex 写者优先）。同 goroutine 的
+// RLock 嵌套因重入性侦破不了该缺陷形态，故必须跨 goroutine 编排（U1-66-10）。
+// Then 不自锁；元数据含四类型字段。
 func TestEngine_DescribeAllReleasesLockBeforeFnCalls(t *testing.T) {
 	e := newTestEngine(t)
+	insideFn := make(chan struct{})
+	release := make(chan struct{})
+	var armed, fnLockStuck atomic.Bool
+	armed.Store(true)
 	e.Register(Descriptor{ID: "t-meta", Family: "t", Name: "元数据", Kind: KindScheduled,
 		NextSlotFn: func() time.Time { return time.Now().Add(time.Hour) },
-		EnabledFn:  func() bool { return e.IsRunning("t-meta") },
-		StatusFn:   func() string { return "running" },
-		Run:        func(rc RunContext) error { return nil }})
+		EnabledFn: func() bool {
+			if armed.CompareAndSwap(true, false) {
+				insideFn <- struct{}{} // 探针点：扫描已进入 Fn（变异形态下此刻仍持读锁）
+				<-release
+				// IsRunning 的 RLock 放独立 goroutine+超时：缺陷形态下它被
+				// pending 写者卡死——置位判负信号并放行 DescribeAll，让引擎
+				// 锁自然解开（否则 t.Cleanup(e.Stop) 随测试退出被同一死锁
+				// 卡住，测试二进制无法干净收场）。
+				done := make(chan bool, 1)
+				go func() { done <- e.IsRunning("t-meta") }()
+				select {
+				case v := <-done:
+					return v
+				case <-time.After(3 * time.Second):
+					fnLockStuck.Store(true)
+					return false
+				}
+			}
+			return e.IsRunning("t-meta")
+		},
+		StatusFn: func() string { return "running" },
+		Run:      func(rc RunContext) error { return nil }})
 	e.StartLoop("t-meta")
+
 	var found *TaskMeta
-	for _, m := range e.DescribeAll() {
-		if m.ID == "t-meta" {
-			found = &m
+	scanDone := make(chan struct{})
+	go func() {
+		defer close(scanDone)
+		for _, m := range e.DescribeAll() {
+			if m.ID == "t-meta" {
+				found = &m
+			}
 		}
+	}()
+	<-insideFn // 扫描停在探针点
+
+	// 写者就位：持续 Register（写锁）——缺陷形态下此刻 pending 在 e.mu.Lock
+	stopWriter := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for {
+			select {
+			case <-stopWriter:
+				return
+			default:
+			}
+			_ = e.Register(Descriptor{ID: "t-writer", Family: "t", Name: "写者", Kind: KindOneshot,
+				Run: func(rc RunContext) error { return nil }})
+			runtime.Gosched()
+		}
+	}()
+	time.Sleep(50 * time.Millisecond) // 写者进入写锁等待队列
+	close(release)                    // 放行 EnabledFn → IsRunning 的 RLock
+
+	select {
+	case <-scanDone:
+	case <-time.After(15 * time.Second):
+		close(stopWriter)
+		t.Fatal("DescribeAll 未在限时内完成（持锁形态异常）")
+	}
+	close(stopWriter)
+	<-writerDone
+
+	// Then：Fn 内 RLock 未被 pending 写者卡死（读锁已在 Fn 调用前释放）
+	if fnLockStuck.Load() {
+		t.Fatal("DescribeAll 持读锁跨 Fn 调用——写者待命时 Fn 内 RLock 自锁（缺陷形态侦破）")
 	}
 	if found == nil {
 		t.Fatal("未找到任务元数据")
@@ -384,6 +451,47 @@ func TestEngine_TriggerCarriesOperator(t *testing.T) {
 	<-done
 	if got != "alice" {
 		t.Fatalf("operator 应为 alice, got %q", got)
+	}
+}
+
+// U1-66-09 纵深：Trigger 对 KindDaemon 拒绝（常驻族启停即可——handler 门之外
+// 的引擎侧第二道防线；此前 Trigger 可直跑 daemon Run 绕过真实生命周期挂钩）。
+func TestEngine_TriggerRejectsDaemon(t *testing.T) {
+	e := newTestEngine(t)
+	ran := false
+	e.Register(Descriptor{ID: "t-daemon", Family: "t", Name: "常驻", Kind: KindDaemon,
+		Run: func(rc RunContext) error { ran = true; return nil }})
+	// When/Then：Trigger 返回错误且 Run 不执行（runNow 同步执行——无竞态）
+	if err := e.Trigger("t-daemon", "manual", ""); err == nil {
+		t.Fatal("Trigger daemon 应被拒绝（启停即可——引擎侧纵深守卫）")
+	}
+	if ran {
+		t.Fatal("daemon Run 不应被 Trigger 执行")
+	}
+}
+
+// L1-66-03：task_runs.operator 列——手动触发操作者落历史（RunRecord.Operator），
+// History SELECT 透出；auto/startup 触发（operator 空）落空串。
+func TestEngine_HistoryCarriesOperator(t *testing.T) {
+	e := newTestEngine(t)
+	e.Register(Descriptor{ID: "t-op-hist", Family: "t", Name: "历史", Kind: KindOneshot,
+		Run: func(rc RunContext) error { return nil }})
+	if err := e.Trigger("t-op-hist", "manual", "alice"); err != nil {
+		t.Fatalf("trigger: %v", err)
+	}
+	runs := e.History("t-op-hist", 5)
+	if len(runs) != 1 {
+		t.Fatalf("want 1 run, got %d", len(runs))
+	}
+	if runs[0].Operator != "alice" {
+		t.Fatalf("历史行 operator=%q, want alice", runs[0].Operator)
+	}
+	// 边界形态：auto/startup 形态（operator 空）落空串非 "alice" 残留
+	if err := e.Trigger("t-op-hist", "manual", ""); err != nil {
+		t.Fatalf("trigger2: %v", err)
+	}
+	if runs = e.History("t-op-hist", 5); runs[0].Operator != "" {
+		t.Fatalf("空操作者应落空串, got %q", runs[0].Operator)
 	}
 }
 

@@ -225,7 +225,9 @@ func (h *Handlers) RunAutoBackupOnce(trigger, operator string, engineRunID int64
 		return wrapped
 	}
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// U7b-F3（第 66 轮审计）：目录权限 0700——备份含私钥与凭证明文（文件 0600），
+	// 目录本身不得放宽到组/其他可读（0700 不受 umask 削弱）。
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return autoBackupRowView{}, fail("创建备份目录失败", err)
 	}
 	payload, exportedSections, countsSummary, _, err := h.buildLbbakExport(context.Background(), loadAutoBackupSectionsSetting())

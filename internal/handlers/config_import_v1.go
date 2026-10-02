@@ -601,6 +601,12 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		if !includeGlobal {
 			backup.Config = nil
 		}
+		// L6-66-01（第 66 轮审计 P2）：users 键存在且为空数组——预览与导入
+		// 同位硬拒（同文案），此前预览显示「用户 0 个」仍 valid=true。
+		if rows, ok := backup.Tables["users"]; ok && len(rows) == 0 {
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: "备份 users 表为空，导入将清空全部账户，已拒绝"}})
+			return
+		}
 		skipWarnings := skipEmptyDomainHTTPRules(backup.Tables)
 		// N+13 H2-F3：与 ImportConfigBackup 同序——空内容拦截页软跳过也须
 		// 进预览，否则预览静默、导入才跳（summary/warnings 口径一致）。
@@ -670,16 +676,36 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			if hasWaf {
 				validateWarnings = append(validateWarnings, "lbbak 完整备份（含规则库数据文件，完整性已校验）——规则库数据库分类将随导入落盘")
 			}
+			// F-B1（第 66 轮审计）：manifest 未登记的威胁库条目——预览/导入
+			// 同文案告警（不拒绝，老备份兼容）。
+			if len(payload.UnregisteredThreatEntries) > 0 {
+				validateWarnings = append(validateWarnings, fmt.Sprintf("lbbak 含 manifest 未登记的威胁库条目（%s）——内容未经完整性校验，已按原样落盘；建议核实来源后重新导出备份", strings.Join(payload.UnregisteredThreatEntries, "、")))
+			}
+		}
+		// L6-66-03（第 66 轮审计）：镜像导入侧 BE-C1-10 单侧文件缺失建模——
+		// 单侧缺失剔对应版本表并告警（此前仅建模双侧缺失，单侧形态预览计数
+		// 含两表且无警告，与导入实际落库分叉）；双侧缺失语义保持（L6-F2，
+		// BE-C1-10「只有元数据=不导入」）。文案与导入侧共用常量（A40-2-F6）。
+		if sectionTables["security_crs_version"] {
+			previewPayload := lbbakPayloadFromCtx(c)
+			crsMissing := previewPayload == nil || previewPayload.CRSTarGz == nil
+			xdbMissing := previewPayload == nil || previewPayload.Xdb == nil
+			switch {
+			case crsMissing && xdbMissing:
+				for _, t := range []string{"security_crs_version", "security_ip2region_version"} {
+					delete(backup.Tables, t)
+				}
+				validateWarnings = append(validateWarnings, warningWafMetadataSkipped)
+			case crsMissing:
+				delete(backup.Tables, "security_crs_version")
+				validateWarnings = append(validateWarnings, warningWafCRSMetadataSkipped)
+			case xdbMissing:
+				delete(backup.Tables, "security_ip2region_version")
+				validateWarnings = append(validateWarnings, warningWafXdbMetadataSkipped)
+			}
 		}
 		summary := map[string]int{}
 		for table, rows := range backup.Tables {
-			// L6-F2（第 65 轮）：无 waf_files 的备份导入会跳过 WAF 版本两表
-			//（BE-C1-10「只有元数据=不导入」）——预览对齐实际落库（曾预览
-			// 计数比实际多 2 表且跳过 warning 只在导入出现）
-			if !hasWaf && (table == "security_crs_version" || table == "security_ip2region_version") {
-				validateWarnings = append(validateWarnings, fmt.Sprintf("%s：备份未携带规则库数据文件，版本记录将跳过导入", table))
-				continue
-			}
 			summary[table] = len(rows)
 		}
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: true, Type: "v2", Summary: summary, Warnings: validateWarnings, DisabledConflicts: disabledConflicts, HasWafFiles: hasWaf}})

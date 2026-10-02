@@ -65,26 +65,53 @@ fi
     caddy run --config /app/config/Caddyfile --adapter caddyfile &
     CADDY_PID=$!
 
+    # L5-66-02:就绪后的恢复动作(重应用 last-good + 写权威修正 trigger)
+    reapply_last_good() {
+      if [ -s /app/data/last_good_caddy_config.json ]; then
+        if wget -q -O /dev/null -T 5 --header="Content-Type: application/json" \
+          --post-file=/app/data/last_good_caddy_config.json \
+          http://localhost:2019/load 2>/dev/null; then
+          sup_log "Re-applied last known good config (last_good 快照)"
+        else
+          sup_log "WARN: last-good config re-apply failed"
+        fi
+      fi
+      # trigger 文件:lazy-balancer 侧监听后走与启动完全相同的 DB 渲染→校验→
+      # 应用流程(权威修正——last_good 只是快速恢复桥,可能滞后于 DB)
+      echo restarted > /tmp/caddy-restarted
+    }
+
     # 等 admin 就绪后重应用 last-good 配置(重启后 Caddy 只有 Caddyfile 的
     # 基础形态,443 规则等需经 admin API /load 重放——否则崩溃自愈后 HTTPS 缺失)
+    READY=0
     for i in 1 2 3 4 5 6 7 8 9 10; do
       if wget -q -O /dev/null -T 1 http://localhost:2019/config/ 2>/dev/null; then
-        if [ -s /app/data/last_good_caddy_config.json ]; then
-          if wget -q -O /dev/null -T 5 --header="Content-Type: application/json" \
-            --post-file=/app/data/last_good_caddy_config.json \
-            http://localhost:2019/load 2>/dev/null; then
-            sup_log "Re-applied last known good config (last_good 快照)"
-          else
-            sup_log "WARN: last-good config re-apply failed"
-          fi
-        fi
-        # trigger 文件:lazy-balancer 侧监听后走与启动完全相同的 DB 渲染→校验→
-        # 应用流程(权威修正——last_good 只是快速恢复桥,可能滞后于 DB)
-        echo restarted > /tmp/caddy-restarted
+        READY=1
+        reapply_last_good
         break
       fi
       sleep 1
     done
+
+    # L5-66-02(第 66 轮审计):就绪探针逾时的兜底自愈——此前逾时(慢磁盘/
+    # 高负载下 admin 迟迟不就绪)既不补 last_good 也不写 trigger,Caddy 以
+    # 零规则形态运行且权威修正链永不唤醒,恢复仅剩重启/人工 reload。后台
+    # 子循环继续探:就绪后补 last_good + trigger;Caddy 退出(本轮 pid 被外层
+    # wait 回收/下轮换新 pid)即退出,与监督器主环生命周期对齐。
+    if [ "$READY" -eq 0 ]; then
+      sup_log "WARN: Caddy admin not ready after 10 probes, background recovery loop continues"
+      (
+        while true; do
+          sleep 1
+          kill -0 "$CADDY_PID" 2>/dev/null || exit 0
+          if wget -q -O /dev/null -T 1 http://localhost:2019/config/ 2>/dev/null; then
+            reapply_last_good
+            sup_log "Slow-start recovery: config re-applied after delayed admin readiness"
+            exit 0
+          fi
+        done
+      ) &
+    fi
 
     # 等待 Caddy 退出(wait 同时回收进程——零僵尸)
     wait $CADDY_PID

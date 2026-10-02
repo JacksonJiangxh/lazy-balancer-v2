@@ -704,7 +704,7 @@ func (h *Handlers) StartCaddyRestartWatcher() {
 			}
 			_ = os.Remove(caddyRestartTriggerFile)
 			services.Logf("info", "检测到 Caddy 进程重启，走启动配置流程重新应用（DB 渲染）")
-			if err := h.ApplyConfigOnStartup(); err != nil {
+			if err := h.ApplyConfigOnStartup(""); err != nil {
 				services.Logf("error", "Caddy 重启后配置重应用失败: %v", err)
 			} else {
 				services.Logf("info", "Caddy 重启后配置重应用完成（与启动流程同源）")
@@ -713,7 +713,14 @@ func (h *Handlers) StartCaddyRestartWatcher() {
 	}()
 }
 
-func (h *Handlers) ApplyConfigOnStartup() error {
+// ApplyConfigOnStartup 系统配置载入（startup:config-load Run 体唯一执行通道：
+// BootSync 启动传空 operator、手动重载经 wire 传操作者——L1-66-03）。
+// operator 非空=手动触发，载入审计归因操作者；空=system。
+func (h *Handlers) ApplyConfigOnStartup(operator string) error {
+	actor := operator
+	if actor == "" {
+		actor = "system"
+	}
 	// R55 F3：存量越界 audit_retention_months 启动钳位（写侧已加 1-12 校验）。
 	clampAuditRetentionMonthsOnStartup()
 	// Round 29 G-3: 启动路径补存量规则校验（保存/导入/启用路径已有自环与遮蔽拦截），
@@ -721,7 +728,7 @@ func (h *Handlers) ApplyConfigOnStartup() error {
 	// 「启动应用失败仅记日志保旧配置」的既有取舍一致（main.go 调用侧同样不退出）。
 	if err := validateEnabledStoredRuleConfigs(context.Background()); err != nil {
 		services.Logf("error", "启动校验发现无效规则配置，继续启动（保留旧配置）：%v", err)
-		services.RecordAuditLog("system", "启动警告", "系统配置", "启动校验发现无效规则配置："+err.Error(), "")
+		services.RecordAuditLog(actor, "启动警告", "系统配置", "启动校验发现无效规则配置："+err.Error(), "")
 	}
 
 	// Wait for Caddy to be ready (up to 10 seconds)
@@ -773,7 +780,7 @@ func (h *Handlers) ApplyConfigOnStartup() error {
 		}
 		wrapped := fmt.Sprintf("运行配置含非本库规则路由（%s，共 %d 条）——疑似 Caddy Admin 地址误配或外来实例曾写入本实例 Caddy，本次启动应用将覆盖收敛", strings.Join(shown, "、"), len(foreign))
 		services.Logf("error", "CRITICAL: %s", wrapped)
-		services.RecordAuditLog("system", "启动警告", "系统配置", wrapped, "")
+		services.RecordAuditLog(actor, "启动警告", "系统配置", wrapped, "")
 	}
 
 	// F49-15（第 49 轮审计·漂移横幅事故）：未初始化实例（无任何用户）空库
@@ -789,7 +796,7 @@ func (h *Handlers) ApplyConfigOnStartup() error {
 			if hasRoutes, probeErr := services.RunningConfigHasRuleRoutes(h.cfg.CaddyAdminURL); probeErr == nil && hasRoutes {
 				wrapped := "启动守卫：未初始化实例（无用户、无启用规则），但 Caddy 运行配置仍含规则路由——跳过本次启动应用（疑似数据目录或 Caddy Admin 地址误配），运行配置保持原样；漂移状态由看门狗持续上报"
 				services.Logf("error", "CRITICAL: %s", wrapped)
-				services.RecordAuditLog("system", "启动警告", "系统配置", wrapped, "")
+				services.RecordAuditLog(actor, "启动警告", "系统配置", wrapped, "")
 				return nil
 			}
 		}
@@ -803,7 +810,7 @@ func (h *Handlers) ApplyConfigOnStartup() error {
 			wrapped := fmt.Sprintf("启动时数据库渲染的配置被 Caddy 拒绝，已回退最后已知正确配置（负载均衡保持可用，运行配置与数据库分叉待修复）：%v", err)
 			services.TaskLogf("startup:config-load", "caddy", "Caddy 应用被拒，已回退最后已知正确配置：%v", err)
 			services.Logf("error", "CRITICAL: %s", wrapped)
-			services.RecordAuditLog("system", "启动警告", "系统配置", wrapped, "")
+			services.RecordAuditLog(actor, "启动警告", "系统配置", wrapped, "")
 			// 2026-09-07 裁定 K1：从节点追加补偿标记——Pull 的 304 分支识别后
 			// 全量重拉，消除「同步正常+运行旧配置」静默窗口；主节点不经 Pull
 			// 消费该标记，故不写。
@@ -821,7 +828,7 @@ func (h *Handlers) ApplyConfigOnStartup() error {
 	}
 	services.Logf("info", "启动：Caddy 配置已载入（启用规则 %d 条）", count)
 	services.TaskLogf("startup:config-load", "caddy", "Caddy 配置渲染应用成功（启用规则 %d 条）", count)
-	services.RecordAuditLog("system", "载入", "系统配置", fmt.Sprintf("从数据库载入配置并应用 Caddy；启用规则 %d 条（触发源见任务运行历史）", count), "")
+	services.RecordAuditLog(actor, "载入", "系统配置", fmt.Sprintf("从数据库载入配置并应用 Caddy；启用规则 %d 条（触发源见任务运行历史）", count), "")
 
 	return nil
 }

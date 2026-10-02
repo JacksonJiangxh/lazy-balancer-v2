@@ -286,6 +286,10 @@ func (h *Handlers) respondLoginWithMFA(c *gin.Context, user models.User, passwor
 	var mfaEnabled int
 	if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", user.ID).Scan(&mfaEnabled); err == nil {
 		response.MFAEnabled = mfaEnabled == 1
+	} else {
+		// U7a-P5-6（第 66 轮审计）：查询失败此前静默保持 false——响应语义不变
+		//（该字段为展示性预检），但错误必须留痕便于诊断。
+		services.Logf("error", "login response mfa_enabled lookup: %v", err)
 	}
 
 	c.JSON(http.StatusOK, models.LoginResponse{

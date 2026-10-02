@@ -1,5 +1,5 @@
 <template>
-  <el-popover v-if="canManage" ref="popoverRef" :width="400" trigger="click" popper-class="ip-location-popper" @before-enter="onPopoverShow">
+  <el-popover v-if="canManage" ref="popoverRef" :width="400" trigger="click" popper-class="ip-location-popper" :popper-options="popperViewportSafe" @before-enter="onPopoverShow">
     <template #reference>
       <span
         class="ip-cell ip-clickable"
@@ -85,6 +85,7 @@ import { useTrustAssociation } from '@/composables/useTrustAssociation'
 import type { IpListOption } from '@/composables/useIpListAdd'
 // 分组类型路由（U8-2）：inferPolicyType 为策略类型单一实现（securityStages 导出，禁第二实现）
 import { inferPolicyType, parseIPList, parseRefIds, entryMatchesIp, invalidateSharedEntriesCache } from '@/utils/securityStages'
+import { popperViewportSafe } from '@/utils/popper'
 import type { SecurityPolicyType, SecurityPolicyTypeInput } from '@/utils/securityStages'
 import type { APIResponse } from '@/types'
 
@@ -462,10 +463,14 @@ const rowView = (policy: PolicyRow): RowView => {
   }
 
   // 生效名单 = 内联 ∪ 引用列表条目；引用命中的条目无法在本弹窗移除
-  // （PUT 仅写内联 ip_acl_list），移除按钮仅对内联命中开放
+  // （PUT 仅写内联 ip_acl_list）。展示口径 CIDR 感知（第 62 轮 F62-9：内联
+  // CIDR 条目命中实际 IP）；U9-1：移除动作收窄为精确条目（inInlineExact）——
+  // 内联 CIDR 覆盖的 IP 无法由 PUT 精确剔除（剔除整条 CIDR 会波及其他 IP），
+  // 不再亮「移除」，状态行改标「来自内联 CIDR」引导到策略编辑。
   const list = mergedAclEntries(policy)
-  // 第 62 轮 F62-9:CIDR 感知(内联 CIDR 条目命中实际 IP;第 61 轮 P2-3 只改了弹框侧)
-  const inInline = parseIPList(policy.ip_acl_list).some((e) => entryMatchesIp(e, props.ip.trim()))
+  const aclInlineEntries = parseIPList(policy.ip_acl_list)
+  const inInlineExact = aclInlineEntries.includes(props.ip.trim())
+  const inInline = aclInlineEntries.some((e) => entryMatchesIp(e, props.ip.trim()))
   const inList = list.some((e) => entryMatchesIp(e, props.ip.trim()))
 
   view.removableRefLists = ipLists.value
@@ -486,8 +491,9 @@ const rowView = (policy: PolicyRow): RowView => {
     view.countLabel = `${list.length} 条`
     if (inList) {
       view.statusClass = td1Owner ? 'is-warn' : 'is-ok'
-      view.statusLabel = (inInline ? '✅ 已在黑名单中' : `✅ 已在黑名单中${view.aclHitSourceLabel}`) + exemptHitSuffix + passthruSuffix
-      view.canRemove = inInline
+      const cidrNote = inInline && !inInlineExact ? '（来自内联 CIDR 条目，请到策略编辑中移除）' : ''
+      view.statusLabel = (inInline ? `✅ 已在黑名单中${cidrNote}` : `✅ 已在黑名单中${view.aclHitSourceLabel}`) + exemptHitSuffix + passthruSuffix
+      view.canRemove = inInlineExact
     } else {
       view.statusLabel = `黑名单 · ${list.length} 条`
       view.canAssociate = true
@@ -498,8 +504,9 @@ const rowView = (policy: PolicyRow): RowView => {
     view.countLabel = `${list.length} 条`
     if (inList) {
       view.statusClass = 'is-ok'
-      view.statusLabel = inInline ? '✅ 已在白名单中' : `✅ 已在白名单中${view.aclHitSourceLabel}`
-      view.canRemove = inInline
+      const cidrNote = inInline && !inInlineExact ? '（来自内联 CIDR 条目，请到策略编辑中移除）' : ''
+      view.statusLabel = (inInline ? `✅ 已在白名单中${cidrNote}` : `✅ 已在白名单中${view.aclHitSourceLabel}`) + exemptHitSuffix + passthruSuffix
+      view.canRemove = inInlineExact
     } else {
       view.statusClass = 'is-warn'
       // allow 交集外 = id:7 拒绝形态：无信任时确实无法访问；信任豁免中放行（记检测）
@@ -521,6 +528,23 @@ const rowView = (policy: PolicyRow): RowView => {
 // 剔除 + 逐个引用列表 remove-ip；随后整行刷新（状态即时翻转为名单/规则拦截）。
 const cancelTrustAll = async (row: RowView): Promise<void> => {
   if (!lockBusy(row.policy.id, 'untrust')) return
+  const ip = props.ip.trim()
+  // U9-1 对齐：信任生效仅由本弹窗不可移除的条目（内联 CIDR 覆盖 / 系统名单精确
+  // 条目）提供时，「取消信任」是空操作——不再弹确认框走流程后谎报成功，直接
+  // 指引到对应编辑面。
+  const inlineExact = parseIPList(row.policy.ip_whitelist).includes(ip)
+  const exactRefLists = row.removableTrustRefLists.filter((m) => (ipListEntries.value[m.id] ?? []).some((e) => e === ip))
+  if (!inlineExact && exactRefLists.length === 0) {
+    if (parseIPList(row.policy.ip_whitelist).some((e) => entryMatchesIp(e, ip))) {
+      ElMessage.info('该 IP 由内联 CIDR 提供信任，请在策略编辑中移除对应条目')
+    } else if (row.removableTrustRefLists.some((m) => (ipListEntries.value[m.id] ?? []).some((e) => entryMatchesIp(e, ip)))) {
+      ElMessage.info('该 IP 由引用列表中的 CIDR 条目提供信任，请编辑对应列表移除条目')
+    } else {
+      ElMessage.warning('该 IP 的信任条目不可在本弹窗移除，请到「安全防护 → 安全策略」编辑该策略处理')
+    }
+    unlockBusy(row.policy.id, 'untrust')
+    return
+  }
   try {
     try {
       await ElMessageBox.confirm(
@@ -536,7 +560,7 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
         await request.put(`/security/policies/${row.policy.id}`, { ip_whitelist: JSON.stringify(inline) })
       }
     }
-    for (const m of row.removableTrustRefLists) {
+    for (const m of exactRefLists) {
       await request.post(`/security/ip-lists/${m.id}/remove-ip`, { value: props.ip })
     }
     ElMessage.success(`已取消 ${props.ip} 对「${row.policy.name}」的信任`)
