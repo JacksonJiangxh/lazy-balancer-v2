@@ -604,7 +604,11 @@ func (h *Handlers) DownloadAutoBackup(c *gin.Context) {
 		return
 	}
 	path := filepath.Join(h.cfg.BackupDir, view.Filename)
-	if _, err := os.Stat(path); err != nil {
+	// U7b-F1（第 66 轮）：句柄先行——os.Open 成功后才审计并流式交付，
+	// 消除 Stat→FileAttachment 窗口内备份完成 prune 掉目标文件导致的
+	// 打开失败 panic/500 与「审计先于交付」虚记。
+	f, err := os.Open(path)
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "备份文件已不存在"})
 			return
@@ -612,8 +616,16 @@ func (h *Handlers) DownloadAutoBackup(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取备份文件失败: " + err.Error()})
 		return
 	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取备份文件失败: " + err.Error()})
+		return
+	}
 	recordAudit(c, "备份下载", "配置备份", services.FormatAuditDetail(
 		fmt.Sprintf("备份 #%d", view.ID), "文件："+view.Filename, "含凭证与证书材料，请加密保管", services.AuditResultPart("success")))
 	c.Header("Cache-Control", "no-store, private")
-	c.FileAttachment(path, view.Filename)
+	c.DataFromReader(http.StatusOK, fi.Size(), "application/octet-stream", f, map[string]string{
+		"Content-Disposition": fmt.Sprintf("attachment; filename=%q", view.Filename),
+	})
 }

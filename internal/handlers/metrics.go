@@ -246,6 +246,41 @@ func metricsIntervalModifier(interval string) string {
 	}
 }
 
+// metricsIntervalSeconds 把 interval 参数换算为窗口秒数（与
+// metricsIntervalModifier 同解析同上限——U8a-P4-1 分桶粒度推导）。
+func metricsIntervalSeconds(interval string) int64 {
+	interval = strings.TrimSpace(strings.ToLower(interval))
+	if interval == "" {
+		return 3600
+	}
+	unit := interval[len(interval)-1:]
+	n := strings.TrimSuffix(interval, unit)
+	value, err := strconv.Atoi(n)
+	if err != nil {
+		return 3600
+	}
+	mult := int64(1)
+	switch unit {
+	case "h":
+		if value > 168 {
+			value = 168
+		}
+		mult = 3600
+	case "d":
+		if value > 7 {
+			value = 7
+		}
+		mult = 86400
+	case "m":
+		if value > 10080 {
+			value = 10080
+		}
+	default:
+		return 3600
+	}
+	return int64(value) * mult
+}
+
 func metricsHistoryRange(value string) (string, int, int) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "1h":
@@ -334,28 +369,58 @@ func (h *Handlers) GetRuleMetricsHistory(c *gin.Context) {
 
 func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 	ruleID := c.Query("rule_id")
-	interval := metricsIntervalModifier(c.DefaultQuery("interval", "1h"))
+	rawInterval := c.DefaultQuery("interval", "1h")
+	interval := metricsIntervalModifier(rawInterval)
+	// U8a-P4-1（第 66 轮）：分桶上限——镜像 get_rule_metrics_history 的窗口
+	// 函数范式（每桶取末行样本，桶数 ≤720）。此前无上限无分桶：默认配置
+	// 7 天窗 30s 间隔可达 ~2 万行 ≈2.5MB 一次性返回（5s 间隔可达 12 万行）。
+	metricsHistoryMaxBuckets := int64(720)
+	bucketSeconds := metricsIntervalSeconds(rawInterval) / metricsHistoryMaxBuckets
+	if bucketSeconds < 1 {
+		bucketSeconds = 1
+	}
 
 	var rows *sql.Rows
 	var err error
 
 	if ruleID != "" {
 		rows, err = db.MetricsDB.Query(`
-			SELECT timestamp, requests_total, requests_2xx, requests_3xx, 
+			WITH ranked AS (
+				SELECT CAST(strftime('%s', timestamp) AS INTEGER) / ? AS bucket,
+				       requests_total, requests_2xx, requests_3xx, requests_4xx, requests_5xx, bytes_in, bytes_out,
+				       ROW_NUMBER() OVER (
+					   PARTITION BY CAST(strftime('%s', timestamp) AS INTEGER) / ?
+					   ORDER BY timestamp DESC, id DESC
+				   ) AS sample_rank
+				FROM metrics_history
+				WHERE rule_id = ? AND timestamp > datetime('now', ?)
+			)
+			SELECT datetime(bucket * ?, 'unixepoch'), requests_total, requests_2xx, requests_3xx,
 			       requests_4xx, requests_5xx, bytes_in, bytes_out
-			FROM metrics_history 
-			WHERE rule_id = ? AND timestamp > datetime('now', ?)
-			ORDER BY timestamp
-		`, ruleID, interval)
+			FROM ranked WHERE sample_rank = 1 ORDER BY bucket LIMIT ?
+		`, bucketSeconds, bucketSeconds, ruleID, interval, bucketSeconds, metricsHistoryMaxBuckets)
 	} else {
 		rows, err = db.MetricsDB.Query(`
-			SELECT timestamp, SUM(requests_total), SUM(requests_2xx), SUM(requests_3xx), 
-			       SUM(requests_4xx), SUM(requests_5xx), SUM(bytes_in), SUM(bytes_out)
-			FROM metrics_history 
-			WHERE rule_id IS NULL AND timestamp > datetime('now', ?)
-			GROUP BY timestamp
-			ORDER BY timestamp
-		`, interval)
+			WITH per_ts AS (
+				SELECT timestamp, SUM(requests_total) AS requests_total, SUM(requests_2xx) AS requests_2xx,
+				       SUM(requests_3xx) AS requests_3xx, SUM(requests_4xx) AS requests_4xx,
+				       SUM(requests_5xx) AS requests_5xx, SUM(bytes_in) AS bytes_in, SUM(bytes_out) AS bytes_out
+				FROM metrics_history
+				WHERE rule_id IS NULL AND timestamp > datetime('now', ?)
+				GROUP BY timestamp
+			), ranked AS (
+				SELECT CAST(strftime('%s', timestamp) AS INTEGER) / ? AS bucket,
+				       requests_total, requests_2xx, requests_3xx, requests_4xx, requests_5xx, bytes_in, bytes_out,
+				       ROW_NUMBER() OVER (
+					   PARTITION BY CAST(strftime('%s', timestamp) AS INTEGER) / ?
+					   ORDER BY timestamp DESC
+				   ) AS sample_rank
+				FROM per_ts
+			)
+			SELECT datetime(bucket * ?, 'unixepoch'), requests_total, requests_2xx, requests_3xx,
+			       requests_4xx, requests_5xx, bytes_in, bytes_out
+			FROM ranked WHERE sample_rank = 1 ORDER BY bucket LIMIT ?
+		`, interval, bucketSeconds, bucketSeconds, bucketSeconds, metricsHistoryMaxBuckets)
 	}
 
 	if err != nil {
@@ -378,13 +443,21 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 	var metrics []MetricRow
 	for rows.Next() {
 		var m MetricRow
-		if err := rows.Scan(&m.Timestamp, &m.RequestsTotal, &m.Status2xx, &m.Status3xx,
+		var ts string
+		if err := rows.Scan(&ts, &m.RequestsTotal, &m.Status2xx, &m.Status3xx,
 			&m.Status4xx, &m.Status5xx, &m.BytesIn, &m.BytesOut); err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取指标历史失败: " + err.Error()})
 			return
 		}
+		parsed, err := time.ParseInLocation("2006-01-02 15:04:05", ts, time.UTC)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "解析历史指标时间失败: " + err.Error()})
+			return
+		}
+		m.Timestamp = parsed
 		metrics = append(metrics, m)
 	}
+
 	if err := rows.Err(); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取指标历史失败: " + err.Error()})
 		return

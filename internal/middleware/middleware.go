@@ -276,6 +276,15 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 			param.Method, param.StatusCode, param.Latency, param.ClientIP, param.Method, param.Path)
 	}), gin.Recovery())
 
+	// U7c-2（第 66 轮）：全局安全响应头——面板页面与 API 响应恒施加
+	// nosniff+DENY（点击劫持/MIME 嗅探表面；认证走 Authorization 头无
+	// cookie 向量，此为纵深加固）。
+	r.Use(func(c *gin.Context) {
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Next()
+	})
+
 	// CORS
 	r.Use(corsMiddleware())
 	r.Use(gzip.Gzip(gzip.DefaultCompression))
