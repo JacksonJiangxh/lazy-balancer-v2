@@ -3288,17 +3288,11 @@ onMounted(async () => {
 
 /* 生效投影条（任务 8）：同一信息条左右两段——左=生效说明句、右=关联规则覆盖状态
    列表，同字号（12px）同基线（align-items: baseline） */
-/* 2026-10-03 用户裁定：阶段 x 配置步内 info-note-bar 与 stage-projection-bar
-   同宽（0 20px 12px）；其余弹框位形态不变 */
-/* 仅步骤顶层提示条与投影条同宽自适应；表单项内与关联规则堆叠提示
-   保持各自表单节奏（2026-10-03 用户裁定回归修正） */
-.step-content .info-note-bar { margin: 0 20px 12px; max-width: none; }
-.step-content .info-note-bar.bound-rule-alert { margin: 8px 0 0; max-width: none; }
-/* 实测修正（浏览器 computed 证据）：note 条曾被全局 .step-content .info-note-bar
-   的 20px 横向边距压中（特异性平局全局胜）→+20px 缩进/-40px 宽。高特异性链稳压。 */
-.step-content .bound-rule-row .info-note-bar { margin: 8px 0 0; }
-.wizard-alert-item .info-note-bar { margin: 0; max-width: none; }
-.step-content .info-note-bar.info-note-bar--inset { margin: 0; }
+/* 2026-10-03 用户最终裁定：阶段步（含关联规则步）全部提示条同一形态——
+   左缘对齐步骤内容、宽随弹框自适应（浏览器实测基准 264/830）；表单项内
+   提示条以 100px 标签列负边距满幅拉齐（364/730→264/830）。 */
+.step-content .info-note-bar { margin: 0 0 12px; max-width: none; }
+.step-content .el-form-item .info-note-bar { width: calc(100% + 100px); margin-left: -100px; box-sizing: border-box; }
 .stage-projection-bar {
   display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
   margin: 0 20px 12px; padding: 8px 12px;
