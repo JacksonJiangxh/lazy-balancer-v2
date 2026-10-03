@@ -179,7 +179,7 @@
 
         <div class="ctx-section-title">请求头</div>
         <template v-if="ctxHeadersParsed.failed">
-          <el-alert type="error" :closable="false" show-icon title="请求头记录解析失败，以下为原始内容" class="ctx-banner" />
+          <div class="info-note-bar ctx-banner"><span class="info-note-desc">请求头记录解析失败，以下为原始内容</span></div>
           <pre class="ctx-body-pre">{{ ctxEvent.request_headers }}</pre>
         </template>
         <template v-else-if="ctxHeadersParsed.rows.length > 0 || ctxHeadersParsed.dropped > 0">
@@ -213,9 +213,9 @@
           <div class="ctx-empty">无请求体记录</div>
         </template>
         <template v-else>
-          <el-alert v-if="ctxBodyParsed.truncated" type="warning" :closable="false" show-icon title="请求体已截断，仅显示保留的前段内容" class="ctx-banner" />
+          <div v-if="ctxBodyParsed.truncated" class="info-note-bar ctx-banner"><span class="info-note-desc">请求体已截断，仅显示保留的前段内容</span></div>
           <div v-if="ctxBodyParsed.binary" class="info-note-bar"><span class="info-note-desc">请求体为二进制内容，已按 Base64 解码展示，可能包含不可读字符</span></div>
-          <el-alert v-if="ctxBodyParsed.state === 'error'" type="error" :closable="false" show-icon title="Base64 解码失败，以下为原始内容" class="ctx-banner" />
+          <div v-if="ctxBodyParsed.state === 'error'" class="info-note-bar ctx-banner"><span class="info-note-desc">Base64 解码失败，以下为原始内容</span></div>
           <pre class="ctx-body-pre">{{ ctxBodyParsed.text }}</pre>
         </template>
       </template>

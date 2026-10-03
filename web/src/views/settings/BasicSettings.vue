@@ -240,7 +240,7 @@
       <div v-if="importValidating" v-loading="true" class="import-validating">正在校验备份文件...</div>
 
       <template v-if="importValidation && !importValidating">
-        <el-alert v-if="!importValidation.valid" :title="importValidation.error || '备份文件校验失败'" type="error" :closable="false" show-icon class="import-alert" />
+        <div v-if="!importValidation.valid" class="info-note-bar import-alert"><span class="info-note-desc">{{ importValidation.error || '备份文件校验失败' }}</span></div>
         <template v-else>
           <div class="import-result">
   <div class="import-sections">
@@ -277,14 +277,7 @@
                 {{ formatImportConflict(conflict) }}
               </li>
             </ul>
-            <el-alert
-              v-if="importValidation.type !== 'v1'"
-              :title="importSections.length === BACKUP_SECTIONS.length ? '导入将覆盖当前全部配置（规则、用户、密钥、证书任务）' : `将仅覆盖所选分类：${importSections.map((k) => BACKUP_SECTIONS.find((s) => s.key === k)?.label || k).join('、')}，未选分类保持现状`"
-              type="warning"
-              :closable="false"
-              show-icon
-              class="import-alert"
-            />
+            <div v-if="importValidation.type !== 'v1'" class="info-note-bar import-alert"><span class="info-note-desc">{{ importSections.length === BACKUP_SECTIONS.length ? '导入将覆盖当前全部配置（规则、用户、密钥、证书任务）' : `将仅覆盖所选分类：${importSections.map((k) => BACKUP_SECTIONS.find((s) => s.key === k)?.label || k).join('、')}，未选分类保持现状` }}</span></div>
             <div v-else class="info-note-bar" style="margin-top: 4px"><span class="info-note-desc">仅导入负载均衡规则，其他数据不受影响</span></div>
           </div>
         </template>
@@ -311,8 +304,7 @@
         <el-button text size="small" @click="exportSections = []">全不选</el-button>
         <el-button text size="small" @click="exportSections = BACKUP_SECTIONS.map((s) => s.key)">全选</el-button>
       </div>
-      <el-alert type="warning" :closable="false" show-icon style="margin-top: 8px"
-        title="导出为 .lbbak 备份包（勾选「安全防护」时含 CRS/IP2Region 规则库文件）；包含凭证与证书材料，请加密保管" />
+      <div class="info-note-bar" style="margin-top: 8px"><span class="info-note-desc">导出为 .lbbak 备份包（勾选「安全防护」时含 CRS/IP2Region 规则库文件）；包含凭证与证书材料，请加密保管</span></div>
       <template #footer>
         <el-button @click="exportDialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="exporting" :disabled="exportSections.length === 0" @click="exportBackup">
