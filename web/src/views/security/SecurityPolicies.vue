@@ -3288,6 +3288,10 @@ onMounted(async () => {
 
 /* 生效投影条（任务 8）：同一信息条左右两段——左=生效说明句、右=关联规则覆盖状态
    列表，同字号（12px）同基线（align-items: baseline） */
+/* 2026-10-03 用户裁定：阶段 x 配置步内 info-note-bar 与 stage-projection-bar
+   同宽（0 20px 12px）；其余弹框位形态不变 */
+.step-content .info-note-bar { margin: 0 20px 12px; }
+.step-content .info-note-bar.info-note-bar--inset { margin: 0; }
 .stage-projection-bar {
   display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
   margin: 0 20px 12px; padding: 8px 12px;
