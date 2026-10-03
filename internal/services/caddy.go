@@ -3016,6 +3016,24 @@ func prefixURIPlaceholder(pathRule PathRuleConfig) string {
 	return ""
 }
 
+// splitDnsAddresses 把 dns_server 字段按逗号（含中文逗号）拆分为多地址——
+// 用户输入 "10.50.29.3,10.50.15.4" 曾渲染为单元素数组导致 Caddy 解析失败。
+func splitDnsAddresses(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == '，' || r == ' ' || r == ';'
+	}) {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func joinUpstreamAddress(host string, port int) string {
 	return net.JoinHostPort(host, strconv.Itoa(port))
 }
@@ -3530,7 +3548,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			}
 			if rule.EnableDnsServer && rule.DnsServer != "" {
 				upstreamEntry["resolver"] = map[string]interface{}{
-					"addresses": []string{rule.DnsServer},
+					"addresses": splitDnsAddresses(rule.DnsServer),
 				}
 			}
 			upstreamList = append(upstreamList, upstreamEntry)

@@ -8,11 +8,7 @@
     @open="onOpen"
   >
     <template #header>
-      <DialogHeader :icon="Lock" :title="mode === 'rule' ? '安全策略绑定' : '绑定规则'" subtitle="
-            {{ mode === 'rule'
-              ? `${rule?.name ?? ''} · 按阶段分区选择，多条策略按阶段 0→3 顺序、同阶段内按策略 ID 升序执行`
-              : `${policyName ?? ''} · 选择要绑定该策略的 HTTP 规则（全量重置该策略的绑定集）` }}
-          " />
+      <DialogHeader :icon="Lock" :title="mode === 'rule' ? '安全策略绑定' : '绑定规则'" :subtitle="bindSubtitle" />
     </template>
 
     <!-- 规则侧：按阶段分区选策略 -->
@@ -195,6 +191,12 @@ interface BindingEditorRule {
   block_page_stage3_id?: number
   block_page_stage3_status?: number
 }
+
+const bindSubtitle = computed(() =>
+  props.mode === 'rule'
+    ? `${props.rule?.name ?? ''} · 按阶段分区选择，多条策略按阶段 0→3 顺序、同阶段内按策略 ID 升序执行`
+    : `${props.policyName ?? ''} · 选择要绑定该策略的 HTTP 规则（全量重置该策略的绑定集）`
+)
 
 const props = defineProps<{
   modelValue: boolean
