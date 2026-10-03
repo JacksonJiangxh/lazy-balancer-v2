@@ -3273,7 +3273,7 @@ onMounted(async () => {
    「表单项统一缩进更合理」——提示是表单内容注解，对齐控件建立归属）；
    关联规则面板无标签网格保持满宽。模板归一后提示条恒为 el-form 直接
    子级，子选择器 > 钉死该层级——再嵌回 el-form-item 即失去缩进（显性可见）。 */
-.step-content .el-form > .info-note-bar { margin-left: 100px; }
+.step-content .el-form > .info-note-bar { margin-left: 0; }
 /* 关联规则面板（规则卡行内）无标签网格语义——不缩进，与策略顺序链同左缘
    （2026-10-03 用户裁定：关联规则步骤提示框不应有缩进） */
 .step-content .bound-rule-row .info-note-bar { margin-left: 0; }
