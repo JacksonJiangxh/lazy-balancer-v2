@@ -3217,7 +3217,7 @@ onMounted(async () => {
 /* 步骤内警告条已统一为 info-note-bar 家族（2026-10-03 用户裁定）：wizard-alert /
    bound-rule-alert 仅保留布局职责——max-width 对齐表单控件列宽（弹窗 800px −
    label 100px − 内边距 ≈ 660px，取 640px），视觉样式全部归 main.css 全局范式。 */
-.bound-rule-alert, .wizard-alert { max-width: 640px; }
+.bound-rule-alert, .wizard-alert { max-width: none; }
 /* 连续 bar 相邻节奏 8px（main.css 全局 :has 规则）对 wizard-alert 同样生效：
    scoped 的 margin-bottom: 12px 平局压过全局规则（组件样式后注入），此处显式收窄 */
 .wizard-alert:has(+ .info-note-bar) { margin-bottom: 8px; }
@@ -3293,8 +3293,8 @@ onMounted(async () => {
 /* 仅步骤顶层提示条与投影条同宽自适应；表单项内与关联规则堆叠提示
    保持各自表单节奏（2026-10-03 用户裁定回归修正） */
 .step-content .info-note-bar { margin: 0 20px 12px; max-width: none; }
-.step-content .info-note-bar.bound-rule-alert { margin: 8px 0 0; max-width: 640px; }
-.wizard-alert-item .info-note-bar { margin: 0; max-width: 640px; }
+.step-content .info-note-bar.bound-rule-alert { margin: 8px 0 0; max-width: none; }
+.wizard-alert-item .info-note-bar { margin: 0; max-width: none; }
 .step-content .info-note-bar.info-note-bar--inset { margin: 0; }
 .stage-projection-bar {
   display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
