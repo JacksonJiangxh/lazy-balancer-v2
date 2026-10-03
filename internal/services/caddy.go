@@ -3664,7 +3664,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			}
 		}
 		if rule.EnableDnsServer && rule.DnsServer != "" {
-			transportConfig["resolver"] = map[string]interface{}{"addresses": []string{rule.DnsServer}}
+			transportConfig["resolver"] = map[string]interface{}{"addresses": splitDnsAddresses(rule.DnsServer)}
 		}
 		if timeouts.dial > 0 {
 			transportConfig["dial_timeout"] = fmt.Sprintf("%ds", timeouts.dial)
