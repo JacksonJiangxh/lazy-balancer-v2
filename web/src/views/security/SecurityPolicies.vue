@@ -3281,6 +3281,9 @@ onMounted(async () => {
    「表单项统一缩进更合理」——提示是表单内容注解，对齐控件建立归属）；
    关联规则面板无标签网格保持满宽。 */
 .step-content .el-form .info-note-bar { margin-left: 100px; }
+/* 关联规则面板（规则卡行内）无标签网格语义——不缩进，与策略顺序链同左缘
+   （2026-10-03 用户裁定：关联规则步骤提示框不应有缩进） */
+.step-content .bound-rule-row .info-note-bar { margin-left: 0; }
 .stage-projection-bar {
   display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
   margin: 0 20px 12px; padding: 8px 12px;
