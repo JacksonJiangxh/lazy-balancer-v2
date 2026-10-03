@@ -374,14 +374,9 @@
               <el-switch v-model="form.log_request_body" :disabled="isReadOnly || form.mode === 'off'" />
               <div class="form-tip-line">仅 CRS/自定义规则命中事件记录请求体；当前模式关闭时不记录</div>
             </el-form-item>
-            <el-alert
-              v-if="form.log_request_body"
-              type="warning"
-              :closable="false"
-              show-icon
-              title="开启后命中规则事件的请求体将明文记录到事件库（单条上限 64KB），可能包含密码等敏感信息，请仅在排障期间开启"
-              style="margin-bottom: 12px"
-            />
+            <div v-if="form.log_request_body" class="form-tip-line">
+              ⚠ 开启后命中事件的请求体将明文记录（≤64KB/条），可能含密码等敏感信息——仅排障期开启，用完即关
+            </div>
             <el-form-item label="排除规则">
               <!-- 表格行编辑器：目标（与规则组同款混合下拉）× 作用域（全部 IP/指定 IP/地址
                    列表）× 条件控件（ip → 标签输入 + isValidCidr 即时拒绝；list → 引用

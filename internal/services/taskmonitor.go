@@ -242,7 +242,10 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		if m.Kind == taskengine.KindDaemon {
 			if latestRun != nil {
 				ti.StartedAt = latestRun.StartedAt
-			} else if m.Running {
+			} else if m.Running || ti.Status == TaskStatusRunning {
+				// m.Running=引擎真实运行位；主节点 cluster-sync 服务面镜像
+				// （StatusFn 返回 running 但本地从未运行）同取引擎启动时刻——
+				// 否则状态列「运行中」与启动列「—」矛盾（2026-10-03 用户报告）。
 				ti.StartedAt = te.StartedAt().In(CurrentLocation()).Format("2006-01-02 15:04:05")
 			}
 		}
