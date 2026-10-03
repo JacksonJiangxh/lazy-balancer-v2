@@ -19,7 +19,7 @@
         <el-tab-pane v-for="tab in policyTypeTabs" :key="tab.type" :label="`${tab.label}（${tab.count}）`" :name="tab.type" />
       </el-tabs>
       <div class="table-toolbar">
-        <el-input v-model="policySearch" placeholder="搜索策略名称" clearable :prefix-icon="Search" class="search-input" />
+        <el-input v-model="policySearch" placeholder="搜索策略名称" clearable :prefix-icon="Search" style="width: 240px" />
       </div>
       <el-table :data="pagedPolicies" v-loading="loading" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="">
         <template #empty>
