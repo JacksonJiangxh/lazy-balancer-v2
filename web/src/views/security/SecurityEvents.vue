@@ -173,8 +173,8 @@
             </el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="异常评分">{{ ctxEvent.anomaly_score > 0 ? ctxEvent.anomaly_score : '—' }}</el-descriptions-item>
-          <el-descriptions-item label="处理时长">{{ formatDurationUs(ctxEvent.duration_us + ctxEvent.precheck_us) }}</el-descriptions-item>
-          <el-descriptions-item v-if="ctxEvent.precheck_us > 0" label="耗时分解">预检 {{ formatDurationUs(ctxEvent.precheck_us) }} + WAF 段 {{ formatDurationUs(ctxEvent.duration_us) }}</el-descriptions-item>
+          <el-descriptions-item label="处理时长">{{ formatDurationUs(ctxWafFamily ? ctxEvent.duration_us + ctxEvent.precheck_us : ctxEvent.duration_us) }}{{ ctxWafFamily ? '' : '（预检耗时）' }}</el-descriptions-item>
+          <el-descriptions-item v-if="ctxWafFamily && ctxEvent.precheck_us > 0" label="耗时分解">预检 {{ formatDurationUs(ctxEvent.precheck_us) }} + WAF 段 {{ formatDurationUs(ctxEvent.duration_us) }}</el-descriptions-item>
         </el-descriptions>
 
         <div class="ctx-section-title">请求头</div>
@@ -253,6 +253,13 @@ const isIpAclFamily = (row: SecurityEvent): boolean => {
   if ([2, 3, 4, 5, 7, 8, 14].includes(n)) return true
   return n >= 800000 && n < 900000
 }
+
+// Review66-Head ②：ctx 弹框耗时展示按族判定——仅 WAF 族（wafCrs/wafCustom/
+// body）经 WAF 段独立测量用加和式；预检族 duration_us≡precheck_us 单值展示。
+const ctxWafFamily = computed(() => {
+  const t = ctxEvent.value?.rule_triggered ?? ''
+  return ['wafCrs', 'wafCustom', 'body'].includes(triggerStageFamily(t))
+})
 
 // FE65-2：stageCategory 改由共享 triggerStageFamily 投影（securityStages 唯一
 // 实现，原 F62-10 双实现并存欠账）——本视图五桶 = 细粒度族的合并投影：

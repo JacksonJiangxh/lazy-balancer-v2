@@ -275,6 +275,7 @@ func metricsIntervalSeconds(interval string) int64 {
 		if value > 10080 {
 			value = 10080
 		}
+		mult = 60
 	default:
 		return 3600
 	}
@@ -397,7 +398,8 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 			)
 			SELECT datetime(bucket * ?, 'unixepoch'), requests_total, requests_2xx, requests_3xx,
 			       requests_4xx, requests_5xx, bytes_in, bytes_out
-			FROM ranked WHERE sample_rank = 1 ORDER BY bucket LIMIT ?
+			FROM (SELECT bucket, requests_total, requests_2xx, requests_3xx, requests_4xx, requests_5xx, bytes_in, bytes_out
+			      FROM ranked WHERE sample_rank = 1 ORDER BY bucket DESC LIMIT ?) ORDER BY bucket
 		`, bucketSeconds, bucketSeconds, ruleID, interval, bucketSeconds, metricsHistoryMaxBuckets)
 	} else {
 		rows, err = db.MetricsDB.Query(`
@@ -419,7 +421,8 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 			)
 			SELECT datetime(bucket * ?, 'unixepoch'), requests_total, requests_2xx, requests_3xx,
 			       requests_4xx, requests_5xx, bytes_in, bytes_out
-			FROM ranked WHERE sample_rank = 1 ORDER BY bucket LIMIT ?
+			FROM (SELECT bucket, requests_total, requests_2xx, requests_3xx, requests_4xx, requests_5xx, bytes_in, bytes_out
+			      FROM ranked WHERE sample_rank = 1 ORDER BY bucket DESC LIMIT ?) ORDER BY bucket
 		`, interval, bucketSeconds, bucketSeconds, bucketSeconds, metricsHistoryMaxBuckets)
 	}
 
