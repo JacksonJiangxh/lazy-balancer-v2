@@ -242,10 +242,10 @@
               <el-switch v-model="form.trust_detection" />
               <span class="form-tip-inline">{{ form.trust_detection ? '开启：信任 IP 仍过后续检测流程，事件动作记为检测' : '关闭（默认）：信任 IP 直通上游，不产生任何安全事件' }}</span>
             </el-form-item>
-            <!-- 信任名单区地址级冲突实时警告（本区条目：信任 IP × 他策略黑名单） -->
-            <el-form-item v-if="whitelistSectionAlert" >
-              <div class="info-note-bar"><span class="info-note-desc">{{ whitelistSectionAlert }}</span></div>
-            </el-form-item>
+            <!-- 信任名单区地址级冲突实时警告（本区条目：信任 IP × 他策略黑名单）：
+                 el-form 直接子级（2026-10-03 模板归一），缩进由
+                 .step-content .el-form > .info-note-bar 统一到控件列 -->
+            <div v-if="whitelistSectionAlert" class="info-note-bar"><span class="info-note-desc">{{ whitelistSectionAlert }}</span></div>
           </el-form>
         </div>
 
@@ -339,11 +339,10 @@
               </div>
               <div class="form-tip-line">选择后仅加载所选规则组，留空加载全部 CRS 规则</div>
               <div class="form-tip-line">初始化（901）与拦截评估（949/959）为系统基础规则，随策略自动加载；通用误报豁免（999）在选择全部规则时自动包含</div>
-              <!-- 跨策略 CRS 规则组重复实时警告（随当前选择重算）：置于表单项内控件列，
-                   顺序 select → 说明 → 警告，与说明文字保持 6px 间距（见样式
-                   .form-tip-line + .wizard-alert） -->
-              <div v-if="wafStepCrsAlert" class="info-note-bar"><span class="info-note-desc">{{ wafStepCrsAlert }}</span></div>
             </el-form-item>
+            <!-- 跨策略 CRS 规则组重复实时警告（随当前选择重算）：el-form 直接子级
+                 （2026-10-03 模板归一），缩进由 .step-content .el-form > .info-note-bar 统一 -->
+            <div v-if="wafStepCrsAlert" class="info-note-bar"><span class="info-note-desc">{{ wafStepCrsAlert }}</span></div>
             <div v-if="hasResponsePhaseGroupWithoutCheck" class="info-note-bar"><span class="info-note-desc">已选含响应阶段的规则组（955 Webshell 等），但未开启「检查响应体」——这些组不会加载生效，请开启「检查响应体」或移除响应阶段组</span></div>
             <el-form-item label="检查响应体">
               <el-switch v-model="form.waf_check_response" :disabled="crsFieldsOff || isReadOnly" />
@@ -545,11 +544,10 @@
                 <div v-if="showAclRefHint" class="form-tip-line">{{ aclRefHint }}</div>
                 <div class="form-tip-line">引用「规则集 → IP 地址列表」中的可复用列表，条目与上方内联名单合并生效</div>
               </el-form-item>
-              <!-- 访问控制区地址级冲突实时警告（本区条目：ACL 列表 + 黑名单）——
-                   无 label 的 el-form-item 仍保留 label 宽度偏移，内容落在控件列 -->
-              <el-form-item v-if="aclSectionAlert" >
-                <div class="info-note-bar"><span class="info-note-desc">{{ aclSectionAlert }}</span></div>
-              </el-form-item>
+              <!-- 访问控制区地址级冲突实时警告（本区条目：ACL 列表 + 黑名单）：
+                   el-form 直接子级（2026-10-03 模板归一），缩进由
+                   .step-content .el-form > .info-note-bar 统一到控件列 -->
+              <div v-if="aclSectionAlert" class="info-note-bar"><span class="info-note-desc">{{ aclSectionAlert }}</span></div>
             </template>
           </el-form>
           <el-divider content-position="left" class="acl-divider">区域控制</el-divider>
@@ -3202,15 +3200,9 @@ onMounted(async () => {
 .bound-rule-chain { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
 
 
-/* 步骤内警告置于表单项控件列（el-form-item__content 为 flex 容器）——
-   width:100% 使其独占一行并填满控件列（上限 640px），与 select/说明文字左对齐 */
-
-/* CRS 警告跟在说明文字之后（select → 说明 → 警告）：与说明保持 6px 顶距；
-   底部间距归零交还 el-form-item 默认 18px，避免与其他表单项的节奏不一致 */
-
-/* IP 两区的警告表单项紧跟上一行控件：el-form-item 默认 margin-bottom 18px
-/* IP 两区警告条已统一 info-note-bar 基本样式（2026-10-03 终裁）：
-   无载体类、无第二种弹框样式，宽度随容器自适应。 */
+/* 2026-10-03 模板归一：向导表单内提示条不再有「表单项控件列」载体——
+   统一为 el-form 直接子级 + .step-content .el-form > .info-note-bar
+   单条缩进规则（宽度随容器自适应，无第二种弹框样式）。 */
 
 .binding-order-chip { font-size: 12px; padding: 0 6px; border-radius: 10px; background: #f3f4f6; color: #4b5563; border: 1px solid #e5e7eb; display: inline-flex; align-items: center; line-height: 18px; vertical-align: middle; }
 .binding-order-chip.is-self { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; font-weight: 500; }
@@ -3279,8 +3271,9 @@ onMounted(async () => {
 /* 2026-10-03 用户终裁：所有弹框提示条统一 info-note-bar 基本样式；
    策略向导表单内提示条统一缩进到控件列（=标签列 100px，用户裁定
    「表单项统一缩进更合理」——提示是表单内容注解，对齐控件建立归属）；
-   关联规则面板无标签网格保持满宽。 */
-.step-content .el-form .info-note-bar { margin-left: 100px; }
+   关联规则面板无标签网格保持满宽。模板归一后提示条恒为 el-form 直接
+   子级，子选择器 > 钉死该层级——再嵌回 el-form-item 即失去缩进（显性可见）。 */
+.step-content .el-form > .info-note-bar { margin-left: 100px; }
 /* 关联规则面板（规则卡行内）无标签网格语义——不缩进，与策略顺序链同左缘
    （2026-10-03 用户裁定：关联规则步骤提示框不应有缩进） */
 .step-content .bound-rule-row .info-note-bar { margin-left: 0; }
