@@ -1,7 +1,7 @@
 <template>
   <el-dialog
     :model-value="modelValue"
-    width="min(920px, 95vw)"
+    width="min(1040px, 95vw)"
     top="5vh"
     destroy-on-close
     class="rule-flow-dialog"

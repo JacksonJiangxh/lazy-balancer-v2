@@ -320,7 +320,7 @@
     </el-card>
 
 
-    <el-dialog v-model="wizardVisible" class="dialog-body-inset" width="min(800px, 94vw)" top="5vh" :close-on-click-modal="false" :before-close="beforeWizardClose" @close="resetWizard">
+    <el-dialog v-model="wizardVisible" class="dialog-body-inset" width="min(960px, 94vw)" top="5vh" :close-on-click-modal="false" :before-close="beforeWizardClose" @close="resetWizard">
       <template #header>
         <DialogHeader :icon="Connection" :title="editingRule ? '编辑规则' : (isCopyMode ? '复制规则' : '新建规则')"
           subtitle="配置负载均衡规则的监听、TLS、上游与路由行为" />
@@ -690,8 +690,8 @@
 
               <template v-if="wizardForm.enable_dns_server">
                 <el-form-item label="DNS 服务器">
-                  <el-input v-model="wizardForm.dns_server" placeholder="例如：8.8.8.8 或 223.5.5.5" style="width: 200px;" />
-                  <span class="form-tip-inline">用于解析上游服务器域名的 DNS 服务器</span>
+                  <el-input v-model="wizardForm.dns_server" placeholder="8.8.8.8 或 8.8.8.8,1.1.1.1" style="width: 220px;" />
+                  <span class="form-tip-inline">多个地址用逗号分隔，按顺序尝试</span>
                 </el-form-item>
               </template>
 
