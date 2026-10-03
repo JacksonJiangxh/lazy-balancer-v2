@@ -3201,7 +3201,7 @@ onMounted(async () => {
 .bound-rule-remove { margin-left: auto; }
 .bound-rule-chain { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
 .bound-rule-alert { margin: 8px 0 0; }
-.bound-rule-note { margin: 8px 0 0; max-width: 640px; }
+.bound-rule-note { margin: 8px 0 0; max-width: none; }
 /* 步骤内警告置于表单项控件列（el-form-item__content 为 flex 容器）——
    width:100% 使其独占一行并填满控件列（上限 640px），与 select/说明文字左对齐 */
 .wizard-alert { margin-bottom: 12px; width: 100%; }
