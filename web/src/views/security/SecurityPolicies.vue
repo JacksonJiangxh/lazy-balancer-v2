@@ -346,6 +346,7 @@
             <el-form-item v-if="wafStepCrsAlert"><div class="info-note-bar"><span class="info-note-desc">{{ wafStepCrsAlert }}</span></div>
             </el-form-item>
             <el-form-item v-if="hasResponsePhaseGroupWithoutCheck"><div class="info-note-bar"><span class="info-note-desc">已选含响应阶段的规则组（955 Webshell 等），但未开启「检查响应体」——这些组不会加载生效，请开启「检查响应体」或移除响应阶段组</span></div>
+            </el-form-item>
             <el-form-item label="检查响应体">
               <el-switch v-model="form.waf_check_response" :disabled="crsFieldsOff || isReadOnly" />
               <div class="form-tip-line">开启后 WAF 读取并检查上游响应内容（响应泄露类规则需要）；关闭可显著降低内存与 CPU 开销，大多数部署只需检查请求</div>
