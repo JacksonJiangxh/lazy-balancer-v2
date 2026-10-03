@@ -3200,20 +3200,20 @@ onMounted(async () => {
 .bound-rule-meta { font-size: 12px; color: #9ca3af; font-family: monospace; }
 .bound-rule-remove { margin-left: auto; }
 .bound-rule-chain { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
-.bound-rule-alert { margin: 8px 0 0; }
-.bound-rule-note { margin: 8px 0 0; max-width: none; }
+.bound-rule-alert { }
+.bound-rule-note { }
 /* 步骤内警告置于表单项控件列（el-form-item__content 为 flex 容器）——
    width:100% 使其独占一行并填满控件列（上限 640px），与 select/说明文字左对齐 */
-.wizard-alert { margin-bottom: 12px; width: 100%; }
+.wizard-alert { width: 100%; }
 /* CRS 警告跟在说明文字之后（select → 说明 → 警告）：与说明保持 6px 顶距；
    底部间距归零交还 el-form-item 默认 18px，避免与其他表单项的节奏不一致 */
-.form-tip-line + .wizard-alert { margin-top: 6px; margin-bottom: 0; }
+.form-tip-line + .wizard-alert { }
 /* IP 两区的警告表单项紧跟上一行控件：el-form-item 默认 margin-bottom 18px
    形成行间距，负 12px 顶距把视觉间距收敛到 6px（18-12）；margin-bottom 保持
    默认 18px + 后续分区标题 4px，与无警告时的分区节奏一致；内部警告不再额外
    撑底距 */
 .wizard-alert-item { margin-top: -12px; }
-.wizard-alert-item .wizard-alert { margin-bottom: 0; }
+.wizard-alert-item .wizard-alert { }
 /* 步骤内警告条已统一为 info-note-bar 家族（2026-10-03 用户裁定）：wizard-alert /
    bound-rule-alert 仅保留布局职责——max-width 对齐表单控件列宽（弹窗 800px −
    label 100px − 内边距 ≈ 660px，取 640px），视觉样式全部归 main.css 全局范式。 */
