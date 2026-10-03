@@ -91,6 +91,11 @@ type masterServingNode struct {
 // masterSyncServingRound 执行一轮巡检（facts 读取→异常判定→零噪音落日志）。
 // now 注入（测试压缩时钟）；w 由循环跨轮持有。
 func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServingWatch) {
+	// 2026-10-04 测试污染修复：ctx 已取消（引擎停机/测试清理）时跳过整轮——
+	// 防止取消后仍完成当前轮写共享日志（taskLogDir 已被下一测试/新引擎重置）。
+	if ctx.Err() != nil {
+		return
+	}
 	if db.DB == nil {
 		return
 	}
@@ -126,6 +131,7 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	for _, n := range nodes {
 		seen[n.id] = true
 		lastSeen := parseNodeLastSeen(n.seenRaw)
+		_ = lastSeen
 		threshold := time.Duration(2*n.interval) * time.Second
 		if threshold < masterSyncOfflineThreshold {
 			threshold = masterSyncOfflineThreshold

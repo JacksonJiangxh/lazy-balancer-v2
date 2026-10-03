@@ -3016,9 +3016,9 @@ func prefixURIPlaceholder(pathRule PathRuleConfig) string {
 	return ""
 }
 
-// splitDnsAddresses 把 dns_server 字段按逗号（含中文逗号）拆分为多地址——
+// SplitDnsAddresses 把 dns_server 字段按逗号（含中文逗号）拆分为多地址——
 // 用户输入 "10.50.29.3,10.50.15.4" 曾渲染为单元素数组导致 Caddy 解析失败。
-func splitDnsAddresses(s string) []string {
+func SplitDnsAddresses(s string) []string {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return nil
@@ -3548,7 +3548,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			}
 			if rule.EnableDnsServer && rule.DnsServer != "" {
 				upstreamEntry["resolver"] = map[string]interface{}{
-					"addresses": splitDnsAddresses(rule.DnsServer),
+					"addresses": SplitDnsAddresses(rule.DnsServer),
 				}
 			}
 			upstreamList = append(upstreamList, upstreamEntry)
@@ -3664,7 +3664,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			}
 		}
 		if rule.EnableDnsServer && rule.DnsServer != "" {
-			transportConfig["resolver"] = map[string]interface{}{"addresses": splitDnsAddresses(rule.DnsServer)}
+			transportConfig["resolver"] = map[string]interface{}{"addresses": SplitDnsAddresses(rule.DnsServer)}
 		}
 		if timeouts.dial > 0 {
 			transportConfig["dial_timeout"] = fmt.Sprintf("%ds", timeouts.dial)

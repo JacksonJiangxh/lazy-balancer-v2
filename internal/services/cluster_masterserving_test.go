@@ -40,6 +40,9 @@ func readClusterSyncLog(t *testing.T) string {
 	t.Helper()
 	body, err := os.ReadFile(taskengine.TaskLogPath("cluster-sync"))
 	if err != nil {
+		if os.IsNotExist(err) {
+			return "" // 无 daemon 环境：尚无写入——空日志语义等价（2026-10-04）
+		}
 		t.Fatalf("读取 cluster-sync 任务日志: %v", err)
 	}
 	return string(body)
@@ -64,6 +67,23 @@ func seedServingNode(t *testing.T, name, lastSeenUTC string, version, interval i
 	}
 	id, _ := res.LastInsertId()
 	return id
+}
+
+// newServingTestEnv 轻量环境：只建 DB+日志目录，不启动 daemon——
+// 直调 masterSyncServingRound 的测试使用（daemon 启动即首轮以 time.Now()
+// 跑，diff≈8h 触发离线告警污染共享日志；2026-10-04 测试污染修复）。
+func newServingTestEnv(t *testing.T) {
+	t.Helper()
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize test database: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	taskengine.SetLogDir(t.TempDir() + "/tasks")
+	_ = os.MkdirAll(taskengine.LogDir(), 0755)
 }
 
 func newServingWatch() *masterServingWatch {
@@ -172,8 +192,7 @@ func TestMasterServingRound_cleanRoundsSilent(t *testing.T) {
 
 // 心跳：小时级一条（60 轮×60s）；无从节点时心跳记「无从节点注册」同样小时级。
 func TestMasterServingRound_heartbeatHourly(t *testing.T) {
-	te := newWireTestEngine(t)
-	_ = te
+	newServingTestEnv(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET cluster_version=3 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
@@ -207,8 +226,7 @@ func TestMasterServingRound_heartbeatHourly(t *testing.T) {
 
 // 版本滞后：持续超 5 分钟才 WARN 一次；后续稳态轮不重复；恢复后再次滞后可再 WARN。
 func TestMasterServingRound_lagWarnsAfterPersistence(t *testing.T) {
-	te := newWireTestEngine(t)
-	_ = te
+	newServingTestEnv(t)
 	nodeID := seedServingNode(t, "edge-b", servingBase.Add(-10*time.Second).UTC().Format("2006-01-02 15:04:05"), 3, 3600)
 	// cluster_version=7 > 从节点已应用 3：滞后
 	if _, err := db.DB.Exec(`UPDATE global_config SET cluster_version=7 WHERE id=1`); err != nil {
