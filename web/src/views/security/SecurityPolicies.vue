@@ -243,8 +243,8 @@
               <span class="form-tip-inline">{{ form.trust_detection ? '开启：信任 IP 仍过后续检测流程，事件动作记为检测' : '关闭（默认）：信任 IP 直通上游，不产生任何安全事件' }}</span>
             </el-form-item>
             <!-- 信任名单区地址级冲突实时警告（本区条目：信任 IP × 他策略黑名单） -->
-            <el-form-item v-if="whitelistSectionAlert" class="wizard-alert-item">
-              <div class="info-note-bar wizard-alert"><span class="info-note-desc">{{ whitelistSectionAlert }}</span></div>
+            <el-form-item v-if="whitelistSectionAlert" >
+              <div class="info-note-bar"><span class="info-note-desc">{{ whitelistSectionAlert }}</span></div>
             </el-form-item>
           </el-form>
         </div>
@@ -342,7 +342,7 @@
               <!-- 跨策略 CRS 规则组重复实时警告（随当前选择重算）：置于表单项内控件列，
                    顺序 select → 说明 → 警告，与说明文字保持 6px 间距（见样式
                    .form-tip-line + .wizard-alert） -->
-              <div v-if="wafStepCrsAlert" class="info-note-bar wizard-alert"><span class="info-note-desc">{{ wafStepCrsAlert }}</span></div>
+              <div v-if="wafStepCrsAlert" class="info-note-bar"><span class="info-note-desc">{{ wafStepCrsAlert }}</span></div>
             </el-form-item>
             <div v-if="hasResponsePhaseGroupWithoutCheck" class="info-note-bar"><span class="info-note-desc">已选含响应阶段的规则组（955 Webshell 等），但未开启「检查响应体」——这些组不会加载生效，请开启「检查响应体」或移除响应阶段组</span></div>
             <el-form-item label="检查响应体">
@@ -353,7 +353,7 @@
               <el-switch v-model="form.log_request_body" :disabled="isReadOnly || form.mode === 'off'" />
               <div class="form-tip-line">仅 CRS/自定义规则命中事件记录请求体；当前模式关闭时不记录</div>
             </el-form-item>
-            <div v-if="form.log_request_body" class="info-note-bar wizard-alert"><span class="info-note-desc">开启后命中规则事件的请求体将明文记录到事件库（单条上限 64KB），可能包含密码等敏感信息，请仅在排障期间开启</span></div>
+            <div v-if="form.log_request_body" class="info-note-bar"><span class="info-note-desc">开启后命中规则事件的请求体将明文记录到事件库（单条上限 64KB），可能包含密码等敏感信息，请仅在排障期间开启</span></div>
             <el-form-item label="排除规则">
               <!-- 表格行编辑器：目标（与规则组同款混合下拉）× 作用域（全部 IP/指定 IP/地址
                    列表）× 条件控件（ip → 标签输入 + isValidCidr 即时拒绝；list → 引用
@@ -547,8 +547,8 @@
               </el-form-item>
               <!-- 访问控制区地址级冲突实时警告（本区条目：ACL 列表 + 黑名单）——
                    无 label 的 el-form-item 仍保留 label 宽度偏移，内容落在控件列 -->
-              <el-form-item v-if="aclSectionAlert" class="wizard-alert-item">
-                <div class="info-note-bar wizard-alert"><span class="info-note-desc">{{ aclSectionAlert }}</span></div>
+              <el-form-item v-if="aclSectionAlert" >
+                <div class="info-note-bar"><span class="info-note-desc">{{ aclSectionAlert }}</span></div>
               </el-form-item>
             </template>
           </el-form>
@@ -641,8 +641,8 @@
                         :class="{ 'is-self': entry.isSelf, 'is-disabled': !entry.enabled, 'is-trust': isStage0ChainEntry(entry) }"
                       >{{ chainChipText(entry, idx) }}</span>
                     </div>
-                    <div v-if="row.showPerfTip" class="info-note-bar bound-rule-alert"><span class="info-note-desc">该规则将绑定 {{ row.mergedCount }} 条策略：每条策略都会叠加一层处理链（WAF/ACL/限流），超过 3 条可能影响转发性能</span></div>
-                    <div v-for="hint in row.hints" :key="hint" class="info-note-bar bound-rule-alert"><span class="info-note-desc">{{ hint }}</span></div>
+                    <div v-if="row.showPerfTip" class="info-note-bar"><span class="info-note-desc">该规则将绑定 {{ row.mergedCount }} 条策略：每条策略都会叠加一层处理链（WAF/ACL/限流），超过 3 条可能影响转发性能</span></div>
+                    <div v-for="hint in row.hints" :key="hint" class="info-note-bar"><span class="info-note-desc">{{ hint }}</span></div>
                     <div
                       v-for="hint in row.infoHints"
                       :key="hint"
@@ -3200,30 +3200,18 @@ onMounted(async () => {
 .bound-rule-meta { font-size: 12px; color: #9ca3af; font-family: monospace; }
 .bound-rule-remove { margin-left: auto; }
 .bound-rule-chain { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
-.bound-rule-alert { }
-.bound-rule-note { }
+
+
 /* 步骤内警告置于表单项控件列（el-form-item__content 为 flex 容器）——
    width:100% 使其独占一行并填满控件列（上限 640px），与 select/说明文字左对齐 */
-.wizard-alert { width: 100%; }
+
 /* CRS 警告跟在说明文字之后（select → 说明 → 警告）：与说明保持 6px 顶距；
    底部间距归零交还 el-form-item 默认 18px，避免与其他表单项的节奏不一致 */
-.form-tip-line + .wizard-alert { }
-/* IP 两区的警告表单项紧跟上一行控件：el-form-item 默认 margin-bottom 18px
-   形成行间距，负 12px 顶距把视觉间距收敛到 6px（18-12）；margin-bottom 保持
-   默认 18px + 后续分区标题 4px，与无警告时的分区节奏一致；内部警告不再额外
-   撑底距 */
-.wizard-alert-item { margin-top: -12px; }
-.wizard-alert-item .wizard-alert { }
-/* 步骤内警告条已统一为 info-note-bar 家族（2026-10-03 用户裁定）：wizard-alert /
-   bound-rule-alert 仅保留布局职责——max-width 对齐表单控件列宽（弹窗 800px −
-   label 100px − 内边距 ≈ 660px，取 640px），视觉样式全部归 main.css 全局范式。 */
-.bound-rule-alert, .wizard-alert { max-width: none; }
-/* 连续 bar 相邻节奏 8px（main.css 全局 :has 规则）对 wizard-alert 同样生效：
-   scoped 的 margin-bottom: 12px 平局压过全局规则（组件样式后注入），此处显式收窄 */
-.wizard-alert:has(+ .info-note-bar) { margin-bottom: 8px; }
 
-/* v2.2.0 绑定顺序 chip：本策略高亮（蓝），禁用策略灰显删除线；
-   显式 line-height + inline-flex 保证 chip 视觉高度 ≈ 18-20px（避免继承表单上下文行高撑高）。 */
+/* IP 两区的警告表单项紧跟上一行控件：el-form-item 默认 margin-bottom 18px
+/* IP 两区警告条已统一 info-note-bar 基本样式（2026-10-03 终裁）：
+   无载体类、无第二种弹框样式，宽度随容器自适应。 */
+
 .binding-order-chip { font-size: 12px; padding: 0 6px; border-radius: 10px; background: #f3f4f6; color: #4b5563; border: 1px solid #e5e7eb; display: inline-flex; align-items: center; line-height: 18px; vertical-align: middle; }
 .binding-order-chip.is-self { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; font-weight: 500; }
 .binding-order-chip.is-disabled { opacity: 0.55; text-decoration: line-through; }
@@ -3288,11 +3276,9 @@ onMounted(async () => {
 
 /* 生效投影条（任务 8）：同一信息条左右两段——左=生效说明句、右=关联规则覆盖状态
    列表，同字号（12px）同基线（align-items: baseline） */
-/* 2026-10-03 用户最终裁定：阶段步（含关联规则步）全部提示条同一形态——
-   左缘对齐步骤内容、宽随弹框自适应（浏览器实测基准 264/830）；表单项内
-   提示条以 100px 标签列负边距满幅拉齐（364/730→264/830）。 */
-.step-content .info-note-bar { margin: 0 20px 12px; max-width: none; }
-.step-content .el-form-item .info-note-bar { width: calc(100% + 100px); margin-left: -100px; box-sizing: border-box; }
+/* 2026-10-03 用户终裁：所有弹框提示条统一 info-note-bar 基本样式——
+   无第二种弹框样式；宽度尊重所在表单/容器宽度自适应（无侧距/无满幅
+   负边距/无宽度帽），仅全局默认节奏。 */
 .stage-projection-bar {
   display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
   margin: 0 20px 12px; padding: 8px 12px;
