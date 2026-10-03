@@ -3290,7 +3290,11 @@ onMounted(async () => {
    列表，同字号（12px）同基线（align-items: baseline） */
 /* 2026-10-03 用户裁定：阶段 x 配置步内 info-note-bar 与 stage-projection-bar
    同宽（0 20px 12px）；其余弹框位形态不变 */
+/* 仅步骤顶层提示条与投影条同宽自适应；表单项内与关联规则堆叠提示
+   保持各自表单节奏（2026-10-03 用户裁定回归修正） */
 .step-content .info-note-bar { margin: 0 20px 12px; max-width: none; }
+.step-content .info-note-bar.bound-rule-alert { margin: 8px 0 0; max-width: 640px; }
+.wizard-alert-item .info-note-bar { margin: 0; max-width: 640px; }
 .step-content .info-note-bar.info-note-bar--inset { margin: 0; }
 .stage-projection-bar {
   display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
