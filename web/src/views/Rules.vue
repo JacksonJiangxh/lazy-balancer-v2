@@ -320,7 +320,7 @@
     </el-card>
 
 
-    <el-dialog v-model="wizardVisible" width="min(800px, 94vw)" top="5vh" :close-on-click-modal="false" :before-close="beforeWizardClose" @close="resetWizard">
+    <el-dialog v-model="wizardVisible" class="dialog-body-inset" width="min(800px, 94vw)" top="5vh" :close-on-click-modal="false" :before-close="beforeWizardClose" @close="resetWizard">
       <template #header>
         <DialogHeader :icon="Connection" :title="editingRule ? '编辑规则' : (isCopyMode ? '复制规则' : '新建规则')"
           subtitle="配置负载均衡规则的监听、TLS、上游与路由行为" />
@@ -482,7 +482,7 @@
                 <el-icon><Plus /></el-icon>添加上游
               </el-button>
             </div>
-            <div v-if="wizardForm.dynamic_dns" class="info-note-bar info-note-bar--inset"><span class="info-note-desc">动态上游模式下仅需一个上游条目，DNS 将动态解析出多个 IP</span></div>
+            <div v-if="wizardForm.dynamic_dns" class="info-note-bar"><span class="info-note-desc">动态上游模式下仅需一个上游条目，DNS 将动态解析出多个 IP</span></div>
 
             <el-table :data="wizardForm.upstreams" border class="upstream-table" :fit="true">
               <el-table-column label="主机地址 *" min-width="180">

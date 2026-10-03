@@ -44,19 +44,6 @@ func SetCertIssuanceLifecycleHooks(start, stop func()) {
 
 // daemonLifecycleRun 常驻生命周期包装：start→阻塞 ctx→stop（nil 挂钩=测试
 // 环境空载体回退）。stop 恒执行（deferred）——StopLoop/角色翻转即真实停服。
-// masterSyncServingStatus 主节点同步任务状态镜像：主节点的同步服务面=
-// 快照签发/注册接收（HTTP 端点随面板常在）→运行中；从节点交由 daemon 实态
-// （真实轮询=运行/开关关=已停止）。
-func masterSyncServingStatus() string {
-	var isMaster int
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
-		return ""
-	}
-	if isMaster == 1 {
-		return "running"
-	}
-	return ""
-}
 
 func daemonLifecycleRun(rc taskengine.RunContext, start, stop func()) error {
 	if start != nil {
@@ -315,20 +302,29 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	// 集群同步：真实生命周期常驻（B 完全标准化）。SlaveOnly——同步=从节点
-	// 职能：角色翻转（promote/demote）经引擎 SetRole 真实启停 SyncService；
-	// 调度开关真实启停轮询；内部 Halted/Resume 状态机全保留（幂等守卫吸收
-	// lifecycle 直调与 daemon 挂钩的双调用）。
+	// 集群同步：真实生命周期常驻（2026-10-03 裁定：主从两角色纳入引擎统一
+	// 生命周期，状态镜像废除）。Run 体按角色分流：
+	// · 从节点=同步轮询（原样——daemonLifecycleRun 挂 SyncService 起停，
+	//   内部 Halted/Resume 状态机全保留，幂等守卫吸收 lifecycle 直调与
+	//   daemon 挂钩的双调用）；
+	// · 主节点=服务面巡检（真实工作体——节点在线/版本滞后巡检，日志零
+	//   噪音口径见 cluster_masterserving.go）。
+	// RunsOn=RoleAny + RestartOnRoleFlip：两角色同启停语义（调度开关/引擎
+	// 生命周期一致）；角色翻转换代重启使 Run 分支与角色同步切换；boot/
+	// 停止/成功/失败行与 tasks/cluster-sync.log 两角色共写（各节点本地文件）。
 	taskEngine.Register(taskengine.Descriptor{
-		ID:          "cluster-sync",
-		Family:      "cluster",
-		Name:        "集群同步",
-		Description: "集群同步服务：从节点按配置间隔轮询主节点快照并增量回放（仅从节点运行；启停真实生效）",
-		Category:    "集群",
-		Kind:        taskengine.KindDaemon,
-		RunsOn:      taskengine.RoleSlaveOnly,
-		StatusFn:    masterSyncServingStatus, // 主节点=运行中（快照签发/注册接收服务在线——2026-10-01 裁定，B 实施时曾丢失）
+		ID:                "cluster-sync",
+		Family:            "cluster",
+		Name:              "集群同步",
+		Description:       "集群同步服务：从节点按配置间隔轮询主节点快照并增量回放；主节点巡检集群服务面（节点在线/版本滞后）。启停真实生效",
+		Category:          "集群",
+		Kind:              taskengine.KindDaemon,
+		RunsOn:            taskengine.RoleAny,
+		RestartOnRoleFlip: true,
 		Run: func(rc taskengine.RunContext) error {
+			if taskEngine.IsMaster() {
+				return masterSyncServingLifecycleRun(rc)
+			}
 			return daemonLifecycleRun(rc, syncLifecycleStart, syncLifecycleStop)
 		},
 	})

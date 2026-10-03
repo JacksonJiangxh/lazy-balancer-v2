@@ -1,6 +1,7 @@
 <template>
   <el-dialog
     :model-value="modelValue"
+    class="dialog-body-inset"
     title="触发详情"
     width="min(680px, 94vw)"
     top="5vh"

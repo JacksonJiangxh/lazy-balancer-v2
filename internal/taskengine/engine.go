@@ -77,6 +77,11 @@ type Descriptor struct {
 	Cancelable bool
 	RunsOn     Role
 	MasterOnly bool
+	// RestartOnRoleFlip：Run 体按角色分流时置位（2026-10-03 裁定，
+	// cluster-sync 引入）——角色真实翻转即换代重启（旧代 Run 体持旧分支，
+	// 不换代则分支与角色脱钩）。未置位的 RoleAny 常驻（如
+	// security-events-ingestion）翻转不重启，无换代噪音。
+	RestartOnRoleFlip bool
 }
 
 // RunRecord task_runs 行视图。
@@ -198,6 +203,21 @@ func (e *Engine) SetRole(isMaster bool) {
 			continue
 		}
 		if e.roleAllows(r.desc.RunsOn) {
+			// 角色真实翻转 × Run 体按角色分流（RestartOnRoleFlip）：换代
+			// 重启——旧代持旧分支（2026-10-03 裁定）。三连重申调用仅真实
+			// 翻转的第一次触发（flipped 门）；换代走 pendingRestart 通道，
+			// 旧代 [done] stopped 后新代接续。
+			if flipped && r.desc.RestartOnRoleFlip {
+				r.mu.Lock()
+				if r.running && r.cancel != nil {
+					r.pendingRestart = true
+					c := r.cancel
+					r.mu.Unlock()
+					c()
+					continue
+				}
+				r.mu.Unlock()
+			}
 			e.tryStartDaemon(r, false)
 			continue
 		}
@@ -230,6 +250,10 @@ func (e *Engine) isMaster() bool {
 	defer e.roleMu.RUnlock()
 	return e.role
 }
+
+// IsMaster 当前角色（导出——Run 体按角色分流需与角色门同源读取；
+// 2026-10-03 cluster-sync 主从分支裁定引入）。
+func (e *Engine) IsMaster() bool { return e.isMaster() }
 
 // tryStartDaemon daemon 空闲且调度开时原子启动（锁内 CAS——并发调用方
 // 只有一个胜出；U1-P2-4 统一入口）。restartIntent 仅在 StartLoop 的
@@ -835,7 +859,9 @@ func (e *Engine) Lookup(id string) (TaskMeta, bool) {
 	if r.desc.EnabledFn != nil {
 		m.Enabled = r.desc.EnabledFn()
 	}
-	if r.desc.StatusFn != nil {
+	// 状态镜像角色门：与 DescribeAll 同门（2026-10-03 裁定）——角色不符
+	// 不采纳，单任务查询不旁路。
+	if r.desc.StatusFn != nil && e.roleAllows(r.desc.RunsOn) {
 		m.StatusMirror = r.desc.StatusFn()
 	}
 	return m, true
@@ -883,7 +909,12 @@ func (e *Engine) DescribeAll() []TaskMeta {
 		if s.desc.EnabledFn != nil {
 			m.Enabled = s.desc.EnabledFn()
 		}
-		if s.desc.StatusFn != nil {
+		// 状态镜像角色门（2026-10-03 裁定）：任务不在本角色运行时，其
+		// StatusFn 读到的常是同步来的业务数据（从节点 cert_jobs/
+		// ip2region update_status 均有主端快照镜像）——采纳即伪造本节点
+		// running。角色不符一律不采纳（空）→ 视图层呈现本节点实态；
+		// 主节点行为不变（StatusFn 保留，主侧为真实业务态）。
+		if s.desc.StatusFn != nil && e.roleAllows(s.desc.RunsOn) {
 			m.StatusMirror = s.desc.StatusFn()
 		}
 		out = append(out, m)

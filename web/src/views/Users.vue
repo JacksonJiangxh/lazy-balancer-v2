@@ -199,7 +199,7 @@
 
     <!-- R72 三次调整（用户裁决）：MFA 绑定向导从基础设置卡片迁到用户管理——
          点「启用 MFA」发起绑定：扫码 → 输码 → 恢复码。 -->
-    <el-dialog v-model="mfaBinding.visible" width="min(520px, 92vw)" :close-on-click-modal="false" @closed="mfaBindingClosed">
+    <el-dialog v-model="mfaBinding.visible" class="dialog-body-inset" width="min(520px, 92vw)" :close-on-click-modal="false" @closed="mfaBindingClosed">
       <template #header>
         <DialogHeader :icon="Lock" title="启用 MFA（两步验证）" subtitle="扫码绑定验证器 → 输码验证 → 保存恢复码" tone="primary" />
       </template>

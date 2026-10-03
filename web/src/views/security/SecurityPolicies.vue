@@ -123,7 +123,7 @@
           <div v-else class="migrate-preview-empty">当前无规则绑定本策略</div>
         </div>
         <div v-if="migrateCapRisk.length > 0" class="info-note-bar"><span class="info-note-desc">上限风险：{{ migrateCapRisk.map((r) => r.name).join('、') }} 迁移后将超过每条规则 {{ MAX_POLICIES_PER_RULE }} 条绑定上限——这些规则保持原绑定并进入跳过清单</span></div>
-        <div class="info-note-bar" style="margin-top: 2px"><span class="info-note-desc">全部规则重映射成功后原策略将被删除；存在被跳过的规则时原策略保留（因仍在使用）</span></div>
+        <div class="info-note-bar"><span class="info-note-desc">全部规则重映射成功后原策略将被删除；存在被跳过的规则时原策略保留（因仍在使用）</span></div>
       </div>
       <template #footer>
         <el-button @click="migrateVisible = false">取消</el-button>
@@ -163,7 +163,7 @@
         <el-button type="warning" @click="openMigrateFromView">更新迁移</el-button>
       </template>
     </el-dialog>
-    <el-dialog v-model="dialogVisible" width="min(950px, 94vw)" top="5vh" :close-on-click-modal="false" :before-close="beforeWizardClose" @close="resetWizard">
+    <el-dialog v-model="dialogVisible" class="dialog-body-inset" width="min(950px, 94vw)" top="5vh" :close-on-click-modal="false" :before-close="beforeWizardClose" @close="resetWizard">
       <template #header>
         <DialogHeader :icon="Lock" :title="editingId ? (isReadOnly ? '查看策略' : '编辑策略') : '新建策略'"
           :subtitle="EDITOR_SUBTITLES[editorPolicyType]" tone="primary" />
@@ -562,7 +562,7 @@
             <template v-if="form.geoip_enabled">
               <!-- R72 二十七次 N3（裁决）：披露 IPv6/不可解析客户端语义——
                    fail-closed 设计下它们按「海外」处理。 -->
-              <div class="info-note-bar info-note-bar--inset"><span class="info-note-desc">地域规则仅对 IPv4 生效：IPv6 与不可解析客户端按「海外」处理（拦截模式勾选海外时将被拦截；仅允许模式只勾选省份时将被拦截）。IP 库未安装时地域规则不可启用。</span></div>
+              <div class="info-note-bar"><span class="info-note-desc">地域规则仅对 IPv4 生效：IPv6 与不可解析客户端按「海外」处理（拦截模式勾选海外时将被拦截；仅允许模式只勾选省份时将被拦截）。IP 库未安装时地域规则不可启用。</span></div>
               <div class="mode-row" role="group" aria-label="地域控制模式">
                 <span class="mode-row-label">控制模式</span>
                 <div class="mode-row-content">
@@ -852,7 +852,7 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="extractDialogVisible" title="提取为地址列表" width="min(480px, 92vw)" append-to-body :close-on-click-modal="false" :close-on-press-escape="!extracting" :show-close="!extracting">
+    <el-dialog v-model="extractDialogVisible" class="dialog-body-inset" title="提取为地址列表" width="min(480px, 92vw)" append-to-body :close-on-click-modal="false" :close-on-press-escape="!extracting" :show-close="!extracting">
       <div class="info-note-bar"><span class="info-note-desc">将创建列表并清空内联条目，引用后语义不变</span></div>
       <el-form label-width="80px" @submit.prevent>
         <el-form-item label="来源">
@@ -3218,6 +3218,9 @@ onMounted(async () => {
    bound-rule-alert 仅保留布局职责——max-width 对齐表单控件列宽（弹窗 800px −
    label 100px − 内边距 ≈ 660px，取 640px），视觉样式全部归 main.css 全局范式。 */
 .bound-rule-alert, .wizard-alert { max-width: 640px; }
+/* 连续 bar 相邻节奏 8px（main.css 全局 :has 规则）对 wizard-alert 同样生效：
+   scoped 的 margin-bottom: 12px 平局压过全局规则（组件样式后注入），此处显式收窄 */
+.wizard-alert:has(+ .info-note-bar) { margin-bottom: 8px; }
 
 /* v2.2.0 绑定顺序 chip：本策略高亮（蓝），禁用策略灰显删除线；
    显式 line-height + inline-flex 保证 chip 视觉高度 ≈ 18-20px（避免继承表单上下文行高撑高）。 */

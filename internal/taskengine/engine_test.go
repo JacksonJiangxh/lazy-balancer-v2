@@ -750,3 +750,46 @@ func TestEngine_DaemonLifecycleHooksRealStartStop(t *testing.T) {
 		t.Fatal("StopLoop 应触发真实 stop 落点（调度开关=真实启停）")
 	}
 }
+
+// ---- 2026-10-03 用户裁定（与 cluster-sync 生命周期统一同批）：状态镜像
+// 角色门——任务不在本角色运行时，其 StatusFn 读到的常是同步来的业务数据
+// （从节点 cert_jobs/update_status 均有主端快照镜像），镜像会伪造本节点
+// running。角色不符一律不采纳（空）→ 视图层呈现本节点实态；主节点行为
+// 不变（三任务 StatusFn 保留，主侧为真实业务态）。 ----
+
+// Given MasterOnly 任务挂恒返 running 的 StatusFn。
+// When 从节点角色下聚合，再翻回主节点。
+// Then 从节点 StatusMirror 为空（角色门拦截，Lookup/DescribeAll 同门），
+// 主节点照常采纳（真实业务态）。
+func TestEngine_StatusMirrorRoleGated(t *testing.T) {
+	e := newTestEngine(t)
+	e.Register(Descriptor{ID: "t-mirror", Family: "t", Name: "主镜像", Kind: KindPeriodic, RunsOn: RoleMasterOnly,
+		IntervalFn: func() time.Duration { return time.Hour },
+		StatusFn:   func() string { return "running" },
+		Run:        func(rc RunContext) error { return nil }})
+	e.SetRole(false)
+	for _, m := range e.DescribeAll() {
+		if m.ID == "t-mirror" && m.StatusMirror != "" {
+			t.Fatalf("从节点不得采纳 MasterOnly 镜像, got %q", m.StatusMirror)
+		}
+	}
+	if m, _ := e.Lookup("t-mirror"); m.StatusMirror != "" {
+		t.Fatalf("Lookup 与 DescribeAll 应同受角色门, got %q", m.StatusMirror)
+	}
+	e.SetRole(true)
+	saw := false
+	for _, m := range e.DescribeAll() {
+		if m.ID == "t-mirror" {
+			saw = true
+			if m.StatusMirror != "running" {
+				t.Fatalf("主节点应采纳真实业务态镜像, got %q", m.StatusMirror)
+			}
+		}
+	}
+	if !saw {
+		t.Fatal("任务未注册")
+	}
+	if m, _ := e.Lookup("t-mirror"); m.StatusMirror != "running" {
+		t.Fatalf("Lookup 主节点应采纳镜像, got %q", m.StatusMirror)
+	}
+}

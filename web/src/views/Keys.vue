@@ -99,7 +99,7 @@
 
     <el-dialog
       v-model="mcpDocsVisible"
-      class="mcp-docs-dialog"
+      class="mcp-docs-dialog dialog-body-inset"
       width="min(1000px, 96vw)"
       top="5vh"
       @opened="fetchMCPTools"
@@ -324,6 +324,7 @@
 
     <el-dialog
       v-model="createdKeyVisible"
+      class="dialog-body-inset"
       width="min(560px, 92vw)"
       :close-on-click-modal="false"
       @closed="createdKey = ''"

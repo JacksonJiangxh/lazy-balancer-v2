@@ -200,6 +200,11 @@ body {
 .info-note-desc { font-weight: 600; color: #374151; line-height: 1.8; }
 .info-note-sub { display: block; font-weight: 400; color: #6b7280; line-height: 1.8; }
 .info-note-bar--inset { margin-left: 20px; margin-right: 20px; }
+/* 连续 info-note-bar 相邻节奏（2026-10-03 用户裁定）：默认 12px，连续 bar
+   间收紧到 8px（对齐 SecurityPolicies .bound-rule-alert 8px 堆叠上限与
+   .stage-projection-bar 相邻节奏）。:has 收窄前者底距——相邻 margin 塌陷
+   取大，仅调后者的 margin-top 压不过前者 12px 底距。 */
+.info-note-bar:has(+ .info-note-bar) { margin-bottom: 8px; }
 /* 弹框正文 20px 水平留白工具类（2026-09-25 用户裁定）：挂到 el-dialog class 即生效；
    全局规则以兼容 append-to-body/teleport 弹框（scoped :deep 对子组件根不落 data-v 不可靠） */
 .dialog-body-inset .el-dialog__body { padding: 0 20px; }

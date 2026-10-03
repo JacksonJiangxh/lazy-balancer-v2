@@ -37,11 +37,12 @@ func TestCollectCertJobRows_TerminalCounts(t *testing.T) {
 	}
 }
 
-// Given 引擎启动并按 v2.0 四类型注册。
+// Given 引擎启动并按 v2.0 四类型注册（2026-10-03 裁定：cluster-sync 主从
+// 两角色统一生命周期，镜像废除——主节点上真实启动）。
 // When CollectSystemTasks 视图聚合。
-// Then 常驻族 started_at=最近 boot 行（真实运行者非空）；从未运行的常驻任务
-// （master 上 cluster-sync——SlaveOnly 角色门）置零值（U1-66-06，UI '—' 兜底）；
-// 循环/定时族 started_at 为空；cert-waiting-ca 默认 loop_on=false。
+// Then 常驻族 started_at=最近 boot 行（真实运行者非空；主节点 cluster-sync
+// 亦真实启动，取本代 boot 行而非任何镜像兜底）；循环/定时族 started_at 为空；
+// cert-waiting-ca 默认 loop_on=false。
 func TestCollectSystemTasks_ContinuousStartedAtAndLoopOn(t *testing.T) {
 	te := newWireTestEngine(t)
 	got := map[string]TaskInfo{}
@@ -58,11 +59,10 @@ func TestCollectSystemTasks_ContinuousStartedAtAndLoopOn(t *testing.T) {
 			t.Fatalf("%s（常驻）loop_on 应 true（StartLoop 默认开启）", id)
 		}
 	}
-	// 从未运行但服务面镜像 running 的常驻任务（master 上 cluster-sync——
-	// SlaveOnly + masterSyncServingStatus 镜像）：取引擎启动时刻——状态列
-	// 「运行中」不得与启动列「—」矛盾（2026-10-03 用户报告回归裁定）。
+	// cluster-sync（2026-10-03 裁定：统一生命周期，镜像废除）：主节点上
+	// 真实启动——started_at=本代 boot 行（真实运行者，非镜像引擎启动兜底）。
 	if got["cluster-sync"].StartedAt == "" {
-		t.Fatal("镜像 running 的常驻任务 started_at 应取引擎启动时刻（状态运行中≠启动于—）")
+		t.Fatal("真实启动的常驻任务 started_at 应非空（本代 boot 行）")
 	}
 	if !got["cluster-sync"].LoopOn {
 		t.Fatal("cluster-sync loop_on 应 true（调度开关保留）")
@@ -86,10 +86,9 @@ func TestCollectSystemTasks_ContinuousStartedAtAndLoopOn(t *testing.T) {
 // '—' 兜底；不再回退引擎进程启动时刻（=uptime 语义，与「空闲」状态矛盾）。
 func TestCollectSystemTasks_DaemonNeverRunStartedAtEmpty(t *testing.T) {
 	te := newWireTestEngine(t)
-	// 真零值形状：从未运行、非镜像 running（无 StatusFn）、调度未开——
-	// 注册测试专用常驻（不 StartLoop）。cluster-sync 在 master 属镜像
-	// running 形态（见 Continuous 测试），不再是零值形状（2026-10-03
-	// 用户报告回归裁定）。
+	// 真零值形状：从未运行、无状态镜像（2026-10-03 裁定：镜像废除+角色门
+	// ——cluster-sync 已真实运行，不再是任何镜像形态）、调度未开——注册
+	// 测试专用常驻（不 StartLoop）。
 	te.Register(taskengine.Descriptor{ID: "t-never", Family: "t", Name: "从未运行", Kind: taskengine.KindDaemon, RunsOn: taskengine.RoleAny,
 		Run: func(rc taskengine.RunContext) error { return nil }})
 	got := map[string]TaskInfo{}

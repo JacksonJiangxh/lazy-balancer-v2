@@ -240,10 +240,11 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		// 置零值——UI '—' 兜底（U1-66-06），不再回退引擎进程启动时刻
 		// （=uptime 语义，与「空闲/已停止」状态矛盾）。L1-12（第 65 轮）。
 		if m.Kind == taskengine.KindDaemon {
-			// 取值语义（2026-10-03 用户两次报告收敛）：真实运行=本代 boot 行；
-			// 镜像 running（主节点 cluster-sync——StatusFn running 但本地无当代）
-			// =引擎启动时刻（当前服务面起点）——不得被陈旧历史 boot 行劫持；
-			// 停用有史=最近一次启动；从未运行且未运行=零值。
+			// 取值语义（2026-10-03 用户两次报告收敛；同日裁定镜像废除）：
+			// 真实运行=本代 boot 行；状态镜像 running（调度关但业务侧活跃
+			// ——如 cert-issuance 在役队列）=引擎启动时刻（当前服务面起点）
+			// ——不得被陈旧历史 boot 行劫持；停用有史=最近一次启动；从未
+			// 运行且未运行=零值。
 			switch {
 			case m.Running:
 				if latestRun != nil {
@@ -268,6 +269,12 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 // 结果——「无临期证书/清理 N 条/摄取 N 条」等；时间戳与 tee 流水同形态）。
 func TaskLogf(taskID, stage, format string, args ...any) {
 	taskengine.TeeTaskLogTime(taskID, "INFO", stage, fmt.Sprintf(format, args...))
+}
+
+// TaskLogfWarn 告警级业务行（WARN——异常状态变化落痕；零噪音裁定下
+// 「状态变化一次」的告警走这里，正常轮零日志）。
+func TaskLogfWarn(taskID, stage, format string, args ...any) {
+	taskengine.TeeTaskLogTime(taskID, "WARN", stage, fmt.Sprintf(format, args...))
 }
 
 func humanInterval(sec int) string {
