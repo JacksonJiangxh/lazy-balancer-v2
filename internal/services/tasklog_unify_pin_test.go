@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 // Given cert_jobs 一行 issued（24h 内更新）+一行 failed。
@@ -57,9 +58,11 @@ func TestCollectSystemTasks_ContinuousStartedAtAndLoopOn(t *testing.T) {
 			t.Fatalf("%s（常驻）loop_on 应 true（StartLoop 默认开启）", id)
 		}
 	}
-	// 从未运行的常驻任务（master 上 cluster-sync——SlaveOnly）：置零值
-	if got["cluster-sync"].StartedAt != "" {
-		t.Fatalf("从未运行的常驻任务 started_at 应为零值（U1-66-06）, got %q", got["cluster-sync"].StartedAt)
+	// 从未运行但服务面镜像 running 的常驻任务（master 上 cluster-sync——
+	// SlaveOnly + masterSyncServingStatus 镜像）：取引擎启动时刻——状态列
+	// 「运行中」不得与启动列「—」矛盾（2026-10-03 用户报告回归裁定）。
+	if got["cluster-sync"].StartedAt == "" {
+		t.Fatal("镜像 running 的常驻任务 started_at 应取引擎启动时刻（状态运行中≠启动于—）")
 	}
 	if !got["cluster-sync"].LoopOn {
 		t.Fatal("cluster-sync loop_on 应 true（调度开关保留）")
@@ -83,17 +86,22 @@ func TestCollectSystemTasks_ContinuousStartedAtAndLoopOn(t *testing.T) {
 // '—' 兜底；不再回退引擎进程启动时刻（=uptime 语义，与「空闲」状态矛盾）。
 func TestCollectSystemTasks_DaemonNeverRunStartedAtEmpty(t *testing.T) {
 	te := newWireTestEngine(t)
+	// 真零值形状：从未运行、非镜像 running（无 StatusFn）、调度未开——
+	// 注册测试专用常驻（不 StartLoop）。cluster-sync 在 master 属镜像
+	// running 形态（见 Continuous 测试），不再是零值形状（2026-10-03
+	// 用户报告回归裁定）。
+	te.Register(taskengine.Descriptor{ID: "t-never", Family: "t", Name: "从未运行", Kind: taskengine.KindDaemon, RunsOn: taskengine.RoleAny,
+		Run: func(rc taskengine.RunContext) error { return nil }})
 	got := map[string]TaskInfo{}
 	for _, ti := range collectEngineFamilies(te) {
 		got[ti.ID] = ti
 	}
-	// master 上 cluster-sync（SlaveOnly）从不启动、从未运行（task_runs 零行）
-	cs := got["cluster-sync"]
-	if cs.Kind != TaskKindDaemon {
-		t.Fatalf("cluster-sync 应为常驻族, got %s", cs.Kind)
+	tn := got["t-never"]
+	if tn.Kind != TaskKindDaemon {
+		t.Fatalf("应为常驻族, got %s", tn.Kind)
 	}
-	if cs.StartedAt != "" {
-		t.Fatalf("从未运行的常驻任务 StartedAt 应为零值, got %q（引擎启动时刻=uptime 失真）", cs.StartedAt)
+	if tn.StartedAt != "" {
+		t.Fatalf("从未运行且未运行的常驻任务 StartedAt 应为零值（UI '—' 兜底）, got %q", tn.StartedAt)
 	}
 }
 
