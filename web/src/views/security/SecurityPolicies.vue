@@ -122,14 +122,7 @@
           </template>
           <div v-else class="migrate-preview-empty">当前无规则绑定本策略</div>
         </div>
-        <el-alert
-          v-if="migrateCapRisk.length > 0"
-          type="warning"
-          :closable="false"
-          show-icon
-          :title="`上限风险：${migrateCapRisk.map((r) => r.name).join('、')} 迁移后将超过每条规则 ${MAX_POLICIES_PER_RULE} 条绑定上限——这些规则保持原绑定并进入跳过清单`"
-          class="migrate-preview-alert"
-        />
+        <div v-if="migrateCapRisk.length > 0" class="info-note-bar"><span class="info-note-desc">上限风险：{{ migrateCapRisk.map((r) => r.name).join('、') }} 迁移后将超过每条规则 {{ MAX_POLICIES_PER_RULE }} 条绑定上限——这些规则保持原绑定并进入跳过清单</span></div>
         <div class="info-note-bar" style="margin-top: 2px"><span class="info-note-desc">全部规则重映射成功后原策略将被删除；存在被跳过的规则时原策略保留（因仍在使用）</span></div>
       </div>
       <template #footer>
@@ -251,7 +244,7 @@
             </el-form-item>
             <!-- 信任名单区地址级冲突实时警告（本区条目：信任 IP × 他策略黑名单） -->
             <el-form-item v-if="whitelistSectionAlert" class="wizard-alert-item">
-              <el-alert type="warning" :closable="false" show-icon :title="whitelistSectionAlert" class="wizard-alert" />
+              <div class="info-note-bar wizard-alert"><span class="info-note-desc">{{ whitelistSectionAlert }}</span></div>
             </el-form-item>
           </el-form>
         </div>
@@ -349,23 +342,9 @@
               <!-- 跨策略 CRS 规则组重复实时警告（随当前选择重算）：置于表单项内控件列，
                    顺序 select → 说明 → 警告，与说明文字保持 6px 间距（见样式
                    .form-tip-line + .wizard-alert） -->
-              <el-alert
-                v-if="wafStepCrsAlert"
-                type="warning"
-                :closable="false"
-                show-icon
-                :title="wafStepCrsAlert"
-                class="wizard-alert"
-              />
+              <div v-if="wafStepCrsAlert" class="info-note-bar wizard-alert"><span class="info-note-desc">{{ wafStepCrsAlert }}</span></div>
             </el-form-item>
-            <el-alert
-              v-if="hasResponsePhaseGroupWithoutCheck"
-              type="warning"
-              :closable="false"
-              show-icon
-              title="已选含响应阶段的规则组（955 Webshell 等），但未开启「检查响应体」——这些组不会加载生效，请开启「检查响应体」或移除响应阶段组"
-              style="margin-bottom: 12px"
-            />
+            <div v-if="hasResponsePhaseGroupWithoutCheck" class="info-note-bar"><span class="info-note-desc">已选含响应阶段的规则组（955 Webshell 等），但未开启「检查响应体」——这些组不会加载生效，请开启「检查响应体」或移除响应阶段组</span></div>
             <el-form-item label="检查响应体">
               <el-switch v-model="form.waf_check_response" :disabled="crsFieldsOff || isReadOnly" />
               <div class="form-tip-line">开启后 WAF 读取并检查上游响应内容（响应泄露类规则需要）；关闭可显著降低内存与 CPU 开销，大多数部署只需检查请求</div>
@@ -374,14 +353,7 @@
               <el-switch v-model="form.log_request_body" :disabled="isReadOnly || form.mode === 'off'" />
               <div class="form-tip-line">仅 CRS/自定义规则命中事件记录请求体；当前模式关闭时不记录</div>
             </el-form-item>
-            <el-alert
-              v-if="form.log_request_body"
-              type="warning"
-              :closable="false"
-              show-icon
-              title="开启后命中规则事件的请求体将明文记录到事件库（单条上限 64KB），可能包含密码等敏感信息，请仅在排障期间开启"
-              class="wizard-alert"
-            />
+            <div v-if="form.log_request_body" class="info-note-bar wizard-alert"><span class="info-note-desc">开启后命中规则事件的请求体将明文记录到事件库（单条上限 64KB），可能包含密码等敏感信息，请仅在排障期间开启</span></div>
             <el-form-item label="排除规则">
               <!-- 表格行编辑器：目标（与规则组同款混合下拉）× 作用域（全部 IP/指定 IP/地址
                    列表）× 条件控件（ip → 标签输入 + isValidCidr 即时拒绝；list → 引用
@@ -519,14 +491,7 @@
                 <div class="form-tip-line">排除的目标规则/规则组不会被检测或拦截；作用域限定排除仅对所选来源 IP 或地址列表生效</div>
               </template>
             </el-form-item>
-            <el-alert
-              v-if="blockingEvalExclusionAlert"
-              type="warning"
-              :closable="false"
-              show-icon
-              title="排除评估规则（949/959）将使拦截模式的评分阈值拦截失效"
-              style="margin-bottom: 12px"
-            />
+            <div v-if="blockingEvalExclusionAlert" class="info-note-bar"><span class="info-note-desc">排除评估规则（949/959）将使拦截模式的评分阈值拦截失效</span></div>
             <el-form-item label="自定义规则">
               <el-select v-model="selectedCustomRules" :disabled="form.mode === 'off'" multiple filterable placeholder="选择要包含的自定义规则" style="width: 100%">
                 <el-option v-for="rule in allCustomRules" :key="rule.id" :label="rule.name" :value="rule.id" />
@@ -583,7 +548,7 @@
               <!-- 访问控制区地址级冲突实时警告（本区条目：ACL 列表 + 黑名单）——
                    无 label 的 el-form-item 仍保留 label 宽度偏移，内容落在控件列 -->
               <el-form-item v-if="aclSectionAlert" class="wizard-alert-item">
-                <el-alert type="warning" :closable="false" show-icon :title="aclSectionAlert" class="wizard-alert" />
+                <div class="info-note-bar wizard-alert"><span class="info-note-desc">{{ aclSectionAlert }}</span></div>
               </el-form-item>
             </template>
           </el-form>
@@ -676,23 +641,8 @@
                         :class="{ 'is-self': entry.isSelf, 'is-disabled': !entry.enabled, 'is-trust': isStage0ChainEntry(entry) }"
                       >{{ chainChipText(entry, idx) }}</span>
                     </div>
-                    <el-alert
-                      v-if="row.showPerfTip"
-                      type="warning"
-                      :closable="false"
-                      show-icon
-                      :title="`该规则将绑定 ${row.mergedCount} 条策略：每条策略都会叠加一层处理链（WAF/ACL/限流），超过 3 条可能影响转发性能`"
-                      class="bound-rule-alert"
-                    />
-                    <el-alert
-                      v-for="hint in row.hints"
-                      :key="hint"
-                      type="warning"
-                      :closable="false"
-                      show-icon
-                      :title="hint"
-                      class="bound-rule-alert"
-                    />
+                    <div v-if="row.showPerfTip" class="info-note-bar bound-rule-alert"><span class="info-note-desc">该规则将绑定 {{ row.mergedCount }} 条策略：每条策略都会叠加一层处理链（WAF/ACL/限流），超过 3 条可能影响转发性能</span></div>
+                    <div v-for="hint in row.hints" :key="hint" class="info-note-bar bound-rule-alert"><span class="info-note-desc">{{ hint }}</span></div>
                     <div
                       v-for="hint in row.infoHints"
                       :key="hint"
@@ -903,7 +853,7 @@
     </el-dialog>
 
     <el-dialog v-model="extractDialogVisible" title="提取为地址列表" width="min(480px, 92vw)" append-to-body :close-on-click-modal="false" :close-on-press-escape="!extracting" :show-close="!extracting">
-      <el-alert type="warning" :closable="false" show-icon title="将创建列表并清空内联条目，引用后语义不变" class="extract-alert" />
+      <div class="info-note-bar"><span class="info-note-desc">将创建列表并清空内联条目，引用后语义不变</span></div>
       <el-form label-width="80px" @submit.prevent>
         <el-form-item label="来源">
           <span class="extract-source">{{ extractSide === 'acl' ? aclListLabel : '信任 IP' }}（内联 {{ extractSourceEntries.length }} 条）</span>
@@ -3154,7 +3104,6 @@ onMounted(async () => {
 .acl-inline-row .acl-inline-select { flex: 1; min-width: 0; }
 .acl-extract-btn { flex-shrink: 0; margin-left: auto; }
 
-.extract-alert { margin-bottom: 12px; }
 .extract-source { font-size: 13px; color: #6b7280; }
 
 .wizard-content { min-height: min(370px, calc(100dvh - 300px)); max-height: calc(100dvh - 300px); overflow-y: auto; padding-right: 8px; }
@@ -3251,7 +3200,7 @@ onMounted(async () => {
 .bound-rule-meta { font-size: 12px; color: #9ca3af; font-family: monospace; }
 .bound-rule-remove { margin-left: auto; }
 .bound-rule-chain { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
-.bound-rule-alert { margin-top: 8px; }
+.bound-rule-alert { margin: 8px 0 0; }
 .bound-rule-note { margin: 8px 0 0; max-width: 640px; }
 /* 步骤内警告置于表单项控件列（el-form-item__content 为 flex 容器）——
    width:100% 使其独占一行并填满控件列（上限 640px），与 select/说明文字左对齐 */
@@ -3265,15 +3214,10 @@ onMounted(async () => {
    撑底距 */
 .wizard-alert-item { margin-top: -12px; }
 .wizard-alert-item .wizard-alert { margin-bottom: 0; }
-/* 紧凑化 el-alert（Step 4 冲突提示与 WAF/IP 步骤实时警告共用）：默认 14px 标题 +
-   8px/16px 内边距在表单内过重，统一收敛到 12px/1.5 的提示文本视觉；max-width 对齐
-   表单控件列宽（弹窗 800px − label 100px − 内边距 ≈ 660px，取 640px），避免横贯弹窗。 */
+/* 步骤内警告条已统一为 info-note-bar 家族（2026-10-03 用户裁定）：wizard-alert /
+   bound-rule-alert 仅保留布局职责——max-width 对齐表单控件列宽（弹窗 800px −
+   label 100px − 内边距 ≈ 660px，取 640px），视觉样式全部归 main.css 全局范式。 */
 .bound-rule-alert, .wizard-alert { max-width: 640px; }
-.bound-rule-alert :deep(.el-alert__content), .wizard-alert :deep(.el-alert__content) { padding: 0; }
-.bound-rule-alert :deep(.el-alert__title), .wizard-alert :deep(.el-alert__title) { font-size: 12px; line-height: 1.5; }
-.bound-rule-alert :deep(.el-alert__icon), .wizard-alert :deep(.el-alert__icon) { font-size: 14px; width: 14px; }
-.bound-rule-alert :deep(.el-alert__close-btn), .wizard-alert :deep(.el-alert__close-btn) { font-size: 12px; }
-.bound-rule-alert.el-alert, .wizard-alert.el-alert { padding: 4px 10px; }
 
 /* v2.2.0 绑定顺序 chip：本策略高亮（蓝），禁用策略灰显删除线；
    显式 line-height + inline-flex 保证 chip 视觉高度 ≈ 18-20px（避免继承表单上下文行高撑高）。 */

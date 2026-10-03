@@ -28,7 +28,7 @@
     </div>
 
     <div v-if="policiesLoading" class="ipo-tip">策略加载中…</div>
-    <el-alert v-else-if="policiesError" type="error" :closable="false" title="策略列表加载失败" />
+    <div v-else-if="policiesError" class="info-note-bar"><span class="info-note-desc">策略列表加载失败</span></div>
     <template v-else-if="rows.length > 0">
       <div v-if="groupedRows.offstage > 0" class="ipo-tip">另有 {{ groupedRows.offstage }} 条限流/WAF 策略不涉及 IP 管控</div>
       <!-- 阶段 0 空态（第 60 轮用户裁定：提示创建，不自动代建） -->

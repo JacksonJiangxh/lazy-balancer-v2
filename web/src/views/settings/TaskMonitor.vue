@@ -228,7 +228,7 @@
           <el-descriptions-item label="24h 成功 / 失败">
             <span class="tm-ok">{{ detailTask.success_24h }}</span> / <span :class="{ 'tm-bad': detailTask.fail_24h > 0 }">{{ detailTask.fail_24h }}</span>
           </el-descriptions-item>
-          <el-descriptions-item v-if="detailTask.kind === 'daemon'" label="启动于">{{ fmtTime(detailTask.started_at) || '—' }}</el-descriptions-item>
+          <el-descriptions-item v-if="detailTask.kind === 'daemon'" label="启动时间">{{ fmtTime(detailTask.started_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="开始时间">{{ fmtTime(detailTask.last_run.started_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="完成时间">{{ detailTask.status === 'running' ? '进行中' : fmtTime(detailTask.last_run.finished_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="耗时">{{ fmtDuration(detailTask.last_run.duration_ms) }}</el-descriptions-item>

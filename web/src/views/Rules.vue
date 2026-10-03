@@ -454,41 +454,12 @@
               
               <!-- Certificate Info Display -->
               <div v-if="certInfo.valid || certInfo.warning || certInfo.error" class="cert-info-container">
-                <!-- Success or Warning with info -->
-                <el-alert
-                  v-if="certInfo.valid"
-                  :type="certInfo.warning ? 'warning' : 'success'"
-                  :closable="false"
-                  class="cert-info-alert"
-                >
-                  <template #title>
-                    <div class="cert-info-title">
-                      {{ certInfo.warning ? '证书验证通过（有警告）' : '证书验证通过' }}
-                    </div>
-                    <div class="cert-info-detail">
-                      域名: {{ certInfo.domain }} | 
-                      过期时间: {{ certInfo.expiryDate }} 
-                      <span v-if="certInfo.daysUntilExpiry <= 30" class="cert-expiry-warning">
-                        (剩余 {{ certInfo.daysUntilExpiry }} 天)
-                      </span>
-                      <span v-else class="cert-expiry-normal">
-                        (剩余 {{ certInfo.daysUntilExpiry }} 天)
-                      </span>
-                    </div>
-                    <div v-if="certInfo.warning" class="cert-warning-text">
-                      ⚠️ {{ certInfo.warning }}
-                    </div>
-                  </template>
-                </el-alert>
-                
-                <!-- Error only -->
-                <el-alert
-                  v-if="certInfo.error"
-                  :title="certInfo.error"
-                  type="error"
-                  :closable="false"
-                  class="cert-info-alert"
-                />
+                <div v-if="certInfo.valid" class="info-note-bar cert-info-alert">
+                  <span class="info-note-desc">{{ certInfo.warning ? '证书验证通过（有警告）' : '证书验证通过' }}</span>
+                  <span class="info-note-sub">域名: {{ certInfo.domain }} | 过期时间: {{ certInfo.expiryDate }} <span v-if="certInfo.daysUntilExpiry <= 30" class="cert-expiry-warning">(剩余 {{ certInfo.daysUntilExpiry }} 天)</span><span v-else class="cert-expiry-normal">(剩余 {{ certInfo.daysUntilExpiry }} 天)</span></span>
+                  <span v-if="certInfo.warning" class="info-note-sub">⚠️ {{ certInfo.warning }}</span>
+                </div>
+                <div v-if="certInfo.error" class="info-note-bar cert-info-alert"><span class="info-note-desc">{{ certInfo.error }}</span></div>
               </div>
             </template>
             <el-form-item label="HTTP 重定向">
@@ -3688,23 +3659,6 @@ onUnmounted(() => {
 .cert-info-alert {
   margin-bottom: 8px;
   word-break: break-word;
-}
-
-.cert-info-alert :deep(.el-alert__content) {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.cert-info-title {
-  font-weight: 600;
-  font-size: 14px;
-}
-
-.cert-info-detail {
-  font-size: 13px;
-  color: #606266;
-  line-height: 1.4;
 }
 
 .cert-expiry-warning {

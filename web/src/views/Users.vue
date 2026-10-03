@@ -228,8 +228,7 @@
         <el-text type="info" size="small">为「{{ mfaBinding.username }}」绑定</el-text>
       </div>
       <div v-else style="display: flex; flex-direction: column; gap: 10px">
-        <el-alert type="warning" :closable="false" show-icon title="恢复代码仅此一次显示"
-          description="每个恢复代码只能使用一次，请妥善保存。丢失验证器时用于登录。" />
+        <div class="info-note-bar"><span class="info-note-desc">恢复代码仅此一次显示</span><span class="info-note-sub">每个恢复代码只能使用一次，请妥善保存。丢失验证器时用于登录。</span></div>
         <div style="display: grid; grid-template-columns: repeat(2, 200px); gap: 8px 24px; margin-top: 6px">
           <div v-for="code in mfaBinding.recoveryCodes" :key="code" style="font-family: monospace; font-size: 14px; background: var(--el-fill-color-light); padding: 6px 10px; border-radius: 3px; text-align: center; user-select: all">{{ code }}</div>
         </div>

@@ -35,7 +35,7 @@
       </div>
 
       <!-- ② 策略配置与命中明细（仅展示与本次触发相关的维度；零操作，处置在 IP 快捷弹框） -->
-      <el-alert v-if="loadError" type="error" :closable="false" show-icon title="策略信息加载失败，请关闭后重试" style="margin-bottom: 12px" />
+      <div v-if="loadError" class="info-note-bar"><span class="info-note-desc">策略信息加载失败，请关闭后重试</span></div>
       <div class="trg-card">
         <div class="trg-card-title">策略配置 · {{ dimensionTitle }}</div>
         <div class="trg-kv"><span class="k">当前配置</span><span>{{ relevantSummary }}</span></div>
@@ -74,16 +74,11 @@
             <template v-else>—</template>
           </div>
           <div class="trg-kv"><span class="k">规则消息</span><span>{{ row?.rule_msg || '—' }}</span></div>
-          <el-alert
-            v-if="!crsIndexLoading && !crsEntry"
-            type="warning"
-            :closable="false"
-            show-icon
-            :title="crsIndexReady
+          <div v-if="!crsIndexLoading && !crsEntry" class="info-note-bar" style="margin-top: 10px">
+            <span class="info-note-desc">{{ crsIndexReady
               ? '此规则已从当前 CRS 移除（存量排除条目仍生效）；排除管理请前往 安全防护 → 安全策略 → 策略编辑 → 排除规则'
-              : '当前 CRS 索引加载失败，无法展示规则详情'"
-            style="margin-top: 10px"
-          />
+              : '当前 CRS 索引加载失败，无法展示规则详情' }}</span>
+          </div>
           <template v-if="crsEntry">
             <div class="crs-snippet-toggle" role="button" tabindex="0" @click="toggleCrsSnippet" @keydown.enter.prevent="toggleCrsSnippet" @keydown.space.prevent="toggleCrsSnippet">
               <el-icon class="crs-snippet-toggle-icon" :class="{ 'is-expanded': crsSnippetExpanded }"><ArrowRight /></el-icon>

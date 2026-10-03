@@ -145,32 +145,17 @@
       </div>
 
       <transition name="el-fade-in">
-        <el-alert
-          v-if="serviceControlWarnings[serviceControlAction]"
-          :title="serviceControlWarnings[serviceControlAction]"
-          type="warning"
-          :closable="false"
-          show-icon
-          class="service-control-warning"
-        />
+        <div v-if="serviceControlWarnings[serviceControlAction]" class="info-note-bar service-control-warning"><span class="info-note-desc">{{ serviceControlWarnings[serviceControlAction] }}</span></div>
       </transition>
 
       <!-- C-3：服务控制返回证书指纹不匹配时提供按节点重钉通道（与从节点侧
            forget-pins 补救对称）；确认后调用 POST /cluster/nodes/:id/forget-pin。 -->
       <transition name="el-fade-in">
-        <el-alert
-          v-if="serviceControlPinMismatch"
-          title="从节点证书指纹不匹配"
-          type="error"
-          :closable="false"
-          show-icon
-          class="service-control-warning"
-        >
-          <div>该节点管理面板证书可能已更换。清除本节点对其的证书指纹钉后，下次服务控制将按其当前证书重新验证。</div>
-          <el-button type="danger" plain size="small" style="margin-top: 8px" :loading="nodePinForgetting" :disabled="nodePinForgetting" @click="forgetNodePin">
-            清除该节点证书指纹
-          </el-button>
-        </el-alert>
+        <div v-if="serviceControlPinMismatch" class="info-note-bar service-control-warning">
+          <span class="info-note-desc">从节点证书指纹不匹配</span>
+          <span class="info-note-sub">该节点管理面板证书可能已更换。清除本节点对其的证书指纹钉后，下次服务控制将按其当前证书重新验证。</span>
+          <span class="info-note-sub"><el-button type="danger" plain size="small" :loading="nodePinForgetting" :disabled="nodePinForgetting" @click="forgetNodePin">清除该节点证书指纹</el-button></span>
+        </div>
       </transition>
 
       <template #footer>

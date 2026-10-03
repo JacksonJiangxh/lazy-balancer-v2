@@ -176,17 +176,10 @@
         <el-collapse-item title="工具清单" name="tools-list">
           <div class="mcp-table-scroll-hint">左右滑动表格可查看方法、REST 路径和类型</div>
           <div v-loading="mcpToolsLoading" class="mcp-tools-table">
-            <el-alert
-              v-if="mcpToolsError"
-              :title="mcpToolsError"
-              type="error"
-              :closable="false"
-              show-icon
-            >
-              <template #default>
-                <el-button size="small" @click="fetchMCPTools">重新加载</el-button>
-              </template>
-            </el-alert>
+            <div v-if="mcpToolsError" class="info-note-bar">
+              <span class="info-note-desc">{{ mcpToolsError }}</span>
+              <span class="info-note-sub"><el-button size="small" @click="fetchMCPTools">重新加载</el-button></span>
+            </div>
             <el-table v-else :data="mcpTools" stripe max-height="38vh" empty-text="暂无工具">
               <el-table-column type="expand">
                 <template #default="scope">
@@ -252,14 +245,7 @@
           </el-tooltip>
           <span class="switch-hint">开启后所有写操作被拒绝</span>
         </el-form-item>
-        <el-alert
-          v-if="createForm.read_only"
-          class="readonly-alert"
-          :title="isAdmin ? '只读模式开启后，该密钥的所有写操作都将被拒绝（包括 MCP 写操作）。' : '普通用户密钥仅支持只读权限'"
-          type="warning"
-          :closable="false"
-          show-icon
-        />
+        <div v-if="createForm.read_only" class="info-note-bar readonly-alert"><span class="info-note-desc">{{ isAdmin ? '只读模式开启后，该密钥的所有写操作都将被拒绝（包括 MCP 写操作）。' : '普通用户密钥仅支持只读权限' }}</span></div>
         <el-divider content-position="left" class="section-divider">有效期与来源限制</el-divider>
         <el-form-item label="过期时间" :error="createExpiresError">
           <el-date-picker
@@ -316,14 +302,7 @@
           </el-tooltip>
           <span class="switch-hint">开启后所有写操作被拒绝</span>
         </el-form-item>
-        <el-alert
-          v-if="featureForm.read_only"
-          class="readonly-alert"
-          :title="isAdmin ? '只读模式开启后，该密钥的所有写操作都将被拒绝（包括 MCP 写操作）。' : '普通用户密钥仅支持只读权限'"
-          type="warning"
-          :closable="false"
-          show-icon
-        />
+        <div v-if="featureForm.read_only" class="info-note-bar readonly-alert"><span class="info-note-desc">{{ isAdmin ? '只读模式开启后，该密钥的所有写操作都将被拒绝（包括 MCP 写操作）。' : '普通用户密钥仅支持只读权限' }}</span></div>
         <el-divider content-position="left" class="section-divider">来源限制</el-divider>
         <el-form-item label="IP 白名单" :error="featureWhitelistError">
           <el-input
@@ -352,12 +331,7 @@
       <template #header>
         <DialogHeader :icon="CircleCheckFilled" title="API 密钥已创建" subtitle="仅显示一次，请立即复制并妥善保存" tone="success" />
       </template>
-      <el-alert
-        title="此密钥仅显示一次，请立即复制并妥善保存。"
-        type="warning"
-        :closable="false"
-        show-icon
-      />
+      <div class="info-note-bar"><span class="info-note-desc">此密钥仅显示一次，请立即复制并妥善保存。</span></div>
       <div class="created-key-box">
         <code class="created-key-text">{{ createdKey }}</code>
         <el-button type="primary" @click="copyCreatedKey">
