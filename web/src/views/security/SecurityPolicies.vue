@@ -3294,6 +3294,9 @@ onMounted(async () => {
    保持各自表单节奏（2026-10-03 用户裁定回归修正） */
 .step-content .info-note-bar { margin: 0 20px 12px; max-width: none; }
 .step-content .info-note-bar.bound-rule-alert { margin: 8px 0 0; max-width: none; }
+/* 实测修正（浏览器 computed 证据）：note 条曾被全局 .step-content .info-note-bar
+   的 20px 横向边距压中（特异性平局全局胜）→+20px 缩进/-40px 宽。高特异性链稳压。 */
+.step-content .bound-rule-row .info-note-bar { margin: 8px 0 0; }
 .wizard-alert-item .info-note-bar { margin: 0; max-width: none; }
 .step-content .info-note-bar.info-note-bar--inset { margin: 0; }
 .stage-projection-bar {
