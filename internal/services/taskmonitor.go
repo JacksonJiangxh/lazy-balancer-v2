@@ -240,13 +240,23 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		// 置零值——UI '—' 兜底（U1-66-06），不再回退引擎进程启动时刻
 		// （=uptime 语义，与「空闲/已停止」状态矛盾）。L1-12（第 65 轮）。
 		if m.Kind == taskengine.KindDaemon {
-			if latestRun != nil {
-				ti.StartedAt = latestRun.StartedAt
-			} else if m.Running || ti.Status == TaskStatusRunning {
-				// m.Running=引擎真实运行位；主节点 cluster-sync 服务面镜像
-				// （StatusFn 返回 running 但本地从未运行）同取引擎启动时刻——
-				// 否则状态列「运行中」与启动列「—」矛盾（2026-10-03 用户报告）。
+			// 取值语义（2026-10-03 用户两次报告收敛）：真实运行=本代 boot 行；
+			// 镜像 running（主节点 cluster-sync——StatusFn running 但本地无当代）
+			// =引擎启动时刻（当前服务面起点）——不得被陈旧历史 boot 行劫持；
+			// 停用有史=最近一次启动；从未运行且未运行=零值。
+			switch {
+			case m.Running:
+				if latestRun != nil {
+					ti.StartedAt = latestRun.StartedAt
+				} else {
+					ti.StartedAt = te.StartedAt().In(CurrentLocation()).Format("2006-01-02 15:04:05")
+				}
+			case ti.Status == TaskStatusRunning:
 				ti.StartedAt = te.StartedAt().In(CurrentLocation()).Format("2006-01-02 15:04:05")
+			default:
+				if latestRun != nil {
+					ti.StartedAt = latestRun.StartedAt
+				}
 			}
 		}
 		out = append(out, ti)
