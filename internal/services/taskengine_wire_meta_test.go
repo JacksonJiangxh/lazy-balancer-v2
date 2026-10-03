@@ -48,11 +48,12 @@ func TestTaskEngineWire_CertWaitingCANextSlotResolves(t *testing.T) {
 	t.Fatal("cert-waiting-ca 未注册")
 }
 
-// Given 引擎完成全量注册（B 完全标准化后）。
-// When DescribeAll。
-// Then cert-issuance/cluster-sync 均为真实可控常驻（Controllable=true、
-// 无状态视图标记；生命周期经 SetSync/CertIssuanceLifecycleHooks 挂钩真实
-// 服务）；cluster-sync 为 SlaveOnly（同步=从节点职能——角色翻转真实启停）。
+// Given 引擎完成全量注册（2026-10-03 裁定后）。
+// When DescribeAll + 两角色调度。
+// Then cert-issuance/cluster-sync/security-events-ingestion 均为真实可控
+// 常驻（Controllable=true）；cluster-sync 为 RoleAny+RestartOnRoleFlip——
+// 两角色统一生命周期（真实启停；状态镜像废除），主节点角色下真实运行
+// （服务面巡检），不再有「主节点不运行」的角色门形态。
 func TestTaskEngineWire_DaemonsFullyControllable(t *testing.T) {
 	te := newWireTestEngine(t)
 	for _, m := range te.DescribeAll() {
@@ -63,29 +64,36 @@ func TestTaskEngineWire_DaemonsFullyControllable(t *testing.T) {
 			}
 		}
 	}
-	// cluster-sync SlaveOnly：主节点角色下调度不启动（真实服务不跑）
+	// cluster-sync RoleAny：主节点角色下真实运行（主分支=服务面巡检）
 	te.SetRole(true)
 	te.StartLoop("cluster-sync")
 	time.Sleep(150 * time.Millisecond)
-	if te.IsRunning("cluster-sync") {
-		t.Fatal("主节点不应运行集群同步（SlaveOnly 角色门）")
+	if !te.IsRunning("cluster-sync") {
+		t.Fatal("主节点 cluster-sync 应真实运行（2026-10-03 裁定：统一生命周期，镜像废除）")
+	}
+	// 从节点角色下同样真实运行（从分支=同步轮询；Run 体按角色分流）
+	te.SetRole(false)
+	time.Sleep(150 * time.Millisecond)
+	if !te.IsRunning("cluster-sync") {
+		t.Fatal("从节点 cluster-sync 应真实运行（同步轮询）")
 	}
 }
 
-// Given 主节点角色（is_master=1）——同步 daemon 因 SlaveOnly 不启动。
+// Given 主节点角色（is_master=1）——cluster-sync 真实启动（主分支巡检）。
 // When 状态聚合。
-// Then cluster-sync 显示运行中（主节点服务面=快照签发/注册接收在线——
-// 2026-10-01 裁定，B 实施时曾丢失）；从节点由 daemon 实态呈现。
+// Then cluster-sync 显示运行中（真实 daemon 实态，非状态镜像——2026-10-03
+// 裁定废除 masterSyncServingStatus）。
 func TestTaskEngineWire_MasterSyncShowsServing(t *testing.T) {
 	te := newWireTestEngine(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=1 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	te.SetRole(true)
+	waitForCond(t, 2*time.Second, func() bool { return te.IsRunning("cluster-sync") })
 	for _, ti := range collectEngineFamilies(te) {
 		if ti.ID == "cluster-sync" {
 			if ti.Status != TaskStatusRunning {
-				t.Fatalf("主节点 cluster-sync 应运行中（服务面镜像）, got %s", ti.Status)
+				t.Fatalf("主节点 cluster-sync 应运行中（真实 daemon 实态）, got %s", ti.Status)
 			}
 			return
 		}

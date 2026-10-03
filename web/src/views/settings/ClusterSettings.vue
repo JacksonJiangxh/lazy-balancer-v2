@@ -104,7 +104,7 @@
       <template #footer><el-button type="primary" @click="tokenDialogVisible = false">我已保存</el-button></template>
     </el-dialog>
 
-    <el-dialog v-model="serviceControlDialogVisible" width="min(520px, 92vw)" :close-on-click-modal="false" :close-on-press-escape="!serviceControlLoading" :show-close="!serviceControlLoading" class="service-control-dialog">
+    <el-dialog v-model="serviceControlDialogVisible" class="service-control-dialog dialog-body-inset" width="min(520px, 92vw)" :close-on-click-modal="false" :close-on-press-escape="!serviceControlLoading" :show-close="!serviceControlLoading">
       <template #header>
         <div class="service-control-header">
           <div class="service-control-title">

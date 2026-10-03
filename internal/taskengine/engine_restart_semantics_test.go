@@ -1,6 +1,7 @@
 package taskengine
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -232,5 +233,97 @@ func TestEngine_DaemonRunPanicRecordsFailedNoRestart(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if daemonRunning(e, "t-dpanic") {
 		t.Fatal("daemon panic 后被自动重启——紧循环风险")
+	}
+}
+
+// ---- 2026-10-03 用户裁定：cluster-sync 纳入统一生命周期（镜像废除）----
+// Run 体按角色分流（主=服务面巡检/从=同步轮询）→ 角色真实翻转时 RoleAny
+// 常驻必须换代重启（旧代持旧分支）。RestartOnRoleFlip 由声明方显式开启，
+// 未声明者（security-events-ingestion 等 RoleAny 常驻）翻转不重启。
+
+// Given RoleAny 常驻声明 RestartOnRoleFlip，Run 体按引擎角色分流。
+// When StartLoop 后 demote→promote（生产三连调用形态只翻真实位）。
+// Then 每次翻转换代重启：新代 Run 体读到新角色；旧代落 [done] stopped。
+func TestEngine_RestartOnRoleFlip_ReplacesGeneration(t *testing.T) {
+	e := newTestEngine(t)
+	// 日志断言需真实 taskLogDir（newTestEngine 不设——隔离并还原）
+	oldLogDir := LogDir()
+	SetLogDir(t.TempDir())
+	t.Cleanup(func() { SetLogDir(oldLogDir) })
+	roleAtStart := make(chan bool, 8)
+	e.Register(Descriptor{ID: "t-flip", Family: "t", Name: "分支常驻", Kind: KindDaemon, RunsOn: RoleAny,
+		RestartOnRoleFlip: true,
+		Run: func(rc RunContext) error {
+			roleAtStart <- e.isMaster()
+			<-rc.Ctx.Done()
+			return nil
+		}})
+	e.SetRole(true)
+	e.StartLoop("t-flip")
+	select {
+	case role := <-roleAtStart:
+		if !role {
+			t.Fatal("初代 Run 体应读到主角色")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("初代未启动")
+	}
+	// demote：换代→从角色分支
+	e.SetRole(false)
+	select {
+	case role := <-roleAtStart:
+		if role {
+			t.Fatal("换代后 Run 体应读到从角色")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("角色翻转未触发换代重启")
+	}
+	// promote 反向：换代回主角色分支
+	e.SetRole(true)
+	select {
+	case role := <-roleAtStart:
+		if !role {
+			t.Fatal("promote 换代后 Run 体应读到主角色")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("promote 未触发换代重启")
+	}
+	if !daemonRunning(e, "t-flip") {
+		t.Fatal("换代收尾后常驻应保持运行")
+	}
+	// 每代各落一条 [start]；旧代各落一条 [done] stopped（取消语义）
+	body, _ := os.ReadFile(TaskLogPath("t-flip"))
+	if n := strings.Count(string(body), "[start]"); n != 3 {
+		t.Fatalf("三代应各落一条 [start]，got %d", n)
+	}
+	if n := strings.Count(string(body), "[done] stopped"); n != 2 {
+		t.Fatalf("两次换代应各落一条 [done] stopped，got %d", n)
+	}
+}
+
+// Given RoleAny 常驻未声明 RestartOnRoleFlip（security-events-ingestion 同形）。
+// When 角色翻转。
+// Then 不换代——运行位连续（重申调用不产生重启噪音）。
+func TestEngine_RoleFlipWithoutFlagNoRestart(t *testing.T) {
+	e := newTestEngine(t)
+	starts := make(chan struct{}, 4)
+	e.Register(Descriptor{ID: "t-steady", Family: "t", Name: "无Flag常驻", Kind: KindDaemon, RunsOn: RoleAny,
+		Run: func(rc RunContext) error {
+			starts <- struct{}{}
+			<-rc.Ctx.Done()
+			return nil
+		}})
+	e.SetRole(true)
+	e.StartLoop("t-steady")
+	<-starts
+	e.SetRole(false)
+	e.SetRole(false) // 生产三连重申
+	select {
+	case <-starts:
+		t.Fatal("未声明 RestartOnRoleFlip 的常驻不得因角色翻转重启")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if !daemonRunning(e, "t-steady") {
+		t.Fatal("角色翻转后常驻应保持原代运行")
 	}
 }
