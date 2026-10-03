@@ -26,7 +26,7 @@
         <div v-if="row?.event_time" class="trg-hero-time">事件时间 · {{ formatTriggerTime(row.event_time) }}</div>
         <div class="trg-hero-meta">
           <span>来源 IP {{ row?.client_ip }}</span>
-          <span v-if="(row?.duration_us ?? 0) > 0">处理时长 {{ formatDurationUs((row?.duration_us ?? 0) + (row?.precheck_us ?? 0)) }}<template v-if="(row?.precheck_us ?? 0) > 0">（预检 {{ formatDurationUs(row?.precheck_us) }} + WAF 段 {{ formatDurationUs(row?.duration_us) }}）</template></span>
+          <span v-if="(row?.duration_us ?? 0) > 0"><template v-if="isWafFamily">处理时长 {{ formatDurationUs((row?.duration_us ?? 0) + (row?.precheck_us ?? 0)) }}<template v-if="(row?.precheck_us ?? 0) > 0">（预检 {{ formatDurationUs(row?.precheck_us) }} + WAF 段 {{ formatDurationUs(row?.duration_us) }}）</template></template><template v-else>处理时长 {{ formatDurationUs(row?.duration_us ?? 0) }}（预检耗时）</template></span>
           <el-tag size="small" :type="row?.action === 'blocked' ? 'danger' : 'warning'" effect="plain">
             {{ row?.action === 'blocked' ? '已拦截' : '已记录（检测）' }}
           </el-tag>
@@ -193,6 +193,11 @@ const kind = computed<Kind>(() => {
     default: return 'acl'
   }
 })
+
+// Review66-Head ②（2026-10-03）：加和式仅 WAF 族——预检族（IP ACL/信任/
+// GeoIP/威胁）duration_us≡precheck_us 同值（securityevents.go:202），加和
+// 会翻倍并误标 WAF 段。
+const isWafFamily = computed(() => ['waf-crs', 'waf-custom', 'body'].includes(kind.value))
 
 const categoryLabel = computed(() => {
   switch (kind.value) {
