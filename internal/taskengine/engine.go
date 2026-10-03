@@ -134,6 +134,7 @@ type Engine struct {
 	// 临界区外复核——不得为读它反向嵌套 e.mu（Stop 持 e.mu→r.mu）。
 	stopped   atomic.Bool
 	startedAt time.Time
+	daemonWG  sync.WaitGroup // daemon goroutine 退出等待（2026-10-04 测试污染修复）
 }
 
 type Options struct {
@@ -172,6 +173,7 @@ func (e *Engine) Stop() {
 	}
 	e.mu.Unlock()
 	<-e.schedDone
+	e.daemonWG.Wait() // 等全部 daemon goroutine 退出——防止跨测试/跨引擎残留（2026-10-04）
 }
 
 func (e *Engine) SetRole(isMaster bool) {
@@ -447,7 +449,9 @@ func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, ca
 	e.finishRun(runID, "success", 0)
 
 	start := time.Now()
+	e.daemonWG.Add(1)
 	go func() {
+		defer e.daemonWG.Done()
 		err := runGuarded(r.desc.Run, RunContext{Ctx: ctx, Trigger: "auto", RunID: runID})
 		dur := time.Since(start).Milliseconds()
 		// 异常退出（非取消）＝Run 返回错误或 panic（L1-66-01 隔离）。

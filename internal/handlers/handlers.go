@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -899,10 +900,23 @@ func checkPortTLSMix(excludeCaddyID string, port int, enableTLS bool) error {
 // validateDnsServerShape(LB40-5):DNS 服务器地址形状校验——host[:port];
 // 裸 host 容错(SplitHostPort 报 missing port 时按裸 host 处理),拒绝空
 // host、非数字/越界端口与控制字符。
+// validateDnsServerShape(2026-10-04 多地址守卫):先按逗号/中文逗号/空格/分号
+// 拆分,逐地址跑单地址校验——此前整串当单 host 放过,垃圾地址逐个通过。
 func validateDnsServerShape(raw string) error {
-	server := strings.TrimSpace(raw)
+	for _, addr := range services.SplitDnsAddresses(raw) {
+		if err := validateSingleDnsAddress(addr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateSingleDnsAddress 单地址校验:host[:port] 形态;host 须为 IP(netip)
+// 或含点的 FQDN 或 localhost;端口 1-65535;拒绝空 host 与控制字符。
+func validateSingleDnsAddress(server string) error {
+	server = strings.TrimSpace(server)
 	if server == "" {
-		return nil
+		return fmt.Errorf("DNS 服务器地址无效")
 	}
 	host := server
 	if h, p, err := net.SplitHostPort(server); err == nil {
@@ -914,7 +928,6 @@ func validateDnsServerShape(raw string) error {
 			}
 		}
 	} else {
-		// 裸 host(无端口)或带括号 IPv6 裸地址:按 host 整体处理。
 		host = strings.Trim(server, "[]")
 	}
 	if strings.TrimSpace(host) == "" {
@@ -924,6 +937,15 @@ func validateDnsServerShape(raw string) error {
 		if r < 0x20 || r == 0x7f {
 			return fmt.Errorf("DNS 服务器地址含非法字符")
 		}
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return nil
+	}
+	if host == "localhost" {
+		return nil
+	}
+	if !strings.Contains(host, ".") {
+		return fmt.Errorf("DNS 服务器地址须为 IP 或完整域名")
 	}
 	return nil
 }
