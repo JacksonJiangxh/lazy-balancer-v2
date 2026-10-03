@@ -145,8 +145,9 @@
                 <div class="tm-tip-title">完成时间</div>
                 <div>{{ row.status === 'running' ? '进行中' : fmtTime(row.last_run?.finished_at) || '—' }}</div>
               </template>
+              <!-- 执行时间列=最近执行时刻（全类型统一，含常驻——其执行记录=boot 行）；
+                   不再显示「常驻 · 启动于」文案（2026-10-03 用户裁定） -->
               <span v-if="row.last_run?.started_at">{{ fmtTime(row.last_run.started_at) }}</span>
-              <span v-else-if="row.kind === 'daemon'" class="tm-dim">常驻 · 启动于 {{ fmtTime(row.started_at) || '—' }}</span>
               <span v-else class="tm-dim">—</span>
             </el-tooltip>
           </template>
