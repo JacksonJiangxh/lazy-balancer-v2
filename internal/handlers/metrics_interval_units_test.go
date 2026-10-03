@@ -18,7 +18,10 @@ import (
 // 1s，升序 LIMIT 720 保留最旧桶，静默丢弃最近数据。
 
 func TestMetricsIntervalSeconds_unitAgreement(t *testing.T) {
-	cases := []struct{ in string; want int64 }{
+	cases := []struct {
+		in   string
+		want int64
+	}{
 		{"30m", 1800},
 		{"10080m", 604800},
 		{"2h", 7200},
