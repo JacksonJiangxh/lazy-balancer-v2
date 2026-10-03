@@ -3291,7 +3291,7 @@ onMounted(async () => {
 /* 2026-10-03 用户最终裁定：阶段步（含关联规则步）全部提示条同一形态——
    左缘对齐步骤内容、宽随弹框自适应（浏览器实测基准 264/830）；表单项内
    提示条以 100px 标签列负边距满幅拉齐（364/730→264/830）。 */
-.step-content .info-note-bar { margin: 0 0 12px; max-width: none; }
+.step-content .info-note-bar { margin: 0 20px 12px; max-width: none; }
 .step-content .el-form-item .info-note-bar { width: calc(100% + 100px); margin-left: -100px; box-sizing: border-box; }
 .stage-projection-bar {
   display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
