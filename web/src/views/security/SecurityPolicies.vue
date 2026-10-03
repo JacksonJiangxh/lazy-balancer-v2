@@ -244,8 +244,9 @@
             </el-form-item>
             <!-- 信任名单区地址级冲突实时警告（本区条目：信任 IP × 他策略黑名单）：
                  el-form 直接子级（2026-10-03 模板归一），缩进由
-                 .step-content .el-form > .info-note-bar 统一到控件列 -->
-            <div v-if="whitelistSectionAlert" class="info-note-bar"><span class="info-note-desc">{{ whitelistSectionAlert }}</span></div>
+                 提示条在表单项内自然对齐控件列（EP label-width 布局，零 CSS 覆盖） -->
+            <el-form-item v-if="whitelistSectionAlert"><div class="info-note-bar"><span class="info-note-desc">{{ whitelistSectionAlert }}</span></div>
+            </el-form-item>
           </el-form>
         </div>
 
@@ -341,9 +342,10 @@
               <div class="form-tip-line">初始化（901）与拦截评估（949/959）为系统基础规则，随策略自动加载；通用误报豁免（999）在选择全部规则时自动包含</div>
             </el-form-item>
             <!-- 跨策略 CRS 规则组重复实时警告（随当前选择重算）：el-form 直接子级
-                 （2026-10-03 模板归一），缩进由 .step-content .el-form > .info-note-bar 统一 -->
-            <div v-if="wafStepCrsAlert" class="info-note-bar"><span class="info-note-desc">{{ wafStepCrsAlert }}</span></div>
-            <div v-if="hasResponsePhaseGroupWithoutCheck" class="info-note-bar"><span class="info-note-desc">已选含响应阶段的规则组（955 Webshell 等），但未开启「检查响应体」——这些组不会加载生效，请开启「检查响应体」或移除响应阶段组</span></div>
+                 提示条在表单项内自然对齐控件列（EP label-width 布局，零 CSS 覆盖） -->
+            <el-form-item v-if="wafStepCrsAlert"><div class="info-note-bar"><span class="info-note-desc">{{ wafStepCrsAlert }}</span></div>
+            </el-form-item>
+            <el-form-item v-if="hasResponsePhaseGroupWithoutCheck"><div class="info-note-bar"><span class="info-note-desc">已选含响应阶段的规则组（955 Webshell 等），但未开启「检查响应体」——这些组不会加载生效，请开启「检查响应体」或移除响应阶段组</span></div>
             <el-form-item label="检查响应体">
               <el-switch v-model="form.waf_check_response" :disabled="crsFieldsOff || isReadOnly" />
               <div class="form-tip-line">开启后 WAF 读取并检查上游响应内容（响应泄露类规则需要）；关闭可显著降低内存与 CPU 开销，大多数部署只需检查请求</div>
@@ -352,7 +354,8 @@
               <el-switch v-model="form.log_request_body" :disabled="isReadOnly || form.mode === 'off'" />
               <div class="form-tip-line">仅 CRS/自定义规则命中事件记录请求体；当前模式关闭时不记录</div>
             </el-form-item>
-            <div v-if="form.log_request_body" class="info-note-bar"><span class="info-note-desc">开启后命中规则事件的请求体将明文记录到事件库（单条上限 64KB），可能包含密码等敏感信息，请仅在排障期间开启</span></div>
+            <el-form-item v-if="form.log_request_body"><div class="info-note-bar"><span class="info-note-desc">开启后命中规则事件的请求体将明文记录到事件库（单条上限 64KB），可能包含密码等敏感信息，请仅在排障期间开启</span></div>
+            </el-form-item>
             <el-form-item label="排除规则">
               <!-- 表格行编辑器：目标（与规则组同款混合下拉）× 作用域（全部 IP/指定 IP/地址
                    列表）× 条件控件（ip → 标签输入 + isValidCidr 即时拒绝；list → 引用
@@ -490,7 +493,8 @@
                 <div class="form-tip-line">排除的目标规则/规则组不会被检测或拦截；作用域限定排除仅对所选来源 IP 或地址列表生效</div>
               </template>
             </el-form-item>
-            <div v-if="blockingEvalExclusionAlert" class="info-note-bar"><span class="info-note-desc">排除评估规则（949/959）将使拦截模式的评分阈值拦截失效</span></div>
+            <el-form-item v-if="blockingEvalExclusionAlert"><div class="info-note-bar"><span class="info-note-desc">排除评估规则（949/959）将使拦截模式的评分阈值拦截失效</span></div>
+            </el-form-item>
             <el-form-item label="自定义规则">
               <el-select v-model="selectedCustomRules" :disabled="form.mode === 'off'" multiple filterable placeholder="选择要包含的自定义规则" style="width: 100%">
                 <el-option v-for="rule in allCustomRules" :key="rule.id" :label="rule.name" :value="rule.id" />
@@ -546,8 +550,9 @@
               </el-form-item>
               <!-- 访问控制区地址级冲突实时警告（本区条目：ACL 列表 + 黑名单）：
                    el-form 直接子级（2026-10-03 模板归一），缩进由
-                   .step-content .el-form > .info-note-bar 统一到控件列 -->
-              <div v-if="aclSectionAlert" class="info-note-bar"><span class="info-note-desc">{{ aclSectionAlert }}</span></div>
+                   提示条在表单项内自然对齐控件列（EP label-width 布局，零 CSS 覆盖） -->
+              <el-form-item v-if="aclSectionAlert"><div class="info-note-bar"><span class="info-note-desc">{{ aclSectionAlert }}</span></div>
+              </el-form-item>
             </template>
           </el-form>
           <el-divider content-position="left" class="acl-divider">区域控制</el-divider>
@@ -560,7 +565,8 @@
             <template v-if="form.geoip_enabled">
               <!-- R72 二十七次 N3（裁决）：披露 IPv6/不可解析客户端语义——
                    fail-closed 设计下它们按「海外」处理。 -->
-              <div class="info-note-bar"><span class="info-note-desc">地域规则仅对 IPv4 生效：IPv6 与不可解析客户端按「海外」处理（拦截模式勾选海外时将被拦截；仅允许模式只勾选省份时将被拦截）。IP 库未安装时地域规则不可启用。</span></div>
+              <el-form-item><div class="info-note-bar"><span class="info-note-desc">地域规则仅对 IPv4 生效：IPv6 与不可解析客户端按「海外」处理（拦截模式勾选海外时将被拦截；仅允许模式只勾选省份时将被拦截）。IP 库未安装时地域规则不可启用。</span></div>
+              </el-form-item>
               <div class="mode-row" role="group" aria-label="地域控制模式">
                 <span class="mode-row-label">控制模式</span>
                 <div class="mode-row-content">
@@ -3201,7 +3207,7 @@ onMounted(async () => {
 
 
 /* 2026-10-03 模板归一：向导表单内提示条不再有「表单项控件列」载体——
-   统一为 el-form 直接子级 + .step-content .el-form > .info-note-bar
+   统一为 el-form-item 包裹（EP label-width 自动对齐控件列，零 CSS 覆盖）
    单条缩进规则（宽度随容器自适应，无第二种弹框样式）。 */
 
 .binding-order-chip { font-size: 12px; padding: 0 6px; border-radius: 10px; background: #f3f4f6; color: #4b5563; border: 1px solid #e5e7eb; display: inline-flex; align-items: center; line-height: 18px; vertical-align: middle; }
@@ -3268,15 +3274,6 @@ onMounted(async () => {
 
 /* 生效投影条（任务 8）：同一信息条左右两段——左=生效说明句、右=关联规则覆盖状态
    列表，同字号（12px）同基线（align-items: baseline） */
-/* 2026-10-03 用户终裁：所有弹框提示条统一 info-note-bar 基本样式；
-   策略向导表单内提示条统一缩进到控件列（=标签列 100px，用户裁定
-   「表单项统一缩进更合理」——提示是表单内容注解，对齐控件建立归属）；
-   关联规则面板无标签网格保持满宽。模板归一后提示条恒为 el-form 直接
-   子级，子选择器 > 钉死该层级——再嵌回 el-form-item 即失去缩进（显性可见）。 */
-.step-content .el-form > .info-note-bar { margin-left: 0; }
-/* 关联规则面板（规则卡行内）无标签网格语义——不缩进，与策略顺序链同左缘
-   （2026-10-03 用户裁定：关联规则步骤提示框不应有缩进） */
-.step-content .bound-rule-row .info-note-bar { margin-left: 0; }
 .stage-projection-bar {
   display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
   margin: 0 20px 12px; padding: 8px 12px;
