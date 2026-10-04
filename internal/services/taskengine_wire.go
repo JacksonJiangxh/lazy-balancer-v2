@@ -497,7 +497,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ManualRun:   true,
 		BootSync:    true, // B1（第 65 轮后裁定）：启动执行=引擎同步触发（面板监听前完成）
 		Run: func(rc taskengine.RunContext) error {
-			if rc.Trigger != "manual" && rc.Trigger != "startup" {
+			// V1（第 67 轮）：caddy-restart=Caddy 崩溃自愈 watcher 经引擎调度
+			// （曾 watcher 直调执行体绕过引擎——task_runs/单飞/日志双行）。
+			if rc.Trigger != "manual" && rc.Trigger != "startup" && rc.Trigger != "caddy-restart" {
 				return nil
 			}
 			if configLoadRerun == nil {

@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -159,20 +158,19 @@ func (h *Handlers) StartThreatLibUpdate(c *gin.Context) {
 	if !requireMasterNode(c) {
 		return
 	}
-	mgr := services.GetThreatUpdateManager()
-	if mgr == nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "威胁库更新服务未初始化"})
+	// V2（第 67 轮用户裁定）：手动触发统一经任务引擎（同 StartCRSUpdate）。
+	te := services.TaskEngine()
+	if te == nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务引擎未初始化"})
 		return
 	}
-	if _, err := mgr.StartUpdate("manual", &taskengine.RunContext{Operator: auditOperator(c)}); err != nil {
-		if errors.Is(err, services.ErrThreatUpdateRunning) {
-			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: err.Error()})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+	if te.IsTaskInFlight("threat") {
+		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务运行中，请稍后重试"})
 		return
 	}
-	// 审计由任务体自记（operator 已传入——2026-09-29 裁定单记口径）
+	op := auditOperator(c)
+	go func() { _ = te.Trigger("threat", "manual", op) }()
+	// 审计由任务体自记（operator 经 RunContext 归人——2026-09-29 裁定单记口径）
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 }
 

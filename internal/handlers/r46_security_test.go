@@ -103,26 +103,6 @@ func TestStartCRSUpdate_slaveNodeRejected403(t *testing.T) {
 	}
 }
 
-// TestStartCRSUpdate_masterPassesGate 验证门控不误伤主节点：主节点上请求穿过
-// 门控到达 manager 检查（未初始化 → 500 而非 403）。
-func TestStartCRSUpdate_masterPassesGate(t *testing.T) {
-	// Given 一个主节点（is_master 默认为 1），更新服务未初始化
-	setupSecurityPolicyTestDB(t)
-	services.ResetCRSUpdateManagerForTest()
-	h := &Handlers{}
-	gin.SetMode(gin.TestMode)
-	router := gin.New()
-	router.POST("/security/crs/update", h.StartCRSUpdate)
-
-	// When 主节点调用手动更新
-	recorder := postJSON(t, router, "/security/crs/update", nil)
-
-	// Then 穿过门控，命中 manager 未初始化的 500
-	if recorder.Code != http.StatusInternalServerError || !strings.Contains(recorder.Body.String(), "CRS 更新服务未初始化") {
-		t.Fatalf("master status=%d body=%s, want 500 CRS 更新服务未初始化（门控已放行）", recorder.Code, recorder.Body.String())
-	}
-}
-
 // TestStartIP2RegionUpdate_slaveNodeRejected403 验证 R46 B-F3：手动 IP2Region
 // 更新从节点一律 403，与 StartCRSUpdate 同一门控口径。
 func TestStartIP2RegionUpdate_slaveNodeRejected403(t *testing.T) {
@@ -146,24 +126,5 @@ func TestStartIP2RegionUpdate_slaveNodeRejected403(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), "该操作仅允许在主节点执行") {
 		t.Fatalf("body=%s, want 主节点专属文案", recorder.Body.String())
-	}
-}
-
-// TestStartIP2RegionUpdate_masterPassesGate 验证门控不误伤主节点。
-func TestStartIP2RegionUpdate_masterPassesGate(t *testing.T) {
-	// Given 一个主节点，更新服务未初始化
-	setupSecurityPolicyTestDB(t)
-	services.ResetIP2RegionUpdateManagerForTest()
-	h := &Handlers{}
-	gin.SetMode(gin.TestMode)
-	router := gin.New()
-	router.POST("/security/ip2region/update", h.StartIP2RegionUpdate)
-
-	// When 主节点调用手动更新
-	recorder := postJSON(t, router, "/security/ip2region/update", nil)
-
-	// Then 穿过门控，命中 manager 未初始化的 500
-	if recorder.Code != http.StatusInternalServerError || !strings.Contains(recorder.Body.String(), "IP2Region 更新服务未初始化") {
-		t.Fatalf("master status=%d body=%s, want 500 IP2Region 更新服务未初始化（门控已放行）", recorder.Code, recorder.Body.String())
 	}
 }

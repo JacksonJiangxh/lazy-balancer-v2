@@ -704,11 +704,18 @@ func (h *Handlers) StartCaddyRestartWatcher() {
 				continue
 			}
 			_ = os.Remove(caddyRestartTriggerFile)
-			services.Logf("info", "检测到 Caddy 进程重启，走启动配置流程重新应用（DB 渲染）")
-			if err := h.ApplyConfigOnStartup(""); err != nil {
+			services.Logf("info", "检测到 Caddy 进程重启，经任务引擎调度配置载入（DB 渲染）")
+			// V1（第 67 轮用户裁定）：一切任务统一引擎调度——曾直调
+			// ApplyConfigOnStartup 绕过引擎（无 task_runs/[start]/[done]/单飞，
+			// 审计+任务日志双行）。Run 体触发门已放行 caddy-restart。
+			if te := services.TaskEngine(); te != nil {
+				if _, err := te.RunSync("startup:config-load", "caddy-restart", ""); err != nil {
+					services.Logf("error", "Caddy 重启后配置重应用失败: %v", err)
+				} else {
+					services.Logf("info", "Caddy 重启后配置重应用完成（引擎调度，与启动流程同源）")
+				}
+			} else if err := h.ApplyConfigOnStartup(""); err != nil { // 引擎缺席（测试环境）回退
 				services.Logf("error", "Caddy 重启后配置重应用失败: %v", err)
-			} else {
-				services.Logf("info", "Caddy 重启后配置重应用完成（与启动流程同源）")
 			}
 		}
 	}()

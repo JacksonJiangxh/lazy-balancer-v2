@@ -55,6 +55,8 @@ fi
     echo "$LINE" >> "$APP_LOG" 2>/dev/null
   }
   CRASHES=0
+  FIRST_START=1  # V1（第 67 轮）：首启豁免——容器启动由 BootSync 权威载入，
+  # 触发文件仅用于运行期 Caddy 崩溃自愈（否则启动载入审计/日志双行）
   while true; do
     # 暂停等待环(admin stop 后持 pause;startCaddy 删除后 ≤1s 退出本环)
     while [ -f "$CADDY_PAUSE_FILE" ]; do
@@ -77,8 +79,11 @@ fi
         fi
       fi
       # trigger 文件:lazy-balancer 侧监听后走与启动完全相同的 DB 渲染→校验→
-      # 应用流程(权威修正——last_good 只是快速恢复桥,可能滞后于 DB)
-      echo restarted > /tmp/caddy-restarted
+      # 应用流程(权威修正——last_good 只是快速恢复桥,可能滞后于 DB)。
+      # 首启豁免(V1):容器启动由 BootSync 权威载入,仅运行期崩溃自愈写触发。
+      if [ "$FIRST_START" -eq 0 ]; then
+        echo restarted > /tmp/caddy-restarted
+      fi
     }
 
     # 等 admin 就绪后重应用 last-good 配置(重启后 Caddy 只有 Caddyfile 的
@@ -113,6 +118,8 @@ fi
       ) &
     fi
 
+    # 首轮拉起流程到此结束——后续均为运行期（崩溃重拉走权威修正触发）
+    FIRST_START=0
     # 等待 Caddy 退出(wait 同时回收进程——零僵尸)
     wait $CADDY_PID
     CODE=$?

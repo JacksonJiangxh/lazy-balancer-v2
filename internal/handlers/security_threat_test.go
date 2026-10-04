@@ -19,6 +19,7 @@ import (
 // 威胁情报库管理面（v2.3.2 名单化重构）：列表+开关+手动更新+状态/日志端点。
 func newThreatTestRouter(t *testing.T) *gin.Engine {
 	t.Helper()
+	initTaskEngineForTest(t) // V2：手动更新统一经引擎（端点内体改 te.Trigger）
 	testHandlers := newBackupTestHandlers(t)
 	services.ResetThreatUpdateManagerForTest()
 	// 更新日志目录默认 /app/logs（容器路径）——测试指向临时目录；
@@ -142,13 +143,20 @@ func TestThreatLib_updateAcceptedWithStatusAndLogs(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200 受理", resp.Code, resp.Body.String())
 	}
-	// 等待任务收尾后断言三源行 success + 名单行有内容 + 状态/日志端点可读
+	// 等待任务收尾后断言三源行 success + 名单行有内容 + 状态/日志端点可读。
+	// V2 引擎化后为异步触发——等 task_runs 终态（而非 manager IsRunning，
+	// 引擎未开跑时 IsRunning=false 会假放行）。
 	deadline := time.Now().Add(10 * time.Second)
-	for services.GetThreatUpdateManager().IsRunning() && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	var runStatus string
+	for time.Now().Before(deadline) {
+		_ = db.DB.QueryRow(`SELECT status FROM task_runs WHERE task_id='threat' ORDER BY id DESC LIMIT 1`).Scan(&runStatus)
+		if runStatus == "success" || runStatus == "failed" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if services.GetThreatUpdateManager().IsRunning() {
-		t.Fatal("更新任务 10s 未结束")
+	if runStatus != "success" {
+		t.Fatalf("引擎任务 10s 未成功收尾（task_runs.status=%q）", runStatus)
 	}
 	for _, name := range []string{"ustc", "firehol_l1", "et_compromised"} {
 		var status string
