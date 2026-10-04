@@ -548,11 +548,14 @@ const exportSections = ref<string[]>(BACKUP_SECTIONS.map((s) => s.key))
 const exportDialogVisible = ref(false)
 const toggleImportSection = (key: string): void => {
   const validation = importValidation.value
-  if (!validation?.valid) return
+  // L6-67-02（CERT41-1）：预览无效时分类开关保持可用——剔除坏行分类后重校验
+  // 即恢复可导入，「未选分类坏行不误拒」契约方才 UI 可达
+  if (!validation) return
   if (validation.type === 'v1' && key !== 'rules') return
   importSections.value = importSections.value.includes(key)
     ? importSections.value.filter((k) => k !== key)
     : [...importSections.value, key]
+  void revalidateImport()
 }
 
 const toggleExportSection = (key: string): void => {
@@ -955,16 +958,16 @@ const handleImportFile = async (event: Event): Promise<void> => {
     const isLbbak = head[0] === 0x1f && head[1] === 0x8b
     importFileIsLbbak.value = isLbbak
     const fileContent = isLbbak ? await file.arrayBuffer() : await file.text()
-    const res = await request.post<{ data: ImportValidation }>('/config/import/validate', fileContent, {
-      headers: { 'Content-Type': isLbbak ? 'application/octet-stream' : 'application/json' },
-    })
-    if (validationSeq !== importValidationSeq) return
     importFileContent.value = fileContent
-    importValidation.value = res.data
+    // L6-67-02：预览请求携带分类选择（初始=全选，与下方 V2 默认选择一致；
+    // V1 备份不消费该参数）——预览与导入同参，预览结果按所选分类过滤
+    const data = await postImportValidation(BACKUP_SECTIONS.map((sec) => sec.key))
+    if (validationSeq !== importValidationSeq) return
+    importValidation.value = data ?? null
     // V1 仅负载规则(锁定);V2 默认全选。无 WAF 规则库文件的备份不整类剔除
     // 「安全防护」(该分类同时含策略表)——后端兜底:跳过规则库版本记录表,
     // 并在响应 warnings 中说明(下方结果弹框展示)
-    if (res.data?.type === 'v1') {
+    if (data?.type === 'v1') {
       importSections.value = ['rules']
     } else {
       importSections.value = BACKUP_SECTIONS.map((sec) => sec.key)
@@ -976,6 +979,49 @@ const handleImportFile = async (event: Event): Promise<void> => {
   } finally {
     if (validationSeq === importValidationSeq) {
       importValidating.value = false
+    }
+  }
+}
+
+// L6-67-02：预览校验请求统一构造——携带当前分类选择（CERT41-1：后端
+// ValidateConfigImport 在校验前按 sections 过滤未选分类的表，坏行不误拒，
+// summary/warnings 亦只含所选分类）。参数形态与导入端点对齐：lbbak 二进制
+// 经 ?sections= query（R39-1），JSON 备份体内顶层注入 sections（V1 备份
+// 不消费该键，解析时忽略）。
+const postImportValidation = async (sections: string[]): Promise<ImportValidation | undefined> => {
+  const isLbbak = importFileIsLbbak.value
+  let endpoint = '/config/import/validate'
+  let body: string | ArrayBuffer = importFileContent.value
+  if (isLbbak) {
+    endpoint = `/config/import/validate?sections=${encodeURIComponent(sections.join(','))}`
+  } else {
+    try {
+      const parsed = JSON.parse(typeof importFileContent.value === 'string' ? importFileContent.value : '') as Record<string, unknown>
+      parsed.sections = sections
+      body = JSON.stringify(parsed)
+    } catch { /* 原样提交（后端按无效备份返回 valid=false） */ }
+  }
+  const res = await request.post<{ data: ImportValidation }>(endpoint, body, {
+    headers: { 'Content-Type': isLbbak ? 'application/octet-stream' : 'application/json' },
+  })
+  return res.data
+}
+
+// 分类切换后按所选分类重校验——预览结果始终反映当前选择（与导入同参）。
+// 面板保持显示（不闪 loading），并发切换经 importValidationSeq 只取最新响应。
+const revalidateImport = async (): Promise<void> => {
+  const sections = importSections.value
+  // V1 校验不消费分类（仅负载规则）；空选择无可导内容（确认时 FE44-6 拦截）——不重发
+  if (importValidation.value?.type === 'v1' || sections.length === 0) return
+  if (!importFileContent.value) return
+  const validationSeq = ++importValidationSeq
+  try {
+    const data = await postImportValidation(sections)
+    if (validationSeq !== importValidationSeq) return
+    importValidation.value = data ?? null
+  } catch {
+    if (validationSeq === importValidationSeq) {
+      importValidation.value = { valid: false, error: '校验请求失败，请重试', disabled_conflicts: [] }
     }
   }
 }

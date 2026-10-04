@@ -59,8 +59,11 @@ func installClusterVersionTriggers(database *sql.DB) error {
 		{name: "security_custom_rules", snapshotColumns: "id,name,description,conditions,action,score,enabled,updated_by,created_at,updated_at"},
 		{name: "security_block_pages", snapshotColumns: "id,name,description,content,content_type,is_default,is_builtin,created_by,created_at,updated_by,updated_at"},
 		{name: "security_ip_lists", snapshotColumns: "id,name,description,category,entries,created_by,created_at,updated_by,updated_at"},
-		{name: "security_crs_version", snapshotColumns: "id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at"},
-		{name: "security_ip2region_version", snapshotColumns: "id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at"},
+		// L5-67-01（第 67 轮审计）：schedule_days/schedule_time 入列——主端排程
+		// 保存（setVersionTableSchedule 同语句写两列+next_update）即 bump 版本，
+		// 排程随快照到达从端（升主即生效，CL41-1 自动备份先例）。
+		{name: "security_crs_version", snapshotColumns: "id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time"},
+		{name: "security_ip2region_version", snapshotColumns: "id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time"},
 		// 威胁情报库（v2.3.x）：多行表（每源一行状态机），随集群快照同步；
 		// last_checked 为运行态读路径指标，UPDATE 触发列排除（同 CRS/IP2Region）。
 		{name: "security_threat_sources", snapshotColumns: "id,name,display_name,url,format,update_enabled,apply_enabled,entry_count,version,update_status,message,last_checked,next_update,trigger,started_at,finished_at,consecutive_failures"},
@@ -173,8 +176,11 @@ func installClusterVersionTriggers(database *sql.DB) error {
 	// 刻意排除——调度器每次备份推进,入列会让每轮备份引发全集群快照重放。
 	// F49-P5-8:trusted_proxy_* 四列入 OF(防御对齐)——主端保存受信代理设置
 	// 须即 bump 版本随快照下发,不在 OF 内则稳态变更永不传播到从节点。
+	// L5-67-01(第 67 轮审计):threat_auto_update/threat_schedule_days/
+	// threat_schedule_time 三列入 OF(同 CL41-1 先例)——主端保存威胁库排程/
+	// 总开关即下发,从端升主后按主端排程运行。
 	if _, err := database.Exec(`CREATE TRIGGER cluster_version_global_config_update
-		AFTER UPDATE OF sync_users,sync_rules,sync_security,branding_json,caddy_config,log_level,access_log_json,access_log_format,task_log_size_mb,audit_log_size_mb,runtime_log_size_mb,audit_retention_months,jwt_expire_minutes,timezone,acme_email,cert_expiry_days,cert_renewal_days,cert_renewal_attempts,default_ca_provider_id,dns_provider,dns_credentials,sync_interval,admin_tls_enabled,admin_tls_mode,admin_tls_cert,admin_tls_key,caddy_log_level,caddy_log_size_mb,request_body_max_size_mb,http_read_timeout,http_write_timeout,http_idle_timeout,upstream_keepalive_timeout,proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,server_tokens_hidden,oidc_config,mfa_write_guard,mfa_lockout_enabled,github_proxy_url,auto_backup_enabled,auto_backup_frequency,auto_backup_time,auto_backup_day,auto_backup_keep,auto_backup_sections,trusted_proxy_enabled,trusted_proxy_ranges,trusted_proxy_headers,trusted_proxy_strict
+		AFTER UPDATE OF sync_users,sync_rules,sync_security,branding_json,caddy_config,log_level,access_log_json,access_log_format,task_log_size_mb,audit_log_size_mb,runtime_log_size_mb,audit_retention_months,jwt_expire_minutes,timezone,acme_email,cert_expiry_days,cert_renewal_days,cert_renewal_attempts,default_ca_provider_id,dns_provider,dns_credentials,sync_interval,admin_tls_enabled,admin_tls_mode,admin_tls_cert,admin_tls_key,caddy_log_level,caddy_log_size_mb,request_body_max_size_mb,http_read_timeout,http_write_timeout,http_idle_timeout,upstream_keepalive_timeout,proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,server_tokens_hidden,oidc_config,mfa_write_guard,mfa_lockout_enabled,github_proxy_url,auto_backup_enabled,auto_backup_frequency,auto_backup_time,auto_backup_day,auto_backup_keep,auto_backup_sections,trusted_proxy_enabled,trusted_proxy_ranges,trusted_proxy_headers,trusted_proxy_strict,threat_auto_update,threat_schedule_days,threat_schedule_time
 		ON global_config
 		WHEN OLD.cluster_version IS NEW.cluster_version AND COALESCE(NEW.is_master,1)=1
 		BEGIN

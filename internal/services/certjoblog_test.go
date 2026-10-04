@@ -180,3 +180,90 @@ func TestCertJobFileLogger_concurrent_writers_keep_lines_intact(t *testing.T) {
 		t.Fatal("no complete log lines survived concurrent writes")
 	}
 }
+
+// L1-P4-1（第 67 轮）：写入侧 5 代移位轮转与 log-cleanup housekeeping（tasks/
+// 主流水，logrotate.go taskLogsHousekeeping）的「rename → .1」单代覆盖式轮转双轨
+// 并存——活动文件被追加推过阈值后、下一次写入前的窗口内，housekeeping 节拍把
+// 活动文件 rename 覆盖既有 .1，5 代链中最新一代历史整代丢失。
+// Given 阈值 1000 字节、每行约 602 字节，写入序列制造「代际存在 + 活动文件已
+// 超阈值」的双轨窗口态。
+// When housekeeping 节拍运行。
+// Then 全部已写入内容仍在活动文件或 .1-.5 代际链内（无任何一代丢失）。
+func TestCertJobFileLogger_housekeepingTickNeverDropsGeneration(t *testing.T) {
+	useCertJobLogTestEnv(t, 1000)
+	logger := NewCertJobFileLogger("lb_dualtrack")
+	payload := strings.Repeat("x", 560) // 行全长 ≈602 字节：两行必超 1000 阈值
+	write := func(tag string) { logger.Log("stage", tag+payload) }
+
+	// Given：旧实现下第 2/4 次写入把活动文件推过阈值而不轮转（窗口态），
+	// 第 3 次写入触发 5 代移位使 .1=[GEN-1,GEN-2]。
+	write("GEN-1-")
+	write("GEN-2-")
+	write("GEN-3-")
+	write("GEN-4-")
+
+	// When：log-cleanup housekeeping 节拍（tasks/ 主流水第二轮转轨）。
+	logFile := filepath.Join(filepath.Dir(taskengine.LogDir()), "lazy-balancer.log")
+	taskLogsHousekeeping(logFile)
+
+	// Then：全部四代内容须仍在活动文件或 .1-.5 代际链内。
+	var b strings.Builder
+	base := CertJobLogPath("lb_dualtrack")
+	for i := 0; i <= maxRotatedFiles; i++ {
+		p := base
+		if i > 0 {
+			p = fmt.Sprintf("%s.%d", base, i)
+		}
+		if data, err := os.ReadFile(p); err == nil {
+			b.Write(data)
+		}
+	}
+	all := b.String()
+	for _, tag := range []string{"GEN-1-", "GEN-2-", "GEN-3-", "GEN-4-"} {
+		if !strings.Contains(all, tag) {
+			t.Fatalf("housekeeping 后历史内容 %q 丢失（双轨 .1 覆盖丢史），链内容=\n%s", tag, all)
+		}
+	}
+}
+
+// 回归钉（L1-P4-1 配套）：单轨超尺寸轮转保持 5 代上限——7 次写入（每次写入前
+// 判定超阈即轮转）后活动文件存最新一代，.1-.5 存最近 5 代，最老一代退役，
+// 不产生 .6。
+func TestCertJobFileLogger_singleTrackRotationKeepsFiveGenerations(t *testing.T) {
+	useCertJobLogTestEnv(t, 1000)
+	logger := NewCertJobFileLogger("lb_fivegen")
+	payload := strings.Repeat("y", 560)
+	for i := 1; i <= 7; i++ {
+		logger.Log("stage", fmt.Sprintf("GEN-%d-%s", i, payload))
+	}
+
+	base := CertJobLogPath("lb_fivegen")
+	if _, err := os.Stat(base + ".6"); !os.IsNotExist(err) {
+		t.Fatalf("不应存在第 6 代轮转文件（5 代上限）: stat err=%v", err)
+	}
+	readGen := func(i int) string {
+		p := base
+		if i > 0 {
+			p = fmt.Sprintf("%s.%d", base, i)
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("读取代际 %s: %v", p, err)
+		}
+		return string(data)
+	}
+	// 活动文件=GEN-7，.1-.5=GEN-6..GEN-2，GEN-1 已退役。
+	want := map[int]string{0: "GEN-7-", 1: "GEN-6-", 2: "GEN-5-", 3: "GEN-4-", 4: "GEN-3-", 5: "GEN-2-"}
+	for i, tag := range want {
+		if got := readGen(i); !strings.Contains(got, tag) {
+			t.Fatalf("代际 .%d 应含 %q，内容=\n%s", i, tag, got)
+		}
+	}
+	var b strings.Builder
+	for i := 0; i <= maxRotatedFiles; i++ {
+		b.WriteString(readGen(i))
+	}
+	if strings.Contains(b.String(), "GEN-1-") {
+		t.Fatal("最老一代 GEN-1 应随 5 代上限退役")
+	}
+}

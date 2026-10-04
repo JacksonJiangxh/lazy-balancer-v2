@@ -2402,3 +2402,73 @@ func TestInitialize_adds_path_rules_upstream_path_column(t *testing.T) {
 		t.Fatalf("path_rules.upstream_path notnull=%d default=%q, want notnull=1 default empty string", notNull, columnDefault)
 	}
 }
+
+// U4-P4-1（第 67 轮审计，P4）：存量 TCP 规则的 enable_dns_server/dns_server
+// 落库恒无效（TCP 渲染路径永不消费且无告警），迁移按 migrateTCPRuleStaleTLS
+// 同口径清空两列；HTTP 规则同名字段（DNS 服务发现合法配置）不受影响。
+func TestRunMigrations_clearsTCPRuleStaleDNSServerFields(t *testing.T) {
+	// Given 存量行：TCP 规则携带 DNS 字段两形态（开关开+地址/仅地址）、
+	// 已干净的 TCP 行、携带同名合法字段的 HTTP 规则（回归形状——不得误清）
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config) VALUES (1,'{}');
+		INSERT INTO lb_rules (name,protocol,domain,listen_port,enable_dns_server,dns_server,caddy_id) VALUES
+			('tcp-dns-on','tcp','',9090,1,'8.8.8.8:53','lb_tcp_dns_on'),
+			('tcp-dns-addr-only','tcp','',9091,0,'1.1.1.1:53','lb_tcp_dns_addr'),
+			('tcp-clean','tcp','',9092,0,'','lb_tcp_clean'),
+			('http-dns','http','c.example.test',8080,1,'8.8.8.8:53','lb_http_dns');`); err != nil {
+		t.Fatalf("seed tcp rules with stale dns fields: %v", err)
+	}
+	drainSystemAuditBuffer()
+
+	// When migrations run (twice, to prove idempotence)
+	if err := runMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+	if err := runMigrations(); err != nil {
+		t.Fatalf("repeat migrations: %v", err)
+	}
+
+	// Then 两条携带 DNS 字段的 TCP 行两列清空
+	for _, caddyID := range []string{"lb_tcp_dns_on", "lb_tcp_dns_addr"} {
+		var enableDNSServer int
+		var dnsServer string
+		if err := database.QueryRow("SELECT IIF(enable_dns_server IN ('1',1),1,0), COALESCE(dns_server,'') FROM lb_rules WHERE caddy_id=?", caddyID).Scan(&enableDNSServer, &dnsServer); err != nil {
+			t.Fatalf("read migrated rule %s: %v", caddyID, err)
+		}
+		if enableDNSServer != 0 || dnsServer != "" {
+			t.Fatalf("rule %s enable_dns_server=%d dns_server=%q, want 0/\"\"", caddyID, enableDNSServer, dnsServer)
+		}
+	}
+
+	// And 受影响规则逐条进入操作日志缓冲，重跑零命中（2 条而非 4 条=幂等）
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 2 {
+		t.Fatalf("system audit entries=%d, want 2（重跑幂等）", len(entries))
+	}
+	for _, entry := range entries {
+		if entry.action != "启动迁移" || entry.resource != "系统配置" {
+			t.Fatalf("audit entry action=%q resource=%q, want 启动迁移/系统配置", entry.action, entry.resource)
+		}
+	}
+
+	// And 干净 TCP 行与 HTTP 行同名字段原样保留（HTTP 的 DNS 配置是合法语义）
+	var httpEnable int
+	var httpDNS string
+	if err := database.QueryRow("SELECT IIF(enable_dns_server IN ('1',1),1,0), COALESCE(dns_server,'') FROM lb_rules WHERE caddy_id='lb_http_dns'").Scan(&httpEnable, &httpDNS); err != nil {
+		t.Fatalf("read http rule: %v", err)
+	}
+	if httpEnable != 1 || httpDNS != "8.8.8.8:53" {
+		t.Fatalf("HTTP 规则 DNS 字段不得受影响: enable=%d server=%q", httpEnable, httpDNS)
+	}
+	var cleanEnable int
+	var cleanDNS string
+	if err := database.QueryRow("SELECT IIF(enable_dns_server IN ('1',1),1,0), COALESCE(dns_server,'') FROM lb_rules WHERE caddy_id='lb_tcp_clean'").Scan(&cleanEnable, &cleanDNS); err != nil {
+		t.Fatalf("read clean tcp rule: %v", err)
+	}
+	if cleanEnable != 0 || cleanDNS != "" {
+		t.Fatalf("干净 TCP 行被误改: enable=%d server=%q", cleanEnable, cleanDNS)
+	}
+}

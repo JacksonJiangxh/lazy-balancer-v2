@@ -468,6 +468,18 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 	snapshot.BasicSettings.AutoBackupDay = &abDay
 	snapshot.BasicSettings.AutoBackupKeep = &abKeep
 	snapshot.BasicSettings.AutoBackupSections = &abSections
+	// L5-67-01（第 67 轮审计）：威胁库任务级排程三列随 users 节同步（镜像
+	// CL41-1 自动备份组：指针装载+COALESCE 兜底恒携带，升主即生效）。
+	var threatAuto bool
+	var threatDays, threatTime string
+	if err := store.QueryRowContext(ctx, `SELECT COALESCE(threat_auto_update,1),
+		COALESCE(threat_schedule_days,'1,2,3,4,5,6,7'), COALESCE(threat_schedule_time,'04:00')
+		FROM global_config WHERE id=1`).Scan(&threatAuto, &threatDays, &threatTime); err != nil {
+		return fmt.Errorf("读取威胁库排程设置: %w", err)
+	}
+	snapshot.BasicSettings.ThreatAutoUpdate = &threatAuto
+	snapshot.BasicSettings.ThreatScheduleDays = &threatDays
+	snapshot.BasicSettings.ThreatScheduleTime = &threatTime
 	return nil
 }
 
@@ -591,7 +603,8 @@ func (s *ClusterService) snapshotSecurityBlockPages(ctx context.Context, store s
 }
 
 func (s *ClusterService) snapshotSecurityCRSVersion(ctx context.Context, store snapshotStore) ([]models.ClusterSecurityCRSVersion, error) {
-	rows, err := store.QueryContext(ctx, `SELECT id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,'') FROM security_crs_version ORDER BY id`)
+	// L5-67-01（第 67 轮审计）：schedule_days/schedule_time 随版本行同步（升主即生效）。
+	rows, err := store.QueryContext(ctx, `SELECT id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,''),COALESCE(schedule_days,'1,2,3,4,5,6,7'),COALESCE(schedule_time,'04:00') FROM security_crs_version ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("读取快照 CRS 版本: %w", err)
 	}
@@ -599,7 +612,7 @@ func (s *ClusterService) snapshotSecurityCRSVersion(ctx context.Context, store s
 	versions := make([]models.ClusterSecurityCRSVersion, 0)
 	for rows.Next() {
 		var version models.ClusterSecurityCRSVersion
-		if err := rows.Scan(&version.ID, &version.Version, &version.UpdatedAt, &version.AutoUpdate, &version.UpdateStatus, &version.Message, &version.LastChecked, &version.NextUpdate, &version.Trigger, &version.StartedAt, &version.FinishedAt); err != nil {
+		if err := rows.Scan(&version.ID, &version.Version, &version.UpdatedAt, &version.AutoUpdate, &version.UpdateStatus, &version.Message, &version.LastChecked, &version.NextUpdate, &version.Trigger, &version.StartedAt, &version.FinishedAt, &version.ScheduleDays, &version.ScheduleTime); err != nil {
 			return nil, fmt.Errorf("扫描快照 CRS 版本: %w", err)
 		}
 		versions = append(versions, version)
@@ -608,7 +621,8 @@ func (s *ClusterService) snapshotSecurityCRSVersion(ctx context.Context, store s
 }
 
 func (s *ClusterService) snapshotSecurityIP2RegionVersion(ctx context.Context, store snapshotStore) ([]models.ClusterSecurityIP2RegionVersion, error) {
-	rows, err := store.QueryContext(ctx, `SELECT id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,'') FROM security_ip2region_version ORDER BY id`)
+	// L5-67-01（第 67 轮审计）：schedule_days/schedule_time 随版本行同步（升主即生效）。
+	rows, err := store.QueryContext(ctx, `SELECT id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,''),COALESCE(schedule_days,'1,2,3,4,5,6,7'),COALESCE(schedule_time,'04:00') FROM security_ip2region_version ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("读取快照 ip2region 版本: %w", err)
 	}
@@ -616,7 +630,7 @@ func (s *ClusterService) snapshotSecurityIP2RegionVersion(ctx context.Context, s
 	versions := make([]models.ClusterSecurityIP2RegionVersion, 0)
 	for rows.Next() {
 		var version models.ClusterSecurityIP2RegionVersion
-		if err := rows.Scan(&version.ID, &version.Version, &version.UpdatedAt, &version.AutoUpdate, &version.UpdateStatus, &version.Message, &version.LastChecked, &version.NextUpdate, &version.Trigger, &version.StartedAt, &version.FinishedAt); err != nil {
+		if err := rows.Scan(&version.ID, &version.Version, &version.UpdatedAt, &version.AutoUpdate, &version.UpdateStatus, &version.Message, &version.LastChecked, &version.NextUpdate, &version.Trigger, &version.StartedAt, &version.FinishedAt, &version.ScheduleDays, &version.ScheduleTime); err != nil {
 			return nil, fmt.Errorf("扫描快照 ip2region 版本: %w", err)
 		}
 		versions = append(versions, version)

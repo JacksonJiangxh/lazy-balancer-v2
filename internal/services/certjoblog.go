@@ -169,7 +169,18 @@ func (l *CertJobFileLogger) write(level, stage, message string) {
 
 	path := CertJobLogPath(l.ruleID)
 
-	if info, err := os.Stat(path); err == nil && info.Size() >= getTaskLogSizeBytes() {
+	timestamp := time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05")
+	line := fmt.Sprintf("%s [%s] %s - %s\n", timestamp, level, stage, message)
+
+	// L1-P4-1（第 67 轮）：轮转判定计入待写入行——size+len(line) 超阈即在写入
+	// 前轮转，磁盘上活动文件恒 ≤ 上限。log-cleanup housekeeping（tasks/ 主流水，
+	// taskLogsHousekeeping）对超阈文件做「rename → .1」单代覆盖式轮转：此前本
+	// 写入侧仅在 size≥阈值时轮转，追加把活动文件推过阈值后、下一次写入前的窗
+	// 口内，housekeeping 节拍会把活动文件 rename 覆盖既有 .1（5 代链最新一代
+	// 整代丢失）。活动文件恒 ≤ 上限后 housekeeping 尺寸分支永不命中证书任务
+	// 日志，轮转唯一负责方归本写入侧（5 代移位），双轨覆盖窗口根除；
+	// housekeeping 的保留期清理语义不变。
+	if info, err := os.Stat(path); err == nil && info.Size()+int64(len(line)) > getTaskLogSizeBytes() {
 		// 轮转失败不再吞没（C-11）：留痕告警后继续追加，维持原写入可用性。
 		if err := rotateCertJobLogFiles(path); err != nil {
 			certJobLogWarnf("cert job log: rotate %s failed: %v", path, err)
@@ -188,8 +199,7 @@ func (l *CertJobFileLogger) write(level, stage, message string) {
 	}
 	defer f.Close()
 
-	timestamp := time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05")
-	fmt.Fprintf(f, "%s [%s] %s - %s\n", timestamp, level, stage, message)
+	fmt.Fprint(f, line)
 }
 
 // rotateCertJobLogFiles 把 current 逐代下移到 .1（.1→.2 … .4→.5，删除旧 .5）。

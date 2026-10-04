@@ -78,9 +78,14 @@ var auditRoutePolicies = map[string]AuditPolicy{
 	"PUT /api/v1/admin-tls":                AuditPolicyExplicit,
 	"POST /api/v1/admin-tls/inspect":       AuditPolicySkip,
 	"POST /api/v1/system/restart":          AuditPolicyGeneric,
-	// 任务监控（v2.3.4）：三操作 handler 均显式留痕
-	// 任务触发：审计由任务体 defer 单记（operator 归人——R63 与三库更新同口径）。
-	"POST /api/v1/system/tasks/:id/trigger": AuditPolicySkip,
+	// 任务监控（v2.3.4）：toggle/cancel/control 三操作 handler 均显式留痕。
+	// 任务触发（U1-P3-1，第 67 轮）：升为 Explicit——Skip 前提「任务体 defer
+	// 单记」随 v2.0 可触发族扩容失效（R63 时仅 3 自记族，现 12 族中 7 族任务体
+	// 零审计：log-cleanup/audit-retention/security-events-retention/
+	// cert-renewal-scan/cert-reconcile/cert-manual-poll/cert-waiting-ca）。
+	// handler 按 TaskTriggerSelfRecordsAudit 分流：非自记族显式补记「触发」，
+	// 自记族跳过（保 U1-P3-2 任务体单记裁定，operator 经 RunContext 归人）。
+	"POST /api/v1/system/tasks/:id/trigger": AuditPolicyExplicit,
 	"POST /api/v1/system/tasks/:id/toggle":  AuditPolicyExplicit,
 	"POST /api/v1/system/tasks/:id/cancel":  AuditPolicyExplicit,
 	"POST /api/v1/system/tasks/:id/control": AuditPolicyExplicit,
@@ -179,6 +184,31 @@ func ClassifyAuditRoute(method, path string) AuditPolicy {
 		return policy
 	}
 	return AuditPolicySkip
+}
+
+// taskTriggerSelfAuditIDs 手动触发审计自记族（U1-P3-1，第 67 轮）：
+//   - threat/crs/ip2region：manager run 的 defer 每轮单记（2026-09-29 用户裁定
+//   - R62 U1-P3-2 收敛），operator 经 RunContext 归人；
+//   - auto-backup：备份执行器（handlers/autobackup.go）按结果记「备份/备份失败」；
+//   - startup:config-load：runConfigLoad 载入审计（启动与手动同体）。
+//
+// 其余 7 个可手动触发族（log-cleanup/audit-retention/security-events-retention/
+// cert-renewal-scan/cert-reconcile/cert-manual-poll/cert-waiting-ca）任务体零
+// RecordAuditLog，由 trigger handler 显式补记。新增可触发族时必须评估本集合
+// （任务体自记 → 加入；否则 handler 自动补记）。
+var taskTriggerSelfAuditIDs = map[string]struct{}{
+	"threat":              {},
+	"crs":                 {},
+	"ip2region":           {},
+	"auto-backup":         {},
+	"startup:config-load": {},
+}
+
+// TaskTriggerSelfRecordsAudit 报告任务族的任务体是否自记手动触发审计——
+// trigger handler 据此分流：自记族不复记（单记裁定），非自记族补记「触发」。
+func TaskTriggerSelfRecordsAudit(id string) bool {
+	_, ok := taskTriggerSelfAuditIDs[id]
+	return ok
 }
 
 func IsAuditedWriteRoute(method, path string) bool {

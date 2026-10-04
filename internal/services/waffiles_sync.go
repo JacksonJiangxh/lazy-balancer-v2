@@ -20,18 +20,21 @@ import (
 	"sync"
 )
 
-// wafFileMu 是 WAF 数据文件写者互斥锁（L6-66-02，第 66 轮审计）：CRS 树
-// （crsinstall 树交换 / lbbak untarGzTo 交换）、威胁库 .iplist+.fast
-// （threatupdate 写编译对 / lbbak 直写）、ip2region xdb（ip2regionupdate
-// 安装段 / ApplyWafFileBundle 直写）四方文件相位在此串行——此前无共享锁，
-// lbbak 导入与三库更新器交错会产生混合/残缺 rules 树（部分防护静默失效
-// fail-open）、撕裂 .iplist（缺条目名单静默残缺）与 xdb 元数据瞬时错位。
+// wafFileMu 是 WAF 数据文件读写互斥锁（L6-66-02，第 66 轮审计写侧；L6-67-01
+// 第 67 轮补读侧）：CRS 树（crsinstall 树交换 / lbbak untarGzTo 交换）、威胁库
+// .iplist+.fast（threatupdate 写编译对 / lbbak 直写）、ip2region xdb
+// （ip2regionupdate 安装段 / ApplyWafFileBundle 直写）四方写相位与
+// BuildWafFileBundle 读相位（lbbak 导出 / 集群按需端点共用）在此串行——此前
+// 无共享锁，lbbak 导入与三库更新器交错会产生混合/残缺 rules 树（部分防护静默
+// 失效 fail-open）、撕裂 .iplist（缺条目名单静默残缺）与 xdb 元数据瞬时错位；
+// 读侧不入锁则打出半新半旧 bundle（manifest sha256 自洽不可检）。
 // 锁只包文件相位（staging 先行、网络下载与 Caddy 重载在锁外——锁内取
 // CaddyOpLock 会与导入路径 CaddyOpLock→wafFileMu 的持锁序构成 AB-BA）。
 var wafFileMu sync.Mutex
 
-// WafFileLock 返回 WAF 数据文件写者互斥锁（跨包消费：handlers 侧 lbbak 导入
-// 文件相位与本包三个更新器共用同一实例）。叶操作、无嵌套重入。
+// WafFileLock 返回 WAF 数据文件读写互斥锁（跨包消费：handlers 侧 lbbak 导入
+// 文件相位与本包三个更新器共用同一实例；BuildWafFileBundle 读相位内部自取）。
+// 叶操作、无嵌套重入。
 func WafFileLock() sync.Locker { return &wafFileMu }
 
 // WafFileBundle carries the CRS rules tree and GeoIP xdb inside a cluster
@@ -107,7 +110,15 @@ func scanThreatFastFiles() map[string]string {
 
 // BuildWafFileBundle collects the live rule files with content; served by the
 // on-demand endpoint, and never embedded in snapshots.
+// L6-67-01（第 67 轮）：本函数是 WAF 数据文件读者——两个调用方（lbbak 导出
+// buildLbbakExport / 集群按需端点 GetWafFiles）都曾在无锁下读 CRS 树/xdb/
+// 威胁 .fast，与写者（CRS 树交换/威胁 .iplist 写编译/xdb 安装/lbbak 导入
+// 直写）交错会打出半新半旧 bundle：lbbak manifest 的 sha256 按内存字节计算
+// 自洽仍通过，还原后 WAF 静默降级。读取全程在 wafFileMu 互斥段内（与写侧
+// 文件相位串行）；锁内不取 CaddyOpLock（写侧同口径，防 AB-BA）。
 func BuildWafFileBundle() *WafFileBundle {
+	wafFileMu.Lock()
+	defer wafFileMu.Unlock()
 	ref := BuildWafFileRef()
 	if ref == nil {
 		return nil

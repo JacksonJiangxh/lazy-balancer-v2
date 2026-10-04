@@ -67,7 +67,22 @@ var watchdogAdminURLValue string
 
 // WatchdogCheckOnce 单轮一致性检查（panic 留痕——看门狗是唯一消费者，
 // goroutine 静默死亡是最坏形态；引擎 60s 节拍调用）。
+// L1-P4-2（第 67 轮审计）：主节点专属检测——从节点整轮短路（循环保持存活，
+// 升主后自动生效；COALESCE(is_master,1) 口径与全仓一致）。此前从节点每轮
+// 空跑簿记：心跳计数累积并逐小时发「配置一致」假心跳（从未真实检查）。
 func WatchdogCheckOnce() {
+	if db.DB == nil {
+		return
+	}
+	var isMaster bool
+	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
+		if err != nil {
+			// 查询失败与「非主节点」同为跳过，失败留痕（对齐 checkConfigConsistency
+			// 内层门第 55 轮 P5 标准——静默吞错会掩盖 DB 异常）。
+			Logf("warn", "配置看门狗: 读取集群角色失败，本轮跳过: %v", err)
+		}
+		return
+	}
 	func() {
 		defer func() {
 			if r := recover(); r != nil {

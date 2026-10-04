@@ -58,12 +58,18 @@ func servingLines(log string) []string {
 	return out
 }
 
+// seedServingNode 种子一个从节点；interval 写 global_config.sync_interval（真实
+// 上报周期，L2-67-01 起巡检阈值随它）——nodes.sync_interval 是写侧从不写的死列
+// （schema 默认 60），此前种子它掩盖了阈值钉死 120s 的 bug。
 func seedServingNode(t *testing.T, name, lastSeenUTC string, version, interval int) int64 {
 	t.Helper()
-	res, err := db.DB.Exec(`INSERT INTO nodes (name, mode, ip_address, port, is_approved, sync_interval, status, last_seen, reported_version)
-		VALUES (?, 'slave', ?, 8000, 1, ?, 'online', ?, ?)`, name, "10.9.0."+name, interval, lastSeenUTC, version)
+	res, err := db.DB.Exec(`INSERT INTO nodes (name, mode, ip_address, port, is_approved, status, last_seen, reported_version)
+		VALUES (?, 'slave', ?, 8000, 1, 'online', ?, ?)`, name, "10.9.0."+name, lastSeenUTC, version)
 	if err != nil {
 		t.Fatalf("seed 节点: %v", err)
+	}
+	if _, err := db.DB.Exec(`UPDATE global_config SET sync_interval=? WHERE id=1`, interval); err != nil {
+		t.Fatalf("seed 全局同步间隔: %v", err)
 	}
 	id, _ := res.LastInsertId()
 	return id
@@ -172,6 +178,43 @@ func TestMasterServingRound_offlineWarnsOnce(t *testing.T) {
 	}
 	if offline != 1 {
 		t.Fatalf("离线应仅状态变化时 WARN 一次, got %d", offline)
+	}
+}
+
+// L2-67-01（第 67 轮审计）：巡检离线阈值须跟随 global_config.sync_interval
+// （与 cluster_sync 同口径）——此前读 nodes.sync_interval 死列（写侧从不写，
+// schema 默认 60），阈值钉死 2×60=120s，interval>120s 部署逐轮误报离线。
+func TestMasterServingRound_offlineThresholdFollowsGlobalSyncInterval(t *testing.T) {
+	newServingTestEnv(t)
+	// Given 全局同步间隔 300s（阈值=max(2×300,120s)=600s）+ 节点 200s 前上报
+	nodeID := seedServingNode(t, "edge-c", servingBase.Add(-200*time.Second).UTC().Format("2006-01-02 15:04:05"), 3, 300)
+	w := newServingWatch()
+	ctx := context.Background()
+
+	// When 巡检一轮
+	masterSyncServingRound(ctx, servingBase, w)
+
+	// Then 200s<600s 不判离线（死列口径 2×60=120s 会误报）
+	for _, line := range servingLines(readClusterSyncLog(t)) {
+		if strings.Contains(line, "edge-c") && strings.Contains(line, "离线") {
+			t.Fatalf("200s 未超 600s 阈值不应判离线（阈值须跟随 global sync_interval=300）: %s", line)
+		}
+	}
+
+	// 回归形状：同阈值下 700s 未上报须判离线，且 WARN 点名 600 秒阈值
+	if _, err := db.DB.Exec(`UPDATE nodes SET last_seen=? WHERE id=?`,
+		servingBase.Add(-700*time.Second).UTC().Format("2006-01-02 15:04:05"), nodeID); err != nil {
+		t.Fatal(err)
+	}
+	masterSyncServingRound(ctx, servingBase.Add(masterSyncInspectInterval), w)
+	found := false
+	for _, line := range servingLines(readClusterSyncLog(t)) {
+		if strings.Contains(line, "edge-c") && strings.Contains(line, "离线") && strings.Contains(line, "超时阈值 600 秒") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("700s 超 600s 阈值应 WARN 离线并点名阈值 600 秒, got %v", servingLines(readClusterSyncLog(t)))
 	}
 }
 

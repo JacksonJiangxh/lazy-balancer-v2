@@ -245,6 +245,13 @@ type ClusterBasicSettings struct {
 	AutoBackupDay       *int    `json:"auto_backup_day,omitempty"`
 	AutoBackupKeep      *int    `json:"auto_backup_keep,omitempty"`
 	AutoBackupSections  *string `json:"auto_backup_sections,omitempty"`
+	// L5-67-01（第 67 轮审计）：威胁库任务级排程三列随 users 节同步——从节点
+	// 提升为主后调度直接生效（镜像 CL41-1 自动备份组）。指针+omitempty 缺席
+	// 语义：旧主端快照缺该组时从端 apply 跳过写入、保留本地设置，不清零；
+	// 新主端装载恒非 nil（COALESCE 兜底），快照恒携带。
+	ThreatAutoUpdate   *bool   `json:"threat_auto_update,omitempty"`
+	ThreatScheduleDays *string `json:"threat_schedule_days,omitempty"`
+	ThreatScheduleTime *string `json:"threat_schedule_time,omitempty"`
 }
 
 type ClusterUser struct {
@@ -394,6 +401,9 @@ type ClusterSecurityCRSVersion struct {
 	Trigger      string `json:"trigger"`
 	StartedAt    string `json:"started_at"`
 	FinishedAt   string `json:"finished_at"`
+	// L5-67-01（第 67 轮审计）：定时更新排程两列随版本行同步（升主即生效）。
+	ScheduleDays string `json:"schedule_days"`
+	ScheduleTime string `json:"schedule_time"`
 }
 
 type ClusterSecurityIP2RegionVersion struct {
@@ -408,6 +418,9 @@ type ClusterSecurityIP2RegionVersion struct {
 	Trigger      string `json:"trigger"`
 	StartedAt    string `json:"started_at"`
 	FinishedAt   string `json:"finished_at"`
+	// L5-67-01（第 67 轮审计）：定时更新排程两列随版本行同步（升主即生效）。
+	ScheduleDays string `json:"schedule_days"`
+	ScheduleTime string `json:"schedule_time"`
 }
 
 func (snapshot ClusterSnapshot) MarshalJSON() ([]byte, error) {

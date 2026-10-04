@@ -1171,6 +1171,9 @@ const submitMigrate = async (): Promise<void> => {
     if (data && data.remapped > 0) parts.push(`重映射 ${data.remapped} 条规则绑定`)
     if (data && !data.deleted_original) parts.push('原策略因仍在使用未删除')
     mfaAwareSuccess(parts.length > 0 ? parts.join('；') : '更新迁移完成')
+    // 退化 200+后缀（Caddy 应用失败但 DB 已提交）须持续警告可见——
+    // 有后缀才弹，无后缀不重复 toast（同下方保存主链路 FE1 口径）
+    if (res.message?.includes('Caddy 配置应用失败')) showSaveResult(res, '')
     if (data && data.skipped.length > 0) {
       ElMessage.warning(`${data.skipped.length} 条规则跳过：${data.skipped.map((s) => s.reason).join('；')}`)
     }

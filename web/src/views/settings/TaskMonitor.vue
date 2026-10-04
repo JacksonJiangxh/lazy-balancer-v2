@@ -232,7 +232,7 @@
           <el-descriptions-item v-if="detailTask.last_run" label="开始时间">{{ fmtTime(detailTask.last_run.started_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="完成时间">{{ detailTask.status === 'running' ? '进行中' : fmtTime(detailTask.last_run.finished_at) || '—' }}</el-descriptions-item>
           <el-descriptions-item v-if="detailTask.last_run" label="耗时">{{ fmtDuration(detailTask.last_run.duration_ms) }}</el-descriptions-item>
-          <el-descriptions-item v-if="detailTask.last_run" label="触发 / 结果">{{ triggerLabel(detailTask.last_run.trigger) }} · <el-tag size="small" :type="resultTagType(detailTask.last_run.result)">{{ statusResultLabel(detailTask.last_run.result) }}</el-tag></el-descriptions-item>
+          <el-descriptions-item v-if="detailTask.last_run" label="触发 / 结果">{{ triggerLabel(detailTask.last_run.trigger) }} · {{ detailTask.last_run.operator || '系统' }} · <el-tag size="small" :type="resultTagType(detailTask.last_run.result)">{{ statusResultLabel(detailTask.last_run.result) }}</el-tag></el-descriptions-item>
         </el-descriptions>
         <div v-if="detailTask.last_run?.message" class="tm-detail-msg">{{ detailTask.last_run.message }}</div>
         <template v-if="history.length">
@@ -246,6 +246,10 @@
             </el-table-column>
             <el-table-column prop="trigger" label="触发" width="72">
               <template #default="{ row }">{{ triggerLabel(row.trigger) }}</template>
+            </el-table-column>
+            <el-table-column label="操作者" width="90">
+              <!-- operator 为空=自动/排程/启动等系统触发（后端 auto/startup/legacy 恒空） -->
+              <template #default="{ row }">{{ row.operator || '系统' }}</template>
             </el-table-column>
             <el-table-column prop="status" label="结果" width="88">
               <template #default="{ row }">

@@ -30,6 +30,9 @@ const (
 	IP2RegionStatusReloading   IP2RegionUpdateStatus = "reloading"
 	IP2RegionStatusSuccess     IP2RegionUpdateStatus = "success"
 	IP2RegionStatusFailed      IP2RegionUpdateStatus = "failed"
+	// IP2RegionStatusSkipped U2-67-01（第 67 轮审计）：起点角色复查中止的正常语义
+	// 终态——镜像 CRS 侧 U2-66-05（第 66 轮漏收敛本侧；从节点中止非故障）。
+	IP2RegionStatusSkipped IP2RegionUpdateStatus = "skipped"
 )
 
 // IP2RegionUpdateManager runs ip2region xdb updates single-flight and persists
@@ -183,8 +186,12 @@ func (m *IP2RegionUpdateManager) setStage(status IP2RegionUpdateStatus, message 
 	m.state.message = message
 	m.mu.Unlock()
 	level := "INFO"
-	if status == IP2RegionStatusFailed {
+	switch status {
+	case IP2RegionStatusFailed:
 		level = "ERROR"
+	case IP2RegionStatusSkipped:
+		// U2-67-01：跳过语义用 WARN（镜像 CRS 侧 U2-66-05，对齐威胁族 WARN skipped）。
+		level = "WARN"
 	}
 	writeIP2RegionUpdateLog(level, string(status), message)
 }
@@ -205,7 +212,8 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 		// 状态中文归一（U2-P5-08b：曾混英文 status token，与 threat 族口径不一）
 		statusLabel := map[string]string{
 			string(IP2RegionStatusSuccess): "成功", string(IP2RegionStatusFailed): "失败",
-			string(IP2RegionStatusIdle): "空闲", string(IP2RegionStatusChecking): "检测中",
+			string(IP2RegionStatusSkipped): "跳过",
+			string(IP2RegionStatusIdle):    "空闲", string(IP2RegionStatusChecking): "检测中",
 		}[status]
 		if statusLabel == "" {
 			statusLabel = status
@@ -236,7 +244,9 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 	// 调度器 tick 的 COALESCE(is_master,1) 同口径（历史 NULL 视为主节点）。
 	var isMaster bool
 	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
-		m.setStage(IP2RegionStatusFailed, "当前节点为从节点，终止 IP2Region 更新")
+		// U2-67-01（第 67 轮审计）：从节点中止是正常跳过语义，镜像 CRS——
+		// 落 skipped 终态、审计「更新跳过」，不再记「更新失败」。
+		m.setStage(IP2RegionStatusSkipped, "当前节点为从节点，终止 IP2Region 更新")
 		return
 	}
 

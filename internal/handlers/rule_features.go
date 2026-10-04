@@ -24,6 +24,8 @@ type ruleFeatureInput struct {
 	EnableTLS                  bool
 	TLSHTTPRedirect            bool
 	DynamicDNS                 bool
+	EnableDnsServer            bool
+	DnsServer                  string
 	EnabledUpstreamCount       int
 	EnabledUpstreamHosts       []string
 	DnsFamily                  string
@@ -65,6 +67,8 @@ func createRuleFeatures(req models.CreateRuleRequest) ruleFeatureInput {
 		EnableTLS:                  req.EnableTLS,
 		TLSHTTPRedirect:            req.TLSHTTPRedirect,
 		DynamicDNS:                 req.DynamicDNS,
+		EnableDnsServer:            req.EnableDnsServer,
+		DnsServer:                  req.DnsServer,
 		EnabledUpstreamCount:       enabledUpstreams,
 		EnabledUpstreamHosts:       enabledHosts,
 		DnsFamily:                  req.DnsFamily,
@@ -109,6 +113,8 @@ func updateRuleFeatures(req models.UpdateRuleRequest, existing models.LbRule) ru
 		EnableTLS:                  existing.EnableTLS,
 		TLSHTTPRedirect:            existing.TLSHTTPRedirect,
 		DynamicDNS:                 existing.DynamicDNS,
+		EnableDnsServer:            existing.EnableDnsServer,
+		DnsServer:                  existing.DnsServer,
 		EnabledUpstreamCount:       enabledUpstreams,
 		EnabledUpstreamHosts:       enabledHosts,
 		DnsFamily:                  existing.DnsFamily,
@@ -128,6 +134,12 @@ func updateRuleFeatures(req models.UpdateRuleRequest, existing models.LbRule) ru
 	}
 	if req.DynamicDNS != nil {
 		input.DynamicDNS = *req.DynamicDNS
+	}
+	if req.EnableDnsServer != nil {
+		input.EnableDnsServer = *req.EnableDnsServer
+	}
+	if req.DnsServer != nil {
+		input.DnsServer = *req.DnsServer
 	}
 	// DnsFamily 为非指针（handler 预合并），空串=未变更沿用 existing。
 	if req.DnsFamily != "" {
@@ -317,6 +329,14 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 		// 看门狗亦不标记——保存前不拒绝即静默死规则。与 I-5（TCP+cookie）同口径。
 		if input.DynamicDNS {
 			return fmt.Errorf("TCP 规则不支持动态上游（dynamic_dns），请关闭动态 DNS 或改用 HTTP 协议")
+		}
+		// U4-P4-1（第 67 轮）：enable_dns_server/dns_server 同为 HTTP 语义
+		// （L4 直拨 IP:port，无 resolver 消费点）——此前拒绝清单漏列，用户可
+		// 在 TCP 规则携带 DNS 配置落库但永不生效且无告警（对照 dynamic_dns
+		// 有本门+渲染告警双保险）。协议切换的零值化（rules.go LB40-2 块）
+		// 与存量迁移（db.migrateTCPRuleStaleDNSServer）已清空，显式携带即拒。
+		if input.EnableDnsServer || strings.TrimSpace(input.DnsServer) != "" {
+			return fmt.Errorf("TCP 规则不支持 DNS 服务发现配置（enable_dns_server/dns_server），请关闭或改用 HTTP 协议")
 		}
 		if input.CustomRoutesEnabled || len(input.PathRules) > 0 {
 			return fmt.Errorf("TCP 规则不支持自定义路径规则")

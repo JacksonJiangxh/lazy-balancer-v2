@@ -2412,6 +2412,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	}
 	if err := validateRuleFeatures(ruleFeatureInput{
 		Protocol: rule.Protocol, Strategy: rule.Strategy, DynamicDNS: rule.DynamicDNS,
+		EnableDnsServer: rule.EnableDnsServer, DnsServer: rule.DnsServer,
 		EnabledUpstreamCount: enabledUpstreamCount,
 		// N3(第 16 轮):补 5 字段——C-F2 80 自环门与 R67 C-N3 地址族门在复制
 		// 路径此前因零值恒不触发(注释自述「与 CreateRule 一致」未兑现)。

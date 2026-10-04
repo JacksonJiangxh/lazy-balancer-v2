@@ -108,6 +108,9 @@ func TestClassifyAuditRouteMatrix(t *testing.T) {
 		{"POST", "/api/v1/security/policies/:id/bind", AuditPolicyExplicit},
 		{"DELETE", "/api/v1/security/policies/:id/bind/:caddy_id", AuditPolicyExplicit},
 		{"PUT", "/api/v1/security/crs/auto-update", AuditPolicyExplicit},
+		// 任务触发（U1-P3-1，第 67 轮）：升 Explicit——handler 按
+		// TaskTriggerSelfRecordsAudit 分流补记（非自记族）/跳过（自记族）。
+		{"POST", "/api/v1/system/tasks/:id/trigger", AuditPolicyExplicit},
 		// 三库手动更新：审计由任务体 defer 单记（2026-09-29 裁定+R62 U1-P3-2）。
 		{"POST", "/api/v1/security/crs/update", AuditPolicySkip},
 		{"POST", "/api/v1/security/custom-rules", AuditPolicyExplicit},
@@ -142,5 +145,27 @@ func TestIsReadOnlyWriteRoute_allowsOIDCDiscoveryProbe(t *testing.T) {
 func TestAuditResultText_translates_partial_result(t *testing.T) {
 	if got := AuditResultText("partial"); got != "部分成功" {
 		t.Fatalf("AuditResultText(partial)=%q, want 部分成功", got)
+	}
+}
+
+// U1-P3-1（第 67 轮）：12 个可手动触发族的自记分流必须与现实一致——5 族
+// 任务体自记审计（handler 跳过复记），7 族任务体零审计（handler 补记）。
+// 集合漂移（新增可触发族未评估/自记机制撤销）会在这里当场失败。
+func TestTaskTriggerSelfRecordsAudit_familySplit(t *testing.T) {
+	// Given 5 个自记族（任务体 defer/执行器/载入审计，operator 经 RunContext 归人）
+	for _, id := range []string{"threat", "crs", "ip2region", "auto-backup", "startup:config-load"} {
+		if !TaskTriggerSelfRecordsAudit(id) {
+			t.Fatalf("自记族 %s 应报告 true（handler 复记会双审计，违反 U1-P3-2 单记裁定）", id)
+		}
+	}
+	// When/Then 7 个非自记族报告 false（handler 显式补记「触发/任务监控」）
+	for _, id := range []string{"log-cleanup", "audit-retention", "security-events-retention", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca"} {
+		if TaskTriggerSelfRecordsAudit(id) {
+			t.Fatalf("非自记族 %s 应报告 false（任务体零审计，handler 不补记则手动触发无痕）", id)
+		}
+	}
+	// 未知族按非自记处理（handler 补记——宁多记不遗漏）
+	if TaskTriggerSelfRecordsAudit("no-such-task") {
+		t.Fatal("未知族应报告 false")
 	}
 }

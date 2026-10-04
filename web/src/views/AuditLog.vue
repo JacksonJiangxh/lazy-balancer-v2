@@ -215,6 +215,7 @@ const ACTION_TAG_TABLE: Record<string, string> = {
   '备份下载': 'warning',
   '复制': 'warning',
   '触发签发': 'warning',
+  '触发': 'warning',
   '写入': 'warning',
   '恢复排队': 'warning',
   '续签排队': 'warning',

@@ -1,5 +1,6 @@
 import { ref, computed } from 'vue'
 import { request } from '@/utils/api'
+import { escapeHtml } from '@/utils/escape'
 
 interface BrandingResponse {
   data?: {
@@ -11,13 +12,10 @@ interface BrandingResponse {
 }
 
 export const appName = ref('Lazy Balancer')
-export const footerText = ref('Lazy Balancer V2 · Copyright © 2026 XiaoBao')
+const footerText = ref('Lazy Balancer V2 · Copyright © 2026 XiaoBao')
 // R72 二十九次：发版检查单——发版时需同步 bump 此回退版本。
 export const appVersion = ref('v2.3.4')
 const footerUsesDefault = ref(true)
-
-const escapeHtml = (text: string): string =>
-  text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 
 export const footerHtml = computed(() => {
   if (!footerUsesDefault.value) {

@@ -253,9 +253,10 @@ func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 	result := TaskLogHousekeepingResult{SizeCapMB: int(getTaskLogSizeBytes() / 1024 / 1024)}
 	// B3：tasks 根 + certjobs 子目录统一扫描（证书任务日志并入任务日志体系）
 	dir := filepath.Join(filepath.Dir(logFile), "tasks")
+	certDir := filepath.Join(dir, "certjobs")
 	dirs := []string{dir}
-	if cj := filepath.Join(dir, "certjobs"); cj != dir {
-		dirs = append(dirs, cj)
+	if certDir != dir {
+		dirs = append(dirs, certDir)
 	}
 	type fileInfo struct {
 		path string
@@ -300,7 +301,10 @@ func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 			}
 			continue
 		}
-		if f.info.Size() > sizeCap {
+		// L1-P4-1（第 67 轮）：certjobs/ 尺寸轮转归写入侧预写入轮转单一负责
+		// （5 代移位）；housekeeping 对其只做保留期清理——否则孤儿超阈活动
+		// 文件会被 rename 覆盖 .1 代际（双轨覆盖丢史窗口残留面）。
+		if f.info.Size() > sizeCap && filepath.Dir(f.path) != certDir {
 			if os.Rename(f.path, f.path+".1") == nil { // 轮转保一份
 				result.Rotated = append(result.Rotated, fmt.Sprintf("%s %.1fMB>%dMB", f.name, float64(f.info.Size())/1024/1024, sizeCap/1024/1024))
 			}

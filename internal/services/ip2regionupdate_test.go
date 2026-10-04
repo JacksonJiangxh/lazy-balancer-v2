@@ -1112,3 +1112,40 @@ func TestIP2RegionUpdate_recordsReloadFailureAudit(t *testing.T) {
 		t.Fatalf("reload failure audit rows=%d, want 2（主重载+回滚恢复重载）", n)
 	}
 }
+
+// U2-67-01（第 67 轮审计）：demote 竞态从节点中止口径镜像 CRS（U2-66-05，第
+// 66 轮漏收敛本侧）——起点角色复查中止须落 skipped 终态并审计「更新跳过」，
+// 不得记「更新失败」（从节点中止是正常语义，非故障）。
+func TestIP2RegionUpdateRun_slaveAbortsSkipSemantics(t *testing.T) {
+	m := newTestIP2RegionManager(t)
+	seedIP2RegionVersionRow(t, "v3.0.0", true)
+	if _, err := db.DB.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.0.0", nil }
+
+	// Given 从节点角色（demote 竞态窗口内）；When 经 StartUpdate（生产入口）驱动：
+	// state 置 trigger 后 StatusSnapshot 读内存终态（直调 run() 时 state 无 trigger
+	// 会回退行状态，观察不到中止终态）。
+	done, err := m.StartUpdate("auto", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	// Then 内存终态=skipped（非 failed），审计记「更新跳过」非「更新失败」
+	snap := m.StatusSnapshot()
+	if snap.Status != "skipped" {
+		t.Fatalf("status=%q, want skipped（从节点中止是跳过语义，镜像 CRS）", snap.Status)
+	}
+	var failed, skipped int
+	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE resource='IP2Region数据库' AND action='更新失败'").Scan(&failed); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE resource='IP2Region数据库' AND detail LIKE '%更新跳过%'").Scan(&skipped); err != nil {
+		t.Fatal(err)
+	}
+	if failed != 0 || skipped != 1 {
+		t.Fatalf("failed=%d skipped=%d, want 0/1（从节点中止不得记更新失败）", failed, skipped)
+	}
+}

@@ -108,6 +108,52 @@ func TestConfigWatchdog_skipsOnSlave(t *testing.T) {
 	_ = db.DB
 }
 
+// L1-P4-2（第 67 轮审计）：从节点 WatchdogCheckOnce 整轮短路——看门狗是主节点
+// 专属检测，从节点零心跳簿记、零任务日志（此前从节点每轮空跑：cleanRounds 累积
+// 并逐小时发「配置一致」假心跳，升主前从未真实检查）。循环保持存活，升主后自动
+// 恢复真实检查。
+func TestConfigWatchdog_slaveSkipsWholeRound(t *testing.T) {
+	// Given 从节点角色 + 一条主节点必报漂移的启用规则 + 空运行配置
+	_, database := newClusterTestService(t)
+	if _, err := database.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
+		t.Fatalf("set slave role: %v", err)
+	}
+	seedGenerationRule(t, database, "lb_watchdog_slave_round", false)
+	resetConfigWatchdogForTest(t)
+	newTaskLogDir(t)
+	server := fakeCaddyWithRoutes(t, emptyCaddyConfig)
+	watchdogAdminURLValue = server.URL
+	t.Cleanup(func() { watchdogAdminURLValue = "" })
+	// When 从节点连打两轮心跳窗口（120 轮）
+	for range 2 * configWatchdogHeartbeatRounds {
+		WatchdogCheckOnce()
+	}
+
+	// Then 零任务日志（无假心跳）+ 心跳计数零累积 + 零漂移态（整轮短路）
+	if data, err := os.ReadFile(taskengine.TaskLogPath("config-watchdog")); err == nil && len(strings.TrimSpace(string(data))) > 0 {
+		t.Fatalf("从节点应零任务日志行, got %q", data)
+	}
+	configDriftMu.Lock()
+	rounds := configDriftCleanRounds
+	configDriftMu.Unlock()
+	if rounds != 0 {
+		t.Fatalf("从节点心跳计数应零累积, got %d", rounds)
+	}
+	if drift := CurrentConfigDrift(); !drift.Consistent {
+		t.Fatalf("从节点不得置漂移态, got %+v", drift)
+	}
+
+	// 回归形状：升主后同一循环恢复真实检查（空运行配置两轮置漂移态）
+	if _, err := database.Exec("UPDATE global_config SET is_master=1 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	WatchdogCheckOnce()
+	WatchdogCheckOnce()
+	if drift := CurrentConfigDrift(); drift.Consistent {
+		t.Fatal("升主后应恢复真实检查（两轮不一致置漂移态）")
+	}
+}
+
 func TestConfigWatchdog_subRoutesBelongToParentRule(t *testing.T) {
 	// Given：运行配置含子路由 @id（lb_x_redirect / lb_x_path_0）——R36 WD-1 误报场景
 	_, database := newClusterTestService(t)

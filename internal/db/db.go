@@ -1243,6 +1243,10 @@ func runMigrations() error {
 	if err := migrateTCPRuleStaleTLS(); err != nil {
 		return fmt.Errorf("failed to migrate tcp rule stale tls: %w", err)
 	}
+	// U4-P4-1（第 67 轮）：紧随 StaleTLS——同为 TCP 死配置清理族，谓词互不重叠。
+	if err := migrateTCPRuleStaleDNSServer(); err != nil {
+		return fmt.Errorf("failed to migrate tcp rule stale dns server: %w", err)
+	}
 
 	// Drop legacy columns from upstreams if they still exist (no longer used).
 	legacyUpstreamHostHeaderColumns := []string{"host_header"}
@@ -1764,6 +1768,54 @@ func migrateTCPRuleStaleTLS() error {
 	}
 	for _, rule := range stale {
 		detail := fmt.Sprintf("存量 TCP 规则携带无效 TLS 状态（空证书），已归一为关闭 TLS：caddy_id=%s name=%s", rule.caddyID, rule.name)
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "系统配置", detail)
+	}
+	return nil
+}
+
+// migrateTCPRuleStaleDNSServer 一次性迁移（U4-P4-1，第 67 轮审计）：存量
+// protocol='tcp' 行可携带 enable_dns_server=1 / dns_server 非空——两字段是
+// HTTP 侧 DNS 服务发现语义，TCP 渲染路径（caddy.go L4 分支）永不消费且无
+// 告警，落库即死配置并随快照/导出/复制放大（保存侧已补 400 拒绝，本迁移清理
+// 存量）。归一为 enable_dns_server=0 + dns_server=”（与 UpdateRule 切换到
+// TCP 的零值化分支同语义）；HTTP 行同名字段是合法配置不受影响。幂等，重跑
+// 零命中。
+func migrateTCPRuleStaleDNSServer() error {
+	rows, err := DB.Query(`SELECT caddy_id, name FROM lb_rules
+		WHERE protocol='tcp' AND (IIF(enable_dns_server IN ('1',1),1,0)=1 OR TRIM(COALESCE(dns_server,''))<>'')`)
+	if err != nil {
+		return fmt.Errorf("failed to query tcp rules with stale dns server: %w", err)
+	}
+	type staleDNSRule struct {
+		caddyID string
+		name    string
+	}
+	var stale []staleDNSRule
+	for rows.Next() {
+		var rule staleDNSRule
+		if err := rows.Scan(&rule.caddyID, &rule.name); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to scan tcp rules with stale dns server: %w", err)
+		}
+		stale = append(stale, rule)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("failed to iterate tcp rules with stale dns server: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("failed to close tcp rules with stale dns server: %w", err)
+	}
+	if len(stale) == 0 {
+		return nil
+	}
+	if _, err := DB.Exec(`UPDATE lb_rules SET enable_dns_server=0, dns_server=''
+		WHERE protocol='tcp' AND (IIF(enable_dns_server IN ('1',1),1,0)=1 OR TRIM(COALESCE(dns_server,''))<>'')`); err != nil {
+		return fmt.Errorf("failed to normalize tcp rules with stale dns server: %w", err)
+	}
+	for _, rule := range stale {
+		detail := fmt.Sprintf("存量 TCP 规则携带无效 DNS 服务发现配置（渲染永不消费），已清空 enable_dns_server/dns_server：caddy_id=%s name=%s", rule.caddyID, rule.name)
 		log.Print(detail)
 		recordSystemAudit("启动迁移", "系统配置", detail)
 	}

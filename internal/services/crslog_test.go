@@ -58,3 +58,44 @@ func TestTaskLogsHousekeeping_rotatesAtConfiguredThreshold(t *testing.T) {
 	}
 	// Rename 语义：原文件移 .1，新文件由下次写入重建（不预建空文件）。
 }
+
+// L1-P4-1 收尾（第 67 轮 C2 残余收口）：certjobs/ 尺寸轮转归写入侧预写入轮转
+// 单一负责（5 代移位），housekeeping 对 certjobs/ 只做保留期清理、不做尺寸轮转——
+// 否则孤儿超阈活动文件会被 rename 覆盖 .1 代际（双轨覆盖丢史窗口的残留面）。
+func TestTaskLogsHousekeeping_certjobsExemptFromSizeRotation(t *testing.T) {
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec("UPDATE global_config SET task_log_size_mb = 1 WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	certJobLogSizeCachedAt.Store(0)
+	t.Cleanup(func() { certJobLogSizeCachedAt.Store(0) })
+
+	logsDir := t.TempDir()
+	certDir := logsDir + "/tasks/certjobs"
+	if err := os.MkdirAll(certDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 孤儿超阈活动文件 + 既有 .1 代际（双轨窗口的历史形态）
+	if err := os.WriteFile(certDir+"/lb_orphan.log", []byte(strings.Repeat("x", 2*1024*1024)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certDir+"/lb_orphan.log.1", []byte("GEN-1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	taskLogsHousekeeping(logsDir + "/app.log")
+
+	// Then: 不尺寸轮转——活动文件原位、.1 代际不被覆盖、无 .1.1 垃圾
+	if _, err := os.Stat(certDir + "/lb_orphan.log"); err != nil {
+		t.Fatalf("certjobs 活动文件不应被轮转移走: %v", err)
+	}
+	data, err := os.ReadFile(certDir + "/lb_orphan.log.1")
+	if err != nil || string(data) != "GEN-1" {
+		t.Fatalf("certjobs .1 代际不应被覆盖, err=%v 内容=%q", err, data)
+	}
+	if _, err := os.Stat(certDir + "/lb_orphan.log.1.1"); !os.IsNotExist(err) {
+		t.Fatalf("不应产生 .1.1 垃圾文件")
+	}
+}

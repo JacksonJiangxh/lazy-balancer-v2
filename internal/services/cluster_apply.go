@@ -940,9 +940,13 @@ func applySecurityBlockPages(ctx context.Context, tx *sql.Tx, pages []models.Sec
 
 func applySecurityCRSVersion(ctx context.Context, tx *sql.Tx, versions []models.ClusterSecurityCRSVersion) error {
 	for _, version := range versions {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO security_crs_version (id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		// L5-67-01（第 67 轮审计）：schedule_days/schedule_time 随版本行全量替换
+		// 落库（升主即生效）；空串来源=旧主端快照缺列，读取端 normalizeScheduleRow
+		// 回落默认，与 NOT NULL 约束兼容。
+		if _, err := tx.ExecContext(ctx, `INSERT INTO security_crs_version (id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			version.ID, version.Version, nullableString(version.UpdatedAt), version.AutoUpdate, version.UpdateStatus, version.Message,
-			nullableString(version.LastChecked), nullableString(version.NextUpdate), nullableString(version.Trigger), nullableString(version.StartedAt), nullableString(version.FinishedAt)); err != nil {
+			nullableString(version.LastChecked), nullableString(version.NextUpdate), nullableString(version.Trigger), nullableString(version.StartedAt), nullableString(version.FinishedAt),
+			version.ScheduleDays, version.ScheduleTime); err != nil {
 			return fmt.Errorf("写入快照 CRS 版本 %d: %w", version.ID, err)
 		}
 	}
@@ -951,9 +955,11 @@ func applySecurityCRSVersion(ctx context.Context, tx *sql.Tx, versions []models.
 
 func applySecurityIP2RegionVersion(ctx context.Context, tx *sql.Tx, versions []models.ClusterSecurityIP2RegionVersion) error {
 	for _, version := range versions {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO security_ip2region_version (id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		// L5-67-01：同 CRS 侧——排程两列随版本行全量替换落库。
+		if _, err := tx.ExecContext(ctx, `INSERT INTO security_ip2region_version (id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			version.ID, version.Version, nullableString(version.UpdatedAt), version.AutoUpdate, version.UpdateStatus, version.Message,
-			nullableString(version.LastChecked), nullableString(version.NextUpdate), nullableString(version.Trigger), nullableString(version.StartedAt), nullableString(version.FinishedAt)); err != nil {
+			nullableString(version.LastChecked), nullableString(version.NextUpdate), nullableString(version.Trigger), nullableString(version.StartedAt), nullableString(version.FinishedAt),
+			version.ScheduleDays, version.ScheduleTime); err != nil {
 			return fmt.Errorf("写入快照 ip2region 版本 %d: %w", version.ID, err)
 		}
 	}
@@ -1131,35 +1137,48 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	// CL41-1(第 41 轮审计):自动备份设置组随 users 节落库。指针缺席=旧主端
 	// 快照未携带该组——跳过写入保留从端本地值(镜像 branding_json 缺席语义,
 	// 不清零);新主端恒携带全组。last_run 为节点本地运行态,永不在此写入。
-	var abClauses []string
-	var abArgs []any
+	// L5-67-01(第 67 轮审计):威胁库任务级排程三列同口径入块(升主即生效)。
+	var settingClauses []string
+	var settingArgs []any
 	if settings.AutoBackupEnabled != nil {
-		abClauses = append(abClauses, "auto_backup_enabled=?")
-		abArgs = append(abArgs, *settings.AutoBackupEnabled)
+		settingClauses = append(settingClauses, "auto_backup_enabled=?")
+		settingArgs = append(settingArgs, *settings.AutoBackupEnabled)
 	}
 	if settings.AutoBackupFrequency != nil {
-		abClauses = append(abClauses, "auto_backup_frequency=?")
-		abArgs = append(abArgs, *settings.AutoBackupFrequency)
+		settingClauses = append(settingClauses, "auto_backup_frequency=?")
+		settingArgs = append(settingArgs, *settings.AutoBackupFrequency)
 	}
 	if settings.AutoBackupTime != nil {
-		abClauses = append(abClauses, "auto_backup_time=?")
-		abArgs = append(abArgs, *settings.AutoBackupTime)
+		settingClauses = append(settingClauses, "auto_backup_time=?")
+		settingArgs = append(settingArgs, *settings.AutoBackupTime)
 	}
 	if settings.AutoBackupDay != nil {
-		abClauses = append(abClauses, "auto_backup_day=?")
-		abArgs = append(abArgs, *settings.AutoBackupDay)
+		settingClauses = append(settingClauses, "auto_backup_day=?")
+		settingArgs = append(settingArgs, *settings.AutoBackupDay)
 	}
 	if settings.AutoBackupKeep != nil {
-		abClauses = append(abClauses, "auto_backup_keep=?")
-		abArgs = append(abArgs, *settings.AutoBackupKeep)
+		settingClauses = append(settingClauses, "auto_backup_keep=?")
+		settingArgs = append(settingArgs, *settings.AutoBackupKeep)
 	}
 	if settings.AutoBackupSections != nil {
-		abClauses = append(abClauses, "auto_backup_sections=?")
-		abArgs = append(abArgs, *settings.AutoBackupSections)
+		settingClauses = append(settingClauses, "auto_backup_sections=?")
+		settingArgs = append(settingArgs, *settings.AutoBackupSections)
 	}
-	if len(abClauses) > 0 {
-		if _, err := tx.ExecContext(ctx, `UPDATE global_config SET `+strings.Join(abClauses, ",")+` WHERE id=1`, abArgs...); err != nil {
-			return fmt.Errorf("写入快照自动备份设置: %w", err)
+	if settings.ThreatAutoUpdate != nil {
+		settingClauses = append(settingClauses, "threat_auto_update=?")
+		settingArgs = append(settingArgs, *settings.ThreatAutoUpdate)
+	}
+	if settings.ThreatScheduleDays != nil {
+		settingClauses = append(settingClauses, "threat_schedule_days=?")
+		settingArgs = append(settingArgs, *settings.ThreatScheduleDays)
+	}
+	if settings.ThreatScheduleTime != nil {
+		settingClauses = append(settingClauses, "threat_schedule_time=?")
+		settingArgs = append(settingArgs, *settings.ThreatScheduleTime)
+	}
+	if len(settingClauses) > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE global_config SET `+strings.Join(settingClauses, ",")+` WHERE id=1`, settingArgs...); err != nil {
+			return fmt.Errorf("写入快照扩展设置: %w", err)
 		}
 	}
 	return nil
@@ -1212,23 +1231,25 @@ func snapshotSecurityVersionRowsDiffer(ctx context.Context, tx *sql.Tx, snapshot
 	wantIP2R := snapJSON(snapshot.SecurityIP2RegionVersion)
 
 	localCRS := make([]models.ClusterSecurityCRSVersion, 0)
-	rows, err := tx.QueryContext(ctx, `SELECT id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,'') FROM security_crs_version ORDER BY id`)
+	// L5-67-01（第 67 轮审计）：本地行读取列与快照 dump（cluster_snapshot.go）
+	// 逐列对齐——差分口径分叉会使排程列变化永判「无差异」而跳过重放。
+	rows, err := tx.QueryContext(ctx, `SELECT id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,''),COALESCE(schedule_days,'1,2,3,4,5,6,7'),COALESCE(schedule_time,'04:00') FROM security_crs_version ORDER BY id`)
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
 			var v models.ClusterSecurityCRSVersion
-			if err := rows.Scan(&v.ID, &v.Version, &v.UpdatedAt, &v.AutoUpdate, &v.UpdateStatus, &v.Message, &v.LastChecked, &v.NextUpdate, &v.Trigger, &v.StartedAt, &v.FinishedAt); err == nil {
+			if err := rows.Scan(&v.ID, &v.Version, &v.UpdatedAt, &v.AutoUpdate, &v.UpdateStatus, &v.Message, &v.LastChecked, &v.NextUpdate, &v.Trigger, &v.StartedAt, &v.FinishedAt, &v.ScheduleDays, &v.ScheduleTime); err == nil {
 				localCRS = append(localCRS, v)
 			}
 		}
 	}
 	localIP2R := make([]models.ClusterSecurityIP2RegionVersion, 0)
-	rows2, err2 := tx.QueryContext(ctx, `SELECT id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,'') FROM security_ip2region_version ORDER BY id`)
+	rows2, err2 := tx.QueryContext(ctx, `SELECT id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,''),COALESCE(schedule_days,'1,2,3,4,5,6,7'),COALESCE(schedule_time,'04:00') FROM security_ip2region_version ORDER BY id`)
 	if err2 == nil {
 		defer rows2.Close()
 		for rows2.Next() {
 			var v models.ClusterSecurityIP2RegionVersion
-			if err := rows2.Scan(&v.ID, &v.Version, &v.UpdatedAt, &v.AutoUpdate, &v.UpdateStatus, &v.Message, &v.LastChecked, &v.NextUpdate, &v.Trigger, &v.StartedAt, &v.FinishedAt); err == nil {
+			if err := rows2.Scan(&v.ID, &v.Version, &v.UpdatedAt, &v.AutoUpdate, &v.UpdateStatus, &v.Message, &v.LastChecked, &v.NextUpdate, &v.Trigger, &v.StartedAt, &v.FinishedAt, &v.ScheduleDays, &v.ScheduleTime); err == nil {
 				localIP2R = append(localIP2R, v)
 			}
 		}

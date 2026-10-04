@@ -737,6 +737,44 @@ func TestClusterVersionTrigger_lastCheckedExcluded(t *testing.T) {
 	}
 }
 
+// L5-67-01（第 67 轮审计）：三规则库排程列入集群同步——版本表 schedule_days/
+// schedule_time 与 global_config 威胁库三列（threat_auto_update/threat_schedule_days/
+// threat_schedule_time）自身入触发器 OF 列表：排程写入即 bump cluster_version，
+// 从端经 304 失效收敛。（生产排程保存同语句还写 next_update——本测试刻意只写
+// 排程列，钉排程列自身的 OF 成员资格，而非搭车 next_update 的偶然 bump。）
+func TestClusterVersionTrigger_ruleLibScheduleBumps(t *testing.T) {
+	database := newClusterVersionTestDB(t)
+	if err := installClusterVersionTriggers(database); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT OR IGNORE INTO security_crs_version (id, version) VALUES (1, '4.28.0')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT OR IGNORE INTO security_ip2region_version (id, version) VALUES (1, 'v3.17.0')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	steps := []struct {
+		name string
+		stmt string
+	}{
+		{"crs 排程列", `UPDATE security_crs_version SET schedule_days='2', schedule_time='04:30' WHERE id=1`},
+		{"ip2region 排程列", `UPDATE security_ip2region_version SET schedule_days='1,3,5', schedule_time='23:15' WHERE id=1`},
+		{"威胁库排程列", `UPDATE global_config SET threat_schedule_days='7', threat_schedule_time='05:00' WHERE id=1`},
+		{"威胁库总开关", `UPDATE global_config SET threat_auto_update=0 WHERE id=1`},
+	}
+	for i, step := range steps {
+		if _, err := database.Exec(step.stmt); err != nil {
+			t.Fatalf("%s: %v", step.name, err)
+		}
+		if got := clusterVersion(t, database); got != i+1 {
+			t.Fatalf("%s 写入后 cluster_version=%d, want %d（排程列须入 OF 触发 bump）", step.name, got, i+1)
+		}
+	}
+}
+
 // branding_json 入 OF 列表(2026-09-11):主节点镜像写入 bump cluster_version,
 // 使快照缓存失效、变更流向从节点。
 func TestClusterVersionTrigger_brandingJSONBumps(t *testing.T) {

@@ -57,6 +57,14 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务运行中，请稍后重试"})
 				return
 			}
+			// U1-P3-1（第 67 轮）：非自记族（log-cleanup 等 7 族任务体零审计）
+			// 由 handler 显式补记「触发」——此前路由整族 Skip 豁免，手动（更高
+			// 特权）触发反而无痕。自记族（threat/crs/ip2region/auto-backup/
+			// startup:config-load）任务体 defer/执行器已单记且 operator 经
+			// RunContext 归人，handler 复记会违反 U1-P3-2 单记裁定。
+			if !services.TaskTriggerSelfRecordsAudit(id) {
+				recordAudit(c, "触发", "任务监控", "手动触发任务 "+m.Name)
+			}
 			go func() {
 				_ = te.Trigger(id, "manual", auditOperator(c)) // 异步——耗时由 task_runs 记录；operator 审计归人
 			}()

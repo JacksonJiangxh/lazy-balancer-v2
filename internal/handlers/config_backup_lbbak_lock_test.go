@@ -8,6 +8,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -125,6 +126,57 @@ func TestApplyLbbakWafFiles_blocks_while_waf_file_lock_held(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("锁释放后 applyLbbakWafFiles 10s 内未完成")
+	}
+}
+
+// ── L6-67-01（第 67 轮）：lbbak 导出侧 BuildWafFileBundle 读相位必须受 wafFileMu 互斥 ──
+
+// Given wafFileMu 被预持（模拟并发的三库更新器/lbbak 导入文件写相位）。
+// When buildLbbakExport 勾选「安全防护」分类（触发 BuildWafFileBundle 读 CRS
+// 树/xdb/威胁 .fast）执行导出。
+// Then 必须阻塞至锁释放——读侧不入锁会在写者交换树/重写 .fast 中途打出残缺
+// bundle（manifest sha256 按内存字节自洽仍通过，还原后 WAF 静默降级）。
+// 回归形状：锁释放后导出完成且载荷完整（无锁竞争时导出正常产出）。
+func TestBuildLbbakExport_blocks_while_waf_file_lock_held(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	crsDir, _ := overrideTestWafPaths(t)
+	if err := os.WriteFile(filepath.Join(crsDir, "VERSION"), []byte("v4.29.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", "REQUEST-901.conf"), []byte("SecRule a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	type exportResult struct {
+		payload          []byte
+		includesWafFiles bool
+		err              error
+	}
+	services.WafFileLock().Lock()
+	done := make(chan exportResult, 1)
+	go func() {
+		payload, _, _, includesWafFiles, err := h.buildLbbakExport(context.Background(), []string{"security"})
+		done <- exportResult{payload, includesWafFiles, err}
+	}()
+	select {
+	case <-done:
+		services.WafFileLock().Unlock()
+		t.Fatal("buildLbbakExport 在 wafFileMu 被预持期间完成——导出读相位未入锁")
+	case <-time.After(300 * time.Millisecond):
+	}
+	services.WafFileLock().Unlock()
+	var res exportResult
+	select {
+	case res = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("锁释放后 buildLbbakExport 10s 内未完成")
+	}
+	// 回归形状：无锁竞争时导出正常产出（载荷可解析且携带 waf 文件节）。
+	if res.err != nil {
+		t.Fatalf("导出失败: %v", res.err)
+	}
+	if !res.includesWafFiles || len(res.payload) == 0 {
+		t.Fatalf("导出应携带 waf 文件节且载荷非空: includesWafFiles=%v len=%d", res.includesWafFiles, len(res.payload))
 	}
 }
 

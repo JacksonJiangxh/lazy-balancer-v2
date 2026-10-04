@@ -260,7 +260,12 @@ func (h *Handlers) MFADisable(c *gin.Context) {
 
 // MFARecoveryCodes POST /auth/mfa/recovery-codes — 重生成恢复码（2026-09 用户
 // 裁定：登录后不再有密码输入要求，JWT 会话即确认；会话安全为信任边界）。
+// U7a-P5-1（第 67 轮）：补 OIDC 门——五个 MFA 写入口仅此一处缺席，与
+// setup/activate/disable 同为自助端点，targetUserID=0（操作自己，从 JWT 取）。
 func (h *Handlers) MFARecoveryCodes(c *gin.Context) {
+	if rejectOIDCUserMFAOperation(c, 0) {
+		return
+	}
 	if !guardAuthJSONBody(c) {
 		return
 	}

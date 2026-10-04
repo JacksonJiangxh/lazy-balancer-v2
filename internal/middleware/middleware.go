@@ -1100,7 +1100,7 @@ func mfaStepUpGuard() gin.HandlerFunc {
 		// 在本守卫之后的 admin 组，从节点 MFA 用户此前先收 428、输码重试后才见
 		// 403 真因。此处按只读门同法查询（COALESCE 兜底）；从节点直接 403，
 		// 查询失败与只读门同语义 fail-closed 500。verify-step/logout 已在上游
-		// 豁免，本判定只影响本将收到 428 的写请求（从节点的敏感 GET 导出不受影响）。
+		// 豁免，本判定影响本将收到 428 的写请求与敏感 GET 导出（从节点敏感 GET 导出现同此短路，直收 403，不再先 428——U7c-P5-1 注释勘正）。
 		var isMaster bool
 		database := db.GetDB()
 		if database == nil {

@@ -324,6 +324,21 @@ func (e *Engine) Trigger(id, trigger, operator string) error {
 
 // RunSync 同步执行一次并返回 runID（handler 直调入口——响应需要行视图）。
 func (e *Engine) RunSync(id, trigger, operator string) (int64, error) {
+	e.mu.RLock()
+	r := e.regs[id]
+	e.mu.RUnlock()
+	if r == nil {
+		return 0, ErrNotFound
+	}
+	// U1-P4-4（第 67 轮）：与 Trigger 同型守卫——常驻任务仅引擎调度（启停即可），
+	// RunSync 直调会绕过 startDaemon 生命周期挂钩与常驻循环双跑（防御缺口：
+	// 当前调用面未触达，B 批裁定语义=常驻任务仅引擎调度）。
+	if r.desc.Kind == KindDaemon {
+		return 0, errors.New("taskengine: 常驻任务不支持手动触发（启停即可）")
+	}
+	if r.desc.MasterOnly && !e.isMaster() {
+		return 0, errors.New("taskengine: 该操作仅允许在主节点执行")
+	}
 	return e.runNow(id, trigger, operator)
 }
 

@@ -81,11 +81,10 @@ func masterSyncServingLoop(ctx context.Context) {
 }
 
 type masterServingNode struct {
-	id       int64
-	name     string
-	seenRaw  string
-	version  int
-	interval int
+	id      int64
+	name    string
+	seenRaw string
+	version int
 }
 
 // masterSyncServingRound 执行一轮巡检（facts 读取→异常判定→零噪音落日志）。
@@ -99,14 +98,18 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	if db.DB == nil {
 		return
 	}
-	var clusterVersion int
+	var clusterVersion, syncInterval int
+	// L2-67-01（第 67 轮审计）：离线阈值跟随全局同步间隔——sync_interval 与
+	// cluster_sync 同口径读 global_config（COALESCE 60 兜底）；nodes.sync_interval
+	// 是写侧（RegisterNode/ReportNode）从不写的死列（schema 默认 60），读它会把
+	// 阈值钉死在 120s 下限，真实 interval>120s 时逐轮误报离线。
 	if err := db.DB.QueryRowContext(ctx,
-		`SELECT COALESCE(cluster_version,0) FROM global_config WHERE id=1`).Scan(&clusterVersion); err != nil {
-		TaskLogfWarn("cluster-sync", "serving", "巡检失败：读取集群版本失败（下一轮重试）：%v", err)
+		`SELECT COALESCE(cluster_version,0), COALESCE(sync_interval,60) FROM global_config WHERE id=1`).Scan(&clusterVersion, &syncInterval); err != nil {
+		TaskLogfWarn("cluster-sync", "serving", "巡检失败：读取集群版本与同步间隔失败（下一轮重试）：%v", err)
 		return
 	}
 	rows, err := db.DB.QueryContext(ctx,
-		`SELECT id, COALESCE(name,''), COALESCE(last_seen,''), COALESCE(reported_version,0), COALESCE(sync_interval,60)
+		`SELECT id, COALESCE(name,''), COALESCE(last_seen,''), COALESCE(reported_version,0)
 		 FROM nodes WHERE is_approved=1 AND mode='slave'`)
 	if err != nil {
 		TaskLogfWarn("cluster-sync", "serving", "巡检失败：读取节点表失败（下一轮重试）：%v", err)
@@ -115,7 +118,7 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	var nodes []masterServingNode
 	for rows.Next() {
 		var n masterServingNode
-		if err := rows.Scan(&n.id, &n.name, &n.seenRaw, &n.version, &n.interval); err == nil {
+		if err := rows.Scan(&n.id, &n.name, &n.seenRaw, &n.version); err == nil {
 			nodes = append(nodes, n)
 		}
 	}
@@ -128,14 +131,15 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 
 	seen := make(map[int64]bool, len(nodes))
 	online, offlineCount, lagging := 0, 0, 0
+	// 每节点阈值=max(2×全局 sync_interval, 下限 120s)——同一轮全节点同值（全局列）。
+	threshold := time.Duration(2*syncInterval) * time.Second
+	if threshold < masterSyncOfflineThreshold {
+		threshold = masterSyncOfflineThreshold
+	}
 	for _, n := range nodes {
 		seen[n.id] = true
 		lastSeen := parseNodeLastSeen(n.seenRaw)
 		_ = lastSeen
-		threshold := time.Duration(2*n.interval) * time.Second
-		if threshold < masterSyncOfflineThreshold {
-			threshold = masterSyncOfflineThreshold
-		}
 		if lastSeen.IsZero() || now.Sub(lastSeen) > threshold {
 			offlineCount++
 			if !w.offlineAlerted[n.id] {

@@ -361,7 +361,9 @@ func TestIP2RegionUpdateRun_slaveAbortsBeforeFetch(t *testing.T) {
 	m.mu.Lock()
 	state := m.state
 	m.mu.Unlock()
-	if state.status != IP2RegionStatusFailed {
-		t.Fatalf("in-memory status=%q, want failed (aborted on slave)", state.status)
+	// U2-67-01（第 67 轮审计）：从节点中止改为 skipped 终态（镜像 CRS 侧
+	// U2-66-05——跳过语义，非故障）。
+	if state.status != IP2RegionStatusSkipped {
+		t.Fatalf("in-memory status=%q, want skipped (aborted on slave)", state.status)
 	}
 }
