@@ -105,6 +105,8 @@ export const useTrustAssociation = (options: {
           category: 'custom',
           entries: '[]',
         })
+        // 中间跳退化 200+后缀（Caddy 应用失败但 DB 已提交）也须可见——有后缀才弹
+        if (created.message?.includes('Caddy 配置应用失败')) showSaveResult(created, '')
         newId = created.data?.id
       }
       if (!newId) {
@@ -113,7 +115,9 @@ export const useTrustAssociation = (options: {
       }
       const refs = parseRefIds(policy[cfg.refField])
       if (!refs.includes(newId)) {
-        await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...refs, newId]) })
+        const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...refs, newId]) })
+        // 同上：关联中间跳的退化后缀不可静默
+        if (assocRes.message?.includes('Caddy 配置应用失败')) showSaveResult(assocRes, '')
       }
       const added = await request.post<APIResponse<{ added: boolean }>>(`/security/ip-lists/${newId}/ips`, { value: ip })
       showSaveResult(added as unknown as { message?: string }, `已${sameName ? '关联既有' : '创建'}「${policy.name}${cfg.suffix}」并加入 ${ip}`)

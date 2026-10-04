@@ -11,9 +11,9 @@
         class="number-input"
         @update:model-value="update(field.key, $event)"
       />
-      <el-text type="info" size="small" class="tip-inline">
+      <span class="form-tip-inline">
         秒，0 = {{ inheritLabel }}<template v-if="showSuggested && field.suggest">；非流式建议 {{ field.suggest }}</template><template v-if="field.desc">；{{ field.desc }}</template>
-      </el-text>
+      </span>
     </el-form-item>
   </div>
 </template>
@@ -57,9 +57,4 @@ const update = (field: keyof ProxyTimeoutConfig, value: number | undefined): voi
 
 <style scoped>
 .number-input { width: 120px; }
-.tip-inline { margin-left: 8px; line-height: 1.5; }
-
-@media (max-width: 767px) {
-  .tip-inline { flex-basis: 100%; margin-top: 4px; margin-left: 0; }
-}
 </style>

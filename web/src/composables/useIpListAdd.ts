@@ -13,19 +13,6 @@ export interface IpListOption {
   system?: boolean
 }
 
-/** 地址列表下拉选项 label（列表名 + 条数）——两处消费统一格式 */
-export const ipListOptionLabel = (list: IpListOption): string => `${list.name}（${list.entry_count} 条）`
-
-/**
- * 拉取地址列表选项（失败原样抛错，静默与否由调用方决定；
- * 悬空选择清理由调用方结合自身会话守卫处理）
- */
-export const fetchIpListOptions = async (): Promise<IpListOption[]> => {
-  const res = await request.get<APIResponse<IpListOption[]>>('/security/ip-lists')
-  // 内置威胁名单只读（后端拒写），从「加入/存入」类选择器剔除（2026-09-24 裁定）
-  return (res.data || []).filter((l) => !l.system)
-}
-
 export interface AddIpToListOptions {
   /** 动作词（默认「加入」）：确认框标题/文案与成功反馈共用 */
   verb?: string
@@ -34,8 +21,8 @@ export interface AddIpToListOptions {
 }
 
 /**
- * 「把 IP 加入地址列表」共享实现（消费方：IPLocationAction 悬浮弹层「存入」、
- * SecurityEvents 事件弹框「加入」）：
+ * 「把 IP 加入地址列表」共享实现（消费方：useTrustAssociation——IPLocationAction
+ * 悬浮弹层黑/白/信任三侧名单动作的同一条链路）：
  * 确认框（含列表名）→ 幂等 POST /security/ip-lists/:id/ips → added 短成功 /
  * 已存在 info；非 silent——错误提示与 MFA 428 step-up 走全局拦截器链。
  * 返回是否完成写入（true 时调用方据此刷新列表选项 / entry_count）。
