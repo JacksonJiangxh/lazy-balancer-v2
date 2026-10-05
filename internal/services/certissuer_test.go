@@ -712,6 +712,7 @@ func TestCertificateService_recoverCertJobs_preserves_deployment_retry_state(t *
 		t.Fatalf("seed deployment retry state: %v", err)
 	}
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	var gotAttempt int
 	var gotDelay time.Duration
 	service.deploymentRetry = func(_ int, material issuedCertificate, delay time.Duration) {

@@ -186,6 +186,7 @@ import type {
   APIResponse,
   ClusterModeResult,
   ClusterNode,
+  ClusterNodeWithSyncError,
   ClusterRegisterToken,
   ClusterRegistrationInput,
   ClusterStatus,
@@ -198,11 +199,6 @@ import ClusterSlavePanel from './cluster/ClusterSlavePanel.vue'
 import ClusterStatusCard from './cluster/ClusterStatusCard.vue'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
-
-type SyncErrorCode = 'schema_too_new' | 'schema_too_old' | 'signature_invalid' | 'pin_mismatch' | 'validation_failed' | 'apply_failed' | 'transport_error'
-type ClusterNodeWithSyncError = Omit<ClusterNode, 'health'> & {
-	readonly health: (NonNullable<ClusterNode['health']> & { readonly sync_error_code?: SyncErrorCode }) | null
-}
 
 interface ActionResponse {
   readonly code: number

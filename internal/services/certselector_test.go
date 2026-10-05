@@ -141,6 +141,7 @@ func TestCertificateService_CheckExpiration_skipsRenewal_whenSelectedCertificate
 	}
 
 	// When
+	resetCertificateServiceForTest(t)
 	jobs := NewCertificateService().CheckExpiration()
 
 	// Then

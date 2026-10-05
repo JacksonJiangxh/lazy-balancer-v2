@@ -54,6 +54,8 @@ func TestCAProviderQueries_returns_credentials(t *testing.T) {
 }
 
 func TestCAProviderService_TestCAProviderWithContext_honors_parent_cancellation(t *testing.T) {
+	// 自有 DB 隔离（U4b-01）：不得隐式依赖前置测试泄漏的 db.DB 全局。
+	newClusterTestService(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	err := NewCAProviderService().TestCAProviderWithContext(ctx, 1)

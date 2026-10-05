@@ -184,6 +184,7 @@ const ACTION_TAG_TABLE: Record<string, string> = {
   '更新失败': 'danger',
   '校验阻断': 'danger',
   '清除失败': 'danger',
+  '触发失败': 'danger',
   '更新': 'warning',
   '手动更新': 'warning',
   '更新信息': 'warning',

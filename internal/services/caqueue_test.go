@@ -479,14 +479,18 @@ func TestCAQueueManager_Enqueue_has_no_database_side_effects_when_paused(t *test
 func TestCAQueueManager_CancelJobsForRule_cancels_and_waits_for_deployment_callback(t *testing.T) {
 	// Given
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	callbackEntered := make(chan struct{})
 	cancellationObserved := make(chan struct{})
 	releaseCallback := make(chan struct{})
 	wroteFiles := make(chan struct{}, 1)
+	// close 幂等（U4b-02）：取消/补扫路径可能对同一任务二次触发本闭包，
+	// 裸 close 已关闭通道必 panic。
+	var callbackOnce, cancellationOnce sync.Once
 	service.retryDeployment = func(ctx context.Context, _ int) error {
-		close(callbackEntered)
+		callbackOnce.Do(func() { close(callbackEntered) })
 		<-ctx.Done()
-		close(cancellationObserved)
+		cancellationOnce.Do(func() { close(cancellationObserved) })
 		<-releaseCallback
 		if ctx.Err() == nil {
 			wroteFiles <- struct{}{}
@@ -529,6 +533,7 @@ func TestCAQueueManager_CancelJobsForRule_blocks_retry_created_during_worker_exi
 		t.Fatalf("seed deployment job: %v", err)
 	}
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	newClusterTestService(t)
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (id,rule_id,domain,status,ca_provider_id) VALUES (42,'lb_deleted','example.com','creating_order',0)`); err != nil {
 		t.Fatalf("seed certificate job: %v", err)
@@ -638,15 +643,18 @@ func TestCAQueue_enqueue_notifies_worker_loop(t *testing.T) {
 func TestCAQueueManager_PauseAndDrain_waits_for_deployment_retry_callback(t *testing.T) {
 	// Given
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	callbackEntered := make(chan struct{})
 	cancellationObserved := make(chan struct{})
 	releaseCallback := make(chan struct{})
 	resumedRetry := make(chan struct{}, 1)
+	// close 幂等（U4b-02）：同 TestCAQueueManager_CancelJobsForRule 闭包。
+	var callbackOnce, cancellationOnce sync.Once
 	service.retryDeployment = func(ctx context.Context, jobID int) error {
 		if jobID == 42 {
-			close(callbackEntered)
+			callbackOnce.Do(func() { close(callbackEntered) })
 			<-ctx.Done()
-			close(cancellationObserved)
+			cancellationOnce.Do(func() { close(cancellationObserved) })
 			<-releaseCallback
 			return ctx.Err()
 		}
