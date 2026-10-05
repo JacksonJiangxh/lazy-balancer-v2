@@ -278,24 +278,19 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 	// L6-66-02：RemoveAll→overrides 写入的树交换段抽为 swapCRSTreeFromStaging，
 	// 在 wafFileMu 互斥段内执行（lbbak 导入 untarGzTo 交换同一棵树，交错产
 	// 混合/残缺 rules 树）；网络下载与 Caddy 重载在锁外。
-	if err := m.swapCRSTreeFromStaging(staging, setupPath, pendingOverrides); err != nil {
+	// F-L6-68-02：版本行随交换段（锁内）落库，prevTag 由交换段锁内读出返回。
+	prevTag, err := m.swapCRSTreeFromStaging(staging, setupPath, pendingOverrides, tag)
+	if err != nil {
 		return err
 	}
 
 	// Reload BEFORE deleting backups: if reload fails, restoreBackup can still roll back.
-	// 审计 U1-F4：版本行必须先于 reloader 更新——crsPoolFingerprint 以版本行为池键
-	// 输入，先重载则指纹仍为旧值、coraza 池命中旧实例，磁盘新规则要等下一次生成
-	// 才生效（无限期静默陈旧）。
+	// 审计 U1-F4：版本行必须先于 reloader 更新（已随上方交换段落库）——
+	// crsPoolFingerprint 以版本行为池键输入，先重载则指纹仍为旧值、coraza 池
+	// 命中旧实例，磁盘新规则要等下一次生成才生效（无限期静默陈旧）。
 	// 审计 V-IMPORTANT-1（第五轮）：先写后失败的版本行回滚——不回滚则
 	// currentCRSVersion() 已为新 tag，下轮自动更新短路「已是最新」、失败被掩盖
-	// 且永不重试（直到重启）。旧 tag 在 downloadAndInstall 调用栈可得。
-	prevTag := currentCRSVersion()
-	if _, err := db.DB.Exec(
-		"UPDATE security_crs_version SET version=?, updated_at=datetime('now') WHERE id=1",
-		tag,
-	); err != nil {
-		writeCRSUpdateLog("WARN", string(CRSStatusReloading), fmt.Sprintf("提前写入版本行失败（稍后重写）: %v", err))
-	}
+	// 且永不重试（直到重启）。旧 tag 由交换段锁内读出（prevTag）。
 	writeCRSUpdateLog("INFO", string(CRSStatusReloading), "应用新规则并重载 Caddy")
 	if m.reloader != nil {
 		err := m.reloader()
@@ -347,26 +342,31 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 // 混合/残缺 rules 树经 waf_files 节传播。失败路径的 restoreBackup（同为树
 // 变更）也在锁内；网络下载与 Caddy 重载不进锁（锁内取 CaddyOpLock 会与
 // 导入路径 CaddyOpLock→wafFileMu 的持锁序构成 AB-BA）。
-func (m *CRSUpdateManager) swapCRSTreeFromStaging(staging, setupPath string, pendingOverrides []byte) error {
+// F-L6-68-02（第 68 轮审计）：security_crs_version 版本行写入收进本段——此前
+// 在锁外（downloadAndInstall 尾段），写相位中段导出侧（BuildWafFileBundle 读
+// 相位持同一锁）可打出「文件新/行旧」偏斜 bundle。单行 UPDATE 毫秒级，与段内
+// 树交换 IO 同量级，不新增锁内长阻塞。prevTag 锁内读出返回，供重载失败回滚
+// （版本行先于 reloader 写入的 U1-F4 语义不变）。
+func (m *CRSUpdateManager) swapCRSTreeFromStaging(staging, setupPath string, pendingOverrides []byte, tag string) (prevTag string, err error) {
 	wafFileMu.Lock()
 	defer wafFileMu.Unlock()
 	rulesPath := filepath.Join(m.crsDir, "rules")
 	if err := os.RemoveAll(rulesPath); err != nil {
 		m.restoreBackup()
-		return fmt.Errorf("清理现有 rules: %w", err)
+		return "", fmt.Errorf("清理现有 rules: %w", err)
 	}
 	if err := moveTree(filepath.Join(staging, "rules"), rulesPath); err != nil {
 		m.restoreBackup()
-		return fmt.Errorf("安装新 rules: %w", err)
+		return "", fmt.Errorf("安装新 rules: %w", err)
 	}
 	newSetup := filepath.Join(staging, "crs-setup.conf.example")
 	if err := copyFile(newSetup, setupPath); err != nil {
 		m.restoreBackup()
-		return fmt.Errorf("写入 crs-setup.conf: %w", err)
+		return "", fmt.Errorf("写入 crs-setup.conf: %w", err)
 	}
 	if err := copyFile(newSetup, filepath.Join(m.crsDir, "crs-setup.stock.conf")); err != nil {
 		m.restoreBackup()
-		return fmt.Errorf("写入 crs-setup.stock.conf 基线: %w", err)
+		return "", fmt.Errorf("写入 crs-setup.stock.conf 基线: %w", err)
 	}
 	// R53 新-2：overrides 迁移写入推迟到此处（rules 与新 setup 均已落盘）——
 	// 此点之后的崩溃留下「新 stock setup（不含自定义行）+ 旧 overrides」，
@@ -379,10 +379,21 @@ func (m *CRSUpdateManager) swapCRSTreeFromStaging(staging, setupPath string, pen
 	if pendingOverrides != nil {
 		if err := os.WriteFile(filepath.Join(m.crsDir, "zz-user-overrides.conf"), pendingOverrides, 0644); err != nil {
 			m.restoreBackup()
-			return fmt.Errorf("写入 zz-user-overrides.conf: %w", err)
+			return "", fmt.Errorf("写入 zz-user-overrides.conf: %w", err)
 		}
 	}
-	return nil
+	// F-L6-68-02：版本行与文件树同互斥区落库——导出读相位（持同一锁）不会
+	// 读到「文件新/行旧」偏斜。U1-F4 语义保持：版本行先于 reloader 写入
+	// （crsPoolFingerprint 以版本行为池键输入）；写失败仅 WARN，run() 成功
+	// 路径稍后重写全量行（crsupdate.go），重载失败路径用 prevTag 回滚。
+	prevTag = currentCRSVersion()
+	if _, err := db.DB.Exec(
+		"UPDATE security_crs_version SET version=?, updated_at=datetime('now') WHERE id=1",
+		tag,
+	); err != nil {
+		writeCRSUpdateLog("WARN", string(CRSStatusReloading), fmt.Sprintf("提前写入版本行失败（稍后重写）: %v", err))
+	}
+	return prevTag, nil
 }
 
 // persistCRSSnapshotFrom copies the live rules tree, setup files and version

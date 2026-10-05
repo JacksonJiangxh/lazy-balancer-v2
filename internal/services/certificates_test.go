@@ -16,6 +16,19 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
+// resetCertificateServiceForTest 测试后复位 certificateService 全局单例——
+// NewCertificateService 会覆写该全局，不复位则旧 service（含其定时器与闭包
+// 通道）泄漏进后续测试，包级函数（scheduleCertificateDeploymentRetry 等）会
+// 作用在死测试的对象上（U4b-02）。
+func resetCertificateServiceForTest(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		certificateServiceMu.Lock()
+		certificateService = nil
+		certificateServiceMu.Unlock()
+	})
+}
+
 func TestCreateOrRequeueCertJob_returns_persisted_job_id(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
@@ -176,6 +189,7 @@ func TestRequeueNonTerminalCertJobs_schedules_downloaded_deployment(t *testing.T
 		t.Fatalf("attach certificate material: %v", err)
 	}
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	retried := make(chan int, 1)
 	service.retryDeployment = func(_ context.Context, gotJobID int) error {
 		retried <- gotJobID
@@ -311,6 +325,7 @@ func TestRequeueNonTerminalCertJobs_skips_job_still_active_in_retired_queue(t *t
 func TestCertificateService_deployment_retry_deduplicates_job_id(t *testing.T) {
 	// Given
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	calls := make(chan int, 2)
 	service.retryDeployment = func(_ context.Context, jobID int) error {
 		calls <- jobID
@@ -341,6 +356,7 @@ func TestCertificateService_scheduleDeploymentRetry_waits_for_inflight_callback_
 	// timer（串行重试，而非并发重试）。
 	// Given
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	calls := make(chan int, 2)
@@ -394,6 +410,7 @@ func TestCertificateService_scheduleDeploymentRetry_waits_for_inflight_callback_
 func TestCertificateService_cancelDeploymentRetry_waits_for_running_callback(t *testing.T) {
 	// Given
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	service.retryDeployment = func(_ context.Context, _ int) error {
@@ -428,6 +445,7 @@ func TestCertificateService_cancelDeploymentRetry_boundedWaitOnStuckCallback(t *
 	// R42 发现3：回调链条调到非 context-aware 的 caddyReloader，Caddy admin 异常
 	// 挂起时 HTTP 调用方必须能在 cancelWaitTimeout 内返回，不能永久阻塞。
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	service.cancelWaitTimeout = 50 * time.Millisecond
 	entered := make(chan struct{})
 	service.retryDeployment = func(_ context.Context, _ int) error {
@@ -458,6 +476,7 @@ func TestCertificateService_Stop_waits_for_deployment_retry_callback(t *testing.
 	// Given
 	_, _ = newClusterTestService(t)
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	service.recoverJobs = func(context.Context) {}
 	callbackEntered := make(chan struct{})
 	cancellationObserved := make(chan struct{})
@@ -511,6 +530,7 @@ func TestCertificateService_periodic_scans_do_not_mutate_jobs_while_queue_paused
 		t.Fatalf("seed paused waiting job: %v", err)
 	}
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 
 	// When
 	service.renewExpiringCertificates()
@@ -554,6 +574,7 @@ func TestCertificateService_renewExpiringCertificates_retries_failed_first_issua
 		<-release
 	}
 	done := make(chan struct{})
+	resetCertificateServiceForTest(t)
 	go func() {
 		NewCertificateService().renewExpiringCertificates()
 		close(done)
@@ -592,6 +613,7 @@ func TestCertificateService_requeueWaitingCAJobs_disables_orphaned_waiting_job(t
 	}
 
 	// When
+	resetCertificateServiceForTest(t)
 	NewCertificateService().requeueWaitingCAJobs()
 
 	// Then
@@ -625,6 +647,7 @@ func TestCertificateService_requeueWaitingCAJobs_pause_after_scan_start_leaves_j
 		<-resumeScan
 	}
 	scanDone := make(chan struct{})
+	resetCertificateServiceForTest(t)
 	go func() {
 		NewCertificateService().requeueWaitingCAJobs()
 		close(scanDone)
@@ -823,6 +846,7 @@ func TestCertificateService_CheckExpiration_returns_only_current_enabled_acme_do
 	}
 
 	// When
+	resetCertificateServiceForTest(t)
 	jobs := NewCertificateService().CheckExpiration()
 
 	// Then
@@ -864,6 +888,7 @@ func TestCertificateService_CheckExpiration_compares_offset_and_fractional_times
 	}
 
 	// When
+	resetCertificateServiceForTest(t)
 	jobs := NewCertificateService().CheckExpiration()
 
 	// Then
@@ -903,6 +928,7 @@ func TestCertificateService_CheckExpiration_respects_ca_cooldown_for_waiting_ca(
 	}
 
 	// When
+	resetCertificateServiceForTest(t)
 	jobs := NewCertificateService().CheckExpiration()
 
 	// Then：冷却中的任务不得被续期扫描捕获（R35-5），冷却已过与无冷却的正常捕获
@@ -1466,6 +1492,7 @@ func TestCertificateService_resumeDeploymentRetries_reschedulesDroppedRetries(t 
 		}
 	}
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	var scheduled []int
 	var delays []time.Duration
 	service.deploymentRetry = func(jobID int, _ issuedCertificate, delay time.Duration) {
@@ -1755,6 +1782,7 @@ func TestCertificateService_rescanSkipsJobsWithActiveTimer(t *testing.T) {
 	jobID := int(jobID64)
 
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	rescheduled := make(chan int, 4)
 	service.deploymentRetry = func(id int, _ issuedCertificate, _ time.Duration) {
 		rescheduled <- id
@@ -1807,6 +1835,7 @@ func TestCertificateService_rescanPicksUpDroppedRetry(t *testing.T) {
 	jobID := int(jobID64)
 
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	rescheduled := make(chan int, 4)
 	service.deploymentRetry = func(id int, _ issuedCertificate, _ time.Duration) {
 		rescheduled <- id

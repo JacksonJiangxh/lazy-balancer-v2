@@ -12,30 +12,30 @@
       <el-form :model="global" label-width="140px" :disabled="isReadOnly">
         <el-form-item label="ACME 邮箱" required>
           <el-input v-model="global.acme_email" placeholder="your@email.com" style="width: 240px;" />
-          <el-text type="info" size="small" class="tip-inline">用于 CA 账户注册，使用 ACME 签发时必须填写</el-text>
+          <span class="form-tip-inline">用于 CA 账户注册，使用 ACME 签发时必须填写</span>
         </el-form-item>
         <el-form-item label="过期提醒天数">
           <el-input-number v-model="global.cert_expiry_days" :min="1" :max="365" />
         </el-form-item>
         <el-form-item label="自动续签时间">
           <el-input-number v-model="global.cert_renewal_days" :min="1" :max="90" />
-          <el-text type="info" size="small" class="tip-inline">证书到期前多少天自动尝试重签；0 = 默认 30 天（仅 API 直写/备份导入可达，本控件下限为 1）</el-text>
+          <span class="form-tip-inline">证书到期前多少天自动尝试重签；0 = 默认 30 天（仅 API 直写/备份导入可达，本控件下限为 1）</span>
         </el-form-item>
         <el-form-item label="续签重试次数">
           <el-input-number v-model="global.cert_renewal_attempts" :min="1" :max="10" />
-          <el-text type="info" size="small" class="tip-inline">证书续签失败（包括 CA 频率限制）后的最大自动重试次数</el-text>
+          <span class="form-tip-inline">证书续签失败（包括 CA 频率限制）后的最大自动重试次数</span>
         </el-form-item>
         <el-form-item label="CA 提供商" required>
           <el-select v-model="global.default_ca_provider_id" style="width: 240px;" placeholder="请选择 CA 提供商">
             <el-option v-for="p in enabledCAProviders" :key="p.id" :label="p.name" :value="p.id" />
           </el-select>
-          <el-text type="info" size="small" class="tip-inline">系统默认使用的证书签发机构</el-text>
+          <span class="form-tip-inline">系统默认使用的证书签发机构</span>
         </el-form-item>
         <el-form-item label="DNS 提供商">
           <el-select v-model="global.dns_provider" style="width: 240px;" placeholder="请选择 DNS 提供商">
             <el-option label="DNSPod" value="dnspod" />
           </el-select>
-          <el-text type="info" size="small" class="tip-inline">全局默认 DNS 提供商，创建规则时默认使用</el-text>
+          <span class="form-tip-inline">全局默认 DNS 提供商，创建规则时默认使用</span>
         </el-form-item>
           <el-form-item>
             <el-button type="primary" :loading="saving" :disabled="isReadOnly" @click="handleSave">
@@ -172,7 +172,7 @@
         <el-divider content-position="left" class="section-divider">状态</el-divider>
         <el-form-item label="启用">
           <el-switch v-model="form.enabled" />
-          <span class="switch-hint">停用后签发/续签不再使用该配置</span>
+          <span class="form-tip-inline">停用后签发/续签不再使用该配置</span>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -199,21 +199,21 @@
         <el-divider content-position="left" class="section-divider">签发速率</el-divider>
         <el-form-item label="最大并发">
           <el-input-number v-model="caForm.max_concurrent" :min="1" :max="100" />
-          <span class="switch-hint">同时进行的签发任务数</span>
+          <span class="form-tip-inline">同时进行的签发任务数</span>
         </el-form-item>
         <el-form-item label="最小间隔">
           <el-input-number v-model="caForm.min_interval_ms" :min="1000" :max="60000" :step="1000" />
-          <span class="switch-hint">两次新签发之间的最小间隔（毫秒）</span>
+          <span class="form-tip-inline">两次新签发之间的最小间隔（毫秒）</span>
         </el-form-item>
         <template v-if="caForm.provider === 'zerossl'">
           <el-divider content-position="left" class="section-divider">EAB 凭证（ZeroSSL）</el-divider>
           <el-form-item label="EAB KID">
             <el-input v-model="caCreds.eab_kid" placeholder="留空则自动获取" />
-            <el-text type="info" size="small" class="tip-block">
+            <div class="form-tip-line">
               可选，留空时会在测试或签发时自动从 ZeroSSL API 获取；也可手动填写（见
-              <a href="https://app.zerossl.com/developer" target="_blank" rel="noopener noreferrer" class="link">ZeroSSL Developer</a>
+              <el-link type="primary" href="https://app.zerossl.com/developer" target="_blank" rel="noopener noreferrer">ZeroSSL Developer</el-link>
               ）
-            </el-text>
+            </div>
           </el-form-item>
           <el-form-item label="EAB HMAC Key">
             <el-input v-model="caCreds.eab_hmac_key" type="password" placeholder="留空则自动获取" show-password />
@@ -222,7 +222,7 @@
         <el-divider content-position="left" class="section-divider">状态</el-divider>
         <el-form-item label="启用">
           <el-switch v-model="caForm.enabled" />
-          <span class="switch-hint">停用后新签发任务不再使用该 CA</span>
+          <span class="form-tip-inline">停用后新签发任务不再使用该 CA</span>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -715,12 +715,8 @@ onMounted(() => {
 .cred-divider { margin: 24px 0 20px; }
 .section-divider { margin: 24px 0 20px; }
 .section-divider :deep(.el-divider__text) { font-size: 14px; color: var(--text-secondary, #6b7280); font-weight: 600; }
-.switch-hint { margin-left: 10px; font-size: 12px; color: var(--text-secondary, #6b7280); }
 .lb-form :deep(.el-form-item) { margin-bottom: 18px; }
-.lb-form .form-tip-line { margin-top: 4px; }
 .cred-divider :deep(.el-divider__text) { font-size: 14px; color: var(--text-secondary, #6b7280); font-weight: 600; }
-.tip-block a.link { color: #3b82f6; text-decoration: none; }
-.tip-block a.link:hover { text-decoration: underline; }
 .card-header {
   display: flex;
   justify-content: space-between;
@@ -735,6 +731,4 @@ onMounted(() => {
   color: var(--text-primary);
 }
 .btn-text { margin-left: 4px; }
-.tip-inline { margin-left: 8px; line-height: 1.5; }
-.tip-block { display: block; margin-top: 4px; line-height: 1.5; }
 </style>

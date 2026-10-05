@@ -112,7 +112,6 @@ export interface CrsRuleOptionView {
  * - ensureForDialog(openSeq)：策略对话框每次打开取一次索引，同一 openSeq 内复用缓存
  *   （步骤间切换不重复请求）；复用 openDialog 的会话序列号守卫模式——对话框快速
  *   关闭重开后，旧会话的在途响应不得覆盖新会话数据（与 fetchIpLists(seq) 同源）。
- * - load()：页面级加载（规则集页等非对话框场景），挂载时刷新一次。
  * 失败语义：HTTP 错误已由全局拦截器 toast，这里退化为空列表（loaded 保持 false，
  * 供消费方区分「索引未就绪」与「规则确实不在索引中」）。
  *
@@ -124,7 +123,9 @@ export interface CrsRuleOptionView {
  */
 // 模块级共享状态（单例）：所有 useCrsRuleIndex() 消费方共享同一份索引与加载态
 const rules = ref<CrsRuleIndexEntry[]>([])
-const version = ref('')
+// F-U10-1（第 68 轮）：rules/version/load 三个返回位全仓零消费（两个消费方仅
+// 解构 loading/loaded/byId/options/ensureForDialog）——version ref 随死返回一并
+// 删除（移除后写-only）；rules/loading 等模块级状态保留（byId/options 内部消费）
 const loading = ref(false)
 // 仅在成功拿到索引后置 true；失败/未加载时为 false，消费方不得据此判定规则陈旧
 const loaded = ref(false)
@@ -160,14 +161,12 @@ const fetchIndex = async (openSeq: number | null): Promise<void> => {
         file: typeof r.file === 'string' ? r.file : '',
         category: typeof r.category === 'string' ? r.category : '',
       }))
-    version.value = typeof res.data?.version === 'string' ? res.data.version : ''
     loaded.value = true
     loadedSeq = openSeq
   } catch (error: unknown) {
     if (openSeq !== null && openSeq !== requestedSeq) return
     console.warn('Failed to load CRS rule index:', error)
     rules.value = []
-    version.value = ''
     loaded.value = false
     // FE44-5：失败不落 loadedSeq——失败不等于「本会话已加载」，
     // 同会话下一次 ensureForDialog 可重试（在途并发去重由 requestedSeq+loading 承担）
@@ -192,8 +191,5 @@ export const useCrsRuleIndex = () => {
     return startFetch(openSeq)
   }
 
-  /** 页面级加载（非对话框场景）：挂载时刷新一次；在途请求不重复发起 */
-  const load = (): Promise<void> => startFetch(null)
-
-  return { rules, version, loading, loaded, byId, options, ensureForDialog, load }
+  return { loading, loaded, byId, options, ensureForDialog }
 }

@@ -1101,6 +1101,23 @@ func MarkStartupFallbackPending(ctx context.Context, database *sql.DB) error {
 	return err
 }
 
+// MarkStartupFallbackFailed 在「启动渲染被拒且 last-known-good 回退也失败」的
+// 双失败路径写入与 applySnapshot 同语义的 apply_ok_reload_failed 补偿标记
+// （F-L5-68-02，第 68 轮审计）：此时运行配置与数据库处于未知分叉态，而 Pull 的
+// 304 分支只认该标记——无标记则自愈失明（「同步正常+运行未知旧配置」静默存活
+// 到下次真实变更或重启）；标记触发下轮全量重拉补偿。与 MarkStartupFallbackPending
+// 同约束：仅从节点调用方使用；db 为 nil 时静默跳过（启动极早期）。
+func MarkStartupFallbackFailed(ctx context.Context, database *sql.DB, cause error) error {
+	if database == nil {
+		return nil
+	}
+	markerCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	_, err := database.ExecContext(markerCtx, "UPDATE global_config SET last_sync_error=? WHERE id=1",
+		encodeSyncError(fmt.Sprintf("apply_ok_reload_failed: 启动时数据库渲染被拒且 last-known-good 回退失败（运行配置与数据库分叉，已排队补偿重拉）: %v", cause), models.SyncErrorCodeApplyFailed))
+	return err
+}
+
 // syncFailureCountPrefix/syncFailureCountSuffix 界定组合消息中的「连续失败计数」
 // 片段：组合时只保留标记段首个失败原因 + 递增计数，消息长度因此有界，不会随
 // 连续失败把整条历史追加为前缀（O(n²) 累计写入，且经 Report 上抛膨胀主节点库）。

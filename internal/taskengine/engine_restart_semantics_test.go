@@ -327,3 +327,40 @@ func TestEngine_RoleFlipWithoutFlagNoRestart(t *testing.T) {
 		t.Fatal("角色翻转后常驻应保持原代运行")
 	}
 }
+
+// Given master-only Scheduled 任务在途（Run 阻塞于 rc.Ctx.Done）。
+// When demote（SetRole(false)，生产形态）。
+// Then 在途 Run 被中止且终态落 cancelled（F-L2-68-01：SetRole targets 曾仅
+// Daemon/Periodic——定时族在途 Run 继续跑完，demote 后从节点写面（三库
+// 版本行/名单/规则树）打破只读不变量；取消经 rc.Ctx 传播，Run 体据此落
+// skipped 与起点角色复查对齐）。
+func TestEngine_DemoteCancelsInFlightScheduled(t *testing.T) {
+	e := newTestEngine(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	e.Register(Descriptor{ID: "t-sched", Family: "t", Name: "定时", Kind: KindScheduled, RunsOn: RoleMasterOnly,
+		Run: func(rc RunContext) error {
+			close(started)
+			select {
+			case <-rc.Ctx.Done():
+				return rc.Ctx.Err()
+			case <-release:
+				return nil
+			}
+		}})
+
+	runDone := make(chan struct{})
+	go func() { _ = e.Trigger("t-sched", "auto", ""); close(runDone) }()
+	<-started
+	e.SetRole(false)
+
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("demote 未中止在途 Scheduled Run（跑完才退出=旧形态）")
+	}
+	if lr := e.LatestRun("t-sched"); lr == nil || lr.Status != "cancelled" {
+		t.Fatalf("在途中止终态=%v, want cancelled", lr)
+	}
+}

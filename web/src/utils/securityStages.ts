@@ -239,7 +239,7 @@ export const parseRefIds = (raw: string | undefined): number[] => {
 }
 
 // GeoIP 区域 JSON 文本 → 区域数（同 parseIPList 守卫口径）
-export const parseGeoipCountryCount = (raw: string): number => {
+const parseGeoipCountryCount = (raw: string): number => {
   if (!raw) return 0
   try {
     const parsed: unknown = JSON.parse(raw)
@@ -355,7 +355,10 @@ const buildStage0Rows = (policy: SecurityStagePolicy | undefined, ipLists: reado
 // 门——ACL 已关闭（保留名单）时名单不生效（渲染 buildIPPrecheckDirectives
 // security.go:996 同门）；②独立黑名单无模式/开关门（security.go:1004-1006，
 // 既有有意裁定）——allow/bypass 模式下摘要不得隐去它仍在拦截的事实。
-export const aclEffectiveCounts = (
+// F-U10-1（第 68 轮）：全仓零外部消费——以下六个仅模块内使用的实现去掉 export
+// （parseGeoipCountryCount/aclEffectiveCounts/mergeIpEntryDetails/crsGroupLabel/
+// rateLimitDetailCaption/ipInCidr），消费面复核记录在修复报告
+const aclEffectiveCounts = (
   ipLists: readonly SecurityStageIPList[],
   policy: { ip_acl_enabled?: boolean; ip_acl_mode?: string; ip_acl_list?: string; ip_acl_list_refs?: string; ip_blacklist?: string },
 ): { aclCount: number; blCount: number; effective: number; inlineCount: number; refCount: number } => {
@@ -551,7 +554,7 @@ export const buildStageModel = (
 // ── 明细拼装（流程抽屉首次展开时调用；纯函数，不持有缓存） ──
 
 // 内联 ∪ 引用逐条明细（精确字符串去重，内联优先；引用条目携带 remark 与来源列表名）
-export const mergeIpEntryDetails = (
+const mergeIpEntryDetails = (
   ipLists: readonly SecurityStageIPList[],
   inline: readonly string[],
   refs: readonly number[],
@@ -579,7 +582,7 @@ export const mergeIpEntryDetails = (
 
 // CRS 组码 → 「请求 · 942 · SQL 注入」式标签（与安全策略页组名表同口径，由规则文件列表推导；
 // 列表未加载/组已消失时回退裸组码，不阻断明细区）
-export const crsGroupLabel = (groupCode: string, crsFiles: readonly CrsRuleFileOption[]): string => {
+const crsGroupLabel = (groupCode: string, crsFiles: readonly CrsRuleFileOption[]): string => {
   const file = crsFiles.find((r) => new RegExp(`^(?:REQUEST|RESPONSE)-9${groupCode}-`, 'i').test(r.filename))
   if (!file) return groupCode
   const phase = /^RESPONSE-/i.test(file.filename) ? '响应' : '请求'
@@ -588,7 +591,7 @@ export const crsGroupLabel = (groupCode: string, crsFiles: readonly CrsRuleFileO
 
 // 限流口径文案（与后端 buildRateLimitHandler 双 zone 语义一致）：
 // burst > 0 → 1s 窗口封顶 rps+burst（瞬时），60s 窗口封顶 rps×60（持续）；burst=0 → 单 1s 窗口
-export const rateLimitDetailCaption = (rps: number, burst: number): string =>
+const rateLimitDetailCaption = (rps: number, burst: number): string =>
   burst > 0
     ? `1s 窗口上限 ${rps + burst} 次（含突发）· 60s 窗口上限 ${rps * 60} 次（持续 ${rps} 次/秒）`
     : `1s 窗口上限 ${rps} 次`
@@ -793,7 +796,7 @@ const ipv4ToLong = (ip: string): number => {
   return (((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0)
 }
 
-export const ipInCidr = (ip: string, cidr: string): boolean => {
+const ipInCidr = (ip: string, cidr: string): boolean => {
   const idx = cidr.indexOf('/')
   if (idx < 0) return false
   const base = cidr.slice(0, idx)

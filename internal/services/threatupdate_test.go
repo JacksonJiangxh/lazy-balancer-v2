@@ -170,8 +170,10 @@ func TestThreatUpdate_sourceFailureKeepsOldListAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
-		t.Fatalf("second run: %v", err)
+	// F-L1-68-01（第 68 轮）：任一源失败即整体失败——RunUpdate 回传
+	// ErrThreatUpdateFailed（引擎 task_runs 记 failed）；单源失败仍不中断其余源。
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); !errors.Is(err, ErrThreatUpdateFailed) {
+		t.Fatalf("second run err=%v, want ErrThreatUpdateFailed", err)
 	}
 
 	status, _, message, _, failures := readThreatRow(t, "firehol_l1")
@@ -213,8 +215,9 @@ func TestThreatUpdate_parseGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
-		t.Fatalf("run: %v", err)
+	// F-L1-68-01（第 68 轮）：两源失败（解析守卫拒绝）→ 整体失败回传。
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); !errors.Is(err, ErrThreatUpdateFailed) {
+		t.Fatalf("run err=%v, want ErrThreatUpdateFailed（两源被守卫拒绝）", err)
 	}
 	if status, _, _, _, _ := readThreatRow(t, "ustc"); status != "success" {
 		t.Fatalf("50%% 边界应通过, got %s", status)
@@ -435,6 +438,11 @@ func TestThreatDueSources_emptyListIsDue(t *testing.T) {
 func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 	overrideWafDirForTest(t)
 	newClusterTestService(t)
+	// 任务日志目录自隔离（certjoblog_test.go:23-27 同型）——本测试断言
+	// TaskLogPath("threat") 内容，不得依赖包级全局泄漏（A 域新 wire 测试
+	// 文件改变全局链后曾读空路径）。
+	taskengine.SetLogDir(t.TempDir())
+	t.Cleanup(func() { taskengine.SetLogDir("") })
 	setupThreatTest(t, nil, nil, nil)
 	var reloads int
 	SetThreatReloader(func() error { reloads++; return nil })
@@ -550,9 +558,11 @@ func TestThreatUpdate_listExistenceQueryErrorNotFastPathSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// When：同内容 run2 —— 原始哈希一致进入快速路径，COUNT 失败
-	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
-		t.Fatalf("run2: %v", err)
+	// When：同内容 run2 —— 原始哈希一致进入快速路径，COUNT 失败。
+	// F-L1-68-01（第 68 轮）后失败回传引擎：源失败必须返回错误（旧契约
+	// 断言返回 nil 已随迁）；行级 failed 落库仍是本测试真契约。
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err == nil {
+		t.Fatal("run2: 源写库失败必须返回错误（F-L1-68-01 失败回传契约）")
 	}
 
 	// Then：不得标 success 快速返回——完整路径写库失败落 failed
@@ -693,5 +703,50 @@ func TestThreatUpdate_runRejectedOnSlave(t *testing.T) {
 	}
 	if touched != 0 {
 		t.Fatalf("从节点不得改写源状态: touched=%d", touched)
+	}
+}
+
+// F-L1-68-01（第 68 轮，P4）：RunUpdate 恒返 nil——源失败仅内部落行，引擎
+// task_runs 把失败轮记成 success（终态失真）。修复：失败终态回传
+// ErrThreatUpdateFailed（「任一源失败即失败」，与 run 内 anyFailed/
+// failSourceRow 口径对齐）；skipped/cancelled 各有终态通道，不算失败。
+func TestThreatRunUpdate_returnsErrorOnSourceFailure(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, map[string]bool{"firehol_l1": true}, nil)
+
+	err := GetThreatUpdateManager().RunUpdate("manual", nil)
+	if !errors.Is(err, ErrThreatUpdateFailed) {
+		t.Fatalf("源失败时 RunUpdate err=%v, want ErrThreatUpdateFailed（引擎据此把 task_runs 记 failed）", err)
+	}
+	if got := GetThreatUpdateManager().StatusSnapshot().Outcome; got != "failed" {
+		t.Fatalf("outcome=%q, want failed", got)
+	}
+	// 行级语义回归：失败源落 failed+message+consecutive_failures+1，健康源不受影响
+	if status, _, message, _, failures := readThreatRow(t, "firehol_l1"); status != "failed" || message == "" || failures != 1 {
+		t.Fatalf("失败源行=(%s,%q,fail=%d), want (failed,非空 message,1)", status, message, failures)
+	}
+	if status, _, _, _, _ := readThreatRow(t, "ustc"); status != "success" {
+		t.Fatalf("健康源应继续成功, got %s", status)
+	}
+}
+
+// F-L1-68-01 引擎侧契约钉：经 wire Run 体透传——源失败轮 task_runs 必须落
+// failed（曾恒 success）。Given 一源必败；When 引擎手动触发 threat；
+// Then Trigger 回传 ErrThreatUpdateFailed 且 task_runs 终态 failed。
+func TestWireThreatRun_failureLandsTaskRunsFailed(t *testing.T) {
+	overrideWafDirForTest(t)
+	stubUpdateRetrySleep(t)    // 任务内重试等待即时化（失败源 3 次重试真睡 90s）
+	te := newWireTestEngine(t) // 先于 seed——newWireTestEngine 重初始化库
+	setupThreatTest(t, nil, map[string]bool{"firehol_l1": true}, nil)
+	if err := te.Trigger("threat", "manual", ""); !errors.Is(err, ErrThreatUpdateFailed) {
+		t.Fatalf("Trigger err=%v, want ErrThreatUpdateFailed", err)
+	}
+	var status string
+	if err := db.DB.QueryRow(`SELECT status FROM task_runs WHERE task_id='threat' ORDER BY id DESC LIMIT 1`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" {
+		t.Fatalf("task_runs status=%q, want failed（失败轮曾记 success——终态失真）", status)
 	}
 }

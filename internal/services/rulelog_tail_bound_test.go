@@ -67,3 +67,39 @@ func TestReadRuleLogTail_multilineTailSemanticsUnchanged(t *testing.T) {
 		t.Fatalf("offset invariant broken: offset=%d len=%d total=%d", offset, len(content), b.Len())
 	}
 }
+
+// F-68-U7b2-01（第 68 轮审计）：removeTimberjackRotations 数字边界守卫——
+// 兄弟规则（caddy_id 以本 stem 为前缀，lb_abc 与 lb_abc-extra）的轮转副本
+// 此前被本规则的清扫按前缀+后缀整体误删（logstats.go B-2 同族先例：
+// stem 后 '-<ts>' 段首字符必须为数字）。
+func TestRemoveRuleLogFiles_siblingRuleRotationsUntouched(t *testing.T) {
+	dir := t.TempDir()
+	origDir := ruleLogDir
+	ruleLogDir = dir
+	t.Cleanup(func() { ruleLogDir = origDir })
+
+	for _, name := range []string{
+		"lb_abc.log", "lb_abc-extra.log",
+		"lb_abc-20260910T15-04-05.123-size.log",
+		"lb_abc-extra-20260910T15-04-05.123-size.log",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	RemoveRuleLogFiles("lb_abc")
+
+	if _, err := os.Stat(filepath.Join(dir, "lb_abc.log")); !os.IsNotExist(err) {
+		t.Fatal("lb_abc.log 应已删除")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "lb_abc-20260910T15-04-05.123-size.log")); !os.IsNotExist(err) {
+		t.Fatal("lb_abc 自身轮转副本应已清扫")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "lb_abc-extra-20260910T15-04-05.123-size.log")); err != nil {
+		t.Fatalf("兄弟规则轮转副本被误删: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "lb_abc-extra.log")); err != nil {
+		t.Fatalf("兄弟规则活文件被误删: %v", err)
+	}
+}

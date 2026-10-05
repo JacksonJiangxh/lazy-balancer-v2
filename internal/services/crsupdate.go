@@ -243,6 +243,17 @@ func (m *CRSUpdateManager) setStage(status CRSUpdateStatus, message string) {
 	writeCRSUpdateLog(level, string(status), message)
 }
 
+// updateRunStillMaster 运行中角色复核（F-L2-68-01 demote 在途中止判定）——
+// 与三库起点角色复查同一 SQL 口径（COALESCE(is_master,1)；查询失败按非主
+// 节点→跳过语义，宁停勿写）。
+func updateRunStillMaster() bool {
+	var isMaster bool
+	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
+		return false
+	}
+	return true
+}
+
 // run executes the full update pipeline synchronously.
 func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	operator := "system"
@@ -272,7 +283,14 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 
 	// R63 单写方：task_runs 由引擎统一记录（manual 预插/ SilentProbes 有工作标记后插入）
 	// 族体零 RecordRun 调用。
-	runCtx, runCancel := context.WithCancel(context.Background())
+	// F-L2-68-01（第 68 轮）：runCtx 派生自 rc.Ctx——引擎 demote 中止（SetRole
+	// 取消在途 Scheduled）与手动取消同通道传播；nil rc（测试/内部路径）回退
+	// Background 保持旧语义。
+	runBase := context.Background()
+	if rc != nil && rc.Ctx != nil {
+		runBase = rc.Ctx
+	}
+	runCtx, runCancel := context.WithCancel(runBase)
 	m.mu.Lock()
 	m.runCancel = runCancel
 	m.mu.Unlock()
@@ -319,6 +337,12 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		writeCRSUpdateLog("WARN", "retry", fmt.Sprintf("查询 CRS 最新版本失败: %v；等待 %s 重试，第 %d 次，共 %d 次", rerr, wait, nextAttempt, updateMaxAttempts))
 	})
 	if err != nil {
+		// F-L2-68-01：runCtx 取消且已非主节点=demote 在途中止——落 skipped
+		// （与起点角色复查同语义），不走 fail（从节点中止非故障、不 restore）。
+		if runCtx.Err() != nil && !updateRunStillMaster() {
+			m.setStage(CRSStatusSkipped, "节点已降级为从节点，终止 CRS 更新")
+			return
+		}
 		m.fail(err, false)
 		return
 	}
@@ -364,6 +388,12 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		writeCRSUpdateLog("WARN", "retry", fmt.Sprintf("下载安装 CRS %s 失败: %v；等待 %s 重试，第 %d 次，共 %d 次", tag, rerr, wait, nextAttempt, updateMaxAttempts))
 	})
 	if installErr != nil {
+		// F-L2-68-01：同上方 fetch 分支——demote 在途中止落 skipped（不 restore：
+		// 从节点不回滚不 reload，保持只读不变量）。
+		if runCtx.Err() != nil && !updateRunStillMaster() {
+			m.setStage(CRSStatusSkipped, "节点已降级为从节点，终止 CRS 更新")
+			return
+		}
 		m.fail(installErr, true)
 		return
 	}

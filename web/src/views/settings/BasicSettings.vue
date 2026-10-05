@@ -17,27 +17,27 @@
               <el-option label="Warning" value="warn" />
               <el-option label="Error" value="error" />
             </el-select>
-            <el-text type="info" size="small" class="tip-inline">控制 Lazy Balancer 自身日志详细程度</el-text>
+            <span class="form-tip-inline">控制 Lazy Balancer 自身日志详细程度</span>
           </el-form-item>
           <el-form-item label="任务日志大小">
             <el-input-number v-model="settings.cert_job_log_size_mb" :disabled="isReadOnly" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
-            <el-text type="info" size="small" class="tip-inline">MB，任务与库更新日志轮转阈值</el-text>
+            <span class="form-tip-inline">MB，任务与库更新日志轮转阈值</span>
           </el-form-item>
           <el-form-item label="审计日志大小">
           <el-input-number v-model="settings.audit_log_size_mb" :disabled="isReadOnly" :min="1" :max="512" controls-position="right" style="width: 120px;" />
-            <el-text type="info" size="small" class="tip-inline">MB，WAF 审计日志轮转阈值</el-text>
+            <span class="form-tip-inline">MB，WAF 审计日志轮转阈值</span>
           </el-form-item>
           <el-form-item label="运行日志大小">
             <el-input-number v-model="settings.runtime_log_size_mb" :disabled="isReadOnly" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
-            <el-text type="info" size="small" class="tip-inline">MB，轮转阈值</el-text>
+            <span class="form-tip-inline">MB，轮转阈值</span>
           </el-form-item>
           <el-form-item label="日志保留">
             <el-input-number v-model="settings.audit_retention_months" :disabled="isReadOnly" :min="1" :max="12" controls-position="right" style="width: 120px;" />
-            <el-text type="info" size="small" class="tip-inline">个月，超期自动清理</el-text>
+            <span class="form-tip-inline">个月，超期自动清理</span>
           </el-form-item>
           <el-form-item label="登录过期">
             <el-input-number v-model="settings.jwt_expire_minutes" :disabled="isReadOnly" :min="1" :max="1440" controls-position="right" style="width: 120px;" />
-            <el-text type="info" size="small" class="tip-inline">分钟，登录令牌有效期</el-text>
+            <span class="form-tip-inline">分钟，登录令牌有效期</span>
           </el-form-item>
           <el-form-item label="时区">
             <el-select v-model="settings.timezone" :disabled="isReadOnly" filterable class="compact-select">
@@ -61,7 +61,7 @@
               <el-option label="Australia/Sydney (UTC+10，夏令时 UTC+11)" value="Australia/Sydney" />
               <el-option label="UTC" value="UTC" />
             </el-select>
-            <el-text type="info" size="small" class="tip-block">影响日志时间戳与证书时间；标注夏令时的时区会随夏令时自动偏移；仅 Caddy 日志需重启服务生效</el-text>
+            <div class="form-tip-line">影响日志时间戳与证书时间；标注夏令时的时区会随夏令时自动偏移；仅 Caddy 日志需重启服务生效</div>
           </el-form-item>
           <el-form-item label="GitHub 加速">
             <el-select v-model="githubProxyUrl" :disabled="isReadOnly" style="width: 160px">
@@ -72,7 +72,7 @@
                 :value="option.value"
               />
             </el-select>
-            <el-text type="info" size="small" class="tip-inline">CRS 规则库与 IP2Region 的下载代理</el-text>
+            <span class="form-tip-inline">CRS 规则库与 IP2Region 的下载代理</span>
           </el-form-item>
           <el-form-item label="GitHub 令牌">
             <el-input
@@ -85,27 +85,27 @@
               @input="githubTokenClearPending = false"
             />
             <el-button v-if="settings.has_github_token && !githubTokenClearPending" type="danger" link size="small" style="margin-left: 8px" @click="clearGithubToken">清除</el-button>
-            <el-text v-if="githubTokenClearPending" type="danger" size="small" class="tip-inline" style="margin-left: 8px">已标记清除，保存后生效</el-text>
+            <el-text v-if="githubTokenClearPending" type="danger" size="small" style="margin-left: 8px">已标记清除，保存后生效</el-text>
             <div class="form-tip-line">可选 GITHUB_TOKEN：令牌认证后 GitHub API 限流由 60 提升至 5000 次/小时，缓解规则库自动更新 403；令牌仅随 GitHub 直连发送，不经第三方代理；点「清除」可撤销已配置令牌（保存后生效）。<el-link type="primary" href="https://github.com/settings/tokens" target="_blank" rel="noopener">前往 GitHub 创建令牌</el-link>（只需公共仓库只读权限，无需勾选任何 scope）</div>
           </el-form-item>
           <el-form-item label="写操作验证">
             <el-switch v-model="settings.mfa_write_guard" :disabled="isReadOnly" />
-            <el-text type="info" size="small" class="tip-inline">写操作需 1 分钟内的 MFA 验证</el-text>
+            <span class="form-tip-inline">写操作需 1 分钟内的 MFA 验证</span>
             <el-link type="info" underline="never" size="small" class="tip-link" style="margin-left: 6px" @click="mfaScopeVisible = true">支持的操作</el-link>
           </el-form-item>
           <el-form-item label="登录失败锁定">
             <el-switch v-model="settings.mfa_lockout_enabled" :disabled="isReadOnly" />
-            <el-text type="info" size="small" class="tip-inline">密码或验证码失败 5 次锁 10 分钟（关闭则不锁定）</el-text>
+            <span class="form-tip-inline">密码或验证码失败 5 次锁 10 分钟（关闭则不锁定）</span>
           </el-form-item>
           <el-form-item label="强制 HTTPS">
             <el-switch v-model="adminTls.enabled" :disabled="isReadOnly" @change="onAdminTlsToggle" />
             <el-button v-if="adminTls.enabled" size="small" style="margin-left: 8px;" @click="openAdminTlsDialog">配置证书</el-button>
-            <el-text v-if="adminTlsDirty" type="warning" size="small" class="tip-inline">已暂存，点击下方保存后生效</el-text>
-            <el-text v-else type="info" size="small" class="tip-inline">启用后 :8000 仅经 HTTPS 访问，需重启服务生效</el-text>
+            <el-text v-if="adminTlsDirty" type="warning" size="small" style="margin-left: 8px">已暂存，点击下方保存后生效</el-text>
+            <span v-else class="form-tip-inline">启用后 :8000 仅经 HTTPS 访问，需重启服务生效</span>
           </el-form-item>
           <el-form-item label="运行日志">
             <el-button size="small" :icon="View" @click="openAppLogDialog">查看日志</el-button>
-            <el-text type="info" size="small" class="tip-inline">查看 Lazy Balancer 自身运行日志</el-text>
+            <span class="form-tip-inline">查看 Lazy Balancer 自身运行日志</span>
           </el-form-item>
           <el-form-item>
             <el-button type="primary" :loading="saving" :disabled="isReadOnly" @click="handleSave">
@@ -241,20 +241,24 @@
 
       <template v-if="importValidation && !importValidating">
         <div v-if="!importValidation.valid" class="info-note-bar import-alert"><span class="info-note-desc">{{ importValidation.error || '备份文件校验失败' }}</span></div>
-        <template v-else>
-          <div class="import-result">
-  <div class="import-sections">
-              <div class="import-sections-label">导入分类（未选分类保持现状）</div>
-              <div class="section-chips">
-                <button
-                  v-for="sec in BACKUP_SECTIONS" :key="sec.key"
-                  type="button" class="section-chip"
-                  :class="{ 'is-active': importSections.includes(sec.key), 'is-disabled': importValidation.type === 'v1' && sec.key !== 'rules' }"
-                  @click="toggleImportSection(sec.key)"
-                >{{ sec.label }}</button>
-              </div>
-              <el-text v-if="importValidation.type === 'v1'" type="info" size="small" class="import-v1-hint">V1 备份仅支持负载均衡规则导入</el-text>
+        <!-- U9-68-P3-1：预览无效时分类 chip 保持可见可用——取消勾选坏行分类后
+             revalidateImport 自动重校验恢复 valid 即解锁确认（L6-67-02「未选分类
+             坏行不误拒」契约的 UI 可达面）；空分类选择仍由确认时 FE44-6 拦截 -->
+        <div class="import-result">
+          <div class="import-sections">
+            <div class="import-sections-label">导入分类（未选分类保持现状）</div>
+            <div class="section-chips">
+              <button
+                v-for="sec in BACKUP_SECTIONS" :key="sec.key"
+                type="button" class="section-chip"
+                :class="{ 'is-active': importSections.includes(sec.key), 'is-disabled': importValidation.type === 'v1' && sec.key !== 'rules' }"
+                @click="toggleImportSection(sec.key)"
+              >{{ sec.label }}</button>
             </div>
+            <el-text v-if="importValidation.type === 'v1'" type="info" size="small" class="import-v1-hint">V1 备份仅支持负载均衡规则导入</el-text>
+            <el-text v-else-if="!importValidation.valid" type="warning" size="small" class="import-v1-hint">校验未通过——取消勾选包含异常数据的分类后将自动重新校验</el-text>
+          </div>
+          <template v-if="importValidation.valid">
             <el-tag :type="importValidation.type === 'v1' ? 'warning' : 'success'" size="small">
               {{ importValidation.type === 'v1' ? 'V1 兼容导入' : 'V2 完整备份' }}
             </el-tag>
@@ -277,10 +281,11 @@
                 {{ formatImportConflict(conflict) }}
               </li>
             </ul>
-            <div v-if="importValidation.type !== 'v1'" class="info-note-bar import-alert"><span class="info-note-desc">{{ importSections.length === BACKUP_SECTIONS.length ? '导入将覆盖当前全部配置（规则、用户、密钥、证书任务）' : `将仅覆盖所选分类：${importSections.map((k) => BACKUP_SECTIONS.find((s) => s.key === k)?.label || k).join('、')}，未选分类保持现状` }}</span></div>
+            <!-- U9-68-P5-5：空分类选择不再拼出「将仅覆盖所选分类：，」残句 -->
+            <div v-if="importValidation.type !== 'v1'" class="info-note-bar import-alert"><span class="info-note-desc">{{ importSections.length === BACKUP_SECTIONS.length ? '导入将覆盖当前全部配置（规则、用户、密钥、证书任务）' : importSections.length > 0 ? `将仅覆盖所选分类：${importSections.map((k) => BACKUP_SECTIONS.find((s) => s.key === k)?.label || k).join('、')}，未选分类保持现状` : '未选择导入分类——本次导入不会覆盖任何数据（请至少选择一个分类）' }}</span></div>
             <div v-else class="info-note-bar" style="margin-top: 4px"><span class="info-note-desc">仅导入负载均衡规则，其他数据不受影响</span></div>
-          </div>
-        </template>
+          </template>
+        </div>
       </template>
 
       <template #footer>
@@ -320,7 +325,7 @@
       <el-form label-width="110px" class="auto-backup-form">
         <el-form-item label="启用">
           <el-switch v-model="autoBackupForm.enabled" />
-          <el-text type="info" size="small" class="tip-inline">调度器仅主节点运行；主从切换后自动开始，无需重启进程</el-text>
+          <span class="form-tip-inline">调度器仅主节点运行；主从切换后自动开始，无需重启进程</span>
         </el-form-item>
         <!-- 自管标签行(同上 a11y 范式):radio+select 兄弟同行,role=group 收口 -->
         <div class="form-radio-row" role="group" aria-label="频率">
@@ -341,11 +346,11 @@
         </div>
         <el-form-item label="备份时间">
           <el-time-select v-model="autoBackupForm.time" start="00:00" end="23:30" step="00:30" style="width: 120px" />
-          <el-text type="info" size="small" class="tip-inline">按系统配置时区执行；停机跨槽会在下次启动补跑一次</el-text>
+          <span class="form-tip-inline">按系统配置时区执行；停机跨槽会在下次启动补跑一次</span>
         </el-form-item>
         <el-form-item label="保留份数">
           <el-input-number v-model="autoBackupForm.keep" :min="1" :max="30" controls-position="right" style="width: 120px" />
-          <el-text type="info" size="small" class="tip-inline">1-30 份，超出自动清理；失败记录另保留最近 20 条</el-text>
+          <span class="form-tip-inline">1-30 份，超出自动清理；失败记录另保留最近 20 条</span>
         </el-form-item>
         <el-form-item label="备份范围">
           <div class="section-chips auto-backup-chips">
@@ -953,11 +958,16 @@ const handleImportFile = async (event: Event): Promise<void> => {
   }
   importValidating.value = true
   try {
-    // v2.3.0 lbbak 为二进制 tar.gz——按魔数选择读取与提交方式
-    const head = new Uint8Array(await file.slice(0, 2).arrayBuffer())
+    // v2.3.0 lbbak 为二进制 tar.gz——按魔数选择读取与提交方式。
+    // F-L6-68-01：先剥 UTF-8 BOM 再做魔数检测（与后端 config_backup.go SYS42-1
+    // 同口径——BOM \xef\xbb\xbf 与 gzip 魔数不冲突，剥 BOM 必须在魔数检测之前），
+    // 否则带 BOM 的 lbbak 前端误判为 JSON、带 BOM 的 JSON 提交体解析失败
+    const bomProbe = new Uint8Array(await file.slice(0, 3).arrayBuffer())
+    const bomLen = bomProbe[0] === 0xef && bomProbe[1] === 0xbb && bomProbe[2] === 0xbf ? 3 : 0
+    const head = new Uint8Array(await file.slice(bomLen, bomLen + 2).arrayBuffer())
     const isLbbak = head[0] === 0x1f && head[1] === 0x8b
     importFileIsLbbak.value = isLbbak
-    const fileContent = isLbbak ? await file.arrayBuffer() : await file.text()
+    const fileContent = isLbbak ? await file.slice(bomLen).arrayBuffer() : await file.slice(bomLen).text()
     importFileContent.value = fileContent
     // L6-67-02：预览请求携带分类选择（初始=全选，与下方 V2 默认选择一致；
     // V1 备份不消费该参数）——预览与导入同参，预览结果按所选分类过滤
@@ -1073,7 +1083,8 @@ const confirmImport = async (): Promise<void> => {
     const resultLines = [
       res.message || '配置导入成功',
       ...warnings,
-      `冲突置为禁用：${disabledConflicts.length} 条`,
+      // U9-68-P5-4：无冲突时不占位——「冲突置为禁用：0 条」恒显属噪音行
+      ...(disabledConflicts.length > 0 ? [`冲突置为禁用：${disabledConflicts.length} 条`] : []),
       ...disabledConflicts.map(formatImportConflict),
     ]
     await ElMessageBox.alert(
@@ -1498,8 +1509,8 @@ const handleSave = async () => {
 }
 .settings-form { padding: 4px 0; }
 .compact-select { width: 240px; max-width: 100%; }
-.tip-inline { margin-left: 8px; line-height: 1.5; }
-.tip-block { display: block; flex-basis: 100%; margin-top: 4px; line-height: 1.5; }
+/* U9-68-P5-6：旧式 el-text tip-inline/tip-block 已全量归一全局 form-tip-inline/
+   form-tip-line（main.css 唯一事实源），scoped 重复定义删除 */
 .info-list { padding: 4px 0; }
 .info-item {
   display: flex;

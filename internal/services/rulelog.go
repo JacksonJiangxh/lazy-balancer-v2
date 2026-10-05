@@ -177,8 +177,17 @@ func removeTimberjackRotations(base string) {
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if strings.HasPrefix(name, stem+"-") && strings.HasSuffix(name, "-size.log") {
-			os.Remove(filepath.Join(dir, name))
+		if !strings.HasPrefix(name, stem+"-") || !strings.HasSuffix(name, "-size.log") {
+			continue
 		}
+		// F-68-U7b2-01（第 68 轮审计）:数字边界守卫(logstats.go B-2 同族
+		// 先例)——stem 后 '-<ts>' 段首字符必须为数字(timberjack 时间戳恒以
+		// 数字开头);否则兄弟规则(caddy_id 以本 stem 为前缀,如 lb_abc 与
+		// lb_abc-extra)的轮转副本会被本清扫误删。
+		rest := name[len(stem):]
+		if len(rest) < 2 || rest[1] < '0' || rest[1] > '9' {
+			continue
+		}
+		os.Remove(filepath.Join(dir, name))
 	}
 }

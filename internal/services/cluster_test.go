@@ -525,6 +525,38 @@ func TestComputeNodeStatus_marks_stale_approved_node_offline(t *testing.T) {
 	}
 }
 
+// F-L2-68-02（第 68 轮审计 P4）：巡检离线阈值 max(2×sync_interval,120s)
+// （cluster_masterserving.go）与 UI 阈值 2×clamp(sync_interval)（ComputeNodeStatus/
+// updateOverview）在 sync_interval∈[10,59] 分叉——interval=30 时巡检以 120s 判
+// 在线、UI 以 60s 判离线，同一节点在告警与节点列表两口径打架。归一为同一函数
+// nodeOfflineThreshold 后，两口径在分叉区间必须一致。
+func TestNodeOfflineThreshold_unifiesInspectAndUIAtLowInterval(t *testing.T) {
+	// Given sync_interval=30（分叉区间）+ 节点 90s 前上报（巡检阈值 120s 内、
+	// 旧 UI 阈值 60s 外）
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	lastSeen := now.Add(-90 * time.Second)
+
+	// When 取统一阈值并走 UI 判定
+	threshold := nodeOfflineThreshold(30)
+	status := ComputeNodeStatus(true, lastSeen, 30, now)
+
+	// Then 阈值=max(2×30,120)=120s（与巡检同口径）；UI 90s<120s 判在线
+	if threshold != 120*time.Second {
+		t.Fatalf("nodeOfflineThreshold(30)=%v, want 120s（max(2×interval,120s)，与巡检同口径）", threshold)
+	}
+	if status != "online" {
+		t.Fatalf("ComputeNodeStatus(interval=30, last_seen 90s 前)=%q, want online（巡检同刻判在线，两口径必须一致）", status)
+	}
+	// 脏值 clamp 保持 R44-1 口径：sync_interval=5 按 60s 计 → max(120,120)=120s
+	if got := nodeOfflineThreshold(5); got != 120*time.Second {
+		t.Fatalf("nodeOfflineThreshold(5)=%v, want 120s（脏值 clamp 60s 后与下限取大）", got)
+	}
+	// 大 interval 不被下限钳制：interval=300 → 600s
+	if got := nodeOfflineThreshold(300); got != 600*time.Second {
+		t.Fatalf("nodeOfflineThreshold(300)=%v, want 600s", got)
+	}
+}
+
 func TestClusterService_Promote_resets_slave_state(t *testing.T) {
 	// Given
 	// Promote 成功路径会拉起自动备份调度器(CL41-1b)——测试结束即停,

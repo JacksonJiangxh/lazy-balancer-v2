@@ -691,6 +691,11 @@ const caddyRestartTriggerFile = "/tmp/caddy-restarted"
 // 第二调用点会产生双 watcher）。
 var caddyRestartWatcherStarted atomic.Bool
 
+// caddyRestartProcessStart 进程启动时刻（F-U1-4 存量触发文件判定基准）：
+// mtime 早于此的文件属上一进程生命周期残留——删除不执行（启动应用已在启动
+// 流程完成，重放无意义）。
+var caddyRestartProcessStart = time.Now()
+
 // StartCaddyRestartWatcher 启动 Caddy 重启监听(2s 轮询 trigger 文件)。
 // 幂等(已运行不重启);main.go 在启动应用完成后调用。
 func (h *Handlers) StartCaddyRestartWatcher() {
@@ -700,25 +705,40 @@ func (h *Handlers) StartCaddyRestartWatcher() {
 	go func() {
 		for {
 			time.Sleep(2 * time.Second)
-			if _, err := os.Stat(caddyRestartTriggerFile); err != nil {
-				continue
-			}
-			_ = os.Remove(caddyRestartTriggerFile)
-			services.Logf("info", "检测到 Caddy 进程重启，经任务引擎调度配置载入（DB 渲染）")
-			// V1（第 67 轮用户裁定）：一切任务统一引擎调度——曾直调
-			// ApplyConfigOnStartup 绕过引擎（无 task_runs/[start]/[done]/单飞，
-			// 审计+任务日志双行）。Run 体触发门已放行 caddy-restart。
-			if te := services.TaskEngine(); te != nil {
-				if _, err := te.RunSync("startup:config-load", "caddy-restart", ""); err != nil {
-					services.Logf("error", "Caddy 重启后配置重应用失败: %v", err)
-				} else {
-					services.Logf("info", "Caddy 重启后配置重应用完成（引擎调度，与启动流程同源）")
-				}
-			} else if err := h.ApplyConfigOnStartup(""); err != nil { // 引擎缺席（测试环境）回退
-				services.Logf("error", "Caddy 重启后配置重应用失败: %v", err)
-			}
+			h.caddyRestartWatcherOnce(caddyRestartTriggerFile, caddyRestartProcessStart)
 		}
 	}()
+}
+
+// caddyRestartWatcherOnce 单轮处理（F-L1-68-03+F-U1-4，第 68 轮）：
+//   - 存量文件（mtime 早于进程启动）→ 删除不执行；
+//   - 新触发 → 先 RunSync 成功后才删文件——失败保留下轮重试（曾先删后跑，
+//     重应用失败即丢重试机会）。
+func (h *Handlers) caddyRestartWatcherOnce(triggerFile string, processStart time.Time) {
+	st, err := os.Stat(triggerFile)
+	if err != nil {
+		return
+	}
+	if st.ModTime().Before(processStart) {
+		_ = os.Remove(triggerFile)
+		services.Logf("info", "检测到存量 Caddy 重启触发文件（mtime 早于进程启动），按上一进程残留清理不执行")
+		return
+	}
+	services.Logf("info", "检测到 Caddy 进程重启，经任务引擎调度配置载入（DB 渲染）")
+	// V1（第 67 轮用户裁定）：一切任务统一引擎调度——曾直调
+	// ApplyConfigOnStartup 绕过引擎（无 task_runs/[start]/[done]/单飞，
+	// 审计+任务日志双行）。Run 体触发门已放行 caddy-restart。
+	if te := services.TaskEngine(); te != nil {
+		if _, err := te.RunSync("startup:config-load", "caddy-restart", ""); err != nil {
+			services.Logf("error", "Caddy 重启后配置重应用失败（触发文件保留，下轮重试）: %v", err)
+			return
+		}
+		services.Logf("info", "Caddy 重启后配置重应用完成（引擎调度，与启动流程同源）")
+	} else if err := h.ApplyConfigOnStartup(""); err != nil { // 引擎缺席（测试环境）回退
+		services.Logf("error", "Caddy 重启后配置重应用失败（触发文件保留，下轮重试）: %v", err)
+		return
+	}
+	_ = os.Remove(triggerFile)
 }
 
 // ApplyConfigOnStartup 系统配置载入（startup:config-load Run 体唯一执行通道：
@@ -831,6 +851,15 @@ func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 			return nil
 		} else {
 			services.Logf("error", "last-known-good fallback failed: %v", fbErr)
+			// F-L5-68-02（第 68 轮审计）：双失败（渲染被拒+回退失败）从节点同样
+			// 写补偿标记——无标记时 Pull 的 304 分支永远判「同步正常」，运行配置
+			// 与数据库的未知分叉静默存活（自愈失明）；标记触发下轮全量重拉。
+			var isMaster bool
+			if mErr := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); mErr == nil && !isMaster {
+				if mErr := services.MarkStartupFallbackFailed(context.Background(), db.DB, fbErr); mErr != nil {
+					services.Logf("error", "startup fallback: write double-failure compensation marker failed: %v", mErr)
+				}
+			}
 		}
 		return fmt.Errorf("apply Caddy config on startup: %w", err)
 	}

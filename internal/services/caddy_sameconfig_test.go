@@ -10,17 +10,13 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
-
-	"lazy-balancer-v2/internal/db"
 )
 
 // Given：fake Caddy admin（GET /config/ 回显最近一次 /load 载荷）。
 // When：连续两次渲染应用同一 DB 视图。Then：首次真 /load；第二次
 // errSameConfig 且零新增 POST（同字节短路）。
 func TestApplyConfig_skipsLoadWhenByteIdentical(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	newClusterTestService(t)
 	var mu sync.Mutex
 	posts := 0
 	var lastBody []byte
@@ -70,9 +66,7 @@ func TestApplyConfig_skipsLoadWhenByteIdentical(t *testing.T) {
 // Given：fake Caddy admin 的 GET /config/ 返回非 200（比对失败）。
 // Then：fail-open 照常 /load（不阻断写入，与 Caddy 自身短路同向）。
 func TestApplyConfig_failsOpenWhenRunningConfigUnreadable(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	newClusterTestService(t)
 	posts := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == "/load" {

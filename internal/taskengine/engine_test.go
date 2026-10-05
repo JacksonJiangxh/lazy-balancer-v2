@@ -5,7 +5,9 @@ package taskengine
 
 import (
 	"errors"
+	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -791,5 +793,66 @@ func TestEngine_StatusMirrorRoleGated(t *testing.T) {
 	}
 	if m, _ := e.Lookup("t-mirror"); m.StatusMirror != "running" {
 		t.Fatalf("Lookup 主节点应采纳镜像, got %q", m.StatusMirror)
+	}
+}
+
+// Given Oneshot 任务与独立任务日志目录。
+// When 以 trigger=caddy-restart 同步执行（Caddy 崩溃自愈 watcher 通道）。
+// Then 任务日志必须含 [start] 行（F-L1-68-04：[start] 打印条件仅放行
+// manual/startup——caddy-restart 轮只有 [done]，排障看不到执行起点）。
+func TestEngine_CaddyRestartTriggerWritesStartLine(t *testing.T) {
+	e := newTestEngine(t)
+	SetLogDir(t.TempDir())
+	t.Cleanup(func() { SetLogDir("") })
+	e.Register(Descriptor{ID: "t-restart", Family: "startup", Name: "系统配置载入", Kind: KindOneshot,
+		Run: func(rc RunContext) error { return nil }})
+
+	if _, err := e.RunSync("t-restart", "caddy-restart", ""); err != nil {
+		t.Fatalf("RunSync: %v", err)
+	}
+
+	data, err := os.ReadFile(TaskLogPath("t-restart"))
+	if err != nil {
+		t.Fatalf("读取任务日志: %v", err)
+	}
+	if !strings.Contains(string(data), "[start]") {
+		t.Fatalf("caddy-restart 触发缺 [start] 行, 日志=%q", string(data))
+	}
+}
+
+// Given Scheduled 任务的 NextSlotFn 阻塞中（模拟三库排程槽 DB 查询耗时）。
+// When tick 求值 NextSlotFn 期间并发调用 IsRunning（需同一把 r.mu）。
+// Then IsRunning 不得被阻塞（F-L1-68-05：NextSlotFn 持 r.mu 调用会把 DB 延迟
+// 传导到同任务的 Cancel/IsRunning/StopLoop——须快照后锁外求值再回锁落缓存）。
+func TestEngine_TickEvaluatesNextSlotOutsideRegistrationLock(t *testing.T) {
+	e := newTestEngine(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var entered atomic.Int32
+	e.Register(Descriptor{ID: "t-slot", Family: "t", Name: "定时", Kind: KindScheduled,
+		NextSlotFn: func() time.Time {
+			entered.Store(1)
+			<-release
+			return time.Now().Add(time.Hour)
+		},
+		Run: func(RunContext) error { return nil },
+	})
+	e.StartLoop("t-slot")
+
+	go e.tick()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && entered.Load() != 1 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if entered.Load() != 1 {
+		t.Fatal("tick 未进入 NextSlotFn")
+	}
+
+	probe := make(chan struct{})
+	go func() { _ = e.IsRunning("t-slot"); close(probe) }()
+	select {
+	case <-probe:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("IsRunning 被 tick 持有的 r.mu 阻塞——NextSlotFn 须锁外求值")
 	}
 }

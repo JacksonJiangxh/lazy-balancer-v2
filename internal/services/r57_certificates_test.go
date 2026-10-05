@@ -14,6 +14,7 @@ import (
 // done → 永久死锁。本测试断言两阶段（回调退出 + 重排完成）均有界完成。
 func TestCertificateService_scheduleDeploymentRetry_reentry_does_not_deadlock(t *testing.T) {
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	entered := make(chan struct{}, 4)
 	release := make(chan struct{})
 	service.retryDeployment = func(_ context.Context, _ int) error {

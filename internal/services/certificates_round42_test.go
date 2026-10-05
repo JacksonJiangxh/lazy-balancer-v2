@@ -29,6 +29,7 @@ func TestCertificateRenewalDays_logsWarningOnReadFailure(t *testing.T) {
 
 	// When the three renewal-days readers run with the broken read
 	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
 	_ = service.CheckExpiration()
 	_ = service.checkFailedFirstIssuance(3)
 	if err := requeueNonTerminalCertJobs(context.Background(), nil); err != nil {

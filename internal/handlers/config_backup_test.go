@@ -1429,6 +1429,59 @@ func TestValidateV2Backup_rejects_wildcard_domain(t *testing.T) {
 	}
 }
 
+// U4-D-1（第 68 轮审计）：v2 导入 ruleFeatureInput 补 EnableDnsServer/DnsServer——
+// 此前两字面量恒零值，TCP 规则携带 dns_server/enable_dns_server 的脏行绕过
+// validateRuleFeatures 的 U4-P4-1 门（保存侧 R67 起拒绝、协议切换零值化、
+// 存量迁移已清空）原样落库成「永不生效且无告警」死配置。与保存侧同门禁：
+// TCP+DNS 脏行整包 400；HTTP 规则携带合法 dns 字段（老备份正常形态）不受影响。
+func TestValidateV2Backup_rejects_tcp_rule_with_dns_server(t *testing.T) {
+	tests := []struct {
+		name        string
+		rule        map[string]any
+		wantErrText string
+	}{
+		{
+			name:        "TCP 规则携带 dns_server 脏行被拒",
+			rule:        map[string]any{"caddy_id": "lb_backup_tcpdns", "name": "TCP-DNS", "protocol": "tcp", "listen_port": 3306, "dns_server": "8.8.8.8"},
+			wantErrText: "TCP 规则不支持 DNS 服务发现配置",
+		},
+		{
+			name:        "TCP 规则携带 enable_dns_server 脏行被拒",
+			rule:        map[string]any{"caddy_id": "lb_backup_tcpdns2", "name": "TCP-DNS2", "protocol": "tcp", "listen_port": 3306, "enable_dns_server": 1},
+			wantErrText: "TCP 规则不支持 DNS 服务发现配置",
+		},
+		{
+			name: "TCP 规则无 DNS 字段正常导入（老备份口径）",
+			rule: map[string]any{"caddy_id": "lb_backup_tcpplain", "name": "TCP", "protocol": "tcp", "listen_port": 3306},
+		},
+		{
+			name: "HTTP 规则携带合法 dns_server 不受影响（R67 域B 老备份口径）",
+			rule: map[string]any{"caddy_id": "lb_backup_httpdns", "name": "HTTP-DNS", "protocol": "http", "domain": "dns.test", "listen_port": 80, "enable_dns_server": 1, "dns_server": "8.8.8.8"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backup := completeBackupJSON(t, map[string][]map[string]any{"lb_rules": {tt.rule}})
+			var b configBackup
+			if err := json.Unmarshal([]byte(backup), &b); err != nil {
+				t.Fatalf("unmarshal backup: %v", err)
+			}
+			// 与 TestValidateV2Backup_rejects_wildcard_domain 同链序（R38 C-3）。
+			_ = skipEmptyDomainHTTPRules(b.Tables)
+			err := validateV2BackupRules(b.Tables)
+			if tt.wantErrText != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrText) {
+					t.Fatalf("validateV2BackupRules err=%v, want contains %q", err, tt.wantErrText)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateV2BackupRules unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 // R62 C3-F2：v2 导入 upstreams.protocol 白名单——与保存侧 validateUpstreams 同口径，
 // 防手造备份带入 http 规则 + 上游 "tls"（渲染侧明文 HTTP 打 TLS 端口，静默 502）。
 func TestValidateBackupRuleReferences_rejects_bad_upstream_protocol(t *testing.T) {

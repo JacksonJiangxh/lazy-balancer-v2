@@ -1061,10 +1061,17 @@ func validateV2BackupRules(tables map[string][]map[string]any) error {
 				enabledHosts = append(enabledHosts, backupString(row["host"]))
 			}
 		}
+		// U4-D-1（第 68 轮审计）：补 EnableDnsServer/DnsServer——此前恒零值，
+		// validateRuleFeatures 的 U4-P4-1 门（TCP 携带 DNS 服务发现配置即拒）
+		// 在导入链恒不触发，TCP+dns_server 脏行原样落库成死配置（保存侧 R67
+		// 已拒、协议切换零值化、存量迁移已清空）。HTTP 规则合法 dns 字段
+		// 不受影响（该门仅 TCP 分支消费）。
 		input := ruleFeatureInput{
 			Protocol:                   protocol,
 			Strategy:                   backupString(rule["strategy"]),
 			DynamicDNS:                 backupBooleanEnabled(rule["dynamic_dns"]),
+			EnableDnsServer:            backupBooleanEnabled(rule["enable_dns_server"]),
+			DnsServer:                  backupString(rule["dns_server"]),
 			EnabledUpstreamCount:       len(enabledHosts),
 			EnabledUpstreamHosts:       enabledHosts,
 			DnsFamily:                  backupString(rule["dns_family"]),

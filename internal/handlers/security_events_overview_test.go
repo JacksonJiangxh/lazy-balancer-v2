@@ -259,6 +259,13 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 		{"protocol attack", "921110", "HTTP Request Smuggling", "协议攻击"},
 		{"scanner", "913100", "Scanner Detected", "扫描探测"},
 		{"blocking evaluation", "949110", "Inbound Anomaly Score Exceeded", "请求阻断评估"},
+		// F-L3-68-02（第 68 轮审计）：已装 CRS v4 组的具体分类（waf/crs/rules/
+		// 目录实证规则 ID）——此前落兜底「其他」。
+		{"multipart attack", "922110", "Multipart Attack", "Multipart 攻击"},
+		{"response java leak", "952011", "Java Exception", "响应 Java 泄露"},
+		{"response iis leak", "954012", "IIS Error", "响应 IIS 泄露"},
+		{"web shell", "955011", "Web Shell Detected", "Web Shell"},
+		{"response ruby leak", "956011", "Ruby Error", "响应 Ruby 泄露"},
 		{"custom rule numeric id", "10001", "自定义拦截", "自定义规则"},
 		{"synthetic custom rule id", "1000001", "旧版规则 命中", "自定义规则"},
 		{"ip blacklist via msg", "", "命中 IP 黑名单", "IP 访问控制"},

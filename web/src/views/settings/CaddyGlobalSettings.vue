@@ -18,37 +18,37 @@
           <el-option label="warn" value="warn" />
           <el-option label="error" value="error" />
         </el-select>
-        <el-text type="info" size="small" class="tip-inline">建议 info；debug 日志量大</el-text>
+        <span class="form-tip-inline">建议 info；debug 日志量大</span>
       </el-form-item>
       <el-form-item label="日志大小">
         <el-input-number v-model="settings.caddy_log_size_mb" :disabled="isReadOnly" :min="100" :max="10240" controls-position="right" class="number-input" />
-        <el-text type="info" size="small" class="tip-inline tip-nowrap">MB，超限归档保留 5 份</el-text>
+        <span class="form-tip-inline tip-nowrap">MB，超限归档保留 5 份</span>
       </el-form-item>
       <el-form-item label="运行日志">
         <el-button size="small" :icon="View" @click="openLogDialog">查看日志</el-button>
-        <el-text type="info" size="small" class="tip-inline">查看 Caddy 运行时、TLS、HTTP 服务器与反向代理日志</el-text>
+        <span class="form-tip-inline">查看 Caddy 运行时、TLS、HTTP 服务器与反向代理日志</span>
       </el-form-item>
 
       <el-divider content-position="left">请求与超时</el-divider>
       <el-form-item label="请求体大小">
         <el-input-number v-model="settings.request_body_max_size_mb" :disabled="isReadOnly" :min="0" :max="4096" controls-position="right" class="number-input" />
-        <el-text type="info" size="small" class="tip-inline tip-nowrap">MB，请求体上限；0 = 默认 128</el-text>
+        <span class="form-tip-inline tip-nowrap">MB，请求体上限；0 = 默认 128</span>
       </el-form-item>
       <el-form-item label="读取超时">
         <el-input-number v-model="settings.http_read_timeout" :disabled="isReadOnly" :min="0" :max="86400" controls-position="right" class="number-input" />
-        <el-text type="info" size="small" class="tip-inline tip-nowrap">秒，读请求超时；0 = 无超时</el-text>
+        <span class="form-tip-inline tip-nowrap">秒，读请求超时；0 = 无超时</span>
       </el-form-item>
       <el-form-item label="写入超时">
         <el-input-number v-model="settings.http_write_timeout" :disabled="isReadOnly" :min="0" :max="86400" controls-position="right" class="number-input" />
-        <el-text type="info" size="small" class="tip-inline">秒，写响应超时；0 = 无超时</el-text>
+        <span class="form-tip-inline">秒，写响应超时；0 = 无超时</span>
       </el-form-item>
       <el-form-item label="空闲超时">
         <el-input-number v-model="settings.http_idle_timeout" :disabled="isReadOnly" :min="0" :max="86400" controls-position="right" class="number-input" />
-        <el-text type="info" size="small" class="tip-inline">秒，Keep-Alive 空闲超时；0 = 默认</el-text>
+        <span class="form-tip-inline">秒，Keep-Alive 空闲超时；0 = 默认</span>
       </el-form-item>
       <el-form-item label="上游 Keepalive">
         <el-input-number v-model="settings.upstream_keepalive_timeout" :disabled="isReadOnly" :min="0" :max="86400" controls-position="right" class="number-input" />
-        <el-text type="info" size="small" class="tip-inline">秒，上游空闲保持；0 = 默认 2 分钟</el-text>
+        <span class="form-tip-inline">秒，上游空闲保持；0 = 默认 2 分钟</span>
       </el-form-item>
 
       <el-divider content-position="left">代理超时</el-divider>
@@ -57,14 +57,14 @@
       <el-divider content-position="left">响应头</el-divider>
       <el-form-item label="Server Tokens">
         <el-switch v-model="settings.server_tokens_hidden" :disabled="isReadOnly" active-text="开启" inactive-text="关闭" />
-        <el-text type="info" size="small" class="tip-inline">隐藏响应 Server 头，减少指纹暴露</el-text>
+        <span class="form-tip-inline">隐藏响应 Server 头，减少指纹暴露</span>
       </el-form-item>
 
       <el-divider content-position="left">安全防护</el-divider>
       <el-form-item label="受信代理">
         <div class="trusted-toggle">
           <el-switch v-model="settings.trusted_proxy_enabled" :disabled="isReadOnly" active-text="开启" inactive-text="关闭" />
-          <el-text type="info" size="small" class="tip-block">CDN/前置代理回源时开启，按真实客户端 IP 判定名单/地域/限流</el-text>
+          <div class="form-tip-line">CDN/前置代理回源时开启，按真实客户端 IP 判定名单/地域/限流</div>
         </div>
       </el-form-item>
       <template v-if="settings.trusted_proxy_enabled">
@@ -79,7 +79,7 @@
             placeholder="粘贴该 CDN 回源网段（CIDR），以官方公布为准"
             class="trusted-field"
           />
-          <el-text type="info" size="small" class="tip-block">仅这些网段发来的请求头会被采信；未配对网段时所有头一律被忽略（最小 /8 与 /96）。{{ trustedPresetRangesDoc }}</el-text>
+          <div class="form-tip-line">仅这些网段发来的请求头会被采信；未配对网段时所有头一律被忽略（最小 /8 与 /96）。{{ trustedPresetRangesDoc }}</div>
         </el-form-item>
         <el-form-item label="请求头">
           <el-select
@@ -92,7 +92,7 @@
             placeholder="留空 = 仅 X-Forwarded-For"
             class="trusted-field"
           />
-          <el-text type="info" size="small" class="tip-block">按顺序优先取：把该 CDN 保证覆盖的权威头放最前。{{ trustedPresetNote }}</el-text>
+          <div class="form-tip-line">按顺序优先取：把该 CDN 保证覆盖的权威头放最前。{{ trustedPresetNote }}</div>
         </el-form-item>
         <el-form-item label="预设填充">
           <el-select
@@ -105,12 +105,12 @@
           >
             <el-option v-for="preset in CDN_PRESETS" :key="preset.label" :label="preset.label" :value="preset.label" />
           </el-select>
-          <el-text type="info" size="small" class="tip-block">按所选 CDN 一键填充上方「请求头」推荐值；仅辅助输入，不影响已填内容以外的配置</el-text>
+          <div class="form-tip-line">按所选 CDN 一键填充上方「请求头」推荐值；仅辅助输入，不影响已填内容以外的配置</div>
         </el-form-item>
         <el-form-item label="严格模式">
           <el-switch v-model="settings.trusted_proxy_strict" :disabled="isReadOnly" active-text="开启" inactive-text="关闭" />
           <el-tooltip content="关闭后按最左值取 IP，可被伪造，不建议关闭" placement="top">
-            <el-text type="info" size="small" class="tip-inline">严格取「最右可信」值；关闭仅用于特殊代理链</el-text>
+            <span class="form-tip-inline">严格取「最右可信」值；关闭仅用于特殊代理链</span>
           </el-tooltip>
         </el-form-item>
       </template>
@@ -118,7 +118,7 @@
       <el-divider content-position="left">访问日志</el-divider>
       <el-form-item label="自定义格式">
         <el-switch v-model="settings.access_log_json" :disabled="isReadOnly" active-text="自定义 JSON" inactive-text="Caddy JSON" />
-        <el-text type="info" size="small" class="tip-block">开启后使用 filter 编码器按自定义格式输出；关闭时输出 Caddy 原生完整 JSON</el-text>
+        <div class="form-tip-line">开启后使用 filter 编码器按自定义格式输出；关闭时输出 Caddy 原生完整 JSON</div>
       </el-form-item>
       <el-form-item v-if="settings.access_log_json" label="日志格式">
         <div class="format-field">
@@ -130,11 +130,11 @@
             placeholder="每行一个字段映射，格式: caddy字段路径 -> 自定义名称，或 caddy字段路径 -> delete"
           />
           <el-button text type="primary" size="small" :disabled="isReadOnly" @click="settings.access_log_format = DEFAULT_ACCESS_LOG_FORMAT">还原默认格式</el-button>
-          <el-text type="info" size="small" class="format-tip">
+          <div class="form-tip-line format-tip">
             每行一条规则：字段重命名 <code>request&gt;remote_ip -&gt; src</code> 或删除字段 <code>request&gt;headers -&gt; delete</code>。
             可用字段：<code>request&gt;remote_ip</code> <code>request&gt;client_ip</code> <code>request&gt;method</code> <code>request&gt;host</code> <code>request&gt;uri</code> <code>request&gt;proto</code> <code>request&gt;headers&gt;User-Agent</code> <code>status</code> <code>size</code> <code>duration</code> <code>bytes_read</code> <code>user_id</code> <code>ts</code> <code>resp_headers</code> <code>request&gt;tls</code>。
             Caddy 日志文档：<a href="https://caddyserver.com/docs/json/apps/http/servers/logs/" target="_blank" rel="noopener noreferrer">官方字段说明</a>
-          </el-text>
+          </div>
         </div>
       </el-form-item>
       <div class="form-actions">
@@ -419,12 +419,13 @@ onUnmounted(stopLogPolling)
 .trusted-field { width: 100%; max-width: 560px; }
 .trusted-preset-field { width: 260px; }
 .trusted-toggle { display: flex; flex-direction: column; align-items: flex-start; }
-.tip-inline { margin-left: 8px; line-height: 1.5; }
-.tip-block { display: block; flex-basis: 100%; margin-top: 4px; line-height: 1.5; }
 /* 单行描述(2026-09-19 图片报障):只加 nowrap,不做溢出裁切(窄屏容忍伸出) */
 .tip-nowrap { white-space: nowrap; }
 .format-field { width: 100%; min-width: 0; }
-.format-tip { display: block; margin-top: 4px; line-height: 1.5; white-space: normal; }
+/* U9-68-P5-1：tip-inline/tip-block 旧式 el-text 已全量归一全局 form-tip-inline/
+   form-tip-line（main.css 唯一事实源，scoped 重复定义删除）；format-tip 仅保留
+   链接/行高补充样式 */
+.format-tip { line-height: 1.5; }
 .format-tip a { color: var(--primary); text-decoration: none; }
 .format-tip a:hover { text-decoration: underline; }
 .form-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
@@ -433,6 +434,5 @@ onUnmounted(stopLogPolling)
 
 @media (max-width: 767px) {
   .card-header { align-items: flex-start; }
-  .tip-inline { flex-basis: 100%; margin-top: 4px; margin-left: 0; }
 }
 </style>

@@ -3226,6 +3226,11 @@ func categorizeAttack(ruleTriggered, ruleMsg string) string {
 		return "协议异常"
 	case strings.HasPrefix(ruleTriggered, "921"):
 		return "协议攻击"
+	case strings.HasPrefix(ruleTriggered, "922"):
+		// F-L3-68-02（第 68 轮审计）：已装 CRS v4 组补具体分类——
+		// REQUEST-922-MULTIPART-ATTACK（922100/922110 等，waf/crs/rules/ 实证），
+		// 此前落兜底「其他」。
+		return "Multipart 攻击"
 	case strings.HasPrefix(ruleTriggered, "911"):
 		return "方法限制"
 	case strings.HasPrefix(ruleTriggered, "912"):
@@ -3244,8 +3249,20 @@ func categorizeAttack(ruleTriggered, ruleMsg string) string {
 		return "响应信息泄露"
 	case strings.HasPrefix(ruleTriggered, "951"):
 		return "响应 SQL 泄露"
+	// F-L3-68-02（第 68 轮审计）：已装 CRS v4 响应侧四组补具体分类——
+	// RESPONSE-952/954/956 DATA-LEAKAGES（952011/954012/956011 等）与
+	// RESPONSE-955-WEB-SHELLS（955011 等），waf/crs/rules/ 目录实证，
+	// 此前均落兜底「其他」。
+	case strings.HasPrefix(ruleTriggered, "952"):
+		return "响应 Java 泄露"
 	case strings.HasPrefix(ruleTriggered, "953"):
 		return "响应 PHP 泄露"
+	case strings.HasPrefix(ruleTriggered, "954"):
+		return "响应 IIS 泄露"
+	case strings.HasPrefix(ruleTriggered, "955"):
+		return "Web Shell"
+	case strings.HasPrefix(ruleTriggered, "956"):
+		return "响应 Ruby 泄露"
 	case strings.HasPrefix(ruleTriggered, "959"):
 		return "响应阻断评估"
 	case strings.HasPrefix(ruleTriggered, "949"):
@@ -3721,7 +3738,14 @@ func (h *Handlers) StartCRSUpdate(c *gin.Context) {
 		return
 	}
 	op := auditOperator(c)
-	go func() { _ = te.Trigger("crs", "manual", op) }()
+	go func() {
+		// F-U1-1（第 68 轮）：Trigger 失败补偿（任务未执行/失败否则零痕迹——
+		// 自记族的失败审计以任务体真实执行为前提）。
+		if err := te.Trigger("crs", "manual", op); err != nil {
+			services.Logf("error", "手动触发 CRS 更新失败: %v", err)
+			services.RecordAuditLog(op, "触发失败", "CRS规则库", "手动触发 CRS 更新失败: "+err.Error(), "")
+		}
+	}()
 	// 审计由任务体自记（operator 经 RunContext 归人——2026-09-29 裁定单记口径）
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 }
@@ -3861,7 +3885,13 @@ func (h *Handlers) StartIP2RegionUpdate(c *gin.Context) {
 		return
 	}
 	op := auditOperator(c)
-	go func() { _ = te.Trigger("ip2region", "manual", op) }()
+	go func() {
+		// F-U1-1（第 68 轮）：Trigger 失败补偿（同 StartCRSUpdate 口径）。
+		if err := te.Trigger("ip2region", "manual", op); err != nil {
+			services.Logf("error", "手动触发 IP2Region 更新失败: %v", err)
+			services.RecordAuditLog(op, "触发失败", "IP数据库", "手动触发 IP2Region 更新失败: "+err.Error(), "")
+		}
+	}()
 	// 审计由任务体自记（operator 经 RunContext 归人——2026-09-29 裁定单记口径）
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 }

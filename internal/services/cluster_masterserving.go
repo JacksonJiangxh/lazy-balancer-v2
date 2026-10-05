@@ -131,11 +131,10 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 
 	seen := make(map[int64]bool, len(nodes))
 	online, offlineCount, lagging := 0, 0, 0
-	// 每节点阈值=max(2×全局 sync_interval, 下限 120s)——同一轮全节点同值（全局列）。
-	threshold := time.Duration(2*syncInterval) * time.Second
-	if threshold < masterSyncOfflineThreshold {
-		threshold = masterSyncOfflineThreshold
-	}
+	// 每节点阈值与 ComputeNodeStatus/updateOverview 同口径（F-L2-68-02）——
+	// max(2×全局 sync_interval, 下限 120s)+脏值 clamp 归一到 nodeOfflineThreshold，
+	// 同一轮全节点同值（全局列）。
+	threshold := nodeOfflineThreshold(syncInterval)
 	for _, n := range nodes {
 		seen[n.id] = true
 		lastSeen := parseNodeLastSeen(n.seenRaw)

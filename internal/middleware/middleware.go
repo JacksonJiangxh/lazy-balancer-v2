@@ -365,7 +365,10 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 		v1.Use(apiKeyAuth(cfg))
 		v1.Use(jwtAuth(cfg))
 		v1.Use(apiKeyReadOnlyGuard())
-		v1.Use(mfaStepUpGuard())
+		// U7c-68-01（第 68 轮审计）：mfaStepUpGuard 不在 v1 级挂载——admin 组内
+		// adminOnly 必须先于 step-up（非管理员先见 403 角色真因，而非 428 后
+		// 输码重试才见真因）；守卫改在 admin/business 两组级挂载（见下方组装配，
+		// 组内次序 adminOnly → mfaStepUpGuard → readOnlyGuard）。
 		// A-1(2026-09-10 审计):把 auditClientIP(内部 MCP 转发采信头)结果
 		// 注入 context,handlers 侧 recordAudit 优先读取——此前 handler 审计
 		// 路径的 c.ClientIP() 对回环自调用恒 127.0.0.1,来源 IP 取证断裂。
@@ -383,7 +386,10 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 			v1.POST("/auth/logout", h.Logout)
 			// User management (admin only)
 			admin := v1.Group("")
-			admin.Use(adminOnly(), readOnlyGuard(db.DB))
+			// U7c-68-01：adminOnly 先于 mfaStepUpGuard——非管理员打 admin 端点
+			// 先见 403 角色真因；step-up 仍在 readOnlyGuard 之前（U7c-3 从节点
+			// 403 先于 428 的守卫内短路口径不变）。
+			admin.Use(adminOnly(), mfaStepUpGuard(), readOnlyGuard(db.DB))
 			{
 				admin.POST("/users", h.CreateUser)
 				admin.PUT("/users/:id", h.UpdateUser)
@@ -496,7 +502,9 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 
 			// User + Admin
 			business := v1.Group("")
-			business.Use(readOnlyGuard(db.DB))
+			// U7c-68-01：守卫随组级下沉（原 v1 级）——business 组保持原有相对
+			// 次序（step-up 先于 readOnlyGuard，U7c-3 守卫内从节点短路不变）。
+			business.Use(mfaStepUpGuard(), readOnlyGuard(db.DB))
 			{
 				// 任务监控聚合视图（全员可见；从节点经 readOnlyGuard 只读可用）
 				business.GET("/system/tasks", h.ListSystemTasks)
@@ -985,6 +993,11 @@ func apiKeyReadOnlyGuard() gin.HandlerFunc {
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"code": 403, "message": "只读 API 密钥禁止写操作"})
 	}
 }
+
+// 挂载面：admin/business 两组级（U7c-68-01 自 v1 级下沉）——admin 组内 adminOnly
+// 先于本守卫（非管理员先见 403 角色真因），business 组内本守卫先于 readOnlyGuard
+// （U7c-3 从节点短路在守卫内保持）。v1 级直挂路由（openapi.yaml/caddy/metrics/
+// logout）本就不在覆盖面（GET 非敏感导出、logout 豁免），下沉无行为变化。
 
 // mfaStepUpGuard v2.1.8：MFA 写操作验证（全局开关，默认关；R72 五次：60 秒窗）。开启时，启用 MFA
 // 的 JWT 用户执行写操作（readOnlyWriteRoutes 判定源——与只读密钥同一事实源，契约

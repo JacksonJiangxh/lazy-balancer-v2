@@ -186,11 +186,15 @@ func (e *Engine) SetRole(isMaster bool) {
 	// （生产启动/翻转期为三连调用）不是重启意图——tryStartDaemon 传
 	// false，不再误栽 pendingRestart（U1-66-01）。Periodic 不启停，仅
 	// 角色真实获得时置零节拍使下一 tick 即到期（U1-66-02：原置零分支
-	// 位于仅收集 Daemon 的切片内不可达）。
+	// 位于仅收集 Daemon 的切片内不可达）。F-L2-68-01（第 68 轮）：
+	// Scheduled 在途 Run 随角色不符中止——demote 后继续跑完会让从节点
+	// 写版本行/名单/规则树，打破只读不变量；取消经 rc.Ctx 传播，三库
+	// Run 体据此落 skipped（与起点角色复查同语义）。promote 无需动作
+	// （tick 每轮重读 NextSlotFn 自动到点触发）。
 	e.mu.RLock()
 	targets := make([]*registration, 0, len(e.regs))
 	for _, r := range e.regs {
-		if r.desc.Kind == KindDaemon || r.desc.Kind == KindPeriodic {
+		if r.desc.Kind == KindDaemon || r.desc.Kind == KindPeriodic || r.desc.Kind == KindScheduled {
 			targets = append(targets, r)
 		}
 	}
@@ -201,6 +205,19 @@ func (e *Engine) SetRole(isMaster bool) {
 				r.mu.Lock()
 				r.lastCheck = time.Time{}
 				r.mu.Unlock()
+			}
+			continue
+		}
+		if r.desc.Kind == KindScheduled {
+			// 角色不符（demote/重申从节点）：取消在途 Run——与下方 Daemon
+			// 分支同型；loopEnabled 保留（promote 后 tick 自动恢复排程）。
+			if !e.roleAllows(r.desc.RunsOn) {
+				r.mu.Lock()
+				c := r.cancel
+				r.mu.Unlock()
+				if c != nil {
+					c()
+				}
 			}
 			continue
 		}
@@ -588,8 +605,14 @@ func (e *Engine) runNow(id, trigger, operator string) (int64, error) {
 
 	rc := RunContext{Ctx: ctx, Trigger: trigger, Operator: operator, RunID: runID}
 	start := time.Now()
-	if trigger == "manual" || trigger == "startup" {
+	// F-L1-68-04（第 68 轮）：caddy-restart（Caddy 崩溃自愈 watcher 通道）
+	// 同样落 [start]——曾仅 manual/startup 放行，自愈轮只有 [done]，排障
+	// 看不到执行起点。
+	switch trigger {
+	case "manual", "startup":
 		taskLogAppend(id, fmt.Sprintf("[start] %s触发", map[bool]string{true: "启动", false: "手动"}[trigger == "startup"]))
+	case "caddy-restart":
+		taskLogAppend(id, "[start] Caddy重启触发")
 	}
 	runErr := runGuarded(r.desc.Run, rc)
 	status := terminalStatus(ctx, runErr)
@@ -600,13 +623,20 @@ func (e *Engine) runNow(id, trigger, operator string) (int64, error) {
 	}
 	taskLogAppend(id, msg)
 
+	// Scheduled：Run 已写新槽——重算缓存。F-L1-68-05 同族收敛：NextSlotFn 含
+	// DB 查询——锁外先求值（求值期间 running 仍=true，tick 自然跳过本轮，
+	// 零重触发窗口），再回锁一次性落 running/cancel/槽缓存。若新槽仍为过去
+	// （业务失败未推进等），running 标志在 CAS 前防重入，此处值供下 tick 判定。
+	var nextSlot time.Time
+	hasSlotFn := r.desc.Kind == KindScheduled && r.desc.NextSlotFn != nil
+	if hasSlotFn {
+		nextSlot = r.desc.NextSlotFn()
+	}
 	r.mu.Lock()
 	r.running = false
 	r.cancel = nil
-	// Scheduled：Run 已写新槽——重算缓存。若新槽仍为过去（业务失败未
-	// 推进等），running 标志在 CAS 前防重入，此处值供下 tick 判定。
-	if r.desc.Kind == KindScheduled && r.desc.NextSlotFn != nil {
-		r.nextScheduledTime = r.desc.NextSlotFn()
+	if hasSlotFn {
+		r.nextScheduledTime = nextSlot
 	}
 	r.mu.Unlock()
 	cancel()
@@ -674,20 +704,30 @@ func (e *Engine) tick() {
 		case KindScheduled:
 			// 排程感知：每 tick 重读 NextSlotFn（简单 SELECT——µs 级）；
 			// 槽到点才触发 Run（中间零执行零落行零日志）；in-flight 不重入。
+			// F-L1-68-05（第 68 轮）：NextSlotFn 含 DB 查询——持 r.mu 调用会把
+			// DB 延迟传导到同任务的 Cancel/IsRunning/StopLoop。改为快照→锁外
+			// 求值→回锁落缓存并复核状态（窗口内翻转不触发）。
 			r.mu.Lock()
 			if !r.loopEnabled || r.running {
 				r.mu.Unlock()
 				continue
 			}
-			if r.desc.NextSlotFn != nil {
-				r.nextScheduledTime = r.desc.NextSlotFn()
+			slotFn := r.desc.NextSlotFn
+			r.mu.Unlock()
+			var next time.Time
+			if slotFn != nil {
+				next = slotFn()
+			}
+			r.mu.Lock()
+			if slotFn != nil {
+				r.nextScheduledTime = next
 			}
 			due := !r.nextScheduledTime.IsZero() && now.After(r.nextScheduledTime)
+			eligible := r.loopEnabled && !r.running
 			r.mu.Unlock()
-			if due && e.roleAllows(r.desc.RunsOn) {
+			if due && eligible && e.roleAllows(r.desc.RunsOn) {
 				go func(rid string) { _, _ = e.runNow(rid, "auto", "") }(id)
 			}
-
 		case KindPeriodic:
 			// 固定间隔：每轮独立执行（Run→exit→记录）；in-flight 跳过本轮。
 			// 角色不符时置零 lastCheck（不推进节拍）——角色获得后下一 tick

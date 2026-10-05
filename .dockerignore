@@ -27,3 +27,9 @@ docs/
 .env
 *.env
 AGENTS.md
+# 本地工具会话目录（第 68 轮审计 U8b-1：防构建上下文形态变化泄漏本地
+# 会话/审计产物进中间层）
+.omp/
+.agent/
+.superpowers/
+story.md

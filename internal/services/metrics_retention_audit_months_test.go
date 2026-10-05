@@ -113,8 +113,9 @@ func TestMetricsServiceCleanupHistory_ignoresMonthsBelowOne(t *testing.T) {
 }
 
 // 死配置不再读取：手动补回 metrics_retention_days 列并设 1（模拟存量库残留），
-// audit_retention_months=3 ⇒ 90 天窗口，20 天前的行必须保留——旧实现按
-// metrics_retention_days=1 会将其删除（RED 判据），证明清理不再消费该键。
+// audit_retention_months 保持默认 3（=90 天）——20 天前的行仍按固定 7 天窗口
+// 删除。若实现回退到读 audit_retention_months（90 天窗口）该行会被保留
+// （RED 判据）；证明清理对两个配置键均不消费。
 func TestMetricsServiceCleanupHistory_ignoresDeadMetricsRetentionDaysColumn(t *testing.T) {
 	// Given：补回死列并塞入激进值 1 天
 	setupMetricsRetentionTest(t)
@@ -127,7 +128,7 @@ func TestMetricsServiceCleanupHistory_ignoresDeadMetricsRetentionDaysColumn(t *t
 	// When
 	NewMetricsService("", 30).cleanupHistory()
 
-	// Then：仅按 audit_retention_months（默认 3 个月=90 天）清理，死列值不生效
+	// Then：固定 7 天窗口清理——audit_retention_months 与死列值均不读取
 	if got := countMetricsRow(t, "lb_20d"); got != 0 {
 		t.Fatalf("20-day row count=%d, want 0（固定 7 天窗口;metrics_retention_days 与 audit_retention_months 均不读取）", got)
 	}

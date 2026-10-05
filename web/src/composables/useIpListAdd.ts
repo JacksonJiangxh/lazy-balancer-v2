@@ -13,7 +13,8 @@ export interface IpListOption {
   system?: boolean
 }
 
-export interface AddIpToListOptions {
+// F-U10-1（第 68 轮）：全仓零外部消费（仅本模块参数类型）——去掉 export
+interface AddIpToListOptions {
   /** 动作词（默认「加入」）：确认框标题/文案与成功反馈共用 */
   verb?: string
   /** 成功反馈文案覆盖（默认「已{verb}地址列表「{list.name}」」） */

@@ -39,6 +39,12 @@ func OverrideThreatWafDirForTest(dir string) (restore func()) {
 
 var ErrThreatUpdateRunning = errors.New("威胁情报库更新任务正在进行中")
 
+// ErrThreatUpdateFailed 任一源失败即整体失败（F-L1-68-01，第 68 轮）：失败终态
+// 回传引擎——RunUpdate 曾恒返 nil，引擎 task_runs 把失败轮记成 success。口径与
+// run 内 anyFailed/failSourceRow 对齐；skipped（角色复查）/cancelled（手动取消）
+// 各有终态通道，不算失败。
+var ErrThreatUpdateFailed = errors.New("威胁情报库更新失败：存在未更新成功的源（详见威胁库更新日志）")
+
 const (
 	threatMaxBodyBytes    = 16 << 20 // 16MB
 	threatMaxEntries      = 200000
@@ -169,6 +175,12 @@ func (m *ThreatUpdateManager) RunUpdate(trigger string, rc *taskengine.RunContex
 		m.mu.Unlock()
 	}()
 	m.run(trigger, rc)
+	// F-L1-68-01（第 68 轮）：失败终态回传引擎（镜像 crs/ip2region wire Run
+	// 体读 StatusSnapshot 判 failed 的口径）——恒返 nil 时引擎 task_runs 把
+	// 失败轮记成 success。
+	if m.StatusSnapshot().Outcome == "failed" {
+		return ErrThreatUpdateFailed
+	}
 	return nil
 }
 
@@ -260,7 +272,14 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		m.mu.Unlock()
 		return
 	}
-	runCtx, runCancel := context.WithCancel(context.Background())
+	// F-L2-68-01（第 68 轮）：runCtx 派生自 rc.Ctx（镜像 CRS/IP2Region 侧）——
+	// 引擎 demote 中止（SetRole 取消在途 Scheduled）随 rc.Ctx 传播；nil rc
+	// （测试/内部路径）回退 Background 保持旧语义。
+	runBase := context.Background()
+	if rc != nil && rc.Ctx != nil {
+		runBase = rc.Ctx
+	}
+	runCtx, runCancel := context.WithCancel(runBase)
 	// R63 单写方：task_runs 由引擎统一记录。
 	m.mu.Lock()
 	m.lastTrigger = trigger
@@ -289,10 +308,18 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	var changedIDs []int // 内容真实变化的名单 id（重载门的判定面）
 	anyFailed := false
 	cancelled := false
+	demoted := false // F-L2-68-01：demote 在途中止标记（outcome=skipped，优先于 cancelled/failed）
 	for _, source := range sources {
 		if runCtx.Err() != nil {
-			cancelled = true
-			AppendThreatUpdateLog("WARN", "cancelled", "威胁情报库更新已被手动取消（已完成源的结果保留）")
+			// F-L2-68-01：取消源分流——demote（角色已翻转）落 skipped（与起点
+			// 角色复查同语义：从节点中止非故障）；主节点=手动取消 cancelled。
+			if !updateRunStillMaster() {
+				demoted = true
+				AppendThreatUpdateLog("WARN", "skipped", "节点已降级为从节点，终止威胁情报库更新（已完成源的结果保留）")
+			} else {
+				cancelled = true
+				AppendThreatUpdateLog("WARN", "cancelled", "威胁情报库更新已被手动取消（已完成源的结果保留）")
+			}
 			break
 		}
 		changed, failed := m.updateOneSource(runCtx, source, trigger)
@@ -303,9 +330,20 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		}
 		anyFailed = anyFailed || failed
 	}
+	// 中止点归一（F-L2-68-01）：末源在途取消时循环自然结束（无下一轮顶部
+	// 检查）——补判一次取消源；demote 优先于源失败（中止非故障）。
+	if !demoted && !cancelled && runCtx.Err() != nil {
+		if updateRunStillMaster() {
+			cancelled = true
+		} else {
+			demoted = true
+		}
+	}
 	m.mu.Lock()
 	m.lastFinishedAt = time.Now().UTC().Format(crsTimeLayout)
-	if cancelled {
+	if demoted {
+		m.lastTaskOutcome = "skipped"
+	} else if cancelled {
 		m.lastTaskOutcome = "cancelled"
 		m.lastCancelled = true
 	} else if anyFailed {

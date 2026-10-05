@@ -7,6 +7,7 @@ package handlers
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -65,8 +66,16 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 			if !services.TaskTriggerSelfRecordsAudit(id) {
 				recordAudit(c, "触发", "任务监控", "手动触发任务 "+m.Name)
 			}
+			// F-U3-01（第 68 轮）：operator 闭包外预取——gin.Context 在 handler
+			// 返回后被池化复用，闭包内读 c 是数据竞态。
+			op := auditOperator(c)
 			go func() {
-				_ = te.Trigger(id, "manual", auditOperator(c)) // 异步——耗时由 task_runs 记录；operator 审计归人
+				// F-U1-1（第 68 轮）：Trigger 失败补偿——否则非自记族只剩
+				// 「触发」孤儿行（任务未执行）、自记族零痕迹；日志同步留痕。
+				if err := te.Trigger(id, "manual", op); err != nil { // 异步——耗时由 task_runs 记录；operator 审计归人
+					services.Logf("error", "手动触发任务 %s 失败: %v", id, err)
+					services.RecordAuditLog(op, "触发失败", "任务监控", fmt.Sprintf("手动触发任务 %s 失败: %v", m.Name, err), "")
+				}
 			}()
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 			return

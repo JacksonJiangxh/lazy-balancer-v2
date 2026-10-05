@@ -187,62 +187,14 @@ func MFARestoreChallenge(token string, userID int) {
 
 // —— 主验证入口 ——
 
-// MFAVerifyCode 对启用 MFA 的用户验证 6 位 TOTP 或恢复码（按长度自动分流）。
-// 成功：推进 mfa_last_timestep（重放防护）；失败：只提示不计数不锁定（2026-09
-// 裁定：全系统唯一锁定=登录阶段密码+验证码同计 5 次/10 分钟、受「登录失败
-// 锁定」开关控制，登录两步的失败计数由 handler 侧 recordLoginFailure 负责）。
-// 返回 (ok, err)。
-func MFAVerifyCode(userID int, code string, now time.Time) (bool, error) {
-	mfaMu.Lock()
-	defer mfaMu.Unlock()
-
-	var secret, recoveryJSON string
-	var lastStep int64
-	if err := db.DB.QueryRow(
-		"SELECT COALESCE(mfa_secret,''), COALESCE(mfa_recovery_codes,'[]'), COALESCE(mfa_last_timestep,0) FROM users WHERE id=?",
-		userID).Scan(&secret, &recoveryJSON, &lastStep); err != nil {
-		return false, err
-	}
-	if secret == "" {
-		return false, fmt.Errorf("用户未启用 MFA")
-	}
-
-	code = strings.TrimSpace(code)
-	if len(code) == 6 {
-		step, ok := mfaValidateTOTP(secret, code, now)
-		if ok {
-			// 重放防护：同窗或更早的已用片拒绝（±1 容差窗内）
-			if step <= lastStep {
-				return false, nil
-			}
-			// SLB10-N6:重放防护状态写失败必须传播——吞错时同片码在 ±1
-			// 容差窗内可重放换取新 step-up 窗。
-			if _, err := db.DB.Exec("UPDATE users SET mfa_last_timestep=? WHERE id=?", step, userID); err != nil {
-				return false, err
-			}
-			return true, nil
-		}
-	} else if len(code) >= 10 && len(code) <= 16 {
-		if mfaConsumeRecoveryCode(userID, code) {
-			return true, nil
-		}
-	}
-
-	// 2026-09 用户裁定：登录后的 MFA 验证失败只提示不计数不锁定（全系统唯一
-	// 锁定在登录阶段 5 次/10 分钟、受「登录失败锁定」开关控制；登录两步的
-	// 失败计数由 handler 侧 recordLoginFailure 负责）。
-	return false, nil
-}
-
-// MFAVerifyTOTPCode 仅校验 6 位动态验证码（用户裁决 N+10：除登录与重置 MFA
-// 外的全部 MFA 入口——verify-step 写守卫链（含配置导入）、重新绑定确认段、
-// 禁用确认——不接受恢复码。恢复码是一次性应急登录凭证，其「提交即消费」
-// 语义与高敏操作的二次校验/审计链不兼容，且不应作为操作授权凭证）。
-// 非 6 位输入与错误 TOTP 同按失败计（硬门冷却同样生效）；不触碰恢复码存储。
-func MFAVerifyTOTPCode(userID int, code string, now time.Time) (bool, error) {
-	mfaMu.Lock()
-	defer mfaMu.Unlock()
-
+// mfaVerifyTOTPLocked MFAVerifyCode/MFAVerifyTOTPCode 共享内核（U7a-68-04
+// 第 68 轮收敛；调用方须持 mfaMu）：读取 secret 与重放状态——secret 为空报
+// 「用户未启用 MFA」（两入口同口径）；code 为 6 位时校验 TOTP，成功推进
+// mfa_last_timestep（重放防护：同窗或更早的已用片拒绝，±1 容差窗内；
+// SLB10-N6 状态写失败必须传播——吞错时同片码可在容差窗内重放换取新
+// step-up 窗）。返回 (true,nil)=通过；(false,nil)=码错误/重放/非 6 位；
+// (false,err)=查询/写库故障。
+func mfaVerifyTOTPLocked(userID int, code string, now time.Time) (bool, error) {
 	var secret string
 	var lastStep int64
 	if err := db.DB.QueryRow(
@@ -253,27 +205,62 @@ func MFAVerifyTOTPCode(userID int, code string, now time.Time) (bool, error) {
 	if secret == "" {
 		return false, fmt.Errorf("用户未启用 MFA")
 	}
-
-	code = strings.TrimSpace(code)
 	if len(code) == 6 {
 		step, ok := mfaValidateTOTP(secret, code, now)
 		if ok {
 			if step <= lastStep {
 				return false, nil
 			}
-			// SLB10-N6:重放防护状态写失败必须传播——吞错时同片码在 ±1
-			// 容差窗内可重放换取新 step-up 窗。
 			if _, err := db.DB.Exec("UPDATE users SET mfa_last_timestep=? WHERE id=?", step, userID); err != nil {
 				return false, err
 			}
 			return true, nil
 		}
 	}
-
 	// 2026-09 用户裁定：登录后的 MFA 验证失败只提示不计数不锁定（全系统唯一
 	// 锁定在登录阶段 5 次/10 分钟、受「登录失败锁定」开关控制；登录两步的
 	// 失败计数由 handler 侧 recordLoginFailure 负责）。
 	return false, nil
+}
+
+// MFAVerifyCode 对启用 MFA 的用户验证 6 位 TOTP 或恢复码（按长度自动分流）。
+// 成功：推进 mfa_last_timestep（重放防护）；失败：只提示不计数不锁定（2026-09
+// 裁定：全系统唯一锁定=登录阶段密码+验证码同计 5 次/10 分钟、受「登录失败
+// 锁定」开关控制，登录两步的失败计数由 handler 侧 recordLoginFailure 负责）。
+// 返回 (ok, err)。
+func MFAVerifyCode(userID int, code string, now time.Time) (bool, error) {
+	mfaMu.Lock()
+	defer mfaMu.Unlock()
+
+	code = strings.TrimSpace(code)
+	if len(code) >= 10 && len(code) <= 16 {
+		// 恢复码通道（一次性应急登录凭证）：secret 门与 TOTP 内核同口径——
+		// 恢复码存储由 mfaConsumeRecoveryCode 自读自消费（原入口综合查询里的
+		// mfa_recovery_codes 列从未被使用，随本次收敛移除该死读）。
+		var secret string
+		if err := db.DB.QueryRow("SELECT COALESCE(mfa_secret,'') FROM users WHERE id=?", userID).Scan(&secret); err != nil {
+			return false, err
+		}
+		if secret == "" {
+			return false, fmt.Errorf("用户未启用 MFA")
+		}
+		if mfaConsumeRecoveryCode(userID, code) {
+			return true, nil
+		}
+		return false, nil
+	}
+	return mfaVerifyTOTPLocked(userID, code, now)
+}
+
+// MFAVerifyTOTPCode 仅校验 6 位动态验证码（用户裁决 N+10：除登录与重置 MFA
+// 外的全部 MFA 入口——verify-step 写守卫链（含配置导入）、重新绑定确认段、
+// 禁用确认——不接受恢复码。恢复码是一次性应急登录凭证，其「提交即消费」
+// 语义与高敏操作的二次校验/审计链不兼容，且不应作为操作授权凭证）。
+// 非 6 位输入与错误 TOTP 同按失败计（硬门冷却同样生效）；不触碰恢复码存储。
+func MFAVerifyTOTPCode(userID int, code string, now time.Time) (bool, error) {
+	mfaMu.Lock()
+	defer mfaMu.Unlock()
+	return mfaVerifyTOTPLocked(userID, strings.TrimSpace(code), now)
 }
 
 // MFAVerifyPending 绑定向导 activate 步：验证 pending secret 的当前码（无重放状态）。

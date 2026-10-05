@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -55,6 +56,9 @@ func daemonLifecycleRun(rc taskengine.RunContext, start, stop func()) error {
 	}
 	return nil
 }
+
+// certJobsActiveFn 测试缝（F-L4-68-01 竞态序列注入用）；生产=certJobsActive。
+var certJobsActiveFn = certJobsActive
 
 // TaskEngine 返回全局引擎实例（未初始化返回 nil——测试环境）。
 func TaskEngine() *taskengine.Engine { return taskEngine }
@@ -162,7 +166,14 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 						months = m
 					}
 				}
-				TaskLogf("log-cleanup", "cleanup", "日志清理完成：应用日志副本删除 %d 个（保留 %d 月，无过期为 0）；%s", res.AppRemoved, months, res.TaskLogs.Summary())
+				summary := fmt.Sprintf("日志清理完成：应用日志副本删除 %d 个（保留 %d 月，无过期为 0）；%s", res.AppRemoved, months, res.TaskLogs.Summary())
+				// F-L3-68-01（第 68 轮审计）：daemon 停机时的 waf-audit 兜底
+				// 动作如实进任务日志（2026-10-01 用户裁定：清理了哪个文件
+				// 必须可见）；无动作时不加尾段，日志行形态不变。
+				if len(res.WafAudit) > 0 {
+					summary += "；waf-audit 兜底：" + strings.Join(res.WafAudit, "、")
+				}
+				TaskLogf("log-cleanup", "cleanup", "%s", summary)
 			}
 			return nil
 		},
@@ -207,7 +218,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Run: func(rc taskengine.RunContext) error {
 			CertRenewalScanOnce()
 			// 入队即唤醒 CA 等待补扫（默认调度关闭——有活自动开启）
-			if certJobsActive() {
+			if certJobsActiveFn() {
 				taskEngine.StartLoop("cert-waiting-ca")
 			}
 			return nil
@@ -236,7 +247,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
 		IntervalFn: func() time.Duration { return 30 * time.Second },
 		StatusFn: func() string {
-			if certJobsActive() {
+			if certJobsActiveFn() {
 				return "running"
 			}
 			if te := TaskEngine(); te != nil && te.IsRunning("cert-waiting-ca") {
@@ -252,9 +263,17 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			return parseUTCSlot(at)
 		},
 		Run: func(rc taskengine.RunContext) error {
-			if !certJobsActive() {
-				// 全部终态——自动关闭调度（回到默认关闭态）
+			if !certJobsActiveFn() {
+				// 全部终态——自动关闭调度（回到默认关闭态）。
+				// F-L4-68-01（第 68 轮）：StopLoop 后复检——首查（T0）到停调度
+				// 之间的入队（T1）若经入队侧 StartLoop 先落地，会被本次 StopLoop
+				// 覆盖成「任务活跃但调度已停」死态；复检捕获则重新拉回（复检
+				// 之后的新入队由入队侧 StartLoop 承担，窗口闭合）。
 				taskEngine.StopLoop("cert-waiting-ca")
+				if certJobsActiveFn() {
+					taskEngine.StartLoop("cert-waiting-ca")
+					return nil
+				}
 				TaskLogf("cert-waiting-ca", "idle", "证书任务全部终态，自动停止补扫")
 				return nil
 			}
@@ -385,11 +404,12 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			if m == nil {
 				return ""
 			}
-			st := m.StatusSnapshot().Status
-			if st == string(CRSStatusIdle) || st == string(CRSStatusSuccess) || st == "" {
-				return ""
+			// F-L1-68-02（第 68 轮）：仅在途阶段映射 running——failed/skipped
+			// 持久终态曾落入 running，任务监控恒显「运行中」。
+			if IsActiveCRSStatus(m.StatusSnapshot().Status) {
+				return "running"
 			}
-			return "running"
+			return ""
 		},
 		MasterOnly: true,
 		CancelHook: func() bool { m := GetCRSUpdateManager(); return m != nil && m.CancelRunning() },
@@ -433,10 +453,12 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		StatusFn: func() string {
 			var status string
 			_ = db.DB.QueryRow("SELECT COALESCE(update_status,'') FROM security_ip2region_version WHERE id=1").Scan(&status)
-			if status == "" || status == "idle" || status == "success" {
-				return ""
+			// F-L1-68-02（第 68 轮）：同 CRS——仅在途阶段映射 running，
+			// failed/skipped 持久终态不再失真为「运行中」。
+			if IsActiveIP2RegionStatus(status) {
+				return "running"
 			}
-			return "running"
+			return ""
 		},
 		MasterOnly: true,
 		CancelHook: func() bool { return GetIP2RegionUpdateManager() != nil && GetIP2RegionUpdateManager().CancelRunning() },

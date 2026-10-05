@@ -26,6 +26,7 @@ func TestU7_P5_2_checkManualCertExpiration_expiryReadFailureLogsAtErrorLevel(t *
 	t.Cleanup(func() { log.SetOutput(oldWriter) })
 
 	// When
+	resetCertificateServiceForTest(t)
 	NewCertificateService().checkManualCertExpiration()
 
 	// Then：降级读取经 helper 以 error 级告警，内联 warn 级旧消息消失

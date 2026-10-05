@@ -249,7 +249,10 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		{Key: "caddy_server", Name: "Caddy HTTP 服务器日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
 		{Key: "caddy_proxy", Name: "Caddy 反向代理日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
 		{Key: "rule_access", Name: "规则访问日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
-		{Key: "coraza_audit", Name: "Coraza 审计日志", LimitBytes: sizeLimitMB("audit_log_size_mb", 10), KeepCount: 5, ConfigSource: "基础设置 · 审计日志大小"},
+		// F-L3-68-03（第 68 轮审计）：原 coraza_audit 行删除——前端零消费方
+		// （LogStorageBar 仅 security_events/rule_access 两键），且与
+		// security_events 行同文件同统计，纯重复死面；audit_log_size_mb 配置
+		// 链仍由 auditlog_rotation.go 完整消费。
 	}
 	byKey := func(key string) *LogStorageInfo {
 		for i := range infos {
@@ -281,9 +284,8 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		byKey("security_events").DBBytes = &sz
 	}
 	// SizeBytes=真实审计日志文件(2026-09-14 用户裁定:不再用 metrics.db 库文件
-	// 虚标——日志文件与 coraza_audit 同目录同口径,DBBytes 单独展示库容量)。
-	// U2-4:security_events 与 coraza_audit 两行共用同一文件——一次 dirBytes
-	// 两行复用(原先每次响应各调一次,重复全目录 ReadDir)。
+	// 虚标,DBBytes 单独展示库容量)。一次 dirBytes 供 security_events 行复用
+	// (原先每次响应各调一次,重复全目录 ReadDir)。
 	auditActive, auditRotated, auditRotCount := dirBytes(wafAuditLogFile)
 	if info := byKey("security_events"); info != nil {
 		info.SizeBytes, info.RotatedBytes, info.RotatedCount = auditActive, auditRotated, auditRotCount
@@ -294,8 +296,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		info.SizeBytes, info.RotatedBytes, info.RotatedCount = rtA, rtR, rtC
 	}
 	// U4-P5-3:每文件恰好一次 dirBytes——四个体行与「caddy」聚合行共用同一批
-	// 结果(原先聚合行对同 4 文件再次 dirBytes,单响应 8 次 ReadDir,前端轮询放大;
-	// U2-4 security_events/coraza_audit 同模式先例)。
+	// 结果(原先聚合行对同 4 文件再次 dirBytes,单响应 8 次 ReadDir,前端轮询放大)。
 	var caddyActive, caddyRotated int64
 	var caddyRotCount int
 	for _, entry := range []struct{ key, file string }{
@@ -314,9 +315,6 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	}
 	if info := byKey("caddy"); info != nil {
 		info.SizeBytes, info.RotatedBytes, info.RotatedCount = caddyActive, caddyRotated, caddyRotCount
-	}
-	if info := byKey("coraza_audit"); info != nil {
-		info.SizeBytes, info.RotatedBytes, info.RotatedCount = auditActive, auditRotated, auditRotCount
 	}
 	// 单一日志数据源（2026-09-29 用户裁定）：三库更新行与任务日志同文件
 	// （tasks/{crs|ip2region|threat}.log）——统计与内容同源。

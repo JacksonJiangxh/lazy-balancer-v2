@@ -29,7 +29,9 @@
       <el-form-item label="同步间隔">
         <div class="interval-row">
           <el-input-number v-model="syncInterval" :min="10" :max="86400" :disabled="intervalDisabled" />
-          <span class="interval-unit">秒</span>
+          <!-- U9-68-P5-1：单位后缀归一全局 form-tip-inline（原自管 .interval-unit
+               与全局类仅色差/字号差）；行内 gap 已提供间距，左侧外边距置零 -->
+          <span class="form-tip-inline" style="margin-left: 0">秒</span>
           <el-button v-if="!isSlave" :loading="intervalSaving" :disabled="intervalDisabled || syncInterval === status?.sync_interval" @click="saveSyncInterval">保存</el-button>
         </div>
         <div class="form-tip-line">{{ isSlave ? '由主节点同步下发，从节点不可修改' : '从节点拉取同步与上报状态的周期（10–86400 秒）' }}</div>
@@ -227,7 +229,6 @@ const submitRegistration = async (): Promise<void> => {
 .mode-row-label { width: 120px; flex-shrink: 0; height: 32px; line-height: 32px; text-align: right; padding-right: 12px; box-sizing: border-box; color: var(--el-text-color-regular); font-size: var(--el-form-label-font-size, 14px); }
 .mode-row-content { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .interval-row { display: flex; align-items: center; gap: 8px; }
-.interval-unit { color: var(--text-secondary); font-size: 13px; }
 
 @media (max-width: 768px) {
   .settings-form :deep(.el-form-item) { display: block; }

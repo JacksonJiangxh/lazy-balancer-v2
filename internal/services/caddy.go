@@ -341,7 +341,14 @@ func (s *CaddyService) persistLastGoodLocked(data []byte) {
 
 // ApplyLastKnownGood 读取并原样应用最后一次成功下发的配置（启动兜底）。
 // 未配置/文件缺失/应用失败均返回错误，由调用方决定后续。
+// F-L5-68-03（第 68 轮审计）：/load 入 CaddyOpLock——此前仅持 s.mu，与持
+// CaddyOpLock 的并发「渲染+/load」写者（handler 写路径/后台 Force 重载）交错时，
+// last-good 的旧配置可后到覆盖新配置。持锁序 CaddyOpLock→s.mu 与
+// GenerateAndApplyConfigForce 同型（叶操作无 AB-BA）；唯一生产调用方
+// ApplyConfigOnStartup 在 applyCaddyConfigE 返回（锁已释放）后调用，无需 InLock 变体。
 func (s *CaddyService) ApplyLastKnownGood() error {
+	CaddyOpLock.Lock()
+	defer CaddyOpLock.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.lastGoodPath == "" {

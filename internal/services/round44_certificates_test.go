@@ -21,6 +21,7 @@ func TestCERT44_5_checkManualCertExpiration_floorsNonPositiveWarnDays(t *testing
 	oldWriter := log.Writer()
 	log.SetOutput(&buf)
 	t.Cleanup(func() { log.SetOutput(oldWriter) })
+	resetCertificateServiceForTest(t)
 
 	for _, days := range []int{0, -5} {
 		buf.Reset()

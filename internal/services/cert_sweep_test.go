@@ -106,6 +106,7 @@ func TestCertTicks_skipAndRecoveryLinesTransitionOnce(t *testing.T) {
 	}
 
 	// 恢复：true→false 转换记一次恢复行，随后正常执行不再记
+	resetCertificateServiceForTest(t)
 	SetActiveCertificateService(NewCertificateService())
 	CertRenewalScanOnce()
 	data, err = os.ReadFile(taskengine.TaskLogPath("cert-renewal-scan"))

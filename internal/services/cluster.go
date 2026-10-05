@@ -404,17 +404,33 @@ func (s *ClusterService) retryPendingPinCleanup() {
 // 避免阈值在两处各自硬编码导致口径漂移。
 const nodeOfflineMultiplier = 2
 
+// nodeOfflineThreshold 节点离线阈值的统一口径（F-L2-68-02，第 68 轮审计）：
+// max(nodeOfflineMultiplier×sync_interval, masterSyncOfflineThreshold 下限)。
+// 存量脏值（R42 前残留的 0/负数或 1-9s）按 60s 计，与从节点 run loop
+// （cluster_sync.go）的 clamp 值一致：从节点实际以 60s 周期上报，若按原始脏值
+// （或 10s）计算阈值，会把两次上报之间的正常从节点误判为离线（R44-1）。
+// ComputeNodeStatus（节点列表/登录票据）、updateOverview（总览在线数）与
+// masterSyncServingRound（巡检）共用本函数——此前巡检侧 max(2×global,120s) 而
+// UI 侧仅 2×clamp(sync_interval)，sync_interval∈[10,59] 时两口径分叉
+// （interval=30：巡检 120s 判在线、UI 60s 判离线）。
+func nodeOfflineThreshold(syncInterval int) time.Duration {
+	if syncInterval < 10 {
+		syncInterval = 60
+	}
+	threshold := time.Duration(nodeOfflineMultiplier*syncInterval) * time.Second
+	if threshold < masterSyncOfflineThreshold {
+		threshold = masterSyncOfflineThreshold
+	}
+	return threshold
+}
+
 func ComputeNodeStatus(approved bool, lastSeen time.Time, syncInterval int, now time.Time) string {
 	if !approved {
 		return "pending"
 	}
-	// 存量脏值（R42 前残留的 0/负数或 1-9s）统一按 60s 计，与从节点 run loop
-	// （cluster_sync.go）的 clamp 值一致：从节点实际以 60s 周期上报，若此处按
-	// 原始脏值（或 10s）计算阈值，会把两次上报之间的正常从节点误判为离线（R44-1）。
-	if syncInterval < 10 {
-		syncInterval = 60
-	}
-	if lastSeen.IsZero() || now.Sub(lastSeen) > nodeOfflineMultiplier*time.Duration(syncInterval)*time.Second {
+	// 阈值口径集中在 nodeOfflineThreshold（F-L2-68-02）：脏值 clamp 与 120s 下限
+	// 与巡检/总览同函数，UI 不再各自维护一套。
+	if lastSeen.IsZero() || now.Sub(lastSeen) > nodeOfflineThreshold(syncInterval) {
 		return "offline"
 	}
 	return "online"

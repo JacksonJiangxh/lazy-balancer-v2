@@ -15,7 +15,6 @@ import (
 	"strings"
 	"testing"
 
-	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -2169,9 +2168,7 @@ func TestGenerateCaddyConfig_autoHTTPSFullyDisabled(t *testing.T) {
 // 采集走 SecAuditLog→安全事件页(独立链路),服务器运行日志只留服务器事件。
 func TestGenerateCaddyConfig_wafNamespaceExcludedFromServerLog(t *testing.T) {
 	// Given 任意有效配置(需 DB 视图)
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	newClusterTestService(t)
 	cfg := GenerateCaddyConfig()
 	// When 读取 caddy_server 日志条目
 	logging, ok := cfg["logging"].(map[string]interface{})

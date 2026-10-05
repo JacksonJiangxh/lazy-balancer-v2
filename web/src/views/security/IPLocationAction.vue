@@ -339,6 +339,7 @@ interface RowView {
   policy: PolicyRow
   inTrust: boolean
   inTrustInline: boolean
+  inTrustInlineExact: boolean
   trustEnabled: boolean
   trustCount: number
   trustDetectionLabel: string
@@ -364,12 +365,19 @@ interface RowView {
 }
 
 const rowView = (policy: PolicyRow): RowView => {
-  // 信任口径（内联 ∪ 引用）先行计算——阶段 0 行整行语义即信任，ACL 行也要渲染信任动作
+  // 信任口径（内联 ∪ 引用）先行计算——阶段 0 行整行语义即信任，ACL 行也要渲染信任动作。
+  // U9-68-P4-1：信任成员判定与 ACL 侧同为 CIDR 感知（entryMatchesIp）——内联/引用
+  // 信任名单的 CIDR 条目在引擎侧本就豁免该 IP，精确串匹配会漏报「已信任」状态；
+  // 移除动作仍收窄为精确条目（inTrustInlineExact，与 U9-1 ACL 侧同口径——CIDR
+  // 覆盖的 IP 无法由 PUT 精确剔除）
   const trustEntries = mergedTrustEntries(policy)
+  const trustInlineEntries = parseIPList(policy.ip_whitelist)
+  const inTrustInlineExact = trustInlineEntries.includes(props.ip.trim())
   const view: RowView = {
     policy,
-    inTrust: trustEntries.includes(props.ip),
-    inTrustInline: parseIPList(policy.ip_whitelist).includes(props.ip),
+    inTrust: trustEntries.some((e) => entryMatchesIp(e, props.ip.trim())),
+    inTrustInline: trustInlineEntries.some((e) => entryMatchesIp(e, props.ip.trim())),
+    inTrustInlineExact,
     trustEnabled: policy.ip_whitelist_enabled !== false,
     trustCount: trustEntries.length,
     // 与 securityStages.buildStage0Rows 模式行同文案
@@ -399,11 +407,10 @@ const rowView = (policy: PolicyRow): RowView => {
   // 内容漂移），不再显示；主动作归「取消信任」（豁免方策略卡上）。
   const isStage0OrMixed = policyTypeOf(policy) === 'stage0' || policyTypeOf(policy) === 'mixed'
   view.canAddTrust = isStage0OrMixed && !view.inTrust
-    && !policies.value.some((p) => mergedTrustEntries(p).includes(props.ip))
-  view.canRemoveTrust = view.inTrust && view.trustEnabled && view.inTrustInline
+    && !policies.value.some((p) => mergedTrustEntries(p).some((e) => entryMatchesIp(e, props.ip.trim())))
+  view.canRemoveTrust = view.inTrust && view.trustEnabled && view.inTrustInlineExact
   view.trustDead = view.inTrust && !view.trustEnabled
-  view.canClearDeadTrust = view.trustDead && view.inTrustInline
-
+  view.canClearDeadTrust = view.trustDead && view.inTrustInlineExact
   // 信任引用命中（全类型行）：信任 refs 中包含此 IP 的非系统列表 → 可移除。
   // 条目来源 = ipListEntries 缓存（loadPolicies 拉取 acl+whitelist 全部 refs）。
   const trustRefIds = parseRefIds(policy.ip_whitelist_refs)
@@ -430,7 +437,9 @@ const rowView = (policy: PolicyRow): RowView => {
     view.countLabel = view.trustCount > 0 ? `${view.trustCount} 条` : ''
     if (view.inTrust) {
       view.statusClass = view.trustEnabled ? 'is-ok' : 'is-warn'
-      const hit = view.inTrustInline ? '✅ 已在信任名单中' : `✅ 已在信任名单中${view.trustHitSourceLabel}`
+      // 内联 CIDR 覆盖（非精确条目）与 ACL 侧同文案标注——来源不再误指引用列表
+      const cidrNote = view.inTrustInline && !view.inTrustInlineExact ? '（来自内联 CIDR 条目，请到策略编辑中移除）' : ''
+      const hit = view.inTrustInline ? `✅ 已在信任名单中${cidrNote}` : `✅ 已在信任名单中${view.trustHitSourceLabel}`
       view.statusLabel = view.trustEnabled ? hit : `${hit}——信任名单未启用，暂不生效`
     } else {
       view.statusLabel = view.trustCount === 0 ? '信任名单未配置' : `信任名单 ${view.trustCount} 条${view.trustEnabled ? '' : '（未启用）'}`
@@ -481,8 +490,8 @@ const rowView = (policy: PolicyRow): RowView => {
   // 全局——但后缀只对「实际命中」形态有意义（deny 命中 / allow 交集外被 id:7
   // 拒），未命中本来就不拦、allow 名单内本来合法放行，挂后缀反而误导；同时
   // 点名豁免策略（跨策略时用户需要知道去哪取消）。
-  const td1Owner = policies.value.find((p) => p.ip_whitelist_enabled && p.trust_detection === true && mergedTrustEntries(p).includes(props.ip))
-  const td0Owner = policies.value.find((p) => p.ip_whitelist_enabled && p.trust_detection === false && mergedTrustEntries(p).includes(props.ip))
+  const td1Owner = policies.value.find((p) => p.ip_whitelist_enabled && p.trust_detection === true && mergedTrustEntries(p).some((e) => entryMatchesIp(e, props.ip.trim())))
+  const td0Owner = policies.value.find((p) => p.ip_whitelist_enabled && p.trust_detection === false && mergedTrustEntries(p).some((e) => entryMatchesIp(e, props.ip.trim())))
   const exemptHitSuffix = td1Owner ? ` · 信任豁免中（由「${td1Owner.name}」放行）：命中不拦截，事件记为检测` : ''
   const passthruSuffix = !td1Owner && td0Owner ? ' · 信任直通中：跳过全部安全阶段，不产生事件' : ''
   if (policy.ip_acl_mode === 'deny') {

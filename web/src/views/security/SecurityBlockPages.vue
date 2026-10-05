@@ -120,6 +120,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { request, formatBytes } from '@/utils/api'
 import { useClampedPagination } from '@/composables/useClampedPagination'
 import { showSaveResult } from '@/utils/saveResult'
+import { escapeHtml } from '@/utils/escape'
 import { useAuthStore } from '@/stores/auth'
 import { formatDate } from '@/utils/date'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
@@ -232,7 +233,6 @@ const handleDelete = (row: BlockPage) => {
     .then(async () => { const del = await request.delete(`/security/block-pages/${row.id}`); showSaveResult(del, '已删除'); fetchData() }).catch(() => {})
 }
 
-const escapeHtml = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 const previewPage = (row: BlockPage) => {
   // 非 HTML 类型按源码展示（第 52 轮 P3-7）——srcdoc 恒按 text/html 解析，
   // JSON/XML/纯文本直接塞入会被吞标签/压成无格式文本流，与真实响应不一致

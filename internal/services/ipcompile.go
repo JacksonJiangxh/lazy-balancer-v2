@@ -10,9 +10,10 @@ import (
 	"lazy-balancer-v2/wafiplist"
 )
 
-// CompileIPListFast 是统一编译器：源条目（文本行或 DB entries）→ CIDR 聚合
-// → 排序 → 序列化 .fast 二进制。所有 IP 列表（威胁库 .iplist 文件 + 自定义
-// 列表 DB entries）经同一编译器产出，下游（@ipListFast 算子）只读 .fast。
+// 统一编译器（入口 CompileFromIplistFile/CompileFromEntries/CompileFromPrefixes）：
+// 源条目（文本行或 DB entries）→ CIDR 聚合 → 排序 → 序列化 .fast 二进制。
+// 所有 IP 列表（威胁库 .iplist 文件 + 自定义列表 DB entries）经同一编译器
+// 产出，下游（@ipListFast 算子）只读 .fast。
 //
 // 编译发生在:
 //   - 威胁库定时更新后（源=.iplist 文件）

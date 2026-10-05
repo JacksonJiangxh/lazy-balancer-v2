@@ -479,12 +479,12 @@ func TestMetricsService_updateOverview_counts_online_nodes_dynamically(t *testin
 	}
 }
 
-func TestMetricsServiceCleanupHistory_fallsBackToDefaultMonthsWhenRetentionReadFails(t *testing.T) {
+func TestMetricsServiceCleanupHistory_stillCleansWhenGlobalConfigDropped(t *testing.T) {
 	// N-5：retention 配置读取失败时清理不得静默跳过——2026-09-15 用户裁定
-	// 后配置读取路径已移除(固定 7 天窗口),读失败场景退化为「清理仍执行」
-	// 兼容形态(断言窗口同步改 7 天)。
+	// 后配置读取路径已移除(固定 7 天窗口),本测试保留极端形态回归:配置表
+	// 不存在时清理仍按 7 天窗口执行。
 	// Given：过期（100 天）与近期（当前）各 1 条历史；DROP global_config
-	// 令配置读取失败
+	// 模拟配置表极端损坏
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	dataDir := t.TempDir()
 	if err := db.Initialize(dataDir); err != nil {
@@ -519,7 +519,7 @@ func TestMetricsServiceCleanupHistory_fallsBackToDefaultMonthsWhenRetentionReadF
 		t.Fatalf("count metrics history: %v", err)
 	}
 	if oldRows != 0 {
-		t.Fatalf("old rows after cleanup = %d, want 0 (cleanup must run with default 3 months)", oldRows)
+		t.Fatalf("old rows after cleanup = %d, want 0 (cleanup must still run with fixed 7-day window)", oldRows)
 	}
 	if freshRows != 1 {
 		t.Fatalf("fresh rows after cleanup = %d, want 1", freshRows)

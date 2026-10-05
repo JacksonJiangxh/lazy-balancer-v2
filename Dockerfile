@@ -49,13 +49,29 @@ RUN go version -m /app/caddy | tee /tmp/caddy-mods.txt && \
 # Build Go backend
 FROM golang:1.26.6-alpine@sha256:af8d6740070b8906d12eae1c3e3ea0957fb63f492051ea05e354c38ef9fe88df AS backend
 WORKDIR /app
+# U8b-2（第 68 轮审计）：GOPROXY 逗号多级回退——与 xcaddy-builder 阶段对称
+#（阶段间 ENV 不继承，backend 此前用官方默认 proxy.golang.org，构建网络对
+# 其不可达时 go mod download 无回退直接失败）：阿里云 404/410 时依次回落
+# goproxy.cn、直连；校验不符类瞬态错误由下方 3 次重试兜底。
+ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,https://goproxy.cn,direct
 # wafiplist 叶模块经根 go.mod replace ./wafiplist 引用（v2.3.4）——go mod
 # download 解析 replace 需要被替换模块的 go.mod/go.sum 在场。
 COPY wafiplist/go.mod wafiplist/go.sum ./wafiplist/
 COPY go.mod go.sum ./
-# 模块缓存挂载（lazy-builder GC 48h）：go.sum 未变时 download 直接命中缓存
+# 模块缓存挂载（lazy-builder GC 48h）：go.sum 未变时 download 直接命中缓存；
+# 3 次重试兜底镜像源偶发供应与校验不符的瞬态错误（与 xcaddy build 同形态）。
+# set -e 下 if 条件中的失败不触发退出，由 dl 标志统一判定后显式 exit 1
 RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download
+  set -e; \
+  dl=0; \
+  for attempt in 1 2 3; do \
+    if go mod download; then \
+      dl=1; break; \
+    fi; \
+    echo ">>> go mod download 第 ${attempt}/3 次失败，10s 后重试" >&2; \
+    sleep 10; \
+  done; \
+  [ "$dl" -eq 1 ] || { echo ">>> go mod download 3 次全部失败" >&2; exit 1; }
 COPY . .
 WORKDIR /app/cmd/server
 # 双缓存挂载（模块+编译缓存，lazy-builder GC 48h）：增量编译只重编改动包；

@@ -94,6 +94,10 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 			Security: snapshot.MasterSyncSwitches.Security,
 		}
 	}
+	// F-L5-68-01：重载失败补偿标记必须在快照事务前捕获——事务内「记录同步状态」
+	// 会清空 last_sync_error，提交后再读永远漏判；标记在=上轮 apply 后 /load
+	// 失败，本轮即使渲染输入无变化也必须强制重载（304 补偿重拉通道的终点）。
+	reloadCompensation := s.syncReloadFailureMarkerPresent(ctx)
 	previous, err := s.cluster.clusterSnapshotBypassingCache(ctx)
 	if err != nil {
 		return fmt.Errorf("备份本地快照: %w", err)
@@ -122,7 +126,12 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	}
 	// R64 A-N5：证书文件轴（删旧+写新）与 cert_jobs 替换同门于 rules 开关——
 	// 开关关闭时从节点本地 acme_dns 规则保留，其证书行/文件不得按主节点快照删改。
+	// F-L5-68-01：证书轴差异（删/增/内容变更）是末段条件重载的强制信号——证书
+	// 文件路径确定性意味着内容变化时渲染 JSON 字节不变，不强制则 Caddy 内存
+	// 继续用旧证书。
+	certsChanged := false
 	if !skip.disabled["rules"] {
+		certsChanged = snapshotCertsDiffer(previous.Certs, snapshot.Certs)
 		if err := removeMissingSnapshotCerts(previous.Certs, snapshot.Certs); err != nil {
 			return errors.Join(fmt.Errorf("删除本地旧证书: %w", err), s.restoreSnapshotArtifacts(previous, snapshot))
 		}
@@ -177,12 +186,26 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// .version 陈旧），仅 sha 比较会把本分支短路，R57 A-#4 的
 	// rewriteVersionIfMissingOrStale 永不执行——304 分支兜底重拉 → 应用
 	// 跳过 → 每周期全量重拉死循环（主节点「同步下发」审计随之刷屏）。
+	// changed 标志在函数作用域声明，供末段条件重载判定（F-L5-68-01）。
+	var crsChanged, xdbChanged, threatChanged bool
 	if switches.Security && (wafFilesRefDiffers(snapshot.WafFiles) || s.wafFilesDrifted()) {
 		// 2026-09-18 用户裁定:同步日志与自动更新日志同款分阶段流水——唯一
 		// 区别是来源(主节点 vs GitHub),弹框日志可对照阅读。
 		AppendCRSUpdateLog("INFO", "checking", "从主节点校验 CRS 规则版本")
 		AppendIP2RegionUpdateLog("INFO", "checking", "从主节点校验 IP2Region数据库版本")
 		bundle, ferr := s.fetchWafFiles(ctx, snapshot.WafFiles)
+		// F-68-U2-02（第 68 轮审计）：调用点持 WafFileLock——与 lbbak 导入
+		// （config_backup_lbbak.go caller-side 持锁）、三库更新器（内锁）与
+		// BuildWafFileBundle 读相位（内锁）串行，杜绝同步落盘与导入/更新交错
+		// 打出混合 rules 树/撕裂 xdb。ApplyWafFileBundle 本体不可内锁（lbbak
+		// 已持锁调用，内锁=双锁死锁）。锁序：本点不持 CaddyOpLock（重载段在
+		// 下方 :253 才取），wafFileMu 叶操作，无 AB-BA。
+		var aerr error
+		if ferr == nil {
+			WafFileLock().Lock()
+			crsChanged, xdbChanged, threatChanged, aerr = ApplyWafFileBundle(bundle)
+			WafFileLock().Unlock()
+		}
 		if ferr != nil {
 			Logf("error", "同步安全数据失败（数据库版本行已同步）: %v", ferr)
 			RecordAuditLog("system", "同步失败", "安全数据", fmt.Sprintf("拉取安全数据失败: %v", ferr), "")
@@ -192,7 +215,7 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 			AppendCRSUpdateLog("ERROR", "failed", fmt.Sprintf("从主节点拉取安全数据失败: %v", ferr))
 			AppendIP2RegionUpdateLog("ERROR", "failed", fmt.Sprintf("从主节点拉取安全数据失败: %v", ferr))
 			AppendThreatUpdateLog("ERROR", "failed", fmt.Sprintf("从主节点拉取安全数据失败: %v", ferr))
-		} else if crsChanged, xdbChanged, threatChanged, aerr := ApplyWafFileBundle(bundle); aerr != nil {
+		} else if aerr != nil {
 			Logf("error", "落盘同步安全数据失败: %v", aerr)
 			RecordAuditLog("system", "同步失败", "安全数据", fmt.Sprintf("落盘安全数据失败: %v", aerr), "")
 			AppendCRSUpdateLog("ERROR", "failed", fmt.Sprintf("落盘主节点安全数据失败: %v", aerr))
@@ -250,9 +273,22 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// watcher（渲染 DB→/load，持锁）交错时，跨同步 commit 点的旧渲染可后到
 	// 覆盖新配置，从节点静默回退上一版本（三通道自愈全探不到）。锁序安全：
 	// 锁内仅 ApplyConfigForce 的 s.mu（叶操作），Pull 路径锁不反向嵌套。
-	CaddyOpLock.Lock()
-	reloadErr := s.caddy.ApplyConfigForce(GenerateCaddyConfig())
-	CaddyOpLock.Unlock()
+	// F-L5-68-01（第 68 轮审计）：渲染数据未变跳过 /load——判定口径=节级信号：
+	// 三节（users/rules/security，渲染的全部 DB 输入）哈希跳过 + WAF 数据文件
+	// 无变化 + 证书轴无变化（证书内容变化 JSON 字节不变，必须强制）+ 无重载
+	// 失败补偿标记（标记在=上轮重载失败，本轮是 304 补偿重拉的语义终点，必须
+	// 强制；标记由事务内「记录同步状态」清空，故在事务前捕获）。排程列/状态列
+	// 等纯簿记变更（版本行 next_update/update_status 族、sync_interval、登录锁）
+	// 不触发。last_good 兼容：渲染未变则既有 last_good 仍是当前运行配置的准确
+	// 快照，无需重写。
+	renderInputsChanged := !(skip.skip("users") && skip.skip("rules") && skip.skip("security"))
+	mustReload := renderInputsChanged || crsChanged || xdbChanged || threatChanged || certsChanged || reloadCompensation
+	var reloadErr error
+	if mustReload {
+		CaddyOpLock.Lock()
+		reloadErr = s.caddy.ApplyConfigForce(GenerateCaddyConfig())
+		CaddyOpLock.Unlock()
+	}
 	if reloadErr != nil {
 		err := reloadErr
 		Logf("error", "集群同步后重载 Caddy 失败（快照已提交）: %v", err)
@@ -269,8 +305,12 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 		} else if rows, raerr := result.RowsAffected(); raerr != nil || rows != 1 {
 			Logf("error", "集群同步重载失败标记写入异常（影响 %d 行，错误 %v）：自愈通道失效，请检查数据库", rows, raerr)
 		}
-	} else {
+	} else if mustReload {
 		RecordAuditLog("system", "重载", "Caddy服务", "同步应用后自动重载", "")
+	} else {
+		// 跳过重载本身留一行应用日志（不进操作审计——零真实重载不落审计，
+		// 与 errSameConfig 短路同口径的审计真实性裁定）。
+		Logf("info", "集群同步：渲染输入无变化，跳过 Caddy 重载")
 	}
 	clusterSnapshotCaches.Delete(s.db)
 	caddySync := "未开启"
@@ -300,6 +340,9 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	}
 	if len(appliedSecs) == 0 {
 		summaryParts = append(summaryParts, "全部节无变化")
+	}
+	if !mustReload {
+		summaryParts = append(summaryParts, "Caddy 重载：跳过（渲染输入无变化）")
 	}
 	summaryParts = append(summaryParts, fmt.Sprintf("Caddy 全局配置：%s", caddySync))
 	RecordAuditLog("system", "同步", "集群同步", FormatAuditDetail(summaryParts...), "")
@@ -386,6 +429,27 @@ func (s *SyncService) materializeSnapshotDNSOwnership(acme *models.ClusterACMESt
 
 func restoreSnapshotCerts(previous, current []models.ClusterCertificate) error {
 	return errors.Join(removeMissingSnapshotCerts(current, previous), materializeSnapshotCerts(previous))
+}
+
+// snapshotCertsDiffer 报告快照证书轴与本地存量是否存在差异（删除/新增/内容
+// 变更），按 RuleID 对齐比较 PEM 对——F-L5-68-01 末段条件重载的强制信号：
+// 证书文件路径确定性意味着内容变化时渲染 JSON 字节不变，差异存在必须强制
+// 重载，否则 Caddy 内存继续服役旧证书。
+func snapshotCertsDiffer(previous, current []models.ClusterCertificate) bool {
+	if len(previous) != len(current) {
+		return true
+	}
+	prevByRule := make(map[string]models.ClusterCertificate, len(previous))
+	for _, cert := range previous {
+		prevByRule[cert.RuleID] = cert
+	}
+	for _, cert := range current {
+		prev, ok := prevByRule[cert.RuleID]
+		if !ok || prev.CertPEM != cert.CertPEM || prev.KeyPEM != cert.KeyPEM {
+			return true
+		}
+	}
+	return false
 }
 
 func removeMissingSnapshotCerts(previous, current []models.ClusterCertificate) error {

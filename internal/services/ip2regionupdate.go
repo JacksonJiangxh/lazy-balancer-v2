@@ -50,6 +50,12 @@ type IP2RegionUpdateManager struct {
 	// 每次 run() 开始时重置，downloadAndInstall 备份成功后置位。
 	bakCreated bool
 
+	// prevVersion 记录安装锁段读出的事件前版本行值（F-L6-68-02）：版本行与
+	// sidecar 随安装段（wafFileMu 互斥区）写入新 tag，重载失败且磁盘已还原
+	// 旧 xdb 时（run() restored 分支）行与 sidecar 必须回滚到本值——否则
+	// 「磁盘旧/行新」三方分叉。每次成功安装锁段内刷新。
+	prevVersion string
+
 	reloader       func() error
 	fetchLatestTag func(ctx context.Context) (tag string, err error)
 	// runCancel 取消当前运行中的下载阶段（任务监控手动取消，v2.3.4）。
@@ -227,7 +233,13 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 	}()
 
 	// R63 单写方：task_runs 由引擎统一记录。
-	runCtx, runCancel := context.WithCancel(context.Background())
+	// F-L2-68-01（第 68 轮）：runCtx 派生自 rc.Ctx（镜像 CRS 侧）——引擎 demote
+	// 中止（SetRole 取消在途 Scheduled）随 rc.Ctx 传播；nil rc 回退 Background。
+	runBase := context.Background()
+	if rc != nil && rc.Ctx != nil {
+		runBase = rc.Ctx
+	}
+	runCtx, runCancel := context.WithCancel(runBase)
 	m.mu.Lock()
 	m.runCancel = runCancel
 	m.mu.Unlock()
@@ -275,6 +287,12 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 		writeIP2RegionUpdateLog("WARN", "retry", fmt.Sprintf("查询 ip2region 最新版本失败: %v；等待 %s 重试，第 %d 次，共 %d 次", rerr, wait, nextAttempt, updateMaxAttempts))
 	})
 	if err != nil {
+		// F-L2-68-01：runCtx 取消且已非主节点=demote 在途中止——落 skipped
+		// （与起点角色复查同语义），不走 fail（从节点中止非故障）。
+		if runCtx.Err() != nil && !updateRunStillMaster() {
+			m.setStage(IP2RegionStatusSkipped, "节点已降级为从节点，终止 IP2Region 更新")
+			return
+		}
 		m.fail(err)
 		return
 	}
@@ -324,6 +342,12 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 		writeIP2RegionUpdateLog("WARN", "retry", fmt.Sprintf("下载安装 ip2region %s 失败: %v；等待 %s 重试，第 %d 次，共 %d 次", tag, rerr, wait, nextAttempt, updateMaxAttempts))
 	})
 	if installErr != nil && !errors.Is(installErr, errIP2RegionReload) {
+		// F-L2-68-01：同上方 fetch 分支——demote 在途中止落 skipped（不回滚
+		// 不重载：从节点保持只读不变量）。
+		if runCtx.Err() != nil && !updateRunStillMaster() {
+			m.setStage(IP2RegionStatusSkipped, "节点已降级为从节点，终止 IP2Region 更新")
+			return
+		}
 		m.fail(fmt.Errorf("安装 ip2region xdb 失败: %w", installErr))
 		return
 	}
@@ -361,10 +385,22 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 			m.successAfterReloadFailOpen(tag, reloadErr, rbErr, memSwitched)
 			return
 		case restored:
+			// F-L6-68-02：磁盘已还原旧 xdb——安装段（锁内）写入的新版本行与
+			// sidecar 必须同步回滚到 prevVersion，否则「磁盘旧/行新」三方分叉
+			// （导出侧读新 tag 配旧 xdb）。回滚失败仅记日志：fail() 落 failed
+			// 状态行，下次成功更新/启动对账自愈。
+			if m.prevVersion != "" {
+				if _, err := db.DB.Exec(
+					"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now') WHERE id=1",
+					m.prevVersion,
+				); err != nil {
+					Logf("error", "ip2region update: 回滚版本行失败（下次成功更新自愈）: %v", err)
+				}
+				if err := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", m.prevVersion); err != nil {
+					Logf("error", "ip2region update: 回滚 .version sidecar 失败（下次成功更新自愈）: %v", err)
+				}
+			}
 			// P5-11（第 50 轮审计）：nil reloader 守卫——镜像本函数上方 F-47-3
-			// 主重载处与 successAfterReloadFailOpen 两处口径（及 CRS 侧
-			// crsinstall.go:314 / crsupdate.go:307）；nil 语义一致：不尝试重载、
-			// 不记审计，回滚落库路径照常。
 			if m.reloader != nil {
 				rErr := m.reloader()
 				recordSystemReloadAudit("ip2region_update", rErr)
@@ -398,9 +434,8 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 	SetIP2RegionVersion(tag)
 	// R72 二十六次 W1-7：主节点补写 .version sidecar——waffiles_sync 的
 	// BuildWafFileRef（ref.IP2RegionTag）与从节点 rewriteVersionIfMissingOrStale
-	// 都假设它存在，而主更新路径此前从不写它（R57 A-#4 在主路径是死路）：审计行
-	// 无版本号、提升的 slave 同样空 tag。写失败只记日志（版本行已提交，sidecar
-	// 下次更新自愈）。
+	// 都假设它存在。F-L6-68-02 后首写已随安装段（wafFileMu 互斥区）完成，此处
+	// 为幂等补写（安装段写失败时的自愈网，同 tag 命中即跳过重写）。
 	if err := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", tag); err != nil {
 		Logf("error", "ip2region update: failed to write .version sidecar: %v", err)
 	}
@@ -487,6 +522,22 @@ func (m *IP2RegionUpdateManager) downloadAndInstall(parent context.Context, tag 
 		os.Remove(liveBak)
 		wafFileMu.Unlock()
 		return fmt.Errorf("安装 ip2region xdb: %w", err)
+	}
+	// F-L6-68-02（第 68 轮审计）：版本行与 .version sidecar 收进安装段同一互斥
+	// 区——此前在锁外 run() 成功路径，写相位中段（xdb 已换、行/sidecar 未写）
+	// 导出侧（BuildWafFileBundle/BuildWafFileRef 读相位持同一锁）可打出「文件
+	// 新/行旧」偏斜并沿 waf_files 通道扩散。单行 UPDATE+小文件原子写毫秒级，
+	// 与段内 rename 同量级，不新增锁内长阻塞。写失败仅记日志：run() 成功路径
+	// 稍后重写全量行与 sidecar，重载失败 restored 分支用 prevVersion 回滚。
+	m.prevVersion = currentIP2RegionVersion()
+	if _, err := db.DB.Exec(
+		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now') WHERE id=1",
+		tag,
+	); err != nil {
+		Logf("error", "ip2region update: 安装段写入版本行失败（稍后重写）: %v", err)
+	}
+	if err := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", tag); err != nil {
+		Logf("error", "ip2region update: 安装段写入 .version sidecar 失败（稍后重写）: %v", err)
 	}
 	wafFileMu.Unlock()
 	// R46 B-F1：rename 后内存热换失败不得静默吞掉——磁盘已是新库而内存仍是旧

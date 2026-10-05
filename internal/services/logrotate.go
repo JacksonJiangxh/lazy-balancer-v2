@@ -180,6 +180,7 @@ func (w *RotatingFileWriter) Close() error {
 type RuntimeCleanupResult struct {
 	AppRemoved int // 应用日志过期副本删除数（app.log.*）
 	TaskLogs   TaskLogHousekeepingResult
+	WafAudit   []string // waf-audit 目录兜底动作明细（daemon 停机时的超阈轮转/截断）
 }
 
 // TaskLogHousekeepingResult 任务日志清理明细。
@@ -208,7 +209,7 @@ func (r TaskLogHousekeepingResult) Summary() string {
 // 清理轮转（taskLogsHousekeeping）。由任务引擎 log-cleanup 族驱动（M2 起
 // 无独立启动器）。
 func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
-	result := RuntimeCleanupResult{TaskLogs: taskLogsHousekeeping(logFile)}
+	result := RuntimeCleanupResult{TaskLogs: taskLogsHousekeeping(logFile), WafAudit: wafAuditHousekeeping()}
 	months := 3
 	database := db.GetDB()
 	if database == nil {
@@ -245,6 +246,52 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 	}
 	result.AppRemoved = removed
 	return result
+}
+
+// wafAuditHousekeeping waf-audit 目录超阈兜底（F-L3-68-01，第 68 轮审计）——
+// audit.log 轮转与 security-timing.log 读后截断的正常驱动面是
+// security-events-ingestion daemon 的 2s tick（SecurityEventsPollOnce）；
+// daemon 停机（任务被禁用/取消）时两文件无守护无界增长——写侧（Coraza
+// 审计流/caddygeoip 耗时侧车）在 Caddy 进程内持续追加，本进程不消费即
+// 只增不减。此处按 audit_log_size_mb 阈值在 log-cleanup 任务体（24h 节拍）
+// 内兜底：
+//
+//   - audit.log 超阈 → SecurityEventsPollOnce()（与 daemon tick 同锁同路径，
+//     摄取+pending-delta+copytruncate 全套安全链——绝不无补采截断；daemon
+//     在场时文件本不会积到阈值，触发即等价一次普通 tick，无竞争）。
+//   - security-timing.log 超阈 → 直接截断。侧车仅是耗时增强数据，超阈即读侧
+//     长期未消费、残留行本不会被任何消费者读取；与正常「读后截断」同形语义
+//     （既有注释已接受读后写入的丢行窗口）。
+//
+// 返回动作明细（log-cleanup 任务日志与运行日志双写——清理了哪个文件必须
+// 可见，2026-10-01 用户裁定口径）。
+func wafAuditHousekeeping() []string {
+	var actions []string
+	maxBytes := auditLogSizeBytes()
+	if info, err := os.Stat(auditLogPath); err == nil && info.Size() >= maxBytes {
+		sizeBefore := info.Size()
+		SecurityEventsPollOnce()
+		if after, aerr := os.Stat(auditLogPath); aerr == nil && after.Size() < sizeBefore {
+			actions = append(actions, fmt.Sprintf("audit.log %.1fMB≥%dMB（摄取+轮转）",
+				float64(sizeBefore)/1024/1024, maxBytes/1024/1024))
+		}
+	}
+	// 耗时侧车：上方 audit.log 触发 poll 时 daemon tick 的 securityTimingLoad
+	// 已「读后截断」一并收敛；此处仍超阈 = 侧车独立积压（audit 静默请求流或
+	// daemon 停机），直接截断。
+	if info, err := os.Stat(securityTimingLogPath); err == nil && info.Size() >= maxBytes {
+		if terr := os.Truncate(securityTimingLogPath, 0); terr == nil {
+			actions = append(actions, fmt.Sprintf("security-timing.log %.1fMB≥%dMB（截断）",
+				float64(info.Size())/1024/1024, maxBytes/1024/1024))
+		} else {
+			Logf("error", "waf-audit 兜底：截断 %s 失败: %v", securityTimingLogPath, terr)
+		}
+	}
+	for _, action := range actions {
+		Logf("info", "waf-audit 兜底轮转：%s", action)
+		TaskLogf("log-cleanup", "waf-audit", "兜底轮转：%s", action)
+	}
+	return actions
 }
 
 // taskLogsHousekeeping 任务日志统一清理与轮转（log-cleanup 任务体）——
