@@ -267,6 +267,8 @@ var backupTableNullDefaults = map[string]map[string]any{
 		"tcp_try_duration": int64(0), "tcp_try_interval": int64(250),
 		"request_body_max_size_mb": int64(0), "upstream_keepalive_timeout": int64(0),
 		"server_tokens_hidden": int64(0), "custom_routes_enabled": int64(0),
+		// 链式回退竞速参数（2026-10-09）：NULL 归一 0（写侧/渲染侧按策略兜底）。
+		"chain_race_interval_ms": int64(0), "chain_request_timeout_ms": int64(0),
 		"proxy_dial_timeout": int64(0), "proxy_response_header_timeout": int64(0), "proxy_read_timeout": int64(0),
 		"proxy_write_timeout": int64(0), "proxy_stream_timeout": int64(0), "proxy_flush_interval": int64(0),
 		"proxy_stream_close_delay": int64(0), "host_header": "",

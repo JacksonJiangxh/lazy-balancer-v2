@@ -541,7 +541,9 @@
               <el-table-column width="110">
                 <template #header>
                   权重 %
-                  <el-tooltip placement="top" content="数字越大，分配到的请求越多；权重相同时即为普通轮询。至少需要添加一个上游服务器。">
+                  <el-tooltip placement="top" :content="wizardForm.strategy === 'chain_fallback'
+                    ? '链式回退下权重即优先级：权重越大越先被请求，相同权重按列表顺序；仍按百分比录入（总和须为 100）。'
+                    : '数字越大，分配到的请求越多；权重相同时即为普通轮询。至少需要添加一个上游服务器。'">
                     <el-icon class="upstream-unknown"><QuestionFilled /></el-icon>
                   </el-tooltip>
                 </template>
@@ -616,16 +618,36 @@
                 <div class="strategy-card-title">IP 哈希</div>
                 <div class="strategy-card-desc">按客户端 IP 固定分配</div>
               </div>
-              <div 
+              <div
                 v-if="wizardForm.protocol === 'http'"
-                class="strategy-card" 
+                class="strategy-card"
                 :class="{ active: wizardForm.strategy === 'cookie' }"
                 @click="wizardForm.strategy = 'cookie'"
               >
                 <div class="strategy-card-title">Cookie 粘滞</div>
                 <div class="strategy-card-desc">通过 Cookie 实现精确会话粘滞</div>
               </div>
+              <div
+                v-if="wizardForm.protocol === 'http'"
+                class="strategy-card"
+                :class="{ active: wizardForm.strategy === 'chain_fallback' }"
+                @click="wizardForm.strategy = 'chain_fallback'"
+              >
+                <div class="strategy-card-title">链式回退</div>
+                <div class="strategy-card-desc">按上游权重降序组成回退链，等待竞速间隔无有效响应即并行发出下一路，先回者胜</div>
+              </div>
             </div>
+
+            <template v-if="wizardForm.strategy === 'chain_fallback' && wizardForm.protocol === 'http'">
+              <el-form-item label="竞速间隔">
+                <el-input-number v-model="wizardForm.chain_race_interval_ms" :min="10" :max="60000" :step="50" controls-position="right" style="width: 140px;" />
+                <span class="form-tip-inline">毫秒，等待该时长仍无有效响应即向下一优先级上游并行发出请求竞速</span>
+              </el-form-item>
+              <el-form-item label="兜底超时">
+                <el-input-number v-model="wizardForm.chain_request_timeout_ms" :min="100" :max="600000" :step="100" controls-position="right" style="width: 140px;" />
+                <span class="form-tip-inline">毫秒，单个上游超过该时长仍未响应将被截断取消，避免耗时浪费</span>
+              </el-form-item>
+            </template>
 
             <el-divider content-position="left" class="compact-divider">健康检查</el-divider>
 
@@ -1874,6 +1896,10 @@ const wizardForm = reactive<RuleForm>({
   domain: '',
   listen_port: 80,
   strategy: 'weighted_round_robin',
+  // 链式回退竞速参数（strategy=chain_fallback 时消费；默认按 N=6 封顶 +
+  // 浏览器 60s 等待约束设计：5×3s+30s=45s < 60s）
+  chain_race_interval_ms: 3000,
+  chain_request_timeout_ms: 30000,
   dynamic_dns: false,
   enable_dns_server: false,
   dns_server: '',
@@ -1983,7 +2009,7 @@ watch(() => wizardForm.protocol, (newVal, oldVal) => {
       ElMessage.info('已切换为 TCP，监听端口自动调整为 8080')
     }
     wizardForm.enable_tls = false
-    if (wizardForm.strategy === 'cookie') wizardForm.strategy = 'weighted_round_robin'
+    if (wizardForm.strategy === 'cookie' || wizardForm.strategy === 'chain_fallback') wizardForm.strategy = 'weighted_round_robin'
     wizardForm.custom_routes_enabled = false
     wizardForm.path_rules = []
     wizardForm.upstreams.forEach(u => {
@@ -2286,6 +2312,9 @@ const openWizard = async (rule?: Rule) => {
       domain: fullRule.domain || '',
       listen_port: fullRule.listen_port,
       strategy: fullRule.strategy || 'weighted_round_robin',
+      // 链式回退竞速参数回填（0=后端兜底默认，UI 显示默认值）
+      chain_race_interval_ms: fullRule.chain_race_interval_ms || 3000,
+      chain_request_timeout_ms: fullRule.chain_request_timeout_ms || 30000,
       dynamic_dns: fullRule.dynamic_dns || false,
       enable_dns_server: fullRule.enable_dns_server || false,
       dns_server: fullRule.dns_server || '',
@@ -2359,6 +2388,8 @@ const openWizard = async (rule?: Rule) => {
       domain: '',
       listen_port: 80,
       strategy: 'weighted_round_robin',
+      chain_race_interval_ms: 3000,
+      chain_request_timeout_ms: 30000,
       dynamic_dns: false,
       health_check_path: '',
       health_check_interval: 10,
@@ -2718,7 +2749,7 @@ const submitWizard = async () => {
   }
   const allowedStrategies = wizardForm.protocol === 'tcp'
     ? ['weighted_round_robin', 'ip_hash', 'least_conn', 'random', 'first']
-    : ['weighted_round_robin', 'ip_hash', 'least_conn', 'random', 'first', 'cookie']
+    : ['weighted_round_robin', 'ip_hash', 'least_conn', 'random', 'first', 'cookie', 'chain_fallback']
   if (!allowedStrategies.includes(wizardForm.strategy)) {
     ElMessage.warning(`${wizardForm.protocol.toUpperCase()} 规则包含协议族不匹配的负载策略`)
     saving.value = false
@@ -2776,6 +2807,9 @@ const submitWizard = async () => {
       domain: wizardForm.domain,
       listen_port: wizardForm.listen_port,
       strategy: wizardForm.strategy,
+      // 链式回退竞速参数（非 chain 策略时后端忽略；0 值后端兜底默认）
+      chain_race_interval_ms: wizardForm.chain_race_interval_ms,
+      chain_request_timeout_ms: wizardForm.chain_request_timeout_ms,
       dynamic_dns: wizardForm.dynamic_dns,
       enable_dns_server: wizardForm.enable_dns_server,
       dns_server: wizardForm.dns_server,
@@ -3032,6 +3066,9 @@ const openCopyWizard = async (rule: Rule) => {
     domain: fullRule.domain || '',
     listen_port: fullRule.listen_port,
     strategy: fullRule.strategy || 'weighted_round_robin',
+    // 副本回填链式回退竞速参数（0=后端兜底默认）
+    chain_race_interval_ms: fullRule.chain_race_interval_ms || 3000,
+    chain_request_timeout_ms: fullRule.chain_request_timeout_ms || 30000,
     dynamic_dns: fullRule.dynamic_dns || false,
     enable_dns_server: fullRule.enable_dns_server || false,
     dns_server: fullRule.dns_server || '',

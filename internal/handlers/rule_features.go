@@ -45,6 +45,9 @@ type ruleFeatureInput struct {
 	TCPHealthCheckPort         int
 	TCPTryDuration             int
 	TCPTryInterval             int
+	// 链式回退竞速参数（strategy=chain_fallback 时参与范围校验）。
+	ChainRaceIntervalMS   int
+	ChainRequestTimeoutMS int
 }
 
 type pathRuleQueryer interface {
@@ -88,6 +91,8 @@ func createRuleFeatures(req models.CreateRuleRequest) ruleFeatureInput {
 		TCPHealthCheckPort:         req.TCPHealthCheckPort,
 		TCPTryDuration:             req.TCPTryDuration,
 		TCPTryInterval:             req.TCPTryInterval,
+		ChainRaceIntervalMS:        req.ChainRaceIntervalMS,
+		ChainRequestTimeoutMS:      req.ChainRequestTimeoutMS,
 	}
 }
 
@@ -195,6 +200,16 @@ func updateRuleFeatures(req models.UpdateRuleRequest, existing models.LbRule) ru
 	if req.TCPTryInterval != nil {
 		input.TCPTryInterval = *req.TCPTryInterval
 	}
+	// 链式回退竞速参数：指针字段同口径合并（nil 沿用 existing），使范围校验
+	// 在更新路径看到真实值。
+	input.ChainRaceIntervalMS = existing.ChainRaceIntervalMS
+	input.ChainRequestTimeoutMS = existing.ChainRequestTimeoutMS
+	if req.ChainRaceIntervalMS != nil {
+		input.ChainRaceIntervalMS = *req.ChainRaceIntervalMS
+	}
+	if req.ChainRequestTimeoutMS != nil {
+		input.ChainRequestTimeoutMS = *req.ChainRequestTimeoutMS
+	}
 	return input
 }
 
@@ -253,6 +268,9 @@ func validateStrategyForProtocol(protocol, strategy string) error {
 		"weighted_round_robin": true, "least_conn": true,
 		"ip_hash": true, "cookie": true,
 		"random": true, "first": true,
+		// 链式回退（2026-10-09）：竞速 + 兜底截断，依赖 HTTP 响应语义，
+		// 仅 HTTP 支持（同 cookie 先例）。
+		"chain_fallback": true,
 	}
 	tcpStrategies := map[string]bool{
 		"weighted_round_robin": true, "least_conn": true,
@@ -262,7 +280,7 @@ func validateStrategyForProtocol(protocol, strategy string) error {
 	switch protocol {
 	case "http":
 		if !httpStrategies[strategy] {
-			return fmt.Errorf("无效的负载策略：HTTP 规则仅支持 weighted_round_robin / ip_hash / least_conn / random / first / cookie")
+			return fmt.Errorf("无效的负载策略：HTTP 规则仅支持 weighted_round_robin / ip_hash / least_conn / random / first / cookie / chain_fallback")
 		}
 	case "tcp":
 		if !tcpStrategies[strategy] {
@@ -284,6 +302,16 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 	// Round 37 I-5: strategy 白名单校验，非法值不再透传到 Caddy。
 	if err := validateStrategyForProtocol(input.Protocol, input.Strategy); err != nil {
 		return err
+	}
+	// 链式回退竞速参数范围校验（2026-10-09）：竞速间隔 0–60000ms、单请求
+	// 兜底超时 0–600000ms；0 值合法（写侧/渲染侧按策略兜底 3000/30000）。
+	if input.Strategy == "chain_fallback" {
+		if input.ChainRaceIntervalMS < 0 || input.ChainRaceIntervalMS > 60000 {
+			return fmt.Errorf("链式回退竞速间隔（%d ms）需在 0–60000 ms 之间", input.ChainRaceIntervalMS)
+		}
+		if input.ChainRequestTimeoutMS < 0 || input.ChainRequestTimeoutMS > 600000 {
+			return fmt.Errorf("链式回退单请求兜底超时（%d ms）需在 0–600000 ms 之间", input.ChainRequestTimeoutMS)
+		}
 	}
 	// Round 37 I-6: 健康检查超时必须小于检查间隔（两者都 > 0 时）。
 	if input.HealthCheckInterval > 0 && input.HealthCheckTimeout > 0 && input.HealthCheckTimeout >= input.HealthCheckInterval {
@@ -825,6 +853,7 @@ const lbRuleListColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE
 	COALESCE(health_check_path,''), COALESCE(health_check_interval,10), COALESCE(health_check_timeout,2), COALESCE(health_check_unhealthy_threshold,3), COALESCE(health_check_healthy_threshold,2),
 	COALESCE(enable_active_health_check,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
 	COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0),
+	COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 	COALESCE(custom_routes_enabled,0),
 	COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 	COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), '', '', COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''),
@@ -837,6 +866,7 @@ const lbRuleColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE(des
 	COALESCE(health_check_path,''), COALESCE(health_check_interval,10), COALESCE(health_check_timeout,2), COALESCE(health_check_unhealthy_threshold,3), COALESCE(health_check_healthy_threshold,2),
 	COALESCE(enable_active_health_check,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
 	COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0),
+	COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 	COALESCE(custom_routes_enabled,0),
 	COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 	COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), COALESCE(tls_cert,''), COALESCE(tls_key,''), COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''),
@@ -859,6 +889,7 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 			&r.HealthCheckPath, &r.HealthCheckInterval, &r.HealthCheckTimeout, &r.HealthCheckUnhealthyThreshold, &r.HealthCheckHealthyThreshold,
 			&enableActiveHealthCheck, &r.TCPHealthCheckPort, &r.TCPProxyProtocol, &r.TCPTryDuration, &r.TCPTryInterval,
 			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden,
+			&r.ChainRaceIntervalMS, &r.ChainRequestTimeoutMS,
 			&r.CustomRoutesEnabled,
 			&r.ProxyDialTimeout, &r.ProxyResponseHeaderTimeout, &r.ProxyReadTimeout, &r.ProxyWriteTimeout, &r.ProxyStreamTimeout, &r.ProxyFlushInterval, &r.ProxyStreamCloseDelay,
 			&enableTLS, &tlsSource, &acmeConfigID, &caProviderID, &tlsCert, &tlsKey, &tlsCertPath, &tlsKeyPath, &tlsHTTPRedirect,

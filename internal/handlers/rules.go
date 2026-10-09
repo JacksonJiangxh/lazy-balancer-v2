@@ -806,6 +806,17 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	if req.Strategy == "" {
 		req.Strategy = "weighted_round_robin"
 	}
+	// 链式回退（2026-10-09）：0 值兜底默认参数（UI 不提供 0=关闭语义，避免
+	// 配置分叉；参考项目 speculativeMs=0 关闭语义不引入）。默认按 N=6 封顶 +
+	// 浏览器 60s 等待约束设计：5×3000+30000=45s < 60s（预算公式见 caddy.go）。
+	if req.Strategy == "chain_fallback" {
+		if req.ChainRaceIntervalMS == 0 {
+			req.ChainRaceIntervalMS = 3000
+		}
+		if req.ChainRequestTimeoutMS == 0 {
+			req.ChainRequestTimeoutMS = 30000
+		}
+	}
 	if req.HealthCheckInterval == 0 {
 		req.HealthCheckInterval = 10
 	}
@@ -955,17 +966,19 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			health_check_unhealthy_threshold, health_check_healthy_threshold,
 			enable_active_health_check, tcp_health_check_port, tcp_proxy_protocol, tcp_try_duration, tcp_try_interval,
 		request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden,
+		chain_race_interval_ms, chain_request_timeout_ms,
 		custom_routes_enabled,
 		proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
 		host_header, enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_cert_path, tls_key_path, tls_http_redirect,
 		enable_compress, compress_types, enabled, created_by, updated_at, caddy_id, log_enabled,
 		block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, req.Name, req.Description, req.Protocol, req.Domain, req.ListenPort, req.Strategy, req.DynamicDNS, req.EnableDnsServer, req.DnsServer, req.DnsFamily,
 		req.HealthCheckPath, req.HealthCheckInterval, req.HealthCheckTimeout,
 		req.HealthCheckUnhealthyThreshold, req.HealthCheckHealthyThreshold,
 		req.EnableActiveHealthCheck, req.TCPHealthCheckPort, req.TCPProxyProtocol, req.TCPTryDuration, req.TCPTryInterval,
 		req.RequestBodyMaxSizeMB, req.UpstreamKeepaliveTimeout, req.ServerTokensHidden,
+		features.ChainRaceIntervalMS, features.ChainRequestTimeoutMS,
 		features.CustomRoutesEnabled,
 		features.ProxyDialTimeout, features.ProxyResponseHeaderTimeout, features.ProxyReadTimeout, features.ProxyWriteTimeout, features.ProxyStreamTimeout, features.ProxyFlushInterval, features.ProxyStreamCloseDelay,
 		req.HostHeader, req.EnableTLS, req.TLSSource, req.ACMEConfigID, req.CAProviderID, req.TLSCert, req.TLSKey, req.TLSCertPath, req.TLSKeyPath,
@@ -1145,6 +1158,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			COALESCE(health_check_unhealthy_threshold,3), COALESCE(health_check_healthy_threshold,2),
 			COALESCE(enable_active_health_check,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
 		COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0),
+		COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 		COALESCE(custom_routes_enabled,0),
 		COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 		COALESCE(host_header,''), COALESCE(enable_compress,1), COALESCE(compress_types,'gzip'),
@@ -1159,6 +1173,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		&existingRule.HealthCheckUnhealthyThreshold, &existingRule.HealthCheckHealthyThreshold,
 		&existingRule.EnableActiveHealthCheck, &existingRule.TCPHealthCheckPort, &existingRule.TCPProxyProtocol, &existingRule.TCPTryDuration, &existingRule.TCPTryInterval,
 		&existingRule.RequestBodyMaxSizeMB, &existingRule.UpstreamKeepaliveTimeout, &existingRule.ServerTokensHidden,
+		&existingRule.ChainRaceIntervalMS, &existingRule.ChainRequestTimeoutMS,
 		&existingRule.CustomRoutesEnabled,
 		&existingRule.ProxyDialTimeout, &existingRule.ProxyResponseHeaderTimeout, &existingRule.ProxyReadTimeout, &existingRule.ProxyWriteTimeout, &existingRule.ProxyStreamTimeout, &existingRule.ProxyFlushInterval, &existingRule.ProxyStreamCloseDelay,
 		&existingRule.HostHeader, &existingRule.EnableCompress, &existingRule.CompressTypes,
@@ -1276,6 +1291,14 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.ServerTokensHidden == nil {
 		req.ServerTokensHidden = &existingRule.ServerTokensHidden
 	}
+	// 链式回退竞速参数（LB-02 口径）：nil=沿用存量，显式 0=落库 0（渲染侧按
+	// chain 策略兜底 3000/30000）。
+	if req.ChainRaceIntervalMS == nil {
+		req.ChainRaceIntervalMS = &existingRule.ChainRaceIntervalMS
+	}
+	if req.ChainRequestTimeoutMS == nil {
+		req.ChainRequestTimeoutMS = &existingRule.ChainRequestTimeoutMS
+	}
 	if req.DynamicDNS == nil {
 		req.DynamicDNS = &existingRule.DynamicDNS
 	}
@@ -1328,7 +1351,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		zero, disabled, empty := 0, false, ""
 		switch req.Protocol {
 		case "tcp":
-			if req.Strategy == "cookie" {
+			if req.Strategy == "cookie" || req.Strategy == "chain_fallback" {
 				req.Strategy = "weighted_round_robin"
 			}
 			req.Domain = ""
@@ -1702,6 +1725,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	args = append(args, *req.UpstreamKeepaliveTimeout)
 	query += "server_tokens_hidden = ?, "
 	args = append(args, *req.ServerTokensHidden)
+	query += "chain_race_interval_ms = ?, "
+	args = append(args, *req.ChainRaceIntervalMS)
+	query += "chain_request_timeout_ms = ?, "
+	args = append(args, *req.ChainRequestTimeoutMS)
 	query += "custom_routes_enabled = ?, "
 	args = append(args, features.CustomRoutesEnabled)
 	query += "proxy_dial_timeout = ?, "
@@ -2508,17 +2535,19 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 			health_check_unhealthy_threshold, health_check_healthy_threshold,
 			enable_active_health_check, tcp_health_check_port, tcp_proxy_protocol, tcp_try_duration, tcp_try_interval,
 			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden,
+			chain_race_interval_ms, chain_request_timeout_ms,
 			enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_cert_path, tls_key_path,
 	tls_http_redirect, enable_compress, compress_types, enabled, created_by, updated_by, created_at, updated_at, host_header, log_enabled, caddy_id,
 		custom_routes_enabled,
 		proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
 		block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, rule.Name+"（副本）", rule.Description, rule.Protocol, rule.Domain, rule.ListenPort, rule.Strategy,
 		rule.DynamicDNS, rule.EnableDnsServer, rule.DnsServer, rule.DnsFamily, rule.HealthCheckPath, rule.HealthCheckInterval, rule.HealthCheckTimeout,
 		rule.HealthCheckUnhealthyThreshold, rule.HealthCheckHealthyThreshold,
 		rule.EnableActiveHealthCheck, rule.TCPHealthCheckPort, rule.TCPProxyProtocol, rule.TCPTryDuration, rule.TCPTryInterval,
 		rule.RequestBodyMaxSizeMB, rule.UpstreamKeepaliveTimeout, rule.ServerTokensHidden,
+		rule.ChainRaceIntervalMS, rule.ChainRequestTimeoutMS,
 		rule.EnableTLS, rule.TLSSource, rule.ACMEConfigID, rule.CAProviderID, rule.TLSCert, rule.TLSKey, rule.TLSCertPath, rule.TLSKeyPath,
 		rule.TLSHTTPRedirect, rule.EnableCompress, rule.CompressTypes, 0, userIDInt, userIDInt,
 		now, now, rule.HostHeader, rule.LogEnabled, newCaddyID,

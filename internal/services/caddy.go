@@ -1254,20 +1254,23 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		TLSCert                       string
 		TLSKey                        string
 		// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件路径（2026-10-09）。
-		TLSCertPath                string
-		TLSKeyPath                 string
-		TLSHTTPRedirect            bool
-		Enabled                    bool
-		EnableCompress             bool
-		CompressTypes              string
-		EnableActiveHealthCheck    bool
-		TCPHealthCheckPort         int
-		TCPProxyProtocol           bool
-		TCPTryDuration             int
-		TCPTryInterval             int
-		RequestBodyMaxSizeMB       int
-		UpstreamKeepaliveTimeout   int
-		ServerTokensHidden         int
+		TLSCertPath              string
+		TLSKeyPath               string
+		TLSHTTPRedirect          bool
+		Enabled                  bool
+		EnableCompress           bool
+		CompressTypes            string
+		EnableActiveHealthCheck  bool
+		TCPHealthCheckPort       int
+		TCPProxyProtocol         bool
+		TCPTryDuration           int
+		TCPTryInterval           int
+		RequestBodyMaxSizeMB     int
+		UpstreamKeepaliveTimeout int
+		ServerTokensHidden       int
+		// 链式回退竞速参数（strategy=chain_fallback 渲染消费；0 值渲染兜底）。
+		ChainRaceIntervalMS        int
+		ChainRequestTimeoutMS      int
 		CustomRoutesEnabled        bool
 		ProxyDialTimeout           int
 		ProxyResponseHeaderTimeout int
@@ -1315,6 +1318,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		       IIF(enabled IN ('1',1),1,0), IIF(enable_compress IN ('1',1),1,0), COALESCE(compress_types,'gzip'),
 		       IIF(enable_active_health_check IN ('1',1),1,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
 		       COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(host_header,''),
+		       COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 		       IIF(log_enabled IN ('1',1),1,0), IIF(custom_routes_enabled IN ('1',1),1,0),
 		       COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 		       COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)
@@ -1335,7 +1339,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			&r.TLSCertPath, &r.TLSKeyPath,
 			&r.TLSHTTPRedirect, &r.Enabled, &r.EnableCompress, &r.CompressTypes,
 			&r.EnableActiveHealthCheck, &r.TCPHealthCheckPort, &r.TCPProxyProtocol, &r.TCPTryDuration, &r.TCPTryInterval,
-			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden, &r.HostHeader, &r.LogEnabled,
+			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden, &r.HostHeader,
+			&r.ChainRaceIntervalMS, &r.ChainRequestTimeoutMS, &r.LogEnabled,
 			&r.CustomRoutesEnabled, &r.ProxyDialTimeout, &r.ProxyResponseHeaderTimeout,
 			&r.ProxyReadTimeout, &r.ProxyWriteTimeout, &r.ProxyStreamTimeout, &r.ProxyFlushInterval, &r.ProxyStreamCloseDelay,
 			&r.BlockPageStage1ID, &r.BlockPageStage1Status, &r.BlockPageStage3ID, &r.BlockPageStage3Status)
@@ -1714,6 +1719,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 				RequestBodyMaxSizeMB:             r.RequestBodyMaxSizeMB,
 				UpstreamKeepaliveTimeout:         r.UpstreamKeepaliveTimeout,
 				ServerTokensHidden:               r.ServerTokensHidden,
+				ChainRaceIntervalMS:              r.ChainRaceIntervalMS,
+				ChainRequestTimeoutMS:            r.ChainRequestTimeoutMS,
 				GlobalRequestBodyMaxSizeMB:       global.requestBodyMaxSizeMB,
 				GlobalUpstreamKeepaliveTimeout:   global.upstreamKeepaliveTimeout,
 				GlobalServerTokensHidden:         global.serverTokensHidden,
@@ -2464,19 +2471,22 @@ type SingleRuleConfig struct {
 	TLSCert                       string
 	TLSKey                        string
 	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件路径（2026-10-09）。
-	TLSCertPath                      string
-	TLSKeyPath                       string
-	TLSHTTPRedirect                  bool
-	EnableCompress                   bool
-	CompressTypes                    string
-	EnableActiveHealthCheck          bool
-	TCPHealthCheckPort               int
-	TCPProxyProtocol                 bool
-	TCPTryDuration                   int
-	TCPTryInterval                   int
-	RequestBodyMaxSizeMB             int
-	UpstreamKeepaliveTimeout         int
-	ServerTokensHidden               int
+	TLSCertPath              string
+	TLSKeyPath               string
+	TLSHTTPRedirect          bool
+	EnableCompress           bool
+	CompressTypes            string
+	EnableActiveHealthCheck  bool
+	TCPHealthCheckPort       int
+	TCPProxyProtocol         bool
+	TCPTryDuration           int
+	TCPTryInterval           int
+	RequestBodyMaxSizeMB     int
+	UpstreamKeepaliveTimeout int
+	ServerTokensHidden       int
+	// 链式回退竞速参数（strategy=chain_fallback 渲染消费；0 值渲染兜底 3000/30000）。
+	ChainRaceIntervalMS              int
+	ChainRequestTimeoutMS            int
 	GlobalRequestBodyMaxSizeMB       int
 	GlobalUpstreamKeepaliveTimeout   int
 	GlobalServerTokensHidden         bool
@@ -3778,6 +3788,25 @@ func buildHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, respond
 	// 语义不变。TLS server_name 同源取值（混合态走 {lb.upstream_sni}）。
 	hostPlan := resolveUpstreamHostPlan(rule, enabledUpstreams)
 
+	// 链式回退（2026-10-09）：strategy=chain_fallback 渲染为自定义 chain_proxy
+	// 处理器（caddychain 模块）——上游按权重降序组成回退链，竞速 + 兜底截断 +
+	// 失败即切。reverse_proxy 专属的负载均衡/健康检查/transport/headers/回源
+	// Host 占位符全部不发射（竞速即可用性机制；逐上游回源 Host 在生成侧解析后
+	// 随车道下发）。安全链/静态响应短路等链上前置 handler 不变。
+	if rule.Protocol == "http" && rule.Strategy == "chain_fallback" {
+		chainConfig := buildChainProxyConfig(rule, enabledUpstreams)
+		if effectiveServerTokensHidden {
+			// deferred Server 删除与 reverse_proxy 无关（响应写出后生效），
+			// 链式规则同样生效。
+			handleChain = append(handleChain, map[string]interface{}{
+				"handler":  "headers",
+				"response": map[string]interface{}{"deferred": true, "delete": []string{"Server"}},
+			})
+		}
+		handleChain = append(handleChain, chainConfig)
+		return handleChain, nil
+	}
+
 	proxyConfig := map[string]interface{}{"handler": "reverse_proxy"}
 	if rule.DynamicDNS {
 		proxyConfig["dynamic_upstreams"] = upstreamList[0]
@@ -3917,20 +3946,10 @@ func buildHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, respond
 	}
 	// X-LB-GeoIP-* 是 caddygeoip→coraza 的进程内控制头（coraza 在本 handler 之前
 	// 执行，已消费完毕），绝不允许透传上游后端。无条件剥离：geoip 关闭的规则
-	// 同时防客户端伪造同名头直达后端。头名清单与 caddygeoip/handler.go 的
-	// geoipCorazaHeaders(caddygeoip/handler.go) 同源，变更需双侧同步。X-LB-Rule-ID 同型：链首注入的归因头
-	//（F3）仅供 coraza 事务内消费，同口径无条件剥离。
+	// 同时防客户端伪造同名头直达后端。头名清单见 lbControlRequestHeaders（与
+	// chain_proxy 的 strip_request_headers 同源，变更需双侧同步）。
 	proxyRequestHeaders := map[string]interface{}{
-		"delete": []string{
-			"X-LB-GeoIP-Country", "X-LB-GeoIP-Country-Code", "X-LB-GeoIP-Region",
-			"X-LB-GeoIP-Province", "X-LB-GeoIP-City", "X-LB-GeoIP-Loc",
-			"X-LB-Rule-ID",
-			// 安全处理耗时关联头（v2.3.3）：blocked_counter 注入供 coraza 审计
-			// 日志收录,摄取管道按 ID 关联侧车文件耗时——coraza 之后链路不再
-			// 需要,与 X-LB-Rule-ID 同机制剥离,不上泄上游。
-			"X-Lb-Security-Timing-Id",
-			"X-Lb-Security-Timing-Start-Ns",
-		},
+		"delete": lbControlRequestHeaders,
 	}
 	// 回源 Host 下发（三级回退计划；有启用上游时三态必有其一——恒显式设置：
 	// 全回退态从「透传客户端 Host」改为「每上游用自身 host:port」，与程序定位
@@ -4035,6 +4054,86 @@ func stripPortForSNI(host string) string {
 		return h
 	}
 	return host
+}
+
+// lbControlRequestHeaders 面板进程内控制头清单：X-LB-GeoIP-* 是 caddygeoip→
+// coraza 的控制头（coraza 在代理 handler 之前执行，已消费完毕），X-LB-Rule-ID
+// 为链首注入的归因头（F3）仅供 coraza 事务内消费，X-Lb-Security-Timing-* 为
+// 安全处理耗时关联头（v2.3.3）——绝不允许透传上游后端。reverse_proxy（headers.
+// request.delete）与 chain_proxy（strip_request_headers）两侧同源消费，与
+// caddygeoip/handler.go 的 geoipCorazaHeaders 同源，变更需三侧同步。
+var lbControlRequestHeaders = []string{
+	"X-LB-GeoIP-Country", "X-LB-GeoIP-Country-Code", "X-LB-GeoIP-Region",
+	"X-LB-GeoIP-Province", "X-LB-GeoIP-City", "X-LB-GeoIP-Loc",
+	"X-LB-Rule-ID",
+	"X-Lb-Security-Timing-Id",
+	"X-Lb-Security-Timing-Start-Ns",
+}
+
+// chainProxyDefaults 与 caddychain 模块 Default* 常量同口径（模块侧 Provision
+// 亦有兜底，此处显式落 JSON 便于配置可读与测试断言）。预算公式（全挂兜底最坏
+// 情形）：总耗时 ≈ (N−1)×RaceInterval + RequestTimeout，按 N=6 封顶 + 浏览器
+// 60s 等待约束设计：5×3000+30000=45s < 60s（15s 余量）。
+const (
+	chainProxyDefaultRaceIntervalMS   = 3000
+	chainProxyDefaultRequestTimeoutMS = 30000
+	chainProxyBodyReplayLimitBytes    = 5 * 1024 * 1024
+)
+
+// buildChainProxyConfig 组装 chain_proxy 处理器配置（strategy=chain_fallback）。
+// 上游按权重降序稳定排序（同权重保持列表顺序；weight<=0→1，满足「发射权重
+// 恒 > 0」不变量——chain 配置不发射 weights 键，但优先级语义同样依赖正权重）；
+// 逐上游回源 Host 按「上游 host_header > 规则级 host_header > 空=用 dial 地址」
+// 三级回退解析（与 resolveUpstreamHostPlan 同口径，无需占位符/混合态处理）。
+func buildChainProxyConfig(rule SingleRuleConfig, enabledUpstreams []UpstreamConfig) map[string]interface{} {
+	sorted := make([]UpstreamConfig, len(enabledUpstreams))
+	copy(sorted, enabledUpstreams)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		wi, wj := sorted[i].Weight, sorted[j].Weight
+		if wi <= 0 {
+			wi = 1
+		}
+		if wj <= 0 {
+			wj = 1
+		}
+		return wi > wj
+	})
+	entries := make([]interface{}, 0, len(sorted))
+	for _, u := range sorted {
+		entry := map[string]interface{}{"dial": joinUpstreamAddress(u.Host, u.Port)}
+		if u.Protocol == "https" {
+			entry["scheme"] = "https"
+		}
+		host := strings.TrimSpace(u.HostHeader)
+		if host == "" {
+			host = strings.TrimSpace(rule.HostHeader)
+		}
+		if host != "" {
+			entry["host"] = host
+		}
+		entries = append(entries, entry)
+	}
+	raceIntervalMS := rule.ChainRaceIntervalMS
+	if raceIntervalMS <= 0 {
+		raceIntervalMS = chainProxyDefaultRaceIntervalMS
+	}
+	requestTimeoutMS := rule.ChainRequestTimeoutMS
+	if requestTimeoutMS <= 0 {
+		requestTimeoutMS = chainProxyDefaultRequestTimeoutMS
+	}
+	handler := map[string]interface{}{
+		"handler":                 "chain_proxy",
+		"upstreams":               entries,
+		"race_interval_ms":        raceIntervalMS,
+		"request_timeout_ms":      requestTimeoutMS,
+		"body_replay_limit_bytes": chainProxyBodyReplayLimitBytes,
+		"strip_request_headers":   lbControlRequestHeaders,
+	}
+	timeouts := resolveProxyTimeouts(rule)
+	if timeouts.dial > 0 {
+		handler["dial_timeout_ms"] = timeouts.dial * 1000
+	}
+	return handler
 }
 
 // ApplyConfigFromTx renders the Caddy config from an uncommitted transaction
