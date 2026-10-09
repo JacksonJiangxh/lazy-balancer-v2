@@ -39,12 +39,15 @@ Open `http://localhost:8000` for the admin panel. First visit opens an initializ
 docker compose up -d
 
 # Build from source
-cd web && npm install && npm run build && cd ..
+# The frontend is produced by the node build stage inside the Dockerfile,
+# so there is no need to run npm build locally first
 docker buildx build --platform linux/amd64,linux/arm64 \
   --build-arg VERSION=v2.3.4 \
   --provenance=false --sbom=false \
   -t v55448330/lazy-balancer-v2:v2.3.4 --push .
 ```
+
+CI is handled by the CNB pipeline: click the "构建并推送镜像" (Build & Push Image) button on the main branch detail page to trigger a native amd64/arm64 dual-arch build → real container smoke test → push to the CNB registry `docker.cnb.cool/xzydm/lazy-balancer-v2` (both the `latest` and a versioned manifest). See `.cnb.yml` and `.cnb/web_trigger.yml`.
 </details>
 
 ## Documentation

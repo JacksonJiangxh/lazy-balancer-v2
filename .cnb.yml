@@ -1,0 +1,303 @@
+# Lazy Balancer V2 · CNB 流水线
+#
+# 两类事件：
+#   1) vscode：仓库页面「云原生开发」按钮 → 远程开发环境（Go 1.26 + Node 22 + sqlite）
+#   2) web_trigger_docker_build：页面自定义按钮（见 .cnb/web_trigger.yml）→
+#      amd64/arm64 原生并行构建镜像 → 探活 → 推送 → 合成多架构 manifest
+#
+# 适配约定：仓库名、镜像源一律走内置变量（${CNB_REPO_SLUG_LOWERCASE} /
+# ${CNB_REPO_NAME_LOWERCASE} / ${CNB_DOCKER_REGISTRY}），**零硬编码仓库名**，
+# 本文件可直接复制到任意 CNB 仓库使用。
+#
+# 两者都必须写在 `$`（兜底分支）下：vscode 属仓库级事件（与分支无关），
+# web_trigger 也建议放兜底分支以免漏配分支。
+
+$:
+  # ──────────────────────────────────────────────────────────────
+  # 云原生开发环境：专供页面中点击「云原生开发」启动远程开发用
+  # ──────────────────────────────────────────────────────────────
+  vscode:
+    - name: dev-env
+      docker:
+        image: docker.cnb.cool/xzydm/mirrors/debian:13-all
+      runner:
+        cpus: 8
+        tags: cnb:arch:amd64
+      services:
+        - docker
+        - name: vscode
+          options:
+            # false（默认）：走标准 WebIDE / VSCode 客户端，而不是只打开预览页
+            onlyPreview: false
+            # 参考仓写的是 `launch: python keepalive.py`（依赖仓内一个 py 脚本）。
+            # 本仓库是 Go 项目，没有也不打算为开发环境往仓库塞脚本，故用等价的
+            # inline 长驻命令：配合 daemon: true 由平台后台 detach 执行，
+            # docker exec 立即返回，不会卡在「等待 launch 退出」上（非守护模式下
+            # launch 超过 5 分钟不退出会判失败）。
+            launch: sh -c "while true; do sleep 3600; done"
+            # 离线保活 16h（默认仅 10 分钟无心跳就回收环境）
+            keepAliveTimeout: 16h
+            daemon: true
+      stages:
+        # 开发环境每次启动都会重跑 stages，故安装必须幂等（command -v 命中即跳过），
+        # 否则每次进环境都要白白重装几百 MB 工具链。
+        - name: install toolchain
+          script: |
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+
+            # 基础命令缺失才 apt-get（apt install 属平台侧的 slow-path，能省则省）
+            MISSING=""
+            for c in curl ca-certificates-x509-tool sqlite3 git jq xz-utils; do
+              case "$c" in
+                ca-certificates-x509-tool) command -v update-ca-certificates >/dev/null 2>&1 || MISSING="$MISSING ca-certificates";;
+                xz-utils) command -v xz >/dev/null 2>&1 || MISSING="$MISSING xz-utils";;
+                *) command -v "$c" >/dev/null 2>&1 || MISSING="$MISSING $c";;
+              esac
+            done
+            if [ -n "$MISSING" ]; then
+              echo ">>> installing system packages:$MISSING"
+              apt-get update -y
+              apt-get install -y --no-install-recommends $MISSING
+            fi
+
+            # ── Go 1.26.6（与 Dockerfile 的 golang:1.26.6-alpine 对齐）──
+            # 主源阿里云（实测 200），回退 google.cn，最后兜底官方 dl
+            if ! command -v go >/dev/null 2>&1; then
+              echo ">>> installing go1.26.6"
+              for base in https://mirrors.aliyun.com/golang https://golang.google.cn/dl https://go.dev/dl; do
+                if curl -fsSL --max-time 300 -o /tmp/go.tgz "$base/go1.26.6.linux-amd64.tar.gz"; then
+                  tar -C /usr/local -xzf /tmp/go.tgz
+                  rm -f /tmp/go.tgz
+                  break
+                fi
+                echo ">>> go 下载失败，换下一个源：$base"
+              done
+            fi
+            command -v go >/dev/null 2>&1 || { echo ">>> go 安装失败：所有下载源均不可达"; exit 1; }
+
+            # ── Node 22（前端 web/ 需要 vite 8 + vue-tsc，Node 20 不够）──
+            # 主源阿里云 nodejs-release（实测 200），回退 npmmirror 二进制站，最后兜底官方
+            if ! command -v node >/dev/null 2>&1; then
+              echo ">>> installing node 22.23.3"
+              NODE_PKG=node-v22.23.3-linux-x64.tar.xz
+              for base in https://mirrors.aliyun.com/nodejs-release/v22.23.3 \
+                          https://registry.npmmirror.com/-/binary/node/v22.23.3 \
+                          https://nodejs.org/dist/v22.23.3; do
+                if curl -fsSL --max-time 300 -o /tmp/node.tar.xz "$base/$NODE_PKG"; then
+                  mkdir -p /usr/local/nodejs
+                  tar -C /usr/local/nodejs --strip-components=1 -xJf /tmp/node.tar.xz
+                  rm -f /tmp/node.tar.xz
+                  break
+                fi
+                echo ">>> node 下载失败，换下一个源：$base"
+              done
+            fi
+
+            # PATH：同时写入 /etc/profile.d（登录 shell）与 ~/.bashrc（部分 IDE
+            # 终端只加载交互式配置），避免 WebIDE 终端出现 command not found
+            cat > /etc/profile.d/lazy-balancer-dev.sh <<'EOF'
+            export PATH=$PATH:/usr/local/go/bin:/usr/local/nodejs/bin
+            export GOPROXY=https://mirrors.aliyun.com/goproxy/,https://goproxy.cn,direct
+            export GOPATH=$HOME/go
+            EOF
+            chmod +x /etc/profile.d/lazy-balancer-dev.sh
+            grep -q 'lazy-balancer-dev.sh' /etc/bash.bashrc 2>/dev/null || \
+              echo '[ -f /etc/profile.d/lazy-balancer-dev.sh ] && . /etc/profile.d/lazy-balancer-dev.sh' >> /etc/bash.bashrc
+            grep -q 'lazy-balancer-dev.sh' "$HOME/.bashrc" 2>/dev/null || \
+              echo '[ -f /etc/profile.d/lazy-balancer-dev.sh ] && . /etc/profile.d/lazy-balancer-dev.sh' >> "$HOME/.bashrc"
+
+            export PATH=$PATH:/usr/local/go/bin:/usr/local/nodejs/bin
+            echo "=== toolchain ==="
+            go version
+            node -v
+            npm -v
+            sqlite3 --version
+
+  # ──────────────────────────────────────────────────────────────
+  # 镜像构建：页面自定义按钮触发（见 .cnb/web_trigger.yml）
+  #
+  # 结构沿用成熟的三 pipeline 形态：amd64 / arm64 两个原生架构作业并行编译，
+  # 第三个作业 await 两者完成后合成多架构 manifest。
+  # 之所以不用 buildx 一把梭多架构：本仓库最重的一步是 xcaddy build
+  #（编译 Caddy + coraza 等 6 个插件），QEMU 模拟下的耗时不可接受，
+  # 原生双 runner 反而更快。
+  # ──────────────────────────────────────────────────────────────
+  web_trigger_docker_build:
+    - name: build-amd64
+      runner:
+        cpus: 8
+        tags: cnb:arch:amd64
+      services:
+        - docker
+      env:
+        IMAGE_TAG: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:latest-linux-amd64
+        # 专用层缓存 tag：不与任何对外 tag 复用，避免下面 remove-tag 把下次
+        # 构建的缓存源一起删掉；终端更新 APP_VERSION 的代价是几百 MB 存储。
+        CACHE_TAG: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:cache-linux-amd64
+      stages:
+        - name: docker login
+          script: docker login -u ${CNB_TOKEN_USER_NAME} -p "${CNB_TOKEN}" ${CNB_DOCKER_REGISTRY}
+        - name: docker build
+          # xcaddy 冷缓存全量重编历史上可达 40 分钟级；默认的 2h 上限 /
+          # 10min 无输出超时（哪怕只是 go build 长时间不打日志）都太紧，显式放宽。
+          timeout: 4h
+          script: |
+            set -e
+            # 版本号：优先取按钮传入的 VERSION，缺省时回退 Dockerfile 的 ARG 默认值。
+            # 注意 Dockerfile 里还有一行 ARG CRS_VERSION=...，故必须锚定行首
+            # ^ARG VERSION=，否则 head -1 可能抓错。
+            VERSION="${VERSION:-$(sed -n 's/^ARG VERSION=//p' Dockerfile | head -1)}"
+            echo "APP_VERSION=${VERSION}"
+            # 首次构建必然没有缓存镜像，拉失败不能中断流水线
+            docker pull ${CACHE_TAG} || true
+            # BUILDKIT_INLINE_CACHE=1 让产物带上层缓存元数据，下次以它为 --cache-from
+            # 即可吃到增量（比 --cache-to type=registry,mode=max 对默认 driver 更稳）
+            docker build \
+              --build-arg BUILDKIT_INLINE_CACHE=1 \
+              --build-arg VERSION=${VERSION} \
+              --cache-from ${CACHE_TAG} \
+              -t ${IMAGE_TAG} .
+        # 「构建成功 ≠ 镜像能跑」——真的把容器跑起来才算过。
+        # 探针形态与 docker-compose.yml 的 healthcheck 保持一致的双探针：管理面板
+        # 可能为自签 HTTPS（此时明文 HTTP 返回 301），也可能只有明文可用；
+        # 且镜像内**没有 curl**（构建期临时装的 curl 事后 apk del 了），
+        # 只能用 busybox wget，自签证书靠 --no-check-certificate 放行。
+        # 探针走 docker exec 在容器内打 127.0.0.1:8000，不依赖宿主机端口映射。
+        - name: docker smoke test
+          timeout: 10m
+          script: |
+            set -e
+            cid=$(docker run -d ${IMAGE_TAG})
+            trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+            ok=0
+            # 首次启动要 --init 建库 + 生成 Caddyfile + 拉起 Caddy 监督器，放宽到 ~2min
+            for i in $(seq 1 60); do
+              if [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || echo false)" != "true" ]; then
+                echo ">>> 容器已退出，提前结束探活"
+                break
+              fi
+              if docker exec "$cid" sh -c 'wget -q -O /dev/null -T 3 --no-check-certificate https://127.0.0.1:8000/health || wget -q -O /dev/null -T 3 http://127.0.0.1:8000/health'; then
+                ok=1
+                break
+              fi
+              sleep 2
+            done
+            echo "--- container logs (tail 40) ---"
+            docker logs "$cid" 2>&1 | tail -40
+            if [ "$ok" != "1" ]; then
+              echo ">>> 镜像探活失败：容器未在 8000 提供 /health（构建绿 ≠ 镜像能跑）"
+              exit 1
+            fi
+            echo ">>> 镜像探活通过"
+        - name: docker push
+          script: |
+            set -e
+            docker push ${IMAGE_TAG}
+            # 同一份镜像换个 tag 推就是下次的缓存源（层在制品库只存一份）
+            docker tag ${IMAGE_TAG} ${CACHE_TAG}
+            docker push ${CACHE_TAG}
+        - name: resolve
+          type: cnb:resolve
+          options:
+            key: build-amd64
+
+    - name: build-arm64
+      runner:
+        cpus: 8
+        tags: cnb:arch:arm64:v8
+      services:
+        - docker
+      env:
+        IMAGE_TAG: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:latest-linux-arm64
+        CACHE_TAG: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:cache-linux-arm64
+      stages:
+        - name: docker login
+          script: docker login -u ${CNB_TOKEN_USER_NAME} -p "${CNB_TOKEN}" ${CNB_DOCKER_REGISTRY}
+        - name: docker build
+          timeout: 4h
+          script: |
+            set -e
+            VERSION="${VERSION:-$(sed -n 's/^ARG VERSION=//p' Dockerfile | head -1)}"
+            echo "APP_VERSION=${VERSION}"
+            docker pull ${CACHE_TAG} || true
+            docker build \
+              --build-arg BUILDKIT_INLINE_CACHE=1 \
+              --build-arg VERSION=${VERSION} \
+              --cache-from ${CACHE_TAG} \
+              -t ${IMAGE_TAG} .
+        # arm64 作业不做真容器探活：一是此处是 arm64 原生 runner，镜像与运行架构
+        # 天然一致，跑不起来的概率远低于交叉构建；二是每次探活要给缓慢的 arm64
+        # 容器额外留 2 分钟启动窗口。冒烟已在 amd64 侧覆盖「构建绿 ≠ 镜像能跑」。
+        # 若将来需要（例如怀疑某个插件在 arm64 上启动崩），把 amd64 作业那一段
+        # smoke test 原样复制到这里即可。
+        - name: docker push
+          script: |
+            set -e
+            docker push ${IMAGE_TAG}
+            docker tag ${IMAGE_TAG} ${CACHE_TAG}
+            docker push ${CACHE_TAG}
+        - name: resolve
+          type: cnb:resolve
+          options:
+            key: build-arm64
+
+    - name: manifest
+      services:
+        - docker
+      env:
+        IMAGE_BASE: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}
+      stages:
+        - name: await the amd64
+          type: cnb:await
+          options:
+            key: build-amd64
+        - name: await the arm64
+          type: cnb:await
+          options:
+            key: build-arm64
+        - name: docker login
+          script: docker login -u ${CNB_TOKEN_USER_NAME} -p "${CNB_TOKEN}" ${CNB_DOCKER_REGISTRY}
+        - name: manifest latest
+          image: cnbcool/manifest
+          settings:
+            # 插件对 CNB 制品库有内置默认账号，但仅当 CNB_TOKEN_USER_NAME / CNB_TOKEN
+            # 在插件容器内可见时才生效；显式传入更稳，且二者都取自构建环境变量
+            #（日志打码），不会落成明文配置。
+            username: ${CNB_TOKEN_USER_NAME}
+            password: ${CNB_TOKEN}
+            target: ${IMAGE_BASE}:latest
+            # 源镜像模板必须写成 latest-OS-ARCH，不能写 latest-linux-OS-ARCH：
+            # 插件的 ARCH/OS/VARIANT 是裸子串替换（不是占位符解析），tag 里已有
+            # linux 再叠 OS 会得到 latest-linux-linux-amd64，制品库里没有该 tag，
+            # manifest 直接 404。
+            template: ${IMAGE_BASE}:latest-OS-ARCH
+            platforms:
+              - linux/amd64
+              - linux/arm64
+        # 版本号 tag：与 latest 指向完全相同的两个 per-arch 镜像，只是换了一个
+        # manifest target（方便用户固定到某个发行版，不被后续 latest 带跑）。
+        # VERSION 由页面按钮的入参注入（见 .cnb/web_trigger.yml，带默认值，必填），
+        # 为空通常说明不是从该按钮触发（例如 API 触发），此时跳过而不是产出
+        # 「{仓库}:」这种残缺 target。
+        - name: manifest version
+          if: '[ -n "${VERSION}" ]'
+          image: cnbcool/manifest
+          settings:
+            username: ${CNB_TOKEN_USER_NAME}
+            password: ${CNB_TOKEN}
+            target: ${IMAGE_BASE}:${VERSION}
+            template: ${IMAGE_BASE}:latest-OS-ARCH
+            platforms:
+              - linux/amd64
+              - linux/arm64
+        - name: remove tag
+          type: artifact:remove-tag
+          options:
+            # 包名用仓库同名制品名，不能用完整镜像地址
+            name: ${CNB_REPO_NAME_LOWERCASE}
+            tags:
+              # 只删两个架构作业实际推送的临时 tag；cache-linux-* 要留着给下次构建
+              - latest-linux-amd64
+              - latest-linux-arm64
+            type: docker

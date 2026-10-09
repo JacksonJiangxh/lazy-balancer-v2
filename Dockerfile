@@ -81,6 +81,26 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux go build -o lazy-balancer
 
+# Frontend build stage.
+# 此前 final 阶段直接 `COPY web/dist /app/ui`，而 web/dist 不入版本库
+#（Git 忽略），导致必须先在宿主机手工 `cd web && npm run build` 才能 docker build
+# —— CI 里这一步必然失败。这里把它下沉为独立构建阶段，使 docker build 自包含：
+# 源码 checkout 后一条命令即可出镜像，流水线与本地都不再有隐式前置步骤。
+# Node 22 是硬要求：web/package.json 钉的是 vite ^8.2.1 + vue-tsc ^3.3.10。
+FROM node:22-alpine AS web-builder
+WORKDIR /app
+# 先只拷贝清单文件：依赖未变时下方 npm ci 直接命中缓存，不因源码改动重跑
+COPY web/package.json web/package-lock.json ./web/
+# npm 缓存挂载（与 Go 侧同形态的 BuildKit cache mount）：避免每次全量拉包。
+# 若构建机访问 registry.npmjs.org 不通，把 npm ci 换成
+#   npm ci --registry=https://registry.npmmirror.com
+RUN --mount=type=cache,target=/root/.npm \
+    cd /app/web && npm ci --no-audit --no-fund
+COPY web ./web
+# npm run build = vue-tsc --noEmit && vite build（类型检查 + 产出 /app/web/dist）
+RUN --mount=type=cache,target=/root/.npm \
+    cd /app/web && npm run build
+
 # Final image
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 ARG VERSION=v2.3.4
@@ -97,7 +117,8 @@ WORKDIR /app
 
 COPY --from=xcaddy-builder /app/caddy /usr/local/bin/caddy
 COPY --from=backend /app/cmd/server/lazy-balancer /usr/local/bin/lazy-balancer
-COPY web/dist /app/ui
+# 静态资源取自上面的 web-builder 阶段（此前依赖宿主机预生成的 web/dist）
+COPY --from=web-builder /app/web/dist /app/ui
 
 RUN mkdir -p /app/data /app/config /app/logs /app/certs /app/waf/crs /app/waf/audit
 

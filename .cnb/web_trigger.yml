@@ -1,0 +1,29 @@
+# 分支详情页的自定义按钮 → 触发 .cnb.yml 中的 web_trigger_docker_build 事件。
+#
+# 注意：.cnb/web_trigger.yml 不支持 include / imports；事件名必须与 .cnb.yml
+# 中配置的 web_trigger 事件完全一致，否则按钮点了没反应。
+
+branch:
+  # 只在 main 分支详情页显示构建按钮（避免开发分支上误触发发布）
+  - reg: ^main
+    buttons:
+      - name: 构建并推送镜像
+        description: 双架构（amd64/arm64）镜像 → CNB 制品库 latest + 版本号
+        event: web_trigger_docker_build
+        inputs:
+          VERSION:
+            name: 镜像版本号
+            description: >-
+              写入镜像 /app 的 APP_VERSION，并作为制品库的第二个 manifest tag。
+              缺省时流水线回退读 Dockerfile 的 ARG VERSION 默认值。
+            type: input
+            required: true
+            # 默认值需与 Dockerfile 的 ARG VERSION 人工对齐；改 Dockerfile 版本时
+            # 记得同步这里，否则不填会用旧版本号发布。
+            default: v2.3.4
+        permissions:
+          # 还需具备仓库写权限；角色向上包含（owner 权限高于 master）
+          roles:
+            - owner
+            - master
+            - developer
