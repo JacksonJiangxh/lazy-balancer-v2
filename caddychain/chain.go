@@ -10,8 +10,8 @@
 //   - 单一路径超过 request_timeout_ms 未收到响应头即取消该路径（兜底截断）；
 //     响应头到达后 body 流不再受此超时约束（护住大文件/SSE/长连接）。
 //
-// 收尾：全部车道落定为 bad → 透传最先到达的 bad 响应；全部车道错误 →
-// 502（全部为超时则 504）。
+// 收尾：全部车道落定为 bad → 返回干净 404（不透传后端报文，避免对象存储
+// XML 等错误文档被当作资源内容展示）；全部车道错误 → 502（全部为超时则 504）。
 //
 // 配置由面板 internal/services/caddy.go 在 rule.Strategy == "chain_fallback"
 // 时生成（JSON 键 "handler": "chain_proxy"），与 reverse_proxy 互斥发射。

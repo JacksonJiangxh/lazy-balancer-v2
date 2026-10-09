@@ -215,7 +215,8 @@ func (h *ChainProxy) serveRace(w http.ResponseWriter, r *http.Request, body []by
 				break
 			}
 			if res.resp != nil {
-				// bad 响应（status>=400）：记录最先到达者，其余即刻释放连接。
+				// bad 响应（status>=400）：记录首个到达者——仅用于收尾判定与
+				// 响应体回收（全挂时返回干净 404 不透传），其余即刻释放连接。
 				if firstBad == nil {
 					firstBad = &res
 				} else {
@@ -263,13 +264,17 @@ func (h *ChainProxy) serveRace(w http.ResponseWriter, r *http.Request, body []by
 		return h.writeUpstreamResponse(w, winner.resp, cancels[winner.idx])
 	}
 	if firstBad != nil {
-		for idx, cancel := range cancels {
-			if cancel != nil && idx != firstBad.idx {
+		// 全挂：不再透传最先到达的 bad 响应（否则对象存储 XML/后端错误页会
+		// 被原样展示给客户端）；回收响应体并统一返回干净 404。
+		for _, cancel := range cancels {
+			if cancel != nil {
 				cancel()
 			}
 		}
+		firstBad.resp.Body.Close()
 		go drainLaneResults(results, n-settledCount)
-		return h.writeUpstreamResponse(w, firstBad.resp, cancels[firstBad.idx])
+		chainWriteError(w, http.StatusNotFound, "404 Not Found")
+		return nil
 	}
 	// 全部车道错误：取消全部，502；全部为兜底超时则 504。
 	for _, cancel := range cancels {
@@ -300,7 +305,8 @@ func drainLaneResults(results <-chan laneResult, remaining int) {
 }
 
 // serveSingleLane 退化直通路径：请求体超重放上限（前缀 + 原始流续传）或链上
-// 仅一个上游。语义与竞速车道 0 一致，但不竞速不重放。
+// 仅一个上游。语义与竞速车道 0 一致，但不竞速不重放；上游 404 与全挂同口径，
+// 返回干净 404（不透传后端错误报文）。
 func (h *ChainProxy) serveSingleLane(w http.ResponseWriter, r *http.Request, prefix []byte, overflow bool) error {
 	var body io.Reader
 	if overflow {
@@ -324,10 +330,18 @@ func (h *ChainProxy) serveSingleLane(w http.ResponseWriter, r *http.Request, pre
 		chainWriteError(w, status, msg)
 		return nil
 	}
+	if resp.StatusCode == http.StatusNotFound {
+		// 上游 404：与全挂口径一致——不回传后端错误报文（对象存储 XML 等），
+		// 返回干净 404；其余状态码（5xx/4xx 等语义错误）保持透传不误标。
+		resp.Body.Close()
+		cancel()
+		chainWriteError(w, http.StatusNotFound, "404 Not Found")
+		return nil
+	}
 	return h.writeUpstreamResponse(w, resp, cancel)
 }
 
-// writeUpstreamResponse 流式写出上游响应（胜者/唯一车道/兜底 bad 响应）。
+// writeUpstreamResponse 流式写出上游响应（竞速胜者 / 单车道非 404 直通）。
 // done 在流结束后取消车道 context（连接回收）；nil 则跳过。
 func (h *ChainProxy) writeUpstreamResponse(w http.ResponseWriter, resp *http.Response, done context.CancelFunc) error {
 	defer resp.Body.Close()
