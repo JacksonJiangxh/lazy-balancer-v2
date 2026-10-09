@@ -11,6 +11,10 @@ type PathRuleInput = {
   readonly upstream_path?: string
   readonly sort_order: number
   readonly upstreams: readonly PathUpstreamInput[] | null
+  // 静态响应（2026-10-09，可选以兼容历史调用方）
+  readonly action?: 'proxy' | 'respond'
+  readonly status_code?: number
+  readonly redirect_url?: string
 }
 
 const isValidIpv4 = (value: string): boolean => {
@@ -70,11 +74,7 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
     // 与后端同口径：前缀校验用原始串（后端 HasPrefix 在 TrimSpace 之前）
     if (!rule.path.startsWith('/')) return `第 ${rowNumber} 条路径必须以 / 开头`
     if (/[*?{}]/.test(rule.path)) return `第 ${rowNumber} 条路径不能包含 * ? { } 通配字符`
-    // 上游路径 改写：非空须以 / 开头且不含空格 ? #（query/fragment 不允许），与后端校验同口径
-    if (rule.upstream_path) {
-      if (!rule.upstream_path.startsWith('/')) return `第 ${rowNumber} 条路径的上游路径 必须以 / 开头`
-      if (/[\s?#]/.test(rule.upstream_path)) return `第 ${rowNumber} 条路径的上游路径 不能包含空格 ? # 字符`
-    }
+    // 查重/遮蔽对两种形态共用：路由按 sort_order 首条终结匹配，与形态无关。
     const canonical = canonicalPathKey(rule.match_type, rule.path)
     const duplicateKey = `${rule.match_type}:${canonical}`
     const seenAt = seen.get(duplicateKey)
@@ -88,6 +88,26 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
       const shadowAt = seenPrefixRoots.get(canonical)
       if (shadowAt !== undefined) return `第 ${rowNumber} 条路径与第 ${shadowAt} 条：同一路径同时存在前缀与精确匹配规则会造成遮蔽，请调整`
       seenExactNorms.set(canonical, rowNumber)
+    }
+    // 静态响应形态（与后端 validateStaticResponsePathRule 同口径）：仅校验响应码与
+    // 重定向目标，上游相关校验整体跳过（两形态互斥）。
+    if (rule.action === 'respond') {
+      const statusCode = rule.status_code ?? 0
+      if (!statusCode) return `第 ${rowNumber} 条路径请选择响应码`
+      if (statusCode >= 300 && statusCode < 400) {
+        const target = (rule.redirect_url ?? '').trim()
+        if (!target) return `第 ${rowNumber} 条路径的重定向响应码必须填写目标 URL`
+        if (!target.startsWith('/') && !/^https?:\/\//i.test(target)) {
+          return `第 ${rowNumber} 条路径的重定向目标 URL 须以 http://、https:// 或 / 开头`
+        }
+        if (/\s/.test(target)) return `第 ${rowNumber} 条路径的重定向目标 URL 不能包含空格`
+      }
+      continue
+    }
+    // 上游路径 改写：非空须以 / 开头且不含空格 ? #（query/fragment 不允许），与后端校验同口径
+    if (rule.upstream_path) {
+      if (!rule.upstream_path.startsWith('/')) return `第 ${rowNumber} 条路径的上游路径 必须以 / 开头`
+      if (/[\s?#]/.test(rule.upstream_path)) return `第 ${rowNumber} 条路径的上游路径 不能包含空格 ? # 字符`
     }
     if (rule.upstreams === null) continue
     if (rule.upstreams.length === 0) return `第 ${rowNumber} 条路径至少需要一个自定义上游`

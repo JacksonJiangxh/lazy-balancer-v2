@@ -269,6 +269,10 @@ func createTables() error {
 		enable_tls BOOLEAN DEFAULT FALSE,
 		tls_cert TEXT,
 		tls_key TEXT,
+		-- 引用型证书（2026-10-09）：tls_source='file' 时直接引用 /app/certs 内
+		-- 成品证书文件路径，不落 PEM（空串=未使用）。
+		tls_cert_path VARCHAR(512) NOT NULL DEFAULT '',
+		tls_key_path VARCHAR(512) NOT NULL DEFAULT '',
 		tls_http_redirect BOOLEAN DEFAULT FALSE,
 		enable_compress BOOLEAN DEFAULT FALSE,
 		compress_types VARCHAR(100) DEFAULT 'gzip',
@@ -312,6 +316,7 @@ func createTables() error {
 		enabled BOOLEAN NOT NULL DEFAULT 1,
 		protocol VARCHAR(10) DEFAULT 'http',
 		max_connections INTEGER DEFAULT 0,
+		host_header VARCHAR(255) DEFAULT '',
 		FOREIGN KEY (rule_id) REFERENCES lb_rules(caddy_id) ON DELETE CASCADE
 	);
 	CREATE INDEX IF NOT EXISTS idx_upstreams_rule_enabled_id ON upstreams(rule_id, enabled, id);
@@ -324,6 +329,11 @@ func createTables() error {
 		path TEXT NOT NULL,
 		upstream_path TEXT NOT NULL DEFAULT '',
 		upstreams_json TEXT,
+		action TEXT NOT NULL DEFAULT 'proxy',
+		status_code INTEGER NOT NULL DEFAULT 0,
+		redirect_url TEXT NOT NULL DEFAULT '',
+		response_body TEXT NOT NULL DEFAULT '',
+		content_type TEXT NOT NULL DEFAULT '',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME,
 		FOREIGN KEY (rule_id) REFERENCES lb_rules(caddy_id) ON DELETE CASCADE
@@ -740,6 +750,10 @@ func runMigrations() error {
 		"enable_active_health_check": "BOOLEAN DEFAULT 0",
 		"tls_source":                 "VARCHAR(20) DEFAULT 'manual'",
 		"acme_config_id":             "INTEGER DEFAULT 0",
+		// 引用型证书（2026-10-09）：tls_source='file' 时引用 /app/certs 内成品
+		// 证书文件路径；存量库补列，空串=未使用。
+		"tls_cert_path": "VARCHAR(512) NOT NULL DEFAULT ''",
+		"tls_key_path":  "VARCHAR(512) NOT NULL DEFAULT ''",
 	}
 
 	for col, dtype := range newLbColumns {
@@ -827,11 +841,20 @@ func runMigrations() error {
 		"security_ip2region_version.finished_at":          "DATETIME",
 		"security_ip2region_version.consecutive_failures": "INTEGER DEFAULT 0",
 		"upstreams.max_connections":                       "INTEGER DEFAULT 0",
-		"global_config.threat_auto_update":                "INTEGER NOT NULL DEFAULT 1",
-		"security_ip_lists.system":                        "INTEGER NOT NULL DEFAULT 0",
-		"path_rules.upstream_path":                        "TEXT NOT NULL DEFAULT ''",
-		"security_threat_sources.content_hash":            "TEXT DEFAULT ''",
-		"security_threat_sources.raw_hash":                "TEXT DEFAULT ''",
+		// 逐上游回源 Host（2026-10-09）：存量库补列，空串=回退规则级/上游自身。
+		"upstreams.host_header":            "TEXT NOT NULL DEFAULT ''",
+		"global_config.threat_auto_update": "INTEGER NOT NULL DEFAULT 1",
+		"security_ip_lists.system":         "INTEGER NOT NULL DEFAULT 0",
+		"path_rules.upstream_path":         "TEXT NOT NULL DEFAULT ''",
+		// 路径规则静态响应（2026-10-09）：action=proxy|respond；respond 时由
+		// status_code/redirect_url/response_body/content_type 渲染 static_response。
+		"path_rules.action":                    "TEXT NOT NULL DEFAULT 'proxy'",
+		"path_rules.status_code":               "INTEGER NOT NULL DEFAULT 0",
+		"path_rules.redirect_url":              "TEXT NOT NULL DEFAULT ''",
+		"path_rules.response_body":             "TEXT NOT NULL DEFAULT ''",
+		"path_rules.content_type":              "TEXT NOT NULL DEFAULT ''",
+		"security_threat_sources.content_hash": "TEXT DEFAULT ''",
+		"security_threat_sources.raw_hash":     "TEXT DEFAULT ''",
 		// 规则库定时调度（v2.3.x）：星期多选逗号串（1=周一…7=周日，默认全选=
 		// 每天）+ HH:MM 时间（默认 04:00），槽位按基础设置时区本地日历计算、
 		// UTC 落库。CRS/IP2Region 列落版本表；威胁库为任务级排程，列挂
@@ -1248,19 +1271,12 @@ func runMigrations() error {
 		return fmt.Errorf("failed to migrate tcp rule stale dns server: %w", err)
 	}
 
-	// Drop legacy columns from upstreams if they still exist (no longer used).
-	legacyUpstreamHostHeaderColumns := []string{"host_header"}
-	for _, col := range legacyUpstreamHostHeaderColumns {
-		if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('upstreams') WHERE name=?", col).Scan(&colCount); err != nil {
-			return fmt.Errorf("failed to check legacy upstreams.%s: %w", col, err)
-		}
-		if colCount > 0 {
-			if _, err := DB.Exec("ALTER TABLE upstreams DROP COLUMN " + col); err != nil {
-				return fmt.Errorf("failed to drop legacy upstreams.%s: %w", col, err)
-			}
-			log.Printf("Dropped legacy column %s from upstreams", col)
-		}
-	}
+	// 2026-10-09：upstreams.host_header 曾为遗留死列并在此清理；现已重新启用
+	// 为「逐上游回源 Host」（渲染侧三级回退，见 services/caddy.go 的
+	// resolveUpstreamHostPlan）——原 DROP COLUMN 迁移移除（否则每次启动都会
+	// 删除本特性依赖的列）。遗留库的既有列与值一并沿用：读侧全链 COALESCE
+	// 兜底（无列由 ensureNewColumns 补列 DEFAULT ''），空值=回退语义。
+	// （清理族其余列 domain/dns_server/proxy_protocol 见下方）
 
 	// Drop legacy columns from upstreams if they still exist (no longer used).
 	legacyUpstreamDomainColumns := []string{"domain"}
@@ -1649,6 +1665,7 @@ func normalizeCertJobsCAAvailableAfter() (sql.Result, error) {
 // （SELECT 预判与 UPDATE 归一必须同谓词，否则审计详情与实际分支发散）。
 const legacyHTTPSHasCertPredicate = `(
 	(COALESCE(tls_cert,'') != '' AND COALESCE(tls_key,'') != '')
+	OR (tls_source = 'file' AND COALESCE(tls_cert_path,'') != '' AND COALESCE(tls_key_path,'') != '')
 	OR (tls_source = 'acme_dns' AND EXISTS (
 		SELECT 1 FROM cert_jobs
 		WHERE cert_jobs.rule_id = lb_rules.caddy_id
@@ -1761,7 +1778,9 @@ func migrateTCPRuleStaleTLS() error {
 	if len(stale) == 0 {
 		return nil
 	}
-	if _, err := DB.Exec(`UPDATE lb_rules SET enable_tls=0, tls_cert='', tls_key=''
+	// R62 C2-N1 口径延伸（2026-10-09）：file 形态的 path 列一并清理，避免留下
+	// 悬挂路径引用（紧随的 tls_cert_path 清空与 tls_cert/tls_key 同语义）。
+	if _, err := DB.Exec(`UPDATE lb_rules SET enable_tls=0, tls_cert='', tls_key='', tls_cert_path='', tls_key_path=''
 		WHERE protocol='tcp' AND IIF(enable_tls IN ('1',1),1,0)=1
 		  AND TRIM(COALESCE(tls_cert,''))='' AND TRIM(COALESCE(tls_key,''))=''`); err != nil {
 		return fmt.Errorf("failed to normalize tcp rules with stale tls: %w", err)
@@ -2551,6 +2570,9 @@ func migrateLbRulesPrimaryKey() error {
 			enable_tls BOOLEAN DEFAULT FALSE,
 			tls_cert TEXT,
 			tls_key TEXT,
+			-- 引用型证书（2026-10-09）：重建 DDL 须携带，否则陈旧重建丢列。
+			tls_cert_path VARCHAR(512) NOT NULL DEFAULT '',
+			tls_key_path VARCHAR(512) NOT NULL DEFAULT '',
 			tls_http_redirect BOOLEAN DEFAULT FALSE,
 			tls_source VARCHAR(20) DEFAULT 'manual',
 			acme_config_id INTEGER DEFAULT 0,
@@ -2591,7 +2613,7 @@ func migrateLbRulesPrimaryKey() error {
 			custom_routes_enabled,
 			proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
 			host_header, enable_tls, tls_cert,
-			tls_key, tls_http_redirect, tls_source, acme_config_id,
+			tls_key, tls_cert_path, tls_key_path, tls_http_redirect, tls_source, acme_config_id,
 			ca_provider_id, enable_compress, compress_types, enabled, log_enabled,
 			created_by, created_at, updated_at, updated_by, caddy_id,
 			block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status
@@ -2606,7 +2628,7 @@ func migrateLbRulesPrimaryKey() error {
 			COALESCE(custom_routes_enabled,0),
 			COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 			host_header, enable_tls, tls_cert,
-			tls_key, tls_http_redirect, tls_source, acme_config_id,
+			tls_key, COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''), tls_http_redirect, tls_source, acme_config_id,
 			ca_provider_id, enable_compress, compress_types, COALESCE(enabled,0), COALESCE(log_enabled,0),
 			created_by, created_at, updated_at, updated_by, caddy_id,
 			COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)
@@ -2643,6 +2665,7 @@ func migrateLbRulesPrimaryKey() error {
 		enabled BOOLEAN NOT NULL DEFAULT 1,
 		protocol VARCHAR(10) DEFAULT 'http',
 		max_connections INTEGER DEFAULT 0,
+		host_header VARCHAR(255) DEFAULT '',
 		FOREIGN KEY (rule_id) REFERENCES lb_rules(caddy_id) ON DELETE CASCADE
 	)
 `)

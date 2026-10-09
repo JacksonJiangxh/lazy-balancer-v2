@@ -401,6 +401,7 @@
                 <el-radio-group v-model="wizardForm.tls_source" :disabled="isCurrentRuleLocked">
                   <el-radio value="manual">手动上传</el-radio>
                   <el-radio value="acme_dns">ACME + DNS 自动</el-radio>
+                  <el-radio value="file">引用证书文件</el-radio>
                 </el-radio-group>
                 <div v-if="isCurrentRuleLocked" class="form-tip-line port-warning">证书申请中，暂不能修改证书来源</div>
               </div>
@@ -418,6 +419,16 @@
                   <el-option v-for="p in enabledCAProviders" :key="p.id" :label="p.name" :value="p.id" />
                 </el-select>
                 <div class="form-tip-line">选择自动签发证书使用的 CA 提供商，留空或「系统默认」将跟随全局默认设置</div>
+              </el-form-item>
+            </template>
+            <template v-else-if="wizardForm.tls_source === 'file'">
+              <el-form-item label="证书文件">
+                <el-input v-model="wizardForm.tls_cert_path" placeholder="如 /app/certs/example.com.crt" />
+                <div class="form-tip-line">直接引用程序可读写目录内的成品证书文件（需位于 /app/certs 目录内），外部更新文件后会自动重载</div>
+              </el-form-item>
+              <el-form-item label="私钥文件">
+                <el-input v-model="wizardForm.tls_key_path" placeholder="如 /app/certs/example.com.key" />
+                <div class="form-tip-line">与证书文件配对的私钥文件路径（需位于 /app/certs 目录内）</div>
               </el-form-item>
             </template>
             <template v-else>
@@ -514,6 +525,17 @@
                       <el-option value="https" label="HTTPS" />
                     </template>
                   </el-select>
+                </template>
+              </el-table-column>
+              <el-table-column v-if="wizardForm.protocol !== 'tcp'" min-width="140">
+                <template #header>
+                  回源Host
+                  <el-tooltip placement="top" content="逐上游回源 Host：留空时回退到「基本配置」的后端域名；若那里也为空，则该上游使用自身地址（host:port）作为回源 Host。">
+                    <el-icon class="upstream-unknown"><QuestionFilled /></el-icon>
+                  </el-tooltip>
+                </template>
+                <template #default="{ row }">
+                  <el-input v-model="row.host_header" placeholder="留空=跟随规则/自身" size="small" class="upstream-input" />
                 </template>
               </el-table-column>
               <el-table-column width="110">
@@ -825,6 +847,10 @@
             </el-descriptions-item>
             <el-descriptions-item label="TLS 证书" v-if="wizardForm.enable_tls">
               <div v-if="wizardForm.tls_source === 'acme_dns'">{{ certTypeLabels.auto }} ({{ caProviderLabel }})</div>
+              <div v-else-if="wizardForm.tls_source === 'file'">
+                <div>{{ certTypeLabels.file }}</div>
+                <div class="cert-preview-info">{{ wizardForm.tls_cert_path || '未填写证书文件' }}</div>
+              </div>
               <div v-else>
                 <div>{{ certTypeLabels.manual }}</div>
                 <div v-if="certInfo.valid" class="cert-preview-info">
@@ -907,6 +933,7 @@
             {{ ruleConfig.tls_http_redirect ? '启用 (HTTP重定向)' : '启用' }}
             <span v-if="ruleConfig.tls_source === 'manual'" class="tls-source-tag">(手动上传)</span>
             <span v-else-if="ruleConfig.tls_source === 'acme_dns'" class="tls-source-tag">(ACME 自动)</span>
+            <span v-else-if="ruleConfig.tls_source === 'file'" class="tls-source-tag">(引用文件)</span>
           </el-descriptions-item>
           <el-descriptions-item label="TLS" v-else>禁用</el-descriptions-item>
           <el-descriptions-item label="压缩" v-if="ruleConfig.protocol === 'http'">
@@ -944,6 +971,9 @@
             <template #default="{ row }">
               <el-tag size="small" :type="row.protocol === 'https' ? 'warning' : 'primary'">{{ row.protocol || 'http' }}</el-tag>
             </template>
+          </el-table-column>
+          <el-table-column v-if="ruleConfig?.protocol !== 'tcp'" label="回源Host">
+            <template #default="{ row }">{{ row.host_header || '跟随规则/自身地址' }}</template>
           </el-table-column>
           <el-table-column label="权重" align="center">
             <template #default="{ row }">{{ weightPercent(ruleConfig?.upstreams, row) }}%</template>
@@ -1263,6 +1293,7 @@ let disposed = false
 const certTypeLabels = {
   auto: 'ACME 自动证书',
   manual: '手动证书',
+  file: '引用证书文件',
 }
 
 const caProviderLabel = computed(() => {
@@ -1801,6 +1832,7 @@ const defaultUpstream = (protocol: UpstreamProtocol = 'http'): UpstreamInput => 
   enabled: true,
   protocol,
   max_connections: 0,
+  host_header: '',
 })
 
 const pathRuleUpstreamsToPercent = (upstreams: readonly PathRuleUpstream[] | null | undefined): PathRuleUpstream[] | null => {
@@ -1864,6 +1896,8 @@ const wizardForm = reactive<RuleForm>({
   ca_provider_id: undefined as number | undefined,
   tls_cert: '',
   tls_key: '',
+  tls_cert_path: '',
+  tls_key_path: '',
   tlsKeySet: false,
   tls_http_redirect: false,
   enable_compress: false,
@@ -2272,6 +2306,7 @@ const openWizard = async (rule?: Rule) => {
         dynamic_dns: false,
         protocol: u.protocol || 'http',
         max_connections: u.max_connections ?? 0,
+        host_header: u.host_header || '',
       })) || [],
       enable_tls: fullRule.enable_tls || false,
       tls_source: fullRule.tls_source || 'manual',
@@ -2279,6 +2314,8 @@ const openWizard = async (rule?: Rule) => {
       ca_provider_id: fullRule.ca_provider_id ?? 0,
       tls_cert: fullRule.tls_cert || '',
       tls_key: fullRule.tls_key || '',
+      tls_cert_path: fullRule.tls_cert_path || '',
+      tls_key_path: fullRule.tls_key_path || '',
       // F50-7：GetRule 掩码私钥时仅回 tls_key_set 标记——表单据此区分「未配置」
       // 与「已隐藏」（提交空 tls_key 后端保留原值）
       tlsKeySet: fullRule.tls_key_set === true,
@@ -2295,6 +2332,12 @@ const openWizard = async (rule?: Rule) => {
         .sort((left, right) => left.sort_order - right.sort_order)
         .map((pathRule) => ({
           ...pathRule,
+          // 静态响应字段归一（老数据/老备份缺列时补默认值）
+          action: pathRule.action === 'respond' ? 'respond' : 'proxy',
+          status_code: pathRule.status_code ?? 0,
+          redirect_url: pathRule.redirect_url || '',
+          response_body: pathRule.response_body || '',
+          content_type: pathRule.content_type || '',
           upstreams: pathRuleUpstreamsToPercent(pathRule.upstreams),
         })),
       proxy_dial_timeout: fullRule.proxy_dial_timeout || 0,
@@ -2337,6 +2380,8 @@ const openWizard = async (rule?: Rule) => {
       ca_provider_id: 0,
       tls_cert: '',
       tls_key: '',
+      tls_cert_path: '',
+      tls_key_path: '',
       tlsKeySet: false, // 私钥掩码态随表单重置（第 55 轮 B3-P5：stale true 曾致新建/复制误显「已配置」）
       tls_http_redirect: false,
       enable_compress: false,
@@ -2435,7 +2480,19 @@ const removeUpstream = (index: number) => {
 
 const onCustomRoutesToggle = (enabled: string | number | boolean): void => {
   if (Boolean(enabled) && wizardForm.path_rules.length === 0) {
-    wizardForm.path_rules.push({ id: nextTemporaryPathRuleId, match_type: 'prefix', path: '/', upstream_path: '', sort_order: 0, upstreams: null })
+    wizardForm.path_rules.push({
+      id: nextTemporaryPathRuleId,
+      match_type: 'prefix',
+      path: '/',
+      upstream_path: '',
+      sort_order: 0,
+      upstreams: null,
+      action: 'proxy',
+      status_code: 0,
+      redirect_url: '',
+      response_body: '',
+      content_type: '',
+    })
     nextTemporaryPathRuleId -= 1
   }
   if (!enabled) wizardForm.path_rules = []
@@ -2498,6 +2555,11 @@ const nextStep = (): void => {
     // F50-7：掩码私钥（tlsKeySet=true）且未粘贴新私钥时允许通过——后端保留原值
     if (wizardForm.tls_source === 'manual' && (!wizardForm.tls_cert.trim() || (!wizardForm.tls_key.trim() && !wizardForm.tlsKeySet))) {
       ElMessage.warning(wizardForm.tls_cert.trim() ? '请上传证书和私钥（或粘贴新私钥以更换）' : '请上传证书和私钥')
+      return
+    }
+    // 引用文件模式：证书与私钥文件路径均必填（后端另校验位于 /app/certs 内且配对）
+    if (wizardForm.tls_source === 'file' && (!wizardForm.tls_cert_path.trim() || !wizardForm.tls_key_path.trim())) {
+      ElMessage.warning('请填写证书文件与私钥文件路径')
       return
     }
     moveToAdjacentWizardStep(1)
@@ -2593,6 +2655,12 @@ const submitWizard = async () => {
         saving.value = false
         return
       }
+    }
+    // 引用文件模式镜像：两个路径均必填
+    if (wizardForm.tls_source === 'file' && (!wizardForm.tls_cert_path?.trim() || !wizardForm.tls_key_path?.trim())) {
+      ElMessage.warning('引用证书文件模式须填写证书与私钥文件路径')
+      saving.value = false
+      return
     }
   }
   if (wizardForm.upstreams.length === 0) {
@@ -2698,6 +2766,7 @@ const submitWizard = async () => {
       weight: u.weight ?? 100,
       dynamic_dns: wizardForm.dynamic_dns,
       max_connections: u.max_connections ?? 0,
+      host_header: (u.host_header || '').trim(),
     }))
 
     const data: UpdateRuleRequest = {
@@ -2729,6 +2798,9 @@ const submitWizard = async () => {
       ca_provider_id: Number(wizardForm.ca_provider_id || 0),
       tls_cert: wizardForm.tls_source === 'manual' ? wizardForm.tls_cert : '',
       tls_key: wizardForm.tls_source === 'manual' ? wizardForm.tls_key : '',
+      // 引用文件模式：提交两个路径；其余来源清空（后端亦按形态互为清空）
+      tls_cert_path: wizardForm.tls_source === 'file' ? wizardForm.tls_cert_path.trim() : '',
+      tls_key_path: wizardForm.tls_source === 'file' ? wizardForm.tls_key_path.trim() : '',
       tls_http_redirect: wizardForm.tls_http_redirect,
       enable_compress: wizardForm.enable_compress,
       compress_types: wizardForm.compress_types.join(',') || 'gzip',
@@ -2739,14 +2811,23 @@ const submitWizard = async () => {
       log_enabled: wizardForm.log_enabled || false,
       custom_routes_enabled: wizardForm.protocol === 'http' && wizardForm.custom_routes_enabled,
       path_rules: wizardForm.protocol === 'http' && wizardForm.custom_routes_enabled
-        ? wizardForm.path_rules.map((pathRule, index) => ({
-            ...(pathRule.id !== undefined && pathRule.id > 0 ? { id: pathRule.id } : {}),
-            match_type: pathRule.match_type,
-            path: pathRule.path,
-            upstream_path: pathRule.upstream_path || '',
-            sort_order: index,
-            upstreams: pathRule.upstreams?.map((upstream) => ({ ...upstream })) || null,
-          }))
+        ? wizardForm.path_rules.map((pathRule, index) => {
+            const respond = pathRule.action === 'respond'
+            return {
+              ...(pathRule.id !== undefined && pathRule.id > 0 ? { id: pathRule.id } : {}),
+              match_type: pathRule.match_type,
+              path: pathRule.path,
+              action: respond ? 'respond' : 'proxy',
+              // 静态响应不使用上游与上游 path 改写（后端互斥校验会拒绝携带）
+              upstream_path: respond ? '' : (pathRule.upstream_path || ''),
+              sort_order: index,
+              upstreams: respond ? null : (pathRule.upstreams?.map((upstream) => ({ ...upstream })) || null),
+              status_code: respond ? pathRule.status_code : 0,
+              redirect_url: respond ? (pathRule.redirect_url || '').trim() : '',
+              response_body: respond ? (pathRule.response_body || '') : '',
+              content_type: respond ? (pathRule.content_type || '').trim() : '',
+            }
+          })
         : [],
       proxy_dial_timeout: wizardForm.protocol === 'http' ? wizardForm.proxy_dial_timeout : 0,
       proxy_response_header_timeout: wizardForm.protocol === 'http' ? wizardForm.proxy_response_header_timeout : 0,
@@ -2971,6 +3052,7 @@ const openCopyWizard = async (rule: Rule) => {
       dynamic_dns: false,
       protocol: u.protocol || 'http',
       max_connections: u.max_connections ?? 0,
+      host_header: u.host_header || '',
     })) || [],
     enable_tls: fullRule.enable_tls || false,
     tls_source: fullRule.tls_source || 'manual',
@@ -2978,6 +3060,8 @@ const openCopyWizard = async (rule: Rule) => {
     ca_provider_id: fullRule.ca_provider_id ?? 0,
     tls_cert: fullRule.tls_cert || '',
     tls_key: fullRule.tls_key || '',
+    tls_cert_path: fullRule.tls_cert_path || '',
+    tls_key_path: fullRule.tls_key_path || '',
     tlsKeySet: fullRule.tls_key_set === true,
     request_body_max_size_mb: fullRule.request_body_max_size_mb || 0,
     upstream_keepalive_timeout: fullRule.upstream_keepalive_timeout || 0,
@@ -2988,6 +3072,12 @@ const openCopyWizard = async (rule: Rule) => {
       .sort((left, right) => left.sort_order - right.sort_order)
       .map((pathRule) => ({
         ...pathRule,
+        // 静态响应字段归一（老数据/老备份缺列时补默认值）
+        action: pathRule.action === 'respond' ? 'respond' : 'proxy',
+        status_code: pathRule.status_code ?? 0,
+        redirect_url: pathRule.redirect_url || '',
+        response_body: pathRule.response_body || '',
+        content_type: pathRule.content_type || '',
         upstreams: pathRuleUpstreamsToPercent(pathRule.upstreams),
       })),
     proxy_dial_timeout: fullRule.proxy_dial_timeout || 0,

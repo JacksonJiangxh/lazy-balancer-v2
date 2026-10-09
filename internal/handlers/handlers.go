@@ -325,6 +325,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		Enabled        bool
 		Protocol       string
 		MaxConnections int
+		HostHeader     string
 	}
 
 	type requestData struct {
@@ -400,7 +401,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 			upstreams = append(upstreams, requestUpstream{
 				Host: u.Host, Port: u.Port, Weight: u.Weight,
 				Enabled: u.Enabled, Protocol: u.Protocol,
-				MaxConnections: u.MaxConnections,
+				MaxConnections: u.MaxConnections, HostHeader: u.HostHeader,
 			})
 		}
 		data.Upstreams = upstreams
@@ -469,7 +470,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 			upstreams = append(upstreams, requestUpstream{
 				Host: u.Host, Port: u.Port, Weight: u.Weight,
 				Enabled: u.Enabled, Protocol: u.Protocol,
-				MaxConnections: u.MaxConnections,
+				MaxConnections: u.MaxConnections, HostHeader: u.HostHeader,
 			})
 		}
 		data.Upstreams = upstreams
@@ -573,6 +574,13 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		}
 		if u.MaxConnections < 0 {
 			return fmt.Errorf("上游 #%d：最大连接数不能为负数", i+1)
+		}
+		// 逐上游回源 Host 与规则级同口径注入防护（LB40-5：直写 reverse_proxy
+		// 请求头/SNI，CRLF/控制字符可注入额外头——拒绝不可见字符）。
+		for _, c := range u.HostHeader {
+			if c < 0x20 || c == 0x7f {
+				return fmt.Errorf("上游 #%d：回源Host含非法字符", i+1)
+			}
 		}
 
 		key := fmt.Sprintf("%s:%d", strings.ToLower(strings.TrimSpace(u.Host)), u.Port)

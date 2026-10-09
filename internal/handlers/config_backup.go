@@ -272,6 +272,8 @@ var backupTableNullDefaults = map[string]map[string]any{
 		"proxy_stream_close_delay": int64(0), "host_header": "",
 		"enable_tls": int64(0), "tls_source": "manual", "acme_config_id": int64(0), "ca_provider_id": int64(0),
 		"tls_cert": "", "tls_key": "", "tls_http_redirect": int64(0),
+		// 引用型证书（2026-10-09）：NOT NULL 默认空串列，NULL 行归一空串。
+		"tls_cert_path": "", "tls_key_path": "",
 		"enable_compress": int64(1), "compress_types": "gzip",
 		"enabled": int64(0), "log_enabled": int64(0), "created_by": int64(0), "updated_by": int64(0),
 		"block_page_stage1_id": int64(0), "block_page_stage1_status": int64(0),
@@ -280,7 +282,7 @@ var backupTableNullDefaults = map[string]map[string]any{
 	},
 	"upstreams": {
 		"weight": int64(1), "dynamic_dns": int64(0), "enabled": int64(0),
-		"protocol": "http", "max_connections": int64(0),
+		"protocol": "http", "max_connections": int64(0), "host_header": "",
 	},
 	"users": {
 		"display_name": "", "is_enabled": int64(1), "password_version": int64(0),
@@ -309,6 +311,12 @@ var backupTableNullDefaults = map[string]map[string]any{
 		// 上游 path 改写：NOT NULL 且默认空串的列——NULL 行归一空串（原样转发），
 		// 防手造备份 NULL 撞列约束响亮 500；缺键行由列 DEFAULT 兜底。
 		"upstream_path": "",
+		// 路径规则静态响应（2026-10-09）：同族 NOT NULL 默认列一并归一。
+		"action":        "proxy",
+		"status_code":   int64(0),
+		"redirect_url":  "",
+		"response_body": "",
+		"content_type":  "",
 	},
 	"security_policies": {
 		"description": "", "mode": "off", "anomaly_threshold": int64(5),

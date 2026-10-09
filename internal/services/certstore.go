@@ -2,18 +2,132 @@ package services
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"lazy-balancer-v2/internal/db"
 )
 
 var certDir = "/app/certs"
+
+// CertDir 返回引用型证书允许的根目录（tls_source="file" 白名单边界）。
+func CertDir() string { return certDir }
+
+// ReferencedCertificate 引用型证书（tls_source="file"）的校验结果：
+// 归一后的路径 + 已读取的 PEM 内容（仅供调用方校验与预检，不落库）。
+type ReferencedCertificate struct {
+	CertPath string
+	KeyPath  string
+	CertPEM  string
+	KeyPEM   string
+}
+
+// ResolveReferencedCertPath 校验并归一引用型证书文件路径（2026-10-09）：
+//   - 绝对路径、位于 certDir 内（前缀 + 分隔符边界，防 /app/certs-evil 绕过）；
+//   - 拒绝空串、目录、含 NUL 的路径；
+//   - 文件须存在且为常规文件；
+//   - 解析符号链接后再次校验边界（防目录内软链指向容器任意文件）。
+//
+// 返回归一路径用于展示与落库（保持用户输入语义），安全性由真实路径校验保证。
+func ResolveReferencedCertPath(rawPath string) (string, error) {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" {
+		return "", fmt.Errorf("证书文件路径不能为空")
+	}
+	if strings.ContainsRune(trimmed, 0) {
+		return "", fmt.Errorf("证书文件路径含非法字符")
+	}
+	cleaned := filepath.Clean(trimmed)
+	if !filepath.IsAbs(cleaned) {
+		return "", fmt.Errorf("证书文件路径必须是绝对路径")
+	}
+	base := filepath.Clean(certDir)
+	if !pathWithinBase(cleaned, base) {
+		return "", fmt.Errorf("证书文件路径必须位于 %s 目录内", base)
+	}
+	info, err := os.Stat(cleaned)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("证书文件不存在: %s", cleaned)
+		}
+		return "", fmt.Errorf("读取证书文件失败: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("证书文件路径不能是目录: %s", cleaned)
+	}
+	// 符号链接逃逸：目录与文件均解析为真实路径后复核边界（目录本身为软链时
+	// 以解析后的真实目录为基准，避免误判）。
+	realPath, err := filepath.EvalSymlinks(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("解析证书文件路径失败: %w", err)
+	}
+	if realBase, baseErr := filepath.EvalSymlinks(base); baseErr == nil {
+		base = realBase
+	}
+	if !pathWithinBase(realPath, base) {
+		return "", fmt.Errorf("证书文件路径（解析符号链接后）必须位于 %s 目录内", base)
+	}
+	return cleaned, nil
+}
+
+// pathWithinBase 判定 path 是否位于 base 内（严格边界：base 本身不计入）。
+func pathWithinBase(path, base string) bool {
+	if path == base {
+		return false
+	}
+	return strings.HasPrefix(path, base+string(os.PathSeparator))
+}
+
+// LoadReferencedCertificate 校验引用型证书的证书/私钥两个路径并读取内容，
+// 同时校验二者能配成合法密钥对（与物化路径同口径，提前失败以免 Caddy 加载期报错）。
+func LoadReferencedCertificate(certPath, keyPath string) (ReferencedCertificate, error) {
+	resolvedCert, err := ResolveReferencedCertPath(certPath)
+	if err != nil {
+		return ReferencedCertificate{}, fmt.Errorf("证书文件：%w", err)
+	}
+	resolvedKey, err := ResolveReferencedCertPath(keyPath)
+	if err != nil {
+		return ReferencedCertificate{}, fmt.Errorf("私钥文件：%w", err)
+	}
+	certPEM, err := os.ReadFile(resolvedCert)
+	if err != nil {
+		return ReferencedCertificate{}, fmt.Errorf("读取证书文件失败: %w", err)
+	}
+	keyPEM, err := os.ReadFile(resolvedKey)
+	if err != nil {
+		return ReferencedCertificate{}, fmt.Errorf("读取私钥文件失败: %w", err)
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return ReferencedCertificate{}, fmt.Errorf("证书与私钥不匹配: %w", err)
+	}
+	return ReferencedCertificate{
+		CertPath: resolvedCert,
+		KeyPath:  resolvedKey,
+		CertPEM:  string(certPEM),
+		KeyPEM:   string(keyPEM),
+	}, nil
+}
+
+// ReferencedCertFileDigest 返回引用型证书文件对的内容指纹（含文件不存在标记）。
+// 供「外部更新证书文件 → 自动重载」的变更检测使用：与上次快照比对，不同即视为
+// 证书已更新。
+func ReferencedCertFileDigest(certPath, keyPath string) string {
+	certData, certErr := os.ReadFile(certPath)
+	keyData, keyErr := os.ReadFile(keyPath)
+	if certErr != nil || keyErr != nil {
+		return fmt.Sprintf("missing:%v:%v", certErr != nil, keyErr != nil)
+	}
+	sum := sha256.Sum256(append(append([]byte{}, certData...), keyData...))
+	return hex.EncodeToString(sum[:])
+}
 
 // SetCertDirForTest 重定向证书物化目录，仅供测试隔离使用（返回还原函数）。
 func SetCertDirForTest(dir string) func() {

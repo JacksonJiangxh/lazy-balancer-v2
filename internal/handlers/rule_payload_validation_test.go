@@ -49,6 +49,35 @@ func TestRulePayload_hostHeaderAndDnsServerValidation(t *testing.T) {
 	}
 }
 
+func TestRulePayload_upstreamHostHeaderValidation(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules", handler.CreateRule)
+	create := func(body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+
+	// 形状一：上游级回源 Host 含 CRLF → 400（与规则级同口径注入防护；
+	// 该值直写 reverse_proxy 的 Host 头/SNI）
+	rec := create(`{"name":"payload-up-v","protocol":"http","domain":"payload-up.test","listen_port":18583,` +
+		`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true,"host_header":"evil.com\r\nX-Injected: 1"}]}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "回源Host含非法字符") {
+		t.Fatalf("CRLF upstream host_header must 400, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 形状二（回归）：合法形状放行（单上游统一静态值——不发射混合处理器）
+	rec = create(`{"name":"payload-up-ok","protocol":"http","domain":"payload-up-ok.test","listen_port":18584,` +
+		`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true,"host_header":"origin.backend.local"}]}`)
+	if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
+		t.Fatalf("legit upstream host_header must pass, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestExtractLabel_exactKeyMatch(t *testing.T) {
 	// x_host 不得被 host 子串匹配误归集
 	if got := extractLabel(`caddy_http_requests_total{x_host="evil"}`, "host"); got != "" {

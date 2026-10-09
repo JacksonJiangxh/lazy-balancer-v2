@@ -158,6 +158,10 @@ type LbRule struct {
 	CAProviderID                  int        `json:"ca_provider_id"`
 	TLSCert                       string     `json:"tls_cert,omitempty"`
 	TLSKey                        string     `json:"tls_key,omitempty"`
+	// TLSCertPath/TLSKeyPath 引用型证书（tls_source="file"）：直接引用程序可读写
+	// 目录（/app/certs）内的成品证书文件，不复制、不落 PEM 到库（2026-10-09）。
+	TLSCertPath string `json:"tls_cert_path,omitempty"`
+	TLSKeyPath  string `json:"tls_key_path,omitempty"`
 	// TLSKeySet 标记「已有隐藏私钥」——GetRule 对只读 Key/非管理员掩码 tls_key
 	// 为空串时置 true，编辑表单借此区分「未配置」与「已隐藏」（F50-7）。
 	TLSKeySet       bool   `json:"tls_key_set,omitempty"`
@@ -282,6 +286,9 @@ type Upstream struct {
 	Enabled        bool   `json:"enabled"`
 	Protocol       string `json:"protocol"`
 	MaxConnections int    `json:"max_connections"`
+	// HostHeader 逐上游回源 Host（2026-10-09）：空=回退规则级 host_header，
+	// 仍空=回退上游自身 host:port（渲染见 services/caddy.go 三级回退）。
+	HostHeader string `json:"host_header"`
 }
 
 type PathRuleUpstream struct {
@@ -291,6 +298,16 @@ type PathRuleUpstream struct {
 	Protocol string `json:"protocol"`
 }
 
+// PathRuleAction 路径规则的处理方式。
+//   - proxy：反向代理到上游（默认，历史语义）；
+//   - respond：由本程序直接返回静态响应（不触达上游）。
+type PathRuleAction string
+
+const (
+	PathRuleActionProxy   PathRuleAction = "proxy"
+	PathRuleActionRespond PathRuleAction = "respond"
+)
+
 type PathRule struct {
 	ID        int    `json:"id"`
 	RuleID    string `json:"-"`
@@ -299,10 +316,20 @@ type PathRule struct {
 	Path      string `json:"path"`
 	// 上游 path 改写：空串=原样转发（现状语义）；非空前缀匹配剥匹配前缀后前置、
 	// 精确匹配整体替换（query 均保留，形状经 caddy 2.11.4 引擎实证）。
-	UpstreamPath string             `json:"upstream_path"`
-	Upstreams    []PathRuleUpstream `json:"upstreams"`
-	CreatedAt    time.Time          `json:"-"`
-	UpdatedAt    sql.NullTime       `json:"-"`
+	UpstreamPath string `json:"upstream_path"`
+	// Action 处理方式：空串与 "proxy" 同义（存量行兼容），"respond" 时
+	// Upstreams/UpstreamPath 不参与渲染，改由 StatusCode 等字段提供静态响应。
+	Action    string             `json:"action"`
+	Upstreams []PathRuleUpstream `json:"upstreams"`
+	// 静态响应（Action="respond"）：StatusCode 为响应码；RedirectURL 供 3xx
+	// 生成 Location 头；ResponseBody 为响应体（3xx/204 不使用）；ContentType
+	// 为空时按响应码兜底（text/html; charset=utf-8）。
+	StatusCode   int          `json:"status_code"`
+	RedirectURL  string       `json:"redirect_url"`
+	ResponseBody string       `json:"response_body"`
+	ContentType  string       `json:"content_type"`
+	CreatedAt    time.Time    `json:"-"`
+	UpdatedAt    sql.NullTime `json:"-"`
 }
 
 // CertificateConfig represents free certificate configuration (ACME + DNS provider)
@@ -457,10 +484,13 @@ type CreateRuleRequest struct {
 	CAProviderID                  int        `json:"ca_provider_id"`
 	TLSCert                       string     `json:"tls_cert"`
 	TLSKey                        string     `json:"tls_key"`
-	TLSHTTPRedirect               bool       `json:"tls_http_redirect"`
-	EnableCompress                bool       `json:"enable_compress"`
-	CompressTypes                 string     `json:"compress_types"`
-	LogEnabled                    bool       `json:"log_enabled"`
+	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件路径（2026-10-09）。
+	TLSCertPath     string `json:"tls_cert_path"`
+	TLSKeyPath      string `json:"tls_key_path"`
+	TLSHTTPRedirect bool   `json:"tls_http_redirect"`
+	EnableCompress  bool   `json:"enable_compress"`
+	CompressTypes   string `json:"compress_types"`
+	LogEnabled      bool   `json:"log_enabled"`
 	// 阶段拦截页覆盖层（0=跟随策略；status ∈ {0,400,401,403,404,503}）
 	BlockPageStage1ID     int `json:"block_page_stage1_id"`
 	BlockPageStage1Status int `json:"block_page_stage1_status"`
@@ -521,11 +551,14 @@ type UpdateRuleRequest struct {
 	CAProviderID               *int        `json:"ca_provider_id"`
 	TLSCert                    string      `json:"tls_cert"`
 	TLSKey                     string      `json:"tls_key"`
-	TLSHTTPRedirect            *bool       `json:"tls_http_redirect"`
-	EnableCompress             *bool       `json:"enable_compress"`
-	CompressTypes              string      `json:"compress_types"`
-	Enabled                    *bool       `json:"enabled"`
-	LogEnabled                 *bool       `json:"log_enabled"`
+	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件路径（2026-10-09）。
+	TLSCertPath     string `json:"tls_cert_path"`
+	TLSKeyPath      string `json:"tls_key_path"`
+	TLSHTTPRedirect *bool  `json:"tls_http_redirect"`
+	EnableCompress  *bool  `json:"enable_compress"`
+	CompressTypes   string `json:"compress_types"`
+	Enabled         *bool  `json:"enabled"`
+	LogEnabled      *bool  `json:"log_enabled"`
 	// 阶段拦截页覆盖层：指针化——省略（nil）=保留原值（同 CAProviderID 先例），
 	// 显式 0=清除覆盖（跟随策略）。
 	BlockPageStage1ID     *int `json:"block_page_stage1_id"`

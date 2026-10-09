@@ -606,7 +606,7 @@ func TestMigrateLbRulesPrimaryKey_preserves_upstream_connection_settings(t *test
 			custom_routes_enabled BOOLEAN, proxy_dial_timeout INTEGER, proxy_response_header_timeout INTEGER,
 			proxy_read_timeout INTEGER, proxy_write_timeout INTEGER, proxy_stream_timeout INTEGER,
 			proxy_flush_interval INTEGER, proxy_stream_close_delay INTEGER,
-			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_http_redirect BOOLEAN,
+			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
 			tls_source TEXT, acme_config_id INTEGER, ca_provider_id INTEGER, enable_compress BOOLEAN,
 			compress_types TEXT, enabled BOOLEAN, log_enabled BOOLEAN, created_by INTEGER, created_at DATETIME,
 			updated_at DATETIME, updated_by INTEGER, caddy_id TEXT,
@@ -641,7 +641,9 @@ func TestMigrateLbRulesPrimaryKey_preserves_upstream_connection_settings(t *test
 		t.Fatalf("max_connections=%d, want 37", maxConnections)
 	}
 	// Legacy dead columns are not carried into the rebuilt table.
-	for _, column := range []string{"domain", "host_header", "dns_server", "proxy_protocol"} {
+	// 2026-10-09：upstreams.host_header 重新启用为逐上游回源 Host——重建表
+	// 携带该列（迁移 DDL 已含），从 legacy 死列清单移除并正向断言。
+	for _, column := range []string{"domain", "dns_server", "proxy_protocol"} {
 		var count int
 		if err := database.QueryRow("SELECT COUNT(*) FROM pragma_table_info('upstreams') WHERE name=?", column).Scan(&count); err != nil {
 			t.Fatalf("check migrated upstreams.%s: %v", column, err)
@@ -649,6 +651,13 @@ func TestMigrateLbRulesPrimaryKey_preserves_upstream_connection_settings(t *test
 		if count != 0 {
 			t.Fatalf("legacy column %s survived primary key migration", column)
 		}
+	}
+	var hostHeaderCols int
+	if err := database.QueryRow("SELECT COUNT(*) FROM pragma_table_info('upstreams') WHERE name='host_header'").Scan(&hostHeaderCols); err != nil {
+		t.Fatalf("check migrated upstreams.host_header: %v", err)
+	}
+	if hostHeaderCols != 1 {
+		t.Fatalf("upstreams.host_header must survive the rebuilt schema, count=%d", hostHeaderCols)
 	}
 }
 
@@ -897,7 +906,7 @@ func TestInitialize_canonicalizes_lb_rule_domain_after_caddy_id_backfill(t *test
 			custom_routes_enabled BOOLEAN, proxy_dial_timeout INTEGER, proxy_response_header_timeout INTEGER,
 			proxy_read_timeout INTEGER, proxy_write_timeout INTEGER, proxy_stream_timeout INTEGER,
 			proxy_flush_interval INTEGER, proxy_stream_close_delay INTEGER,
-			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_http_redirect BOOLEAN,
+			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
 			tls_source TEXT, acme_config_id INTEGER, ca_provider_id INTEGER, enable_compress BOOLEAN,
 			compress_types TEXT, enabled BOOLEAN, log_enabled BOOLEAN, created_by INTEGER, created_at DATETIME,
 			updated_at DATETIME, updated_by INTEGER
@@ -1449,7 +1458,7 @@ func TestMigrateLbRulesPrimaryKey_rebuildsUpstreamEnabledNotNull(t *testing.T) {
 			custom_routes_enabled BOOLEAN, proxy_dial_timeout INTEGER, proxy_response_header_timeout INTEGER,
 			proxy_read_timeout INTEGER, proxy_write_timeout INTEGER, proxy_stream_timeout INTEGER,
 			proxy_flush_interval INTEGER, proxy_stream_close_delay INTEGER,
-			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_http_redirect BOOLEAN,
+			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
 			tls_source TEXT, acme_config_id INTEGER, ca_provider_id INTEGER, enable_compress BOOLEAN,
 			compress_types TEXT, enabled BOOLEAN, log_enabled BOOLEAN, created_by INTEGER, created_at DATETIME,
 			updated_at DATETIME, updated_by INTEGER, caddy_id TEXT,
@@ -1845,7 +1854,7 @@ func TestInitialize_recreatesIndexesDroppedByPkRebuildInSameBoot(t *testing.T) {
 			custom_routes_enabled BOOLEAN, proxy_dial_timeout INTEGER, proxy_response_header_timeout INTEGER,
 			proxy_read_timeout INTEGER, proxy_write_timeout INTEGER, proxy_stream_timeout INTEGER,
 			proxy_flush_interval INTEGER, proxy_stream_close_delay INTEGER,
-			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_http_redirect BOOLEAN,
+			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
 			tls_source TEXT, acme_config_id INTEGER, ca_provider_id INTEGER, enable_compress BOOLEAN,
 			compress_types TEXT, enabled BOOLEAN, log_enabled BOOLEAN, created_by INTEGER, created_at DATETIME,
 			updated_at DATETIME, updated_by INTEGER, caddy_id TEXT,
@@ -2227,7 +2236,7 @@ func TestInitialize_preservesStagePageColumnsOnLbRulesPkRebuild(t *testing.T) {
 			custom_routes_enabled BOOLEAN, proxy_dial_timeout INTEGER, proxy_response_header_timeout INTEGER,
 			proxy_read_timeout INTEGER, proxy_write_timeout INTEGER, proxy_stream_timeout INTEGER,
 			proxy_flush_interval INTEGER, proxy_stream_close_delay INTEGER,
-			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_http_redirect BOOLEAN,
+			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
 			tls_source TEXT, acme_config_id INTEGER, ca_provider_id INTEGER, enable_compress BOOLEAN,
 			compress_types TEXT, enabled BOOLEAN, log_enabled BOOLEAN, created_by INTEGER, created_at DATETIME,
 			updated_at DATETIME, updated_by INTEGER, caddy_id TEXT,

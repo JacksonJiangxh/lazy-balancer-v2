@@ -180,6 +180,9 @@ func run() error {
 	// M2 统一任务引擎：看门狗/安全事件摄取/运行日志清理三常驻族迁入
 	// （单轮体+引擎节拍；原生自循环与 TaskRuntime 注册表退役）。
 	services.SetConfigLoadRerun(runConfigLoad) // 启动 BootSync 与手动重载=同一执行体（含载入审计）
+	// 引用型证书（tls_source="file"）外部更新自动重载：看门狗检出 /app/certs 内
+	// 成品证书文件变化时，复用同一强制重载执行体（配置 JSON 未变，必须 force）。
+	services.SetReferencedCertReload(caddyReloader)
 	// B 完全标准化：常驻服务真实生命周期挂钩（daemon Run start→阻塞→stop；
 	// 幂等守卫吸收 lifecycle 直调与 daemon 挂钩的双调用）
 	services.SetCertIssuanceLifecycleHooks(lifecycle.StartACME, lifecycle.StopACME)

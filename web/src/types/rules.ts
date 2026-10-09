@@ -11,6 +11,8 @@ export interface Upstream {
   enabled: boolean
   protocol: UpstreamProtocol
   max_connections: number
+  // 逐上游回源 Host：空=回退规则级 host_header，仍空=回退上游自身 host:port
+  host_header: string
 }
 
 export type UpstreamInput = Omit<Upstream, 'id' | 'rule_id'> & {
@@ -33,6 +35,9 @@ export interface RuleFlowPathRule {
   upstreams: Array<{ host: string; port: number; enabled: boolean }>
 }
 
+// 路径规则处理方式：proxy=反向代理到上游（默认）；respond=由本程序直接返回静态响应
+export type PathRuleAction = 'proxy' | 'respond'
+
 export interface PathRule {
   id?: number
   match_type: 'prefix' | 'exact'
@@ -41,6 +46,13 @@ export interface PathRule {
   upstream_path: string
   sort_order: number
   upstreams: PathRuleUpstream[] | null
+  // 静态响应（action='respond'）：status_code 为预置响应码；redirect_url 供 3xx 生成
+  // Location；response_body 为响应体（3xx/204 不使用）；content_type 留空按状态码兜底
+  action: PathRuleAction
+  status_code: number
+  redirect_url: string
+  response_body: string
+  content_type: string
 }
 
 export interface ProxyTimeoutConfig {
@@ -87,6 +99,9 @@ export interface Rule extends ProxyTimeoutConfig {
   ca_provider_id: number
   tls_cert?: string
   tls_key?: string
+  // 引用型证书（tls_source="file"）：位于 /app/certs 内的成品证书/私钥文件路径
+  tls_cert_path?: string
+  tls_key_path?: string
   // F50-7：GetRule 对只读 Key/非管理员掩码 tls_key 时的「已有隐藏私钥」标记
   tls_key_set?: boolean
   tls_http_redirect: boolean
@@ -140,6 +155,9 @@ export interface CreateRuleRequest extends ProxyTimeoutConfig {
   ca_provider_id: number
   tls_cert: string
   tls_key: string
+  // 引用型证书（tls_source="file"）：位于 /app/certs 内的成品证书/私钥文件路径
+  tls_cert_path: string
+  tls_key_path: string
   tls_http_redirect: boolean
   enable_compress: boolean
   compress_types: string

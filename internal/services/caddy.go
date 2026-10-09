@@ -1253,33 +1253,36 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		ACMEEmail                     string
 		TLSCert                       string
 		TLSKey                        string
-		TLSHTTPRedirect               bool
-		Enabled                       bool
-		EnableCompress                bool
-		CompressTypes                 string
-		EnableActiveHealthCheck       bool
-		TCPHealthCheckPort            int
-		TCPProxyProtocol              bool
-		TCPTryDuration                int
-		TCPTryInterval                int
-		RequestBodyMaxSizeMB          int
-		UpstreamKeepaliveTimeout      int
-		ServerTokensHidden            int
-		CustomRoutesEnabled           bool
-		ProxyDialTimeout              int
-		ProxyResponseHeaderTimeout    int
-		ProxyReadTimeout              int
-		ProxyWriteTimeout             int
-		ProxyStreamTimeout            int
-		ProxyFlushInterval            int
-		ProxyStreamCloseDelay         int
-		PathRules                     []PathRuleConfig
-		HostHeader                    string
-		LogEnabled                    bool
-		BlockPageStage1ID             int
-		BlockPageStage1Status         int
-		BlockPageStage3ID             int
-		BlockPageStage3Status         int
+		// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件路径（2026-10-09）。
+		TLSCertPath                string
+		TLSKeyPath                 string
+		TLSHTTPRedirect            bool
+		Enabled                    bool
+		EnableCompress             bool
+		CompressTypes              string
+		EnableActiveHealthCheck    bool
+		TCPHealthCheckPort         int
+		TCPProxyProtocol           bool
+		TCPTryDuration             int
+		TCPTryInterval             int
+		RequestBodyMaxSizeMB       int
+		UpstreamKeepaliveTimeout   int
+		ServerTokensHidden         int
+		CustomRoutesEnabled        bool
+		ProxyDialTimeout           int
+		ProxyResponseHeaderTimeout int
+		ProxyReadTimeout           int
+		ProxyWriteTimeout          int
+		ProxyStreamTimeout         int
+		ProxyFlushInterval         int
+		ProxyStreamCloseDelay      int
+		PathRules                  []PathRuleConfig
+		HostHeader                 string
+		LogEnabled                 bool
+		BlockPageStage1ID          int
+		BlockPageStage1Status      int
+		BlockPageStage3ID          int
+		BlockPageStage3Status      int
 	}
 
 	type upstream struct {
@@ -1289,6 +1292,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		Enabled        bool
 		Protocol       string
 		MaxConnections int
+		// HostHeader 逐上游回源 Host（空=回退规则级 host_header，仍空=上游自身）。
+		HostHeader string
 	}
 
 	type ruleWithUpstreams struct {
@@ -1305,6 +1310,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		       COALESCE(health_check_path,''), COALESCE(health_check_interval,10),
 		       COALESCE(health_check_timeout,2), COALESCE(health_check_unhealthy_threshold,3), COALESCE(health_check_healthy_threshold,2),
 		       IIF(enable_tls IN ('1',1),1,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(tls_cert,''), COALESCE(tls_key,''),
+		       COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''),
 		       IIF(tls_http_redirect IN ('1',1),1,0),
 		       IIF(enabled IN ('1',1),1,0), IIF(enable_compress IN ('1',1),1,0), COALESCE(compress_types,'gzip'),
 		       IIF(enable_active_health_check IN ('1',1),1,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
@@ -1326,6 +1332,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			&r.DynamicDNS, &r.EnableDnsServer, &r.DnsServer, &r.DnsFamily, &r.HealthCheckPath, &r.HealthCheckInterval,
 			&r.HealthCheckTimeout, &r.HealthCheckUnhealthyThreshold, &r.HealthCheckHealthyThreshold,
 			&r.EnableTLS, &r.TLSSource, &r.ACMEConfigID, &r.TLSCert, &r.TLSKey,
+			&r.TLSCertPath, &r.TLSKeyPath,
 			&r.TLSHTTPRedirect, &r.Enabled, &r.EnableCompress, &r.CompressTypes,
 			&r.EnableActiveHealthCheck, &r.TCPHealthCheckPort, &r.TCPProxyProtocol, &r.TCPTryDuration, &r.TCPTryInterval,
 			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden, &r.HostHeader, &r.LogEnabled,
@@ -1362,7 +1369,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	}
 
 	upstreamRows, err := store.Query(`
-		SELECT u.rule_id, u.host, u.port, COALESCE(u.weight,1), IIF(u.enabled IN ('1',1),1,0), COALESCE(u.protocol,'http'), COALESCE(u.max_connections,0)
+		SELECT u.rule_id, u.host, u.port, COALESCE(u.weight,1), IIF(u.enabled IN ('1',1),1,0), COALESCE(u.protocol,'http'), COALESCE(u.max_connections,0), COALESCE(u.host_header,'')
 		FROM upstreams u JOIN lb_rules r ON r.caddy_id = u.rule_id
 		WHERE IIF(u.enabled IN ('1',1),1,0) = 1 AND r.enabled = 1 ORDER BY u.rule_id, u.id
 	`)
@@ -1372,7 +1379,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	for upstreamRows.Next() {
 		var ruleID string
 		var u upstream
-		if err := upstreamRows.Scan(&ruleID, &u.Host, &u.Port, &u.Weight, &u.Enabled, &u.Protocol, &u.MaxConnections); err != nil {
+		if err := upstreamRows.Scan(&ruleID, &u.Host, &u.Port, &u.Weight, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.HostHeader); err != nil {
 			closeErr := upstreamRows.Close()
 			return generationFailure("scan upstream: %v", errors.Join(err, closeErr))
 		}
@@ -1390,7 +1397,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 
 	if hasCustomRoutes {
 		pathRows, pathErr := store.Query(`
-			SELECT p.rule_id, p.sort_order, p.match_type, p.path, p.upstream_path, p.upstreams_json
+			SELECT p.rule_id, p.sort_order, p.match_type, p.path, p.upstream_path, p.upstreams_json,
+				COALESCE(p.action,'proxy'), COALESCE(p.status_code,0), COALESCE(p.redirect_url,''), COALESCE(p.response_body,''), COALESCE(p.content_type,'')
 			FROM path_rules p JOIN lb_rules r ON r.caddy_id = p.rule_id
 			WHERE r.enabled = 1 AND r.custom_routes_enabled = 1
 			ORDER BY p.rule_id, p.sort_order, p.id
@@ -1402,7 +1410,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			var ruleID string
 			var pathRule PathRuleConfig
 			var upstreamsJSON sql.NullString
-			if scanErr := pathRows.Scan(&ruleID, &pathRule.SortOrder, &pathRule.MatchType, &pathRule.Path, &pathRule.UpstreamPath, &upstreamsJSON); scanErr != nil {
+			if scanErr := pathRows.Scan(&ruleID, &pathRule.SortOrder, &pathRule.MatchType, &pathRule.Path, &pathRule.UpstreamPath, &upstreamsJSON,
+				&pathRule.Action, &pathRule.StatusCode, &pathRule.RedirectURL, &pathRule.ResponseBody, &pathRule.ContentType); scanErr != nil {
 				closeErr := pathRows.Close()
 				return generationFailure("scan path rule: %v", errors.Join(scanErr, closeErr))
 			}
@@ -1503,6 +1512,12 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			material := CertMaterial{RuleID: r.CaddyID, CertPEM: r.TLSCert, KeyPEM: r.TLSKey}
 			availableCerts[r.CaddyID] = material
 			materials = append(materials, material)
+			continue
+		}
+		// 引用型证书（2026-10-09）：直接引用 /app/certs 内的成品文件，不物化、
+		// 不落 PEM——仅登记「该规则有可用证书」，路径由下方 tlsCertFiles 直取。
+		if r.TLSSource == "file" && r.TLSCertPath != "" && r.TLSKeyPath != "" {
+			availableCerts[r.CaddyID] = CertMaterial{RuleID: r.CaddyID}
 			continue
 		}
 		if r.TLSSource == "acme_dns" {
@@ -1689,6 +1704,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 				ACMEConfigID:                     r.ACMEConfigID,
 				TLSCert:                          r.TLSCert,
 				TLSKey:                           r.TLSKey,
+				TLSCertPath:                      r.TLSCertPath,
+				TLSKeyPath:                       r.TLSKeyPath,
 				TLSHTTPRedirect:                  r.TLSHTTPRedirect,
 				EnableCompress:                   r.EnableCompress,
 				CompressTypes:                    r.CompressTypes,
@@ -1732,7 +1749,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 					}
 					ruleConfig.Upstreams = append(ruleConfig.Upstreams, UpstreamConfig{
 						Host: u.Host, Port: u.Port, Weight: weight, Protocol: protocol, Enabled: u.Enabled,
-						MaxConnections: u.MaxConnections,
+						MaxConnections: u.MaxConnections, HostHeader: u.HostHeader,
 					})
 				}
 			}
@@ -1942,20 +1959,42 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	}
 
 	// Collect TLS certificate file paths for all rules (manual + ACME from cert_jobs)
+	// 同路径去重合并 tags：引用型证书（tls_source="file"）的典型用法是多条规则
+	// 共用一份对外维护的证书文件，重复 (cert,key) 路径会让同一证书被加载多次——
+	// 按路径聚合，tags 合并为该证书适用的全部规则。
 	var tlsCertFiles []map[string]interface{}
+	tlsCertFileIndex := make(map[string]int)
+	addCertFile := func(certPath, keyPath, caddyID string) {
+		if certPath == "" || keyPath == "" {
+			return
+		}
+		dedupKey := certPath + "\x00" + keyPath
+		if index, exists := tlsCertFileIndex[dedupKey]; exists {
+			tags, _ := tlsCertFiles[index]["tags"].([]string)
+			tlsCertFiles[index]["tags"] = append(tags, caddyID)
+			return
+		}
+		tlsCertFileIndex[dedupKey] = len(tlsCertFiles)
+		tlsCertFiles = append(tlsCertFiles, map[string]interface{}{
+			"certificate": certPath,
+			"key":         keyPath,
+			"tags":        []string{caddyID},
+		})
+	}
 	for _, ru := range allRules {
 		r := ru.rule
 		if !r.EnableTLS {
 			continue
 		}
-		if _, hasCert := availableCerts[r.CaddyID]; hasCert {
-			certPath, keyPath := CertFilePaths(r.CaddyID)
-			tlsCertFiles = append(tlsCertFiles, map[string]interface{}{
-				"certificate": certPath,
-				"key":         keyPath,
-				"tags":        []string{r.CaddyID},
-			})
+		if _, hasCert := availableCerts[r.CaddyID]; !hasCert {
+			continue
 		}
+		if r.TLSSource == "file" {
+			addCertFile(r.TLSCertPath, r.TLSKeyPath, r.CaddyID)
+			continue
+		}
+		certPath, keyPath := CertFilePaths(r.CaddyID)
+		addCertFile(certPath, keyPath, r.CaddyID)
 	}
 
 	layer4Servers := make(map[string]interface{})
@@ -2016,7 +2055,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			}
 			ruleConfig.Upstreams = append(ruleConfig.Upstreams, UpstreamConfig{
 				Host: u.Host, Port: u.Port, Weight: weight, Protocol: u.Protocol, Enabled: u.Enabled,
-				MaxConnections: u.MaxConnections,
+				MaxConnections: u.MaxConnections, HostHeader: u.HostHeader,
 			})
 		}
 		layer4Servers[fmt.Sprintf("tcp_%d", port)] = buildTCPServer(ruleConfig)
@@ -2405,25 +2444,28 @@ func httpsRedirectLocation(listenPort int) string {
 }
 
 type SingleRuleConfig struct {
-	CaddyID                          string
-	Protocol                         string
-	Domain                           string
-	ListenPort                       int
-	Strategy                         string
-	DynamicDNS                       bool
-	EnableDnsServer                  bool
-	DnsServer                        string
-	DnsFamily                        string
-	HealthCheckPath                  string
-	HealthCheckInterval              int
-	HealthCheckTimeout               int
-	HealthCheckUnhealthyThreshold    int
-	HealthCheckHealthyThreshold      int
-	EnableTLS                        bool
-	TLSSource                        string
-	ACMEConfigID                     int
-	TLSCert                          string
-	TLSKey                           string
+	CaddyID                       string
+	Protocol                      string
+	Domain                        string
+	ListenPort                    int
+	Strategy                      string
+	DynamicDNS                    bool
+	EnableDnsServer               bool
+	DnsServer                     string
+	DnsFamily                     string
+	HealthCheckPath               string
+	HealthCheckInterval           int
+	HealthCheckTimeout            int
+	HealthCheckUnhealthyThreshold int
+	HealthCheckHealthyThreshold   int
+	EnableTLS                     bool
+	TLSSource                     string
+	ACMEConfigID                  int
+	TLSCert                       string
+	TLSKey                        string
+	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件路径（2026-10-09）。
+	TLSCertPath                      string
+	TLSKeyPath                       string
 	TLSHTTPRedirect                  bool
 	EnableCompress                   bool
 	CompressTypes                    string
@@ -2472,6 +2514,13 @@ type PathRuleConfig struct {
 	// 精确匹配整体替换（引擎实证形状，见 upstreamPathRewriteHandlers）。
 	UpstreamPath string
 	Upstreams    []UpstreamConfig
+	// 静态响应（2026-10-09）：Action="respond" 时该路径规则改由本程序直接返回
+	// （static_response），Upstreams/UpstreamPath 不参与渲染。
+	Action       string
+	StatusCode   int
+	RedirectURL  string
+	ResponseBody string
+	ContentType  string
 }
 
 type proxyTimeouts struct {
@@ -2491,6 +2540,9 @@ type UpstreamConfig struct {
 	Protocol       string
 	Enabled        bool
 	MaxConnections int
+	// HostHeader 逐上游回源 Host（空=回退规则级 host_header，仍空=上游自身）。
+	// 仅 HTTP 链消费（buildHTTPHandleChain 三级回退）；TCP（layer4）无 Host 概念。
+	HostHeader string
 }
 
 func resolveRuleOverrides(rule SingleRuleConfig) (requestBodyMaxSizeMB int, upstreamKeepalive int, hideServer bool) {
@@ -2583,17 +2635,23 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 	}
 	apps := map[string]interface{}{}
 	hasCert := false
+	// 引用型证书（tls_source="file"）的显式文件路径：块内读取、块外供 load_files 使用。
+	certFilePath, keyFilePath := "", ""
 	if protocol == "http" {
 		var tlsSource string
 		var certPresent, keyPresent, enableTLS bool
 		// Round 34 F-3: 查询失败必须留痕，对话框不得静默显示"无证书"。
 		// N+12 G8-S3：仅需存在性判断，投影 COALESCE!='' 布尔，不搬运 PEM 正文。
-		if err := db.DB.QueryRow(`SELECT COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '', COALESCE(tls_key,'') != '', COALESCE(enable_tls,0) FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(&tlsSource, &certPresent, &keyPresent, &enableTLS); err != nil {
+		if err := db.DB.QueryRow(`SELECT COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '', COALESCE(tls_key,'') != '', COALESCE(enable_tls,0),
+			COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'') FROM lb_rules WHERE caddy_id = ?`, caddyID).
+			Scan(&tlsSource, &certPresent, &keyPresent, &enableTLS, &certFilePath, &keyFilePath); err != nil {
 			Logf("error", "GenerateRuleServerContext: 读取规则 %s TLS 字段失败: %v", caddyID, err)
 		} else if enableTLS {
 			// Round 34 F-2: 与全量渲染 availableCerts 同口径（caddy.go 全量路径
 			// 要求 EnableTLS），未开 TLS 的规则不加载证书。
 			if tlsSource == "manual" && certPresent && keyPresent {
+				hasCert = true
+			} else if tlsSource == "file" && certFilePath != "" && keyFilePath != "" {
 				hasCert = true
 			} else if tlsSource == "acme_dns" {
 				hasCert = isACMECertIssuedFromStore(db.DB, caddyID, domain)
@@ -2603,7 +2661,9 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 		// Round 34 F-2: 与全量渲染 httpServersByPort 同口径——仅 enable_tls=1 且
 		// 存在启用上游的规则进入 TLS 策略（无上游/关 TLS 规则在真实配置中不存在）。
 		// N+12 G8-S3：证书仅有无的判断在 SQL 侧完成，不再把整列 PEM 拉进进程。
-		rows, err := db.DB.Query(`SELECT COALESCE(caddy_id,''), COALESCE(domain,''), COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '' AND COALESCE(tls_key,'') != ''
+		rows, err := db.DB.Query(`SELECT COALESCE(caddy_id,''), COALESCE(domain,''), COALESCE(tls_source,'manual'),
+			COALESCE(tls_cert,'') != '' AND COALESCE(tls_key,'') != '',
+			COALESCE(tls_cert_path,'') != '' AND COALESCE(tls_key_path,'') != ''
 			FROM lb_rules WHERE enabled = 1 AND protocol = 'http' AND listen_port = ? AND enable_tls = 1
 			AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id = lb_rules.caddy_id AND IIF(u.enabled IN ('1',1),1,0) = 1)
 			ORDER BY rowid`, listenPort)
@@ -2612,12 +2672,12 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 		} else {
 			for rows.Next() {
 				var ruleID, ruleDomain, tlsSource string
-				var hasManualCert bool
-				if rows.Scan(&ruleID, &ruleDomain, &tlsSource, &hasManualCert) != nil {
+				var hasManualCert, hasFileCert bool
+				if rows.Scan(&ruleID, &ruleDomain, &tlsSource, &hasManualCert, &hasFileCert) != nil {
 					Logf("error", "GenerateRuleServerContext: 扫描端口 %d 规则 TLS 字段失败", listenPort)
 					continue
 				}
-				available := (tlsSource == "manual" && hasManualCert) || (tlsSource == "acme_dns" && isACMECertIssuedFromStore(db.DB, ruleID, ruleDomain))
+				available := (tlsSource == "manual" && hasManualCert) || (tlsSource == "file" && hasFileCert) || (tlsSource == "acme_dns" && isACMECertIssuedFromStore(db.DB, ruleID, ruleDomain))
 				if !available {
 					continue
 				}
@@ -2647,7 +2707,11 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 		apps["layer4"] = map[string]interface{}{"servers": map[string]interface{}{serverName: server}}
 	}
 	if hasCert {
+		// 引用型证书（2026-10-09）：直接引用用户指定的成品文件；其余来源用物化路径。
 		certPath, keyPath := CertFilePaths(caddyID)
+		if certFilePath != "" && keyFilePath != "" {
+			certPath, keyPath = certFilePath, keyFilePath
+		}
 		apps["tls"] = map[string]interface{}{
 			"certificates": map[string]interface{}{
 				"load_files": []interface{}{
@@ -2770,8 +2834,9 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 			"routes": routeValues,
 		}
 
-		// Add TLS configuration for manual certificates
-		if rule.EnableTLS && rule.TLSSource == "manual" && rule.TLSCert != "" && rule.TLSKey != "" {
+		// Add TLS configuration for manual certificates / referenced certificate files
+		if rule.EnableTLS && ((rule.TLSSource == "manual" && rule.TLSCert != "" && rule.TLSKey != "") ||
+			(rule.TLSSource == "file" && rule.TLSCertPath != "" && rule.TLSKeyPath != "")) {
 			server["tls_connection_policies"] = []interface{}{
 				map[string]interface{}{
 					"match": map[string]interface{}{
@@ -2831,6 +2896,21 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 					{
 						"certificate": rule.TLSCert,
 						"key":         rule.TLSKey,
+						"tags":        []string{rule.CaddyID},
+					},
+				},
+			},
+		}
+	}
+	// 引用型证书（2026-10-09）：直接引用成品文件路径（load_files），不落 PEM、
+	// 不复制到程序证书目录。
+	if rule.EnableTLS && rule.TLSSource == "file" && rule.TLSCertPath != "" && rule.TLSKeyPath != "" {
+		apps["tls"] = map[string]interface{}{
+			"certificates": map[string]interface{}{
+				"load_files": []map[string]interface{}{
+					{
+						"certificate": rule.TLSCertPath,
+						"key":         rule.TLSKeyPath,
 						"tags":        []string{rule.CaddyID},
 					},
 				},
@@ -2901,18 +2981,29 @@ func generateHTTPRouteObjects(rule SingleRuleConfig, securityCtx ...*securityPol
 			return pathRules[i].SortOrder < pathRules[j].SortOrder
 		})
 		for pathIndex, pathRule := range pathRules {
-			upstreams := pathRule.Upstreams
-			// Round 32 F-3: 空数组与 nil 统一回退主上游——DB 中 upstreams_json="[]"
-			// 的存量路径规则此前因 `upstreams == nil` 不成立而走 buildHTTPHandleChain
-			// 硬失败（预校验特判放行、全量渲染失败的不对称），修复后两者语义一致。
-			if len(upstreams) == 0 {
-				upstreams = rule.Upstreams
+			// 静态响应分支（2026-10-09）：该路径由本程序直接响应（static_response），
+			// 与上游无关——跳过上游回退与 path 改写，链尾为预设响应。
+			respond := normalizedPathRuleAction(pathRule.Action) == string(models.PathRuleActionRespond)
+			var handle []interface{}
+			var handleErr error
+			if respond {
+				handle, handleErr = buildStaticResponsePathChain(rule, pathRule, ctx)
+			} else {
+				upstreams := pathRule.Upstreams
+				// Round 32 F-3: 空数组与 nil 统一回退主上游——DB 中 upstreams_json="[]"
+				// 的存量路径规则此前因 `upstreams == nil` 不成立而走 buildHTTPHandleChain
+				// 硬失败（预校验特判放行、全量渲染失败的不对称），修复后两者语义一致。
+				if len(upstreams) == 0 {
+					upstreams = rule.Upstreams
+				}
+				handle, handleErr = buildHTTPHandleChain(rule, upstreams, ctx)
+				if handleErr == nil {
+					handle = insertUpstreamPathRewrites(handle, pathRule)
+				}
 			}
-			handle, handleErr := buildHTTPHandleChain(rule, upstreams, ctx)
 			if handleErr != nil {
 				return nil, nil, handleErr
 			}
-			handle = insertUpstreamPathRewrites(handle, pathRule)
 			matcher := map[string]interface{}{
 				"host": domainHosts,
 				"path": pathMatcherSpecs(pathRule),
@@ -2951,6 +3042,92 @@ func pathMatcherSpecs(pathRule PathRuleConfig) []string {
 // 同源）；root 为空即「匹配一切」形态（path / 或 /*）。
 func pathPrefixRoot(path string) string {
 	return strings.TrimRight(path, "/*")
+}
+
+// respondStatusCodes 预置的静态响应状态码集合（前端下拉同源展示，后端为权威
+// 白名单）：成功 / 重定向 / 客户端错误 / 服务端错误四组常用码。
+var respondStatusCodes = []int{
+	200, 204, // 成功
+	301, 302, 303, 307, 308, // 重定向（响应必须带 Location）
+	400, 401, 403, 404, 405, 410, 429, // 客户端错误
+	500, 502, 503, 504, // 服务端错误
+}
+
+// RespondStatusCodes 返回预置状态码清单副本（API/前端契约同源，防调用方篡改）。
+func RespondStatusCodes() []int {
+	out := make([]int, len(respondStatusCodes))
+	copy(out, respondStatusCodes)
+	return out
+}
+
+// IsSupportedRespondStatus 判定状态码是否在预置集合内（保存校验白名单）。
+func IsSupportedRespondStatus(code int) bool {
+	for _, preset := range respondStatusCodes {
+		if preset == code {
+			return true
+		}
+	}
+	return false
+}
+
+// IsRedirectRespondStatus 判定是否重定向类状态码（3xx：必须携带 Location，
+// 且按 RFC 9110 不带消息体）。
+func IsRedirectRespondStatus(code int) bool {
+	return code >= 300 && code < 400
+}
+
+// respondBodyAllowed 判定该状态码是否允许响应体（204/304 与全部 3xx 不允许）。
+func respondBodyAllowed(code int) bool {
+	return code != 204 && code != 304 && !IsRedirectRespondStatus(code)
+}
+
+// defaultRespondContentType 静态响应带体且未指定内容类型时的兜底值。
+const defaultRespondContentType = "text/html; charset=utf-8"
+
+// staticResponseHandler 构造本程序直接响应的 static_response handler：必备响应头
+// 按标准状态码语义预设（3xx→Location、401→WWW-Authenticate、405→Allow、带体→
+// Content-Type），响应体经占位符转义后原样输出。
+func staticResponseHandler(pathRule PathRuleConfig) map[string]interface{} {
+	handler := map[string]interface{}{
+		"handler":     "static_response",
+		"status_code": pathRule.StatusCode,
+	}
+	headers := map[string]interface{}{}
+	switch {
+	case IsRedirectRespondStatus(pathRule.StatusCode):
+		// 重定向必备头：目标 URL 由用户填写（校验层保证非空且形状合法）。
+		headers["Location"] = []string{pathRule.RedirectURL}
+	case pathRule.StatusCode == 401:
+		// RFC 9110：401 响应必须携带 WWW-Authenticate——本程序不参与凭据校验，
+		// 以通用 Basic 形态占位，满足标准响应形状。
+		headers["WWW-Authenticate"] = []string{`Basic realm="Restricted"`}
+	case pathRule.StatusCode == 405:
+		// RFC 9110：405 响应必须携带 Allow——静态响应对全部方法同响应，列出常规
+		// 方法全集供客户端判断。
+		headers["Allow"] = []string{"GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"}
+	}
+	if respondBodyAllowed(pathRule.StatusCode) {
+		contentType := strings.TrimSpace(pathRule.ContentType)
+		if contentType == "" {
+			contentType = defaultRespondContentType
+		}
+		headers["Content-Type"] = []string{contentType}
+	}
+	if len(headers) > 0 {
+		handler["headers"] = headers
+	}
+	if respondBodyAllowed(pathRule.StatusCode) && pathRule.ResponseBody != "" {
+		handler["body"] = escapeCaddyPlaceholders(pathRule.ResponseBody)
+	}
+	return handler
+}
+
+// escapeCaddyPlaceholders 转义响应体中的 { ——Caddy static_response 的 body 会做
+// 占位符替换，且未识别的占位符按 replacer.ReplaceAll 的 treatUnknownAsEmpty 语义
+// 展开为空串，用户内容里的 JSON/模板花括号会被静默吞掉。转义为 \{ 后引擎按字面
+// 输出（replacer.go 的 phEscape 分支），保证所见即所得。
+func escapeCaddyPlaceholders(body string) string {
+	return strings.ReplaceAll(body, "{", `\{`)
 }
 
 // insertUpstreamPathRewrites 在链内最后一个 reverse_proxy 之前插入上游 path
@@ -3326,7 +3503,21 @@ var geoipPrivateRanges = []string{
 	"fe80::/10",              // IPv6 链路本地
 }
 
+// buildHTTPHandleChain 反向代理处理链（上游负载池 → reverse_proxy）。
 func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, securityCtx ...*securityPolicyContext) ([]interface{}, error) {
+	return buildHandleChain(rule, upstreams, nil, securityCtx...)
+}
+
+// buildStaticResponsePathChain 静态响应处理链（2026-10-09）：与代理路径共用同一
+// 安全前缀（WAF/限流/请求体限额/指标口径一致），仅终结 handler 换成本程序直接
+// 生成的 static_response——「针对某个路径由本程序提供响应」。
+func buildStaticResponsePathChain(rule SingleRuleConfig, pathRule PathRuleConfig, securityCtx ...*securityPolicyContext) ([]interface{}, error) {
+	return buildHandleChain(rule, nil, &pathRule, securityCtx...)
+}
+
+// buildHandleChain 处理链统一实现。respond 与 upstreams 互斥：respond != nil 时
+// 为静态响应形态（不校验/不构建上游，链尾为 static_response）。
+func buildHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, respond *PathRuleConfig, securityCtx ...*securityPolicyContext) ([]interface{}, error) {
 	var ctx *securityPolicyContext
 	if len(securityCtx) > 0 {
 		ctx = securityCtx[0]
@@ -3337,7 +3528,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			enabledUpstreams = append(enabledUpstreams, upstream)
 		}
 	}
-	if len(enabledUpstreams) == 0 {
+	if respond == nil && len(enabledUpstreams) == 0 {
 		return nil, fmt.Errorf("%w", ErrNoEnabledUpstreams)
 	}
 	if rule.DynamicDNS && len(enabledUpstreams) > 1 {
@@ -3527,6 +3718,13 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		handleChain = append(handleChain, securityChain...)
 	}
 
+	// 静态响应短路（2026-10-09）：安全前缀已就位，链尾直接返回本程序生成的
+	// 响应——不构建上游列表/负载均衡/健康检查/transport（与上游无关）。
+	if respond != nil {
+		handleChain = append(handleChain, staticResponseHandler(*respond))
+		return handleChain, nil
+	}
+
 	upstreamList := make([]interface{}, 0, len(enabledUpstreams))
 	upstreamWeights := make([]int, 0, len(enabledUpstreams))
 	hasHTTPSUpstream := false
@@ -3570,6 +3768,15 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			hasHTTPSUpstream = true
 		}
 	}
+
+	// ── 逐上游回源 Host 三级回退（2026-10-09）─────────────────────────────
+	// 优先级：上游自定义 host_header > 规则级 host_header > 上游自身 host:port。
+	// Caddy 单个 reverse_proxy 的请求头操作为 handler 级——同一负载池共享一个
+	// Host 值：全统一态用静态值；全回退态用 {http.reverse_proxy.upstream.hostport}
+	// （等价每上游用自身地址）；混合态（上游间取值不一致）由 lb_upstream_host
+	// 处理器（caddygeoip 模块）在请求期按选中上游惰性下发——负载均衡/健康检查
+	// 语义不变。TLS server_name 同源取值（混合态走 {lb.upstream_sni}）。
+	hostPlan := resolveUpstreamHostPlan(rule, enabledUpstreams)
 
 	proxyConfig := map[string]interface{}{"handler": "reverse_proxy"}
 	if rule.DynamicDNS {
@@ -3643,8 +3850,16 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 				"passes":   hcPasses,
 				"fails":    hcThreshold,
 			}
-			if rule.HostHeader != "" {
-				active["headers"] = map[string]interface{}{"Host": []string{rule.HostHeader}}
+			// 主动健康检查的 headers 为 handler 级（Caddy active health check
+			// 不支持逐上游 headers）——统一态与代理请求同源取回源 Host（含
+			// 上游级统一值）；混合/全回退态维持规则级值（空=不带 Host 覆盖，
+			// 健康检查域名依赖上游自身，与 dial 默认行为一致）。
+			healthHost := rule.HostHeader
+			if hostPlan.staticHost != "" {
+				healthHost = hostPlan.staticHost
+			}
+			if healthHost != "" {
+				active["headers"] = map[string]interface{}{"Host": []string{healthHost}}
 			}
 			healthChecks["active"] = active
 		}
@@ -3665,9 +3880,17 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	if needsTransport {
 		transportConfig := map[string]interface{}{"protocol": "http"}
 		if hasHTTPSUpstream {
+			// SNI 与回源 Host 同源：统一态用同一静态值；混合态 {lb.upstream_sni}
+			// 按选中上游惰性解析（处理器侧剥端口，SNI 不得含端口）；全回退态
+			// 维持 rule.HostHeader 现状（空=交给 Caddy 以 dial host 兜底，与
+			// v2.11 自动行为一致）。
+			serverName := rule.HostHeader
+			if hostPlan.sniTarget != "" {
+				serverName = hostPlan.sniTarget
+			}
 			transportConfig["tls"] = map[string]interface{}{
 				"insecure_skip_verify": true,
-				"server_name":          rule.HostHeader,
+				"server_name":          serverName,
 			}
 		}
 		if rule.EnableDnsServer && rule.DnsServer != "" {
@@ -3709,8 +3932,16 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			"X-Lb-Security-Timing-Start-Ns",
 		},
 	}
-	if rule.HostHeader != "" {
-		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{rule.HostHeader}}
+	// 回源 Host 下发（三级回退计划；有启用上游时三态必有其一——恒显式设置：
+	// 全回退态从「透传客户端 Host」改为「每上游用自身 host:port」，与程序定位
+	// 一致：默认即以回源目标身份访问）。
+	switch {
+	case hostPlan.overrideMap != nil:
+		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{"{lb.upstream_host}"}}
+	case hostPlan.staticHost != "":
+		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{hostPlan.staticHost}}
+	case hostPlan.usePlaceholder:
+		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{"{http.reverse_proxy.upstream.hostport}"}}
 	}
 	proxyConfig["headers"] = map[string]interface{}{"request": proxyRequestHeaders}
 	if effectiveServerTokensHidden {
@@ -3723,8 +3954,87 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			"response": map[string]interface{}{"deferred": true, "delete": []string{"Server"}},
 		})
 	}
+	// 混合态：lb_upstream_host 须先于 reverse_proxy 执行（请求期注册惰性
+	// 占位符提供者 {lb.upstream_host}/{lb.upstream_sni}，reverse_proxy 选中
+	// 上游后求值）。
+	if hostPlan.overrideMap != nil {
+		handleChain = append(handleChain, map[string]interface{}{
+			"handler": "lb_upstream_host",
+			"hosts":   hostPlan.overrideMap,
+		})
+	}
 	handleChain = append(handleChain, proxyConfig)
 	return handleChain, nil
+}
+
+// upstreamHostPlan 逐上游回源 Host 三级回退计划（2026-10-09）。
+// 三态互斥（有启用上游时恒居其一）：
+//   - usePlaceholder：全回退——Host={http.reverse_proxy.upstream.hostport}；
+//   - staticHost：全统一静态值（含仅规则级 host_header 生效的场景）；
+//   - overrideMap：混合——dial→回源 Host 映射（未收录上游由处理器未命中
+//     兜底回上游自身地址）；Host={lb.upstream_host}。
+//
+// sniTarget 为 TLS server_name 目标（静态值或 {lb.upstream_sni}；""=维持
+// rule.HostHeader 现状语义——全回退时规则级亦空，等价 Caddy 以 dial host 兜底）。
+type upstreamHostPlan struct {
+	staticHost     string
+	usePlaceholder bool
+	overrideMap    map[string]string
+	sniTarget      string
+}
+
+// resolveUpstreamHostPlan 计算启用上游集合的回源 Host 计划。DynamicDNS 规则经
+// buildHTTPHandleChain 前置校验强制单启用上游（ErrDynamicDNSUpstreamCount），
+// 且动态解析 IP 逐请求变化、dial 不可预知——单上游恒落入全回退/全统一两态，
+// 混合映射天然不出现，无需特判。
+func resolveUpstreamHostPlan(rule SingleRuleConfig, upstreams []UpstreamConfig) upstreamHostPlan {
+	if len(upstreams) == 0 {
+		return upstreamHostPlan{}
+	}
+	// 逐上游有效值：上游自定义 > 规则级；两者皆空记 ""（回退自身地址）。
+	effective := make([]string, len(upstreams))
+	allSame := true
+	for i, u := range upstreams {
+		host := strings.TrimSpace(u.HostHeader)
+		if host == "" {
+			host = strings.TrimSpace(rule.HostHeader)
+		}
+		effective[i] = host
+		if i > 0 && host != effective[0] {
+			allSame = false
+		}
+	}
+	if allSame {
+		if effective[0] == "" {
+			return upstreamHostPlan{usePlaceholder: true}
+		}
+		return upstreamHostPlan{staticHost: effective[0], sniTarget: stripPortForSNI(effective[0])}
+	}
+	// 混合态：仅收录「有效值非自身回退」的上游（dial 与 Caddy 的
+	// {http.reverse_proxy.upstream.hostport} 同格式：net.JoinHostPort，见
+	// joinUpstreamAddress 与 caddy.NetworkAddress.JoinHostPort(0) 同源）。
+	overrides := make(map[string]string, len(upstreams))
+	for i, u := range upstreams {
+		if effective[i] == "" {
+			continue
+		}
+		overrides[joinUpstreamAddress(u.Host, u.Port)] = effective[i]
+	}
+	if len(overrides) == 0 {
+		// 防御：值集合不一致却无静态项（理论不可达：至少一个非空）。回退
+		// 占位符语义，绝不产出空 Host。
+		return upstreamHostPlan{usePlaceholder: true}
+	}
+	return upstreamHostPlan{overrideMap: overrides, sniTarget: "{lb.upstream_sni}"}
+}
+
+// stripPortForSNI 剥离回源 Host 的端口（SNI 不得含端口；Host 头侧保留原样）。
+// 无端口/裸 IPv6 形态原样返回（UTF-8 主机名与 IPv4 字面量由 Go 侧 SNI 规则处理）。
+func stripPortForSNI(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
 }
 
 // ApplyConfigFromTx renders the Caddy config from an uncommitted transaction

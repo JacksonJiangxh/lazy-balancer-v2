@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +46,94 @@ func ResetConfigDrift() {
 	configDriftCleanRounds = 0
 	configDriftQueryWarned = false
 	configDriftReadWarned = false
+	// 引用型证书指纹快照同源重置：从→主切换后下一轮 scan 重新建基线，避免用
+	// 旧快照误判「证书已更新」而触发一次多余重载。
+	ResetReferencedCertWatch()
+}
+
+// 引用型证书（tls_source="file"）外部更新自动重载（2026-10-09）：用户直接维护
+// /app/certs 内的成品证书文件（多项目公用），更新后看门狗在下一轮（60s 节拍）
+// 检出文件内容指纹变化并强制重载 Caddy。因引用模式只传路径、配置 JSON 与路径
+// 均未变，Caddy changeConfig 会按「同字节」短路——必须走 force 变体绕过，否则
+// Caddy 内存仍停留旧证书（重载静默不生效）。
+var (
+	referencedCertWatchMu    sync.Mutex
+	referencedCertWatchState = map[string]string{}
+	referencedCertWatchReady bool
+	referencedCertReloadFn   func() error
+)
+
+// SetReferencedCertReload 注入引用型证书变化后的强制重载实现（main: caddyReloader）。
+func SetReferencedCertReload(fn func() error) { referencedCertReloadFn = fn }
+
+// ResetReferencedCertWatch 清空引用型证书指纹快照——角色切换/测试隔离复用；
+// 清空后下一轮 scan 只重建基线、不触发重载（首扫语义）。
+func ResetReferencedCertWatch() {
+	referencedCertWatchMu.Lock()
+	defer referencedCertWatchMu.Unlock()
+	referencedCertWatchState = map[string]string{}
+	referencedCertWatchReady = false
+}
+
+// checkReferencedCertFiles 扫描引用型证书规则，逐条比对证书/私钥文件对的内容
+// 指纹；检出变化（含新出现与内容变更）即触发强制重载并留痕。首扫仅建基线不
+// 重载——避免启动/升主即产生一次多余 /load。
+func checkReferencedCertFiles() {
+	if db.DB == nil {
+		return
+	}
+	rows, err := db.DB.Query(`SELECT caddy_id, COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'')
+		FROM lb_rules WHERE enable_tls=1 AND tls_source='file'
+		AND COALESCE(tls_cert_path,'')<>'' AND COALESCE(tls_key_path,'')<>''`)
+	if err != nil {
+		Logf("warn", "引用证书看门狗: 读取规则失败: %v", err)
+		return
+	}
+	defer rows.Close()
+	current := make(map[string]string)
+	for rows.Next() {
+		var caddyID, certPath, keyPath string
+		if err := rows.Scan(&caddyID, &certPath, &keyPath); err != nil {
+			Logf("warn", "引用证书看门狗: 扫描规则失败: %v", err)
+			return
+		}
+		current[caddyID] = ReferencedCertFileDigest(certPath, keyPath)
+	}
+	if err := rows.Err(); err != nil {
+		Logf("warn", "引用证书看门狗: 遍历规则失败: %v", err)
+		return
+	}
+
+	referencedCertWatchMu.Lock()
+	prev := referencedCertWatchState
+	ready := referencedCertWatchReady
+	var changed []string
+	if ready {
+		for id, digest := range current {
+			if old, ok := prev[id]; !ok || old != digest {
+				changed = append(changed, id)
+			}
+		}
+	}
+	referencedCertWatchState = current
+	referencedCertWatchReady = true
+	referencedCertWatchMu.Unlock()
+
+	if !ready || len(changed) == 0 {
+		return
+	}
+	sort.Strings(changed)
+	if referencedCertReloadFn == nil {
+		Logf("warn", "引用证书看门狗: 检出证书文件变化但重载未接线，跳过（规则: %s）", strings.Join(changed, "、"))
+		return
+	}
+	if err := referencedCertReloadFn(); err != nil {
+		Logf("error", "引用证书看门狗: 证书文件变化后重载失败: %v", err)
+		TaskLogf("config-watchdog", "cert-file", "引用证书文件已更新，自动重载失败：%v", err)
+		return
+	}
+	Logf("info", "引用证书看门狗: 检出证书文件变化，已自动重载（规则: %s）", strings.Join(changed, "、"))
+	TaskLogf("config-watchdog", "cert-file", "引用证书文件已更新，已自动重载 %d 条规则", len(changed))
 }
 
 // CurrentConfigDrift 返回看门狗当前状态（GetCaddyStatus 等展示路径消费）。
@@ -91,6 +180,9 @@ func WatchdogCheckOnce() {
 			}
 		}()
 		checkConfigConsistency(watchdogAdminURLValue)
+		// 引用型证书文件变化检测（外部更新 /app/certs 内成品证书后自动重载）：
+		// 与一致性检查同节拍、同主节点门（从节点 Caddy 无需本地证书热更）。
+		checkReferencedCertFiles()
 		// R66 日志收敛（2026-10-03 裁定，R65「日志只记真实执行」延伸）：一致轮
 		// 零逐轮行，每 configWatchdogHeartbeatRounds 轮（60s×60≈1h）一条心跳；
 		// 漂移期逐轮漂移行与恢复事件照旧（task_runs 维持失败留痕不膨胀）。
