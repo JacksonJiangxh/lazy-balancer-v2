@@ -59,7 +59,7 @@
 1. **车道编排**：按配置顺序（已按权重降序）启动车道 0；此后当 ① 距上一次发车道已过 `race_interval_ms` 仍无胜者，或 ② 某车道落定且结果为错误/`status>=400` 且还有未发车道 —— 发出下一车道。
 2. **胜者判定**：最先返回 `status < 400` 响应头的车道胜出，其响应直接流式写客户端（透传 `http.Flusher`，支持 SSE）。胜者确定后 `context.Cancel` 其余在途车道。
 3. **兜底截断**：每车道请求 context 挂 `request_timeout_ms` 超时（仅约束「收到响应头之前」；响应头到达后 body 流不再受此超时，避免误杀大文件/长连接）。超时车道被取消，视为失败车道。
-4. **收尾**：全部车道落定为 bad → 写出**最先到达**的 bad 响应（status>=400 原样透传）；全部车道错误 → 502（全部为超时则 504）。
+4. **收尾**：全部车道落定为 bad → 返回干净 404（不透传后端报文；2026-10-10 决策修订，原为透传最先到达的 bad 响应）；全部车道错误 → 502（全部为超时则 504）。
 5. **请求体重放**：`len(upstreams)>1` 且方法含 body 时，物化请求体至上限 `body_replay_limit_bytes`（超出 → 退化为仅车道 0 直通，不竞速不重放）。
 6. **WebSocket/Upgrade 请求**：不竞速；按链序逐个尝试 hijack 隧道（dial 失败换下一个）。
 7. **每车道独立构造请求**：`URL` 按 dial/scheme 重建；`req.Host` = 该上游 `host`（空则 dial 地址）；追加 `X-Forwarded-For`、设置 `X-Forwarded-Proto/Host`；双向剥离 hop-by-hop 头；入口剥离 `strip_request_headers` 清单。
@@ -110,7 +110,7 @@ wizardForm 初始值：`chain_race_interval_ms: 500, chain_request_timeout_ms: 1
 
 * `internal/services`：chain 策略生成 `chain_proxy` handler，上游按权重降序且 `weight<=0→1`、逐上游 host 正确、跳过 reverse\_proxy 专属键；现有 WRR 生成不受影响（回归）。
 
-* `caddychain`（模块内 `go test`）：① 车道 0 慢、车道 1 快 → 胜者 200 直达且车道 0 被 cancel；② 车道 0 返回 502 → 立即发车道 1，车道 1 200 胜出；③ 全部车道 4xx/5xx → 透传最先到达的 bad 响应；④ 全部超时 → 504；⑤ body 重放（POST + buffer 内）双路都收到相同 body；⑥ body 超上限 → 不竞速仅车道 0；⑦ 逐上游 Host/XFF/hop-by-hop 剥离；⑧ race\_interval 未到且车道 0 已返回 200 → 不发第二路。
+* `caddychain`（模块内 `go test`）：① 车道 0 慢、车道 1 快 → 胜者 200 直达且车道 0 被 cancel；② 车道 0 返回 502 → 立即发车道 1，车道 1 200 胜出；③ 全部车道 4xx/5xx → 干净 404（不透传报文与响应头）；④ 全部超时 → 504；⑤ body 重放（POST + buffer 内）双路都收到相同 body；⑥ body 超上限 → 不竞速仅车道 0；⑦ 逐上游 Host/XFF/hop-by-hop 剥离；⑧ race\_interval 未到且车道 0 已返回 200 → 不发第二路。
 
 ### 3.7 备份/集群同步核查（只查不改为主）
 
@@ -123,7 +123,7 @@ grep 确认 `config_backup`、`cluster_sections`/`cluster_snapshot`、`config_im
 3. **优先级 = 权重降序**，同权重按列表顺序；权重百分比 UI（和=100）保持不变，仅含义提示变化。
 4. 「没收到回复」定义为**未收到响应头**；响应头后 body 流不受兜底超时约束（护住大文件/SSE/长连接）。
 5. **可重试状态码 = status>=400**（对齐参考项目 `retryOn: 4xx5xx`）；网络错误/超时恒为失败。
-6. 全部车道落定 bad 时返回**最先到达**的 bad 响应（最低客户端延迟）。
+6. 全部车道落定 bad 时返回干净 404（2026-10-10 修订：原为透传最先到达的 bad 响应——对象存储错误 XML 会被误当资源内容展示给客户端）；单上游退化直通的上游 404 同口径处理，非 404 错误保持透传。
 7. race\_interval=0 落库含义 = 用户未改默认 → 写侧兜底 500ms（UI 不提供 0=关闭；参考项目 speculativeMs=0 关闭的语义不引入，避免配置分叉）。
 8. 单启用上游（含 DynamicDNS 规则）→ 链退化直通，合法但无竞速。
 9. 链式规则不发射健康检查/transport/headers 配置（竞速即可用性机制），DB 健康检查字段保留但渲染忽略。

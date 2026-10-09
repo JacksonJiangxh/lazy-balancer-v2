@@ -186,11 +186,13 @@ func TestFailover_BadStatusLaunchesNextImmediately(t *testing.T) {
 	}
 }
 
-// TestAllBad_ReturnsFirstBadResponse 全部落定为 bad：透传最先到达的 bad 响应。
-func TestAllBad_ReturnsFirstBadResponse(t *testing.T) {
+// TestAllBad_ReturnsClean404 全部落定为 bad：返回干净 404，不透传后端报文
+// 与响应头（对象存储错误 XML 等不得作为资源内容展示给客户端）。
+func TestAllBad_ReturnsClean404(t *testing.T) {
 	notFound := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Origin-Marker", "first-bad")
 		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprint(w, "first-bad")
+		fmt.Fprint(w, "<Error><Code>NoSuchKey</Code></Error>")
 	}))
 	t.Cleanup(notFound.Close)
 	forbidden := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -205,10 +207,14 @@ func TestAllBad_ReturnsFirstBadResponse(t *testing.T) {
 
 	resp := do(t, h, http.MethodGet, "/", "")
 	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404 (first-arrived bad)", resp.StatusCode)
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
-	if body := readAll(t, resp); body != "first-bad" {
-		t.Fatalf("body = %q, want first-bad", body)
+	body := readAll(t, resp)
+	if strings.Contains(body, "NoSuchKey") || strings.Contains(body, "Error") {
+		t.Fatalf("backend error body leaked: %q", body)
+	}
+	if got := resp.Header.Get("X-Origin-Marker"); got != "" {
+		t.Fatalf("backend header leaked: X-Origin-Marker=%q", got)
 	}
 }
 
@@ -456,5 +462,46 @@ func TestSingleUpstream_DirectProxy(t *testing.T) {
 	}
 	if resp.Header.Get("X-Upstream") != "yes" {
 		t.Fatal("response headers not passed through")
+	}
+}
+
+// TestSingleUpstream_404Clean 单上游退化直通：上游 404 与全挂同口径，
+// 返回干净 404 而非透传后端报文（对象存储错误 XML 不得展示给客户端）。
+func TestSingleUpstream_404Clean(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Origin-Marker", "yes")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, "<Error><Code>NoSuchKey</Code></Error>")
+	}))
+	t.Cleanup(up.Close)
+	h := newTestHandler([]ChainUpstream{{Dial: dialOf(up)}}, 50, 9000, 0)
+	resp := do(t, h, http.MethodGet, "/missing.jpg", "")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+	body := readAll(t, resp)
+	if strings.Contains(body, "NoSuchKey") {
+		t.Fatalf("backend error body leaked: %q", body)
+	}
+	if got := resp.Header.Get("X-Origin-Marker"); got != "" {
+		t.Fatalf("backend header leaked: X-Origin-Marker=%q", got)
+	}
+}
+
+// TestSingleUpstream_Non404Passthrough 单上游退化直通：非 404 的错误响应保持
+// 透传（5xx 等语义错误不被误标为 404）。
+func TestSingleUpstream_Non404Passthrough(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, "boom")
+	}))
+	t.Cleanup(up.Close)
+	h := newTestHandler([]ChainUpstream{{Dial: dialOf(up)}}, 50, 9000, 0)
+	resp := do(t, h, http.MethodGet, "/", "")
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 passthrough", resp.StatusCode)
+	}
+	if body := readAll(t, resp); body != "boom" {
+		t.Fatalf("body = %q, want boom", body)
 	}
 }
