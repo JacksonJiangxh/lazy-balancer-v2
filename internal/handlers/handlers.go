@@ -522,13 +522,15 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		"ip_hash": true, "least_conn": true,
 		"random": true, "first": true, "weighted_round_robin": true,
 		"cookie": true,
+		// 链式回退（2026-10-09）：竞速 + 兜底截断，仅 HTTP（同 cookie 先例）。
+		"chain_fallback": true,
 	}
 	tcpStrategies := map[string]bool{
 		"ip_hash": true, "least_conn": true,
 		"random": true, "first": true, "weighted_round_robin": true,
 	}
 	if data.Protocol == "http" && !httpStrategies[data.Strategy] {
-		return fmt.Errorf("无效的负载策略：HTTP 规则仅支持 weighted_round_robin / ip_hash / least_conn / random / first / cookie")
+		return fmt.Errorf("无效的负载策略：HTTP 规则仅支持 weighted_round_robin / ip_hash / least_conn / random / first / cookie / chain_fallback")
 	}
 	if data.Protocol == "tcp" && !tcpStrategies[data.Strategy] {
 		return fmt.Errorf("无效的负载策略：TCP 规则仅支持 weighted_round_robin / ip_hash / least_conn / random / first")

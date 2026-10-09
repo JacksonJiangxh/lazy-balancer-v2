@@ -91,6 +91,9 @@ export interface Rule extends ProxyTimeoutConfig {
   request_body_max_size_mb: number
   upstream_keepalive_timeout: number
   server_tokens_hidden: number
+  // 链式回退竞速参数（strategy=chain_fallback 时生效；0=后端兜底 3000/30000）
+  chain_race_interval_ms: number
+  chain_request_timeout_ms: number
   host_header: string
   upstreams: Upstream[] | null
   enable_tls: boolean
@@ -145,6 +148,9 @@ export interface CreateRuleRequest extends ProxyTimeoutConfig {
   request_body_max_size_mb: number
   upstream_keepalive_timeout: number
   server_tokens_hidden: number
+  // 链式回退竞速参数（strategy=chain_fallback 时生效；0=后端兜底 3000/30000）
+  chain_race_interval_ms: number
+  chain_request_timeout_ms: number
   custom_routes_enabled: boolean
   path_rules: PathRule[]
   host_header: string
@@ -168,6 +174,8 @@ export interface UpdateRuleRequest extends Omit<CreateRuleRequest,
   | 'request_body_max_size_mb'
   | 'upstream_keepalive_timeout'
   | 'server_tokens_hidden'
+  | 'chain_race_interval_ms'
+  | 'chain_request_timeout_ms'
   | 'custom_routes_enabled'
   | 'tcp_proxy_protocol'
   | keyof ProxyTimeoutConfig
@@ -176,6 +184,9 @@ export interface UpdateRuleRequest extends Omit<CreateRuleRequest,
   request_body_max_size_mb?: number
   upstream_keepalive_timeout?: number
   server_tokens_hidden?: number
+  // 链式回退竞速参数：可选——省略=保留原值（后端 *int 合并语义）
+  chain_race_interval_ms?: number
+  chain_request_timeout_ms?: number
   custom_routes_enabled?: boolean
   tcp_proxy_protocol: boolean
   proxy_dial_timeout?: number

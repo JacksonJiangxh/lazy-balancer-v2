@@ -257,6 +257,10 @@ func createTables() error {
 		request_body_max_size_mb INTEGER DEFAULT 0,
 		upstream_keepalive_timeout INTEGER DEFAULT 0,
 		server_tokens_hidden INTEGER DEFAULT 0,
+		-- 链式回退（strategy=chain_fallback，2026-10-09）竞速参数：竞速间隔与
+		-- 单请求兜底截断（毫秒）；0=写侧/渲染侧按策略兜底 3000/30000。
+		chain_race_interval_ms INTEGER NOT NULL DEFAULT 0,
+		chain_request_timeout_ms INTEGER NOT NULL DEFAULT 0,
 		custom_routes_enabled BOOLEAN NOT NULL DEFAULT 0,
 		proxy_dial_timeout INTEGER NOT NULL DEFAULT 0,
 		proxy_response_header_timeout INTEGER NOT NULL DEFAULT 0,
@@ -813,11 +817,14 @@ func runMigrations() error {
 		"lb_rules.request_body_max_size_mb":   "INTEGER DEFAULT 0",
 		"lb_rules.upstream_keepalive_timeout": "INTEGER DEFAULT 0",
 		"lb_rules.server_tokens_hidden":       "INTEGER DEFAULT 0",
-		"lb_rules.block_page_stage1_id":       "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.block_page_stage1_status":   "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.block_page_stage3_id":       "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.block_page_stage3_status":   "INTEGER NOT NULL DEFAULT 0",
-		"auto_backups.app_version":            "TEXT NOT NULL DEFAULT ''",
+		// 链式回退竞速参数（2026-10-09）：存量库补列，0=写侧/渲染侧按策略兜底。
+		"lb_rules.chain_race_interval_ms":   "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.chain_request_timeout_ms": "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.block_page_stage1_id":     "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.block_page_stage1_status": "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.block_page_stage3_id":     "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.block_page_stage3_status": "INTEGER NOT NULL DEFAULT 0",
+		"auto_backups.app_version":          "TEXT NOT NULL DEFAULT ''",
 		// 统一任务引擎（L1-66-03）：手动触发操作者归因列——runNow/Trigger 落
 		// 操作者，auto/startup/legacy 落空串。存量库幂等补列（ensureNewColumns）。
 		"task_runs.operator":                              "TEXT NOT NULL DEFAULT ''",
@@ -2558,6 +2565,9 @@ func migrateLbRulesPrimaryKey() error {
 			request_body_max_size_mb INTEGER DEFAULT 0,
 			upstream_keepalive_timeout INTEGER DEFAULT 0,
 			server_tokens_hidden INTEGER DEFAULT 0,
+			-- 链式回退竞速参数（2026-10-09）：重建 DDL 须携带，否则陈旧重建丢列。
+			chain_race_interval_ms INTEGER NOT NULL DEFAULT 0,
+			chain_request_timeout_ms INTEGER NOT NULL DEFAULT 0,
 			custom_routes_enabled BOOLEAN NOT NULL DEFAULT 0,
 			proxy_dial_timeout INTEGER NOT NULL DEFAULT 0,
 			proxy_response_header_timeout INTEGER NOT NULL DEFAULT 0,
@@ -2610,6 +2620,7 @@ func migrateLbRulesPrimaryKey() error {
 			health_check_unhealthy_threshold, health_check_healthy_threshold,
 			enable_active_health_check, tcp_health_check_port, tcp_proxy_protocol, tcp_try_duration, tcp_try_interval,
 			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden,
+			chain_race_interval_ms, chain_request_timeout_ms,
 			custom_routes_enabled,
 			proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
 			host_header, enable_tls, tls_cert,
@@ -2625,6 +2636,7 @@ func migrateLbRulesPrimaryKey() error {
 			health_check_unhealthy_threshold, health_check_healthy_threshold,
 			enable_active_health_check, tcp_health_check_port, tcp_proxy_protocol, tcp_try_duration, tcp_try_interval,
 			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden,
+			COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 			COALESCE(custom_routes_enabled,0),
 			COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 			host_header, enable_tls, tls_cert,

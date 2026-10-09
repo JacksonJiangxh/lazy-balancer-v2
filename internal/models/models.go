@@ -116,48 +116,55 @@ func NewAPIKeyWithUserResponse(key APIKey, username string) APIKeyWithUserRespon
 
 // LbRule represents a load balancing rule
 type LbRule struct {
-	ID                            int        `json:"id"`
-	CaddyID                       string     `json:"caddy_id"`
-	Name                          string     `json:"name"`
-	Description                   string     `json:"description"`
-	Protocol                      string     `json:"protocol"`
-	Domain                        string     `json:"domain"`
-	ListenPort                    int        `json:"listen_port"`
-	Strategy                      string     `json:"strategy"`
-	DynamicDNS                    bool       `json:"dynamic_dns"`
-	EnableDnsServer               bool       `json:"enable_dns_server"`
-	DnsServer                     string     `json:"dns_server"`
-	DnsFamily                     string     `json:"dns_family"`
-	HealthCheckPath               string     `json:"health_check_path"`
-	HealthCheckInterval           int        `json:"health_check_interval"`
-	HealthCheckTimeout            int        `json:"health_check_timeout"`
-	HealthCheckUnhealthyThreshold int        `json:"health_check_unhealthy_threshold"`
-	HealthCheckHealthyThreshold   int        `json:"health_check_healthy_threshold"`
-	EnableActiveHealthCheck       bool       `json:"enable_active_health_check"`
-	TCPHealthCheckPort            int        `json:"tcp_health_check_port"`
-	TCPProxyProtocol              bool       `json:"tcp_proxy_protocol"`
-	TCPTryDuration                int        `json:"tcp_try_duration"`
-	TCPTryInterval                int        `json:"tcp_try_interval"`
-	RequestBodyMaxSizeMB          int        `json:"request_body_max_size_mb"`
-	UpstreamKeepaliveTimeout      int        `json:"upstream_keepalive_timeout"`
-	ServerTokensHidden            int        `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
-	CustomRoutesEnabled           bool       `json:"custom_routes_enabled"`
-	ProxyDialTimeout              int        `json:"proxy_dial_timeout"`
-	ProxyResponseHeaderTimeout    int        `json:"proxy_response_header_timeout"`
-	ProxyReadTimeout              int        `json:"proxy_read_timeout"`
-	ProxyWriteTimeout             int        `json:"proxy_write_timeout"`
-	ProxyStreamTimeout            int        `json:"proxy_stream_timeout"`
-	ProxyFlushInterval            int        `json:"proxy_flush_interval"`
-	ProxyStreamCloseDelay         int        `json:"proxy_stream_close_delay"`
-	PathRules                     []PathRule `json:"path_rules"`
-	Upstreams                     []Upstream `json:"upstreams"`
-	HostHeader                    string     `json:"host_header"`
-	EnableTLS                     bool       `json:"enable_tls"`
-	TLSSource                     string     `json:"tls_source"`
-	ACMEConfigID                  int        `json:"acme_config_id"`
-	CAProviderID                  int        `json:"ca_provider_id"`
-	TLSCert                       string     `json:"tls_cert,omitempty"`
-	TLSKey                        string     `json:"tls_key,omitempty"`
+	ID                            int    `json:"id"`
+	CaddyID                       string `json:"caddy_id"`
+	Name                          string `json:"name"`
+	Description                   string `json:"description"`
+	Protocol                      string `json:"protocol"`
+	Domain                        string `json:"domain"`
+	ListenPort                    int    `json:"listen_port"`
+	Strategy                      string `json:"strategy"`
+	DynamicDNS                    bool   `json:"dynamic_dns"`
+	EnableDnsServer               bool   `json:"enable_dns_server"`
+	DnsServer                     string `json:"dns_server"`
+	DnsFamily                     string `json:"dns_family"`
+	HealthCheckPath               string `json:"health_check_path"`
+	HealthCheckInterval           int    `json:"health_check_interval"`
+	HealthCheckTimeout            int    `json:"health_check_timeout"`
+	HealthCheckUnhealthyThreshold int    `json:"health_check_unhealthy_threshold"`
+	HealthCheckHealthyThreshold   int    `json:"health_check_healthy_threshold"`
+	EnableActiveHealthCheck       bool   `json:"enable_active_health_check"`
+	TCPHealthCheckPort            int    `json:"tcp_health_check_port"`
+	TCPProxyProtocol              bool   `json:"tcp_proxy_protocol"`
+	TCPTryDuration                int    `json:"tcp_try_duration"`
+	TCPTryInterval                int    `json:"tcp_try_interval"`
+	RequestBodyMaxSizeMB          int    `json:"request_body_max_size_mb"`
+	UpstreamKeepaliveTimeout      int    `json:"upstream_keepalive_timeout"`
+	ServerTokensHidden            int    `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
+	// 链式回退（strategy=chain_fallback，仅 HTTP）竞速参数（2026-10-09）：
+	// ChainRaceIntervalMS 竞速间隔——等待该时长无有效响应即并行发出下一路；
+	// ChainRequestTimeoutMS 单请求兜底截断——超过该时长未收到响应头即取消
+	// 该路。0 值在写侧（CreateRule/UpdateRule）与渲染侧兜底 3000/30000
+	//（预算公式：(N−1)×race+timeout ≤ 60s，按 N=6 封顶设计，见 caddy.go）。
+	ChainRaceIntervalMS        int        `json:"chain_race_interval_ms"`
+	ChainRequestTimeoutMS      int        `json:"chain_request_timeout_ms"`
+	CustomRoutesEnabled        bool       `json:"custom_routes_enabled"`
+	ProxyDialTimeout           int        `json:"proxy_dial_timeout"`
+	ProxyResponseHeaderTimeout int        `json:"proxy_response_header_timeout"`
+	ProxyReadTimeout           int        `json:"proxy_read_timeout"`
+	ProxyWriteTimeout          int        `json:"proxy_write_timeout"`
+	ProxyStreamTimeout         int        `json:"proxy_stream_timeout"`
+	ProxyFlushInterval         int        `json:"proxy_flush_interval"`
+	ProxyStreamCloseDelay      int        `json:"proxy_stream_close_delay"`
+	PathRules                  []PathRule `json:"path_rules"`
+	Upstreams                  []Upstream `json:"upstreams"`
+	HostHeader                 string     `json:"host_header"`
+	EnableTLS                  bool       `json:"enable_tls"`
+	TLSSource                  string     `json:"tls_source"`
+	ACMEConfigID               int        `json:"acme_config_id"`
+	CAProviderID               int        `json:"ca_provider_id"`
+	TLSCert                    string     `json:"tls_cert,omitempty"`
+	TLSKey                     string     `json:"tls_key,omitempty"`
 	// TLSCertPath/TLSKeyPath 引用型证书（tls_source="file"）：直接引用程序可读写
 	// 目录（/app/certs）内的成品证书文件，不复制、不落 PEM 到库（2026-10-09）。
 	TLSCertPath string `json:"tls_cert_path,omitempty"`
@@ -444,46 +451,53 @@ type UpdateAPIKeyRequest struct {
 }
 
 type CreateRuleRequest struct {
-	Name                          string     `json:"name" binding:"required"`
-	Description                   string     `json:"description"`
-	Protocol                      string     `json:"protocol" binding:"required"`
-	Domain                        string     `json:"domain"`
-	ListenPort                    int        `json:"listen_port"`
-	Strategy                      string     `json:"strategy"`
-	DynamicDNS                    bool       `json:"dynamic_dns"`
-	EnableDnsServer               bool       `json:"enable_dns_server"`
-	DnsServer                     string     `json:"dns_server"`
-	DnsFamily                     string     `json:"dns_family"`
-	HealthCheckPath               string     `json:"health_check_path"`
-	HealthCheckInterval           int        `json:"health_check_interval"`
-	HealthCheckTimeout            int        `json:"health_check_timeout"`
-	HealthCheckUnhealthyThreshold int        `json:"health_check_unhealthy_threshold"`
-	HealthCheckHealthyThreshold   int        `json:"health_check_healthy_threshold"`
-	EnableActiveHealthCheck       bool       `json:"enable_active_health_check"`
-	TCPHealthCheckPort            int        `json:"tcp_health_check_port"`
-	TCPProxyProtocol              bool       `json:"tcp_proxy_protocol"`
-	TCPTryDuration                int        `json:"tcp_try_duration"`
-	TCPTryInterval                int        `json:"tcp_try_interval"`
-	RequestBodyMaxSizeMB          int        `json:"request_body_max_size_mb"`
-	UpstreamKeepaliveTimeout      int        `json:"upstream_keepalive_timeout"`
-	ServerTokensHidden            int        `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
-	CustomRoutesEnabled           bool       `json:"custom_routes_enabled"`
-	ProxyDialTimeout              int        `json:"proxy_dial_timeout"`
-	ProxyResponseHeaderTimeout    int        `json:"proxy_response_header_timeout"`
-	ProxyReadTimeout              int        `json:"proxy_read_timeout"`
-	ProxyWriteTimeout             int        `json:"proxy_write_timeout"`
-	ProxyStreamTimeout            int        `json:"proxy_stream_timeout"`
-	ProxyFlushInterval            int        `json:"proxy_flush_interval"`
-	ProxyStreamCloseDelay         int        `json:"proxy_stream_close_delay"`
-	PathRules                     []PathRule `json:"path_rules"`
-	HostHeader                    string     `json:"host_header"`
-	Upstreams                     []Upstream `json:"upstreams" binding:"required"`
-	EnableTLS                     bool       `json:"enable_tls"`
-	TLSSource                     string     `json:"tls_source"`
-	ACMEConfigID                  int        `json:"acme_config_id"`
-	CAProviderID                  int        `json:"ca_provider_id"`
-	TLSCert                       string     `json:"tls_cert"`
-	TLSKey                        string     `json:"tls_key"`
+	Name                          string `json:"name" binding:"required"`
+	Description                   string `json:"description"`
+	Protocol                      string `json:"protocol" binding:"required"`
+	Domain                        string `json:"domain"`
+	ListenPort                    int    `json:"listen_port"`
+	Strategy                      string `json:"strategy"`
+	DynamicDNS                    bool   `json:"dynamic_dns"`
+	EnableDnsServer               bool   `json:"enable_dns_server"`
+	DnsServer                     string `json:"dns_server"`
+	DnsFamily                     string `json:"dns_family"`
+	HealthCheckPath               string `json:"health_check_path"`
+	HealthCheckInterval           int    `json:"health_check_interval"`
+	HealthCheckTimeout            int    `json:"health_check_timeout"`
+	HealthCheckUnhealthyThreshold int    `json:"health_check_unhealthy_threshold"`
+	HealthCheckHealthyThreshold   int    `json:"health_check_healthy_threshold"`
+	EnableActiveHealthCheck       bool   `json:"enable_active_health_check"`
+	TCPHealthCheckPort            int    `json:"tcp_health_check_port"`
+	TCPProxyProtocol              bool   `json:"tcp_proxy_protocol"`
+	TCPTryDuration                int    `json:"tcp_try_duration"`
+	TCPTryInterval                int    `json:"tcp_try_interval"`
+	RequestBodyMaxSizeMB          int    `json:"request_body_max_size_mb"`
+	UpstreamKeepaliveTimeout      int    `json:"upstream_keepalive_timeout"`
+	ServerTokensHidden            int    `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
+	// 链式回退（strategy=chain_fallback，仅 HTTP）竞速参数（2026-10-09）：
+	// ChainRaceIntervalMS 竞速间隔——等待该时长无有效响应即并行发出下一路；
+	// ChainRequestTimeoutMS 单请求兜底截断——超过该时长未收到响应头即取消
+	// 该路。0 值在写侧（CreateRule/UpdateRule）与渲染侧兜底 3000/30000
+	//（预算公式：(N−1)×race+timeout ≤ 60s，按 N=6 封顶设计，见 caddy.go）。
+	ChainRaceIntervalMS        int        `json:"chain_race_interval_ms"`
+	ChainRequestTimeoutMS      int        `json:"chain_request_timeout_ms"`
+	CustomRoutesEnabled        bool       `json:"custom_routes_enabled"`
+	ProxyDialTimeout           int        `json:"proxy_dial_timeout"`
+	ProxyResponseHeaderTimeout int        `json:"proxy_response_header_timeout"`
+	ProxyReadTimeout           int        `json:"proxy_read_timeout"`
+	ProxyWriteTimeout          int        `json:"proxy_write_timeout"`
+	ProxyStreamTimeout         int        `json:"proxy_stream_timeout"`
+	ProxyFlushInterval         int        `json:"proxy_flush_interval"`
+	ProxyStreamCloseDelay      int        `json:"proxy_stream_close_delay"`
+	PathRules                  []PathRule `json:"path_rules"`
+	HostHeader                 string     `json:"host_header"`
+	Upstreams                  []Upstream `json:"upstreams" binding:"required"`
+	EnableTLS                  bool       `json:"enable_tls"`
+	TLSSource                  string     `json:"tls_source"`
+	ACMEConfigID               int        `json:"acme_config_id"`
+	CAProviderID               int        `json:"ca_provider_id"`
+	TLSCert                    string     `json:"tls_cert"`
+	TLSKey                     string     `json:"tls_key"`
 	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件路径（2026-10-09）。
 	TLSCertPath     string `json:"tls_cert_path"`
 	TLSKeyPath      string `json:"tls_key_path"`
@@ -527,13 +541,17 @@ type UpdateRuleRequest struct {
 	// 零值落库（tcp_try_duration 0=不重试、tcp_try_interval 0=Caddy 默认间隔、
 	// tcp_health_check_port 0=跟随上游端口）。此前非指针 int 的「0=沿用存量」
 	// 合并使显式清零永不可达。
-	TCPHealthCheckPort         *int        `json:"tcp_health_check_port"`
-	TCPProxyProtocol           *bool       `json:"tcp_proxy_protocol"`
-	TCPTryDuration             *int        `json:"tcp_try_duration"`
-	TCPTryInterval             *int        `json:"tcp_try_interval"`
-	RequestBodyMaxSizeMB       *int        `json:"request_body_max_size_mb"`
-	UpstreamKeepaliveTimeout   *int        `json:"upstream_keepalive_timeout"`
-	ServerTokensHidden         *int        `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
+	TCPHealthCheckPort       *int  `json:"tcp_health_check_port"`
+	TCPProxyProtocol         *bool `json:"tcp_proxy_protocol"`
+	TCPTryDuration           *int  `json:"tcp_try_duration"`
+	TCPTryInterval           *int  `json:"tcp_try_interval"`
+	RequestBodyMaxSizeMB     *int  `json:"request_body_max_size_mb"`
+	UpstreamKeepaliveTimeout *int  `json:"upstream_keepalive_timeout"`
+	ServerTokensHidden       *int  `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
+	// 链式回退竞速参数（LB-02 口径）：指针化——省略（nil）=保留原值，
+	// 显式 0=落库 0（写侧/渲染侧按 chain 策略兜底 3000/30000）。
+	ChainRaceIntervalMS        *int        `json:"chain_race_interval_ms"`
+	ChainRequestTimeoutMS      *int        `json:"chain_request_timeout_ms"`
 	CustomRoutesEnabled        *bool       `json:"custom_routes_enabled"`
 	ProxyDialTimeout           *int        `json:"proxy_dial_timeout"`
 	ProxyResponseHeaderTimeout *int        `json:"proxy_response_header_timeout"`

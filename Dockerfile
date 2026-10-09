@@ -27,6 +27,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       --with github.com/mholt/caddy-ratelimit@v0.1.0 \
       --with github.com/corazawaf/coraza-caddy/v2@v2.6.1 \
       --with lazy-balancer-v2/caddygeoip=./caddygeoip \
+      --with lazy-balancer-v2/caddychain=./caddychain \
       --with lazy-balancer-v2/caddydeps=./caddydeps \
       --with lazy-balancer-v2/wafiplist=./wafiplist; then \
       built=1; break; \
