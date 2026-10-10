@@ -1573,7 +1573,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 
 	// Validate TLS certificate if provided (manual source only)
 	var certWarnings []string
-	if *req.EnableTLS && req.TLSSource != "manual" && req.TLSSource != "acme_dns" {
+	if *req.EnableTLS && req.TLSSource != "manual" && req.TLSSource != "acme_dns" && req.TLSSource != "file" {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"})
 		return
 	}
