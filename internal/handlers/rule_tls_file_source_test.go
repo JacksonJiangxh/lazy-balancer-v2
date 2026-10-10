@@ -150,3 +150,54 @@ func TestCreateRule_referencedCertMismatchedPairRejected(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
 	}
 }
+
+// Given: 存量规则（manual 来源）与证书目录内一对合法成品证书
+// When: 通过 PUT 切换到 tls_source=file 并提交容器内路径
+// Then: 更新成功且 PEM 内容摄取入库——守卫以 CreateRule 同口径放过 file 来源
+// （回归：UpdateRule 的来源白名单曾漏列 file，导致前端「引用证书文件」保存恒 400）
+func TestUpdateRule_referencedCertFileIngestsContent(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	dir := t.TempDir()
+	restore := services.SetCertDirForTest(dir)
+	t.Cleanup(restore)
+	certPath, keyPath := writeReferencedPair(t, dir, "file-update.test")
+	wantCertPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("read source cert: %v", err)
+	}
+
+	seedAuditRule(t, "lb_file_update", "file-update", "file-update.test", 19445, true, "manual", false)
+	seedAuditUpstream(t, "lb_file_update")
+
+	payload := map[string]any{
+		"enable_tls":    true,
+		"tls_source":    "file",
+		"tls_cert_path": certPath,
+		"tls_key_path":  keyPath,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_file_update", strings.NewReader(string(body)))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s, want 200 (file 来源不应被来源白名单拒绝)", response.Code, response.Body.String())
+	}
+	var storedSource, storedCert, storedKey string
+	if err := db.DB.QueryRow(`SELECT tls_source, COALESCE(tls_cert,''), COALESCE(tls_key,'')
+		FROM lb_rules WHERE caddy_id='lb_file_update'`).Scan(&storedSource, &storedCert, &storedKey); err != nil {
+		t.Fatalf("read persisted rule: %v", err)
+	}
+	if storedSource != "file" {
+		t.Fatalf("tls_source=%q, want file", storedSource)
+	}
+	if storedCert != string(wantCertPEM) || storedKey == "" {
+		t.Fatalf("file 模式应摄取 PEM 内容入库, certEmpty=%v keyEmpty=%v", storedCert == "", storedKey == "")
+	}
+}
