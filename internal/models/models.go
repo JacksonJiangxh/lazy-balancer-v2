@@ -304,10 +304,6 @@ type PathRuleUpstream struct {
 	Port     int    `json:"port"`
 	Weight   int    `json:"weight"`
 	Protocol string `json:"protocol"`
-	// HostHeader 该自定义路由上游的回源 Host（2026-10-10）：前端从「基础设置」
-	// 同 host:port 的上游预填固化，渲染侧同上游口径三级回退（本值 > 规则级
-	// host_header > 上游自身地址）。空=回退规则级/自身。
-	HostHeader string `json:"host_header"`
 }
 
 // PathRuleAction 路径规则的处理方式。

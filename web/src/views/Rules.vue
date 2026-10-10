@@ -716,7 +716,7 @@
 
         <!-- Step 3: 自定义路由（仅 HTTP 且启用时显示） -->
         <div v-show="currentStep === WIZARD_STEP.CUSTOM_ROUTES" class="step-content">
-          <PathRulesEditor v-if="showCustomRoutesStep" v-model="wizardForm.path_rules" :rule-upstreams="wizardForm.upstreams" />
+          <PathRulesEditor v-if="showCustomRoutesStep" v-model="wizardForm.path_rules" />
         </div>
 
         <!-- Step 4: 高级选项 -->
@@ -1007,26 +1007,7 @@
             </template>
           </el-table-column>
         </el-table>
-
-        <!-- 自定义路由上游（仅自定义路由开启且携带上游时展示）：路径规则各自
-             的回源 Host 与主上游同口径三级回退，列出来便于排查回源域名不符。 -->
-        <template v-if="ruleConfig?.protocol === 'http' && ruleConfig?.custom_routes_enabled">
-          <el-divider content-position="left">自定义路由上游</el-divider>
-          <el-table :data="configPathRuleUpstreams" size="small" border v-if="configPathRuleUpstreams.length">
-            <el-table-column prop="path" label="路径" />
-            <el-table-column prop="address" label="主机地址" />
-            <el-table-column prop="port" label="端口" align="center" />
-            <el-table-column prop="protocol" label="协议" align="center">
-              <template #default="{ row }">
-                <el-tag size="small" :type="row.protocol === 'https' ? 'warning' : 'primary'">{{ row.protocol || 'http' }}</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="回源Host">
-              <template #default="{ row }">{{ row.host_header || '跟随规则/自身地址' }}</template>
-            </el-table-column>
-          </el-table>
-        </template>
-
+        
         <el-divider content-position="left">Caddy 配置 (JSON)</el-divider>
         <el-empty v-if="ruleConfig.config_not_exists" description="配置不存在" :image-size="60" />
         <SyntaxHighlight v-else :content="JSON.stringify(ruleConfig.config, null, 2)" language="json" />
@@ -1282,9 +1263,6 @@ interface RuleConfigView {
   upstream_keepalive_timeout: number
   server_tokens_hidden: number
   upstreams: Upstream[]
-  // 自定义路由（查看配置弹框的「自定义路由上游」分组消费）
-  custom_routes_enabled?: boolean
-  path_rules?: PathRule[]
   enabled: boolean
   config: object | null
   config_not_exists: boolean
@@ -1716,19 +1694,6 @@ let ruleLogRequestSeq = 0
 
 const ruleLogHtml = computed(() => ansiToHtml(ruleLogContent.value || '暂无日志'))
 const ruleConfig = ref<RuleConfigView | null>(null)
-
-// 查看配置弹框的「自定义路由上游」扁平投影：路径规则 × 其上游（继承主上游的
-// 路径行不展开——那些上游已在「上游服务器」表里列出）。
-const configPathRuleUpstreams = computed<Array<PathRuleUpstream & { path: string }>>(() => {
-  const rows: Array<PathRuleUpstream & { path: string }> = []
-  for (const pathRule of ruleConfig.value?.path_rules || []) {
-    if (pathRule.action === 'respond' || !pathRule.upstreams) continue
-    for (const upstream of pathRule.upstreams) {
-      rows.push({ ...upstream, path: pathRule.path })
-    }
-  }
-  return rows
-})
 
 // R69 结构性简化（D 域 2(e)）：四方 host 门的核心谓词单源化——红框/常驻警告/
 // 步进门三条腿此前手工维护同一条件（R67 D-1 的消息腿落后一轮正是该维护风险

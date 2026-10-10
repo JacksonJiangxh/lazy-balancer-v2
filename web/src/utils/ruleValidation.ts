@@ -3,8 +3,6 @@ type PathUpstreamInput = {
   readonly address: string
   readonly port: number
   readonly weight: number
-  // 该自定义路由上游的回源 Host（可选以兼容历史调用方）；空=回退规则级/自身
-  readonly host_header?: string
 }
 
 type PathRuleInput = {
@@ -118,9 +116,6 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
       if (!upstream.address.trim()) return `第 ${rowNumber} 条路径的自定义上游地址不能为空`
       if (upstream.port < 1 || upstream.port > 65535) return `第 ${rowNumber} 条路径的自定义上游端口无效`
       if (upstream.weight < 1) return `第 ${rowNumber} 条路径的自定义上游权重必须大于 0`
-      // 回源 Host 直写 reverse_proxy 的 Host 头/SNI，与后端同口径拒绝不可见字符
-      // （CRLF 注入防护；LB40-5）。空白即未设置，允许。
-      if (/[\u0000-\u001f\u007f]/.test(upstream.host_header ?? '')) return `第 ${rowNumber} 条路径的自定义上游回源Host含非法字符`
     }
   }
   return null

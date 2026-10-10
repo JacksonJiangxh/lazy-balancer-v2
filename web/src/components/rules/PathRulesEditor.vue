@@ -168,48 +168,24 @@
             <span>协议</span>
             <span>地址</span>
             <span>端口</span>
-            <span>回源Host</span>
             <span>权重 %</span>
             <span>操作</span>
           </div>
           <div v-for="(upstream, upstreamIndex) in rule.upstreams" :key="upstreamIndex" class="upstream-grid upstream-row">
             <label class="upstream-field">
               <span class="mobile-field-label">协议</span>
-              <el-select v-model="upstream.protocol" size="small" aria-label="协议" @change="onUpstreamIdentityChange(upstream)">
+              <el-select v-model="upstream.protocol" size="small" aria-label="协议">
                 <el-option value="http" label="HTTP" />
                 <el-option value="https" label="HTTPS" />
               </el-select>
             </label>
             <label class="upstream-field upstream-address-field">
               <span class="mobile-field-label">地址</span>
-              <el-input
-                v-model="upstream.address"
-                size="small"
-                :aria-label="`路径规则 ${index + 1} 自定义上游 ${upstreamIndex + 1} 地址`"
-                placeholder="IP 或域名"
-                @blur="onUpstreamIdentityChange(upstream)"
-              />
+              <el-input v-model="upstream.address" size="small" :aria-label="`路径规则 ${index + 1} 自定义上游 ${upstreamIndex + 1} 地址`" placeholder="IP 或域名" />
             </label>
             <label class="upstream-field">
               <span class="mobile-field-label">端口</span>
-              <el-input-number
-                v-model="upstream.port"
-                size="small"
-                :min="1"
-                :max="65535"
-                aria-label="端口"
-                controls-position="right"
-                @change="onUpstreamIdentityChange(upstream)"
-              />
-            </label>
-            <label class="upstream-field upstream-host-field">
-              <span class="mobile-field-label">回源Host</span>
-              <el-input
-                v-model="upstream.host_header"
-                size="small"
-                :aria-label="`路径规则 ${index + 1} 自定义上游 ${upstreamIndex + 1} 回源Host`"
-                placeholder="留空=跟随规则/自身"
-              />
+              <el-input-number v-model="upstream.port" size="small" :min="1" :max="65535" aria-label="端口" controls-position="right" />
             </label>
             <label class="upstream-field">
               <span class="mobile-field-label">权重</span>
@@ -230,18 +206,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
 import { ArrowDown, ArrowUp, Delete, Plus, QuestionFilled } from '@element-plus/icons-vue'
-import type { PathRule, PathRuleUpstream, UpstreamInput } from '@/types'
+import type { PathRule, PathRuleUpstream } from '@/types'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, redistributeWeight } from '@/utils/upstreamWeights'
 import { canonicalPathKey } from '@/utils/ruleValidation'
 
 const pathRules = defineModel<PathRule[]>({ required: true })
-
-// ruleUpstreams：规则「基础设置」里的默认上游——仅用于新建自定义路由上游时
-// 按 host:port 预填回源 Host（见下方 defaultHostHeaderIndex）。向导步骤间共享
-// 同一份表单数据，此处只读消费。
-const props = withDefaults(defineProps<{ ruleUpstreams?: UpstreamInput[] }>(), { ruleUpstreams: () => [] })
 
 // ── 静态响应（2026-10-09）：由本程序直接返回，字段与后端 services/caddy.go 的
 // respondStatusCodes / staticResponseHandler 同源（状态码白名单与必备响应头）。──
@@ -418,57 +388,10 @@ const moveRule = (index: number, direction: -1 | 1): void => {
   normalizeOrder()
 }
 
-const defaultUpstream = (): PathRuleUpstream => ({ protocol: 'http', address: '', port: 80, weight: 100, host_header: '' })
-
-// 回源 Host 预填（2026-10-10 用户裁定）：自定义路由若选了「上游服务器」，回源
-// Host 应遵循该上游自己配的回源 Host，而非「基本配置」的后端域名。上游定义在
-// 基础设置里，此处按 host:port 从规则默认上游取一份固化进本行——保存后即离线
-// 可用（后端不回查 upstreams 表，集群/备份/导入天然携带）。留空即三级回退。
-const upstreamKey = (protocol: string | undefined, address: string, port: number): string =>
-  `${(protocol || '').toLowerCase()}://${(address || '').trim().toLowerCase()}:${port}`
-
-// 规则默认上游的 host:port → host_header 索引（含协议与免协议两种键，任一侧
-// 匹配即预填——基础设置里的上游协议与自定义路由行可能不同）。
-const defaultHostHeaderIndex = computed<Map<string, string>>(() => {
-  const index = new Map<string, string>()
-  for (const upstream of props.ruleUpstreams || []) {
-    const hostHeader = (upstream.host_header || '').trim()
-    if (!hostHeader) continue
-    index.set(upstreamKey(upstream.protocol, upstream.host, upstream.port), hostHeader)
-    index.set(upstreamKey(undefined, upstream.host, upstream.port), hostHeader)
-  }
-  return index
-})
-
-const prefillHostHeader = (upstream: PathRuleUpstream): void => {
-  const byProtocol = defaultHostHeaderIndex.value.get(upstreamKey(upstream.protocol, upstream.address, upstream.port))
-  upstream.host_header = byProtocol ?? defaultHostHeaderIndex.value.get(upstreamKey(undefined, upstream.address, upstream.port)) ?? ''
-}
-
-// 地址/端口（或协议）落定后补预填：新建行初值为空地址，无从匹配，待用户填完
-// 才可能对上基础设置的某条上游。仅补空白值，不覆盖用户已手填的内容。
-const onUpstreamIdentityChange = (upstream: PathRuleUpstream): void => {
-  if ((upstream.host_header || '').trim() !== '') return
-  prefillHostHeader(upstream)
-}
+const defaultUpstream = (): PathRuleUpstream => ({ protocol: 'http', address: '', port: 80, weight: 100 })
 
 const toggleCustomUpstreams = (rule: PathRule, enabled: string | number | boolean): void => {
-  if (!Boolean(enabled)) {
-    rule.upstreams = null
-    return
-  }
-  const seeded = defaultUpstream()
-  // 规则恰有一个默认上游时（绝大多数场景），直接把地址/端口/回源 Host 带过来：
-  // 用户不用重敲一遍，且「继承该上游的回源 Host」这条语义天然兑现。多个默认上游
-  // 时有歧义，留空由用户选定后经 onUpstreamIdentityChange 预填。
-  if (props.ruleUpstreams?.length === 1) {
-    const only = props.ruleUpstreams[0]!
-    seeded.protocol = only.protocol === 'https' ? 'https' : 'http'
-    seeded.address = only.host || ''
-    seeded.port = only.port || 80
-    seeded.host_header = (only.host_header || '').trim()
-  }
-  rule.upstreams = [seeded]
+  rule.upstreams = Boolean(enabled) ? [defaultUpstream()] : null
 }
 
 const addUpstream = (rule: PathRule): void => {
@@ -532,7 +455,7 @@ const onWeightChange = (rule: PathRule, index: number): void => {
 .respond-note { padding: 2px 0; }
 .custom-upstream-title { color: var(--el-text-color-regular); font-size: 13px; }
 .custom-upstream-editor { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-secondary); }
-.upstream-grid { display: grid; grid-template-columns: minmax(0, 0.42fr) minmax(0, 1fr) minmax(0, 0.36fr) minmax(0, 0.7fr) minmax(0, 0.36fr) auto; align-items: center; gap: 8px; }
+.upstream-grid { display: grid; grid-template-columns: minmax(0, 0.45fr) minmax(0, 1fr) minmax(0, 0.4fr) minmax(0, 0.4fr) auto; align-items: center; gap: 8px; }
 .upstream-grid-header { color: var(--text-secondary); font-size: 12px; font-weight: 500; }
 .upstream-field { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
 .upstream-field :deep(.el-input-number) { width: 100%; }
@@ -547,7 +470,6 @@ const onWeightChange = (rule: PathRule, index: number): void => {
   .match-type-select { width: 100%; }
   .upstream-grid-header { display: none; }
   .upstream-row { grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr); align-items: end; padding-top: 8px; border-top: 1px solid var(--border); }
-  .upstream-address-field, .upstream-host-field { grid-column: 1 / -1; }
   .upstream-row:first-of-type { padding-top: 0; border-top: 0; }
   .mobile-field-label { display: inline; }
   .upstream-row > .el-button { justify-self: end; }
