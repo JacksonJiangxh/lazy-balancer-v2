@@ -4,10 +4,13 @@
 #   1) vscode：仓库页面「云原生开发」按钮 → 远程开发环境（Go 1.26 + Node 22 + sqlite）
 #   2) web_trigger_docker_build：页面自定义按钮（见 .cnb/web_trigger.yml）→
 #      amd64/arm64 原生并行构建镜像 → 探活 → 推送 → 合成多架构 manifest
+#      → 再把 latest 多架构镜像额外镜像一份到 xzydm/mirrors 仓库
 #
 # 适配约定：仓库名、镜像源一律走内置变量（${CNB_REPO_SLUG_LOWERCASE} /
 # ${CNB_REPO_NAME_LOWERCASE} / ${CNB_DOCKER_REGISTRY}），**零硬编码仓库名**，
-# 本文件可直接复制到任意 CNB 仓库使用。
+# 本文件可直接复制到任意 CNB 仓库使用。唯一例外是 mirror 目标仓库
+# （manifest 作业的 MIRROR_REPO_SLUG），它必须显式指向一个外部仓库；
+# 置空即关闭镜像，复制本文件到其它仓库时按需修改或留空。
 #
 # 两者都必须写在 `$`（兜底分支）下：vscode 属仓库级事件（与分支无关），
 # web_trigger 也建议放兜底分支以免漏配分支。
@@ -247,6 +250,15 @@ $:
         - docker
       env:
         IMAGE_BASE: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}
+        # 额外镜像（mirror）目标仓库。这是本文件唯一一处硬编码仓库名——因为
+        # 「把镜像再推一份到另一个仓库」本质上就指向一个外部仓库，无法由
+        # ${CNB_REPO_SLUG_LOWERCASE} 推导。与源同属 docker.cnb.cool 同一 registry，
+        # 只是换到 mirrors 仓库的命名空间下（非同名制品，路径 = 仓库路径/制品名），
+        # 故无需第二套凭据，仍用当前构建的 cnb:${CNB_TOKEN}；前提是触发者
+        # 对该仓库有写权限。改成空串即可关闭镜像。
+        MIRROR_REPO_SLUG: xzydm/mirrors
+        # 空串表示不镜像；非空时镜像到该仓库下的同名制品
+        MIRROR_BASE: ${CNB_DOCKER_REGISTRY}/${MIRROR_REPO_SLUG}/${CNB_REPO_NAME_LOWERCASE}
       stages:
         - name: await the amd64
           type: cnb:await
@@ -291,6 +303,26 @@ $:
             platforms:
               - linux/amd64
               - linux/arm64
+        # 把刚合成的 latest 多架构镜像额外复制一份到 `xzydm/mirrors` 仓库。
+        # 用 buildx imagetools create 做 registry→registry 复制：它按 manifest list
+        # 逐个子 manifest/layer 搬运，不落地本地 daemon，比 pull + retag + push
+        # （本机再拉一次 ~几百 MB 层）更快，也天然保留多架构索引。
+        # 只镜像 latest（版本号 tag 保持仅在源仓库存在，避免镜像仓里堆一摞历史版本）。
+        - name: mirror latest to mirrors repo
+          timeout: 30m
+          script: |
+            set -e
+            # MIRROR_REPO_SLUG 置空即关闭镜像，方便本文件被别的仓库直接复用
+            if [ -z "${MIRROR_REPO_SLUG}" ]; then
+              echo ">>> MIRROR_REPO_SLUG 为空，跳过 mirror"
+              exit 0
+            fi
+            echo ">>> mirror ${IMAGE_BASE}:latest -> ${MIRROR_BASE}:latest"
+            docker buildx imagetools create \
+              -t ${MIRROR_BASE}:latest \
+              ${IMAGE_BASE}:latest
+            echo ">>> mirror 完成"
+            docker buildx imagetools inspect ${MIRROR_BASE}:latest
         - name: remove tag
           type: artifact:remove-tag
           options:
