@@ -363,9 +363,12 @@
               <el-input-number v-model="wizardForm.listen_port" :min="1" :max="65535" controls-position="right" @change="userExplicitPort = true" />
               <span class="form-tip-inline">
                 <span v-if="portWarning" class="port-warning">{{ portWarning }}</span>
-                <span v-else-if="wizardForm.protocol === 'http'">建议使用 80 或其他非保留端口</span>
+                <span v-else-if="wizardForm.protocol === 'http'">建议使用 {{ proxyPorts.http_port }} 或其他非保留端口</span>
                 <span v-else>建议使用 10000-60000 范围内的端口</span>
               </span>
+              <!-- 存量规则端口提示（ISSUE #7）：部署默认口已改、但本条规则仍是旧端口时，
+                   明示「保存即按当前值落库」——不会被自动迁移，改了才覆盖。 -->
+              <div v-if="stalePortHint" class="form-tip-line">{{ stalePortHint }}</div>
             </el-form-item>
 
             <el-form-item label="后端域名" v-if="wizardForm.protocol === 'http'">
@@ -1355,6 +1358,24 @@ class CertInfoRefreshError extends Error {
 }
 
 const rules = ref<Rule[]>([])
+// 部署侧代理默认口与面板口（HTTP_PORT/HTTPS_PORT/PANEL_PORT，ISSUE #7）。
+// 出厂默认与后端一致；onMounted 拉取 /system/ports 后覆盖——保证「compose 改了
+// 变量、面板向导默认值随动」不割裂。只影响默认语义，不迁移存量规则的 listen_port。
+const proxyPorts = ref({ http_port: 80, https_port: 443, panel_port: 8000 })
+const fetchProxyPorts = async () => {
+  try {
+    const res = await request.get<APIResponse<{ http_port: number; https_port: number; panel_port: number }>>('/system/ports', { silent: true })
+    if (res.code === 0 && res.data) {
+      proxyPorts.value = {
+        http_port: res.data.http_port || 80,
+        https_port: res.data.https_port || 443,
+        panel_port: res.data.panel_port || 8000,
+      }
+    }
+  } catch {
+    // 装饰性预取失败保出厂默认
+  }
+}
 // v2.2.0：一规则可绑多策略——/security/bindings 返回 rule_caddy_id → 绑定数组（policy_id ASC）。
 
 const securityBindings = ref<Record<string, SecurityStageBinding[]>>({})
@@ -1894,7 +1915,9 @@ const wizardForm = reactive<RuleForm>({
   description: '',
   protocol: 'http',
   domain: '',
-  listen_port: 80,
+  // 初值随部署 HTTP 默认口（/system/ports 异步返回后由 resetWizard/新建流程再赋值；
+  // 此初值仅为挂载前的占位，出厂 80）
+  listen_port: proxyPorts.value.http_port,
   strategy: 'weighted_round_robin',
   // 链式回退竞速参数（strategy=chain_fallback 时消费；默认按 N=6 封顶 +
   // 浏览器 60s 等待约束设计：5×3s+30s=45s < 60s）
@@ -1974,23 +1997,25 @@ let preTcpSnapshot: { listenPort: number; enableTls: boolean } | null = null
 watch(() => wizardForm.enable_tls, (newVal, oldVal) => {
   if (hydratingWizard) return
   // 编辑态下端口不做自动迁移（保留已提交配置），但 TLS 开关与非常态端口组合时给出非静默提示
-  if (newVal && !oldVal && userExplicitPort.value && wizardForm.listen_port === 80) {
-    showTlsHint('端口当前为 80，如需 HTTPS 访问建议改为 443')
+  const defHttp = proxyPorts.value.http_port
+  const defHttps = proxyPorts.value.https_port
+  if (newVal && !oldVal && userExplicitPort.value && wizardForm.listen_port === defHttp) {
+    showTlsHint(`端口当前为 ${defHttp}，如需 HTTPS 访问建议改为 ${defHttps}`)
   }
-  if (!newVal && oldVal && userExplicitPort.value && wizardForm.listen_port === 443) {
-    showTlsHint('端口当前为 443，关闭 TLS 后如需 HTTP 访问建议改为 80')
+  if (!newVal && oldVal && userExplicitPort.value && wizardForm.listen_port === defHttps) {
+    showTlsHint(`端口当前为 ${defHttps}，关闭 TLS 后如需 HTTP 访问建议改为 ${defHttp}`)
   }
   if (userExplicitPort.value) return
   if (wizardForm.protocol !== 'http') return
   if (newVal && !oldVal) {
-    // Enabling HTTPS: default to 443 if currently using the HTTP default 80
-    if (wizardForm.listen_port === 80) {
-      wizardForm.listen_port = 443
+    // Enabling HTTPS: default to HTTPS 默认口 if currently using the HTTP 默认口
+    if (wizardForm.listen_port === defHttp) {
+      wizardForm.listen_port = defHttps
     }
   } else if (!newVal && oldVal) {
-    // Disabling HTTPS: revert to 80 if currently 443
-    if (wizardForm.listen_port === 443) {
-      wizardForm.listen_port = 80
+    // Disabling HTTPS: revert to HTTP 默认口 if currently on HTTPS 默认口
+    if (wizardForm.listen_port === defHttps) {
+      wizardForm.listen_port = defHttp
     }
   }
 }, { flush: 'sync' })
@@ -2003,8 +2028,8 @@ watch(() => wizardForm.protocol, (newVal, oldVal) => {
     // 快照进入 TCP 前的 HTTP 态（须先于下方端口/ enable_tls 变更），供回转提示判断
     preTcpSnapshot = { listenPort: wizardForm.listen_port, enableTls: wizardForm.enable_tls }
     // Switching to TCP: use a neutral high port and plain TCP upstreams.
-    // 无条件迁移：DB 中不存在 TCP:80/443 存量规则（后端无条件拒绝），编辑态无需保留该值
-    if (wizardForm.listen_port === 80 || wizardForm.listen_port === 443) {
+    // 无条件迁移：DB 中不存在 TCP:HTTP/HTTPS 默认口存量规则（后端无条件拒绝），编辑态无需保留该值
+    if (wizardForm.listen_port === proxyPorts.value.http_port || wizardForm.listen_port === proxyPorts.value.https_port) {
       wizardForm.listen_port = 8080
       ElMessage.info('已切换为 TCP，监听端口自动调整为 8080')
     }
@@ -2021,7 +2046,7 @@ watch(() => wizardForm.protocol, (newVal, oldVal) => {
     // 无条件迁移 80/443→8080，回转不还原会保存即静默改写 DB 端口（BUG-03）
     const portChanged =
       wizardForm.listen_port === 8080 &&
-      (preTcpSnapshot?.listenPort === 80 || preTcpSnapshot?.listenPort === 443)
+      (preTcpSnapshot?.listenPort === proxyPorts.value.http_port || preTcpSnapshot?.listenPort === proxyPorts.value.https_port)
     const tlsWasOn = preTcpSnapshot?.enableTls === true
     if (portChanged && preTcpSnapshot) wizardForm.listen_port = preTcpSnapshot.listenPort
     wizardForm.upstreams.forEach(u => {
@@ -2058,8 +2083,11 @@ watch(() => wizardForm.enable_active_health_check, (newVal) => {
   }
 })
 
-const adminPorts = [8000, 2019]
-const httpReservedPorts = [80, 443]
+// 管理口 / HTTP(S) 保留口随部署配置（/system/ports）：管理口含面板实际口与固定
+// 的 Caddy admin 2019；保留口取 HTTP_PORT/HTTPS_PORT（出厂 80/443）。computed
+// 以随 /system/ports 异步返回更新——向导校验实时用最新值。
+const adminPorts = computed(() => [proxyPorts.value.panel_port, 8000, 2019])
+const httpReservedPorts = computed(() => [proxyPorts.value.http_port, proxyPorts.value.https_port])
 
 const showTlsStep = computed(() => wizardForm.protocol === 'http' && wizardForm.enable_tls)
 const showCustomRoutesStep = computed(() => wizardForm.protocol === 'http' && wizardForm.custom_routes_enabled)
@@ -2102,18 +2130,18 @@ const portWarning = computed(() => {
   
   if (wizardForm.protocol === 'http') {
     // HTTP rules cannot use admin ports and cannot share a port with any TCP rule.
-    if (adminPorts.includes(wizardForm.listen_port)) {
+    if (adminPorts.value.includes(wizardForm.listen_port)) {
       return `端口 ${wizardForm.listen_port} 为管理端口，不可使用`
     }
     if (tcpPorts.includes(wizardForm.listen_port)) {
       return `端口已被 TCP 规则占用`
     }
   } else if (wizardForm.protocol === 'tcp') {
-    // TCP rules cannot use admin ports, 80/443, or share a port with any other rule.
-    if (httpReservedPorts.includes(wizardForm.listen_port)) {
+    // TCP rules cannot use admin ports, HTTP(S) 默认口, or share a port with any other rule.
+    if (httpReservedPorts.value.includes(wizardForm.listen_port)) {
       return `端口 ${wizardForm.listen_port} 为 HTTP/Web 端口，TCP 规则不可使用`
     }
-    if (adminPorts.includes(wizardForm.listen_port)) {
+    if (adminPorts.value.includes(wizardForm.listen_port)) {
       return `端口 ${wizardForm.listen_port} 为管理端口，不可使用`
     }
     if (httpPorts.includes(wizardForm.listen_port) || tcpPorts.includes(wizardForm.listen_port)) {
@@ -2121,6 +2149,16 @@ const portWarning = computed(() => {
     }
   }
   return ''
+})
+
+// stalePortHint：编辑存量规则时，若其已存端口既非 HTTP 默认口也非 HTTPS 默认口
+// （说明部署侧换过口号或该规则建于换口前），提示保存语义——避免用户误以为改
+// compose 变量后老规则会自动跟着变（ISSUE #7：不自动迁移，手动改后保存即覆盖）。
+const stalePortHint = computed(() => {
+  if (!editingRule.value) return ''
+  const stored = wizardForm.listen_port
+  if (stored === proxyPorts.value.http_port || stored === proxyPorts.value.https_port) return ''
+  return `本条规则当前监听 ${stored}，与部署默认口（HTTP ${proxyPorts.value.http_port} / HTTPS ${proxyPorts.value.https_port}）不同；端口不会自动迁移，改好后点保存即按当前值生效`
 })
 
 // FE40-D1-2：策略文案映射提取至 utils/strategyLabels（Dashboard 共用，
@@ -2386,7 +2424,7 @@ const openWizard = async (rule?: Rule) => {
       description: '',
       protocol: 'http',
       domain: '',
-      listen_port: 80,
+      listen_port: proxyPorts.value.http_port,
       strategy: 'weighted_round_robin',
       chain_race_interval_ms: 3000,
       chain_request_timeout_ms: 30000,
@@ -3546,6 +3584,7 @@ onMounted(() => {
     searchQuery.value = rs
     window.history.replaceState(null, '', window.location.pathname)
   }
+  void fetchProxyPorts()
   void fetchRules()
   void fetchUsers()
   void fetchCertConfigs()

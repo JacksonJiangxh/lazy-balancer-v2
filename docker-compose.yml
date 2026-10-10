@@ -25,11 +25,20 @@ services:
     environment:
       - NODE_NAME=master
       - LOG_FILE=/app/logs/lazy-balancer.log
+      # —— 端口换位（80/443/8000 被占用时改这里）——
+      # host 网络下这是 Caddy/面板的「实际监听口」，不是端口转发：改 HTTP_PORT=8080
+      # 后 80 不再被本容器监听。只影响默认语义（新建规则向导默认值、兜底站与
+      # HTTP→HTTPS 跳转落点、80/443 保留端口判定）；存量规则 listen_port 是持久化
+      # 数据，不会被自动迁移——需手动逐条改成新端口后保存。详见 docs/deployment.zh-CN.md
+      - HTTP_PORT=80
+      - HTTPS_PORT=443
+      - PANEL_PORT=8000
     restart: unless-stopped
     healthcheck:
       # 探针须模式无关：面板默认强制 HTTPS（明文 HTTP 得 301），而 admin_tls 关闭时
       # 又只有明文可用；镜像内无 curl（仅构建期临时安装后 apk del），busybox wget
       # 的 --no-check-certificate 经实证可完成自签 TLS 探测（第 47 轮 F-47-30）。
+      # PANEL_PORT 改动后此处需同步替换 8000。
       test: ["CMD-SHELL", "wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8000/health || wget -q -O /dev/null http://127.0.0.1:8000/health"]
       interval: 30s
       timeout: 5s
@@ -65,6 +74,9 @@ services:
     environment:
       - NODE_NAME=slave-test
       - LOG_FILE=/app/logs/lazy-balancer.log
+      # 从节点测试实例的面板口固定 8000（bridge 网络映射 8001:8000），不跟随
+      # HTTP_PORT/HTTPS_PORT——那是代理口，本实例不承载代理流量。
+      - PANEL_PORT=8000
     ulimits:
       nofile:
         soft: 1048576

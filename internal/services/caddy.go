@@ -66,7 +66,8 @@ var (
 	defaultLandingBodyVal = DefaultLandingText
 )
 
-// DefaultLandingText 是空域名命中 http_80 catch-all 时的产品默认提示文案。
+// DefaultLandingText 是空域名命中 HTTP 默认口兜底站（http_{HTTP_PORT}，出厂
+// http_80）catch-all 时的产品默认提示文案。
 const DefaultLandingText = "Lazy Balancer V2 is running!"
 
 // SetDefaultLandingBody 注入 branding.json 的 landing_text(已归一:空串
@@ -1979,8 +1980,14 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		layer4Servers[fmt.Sprintf("tcp_%d", port)] = buildTCPServer(ruleConfig)
 	}
 
+	// httpDefaultPort/httpDefaultServer 是兜底站与 HTTP→HTTPS 跳转的落点：
+	// 出厂 80（HTTP_PORT 未改时行为与旧硬编码完全一致）；改 HTTP_PORT=8080 后
+	// 兜底站与全部跳转路由跟随到 :8080——规则本身仍是用户显式指定的端口。
+	httpDefaultPort := DefaultHTTPPort()
+	httpDefaultServer := fmt.Sprintf("http_%d", httpDefaultPort)
+
 	defaultSite := map[string]interface{}{
-		"listen": []string{":80"},
+		"listen": []string{fmt.Sprintf(":%d", httpDefaultPort)},
 		"routes": []interface{}{
 			map[string]interface{}{
 				"handle": []interface{}{
@@ -1994,13 +2001,13 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	}
 	applyTimeouts(defaultSite)
 
-	if _, exists := servers["http_80"]; !exists {
+	if _, exists := servers[httpDefaultServer]; !exists {
 		if len(redirectRoutes) > 0 {
 			defaultSite["routes"] = append(redirectRoutes, defaultSite["routes"].([]interface{})...)
 		}
-		servers["http_80"] = defaultSite
+		servers[httpDefaultServer] = defaultSite
 	} else {
-		server := servers["http_80"].(map[string]interface{})
+		server := servers[httpDefaultServer].(map[string]interface{})
 		// SEM44-2(第 44 轮):不再重复 applyTimeouts——server 在 :1456 创建时已
 		// 应用,两处之间无超时值变异,重复调用是幂等同值覆写。
 		routes, ok := server["routes"].([]interface{})
@@ -2021,7 +2028,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		}
 		routes = append(routes, defaultRoute)
 		server["routes"] = routes
-		servers["http_80"] = server
+		servers[httpDefaultServer] = server
 	}
 
 	// R57 C-4：logger_names 按 server（端口）拆分——同域名跨端口双规则时全局
@@ -2355,7 +2362,10 @@ func httpsRedirectLocation(listenPort int) string {
 	// R72 二十七次 N2（补正重写）：Location 必须追加 {http.request.uri}（path+query）
 	// ——Caddy static_response 不会自动保留原 URI（原生 auto-HTTPS 重定向会保留），
 	// 缺失时 http://a.com/page?x=1 会被跳到根路径。首版实施因脚本断言中止丢失。
-	if listenPort != 443 {
+	// 判定基准是部署侧 HTTPS 默认口（HTTPS_PORT，出厂 443）：非默认口需显式带
+	// 端口号自引用（否则跳回浏览器默认 443），默认口则省略（旧硬编码 443 的
+	// 行为在未改 HTTPS_PORT 时逐字节保持）。
+	if listenPort != DefaultHTTPSPort() {
 		return fmt.Sprintf("https://{http.request.host}:%d{http.request.uri}", listenPort)
 	}
 	return "https://{http.request.host}{http.request.uri}"
@@ -2764,7 +2774,7 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 			}
 		}
 
-		if rule.ListenPort != 443 && rule.ListenPort != 80 {
+		if rule.ListenPort != DefaultHTTPSPort() && rule.ListenPort != DefaultHTTPPort() {
 			server["automatic_https"] = map[string]interface{}{
 				"disable": true,
 			}

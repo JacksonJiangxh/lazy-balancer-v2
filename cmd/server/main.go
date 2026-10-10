@@ -44,6 +44,10 @@ func run() error {
 
 	// Load configuration
 	cfg := config.Load(*configPath)
+	// 代理默认监听口注入渲染层（HTTP_PORT/HTTPS_PORT，ISSUE #7）：兜底站监听口、
+	// HTTP→HTTPS 跳转 Location 判定、规则侧保留端口判定同源。只影响默认语义，
+	// 不动存量规则的 listen_port（那是持久化数据，保存时以面板值为准）。
+	services.SetDefaultProxyPorts(cfg.HTTPPort, cfg.HTTPSPort)
 
 	log.SetFlags(0)
 	var logWriter io.Writer = os.Stdout

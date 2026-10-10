@@ -64,6 +64,36 @@ func (h *Handlers) GetSystemInfo(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: info})
 }
 
+// proxyPortsResponse 是代理默认监听口配置（前端向导默认值/保留端口判定用）。
+type proxyPortsResponse struct {
+	HTTPPort  int `json:"http_port"`
+	HTTPSPort int `json:"https_port"`
+	PanelPort int `json:"panel_port"`
+}
+
+// GetProxyPorts 返回部署侧代理默认口与面板口（HTTP_PORT/HTTPS_PORT/PANEL_PORT，
+// ISSUE #7）。前端新建规则向导的默认 listen_port、80↔443 联动与保留端口校验
+// 读此值，避免「compose 改了变量、面板新建规则还默认 80」的割裂。全部认证用户
+// 可见（只读配置，无敏感信息）。
+func (h *Handlers) GetProxyPorts(c *gin.Context) {
+	httpPort, httpsPort := services.DefaultHTTPPort(), services.DefaultHTTPSPort()
+	panelPort := 8000
+	if h.cfg != nil {
+		if h.cfg.HTTPPort >= 1 && h.cfg.HTTPPort <= 65535 {
+			httpPort = h.cfg.HTTPPort
+		}
+		if h.cfg.HTTPSPort >= 1 && h.cfg.HTTPSPort <= 65535 {
+			httpsPort = h.cfg.HTTPSPort
+		}
+		if h.cfg.Port >= 1 && h.cfg.Port <= 65535 {
+			panelPort = h.cfg.Port
+		}
+	}
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: proxyPortsResponse{
+		HTTPPort: httpPort, HTTPSPort: httpsPort, PanelPort: panelPort,
+	}})
+}
+
 func (h *Handlers) GetSystemMetrics(c *gin.Context) {
 	metrics, err := getSystemMetrics()
 	if err != nil {

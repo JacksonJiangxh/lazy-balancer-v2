@@ -155,6 +155,7 @@ var apiDocRoutes = []apiDocRoute{
 	{"GET", "/metrics/connections", "指标", "连接统计", "", `{"established":0,"syn_recv":0,"fin_wait1":0,"fin_wait2":0,"close_wait":0,"last_ack":0,"listening":0,"closing":0,"time_wait":0,"total":0}`, []string{"401 unauthenticated"}, ""},
 	{"GET", "/system/info", "系统", "系统信息", "", `{"ip_address":"...","hostname":"..."}`, []string{"401 unauthenticated"}, ""},
 	{"GET", "/system/metrics", "系统", "系统指标", "", `{"cpu_percent":0,"memory_percent":0}`, []string{"401 unauthenticated"}, ""},
+	{"GET", "/system/ports", "系统", "代理默认监听口与面板口", "", `{"http_port":80,"https_port":443,"panel_port":8000}`, []string{"401 unauthenticated"}, "来自部署环境变量 HTTP_PORT/HTTPS_PORT/PANEL_PORT（出厂 80/443/8000）。前端向导默认值与保留端口判定用此值；只影响默认语义，存量规则的 listen_port 不随之迁移。"},
 	{"GET", "/audit-logs", "审计", "操作日志", "", `{"list":[],"total":0,"page":1,"page_size":20}`, []string{"401 unauthenticated"}, "query: page, page_size, username, action, resource, ip, keyword, start_time, end_time；created_at 为 UTC（2006-01-02 15:04:05），前端按配置时区展示。"},
 	{"GET", "/audit-logs/options", "审计", "操作日志筛选选项", "", `{"usernames":[{"value":"admin","count":12}],"actions":[{"value":"更新","count":5}],"resources":[{"value":"全局配置","count":3}]}`, []string{"401 unauthenticated"}, "操作人/操作/对象的去重可选值（按频次排序，对象取高频前 50）。"},
 	{"GET", "/auth/oidc/status", "认证", "OIDC 状态(公开)", "", `{"enabled":true,"display_name":"sso.example.com"}`, []string{}, "登录页按钮显隐;未启用返回 enabled=false。"},
