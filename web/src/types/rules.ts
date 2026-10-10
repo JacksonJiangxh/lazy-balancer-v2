@@ -25,6 +25,10 @@ export interface PathRuleUpstream {
   address: string
   port: number
   weight: number
+  // 该自定义路由上游的回源 Host：空=回退「基本配置」的后端域名，仍空=上游自身
+  // 地址。新建自定义上游时前端会从「基础设置」里同 host:port 的上游预填并固化
+  // 保存，使自定义路由不再误用「基本配置」的值。
+  host_header: string
 }
 
 // 流程弹框「路由分发」行（RuleFlowTarget.pathRules 元素，渲染投影形状）：上游仅

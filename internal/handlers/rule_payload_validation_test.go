@@ -93,3 +93,36 @@ func TestExtractLabel_exactKeyMatch(t *testing.T) {
 		t.Fatalf("x_host label must match its own key, got %q", got)
 	}
 }
+
+func TestRulePayload_pathRuleUpstreamHostHeaderValidation(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules", handler.CreateRule)
+	create := func(body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+	base := func(hostHeaderJSON string) string {
+		return `{"name":"payload-pr-up","protocol":"http","domain":"payload-pr-up.test","listen_port":18585,` +
+			`"custom_routes_enabled":true,` +
+			`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}],` +
+			`"path_rules":[{"match_type":"prefix","path":"/api","upstreams":[{"address":"127.0.0.1","port":9100,"weight":100,"protocol":"http"` + hostHeaderJSON + `}]}]}`
+	}
+
+	// 形状一：自定义路由上游回源 Host 含 CRLF → 400（与主上游/规则级同口径
+	// 注入防护——该值直写 reverse_proxy 的 Host 头/SNI）
+	rec := create(base(`,"host_header":"evil.com\r\nX-Injected: 1"`))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "回源Host含非法字符") {
+		t.Fatalf("CRLF path upstream host_header must 400, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 形状二（回归）：合法形状放行
+	rec = create(base(`,"host_header":"api.backend.local"`))
+	if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
+		t.Fatalf("legit path upstream host_header must pass, got %d %s", rec.Code, rec.Body.String())
+	}
+}

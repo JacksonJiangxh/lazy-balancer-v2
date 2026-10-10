@@ -1,6 +1,7 @@
 package services
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -333,5 +334,189 @@ func TestUpstreamHostDisabledUpstreamIgnored(t *testing.T) {
 	}
 	if override != nil {
 		t.Fatalf("disabled upstream must not influence the plan: %#v", override)
+	}
+}
+
+// pathRuleChainOf 取自定义路由链（@id = <caddyID>_path_<index>）的 handle 列表。
+func pathRuleChainOf(t *testing.T, rule SingleRuleConfig, pathIndex int) []interface{} {
+	t.Helper()
+	routes, _, err := generateHTTPRouteObjects(rule)
+	if err != nil {
+		t.Fatalf("generateHTTPRouteObjects: %v", err)
+	}
+	wantID := fmt.Sprintf("%s_path_%d", rule.CaddyID, pathIndex)
+	for _, route := range routes {
+		if route["@id"] != wantID {
+			continue
+		}
+		handle, ok := route["handle"].([]interface{})
+		if !ok {
+			t.Fatalf("route %s handle type=%T", wantID, route["handle"])
+		}
+		return handle
+	}
+	t.Fatalf("route %s not found", wantID)
+	return nil
+}
+
+// chainHostPlanOf 从处理链投影回源 Host 下发（同 upstreamHostPlanOf，但作用于链）。
+func chainHostPlanOf(t *testing.T, chain []interface{}) (host []string, override map[string]interface{}) {
+	t.Helper()
+	for _, raw := range chain {
+		entry, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch entry["handler"] {
+		case "lb_upstream_host":
+			override = entry
+		case "reverse_proxy":
+			headers, _ := entry["headers"].(map[string]interface{})
+			request, _ := headers["request"].(map[string]interface{})
+			set, _ := request["set"].(map[string]interface{})
+			if hosts, ok := set["Host"].([]string); ok {
+				host = hosts
+			}
+		}
+	}
+	return host, override
+}
+
+// Given: 自定义路由自带上游且其上游配置了回源 Host（2026-10-10 用户裁定）
+// When: 渲染该路径规则的代理链
+// Then: Host 取该上游的回源 Host（优先于规则级「后端域名」），与主链同口径
+func TestPathRuleUpstreamHost_prefersPathUpstreamHost(t *testing.T) {
+	rule := SingleRuleConfig{
+		CaddyID: "lb_pr_host", Protocol: "http", ListenPort: 80,
+		HostHeader: "base.internal", CustomRoutesEnabled: true,
+		Upstreams: []UpstreamConfig{
+			{Host: "10.0.0.9", Port: 9000, Weight: 1, Enabled: true},
+		},
+		PathRules: []PathRuleConfig{{
+			SortOrder: 0, MatchType: "prefix", Path: "/api",
+			Upstreams: []UpstreamConfig{
+				{Host: "10.0.0.1", Port: 8080, Weight: 1, Enabled: true, HostHeader: "api.internal"},
+			},
+		}},
+	}
+
+	host, override := chainHostPlanOf(t, pathRuleChainOf(t, rule, 0))
+	if len(host) != 1 || host[0] != "api.internal" {
+		t.Fatalf("host=%v; want [api.internal]（自定义路由上游回源 Host 优先于规则级）", host)
+	}
+	if override != nil {
+		t.Fatalf("uniform path value must fold to static: %#v", override)
+	}
+}
+
+// Given: 自定义路由自带上游未配回源 Host，规则级「后端域名」非空
+// When: 渲染该路径规则的代理链
+// Then: Host 回退规则级（第二级）
+func TestPathRuleUpstreamHost_fallsBackToRuleLevel(t *testing.T) {
+	rule := SingleRuleConfig{
+		CaddyID: "lb_pr_host_fb", Protocol: "http", ListenPort: 80,
+		HostHeader: "base.internal", CustomRoutesEnabled: true,
+		Upstreams: []UpstreamConfig{
+			{Host: "10.0.0.9", Port: 9000, Weight: 1, Enabled: true},
+		},
+		PathRules: []PathRuleConfig{{
+			SortOrder: 0, MatchType: "prefix", Path: "/api",
+			Upstreams: []UpstreamConfig{
+				{Host: "10.0.0.1", Port: 8080, Weight: 1, Enabled: true},
+			},
+		}},
+	}
+
+	host, _ := chainHostPlanOf(t, pathRuleChainOf(t, rule, 0))
+	if len(host) != 1 || host[0] != "base.internal" {
+		t.Fatalf("host=%v; want [base.internal]（第二级回退：规则级后端域名）", host)
+	}
+}
+
+// Given: 自定义路由自带上游未配回源 Host，规则级也为空
+// When: 渲染该路径规则的代理链
+// Then: Host 走上游自身地址占位符（第三级：回源域名）
+func TestPathRuleUpstreamHost_fallsBackToUpstreamDial(t *testing.T) {
+	rule := SingleRuleConfig{
+		CaddyID: "lb_pr_host_dial", Protocol: "http", ListenPort: 80,
+		CustomRoutesEnabled: true,
+		Upstreams: []UpstreamConfig{
+			{Host: "10.0.0.9", Port: 9000, Weight: 1, Enabled: true},
+		},
+		PathRules: []PathRuleConfig{{
+			SortOrder: 0, MatchType: "prefix", Path: "/api",
+			Upstreams: []UpstreamConfig{
+				{Host: "10.0.0.1", Port: 8080, Weight: 1, Enabled: true},
+			},
+		}},
+	}
+
+	host, _ := chainHostPlanOf(t, pathRuleChainOf(t, rule, 0))
+	if len(host) != 1 || host[0] != "{http.reverse_proxy.upstream.hostport}" {
+		t.Fatalf("host=%v; want [{http.reverse_proxy.upstream.hostport}]（第三级回退：上游自身地址）", host)
+	}
+}
+
+// Given: 自定义路由回退到规则默认上游（upstreams 为空 → 继承主上游），
+// 主上游自带回源 Host
+// When: 渲染该路径规则的代理链
+// Then: 与主链同源——继承后的上游集合照常三级回退（上游自身 host_header 生效）
+func TestPathRuleUpstreamHost_inheritedUpstreamsKeepTheirHostHeader(t *testing.T) {
+	rule := SingleRuleConfig{
+		CaddyID: "lb_pr_host_inherit", Protocol: "http", ListenPort: 80,
+		HostHeader: "base.internal", CustomRoutesEnabled: true,
+		Upstreams: []UpstreamConfig{
+			{Host: "10.0.0.1", Port: 8080, Weight: 1, Enabled: true, HostHeader: "origin.internal"},
+		},
+		PathRules: []PathRuleConfig{{
+			SortOrder: 0, MatchType: "prefix", Path: "/api",
+			Upstreams: []UpstreamConfig{
+				{Host: "10.0.0.1", Port: 8080, Weight: 1, Enabled: true, HostHeader: "origin.internal"},
+			},
+		}},
+	}
+
+	host, _ := chainHostPlanOf(t, pathRuleChainOf(t, rule, 0))
+	if len(host) != 1 || host[0] != "origin.internal" {
+		t.Fatalf("host=%v; want [origin.internal]", host)
+	}
+}
+
+// Given: 自定义路由 + 链式回退策略，路径上游携带回源 Host
+// When: 渲染该路径规则的链
+// Then: chain_proxy 的车道 host 取该上游的回源 Host（与 reverse_proxy 链同源口径）
+func TestPathRuleUpstreamHost_chainFallbackHonoursHostHeader(t *testing.T) {
+	rule := SingleRuleConfig{
+		CaddyID: "lb_pr_host_chain", Protocol: "http", ListenPort: 80,
+		HostHeader: "base.internal", CustomRoutesEnabled: true,
+		Upstreams: []UpstreamConfig{
+			{Host: "10.0.0.9", Port: 9000, Weight: 1, Enabled: true},
+		},
+		PathRules: []PathRuleConfig{{
+			SortOrder: 0, MatchType: "prefix", Path: "/api",
+			Upstreams: []UpstreamConfig{
+				{Host: "10.0.0.1", Port: 8080, Weight: 1, Enabled: true, HostHeader: "api.internal"},
+			},
+		}},
+	}
+	rule.Strategy = "chain_fallback"
+
+	var lanes []interface{}
+	for _, raw := range pathRuleChainOf(t, rule, 0) {
+		entry, ok := raw.(map[string]interface{})
+		if !ok || entry["handler"] != "chain_proxy" {
+			continue
+		}
+		lanes, _ = entry["upstreams"].([]interface{})
+	}
+	if len(lanes) != 1 {
+		t.Fatalf("chain_proxy lanes=%v; want exactly one（自定义路由单上游）", lanes)
+	}
+	lane, ok := lanes[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("lane payload type=%T", lanes[0])
+	}
+	if lane["host"] != "api.internal" {
+		t.Fatalf("lane host=%v; want api.internal（chain 车道同三级回退口径）", lane["host"])
 	}
 }

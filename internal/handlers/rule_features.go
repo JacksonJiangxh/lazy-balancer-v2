@@ -222,6 +222,21 @@ func normalizePathRules(pathRules []models.PathRule) []models.PathRule {
 		// Round 29 G-6: 存储前 TrimSpace，与校验侧（validateRuleFeatures 277 行先 TrimSpace
 		// 再归一）及渲染侧 pathMatcherSpecs 对齐，避免空格路径校验误报冲突。
 		normalized[index].Path = strings.TrimSpace(normalized[index].Path)
+		// 自定义路由上游的回源 Host（2026-10-10）：与主上游写侧同口径 TrimSpace
+		// 后回填（loadUpstreamsBatch 读侧不 Trim——主上游由前端提交前 trim，
+		// 此处为路径规则行补齐同款），避免纯空格值落库后渲染成 {lb.upstream_host}
+		// 混合态却在查询侧显示为空白。
+		if normalized[index].Upstreams != nil {
+			// 注意：必须显式 make 保长度（append 到 nil 切片在空输入下返回 nil，
+			// 会把「显式空数组」误归为「null 继承主上游」——C-F4 的
+			// 「空数组须 400 拒绝」随即失守）。
+			upstreams := make([]models.PathRuleUpstream, len(normalized[index].Upstreams))
+			for upstreamIndex, upstream := range normalized[index].Upstreams {
+				upstream.HostHeader = strings.TrimSpace(upstream.HostHeader)
+				upstreams[upstreamIndex] = upstream
+			}
+			normalized[index].Upstreams = upstreams
+		}
 	}
 	return normalized
 }
@@ -249,6 +264,7 @@ func toPathRuleConfigs(pathRules []models.PathRule) []services.PathRuleConfig {
 				}
 				config.Upstreams = append(config.Upstreams, services.UpstreamConfig{
 					Host: upstream.Address, Port: upstream.Port, Weight: upstream.Weight, Protocol: protocol, Enabled: true,
+					HostHeader: upstream.HostHeader,
 				})
 			}
 		}
@@ -490,6 +506,14 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			}
 			if upstream.Protocol != "" && upstream.Protocol != "http" && upstream.Protocol != "https" {
 				return fmt.Errorf("第 %d 条路径规则的第 %d 个上游协议只能是 http 或 https", index+1, upstreamIndex+1)
+			}
+			// 自定义路由上游的回源 Host（2026-10-10）：与主上游/规则级同口径
+			// 注入防护（LB40-5——直写 reverse_proxy 请求头/SNI，CRLF/控制字符
+			// 可注入额外头，拒绝不可见字符）。
+			for _, c := range upstream.HostHeader {
+				if c < 0x20 || c == 0x7f {
+					return fmt.Errorf("第 %d 条路径规则的第 %d 个上游：回源Host含非法字符", index+1, upstreamIndex+1)
+				}
 			}
 			key := strings.ToLower(net.JoinHostPort(strings.TrimSpace(upstream.Address), fmt.Sprintf("%d", upstream.Port)))
 			if pathHostPortSeen[key] {

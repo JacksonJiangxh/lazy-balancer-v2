@@ -3266,6 +3266,9 @@ func decodePathUpstreams(raw string) ([]UpstreamConfig, error) {
 		Port     int    `json:"port"`
 		Weight   int    `json:"weight"`
 		Protocol string `json:"protocol"`
+		// HostHeader 该自定义路由上游的回源 Host（2026-10-10，前端从「基础设置」
+		// 同 host:port 的上游预填固化）——空=回退规则级 host_header。
+		HostHeader string `json:"host_header"`
 	}
 	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
 		return nil, err
@@ -3278,6 +3281,7 @@ func decodePathUpstreams(raw string) ([]UpstreamConfig, error) {
 		}
 		upstreams = append(upstreams, UpstreamConfig{
 			Host: item.Address, Port: item.Port, Weight: item.Weight, Protocol: protocol, Enabled: true,
+			HostHeader: item.HostHeader,
 		})
 	}
 	return upstreams, nil
@@ -3949,7 +3953,8 @@ func buildHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, respond
 	return handleChain, nil
 }
 
-// upstreamHostPlan 逐上游回源 Host 三级回退计划（2026-10-09）。
+// upstreamHostPlan 逐上游回源 Host 三级回退计划（2026-10-09；自定义路由链
+// 2026-10-10 同源复用：自定义路由的上游行各自携带 host_header）。
 // 三态互斥（有启用上游时恒居其一）：
 //   - usePlaceholder：全回退——Host={http.reverse_proxy.upstream.hostport}；
 //   - staticHost：全统一静态值（含仅规则级 host_header 生效的场景）；
@@ -3969,6 +3974,10 @@ type upstreamHostPlan struct {
 // buildHTTPHandleChain 前置校验强制单启用上游（ErrDynamicDNSUpstreamCount），
 // 且动态解析 IP 逐请求变化、dial 不可预知——单上游恒落入全回退/全统一两态，
 // 混合映射天然不出现，无需特判。
+//
+// 入参 upstreams 为「已解析 up.HostHeader」的上游集合：主链来自 upstreams 表
+// （上游表列），自定义路由链（2026-10-10）来自 path_rules.upstreams_json 的
+// 同名字段——两条链共用本函数与同一三级回退口径，避免第二套解析分叉。
 func resolveUpstreamHostPlan(rule SingleRuleConfig, upstreams []UpstreamConfig) upstreamHostPlan {
 	if len(upstreams) == 0 {
 		return upstreamHostPlan{}
