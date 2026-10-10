@@ -46,7 +46,7 @@ docker buildx build --platform linux/amd64,linux/arm64 \
   -t v55448330/lazy-balancer-v2:v2.3.4 --push .
 ```
 
-CI 由 CNB 流水线承担：在 main 分支详情页点「构建并推送镜像」按钮，即触发 amd64/arm64 双架构原生构建 → 真容器探活 → 推送到 CNB 制品库 `docker.cnb.cool/xzydm/lazy-balancer-v2`（同时产出 `latest` 与版本号两个 manifest），配置见 `.cnb.yml` 与 `.cnb/web_trigger.yml`。
+CI 由 CNB 流水线承担：在 main 分支详情页点「构建并推送镜像」按钮，即触发 amd64/arm64 双架构原生构建 → 真容器探活 → 推送到 CNB 制品库 `docker.cnb.cool/xzydm/lazy-balancer-v2`（同时产出 `latest` 与版本号两个 manifest），并把 `latest` 多架构镜像额外镜像一份到 `docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2`，配置见 `.cnb.yml` 与 `.cnb/web_trigger.yml`。
 </details>
 
 ## 文档
