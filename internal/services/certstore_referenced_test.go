@@ -146,10 +146,11 @@ func TestReferencedCertFileDigest_detectsContentChange(t *testing.T) {
 	}
 }
 
-// Given: 一条 tls_source=file 规则且证书文件被外部更新
+// Given: 一条 tls_source=file 规则（内容已入库）且源文件被外部更新为新配对
 // When: checkReferencedCertFiles 逐轮扫描
-// Then: 首扫建基线不重载；文件变化后触发一次强制重载；无变化不再重载
-func TestCheckReferencedCertFiles_triggersReloadOnChange(t *testing.T) {
+// Then: 首扫建基线不摄取；文件变化后读取新内容回写 DB（摄取入库）并强制重载
+// 一次；无变化不再摄取/重载（数据库是运行时唯一信任源，文件只是采集来源）
+func TestCheckReferencedCertFiles_ingestsChangedFiles(t *testing.T) {
 	_, database := newClusterTestService(t)
 	dir := useTemporaryCertDir(t)
 	certPath, keyPath := writeReferencedCertFiles(t, dir, "watch.crt", "watch.key")
@@ -167,27 +168,232 @@ func TestCheckReferencedCertFiles_triggersReloadOnChange(t *testing.T) {
 		ResetReferencedCertWatch()
 	})
 
-	// 首扫：仅建基线，不应触发重载。
+	// 首扫：仅建基线，不摄取不重载。
 	checkReferencedCertFiles()
 	if reloads != 0 {
 		t.Fatalf("首扫不应重载, reloads=%d", reloads)
 	}
-	// 内容未变：仍不重载。
+	// 内容未变：仍不摄取/重载。
 	checkReferencedCertFiles()
 	if reloads != 0 {
 		t.Fatalf("内容未变不应重载, reloads=%d", reloads)
 	}
-	// 外部更新证书文件：下一轮检出变化并重载一次。
-	if err := os.WriteFile(certPath, []byte("updated-cert-content"), 0644); err != nil {
+	// 外部更新为新配对文件：下一轮检出变化，摄取新内容入库并重载一次。
+	newCertPEM, newKeyPEM := matchingCertificatePair(t, "updated.example.test")
+	if err := os.WriteFile(certPath, []byte(newCertPEM), 0644); err != nil {
 		t.Fatalf("rewrite cert: %v", err)
+	}
+	if err := os.WriteFile(keyPath, []byte(newKeyPEM), 0600); err != nil {
+		t.Fatalf("rewrite key: %v", err)
 	}
 	checkReferencedCertFiles()
 	if reloads != 1 {
 		t.Fatalf("证书变化应触发一次重载, reloads=%d", reloads)
 	}
-	// 无进一步变化：不应重复重载。
+	var storedCert, storedKey string
+	if err := database.QueryRow(`SELECT COALESCE(tls_cert,''), COALESCE(tls_key,'') FROM lb_rules WHERE caddy_id='lb_refcert'`).Scan(&storedCert, &storedKey); err != nil {
+		t.Fatalf("read persisted rule: %v", err)
+	}
+	if storedCert != newCertPEM || storedKey != newKeyPEM {
+		t.Fatal("变化后新内容应已摄取入库（tls_cert/tls_key 与新源文件一致）")
+	}
+	// 无进一步变化：不应重复摄取/重载。
 	checkReferencedCertFiles()
 	if reloads != 1 {
 		t.Fatalf("无变化不应重复重载, reloads=%d", reloads)
+	}
+}
+
+// Given: tls_source=file 规则且源文件被删除（digest=missing:）
+// When: checkReferencedCertFiles 扫描
+// Then: 跳过摄取（数据库保留上次有效内容 last-good）、不重载
+func TestCheckReferencedCertFiles_missingFilesSkipsIngest(t *testing.T) {
+	_, database := newClusterTestService(t)
+	dir := useTemporaryCertDir(t)
+	certPath, keyPath := writeReferencedCertFiles(t, dir, "gone.crt", "gone.key")
+
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, enable_tls, tls_source, tls_cert_path, tls_key_path, tls_cert, tls_key)
+		VALUES ('lb_refgone','ref-gone','http','ref-gone.test',19444,1,'file',?,?,'old-cert','old-key')`, certPath, keyPath); err != nil {
+		t.Fatalf("seed referenced rule: %v", err)
+	}
+
+	reloads := 0
+	SetReferencedCertReload(func() error { reloads++; return nil })
+	ResetReferencedCertWatch()
+	t.Cleanup(func() {
+		SetReferencedCertReload(nil)
+		ResetReferencedCertWatch()
+	})
+
+	checkReferencedCertFiles() // 首扫建基线
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatalf("remove key file: %v", err)
+	}
+	checkReferencedCertFiles()
+	if reloads != 0 {
+		t.Fatalf("文件缺失不应触发重载, reloads=%d", reloads)
+	}
+	var storedCert, storedKey string
+	if err := database.QueryRow(`SELECT COALESCE(tls_cert,''), COALESCE(tls_key,'') FROM lb_rules WHERE caddy_id='lb_refgone'`).Scan(&storedCert, &storedKey); err != nil {
+		t.Fatalf("read persisted rule: %v", err)
+	}
+	if storedCert != "old-cert" || storedKey != "old-key" {
+		t.Fatal("文件缺失时数据库应保留上次有效内容（last-good）")
+	}
+}
+
+// Given: tls_source=file 规则且源文件更新为不配对内容（外部工具更新到一半）
+// When: checkReferencedCertFiles 扫描
+// Then: 校验失败跳过摄取（数据库保留 last-good）、不重载
+func TestCheckReferencedCertFiles_invalidPairSkipsIngest(t *testing.T) {
+	_, database := newClusterTestService(t)
+	dir := useTemporaryCertDir(t)
+	certPath, keyPath := writeReferencedCertFiles(t, dir, "half.crt", "half.key")
+
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, enable_tls, tls_source, tls_cert_path, tls_key_path, tls_cert, tls_key)
+		VALUES ('lb_refhalf','ref-half','http','ref-half.test',19445,1,'file',?,?,'old-cert','old-key')`, certPath, keyPath); err != nil {
+		t.Fatalf("seed referenced rule: %v", err)
+	}
+
+	reloads := 0
+	SetReferencedCertReload(func() error { reloads++; return nil })
+	ResetReferencedCertWatch()
+	t.Cleanup(func() {
+		SetReferencedCertReload(nil)
+		ResetReferencedCertWatch()
+	})
+
+	checkReferencedCertFiles() // 首扫建基线
+	// 仅换私钥为新密钥对（与现存证书不配对，模拟外部工具写了一半）。
+	_, newKeyPEM := matchingCertificatePair(t, "other.example.test")
+	if err := os.WriteFile(keyPath, []byte(newKeyPEM), 0600); err != nil {
+		t.Fatalf("rewrite key: %v", err)
+	}
+	checkReferencedCertFiles()
+	if reloads != 0 {
+		t.Fatalf("配对无效不应触发重载, reloads=%d", reloads)
+	}
+	var storedCert, storedKey string
+	if err := database.QueryRow(`SELECT COALESCE(tls_cert,''), COALESCE(tls_key,'') FROM lb_rules WHERE caddy_id='lb_refhalf'`).Scan(&storedCert, &storedKey); err != nil {
+		t.Fatalf("read persisted rule: %v", err)
+	}
+	if storedCert != "old-cert" || storedKey != "old-key" {
+		t.Fatal("配对无效时数据库应保留上次有效内容（last-good）")
+	}
+}
+
+// Given: tls_source=file 规则且内容已入库
+// When: MaterializeAllCertsFromDB 启动物化
+// Then: 与 manual 同流——物化 /app/certs/{rule}.crt/.key 且内容与 DB 一致
+func TestMaterializeAllCertsFromDB_materializesReferencedRule(t *testing.T) {
+	_, database := newClusterTestService(t)
+	useTemporaryCertDir(t)
+	wantCert, wantKey := matchingCertificatePair(t, "refmat.example.test")
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, enable_tls, tls_source, tls_cert_path, tls_key_path, tls_cert, tls_key)
+		VALUES ('lb_refmat','ref-mat','http','refmat.example.test',19446,1,'file','/app/certs/refmat.example.test.crt','/app/certs/refmat.example.test.key',?,?)`,
+		wantCert, wantKey); err != nil {
+		t.Fatalf("seed referenced rule: %v", err)
+	}
+
+	MaterializeAllCertsFromDB()
+
+	certPath, keyPath := CertFilePaths("lb_refmat")
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("read materialized certificate: %v", err)
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("read materialized private key: %v", err)
+	}
+	if string(certPEM) != wantCert || string(keyPEM) != wantKey {
+		t.Fatal("物化内容应与 DB 入库内容一致（引用型与手动证书同流）")
+	}
+}
+
+// Given: 旧版本/旧备份还原产生的「只有摄取源路径、内容为空」的 file 行
+// When: IngestMissingReferencedCerts 启动回填
+// Then: 本机源文件可读时内容入库；文件缺失的行保持空内容（幂等不命中已有内容行）
+func TestIngestMissingReferencedCerts_backfillsPathOnlyRows(t *testing.T) {
+	_, database := newClusterTestService(t)
+	dir := useTemporaryCertDir(t)
+	certPath, keyPath := writeReferencedCertFiles(t, dir, "backfill.crt", "backfill.key")
+	gonePath := filepath.Join(dir, "gone.crt")
+	goneKeyPath := filepath.Join(dir, "gone.key")
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, enable_tls, tls_source, tls_cert_path, tls_key_path)
+		VALUES ('lb_refbackfill','ref-backfill','http','backfill.test',19447,1,'file',?,?)`, certPath, keyPath); err != nil {
+		t.Fatalf("seed backfill rule: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, enable_tls, tls_source, tls_cert_path, tls_key_path)
+		VALUES ('lb_refgone2','ref-gone2','http','gone2.test',19448,1,'file',?,?)`, gonePath, goneKeyPath); err != nil {
+		t.Fatalf("seed missing-file rule: %v", err)
+	}
+
+	recovered := IngestMissingReferencedCerts()
+	if recovered != 1 {
+		t.Fatalf("recovered=%d, want 1（可读行回填、缺失行跳过）", recovered)
+	}
+	var storedCert, storedKey string
+	if err := database.QueryRow(`SELECT COALESCE(tls_cert,''), COALESCE(tls_key,'') FROM lb_rules WHERE caddy_id='lb_refbackfill'`).Scan(&storedCert, &storedKey); err != nil {
+		t.Fatalf("read backfilled rule: %v", err)
+	}
+	wantCert, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("read source cert: %v", err)
+	}
+	if storedCert != string(wantCert) {
+		t.Fatal("回填内容应与源文件一致")
+	}
+	var emptyCert string
+	if err := database.QueryRow(`SELECT COALESCE(tls_cert,'') FROM lb_rules WHERE caddy_id='lb_refgone2'`).Scan(&emptyCert); err != nil {
+		t.Fatalf("read missing-file rule: %v", err)
+	}
+	if emptyCert != "" {
+		t.Fatal("源文件缺失的行不应回填（保持空内容，由 EnableRule 门拦截）")
+	}
+	// 幂等：内容已非空的行不命中。
+	if again := IngestMissingReferencedCerts(); again != 0 {
+		t.Fatalf("重跑应零命中, recovered=%d", again)
+	}
+}
+
+// Given: tls_source=file 规则内容已入库
+// When: GenerateRuleServerContext 构建单规则服务器上下文
+// Then: 与 manual 同口径判有证并引用物化路径（路径列不参与判定）
+func TestGenerateRuleServerContext_referencedRuleHasCertLikeManual(t *testing.T) {
+	_, database := newClusterTestService(t)
+	useTemporaryCertDir(t)
+	wantCert, wantKey := matchingCertificatePair(t, "refctx.example.test")
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, enable_tls, tls_source, tls_cert_path, tls_key_path, tls_cert, tls_key, enabled)
+		VALUES ('lb_refctx','ref-ctx','http','refctx.example.test',19449,1,'file','/app/certs/refctx.example.test.crt','/app/certs/refctx.example.test.key',?,?,'0')`,
+		wantCert, wantKey); err != nil {
+		t.Fatalf("seed referenced rule: %v", err)
+	}
+	// 物化文件预置（hasCert 判定只看 DB 内容，load_files 引用物化路径）。
+	certPath, keyPath := CertFilePaths("lb_refctx")
+	if err := os.WriteFile(certPath, []byte(wantCert), 0644); err != nil {
+		t.Fatalf("write materialized cert: %v", err)
+	}
+	if err := os.WriteFile(keyPath, []byte(wantKey), 0600); err != nil {
+		t.Fatalf("write materialized key: %v", err)
+	}
+
+	ctx := GenerateRuleServerContext("lb_refctx", 19449, "http", "refctx.example.test")
+	apps, _ := ctx["apps"].(map[string]interface{})
+	if apps == nil {
+		t.Fatal("apps 缺失")
+	}
+	tlsApp, ok := apps["tls"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("file 模式内容在库应判有证并产出 tls app，got %v", ctx)
+	}
+	certs, _ := tlsApp["certificates"].(map[string]interface{})
+	loadFiles, _ := certs["load_files"].([]interface{})
+	if len(loadFiles) != 1 {
+		t.Fatalf("load_files=%v, want 1 项", loadFiles)
+	}
+	entry, _ := loadFiles[0].(map[string]interface{})
+	if entry["certificate"] != certPath || entry["key"] != keyPath {
+		t.Fatalf("load_files 应引用物化路径 (%v,%v), want (%s,%s)", entry["certificate"], entry["key"], certPath, keyPath)
 	}
 }

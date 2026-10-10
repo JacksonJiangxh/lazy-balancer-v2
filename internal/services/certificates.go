@@ -876,8 +876,9 @@ func (s *CertificateService) recoverCertJobs(ctx context.Context) {
 
 // reconcileMissingCertFiles 巡检已签发（issued/downloaded）的 ACME 证书任务，若其磁盘
 // 证书/私钥文件缺失，则从数据库 cert_pem/key_pem 重建，避免容器重建或磁盘清理后 Caddy
-// 因缺证书文件而拒绝加载。仅覆盖 ACME 任务：手动证书内联在 lb_rules.tls_cert，由启动时
-// MaterializeAllCertsFromDB 物化；本函数随证书服务（仅主节点）每 6 小时对账一次。
+// 因缺证书文件而拒绝加载。仅覆盖 ACME 任务：手动/引用证书内联在 lb_rules.tls_cert
+// （引用型内容保存/摄取时入库），由启动时 MaterializeAllCertsFromDB 物化；本函数随
+// 证书服务（仅主节点）每 6 小时对账一次。
 func reconcileMissingCertFiles(dbh *sql.DB) int {
 	// CL23-2(第 23 轮审计):多行规则必须按 certJobRuleApplicable 同语义过滤——
 	// 否则灾备重建内容取决于扫描顺序,可能重建旧域证书且无自愈。

@@ -300,7 +300,7 @@ func TestUpdateConfig_flags_enabled_rule_with_unknown_tls_source(t *testing.T) {
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s, want 400（垃圾 tls_source 启用规则必须点名）", response.Code, response.Body.String())
 	}
-	for _, want := range []string{"startup-garbage-tls", "lb_startup_garbage_tls", "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"} {
+	for _, want := range []string{"startup-garbage-tls", "lb_startup_garbage_tls", "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"} {
 		if !strings.Contains(response.Body.String(), want) {
 			t.Fatalf("body must contain %q，实际: %s", want, response.Body.String())
 		}

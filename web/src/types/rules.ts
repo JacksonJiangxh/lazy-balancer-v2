@@ -102,7 +102,8 @@ export interface Rule extends ProxyTimeoutConfig {
   ca_provider_id: number
   tls_cert?: string
   tls_key?: string
-  // 引用型证书（tls_source="file"）：位于 /app/certs 内的成品证书/私钥文件路径
+  // 引用型证书（tls_source="file"）：/app/certs 内成品证书/私钥文件的摄取源路径
+  // （内容保存时入库，数据库是运行时唯一信任源）
   tls_cert_path?: string
   tls_key_path?: string
   // F50-7：GetRule 对只读 Key/非管理员掩码 tls_key 时的「已有隐藏私钥」标记
@@ -161,7 +162,8 @@ export interface CreateRuleRequest extends ProxyTimeoutConfig {
   ca_provider_id: number
   tls_cert: string
   tls_key: string
-  // 引用型证书（tls_source="file"）：位于 /app/certs 内的成品证书/私钥文件路径
+  // 引用型证书（tls_source="file"）：/app/certs 内成品证书/私钥文件的摄取源路径
+  // （内容保存时入库，数据库是运行时唯一信任源）
   tls_cert_path: string
   tls_key_path: string
   tls_http_redirect: boolean

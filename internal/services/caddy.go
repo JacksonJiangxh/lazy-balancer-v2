@@ -1253,7 +1253,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		ACMEEmail                     string
 		TLSCert                       string
 		TLSKey                        string
-		// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件路径（2026-10-09）。
+		// 引用型证书（tls_source="file"）：摄取源文件路径记录——内容已入库
+		// （tls_cert/tls_key），路径仅供看门狗检测外部更新与展示，渲染不消费。
 		TLSCertPath              string
 		TLSKeyPath               string
 		TLSHTTPRedirect          bool
@@ -1513,16 +1514,13 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		if !r.EnableTLS {
 			continue
 		}
-		if r.TLSSource == "manual" && r.TLSCert != "" && r.TLSKey != "" {
+		// 引用型证书与手动证书同流：PEM 内容已在保存/摄取时入库（tls_cert/tls_key），
+		// 此处统一物化到 /app/certs/{rule}.crt/.key 后由下方 load_files 引用——
+		// 运行时唯一信任源是数据库，文件不参与运行配置真相。
+		if (r.TLSSource == "manual" || r.TLSSource == "file") && r.TLSCert != "" && r.TLSKey != "" {
 			material := CertMaterial{RuleID: r.CaddyID, CertPEM: r.TLSCert, KeyPEM: r.TLSKey}
 			availableCerts[r.CaddyID] = material
 			materials = append(materials, material)
-			continue
-		}
-		// 引用型证书（2026-10-09）：直接引用 /app/certs 内的成品文件，不物化、
-		// 不落 PEM——仅登记「该规则有可用证书」，路径由下方 tlsCertFiles 直取。
-		if r.TLSSource == "file" && r.TLSCertPath != "" && r.TLSKeyPath != "" {
-			availableCerts[r.CaddyID] = CertMaterial{RuleID: r.CaddyID}
 			continue
 		}
 		if r.TLSSource == "acme_dns" {
@@ -1965,29 +1963,10 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		}
 	}
 
-	// Collect TLS certificate file paths for all rules (manual + ACME from cert_jobs)
-	// 同路径去重合并 tags：引用型证书（tls_source="file"）的典型用法是多条规则
-	// 共用一份对外维护的证书文件，重复 (cert,key) 路径会让同一证书被加载多次——
-	// 按路径聚合，tags 合并为该证书适用的全部规则。
+	// Collect TLS certificate file paths for all rules (manual + 引用型 + ACME from
+	// cert_jobs)：统一引用物化路径 /app/certs/{rule}.crt/.key（每规则各一份，无
+	// 共用外部文件，无需按路径去重）。
 	var tlsCertFiles []map[string]interface{}
-	tlsCertFileIndex := make(map[string]int)
-	addCertFile := func(certPath, keyPath, caddyID string) {
-		if certPath == "" || keyPath == "" {
-			return
-		}
-		dedupKey := certPath + "\x00" + keyPath
-		if index, exists := tlsCertFileIndex[dedupKey]; exists {
-			tags, _ := tlsCertFiles[index]["tags"].([]string)
-			tlsCertFiles[index]["tags"] = append(tags, caddyID)
-			return
-		}
-		tlsCertFileIndex[dedupKey] = len(tlsCertFiles)
-		tlsCertFiles = append(tlsCertFiles, map[string]interface{}{
-			"certificate": certPath,
-			"key":         keyPath,
-			"tags":        []string{caddyID},
-		})
-	}
 	for _, ru := range allRules {
 		r := ru.rule
 		if !r.EnableTLS {
@@ -1996,12 +1975,15 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		if _, hasCert := availableCerts[r.CaddyID]; !hasCert {
 			continue
 		}
-		if r.TLSSource == "file" {
-			addCertFile(r.TLSCertPath, r.TLSKeyPath, r.CaddyID)
+		certPath, keyPath := CertFilePaths(r.CaddyID)
+		if certPath == "" || keyPath == "" {
 			continue
 		}
-		certPath, keyPath := CertFilePaths(r.CaddyID)
-		addCertFile(certPath, keyPath, r.CaddyID)
+		tlsCertFiles = append(tlsCertFiles, map[string]interface{}{
+			"certificate": certPath,
+			"key":         keyPath,
+			"tags":        []string{r.CaddyID},
+		})
 	}
 
 	layer4Servers := make(map[string]interface{})
@@ -2470,7 +2452,8 @@ type SingleRuleConfig struct {
 	ACMEConfigID                  int
 	TLSCert                       string
 	TLSKey                        string
-	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件路径（2026-10-09）。
+	// 引用型证书（tls_source="file"）：摄取源文件路径记录——内容已入库
+	// （tls_cert/tls_key），渲染不消费路径。
 	TLSCertPath              string
 	TLSKeyPath               string
 	TLSHTTPRedirect          bool
@@ -2645,23 +2628,21 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 	}
 	apps := map[string]interface{}{}
 	hasCert := false
-	// 引用型证书（tls_source="file"）的显式文件路径：块内读取、块外供 load_files 使用。
-	certFilePath, keyFilePath := "", ""
 	if protocol == "http" {
 		var tlsSource string
 		var certPresent, keyPresent, enableTLS bool
 		// Round 34 F-3: 查询失败必须留痕，对话框不得静默显示"无证书"。
 		// N+12 G8-S3：仅需存在性判断，投影 COALESCE!='' 布尔，不搬运 PEM 正文。
-		if err := db.DB.QueryRow(`SELECT COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '', COALESCE(tls_key,'') != '', COALESCE(enable_tls,0),
-			COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'') FROM lb_rules WHERE caddy_id = ?`, caddyID).
-			Scan(&tlsSource, &certPresent, &keyPresent, &enableTLS, &certFilePath, &keyFilePath); err != nil {
+		// 引用型证书与手动证书同口径：内容（tls_cert/tls_key）在库即有证，路径
+		// 列只是摄取源记录，不参与运行配置判定。
+		if err := db.DB.QueryRow(`SELECT COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '', COALESCE(tls_key,'') != '', COALESCE(enable_tls,0)
+			FROM lb_rules WHERE caddy_id = ?`, caddyID).
+			Scan(&tlsSource, &certPresent, &keyPresent, &enableTLS); err != nil {
 			Logf("error", "GenerateRuleServerContext: 读取规则 %s TLS 字段失败: %v", caddyID, err)
 		} else if enableTLS {
 			// Round 34 F-2: 与全量渲染 availableCerts 同口径（caddy.go 全量路径
 			// 要求 EnableTLS），未开 TLS 的规则不加载证书。
-			if tlsSource == "manual" && certPresent && keyPresent {
-				hasCert = true
-			} else if tlsSource == "file" && certFilePath != "" && keyFilePath != "" {
+			if (tlsSource == "manual" || tlsSource == "file") && certPresent && keyPresent {
 				hasCert = true
 			} else if tlsSource == "acme_dns" {
 				hasCert = isACMECertIssuedFromStore(db.DB, caddyID, domain)
@@ -2672,8 +2653,7 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 		// 存在启用上游的规则进入 TLS 策略（无上游/关 TLS 规则在真实配置中不存在）。
 		// N+12 G8-S3：证书仅有无的判断在 SQL 侧完成，不再把整列 PEM 拉进进程。
 		rows, err := db.DB.Query(`SELECT COALESCE(caddy_id,''), COALESCE(domain,''), COALESCE(tls_source,'manual'),
-			COALESCE(tls_cert,'') != '' AND COALESCE(tls_key,'') != '',
-			COALESCE(tls_cert_path,'') != '' AND COALESCE(tls_key_path,'') != ''
+			COALESCE(tls_cert,'') != '' AND COALESCE(tls_key,'') != ''
 			FROM lb_rules WHERE enabled = 1 AND protocol = 'http' AND listen_port = ? AND enable_tls = 1
 			AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id = lb_rules.caddy_id AND IIF(u.enabled IN ('1',1),1,0) = 1)
 			ORDER BY rowid`, listenPort)
@@ -2682,12 +2662,12 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 		} else {
 			for rows.Next() {
 				var ruleID, ruleDomain, tlsSource string
-				var hasManualCert, hasFileCert bool
-				if rows.Scan(&ruleID, &ruleDomain, &tlsSource, &hasManualCert, &hasFileCert) != nil {
+				var hasInlineCert bool
+				if rows.Scan(&ruleID, &ruleDomain, &tlsSource, &hasInlineCert) != nil {
 					Logf("error", "GenerateRuleServerContext: 扫描端口 %d 规则 TLS 字段失败", listenPort)
 					continue
 				}
-				available := (tlsSource == "manual" && hasManualCert) || (tlsSource == "file" && hasFileCert) || (tlsSource == "acme_dns" && isACMECertIssuedFromStore(db.DB, ruleID, ruleDomain))
+				available := (tlsSource == "manual" || tlsSource == "file") && hasInlineCert || (tlsSource == "acme_dns" && isACMECertIssuedFromStore(db.DB, ruleID, ruleDomain))
 				if !available {
 					continue
 				}
@@ -2717,11 +2697,8 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 		apps["layer4"] = map[string]interface{}{"servers": map[string]interface{}{serverName: server}}
 	}
 	if hasCert {
-		// 引用型证书（2026-10-09）：直接引用用户指定的成品文件；其余来源用物化路径。
+		// 各来源统一引用物化路径 /app/certs/{rule}.crt/.key（内容来自 DB 物化）。
 		certPath, keyPath := CertFilePaths(caddyID)
-		if certFilePath != "" && keyFilePath != "" {
-			certPath, keyPath = certFilePath, keyFilePath
-		}
 		apps["tls"] = map[string]interface{}{
 			"certificates": map[string]interface{}{
 				"load_files": []interface{}{
@@ -2844,9 +2821,8 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 			"routes": routeValues,
 		}
 
-		// Add TLS configuration for manual certificates / referenced certificate files
-		if rule.EnableTLS && ((rule.TLSSource == "manual" && rule.TLSCert != "" && rule.TLSKey != "") ||
-			(rule.TLSSource == "file" && rule.TLSCertPath != "" && rule.TLSKeyPath != "")) {
+		// Add TLS configuration for manual / 引用型 certificates（内容在库即有证）
+		if rule.EnableTLS && (rule.TLSSource == "manual" || rule.TLSSource == "file") && rule.TLSCert != "" && rule.TLSKey != "" {
 			server["tls_connection_policies"] = []interface{}{
 				map[string]interface{}{
 					"match": map[string]interface{}{
@@ -2899,28 +2875,15 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 	}
 
 	// Add TLS certificates configuration for manual certificates
-	if rule.EnableTLS && rule.TLSSource == "manual" && rule.TLSCert != "" && rule.TLSKey != "" {
+	// 引用型证书与手动证书同流：内容已在库（tls_cert/tls_key），预览统一走
+	// load_pem 内联 PEM（不复制文件、不引用摄取源路径）。
+	if rule.EnableTLS && (rule.TLSSource == "manual" || rule.TLSSource == "file") && rule.TLSCert != "" && rule.TLSKey != "" {
 		apps["tls"] = map[string]interface{}{
 			"certificates": map[string]interface{}{
 				"load_pem": []map[string]interface{}{
 					{
 						"certificate": rule.TLSCert,
 						"key":         rule.TLSKey,
-						"tags":        []string{rule.CaddyID},
-					},
-				},
-			},
-		}
-	}
-	// 引用型证书（2026-10-09）：直接引用成品文件路径（load_files），不落 PEM、
-	// 不复制到程序证书目录。
-	if rule.EnableTLS && rule.TLSSource == "file" && rule.TLSCertPath != "" && rule.TLSKeyPath != "" {
-		apps["tls"] = map[string]interface{}{
-			"certificates": map[string]interface{}{
-				"load_files": []map[string]interface{}{
-					{
-						"certificate": rule.TLSCertPath,
-						"key":         rule.TLSKeyPath,
 						"tags":        []string{rule.CaddyID},
 					},
 				},

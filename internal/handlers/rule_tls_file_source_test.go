@@ -70,10 +70,19 @@ func writeReferencedPair(t *testing.T, dir, cn string) (string, string) {
 
 // Given: 证书目录内的合法成品证书文件
 // When: 以 tls_source=file 创建规则
-// Then: 创建成功，路径落库且内联 PEM 字段清空（形态互斥）
-func TestCreateRule_referencedCertFilePersistsPaths(t *testing.T) {
+// Then: 创建成功，路径落库为摄取源记录，且 PEM 内容摄取入库（数据库是运行时
+// 唯一信任源——与 manual 同列 tls_cert/tls_key）
+func TestCreateRule_referencedCertFileIngestsContent(t *testing.T) {
 	router, dir := newReferencedCertRouter(t)
 	certPath, keyPath := writeReferencedPair(t, dir, "file-src.test")
+	wantCertPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("read source cert: %v", err)
+	}
+	wantKeyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("read source key: %v", err)
+	}
 
 	rec := postReferencedCertRule(t, router, certPath, keyPath)
 	if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
@@ -88,8 +97,9 @@ func TestCreateRule_referencedCertFilePersistsPaths(t *testing.T) {
 	if storedCertPath != certPath || storedKeyPath != keyPath {
 		t.Fatalf("paths=(%q,%q), want (%q,%q)", storedCertPath, storedKeyPath, certPath, keyPath)
 	}
-	if storedCert != "" || storedKey != "" {
-		t.Fatalf("file 模式不应落 PEM（形态互斥），got cert=%q key=%q", storedCert, storedKey)
+	if storedCert != string(wantCertPEM) || storedKey != string(wantKeyPEM) {
+		t.Fatalf("file 模式应摄取 PEM 内容入库（与源文件逐字节一致）, cert match=%v key match=%v",
+			storedCert == string(wantCertPEM), storedKey == string(wantKeyPEM))
 	}
 }
 

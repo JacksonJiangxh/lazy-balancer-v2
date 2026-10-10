@@ -165,8 +165,9 @@ type LbRule struct {
 	CAProviderID               int        `json:"ca_provider_id"`
 	TLSCert                    string     `json:"tls_cert,omitempty"`
 	TLSKey                     string     `json:"tls_key,omitempty"`
-	// TLSCertPath/TLSKeyPath 引用型证书（tls_source="file"）：直接引用程序可读写
-	// 目录（/app/certs）内的成品证书文件，不复制、不落 PEM 到库（2026-10-09）。
+	// TLSCertPath/TLSKeyPath 引用型证书（tls_source="file"）：/app/certs 内成品
+	// 证书文件的摄取源路径——保存时读取并校验，PEM 内容入库（tls_cert/tls_key，
+	// 与 manual 同列）；数据库是运行时唯一信任源，路径仅供看门狗检测外部更新。
 	TLSCertPath string `json:"tls_cert_path,omitempty"`
 	TLSKeyPath  string `json:"tls_key_path,omitempty"`
 	// TLSKeySet 标记「已有隐藏私钥」——GetRule 对只读 Key/非管理员掩码 tls_key
@@ -498,7 +499,8 @@ type CreateRuleRequest struct {
 	CAProviderID               int        `json:"ca_provider_id"`
 	TLSCert                    string     `json:"tls_cert"`
 	TLSKey                     string     `json:"tls_key"`
-	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件路径（2026-10-09）。
+	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件的摄取源路径
+	// （内容保存时入库到 tls_cert/tls_key，路径仅供看门狗检测外部更新）。
 	TLSCertPath     string `json:"tls_cert_path"`
 	TLSKeyPath      string `json:"tls_key_path"`
 	TLSHTTPRedirect bool   `json:"tls_http_redirect"`
@@ -569,7 +571,8 @@ type UpdateRuleRequest struct {
 	CAProviderID               *int        `json:"ca_provider_id"`
 	TLSCert                    string      `json:"tls_cert"`
 	TLSKey                     string      `json:"tls_key"`
-	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件路径（2026-10-09）。
+	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件的摄取源路径
+	// （内容保存时入库到 tls_cert/tls_key，路径仅供看门狗检测外部更新）。
 	TLSCertPath     string `json:"tls_cert_path"`
 	TLSKeyPath      string `json:"tls_key_path"`
 	TLSHTTPRedirect *bool  `json:"tls_http_redirect"`

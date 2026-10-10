@@ -1181,8 +1181,8 @@ func validateV2BackupTLSShapeSoft(tables map[string][]map[string]any, softLiveAC
 			continue
 		}
 		tlsSource := backupString(rule["tls_source"])
-		if tlsSource != "manual" && tlsSource != "acme_dns" {
-			return 0, fmt.Errorf("规则 #%d（%s）：启用 TLS 时必须选择证书来源（manual 或 acme_dns）", index+1, backupString(rule["name"]))
+		if tlsSource != "manual" && tlsSource != "acme_dns" && tlsSource != "file" {
+			return 0, fmt.Errorf("规则 #%d（%s）：启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）", index+1, backupString(rule["name"]))
 		}
 		if tlsSource == "manual" &&
 			(strings.TrimSpace(backupString(rule["tls_cert"])) == "" || strings.TrimSpace(backupString(rule["tls_key"])) == "") {
@@ -2717,6 +2717,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	if filename != "" {
 		auditSource = "服务器备份 " + filename + "（覆盖" + action + "）"
 	}
+	var referencedIngestWarnings []string
 	auditParts := []string{"来源：" + auditSource, counts}
 	if jwtExpireClamped {
 		auditParts = append(auditParts, "jwt_expire_minutes 越界，已重置为 20")
@@ -2731,6 +2732,18 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 		auditParts = append(auditParts, fmt.Sprintf("audit_log_size_mb 越界，已钳位为 %v", backup.Config["audit_log_size_mb"]))
 	}
 	auditParts = append(auditParts, certNumericClamped...)
+	// 引用型证书摄取兜底：旧备份的 file 行只有摄取源路径、无内容（旧语义不落
+	// PEM）——还原提交后从本机源文件回填入库；回填成功需强制重载（物化路径
+	// 不变，渲染 JSON 同字节会被 errSameConfig 短路）。本机源文件不可读时留
+	// 警告（渲染按无证；启动期回填与重新保存可后续修复）。
+	if referencedIngested := services.IngestMissingReferencedCerts(); referencedIngested > 0 {
+		if err := h.caddyService.GenerateAndApplyConfigForce(); err != nil {
+			referencedIngestWarnings = append(referencedIngestWarnings,
+				fmt.Sprintf("引用证书内容已回填 %d 条规则，但强制重载失败: %v", referencedIngested, err))
+		} else {
+			auditParts = append(auditParts, fmt.Sprintf("引用证书内容回填 %d 条规则（旧备份仅含路径）", referencedIngested))
+		}
+	}
 	if len(skipWarnings) > 0 {
 		// N+13 H2-F3：列表现含空域名规则与空内容拦截页两类跳过，标签泛化。
 		auditParts = append(auditParts, "跳过警告："+strings.Join(skipWarnings, "；"))
@@ -2754,7 +2767,8 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	if !reseedBlockPageNeeded || reseedApplyFailed == false {
 		h.recordCaddyApplyResult(nil)
 	}
-	responseWarnings := skipWarnings
+	// 引用证书摄取兜底的重载失败警告随响应可见（与审计同文案族）。
+	responseWarnings := append(append([]string{}, skipWarnings...), referencedIngestWarnings...)
 	if wafMetadataSkipped {
 		responseWarnings = append(append([]string{}, responseWarnings...), warningWafMetadataSkipped)
 	}

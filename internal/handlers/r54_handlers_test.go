@@ -35,11 +35,11 @@ func TestValidateV2BackupTLSShape_rejects_unknown_tls_source(t *testing.T) {
 		injectKey   bool
 		wantErrText string
 	}{
-		{name: "空串 tls_source 被拒绝", tlsSource: "", injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"},
-		{name: "垃圾值 https 被拒绝", tlsSource: "https", injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"},
-		{name: "任意未知值被拒绝", tlsSource: "auto", injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"},
-		{name: "非字符串值（数字）被拒绝", tlsSource: 1, injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"},
-		{name: "缺失 tls_source 键被拒绝", tlsSource: nil, injectKey: false, wantErrText: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"},
+		{name: "空串 tls_source 被拒绝", tlsSource: "", injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"},
+		{name: "垃圾值 https 被拒绝", tlsSource: "https", injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"},
+		{name: "任意未知值被拒绝", tlsSource: "auto", injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"},
+		{name: "非字符串值（数字）被拒绝", tlsSource: 1, injectKey: true, wantErrText: "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"},
+		{name: "缺失 tls_source 键被拒绝", tlsSource: nil, injectKey: false, wantErrText: "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"},
 		{name: "manual 携带证书材料放行", tlsSource: "manual", injectKey: true},
 	}
 	for _, tt := range tests {

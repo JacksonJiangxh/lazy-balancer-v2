@@ -1127,10 +1127,11 @@ func validateStoredRuleConfig(ctx context.Context, caddyID string) error {
 		(strings.TrimSpace(rule.TLSCert) == "" || strings.TrimSpace(rule.TLSKey) == "") {
 		return &configValidationError{message: "手动证书模式下必须提供 TLS 证书和私钥"}
 	}
-	// 引用型证书（2026-10-09）：启用状态下两个路径文件必须齐备。
+	// 引用型证书：运行时唯一信任源是 DB——启用状态下内容必须已摄取入库
+	// （路径仅作摄取源记录；内容缺失（如旧备份/导入行）先经保存路径摄取）。
 	if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource == "file" &&
-		(strings.TrimSpace(rule.TLSCertPath) == "" || strings.TrimSpace(rule.TLSKeyPath) == "") {
-		return &configValidationError{message: "引用证书文件模式下必须提供证书与私钥文件路径"}
+		(strings.TrimSpace(rule.TLSCert) == "" || strings.TrimSpace(rule.TLSKey) == "") {
+		return &configValidationError{message: "引用证书文件模式下证书内容未入库，请重新保存规则以从文件摄取"}
 	}
 	// LB42-2:与保存门同口径的策略白名单——存量(校验上线前落库)/直改 DB 的
 	// TCP+cookie 等 HTTP 专属策略启用行透传到 L4 渲染被静默忽略,启用即拒。

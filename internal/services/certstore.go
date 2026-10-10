@@ -488,18 +488,73 @@ func restoreCertFile(path string, snapshot CertFileSnapshot) error {
 	return syncParentDir(path)
 }
 
+// IngestMissingReferencedCerts 启动期回填：引用型证书（tls_source="file"）的
+// 运行时唯一信任源是数据库——旧版本升级、旧备份还原或 v2 导入产生的「只有
+// 摄取源路径、内容为空」的行，在本机源文件可读时摄取回填内容；不可读则保留
+// 空内容并留痕（渲染按无证、EnableRule 门拒绝启用，用户重新保存即修复）。
+//   - 返回成功回填的规则数（0=无可回填行或全部失败，调用方按需留警告）。
+//
+// 幂等：内容已非空的行不命中。
+func IngestMissingReferencedCerts() int {
+	rows, err := db.DB.Query(`SELECT caddy_id, COALESCE(tls_cert_path,''), COALESCE(tls_key_path,'')
+		FROM lb_rules WHERE enable_tls=1 AND tls_source='file'
+		AND COALESCE(tls_cert,'')='' AND COALESCE(tls_key,'')=''
+		AND COALESCE(tls_cert_path,'')<>'' AND COALESCE(tls_key_path,'')<>''`)
+	if err != nil {
+		Logf("warn", "certstore: query referenced certs missing content failed: %v", err)
+		return 0
+	}
+	type pending struct{ certPath, keyPath string }
+	pendings := map[string]pending{}
+	order := []string{}
+	for rows.Next() {
+		var caddyID, certPath, keyPath string
+		if err := rows.Scan(&caddyID, &certPath, &keyPath); err != nil {
+			continue
+		}
+		pendings[caddyID] = pending{certPath, keyPath}
+		order = append(order, caddyID)
+	}
+	rows.Close()
+	if len(order) == 0 {
+		return 0
+	}
+	sort.Strings(order)
+	recovered := 0
+	for _, caddyID := range order {
+		p := pendings[caddyID]
+		referenced, loadErr := LoadReferencedCertificate(p.certPath, p.keyPath)
+		if loadErr != nil {
+			Logf("warn", "certstore: referenced cert ingest skipped for %s (source files unavailable): %v", caddyID, loadErr)
+			continue
+		}
+		if _, err := db.DB.Exec(`UPDATE lb_rules SET tls_cert=?, tls_key=? WHERE caddy_id=?`, referenced.CertPEM, referenced.KeyPEM, caddyID); err != nil {
+			Logf("error", "certstore: referenced cert ingest write failed for %s: %v", caddyID, err)
+			continue
+		}
+		RecordAuditLog("system", "证书摄取", "负载规则", FormatAuditDetail(AuditRulePart(caddyID), "启动回填：源文件内容已入库"), "")
+		recovered++
+	}
+	if recovered > 0 {
+		TaskLogf("startup:config-load", "certs", "引用证书内容回填完成：%d 条规则", recovered)
+	}
+	return recovered
+}
+
 func MaterializeAllCertsFromDB() {
 	if err := os.MkdirAll(certDir, 0755); err != nil {
 		Logf("error", "certstore: create cert dir failed: %v", err)
 		return
 	}
+	// 引用型证书内容回填先行（升级/还原后「有路径无内容」的行先摄取，再统一物化）。
+	IngestMissingReferencedCerts()
 	manualRecovered := 0
 	acmeRecovered := 0
 
-	rows, err := db.DB.Query(`SELECT caddy_id, tls_cert, tls_key FROM lb_rules WHERE enable_tls=1 AND tls_source='manual' AND COALESCE(tls_cert,'')!='' AND COALESCE(tls_key,'')!=''`)
+	rows, err := db.DB.Query(`SELECT caddy_id, tls_cert, tls_key FROM lb_rules WHERE enable_tls=1 AND tls_source IN ('manual','file') AND COALESCE(tls_cert,'')!='' AND COALESCE(tls_key,'')!=''`)
 	if err != nil {
 		Logf("error", "certstore: query manual certs failed: %v", err)
-		RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), "类型：手动证书", AuditResultPart("query_failed")), "")
+		RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), "类型：手动/引用证书", AuditResultPart("query_failed")), "")
 	} else {
 		for rows.Next() {
 			var ruleID, certPEM, keyPEM string
@@ -509,7 +564,7 @@ func MaterializeAllCertsFromDB() {
 			}
 			if err := materializeCertPair(ruleID, certPEM, keyPEM); err != nil {
 				Logf("error", "certstore: write manual cert %s failed: %v", ruleID, err)
-				RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditRulePart(ruleID), "类型：手动证书", AuditResultPart("io_error")), "")
+				RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditRulePart(ruleID), "类型：手动/引用证书", AuditResultPart("io_error")), "")
 			} else {
 				manualRecovered++
 			}
@@ -563,9 +618,9 @@ func MaterializeAllCertsFromDB() {
 		rows2.Close()
 	}
 	if manualRecovered > 0 || acmeRecovered > 0 {
-		RecordAuditLog("system", "恢复", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), fmt.Sprintf("手动证书 %d 个", manualRecovered), fmt.Sprintf("ACME证书 %d 个", acmeRecovered)), "")
+		RecordAuditLog("system", "恢复", "证书文件", FormatAuditDetail(AuditSourcePart("startup_materialization"), fmt.Sprintf("手动/引用证书 %d 个", manualRecovered), fmt.Sprintf("ACME证书 %d 个", acmeRecovered)), "")
 	}
-	TaskLogf("startup:config-load", "certs", "证书物化完成：手动证书 %d 个、ACME 证书 %d 个落盘", manualRecovered, acmeRecovered)
+	TaskLogf("startup:config-load", "certs", "证书物化完成：手动/引用证书 %d 个、ACME 证书 %d 个落盘", manualRecovered, acmeRecovered)
 }
 
 func materializeCertPair(ruleID, certPEM, keyPEM string) error {

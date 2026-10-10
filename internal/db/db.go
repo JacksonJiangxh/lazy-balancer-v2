@@ -273,8 +273,9 @@ func createTables() error {
 		enable_tls BOOLEAN DEFAULT FALSE,
 		tls_cert TEXT,
 		tls_key TEXT,
-		-- 引用型证书（2026-10-09）：tls_source='file' 时直接引用 /app/certs 内
-		-- 成品证书文件路径，不落 PEM（空串=未使用）。
+		-- 引用型证书（tls_source='file'）：/app/certs 内成品证书文件的摄取源路径
+		-- ——保存时读取并校验，PEM 内容入库（tls_cert/tls_key）；数据库是运行时
+		-- 唯一信任源，路径仅供看门狗检测外部更新（空串=未使用）。
 		tls_cert_path VARCHAR(512) NOT NULL DEFAULT '',
 		tls_key_path VARCHAR(512) NOT NULL DEFAULT '',
 		tls_http_redirect BOOLEAN DEFAULT FALSE,
@@ -754,8 +755,8 @@ func runMigrations() error {
 		"enable_active_health_check": "BOOLEAN DEFAULT 0",
 		"tls_source":                 "VARCHAR(20) DEFAULT 'manual'",
 		"acme_config_id":             "INTEGER DEFAULT 0",
-		// 引用型证书（2026-10-09）：tls_source='file' 时引用 /app/certs 内成品
-		// 证书文件路径；存量库补列，空串=未使用。
+		// 引用型证书（tls_source='file'）：/app/certs 内成品证书文件的摄取源路径
+		// （内容保存时入库到 tls_cert/tls_key）；存量库补列，空串=未使用。
 		"tls_cert_path": "VARCHAR(512) NOT NULL DEFAULT ''",
 		"tls_key_path":  "VARCHAR(512) NOT NULL DEFAULT ''",
 	}
@@ -1670,9 +1671,11 @@ func normalizeCertJobsCAAvailableAfter() (sql.Result, error) {
 
 // legacyHTTPSHasCertPredicate 是 migrateLegacyHTTPSProtocol 的「有证」判定
 // （SELECT 预判与 UPDATE 归一必须同谓词，否则审计详情与实际分支发散）。
+// 引用型证书与手动证书同口径：内容（tls_cert/tls_key）在库即有证——路径列只是
+// 摄取源记录，渲染不消费，仅路径无内容的行按无证归一（升级/还原后由启动期
+// IngestMissingReferencedCerts 从源文件回填内容，文件也不可用时保持无证）。
 const legacyHTTPSHasCertPredicate = `(
 	(COALESCE(tls_cert,'') != '' AND COALESCE(tls_key,'') != '')
-	OR (tls_source = 'file' AND COALESCE(tls_cert_path,'') != '' AND COALESCE(tls_key_path,'') != '')
 	OR (tls_source = 'acme_dns' AND EXISTS (
 		SELECT 1 FROM cert_jobs
 		WHERE cert_jobs.rule_id = lb_rules.caddy_id

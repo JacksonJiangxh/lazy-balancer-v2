@@ -845,16 +845,17 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			services.Logf("warn", "CreateRule manual TLS certificate warning (rule %s, domain %s): %s", req.Name, req.Domain, warning)
 		}
 	}
-	// 引用型证书（2026-10-09）：引用 /app/certs 内成品文件，不落 PEM——校验路径
-	// 边界与文件有效性后归一落库，并清空内联字段（与 manual 形态互斥）。
+	// 引用型证书：文件只是采集来源——校验路径边界与文件有效性后，把读取到的
+	// PEM 内容摄取入库（tls_cert/tls_key，与 manual 同列）；路径列保留作摄取源
+	// 记录（看门狗据此检测外部更新并同步回写 DB）。
 	if req.EnableTLS && req.TLSSource == "file" {
-		certPath, keyPath, warnings, err := validateReferencedCertificateFiles(req.TLSCertPath, req.TLSKeyPath, req.Domain)
+		certPath, keyPath, certPEM, keyPEM, warnings, err := validateReferencedCertificateFiles(req.TLSCertPath, req.TLSKeyPath, req.Domain)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "引用证书文件校验失败: " + err.Error()})
 			return
 		}
 		req.TLSCertPath, req.TLSKeyPath = certPath, keyPath
-		req.TLSCert, req.TLSKey = "", ""
+		req.TLSCert, req.TLSKey = certPEM, keyPEM
 		certWarnings = warnings
 		for _, warning := range warnings {
 			services.Logf("warn", "CreateRule referenced TLS certificate warning (rule %s, domain %s): %s", req.Name, req.Domain, warning)
@@ -1613,8 +1614,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			}
 		}
 	}
-	// 引用型证书（2026-10-09）：同模式可沿用存量路径（前端编辑回填已带），跨模式
-	// 必须显式提供（空路径由校验层响亮拒绝）；通过后归一落库并清空内联 PEM。
+	// 引用型证书：同模式可沿用存量路径（前端编辑回填已带），跨模式必须显式提供
+	// （空路径由校验层响亮拒绝）；通过后归一落库，并把读取到的 PEM 内容摄取入库
+	// （文件只是采集来源，运行时唯一信任源是数据库）。
 	if (*req.EnableTLS || req.TLSCertPath != "" || req.TLSKeyPath != "") && req.TLSSource == "file" {
 		certPath, keyPath := req.TLSCertPath, req.TLSKeyPath
 		if existingRule.TLSSource == "file" {
@@ -1625,13 +1627,13 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				keyPath = existingRule.TLSKeyPath
 			}
 		}
-		resolvedCert, resolvedKey, warnings, err := validateReferencedCertificateFiles(certPath, keyPath, req.Domain)
+		resolvedCert, resolvedKey, certPEM, keyPEM, warnings, err := validateReferencedCertificateFiles(certPath, keyPath, req.Domain)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "引用证书文件校验失败: " + err.Error()})
 			return
 		}
 		req.TLSCertPath, req.TLSKeyPath = resolvedCert, resolvedKey
-		req.TLSCert, req.TLSKey = "", ""
+		req.TLSCert, req.TLSKey = certPEM, keyPEM
 		certWarnings = warnings
 		for _, warning := range warnings {
 			services.Logf("warn", "UpdateRule referenced TLS certificate warning for caddy_id=%s (domain %s): %s", caddyID, req.Domain, warning)
@@ -1670,7 +1672,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		req.ACMEConfigID = 0
 	}
 	// 形态互斥归一（2026-10-09）：非 file 模式清空引用路径列，避免切走后残留
-	// 悬挂路径（file 模式的内联 PEM 清空已在上方校验分支完成）。
+	// 悬挂路径（file 模式的内联 PEM 摄取入库已在上方校验分支完成）。
 	if req.TLSSource != "file" {
 		req.TLSCertPath, req.TLSKeyPath = "", ""
 	}

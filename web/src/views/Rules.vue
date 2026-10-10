@@ -424,11 +424,11 @@
             <template v-else-if="wizardForm.tls_source === 'file'">
               <el-form-item label="证书文件">
                 <el-input v-model="wizardForm.tls_cert_path" placeholder="如 /app/certs/example.com.crt" />
-                <div class="form-tip-line">直接引用程序可读写目录内的成品证书文件（需位于 /app/certs 目录内），外部更新文件后会自动重载</div>
+                <div class="form-tip-line">引用程序可读写目录内的成品证书文件（需位于 /app/certs 目录内），保存时读取并校验后内容入库；外部更新文件后会自动同步入库并重载</div>
               </el-form-item>
               <el-form-item label="私钥文件">
                 <el-input v-model="wizardForm.tls_key_path" placeholder="如 /app/certs/example.com.key" />
-                <div class="form-tip-line">与证书文件配对的私钥文件路径（需位于 /app/certs 目录内）</div>
+                <div class="form-tip-line">与证书文件配对的私钥文件路径（需位于 /app/certs 目录内），内容随保存入库</div>
               </el-form-item>
             </template>
             <template v-else>
