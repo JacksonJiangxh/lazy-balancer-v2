@@ -69,7 +69,7 @@ docker compose up -d
 # 从源码构建
 # 前端由 Dockerfile 内的 node 构建阶段产出，无需先本地 npm build
 docker buildx build --platform linux/amd64,linux/arm64 \
-  --build-arg VERSION=v2.3.4 \
+  --build-arg VERSION=v2.3.5 \
   --provenance=false --sbom=false \
   -t docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest --push .
 ```
@@ -87,15 +87,18 @@ amd64/arm64 双架构原生构建 → 真容器探活 → 推送到 CNB 制品�
 
 ## 我们相对上游改了什么
 
-这里只列「人话版」的能力差异，逐文件的合并对账见
-[上游合并清单](docs/upstream-merge.zh-CN.md)。
+**当前上游基线：`v2.3.5`（`98c607ac`）。** 上游在这个版本里的迭代
+（回源域名原生 `map` 晚绑定、静态响应 `response_mode` 三值、健康检查域名、
+SNI 剥端口、仪表盘分位数插值、第 69 轮 151 项审计修复等）已全部吃进，
+逐条对账见[上游合并清单](docs/upstream-merge.zh-CN.md)。
+
+下表只列「人话版」的**我们独有**能力（上游没有的部分）：
 
 | 改动 | 说明 |
 |---|---|
 | 链式回退负载策略 | 一路后端全挂/全 404 时按配置回退到下一组，且不透传后端错误报文 |
 | 引用型证书摄取入库 | `tls_source=file` 改为保存时读取 PEM 入库，DB 成为唯一信任源；外部文件变更由看门狗回写并热重载 |
 | 端口换位 | `HTTP_PORT` / `HTTPS_PORT` / `PANEL_PORT` 三个环境变量正式换位，只影响默认语义，不动存量规则 |
-| 自定义路由回源 Host | 自定义路由上游的回源 Host 改为渲染期内部推导，**规则设定里不新增任何字段** |
 | 引用证书更新放行 | 修掉更新规则时引用证书文件来源被误拦的问题 |
 | 上游版本巡检 | CNB 定时任务检查上游新 release，发现即开 Issue 提醒 |
 
@@ -147,7 +150,8 @@ amd64/arm64 双架构原生构建 → 真容器探活 → 推送到 CNB 制品�
 
 | 日期 | 内容 |
 |---|---|
-| 2026-10-11 | 端口换位补齐默认口漏网点；自定义路由回源 Host 改为渲染期推导；引用证书摄取入库；链式回退策略；新增 GitHub Actions 上游同步 + CNB 上游巡检；重写 README；`docker-compose` 引用改为自维护镜像 |
+| 2026-10-11 | **合入上游 v2.3.5**（`98c607ac`）：逐上游回源域名改吃上游 `origin_domain` + 原生 `map`，静态响应改吃上游 `response_mode` 三值——自研 `host_header` / `action=respond` 两套实现退役，存量数据自动双向迁移；保留链式回退、引用型证书摄取入库、端口换位三项自维护能力 |
+| 2026-10-11 | 端口换位补齐默认口漏网点；引用证书摄取入库；链式回退策略；新增 GitHub Actions 上游同步 + CNB 上游巡检；重写 README；`docker-compose` 引用改为自维护镜像 |
 
 ## 技术栈
 

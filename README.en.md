@@ -77,7 +77,7 @@ docker compose up -d
 # The frontend is produced by the node build stage inside the Dockerfile,
 # so there is no need to run npm build locally first
 docker buildx build --platform linux/amd64,linux/arm64 \
-  --build-arg VERSION=v2.3.4 \
+  --build-arg VERSION=v2.3.5 \
   --provenance=false --sbom=false \
   -t docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest --push .
 ```
@@ -97,15 +97,21 @@ and `.cnb/web_trigger.yml`.
 
 ## What we changed versus upstream
 
-A plain-language view; the file-by-file reconciliation is in the
-[upstream merge checklist](docs/upstream-merge.zh-CN.md).
+**Current upstream baseline: `v2.3.5` (`98c607ac`).** Everything upstream
+shipped in that release (native `map` late-binding for origin domains,
+`response_mode` tri-state for static responses, health-check host, SNI port
+stripping, dashboard quantile interpolation, the 151-item round-69 audit, etc.)
+is already merged in — see the
+[upstream merge checklist](docs/upstream-merge.zh-CN.md) for the itemized
+reconciliation.
+
+The table below lists only capabilities **unique to us** (not in upstream):
 
 | Change | Description |
 |---|---|
 | Chained fallback strategy | Fall back to the next upstream group when a whole group is down or all-404, without leaking backend error bodies |
 | Referenced certificate ingestion | `tls_source=file` now reads PEM into the DB on save, making the DB the single source of truth; external file changes are written back and hot-reloaded by a watchdog |
 | Port remapping | `HTTP_PORT` / `HTTPS_PORT` / `PANEL_PORT` officially remap listen ports; default semantics only, existing rules untouched |
-| Custom-route origin Host | Origin Host for custom-route upstreams is derived internally at render time — **no new fields in the rule editor** |
 | Referenced cert update fix | Fixes referenced cert file sources being wrongly rejected on rule update |
 | Upstream release watch | A CNB scheduled job checks for new upstream releases and opens an issue when one appears |
 
@@ -159,7 +165,8 @@ releases.
 
 | Date | Content |
 |---|---|
-| 2026-10-11 | Port remap edge cases; custom-route origin Host derived at render time; referenced certificate ingestion; chained fallback strategy; GitHub Actions upstream sync + CNB upstream watch; README rewrite; `docker-compose` now references our own image |
+| 2026-10-11 | **Merged upstream v2.3.5** (`98c607ac`): per-upstream origin domain now uses upstream `origin_domain` + native `map`, static responses use upstream `response_mode` tri-state — our `host_header` / `action=respond` implementations retired, with automatic two-way data migration; chained fallback, referenced-cert ingestion and port remapping kept |
+| 2026-10-11 | Port remap edge cases; referenced certificate ingestion; chained fallback strategy; GitHub Actions upstream sync + CNB upstream watch; README rewrite; `docker-compose` now references our own image |
 
 ## Tech Stack
 

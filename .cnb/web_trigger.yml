@@ -20,7 +20,7 @@ branch:
             required: true
             # 默认值需与 Dockerfile 的 ARG VERSION 人工对齐；改 Dockerfile 版本时
             # 记得同步这里，否则不填会用旧版本号发布。
-            default: v2.3.4
+            default: v2.3.5
         permissions:
           # 还需具备仓库写权限；角色向上包含（owner 权限高于 master）
           roles:
