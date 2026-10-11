@@ -11,8 +11,8 @@ export interface Upstream {
   enabled: boolean
   protocol: UpstreamProtocol
   max_connections: number
-  // 逐上游回源 Host：空=回退规则级 host_header，仍空=回退上游自身 host:port
-  host_header: string
+  // 逐上游回源域名（2026-10-10）：驱动该上游回源 Host 头与 HTTPS SNI；空=跟随后端域名
+  origin_domain?: string
 }
 
 export type UpstreamInput = Omit<Upstream, 'id' | 'rule_id'> & {
@@ -46,13 +46,13 @@ export interface PathRule {
   upstream_path: string
   sort_order: number
   upstreams: PathRuleUpstream[] | null
-  // 静态响应（action='respond'）：status_code 为预置响应码；redirect_url 供 3xx 生成
-  // Location；response_body 为响应体（3xx/204 不使用）；content_type 留空按状态码兜底
-  action: PathRuleAction
-  status_code: number
-  redirect_url: string
-  response_body: string
-  content_type: string
+  // 直接返回/301 跳转（2026-10-10 用户裁定）：''=转发上游（现状）/static=静态响应/redirect=301 跳转
+  // 'forward' 为 UI 选择器哨兵（el-select 空串选项不显示标签，显示为「请选择」）——提交时归一为 ''
+  response_mode?: '' | 'static' | 'redirect' | 'forward'
+  response_status?: number
+  response_body?: string
+  response_content_type?: '' | 'text/plain' | 'application/json' | 'text/html'
+  redirect_to?: string
 }
 
 export interface ProxyTimeoutConfig {
@@ -95,6 +95,8 @@ export interface Rule extends ProxyTimeoutConfig {
   chain_race_interval_ms: number
   chain_request_timeout_ms: number
   host_header: string
+  // 健康检查域名：主动健康检查 probe 的 Host 头；空=跟随 host_header
+  health_check_host?: string
   upstreams: Upstream[] | null
   enable_tls: boolean
   tls_source: string
@@ -155,6 +157,7 @@ export interface CreateRuleRequest extends ProxyTimeoutConfig {
   custom_routes_enabled: boolean
   path_rules: PathRule[]
   host_header: string
+  health_check_host?: string
   upstreams: UpstreamInput[]
   enable_tls: boolean
   tls_source: string
@@ -182,7 +185,10 @@ export interface UpdateRuleRequest extends Omit<CreateRuleRequest,
   | 'tcp_proxy_protocol'
   | keyof ProxyTimeoutConfig
   | 'path_rules'
-  | 'ca_provider_id'> {
+  | 'ca_provider_id'
+  | 'host_header'> {
+  // host_header 可选（2026-10-10 向导退役后端域名配置项）：省略=保留原值（后端 *string 合并语义）
+  host_header?: string
   request_body_max_size_mb?: number
   upstream_keepalive_timeout?: number
   server_tokens_hidden?: number

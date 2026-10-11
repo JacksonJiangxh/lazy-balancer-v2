@@ -757,6 +757,35 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 
+	// R69 C-N1：CreateRule 补 tcp-TLS 归一（R62 C2-N1 五层入口漏掉的第 5 个）——
+	// TCP 规则不终结入站 TLS，保留 enable_tls=1 落库成死形态行（tcp+acme 组合
+	// 还会产生永不消费证书的僵尸续签任务）。与 UpdateRule 归一分支同语义。
+	// LBH-A-U2（第 69 轮）：归一前移至全部 TLS 相关校验（来源白名单/手动证书
+	// 材料/ACME 域名形状）之前——归一后 EnableTLS=false，校验自然跳过；此前
+	// TCP+enable_tls:true+空/bogus tls_source 创建恒 400 而同形态更新放行 200。
+	// LBH-A-U1（第 69 轮）：归一族扩展至全部 HTTP 专属死配置字段（host_header/
+	// health_check_path/enable_compress/compress_types/request_body_max_size_mb/
+	// upstream_keepalive_timeout/server_tokens_hidden）——TCP 渲染零消费
+	// （buildTCPServer/buildTCPProxyRoute grep 实证），携带即弃置，与
+	// protocolChanged 切换归零同格；存量行渲染忽略（不动数据），编辑自愈。
+	if req.Protocol == "tcp" {
+		req.EnableTLS = false
+		req.TLSSource = "manual"
+		req.TLSCert, req.TLSKey = "", ""
+		req.ACMEConfigID = 0
+		req.HostHeader = ""
+		req.HealthCheckPath = ""
+		req.EnableCompress = false
+		req.CompressTypes = ""
+		req.RequestBodyMaxSizeMB = 0
+		req.UpstreamKeepaliveTimeout = 0
+		req.ServerTokensHidden = 0
+		// U3-1:阶段页 4 列仅 http 渲染消费——tcp 创建携带页引用即归一 0
+		// (跟随策略),不留永不消费的死引用。
+		req.BlockPageStage1ID, req.BlockPageStage1Status = 0, 0
+		req.BlockPageStage3ID, req.BlockPageStage3Status = 0, 0
+	}
+
 	if req.Protocol == "http" && strings.TrimSpace(req.Domain) == "" {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "HTTP/HTTPS 规则的域名不能为空"})
 		return
@@ -875,7 +904,9 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		}
 	}
 
-	if req.CompressTypes == "" {
+	// LBH-A-U1：gzip 默认仅 http 注入——TCP 归一（创建头部）已清零
+	// CompressTypes，此处不重建死配置（压缩是 HTTP 渲染语义）。
+	if req.Protocol != "tcp" && req.CompressTypes == "" {
 		req.CompressTypes = "gzip"
 	}
 
@@ -890,21 +921,6 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	if req.ServerTokensHidden < 0 || req.ServerTokensHidden > 2 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "server_tokens_hidden 必须为 0、1 或 2"})
 		return
-	}
-	// R69 C-N1：CreateRule 补 tcp-TLS 归一（R62 C2-N1 五层入口漏掉的第 5 个）——
-	// TCP 规则不终结入站 TLS，保留 enable_tls=1 落库成死形态行（tcp+acme 组合
-	// 还会产生永不消费证书的僵尸续签任务）。与 UpdateRule 归一分支同语义。
-	if req.Protocol == "tcp" {
-		req.EnableTLS = false
-		req.TLSSource = "manual"
-		req.TLSCert, req.TLSKey = "", ""
-		req.ACMEConfigID = 0
-		// CERT41-4:证书材料随 TCP 归一弃置——其质量警告不得随审计留痕(误导)。
-		certWarnings = nil
-		// U3-1:阶段页 4 列仅 http 渲染消费——tcp 创建携带页引用即归一 0
-		// (跟随策略),不留永不消费的死引用。
-		req.BlockPageStage1ID, req.BlockPageStage1Status = 0, 0
-		req.BlockPageStage3ID, req.BlockPageStage3Status = 0, 0
 	}
 	features := createRuleFeatures(req)
 	if err := validateRuleFeatures(features); err != nil {
@@ -983,10 +999,10 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		chain_race_interval_ms, chain_request_timeout_ms,
 		custom_routes_enabled,
 		proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
-		host_header, enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_cert_path, tls_key_path, tls_http_redirect,
+		host_header, health_check_host, enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_cert_path, tls_key_path, tls_http_redirect,
 		enable_compress, compress_types, enabled, created_by, updated_at, caddy_id, log_enabled,
 		block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, req.Name, req.Description, req.Protocol, req.Domain, req.ListenPort, req.Strategy, req.DynamicDNS, req.EnableDnsServer, req.DnsServer, req.DnsFamily,
 		req.HealthCheckPath, req.HealthCheckInterval, req.HealthCheckTimeout,
 		req.HealthCheckUnhealthyThreshold, req.HealthCheckHealthyThreshold,
@@ -995,7 +1011,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		features.ChainRaceIntervalMS, features.ChainRequestTimeoutMS,
 		features.CustomRoutesEnabled,
 		features.ProxyDialTimeout, features.ProxyResponseHeaderTimeout, features.ProxyReadTimeout, features.ProxyWriteTimeout, features.ProxyStreamTimeout, features.ProxyFlushInterval, features.ProxyStreamCloseDelay,
-		req.HostHeader, req.EnableTLS, req.TLSSource, req.ACMEConfigID, req.CAProviderID, req.TLSCert, req.TLSKey, req.TLSCertPath, req.TLSKeyPath,
+		req.HostHeader, req.HealthCheckHost, req.EnableTLS, req.TLSSource, req.ACMEConfigID, req.CAProviderID, req.TLSCert, req.TLSKey, req.TLSCertPath, req.TLSKeyPath,
 		req.TLSHTTPRedirect, req.EnableCompress, req.CompressTypes, enabledVal, userIDInt, time.Now().UTC().Format("2006-01-02 15:04:05"), caddyID, req.LogEnabled,
 		req.BlockPageStage1ID, req.BlockPageStage1Status, req.BlockPageStage3ID, req.BlockPageStage3Status)
 
@@ -1017,10 +1033,12 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 				u.Protocol = "http"
 			}
 		}
-		// Round 37 I-11: HTTP 规则上游 protocol=tls 静默当 http 处理（与 TCP 行为不对称），显式拒绝。
-		_, err = tx.Exec(`INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, host_header)
+		// Round 37 I-11：非协议族的上游 protocol（如 HTTP 规则携带 tls，此前
+		// 静默当 http 处理，与 TCP 行为不对称）已在 validateRulePayloadBeforeSave
+		// 显式 400 拒绝——此处 INSERT 只写归一后的合法值。
+		_, err = tx.Exec(`INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			caddyID, u.Host, u.Port, u.Weight, u.DynamicDNS, u.Enabled, u.Protocol, u.MaxConnections, u.HostHeader)
+			caddyID, u.Host, u.Port, u.Weight, u.DynamicDNS, u.Enabled, u.Protocol, u.MaxConnections, u.OriginDomain)
 		if err != nil {
 			tx.Rollback()
 			services.Logf("error", "CreateRule upstream insert error: %v", err)
@@ -1059,7 +1077,9 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		cleanupCommitted := false
 		defer func() {
 			if !cleanupCommitted {
-				if rollbackErr := cleanupTx.Rollback(); rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+				// LBH-A-U4 附带（第 69 轮）：ErrTxDone 判定统一 errors.Is（与
+				// 本文件其余五处回滚守卫同格，裸 != 不穿透包装）。
+				if rollbackErr := cleanupTx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
 					services.Logf("error", "CreateRule compensation rollback failed for caddy_id=%s: %v", caddyID, rollbackErr)
 				}
 			}
@@ -1175,7 +1195,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 		COALESCE(custom_routes_enabled,0),
 		COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
-		COALESCE(host_header,''), COALESCE(enable_compress,1), COALESCE(compress_types,'gzip'),
+		COALESCE(host_header,''), COALESCE(health_check_host,''), COALESCE(enable_compress,1), COALESCE(compress_types,'gzip'),
 		IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0), name, description
 	FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(
 		&existingRule.Protocol, &existingRule.Domain, &existingRule.ListenPort, &existingRule.Strategy,
@@ -1190,7 +1210,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		&existingRule.ChainRaceIntervalMS, &existingRule.ChainRequestTimeoutMS,
 		&existingRule.CustomRoutesEnabled,
 		&existingRule.ProxyDialTimeout, &existingRule.ProxyResponseHeaderTimeout, &existingRule.ProxyReadTimeout, &existingRule.ProxyWriteTimeout, &existingRule.ProxyStreamTimeout, &existingRule.ProxyFlushInterval, &existingRule.ProxyStreamCloseDelay,
-		&existingRule.HostHeader, &existingRule.EnableCompress, &existingRule.CompressTypes,
+		&existingRule.HostHeader, &existingRule.HealthCheckHost, &existingRule.EnableCompress, &existingRule.CompressTypes,
 		&existingRule.Enabled, &existingRule.LogEnabled, &existingRule.Name, &existingRule.Description)
 	if err != nil {
 		// SLB10-N2:分判 ErrNoRows 与真实 DB 故障(同 EnableRule 口径)——
@@ -1212,7 +1232,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// Round 34 F-1: 存量 upstreams.enabled 无 NOT NULL，NULL 行裸 scan 进 bool 会 500；
 	// IIF 与生成侧（services/caddy.go）同口径：NULL 视同禁用，回写/回滚保持同一有效状态。
 	var oldUpstreams []models.Upstream
-	oldUpstreamRows, err := db.DB.Query("SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(host_header,'') FROM upstreams WHERE rule_id = ?", caddyID)
+	oldUpstreamRows, err := db.DB.Query("SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'') FROM upstreams WHERE rule_id = ?", caddyID)
 	if err != nil {
 		services.Logf("error", "UpdateRule failed to read existing upstreams for caddy_id=%s: %v", caddyID, err)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取现有上游服务器失败"})
@@ -1220,7 +1240,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 	for oldUpstreamRows.Next() {
 		var u models.Upstream
-		if err := oldUpstreamRows.Scan(&u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.HostHeader); err != nil {
+		if err := oldUpstreamRows.Scan(&u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain); err != nil {
 			if closeErr := oldUpstreamRows.Close(); closeErr != nil {
 				services.Logf("error", "UpdateRule failed to close existing upstream cursor for caddy_id=%s: %v", caddyID, closeErr)
 			}
@@ -1352,6 +1372,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.HostHeader == nil {
 		req.HostHeader = &existingRule.HostHeader
 	}
+	if req.HealthCheckHost == nil {
+		req.HealthCheckHost = &existingRule.HealthCheckHost
+	}
 	if req.Name == "" {
 		req.Name = existingRule.Name
 	}
@@ -1398,6 +1421,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			req.DnsServer = &empty
 			req.DnsFamily = ""
 			req.HostHeader = &empty
+			req.HealthCheckHost = &empty
 			req.EnableCompress = &disabled
 			req.CompressTypes = ""
 			// U3-1:阶段页 4 列仅 http 渲染消费,切换即清零(0=跟随策略)——
@@ -1427,6 +1451,17 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.Protocol == "tcp" {
 		tcpDisabled := false
 		tcpZero := 0
+		// LBH-A-U1（第 69 轮）：HTTP 专属死配置字段族随 TCP 编辑归一归零——
+		// 与 protocolChanged 分支切换归零同格；存量/导入残留与显式携带一律
+		// 弃置（TCP 渲染零消费），不随快照/导出/复制放大。
+		tcpEmpty := ""
+		req.HostHeader = &tcpEmpty
+		req.HealthCheckPath = &tcpEmpty
+		req.EnableCompress = &tcpDisabled
+		req.CompressTypes = ""
+		req.RequestBodyMaxSizeMB = &tcpZero
+		req.UpstreamKeepaliveTimeout = &tcpZero
+		req.ServerTokensHidden = &tcpZero
 		req.EnableTLS = &tcpDisabled
 		req.TLSSource = "manual"
 		req.TLSCert, req.TLSKey = "", ""
@@ -1521,10 +1556,11 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 
 	// Load existing upstreams if not provided in request
 	// LB43-4(第 43 轮):nil 判定区分「省略」与「显式空数组」——len==0 会把显式
-	// [] 归并进保留存量,与 updateRuleFeatures(:87 按 nil 判空)的校验输入分叉。
-	// 显式 []=非合法形态:下游 validateRulePayloadBeforeSave「至少需要一个上游
-	// 服务器」(handlers.go:546)400 拒绝、存量不变(U3-3 注释纠正:此处曾误称
-	// 「显式 []=清空,零上游为合法形态」——实际清空路径被 400 拒绝,LB43-4 裁定)。
+	// [] 归并进保留存量。显式 []=非合法形态:下游 validateRulePayloadBeforeSave
+	// 「至少需要一个上游服务器」(handlers.go)400 拒绝、存量不变(U3-3 注释纠正:
+	// 此处曾误称「显式 []=清空,零上游为合法形态」——实际清空路径被 400 拒绝,
+	// LB43-4 裁定)。updateRuleFeatures 按调用契约直接消费合并后的 req.Upstreams
+	// （LBH-A-D2，第 69 轮删死分支后不再按 nil 判空）。
 	if req.Upstreams == nil {
 		req.Upstreams = oldUpstreams
 	}
@@ -1532,6 +1568,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		for index := range req.Upstreams {
 			switch req.Protocol {
 			case "tcp":
+				// LBH-A-L1（第 69 轮 P2）：回源域名是 HTTP-only 语义——切换即弃置
+				//（与 host_header/health_check_host 归零同格），否则隐藏残留字段
+				// 被「回源域名仅 HTTP 规则支持」门恒拒，卡死保存。
+				req.Upstreams[index].OriginDomain = ""
 				switch req.Upstreams[index].Protocol {
 				case "", "http":
 					req.Upstreams[index].Protocol = "tcp"
@@ -1653,7 +1693,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 	}
 
-	// R71 N-1：端口类 400 前移至快照/validate 之前（与 CreateRule :632/:636 顺序对齐）
+	// R71 N-1：端口类 400 前移至快照/validate 之前（与 CreateRule 的
+	// validateRuleListenPortForSave/validatePortFromDB 前置顺序对齐）
 	// ——TCP 候选 server 名含端口，validate 经 /load 真实加载会把同端口启用中规则 B
 	// 的 server 替换为候选（跨规则流量顶替），此前端口冲突在 validate 之后才拒绝且
 	// 无运行配置恢复。前移后该场景在副作用发生前拦截。
@@ -1762,16 +1803,18 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	args = append(args, features.ProxyStreamCloseDelay)
 	query += "host_header = ?, "
 	args = append(args, derefStr(req.HostHeader))
+	query += "health_check_host = ?, "
+	args = append(args, derefStr(req.HealthCheckHost))
 	query += "enable_tls = ?, "
 	args = append(args, *req.EnableTLS)
 	query += "tls_source = ?, "
 	args = append(args, req.TLSSource)
 	query += "acme_config_id = ?, "
 	args = append(args, req.ACMEConfigID)
-	if req.CAProviderID != nil {
-		query += "ca_provider_id = ?, "
-		args = append(args, *req.CAProviderID)
-	}
+	// LBH-A-D2（第 69 轮）：ca_provider_id 恒随更新写入——前方合并区已保证
+	// req.CAProviderID 非 nil（nil=沿用存量），原 if 条件恒真。
+	query += "ca_provider_id = ?, "
+	args = append(args, *req.CAProviderID)
 	if req.BlockPageStage1ID != nil {
 		query += "block_page_stage1_id = ?, "
 		args = append(args, *req.BlockPageStage1ID)
@@ -1892,7 +1935,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "写入数据库失败（确认规则更新结果）: " + err.Error()})
 		return
 	}
-	services.Logf("debug", "UpdateRule executed for caddy_id=%s: rows_affected=%d ca_provider_id_included=%v", caddyID, rowsAffected, req.CAProviderID != nil)
+	services.Logf("debug", "UpdateRule executed for caddy_id=%s: rows_affected=%d", caddyID, rowsAffected)
 	if rowsAffected == 0 {
 		tx.Rollback()
 		// R71 N-1：409 早退（非终态证书任务在途）。裁定 ④' 后保存路径无预校验
@@ -1979,10 +2022,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// disabled 任务行永驻,再启用时按新域查不到任务另建新行,破坏「一规则
 	// 一任务」不变量(块内 needJob 判定仍按启用语义执行)。
 	if *req.EnableTLS && req.TLSSource == "acme_dns" && req.Protocol == "http" && domain != "" {
-		caProviderID := existingRule.CAProviderID
-		if req.CAProviderID != nil {
-			caProviderID = *req.CAProviderID
-		}
+		// LBH-A-D2 同族（第 69 轮）：合并区已保证 req.CAProviderID 非 nil，
+		// 原 if 判空恒真，直接解引用。
+		caProviderID := *req.CAProviderID
 		resolvedCAProviderID, resolveErr := services.ResolveCAProviderID(caProviderID)
 		resolvedExistingCAProviderID, resolveExistingErr := services.ResolveCAProviderID(existingRule.CAProviderID)
 		if resolveErr != nil || resolveExistingErr != nil {
@@ -2316,7 +2358,7 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 	committed := false
 	defer func() {
 		if !committed {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) { // LBH-A-U4 附带（第 69 轮）：统一 errors.Is
 				services.Logf("error", "DeleteRule transaction rollback failed for caddy_id=%s: %v", caddyID, rollbackErr)
 			}
 		}
@@ -2468,6 +2510,16 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		// 不再放大到副本,副本落 0(跟随策略)。
 		rule.BlockPageStage1ID, rule.BlockPageStage1Status = 0, 0
 		rule.BlockPageStage3ID, rule.BlockPageStage3Status = 0, 0
+		// LBH-A-U1（第 69 轮）：HTTP 专属死配置字段族不放大到副本——与
+		// CreateRule/UpdateRule 归一同口径（TCP 渲染零消费，源行存量/导入
+		// 残留复制即弃置）。
+		rule.HostHeader = ""
+		rule.HealthCheckPath = ""
+		rule.EnableCompress = false
+		rule.CompressTypes = ""
+		rule.RequestBodyMaxSizeMB = 0
+		rule.UpstreamKeepaliveTimeout = 0
+		rule.ServerTokensHidden = 0
 	}
 
 	userIDInt := contextUserID(c)
@@ -2552,11 +2604,11 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden,
 			chain_race_interval_ms, chain_request_timeout_ms,
 			enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_cert_path, tls_key_path,
-	tls_http_redirect, enable_compress, compress_types, enabled, created_by, updated_by, created_at, updated_at, host_header, log_enabled, caddy_id,
+	tls_http_redirect, enable_compress, compress_types, enabled, created_by, updated_by, created_at, updated_at, host_header, health_check_host, log_enabled, caddy_id,
 		custom_routes_enabled,
 		proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
 		block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, rule.Name+"（副本）", rule.Description, rule.Protocol, rule.Domain, rule.ListenPort, rule.Strategy,
 		rule.DynamicDNS, rule.EnableDnsServer, rule.DnsServer, rule.DnsFamily, rule.HealthCheckPath, rule.HealthCheckInterval, rule.HealthCheckTimeout,
 		rule.HealthCheckUnhealthyThreshold, rule.HealthCheckHealthyThreshold,
@@ -2565,7 +2617,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		rule.ChainRaceIntervalMS, rule.ChainRequestTimeoutMS,
 		rule.EnableTLS, rule.TLSSource, rule.ACMEConfigID, rule.CAProviderID, rule.TLSCert, rule.TLSKey, rule.TLSCertPath, rule.TLSKeyPath,
 		rule.TLSHTTPRedirect, rule.EnableCompress, rule.CompressTypes, 0, userIDInt, userIDInt,
-		now, now, rule.HostHeader, rule.LogEnabled, newCaddyID,
+		now, now, rule.HostHeader, rule.HealthCheckHost, rule.LogEnabled, newCaddyID,
 		rule.CustomRoutesEnabled,
 		rule.ProxyDialTimeout, rule.ProxyResponseHeaderTimeout, rule.ProxyReadTimeout, rule.ProxyWriteTimeout, rule.ProxyStreamTimeout, rule.ProxyFlushInterval, rule.ProxyStreamCloseDelay,
 		rule.BlockPageStage1ID, rule.BlockPageStage1Status, rule.BlockPageStage3ID, rule.BlockPageStage3Status,
@@ -2580,7 +2632,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	// F50-1（第 50 轮审计）：dynamic_dns 同列同病——legacy NULL 行裸 scan
 	// NULL→bool 报错恒 500，按 0 归一（遗留死列，渲染只读规则级值）。
 	upstreamRows, err := tx.Query(`
-		SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(host_header,'')
+		SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'')
 		FROM upstreams WHERE rule_id = ?
 	`, caddyID)
 	if err != nil {
@@ -2596,17 +2648,17 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 			Enabled        bool
 			Protocol       string
 			MaxConnections int
-			HostHeader     string
+			OriginDomain   string
 		}
-		if err := upstreamRows.Scan(&u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.HostHeader); err != nil {
+		if err := upstreamRows.Scan(&u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain); err != nil {
 			upstreamRows.Close()
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "扫描上游失败，已回滚: " + err.Error()})
 			return
 		}
 		if _, err := tx.Exec(`
-			INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, host_header)
+			INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, newCaddyID, u.Host, u.Port, u.Weight, u.DynamicDNS, u.Enabled, u.Protocol, u.MaxConnections, u.HostHeader); err != nil {
+		`, newCaddyID, u.Host, u.Port, u.Weight, u.DynamicDNS, u.Enabled, u.Protocol, u.MaxConnections, u.OriginDomain); err != nil {
 			upstreamRows.Close()
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "复制上游失败，已回滚: " + err.Error()})
 			return
@@ -2626,8 +2678,8 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 
 	if rule.CustomRoutesEnabled {
 		if _, err := tx.Exec(`
-			INSERT INTO path_rules (rule_id, sort_order, match_type, path, upstream_path, upstreams_json, action, status_code, redirect_url, response_body, content_type, created_at, updated_at)
-			SELECT ?, sort_order, match_type, path, upstream_path, upstreams_json, action, status_code, redirect_url, response_body, content_type, datetime('now'), datetime('now') FROM path_rules WHERE rule_id = ?
+		INSERT INTO path_rules (rule_id, sort_order, match_type, path, upstream_path, upstreams_json, response_mode, response_status, response_body, response_content_type, redirect_to, created_at, updated_at)
+		SELECT ?, sort_order, match_type, path, upstream_path, upstreams_json, response_mode, response_status, response_body, response_content_type, redirect_to, datetime('now'), datetime('now') FROM path_rules WHERE rule_id = ?
 		`, newCaddyID, caddyID); err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "复制路径规则失败，已回滚: " + err.Error()})
 			return
@@ -2677,7 +2729,7 @@ type storedUpstream struct {
 	enabled        bool
 	protocol       string
 	maxConnections int
-	hostHeader     string
+	originDomain   string
 	needsNormalize bool
 }
 
@@ -2696,8 +2748,8 @@ type storedUpstream struct {
 // （weight 0→1、protocol 默认、tls 校验），内容比较以终值为准。
 func replaceUpstreamsTx(ctx context.Context, tx *sql.Tx, ruleID string, upstreams []models.Upstream) error {
 	rows, err := tx.QueryContext(ctx, `SELECT id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0),
-		IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(host_header,''),
-		(weight IS NULL OR dynamic_dns IS NULL OR enabled IS NULL OR protocol IS NULL OR max_connections IS NULL OR host_header IS NULL)
+		IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,''),
+		(weight IS NULL OR dynamic_dns IS NULL OR enabled IS NULL OR protocol IS NULL OR max_connections IS NULL)
 		FROM upstreams WHERE rule_id = ? ORDER BY id`, ruleID)
 	if err != nil {
 		return fmt.Errorf("读取规则 %s 的上游: %w", ruleID, err)
@@ -2705,7 +2757,7 @@ func replaceUpstreamsTx(ctx context.Context, tx *sql.Tx, ruleID string, upstream
 	var existing []storedUpstream
 	for rows.Next() {
 		var row storedUpstream
-		if err := rows.Scan(&row.id, &row.host, &row.port, &row.weight, &row.dynamicDNS, &row.enabled, &row.protocol, &row.maxConnections, &row.hostHeader, &row.needsNormalize); err != nil {
+		if err := rows.Scan(&row.id, &row.host, &row.port, &row.weight, &row.dynamicDNS, &row.enabled, &row.protocol, &row.maxConnections, &row.originDomain, &row.needsNormalize); err != nil {
 			rows.Close()
 			return fmt.Errorf("解析规则 %s 的上游: %w", ruleID, err)
 		}
@@ -2725,8 +2777,7 @@ func replaceUpstreamsTx(ctx context.Context, tx *sql.Tx, ruleID string, upstream
 	for _, u := range upstreams {
 		incoming := storedUpstream{
 			host: u.Host, port: u.Port, weight: u.Weight, dynamicDNS: u.DynamicDNS,
-			enabled: u.Enabled, protocol: u.Protocol, maxConnections: u.MaxConnections,
-			hostHeader: u.HostHeader,
+			enabled: u.Enabled, protocol: u.Protocol, maxConnections: u.MaxConnections, originDomain: u.OriginDomain,
 		}
 		// ① 显式 id 命中（前端编辑既有行回传真实 id）
 		if index, ok := indexByID[u.ID]; ok && !consumed[index] {
@@ -2761,9 +2812,9 @@ func replaceUpstreamsTx(ctx context.Context, tx *sql.Tx, ruleID string, upstream
 		}
 	}
 	for _, insert := range inserts {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, host_header)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			ruleID, insert.host, insert.port, insert.weight, insert.dynamicDNS, insert.enabled, insert.protocol, insert.maxConnections, insert.hostHeader); err != nil {
+			ruleID, insert.host, insert.port, insert.weight, insert.dynamicDNS, insert.enabled, insert.protocol, insert.maxConnections, insert.originDomain); err != nil {
 			return fmt.Errorf("写入规则 %s 的上游 %s:%d: %w", ruleID, insert.host, insert.port, err)
 		}
 	}
@@ -2782,7 +2833,7 @@ func matchStoredUpstream(existing []storedUpstream, consumed []bool, incoming st
 			continue
 		}
 		if exactContent && (row.needsNormalize || row.weight != incoming.weight || row.dynamicDNS != incoming.dynamicDNS ||
-			row.enabled != incoming.enabled || row.maxConnections != incoming.maxConnections || row.hostHeader != incoming.hostHeader) {
+			row.enabled != incoming.enabled || row.maxConnections != incoming.maxConnections || row.originDomain != incoming.originDomain) {
 			continue
 		}
 		return index
@@ -2795,12 +2846,11 @@ func matchStoredUpstream(existing []storedUpstream, consumed []bool, incoming st
 func updateUpstreamTx(ctx context.Context, tx *sql.Tx, row, incoming storedUpstream) error {
 	if !row.needsNormalize && row.host == incoming.host && row.port == incoming.port && row.protocol == incoming.protocol &&
 		row.weight == incoming.weight && row.dynamicDNS == incoming.dynamicDNS &&
-		row.enabled == incoming.enabled && row.maxConnections == incoming.maxConnections &&
-		row.hostHeader == incoming.hostHeader {
+		row.enabled == incoming.enabled && row.maxConnections == incoming.maxConnections && row.originDomain == incoming.originDomain {
 		return nil
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE upstreams SET host=?, port=?, weight=?, dynamic_dns=?, enabled=?, protocol=?, max_connections=?, host_header=? WHERE id=?`,
-		incoming.host, incoming.port, incoming.weight, incoming.dynamicDNS, incoming.enabled, incoming.protocol, incoming.maxConnections, incoming.hostHeader, row.id); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE upstreams SET host=?, port=?, weight=?, dynamic_dns=?, enabled=?, protocol=?, max_connections=?, origin_domain=? WHERE id=?`,
+		incoming.host, incoming.port, incoming.weight, incoming.dynamicDNS, incoming.enabled, incoming.protocol, incoming.maxConnections, incoming.originDomain, row.id); err != nil {
 		return err
 	}
 	return nil

@@ -35,7 +35,8 @@
               <!-- 锁 hover 摘要（不可点击）：按阶段 0/1/2/3 分组的紧凑摘要；
                    「查看完整处理流程」链接跳转流程弹框（跳转前 hide 本 popover 防遮挡）。
                    2026-09-21 用户裁定：HTTP/HTTPS 规则恒显示锁（未绑定=warning 黄锁，
-                   四阶段灰态「未启用」；绑定=is-allow 绿锁现状）；TCP 规则不显示。 -->
+                   四阶段灰态「未启用」；绑定=is-allow 绿锁现状）；TCP 规则显示灰色锁
+                   （2026-10-10 用户裁定，无弹框，hover 提示不支持原因）。 -->
               <el-popover
                 v-if="row.protocol === 'http'"
                 :ref="(el: unknown) => setLockPopover(row.caddy_id, el)"
@@ -80,6 +81,14 @@
                   <div class="lock-summary-hint"><el-link type="primary" class="lock-flow-link" @click="openFlowFromLock(row)">查看完整处理流程 →</el-link></div>
                 </div>
               </el-popover>
+              <!-- TCP 灰色锁（2026-10-10 用户裁定）：无弹框，hover 提示不支持原因 -->
+              <el-tooltip
+                v-else-if="row.protocol === 'tcp'"
+                placement="top"
+                content="TCP 规则不支持安全策略"
+              >
+                <el-icon :size="14" class="acl-lock-icon acl-lock-icon--tcp" tabindex="0"><Lock /></el-icon>
+              </el-tooltip>
               <a class="rule-name-link" role="button" tabindex="0" :title="row.name" @click.prevent="viewConfig(row)" @keydown.enter.prevent="viewConfig(row)" @keydown.space.prevent="viewConfig(row)">{{ row.name }}</a>
             </div>
           </template>
@@ -342,17 +351,15 @@
               <el-input v-model="wizardForm.name" placeholder="例如：我的网站负载均衡" />
             </el-form-item>
             
-            <!-- 自管标签行(EP 2.14.4 规避,同 ClusterModeCard 范式):el-radio-group
-                 会把组容器 DIV 注册为表单输入 id,label for 指向 DIV 触发 Firefox 告警 -->
-            <div class="mode-row" role="group" aria-label="协议">
-              <span class="mode-row-label"><span class="required-mark">*</span>协议</span>
-              <div class="mode-row-content">
-                <el-radio-group v-model="wizardForm.protocol">
-                  <el-radio value="http">HTTP</el-radio>
-                  <el-radio value="tcp">TCP</el-radio>
-                </el-radio-group>
-              </div>
-            </div>
+            <!-- 原生表单行（2026-10-11 用户裁定：对齐统一走 el-form-item，弃自管标签行
+                 ——后者曾因侧距与 el-form-item 不一致致 20px 漂移；radio-group 的 Firefox
+                 label-for 控制台告警为 EP 上游已知形态，非用户可见） -->
+            <el-form-item label="协议" required>
+              <el-radio-group v-model="wizardForm.protocol" aria-label="协议">
+                <el-radio value="http">HTTP</el-radio>
+                <el-radio value="tcp">TCP</el-radio>
+              </el-radio-group>
+            </el-form-item>
 
             <el-form-item label="域名" required v-if="wizardForm.protocol === 'http'" class="domain-item">
               <el-input v-model="wizardForm.domain" placeholder="例如：example.com, www.example.com" />
@@ -369,11 +376,6 @@
               <!-- 存量规则端口提示（ISSUE #7）：部署默认口已改、但本条规则仍是旧端口时，
                    明示「保存即按当前值落库」——不会被自动迁移，改了才覆盖。 -->
               <div v-if="stalePortHint" class="form-tip-line">{{ stalePortHint }}</div>
-            </el-form-item>
-
-            <el-form-item label="后端域名" v-if="wizardForm.protocol === 'http'">
-              <el-input v-model="wizardForm.host_header" placeholder="例如：www.baidu.com" style="width: 300px;" />
-              <span class="form-tip-inline">设置转发到上游服务器时的 Host 头</span>
             </el-form-item>
 
             <el-form-item label="启用 HTTPS" v-if="wizardForm.protocol === 'http'">
@@ -398,17 +400,14 @@
         <!-- Step 1: TLS 配置 (仅当启用 HTTPS 时显示) -->
         <div v-show="currentStep === WIZARD_STEP.TLS" class="step-content">
           <el-form :model="wizardForm" label-width="100px" v-if="wizardForm.enable_tls && wizardForm.protocol === 'http'">
-            <div class="mode-row" role="group" aria-label="证书来源">
-              <span class="mode-row-label">证书来源</span>
-              <div class="mode-row-content">
-                <el-radio-group v-model="wizardForm.tls_source" :disabled="isCurrentRuleLocked">
-                  <el-radio value="manual">手动上传</el-radio>
-                  <el-radio value="acme_dns">ACME + DNS 自动</el-radio>
-                  <el-radio value="file">引用证书文件</el-radio>
-                </el-radio-group>
-                <div v-if="isCurrentRuleLocked" class="form-tip-line port-warning">证书申请中，暂不能修改证书来源</div>
-              </div>
-            </div>
+            <el-form-item label="证书来源">
+              <el-radio-group v-model="wizardForm.tls_source" :disabled="isCurrentRuleLocked" aria-label="证书来源">
+                <el-radio value="manual">手动上传</el-radio>
+                <el-radio value="acme_dns">ACME + DNS 自动</el-radio>
+                <el-radio value="file">引用证书文件</el-radio>
+              </el-radio-group>
+              <div v-if="isCurrentRuleLocked" class="form-tip-line port-warning">证书申请中，暂不能修改证书来源</div>
+            </el-form-item>
             <template v-if="wizardForm.tls_source === 'acme_dns'">
               <el-form-item label="DNS 配置">
                 <el-select v-model="wizardForm.acme_config_id" placeholder="选择 DNS 提供商配置" style="width: 100%;">
@@ -499,7 +498,7 @@
             <div v-if="wizardForm.dynamic_dns" class="info-note-bar"><span class="info-note-desc">动态上游模式下仅需一个上游条目，DNS 将动态解析出多个 IP</span></div>
 
             <el-table :data="wizardForm.upstreams" border class="upstream-table" :fit="true">
-              <el-table-column label="主机地址 *" min-width="180">
+              <el-table-column label="主机地址 *" min-width="220">
                 <template #default="{ row, $index }">
                   <el-input 
                     v-model="row.host" 
@@ -511,12 +510,12 @@
                   />
                 </template>
               </el-table-column>
-              <el-table-column label="端口" width="110">
+              <el-table-column label="端口" width="88">
                 <template #default="{ row }">
                   <el-input-number v-model="row.port" :min="1" :max="65535" size="small" controls-position="right" class="upstream-input-small" />
                 </template>
               </el-table-column>
-              <el-table-column label="协议" width="100">
+              <el-table-column label="协议" width="96">
                 <template #default="{ row }">
                   <el-select v-model="row.protocol" size="small" placeholder="协议">
                     <template v-if="wizardForm.protocol === 'tcp'">
@@ -530,18 +529,26 @@
                   </el-select>
                 </template>
               </el-table-column>
-              <el-table-column v-if="wizardForm.protocol !== 'tcp'" min-width="140">
+              <el-table-column min-width="180" v-if="wizardForm.protocol === 'http'">
                 <template #header>
-                  回源Host
-                  <el-tooltip placement="top" content="逐上游回源 Host：留空时回退到「基本配置」的后端域名；若那里也为空，则该上游使用自身地址（host:port）作为回源 Host。">
+                  回源域名
+                  <el-tooltip placement="top" content="该上游独立的回源 Host 头与 HTTPS SNI（主机名，不带端口；端口沿用左侧端口列配置）。留空=不覆盖（Host 跟随客户端请求或上游地址）">
                     <el-icon class="upstream-unknown"><QuestionFilled /></el-icon>
                   </el-tooltip>
                 </template>
                 <template #default="{ row }">
-                  <el-input v-model="row.host_header" placeholder="留空=跟随规则/自身" size="small" class="upstream-input" />
+                  <el-tooltip placement="top" :disabled="!wizardForm.dynamic_dns" content="动态上游模式不支持回源域名（改写 Host 请经 API/MCP 设置规则级 host_header）">
+                    <el-input
+                      v-model="row.origin_domain"
+                      placeholder="留空=不覆盖"
+                      size="small"
+                      class="upstream-input"
+                      :disabled="wizardForm.dynamic_dns"
+                    />
+                  </el-tooltip>
                 </template>
               </el-table-column>
-              <el-table-column width="110">
+              <el-table-column width="84">
                 <template #header>
                   权重 %
                   <el-tooltip placement="top" :content="wizardForm.strategy === 'chain_fallback'
@@ -554,7 +561,7 @@
                   <el-input-number v-model="row.weight" :min="1" :max="100" size="small" controls-position="right" class="upstream-input-small" :disabled="!row.enabled" @change="onWeightChange($index)" />
                 </template>
               </el-table-column>
-              <el-table-column width="130">
+              <el-table-column width="118">
                 <template #header>
                   {{ wizardForm.protocol === 'tcp' ? '最大连接' : '最大请求数' }}
                   <el-tooltip placement="top" :content="wizardForm.protocol === 'tcp'
@@ -564,17 +571,17 @@
                   </el-tooltip>
                 </template>
                 <template #default="{ row }">
-                  <el-tooltip placement="top" :disabled="!wizardForm.dynamic_dns" content="动态上游模式下最大连接数不生效">
+                  <el-tooltip placement="top" :disabled="!wizardForm.dynamic_dns" :content="`动态上游模式下${wizardForm.protocol === 'tcp' ? '最大连接' : '最大请求数'}不生效`">
                     <el-input-number v-model="row.max_connections" :min="0" :max="100000" size="small" controls-position="right" class="upstream-input-small" :disabled="wizardForm.dynamic_dns" />
                   </el-tooltip>
                 </template>
               </el-table-column>
-              <el-table-column label="启用" width="60" align="center">
+              <el-table-column label="启用" width="56" align="center">
                 <template #default="{ row, $index }">
                   <el-switch v-model="row.enabled" size="small" @change="onWeightChange($index)" />
                 </template>
               </el-table-column>
-              <el-table-column width="50" align="center">
+              <el-table-column width="46" align="center">
                 <template #default="{ $index }">
                   <el-button type="danger" link size="small" @click="removeUpstream($index)">
                     <el-icon><Delete /></el-icon>
@@ -678,10 +685,21 @@
                 </div>
               </el-form-item>
 
+              <!-- 混合回源域名 + 主动检查提示（2026-10-10 用户裁定）：探测不感知
+                   逐上游回源域名（引擎硬墙：probe 不走处理链、replacer 无提供者），
+                   统一 Host 探测可能误摘按域名严格校验的后端节点 -->
+              <div v-if="mixedOriginActiveCheckWarn" class="info-note-bar">
+                <span class="info-note-desc">已配置逐上游回源域名：主动健康检查不感知回源域名，探测请求的 Host 将统一使用「健康检查域名」（留空则跟随后端域名（若配置），否则用上游地址）——按域名严格校验 Host 的后端可能被误摘为不健康。建议设置一个所有后端都接受的健康检查域名，或关闭主动检查改用被动熔断</span>
+              </div>
+
               <template v-if="wizardForm.enable_active_health_check">
                 <el-form-item label="检查路径">
                   <el-input v-model="wizardForm.health_check_path" placeholder="默认 /" style="width: 180px;" />
-                  <span class="form-tip-inline">留空探测 /，需返回 2xx 否则判为异常；携带后端域名作为 Host 头</span>
+                  <span class="form-tip-inline">留空探测 /，需返回 2xx 否则判为异常</span>
+                </el-form-item>
+                <el-form-item label="健康检查域名">
+                  <el-input v-model="wizardForm.health_check_host" placeholder="留空=跟随后端域名（若配置），否则用上游地址" style="width: 220px;" />
+                  <span class="form-tip-inline">探测请求的 Host 头；HTTPS 上游的探测不携带独立 SNI（回源域名仅作用于代理流量）</span>
                 </el-form-item>
                 <el-form-item label="恢复阈值">
                   <el-input-number v-model="wizardForm.health_check_healthy_threshold" :min="1" :max="10" controls-position="right" style="width: 120px;" />
@@ -750,15 +768,12 @@
                   <span class="form-tip-inline">启用后，响应将被压缩传输以减少带宽</span>
                 </div>
               </el-form-item>
-              <div v-if="wizardForm.enable_compress" class="mode-row" role="group" aria-label="压缩方式">
-                <span class="mode-row-label">压缩方式</span>
-                <div class="mode-row-content">
-                  <el-radio-group v-model="compressType">
-                    <el-radio value="gzip">gzip</el-radio>
-                    <el-radio value="zstd">zstd（更快、压缩比更高，需客户端支持）</el-radio>
-                  </el-radio-group>
-                </div>
-              </div>
+              <el-form-item v-if="wizardForm.enable_compress" label="压缩方式">
+                <el-radio-group v-model="compressType" aria-label="压缩方式">
+                  <el-radio value="gzip">gzip</el-radio>
+                  <el-radio value="zstd">zstd（更快、压缩比更高，需客户端支持）</el-radio>
+                </el-radio-group>
+              </el-form-item>
 
               <el-divider content-position="left" class="compact-divider">动态上游</el-divider>
 
@@ -770,15 +785,12 @@
               </el-form-item>
 
               <template v-if="wizardForm.dynamic_dns">
-                <div class="mode-row" role="group" aria-label="协议栈">
-                  <span class="mode-row-label">协议栈</span>
-                  <div class="mode-row-content">
-                    <el-checkbox-group v-model="wizardForm.dns_family" style="width: 200px;">
-                      <el-checkbox value="ipv4">IPv4</el-checkbox>
-                      <el-checkbox value="ipv6">IPv6</el-checkbox>
-                    </el-checkbox-group>
-                  </div>
-                </div>
+                <el-form-item label="协议栈">
+                  <el-checkbox-group v-model="wizardForm.dns_family" style="width: 200px;" aria-label="协议栈">
+                    <el-checkbox value="ipv4">IPv4</el-checkbox>
+                    <el-checkbox value="ipv6">IPv6</el-checkbox>
+                  </el-checkbox-group>
+                </el-form-item>
               </template>
 
               <el-divider content-position="left" class="compact-divider">代理超时</el-divider>
@@ -829,11 +841,10 @@
             </el-descriptions-item>
             <el-descriptions-item label="域名" v-if="wizardForm.protocol === 'http'">{{ wizardForm.domain || '-' }}</el-descriptions-item>
             <el-descriptions-item label="监听端口">{{ wizardForm.listen_port }}</el-descriptions-item>
-            <el-descriptions-item label="后端域名" v-if="wizardForm.protocol === 'http'">{{ wizardForm.host_header || '-' }}</el-descriptions-item>
             <el-descriptions-item label="负载策略">{{ getStrategyLabel(wizardForm.strategy) }}</el-descriptions-item>
             <el-descriptions-item label="健康检查" v-if="wizardForm.protocol === 'http'">
               <template v-if="wizardForm.enable_active_health_check">
-                {{ wizardForm.health_check_path || '/' }} ({{ wizardForm.health_check_interval }}s/{{ wizardForm.health_check_timeout }}s)
+                {{ wizardForm.health_check_path || '/' }} ({{ wizardForm.health_check_interval }}s/{{ wizardForm.health_check_timeout }}s){{ wizardForm.health_check_host ? `，Host: ${wizardForm.health_check_host}` : '' }}
               </template>
               <template v-else>被动检查 (失败 {{ wizardForm.health_check_unhealthy_threshold }} 次视为不健康, 超时 {{ wizardForm.health_check_timeout }}s)</template>
             </el-descriptions-item>
@@ -878,9 +889,9 @@
               </div>
               <div v-else>
                 <div>{{ certTypeLabels.manual }}</div>
-                <div v-if="certInfo.valid" class="cert-preview-info">
+                <div v-if="certInfo.valid">
                   <el-tag size="small" :type="certInfo.warning ? 'warning' : 'success'">{{ certInfo.domain }}</el-tag>
-                  <span class="cert-expiry">过期: {{ certInfo.expiryDate }}</span>
+                  <span>过期: {{ certInfo.expiryDate }}</span>
                   <span v-if="certInfo.daysUntilExpiry <= 30" class="cert-expiry-warning">({{ certInfo.daysUntilExpiry }} 天后)</span>
                 </div>
               </div>
@@ -904,6 +915,9 @@
                   <template #default="{ row }">{{ row.enabled ? `${weightPercent(wizardForm.upstreams, row)}%` : '禁用' }}</template>
                 </el-table-column>
                 <el-table-column prop="max_connections" :label="wizardForm.protocol === 'http' ? '最大请求数' : '最大连接'" width="100" />
+                <el-table-column v-if="wizardForm.protocol === 'http'" label="回源域名" min-width="130">
+                  <template #default="{ row }">{{ row.origin_domain || '-' }}</template>
+                </el-table-column>
                 <el-table-column prop="enabled" label="状态" width="70">
                   <template #default="{ row }">
                     {{ row.enabled ? '启用' : '禁用' }}
@@ -965,7 +979,7 @@
             {{ ruleConfig.enable_compress ? (Array.isArray(ruleConfig.compress_types) ? ruleConfig.compress_types[0] : (ruleConfig.compress_types || 'gzip')) : '禁用' }}
           </el-descriptions-item>
           <el-descriptions-item label="主动健康检查" v-if="ruleConfig.protocol === 'http' && ruleConfig.health_check_path">
-            {{ ruleConfig.health_check_path }} ({{ ruleConfig.health_check_interval }}s/{{ ruleConfig.health_check_timeout }}s)
+            {{ ruleConfig.health_check_path }} ({{ ruleConfig.health_check_interval }}s/{{ ruleConfig.health_check_timeout }}s){{ ruleConfig.health_check_host ? `，Host: ${ruleConfig.health_check_host}` : '' }}
           </el-descriptions-item>
           <el-descriptions-item label="主动健康检查" v-if="ruleConfig.protocol === 'http' && !ruleConfig.health_check_path">未启用</el-descriptions-item>
           <el-descriptions-item label="主动健康检查" v-if="ruleConfig.protocol === 'tcp' && ruleConfig.enable_active_health_check">
@@ -1004,6 +1018,9 @@
             <template #default="{ row }">{{ weightPercent(ruleConfig?.upstreams, row) }}%</template>
           </el-table-column>
           <el-table-column prop="max_connections" :label="ruleConfig?.protocol === 'http' ? '最大请求数' : '最大连接'" align="center" />
+          <el-table-column v-if="ruleConfig?.protocol === 'http'" label="回源域名" align="center">
+            <template #default="{ row }">{{ row.origin_domain || '-' }}</template>
+          </el-table-column>
           <el-table-column prop="enabled" label="状态" align="center">
             <template #default="{ row }">
               <el-tag size="small" :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '禁用' }}</el-tag>
@@ -1163,7 +1180,7 @@ import type {
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import PathRulesEditor from '@/components/rules/PathRulesEditor.vue'
 import ProxyTimeoutFields from '@/components/rules/ProxyTimeoutFields.vue'
-import { validatePathRules } from '@/utils/ruleValidation'
+import { isValidHostName, validatePathRules } from '@/utils/ruleValidation'
 import { getStrategyLabel } from '@/utils/strategyLabels'
 import { popperViewportSafe } from '@/utils/popper'
 import { hostPortKey } from '@/utils/upstreamKeys'
@@ -1174,7 +1191,7 @@ import { usePollingTask } from '@/composables/usePollingTask'
 import { useClampedPagination } from '@/composables/useClampedPagination'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
 
-interface RuleForm extends Omit<CreateRuleRequest, 'dns_family' | 'upstreams' | 'acme_config_id' | 'ca_provider_id' | 'compress_types'> {
+interface RuleForm extends Omit<CreateRuleRequest, 'dns_family' | 'upstreams' | 'acme_config_id' | 'ca_provider_id' | 'compress_types' | 'host_header'> {
   dns_family: string[]
   upstreams: UpstreamInput[]
   acme_config_id?: number
@@ -1238,6 +1255,7 @@ interface RuleCaddyConfigResponse {
 }
 
 interface RuleConfigView {
+  host_header: string
   id: number
   caddy_id: string
   name: string
@@ -1248,7 +1266,7 @@ interface RuleConfigView {
   dynamic_dns: boolean
   enable_dns_server: boolean
   dns_server: string
-  host_header: string
+  health_check_host: string
   enable_tls: boolean
   tls_source: string
   tls_http_redirect: boolean
@@ -1725,6 +1743,20 @@ const upstreamRowNeedsHost = (u: UpstreamInput, i: number): boolean =>
 const upstreamHostWarning = computed(() =>
   wizardForm.upstreams.some((u, i) => upstreamRowNeedsHost(u, i)) ? '主机地址为必填项，请填写完整' : '')
 
+// 混合回源域名 + 主动健康检查警告谓词（2026-10-10 用户裁定）：HTTP 规则 +
+// 主动检查开启 + 未设统一健康检查域名 + 任一启用上游配置了回源域名。
+// 已设健康检查域名=用户已做统一探测旁路，不再警告。
+// SEM-U1（第 69 轮）：谓词从「≥2 去重值」放宽到「任一启用上游配了回源域名」——
+// 单值形态（仅一个回源域名+主动检查+健康检查域名空）同样分裂：代理流量
+// Host=回源域名、探测 Host=上游地址/后端域名，无警告会静默误摘后端。
+const mixedOriginActiveCheckWarn = computed(() => {
+  if (wizardForm.protocol !== 'http' || !wizardForm.enable_active_health_check) return false
+  if ((wizardForm.health_check_host || '').trim() !== '') return false
+  return wizardForm.upstreams
+    .filter(u => u.enabled !== false)
+    .some(u => (u.origin_domain || '').trim() !== '')
+})
+
 interface HealthSummary { healthy: number; unhealthy: number; degraded: number; unknown: number; na: number; total: number }
 
 const getEnabledUpstreams = (rule: Rule): Upstream[] =>
@@ -1875,7 +1907,7 @@ const defaultUpstream = (protocol: UpstreamProtocol = 'http'): UpstreamInput => 
   enabled: true,
   protocol,
   max_connections: 0,
-  host_header: '',
+  origin_domain: '',
 })
 
 const pathRuleUpstreamsToPercent = (upstreams: readonly PathRuleUpstream[] | null | undefined): PathRuleUpstream[] | null => {
@@ -1937,7 +1969,7 @@ const wizardForm = reactive<RuleForm>({
   tcp_proxy_protocol: false,
   tcp_try_duration: 0,
   tcp_try_interval: 250,
-  host_header: '',
+  health_check_host: '',
   upstreams: [],
   enable_tls: false,
   tls_source: 'manual',
@@ -2036,8 +2068,12 @@ watch(() => wizardForm.protocol, (newVal, oldVal) => {
     wizardForm.enable_tls = false
     if (wizardForm.strategy === 'cookie' || wizardForm.strategy === 'chain_fallback') wizardForm.strategy = 'weighted_round_robin'
     wizardForm.custom_routes_enabled = false
+    wizardForm.health_check_host = ''
     wizardForm.path_rules = []
     wizardForm.upstreams.forEach(u => {
+      // FE-L1/LBH-A-L1（第 69 轮 P2）：回源域名是 HTTP-only 语义——切换即弃置，
+      // 否则隐藏残留字段被后端「回源域名仅 HTTP 规则支持」门恒拒，卡死保存
+      u.origin_domain = ''
       if (u.protocol === 'http') u.protocol = 'tcp'
       if (u.protocol === 'https') u.protocol = 'tls'
     })
@@ -2367,13 +2403,13 @@ const openWizard = async (rule?: Rule) => {
       tcp_proxy_protocol: fullRule.tcp_proxy_protocol === true,
       tcp_try_duration: fullRule.tcp_try_duration || 0,
       tcp_try_interval: fullRule.tcp_try_interval ?? 250,
-      host_header: fullRule.host_header || '',
+      health_check_host: fullRule.health_check_host || '',
       upstreams: fullRule.upstreams?.map(u => ({
         ...u,
         dynamic_dns: false,
         protocol: u.protocol || 'http',
         max_connections: u.max_connections ?? 0,
-        host_header: u.host_header || '',
+        origin_domain: u.origin_domain || '',
       })) || [],
       enable_tls: fullRule.enable_tls || false,
       tls_source: fullRule.tls_source || 'manual',
@@ -2399,12 +2435,8 @@ const openWizard = async (rule?: Rule) => {
         .sort((left, right) => left.sort_order - right.sort_order)
         .map((pathRule) => ({
           ...pathRule,
-          // 静态响应字段归一（老数据/老备份缺列时补默认值）
-          action: pathRule.action === 'respond' ? 'respond' : 'proxy',
-          status_code: pathRule.status_code ?? 0,
-          redirect_url: pathRule.redirect_url || '',
-          response_body: pathRule.response_body || '',
-          content_type: pathRule.content_type || '',
+          // UI 哨兵：空串模式映射为 'forward'（el-select 空串选项不显示标签）；提交归一 ''
+          response_mode: pathRule.response_mode || 'forward',
           upstreams: pathRuleUpstreamsToPercent(pathRule.upstreams),
         })),
       proxy_dial_timeout: fullRule.proxy_dial_timeout || 0,
@@ -2439,7 +2471,7 @@ const openWizard = async (rule?: Rule) => {
       tcp_proxy_protocol: false,
       tcp_try_duration: 0,
       tcp_try_interval: 250,
-      host_header: '',
+      health_check_host: '',
       dns_server: '',
       dns_family: ['ipv4'],
       upstreams: [defaultUpstream()],
@@ -2549,19 +2581,7 @@ const removeUpstream = (index: number) => {
 
 const onCustomRoutesToggle = (enabled: string | number | boolean): void => {
   if (Boolean(enabled) && wizardForm.path_rules.length === 0) {
-    wizardForm.path_rules.push({
-      id: nextTemporaryPathRuleId,
-      match_type: 'prefix',
-      path: '/',
-      upstream_path: '',
-      sort_order: 0,
-      upstreams: null,
-      action: 'proxy',
-      status_code: 0,
-      redirect_url: '',
-      response_body: '',
-      content_type: '',
-    })
+    wizardForm.path_rules.push({ id: nextTemporaryPathRuleId, match_type: 'prefix', path: '/', upstream_path: '', sort_order: 0, upstreams: null, response_mode: 'forward', response_status: 200, response_body: '', response_content_type: '', redirect_to: '' })
     nextTemporaryPathRuleId -= 1
   }
   if (!enabled) wizardForm.path_rules = []
@@ -2785,6 +2805,46 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
+  // 混布门（第 69 轮 LBS-A-L1，与后端同口径）：HTTP 规则启用上游 http/https 混布
+  // 会在 Caddy 池级 TLS 传输下使 http 上游静默全灭——保存前拦截
+  if (wizardForm.protocol === 'http') {
+    const enabledProtos = new Set(wizardForm.upstreams.filter(u => u.enabled !== false).map(u => u.protocol || 'http'))
+    if (enabledProtos.has('http') && enabledProtos.has('https')) {
+      ElMessage.warning('同一 HTTP 规则的启用上游协议须一致（http/https 混布时 http 上游会被 TLS 化而无法访问；如需共存请拆分为两条规则）')
+      saving.value = false
+      return
+    }
+  }
+  // 逐上游回源域名（2026-10-10）：与后端 validateRulePayloadBeforeSave 同口径——
+  // 纯主机名不带端口（端口已有独立配置列）、仅 HTTP 静态上游可用
+  // FE-U3（第 69 轮）：正则双份收敛为共享 isValidHostName（标签首尾 alnum、63/253 与后端对齐）
+  const isValidOriginDomain = isValidHostName
+  for (const [index, upstream] of wizardForm.upstreams.entries()) {
+    const origin = (upstream.origin_domain || '').trim()
+    if (origin === '') continue
+    if (wizardForm.protocol !== 'http') {
+      ElMessage.warning(`上游 #${index + 1}：回源域名仅 HTTP 规则支持`)
+      saving.value = false
+      return
+    }
+    if (wizardForm.dynamic_dns) {
+      ElMessage.warning(`上游 #${index + 1}：动态上游模式不支持回源域名（改写 Host 请经 API/MCP 设置规则级 host_header）`)
+      saving.value = false
+      return
+    }
+    if (!isValidOriginDomain(origin)) {
+      ElMessage.warning(`上游 #${index + 1}：回源域名 "${origin}" 无效（仅支持主机名，不带端口）`)
+      saving.value = false
+      return
+    }
+  }
+  // 健康检查域名：probe Host 头，纯主机名不带端口（与后端同口径）
+  const healthCheckHost = (wizardForm.health_check_host || '').trim()
+  if (healthCheckHost !== '' && wizardForm.protocol === 'http' && !isValidHostName(healthCheckHost)) {
+    ElMessage.warning(`健康检查域名 "${healthCheckHost}" 无效（仅支持主机名，不带端口）`)
+    saving.value = false
+    return
+  }
   const allowedStrategies = wizardForm.protocol === 'tcp'
     ? ['weighted_round_robin', 'ip_hash', 'least_conn', 'random', 'first']
     : ['weighted_round_robin', 'ip_hash', 'least_conn', 'random', 'first', 'cookie', 'chain_fallback']
@@ -2835,7 +2895,8 @@ const submitWizard = async () => {
       weight: u.weight ?? 100,
       dynamic_dns: wizardForm.dynamic_dns,
       max_connections: u.max_connections ?? 0,
-      host_header: (u.host_header || '').trim(),
+      // 动态上游模式回源域名不可用（后端同口径 400；UI 列已禁用，此处防 stale 值外泄）
+      origin_domain: wizardForm.dynamic_dns ? '' : (u.origin_domain || ''),
     }))
 
     const data: UpdateRuleRequest = {
@@ -2862,7 +2923,7 @@ const submitWizard = async () => {
       tcp_proxy_protocol: wizardForm.protocol === 'tcp' && wizardForm.tcp_proxy_protocol,
       tcp_try_duration: wizardForm.tcp_try_duration || 0,
       tcp_try_interval: wizardForm.tcp_try_interval ?? 250,
-      host_header: wizardForm.host_header,
+      health_check_host: wizardForm.health_check_host || '',
       upstreams: validUpstreams,
       enable_tls: wizardForm.enable_tls,
       tls_source: wizardForm.tls_source,
@@ -2883,23 +2944,25 @@ const submitWizard = async () => {
       log_enabled: wizardForm.log_enabled || false,
       custom_routes_enabled: wizardForm.protocol === 'http' && wizardForm.custom_routes_enabled,
       path_rules: wizardForm.protocol === 'http' && wizardForm.custom_routes_enabled
-        ? wizardForm.path_rules.map((pathRule, index) => {
-            const respond = pathRule.action === 'respond'
-            return {
-              ...(pathRule.id !== undefined && pathRule.id > 0 ? { id: pathRule.id } : {}),
-              match_type: pathRule.match_type,
-              path: pathRule.path,
-              action: respond ? 'respond' : 'proxy',
-              // 静态响应不使用上游与上游 path 改写（后端互斥校验会拒绝携带）
-              upstream_path: respond ? '' : (pathRule.upstream_path || ''),
-              sort_order: index,
-              upstreams: respond ? null : (pathRule.upstreams?.map((upstream) => ({ ...upstream })) || null),
-              status_code: respond ? pathRule.status_code : 0,
-              redirect_url: respond ? (pathRule.redirect_url || '').trim() : '',
-              response_body: respond ? (pathRule.response_body || '') : '',
-              content_type: respond ? (pathRule.content_type || '').trim() : '',
-            }
-          })
+        ? wizardForm.path_rules.map((pathRule, index) => ({
+            ...(pathRule.id !== undefined && pathRule.id > 0 ? { id: pathRule.id } : {}),
+            match_type: pathRule.match_type,
+            path: pathRule.path,
+            upstream_path: pathRule.upstream_path || '',
+            sort_order: index,
+            // 直接返回/301 跳转（2026-10-10）：'forward' 为 UI 哨兵（el-select 空串选项不显示标签），提交归一 ''
+            ...(() => {
+              const mode: '' | 'static' | 'redirect' = pathRule.response_mode === 'static' || pathRule.response_mode === 'redirect' ? pathRule.response_mode : ''
+              return {
+                response_mode: mode,
+                response_status: mode === 'static' ? (pathRule.response_status || 200) : 200,
+                response_body: mode === 'static' ? (pathRule.response_body || '') : '',
+                response_content_type: mode === 'static' ? (pathRule.response_content_type || '') : '',
+                redirect_to: mode === 'redirect' ? (pathRule.redirect_to || '') : '',
+                upstreams: mode ? null : (pathRule.upstreams?.map((upstream) => ({ ...upstream })) || null),
+              }
+            })(),
+          }))
         : [],
       proxy_dial_timeout: wizardForm.protocol === 'http' ? wizardForm.proxy_dial_timeout : 0,
       proxy_response_header_timeout: wizardForm.protocol === 'http' ? wizardForm.proxy_response_header_timeout : 0,
@@ -3121,13 +3184,13 @@ const openCopyWizard = async (rule: Rule) => {
     tcp_proxy_protocol: fullRule.tcp_proxy_protocol === true,
     tcp_try_duration: fullRule.tcp_try_duration || 0,
     tcp_try_interval: fullRule.tcp_try_interval ?? 250,
-    host_header: fullRule.host_header || '',
+    health_check_host: fullRule.health_check_host || '',
     upstreams: fullRule.upstreams?.map(u => ({
       ...u,
       dynamic_dns: false,
       protocol: u.protocol || 'http',
       max_connections: u.max_connections ?? 0,
-      host_header: u.host_header || '',
+      origin_domain: u.origin_domain || '',
     })) || [],
     enable_tls: fullRule.enable_tls || false,
     tls_source: fullRule.tls_source || 'manual',
@@ -3147,12 +3210,7 @@ const openCopyWizard = async (rule: Rule) => {
       .sort((left, right) => left.sort_order - right.sort_order)
       .map((pathRule) => ({
         ...pathRule,
-        // 静态响应字段归一（老数据/老备份缺列时补默认值）
-        action: pathRule.action === 'respond' ? 'respond' : 'proxy',
-        status_code: pathRule.status_code ?? 0,
-        redirect_url: pathRule.redirect_url || '',
-        response_body: pathRule.response_body || '',
-        content_type: pathRule.content_type || '',
+        response_mode: pathRule.response_mode || 'forward',
         upstreams: pathRuleUpstreamsToPercent(pathRule.upstreams),
       })),
     proxy_dial_timeout: fullRule.proxy_dial_timeout || 0,
@@ -3201,6 +3259,7 @@ const viewConfig = async (rule: Rule) => {
       enable_dns_server: rule.enable_dns_server || false,
       dns_server: rule.dns_server || '',
       host_header: rule.host_header || '',
+      health_check_host: rule.health_check_host || '',
       enable_tls: rule.enable_tls || false,
       tls_source: rule.tls_source || 'manual',
       tls_http_redirect: rule.tls_http_redirect || false,
@@ -3238,6 +3297,7 @@ const viewConfig = async (rule: Rule) => {
       enable_dns_server: rule.enable_dns_server || false,
       dns_server: rule.dns_server || '',
       host_header: rule.host_header || '',
+      health_check_host: rule.health_check_host || '',
       enable_tls: rule.enable_tls || false,
       tls_source: rule.tls_source || 'manual',
       tls_http_redirect: rule.tls_http_redirect || false,
@@ -3612,14 +3672,9 @@ onUnmounted(() => {
 .search-input { width: 280px; }
 .rules-pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
 .polling-error-alert { margin-bottom: 16px; }
-.polling-error-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; }
-.polling-error-meta { font-size: 12px; }
-/* 自管标签行(EP 2.14.4 规避,同 ClusterModeCard 范式):复刻 EP
- * el-form-item 结构——.mode-row-label 宽度对齐本向导 label-width=100px */
-.mode-row { display: flex; margin-bottom: 18px; }
-.mode-row-label { width: 100px; flex-shrink: 0; height: 32px; line-height: 32px; text-align: right; padding-right: 12px; box-sizing: border-box; color: var(--el-text-color-regular); font-size: var(--el-form-label-font-size, 14px); }
-.mode-row-content { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-.required-mark { color: var(--el-color-danger); margin-right: 4px; }
+/* .polling-error-title/.polling-error-meta 已收敛 main.css（FE-R2） */
+/* .mode-row 自管标签行族已全量退役（2026-10-11 用户裁定：对齐统一走原生
+ * el-form-item）——.mode-row-label/.mode-row-content/.required-mark 死 CSS 一并删除 */
 /* .page-header/.header-left/.page-title/.title-icon/.page-desc 与
  * styles/main.css 全局定义逐字等价(字面值=对应 CSS 变量解析值),已删除 */
 
@@ -3628,6 +3683,7 @@ onUnmounted(() => {
 .acl-lock-icon { flex: 0 0 auto; cursor: pointer; }
 .acl-lock-icon.is-allow { color: var(--el-color-success); }
 .acl-lock-icon.is-unbound { color: var(--el-color-warning); }
+.acl-lock-icon--tcp { color: var(--el-text-color-placeholder); cursor: default; }
 .rule-name-link { 
   font-weight: 500; 
   color: #111827; 
@@ -3643,7 +3699,6 @@ onUnmounted(() => {
 .tls-tag {
   min-width: 44px;
 }
-.text-secondary { color: #6b7280; }
 .port-warning { color: #eab308; }
 
 /* 页内其余表格（日志统计等）单元格 padding——主规则表由更特异的
@@ -3836,12 +3891,6 @@ onUnmounted(() => {
   color: #67c23a;
 }
 
-.cert-warning-text {
-  color: #e6a23c;
-  font-size: 13px;
-  margin-top: 4px;
-  font-weight: 500;
-}
 
 .wizard-steps { margin-bottom: 24px; }
 .wizard-steps.is-clickable :deep(.el-step) { cursor: pointer; }
@@ -3870,6 +3919,14 @@ onUnmounted(() => {
   box-shadow: 0 0 0 1px #f56c6c inset;
 }
 .upstream-input-small { width: 100%; }
+/* 数字输入框左侧空白收敛（2026-10-10 两轮用户反馈，根因实证）：EP
+   el-input-number 的 .el-input__wrapper 恒 padding 42px 双侧（为侧排 +/- 预留），
+   controls-position=right 时左侧 42px 纯浪费——窄值居中/贴边都救不了，须收
+   wrapper 层；右 31px 保留给右侧 spinner。内层同时左对齐。 */
+.upstream-input-small :deep(.el-input__wrapper) { padding-left: 6px; padding-right: 31px; }
+.upstream-input-small :deep(.el-input__inner) { padding-left: 0; text-align: left; }
+/* 上游表列标题不换行（列宽按内容精修后防止标题折行） */
+.upstream-table :deep(.el-table__header th .cell) { white-space: nowrap; }
 
 .strategy-cards {
   display: flex;

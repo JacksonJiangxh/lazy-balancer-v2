@@ -325,7 +325,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		Enabled        bool
 		Protocol       string
 		MaxConnections int
-		HostHeader     string
+		OriginDomain   string
 	}
 
 	type requestData struct {
@@ -352,6 +352,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		CompressTypes                 string
 		EnableActiveHealthCheck       bool
 		HostHeader                    string
+		HealthCheckHost               string
 		RequestBodyMaxSizeMB          int
 		UpstreamKeepaliveTimeout      int
 		ServerTokensHidden            int
@@ -390,6 +391,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		data.CompressTypes = r.CompressTypes
 		data.EnableActiveHealthCheck = r.EnableActiveHealthCheck
 		data.HostHeader = r.HostHeader
+		data.HealthCheckHost = r.HealthCheckHost
 		data.RequestBodyMaxSizeMB = r.RequestBodyMaxSizeMB
 		data.UpstreamKeepaliveTimeout = r.UpstreamKeepaliveTimeout
 		data.ServerTokensHidden = r.ServerTokensHidden
@@ -401,7 +403,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 			upstreams = append(upstreams, requestUpstream{
 				Host: u.Host, Port: u.Port, Weight: u.Weight,
 				Enabled: u.Enabled, Protocol: u.Protocol,
-				MaxConnections: u.MaxConnections, HostHeader: u.HostHeader,
+				MaxConnections: u.MaxConnections, OriginDomain: u.OriginDomain,
 			})
 		}
 		data.Upstreams = upstreams
@@ -445,6 +447,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 			data.EnableActiveHealthCheck = *r.EnableActiveHealthCheck
 		}
 		data.HostHeader = derefStr(r.HostHeader)
+		data.HealthCheckHost = derefStr(r.HealthCheckHost)
 		if r.RequestBodyMaxSizeMB != nil {
 			data.RequestBodyMaxSizeMB = *r.RequestBodyMaxSizeMB
 		}
@@ -470,7 +473,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 			upstreams = append(upstreams, requestUpstream{
 				Host: u.Host, Port: u.Port, Weight: u.Weight,
 				Enabled: u.Enabled, Protocol: u.Protocol,
-				MaxConnections: u.MaxConnections, HostHeader: u.HostHeader,
+				MaxConnections: u.MaxConnections, OriginDomain: u.OriginDomain,
 			})
 		}
 		data.Upstreams = upstreams
@@ -518,22 +521,13 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		return fmt.Errorf("无效的监听端口：必须在 1-65535 之间")
 	}
 
-	httpStrategies := map[string]bool{
-		"ip_hash": true, "least_conn": true,
-		"random": true, "first": true, "weighted_round_robin": true,
-		"cookie": true,
-		// 链式回退（2026-10-09）：竞速 + 兜底截断，仅 HTTP（同 cookie 先例）。
-		"chain_fallback": true,
-	}
-	tcpStrategies := map[string]bool{
-		"ip_hash": true, "least_conn": true,
-		"random": true, "first": true, "weighted_round_robin": true,
-	}
-	if data.Protocol == "http" && !httpStrategies[data.Strategy] {
-		return fmt.Errorf("无效的负载策略：HTTP 规则仅支持 weighted_round_robin / ip_hash / least_conn / random / first / cookie / chain_fallback")
-	}
-	if data.Protocol == "tcp" && !tcpStrategies[data.Strategy] {
-		return fmt.Errorf("无效的负载策略：TCP 规则仅支持 weighted_round_robin / ip_hash / least_conn / random / first")
+	// LBH-A-R1（第 69 轮）：策略白名单委托共享实现——此前此处内联
+	// httpStrategies/tcpStrategies 双 map 与 validateStrategyForProtocol
+	// 重复（保存链双重判定，两份 map 是漂移种子）。空 strategy 放行
+	// （渲染侧默认 weighted_round_robin；Create/Update 入口已默认/合并，
+	// 空值不可达）。
+	if err := validateStrategyForProtocol(data.Protocol, data.Strategy); err != nil {
+		return err
 	}
 
 	if data.Domain != "" && data.Protocol == "http" {
@@ -554,6 +548,10 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 	}
 
 	enabledUpstreamCount := 0
+	// LBS-A-L1（第 69 轮 P1）：HTTP 规则 http/https 混布池拒绝——Caddy TLS 决策
+	// 是传输级（shouldUseTLS 无逐上游概念），任一 https 上游使 http 上游明文
+	// 打 TLS 端口静默全灭 502；禁用上游不参与渲染，不计入混布判定。
+	enabledProtocols := make(map[string]bool, 2)
 	hostPortSeen := make(map[string]bool)
 	for i, u := range data.Upstreams {
 		if u.Host == "" {
@@ -577,14 +575,6 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		if u.MaxConnections < 0 {
 			return fmt.Errorf("上游 #%d：最大连接数不能为负数", i+1)
 		}
-		// 逐上游回源 Host 与规则级同口径注入防护（LB40-5：直写 reverse_proxy
-		// 请求头/SNI，CRLF/控制字符可注入额外头——拒绝不可见字符）。
-		for _, c := range u.HostHeader {
-			if c < 0x20 || c == 0x7f {
-				return fmt.Errorf("上游 #%d：回源Host含非法字符", i+1)
-			}
-		}
-
 		key := fmt.Sprintf("%s:%d", strings.ToLower(strings.TrimSpace(u.Host)), u.Port)
 		if hostPortSeen[key] {
 			return fmt.Errorf("上游 %s:%d 重复", u.Host, u.Port)
@@ -595,9 +585,34 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 			return fmt.Errorf("上游 #%d：主机 '%s' 无效", i+1, u.Host)
 		}
 
+		// 逐上游回源域名（2026-10-10）：仅 HTTP 规则静态上游可用——dynamic_dns
+		// 池 dial=解析后 IP（渲染期映射永不命中）；TCP 规则无 Host/SNI 语义。
+		if u.OriginDomain != "" {
+			if data.Protocol != "http" {
+				return fmt.Errorf("上游 #%d：回源域名仅 HTTP 规则支持", i+1)
+			}
+			if data.DynamicDNS {
+				return fmt.Errorf("上游 #%d：动态上游模式不支持回源域名（请使用规则级后端域名）", i+1)
+			}
+			// 纯主机名不带端口（2026-10-10 用户裁定：端口已有独立配置列）；
+			// isValidHost 字符集天然拒绝 CRLF/控制字符与端口冒号形态。
+			if !isValidHost(u.OriginDomain) {
+				return fmt.Errorf("上游 #%d：回源域名 %q 无效（仅支持主机名，不带端口）", i+1, u.OriginDomain)
+			}
+		}
+
 		if u.Enabled {
 			enabledUpstreamCount++
+			proto := u.Protocol
+			if proto == "" {
+				proto = "http"
+			}
+			enabledProtocols[proto] = true
 		}
+	}
+
+	if data.Protocol == "http" && enabledProtocols["http"] && enabledProtocols["https"] {
+		return fmt.Errorf("同一 HTTP 规则的启用上游协议须一致（http/https 混布时 http 上游会被 TLS 化静默全灭；如需共存请拆分为两条规则）")
 	}
 
 	if enabledUpstreamCount == 0 {
@@ -613,6 +628,17 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 
 	if data.HealthCheckPath != "" && !strings.HasPrefix(data.HealthCheckPath, "/") {
 		return fmt.Errorf("健康检查路径必须以 / 开头")
+	}
+
+	// 健康检查域名（2026-10-10）：probe 的 Host 头（health_checks.active.headers.
+	// Host 特判，不带端口）；仅 HTTP 规则渲染消费（TCP 健康检查走端口探测）。
+	if data.HealthCheckHost != "" {
+		if data.Protocol != "http" {
+			return fmt.Errorf("健康检查域名仅 HTTP 规则支持")
+		}
+		if !isValidHost(data.HealthCheckHost) {
+			return fmt.Errorf("健康检查域名 %q 无效（仅支持主机名，不带端口）", data.HealthCheckHost)
+		}
 	}
 
 	if data.EnableTLS && data.TLSSource == "acme_dns" {

@@ -66,8 +66,7 @@ var (
 	defaultLandingBodyVal = DefaultLandingText
 )
 
-// DefaultLandingText 是空域名命中 HTTP 默认口兜底站（http_{HTTP_PORT}，出厂
-// http_80）catch-all 时的产品默认提示文案。
+// DefaultLandingText 是空域名命中 http_80 catch-all 时的产品默认提示文案。
 const DefaultLandingText = "Lazy Balancer V2 is running!"
 
 // SetDefaultLandingBody 注入 branding.json 的 landing_text(已归一:空串
@@ -1232,6 +1231,79 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		return map[string]interface{}{caddyConfigGenerationErrorKey: err.Error()}
 	}
 
+	type lbRule struct {
+		CaddyID                       string
+		Name                          string
+		Protocol                      string
+		Domain                        string
+		ListenPort                    int
+		Strategy                      string
+		DynamicDNS                    bool
+		EnableDnsServer               bool
+		DnsServer                     string
+		DnsFamily                     string
+		HealthCheckPath               string
+		HealthCheckInterval           int
+		HealthCheckTimeout            int
+		HealthCheckUnhealthyThreshold int
+		HealthCheckHealthyThreshold   int
+		EnableTLS                     bool
+		TLSSource                     string
+		ACMEConfigID                  int
+		ACMEEmail                     string
+		TLSCert                       string
+		TLSKey                        string
+		// 引用型证书（tls_source="file"）：摄取源路径记录——内容已入库，渲染不消费。
+		TLSCertPath              string
+		TLSKeyPath               string
+		TLSHTTPRedirect          bool
+		Enabled                  bool
+		EnableCompress           bool
+		CompressTypes            string
+		EnableActiveHealthCheck  bool
+		TCPHealthCheckPort       int
+		TCPProxyProtocol         bool
+		TCPTryDuration           int
+		TCPTryInterval           int
+		RequestBodyMaxSizeMB     int
+		UpstreamKeepaliveTimeout int
+		ServerTokensHidden       int
+		// 链式回退竞速参数（strategy=chain_fallback 渲染消费；0 值渲染兜底）。
+		ChainRaceIntervalMS        int
+		ChainRequestTimeoutMS      int
+		CustomRoutesEnabled        bool
+		ProxyDialTimeout           int
+		ProxyResponseHeaderTimeout int
+		ProxyReadTimeout           int
+		ProxyWriteTimeout          int
+		ProxyStreamTimeout         int
+		ProxyFlushInterval         int
+		ProxyStreamCloseDelay      int
+		PathRules                  []PathRuleConfig
+		HostHeader                 string
+		HealthCheckHost            string
+		LogEnabled                 bool
+		BlockPageStage1ID          int
+		BlockPageStage1Status      int
+		BlockPageStage3ID          int
+		BlockPageStage3Status      int
+	}
+
+	type upstream struct {
+		Host           string
+		Port           int
+		Weight         int
+		Enabled        bool
+		Protocol       string
+		MaxConnections int
+		OriginDomain   string
+	}
+
+	type ruleWithUpstreams struct {
+		rule      lbRule
+		upstreams []upstream
+	}
+
 	// LB41-2：lb_rules.id 为可空遗留列（生产形态恒 NULL），ORDER BY id 语义
 	// 退化；rowid 显式化——行为与现状等价（NULL 排序实践上即 rowid 序）。
 	// Load all enabled rules into memory first to avoid holding cursor while querying upstreams/global_config
@@ -1245,8 +1317,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		       IIF(tls_http_redirect IN ('1',1),1,0),
 		       IIF(enabled IN ('1',1),1,0), IIF(enable_compress IN ('1',1),1,0), COALESCE(compress_types,'gzip'),
 		       IIF(enable_active_health_check IN ('1',1),1,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
-		       COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(host_header,''),
-		       COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
+	       COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(host_header,''), COALESCE(health_check_host,''),
+	       COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 		       IIF(log_enabled IN ('1',1),1,0), IIF(custom_routes_enabled IN ('1',1),1,0),
 		       COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 		       COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)
@@ -1267,7 +1339,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			&r.TLSCertPath, &r.TLSKeyPath,
 			&r.TLSHTTPRedirect, &r.Enabled, &r.EnableCompress, &r.CompressTypes,
 			&r.EnableActiveHealthCheck, &r.TCPHealthCheckPort, &r.TCPProxyProtocol, &r.TCPTryDuration, &r.TCPTryInterval,
-			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden, &r.HostHeader,
+			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden, &r.HostHeader, &r.HealthCheckHost,
 			&r.ChainRaceIntervalMS, &r.ChainRequestTimeoutMS, &r.LogEnabled,
 			&r.CustomRoutesEnabled, &r.ProxyDialTimeout, &r.ProxyResponseHeaderTimeout,
 			&r.ProxyReadTimeout, &r.ProxyWriteTimeout, &r.ProxyStreamTimeout, &r.ProxyFlushInterval, &r.ProxyStreamCloseDelay,
@@ -1302,7 +1374,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	}
 
 	upstreamRows, err := store.Query(`
-		SELECT u.rule_id, u.host, u.port, COALESCE(u.weight,1), IIF(u.enabled IN ('1',1),1,0), COALESCE(u.protocol,'http'), COALESCE(u.max_connections,0), COALESCE(u.host_header,'')
+		SELECT u.rule_id, u.host, u.port, COALESCE(u.weight,1), IIF(u.enabled IN ('1',1),1,0), COALESCE(u.protocol,'http'), COALESCE(u.max_connections,0), COALESCE(u.origin_domain,'')
 		FROM upstreams u JOIN lb_rules r ON r.caddy_id = u.rule_id
 		WHERE IIF(u.enabled IN ('1',1),1,0) = 1 AND r.enabled = 1 ORDER BY u.rule_id, u.id
 	`)
@@ -1310,12 +1382,13 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		return generationFailure("query enabled upstreams: %v", err)
 	}
 	for upstreamRows.Next() {
-		var u upstreamRow
-		if err := upstreamRows.Scan(&u.RuleID, &u.Host, &u.Port, &u.Weight, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.HostHeader); err != nil {
+		var ruleID string
+		var u upstream
+		if err := upstreamRows.Scan(&ruleID, &u.Host, &u.Port, &u.Weight, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain); err != nil {
 			closeErr := upstreamRows.Close()
 			return generationFailure("scan upstream: %v", errors.Join(err, closeErr))
 		}
-		if r := rulesByID[u.RuleID]; r != nil {
+		if r := rulesByID[ruleID]; r != nil {
 			r.upstreams = append(r.upstreams, u)
 		}
 	}
@@ -1328,13 +1401,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	}
 
 	if hasCustomRoutes {
-		// 自定义路由上游的回源 Host 解析上下文：地址在统一上游集合里 → 用「该地址
-		// 所属规则」的上游集合整体计划（逐上游优先、规则级兜底）；不在集合里 → 只有
-		// 规则级一档，空则用自身地址。数据源与主链同一张表，避免第二套配置真相。
-		pathResolver := buildPathUpstreamHostResolver(rulesByID)
 		pathRows, pathErr := store.Query(`
-			SELECT p.rule_id, p.sort_order, p.match_type, p.path, p.upstream_path, p.upstreams_json,
-				COALESCE(p.action,'proxy'), COALESCE(p.status_code,0), COALESCE(p.redirect_url,''), COALESCE(p.response_body,''), COALESCE(p.content_type,'')
+		SELECT p.rule_id, p.sort_order, p.match_type, p.path, p.upstream_path, p.upstreams_json, p.response_mode, p.response_status, p.response_body, p.response_content_type, p.redirect_to
 			FROM path_rules p JOIN lb_rules r ON r.caddy_id = p.rule_id
 			WHERE r.enabled = 1 AND r.custom_routes_enabled = 1
 			ORDER BY p.rule_id, p.sort_order, p.id
@@ -1347,7 +1415,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			var pathRule PathRuleConfig
 			var upstreamsJSON sql.NullString
 			if scanErr := pathRows.Scan(&ruleID, &pathRule.SortOrder, &pathRule.MatchType, &pathRule.Path, &pathRule.UpstreamPath, &upstreamsJSON,
-				&pathRule.Action, &pathRule.StatusCode, &pathRule.RedirectURL, &pathRule.ResponseBody, &pathRule.ContentType); scanErr != nil {
+				&pathRule.ResponseMode, &pathRule.ResponseStatus, &pathRule.ResponseBody, &pathRule.ResponseContentType, &pathRule.RedirectTo); scanErr != nil {
 				closeErr := pathRows.Close()
 				return generationFailure("scan path rule: %v", errors.Join(scanErr, closeErr))
 			}
@@ -1356,7 +1424,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 				continue
 			}
 			if upstreamsJSON.Valid {
-				pathUpstreams, unmarshalErr := decodePathUpstreamsWithResolver(upstreamsJSON.String, pathResolver, r.rule.HostHeader)
+				pathUpstreams, unmarshalErr := decodePathUpstreams(upstreamsJSON.String)
 				if unmarshalErr != nil {
 					closeErr := pathRows.Close()
 					return generationFailure("decode path upstreams for rule %s: %v", ruleID, errors.Join(unmarshalErr, closeErr))
@@ -1444,9 +1512,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		if !r.EnableTLS {
 			continue
 		}
-		// 引用型证书与手动证书同流：PEM 内容已在保存/摄取时入库（tls_cert/tls_key），
-		// 此处统一物化到 /app/certs/{rule}.crt/.key 后由下方 load_files 引用——
-		// 运行时唯一信任源是数据库，文件不参与运行配置真相。
+		// 引用型证书与手动证书同流：PEM 内容已在保存/摄取时入库，运行时唯一信任源
+		// 是数据库，文件不参与运行配置真相。
 		if (r.TLSSource == "manual" || r.TLSSource == "file") && r.TLSCert != "" && r.TLSKey != "" {
 			material := CertMaterial{RuleID: r.CaddyID, CertPEM: r.TLSCert, KeyPEM: r.TLSKey}
 			availableCerts[r.CaddyID] = material
@@ -1644,6 +1711,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 				CompressTypes:                    r.CompressTypes,
 				EnableActiveHealthCheck:          r.EnableActiveHealthCheck,
 				HostHeader:                       r.HostHeader,
+				HealthCheckHost:                  r.HealthCheckHost,
 				RequestBodyMaxSizeMB:             r.RequestBodyMaxSizeMB,
 				UpstreamKeepaliveTimeout:         r.UpstreamKeepaliveTimeout,
 				ServerTokensHidden:               r.ServerTokensHidden,
@@ -1684,7 +1752,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 					}
 					ruleConfig.Upstreams = append(ruleConfig.Upstreams, UpstreamConfig{
 						Host: u.Host, Port: u.Port, Weight: weight, Protocol: protocol, Enabled: u.Enabled,
-						MaxConnections: u.MaxConnections, HostHeader: u.HostHeader,
+						MaxConnections: u.MaxConnections, OriginDomain: u.OriginDomain,
 					})
 				}
 			}
@@ -1800,7 +1868,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	var redirectRoutes []interface{}
 	// M1：判定提为闭包，供 r 自身与下方 other 遮蔽复核共用同款口径。
 	// SYS20-P5-4：提出循环外——闭包捕获空、无状态，每迭代重建纯属浪费。
-	hasEnabledUpstream := func(ups []upstreamRow) bool {
+	hasEnabledUpstream := func(ups []upstream) bool {
 		for _, u := range ups {
 			if u.Enabled {
 				return true
@@ -1843,7 +1911,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 						continue
 					}
 					// M1（审计）：遮蔽复核的比对方也过启用上游门——零启用上游的
-					// 规则不生成 HTTP 默认口路由（死规则），不得作为遮蔽方压制兄弟
+					// 规则不生成 80 端口路由（死规则），不得作为遮蔽方压制兄弟
 					// 域名的 HTTPS 跳转。
 					if !hasEnabledUpstream(other.upstreams) {
 						continue
@@ -1865,10 +1933,10 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 						}
 					}
 					if len(filtered) == 0 {
-						Logf("warn", "跳转规则 %s（%s）的域名 %s 已有启用规则直接监听 %d 端口，该规则所有域名的 HTTPS 跳转均被遮蔽，整条跳转不生成（避免遮蔽 %d 端口规则）", r.Name, r.CaddyID, shadowedBy, DefaultHTTPPort(), DefaultHTTPPort())
+						Logf("warn", "跳转规则 %s（%s）的域名 %s 已有启用规则直接监听 80 端口，该规则所有域名的 HTTPS 跳转均被遮蔽，整条跳转不生成（避免遮蔽 80 端口规则）", r.Name, r.CaddyID, shadowedBy)
 						continue
 					}
-					Logf("warn", "跳转规则 %s（%s）的域名 %s 已有启用规则直接监听 %d 端口，已从跳转中移除（其余域名仍生成跳转）", r.Name, r.CaddyID, shadowedBy, DefaultHTTPPort())
+					Logf("warn", "跳转规则 %s（%s）的域名 %s 已有启用规则直接监听 80 端口，已从跳转中移除（其余域名仍生成跳转）", r.Name, r.CaddyID, shadowedBy)
 					domainHosts = filtered
 				}
 				redirectRoutes = append(redirectRoutes, map[string]interface{}{
@@ -1893,27 +1961,21 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		}
 	}
 
-	// Collect TLS certificate file paths for all rules (manual + 引用型 + ACME from
-	// cert_jobs)：统一引用物化路径 /app/certs/{rule}.crt/.key（每规则各一份，无
-	// 共用外部文件，无需按路径去重）。
+	// Collect TLS certificate file paths for all rules (manual + ACME from cert_jobs)
 	var tlsCertFiles []map[string]interface{}
 	for _, ru := range allRules {
 		r := ru.rule
 		if !r.EnableTLS {
 			continue
 		}
-		if _, hasCert := availableCerts[r.CaddyID]; !hasCert {
-			continue
+		if _, hasCert := availableCerts[r.CaddyID]; hasCert {
+			certPath, keyPath := CertFilePaths(r.CaddyID)
+			tlsCertFiles = append(tlsCertFiles, map[string]interface{}{
+				"certificate": certPath,
+				"key":         keyPath,
+				"tags":        []string{r.CaddyID},
+			})
 		}
-		certPath, keyPath := CertFilePaths(r.CaddyID)
-		if certPath == "" || keyPath == "" {
-			continue
-		}
-		tlsCertFiles = append(tlsCertFiles, map[string]interface{}{
-			"certificate": certPath,
-			"key":         keyPath,
-			"tags":        []string{r.CaddyID},
-		})
 	}
 
 	layer4Servers := make(map[string]interface{})
@@ -1974,15 +2036,15 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			}
 			ruleConfig.Upstreams = append(ruleConfig.Upstreams, UpstreamConfig{
 				Host: u.Host, Port: u.Port, Weight: weight, Protocol: u.Protocol, Enabled: u.Enabled,
-				MaxConnections: u.MaxConnections, HostHeader: u.HostHeader,
+				MaxConnections: u.MaxConnections,
 			})
 		}
 		layer4Servers[fmt.Sprintf("tcp_%d", port)] = buildTCPServer(ruleConfig)
 	}
 
 	// httpDefaultPort/httpDefaultServer 是兜底站与 HTTP→HTTPS 跳转的落点：
-	// 出厂 80（HTTP_PORT 未改时行为与旧硬编码完全一致）；改 HTTP_PORT=8080 后
-	// 兜底站与全部跳转路由跟随到 :8080——规则本身仍是用户显式指定的端口。
+	// 出厂 80（HTTP_PORT 未改时行为与旧硬编码一致）；改 HTTP_PORT 后兜底站与
+	// 全部跳转路由跟随——规则本身仍是用户显式指定的端口。
 	httpDefaultPort := DefaultHTTPPort()
 	httpDefaultServer := fmt.Sprintf("http_%d", httpDefaultPort)
 
@@ -2045,13 +2107,11 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			perPort = map[string]interface{}{}
 			loggerNamesByPort[r.ListenPort] = perPort
 		}
-		for _, d := range strings.Split(r.Domain, ",") {
-			d = strings.TrimSpace(d)
-			if d != "" {
-				// SLB9-3:与 host matcher 同口径规范化——Caddy 日志查找大小写
-				// 敏感,混合大小写 Host 请求会落到默认 logger(归属错位)。
-				perPort[normalizeHostForMatcher(d)] = "rule_" + r.CaddyID
-			}
+		for _, d := range splitAndTrim(r.Domain) {
+			// SLB9-3:与 host matcher 同口径规范化——Caddy 日志查找大小写
+			// 敏感,混合大小写 Host 请求会落到默认 logger(归属错位)。
+			// LBS-A-R2（第 69 轮）：拆分复用 splitAndTrim（同型去重）。
+			perPort[normalizeHostForMatcher(d)] = "rule_" + r.CaddyID
 		}
 	}
 	if len(loggerNamesByPort) > 0 {
@@ -2117,12 +2177,26 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		} else {
 			encoder = map[string]interface{}{"format": "json"}
 		}
+		// LBS-A-P2（第 69 轮）：ruleLogDir 创建移出逐规则循环（此前每条规则一次
+		// 重复 syscall 且错误被丢弃）——有任一启用日志的 http 规则时创建一次，
+		// 失败记日志（writer 落不了盘会体现为 caddy 配置应用错误，此处点名目录）。
+		ruleLoggerNeeded := false
+		for _, ru := range allRules {
+			if r := ru.rule; r.LogEnabled && r.Protocol == "http" {
+				ruleLoggerNeeded = true
+				break
+			}
+		}
+		if ruleLoggerNeeded {
+			if err := os.MkdirAll(ruleLogDir, 0755); err != nil {
+				Logf("error", "创建规则日志目录 %s 失败: %v", ruleLogDir, err)
+			}
+		}
 		for _, ru := range allRules {
 			r := ru.rule
 			if !r.LogEnabled || r.Protocol != "http" {
 				continue
 			}
-			os.MkdirAll(ruleLogDir, 0755)
 			logsMap["rule_"+r.CaddyID] = map[string]interface{}{
 				"writer": map[string]interface{}{
 					"output":       "file",
@@ -2230,11 +2304,11 @@ func buildCaddyLogging(level string, sizeMB int) map[string]interface{} {
 	}
 }
 
-// acmeCertCandidatesForRule 无 lb_rules 子查询的 per-rule 证书候选查询（R65 A-N1
-// 谓词 miss 补查专用）：查询形态与 acmeCertCandidatesQuery 的行过滤一致（PEM
-// 非空），但绕过 enabled/enable_tls/tls_source 谓词——调用方已确保规则在 allRules
-// （tx 视图）中为启用 acme 规则。status 过滤交由 SelectCertificate 后置执行。
-// 查询/解析失败仅记日志返回 nil（与调用点的空候选语义一致：按无证书渲染）。
+// acmeCertCandidatesForRule 查询指定规则的 ACME 证书候选（PEM 非空行，
+// updated_at/id 倒序）。R65 A-N1 谓词 miss 补查与 loadACMECertificateFromStore
+// 共用本查询体（LBS-A-R1 第 69 轮去重——此前两处同一 SELECT+扫描循环逐字
+// 重复）；status 过滤由调用方 SelectCertificate 后置执行。查询/解析失败仅记
+// 日志返回 nil（调用点按无证书渲染/判定，语义不变）。
 func acmeCertCandidatesForRule(store caddyConfigStore, ruleID string) []CertificateCandidate {
 	rows, err := store.Query(`
 		SELECT id, domain, status, cert_pem, key_pem,
@@ -2245,7 +2319,7 @@ func acmeCertCandidatesForRule(store caddyConfigStore, ruleID string) []Certific
 		  AND key_pem IS NOT NULL AND key_pem <> ''
 		ORDER BY updated_at DESC, id DESC`, ruleID)
 	if err != nil {
-		Logf("warn", "ACME 证书候选补查失败（规则 %s，按无证书渲染）: %v", ruleID, err)
+		Logf("warn", "ACME 证书候选查询失败（规则 %s，按无证书处理）: %v", ruleID, err)
 		return nil
 	}
 	defer rows.Close()
@@ -2253,13 +2327,13 @@ func acmeCertCandidatesForRule(store caddyConfigStore, ruleID string) []Certific
 	for rows.Next() {
 		var candidate CertificateCandidate
 		if err := rows.Scan(&candidate.ID, &candidate.Domain, &candidate.Status, &candidate.CertPEM, &candidate.KeyPEM, &candidate.UpdatedAt); err != nil {
-			Logf("warn", "ACME 证书候选补查解析失败（规则 %s）: %v", ruleID, err)
+			Logf("warn", "ACME 证书候选解析失败（规则 %s）: %v", ruleID, err)
 			return nil
 		}
 		candidates = append(candidates, candidate)
 	}
 	if err := rows.Err(); err != nil {
-		Logf("warn", "ACME 证书候选补查遍历失败（规则 %s）: %v", ruleID, err)
+		Logf("warn", "ACME 证书候选遍历失败（规则 %s）: %v", ruleID, err)
 		return nil
 	}
 	return candidates
@@ -2268,32 +2342,10 @@ func acmeCertCandidatesForRule(store caddyConfigStore, ruleID string) []Certific
 // loadACMECertificateFromStore reads the issued ACME certificate and key from
 // cert_jobs (via store) for the given rule and domain. Returns
 // (certPEM, keyPEM, true) if issued.
+// LBS-A-R1（第 69 轮）：查询体委托 acmeCertCandidatesForRule，本函数只做
+// SelectCertificate 择优（此前两函数 SELECT+扫描循环逐字重复）。
 func loadACMECertificateFromStore(store caddyConfigStore, caddyID, domain string) (string, string, bool) {
-	rows, err := store.Query(`
-		SELECT id, domain, status, cert_pem, key_pem,
-		       COALESCE(julianday(COALESCE(updated_at, created_at)), 0)
-		FROM cert_jobs
-		WHERE rule_id=?
-		  AND cert_pem IS NOT NULL AND cert_pem <> ''
-		  AND key_pem IS NOT NULL AND key_pem <> ''
-		ORDER BY updated_at DESC, id DESC`, caddyID)
-	if err != nil {
-		Logf("error", "loadACMECertificate: query failed for rule %s: %v", caddyID, err)
-		return "", "", false
-	}
-	defer rows.Close()
-	candidates := make([]CertificateCandidate, 0)
-	for rows.Next() {
-		var candidate CertificateCandidate
-		if err := rows.Scan(&candidate.ID, &candidate.Domain, &candidate.Status, &candidate.CertPEM, &candidate.KeyPEM, &candidate.UpdatedAt); err != nil {
-			return "", "", false
-		}
-		candidates = append(candidates, candidate)
-	}
-	if err := rows.Err(); err != nil {
-		return "", "", false
-	}
-	selected, ok := SelectCertificate(candidates, domain, time.Now())
+	selected, ok := SelectCertificate(acmeCertCandidatesForRule(store, caddyID), domain, time.Now())
 	if ok {
 		return selected.Candidate.CertPEM, selected.Candidate.KeyPEM, true
 	}
@@ -2363,8 +2415,7 @@ func httpsRedirectLocation(listenPort int) string {
 	// ——Caddy static_response 不会自动保留原 URI（原生 auto-HTTPS 重定向会保留），
 	// 缺失时 http://a.com/page?x=1 会被跳到根路径。首版实施因脚本断言中止丢失。
 	// 判定基准是部署侧 HTTPS 默认口（HTTPS_PORT，出厂 443）：非默认口需显式带
-	// 端口号自引用（否则跳回浏览器默认 443），默认口则省略（旧硬编码 443 的
-	// 行为在未改 HTTPS_PORT 时逐字节保持）。
+	// 端口号自引用（否则跳回浏览器默认 443），默认口则省略。
 	if listenPort != DefaultHTTPSPort() {
 		return fmt.Sprintf("https://{http.request.host}:%d{http.request.uri}", listenPort)
 	}
@@ -2407,12 +2458,15 @@ type SingleRuleConfig struct {
 	UpstreamKeepaliveTimeout int
 	ServerTokensHidden       int
 	// 链式回退竞速参数（strategy=chain_fallback 渲染消费；0 值渲染兜底 3000/30000）。
-	ChainRaceIntervalMS              int
-	ChainRequestTimeoutMS            int
-	GlobalRequestBodyMaxSizeMB       int
-	GlobalUpstreamKeepaliveTimeout   int
-	GlobalServerTokensHidden         bool
-	HostHeader                       string
+	ChainRaceIntervalMS            int
+	ChainRequestTimeoutMS          int
+	GlobalRequestBodyMaxSizeMB     int
+	GlobalUpstreamKeepaliveTimeout int
+	GlobalServerTokensHidden       bool
+	HostHeader                     string
+	// 健康检查域名：主动健康检查 probe 的 Host 头（health_checks.active.headers.Host
+	// 特判实证，healthchecks.go:453-458）；空=跟随 HostHeader。
+	HealthCheckHost                  string
 	CustomRoutesEnabled              bool
 	PathRules                        []PathRuleConfig
 	ProxyDialTimeout                 int
@@ -2446,13 +2500,15 @@ type PathRuleConfig struct {
 	// 精确匹配整体替换（引擎实证形状，见 upstreamPathRewriteHandlers）。
 	UpstreamPath string
 	Upstreams    []UpstreamConfig
-	// 静态响应（2026-10-09）：Action="respond" 时该路径规则改由本程序直接返回
-	// （static_response），Upstreams/UpstreamPath 不参与渲染。
-	Action       string
-	StatusCode   int
-	RedirectURL  string
-	ResponseBody string
-	ContentType  string
+	// 直接返回/301 跳转（2026-10-10 用户裁定）：ResponseMode ''=转发上游
+	// （现状，全链渲染）/static=静态响应/redirect=301 跳转——后两者不经
+	// 安全链与 reverse_proxy；LBS-A-U1（第 69 轮）起链首带 lb_rule_metrics
+	// 纯计数（指标不属于安全链）。
+	ResponseMode        string
+	ResponseStatus      int
+	ResponseBody        string
+	ResponseContentType string
+	RedirectTo          string
 }
 
 type proxyTimeouts struct {
@@ -2472,9 +2528,9 @@ type UpstreamConfig struct {
 	Protocol       string
 	Enabled        bool
 	MaxConnections int
-	// HostHeader 逐上游回源 Host（空=回退规则级 host_header，仍空=上游自身）。
-	// 仅 HTTP 链消费（buildHTTPHandleChain 三级回退）；TCP（layer4）无 Host 概念。
-	HostHeader string
+	// 逐上游回源域名：非空时经 map 处理器（{lb.upstream_host}/{lb.upstream_sni}）
+	// 驱动该上游回源 Host 头与 HTTPS SNI；空=跟随 HostHeader/现状默认。
+	OriginDomain string
 }
 
 func resolveRuleOverrides(rule SingleRuleConfig) (requestBodyMaxSizeMB int, upstreamKeepalive int, hideServer bool) {
@@ -2572,15 +2628,13 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 		var certPresent, keyPresent, enableTLS bool
 		// Round 34 F-3: 查询失败必须留痕，对话框不得静默显示"无证书"。
 		// N+12 G8-S3：仅需存在性判断，投影 COALESCE!='' 布尔，不搬运 PEM 正文。
-		// 引用型证书与手动证书同口径：内容（tls_cert/tls_key）在库即有证，路径
-		// 列只是摄取源记录，不参与运行配置判定。
-		if err := db.DB.QueryRow(`SELECT COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '', COALESCE(tls_key,'') != '', COALESCE(enable_tls,0)
-			FROM lb_rules WHERE caddy_id = ?`, caddyID).
-			Scan(&tlsSource, &certPresent, &keyPresent, &enableTLS); err != nil {
+		if err := db.DB.QueryRow(`SELECT COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '', COALESCE(tls_key,'') != '', COALESCE(enable_tls,0) FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(&tlsSource, &certPresent, &keyPresent, &enableTLS); err != nil {
 			Logf("error", "GenerateRuleServerContext: 读取规则 %s TLS 字段失败: %v", caddyID, err)
 		} else if enableTLS {
 			// Round 34 F-2: 与全量渲染 availableCerts 同口径（caddy.go 全量路径
 			// 要求 EnableTLS），未开 TLS 的规则不加载证书。
+			// 引用型证书与手动证书同口径：内容（tls_cert/tls_key）在库即有证，
+			// 路径列只是摄取源记录，不参与运行配置判定。
 			if (tlsSource == "manual" || tlsSource == "file") && certPresent && keyPresent {
 				hasCert = true
 			} else if tlsSource == "acme_dns" {
@@ -2591,8 +2645,7 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 		// Round 34 F-2: 与全量渲染 httpServersByPort 同口径——仅 enable_tls=1 且
 		// 存在启用上游的规则进入 TLS 策略（无上游/关 TLS 规则在真实配置中不存在）。
 		// N+12 G8-S3：证书仅有无的判断在 SQL 侧完成，不再把整列 PEM 拉进进程。
-		rows, err := db.DB.Query(`SELECT COALESCE(caddy_id,''), COALESCE(domain,''), COALESCE(tls_source,'manual'),
-			COALESCE(tls_cert,'') != '' AND COALESCE(tls_key,'') != ''
+		rows, err := db.DB.Query(`SELECT COALESCE(caddy_id,''), COALESCE(domain,''), COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '' AND COALESCE(tls_key,'') != ''
 			FROM lb_rules WHERE enabled = 1 AND protocol = 'http' AND listen_port = ? AND enable_tls = 1
 			AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id = lb_rules.caddy_id AND IIF(u.enabled IN ('1',1),1,0) = 1)
 			ORDER BY rowid`, listenPort)
@@ -2636,7 +2689,6 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 		apps["layer4"] = map[string]interface{}{"servers": map[string]interface{}{serverName: server}}
 	}
 	if hasCert {
-		// 各来源统一引用物化路径 /app/certs/{rule}.crt/.key（内容来自 DB 物化）。
 		certPath, keyPath := CertFilePaths(caddyID)
 		apps["tls"] = map[string]interface{}{
 			"certificates": map[string]interface{}{
@@ -2760,7 +2812,7 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 			"routes": routeValues,
 		}
 
-		// Add TLS configuration for manual / 引用型 certificates（内容在库即有证）
+		// Add TLS configuration for manual certificates
 		if rule.EnableTLS && (rule.TLSSource == "manual" || rule.TLSSource == "file") && rule.TLSCert != "" && rule.TLSKey != "" {
 			server["tls_connection_policies"] = []interface{}{
 				map[string]interface{}{
@@ -2813,9 +2865,8 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 		},
 	}
 
-	// Add TLS certificates configuration for manual certificates
-	// 引用型证书与手动证书同流：内容已在库（tls_cert/tls_key），预览统一走
-	// load_pem 内联 PEM（不复制文件、不引用摄取源路径）。
+	// Add TLS certificates configuration for manual / 引用型 certificates
+	// （引用型与手动同流：内容已在库，预览统一走 load_pem 内联 PEM）。
 	if rule.EnableTLS && (rule.TLSSource == "manual" || rule.TLSSource == "file") && rule.TLSCert != "" && rule.TLSKey != "" {
 		apps["tls"] = map[string]interface{}{
 			"certificates": map[string]interface{}{
@@ -2893,29 +2944,35 @@ func generateHTTPRouteObjects(rule SingleRuleConfig, securityCtx ...*securityPol
 			return pathRules[i].SortOrder < pathRules[j].SortOrder
 		})
 		for pathIndex, pathRule := range pathRules {
-			// 静态响应分支（2026-10-09）：该路径由本程序直接响应（static_response），
-			// 与上游无关——跳过上游回退与 path 改写，链尾为预设响应。
-			respond := normalizedPathRuleAction(pathRule.Action) == string(models.PathRuleActionRespond)
-			var handle []interface{}
-			var handleErr error
-			if respond {
-				handle, handleErr = buildStaticResponsePathChain(rule, pathRule, ctx)
-			} else {
-				upstreams := pathRule.Upstreams
-				// Round 32 F-3: 空数组与 nil 统一回退主上游——DB 中 upstreams_json="[]"
-				// 的存量路径规则此前因 `upstreams == nil` 不成立而走 buildHTTPHandleChain
-				// 硬失败（预校验特判放行、全量渲染失败的不对称），修复后两者语义一致。
-				if len(upstreams) == 0 {
-					upstreams = rule.Upstreams
+			// 直接返回/301 跳转（2026-10-10 用户裁定）：不经安全链/改写/reverse_proxy
+			// （无上游可代理，静态响应天然无后端攻击面；安全策略不覆盖此类路径）。
+			// LBS-A-U1（第 69 轮）：链首补 lb_rule_metrics 纯计数——指标不属于
+			// 安全链，不修时规则全量流量指标漏计该类路径流量（指标页失真）。
+			if pathRule.ResponseMode == "static" || pathRule.ResponseMode == "redirect" {
+				staticRoute := map[string]interface{}{
+					"match": []interface{}{map[string]interface{}{"host": domainHosts, "path": pathMatcherSpecs(pathRule)}},
+					"handle": []interface{}{
+						map[string]interface{}{"handler": "lb_rule_metrics", "rule": rule.CaddyID},
+						buildStaticResponseHandler(pathRule),
+					},
+					"terminal": true,
 				}
-				handle, handleErr = buildHTTPHandleChain(rule, upstreams, ctx)
-				if handleErr == nil {
-					handle = insertUpstreamPathRewrites(handle, pathRule)
-				}
+				tagRuleRoute(staticRoute, rule.CaddyID, fmt.Sprintf("path_%d", pathIndex))
+				routes = append(routes, staticRoute)
+				continue
 			}
+			upstreams := pathRule.Upstreams
+			// Round 32 F-3: 空数组与 nil 统一回退主上游——DB 中 upstreams_json="[]"
+			// 的存量路径规则此前因 `upstreams == nil` 不成立而走 buildHTTPHandleChain
+			// 硬失败（预校验特判放行、全量渲染失败的不对称），修复后两者语义一致。
+			if len(upstreams) == 0 {
+				upstreams = rule.Upstreams
+			}
+			handle, handleErr := buildHTTPHandleChain(rule, upstreams, ctx)
 			if handleErr != nil {
 				return nil, nil, handleErr
 			}
+			handle = insertUpstreamPathRewrites(handle, pathRule)
 			matcher := map[string]interface{}{
 				"host": domainHosts,
 				"path": pathMatcherSpecs(pathRule),
@@ -2956,92 +3013,6 @@ func pathPrefixRoot(path string) string {
 	return strings.TrimRight(path, "/*")
 }
 
-// respondStatusCodes 预置的静态响应状态码集合（前端下拉同源展示，后端为权威
-// 白名单）：成功 / 重定向 / 客户端错误 / 服务端错误四组常用码。
-var respondStatusCodes = []int{
-	200, 204, // 成功
-	301, 302, 303, 307, 308, // 重定向（响应必须带 Location）
-	400, 401, 403, 404, 405, 410, 429, // 客户端错误
-	500, 502, 503, 504, // 服务端错误
-}
-
-// RespondStatusCodes 返回预置状态码清单副本（API/前端契约同源，防调用方篡改）。
-func RespondStatusCodes() []int {
-	out := make([]int, len(respondStatusCodes))
-	copy(out, respondStatusCodes)
-	return out
-}
-
-// IsSupportedRespondStatus 判定状态码是否在预置集合内（保存校验白名单）。
-func IsSupportedRespondStatus(code int) bool {
-	for _, preset := range respondStatusCodes {
-		if preset == code {
-			return true
-		}
-	}
-	return false
-}
-
-// IsRedirectRespondStatus 判定是否重定向类状态码（3xx：必须携带 Location，
-// 且按 RFC 9110 不带消息体）。
-func IsRedirectRespondStatus(code int) bool {
-	return code >= 300 && code < 400
-}
-
-// respondBodyAllowed 判定该状态码是否允许响应体（204/304 与全部 3xx 不允许）。
-func respondBodyAllowed(code int) bool {
-	return code != 204 && code != 304 && !IsRedirectRespondStatus(code)
-}
-
-// defaultRespondContentType 静态响应带体且未指定内容类型时的兜底值。
-const defaultRespondContentType = "text/html; charset=utf-8"
-
-// staticResponseHandler 构造本程序直接响应的 static_response handler：必备响应头
-// 按标准状态码语义预设（3xx→Location、401→WWW-Authenticate、405→Allow、带体→
-// Content-Type），响应体经占位符转义后原样输出。
-func staticResponseHandler(pathRule PathRuleConfig) map[string]interface{} {
-	handler := map[string]interface{}{
-		"handler":     "static_response",
-		"status_code": pathRule.StatusCode,
-	}
-	headers := map[string]interface{}{}
-	switch {
-	case IsRedirectRespondStatus(pathRule.StatusCode):
-		// 重定向必备头：目标 URL 由用户填写（校验层保证非空且形状合法）。
-		headers["Location"] = []string{pathRule.RedirectURL}
-	case pathRule.StatusCode == 401:
-		// RFC 9110：401 响应必须携带 WWW-Authenticate——本程序不参与凭据校验，
-		// 以通用 Basic 形态占位，满足标准响应形状。
-		headers["WWW-Authenticate"] = []string{`Basic realm="Restricted"`}
-	case pathRule.StatusCode == 405:
-		// RFC 9110：405 响应必须携带 Allow——静态响应对全部方法同响应，列出常规
-		// 方法全集供客户端判断。
-		headers["Allow"] = []string{"GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"}
-	}
-	if respondBodyAllowed(pathRule.StatusCode) {
-		contentType := strings.TrimSpace(pathRule.ContentType)
-		if contentType == "" {
-			contentType = defaultRespondContentType
-		}
-		headers["Content-Type"] = []string{contentType}
-	}
-	if len(headers) > 0 {
-		handler["headers"] = headers
-	}
-	if respondBodyAllowed(pathRule.StatusCode) && pathRule.ResponseBody != "" {
-		handler["body"] = escapeCaddyPlaceholders(pathRule.ResponseBody)
-	}
-	return handler
-}
-
-// escapeCaddyPlaceholders 转义响应体中的 { ——Caddy static_response 的 body 会做
-// 占位符替换，且未识别的占位符按 replacer.ReplaceAll 的 treatUnknownAsEmpty 语义
-// 展开为空串，用户内容里的 JSON/模板花括号会被静默吞掉。转义为 \{ 后引擎按字面
-// 输出（replacer.go 的 phEscape 分支），保证所见即所得。
-func escapeCaddyPlaceholders(body string) string {
-	return strings.ReplaceAll(body, "{", `\{`)
-}
-
 // insertUpstreamPathRewrites 在链内最后一个 reverse_proxy 之前插入上游 path
 // 改写 handler。形状经 caddy 2.11.4 容器行为实证：
 //   - 前缀匹配：先 strip_path_prefix 剥匹配前缀根（root 空则无可剥，跳过），
@@ -3073,6 +3044,38 @@ func insertUpstreamPathRewrites(handle []interface{}, pathRule PathRuleConfig) [
 	rewritten = append(rewritten, rewrites...)
 	rewritten = append(rewritten, handle[proxyIndex:]...)
 	return rewritten
+}
+
+// buildStaticResponseHandler 渲染路径规则的直接返回/301 跳转 handler（全原生
+// http.handlers.static_response）：redirect=301+Location（目标经校验侧形状门）；
+// static=status_code+body+Content-Type，缺省兜底 200/text/plain。
+// LBS-A-P1（第 69 轮，语义声明）：static_response 的 headers 值与 body 在
+// 运行时经 Caddy replacer 展开已知占位符（v2.11.6 staticresp.go:193-208 实证，
+// ReplaceKnown）——redirect_to/body 中的 {http.request.uri} 等会被改写为请求
+// 值（与 httpsRedirectLocation 的占位符用法同引擎机制）。校验侧有意不拒 '{'
+// （保路径跳转的合法占位符用法），审计不重报。
+func buildStaticResponseHandler(pathRule PathRuleConfig) map[string]interface{} {
+	if pathRule.ResponseMode == "redirect" {
+		return map[string]interface{}{
+			"handler":     "static_response",
+			"status_code": 301,
+			"headers":     map[string]interface{}{"Location": []string{pathRule.RedirectTo}},
+		}
+	}
+	status := pathRule.ResponseStatus
+	if status <= 0 {
+		status = 200
+	}
+	contentType := pathRule.ResponseContentType
+	if contentType == "" {
+		contentType = "text/plain"
+	}
+	return map[string]interface{}{
+		"handler":     "static_response",
+		"status_code": status,
+		"body":        pathRule.ResponseBody,
+		"headers":     map[string]interface{}{"Content-Type": []string{contentType}},
+	}
 }
 
 func upstreamPathRewriteHandlers(pathRule PathRuleConfig) []interface{} {
@@ -3132,6 +3135,15 @@ func SplitDnsAddresses(s string) []string {
 
 func joinUpstreamAddress(host string, port int) string {
 	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+// stripOriginPort 剥离 host:port 形态的端口（SNI 不得含端口）；无端口形态
+// （含裸 IPv6 字面量）原样返回。渲染期预计算 map outputs 第二值专用。
+func stripOriginPort(host string) string {
+	if hostOnly, _, err := net.SplitHostPort(host); err == nil {
+		return hostOnly
+	}
+	return host
 }
 
 // blockStatusForPolicy 返回策略段的中断抬码（阶段化模型）：规则配了阶段 3
@@ -3199,220 +3211,12 @@ func buildBlockPageAttributionRoute(synthetic int, content string, statusCode in
 	}
 }
 
-type lbRule struct {
-	CaddyID                       string
-	Name                          string
-	Protocol                      string
-	Domain                        string
-	ListenPort                    int
-	Strategy                      string
-	DynamicDNS                    bool
-	EnableDnsServer               bool
-	DnsServer                     string
-	DnsFamily                     string
-	HealthCheckPath               string
-	HealthCheckInterval           int
-	HealthCheckTimeout            int
-	HealthCheckUnhealthyThreshold int
-	HealthCheckHealthyThreshold   int
-	EnableTLS                     bool
-	TLSSource                     string
-	ACMEConfigID                  int
-	ACMEEmail                     string
-	TLSCert                       string
-	TLSKey                        string
-	// 引用型证书（tls_source="file"）：摄取源文件路径记录——内容已入库
-	// （tls_cert/tls_key），路径仅供看门狗检测外部更新与展示，渲染不消费。
-	TLSCertPath              string
-	TLSKeyPath               string
-	TLSHTTPRedirect          bool
-	Enabled                  bool
-	EnableCompress           bool
-	CompressTypes            string
-	EnableActiveHealthCheck  bool
-	TCPHealthCheckPort       int
-	TCPProxyProtocol         bool
-	TCPTryDuration           int
-	TCPTryInterval           int
-	RequestBodyMaxSizeMB     int
-	UpstreamKeepaliveTimeout int
-	ServerTokensHidden       int
-	// 链式回退竞速参数（strategy=chain_fallback 渲染消费；0 值渲染兜底）。
-	ChainRaceIntervalMS        int
-	ChainRequestTimeoutMS      int
-	CustomRoutesEnabled        bool
-	ProxyDialTimeout           int
-	ProxyResponseHeaderTimeout int
-	ProxyReadTimeout           int
-	ProxyWriteTimeout          int
-	ProxyStreamTimeout         int
-	ProxyFlushInterval         int
-	ProxyStreamCloseDelay      int
-	PathRules                  []PathRuleConfig
-	HostHeader                 string
-	LogEnabled                 bool
-	BlockPageStage1ID          int
-	BlockPageStage1Status      int
-	BlockPageStage3ID          int
-	BlockPageStage3Status      int
-}
-
-// upstreamRow 统一上游（upstreams 表）一行：主链负载池与「自定义路由上游回源
-// Host 推导」共用同一投影（后者按地址反查所属规则，故同样需要 rule_id）。
-type upstreamRow struct {
-	RuleID         string
-	Host           string
-	Port           int
-	Weight         int
-	Enabled        bool
-	Protocol       string
-	MaxConnections int
-	// HostHeader 逐上游回源 Host（空=回退规则级 host_header，仍空=上游自身）。
-	HostHeader string
-}
-
-// ruleWithUpstreams 规则 + 其启用上游集合（渲染期工作集）。
-type ruleWithUpstreams struct {
-	rule      lbRule
-	upstreams []upstreamRow
-}
-
-// decodePathUpstreams 无推导上下文的解析入口（测试与「无规则上下文」调用方）：
-// 行内回源 Host 一律留空 → 规则级/自身地址，与历史行为逐字节一致。
 func decodePathUpstreams(raw string) ([]UpstreamConfig, error) {
-	return decodePathUpstreamsWithResolver(raw, nil, "")
-}
-
-// upstreamHostKey 统一「主机:端口」键（小写主机 + 端口），索引与查询同源拼写。
-func upstreamHostKey(host string, port int) string {
-	return strings.ToLower(net.JoinHostPort(strings.TrimSpace(host), fmt.Sprintf("%d", port)))
-}
-
-// pathUpstreamHostResolver 自定义路由上游（path_rules.upstreams_json 里的
-// address:port）的回源 Host 解析入口。自定义路由前端不携带该字段（2026-10-10
-// 用户裁定：规则设定不新增额外字段，只有内部逻辑），渲染期按「该地址是否出现
-// 在统一上游集合里」分派给两类解析器：
-//   - 是：hoisted——用统一上游集合的整体计划（与规则主链同一函数、同一三级
-//     回退），即用户举例里的 C/D 走各自逐上游 Host、192.168.42.2 走规则级；
-//   - 否：orphan——不在统一上游集合里的外部地址（用户举例里的 X.com），Host
-//     只有规则级（基础设置后端域名）一档，仍空才用自身地址。
-//
-// 两类都只回退到「规则级」与「自身地址」，绝不透传客户端 Host。
-type pathUpstreamHostResolver struct {
-	hoisted func(host string, port int) (string, bool)
-	orphan  func(ruleHostHeader string) string
-}
-
-// hostFor 解析单个自定义路由上游的回源 Host（ruleHostHeader 为当前规则级后端域名）。
-func (r *pathUpstreamHostResolver) hostFor(host string, port int, ruleHostHeader string) string {
-	if r == nil {
-		return ""
-	}
-	if r.hoisted != nil {
-		if value, ok := r.hoisted(host, port); ok {
-			return value
-		}
-	}
-	if r.orphan != nil {
-		return r.orphan(ruleHostHeader)
-	}
-	return ""
-}
-
-// buildPathUpstreamHostResolver 组装自定义路由上游的回源 Host 解析上下文。
-// 数据源为统一上游集合（upstreams 表 + 其规则级 host_header），键为「主机:端口」：
-//   - hoisted：地址命中集合 → 取「该地址所属规则」的上游集合整体计划里的对应值
-//     （用户举例：/img/ 的 C.com 与 /admin 的 D.com 各用自己那条上游行的
-//     逐上游 Host；/ 的 192.168.42.2 那条上游行为空 → 规则级 B.com）。
-//   - orphan：地址不在集合 → 只有规则级一档（用户举例：/api 的 X.com 用 B.com；
-//     规则级也为空 → 自身地址）。
-//
-// 同一 host:port 命中多行/多规则时取首个命中（确定性：按规则集合顺序），此时
-// 取值来源可能与实际转发的那条不同——属配置歧义，由用户侧消歧（同一地址配成
-// 两台上游本身即属可疑配置），不阻断渲染。
-func buildPathUpstreamHostResolver(rulesByID map[string]*ruleWithUpstreams) *pathUpstreamHostResolver {
-	type ownerRef struct {
-		upstreams []UpstreamConfig
-		ruleHost  string
-	}
-	ownersByKey := make(map[string]ownerRef)
-	for _, entry := range rulesByID {
-		if entry == nil || entry.rule.Protocol != "http" {
-			continue
-		}
-		ups := make([]UpstreamConfig, 0, len(entry.upstreams))
-		for _, u := range entry.upstreams {
-			protocol := u.Protocol
-			if protocol == "" {
-				protocol = "http"
-			}
-			ups = append(ups, UpstreamConfig{
-				Host: u.Host, Port: u.Port, Weight: u.Weight, Protocol: protocol, Enabled: u.Enabled,
-				MaxConnections: u.MaxConnections, HostHeader: u.HostHeader,
-			})
-		}
-		for _, u := range entry.upstreams {
-			key := upstreamHostKey(u.Host, u.Port)
-			if _, seen := ownersByKey[key]; !seen {
-				ownersByKey[key] = ownerRef{upstreams: ups, ruleHost: entry.rule.HostHeader}
-			}
-		}
-	}
-	hoisted := func(host string, port int) (string, bool) {
-		owner, ok := ownersByKey[upstreamHostKey(host, port)]
-		if !ok || len(owner.upstreams) == 0 {
-			return "", false
-		}
-		return hostPlanValueFor(resolveUpstreamHostPlan(SingleRuleConfig{HostHeader: owner.ruleHost}, owner.upstreams), host, port)
-	}
-	// orphan 只依赖「规则级后端域名」，逐规则取值——解析器本身无状态，闭包由
-	// 调用点给出当前规则（同一份索引被所有规则复用，避免每规则重建）。
-	return &pathUpstreamHostResolver{
-		hoisted: hoisted,
-		orphan: func(ruleHostHeader string) string {
-			return strings.TrimSpace(ruleHostHeader)
-		},
-	}
-}
-
-// hostPlanValueFor 从回源 Host 计划里取指定上游的有效值（含最终回退档的解析）：
-// 静态档统一取值；混合档查 overrideMap（未收录项=该上游回退自身地址）；全回退
-// 档返回空串表示「用自身地址」，调用侧按 joinUpstreamAddress 兜底。
-func hostPlanValueFor(plan upstreamHostPlan, host string, port int) (string, bool) {
-	if plan.staticHost != "" {
-		return plan.staticHost, true
-	}
-	if plan.overrideMap != nil {
-		if value, ok := plan.overrideMap[joinUpstreamAddress(host, port)]; ok {
-			return value, true
-		}
-		return "", true
-	}
-	if plan.usePlaceholder {
-		return "", true
-	}
-	return "", false
-}
-
-// decodePathUpstreamsWithResolver 解析 path_rules.upstreams_json 并当场定下行内
-// 回源 Host。自定义路由的该字段全部由渲染期内部推导（2026-10-10 用户裁定：规则
-// 设定不新增额外字段，只有内部逻辑）：
-//   - 存储行里的 host_header 被**有意忽略**——外部负载（备份导入、API/MCP 直写）
-//     无法保证与统一上游集合一致，而回源 Host 属上游属性，配置真相只在 upstreams
-//     表；忽略它还让本特性的渲染与「前端回拨的旧值」解耦（同一份规则集合恒等价）；
-//   - 解析结果由 resolver 分派：地址在统一上游集合里走集合整体计划（逐上游优先、
-//     规则级兜底），不在集合里只走规则级、再空用自身地址（joinUpstreamAddress）。
-//
-// resolver 为 nil（无规则上下文的调用方）时行内留空，落到规则级/自身地址，
-// 与「地址不在统一上游集合里」同口径。
-func decodePathUpstreamsWithResolver(raw string, resolver *pathUpstreamHostResolver, ruleHostHeader string) ([]UpstreamConfig, error) {
 	var stored []struct {
 		Address  string `json:"address"`
 		Port     int    `json:"port"`
 		Weight   int    `json:"weight"`
 		Protocol string `json:"protocol"`
-		// HostHeader：外部负载里可能存在的历史值，有意不读取。
-		HostHeader string `json:"host_header"`
 	}
 	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
 		return nil, err
@@ -3423,13 +3227,8 @@ func decodePathUpstreamsWithResolver(raw string, resolver *pathUpstreamHostResol
 		if protocol == "" {
 			protocol = "http"
 		}
-		var hostHeader string
-		if resolver != nil {
-			hostHeader = strings.TrimSpace(resolver.hostFor(item.Address, item.Port, ruleHostHeader))
-		}
 		upstreams = append(upstreams, UpstreamConfig{
 			Host: item.Address, Port: item.Port, Weight: item.Weight, Protocol: protocol, Enabled: true,
-			HostHeader: hostHeader,
 		})
 	}
 	return upstreams, nil
@@ -3628,21 +3427,7 @@ var geoipPrivateRanges = []string{
 	"fe80::/10",              // IPv6 链路本地
 }
 
-// buildHTTPHandleChain 反向代理处理链（上游负载池 → reverse_proxy）。
 func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, securityCtx ...*securityPolicyContext) ([]interface{}, error) {
-	return buildHandleChain(rule, upstreams, nil, securityCtx...)
-}
-
-// buildStaticResponsePathChain 静态响应处理链（2026-10-09）：与代理路径共用同一
-// 安全前缀（WAF/限流/请求体限额/指标口径一致），仅终结 handler 换成本程序直接
-// 生成的 static_response——「针对某个路径由本程序提供响应」。
-func buildStaticResponsePathChain(rule SingleRuleConfig, pathRule PathRuleConfig, securityCtx ...*securityPolicyContext) ([]interface{}, error) {
-	return buildHandleChain(rule, nil, &pathRule, securityCtx...)
-}
-
-// buildHandleChain 处理链统一实现。respond 与 upstreams 互斥：respond != nil 时
-// 为静态响应形态（不校验/不构建上游，链尾为 static_response）。
-func buildHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, respond *PathRuleConfig, securityCtx ...*securityPolicyContext) ([]interface{}, error) {
 	var ctx *securityPolicyContext
 	if len(securityCtx) > 0 {
 		ctx = securityCtx[0]
@@ -3653,7 +3438,7 @@ func buildHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, respond
 			enabledUpstreams = append(enabledUpstreams, upstream)
 		}
 	}
-	if respond == nil && len(enabledUpstreams) == 0 {
+	if len(enabledUpstreams) == 0 {
 		return nil, fmt.Errorf("%w", ErrNoEnabledUpstreams)
 	}
 	if rule.DynamicDNS && len(enabledUpstreams) > 1 {
@@ -3843,16 +3628,15 @@ func buildHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, respond
 		handleChain = append(handleChain, securityChain...)
 	}
 
-	// 静态响应短路（2026-10-09）：安全前缀已就位，链尾直接返回本程序生成的
-	// 响应——不构建上游列表/负载均衡/健康检查/transport（与上游无关）。
-	if respond != nil {
-		handleChain = append(handleChain, staticResponseHandler(*respond))
-		return handleChain, nil
-	}
-
 	upstreamList := make([]interface{}, 0, len(enabledUpstreams))
 	upstreamWeights := make([]int, 0, len(enabledUpstreams))
 	hasHTTPSUpstream := false
+	// 逐上游回源域名（2026-10-10，原生 map 方案）：dial→origin_domain 收敛表。
+	// 仅静态模式收录——dynamic_dns 池 dial=解析后 IP（请求期才确定），静态映射
+	// 永不命中（校验侧另 400 拒绝，此处为渲染守卫）；同 dial 重复条目首现生效
+	// （map Validate 拒绝重复 input，map.go:107-115——保存侧查重之外的防御）。
+	originDomains := make(map[string]string, len(enabledUpstreams))
+	originDialOrder := make([]string, 0, len(enabledUpstreams))
 	for _, upstream := range enabledUpstreams {
 		weight := upstream.Weight
 		if weight <= 0 {
@@ -3883,9 +3667,16 @@ func buildHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, respond
 			}
 			upstreamList = append(upstreamList, upstreamEntry)
 		} else {
-			entry := map[string]interface{}{"dial": joinUpstreamAddress(upstream.Host, upstream.Port)}
+			dial := joinUpstreamAddress(upstream.Host, upstream.Port)
+			entry := map[string]interface{}{"dial": dial}
 			if upstream.MaxConnections > 0 {
 				entry["max_requests"] = upstream.MaxConnections
+			}
+			if upstream.OriginDomain != "" {
+				if _, dup := originDomains[dial]; !dup {
+					originDomains[dial] = upstream.OriginDomain
+					originDialOrder = append(originDialOrder, dial)
+				}
 			}
 			upstreamList = append(upstreamList, entry)
 		}
@@ -3894,25 +3685,14 @@ func buildHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, respond
 		}
 	}
 
-	// ── 逐上游回源 Host 三级回退（2026-10-09）─────────────────────────────
-	// 优先级：上游自定义 host_header > 规则级 host_header > 上游自身 host:port。
-	// Caddy 单个 reverse_proxy 的请求头操作为 handler 级——同一负载池共享一个
-	// Host 值：全统一态用静态值；全回退态用 {http.reverse_proxy.upstream.hostport}
-	// （等价每上游用自身地址）；混合态（上游间取值不一致）由 lb_upstream_host
-	// 处理器（caddygeoip 模块）在请求期按选中上游惰性下发——负载均衡/健康检查
-	// 语义不变。TLS server_name 同源取值（混合态走 {lb.upstream_sni}）。
-	hostPlan := resolveUpstreamHostPlan(rule, enabledUpstreams)
-
 	// 链式回退（2026-10-09）：strategy=chain_fallback 渲染为自定义 chain_proxy
 	// 处理器（caddychain 模块）——上游按权重降序组成回退链，竞速 + 兜底截断 +
 	// 失败即切。reverse_proxy 专属的负载均衡/健康检查/transport/headers/回源
-	// Host 占位符全部不发射（竞速即可用性机制；逐上游回源 Host 在生成侧解析后
+	// Host 占位符全部不发射（竞速即可用性机制；逐上游回源域名在生成侧解析后
 	// 随车道下发）。安全链/静态响应短路等链上前置 handler 不变。
 	if rule.Protocol == "http" && rule.Strategy == "chain_fallback" {
 		chainConfig := buildChainProxyConfig(rule, enabledUpstreams)
 		if effectiveServerTokensHidden {
-			// deferred Server 删除与 reverse_proxy 无关（响应写出后生效），
-			// 链式规则同样生效。
 			handleChain = append(handleChain, map[string]interface{}{
 				"handler":  "headers",
 				"response": map[string]interface{}{"deferred": true, "delete": []string{"Server"}},
@@ -3994,16 +3774,14 @@ func buildHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, respond
 				"passes":   hcPasses,
 				"fails":    hcThreshold,
 			}
-			// 主动健康检查的 headers 为 handler 级（Caddy active health check
-			// 不支持逐上游 headers）——统一态与代理请求同源取回源 Host（含
-			// 上游级统一值）；混合/全回退态维持规则级值（空=不带 Host 覆盖，
-			// 健康检查域名依赖上游自身，与 dial 默认行为一致）。
-			healthHost := rule.HostHeader
-			if hostPlan.staticHost != "" {
-				healthHost = hostPlan.staticHost
+			// 健康检查域名优先于规则级后端域名（probe Host 头特判实证，
+			// healthchecks.go:453-458）；皆空则不输出 headers 键（现状不变）。
+			probeHost := rule.HealthCheckHost
+			if probeHost == "" {
+				probeHost = rule.HostHeader
 			}
-			if healthHost != "" {
-				active["headers"] = map[string]interface{}{"Host": []string{healthHost}}
+			if probeHost != "" {
+				active["headers"] = map[string]interface{}{"Host": []string{probeHost}}
 			}
 			healthChecks["active"] = active
 		}
@@ -4024,13 +3802,15 @@ func buildHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, respond
 	if needsTransport {
 		transportConfig := map[string]interface{}{"protocol": "http"}
 		if hasHTTPSUpstream {
-			// SNI 与回源 Host 同源：统一态用同一静态值；混合态 {lb.upstream_sni}
-			// 按选中上游惰性解析（处理器侧剥端口，SNI 不得含端口）；全回退态
-			// 维持 rule.HostHeader 现状（空=交给 Caddy 以 dial host 兜底，与
-			// v2.11 自动行为一致）。
-			serverName := rule.HostHeader
-			if hostPlan.sniTarget != "" {
-				serverName = hostPlan.sniTarget
+			// 逐上游回源域名在场时 SNI 改走占位符（server_name 占位符逐连接展开
+			// 实证，httptransport.go:427-446）。已知限制：主动健康检查 probe 用
+			// 全新 replacer（healthchecks.go:442），占位符不展开→probe 不发 SNI；
+			// 项目恒 insecure_skip_verify，TLS 层不断（严格 SNI 多租户上游为边角）。
+			// 静态路径同样剥端口（2026-10-10 用户裁定）：SNI 无端口语义（RFC 6066），
+			// host_header 带端口时原样透传是畸形值；Host 头侧（:3760+）保留端口原样。
+			serverName := stripOriginPort(rule.HostHeader)
+			if len(originDomains) > 0 {
+				serverName = "{lb.upstream_sni}"
 			}
 			transportConfig["tls"] = map[string]interface{}{
 				"insecure_skip_verify": true,
@@ -4061,21 +3841,18 @@ func buildHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, respond
 	}
 	// X-LB-GeoIP-* 是 caddygeoip→coraza 的进程内控制头（coraza 在本 handler 之前
 	// 执行，已消费完毕），绝不允许透传上游后端。无条件剥离：geoip 关闭的规则
-	// 同时防客户端伪造同名头直达后端。头名清单见 lbControlRequestHeaders（与
-	// chain_proxy 的 strip_request_headers 同源，变更需双侧同步）。
+	// 同时防客户端伪造同名头直达后端。头名清单与 caddygeoip/handler.go 的
+	// geoipCorazaHeaders(caddygeoip/handler.go) 同源，变更需双侧同步。X-LB-Rule-ID 同型：链首注入的归因头
+	//（F3）仅供 coraza 事务内消费，同口径无条件剥离。
 	proxyRequestHeaders := map[string]interface{}{
 		"delete": lbControlRequestHeaders,
 	}
-	// 回源 Host 下发（三级回退计划；有启用上游时三态必有其一——恒显式设置：
-	// 全回退态从「透传客户端 Host」改为「每上游用自身 host:port」，与程序定位
-	// 一致：默认即以回源目标身份访问）。
-	switch {
-	case hostPlan.overrideMap != nil:
+	// 回源域名在场时 Host 头改走 map 占位符（defaults 已烘焙 host_header/透传
+	// 回退链）；否则维持静态 host_header 或透传现状。
+	if len(originDomains) > 0 {
 		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{"{lb.upstream_host}"}}
-	case hostPlan.staticHost != "":
-		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{hostPlan.staticHost}}
-	case hostPlan.usePlaceholder:
-		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{"{http.reverse_proxy.upstream.hostport}"}}
+	} else if rule.HostHeader != "" {
+		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{rule.HostHeader}}
 	}
 	proxyConfig["headers"] = map[string]interface{}{"request": proxyRequestHeaders}
 	if effectiveServerTokensHidden {
@@ -4088,92 +3865,47 @@ func buildHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, respond
 			"response": map[string]interface{}{"deferred": true, "delete": []string{"Server"}},
 		})
 	}
-	// 混合态：lb_upstream_host 须先于 reverse_proxy 执行（请求期注册惰性
-	// 占位符提供者 {lb.upstream_host}/{lb.upstream_sni}，reverse_proxy 选中
-	// 上游后求值）。
-	if hostPlan.overrideMap != nil {
+	// 逐上游回源域名（2026-10-10）：内建 http.handlers.map 晚绑定查表——Source
+	// {http.reverse_proxy.upstream.hostport} 在占位符被使用时才求值（map.go:138），
+	// 恰为 reverse_proxy 选中上游后（reverseproxy.go:663-692：每次 attempt 先 Set
+	// 上游占位符再展开 headers/transport，重试换上游逐次重展开）。defaults 回退链
+	// 精确复现现状：Host=host_header 或池形态回退；SNI=host_header 剥端口或 dial
+	// 主机名（stdlib 空 server_name 默认）。originDialOrder 保持上游 SELECT 序。
+	// LBS-A-L2（第 69 轮 P2 修复）：Host 回退按池形态分流——{http.request.
+	// hostport} 绑原始请求（replacer.go:128-129），在 TLS 池恒为客户端 Host，
+	// 不等于现状的 transport 注入 hostport；TLS 池改 {http.reverse_proxy.
+	// upstream.hostport}（reverseproxy.go:664-668 先于 userOps 设置，可用）。
+	if len(originDialOrder) > 0 {
+		hostFallback := rule.HostHeader
+		if hostFallback == "" {
+			if hasHTTPSUpstream {
+				hostFallback = "{http.reverse_proxy.upstream.hostport}"
+			} else {
+				hostFallback = "{http.request.hostport}"
+			}
+		}
+		sniFallback := stripOriginPort(rule.HostHeader)
+		if sniFallback == "" {
+			sniFallback = "{http.reverse_proxy.upstream.host}"
+		}
+		mappings := make([]map[string]interface{}, 0, len(originDialOrder))
+		for _, dial := range originDialOrder {
+			origin := originDomains[dial]
+			mappings = append(mappings, map[string]interface{}{
+				"input":   dial,
+				"outputs": []string{origin, stripOriginPort(origin)},
+			})
+		}
 		handleChain = append(handleChain, map[string]interface{}{
-			"handler": "lb_upstream_host",
-			"hosts":   hostPlan.overrideMap,
+			"handler":      "map",
+			"source":       "{http.reverse_proxy.upstream.hostport}",
+			"destinations": []string{"{lb.upstream_host}", "{lb.upstream_sni}"},
+			"mappings":     mappings,
+			"defaults":     []string{hostFallback, sniFallback},
 		})
 	}
 	handleChain = append(handleChain, proxyConfig)
 	return handleChain, nil
-}
-
-// upstreamHostPlan 逐上游回源 Host 三级回退计划（2026-10-09；自定义路由链
-// 2026-10-10 同源复用：自定义路由的上游行各自携带 host_header）。
-// 三态互斥（有启用上游时恒居其一）：
-//   - usePlaceholder：全回退——Host={http.reverse_proxy.upstream.hostport}；
-//   - staticHost：全统一静态值（含仅规则级 host_header 生效的场景）；
-//   - overrideMap：混合——dial→回源 Host 映射（未收录上游由处理器未命中
-//     兜底回上游自身地址）；Host={lb.upstream_host}。
-//
-// sniTarget 为 TLS server_name 目标（静态值或 {lb.upstream_sni}；""=维持
-// rule.HostHeader 现状语义——全回退时规则级亦空，等价 Caddy 以 dial host 兜底）。
-type upstreamHostPlan struct {
-	staticHost     string
-	usePlaceholder bool
-	overrideMap    map[string]string
-	sniTarget      string
-}
-
-// resolveUpstreamHostPlan 计算启用上游集合的回源 Host 计划。DynamicDNS 规则经
-// buildHTTPHandleChain 前置校验强制单启用上游（ErrDynamicDNSUpstreamCount），
-// 且动态解析 IP 逐请求变化、dial 不可预知——单上游恒落入全回退/全统一两态，
-// 混合映射天然不出现，无需特判。
-//
-// 入参 upstreams 为「已解析 up.HostHeader」的上游集合：主链来自 upstreams 表
-// （上游表列），自定义路由链（2026-10-10）来自 path_rules.upstreams_json 的
-// 同名字段——两条链共用本函数与同一三级回退口径，避免第二套解析分叉。
-func resolveUpstreamHostPlan(rule SingleRuleConfig, upstreams []UpstreamConfig) upstreamHostPlan {
-	if len(upstreams) == 0 {
-		return upstreamHostPlan{}
-	}
-	// 逐上游有效值：上游自定义 > 规则级；两者皆空记 ""（回退自身地址）。
-	effective := make([]string, len(upstreams))
-	allSame := true
-	for i, u := range upstreams {
-		host := strings.TrimSpace(u.HostHeader)
-		if host == "" {
-			host = strings.TrimSpace(rule.HostHeader)
-		}
-		effective[i] = host
-		if i > 0 && host != effective[0] {
-			allSame = false
-		}
-	}
-	if allSame {
-		if effective[0] == "" {
-			return upstreamHostPlan{usePlaceholder: true}
-		}
-		return upstreamHostPlan{staticHost: effective[0], sniTarget: stripPortForSNI(effective[0])}
-	}
-	// 混合态：仅收录「有效值非自身回退」的上游（dial 与 Caddy 的
-	// {http.reverse_proxy.upstream.hostport} 同格式：net.JoinHostPort，见
-	// joinUpstreamAddress 与 caddy.NetworkAddress.JoinHostPort(0) 同源）。
-	overrides := make(map[string]string, len(upstreams))
-	for i, u := range upstreams {
-		if effective[i] == "" {
-			continue
-		}
-		overrides[joinUpstreamAddress(u.Host, u.Port)] = effective[i]
-	}
-	if len(overrides) == 0 {
-		// 防御：值集合不一致却无静态项（理论不可达：至少一个非空）。回退
-		// 占位符语义，绝不产出空 Host。
-		return upstreamHostPlan{usePlaceholder: true}
-	}
-	return upstreamHostPlan{overrideMap: overrides, sniTarget: "{lb.upstream_sni}"}
-}
-
-// stripPortForSNI 剥离回源 Host 的端口（SNI 不得含端口；Host 头侧保留原样）。
-// 无端口/裸 IPv6 形态原样返回（UTF-8 主机名与 IPv4 字面量由 Go 侧 SNI 规则处理）。
-func stripPortForSNI(host string) string {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		return h
-	}
-	return host
 }
 
 // lbControlRequestHeaders 面板进程内控制头清单：X-LB-GeoIP-* 是 caddygeoip→
@@ -4203,8 +3935,8 @@ const (
 // buildChainProxyConfig 组装 chain_proxy 处理器配置（strategy=chain_fallback）。
 // 上游按权重降序稳定排序（同权重保持列表顺序；weight<=0→1，满足「发射权重
 // 恒 > 0」不变量——chain 配置不发射 weights 键，但优先级语义同样依赖正权重）；
-// 逐上游回源 Host 按「上游 host_header > 规则级 host_header > 空=用 dial 地址」
-// 三级回退解析（与 resolveUpstreamHostPlan 同口径，无需占位符/混合态处理）。
+// 逐上游回源域名按「上游 origin_domain > 规则级 host_header > 空=用 dial 地址」
+// 三级回退解析（与 reverse_proxy 侧 map 方案同语义，chain 车道直接下发静态值）。
 func buildChainProxyConfig(rule SingleRuleConfig, enabledUpstreams []UpstreamConfig) map[string]interface{} {
 	sorted := make([]UpstreamConfig, len(enabledUpstreams))
 	copy(sorted, enabledUpstreams)
@@ -4224,7 +3956,7 @@ func buildChainProxyConfig(rule SingleRuleConfig, enabledUpstreams []UpstreamCon
 		if u.Protocol == "https" {
 			entry["scheme"] = "https"
 		}
-		host := strings.TrimSpace(u.HostHeader)
+		host := strings.TrimSpace(u.OriginDomain)
 		if host == "" {
 			host = strings.TrimSpace(rule.HostHeader)
 		}

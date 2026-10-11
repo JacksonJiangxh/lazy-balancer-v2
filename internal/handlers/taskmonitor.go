@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -43,6 +45,18 @@ func requireMasterNode(c *gin.Context) bool {
 func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 	id := c.Param("id")
 	if !requireMasterNode(c) {
+		return
+	}
+	// cert-job 行触发分支（2026-10-11 用户裁定）：证书队列行视为触发任务——
+	// 可自动调度（签发守护消费）即可手动调度（证书可重签发）。复用重试核心
+	//（在途 409/退役 429/冷却 429/规则禁用 409 同一门），审计「重试」归人。
+	if strings.HasPrefix(id, "cert-job:") {
+		jobID, err := strconv.Atoi(strings.TrimPrefix(id, "cert-job:"))
+		if err != nil || jobID <= 0 {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid job ID"})
+			return
+		}
+		h.retryCertJobByID(c, jobID)
 		return
 	}
 	// 终态：触发全经任务引擎（CanTrigger 语义族——单飞/主节点门/历史统一）
@@ -148,9 +162,10 @@ func (h *Handlers) CancelSystemTask(c *gin.Context) {
 }
 
 // ControlSystemTask 常驻循环启停（admin；body {"action":"start|stop|restart"}）。
-// P2-②：经 DescribeAll 的 Controllable 元数据路由——cert-waiting-ca 等
-// Continuous 族真正可控（曾硬编码三 ID map + TaskRuntime 死回退恒 400）；
-// TaskRuntime 注册表已随 M2 退役删除。
+// TASK-L11（第 69 轮）：现形态——Controllable = Kind==Daemon（引擎元数据驱动），
+// 仅常驻族（security-events-ingestion/cert-issuance/cluster-sync）可控；Periodic
+// 族（cert-waiting-ca 等）启停走 toggle 端点，本端点对其恒 400。v2.0 前
+// 「Continuous 族可控」注释已随四类型标准作废。
 func (h *Handlers) ControlSystemTask(c *gin.Context) {
 	id := c.Param("id")
 	var req struct {
@@ -205,6 +220,16 @@ func (h *Handlers) GetSystemTaskHistory(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"runs": []struct{}{}}})
+}
+
+// GetSystemTaskStats24hSeries 24h 分小时桶成功/失败序列（全员可见）——
+// 任务监控「近 24 小时执行」卡片时间序列图数据源（2026-10-11 用户裁定方案 A）。
+func (h *Handlers) GetSystemTaskStats24hSeries(c *gin.Context) {
+	if te := services.TaskEngine(); te != nil {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"series": te.Stats24hHourlySeries()}})
+		return
+	}
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"series": []taskengine.TaskHourlyStat{}}})
 }
 
 // GetSystemTaskLogs 任务文本日志（统一任务引擎管理——tasks/{id}.log；
