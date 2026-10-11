@@ -13,12 +13,14 @@ import (
 
 // 历史修复(用户 2026-09-19 裁定按建议修):
 // 历史问题 CreateRule/UpdateRule 对 chunked/未知长度超限 body 不映射 413(落 400),
-// 与 PutCaddyConfig(caddy.go:843)/导入路径(config_backup.go:1990)口径不一。
-// 历史问题 UpdateRule 显式空 upstreams 数组被 len==0 归并进「保留存量」,校验输入
-// (0 上游,updateRuleFeatures 按 nil 判空)与落库值(旧上游)分叉;改为 nil 判定后
-// 显式 []=清空(零上游为合法形态:渲染整跳过,历史 历史问题 特判)。
-// 历史问题 DuplicateRule 的 TCP 死形态归一漏清 CAProviderID,与 CreateRule(:890)
-// /UpdateRule(:1296)两入口不对称——源行遗留 tcp+ca_provider_id≠0 死形态会放大到副本。
+// 与 PutCaddyConfig/导入路径(config_backup.go)口径不一。
+// 历史问题 UpdateRule 显式空 upstreams 数组曾被 len==0 归并进「保留存量」;改为
+// nil 判定区分「省略」与「显式 []」——显式 [] 经 validateRulePayloadBeforeSave
+// 「至少需要一个上游服务器」400 拒绝（历史问题 历史纠正：零上游非合法形态，
+// 本文件早期头注释「显式 []=清空（零上游为合法形态）」与现行语义相反，已更正；
+// 引用一律用函数名，不写行号——行号漂移曾致三处误导）。
+// 历史问题 DuplicateRule 的 TCP 死形态归一漏清 CAProviderID,与 CreateRule/UpdateRule
+// 两入口不对称——源行遗留 tcp+ca_provider_id≠0 死形态会放大到副本。
 
 // 历史问题①:CreateRule 对 chunked(无 ContentLength)超限 body 期望 413。
 func TestCreateRule_chunkedOversizeBodyReturns413(t *testing.T) {
