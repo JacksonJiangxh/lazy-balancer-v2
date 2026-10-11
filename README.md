@@ -19,17 +19,16 @@
 |---|---|---|
 | 定位 | 官方发布 | 生产自用 + 定制 |
 | 版本节奏 | 官方 tag | 跟官方 tag，我们自己的改动随时发 |
-| 分支 | `master` | `main`（开发主线）、`master`（上游镜像轨，只在 GitHub） |
-| 镜像 | Docker Hub `v55448330/...` | CNB 制品库 `docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest` |
+| 分支 | `master` | `master-dev`（开发主线）、`master`（上游镜像轨） |
+| 镜像 | Docker Hub `v55448330/...` | `docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest` |
 | 反馈 | 上游 issue | 本仓库 issue |
 
 ### 分支说明
 
 | 分支 | 位置 | 作用 |
 |---|---|---|
-| `main` | CNB + GitHub | **开发主线。** 上游基线 + 我们的全部改动，日常都提交到这里 |
-| `master` | 仅 GitHub | **上游镜像轨。** 由 GitHub Actions 自动同步上游 release，逐字节等于上游某个 tag，**不含任何我们的改动，请勿在此分支开发** |
-| `master-dev` | 仅 GitHub | GitHub 侧的默认分支，与我们 `main` 内容对齐（GitHub 用户看到的门面） |
+| `master-dev` | 本仓库默认分支 | **开发主线。** 上游基线 + 我们的全部改动，日常都提交到这里 |
+| `master` | 本仓库 | **上游镜像轨。** 由 GitHub Actions 自动同步上游 release，逐字节等于上游某个 tag，**不含任何我们的改动，请勿在此分支开发** |
 
 > 为什么 `master` 要单独留一条干净的轨：这样「比上游差了什么」永远只有一个
 > 参照物，不会被我们自己的改动污染。巡检任务也是靠它来判断版本差距的。
@@ -74,12 +73,8 @@ docker buildx build --platform linux/amd64,linux/arm64 \
   -t docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest --push .
 ```
 
-CI 由 CNB 流水线承担：在 main 分支详情页点「构建并推送镜像」按钮，即触发
-amd64/arm64 双架构原生构建 → 真容器探活 → 推送到 CNB 制品库
-`docker.cnb.cool/xzydm/lazy-balancer-v2`（同时产出 `latest` 与版本号两个 manifest），
-并把 `latest` 多架构镜像额外镜像一份到
-`docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2`。配置见 `.cnb.yml` 与
-`.cnb/web_trigger.yml`。
+镜像由内部流水线构建发布（`docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2`）：双架构
+原生构建 → 真容器探活 → 打 `latest` 与版本号两个 manifest。
 
 > 官方 Docker Hub 的 `v55448330/lazy-balancer-v2` 是**上游**的镜像，
 > 不含我们的改动，请勿在本仓库的部署流程里引用它。
@@ -100,7 +95,7 @@ SNI 剥端口、仪表盘分位数插值、第 69 轮 151 项审计修复等）�
 | 引用型证书摄取入库 | `tls_source=file` 改为保存时读取 PEM 入库，DB 成为唯一信任源；外部文件变更由看门狗回写并热重载 |
 | 端口换位 | `HTTP_PORT` / `HTTPS_PORT` / `PANEL_PORT` 三个环境变量正式换位，只影响默认语义，不动存量规则 |
 | 引用证书更新放行 | 修掉更新规则时引用证书文件来源被误拦的问题 |
-| 上游版本巡检 | CNB 定时任务检查上游新 release，发现即开 Issue 提醒 |
+| 上游版本巡检 | 定时检查上游新 release，发现即开 Issue 提醒 |
 
 ## 同步上游的方式
 
@@ -108,16 +103,16 @@ SNI 剥端口、仪表盘分位数插值、第 69 轮 151 项审计修复等）�
 
 1. **GitHub Actions**（`sync-upstream-master.yml`）
    每 6 小时查一次上游 tag（只认 `v<major>.<minor>.<patch>` 形态的版本级 tag），
-   有新 tag 就把它的提交同步到 fork 的 `master`。
+   有新 tag 就把它的提交同步到本仓库的 `master`。
    需要仓库 Secret `UPSTREAM_SYNC_TOKEN`（PAT，含 repo 权限）。
 
-2. **CNB 定时任务**（`.cnb.yml` 里 `main` 分支的 `crontab`）
-   每 6 小时查一次上游最新版本，比 `.cnb.yml` 中的 `BASELINE_TAG` 新就自动开
-   Issue 通知。同一版本只开一条，不会刷屏。
+2. **版本巡检**
+   定时任务比对上游最新版本与维护基线，出现新版本即开 Issue 通知。
+   同一版本只开一条，不会刷屏。
 
 3. **人工合并**
    收到 Issue 后按[上游合并清单](docs/upstream-merge.zh-CN.md)走一遍：
-   出清单 → 你拍板 → 改代码 → 更新 `BASELINE_TAG` → 关 Issue。
+   出清单 → 拍板 → 改代码 → 更新基线 → 关 Issue。
 
 ## 文档
 
@@ -151,7 +146,8 @@ SNI 剥端口、仪表盘分位数插值、第 69 轮 151 项审计修复等）�
 | 日期 | 内容 |
 |---|---|
 | 2026-10-11 | **合入上游 v2.3.5**（`98c607ac`）：逐上游回源域名改吃上游 `origin_domain` + 原生 `map`，静态响应改吃上游 `response_mode` 三值——自研 `host_header` / `action=respond` 两套实现退役，存量数据自动双向迁移；保留链式回退、引用型证书摄取入库、端口换位三项自维护能力 |
-| 2026-10-11 | 端口换位补齐默认口漏网点；引用证书摄取入库；链式回退策略；新增 GitHub Actions 上游同步 + CNB 上游巡检；重写 README；`docker-compose` 引用改为自维护镜像 |
+| 2026-10-11 | 清理仓库内与内部开发平台相关的描述（页脚链接、CI 章节、迁移说明），公开面统一指向本仓库 |
+| 2026-10-11 | 端口换位补齐默认口漏网点；引用证书摄取入库；链式回退策略；新增 GitHub Actions 上游同步与版本巡检；重写 README；`docker-compose` 引用改为自维护镜像 |
 
 ## 技术栈
 

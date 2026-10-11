@@ -75,7 +75,7 @@ type convertedRule struct {
 	HealthInt   int
 	ActiveHC    bool
 	Enabled     bool
-	HostHeader  string
+	OriginDomain string
 	Description string
 	Upstreams   []convertedUpstream
 }
@@ -317,7 +317,7 @@ func convertV1Rules(proxies []v1Proxy, upstreams map[int]v1Upstream) ([]converte
 			rule.TLSKey = f.SSLKey
 		}
 		if f.BackendDomainToggle && f.BackendDomain != "" {
-			rule.HostHeader = f.BackendDomain
+			rule.OriginDomain = f.BackendDomain
 		}
 		for _, pk := range f.UpstreamList {
 			u, ok := upstreams[pk]
@@ -857,12 +857,12 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 			health_check_unhealthy_threshold, health_check_healthy_threshold,
 			enable_active_health_check, tcp_health_check_port, tcp_try_duration, tcp_try_interval,
 			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden,
-			host_header, enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_http_redirect,
+			origin_domain, enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_http_redirect,
 			enable_compress, compress_types, enabled, created_by, updated_by, updated_at, caddy_id, log_enabled)
 		VALUES (?, ?, ?, ?, ?, ?, 0, 0, '', '', ?, 5, ?, 2, ?, 0, 0, 250, 0, 0, 0, ?, ?, ?, 0, 0, ?, ?, ?, ?, 'gzip', ?, ?, ?, datetime('now'), ?, 0)`,
 			r.Name, r.Description, r.Protocol, r.Domain, r.ListenPort, r.Strategy,
 			r.HealthInt, r.HealthFails, r.ActiveHC,
-			r.HostHeader, r.EnableTLS, tlsSource(r), r.TLSCert, r.TLSKey, r.Redirect,
+			r.OriginDomain, r.EnableTLS, tlsSource(r), r.TLSCert, r.TLSKey, r.Redirect,
 			r.Compress, r.Enabled, userID, userID, caddyID)
 		if err != nil {
 			err = session.abort(err)

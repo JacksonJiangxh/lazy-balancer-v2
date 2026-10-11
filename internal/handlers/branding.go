@@ -426,7 +426,7 @@ func renderBlockPageShell(cfg brandingConfig, spec blockPageSpec) string {
 	} else {
 		// 默认页脚只指向本仓库（自维护分支），不指向上游——上游仓库与这里的
 		// 改动无关，把使用者引过去会让「跑的到底是哪份代码」更难判断。
-		footer += "<br>" + html.EscapeString(defaultFooterText) + ` · <a href="https://cnb.cool/xzydm/lazy-balancer-v2" target="_blank" rel="noopener noreferrer">GitHub</a>`
+		footer += "<br>" + html.EscapeString(defaultFooterText) + ` · <a href="https://github.com/xzydm/lazy-balancer-v2" target="_blank" rel="noopener noreferrer">GitHub</a>`
 	}
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="zh-CN">

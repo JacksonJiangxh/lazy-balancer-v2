@@ -24,7 +24,7 @@ x-common-healthcheck: &common-healthcheck
 services:
   # 主从两个容器共用同一镜像。
   #
-  # 镜像引用的是**我们自己维护的那份**：CNB 流水线构建后镜像到
+  # 镜像引用的是**我们自己维护的那份**：本仓库的流水线构建后发布到
   # docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2。刻意不指向上游的
   # v55448330/lazy-balancer-v2——那个 tag 随上游发版往前跑，会把我们的定制
   # 改动悄悄换成上游原版，出现「代码是我们改的、跑的是上游」的版本错乱。

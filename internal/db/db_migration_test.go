@@ -664,7 +664,7 @@ func TestMigrateLbRulesPrimaryKey_preserves_upstream_connection_settings(t *test
 		);
 		CREATE TABLE upstreams (
 			id INTEGER PRIMARY KEY, rule_id INTEGER NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
-			weight INTEGER, domain TEXT, dynamic_dns BOOLEAN, enabled BOOLEAN, protocol TEXT, host_header TEXT,
+			weight INTEGER, domain TEXT, dynamic_dns BOOLEAN, enabled BOOLEAN, protocol TEXT,
 			dns_server TEXT, max_connections INTEGER, proxy_protocol TEXT, origin_domain TEXT NOT NULL DEFAULT ''
 		);
 		INSERT INTO lb_rules (id, name, protocol, listen_port, caddy_id) VALUES (7, 'legacy', 'tcp', 443, 'lb_preserve');
@@ -689,8 +689,8 @@ func TestMigrateLbRulesPrimaryKey_preserves_upstream_connection_settings(t *test
 	}
 	// Legacy dead columns are not carried into the rebuilt table.
 	// 2026-10-11（上游合并 C1）：逐上游回源 Host 切上游 origin_domain——重建表
-	// 携带 origin_domain，自研 host_header 列随 legacy 死列一并清除（数据在
-	// 启动迁移阶段已先搬入 origin_domain，此处只断言列形态）。
+	// 携带 origin_domain，自研过渡列 host_header 已不再进重建 DDL（值与列都在
+	// 重建前的启动迁移里完成「先搬后删」，此处断言的是重建后的列形态）。
 	for _, column := range []string{"domain", "host_header", "dns_server", "proxy_protocol"} {
 		var count int
 		if err := database.QueryRow("SELECT COUNT(*) FROM pragma_table_info('upstreams') WHERE name=?", column).Scan(&count); err != nil {

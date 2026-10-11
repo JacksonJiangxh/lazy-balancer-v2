@@ -158,8 +158,8 @@ type LbRule struct {
 	ProxyStreamCloseDelay      int        `json:"proxy_stream_close_delay"`
 	PathRules                  []PathRule `json:"path_rules"`
 	Upstreams                  []Upstream `json:"upstreams"`
-	HostHeader                 string     `json:"host_header"`
-	// 健康检查域名（2026-10-10）：主动健康检查 probe 的 Host 头；空=跟随 HostHeader。
+	OriginDomain                 string     `json:"origin_domain"`
+	// 健康检查域名（2026-10-10）：主动健康检查 probe 的 Host 头；空=跟随 OriginDomain。
 	HealthCheckHost string `json:"health_check_host"`
 	EnableTLS       bool   `json:"enable_tls"`
 	TLSSource       string `json:"tls_source"`
@@ -298,7 +298,7 @@ type Upstream struct {
 	Protocol       string `json:"protocol"`
 	MaxConnections int    `json:"max_connections"`
 	// 逐上游回源域名（2026-10-10）：非空时驱动该上游回源 Host 头与 HTTPS SNI
-	// （map 处理器晚绑定查表）；空=跟随规则级 HostHeader/现状默认。
+	// （map 处理器晚绑定查表）；空=跟随规则级 OriginDomain/现状默认。
 	OriginDomain string `json:"origin_domain,omitempty"`
 }
 
@@ -481,8 +481,8 @@ type CreateRuleRequest struct {
 	ProxyFlushInterval         int        `json:"proxy_flush_interval"`
 	ProxyStreamCloseDelay      int        `json:"proxy_stream_close_delay"`
 	PathRules                  []PathRule `json:"path_rules"`
-	HostHeader                 string     `json:"host_header"`
-	// 健康检查域名：空=跟随 HostHeader（省略与空串同义，创建语义）。
+	OriginDomain                 string     `json:"origin_domain"`
+	// 健康检查域名：空=跟随 OriginDomain（省略与空串同义，创建语义）。
 	HealthCheckHost string     `json:"health_check_host"`
 	Upstreams       []Upstream `json:"upstreams" binding:"required"`
 	EnableTLS       bool       `json:"enable_tls"`
@@ -512,7 +512,7 @@ type CreateRuleRequest struct {
 
 type UpdateRuleRequest struct {
 	Name string `json:"name"`
-	// 审计 M16：HostHeader/Description/DnsServer/HealthCheckPath 指针化——
+	// 审计 M16：OriginDomain/Description/DnsServer/HealthCheckPath 指针化——
 	// 省略（nil）=保留原值，显式空串=清空；旧行为空串与省略无法区分。
 	Description         *string `json:"description"`
 	Protocol            string  `json:"protocol"`
@@ -556,8 +556,8 @@ type UpdateRuleRequest struct {
 	ProxyFlushInterval         *int        `json:"proxy_flush_interval"`
 	ProxyStreamCloseDelay      *int        `json:"proxy_stream_close_delay"`
 	PathRules                  *[]PathRule `json:"path_rules"`
-	HostHeader                 *string     `json:"host_header"`
-	// 健康检查域名：指针化同 HostHeader——省略=保留原值，显式空串=清空。
+	OriginDomain                 *string     `json:"origin_domain"`
+	// 健康检查域名：指针化同 OriginDomain——省略=保留原值，显式空串=清空。
 	HealthCheckHost *string    `json:"health_check_host"`
 	Upstreams       []Upstream `json:"upstreams"`
 	EnableTLS       *bool      `json:"enable_tls"`

@@ -51,7 +51,7 @@ func TestUpdateRule_protocolSwitchToTCPZeroesDNSFields(t *testing.T) {
 
 // LBH-A-L1（第 69 轮 P2）：http→tcp 协议切换不清上游 origin_domain——后端
 // validateRulePayloadBeforeSave 对 TCP+origin_domain 硬 400，前端 TCP 下该列
-// 不渲染（隐藏字段卡保存）。切换即弃置（与 host_header 同格归零）。
+// 不渲染（隐藏字段卡保存）。切换即弃置（与同族 HTTP 专属字段同格归零）。
 func TestUpdateRule_protocolSwitchToTCPZeroesOriginDomain(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -153,7 +153,7 @@ func TestCreateRule_tcpNormalizationPrecedesTLSValidation(t *testing.T) {
 }
 
 // LBH-A-U1（第 69 轮 P3）：TCP 规则创建不得落库 HTTP 专属死配置字段族
-// （host_header/health_check_path/enable_compress/compress_types/
+// （origin_domain/health_check_path/enable_compress/compress_types/
 // request_body_max_size_mb/upstream_keepalive_timeout/server_tokens_hidden）——
 // TCP 渲染零消费（buildTCPServer/buildTCPProxyRoute 实证），携带即归一弃置
 // （与 protocolChanged 归零同格），不随快照/导出/复制放大。
@@ -165,7 +165,7 @@ func TestCreateRule_tcpDropsHTTPOnlyFieldFamily(t *testing.T) {
 
 	// Given：TCP 创建载荷显式携带全部七个 HTTP 专属字段
 	body := `{"name":"tcp-family","protocol":"tcp","listen_port":18595,` +
-		`"host_header":"dead.example","health_check_path":"/healthz",` +
+		`"origin_domain":"dead.example","health_check_path":"/healthz",` +
 		`"enable_compress":true,"compress_types":"zstd",` +
 		`"request_body_max_size_mb":64,"upstream_keepalive_timeout":30,"server_tokens_hidden":1,` +
 		`"upstreams":[{"host":"10.0.0.1","port":9000,"enabled":true}]}`
@@ -193,7 +193,7 @@ func TestUpdateRule_tcpEditHealsHTTPOnlyFieldFamily(t *testing.T) {
 
 	// Given：存量 TCP 行携带死配置（修复前 API 直构/导入落库的形态）
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,
-		host_header,health_check_path,enable_compress,compress_types,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden)
+		origin_domain,health_check_path,enable_compress,compress_types,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden)
 		VALUES ('lb_tcpfam','tcpfam','','tcp','',18596,'weighted_round_robin',1,
 		'legacy.example','/h',1,'gzip',32,15,2)`); err != nil {
 		t.Fatalf("seed rule: %v", err)
@@ -225,7 +225,7 @@ func TestDuplicateRule_tcpCopyDropsHTTPOnlyFieldFamily(t *testing.T) {
 
 	// Given
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,
-		host_header,health_check_path,enable_compress,compress_types,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden)
+		origin_domain,health_check_path,enable_compress,compress_types,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden)
 		VALUES ('lb_tcpdup','tcpdup','','tcp','',18597,'weighted_round_robin',1,
 		'legacy.example','/h',1,'gzip',32,15,2)`); err != nil {
 		t.Fatalf("seed rule: %v", err)
@@ -249,18 +249,18 @@ func TestDuplicateRule_tcpCopyDropsHTTPOnlyFieldFamily(t *testing.T) {
 // assertTCPRuleFamilyZeroed 断言 lb_rules 中匹配 where 的行七字段全部为零值形态。
 func assertTCPRuleFamilyZeroed(t *testing.T, label, where string) {
 	t.Helper()
-	var hostHeader, healthCheckPath, compressTypes string
+	var originDomain, healthCheckPath, compressTypes string
 	var enableCompress, bodyMax, keepalive, tokensHidden int
-	if err := db.DB.QueryRow(`SELECT COALESCE(host_header,''), COALESCE(health_check_path,''),
+	if err := db.DB.QueryRow(`SELECT COALESCE(origin_domain,''), COALESCE(health_check_path,''),
 		IIF(enable_compress IN ('1',1),1,0), COALESCE(compress_types,''),
 		COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0)
 		FROM lb_rules WHERE `+where).
-		Scan(&hostHeader, &healthCheckPath, &enableCompress, &compressTypes, &bodyMax, &keepalive, &tokensHidden); err != nil {
+		Scan(&originDomain, &healthCheckPath, &enableCompress, &compressTypes, &bodyMax, &keepalive, &tokensHidden); err != nil {
 		t.Fatalf("%s readback: %v", label, err)
 	}
-	if hostHeader != "" || healthCheckPath != "" || enableCompress != 0 || compressTypes != "" ||
+	if originDomain != "" || healthCheckPath != "" || enableCompress != 0 || compressTypes != "" ||
 		bodyMax != 0 || keepalive != 0 || tokensHidden != 0 {
-		t.Fatalf("%s HTTP 专属死配置未归一: host_header=%q health_check_path=%q enable_compress=%d compress_types=%q body_max=%d keepalive=%d tokens_hidden=%d",
-			label, hostHeader, healthCheckPath, enableCompress, compressTypes, bodyMax, keepalive, tokensHidden)
+		t.Fatalf("%s HTTP 专属死配置未归一: origin_domain=%q health_check_path=%q enable_compress=%d compress_types=%q body_max=%d keepalive=%d tokens_hidden=%d",
+			label, originDomain, healthCheckPath, enableCompress, compressTypes, bodyMax, keepalive, tokensHidden)
 	}
 }

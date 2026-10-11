@@ -439,7 +439,7 @@ func TestDuplicateRule_accepts_API_key_user_ID_and_copies_rule_upstreams_and_pat
 		enable_active_health_check,tcp_health_check_port,tcp_proxy_protocol,tcp_try_duration,tcp_try_interval,
 		request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden,
 		enable_tls,tls_source,acme_config_id,ca_provider_id,tls_cert,tls_key,tls_http_redirect,
-		enable_compress,compress_types,enabled,created_by,updated_by,host_header,log_enabled,
+		enable_compress,compress_types,enabled,created_by,updated_by,origin_domain,log_enabled,
 		custom_routes_enabled,
 		proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay)
 		VALUES ('lb_dupsrc','源规则','','http','dup.example.test',8080,'weighted_round_robin',0,0,'','ipv4',
@@ -867,7 +867,7 @@ func simulateLegacyNullableLbRules(t *testing.T, database *sql.DB) {
 		proxy_stream_timeout INTEGER NOT NULL DEFAULT 0,
 		proxy_flush_interval INTEGER NOT NULL DEFAULT 0,
 		proxy_stream_close_delay INTEGER NOT NULL DEFAULT 0,
-		host_header VARCHAR(255),
+		origin_domain TEXT NOT NULL DEFAULT '',
 		health_check_host TEXT NOT NULL DEFAULT '',
 		enable_tls BOOLEAN DEFAULT FALSE,
 		tls_cert TEXT,
@@ -965,14 +965,14 @@ func TestToPathRuleConfigs_carriesResponseFields(t *testing.T) {
 }
 
 // LBH-A-P1 同族：预检 SingleRuleConfig 回填 origin_domain（逐上游回源域名，
-// 真实渲染经 map 处理器消费）与 host_header/health_check_host/enable_compress
+// 真实渲染经 map 处理器消费）与 origin_domain/health_check_host/enable_compress
 // 族；TLS 材料/开关为有意保留的空口子集（GenerateSingleRuleCaddyConfig 单规则
 // 形态约定，钉零防误回填）。
 func TestPrecheckRuleConfig_carriesNewFeatureColumns(t *testing.T) {
 	// Given
 	rule := models.LbRule{
 		CaddyID: "lb_precheck", Protocol: "http", Domain: "precheck.test", ListenPort: 8080,
-		Strategy: "weighted_round_robin", HostHeader: "backend.example", HealthCheckHost: "probe.example",
+		Strategy: "weighted_round_robin", OriginDomain: "backend.example", HealthCheckHost: "probe.example",
 		EnableCompress: true, CompressTypes: "zstd",
 		Upstreams: []models.Upstream{
 			{Host: "10.0.0.1", Port: 8443, Weight: 1, Enabled: true, Protocol: "https", OriginDomain: "origin.example"},
@@ -989,8 +989,8 @@ func TestPrecheckRuleConfig_carriesNewFeatureColumns(t *testing.T) {
 	if len(config.Upstreams) != 1 || config.Upstreams[0].OriginDomain != "origin.example" {
 		t.Fatalf("upstreams 丢 origin_domain: %+v", config.Upstreams)
 	}
-	if config.HostHeader != "backend.example" || config.HealthCheckHost != "probe.example" {
-		t.Fatalf("丢 host_header/health_check_host: %q/%q", config.HostHeader, config.HealthCheckHost)
+	if config.OriginDomain != "backend.example" || config.HealthCheckHost != "probe.example" {
+		t.Fatalf("丢 origin_domain/health_check_host: %q/%q", config.OriginDomain, config.HealthCheckHost)
 	}
 	if !config.EnableCompress || config.CompressTypes != "zstd" {
 		t.Fatalf("丢压缩配置: %v/%q", config.EnableCompress, config.CompressTypes)

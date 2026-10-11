@@ -1280,7 +1280,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		ProxyFlushInterval         int
 		ProxyStreamCloseDelay      int
 		PathRules                  []PathRuleConfig
-		HostHeader                 string
+		OriginDomain               string
 		HealthCheckHost            string
 		LogEnabled                 bool
 		BlockPageStage1ID          int
@@ -1317,7 +1317,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		       IIF(tls_http_redirect IN ('1',1),1,0),
 		       IIF(enabled IN ('1',1),1,0), IIF(enable_compress IN ('1',1),1,0), COALESCE(compress_types,'gzip'),
 		       IIF(enable_active_health_check IN ('1',1),1,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
-	       COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(host_header,''), COALESCE(health_check_host,''),
+	       COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(health_check_host,''),
 	       COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 		       IIF(log_enabled IN ('1',1),1,0), IIF(custom_routes_enabled IN ('1',1),1,0),
 		       COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
@@ -1339,7 +1339,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			&r.TLSCertPath, &r.TLSKeyPath,
 			&r.TLSHTTPRedirect, &r.Enabled, &r.EnableCompress, &r.CompressTypes,
 			&r.EnableActiveHealthCheck, &r.TCPHealthCheckPort, &r.TCPProxyProtocol, &r.TCPTryDuration, &r.TCPTryInterval,
-			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden, &r.HostHeader, &r.HealthCheckHost,
+			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden, &r.HealthCheckHost,
 			&r.ChainRaceIntervalMS, &r.ChainRequestTimeoutMS, &r.LogEnabled,
 			&r.CustomRoutesEnabled, &r.ProxyDialTimeout, &r.ProxyResponseHeaderTimeout,
 			&r.ProxyReadTimeout, &r.ProxyWriteTimeout, &r.ProxyStreamTimeout, &r.ProxyFlushInterval, &r.ProxyStreamCloseDelay,
@@ -1710,7 +1710,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 				EnableCompress:                   r.EnableCompress,
 				CompressTypes:                    r.CompressTypes,
 				EnableActiveHealthCheck:          r.EnableActiveHealthCheck,
-				HostHeader:                       r.HostHeader,
+				OriginDomain:                     r.OriginDomain,
 				HealthCheckHost:                  r.HealthCheckHost,
 				RequestBodyMaxSizeMB:             r.RequestBodyMaxSizeMB,
 				UpstreamKeepaliveTimeout:         r.UpstreamKeepaliveTimeout,
@@ -2463,9 +2463,11 @@ type SingleRuleConfig struct {
 	GlobalRequestBodyMaxSizeMB     int
 	GlobalUpstreamKeepaliveTimeout int
 	GlobalServerTokensHidden       bool
-	HostHeader                     string
+	// 回源域名（上游 lb_rules.origin_domain）：非空时覆盖回源 Host 头与 HTTPS SNI
+	// 回退链；空=跟随上游服务器自身 origin_domain / 透传现状。
+	OriginDomain string
 	// 健康检查域名：主动健康检查 probe 的 Host 头（health_checks.active.headers.Host
-	// 特判实证，healthchecks.go:453-458）；空=跟随 HostHeader。
+	// 特判实证，healthchecks.go:453-458）；空=跟随 OriginDomain。
 	HealthCheckHost                  string
 	CustomRoutesEnabled              bool
 	PathRules                        []PathRuleConfig
@@ -3778,7 +3780,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			// healthchecks.go:453-458）；皆空则不输出 headers 键（现状不变）。
 			probeHost := rule.HealthCheckHost
 			if probeHost == "" {
-				probeHost = rule.HostHeader
+				probeHost = rule.OriginDomain
 			}
 			if probeHost != "" {
 				active["headers"] = map[string]interface{}{"Host": []string{probeHost}}
@@ -3808,7 +3810,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			// 项目恒 insecure_skip_verify，TLS 层不断（严格 SNI 多租户上游为边角）。
 			// 静态路径同样剥端口（2026-10-10 用户裁定）：SNI 无端口语义（RFC 6066），
 			// host_header 带端口时原样透传是畸形值；Host 头侧（:3760+）保留端口原样。
-			serverName := stripOriginPort(rule.HostHeader)
+			serverName := stripOriginPort(rule.OriginDomain)
 			if len(originDomains) > 0 {
 				serverName = "{lb.upstream_sni}"
 			}
@@ -3847,12 +3849,12 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	proxyRequestHeaders := map[string]interface{}{
 		"delete": lbControlRequestHeaders,
 	}
-	// 回源域名在场时 Host 头改走 map 占位符（defaults 已烘焙 host_header/透传
-	// 回退链）；否则维持静态 host_header 或透传现状。
+	// 回源域名在场时 Host 头改走 map 占位符（defaults 已烘焙 origin_domain/透传
+	// 回退链）；否则维持静态 origin_domain 或透传现状。
 	if len(originDomains) > 0 {
 		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{"{lb.upstream_host}"}}
-	} else if rule.HostHeader != "" {
-		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{rule.HostHeader}}
+	} else if rule.OriginDomain != "" {
+		proxyRequestHeaders["set"] = map[string]interface{}{"Host": []string{rule.OriginDomain}}
 	}
 	proxyConfig["headers"] = map[string]interface{}{"request": proxyRequestHeaders}
 	if effectiveServerTokensHidden {
@@ -3876,7 +3878,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 不等于现状的 transport 注入 hostport；TLS 池改 {http.reverse_proxy.
 	// upstream.hostport}（reverseproxy.go:664-668 先于 userOps 设置，可用）。
 	if len(originDialOrder) > 0 {
-		hostFallback := rule.HostHeader
+		hostFallback := rule.OriginDomain
 		if hostFallback == "" {
 			if hasHTTPSUpstream {
 				hostFallback = "{http.reverse_proxy.upstream.hostport}"
@@ -3884,7 +3886,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 				hostFallback = "{http.request.hostport}"
 			}
 		}
-		sniFallback := stripOriginPort(rule.HostHeader)
+		sniFallback := stripOriginPort(rule.OriginDomain)
 		if sniFallback == "" {
 			sniFallback = "{http.reverse_proxy.upstream.host}"
 		}
@@ -3958,7 +3960,7 @@ func buildChainProxyConfig(rule SingleRuleConfig, enabledUpstreams []UpstreamCon
 		}
 		host := strings.TrimSpace(u.OriginDomain)
 		if host == "" {
-			host = strings.TrimSpace(rule.HostHeader)
+			host = strings.TrimSpace(rule.OriginDomain)
 		}
 		if host != "" {
 			entry["host"] = host

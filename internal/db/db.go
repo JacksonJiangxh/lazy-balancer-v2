@@ -269,9 +269,10 @@ func createTables() error {
 		proxy_stream_timeout INTEGER NOT NULL DEFAULT 0,
 		proxy_flush_interval INTEGER NOT NULL DEFAULT 0,
 		proxy_stream_close_delay INTEGER NOT NULL DEFAULT 0,
-	host_header VARCHAR(255),
-	-- 逐上游回源域名特性（2026-10-10）：健康检查域名（probe Host 头），空=跟随 host_header。
-	health_check_host TEXT NOT NULL DEFAULT '',
+		-- 回源域名（2026-10-10）：该规则的回源 Host 头默认值；上游服务器可各自覆盖。
+		origin_domain TEXT NOT NULL DEFAULT '',
+		-- 健康检查域名（2026-10-10）：主动健康检查 probe 的 Host 头；空=跟随 origin_domain。
+		health_check_host TEXT NOT NULL DEFAULT '',
 		enable_tls BOOLEAN DEFAULT FALSE,
 		tls_cert TEXT,
 		tls_key TEXT,
@@ -703,6 +704,12 @@ func createTables() error {
 			return fmt.Errorf("failed to refresh threat source display_name %s: %w", seed[0], err)
 		}
 	}
+
+	// 先搬后删的第二拍：存量 host_header 值此时已进 origin_domain（上方一次性
+	// 搬迁），过渡列到此完成使命——删除以免 fresh 库形态与存量库继续分叉。
+	if err := dropLegacyUpstreamHostHeader(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -821,10 +828,9 @@ func runMigrations() error {
 		"upstreams.max_connections":                       "INTEGER DEFAULT 0",
 		// 逐上游回源域名 + 健康检查域名（2026-10-10）：空串=不配置，
 		// 回退规则级 host_header / 现状默认。
-		"upstreams.origin_domain": "TEXT NOT NULL DEFAULT ''",
-		// 过渡保留（本次合并起）：存量库的 host_header 将在下方一次性搬迁进
-		// origin_domain，随后从 legacyUpstreamDeadColumns 之外的独立步骤删除。
-		"upstreams.host_header":      "TEXT NOT NULL DEFAULT ''",
+		// 注：自研过渡列 upstreams.host_header 刻意不登记——登记会与下方
+		// 一次性搬迁后的 DROP 步骤互斥（先补列再删列），且 fresh 库不该有它。
+		"upstreams.origin_domain":    "TEXT NOT NULL DEFAULT ''",
 		"lb_rules.health_check_host": "TEXT NOT NULL DEFAULT ''",
 		// 引用型证书（tls_source="file"）摄取源路径列（本次上游合并保留）：
 		// 上游 newColumns 未登记，此处补入——重建 DDL 与运行期读取均依赖其存在。
@@ -1276,6 +1282,10 @@ func runMigrations() error {
 	// CORE-R1（第 69 轮）：host_header/domain/proxy_protocol+dns_server 三个
 	// 逐字相同的独立循环合并为单一登记清单。
 	legacyUpstreamDeadColumns := []string{"domain", "proxy_protocol", "dns_server"}
+	// 自研过渡列（本次上游合并 C1）：逐上游回源 Host 已切上游 upstreams.origin_domain，
+	// host_header 仅剩「存量值待搬运」一个用途——先搬后删（搬迁函数紧随其后），
+	// 否则 fresh 库会因 createTables 不再建列而落进 ensureNewColumns 又复生。
+	legacyUpstreamDeadColumns = append(legacyUpstreamDeadColumns, "host_header")
 	for _, col := range legacyUpstreamDeadColumns {
 		if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('upstreams') WHERE name=?", col).Scan(&colCount); err != nil {
 			return fmt.Errorf("failed to check legacy upstreams.%s: %w", col, err)
@@ -2158,7 +2168,8 @@ func migratePathRuleActionToResponseMode() error {
 // migrateUpstreamHostHeaderToOriginDomain 把自研逐上游回源 Host（host_header）
 // 搬迁到上游口径的 origin_domain（本次上游合并 C1 决策：切上游 origin_domain +
 // 原生 map）。幂等：origin_domain 已有值时不动（显式配置优先于遗留列）。
-// 两列任一不存在（fresh 库 / 极端残库）时静默返回。
+// 两列任一不存在（fresh 库 / 极端残库 / 上一次启动已删列）时静默返回——
+// 搬迁与删列都幂等，任意顺序重入都收敛到同一形态。
 func migrateUpstreamHostHeaderToOriginDomain() error {
 	var hasHostHeader, hasOriginDomain int
 	if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('upstreams') WHERE name='host_header'").Scan(&hasHostHeader); err != nil {
@@ -2383,6 +2394,25 @@ func migrateSecurityPoliciesNullable() error {
 	}
 	committed = true
 	log.Printf("Rebuilt security_policies with nullable geoip/waf columns (converged %d NOT NULL columns)", notNullCount)
+	return nil
+}
+
+// dropLegacyUpstreamHostHeader 在存量值已搬入 origin_domain 之后删除自研过渡列
+// upstreams.host_header（本次上游合并 C1；先搬后删的第二拍）。启动序里死列清理
+// 早于搬迁，故删列推到这里：否则 fresh/存量库都会在「清理不足 + newColumns 补列」
+// 之间把过渡列复活。幂等：列已不存在即返回；重建 DDL 亦已不再携带该列。
+func dropLegacyUpstreamHostHeader() error {
+	var count int
+	if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('upstreams') WHERE name='host_header'").Scan(&count); err != nil {
+		return fmt.Errorf("failed to check legacy upstreams.host_header: %w", err)
+	}
+	if count == 0 {
+		return nil
+	}
+	if _, err := DB.Exec("ALTER TABLE upstreams DROP COLUMN host_header"); err != nil {
+		return fmt.Errorf("failed to drop legacy upstreams.host_header: %w", err)
+	}
+	log.Printf("Dropped legacy column host_header from upstreams (values migrated to origin_domain)")
 	return nil
 }
 
@@ -2636,7 +2666,6 @@ func migrateLbRulesPrimaryKey() error {
 			proxy_stream_timeout INTEGER NOT NULL DEFAULT 0,
 			proxy_flush_interval INTEGER NOT NULL DEFAULT 0,
 			proxy_stream_close_delay INTEGER NOT NULL DEFAULT 0,
-			host_header VARCHAR(255),
 			-- 与 fresh CREATE 同步携带（ensureNewColumns 在本重建之前已加列，
 			-- 陈旧 DDL 会把列连同值一并丢弃——U6B-3 先例）。
 			health_check_host TEXT NOT NULL DEFAULT '',
@@ -2686,7 +2715,7 @@ func migrateLbRulesPrimaryKey() error {
 			chain_race_interval_ms, chain_request_timeout_ms,
 			custom_routes_enabled,
 			proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
-			host_header, health_check_host, enable_tls, tls_cert,
+			health_check_host, enable_tls, tls_cert,
 			tls_key, tls_cert_path, tls_key_path, tls_http_redirect, tls_source, acme_config_id,
 			ca_provider_id, enable_compress, compress_types, enabled, log_enabled,
 			created_by, created_at, updated_at, updated_by, caddy_id,
@@ -2702,7 +2731,7 @@ func migrateLbRulesPrimaryKey() error {
 			COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 			COALESCE(custom_routes_enabled,0),
 			COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
-			host_header, COALESCE(health_check_host,''), enable_tls, tls_cert,
+			COALESCE(health_check_host,''), enable_tls, tls_cert,
 			tls_key, COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''), tls_http_redirect, tls_source, acme_config_id,
 			ca_provider_id, enable_compress, compress_types, COALESCE(enabled,0), COALESCE(log_enabled,0),
 			created_by, created_at, updated_at, updated_by, caddy_id,
@@ -3119,17 +3148,18 @@ func normalizeRuleTimestampsMigration() error {
 }
 
 // migrateTCPRuleDeadFields（2026-10-11 用户裁定「如果没有就都应该没有」）：
-// 主端存量 TCP 行的 HTTP 专属七字段死值清零——与 normalizeRuleForTransport
+// 主端存量 TCP 行的 HTTP 专属字段死值清零（含上游 health_check_host 健康检查
+// 域名——TCP 规则无 Host 语义）——与 normalizeRuleForTransport
 // 传输归一同一清单。此前仅导出侧归一（CL10-P2-3「主端存储值不变」），用户
 // 裁定改为存储也归零：主端 DB、导出 canonical、从端落库三面同值，快照缓存
 // 的 canonical 变化由本迁移写侧触发 cluster_version bump 随下轮同步收敛。
 func migrateTCPRuleDeadFields() error {
 	res, err := DB.Exec(`UPDATE lb_rules SET
-		host_header='', health_check_path='', enable_compress=0, compress_types='',
+		health_check_host='', health_check_path='', enable_compress=0, compress_types='',
 		request_body_max_size_mb=0, upstream_keepalive_timeout=0, server_tokens_hidden=0,
 		enable_tls=0, tls_cert='', tls_key=''
 		WHERE protocol='tcp' AND (
-			COALESCE(host_header,'')<>'' OR COALESCE(health_check_path,'')<>''
+			COALESCE(health_check_host,'')<>'' OR COALESCE(health_check_path,'')<>''
 			OR enable_compress=1 OR COALESCE(compress_types,'')<>''
 			OR request_body_max_size_mb<>0 OR upstream_keepalive_timeout<>0 OR server_tokens_hidden<>0
 			OR (enable_tls=1 AND (COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>''))

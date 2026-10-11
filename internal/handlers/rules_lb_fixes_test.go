@@ -82,7 +82,7 @@ func seedTCPRuleForZeroMerge(t *testing.T, caddyID string, listenPort int) {
 		enable_active_health_check,tcp_health_check_port,tcp_proxy_protocol,tcp_try_duration,tcp_try_interval,
 		request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden,
 		enable_tls,tls_source,acme_config_id,ca_provider_id,tls_cert,tls_key,tls_http_redirect,
-		enable_compress,compress_types,enabled,created_by,host_header,log_enabled,
+		enable_compress,compress_types,enabled,created_by,origin_domain,log_enabled,
 		custom_routes_enabled,
 		proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay)
 		VALUES (?,'tcp-zero','','tcp','',?,'weighted_round_robin',

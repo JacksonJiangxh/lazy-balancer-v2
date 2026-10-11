@@ -545,7 +545,7 @@ func TestPolicyHasGeoIP_modeGate(t *testing.T) {
 // TestBuildHTTPHandleChain_stripsGeoIPHeadersBeforeUpstream：X-LB-GeoIP-* 是
 // caddygeoip→coraza 的进程内控制头，绝不允许透传上游后端。reverse_proxy 必须在
 // headers.request.delete 中剥离全部 6 个头；无条件剥离（不依赖安全策略绑定），
-// 同时拦截 geoip 关闭时客户端伪造同名头直达后端。与 HostHeader set 并存。
+// 同时拦截 geoip 关闭时客户端伪造同名头直达后端。与 OriginDomain set 并存。
 func TestBuildHTTPHandleChain_stripsGeoIPHeadersBeforeUpstream(t *testing.T) {
 	wantStrip := []string{
 		"X-LB-GeoIP-Country", "X-LB-GeoIP-Country-Code", "X-LB-GeoIP-Region",
@@ -561,7 +561,7 @@ func TestBuildHTTPHandleChain_stripsGeoIPHeadersBeforeUpstream(t *testing.T) {
 		{name: "with host header override", hostHeader: "api.example.com"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rule := SingleRuleConfig{CaddyID: "lb_strip", Protocol: "http", ListenPort: 80, HostHeader: tc.hostHeader}
+			rule := SingleRuleConfig{CaddyID: "lb_strip", Protocol: "http", ListenPort: 80, OriginDomain: tc.hostHeader}
 			chain, err := buildHTTPHandleChain(rule, upstreams)
 			if err != nil {
 				t.Fatalf("buildHTTPHandleChain: %v", err)

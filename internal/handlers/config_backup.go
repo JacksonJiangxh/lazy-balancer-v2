@@ -271,7 +271,10 @@ var backupTableNullDefaults = map[string]map[string]any{
 		"chain_race_interval_ms": int64(0), "chain_request_timeout_ms": int64(0),
 		"proxy_dial_timeout": int64(0), "proxy_response_header_timeout": int64(0), "proxy_read_timeout": int64(0),
 		"proxy_write_timeout": int64(0), "proxy_stream_timeout": int64(0), "proxy_flush_interval": int64(0),
-		"proxy_stream_close_delay": int64(0), "host_header": "",
+		"proxy_stream_close_delay": int64(0),
+		// 回源域名 / 健康检查域名（2026-10-10）：NOT NULL 默认空串列，NULL 行归一空串
+		// （空=不配置，回退上游服务器自身 origin_domain）。
+		"origin_domain": "", "health_check_host": "",
 		"enable_tls": int64(0), "tls_source": "manual", "acme_config_id": int64(0), "ca_provider_id": int64(0),
 		"tls_cert": "", "tls_key": "", "tls_http_redirect": int64(0),
 		// 引用型证书（2026-10-09）：NOT NULL 默认空串列，NULL 行归一空串。
@@ -284,7 +287,7 @@ var backupTableNullDefaults = map[string]map[string]any{
 	},
 	"upstreams": {
 		"weight": int64(1), "dynamic_dns": int64(0), "enabled": int64(0),
-		"protocol": "http", "max_connections": int64(0), "host_header": "",
+		"protocol": "http", "max_connections": int64(0), "origin_domain": "",
 	},
 	"users": {
 		"display_name": "", "is_enabled": int64(1), "password_version": int64(0),
@@ -2578,10 +2581,10 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// 与 RFC3339/Go time 格式时间戳；不归一则导入后主端 DB 重新回到三态并存）。
 	if _, hasRules := backup.Tables["lb_rules"]; hasRules {
 		if _, err := tx.ExecContext(ctx, `UPDATE lb_rules SET
-			host_header='', health_check_path='', enable_compress=0, compress_types='',
+			health_check_host='', health_check_path='', enable_compress=0, compress_types='',
 			request_body_max_size_mb=0, upstream_keepalive_timeout=0, server_tokens_hidden=0
 			WHERE protocol='tcp' AND (
-				COALESCE(host_header,'')<>'' OR COALESCE(health_check_path,'')<>''
+				COALESCE(health_check_host,'')<>'' OR COALESCE(health_check_path,'')<>''
 				OR enable_compress=1 OR COALESCE(compress_types,'')<>''
 				OR request_body_max_size_mb<>0 OR upstream_keepalive_timeout<>0 OR server_tokens_hidden<>0)`); err != nil {
 			err = session.abort(err)

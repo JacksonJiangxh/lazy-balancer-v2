@@ -875,7 +875,7 @@ const lbRuleListColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE
 	COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 	COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), '', '', COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''),
 	COALESCE(tls_http_redirect,0), COALESCE(enable_compress,1), COALESCE(compress_types,'gzip'), IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0),
-	created_by, created_at, updated_at, updated_by, COALESCE(host_header,''), COALESCE(health_check_host,''),
+	created_by, created_at, updated_at, updated_by, COALESCE(health_check_host,''),
 	COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)`
 
 const lbRuleColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE(description,''), protocol, COALESCE(domain,''), listen_port, COALESCE(strategy,''),
@@ -888,7 +888,7 @@ const lbRuleColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE(des
 	COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 	COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), COALESCE(tls_cert,''), COALESCE(tls_key,''), COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''),
 	COALESCE(tls_http_redirect,0), COALESCE(enable_compress,1), COALESCE(compress_types,'gzip'), IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0),
-	created_by, created_at, updated_at, updated_by, COALESCE(host_header,''), COALESCE(health_check_host,''),
+	created_by, created_at, updated_at, updated_by, COALESCE(health_check_host,''),
 	COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)`
 
 // 规范化规则行扫描：ListRules/GetRule/DuplicateRule 共用，避免列清单多处漂移
@@ -896,7 +896,7 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 	rules := make([]models.LbRule, 0)
 	for rows.Next() {
 		var r models.LbRule
-		var description, domain, strategy, dnsFamily, tlsSource, tlsCert, tlsKey, tlsCertPath, tlsKeyPath, compressTypes, hostHeader, healthCheckHost string
+		var description, domain, strategy, dnsFamily, tlsSource, tlsCert, tlsKey, tlsCertPath, tlsKeyPath, compressTypes, originDomain, healthCheckHost string
 		var dynamicDNS, enableDnsServer, enableActiveHealthCheck, enableTLS, tlsHTTPRedirect, enableCompress bool
 		var acmeConfigID, caProviderID int
 		var createdBy, updatedBy sql.NullInt64
@@ -911,7 +911,7 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 			&r.ProxyDialTimeout, &r.ProxyResponseHeaderTimeout, &r.ProxyReadTimeout, &r.ProxyWriteTimeout, &r.ProxyStreamTimeout, &r.ProxyFlushInterval, &r.ProxyStreamCloseDelay,
 			&enableTLS, &tlsSource, &acmeConfigID, &caProviderID, &tlsCert, &tlsKey, &tlsCertPath, &tlsKeyPath, &tlsHTTPRedirect,
 			&enableCompress, &compressTypes, &r.Enabled, &r.LogEnabled,
-			&createdBy, &createdAt, &updatedAt, &updatedBy, &hostHeader, &healthCheckHost,
+			&createdBy, &createdAt, &updatedAt, &updatedBy, &healthCheckHost,
 			&r.BlockPageStage1ID, &r.BlockPageStage1Status, &r.BlockPageStage3ID, &r.BlockPageStage3Status); err != nil {
 			return nil, err
 		}
@@ -936,7 +936,7 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 		r.TLSHTTPRedirect = tlsHTTPRedirect
 		r.EnableCompress = enableCompress
 		r.CompressTypes = compressTypes
-		r.HostHeader = hostHeader
+		r.OriginDomain = originDomain
 		r.HealthCheckHost = healthCheckHost
 		if createdBy.Valid {
 			r.CreatedBy = int(createdBy.Int64)
@@ -1277,7 +1277,7 @@ func loadRulesForConfigValidation(ctx context.Context, suffix string, args ...an
 
 // precheckRuleConfig 构造预校验渲染输入（EnableRule/启动聚合校验共用）。
 // LBH-A-P1（第 69 轮）回填本日新特性列：upstreams 携带 OriginDomain、
-// path_rules 携带 response_* 五列、规则级携带 HostHeader/HealthCheckHost/
+// path_rules 携带 response_* 五列、规则级携带 OriginDomain/HealthCheckHost/
 // EnableCompress/CompressTypes——此前预检渲染把直返/301 路径规则当转发链
 // 渲染、不发射回源域名 map 处理器，与真实渲染分叉（错误拦截时机后移）。
 // 有意保留的空口子集（勿回填）：TLS 开关与证书材料（GenerateSingleRuleCaddyConfig
@@ -1297,7 +1297,7 @@ func precheckRuleConfig(rule models.LbRule) services.SingleRuleConfig {
 		CaddyID: rule.CaddyID, Protocol: rule.Protocol, Domain: rule.Domain, ListenPort: rule.ListenPort,
 		Strategy: rule.Strategy, DynamicDNS: rule.DynamicDNS, EnableDnsServer: rule.EnableDnsServer,
 		DnsServer: rule.DnsServer, DnsFamily: rule.DnsFamily, CustomRoutesEnabled: rule.CustomRoutesEnabled,
-		HostHeader: rule.HostHeader, HealthCheckHost: rule.HealthCheckHost,
+		OriginDomain: rule.OriginDomain, HealthCheckHost: rule.HealthCheckHost,
 		EnableCompress: rule.EnableCompress, CompressTypes: rule.CompressTypes,
 		BlockPageStage1ID: rule.BlockPageStage1ID, BlockPageStage1Status: rule.BlockPageStage1Status,
 		BlockPageStage3ID: rule.BlockPageStage3ID, BlockPageStage3Status: rule.BlockPageStage3Status,

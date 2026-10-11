@@ -773,7 +773,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		req.TLSSource = "manual"
 		req.TLSCert, req.TLSKey = "", ""
 		req.ACMEConfigID = 0
-		req.HostHeader = ""
+		req.OriginDomain = ""
 		req.HealthCheckPath = ""
 		req.EnableCompress = false
 		req.CompressTypes = ""
@@ -999,10 +999,10 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		chain_race_interval_ms, chain_request_timeout_ms,
 		custom_routes_enabled,
 		proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
-		host_header, health_check_host, enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_cert_path, tls_key_path, tls_http_redirect,
+		health_check_host, enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_cert_path, tls_key_path, tls_http_redirect,
 		enable_compress, compress_types, enabled, created_by, updated_at, caddy_id, log_enabled,
 		block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, req.Name, req.Description, req.Protocol, req.Domain, req.ListenPort, req.Strategy, req.DynamicDNS, req.EnableDnsServer, req.DnsServer, req.DnsFamily,
 		req.HealthCheckPath, req.HealthCheckInterval, req.HealthCheckTimeout,
 		req.HealthCheckUnhealthyThreshold, req.HealthCheckHealthyThreshold,
@@ -1011,7 +1011,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		features.ChainRaceIntervalMS, features.ChainRequestTimeoutMS,
 		features.CustomRoutesEnabled,
 		features.ProxyDialTimeout, features.ProxyResponseHeaderTimeout, features.ProxyReadTimeout, features.ProxyWriteTimeout, features.ProxyStreamTimeout, features.ProxyFlushInterval, features.ProxyStreamCloseDelay,
-		req.HostHeader, req.HealthCheckHost, req.EnableTLS, req.TLSSource, req.ACMEConfigID, req.CAProviderID, req.TLSCert, req.TLSKey, req.TLSCertPath, req.TLSKeyPath,
+		req.HealthCheckHost, req.EnableTLS, req.TLSSource, req.ACMEConfigID, req.CAProviderID, req.TLSCert, req.TLSKey, req.TLSCertPath, req.TLSKeyPath,
 		req.TLSHTTPRedirect, req.EnableCompress, req.CompressTypes, enabledVal, userIDInt, time.Now().UTC().Format("2006-01-02 15:04:05"), caddyID, req.LogEnabled,
 		req.BlockPageStage1ID, req.BlockPageStage1Status, req.BlockPageStage3ID, req.BlockPageStage3Status)
 
@@ -1195,7 +1195,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 		COALESCE(custom_routes_enabled,0),
 		COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
-		COALESCE(host_header,''), COALESCE(health_check_host,''), COALESCE(enable_compress,1), COALESCE(compress_types,'gzip'),
+		COALESCE(health_check_host,''), COALESCE(enable_compress,1), COALESCE(compress_types,'gzip'),
 		IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0), name, description
 	FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(
 		&existingRule.Protocol, &existingRule.Domain, &existingRule.ListenPort, &existingRule.Strategy,
@@ -1210,7 +1210,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		&existingRule.ChainRaceIntervalMS, &existingRule.ChainRequestTimeoutMS,
 		&existingRule.CustomRoutesEnabled,
 		&existingRule.ProxyDialTimeout, &existingRule.ProxyResponseHeaderTimeout, &existingRule.ProxyReadTimeout, &existingRule.ProxyWriteTimeout, &existingRule.ProxyStreamTimeout, &existingRule.ProxyFlushInterval, &existingRule.ProxyStreamCloseDelay,
-		&existingRule.HostHeader, &existingRule.HealthCheckHost, &existingRule.EnableCompress, &existingRule.CompressTypes,
+		&existingRule.HealthCheckHost, &existingRule.EnableCompress, &existingRule.CompressTypes,
 		&existingRule.Enabled, &existingRule.LogEnabled, &existingRule.Name, &existingRule.Description)
 	if err != nil {
 		// SLB10-N2:分判 ErrNoRows 与真实 DB 故障(同 EnableRule 口径)——
@@ -1369,8 +1369,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.DnsFamily == "" {
 		req.DnsFamily = existingRule.DnsFamily
 	}
-	if req.HostHeader == nil {
-		req.HostHeader = &existingRule.HostHeader
+	if req.OriginDomain == nil {
+		req.OriginDomain = &existingRule.OriginDomain
 	}
 	if req.HealthCheckHost == nil {
 		req.HealthCheckHost = &existingRule.HealthCheckHost
@@ -1420,7 +1420,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			req.EnableDnsServer = &disabled
 			req.DnsServer = &empty
 			req.DnsFamily = ""
-			req.HostHeader = &empty
+			req.OriginDomain = &empty
 			req.HealthCheckHost = &empty
 			req.EnableCompress = &disabled
 			req.CompressTypes = ""
@@ -1455,7 +1455,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		// 与 protocolChanged 分支切换归零同格；存量/导入残留与显式携带一律
 		// 弃置（TCP 渲染零消费），不随快照/导出/复制放大。
 		tcpEmpty := ""
-		req.HostHeader = &tcpEmpty
+		req.OriginDomain = &tcpEmpty
 		req.HealthCheckPath = &tcpEmpty
 		req.EnableCompress = &tcpDisabled
 		req.CompressTypes = ""
@@ -1801,8 +1801,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	args = append(args, features.ProxyFlushInterval)
 	query += "proxy_stream_close_delay = ?, "
 	args = append(args, features.ProxyStreamCloseDelay)
-	query += "host_header = ?, "
-	args = append(args, derefStr(req.HostHeader))
+	query += "origin_domain = ?, "
+	args = append(args, derefStr(req.OriginDomain))
 	query += "health_check_host = ?, "
 	args = append(args, derefStr(req.HealthCheckHost))
 	query += "enable_tls = ?, "
@@ -2513,7 +2513,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		// LBH-A-U1（第 69 轮）：HTTP 专属死配置字段族不放大到副本——与
 		// CreateRule/UpdateRule 归一同口径（TCP 渲染零消费，源行存量/导入
 		// 残留复制即弃置）。
-		rule.HostHeader = ""
+		rule.OriginDomain = ""
 		rule.HealthCheckPath = ""
 		rule.EnableCompress = false
 		rule.CompressTypes = ""
@@ -2604,11 +2604,11 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden,
 			chain_race_interval_ms, chain_request_timeout_ms,
 			enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_cert_path, tls_key_path,
-	tls_http_redirect, enable_compress, compress_types, enabled, created_by, updated_by, created_at, updated_at, host_header, health_check_host, log_enabled, caddy_id,
+	tls_http_redirect, enable_compress, compress_types, enabled, created_by, updated_by, created_at, updated_at, health_check_host, log_enabled, caddy_id,
 		custom_routes_enabled,
 		proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
 		block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, rule.Name+"（副本）", rule.Description, rule.Protocol, rule.Domain, rule.ListenPort, rule.Strategy,
 		rule.DynamicDNS, rule.EnableDnsServer, rule.DnsServer, rule.DnsFamily, rule.HealthCheckPath, rule.HealthCheckInterval, rule.HealthCheckTimeout,
 		rule.HealthCheckUnhealthyThreshold, rule.HealthCheckHealthyThreshold,
@@ -2617,7 +2617,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		rule.ChainRaceIntervalMS, rule.ChainRequestTimeoutMS,
 		rule.EnableTLS, rule.TLSSource, rule.ACMEConfigID, rule.CAProviderID, rule.TLSCert, rule.TLSKey, rule.TLSCertPath, rule.TLSKeyPath,
 		rule.TLSHTTPRedirect, rule.EnableCompress, rule.CompressTypes, 0, userIDInt, userIDInt,
-		now, now, rule.HostHeader, rule.HealthCheckHost, rule.LogEnabled, newCaddyID,
+		now, now, rule.HealthCheckHost, rule.LogEnabled, newCaddyID,
 		rule.CustomRoutesEnabled,
 		rule.ProxyDialTimeout, rule.ProxyResponseHeaderTimeout, rule.ProxyReadTimeout, rule.ProxyWriteTimeout, rule.ProxyStreamTimeout, rule.ProxyFlushInterval, rule.ProxyStreamCloseDelay,
 		rule.BlockPageStage1ID, rule.BlockPageStage1Status, rule.BlockPageStage3ID, rule.BlockPageStage3Status,

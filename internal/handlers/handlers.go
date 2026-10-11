@@ -351,7 +351,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		EnableCompress                bool
 		CompressTypes                 string
 		EnableActiveHealthCheck       bool
-		HostHeader                    string
+		OriginDomain                  string
 		HealthCheckHost               string
 		RequestBodyMaxSizeMB          int
 		UpstreamKeepaliveTimeout      int
@@ -390,7 +390,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		data.EnableCompress = r.EnableCompress
 		data.CompressTypes = r.CompressTypes
 		data.EnableActiveHealthCheck = r.EnableActiveHealthCheck
-		data.HostHeader = r.HostHeader
+		data.OriginDomain = r.OriginDomain
 		data.HealthCheckHost = r.HealthCheckHost
 		data.RequestBodyMaxSizeMB = r.RequestBodyMaxSizeMB
 		data.UpstreamKeepaliveTimeout = r.UpstreamKeepaliveTimeout
@@ -446,7 +446,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		if r.EnableActiveHealthCheck != nil {
 			data.EnableActiveHealthCheck = *r.EnableActiveHealthCheck
 		}
-		data.HostHeader = derefStr(r.HostHeader)
+		data.OriginDomain = derefStr(r.OriginDomain)
 		data.HealthCheckHost = derefStr(r.HealthCheckHost)
 		if r.RequestBodyMaxSizeMB != nil {
 			data.RequestBodyMaxSizeMB = *r.RequestBodyMaxSizeMB
@@ -504,9 +504,9 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		return fmt.Errorf("无效的协议：仅支持 http 或 tcp")
 	}
 
-	// LB40-5:host_header 直写 reverse_proxy 头部——CRLF/控制字符可注入额外
+	// LB40-5:origin_domain 直写 reverse_proxy 头部——CRLF/控制字符可注入额外
 	// 头(请求拆分面);拒绝不可见字符,可见 ASCII 与常规 Unicode 放行。
-	for _, r := range data.HostHeader {
+	for _, r := range data.OriginDomain {
 		if r < 0x20 || r == 0x7f {
 			return fmt.Errorf("后端域名含非法字符")
 		}

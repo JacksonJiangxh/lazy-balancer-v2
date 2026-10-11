@@ -1,6 +1,6 @@
 package handlers
 
-// LB40-5/LB40-6(第 40 轮):host_header 字符校验(CRLF/控制字符注入
+// LB40-5/LB40-6(第 40 轮):origin_domain 字符校验(CRLF/控制字符注入
 // reverse_proxy 头部)、dns_server 形状校验(空 host/非数字端口)、
 // extractLabel 精确键匹配(x_host 不得误归集 host)。
 
@@ -30,10 +30,10 @@ func TestRulePayload_hostHeaderAndDnsServerValidation(t *testing.T) {
 		return response
 	}
 
-	// 形状一:host_header 含 CRLF → 400
-	rec := create(base(`"host_header":"evil.com\r\nX-Injected: 1"`))
+	// 形状一:origin_domain 含 CRLF → 400
+	rec := create(base(`"origin_domain":"evil.com\r\nX-Injected: 1"`))
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "后端域名含非法字符") {
-		t.Fatalf("CRLF host_header must 400, got %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("CRLF origin_domain must 400, got %d %s", rec.Code, rec.Body.String())
 	}
 
 	// 形状二:垃圾 dns_server(非数字端口) → 400
@@ -43,9 +43,9 @@ func TestRulePayload_hostHeaderAndDnsServerValidation(t *testing.T) {
 	}
 
 	// 形状三(回归):合法形状放行
-	rec = create(base(`"host_header":"api.backend.local"`))
+	rec = create(base(`"origin_domain":"api.backend.local"`))
 	if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
-		t.Fatalf("legit host_header must pass, got %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("legit origin_domain must pass, got %d %s", rec.Code, rec.Body.String())
 	}
 }
 
