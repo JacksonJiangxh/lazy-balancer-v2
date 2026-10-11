@@ -63,46 +63,61 @@ DB 为唯一事实源，看门狗负责外部文件变化回写 DB」。
 
 ### D-1【最关键】逐上游回源 Host：两套实现取哪套
 
-同一个功能，两边独立做了一遍，方向不同：
+同一个功能，两边独立做了一遍，**落点相同（都在上游服务器表里加一列），但字段与机制不同**：
 
 | | 我们的实现 | 上游的实现 |
 |---|---|---|
-| 数据落在哪 | `upstreams.host_header`（复用已有列） | 新增 `upstreams.origin_domain` 列 |
-| 自定义路由怎么取值 | 渲染期内部推导（不落库、前端无字段） | 前端有「回源域名」列，随 `upstreams_json` 落库 |
+| 表列 | `upstreams.host_header`，前端列名「回源Host」 | `upstreams.origin_domain`，前端列名「回源域名」 |
+| 前端位置 | **有**（`Rules.vue` 上游表「回源Host」列，`PathRulesEditor.vue` 反向删过 → 现无） | **有**（`Rules.vue` 上游表「回源域名」列） |
+| 自定义路由内取值 | 渲染期内部推导（不落库、无字段） | 同样不在自定义路由内落字段，靠上游表晚绑定 |
 | 渲染机制 | Go 侧推导 + `{lb.upstream_host}` 占位符 | 原生 `map` 处理器晚绑定查表 |
-| 是否新增 Caddy 模块 | 否 | 否（上游也做到了零新模块） |
 | SNI 处理 | 跟随 `host_header`，带端口原样 | `stripOriginPort` 剥离端口 |
-| 健康检查域名 | 无 | 新增 `upstreams.health_check_host`（probe Host 头） |
+| 健康检查域名 | 无（规则级 `lb_rules.health_check_host` 也无） | 新增 `lb_rules.health_check_host` + 上游级 `upstreams.health_check_host` |
 
-**三个选项：**
+> **勘误**：上一版清单写「我们的前端无字段」是错的。我们前端**有**「回源Host」列
+> （`Rules.vue` 上游服务器表），只是「自定义路由」子表内不落该字段——这一点上
+> 上游的做法其实与我们一致（上游也没有在自定义路由里放这个字段）。
+> 真正的分歧是**字段名 + 渲染机制**，不是「有没有列」。
 
-- **方案 1（推荐）：以我们的实现为基线，选择性吸收上游的能力点。**
-  保留我们的三级回退 + 渲染期推导（这是你 2026-10-10 亲自裁定的口径：
-  「自定义路由的规则设定不该出现任何额外字段」），但吸收上游这两点：
-  - 新增 `upstreams.health_check_host` 列与 probe Host 头支持（我们目前是缺的）；
-  - SNI 剥端口（`stripOriginPort`，上游理由是 RFC 6066 SNI 无端口语义）。
-  代价：需要把上游这两个点从它那套 map 方案里「拆」出来、移植到我们的推导方案上，
-  工作量中等，但代码口径保持统一，前端一行不动。
+**决策要定的是三件事，可以分开选：**
+1. 字段名：`host_header`（我们的）还是 `origin_domain`（上游的）
+2. 渲染机制：我们的「Go 侧推导 + `{lb.upstream_host}`」还是上游的「原生 map 晚绑定」
+3. 上游新增能力（`health_check_host` / SNI 剥端口）是否吸收
 
-- **方案 2：完全切到上游实现。**
-  删掉我们的 `pathUpstreamHostResolver` / `hostPlanValueFor` 一整套，改吃
-  `origin_domain`。好处是后续合并零冲突；坏处是**推翻你之前对前端的裁定**
-  ——你的原话是自定义路由不应出现「回源 Host」列，而上游方案前端是有这个字段的。
+**推荐：字段名与渲染机制都切上游（`origin_domain` + map），同时吸收
+`health_check_host` 与 SNI 剥端口。** 理由：
+- 上游的 map 方案零新 Caddy 模块、代码量小，且**已修了我们大概率没修的 bug**
+  （TLS 池下 Host 回退占位符错误，会退化成客户端 Host）；
+- 我们已有的 `upstreams.host_header` **前端行为保持不变**（列还在，只是列名 →
+  「回源域名」、列名背后字段换名），用户感知几乎为零；
+- 继续留自研实现 = 永久冲突面 + 落后修复两笔债。
+- 迁移：启动时 `host_header` 非空 → 搬入 `origin_domain`（并在
+  `legacyUpstreamDeadColumns` 里保证先搬后删，避免我们这列被上游当死列 DROP 掉）。
 
-- **方案 3：两套并存。**
-  保留我们的推导，同时接上游的 `origin_domain` 作为「显式覆盖」优先档。
-  好处是兼容两边；坏处是**同一个语义有两个数据源**，回源 Host 到底谁说话
-  要靠一套优先级规则解释——这正是你此前反对的「配置歧义」形态，我不推荐。
+**若选保守方案**：字段名切上游、渲染保留我们的推导，则需把上游的
+`health_check_host` / SNI 剥端口两点从那套 map 里拆出来移植，工作量中等。
 
-> 我的建议：**方案 1**。理由是它保住了你已经拍过板的用户可见行为（自定义路由
-> 无额外字段），同时把上游真正缺的那块能力（健康检查域名、SNI 剥端口）补上。
+### D-2 自定义路由「直接返回 / 301 跳转」：**同样是同需求两实现，不是纯新增**
 
-### D-2 自定义路由「直接返回 / 301 跳转」要不要接
-上游新增 `path_rules` 五列（`response_mode` / `response_status` / `response_body` /
-`response_content_type` / `redirect_to`），支持路径规则直接返回静态响应或 301。
-> 判断：**纯新增能力，与我们无冲突，建议直接接。** 唯一要补的是预检渲染路径的
-> 字段回填（上游在 `toPathRuleConfigs` 里补了，我们改过该函数的上下文，
-> 合进去时要人工确认没丢字段）。
+> **勘误**：上一版写「上游纯新增，我们无冲突」是错的。我们**已经有**这个能力
+> （`path_rules.action='respond'`，提交 `e43b1976`，2026-10-09；前端
+> `PathRulesEditor.vue` 的「静态响应」下拉 + 响应码/重定向目标/响应内容/内容类型）。
+> 上游在 **2026-10-10** 也做了同一件事，但是**独立另一套**：`response_mode`
+> 三值（`''`/`static`/`redirect`）+ `response_status` / `redirect_to` /
+> `response_content_type`（提交 `2ca1e014`，同样是用户裁定）。
+
+| | 我们的 | 上游的 |
+|---|---|---|
+| 字段 | `action='proxy'\|'respond'` | `response_mode=''\|'static'\|'redirect'` |
+| 状态码/目标 | `status_code` / `redirect_url` | `response_status` / `redirect_to` |
+| 响应体/类型 | `response_body` / `content_type` | `response_body` / `response_content_type` |
+| 能力粒度 | 一个 `respond` 管「静态响应 + 3xx 跳转」 | 拆成 `static` 与 `redirect` 两模式 |
+| 校验 | `validateStaticResponsePathRule` | 内联 switch + 状态码白名单 |
+| 指标 | 我们补过 `lb_rule_metrics` | 上游在链首也补了 `lb_rule_metrics` |
+
+**这是一个真正的「同需求两实现」碰撞，和 D-1 同一性质。** 需要一个决策：
+统一到 `response_mode` 三值（上游口径），还是统一到 `action=respond`（我们口径）。
+数据迁移成本两边都要付（存量行改写）。
 
 ### D-3 `task_runs` 表要删三列，会不会影响我们的任务监控
 上游删了 `task_runs.stage` / `entry_count` 两个「零写入方」死列（`message` 留着），
