@@ -124,7 +124,7 @@ func TestBuildChainProxyConfig_paramsAndDialTimeout(t *testing.T) {
 		ProxyDialTimeout:      2,
 	}
 	ups := []UpstreamConfig{
-		{Host: "10.0.0.9", Port: 9409, Weight: 1, Protocol: "https", Enabled: true, HostHeader: "origin.test"},
+		{Host: "10.0.0.9", Port: 9409, Weight: 1, Protocol: "https", Enabled: true, OriginDomain: "origin.test"},
 	}
 	cfg := buildChainProxyConfig(rule, ups)
 	if cfg["race_interval_ms"].(int) != 800 || cfg["request_timeout_ms"].(int) != 3000 {
@@ -143,7 +143,7 @@ func TestBuildChainProxyConfig_paramsAndDialTimeout(t *testing.T) {
 	}
 }
 
-// 逐上游回源 Host 三级回退：上游 host_header > 规则级 host_header > 空（不发射）。
+// 逐上游回源域名三级回退：上游 origin_domain > 规则级 host_header > 空（不发射）。
 func TestBuildChainProxyConfig_hostHeaderFallback(t *testing.T) {
 	rule := SingleRuleConfig{
 		CaddyID:    "lb_chain_host",
@@ -152,16 +152,16 @@ func TestBuildChainProxyConfig_hostHeaderFallback(t *testing.T) {
 		HostHeader: "rule-level.test",
 	}
 	ups := []UpstreamConfig{
-		{Host: "10.0.0.1", Port: 9501, Weight: 1, Protocol: "http", Enabled: true, HostHeader: "upstream-level.test"},
+		{Host: "10.0.0.1", Port: 9501, Weight: 1, Protocol: "http", Enabled: true, OriginDomain: "upstream-level.test"},
 		{Host: "10.0.0.2", Port: 9502, Weight: 1, Protocol: "http", Enabled: true}, // 回退规则级
 		{Host: "10.0.0.3", Port: 9503, Weight: 1, Protocol: "http", Enabled: true},
 	}
 	rule.HostHeader = ""
-	ups[2].HostHeader = "  " // 空白视为空
+	ups[2].OriginDomain = "  " // 空白视为空
 	cfg := buildChainProxyConfig(rule, ups)
 	upsOut := cfg["upstreams"].([]interface{})
 	if upsOut[0].(map[string]interface{})["host"] != "upstream-level.test" {
-		t.Fatalf("上游级 host_header 应最高优先: %v", upsOut[0])
+		t.Fatalf("上游级 origin_domain 应最高优先: %v", upsOut[0])
 	}
 	if _, ok := upsOut[1].(map[string]interface{})["host"]; ok {
 		t.Fatalf("规则级与上游级均空时不发射 host（用 dial 地址兜底）: %v", upsOut[1])

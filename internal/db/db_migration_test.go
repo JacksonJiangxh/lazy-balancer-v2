@@ -65,6 +65,50 @@ func TestRunMigrationsAddsTaskRunsOperatorColumn(t *testing.T) {
 	}
 }
 
+// TASK-L7（第 69 轮）：task_runs.stage/entry_count 零写入方死列清理——
+// fresh DDL 不含两列；存量库经 runMigrations 的 deadColumnDrops 幂等删除。
+func TestRunMigrationsDropsTaskRunsStageEntryCount(t *testing.T) {
+	// Given 存量库形态：task_runs 带 stage/entry_count 两列（fresh DDL 已删
+	// 时补回模拟旧库；未删时本已存在——条件补列两种形态通用）
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec("INSERT INTO global_config (id,caddy_config) VALUES (1,'{}')"); err != nil {
+		t.Fatalf("seed global config: %v", err)
+	}
+	for _, col := range []struct{ name, ddl string }{
+		{"stage", "TEXT DEFAULT ''"},
+		{"entry_count", "INTEGER DEFAULT 0"},
+	} {
+		var cnt int
+		if err := database.QueryRow("SELECT COUNT(*) FROM pragma_table_info('task_runs') WHERE name=?", col.name).Scan(&cnt); err != nil {
+			t.Fatalf("query task_runs schema: %v", err)
+		}
+		if cnt == 0 {
+			if _, err := database.Exec("ALTER TABLE task_runs ADD COLUMN " + col.name + " " + col.ddl); err != nil {
+				t.Fatalf("simulate legacy column %s: %v", col.name, err)
+			}
+		}
+	}
+
+	// When
+	if err := runMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	// Then 两死列均被移除
+	for _, col := range []string{"stage", "entry_count"} {
+		var cnt int
+		if err := database.QueryRow("SELECT COUNT(*) FROM pragma_table_info('task_runs') WHERE name=?", col).Scan(&cnt); err != nil {
+			t.Fatalf("query task_runs schema: %v", err)
+		}
+		if cnt != 0 {
+			t.Fatalf("task_runs.%s count=%d, want 0（死列未删）", col, cnt)
+		}
+	}
+}
+
 func TestRunMigrationsCreatesAuthenticationAndUpstreamIndexes(t *testing.T) {
 	// Given
 	database := openMigrationTestDB(t)
@@ -614,12 +658,14 @@ func TestMigrateLbRulesPrimaryKey_preserves_upstream_connection_settings(t *test
 			block_page_stage1_id INTEGER NOT NULL DEFAULT 0,
 			block_page_stage1_status INTEGER NOT NULL DEFAULT 0,
 			block_page_stage3_id INTEGER NOT NULL DEFAULT 0,
-			block_page_stage3_status INTEGER NOT NULL DEFAULT 0
+			block_page_stage3_status INTEGER NOT NULL DEFAULT 0,
+			-- 真实启动序：ensureNewColumns 先于 PK 重建运行，重建只见补列后形态
+			health_check_host TEXT NOT NULL DEFAULT ''
 		);
 		CREATE TABLE upstreams (
 			id INTEGER PRIMARY KEY, rule_id INTEGER NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
 			weight INTEGER, domain TEXT, dynamic_dns BOOLEAN, enabled BOOLEAN, protocol TEXT, host_header TEXT,
-			dns_server TEXT, max_connections INTEGER, proxy_protocol TEXT
+			dns_server TEXT, max_connections INTEGER, proxy_protocol TEXT, origin_domain TEXT NOT NULL DEFAULT ''
 		);
 		INSERT INTO lb_rules (id, name, protocol, listen_port, caddy_id) VALUES (7, 'legacy', 'tcp', 443, 'lb_preserve');
 		INSERT INTO upstreams (id, rule_id, host, port, max_connections, proxy_protocol)
@@ -642,9 +688,10 @@ func TestMigrateLbRulesPrimaryKey_preserves_upstream_connection_settings(t *test
 		t.Fatalf("max_connections=%d, want 37", maxConnections)
 	}
 	// Legacy dead columns are not carried into the rebuilt table.
-	// 2026-10-09：upstreams.host_header 重新启用为逐上游回源 Host——重建表
-	// 携带该列（迁移 DDL 已含），从 legacy 死列清单移除并正向断言。
-	for _, column := range []string{"domain", "dns_server", "proxy_protocol"} {
+	// 2026-10-11（上游合并 C1）：逐上游回源 Host 切上游 origin_domain——重建表
+	// 携带 origin_domain，自研 host_header 列随 legacy 死列一并清除（数据在
+	// 启动迁移阶段已先搬入 origin_domain，此处只断言列形态）。
+	for _, column := range []string{"domain", "host_header", "dns_server", "proxy_protocol"} {
 		var count int
 		if err := database.QueryRow("SELECT COUNT(*) FROM pragma_table_info('upstreams') WHERE name=?", column).Scan(&count); err != nil {
 			t.Fatalf("check migrated upstreams.%s: %v", column, err)
@@ -653,12 +700,12 @@ func TestMigrateLbRulesPrimaryKey_preserves_upstream_connection_settings(t *test
 			t.Fatalf("legacy column %s survived primary key migration", column)
 		}
 	}
-	var hostHeaderCols int
-	if err := database.QueryRow("SELECT COUNT(*) FROM pragma_table_info('upstreams') WHERE name='host_header'").Scan(&hostHeaderCols); err != nil {
-		t.Fatalf("check migrated upstreams.host_header: %v", err)
+	var originDomainCols int
+	if err := database.QueryRow("SELECT COUNT(*) FROM pragma_table_info('upstreams') WHERE name='origin_domain'").Scan(&originDomainCols); err != nil {
+		t.Fatalf("check migrated upstreams.origin_domain: %v", err)
 	}
-	if hostHeaderCols != 1 {
-		t.Fatalf("upstreams.host_header must survive the rebuilt schema, count=%d", hostHeaderCols)
+	if originDomainCols != 1 {
+		t.Fatalf("upstreams.origin_domain must survive the rebuilt schema, count=%d", originDomainCols)
 	}
 }
 
@@ -1468,11 +1515,14 @@ func TestMigrateLbRulesPrimaryKey_rebuildsUpstreamEnabledNotNull(t *testing.T) {
 			block_page_stage1_id INTEGER NOT NULL DEFAULT 0,
 			block_page_stage1_status INTEGER NOT NULL DEFAULT 0,
 			block_page_stage3_id INTEGER NOT NULL DEFAULT 0,
-			block_page_stage3_status INTEGER NOT NULL DEFAULT 0
+			block_page_stage3_status INTEGER NOT NULL DEFAULT 0,
+			-- 真实启动序：ensureNewColumns 先于 PK 重建运行，重建只见补列后形态
+			health_check_host TEXT NOT NULL DEFAULT ''
 		);
 		CREATE TABLE upstreams (
 			id INTEGER PRIMARY KEY, rule_id INTEGER NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
-			weight INTEGER, dynamic_dns BOOLEAN, enabled BOOLEAN, protocol TEXT, max_connections INTEGER
+			weight INTEGER, dynamic_dns BOOLEAN, enabled BOOLEAN, protocol TEXT, max_connections INTEGER,
+			origin_domain TEXT NOT NULL DEFAULT ''
 		);
 		INSERT INTO lb_rules (id, name, protocol, listen_port, caddy_id) VALUES (7, 'legacy', 'tcp', 443, 'lb_enabled_nn');
 		INSERT INTO upstreams (id, rule_id, host, port, enabled) VALUES (9, 7, '127.0.0.1', 8443, NULL);
@@ -1565,18 +1615,17 @@ func TestMigrateLegacyDNSCredentials_rollsBackAllRowsOnFailure(t *testing.T) {
 	}
 }
 
-func TestInitialize_adds_security_policy_response_and_event_retention_columns(t *testing.T) {
-	// Given
-	dir := t.TempDir()
-	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
-	t.Cleanup(func() {
-		_ = Close()
-		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
-	})
+func TestEnsureNewColumns_rejectsMalformedKey(t *testing.T) {
+	// Given CORE-U2（第 69 轮）：登记 key 非 "table.column" 形态时须启动期响亮
+	// 失败——此前静默跳过（continue），笔误列静默不补、运行时才以 no such column 暴露。
+	openMigrationTestDB(t)
 
 	// When
-	if err := Initialize(dir); err != nil {
-		t.Fatalf("initialize database: %v", err)
+	err := ensureNewColumns(map[string]string{"lb_rules.no.dot": "TEXT"}, nil)
+
+	// Then
+	if err == nil || !strings.Contains(err.Error(), "malformed") {
+		t.Fatalf("err=%v, want malformed-key error（畸形登记键必须响亮失败）", err)
 	}
 }
 
@@ -2484,5 +2533,254 @@ func TestRunMigrations_clearsTCPRuleStaleDNSServerFields(t *testing.T) {
 	}
 	if cleanEnable != 0 || cleanDNS != "" {
 		t.Fatalf("干净 TCP 行被误改: enable=%d server=%q", cleanEnable, cleanDNS)
+	}
+}
+
+// 逐上游回源域名 + 健康检查域名（2026-10-10）：upstreams.origin_domain 与
+// lb_rules.health_check_host 两列——fresh DDL 建表含列，存量库经 ensureNewColumns
+// 幂等补列，PK 重建迁移（migrateLbRulesPrimaryKey）DDL 同步携带保值。
+
+// TestInitialize_freshSchemaCarriesUpstreamHostColumns：fresh 安装两表携带新列，
+// NOT NULL + 默认空串（同 path_rules.upstream_path 断言口径）。
+func TestInitialize_freshSchemaCarriesUpstreamHostColumns(t *testing.T) {
+	// Given
+	dir := t.TempDir()
+	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
+	t.Cleanup(func() {
+		_ = Close()
+		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+
+	// When
+	if err := Initialize(dir); err != nil {
+		t.Fatalf("initialize database: %v", err)
+	}
+
+	// Then
+	for _, tc := range []struct{ table, column string }{
+		{"upstreams", "origin_domain"},
+		{"lb_rules", "health_check_host"},
+	} {
+		var notNull int
+		var columnDefault string
+		query := fmt.Sprintf(`SELECT "notnull", COALESCE(dflt_value,'') FROM pragma_table_info('%s') WHERE name='%s'`, tc.table, tc.column)
+		if err := DB.QueryRow(query).Scan(&notNull, &columnDefault); err != nil {
+			t.Fatalf("read %s.%s schema: %v", tc.table, tc.column, err)
+		}
+		if notNull != 1 || columnDefault != "''" {
+			t.Fatalf("%s.%s notnull=%d default=%q, want notnull=1 default empty string", tc.table, tc.column, notNull, columnDefault)
+		}
+	}
+}
+
+// TestRunMigrations_addsUpstreamHostColumnsToLegacyRows：存量库（无两列）经
+// runMigrations 补列，已存在行读回默认空串（SQLite ADD COLUMN 以默认值填充存量行）。
+func TestRunMigrations_addsUpstreamHostColumnsToLegacyRows(t *testing.T) {
+	// Given 存量库：createTables 后模拟旧版——若新列已存在则先 DROP（RED 期列本不存在，跳过）
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config) VALUES (1,'{}');
+		INSERT INTO lb_rules (name,protocol,domain,listen_port,caddy_id) VALUES ('legacy','http','legacy.example.test',8080,'lb_legacyhost');
+		INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_legacyhost','10.0.0.1',9000,1,1,'http');`); err != nil {
+		t.Fatalf("seed legacy rows: %v", err)
+	}
+	for _, tc := range []struct{ table, column string }{
+		{"upstreams", "origin_domain"},
+		{"lb_rules", "health_check_host"},
+	} {
+		var cnt int
+		if err := database.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, tc.table, tc.column).Scan(&cnt); err != nil {
+			t.Fatalf("inspect %s.%s: %v", tc.table, tc.column, err)
+		}
+		if cnt == 1 {
+			if _, err := database.Exec(fmt.Sprintf(`ALTER TABLE %s DROP COLUMN %s`, tc.table, tc.column)); err != nil {
+				t.Fatalf("simulate legacy %s.%s: %v", tc.table, tc.column, err)
+			}
+		}
+	}
+
+	// When migrations run (twice, to prove idempotence)
+	if err := runMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+	if err := runMigrations(); err != nil {
+		t.Fatalf("repeat migrations: %v", err)
+	}
+
+	// Then 两列补出且存量行读回空串
+	var originDomain string
+	if err := database.QueryRow(`SELECT origin_domain FROM upstreams WHERE rule_id='lb_legacyhost'`).Scan(&originDomain); err != nil {
+		t.Fatalf("read origin_domain: %v", err)
+	}
+	if originDomain != "" {
+		t.Fatalf("origin_domain=%q, want empty default", originDomain)
+	}
+	var healthCheckHost string
+	if err := database.QueryRow(`SELECT health_check_host FROM lb_rules WHERE caddy_id='lb_legacyhost'`).Scan(&healthCheckHost); err != nil {
+		t.Fatalf("read health_check_host: %v", err)
+	}
+	if healthCheckHost != "" {
+		t.Fatalf("health_check_host=%q, want empty default", healthCheckHost)
+	}
+}
+
+// TestInitialize_carriesUpstreamHostColumnsThroughPkRebuild：遗留库（int PK，
+// 触发 migrateLbRulesPrimaryKey 重建）上两列已带真实值——重建 DDL 必须携带，
+// 否则重建丢列、值被安全网以默认值回填（U6B-3 同型先例）。
+func TestInitialize_carriesUpstreamHostColumnsThroughPkRebuild(t *testing.T) {
+	// Given 遗留库：int PK lb_rules/upstreams + 两新列已带值（模拟 ensureNewColumns
+	// 已在重建前补列并被写入真实配置的形态）
+	dir := t.TempDir()
+	legacy, err := sql.Open("sqlite", filepath.Join(dir, "lazy-balancer.db"))
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	if _, err := legacy.Exec(`
+		CREATE TABLE lb_rules (
+			id INTEGER PRIMARY KEY, name TEXT, description TEXT, protocol TEXT, domain TEXT, listen_port INTEGER,
+			strategy TEXT, dynamic_dns BOOLEAN, enable_dns_server BOOLEAN, dns_server TEXT, dns_family TEXT,
+			health_check_path TEXT, health_check_interval INTEGER, health_check_timeout INTEGER,
+			health_check_unhealthy_threshold INTEGER, health_check_healthy_threshold INTEGER,
+			enable_active_health_check BOOLEAN, tcp_health_check_port INTEGER, tcp_proxy_protocol BOOLEAN,
+			tcp_try_duration INTEGER, tcp_try_interval INTEGER, request_body_max_size_mb INTEGER,
+			upstream_keepalive_timeout INTEGER, server_tokens_hidden INTEGER,
+			custom_routes_enabled BOOLEAN, proxy_dial_timeout INTEGER, proxy_response_header_timeout INTEGER,
+			proxy_read_timeout INTEGER, proxy_write_timeout INTEGER, proxy_stream_timeout INTEGER,
+			proxy_flush_interval INTEGER, proxy_stream_close_delay INTEGER,
+			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_http_redirect BOOLEAN,
+			tls_source TEXT, acme_config_id INTEGER, ca_provider_id INTEGER, enable_compress BOOLEAN,
+			compress_types TEXT, enabled BOOLEAN, log_enabled BOOLEAN, created_by INTEGER, created_at DATETIME,
+			updated_at DATETIME, updated_by INTEGER, caddy_id TEXT,
+			block_page_stage1_id INTEGER NOT NULL DEFAULT 0,
+			block_page_stage1_status INTEGER NOT NULL DEFAULT 0,
+			block_page_stage3_id INTEGER NOT NULL DEFAULT 0,
+			block_page_stage3_status INTEGER NOT NULL DEFAULT 0,
+			health_check_host TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE upstreams (
+			id INTEGER PRIMARY KEY, rule_id INTEGER NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
+			weight INTEGER, domain TEXT, dynamic_dns BOOLEAN, enabled BOOLEAN, protocol TEXT, host_header TEXT,
+			dns_server TEXT, max_connections INTEGER, proxy_protocol TEXT,
+			origin_domain TEXT NOT NULL DEFAULT ''
+		);
+		INSERT INTO lb_rules (id, name, protocol, listen_port, caddy_id, health_check_host)
+		VALUES (7, 'legacy', 'http', 8080, 'lb_originhost', 'probe.example.test');
+		INSERT INTO upstreams (id, rule_id, host, port, enabled, protocol, origin_domain)
+		VALUES (3, 7, '10.0.0.1', 9000, 1, 'http', 'origin.example.test');
+	`); err != nil {
+		t.Fatalf("seed legacy load-balancer schema: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
+	t.Cleanup(func() {
+		_ = Close()
+		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+
+	// When：遗留库启动一次（PK 重建 DROP 并重建 lb_rules/upstreams）
+	if err := Initialize(dir); err != nil {
+		t.Fatalf("initialize legacy database: %v", err)
+	}
+
+	// Then：两列存在且值存活
+	var healthCheckHost string
+	if err := DB.QueryRow(`SELECT health_check_host FROM lb_rules WHERE caddy_id='lb_originhost'`).Scan(&healthCheckHost); err != nil {
+		t.Fatalf("read migrated rule health_check_host: %v", err)
+	}
+	if healthCheckHost != "probe.example.test" {
+		t.Fatalf("health_check_host=%q after PK rebuild, want probe.example.test（重建丢列）", healthCheckHost)
+	}
+	var originDomain string
+	if err := DB.QueryRow(`SELECT origin_domain FROM upstreams WHERE host='10.0.0.1'`).Scan(&originDomain); err != nil {
+		t.Fatalf("read migrated upstream origin_domain: %v", err)
+	}
+	if originDomain != "origin.example.test" {
+		t.Fatalf("origin_domain=%q after PK rebuild, want origin.example.test（重建丢列）", originDomain)
+	}
+}
+
+// 自定义路由静态响应/301 跳转（2026-10-10 用户裁定）：path_rules 补五列——
+// response_mode(”=转发/static/redirect)/response_status/response_body/
+// response_content_type/redirect_to。path_rules 不经 migrateLbRulesPrimaryKey
+// 重建（仅 lb_rules/upstreams），fresh DDL + ensureNewColumns 双通道即可。
+func TestInitialize_freshSchemaCarriesPathRuleResponseColumns(t *testing.T) {
+	// Given
+	dir := t.TempDir()
+	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
+	t.Cleanup(func() {
+		_ = Close()
+		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+
+	// When
+	if err := Initialize(dir); err != nil {
+		t.Fatalf("initialize database: %v", err)
+	}
+
+	// Then
+	for _, tc := range []struct{ column, dflt string }{
+		{"response_mode", "''"},
+		{"response_status", "200"},
+		{"response_body", "''"},
+		{"response_content_type", "''"},
+		{"redirect_to", "''"},
+	} {
+		var notNull int
+		var columnDefault string
+		if err := DB.QueryRow(fmt.Sprintf(`SELECT "notnull", COALESCE(dflt_value,'') FROM pragma_table_info('path_rules') WHERE name='%s'`, tc.column)).Scan(&notNull, &columnDefault); err != nil {
+			t.Fatalf("read path_rules.%s schema: %v", tc.column, err)
+		}
+		if notNull != 1 || columnDefault != tc.dflt {
+			t.Fatalf("path_rules.%s notnull=%d default=%q, want notnull=1 default %s", tc.column, notNull, columnDefault, tc.dflt)
+		}
+	}
+}
+
+// TestRunMigrations_addsPathRuleResponseColumnsToLegacyRows：存量库补列后
+// 旧行五列读回默认值（”=转发/200/空体/空格式/空目标=现状转发语义零漂移）。
+func TestRunMigrations_addsPathRuleResponseColumnsToLegacyRows(t *testing.T) {
+	// Given
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config) VALUES (1,'{}');
+		INSERT INTO lb_rules (name,protocol,domain,listen_port,caddy_id) VALUES ('legacy','http','legacy.example.test',8080,'lb_prresp');
+		INSERT INTO path_rules (rule_id,sort_order,match_type,path) VALUES ('lb_prresp',0,'prefix','/api')`); err != nil {
+		t.Fatalf("seed legacy rows: %v", err)
+	}
+	for _, col := range []string{"response_mode", "response_status", "response_body", "response_content_type", "redirect_to"} {
+		var cnt int
+		if err := database.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_info('path_rules') WHERE name='%s'`, col)).Scan(&cnt); err != nil {
+			t.Fatalf("inspect path_rules.%s: %v", col, err)
+		}
+		if cnt == 1 {
+			if _, err := database.Exec(`ALTER TABLE path_rules DROP COLUMN ` + col); err != nil {
+				t.Fatalf("simulate legacy path_rules.%s: %v", col, err)
+			}
+		}
+	}
+
+	// When（重跑证幂等）
+	if err := runMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+	if err := runMigrations(); err != nil {
+		t.Fatalf("repeat migrations: %v", err)
+	}
+
+	// Then
+	var mode, body, contentType, redirectTo string
+	var status int
+	if err := database.QueryRow(`SELECT response_mode, response_status, response_body, response_content_type, redirect_to
+		FROM path_rules WHERE rule_id='lb_prresp'`).Scan(&mode, &status, &body, &contentType, &redirectTo); err != nil {
+		t.Fatalf("read migrated path rule: %v", err)
+	}
+	if mode != "" || status != 200 || body != "" || contentType != "" || redirectTo != "" {
+		t.Fatalf("migrated=(%q,%d,%q,%q,%q), want ('',200,'','','')", mode, status, body, contentType, redirectTo)
 	}
 }

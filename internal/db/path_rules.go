@@ -14,9 +14,7 @@ type PathRuleQueryer interface {
 }
 
 func LoadPathRules(ctx context.Context, queryer PathRuleQueryer, ruleID string) ([]models.PathRule, error) {
-	rows, err := queryer.QueryContext(ctx, `SELECT id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,
-		COALESCE(action,'proxy'), COALESCE(status_code,0), COALESCE(redirect_url,''), COALESCE(response_body,''), COALESCE(content_type,'')
-		FROM path_rules WHERE rule_id=? ORDER BY sort_order,id`, ruleID)
+	rows, err := queryer.QueryContext(ctx, `SELECT id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to FROM path_rules WHERE rule_id=? ORDER BY sort_order,id`, ruleID)
 	if err != nil {
 		return nil, fmt.Errorf("read path rules for %s: %w", ruleID, err)
 	}
@@ -26,7 +24,7 @@ func LoadPathRules(ctx context.Context, queryer PathRuleQueryer, ruleID string) 
 		var pathRule models.PathRule
 		var upstreamsJSON sql.NullString
 		if err := rows.Scan(&pathRule.ID, &pathRule.RuleID, &pathRule.SortOrder, &pathRule.MatchType, &pathRule.Path, &pathRule.UpstreamPath, &upstreamsJSON,
-			&pathRule.Action, &pathRule.StatusCode, &pathRule.RedirectURL, &pathRule.ResponseBody, &pathRule.ContentType); err != nil {
+			&pathRule.ResponseMode, &pathRule.ResponseStatus, &pathRule.ResponseBody, &pathRule.ResponseContentType, &pathRule.RedirectTo); err != nil {
 			return nil, fmt.Errorf("scan path rules for %s: %w", ruleID, err)
 		}
 		if upstreamsJSON.Valid {

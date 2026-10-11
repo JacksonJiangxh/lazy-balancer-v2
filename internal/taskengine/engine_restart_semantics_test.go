@@ -189,7 +189,7 @@ func TestEngine_StopLoopImmediatelyAfterStartEventuallyStops(t *testing.T) {
 // Then panic 被隔离为 failed 行（不得杀进程）。
 func TestEngine_TaskRunPanicRecordsFailed(t *testing.T) {
 	e := newTestEngine(t)
-	e.Register(Descriptor{ID: "t-panic", Family: "t", Name: "恐慌任务", Kind: KindOneshot, ManualRun: true,
+	e.Register(Descriptor{ID: "t-panic", Family: "t", Name: "恐慌任务", Kind: KindOneshot,
 		Run: func(rc RunContext) error { panic("boom") }})
 	_, err := e.RunSync("t-panic", "manual", "tester")
 	if err == nil {
@@ -340,6 +340,9 @@ func TestEngine_DemoteCancelsInFlightScheduled(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	e.Register(Descriptor{ID: "t-sched", Family: "t", Name: "定时", Kind: KindScheduled, RunsOn: RoleMasterOnly,
+		// TASK-L2（第 69 轮）配套：Scheduled 注册必须带 NextSlotFn（远期槽——
+		// tick 不触发，本测试经 Trigger 驱动在途形态）。
+		NextSlotFn: func() time.Time { return time.Now().Add(time.Hour) },
 		Run: func(rc RunContext) error {
 			close(started)
 			select {

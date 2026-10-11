@@ -99,10 +99,11 @@ func createRuleFeatures(req models.CreateRuleRequest) ruleFeatureInput {
 func updateRuleFeatures(req models.UpdateRuleRequest, existing models.LbRule) ruleFeatureInput {
 	enabledUpstreams := 0
 	var enabledHosts []string
-	upstreams := existing.Upstreams
-	if req.Upstreams != nil {
-		upstreams = req.Upstreams
-	}
+	// LBH-A-D2（第 69 轮）：调用契约——唯一调用点 UpdateRule 在调用前已把
+	// req.Upstreams 合并为非 nil（nil=保留存量，赋值为 oldUpstreams），此处
+	// 不再有 existing.Upstreams 回退（LbRule.Upstreams 本就不随 scanLbRules
+	// 填充，回退拿到的恒为空集，属误导性死分支）。
+	upstreams := req.Upstreams
 	for _, u := range upstreams {
 		if u.Enabled {
 			enabledUpstreams++
@@ -234,11 +235,13 @@ func toPathRuleConfigs(pathRules []models.PathRule) []services.PathRuleConfig {
 			MatchType:    pathRule.MatchType,
 			Path:         pathRule.Path,
 			UpstreamPath: pathRule.UpstreamPath,
-			Action:       pathRule.Action,
-			StatusCode:   pathRule.StatusCode,
-			RedirectURL:  pathRule.RedirectURL,
-			ResponseBody: pathRule.ResponseBody,
-			ContentType:  pathRule.ContentType,
+			// LBH-A-P1（第 69 轮）：预检渲染回填直返/301 五列——丢失会让预检
+			// 把 static/redirect 路径规则当转发链渲染，与真实渲染分叉。
+			ResponseMode:        pathRule.ResponseMode,
+			ResponseStatus:      pathRule.ResponseStatus,
+			ResponseBody:        pathRule.ResponseBody,
+			ResponseContentType: pathRule.ResponseContentType,
+			RedirectTo:          pathRule.RedirectTo,
 		}
 		if pathRule.Upstreams != nil {
 			config.Upstreams = make([]services.UpstreamConfig, 0, len(pathRule.Upstreams))
@@ -408,25 +411,9 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 		default:
 			return fmt.Errorf("第 %d 条路径规则的匹配类型只能是 prefix 或 exact", index+1)
 		}
-		// 处理方式（2026-10-09）：空串视同 proxy（存量行兼容）。
-		action := strings.TrimSpace(pathRule.Action)
-		if action == "" {
-			action = string(models.PathRuleActionProxy)
-		}
-		switch action {
-		case string(models.PathRuleActionProxy):
-		case string(models.PathRuleActionRespond):
-			if err := validateStaticResponsePathRule(index, pathRule); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("第 %d 条路径规则的处理方式只能是 proxy 或 respond", index+1)
-		}
-		isProxyPathRule := action == string(models.PathRuleActionProxy)
-
 		// 上游 path 改写：非空须以 / 开头且不含空格与 ? #（query/fragment 不允许，
 		// 空白字符会破坏 Caddy rewrite URI 形状）；空串=原样转发放行。
-		if isProxyPathRule && pathRule.UpstreamPath != "" {
+		if pathRule.UpstreamPath != "" {
 			if !strings.HasPrefix(pathRule.UpstreamPath, "/") {
 				return fmt.Errorf("第 %d 条路径规则的上游 path 必须以 / 开头", index+1)
 			}
@@ -462,11 +449,56 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			}
 			seenExactNorms[normalizedExact] = index + 1
 		}
-		// 上游相关校验仅 Proxy 形态适用（respond 形态已在
-		// validateStaticResponsePathRule 拒绝携带上游）；此处为循环末段，
-		// continue 与跳过后无剩余逻辑等价。
-		if !isProxyPathRule {
-			continue
+		// 直接返回/301 跳转（2026-10-10 用户裁定）：模式枚举 + 按模式字段门 +
+		// 与转发配置互斥。static=常用状态码白名单 + 响应体 ≤64 字符 + 格式
+		// {text/plain,application/json,text/html}；redirect=目标必填且形状合法。
+		switch pathRule.ResponseMode {
+		case "":
+			// 转发现状：响应字段为死配置，写侧归一为默认值（replacePathRulesTx），
+			// 此处不拒（旧客户端/备份缺省形态直达）。
+		case "static":
+			// 缺省 0=默认 200（写侧归一同口径）；白名单只拦截显式的非常用值。
+			status := pathRule.ResponseStatus
+			if status == 0 {
+				status = 200
+			}
+			if !validStaticResponseStatuses[status] {
+				return fmt.Errorf("第 %d 条路径规则：直接返回的状态码 %d 不在常用集合（200/201/204/400/401/403/404/410/500/502/503）", index+1, pathRule.ResponseStatus)
+			}
+			if len([]rune(pathRule.ResponseBody)) > 64 {
+				return fmt.Errorf("第 %d 条路径规则：响应内容不能超过 64 个字符", index+1)
+			}
+			if pathRule.ResponseContentType != "" && pathRule.ResponseContentType != "text/plain" &&
+				pathRule.ResponseContentType != "application/json" && pathRule.ResponseContentType != "text/html" {
+				return fmt.Errorf("第 %d 条路径规则：响应格式仅支持 text/plain、application/json、text/html", index+1)
+			}
+			if pathRule.RedirectTo != "" {
+				return fmt.Errorf("第 %d 条路径规则：直接返回与跳转目标互斥（请清空跳转地址）", index+1)
+			}
+			if pathRule.Upstreams != nil || pathRule.UpstreamPath != "" {
+				return fmt.Errorf("第 %d 条路径规则：直接返回模式与上游配置互斥（不访问上游）", index+1)
+			}
+		case "redirect":
+			if strings.TrimSpace(pathRule.RedirectTo) == "" {
+				return fmt.Errorf("第 %d 条路径规则：301 跳转需要填写跳转地址", index+1)
+			}
+			for _, r := range pathRule.RedirectTo {
+				if r < 0x20 || r == 0x7f {
+					return fmt.Errorf("第 %d 条路径规则：跳转地址含非法字符", index+1)
+				}
+			}
+			if !strings.HasPrefix(pathRule.RedirectTo, "/") &&
+				!strings.HasPrefix(pathRule.RedirectTo, "http://") && !strings.HasPrefix(pathRule.RedirectTo, "https://") {
+				return fmt.Errorf("第 %d 条路径规则：跳转地址须为 http(s):// 绝对地址或 / 开头路径", index+1)
+			}
+			if pathRule.ResponseBody != "" || pathRule.ResponseContentType != "" {
+				return fmt.Errorf("第 %d 条路径规则：301 跳转与响应内容互斥（请清空内容/格式）", index+1)
+			}
+			if pathRule.Upstreams != nil || pathRule.UpstreamPath != "" {
+				return fmt.Errorf("第 %d 条路径规则：301 跳转模式与上游配置互斥（不访问上游）", index+1)
+			}
+		default:
+			return fmt.Errorf("第 %d 条路径规则：response_mode %q 无效（仅支持空=转发/static=直接返回/redirect=301 跳转）", index+1, pathRule.ResponseMode)
 		}
 		// C-F4: 空数组虽在生成阶段已回退主上游（Round 32 F-3，与 nil 同语义），
 		// 仍禁止写入上游表占位的空 upstreams_json——保存前拒绝保持数据整洁。
@@ -477,6 +509,19 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 		// 同口径;JoinHostPort 兼容 IPv6 裸地址形态)——同 host:port 双条目
 		// 权重翻倍,均衡语义静默漂移。
 		pathHostPortSeen := make(map[string]bool)
+		// LBS-A-L1 同族（第 69 轮 P1）：路径规则自定义上游池同样拒绝 http/https
+		// 混布——同一 reverse_proxy 池级 TLS 传输下 http 上游静默全灭。
+		pathPoolProtos := make(map[string]bool, 2)
+		for _, upstream := range pathRule.Upstreams {
+			proto := upstream.Protocol
+			if proto == "" {
+				proto = "http"
+			}
+			pathPoolProtos[proto] = true
+		}
+		if pathPoolProtos["http"] && pathPoolProtos["https"] {
+			return fmt.Errorf("第 %d 条路径规则的自定义上游 http/https 混布（同一上游池协议须一致）", index+1)
+		}
 		for upstreamIndex, upstream := range pathRule.Upstreams {
 			if strings.TrimSpace(upstream.Address) == "" {
 				return fmt.Errorf("第 %d 条路径规则的第 %d 个上游地址不能为空", index+1, upstreamIndex+1)
@@ -513,50 +558,6 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 	return nil
 }
 
-// validateStaticResponsePathRule 校验「静态响应」路径规则的响应字段
-// （2026-10-09）：状态码须在预置白名单内；重定向必须有合法目标；响应体/内容
-// 类型不得含注入类控制字符；且不得携带上游与上游 path 改写（与代理形态互斥）。
-func validateStaticResponsePathRule(index int, pathRule models.PathRule) error {
-	if !services.IsSupportedRespondStatus(pathRule.StatusCode) {
-		return fmt.Errorf("第 %d 条路径规则的响应码 %d 不在支持范围内", index+1, pathRule.StatusCode)
-	}
-	if pathRule.Upstreams != nil {
-		return fmt.Errorf("第 %d 条路径规则为静态响应，不能配置上游服务器", index+1)
-	}
-	if strings.TrimSpace(pathRule.UpstreamPath) != "" {
-		return fmt.Errorf("第 %d 条路径规则为静态响应，不支持上游路径改写", index+1)
-	}
-	if services.IsRedirectRespondStatus(pathRule.StatusCode) {
-		target := strings.TrimSpace(pathRule.RedirectURL)
-		if target == "" {
-			return fmt.Errorf("第 %d 条路径规则选择了重定向响应码 %d，必须填写重定向目标 URL", index+1, pathRule.StatusCode)
-		}
-		if !isValidRedirectTarget(target) {
-			return fmt.Errorf("第 %d 条路径规则的重定向目标 URL 无效（须以 http://、https:// 或 / 开头，且不含空格与控制字符）", index+1)
-		}
-		return nil
-	}
-	// 非重定向形态：携带重定向目标属误配，明确拒绝而非静默忽略。
-	if strings.TrimSpace(pathRule.RedirectURL) != "" {
-		return fmt.Errorf("第 %d 条路径规则选择了响应码 %d，不应填写重定向目标 URL", index+1, pathRule.StatusCode)
-	}
-	// 响应体放行常规空白（HTML/JSON 多行排版需要），拒绝其余控制字符。
-	for _, c := range pathRule.ResponseBody {
-		if c < 0x20 && c != '\n' && c != '\r' && c != '\t' {
-			return fmt.Errorf("第 %d 条路径规则的响应内容含非法控制字符", index+1)
-		}
-	}
-	// 内容类型直写响应头：拒绝全部控制字符（含 CR/LF，防头注入）。
-	if contentType := strings.TrimSpace(pathRule.ContentType); contentType != "" {
-		for _, c := range contentType {
-			if c < 0x20 || c == 0x7f {
-				return fmt.Errorf("第 %d 条路径规则的内容类型含非法字符", index+1)
-			}
-		}
-	}
-	return nil
-}
-
 // isValidRedirectTarget 校验重定向目标：站内绝对路径（/ 开头）或绝对 URL
 // （http/https），不含空格与控制字符。
 func isValidRedirectTarget(target string) bool {
@@ -583,13 +584,19 @@ type storedPathRule struct {
 	path         string
 	upstreamPath string
 	upstreams    string // COALESCE(upstreams_json,'')：NULL 与 '' 判定等价，写回时仍按 nil 保持 NULL
-	// 静态响应字段（2026-10-09）：action 读侧 COALESCE 归一并写 'proxy'，避免
-	// 存量空值与新写 'proxy' 之间反复触发无谓 UPDATE（进而抖动静默同步版本）。
-	action       string
-	statusCode   int
-	redirectURL  string
-	responseBody string
-	contentType  string
+	// 直接返回/301 跳转（2026-10-10）：五列全内容列——变更触发原地 UPDATE。
+	responseMode        string
+	responseStatus      int
+	responseBody        string
+	responseContentType string
+	redirectTo          string
+}
+
+// validStaticResponseStatuses 直接返回的常用状态码白名单（2026-10-10 用户裁定）。
+var validStaticResponseStatuses = map[int]bool{
+	200: true, 201: true, 204: true,
+	400: true, 401: true, 403: true, 404: true, 410: true,
+	500: true, 502: true, 503: true,
 }
 
 // replacePathRulesTx 以「保留不变行」的方式收敛给定规则的路径规则集合（第 47 轮
@@ -605,7 +612,7 @@ type storedPathRule struct {
 // 调用方（MCP/导出导入/集群 apply）退化为按身份键配对。
 func replacePathRulesTx(ctx context.Context, tx *sql.Tx, ruleID string, pathRules []models.PathRule) error {
 	rows, err := tx.QueryContext(ctx, `SELECT id, sort_order, match_type, path, upstream_path, COALESCE(upstreams_json,''),
-		COALESCE(action,'proxy'), COALESCE(status_code,0), COALESCE(redirect_url,''), COALESCE(response_body,''), COALESCE(content_type,'')
+		response_mode, response_status, response_body, response_content_type, redirect_to
 		FROM path_rules WHERE rule_id = ? ORDER BY sort_order, id`, ruleID)
 	if err != nil {
 		return fmt.Errorf("读取规则 %s 的路径规则: %w", ruleID, err)
@@ -614,7 +621,7 @@ func replacePathRulesTx(ctx context.Context, tx *sql.Tx, ruleID string, pathRule
 	for rows.Next() {
 		var row storedPathRule
 		if err := rows.Scan(&row.id, &row.sortOrder, &row.matchType, &row.path, &row.upstreamPath, &row.upstreams,
-			&row.action, &row.statusCode, &row.redirectURL, &row.responseBody, &row.contentType); err != nil {
+			&row.responseMode, &row.responseStatus, &row.responseBody, &row.responseContentType, &row.redirectTo); err != nil {
 			rows.Close()
 			return fmt.Errorf("解析规则 %s 的路径规则: %w", ruleID, err)
 		}
@@ -648,11 +655,32 @@ func replacePathRulesTx(ctx context.Context, tx *sql.Tx, ruleID string, pathRule
 			path:         pathRule.Path,
 			upstreamPath: pathRule.UpstreamPath,
 			upstreams:    upstreamsJSON,
-			action:       pathRuleActionOrProxy(pathRule.Action),
-			statusCode:   pathRule.StatusCode,
-			redirectURL:  pathRule.RedirectURL,
-			responseBody: pathRule.ResponseBody,
-			contentType:  pathRule.ContentType,
+			// 缺省归一（nil/0 载荷与默认值的同义形态）：模式空=转发；static 缺省
+			// 状态码 200、格式空=text/plain（渲染侧同口径兜底）。
+			responseMode:        pathRule.ResponseMode,
+			responseStatus:      pathRule.ResponseStatus,
+			responseBody:        pathRule.ResponseBody,
+			responseContentType: pathRule.ResponseContentType,
+			redirectTo:          pathRule.RedirectTo,
+		}
+		// 按模式归一死字段（2026-10-10）：转发=五字段全默认；static=清跳转目标，
+		// 缺省状态码 0→200；redirect=清内容/格式（状态码渲染侧恒 301）。保持
+		// 存储值规范形，no-op 编辑不触发原地 UPDATE（零写入语义不破）。
+		switch incoming.responseMode {
+		case "":
+			incoming.responseStatus = 200
+			incoming.responseBody = ""
+			incoming.responseContentType = ""
+			incoming.redirectTo = ""
+		case "static":
+			if incoming.responseStatus == 0 {
+				incoming.responseStatus = 200
+			}
+			incoming.redirectTo = ""
+		case "redirect":
+			incoming.responseStatus = 200
+			incoming.responseBody = ""
+			incoming.responseContentType = ""
 		}
 		// ① 显式 id 命中（前端编辑既有行回传真实 id）
 		if index, ok := indexByID[pathRule.ID]; ok && !consumed[index] {
@@ -690,32 +718,11 @@ func replacePathRulesTx(ctx context.Context, tx *sql.Tx, ruleID string, pathRule
 		if insert.upstreams != "" {
 			upstreamsValue = insert.upstreams
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO path_rules (rule_id,sort_order,match_type,path,upstream_path,upstreams_json,action,status_code,redirect_url,response_body,content_type,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime('now'))`,
-			ruleID, insert.sortOrder, insert.matchType, insert.path, insert.upstreamPath, upstreamsValue,
-			insert.action, insert.statusCode, insert.redirectURL, insert.responseBody, insert.contentType); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO path_rules (rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime('now'))`, ruleID, insert.sortOrder, insert.matchType, insert.path, insert.upstreamPath, upstreamsValue, insert.responseMode, insert.responseStatus, insert.responseBody, insert.responseContentType, insert.redirectTo); err != nil {
 			return fmt.Errorf("写入规则 %s 的路径规则 %s: %w", ruleID, insert.path, err)
 		}
 	}
 	return nil
-}
-
-// pathRuleActionOrProxy 归一路径规则处理方式：空串视同 proxy（存量行兼容），
-// 与 services.normalizedPathRuleAction 同口径（跨包各自持有，避免导出内部辅助）。
-func pathRuleActionOrProxy(action string) string {
-	if strings.TrimSpace(action) == "" {
-		return string(models.PathRuleActionProxy)
-	}
-	return action
-}
-
-// samePathRuleContent 判定存量行与 incoming 内容完全一致（含静态响应字段）——
-// 用于零写入短路（不触发同步触发器）。
-func samePathRuleContent(row, incoming storedPathRule) bool {
-	return row.sortOrder == incoming.sortOrder && row.matchType == incoming.matchType && row.path == incoming.path &&
-		row.upstreamPath == incoming.upstreamPath && row.upstreams == incoming.upstreams &&
-		row.action == incoming.action && row.statusCode == incoming.statusCode &&
-		row.redirectURL == incoming.redirectURL && row.responseBody == incoming.responseBody &&
-		row.contentType == incoming.contentType
 }
 
 // matchStoredPathRule 在未消费的存量行中定位与 incoming 配对的行：exactContent 为
@@ -737,7 +744,11 @@ func matchStoredPathRule(existing []storedPathRule, consumed []bool, incoming st
 		if consumed[index] {
 			continue
 		}
-		if samePathRuleContent(row, incoming) {
+		if row.sortOrder == incoming.sortOrder && row.matchType == incoming.matchType && row.path == incoming.path &&
+			row.upstreamPath == incoming.upstreamPath && row.upstreams == incoming.upstreams &&
+			row.responseMode == incoming.responseMode && row.responseStatus == incoming.responseStatus &&
+			row.responseBody == incoming.responseBody && row.responseContentType == incoming.responseContentType &&
+			row.redirectTo == incoming.redirectTo {
 			return index
 		}
 	}
@@ -746,12 +757,16 @@ func matchStoredPathRule(existing []storedPathRule, consumed []bool, incoming st
 
 // updatePathRuleTx 内容真有变化时才 UPDATE（保留 id/created_at，刷新 updated_at）。
 func updatePathRuleTx(ctx context.Context, tx *sql.Tx, row, incoming storedPathRule, upstreamsValue any) error {
-	if samePathRuleContent(row, incoming) {
+	if row.sortOrder == incoming.sortOrder && row.matchType == incoming.matchType && row.path == incoming.path &&
+		row.upstreamPath == incoming.upstreamPath && row.upstreams == incoming.upstreams &&
+		row.responseMode == incoming.responseMode && row.responseStatus == incoming.responseStatus &&
+		row.responseBody == incoming.responseBody && row.responseContentType == incoming.responseContentType &&
+		row.redirectTo == incoming.redirectTo {
 		return nil
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE path_rules SET sort_order=?, match_type=?, path=?, upstream_path=?, upstreams_json=?, action=?, status_code=?, redirect_url=?, response_body=?, content_type=?, updated_at=datetime('now') WHERE id=?`,
+	if _, err := tx.ExecContext(ctx, `UPDATE path_rules SET sort_order=?, match_type=?, path=?, upstream_path=?, upstreams_json=?, response_mode=?, response_status=?, response_body=?, response_content_type=?, redirect_to=?, updated_at=datetime('now') WHERE id=?`,
 		incoming.sortOrder, incoming.matchType, incoming.path, incoming.upstreamPath, upstreamsValue,
-		incoming.action, incoming.statusCode, incoming.redirectURL, incoming.responseBody, incoming.contentType, row.id); err != nil {
+		incoming.responseMode, incoming.responseStatus, incoming.responseBody, incoming.responseContentType, incoming.redirectTo, row.id); err != nil {
 		return err
 	}
 	return nil
@@ -860,7 +875,7 @@ const lbRuleListColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE
 	COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 	COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), '', '', COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''),
 	COALESCE(tls_http_redirect,0), COALESCE(enable_compress,1), COALESCE(compress_types,'gzip'), IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0),
-	created_by, created_at, updated_at, updated_by, COALESCE(host_header,''),
+	created_by, created_at, updated_at, updated_by, COALESCE(host_header,''), COALESCE(health_check_host,''),
 	COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)`
 
 const lbRuleColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE(description,''), protocol, COALESCE(domain,''), listen_port, COALESCE(strategy,''),
@@ -873,7 +888,7 @@ const lbRuleColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE(des
 	COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 	COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), COALESCE(tls_cert,''), COALESCE(tls_key,''), COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''),
 	COALESCE(tls_http_redirect,0), COALESCE(enable_compress,1), COALESCE(compress_types,'gzip'), IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0),
-	created_by, created_at, updated_at, updated_by, COALESCE(host_header,''),
+	created_by, created_at, updated_at, updated_by, COALESCE(host_header,''), COALESCE(health_check_host,''),
 	COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)`
 
 // 规范化规则行扫描：ListRules/GetRule/DuplicateRule 共用，避免列清单多处漂移
@@ -881,7 +896,7 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 	rules := make([]models.LbRule, 0)
 	for rows.Next() {
 		var r models.LbRule
-		var description, domain, strategy, dnsFamily, tlsSource, tlsCert, tlsKey, tlsCertPath, tlsKeyPath, compressTypes, hostHeader string
+		var description, domain, strategy, dnsFamily, tlsSource, tlsCert, tlsKey, tlsCertPath, tlsKeyPath, compressTypes, hostHeader, healthCheckHost string
 		var dynamicDNS, enableDnsServer, enableActiveHealthCheck, enableTLS, tlsHTTPRedirect, enableCompress bool
 		var acmeConfigID, caProviderID int
 		var createdBy, updatedBy sql.NullInt64
@@ -896,7 +911,7 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 			&r.ProxyDialTimeout, &r.ProxyResponseHeaderTimeout, &r.ProxyReadTimeout, &r.ProxyWriteTimeout, &r.ProxyStreamTimeout, &r.ProxyFlushInterval, &r.ProxyStreamCloseDelay,
 			&enableTLS, &tlsSource, &acmeConfigID, &caProviderID, &tlsCert, &tlsKey, &tlsCertPath, &tlsKeyPath, &tlsHTTPRedirect,
 			&enableCompress, &compressTypes, &r.Enabled, &r.LogEnabled,
-			&createdBy, &createdAt, &updatedAt, &updatedBy, &hostHeader,
+			&createdBy, &createdAt, &updatedAt, &updatedBy, &hostHeader, &healthCheckHost,
 			&r.BlockPageStage1ID, &r.BlockPageStage1Status, &r.BlockPageStage3ID, &r.BlockPageStage3Status); err != nil {
 			return nil, err
 		}
@@ -922,6 +937,7 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 		r.EnableCompress = enableCompress
 		r.CompressTypes = compressTypes
 		r.HostHeader = hostHeader
+		r.HealthCheckHost = healthCheckHost
 		if createdBy.Valid {
 			r.CreatedBy = int(createdBy.Int64)
 		}
@@ -952,7 +968,7 @@ func loadUpstreamsBatch(ctx context.Context, ruleIDs []string) (map[string][]mod
 	}
 	// Round 35: 与渲染侧同口径（IIF(enabled IN ('1',1),1,0)，NULL 视禁用）——
 	// 此前 COALESCE(enabled,1) 将遗留 NULL 行视为启用，UI 显示与生成配置分裂。
-	rows, err := db.DB.QueryContext(ctx, `SELECT id, rule_id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(host_header,'')
+	rows, err := db.DB.QueryContext(ctx, `SELECT id, rule_id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'')
 		FROM upstreams WHERE rule_id IN (`+strings.Join(placeholders, ",")+`) ORDER BY id`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("批量读取上游: %w", err)
@@ -960,7 +976,7 @@ func loadUpstreamsBatch(ctx context.Context, ruleIDs []string) (map[string][]mod
 	defer rows.Close()
 	for rows.Next() {
 		var u models.Upstream
-		if err := rows.Scan(&u.ID, &u.RuleID, &u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.HostHeader); err != nil {
+		if err := rows.Scan(&u.ID, &u.RuleID, &u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain); err != nil {
 			return nil, err
 		}
 		result[u.RuleID] = append(result[u.RuleID], u)
@@ -979,8 +995,7 @@ func loadPathRulesBatch(ctx context.Context, ruleIDs []string) (map[string][]mod
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	rows, err := db.DB.QueryContext(ctx, `SELECT id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,
-		COALESCE(action,'proxy'), COALESCE(status_code,0), COALESCE(redirect_url,''), COALESCE(response_body,''), COALESCE(content_type,'')
+	rows, err := db.DB.QueryContext(ctx, `SELECT id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to
 		FROM path_rules WHERE rule_id IN (`+strings.Join(placeholders, ",")+`) ORDER BY rule_id, sort_order, id`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("批量读取路径规则: %w", err)
@@ -990,7 +1005,7 @@ func loadPathRulesBatch(ctx context.Context, ruleIDs []string) (map[string][]mod
 		var pathRule models.PathRule
 		var upstreamsJSON sql.NullString
 		if err := rows.Scan(&pathRule.ID, &pathRule.RuleID, &pathRule.SortOrder, &pathRule.MatchType, &pathRule.Path, &pathRule.UpstreamPath, &upstreamsJSON,
-			&pathRule.Action, &pathRule.StatusCode, &pathRule.RedirectURL, &pathRule.ResponseBody, &pathRule.ContentType); err != nil {
+			&pathRule.ResponseMode, &pathRule.ResponseStatus, &pathRule.ResponseBody, &pathRule.ResponseContentType, &pathRule.RedirectTo); err != nil {
 			return nil, err
 		}
 		if upstreamsJSON.Valid {
@@ -1260,23 +1275,38 @@ func loadRulesForConfigValidation(ctx context.Context, suffix string, args ...an
 	return rules, nil
 }
 
-func validateRuleConfigGeneration(rule models.LbRule) error {
+// precheckRuleConfig 构造预校验渲染输入（EnableRule/启动聚合校验共用）。
+// LBH-A-P1（第 69 轮）回填本日新特性列：upstreams 携带 OriginDomain、
+// path_rules 携带 response_* 五列、规则级携带 HostHeader/HealthCheckHost/
+// EnableCompress/CompressTypes——此前预检渲染把直返/301 路径规则当转发链
+// 渲染、不发射回源域名 map 处理器，与真实渲染分叉（错误拦截时机后移）。
+// 有意保留的空口子集（勿回填）：TLS 开关与证书材料（GenerateSingleRuleCaddyConfig
+// 单规则形态约定——TLS 跳转分支自述无预检调用方）、健康检查间隔族/代理超时族
+// （无生成期错误路径，形状差异由 applyFromTxNote 事务视图全保真渲染 +
+// CLI validate 兜底）。
+func precheckRuleConfig(rule models.LbRule) services.SingleRuleConfig {
 	upstreams := make([]services.UpstreamConfig, 0, len(rule.Upstreams))
 	for _, upstream := range rule.Upstreams {
 		upstreams = append(upstreams, services.UpstreamConfig{
 			Host: upstream.Host, Port: upstream.Port, Weight: upstream.Weight,
 			Protocol: upstream.Protocol, Enabled: upstream.Enabled, MaxConnections: upstream.MaxConnections,
-			HostHeader: upstream.HostHeader,
+			OriginDomain: upstream.OriginDomain,
 		})
 	}
-	config := services.GenerateSingleRuleCaddyConfig(services.SingleRuleConfig{
+	return services.SingleRuleConfig{
 		CaddyID: rule.CaddyID, Protocol: rule.Protocol, Domain: rule.Domain, ListenPort: rule.ListenPort,
 		Strategy: rule.Strategy, DynamicDNS: rule.DynamicDNS, EnableDnsServer: rule.EnableDnsServer,
 		DnsServer: rule.DnsServer, DnsFamily: rule.DnsFamily, CustomRoutesEnabled: rule.CustomRoutesEnabled,
+		HostHeader: rule.HostHeader, HealthCheckHost: rule.HealthCheckHost,
+		EnableCompress: rule.EnableCompress, CompressTypes: rule.CompressTypes,
 		BlockPageStage1ID: rule.BlockPageStage1ID, BlockPageStage1Status: rule.BlockPageStage1Status,
 		BlockPageStage3ID: rule.BlockPageStage3ID, BlockPageStage3Status: rule.BlockPageStage3Status,
 		PathRules: toPathRuleConfigs(rule.PathRules), Upstreams: upstreams,
-	})
+	}
+}
+
+func validateRuleConfigGeneration(rule models.LbRule) error {
+	config := services.GenerateSingleRuleCaddyConfig(precheckRuleConfig(rule))
 	genErr, hasErr := config["error"].(error)
 	if !hasErr {
 		return nil

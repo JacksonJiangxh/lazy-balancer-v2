@@ -159,17 +159,20 @@ type LbRule struct {
 	PathRules                  []PathRule `json:"path_rules"`
 	Upstreams                  []Upstream `json:"upstreams"`
 	HostHeader                 string     `json:"host_header"`
-	EnableTLS                  bool       `json:"enable_tls"`
-	TLSSource                  string     `json:"tls_source"`
-	ACMEConfigID               int        `json:"acme_config_id"`
-	CAProviderID               int        `json:"ca_provider_id"`
-	TLSCert                    string     `json:"tls_cert,omitempty"`
-	TLSKey                     string     `json:"tls_key,omitempty"`
+	// 健康检查域名（2026-10-10）：主动健康检查 probe 的 Host 头；空=跟随 HostHeader。
+	HealthCheckHost string `json:"health_check_host"`
+	EnableTLS       bool   `json:"enable_tls"`
+	TLSSource       string `json:"tls_source"`
+	ACMEConfigID    int    `json:"acme_config_id"`
+	CAProviderID    int    `json:"ca_provider_id"`
+	TLSCert         string `json:"tls_cert,omitempty"`
+	TLSKey          string `json:"tls_key,omitempty"`
 	// TLSCertPath/TLSKeyPath 引用型证书（tls_source="file"）：/app/certs 内成品
 	// 证书文件的摄取源路径——保存时读取并校验，PEM 内容入库（tls_cert/tls_key，
 	// 与 manual 同列）；数据库是运行时唯一信任源，路径仅供看门狗检测外部更新。
 	TLSCertPath string `json:"tls_cert_path,omitempty"`
 	TLSKeyPath  string `json:"tls_key_path,omitempty"`
+
 	// TLSKeySet 标记「已有隐藏私钥」——GetRule 对只读 Key/非管理员掩码 tls_key
 	// 为空串时置 true，编辑表单借此区分「未配置」与「已隐藏」（F50-7）。
 	TLSKeySet       bool   `json:"tls_key_set,omitempty"`
@@ -294,9 +297,9 @@ type Upstream struct {
 	Enabled        bool   `json:"enabled"`
 	Protocol       string `json:"protocol"`
 	MaxConnections int    `json:"max_connections"`
-	// HostHeader 逐上游回源 Host（2026-10-09）：空=回退规则级 host_header，
-	// 仍空=回退上游自身 host:port（渲染见 services/caddy.go 三级回退）。
-	HostHeader string `json:"host_header"`
+	// 逐上游回源域名（2026-10-10）：非空时驱动该上游回源 Host 头与 HTTPS SNI
+	// （map 处理器晚绑定查表）；空=跟随规则级 HostHeader/现状默认。
+	OriginDomain string `json:"origin_domain,omitempty"`
 }
 
 type PathRuleUpstream struct {
@@ -305,16 +308,6 @@ type PathRuleUpstream struct {
 	Weight   int    `json:"weight"`
 	Protocol string `json:"protocol"`
 }
-
-// PathRuleAction 路径规则的处理方式。
-//   - proxy：反向代理到上游（默认，历史语义）；
-//   - respond：由本程序直接返回静态响应（不触达上游）。
-type PathRuleAction string
-
-const (
-	PathRuleActionProxy   PathRuleAction = "proxy"
-	PathRuleActionRespond PathRuleAction = "respond"
-)
 
 type PathRule struct {
 	ID        int    `json:"id"`
@@ -325,19 +318,16 @@ type PathRule struct {
 	// 上游 path 改写：空串=原样转发（现状语义）；非空前缀匹配剥匹配前缀后前置、
 	// 精确匹配整体替换（query 均保留，形状经 caddy 2.11.4 引擎实证）。
 	UpstreamPath string `json:"upstream_path"`
-	// Action 处理方式：空串与 "proxy" 同义（存量行兼容），"respond" 时
-	// Upstreams/UpstreamPath 不参与渲染，改由 StatusCode 等字段提供静态响应。
-	Action    string             `json:"action"`
-	Upstreams []PathRuleUpstream `json:"upstreams"`
-	// 静态响应（Action="respond"）：StatusCode 为响应码；RedirectURL 供 3xx
-	// 生成 Location 头；ResponseBody 为响应体（3xx/204 不使用）；ContentType
-	// 为空时按响应码兜底（text/html; charset=utf-8）。
-	StatusCode   int          `json:"status_code"`
-	RedirectURL  string       `json:"redirect_url"`
-	ResponseBody string       `json:"response_body"`
-	ContentType  string       `json:"content_type"`
-	CreatedAt    time.Time    `json:"-"`
-	UpdatedAt    sql.NullTime `json:"-"`
+	// 直接返回/301 跳转（2026-10-10 用户裁定）：ResponseMode ''=转发上游（现状）
+	// /static=静态响应（Status+Body+ContentType）/redirect=301 跳转（RedirectTo）。
+	ResponseMode        string             `json:"response_mode"`
+	ResponseStatus      int                `json:"response_status"`
+	ResponseBody        string             `json:"response_body"`
+	ResponseContentType string             `json:"response_content_type"`
+	RedirectTo          string             `json:"redirect_to"`
+	Upstreams           []PathRuleUpstream `json:"upstreams"`
+	CreatedAt           time.Time          `json:"-"`
+	UpdatedAt           sql.NullTime       `json:"-"`
 }
 
 // CertificateConfig represents free certificate configuration (ACME + DNS provider)
@@ -492,17 +482,20 @@ type CreateRuleRequest struct {
 	ProxyStreamCloseDelay      int        `json:"proxy_stream_close_delay"`
 	PathRules                  []PathRule `json:"path_rules"`
 	HostHeader                 string     `json:"host_header"`
-	Upstreams                  []Upstream `json:"upstreams" binding:"required"`
-	EnableTLS                  bool       `json:"enable_tls"`
-	TLSSource                  string     `json:"tls_source"`
-	ACMEConfigID               int        `json:"acme_config_id"`
-	CAProviderID               int        `json:"ca_provider_id"`
-	TLSCert                    string     `json:"tls_cert"`
-	TLSKey                     string     `json:"tls_key"`
+	// 健康检查域名：空=跟随 HostHeader（省略与空串同义，创建语义）。
+	HealthCheckHost string     `json:"health_check_host"`
+	Upstreams       []Upstream `json:"upstreams" binding:"required"`
+	EnableTLS       bool       `json:"enable_tls"`
+	TLSSource       string     `json:"tls_source"`
+	ACMEConfigID    int        `json:"acme_config_id"`
+	CAProviderID    int        `json:"ca_provider_id"`
+	TLSCert         string     `json:"tls_cert"`
+	TLSKey          string     `json:"tls_key"`
 	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件的摄取源路径
 	// （内容保存时入库到 tls_cert/tls_key，路径仅供看门狗检测外部更新）。
-	TLSCertPath     string `json:"tls_cert_path"`
-	TLSKeyPath      string `json:"tls_key_path"`
+	TLSCertPath string `json:"tls_cert_path"`
+	TLSKeyPath  string `json:"tls_key_path"`
+
 	TLSHTTPRedirect bool   `json:"tls_http_redirect"`
 	EnableCompress  bool   `json:"enable_compress"`
 	CompressTypes   string `json:"compress_types"`
@@ -564,17 +557,20 @@ type UpdateRuleRequest struct {
 	ProxyStreamCloseDelay      *int        `json:"proxy_stream_close_delay"`
 	PathRules                  *[]PathRule `json:"path_rules"`
 	HostHeader                 *string     `json:"host_header"`
-	Upstreams                  []Upstream  `json:"upstreams"`
-	EnableTLS                  *bool       `json:"enable_tls"`
-	TLSSource                  string      `json:"tls_source"`
-	ACMEConfigID               int         `json:"acme_config_id"`
-	CAProviderID               *int        `json:"ca_provider_id"`
-	TLSCert                    string      `json:"tls_cert"`
-	TLSKey                     string      `json:"tls_key"`
+	// 健康检查域名：指针化同 HostHeader——省略=保留原值，显式空串=清空。
+	HealthCheckHost *string    `json:"health_check_host"`
+	Upstreams       []Upstream `json:"upstreams"`
+	EnableTLS       *bool      `json:"enable_tls"`
+	TLSSource       string     `json:"tls_source"`
+	ACMEConfigID    int        `json:"acme_config_id"`
+	CAProviderID    *int       `json:"ca_provider_id"`
+	TLSCert         string     `json:"tls_cert"`
+	TLSKey          string     `json:"tls_key"`
 	// 引用型证书（tls_source="file"）：/app/certs 内成品证书文件的摄取源路径
 	// （内容保存时入库到 tls_cert/tls_key，路径仅供看门狗检测外部更新）。
-	TLSCertPath     string `json:"tls_cert_path"`
-	TLSKeyPath      string `json:"tls_key_path"`
+	TLSCertPath string `json:"tls_cert_path"`
+	TLSKeyPath  string `json:"tls_key_path"`
+
 	TLSHTTPRedirect *bool  `json:"tls_http_redirect"`
 	EnableCompress  *bool  `json:"enable_compress"`
 	CompressTypes   string `json:"compress_types"`

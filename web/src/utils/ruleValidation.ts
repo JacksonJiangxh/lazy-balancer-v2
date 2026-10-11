@@ -11,11 +11,25 @@ type PathRuleInput = {
   readonly upstream_path?: string
   readonly sort_order: number
   readonly upstreams: readonly PathUpstreamInput[] | null
-  // 静态响应（2026-10-09，可选以兼容历史调用方）
-  readonly action?: 'proxy' | 'respond'
-  readonly status_code?: number
-  readonly redirect_url?: string
+  // 直接返回/301 跳转（2026-10-10）：''=转发（现状）/static/redirect
+  readonly response_mode?: '' | 'static' | 'redirect' | 'forward'
+  readonly response_status?: number
+  readonly response_body?: string
+  readonly response_content_type?: string
+  readonly redirect_to?: string
 }
+// isValidHostName 与后端 isValidHost（internal/handlers/helpers.go）逐条对齐的
+// 主机名校验（FE-U3，第 69 轮）：标签字符 [A-Za-z0-9_-]、标签首尾须字母或数字、
+// 单标签 ≤63、总长 ≤253。前端方向不放宽到 IP 字面量（SNI 语义不需要）。
+export const isValidHostName = (value: string): boolean => {
+  if (value === '' || value.length > 253) return false
+  return value.split('.').every((part) => {
+    if (part === '' || part.length > 63) return false
+    if (!/^[A-Za-z0-9_-]+$/.test(part)) return false
+    return /^[A-Za-z0-9]/.test(part) && /[A-Za-z0-9]$/.test(part)
+  })
+}
+
 
 const isValidIpv4 = (value: string): boolean => {
   const segments = value.split('.')
@@ -63,6 +77,12 @@ export const canonicalPathKey = (matchType: 'prefix' | 'exact', raw: string): st
   return canonical === '' ? '/' : canonical
 }
 
+
+// 直接返回的常用状态码白名单（与后端 validStaticResponseStatuses 同源）
+const STATIC_RESPONSE_STATUSES: Readonly<Record<number, true>> = {
+  200: true, 201: true, 204: true, 400: true, 401: true,
+  403: true, 404: true, 410: true, 500: true, 502: true, 503: true,
+}
 export const validatePathRules = (rules: readonly PathRuleInput[]): string | null => {
   const seen = new Map<string, number>()
   // C-F3 同后端：prefix 与 exact 在同一路径上并存时，路由按 SortOrder 首条终结
@@ -89,26 +109,31 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
       if (shadowAt !== undefined) return `第 ${rowNumber} 条路径与第 ${shadowAt} 条：同一路径同时存在前缀与精确匹配规则会造成遮蔽，请调整`
       seenExactNorms.set(canonical, rowNumber)
     }
-    // 静态响应形态（与后端 validateStaticResponsePathRule 同口径）：仅校验响应码与
-    // 重定向目标，上游相关校验整体跳过（两形态互斥）。
-    if (rule.action === 'respond') {
-      const statusCode = rule.status_code ?? 0
-      if (!statusCode) return `第 ${rowNumber} 条路径请选择响应码`
-      if (statusCode >= 300 && statusCode < 400) {
-        const target = (rule.redirect_url ?? '').trim()
-        if (!target) return `第 ${rowNumber} 条路径的重定向响应码必须填写目标 URL`
-        if (!target.startsWith('/') && !/^https?:\/\//i.test(target)) {
-          return `第 ${rowNumber} 条路径的重定向目标 URL 须以 http://、https:// 或 / 开头`
-        }
-        if (/\s/.test(target)) return `第 ${rowNumber} 条路径的重定向目标 URL 不能包含空格`
-      }
+    // 直接返回/301 跳转（2026-10-10 用户裁定）：与后端 validateRuleFeatures 同口径
+    // 'forward' 为 UI 选择器哨兵（el-select 空串选项不显示标签），与 '' 同义
+    const responseMode = rule.response_mode === 'forward' ? '' : (rule.response_mode ?? '')
+    if (responseMode === 'static') {
+      const status = rule.response_status || 200
+      if (!STATIC_RESPONSE_STATUSES[status]) return `第 ${rowNumber} 条路径：直接返回的状态码 ${status} 不在常用集合`
+      if ([...rule.response_body ?? ''].length > 64) return `第 ${rowNumber} 条路径：响应内容不能超过 64 个字符`
+      const ct = rule.response_content_type ?? ''
+      if (ct !== '' && ct !== 'text/plain' && ct !== 'application/json' && ct !== 'text/html') return `第 ${rowNumber} 条路径：响应格式仅支持纯文本/JSON/HTML`
+      if (rule.redirect_to) return `第 ${rowNumber} 条路径：直接返回与跳转地址互斥`
+      if (rule.upstreams !== null || rule.upstream_path) return `第 ${rowNumber} 条路径：直接返回模式与上游配置互斥`
       continue
     }
-    // 上游路径 改写：非空须以 / 开头且不含空格 ? #（query/fragment 不允许），与后端校验同口径
-    if (rule.upstream_path) {
-      if (!rule.upstream_path.startsWith('/')) return `第 ${rowNumber} 条路径的上游路径 必须以 / 开头`
-      if (/[\s?#]/.test(rule.upstream_path)) return `第 ${rowNumber} 条路径的上游路径 不能包含空格 ? # 字符`
+    if (responseMode === 'redirect') {
+      const target = rule.redirect_to ?? ''
+      if (!target.trim()) return `第 ${rowNumber} 条路径：301 跳转需要填写跳转地址`
+      // FE-U4（第 69 轮）：形状校验查原串（与后端 rule_features.go 同位）——
+      // 此前 trim 后判定，" http://x" 前端放行、后端按原串 400，口径分叉。
+      // eslint-disable-next-line no-control-regex
+      if (/[\x00-\x1f\x7f]/.test(target)) return `第 ${rowNumber} 条路径：跳转地址含非法字符`
+      if (!target.startsWith('/') && !target.startsWith('http://') && !target.startsWith('https://')) return `第 ${rowNumber} 条路径：跳转地址须为 http(s):// 绝对地址或 / 开头路径`
+      if (rule.upstreams !== null || rule.upstream_path) return `第 ${rowNumber} 条路径：301 跳转模式与上游配置互斥`
+      continue
     }
+    if (responseMode) return `第 ${rowNumber} 条路径：response_mode 无效`
     if (rule.upstreams === null) continue
     if (rule.upstreams.length === 0) return `第 ${rowNumber} 条路径至少需要一个自定义上游`
 

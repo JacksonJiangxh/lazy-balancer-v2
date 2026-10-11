@@ -271,11 +271,53 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
    注意：本地 `caddy_upstream_host_test.go`、`caddy_static_response_test.go`
    断言旧字段名，采纳上游后需**重写**而非保留。
 
-## 六、本次尚未动业务代码的说明
+## 六、决策与执行结果（2026-10-11）
 
-本轮只做「对齐原始报告 + 事实复核 + 文档修正」，**未动任何业务代码**
-（`git status` 干净，HEAD 仍为 `977a3b04`）。因为 C1/C2 选错方向改了也白改，
-还会污染后续 diff。你回复决策后，我再按第五节顺序动手。
+**用户裁定**：`D-1 切上游 origin_domain + map`；`D-2 切上游 response_mode`。
+
+已按第五节四步顺序完成合并（分支 `sync/upstream-v2.3.5`，基线 `614d0178`，
+合入上游 `master` 至 `98c607ac`）：
+
+**圈层 C：同需求两实现 → 采纳上游**
+- C1 逐上游回源域名：删自研 `upstreams.host_header` + `{lb.upstream_host}`
+  占位符 + `caddygeoip/upstream_host.go` + `pathUpstreamHostResolver` /
+  `resolveUpstreamHostPlan` 全链；改吃上游 `upstreams.origin_domain` +
+  原生 `http.handlers.map` 晚绑定。**存量数据先搬后删**：新增
+  `migrateUpstreamHostHeaderToOriginDomain`（`origin_domain` 空而 `host_header`
+  非空时搬值），`host_header` 已从 `legacyUpstreamDeadColumns` 摘出，不会启动即 DROP。
+- C2 静态响应 / 301：删自研 `path_rules.action='respond'` +
+  `status_code/redirect_url/content_type` 渲染链；改吃上游 `response_mode`
+  三值（`''`/`static`/`redirect`）。**存量数据归一迁移**：新增
+  `migratePathRuleActionToResponseMode`（`action='respond'`：3xx → `redirect`
+  且搬 `redirect_url`，其余 → `static` 且归一状态码/内容类型）。
+
+**圈层 A/D：保留我们的自维护能力**
+- 链式回退 `chain_fallback`（`caddychain/` 模块 + `buildChainProxyConfig` +
+  `lb_rules.chain_*` 两列）：融入上游新渲染结构（上游函数内局部类型补
+  `ChainRaceIntervalMS/ChainRequestTimeoutMS`；`lbControlRequestHeaders` 提取为
+  单一变量，reverse_proxy 与 chain_proxy 两侧同源）。
+- 引用型证书 `tls_source='file'`（`tls_cert_path/tls_key_path`）：在上游
+  `newColumns` 补登记（上游未含），渲染/预览/可用性判定与 manual 同流。
+- 默认端口换位（`HTTP_PORT/HTTPS_PORT/PANEL_PORT`）：兜底站、跳转自引用、
+  端口判定全部改走 `DefaultHTTPPort()/DefaultHTTPSPort()`。
+- `docker-compose.yml`：吃上游 `x-common-*` 锚点结构 + 我们的自维护镜像地址
+  与主/从端口换位段。
+- `README.md` / `README.en.md`：以我们的重写为准（本 fork 定位说明）。
+
+**验证**（`sync/upstream-v2.3.5`）：
+- `go build ./...` ✅；`go vet ./...` ✅
+- `go test ./...`：与上游 `master` 基线逐一比对，**无非环境性差异**；
+  唯一失败族为 `TestCRSUpdate*` / `TestUntarGzTo*` / caddygeoip
+  `TestAppendSecurityTiming_concurrentAppend`——在**上游 `master` 原始检出**上
+  同样失败（沙箱网络下载与被清理的临时目录所致），失败集合逐条一致。
+- 前端 `npx vue-tsc --noEmit` ✅；`npm run build` ✅。
+
+**删除的过时资产**（自研实现已被上游方案取代）：
+- `caddygeoip/upstream_host.go` 及其测试
+- `internal/services/caddy_upstream_host_test.go`、`caddy_static_response_test.go`
+- `internal/handlers/rule_static_response_test.go`
+- `internal/models/models.go` 的 `PathRuleAction` 类型、`cluster_apply.go` 的
+  `normalizedPathRuleAction`
 
 ## 七、变更日志
 
@@ -284,3 +326,4 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
 | 2026-10-11 | 建立清单；范围 `v2.3.4 → v2.3.5`；立 D-1 ~ D-6 六个决策点 |
 | 2026-10-11 | 修正 D-1/D-2 误判（`707fe14b`）：前端有列、静态响应对面也已实现 |
 | 2026-10-11 | **对齐原始只读报告复核**：恢复「四圈层」骨架；所有结论附证据（行号/提交号）；实测 22 冲突文件；上游推进至 16 提交 |
+| 2026-10-11 | **执行合并**：用户裁定 D-1 切上游 `origin_domain`+map、D-2 切上游 `response_mode`；四步合并完成（22 冲突文件全部解决）；存量数据双向迁移；链式回退/引用型证书/默认端口换位保留；`go build`/`vet`/`test`（与上游基线零非环境差异）/前端 `vue-tsc`+`build` 全通过 |

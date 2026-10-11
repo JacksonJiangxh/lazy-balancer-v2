@@ -56,7 +56,7 @@
             </div>
           </label>
 
-          <label v-if="!isRespondRule(rule)" class="rule-field upstream-path-field">
+          <label v-if="isForwardMode(rule)" class="rule-field upstream-path-field">
             <span class="rule-field-label">
               上游路径
               <!-- 语义说明合并为单一 tooltip:留空语义 + 前缀/精确改写示例 -->
@@ -80,90 +80,63 @@
           </label>
         </div>
 
-        <!-- 处理方式行：反向代理（默认）/ 静态响应（由本程序直接返回，2026-10-09） -->
-        <div class="path-rule-action-row">
-          <label class="rule-field action-field">
-            <span class="rule-field-label">处理方式</span>
-            <el-select
-              :model-value="rule.action === 'respond' ? 'respond' : 'proxy'"
-              class="action-select"
-              size="small"
-              aria-label="处理方式"
-              @change="onActionChange(rule, $event)"
-            >
-              <el-option label="反向代理" value="proxy" />
-              <el-option label="静态响应" value="respond" />
+        <!-- 响应方式行（2026-10-10 用户裁定）：转发上游（默认）/直接返回/301 跳转 -->
+        <div class="rule-field path-rule-mode-row">
+          <span class="rule-field-label">响应方式</span>
+          <el-select v-model="rule.response_mode" size="small" style="width: 160px;" aria-label="响应方式" @change="onModeChange(rule)">
+            <!-- forward 为 UI 哨兵（el-select 空串选项不显示标签）——提交归一 '' -->
+            <el-option label="转发上游（默认）" value="forward" />
+            <el-option label="直接返回" value="static" />
+            <el-option label="301 跳转" value="redirect" />
+          </el-select>
+          <span class="form-tip-inline" v-if="isForwardMode(rule)">按路径转发到上游</span>
+          <span class="form-tip-inline" v-else-if="rule.response_mode === 'static'">不访问上游，直接返回指定状态码与内容（该路径不经安全链：信任/IP 访问控制/限流/WAF 不生效）</span>
+          <span class="form-tip-inline" v-else>不访问上游，301 永久跳转到目标地址（该路径不经安全链：信任/IP 访问控制/限流/WAF 不生效）</span>
+        </div>
+
+        <!-- 直接返回字段行 -->
+        <div v-if="rule.response_mode === 'static'" class="path-rule-response-row">
+          <label class="rule-field">
+            <span class="rule-field-label">状态码</span>
+            <!-- 标准全称显示（2026-10-10 用户裁定）：值仍为数字状态码 -->
+            <el-select v-model="rule.response_status" size="small" style="width: 210px;" aria-label="状态码">
+              <el-option v-for="code in STATIC_STATUSES" :key="code" :label="`${code} ${STATUS_REASONS[code]}`" :value="code" />
             </el-select>
           </label>
-
-          <label v-if="isRespondRule(rule)" class="rule-field status-field">
-            <span class="rule-field-label">响应码</span>
+          <label class="rule-field">
+            <span class="rule-field-label">格式</span>
+            <el-select v-model="rule.response_content_type" size="small" style="width: 130px;" aria-label="响应格式">
+              <el-option label="纯文本" value="text/plain" />
+              <el-option label="JSON" value="application/json" />
+              <el-option label="HTML" value="text/html" />
+            </el-select>
+          </label>
+          <label class="rule-field" style="flex: 1;">
+            <span class="rule-field-label">内容</span>
             <div class="rule-field-control">
-              <el-select
-                v-model="rule.status_code"
-                class="status-select"
-                size="small"
-                aria-label="响应码"
-                placeholder="选择响应码"
-                @change="onStatusChange(rule)"
-              >
-                <el-option-group v-for="group in respondStatusGroups" :key="group.label" :label="group.label">
-                  <el-option v-for="code in group.codes" :key="code" :label="`${code} ${respondStatusText[code] ?? ''}`" :value="code" />
-                </el-option-group>
-              </el-select>
-              <span v-if="respondError(index)" class="path-field-error">{{ respondError(index) }}</span>
+              <el-input v-model="rule.response_body" size="small" maxlength="64" show-word-limit placeholder="不超过 64 个字符，可留空" :aria-label="`路径规则 ${index + 1} 的响应内容`" />
             </div>
           </label>
         </div>
 
-        <!-- 静态响应编辑区：按响应码动态呈现（重定向填 URL / 带体填内容与类型 / 无体仅提示） -->
-        <div v-if="isRespondRule(rule)" class="respond-editor">
-          <label v-if="isRedirectStatus(rule.status_code)" class="respond-field">
-            <span class="respond-field-label">重定向目标 URL <span class="required-mark">*</span></span>
-            <el-input
-              v-model="rule.redirect_url"
-              size="small"
-              aria-label="重定向目标 URL"
-              placeholder="https://example.com/new 或 /new-path"
-            />
-            <span class="respond-hint">该响应码将自动生成 Location 响应头</span>
+        <!-- 301 跳转字段行 -->
+        <div v-if="rule.response_mode === 'redirect'" class="path-rule-response-row">
+          <label class="rule-field" style="flex: 1;">
+            <span class="rule-field-label">跳转地址</span>
+            <div class="rule-field-control">
+              <el-input v-model="rule.redirect_to" size="small" placeholder="https://example.com/new 或 /new/" :aria-label="`路径规则 ${index + 1} 的跳转地址`" :class="{ 'is-error-input': responseError(index) }" />
+              <span v-if="responseError(index)" class="path-field-error">{{ responseError(index) }}</span>
+            </div>
           </label>
-
-          <div v-else-if="!respondBodyAllowed(rule.status_code)" class="respond-note">
-            <el-text type="info" size="small">{{ rule.status_code }} 按标准不允许携带响应体，仅返回状态码</el-text>
-          </div>
-
-          <template v-else>
-            <label class="respond-field">
-              <span class="respond-field-label">响应内容</span>
-              <el-input
-                v-model="rule.response_body"
-                type="textarea"
-                :rows="4"
-                resize="vertical"
-                aria-label="响应内容"
-                placeholder="返回给客户端的响应体（支持 HTML / JSON / 纯文本）"
-              />
-            </label>
-            <label class="respond-field">
-              <span class="respond-field-label">内容类型</span>
-              <el-input
-                v-model="rule.content_type"
-                size="small"
-                aria-label="内容类型"
-                placeholder="留空默认 text/html; charset=utf-8"
-              />
-            </label>
-          </template>
         </div>
 
-        <div v-if="!isRespondRule(rule)" class="custom-upstream-toggle">
+        <div v-if="isForwardMode(rule)" class="custom-upstream-toggle">
           <span class="custom-upstream-title">使用自定义上游</span>
           <el-switch :model-value="rule.upstreams !== null" @change="toggleCustomUpstreams(rule, $event)" />
           <span class="form-tip-inline">关闭时使用规则的默认上游服务器</span>
         </div>
 
-        <div v-if="!isRespondRule(rule) && rule.upstreams !== null" class="custom-upstream-editor">
+        <div v-if="rule.upstreams !== null" class="custom-upstream-editor">
           <div class="upstream-grid upstream-grid-header" aria-hidden="true">
             <span>协议</span>
             <span>地址</span>
@@ -212,85 +185,6 @@ import { MAX_UPSTREAM_ROWS, normalizeWeights, redistributeWeight } from '@/utils
 import { canonicalPathKey } from '@/utils/ruleValidation'
 
 const pathRules = defineModel<PathRule[]>({ required: true })
-
-// ── 静态响应（2026-10-09）：由本程序直接返回，字段与后端 services/caddy.go 的
-// respondStatusCodes / staticResponseHandler 同源（状态码白名单与必备响应头）。──
-const isRespondRule = (rule: PathRule): boolean => rule.action === 'respond'
-
-// 与后端 respondStatusCodes 同源分组（新增状态码须两端同步）。
-const respondStatusGroups: Array<{ label: string; codes: number[] }> = [
-  { label: '成功', codes: [200, 204] },
-  { label: '重定向', codes: [301, 302, 303, 307, 308] },
-  { label: '客户端错误', codes: [400, 401, 403, 404, 405, 410, 429] },
-  { label: '服务端错误', codes: [500, 502, 503, 504] },
-]
-
-// 标准原因短语（RFC 9110），仅用于下拉展示。
-const respondStatusText: Record<number, string> = {
-  200: 'OK',
-  204: 'No Content',
-  301: 'Moved Permanently',
-  302: 'Found',
-  303: 'See Other',
-  307: 'Temporary Redirect',
-  308: 'Permanent Redirect',
-  400: 'Bad Request',
-  401: 'Unauthorized',
-  403: 'Forbidden',
-  404: 'Not Found',
-  405: 'Method Not Allowed',
-  410: 'Gone',
-  429: 'Too Many Requests',
-  500: 'Internal Server Error',
-  502: 'Bad Gateway',
-  503: 'Service Unavailable',
-  504: 'Gateway Timeout',
-}
-
-const isRedirectStatus = (code: number): boolean => code >= 300 && code < 400
-// 与后端 respondBodyAllowed 同口径：204 与全部 3xx 不允许携带响应体。
-const respondBodyAllowed = (code: number): boolean => code !== 204 && !isRedirectStatus(code)
-
-// 与后端 isValidRedirectTarget 同口径：站内绝对路径或 http(s) 绝对 URL。
-const isValidRedirectTarget = (target: string): boolean =>
-  target.startsWith('/') || /^https?:\/\//i.test(target)
-
-// 静态响应字段即时校验（非阻断提示；后端保存时同口径拒绝）。
-const respondError = (index: number): string => {
-  const rule = pathRules.value[index]
-  if (!rule || !isRespondRule(rule)) return ''
-  if (!rule.status_code) return '请选择响应码'
-  if (isRedirectStatus(rule.status_code)) {
-    const target = (rule.redirect_url || '').trim()
-    if (!target) return '请填写重定向目标 URL'
-    if (!isValidRedirectTarget(target) || /\s/.test(target)) return 'URL 须以 http://、https:// 或 / 开头且不含空格'
-  } else if ((rule.redirect_url || '').trim() !== '') {
-    return '当前响应码不应填写重定向 URL'
-  }
-  return ''
-}
-
-// 切换处理方式：进入静态响应时补默认响应码并清掉上游配置（两种形态互斥）；
-// 上游路径同步清空，避免残留值在后端互斥校验下报错。
-const onActionChange = (rule: PathRule, action: string | number | boolean): void => {
-  const next = action === 'respond' ? 'respond' : 'proxy'
-  rule.action = next
-  if (next === 'respond') {
-    if (!rule.status_code) rule.status_code = 200
-    rule.upstreams = null
-    rule.upstream_path = ''
-  }
-}
-
-// 切换响应码：不适用字段清空（3xx 清响应体、非 3xx 清 URL），保持数据整洁。
-const onStatusChange = (rule: PathRule): void => {
-  if (isRedirectStatus(rule.status_code)) {
-    rule.response_body = ''
-    rule.content_type = ''
-  } else {
-    rule.redirect_url = ''
-  }
-}
 
 const rowError = (index: number): string => {
   const rule = pathRules.value[index]
@@ -343,6 +237,57 @@ const rowShadowWarning = (index: number): string => {
   return `被前序前缀规则 ${priorIndex + 1}（${prior?.path.trim() ?? ''}）遮蔽，不会生效`
 }
 
+// 直接返回/301 跳转（2026-10-10 用户裁定）：常用状态码白名单（与后端
+// validStaticResponseStatuses / ruleValidation.ts 同源）
+const STATIC_STATUSES: readonly number[] = [200, 201, 204, 400, 401, 403, 404, 410, 500, 502, 503]
+
+// STATUS_REASONS 状态码标准全称（下拉显示用；值仍为数字状态码）
+const STATUS_REASONS: Readonly<Record<number, string>> = {
+  200: 'OK', 201: 'Created', 204: 'No Content',
+  400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 410: 'Gone',
+  500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable',
+}
+
+// isForwardMode 转发判定：''（API 形态）与 'forward'（UI 哨兵——el-select 空串
+// 选项不显示标签）同为转发；提交时归一为 ''。
+const isForwardMode = (rule: PathRule): boolean => !rule.response_mode || rule.response_mode === 'forward'
+
+// onModeChange 模式切换归一：非转发模式清空转发专属字段（上游路径/自定义上游），
+// 跳转/静态互清对方字段，静态进场补默认值（后端写侧同口径归一）。
+const onModeChange = (rule: PathRule): void => {
+  if (!isForwardMode(rule)) {
+    rule.upstream_path = ''
+    rule.upstreams = null
+  }
+  if (rule.response_mode === 'static') {
+    rule.redirect_to = ''
+    if (!rule.response_status) rule.response_status = 200
+    if (!rule.response_content_type) rule.response_content_type = 'text/plain'
+  } else if (rule.response_mode === 'redirect') {
+    rule.response_body = ''
+    rule.response_content_type = ''
+  } else {
+    rule.response_status = 200
+    rule.response_body = ''
+    rule.response_content_type = ''
+    rule.redirect_to = ''
+  }
+}
+
+// responseError 行内校验（与后端 validateRuleFeatures / ruleValidation.ts 同口径）
+const responseError = (index: number): string => {
+  const rule = pathRules.value[index]
+  if (!rule) return ''
+  if (rule.response_mode === 'redirect') {
+    const target = (rule.redirect_to ?? '').trim()
+    if (!target) return '301 跳转需要填写跳转地址'
+    // eslint-disable-next-line no-control-regex
+    if (/[\x00-\x1f\x7f]/.test(target)) return '跳转地址含非法字符'
+    if (!target.startsWith('/') && !target.startsWith('http://') && !target.startsWith('https://')) return '跳转地址须为 http(s):// 绝对地址或 / 开头路径'
+  }
+  return ''
+}
+
 const normalizeOrder = (): void => {
   pathRules.value.forEach((rule, index) => { rule.sort_order = index })
 }
@@ -358,18 +303,7 @@ const upstreamError = (index: number): string => {
 }
 
 const addRule = (): void => {
-  pathRules.value.push({
-    match_type: 'prefix',
-    path: '/',
-    upstream_path: '',
-    sort_order: pathRules.value.length,
-    upstreams: null,
-    action: 'proxy',
-    status_code: 0,
-    redirect_url: '',
-    response_body: '',
-    content_type: '',
-  })
+  pathRules.value.push({ match_type: 'prefix', path: '/', upstream_path: '', sort_order: pathRules.value.length, upstreams: null, response_mode: 'forward', response_status: 200, response_body: '', response_content_type: '', redirect_to: '' })
 }
 
 const removeRule = (index: number): void => {
@@ -438,6 +372,9 @@ const onWeightChange = (rule: PathRule, index: number): void => {
 .field-hint-icon { color: var(--el-text-color-placeholder); cursor: help; }
 .path-rule-actions { display: flex; align-items: center; gap: 4px; }
 .path-rule-actions :deep(.el-button + .el-button) { margin-left: 0; }
+/* 响应方式行 + 直接返回/301 跳转字段行（2026-10-10） */
+.path-rule-mode-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.path-rule-response-row { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px; }
 /* 层次二/三：开关行单句说明 + 满宽次级卡片（左右贴齐外层卡片内容缘，双侧同 padding），行距统一 12px */
 .custom-upstream-toggle { display: flex; align-items: center; gap: 8px; min-height: 24px; }
 /* 处理方式行：方式选择与响应码同基线；静态响应时上游相关区块整体隐藏 */

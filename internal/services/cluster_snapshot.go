@@ -748,8 +748,7 @@ func (s *ClusterService) snapshotRules(ctx context.Context, store snapshotStore)
 		COALESCE(strategy,'weighted_round_robin'), COALESCE(dynamic_dns,0), COALESCE(enable_dns_server,0), COALESCE(dns_server,''), COALESCE(dns_family,'ipv4'),
 		COALESCE(health_check_path,''), COALESCE(health_check_interval,10), COALESCE(health_check_timeout,2), COALESCE(health_check_unhealthy_threshold,3), COALESCE(health_check_healthy_threshold,2),
 		COALESCE(enable_active_health_check,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
-		COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(host_header,''),
-		COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
+	COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0), COALESCE(host_header,''), COALESCE(health_check_host,''),
 		COALESCE(custom_routes_enabled,0),
 		COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 		COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), COALESCE(tls_cert,''), COALESCE(tls_key,''),
@@ -778,8 +777,7 @@ func (s *ClusterService) snapshotRules(ctx context.Context, store snapshotStore)
 			&rule.Strategy, &rule.DynamicDNS, &rule.EnableDnsServer, &rule.DnsServer, &rule.DnsFamily,
 			&rule.HealthCheckPath, &rule.HealthCheckInterval, &rule.HealthCheckTimeout, &rule.HealthCheckUnhealthyThreshold, &rule.HealthCheckHealthyThreshold,
 			&rule.EnableActiveHealthCheck, &rule.TCPHealthCheckPort, &rule.TCPProxyProtocol, &rule.TCPTryDuration, &rule.TCPTryInterval,
-			&rule.RequestBodyMaxSizeMB, &rule.UpstreamKeepaliveTimeout, &rule.ServerTokensHidden, &rule.HostHeader,
-			&rule.ChainRaceIntervalMS, &rule.ChainRequestTimeoutMS,
+			&rule.RequestBodyMaxSizeMB, &rule.UpstreamKeepaliveTimeout, &rule.ServerTokensHidden, &rule.ChainRaceIntervalMS, &rule.ChainRequestTimeoutMS, &rule.HostHeader, &rule.HealthCheckHost,
 			&rule.CustomRoutesEnabled,
 			&rule.ProxyDialTimeout, &rule.ProxyResponseHeaderTimeout, &rule.ProxyReadTimeout, &rule.ProxyWriteTimeout, &rule.ProxyStreamTimeout, &rule.ProxyFlushInterval, &rule.ProxyStreamCloseDelay,
 			&rule.EnableTLS, &rule.TLSSource, &rule.ACMEConfigID, &rule.CAProviderID, &rule.TLSCert, &rule.TLSKey,
@@ -788,21 +786,11 @@ func (s *ClusterService) snapshotRules(ctx context.Context, store snapshotStore)
 			&rule.BlockPageStage1ID, &rule.BlockPageStage1Status, &rule.BlockPageStage3ID, &rule.BlockPageStage3Status); err != nil {
 			return nil, fmt.Errorf("扫描快照规则: %w", err)
 		}
-		// CL10-P2-3(第 10 轮审计):导出侧与从端 insertSnapshotRules 同口径
-		// 归一(R59 C-F1 body 钳 [0,4096]/R63 A-N1 tcp+TLS 死形态)——主端
-		// 存储值不变、仅导出值归一。此前主端原样导出 vs 从端归一落库,存量
-		// 越界/死形态行导致 rules 节哈希两侧永不相等,每版本 bump 永久重放
-		// 振荡(LB-04 收敛论证对 COALESCE 缺省成立、对钳制列不成立)。
-		if rule.RequestBodyMaxSizeMB < 0 {
-			rule.RequestBodyMaxSizeMB = 0
-		} else if rule.RequestBodyMaxSizeMB > 4096 {
-			rule.RequestBodyMaxSizeMB = 4096
-		}
-		if rule.Protocol == "tcp" && rule.EnableTLS {
-			rule.EnableTLS = false
-			rule.TLSCert, rule.TLSKey = "", ""
-			rule.TLSCertPath, rule.TLSKeyPath = "", ""
-		}
+		// 传输归一（单一事实源，2026-10-11）：body 钳制 + TCP 死形态 + TCP
+		// 七字段——导出侧与从端 insertSnapshotRules 共用 normalizeRuleForTransport。
+		// 第 69 轮事故：两处平行手写归一块改一侧漏另一侧，主从 canonical 不同形，
+		// 「分区滞后」在 304 稳态下永不自愈（CL10-P2-3 契约由单函数结构性保证）。
+		normalizeRuleForTransport(&rule)
 		rule.Upstreams = upstreamsByRule[rule.CaddyID]
 		if rule.Upstreams == nil {
 			rule.Upstreams = make([]models.Upstream, 0)
@@ -820,7 +808,7 @@ func (s *ClusterService) snapshotRules(ctx context.Context, store snapshotStore)
 }
 
 func (s *ClusterService) snapshotAllUpstreams(ctx context.Context, store snapshotStore) (map[string][]models.Upstream, error) {
-	rows, err := store.QueryContext(ctx, `SELECT id, rule_id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(host_header,'') FROM upstreams ORDER BY rule_id, id`)
+	rows, err := store.QueryContext(ctx, `SELECT id, rule_id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'') FROM upstreams ORDER BY rule_id, id`)
 	if err != nil {
 		return nil, fmt.Errorf("读取快照上游: %w", err)
 	}
@@ -828,7 +816,7 @@ func (s *ClusterService) snapshotAllUpstreams(ctx context.Context, store snapsho
 	byRule := make(map[string][]models.Upstream)
 	for rows.Next() {
 		var upstream models.Upstream
-		if err := rows.Scan(&upstream.ID, &upstream.RuleID, &upstream.Host, &upstream.Port, &upstream.Weight, &upstream.DynamicDNS, &upstream.Enabled, &upstream.Protocol, &upstream.MaxConnections, &upstream.HostHeader); err != nil {
+		if err := rows.Scan(&upstream.ID, &upstream.RuleID, &upstream.Host, &upstream.Port, &upstream.Weight, &upstream.DynamicDNS, &upstream.Enabled, &upstream.Protocol, &upstream.MaxConnections, &upstream.OriginDomain); err != nil {
 			return nil, fmt.Errorf("扫描快照上游: %w", err)
 		}
 		byRule[upstream.RuleID] = append(byRule[upstream.RuleID], upstream)
@@ -837,9 +825,7 @@ func (s *ClusterService) snapshotAllUpstreams(ctx context.Context, store snapsho
 }
 
 func (s *ClusterService) snapshotAllPathRules(ctx context.Context, store snapshotStore) (map[string][]models.PathRule, error) {
-	rows, err := store.QueryContext(ctx, `SELECT id, rule_id, sort_order, match_type, path, upstream_path, upstreams_json,
-		COALESCE(action,'proxy'), COALESCE(status_code,0), COALESCE(redirect_url,''), COALESCE(response_body,''), COALESCE(content_type,''), created_at, updated_at
-		FROM path_rules ORDER BY rule_id, sort_order, id`)
+	rows, err := store.QueryContext(ctx, `SELECT id, rule_id, sort_order, match_type, path, upstream_path, upstreams_json, response_mode, response_status, response_body, response_content_type, redirect_to, created_at, updated_at FROM path_rules ORDER BY rule_id, sort_order, id`)
 	if err != nil {
 		return nil, fmt.Errorf("读取快照路径规则: %w", err)
 	}
@@ -849,7 +835,7 @@ func (s *ClusterService) snapshotAllPathRules(ctx context.Context, store snapsho
 		var pathRule models.PathRule
 		var upstreamsJSON sql.NullString
 		if err := rows.Scan(&pathRule.ID, &pathRule.RuleID, &pathRule.SortOrder, &pathRule.MatchType, &pathRule.Path, &pathRule.UpstreamPath, &upstreamsJSON,
-			&pathRule.Action, &pathRule.StatusCode, &pathRule.RedirectURL, &pathRule.ResponseBody, &pathRule.ContentType, &pathRule.CreatedAt, &pathRule.UpdatedAt); err != nil {
+			&pathRule.ResponseMode, &pathRule.ResponseStatus, &pathRule.ResponseBody, &pathRule.ResponseContentType, &pathRule.RedirectTo, &pathRule.CreatedAt, &pathRule.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("扫描快照路径规则: %w", err)
 		}
 		if upstreamsJSON.Valid {
