@@ -519,6 +519,11 @@ func retireCertJobsForDomain(database *sql.DB, ruleID, canonicalDomain, reversed
 	return err
 }
 
+// validateRuleListenPort 是包级规则端口校验（导入/备份还原链走此路径，无
+// Handlers 实例）。管理口口径为「出厂默认 8000/2019」——真实管理口校验由
+// validateRuleListenPortForSave 叠加（LB-03）。HTTP/HTTPS 保留端口取部署侧
+// 默认口（HTTP_PORT/HTTPS_PORT，出厂 80/443）：改口后 TCP 规则不得再抢
+// 服务端默认 HTTP/HTTPS 口（那是代理面本身的落点）。
 func validateRuleListenPort(protocol string, port int) error {
 	if port < 1 || port > 65535 {
 		return fmt.Errorf("端口必须在 1-65535 之间")
@@ -526,7 +531,7 @@ func validateRuleListenPort(protocol string, port int) error {
 	if port == 8000 || port == 2019 {
 		return fmt.Errorf("端口 %d 为管理端口，不可使用", port)
 	}
-	if protocol == "tcp" && (port == 80 || port == 443) {
+	if protocol == "tcp" && (port == services.DefaultHTTPPort() || port == services.DefaultHTTPSPort()) {
 		return fmt.Errorf("端口 %d 为 HTTP/HTTPS 保留端口", port)
 	}
 	return nil
@@ -571,10 +576,11 @@ func enabledRuleDomainConflict(domain string, listenPort int, excludeCaddyID str
 	return queryRuleDomainConflict(domain, listenPort, excludeCaddyID, " AND enabled = 1")
 }
 
-// queryRedirectShadowConflict 检查 80 端口跳转遮蔽：启用中的 TLS+HTTP 跳转规则会在
-// 80 端口服务器头部生成 terminal 跳转路由（caddy.go redirectRoutes），同域名直接
-// 监听 80 的规则会被遮蔽为死规则。两个方向同判：保存 80 端口规则时查跳转规则占用；
-// 保存/启用 TLS+跳转规则时查 80 端口规则占用。返回冲突规则描述与冲突域名。
+// queryRedirectShadowConflict 检查 HTTP 默认口（HTTP_PORT，出厂 80）的跳转遮蔽：
+// 启用中的 TLS+HTTP 跳转规则会在该口服务器头部生成 terminal 跳转路由
+// （caddy.go redirectRoutes），同域名直接监听该口的规则会被遮蔽为死规则。两个
+// 方向同判：保存该口规则时查跳转规则占用；保存/启用 TLS+跳转规则时查该口规则
+// 占用。返回冲突规则描述与冲突域名。
 func queryRedirectShadowConflict(domain string, listenPort int, enableTLS, tlsHTTPRedirect bool, excludeCaddyID string) (string, string, error) {
 	candidates := normalizedRuleDomains(domain)
 	if len(candidates) == 0 {
@@ -586,20 +592,21 @@ func queryRedirectShadowConflict(domain string, listenPort int, enableTLS, tlsHT
 	}
 	var rows *sql.Rows
 	var err error
+	defaultHTTPPort := services.DefaultHTTPPort()
 	switch {
-	case listenPort == 80:
+	case listenPort == defaultHTTPPort:
 		// Round 29 G-4: 排除对方 80 端口自环跳转规则（listen_port=80 + TLS + 跳转本身
 		// 生成自环 Location、属非法存量，不应作为占用方拦截新建 80 规则）。
 		// SLB16-N1(第 16 轮审计):镜像 2026-09 复审裁定 2(跳转分支同款 EXISTS)
 		// ——全部上游被禁用的规则不产生 host 路由与跳转(caddy.go R43 F-A),
 		// 不作为占用方;此前裁定只落了单侧,该形态下 80 规则被纯误拦 400。
-		rows, err = db.DB.Query(`SELECT caddy_id, name, COALESCE(domain,'') FROM lb_rules WHERE protocol='http' AND enabled=1 AND enable_tls=1 AND tls_http_redirect=1 AND listen_port != 80 AND caddy_id != ? AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=lb_rules.caddy_id AND u.enabled=1)`, excludeCaddyID)
+		rows, err = db.DB.Query(`SELECT caddy_id, name, COALESCE(domain,'') FROM lb_rules WHERE protocol='http' AND enabled=1 AND enable_tls=1 AND tls_http_redirect=1 AND listen_port != ? AND caddy_id != ? AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=lb_rules.caddy_id AND u.enabled=1)`, defaultHTTPPort, excludeCaddyID)
 	case enableTLS && tlsHTTPRedirect:
 		// 2026-09 复审裁定 2：与渲染面同口径——全部上游被禁用的 80 规则不产生
 		// host 路由、不会遮蔽跳转，不再作为占用方（报错与真实渲染行为一致）。
 		rows, err = db.DB.Query(`SELECT r.caddy_id, r.name, COALESCE(r.domain,'') FROM lb_rules r
-			WHERE r.protocol='http' AND r.enabled=1 AND r.listen_port=80 AND r.caddy_id != ?
-			AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=r.caddy_id AND u.enabled=1)`, excludeCaddyID)
+			WHERE r.protocol='http' AND r.enabled=1 AND r.listen_port = ? AND r.caddy_id != ?
+			AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=r.caddy_id AND u.enabled=1)`, defaultHTTPPort, excludeCaddyID)
 	default:
 		return "", "", nil
 	}
@@ -729,9 +736,15 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "协议不能为空"})
 		return
 	}
-	// When TLS is enabled for HTTP, default the listen port to 443 unless the user explicitly set another port.
-	if req.Protocol == "http" && req.EnableTLS && req.ListenPort == 0 {
-		req.ListenPort = 443
+	// HTTP 规则的端口兜底（端口为 0=未指定）：TLS 开 → HTTPS 默认口（出厂 443），
+	// 否则 → HTTP 默认口（出厂 80）。部署侧改 HTTP_PORT/HTTPS_PORT 后向导与 API
+	// 的缺省落点随动（ISSUE #7）；显式传了端口则原样使用，不做任何改写。
+	if req.Protocol == "http" && req.ListenPort == 0 {
+		if req.EnableTLS {
+			req.ListenPort = services.DefaultHTTPSPort()
+		} else {
+			req.ListenPort = services.DefaultHTTPPort()
+		}
 	}
 
 	if req.ListenPort <= 0 {
@@ -795,10 +808,10 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			return
 		}
 		if shadowRule != "" {
-			if req.ListenPort == 80 {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被规则 %s 的 HTTPS 跳转占用（跳转在 80 端口优先生效，保存后本规则将不可达）", shadowDomain, shadowRule)})
+			if req.ListenPort == services.DefaultHTTPPort() {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被规则 %s 的 HTTPS 跳转占用（跳转在 %d 端口优先生效，保存后本规则将不可达）", shadowDomain, shadowRule, services.DefaultHTTPPort())})
 			} else {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已有规则 %s 直接监听 80 端口，开启 HTTP 转 HTTPS 跳转会使其不可达，请先调整该规则", shadowDomain, shadowRule)})
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已有规则 %s 直接监听 %d 端口，开启 HTTP 转 HTTPS 跳转会使其不可达，请先调整该规则", shadowDomain, shadowRule, services.DefaultHTTPPort())})
 			}
 			return
 		}
@@ -1144,7 +1157,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// When TLS is enabled on HTTP, default the port to 443 if the user didn't explicitly set one.
 	// For updates the port is fixed, so we only apply the default when an explicit port was not supplied.
 	if req.Protocol == "http" && req.EnableTLS != nil && *req.EnableTLS && req.ListenPort == 0 {
-		req.ListenPort = 443
+		req.ListenPort = services.DefaultHTTPSPort()
 	}
 
 	// Fill in missing fields from database so validation and the update use complete data.
@@ -1496,10 +1509,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				return
 			}
 			if shadowRule != "" {
-				if req.ListenPort == 80 {
-					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被规则 %s 的 HTTPS 跳转占用（跳转在 80 端口优先生效，保存后本规则将不可达）", shadowDomain, shadowRule)})
+				if req.ListenPort == services.DefaultHTTPPort() {
+					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被规则 %s 的 HTTPS 跳转占用（跳转在 %d 端口优先生效，保存后本规则将不可达）", shadowDomain, shadowRule, services.DefaultHTTPPort())})
 				} else {
-					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已有规则 %s 直接监听 80 端口，开启 HTTP 转 HTTPS 跳转会使其不可达，请先调整该规则", shadowDomain, shadowRule)})
+					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已有规则 %s 直接监听 %d 端口，开启 HTTP 转 HTTPS 跳转会使其不可达，请先调整该规则", shadowDomain, shadowRule, services.DefaultHTTPPort())})
 				}
 				return
 			}
@@ -2969,10 +2982,10 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 			return
 		}
 		if shadowRule != "" {
-			if rulePort == 80 {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被规则 %s 的 HTTPS 跳转占用（跳转在 80 端口优先生效，启用后本规则将不可达），无法启用", shadowDomain, shadowRule)})
+			if rulePort == services.DefaultHTTPPort() {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已被规则 %s 的 HTTPS 跳转占用（跳转在 %d 端口优先生效，启用后本规则将不可达），无法启用", shadowDomain, shadowRule, services.DefaultHTTPPort())})
 			} else {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已有规则 %s 直接监听 80 端口，启用 HTTP 转 HTTPS 跳转会使其不可达，请先调整该规则", shadowDomain, shadowRule)})
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("域名 %s 已有规则 %s 直接监听 %d 端口，启用 HTTP 转 HTTPS 跳转会使其不可达，请先调整该规则", shadowDomain, shadowRule, services.DefaultHTTPPort())})
 			}
 			return
 		}

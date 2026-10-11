@@ -167,6 +167,8 @@ COPY --from=backend /app/config /app/config
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# EXPOSE 仅为文档性声明（host 网络下不参与实际绑定）。默认口可经
+# HTTP_PORT/HTTPS_PORT/PANEL_PORT 换位，见 docs/deployment.zh-CN.md。
 EXPOSE 80 443 8000
 
 ENTRYPOINT ["docker-entrypoint.sh"]

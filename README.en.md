@@ -31,6 +31,8 @@ Mounts: `/app/data` database and config (required), `/app/certs` certificates an
 
 Open `http://localhost:8000` for the admin panel. First visit opens an initialization wizard; no default credentials.
 
+> If ports 80/443/8000 are taken, remap them with `HTTP_PORT` / `HTTPS_PORT` / `PANEL_PORT` (with host networking these are the actual listen ports). See the [deployment guide](docs/deployment.zh-CN.md). Existing rules keep their stored `listen_port` — update and save them manually.
+
 <details>
 <summary>Docker Compose / Build from Source</summary>
 

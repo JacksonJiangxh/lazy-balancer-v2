@@ -351,10 +351,12 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			}
 		}
 	}
-	// C-F2: 80 端口 + TLS 跳转自环：跳转目标 https://host:80 与来源同为 80 端口，
-	// 请求会被跳回自身监听器形成循环，必须在保存前拒绝。
-	if input.Protocol == "http" && input.ListenPort == 80 && input.EnableTLS && input.TLSHTTPRedirect {
-		return fmt.Errorf("80 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 443 端口或关闭跳转")
+	// C-F2: HTTP 默认口 + TLS 跳转自环：跳转目标 https://host:HTTP_PORT 与来源
+	// 同为该口，请求会被跳回自身监听器形成循环，必须在保存前拒绝（HTTP_PORT 在
+	// 部署侧可变，目标口随之判定）。
+	if input.Protocol == "http" && input.ListenPort == services.DefaultHTTPPort() && input.EnableTLS && input.TLSHTTPRedirect {
+		return fmt.Errorf("%d 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 %d 端口或关闭跳转",
+			services.DefaultHTTPPort(), services.DefaultHTTPSPort())
 	}
 	if input.Protocol == "tcp" {
 		// N+12 G8-S1：L4 代理无 HTTP Host 头可驱动动态 DNS 解析（Caddy layer4 直拨
@@ -1107,9 +1109,10 @@ func validateStoredRuleConfig(ctx context.Context, caddyID string) error {
 		return fmt.Errorf("规则不存在")
 	}
 	rule := rules[0]
-	// C-F2: 与 validateRuleFeatures 同口径，兜住历史存量/导入的 80 端口 + TLS 跳转自环规则。
-	if rule.Protocol == "http" && rule.ListenPort == 80 && rule.EnableTLS && rule.TLSHTTPRedirect {
-		return &configValidationError{message: "80 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 443 端口或关闭跳转"}
+	// C-F2: 与 validateRuleFeatures 同口径，兜住历史存量/导入的 HTTP 默认口 + TLS 跳转自环规则。
+	if rule.Protocol == "http" && rule.ListenPort == services.DefaultHTTPPort() && rule.EnableTLS && rule.TLSHTTPRedirect {
+		return &configValidationError{message: fmt.Sprintf("%d 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 %d 端口或关闭跳转",
+			services.DefaultHTTPPort(), services.DefaultHTTPSPort())}
 	}
 	if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource != "manual" && rule.TLSSource != "acme_dns" && rule.TLSSource != "file" {
 		return &configValidationError{message: "启用 TLS 时必须选择证书来源（manual、acme_dns 或 file）"}
@@ -1156,10 +1159,11 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 	}
 	problems := make([]error, 0)
 	for _, rule := range rules {
-		// 存量规则可能建于校验上线前：80 端口 + TLS 跳转生成自环 Location，
+		// 存量规则可能建于校验上线前：HTTP 默认口 + TLS 跳转生成自环 Location，
 		// 启动再生配置前按保存路径同口径拦截并指出具体规则。
-		if rule.Protocol == "http" && rule.ListenPort == 80 && rule.EnableTLS && rule.TLSHTTPRedirect {
-			problems = append(problems, &configValidationError{message: fmt.Sprintf("规则 %s（%s）80 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 443 端口或关闭跳转", rule.Name, rule.CaddyID)})
+		if rule.Protocol == "http" && rule.ListenPort == services.DefaultHTTPPort() && rule.EnableTLS && rule.TLSHTTPRedirect {
+			problems = append(problems, &configValidationError{message: fmt.Sprintf("规则 %s（%s）%d 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 %d 端口或关闭跳转",
+				rule.Name, rule.CaddyID, services.DefaultHTTPPort(), services.DefaultHTTPSPort())})
 			continue
 		}
 		// R55 C-3：与 validateStoredRuleConfig 同口径的 tls_source 白名单——

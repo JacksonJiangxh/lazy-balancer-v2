@@ -953,10 +953,12 @@ func ruleMetricHosts(target ruleMetricTarget) map[string]struct{} {
 			continue
 		}
 		hosts[net.JoinHostPort(domain, strconv.Itoa(target.listenPort))] = struct{}{}
+		// TLS 规则的指标 host 另按 HTTPS 默认口（HTTPS_PORT，出厂 443）匹配；无 TLS 且
+		// 端口未显式指定（0）或正是 HTTP 默认口时按 HTTP 默认口匹配（ISSUE #7）。
 		if target.enableTLS {
-			hosts[net.JoinHostPort(domain, "443")] = struct{}{}
-		} else if target.listenPort == 80 || target.listenPort == 0 {
-			hosts[net.JoinHostPort(domain, "80")] = struct{}{}
+			hosts[net.JoinHostPort(domain, strconv.Itoa(services.DefaultHTTPSPort()))] = struct{}{}
+		} else if target.listenPort == services.DefaultHTTPPort() || target.listenPort == 0 {
+			hosts[net.JoinHostPort(domain, strconv.Itoa(services.DefaultHTTPPort()))] = struct{}{}
 		}
 	}
 	return hosts

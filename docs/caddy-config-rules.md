@@ -19,8 +19,10 @@
 ### 端口范围限制
 - 端口必须在 1-65535 范围内
 - 8000、2019 端口保留给 admin 接口；创建/更新规则还会按部署实际配置拦截
-  管理面板监听口（config 文件 `port`，admin TLS 与面板同口）与 Caddy admin
-  端口（`caddy_admin_url` 解析），自定义部署不再只依赖硬编码默认值
+  管理面板监听口（`PANEL_PORT` env 或 config 文件 `port`，admin TLS 与面板同口）
+  与 Caddy admin 端口（`caddy_admin_url` 解析），自定义部署不再只依赖硬编码默认值
+- `HTTP_PORT` / `HTTPS_PORT`（出厂 80/443）是 HTTP/HTTPS 保留端口：TCP 规则不得
+  抢占；HTTP 默认口还承担「TLS 跳转自环」与「跳转遮蔽」判定（改口后判定基准随动）
 
 ### 协议冲突检测
 - **HTTP/HTTPS 规则**：可以与其他 HTTP/HTTPS 规则共用端口（同协议）

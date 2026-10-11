@@ -31,6 +31,8 @@ docker run -d --name lazy-balancer --network host \
 
 打开 `http://localhost:8000` 进入管理面板。首次访问进入初始化向导，无默认凭据。
 
+> 宿主机 80/443/8000 被占用时，用 `HTTP_PORT` / `HTTPS_PORT` / `PANEL_PORT` 换位（host 网络下即换监听口）。详见[部署指南](docs/deployment.zh-CN.md#端口换位804438000-被占用时)。存量规则端口不会被自动改写，需手动逐条修改后保存。
+
 <details>
 <summary>Docker Compose / 构建源码</summary>
 

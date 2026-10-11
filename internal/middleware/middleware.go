@@ -605,6 +605,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 
 				// System
 				business.GET("/system/info", h.GetSystemInfo)
+				business.GET("/system/ports", h.GetProxyPorts)
 				business.GET("/admin-tls", h.GetAdminTLS)
 				business.POST("/admin-tls/inspect", h.InspectAdminTLSCert)
 				business.GET("/system/metrics", h.GetSystemMetrics)
