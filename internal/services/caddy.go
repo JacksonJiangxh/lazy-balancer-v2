@@ -1839,11 +1839,11 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 				shadowedBy := ""
 				for _, other := range allRules {
 					otherRule := other.rule
-					if otherRule.CaddyID == r.CaddyID || otherRule.Protocol != "http" || otherRule.ListenPort != 80 {
+					if otherRule.CaddyID == r.CaddyID || otherRule.Protocol != "http" || otherRule.ListenPort != DefaultHTTPPort() {
 						continue
 					}
 					// M1（审计）：遮蔽复核的比对方也过启用上游门——零启用上游的
-					// 规则不生成 80 端口路由（死规则），不得作为遮蔽方压制兄弟
+					// 规则不生成 HTTP 默认口路由（死规则），不得作为遮蔽方压制兄弟
 					// 域名的 HTTPS 跳转。
 					if !hasEnabledUpstream(other.upstreams) {
 						continue
@@ -1865,10 +1865,10 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 						}
 					}
 					if len(filtered) == 0 {
-						Logf("warn", "跳转规则 %s（%s）的域名 %s 已有启用规则直接监听 80 端口，该规则所有域名的 HTTPS 跳转均被遮蔽，整条跳转不生成（避免遮蔽 80 端口规则）", r.Name, r.CaddyID, shadowedBy)
+						Logf("warn", "跳转规则 %s（%s）的域名 %s 已有启用规则直接监听 %d 端口，该规则所有域名的 HTTPS 跳转均被遮蔽，整条跳转不生成（避免遮蔽 %d 端口规则）", r.Name, r.CaddyID, shadowedBy, DefaultHTTPPort(), DefaultHTTPPort())
 						continue
 					}
-					Logf("warn", "跳转规则 %s（%s）的域名 %s 已有启用规则直接监听 80 端口，已从跳转中移除（其余域名仍生成跳转）", r.Name, r.CaddyID, shadowedBy)
+					Logf("warn", "跳转规则 %s（%s）的域名 %s 已有启用规则直接监听 %d 端口，已从跳转中移除（其余域名仍生成跳转）", r.Name, r.CaddyID, shadowedBy, DefaultHTTPPort())
 					domainHosts = filtered
 				}
 				redirectRoutes = append(redirectRoutes, map[string]interface{}{

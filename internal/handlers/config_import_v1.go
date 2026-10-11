@@ -145,13 +145,14 @@ func validateRuleConflictMatrix(candidates []ruleConflictCandidate) []disabledRu
 					}
 				}
 			case left.protocol == "http" && right.protocol == "http" && left.listenPort != right.listenPort:
-				// Round 29 G-1: 跨端口跳转遮蔽方向——TLS+跳转规则在 80 端口服务器头部
-				// 生成 terminal 301（caddy.go redirectRoutes），同域名直接监听 80 的规则
-				// 会被静默遮蔽为死规则。仅双方均启用时判定，按矩阵惯例冲突双方置禁用。
+				// Round 29 G-1: 跨端口跳转遮蔽方向——TLS+跳转规则在 HTTP 默认口（HTTP_PORT，
+				// 出厂 80）服务器头部生成 terminal 301（caddy.go redirectRoutes），同域名
+				// 直接监听该口的规则会被静默遮蔽为死规则。仅双方均启用时判定，按矩阵惯例
+				// 冲突双方置禁用。判定基准随部署侧默认口（ISSUE #7）。
 				if left.enabled && right.enabled {
-					if left.listenPort == 80 && right.enableTLS && right.tlsHTTPRedirect {
+					if left.listenPort == services.DefaultHTTPPort() && right.enableTLS && right.tlsHTTPRedirect {
 						reason = httpRedirectShadowReason(left.domain, right.domain)
-					} else if right.listenPort == 80 && left.enableTLS && left.tlsHTTPRedirect {
+					} else if right.listenPort == services.DefaultHTTPPort() && left.enableTLS && left.tlsHTTPRedirect {
 						reason = httpRedirectShadowReason(right.domain, left.domain)
 					}
 				}

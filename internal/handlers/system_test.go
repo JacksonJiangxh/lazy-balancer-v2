@@ -131,3 +131,34 @@ func TestGetProxyPorts_fallsBackToFactoryDefaults(t *testing.T) {
 		t.Fatalf("unexpected fallback ports: %+v", envelope.Data)
 	}
 }
+
+// ruleMetricHosts 的 TLS/默认口 host 匹配跟随部署侧默认口（ISSUE #7）：
+// 改 HTTPS_PORT 后按新口匹配 —— 否则换口部署的 TLS 规则指标恒查不到（空指标）。
+func TestRuleMetricHosts_followsDeploymentDefaultPorts(t *testing.T) {
+	services.SetDefaultProxyPorts(80, 443)
+	t.Cleanup(func() { services.SetDefaultProxyPorts(80, 443) })
+
+	// Given: 换口部署
+	services.SetDefaultProxyPorts(8080, 8443)
+
+	// When: 无 TLS 且端口未显式指定（0）→ 按 HTTP 默认口匹配
+	plain := ruleMetricHosts(ruleMetricTarget{domain: "a.test", listenPort: 0})
+	// 显式等于 HTTP 默认口
+	onDefault := ruleMetricHosts(ruleMetricTarget{domain: "b.test", listenPort: 8080})
+	// TLS 规则 → 另按 HTTPS 默认口匹配
+	secure := ruleMetricHosts(ruleMetricTarget{domain: "c.test", listenPort: 8443, enableTLS: true})
+
+	// Then
+	if _, ok := plain["a.test:8080"]; !ok {
+		t.Fatalf("listenPort=0 应按 HTTP 默认口 8080 匹配, got %v", plain)
+	}
+	if _, ok := onDefault["b.test:8080"]; !ok {
+		t.Fatalf("listenPort=8080（=HTTP 默认口）应额外匹配 8080, got %v", onDefault)
+	}
+	if _, ok := secure["c.test:8443"]; !ok {
+		t.Fatalf("TLS 规则应按 HTTPS 默认口 8443 匹配, got %v", secure)
+	}
+	if _, leaked := secure["c.test:443"]; leaked {
+		t.Fatalf("HTTPS_PORT 已改 8443，不应再匹配旧口 443, got %v", secure)
+	}
+}
