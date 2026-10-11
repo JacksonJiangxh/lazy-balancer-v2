@@ -326,4 +326,5 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
 | 2026-10-11 | 建立清单；范围 `v2.3.4 → v2.3.5`；立 D-1 ~ D-6 六个决策点 |
 | 2026-10-11 | 修正 D-1/D-2 误判（`707fe14b`）：前端有列、静态响应对面也已实现 |
 | 2026-10-11 | **对齐原始只读报告复核**：恢复「四圈层」骨架；所有结论附证据（行号/提交号）；实测 22 冲突文件；上游推进至 16 提交 |
+| 2026-10-11 | 版本号对齐：`Dockerfile`/`docker-compose.yml`/`internal/config` 默认版本、`.cnb/web_trigger.yml` 按钮默认值、`.cnb.yml` `BASELINE_TAG`、README 构建示例统一为 `v2.3.5`（此前 `web_trigger`/`BASELINE_TAG`/README 仍停在 `v2.3.4`）|
 | 2026-10-11 | **执行合并**：用户裁定 D-1 切上游 `origin_domain`+map、D-2 切上游 `response_mode`；四步合并完成（22 冲突文件全部解决）；存量数据双向迁移；链式回退/引用型证书/默认端口换位保留；`go build`/`vet`/`test`（与上游基线零非环境差异）/前端 `vue-tsc`+`build` 全通过 |
