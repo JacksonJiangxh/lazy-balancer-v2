@@ -22,17 +22,16 @@ re-synced":
 |---|---|---|
 | Purpose | Official releases | Production use + customizations |
 | Versioning | Official tags | Tracks upstream tags; our changes ship anytime |
-| Branches | `master` | `main` (mainline), `master` (upstream mirror track, GitHub only) |
-| Image | Docker Hub `v55448330/...` | CNB registry `docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest` |
+| Branches | `master` | `master-dev` (mainline), `master` (upstream mirror track) |
+| Image | Docker Hub `v55448330/...` | `docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest` |
 | Feedback | Upstream issues | Issues in this repo |
 
 ### Branches
 
 | Branch | Where | Purpose |
 |---|---|---|
-| `main` | CNB + GitHub | **Mainline.** Upstream baseline plus all our changes |
-| `master` | GitHub only | **Upstream mirror track.** Auto-synced to an upstream release by GitHub Actions, byte-for-byte identical to that tag. **No development here.** |
-| `master-dev` | GitHub only | GitHub's default branch, kept in sync with our `main` |
+| `master-dev` | Default branch of this repo | **Mainline.** Upstream baseline plus all our changes |
+| `master` | This repo | **Upstream mirror track.** Auto-synced to an upstream release by GitHub Actions, byte-for-byte identical to that tag. **No development here.** |
 
 > Why keep a clean `master`: "how far behind upstream are we" then has exactly
 > one reference point, never polluted by our own changes. The scheduled watch
@@ -82,13 +81,9 @@ docker buildx build --platform linux/amd64,linux/arm64 \
   -t docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest --push .
 ```
 
-CI runs on the CNB pipeline: click the "Build & Push Image" button on the main
-branch page to trigger a native amd64/arm64 dual-arch build → real container
-smoke test → push to the CNB registry
-`docker.cnb.cool/xzydm/lazy-balancer-v2` (both `latest` and a versioned
-manifest), then mirror the `latest` multi-arch image into
-`docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2`. Config lives in `.cnb.yml`
-and `.cnb/web_trigger.yml`.
+Images are built by an internal pipeline and published as
+`docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2`: multi-arch build, real-container
+smoke test, then both a `latest` and a versioned manifest.
 
 > The official Docker Hub `v55448330/lazy-balancer-v2` is **upstream's** image
 > and does not contain our changes. Do not reference it in this repo's
@@ -113,7 +108,7 @@ The table below lists only capabilities **unique to us** (not in upstream):
 | Referenced certificate ingestion | `tls_source=file` now reads PEM into the DB on save, making the DB the single source of truth; external file changes are written back and hot-reloaded by a watchdog |
 | Port remapping | `HTTP_PORT` / `HTTPS_PORT` / `PANEL_PORT` officially remap listen ports; default semantics only, existing rules untouched |
 | Referenced cert update fix | Fixes referenced cert file sources being wrongly rejected on rule update |
-| Upstream release watch | A CNB scheduled job checks for new upstream releases and opens an issue when one appears |
+| Upstream release watch | A scheduled job checks for new upstream releases and opens an issue when one appears |
 
 ## How upstream sync works
 
@@ -121,17 +116,18 @@ Three gates, each with one job:
 
 1. **GitHub Actions** (`sync-upstream-master.yml`)
    Checks upstream tags every 6 hours (only `v<major>.<minor>.<patch>` release
-   tags), and syncs its commit to the fork's `master` when a new one appears.
+   tags), and syncs its commit to this repo's `master` when a new one appears.
    Requires the repository secret `UPSTREAM_SYNC_TOKEN` (a PAT with repo scope).
 
-2. **CNB scheduled job** (the `crontab` entry under `main` in `.cnb.yml`)
-   Checks the latest upstream version every 6 hours; if it is newer than
-   `BASELINE_TAG` it opens an issue. One issue per version, no spam.
+2. **Release watch**
+   A scheduled job compares the latest upstream version against the maintained
+   baseline and opens an issue when a new one appears. One issue per version,
+   no spam.
 
 3. **Manual merge**
    After the issue, follow the
    [upstream merge checklist](docs/upstream-merge.zh-CN.md): produce a diff
-   list → you decide → we change code → bump `BASELINE_TAG` → close the issue.
+   list → decide → change code → bump the baseline → close the issue.
 
 ## Documentation
 
@@ -166,7 +162,8 @@ releases.
 | Date | Content |
 |---|---|
 | 2026-10-11 | **Merged upstream v2.3.5** (`98c607ac`): per-upstream origin domain now uses upstream `origin_domain` + native `map`, static responses use upstream `response_mode` tri-state — our `host_header` / `action=respond` implementations retired, with automatic two-way data migration; chained fallback, referenced-cert ingestion and port remapping kept |
-| 2026-10-11 | Port remap edge cases; referenced certificate ingestion; chained fallback strategy; GitHub Actions upstream sync + CNB upstream watch; README rewrite; `docker-compose` now references our own image |
+| 2026-10-11 | Port remap edge cases; referenced certificate ingestion; chained fallback strategy; GitHub Actions upstream sync + release watch; README rewrite; `docker-compose` now references our own image |
+| 2026-10-11 | Removed references to the internal development platform (footer link, CI section, migration notes); public surface now points at this repo |
 
 ## Tech Stack
 

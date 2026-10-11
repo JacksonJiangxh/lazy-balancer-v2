@@ -1240,7 +1240,7 @@ func TestGenerateSingleRuleCaddyConfig_parityWithProductionBuilders(t *testing.T
 						}}
 					}
 					if withExtras {
-						rule.HostHeader = "backend.internal"
+						rule.OriginDomain = "backend.internal"
 						rule.HealthCheckInterval = 30
 						rule.EnableActiveHealthCheck = true
 						rule.HealthCheckPath = "/healthz"

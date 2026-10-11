@@ -23,7 +23,7 @@ export const footerHtml = computed(() => {
   }
   return (
     escapeHtml(footerText.value) +
-    ' · <a href="https://github.com/v55448330/lazy-balancer-v2" target="_blank" rel="noopener noreferrer" class="footer-link">GitHub</a>'
+    ' · <a href="https://github.com/xzydm/lazy-balancer-v2" target="_blank" rel="noopener noreferrer" class="footer-link">GitHub</a>'
   )
 })
 

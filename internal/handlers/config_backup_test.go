@@ -2119,7 +2119,7 @@ func TestImportConfigBackup_normalizes_null_rows_for_all_backup_tables(t *testin
 			"mfa_enabled": nil, "mfa_secret": nil, "mfa_recovery_codes": nil}},
 		"lb_rules": {{"caddy_id": "lb_nulldump", "name": "null-cols", "protocol": "http", "domain": "nulldump.example.test",
 			"listen_port": 8461, "enabled": nil, "description": nil, "strategy": nil, "dns_server": nil, "dns_family": nil,
-			"health_check_path": nil, "host_header": nil, "tls_source": nil, "compress_types": nil, "enable_compress": nil,
+			"health_check_path": nil, "health_check_host": nil, "origin_domain": nil, "tls_source": nil, "compress_types": nil, "enable_compress": nil,
 			"server_tokens_hidden": nil, "tcp_try_interval": nil, "health_check_interval": nil,
 			"created_by": nil, "updated_by": nil, "enable_tls": 0, "custom_routes_enabled": 1,
 			"created_at": nil, "updated_at": nil}},
@@ -2292,20 +2292,20 @@ func TestImportConfigBackup_normalizes_null_rows_for_all_backup_tables(t *testin
 	}
 
 	// 落库值断言：lb_rules/upstreams/certificate_configs/版本表归一为 dump 侧对齐默认值。
-	var ruleDesc, ruleStrategy, ruleDNSFamily, ruleHostHeader, ruleTLSSource, ruleCompressTypes sql.NullString
+	var ruleDesc, ruleStrategy, ruleDNSFamily, ruleOriginDomain, ruleTLSSource, ruleCompressTypes sql.NullString
 	var ruleEnableCompress, ruleServerTokensHidden, ruleTCPTryInterval, ruleHealthCheckInterval sql.NullInt64
 	var ruleCreatedBy, ruleUpdatedBy sql.NullInt64
-	if err := db.DB.QueryRow(`SELECT description, strategy, dns_family, host_header, tls_source, compress_types,
+	if err := db.DB.QueryRow(`SELECT description, strategy, dns_family, origin_domain, tls_source, compress_types,
 		enable_compress, server_tokens_hidden, tcp_try_interval, health_check_interval, created_by, updated_by
 		FROM lb_rules WHERE caddy_id='lb_nulldump'`).
-		Scan(&ruleDesc, &ruleStrategy, &ruleDNSFamily, &ruleHostHeader, &ruleTLSSource, &ruleCompressTypes,
+		Scan(&ruleDesc, &ruleStrategy, &ruleDNSFamily, &ruleOriginDomain, &ruleTLSSource, &ruleCompressTypes,
 			&ruleEnableCompress, &ruleServerTokensHidden, &ruleTCPTryInterval, &ruleHealthCheckInterval, &ruleCreatedBy, &ruleUpdatedBy); err != nil {
 		t.Fatalf("read normalized lb_rules: %v", err)
 	}
 	if !ruleDesc.Valid || ruleDesc.String != "" || !ruleStrategy.Valid || ruleStrategy.String != "weighted_round_robin" ||
-		!ruleDNSFamily.Valid || ruleDNSFamily.String != "ipv4" || !ruleHostHeader.Valid || ruleHostHeader.String != "" ||
+		!ruleDNSFamily.Valid || ruleDNSFamily.String != "ipv4" || !ruleOriginDomain.Valid || ruleOriginDomain.String != "" ||
 		!ruleTLSSource.Valid || ruleTLSSource.String != "manual" || !ruleCompressTypes.Valid || ruleCompressTypes.String != "gzip" {
-		t.Fatalf("lb_rules text defaults: desc=%+v strategy=%+v dns_family=%+v host=%+v tls_source=%+v compress=%+v", ruleDesc, ruleStrategy, ruleDNSFamily, ruleHostHeader, ruleTLSSource, ruleCompressTypes)
+		t.Fatalf("lb_rules text defaults: desc=%+v strategy=%+v dns_family=%+v origin=%+v tls_source=%+v compress=%+v", ruleDesc, ruleStrategy, ruleDNSFamily, ruleOriginDomain, ruleTLSSource, ruleCompressTypes)
 	}
 	if !ruleEnableCompress.Valid || ruleEnableCompress.Int64 != 1 || !ruleServerTokensHidden.Valid || ruleServerTokensHidden.Int64 != 0 ||
 		!ruleTCPTryInterval.Valid || ruleTCPTryInterval.Int64 != 250 || !ruleHealthCheckInterval.Valid || ruleHealthCheckInterval.Int64 != 10 ||
@@ -2409,7 +2409,7 @@ func TestConfigBackup_restore_dump_isomorphism_roundtrip(t *testing.T) {
 		dns_server,dns_family,health_check_path,health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold,
 		enable_active_health_check,tcp_health_check_port,tcp_try_duration,tcp_try_interval,request_body_max_size_mb,upstream_keepalive_timeout,
 		server_tokens_hidden,custom_routes_enabled,proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,
-		proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,host_header,enable_tls,tls_source,acme_config_id,ca_provider_id,
+		proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,origin_domain,enable_tls,tls_source,acme_config_id,ca_provider_id,
 		tls_http_redirect,enable_compress,compress_types,enabled,log_enabled,created_by,created_at,updated_at,updated_by)
 		VALUES ('lb_iso','iso','iso-desc','http','iso.example.test',8462,'least_conn',0,0,'','both','/health',15,4,3,2,
 		0,0,0,300,0,0,1,1,0,0,0,0,0,0,0,'hh.example.test',0,'manual',0,0,

@@ -143,20 +143,20 @@ func TestBuildChainProxyConfig_paramsAndDialTimeout(t *testing.T) {
 	}
 }
 
-// 逐上游回源域名三级回退：上游 origin_domain > 规则级 host_header > 空（不发射）。
+// 逐上游回源域名三级回退：上游 origin_domain > 规则级 origin_domain > 空（不发射）。
 func TestBuildChainProxyConfig_hostHeaderFallback(t *testing.T) {
 	rule := SingleRuleConfig{
 		CaddyID:    "lb_chain_host",
 		Protocol:   "http",
 		Strategy:   "chain_fallback",
-		HostHeader: "rule-level.test",
+		OriginDomain: "rule-level.test",
 	}
 	ups := []UpstreamConfig{
 		{Host: "10.0.0.1", Port: 9501, Weight: 1, Protocol: "http", Enabled: true, OriginDomain: "upstream-level.test"},
 		{Host: "10.0.0.2", Port: 9502, Weight: 1, Protocol: "http", Enabled: true}, // 回退规则级
 		{Host: "10.0.0.3", Port: 9503, Weight: 1, Protocol: "http", Enabled: true},
 	}
-	rule.HostHeader = ""
+	rule.OriginDomain = ""
 	ups[2].OriginDomain = "  " // 空白视为空
 	cfg := buildChainProxyConfig(rule, ups)
 	upsOut := cfg["upstreams"].([]interface{})

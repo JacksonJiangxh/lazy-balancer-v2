@@ -3,7 +3,7 @@
 > 本文件是「我们维护的代码」与「上游原作者发布版本」之间的对账记录。
 > 每次上游发版，按本文件的流程走一遍，并把新版本追加成一节。
 >
-> - 我们的代码：CNB `xzydm/lazy-balancer-v2`（`main` 分支）
+> - 我们的代码：本仓库 `xzydm/lazy-balancer-v2`（`master-dev` 分支）
 > - 上游代码：GitHub `v55448330/lazy-balancer-v2`
 > - 本次范围：`v2.3.4`（我们当前的基线）→ `v2.3.5`（上游最新 release）
 
@@ -62,7 +62,7 @@ c005a689 规则列表 TCP 规则补灰色锁图标
 │
 ├─ 圈层 B：本地独占 ──────── 永远自维护，上游不碰（纯新增文件，无冲突）
 │  caddychain/（独立 go.mod）、caddygeoip/upstream_host.go、
-│  internal/services/default_ports.go、.cnb.yml/.cnb/web_trigger.yml、
+│  internal/services/default_ports.go、构建与巡检配置、
 │  .gitattributes、Dockerfile 的 web-builder 阶段、本地新增测试文件
 │
 ├─ 圈层 C：同需求两实现 ──── 必须一次性决策，选错方向改了也白改  ★
@@ -216,7 +216,7 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
 ### D-5 上游 `docker-compose.yml` 的锚点重构要不要吃
 上游把 `logging` / `ulimits` / `healthcheck` 三处重复收敛为 `x-common-*` 锚点。
 > 判断：**吃，但要用我们的镜像地址与端口换位段。** 合并方式：
-> 拿上游的锚点结构 + 我们的 `image: docker.cnb.cool/...` + 我们的
+> 拿上游的锚点结构 + 我们的自维护镜像地址 `image: ...` + 我们的
 > `HTTP_PORT/HTTPS_PORT/PANEL_PORT` 环境变量段。
 
 ### D-6 仪表盘 P50/P95/P99 插值算法
@@ -326,5 +326,6 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
 | 2026-10-11 | 建立清单；范围 `v2.3.4 → v2.3.5`；立 D-1 ~ D-6 六个决策点 |
 | 2026-10-11 | 修正 D-1/D-2 误判（`707fe14b`）：前端有列、静态响应对面也已实现 |
 | 2026-10-11 | **对齐原始只读报告复核**：恢复「四圈层」骨架；所有结论附证据（行号/提交号）；实测 22 冲突文件；上游推进至 16 提交 |
-| 2026-10-11 | 版本号对齐：`Dockerfile`/`docker-compose.yml`/`internal/config` 默认版本、`.cnb/web_trigger.yml` 按钮默认值、`.cnb.yml` `BASELINE_TAG`、README 构建示例统一为 `v2.3.5`（此前 `web_trigger`/`BASELINE_TAG`/README 仍停在 `v2.3.4`）|
-| 2026-10-11 | **执行合并**：用户裁定 D-1 切上游 `origin_domain`+map、D-2 切上游 `response_mode`；四步合并完成（22 冲突文件全部解决）；存量数据双向迁移；链式回退/引用型证书/默认端口换位保留；`go build`/`vet`/`test`（与上游基线零非环境差异）/前端 `vue-tsc`+`build` 全通过 |
+| 2026-10-11 | 版本号对齐：`Dockerfile`/`docker-compose.yml`/`internal/config` 默认版本、构建按钮默认值、巡检基线、README 构建示例统一为 `v2.3.5`（此前几处仍停在 `v2.3.4`）|
+| 2026-10-11 | **执行合并**：裁定 D-1 切上游 `origin_domain`+map、D-2 切上游 `response_mode`；四步合并完成（22 冲突文件全部解决）；存量数据双向迁移；链式回退/引用型证书/默认端口换位保留；`go build`/`vet`/`test`（与上游基线零非环境差异）/前端 `vue-tsc`+`build` 全通过 |
+| 2026-10-11 | 公开面清理：仓库内不再描述内部开发平台（页脚链接改指本仓库、README 的 CI/同步章节改为通用表述、本文件中的平台字样去除）；`lb_rules` 的读列/列清单同步切到 `origin_domain`，过渡列 `host_header` 改为先搬后删 |

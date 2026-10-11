@@ -36,7 +36,7 @@ func normalizeRuleForTransport(rule *models.LbRule) {
 		}
 		// TCP 渲染零消费字段族（buildTCPServer/buildTCPProxyRoute）——
 		// 「没有就都应该没有」：主端存储、导出、从端落库三面全零。
-		rule.HostHeader = ""
+		rule.OriginDomain = ""
 		rule.HealthCheckPath = ""
 		rule.EnableCompress = false
 		rule.CompressTypes = ""

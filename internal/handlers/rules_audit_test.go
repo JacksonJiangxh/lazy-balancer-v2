@@ -1572,19 +1572,19 @@ func TestDeleteRule_queuedOnlyJobIsNotBlocked(t *testing.T) {
 	}
 }
 
-// 审计 M16：host_header 指针化后「省略=保留原值、空串=清空」——空串必须
+// 审计 M16：origin_domain 指针化后「省略=保留原值、空串=清空」——空串必须
 // 落库为空串，而非被合并逻辑吞回原值。
-func TestUpdateRule_empty_host_header_clears_value(t *testing.T) {
+func TestUpdateRule_empty_origin_domain_clears_value(t *testing.T) {
 	// Given
-	harness := newUpdateAuditRuleHandlers(t, "lb_clear_host_header", 0, false)
-	seedAuditRule(t, "lb_clear_host_header", "before", "clear.example.test", 8080, false, "manual", false)
-	seedAuditUpstream(t, "lb_clear_host_header")
-	if _, err := db.DB.Exec("UPDATE lb_rules SET host_header='backend.example.test' WHERE caddy_id='lb_clear_host_header'"); err != nil {
-		t.Fatalf("seed host header: %v", err)
+	harness := newUpdateAuditRuleHandlers(t, "lb_clear_origin_domain", 0, false)
+	seedAuditRule(t, "lb_clear_origin_domain", "before", "clear.example.test", 8080, false, "manual", false)
+	seedAuditUpstream(t, "lb_clear_origin_domain")
+	if _, err := db.DB.Exec("UPDATE lb_rules SET origin_domain='backend.example.test' WHERE caddy_id='lb_clear_origin_domain'"); err != nil {
+		t.Fatalf("seed origin domain: %v", err)
 	}
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
-	request := httptest.NewRequest(http.MethodPut, "/rules/lb_clear_host_header", strings.NewReader(`{"host_header":""}`))
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_clear_origin_domain", strings.NewReader(`{"origin_domain":""}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
@@ -1595,12 +1595,12 @@ func TestUpdateRule_empty_host_header_clears_value(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("update status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
-	var hostHeader string
-	if err := db.DB.QueryRow("SELECT COALESCE(host_header,'') FROM lb_rules WHERE caddy_id='lb_clear_host_header'").Scan(&hostHeader); err != nil {
-		t.Fatalf("read host header: %v", err)
+	var originDomain string
+	if err := db.DB.QueryRow("SELECT COALESCE(origin_domain,'') FROM lb_rules WHERE caddy_id='lb_clear_origin_domain'").Scan(&originDomain); err != nil {
+		t.Fatalf("read origin domain: %v", err)
 	}
-	if hostHeader != "" {
-		t.Fatalf("host_header=%q, want empty string（空串=清空）", hostHeader)
+	if originDomain != "" {
+		t.Fatalf("origin_domain=%q, want empty string（空串=清空）", originDomain)
 	}
 }
 
