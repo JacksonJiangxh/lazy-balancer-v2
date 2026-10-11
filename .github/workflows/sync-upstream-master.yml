@@ -1,0 +1,171 @@
+# 上游版本同步流水线（GitHub Actions）
+#
+# 作用：盯着原作者仓库的新「版本级」发布（= 带 tag 的 release），一旦出现新 tag，
+# 就把上游那个 tag 指向的提交强制同步到本 fork 的 master 分支。
+#
+# 为什么是 master 而不是 master-dev：
+#   master      = 上游镜像轨，只承载「原封不动的上游发布」，不含我们自己的改动。
+#   master-dev  = 我们的开发轨（GitHub 默认分支），承载定制改动，本流水线**不碰**。
+#   这样 CNB 侧比对上游差异时，永远只看向上游，不会被我们的改动污染。
+#
+# 两种触发方式：
+#   1. schedule：每 6 小时自查一次（上游打 tag 时 GitHub 不会通知 fork，只能轮询）
+#   2. workflow_dispatch：手动补跑，可指定要同步的具体 tag
+#
+# 凭据：仓库 Secrets 中名为 UPSTREAM_SYNC_TOKEN 的 PAT（需 repo scope，
+#       用于 push 到本 fork 的 master）。未配置时脚本会明确报错退出，
+#       不会静默失败（GitHub 默认 GITHUB_TOKEN 无权触发下游 workflow，
+#       故这里必须用 PAT）。
+name: Sync upstream release to master
+
+on:
+  schedule:
+    # 每 6 小时（UTC）检查一次上游是否有新 tag
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要同步的上游 tag（留空则取上游最新 tag）'
+        required: false
+        default: ''
+      dry_run:
+        description: '试运行（只打印将要同步的 tag，不推送）'
+        required: false
+        type: boolean
+        default: false
+
+# 同一时间只跑一个同步作业；新任务排队而不是并发（避免竞态 push）
+concurrency:
+  group: sync-upstream-master
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # 上游（原作者）仓库，owner/repo 形式
+  UPSTREAM_REPO: v55448330/lazy-balancer-v2
+  # 要同步的目标分支（本 fork 的「上游镜像轨」）
+  TARGET_BRANCH: master
+
+jobs:
+  sync:
+    name: 同步上游最新 release 到 master
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 —— 需要完整的 tag/提交历史做「已包含」判定
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: 解析上游最新 tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+            echo ">>> 使用手动指定的 tag：$TAG"
+          else
+            # 只认「版本级」tag：形如 v1.2.3 / 1.2.3，排除 nightly、beta 之类的滚动 tag。
+            # 按语义版本倒序取第一个，避免依赖 tags API 的返回顺序。
+            TAG=$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/tags?per_page=100" \
+              | jq -r '.[].name' \
+              | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -Vr \
+              | head -1)
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo ">>> 上游没有任何形如 v<major>.<minor>.<patch> 的 tag，无可同步内容"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo ">>> 上游最新版本 tag：$TAG"
+
+      - name: 判断是否需要同步
+        id: check
+        if: steps.resolve.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.tag }}"
+
+          # 拉上游 tag 对象（只拉这一个 tag，不整仓 fetch）
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags --depth=1 upstream "refs/tags/${TAG}:refs/tags/${TAG}" \
+            || git fetch --no-tags upstream "refs/tags/${TAG}:refs/tags/${TAG}"
+
+          UPSTREAM_SHA=$(git rev-list -n1 "${TAG}")
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo ">>> 上游 ${TAG} -> ${UPSTREAM_SHA}"
+
+          # master 已包含该提交 => 已经同步过，直接跳过（幂等）
+          git fetch origin "${TARGET_BRANCH}" || true
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" "origin/${TARGET_BRANCH}" 2>/dev/null; then
+            echo ">>> master 已包含 ${TAG}，无需同步"
+            echo "need_sync=false" >> "$GITHUB_OUTPUT"
+          else
+            echo ">>> master 尚未包含 ${TAG}，需要同步"
+            echo "need_sync=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 同步到 master
+        if: steps.check.outputs.need_sync == 'true'
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.tag }}"
+          SHA="${{ steps.check.outputs.upstream_sha }}"
+
+          # master 是「上游镜像轨」，语义就是上游某个 release 的原样副本，
+          # 因此这里用硬重置而不是 merge —— 保证与上游逐字节一致。
+          # 我们自己的改动一律在 master-dev，不会被影响。
+          git checkout -B "${TARGET_BRANCH}" "$SHA"
+
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            echo ">>> 试运行：本应把 ${TARGET_BRANCH} 重置到 ${TAG} (${SHA})"
+            git log --oneline -5
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          MSG=$(cat <<MSGEOF
+          chore(sync): 同步上游 release ${TAG}
+
+          来源: ${UPSTREAM_REPO} tag ${TAG} (${SHA})
+          目标: 本 fork ${TARGET_BRANCH} (上游镜像轨, 不含定制改动)
+          由 GitHub Actions 自动同步, 勿手工在此分支上改动.
+          MSGEOF
+          )
+          git commit --allow-empty -m "$MSG"
+
+          # --force-with-lease：若远端 master 在此期间被他人推进，则拒推而不是覆盖
+          git push --force-with-lease origin "${TARGET_BRANCH}"
+
+      - name: 汇总
+        if: always()
+        run: |
+          {
+            echo "## 上游同步结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游仓库 | \`${UPSTREAM_REPO}\` |"
+            echo "| 解析到的 tag | \`${{ steps.resolve.outputs.tag }}\` |"
+            echo "| 上游提交 | \`${{ steps.check.outputs.upstream_sha }}\` |"
+            echo "| 需要同步 | \`${{ steps.check.outputs.need_sync }}\` |"
+            echo "| 目标分支 | \`${TARGET_BRANCH}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

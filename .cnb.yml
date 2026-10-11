@@ -15,6 +15,154 @@
 # 两者都必须写在 `$`（兜底分支）下：vscode 属仓库级事件（与分支无关），
 # web_trigger 也建议放兜底分支以免漏配分支。
 
+
+# main 分支：
+#   crontab 定时任务 —— 上游版本巡检（发现了就开 Issue 叫人）。
+#   之所以单独放在具体分支名（main）下：CNB 的 crontab 事件不支持 `$` 兜底分支
+#   或 glob 分支，必须挂在确切的分支 key 上。
+main:
+  # ──────────────────────────────────────────────────────────────
+  # 上游版本巡检：定时任务（每 6 小时）检查原作者仓库有没有新「版本级」tag。
+  #
+  # 与 GitHub Actions 的分工：GH Action 负责「真的把上游 tag 同步到 fork 的
+  # master」；这里负责「发现了就开 Issue 叫人」，两件事互不依赖——
+  # 哪怕 GH Action 因 token 过期没跑成，这里的 Issue 也会照开，不会静默错过版本。
+  #
+  # 必须写在具体分支名（main）下：crontab 事件不支持 $ 兜底分支或 glob 分支。
+  # 事件名用 "crontab: <cron>" 形式，系统时区 Asia/Shanghai。
+  #
+  # 幂等：开 Issue 前先查本仓是否已有同名未关闭的巡检 Issue，有就只更新/跳过，
+  # 不会每 6 小时刷一条新 Issue。状态记号写在 Issue 的 HTML 注释里（人类不可见），
+  # 形如 <!--upstream-sync-state: v2.3.5-->。
+  #
+  # 依赖：jq（查 GitHub API / 解析 CNB Issue 列表）。CNB 默认环境已自带，
+  # 这里仍显式检查一遍，缺失就报错而不是产出错数据。
+  # ──────────────────────────────────────────────────────────────
+  # ──────────────────────────────────────────────────────────────
+  # 上游版本巡检：定时任务（每 6 小时）检查原作者仓库有没有新「版本级」tag。
+  #
+  # 与 GitHub Actions 的分工：GH Action 负责「真的把上游 tag 同步到 fork 的
+  # master」；这里负责「发现了就开 Issue 叫人」，两件事互不依赖——
+  # 哪怕 GH Action 因 token 过期没跑成，这里的 Issue 也会照开，不会静默错过版本。
+  #
+  # 必须写在具体分支名（main）下：crontab 事件不支持 $ 兜底分支或 glob 分支。
+  # 事件名用 "crontab: <cron>" 形式，系统时区 Asia/Shanghai。
+  #
+  # 幂等：开 Issue 前先查本仓是否已有同名未关闭的巡检 Issue，有就补一条评论，
+  # 不会每 6 小时刷一条新 Issue。版本记号写在 Issue 正文的 HTML 注释里
+  # （人类不可见），形如 <!--upstream-sync-state: v2.3.5-->。
+  #
+  # 依赖 curl + jq；二者在下面显式检查，缺失就报错而不是产出错数据。
+  # ──────────────────────────────────────────────────────────────
+  "crontab: 30 */6 * * *":
+    - name: upstream-release-watch
+      # 纯 curl + jq 的轻量作业，1 核足够
+      runner:
+        cpus: 1
+      docker:
+        image: docker.cnb.cool/xzydm/mirrors/debian:13-all
+      env:
+        # 上游（原作者）仓库，owner/repo 形式
+        UPSTREAM_REPO: v55448330/lazy-balancer-v2
+        # 我们已合并到的上游版本（人工确认基线）。上游最新 tag 比它新 -> 开 Issue。
+        # 每次真正合并完一个上游版本后，把这里改成新版本号再关 Issue——
+        # 这是唯一的人工确认点：不改它，巡检就会一直提醒同一个版本。
+        BASELINE_TAG: v2.3.4
+      stages:
+        - name: check upstream release
+          script: |
+            set -euo pipefail
+
+            for c in curl jq; do
+              command -v "$c" >/dev/null 2>&1 || { echo "缺少依赖：$c"; exit 1; }
+            done
+
+            echo ">>> 上游仓库：${UPSTREAM_REPO}"
+            echo ">>> 已合并基线：${BASELINE_TAG}"
+
+            # tags API 单页 100 条足够覆盖（上游历史版本远少于 100）。
+            # 只认 v<major>.<minor>.<patch> 形态的「版本级」tag，
+            # 排除 nightly / beta / rc 之类滚动 tag（它们不是发布）。
+            TAGS_JSON=$(curl -fsSL --max-time 30 \
+              -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: cnb-upstream-watch" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/tags?per_page=100")
+
+            LATEST=$(printf '%s' "$TAGS_JSON" \
+              | jq -r '.[].name' \
+              | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -Vr \
+              | head -1)
+
+            if [ -z "${LATEST}" ]; then
+              echo ">>> 上游没有版本级 tag，结束"
+              exit 0
+            fi
+            echo ">>> 上游最新版本：${LATEST}"
+
+            # 语义版本比较：LATEST 是否比 BASELINE 新
+            newer=$(printf '%s\n%s\n' "$BASELINE_TAG" "$LATEST" | sort -V | tail -1)
+            if [ "$newer" = "$LATEST" ] && [ "$LATEST" != "$BASELINE_TAG" ]; then
+              echo ">>> 发现新版本 ${LATEST}（基线 ${BASELINE_TAG}）"
+            else
+              echo ">>> 无新版本（${LATEST} <= ${BASELINE_TAG}），结束"
+              exit 0
+            fi
+
+            # 取该 tag 的提交与发布时间，写进 Issue 便于定位。
+            # 这两处只看成败、不阻断：取不到就写 unknown，Issue 照开。
+            TAG_META=$(curl -fsSL --max-time 30 \
+              -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: cnb-upstream-watch" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/git/ref/tags/${LATEST}" || echo '{}')
+            TAG_SHA=$(printf '%s' "$TAG_META" | jq -r '.object.sha // "unknown"' | cut -c1-10)
+            RELEASED_AT=$(curl -fsSL --max-time 30 \
+              -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: cnb-upstream-watch" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${LATEST}" \
+              | jq -r '.published_at // "unknown"' || echo "unknown")
+
+            # 幂等守卫：查本仓是否已有「未关闭」的同名巡检 Issue。
+            # cnb CLI 要加 --verbose 才输出可解析 JSON（形如 {"data":[...]}）；
+            # 分页默认 10 条，open 状态的巡检 Issue 不会多到需要翻页。
+            ISSUE_TITLE="[上游巡检] ${UPSTREAM_REPO} 发布新版本 ${LATEST}"
+            EXISTING=$(cnb issues list-issues --repo "${CNB_REPO_SLUG}" --state open --verbose 2>/dev/null               | jq -r --arg t "$ISSUE_TITLE" '.data[]? | select(.title == $t) | .number' 2>/dev/null | head -1 || true)
+
+            # Issue 正文用 printf 逐行拼，不用 heredoc：heredoc 的内容行若跟着
+            # script 块的缩进，正文每行都会带前导空格、markdown 表格直接散架；
+            # 而 <<- 只去 TAB 不去空格，在这个全空格的 YAML 块里用不上。
+            BODY_FILE=$(mktemp)
+            {
+              printf '%s\n' "<!--upstream-sync-state: ${LATEST}-->"
+              printf '%s\n' ""
+              printf '%s\n' "## 上游有新版本发布"
+              printf '%s\n' ""
+              printf '%s\n' "| 项 | 值 |"
+              printf '%s\n' "|---|---|"
+              printf '%s\n' "| 上游仓库 | \`${UPSTREAM_REPO}\` |"
+              printf '%s\n' "| 新版本 tag | **${LATEST}** |"
+              printf '%s\n' "| tag 提交 | \`${TAG_SHA}\` |"
+              printf '%s\n' "| 发布时间 | ${RELEASED_AT} |"
+              printf '%s\n' "| 本仓已合并基线 | \`${BASELINE_TAG}\` |"
+              printf '%s\n' ""
+              printf '%s\n' "### 接下来要做的事"
+              printf '%s\n' ""
+              printf '%s\n' "1. 确认 GitHub Actions 的 \`Sync upstream release to master\` 已把 \`${LATEST}\` 同步到 fork 的 **master**（镜像轨）；没成功就手动 \`workflow_dispatch\` 补跑一次。"
+              printf '%s\n' "2. 拿到一份基于 fork 的 master 与本仓 main 的代码合并清单，逐项拍板。"
+              printf '%s\n' "3. 拍板后再动代码；改完把本仓 \`.cnb.yml\` 里 \`upstream-release-watch\` 的 \`BASELINE_TAG\` 提到 \`${LATEST}\`，再关闭本 Issue。"
+              printf '%s\n' ""
+              printf '%s\n' "> 本 Issue 由 CNB 定时任务自动创建（每 6 小时巡检一次）。同一版本只会开一条。"
+            } > "$BODY_FILE"
+
+            if [ -n "${EXISTING}" ]; then
+              echo ">>> 已有未关闭的巡检 Issue #${EXISTING}，补一条评论而不是新开"
+              cnb issues comment --repo "${CNB_REPO_SLUG}" --number "${EXISTING}"                 --body "又巡检到上游版本 **${LATEST}** 仍未合并（基线 ${BASELINE_TAG}，tag 提交 \`${TAG_SHA}\`）。详见上方清单。"
+            else
+              echo ">>> 新建巡检 Issue：${ISSUE_TITLE}"
+              cnb issues create-issue --repo "${CNB_REPO_SLUG}"                 --title "${ISSUE_TITLE}"                 --body-file "$BODY_FILE"                 --priority P2
+            fi
+            rm -f "$BODY_FILE"
+
 $:
   # ──────────────────────────────────────────────────────────────
   # 云原生开发环境：专供页面中点击「云原生开发」启动远程开发用

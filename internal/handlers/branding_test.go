@@ -88,7 +88,7 @@ func TestRenderDefaultBlockPage_omits_footer_text_line_when_empty(t *testing.T) 
 	if !strings.Contains(html, `Powered by <span class="name">Acme</span>`) {
 		t.Errorf("rendered page missing powered-by line:\n%s", html)
 	}
-	if strings.Count(html, "<br>") != 1 || !strings.Contains(html, `href="https://github.com/v55448330/lazy-balancer-v2"`) {
+	if strings.Count(html, "<br>") != 1 || !strings.Contains(html, `href="https://cnb.cool/xzydm/lazy-balancer-v2"`) {
 		t.Errorf("rendered page should contain exactly one line break (repo link only) when footer text is empty:\n%s", html)
 	}
 }
@@ -136,7 +136,7 @@ func TestSeedDefaultBlockPage_uses_default_branding_when_file_missing(t *testing
 	if !strings.Contains(content, defaultBranding.AppName) || !strings.Contains(content, strings.Split(defaultBranding.FooterText, " · ")[0]) {
 		t.Errorf("default block page missing default branding:\n%s", content)
 	}
-	if !strings.Contains(content, `href="https://github.com/v55448330/lazy-balancer-v2"`) {
+	if !strings.Contains(content, `href="https://cnb.cool/xzydm/lazy-balancer-v2"`) {
 		t.Errorf("default block page footer missing repo link:\n%s", content)
 	}
 	if content == before {
