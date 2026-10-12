@@ -494,11 +494,22 @@ $:
   # 凭据：GitHub PAT 存在 CNB 密钥仓库（xzydm/xzsecret 的 github.yml）里，
   # 通过 imports 注入，流水线内不出现任何明文。
   #
-  # 关于变量名 163_GIT_ALL_TOKEN：它来自密钥仓库文件里的键名，以数字开头。
-  # POSIX shell 不接受以数字开头的变量名（`${163_GIT_ALL_TOKEN}` 是 bad
-  # substitution，`export` 也会直接报错），只有 bash 的 printenv 能读到。
-  # 因此这里在 env 层用 CNB 的变量替换把它改成一个合法名字 GIT_ALL_TOKEN，
-  # 脚本只认 GIT_ALL_TOKEN；同时脚本内保留一次 printenv 兜底，双保险。
+  # ── 为什么必须改名（这是本流水线此前「token 为空」的真正原因）──
+  # 密钥文件里的键名是 163_GIT_ALL_TOKEN。CNB 文档明确：环境变量名
+  # 「只能含字母/数字/下划线，且不能以数字开头」。以数字开头的键名不是合法
+  # 变量名，会以两种方式同时失效：
+  #   1) ${163_GIT_ALL_TOKEN} 在 sh/bash 下是 bad substitution，直接语法错误；
+  #   2) 更隐蔽的是：CNB 流水线默认用 sh（Debian 上即 dash）执行 script，
+  #      而 dash 在进程启动、构建自身环境时，会**静默丢弃**所有名字非法的
+  #      环境变量。也就是说 token 确实被 imports 注入到了进程环境里，
+  #      但 dash 一启动就把它扔了——连 printenv 都读不到。
+  #      （实测：bash 保留，dash 丢弃；这正是「构建镜像成功、推送 GitHub 拿不到
+  #       token」的原因，与密钥仓库 allow_* 授权无关。）
+  # 因此正确做法不是想办法把它读出来，而是**在密钥文件里把键名改成合法标识符**：
+  #   # xzydm/xzsecret 的 github.yml
+  #   GIT_ALL_TOKEN: "ghp_xxx"          # ← 正名（新名，推荐）
+  #   163_GIT_ALL_TOKEN: "ghp_xxx"      # ← 可选：过渡期保留旧名做兼容
+  # 本流水线按新名 GIT_ALL_TOKEN 引用，与 env / imports 同名 key 覆盖规则一致。
   #
   # 密钥文件需要在密钥仓库侧声明 allow_* 规则，否则只有密钥仓管理员触发的
   # 流水线才有权引用（allow_* 一旦声明，触发者角色不再参与判定）：
@@ -514,11 +525,9 @@ $:
       docker:
         image: docker.cnb.cool/xzydm/mirrors/debian:13-all
       imports:
-        # 密钥仓库中的 GitHub 凭据文件（键：163_GIT_ALL_TOKEN）
+        # 密钥仓库中的 GitHub 凭据文件（键：GIT_ALL_TOKEN）
         - https://cnb.cool/xzydm/xzsecret/-/blob/main/github.yml
       env:
-        # 把密钥仓里以数字开头的变量名洗成 shell 合法名（见上方说明）
-        GIT_ALL_TOKEN: ${163_GIT_ALL_TOKEN}
         # GitHub 目标仓库，owner/repo 形式。
         # 默认指向本仓库在 GitHub 侧的 fork；若 fork 在别的账号名下，改这一行即可。
         GITHUB_REPO: xzydm/lazy-balancer-v2
@@ -535,14 +544,14 @@ $:
 
             command -v git >/dev/null 2>&1 || { echo ">>> 缺少依赖：git"; exit 1; }
 
-            # 取 token：优先用 env 洗过的 GIT_ALL_TOKEN；为空再用 printenv 兜底读原名
-            #（bash 下 printenv 能读到数字开头的变量，dash 下读不到，故只作兜底）。
+            # 令牌由 imports 逐 key 注入，键名必须是合法环境变量名（见上方说明）。
+            # GIT_ALL_TOKEN 就是密钥文件里的键名；它必须是合法变量名，否则到不了这里。
             TOKEN="${GIT_ALL_TOKEN:-}"
             if [ -z "$TOKEN" ]; then
-              TOKEN="$(printenv 163_GIT_ALL_TOKEN 2>/dev/null || true)"
-            fi
-            if [ -z "$TOKEN" ]; then
-              echo ">>> 未拿到 GitHub 令牌：检查密钥仓库 github.yml 是否声明了 allow_slugs/allow_events/allow_branches"
+              echo ">>> 未拿到 GitHub 令牌。请检查密钥仓库 xzydm/xzsecret 的 github.yml："
+              echo "    - 键名必须是不以数字开头的合法变量名（用 GIT_ALL_TOKEN，不要用 163_GIT_ALL_TOKEN）"
+              echo "    - 若已声明 allow_* 规则，需 allow_slugs 含 xzydm/lazy-balancer-v2、"
+              echo "      allow_events 含 web_trigger_push_github、allow_branches 含 main"
               exit 1
             fi
 
