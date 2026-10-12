@@ -1,10 +1,10 @@
-# 分支详情页的自定义按钮 → 触发 .cnb.yml 中的 web_trigger_docker_build 事件。
+# 分支详情页的自定义按钮 → 触发 .cnb.yml 中的 web_trigger_* 事件。
 #
 # 注意：.cnb/web_trigger.yml 不支持 include / imports；事件名必须与 .cnb.yml
 # 中配置的 web_trigger 事件完全一致，否则按钮点了没反应。
 
 branch:
-  # 只在 main 分支详情页显示构建按钮（避免开发分支上误触发发布）
+  # 只在 main 分支详情页显示按钮（避免开发分支上误触发）
   - reg: ^main
     buttons:
       - name: 构建并推送镜像
@@ -23,6 +23,38 @@ branch:
             default: v2.3.6-beta
         permissions:
           # 还需具备仓库写权限；角色向上包含（owner 权限高于 master）
+          roles:
+            - owner
+            - master
+            - developer
+
+      # 把本仓 main 的最新提交推到 GitHub 的 master-dev（fork 的开发主线）。
+      # 方向与 GitHub Actions 的上游同步相反：GH Action 把上游 release 拉进
+      # fork 的 master，这里把我们的 main 推回 fork 的 master-dev，两边互为备份。
+      # 凭据（GitHub PAT）走密钥仓库 imports，不在流水线里落任何明文。
+      - name: 推送 main 到 GitHub master-dev
+        description: 把本仓 main 同步到 GitHub fork 的 master-dev（凭据取自密钥仓库）
+        event: web_trigger_push_github
+        inputs:
+          # 目标分支名做成可输入项：默认 master-dev，异常时（如误推生产分支）
+          # 也能显式改；填错分支会由下面的守卫拦下，不会把 main 乱塞进去。
+          TARGET_BRANCH:
+            name: 目标分支
+            description: GitHub 侧要更新的分支（默认 master-dev）
+            type: input
+            required: true
+            default: master-dev
+          FORCE:
+            name: 强制推送
+            description: 打开则 --force（覆盖 GitHub 侧历史，慎用）
+            type: select
+            default: "false"
+            options:
+              - name: 否（快进，安全）
+                value: "false"
+              - name: 是（覆盖远端历史）
+                value: "true"
+        permissions:
           roles:
             - owner
             - master
