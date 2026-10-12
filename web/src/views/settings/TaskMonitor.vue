@@ -1,5 +1,16 @@
 <template>
   <div class="tm-root">
+    <!-- FE-70-9：轮询失败横幅（照 CertJobs 形态；行内件样式复用 main.css
+         .polling-error-*/.error-banner，FE-R2 家族收敛第 4 点） -->
+    <el-alert v-if="pollingError.errorMessage.value" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+      <template #title>
+        <div class="polling-error-title">
+          <span>任务监控加载失败：{{ pollingError.errorMessage.value }}</span>
+          <el-button link type="danger" :loading="refreshing" @click="retryPolling">立即重试</el-button>
+        </div>
+      </template>
+      <div class="polling-error-meta">{{ pollingErrorDescription }}</div>
+    </el-alert>
     <!-- KPI 概览（四卡） -->
     <el-row :gutter="20" class="tm-kpis">
       <el-col :xs="12" :md="6">
@@ -129,8 +140,10 @@
         <el-table-column label="调度" width="92">
           <template #default="{ row }">
             <!-- v2.0 调度开关统一：定时=暂停/恢复排程、循环=暂停/恢复循环、
-                 常驻=启停自管理循环——绑定 loop_on 走 /toggle（后端按 Kind 路由） -->
-            <el-switch v-if="row.kind !== 'oneshot'" :model-value="row.loop_on" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
+                 常驻=启停自管理循环——绑定 loop_on 走 /toggle（后端按 Kind 路由）。
+                 方案 A（2026-10-12）：并判 enabled（业务开关联动，如自动更新关闭/
+                 备份未启用）——业务关时开关显示「已暂停」，状态列不再用 disabled 表达 -->
+            <el-switch v-if="row.kind !== 'oneshot'" :model-value="!!row.loop_on && row.enabled !== false" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
             <!-- 触发类（含 cert-job 动态行）：统一显示禁用开关保持页面一致性——
                  仅手动/代码触发执行（2026-10-01 用户裁定；cert-job 特例已消除） -->
             <el-tooltip v-else content="触发类任务不可调度——仅手动/代码触发执行" placement="top" :offset="8" :show-after="150" :show-arrow="false">
@@ -221,8 +234,8 @@
         <el-descriptions :column="2" border size="small" class="tm-detail-descs">
           <el-descriptions-item label="运行节奏">{{ detailTask.cadence || '—' }}</el-descriptions-item>
           <el-descriptions-item label="调度开关">
-            <!-- v2.0 统一口径：非触发类显示 loop_on 态（定时/循环=排程暂停、常驻=运行/停止） -->
-            <el-tag v-if="detailTask.kind !== 'oneshot'" size="small" :type="detailTask.loop_on ? 'success' : 'warning'" effect="plain">{{ detailTask.loop_on ? '开启' : '已暂停' }}</el-tag>
+            <!-- v2.0 统一口径：非触发类显示 loop_on 态；方案 A（2026-10-12）：并判 enabled（业务关=已暂停） -->
+            <el-tag v-if="detailTask.kind !== 'oneshot'" size="small" :type="detailTask.loop_on && detailTask.enabled !== false ? 'success' : 'warning'" effect="plain">{{ detailTask.loop_on && detailTask.enabled !== false ? '开启' : '已暂停' }}</el-tag>
             <el-tooltip v-else content="触发类任务不可调度——仅手动/代码触发执行" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <el-tag size="small" type="info" effect="plain">不可调度</el-tag>
             </el-tooltip>
@@ -301,6 +314,8 @@ import { Refresh, PieChart as PieChartIcon, DataLine, List, Monitor, Lock, Box, 
 import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
+import { formatDate } from '@/utils/date'
+import { usePollingErrorState } from '@/composables/usePollingErrorState'
 import { statusColor } from '@/utils/chartTheme'
 import { certJobStatusLabel, type CertJobStatus } from '@/utils/certJobStatus'
 import DialogHeader from '@/components/DialogHeader.vue'
@@ -314,7 +329,7 @@ interface TaskInfo {
   kind: 'scheduled' | 'daemon' | 'periodic' | 'oneshot'
   status: string; cancellable: boolean; controllable?: boolean; triggerable?: boolean
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
-  loop_on?: boolean; started_at?: string; log_size_bytes?: number // 常驻族：循环启停态（调度列开关绑定值）/ 引擎启动时刻
+  loop_on?: boolean; enabled?: boolean; started_at?: string; log_size_bytes?: number // 常驻族：循环启停态/业务开关联动（方案 A：开关列并判 loop_on&&enabled）/ 引擎启动时刻
 }
 interface RunRecord {
   id: number; task_id: string; family: string; trigger: string; operator?: string; status: string
@@ -349,7 +364,10 @@ const fetchSeries = async () => {
 }
 const refreshNow = async () => {
   refreshing.value = true
-  try { await Promise.all([fetchTasks(), fetchSeries(), fetchCertQueue()]) } finally { refreshing.value = false }
+  try {
+    await Promise.all([fetchTasks(), fetchSeries(), fetchCertQueue()])
+    pollingError.clear()
+  } finally { refreshing.value = false }
 }
 onMounted(() => {
   void polling.run() // 首跑立即（start() 只设定时器；证书队列横幅已入轮询闭包随首跑）
@@ -357,13 +375,32 @@ onMounted(() => {
 })
 onUnmounted(() => polling.stop())
 
+// FE-70-9：轮询失败可见化（此前只落 console）。契约性失败（TypeError）退避
+// 期间轮询闭包经 canRun 门跳过；横幅「立即重试」重置退避立即拉取。
+const pollingError = usePollingErrorState()
+const pollingErrorDescription = computed(() => {
+  const lastError = formatDate(pollingError.lastErrorAt.value)
+  const retryAt = formatDate(pollingError.retryAt.value)
+  return retryAt
+    ? `最后错误：${lastError}；契约响应异常，自动重试已退避至 ${retryAt}`
+    : `最后错误：${lastError}`
+})
 const polling = usePollingTask(async () => {
   // U5-P3-4：证书队列横幅与任务列表同频 10s（曾只在 mounted/手动刷新拉取，横幅最长陈旧一个会话）
+  if (!pollingError.canRun()) return
   await Promise.all([fetchTasks(), fetchSeries(), fetchCertQueue()])
+  pollingError.clear()
 }, {
   interval: 10000,
-  onError: (e) => console.error('task monitor poll failed:', e),
+  onError: (e) => {
+    console.error('task monitor poll failed:', e)
+    pollingError.recordError(e)
+  },
 })
+const retryPolling = async (): Promise<void> => {
+  pollingError.resetBackoff()
+  await polling.run()
+}
 // ===== 证书队列状态（独立卡——非任务族） =====
 interface CertJobRow { id: number; domain: string; status: string; updated_at?: string | null; ca_provider_name?: string }
 // FE-D3（第 69 轮）：certQueue.loaded 死字段删除（写字段零消费方）。
@@ -378,8 +415,10 @@ const fetchCertQueue = async () => {
     const count = (pred: (j: CertJobRow) => boolean) => live.filter(pred).length
     certQueue.value = {
       total: live.length,
+      // FE-70-3：进行中扣除 waiting_ca——曾 live-queued 把「等 CA」双计进
+      // 「进行中」（同屏「进行中 2·等 CA 2」实为同一批任务）；waiting 仅入「等 CA」
       queued: count(j => ['queued', 'pending'].includes(j.status)),
-      running: live.length - count(j => ['queued', 'pending'].includes(j.status)),
+      running: live.length - count(j => ['queued', 'pending'].includes(j.status)) - count(j => j.status === 'waiting_ca'),
       waiting: count(j => j.status === 'waiting_ca'),
       jobs: live.slice(0, 6),
     }
@@ -453,6 +492,13 @@ const onTrigger = async (row: TaskInfo) => {
   fetchTasks()
 }
 const onToggle = async (row: TaskInfo, enabled: boolean) => {
+  // 方案 A 配套：业务开关联动关闭（自动更新/自动备份等设置页开关）时，
+  // 开关列显示「已暂停」来自 enabled=false——此时拨动只改 loop_on 无实际
+  // 效果且开关仍显示关。给出解释并引导到对应设置页，不误改调度开关。
+  if (row.enabled === false) {
+    ElMessage.warning('该任务的业务开关已关闭（如自动更新/自动备份设置），请到对应设置页开启后调度才会运行')
+    return
+  }
   // 常驻族停止前确认（功能中断影响大——如安全事件采集停摆）
   if (!enabled && row.kind === 'daemon') {
     try {
@@ -490,7 +536,7 @@ const detailTone = computed((): 'primary' | 'success' | 'warning' | 'danger' | u
   const st = detailTask.value?.status
   if (st === 'failed') return 'danger'
   if (st === 'running') return 'primary'
-  if (st === 'stopped' || st === 'disabled') return 'warning'
+  if (st === 'disabled') return 'warning' // 仅 cert-job 退役行（方案 A：stopped 已退役）
   return undefined
 })
 const isCertJobRow = (id: string): boolean => id.startsWith('cert-job:')
@@ -508,7 +554,11 @@ const fetchCertJobHistory = async (jobId: number): Promise<RunRecord[]> => {
   const end = j.updated_at ? Date.parse(j.updated_at) : NaN
   return [{
     id: j.id, task_id: `cert-job:${j.id}`, family: 'cert-job', trigger: 'queue', status: j.status,
-    started_at: j.created_at || '', finished_at: j.updated_at || '',
+    // FE-70-2：cert_jobs 为 UTC 存储族（RFC3339Z）——映射时经 formatDate 转配置
+    // 时区墙串再入列（fmtTime 对墙串原样渲染）；同页引擎族 last_run 为配置时区
+    // 墙串不经此处。duration 用原始 RFC3339 串 Date.parse 差值，不受格式化影响。
+    started_at: j.created_at ? formatDate(j.created_at) : '',
+    finished_at: j.updated_at ? formatDate(j.updated_at) : '',
     duration_ms: !isNaN(start) && !isNaN(end) && end > start ? end - start : 0,
     message: j.message || undefined,
   }]
@@ -559,10 +609,11 @@ onUnmounted(closeLogs)
 
 
 // ===== 文案 =====
-// 状态五态统一（R63 设计重构）：引擎族只呈现 running/idle/failed/stopped/disabled；
-// cert-job 行的 queued 等队列态经 certJobStatusLabel 回退链显示
+// 状态列方案 A（2026-10-12 用户裁定）：只承载执行语义——running/idle/failed
+// （cert-job 行另走 certJobStatusLabel 全状态集：queued/waiting_ca/disabled=已禁用）。
+// stopped/disabled 已从引擎族状态产出退役（调度语义归开关列 loop_on&&enabled）。
 const statusLabels: Record<string, string> = {
-  running: '运行中', idle: '空闲', failed: '失败', stopped: '已停止', disabled: '已暂停',
+  running: '运行中', idle: '空闲', failed: '失败',
 }
 const statusLabel = (s: string) => statusLabels[s] || certJobStatusLabel(s as CertJobStatus)
 // v2.0 四类型：定时(蓝)/常驻(绿)/循环(青)/触发(橙)
@@ -644,7 +695,7 @@ const fmtDuration = (ms?: number) => {
 .tm-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--tm-c, #9aa0b5); box-shadow: 0 0 6px var(--tm-c, transparent); }
 .tm-status[data-status="running"] { --tm-c: #4f8cff; }
 .tm-status[data-status="failed"] { --tm-c: #f87171; }
-.tm-status[data-status="stopped"], .tm-status[data-status="disabled"] { --tm-c: #62687f; }
+.tm-status[data-status="disabled"] { --tm-c: #62687f; } /* 方案 A：stopped 退役；disabled 仅 cert-job 退役行 */
 .tm-status[data-status="idle"] { --tm-c: #9aa0b5; }
 .tm-tag-periodic {
   --el-tag-bg-color: rgba(0, 168, 168, 0.1);

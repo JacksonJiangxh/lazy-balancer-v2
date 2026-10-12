@@ -5,7 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +17,7 @@ import (
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 // resetCertificateServiceForTest 测试后复位 certificateService 全局单例——
@@ -599,6 +603,123 @@ func TestCertificateService_renewExpiringCertificates_retries_failed_first_issua
 	}
 	close(release)
 	<-done
+}
+
+// CERT-A（第 70 轮）：已达最大重试的 issued/failed 任务每轮续签扫描都会被
+// 重复选出并入摘要后静默 continue——至少要留 warn 痕，操作者可见「仅手动
+// 重试可达」（waiting_ca 有终局转换+审计，同条件 issued/failed 零痕迹）。
+func TestCertificateService_renewExpiringCertificates_logs_capped_skip(t *testing.T) {
+	// Given：临期 issued 任务已达最大续签重试次数
+	_, database := newClusterTestService(t)
+	ResetCAQueueManagerForTest()
+	InitCAQueueManager(func() error { return nil })
+	t.Cleanup(ResetCAQueueManagerForTest)
+	ruleID := "lb_capped_warn"
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES (?,?,?,'http',8080,1,1,'acme_dns')`, ruleID, ruleID, ruleID+".example.com"); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	maxAttempts := GetCertRenewalAttempts()
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,expires_at,renewal_attempts,ca_provider_id) VALUES (?,?, 'issued', datetime('now','+1 day'),?,1)`, ruleID, ruleID+".example.com", maxAttempts); err != nil {
+		t.Fatalf("seed capped job: %v", err)
+	}
+	var buf strings.Builder
+	oldWriter := log.Writer()
+	oldFlags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(oldWriter)
+		log.SetFlags(oldFlags)
+	})
+
+	// When
+	resetCertificateServiceForTest(t)
+	NewCertificateService().renewExpiringCertificates()
+
+	// Then：静默跳过必须留 warn 痕（含任务号与上限值）
+	if !strings.Contains(buf.String(), "已达最大重试次数") {
+		t.Fatalf("capped job skipped without warn trace, log=%q", buf.String())
+	}
+	var attempts int
+	if err := database.QueryRow("SELECT renewal_attempts FROM cert_jobs WHERE rule_id=?", ruleID).Scan(&attempts); err != nil {
+		t.Fatalf("read capped job: %v", err)
+	}
+	if attempts != maxAttempts {
+		t.Fatalf("capped job attempts=%d, want unchanged %d", attempts, maxAttempts)
+	}
+}
+
+// CERT71-3（第 71 轮审计）：续期摘要分档——已达上限任务每轮仍被选出（CERT-A
+// warn 形态，自动重试不可达），摘要不得把它们无声计入「待重试」；须标注
+// 「其中 M 个已达重试上限，仅手动重签可达」。
+func TestCertificateService_renewExpiringCertificates_summaryTiersCappedJobs(t *testing.T) {
+	// Given：一条临期未达上限（会入队重试）+ 一条临期已达上限（仅 warn）
+	_, database := newClusterTestService(t)
+	ResetCAQueueManagerForTest()
+	InitCAQueueManager(func() error { return nil })
+	t.Cleanup(ResetCAQueueManagerForTest)
+	for _, ruleID := range []string{"lb_sum_normal", "lb_sum_capped"} {
+		if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES (?,?,?,'http',8080,1,1,'acme_dns')`, ruleID, ruleID, ruleID+".example.com"); err != nil {
+			t.Fatalf("seed rule %s: %v", ruleID, err)
+		}
+	}
+	maxAttempts := GetCertRenewalAttempts()
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,expires_at,renewal_attempts,ca_provider_id) VALUES
+		('lb_sum_normal','lb_sum_normal.example.com','issued',datetime('now','+1 day'),0,1),
+		('lb_sum_capped','lb_sum_capped.example.com','issued',datetime('now','+1 day'),?,1)`, maxAttempts); err != nil {
+		t.Fatalf("seed cert jobs: %v", err)
+	}
+	logDir := filepath.Join(t.TempDir(), "tasks")
+	oldDir := taskengine.LogDir()
+	taskengine.SetLogDir(logDir)
+	t.Cleanup(func() { taskengine.SetLogDir(oldDir) })
+
+	// When
+	resetCertificateServiceForTest(t)
+	NewCertificateService().renewExpiringCertificates()
+
+	// Then：N=2 其中 M=1 分档可见（修复前两任务混入同一「待重试」口径）
+	data, err := os.ReadFile(taskengine.TaskLogPath("cert-renewal-scan"))
+	if err != nil {
+		t.Fatalf("read task log: %v", err)
+	}
+	want := "检测到 2 个临期/待重试证书任务（其中 1 个已达重试上限，仅手动重签可达）"
+	if !strings.Contains(string(data), want) {
+		t.Fatalf("摘要未分档: %q", string(data))
+	}
+}
+
+// CERT71-3 反向形状：全部未达上限时保持原摘要文案（不追加空分档括注）。
+func TestCertificateService_renewExpiringCertificates_summaryKeepsPlainFormWithoutCappedJobs(t *testing.T) {
+	_, database := newClusterTestService(t)
+	ResetCAQueueManagerForTest()
+	InitCAQueueManager(func() error { return nil })
+	t.Cleanup(ResetCAQueueManagerForTest)
+	ruleID := "lb_sum_plain"
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES (?,?,?,'http',8080,1,1,'acme_dns')`, ruleID, ruleID, ruleID+".example.com"); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,expires_at,renewal_attempts,ca_provider_id) VALUES (?,?, 'issued', datetime('now','+1 day'),0,1)`, ruleID, ruleID+".example.com"); err != nil {
+		t.Fatalf("seed cert job: %v", err)
+	}
+	logDir := filepath.Join(t.TempDir(), "tasks")
+	oldDir := taskengine.LogDir()
+	taskengine.SetLogDir(logDir)
+	t.Cleanup(func() { taskengine.SetLogDir(oldDir) })
+
+	resetCertificateServiceForTest(t)
+	NewCertificateService().renewExpiringCertificates()
+
+	data, err := os.ReadFile(taskengine.TaskLogPath("cert-renewal-scan"))
+	if err != nil {
+		t.Fatalf("read task log: %v", err)
+	}
+	if !strings.Contains(string(data), "检测到 1 个临期/待重试证书任务：") {
+		t.Fatalf("原摘要文案缺席: %q", string(data))
+	}
+	if strings.Contains(string(data), "已达重试上限") {
+		t.Fatalf("无上限任务时不得追加空分档括注: %q", string(data))
+	}
 }
 
 func TestCertificateService_requeueWaitingCAJobs_disables_orphaned_waiting_job(t *testing.T) {

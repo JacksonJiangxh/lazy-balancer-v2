@@ -651,7 +651,7 @@ func TestMigrateLbRulesPrimaryKey_preserves_upstream_connection_settings(t *test
 			custom_routes_enabled BOOLEAN, proxy_dial_timeout INTEGER, proxy_response_header_timeout INTEGER,
 			proxy_read_timeout INTEGER, proxy_write_timeout INTEGER, proxy_stream_timeout INTEGER,
 			proxy_flush_interval INTEGER, proxy_stream_close_delay INTEGER,
-			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
+			host_header TEXT, origin_domain TEXT NOT NULL DEFAULT '', enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
 			tls_source TEXT, acme_config_id INTEGER, ca_provider_id INTEGER, enable_compress BOOLEAN,
 			compress_types TEXT, enabled BOOLEAN, log_enabled BOOLEAN, created_by INTEGER, created_at DATETIME,
 			updated_at DATETIME, updated_by INTEGER, caddy_id TEXT,
@@ -660,7 +660,9 @@ func TestMigrateLbRulesPrimaryKey_preserves_upstream_connection_settings(t *test
 			block_page_stage3_id INTEGER NOT NULL DEFAULT 0,
 			block_page_stage3_status INTEGER NOT NULL DEFAULT 0,
 			-- 真实启动序：ensureNewColumns 先于 PK 重建运行，重建只见补列后形态
-			health_check_host TEXT NOT NULL DEFAULT ''
+			health_check_host TEXT NOT NULL DEFAULT '',
+			ntlm_compatible INTEGER NOT NULL DEFAULT 0,
+			upstream_force_http1 INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE TABLE upstreams (
 			id INTEGER PRIMARY KEY, rule_id INTEGER NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
@@ -955,7 +957,7 @@ func TestInitialize_canonicalizes_lb_rule_domain_after_caddy_id_backfill(t *test
 			custom_routes_enabled BOOLEAN, proxy_dial_timeout INTEGER, proxy_response_header_timeout INTEGER,
 			proxy_read_timeout INTEGER, proxy_write_timeout INTEGER, proxy_stream_timeout INTEGER,
 			proxy_flush_interval INTEGER, proxy_stream_close_delay INTEGER,
-			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
+			host_header TEXT, origin_domain TEXT NOT NULL DEFAULT '', enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
 			tls_source TEXT, acme_config_id INTEGER, ca_provider_id INTEGER, enable_compress BOOLEAN,
 			compress_types TEXT, enabled BOOLEAN, log_enabled BOOLEAN, created_by INTEGER, created_at DATETIME,
 			updated_at DATETIME, updated_by INTEGER
@@ -1508,7 +1510,7 @@ func TestMigrateLbRulesPrimaryKey_rebuildsUpstreamEnabledNotNull(t *testing.T) {
 			custom_routes_enabled BOOLEAN, proxy_dial_timeout INTEGER, proxy_response_header_timeout INTEGER,
 			proxy_read_timeout INTEGER, proxy_write_timeout INTEGER, proxy_stream_timeout INTEGER,
 			proxy_flush_interval INTEGER, proxy_stream_close_delay INTEGER,
-			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
+			host_header TEXT, origin_domain TEXT NOT NULL DEFAULT '', enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
 			tls_source TEXT, acme_config_id INTEGER, ca_provider_id INTEGER, enable_compress BOOLEAN,
 			compress_types TEXT, enabled BOOLEAN, log_enabled BOOLEAN, created_by INTEGER, created_at DATETIME,
 			updated_at DATETIME, updated_by INTEGER, caddy_id TEXT,
@@ -1517,7 +1519,9 @@ func TestMigrateLbRulesPrimaryKey_rebuildsUpstreamEnabledNotNull(t *testing.T) {
 			block_page_stage3_id INTEGER NOT NULL DEFAULT 0,
 			block_page_stage3_status INTEGER NOT NULL DEFAULT 0,
 			-- 真实启动序：ensureNewColumns 先于 PK 重建运行，重建只见补列后形态
-			health_check_host TEXT NOT NULL DEFAULT ''
+			health_check_host TEXT NOT NULL DEFAULT '',
+			ntlm_compatible INTEGER NOT NULL DEFAULT 0,
+			upstream_force_http1 INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE TABLE upstreams (
 			id INTEGER PRIMARY KEY, rule_id INTEGER NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
@@ -1907,7 +1911,7 @@ func TestInitialize_recreatesIndexesDroppedByPkRebuildInSameBoot(t *testing.T) {
 			custom_routes_enabled BOOLEAN, proxy_dial_timeout INTEGER, proxy_response_header_timeout INTEGER,
 			proxy_read_timeout INTEGER, proxy_write_timeout INTEGER, proxy_stream_timeout INTEGER,
 			proxy_flush_interval INTEGER, proxy_stream_close_delay INTEGER,
-			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
+			host_header TEXT, origin_domain TEXT NOT NULL DEFAULT '', enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
 			tls_source TEXT, acme_config_id INTEGER, ca_provider_id INTEGER, enable_compress BOOLEAN,
 			compress_types TEXT, enabled BOOLEAN, log_enabled BOOLEAN, created_by INTEGER, created_at DATETIME,
 			updated_at DATETIME, updated_by INTEGER, caddy_id TEXT,
@@ -2290,7 +2294,7 @@ func TestInitialize_preservesStagePageColumnsOnLbRulesPkRebuild(t *testing.T) {
 			custom_routes_enabled BOOLEAN, proxy_dial_timeout INTEGER, proxy_response_header_timeout INTEGER,
 			proxy_read_timeout INTEGER, proxy_write_timeout INTEGER, proxy_stream_timeout INTEGER,
 			proxy_flush_interval INTEGER, proxy_stream_close_delay INTEGER,
-			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
+			host_header TEXT, origin_domain TEXT NOT NULL DEFAULT '', enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_cert_path TEXT, tls_key_path TEXT, tls_http_redirect BOOLEAN,
 			tls_source TEXT, acme_config_id INTEGER, ca_provider_id INTEGER, enable_compress BOOLEAN,
 			compress_types TEXT, enabled BOOLEAN, log_enabled BOOLEAN, created_by INTEGER, created_at DATETIME,
 			updated_at DATETIME, updated_by INTEGER, caddy_id TEXT,
@@ -2649,7 +2653,7 @@ func TestInitialize_carriesUpstreamHostColumnsThroughPkRebuild(t *testing.T) {
 			custom_routes_enabled BOOLEAN, proxy_dial_timeout INTEGER, proxy_response_header_timeout INTEGER,
 			proxy_read_timeout INTEGER, proxy_write_timeout INTEGER, proxy_stream_timeout INTEGER,
 			proxy_flush_interval INTEGER, proxy_stream_close_delay INTEGER,
-			host_header TEXT, enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_http_redirect BOOLEAN,
+			host_header TEXT, origin_domain TEXT NOT NULL DEFAULT '', enable_tls BOOLEAN, tls_cert TEXT, tls_key TEXT, tls_http_redirect BOOLEAN,
 			tls_source TEXT, acme_config_id INTEGER, ca_provider_id INTEGER, enable_compress BOOLEAN,
 			compress_types TEXT, enabled BOOLEAN, log_enabled BOOLEAN, created_by INTEGER, created_at DATETIME,
 			updated_at DATETIME, updated_by INTEGER, caddy_id TEXT,
@@ -2657,7 +2661,9 @@ func TestInitialize_carriesUpstreamHostColumnsThroughPkRebuild(t *testing.T) {
 			block_page_stage1_status INTEGER NOT NULL DEFAULT 0,
 			block_page_stage3_id INTEGER NOT NULL DEFAULT 0,
 			block_page_stage3_status INTEGER NOT NULL DEFAULT 0,
-			health_check_host TEXT NOT NULL DEFAULT ''
+			health_check_host TEXT NOT NULL DEFAULT '',
+			ntlm_compatible INTEGER NOT NULL DEFAULT 0,
+			upstream_force_http1 INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE TABLE upstreams (
 			id INTEGER PRIMARY KEY, rule_id INTEGER NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,

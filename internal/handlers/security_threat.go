@@ -55,6 +55,13 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 		}
 		rawRows = append(rawRows, s)
 	}
+	// SEC-C-N1（第 71 轮 P4·家族漏收敛）：迭代错误（rows.Err）不得以
+	// 「部分/空列表 + 200」返回——与 R36/R37 在总览/事件列表建立的
+	// 「残缺列表不得以 200」口径对齐（Scan 失败分支同响应形）。
+	if err := rows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取威胁情报库失败: " + err.Error()})
+		return
+	}
 	totalEntries := 0
 	for _, s := range rawRows {
 		listName := db.ThreatListNameBySource(s.Name)
@@ -102,7 +109,8 @@ func (h *Handlers) UpdateThreatAutoUpdate(c *gin.Context) {
 }
 
 // UpdateThreatSchedule 任务级排程保存（弹框「定时更新」区；镜像
-// UpdateCRSSchedule 形态——保存即重排启用且非失败源的 next_update）。
+// UpdateCRSSchedule 形态——保存即重排 next_update：WHERE update_enabled=1
+// 一律重排（2026-09-25 裁定，含失败源））。
 func (h *Handlers) UpdateThreatSchedule(c *gin.Context) {
 	days, hhmm, ok := h.updateLibSchedule(c, services.SetThreatSchedule)
 	if !ok {

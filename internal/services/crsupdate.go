@@ -356,7 +356,7 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		writeCRSUpdateLog("INFO", string(CRSStatusSuccess), "已是最新版本，无需更新")
 		if _, err := db.DB.Exec(
 			// 排程槽——手动触发不得改变下一次预约执行时间；现存未来槽不被回拨。
-			"UPDATE security_crs_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, next_update=IIF(auto_update=1 AND ?='auto' AND (COALESCE(next_update,'')='' OR next_update<=datetime('now')), ?, next_update) WHERE id=1",
+			"UPDATE security_crs_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotAdvanceSQL+" WHERE id=1",
 			trigger, versionTableNextSlot("security_crs_version", time.Now().UTC()),
 		); err != nil {
 			Logf("warn", "crs update: failed to record latest-version skip: %v", err)
@@ -401,7 +401,7 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		return
 	}
 	if _, err := db.DB.Exec(
-		"UPDATE security_crs_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, next_update=IIF(auto_update=1 AND ?='auto' AND (COALESCE(next_update,'')='' OR next_update<=datetime('now')), ?, next_update) WHERE id=1",
+		"UPDATE security_crs_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotAdvanceSQL+" WHERE id=1",
 		tag, trigger, versionTableNextSlot("security_crs_version", time.Now().UTC()),
 	); err != nil {
 		Logf("error", "crs update: failed to record success: %v", err)
@@ -490,8 +490,6 @@ func (m *CRSUpdateManager) downloadTarballLogged(ctx context.Context, tag, destP
 	return nil
 }
 
-// StatusSnapshot returns the in-memory task view, falling back to the stored
-// terminal state when no update has run since process start.
 // CancelRunning 取消当前运行中的更新（下载阶段中断）。无运行中任务返回 false。
 func (m *CRSUpdateManager) CancelRunning() bool {
 	m.mu.Lock()
@@ -505,6 +503,8 @@ func (m *CRSUpdateManager) CancelRunning() bool {
 	return true
 }
 
+// StatusSnapshot returns the in-memory task view, falling back to the stored
+// terminal state when no update has run since process start.
 func (m *CRSUpdateManager) StatusSnapshot() CRSUpdateStatusSnapshot {
 	m.mu.Lock()
 	state := m.state

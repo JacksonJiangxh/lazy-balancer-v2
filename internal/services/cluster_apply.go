@@ -517,12 +517,14 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 	}
 	if snapshot.ACME != nil {
 		for _, provider := range snapshot.ACME.CAProviders {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO ca_providers (id,name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`, provider.ID, provider.Name, provider.Provider, provider.DirectoryURL, nullableString(provider.Credentials), provider.MaxConcurrent, provider.MinIntervalMS, provider.Enabled, provider.CreatedAt, provider.UpdatedAt); err != nil {
+			// CL-1（第 70 轮审计）：从端全部时间列统一平面格式（nullableTimeFlat/
+			// UTC 直写），消除驱动序列化 '+00:00'/RFC3339 后缀形态与主端三态并存。
+			if _, err := tx.ExecContext(ctx, `INSERT INTO ca_providers (id,name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`, provider.ID, provider.Name, provider.Provider, provider.DirectoryURL, nullableString(provider.Credentials), provider.MaxConcurrent, provider.MinIntervalMS, provider.Enabled, provider.CreatedAt.UTC().Format(crsTimeLayout), provider.UpdatedAt.UTC().Format(crsTimeLayout)); err != nil {
 				return fmt.Errorf("写入快照 CA 提供商 %d: %w", provider.ID, err)
 			}
 		}
 		for _, config := range snapshot.ACME.CertificateConfigs {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?)`, config.ID, config.Name, config.DNSProvider, nullableString(config.DNSCredentials), config.Enabled, config.CreatedAt, nullableTime(config.UpdatedAt.NullTime)); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?)`, config.ID, config.Name, config.DNSProvider, nullableString(config.DNSCredentials), config.Enabled, config.CreatedAt.UTC().Format(crsTimeLayout), nullableTimeFlat(config.UpdatedAt.NullTime)); err != nil {
 				return fmt.Errorf("写入快照证书配置 %d: %w", config.ID, err)
 			}
 		}
@@ -547,7 +549,7 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 			if cert.SourceStatus != "" {
 				message += "，源任务状态：" + cert.SourceStatus
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO cert_jobs (rule_id,domain,status,message,expires_at,cert_pem,key_pem,ca_provider_id,renewal_attempts,ca_available_after,last_error_code) SELECT ?,COALESCE(NULLIF(?,''),domain),'issued',?,?,?,?,?,?,?,? FROM lb_rules WHERE caddy_id=? AND tls_source='acme_dns'`, cert.RuleID, cert.Domain, message, nullableString(cert.ExpiresAt), cert.CertPEM, cert.KeyPEM, cert.CAProviderID, cert.RenewalAttempts, nullableTime(cert.CAAvailableAfter.NullTime), nullableString(cert.LastErrorCode), cert.RuleID); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO cert_jobs (rule_id,domain,status,message,expires_at,cert_pem,key_pem,ca_provider_id,renewal_attempts,ca_available_after,last_error_code) SELECT ?,COALESCE(NULLIF(?,''),domain),'issued',?,?,?,?,?,?,?,? FROM lb_rules WHERE caddy_id=? AND tls_source='acme_dns'`, cert.RuleID, cert.Domain, message, nullableString(cert.ExpiresAt), cert.CertPEM, cert.KeyPEM, cert.CAProviderID, cert.RenewalAttempts, nullableTimeFlat(cert.CAAvailableAfter.NullTime), nullableString(cert.LastErrorCode), cert.RuleID); err != nil {
 				return fmt.Errorf("写入快照证书 %s: %w", cert.RuleID, err)
 			}
 		}
@@ -610,7 +612,7 @@ func clearSyncTables(ctx context.Context, tx *sql.Tx, tables ...string) error {
 func insertSnapshotUsersAndKeys(ctx context.Context, tx *sql.Tx, snapshot models.ClusterSnapshot) error {
 	for _, user := range snapshot.Users {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO users (id,username,password_hash,role,display_name,is_enabled,password_version,password_changed_at,created_at,last_login,mfa_enabled,mfa_secret,mfa_recovery_codes,mfa_last_timestep,auth_provider,oidc_subject,oidc_issuer) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			user.ID, user.Username, user.PasswordHash, user.Role, user.DisplayName, user.IsEnabled, user.PasswordVersion, user.PasswordChangedAt, user.CreatedAt, nullableTime(user.LastLogin.NullTime),
+			user.ID, user.Username, user.PasswordHash, user.Role, user.DisplayName, user.IsEnabled, user.PasswordVersion, user.PasswordChangedAt, user.CreatedAt.UTC().Format(crsTimeLayout), nullableTimeFlat(user.LastLogin.NullTime),
 			user.MFAEnabled, user.MFASecret, user.MFARecoveryCodes, user.MFALastTimestep,
 			user.AuthProvider, user.OIDCSubject, user.OIDCIssuer); err != nil {
 			return fmt.Errorf("写入快照用户 %s: %w", user.Username, err)
@@ -629,7 +631,7 @@ func insertSnapshotUsersAndKeys(ctx context.Context, tx *sql.Tx, snapshot models
 				return fmt.Errorf("序列化快照密钥 %d 的 MCP IP 白名单: %w", key.ID, err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO api_keys (id,name,key_hash,key_prefix,created_by,expires_at,is_enabled,mcp_enabled,read_only,mcp_ip_whitelist,last_used,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, key.ID, key.Name, key.KeyHash, key.KeyPrefix, key.CreatedBy, nullableString(key.ExpiresAt), key.IsEnabled, key.MCPEnabled, key.ReadOnly, string(whitelistJSON), nullableTime(key.LastUsed.NullTime), key.CreatedAt); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO api_keys (id,name,key_hash,key_prefix,created_by,expires_at,is_enabled,mcp_enabled,read_only,mcp_ip_whitelist,last_used,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, key.ID, key.Name, key.KeyHash, key.KeyPrefix, key.CreatedBy, nullableString(key.ExpiresAt), key.IsEnabled, key.MCPEnabled, key.ReadOnly, string(whitelistJSON), nullableTimeFlat(key.LastUsed.NullTime), key.CreatedAt.UTC().Format(crsTimeLayout)); err != nil {
 			return fmt.Errorf("写入快照密钥 %d: %w", key.ID, err)
 		}
 	}
@@ -1114,8 +1116,8 @@ func insertSnapshotRules(ctx context.Context, tx *sql.Tx, rules []models.LbRule)
 		// 节哈希主从相等的不变量基础。第 69 轮两处平行手写块改一侧漏另一侧即
 		// 本次「分区滞后」永不自愈事故的根因。
 		normalizeRuleForTransport(&rule)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO lb_rules (id,caddy_id,name,description,protocol,domain,listen_port,strategy,dynamic_dns,enable_dns_server,dns_server,dns_family,health_check_path,health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold,enable_active_health_check,tcp_health_check_port,tcp_proxy_protocol,tcp_try_duration,tcp_try_interval,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden,chain_race_interval_ms,chain_request_timeout_ms,custom_routes_enabled,proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,origin_domain,health_check_host,enable_tls,tls_source,acme_config_id,ca_provider_id,tls_cert,tls_key,tls_cert_path,tls_key_path,tls_http_redirect,enable_compress,compress_types,enabled,log_enabled,created_by,updated_by,created_at,updated_at,block_page_stage1_id,block_page_stage1_status,block_page_stage3_id,block_page_stage3_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			rule.ID, rule.CaddyID, rule.Name, rule.Description, rule.Protocol, rule.Domain, rule.ListenPort, rule.Strategy, rule.DynamicDNS, rule.EnableDnsServer, rule.DnsServer, rule.DnsFamily, rule.HealthCheckPath, rule.HealthCheckInterval, rule.HealthCheckTimeout, rule.HealthCheckUnhealthyThreshold, rule.HealthCheckHealthyThreshold, rule.EnableActiveHealthCheck, rule.TCPHealthCheckPort, rule.TCPProxyProtocol, rule.TCPTryDuration, rule.TCPTryInterval, rule.RequestBodyMaxSizeMB, rule.UpstreamKeepaliveTimeout, rule.ServerTokensHidden, rule.ChainRaceIntervalMS, rule.ChainRequestTimeoutMS, rule.CustomRoutesEnabled, rule.ProxyDialTimeout, rule.ProxyResponseHeaderTimeout, rule.ProxyReadTimeout, rule.ProxyWriteTimeout, rule.ProxyStreamTimeout, rule.ProxyFlushInterval, rule.ProxyStreamCloseDelay, rule.OriginDomain, rule.HealthCheckHost, rule.EnableTLS, rule.TLSSource, rule.ACMEConfigID, rule.CAProviderID, rule.TLSCert, rule.TLSKey, rule.TLSCertPath, rule.TLSKeyPath, rule.TLSHTTPRedirect, rule.EnableCompress, rule.CompressTypes, rule.Enabled, rule.LogEnabled, rule.CreatedBy, rule.UpdatedBy, rule.CreatedAt.UTC().Format("2006-01-02 15:04:05"), nullableTimeFlat(rule.UpdatedAt.NullTime), rule.BlockPageStage1ID, rule.BlockPageStage1Status, rule.BlockPageStage3ID, rule.BlockPageStage3Status); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO lb_rules (id,caddy_id,name,description,protocol,domain,listen_port,strategy,dynamic_dns,enable_dns_server,dns_server,dns_family,health_check_path,health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold,enable_active_health_check,tcp_health_check_port,tcp_proxy_protocol,tcp_try_duration,tcp_try_interval,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden,ntlm_compatible,upstream_force_http1,chain_race_interval_ms,chain_request_timeout_ms,custom_routes_enabled,proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,origin_domain,health_check_host,enable_tls,tls_source,acme_config_id,ca_provider_id,tls_cert,tls_key,tls_cert_path,tls_key_path,tls_http_redirect,enable_compress,compress_types,enabled,log_enabled,created_by,updated_by,created_at,updated_at,block_page_stage1_id,block_page_stage1_status,block_page_stage3_id,block_page_stage3_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			rule.ID, rule.CaddyID, rule.Name, rule.Description, rule.Protocol, rule.Domain, rule.ListenPort, rule.Strategy, rule.DynamicDNS, rule.EnableDnsServer, rule.DnsServer, rule.DnsFamily, rule.HealthCheckPath, rule.HealthCheckInterval, rule.HealthCheckTimeout, rule.HealthCheckUnhealthyThreshold, rule.HealthCheckHealthyThreshold, rule.EnableActiveHealthCheck, rule.TCPHealthCheckPort, rule.TCPProxyProtocol, rule.TCPTryDuration, rule.TCPTryInterval, rule.RequestBodyMaxSizeMB, rule.UpstreamKeepaliveTimeout, rule.ServerTokensHidden, rule.NTLMCompatible, rule.UpstreamForceHTTP1, rule.ChainRaceIntervalMS, rule.ChainRequestTimeoutMS, rule.CustomRoutesEnabled, rule.ProxyDialTimeout, rule.ProxyResponseHeaderTimeout, rule.ProxyReadTimeout, rule.ProxyWriteTimeout, rule.ProxyStreamTimeout, rule.ProxyFlushInterval, rule.ProxyStreamCloseDelay, rule.OriginDomain, rule.HealthCheckHost, rule.EnableTLS, rule.TLSSource, rule.ACMEConfigID, rule.CAProviderID, rule.TLSCert, rule.TLSKey, rule.TLSCertPath, rule.TLSKeyPath, rule.TLSHTTPRedirect, rule.EnableCompress, rule.CompressTypes, rule.Enabled, rule.LogEnabled, rule.CreatedBy, rule.UpdatedBy, rule.CreatedAt.UTC().Format("2006-01-02 15:04:05"), nullableTimeFlat(rule.UpdatedAt.NullTime), rule.BlockPageStage1ID, rule.BlockPageStage1Status, rule.BlockPageStage3ID, rule.BlockPageStage3Status); err != nil {
 			return fmt.Errorf("写入快照规则 %s: %w", rule.CaddyID, err)
 		}
 		for _, upstream := range rule.Upstreams {
@@ -1130,6 +1132,8 @@ func insertSnapshotRules(ctx context.Context, tx *sql.Tx, rules []models.LbRule)
 	return nil
 }
 
+// CL-B1（第 71 轮审计）：本函数与 nullableTimeFlat 的时间戳布局统一引用
+// crsTimeLayout 常量（此前字面量与常量双拼法并存）。
 func insertSnapshotPathRules(ctx context.Context, tx *sql.Tx, ruleID string, pathRules []models.PathRule) error {
 	for _, pathRule := range pathRules {
 		var upstreamsJSON any
@@ -1142,9 +1146,9 @@ func insertSnapshotPathRules(ctx context.Context, tx *sql.Tx, ruleID string, pat
 		}
 		var err error
 		if pathRule.ID > 0 {
-			_, err = tx.ExecContext(ctx, `INSERT INTO path_rules (id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, pathRule.ID, ruleID, pathRule.SortOrder, pathRule.MatchType, pathRule.Path, pathRule.UpstreamPath, upstreamsJSON, pathRule.ResponseMode, pathRule.ResponseStatus, pathRule.ResponseBody, pathRule.ResponseContentType, pathRule.RedirectTo, pathRule.CreatedAt.UTC().Format("2006-01-02 15:04:05"), nullableTimeFlat(pathRule.UpdatedAt))
+			_, err = tx.ExecContext(ctx, `INSERT INTO path_rules (id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, pathRule.ID, ruleID, pathRule.SortOrder, pathRule.MatchType, pathRule.Path, pathRule.UpstreamPath, upstreamsJSON, pathRule.ResponseMode, pathRule.ResponseStatus, pathRule.ResponseBody, pathRule.ResponseContentType, pathRule.RedirectTo, pathRule.CreatedAt.UTC().Format(crsTimeLayout), nullableTimeFlat(pathRule.UpdatedAt))
 		} else {
-			_, err = tx.ExecContext(ctx, `INSERT INTO path_rules (rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, ruleID, pathRule.SortOrder, pathRule.MatchType, pathRule.Path, pathRule.UpstreamPath, upstreamsJSON, pathRule.ResponseMode, pathRule.ResponseStatus, pathRule.ResponseBody, pathRule.ResponseContentType, pathRule.RedirectTo, pathRule.CreatedAt.UTC().Format("2006-01-02 15:04:05"), nullableTimeFlat(pathRule.UpdatedAt))
+			_, err = tx.ExecContext(ctx, `INSERT INTO path_rules (rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, ruleID, pathRule.SortOrder, pathRule.MatchType, pathRule.Path, pathRule.UpstreamPath, upstreamsJSON, pathRule.ResponseMode, pathRule.ResponseStatus, pathRule.ResponseBody, pathRule.ResponseContentType, pathRule.RedirectTo, pathRule.CreatedAt.UTC().Format(crsTimeLayout), nullableTimeFlat(pathRule.UpdatedAt))
 		}
 		if err != nil {
 			return fmt.Errorf("写入快照路径 %s: %w", pathRule.Path, err)
@@ -1261,22 +1265,15 @@ func snapshotNullableDatetime(value interface{}) any {
 	return nullableString(s)
 }
 
-func nullableTime(value sql.NullTime) any {
-	if !value.Valid {
-		return nil
-	}
-	return value.Time
-}
-
-// nullableTimeFlat（2026-10-11 时间戳格式统一）：从端落库时间统一 SQLite
-// 平面格式 'YYYY-MM-DD HH:MM:SS'（UTC）——此前直写 time.Time 由驱动序列化为
-// '+00:00' 后缀格式，与主端 datetime('now') 平面格式三态并存（时间戳同构
-// 迁移的写入侧终结点）。
+// nullableTimeFlat（2026-10-11 时间戳格式统一；CL-1 第 70 轮收口全部写点）：
+// 从端落库时间统一 SQLite 平面格式 'YYYY-MM-DD HH:MM:SS'（UTC）——此前直写
+// time.Time 由驱动序列化为带时区后缀格式，与主端 datetime('now') 平面格式
+// 三态并存（时间戳同构迁移的写入侧终结点）；空值路径保持 NULL 语义。
 func nullableTimeFlat(value sql.NullTime) any {
 	if !value.Valid {
 		return nil
 	}
-	return value.Time.UTC().Format("2006-01-02 15:04:05")
+	return value.Time.UTC().Format(crsTimeLayout)
 }
 
 // snapshotSecurityVersionRowsDiffer 比较快照携带的 CRS/IP2Region 版本行与

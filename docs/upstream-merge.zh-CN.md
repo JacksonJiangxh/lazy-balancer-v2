@@ -329,3 +329,6 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
 | 2026-10-11 | 版本号对齐：`Dockerfile`/`docker-compose.yml`/`internal/config` 默认版本、构建按钮默认值、巡检基线、README 构建示例统一为 `v2.3.5`（此前几处仍停在 `v2.3.4`）|
 | 2026-10-11 | **执行合并**：裁定 D-1 切上游 `origin_domain`+map、D-2 切上游 `response_mode`；四步合并完成（22 冲突文件全部解决）；存量数据双向迁移；链式回退/引用型证书/默认端口换位保留；`go build`/`vet`/`test`（与上游基线零非环境差异）/前端 `vue-tsc`+`build` 全通过 |
 | 2026-10-11 | 公开面清理：仓库内不再描述内部开发平台（页脚链接改指本仓库、README 的 CI/同步章节改为通用表述、本文件中的平台字样去除）；`lb_rules` 的读列/列清单同步切到 `origin_domain`，过渡列 `host_header` 改为先搬后删 |
+| 2026-10-12 | **追平 `v2.3.5` 之后 11 个未打标签提交**（至 `v2.3.6-beta` / `c617664b`）：Caddy v2.11.7、Go 1.26.9 + x/net v0.60.0 + Alpine 3.24.2、coraza v3.8.1、规则级 NTLM 兼容开关、第 70/71 轮审计、task-engine 状态列方案 A；16 冲突文件全部解决（新增列 `ntlm_compatible`/`upstream_force_http1` 与自维护列取并集） |
+| 2026-10-12 | **规则级改名收口**：`lb_rules.origin_domain` 补登记进 `newColumns`，新增 `migrateLbRuleHostHeaderToOriginDomain`（`host_header` → `origin_domain` 先搬后留）；重建 DDL/INSERT/SELECT、`normalizeRuleRowsForTransport`、`migrateTCPRuleDeadFields` 由 `host_header` 统一到 `origin_domain`（修复上一轮扫尾遗留的 `no such column` 缺陷） |
+| 2026-10-12 | 版本号对齐：`.cnb.yml` 巡检基线、构建按钮默认值、README 基线声明统一到 `v2.3.6-beta` |

@@ -780,6 +780,8 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		req.RequestBodyMaxSizeMB = 0
 		req.UpstreamKeepaliveTimeout = 0
 		req.ServerTokensHidden = 0
+		// NTLM 兼容仅 HTTP 语义——TCP 创建携带 ntlm_compatible=1 由保存门
+		// （validateRuleFeatures）显式 400 拒绝，不做静默弃置（2026-10-12 定稿）。
 		// U3-1:阶段页 4 列仅 http 渲染消费——tcp 创建携带页引用即归一 0
 		// (跟随策略),不留永不消费的死引用。
 		req.BlockPageStage1ID, req.BlockPageStage1Status = 0, 0
@@ -995,23 +997,23 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			health_check_path, health_check_interval, health_check_timeout,
 			health_check_unhealthy_threshold, health_check_healthy_threshold,
 			enable_active_health_check, tcp_health_check_port, tcp_proxy_protocol, tcp_try_duration, tcp_try_interval,
-		request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden,
+		request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden, ntlm_compatible, upstream_force_http1,
 		chain_race_interval_ms, chain_request_timeout_ms,
 		custom_routes_enabled,
 		proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
-		health_check_host, enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_cert_path, tls_key_path, tls_http_redirect,
+		origin_domain, health_check_host, enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_cert_path, tls_key_path, tls_http_redirect,
 		enable_compress, compress_types, enabled, created_by, updated_at, caddy_id, log_enabled,
 		block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, req.Name, req.Description, req.Protocol, req.Domain, req.ListenPort, req.Strategy, req.DynamicDNS, req.EnableDnsServer, req.DnsServer, req.DnsFamily,
 		req.HealthCheckPath, req.HealthCheckInterval, req.HealthCheckTimeout,
 		req.HealthCheckUnhealthyThreshold, req.HealthCheckHealthyThreshold,
 		req.EnableActiveHealthCheck, req.TCPHealthCheckPort, req.TCPProxyProtocol, req.TCPTryDuration, req.TCPTryInterval,
-		req.RequestBodyMaxSizeMB, req.UpstreamKeepaliveTimeout, req.ServerTokensHidden,
+		req.RequestBodyMaxSizeMB, req.UpstreamKeepaliveTimeout, req.ServerTokensHidden, req.NTLMCompatible, req.UpstreamForceHTTP1,
 		features.ChainRaceIntervalMS, features.ChainRequestTimeoutMS,
 		features.CustomRoutesEnabled,
 		features.ProxyDialTimeout, features.ProxyResponseHeaderTimeout, features.ProxyReadTimeout, features.ProxyWriteTimeout, features.ProxyStreamTimeout, features.ProxyFlushInterval, features.ProxyStreamCloseDelay,
-		req.HealthCheckHost, req.EnableTLS, req.TLSSource, req.ACMEConfigID, req.CAProviderID, req.TLSCert, req.TLSKey, req.TLSCertPath, req.TLSKeyPath,
+		req.OriginDomain, req.HealthCheckHost, req.EnableTLS, req.TLSSource, req.ACMEConfigID, req.CAProviderID, req.TLSCert, req.TLSKey, req.TLSCertPath, req.TLSKeyPath,
 		req.TLSHTTPRedirect, req.EnableCompress, req.CompressTypes, enabledVal, userIDInt, time.Now().UTC().Format("2006-01-02 15:04:05"), caddyID, req.LogEnabled,
 		req.BlockPageStage1ID, req.BlockPageStage1Status, req.BlockPageStage3ID, req.BlockPageStage3Status)
 
@@ -1134,6 +1136,22 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	c.JSON(http.StatusCreated, models.APIResponse{Code: 0, Message: "规则已创建", Data: gin.H{"caddy_id": caddyID}})
 }
 
+// retireOldDomainCertJobOrAudit LBH-A-2（第 70 轮 P4）：UpdateRule 域名迁移
+// 三失败分支（事务开启/UPDATE/commit 失败）的「退役旧域任务 + 退役失败补
+// 审计」块逐字三份——收敛为单一 helper，三处只差退役原因/日志相位/审计
+// 前缀文案，行为零变化。R50-N3：退役失败即旧域任务保持原状（'issued'+PEM
+// 行永驻，与 pre-R49 行为等效，fail-safe 但静默），补审计让运维可见。
+func retireOldDomainCertJobOrAudit(c *gin.Context, caddyID string, existingRule models.LbRule, reason, logPhase, auditPrefix string) {
+	oldCanonical := canonicalACMEDomainForJobLookup(existingRule.Domain)
+	if retireErr := retireCertJobsForDomain(db.DB, caddyID, oldCanonical, reversedACMEDomainForm(oldCanonical), reason); retireErr != nil {
+		services.Logf("error", "CRITICAL: UpdateRule: failed to retire old-domain cert job after %s for caddy_id=%s: %v", logPhase, caddyID, retireErr)
+		recordAudit(c, "写入失败", "证书任务", services.FormatAuditDetail(
+			services.AuditRulePart(caddyID),
+			fmt.Sprintf("%s：%v。旧域任务保持原状，请人工检查", auditPrefix, retireErr),
+		))
+	}
+}
+
 func (h *Handlers) UpdateRule(c *gin.Context) {
 
 	caddyID := c.Param("caddy_id")
@@ -1191,7 +1209,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			COALESCE(health_check_path,''), COALESCE(health_check_interval,10), COALESCE(health_check_timeout,2),
 			COALESCE(health_check_unhealthy_threshold,3), COALESCE(health_check_healthy_threshold,2),
 			COALESCE(enable_active_health_check,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
-		COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0),
+		COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0),
 		COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 		COALESCE(custom_routes_enabled,0),
 		COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
@@ -1206,7 +1224,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		&existingRule.HealthCheckPath, &existingRule.HealthCheckInterval, &existingRule.HealthCheckTimeout,
 		&existingRule.HealthCheckUnhealthyThreshold, &existingRule.HealthCheckHealthyThreshold,
 		&existingRule.EnableActiveHealthCheck, &existingRule.TCPHealthCheckPort, &existingRule.TCPProxyProtocol, &existingRule.TCPTryDuration, &existingRule.TCPTryInterval,
-		&existingRule.RequestBodyMaxSizeMB, &existingRule.UpstreamKeepaliveTimeout, &existingRule.ServerTokensHidden,
+		&existingRule.RequestBodyMaxSizeMB, &existingRule.UpstreamKeepaliveTimeout, &existingRule.ServerTokensHidden, &existingRule.NTLMCompatible, &existingRule.UpstreamForceHTTP1,
 		&existingRule.ChainRaceIntervalMS, &existingRule.ChainRequestTimeoutMS,
 		&existingRule.CustomRoutesEnabled,
 		&existingRule.ProxyDialTimeout, &existingRule.ProxyResponseHeaderTimeout, &existingRule.ProxyReadTimeout, &existingRule.ProxyWriteTimeout, &existingRule.ProxyStreamTimeout, &existingRule.ProxyFlushInterval, &existingRule.ProxyStreamCloseDelay,
@@ -1325,6 +1343,12 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.ServerTokensHidden == nil {
 		req.ServerTokensHidden = &existingRule.ServerTokensHidden
 	}
+	if req.NTLMCompatible == nil {
+		req.NTLMCompatible = &existingRule.NTLMCompatible
+	}
+	if req.UpstreamForceHTTP1 == nil {
+		req.UpstreamForceHTTP1 = &existingRule.UpstreamForceHTTP1
+	}
 	// 链式回退竞速参数（LB-02 口径）：nil=沿用存量，显式 0=落库 0（渲染侧按
 	// chain 策略兜底 3000/30000）。
 	if req.ChainRaceIntervalMS == nil {
@@ -1403,6 +1427,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			req.RequestBodyMaxSizeMB = &zero
 			req.UpstreamKeepaliveTimeout = &zero
 			req.ServerTokensHidden = &zero
+			// NTLM 仅 HTTP 语义：协议切到 TCP 即归零（与 cookie 策略改写同格）。
+			req.NTLMCompatible = &zero
+			// 上游强制 HTTP/1.1 是 HTTP 传输语义——切 TCP 同步弃置。
+			req.UpstreamForceHTTP1 = &zero
 			req.CustomRoutesEnabled = &disabled
 			emptyPathRules := []models.PathRule{}
 			req.PathRules = &emptyPathRules
@@ -1462,6 +1490,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		req.RequestBodyMaxSizeMB = &tcpZero
 		req.UpstreamKeepaliveTimeout = &tcpZero
 		req.ServerTokensHidden = &tcpZero
+		// NTLM 仅 HTTP 语义：TCP 编辑（含存量残留）自愈归零。
+		req.NTLMCompatible = &tcpZero
+		req.UpstreamForceHTTP1 = &tcpZero
 		req.EnableTLS = &tcpDisabled
 		req.TLSSource = "manual"
 		req.TLSCert, req.TLSKey = "", ""
@@ -1781,6 +1812,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	args = append(args, *req.UpstreamKeepaliveTimeout)
 	query += "server_tokens_hidden = ?, "
 	args = append(args, *req.ServerTokensHidden)
+	query += "ntlm_compatible = ?, "
+	args = append(args, *req.NTLMCompatible)
+	query += "upstream_force_http1 = ?, "
+	args = append(args, *req.UpstreamForceHTTP1)
 	query += "chain_race_interval_ms = ?, "
 	args = append(args, *req.ChainRaceIntervalMS)
 	query += "chain_request_timeout_ms = ?, "
@@ -2075,16 +2110,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				// 此处域名未实际迁移，故保留 PEM 作历史、置 'disabled'——旧证留在
 				// 旧域行上无副作用（部署/续期均按新域匹配，不读此行）。
 				services.Logf("error", "UpdateRule: cert job domain migration begin failed for caddy_id=%s: %v", caddyID, txErr)
-				oldCanonical := canonicalACMEDomainForJobLookup(existingRule.Domain)
-				if retireErr := retireCertJobsForDomain(db.DB, caddyID, oldCanonical, reversedACMEDomainForm(oldCanonical), "域名迁移事务开启失败"); retireErr != nil {
-					services.Logf("error", "CRITICAL: UpdateRule: failed to retire old-domain cert job after migration begin failure for caddy_id=%s: %v", caddyID, retireErr)
-					// R50-N3：退役失败即旧域任务保持原状（'issued'+PEM 行永驻，与
-					// pre-R49 行为等效，fail-safe 但静默），补审计让运维可见。
-					recordAudit(c, "写入失败", "证书任务", services.FormatAuditDetail(
-						services.AuditRulePart(caddyID),
-						fmt.Sprintf("域名迁移事务开启失败后旧域任务退役失败：%v。旧域任务保持原状，请人工检查", retireErr),
-					))
-				}
+				retireOldDomainCertJobOrAudit(c, caddyID, existingRule, "域名迁移事务开启失败", "migration begin failure", "域名迁移事务开启失败后旧域任务退役失败")
 			} else {
 				var existingJobID int
 				queryErr := certTx.QueryRow(
@@ -2103,14 +2129,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 							services.Logf("error", "UpdateRule: cert job domain migration rollback failed for caddy_id=%s: %v", caddyID, rbErr)
 						}
 						services.Logf("error", "UpdateRule: failed to update cert job %d domain for caddy_id=%s: %v", existingJobID, caddyID, err)
-						oldCanonical := canonicalACMEDomainForJobLookup(existingRule.Domain)
-						if retireErr := retireCertJobsForDomain(db.DB, caddyID, oldCanonical, reversedACMEDomainForm(oldCanonical), "域名迁移 UPDATE 失败"); retireErr != nil {
-							services.Logf("error", "CRITICAL: UpdateRule: failed to retire old-domain cert job after migration update failure for caddy_id=%s: %v", caddyID, retireErr)
-							recordAudit(c, "写入失败", "证书任务", services.FormatAuditDetail(
-								services.AuditRulePart(caddyID),
-								fmt.Sprintf("域名迁移更新失败后旧域任务退役失败：%v。旧域任务保持原状，请人工检查", retireErr),
-							))
-						}
+						retireOldDomainCertJobOrAudit(c, caddyID, existingRule, "域名迁移 UPDATE 失败", "migration update failure", "域名迁移更新失败后旧域任务退役失败")
 						migrationRolledBack = true
 					} else {
 						services.Logf("info", "UpdateRule: migrated cert job %d domain to %s for caddy_id=%s", existingJobID, newCanonical, caddyID)
@@ -2129,14 +2148,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 						// 旧域任务持原域永驻（sweep 跳过终态），稍后 needJob 为新域
 						// 另建任务破坏「一规则一任务」。与 R48-2/R49 分支同语义退役。
 						services.Logf("error", "UpdateRule: cert job domain migration commit failed for caddy_id=%s: %v", caddyID, err)
-						oldCanonical := canonicalACMEDomainForJobLookup(existingRule.Domain)
-						if retireErr := retireCertJobsForDomain(db.DB, caddyID, oldCanonical, reversedACMEDomainForm(oldCanonical), "域名迁移 commit 失败"); retireErr != nil {
-							services.Logf("error", "CRITICAL: UpdateRule: failed to retire old-domain cert job after migration commit failure for caddy_id=%s: %v", caddyID, retireErr)
-							recordAudit(c, "写入失败", "证书任务", services.FormatAuditDetail(
-								services.AuditRulePart(caddyID),
-								fmt.Sprintf("域名迁移提交失败后旧域任务退役失败：%v。旧域任务保持原状，请人工检查", retireErr),
-							))
-						}
+						retireOldDomainCertJobOrAudit(c, caddyID, existingRule, "域名迁移 commit 失败", "migration commit failure", "域名迁移提交失败后旧域任务退役失败")
 					}
 				}
 			}
@@ -2520,6 +2532,8 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		rule.RequestBodyMaxSizeMB = 0
 		rule.UpstreamKeepaliveTimeout = 0
 		rule.ServerTokensHidden = 0
+		rule.NTLMCompatible = 0
+		rule.UpstreamForceHTTP1 = 0
 	}
 
 	userIDInt := contextUserID(c)
@@ -2570,6 +2584,8 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		ProxyReadTimeout: rule.ProxyReadTimeout, ProxyWriteTimeout: rule.ProxyWriteTimeout,
 		ProxyStreamTimeout: rule.ProxyStreamTimeout, ProxyFlushInterval: rule.ProxyFlushInterval,
 		ProxyStreamCloseDelay: rule.ProxyStreamCloseDelay,
+		NTLMCompatible:        rule.NTLMCompatible,
+		UpstreamForceHTTP1:    rule.UpstreamForceHTTP1,
 		// U3-4:TCP 三字段随负值门接入——复制路径与 CreateRule/UpdateRule 同校验
 		// (Round 38 B3 契约),不留绕行口。
 		TCPHealthCheckPort: rule.TCPHealthCheckPort,
@@ -2596,28 +2612,35 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		return
 	}
 
+	// LBH-A-1（第 70 轮 P2）：源行启用上游池混布同检——保存门只拦新建/更新
+	// 载荷，复制是对存量混布行（69 轮修复前落库/直改 DB）的旁路放大通道。
+	if err := mixedUpstreamPoolError(rule); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "源规则配置不合法：" + err.Error()})
+		return
+	}
+
 	if _, err := tx.Exec(`
 		INSERT INTO lb_rules (name, description, protocol, domain, listen_port, strategy, dynamic_dns, enable_dns_server, dns_server, dns_family,
 			health_check_path, health_check_interval, health_check_timeout,
 			health_check_unhealthy_threshold, health_check_healthy_threshold,
 			enable_active_health_check, tcp_health_check_port, tcp_proxy_protocol, tcp_try_duration, tcp_try_interval,
-			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden,
+			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden, ntlm_compatible, upstream_force_http1,
 			chain_race_interval_ms, chain_request_timeout_ms,
 			enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_cert_path, tls_key_path,
-	tls_http_redirect, enable_compress, compress_types, enabled, created_by, updated_by, created_at, updated_at, health_check_host, log_enabled, caddy_id,
+	tls_http_redirect, enable_compress, compress_types, enabled, created_by, updated_by, created_at, updated_at, origin_domain, health_check_host, log_enabled, caddy_id,
 		custom_routes_enabled,
 		proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
 		block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, rule.Name+"（副本）", rule.Description, rule.Protocol, rule.Domain, rule.ListenPort, rule.Strategy,
 		rule.DynamicDNS, rule.EnableDnsServer, rule.DnsServer, rule.DnsFamily, rule.HealthCheckPath, rule.HealthCheckInterval, rule.HealthCheckTimeout,
 		rule.HealthCheckUnhealthyThreshold, rule.HealthCheckHealthyThreshold,
 		rule.EnableActiveHealthCheck, rule.TCPHealthCheckPort, rule.TCPProxyProtocol, rule.TCPTryDuration, rule.TCPTryInterval,
-		rule.RequestBodyMaxSizeMB, rule.UpstreamKeepaliveTimeout, rule.ServerTokensHidden,
+		rule.RequestBodyMaxSizeMB, rule.UpstreamKeepaliveTimeout, rule.ServerTokensHidden, rule.NTLMCompatible, rule.UpstreamForceHTTP1,
 		rule.ChainRaceIntervalMS, rule.ChainRequestTimeoutMS,
 		rule.EnableTLS, rule.TLSSource, rule.ACMEConfigID, rule.CAProviderID, rule.TLSCert, rule.TLSKey, rule.TLSCertPath, rule.TLSKeyPath,
 		rule.TLSHTTPRedirect, rule.EnableCompress, rule.CompressTypes, 0, userIDInt, userIDInt,
-		now, now, rule.HealthCheckHost, rule.LogEnabled, newCaddyID,
+		now, now, rule.OriginDomain, rule.HealthCheckHost, rule.LogEnabled, newCaddyID,
 		rule.CustomRoutesEnabled,
 		rule.ProxyDialTimeout, rule.ProxyResponseHeaderTimeout, rule.ProxyReadTimeout, rule.ProxyWriteTimeout, rule.ProxyStreamTimeout, rule.ProxyFlushInterval, rule.ProxyStreamCloseDelay,
 		rule.BlockPageStage1ID, rule.BlockPageStage1Status, rule.BlockPageStage3ID, rule.BlockPageStage3Status,

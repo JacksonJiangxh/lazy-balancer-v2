@@ -91,6 +91,10 @@ export interface Rule extends ProxyTimeoutConfig {
   request_body_max_size_mb: number
   upstream_keepalive_timeout: number
   server_tokens_hidden: number
+  // NTLM 兼容开关：1=开启（要求 strategy=cookie；仅 HTTP 规则）
+  ntlm_compatible: number
+  // 通用列：1=上游强制 HTTP/1.1（https 上游禁 ALPN h2）；NTLM 接管时恒 1
+  upstream_force_http1: number
   // 链式回退竞速参数（strategy=chain_fallback 时生效；0=后端兜底 3000/30000）
   chain_race_interval_ms: number
   chain_request_timeout_ms: number
@@ -151,6 +155,8 @@ export interface CreateRuleRequest extends ProxyTimeoutConfig {
   request_body_max_size_mb: number
   upstream_keepalive_timeout: number
   server_tokens_hidden: number
+  ntlm_compatible: number
+  upstream_force_http1: number
   // 链式回退竞速参数（strategy=chain_fallback 时生效；0=后端兜底 3000/30000）
   chain_race_interval_ms: number
   chain_request_timeout_ms: number
@@ -179,6 +185,8 @@ export interface UpdateRuleRequest extends Omit<CreateRuleRequest,
   | 'request_body_max_size_mb'
   | 'upstream_keepalive_timeout'
   | 'server_tokens_hidden'
+  | 'ntlm_compatible'
+  | 'upstream_force_http1'
   | 'chain_race_interval_ms'
   | 'chain_request_timeout_ms'
   | 'custom_routes_enabled'
@@ -192,6 +200,8 @@ export interface UpdateRuleRequest extends Omit<CreateRuleRequest,
   request_body_max_size_mb?: number
   upstream_keepalive_timeout?: number
   server_tokens_hidden?: number
+  ntlm_compatible?: number
+  upstream_force_http1?: number
   // 链式回退竞速参数：可选——省略=保留原值（后端 *int 合并语义）
   chain_race_interval_ms?: number
   chain_request_timeout_ms?: number

@@ -48,7 +48,9 @@ fi
   # set +e: 监督器必须扛住 Caddy 的非零退出(被杀/崩溃)——外层 set -e 会在
   # caddy run 返回非零时杀死监督器本身(实测:kill -9 后监督器变僵尸不自愈)
   set +e
-  echo $$ > /tmp/lazy-balancer-caddy-supervisor.pid
+  # INFRA-71-1（第 71 轮）：pid 标记移至父壳侧写入（见下方 `) &` 后）——
+  # POSIX sh 的 $$ 在 subshell 内仍=父 shell pid，此处写入的是父壳 pid
+  # （exec 后=PID1 app），supervisorAlive 读到 app 自身恒判活。
   # 监督器日志双写: stdout(docker logs) + lazy-balancer.log(运行日志弹框可见,
   # 时间戳格式与 services.Logf 对齐)——用户在基础设置→运行日志可看完整自愈链
   APP_LOG="${LOG_FILE:-/app/logs/lazy-balancer.log}"
@@ -57,6 +59,15 @@ fi
     echo "$LINE"
     echo "$LINE" >> "$APP_LOG" 2>/dev/null
   }
+  # INFRA-A1-R1（第 70 轮回归修复）：pause 生命周期=容器运行期。监督器启动即
+  # 代表容器新生命周期，此刻 pause 必为上一生命周期残留（docker stop/start、
+  # restart 复用同一容器可写层，/tmp 不清空——仅 compose 重建容器才清），
+  # 残留会让监督器开机即 standby、永不拉起 Caddy，startup 配置载入全部 refused。
+  # 运行期协议不受影响：监督器此时尚未进主循环，stopCaddy 建/startCaddy 删照旧。
+  if [ -f "$CADDY_PAUSE_FILE" ]; then
+    rm -f "$CADDY_PAUSE_FILE"
+    sup_log "Cleared stale pause marker from previous container life"
+  fi
   CRASHES=0
   FIRST_START=1  # V1（第 67 轮）：首启豁免——容器启动由 BootSync 权威载入，
   # 触发文件仅用于运行期 Caddy 崩溃自愈（否则启动载入审计/日志双行）
@@ -148,6 +159,13 @@ fi
   done
 ) &
 
+# INFRA-71-1（第 71 轮）：监督器 pid 标记在父壳侧写入——$! = 刚后台化的
+# 子 shell 本体 pid（POSIX 后台作业 pid）；写入先于下方 exec 成 app，无
+# 时序竞争。handlers/caddy.go supervisorAlive 按此标记+stat 状态字节判定。
+echo $! > /tmp/lazy-balancer-caddy-supervisor.pid
+
 # Start backend (PID 1 — 容器 stop 时优雅退出,teardown 杀监督器+Caddy)
 echo "Starting Lazy Balancer..."
-exec /usr/local/bin/lazy-balancer serve
+# INFRA-71-4（第 71 轮）：删除 serve 位参——main.go 只有 -config/-init
+# flag，无子命令分发，位参无消费方（flag.Args 从不被读）。
+exec /usr/local/bin/lazy-balancer
