@@ -67,7 +67,7 @@ main:
         # 我们已合并到的上游版本（人工确认基线）。上游最新 tag 比它新 -> 开 Issue。
         # 每次真正合并完一个上游版本后，把这里改成新版本号再关 Issue——
         # 这是唯一的人工确认点：不改它，巡检就会一直提醒同一个版本。
-        BASELINE_TAG: v2.3.5
+        BASELINE_TAG: v2.3.6-beta
       stages:
         - name: check upstream release
           script: |

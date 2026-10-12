@@ -604,50 +604,28 @@
             <el-divider content-position="left" class="compact-divider">负载策略</el-divider>
 
             <div class="strategy-cards">
-              <div 
-                class="strategy-card" 
-                :class="{ active: wizardForm.strategy === 'weighted_round_robin' }"
-                @click="wizardForm.strategy = 'weighted_round_robin'"
+              <el-tooltip
+                v-for="card in strategyCardOptions"
+                :key="card.value"
+                placement="top"
+                :disabled="!ntlmOn || card.value === 'cookie'"
+                content="NTLM 模式下已锁定"
               >
-                <div class="strategy-card-title">轮询</div>
-                <div class="strategy-card-desc">按上游权重比例分配，权重相同即为普通轮询</div>
-              </div>
-              <div 
-                class="strategy-card" 
-                :class="{ active: wizardForm.strategy === 'least_conn' }"
-                @click="wizardForm.strategy = 'least_conn'"
-              >
-                <div class="strategy-card-title">最少连接</div>
-                <div class="strategy-card-desc">优先分配给连接数最少的服务器</div>
-              </div>
-              <div 
-                class="strategy-card" 
-                :class="{ active: wizardForm.strategy === 'ip_hash' }"
-                @click="wizardForm.strategy = 'ip_hash'"
-              >
-                <div class="strategy-card-title">IP 哈希</div>
-                <div class="strategy-card-desc">按客户端 IP 固定分配</div>
-              </div>
-              <div
-                v-if="wizardForm.protocol === 'http'"
-                class="strategy-card"
-                :class="{ active: wizardForm.strategy === 'cookie' }"
-                @click="wizardForm.strategy = 'cookie'"
-              >
-                <div class="strategy-card-title">Cookie 粘滞</div>
-                <div class="strategy-card-desc">通过 Cookie 实现精确会话粘滞</div>
-              </div>
-              <div
-                v-if="wizardForm.protocol === 'http'"
-                class="strategy-card"
-                :class="{ active: wizardForm.strategy === 'chain_fallback' }"
-                @click="wizardForm.strategy = 'chain_fallback'"
-              >
-                <div class="strategy-card-title">链式回退</div>
-                <div class="strategy-card-desc">按上游权重降序组成回退链，等待竞速间隔无有效响应即并行发出下一路，先回者胜</div>
-              </div>
+                <div
+                  class="strategy-card"
+                  :class="{ active: wizardForm.strategy === card.value, locked: ntlmOn && card.value !== 'cookie' }"
+                  @click="selectStrategy(card.value)"
+                >
+                  <div class="strategy-card-title">
+                    {{ card.title }}
+                    <el-icon v-if="ntlmOn && card.value === 'cookie'" class="strategy-lock-icon"><Lock /></el-icon>
+                  </div>
+                  <div class="strategy-card-desc">{{ card.desc }}</div>
+                </div>
+              </el-tooltip>
             </div>
 
+            <!-- 链式回退竞速参数（strategy=chain_fallback，仅 HTTP） -->
             <template v-if="wizardForm.strategy === 'chain_fallback' && wizardForm.protocol === 'http'">
               <el-form-item label="竞速间隔">
                 <el-input-number v-model="wizardForm.chain_race_interval_ms" :min="10" :max="60000" :step="50" controls-position="right" style="width: 140px;" />
@@ -657,6 +635,33 @@
                 <el-input-number v-model="wizardForm.chain_request_timeout_ms" :min="100" :max="600000" :step="100" controls-position="right" style="width: 140px;" />
                 <span class="form-tip-inline">毫秒，单个上游超过该时长仍未响应将被截断取消，避免耗时浪费</span>
               </el-form-item>
+            </template>
+
+            <!-- NTLM 兼容（2026-10-12 用户定稿）：仅 HTTP 规则可见；开启后以
+                 NTLM 接管形态锁定 7 字段（清单见 onNtlmToggle 弹框），被接管
+                 控件在各分区呈灰态 + 「NTLM 接管」徽标 -->
+            <template v-if="wizardForm.protocol === 'http'">
+              <el-divider content-position="left" class="compact-divider">NTLM 兼容</el-divider>
+
+              <el-form-item label="NTLM 兼容">
+                <div class="ntlm-switch-control">
+                  <el-switch :model-value="ntlmOn" @change="onNtlmToggle" />
+                  <el-tooltip placement="top" popper-class="ntlm-help-popper">
+                    <template #content>
+                      <div class="ntlm-help-line">适用场景：Exchange / AD / 旧版 IIS 等使用 NTLM / 协商认证的后端</div>
+                      <div class="ntlm-help-line">已知限制：</div>
+                      <div class="ntlm-help-line">· 若后端协商到 Kerberos，建议不改写 Host</div>
+                      <div class="ntlm-help-line">· 入口 HTTP/2 由客户端自动降级，不受本开关控制</div>
+                    </template>
+                    <el-icon class="ntlm-help-icon"><WarningFilled /></el-icon>
+                  </el-tooltip>
+                  <span class="form-tip-inline">为 NTLM / 协商认证后端锁定长连接亲和的代理形态</span>
+                </div>
+              </el-form-item>
+
+              <div v-if="ntlmOn" class="info-note-bar">
+                <span class="info-note-desc">NTLM 接管已生效：负载策略锁定 Cookie 会话保持 · 请求重试禁用 · 响应立即透传 · Keepalive 300s + 强制 HTTP/1.1 · 主动健康检查关闭（被动健康检查仍在役）</span>
+              </div>
             </template>
 
             <el-divider content-position="left" class="compact-divider">健康检查</el-divider>
@@ -680,8 +685,11 @@
 
               <el-form-item label="主动检查">
                 <div class="active-check-control">
-                  <el-switch v-model="wizardForm.enable_active_health_check" />
-                  <span class="form-tip-inline">{{ wizardForm.enable_active_health_check ? '周期探测，异常节点持续摘除直至恢复（推荐）' : '仅被动熔断，异常节点会周期恢复并重新接收流量' }}</span>
+                  <el-switch v-model="wizardForm.enable_active_health_check" :disabled="ntlmOn" />
+                  <span v-if="ntlmOn" class="ntlm-takeover-badge">NTLM 接管</span>
+                  <span class="form-tip-inline">{{ ntlmOn
+                    ? '已关闭：NTLM 后端探测返回 401 会被误判摘除；被动健康检查仍在役'
+                    : (wizardForm.enable_active_health_check ? '周期探测，异常节点持续摘除直至恢复（推荐）' : '仅被动熔断，异常节点会周期恢复并重新接收流量') }}</span>
                 </div>
               </el-form-item>
 
@@ -794,7 +802,19 @@
               </template>
 
               <el-divider content-position="left" class="compact-divider">代理超时</el-divider>
-              <ProxyTimeoutFields :value="wizardForm" inherit-label="全局" @update="updateRuleProxyTimeout" />
+              <ProxyTimeoutFields :value="wizardForm" inherit-label="全局" :field-overrides="proxyTimeoutFieldOverrides" @update="updateRuleProxyTimeout" />
+
+              <!-- 上游兼容：通用强制 HTTP/1.1（https 上游禁 ALPN h2）；
+                   NTLM 接管时由开关锁定为开，呈灰态 -->
+              <el-divider content-position="left" class="compact-divider">上游兼容</el-divider>
+
+              <el-form-item label="上游强制 HTTP/1.1">
+                <div class="active-check-control">
+                  <el-switch v-model="wizardForm.upstream_force_http1" :active-value="1" :inactive-value="0" :disabled="ntlmOn" />
+                  <span v-if="ntlmOn" class="ntlm-takeover-badge">NTLM 接管</span>
+                  <span class="form-tip-inline">后端不支持 HTTP/2 或使用 NTLM 认证时开启；仅对 https 上游生效</span>
+                </div>
+              </el-form-item>
             </template>
 
             <template v-if="wizardForm.protocol === 'tcp'">
@@ -824,7 +844,8 @@
             </el-form-item>
 
             <el-form-item label="Keepalive 超时">
-              <el-input-number v-model="wizardForm.upstream_keepalive_timeout" :min="0" :max="3600" controls-position="right" style="width: 120px;" />
+              <el-input-number v-model="wizardForm.upstream_keepalive_timeout" :min="0" :max="3600" controls-position="right" style="width: 120px;" :disabled="ntlmOn" />
+              <span v-if="ntlmOn" class="ntlm-takeover-badge">NTLM 接管</span>
               <span class="form-tip-inline">秒，0 = 全局默认；与上游服务器长连接的空闲超时</span>
             </el-form-item>
           </el-form>
@@ -842,6 +863,9 @@
             <el-descriptions-item label="域名" v-if="wizardForm.protocol === 'http'">{{ wizardForm.domain || '-' }}</el-descriptions-item>
             <el-descriptions-item label="监听端口">{{ wizardForm.listen_port }}</el-descriptions-item>
             <el-descriptions-item label="负载策略">{{ getStrategyLabel(wizardForm.strategy) }}</el-descriptions-item>
+            <el-descriptions-item label="NTLM 兼容" v-if="wizardForm.protocol === 'http' && ntlmOn">
+              开启（Cookie 会话保持 · 禁用重试 · 立即透传 · Keepalive 300s · 强制 HTTP/1.1 · 主动健康检查关闭）
+            </el-descriptions-item>
             <el-descriptions-item label="健康检查" v-if="wizardForm.protocol === 'http'">
               <template v-if="wizardForm.enable_active_health_check">
                 {{ wizardForm.health_check_path || '/' }} ({{ wizardForm.health_check_interval }}s/{{ wizardForm.health_check_timeout }}s){{ wizardForm.health_check_host ? `，Host: ${wizardForm.health_check_host}` : '' }}
@@ -1150,7 +1174,7 @@ import DialogHeader from '@/components/DialogHeader.vue'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import axios from 'axios'
 import { ansiToHtml } from '@/utils/ansi'
-import { formatDate } from '@/utils/date'
+import { formatDate, parseDbTimeMs } from '@/utils/date'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import RuleFlowDialog from '@/components/RuleFlowDialog.vue'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
@@ -1475,11 +1499,9 @@ const filteredRules = computed(() => {
 })
 
 
-const ruleUpdatedAtMs = (rule: Rule): number => {
-  const value = rule.updated_at
-  const t = value ? new Date(value).getTime() : 0
-  return Number.isNaN(t) ? 0 : t
-}
+// FE-70-5：墙钟串统一经 parseDbTimeMs 的 +Z 规范化——裸 new Date 在 Safari 对
+// 空格分隔格式返回 NaN，曾致排序比较恒 0 退化。
+const ruleUpdatedAtMs = (rule: Rule): number => parseDbTimeMs(rule.updated_at) ?? 0
 
 // 分页夹紧+切片：useClampedPagination 单一范式（第 52 轮 P5-3）
 const { pagedItems: pagedRules } = useClampedPagination(filteredRules, currentPage, pageSize)
@@ -1986,6 +2008,8 @@ const wizardForm = reactive<RuleForm>({
   request_body_max_size_mb: 0,
   upstream_keepalive_timeout: 0,
   server_tokens_hidden: 0,
+  ntlm_compatible: 0,
+  upstream_force_http1: 0,
   enabled: true,
   log_enabled: false,
   custom_routes_enabled: false,
@@ -2066,7 +2090,15 @@ watch(() => wizardForm.protocol, (newVal, oldVal) => {
       ElMessage.info('已切换为 TCP，监听端口自动调整为 8080')
     }
     wizardForm.enable_tls = false
+    // 切换 TCP：HTTP 专属策略（cookie/chain_fallback）回落默认
     if (wizardForm.strategy === 'cookie' || wizardForm.strategy === 'chain_fallback') wizardForm.strategy = 'weighted_round_robin'
+    // NTLM 兼容是 HTTP 语义：切 TCP 开关自动关 + 接管字段恢复默认（静默，设计定稿）
+    if (wizardForm.ntlm_compatible === 1) {
+      wizardForm.ntlm_compatible = 0
+      restoreNtlmDefaults()
+    }
+    // 上游强制 HTTP/1.1 同为 HTTP 传输语义——切 TCP 一并弃置
+    wizardForm.upstream_force_http1 = 0
     wizardForm.custom_routes_enabled = false
     wizardForm.health_check_host = ''
     wizardForm.path_rules = []
@@ -2254,13 +2286,13 @@ const validateCertificate = async () => {
   }
 
   // Validate private key format
-  const keyValid = 
-    (keyPEM.includes('-----BEGIN PRIVATE KEY-----') && keyPEM.includes('-----END PRIVATE KEY-----')) ||
-    (keyPEM.includes('-----BEGIN RSA PRIVATE KEY-----') && keyPEM.includes('-----END RSA PRIVATE KEY-----')) ||
-    (keyPEM.includes('-----BEGIN EC PRIVATE KEY-----') && keyPEM.includes('-----END EC PRIVATE KEY-----'))
-
-  if (!keyValid) {
-    certInfo.error = '私钥格式无效'
+  // FE71-1：旧哨兵串 $$PRIVATEKEY_* 全仓零产生方（后端现行掩码=tls_key 空+
+  // tls_key_set，F50-7），真实 PEM 曾被误判「私钥格式无效」致 /certificates/parse
+  // 永不发起——改认真实 PEM 头（RSA/EC/PKCS#8/OPENSSH/ENCRYPTED 等
+  // * PRIVATE KEY 形态）；本门仅 advisory，终裁仍由后端 parseTLSCertificate
+  // （tls.X509KeyPair）判定。
+  if (!/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/.test(keyPEM)) {
+    certInfo.error = '私钥格式无效，须以 -----BEGIN ... PRIVATE KEY----- 开头'
     return
   }
 
@@ -2428,6 +2460,9 @@ const openWizard = async (rule?: Rule) => {
       request_body_max_size_mb: fullRule.request_body_max_size_mb || 0,
       upstream_keepalive_timeout: fullRule.upstream_keepalive_timeout || 0,
       server_tokens_hidden: fullRule.server_tokens_hidden || 0,
+      // NTLM 接管态原样回填：7 字段实际值（-1/300 等经 || 0 保真），UI 呈灰态
+      ntlm_compatible: fullRule.ntlm_compatible === 1 ? 1 : 0,
+      upstream_force_http1: fullRule.upstream_force_http1 === 1 ? 1 : 0,
       enabled: fullRule.enabled,
       log_enabled: fullRule.log_enabled || false,
       custom_routes_enabled: fullRule.custom_routes_enabled === true,
@@ -2490,6 +2525,8 @@ const openWizard = async (rule?: Rule) => {
       request_body_max_size_mb: 0,
       upstream_keepalive_timeout: 0,
       server_tokens_hidden: 0,
+      ntlm_compatible: 0,
+      upstream_force_http1: 0,
       enable_dns_server: false,
       log_enabled: false,
       enabled: true,
@@ -2500,6 +2537,7 @@ const openWizard = async (rule?: Rule) => {
       proxy_read_timeout: 0,
       proxy_write_timeout: 0,
       proxy_stream_timeout: 0,
+      proxy_flush_interval: 0, // 此前重置族缺失：NTLM 开启后 flush=-1 为可达态，防 stale 泄漏进新建表单
       proxy_stream_close_delay: 0,
     })
   }
@@ -2590,6 +2628,76 @@ const onCustomRoutesToggle = (enabled: string | number | boolean): void => {
 const updateRuleProxyTimeout = (field: keyof ProxyTimeoutConfig, value: number): void => {
   wizardForm[field] = value
 }
+
+// ── NTLM 兼容开关（2026-10-12 用户定稿）：开启=UI 修改器，7 字段全落库；
+// 关闭/切 TCP=恢复默认（原值不保留记忆）。被接管控件呈灰态 + 「NTLM 接管」徽标 ──
+const ntlmOn = computed(() => wizardForm.protocol === 'http' && wizardForm.ntlm_compatible === 1)
+
+const strategyCardOptions = computed(() => {
+  const cards = [
+    { value: 'weighted_round_robin', title: '轮询', desc: '按上游权重比例分配，权重相同即为普通轮询' },
+    { value: 'least_conn', title: '最少连接', desc: '优先分配给连接数最少的服务器' },
+    { value: 'ip_hash', title: 'IP 哈希', desc: '按客户端 IP 固定分配' },
+  ]
+  if (wizardForm.protocol === 'http') {
+    cards.push({ value: 'cookie', title: 'Cookie 粘滞', desc: '通过 Cookie 实现精确会话粘滞' })
+    cards.push({ value: 'chain_fallback', title: '链式回退', desc: '按上游权重降序组成回退链，等待竞速间隔无有效响应即并行发出下一路，先回者胜' })
+  }
+  return cards
+})
+
+const selectStrategy = (strategy: string): void => {
+  if (ntlmOn.value) return // NTLM 接管：策略锁定 cookie，其余卡片置灰不可选
+  wizardForm.strategy = strategy
+}
+
+const applyNtlmTakeover = (): void => {
+  wizardForm.strategy = 'cookie'
+  wizardForm.proxy_flush_interval = -1
+  wizardForm.upstream_keepalive_timeout = 300
+  wizardForm.upstream_force_http1 = 1
+  wizardForm.tcp_try_duration = -1
+  wizardForm.enable_active_health_check = false
+}
+
+const restoreNtlmDefaults = (): void => {
+  wizardForm.strategy = 'weighted_round_robin'
+  wizardForm.proxy_flush_interval = 0
+  wizardForm.upstream_keepalive_timeout = 0
+  wizardForm.upstream_force_http1 = 0
+  wizardForm.tcp_try_duration = 0
+  // 主动健康检查保持关闭（默认关，用户可再自行开启）——关闭弹框中明示
+  wizardForm.enable_active_health_check = false
+}
+
+const onNtlmToggle = async (enabled: string | number | boolean): Promise<void> => {
+  if (Boolean(enabled)) {
+    try {
+      await ElMessageBox.confirm(
+        `<div style="line-height:1.9">开启后将接管以下配置：<br/>① 负载策略锁定为 Cookie 会话保持<br/>② 禁用请求重试<br/>③ 响应立即透传<br/>④ 上游连接保持 300s + 强制 HTTP/1.1<br/>⑤ 主动健康检查关闭（NTLM 后端探测返回 401 会被误判摘除；被动健康检查仍在役）<br/><strong>原配置不保留记忆，关闭时恢复默认</strong></div>`,
+        '开启 NTLM 兼容',
+        { type: 'warning', dangerouslyUseHTMLString: true, confirmButtonText: '开启', cancelButtonText: '取消' }
+      )
+    } catch {
+      return // 取消：开关由 model-value 驱动自动回弹，不改动任何字段
+    }
+    wizardForm.ntlm_compatible = 1
+    applyNtlmTakeover()
+  } else {
+    wizardForm.ntlm_compatible = 0
+    restoreNtlmDefaults()
+    await ElMessageBox.alert(
+      '已恢复默认配置：策略解锁为轮询、重试窗口 5s 默认、透传/Keepalive/HTTP1 恢复全局继承、主动健康检查关闭',
+      'NTLM 兼容已关闭',
+      { type: 'info', confirmButtonText: '知道了' }
+    )
+  }
+}
+
+// 代理超时区被接管字段（仅刷新间隔）：灰态 + 徽标 + 「立即透传」显示值
+const proxyTimeoutFieldOverrides = computed(() => ntlmOn.value
+  ? { proxy_flush_interval: { disabled: true, badge: 'NTLM 接管', note: '立即透传（-1 = 所有响应无缓冲）' } }
+  : undefined)
 
 const moveToAdjacentWizardStep = (direction: -1 | 1): void => {
   const currentIndex = visibleWizardSteps.value.indexOf(currentStep.value)
@@ -2853,6 +2961,18 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
+  // NTLM 兼容预校验（与后端 validateRuleFeatures 同口径；正常交互不可达，
+  // 兜直改 DB/导入产生的失配态）
+  if (wizardForm.protocol === 'http' && wizardForm.ntlm_compatible === 1 && wizardForm.strategy !== 'cookie') {
+    ElMessage.warning('NTLM 兼容模式要求负载策略为 Cookie 会话保持')
+    saving.value = false
+    return
+  }
+  if (wizardForm.protocol === 'tcp' && wizardForm.ntlm_compatible === 1) {
+    ElMessage.warning('TCP 规则不支持 NTLM 兼容模式（仅 HTTP 规则可用）')
+    saving.value = false
+    return
+  }
 
   // 复制向导确认框双保存按钮（用户裁定）：「含安全策略」=副本携带源规则全部策略绑定；
   // 「仅负载规则」=副本不含任何安全策略绑定（需后绑定）。普通新建/编辑不受影响
@@ -2940,6 +3060,10 @@ const submitWizard = async () => {
       request_body_max_size_mb: wizardForm.request_body_max_size_mb || 0,
       upstream_keepalive_timeout: wizardForm.upstream_keepalive_timeout || 0,
       server_tokens_hidden: wizardForm.server_tokens_hidden || 0,
+      // NTLM 兼容：HTTP 规则显式 0/1（Update nil 合并语义下 undefined=保留原值，
+      // 关闭 NTLM 必须落 0）；TCP 规则不上送 ntlm（设计定稿，后端恒归零兜底）
+      ntlm_compatible: wizardForm.protocol === 'http' ? (wizardForm.ntlm_compatible === 1 ? 1 : 0) : undefined,
+      upstream_force_http1: wizardForm.upstream_force_http1 === 1 ? 1 : 0,
       enabled: wizardForm.enabled,
       log_enabled: wizardForm.log_enabled || false,
       custom_routes_enabled: wizardForm.protocol === 'http' && wizardForm.custom_routes_enabled,
@@ -3204,6 +3328,9 @@ const openCopyWizard = async (rule: Rule) => {
     request_body_max_size_mb: fullRule.request_body_max_size_mb || 0,
     upstream_keepalive_timeout: fullRule.upstream_keepalive_timeout || 0,
     server_tokens_hidden: fullRule.server_tokens_hidden || 0,
+    // 复制携带 NTLM 形态（后端按零值族处理接管字段），接管态原样呈现
+    ntlm_compatible: fullRule.ntlm_compatible === 1 ? 1 : 0,
+    upstream_force_http1: fullRule.upstream_force_http1 === 1 ? 1 : 0,
     log_enabled: fullRule.log_enabled || false,
     custom_routes_enabled: fullRule.custom_routes_enabled === true,
     path_rules: [...(fullRule.path_rules || [])]
@@ -3989,6 +4116,42 @@ onUnmounted(() => {
   margin-top: 2px;
 }
 
+/* NTLM 接管：非 cookie 策略卡片置灰禁点 */
+.strategy-card.locked {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.strategy-lock-icon {
+  margin-left: 4px;
+  color: #3b82f6;
+  vertical-align: -2px;
+}
+
+.ntlm-switch-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ntlm-help-icon {
+  color: #e6a23c;
+  cursor: help;
+  font-size: 15px;
+}
+
+.ntlm-takeover-badge {
+  display: inline-block;
+  padding: 0 6px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 4px;
+  background: var(--el-fill-color-light);
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
 .active-check-control {
   display: flex;
   align-items: center;
@@ -4165,4 +4328,7 @@ onUnmounted(() => {
 .rule-lock-popper .lock-row-label { flex: 0 0 auto; color: #9ca3af; }
 .rule-lock-popper .lock-row-detail { min-width: 0; color: #374151; word-break: break-all; }
 .rule-lock-popper .lock-summary-hint { font-size: 12px; color: #9ca3af; border-top: 1px dashed #e5e7eb; padding-top: 6px; }
+/* NTLM 帮助 tooltip：popper 挂 body，须非 scoped */
+.ntlm-help-popper { max-width: 360px; }
+.ntlm-help-popper .ntlm-help-line { font-size: 12px; line-height: 1.7; }
 </style>

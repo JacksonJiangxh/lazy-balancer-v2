@@ -338,7 +338,7 @@
               </el-table-column>
               <el-table-column v-if="!ipListDialogReadOnly" label="" width="80" align="center">
                 <template #default="{ $index }">
-                  <el-button link type="danger" size="small" @click="ipListForm.entries.splice(ipListEntryPageStart + $index, 1)">删除</el-button>
+                  <el-button link type="danger" size="small" @click="removeIpListEntry(ipListEntryPageStart + $index)">删除</el-button>
                 </template>
               </el-table-column>
             </el-table>
@@ -835,6 +835,14 @@ const ipListEntriesPaged = computed(() =>
 const addIpListEntry = (): void => {
   ipListForm.value.entries.push({ value: '', remark: '' })
   ipListEntryPage.value = Math.ceil(ipListForm.value.entries.length / ipListEntryPageSize)
+}
+
+// FE71-2：删除末页末条后页码越界会落在空页（空白表格）——splice 后回夹最大页
+//（同 useClampedPagination 的 maxPage 夹紧口径，entries 切片另有共享数组注释见上）
+const removeIpListEntry = (index: number): void => {
+  ipListForm.value.entries.splice(index, 1)
+  const maxPage = Math.max(1, Math.ceil(ipListForm.value.entries.length / ipListEntryPageSize))
+  if (ipListEntryPage.value > maxPage) ipListEntryPage.value = maxPage
 }
 
 // FR66-1：乱序响应守卫（镜像同文件 openRuleContent 的 ruleContentSeq 范式）——
@@ -1364,9 +1372,6 @@ onUnmounted(() => {
    nowrap+overflow hidden)把条件列多标签裁剪成单行——3/4 条件不可见。本列
    恢复换行展示(居中保持,scoped 属性选择器特异性高于全局规则)。 */
 :deep(.el-table .cell:has(.el-tag)) { flex-wrap: wrap; row-gap: 4px; }
-/* 自管标签行(EP 2.14.4 规避,同 ClusterModeCard 范式):复刻 EP
- * .el-form-item__label 计算样式(右对齐/32px 行高/12px 右内边距),
- * 宽度对齐本弹框 label-width=80px */
 
 .crs-card :deep(.el-card__header) .crs-header { display: flex; justify-content: space-between; align-items: center; width: 100%; }
 .crs-card :deep(.el-card__header) .crs-header-title { display: flex; align-items: center; gap: 12px; }

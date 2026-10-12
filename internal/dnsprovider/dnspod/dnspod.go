@@ -91,6 +91,13 @@ func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, t
 			return resolveErr
 		}
 		recordID, err = p.createRecord(ctx, freshID, subDomain, value, ttl)
+		if err == nil {
+			// AD-1（第 70 轮审计）：自愈重试成功后回写 domainID=freshID（与
+			// cleanUp deleteOne 的 U5-1 回写对称）——否则 ownership 回滚删除
+			// 与内存 owned 键仍打向陈旧 ID（删除必败/TXT 泄漏、CleanUp 键
+			// 不匹配静默零删除残留）。
+			domainID = freshID
+		}
 	}
 	if err != nil {
 		return err
@@ -171,6 +178,20 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 			if resolveErr != nil {
 				err = errors.Join(err, resolveErr)
 			} else {
+				// ADNS71-1（第 71 轮审计）：自愈换新 domain_id 后 bookkeeping 键
+				// 随之换代——残留旧键条目（kept 未选中之值/failed 回填）同步迁移
+				// 新键。否则后续 cleanUp/Present 按新键查找，旧键条目永不可达，
+				// 「failed 回填供后续清理重试」失效（仅内存模式；ownership 存储
+				// 不含 domain_id，无此问题）。
+				if p.ownership == nil {
+					p.mu.Lock()
+					if freshKey := freshID + "|" + subDomain; freshKey != key {
+						p.owned[freshKey] = append(p.owned[freshKey], p.owned[key]...)
+						delete(p.owned, key)
+						key = freshKey
+					}
+					p.mu.Unlock()
+				}
 				domainID = freshID
 				err = p.deleteRecord(ctx, freshID, recordID)
 			}

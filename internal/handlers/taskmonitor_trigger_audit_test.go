@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 // countTriggerAudit 统计「触发/任务监控」审计行数。
@@ -101,4 +103,122 @@ func TestTriggerSystemTask_triggerFailureLeavesCompensationAudit(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("Trigger 失败路径零补偿审计——任务未执行/失败无痕（孤儿审计）")
+}
+
+// TASK-2（第 70 轮 P3）：手动触发 409 预检（IsTaskInFlight）与异步 goroutine
+// Trigger 之间无原子性——并发双击两请求均可过预检，后到者在引擎 CAS 落败拿
+// ErrAlreadyRunning：任务实际已由先到请求启动，落「触发失败」审计是语义
+// 失真（用户看到失败而任务在跑）。修复：该错误在 goroutine 内静默。
+//
+// 竞态窗口窄，测试用「同线程背靠背双发 + 重试直至成形」驱动：两请求均 200
+// 且胜者已进入 Run 才算成形（非空跑），成形后断言零「触发失败」审计。
+func TestTriggerSystemTask_doubleClickRaceNoMisleadingFailAudit(t *testing.T) {
+	initTaskEngineForTest(t)
+	newBackupTestHandlers(t)
+	r, _ := taskMonitorRouter()
+	te := services.TaskEngine()
+
+	waitNotInFlight := func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if !te.IsTaskInFlight("t-race") {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	materialized := false
+	for attempt := 0; attempt < 50 && !materialized; attempt++ {
+		before := countTriggerFailAudit(t)
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		if err := te.Register(taskengine.Descriptor{
+			ID: "t-race", Family: "t", Name: "双击竞态", Kind: taskengine.KindOneshot,
+			Run: func(taskengine.RunContext) error {
+				close(entered)
+				<-release
+				return nil
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		rec1, rec2 := httptest.NewRecorder(), httptest.NewRecorder()
+		req1 := httptest.NewRequest(http.MethodPost, "/system/tasks/t-race/trigger", nil)
+		req2 := httptest.NewRequest(http.MethodPost, "/system/tasks/t-race/trigger", nil)
+		done := make(chan struct{}, 2)
+		go func() { r.ServeHTTP(rec1, req1); done <- struct{}{} }()
+		go func() { r.ServeHTTP(rec2, req2); done <- struct{}{} }()
+		<-done
+		<-done
+		if rec1.Code != http.StatusOK || rec2.Code != http.StatusOK {
+			// 预检已拦（其一 409）——竞态未成形，释放后重试
+			close(release)
+			waitNotInFlight()
+			continue
+		}
+		select {
+		case <-entered: // 两请求均 200 且胜者已进 Run——败者必拿 ErrAlreadyRunning
+			materialized = true
+		case <-time.After(2 * time.Second):
+			close(release)
+			waitNotInFlight()
+			continue
+		}
+		time.Sleep(200 * time.Millisecond) // 败者补偿路径（审计/日志）落库
+		if got := countTriggerFailAudit(t) - before; got != 0 {
+			close(release)
+			t.Fatalf("并发双击第二请求落了 %d 条「触发失败」审计——任务实际已启动（语义失真）", got)
+		}
+		close(release)
+		waitNotInFlight()
+	}
+	if !materialized {
+		t.Skip("50 次尝试内双击竞态未成形（预检均拦截）——未验证到目标分支")
+	}
+}
+
+// LNK71-1（第 71 轮 P5）：手动触发落在 skipped 终态时仍落「触发失败」审计
+// ——threat/crs/ip2region Run 体 demote 中止返回 ErrTaskSkipped（TASK-L5
+// 哨兵，task_runs 已落 skipped 行），TASK-2 修 ErrAlreadyRunning 时同族扫描
+// 未延伸到该哨兵。skipped=「非故障放弃」，复记「触发失败」是语义失真
+// （用户看到失败而任务体明确声明放弃）。修复：goroutine 内静默
+// （镜像 ErrAlreadyRunning 分支）。
+func TestTriggerSystemTask_skippedTerminalNoFailAudit(t *testing.T) {
+	initTaskEngineForTest(t)
+	newBackupTestHandlers(t)
+	te := services.TaskEngine()
+	if err := te.Register(taskengine.Descriptor{
+		ID: "skip-probe", Family: "测试", Name: "跳过探针", Kind: taskengine.KindOneshot,
+		Run: func(taskengine.RunContext) error { return taskengine.ErrTaskSkipped },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := countTriggerFailAudit(t)
+	r, _ := taskMonitorRouter()
+	resp := httptest.NewRecorder()
+	r.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/system/tasks/skip-probe/trigger", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("手动触发应 200, got %d %s", resp.Code, resp.Body.String())
+	}
+	// Trigger→runNow 同步执行：轮询 task_runs 落 skipped 终态（证明任务体
+	// 已执行且哨兵已回传 handler goroutine 的 Trigger 调用方）。
+	deadline := time.Now().Add(3 * time.Second)
+	skipped := false
+	for time.Now().Before(deadline) {
+		var status string
+		if err := db.DB.QueryRow(`SELECT status FROM task_runs WHERE task_id='skip-probe' ORDER BY id DESC LIMIT 1`).Scan(&status); err == nil && status == "skipped" {
+			skipped = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !skipped {
+		t.Fatal("skip-probe 未落 skipped 终态——任务未执行")
+	}
+	// 补偿路径（审计/日志）落库窗口（与双击竞态测试同手法）
+	time.Sleep(200 * time.Millisecond)
+	if got := countTriggerFailAudit(t) - before; got != 0 {
+		t.Fatalf("skipped 终态（非故障放弃）落了 %d 条「触发失败」审计——语义失真", got)
+	}
 }

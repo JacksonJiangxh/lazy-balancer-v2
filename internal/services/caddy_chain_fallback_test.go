@@ -146,9 +146,9 @@ func TestBuildChainProxyConfig_paramsAndDialTimeout(t *testing.T) {
 // 逐上游回源域名三级回退：上游 origin_domain > 规则级 origin_domain > 空（不发射）。
 func TestBuildChainProxyConfig_hostHeaderFallback(t *testing.T) {
 	rule := SingleRuleConfig{
-		CaddyID:    "lb_chain_host",
-		Protocol:   "http",
-		Strategy:   "chain_fallback",
+		CaddyID:      "lb_chain_host",
+		Protocol:     "http",
+		Strategy:     "chain_fallback",
 		OriginDomain: "rule-level.test",
 	}
 	ups := []UpstreamConfig{

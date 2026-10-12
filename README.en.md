@@ -92,7 +92,7 @@ smoke test, then both a `latest` and a versioned manifest.
 
 ## What we changed versus upstream
 
-**Current upstream baseline: `v2.3.5` (`98c607ac`).** Everything upstream
+**Current upstream baseline: `v2.3.6-beta` (`c617664b`, covering the 11 commits after `v2.3.5`).** Everything upstream
 shipped in that release (native `map` late-binding for origin domains,
 `response_mode` tri-state for static responses, health-check host, SNI port
 stripping, dashboard quantile interpolation, the 151-item round-69 audit, etc.)
@@ -161,6 +161,7 @@ releases.
 
 | Date | Content |
 |---|---|
+| 2026-10-12 | **Caught up the 11 untagged upstream commits after `v2.3.5`** (through `v2.3.6-beta` / `c617664b`): Caddy v2.11.7 streaming-forwarding regression fix, Go 1.26.9 + x/net v0.60.0 + Alpine 3.24.2 (10 CVEs), coraza v3.8.1 security fixes, a new rule-level NTLM compatibility switch, round 70/71 audit fixes, task-engine state-column plan A — a security/regression-grade update; our self-maintained features (chained fallback, referenced-cert ingestion, port remapping) and the rule-level `origin_domain` naming are preserved |
 | 2026-10-11 | **Merged upstream v2.3.5** (`98c607ac`): per-upstream origin domain now uses upstream `origin_domain` + native `map`, static responses use upstream `response_mode` tri-state — our `host_header` / `action=respond` implementations retired, with automatic two-way data migration; chained fallback, referenced-cert ingestion and port remapping kept |
 | 2026-10-11 | Port remap edge cases; referenced certificate ingestion; chained fallback strategy; GitHub Actions upstream sync + release watch; README rewrite; `docker-compose` now references our own image |
 | 2026-10-11 | Removed references to the internal development platform (footer link, CI section, migration notes); public surface now points at this repo |

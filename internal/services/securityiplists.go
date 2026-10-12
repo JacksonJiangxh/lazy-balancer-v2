@@ -96,60 +96,12 @@ func expandPolicyIPRefs(p *models.SecurityPolicy, listsByID map[int64][]string) 
 	return exp
 }
 
-// loadIPListEntries 在给定 store 上以一次（或分块）查询取回 id → 条目值列表
-// 映射：只解析 entries 的 value，remark 不参与生成；行缺失（悬空引用）与
-// entries 畸形行跳过——与自定义规则悬空引用仅留痕口径一致。
-// loadIPListEntries 与 loadIPListEntriesVia 是有意双实现(F64-P5 声明):
-// 前者供降级路径(渲染容忍缺失列表),后者供严格校验(refs 必须全部存在)。
-// 错误通道语义不同是设计意图,非冗余——合并需逐调用方审计错误处理链。
-func loadIPListEntries(store caddyConfigStore, ids []int64) map[int64][]string {
-	if len(ids) == 0 || store == nil {
-		return nil
-	}
-	listsByID := make(map[int64][]string, len(ids))
-	for start := 0; start < len(ids); start += ipListChunkSize {
-		end := start + ipListChunkSize
-		if end > len(ids) {
-			end = len(ids)
-		}
-		chunk := ids[start:end]
-		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
-		args := make([]interface{}, len(chunk))
-		for i, id := range chunk {
-			args[i] = id
-		}
-		rows, err := store.Query("SELECT id, COALESCE(entries,'[]') FROM security_ip_lists WHERE id IN ("+placeholders+")", args...)
-		if err != nil {
-			Logf("warn", "加载 IP 地址列表分块查询失败（id 段 %d-%d）: %v", chunk[0], chunk[len(chunk)-1], err)
-			continue
-		}
-		for rows.Next() {
-			var id int64
-			var entriesJSON string
-			if err := rows.Scan(&id, &entriesJSON); err != nil {
-				continue
-			}
-			var entries []models.IPListEntry
-			if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
-				continue
-			}
-			values := make([]string, 0, len(entries))
-			for _, entry := range entries {
-				if entry.Value != "" {
-					values = append(values, entry.Value)
-				}
-			}
-			listsByID[id] = values
-		}
-		rows.Close()
-	}
-	return listsByID
-}
-
 // LoadIPListEntriesByID 以一次查询批量加载 IP 地址列表条目值（仅 value）。
 // ids 为空或数据库未初始化时返回空映射；缺失的 id 不出现在结果中。
-// loadIPListEntriesVia：store 感知装载（审计 U1-F3）——store 非-nil（v2 导入
-// 事务视图）经其查询，nil 回退 db.DB。镜像 resolvePolicyIPListRefs 的回退逻辑。
+// loadIPListEntriesVia：唯一装载实现（F64-P5 曾声明与 loadIPListEntries 双实现，
+// 后者零调用已删——第 70 轮 SEC-A-1；渲染与严格校验统一走 Via 错误通道）。
+// store 感知装载（审计 U1-F3）——store 非-nil（v2 导入事务视图）经其查询，
+// nil 回退 db.DB。镜像 resolvePolicyIPListRefs 的回退逻辑。
 func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]string, map[int64]bool, error) {
 	if store == nil {
 		m, err := LoadIPListEntriesByID(ids)
@@ -191,6 +143,9 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 			var system int
 			var name string
 			if err := rows.Scan(&id, &raw, &system, &name); err != nil {
+				// SEC-A-F1（第 71 轮）：Scan 失败不再静默——行丢弃须留痕（该列表
+				// 若被引用，缺失表现为合并集静默缺条目）。
+				Logf("warn", "渲染: security_ip_lists 行扫描失败（该行丢弃）: %v", err)
 				continue
 			}
 			if system == 1 {
@@ -209,6 +164,9 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 				// 自定义列表：读 DB entries JSON
 				var list []models.IPListEntry
 				if err := json.Unmarshal([]byte(raw), &list); err != nil {
+					// SEC-A-F1（第 71 轮）：Unmarshal 失败同 Scan 失败——静默
+					// continue 会让该列表在 entries 缺席且零信号。
+					Logf("warn", "渲染: 自定义 IP 列表(id=%d) entries 解析失败（该列表按缺失处理）: %v", id, err)
 					continue
 				}
 				vals := make([]string, 0, len(list))
@@ -218,6 +176,20 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 					}
 				}
 				entries[id] = vals
+			}
+		}
+		// SEC-A-F1（第 71 轮 P4）：迭代错误必须显式捕获——rows.Next() 因错误
+		// （而非 EOF）返回 false 时静默走掉会让装载集合缺行而 failedIDs 不置位，
+		// 引用策略拿到「静默缺内容的合并集」绕过 IPRefMissing 严格模式
+		// （ACL/信任面静默收窄零留痕）。与查询失败分支同口径：warn+整块
+		// fail-closed（全入 failedIDs）+首错上抛。
+		if err := rows.Err(); err != nil {
+			Logf("error", "渲染: security_ip_lists 迭代失败（本块 %d 个列表全部按装载失败处理）: %v", len(chunk), err)
+			for _, id := range chunk {
+				failed[id] = true
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("store 迭代 security_ip_lists: %w", err)
 			}
 		}
 		rows.Close()
@@ -416,8 +388,10 @@ func ReadThreatIplistForUI(listName string) ([]string, error) {
 		return nil, err
 	}
 	var vals []string
+	// SEC-A-F2（第 71 轮）：#/; 注释行与渲染侧 readThreatIplistEntries、
+	// 编译侧 ipcompile 同口径过滤（三处单一行过滤契约，勿单方漂移）。
 	for _, line := range strings.Split(string(raw), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
+		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, ";") {
 			vals = append(vals, line)
 		}
 	}

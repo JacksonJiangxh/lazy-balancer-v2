@@ -45,6 +45,8 @@ type ruleFeatureInput struct {
 	TCPHealthCheckPort         int
 	TCPTryDuration             int
 	TCPTryInterval             int
+	NTLMCompatible             int
+	UpstreamForceHTTP1         int
 	// 链式回退竞速参数（strategy=chain_fallback 时参与范围校验）。
 	ChainRaceIntervalMS   int
 	ChainRequestTimeoutMS int
@@ -66,6 +68,8 @@ func createRuleFeatures(req models.CreateRuleRequest) ruleFeatureInput {
 	return ruleFeatureInput{
 		Protocol:                   req.Protocol,
 		Strategy:                   req.Strategy,
+		NTLMCompatible:             req.NTLMCompatible,
+		UpstreamForceHTTP1:         req.UpstreamForceHTTP1,
 		ListenPort:                 req.ListenPort,
 		EnableTLS:                  req.EnableTLS,
 		TLSHTTPRedirect:            req.TLSHTTPRedirect,
@@ -115,6 +119,8 @@ func updateRuleFeatures(req models.UpdateRuleRequest, existing models.LbRule) ru
 	input := ruleFeatureInput{
 		Protocol:                   existing.Protocol,
 		Strategy:                   req.Strategy,
+		NTLMCompatible:             existing.NTLMCompatible,
+		UpstreamForceHTTP1:         existing.UpstreamForceHTTP1,
 		ListenPort:                 req.ListenPort,
 		EnableTLS:                  existing.EnableTLS,
 		TLSHTTPRedirect:            existing.TLSHTTPRedirect,
@@ -200,6 +206,13 @@ func updateRuleFeatures(req models.UpdateRuleRequest, existing models.LbRule) ru
 	}
 	if req.TCPTryInterval != nil {
 		input.TCPTryInterval = *req.TCPTryInterval
+	}
+	// NTLM 兼容开关：nil=沿用存量（handler 已预合并），显式 0/1 落库。
+	if req.NTLMCompatible != nil {
+		input.NTLMCompatible = *req.NTLMCompatible
+	}
+	if req.UpstreamForceHTTP1 != nil {
+		input.UpstreamForceHTTP1 = *req.UpstreamForceHTTP1
 	}
 	// 链式回退竞速参数：指针字段同口径合并（nil 沿用 existing），使范围校验
 	// 在更新路径看到真实值。
@@ -305,6 +318,26 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 	// Round 37 I-5: strategy 白名单校验，非法值不再透传到 Caddy。
 	if err := validateStrategyForProtocol(input.Protocol, input.Strategy); err != nil {
 		return err
+	}
+	// NTLM 兼容开关（2026-10-12 用户定稿）：①值域 0/1；②仅 HTTP 语义；③开启
+	// 时强制 Cookie 会话保持——挑战-应答必须固定同一上游，任何无会话策略都会
+	// 打断握手。保存（Create/Update/复制）/启用（validateStoredRuleConfig）/
+	// 导入（validateV2BackupRules）三链同门。
+	if input.NTLMCompatible != 0 && input.NTLMCompatible != 1 {
+		return fmt.Errorf("ntlm_compatible 必须为 0 或 1")
+	}
+	// 重试窗口值域（方案 C，2026-10-12）：http 规则 tcp_try_duration ∈ [-1,60000]
+	// （-1=显式禁用重试，NTLM 接管态）；tcp 规则 ∈ [0,60000]（下方 TCP 分支拒负值）。
+	if input.Protocol == "http" && (input.TCPTryDuration < -1 || input.TCPTryDuration > 60000) {
+		return fmt.Errorf("重试窗口必须在 -1 到 60000 毫秒之间（-1=禁用重试，0=默认 5 秒窗口）")
+	}
+	if input.NTLMCompatible == 1 {
+		if input.Protocol == "tcp" {
+			return fmt.Errorf("TCP 规则不支持 NTLM 兼容模式（仅 HTTP 规则可用）")
+		}
+		if input.Strategy != "cookie" {
+			return fmt.Errorf("NTLM 兼容模式要求负载策略为 Cookie 会话保持")
+		}
 	}
 	// 链式回退竞速参数范围校验（2026-10-09）：竞速间隔 0–60000ms、单请求
 	// 兜底超时 0–600000ms；0 值合法（写侧/渲染侧按策略兜底 3000/30000）。
@@ -869,7 +902,7 @@ const lbRuleListColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE
 	COALESCE(dynamic_dns,0), COALESCE(enable_dns_server,0), COALESCE(dns_server,''), COALESCE(dns_family,'ipv4'),
 	COALESCE(health_check_path,''), COALESCE(health_check_interval,10), COALESCE(health_check_timeout,2), COALESCE(health_check_unhealthy_threshold,3), COALESCE(health_check_healthy_threshold,2),
 	COALESCE(enable_active_health_check,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
-	COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0),
+	COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0),
 	COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 	COALESCE(custom_routes_enabled,0),
 	COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
@@ -882,7 +915,7 @@ const lbRuleColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE(des
 	COALESCE(dynamic_dns,0), COALESCE(enable_dns_server,0), COALESCE(dns_server,''), COALESCE(dns_family,'ipv4'),
 	COALESCE(health_check_path,''), COALESCE(health_check_interval,10), COALESCE(health_check_timeout,2), COALESCE(health_check_unhealthy_threshold,3), COALESCE(health_check_healthy_threshold,2),
 	COALESCE(enable_active_health_check,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
-	COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0),
+	COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0),
 	COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 	COALESCE(custom_routes_enabled,0),
 	COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
@@ -905,7 +938,7 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 			&dynamicDNS, &enableDnsServer, &r.DnsServer, &dnsFamily,
 			&r.HealthCheckPath, &r.HealthCheckInterval, &r.HealthCheckTimeout, &r.HealthCheckUnhealthyThreshold, &r.HealthCheckHealthyThreshold,
 			&enableActiveHealthCheck, &r.TCPHealthCheckPort, &r.TCPProxyProtocol, &r.TCPTryDuration, &r.TCPTryInterval,
-			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden,
+			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden, &r.NTLMCompatible, &r.UpstreamForceHTTP1,
 			&r.ChainRaceIntervalMS, &r.ChainRequestTimeoutMS,
 			&r.CustomRoutesEnabled,
 			&r.ProxyDialTimeout, &r.ProxyResponseHeaderTimeout, &r.ProxyReadTimeout, &r.ProxyWriteTimeout, &r.ProxyStreamTimeout, &r.ProxyFlushInterval, &r.ProxyStreamCloseDelay,
@@ -1115,6 +1148,46 @@ func validateStageBlockPageRef(pageID, status int, label string) error {
 	return nil
 }
 
+// mixedUpstreamPoolError LBH-A-1（第 70 轮 P2）：HTTP 规则启用上游池混布
+// （保存门 handlers.go:615 同款文案/口径）——主池按启用上游统计（IIF 归一，
+// 空协议视同 http），路径池全量统计（PathRuleUpstream 无 enabled 位，与
+// 保存门 rule_features.go 路径池同口径）。启用链（EnableRule 经
+// validateStoredRuleConfig）、启动/UpdateConfig 聚合校验、复制链
+// （DuplicateRule）共用本 helper（R-12：不落第三份实现）。
+func mixedUpstreamPoolError(rule models.LbRule) error {
+	if rule.Protocol != "http" {
+		return nil
+	}
+	protos := map[string]bool{}
+	for _, u := range rule.Upstreams {
+		if !u.Enabled {
+			continue
+		}
+		proto := u.Protocol
+		if proto == "" {
+			proto = "http"
+		}
+		protos[proto] = true
+	}
+	if protos["http"] && protos["https"] {
+		return fmt.Errorf("同一 HTTP 规则的启用上游协议须一致（http/https 混布时 http 上游会被 TLS 化静默全灭；如需共存请拆分为两条规则）")
+	}
+	for _, pr := range rule.PathRules {
+		pathProtos := map[string]bool{}
+		for _, u := range pr.Upstreams {
+			proto := u.Protocol
+			if proto == "" {
+				proto = "http"
+			}
+			pathProtos[proto] = true
+		}
+		if pathProtos["http"] && pathProtos["https"] {
+			return fmt.Errorf("路径规则 %s 的自定义上游 http/https 混布（同一上游池协议须一致）", pr.Path)
+		}
+	}
+	return nil
+}
+
 func validateStoredRuleConfig(ctx context.Context, caddyID string) error {
 	rules, err := loadRulesForConfigValidation(ctx, " WHERE caddy_id = ?", caddyID)
 	if err != nil {
@@ -1156,10 +1229,30 @@ func validateStoredRuleConfig(ctx context.Context, caddyID string) error {
 	if err := validateStrategyForProtocol(rule.Protocol, rule.Strategy); err != nil {
 		return &configValidationError{message: err.Error()}
 	}
+	// NTLM 兼容开关启用门（2026-10-12）：与保存门 validateRuleFeatures 同口径
+	// ——直改 DB/旧导入的 ntlm=1+非 cookie（或 TCP+ntlm）行启用即拒，渲染侧
+	// 零特判（按落库字段纯映射），坏形态不得投入运行。
+	if rule.NTLMCompatible != 0 {
+		if rule.NTLMCompatible != 1 {
+			return &configValidationError{message: "ntlm_compatible 必须为 0 或 1"}
+		}
+		if rule.Protocol == "tcp" {
+			return &configValidationError{message: "TCP 规则不支持 NTLM 兼容模式（仅 HTTP 规则可用）"}
+		}
+		if rule.Strategy != "cookie" {
+			return &configValidationError{message: "NTLM 兼容模式要求负载策略为 Cookie 会话保持"}
+		}
+	}
 	// LB42-3①:与保存门(validateRuleFeatures)同口径——TCP+dynamic_dns 规则
 	// 渲染侧整体跳过(无 Host 头驱动解析),启用即拒,不留静默死规则。
 	if rule.Protocol == "tcp" && rule.DynamicDNS {
 		return &configValidationError{message: "TCP 规则不支持动态上游（dynamic_dns），请关闭动态 DNS 或改用 HTTP 协议"}
+	}
+	// LBH-A-1（第 70 轮 P2）：启用上游池混布与保存门同检——存量（69 轮修复
+	// 前落库/直改 DB）混布行经启用投入运行会让 http 上游被池级 TLS 化静默
+	// 全灭 502（渲染器对混布池无错误路径，静默渲染）。
+	if err := mixedUpstreamPoolError(rule); err != nil {
+		return &configValidationError{message: err.Error()}
 	}
 	return validateRuleConfigGeneration(rule)
 }
@@ -1256,6 +1349,18 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 			services.Logf("warn", "端口 %d 存在 TLS 与明文规则混布（明文：%v；TLS：%v）——该端口监听器将整体切换为 TLS，明文规则流量将握手失败，请调整规则端口", port, mix[0], mix[1])
 		}
 	}
+	// LBH-A-1（第 70 轮 P2）：存量启用行启用上游池混布点名告警（镜像
+	// portTLSMix 形态，不阻断启动——阻断会让节点起不来；启用方向已被
+	// validateStoredRuleConfig 400 拦截，此门兜直改 DB/69 轮修复前落库的
+	// 存量，提示管理员修正）。
+	for _, rule := range rules {
+		if !rule.Enabled || rule.Protocol != "http" {
+			continue
+		}
+		if err := mixedUpstreamPoolError(rule); err != nil {
+			services.Logf("warn", "规则 %s（%s）%s——混布池已进入运行态，http 上游正被池级 TLS 化静默 502，请统一上游协议或拆分规则", rule.Name, rule.CaddyID, err.Error())
+		}
+	}
 	return errors.Join(problems...)
 }
 
@@ -1298,6 +1403,9 @@ func precheckRuleConfig(rule models.LbRule) services.SingleRuleConfig {
 		Strategy: rule.Strategy, DynamicDNS: rule.DynamicDNS, EnableDnsServer: rule.EnableDnsServer,
 		DnsServer: rule.DnsServer, DnsFamily: rule.DnsFamily, CustomRoutesEnabled: rule.CustomRoutesEnabled,
 		OriginDomain: rule.OriginDomain, HealthCheckHost: rule.HealthCheckHost,
+		NTLMCompatible:     rule.NTLMCompatible,
+		UpstreamForceHTTP1: rule.UpstreamForceHTTP1,
+		TCPTryDuration:     rule.TCPTryDuration, TCPTryInterval: rule.TCPTryInterval,
 		EnableCompress: rule.EnableCompress, CompressTypes: rule.CompressTypes,
 		BlockPageStage1ID: rule.BlockPageStage1ID, BlockPageStage1Status: rule.BlockPageStage1Status,
 		BlockPageStage3ID: rule.BlockPageStage3ID, BlockPageStage3Status: rule.BlockPageStage3Status,

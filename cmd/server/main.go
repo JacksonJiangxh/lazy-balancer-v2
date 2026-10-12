@@ -50,6 +50,10 @@ func run() error {
 	// 不动存量规则的 listen_port（那是持久化数据，保存时以面板值为准）。
 	services.SetDefaultProxyPorts(cfg.HTTPPort, cfg.HTTPSPort)
 
+	// F-SYSR-5（第 71 轮·声明）：SetFlags(0) 是下方 services.NewApplicationLogWriter
+	// 日志级别过滤的隐式契约——过滤按行首 "WARNING:"/"ERROR:" 前缀判定（tz.go
+	// applicationLogWriter），标准 log 前缀会破坏该判定。此处改 flags 须同步
+	// applicationLogWriter 的前缀剥离逻辑（同注释互指）。
 	log.SetFlags(0)
 	var logWriter io.Writer = os.Stdout
 	var runtimeLogFile string
@@ -145,8 +149,10 @@ func run() error {
 	// then materialize cert files from DB, then apply Caddy config on startup
 	// SECLB23-P1-1(第 23 轮审计):审计日志目录必须在首次 ApplyConfigOnStartup
 	// 前保证存在——coraza NewWAF 时 OpenFile 不建父目录,缺失=/load 拒收。
+	// INFRA-71-5（第 71 轮）：告警改走 services.Logf("warn")——绕过日志
+	// 级别门（ApplyLogLevel 已在上方装配）会让 warn 级过滤对它失效。
 	if err := services.EnsureWafAuditDir(); err != nil {
-		log.Printf("warning: create waf audit dir failed: %v", err)
+		services.Logf("warn", "create waf audit dir failed: %v", err)
 	}
 	// WAF 文件目录按 data_dir 派生（容器 /app/data → /app/waf 恒等；本地开发
 	// 落到数据目录同级）。须在首个渲染（ApplyConfigOnStartup）之前。
@@ -357,11 +363,38 @@ func waitForServerStop(server *http.Server, signals serverStopSignals) error {
 	return nil
 }
 
+// caddyPauseFilePath 与 handlers 包的 caddyPauseFile（internal/handlers/caddy.go）
+// 及 docker-entrypoint.sh 的 CADDY_PAUSE_FILE 同值 "/tmp/lazy-balancer-caddy-paused"
+// ——main 包不 import handlers 的未导出变量，自持常量并以注释互指；任一侧
+// 改路径须三处同步（handlers 侧为测试注入缝用 var，本侧停机路径无注入需求用 const）。
+const caddyPauseFilePath = "/tmp/lazy-balancer-caddy-paused"
+
+// writeDrainPauseFile INFRA-A1（第 70 轮）：排水前建 pause 标记，让监督器把
+// 本次优雅停机按「admin 停止」分支处理（docker-entrypoint.sh 见文件不重启、
+// CRASHES 不 +1）——此前 drainCaddy 直接 POST /stop，监督器一律按崩溃重拉，
+// 排水窗口内 1s 退避重绑 80/443，伪 Crash 噪音+排水语义被消解。
+// 与 stopCaddy（handlers/caddy.go）刻意不同：仅当文件不存在时写（不覆盖
+// stopCaddy 用户意图停机的在场标记）；写后即使排水请求失败也不回滚——本
+// 函数只在整个进程退出路径上调用，而 stopCaddy 是长驻运行期操作，停失败
+// 必须回滚让监督器继续看护。
+// pause 生命周期=容器运行期。注意：docker stop/start、restart 复用同一容器
+// 可写层，/tmp 并不清空（INFRA-A1-R1 事故：曾误假设「随容器重建清空」，导致
+// 重启后监督器开机 standby、Caddy 永不拉起）——跨重启残留由监督器启动首行
+// 清残兜底（docker-entrypoint.sh INFRA-A1-R1）；非容器部署下次 startCaddy
+// 亦会删标记。此处粘滞因此安全。
+func writeDrainPauseFile() {
+	if _, err := os.Stat(caddyPauseFilePath); err == nil {
+		return
+	}
+	_ = os.WriteFile(caddyPauseFilePath, nil, 0o644)
+}
+
 // drainCaddy best-effort 请求 Caddy admin /stop（2s 上限，错误只记日志）。
 func drainCaddy(adminURL string) {
 	if adminURL == "" {
 		return
 	}
+	writeDrainPauseFile()
 	client := &http.Client{Timeout: 2 * time.Second}
 	req, err := http.NewRequest(http.MethodPost, strings.TrimSuffix(adminURL, "/")+"/stop", nil)
 	if err != nil {

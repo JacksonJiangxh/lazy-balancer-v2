@@ -141,6 +141,10 @@ type LbRule struct {
 	RequestBodyMaxSizeMB          int    `json:"request_body_max_size_mb"`
 	UpstreamKeepaliveTimeout      int    `json:"upstream_keepalive_timeout"`
 	ServerTokensHidden            int    `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
+	// NTLM 兼容开关（2026-10-12）：1=按 NTLM 兼容形态渲染（保存门强制
+	// strategy=cookie）；仅 HTTP 语义，TCP 行恒 0。
+	NTLMCompatible     int `json:"ntlm_compatible"`
+	UpstreamForceHTTP1 int `json:"upstream_force_http1"`
 	// 链式回退（strategy=chain_fallback，仅 HTTP）竞速参数（2026-10-09）：
 	// ChainRaceIntervalMS 竞速间隔——等待该时长无有效响应即并行发出下一路；
 	// ChainRequestTimeoutMS 单请求兜底截断——超过该时长未收到响应头即取消
@@ -158,7 +162,7 @@ type LbRule struct {
 	ProxyStreamCloseDelay      int        `json:"proxy_stream_close_delay"`
 	PathRules                  []PathRule `json:"path_rules"`
 	Upstreams                  []Upstream `json:"upstreams"`
-	OriginDomain                 string     `json:"origin_domain"`
+	OriginDomain               string     `json:"origin_domain"`
 	// 健康检查域名（2026-10-10）：主动健康检查 probe 的 Host 头；空=跟随 OriginDomain。
 	HealthCheckHost string `json:"health_check_host"`
 	EnableTLS       bool   `json:"enable_tls"`
@@ -465,6 +469,10 @@ type CreateRuleRequest struct {
 	RequestBodyMaxSizeMB          int    `json:"request_body_max_size_mb"`
 	UpstreamKeepaliveTimeout      int    `json:"upstream_keepalive_timeout"`
 	ServerTokensHidden            int    `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
+	// NTLM 兼容开关（2026-10-12）：1=按 NTLM 兼容形态渲染（保存门强制
+	// strategy=cookie）；仅 HTTP 语义，TCP 行恒 0。
+	NTLMCompatible     int `json:"ntlm_compatible"`
+	UpstreamForceHTTP1 int `json:"upstream_force_http1"`
 	// 链式回退（strategy=chain_fallback，仅 HTTP）竞速参数（2026-10-09）：
 	// ChainRaceIntervalMS 竞速间隔——等待该时长无有效响应即并行发出下一路；
 	// ChainRequestTimeoutMS 单请求兜底截断——超过该时长未收到响应头即取消
@@ -481,7 +489,7 @@ type CreateRuleRequest struct {
 	ProxyFlushInterval         int        `json:"proxy_flush_interval"`
 	ProxyStreamCloseDelay      int        `json:"proxy_stream_close_delay"`
 	PathRules                  []PathRule `json:"path_rules"`
-	OriginDomain                 string     `json:"origin_domain"`
+	OriginDomain               string     `json:"origin_domain"`
 	// 健康检查域名：空=跟随 OriginDomain（省略与空串同义，创建语义）。
 	HealthCheckHost string     `json:"health_check_host"`
 	Upstreams       []Upstream `json:"upstreams" binding:"required"`
@@ -543,6 +551,9 @@ type UpdateRuleRequest struct {
 	RequestBodyMaxSizeMB     *int  `json:"request_body_max_size_mb"`
 	UpstreamKeepaliveTimeout *int  `json:"upstream_keepalive_timeout"`
 	ServerTokensHidden       *int  `json:"server_tokens_hidden"` // 0=default, 1=hide, 2=show
+	// NTLM 兼容开关：指针化——省略（nil）=保留原值，显式 0=关闭。
+	NTLMCompatible     *int `json:"ntlm_compatible"`
+	UpstreamForceHTTP1 *int `json:"upstream_force_http1"`
 	// 链式回退竞速参数（LB-02 口径）：指针化——省略（nil）=保留原值，
 	// 显式 0=落库 0（写侧/渲染侧按 chain 策略兜底 3000/30000）。
 	ChainRaceIntervalMS        *int        `json:"chain_race_interval_ms"`
@@ -556,7 +567,7 @@ type UpdateRuleRequest struct {
 	ProxyFlushInterval         *int        `json:"proxy_flush_interval"`
 	ProxyStreamCloseDelay      *int        `json:"proxy_stream_close_delay"`
 	PathRules                  *[]PathRule `json:"path_rules"`
-	OriginDomain                 *string     `json:"origin_domain"`
+	OriginDomain               *string     `json:"origin_domain"`
 	// 健康检查域名：指针化同 OriginDomain——省略=保留原值，显式空串=清空。
 	HealthCheckHost *string    `json:"health_check_host"`
 	Upstreams       []Upstream `json:"upstreams"`

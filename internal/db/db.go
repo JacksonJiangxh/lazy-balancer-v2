@@ -257,6 +257,11 @@ func createTables() error {
 		request_body_max_size_mb INTEGER DEFAULT 0,
 		upstream_keepalive_timeout INTEGER DEFAULT 0,
 		server_tokens_hidden INTEGER DEFAULT 0,
+		-- 规则级 NTLM 兼容开关（2026-10-12）：仅 HTTP 语义，1=按 NTLM 兼容形态
+		-- 渲染（保存门强制 strategy=cookie）；TCP 规则携带即 400。
+		ntlm_compatible INTEGER NOT NULL DEFAULT 0,
+		-- 上游强制 HTTP/1.1（通用列）：1=对 https 上游禁 ALPN h2（transport.versions）。
+		upstream_force_http1 INTEGER NOT NULL DEFAULT 0,
 		-- 链式回退（strategy=chain_fallback，2026-10-09）竞速参数：竞速间隔与
 		-- 单请求兜底截断（毫秒）；0=写侧/渲染侧按策略兜底 3000/30000。
 		chain_race_interval_ms INTEGER NOT NULL DEFAULT 0,
@@ -795,6 +800,8 @@ func runMigrations() error {
 		"lb_rules.request_body_max_size_mb":   "INTEGER DEFAULT 0",
 		"lb_rules.upstream_keepalive_timeout": "INTEGER DEFAULT 0",
 		"lb_rules.server_tokens_hidden":       "INTEGER DEFAULT 0",
+		"lb_rules.ntlm_compatible":            "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.upstream_force_http1":       "INTEGER NOT NULL DEFAULT 0",
 		// 链式回退竞速参数（2026-10-09）：存量库补列，0=写侧/渲染侧按策略兜底。
 		"lb_rules.chain_race_interval_ms":   "INTEGER NOT NULL DEFAULT 0",
 		"lb_rules.chain_request_timeout_ms": "INTEGER NOT NULL DEFAULT 0",
@@ -830,7 +837,12 @@ func runMigrations() error {
 		// 回退规则级 host_header / 现状默认。
 		// 注：自研过渡列 upstreams.host_header 刻意不登记——登记会与下方
 		// 一次性搬迁后的 DROP 步骤互斥（先补列再删列），且 fresh 库不该有它。
-		"upstreams.origin_domain":    "TEXT NOT NULL DEFAULT ''",
+		"upstreams.origin_domain": "TEXT NOT NULL DEFAULT ''",
+		// 规则级回源域名（2026-10-11 上游合并 C1 改名收口）：自研 lb_rules.host_header
+		// 已切上游口径 origin_domain（与 upstreams.origin_domain 同名同义）。存量库由
+		// migrateLbRuleHostHeaderToOriginDomain 先搬后留，此处补列保证任意形态库上
+		// 列存在（否则重建 DDL / 渲染读列会 no such column）。
+		"lb_rules.origin_domain":     "TEXT NOT NULL DEFAULT ''",
 		"lb_rules.health_check_host": "TEXT NOT NULL DEFAULT ''",
 		// 引用型证书（tls_source="file"）摄取源路径列（本次上游合并保留）：
 		// 上游 newColumns 未登记，此处补入——重建 DDL 与运行期读取均依赖其存在。
@@ -1537,6 +1549,11 @@ func runMigrations() error {
 	// 规则三面同构迁移（2026-10-11 用户裁定「如果没有就都应该没有/时间戳格式
 	// 统一」）：TCP 死值清零（bump cluster_version 触发从端下轮收敛）+ 时间戳
 	// 格式归一（RFC3339/+00:00/平面 三态并存 → SQLite 平面 UTC）。
+	// 规则级回源域名改名收口（本次上游合并）：先把存量 lb_rules.host_header 搬到
+	// lb_rules.origin_domain，再跑 TCP 死值清零（清零按 origin_domain 判定）。
+	if err := migrateLbRuleHostHeaderToOriginDomain(); err != nil {
+		return err
+	}
 	if err := migrateTCPRuleDeadFields(); err != nil {
 		return err
 	}
@@ -2124,7 +2141,7 @@ func migrateCanonicalDomains() error {
 
 // migratePathRuleActionToResponseMode 把自研路径规则静态响应（action='respond'
 // + status_code/redirect_url/response_body/content_type）搬迁到上游口径
-// response_mode（''/static/redirect）+ response_status/redirect_to/
+// response_mode（”/static/redirect）+ response_status/redirect_to/
 // response_body/response_content_type（本次上游合并 C2 决策：切上游）。
 //
 //	3xx -> response_mode='redirect'，redirect_to=redirect_url
@@ -2188,6 +2205,32 @@ func migrateUpstreamHostHeaderToOriginDomain() error {
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
 		log.Printf("Migrated %d upstreams.host_header value(s) into origin_domain", n)
+	}
+	return nil
+}
+
+// migrateLbRuleHostHeaderToOriginDomain 把规则级回源域名从自研列
+// lb_rules.host_header 搬到上游口径 lb_rules.origin_domain（2026-10-11 上游合并
+// C1 改名收口：规则级与逐上游两级同名 origin_domain）。幂等：origin_domain 已有值
+// 时不动。两列任一不存在（fresh 库 / 已搬完）时静默返回。
+func migrateLbRuleHostHeaderToOriginDomain() error {
+	var hasHostHeader, hasOriginDomain int
+	if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('lb_rules') WHERE name='host_header'").Scan(&hasHostHeader); err != nil {
+		return fmt.Errorf("failed to check lb_rules.host_header: %w", err)
+	}
+	if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('lb_rules') WHERE name='origin_domain'").Scan(&hasOriginDomain); err != nil {
+		return fmt.Errorf("failed to check lb_rules.origin_domain: %w", err)
+	}
+	if hasHostHeader == 0 || hasOriginDomain == 0 {
+		return nil
+	}
+	res, err := DB.Exec(`UPDATE lb_rules SET origin_domain = host_header
+		WHERE COALESCE(origin_domain,'') = '' AND COALESCE(host_header,'') <> ''`)
+	if err != nil {
+		return fmt.Errorf("failed to migrate lb_rules.host_header -> origin_domain: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("Migrated %d lb_rules.host_header value(s) into origin_domain", n)
 	}
 	return nil
 }
@@ -2655,6 +2698,10 @@ func migrateLbRulesPrimaryKey() error {
 			request_body_max_size_mb INTEGER DEFAULT 0,
 			upstream_keepalive_timeout INTEGER DEFAULT 0,
 			server_tokens_hidden INTEGER DEFAULT 0,
+			-- 与 fresh CREATE 同步携带（ensureNewColumns 已加列，陈旧 DDL 会把列
+			-- 连同值一并丢弃——U6B-3 先例）。
+			ntlm_compatible INTEGER NOT NULL DEFAULT 0,
+			upstream_force_http1 INTEGER NOT NULL DEFAULT 0,
 			-- 链式回退竞速参数（2026-10-09）：重建 DDL 须携带，否则陈旧重建丢列。
 			chain_race_interval_ms INTEGER NOT NULL DEFAULT 0,
 			chain_request_timeout_ms INTEGER NOT NULL DEFAULT 0,
@@ -2668,6 +2715,7 @@ func migrateLbRulesPrimaryKey() error {
 			proxy_stream_close_delay INTEGER NOT NULL DEFAULT 0,
 			-- 与 fresh CREATE 同步携带（ensureNewColumns 在本重建之前已加列，
 			-- 陈旧 DDL 会把列连同值一并丢弃——U6B-3 先例）。
+			origin_domain TEXT NOT NULL DEFAULT '',
 			health_check_host TEXT NOT NULL DEFAULT '',
 			enable_tls BOOLEAN DEFAULT FALSE,
 			tls_cert TEXT,
@@ -2711,10 +2759,11 @@ func migrateLbRulesPrimaryKey() error {
 			health_check_path, health_check_interval, health_check_timeout,
 			health_check_unhealthy_threshold, health_check_healthy_threshold,
 			enable_active_health_check, tcp_health_check_port, tcp_proxy_protocol, tcp_try_duration, tcp_try_interval,
-			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden,
+			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden, ntlm_compatible, upstream_force_http1,
 			chain_race_interval_ms, chain_request_timeout_ms,
 			custom_routes_enabled,
 			proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
+			origin_domain,
 			health_check_host, enable_tls, tls_cert,
 			tls_key, tls_cert_path, tls_key_path, tls_http_redirect, tls_source, acme_config_id,
 			ca_provider_id, enable_compress, compress_types, enabled, log_enabled,
@@ -2727,10 +2776,11 @@ func migrateLbRulesPrimaryKey() error {
 			health_check_path, health_check_interval, health_check_timeout,
 			health_check_unhealthy_threshold, health_check_healthy_threshold,
 			enable_active_health_check, tcp_health_check_port, tcp_proxy_protocol, tcp_try_duration, tcp_try_interval,
-			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden,
+			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden, COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0),
 			COALESCE(chain_race_interval_ms,0), COALESCE(chain_request_timeout_ms,0),
 			COALESCE(custom_routes_enabled,0),
 			COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
+			COALESCE(origin_domain,''),
 			COALESCE(health_check_host,''), enable_tls, tls_cert,
 			tls_key, COALESCE(tls_cert_path,''), COALESCE(tls_key_path,''), tls_http_redirect, tls_source, acme_config_id,
 			ca_provider_id, enable_compress, compress_types, COALESCE(enabled,0), COALESCE(log_enabled,0),
@@ -2846,6 +2896,10 @@ func hasExactStatusConstraint(tableSQL string, requiredStatuses []string) bool {
 
 // migrateCertJobsStatusConstraint rebuilds cert_jobs to enforce the allowed
 // status CHECK constraint and the 'queued' default value on existing databases.
+// CORE-3（第 70 轮审计裁定，边界声明防重报）：此类 CHECK 收敛迁移仅适用于
+// 跨版本演化过的表（cert_jobs 的约束集随版本多次扩充，存量库存在旧形态）；
+// auto_backups/task_runs 等同版引入的表以 fresh DDL 为准——首版 DDL 即含
+// 全量约束，不存在需要收敛的旧库形态，刻意不建同型迁移。
 func migrateCertJobsStatusConstraint() error {
 	var tableSQL string
 	if err := DB.QueryRow("SELECT sql FROM sqlite_master WHERE type='table' AND name='cert_jobs'").Scan(&tableSQL); err != nil {
@@ -3148,21 +3202,23 @@ func normalizeRuleTimestampsMigration() error {
 }
 
 // migrateTCPRuleDeadFields（2026-10-11 用户裁定「如果没有就都应该没有」）：
-// 主端存量 TCP 行的 HTTP 专属字段死值清零（含上游 health_check_host 健康检查
-// 域名——TCP 规则无 Host 语义）——与 normalizeRuleForTransport
+// 主端存量 TCP 行的 HTTP 专属字段死值清零（含规则级回源域名与 NTLM 开关——
+// TCP 规则无 Host 语义、NTLM 仅 HTTP）——与 normalizeRuleForTransport
 // 传输归一同一清单。此前仅导出侧归一（CL10-P2-3「主端存储值不变」），用户
 // 裁定改为存储也归零：主端 DB、导出 canonical、从端落库三面同值，快照缓存
 // 的 canonical 变化由本迁移写侧触发 cluster_version bump 随下轮同步收敛。
+// WHERE 谓词与归一函数逐字对齐：enable_tls=1 即入选（CL-2，第 70 轮审计——
+// 此前要求证书材料非空会漏掉「TCP+enable_tls=1+双空证书」形态的存量行）。
 func migrateTCPRuleDeadFields() error {
 	res, err := DB.Exec(`UPDATE lb_rules SET
-		health_check_host='', health_check_path='', enable_compress=0, compress_types='',
-		request_body_max_size_mb=0, upstream_keepalive_timeout=0, server_tokens_hidden=0,
+		origin_domain='', health_check_path='', enable_compress=0, compress_types='',
+		request_body_max_size_mb=0, upstream_keepalive_timeout=0, server_tokens_hidden=0, ntlm_compatible=0, upstream_force_http1=0,
 		enable_tls=0, tls_cert='', tls_key=''
 		WHERE protocol='tcp' AND (
-			COALESCE(health_check_host,'')<>'' OR COALESCE(health_check_path,'')<>''
+			COALESCE(origin_domain,'')<>'' OR COALESCE(health_check_path,'')<>''
 			OR enable_compress=1 OR COALESCE(compress_types,'')<>''
-			OR request_body_max_size_mb<>0 OR upstream_keepalive_timeout<>0 OR server_tokens_hidden<>0
-			OR (enable_tls=1 AND (COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>''))
+			OR request_body_max_size_mb<>0 OR upstream_keepalive_timeout<>0 OR server_tokens_hidden<>0 OR ntlm_compatible<>0 OR upstream_force_http1<>0
+			OR enable_tls=1
 		)`)
 	if err != nil {
 		return fmt.Errorf("failed to zero TCP dead fields: %w", err)
