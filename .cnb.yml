@@ -548,7 +548,7 @@ $:
       env:
         # GitHub 目标仓库，owner/repo 形式。
         # 默认指向本仓库在 GitHub 侧的 fork；若 fork 在别的账号名下，改这一行即可。
-        GITHUB_REPO: xzydm/lazy-balancer-v2
+        GITHUB_REPO: JacksonJiangxh/lazy-balancer-v2
         # 源分支（本仓 main）与默认目标分支（可被按钮输入覆盖）
         SOURCE_BRANCH: main
         DEFAULT_TARGET_BRANCH: master-dev
