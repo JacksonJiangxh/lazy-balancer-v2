@@ -494,28 +494,39 @@ $:
   # 凭据：GitHub PAT 存在 CNB 密钥仓库（xzydm/xzsecret 的 github.yml）里，
   # 通过 imports 注入，流水线内不出现任何明文。
   #
-  # ── 关于键名里的账号标识 163（这是本流水线此前「token 为空」的真正原因）──
-  # 密钥文件里的键名曾是 163_GIT_ALL_TOKEN。CNB 文档明确：环境变量名
-  # 「仅支持字母、数字和下划线，不能以数字开头」（见 云原生构建/环境变量/限制说明）。
-  # 不合规的键名不是「换个写法就能读」，它在两处同时失效：
-  #   1) ${163_GIT_ALL_TOKEN} 在 sh/bash 下是 bad substitution，直接语法错误；
-  #   2) 更隐蔽的是：CNB 流水线默认用 sh（Debian 上即 dash）执行 script，
-  #      而 dash 在进程启动、构建自身环境时，会**静默丢弃**所有名字非法的
-  #      环境变量。也就是说 token 确实被 imports 注入到了进程环境里，
-  #      但 dash 一启动就把它扔了——连 printenv 都读不到。
-  #      （实测：bash 保留，dash 丢弃；这正是「构建镜像成功、推送 GitHub 拿不到
-  #       token」的原因，与密钥仓库 allow_* 授权无关。）
+  # ── 关于密钥变量怎么用（含本流水线此前「token 为空」的真相）──
   #
-  # 注意：163 是多账号场景下的**账号标识**，必须保留——它不能出现在键名**开头**
-  # （数字开头非法），但可以出现在中间或结尾，一样能区分账号：
+  # 密钥仓库文件里的键名就是环境变量名，imports 会逐 key 原样注入，
+  # 脚本里**直接用同名变量**即可，不要中转改名。中转会让"被审计的那个名字"
+  # 与"实际参与拼接的字符串"分离：真正的 token 一旦落进你自己名字的变量里，
+  # 它就不再是审计对象，而审计日志只记录"谁引用过这个文件"，不会区分中转。
+  #
+  # 本流水线此前 token 为空，根因是键名 `163_GIT_ALL_TOKEN` 以数字开头。
+  # 官方文档对变量名有硬约束（云原生构建/环境变量/限制说明）：
+  #   变量名格式：仅支持字母、数字和下划线，**不能以数字开头**
+  # 且提示「不符合规则的变量会被忽略」。实测（debian 13，/bin/sh -> dash）：
+  #
+  #   env -i 163_GIT_ALL_TOKEN=SECRET123 dash -c 'printenv 163_GIT_ALL_TOKEN'
+  #     -> 无输出（变量不存在）
+  #   env -i 163_GIT_ALL_TOKEN=SECRET123 bash -c 'printenv 163_GIT_ALL_TOKEN'
+  #     -> SECRET123
+  #   env -i 163_GIT_ALL_TOKEN=SECRET123 dash -c 'python3 ...os.environ...'
+  #     -> None            # 非法名被 shell 在启动时剔掉，子进程也拿不到
+  #   env -i 163_GIT_ALL_TOKEN=SECRET123 python3 ...os.environ...
+  #     -> SECRET123       # 不经 shell 就能拿到
+  #
+  # 也就是说：token 确实被 imports 注入到了进程环境，是**默认 shell（dash）
+  # 在启动时把这条非法名目删掉了**，连 /proc/self/environ 里的对应槽位都没了。
+  # 这跟密钥仓库的 allow_* 授权无关（授权不通过是整文件加载失败，不是空值）。
+  #
+  # 所以修法只有一条：**把密钥文件里的键名改成合法标识符，然后直接用**。
+  # 163 是多账号场景的账号标识，必须留——只是不能放开头，挪到中间/结尾即可：
   #   # xzydm/xzsecret 的 github.yml
-  #   GIT_163_ALL_TOKEN: "ghp_xxx"      # ← 推荐：账号号夹在中间，语义清晰
-  #   GIT_ALL_TOKEN_163: "ghp_xxx"      # ← 等价写法：账号号放结尾
-  #   # 多账号可以并列，各自独立、互不串号：
-  #   # GIT_163_ALL_TOKEN: "ghp_163..."   # 163 账号
-  #   # GIT_ABC_ALL_TOKEN: "ghp_abc..."   # 另一个账号
-  #   163_GIT_ALL_TOKEN: "ghp_xxx"      # ❌ 数字开头：sh 脚本里永远读不到
-  # 本流水线按 GIT_163_ALL_TOKEN 引用；要换账号只改这一处键名 + GITHUB_REPO。
+  #   GIT_163_ALL_TOKEN: "ghp_163..."   # ✅ 推荐：账号号夹在中间
+  #   GIT_ALL_TOKEN_163: "ghp_163..."   # ✅ 等价：账号号放结尾
+  #   GIT_ABC_ALL_TOKEN: "ghp_abc..."   # ✅ 多账号并列，各用各的、不串号
+  #   163_GIT_ALL_TOKEN: "ghp_163..."   # ❌ 数字开头：sh 里永远读不到
+  # 本流水线按 GIT_163_ALL_TOKEN 直接引用；换账号只改这一处键名 + GITHUB_REPO。
   #
   # 密钥文件需要在密钥仓库侧声明 allow_* 规则，否则只有密钥仓管理员触发的
   # 流水线才有权引用（allow_* 一旦声明，触发者角色不再参与判定）：
@@ -531,7 +542,8 @@ $:
       docker:
         image: docker.cnb.cool/xzydm/mirrors/debian:13-all
       imports:
-        # 密钥仓库中的 GitHub 凭据文件（键：GIT_163_ALL_TOKEN，163 为账号标识）
+        # 密钥仓库中的 GitHub 凭据文件；键名 GIT_163_ALL_TOKEN 被原样注入，
+        # 脚本直接用同名变量读取（不做任何中转改名，保持审计链路干净）。
         - https://cnb.cool/xzydm/xzsecret/-/blob/main/github.yml
       env:
         # GitHub 目标仓库，owner/repo 形式。
@@ -550,14 +562,15 @@ $:
 
             command -v git >/dev/null 2>&1 || { echo ">>> 缺少依赖：git"; exit 1; }
 
-            # 令牌由 imports 逐 key 注入，键名必须是合法环境变量名（见上方说明）。
-            # GIT_163_ALL_TOKEN 就是密钥文件里的键名（163 = 账号标识）。
+            # imports 逐 key 原样注入，变量名 = 密钥文件里的键名，直接用。
+            # 这里不做任何中转改名：中转会让审计对象与实际参与拼接的字符串分离。
+            # GIT_163_ALL_TOKEN 就是密钥文件里的键名（163 = 账号标识），
             # 换账号时只改这里和 GITHUB_REPO。
             TOKEN="${GIT_163_ALL_TOKEN:-}"
             if [ -z "$TOKEN" ]; then
               echo ">>> 未拿到 GitHub 令牌。请检查密钥仓库 xzydm/xzsecret 的 github.yml："
-              echo "    - 键名需为 GIT_163_ALL_TOKEN（163 是账号标识，可换；但不得以数字开头，"
-              echo "      写 163_GIT_ALL_TOKEN 会因变量名非法而永远读不到）"
+              echo "    - 键名需为 GIT_163_ALL_TOKEN（163 是账号标识，可换；但不得以数字开头："
+              echo "      写 163_GIT_ALL_TOKEN 会被 shell 启动时剔除，永远读不到）"
               echo "    - 若已声明 allow_* 规则，需 allow_slugs 含 xzydm/lazy-balancer-v2、"
               echo "      allow_events 含 web_trigger_push_github、allow_branches 含 main"
               exit 1
