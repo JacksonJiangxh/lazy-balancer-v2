@@ -481,3 +481,96 @@ $:
               - latest-linux-amd64
               - latest-linux-arm64
             type: docker
+
+  # ──────────────────────────────────────────────────────────────
+  # 把本仓 main 同步到 GitHub fork 的 master-dev：页面自定义按钮触发
+  #（见 .cnb/web_trigger.yml 的「推送 main 到 GitHub master-dev」）。
+  #
+  # 方向说明：本仓库是 GitHub 上游 v55448330/lazy-balancer-v2 的 fork 的
+  # CNB 镜像。GitHub Actions 负责「上游 release → fork 的 master（上游镜像轨）」；
+  # 这里补上反向的一环：「本仓 main（我们的开发主线）→ fork 的 master-dev」，
+  # 让 GitHub 侧的开发主线也拿到我们最新的改动，两边互为备份。
+  #
+  # 凭据：GitHub PAT 存在 CNB 密钥仓库（xzydm/xzsecret 的 github.yml）里，
+  # 通过 imports 注入，流水线内不出现任何明文。
+  #
+  # 关于变量名 163_GIT_ALL_TOKEN：它来自密钥仓库文件里的键名，以数字开头。
+  # POSIX shell 不接受以数字开头的变量名（`${163_GIT_ALL_TOKEN}` 是 bad
+  # substitution，`export` 也会直接报错），只有 bash 的 printenv 能读到。
+  # 因此这里在 env 层用 CNB 的变量替换把它改成一个合法名字 GIT_ALL_TOKEN，
+  # 脚本只认 GIT_ALL_TOKEN；同时脚本内保留一次 printenv 兜底，双保险。
+  #
+  # 密钥文件需要在密钥仓库侧声明 allow_* 规则，否则只有密钥仓管理员触发的
+  # 流水线才有权引用（allow_* 一旦声明，触发者角色不再参与判定）：
+  #   allow_slugs: "xzydm/lazy-balancer-v2"
+  #   allow_events: "web_trigger_push_github"
+  #   allow_branches: "main"
+  # ──────────────────────────────────────────────────────────────
+  web_trigger_push_github:
+    - name: push-main-to-github
+      runner:
+        # 纯 git 操作，1 核足够
+        cpus: 1
+      docker:
+        image: docker.cnb.cool/xzydm/mirrors/debian:13-all
+      imports:
+        # 密钥仓库中的 GitHub 凭据文件（键：163_GIT_ALL_TOKEN）
+        - https://cnb.cool/xzydm/xzsecret/-/blob/main/github.yml
+      env:
+        # 把密钥仓里以数字开头的变量名洗成 shell 合法名（见上方说明）
+        GIT_ALL_TOKEN: ${163_GIT_ALL_TOKEN}
+        # GitHub 目标仓库，owner/repo 形式。
+        # 默认指向本仓库在 GitHub 侧的 fork；若 fork 在别的账号名下，改这一行即可。
+        GITHUB_REPO: xzydm/lazy-balancer-v2
+        # 源分支（本仓 main）与默认目标分支（可被按钮输入覆盖）
+        SOURCE_BRANCH: main
+        DEFAULT_TARGET_BRANCH: master-dev
+        # 目标分支白名单：只允许推到这些分支，防止手滑把 main 推到 master/production。
+        ALLOWED_TARGET_BRANCHES: master-dev
+      stages:
+        - name: push to github
+          timeout: 20m
+          script: |
+            set -eu
+
+            command -v git >/dev/null 2>&1 || { echo ">>> 缺少依赖：git"; exit 1; }
+
+            # 取 token：优先用 env 洗过的 GIT_ALL_TOKEN；为空再用 printenv 兜底读原名
+            #（bash 下 printenv 能读到数字开头的变量，dash 下读不到，故只作兜底）。
+            TOKEN="${GIT_ALL_TOKEN:-}"
+            if [ -z "$TOKEN" ]; then
+              TOKEN="$(printenv 163_GIT_ALL_TOKEN 2>/dev/null || true)"
+            fi
+            if [ -z "$TOKEN" ]; then
+              echo ">>> 未拿到 GitHub 令牌：检查密钥仓库 github.yml 是否声明了 allow_slugs/allow_events/allow_branches"
+              exit 1
+            fi
+
+            TARGET="${TARGET_BRANCH:-${DEFAULT_TARGET_BRANCH}}"
+
+            # 白名单守卫：逗号或竖线分隔（用 tr 归一，不依赖 bash 的 ${var//}
+            # 替换语法，保证在 dash/sh 下也能跑）
+            ALLOWED_NORM="$(printf '%s' "${ALLOWED_TARGET_BRANCHES}" | tr '|' ',')"
+            case ",${ALLOWED_NORM}," in
+              *",${TARGET},"*) ;;
+              *) echo ">>> 目标分支 ${TARGET} 不在白名单内（允许：${ALLOWED_TARGET_BRANCHES}）"; exit 1 ;;
+            esac
+
+            # FORCE 来自按钮输入（字符串 "true"/"false"）
+            PUSH_ARGS=""
+            if [ "${FORCE:-false}" = "true" ]; then
+              echo ">>> 警告：FORCE=true，将覆盖 GitHub 侧 ${TARGET} 的历史"
+              PUSH_ARGS="--force"
+            fi
+
+            # 带认证的 HTTPS 地址；token 不回显（git 自身不会打印凭据）
+            REMOTE_URL="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPO}.git"
+
+            echo ">>> 源：本仓 ${SOURCE_BRANCH}（${CNB_COMMIT_SHORT:-unknown}）"
+            echo ">>> 目标：github.com/${GITHUB_REPO} ${TARGET}"
+
+            # 把当前检出（本仓 main 的这次提交）直接推到 GitHub 目标分支。
+            # 用 HEAD:refs/heads/<target> 避免本地检出分支名（main）与目标名
+            #（master-dev）不一致带来的歧义。
+            git push ${PUSH_ARGS} "${REMOTE_URL}" "HEAD:refs/heads/${TARGET}"
+            echo ">>> 推送完成"
