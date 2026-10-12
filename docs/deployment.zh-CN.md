@@ -112,22 +112,66 @@ environment:
 - **未显式配置超时时的新默认：1 分钟空闲读/写超时**：慢客户端长连接（大文件上传挂起、半开连接）超过空闲窗口会被服务端主动关闭，不再无限等待。
 - **499 客户端取消语义**：客户端在响应完成前主动断开时，访问日志按 499 分桶记录（此前计入 4xx）——基于状态码 4xx 的告警口径不受影响，但日志分析需知晓该新桶。
 
-## 流水线密钥陷阱：账号标识不能放在变量名开头
+## 流水线密钥：键名直接使用，不要中转改名
 
-CNB 流水线的 `imports` 会把密钥文件的每个键**逐 key 注入为环境变量**。但官方文档对变量名有硬性约束（[环境变量 · 限制说明](https://docs.cnb.cool/zh/build/env.md)）：
+### 先用对，再说坑
+
+`imports` 会把密钥文件的每个键**逐 key 原样注入为环境变量**，变量名就是文件里的键名。
+所以脚本里**直接引用同名变量**即可：
+
+```yaml
+# 密钥仓库 xzydm/xzsecret 的 github.yml
+GIT_163_ALL_TOKEN: "ghp_163..."
+
+# .cnb.yml
+imports:
+  - https://cnb.cool/xzydm/xzsecret/-/blob/main/github.yml
+stages:
+  - script: |
+      TOKEN="${GIT_163_ALL_TOKEN:-}"
+```
+
+**不要中转改名。** 像这样是错的方向：
+
+```yaml
+env:
+  GIT_ALL_TOKEN: ${163_GIT_ALL_TOKEN}   # ❌ 中转：审计对象与真实取值分离
+```
+
+两个理由：
+
+1. **审计链路会断**。密钥仓库的审计记录的是"哪个流水线引用过这个文件"，被审计的是**密钥文件里的那个键名**。一旦把值转进你自己起名的变量，真正参与拼接的字符串就不再对应审计条目——排查"这个 token 被谁用过"时，链路上多出一段查不到的黑箱。你担心的泄露面，正是从这里长出来的，不是被消掉的。
+2. **中转没有任何好处。** 它唯一的作用是绕开"名字不合法"，而绕开的方式本就该是改键名（见下）。多一层变量 = 多一处可能被误打印、误导出、误落日志的地方。
+
+### 真正会踩的坑：键名以数字开头
+
+本仓此前"构建镜像成功、推送 GitHub 拿不到 token"，根因就是键名 `163_GIT_ALL_TOKEN` 以数字开头。
+官方文档对变量名有硬约束（[环境变量 · 限制说明](https://docs.cnb.cool/zh/build/env.md)）：
 
 > 变量名格式：仅支持字母、数字和下划线，**不能以数字开头**。
 
-**不合规的键名不是「换个写法就能读出来」，它会在两处同时失效：**
+并且明确：**不符合规则的变量会被忽略。**
 
-1. `${163_GIT_ALL_TOKEN}` 在 `sh`/`bash` 下是 `bad substitution`，直接语法错误；
-2. 更隐蔽的是：CNB 流水线**默认用 `sh` 执行 `script`**（Debian 上即 `dash`），而 `dash` 在进程启动构建自身环境时，会**静默丢弃**所有名字非法的环境变量。token 确实被注入到了进程环境，但 `dash` 一启动就把它扔了，连 `printenv` 都读不到。
+实测（Debian 13，`/bin/sh` → `dash`）：
 
-也就是说，这类键名**没有任何 shell 层面的事后补救办法**（`printenv`、`env` 都没用）。
+```console
+$ env -i 163_GIT_ALL_TOKEN=SECRET123 dash -c 'printenv 163_GIT_ALL_TOKEN'
+                                    # 无输出：变量不存在
+$ env -i 163_GIT_ALL_TOKEN=SECRET123 bash -c 'printenv 163_GIT_ALL_TOKEN'
+SECRET123                           # bash 能拿到
+$ env -i 163_GIT_ALL_TOKEN=SECRET123 dash -c 'python3 -c "import os;print(os.environ.get("163_GIT_ALL_TOKEN"))"'
+None                                # dash 里连子进程都拿不到
+$ env -i 163_GIT_ALL_TOKEN=SECRET123 python3 -c 'import os;print(os.environ.get("163_GIT_ALL_TOKEN"))'
+SECRET123                           # 不经 shell 就能拿到
+```
 
-### 多账号场景：保留账号标识，只挪位置
+结论：**token 确实被 `imports` 注入到了进程环境，是默认 shell（`dash`）在启动时把这条非法名目删掉了**
+（`/proc/self/environ` 里的对应槽位也没了）。所以任何 shell 层的事后补救——`printenv`、`env`、
+`bash -c`、外包一个脚本——都没用，变量在脚本开始前就不存在了。
 
-有多个 GitHub 账号时，键名必须自带账号标识，否则容易拿错 token。**标识不能放在开头，但可以放在中间或结尾**——效果一样，且合法：
+### 修法：保留账号标识，只挪位置
+
+163 是多账号场景的账号标识，必须留。它只是不能出现在**开头**，放在中间或结尾一样能区分账号：
 
 ```yaml
 # 密钥仓库 xzydm/xzsecret 的 github.yml
@@ -140,7 +184,7 @@ GIT_ALL_TOKEN_163: "ghp_163..."   # ✅ 等价：账号号放结尾
 # GIT_ABC_ALL_TOKEN: "ghp_abc..."    # 另一个账号
 ```
 
-流水线侧对应写法（一个账号一段流水线，只换键名即可）：
+改完键名，流水线侧**直接用**，不需要配套改动：
 
 ```yaml
 stages:
@@ -153,4 +197,4 @@ stages:
 
 **`imports` 授权错了 → 整个文件加载失败（流水线直接报错）；键名非法 → 文件正常加载但变量读不到（表现为空值）。**
 
-两者现象完全不同，前者不会表现为「token 为空」——排查时先确认现象属于哪一类，再看 `allow_*`。
+两种现象完全不同，后者跟密钥仓库的 `allow_*` 无关——先分清现象属于哪一类，再去查 `allow_*`，否则会白折腾一轮。
