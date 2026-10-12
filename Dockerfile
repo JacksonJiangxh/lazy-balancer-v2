@@ -10,11 +10,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 WORKDIR /app
 
 ENV GOTOOLCHAIN=auto
-# INFRA-P1（第 69 轮）：xcaddy 阶段只需三个本地插件目录（--with 引用），
+# INFRA-P1（第 69 轮）：xcaddy 阶段只需四个本地插件目录（--with 引用），
 # 窄化 COPY 面——此前 COPY . . 全仓入镜，任何前端/文档变更即 bust 该层并重跑
 # xcaddy build（缓存挂载兜底仍需分钟级增量编译）。backend 阶段保留全量 COPY
 #（Go 编译需全源码）。
+# 清单必须与下方 xcaddy 的 --with 本地目录逐一对齐：漏一个目录 xcaddy 会以
+# "replacement directory /app/<dir> does not exist" 失败（caddychain 曾漏）。
 COPY caddygeoip/ caddygeoip/
+COPY caddychain/ caddychain/
 COPY caddydeps/ caddydeps/
 COPY wafiplist/ wafiplist/
 # 双缓存挂载（模块+编译缓存）按 builder 持久（lazy-builder GC 48h）：
