@@ -5189,11 +5189,7 @@ main:
           options:
             include:
               - AGENTS.md
-              - CASEBOOK.md
-              - casebook/**/*.md
-              - KNOWLEDGE-MAP.md
               - README.md
-              - docs/ROADMAP.md
             # embeddingModel: hunyuan   # 默认 hunyuan（官方目前仅支持该模型），显式保留默认即不新增付费依赖
             # issueSyncEnabled: true    # 默认 true：台账/决策 Issue 同步入知识库，便于检索历史裁决
 
