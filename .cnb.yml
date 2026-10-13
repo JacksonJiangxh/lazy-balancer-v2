@@ -404,7 +404,10 @@
             REPO="${CNB_REPO_SLUG:-}"
             PR_META="$(cnb pulls get-pull --repo "$REPO" --number "$PR_IID" -v 2>/dev/null | tr -d '\r')"
             # 取 state：取不到即空值（非零退出码经 `set +e` + 命令替换容忍；空 ⇒ 下走 fail-open）
-            PR_ST="$(printf '%s' "$PR_META" | LC_ALL=C grep -m1 -oE '"state"[[:space:]]*:[[:space:]]*"[a-z_]+"' | grep -oE '[a-z_]+"?$' | tr -d '"')"
+            #   ★ 末位 `head -1`（门下 P2-3）：`grep -oE` 逐行输出命中；若上游 JSON 形态变化致
+            #     多行命中，首个之外的残留会让 `case` 落闭集外 ⇒ 得 fail-open（方向安全但降判别力）。
+            #     固定取首条命中 ⇒ 生产形态（现网 `-v` 多行、state 唯一）判定不变，异常形态亦稳定可判。
+            PR_ST="$(printf '%s' "$PR_META" | LC_ALL=C grep -m1 -oE '"state"[[:space:]]*:[[:space:]]*"[a-z_]+"' | grep -oE '[a-z_]+"?$' | head -1 | tr -d '"')"
             case "$PR_ST" in
               open|closed|merged)
                 if [ "$PR_ST" = "open" ]; then
@@ -437,7 +440,18 @@
           exit 0
       - name: npc go
         # 熔断守卫：上一 stage 判定熔断（写 /workspace/qg-熔断.txt）时**整段跳过** ⇒ 评论链不再产出修复 commit。
-        # 与 `failStages`→「工部尚书自愈」stage 的 `if` **逐字同形**（同哨兵、两处绑定；矩阵 C-LATCH-③ 断言同源）。
+        # ★ 口径更正（门下 P1-1 · #TASK-MERGEDPR-GUARD-20261013-01 · 据实）：本行原称「与 `failStages`→
+        #   「工部尚书自愈」stage 的 `if` **逐字同形**（矩阵 C-LATCH-③ 断言同源）」——**该句在本单后已不成立**：
+        #   自愈 stage 的 `if` 仍是**两哨兵**（`qg-熔断.txt` + `qg-裁决冻结.txt`），评论链现为**三哨兵**。
+        #   自愈侧**不**并 `qg-pr终态.txt` 是**有意为之**，非漏改：
+        #     ① 语义：`qg-pr终态.txt` 只表达「评论事件的对象（PR）已终态」——这是**评论事件侧**的事实；
+        #        `failStages` 自愈环由 **push/pull_request 事件**驱动（把新 commit 推上去触发新 CI），
+        #        与"PR 是否 open"无关——PR 已合并时自愈环本就不会有新 head 可推；并入只会造成语义耦合。
+        #     ② 范围：自愈 stage 位于 `$: pull_request` 段，**在本单诏令白名单（`.npc` 锚点段）之外**，
+        #        本单 b_t=2 已满 ⇒ **不得越范围/越预算**擅自并入（门下 P1-1 修法① 明确裁定）。
+        #   ⇒ C-LATCH-③（「两处守卫同源」逐字断言）**本单后不再为真**：其判据本体在上游 canonical
+        #     `i.o/x:scripts/gate-regression.sh`，修订须走上游单，**已登记为 follow-up**（台账 #35
+        #     【待办发现清单】）。本仓单方不改判据、不假称仍同源。
         # PR 终态守卫（#TASK-MERGEDPR-GUARD-20261013-01）：上一 stage 判定本 PR 非 open（closed/merged，
         # 写 /workspace/qg-pr终态.txt）时**整段跳过** ⇒ 已合并/已关闭 PR 上不再产出新回奏（断自激链）。
         # 三哨兵并列取 OR（任一在位即跳过）；两守卫 stage 均恒 exit 0、互不读写，次序无关。
