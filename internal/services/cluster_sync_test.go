@@ -1402,7 +1402,7 @@ func TestSyncService_Pull_convergesVersionTagOnlyWafDrift(t *testing.T) {
 	if got, err := os.ReadFile(ip2regionLivePath + ".version"); err != nil || strings.TrimSpace(string(got)) != "v3.17.0audit" {
 		t.Fatalf("version tag not converged: content=%q err=%v", got, err)
 	}
-	if service.wafFilesDrifted() {
+	if service.wafFilesDrifted(context.Background()) {
 		t.Fatal("wafFilesDrifted still true after convergence")
 	}
 
@@ -1430,7 +1430,7 @@ func TestSyncService_Pull_convergesVersionTagOnlyWafDrift(t *testing.T) {
 	if got, err := os.ReadFile(ip2regionLivePath + ".version"); err != nil || strings.TrimSpace(string(got)) != "v3.17.0audit" {
 		t.Fatalf("version tag regressed: content=%q err=%v", got, err)
 	}
-	if service.wafFilesDrifted() {
+	if service.wafFilesDrifted(context.Background()) {
 		t.Fatal("wafFilesDrifted true after loop termination")
 	}
 }
@@ -1950,8 +1950,6 @@ func TestWafFilesDrifted_nullRefAppliedHashExempt(t *testing.T) {
 	// 模拟主节点无文件的已应用哈希(payload=纯 ref=nil → sha256("null"))
 	seedAppliedWafRefHash(t, database, wafFilesNullRefHash)
 	// 从节点残留一个文件(本地 ref 非 nil)
-	rescue := func(dir string, path string, content string) { t.Helper() }
-	_ = rescue
 	oldCrs, oldXdb := crsLiveDir, ip2regionLivePath
 	tmp := t.TempDir()
 	crsLiveDir, ip2regionLivePath = filepath.Join(tmp, "crs"), filepath.Join(tmp, "ip2region.xdb")
@@ -1960,7 +1958,7 @@ func TestWafFilesDrifted_nullRefAppliedHashExempt(t *testing.T) {
 	os.WriteFile(filepath.Join(crsLiveDir, "rules", "a.conf"), []byte("residual"), 0644)
 
 	service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
-	if service.wafFilesDrifted() {
+	if service.wafFilesDrifted(context.Background()) {
 		t.Fatal("null-ref applied hash must be exempt (master has no files; slave residuals must not loop)")
 	}
 }

@@ -154,6 +154,7 @@ import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Lock, Search, WarningFilled } from '@element-plus/icons-vue'
 import { request, mfaAwareSuccess } from '@/utils/api'
+import DialogHeader from '@/components/DialogHeader.vue'
 import type { APIResponse } from '@/types'
 import {
   POLICY_TYPE_SHORT_LABELS,
@@ -307,12 +308,16 @@ const toggleSelectAll = (checked: string | number | boolean): void => {
   pickerSelected.value = pickerSelected.value.filter((id) => !selectableIdSet.has(id))
 }
 
+// 策略 id → 类型映射：策略集变化时重建一次（原实现每行每类型调用都全量构建 Map）
+const policyTypeById = computed<ReadonlyMap<number, SecurityPolicyType>>(() => {
+  const map = new Map<number, SecurityPolicyType>()
+  for (const policy of props.policies) map.set(policy.id, inferPolicyType(policy))
+  return map
+})
+
 // 规则行内当前绑定集合（按策略类型分区）
-const boundPoliciesByType = (rule: BindingEditorRule, type: SecurityPolicyType): SecurityStageBinding[] => {
-  const policyTypeById = new Map<number, SecurityPolicyType>()
-  for (const policy of props.policies) policyTypeById.set(policy.id, inferPolicyType(policy))
-  return (props.bindings[rule.caddy_id] || []).filter((binding) => policyTypeById.get(binding.policy_id) === type)
-}
+const boundPoliciesByType = (rule: BindingEditorRule, type: SecurityPolicyType): SecurityStageBinding[] =>
+  (props.bindings[rule.caddy_id] || []).filter((binding) => policyTypeById.value.get(binding.policy_id) === type)
 
 // 阶段页覆盖徽标（页已删/内容空 = broken）
 const overrideBadge = (rule: BindingEditorRule, stage: 1 | 3): { text: string; title: string; broken: boolean } | null => {
@@ -382,33 +387,32 @@ const submit = async (): Promise<void> => {
     return
   }
 
-  // 策略模式：全量重置该策略的绑定集——逐规则 PUT（新选中补绑、被取消解绑），
-  // 其他策略在这些规则上的绑定保持不动
+  // 策略模式：全量重置该策略的绑定集——策略侧批量端点一次提交（第 72 轮：
+  // 原逐规则 PUT 规则侧全量端点，每条独立全链渲染，N 规则=N×~500ms；bulk
+  // 单事务只增删本策略绑定行、不触碰兄弟绑定，语义与原循环一致，单渲染）。
   const pid = props.policyId
   if (pid == null) return
   const selected = new Set(pickerSelected.value)
-  const ops: Array<Promise<unknown>> = []
+  const toBind: string[] = []
+  const toUnbind: string[] = []
   for (const rule of pickerHttpRules.value) {
     const current = (props.bindings[rule.caddy_id] || []).map((b) => b.policy_id)
     const has = current.includes(pid)
     const want = selected.has(rule.caddy_id)
     if (has === want) continue
-    const next = want ? [...current, pid] : current.filter((id) => id !== pid)
-    ops.push(request.put<APIResponse>(`/security/rules/${encodeURIComponent(rule.caddy_id)}/policies`, { policy_ids: next }))
+    if (want) toBind.push(rule.caddy_id)
+    else toUnbind.push(rule.caddy_id)
   }
-  if (ops.length === 0) {
+  if (toBind.length === 0 && toUnbind.length === 0) {
     ElMessage.info('绑定关系无变化')
     emit('update:modelValue', false)
     return
   }
   saving.value = true
   try {
-    const results = await Promise.allSettled(ops)
-    const failed = results.filter((r) => r.status === 'rejected').length
-    const succeeded = results.length - failed
-    if (succeeded > 0) mfaAwareSuccess(`已更新 ${succeeded} 条规则的绑定`)
-    if (failed > 0) ElMessage.error(`${failed} 条规则绑定更新失败`)
-    if (failed === 0) emit('update:modelValue', false)
+    await request.post(`/security/policies/${pid}/bindings/bulk`, { bind: toBind, unbind: toUnbind })
+    mfaAwareSuccess(`已更新 ${toBind.length + toUnbind.length} 条规则的绑定`)
+    emit('update:modelValue', false)
     emit('saved')
   } finally {
     saving.value = false

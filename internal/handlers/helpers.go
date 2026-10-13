@@ -891,7 +891,7 @@ func (metrics *ruleMetricsAggregate) observeHTTP(name string, value float64) {
 		metrics.requestsTotal += int64(value)
 	case strings.HasPrefix(name, "caddy_http_request_duration_seconds_count{"):
 		v := int64(value)
-		switch bucket := classifyStatusCode(extractLabel(name, "code")); bucket {
+		switch bucket := classifyStatusCode(services.ExtractMetricLabel(name, "code")); bucket {
 		case "status_2xx":
 			metrics.status2xx += v
 		case "status_3xx":
@@ -903,9 +903,9 @@ func (metrics *ruleMetricsAggregate) observeHTTP(name string, value float64) {
 		}
 	case strings.HasPrefix(name, "caddy_http_requests_in_flight{"):
 		metrics.requestsInFlight += int64(value)
-	case strings.Contains(name, "caddy_http_request_size_bytes_sum"):
+	case strings.HasPrefix(name, "caddy_http_request_size_bytes_sum"):
 		metrics.bytesIn += int64(value)
-	case strings.Contains(name, "caddy_http_response_size_bytes_sum"):
+	case strings.HasPrefix(name, "caddy_http_response_size_bytes_sum"):
 		metrics.bytesOut += int64(value)
 	}
 }
@@ -974,7 +974,7 @@ func (index *prometheusMetricsIndex) addSample(sample prometheusSample) {
 		index.goroutines = int64(value)
 	}
 
-	if host := extractLabel(name, "host"); host != "" {
+	if host := services.ExtractMetricLabel(name, "host"); host != "" {
 		index.aggregateFor(index.hosts, host).add(&metric)
 		index.aggregateFor(index.httpHosts, host).add(&metric)
 		if bareHost, _, err := net.SplitHostPort(host); err == nil {
@@ -982,7 +982,7 @@ func (index *prometheusMetricsIndex) addSample(sample prometheusSample) {
 		}
 	}
 
-	if rule := extractLabel(name, "rule"); rule != "" {
+	if rule := services.ExtractMetricLabel(name, "rule"); rule != "" {
 		if strings.HasPrefix(name, "lazybalancer_security_blocked_total{") {
 			// SECLB30-2(P5,第 30 轮审计):blocked-only 样本不建 ruleMetricsByRule
 			// 空聚合——否则过渡形态(插件未升级)下 ruleMetrics early return 空,
@@ -998,7 +998,7 @@ func (index *prometheusMetricsIndex) addSample(sample prometheusSample) {
 		case strings.HasPrefix(name, "lazybalancer_requests_in_flight{"):
 			agg.requestsInFlight = int64(value)
 		case strings.HasPrefix(name, "lazybalancer_request_status_total{"):
-			switch extractLabel(name, "class") {
+			switch services.ExtractMetricLabel(name, "class") {
 			case "2xx":
 				agg.status2xx += int64(value)
 			case "3xx":
@@ -1009,7 +1009,7 @@ func (index *prometheusMetricsIndex) addSample(sample prometheusSample) {
 				agg.status5xx += int64(value)
 			}
 		case strings.HasPrefix(name, "lazybalancer_bytes_total{"):
-			switch extractLabel(name, "direction") {
+			switch services.ExtractMetricLabel(name, "direction") {
 			case "in":
 				agg.bytesIn += int64(value)
 			case "out":
@@ -1018,7 +1018,7 @@ func (index *prometheusMetricsIndex) addSample(sample prometheusSample) {
 		}
 	}
 
-	if upstream := extractLabel(name, "upstream"); upstream != "" {
+	if upstream := services.ExtractMetricLabel(name, "upstream"); upstream != "" {
 		aggregate := index.aggregateFor(index.tcpUpstreams, upstream)
 		switch {
 		case strings.HasPrefix(name, "caddy_layer4_proxy_connections_total{"),
@@ -1087,28 +1087,8 @@ func parseHostMetricsFromSamples(samples []prometheusSample) []models.HostMetric
 	return buildPrometheusMetricsIndex(samples).hostMetrics()
 }
 
-// extractLabel(LB40-6 精确键匹配):label 键必须以标签边界(逗号后/花括号后/
-// 字符串起始)出现——子串匹配会把 x_host 误归集到 host,指标归因错乱。
-func extractLabel(metricName string, label string) string {
-	start := -1
-	for _, boundary := range []string{"," + label + `="`, "{" + label + `="`} {
-		if idx := strings.Index(metricName, boundary); idx >= 0 {
-			start = idx + len(boundary)
-			break
-		}
-	}
-	if start < 0 && strings.HasPrefix(metricName, label+`="`) {
-		start = len(label) + 2
-	}
-	if start < 0 {
-		return ""
-	}
-	end := strings.Index(metricName[start:], `"`)
-	if end == -1 {
-		return ""
-	}
-	return metricName[start : start+end]
-}
+// 指标 label 抽取统一走 services.ExtractMetricLabel（LBS/LBH-7 第 73 轮：
+// 本包原 extractLabel 与 services extractMetricLabel 逐字重复，收敛为跨包单源）。
 
 func parseTCPRuleMetricsFromPrometheus(body string, upstreams []models.Upstream) (gin.H, error) {
 	samples, err := parsePrometheusSamples(body)
@@ -1190,17 +1170,8 @@ func classifyStatusCode(code string) string {
 }
 
 func emptyRuleMetrics() gin.H {
-	return gin.H{
-		"requests_total":     int64(0),
-		"requests_in_flight": int64(0),
-		"status_2xx":         int64(0),
-		"status_3xx":         int64(0),
-		"status_4xx":         int64(0),
-		"status_5xx":         int64(0),
-		"bytes_in":           int64(0),
-		"bytes_out":          int64(0),
-		"healthy":            false,
-	}
+	// 双源收敛：空值形状与 ruleMetricsAggregate 零值输出同源，禁手工维护两套键表。
+	return ruleMetricsAggregate{}.ruleMetrics(true)
 }
 
 func isValidHost(host string) bool {

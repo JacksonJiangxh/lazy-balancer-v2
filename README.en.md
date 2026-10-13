@@ -92,10 +92,12 @@ smoke test, then both a `latest` and a versioned manifest.
 
 ## What we changed versus upstream
 
-**Current upstream baseline: `v2.3.6-beta` (`c617664b`, covering the 11 commits after `v2.3.5`).** Everything upstream
-shipped in that release (native `map` late-binding for origin domains,
+**Current upstream baseline: `v2.3.6` (`9c759716`, the v2.3.6 release).** Everything upstream
+shipped through that release (native `map` late-binding for origin domains,
 `response_mode` tri-state for static responses, health-check host, SNI port
-stripping, dashboard quantile interpolation, the 151-item round-69 audit, etc.)
+stripping, dashboard quantile interpolation, the round-69/70/71/72 audits, the
+`geoipnames` shared table library, `trusted_proxy_range_refs` list-based trusted
+ranges, the reworked ACME propagation criterion, etc.)
 is already merged in — see the
 [upstream merge checklist](docs/upstream-merge.zh-CN.md) for the itemized
 reconciliation.
@@ -161,6 +163,7 @@ releases.
 
 | Date | Content |
 |---|---|
+| 2026-10-13 | **Caught up the `v2.3.6` release** (`9c759716`, 23 commits / 192 files): new `geoipnames` zero-dependency shared table library (xcaddy `--with` plus `replace` as belt-and-braces), list-based trusted proxy ranges (`trusted_proxy_range_refs`), NTLM switch relocated in the UI to the "routing & backend compatibility" section, reworked ACME propagation criterion, round-72 (35-item) audit fixes, rule-list TLS label with live issuance state, CRS v4.28.0; version unified to `v2.3.6` (beta suffix dropped); the 7 conflicting files resolved per the layering rules, with self-maintained features (chained fallback, referenced-cert ingestion, port remapping) preserved |
 | 2026-10-12 | **Caught up the 11 untagged upstream commits after `v2.3.5`** (through `v2.3.6-beta` / `c617664b`): Caddy v2.11.7 streaming-forwarding regression fix, Go 1.26.9 + x/net v0.60.0 + Alpine 3.24.2 (10 CVEs), coraza v3.8.1 security fixes, a new rule-level NTLM compatibility switch, round 70/71 audit fixes, task-engine state-column plan A — a security/regression-grade update; our self-maintained features (chained fallback, referenced-cert ingestion, port remapping) and the rule-level `origin_domain` naming are preserved |
 | 2026-10-11 | **Merged upstream v2.3.5** (`98c607ac`): per-upstream origin domain now uses upstream `origin_domain` + native `map`, static responses use upstream `response_mode` tri-state — our `host_header` / `action=respond` implementations retired, with automatic two-way data migration; chained fallback, referenced-cert ingestion and port remapping kept |
 | 2026-10-11 | Port remap edge cases; referenced certificate ingestion; chained fallback strategy; GitHub Actions upstream sync + release watch; README rewrite; `docker-compose` now references our own image |

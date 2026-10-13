@@ -1,4 +1,7 @@
-# 上游合并清单：v2.3.4 → v2.3.5
+# 上游合并清单：v2.3.4 → v2.3.6
+
+> 逐节记录历次追平：§一~七 = `v2.3.4 → v2.3.5`（含 v2.3.6-beta）；
+> §八 = `v2.3.5 → v2.3.6` 正式版（2026-10-13）。
 
 > 本文件是「我们维护的代码」与「上游原作者发布版本」之间的对账记录。
 > 每次上游发版，按本文件的流程走一遍，并把新版本追加成一节。
@@ -332,3 +335,64 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
 | 2026-10-12 | **追平 `v2.3.5` 之后 11 个未打标签提交**（至 `v2.3.6-beta` / `c617664b`）：Caddy v2.11.7、Go 1.26.9 + x/net v0.60.0 + Alpine 3.24.2、coraza v3.8.1、规则级 NTLM 兼容开关、第 70/71 轮审计、task-engine 状态列方案 A；16 冲突文件全部解决（新增列 `ntlm_compatible`/`upstream_force_http1` 与自维护列取并集） |
 | 2026-10-12 | **规则级改名收口**：`lb_rules.origin_domain` 补登记进 `newColumns`，新增 `migrateLbRuleHostHeaderToOriginDomain`（`host_header` → `origin_domain` 先搬后留）；重建 DDL/INSERT/SELECT、`normalizeRuleRowsForTransport`、`migrateTCPRuleDeadFields` 由 `host_header` 统一到 `origin_domain`（修复上一轮扫尾遗留的 `no such column` 缺陷） |
 | 2026-10-12 | 版本号对齐：`.cnb.yml` 巡检基线、构建按钮默认值、README 基线声明统一到 `v2.3.6-beta` |
+| 2026-10-13 | **追平上游 `v2.3.6` 正式版**（`9c759716`，23 提交 / 192 文件）：新增 `geoipnames` 共享表库、受信网段名单化、NTLM UI 归位、ACME 传播判据改造、第 72 轮 35 项审计修复、TLS 标签签发态实时可见、CRS v4.28.0；7 冲突文件按圈层规则解决，自维护能力（链式回退、引用型证书、端口换位）保留；版本口径八处统一到 `v2.3.6` |
+
+---
+
+## 八、v2.3.5 → v2.3.6（2026-10-13 · 追平正式版）
+
+> 本节承接上文的 v2.3.4 → v2.3.5。上游在 v2.3.5（`98c607ac`）之后继续推进，
+> 到 v2.3.6 正式版（tag 对应 GitHub `master` tip `9c759716`）共 **23 个提交**。
+> 我们此前已追平到 v2.3.6-beta（`c617664b`），本轮是把 beta 之后的 23 提交并入。
+
+### 8.1 状态速览（实测）
+
+| 项 | 值 |
+|---|---|
+| 分叉点（共同祖先） | `c617664b`（v2.3.6-beta，双方共有） |
+| 上游新增 | **23** 个提交（`c617664b..9c759716`），192 文件 `+6606/−1638` |
+| 上游 tip | `9c759716`（commit 标题「规则列表 TLS 标签：签发活动态实时可见」） |
+| 我们侧新增 | **44** 个提交（流水线/GitHub 推送/文档/自维护特性） |
+| 合并冲突 | **7 个文件**（`git merge-tree --write-tree` 实测，上一轮 16 个） |
+
+> 冲突从 16 降到 7，正是圈层策略在起作用：v2.3.5 那轮已把圈层 C 决策落地，
+> 本轮属「圈层 A 机械吸收 + 少量保持自维护不变式」。
+
+### 8.2 冲突文件的圈层归类与决策
+
+| 文件 | 圈层 | 决策 |
+|---|---|---|
+| `Dockerfile` | D | 吃上游 `geoipnames/` 接入（`COPY` + `--with` + 叶模块 `go.mod` 拷入），**保留**我们的 web-builder 阶段与 `caddychain/` 的 `COPY` + `--with` |
+| `docker-compose.yml` | D | 保留自维护镜像地址（`docker.cnb.cool/xzydm/mirrors/...`）与主/从端口换位段；`args.VERSION` 保持 `v2.3.6` |
+| `README.md` / `README.en.md` | D | **以我们重写版为准**，仅吸收上游 tag 修正；基线声明与变更日志更新到 `v2.3.6` |
+| `web/src/views/Rules.vue` | C | **以上游重构为骨**（`FieldHelpIcon` 统一角标 + NTLM 开关 UI 归位「路由与后端兼容」区），**合并**自维护列：权重 `FieldHelpIcon` 保留 `chain_fallback` 条件文案；`chain_fallback` 竞速参数块原样保留；`enable_tls` 端口 watcher 保留我们的 `proxyPorts` 动态默认口（不取上游硬编码 443/80） |
+| `internal/handlers/config_backup.go` | D | 采纳上游 `tcpRuleDeadFieldsResetSQL` 常量抽取结构，**列清单取并集**——自维护口径 `origin_domain`（本仓 `lb_rules` 已改名收口）替代上游 `host_header` |
+| `internal/handlers/config_backup_test.go` | D | 采纳上游两行 `lb_rules` 夹具结构（含 ACME 态 `lb_nullacme`），列名取本仓口径 `origin_domain` |
+
+### 8.3 上游本轮新增能力（一并吃进）
+
+- `geoipnames/` 零依赖共享表库（xcaddy `--with` + `replace` 双保险）
+- `global_config.trusted_proxy_range_refs` 受信网段名单化
+- NTLM 开关 UI 归位「路由与后端兼容」区，`FieldHelpIcon` 统一角标组件
+- ACME 传播判据改造（`issuer_propagation`）
+- 第 72 轮 35 项审计修复（R1-R6），含 `tcpRuleDeadFieldsResetSQL` 常量抽取与 parity 钉测
+- 规则列表 TLS 标签签发活动态实时可见
+- CRS v4.28.0、`zlib 1.3.2-r1` 钉版
+- `tcp_dead_fields_parity_test.go` parity 钉测（启动迁移 ↔ 导入归一 SQL 逐字一致）
+
+### 8.4 验证（分支 `sync/upstream-v2.3.6-release`）
+
+- **冲突标记门**：`git grep -nE '^(<<<<<<<|=======$|>>>>>>>)' ` 全仓零命中。
+- **自维护能力实测**：
+  - 链式回退 `chain_fallback`：`caddychain` 单测 ✅ + `TestBuildHTTPHandleChain_chainFallback_emitsChainProxy` ✅
+  - 引用型证书 `tls_source=file`：`TestCreateRule_referencedCertFileIngestsContent` 等 ✅ + 看门狗 `TestCheckReferencedCertFiles_*` ✅
+  - 默认端口换位：`TestSetDefaultProxyPorts_*` / `TestGenerateCaddyConfig_defaultSiteFollowsHTTPPort` ✅
+  - 上游新能力：`trusted_proxy_range_refs` / NTLM / ACME 传播 单测 ✅
+- `go build ./...` ✅；`go vet ./...` ✅
+- `go test ./internal/... ./cmd/...`：与**上游 tip 原始检出**逐包比对，失败包集合一致
+  （`internal/dnsprovider/dnspod`、`internal/dnsprovider/tencent`、`internal/services`）——
+  根因均为沙箱环境（root 用户权限语义 / CRS 网络下载尺寸判据），与本次合并无关。
+- 前端 `npx vue-tsc --noEmit` ✅；`npm run build` ✅。
+- 版本口径八处统一 `v2.3.6`（`Dockerfile` ARG、`internal/config` 默认值、
+  `docker-compose` `args.VERSION`、`branding.ts` 回退值、`.cnb/web_trigger.yml`
+  构建按钮、`.cnb.yml` `BASELINE_TAG`、README 中英基线声明与变更日志）。

@@ -531,10 +531,7 @@
               </el-table-column>
               <el-table-column min-width="180" v-if="wizardForm.protocol === 'http'">
                 <template #header>
-                  回源域名
-                  <el-tooltip placement="top" content="该上游独立的回源 Host 头与 HTTPS SNI（主机名，不带端口；端口沿用左侧端口列配置）。留空=不覆盖（Host 跟随客户端请求或上游地址）">
-                    <el-icon class="upstream-unknown"><QuestionFilled /></el-icon>
-                  </el-tooltip>
+                  回源域名<FieldHelpIcon content="该上游独立的回源 Host 头与 HTTPS SNI（主机名，不带端口；端口沿用左侧端口列配置）。留空=不覆盖（Host 跟随客户端请求或上游地址）" />
                 </template>
                 <template #default="{ row }">
                   <el-tooltip placement="top" :disabled="!wizardForm.dynamic_dns" content="动态上游模式不支持回源域名（改写 Host 请经 API/MCP 设置规则级 host_header）">
@@ -550,12 +547,9 @@
               </el-table-column>
               <el-table-column width="84">
                 <template #header>
-                  权重 %
-                  <el-tooltip placement="top" :content="wizardForm.strategy === 'chain_fallback'
+                  权重 %<FieldHelpIcon :content="wizardForm.strategy === 'chain_fallback'
                     ? '链式回退下权重即优先级：权重越大越先被请求，相同权重按列表顺序；仍按百分比录入（总和须为 100）。'
-                    : '数字越大，分配到的请求越多；权重相同时即为普通轮询。至少需要添加一个上游服务器。'">
-                    <el-icon class="upstream-unknown"><QuestionFilled /></el-icon>
-                  </el-tooltip>
+                    : '数字越大，分配到的请求越多；权重相同时即为普通轮询。至少需要添加一个上游服务器。'" />
                 </template>
                 <template #default="{ row, $index }">
                   <el-input-number v-model="row.weight" :min="1" :max="100" size="small" controls-position="right" class="upstream-input-small" :disabled="!row.enabled" @change="onWeightChange($index)" />
@@ -563,12 +557,9 @@
               </el-table-column>
               <el-table-column width="118">
                 <template #header>
-                  {{ wizardForm.protocol === 'tcp' ? '最大连接' : '最大请求数' }}
-                  <el-tooltip placement="top" :content="wizardForm.protocol === 'tcp'
+                  {{ wizardForm.protocol === 'tcp' ? '最大连接' : '最大请求数' }}<FieldHelpIcon :content="wizardForm.protocol === 'tcp'
                     ? '该上游并发连接数上限（HTTP 规则映射为 reverse_proxy 每上游并发请求数 max_requests；TCP 规则映射为 caddy-l4 max_connections），0 为不限制'
-                    : '该上游同时处理的请求数达到上限后判定不可用并移出负载，0 为不限制——HTTP 反代无逐上游并发连接限制'" >
-                    <el-icon class="upstream-unknown"><QuestionFilled /></el-icon>
-                  </el-tooltip>
+                    : '该上游同时处理的请求数达到上限后判定不可用并移出负载，0 为不限制——HTTP 反代无逐上游并发连接限制'" />
                 </template>
                 <template #default="{ row }">
                   <el-tooltip placement="top" :disabled="!wizardForm.dynamic_dns" :content="`动态上游模式下${wizardForm.protocol === 'tcp' ? '最大连接' : '最大请求数'}不生效`">
@@ -594,11 +585,32 @@
             </div>
 
             <template v-if="wizardForm.protocol === 'http'">
-              <el-divider content-position="left" class="compact-divider">自定义路由</el-divider>
+              <el-divider content-position="left" class="compact-divider">路由与后端兼容</el-divider>
               <el-form-item label="自定义路由">
                 <el-switch v-model="wizardForm.custom_routes_enabled" @change="onCustomRoutesToggle" />
                 <span class="form-tip-inline">开启后在下一步配置按路径转发规则</span>
               </el-form-item>
+              <!-- NTLM 兼容（2026-10-12 用户定稿）：与自定义路由同区（后端兼容域）；
+                   开启后以 NTLM 接管形态锁定 7 字段（清单见 onNtlmToggle 弹框） -->
+              <el-form-item>
+                <template #label><span>NTLM 兼容<FieldHelpIcon popper-class="ntlm-help-popper">
+                    <template #content>
+                      <div class="ntlm-help-line">适用场景：Exchange / AD / 旧版 IIS 等使用 NTLM / 协商认证的后端</div>
+                      <div class="ntlm-help-line">已知限制：</div>
+                      <div class="ntlm-help-line">· 若后端协商到 Kerberos，建议不改写 Host</div>
+                      <div class="ntlm-help-line">· 入口 HTTP/2 由客户端自动降级，不受本开关控制</div>
+                    </template>
+                  </FieldHelpIcon></span>
+                </template>
+                <div class="ntlm-switch-control">
+                  <el-switch :model-value="ntlmOn" @change="onNtlmToggle" />
+                  <span class="form-tip-inline">为 NTLM / 协商认证后端锁定长连接亲和的代理形态</span>
+                </div>
+              </el-form-item>
+
+              <div v-if="ntlmOn" class="info-note-bar">
+                <span class="info-note-desc">NTLM 接管已生效：负载策略锁定 Cookie 会话保持 · 请求重试禁用 · 响应立即透传 · Keepalive 300s + 强制 HTTP/1.1 · 主动健康检查关闭（被动健康检查仍在役）</span>
+              </div>
             </template>
 
             <el-divider content-position="left" class="compact-divider">负载策略</el-divider>
@@ -625,7 +637,8 @@
               </el-tooltip>
             </div>
 
-            <!-- 链式回退竞速参数（strategy=chain_fallback，仅 HTTP） -->
+            <!-- 链式回退竞速参数（strategy=chain_fallback，仅 HTTP）——自维护能力，
+                 上游无此块，合并时原样保留（见 AGENTS.md §圈层规则） -->
             <template v-if="wizardForm.strategy === 'chain_fallback' && wizardForm.protocol === 'http'">
               <el-form-item label="竞速间隔">
                 <el-input-number v-model="wizardForm.chain_race_interval_ms" :min="10" :max="60000" :step="50" controls-position="right" style="width: 140px;" />
@@ -635,33 +648,6 @@
                 <el-input-number v-model="wizardForm.chain_request_timeout_ms" :min="100" :max="600000" :step="100" controls-position="right" style="width: 140px;" />
                 <span class="form-tip-inline">毫秒，单个上游超过该时长仍未响应将被截断取消，避免耗时浪费</span>
               </el-form-item>
-            </template>
-
-            <!-- NTLM 兼容（2026-10-12 用户定稿）：仅 HTTP 规则可见；开启后以
-                 NTLM 接管形态锁定 7 字段（清单见 onNtlmToggle 弹框），被接管
-                 控件在各分区呈灰态 + 「NTLM 接管」徽标 -->
-            <template v-if="wizardForm.protocol === 'http'">
-              <el-divider content-position="left" class="compact-divider">NTLM 兼容</el-divider>
-
-              <el-form-item label="NTLM 兼容">
-                <div class="ntlm-switch-control">
-                  <el-switch :model-value="ntlmOn" @change="onNtlmToggle" />
-                  <el-tooltip placement="top" popper-class="ntlm-help-popper">
-                    <template #content>
-                      <div class="ntlm-help-line">适用场景：Exchange / AD / 旧版 IIS 等使用 NTLM / 协商认证的后端</div>
-                      <div class="ntlm-help-line">已知限制：</div>
-                      <div class="ntlm-help-line">· 若后端协商到 Kerberos，建议不改写 Host</div>
-                      <div class="ntlm-help-line">· 入口 HTTP/2 由客户端自动降级，不受本开关控制</div>
-                    </template>
-                    <el-icon class="ntlm-help-icon"><WarningFilled /></el-icon>
-                  </el-tooltip>
-                  <span class="form-tip-inline">为 NTLM / 协商认证后端锁定长连接亲和的代理形态</span>
-                </div>
-              </el-form-item>
-
-              <div v-if="ntlmOn" class="info-note-bar">
-                <span class="info-note-desc">NTLM 接管已生效：负载策略锁定 Cookie 会话保持 · 请求重试禁用 · 响应立即透传 · Keepalive 300s + 强制 HTTP/1.1 · 主动健康检查关闭（被动健康检查仍在役）</span>
-              </div>
             </template>
 
             <el-divider content-position="left" class="compact-divider">健康检查</el-divider>
@@ -686,7 +672,7 @@
               <el-form-item label="主动检查">
                 <div class="active-check-control">
                   <el-switch v-model="wizardForm.enable_active_health_check" :disabled="ntlmOn" />
-                  <span v-if="ntlmOn" class="ntlm-takeover-badge">NTLM 接管</span>
+                  <TakeoverBadge v-if="ntlmOn" />
                   <span class="form-tip-inline">{{ ntlmOn
                     ? '已关闭：NTLM 后端探测返回 401 会被误判摘除；被动健康检查仍在役'
                     : (wizardForm.enable_active_health_check ? '周期探测，异常节点持续摘除直至恢复（推荐）' : '仅被动熔断，异常节点会周期恢复并重新接收流量') }}</span>
@@ -808,29 +794,35 @@
                    NTLM 接管时由开关锁定为开，呈灰态 -->
               <el-divider content-position="left" class="compact-divider">上游兼容</el-divider>
 
-              <el-form-item label="上游强制 HTTP/1.1">
+              <el-form-item label="强制 HTTP/1.1">
                 <div class="active-check-control">
                   <el-switch v-model="wizardForm.upstream_force_http1" :active-value="1" :inactive-value="0" :disabled="ntlmOn" />
-                  <span v-if="ntlmOn" class="ntlm-takeover-badge">NTLM 接管</span>
+                  <TakeoverBadge v-if="ntlmOn" />
                   <span class="form-tip-inline">后端不支持 HTTP/2 或使用 NTLM 认证时开启；仅对 https 上游生效</span>
                 </div>
               </el-form-item>
             </template>
 
-            <template v-if="wizardForm.protocol === 'tcp'">
+            <template v-if="wizardForm.protocol === 'http' || wizardForm.protocol === 'tcp'">
               <el-divider content-position="left" class="compact-divider">连接重试</el-divider>
 
-              <el-form-item label="重试窗口">
-                <el-input-number v-model="wizardForm.tcp_try_duration" :min="0" :max="60000" controls-position="right" style="width: 120px;" />
-                <span class="form-tip-inline">毫秒，0 表示不重试；连接失败后在窗口期内尝试其他上游</span>
+              <el-form-item>
+                <template #label>重试窗口
+                </template>
+                <el-input-number v-model="wizardForm.tcp_try_duration" :min="ntlmOn ? -1 : 0" :max="60000" controls-position="right" style="width: 120px;" :disabled="ntlmOn" />
+                <span class="form-tip-inline"><TakeoverBadge v-if="ntlmOn" />{{ ntlmOn
+                  ? '禁用重试（NTLM 模式锁定）'
+                  : (wizardForm.protocol === 'tcp'
+                      ? '毫秒，0 表示不重试；连接失败后在窗口期内尝试其他上游'
+                      : '毫秒，0 = 默认 5 秒窗口；失败后在窗口期内尝试其他上游') }}</span>
               </el-form-item>
 
               <el-form-item label="重试间隔">
-                <el-input-number v-model="wizardForm.tcp_try_interval" :min="0" :max="10000" controls-position="right" style="width: 120px;" />
-                <span class="form-tip-inline">毫秒，每次重试间隔；0 表示使用 Caddy 默认间隔</span>
+                <el-input-number v-model="wizardForm.tcp_try_interval" :min="0" :max="10000" controls-position="right" style="width: 120px;" :disabled="ntlmOn || (wizardForm.tcp_try_duration || 0) <= 0" />
+                <span class="form-tip-inline"><TakeoverBadge v-if="ntlmOn" />{{ ntlmOn ? '重试已禁用，间隔不生效' : ((wizardForm.tcp_try_duration || 0) <= 0 ? '窗口未启用时间隔不生效' : '毫秒，每次重试间隔；0 表示使用 Caddy 默认间隔') }}</span>
               </el-form-item>
 
-              <el-form-item label="PROXY V2">
+              <el-form-item v-if="wizardForm.protocol === 'tcp'" label="PROXY V2">
                 <el-switch v-model="wizardForm.tcp_proxy_protocol" />
                 <span class="form-tip-inline">开启后向上游发送 PROXY v2 协议头传递真实客户端 IP，需后端支持</span>
               </el-form-item>
@@ -845,8 +837,7 @@
 
             <el-form-item label="Keepalive 超时">
               <el-input-number v-model="wizardForm.upstream_keepalive_timeout" :min="0" :max="3600" controls-position="right" style="width: 120px;" :disabled="ntlmOn" />
-              <span v-if="ntlmOn" class="ntlm-takeover-badge">NTLM 接管</span>
-              <span class="form-tip-inline">秒，0 = 全局默认；与上游服务器长连接的空闲超时</span>
+              <span class="form-tip-inline"><TakeoverBadge v-if="ntlmOn" />{{ ntlmOn ? 'NTLM 模式锁定 300s（关闭后恢复全局继承）' : '秒，0 = 全局默认；与上游服务器长连接的空闲超时' }}</span>
             </el-form-item>
           </el-form>
         </div>
@@ -1013,11 +1004,12 @@
           <el-descriptions-item label="被动健康检查" v-if="ruleConfig.protocol === 'http' || ruleConfig.protocol === 'tcp'">
             失败 {{ ruleConfig.health_check_unhealthy_threshold || 3 }} 次视为不健康, 间隔 {{ ruleConfig.health_check_interval || 10 }}s, 超时 {{ ruleConfig.health_check_timeout || 2 }}s
           </el-descriptions-item>
-          <el-descriptions-item label="连接重试" v-if="ruleConfig.protocol === 'tcp'">
+          <el-descriptions-item label="连接重试" v-if="ruleConfig.protocol === 'http' || ruleConfig.protocol === 'tcp'">
             <template v-if="ruleConfig.tcp_try_duration > 0">
               窗口 {{ ruleConfig.tcp_try_duration }}ms / 间隔 {{ ruleConfig.tcp_try_interval }}ms
             </template>
-            <template v-else>禁用</template>
+            <template v-else-if="ruleConfig.tcp_try_duration === -1">禁用重试（NTLM 模式）</template>
+            <template v-else>{{ ruleConfig.protocol === 'tcp' ? '禁用' : '默认 5s 窗口' }}</template>
           </el-descriptions-item>
           <el-descriptions-item label="请求体大小">{{ (ruleConfig.request_body_max_size_mb || 0) > 0 ? ruleConfig.request_body_max_size_mb + 'MB' : '全局默认' }}</el-descriptions-item>
             <el-descriptions-item label="Keepalive 超时">{{ (ruleConfig.upstream_keepalive_timeout || 0) > 0 ? ruleConfig.upstream_keepalive_timeout + 's' : '全局默认' }}</el-descriptions-item>
@@ -1150,6 +1142,39 @@
         </div>
       </template>
     </el-dialog>
+
+    <!-- NTLM 开关确认（参照更新迁移预演范式）：开启=接管清单确认；关闭=恢复默认告知 -->
+    <el-dialog v-model="ntlmConfirmVisible" class="dialog-body-inset" width="min(560px, 94vw)" top="10vh" :close-on-click-modal="false">
+      <template #header>
+        <DialogHeader :icon="ntlmConfirmMode === 'on' ? WarningFilled : CircleCheckFilled"
+          :title="ntlmConfirmMode === 'on' ? '开启 NTLM 兼容' : 'NTLM 兼容已关闭'"
+          :subtitle="ntlmConfirmMode === 'on' ? '为 NTLM / 协商认证后端锁定长连接亲和的代理形态' : '已恢复默认配置'" />
+      </template>
+      <div v-if="ntlmConfirmMode === 'on'" class="ntlm-confirm-body">
+        <div class="ntlm-confirm-title">开启后将接管以下配置：</div>
+        <ul class="ntlm-confirm-list">
+          <li>负载策略锁定为 <b>Cookie 会话保持</b></li>
+          <li>禁用请求重试</li>
+          <li>响应立即透传</li>
+          <li>上游连接保持 300s + 强制 HTTP/1.1</li>
+          <li>主动健康检查关闭（探测返回 401 会被误判摘除；被动健康检查仍在役）</li>
+        </ul>
+        <div class="info-note-bar"><span class="info-note-desc">原配置不保留记忆，关闭时恢复默认</span></div>
+      </div>
+      <div v-else class="ntlm-confirm-body">
+        <ul class="ntlm-confirm-list">
+          <li>负载策略解锁为轮询</li>
+          <li>重试窗口恢复 5s 默认</li>
+          <li>透传 / Keepalive / HTTP 版本恢复全局继承</li>
+          <li>主动健康检查保持关闭，可按需重新开启</li>
+        </ul>
+      </div>
+      <template #footer>
+        <el-button v-if="ntlmConfirmMode === 'on'" @click="ntlmConfirmVisible = false">取消</el-button>
+        <el-button v-if="ntlmConfirmMode === 'on'" type="warning" @click="confirmNtlmToggle">开启</el-button>
+        <el-button v-else type="primary" @click="confirmNtlmToggle">确认关闭</el-button>
+      </template>
+    </el-dialog>
     <SecurityBindingEditor
       v-model="bindDialogVisible"
       mode="rule"
@@ -1169,8 +1194,10 @@
 import { ref, reactive, onMounted, onUnmounted, computed, watch, nextTick } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { request, mfaAwareSuccess } from '@/utils/api'
-import { Plus, Operation, Delete, InfoFilled, Lock, Connection, Guide, Check, ArrowLeft, ArrowRight, Document, CircleCheckFilled, CircleCloseFilled, QuestionFilled, Setting, RefreshRight, Search, WarningFilled, Location, Monitor, Link, Tickets } from '@element-plus/icons-vue'
+import { Plus, Operation, Delete, InfoFilled, Lock, Connection, Guide, Check, ArrowLeft, ArrowRight, Document, CircleCheckFilled, CircleCloseFilled, Setting, RefreshRight, Search, WarningFilled, Location, Monitor, Link, Tickets } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
+import FieldHelpIcon from '@/components/common/FieldHelpIcon.vue'
+import TakeoverBadge from '@/components/common/TakeoverBadge.vue'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import axios from 'axios'
 import { ansiToHtml } from '@/utils/ansi'
@@ -1682,15 +1709,18 @@ const canDeleteRule = (row: Rule) => {
 
 const tlsTagType = (row: Rule) => {
   const cert = certInfoMap.value[row.caddy_id]
+  const jobStatus = certJobMap.value[row.caddy_id]?.status
+  // 重新签发进行中（含切换 CA）优先呈现活动态——在役证书 valid 不再抢先显示
+  //「已签发」（第 73 轮用户报告：签发任务执行中标签无变化）。
+  if (row.tls_source === 'acme_dns' && jobStatus && (isCertJobActive(jobStatus) || jobStatus === 'waiting_ca')) return 'warning'
   if (cert?.status === 'expired') return 'danger'
   if (cert?.status === 'expiring') return 'warning'
   if (cert?.status === 'valid') return 'success'
   if (row.tls_source === 'acme_dns') {
-    const status = certJobMap.value[row.caddy_id]?.status
-    if (status === 'issued') return 'success'
-    if (status === 'failed') return 'danger'
-    if (status === 'disabled') return 'info'
-    if (status) return 'warning'
+    if (jobStatus === 'issued') return 'success'
+    if (jobStatus === 'failed') return 'danger'
+    if (jobStatus === 'disabled') return 'info'
+    if (jobStatus) return 'warning'
     return 'info'
   }
   return 'primary'
@@ -1698,13 +1728,17 @@ const tlsTagType = (row: Rule) => {
 
 const tlsTagLabel = (row: Rule) => {
   const cert = certInfoMap.value[row.caddy_id]
+  const jobStatus = certJobMap.value[row.caddy_id]?.status
+  // 活动签发态（含限流冷却）优先用任务阶段性短标签（certJobStatusLabel 2-4 字，
+  // 适配 106px 列宽）——重新签发/切 CA 期间每个阶段实时可见。
+  if (row.tls_source === 'acme_dns' && jobStatus && (isCertJobActive(jobStatus) || jobStatus === 'waiting_ca')) {
+    return certJobStatusLabel(jobStatus)
+  }
   if (cert?.status === 'expired') return '已过期'
   if (cert?.status === 'expiring') return `临期 ${cert.days_remaining} 天`
   if (cert?.status === 'valid') return row.tls_source === 'acme_dns' ? '已签发' : '手动'
   if (row.tls_source === 'acme_dns') {
-    const status = certJobMap.value[row.caddy_id]?.status
-    const label = status ? certJobStatusLabel(status) : ''
-    return label || '未签发'
+    return (jobStatus ? certJobStatusLabel(jobStatus) : '') || '未签发'
   }
   return '手动'
 }
@@ -2050,25 +2084,29 @@ const userExplicitPort = ref(false)
 let preTcpSnapshot: { listenPort: number; enableTls: boolean } | null = null
 
 // Watch for enable_tls toggle to adjust default listen port
+// R10-2（第 72 轮，用户裁定）：启用 TLS 时端口直接默认 HTTPS 口（不仅是提示）——
+// 编辑态与创建态统一，开启分支必须先于 userExplicitPort 短路（2026-10-13
+// 生产实证：短路前置导致编辑态拨 TLS 永不改端口）。用户随后手动改端口即置
+// userExplicitPort，关闭方向的自动回 HTTP 口仍受其约束（既有 R59 D-F1 语义）。
+// 自维护合并（圈层规则）：上游此处硬编码 443/80，本仓口径须走 proxyPorts
+// 动态默认口（默认端口换位能力，见 internal/services/default_ports.go）。
 watch(() => wizardForm.enable_tls, (newVal, oldVal) => {
   if (hydratingWizard) return
-  // 编辑态下端口不做自动迁移（保留已提交配置），但 TLS 开关与非常态端口组合时给出非静默提示
   const defHttp = proxyPorts.value.http_port
   const defHttps = proxyPorts.value.https_port
-  if (newVal && !oldVal && userExplicitPort.value && wizardForm.listen_port === defHttp) {
-    showTlsHint(`端口当前为 ${defHttp}，如需 HTTPS 访问建议改为 ${defHttps}`)
+  if (wizardForm.protocol !== 'http') return
+  if (newVal && !oldVal) {
+    if (wizardForm.listen_port !== defHttps) {
+      wizardForm.listen_port = defHttps
+      showTlsHint(`已默认切换为 ${defHttps} 端口`)
+    }
+    return
   }
   if (!newVal && oldVal && userExplicitPort.value && wizardForm.listen_port === defHttps) {
     showTlsHint(`端口当前为 ${defHttps}，关闭 TLS 后如需 HTTP 访问建议改为 ${defHttp}`)
   }
   if (userExplicitPort.value) return
-  if (wizardForm.protocol !== 'http') return
-  if (newVal && !oldVal) {
-    // Enabling HTTPS: default to HTTPS 默认口 if currently using the HTTP 默认口
-    if (wizardForm.listen_port === defHttp) {
-      wizardForm.listen_port = defHttps
-    }
-  } else if (!newVal && oldVal) {
+  if (!newVal && oldVal) {
     // Disabling HTTPS: revert to HTTP 默认口 if currently on HTTPS 默认口
     if (wizardForm.listen_port === defHttps) {
       wizardForm.listen_port = defHttp
@@ -2670,28 +2708,24 @@ const restoreNtlmDefaults = (): void => {
   wizardForm.enable_active_health_check = false
 }
 
-const onNtlmToggle = async (enabled: string | number | boolean): Promise<void> => {
-  if (Boolean(enabled)) {
-    try {
-      await ElMessageBox.confirm(
-        `<div style="line-height:1.9">开启后将接管以下配置：<br/>① 负载策略锁定为 Cookie 会话保持<br/>② 禁用请求重试<br/>③ 响应立即透传<br/>④ 上游连接保持 300s + 强制 HTTP/1.1<br/>⑤ 主动健康检查关闭（NTLM 后端探测返回 401 会被误判摘除；被动健康检查仍在役）<br/><strong>原配置不保留记忆，关闭时恢复默认</strong></div>`,
-        '开启 NTLM 兼容',
-        { type: 'warning', dangerouslyUseHTMLString: true, confirmButtonText: '开启', cancelButtonText: '取消' }
-      )
-    } catch {
-      return // 取消：开关由 model-value 驱动自动回弹，不改动任何字段
-    }
+// NTLM 开关确认弹框（参照安全策略「更新迁移预演」范式：DialogHeader+分区清单+footer）
+const ntlmConfirmVisible = ref(false)
+const ntlmConfirmMode = ref<'on' | 'off'>('on')
+
+const onNtlmToggle = (enabled: string | number | boolean): void => {
+  ntlmConfirmMode.value = Boolean(enabled) ? 'on' : 'off'
+  ntlmConfirmVisible.value = true // 开关由 model-value 驱动：取消则自动回弹零改动
+}
+
+const confirmNtlmToggle = (): void => {
+  if (ntlmConfirmMode.value === 'on') {
     wizardForm.ntlm_compatible = 1
     applyNtlmTakeover()
   } else {
     wizardForm.ntlm_compatible = 0
     restoreNtlmDefaults()
-    await ElMessageBox.alert(
-      '已恢复默认配置：策略解锁为轮询、重试窗口 5s 默认、透传/Keepalive/HTTP1 恢复全局继承、主动健康检查关闭',
-      'NTLM 兼容已关闭',
-      { type: 'info', confirmButtonText: '知道了' }
-    )
   }
+  ntlmConfirmVisible.value = false
 }
 
 // 代理超时区被接管字段（仅刷新间隔）：灰态 + 徽标 + 「立即透传」显示值
@@ -3950,10 +3984,6 @@ onUnmounted(() => {
   font-size: 14px;
 }
 
-.upstream-unknown {
-  color: #9ca3af;
-  font-size: 14px;
-}
 
 /* Status switch */
 .status-switch :deep(.el-switch__core) {
@@ -4059,7 +4089,7 @@ onUnmounted(() => {
   display: flex;
   gap: 8px;
   width: 100%;
-  padding: 0 20px;
+  padding: 10px 20px 14px;
   box-sizing: border-box;
 }
 
@@ -4134,28 +4164,10 @@ onUnmounted(() => {
   gap: 8px;
 }
 
-.ntlm-help-icon {
-  color: #e6a23c;
-  cursor: help;
-  font-size: 15px;
-}
-
-.ntlm-takeover-badge {
-  display: inline-block;
-  padding: 0 6px;
-  border: 1px solid var(--el-border-color);
-  border-radius: 4px;
-  background: var(--el-fill-color-light);
-  color: var(--el-text-color-secondary);
-  font-size: 11px;
-  line-height: 18px;
-  white-space: nowrap;
-}
-
 .active-check-control {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
 }
 
 .wizard-footer {
@@ -4331,4 +4343,8 @@ onUnmounted(() => {
 /* NTLM 帮助 tooltip：popper 挂 body，须非 scoped */
 .ntlm-help-popper { max-width: 360px; }
 .ntlm-help-popper .ntlm-help-line { font-size: 12px; line-height: 1.7; }
+.ntlm-confirm-body { padding: 2px 4px; }
+.ntlm-confirm-title { font-size: 13px; color: var(--el-text-color-regular); margin-bottom: 6px; }
+.ntlm-confirm-list { margin: 0 0 4px; padding-left: 18px; font-size: 13px; line-height: 2; color: var(--el-text-color-regular); }
+.ntlm-confirm-list b { color: var(--el-text-color-primary); }
 </style>

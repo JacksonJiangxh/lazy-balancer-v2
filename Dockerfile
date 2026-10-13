@@ -10,16 +10,19 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 WORKDIR /app
 
 ENV GOTOOLCHAIN=auto
-# INFRA-P1（第 69 轮）：xcaddy 阶段只需四个本地插件目录（--with 引用），
+# INFRA-P1（第 69 轮）：xcaddy 阶段只需五个本地目录（--with 引用），
 # 窄化 COPY 面——此前 COPY . . 全仓入镜，任何前端/文档变更即 bust 该层并重跑
 # xcaddy build（缓存挂载兜底仍需分钟级增量编译）。backend 阶段保留全量 COPY
-#（Go 编译需全源码）。
+#（Go 编译需全源码）。geoipnames 是零依赖共享表库（PLUG-N3 第 72 轮）——
+# --with 在此兼作 replace 载体（插件模块内 replace 对 xcaddy 临时主模块无效，
+# 与 wafiplist 同模式双保险）。
 # 清单必须与下方 xcaddy 的 --with 本地目录逐一对齐：漏一个目录 xcaddy 会以
 # "replacement directory /app/<dir> does not exist" 失败（caddychain 曾漏）。
 COPY caddygeoip/ caddygeoip/
 COPY caddychain/ caddychain/
 COPY caddydeps/ caddydeps/
 COPY wafiplist/ wafiplist/
+COPY geoipnames/ geoipnames/
 # 双缓存挂载（模块+编译缓存）按 builder 持久（lazy-builder GC 48h）：
 # 根治冷缓存全量重编 42 分钟——命中缓存后增量编译只需数分钟。
 # 3 次重试兜底镜像源偶发供应与 sum.golang.org 校验不符的比特
@@ -38,7 +41,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       --with lazy-balancer-v2/caddygeoip=./caddygeoip \
       --with lazy-balancer-v2/caddychain=./caddychain \
       --with lazy-balancer-v2/caddydeps=./caddydeps \
-      --with lazy-balancer-v2/wafiplist=./wafiplist; then \
+      --with lazy-balancer-v2/wafiplist=./wafiplist \
+      --with lazy-balancer-v2/geoipnames=./geoipnames; then \
       built=1; break; \
     fi; \
     echo ">>> xcaddy build 第 ${attempt}/3 次失败，10s 后重试" >&2; \
@@ -64,9 +68,11 @@ WORKDIR /app
 # 其不可达时 go mod download 无回退直接失败）：阿里云 404/410 时依次回落
 # goproxy.cn、直连；校验不符类瞬态错误由下方 3 次重试兜底。
 ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,https://goproxy.cn,direct
-# wafiplist 叶模块经根 go.mod replace ./wafiplist 引用（v2.3.4）——go mod
-# download 解析 replace 需要被替换模块的 go.mod/go.sum 在场。
+# wafiplist/geoipnames 叶模块经根 go.mod replace ./wafiplist ./geoipnames 引用
+# （geoipnames 自 PLUG-N3 第 72 轮）——go mod download 解析 replace 需要被替换
+# 模块的 go.mod/go.sum 在场（geoipnames 零依赖无 go.sum）。
 COPY wafiplist/go.mod wafiplist/go.sum ./wafiplist/
+COPY geoipnames/go.mod ./geoipnames/
 COPY go.mod go.sum ./
 # 模块缓存挂载（lazy-builder GC 48h）：go.sum 未变时 download 直接命中缓存；
 # 3 次重试兜底镜像源偶发供应与校验不符的瞬态错误（与 xcaddy build 同形态）。
@@ -112,6 +118,10 @@ RUN --mount=type=cache,target=/root/.npm \
 
 # Final image
 FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+# FE-8/INFRA-4（第 73 轮登记）：版本号三处硬编码之一（另两处
+# web/src/utils/branding.ts appVersion 回退值、docker-compose.yml args.VERSION）。
+# 发版检查单已固化进 lazy-balancer-release 技能步骤 2（三处同步 bump）——保留
+# 硬编码不回退，仅登记防漏。
 ARG VERSION=v2.3.6
 # 构建机网络受限时经 --build-arg HTTP(S)_PROXY 透传给 RUN 下载步骤
 # （CRS/ip2region 钉版下载）；未传参时为空值，行为不变（官方惯例形态）。

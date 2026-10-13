@@ -540,6 +540,14 @@ func securityEventsPolicyContainsRule(policy *models.SecurityPolicy, ruleTrigger
 		if len(groups) == 0 {
 			return true
 		}
+		// SEC-B-3（第 72 轮）：切片前长度防御——六位是 CRS 规则 ID 的规范
+		// 形态；前导零等畸形串（Atoi 可解析入区间但长度≠6，如 "0942100"）
+		// 的 [1:3] 切片错位（切出 "94" 而非真实组号 21），会误认领存量/带外
+		// 携带对应错位组号的策略。组号不可解码即保守不认领——事件归属由
+		// fallback 层兜底（摄取必有归属不破），生产不可达纯防御。
+		if len(ruleTriggered) != 6 {
+			return false
+		}
 		code := ruleTriggered[1:3]
 		for _, g := range groups {
 			if strings.TrimSpace(g) == code {
@@ -595,12 +603,13 @@ func securityEventsPolicyContainsRule(policy *models.SecurityPolicy, ruleTrigger
 //	  无 949 评分链,id:11 守卫(phase:2 pass)恒不产 blocked(F1 标靶保持);
 //	  自定义规则无 id:6 切换任意相位可拦;预检 id:7 与模式无关(:927-935)
 //	  (A35-SECLB-3:初版门允许集漏 7,误拒);
-//	· id:11 发射面(2026-09-21 实证,维持现状):emitBodyProcessorRules 在
-//	  custom_only/blocking/detection 三模式恒发射(security.go :347/:408,
-//	  请求体处理器激活与畸形 body 守卫不依赖自定义规则)——logged 事件三模式
-//	  物理可能,门放行格与发射面一致;blocked 任何模式均不可产(phase:2 pass
-//	  恒不中断),blocking 的 blocked 11 保持可行格(物理上该形状事件不存在,
-//	  恒真格无害);
+//	· id:11 发射面(2026-09-21 实证;SEC-B-1 第 72 轮收紧):emitBodyProcessorRules
+//	  在 blocking/detection 恒发射,custom_only 收紧为存在启用自定义规则才发射
+//	  (security.go :374,零规则+仅 IP 控制形状 body access 恒 Off、发射即死
+//	  指令)——logged 事件三模式物理可能,门放行格与发射面一致(模式粒度,
+//	  custom_only 零规则策略的物理不可能由 fallback 归属兜底吸收);blocked
+//	  任何模式均不可产(phase:2 pass 恒不中断),blocking 的 blocked 11 保持
+//	  可行格(物理上该形状事件不存在,恒真格无害);
 //	· 自定义族(10000-799999/1000000+)的物理发射面能力维度由上层首选层
 //	  securityEventsCustomRulesEventSurface 承担(emitCustomRules 对 Disabled
 //	  整条跳过的镜像):无启用自定义规则的策略不得凭候选顺序抢先认领本族事件;
@@ -1477,7 +1486,7 @@ func runIngestionLoop(ctx context.Context) error {
 
 // —— 安全处理耗时侧车文件（2026-09-27 用户裁定）——
 // 跨进程通信:写侧在 Caddy 二进制(caddygeoip/blocked_counter 经
-// AppendSecurityTiming 追加「<id> <ms>」行),读侧在本进程(每 audit pass 前
+// AppendSecurityTiming 追加「<id> <us>」行),读侧在本进程(每 audit pass 前
 // securityTimingLoad 全量读入 tick 级 map);关联键=blocked_counter 注入请求头
 // X-Lb-Security-Timing-Id(coraza 审计日志 request.headers 天然收录)。
 // 生命周期:tick 级 map(pass 结束后下轮 Load 重建,旧条目自然丢弃);文件由
@@ -1512,11 +1521,11 @@ func securityTimingLoad() {
 		if line == "" {
 			continue
 		}
-		id, ms, ok := strings.Cut(line, " ")
+		id, us, ok := strings.Cut(line, " ")
 		if !ok || id == "" {
 			continue
 		}
-		v, err := strconv.ParseInt(ms, 10, 64)
+		v, err := strconv.ParseInt(us, 10, 64)
 		if err != nil || v < 0 {
 			continue
 		}
@@ -1601,8 +1610,3 @@ func securityEventsStageDuration(timingID, ruleID string) int64 {
 	}
 	return 0
 }
-
-// Stage1PrecheckIDSQLList 是预检段规则 ID 的 SQL 字面量清单——handlers 层
-// SQL 与本文件 Go 谓词(securityEventsIsPrecheckRule)共享同一事实源(第 62
-// 轮 F62-40 三处字面量收敛;3/5/12 为防御性包含——当前 nolog pass 不产事件)。
-const Stage1PrecheckIDSQLList = "('2','3','4','5','7','8','12','14')"

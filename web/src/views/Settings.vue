@@ -87,13 +87,14 @@ const settings = ref<SettingsConfig>({
   proxy_flush_interval: 0,
   proxy_stream_close_delay: 0,
   server_tokens_hidden: false,
-  cert_job_log_size_mb: 10,
+  task_log_size_mb: 10,
   audit_log_size_mb: 10,
   runtime_log_size_mb: 100,
   access_log_json: true,
   access_log_format: DEFAULT_ACCESS_LOG_FORMAT,
   trusted_proxy_enabled: false,
   trusted_proxy_ranges: '[]',
+  trusted_proxy_range_refs: '[]',
   trusted_proxy_headers: '[]',
   trusted_proxy_strict: true,
   audit_retention_months: 3,
@@ -139,7 +140,7 @@ type ConfigPayload = SettingsConfig & CertificateConfig
 
 const applyBasicKeys = (data: ConfigPayload) => {
   settings.value.log_level = data.log_level || 'info'
-  settings.value.cert_job_log_size_mb = data.cert_job_log_size_mb ?? 10
+  settings.value.task_log_size_mb = data.task_log_size_mb ?? 10
   settings.value.audit_log_size_mb = data.audit_log_size_mb ?? 10
   settings.value.runtime_log_size_mb = data.runtime_log_size_mb ?? 100
   settings.value.audit_retention_months = data.audit_retention_months ?? 3
@@ -171,6 +172,7 @@ const applyCaddyKeys = (data: ConfigPayload) => {
   // v2.3.x 受信代理（CDN 真实 IP）
   settings.value.trusted_proxy_enabled = data.trusted_proxy_enabled ?? false
   settings.value.trusted_proxy_ranges = data.trusted_proxy_ranges ?? '[]'
+  settings.value.trusted_proxy_range_refs = data.trusted_proxy_range_refs ?? '[]'
   settings.value.trusted_proxy_headers = data.trusted_proxy_headers ?? '[]'
   settings.value.trusted_proxy_strict = data.trusted_proxy_strict ?? true
 }

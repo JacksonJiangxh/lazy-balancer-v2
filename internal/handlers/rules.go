@@ -499,11 +499,10 @@ func canonicalACMEDomainForJobLookup(domain string) string {
 // reversedACMEDomainForm 返回双域名集合的逆序形式；cert_jobs.domain 按排序规范
 // 形式存储，而导入备份可携带用户输入顺序的非规范行——与 certjobs.go 规则侧
 // joined+reversed 双形式匹配同型。
+// LBH-6（第 73 轮 P5）：单源收敛至 services.ReversedCertJobDomain（与
+// certjobs.reversedCertJobDomain 同实现，两侧委托）。
 func reversedACMEDomainForm(domain string) string {
-	if parts := strings.Split(domain, ","); len(parts) == 2 {
-		return parts[1] + "," + parts[0]
-	}
-	return domain
+	return services.ReversedCertJobDomain(domain)
 }
 
 // retireCertJobsForDomain 将规则下旧域证书任务退役为 disabled 终态（保留 PEM 作
@@ -1334,6 +1333,18 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.TCPTryInterval == nil {
 		req.TCPTryInterval = &existingRule.TCPTryInterval
 	}
+	// LBH-1（第 73 轮 P4）：重试窗口上界自愈（http/tcp 共用字段，上界同值）——
+	// 存量/导入/直改 DB 行携带 >60000 的越界值随任意编辑归零（0=默认窗口），
+	// 避免命中新增上界门 400 死端（与 LBH-A-N1 负值自愈同格；http 侧 td=-1 是
+	// NTLM 接管态合法哨兵，不在本门，TCP 侧负值由下方 TCP 块按 LBH-A-N1 归零）。
+	if req.TCPTryDuration != nil && *req.TCPTryDuration > 60000 {
+		upperZero := 0
+		req.TCPTryDuration = &upperZero
+	}
+	if req.TCPTryInterval != nil && *req.TCPTryInterval > 60000 {
+		upperZero := 0
+		req.TCPTryInterval = &upperZero
+	}
 	if req.RequestBodyMaxSizeMB == nil {
 		req.RequestBodyMaxSizeMB = &existingRule.RequestBodyMaxSizeMB
 	}
@@ -1502,6 +1513,18 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		req.BlockPageStage1Status = &tcpZero
 		req.BlockPageStage3ID = &tcpZero
 		req.BlockPageStage3Status = &tcpZero
+		// LBH-A-N1（第 72 轮）：重试窗口是 http/tcp 共用字段（方案 C），http 侧
+		// -1=NTLM 接管态合法；指针合并（nil=沿用存量）会把存量 -1 带进 TCP
+		// 值域门（rule_features.go TCP 分支拒负值）——切换与同协议编辑双路径
+		// 均命中 400 死端，错误指向用户从未提交的字段。负值一律自愈归零
+		// （0=默认 5s 窗口）；非负值尊重 LB-02 指针合并契约（nil=沿用存量/
+		// 显式值=尊重输入，rules_lb_fixes_test 钉测）——不可无条件归零。
+		if req.TCPTryDuration != nil && *req.TCPTryDuration < 0 {
+			req.TCPTryDuration = &tcpZero
+		}
+		if req.TCPTryInterval != nil && *req.TCPTryInterval < 0 {
+			req.TCPTryInterval = &tcpZero
+		}
 	}
 
 	if req.Protocol == "http" && strings.TrimSpace(req.Domain) == "" {
@@ -1932,22 +1955,29 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 	}()
 
-	// L4-66-01：acme→manual 切换第一步——事务内先把非终态 cert_jobs 翻转为终态
-	// （'disabled'，照 DisableRule 用的终态值），使主 UPDATE 的 NOT EXISTS 守卫
-	// 放行、30s 补扫（requeueStrandedQueuedJobs/requeueWaitingCAJobs）不再复活
-	// 该行。事务回滚（应用失败）时翻转一并撤销，队列仍持有任务，语义一致。
+	// 孤儿自愈（第 72 轮用户裁定，取代 L4-66-01 的转换事件判定）：规则保存后
+	// 终态不使用 ACME 自动签发（证书源手动 / 禁用 TLS）即删除其全部 cert_jobs
+	//（含 failed/issued 历史残留）——v2.3.5 时代 acme→manual 翻转语义遗留的
+	// 失败行，用户重存规则（manual→manual，无转换事件）也一并收敛，幂等。
+	// 30s 补扫不再有非终态行可复活；事务回滚（应用失败）时删除一并撤销。
+	// req.TLSSource/req.EnableTLS 在合并区已按 existingRule 兜底（缺省提交
+	// =维持原状），直接判终态即可。删除在 tx 内（应用失败随事务回滚），提交
+	// 后仍取消队列在途签发（下方 cancelRuleJobs——行已删仍需防 worker 僵尸执行）。
+	orphanACME := !derefBool(req.EnableTLS) || req.TLSSource != "acme_dns"
 	var switchedCertJobs int64
-	if switchingFromACME {
-		flipResult, flipErr := tx.Exec("UPDATE cert_jobs SET status='disabled', message='规则证书源已切换为手动，任务已取消', updated_at=datetime('now') WHERE rule_id=? AND status NOT IN ('failed','disabled')", caddyID)
-		if flipErr != nil {
-			services.Logf("error", "UpdateRule cert job flip error for caddy_id=%s: %v", caddyID, flipErr)
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新证书任务状态失败: " + flipErr.Error()})
+	delReason := ""
+	if orphanACME {
+		delReason = "规则已不使用 ACME 自动签发，证书任务已删除"
+		delResult, delErr := tx.Exec("DELETE FROM cert_jobs WHERE rule_id=?", caddyID)
+		if delErr != nil {
+			services.Logf("error", "UpdateRule cert job delete error for caddy_id=%s: %v", caddyID, delErr)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "删除证书任务失败: " + delErr.Error()})
 			return
 		}
-		switchedCertJobs, flipErr = flipResult.RowsAffected()
-		if flipErr != nil {
-			services.Logf("error", "UpdateRule cert job flip RowsAffected error for caddy_id=%s: %v", caddyID, flipErr)
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "确认证书任务状态失败: " + flipErr.Error()})
+		switchedCertJobs, delErr = delResult.RowsAffected()
+		if delErr != nil {
+			services.Logf("error", "UpdateRule cert job delete RowsAffected error for caddy_id=%s: %v", caddyID, delErr)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "确认证书任务删除结果失败: " + delErr.Error()})
 			return
 		}
 	}
@@ -1978,13 +2008,11 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "证书申请中，请等待完成或失败后再修改规则"})
 		return
 	}
-	if protocolChanged && req.Protocol == "tcp" {
-		if _, err := tx.Exec("DELETE FROM cert_jobs WHERE rule_id = ?", caddyID); err != nil {
-			services.Logf("error", "UpdateRule certificate cleanup error for caddy_id=%s: %v", caddyID, err)
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧证书任务失败"})
-			return
-		}
-	}
+	// LBH-5（第 73 轮 P5）：此处曾有 protocolChanged&&tcp 的二次
+	// `DELETE FROM cert_jobs WHERE rule_id=?`——恒 0 行 no-op：协议切到 tcp 时
+	// req.EnableTLS 已置 false，上方 orphanACME（!EnableTLS||TLSSource!="acme_dns"）
+	// 的删除已先行命中同一 rule_id（cert_jobs 按 rule_id 唯一），且 409 早退
+	// 保证无在途非终态行。文件清理段（下方 RemoveCertFiles）保留。
 
 	// F49-11：归一（weight/protocol/tls 校验）前置后走增量收敛——同内容编辑
 	// 不再 DELETE+INSERT 重建全部上游行（id 保留、不触发上游表行级同步触发器）。
@@ -2035,18 +2063,19 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 	committed = true
 
-	// L4-66-01：acme→manual 切换第二步——提交成功后留痕并取消队列在途签发
-	// （DisableRule 同序：先翻终态后取消）。有界等待；失败仅告警继续——规则
-	// 切换本身已提交，任务行已终态，队列残留由取消的 best-effort 收敛。
-	if switchingFromACME {
+	// L4-66-01/R10：规则脱离 ACME（改手动/禁用 TLS）第二步——提交成功后留痕
+	// 并取消队列在途签发（DisableRule 同序：先收敛任务行后取消）。有界等待；
+	// 失败仅告警继续——规则切换本身已提交，任务行已删除，队列残留由取消的
+	// best-effort 收敛。
+	if orphanACME {
 		if switchedCertJobs > 0 {
-			services.WriteCertJobLogByRule(caddyID, "WARN", "cancelled", "规则证书源已切换为手动，证书任务已取消")
-			recordAudit(c, "更新", "证书任务", fmt.Sprintf("规则 %s 证书源已切换为手动，%d 个证书任务状态设为已取消", caddyID, switchedCertJobs))
+			services.WriteCertJobLogByRule(caddyID, "WARN", "cancelled", delReason)
+			recordAudit(c, "更新", "证书任务", fmt.Sprintf("规则 %s %s（%d 个）", caddyID, delReason, switchedCertJobs))
 		}
 		if qm := services.GetCAQueueManager(); qm != nil {
 			cancelCtx, cancel := context.WithTimeout(c.Request.Context(), cancelRuleJobsTimeout)
 			if err := cancelRuleJobs(cancelCtx, qm, caddyID); err != nil {
-				services.Logf("warn", "UpdateRule acme→manual: cancel cert jobs for %s failed: %v (continuing)", caddyID, err)
+				services.Logf("warn", "UpdateRule cert job cancel for %s failed: %v (continuing)", caddyID, err)
 			}
 			cancel()
 		}
@@ -2506,6 +2535,17 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	}
 	rule := rules[0]
 
+	// LBH-1（第 73 轮 P4）：重试窗口上界自愈——源行携带 >60000 越界值
+	//（API/MCP/导入/直改 DB 落库的历史值）时，副本不得原样放大并命中新增
+	// 上界门 400 死端（与 LBH-A-N1 负值自愈同格；http/tcp 上界同值）。负值
+	// 由下方 TCP 块按协议处理（http td=-1 是 NTLM 接管态合法哨兵）。
+	if rule.TCPTryDuration > 60000 {
+		rule.TCPTryDuration = 0
+	}
+	if rule.TCPTryInterval > 60000 {
+		rule.TCPTryInterval = 0
+	}
+
 	// 审计 A2-S2：tcp-TLS 死形态归一与 CreateRule/UpdateRule 同口径——源行
 	// 遗留 enable_tls=1/tls_source=acme_dns 时，副本会原样携带死形态（tcp 不
 	// 终结入站 TLS、ACME 任务永不消费证书）。
@@ -2534,6 +2574,16 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		rule.ServerTokensHidden = 0
 		rule.NTLMCompatible = 0
 		rule.UpstreamForceHTTP1 = 0
+		// LBH-A-N1 同族（R-12 收敛）：负值重试窗口不喂进复制校验（td/ti 原样
+		// 传入会让直改 DB 残留的 tcp 源行复制即 400 死端），也不放大到副本——
+		// 与 UpdateRule 最终协议 tcp 块负值自愈同格；非负窗口是合法 tcp 配置，
+		// 原样复制（http 源行 td=-1 是 NTLM 接管态，协议原样复制、不受此门）。
+		if rule.TCPTryDuration < 0 {
+			rule.TCPTryDuration = 0
+		}
+		if rule.TCPTryInterval < 0 {
+			rule.TCPTryInterval = 0
+		}
 	}
 
 	userIDInt := contextUserID(c)

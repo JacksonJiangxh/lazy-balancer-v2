@@ -38,13 +38,16 @@ func installClusterVersionTriggers(database *sql.DB) error {
 		// R72 F-4：users 触发器 OF 列表补 v2.1.8 的 MFA 权威列——此前不在列表内，
 		// MFA 状态写（含管理员重置）不 bump cluster_version → 快照缓存持续命中
 		// 旧指纹 → 从节点 304 循环，主节点 MFA 变更稳态永不传播（泄露 secret 经
-		// 重置后在从节点仍可用）。记账三列（last_timestep/failed_attempts/
-		// locked_until）不补——它们经 R72 F-3 的哈希清零已不参与漂移判定，补了
-		// 反而让从节点本地登录 bump 版本引发无谓重放。pending 不跨节点不补。
-		// SC-4 修订：login_locked_until 入 OF 列表——主端置锁/解锁 UPDATE 即 bump
-		// cluster_version，快照缓存重建、locked_users 当周期下发（否则锁只在下次
-		// 无关变更时才传播）。仅失败计数（login_failed_attempts）不入列：普通失败
-		// 不产生版本抖动；从端本地写由 WHEN is_master=1 守卫排除。
+		// 重置后在从节点仍可用）。记账两列（last_timestep/failed_attempts）不补
+		// ——它们经 R72 F-3 的哈希清零已不参与漂移判定，入列只会让登录热路径的
+		// 计数推进引发无谓重放。pending 不跨节点不补。
+		// SC-4 修订：locked_until（login_locked_until）从 F-4 初版「不补」枚举划出
+		// 入 OF 列表——主端置锁/解锁 UPDATE 即 bump cluster_version，快照缓存重建、
+		// locked_users 当周期下发（否则锁只在下次无关变更时才传播）；F-4「补了
+		// 引发无谓重放」的前提已被 SLB12-P1-1 值变化守卫消除（登录热路径对
+		// login_locked_until 的保值写不 bump，见下方守卫段）。仅失败计数
+		// （login_failed_attempts）不入列：普通失败不产生版本抖动；从端本地写由
+		// WHEN is_master=1 守卫排除。
 		// CL43-4(第 43 轮):auth_provider/oidc_subject/oidc_issuer 三列刻意不入
 		// OF——当前唯一写路径是 OIDC JIT 开户 INSERT(auth_oidc.go),无 UPDATE
 		// 写路径;若未来新增该三列 UPDATE 写路径(换绑/issuer 迁移),必须同步
@@ -176,11 +179,13 @@ func installClusterVersionTriggers(database *sql.DB) error {
 	// 刻意排除——调度器每次备份推进,入列会让每轮备份引发全集群快照重放。
 	// F49-P5-8:trusted_proxy_* 四列入 OF(防御对齐)——主端保存受信代理设置
 	// 须即 bump 版本随快照下发,不在 OF 内则稳态变更永不传播到从节点。
+	// 2026-10-12:trusted_proxy_range_refs(引用名单 id)同入——引用的名单
+	// 本体在 security 节同步,refs 列变化须触发快照重放(从端渲染展开收敛)。
 	// L5-67-01(第 67 轮审计):threat_auto_update/threat_schedule_days/
 	// threat_schedule_time 三列入 OF(同 CL41-1 先例)——主端保存威胁库排程/
 	// 总开关即下发,从端升主后按主端排程运行。
 	if _, err := database.Exec(`CREATE TRIGGER cluster_version_global_config_update
-		AFTER UPDATE OF sync_users,sync_rules,sync_security,branding_json,caddy_config,log_level,access_log_json,access_log_format,task_log_size_mb,audit_log_size_mb,runtime_log_size_mb,audit_retention_months,jwt_expire_minutes,timezone,acme_email,cert_expiry_days,cert_renewal_days,cert_renewal_attempts,default_ca_provider_id,dns_provider,dns_credentials,sync_interval,admin_tls_enabled,admin_tls_mode,admin_tls_cert,admin_tls_key,caddy_log_level,caddy_log_size_mb,request_body_max_size_mb,http_read_timeout,http_write_timeout,http_idle_timeout,upstream_keepalive_timeout,proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,server_tokens_hidden,oidc_config,mfa_write_guard,mfa_lockout_enabled,github_proxy_url,auto_backup_enabled,auto_backup_frequency,auto_backup_time,auto_backup_day,auto_backup_keep,auto_backup_sections,trusted_proxy_enabled,trusted_proxy_ranges,trusted_proxy_headers,trusted_proxy_strict,threat_auto_update,threat_schedule_days,threat_schedule_time
+		AFTER UPDATE OF sync_users,sync_rules,sync_security,branding_json,caddy_config,log_level,access_log_json,access_log_format,task_log_size_mb,audit_log_size_mb,runtime_log_size_mb,audit_retention_months,jwt_expire_minutes,timezone,acme_email,cert_expiry_days,cert_renewal_days,cert_renewal_attempts,default_ca_provider_id,dns_provider,dns_credentials,sync_interval,admin_tls_enabled,admin_tls_mode,admin_tls_cert,admin_tls_key,caddy_log_level,caddy_log_size_mb,request_body_max_size_mb,http_read_timeout,http_write_timeout,http_idle_timeout,upstream_keepalive_timeout,proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,server_tokens_hidden,oidc_config,mfa_write_guard,mfa_lockout_enabled,github_proxy_url,auto_backup_enabled,auto_backup_frequency,auto_backup_time,auto_backup_day,auto_backup_keep,auto_backup_sections,trusted_proxy_enabled,trusted_proxy_ranges,trusted_proxy_range_refs,trusted_proxy_headers,trusted_proxy_strict,threat_auto_update,threat_schedule_days,threat_schedule_time
 		ON global_config
 		WHEN OLD.cluster_version IS NEW.cluster_version AND COALESCE(NEW.is_master,1)=1
 		BEGIN

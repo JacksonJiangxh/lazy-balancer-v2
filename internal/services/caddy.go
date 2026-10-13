@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"reflect"
@@ -863,7 +864,7 @@ func (s *CaddyService) getUpstreamHealthFromMetrics() map[string]bool {
 	lines := strings.Split(string(body), "\n")
 	for _, line := range lines {
 		if strings.HasPrefix(line, "caddy_reverse_proxy_upstreams_healthy{") || strings.HasPrefix(line, "caddy_layer4_proxy_upstream_healthy{") {
-			upstream := extractMetricLabel(line, "upstream")
+			upstream := ExtractMetricLabel(line, "upstream")
 			spaceIdx := strings.LastIndex(line, " ")
 			var isHealthy float64
 			if spaceIdx > 0 {
@@ -881,10 +882,11 @@ func (s *CaddyService) getUpstreamHealthFromMetrics() map[string]bool {
 	return result
 }
 
-// extractMetricLabel（LBS-A-2，第 70 轮 P4）：label 键必须以标签边界出现
-// （LB40-6 精确键匹配——与 handlers extractLabel 同型收敛）。裸子串匹配会把
-// peer_upstream 等前缀兄弟标签的值误归到目标 label。
-func extractMetricLabel(metricName string, label string) string {
+// ExtractMetricLabel（LBS-A-2，第 70 轮 P4；LBS/LBH-7 第 73 轮收敛为单源）：
+// label 键必须以标签边界出现（LB40-6 精确键匹配）。裸子串匹配会把
+// peer_upstream 等前缀兄弟标签的值误归到目标 label。handlers 侧同名叶函数
+// extractLabel 已删除并改调本函数（跨包唯一实现）。
+func ExtractMetricLabel(metricName string, label string) string {
 	start := -1
 	for _, boundary := range []string{"," + label + `="`, "{" + label + `="`} {
 		if idx := strings.Index(metricName, boundary); idx >= 0 {
@@ -1144,14 +1146,15 @@ func GenerateCaddyConfig(overrides ...*models.UpdateConfigRequest) map[string]in
 // trustedProxyServerFields 渲染受信代理（CDN 真实 IP）的 server 级字段
 // （v2.3.x）：enabled=false 或读错时返回空 map（读错 fail-closed=不注入，
 // 与「未启用」同形——宁可退回 socket IP 也不采信未校验的头）。启用时：
-// trusted_proxies 静态网段 + trusted_proxies_strict（1/0 恒输出）+
-// client_ip_headers（非空才输出，空=仅 X-Forwarded-For）。
-// store 形参保证事务内渲染（ApplyConfigFromTx）读到未提交的设置。
+// trusted_proxies 静态网段（内联 ∪ 引用名单展开，2026-10-12）+
+// trusted_proxies_strict（1/0 恒输出）+ client_ip_headers（非空才输出，
+// 空=仅 X-Forwarded-For）。store 形参保证事务内渲染（ApplyConfigFromTx）
+// 读到未提交的设置与名单。
 func trustedProxyServerFields(store caddyConfigStore) map[string]interface{} {
 	var enabled, strict bool
-	var rangesJSON, headersJSON string
-	if err := store.QueryRow(`SELECT COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_ranges,'[]'), COALESCE(trusted_proxy_headers,'[]'), COALESCE(trusted_proxy_strict,1) FROM global_config WHERE id = 1`).
-		Scan(&enabled, &rangesJSON, &headersJSON, &strict); err != nil {
+	var rangesJSON, refsJSON, headersJSON string
+	if err := store.QueryRow(`SELECT COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_ranges,'[]'), COALESCE(trusted_proxy_range_refs,'[]'), COALESCE(trusted_proxy_headers,'[]'), COALESCE(trusted_proxy_strict,1) FROM global_config WHERE id = 1`).
+		Scan(&enabled, &rangesJSON, &refsJSON, &headersJSON, &strict); err != nil {
 		Logf("error", "读取受信代理设置失败（按未启用渲染）: %v", err)
 		return nil
 	}
@@ -1167,10 +1170,15 @@ func trustedProxyServerFields(store caddyConfigStore) map[string]interface{} {
 		Logf("error", "解析受信代理请求头失败（按未启用渲染）: %v", err)
 		return nil
 	}
+	merged, err := expandTrustedProxyRanges(store, ranges, refsJSON)
+	if err != nil {
+		Logf("error", "展开受信代理引用名单失败（按未启用渲染）: %v", err)
+		return nil
+	}
 	fields := map[string]interface{}{
 		"trusted_proxies": map[string]interface{}{
 			"source": "static",
-			"ranges": ranges,
+			"ranges": merged,
 		},
 	}
 	if strict {
@@ -1184,8 +1192,69 @@ func trustedProxyServerFields(store caddyConfigStore) map[string]interface{} {
 	return fields
 }
 
+// expandTrustedProxyRanges 合并内联网段与引用名单条目（2026-10-12）：
+// refs 按 id 经 loadIPListEntriesVia 装载（system=1 读 .iplist 文件、
+// 自定义读 DB entries——与策略 refs 同一装载通道）；内联在前、引用按
+// refs 出现顺序追加；跨来源按规范前缀去重（裸 IP 补 /32 //128）；逐条
+// 经 CIDR 校验，非法条目跳过并留痕（名单写侧已过 validIPOrCIDR，此处
+// 仅防御带外改库/导入残留）。悬空引用（名单不存在）贡献零条目——保存侧
+// 存在性门与删除守卫保证常规路径不产生；装载失败整体 fail-closed 上抛
+// （调用方按未启用渲染，宁可退回 socket IP）。
+func expandTrustedProxyRanges(store caddyConfigStore, inline []string, refsJSON string) ([]string, error) {
+	refIDs := parseIPListRefs(refsJSON)
+	if strings.TrimSpace(refsJSON) != "" && refIDs == nil {
+		// 非空但解析不出 id：畸形 JSON 或全非整数条目（带外改库形态）。
+		return nil, fmt.Errorf("trusted_proxy_range_refs 畸形: %q", refsJSON)
+	}
+	merged := make([]string, 0, len(inline))
+	seen := make(map[string]struct{}, len(inline))
+	appendCIDR := func(value string) {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
+		if err != nil {
+			addr, addrErr := netip.ParseAddr(strings.TrimSpace(value))
+			if addrErr != nil {
+				Logf("warn", "受信代理引用条目 %q 不是有效 IP/CIDR（跳过）", value)
+				return
+			}
+			bits := 32
+			if addr.Is6() {
+				bits = 128
+			}
+			prefix = netip.PrefixFrom(addr, bits)
+		}
+		if _, dup := seen[prefix.String()]; dup {
+			return
+		}
+		seen[prefix.String()] = struct{}{}
+		merged = append(merged, prefix.String())
+	}
+	for _, entry := range inline {
+		appendCIDR(entry)
+	}
+	if len(refIDs) == 0 {
+		return merged, nil
+	}
+	entriesByID, _, err := loadIPListEntriesVia(store, refIDs)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range refIDs {
+		entries, ok := entriesByID[id]
+		if !ok {
+			Logf("warn", "受信代理引用的地址列表 #%d 不存在（贡献零条目）", id)
+			continue
+		}
+		for _, entry := range entries {
+			appendCIDR(entry)
+		}
+	}
+	return merged, nil
+}
+
 // mergeTrustedProxyServerFields 把受信代理字段并入每个 HTTP server 条目
 // （含 :80 默认站）；layer4/admin 不在此函数视野内，天然不注入。
+// 产出为共享实例（fields 同一份 map 经 maps.Copy 逐键并入各 server，
+// 值内嵌套结构仍被多 server 共享引用）——消费方禁变异，如需改动须先深拷贝。
 func mergeTrustedProxyServerFields(servers map[string]interface{}, store caddyConfigStore) {
 	fields := trustedProxyServerFields(store)
 	if len(fields) == 0 {
@@ -3746,11 +3815,12 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		} else if rule.Strategy == "weighted_round_robin" {
 			selectionPolicy["weights"] = normalizeWeights(upstreamWeights)
 		}
-		// 重试窗口（方案 C，2026-10-12 裁定——HTTP 与 TCP 值语义通用，零存量行为变化）：
-		// td>0 → 按值发射窗口+间隔（间隔缺省 250ms）；td==0 → 保持现状兜底 5s/250ms
-		// （存量 HTTP 行恒 0，行为不变）；td==-1 → 显式禁用重试——发射 retries=0
-		// 且不发射 try_duration/try_interval（NTLM 接管态由 UI 修改器落 -1，渲染
-		// 对 ntlm_compatible 零感知）。
+		// 重试窗口（方案 C，2026-10-12 裁定——HTTP 与 TCP 值域通用（[-1,60000]），
+		// 但 td==0/-1 渲染语义按协议分叉）：td>0 → 按值发射窗口+间隔（间隔缺省
+		// 250ms）；HTTP 侧 td==0 → 保持现状兜底 5s/250ms（存量 HTTP 行恒 0，行为
+		// 不变）；HTTP 侧 td==-1 → 显式禁用重试——发射 retries=0 且不发射
+		// try_duration/try_interval；TCP 侧 td==0/-1 均零窗口不发射（l4 proxy 无
+		// retries 字段）。NTLM 接管态由 UI 修改器落 -1，渲染对 ntlm_compatible 零感知。
 		loadBalancing := map[string]interface{}{
 			"selection_policy": selectionPolicy,
 		}
