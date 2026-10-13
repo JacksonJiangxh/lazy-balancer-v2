@@ -384,8 +384,8 @@
       #   为什么 fail-open（而非 fail-closed）：本守卫是**收敛积压**的护栏、非质量门；不可判定时若拦，
       #   等于让「查询抖动」静默停掉整条评论链（比不拦更危险的误杀）。故按 #35 诏令要求：
       #   **禁以不可判定为由静默停摆**，一律放行 + 大声告警。
-      #   取数纪律（AC-8）：**一次只读调用** `cnb pulls get-pull -v`（复用 F-308a 同款缺省即空值的字段抽取，
-      #   不引 python3 —— 见既有告警「无 python3 环境解析静默退空」），无写调用、无跨仓/跨根依赖。
+      #   取数纪律（AC-8）：**一次只读调用** `cnb pulls get-pull -v`（**结构化取值** · `python3 json` 只读权威键
+      #   `data.state`；`.npc` 锚点镜像实测含 `python3 3.11.2`），无写调用、无跨仓/跨根依赖。
       #   放行面（防死锁 · 同熔断守卫）：只覆盖**评论事件侧**；`$: api_trigger`（含裁决与换方案落地）不经
       #   本锚点 ⇒ 不被跳过，权威通道不受影响。哨兵载体独立于 `qg-熔断.txt`，两守卫互不读写、次序无关。
       - name: PR 终态守卫
@@ -403,32 +403,27 @@
           else
             REPO="${CNB_REPO_SLUG:-}"
             PR_META="$(cnb pulls get-pull --repo "$REPO" --number "$PR_IID" -v 2>/dev/null | tr -d '\r')"
-            # 取 state：**仅当「权威键锚点」后恰 1 处命中才采信；否则置空 ⇒ 落下方 fail-open 分支**。
-            #   ★ 为什么不以「行区间截断 + 命中计数」为准（本 stage 曾两版踩坑）：
-            #     ① 封套形态漂移不可控：`-v` 可能把整篇 JSON 压成**单行**（本仓已载「封套形态漂移」族旧坑），
-            #        此时 `sed -n '1,/^[[:space:]]*"body"/p'` 因**找不到以 `"body"` 起头的行**而**整篇返回**，
-            #        区间截断形同虚设——命中数随 `body` 文本内容漂移，判定力不可控。
-            #     ② 计数式「多命中 ⇒ 置空」会被**正文里的字面 `"state": "..."`** 抬高计数（如回奏正文引用
-            #        本 stage 自身实现），使守卫退化为**恒放行**；反之若正文恰好只 1 处、而非权威字段，
-            #        又会**误采信正文值**。
-            #   ★ 现行判据（结构性锚定 · 与封套行/键序解耦）：以**本 PR 自身的权威键** `"number": "<IID>"`
-            #     作为锚点（`data.number` 与请求 IID 必然相等），只在其**之后**取首个 `"state"` 值：
-            #       · 该 `"state"` 必为权威 `data.state`（`number` 与 `state` 同属 data 对象、且 `data.number`
-            #         在真封套中先于 `data.state`；截取范围止于 `"body"`，杜绝正文串污染）；
-            #       · 锚点缺失 / `"state"` 缺失 / 取值落闭集外 ⇒ 一律置空 ⇒ fail-open + 告警（方向恒安全）。
-            #   ★ POSIX 合规（runner `sh -e -c`，`/bin/sh -> dash`）：只 `printf`/`sed`，**无** bashism。
-            _PR_ANCHOR='"number"[[:space:]]*:[[:space:]]*"'"$PR_IID"'"'
-            _PR_ST="$(printf '%s' "$PR_META" | LC_ALL=C tr '\n' ' ' \
-              | LC_ALL=C sed -n 's/.*'"$_PR_ANCHOR"'\(.*\)/\1/p' \
-              | LC_ALL=C sed -n 's/^\(.*"state"[[:space:]]*:[[:space:]]*"\)\([a-z_]*\)\(\".*\)$/\2/p' \
-              | LC_ALL=C head -1)"
-            # 归一：仅接受「单次、完整」取值；多值（多行）与空值同样置空 ⇒ 交下方 fail-open 分支。
-            case "$_PR_ST" in
-              ?*)
-                if printf '%s' "$_PR_ST" | LC_ALL=C grep -qE '^[a-z_]+$'; then PR_ST="$_PR_ST"; else PR_ST=""; fi
-                ;;
-              *) PR_ST="" ;;
-            esac
+            # 取 state：**结构化取值（JSON 解析）**——只读权威键 `data.state`，与封套键序 / 嵌套字段 / 正文串解耦；
+            #   取不到则置空 ⇒ 落下方 fail-open 分支。
+            #   ★ 为什么弃 sed（R4 判据失守根因 · 台账 #35 裁决）：字符串抽取对**封套形态**结构性敏感——
+            #     R4（`e466789d`）在真实样本 `i.o/x#751`（state=closed ∧ is_merged ∧ statuses 非空）上抽出
+            #     `success` 落闭集外 ⇒ fail-open ⇒ **漏拦已合并 PR**（与 AC-1 相反）。故本轮换方案：结构化取值。
+            #   ★ 现行判据：`python3 -c` 解析 JSON ⇒ 取 `data.state`（无 `data` 封套则退化为顶层 `state`）；
+            #     仅接受闭集 {open,closed,merged}，否则 stdout 空 ⇒ 置空。
+            #   ★ 兼容面（据实 · **非**「与旧实现语义相同」）：解析失败（非 JSON / 非对象）经 `2>/dev/null`
+            #     静默退空，与 fail-open 同向；`_PR_ANCHOR` 锚定 / 行区间截断 / 命中计数等旧法**一并弃用**
+            #     （不保留回退位）。
+            #   ★ 环境（实测 · 台账 #35）：`.npc` 锚点 `image: cnbcool/default-npc:latest` 含 `python3 3.11.2`。
+            PR_ST="$(printf '%s' "$PR_META" | python3 -c '
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              sys.exit(0)
+          d = d.get("data", d) if isinstance(d, dict) else {}
+          st = d.get("state", "") if isinstance(d, dict) else ""
+          print(st if st in ("open", "closed", "merged") else "")
+          ' 2>/dev/null | head -1)"
             case "$PR_ST" in
               open|closed|merged)
                 if [ "$PR_ST" = "open" ]; then
