@@ -380,7 +380,8 @@
       #   判据（二进制 · fail-open 方向）：
       #     · `CNB_PULL_REQUEST_IID` 非空 ∧ `state ∈ {closed, merged}` ⇒ 写哨兵、跳过 npc go；
       #     · `state=open` ⇒ 照常执行；
-      #     · 无 IID（非 PR 事件）/ `cnb` 不可用 / **取数失败** / state 空或落闭集外 ⇒ **照常执行 ＋ 显式告警**。
+      #     · 无 IID（非 PR 事件）/ `cnb` 不可用 / **解析器缺失（python3 不可用）** / **取数失败** / state 空或落闭集外
+      #       ⇒ **照常执行 ＋ 显式告警**（其中「解析器缺失」与「取数失败 / 落闭集外」在告警行内**逐字可区分** · FU-5）。
       #   为什么 fail-open（而非 fail-closed）：本守卫是**收敛积压**的护栏、非质量门；不可判定时若拦，
       #   等于让「查询抖动」静默停掉整条评论链（比不拦更危险的误杀）。故按 #35 诏令要求：
       #   **禁以不可判定为由静默停摆**，一律放行 + 大声告警。
@@ -414,6 +415,13 @@
             #     静默退空，与 fail-open 同向；`_PR_ANCHOR` 锚定 / 行区间截断 / 命中计数等旧法**一并弃用**
             #     （不保留回退位）。
             #   ★ 环境（实测 · 台账 #35）：`.npc` 锚点 `image: cnbcool/default-npc:latest` 含 `python3 3.11.2`。
+            #   ★ FU-5（#TASK-CNBGUARD-FU-20261014-01）：先判**解析器可用性**——`python3` 缺失时给出
+            #     **显式诊断**（`PR_ST_DIAG`），使「解析器缺失」与「取数失败 / 落闭集外」在日志与理由里**可区分**
+            #     （旧实现：python3 缺失经 `2>/dev/null` 静默退空 ⇒ 与「落闭集外」同形、不可辨，护栏静默降级）。
+            PR_ST=""; PR_ST_DIAG=""
+            if ! command -v python3 >/dev/null 2>&1; then
+              PR_ST_DIAG="解析器缺失（python3 不可用）"
+            else
             PR_ST="$(printf '%s' "$PR_META" | python3 -c '
           import sys, json
           try:
@@ -424,6 +432,7 @@
           st = d.get("state", "") if isinstance(d, dict) else ""
           print(st if st in ("open", "closed", "merged") else "")
           ' 2>/dev/null | head -1)"
+            fi
             case "$PR_ST" in
               open|closed|merged)
                 if [ "$PR_ST" = "open" ]; then
@@ -435,7 +444,11 @@
                 fi
                 ;;
               *)
-                PRT_WHY="PR #$PR_IID state 取数失败 / 空 / 落闭集外（实测值='${PR_ST}'）⇒ 不可判定，照常执行（fail-open）"
+                if [ -n "$PR_ST_DIAG" ]; then
+                  PRT_WHY="PR #$PR_IID 状态不可判定 —— $PR_ST_DIAG ⇒ 照常执行（fail-open）"
+                else
+                  PRT_WHY="PR #$PR_IID state 取数失败 / 空 / 落闭集外（实测值='${PR_ST}'）⇒ 不可判定，照常执行（fail-open）"
+                fi
                 echo "⚠️ PR 终态守卫：$PRT_WHY"
                 ;;
             esac
@@ -524,10 +537,11 @@
         # ★ 口径更正（门下 P1-1 · #TASK-MERGEDPR-GUARD-20261013-01 · 据实）：本行原称「与 `failStages`→
         #   「工部尚书自愈」stage 的 `if` **逐字同形**（矩阵 C-LATCH-③ 断言同源）」——**该句在本单后已不成立**：
         #   自愈 stage 的 `if` 仍是**两哨兵**（`qg-熔断.txt` + `qg-裁决冻结.txt`），评论链现为**四哨兵**。
-        #   自愈侧**不**并 `qg-pr终态.txt` 是**有意为之**，非漏改：
-        #     ① 语义：`qg-pr终态.txt` 只表达「评论事件的对象（PR）已终态」——这是**评论事件侧**的事实；
+        #   自愈侧**不**并两道终态哨兵（`qg-pr终态.txt` / `qg-issue终态.txt`）是**有意为之**，非漏改
+        #   （FU-6 · #TASK-CNBGUARD-FU-20261014-01：原句只覆盖 `qg-pr终态.txt`，已泛化为**终态哨兵族**，防后人误判漏改）：
+        #     ① 语义：终态哨兵族只表达「**评论事件的对象**（PR / Issue）已终态」——这是**评论事件侧**的事实；
         #        `failStages` 自愈环由 **push/pull_request 事件**驱动（把新 commit 推上去触发新 CI），
-        #        与"PR 是否 open"无关——PR 已合并时自愈环本就不会有新 head 可推；并入只会造成语义耦合。
+        #        与"评论对象是否 open"无关——对象已终态时自愈环本就不会有新 head 可推；并入只会造成语义耦合。
         #     ② 范围：自愈 stage 位于 `$: pull_request` 段，**在本单诏令白名单（`.npc` 锚点段）之外**，
         #        本单 b_t=2 已满 ⇒ **不得越范围/越预算**擅自并入（门下 P1-1 修法① 明确裁定）。
         #   ⇒ C-LATCH-③（「两处守卫同源」逐字断言）**本单后不再为真**：其判据本体在上游 canonical
@@ -1777,8 +1791,11 @@ $:
             #   **整条质量门自愈链静默失效**（PR#458 实录：PR 正文用 `台账：链接` 形态、无 marker，
             #   failStages 三 stage 全灭，构建停在 error 上，只能人工喊「CI failed」）。
             #   故：① 补 `set +e`——口径与**本 stage 体的首条可执行语句**规范一致（同库各 script stage 体
-            #          首条即声明 `set +e` 者：`熔断守卫`/`评论撞线守卫`/`运行时产物守卫`/`冲突标记残片门`/`GFM 表行竖线门`/
-            #          `文档体量门`/`质量门-gate`/`转储失败信息`/`自愈熔断判定`（枚举随 stage 增删同步；可 `grep -n 'set +e' .cnb.yml` 回查）；
+            #          首条即声明 `set +e` 者（**列全** · FU-4 · #TASK-CNBGUARD-FU-20261014-01）：`熔断守卫`/
+            #          `PR 终态守卫`/`Issue 终态守卫`/`评论撞线守卫`/`运行时产物守卫`/`冲突标记残片门`/`GFM 表行竖线门`/
+            #          `文档体量门`/`质量门-gate`/`转储失败信息`/`自愈熔断判定`/`翰林档位选择`/`评论链终态守卫（翰林段）`
+            #          （枚举随 stage 增删同步 —— 「PR 终态守卫」/「Issue 终态守卫」/「翰林档位选择」/
+            #           「评论链终态守卫（翰林段）」**曾未列入，本单补齐**；逐项核验可 `grep -n 'set +e' .cnb.yml` 回查）；
             #          ★ 「文档体量门」**曾**同形缺 `set +e`（**锚点式指认＝ stage 名「文档体量门」**；两门 `sh -e` 实跑反证：size-check
             #          返回非零时 rc 在 `rc=$?` 之前致命化、`qg-体量.rc` 不生成，与本 stage 缺陷同类同因）
             #          ——本单（R2）已在**同 PR**一并收口：该 stage 体首补 `set +e`，结论仍由 `qg-体量.rc`
@@ -5350,6 +5367,92 @@ main:
     docker:
       image: cnbcool/default-npc:latest      # 官方默认运行环境，开箱即用
     stages:
+      # ---- 评论链终态守卫（翰林段 · FU-2 · #TASK-CNBGUARD-FU-20261014-01）----
+      #   为什么本段要**自带**（根因 · 台账 #39 FU-2）：本锚点 `.hy_pipelines` 是**单点覆盖**段（自带
+      #   `翰林档位选择`）、**不复用 `.npc` 锚点** ⇒ 不继承 `.npc` 的「熔断守卫 / PR 终态守卫 / Issue 终态守卫」；
+      #   而本段由 `issue.comment@npc` / `pull_request.comment@npc` **双评论事件**命中（同 `.npc` 兜底段）
+      #   ⇒ 已合并/已关闭 PR（或已关闭 Issue）上的评论**仍会拉起**本段 ⇒ 自激积压的**残余源**。
+      #   判据（二进制 · fail-open · 与 `.npc` 两守卫**同向、哨兵同载体**）：
+      #     · PR 事件 ∧ `state ∈ {closed, merged}` ⇒ 写 `/workspace/qg-pr终态.txt`；
+      #     · Issue 事件 ∧ `CNB_ISSUE_STATE = closed` ⇒ 写 `/workspace/qg-issue终态.txt`；
+      #     · `open`（或在位对象非终态）⇒ 不写、照常执行；
+      #     · 无对应 IID（非该类事件）/ `cnb` 不可用 / **解析器缺失（python3 不可用）** / 取数失败 / 落闭集外
+      #       ⇒ **放行 ＋ 显式告警**（禁静默停摆；后三者逐字可区分 · 同 FU-5 口径）。
+      #   本 stage 恒 `exit 0`；三档 `npc go` 的 `if` 各自并列读同载体（OR 语义）。
+      - name: 评论链终态守卫（翰林段）
+        script: |
+          set +e
+          echo "===== 评论链终态守卫（翰林段 · FU-2 · #TASK-CNBGUARD-FU-20261014-01）====="
+          PRT="no"; ISS="no"; HYT_WHY=""
+          REPO="${CNB_REPO_SLUG:-}"
+          # ---- PR 侧（只读一次 `cnb pulls get-pull` + 结构化取值 `data.state`）----
+          PR_IID="${CNB_PULL_REQUEST_IID:-}"
+          if [ -z "$PR_IID" ]; then
+            echo "⚠️ 翰林段守卫·PR：非 PR 事件（CNB_PULL_REQUEST_IID 缺失）⇒ 无需判定，照常执行"
+          elif ! command -v cnb >/dev/null 2>&1; then
+            echo "⚠️ 翰林段守卫·PR：cnb CLI 不可用 ⇒ 状态不可判定，照常执行（fail-open）"
+          elif ! command -v python3 >/dev/null 2>&1; then
+            echo "⚠️ 翰林段守卫·PR：解析器缺失（python3 不可用）⇒ 状态不可判定，照常执行（fail-open）"
+          else
+            PR_META="$(cnb pulls get-pull --repo "$REPO" --number "$PR_IID" -v 2>/dev/null | tr -d '\r')"
+            PR_ST="$(printf '%s' "$PR_META" | python3 -c '
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              sys.exit(0)
+          d = d.get("data", d) if isinstance(d, dict) else {}
+          st = d.get("state", "") if isinstance(d, dict) else ""
+          print(st if st in ("open", "closed", "merged") else "")
+          ' 2>/dev/null | head -1)"
+            case "$PR_ST" in
+              open) echo "✅ 翰林段守卫·PR：PR #$PR_IID state=open ⇒ 照常执行 npc go" ;;
+              closed|merged)
+                PRT="yes"; HYT_WHY="PR #$PR_IID state=$PR_ST（非 open）"
+                echo "🛑 翰林段守卫·PR：$HYT_WHY ⇒ 跳过 npc go"
+                ;;
+              *) echo "⚠️ 翰林段守卫·PR：PR #$PR_IID state 取数失败 / 空 / 落闭集外（实测值='${PR_ST}'）⇒ 不可判定，照常执行（fail-open）" ;;
+            esac
+          fi
+          # ---- Issue 侧（平台内置环境变量 · 零网络调用）----
+          ISS_IID="${CNB_ISSUE_IID:-}"
+          ISS_ST="${CNB_ISSUE_STATE:-}"
+          echo "🔎 翰林段守卫实测 CNB_ISSUE_IID='${ISS_IID}' CNB_ISSUE_STATE='${ISS_ST}'"
+          if [ -z "$ISS_IID" ]; then
+            echo "⚠️ 翰林段守卫·Issue：非 Issue 事件（CNB_ISSUE_IID 缺失）⇒ 无需判定，照常执行"
+          else
+            case "$ISS_ST" in
+              open) echo "✅ 翰林段守卫·Issue：Issue #$ISS_IID state=open ⇒ 照常执行 npc go" ;;
+              closed)
+                ISS="yes"; HYT_WHY="${HYT_WHY:+$HYT_WHY；}Issue #$ISS_IID state=closed（非 open）"
+                echo "🛑 翰林段守卫·Issue：Issue #$ISS_IID state=closed（非 open）⇒ 跳过 npc go"
+                ;;
+              *) echo "⚠️ 翰林段守卫·Issue：Issue #$ISS_IID state 取数失败 / 空 / 落闭集外（实测值='${ISS_ST}'）⇒ 不可判定，照常执行（fail-open）" ;;
+            esac
+          fi
+          echo "评论链终态守卫（翰林段）判定 PR=$PRT Issue=$ISS  理由=${HYT_WHY:-无}"
+          if [ "$PRT" = "yes" ]; then
+            {
+              echo "===== 评论链终态守卫（翰林段）：PR 已终态 ⇒ 跳过 npc go ====="
+              echo "理由=$HYT_WHY"
+              echo "载体=/workspace/qg-pr终态.txt（与 .npc 段 PR 终态守卫同载体）"
+              echo "放行面=api_trigger（裁决 / 换方案落地通道不经本锚点）"
+              echo "fail-open 面=无 IID / cnb 不可用 / 解析器缺失 / 取数失败（一律放行 + 告警，禁静默停摆）"
+            } > /workspace/qg-pr终态.txt
+            echo "🛑 已写 /workspace/qg-pr终态.txt ⇒ 本 build 翰林段 npc go 被 if 守卫跳过"
+          fi
+          if [ "$ISS" = "yes" ]; then
+            {
+              echo "===== 评论链终态守卫（翰林段）：Issue 已终态 ⇒ 跳过 npc go ====="
+              echo "理由=$HYT_WHY"
+              echo "载体=/workspace/qg-issue终态.txt（与 .npc 段 Issue 终态守卫同载体）"
+              echo "放行面=api_trigger（裁决 / 换方案落地通道不经本锚点）"
+              echo "fail-open 面=无 IID / state 空 / 落闭集外（一律放行 + 告警，禁静默停摆）"
+            } > /workspace/qg-issue终态.txt
+            echo "🛑 已写 /workspace/qg-issue终态.txt ⇒ 本 build 翰林段 npc go 被 if 守卫跳过"
+          fi
+          { [ "$PRT" = "yes" ] || [ "$ISS" = "yes" ]; } || echo "✅ 未命中终态 ⇒ 照常执行 npc go"
+          exit 0
       - name: 翰林档位选择
         #   ★ P1-2 收口（R5）：**声明 `timeout`**——平台「连续无输出即超时」对间隔取大响应的
         #     逐条审计过紧（真实月量级的条数与串行墙钟取值，见台账 #457 回奏）；本 stage 已改「增量输出 + 并发取数」，
@@ -5380,8 +5483,10 @@ main:
         exports:
           hanyuan_tier: HY_TIER
       - name: npc go（T1 · glm-5.3）
+        #   FU-2（#TASK-CNBGUARD-FU-20261014-01）：并列读**终态哨兵族**（与本锚点 `评论链终态守卫（翰林段）`
+        #   stage 同载体、取 OR 语义：任一在位即跳过）——本段不复用 `.npc` 锚点，守卫须逐档自持。
         if: |
-          [ -z "$HY_TIER" ] || [ "$HY_TIER" = "glm-5.3" ]
+          ( [ -z "$HY_TIER" ] || [ "$HY_TIER" = "glm-5.3" ] ) && [ ! -f /workspace/qg-pr终态.txt ] && [ ! -f /workspace/qg-issue终态.txt ]
         type: npc:go
         options:
           <<: *budget-light   # ← 轻量档：规划位不占常规业务预算
@@ -5397,8 +5502,9 @@ main:
             【收敛入口（对外事件侧 · `#TASK-ORCH-CONVERGE-20261004-01 AC-1`）】**结论先行**（先出结论/回奏、再补证据）；单轮**最多深挖 3 项**（含 merge/派单/裁决），其余维**只登记不展开**；**禁整份 `cat`/通读总纲**（只读〇导航+本角色必读切片，深水区用 `bash scripts/kb-query.sh` Top-K 检索）；**轮次自警**：工具调用累计约 ≥80 次或已深挖满 3 项即**立即收敛出手**（防撞机械轮次上限致 `error`=交付断链）；**逼近第⑨维① / 第⑩维阈值即自退**（限巡检类任务，不追加深挖）。（措辞同源＝心跳段 `#TASK-HB-BUDGET-HARDEN-20260912-01 AC-1`；防撞括注取**档位中性**表述、不绑定档位取值，故各档位段通用，防跨档失实。）**首动作纪律（FU-CC-4 · #TASK-CROSSROOT-CHAINBREAK-20261007-01）**：**第一个写动作必须早于深挖**（先建分支/先落最小骨架，再补调研），禁「全程只调研、零落盘」——跨根 0 落地实测末跳 `out=32000/content=0` 静默丢步 ⇒ 零产出断链。
             ${SUMMON_BRIEF}
       - name: npc go（T2 · hy4-preview）
+        #   FU-2：并列读终态哨兵族（OR 语义 · 同 T1 档）。
         if: |
-          [ "$HY_TIER" = "hy4-preview" ]
+          [ "$HY_TIER" = "hy4-preview" ] && [ ! -f /workspace/qg-pr终态.txt ] && [ ! -f /workspace/qg-issue终态.txt ]
         type: npc:go
         options:
           <<: *budget-light   # ← 轻量档（与上下档同源）
@@ -5410,8 +5516,9 @@ main:
             ${SUMMON_BRIEF}
           role: ${NPC_ROLE}
       - name: npc go（T3 · 免费保底）
+        #   FU-2：并列读终态哨兵族（OR 语义 · 同 T1 档）。
         if: |
-          [ "$HY_TIER" = "deepseek-v4.1-flash" ]
+          [ "$HY_TIER" = "deepseek-v4.1-flash" ] && [ ! -f /workspace/qg-pr终态.txt ] && [ ! -f /workspace/qg-issue终态.txt ]
         type: npc:go
         options:
           <<: *budget-light   # ← 轻量档（与上下档同源）
