@@ -403,23 +403,32 @@
           else
             REPO="${CNB_REPO_SLUG:-}"
             PR_META="$(cnb pulls get-pull --repo "$REPO" --number "$PR_IID" -v 2>/dev/null | tr -d '\r')"
-            # 取 state：**唯一命中才采信；多命中 / 零命中一律置空 ⇒ 落下方 fail-open 分支**（含 ⚠️ 告警行）。
-            #   ★ P1-1 修法（门下 R2 封驳 · 二修）：本行曾按「锁首条命中」（`grep -m1` + `| head -1`）实现，
-            #     经门下独立复现证明**方向相反**——`grep -m1 -o` 会把**首个命中行上全部命中**一并输出，
-            #     故 `head -1` 恰把「多命中（如 reviewers[].state=closed 出现在权威 data.state=open 之前）」
-            #     由 fail-open 翻成 `PR_ST=closed` ⇒ **误拦一个 open PR**（静默停摆，比不拦更危险的误杀，
-            #     与本 stage 上方自述契约及 AC-3 相悖）。故**禁**无条件取首条命中；两处同时收口：
-            #       (a) **只扫权威区**：真封套键序为 `number/state/title/body`，正文 `body` 内可能出现字面
-            #           `"state": "..."`（会抬高命中数）⇒ 先截到 `"body"` 之前（`sed -n '1,/^[[:space:]]*"body"/p'`）。
-            #       (b) **唯一命中才采信**：数命中数，`=1` 才取值，否则置空 ⇒ 交既有 fail-open 分支处置。
-            #     方向不变面：现网 `-v` 封套权威区恰 1 处命中 ⇒ AC-1/AC-2 判定与先前一致（判据只更严、不放宽）。
-            _PR_AUTH="$(printf '%s' "$PR_META" | LC_ALL=C sed -n '1,/^[[:space:]]*"body"/p')"
-            _PR_CNT="$(printf '%s' "$_PR_AUTH" | LC_ALL=C grep -oE '"state"[[:space:]]*:[[:space:]]*"[a-z_]+"' | wc -l | tr -d ' ')"
-            if [ "$_PR_CNT" = "1" ]; then
-              PR_ST="$(printf '%s' "$_PR_AUTH" | LC_ALL=C grep -oE '"state"[[:space:]]*:[[:space:]]*"[a-z_]+"' | grep -oE '[a-z_]+"?$' | tr -d '"')"
-            else
-              PR_ST=""
-            fi
+            # 取 state：**仅当「权威键锚点」后恰 1 处命中才采信；否则置空 ⇒ 落下方 fail-open 分支**。
+            #   ★ 为什么不以「行区间截断 + 命中计数」为准（本 stage 曾两版踩坑）：
+            #     ① 封套形态漂移不可控：`-v` 可能把整篇 JSON 压成**单行**（本仓已载「封套形态漂移」族旧坑），
+            #        此时 `sed -n '1,/^[[:space:]]*"body"/p'` 因**找不到以 `"body"` 起头的行**而**整篇返回**，
+            #        区间截断形同虚设——命中数随 `body` 文本内容漂移，判定力不可控。
+            #     ② 计数式「多命中 ⇒ 置空」会被**正文里的字面 `"state": "..."`** 抬高计数（如回奏正文引用
+            #        本 stage 自身实现），使守卫退化为**恒放行**；反之若正文恰好只 1 处、而非权威字段，
+            #        又会**误采信正文值**。
+            #   ★ 现行判据（结构性锚定 · 与封套行/键序解耦）：以**本 PR 自身的权威键** `"number": "<IID>"`
+            #     作为锚点（`data.number` 与请求 IID 必然相等），只在其**之后**取首个 `"state"` 值：
+            #       · 该 `"state"` 必为权威 `data.state`（`number` 与 `state` 同属 data 对象、且 `data.number`
+            #         在真封套中先于 `data.state`；截取范围止于 `"body"`，杜绝正文串污染）；
+            #       · 锚点缺失 / `"state"` 缺失 / 取值落闭集外 ⇒ 一律置空 ⇒ fail-open + 告警（方向恒安全）。
+            #   ★ POSIX 合规（runner `sh -e -c`，`/bin/sh -> dash`）：只 `printf`/`sed`，**无** bashism。
+            _PR_ANCHOR='"number"[[:space:]]*:[[:space:]]*"'"$PR_IID"'"'
+            _PR_ST="$(printf '%s' "$PR_META" | LC_ALL=C tr '\n' ' ' \
+              | LC_ALL=C sed -n 's/.*'"$_PR_ANCHOR"'\(.*\)/\1/p' \
+              | LC_ALL=C sed -n 's/^\(.*"state"[[:space:]]*:[[:space:]]*"\)\([a-z_]*\)\(\".*\)$/\2/p' \
+              | LC_ALL=C head -1)"
+            # 归一：仅接受「单次、完整」取值；多值（多行）与空值同样置空 ⇒ 交下方 fail-open 分支。
+            case "$_PR_ST" in
+              ?*)
+                if printf '%s' "$_PR_ST" | LC_ALL=C grep -qE '^[a-z_]+$'; then PR_ST="$_PR_ST"; else PR_ST=""; fi
+                ;;
+              *) PR_ST="" ;;
+            esac
             case "$PR_ST" in
               open|closed|merged)
                 if [ "$PR_ST" = "open" ]; then
