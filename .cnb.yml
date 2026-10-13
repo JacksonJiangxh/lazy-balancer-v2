@@ -403,11 +403,23 @@
           else
             REPO="${CNB_REPO_SLUG:-}"
             PR_META="$(cnb pulls get-pull --repo "$REPO" --number "$PR_IID" -v 2>/dev/null | tr -d '\r')"
-            # 取 state：取不到即空值（非零退出码经 `set +e` + 命令替换容忍；空 ⇒ 下走 fail-open）
-            #   ★ 末位 `head -1`（门下 P2-3）：`grep -oE` 逐行输出命中；若上游 JSON 形态变化致
-            #     多行命中，首个之外的残留会让 `case` 落闭集外 ⇒ 得 fail-open（方向安全但降判别力）。
-            #     固定取首条命中 ⇒ 生产形态（现网 `-v` 多行、state 唯一）判定不变，异常形态亦稳定可判。
-            PR_ST="$(printf '%s' "$PR_META" | LC_ALL=C grep -m1 -oE '"state"[[:space:]]*:[[:space:]]*"[a-z_]+"' | grep -oE '[a-z_]+"?$' | head -1 | tr -d '"')"
+            # 取 state：**唯一命中才采信；多命中 / 零命中一律置空 ⇒ 落下方 fail-open 分支**（含 ⚠️ 告警行）。
+            #   ★ P1-1 修法（门下 R2 封驳 · 二修）：本行曾按「锁首条命中」（`grep -m1` + `| head -1`）实现，
+            #     经门下独立复现证明**方向相反**——`grep -m1 -o` 会把**首个命中行上全部命中**一并输出，
+            #     故 `head -1` 恰把「多命中（如 reviewers[].state=closed 出现在权威 data.state=open 之前）」
+            #     由 fail-open 翻成 `PR_ST=closed` ⇒ **误拦一个 open PR**（静默停摆，比不拦更危险的误杀，
+            #     与本 stage 上方自述契约及 AC-3 相悖）。故**禁**无条件取首条命中；两处同时收口：
+            #       (a) **只扫权威区**：真封套键序为 `number/state/title/body`，正文 `body` 内可能出现字面
+            #           `"state": "..."`（会抬高命中数）⇒ 先截到 `"body"` 之前（`sed -n '1,/^[[:space:]]*"body"/p'`）。
+            #       (b) **唯一命中才采信**：数命中数，`=1` 才取值，否则置空 ⇒ 交既有 fail-open 分支处置。
+            #     方向不变面：现网 `-v` 封套权威区恰 1 处命中 ⇒ AC-1/AC-2 判定与先前一致（判据只更严、不放宽）。
+            _PR_AUTH="$(printf '%s' "$PR_META" | LC_ALL=C sed -n '1,/^[[:space:]]*"body"/p')"
+            _PR_CNT="$(printf '%s' "$_PR_AUTH" | LC_ALL=C grep -oE '"state"[[:space:]]*:[[:space:]]*"[a-z_]+"' | wc -l | tr -d ' ')"
+            if [ "$_PR_CNT" = "1" ]; then
+              PR_ST="$(printf '%s' "$_PR_AUTH" | LC_ALL=C grep -oE '"state"[[:space:]]*:[[:space:]]*"[a-z_]+"' | grep -oE '[a-z_]+"?$' | tr -d '"')"
+            else
+              PR_ST=""
+            fi
             case "$PR_ST" in
               open|closed|merged)
                 if [ "$PR_ST" = "open" ]; then
