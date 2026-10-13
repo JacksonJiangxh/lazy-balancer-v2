@@ -371,11 +371,78 @@
           fi
           #BREAKER_LATCH_SH>>
           exit 0
+      # ---- PR 终态守卫（评论链 · AC-1~AC-5 · #TASK-MERGEDPR-GUARD-20261013-01）----
+      #   为什么补这一段（根因 · 台账 #35 实测）：PR 合并/关闭后，平台侧 PR 评论事件**仍在**触发
+      #   `pull_request.comment@npc` ⇒ 每条评论拉起一次 NPC 构建（该 PR 早已 `state=closed / is_merged=true`），
+      #   形成**自激式积压**——台账 #35 实测单日 12 条构建中约 9 条源于已合并 PR#31 的评论链（第⑩维熔断命中源）。
+      #   本守卫与「熔断守卫」**同构**：命中即写哨兵 `/workspace/qg-pr终态.txt`，由 `npc go` 的 `if`
+      #   并列跳过（与 `qg-熔断.txt` / `qg-裁决冻结.txt` 取 OR 语义：任一在位即跳过），评论链不再产出新回奏。
+      #   判据（二进制 · fail-open 方向）：
+      #     · `CNB_PULL_REQUEST_IID` 非空 ∧ `state ∈ {closed, merged}` ⇒ 写哨兵、跳过 npc go；
+      #     · `state=open` ⇒ 照常执行；
+      #     · 无 IID（非 PR 事件）/ `cnb` 不可用 / **取数失败** / state 空或落闭集外 ⇒ **照常执行 ＋ 显式告警**。
+      #   为什么 fail-open（而非 fail-closed）：本守卫是**收敛积压**的护栏、非质量门；不可判定时若拦，
+      #   等于让「查询抖动」静默停掉整条评论链（比不拦更危险的误杀）。故按 #35 诏令要求：
+      #   **禁以不可判定为由静默停摆**，一律放行 + 大声告警。
+      #   取数纪律（AC-8）：**一次只读调用** `cnb pulls get-pull -v`（复用 F-308a 同款缺省即空值的字段抽取，
+      #   不引 python3 —— 见既有告警「无 python3 环境解析静默退空」），无写调用、无跨仓/跨根依赖。
+      #   放行面（防死锁 · 同熔断守卫）：只覆盖**评论事件侧**；`$: api_trigger`（含裁决与换方案落地）不经
+      #   本锚点 ⇒ 不被跳过，权威通道不受影响。哨兵载体独立于 `qg-熔断.txt`，两守卫互不读写、次序无关。
+      - name: PR 终态守卫
+        script: |
+          set +e
+          echo "===== PR 终态守卫（评论链 · #TASK-MERGEDPR-GUARD-20261013-01）====="
+          PRT="no"; PRT_WHY=""
+          PR_IID="${CNB_PULL_REQUEST_IID:-}"
+          if [ -z "$PR_IID" ]; then
+            PRT_WHY="非 PR 事件（CNB_PULL_REQUEST_IID 缺失）⇒ 无需判定，照常执行 npc go"
+            echo "⚠️ PR 终态守卫：$PRT_WHY"
+          elif ! command -v cnb >/dev/null 2>&1; then
+            PRT_WHY="cnb CLI 不可用 ⇒ 状态不可判定，照常执行（fail-open）"
+            echo "⚠️ PR 终态守卫：$PRT_WHY"
+          else
+            REPO="${CNB_REPO_SLUG:-}"
+            PR_META="$(cnb pulls get-pull --repo "$REPO" --number "$PR_IID" -v 2>/dev/null | tr -d '\r')"
+            # 取 state：取不到即空值（非零退出码经 `set +e` + 命令替换容忍；空 ⇒ 下走 fail-open）
+            PR_ST="$(printf '%s' "$PR_META" | LC_ALL=C grep -m1 -oE '"state"[[:space:]]*:[[:space:]]*"[a-z_]+"' | grep -oE '[a-z_]+"?$' | tr -d '"')"
+            case "$PR_ST" in
+              open|closed|merged)
+                if [ "$PR_ST" = "open" ]; then
+                  PRT_WHY="PR #$PR_IID state=open ⇒ 照常执行 npc go"
+                  echo "✅ PR 终态守卫：$PRT_WHY"
+                else
+                  PRT="yes"; PRT_WHY="PR #$PR_IID state=$PR_ST（非 open）⇒ 跳过 npc go"
+                  echo "🛑 PR 终态守卫：$PRT_WHY"
+                fi
+                ;;
+              *)
+                PRT_WHY="PR #$PR_IID state 取数失败 / 空 / 落闭集外（实测值='${PR_ST}'）⇒ 不可判定，照常执行（fail-open）"
+                echo "⚠️ PR 终态守卫：$PRT_WHY"
+                ;;
+            esac
+          fi
+          echo "PR 终态守卫判定=$PRT  理由=$PRT_WHY"
+          if [ "$PRT" = "yes" ]; then
+            {
+              echo "===== PR 终态守卫（评论链）：命中 ⇒ 跳过 npc go，不再产出新回奏 ====="
+              echo "理由=$PRT_WHY"
+              echo "载体=/workspace/qg-pr终态.txt（与 npc go 的 if 守卫同载体）"
+              echo "放行面=api_trigger（裁决 / 换方案落地通道不经本锚点）"
+              echo "fail-open 面=无 IID / cnb 不可用 / 取数失败（一律放行 + 告警，禁静默停摆）"
+            } > /workspace/qg-pr终态.txt
+            echo "🛑 已写 /workspace/qg-pr终态.txt ⇒ 本 build 评论链 npc go 被 if 守卫跳过"
+          else
+            echo "✅ 未命中 PR 终态 ⇒ 照常执行 npc go"
+          fi
+          exit 0
       - name: npc go
         # 熔断守卫：上一 stage 判定熔断（写 /workspace/qg-熔断.txt）时**整段跳过** ⇒ 评论链不再产出修复 commit。
         # 与 `failStages`→「工部尚书自愈」stage 的 `if` **逐字同形**（同哨兵、两处绑定；矩阵 C-LATCH-③ 断言同源）。
+        # PR 终态守卫（#TASK-MERGEDPR-GUARD-20261013-01）：上一 stage 判定本 PR 非 open（closed/merged，
+        # 写 /workspace/qg-pr终态.txt）时**整段跳过** ⇒ 已合并/已关闭 PR 上不再产出新回奏（断自激链）。
+        # 三哨兵并列取 OR（任一在位即跳过）；两守卫 stage 均恒 exit 0、互不读写，次序无关。
         if: |
-          [ ! -f /workspace/qg-熔断.txt ] && [ ! -f /workspace/qg-裁决冻结.txt ]
+          [ ! -f /workspace/qg-熔断.txt ] && [ ! -f /workspace/qg-裁决冻结.txt ] && [ ! -f /workspace/qg-pr终态.txt ]
         type: npc:go                         # 平台内置 NPC 任务：读取角色 prompt + Issue/PR 上下文 → 执行 → 回评
         options:
           <<: *budget   # ← 机械级预算硬顶（#TASK-ORCH-BUDGET-20260911-01；口径见 AGENTS.md §6.6）
