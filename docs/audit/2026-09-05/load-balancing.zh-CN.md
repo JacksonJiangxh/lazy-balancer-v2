@@ -702,5 +702,5 @@ grep 核实调用方仅两处：`handlers.go:582`（TCP 分支）与 `rule_featu
 | 编号 | 条目 | 问题 | 建议 |
 |---|---|---|---|
 | T-1 | LB-07 | `ValidateRouteMergedConfig` 目标 server 不存在时直接放行（候选路由未经 Caddy 校验），是否有意避免对空配置发请求？ | 裁定后补最小合并副本送验，或注释声明有意放行 |
-| T-2 | （观察项，未单列编号）HTTP 规则重试窗口固定 `try_duration=5s/try_interval=250ms` 硬编码（caddy.go:3057-3061），UI「连接重试」仅 TCP 步骤暴露、文档未记载该 L7 固定值；L4 则完全可配。是否为有意的不对称？ | 裁定后补 UI 高级选项/文档说明，或开放规则级配置 |
+| T-2 | （观察项，未单列编号） | HTTP 规则重试窗口固定 `try_duration=5s/try_interval=250ms` 硬编码（caddy.go:3057-3061），UI「连接重试」仅 TCP 步骤暴露、文档未记载该 L7 固定值；L4 则完全可配。是否为有意的不对称？ | 裁定后补 UI 高级选项/文档说明，或开放规则级配置 |
 | T-3 | LB-15 | 规则级 `server_tokens_hidden`（0/1/2）后端全链路支持（模型/校验/渲染）但 UI 无入口：API 预留还是 UI 缺失？ | 补 UI 或文档声明 API-only |

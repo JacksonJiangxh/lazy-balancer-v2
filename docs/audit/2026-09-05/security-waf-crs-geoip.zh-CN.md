@@ -86,7 +86,7 @@
 | 自动更新排程 | 开关即写 `next_update=+24h`（R69）、「下次更新」列 | `next_update` UTC naive 文本 | schedulerTick 到期触发 + rearm 失败退避 1h→24h（crsscheduler.go:118-215） | 前端 date.ts:80 将 naive 串按 UTC 解析→配置时区渲染 | 一致 |
 | 自定义规则动作 | 编辑器三态 拦截/仅记录/放行计分（:259-266） | `security_custom_rules.action`（block/log/pass，handlers/security.go:76-78） | emitCustomRules：block→deny+skipAfter；log→不累分；pass→`setvar:tx.inbound_anomaly_score_pl1=+N`（services/security.go:544-551） | **列表标签二值化，pass 显示为「记录」** | 不一致 → W2 |
 | 从节点只读 | 开关/按钮 `isReadOnly` 禁用 | — | 三层门：handler 直查 403（security.go:2300-2328）、run() 起点复查（crsupdate.go:222-229）、调度器 tick is_master 守卫（crsscheduler.go:118-122） | 从节点 UI 只读 + 后端 403 | 一致 |
-| WAF 文件主从同步 | 集群设置「规则库数据库」（ClusterSettings.vue:427） | 快照嵌 `WafFiles` 哈希引用（无内容） | 双门 `wafFilesRefDiffers || wafFilesDrifted`（cluster_apply.go:162）→按需拉取→`untarGzTo` 解包+整树哈希复核→落盘 | VERSION 原始字节随 tar 落盘（R46-E1）、`.version` sidecar 双写（R57 A-#4） | 一致 |
+| WAF 文件主从同步 | 集群设置「规则库数据库」（ClusterSettings.vue:427） | 快照嵌 `WafFiles` 哈希引用（无内容） | 双门 `wafFilesRefDiffers \|\| wafFilesDrifted`（cluster_apply.go:162）→按需拉取→`untarGzTo` 解包+整树哈希复核→落盘 | VERSION 原始字节随 tar 落盘（R46-E1）、`.version` sidecar 双写（R57 A-#4） | 一致 |
 
 ### W1 coraza 池指纹未覆盖 crs-setup.conf / rules/*.conf 的带外手改（中）
 
