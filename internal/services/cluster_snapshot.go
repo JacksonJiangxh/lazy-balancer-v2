@@ -129,7 +129,7 @@ func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnap
 	// D2-S2：开关读取失败必须报错——空缓存键 + nil 开关会把主节点 sync_users=0
 	// 等关闭保护在该份快照内绕过（从节点 computeSectionSkips 回退全开默认值），
 	// 且无自愈路径。无法确认权威开关状态时不得发布快照。
-	switches, err := readSyncSwitches(s.db)
+	switches, err := readSyncSwitches(ctx, s.db)
 	if err != nil {
 		return models.ClusterSnapshot{}, nil, "", fmt.Errorf("读取同步开关: %w", err)
 	}
@@ -179,7 +179,7 @@ func (s *ClusterService) buildFullSnapshot(ctx context.Context, store snapshotSt
 	}
 	snapshot.WafFiles = BuildWafFileRef()
 	// D2-S2：与缓存键侧同口径——读不到权威开关时不得发布 nil 开关快照。
-	switches, err := readSyncSwitches(s.db)
+	switches, err := readSyncSwitches(ctx, s.db)
 	if err != nil {
 		return models.ClusterSnapshot{}, fmt.Errorf("读取主节点同步开关: %w", err)
 	}
@@ -439,7 +439,7 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 		COALESCE(upstream_keepalive_timeout,0),
 		COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 		COALESCE(server_tokens_hidden,0),
-		COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_ranges,'[]'), COALESCE(trusted_proxy_headers,'[]'), COALESCE(trusted_proxy_strict,1)
+		COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_ranges,'[]'), COALESCE(trusted_proxy_range_refs,'[]'), COALESCE(trusted_proxy_headers,'[]'), COALESCE(trusted_proxy_strict,1)
 		FROM global_config WHERE id=1`).Scan(
 		&snapshot.BasicSettings.CaddyLogLevel, &snapshot.BasicSettings.CaddyLogSizeMB,
 		&snapshot.BasicSettings.AccessLogJSON, &snapshot.BasicSettings.AccessLogFormat,
@@ -447,7 +447,7 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 		&snapshot.BasicSettings.UpstreamKeepaliveTimeout,
 		&snapshot.BasicSettings.ProxyDialTimeout, &snapshot.BasicSettings.ProxyResponseHeaderTimeout, &snapshot.BasicSettings.ProxyReadTimeout, &snapshot.BasicSettings.ProxyWriteTimeout, &snapshot.BasicSettings.ProxyStreamTimeout, &snapshot.BasicSettings.ProxyFlushInterval, &snapshot.BasicSettings.ProxyStreamCloseDelay,
 		&snapshot.BasicSettings.ServerTokensHidden,
-		&snapshot.BasicSettings.TrustedProxyEnabled, &snapshot.BasicSettings.TrustedProxyRanges, &snapshot.BasicSettings.TrustedProxyHeaders, &snapshot.BasicSettings.TrustedProxyStrict); err != nil {
+		&snapshot.BasicSettings.TrustedProxyEnabled, &snapshot.BasicSettings.TrustedProxyRanges, &snapshot.BasicSettings.TrustedProxyRangeRefs, &snapshot.BasicSettings.TrustedProxyHeaders, &snapshot.BasicSettings.TrustedProxyStrict); err != nil {
 		return fmt.Errorf("读取 Caddy 全局设置: %w", err)
 	}
 	// CL41-1(第 41 轮审计):自动备份六设置列随 users 节同步。指针形态装载,

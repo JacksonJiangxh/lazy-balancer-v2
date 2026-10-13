@@ -188,11 +188,11 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 跳过 → 每周期全量重拉死循环（主节点「同步下发」审计随之刷屏）。
 	// changed 标志在函数作用域声明，供末段条件重载判定（F-L5-68-01）。
 	var crsChanged, xdbChanged, threatChanged bool
-	if switches.Security && (wafFilesRefDiffers(snapshot.WafFiles) || s.wafFilesDrifted()) {
+	if switches.Security && (wafFilesRefDiffers(snapshot.WafFiles) || s.wafFilesDrifted(ctx)) {
 		// 2026-09-18 用户裁定:同步日志与自动更新日志同款分阶段流水——唯一
 		// 区别是来源(主节点 vs GitHub),弹框日志可对照阅读。
-		AppendCRSUpdateLog("INFO", "checking", "从主节点校验 CRS 规则版本")
-		AppendIP2RegionUpdateLog("INFO", "checking", "从主节点校验 IP2Region数据库版本")
+		WriteCRSUpdateLog("INFO", "checking", "从主节点校验 CRS 规则版本")
+		WriteIP2RegionUpdateLog("INFO", "checking", "从主节点校验 IP2Region数据库版本")
 		bundle, ferr := s.fetchWafFiles(ctx, snapshot.WafFiles)
 		// F-68-U2-02（第 68 轮审计）：调用点持 WafFileLock——与 lbbak 导入
 		// （config_backup_lbbak.go caller-side 持锁）、三库更新器（内锁）与
@@ -212,21 +212,21 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 			// CL39-B1-3(D3):checking 已写入弹框日志,失败必须补终态——
 			// 否则规则库更新弹框的日志流停在 checking(对照 config_backup_lbbak.go
 			// 完整链形态,与自动更新器 failed 同款 stage)。
-			AppendCRSUpdateLog("ERROR", "failed", fmt.Sprintf("从主节点拉取安全数据失败: %v", ferr))
-			AppendIP2RegionUpdateLog("ERROR", "failed", fmt.Sprintf("从主节点拉取安全数据失败: %v", ferr))
+			WriteCRSUpdateLog("ERROR", "failed", fmt.Sprintf("从主节点拉取安全数据失败: %v", ferr))
+			WriteIP2RegionUpdateLog("ERROR", "failed", fmt.Sprintf("从主节点拉取安全数据失败: %v", ferr))
 			AppendThreatUpdateLog("ERROR", "failed", fmt.Sprintf("从主节点拉取安全数据失败: %v", ferr))
 		} else if aerr != nil {
 			Logf("error", "落盘同步安全数据失败: %v", aerr)
 			RecordAuditLog("system", "同步失败", "安全数据", fmt.Sprintf("落盘安全数据失败: %v", aerr), "")
-			AppendCRSUpdateLog("ERROR", "failed", fmt.Sprintf("落盘主节点安全数据失败: %v", aerr))
-			AppendIP2RegionUpdateLog("ERROR", "failed", fmt.Sprintf("落盘主节点安全数据失败: %v", aerr))
+			WriteCRSUpdateLog("ERROR", "failed", fmt.Sprintf("落盘主节点安全数据失败: %v", aerr))
+			WriteIP2RegionUpdateLog("ERROR", "failed", fmt.Sprintf("落盘主节点安全数据失败: %v", aerr))
 			AppendThreatUpdateLog("ERROR", "failed", fmt.Sprintf("落盘主节点安全数据失败: %v", aerr))
 		} else if crsChanged || xdbChanged || threatChanged {
 			detail := wafBundleSyncDetail(bundle, crsChanged, xdbChanged)
 			RecordAuditLog("system", "同步", "安全数据", detail, "")
 			// 同步有变动=完整更新流程(与自动更新器同款阶段流水)
 			if xdbChanged {
-				AppendIP2RegionUpdateLog("INFO", "installing", "校验并落盘主节点 IP2Region数据库")
+				WriteIP2RegionUpdateLog("INFO", "installing", "校验并落盘主节点 IP2Region数据库")
 				if err := Reload(); err != nil {
 					Logf("error", "同步后 ip2region 内存缓存热换失败(下次重启生效): %v", err)
 				}
@@ -235,27 +235,27 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 				if tag == "" {
 					tag = "未知版本"
 				}
-				AppendIP2RegionUpdateLog("INFO", "success", fmt.Sprintf("ip2region 已随主节点同步更新到 %s", tag))
+				WriteIP2RegionUpdateLog("INFO", "success", fmt.Sprintf("ip2region 已随主节点同步更新到 %s", tag))
 			}
 			if threatChanged {
 				AppendThreatUpdateLog("INFO", "success", "威胁情报库已随主节点同步更新(.fast 落盘)")
 			}
 			if crsChanged {
-				AppendCRSUpdateLog("INFO", "installing", "校验并落盘主节点 CRS 规则")
-				AppendCRSUpdateLog("INFO", "reloading", "重载 Caddy 配置")
+				WriteCRSUpdateLog("INFO", "installing", "校验并落盘主节点 CRS 规则")
+				WriteCRSUpdateLog("INFO", "reloading", "重载 Caddy 配置")
 				version := bundle.CRSVersion
 				if version == "" {
 					version = "未知版本"
 				}
-				AppendCRSUpdateLog("INFO", "success", fmt.Sprintf("CRS 已随主节点同步更新到 %s", version))
+				WriteCRSUpdateLog("INFO", "success", fmt.Sprintf("CRS 已随主节点同步更新到 %s", version))
 			}
 		} else {
 			// 校验无变动也留痕(仅在实际执行同步校验的周期记录,非每周期刷屏)
 			if bundle.CRSVersion != "" || bundle.CRSTarGz != nil {
-				AppendCRSUpdateLog("INFO", "success", "主节点 CRS 数据无更新，无需同步")
+				WriteCRSUpdateLog("INFO", "success", "主节点 CRS 数据无更新，无需同步")
 			}
 			if bundle.IP2RegionTag != "" || bundle.Xdb != nil {
-				AppendIP2RegionUpdateLog("INFO", "success", "主节点 IP2Region 数据无更新，无需同步")
+				WriteIP2RegionUpdateLog("INFO", "success", "主节点 IP2Region 数据无更新，无需同步")
 			}
 			if len(bundle.ThreatFiles) > 0 {
 				AppendThreatUpdateLog("INFO", "success", "主节点威胁情报库数据无更新，无需同步")
@@ -822,7 +822,7 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 				return fmt.Errorf("写入威胁库源行: %w", err)
 			}
 		}
-		// F65:从节点威胁情报库同步日志(与 CRS/IP2Region 的 AppendCRSUpdateLog 同构)
+		// F65:从节点威胁情报库同步日志(与 CRS/IP2Region 的 WriteCRSUpdateLog 同构)
 		if len(threatSources) > 0 {
 			threatEnabled := 0
 			entryTotal := 0
@@ -1182,11 +1182,11 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 		} else if settings.RequestBodyMaxSizeMB > 4096 {
 			settings.RequestBodyMaxSizeMB = 4096
 		}
-		query += ",caddy_config=?,access_log_json=?,access_log_format=?,caddy_log_level=?,caddy_log_size_mb=?,request_body_max_size_mb=?,http_read_timeout=?,http_write_timeout=?,http_idle_timeout=?,upstream_keepalive_timeout=?,proxy_dial_timeout=?,proxy_response_header_timeout=?,proxy_read_timeout=?,proxy_write_timeout=?,proxy_stream_timeout=?,proxy_flush_interval=?,proxy_stream_close_delay=?,server_tokens_hidden=?,trusted_proxy_enabled=?,trusted_proxy_ranges=?,trusted_proxy_headers=?,trusted_proxy_strict=?"
+		query += ",caddy_config=?,access_log_json=?,access_log_format=?,caddy_log_level=?,caddy_log_size_mb=?,request_body_max_size_mb=?,http_read_timeout=?,http_write_timeout=?,http_idle_timeout=?,upstream_keepalive_timeout=?,proxy_dial_timeout=?,proxy_response_header_timeout=?,proxy_read_timeout=?,proxy_write_timeout=?,proxy_stream_timeout=?,proxy_flush_interval=?,proxy_stream_close_delay=?,server_tokens_hidden=?,trusted_proxy_enabled=?,trusted_proxy_ranges=?,trusted_proxy_range_refs=?,trusted_proxy_headers=?,trusted_proxy_strict=?"
 		args = append(args, *snapshot.CaddyConfig, settings.AccessLogJSON, settings.AccessLogFormat, settings.CaddyLogLevel, settings.CaddyLogSizeMB,
 			settings.RequestBodyMaxSizeMB, settings.HTTPReadTimeout, settings.HTTPWriteTimeout, settings.HTTPIdleTimeout,
 			settings.UpstreamKeepaliveTimeout, settings.ProxyDialTimeout, settings.ProxyResponseHeaderTimeout, settings.ProxyReadTimeout, settings.ProxyWriteTimeout, settings.ProxyStreamTimeout, settings.ProxyFlushInterval, settings.ProxyStreamCloseDelay,
-			settings.ServerTokensHidden, settings.TrustedProxyEnabled, settings.TrustedProxyRanges, settings.TrustedProxyHeaders, settings.TrustedProxyStrict)
+			settings.ServerTokensHidden, settings.TrustedProxyEnabled, settings.TrustedProxyRanges, settings.TrustedProxyRangeRefs, settings.TrustedProxyHeaders, settings.TrustedProxyStrict)
 	}
 	query += " WHERE id=1"
 	if _, err := tx.ExecContext(ctx, query, args...); err != nil {

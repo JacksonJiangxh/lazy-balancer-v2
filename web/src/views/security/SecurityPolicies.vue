@@ -901,7 +901,7 @@ import type { CrsExcludedRow, CrsRuleOptionView } from '@/composables/useCrsRule
 import type { APIResponse, UserListItem } from '@/types'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
-import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, buildStageModel, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, parseRefIds, IP_LIST_CATEGORIES} from '@/utils/securityStages'
+import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, buildStageModel, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, parseRefIds, IP_LIST_CATEGORIES} from '@/utils/securityStages'
 import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy } from '@/utils/securityStages'
 
 interface PolicyDetail { id: number; name: string; description: string; mode: string; anomaly_threshold: number; ip_acl_mode: string; ip_acl_list: string; ip_acl_enabled: boolean; ip_whitelist: string; ip_whitelist_enabled?: boolean; ip_blacklist?: string; ip_acl_list_refs?: string; ip_whitelist_refs?: string; rate_limit_enabled: boolean; rate_limit_rps: number; rate_limit_burst: number; crs_rule_groups: string; crs_excluded_rules: string; custom_rules: string; block_page_id: number; block_status_code: number; enabled: boolean; updated_at: string; geoip_mode?: string; geoip_countries?: string; waf_check_response?: boolean; log_request_body?: boolean; trust_detection?: boolean }
@@ -1382,20 +1382,11 @@ const fetchIpLists = async (seq?: number): Promise<void> => {
     ipLists.value = res.data || []
   } catch { /* 静默失败：引用选择器退化为空列表，冲突比较回退内联口径 */ }
 }
-// 合并内联 + 引用列表条目（按精确字符串去重，与 v1 匹配口径一致）；
-// 缓存中缺失的引用列表跳过（防御性回退为仅内联）
-const mergeIpEntries = (inline: string[], refs: number[]): string[] => {
-  const set = new Set(inline.map((v) => v.trim()).filter((v) => v !== ''))
-  for (const id of refs) {
-    const entries = ipListDetails.value[id]
-    if (!entries) continue // 详情未加载/加载失败：防御性回退为仅内联
-    for (const entry of entries) {
-      const v = entry.value.trim()
-      if (v !== '') set.add(v)
-    }
-  }
-  return [...set]
-}
+// 合并内联 + 引用列表条目（按精确字符串去重，与 v1 匹配口径一致）；缓存中缺失的
+// 引用列表跳过（防御性回退为仅内联）。内核统一在 utils/securityStages
+// mergeIpEntryValues（R73 FE-3 收敛），本处仅适配 ipListDetails 数据源成形。
+const mergeIpEntries = (inline: string[], refs: number[]): string[] =>
+  mergeIpEntryValues(inline, refs.map((id) => (ipListDetails.value[id] ?? []).map((e) => e.value)))
 // 条数-only 合并口径（列表页摘要用，不拉条目值）：内联去重数 + Σ引用名单
 // entry_count。与 mergeIpEntries 的去重合计可能略有出入（内联与引用重叠时），
 // 仅作列表页一行摘要展示；精确合计以向导内（条目已加载）为准。
@@ -2846,6 +2837,10 @@ const resetWizard = () => {
   editingPolicyType.value = null
   rulePickerVisible.value = false
   ruleBoundPolicies.value = {}
+  // FE-2（第 73 轮）：阶段页覆盖编辑暂存须随向导复位清空——否则编辑策略 A
+  // 暂存的覆盖会跨会话泄漏到绑定同规则的策略 B（保存写入 A 的暂存值）。
+  stageOverrideEdits.value = {}
+  stageOverrideSaving.value = {}
 }
 
 const beforeWizardClose = (done: () => void): void => {
@@ -2961,23 +2956,27 @@ const handleSave = async () => {
       const createdId = saveRes.data?.id
       if (!createdId) throw new Error('创建策略响应缺少 id')
       editingId.value = createdId
+      // 新建落库即转入已保存实体（后续 bind/阶段页覆盖用新 id）——同步锁定
+      // 编辑器类型为用户所选类型：否则 editingPolicyType 仍为 null，editorPolicyType
+      // fallback 'mixed' → 步骤瞬间跳全阶段、标题/标签错变「混合策略」（bind 失败
+      // 保持打开重试时用户停留在此错乱视图）。
+      editingPolicyType.value = createPolicyType.value
     }
-    // v2.2.0 多策略绑定保存组合（SC-BIND-02）：新增规则走 additive POST bind（仅
-    // INSERT OR IGNORE 本策略一行，绝不动该规则的兄弟绑定）；取消选择的规则只
-    // DELETE 解绑本策略一行。规则的完整绑定列表不经本对话框改写——PUT 全量替换
-    // 需要持有兄弟绑定快照，在本入口属于危险且无必要的写法。
+    // v2.2.0 多策略绑定保存组合（SC-BIND-02）：新增/取消走策略侧批量端点
+    // （第 72 轮：单事务批量增删本策略绑定行，不触碰兄弟绑定——与原逐规则
+    // additive POST/DELETE 语义一致，但从 N 次全链请求收敛为 1 次单渲染请求）。
     let bindLastRes: { message?: string } | undefined
     try {
-      // 2026-09-08 审计 FE1：捕获最后一个响应传 showSaveResult——退化 200+后缀
+      // 2026-09-08 审计 FE1：捕获响应传 showSaveResult——退化 200+后缀
       // （Caddy 应用失败但 DB 已提交）时持续警告可见（有全局横幅兜底但即时
-      // 反馈更佳）。bind/unbind 均经 finishTxApply 可产生后缀。
-      const bindResults = await Promise.all([
-        ...added.map((caddyId) => request.post(`/security/policies/${editingId.value}/bind`, { rule_caddy_id: caddyId })),
-        ...removed.map((caddyId) => request.delete(`/security/policies/${editingId.value}/bind/${caddyId}`)),
-      ])
-      bindLastRes = bindResults[bindResults.length - 1] as { message?: string }
+      // 反馈更佳）。bulk 端点同样经 finishTxApply 可产生后缀。
+      const bindRes = await request.post<{ message?: string }>(`/security/policies/${editingId.value}/bindings/bulk`, {
+        bind: added,
+        unbind: removed,
+      })
+      bindLastRes = bindRes as { message?: string }
     } catch (error: unknown) {
-      // 失败的 bind 请求已由全局拦截器逐个 toast，这里仅记录并中止收尾
+      // 失败的绑定请求已由全局拦截器 toast，这里仅记录并中止收尾
       console.error('Failed to sync policy bindings:', error)
      ElMessage.warning('策略已保存，但部分规则绑定同步失败；对话框保持打开，重新点击保存可重试绑定（幂等）')
       return

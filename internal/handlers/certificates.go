@@ -191,9 +191,25 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 		return
 	}
 
+	// LBS/LBH-4（第 73 轮 P5）：旧行读取与动态 UPDATE 收敛到同一事务
+	//（_txlock=immediate → BEGIN IMMEDIATE 先取写锁）——审计 changed 清单的
+	//比对基线即写入前那一刻的真实行，消除「事务外预读 → 写入」窗口内并发
+	//提交导致的清单失真（镜像 CERT-N1 的事务内旧行模式）。
+	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to update config"})
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
 	var oldName, oldProvider, oldCredentials string
 	var oldEnabled bool
-	if err := db.DB.QueryRow("SELECT name, dns_provider, COALESCE(dns_credentials,''), COALESCE(enabled,1) FROM certificate_configs WHERE id=?", id).Scan(&oldName, &oldProvider, &oldCredentials, &oldEnabled); dbQueryNotFound(c, err, "Config not found", "UpdateCertificateConfig query config") {
+	if err := tx.QueryRowContext(c.Request.Context(), "SELECT name, dns_provider, COALESCE(dns_credentials,''), COALESCE(enabled,1) FROM certificate_configs WHERE id=?", id).Scan(&oldName, &oldProvider, &oldCredentials, &oldEnabled); dbQueryNotFound(c, err, "Config not found", "UpdateCertificateConfig query config") {
 		return
 	}
 	effectiveProvider := oldProvider
@@ -288,10 +304,15 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 	query += "updated_at = datetime('now') WHERE id = ?"
 	args = append(args, id)
 
-	if _, err := db.DB.Exec(query, args...); err != nil {
+	if _, err := tx.ExecContext(c.Request.Context(), query, args...); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to update config"})
 		return
 	}
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to update config"})
+		return
+	}
+	committed = true
 	recordAudit(c, "更新", "DNS配置", services.FormatAuditDetail(fmt.Sprintf("配置 %d", id), fmt.Sprintf("变更：%s", strings.Join(changed, "、"))))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "Config updated"})
 }
@@ -484,6 +505,10 @@ func (h *Handlers) ListCertificates(c *gin.Context) {
 		var ruleID, domain, status, message, expiresAt, updatedAt string
 		var expiresNull, updatedNull sql.NullString
 		if err := rows.Scan(&id, &ruleID, &domain, &status, &message, &expiresNull, &updatedNull); err != nil {
+			// SYS-F2（第 72 轮 P4）：单行 Scan 失败 warn 留痕+跳过（对齐
+			// F-CORE-2 口径）——静默丢行会让该域名在证书清单中无故缺席；
+			// 迭代级失败仍由下方 rows.Err() 500 兜底。
+			services.Logf("warn", "证书任务列表：跳过扫描失败行（该域名聚合行本轮缺失）: %v", err)
 			continue
 		}
 		expiresAt, updatedAt = expiresNull.String, updatedNull.String

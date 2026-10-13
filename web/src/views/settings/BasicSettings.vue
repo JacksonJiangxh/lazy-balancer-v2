@@ -20,7 +20,7 @@
             <span class="form-tip-inline">控制 Lazy Balancer 自身日志详细程度</span>
           </el-form-item>
           <el-form-item label="任务日志大小">
-            <el-input-number v-model="settings.cert_job_log_size_mb" :disabled="isReadOnly" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
+            <el-input-number v-model="settings.task_log_size_mb" :disabled="isReadOnly" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
             <span class="form-tip-inline">MB，任务与库更新日志轮转阈值</span>
           </el-form-item>
           <el-form-item label="审计日志大小">
@@ -520,12 +520,8 @@ watch(appLogAutoRefresh, (enabled) => {
   if (enabled) appLogTimer = setInterval(() => void fetchAppLogs(), 3000)
 })
 
-onUnmounted(() => {
-  disposed = true
-  stopAppLogTimer()
-  if (tlsProtocolFallbackTimer) clearTimeout(tlsProtocolFallbackTimer)
-  tlsProtocolFallbackTimer = null
-})
+// FE-6（第 73 轮）：onUnmounted 生命周期收尾移至 disposed/tlsProtocolFallbackTimer
+// 声明之后（见下方 TLS 段尾），消除「引用其后声明的 let」的脆弱形态。
 
 // 三分类合并(2026-09-19 用户裁定):备份分类收敛为 3 类,与集群同步节同构
 // ——全局配置并入「系统数据」、规则库并入「安全防护」。默认全选。
@@ -1109,7 +1105,7 @@ const confirmImport = async (): Promise<void> => {
 
 interface BasicSettingsConfig {
   log_level: string
-  cert_job_log_size_mb: number
+  task_log_size_mb: number
   audit_log_size_mb: number
   runtime_log_size_mb: number
   audit_retention_months: number
@@ -1284,6 +1280,15 @@ let tlsInspectSeq = 0
 let tlsProtocolFallbackTimer: ReturnType<typeof setTimeout> | null = null
 let disposed = false
 
+// FE-6（第 73 轮）：组件卸载收尾引用上述 tls 态与 disposed，故置于声明之后
+// （原位于 appLogTimer watch 附近、引用其后声明的 let——当前安全但形态脆弱）。
+onUnmounted(() => {
+  disposed = true
+  stopAppLogTimer()
+  if (tlsProtocolFallbackTimer) clearTimeout(tlsProtocolFallbackTimer)
+  tlsProtocolFallbackTimer = null
+})
+
 const onTlsFile = async (e: Event, kind: 'cert' | 'key') => {
   const input = e.target as HTMLInputElement
   const file = input.files?.[0]
@@ -1390,7 +1395,7 @@ const handleSave = async () => {
   try {
     const payload = {
       log_level: settings.value.log_level,
-      cert_job_log_size_mb: settings.value.cert_job_log_size_mb,
+      task_log_size_mb: settings.value.task_log_size_mb,
       audit_log_size_mb: settings.value.audit_log_size_mb,
       runtime_log_size_mb: settings.value.runtime_log_size_mb,
       audit_retention_months: settings.value.audit_retention_months,

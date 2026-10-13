@@ -268,7 +268,7 @@ export interface GlobalConfigData {
   proxy_flush_interval: number
   proxy_stream_close_delay: number
   server_tokens_hidden: boolean
-  cert_job_log_size_mb: number
+  task_log_size_mb: number
   audit_log_size_mb: number
   runtime_log_size_mb: number
   access_log_json: boolean
@@ -278,9 +278,11 @@ export interface GlobalConfigData {
   timezone: string
   mfa_write_guard: boolean
   mfa_lockout_enabled: boolean
-  // v2.3.x 受信代理（CDN 真实 IP）：ranges/headers 为 JSON 数组文本（有序）。
+  // v2.3.x 受信代理（CDN 真实 IP）：ranges/headers 为 JSON 数组文本（有序）；
+  // range_refs 为引用的 IP 地址列表 id（JSON 整数数组文本，与 ranges 合并生效）。
   trusted_proxy_enabled: boolean
   trusted_proxy_ranges: string
+  trusted_proxy_range_refs: string
   trusted_proxy_headers: string
   trusted_proxy_strict: boolean
   acme_email: string
