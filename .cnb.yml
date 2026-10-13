@@ -2332,10 +2332,10 @@ $:
                 echo "熔断判定=TRIPPED  理由=$REASON"
                 echo "分支=$BRANCH  PR=#$PR  台账=#${LEDGER:-未解析}  自愈轮次=$ROUNDS"
                 echo "---- 拟发升级载荷（BRIEF）----"
-                printf '%s\n\n@i.o/x(中书令)\n' "$BRIEF"
+                printf '%s\n\n@xzydm/lazy-balancer-v2(中书令)\n' "$BRIEF"
                 echo "---- 拟发目标 ----"
                 echo "a) api_trigger：cnb build start-build --event api_trigger --npc-name CodeBuddy --npc-workMode --env NPC_ROLE=中书令"
-                echo "b) 回落评论：$([ -n "$LEDGER" ] && echo "台账 #$LEDGER" || echo "PR #${PR:-未解析}") + @i.o/x(中书令)"
+                echo "b) 回落评论：$([ -n "$LEDGER" ] && echo "台账 #$LEDGER" || echo "PR #${PR:-未解析}") + @xzydm/lazy-balancer-v2(中书令)"
               } > /workspace/qg-熔断-升级-dryrun.log 2>&1
               echo "🧪 升级出口已隔离（不发评论/不派单）；拟发载荷落 /workspace/qg-熔断-升级-dryrun.log："
               cat /workspace/qg-熔断-升级-dryrun.log
@@ -2444,7 +2444,7 @@ $:
                 fi
                 printf '%s' "$LT" | grep -qE '^[0-9]+$' || LT=0
                 if [ "$LT" -lt 90 ]; then
-                  printf '%s\n\n@i.o/x(中书令)\n' "$BRIEF" > /workspace/qg-熔断-升级评论.md
+                  printf '%s\n\n@xzydm/lazy-balancer-v2(中书令)\n' "$BRIEF" > /workspace/qg-熔断-升级评论.md
                   if [ "$TARGET_KIND" = "ledger" ]; then
                     if cnb issues post-issue-comment --repo "$REPO" --number "$TARGET_NO" --body-file /workspace/qg-熔断-升级评论.md >/dev/null 2>&1; then
                       COMMENT_OK="yes"; COMMENT_TGT="台账 #$TARGET_NO"
