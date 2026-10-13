@@ -454,11 +454,76 @@
             echo "✅ 未命中 PR 终态 ⇒ 照常执行 npc go"
           fi
           exit 0
+      # ---- Issue 终态守卫（评论链 · AC-1~AC-4 · AC-8 · #TASK-ISSUEGUARD-20261014-01）----
+      #   为什么补这一段（根因 · 台账 #42 实测）：与 PR 侧同构——Issue 关闭（`state != open`）后，
+      #   `issue.comment@npc` 事件**仍在**触发 ⇒ 已关闭 Issue 上的评论照样拉起 NPC 构建（自激式积压）。
+      #   台账 #42 实测：当日 `issue.comment@npc` 12 条 vs `pull_request.comment@npc` 9 条（Issue 侧已是同等量级）；
+      #   实证台账 #35（18:44:23Z closed）/#29（18:53:39Z closed）在关闭前后均持续被评论拉起，其中
+      #   `sn=cnb-ph3-1k4r7sss5`（Issue #35，已 closed）`npc go` 长期 pending。
+      #   旧「PR 终态守卫」以 `CNB_PULL_REQUEST_IID` 为锚 ⇒ Issue 事件该变量为空 ⇒ 落
+      #   「非 PR 事件 ⇒ 无需判定」fail-open 分支 ⇒ **结构性不覆盖 Issue 侧**（本 stage 即补该缺口）。
+      #   判据（二进制 · fail-open 方向 · 与 PR 守卫**同构**）：
+      #     · `CNB_ISSUE_IID` 非空 ∧ `CNB_ISSUE_STATE == closed` ⇒ 写哨兵 `/workspace/qg-issue终态.txt`、跳过 npc go；
+      #     · `CNB_ISSUE_STATE == open` ⇒ 照常执行；
+      #     · 无 IID（非 Issue 事件）/ state 空 / 落闭集外 ⇒ **照常执行 ＋ 显式告警**（禁静默停摆）。
+      #   取值域（T0 · 官方 `docs.cnb.cool/zh/build/build-in-env.html` 实测抓取 · 闭集逐字）：
+      #     `CNB_ISSUE_STATE`：触发事件 `issue.*` ⇒ `open` / `closed`；其他事件 ⇒ **空字符串**。
+      #     `CNB_ISSUE_IS_RESOLVED`：`issue.*` ⇒ `true` / `false`（仅作日志旁证，非判据）。
+      #   研究先行（AC 要求 · 现场复验）：**零网络调用**——本 stage 只读平台注入的环境变量，
+      #     无 `cnb` CLI 调用、无 API 请求 ⇒ AC-8「零写调用、零跨仓/跨根依赖」由结构保证；
+      #     实测值逐次打进日志（`实测 CNB_ISSUE_IID=... CNB_ISSUE_STATE=...`）供 AC-7 现场核验。
+      #   为什么 fail-open（同 PR 守卫）：本守卫是**收敛积压**的护栏、非质量门；不可判定时若拦，
+      #     等于让「变量缺失/取值域变动」静默停掉整条评论链（比不拦更危险的误杀）。
+      #   放行面（防死锁 · 同前两守卫）：只覆盖**评论事件侧**；`$: api_trigger`（裁决与换方案落地）
+      #     不经本锚点 ⇒ 不被跳过。哨兵载体独立于 `qg-熔断.txt` / `qg-pr终态.txt` / `qg-裁决冻结.txt`，
+      #     各守卫互不读写、次序无关（`npc go` 的 if 取 OR）。
+      - name: Issue 终态守卫
+        script: |
+          set +e
+          echo "===== Issue 终态守卫（评论链 · #TASK-ISSUEGUARD-20261014-01）====="
+          ISS="no"; ISS_WHY=""
+          ISS_IID="${CNB_ISSUE_IID:-}"
+          ISS_ST="${CNB_ISSUE_STATE:-}"
+          # 实测值逐次入日志（AC-7 取证面；禁凭记忆假定变量存在/取值域）
+          echo "🔎 实测 CNB_ISSUE_IID='${ISS_IID}' CNB_ISSUE_STATE='${ISS_ST}' CNB_ISSUE_IS_RESOLVED='${CNB_ISSUE_IS_RESOLVED:-}'"
+          if [ -z "$ISS_IID" ]; then
+            ISS_WHY="非 Issue 事件（CNB_ISSUE_IID 缺失）⇒ 无需判定，照常执行 npc go"
+            echo "⚠️ Issue 终态守卫：$ISS_WHY"
+          else
+            case "$ISS_ST" in
+              open)
+                ISS_WHY="Issue #$ISS_IID state=open ⇒ 照常执行 npc go"
+                echo "✅ Issue 终态守卫：$ISS_WHY"
+                ;;
+              closed)
+                ISS="yes"; ISS_WHY="Issue #$ISS_IID state=closed（非 open）⇒ 跳过 npc go"
+                echo "🛑 Issue 终态守卫：$ISS_WHY"
+                ;;
+              *)
+                ISS_WHY="Issue #$ISS_IID state 取数失败 / 空 / 落闭集外（实测值='${ISS_ST}'）⇒ 不可判定，照常执行（fail-open）"
+                echo "⚠️ Issue 终态守卫：$ISS_WHY"
+                ;;
+            esac
+          fi
+          echo "Issue 终态守卫判定=$ISS  理由=$ISS_WHY"
+          if [ "$ISS" = "yes" ]; then
+            {
+              echo "===== Issue 终态守卫（评论链）：命中 ⇒ 跳过 npc go，不再产出新回奏 ====="
+              echo "理由=$ISS_WHY"
+              echo "载体=/workspace/qg-issue终态.txt（与 npc go 的 if 守卫同载体）"
+              echo "放行面=api_trigger（裁决 / 换方案落地通道不经本锚点）"
+              echo "fail-open 面=无 IID / state 空 / 落闭集外（一律放行 + 告警，禁静默停摆）"
+            } > /workspace/qg-issue终态.txt
+            echo "🛑 已写 /workspace/qg-issue终态.txt ⇒ 本 build 评论链 npc go 被 if 守卫跳过"
+          else
+            echo "✅ 未命中 Issue 终态 ⇒ 照常执行 npc go"
+          fi
+          exit 0
       - name: npc go
         # 熔断守卫：上一 stage 判定熔断（写 /workspace/qg-熔断.txt）时**整段跳过** ⇒ 评论链不再产出修复 commit。
         # ★ 口径更正（门下 P1-1 · #TASK-MERGEDPR-GUARD-20261013-01 · 据实）：本行原称「与 `failStages`→
         #   「工部尚书自愈」stage 的 `if` **逐字同形**（矩阵 C-LATCH-③ 断言同源）」——**该句在本单后已不成立**：
-        #   自愈 stage 的 `if` 仍是**两哨兵**（`qg-熔断.txt` + `qg-裁决冻结.txt`），评论链现为**三哨兵**。
+        #   自愈 stage 的 `if` 仍是**两哨兵**（`qg-熔断.txt` + `qg-裁决冻结.txt`），评论链现为**四哨兵**。
         #   自愈侧**不**并 `qg-pr终态.txt` 是**有意为之**，非漏改：
         #     ① 语义：`qg-pr终态.txt` 只表达「评论事件的对象（PR）已终态」——这是**评论事件侧**的事实；
         #        `failStages` 自愈环由 **push/pull_request 事件**驱动（把新 commit 推上去触发新 CI），
@@ -470,9 +535,11 @@
         #     【待办发现清单】）。本仓单方不改判据、不假称仍同源。
         # PR 终态守卫（#TASK-MERGEDPR-GUARD-20261013-01）：上一 stage 判定本 PR 非 open（closed/merged，
         # 写 /workspace/qg-pr终态.txt）时**整段跳过** ⇒ 已合并/已关闭 PR 上不再产出新回奏（断自激链）。
-        # 三哨兵并列取 OR（任一在位即跳过）；两守卫 stage 均恒 exit 0、互不读写，次序无关。
+        # Issue 终态守卫（#TASK-ISSUEGUARD-20261014-01）：上一 stage 判定本 Issue 非 open（closed，
+        # 写 /workspace/qg-issue终态.txt）时**整段跳过** ⇒ 已关闭 Issue 上不再产出新回奏（断自激链）。
+        # 四哨兵并列取 OR（任一在位即跳过）；三个守卫 stage 均恒 exit 0、互不读写，次序无关。
         if: |
-          [ ! -f /workspace/qg-熔断.txt ] && [ ! -f /workspace/qg-裁决冻结.txt ] && [ ! -f /workspace/qg-pr终态.txt ]
+          [ ! -f /workspace/qg-熔断.txt ] && [ ! -f /workspace/qg-裁决冻结.txt ] && [ ! -f /workspace/qg-pr终态.txt ] && [ ! -f /workspace/qg-issue终态.txt ]
         type: npc:go                         # 平台内置 NPC 任务：读取角色 prompt + Issue/PR 上下文 → 执行 → 回评
         options:
           <<: *budget   # ← 机械级预算硬顶（#TASK-ORCH-BUDGET-20260911-01；口径见 AGENTS.md §6.6）
