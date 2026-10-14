@@ -104,6 +104,36 @@ func TestSecurityEventsParseTransaction_durationFromTimingHeader(t *testing.T) {
 	}
 }
 
+// 历史：logged 事件（is_interrupted=false）走分段锚点形态——:end 即 WAF 段值
+// 直接取用（钉 IsInterrupted 贯通调用链：动作错传会回落 end-pre 减法出负值/垃圾差）。
+func TestSecurityEventsParseTransaction_loggedEventTakesSegmentEnd(t *testing.T) {
+	const auditJSON = `{"transaction":{"unix_timestamp":1790452183279764883,"id":"ABtibGJndZlGPDP1","client_ip":"::1","server_id":"test.example.com","request":{"method":"GET","uri":"/","headers":{"host":["test.example.com"],"x-lb-rule-id":["lb_test"],"x-lb-security-timing-id":["abc12345"]}},"is_interrupted":false},"messages":[{"message":"test","data":{"id":"942100","raw":""}}]}`
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "security-timing.log")
+	if err := os.WriteFile(path, []byte("abc12345:pre 10000\nabc12345:end 250\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	origPath := securityTimingLogPath
+	securityTimingLogPath = path
+	defer func() { securityTimingLogPath = origPath; securityTimingTickMap = nil }()
+	securityTimingLoad()
+
+	rec, err := securityEventsParseTransaction([]byte(auditJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.DurationUs != 250 {
+		t.Errorf("DurationUs = %d; want 250 (logged: :end = WAF 段值, no subtraction)", rec.DurationUs)
+	}
+	if rec.PrecheckUs != 10000 {
+		t.Errorf("PrecheckUs = %d; want 10000 (:pre)", rec.PrecheckUs)
+	}
+	if rec.Action != "logged" {
+		t.Errorf("Action = %q; want logged", rec.Action)
+	}
+}
+
 // Given: 审计条目无 timing 头(历史条目/Caddy 旧版本)
 // When: securityEventsParseTransaction
 // Then: DurationUs 保持 0(不报错)
@@ -128,10 +158,10 @@ func TestSecurityEventsStageDuration_precheckRuleTakesPre(t *testing.T) {
 		"tid1:end": 5000,
 	}
 	defer func() { securityTimingTickMap = nil }()
-	if v := securityEventsStageDuration("tid1", "2"); v != 100 {
+	if v := securityEventsStageDuration("tid1", "2", true); v != 100 {
 		t.Errorf("precheck rule duration = %d; want 100 (:pre)", v)
 	}
-	if v := securityEventsStageDuration("tid1", "942100"); v != 4900 {
+	if v := securityEventsStageDuration("tid1", "942100", true); v != 4900 {
 		t.Errorf("WAF rule duration = %d; want 4900 (:end-:pre)", v)
 	}
 }
@@ -140,7 +170,7 @@ func TestSecurityEventsStageDuration_precheckRuleTakesPre(t *testing.T) {
 func TestSecurityEventsStageDuration_precheckBlockFallback(t *testing.T) {
 	securityTimingTickMap = map[string]int64{"tid2:end": 350}
 	defer func() { securityTimingTickMap = nil }()
-	if v := securityEventsStageDuration("tid2", "2"); v != 350 {
+	if v := securityEventsStageDuration("tid2", "2", true); v != 350 {
 		t.Errorf("precheck block duration = %d; want 350 (:end fallback)", v)
 	}
 }
@@ -149,7 +179,45 @@ func TestSecurityEventsStageDuration_precheckBlockFallback(t *testing.T) {
 func TestSecurityEventsStageDuration_wafPreMissFallback(t *testing.T) {
 	securityTimingTickMap = map[string]int64{"tid3:end": 6475}
 	defer func() { securityTimingTickMap = nil }()
-	if v := securityEventsStageDuration("tid3", "942100"); v != 6475 {
+	if v := securityEventsStageDuration("tid3", "942100", true); v != 6475 {
 		t.Errorf("WAF pre-miss duration = %d; want 6475 (:end fallback)", v)
+	}
+}
+
+// 历史（预检拦耗时口径）读侧适配：分段锚点交接后 :end 值按事件动作二态——
+// 拦截事件（blocked_counter 写）:end=链首→中断全链，WAF 段=end-:pre；
+// logged 事件（timing_end 写，起始头已被重写为预检后锚点）:end 即 WAF 段值，
+// 直接取用不减 :pre（减法会混入跨锚点垃圾差值）。
+
+// Given: WAF 段拦截事件 + 全链 :end 与 :pre 并存
+// When: securityEventsStageDuration(interrupted=true)
+// Then: end-pre（WAF 段隔离，既有口径不变）
+func TestSecurityEventsStageDuration_wafBlockedSubtracts(t *testing.T) {
+	securityTimingTickMap = map[string]int64{"tidb:pre": 100, "tidb:end": 5000}
+	defer func() { securityTimingTickMap = nil }()
+	if v := securityEventsStageDuration("tidb", "942100", true); v != 4900 {
+		t.Errorf("WAF blocked duration = %d; want 4900 (:end-:pre)", v)
+	}
+}
+
+// Given: WAF 段 logged 事件（检测记录/放行）+ 分段锚点形态 :end=段值
+// When: securityEventsStageDuration(interrupted=false)
+// Then: 直接取 :end（250），不做 end-pre 减法
+func TestSecurityEventsStageDuration_wafLoggedTakesSegmentEnd(t *testing.T) {
+	securityTimingTickMap = map[string]int64{"tidl:pre": 10000, "tidl:end": 250}
+	defer func() { securityTimingTickMap = nil }()
+	if v := securityEventsStageDuration("tidl", "942100", false); v != 250 {
+		t.Errorf("WAF logged duration = %d; want 250 (:end segment value, no subtraction)", v)
+	}
+}
+
+// Given: 预检段拦截事件（:pre 已由拦截写点记录——历史起预检拦主形态）
+// When: securityEventsStageDuration(interrupted=true)
+// Then: 取 :pre
+func TestSecurityEventsStageDuration_precheckBlockTakesPre(t *testing.T) {
+	securityTimingTickMap = map[string]int64{"tidp:pre": 1180, "tidp:end": 1250}
+	defer func() { securityTimingTickMap = nil }()
+	if v := securityEventsStageDuration("tidp", "2", true); v != 1180 {
+		t.Errorf("precheck blocked duration = %d; want 1180 (:pre decision time)", v)
 	}
 }

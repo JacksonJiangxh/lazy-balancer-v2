@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -177,6 +176,8 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 				// 自动解封的唯一发射面。解析失败的 expires_at 保留条目（fail-open
 				// 不误删）；判断以 UTC 墙钟串（autobanTimeLayout 同形态），
 				// 时钟走 autobanNow 缝（与自动封禁同源，测试可注入时间轴）。
+				// AB-4（历史）：判据单源化 autobanEntryExpired——/status 计数
+				// 与渲染生效面共用同一谓词，永不漂移。
 				now := autobanNow()
 				vals := make([]string, 0, len(list))
 				for _, e := range list {
@@ -184,10 +185,8 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 					if v == "" {
 						continue
 					}
-					if e.ExpiresAt != "" {
-						if exp, perr := time.ParseInLocation(autobanTimeLayout, e.ExpiresAt, time.UTC); perr == nil && !exp.After(now) {
-							continue
-						}
+					if autobanEntryExpired(e, now) {
+						continue
 					}
 					vals = append(vals, v)
 				}

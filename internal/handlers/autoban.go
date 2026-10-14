@@ -2,7 +2,7 @@ package handlers
 
 // 自动封禁（历史问题）端面：配置读写（六项+校验；保存联动调度启停）、
 // 运行状态（状态卡数据源：运行态/今日封禁/名单条数/引用状态/观察建议）。
-// 预置名单的条目管理例外（删 400/条目可改/解封抑制）在 securityiplists.go。
+// 预置名单的条目管理例外（删 400/条目可改）在 securityiplists.go。
 // 「立即执行」端点已废除（2026-10-14 裁定：调度唯一前提=业务启用）。
 
 import (
@@ -84,6 +84,9 @@ func autobanScopeText(scope string) string {
 // 可读）。running/last_run 取任务引擎实态；list_referenced=启用中的安全策略
 // （ip_acl_list_refs ∪ ip_whitelist_refs，JSON 精确解析）是否引用预置名单——
 // 未引用时前端黄条提示「名单未生效」；suggestions=上一轮观察建议（dry-run）。
+// is_master/role=调度面节点角色（F75C-2，历史：从端卡片按角色门控写按钮，
+// 引擎未装配时保守判从）；list_entries 与渲染生效面同口径（AB-4：剔除已到期
+// 未清理条目）。
 func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 	cfg := services.GetAutobanConfig()
 	entries, _, err := services.AutobanListEntries()
@@ -91,6 +94,7 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取自动封禁名单失败: " + err.Error()})
 		return
 	}
+	isMaster := services.AutobanIsMaster()
 	resp := gin.H{
 		"enabled":         cfg.Enabled,
 		"dry_run":         cfg.DryRun,
@@ -99,10 +103,12 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 		"duration":        cfg.Duration,
 		"scope":           cfg.Scope,
 		"banned_today":    services.AutobanBannedToday(),
-		"list_entries":    len(entries),
+		"list_entries":    len(services.AutobanActiveEntries(entries)),
 		"list_referenced": h.autobanListReferenced(),
 		"tracked_ips":     services.AutobanTrackedIPs(),
 		"suggestions":     services.AutobanSuggestions(),
+		"is_master":       isMaster,
+		"role":            map[bool]string{true: "master", false: "slave"}[isMaster],
 		"running":         false,
 		"last_run":        "",
 		"last_status":     "",

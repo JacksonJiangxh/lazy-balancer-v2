@@ -56,6 +56,10 @@ var auditVocabDynamicAllowlist = map[string]map[int][]string{
 	"handlers/handlers.go":            {1: {"finishTxApply"}, 2: {"finishTxApply"}},
 	"services/certificates.go":        {1: {"renewExpiringCertificates"}},
 	"services/downloadintegrity.go":   {2: {"recordDownloadIntegrity"}},
+	// RunAutobanCycle 的动作传 AutobanAuditAction 包级常量（字面值「自动封禁」
+	// 单源——merge 审计写点与 AutobanBannedToday 的 audit_log 计数共用同一
+	// 常量，两处字面量漂移会让今日封禁恒 0；2026-10-15 核清入白名单）。
+	"services/autoban.go": {1: {"RunAutobanCycle"}},
 }
 
 // auditVocabCallSpecs 给出各审计写入口的 动作/对象 参数下标。

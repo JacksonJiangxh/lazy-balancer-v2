@@ -24,9 +24,11 @@ var securityTimingLogPath = "/app/logs/waf-audit/security-timing.log"
 // reverse_proxy 前删除(caddy.go 渲染层),不上泄上游。
 const securityTimingHeader = "X-Lb-Security-Timing-Id"
 
-// securityTimingStartHeader 是起始纳秒时间戳头——blocked_counter 注入,
-// SecurityTimingEnd 在安全链末尾读取计算 passed 事件的纯评估耗时(不含
-// reverse_proxy 上游往返)。与 timing ID 头同清单剥离。
+// securityTimingStartHeader 是起始纳秒时间戳头——blocked_counter 注入(注入原值
+// 兼作「链未过预检收点」判定基准:拦截检出时头仍=原值即预检段拦);SecurityTimingPre
+// 记 :pre 后把它重写为预检完成锚点,SecurityTimingEnd 读锚点计算 logged 事件的
+// WAF 段耗时(拦截事件的耗时由 blocked_counter 写,不经此头)。与 timing ID 头
+// 同清单剥离。
 const securityTimingStartHeader = "X-Lb-Security-Timing-Start-Ns"
 
 // securityTimingStateMu/securityTimingCh 等是耗时侧车的写管线状态——PLUG-N1
@@ -129,8 +131,11 @@ func AppendSecurityTiming(id string, durationUs int64) {
 
 // recordSecurityTiming 读耗时关联头对（timing ID + 起始纳秒）并记录一段耗时——
 // PLUG-R1（历史 历史问题）：SecurityTimingPre/End 两 ServeHTTP 原逐字重复，收敛为
-// 本 helper，suffix 区分收点（":pre" 预检段 / ":end" 全链）。头对缺失或起始
-// 时间戳不可解析时静默跳过（耗时是增强信息，不产生请求路径错误）。
+// 本 helper，suffix 区分收点。分段键语义（历史）：:pre=预检段（放行由
+// timing_pre 记；预检拦由 blocked_counter 代记，决策口径）；:end 二态——拦截
+// 事件=链首→中断全链（blocked_counter），logged 事件=预检完成后→链末（timing_end
+// 读重写后的分段锚点）。头对缺失或起始时间戳不可解析时静默跳过（耗时是增强
+// 信息，不产生请求路径错误）。
 func recordSecurityTiming(r *http.Request, suffix string) {
 	timingID := r.Header.Get(securityTimingHeader)
 	startNsStr := r.Header.Get(securityTimingStartHeader)

@@ -27,9 +27,15 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
+// caddyInternalKeyPrefix 渲染层内部标记键统一前缀：caddyPayload 按前缀整体
+// 剔除（RC-1，历史）——内部键一律不得进 Caddy 载荷（真 Caddy
+// StrictUnmarshalJSON 拒未知顶层字段返 400，内部键漏网会让降级配置被硬拒，
+// D3 可用性优先被反转）。新增内部键必须复用本前缀。
+const caddyInternalKeyPrefix = "__lazy_balancer_"
+
 const (
-	caddyConfigGenerationErrorKey = "__lazy_balancer_generation_error"
-	caddyCertFilesSnapshotKey     = "__lazy_balancer_cert_files_snapshot"
+	caddyConfigGenerationErrorKey = caddyInternalKeyPrefix + "generation_error"
+	caddyCertFilesSnapshotKey     = caddyInternalKeyPrefix + "cert_files_snapshot"
 )
 
 // ErrNoEnabledUpstreams 规则（或路径规则）没有启用上游时生成的哨兵错误。
@@ -220,7 +226,7 @@ var errSameConfig = errors.New("config byte-identical to running config")
 // 解析失败按安全侧兜底渲染（可用性优先，不 fail-visible——一份带外脏行不得
 // 阻断整份配置生成），但「渲染产物与 UI 宣称分叉」的事实随配置图携带，apply
 // 成功后落审计行+caddy_apply_error 横幅，面板可见。
-const caddyConfigDegradationKey = "__lazy_balancer_generation_degradation"
+const caddyConfigDegradationKey = caddyInternalKeyPrefix + "generation_degradation"
 
 // lastRenderDegradation 记录最近一次成功应用的配置携带的降级说明（空=无降级）。
 // recordCaddyApplyResult 的成功清除先查本值——降级不是应用失败，横幅不得被
@@ -537,8 +543,11 @@ const caddyErrorBodyMaxBytes = 1024
 // ValidateConfig validates Caddy configuration using the /load API with validate=true
 func (s *CaddyService) ValidateConfig(config map[string]interface{}) (err error) {
 	// 历史问题：validate=true 实为真实加载（Caddy 以校验模式执行完整的 provision/
-	// 加载路径，coraza 等插件照常编译并持有资源），与 apply 同为写操作——必须
-	// 持写锁串行化，避免与并发 apply/证书快照恢复竞态。
+	// 加载路径，coraza 等插件照常编译并持有资源），与 apply 同为写操作——
+	// 跨层串行化契约：**调用方须持 CaddyOpLock** 进入（本函数仅持 s.mu 保护
+	// CaddyService 内部状态；与并发 apply/证书快照恢复的互斥由调用方的
+	// CaddyOpLock 临界区承担——RC-3，历史：原注释「必须持写锁串行化」
+	// 误读为本函数自取跨层写锁）。
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if message, ok := config[caddyConfigGenerationErrorKey].(string); ok {
@@ -572,9 +581,13 @@ func (s *CaddyService) ValidateConfig(config map[string]interface{}) (err error)
 func caddyPayload(config map[string]interface{}) map[string]interface{} {
 	payload := make(map[string]interface{}, len(config))
 	for key, value := range config {
-		if key != caddyCertFilesSnapshotKey {
-			payload[key] = value
+		// RC-1（历史）：按 __lazy_balancer_ 前缀整体剔除内部键
+		//（generation_error/cert_files_snapshot/degradation 及未来新增），
+		// 不再逐键枚举——漏一枚即被真 Caddy 严格解码 400 硬拒。
+		if strings.HasPrefix(key, caddyInternalKeyPrefix) {
+			continue
 		}
+		payload[key] = value
 	}
 	return payload
 }

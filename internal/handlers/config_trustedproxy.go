@@ -29,23 +29,34 @@ var trustedProxyHeaderPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
 // 防御单一名单（≤2000 条写侧门，2026-10-14 裁定 500→2000）×多引用的组合膨胀。
 const trustedProxyMaxTotalCIDRs = 2000
 
-// validateTrustedProxyFields 保存侧入口（UpdateConfig/PreviewConfigUpdate）：
-// 名单解析仅走库内（overlay=nil）。
-func validateTrustedProxyFields(req *models.UpdateConfigRequest) error {
-	return validateTrustedProxyFieldsWithSource(req, nil)
-}
-
-// trustedProxyListSource 名单解析源（id → 名单行）。nil=仅库内解析（保存
-// 通道）。导入通道（D3，历史）传备份 security_ip_lists 行——引用
-// 名单随备份全量替换，refs 存在性/条目校验/总量上限须按「备份内优先 ∪
-// 库内存量」解析：跨节点还原（备份名单 id 不在本地库）不得误拒；备份携带
-// 同 id 行时以其为准（导入后备份行覆盖同 id 库行）。
+// trustedProxyListSource 名单解析源行（id → 名单行）。
 type trustedProxyListSource struct {
 	name    string
 	entries string
 }
 
-func validateTrustedProxyFieldsWithSource(req *models.UpdateConfigRequest, source map[int64]trustedProxyListSource) error {
+// trustedProxyBackupSource 导入通道的名单解析源（RC-2/F75C-3，历史）。
+// 按「备份是否携带 security_ip_lists 表」分流：
+//   - carried=true：名单表随备份**全量替换**（W2 先例——备份行才是导入后的
+//     真实数据），refs 存在性仅按备份行集合解析；指向库内但不在备份内的 id
+//     导入后必然悬空，校验期 400 拒绝（旧「备份内优先 ∪ 库内」口径会借库内
+//     命中放行为导入后悬空引用）。
+//   - carried=false：备份未携带名单表——导入后名单表保持本地现状（「缺席=
+//     保留本地」语义），refs 存在性按库内解析（与保存通道同口径）。
+//
+// 零值=仅库内解析（保存通道）。
+type trustedProxyBackupSource struct {
+	lists   map[int64]trustedProxyListSource
+	carried bool
+}
+
+// validateTrustedProxyFields 保存侧入口（UpdateConfig/PreviewConfigUpdate）：
+// 名单解析仅走库内（零值 source）。
+func validateTrustedProxyFields(req *models.UpdateConfigRequest) error {
+	return validateTrustedProxyFieldsWithSource(req, trustedProxyBackupSource{})
+}
+
+func validateTrustedProxyFieldsWithSource(req *models.UpdateConfigRequest, source trustedProxyBackupSource) error {
 	if req.TrustedProxyRanges != nil {
 		normalized, err := normalizeTrustedProxyRanges(*req.TrustedProxyRanges)
 		if err != nil {
@@ -156,13 +167,55 @@ func chunkIDs(ids []int64, chunkSize int) []idChunk {
 // trustedProxyInlineCount 存量畸形口径一致：总量门不因存量问题拒绝合法的
 // 内联载荷（存量引用的悬空由名单删除守卫与渲染层各自兜底）。
 func trustedProxyStoredRefEntries() (int, error) {
-	return trustedProxyStoredRefEntriesWithSource(nil)
+	return trustedProxyStoredRefEntriesWithSource(trustedProxyBackupSource{})
+}
+
+// resolveTrustedProxyRefLists 解析 refs 引用的名单行（RC-2 分流的单点）：
+// 备份行命中直取；未命中且备份未携带名单表（carried=false）时分片查库。
+// carried=true 不回落库内——名单表随备份全量替换，库内命中不代表导入后存在。
+func resolveTrustedProxyRefLists(ids []int64, source trustedProxyBackupSource) (map[int64]trustedProxyListSource, error) {
+	resolved := make(map[int64]trustedProxyListSource, len(ids))
+	var missing []int64
+	for _, id := range ids {
+		if row, ok := source.lists[id]; ok {
+			resolved[id] = row
+		} else if !source.carried {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) == 0 {
+		return resolved, nil
+	}
+	for _, ch := range chunkIDs(missing, 500) {
+		rows, err := db.DB.Query(`SELECT id, COALESCE(entries,'[]'), COALESCE(name,'') FROM security_ip_lists WHERE id IN (`+ch.placeholders+`)`, ch.args...)
+		if err != nil {
+			return nil, fmt.Errorf("校验受信代理引用列表失败: %v", err)
+		}
+		for rows.Next() {
+			var id int64
+			var entriesJSON, name string
+			if err := rows.Scan(&id, &entriesJSON, &name); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("校验受信代理引用列表失败: %v", err)
+			}
+			resolved[id] = trustedProxyListSource{name: name, entries: entriesJSON}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("校验受信代理引用列表失败: %v", err)
+		}
+		rows.Close()
+	}
+	return resolved, nil
 }
 
 // trustedProxyStoredRefEntriesWithSource 库中存量 trusted_proxy_range_refs 的
-// 引用展开条目总数；source 非空时（导入通道）引用名单按「备份内优先 ∪ 库内」
-// 解析。存量 refs JSON 畸形/引用悬空/条目不可解析（仅见于带外改库）按 0 计。
-func trustedProxyStoredRefEntriesWithSource(source map[int64]trustedProxyListSource) (int, error) {
+// 引用展开条目总数（总量门的引用面计数——不做存在性门）。source.carried=true
+// （导入通道携表）时未命中备份行的存量 ref 不参与计数（导入后该名单不复存在，
+// 展开面归零）；载荷未携带 refs 键而备份携带名单表的残留悬空形态（仅手造备份
+// 可达——真实导出恒携带全列）不在本门范围内，由渲染层 fail-closed 与名单删除
+// 守卫兜底。存量 refs JSON 畸形/条目不可解析（仅见于带外改库）按 0 计。
+func trustedProxyStoredRefEntriesWithSource(source trustedProxyBackupSource) (int, error) {
 	var raw string
 	if err := db.DB.QueryRow(`SELECT COALESCE(trusted_proxy_range_refs,'[]') FROM global_config WHERE id=1`).Scan(&raw); err != nil {
 		return 0, fmt.Errorf("读取当前受信代理引用列表失败: %v", err)
@@ -171,36 +224,9 @@ func trustedProxyStoredRefEntriesWithSource(source map[int64]trustedProxyListSou
 	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &ids); err != nil || len(ids) == 0 {
 		return 0, nil
 	}
-	// 与 normalizeTrustedProxyRangeRefsWithSource 同构：备份行命中直取，
-	// 未命中分片查库。
-	resolved := make(map[int64]trustedProxyListSource, len(ids))
-	var missing []int64
-	for _, id := range ids {
-		if row, ok := source[id]; ok {
-			resolved[id] = row
-		} else {
-			missing = append(missing, id)
-		}
-	}
-	for _, ch := range chunkIDs(missing, 500) {
-		rows, err := db.DB.Query(`SELECT id, COALESCE(entries,'[]') FROM security_ip_lists WHERE id IN (`+ch.placeholders+`)`, ch.args...)
-		if err != nil {
-			return 0, fmt.Errorf("读取受信代理引用名单失败: %v", err)
-		}
-		for rows.Next() {
-			var id int64
-			var entriesJSON string
-			if err := rows.Scan(&id, &entriesJSON); err != nil {
-				rows.Close()
-				return 0, fmt.Errorf("读取受信代理引用名单失败: %v", err)
-			}
-			resolved[id] = trustedProxyListSource{entries: entriesJSON}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return 0, fmt.Errorf("读取受信代理引用名单失败: %v", err)
-		}
-		rows.Close()
+	resolved, err := resolveTrustedProxyRefLists(ids, source)
+	if err != nil {
+		return 0, err
 	}
 	total := 0
 	for _, row := range resolved {
@@ -214,16 +240,17 @@ func trustedProxyStoredRefEntriesWithSource(source map[int64]trustedProxyListSou
 
 // normalizeTrustedProxyRangeRefs 保存通道入口（仅库内解析）。
 func normalizeTrustedProxyRangeRefs(raw string) (string, int, error) {
-	return normalizeTrustedProxyRangeRefsWithSource(raw, nil)
+	return normalizeTrustedProxyRangeRefsWithSource(raw, trustedProxyBackupSource{})
 }
 
 // normalizeTrustedProxyRangeRefsWithSource 校验并归一引用载荷：空白归一 "[]"；
 // 非空须为整数数组 JSON（字符串/对象条目拒绝）；逐 id 校验存在性与条目格式
 // （复用 validIPOrCIDR——带 zone 形态与名单写侧同口径拒绝）；去重保序。
-// source 非空时（导入通道）名单按「备份内优先 ∪ 库内存量」解析——引用名单
-// 随备份全量替换，跨节点还原（名单 id 仅在备份内）不得误拒。
+// source 按备份是否携带名单表分流（trustedProxyBackupSource）：carried=true
+// 时存在性仅按备份行集合解析（RC-2——全量替换后库内行不复存在，悬空 400）；
+// carried=false 时未命中备份行的 id 按库内存量解析（保存通道同口径）。
 // 返回归一 JSON 与引用名单条目总数（总量门的判定面）。
-func normalizeTrustedProxyRangeRefsWithSource(raw string, source map[int64]trustedProxyListSource) (string, int, error) {
+func normalizeTrustedProxyRangeRefsWithSource(raw string, source trustedProxyBackupSource) (string, int, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return "[]", 0, nil
@@ -247,36 +274,12 @@ func normalizeTrustedProxyRangeRefsWithSource(raw string, source map[int64]trust
 	if len(unique) == 0 {
 		return "[]", 0, nil
 	}
-	// source（备份行）命中直取；未命中的 id 分片查库（chunkIDs 保留 SQLite
-	// 变量数上限的批量口径——手造备份可携带任意长的 refs 数组）。
-	resolved := make(map[int64]trustedProxyListSource, len(unique))
-	var missing []int64
-	for _, id := range unique {
-		if row, ok := source[id]; ok {
-			resolved[id] = row
-		} else {
-			missing = append(missing, id)
-		}
-	}
-	for _, ch := range chunkIDs(missing, 500) {
-		rows, err := db.DB.Query(`SELECT id, COALESCE(entries,'[]'), COALESCE(name,'') FROM security_ip_lists WHERE id IN (`+ch.placeholders+`)`, ch.args...)
-		if err != nil {
-			return "", 0, fmt.Errorf("校验受信代理引用列表失败: %v", err)
-		}
-		for rows.Next() {
-			var id int64
-			var entriesJSON, name string
-			if err := rows.Scan(&id, &entriesJSON, &name); err != nil {
-				rows.Close()
-				return "", 0, fmt.Errorf("校验受信代理引用列表失败: %v", err)
-			}
-			resolved[id] = trustedProxyListSource{name: name, entries: entriesJSON}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return "", 0, fmt.Errorf("校验受信代理引用列表失败: %v", err)
-		}
-		rows.Close()
+	// RC-2 分流单点：备份行命中直取；未命中仅当备份未携名单表才回落库内
+	// （resolveTrustedProxyRefLists——chunkIDs 保留 SQLite 变量数上限的批量
+	// 口径，手造备份可携带任意长的 refs 数组）。
+	resolved, err := resolveTrustedProxyRefLists(unique, source)
+	if err != nil {
+		return "", 0, err
 	}
 	total := 0
 	for _, id := range unique {

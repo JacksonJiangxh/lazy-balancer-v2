@@ -308,7 +308,7 @@
       <el-form :model="ipListForm" label-width="80px" label-position="right" :disabled="ipListDialogReadOnly" v-loading="loadingIpListDetail">
         <!-- 历史问题：自动封禁预置名单名称/分类/描述为内置字段（后端 400 守卫同口径），
              前端直接禁用灰态——禁止修改的字段不可输入，而非提交后报 400 -->
-        <div v-if="editingIpListPreset" class="form-tip-line">内置名单字段不可修改，仅条目可编辑（手动封禁 / 解封）</div>
+        <div v-if="editingIpListPreset" class="form-tip-line">内置名单字段不可修改，仅条目可编辑（手动封禁 / 删除条目）</div>
         <el-form-item label="名称" required>
           <el-input v-model="ipListForm.name" placeholder="列表名称" maxlength="50" show-word-limit :disabled="editingIpListPreset" />
         </el-form-item>
@@ -325,43 +325,35 @@
           <div class="entries-block">
             <el-table :data="ipListEntriesPaged" size="small" max-height="360" empty-text="">
               <template #empty><el-empty description="暂无条目，点击下方按钮添加" :image-size="50" /></template>
-              <el-table-column label="#" width="70" align="right">
+              <el-table-column label="#" width="50" align="right">
                 <template #default="{ $index }"><span class="ip-entry-index">{{ ipListEntryPageStart + $index + 1 }}</span></template>
               </el-table-column>
-              <el-table-column label="IP / CIDR" min-width="260">
+              <el-table-column label="IP / CIDR" min-width="230">
                 <template #default="{ row }">
                   <span v-if="ipListDialogReadOnly" class="ip-entry-text">{{ row.value }}</span>
                   <el-input v-else v-model="row.value" placeholder="如 192.168.1.0/24" size="small" :class="{ 'ip-entry-invalid': !isValidCidr(row.value) }" />
                 </template>
               </el-table-column>
-              <el-table-column label="备注" min-width="160">
+              <el-table-column label="备注" min-width="140">
                 <template #default="{ row }">
                   <span v-if="ipListDialogReadOnly" class="ip-entry-text">{{ row.remark }}</span>
                   <el-input v-else v-model="row.remark" placeholder="可选备注" size="small" maxlength="100" />
                 </template>
               </el-table-column>
-              <!-- 历史问题：自动封禁名单条目展示加入时间/到期/剩余 + 逐行解封 -->
+              <!-- 历史问题：自动封禁名单条目展示加入时间/剩余（到期时间由剩余列表达；删除条目即解封） -->
               <template v-if="editingIpListPreset">
-                <el-table-column label="加入时间" width="150" align="center">
+                <el-table-column label="加入时间" width="140" align="center">
                   <template #default="{ row }">{{ formatDate(row.created_at) || '—' }}</template>
                 </el-table-column>
-                <el-table-column label="到期时间" width="150" align="center">
-                  <template #default="{ row }">{{ row.expires_at ? formatDate(row.expires_at) : '永久' }}</template>
-                </el-table-column>
-                <el-table-column label="剩余" width="100" align="center">
+                <el-table-column label="剩余时长" width="90" align="center">
                   <template #default="{ row }">
                     <el-tag v-if="!row.expires_at" size="small" effect="plain" type="info">永久</el-tag>
                     <el-tag v-else-if="autobanEntryExpired(row.expires_at)" size="small" effect="plain" type="info">已到期</el-tag>
                     <span v-else class="text-secondary">{{ autobanEntryRemaining(row.expires_at) }}</span>
                   </template>
                 </el-table-column>
-                <el-table-column label="" width="70" align="center">
-                  <template #default="{ row }">
-                    <el-button size="small" link type="warning" :disabled="isReadOnly || unbanningIp === row.value" @click="unbanAutobanEntry(row.value)">解封</el-button>
-                  </template>
-                </el-table-column>
               </template>
-              <el-table-column v-if="!ipListDialogReadOnly" label="" width="80" align="center">
+              <el-table-column v-if="!ipListDialogReadOnly" label="" width="60" align="center">
                 <template #default="{ $index }">
                   <el-button link type="danger" size="small" @click="removeIpListEntry(ipListEntryPageStart + $index)">删除</el-button>
                 </template>
@@ -838,8 +830,8 @@ const { pagedItems: ipListsPaged } = useClampedPagination(ipListsFiltered, ipLis
 watch(ipListSearch, () => { ipListPage.value = 1 })
 const ipListDialogVisible = ref(false)
 // 内置名单（威胁情报库 system=1）弹框恒只读（管理员同）——内容只读查看/导出。
-// 历史问题 例外：自动封禁预置名单条目可改（手动封禁/解封），弹框编辑形态+
-// 到期列+解封动作。
+// 历史问题 例外：自动封禁预置名单条目可改（手动封禁/删除条目——删除即解封，
+// 2026-10-15 用户裁定：无抑制窗口，IP 重新达标会被再次封禁）。
 const editingIpListPreset = ref(false)
 const ipListDialogReadOnly = computed(() => isReadOnly.value || (editingIpListSystem.value && !editingIpListPreset.value))
 const editingIpListId = ref<number | null>(null)
@@ -875,7 +867,7 @@ const removeIpListEntry = (index: number): void => {
   if (ipListEntryPage.value > maxPage) ipListEntryPage.value = maxPage
 }
 
-// —— 历史问题：自动封禁名单弹框的到期展示与解封动作 ——
+// —— 历史问题：自动封禁名单弹框的到期展示 ——
 
 // 到期判定/剩余时长以浏览器本地解析（parseDbTimeMs 已做 UTC +Z 规范化）与
 // Date.now 对比——展示层近似（分钟粒度），封禁真值以后端投影过滤为准。
@@ -891,30 +883,6 @@ const autobanEntryRemaining = (expiresAt: string): string => {
   const hours = Math.floor(minutes / 60)
   if (hours < 24) return `${hours} 小时 ${minutes % 60} 分`
   return `${Math.floor(hours / 24)} 天 ${hours % 24} 时`
-}
-
-const unbanningIp = ref<string | null>(null)
-// 解封=移除该条目（POST remove-ip：后端同事务写 30 天抑制，期内不再自动封禁）
-// → 刷新弹框条目与列表行（entry_count）。
-const unbanAutobanEntry = async (ip: string): Promise<void> => {
-  if (editingIpListId.value === null || unbanningIp.value !== null) return
-  unbanningIp.value = ip
-  try {
-    await request.post(`/security/ip-lists/${editingIpListId.value}/remove-ip`, { value: ip })
-    ElMessage.success(`已解封 ${ip}（30 天内不再自动封禁）`)
-    const requestSeq = ++ipListDetailSeq
-    try {
-      const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${editingIpListId.value}`)
-      if (requestSeq === ipListDetailSeq && res.data && ipListDialogVisible.value) {
-        ipListForm.value.entries = (res.data.entries || []).map((e) => ({ value: e.value, remark: e.remark, created_at: e.created_at, expires_at: e.expires_at }))
-      }
-    } catch { /* 条目刷新失败不打断主流程，列表刷新仍执行 */ }
-    fetchIpLists()
-  } catch {
-    // 错误已由全局拦截器 toast
-  } finally {
-    unbanningIp.value = null
-  }
 }
 
 // F历史问题：乱序响应守卫（镜像同文件 openRuleContent 的 ruleContentSeq 范式）——
