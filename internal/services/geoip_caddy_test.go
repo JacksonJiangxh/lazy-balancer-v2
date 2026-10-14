@@ -409,19 +409,19 @@ func seedGeoipPolicyBound(t *testing.T, database *sql.DB, ruleCaddyID, countries
 // TestGeoipLocOperator_forms：算子编译的形态覆盖——海外字面、纯省附加
 // (?:/.*)?、省/市精确联值、allow 取反、QuoteMeta 防注入。
 func TestGeoipLocOperator_forms(t *testing.T) {
-	deny := geoipLocOperator([]string{"福建省", "广东省/深圳市", "海外"}, false)
+	deny := geoipLocOperator([]string{"福建省", "广东省/深圳市", "海外"}, false, nil)
 	if !strings.Contains(deny, `福建省(?:/.*)?`) || !strings.Contains(deny, `广东省/深圳市`) || !strings.Contains(deny, `海外`) {
 		t.Fatalf("operator missing entry forms: %s", deny)
 	}
 	if !strings.HasPrefix(deny, "@rx ^(?:") || !strings.HasSuffix(deny, ")$") {
 		t.Fatalf("operator must be anchored full-value match: %s", deny)
 	}
-	allow := geoipLocOperator([]string{"广东省"}, true)
+	allow := geoipLocOperator([]string{"广东省"}, true, nil)
 	if allow != "!@rx ^(?:广东省(?:/.*)?)$" {
 		t.Fatalf("allow mode must negate the whole match: %s", allow)
 	}
 	// 集群同步/历史行可携带绕过校验的元字符——QuoteMeta 中和（ReDoS/越权匹配）
-	evil := geoipLocOperator([]string{`EVIL(.*)`}, false)
+	evil := geoipLocOperator([]string{`EVIL(.*)`}, false, nil)
 	if !strings.Contains(evil, `EVIL\(\.\*\)`) {
 		t.Fatalf("metacharacters must be quoted: %s", evil)
 	}
@@ -434,7 +434,7 @@ func TestGeoipLocOperator_forms(t *testing.T) {
 func TestGeoipLocOperator_regexEquivalence(t *testing.T) {
 	compile := func(t *testing.T, countries []string, allowMode bool) *regexp.Regexp {
 		t.Helper()
-		op := geoipLocOperator(countries, allowMode)
+		op := geoipLocOperator(countries, allowMode, nil)
 		re, err := regexp.Compile(strings.TrimPrefix(strings.TrimPrefix(op, "!"), "@rx "))
 		if err != nil {
 			t.Fatalf("compile %q: %v", op, err)

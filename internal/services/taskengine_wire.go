@@ -335,7 +335,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			}
 			return parseUTCSlot(earliestThreatNextUpdate())
 		},
-		EnabledFn: func() bool { return ThreatAutoUpdateEnabled() }, // 业务开关联动展示（关=已暂停）
+		EnabledFn: func() bool { return ThreatAutoUpdateEnabled() }, // 业务开关门（关=已停止——展示+调度面跳过，历史问题）
 		StatusFn: func() string {
 			if m := GetThreatUpdateManager(); m != nil && m.StatusSnapshot().Running {
 				return "running"
@@ -378,9 +378,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			//（coveredSlotStepPast 每 tick 重算永远领先 now 一步=零宽窗口停摆，已退役）。
 			return parseUTCSlot(versionTableNextUpdate("security_crs_version"))
 		},
-		EnabledFn: func() bool { // 业务开关联动展示（关=已暂停；DB 直读——manager 未初始化窗口也正确）
+		EnabledFn: func() bool { // 业务开关门（关=已停止——展示+调度面跳过，历史问题；DB 直读——manager 未初始化窗口也正确）
 			var en int
-			// TASK-2（历史）：读库失败 fail-closed（显示已暂停）——曾 err→true
+			// TASK-2（历史）：读库失败 fail-closed（显示已停止）——曾 err→true
 			// 把读错误报为启用（threat 侧 ThreatAutoUpdateEnabled 已是 fail-closed 口径）。
 			if err := db.DB.QueryRow("SELECT COALESCE(auto_update,1) FROM security_crs_version WHERE id=1").Scan(&en); err != nil {
 				return false
@@ -433,7 +433,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			}
 			return parseUTCSlot(versionTableNextUpdate("security_ip2region_version"))
 		},
-		EnabledFn: func() bool { // 业务开关联动展示（关=已暂停；DB 直读）
+		EnabledFn: func() bool { // 业务开关门（关=已停止——展示+调度面跳过，历史问题；DB 直读）
 			var en int
 			// TASK-2（历史）：读库失败 fail-closed（与 crs 同批收敛）。
 			if err := db.DB.QueryRow("SELECT COALESCE(auto_update,1) FROM security_ip2region_version WHERE id=1").Scan(&en); err != nil {
@@ -474,6 +474,17 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	})
 
 	taskEngine.Register(taskengine.Descriptor{
+		ID: "autoban", Family: "security", Name: "自动封禁",
+		Description: "按滑动窗口统计 WAF 安全事件（口径可配：拦截/检测/全部），同一 IP 计数达阈值即写入「自动封禁名单」并在到期后自动解封；默认观察模式仅记录建议不封禁。计数数据源=安全事件采集提交点（仅主节点）",
+		Category:    "安全防护", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
+		IntervalFn: func() time.Duration { return time.Minute },
+		EnabledFn:  func() bool { return AutobanEnabled() }, // 业务开关门（关=已停止——展示+调度面跳过，历史问题；fail-closed 读库）
+		Run: func(rc taskengine.RunContext) error {
+			return RunAutobanCycle(rc)
+		},
+	})
+
+	taskEngine.Register(taskengine.Descriptor{
 		ID: "auto-backup", Family: "backup", Name: "自动备份",
 		Description: "按排程把全量配置打包为 lbbak 落盘 backup 目录（含 CRS/IP2Region/威胁库数据文件），保留份数自动清理",
 		Category:    "备份", Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly,
@@ -483,7 +494,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			}
 			return time.Time{}
 		},
-		EnabledFn: func() bool { // 业务开关联动展示（备份未启用=已暂停）
+		EnabledFn: func() bool { // 业务开关门（备份未启用=已停止——展示+调度面跳过，历史问题）
 			// TASK-2（历史）：读库失败 fail-closed——曾 err!=nil||enabled
 			// 把读错误报为启用。
 			row, err := loadAutoBackupSettings()
@@ -538,7 +549,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		"config-watchdog", "log-cleanup", "audit-retention", "security-events-retention",
 		"cert-renewal-scan", "cert-reconcile", "cert-manual-poll",
 		"security-events-ingestion", "cert-issuance", "cluster-sync",
-		"threat", "crs", "ip2region", "auto-backup",
+		"threat", "crs", "ip2region", "autoban", "auto-backup",
 	} {
 		taskEngine.StartLoop(id)
 	}

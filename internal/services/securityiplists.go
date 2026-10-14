@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -148,8 +149,11 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 				Logf("warn", "渲染: security_ip_lists 行扫描失败（该行丢弃）: %v", err)
 				continue
 			}
-			if system == 1 {
-				// 威胁库：读 .iplist 文件（RDB 源文件）
+			if system == 1 && threatSourceByListName(name) != "" {
+				// 威胁库（RDB 文件化名单）：读 .iplist 文件（源文件）。历史问题：
+				// 以「名字映射到威胁源」路由而非 system=1——自动封禁预置名单
+				// 同为 system=1 但条目在 DB entries，走文件分支会恒失败并触发
+				// 严格模式跳过引用策略的渲染。
 				vals, ferr := readThreatIplistEntries(name)
 				if ferr != nil {
 					Logf("error", "渲染: 威胁库 %q 文件读取失败: %v（严格模式：引用该列表的策略将被跳过渲染）", name, ferr)
@@ -169,11 +173,23 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 					Logf("warn", "渲染: 自定义 IP 列表(id=%d) entries 解析失败（该列表按缺失处理）: %v", id, err)
 					continue
 				}
+				// 历史问题：过期条目（expires_at 可解析且 <= now）不再下发——到期即
+				// 自动解封的唯一发射面。解析失败的 expires_at 保留条目（fail-open
+				// 不误删）；判断以 UTC 墙钟串（autobanTimeLayout 同形态），
+				// 时钟走 autobanNow 缝（与自动封禁同源，测试可注入时间轴）。
+				now := autobanNow()
 				vals := make([]string, 0, len(list))
 				for _, e := range list {
-					if v := strings.TrimSpace(e.Value); v != "" {
-						vals = append(vals, v)
+					v := strings.TrimSpace(e.Value)
+					if v == "" {
+						continue
 					}
+					if e.ExpiresAt != "" {
+						if exp, perr := time.ParseInLocation(autobanTimeLayout, e.ExpiresAt, time.UTC); perr == nil && !exp.After(now) {
+							continue
+						}
+					}
+					vals = append(vals, v)
 				}
 				entries[id] = vals
 			}

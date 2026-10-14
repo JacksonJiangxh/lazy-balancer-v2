@@ -452,9 +452,14 @@ type IPList struct {
 
 // IPListEntry 是 IP 地址列表的单个条目：value 必须是合法的 IP 或 CIDR
 // （netip.ParsePrefix / netip.ParseAddr 双形态），remark 为自由备注。
+// created_at/expires_at（历史问题 自动封禁，UTC 墙钟串）可选：expires_at 非空且
+// 已到期时投影层（loadIPListEntriesVia）不再下发该条目（到期即自动解封）；
+// 手动条目两者留空。
 type IPListEntry struct {
-	Value  string `json:"value"`
-	Remark string `json:"remark"`
+	Value     string `json:"value"`
+	Remark    string `json:"remark"`
+	CreatedAt string `json:"created_at,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 type CreateIPListRequest struct {

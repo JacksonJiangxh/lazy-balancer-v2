@@ -11,15 +11,17 @@
 | **中间空窗** | **零活动**（零执行/零 task_runs/零日志） | Run 持续运行，引擎不干预 | 间隔等待 | 空闲 |
 | **task_runs** | 每次排程执行 1 行 | 每生命周期 1 行（boot 落行，终态随停止更新） | 每轮 1 行 | 每次触发 1 行 |
 | **日志（tasks/{id}.log）** | [done]+业务行 | [start]+[done]+失败行+业务行 | 每轮 [done]+业务行 | [start]/[done]+业务行 |
-| **调度开关** | ✅ 暂停/恢复排程 | ✅ 启停自管理循环 | ✅ 暂停/恢复循环 | ❌ 显示禁用开关（页面一致性） |
+| **调度开关** | ✅ 停止/恢复调度 | ✅ 启停自管理循环 | ✅ 停止/恢复调度 | ❌ 显示禁用开关（页面一致性） |
 | **手动触发** | ✅ | ❌（启停即可） | ✅ | ✅（唯一执行方式） |
 | **取消** | ✅ 执行中可取消 | 用停止代替 | 每轮自动完成 | 每次自动完成 |
 
 ### 1.1 引擎调度循环（每 1s tick）
 
 ```
-Scheduled: loopEnabled && !running && NextSlotFn() ≤ now → Run（每 tick 重读槽——µs 级 SELECT）
+Scheduled: loopEnabled && !running && EnabledFn()≠false && NextSlotFn() ≤ now → Run
+           （每 tick 重读槽——µs 级 SELECT；EnabledFn=false 整分支跳过：零评估零落行）
 Periodic : loopEnabled && !running && now-lastCheck ≥ IntervalFn() → Run
+           （EnabledFn=false 同跳过且不推进节拍——恢复后下一 tick 到期即跑，历史问题 历史）
 Daemon   : 不进 tick——StartLoop 启动 Run 一次（阻塞）；StopLoop 取消 ctx
 Oneshot  : 不进 tick——仅 Trigger
 ```
@@ -44,7 +46,7 @@ type Descriptor struct {
 
 已删除：`SilentProbes`/`RecordFailuresOnly`/`SignalledWork`/`AsKind`/`Cadence`/`Singleton`——Kind 单独决定全部行为；`ToggleFn`/`ToggleName`（LNK71-3，2026-10-11）——v2.0 调度开关统一（StartLoop/StopLoop）后声明族零消费退役，TaskMeta/TaskInfo 的 `toggleable`/`toggle_name` 序列化字段一并删除。
 
-## 2. 任务清单（16 注册任务）
+## 2. 任务清单（17 注册任务）
 
 ### 定时（4）——排程槽驱动，Run 纯业务
 
@@ -76,7 +78,7 @@ SetRole（promote/demote）自动拉起/停止角色不符的 daemon（loopEnabl
 事实——成功列体现启动计数）；异常退出（Run 返回错误且非 ctx 取消）补记
 failed 行（真实时长与错误）；取消/正常停止不增行。
 
-### 循环（8）——固定间隔，每轮独立执行+记录
+### 循环（9）——固定间隔，每轮独立执行+记录
 
 | 任务 | 间隔 |
 |---|---|
@@ -88,6 +90,7 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
 | log-cleanup | 24h |
 | audit-retention | 24h |
 | security-events-retention | 24h |
+| autoban | 60s（EnabledFn=autoban_enabled 业务开关；观察模式默认开） |
 
 
 另：cert-job 动态行（`cert_jobs` 表逐单镜像）为签发工作项视图，不入引擎注册表。
@@ -106,7 +109,7 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
 ## 3. cert-waiting-ca 特例（默认关闭 + 唤醒/自停）
 
 ```
-默认：调度关闭（不在默认 StartLoop 清单）——引擎不 tick，页面状态列「空闲」+开关列「已暂停」（方案 A，2026-10-12）
+默认：调度关闭（不在默认 StartLoop 清单）——引擎不 tick，页面状态列「空闲」+开关列「已停止」（方案 A，2026-10-12）
 唤醒（历史问题-05 勘误：非单点——四处入队成功路径各自唤醒）：
       cert-renewal-scan Run 体入队后 certJobsActive → StartLoop
       CreateOrRequeueCertJobWithChange 成功路径（规则写路径 Create/Retry/Renew 收敛点）
@@ -136,9 +139,9 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
 
 四个定时任务的**业务开关**（安全设置页的 threat/CRS/IP2Region 自动更新、备份设置页的自动备份启用）与任务监控联动：
 
-- EnabledFn（DB 直读）暴露业务开关态 → 视图 `enabled=false`（方案 A，2026-10-12：状态列=空闲，开关列并判 loop_on&&enabled 显示「已暂停」；cert-waiting-ca 的 StatusFn stopped 借用同轮废除）
+- EnabledFn（DB 直读）暴露业务开关态 → 视图 `enabled=false`（方案 A，2026-10-12：状态列=空闲，开关列并判 loop_on&&enabled 显示「已停止」；cert-waiting-ca 的 StatusFn stopped 借用同轮废除）
 - NextSlotFn 同源判断——业务关=零调度零下次执行
-- 引擎调度开关（loop_on）与业务开关两层独立：调度开关暂停=引擎不投递；业务开关关闭=无排程槽可投递
+- 引擎调度开关（loop_on）与业务开关两层独立：调度开关关闭=引擎不投递；业务开关关闭=引擎 tick 跳过（历史问题 历史 EnabledFn 调度门补全：不调度不落行不推进节拍，恢复后下一 tick 到期即跑；手动触发不受门拦）
 
 ## 5. 记录与日志口径
 
@@ -162,4 +165,7 @@ task_runs 保留 90 天（audit-retention 每日清理）。
 
 ## 7. 修订记录
 
+- v2.0.2（2026-10-14，历史问题）：新增 autoban 循环任务（60s/主节点/EnabledFn=autoban_enabled 业务开关联动）——WAF 事件滑动窗口计数（摄取提交点喂入）→ 阈值判定 →「自动封禁名单」merge（清到期/保留手动/抑制过滤/超限挤最早到期）→ 重载 60s 节流暂存合并；观察模式（dry_run 默认开）仅记建议；每轮 TaskLogf 摘要行入 tasks/autoban.log。
+
+- v2.0.1（2026-10-14，历史问题）：EnabledFn 调度门补全——tick 的 Scheduled/Periodic 分支业务关即整支跳过（不落行不推进节拍，恢复后下一 tick 到期即跑；手动触发不受门拦）；术语统一「已暂停」→「已停止」（任务监控开关列/详情/tooltip、API 消息与本文档）。
 - v2.0（2026-10-01）：四类型标准重构。Kind 枚举 4 值替代 Continuous/Queue/Info；删除 SilentProbes/RecordFailuresOnly/SignalledWork/Singleton/AsKind/Cadence；NextSlotFn 返回 time.Time；Daemon 生命周期（StartLoop 调 Run 一次+阻塞）；cert-waiting-ca 默认调度关闭+唤醒/自停；自动备份遗留 1min 调度器删除（追补语义移入 nextAutoBackupSlot 的 last_run 感知）；ingestion 改自管理循环。

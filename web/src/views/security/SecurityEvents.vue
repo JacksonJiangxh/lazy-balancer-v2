@@ -11,6 +11,50 @@
       <el-button :icon="Refresh" @click="fetchEvents">刷新</el-button>
     </div>
 
+    <!-- 自动封禁状态卡（历史问题）：状态/口径/窗口/阈值/时长/今日封禁/名单数 + 三按钮 -->
+    <el-card class="autoban-card" v-loading="autobanStatusLoading">
+      <div class="autoban-bar">
+        <div class="autoban-title">
+          <el-icon class="title-icon"><Lock /></el-icon>
+          <span>自动封禁</span>
+          <el-tag :type="autobanStatus.enabled ? (autobanStatus.dry_run ? 'warning' : 'success') : 'info'" size="small" effect="plain">
+            {{ autobanStatus.enabled ? (autobanStatus.dry_run ? '观察模式' : '运行中') : '未启用' }}
+          </el-tag>
+        </div>
+        <div class="autoban-stats">
+          <span class="autoban-stat">口径 <b>{{ autobanScopeText }}</b></span>
+          <el-divider direction="vertical" />
+          <span class="autoban-stat">窗口 <b>{{ autobanStatus.window_minutes }} 分钟</b></span>
+          <el-divider direction="vertical" />
+          <span class="autoban-stat">阈值 <b>{{ autobanStatus.threshold }} 次</b></span>
+          <el-divider direction="vertical" />
+          <span class="autoban-stat">时长 <b>{{ autobanDurationText }}</b></span>
+          <el-divider direction="vertical" />
+          <span class="autoban-stat">今日封禁 <b class="autoban-danger">{{ autobanStatus.banned_today }}</b></span>
+          <el-divider direction="vertical" />
+          <span class="autoban-stat">名单 <b>{{ autobanStatus.list_entries }} 条</b></span>
+        </div>
+        <div class="autoban-actions">
+          <el-button size="small" @click="openAutobanConfig">配置</el-button>
+          <el-button size="small" type="primary" plain :loading="autobanRunning" @click="runAutobanNow">立即执行</el-button>
+        </div>
+      </div>
+      <!-- 未关联策略黄条：名单未被启用中的安全策略引用，封禁不生效 -->
+      <div v-if="autobanStatus.enabled && autobanStatus.list_referenced === false" class="info-note-bar autoban-warn-bar">
+        <span class="info-note-desc">「自动封禁名单」尚未被任何启用的安全策略引用，封禁暂不生效——请到「安全规则 → IP 地址列表」将该名单引用到 IP 访问控制（deny）策略</span>
+      </div>
+      <!-- 观察模式建议列表：dry-run 下达阈值 IP（不封禁，供评估阈值/口径） -->
+      <template v-if="autobanStatus.enabled && autobanStatus.dry_run && (autobanStatus.suggestions?.length ?? 0) > 0">
+        <div class="info-note-bar autoban-warn-bar">
+          <span class="info-note-desc">观察模式：以下 IP 在 {{ autobanStatus.window_minutes }} 分钟窗口内命中 {{ autobanStatus.threshold }} 次阈值（仅记录建议，不写入名单）</span>
+        </div>
+        <el-table :data="autobanStatus.suggestions" size="small" max-height="200" :header-cell-style="{ background: '#f9fafb' }">
+          <el-table-column prop="ip" label="IP" min-width="160" />
+          <el-table-column prop="count" label="命中次数" width="110" align="center" />
+        </el-table>
+      </template>
+    </el-card>
+
     <el-card>
       <div class="table-toolbar">
         <el-date-picker
@@ -147,6 +191,47 @@
          信息优先展示，IP 处置动作收敛到 IP 快捷弹框（列表中点击 IP） -->
     <TriggerDetailDialog v-model="triggerDetailVisible" :row="triggerDetailRow" />
 
+    <!-- 自动封禁配置弹框（历史问题）：六项配置+口径/窗口变更重置提示 -->
+    <el-dialog v-model="autobanDialogVisible" width="min(560px, 94vw)" top="8vh" append-to-body class="dialog-body-inset">
+      <template #header>
+        <DialogHeader :icon="Lock" title="自动封禁配置" subtitle="WAF 事件滑动窗口计数达到阈值即写入「自动封禁名单」，到期自动解封" />
+      </template>
+      <el-form :model="autobanForm" label-width="96px" label-position="right">
+        <el-form-item label="启用">
+          <el-switch v-model="autobanForm.enabled" />
+          <span class="form-tip-inline">关闭后任务停止调度，已有封禁条目按到期自然解封</span>
+        </el-form-item>
+        <el-form-item label="观察模式">
+          <el-switch v-model="autobanForm.dry_run" />
+          <span class="form-tip-inline">开启时仅记录达阈值建议、不写入名单（推荐先观察校准阈值）</span>
+        </el-form-item>
+        <el-form-item label="统计口径">
+          <el-radio-group v-model="autobanForm.scope">
+            <el-radio v-for="s in AUTOBAN_SCOPES" :key="s.value" :value="s.value">{{ s.label }}</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="统计窗口">
+          <el-input-number v-model="autobanForm.window_minutes" :min="1" :max="60" :step="5" controls-position="right" style="width: 140px" />
+          <span class="form-tip-inline">分钟（同一 IP 窗口内累计计数，跨窗口自动重置）</span>
+        </el-form-item>
+        <el-form-item label="封禁阈值">
+          <el-input-number v-model="autobanForm.threshold" :min="1" :max="10000" :step="10" controls-position="right" style="width: 140px" />
+          <span class="form-tip-inline">窗口内命中次数</span>
+        </el-form-item>
+        <el-form-item label="封禁时长">
+          <el-select v-model="autobanForm.duration" style="width: 160px">
+            <el-option v-for="d in AUTOBAN_DURATIONS" :key="d.value" :label="d.label" :value="d.value" />
+          </el-select>
+          <span class="form-tip-inline">到期自动解封（从名单移除）</span>
+        </el-form-item>
+      </el-form>
+      <div class="info-note-bar"><span class="info-note-desc">修改统计窗口或口径会立即重置计数器（旧计数与新口径不可混算）</span></div>
+      <template #footer>
+        <el-button @click="autobanDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="autobanSaving" @click="saveAutobanConfig">保存</el-button>
+      </template>
+    </el-dialog>
+
     <!-- 请求上下文详情：策略开启「记录请求体」后，命中规则事件携带的请求头/请求体。
          请求头为 map[string][]string JSON 文本（多值以 ", " 连接；Cookie/Authorization/
          Set-Cookie/Proxy-Authorization 值默认掩码，逐行眼睛图标点击显示）；合成键
@@ -228,7 +313,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { Refresh, Warning, View, Hide, Document } from '@element-plus/icons-vue'
+import { Refresh, Warning, View, Hide, Document, Lock } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import { ElMessage } from 'element-plus'
 import type { CheckboxValueType } from 'element-plus'
@@ -241,6 +326,85 @@ import { formatDate } from '@/utils/date'
 import type { APIResponse } from '@/types'
 
 interface SecurityEvent { id: number; event_time: string; rule_caddy_id: string; rule_name: string; policy_id: number; policy_name: string; client_ip: string; ip_location: string; method: string; uri: string; event_type: string; rule_triggered: string; rule_msg: string; action: string; anomaly_score: number; duration_us: number; precheck_us: number; request_headers: string; request_body: string }
+
+// —— 自动封禁（历史问题）：状态卡/配置弹框 ——
+
+interface AutobanSuggestion { ip: string; count: number }
+interface AutobanStatus {
+  enabled: boolean; dry_run: boolean; threshold: number; window_minutes: number
+  duration: string; scope: string; banned_today: number; list_entries: number
+  list_referenced: boolean; tracked_ips: number; suggestions: AutobanSuggestion[]
+  running: boolean; last_run: string; last_status: string
+}
+const AUTOBAN_DURATIONS = [
+  { value: '10m', label: '10 分钟' }, { value: '30m', label: '30 分钟' },
+  { value: '1h', label: '1 小时' }, { value: '6h', label: '6 小时' },
+  { value: '12h', label: '12 小时' }, { value: '24h', label: '24 小时' },
+  { value: 'permanent', label: '永久' },
+]
+const AUTOBAN_SCOPES = [
+  { value: 'all', label: '全部事件' }, { value: 'blocked', label: '仅拦截' }, { value: 'logged', label: '仅检测' },
+]
+
+const autobanStatus = ref<AutobanStatus>({
+  enabled: false, dry_run: true, threshold: 100, window_minutes: 5, duration: '1h', scope: 'all',
+  banned_today: 0, list_entries: 0, list_referenced: true, tracked_ips: 0, suggestions: [],
+  running: false, last_run: '', last_status: '',
+})
+const autobanStatusLoading = ref(false)
+const autobanRunning = ref(false)
+const autobanScopeText = computed(() => AUTOBAN_SCOPES.find((s) => s.value === autobanStatus.value.scope)?.label ?? autobanStatus.value.scope)
+const autobanDurationText = computed(() => AUTOBAN_DURATIONS.find((d) => d.value === autobanStatus.value.duration)?.label ?? autobanStatus.value.duration)
+
+const fetchAutobanStatus = async (): Promise<void> => {
+  autobanStatusLoading.value = true
+  try {
+    const res = await request.get<APIResponse<AutobanStatus>>('/security/autoban/status', { silent: true })
+    if (res.data) autobanStatus.value = res.data
+  } catch { /* 静默：状态卡退化为默认值，不打断事件日志主功能 */ }
+  finally { autobanStatusLoading.value = false }
+}
+
+// 配置弹框（七项=六项配置+口径变更提示）
+const autobanDialogVisible = ref(false)
+const autobanSaving = ref(false)
+const autobanForm = ref({ enabled: false, dry_run: true, threshold: 100, window_minutes: 5, duration: '1h', scope: 'all' })
+const openAutobanConfig = (): void => {
+  autobanForm.value = {
+    enabled: autobanStatus.value.enabled, dry_run: autobanStatus.value.dry_run,
+    threshold: autobanStatus.value.threshold, window_minutes: autobanStatus.value.window_minutes,
+    duration: autobanStatus.value.duration, scope: autobanStatus.value.scope,
+  }
+  autobanDialogVisible.value = true
+}
+const saveAutobanConfig = async (): Promise<void> => {
+  if (autobanForm.value.threshold < 1 || autobanForm.value.threshold > 10000) {
+    ElMessage.warning('阈值须在 1-10000 之间'); return
+  }
+  if (autobanForm.value.window_minutes < 1 || autobanForm.value.window_minutes > 60) {
+    ElMessage.warning('统计窗口须在 1-60 分钟之间'); return
+  }
+  autobanSaving.value = true
+  try {
+    await request.put('/security/autoban', autobanForm.value)
+    ElMessage.success('自动封禁配置已更新')
+    autobanDialogVisible.value = false
+    fetchAutobanStatus()
+  } catch { /* 错误已由全局拦截器 toast */ }
+  finally { autobanSaving.value = false }
+}
+
+const runAutobanNow = async (): Promise<void> => {
+  if (autobanRunning.value) return
+  autobanRunning.value = true
+  try {
+    await request.post('/security/autoban/run', {})
+    ElMessage.success('已触发自动封禁任务')
+    // 任务异步执行——延迟刷新状态卡
+    setTimeout(fetchAutobanStatus, 2000)
+  } catch { /* 错误已由全局拦截器 toast */ }
+  finally { autobanRunning.value = false }
+}
 
 // 触发阶段分类（历史追加需求，用户裁定）：IP ACL 族=黑白名单/信任/地域/
 // 威胁库预检，统一展示「IP 访问控制」；WAF 含 CRS 与自定义两源；请求体异常独立。
@@ -476,10 +640,25 @@ const fetchEvents = async () => {
     if (requestSeq === fetchEventsSeq) loading.value = false
   }
 }
-onMounted(fetchEvents)
+onMounted(() => {
+  fetchEvents()
+  fetchAutobanStatus()
+})
 </script>
 
 <style scoped>
+/* —— 自动封禁状态卡（历史问题）—— */
+.autoban-card { margin-bottom: 16px; }
+.autoban-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.autoban-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: #111827; flex-shrink: 0; }
+.autoban-title .title-icon { font-size: 16px; color: #3b82f6; }
+.autoban-stats { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: 1; min-width: 0; font-size: 12px; color: var(--text-secondary, #6b7280); }
+.autoban-stat b { color: #111827; font-weight: 600; margin-left: 2px; }
+.autoban-danger { color: #f56c6c !important; }
+.autoban-actions { flex-shrink: 0; display: flex; gap: 8px; }
+.autoban-warn-bar { margin-top: 10px; }
+.form-tip-inline { margin-left: 10px; font-size: 12px; color: var(--text-secondary, #9ca3af); }
+
 /* 工具行单行排布（1280px 视口全控件 + 筛选/重置一行放下）：nowrap 禁止换行，
    各控件定宽不收缩，极端窄视口降级为横向滚动而非把按钮顶到第二行 */
 .table-toolbar { display: flex; flex-wrap: nowrap; gap: 8px; justify-content: flex-start; margin-bottom: 16px; align-items: center; overflow-x: auto; }

@@ -583,8 +583,9 @@ func emitBodyProcessorRules(sb *strings.Builder) {
 	sb.WriteString(`SecRule REQBODY_PROCESSOR_ERROR "@eq 1" "id:11,phase:2,pass,log,setvar:tx.inbound_anomaly_score_pl1=+5,msg:'请求体解析失败'"` + "\n")
 }
 
-// geoipLocOverseas 是 X-LB-GeoIP-Loc 的海外哨兵值：caddygeoip 对国家列非「中国」
-// （含空/0/海外国名，fail-closed）的客户端发射此值。
+// geoipLocOverseas 是 X-LB-GeoIP-Loc 的海外哨兵值：caddygeoip 对解析失败/
+// 库缺失/国家列非国家值（空/0/Reserved）的客户端发射此值（fail-closed 兜底；
+// 域 G 起已解析海外行发射归一化国名）。
 const geoipLocOverseas = "海外"
 
 // geoipLocOperator 把策略 geoip_countries 条目编译为 REQUEST_HEADERS:X-LB-GeoIP-Loc
@@ -592,14 +593,29 @@ const geoipLocOverseas = "海外"
 // （国内段省份不可解析）恒不命中（deny 模式不误伤）；allow 模式取反后空串反向
 // 命中 → 拦截（fail-closed，与既有 CEL 语义逐案等价）。条目形态与
 // caddygeoip 发射的 X-LB-GeoIP-Loc 同构：海外 → 字面「海外」；省 → 整省，附加
-// (?:/.*)? 使省内城市段（省/市 形态）同样命中；省/市 → 精确省市联值。
+// (?:/.*)? 使省内城市段（省/市 形态）同样命中；省/市 → 精确省市联值；国名
+// （域 G，历史裁定）→ 精确匹配（exactSet 含树 Countries 集时），与「海外」
+// 同款不加后缀——caddygeoip 对海外行只发国名单值，精确匹配杜绝未来复合形态
+// 误命中。exactSet 为空（树缺失/无国名）时国名条目退回后缀形态（(?:/.*)?
+// 可选，国名单值仍命中，不放大拦截面）。
 // 条目经 QuoteMeta 转义——集群同步/历史行可携带绕过校验的特殊字符，未转义会
 // 注入正则元字符（ReDoS/越权匹配）。
-func geoipLocOperator(countries []string, allowMode bool) string {
-	alts := make([]string, 0, len(countries))
+func geoipLocOperator(countries []string, allowMode bool, exactSet map[string]bool) string {
+	// 历史问题 兼容补丁（2026-10-14 用户裁定）：「海外」条目语义展开——发射端
+	// 改造后已解析海外行发国名，存量「禁止海外」规则的「海外」条目必须覆盖
+	// 「哨兵 ∪ 树 Countries 全集」，否则已解析海外流量漏放（deny）/误拒（allow）。
+	// exactSet 为空（树缺失）时仅保留哨兵（fail-safe 不产生死条目）。
+	alts := make([]string, 0, len(countries)+len(exactSet))
 	for _, entry := range countries {
 		quoted := regexp.QuoteMeta(entry)
-		if entry == geoipLocOverseas || strings.Contains(entry, "/") {
+		if entry == geoipLocOverseas {
+			alts = append(alts, quoted)
+			for country := range exactSet {
+				alts = append(alts, regexp.QuoteMeta(country))
+			}
+			continue
+		}
+		if strings.Contains(entry, "/") || exactSet[entry] {
 			alts = append(alts, quoted)
 			continue
 		}
@@ -1195,6 +1211,16 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 	if denyStatus != 403 {
 		geoipStatusFragment = fmt.Sprintf(",status:%d", denyStatus)
 	}
+	// 域 G（历史）：国名条目精确匹配集——树 Countries（live 优先、缓存
+	// 兜底，与 ValidateGeoIPCountries 同源）；树缺失（无库且无缓存）时空集，
+	// 国名条目退回后缀形态（geoipLocOperator 注释）。单次取树供全部策略链
+	// 复用（N+13 H2-F1 同款：避免循环内重复全量扫描；树扫描本身有 memo）。
+	geoipCountryExact := map[string]bool{}
+	if tree := GetIP2RegionRegionTree(); tree != nil {
+		for _, c := range tree.Countries {
+			geoipCountryExact[c] = true
+		}
+	}
 	for _, p := range policies {
 		if p == nil || !PolicyHasGeoIP(p) {
 			continue
@@ -1209,7 +1235,7 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 			continue
 		}
 		sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"!@ipMatch %s\" \"id:%d,phase:1,deny%s,log,msg:'GeoIP 区域拦截',skipAfter:SECURITY_RULES_END,chain\"\n", strings.Join(geoipPrivateRanges, ","), geoipPrecheckRuleBase+p.ID, geoipStatusFragment))
-		sb.WriteString(fmt.Sprintf(" SecRule REQUEST_HEADERS:X-LB-GeoIP-Loc \"%s\" \"t:none\"\n", escapeCorazaPattern(geoipLocOperator(geoipCountries(p), p.GeoIPMode == "allow"))))
+		sb.WriteString(fmt.Sprintf(" SecRule REQUEST_HEADERS:X-LB-GeoIP-Loc \"%s\" \"t:none\"\n", escapeCorazaPattern(geoipLocOperator(geoipCountries(p), p.GeoIPMode == "allow", geoipCountryExact))))
 		if p.IPWhitelistEnabled {
 			if trusted := mergedWhitelist(p); len(trusted) > 0 {
 				operand, err := ipListRuleOperand(fmt.Sprintf("p%d-trust", p.ID), trusted, true)
@@ -1782,10 +1808,10 @@ func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, gr
 }
 
 // ValidateGeoIPCountries 校验 geoip_countries 载荷：必须是 JSON 数组且条目非空；
-// ip2region 已加载（live 或缓存）时条目必须属于已知省份或"海外"，未知省份在
-// 发射端永不匹配，会静默削弱地域控制。ip2region 未加载且无缓存时同样拒绝未知
-// 省份（fail-closed）：启动期放行任意省份会让 deny 模式的地域拦截静默失效，
-// 提示未加载而非放行。
+// ip2region 已加载（live 或缓存）时条目必须属于已知省份、"海外"或海外国家集
+// （域 G：树 Countries 并入 known），未知条目在发射端永不匹配，会静默削弱地域
+// 控制。ip2region 未加载且无缓存时同样拒绝未知条目（fail-closed）：启动期放行
+// 任意省份会让 deny 模式的地域拦截静默失效，提示未加载而非放行。
 // geoipMode="off" 是区域控制关闭态：名单仅为保留数据（开关重开即复用），
 // 跳过可用性门（缺库时关闭/保留名单的保存不得被 400 卡死），仅做形状校验。
 func ValidateGeoIPCountries(raw string, geoipMode string) error {
@@ -1828,6 +1854,11 @@ func ValidateGeoIPCountries(raw string, geoipMode string) error {
 		for _, p := range tree.Provinces {
 			known[p] = true
 		}
+		// 域 G（历史）：海外国家并入 known 集——国名条目与省份条目同校验
+		// 口径（未知国名在发射端永不匹配，静默削弱地域控制）。
+		for _, c := range tree.Countries {
+			known[c] = true
+		}
 		// 历史问题 二十三次：城市树供「省/市」条目校验（市必须在省的城市集内——防
 		// 拼写错误生成 CEL 恒假死条目）。
 		for prov, cities := range tree.Cities {
@@ -1862,7 +1893,7 @@ func ValidateGeoIPCountries(raw string, geoipMode string) error {
 			continue
 		}
 		if !known[trimmed] {
-			return fmt.Errorf("geoip_countries 包含未知省份：%q", trimmed)
+			return fmt.Errorf("geoip_countries 包含未知省份或国家：%q", trimmed)
 		}
 	}
 	return nil

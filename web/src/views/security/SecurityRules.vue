@@ -153,7 +153,8 @@
             <el-table-column prop="name" label="名称" min-width="150">
               <template #default="{ row }">
                 <el-link type="primary" @click="openIpListDialog(row)">{{ row.name }}</el-link>
-                <el-tag v-if="row.system" size="small" type="warning" effect="plain" style="margin-left: 6px;">内置</el-tag>
+                <el-tag v-if="row.preset_autoban" size="small" type="danger" effect="plain" style="margin-left: 6px;">自动封禁</el-tag>
+                <el-tag v-else-if="row.system" size="small" type="warning" effect="plain" style="margin-left: 6px;">内置</el-tag>
               </template>
             </el-table-column>
             <el-table-column label="分类" width="120" align="center">
@@ -184,7 +185,7 @@
             </el-table-column>
             <el-table-column label="操作" width="140" fixed="right">
               <template #default="{ row }">
-                <el-button size="small" link type="primary" @click="openIpListDialog(row)">{{ isReadOnly || row.system ? '查看' : '编辑' }}</el-button>
+                <el-button size="small" link type="primary" @click="openIpListDialog(row)">{{ isReadOnly || (row.system && !row.preset_autoban) ? '查看' : '编辑' }}</el-button>
                 <el-button v-if="!row.system" size="small" link type="danger" :disabled="isReadOnly" @click="deleteIpList(row)">删除</el-button>
               </template>
             </el-table-column>
@@ -336,6 +337,27 @@
                   <el-input v-else v-model="row.remark" placeholder="可选备注" size="small" maxlength="100" />
                 </template>
               </el-table-column>
+              <!-- 历史问题：自动封禁名单条目展示加入时间/到期/剩余 + 逐行解封 -->
+              <template v-if="editingIpListPreset">
+                <el-table-column label="加入时间" width="150" align="center">
+                  <template #default="{ row }">{{ formatDate(row.created_at) || '—' }}</template>
+                </el-table-column>
+                <el-table-column label="到期时间" width="150" align="center">
+                  <template #default="{ row }">{{ row.expires_at ? formatDate(row.expires_at) : '永久' }}</template>
+                </el-table-column>
+                <el-table-column label="剩余" width="100" align="center">
+                  <template #default="{ row }">
+                    <el-tag v-if="!row.expires_at" size="small" effect="plain" type="info">永久</el-tag>
+                    <el-tag v-else-if="autobanEntryExpired(row.expires_at)" size="small" effect="plain" type="info">已到期</el-tag>
+                    <span v-else class="text-secondary">{{ autobanEntryRemaining(row.expires_at) }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="" width="70" align="center">
+                  <template #default="{ row }">
+                    <el-button size="small" link type="warning" :disabled="isReadOnly || unbanningIp === row.value" @click="unbanAutobanEntry(row.value)">解封</el-button>
+                  </template>
+                </el-table-column>
+              </template>
               <el-table-column v-if="!ipListDialogReadOnly" label="" width="80" align="center">
                 <template #default="{ $index }">
                   <el-button link type="danger" size="small" @click="removeIpListEntry(ipListEntryPageStart + $index)">删除</el-button>
@@ -506,7 +528,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { Aim, Filter, List, Location, Lock, Search, Notebook, Plus, WarningFilled } from '@element-plus/icons-vue'
-import { formatDate } from '@/utils/date'
+import { formatDate, parseDbTimeMs } from '@/utils/date'
 import { compareVersion, IP_LIST_CATEGORIES} from '@/utils/securityStages'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import RuleLibScheduleEditor from '@/components/RuleLibScheduleEditor.vue'
@@ -702,9 +724,10 @@ const {
 interface CRSRuleFile { filename: string; category: string; size: number; updated_at: string }
 interface CustomRuleCondition { target: string; operator: string; pattern: string }
 interface CustomRule { id: number; name: string; description: string; conditions: CustomRuleCondition[]; action: string; score: number; enabled: boolean; updated_at: string; updated_by: number }
-interface IPListEntry { value: string; remark: string }
+// 历史问题：自动封禁名单条目携带加入时间/到期时间（UTC 墙钟串，formatDate 消费）
+interface IPListEntry { value: string; remark: string; created_at?: string; expires_at?: string }
 interface IPListRefPolicy { id: number; name: string }
-interface IPListRow { id: number; name: string; description: string; category: string; entries: IPListEntry[]; entry_count: number; ref_count: number; ref_policies: IPListRefPolicy[]; created_by: number; created_at: string; updated_by: number; updated_at: string; system: boolean }
+interface IPListRow { id: number; name: string; description: string; category: string; entries: IPListEntry[]; entry_count: number; ref_count: number; ref_policies: IPListRefPolicy[]; created_by: number; created_at: string; updated_by: number; updated_at: string; system: boolean; preset_autoban?: boolean }
 interface CRSUpdateInfo { readonly status: string; readonly trigger: string; readonly started_at: string; readonly finished_at: string; readonly message: string; readonly version: string }
 interface IP2RegionUpdateInfo { readonly status: string; readonly trigger: string; readonly started_at: string; readonly finished_at: string; readonly message: string; readonly version: string }
 interface ThreatUpdateInfo { running: boolean; trigger: string; started_at: string; finished_at: string; outcome: string }
@@ -812,7 +835,10 @@ const { pagedItems: ipListsPaged } = useClampedPagination(ipListsFiltered, ipLis
 watch(ipListSearch, () => { ipListPage.value = 1 })
 const ipListDialogVisible = ref(false)
 // 内置名单（威胁情报库 system=1）弹框恒只读（管理员同）——内容只读查看/导出。
-const ipListDialogReadOnly = computed(() => isReadOnly.value || editingIpListSystem.value)
+// 历史问题 例外：自动封禁预置名单条目可改（手动封禁/解封），弹框编辑形态+
+// 到期列+解封动作。
+const editingIpListPreset = ref(false)
+const ipListDialogReadOnly = computed(() => isReadOnly.value || (editingIpListSystem.value && !editingIpListPreset.value))
 const editingIpListId = ref<number | null>(null)
 const savingIpList = ref(false)
 const ipListForm = ref<{ name: string; description: string; category: string; entries: IPListEntry[] }>({ name: '', description: '', category: '', entries: [] })
@@ -838,11 +864,54 @@ const addIpListEntry = (): void => {
 }
 
 // FE71-2：删除末页末条后页码越界会落在空页（空白表格）——splice 后回夹最大页
+
 //（同 useClampedPagination 的 maxPage 夹紧口径，entries 切片另有共享数组注释见上）
 const removeIpListEntry = (index: number): void => {
   ipListForm.value.entries.splice(index, 1)
   const maxPage = Math.max(1, Math.ceil(ipListForm.value.entries.length / ipListEntryPageSize))
   if (ipListEntryPage.value > maxPage) ipListEntryPage.value = maxPage
+}
+
+// —— 历史问题：自动封禁名单弹框的到期展示与解封动作 ——
+
+// 到期判定/剩余时长以浏览器本地解析（parseDbTimeMs 已做 UTC +Z 规范化）与
+// Date.now 对比——展示层近似（分钟粒度），封禁真值以后端投影过滤为准。
+const autobanEntryExpired = (expiresAt: string): boolean => {
+  const ms = parseDbTimeMs(expiresAt)
+  return ms !== null && ms <= Date.now()
+}
+const autobanEntryRemaining = (expiresAt: string): string => {
+  const ms = parseDbTimeMs(expiresAt)
+  if (ms === null) return '—'
+  const minutes = Math.floor((ms - Date.now()) / 60000)
+  if (minutes < 60) return `${Math.max(minutes, 0)} 分钟`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} 小时 ${minutes % 60} 分`
+  return `${Math.floor(hours / 24)} 天 ${hours % 24} 时`
+}
+
+const unbanningIp = ref<string | null>(null)
+// 解封=移除该条目（POST remove-ip：后端同事务写 30 天抑制，期内不再自动封禁）
+// → 刷新弹框条目与列表行（entry_count）。
+const unbanAutobanEntry = async (ip: string): Promise<void> => {
+  if (editingIpListId.value === null || unbanningIp.value !== null) return
+  unbanningIp.value = ip
+  try {
+    await request.post(`/security/ip-lists/${editingIpListId.value}/remove-ip`, { value: ip })
+    ElMessage.success(`已解封 ${ip}（30 天内不再自动封禁）`)
+    const requestSeq = ++ipListDetailSeq
+    try {
+      const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${editingIpListId.value}`)
+      if (requestSeq === ipListDetailSeq && res.data && ipListDialogVisible.value) {
+        ipListForm.value.entries = (res.data.entries || []).map((e) => ({ value: e.value, remark: e.remark, created_at: e.created_at, expires_at: e.expires_at }))
+      }
+    } catch { /* 条目刷新失败不打断主流程，列表刷新仍执行 */ }
+    fetchIpLists()
+  } catch {
+    // 错误已由全局拦截器 toast
+  } finally {
+    unbanningIp.value = null
+  }
 }
 
 // F历史问题：乱序响应守卫（镜像同文件 openRuleContent 的 ruleContentSeq 范式）——
@@ -852,6 +921,7 @@ let ipListDetailSeq = 0
 const openIpListDialog = async (row?: IPListRow) => {
   const requestSeq = ++ipListDetailSeq
   editingIpListSystem.value = row?.system === true
+  editingIpListPreset.value = row?.preset_autoban === true
   ipListEntryPage.value = 1
   editingIpListId.value = row?.id ?? null
   if (!row) {
@@ -870,7 +940,9 @@ const openIpListDialog = async (row?: IPListRow) => {
     const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${row.id}`)
     if (requestSeq !== ipListDetailSeq) return
     if (res.data && ipListDialogVisible.value) {
-      ipListForm.value.entries = (res.data.entries || []).map((e) => ({ value: e.value, remark: e.remark }))
+      // 历史问题：自动封禁名单条目保留 created_at/expires_at（保存随全量写回，
+      // 任务 merge 的到期语义与弹框到期列依赖这两字段）
+      ipListForm.value.entries = (res.data.entries || []).map((e) => ({ value: e.value, remark: e.remark, created_at: e.created_at, expires_at: e.expires_at }))
     }
   } catch {
     if (requestSeq !== ipListDetailSeq) return
@@ -888,7 +960,7 @@ const saveIpList = async () => {
   if (ipListForm.value.description.length > 200) { ElMessage.warning('描述不能超过 200 字符'); return }
   // 值与备注均为空的行视为未填写的占位行，保存时静默丢弃
   const entries = ipListForm.value.entries
-    .map((e) => ({ value: e.value.trim(), remark: e.remark.trim() }))
+    .map((e) => ({ value: e.value.trim(), remark: e.remark.trim(), created_at: e.created_at || undefined, expires_at: e.expires_at || undefined }))
     .filter((e) => e.value !== '' || e.remark !== '')
   const invalidEntry = entries.find((e) => e.value === '' || !isValidCidr(e.value))
   if (invalidEntry) {

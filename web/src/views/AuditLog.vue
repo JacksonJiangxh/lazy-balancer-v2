@@ -249,6 +249,9 @@ const ACTION_TAG_TABLE: Record<string, string> = {
   '配置恢复': 'success',
   '载入': 'success',
   '校验成功': 'success',
+  // 自动封禁（历史问题）：封禁=阻断（danger），到期自动解封=恢复（success）。
+  '自动封禁': 'danger',
+  '自动解封': 'success',
 }
 const actionTagType = (action: string): string => ACTION_TAG_TABLE[action] ?? 'info'
 

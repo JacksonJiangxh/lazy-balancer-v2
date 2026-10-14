@@ -1170,12 +1170,24 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	decoder := json.NewDecoder(f)
 	const batchSize = 500
 	count := 0
+	// 历史问题 自动封禁喂入：本事务批次内成功解析的 WAF 事件随「提交点」喂计数器
+	// ——commit 成功后才喂（回滚路径不喂，重试不重复计数）；feedBatch 为 nil
+	// 时 autobanObserveBatch 零动作（未启用/从节点等门在函数内收敛）。
+	var autobanBatch []autobanFeedItem
+	commit := func() error {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		autobanObserveBatch(autobanBatch)
+		autobanBatch = nil
+		return nil
+	}
 	for {
 		var raw json.RawMessage
 		err := decoder.Decode(&raw)
 		if errors.Is(err, io.EOF) {
 			stmt.Close()
-			if cerr := tx.Commit(); cerr != nil {
+			if cerr := commit(); cerr != nil {
 				return committedOffset, fmt.Errorf("security events: commit inserts: %w", cerr)
 			}
 			t.lastIngested = count
@@ -1203,7 +1215,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 				if info, serr := f.Stat(); serr == nil && decoderStart+decoder.InputOffset()+securityEventsScanWindowLimit < info.Size() {
 					if !t.archivePass {
 						_ = stmt.Close()
-						if cerr := tx.Commit(); cerr != nil {
+						if cerr := commit(); cerr != nil {
 							return committedOffset, fmt.Errorf("security events: commit inserts: %w", cerr)
 						}
 						t.failOffset = decoderStart + decoder.InputOffset()
@@ -1217,7 +1229,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 					}
 					if !found {
 						_ = stmt.Close()
-						if cerr := tx.Commit(); cerr != nil {
+						if cerr := commit(); cerr != nil {
 							return committedOffset, fmt.Errorf("security events: commit inserts: %w", cerr)
 						}
 						Logf("error", "security events ingestion: unrecoverable unreadable audit data at offset %d in archive, ending pass", decoderStart+decoder.InputOffset())
@@ -1235,7 +1247,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 					continue
 				}
 				stmt.Close()
-				if cerr := tx.Commit(); cerr != nil {
+				if cerr := commit(); cerr != nil {
 					return committedOffset, fmt.Errorf("security events: commit inserts: %w", cerr)
 				}
 				return offset, nil
@@ -1270,7 +1282,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 				}
 				if t.stallCount <= securityEventsDecodeStallLimit {
 					stmt.Close()
-					if cerr := tx.Commit(); cerr != nil {
+					if cerr := commit(); cerr != nil {
 						return committedOffset, fmt.Errorf("security events: commit inserts: %w", cerr)
 					}
 					return offset, errSecurityEventsStalled
@@ -1318,10 +1330,11 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 				_ = tx.Rollback()
 				return committedOffset, fmt.Errorf("security events: insert event: %w", ierr)
 			}
+			autobanBatch = append(autobanBatch, autobanFeedItem{IP: rec.ClientIP, Action: rec.Action, RuleTriggered: rec.RuleTriggered})
 			count++
 			if count >= batchSize {
 				stmt.Close()
-				if cerr := tx.Commit(); cerr != nil {
+				if cerr := commit(); cerr != nil {
 					return committedOffset, fmt.Errorf("security events: commit batch: %w", cerr)
 				}
 				committedOffset = docEnd

@@ -4186,6 +4186,7 @@ func (h *Handlers) GetIP2RegionRegions(c *gin.Context) {
 		tree = &services.IP2RegionRegionTree{
 			Provinces: services.GetIP2RegionProvinceList(),
 			Cities:    map[string][]string{},
+			Countries: []string{},
 		}
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: tree})

@@ -571,14 +571,15 @@
               <el-form-item label="区域选择">
                 <!-- 历史问题 二十三次（用户裁决）：区域精确到市——省级联选择；只选省 =
                      整省生效（存量语义），展开选市 = 省+市联合匹配（省/市 形态）。
-                     海外为一级条目（不细分国家）。 -->
+                     域 G：「海外」仍为兜底一级条目（解析失败/IPv6）；
+                     「海外国家」分组提供已解析海外行的国家级选择。 -->
                 <el-cascader
                   v-model="geoipCountries"
                   :options="regionCascaderOptions"
                   :props="{ multiple: true, checkStrictly: true, emitPath: false }"
                   filterable
                   clearable
-                  placeholder="选择区域（可选省或精确到市）"
+                  placeholder="选择区域（省 / 省-市 / 海外国家）"
                   style="width: 100%"
                 />
                 <div class="form-tip-line">基于 IP2Region 离线库判断访客所在区域，与 CIDR 规则同时生效；只选省份 = 整省生效</div>
@@ -925,23 +926,36 @@ interface PolicySummary { id: number; name: string; mode: string; enabled: boole
 
 
 
-interface RegionTree { provinces: string[]; cities: Record<string, string[]> }
+interface RegionTree { provinces: string[]; cities: Record<string, string[]>; countries?: string[] }
 const regionTree = ref<RegionTree>({ provinces: [], cities: {} })
 // 级联选项：各省为父节点（选父 = 整省），省内城市为子节点（省/市 联合匹配）；
-// 海外为一级条目（无子节点）。
-const regionCascaderOptions = computed(() =>
-  regionTree.value.provinces.map((prov) => {
-    const cities = regionTree.value.cities[prov] || []
-    if (cities.length === 0) {
-      return { value: prov, label: prov }
-    }
-    return {
-      value: prov,
-      label: prov,
-      children: cities.map((city) => ({ value: `${prov}/${city}`, label: city })),
-    }
-  }),
-)
+// 「海外」仍为一级叶子（解析失败/IPv6 的兜底条目），「海外国家」为分组父节点
+//（disabled 不可选，仅承载 children）——已解析海外行按国家粒度选择，选择值
+// 仍为扁平字符串数组，下游（geoip_countries 提交/回显）零改动。
+const regionCascaderOptions = computed(() => {
+  const options: Array<{ value: string; label: string; disabled?: boolean; children?: Array<{ value: string; label: string }> }> =
+    regionTree.value.provinces.map((prov) => {
+      const cities = regionTree.value.cities[prov] || []
+      if (cities.length === 0) {
+        return { value: prov, label: prov }
+      }
+      return {
+        value: prov,
+        label: prov,
+        children: cities.map((city) => ({ value: `${prov}/${city}`, label: city })),
+      }
+    })
+  const overseas = regionTree.value.countries || []
+  if (overseas.length > 0) {
+    options.push({
+      value: 'overseas-countries-group',
+      label: '海外国家',
+      disabled: true,
+      children: overseas.map((country) => ({ value: country, label: country })),
+    })
+  }
+  return options
+})
 
 const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
@@ -3039,9 +3053,9 @@ const openRuleInNewTab = (caddyId: string): void => {
 const fetchRegions = async () => {
   try {
     const res = await request.get<APIResponse<RegionTree>>('/security/ip2region/regions')
-    regionTree.value = { provinces: res.data?.provinces || [], cities: res.data?.cities || {} }
+    regionTree.value = { provinces: res.data?.provinces || [], cities: res.data?.cities || {}, countries: res.data?.countries || [] }
   } catch {
-    regionTree.value = { provinces: [], cities: {} }
+    regionTree.value = { provinces: [], cities: {}, countries: [] }
   }
 }
 
