@@ -391,10 +391,16 @@ const saveAutobanConfig = async (): Promise<void> => {
   if (autobanForm.value.window_minutes < 1 || autobanForm.value.window_minutes > 60) {
     ElMessage.warning('统计窗口须在 1-60 分钟之间'); return
   }
-  // 保存一律二次确认（用户裁定 2026-10-14：编辑保存同样确认，不直接保存关闭）——
-  // 启用入口与编辑入口共用须知+建议内容，按钮文案区分。
+  // 保存二次确认（用户裁定 2026-10-14）：启用入口=完整须知+建议框（按钮「确认启用」）；
+  // 已启用的编辑入口=简化确认（按钮「确认保存」，不带启用描述警告）。
   // 弹框无启用开关（外卡片持有启停职责）——payload enabled 恒 true（启用或保持）。
-  if (!(await confirmAutobanApply('自动封禁', autobanStatus.value.enabled ? '确认保存' : '确认启用'))) return
+  if (autobanStatus.value.enabled) {
+    try {
+      await ElMessageBox.confirm('确认保存自动封禁配置？新配置将在下一轮调度生效。', '保存配置', {
+        confirmButtonText: '确认保存', cancelButtonText: '取消', type: 'info',
+      })
+    } catch { return }
+  } else if (!(await confirmAutobanApply())) return
   autobanSaving.value = true
   try {
     await request.put('/security/autoban', { ...autobanForm.value, enabled: true })
@@ -421,10 +427,10 @@ const AUTOBAN_ENABLE_CONFIRM_HTML = `
   <div class="autoban-confirm-title autoban-confirm-title--gap">使用建议</div>
   <p class="autoban-confirm-text">对大多数部署而言，IP 威胁库 + CRS + 地域拦截已能挡住 99% 以上的恶意请求，少量恶意 IP 手动拉黑即可。确认要启用自动封禁吗？建议先以观察模式运行，确认封禁建议准确后再转为正式封禁。</p>
 </div>`
-const confirmAutobanApply = async (title: string, confirmText: string): Promise<boolean> => {
+const confirmAutobanApply = async (): Promise<boolean> => {
   try {
-    await ElMessageBox.confirm(AUTOBAN_ENABLE_CONFIRM_HTML, title, {
-      confirmButtonText: confirmText,
+    await ElMessageBox.confirm(AUTOBAN_ENABLE_CONFIRM_HTML, '启用自动封禁', {
+      confirmButtonText: '确认启用',
       cancelButtonText: '取消',
       dangerouslyUseHTMLString: true,
       customClass: 'autoban-confirm-box',
@@ -445,7 +451,15 @@ const openAutobanConfigForEnable = (): void => {
 }
 
 const toggleAutobanEnabled = async (): Promise<void> => {
-  if (autobanToggling.value || autobanStatus.value.enabled) return
+  // 守卫：仅在已启用状态执行禁用（此前条件写反致禁用按钮无效——用户报告修复）
+  if (autobanToggling.value || !autobanStatus.value.enabled) return
+  try {
+    await ElMessageBox.confirm(
+      '确认禁用自动封禁？任务调度将停止，已有封禁条目按到期时间自然解封。',
+      '禁用自动封禁',
+      { confirmButtonText: '确认禁用', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch { return }
   autobanToggling.value = true
   try {
     await request.put('/security/autoban', {
