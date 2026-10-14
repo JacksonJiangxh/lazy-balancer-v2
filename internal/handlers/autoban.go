@@ -43,18 +43,6 @@ func (h *Handlers) UpdateAutobanConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
-	// 启用时幂等创建预置策略（用户裁定 2026-10-14）：阶段 1 IPACL deny 引用
-	// 「自动封禁名单」、不关联规则——用户到安全策略页自行绑定。
-	createdPolicy := false
-	if req.Enabled {
-		created, err := services.EnsureAutobanPolicy()
-		if err != nil {
-			services.Logf("warn", "启用自动封禁：创建预置策略失败: %v", err)
-		} else if created {
-			createdPolicy = true
-			recordAudit(c, "创建", "安全策略", "自动封禁启用时自动创建「"+services.AutobanPresetPolicyName+"」（引用自动封禁名单，未关联规则）")
-		}
-	}
 	if te := services.TaskEngine(); te != nil {
 		if req.Enabled {
 			te.StartLoop(services.AutobanTaskID)
@@ -66,11 +54,7 @@ func (h *Handlers) UpdateAutobanConfig(c *gin.Context) {
 		boolOnOff(req.Enabled), map[bool]string{true: "已开启", false: "已停止"}[req.Enabled], req.Threshold, req.WindowMinutes,
 		services.AutobanDurationLabel(req.Duration), autobanScopeText(req.Scope),
 		map[bool]string{true: "观察", false: "正式"}[req.DryRun]))
-	msg := "自动封禁配置已更新"
-	if createdPolicy {
-		msg += "；已创建「" + services.AutobanPresetPolicyName + "」策略，请到「安全策略」关联到需要防护的规则"
-	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: msg, Data: services.GetAutobanConfig()})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "自动封禁配置已更新", Data: services.GetAutobanConfig()})
 }
 
 func boolOnOff(b bool) string {
