@@ -17,7 +17,6 @@
          由「启用后按配置调度执行」） -->
     <el-card class="autoban-card" v-loading="autobanStatusLoading">
       <div class="autoban-bar">
-        <div>
           <div class="autoban-main">
             <div class="autoban-title">
               <el-icon class="title-icon"><Lock /></el-icon>
@@ -40,7 +39,6 @@
               <span class="autoban-stat">名单 <b>{{ autobanStatus.list_entries }} 条</b></span>
             </div>
           </div>
-        </div>
         <div class="autoban-actions">
           <template v-if="autobanStatus.enabled">
             <el-button size="small" type="danger" plain :loading="autobanToggling" @click="toggleAutobanEnabled">禁用</el-button>
@@ -393,9 +391,10 @@ const saveAutobanConfig = async (): Promise<void> => {
   if (autobanForm.value.window_minutes < 1 || autobanForm.value.window_minutes > 60) {
     ElMessage.warning('统计窗口须在 1-60 分钟之间'); return
   }
-  // 启用入口（卡片「启用」打开，此前未启用）保存前二次确认；编辑入口（已启用）直接保存。
-  // 弹框已无启用开关（外卡片持有启停职责）——payload enabled 恒 true（启用或保持）。
-  if (!autobanStatus.value.enabled && !(await confirmAutobanEnable())) return
+  // 保存一律二次确认（用户裁定 2026-10-14：编辑保存同样确认，不直接保存关闭）——
+  // 启用入口与编辑入口共用须知+建议内容，按钮文案区分。
+  // 弹框无启用开关（外卡片持有启停职责）——payload enabled 恒 true（启用或保持）。
+  if (!(await confirmAutobanApply('自动封禁', autobanStatus.value.enabled ? '确认保存' : '确认启用'))) return
   autobanSaving.value = true
   try {
     await request.put('/security/autoban', { ...autobanForm.value, enabled: true })
@@ -422,10 +421,10 @@ const AUTOBAN_ENABLE_CONFIRM_HTML = `
   <div class="autoban-confirm-title autoban-confirm-title--gap">使用建议</div>
   <p class="autoban-confirm-text">对大多数部署而言，IP 威胁库 + CRS + 地域拦截已能挡住 99% 以上的恶意请求，少量恶意 IP 手动拉黑即可。确认要启用自动封禁吗？建议先以观察模式运行，确认封禁建议准确后再转为正式封禁。</p>
 </div>`
-const confirmAutobanEnable = async (): Promise<boolean> => {
+const confirmAutobanApply = async (title: string, confirmText: string): Promise<boolean> => {
   try {
-    await ElMessageBox.confirm(AUTOBAN_ENABLE_CONFIRM_HTML, '启用自动封禁', {
-      confirmButtonText: '确认启用',
+    await ElMessageBox.confirm(AUTOBAN_ENABLE_CONFIRM_HTML, title, {
+      confirmButtonText: confirmText,
       cancelButtonText: '取消',
       dangerouslyUseHTMLString: true,
       customClass: 'autoban-confirm-box',
@@ -789,8 +788,11 @@ onMounted(() => {
 .autoban-confirm-list li::before { content: ''; position: absolute; left: 2px; top: 9px; width: 4px; height: 4px; border-radius: 50%; background: var(--el-color-warning, #e6a23c); }
 .autoban-confirm-text { margin: 0; color: var(--el-text-color-regular, #606266); }
 /* MessageBox 结构修正：无默认图标时消息区占满、按钮区上边距收敛 */
-:global(.autoban-confirm-box .el-message-box__message) { display: block; padding: 4px 0 0; }
-:global(.autoban-confirm-box .el-message-box__btns) { padding-top: 14px; }
+:global(.autoban-confirm-box .el-message-box__container) { padding: 0 28px; }
+:global(.autoban-confirm-box .el-message-box__message) { display: block; padding: 10px 0 0; }
+:global(.autoban-confirm-box .el-message-box__title) { padding-left: 28px; }
+:global(.autoban-confirm-box .el-message-box__btns) { padding: 14px 28px 6px 0; }
+:global(.autoban-confirm-box .el-message-box__header) { padding-bottom: 4px; }
 .autoban-confirm-list { margin: 0; padding-left: 20px; }
 .autoban-confirm-list li + li { margin-top: 4px; }
 .autoban-confirm-text { margin: 0; }
