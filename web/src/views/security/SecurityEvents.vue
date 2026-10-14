@@ -59,7 +59,12 @@
           <span class="info-note-desc">观察模式：以下 IP 在 {{ autobanStatus.window_minutes }} 分钟窗口内命中 {{ autobanStatus.threshold }} 次阈值（仅记录建议，不写入名单；建议封禁时长 {{ autobanDurationText }}；最多展示命中最多的 50 条）</span>
         </div>
         <el-table :data="autobanStatus.suggestions" size="small" max-height="320" :header-cell-style="{ background: '#f9fafb' }">
-          <el-table-column prop="ip" label="IP" min-width="150" />
+          <el-table-column label="IP" width="200">
+            <template #default="{ row }">
+              <!-- 快捷处置弹框与事件表同款（无规则上下文：组件回退全量启用策略，SecurityOverview top_ips 同形态） -->
+              <IPLocationAction :ip="row.ip" :location="row.ip_location || ''" />
+            </template>
+          </el-table-column>
           <el-table-column label="命中次数" width="110" align="right">
             <template #default="{ row }"><span :style="suggestionCountStyle(row.count)">{{ row.count }}</span></template>
           </el-table-column>
@@ -340,7 +345,7 @@ interface SecurityEvent { id: number; event_time: string; rule_caddy_id: string;
 
 // —— 自动封禁（历史问题）：状态卡/配置弹框 ——
 
-interface AutobanSuggestion { ip: string; count: number; window_start?: string; last_seen?: string }
+interface AutobanSuggestion { ip: string; count: number; ip_location?: string; window_start?: string; last_seen?: string }
 interface AutobanStatus {
   enabled: boolean; dry_run: boolean; threshold: number; window_minutes: number
   duration: string; scope: string; banned_today: number; list_entries: number
