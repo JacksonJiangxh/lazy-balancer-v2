@@ -124,8 +124,10 @@ func TestImportV1Config_clamps_short_active_health_interval(t *testing.T) {
 	if err := db.DB.QueryRow("SELECT health_check_interval, health_check_timeout FROM lb_rules WHERE name='hc-clamp'").Scan(&interval, &timeout); err != nil {
 		t.Fatalf("read imported rule: %v", err)
 	}
-	if interval != 6 || timeout != 5 {
-		t.Fatalf("health interval=%d timeout=%d, want 6/5", interval, timeout)
+	// 库值唯一真相批 1+2：v1 导入 health_check_timeout 落治理默认 2（原硬编码
+	// 5 为从未生效的陈旧默认，LB25-P2-1/LB-04 已三方统一 2）。
+	if interval != 6 || timeout != 2 {
+		t.Fatalf("health interval=%d timeout=%d, want 6/2", interval, timeout)
 	}
 }
 

@@ -1722,7 +1722,13 @@ func TestSanitizeLegacyCustomRulePatterns_survivesNullColumns(t *testing.T) {
 	}
 }
 
-func TestInitialize_backfillsLegacyTimeoutColumnsOnceAndPreservesExplicitZero(t *testing.T) {
+func TestInitialize_backfillsLegacyTimeoutColumnsAndNormalizesZeroOnRestart(t *testing.T) {
+	// 库值唯一真相（批 1+2，2026-10-14 用户裁定）改判：http_read/write/idle_timeout
+	// 为类型①值型列（0 无效）——旧 R42 F1「显式 0 跨重启保留」语义随渲染层
+	// 「0=省略」形态一并废除：新增列一次性回填照旧（60/60/120），此后每启动
+	// 幂等回填把 0/NULL 行归默认（带外直写/旧备份恢复的脏行在下次启动收敛）。
+	// upstream_keepalive_timeout 保持类型②省略型（0=继承 Caddy/Go Transport
+	// 默认 2 分钟，R72 三次用户反馈）——显式 0 跨重启原样保留，任何迁移不改写。
 	// Given a legacy database whose global_config predates the four timeout columns
 	dir := t.TempDir()
 	legacy, err := sql.Open("sqlite", filepath.Join(dir, "lazy-balancer.db"))
@@ -1763,9 +1769,9 @@ func TestInitialize_backfillsLegacyTimeoutColumnsOnceAndPreservesExplicitZero(t 
 		t.Fatalf("backfilled timeouts=(%d,%d,%d,%d), want (60,60,120,0)", r, w, i, k)
 	}
 
-	// And when the user explicitly sets 0 (= 省略超时指令、用 Caddy 默认) and the service restarts
+	// And when a band-out write leaves 0 (= 旧省略语义残留/旧备份恢复形态) and the service restarts
 	if _, err := DB.Exec(`UPDATE global_config SET http_read_timeout=0, http_write_timeout=0, http_idle_timeout=0, upstream_keepalive_timeout=0 WHERE id=1`); err != nil {
-		t.Fatalf("set explicit zero timeouts: %v", err)
+		t.Fatalf("set zero timeouts: %v", err)
 	}
 	if err := Close(); err != nil {
 		t.Fatalf("close database before restart: %v", err)
@@ -1774,9 +1780,10 @@ func TestInitialize_backfillsLegacyTimeoutColumnsOnceAndPreservesExplicitZero(t 
 		t.Fatalf("reinitialize database: %v", err)
 	}
 
-	// Then the explicit zeros survive the restart migration unchanged
-	if r, w, i, k := readTimeouts(); r != 0 || w != 0 || i != 0 || k != 0 {
-		t.Fatalf("explicit zero timeouts rewritten to (%d,%d,%d,%d), want (0,0,0,0)", r, w, i, k)
+	// Then the value-typed columns are normalized back to governed defaults on
+	// restart, while the omission-typed keepalive zero survives unchanged
+	if r, w, i, k := readTimeouts(); r != 60 || w != 60 || i != 120 || k != 0 {
+		t.Fatalf("post-restart timeouts=(%d,%d,%d,%d), want (60,60,120,0)（类型①回填+类型②0 保留）", r, w, i, k)
 	}
 }
 
@@ -2773,5 +2780,46 @@ func TestRunMigrations_addsPathRuleResponseColumnsToLegacyRows(t *testing.T) {
 	}
 	if mode != "" || status != 200 || body != "" || contentType != "" || redirectTo != "" {
 		t.Fatalf("migrated=(%q,%d,%q,%q,%q), want ('',200,'','','')", mode, status, body, contentType, redirectTo)
+	}
+}
+
+// 库值唯一真相（批 3，2026-10-14/15 用户裁定）：global_config.cert_expiry_days
+// 类型①值型列——写侧 [1,365] 校验（R58 C-N5）+ 导入钳制（R57 C-2/R66 C-F3）
+// 之外的最后防线：NULL/<=0 随启动幂等回填 30；用户已设有效值（>0）恒不触碰。
+func TestInitialize_backfillsCertExpiryDays(t *testing.T) {
+	dir := t.TempDir()
+	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
+	t.Cleanup(func() {
+		_ = Close()
+		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	if err := Initialize(dir); err != nil {
+		t.Fatalf("initialize database: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		seed string
+		want int
+	}{
+		{"null", `UPDATE global_config SET cert_expiry_days=NULL WHERE id=1`, 30},
+		{"zero", `UPDATE global_config SET cert_expiry_days=0 WHERE id=1`, 30},
+		{"negative", `UPDATE global_config SET cert_expiry_days=-5 WHERE id=1`, 30},
+		{"valid-untouched", `UPDATE global_config SET cert_expiry_days=45 WHERE id=1`, 45},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DB.Exec(tc.seed); err != nil {
+				t.Fatalf("seed cert_expiry_days: %v", err)
+			}
+			if err := Initialize(dir); err != nil {
+				t.Fatalf("re-initialize database: %v", err)
+			}
+			var got int
+			if err := DB.QueryRow("SELECT cert_expiry_days FROM global_config WHERE id=1").Scan(&got); err != nil {
+				t.Fatalf("read cert_expiry_days: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("cert_expiry_days=%d after backfill, want %d (seed %q)", got, tc.want, tc.seed)
+			}
+		})
 	}
 }

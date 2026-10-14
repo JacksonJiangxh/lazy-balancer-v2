@@ -38,7 +38,7 @@ func TestRulePayload_rejectsMixedHttpHttpsUpstreamPool(t *testing.T) {
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			body := fmt.Sprintf(`{"name":"mixpool-%d","protocol":"http","domain":"mix-%d.test","listen_port":%d,"upstreams":%s}`,
+			body := fmt.Sprintf(`{"name":"mixpool-%d","protocol":"http","domain":"mix-%d.test","listen_port":%d,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":%s}`,
 				i, i, 19300+i, tc.upstreams)
 			req := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")

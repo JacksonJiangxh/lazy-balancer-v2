@@ -52,9 +52,9 @@ func seedTLSMixRule(t *testing.T, caddyID, domain string, listenPort int, enable
 func tlsMixBody(name, domain string, listenPort int, enableTLS bool) string {
 	if enableTLS {
 		certPEM, keyPEM, _ := generateTestCert(domain, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
-		return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":%d,"enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain, listenPort, certPEM, keyPEM)
+		return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":%d,"enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain, listenPort, certPEM, keyPEM)
 	}
-	return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":%d,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain, listenPort)
+	return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":%d,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain, listenPort)
 }
 
 func TestRulePortTLSMix_rejected(t *testing.T) {

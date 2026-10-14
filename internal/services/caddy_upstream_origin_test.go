@@ -38,7 +38,7 @@ func lastReverseProxy(t *testing.T, chain []interface{}) map[string]interface{} 
 //
 //	defaults 回退规则级后端域名
 func TestBuildHTTPHandleChain_originDomainEmitsMapHandler(t *testing.T) {
-	rule := SingleRuleConfig{CaddyID: "lb_origin", Protocol: "http", ListenPort: 80, HostHeader: "backend.example.com"}
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_origin", Protocol: "http", ListenPort: 80, HostHeader: "backend.example.com"}
 	upstreams := []UpstreamConfig{
 		{Host: "10.0.0.1", Port: 8080, Weight: 1, Enabled: true, OriginDomain: "origin-a.example.com"},
 		{Host: "10.0.0.2", Port: 8080, Weight: 1, Enabled: true},
@@ -93,7 +93,7 @@ func TestBuildHTTPHandleChain_originDomainEmitsMapHandler(t *testing.T) {
 //
 //	RFC 6066——原样透传是畸形值，严格 SNI 后端选路失败）
 func TestBuildHTTPHandleChain_staticSNIStripsHostHeaderPort(t *testing.T) {
-	rule := SingleRuleConfig{CaddyID: "lb_sniport", Protocol: "http", ListenPort: 443, HostHeader: "backend.example.com:8443"}
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_sniport", Protocol: "http", ListenPort: 443, HostHeader: "backend.example.com:8443"}
 	upstreams := []UpstreamConfig{
 		{Host: "10.0.0.1", Port: 8443, Weight: 1, Enabled: true, Protocol: "https"},
 	}
@@ -122,7 +122,7 @@ func TestBuildHTTPHandleChain_staticSNIStripsHostHeaderPort(t *testing.T) {
 // {http.reverse_proxy.upstream.hostport}（reverseproxy.go:664-668 先于
 // userOps 设置，求值时点可用）。
 func TestBuildHTTPHandleChain_tlsPoolFallbackUsesUpstreamHostport(t *testing.T) {
-	rule := SingleRuleConfig{CaddyID: "lb_tlsfb", Protocol: "http", ListenPort: 443}
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_tlsfb", Protocol: "http", ListenPort: 443}
 	upstreams := []UpstreamConfig{
 		{Host: "10.0.0.1", Port: 8443, Weight: 1, Enabled: true, Protocol: "https", OriginDomain: "origin-a.example.com"},
 		{Host: "10.0.0.2", Port: 8443, Weight: 1, Enabled: true, Protocol: "https"},
@@ -152,7 +152,7 @@ func TestBuildHTTPHandleChain_tlsPoolFallbackUsesUpstreamHostport(t *testing.T) 
 // When: 构建链
 // Then: transport.tls.server_name 切换为 {lb.upstream_sni} 占位符
 func TestBuildHTTPHandleChain_originDomainHttpsSwitchesServerName(t *testing.T) {
-	rule := SingleRuleConfig{CaddyID: "lb_sni", Protocol: "http", ListenPort: 443, HostHeader: "backend.example.com"}
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_sni", Protocol: "http", ListenPort: 443, HostHeader: "backend.example.com"}
 	upstreams := []UpstreamConfig{
 		{Host: "10.0.0.1", Port: 8443, Weight: 1, Enabled: true, Protocol: "https", OriginDomain: "origin-a.example.com"},
 	}
@@ -188,7 +188,7 @@ func TestBuildHTTPHandleChain_noOriginDomainKeepsCurrentShape(t *testing.T) {
 		{"host_header 已配", "backend.example.com"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rule := SingleRuleConfig{CaddyID: "lb_pin", Protocol: "http", ListenPort: 80, HostHeader: tc.hostHeader}
+			rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_pin", Protocol: "http", ListenPort: 80, HostHeader: tc.hostHeader}
 			chain, err := buildHTTPHandleChain(rule, upstreams)
 			if err != nil {
 				t.Fatalf("buildHTTPHandleChain: %v", err)
@@ -222,7 +222,7 @@ func TestBuildHTTPHandleChain_noOriginDomainKeepsCurrentShape(t *testing.T) {
 //
 //	transport 改写值；SNI={http.reverse_proxy.upstream.host} dial 主机名）
 func TestBuildHTTPHandleChain_originDomainDefaultsWithoutHostHeader(t *testing.T) {
-	rule := SingleRuleConfig{CaddyID: "lb_dft", Protocol: "http", ListenPort: 80}
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_dft", Protocol: "http", ListenPort: 80}
 	upstreams := []UpstreamConfig{
 		{Host: "10.0.0.1", Port: 8080, Weight: 1, Enabled: true, OriginDomain: "origin-a.example.com"},
 	}
@@ -247,7 +247,7 @@ func TestBuildHTTPHandleChain_originDomainDefaultsWithoutHostHeader(t *testing.T
 // When: 构建链
 // Then: 不发射 map 处理器（动态池 dial=解析后 IP，静态映射永不命中）
 func TestBuildHTTPHandleChain_originDomainSkippedForDynamicDNS(t *testing.T) {
-	rule := SingleRuleConfig{CaddyID: "lb_dyn", Protocol: "http", ListenPort: 80, DynamicDNS: true}
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_dyn", Protocol: "http", ListenPort: 80, DynamicDNS: true}
 	upstreams := []UpstreamConfig{
 		{Host: "up.example.com", Port: 8080, Weight: 1, Enabled: true, OriginDomain: "origin-a.example.com"},
 	}
@@ -265,7 +265,7 @@ func TestBuildHTTPHandleChain_originDomainSkippedForDynamicDNS(t *testing.T) {
 // When: 构建链
 // Then: 该 dial 仅一条 mapping（map Validate 拒绝重复 input，map.go:107-115），先出现者生效
 func TestBuildHTTPHandleChain_originDomainDedupesDial(t *testing.T) {
-	rule := SingleRuleConfig{CaddyID: "lb_dup", Protocol: "http", ListenPort: 80}
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_dup", Protocol: "http", ListenPort: 80}
 	upstreams := []UpstreamConfig{
 		{Host: "10.0.0.1", Port: 8080, Weight: 1, Enabled: true, OriginDomain: "first.example.com"},
 		{Host: "10.0.0.1", Port: 8080, Weight: 2, Enabled: true, OriginDomain: "second.example.com"},
@@ -306,11 +306,9 @@ func TestBuildHTTPHandleChain_healthCheckHostOverridesProbeHost(t *testing.T) {
 		{"两者皆空不发射 headers 键（现状钉）", "", "", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rule := SingleRuleConfig{
-				CaddyID: "lb_hc", Protocol: "http", ListenPort: 80,
+			rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_hc", Protocol: "http", ListenPort: 80,
 				HostHeader: tc.hostHeader, HealthCheckHost: tc.healthCheckHost,
-				EnableActiveHealthCheck: true,
-			}
+				EnableActiveHealthCheck: true}
 			chain, err := buildHTTPHandleChain(rule, upstreams)
 			if err != nil {
 				t.Fatalf("buildHTTPHandleChain: %v", err)

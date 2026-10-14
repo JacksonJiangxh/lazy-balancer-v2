@@ -21,7 +21,7 @@ func useCRSDirectivesDir(t *testing.T, dir string) {
 func TestBuildCorazaDirectives_WAFAuditLogPartsIncludeK(t *testing.T) {
 	// Given a blocking policy
 	// When
-	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: "blocking"}, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 0))
 
 	// Then the audit log keeps part K so matched rule ids/messages populate the
 	// audit messages array (without K, event rule attribution is lost)
@@ -36,6 +36,7 @@ func TestBuildCorazaDirectives_WAFAuditLogPartsIncludeK(t *testing.T) {
 func TestBuildCorazaDirectives_BypassAndTrustListUseDistinctIDs(t *testing.T) {
 	// Given a blocking policy in bypass ACL mode whose trust list is also populated
 	policy := &models.SecurityPolicy{
+		AnomalyThreshold:   5,
 		Mode:               "blocking",
 		IPACLMode:          "bypass",
 		IPACLList:          `["203.0.113.0/24","192.0.2.7"]`,
@@ -79,6 +80,7 @@ func TestBuildCorazaDirectives_BypassAndTrustListUseDistinctIDs(t *testing.T) {
 func TestBuildCorazaDirectives_TrustListPrecedesACLRules(t *testing.T) {
 	// Given an allow-mode ACL policy that also trusts a monitoring IP
 	policy := &models.SecurityPolicy{
+		AnomalyThreshold:   5,
 		Mode:               "blocking",
 		IPACLMode:          "allow",
 		IPACLList:          `["203.0.113.0/24"]`,
@@ -110,8 +112,8 @@ func TestBuildCorazaDirectives_TrustListPrecedesACLRules(t *testing.T) {
 
 func TestBuildCorazaDirectives_allowAndDenyModesUnchangedByBypass(t *testing.T) {
 	// Given allow and deny policies
-	allow := &models.SecurityPolicy{Mode: "blocking", IPACLMode: "allow", IPACLList: `["198.51.100.7"]`, IPACLEnabled: true}
-	deny := &models.SecurityPolicy{Mode: "blocking", IPACLMode: "deny", IPACLList: `["203.0.113.0/24"]`, IPACLEnabled: true}
+	allow := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPACLMode: "allow", IPACLList: `["198.51.100.7"]`, IPACLEnabled: true}
+	deny := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPACLMode: "deny", IPACLList: `["203.0.113.0/24"]`, IPACLEnabled: true}
 
 	// When
 	allowDirectives := mustDirectives(BuildCorazaDirectives(allow, nil, "", false, 0))
@@ -140,11 +142,12 @@ func TestBuildCorazaDirectives_allowAndDenyModesUnchangedByBypass(t *testing.T) 
 func TestBuildCorazaDirectives_ipACLDenyCarriesSkipAfterAndMarker(t *testing.T) {
 	// Given：deny 模式 ACL + 遗留黑名单各一条
 	policy := &models.SecurityPolicy{
-		Mode:         "blocking",
-		IPACLMode:    "deny",
-		IPACLList:    `["203.0.113.0/24"]`,
-		IPACLEnabled: true,
-		IPBlacklist:  json.RawMessage(`["192.0.2.99"]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		IPACLMode:        "deny",
+		IPACLList:        `["203.0.113.0/24"]`,
+		IPACLEnabled:     true,
+		IPBlacklist:      json.RawMessage(`["192.0.2.99"]`),
 	}
 
 	// When
@@ -278,7 +281,7 @@ func TestBuildCorazaDirectives_includesUserOverridesWhenFileExists(t *testing.T)
 	useCRSDirectivesDir(t, dir)
 
 	// When
-	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: "blocking"}, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 0))
 
 	// Then the overrides include follows the crs-setup include
 	setupIdx := strings.Index(directives, "Include /app/waf/crs/crs-setup.conf")
@@ -299,7 +302,7 @@ func TestBuildCorazaDirectives_omitsUserOverridesWhenFileMissing(t *testing.T) {
 	useCRSDirectivesDir(t, t.TempDir())
 
 	// When
-	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: "blocking"}, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 0))
 
 	// Then
 	if strings.Contains(directives, "zz-user-overrides") {
@@ -322,7 +325,7 @@ func TestBuildCorazaDirectives_activatesJSONXMLBodyProcessors(t *testing.T) {
 
 	for _, mode := range []string{"blocking", "detection"} {
 		// Given / When：CRS 加载的两种模式
-		directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: mode}, nil, "", false, 0))
+		directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: mode}, nil, "", false, 0))
 
 		// Then：两条激活规则存在，且位于 crs-setup Include 之前（phase:1 按
 		// 发射序执行，晚于 901340 的激活无法阻止 URLENCODED 兜底）
@@ -351,7 +354,7 @@ func TestBuildCorazaDirectives_flagsBodyProcessorErrors(t *testing.T) {
 	guard := `SecRule REQBODY_PROCESSOR_ERROR "@eq 1" "id:11,phase:2,pass,log,setvar:tx.inbound_anomaly_score_pl1=+5,msg:'请求体解析失败'"`
 	for _, mode := range []string{"blocking", "detection"} {
 		// Given / When
-		directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: mode}, nil, "", false, 0))
+		directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: mode}, nil, "", false, 0))
 
 		// Then
 		if !strings.Contains(directives, guard) {
@@ -427,6 +430,7 @@ func TestBuildCorazaDirectives_skipsIllegalSecRuleRemoveTargets(t *testing.T) {
 	// 全部配置编译失败/LB 停摆）与越界 range（1-999999 静默删光全部规则）
 	// 必须跳过；合法单 ID 与合法区间照常发射。
 	policy := &models.SecurityPolicy{
+		AnomalyThreshold: 5,
 		Mode:             "blocking",
 		CRSRuleGroups:    json.RawMessage(`["942"]`),
 		CRSExcludedRules: json.RawMessage(`["942100","ABCDEF","942100-abc","REQUEST-942.conf","1-999999","932100-932200"]`),
@@ -483,8 +487,9 @@ func TestBuildCorazaDirectives_emitsCustomRuleWithNullColumns(t *testing.T) {
 	}
 	r2ID, _ := r2.LastInsertId()
 	policy := &models.SecurityPolicy{
-		Mode:        "blocking",
-		CustomRules: json.RawMessage(fmt.Sprintf("[%d,%d]", r1ID, r2ID)),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CustomRules:      json.RawMessage(fmt.Sprintf("[%d,%d]", r1ID, r2ID)),
 	}
 
 	// When
@@ -513,7 +518,10 @@ func TestBuildRateLimitHandler_sweepIntervalAtHandlerLevel(t *testing.T) {
 	_ = sec
 	_ = burst
 	policy := &models.SecurityPolicy{RateLimitEnabled: true, RateLimitRPS: 5, RateLimitBurst: 10}
-	handler := buildRateLimitHandler("lb_test", policy)
+	handler, err := buildRateLimitHandler("lb_test", policy)
+	if err != nil {
+		t.Fatalf("buildRateLimitHandler: %v", err)
+	}
 	if handler["sweep_interval"] != "10m" {
 		t.Fatalf("sweep_interval must live at handler level, got %v", handler["sweep_interval"])
 	}
@@ -543,7 +551,7 @@ func TestBuildCorazaDirectives_crsPoolFingerprint(t *testing.T) {
 	dir := t.TempDir()
 	useCRSDirectivesDir(t, dir)
 	_, database := newClusterTestService(t)
-	policy := &models.SecurityPolicy{Mode: "blocking"}
+	policy := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}
 
 	// When：第一次渲染
 	d1 := mustDirectives(BuildCorazaDirectives(policy, database, "", false, 0))
@@ -607,8 +615,12 @@ func TestBuildCorazaDirectives_responseBodyAccessGatedByCRSMode(t *testing.T) {
 		{"detection", true},
 		{"custom_only", false},
 	} {
-		directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: tc.mode, WAFCheckResponse: true,
-			CustomRules: json.RawMessage(`[{"id":1,"name":"r","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/x"}]}]`)}, nil, "", false, 0))
+		p := &models.SecurityPolicy{Mode: tc.mode, WAFCheckResponse: true,
+			CustomRules: json.RawMessage(`[{"id":1,"name":"r","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/x"}]}]`)}
+		if tc.mode == "blocking" || tc.mode == "detection" {
+			p.AnomalyThreshold = 5
+		}
+		directives := mustDirectives(BuildCorazaDirectives(p, nil, "", false, 0))
 		got := strings.Contains(directives, "SecResponseBodyAccess On")
 		if got != tc.want {
 			t.Fatalf("mode=%s SecResponseBodyAccess On=%v, want %v:\n%s", tc.mode, got, tc.want, directives)

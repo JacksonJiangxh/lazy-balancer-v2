@@ -22,6 +22,7 @@ func TestRulePayload_hostHeaderAndDnsServerValidation(t *testing.T) {
 	router.POST("/rules", handler.CreateRule)
 	base := func(extra string) string {
 		return `{"name":"payload-v","protocol":"http","domain":"payload.test","listen_port":18582,` +
+			`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,` +
 			`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}],` + extra + `}`
 	}
 	create := func(body string) *httptest.ResponseRecorder {

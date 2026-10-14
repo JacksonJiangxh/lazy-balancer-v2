@@ -94,7 +94,7 @@ func TestRuleWrites_reject_overlapping_domain_lists(t *testing.T) {
 		path  string
 		body  string
 	}{
-		{name: "create", mount: func(router *gin.Engine, handler *Handlers) { router.POST("/rules", handler.CreateRule) }, path: "/rules", body: `{"name":"overlap","protocol":"http","domain":"a.example.test, b.example.test","listen_port":8080,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`},
+		{name: "create", mount: func(router *gin.Engine, handler *Handlers) { router.POST("/rules", handler.CreateRule) }, path: "/rules", body: `{"name":"overlap","protocol":"http","domain":"a.example.test, b.example.test","listen_port":8080,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`},
 		{name: "update", mount: func(router *gin.Engine, handler *Handlers) { router.PUT("/rules/:caddy_id", handler.UpdateRule) }, path: "/rules/lb_target", body: `{"domain":"a.example.test, b.example.test"}`},
 	}
 	for _, test := range tests {
@@ -147,7 +147,7 @@ func TestCreateRule_succeeds_when_domain_owned_by_disabled_rule(t *testing.T) {
 	}
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
-	body := strings.NewReader(`{"name":"new-rule","protocol":"http","domain":"occupied.example.test","listen_port":8080,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`)
+	body := strings.NewReader(`{"name":"new-rule","protocol":"http","domain":"occupied.example.test","listen_port":8080,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`)
 	request := httptest.NewRequest(http.MethodPost, "/rules", body)
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -269,7 +269,7 @@ func TestCreateRule_removes_rule_and_restores_Caddy_when_ACME_queue_is_unavailab
 	}
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
-	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(fmt.Sprintf(`{"name":"acme-create","protocol":"http","domain":"create.example.test","listen_port":8080,"enable_tls":true,"tls_source":"acme_dns","acme_config_id":%d,"ca_provider_id":1,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, dnsConfigID)))
+	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(fmt.Sprintf(`{"name":"acme-create","protocol":"http","domain":"create.example.test","listen_port":8080,"enable_tls":true,"tls_source":"acme_dns","acme_config_id":%d,"ca_provider_id":1,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, dnsConfigID)))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
@@ -774,7 +774,7 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 		assert func(*testing.T)
 	}{
 		{
-			name: "create", method: http.MethodPost, path: "/rules", body: `{"name":"candidate","protocol":"tcp","listen_port":19001,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
+			name: "create", method: http.MethodPost, path: "/rules", body: `{"name":"candidate","protocol":"tcp","listen_port":19001,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
 			seed: func(t *testing.T) {
 				if _, err := db.DB.Exec(`CREATE TRIGGER block_create_compensation BEFORE DELETE ON lb_rules WHEN OLD.name='candidate' BEGIN SELECT RAISE(ABORT,'delete blocked'); END`); err != nil {
 					t.Fatalf("create compensation blocker: %v", err)
@@ -1635,7 +1635,7 @@ func TestRuleLifecycle_recordsReloadAuditAfterTransactionalApply(t *testing.T) {
 			mount:  func(router *gin.Engine, handler *Handlers) { router.POST("/rules", handler.CreateRule) },
 			method: http.MethodPost,
 			path:   "/rules",
-			body:   `{"name":"reload-audit","protocol":"http","domain":"reload-audit.example.test","listen_port":8090,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
+			body:   `{"name":"reload-audit","protocol":"http","domain":"reload-audit.example.test","listen_port":8090,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
 			source: "创建规则",
 		},
 		{
@@ -1743,7 +1743,7 @@ func TestRuleSave_appliesExactlyOnce(t *testing.T) {
 			},
 			method: http.MethodPost,
 			path:   "/rules",
-			body:   `{"name":"single-apply","protocol":"http","domain":"single-apply.example.test","listen_port":8091,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
+			body:   `{"name":"single-apply","protocol":"http","domain":"single-apply.example.test","listen_port":8091,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
 		},
 		{
 			// 先创建使 http_8092 server 进入运行配置（旧探针对已存在 server 才
@@ -1762,7 +1762,7 @@ func TestRuleSave_appliesExactlyOnce(t *testing.T) {
 			// 判定点保持为一次真实最终应用。
 			body: `{"name":"after","listen_port":8093}`,
 			prep: func(t *testing.T, router *gin.Engine) string {
-				request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"prep","protocol":"http","domain":"single-apply.example.test","listen_port":8092,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
+				request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"prep","protocol":"http","domain":"single-apply.example.test","listen_port":8092,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
 				request.Header.Set("Content-Type", "application/json")
 				rec := httptest.NewRecorder()
 				router.ServeHTTP(rec, request)
@@ -1826,6 +1826,7 @@ func TestCreateRule_manualTLSSelfSigned_recordsCertWarningAudit(t *testing.T) {
 		"name": "tls-warn", "protocol": "http", "domain": "tls-warn.example.test",
 		"listen_port": 8443, "enable_tls": true, "tls_source": "manual",
 		"tls_cert": certPEM, "tls_key": keyPEM,
+		"health_check_interval": 10, "health_check_timeout": 2, "health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
 		"upstreams": []map[string]any{{"host": "127.0.0.1", "port": 9000, "enabled": true}},
 	})
 	if err != nil {
@@ -1904,6 +1905,7 @@ func TestCreateRule_manualTLSTrustedChain_omitsCertWarningAudit(t *testing.T) {
 		"name": "tls-ok", "protocol": "http", "domain": "tls-ok.example.test",
 		"listen_port": 8443, "enable_tls": true, "tls_source": "manual",
 		"tls_cert": certPEM, "tls_key": keyPEM,
+		"health_check_interval": 10, "health_check_timeout": 2, "health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
 		"upstreams": []map[string]any{{"host": "127.0.0.1", "port": 9000, "enabled": true}},
 	})
 	if err != nil {
@@ -1945,6 +1947,7 @@ func TestCreateRule_tcpTLSMaterialNormalized_omitsCertWarningAudit(t *testing.T)
 		"name": "tcp-cert", "protocol": "tcp",
 		"listen_port": 8553, "enable_tls": true, "tls_source": "manual",
 		"tls_cert": certPEM, "tls_key": keyPEM,
+		"health_check_interval": 10, "health_check_timeout": 2, "health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
 		"upstreams": []map[string]any{{"host": "127.0.0.1", "port": 9000, "enabled": true}},
 	})
 	if err != nil {

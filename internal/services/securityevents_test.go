@@ -3347,7 +3347,7 @@ func resetSecurityEventsPollState(t *testing.T) {
 func TestSecurityEventsPolicyContainsRule_leadingZeroRuleIDGroupDecode(t *testing.T) {
 	// Given：blocking 策略组号存量 "94"（带外/旧数据形态）；畸形前导零规则
 	// ID "0942100"（数值 942100，真实组号 21，[1:3] 错位切片恰得 "94"）
-	policy := &models.SecurityPolicy{Mode: "blocking", CRSRuleGroups: json.RawMessage(`["94"]`)}
+	policy := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", CRSRuleGroups: json.RawMessage(`["94"]`)}
 	// When
 	claimed := securityEventsPolicyContainsRule(policy, "0942100", "198.51.100.9")
 	// Then：不得被错位解码的 "94" 组误认领
@@ -3355,11 +3355,11 @@ func TestSecurityEventsPolicyContainsRule_leadingZeroRuleIDGroupDecode(t *testin
 		t.Fatal("leading-zero rule id 0942100（真实组号 21）不得被错位切片解码出的 \"94\" 组认领")
 	}
 	// 回归形状：规范 6 位形态组号解码不受影响（组 42 策略认领 942100）
-	regPolicy := &models.SecurityPolicy{Mode: "blocking", CRSRuleGroups: json.RawMessage(`["42"]`)}
+	regPolicy := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", CRSRuleGroups: json.RawMessage(`["42"]`)}
 	if !securityEventsPolicyContainsRule(regPolicy, "942100", "198.51.100.9") {
 		t.Fatal("规范 6 位形态 942100 必须按组 42 正常认领（回归形状）")
 	}
 	// 畸形形状：前导零串同样不得被真实组 21 策略按错位解码误配/误拒 panic
-	g21Policy := &models.SecurityPolicy{Mode: "blocking", CRSRuleGroups: json.RawMessage(`["21"]`)}
+	g21Policy := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", CRSRuleGroups: json.RawMessage(`["21"]`)}
 	_ = securityEventsPolicyContainsRule(g21Policy, "0942100", "198.51.100.9") // 断言不 panic
 }

@@ -155,6 +155,7 @@ func TestCreateRule_rejects_path_rule_with_empty_upstreams_array(t *testing.T) {
 		"name":"empty-path-upstreams","protocol":"http","domain":"empty-paths.example.test","listen_port":13010,
 		"custom_routes_enabled":true,
 		"path_rules":[{"sort_order":0,"match_type":"prefix","path":"/api","upstreams":[]}],
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -182,6 +183,7 @@ func TestCreateRule_rejects_port_80_tls_redirect_self_loop(t *testing.T) {
 	body := fmt.Sprintf(`{
 		"name":"tls-loop-80","protocol":"http","domain":"tls-loop.example.test","listen_port":80,
 		"enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q,"tls_http_redirect":true,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`, certPEM, keyPEM)
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
@@ -213,6 +215,7 @@ func TestCreateRule_accepts_port_443_tls_redirect(t *testing.T) {
 	body := fmt.Sprintf(`{
 		"name":"tls-ok-443","protocol":"http","domain":"tls-ok.example.test","listen_port":443,
 		"enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q,"tls_http_redirect":true,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`, certPEM, keyPEM)
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))

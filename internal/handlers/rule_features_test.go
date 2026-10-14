@@ -218,7 +218,7 @@ func TestCreateRule_rejects_empty_domain_for_HTTP(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
-	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"no-domain","protocol":"http","listen_port":8080,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
+	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"no-domain","protocol":"http","listen_port":8080,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
@@ -262,7 +262,7 @@ func TestCreateRule_rejects_manual_TLS_without_certificate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
-	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"manual-nocert","protocol":"http","domain":"manual-nocert.example.test","listen_port":8443,"enable_tls":true,"tls_source":"manual","upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
+	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"manual-nocert","protocol":"http","domain":"manual-nocert.example.test","listen_port":8443,"enable_tls":true,"tls_source":"manual","health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
@@ -291,7 +291,7 @@ func TestCreateRule_rejects_unknown_tls_source(t *testing.T) {
 			gin.SetMode(gin.TestMode)
 			router := gin.New()
 			router.POST("/rules", handler.CreateRule)
-			body := fmt.Sprintf(`{"name":"tls-source","protocol":"http","domain":%q,"listen_port":0,"enable_tls":true,"tls_source":%q,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, test.domain, test.tlsSource)
+			body := fmt.Sprintf(`{"name":"tls-source","protocol":"http","domain":%q,"listen_port":0,"enable_tls":true,"tls_source":%q,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, test.domain, test.tlsSource)
 			request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 			request.Header.Set("Content-Type", "application/json")
 			response := httptest.NewRecorder()
@@ -407,6 +407,7 @@ func TestCreateRule_accepts_API_key_user_ID_and_succeeds_with_all_feature_column
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{
 		"name":"全字段 TCP 规则","protocol":"tcp","listen_port":13000,
 		"tcp_health_check_port":9000,"tcp_proxy_protocol":true,"tcp_try_duration":5,"tcp_try_interval":250,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"weight":1,"enabled":true}]
 	}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -497,7 +498,7 @@ func TestCreateRule_persists_requested_DNS_family(t *testing.T) {
 			router := gin.New()
 			router.POST("/rules", handler.CreateRule)
 			// N+12 G8-S1：TCP+dynamic_dns 保存侧已拒绝，dns_family 持久化改用 HTTP 载体。
-			body := strings.NewReader(fmt.Sprintf(`{"name":"dns-%s","protocol":"http","domain":"dns-%s.example.test","listen_port":%d,"dynamic_dns":true,"dns_family":"%s","upstreams":[{"host":"example.test","port":9000,"enabled":true}]}`, test.family, test.family, test.port, test.family))
+			body := strings.NewReader(fmt.Sprintf(`{"name":"dns-%s","protocol":"http","domain":"dns-%s.example.test","listen_port":%d,"dynamic_dns":true,"dns_family":"%s","health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"example.test","port":9000,"enabled":true}]}`, test.family, test.family, test.port, test.family))
 			request := httptest.NewRequest(http.MethodPost, "/rules", body)
 			request.Header.Set("Content-Type", "application/json")
 			response := httptest.NewRecorder()
@@ -529,7 +530,7 @@ func TestCreateRule_does_not_require_CA_provider_outside_ACME(t *testing.T) {
 		{
 			name: "TCP rule",
 			body: func(*testing.T) string {
-				return `{"name":"tcp-no-ca","protocol":"tcp","listen_port":13003,"ca_provider_id":999,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
+				return `{"name":"tcp-no-ca","protocol":"tcp","listen_port":13003,"ca_provider_id":999,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
 			},
 			port: 13003,
 		},
@@ -543,6 +544,7 @@ func TestCreateRule_does_not_require_CA_provider_outside_ACME(t *testing.T) {
 				payload, err := json.Marshal(map[string]any{
 					"name": "manual-no-ca", "protocol": "http", "domain": "manual.example.test", "listen_port": 13004,
 					"enable_tls": true, "tls_source": "manual", "tls_cert": certPEM, "tls_key": keyPEM,
+					"health_check_interval": 10, "health_check_timeout": 2, "health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
 					"upstreams": []map[string]any{{"host": "127.0.0.1", "port": 9000, "enabled": true}},
 				})
 				if err != nil {
@@ -555,7 +557,7 @@ func TestCreateRule_does_not_require_CA_provider_outside_ACME(t *testing.T) {
 		{
 			name: "HTTP rule without TLS",
 			body: func(*testing.T) string {
-				return `{"name":"http-no-ca","protocol":"http","domain":"plain.example.test","listen_port":13005,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
+				return `{"name":"http-no-ca","protocol":"http","domain":"plain.example.test","listen_port":13005,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
 			},
 			port: 13005,
 		},
@@ -614,7 +616,7 @@ func TestCreateRule_resolves_default_CA_provider_for_ACME(t *testing.T) {
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
-	requestBody := fmt.Sprintf(`{"name":"default-ca","protocol":"http","domain":"default-ca.example.test","listen_port":13006,"enable_tls":true,"tls_source":"acme_dns","acme_config_id":%d,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, dnsConfigID)
+	requestBody := fmt.Sprintf(`{"name":"default-ca","protocol":"http","domain":"default-ca.example.test","listen_port":13006,"enable_tls":true,"tls_source":"acme_dns","acme_config_id":%d,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, dnsConfigID)
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(requestBody))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()

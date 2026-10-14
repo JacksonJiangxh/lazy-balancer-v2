@@ -111,7 +111,7 @@ func TestCreateRule_rejects_acme_dns_without_certificate_config(t *testing.T) {
 	handler, _, _ := newAuditRuleHandlers(t, 0)
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
-	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"acme-no-config","protocol":"http","domain":"no-config.example.test","listen_port":8080,"enable_tls":true,"tls_source":"acme_dns","upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
+	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{"name":"acme-no-config","protocol":"http","domain":"no-config.example.test","listen_port":8080,"enable_tls":true,"tls_source":"acme_dns","health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 

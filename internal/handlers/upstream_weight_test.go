@@ -55,6 +55,7 @@ func TestCreateRule_zeroWeightStillNormalized(t *testing.T) {
 		"name": "zero-weight", "protocol": "http", "domain": "zero.example.test",
 		"listen_port": 443, "strategy": "weighted_round_robin",
 		"enable_tls": false, "tls_source": "manual", "enabled": false,
+		"health_check_interval": 10, "health_check_timeout": 2, "health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
 		"upstreams": []map[string]any{{"host": "10.0.0.1", "port": 8080, "weight": 0, "enabled": true}},
 	}
 	raw, _ := json.Marshal(body)

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -894,6 +895,21 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 				Logf("warn", "快照携带 mode=off 且挂启用自定义规则的策略 %v(旧主节点语义):新版本 off=全关,该策略自定义规则暂不生效,请升级主节点后由其重发快照(或改用 custom_only)", p["name"])
 			}
 		}
+		// 库值唯一真相（批 3）：apply 门值列归一——旧主快照/带外脏值不得在
+		// 从节点复制渲染期静默漂移。anomaly_threshold<=0/nil→5（Create 侧默认，
+		// 与主节点启动回填同口径）；rate_limit_burst<0→0（类型②省略型规范值，
+		// 负值仅带外可达）；block_status_code 枚举外→403（默认拦截状态码，与
+		// 启动归一/导入门同口径）。rate_limit_rps 有意不归一：无默认可归，镜像
+		// 语义下主从渲染同报错（fail-visible，buildRateLimitHandler）。
+		if toFloat64(p["anomaly_threshold"]) <= 0 {
+			p["anomaly_threshold"] = int64(5)
+		}
+		if toFloat64(p["rate_limit_burst"]) < 0 {
+			p["rate_limit_burst"] = int64(0)
+		}
+		if !ValidBlockStatusCode(int(toFloat64(p["block_status_code"]))) {
+			p["block_status_code"] = int64(403)
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO security_policies (id,name,description,mode,anomaly_threshold,ip_acl_mode,ip_acl_list,ip_acl_enabled,ip_whitelist,ip_whitelist_enabled,ip_blacklist,rate_limit_enabled,rate_limit_rps,rate_limit_burst,crs_rule_groups,crs_excluded_rules,custom_rules,block_page_id,block_status_code,enabled,updated_by,created_at,updated_at,geoip_countries,geoip_mode,waf_check_response,log_request_body,ip_acl_list_refs,ip_whitelist_refs,policy_type,trust_detection) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			p["id"], p["name"], p["description"], p["mode"], p["anomaly_threshold"],
 			p["ip_acl_mode"], snapshotJSONText(p["ip_acl_list"]), p["ip_acl_enabled"],
@@ -1174,13 +1190,27 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	// 完成登录校验，性质不同。
 	args := []any{settings.LogLevel, settings.TaskLogSizeMB, settings.AuditLogSizeMB, settings.RuntimeLogSizeMB, settings.AuditRetentionMonths, settings.JWTExpireMinutes, settings.Timezone, settings.ACMEEmail, settings.CertExpiryDays, settings.CertRenewalDays, settings.CertRenewalAttempts, settings.DefaultCAProviderID, settings.DNSProvider, settings.DNSCredentials, settings.SyncInterval, settings.AdminTLSEnabled, settings.AdminTLSMode, settings.AdminTLSCert, settings.AdminTLSKey, settings.MFAWriteGuard, settings.MFALockoutEnabled, settings.GitHubProxyURL, settings.OIDCConfig, settings.BrandingJSON}
 	if snapshot.CaddyConfig != nil {
-		// R60 A-N1：全局 body 上限钳制 [0,4096]（与 insertSnapshotRules 的行级
-		// 归一、写侧校验、导入钳制同边界）——这是全局轴最后一个未闭合的持久化
-		// 边界；渲染侧 int64(MB)*1024*1024 回绕会让限制静默取消。
-		if settings.RequestBodyMaxSizeMB < 0 {
-			settings.RequestBodyMaxSizeMB = 0
+		// R60 A-N1：全局 body 上限钳制 [1,4096]（与 insertSnapshotRules 的行级
+		// 归一、写侧校验、导入钳制同边界）——渲染侧 int64(MB)*1024*1024 回绕会让
+		// 限制静默取消。库值唯一真相（批 1+2）：request_body_max_size_mb 与
+		// http 三超时/caddy_log_size_mb 为类型①值型列——旧版本主端快照携带的
+		// 0/越界值在从端落库前归治理默认，渲染层已零兜底。
+		if settings.RequestBodyMaxSizeMB <= 0 {
+			settings.RequestBodyMaxSizeMB = db.DefaultRequestBodyMaxSizeMB
 		} else if settings.RequestBodyMaxSizeMB > 4096 {
 			settings.RequestBodyMaxSizeMB = 4096
+		}
+		if settings.HTTPReadTimeout <= 0 {
+			settings.HTTPReadTimeout = db.DefaultHTTPReadTimeout
+		}
+		if settings.HTTPWriteTimeout <= 0 {
+			settings.HTTPWriteTimeout = db.DefaultHTTPWriteTimeout
+		}
+		if settings.HTTPIdleTimeout <= 0 {
+			settings.HTTPIdleTimeout = db.DefaultHTTPIdleTimeout
+		}
+		if settings.CaddyLogSizeMB <= 0 {
+			settings.CaddyLogSizeMB = db.DefaultCaddyLogSizeMB
 		}
 		query += ",caddy_config=?,access_log_json=?,access_log_format=?,caddy_log_level=?,caddy_log_size_mb=?,request_body_max_size_mb=?,http_read_timeout=?,http_write_timeout=?,http_idle_timeout=?,upstream_keepalive_timeout=?,proxy_dial_timeout=?,proxy_response_header_timeout=?,proxy_read_timeout=?,proxy_write_timeout=?,proxy_stream_timeout=?,proxy_flush_interval=?,proxy_stream_close_delay=?,server_tokens_hidden=?,trusted_proxy_enabled=?,trusted_proxy_ranges=?,trusted_proxy_range_refs=?,trusted_proxy_headers=?,trusted_proxy_strict=?"
 		args = append(args, *snapshot.CaddyConfig, settings.AccessLogJSON, settings.AccessLogFormat, settings.CaddyLogLevel, settings.CaddyLogSizeMB,

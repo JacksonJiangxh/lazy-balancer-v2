@@ -613,6 +613,11 @@ func (h *Handlers) DeleteSecurityBlockPage(c *gin.Context) {
 //  2. enabled 用 COALESCE(enabled,1)（schema 默认 TRUE）：List/Get 无 enabled
 //     WHERE 过滤，NULL-enabled 行须按 schema 默认呈现启用态；生成路径以
 //     WHERE enabled=1 守卫，NULL 行本就被过滤，故裸列即可。
+//  3. 库值唯一真相（批 3）刻意第三差异：anomaly_threshold 此处保留
+//     COALESCE(...,5)（展示层对带外 NULL 行按 Create 默认呈现，容忍遗留脏
+//     行）；services 两条生成投影已改 COALESCE(...,0) 无效哨兵——NULL/<=0
+//     在渲染层 fail-visible（BuildCorazaDirectives 显性报错），展示层不做
+//     行为消费，无需同口径。
 const securityPolicySelectColumns = `id, name, COALESCE(description,''), COALESCE(mode,'off'), COALESCE(anomaly_threshold,5), COALESCE(ip_acl_mode,''), COALESCE(ip_acl_list,'[]'), COALESCE(ip_acl_enabled,0), COALESCE(ip_whitelist_enabled,1), COALESCE(ip_whitelist,'[]'), COALESCE(ip_blacklist,'[]'),
 	COALESCE(rate_limit_enabled,0), COALESCE(rate_limit_rps,0), COALESCE(rate_limit_burst,0), COALESCE(crs_rule_groups,'[]'), COALESCE(crs_excluded_rules,'[]'), COALESCE(custom_rules,'[]'), COALESCE(block_page_id,0), COALESCE(block_status_code,0), COALESCE(enabled,1), COALESCE(updated_by,0), COALESCE(created_at,''), COALESCE(updated_at,''), COALESCE(geoip_countries,'[]'), COALESCE(geoip_mode,'off'), COALESCE(waf_check_response,0), COALESCE(log_request_body,0), COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_refs,'[]'), COALESCE(policy_type,''), COALESCE(trust_detection,0)`
 

@@ -1219,6 +1219,21 @@ func validateV2BackupRules(tables map[string][]map[string]any) error {
 				rule["request_body_max_size_mb"] = clamped
 			}
 		}
+		// 库值唯一真相（批 1+2）：健康检查族/tcp_try_interval 为类型①值型列，
+		// 旧备份可携带 0（渲染兜底时代合法落库）——导入门写回归治理默认，
+		// restoreTable 直写后库恒有效（渲染层已零兜底）；缺失键由
+		// backupTableNullDefaults 的 NULL→默认通道承担，两通道落同一默认值。
+		for key, def := range map[string]int64{
+			"health_check_interval":            int64(db.DefaultHealthCheckInterval),
+			"health_check_timeout":             int64(db.DefaultHealthCheckTimeout),
+			"health_check_unhealthy_threshold": int64(db.DefaultHealthCheckUnhealthyThreshold),
+			"health_check_healthy_threshold":   int64(db.DefaultHealthCheckHealthyThreshold),
+			"tcp_try_interval":                 int64(db.DefaultTCPTryInterval),
+		} {
+			if n, ok := backupInteger(rule[key]); !ok || n <= 0 {
+				rule[key] = def
+			}
+		}
 		// R57 C-5（R58 C-N1 修正）：dynamic_dns+dns_family 走与保存侧同口径的
 		// 枚举校验——此前 input 不带 DnsFamily，垃圾值原样落库后渲染端 versions
 		// 双 false 解析退化为双栈（fail-open 方向）。合法值含 "both"：UI 双选
@@ -1457,8 +1472,27 @@ func validateV2BackupSecurityPolicies(tables map[string][]map[string]any) error 
 		// W3-R44-3(第 44 轮 W3 评审):429 已剔出保存侧白名单(SEC44-1)——
 		// 导入侧归一为 403,与 CERT44-1 同格(导入不宽于保存侧),修复前时代
 		// 的合法备份不因新白名单硬拒。
-		if v, ok := backupInteger(policy["block_status_code"]); ok && v == 429 {
-			policy["block_status_code"] = int64(403)
+		// 库值唯一真相（批 3）：值列导入门归一——旧备份可携带治理前形态
+		//（anomaly_threshold=0/NULL/非整数、burst 负值、block_status_code 枚举
+		// 外如 429/418），在导入门写回归一值后 restoreTable 直写，库恒有效
+		//（渲染层已零兜底/fail-visible）；缺失键由 backupTableNullDefaults 的
+		// NULL→默认通道承担（anomaly→5、block→0 省略型）。429 归一为 W3 既有
+		// 口径的枚举外全集特例。rate_limit_rps 不在此归一：enabled=1 时 rps<1
+		// 交由下方既有检查 400 拒绝（写侧同口径，导入不宽于保存侧）。
+		if raw, exists := policy["anomaly_threshold"]; exists {
+			if n, ok := backupInteger(raw); !ok || n <= 0 {
+				policy["anomaly_threshold"] = int64(5)
+			}
+		}
+		if raw, exists := policy["rate_limit_burst"]; exists {
+			if n, ok := backupInteger(raw); !ok || n < 0 {
+				policy["rate_limit_burst"] = int64(0)
+			}
+		}
+		if raw, exists := policy["block_status_code"]; exists {
+			if n, ok := backupInteger(raw); !ok || !services.ValidBlockStatusCode(int(n)) {
+				policy["block_status_code"] = int64(403)
+			}
 		}
 		mode := backupString(policy["mode"])
 		if mode == "" {
@@ -2509,17 +2543,37 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 			}
 		}
 	}
-	// R58 C-N2：request_body_max_size_mb 导入钳制 ≤4096（与 R57 C-7 写侧三处
+	// R58 C-N2：request_body_max_size_mb 导入钳制（与 R57 C-7 写侧三处
 	// 同边界）——溢出向量此前只堵了保存/更新，备份导入可携带天文数字绕过，
-	// 渲染侧 MB→字节 int64 乘法回绕会让 body 限制静默取消。
+	// 渲染侧 MB→字节 int64 乘法回绕会让 body 限制静默取消。库值唯一真相
+	//（批 1+2）：该列为类型①值型列，<=0（旧备份的渲染兜底时代残留/NULL）
+	// 归治理默认 128。
 	if value, exists := backup.Config["request_body_max_size_mb"]; exists {
-		if n, ok := backupInteger(value); ok && (n < 0 || n > 4096) {
-			clamped := 0
+		if n, ok := backupInteger(value); ok && (n <= 0 || n > 4096) {
+			clamped := db.DefaultRequestBodyMaxSizeMB
 			if n > 4096 {
 				clamped = 4096
 			}
 			backup.Config["request_body_max_size_mb"] = clamped
 			certNumericClamped = append(certNumericClamped, fmt.Sprintf("request_body_max_size_mb 越界（%d），已钳位为 %d", n, clamped))
+		}
+	}
+	// 库值唯一真相（批 1+2）：http 三超时为类型①值型列（NOT NULL DEFAULT
+	// 60/60/120+启动回填）——旧备份的 0/NULL（省略语义时代残留）在导入门归
+	// 治理默认，restoreTable 的字段级 UPDATE 直写后库恒有效（渲染层已零兜底）。
+	for _, kc := range []struct {
+		key string
+		def int
+	}{
+		{"http_read_timeout", db.DefaultHTTPReadTimeout},
+		{"http_write_timeout", db.DefaultHTTPWriteTimeout},
+		{"http_idle_timeout", db.DefaultHTTPIdleTimeout},
+	} {
+		if value, exists := backup.Config[kc.key]; exists {
+			if n, ok := backupInteger(value); !ok || n <= 0 {
+				backup.Config[kc.key] = kc.def
+				certNumericClamped = append(certNumericClamped, fmt.Sprintf("%s 非法（须为正整数），已归默认 %d", kc.key, kc.def))
+			}
 		}
 	}
 	ctx := c.Request.Context()

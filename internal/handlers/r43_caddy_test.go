@@ -23,7 +23,7 @@ func TestCreateRule_rejects_unknown_protocol(t *testing.T) {
 	router.POST("/rules", handler.CreateRule)
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{
 		"name":"https-proto","protocol":"https","domain":"https.example.test","listen_port":8443,
-		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()

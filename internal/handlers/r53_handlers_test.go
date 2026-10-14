@@ -130,7 +130,7 @@ func TestCreateRule_rejects_disabled_certificate_config(t *testing.T) {
 	}
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
-	body := fmt.Sprintf(`{"name":"disabled-cfg","protocol":"http","domain":"disabled-cfg.example.test","listen_port":8080,"enable_tls":true,"tls_source":"acme_dns","acme_config_id":%d,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, configID)
+	body := fmt.Sprintf(`{"name":"disabled-cfg","protocol":"http","domain":"disabled-cfg.example.test","listen_port":8080,"enable_tls":true,"tls_source":"acme_dns","acme_config_id":%d,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, configID)
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()

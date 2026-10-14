@@ -63,12 +63,10 @@ func TestBuildHTTPHandleChain_nonPositiveWeightsNormalized(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rule := SingleRuleConfig{
-				CaddyID:  "lb_weight_gate",
+			rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_weight_gate",
 				Domain:   "weight-gate.test",
 				Protocol: "http",
-				Strategy: "weighted_round_robin",
-			}
+				Strategy: "weighted_round_robin"}
 			ups := make([]UpstreamConfig, 0, len(tc.input))
 			for i, w := range tc.input {
 				ups = append(ups, UpstreamConfig{

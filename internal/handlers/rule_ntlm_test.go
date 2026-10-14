@@ -51,6 +51,7 @@ func TestCreateRule_rejects_ntlm_with_non_cookie_strategy(t *testing.T) {
 	response := serveJSON(t, router, http.MethodPost, "/rules", `{
 		"name":"ntlm-poll","protocol":"http","domain":"ntlm-poll.example.test","listen_port":18001,
 		"strategy":"weighted_round_robin","ntlm_compatible":1,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`)
 
@@ -65,6 +66,7 @@ func TestCreateRule_rejects_ntlm_on_tcp_rule(t *testing.T) {
 	response := serveJSON(t, router, http.MethodPost, "/rules", `{
 		"name":"ntlm-tcp","protocol":"tcp","listen_port":18002,
 		"ntlm_compatible":1,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`)
 
@@ -98,6 +100,7 @@ func TestUpdateRule_rejects_strategy_change_while_ntlm_on(t *testing.T) {
 	caddyID := ntlmCreateAndWait(t, router, `{
 		"name":"ntlm-edit","protocol":"http","domain":"ntlm-edit.example.test","listen_port":18003,
 		"strategy":"cookie","ntlm_compatible":1,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`)
 
@@ -129,6 +132,7 @@ func TestCreateRule_persists_ntlm_and_getrule_returns_it(t *testing.T) {
 	created := serveJSON(t, router, http.MethodPost, "/rules", `{
 		"name":"ntlm-ok","protocol":"http","domain":"ntlm-ok.example.test","listen_port":18005,
 		"strategy":"cookie","ntlm_compatible":1,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`)
 	if created.Code != http.StatusCreated && created.Code != http.StatusOK {
@@ -170,6 +174,7 @@ func TestUpdateRule_ntlm_off_restores_zero_and_omitted_keeps_value(t *testing.T)
 	caddyID := ntlmCreateAndWait(t, router, `{
 		"name":"ntlm-off","protocol":"http","domain":"ntlm-off.example.test","listen_port":18006,
 		"strategy":"cookie","ntlm_compatible":1,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`)
 

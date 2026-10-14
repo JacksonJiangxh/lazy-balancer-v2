@@ -836,12 +836,9 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	if req.Strategy == "" {
 		req.Strategy = "weighted_round_robin"
 	}
-	if req.HealthCheckInterval == 0 {
-		req.HealthCheckInterval = 10
-	}
-	if req.HealthCheckTimeout == 0 {
-		req.HealthCheckTimeout = 2
-	}
+	// 库值唯一真相（批 1+2）：健康检查 interval/timeout 为类型①值型列——
+	// 0→10/2 的写侧静默归一废除（0 由 validateRulePayloadBeforeSave 的 <1
+	// 边界 400；前端表单初值=默认，清空提交被拦）。
 	if req.EnableTLS && req.TLSSource != "manual" && req.TLSSource != "acme_dns" {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"})
 		return
@@ -1264,14 +1261,16 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.HealthCheckPath == nil {
 		req.HealthCheckPath = &existingRule.HealthCheckPath
 	}
+	// 非 nil=沿用存量（0=未提供的 API 编码，非显式零值）先合并——合并后的
+	// 生效值经 validateRulePayloadBeforeSave 的 <1 边界校验（库值唯一真相批 1+2：
+	// 类型①值型列落库恒有效，渲染零兜底）。指针阈值列 nil=沿用存量、显式 0
+	// 直达 <1 门 400。
 	if req.HealthCheckInterval == 0 {
 		req.HealthCheckInterval = existingRule.HealthCheckInterval
 	}
 	if req.HealthCheckTimeout == 0 {
 		req.HealthCheckTimeout = existingRule.HealthCheckTimeout
 	}
-	// LB41-1（M16 口径）：nil=沿用存量，显式 0=落库 0（渲染侧 <=0 兜底默认
-	// 3/2，与 HealthCheckPath/Interval/Timeout 合并区同位补齐）。
 	if req.HealthCheckUnhealthyThreshold == nil {
 		req.HealthCheckUnhealthyThreshold = &existingRule.HealthCheckUnhealthyThreshold
 	}

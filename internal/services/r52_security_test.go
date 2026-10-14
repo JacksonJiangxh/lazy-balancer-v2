@@ -171,3 +171,67 @@ func TestNormalizeLegacySecurityPolicyEnums_backfillsZeroAnomalyThreshold(t *tes
 		t.Fatalf("cluster_version=%d, want %d（一次启动归一净增 1）", v, before+1)
 	}
 }
+
+// 批 3 扩展（R63 B-N5 同族）：负值行同归一——回填口径从 `=0` 扩为 `<=0`
+// （写侧 max1(x,5)/枚举白名单恒产生正值，负值只能是带外直写）。
+func TestNormalizeLegacySecurityPolicyEnums_backfillsNegativeAnomalyThreshold(t *testing.T) {
+	setupSecurityEnumTestDB(t)
+	if _, err := db.DB.Exec(
+		"INSERT INTO security_policies (name, mode, anomaly_threshold) VALUES ('neg-threshold', 'blocking', -3), ('valid-threshold', 'blocking', 10)"); err != nil {
+		t.Fatalf("insert policies: %v", err)
+	}
+
+	NormalizeLegacySecurityPolicyEnums(context.Background())
+
+	var neg, valid int
+	if err := db.DB.QueryRow("SELECT anomaly_threshold FROM security_policies WHERE name='neg-threshold'").Scan(&neg); err != nil {
+		t.Fatalf("read neg-threshold: %v", err)
+	}
+	if err := db.DB.QueryRow("SELECT anomaly_threshold FROM security_policies WHERE name='valid-threshold'").Scan(&valid); err != nil {
+		t.Fatalf("read valid-threshold: %v", err)
+	}
+	if neg != 5 || valid != 10 {
+		t.Fatalf("anomaly_threshold neg-row=%d valid-row=%d, want 5/10（负值归一、合法值不受影响）", neg, valid)
+	}
+}
+
+// 批 3 扩展（SEC44-1 同族）：拦截状态码枚举外值（418 带外、451 SQL 直写形
+// 态——写侧白名单仅 400/401/403/404/503）随启动归一为默认 403；合法枚举
+// （含 0=未设置类型②省略型）不受影响。
+func TestNormalizeLegacySecurityPolicyEnums_backfillsInvalidBlockStatusCode(t *testing.T) {
+	setupSecurityEnumTestDB(t)
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, block_status_code) VALUES
+		('invalid-418', 'blocking', 418),
+		('off-enum-451', 'blocking', 451),
+		('legacy-429', 'blocking', 429),
+		('valid-503', 'blocking', 503),
+		('unset-zero', 'blocking', 0)`); err != nil {
+		t.Fatalf("insert policies: %v", err)
+	}
+
+	NormalizeLegacySecurityPolicyEnums(context.Background())
+
+	readStatus := func(name string) int {
+		t.Helper()
+		var status int
+		if err := db.DB.QueryRow("SELECT block_status_code FROM security_policies WHERE name=?", name).Scan(&status); err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return status
+	}
+	if got := readStatus("invalid-418"); got != 403 {
+		t.Fatalf("invalid-418 block_status_code=%d, want 403（枚举外归一默认）", got)
+	}
+	if got := readStatus("off-enum-451"); got != 403 {
+		t.Fatalf("off-enum-451 block_status_code=%d, want 403（451 非写侧白名单值，SQL 直写形态归一）", got)
+	}
+	if got := readStatus("legacy-429"); got != 403 {
+		t.Fatalf("legacy-429 block_status_code=%d, want 403（SEC44-1 既有归一保持）", got)
+	}
+	if got := readStatus("valid-503"); got != 503 {
+		t.Fatalf("valid-503 block_status_code=%d, want 503（合法值不受影响）", got)
+	}
+	if got := readStatus("unset-zero"); got != 0 {
+		t.Fatalf("unset-zero block_status_code=%d, want 0（类型②省略型合法值不受影响）", got)
+	}
+}

@@ -236,10 +236,16 @@ func TestClusterService_ForgetNodePin_removesOnlyTargetNodePin(t *testing.T) {
 // 渲染/写侧（rule_features/caddy.go、UpdateRule 存量读取，已统一为 2）一致——
 // 快照仍导 5 会让主节点实际行为（2）与下发值（5）分叉，且从节点回放后把 5
 // 物化为非 NULL 值，永久固化错误口径。
-func TestSnapshot_rulesNullHealthCheckTimeout_fallsBackToTwo(t *testing.T) {
-	// Given：一条 health_check_timeout=NULL 的存量规则
+func TestSnapshot_rulesInvalidHealthColumns_normalizedByTransportGate(t *testing.T) {
+	// 库值唯一真相批 1+2：健康检查族为 NOT NULL 值型列（fresh DDL），NULL 行
+	// 结构上不可达（原 LB-04 NULL→2 导出回退随之退役）；带外 0 脏行由传输归一
+	// 门 normalizeRuleForTransport 在导出侧归治理默认——三面（导出/落库/导入）
+	// 同构，渲染层零兜底。
 	cluster, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,health_check_timeout) VALUES ('lb_hc_null','hc-null','http',80,NULL)`); err != nil {
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port) VALUES ('lb_hc_zero','hc-zero','http',80)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE lb_rules SET health_check_timeout=0, health_check_interval=0, tcp_try_interval=0 WHERE caddy_id='lb_hc_zero'`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -249,12 +255,18 @@ func TestSnapshot_rulesNullHealthCheckTimeout_fallsBackToTwo(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Then：快照导出 NULL 回退为 2（与渲染/写侧口径一致）
+	// Then：快照导出 0 行归治理默认（与启动回填/渲染直读口径一致）
 	if len(incoming.Rules) != 1 {
 		t.Fatalf("rules=%d, want 1", len(incoming.Rules))
 	}
 	if incoming.Rules[0].HealthCheckTimeout != 2 {
-		t.Fatalf("health_check_timeout=%d, want 2（与渲染/写侧 NULL 回退口径一致）", incoming.Rules[0].HealthCheckTimeout)
+		t.Fatalf("health_check_timeout=%d, want 2（治理默认，与启动回填同口径）", incoming.Rules[0].HealthCheckTimeout)
+	}
+	if incoming.Rules[0].HealthCheckInterval != 10 {
+		t.Fatalf("health_check_interval=%d, want 10（治理默认）", incoming.Rules[0].HealthCheckInterval)
+	}
+	if incoming.Rules[0].TCPTryInterval != 250 {
+		t.Fatalf("tcp_try_interval=%d, want 250（治理默认）", incoming.Rules[0].TCPTryInterval)
 	}
 }
 

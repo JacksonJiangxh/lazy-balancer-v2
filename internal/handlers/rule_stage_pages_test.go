@@ -119,6 +119,7 @@ func TestRule_stageBlockPages_validation(t *testing.T) {
 	// 创建路径同校验：悬空阶段页 → 400
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{
 		"name":"stage-new","protocol":"http","domain":"stage-new.example.test","listen_port":8081,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}],
 		"block_page_stage3_id":999
 	}`))
@@ -137,6 +138,7 @@ func TestCreateRule_stageBlockPages_roundTrip(t *testing.T) {
 
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{
 		"name":"stage-created","protocol":"http","domain":"stage-created.example.test","listen_port":8082,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}],
 		"block_page_stage1_id":7,"block_page_stage1_status":403,
 		"block_page_stage3_id":8

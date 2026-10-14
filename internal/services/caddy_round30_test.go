@@ -147,7 +147,7 @@ func TestGenerateSingleRuleCaddyConfig_pathRuleEmptyUpstreamArray_fallsBackToMai
 // 包装哨兵，errors.Is 亦可命中。
 func TestGenerateSingleRuleCaddyConfig_zeroUpstreams_returnsErrNoEnabledUpstreamsSentinel(t *testing.T) {
 	// Given
-	rule := SingleRuleConfig{CaddyID: "lb_zero", Protocol: "tcp", ListenPort: 9000}
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_zero", Protocol: "tcp", ListenPort: 9000}
 
 	// When
 	config := GenerateSingleRuleCaddyConfig(rule)

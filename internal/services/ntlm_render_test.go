@@ -32,8 +32,10 @@ func TestGenerateSingleRuleCaddyConfig_retryWindow_zero_keepsDefaultFallback(t *
 }
 
 func TestGenerateSingleRuleCaddyConfig_retryWindow_positive_emitsWindow(t *testing.T) {
-	// Given：td>0 → 按值发射窗口；间隔缺省 250ms
-	loadBalancing := httpRoutesWithTryDuration(t, 3000, 0)
+	// Given：td>0 → 按值发射窗口；tcp_try_interval 为类型①值型列直读
+	//（库值唯一真相批 1+2：ti=0 渲染显性报错，原 250ms 写死兜底废除——
+	// 该形态见 TestGenerateSingleRuleCaddyConfig_retryWindow_zeroInterval_failsVisible）
+	loadBalancing := httpRoutesWithTryDuration(t, 3000, 250)
 	if loadBalancing["try_duration"] != "3000ms" || loadBalancing["try_interval"] != "250ms" {
 		t.Fatalf("td=3000 got try_duration=%v try_interval=%v", loadBalancing["try_duration"], loadBalancing["try_interval"])
 	}
@@ -45,6 +47,18 @@ func TestGenerateSingleRuleCaddyConfig_retryWindow_positive_emitsWindow(t *testi
 	}
 	if _, exists := loadBalancing["retries"]; exists {
 		t.Fatalf("td>0 must not emit retries, got %v", loadBalancing["retries"])
+	}
+}
+
+func TestGenerateSingleRuleCaddyConfig_retryWindow_zeroInterval_failsVisible(t *testing.T) {
+	// 库值唯一真相批 1+2：td>0 时 tcp_try_interval 为必填值型列，0=带外脏数据
+	// → 渲染显性报错（不再回退写死 250ms）。单规则路径以 {"error": err} 形态直返。
+	rule := baseHTTPRule()
+	rule.TCPTryDuration = 3000
+	rule.TCPTryInterval = 0
+	config := GenerateSingleRuleCaddyConfig(rule)
+	if _, hasErr := config["error"]; !hasErr {
+		t.Fatalf("ti=0 with td>0 must fail single-rule generation (fail-visible), got keys %v", config)
 	}
 }
 

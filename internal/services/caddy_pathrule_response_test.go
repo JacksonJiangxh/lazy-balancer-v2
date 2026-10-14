@@ -53,14 +53,12 @@ func staticResponseOf(t *testing.T, route map[string]interface{}) map[string]int
 // When: 生成路由
 // Then: handle 链尾仍是 reverse_proxy，无 static_response
 func TestPathRuleRoute_forwardModeUnchanged(t *testing.T) {
-	rule := SingleRuleConfig{
-		CaddyID: "lb_prresp", Protocol: "http", ListenPort: 8080, Domain: "prresp.example.test",
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_prresp", Protocol: "http", ListenPort: 8080, Domain: "prresp.example.test",
 		CustomRoutesEnabled: true,
 		Upstreams:           []UpstreamConfig{{Host: "10.0.0.1", Port: 9000, Weight: 1, Enabled: true}},
 		PathRules: []PathRuleConfig{
 			{SortOrder: 0, MatchType: "prefix", Path: "/api/", ResponseMode: ""},
-		},
-	}
+		}}
 	routes := buildPathRuleRoutesForTest(t, rule)
 	route := findPathRoute(routes, "path_0")
 	if route == nil {
@@ -83,15 +81,13 @@ func TestPathRuleRoute_forwardModeUnchanged(t *testing.T) {
 // Then: 不经 reverse_proxy/改写/安全链；链 = lb_rule_metrics(LBS-A-U1 计数) +
 // static_response
 func TestPathRuleRoute_staticModeEmitsStaticResponse(t *testing.T) {
-	rule := SingleRuleConfig{
-		CaddyID: "lb_prresp", Protocol: "http", ListenPort: 8080, Domain: "prresp.example.test",
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_prresp", Protocol: "http", ListenPort: 8080, Domain: "prresp.example.test",
 		CustomRoutesEnabled: true,
 		Upstreams:           []UpstreamConfig{{Host: "10.0.0.1", Port: 9000, Weight: 1, Enabled: true}},
 		PathRules: []PathRuleConfig{
 			{SortOrder: 0, MatchType: "exact", Path: "/maint", ResponseMode: "static",
 				ResponseStatus: 418, ResponseBody: `{"error":"teapot"}`, ResponseContentType: "application/json"},
-		},
-	}
+		}}
 	routes := buildPathRuleRoutesForTest(t, rule)
 	route := findPathRoute(routes, "path_0")
 	h := staticResponseOf(t, route)
@@ -123,14 +119,12 @@ func TestPathRuleRoute_staticModeEmitsStaticResponse(t *testing.T) {
 // When: 生成路由
 // Then: static_response 301 + Location 头指向目标
 func TestPathRuleRoute_redirectModeEmits301Location(t *testing.T) {
-	rule := SingleRuleConfig{
-		CaddyID: "lb_prresp", Protocol: "http", ListenPort: 8080, Domain: "prresp.example.test",
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_prresp", Protocol: "http", ListenPort: 8080, Domain: "prresp.example.test",
 		CustomRoutesEnabled: true,
 		Upstreams:           []UpstreamConfig{{Host: "10.0.0.1", Port: 9000, Weight: 1, Enabled: true}},
 		PathRules: []PathRuleConfig{
 			{SortOrder: 0, MatchType: "prefix", Path: "/old/", ResponseMode: "redirect", RedirectTo: "https://new.example.com/landing"},
-		},
-	}
+		}}
 	routes := buildPathRuleRoutesForTest(t, rule)
 	route := findPathRoute(routes, "path_0")
 	h := staticResponseOf(t, route)
@@ -157,14 +151,12 @@ func TestPathRuleRoute_redirectModeEmits301Location(t *testing.T) {
 // When: 生成路由
 // Then: 渲染兜底 200 + text/plain
 func TestPathRuleRoute_staticModeDefaults(t *testing.T) {
-	rule := SingleRuleConfig{
-		CaddyID: "lb_prresp", Protocol: "http", ListenPort: 8080, Domain: "prresp.example.test",
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_prresp", Protocol: "http", ListenPort: 8080, Domain: "prresp.example.test",
 		CustomRoutesEnabled: true,
 		Upstreams:           []UpstreamConfig{{Host: "10.0.0.1", Port: 9000, Weight: 1, Enabled: true}},
 		PathRules: []PathRuleConfig{
 			{SortOrder: 0, MatchType: "exact", Path: "/ping", ResponseMode: "static", ResponseBody: "pong"},
-		},
-	}
+		}}
 	routes := buildPathRuleRoutesForTest(t, rule)
 	h := staticResponseOf(t, findPathRoute(routes, "path_0"))
 	if h["status_code"] != 200 {
@@ -182,15 +174,13 @@ func TestPathRuleRoute_staticModeDefaults(t *testing.T) {
 // （计数包装响应写出，与主链同格；不经安全链/reverse_proxy 裁定不变）。
 func TestPathRuleRoute_staticChainCountsMetrics(t *testing.T) {
 	// Given
-	rule := SingleRuleConfig{
-		CaddyID: "lb_prresp", Protocol: "http", ListenPort: 8080, Domain: "prresp.example.test",
+	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_prresp", Protocol: "http", ListenPort: 8080, Domain: "prresp.example.test",
 		CustomRoutesEnabled: true,
 		Upstreams:           []UpstreamConfig{{Host: "10.0.0.1", Port: 9000, Weight: 1, Enabled: true}},
 		PathRules: []PathRuleConfig{
 			{SortOrder: 0, MatchType: "exact", Path: "/maint", ResponseMode: "static", ResponseBody: "维护中"},
 			{SortOrder: 1, MatchType: "prefix", Path: "/old", ResponseMode: "redirect", RedirectTo: "https://new.example.com/"},
-		},
-	}
+		}}
 
 	// When
 	routes := buildPathRuleRoutesForTest(t, rule)

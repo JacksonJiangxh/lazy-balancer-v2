@@ -1336,10 +1336,12 @@ func loadRulesForConfigValidation(ctx context.Context, suffix string, args ...an
 // path_rules 携带 response_* 五列、规则级携带 HostHeader/HealthCheckHost/
 // EnableCompress/CompressTypes——此前预检渲染把直返/301 路径规则当转发链
 // 渲染、不发射回源域名 map 处理器，与真实渲染分叉（错误拦截时机后移）。
-// 有意保留的空口子集（勿回填）：TLS 开关与证书材料（GenerateSingleRuleCaddyConfig
-// 单规则形态约定——TLS 跳转分支自述无预检调用方）、健康检查间隔族/代理超时族
-// （无生成期错误路径，形状差异由 applyFromTxNote 事务视图全保真渲染 +
-// CLI validate 兜底）。
+// 库值唯一真相（批 1+2）：健康检查族/tcp_try_interval 随 DB 行携带——渲染层
+// 对这些值型列已零兜底（0 值渲染报错），预检不再复制会把「带外脏行」的拦截
+// 时机后移到 applyFromTxNote（原「有意保留的空口子集（勿回填）」清单中
+// 「健康检查间隔族」一项就此移除；代理超时族维持 0=省略合法语义，保留空口）。
+// TLS 开关与证书材料仍为有意空口（GenerateSingleRuleCaddyConfig 单规则形态
+// 约定——TLS 跳转分支自述无预检调用方）。
 func precheckRuleConfig(rule models.LbRule) services.SingleRuleConfig {
 	upstreams := make([]services.UpstreamConfig, 0, len(rule.Upstreams))
 	for _, upstream := range rule.Upstreams {
@@ -1349,16 +1351,32 @@ func precheckRuleConfig(rule models.LbRule) services.SingleRuleConfig {
 			OriginDomain: upstream.OriginDomain,
 		})
 	}
+	// 库值唯一真相（批 1+2）：单规则预校验路径需携带全局 request_body_max_size_mb
+	//（生产渲染由 generateCaddyConfigWithCertSource 从 global_config 灌入；预检
+	// 此前缺位、靠渲染层「兜底 128」幸存——兜底废除后必须显式携带）。查询失败
+	// 置 0：渲染层 resolveRuleOverrides 显性报错，预检随真实渲染同 fail-visible。
+	globalBody := 0
+	if db.DB != nil {
+		if err := db.DB.QueryRow(`SELECT request_body_max_size_mb FROM global_config WHERE id=1`).Scan(&globalBody); err != nil {
+			services.Logf("warn", "precheckRuleConfig: 读取全局 request_body_max_size_mb 失败: %v", err)
+			globalBody = 0
+		}
+	}
 	return services.SingleRuleConfig{
 		CaddyID: rule.CaddyID, Protocol: rule.Protocol, Domain: rule.Domain, ListenPort: rule.ListenPort,
 		Strategy: rule.Strategy, DynamicDNS: rule.DynamicDNS, EnableDnsServer: rule.EnableDnsServer,
 		DnsServer: rule.DnsServer, DnsFamily: rule.DnsFamily, CustomRoutesEnabled: rule.CustomRoutesEnabled,
 		HostHeader: rule.HostHeader, HealthCheckHost: rule.HealthCheckHost,
-		NTLMCompatible:     rule.NTLMCompatible,
-		UpstreamForceHTTP1: rule.UpstreamForceHTTP1,
-		TCPTryDuration:     rule.TCPTryDuration, TCPTryInterval: rule.TCPTryInterval,
+		HealthCheckInterval:           rule.HealthCheckInterval,
+		HealthCheckTimeout:            rule.HealthCheckTimeout,
+		HealthCheckUnhealthyThreshold: rule.HealthCheckUnhealthyThreshold,
+		HealthCheckHealthyThreshold:   rule.HealthCheckHealthyThreshold,
+		NTLMCompatible:                rule.NTLMCompatible,
+		UpstreamForceHTTP1:            rule.UpstreamForceHTTP1,
+		TCPTryDuration:                rule.TCPTryDuration, TCPTryInterval: rule.TCPTryInterval,
 		EnableCompress: rule.EnableCompress, CompressTypes: rule.CompressTypes,
-		BlockPageStage1ID: rule.BlockPageStage1ID, BlockPageStage1Status: rule.BlockPageStage1Status,
+		GlobalRequestBodyMaxSizeMB: globalBody,
+		BlockPageStage1ID:          rule.BlockPageStage1ID, BlockPageStage1Status: rule.BlockPageStage1Status,
 		BlockPageStage3ID: rule.BlockPageStage3ID, BlockPageStage3Status: rule.BlockPageStage3Status,
 		PathRules: toPathRuleConfigs(rule.PathRules), Upstreams: upstreams,
 	}

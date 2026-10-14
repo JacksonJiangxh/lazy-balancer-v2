@@ -55,10 +55,10 @@ func TestRuleDomainConflict_redirectShadow(t *testing.T) {
 		return response
 	}
 	port80Body := func(name, domain string) string {
-		return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":80,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain)
+		return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":80,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain)
 	}
 	tlsRedirectBody := func(name, domain string) string {
-		return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":443,"enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q,"tls_http_redirect":true,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain, certPEM, keyPEM)
+		return fmt.Sprintf(`{"name":%q,"protocol":"http","domain":%q,"listen_port":443,"enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q,"tls_http_redirect":true,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, name, domain, certPEM, keyPEM)
 	}
 
 	t.Run("create port-80 rule shadowed by existing TLS redirect rule rejected", func(t *testing.T) {

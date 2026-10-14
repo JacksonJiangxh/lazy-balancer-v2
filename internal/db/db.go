@@ -30,6 +30,26 @@ var (
 	domainProfile = idna.New(idna.MapForLookup(), idna.BidiRule(), idna.VerifyDNSLength(true))
 )
 
+// 库值唯一真相（批 1+2，2026-10-14 用户裁定）类型①值型列默认值——渲染层
+// 写死兜底废除后，默认值的唯一入口：fresh DDL DEFAULT、启动迁移回填
+// （defaultUpdates，幂等 UPDATE WHERE IS NULL OR <=0）、导入/快照/传输归一
+// 门。语义约定：这些列 0 无效（库恒有效），渲染直读，无效即显性报错。
+// 反向钉测：db_truth_defaults_test.go 断言 DDL DEFAULT 与本组常量逐项一致；
+// 渲染侧 fail-visible 见 render_db_truth_test.go。
+const (
+	DefaultRequestBodyMaxSizeMB          = 128
+	DefaultHTTPReadTimeout               = 60
+	DefaultHTTPWriteTimeout              = 60
+	DefaultHTTPIdleTimeout               = 120
+	DefaultCaddyLogSizeMB                = 100
+	DefaultHealthCheckInterval           = 10
+	DefaultHealthCheckTimeout            = 2
+	DefaultHealthCheckHealthyThreshold   = 2
+	DefaultHealthCheckUnhealthyThreshold = 3
+	DefaultTCPTryInterval                = 250
+	DefaultCertExpiryDays                = 30
+)
+
 func CanonicalDomains(value string) (string, error) {
 	seen := make(map[string]struct{})
 	domains := make([]string, 0)
@@ -244,16 +264,21 @@ func createTables() error {
 		dns_server VARCHAR(255) DEFAULT '',
 		dns_family VARCHAR(20) DEFAULT 'ipv4',
 		health_check_path VARCHAR(255),
-		health_check_interval INTEGER DEFAULT 10,
+		-- 库值唯一真相（批 1+2）：健康检查族值型列 NOT NULL+DEFAULT，渲染直读
+		-- 无兜底（0 无效→启动回填/写侧 400 拦截）。存量库 ALTER 无法补 NOT NULL
+		--（SQLite 限制），由每启动回填 defaultUpdates 收敛 NULL/<=0。
+		health_check_interval INTEGER NOT NULL DEFAULT 10,
 		-- R41 C-3: schema 默认仅新库/重建生效（SQLite 不支持 ALTER COLUMN DEFAULT）；
 		-- 存量行 health_check_timeout 值不变；全部生产 INSERT 显式带值，DEFAULT 惰性。
-		health_check_timeout INTEGER DEFAULT 5,
-		health_check_unhealthy_threshold INTEGER DEFAULT 3,
-		health_check_healthy_threshold INTEGER DEFAULT 2,
+		-- 批 1+2：DEFAULT 5→2——与写侧（CreateRule 校验边界）/读取/渲染三方统一
+		-- （LB25-P2-1/LB-04），5 为从未生效的陈旧默认。
+		health_check_timeout INTEGER NOT NULL DEFAULT 2,
+		health_check_unhealthy_threshold INTEGER NOT NULL DEFAULT 3,
+		health_check_healthy_threshold INTEGER NOT NULL DEFAULT 2,
 		enable_active_health_check BOOLEAN DEFAULT FALSE,
 		tcp_health_check_port INTEGER DEFAULT 0,
 		tcp_try_duration INTEGER DEFAULT 0,
-		tcp_try_interval INTEGER DEFAULT 250,
+		tcp_try_interval INTEGER NOT NULL DEFAULT 250,
 		request_body_max_size_mb INTEGER DEFAULT 0,
 		upstream_keepalive_timeout INTEGER DEFAULT 0,
 		server_tokens_hidden INTEGER DEFAULT 0,
@@ -389,13 +414,13 @@ func createTables() error {
 		master_url VARCHAR(255),
 		sync_interval INTEGER DEFAULT 60,
 		caddy_log_level VARCHAR(10) DEFAULT 'info',
-		caddy_log_size_mb INTEGER DEFAULT 100,
-		-- D40-2-1:默认 128(与 coraza 默认 RequestBodyLimit 统一);存量库
-		-- 保持 0,由渲染侧 resolveRuleOverrides 读侧归一。
-		request_body_max_size_mb INTEGER DEFAULT 128,
-		http_read_timeout INTEGER DEFAULT 60,
-		http_write_timeout INTEGER DEFAULT 60,
-		http_idle_timeout INTEGER DEFAULT 120,
+		caddy_log_size_mb INTEGER NOT NULL DEFAULT 100,
+		-- D40-2-1:默认 128(与 coraza 默认 RequestBodyLimit 统一)。批 1+2:
+		-- NOT NULL+渲染直读,存量库 0 行由启动回填报 128,渲染层写死 128 兜底废除。
+		request_body_max_size_mb INTEGER NOT NULL DEFAULT 128,
+		http_read_timeout INTEGER NOT NULL DEFAULT 60,
+		http_write_timeout INTEGER NOT NULL DEFAULT 60,
+		http_idle_timeout INTEGER NOT NULL DEFAULT 120,
 		upstream_keepalive_timeout INTEGER DEFAULT 0,
 		proxy_dial_timeout INTEGER DEFAULT 0,
 		proxy_response_header_timeout INTEGER DEFAULT 0,
@@ -792,7 +817,7 @@ func runMigrations() error {
 		"lb_rules.tcp_health_check_port":      "INTEGER DEFAULT 0",
 		"lb_rules.tcp_proxy_protocol":         "BOOLEAN DEFAULT 0",
 		"lb_rules.tcp_try_duration":           "INTEGER DEFAULT 0",
-		"lb_rules.tcp_try_interval":           "INTEGER DEFAULT 250",
+		"lb_rules.tcp_try_interval":           "INTEGER NOT NULL DEFAULT 250",
 		"lb_rules.request_body_max_size_mb":   "INTEGER DEFAULT 0",
 		"lb_rules.upstream_keepalive_timeout": "INTEGER DEFAULT 0",
 		"lb_rules.server_tokens_hidden":       "INTEGER DEFAULT 0",
@@ -903,11 +928,11 @@ func runMigrations() error {
 		"global_config.acme_email":                    "VARCHAR(255)",
 		"global_config.cert_expiry_days":              "INTEGER DEFAULT 30",
 		"global_config.caddy_log_level":               "VARCHAR(10) DEFAULT 'info'",
-		"global_config.caddy_log_size_mb":             "INTEGER DEFAULT 100",
-		"global_config.request_body_max_size_mb":      "INTEGER DEFAULT 128",
-		"global_config.http_read_timeout":             "INTEGER DEFAULT 0",
-		"global_config.http_write_timeout":            "INTEGER DEFAULT 0",
-		"global_config.http_idle_timeout":             "INTEGER DEFAULT 0",
+		"global_config.caddy_log_size_mb":             "INTEGER NOT NULL DEFAULT 100",
+		"global_config.request_body_max_size_mb":      "INTEGER NOT NULL DEFAULT 128",
+		"global_config.http_read_timeout":             "INTEGER NOT NULL DEFAULT 60",
+		"global_config.http_write_timeout":            "INTEGER NOT NULL DEFAULT 60",
+		"global_config.http_idle_timeout":             "INTEGER NOT NULL DEFAULT 120",
 		"global_config.upstream_keepalive_timeout":    "INTEGER DEFAULT 0",
 		"global_config.server_tokens_hidden":          "BOOLEAN DEFAULT FALSE",
 		"global_config.admin_tls_enabled":             "BOOLEAN DEFAULT 0",
@@ -1013,14 +1038,16 @@ func runMigrations() error {
 		"global_config.autoban_scope":          "TEXT NOT NULL DEFAULT 'all'",
 		"global_config.autoban_dry_run":        "INTEGER NOT NULL DEFAULT 1",
 	}
-	// R42 F1: 四个全局超时列的 0→推荐默认回填只在「新增列」时执行一次——
-	// 历史存量行在新列 ADD 后恰好为 0，才是真正需要回填的场景；渲染层把 0 当作
-	// 「省略=用 Caddy 默认」的有效值（仅 >0 才输出超时指令），若每次启动都无条件
-	// 回填，会把用户显式设置的 0 静默改写，导致运行行为与界面展示不一致。
+	// R42 F1: 四个全局超时列的 0→推荐默认回填原为「仅新增列时执行一次」——
+	// 当时渲染层把 0 当作「省略=用 Caddy 默认」的有效值，每启动无条件回填会
+	// 静默改写用户显式设置的 0。批 1+2（库值唯一真相，2026-10-14 用户裁定）
+	// 推翻该口径：http_read/write/idle_timeout 三列转为类型①值型（0 无效），
+	// 回填改为每启动幂等 UPDATE（defaultUpdates，WHERE IS NULL OR <=0——0 已非
+	// 合法用户选择，归一不是改写）；此处三列一次性回填随之退役。
+	// upstream_keepalive_timeout 保持类型②省略型（0=省略=R72 用户裁定，继承
+	// Caddy/Go Transport 默认 2 分钟）——「新增列时代存量行为 0」的一次性形状
+	// 防御保留，显式 60 是写侧合法值，任何迁移不得改写（审计 A5-S1）。
 	newColumnBackfills := map[string]string{
-		"global_config.http_read_timeout":  "UPDATE global_config SET http_read_timeout=60 WHERE http_read_timeout=0",
-		"global_config.http_write_timeout": "UPDATE global_config SET http_write_timeout=60 WHERE http_write_timeout=0",
-		"global_config.http_idle_timeout":  "UPDATE global_config SET http_idle_timeout=120 WHERE http_idle_timeout=0",
 		// 审计 A5-S1/B5-F1：本列自引入起 DEFAULT 0，新增当刻存量行恒为 0——
 		// 此回填仅覆盖理论上的「列带 DEFAULT 60 时代新增」路径，实际库零命中
 		//（保留作形状防御）；真正的默认值收敛由 fresh CREATE DEFAULT 0 承担。
@@ -1096,6 +1123,25 @@ func runMigrations() error {
 		// 校验的合法值，原 COALESCE 口径会在每次启动把用户显式设置的 60
 		// 静默抹为 0（循环复现）。
 		"UPDATE global_config SET upstream_keepalive_timeout=0 WHERE upstream_keepalive_timeout IS NULL",
+		// 库值唯一真相（批 1+2，2026-10-14 用户裁定）：类型①值型列每启动幂等
+		// 回填——NULL/<=0 归默认（fresh DDL NOT NULL+DEFAULT、newColumns 补列、
+		// 写侧 400、导入/快照/传输归一门之外的最后防线：带外直写/旧备份恢复的
+		// 脏行在下次启动收敛）。用户已设有效值（>0）恒不触碰。渲染层对这批列
+		// 直读零兜底，无效值在此之后只能显性报错。
+		fmt.Sprintf("UPDATE global_config SET request_body_max_size_mb=%d WHERE request_body_max_size_mb IS NULL OR request_body_max_size_mb<=0", DefaultRequestBodyMaxSizeMB),
+		fmt.Sprintf("UPDATE global_config SET http_read_timeout=%d WHERE http_read_timeout IS NULL OR http_read_timeout<=0", DefaultHTTPReadTimeout),
+		fmt.Sprintf("UPDATE global_config SET http_write_timeout=%d WHERE http_write_timeout IS NULL OR http_write_timeout<=0", DefaultHTTPWriteTimeout),
+		fmt.Sprintf("UPDATE global_config SET http_idle_timeout=%d WHERE http_idle_timeout IS NULL OR http_idle_timeout<=0", DefaultHTTPIdleTimeout),
+		fmt.Sprintf("UPDATE global_config SET caddy_log_size_mb=%d WHERE caddy_log_size_mb IS NULL OR caddy_log_size_mb<=0", DefaultCaddyLogSizeMB),
+		fmt.Sprintf("UPDATE lb_rules SET health_check_interval=%d WHERE health_check_interval IS NULL OR health_check_interval<=0", DefaultHealthCheckInterval),
+		fmt.Sprintf("UPDATE lb_rules SET health_check_timeout=%d WHERE health_check_timeout IS NULL OR health_check_timeout<=0", DefaultHealthCheckTimeout),
+		fmt.Sprintf("UPDATE lb_rules SET health_check_unhealthy_threshold=%d WHERE health_check_unhealthy_threshold IS NULL OR health_check_unhealthy_threshold<=0", DefaultHealthCheckUnhealthyThreshold),
+		fmt.Sprintf("UPDATE lb_rules SET health_check_healthy_threshold=%d WHERE health_check_healthy_threshold IS NULL OR health_check_healthy_threshold<=0", DefaultHealthCheckHealthyThreshold),
+		fmt.Sprintf("UPDATE lb_rules SET tcp_try_interval=%d WHERE tcp_try_interval IS NULL OR tcp_try_interval<=0", DefaultTCPTryInterval),
+		// 库值唯一真相（批 3）：cert_expiry_days 类型①值型列（写侧 1-365 校验
+		// R58 C-N5 + 导入钳制 R57 C-2 之外的最后防线）：NULL/<=0 归 30；用户已设
+		// 有效值（>0）恒不触碰。消费侧 GetCertExpiryThreshold 直读零兜底。
+		fmt.Sprintf("UPDATE global_config SET cert_expiry_days=%d WHERE cert_expiry_days IS NULL OR cert_expiry_days<=0", DefaultCertExpiryDays),
 	}
 	for _, statement := range defaultUpdates {
 		if _, err := DB.Exec(statement); err != nil {

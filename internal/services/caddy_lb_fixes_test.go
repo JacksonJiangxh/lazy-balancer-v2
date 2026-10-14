@@ -6,63 +6,74 @@ import (
 	"testing"
 )
 
-// LB-04：health_check_timeout 默认值统一为 2——NULL 行（生成 SQL 的 COALESCE）
-// 与显式 0 行（渲染兜底）生成的 active health check timeout 均应为 "2s"。
-// 此前读侧/渲染侧兜底为 5，与写侧默认 2 分裂。
-func TestGenerateCaddyConfig_activeHealthTimeout_defaults_to_2_for_null_and_zero_rows(t *testing.T) {
-	// Given：两条启用主动健康检查的规则；timeout 分别显式置 NULL（建表列有
-	// DEFAULT 5，须 UPDATE 才能构造 NULL 行——COALESCE 读取口径的靶点）与 0
-	//（渲染兜底的靶点）
+// LB-04 曾钉 health_check_timeout NULL/0 行渲染兜底 2s；库值唯一真相批 1+2
+// （2026-10-14 用户裁定）废除写死兜底——health_check_timeout 为类型①值型列
+// （NOT NULL DEFAULT 2+启动回填+写侧 400+导入归一门）：fresh DDL 的 NOT NULL
+// 使 NULL 行结构上不可达（存量库可空列 NULL 由每启动回填报 2）；0 行=带外
+// 脏数据，渲染显性报错（fail-visible）。
+func TestGenerateCaddyConfig_activeHealthTimeout_zero_row_fails_generation(t *testing.T) {
+	// Given：启用主动健康检查、timeout 显式置 0 的规则（带外写入形态）
 	_, database := newClusterTestService(t)
-	seedGenerationRule(t, database, "lb_hc_null", false)
 	seedGenerationRule(t, database, "lb_hc_zero", false)
-	if _, err := database.Exec(`UPDATE lb_rules SET enable_active_health_check=1, listen_port=18081, health_check_timeout=NULL WHERE caddy_id='lb_hc_null'`); err != nil {
-		t.Fatalf("enable active health check (null row): %v", err)
-	}
-	if _, err := database.Exec(`UPDATE lb_rules SET enable_active_health_check=1, health_check_timeout=0, listen_port=18082 WHERE caddy_id='lb_hc_zero'`); err != nil {
+	if _, err := database.Exec(`UPDATE lb_rules SET enable_active_health_check=1, health_check_timeout=0 WHERE caddy_id='lb_hc_zero'`); err != nil {
 		t.Fatalf("enable active health check (zero row): %v", err)
 	}
 
 	// When
 	generated := generateCaddyConfigFromStore(database)
 
-	// Then
-	if message, failed := generated[caddyConfigGenerationErrorKey].(string); failed {
-		t.Fatalf("generation failed: %s", message)
+	// Then：不再回退写死 2s，生成显性失败且点名列
+	message, failed := generated[caddyConfigGenerationErrorKey].(string)
+	if !failed {
+		t.Fatalf("health_check_timeout=0 must fail generation (fail-visible), got keys %v", generated)
 	}
-	body, err := json.Marshal(generated["apps"])
-	if err != nil {
-		t.Fatalf("marshal generated apps: %v", err)
-	}
-	if got := strings.Count(string(body), `"timeout":"2s"`); got != 2 {
-		t.Fatalf("active health timeout \"2s\" count=%d (body=%s), want 2 (NULL 行与 0 值行各一)", got, body)
-	}
-	if strings.Contains(string(body), `"timeout":"5s"`) {
-		t.Fatalf("active health timeout still renders 5s, want unified default 2s: %s", body)
+	if !strings.Contains(message, "health_check_timeout") {
+		t.Fatalf("generation error %q must name health_check_timeout", message)
 	}
 }
 
-// LB25-P2-1(第 25 轮审计):TCP 主动健检 timeout 渲染兜底 5s 与 LB-04 统一 2s
-// 分裂——写侧默认 2(rules.go:789)+COALESCE 读取 2+HTTP 渲染兜底 2,独 TCP 链=5。
-func TestBuildTCPServer_activeHealthTimeout_defaults_to_2(t *testing.T) {
-	// Given: TCP 规则启用主动健检,timeout=0(导入路径可达 0 值)
-	cfg := SingleRuleConfig{
-		ListenPort:              16379,
-		Protocol:                "tcp",
-		EnableActiveHealthCheck: true,
-		HealthCheckTimeout:      0, // 渲染兜底靶点
-		Upstreams:               []UpstreamConfig{{Host: "127.0.0.1", Port: 6379, Weight: 1, Enabled: true}},
-	}
+// LB25-P2-1(第 25 轮审计)曾钉 TCP 主动健检 timeout=0 兜底 2s；库值唯一真相
+// 批 1+2（2026-10-14 用户裁定）废除写死兜底——health_check_timeout 为类型①
+// 值型列（NOT NULL DEFAULT 2+启动回填+写侧 400+导入归一门），0 值=库值治理
+// 被带外写入破坏，渲染显性报错；有效值直读贯通（哨兵 13s 验证无替换）。
+func TestBuildTCPServer_activeHealthTimeout_failVisibleAndPassThrough(t *testing.T) {
+	t.Run("zero value fails generation", func(t *testing.T) {
+		// Given: TCP 规则启用主动健检,timeout=0(带外写入形态)
+		cfg := SingleRuleConfig{
+			ListenPort:                    16379,
+			Protocol:                      "tcp",
+			EnableActiveHealthCheck:       true,
+			HealthCheckInterval:           10,
+			HealthCheckTimeout:            0,
+			HealthCheckUnhealthyThreshold: 3,
+			HealthCheckHealthyThreshold:   2,
+			Upstreams:                     []UpstreamConfig{{Host: "127.0.0.1", Port: 6379, Weight: 1, Enabled: true}},
+		}
 
-	// When
-	server := buildTCPServer(cfg)
-	body, _ := json.Marshal(server)
+		// When / Then: 渲染显性报错，不再回退写死 2s
+		if _, err := buildTCPServer(cfg); err == nil {
+			t.Fatal("health_check_timeout=0 must fail TCP render generation (fail-visible)")
+		}
+	})
 
-	// Then: timeout 统一为 2s(与 HTTP 链/LB-04 钉口径一致)
-	if strings.Contains(string(body), `"timeout":"5s"`) {
-		t.Fatalf("TCP active health timeout still renders 5s, want unified default 2s: %s", body)
-	}
-	if !strings.Contains(string(body), `"timeout":"2s"`) {
-		t.Fatalf("TCP active health timeout missing 2s: %s", body)
-	}
+	t.Run("stored value passes through", func(t *testing.T) {
+		cfg := SingleRuleConfig{
+			ListenPort:                    16379,
+			Protocol:                      "tcp",
+			EnableActiveHealthCheck:       true,
+			HealthCheckInterval:           10,
+			HealthCheckTimeout:            13,
+			HealthCheckUnhealthyThreshold: 3,
+			HealthCheckHealthyThreshold:   2,
+			Upstreams:                     []UpstreamConfig{{Host: "127.0.0.1", Port: 6379, Weight: 1, Enabled: true}},
+		}
+		server, err := buildTCPServer(cfg)
+		if err != nil {
+			t.Fatalf("buildTCPServer: %v", err)
+		}
+		body, _ := json.Marshal(server)
+		if !strings.Contains(string(body), `"timeout":"13s"`) {
+			t.Fatalf("TCP active health timeout must pass through stored value 13s: %s", body)
+		}
+	})
 }

@@ -77,8 +77,11 @@ func TestValidateRuleConfigGeneration_dynamicDNS_returnsValidationError(t *testi
 // Round 31 C-2: 合法规则基线——生成无错误时不误报。
 func TestValidateRuleConfigGeneration_validRule_returnsNil(t *testing.T) {
 	newBackupTestHandlers(t)
+	// 库值唯一真相批 1+2：健康检查族为值型列，预检渲染直读零兜底——内存
+	// fixture 构造即带库态有效值。
 	rule := models.LbRule{
 		CaddyID: "lb_ok", Protocol: "http", Domain: "ok.example.test", ListenPort: 80,
+		HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2,
 		Upstreams: []models.Upstream{
 			{Host: "up1.example.test", Port: 8080, Enabled: true},
 		},
@@ -97,6 +100,7 @@ func TestValidateRuleConfigGeneration_pathRuleEmptyUpstreams_returnsNil(t *testi
 	rule := models.LbRule{
 		CaddyID: "lb_path_empty", Protocol: "http", Domain: "path.example.test", ListenPort: 80,
 		CustomRoutesEnabled: true,
+		HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2,
 		Upstreams: []models.Upstream{
 			{Host: "up1.example.test", Port: 8080, Enabled: true},
 		},
