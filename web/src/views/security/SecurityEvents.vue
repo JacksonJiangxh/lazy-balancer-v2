@@ -11,33 +11,37 @@
       <el-button :icon="Refresh" @click="fetchEvents">刷新</el-button>
     </div>
 
-    <!-- 自动封禁状态卡（F73-A）：状态/口径/窗口/阈值/时长/今日封禁/名单数 + 两按钮
-         （2026-10-14 裁定：启用/禁用直接切换业务开关并联动调度；「立即执行」废除——
-         任务只能由「启用后按配置调度执行」） -->
+    <!-- 自动封禁状态卡（F73-A）：状态/口径/窗口/阈值/时长/今日封禁/名单数；
+         配置入口=点击卡片主体（2026-10-14 裁定：废除「配置」按钮），按钮区仅留
+         启用/禁用 toggle（直接切换业务开关并联动调度；「立即执行」废除——任务只能
+         由「启用后按配置调度执行」） -->
     <el-card class="autoban-card" v-loading="autobanStatusLoading">
       <div class="autoban-bar">
-        <div class="autoban-title">
-          <el-icon class="title-icon"><Lock /></el-icon>
-          <span>自动封禁</span>
-          <el-tag :type="autobanStatus.enabled ? (autobanStatus.dry_run ? 'warning' : 'success') : 'info'" size="small" effect="plain">
-            {{ autobanStatus.enabled ? (autobanStatus.dry_run ? '观察模式' : '运行中') : '未启用' }}
-          </el-tag>
-        </div>
-        <div class="autoban-stats">
-          <span class="autoban-stat">口径 <b>{{ autobanScopeText }}</b></span>
-          <el-divider direction="vertical" />
-          <span class="autoban-stat">窗口 <b>{{ autobanStatus.window_minutes }} 分钟</b></span>
-          <el-divider direction="vertical" />
-          <span class="autoban-stat">阈值 <b>{{ autobanStatus.threshold }} 次</b></span>
-          <el-divider direction="vertical" />
-          <span class="autoban-stat">时长 <b>{{ autobanDurationText }}</b></span>
-          <el-divider direction="vertical" />
-          <span class="autoban-stat">今日封禁 <b class="autoban-danger">{{ autobanStatus.banned_today }}</b></span>
-          <el-divider direction="vertical" />
-          <span class="autoban-stat">名单 <b>{{ autobanStatus.list_entries }} 条</b></span>
-        </div>
+        <el-tooltip content="点击配置" placement="top" :show-after="400">
+          <div class="autoban-main" @click="openAutobanConfig">
+            <div class="autoban-title">
+              <el-icon class="title-icon"><Lock /></el-icon>
+              <span>自动封禁</span>
+              <el-tag :type="autobanStatus.enabled ? (autobanStatus.dry_run ? 'warning' : 'success') : 'info'" size="small" effect="plain">
+                {{ autobanStatus.enabled ? (autobanStatus.dry_run ? '观察模式' : '运行中') : '未启用' }}
+              </el-tag>
+            </div>
+            <div class="autoban-stats">
+              <span class="autoban-stat">口径 <b>{{ autobanScopeText }}</b></span>
+              <el-divider direction="vertical" />
+              <span class="autoban-stat">窗口 <b>{{ autobanStatus.window_minutes }} 分钟</b></span>
+              <el-divider direction="vertical" />
+              <span class="autoban-stat">阈值 <b>{{ autobanStatus.threshold }} 次</b></span>
+              <el-divider direction="vertical" />
+              <span class="autoban-stat">时长 <b>{{ autobanDurationText }}</b></span>
+              <el-divider direction="vertical" />
+              <span class="autoban-stat">今日封禁 <b class="autoban-danger">{{ autobanStatus.banned_today }}</b></span>
+              <el-divider direction="vertical" />
+              <span class="autoban-stat">名单 <b>{{ autobanStatus.list_entries }} 条</b></span>
+            </div>
+          </div>
+        </el-tooltip>
         <div class="autoban-actions">
-          <el-button size="small" @click="openAutobanConfig">配置</el-button>
           <el-button
             size="small"
             :type="autobanStatus.enabled ? 'danger' : 'success'"
@@ -378,6 +382,9 @@ const autobanDialogVisible = ref(false)
 const autobanSaving = ref(false)
 const autobanForm = ref({ enabled: false, dry_run: true, threshold: 100, window_minutes: 5, duration: '1h', scope: 'all' })
 const openAutobanConfig = (): void => {
+  // 状态加载中不进配置：表单从 autobanStatus 回填，此刻会拿到默认值，
+  // 保存将覆盖真实配置
+  if (autobanStatusLoading.value) return
   autobanForm.value = {
     enabled: autobanStatus.value.enabled, dry_run: autobanStatus.value.dry_run,
     threshold: autobanStatus.value.threshold, window_minutes: autobanStatus.value.window_minutes,
@@ -407,11 +414,28 @@ const saveAutobanConfig = async (): Promise<void> => {
 // 启用二次确认（2026-10-14 用户裁定）：enabled 关→开的保存动作先确认——
 // 威胁库+CRS+地域拦截已覆盖绝大多数恶意请求，自动封禁定位是少量高频攻击者
 // 的资源救济；建议观察模式起步校准后转正式。取消=不保存。
-const AUTOBAN_ENABLE_CONFIRM_TEXT =
-  '启用前须知：新封禁最迟约 1 分钟后生效（重载按分钟节流合并）；每次配置重载为优雅热载，进行中的请求不受影响，但已建立的长连接（WebSocket / SSE 等）可能被断开，客户端会自动重连；持续攻击期间每分钟至多一次全量配置渲染与重载，存在一定性能开销。<br/><br/>对大多数部署而言，IP 威胁库 + CRS + 地域拦截已能挡住 99% 以上的恶意请求，少量恶意 IP 手动拉黑即可。确认要启用自动封禁吗？建议先以观察模式运行，确认封禁建议准确后再转为正式封禁。'
+// 排版：dangerouslyUseHTMLString 精排两段（启用前须知三条列表 + 使用建议正文），
+// MessageBox 挂 body → 样式放非 scoped 块。纯静态文案、无任何用户输入插值，无注入面。
+const AUTOBAN_ENABLE_CONFIRM_HTML = `
+<div class="autoban-confirm">
+  <div class="autoban-confirm-title">启用前须知</div>
+  <ul class="autoban-confirm-list">
+    <li>新封禁最迟约 1 分钟后生效（重载按分钟节流合并）</li>
+    <li>每次配置重载为优雅热载，进行中的请求不受影响，但已建立的长连接（WebSocket / SSE 等）可能被断开，客户端会自动重连</li>
+    <li>持续攻击期间每分钟至多一次全量配置渲染与重载，存在一定性能开销</li>
+  </ul>
+  <div class="autoban-confirm-title autoban-confirm-title--gap">使用建议</div>
+  <p class="autoban-confirm-text">对大多数部署而言，IP 威胁库 + CRS + 地域拦截已能挡住 99% 以上的恶意请求，少量恶意 IP 手动拉黑即可。确认要启用自动封禁吗？建议先以观察模式运行，确认封禁建议准确后再转为正式封禁。</p>
+</div>`
 const confirmAutobanEnable = async (): Promise<boolean> => {
   try {
-    await ElMessageBox.confirm(AUTOBAN_ENABLE_CONFIRM_TEXT, '启用自动封禁', { confirmButtonText: '确认启用', cancelButtonText: '取消', type: 'warning', dangerouslyUseHTMLString: true })
+    await ElMessageBox.confirm(AUTOBAN_ENABLE_CONFIRM_HTML, '启用自动封禁', {
+      confirmButtonText: '确认启用',
+      cancelButtonText: '取消',
+      type: 'warning',
+      dangerouslyUseHTMLString: true,
+      customStyle: { width: '480px' },
+    })
     return true
   } catch {
     return false
@@ -684,6 +708,10 @@ onMounted(() => {
 /* —— 自动封禁状态卡（F73-A）—— */
 .autoban-card { margin-bottom: 16px; }
 .autoban-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+/* 卡片主体=配置入口（2026-10-14 裁定）：标题/参数区可点，hover 灰底+pointer 反馈；
+   padding+负 margin 扩大热区而不改变行内布局 */
+.autoban-main { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex: 1; min-width: 0; cursor: pointer; padding: 4px 8px; margin: -4px -8px; border-radius: 6px; transition: background-color 0.15s; }
+.autoban-main:hover { background: #f3f4f6; }
 .autoban-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: #111827; flex-shrink: 0; }
 .autoban-title .title-icon { font-size: 16px; color: #3b82f6; }
 .autoban-stats { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: 1; min-width: 0; font-size: 12px; color: var(--text-secondary, #6b7280); }
@@ -750,4 +778,14 @@ onMounted(() => {
 /* 选中项不加粗：EP 2.14 多选下拉 is-selected 默认 font-weight:bold，该筛选常态
    全选（四类全勾）导致整列粗体，覆写回 normal（选中色与右侧 ✓ 保留） */
 .triggered-filter-popper .el-select-dropdown__item.is-selected { font-weight: normal; }
+
+/* 自动封禁启用确认框（dangerouslyUseHTMLString 精排，2026-10-14 裁定）：
+   MessageBox 挂 body，scoped 样式不可达 → 全局作用域。两段式（启用前须知三条
+   列表 + 使用建议正文），13px 正文紧凑排布，弹框宽 480px（customStyle 指定） */
+.autoban-confirm { font-size: 13px; line-height: 1.7; color: var(--el-text-color-regular, #606266); }
+.autoban-confirm-title { font-size: 13px; font-weight: 600; color: var(--el-text-color-primary, #303133); margin: 0 0 6px; }
+.autoban-confirm-title--gap { margin-top: 14px; }
+.autoban-confirm-list { margin: 0; padding-left: 20px; }
+.autoban-confirm-list li + li { margin-top: 4px; }
+.autoban-confirm-text { margin: 0; }
 </style>
