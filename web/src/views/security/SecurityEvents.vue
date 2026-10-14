@@ -17,8 +17,8 @@
          由「启用后按配置调度执行」） -->
     <el-card class="autoban-card" v-loading="autobanStatusLoading">
       <div class="autoban-bar">
-        <el-tooltip content="点击配置" placement="top" :show-after="400">
-          <div class="autoban-main" @click="openAutobanConfig">
+        <div>
+          <div class="autoban-main">
             <div class="autoban-title">
               <el-icon class="title-icon"><Lock /></el-icon>
               <span>自动封禁</span>
@@ -40,23 +40,13 @@
               <span class="autoban-stat">名单 <b>{{ autobanStatus.list_entries }} 条</b></span>
             </div>
           </div>
-        </el-tooltip>
+        </div>
         <div class="autoban-actions">
-          <el-button
-            v-if="autobanStatus.enabled"
-            size="small"
-            type="danger"
-            plain
-            :loading="autobanToggling"
-            @click="toggleAutobanEnabled"
-          >禁用</el-button>
-          <el-button
-            v-else
-            size="small"
-            type="success"
-            plain
-            @click="openAutobanConfigForEnable"
-          >启用</el-button>
+          <template v-if="autobanStatus.enabled">
+            <el-button size="small" type="danger" plain :loading="autobanToggling" @click="toggleAutobanEnabled">禁用</el-button>
+            <el-button size="small" plain @click="openAutobanConfig">编辑</el-button>
+          </template>
+          <el-button v-else size="small" type="success" plain @click="openAutobanConfigForEnable">启用</el-button>
         </div>
       </div>
       <!-- 未关联策略黄条：名单未被启用中的安全策略引用，封禁不生效 -->
@@ -212,15 +202,11 @@
     <TriggerDetailDialog v-model="triggerDetailVisible" :row="triggerDetailRow" />
 
     <!-- 自动封禁配置弹框（历史问题）：六项配置+口径/窗口变更重置提示 -->
-    <el-dialog v-model="autobanDialogVisible" width="min(560px, 94vw)" top="8vh" append-to-body class="dialog-body-inset">
+    <el-dialog v-model="autobanDialogVisible" width="min(600px, 94vw)" top="8vh" append-to-body class="dialog-body-inset">
       <template #header>
         <DialogHeader :icon="Lock" title="自动封禁配置" subtitle="WAF 事件滑动窗口计数达到阈值即写入「自动封禁名单」，到期自动解封" />
       </template>
-      <el-form :model="autobanForm" label-width="96px" label-position="right">
-        <el-form-item label="启用">
-          <el-switch v-model="autobanForm.enabled" />
-          <span class="form-tip-inline">关闭后任务停止调度，已有封禁条目按到期自然解封</span>
-        </el-form-item>
+      <el-form :model="autobanForm" label-width="96px" label-position="right" class="autoban-config-form">
         <el-form-item label="观察模式">
           <el-switch v-model="autobanForm.dry_run" />
           <span class="form-tip-inline">开启时仅记录达阈值建议、不写入名单（推荐先观察校准阈值）</span>
@@ -407,11 +393,12 @@ const saveAutobanConfig = async (): Promise<void> => {
   if (autobanForm.value.window_minutes < 1 || autobanForm.value.window_minutes > 60) {
     ElMessage.warning('统计窗口须在 1-60 分钟之间'); return
   }
-  // 弹框内把 enabled 从关改开：同款二次确认（取消=不保存，弹框留在原处）
-  if (autobanForm.value.enabled && !autobanStatus.value.enabled && !(await confirmAutobanEnable())) return
+  // 启用入口（卡片「启用」打开，此前未启用）保存前二次确认；编辑入口（已启用）直接保存。
+  // 弹框已无启用开关（外卡片持有启停职责）——payload enabled 恒 true（启用或保持）。
+  if (!autobanStatus.value.enabled && !(await confirmAutobanEnable())) return
   autobanSaving.value = true
   try {
-    await request.put('/security/autoban', autobanForm.value)
+    await request.put('/security/autoban', { ...autobanForm.value, enabled: true })
     ElMessage.success('自动封禁配置已更新')
     autobanDialogVisible.value = false
     fetchAutobanStatus()
@@ -442,7 +429,7 @@ const confirmAutobanEnable = async (): Promise<boolean> => {
       cancelButtonText: '取消',
       dangerouslyUseHTMLString: true,
       customClass: 'autoban-confirm-box',
-      customStyle: { width: '520px', paddingTop: '16px' },
+      customStyle: { width: '540px', paddingTop: '16px' },
     })
     return true
   } catch {
@@ -456,7 +443,6 @@ const confirmAutobanEnable = async (): Promise<boolean> => {
 // 保存/启用时才弹启用确认框——卡片按钮不直接确认启用。
 const openAutobanConfigForEnable = (): void => {
   openAutobanConfig()
-  autobanForm.value.enabled = true
 }
 
 const toggleAutobanEnabled = async (): Promise<void> => {
@@ -723,8 +709,9 @@ onMounted(() => {
 .autoban-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 /* 卡片主体=配置入口（2026-10-14 裁定）：标题/参数区可点，hover 灰底+pointer 反馈；
    padding+负 margin 扩大热区而不改变行内布局 */
-.autoban-main { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex: 1; min-width: 0; cursor: pointer; padding: 4px 8px; margin: -4px -8px; border-radius: 6px; transition: background-color 0.15s; }
-.autoban-main:hover { background: #f3f4f6; }
+.autoban-main { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex: 1; min-width: 0; }
+/* 自动封禁弹框：行内提示改块级换行（用户裁定 2026-10-14——行内被控件挤折行） */
+:deep(.autoban-config-form .form-tip-inline) { display: block; margin: 2px 0 0; line-height: 1.5; }
 .autoban-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: #111827; flex-shrink: 0; }
 .autoban-title .title-icon { font-size: 16px; color: #3b82f6; }
 .autoban-stats { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: 1; min-width: 0; font-size: 12px; color: var(--text-secondary, #6b7280); }
