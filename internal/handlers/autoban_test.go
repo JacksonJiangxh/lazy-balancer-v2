@@ -1,8 +1,8 @@
 package handlers
 
 // 自动封禁（历史问题）端点与预置名单例外钉：
-//   GET/PUT /security/autoban 六项配置（校验/审计）
-//   POST /security/autoban/run 立即执行（引擎门）
+//   GET/PUT /security/autoban 六项配置（校验/审计；保存联动调度启停）
+//   POST /security/autoban/run 已废除（2026-10-14 裁定：调度唯一前提=启用）
 //   GET  /security/autoban/status 运行态+今日封禁+名单数+观察建议+引用状态
 //   预置「自动封禁名单」（system=1）删 400/条目可改 200/手动解封写抑制表/导出 TXT
 
@@ -43,7 +43,6 @@ func newAutobanTestEnv(t *testing.T) *gin.Engine {
 	router := gin.New()
 	router.GET("/security/autoban", h.GetAutobanConfig)
 	router.PUT("/security/autoban", h.UpdateAutobanConfig)
-	router.POST("/security/autoban/run", h.RunAutobanNow)
 	router.GET("/security/autoban/status", h.GetAutobanStatus)
 	router.GET("/security/ip-lists/:id/export", h.ExportIPList)
 	router.PUT("/security/ip-lists/:id", h.UpdateIPList)
@@ -145,31 +144,49 @@ func TestAutobanConfig_putRejectsInvalid(t *testing.T) {
 	}
 }
 
-// ---- 立即执行 ----
+// ---- 保存联动调度（2026-10-14 用户裁定：调度唯一前提=业务启用） ----
 
-func TestAutobanRun_requiresEngine(t *testing.T) {
-	router := newAutobanTestEnv(t)
-	if rec := postJSON(t, router, "/security/autoban/run", map[string]any{}); rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("无引擎 status=%d, want 503", rec.Code)
-	}
-}
-
-func TestAutobanRun_triggersEngine(t *testing.T) {
+// Given 引擎装配+PUT /security/autoban 保存。
+// When enabled=true / enabled=false。
+// Then 联动启停 autoban 循环调度（loop_on 跟随业务开关）。
+func TestAutobanConfig_putTogglesLoopScheduling(t *testing.T) {
 	router := newAutobanTestEnv(t)
 	services.SetConfigLoadRerun(func(operator string) error { return nil })
 	t.Cleanup(func() { services.SetConfigLoadRerun(nil) })
 	te := services.InitTaskEngine("", t.TempDir()+"/app.log")
 	t.Cleanup(te.Stop)
 
-	rec := postJSON(t, router, "/security/autoban/run", map[string]any{})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	base := map[string]any{"threshold": 100, "window_minutes": 5, "duration": "1h", "scope": "all", "dry_run": true}
+	body := func(enabled bool) map[string]any {
+		m := map[string]any{}
+		for k, v := range base {
+			m[k] = v
+		}
+		m["enabled"] = enabled
+		return m
 	}
-	if !strings.Contains(rec.Body.String(), "running") {
-		t.Fatalf("响应应含 running: %s", rec.Body.String())
+	if rec := putJSON(t, router, "/security/autoban", body(true)); rec.Code != http.StatusOK {
+		t.Fatalf("启用保存 status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if n := countAuditRows(t, "触发", "自动封禁"); n != 1 {
-		t.Fatalf("触发审计=%d, want 1", n)
+	if m, _ := te.Lookup(services.AutobanTaskID); !m.LoopOn {
+		t.Fatal("enabled=true 保存应联动开启调度（StartLoop）")
+	}
+	if rec := putJSON(t, router, "/security/autoban", body(false)); rec.Code != http.StatusOK {
+		t.Fatalf("禁用保存 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if m, _ := te.Lookup(services.AutobanTaskID); m.LoopOn {
+		t.Fatal("enabled=false 保存应联动停止调度（StopLoop）")
+	}
+}
+
+// Given /security/autoban/run 端点已废除（前端无入口+手动执行语义收编进
+// 「启用后按配置调度」模型）。
+// When POST 该路径。
+// Then 404。
+func TestAutobanRun_endpointRemoved(t *testing.T) {
+	router := newAutobanTestEnv(t)
+	if rec := postJSON(t, router, "/security/autoban/run", map[string]any{}); rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404（端点已删除）", rec.Code)
 	}
 }
 
@@ -335,5 +352,33 @@ func TestAutobanListEntryCap_matchesHandlerCap(t *testing.T) {
 	if services.AutobanListEntryCap != ipListMaxEntries {
 		t.Fatalf("services.AutobanListEntryCap=%d != handlers ipListMaxEntries=%d（两值漂移会让任务写入被校验拒绝）",
 			services.AutobanListEntryCap, ipListMaxEntries)
+	}
+}
+
+// ---- 预置名单三字段锁定（2026-10-14 用户裁定：名称/分类/描述禁改） ----
+
+// Given 预置「自动封禁名单」（名称已禁改）。
+// When PUT 变更分类/描述。
+// Then 400（文案与名称同款）；同值提交不受影响（仅「变更」被拦）。
+func TestAutobanPreset_categoryDescriptionLocked(t *testing.T) {
+	router := newAutobanTestEnv(t)
+	id := autobanPresetID(t)
+
+	rec := putJSON(t, router, fmt.Sprintf("/security/ip-lists/%d", id), map[string]any{"category": "自定义分类"})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "分类不可修改") {
+		t.Fatalf("变更分类 status=%d body=%s, want 400+分类不可修改", rec.Code, rec.Body.String())
+	}
+	rec = putJSON(t, router, fmt.Sprintf("/security/ip-lists/%d", id), map[string]any{"description": "自定义描述"})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "描述不可修改") {
+		t.Fatalf("变更描述 status=%d body=%s, want 400+描述不可修改", rec.Code, rec.Body.String())
+	}
+
+	// 回归形状：同值提交（分类/描述与种子一致）放行
+	rec = putJSON(t, router, fmt.Sprintf("/security/ip-lists/%d", id), map[string]any{
+		"category":    "自动封禁",
+		"description": "自动封禁命中 IP（自动封禁任务维护；可手动追加或解封）",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("同值提交 status=%d body=%s, want 200（仅拦「变更」）", rec.Code, rec.Body.String())
 	}
 }

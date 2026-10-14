@@ -383,7 +383,7 @@
               </div>
             </div>
             <input ref="importEntriesInput" type="file" accept=".txt,.csv" class="entries-import-input" @change="onImportEntriesFileChange" />
-            <div class="form-tip-line">每条支持单 IP 或 CIDR（如 10.0.0.1、2001:db8::/32）；每个列表最多 500 条，全站列表总数上限 200 个，格式错误的行以红色标出；导入支持 .txt/.csv（每行一条：IP/CIDR + 可选备注，逗号或空白分隔）</div>
+            <div class="form-tip-line">每条支持单 IP 或 CIDR（如 10.0.0.1、2001:db8::/32）；每个列表最多 2000 条，全站列表总数上限 200 个，格式错误的行以红色标出；导入支持 .txt/.csv（每行一条：IP/CIDR + 可选备注，逗号或空白分隔）</div>
           </div>
         </el-form-item>
       </el-form>
@@ -971,7 +971,7 @@ const saveIpList = async () => {
   }
   // 允许空列表保存（历史用户裁定）：后端 validateIPListShape 不要求非空；
   // allow 模式策略引用的清空由后端 N1 守卫 409 拦截（fail-open 防护）
-  if (entries.length > 500) { ElMessage.warning('每个列表最多 500 条条目'); return }
+  if (entries.length > 2000) { ElMessage.warning('每个列表最多 2000 条条目'); return }
   const action = editingIpListId.value ? '保存' : '创建'
   try {
     await ElMessageBox.confirm(`确定${action} IP 地址列表「${name}」（${entries.length} 条条目）？`, '确认', { type: 'warning' })

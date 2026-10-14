@@ -8,6 +8,8 @@ package services
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -693,11 +695,14 @@ func TestAutobanBannedToday_countsTodayAutobanEntries(t *testing.T) {
 	}
 }
 
-// ---- wire 接线钉：Descriptor 标准七字段 + EnabledFn 业务开关联动 ----
+// ---- wire 接线钉：Descriptor 标准七字段 + 调度唯一前提=业务启用 ----
 
-// Given 引擎装配（InitTaskEngine）。
+// Given 引擎装配（InitTaskEngine），库内默认未启用（autoban_enabled=0）。
 // When 查 autoban 元数据。
-// Then 循环族 60s 间隔、主节点角色门、默认调度开、Enabled 随 autoban_enabled。
+// Then 循环族 60s 间隔、主节点角色门、可手动触发；Descriptor 无 EnabledFn
+// （任务监控 enabled 列恒开——启停语义全在调度开关+事件页业务开关，
+// 2026-10-14 用户裁定）；未启用时启动不开调度（否则未启用部署首 tick
+// 必落「未启用」失败行）。
 func TestTaskEngineWire_AutobanDescriptor(t *testing.T) {
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -722,37 +727,237 @@ func TestTaskEngineWire_AutobanDescriptor(t *testing.T) {
 	if m.IntervalSec != 60 {
 		t.Fatalf("interval=%ds, want 60s", m.IntervalSec)
 	}
-	if !m.LoopOn {
-		t.Fatal("默认调度应开启（StartLoop 清单含 autoban）")
-	}
 	if !m.CanTrigger {
 		t.Fatal("循环族应可手动触发")
 	}
-	// EnabledFn 读 autoban_enabled：默认 0 → 已停止；置 1 → 启用。
-	if m.Enabled {
-		t.Fatal("autoban_enabled 默认 0 时 Enabled 应为 false（已停止）")
+	if !m.Enabled {
+		t.Fatal("Descriptor 无 EnabledFn：任务监控 enabled 列应恒开（启停语义在 loop 开关+业务开关）")
+	}
+	if m.LoopOn {
+		t.Fatal("默认未启用（autoban_enabled=0）时启动不得开调度（调度唯一前提=业务启用）")
+	}
+}
+
+// Given 库内 autoban_enabled=1 后装配引擎。
+// When 查 autoban 元数据。
+// Then 启动即开调度（loop_on=true——与 PUT 保存联动同一前提）。
+func TestTaskEngineWire_AutobanLoopMirrorsEnabledOnStartup(t *testing.T) {
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize: %v", err)
 	}
 	if _, err := db.DB.Exec(`UPDATE global_config SET autoban_enabled=1 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	if m2, _ := te.Lookup(AutobanTaskID); !m2.Enabled {
-		t.Fatal("autoban_enabled=1 时 Enabled 应为 true")
-	}
-	if _, err := db.DB.Exec(`UPDATE global_config SET autoban_enabled=0 WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
-	if m3, _ := te.Lookup(AutobanTaskID); m3.Enabled {
-		t.Fatal("autoban_enabled=0 时 Enabled 应回落 false")
+	t.Cleanup(func() {
+		StopTaskEngine()
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	SetConfigLoadRerun(func(operator string) error { return nil })
+	t.Cleanup(func() { SetConfigLoadRerun(nil) })
+	te := InitTaskEngine("", t.TempDir()+"/app.log")
+
+	if m, _ := te.Lookup(AutobanTaskID); !m.LoopOn {
+		t.Fatal("autoban_enabled=1 时启动应开调度（启用即按配置调度）")
 	}
 }
 
-// Given 读库失败。
-// When 查 autoban 元数据。
-// Then Enabled=false（fail-closed——与 crs/ip2region 同口径）。
-func TestTaskEngineWire_AutobanEnabledFnFailsClosedOnDBError(t *testing.T) {
-	te := newWireTestEngine(t)
-	swapBrokenDB(t)
-	if enabledOf(t, te, AutobanTaskID) {
-		t.Fatal("autoban EnabledFn 读库失败应 fail-closed（Enabled=false/已停止），得到 true")
+// ---- Run 体业务门（2026-10-14 用户裁定：该任务只能由「启用后按配置调度」）----
+
+// Given 引擎装配+手动开调度（用户在任务列表开 loop）但业务未启用。
+// When 该任务被调度执行一轮（te.Trigger 与 tick 投递同走 runNow→Run 体）。
+// Then Run 体门拦下：错误含「未启用」；task_runs 落 failed 行（message 含
+// 未启用）；tasks/autoban.log 含「手动调度」；loop 被重禁（LoopOn=false）——
+// 未启用状态不得在调度面空转续跑。随后启用+重开调度，正常轮不被门拦。
+func TestAutobanRunGate_ManualLoopWhileDisabledFailsAndStopsLoop(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	newTaskLogDir(t)
+	SetConfigLoadRerun(func(operator string) error { return nil })
+	t.Cleanup(func() { SetConfigLoadRerun(nil) })
+	te := InitTaskEngine("", t.TempDir()+"/app.log")
+	t.Cleanup(te.Stop)
+
+	// 前置：手动开调度（任务列表 loop 开关）
+	te.StartLoop(AutobanTaskID)
+	if m, _ := te.Lookup(AutobanTaskID); !m.LoopOn {
+		t.Fatal("前置：手动开调度应生效")
+	}
+
+	// 调度执行一轮（Trigger 与 tick 投递同体：runNow→Run 体门）
+	err := te.Trigger(AutobanTaskID, "manual", "tester")
+	if err == nil || !strings.Contains(err.Error(), "未启用") {
+		t.Fatalf("Run 体门应拒绝未启用执行，err=%v", err)
+	}
+	if m, _ := te.Lookup(AutobanTaskID); m.LoopOn {
+		t.Fatal("Run 体门应重禁调度（StopLoop），未启用不得续跑")
+	}
+	var status, msg string
+	if err := db.DB.QueryRow(`SELECT status, COALESCE(message,'') FROM task_runs WHERE task_id='autoban' ORDER BY id DESC LIMIT 1`).Scan(&status, &msg); err != nil {
+		t.Fatalf("task_runs 行缺失: %v", err)
+	}
+	if status != "failed" || !strings.Contains(msg, "未启用") {
+		t.Fatalf("task_runs=(%s,%q), want failed+message 含未启用", status, msg)
+	}
+	if log := readTaskLog(t, AutobanTaskID); !strings.Contains(log, "手动调度") {
+		t.Fatalf("任务日志应含「手动调度」行: %s", log)
+	}
+
+	// 回归形状：启用后重开调度 → 正常执行（观察模式默认开，门只拦未启用）
+	if _, err := db.DB.Exec(`UPDATE global_config SET autoban_enabled=1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	te.StartLoop(AutobanTaskID)
+	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
+		t.Fatalf("启用后正常轮不得被门拦: %v", err)
+	}
+}
+
+// ---- 上限契约钉（2026-10-14 用户裁定：500→2000 设大值） ----
+
+func TestAutobanListEntryCap_raisedTo2000(t *testing.T) {
+	if AutobanListEntryCap != 2000 {
+		t.Fatalf("AutobanListEntryCap=%d, want 2000（2026-10-14 用户裁定设大值）", AutobanListEntryCap)
+	}
+}
+
+// Given 名单为空、候选新封数超过上限。
+// When merge 容量收敛。
+// Then 按容量截断新封（高计数优先保留）——不得因「无可挤的存量自动条目」
+// 把整批新封全丢弃；丢弃数入 DroppedNew（可观测）。
+func TestAutobanMerge_trimsNewBansWhenCapExceeded(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
+	oldCap := AutobanListEntryCap
+	AutobanListEntryCap = 200
+	t.Cleanup(func() { AutobanListEntryCap = oldCap })
+
+	candidates := make([]AutobanSuggestion, 0, 201)
+	for i := 1; i <= 201; i++ {
+		candidates = append(candidates, AutobanSuggestion{IP: fmt.Sprintf("198.51.100.%d", i), Count: 1000 - i})
+	}
+	out, err := autobanMergeEntries(AutobanConfig{Enabled: true, Threshold: 1, WindowMinutes: 5, Duration: "1h", Scope: "all", DryRun: false}, candidates)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	entries := presetEntries(t)
+	if len(entries) != 200 {
+		t.Fatalf("201 个新封只留 200（截断而非整批丢弃），得到 %d 条", len(entries))
+	}
+	if out.Total != 200 || out.DroppedNew != 1 || out.Evicted != 0 {
+		t.Fatalf("merge 计数失真：total=%d dropped=%d evicted=%d, want 200/1/0", out.Total, out.DroppedNew, out.Evicted)
+	}
+	if len(out.Banned) != 200 {
+		t.Fatalf("banned=%d, want 200（保留的新封）", len(out.Banned))
+	}
+	// 高计数优先保留：计数最高的 198.51.100.1 必须在场
+	if _, exists := entryValues(entries)["198.51.100.1"]; !exists {
+		t.Fatal("容量截断必须保留高计数候选（198.51.100.1 缺失）")
+	}
+	if _, exists := entryValues(entries)["198.51.100.201"]; exists {
+		t.Fatal("超限的最低计数候选应被丢弃（198.51.100.201 应缺席）")
+	}
+}
+
+// ---- 超限可观测：任务日志 WARN 行 + 审计「容量收敛」行（系统操作者） ----
+
+// Given 名单已满自动条目、候选触发挤出。
+// When 正式模式跑一轮 RunAutobanCycle。
+// Then tasks/autoban.log 落 WARN 级「容量收敛：挤出 N、丢弃 M」行；审计落
+// action=容量收敛、username=system 的操作记录。
+func TestAutobanRunCycle_capacityConvergenceObservable(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
+	oldCap := AutobanListEntryCap
+	AutobanListEntryCap = 2
+	t.Cleanup(func() { AutobanListEntryCap = oldCap })
+	seedPresetEntries(t, []models.IPListEntry{
+		{Value: "198.51.100.3", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 12:00:00"}, // 晚到期
+		{Value: "198.51.100.4", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 11:00:00"}, // 最早到期→被挤
+	})
+	autobanObserveEvent("203.0.113.10", "blocked", "942100")
+
+	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
+		t.Fatalf("RunAutobanCycle: %v", err)
+	}
+	log := readTaskLog(t, AutobanTaskID)
+	if !strings.Contains(log, "[WARN]") || !strings.Contains(log, "容量收敛：挤出 1、丢弃 0") {
+		t.Fatalf("任务日志应有 WARN 级容量收敛行（挤出 1、丢弃 0）:\n%s", log)
+	}
+	var n int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='容量收敛' AND resource='IP 地址列表' AND username='system'`).Scan(&n); err != nil {
+		t.Fatalf("count audit: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("容量收敛审计行=%d, want 1（系统操作者）", n)
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='容量收敛'`).Scan(&detail); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(detail, "挤出 1") || !strings.Contains(detail, "丢弃 0") {
+		t.Fatalf("容量收敛审计详情失真: %q", detail)
+	}
+}
+
+// ---- 计数分级日志：达标恰一行 / 窗口过期清零一行 / 未达标零行 / 摘要活跃数 ----
+
+// autobanLogNow 软读任务日志（尚未写任何行=空串——「零日志」断言用）。
+func autobanLogNow(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile(taskengine.TaskLogPath(AutobanTaskID))
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func TestAutobanCounter_tieredLogging(t *testing.T) {
+	f := installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 3, 5, "1h", "all", true)
+
+	// 未达标 IP 零日志（2 次 < 阈值 3）
+	autobanObserveEvent("203.0.113.8", "blocked", "942100")
+	autobanObserveEvent("203.0.113.8", "blocked", "942100")
+	if s := autobanLogNow(t); strings.Contains(s, "达到封禁阈值") || strings.Contains(s, "203.0.113.8") {
+		t.Fatalf("未达标 IP 不得留任何分级日志:\n%s", s)
+	}
+
+	// 首次达到阈值 → 恰好一行（非逐事件：第 4 次不再记）
+	for range 4 {
+		autobanObserveEvent("203.0.113.7", "blocked", "942100")
+	}
+	if got := strings.Count(autobanLogNow(t), "IP 203.0.113.7 达到封禁阈值（3 次/5 分钟）"); got != 1 {
+		t.Fatalf("阈值日志=%d 行, want 恰 1 行:\n%s", got, autobanLogNow(t))
+	}
+
+	// 每轮摘要行含「活跃 M 个 IP」（M=当前窗口内达过阈值的 IP 数）
+	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
+		t.Fatalf("RunAutobanCycle: %v", err)
+	}
+	if s := autobanLogNow(t); !strings.Contains(s, "活跃 1 个 IP") {
+		t.Fatalf("摘要行应含「活跃 1 个 IP」:\n%s", s)
+	}
+
+	// Feed 路径窗口过期：曾达标 IP 再次来事件 → 清零一行 + 新窗口重新计数
+	f.Advance(6 * time.Minute)
+	autobanObserveEvent("203.0.113.7", "blocked", "942100")
+	if got := strings.Count(autobanLogNow(t), "IP 203.0.113.7 计数窗口过期，清零"); got != 1 {
+		t.Fatalf("feed 路径清零日志=%d 行, want 1:\n%s", got, autobanLogNow(t))
+	}
+	if got := strings.Count(autobanLogNow(t), "203.0.113.7 达到封禁阈值"); got != 1 {
+		t.Fatalf("新窗口单次事件（1<3）不得再记阈值日志，得到 %d 行", got)
+	}
+
+	// 新窗口内再次达标 → 第二行阈值日志；随后修剪路径过期 → 第二行清零
+	autobanObserveEvent("203.0.113.7", "blocked", "942100")
+	autobanObserveEvent("203.0.113.7", "blocked", "942100")
+	if got := strings.Count(autobanLogNow(t), "203.0.113.7 达到封禁阈值"); got != 2 {
+		t.Fatalf("新窗口达标应再记一行（共 2），得到 %d 行", got)
+	}
+	f.Advance(6 * time.Minute)
+	autobanCandidates(3, 5*time.Minute)
+	if got := strings.Count(autobanLogNow(t), "IP 203.0.113.7 计数窗口过期，清零"); got != 2 {
+		t.Fatalf("修剪路径清零日志=%d 行, want 共 2:\n%s", got, autobanLogNow(t))
 	}
 }

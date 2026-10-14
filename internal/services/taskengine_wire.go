@@ -478,7 +478,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Description: "按滑动窗口统计 WAF 安全事件（口径可配：拦截/检测/全部），同一 IP 计数达阈值即写入「自动封禁名单」并在到期后自动解封；默认观察模式仅记录建议不封禁。计数数据源=安全事件采集提交点（仅主节点）",
 		Category:    "安全防护", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
 		IntervalFn: func() time.Duration { return time.Minute },
-		EnabledFn:  func() bool { return AutobanEnabled() }, // 业务开关门（关=已停止——展示+调度面跳过，历史问题；fail-closed 读库）
+		// 无 EnabledFn（2026-10-14 用户裁定）：调度唯一前提=业务启用（PUT
+		// 保存联动启停+启动按库实态对齐）；挂 EnabledFn 会让域 E 调度门在
+		// 调度面静默拦截，到不了 Run 体业务门（未启用空转无落痕）。任务监控
+		// enabled 列恒开，启停语义全在调度开关+事件页业务开关。
 		Run: func(rc taskengine.RunContext) error {
 			return RunAutobanCycle(rc)
 		},
@@ -542,16 +545,23 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// 定时/循环/触发均可手动调度；常驻族恒不可（启停即可，启停由调度开关+重启承担）。
 
 	// 默认调度启动：
-	// - 循环 8 个全启动（cert-waiting-ca 除外——默认关闭，续期扫描唤醒）
+	// - 循环 8 个全启动（cert-waiting-ca 除外——默认关闭，续期扫描唤醒；
+	//   autoban 除外——调度唯一前提=业务启用，见下）
 	// - 常驻 3 个全启动（系统启动即运行；关闭调度=启动也不运行）
 	// - 定时 4 个启动排程（EnabledFn/NextSlotFn 内含开关判断）
 	for _, id := range []string{
 		"config-watchdog", "log-cleanup", "audit-retention", "security-events-retention",
 		"cert-renewal-scan", "cert-reconcile", "cert-manual-poll",
 		"security-events-ingestion", "cert-issuance", "cluster-sync",
-		"threat", "crs", "ip2region", "autoban", "auto-backup",
+		"threat", "crs", "ip2region", "auto-backup",
 	} {
 		taskEngine.StartLoop(id)
+	}
+	// autoban 例外（2026-10-14 用户裁定）：启动按库内业务开关实态对齐——
+	// 启用才开调度（未启用即 StartLoop 会在首 tick 被 Run 体业务门拦停，
+	// 每次启动都落一行「未启用」假失败）。
+	if AutobanEnabled() {
+		taskEngine.StartLoop("autoban")
 	}
 	// TASK-L1（历史 历史问题）：首槽武装——引擎化前旧调度器首个 tick 才武装首槽
 	//（auto_update 开且 next_update 空时写入下一排程槽）；引擎零槽恒不到期

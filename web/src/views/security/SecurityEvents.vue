@@ -11,7 +11,9 @@
       <el-button :icon="Refresh" @click="fetchEvents">刷新</el-button>
     </div>
 
-    <!-- 自动封禁状态卡（历史问题）：状态/口径/窗口/阈值/时长/今日封禁/名单数 + 三按钮 -->
+    <!-- 自动封禁状态卡（历史问题）：状态/口径/窗口/阈值/时长/今日封禁/名单数 + 两按钮
+         （2026-10-14 裁定：启用/禁用直接切换业务开关并联动调度；「立即执行」废除——
+         任务只能由「启用后按配置调度执行」） -->
     <el-card class="autoban-card" v-loading="autobanStatusLoading">
       <div class="autoban-bar">
         <div class="autoban-title">
@@ -36,7 +38,13 @@
         </div>
         <div class="autoban-actions">
           <el-button size="small" @click="openAutobanConfig">配置</el-button>
-          <el-button size="small" type="primary" plain :loading="autobanRunning" @click="runAutobanNow">立即执行</el-button>
+          <el-button
+            size="small"
+            :type="autobanStatus.enabled ? 'danger' : 'success'"
+            plain
+            :loading="autobanToggling"
+            @click="toggleAutobanEnabled"
+          >{{ autobanStatus.enabled ? '禁用' : '启用' }}</el-button>
         </div>
       </div>
       <!-- 未关联策略黄条：名单未被启用中的安全策略引用，封禁不生效 -->
@@ -315,7 +323,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { Refresh, Warning, View, Hide, Document, Lock } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { CheckboxValueType } from 'element-plus'
 import { request } from '@/utils/api'
 import LogStorageBar from '@/components/LogStorageBar.vue'
@@ -352,7 +360,7 @@ const autobanStatus = ref<AutobanStatus>({
   running: false, last_run: '', last_status: '',
 })
 const autobanStatusLoading = ref(false)
-const autobanRunning = ref(false)
+const autobanToggling = ref(false)
 const autobanScopeText = computed(() => AUTOBAN_SCOPES.find((s) => s.value === autobanStatus.value.scope)?.label ?? autobanStatus.value.scope)
 const autobanDurationText = computed(() => AUTOBAN_DURATIONS.find((d) => d.value === autobanStatus.value.duration)?.label ?? autobanStatus.value.duration)
 
@@ -384,6 +392,8 @@ const saveAutobanConfig = async (): Promise<void> => {
   if (autobanForm.value.window_minutes < 1 || autobanForm.value.window_minutes > 60) {
     ElMessage.warning('统计窗口须在 1-60 分钟之间'); return
   }
+  // 弹框内把 enabled 从关改开：同款二次确认（取消=不保存，弹框留在原处）
+  if (autobanForm.value.enabled && !autobanStatus.value.enabled && !(await confirmAutobanEnable())) return
   autobanSaving.value = true
   try {
     await request.put('/security/autoban', autobanForm.value)
@@ -394,16 +404,40 @@ const saveAutobanConfig = async (): Promise<void> => {
   finally { autobanSaving.value = false }
 }
 
-const runAutobanNow = async (): Promise<void> => {
-  if (autobanRunning.value) return
-  autobanRunning.value = true
+// 启用二次确认（2026-10-14 用户裁定）：enabled 关→开的保存动作先确认——
+// 威胁库+CRS+地域拦截已覆盖绝大多数恶意请求，自动封禁定位是少量高频攻击者
+// 的资源救济；建议观察模式起步校准后转正式。取消=不保存。
+const AUTOBAN_ENABLE_CONFIRM_TEXT =
+  '启用前须知：新封禁最迟约 1 分钟后生效（重载按分钟节流合并）；每次配置重载为优雅热载，进行中的请求不受影响，但已建立的长连接（WebSocket / SSE 等）可能被断开，客户端会自动重连；持续攻击期间每分钟至多一次全量配置渲染与重载，存在一定性能开销。<br/><br/>对大多数部署而言，IP 威胁库 + CRS + 地域拦截已能挡住 99% 以上的恶意请求，少量恶意 IP 手动拉黑即可。确认要启用自动封禁吗？建议先以观察模式运行，确认封禁建议准确后再转为正式封禁。'
+const confirmAutobanEnable = async (): Promise<boolean> => {
   try {
-    await request.post('/security/autoban/run', {})
-    ElMessage.success('已触发自动封禁任务')
-    // 任务异步执行——延迟刷新状态卡
-    setTimeout(fetchAutobanStatus, 2000)
+    await ElMessageBox.confirm(AUTOBAN_ENABLE_CONFIRM_TEXT, '启用自动封禁', { confirmButtonText: '确认启用', cancelButtonText: '取消', type: 'warning', dangerouslyUseHTMLString: true })
+    return true
+  } catch {
+    return false
+  }
+}
+
+// 启用/禁用直切业务开关（2026-10-14 裁定）：保存即联动调度——enabled=true
+// 开 autoban 循环调度、false 停。PUT 需全量六项配置，从状态卡实态回填。
+const toggleAutobanEnabled = async (): Promise<void> => {
+  if (autobanToggling.value) return
+  const next = !autobanStatus.value.enabled
+  if (next && !(await confirmAutobanEnable())) return
+  autobanToggling.value = true
+  try {
+    await request.put('/security/autoban', {
+      enabled: next,
+      dry_run: autobanStatus.value.dry_run,
+      threshold: autobanStatus.value.threshold,
+      window_minutes: autobanStatus.value.window_minutes,
+      duration: autobanStatus.value.duration,
+      scope: autobanStatus.value.scope,
+    })
+    ElMessage.success(next ? '自动封禁已启用（按配置调度执行）' : '自动封禁已禁用（调度已停止）')
+    fetchAutobanStatus()
   } catch { /* 错误已由全局拦截器 toast */ }
-  finally { autobanRunning.value = false }
+  finally { autobanToggling.value = false }
 }
 
 // 触发阶段分类（历史追加需求，用户裁定）：IP ACL 族=黑白名单/信任/地域/

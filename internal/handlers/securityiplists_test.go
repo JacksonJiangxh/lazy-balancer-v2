@@ -71,7 +71,7 @@ func TestCreateIPList_validationMatrix(t *testing.T) {
 		{"remark too long", map[string]any{"name": "ok", "entries": fmt.Sprintf(`[{"value":"1.2.3.4","remark":"%s"}]`, strings.Repeat("r", 101))}, 400, "备注长度"},
 		{"invalid entry value", map[string]any{"name": "ok", "entries": `[{"value":"999.1.1.1","remark":""}]`}, 400, "无效的 IP/CIDR"},
 		{"entries not json", map[string]any{"name": "ok", "entries": "not-json"}, 400, "JSON 数组"},
-		{"too many entries", map[string]any{"name": "ok", "entries": bigEntriesJSON(501)}, 400, "条目数量"},
+		{"too many entries", map[string]any{"name": "ok", "entries": bigEntriesJSON(2001)}, 400, "条目数量"},
 		{"dup name case-insensitive", map[string]any{"name": "办公网", "entries": "[]"}, 409, "已存在"},
 	}
 	for _, tc := range cases {

@@ -90,7 +90,7 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
 | log-cleanup | 24h |
 | audit-retention | 24h |
 | security-events-retention | 24h |
-| autoban | 60s（EnabledFn=autoban_enabled 业务开关；观察模式默认开） |
+| autoban | 60s（调度唯一前提=业务启用：PUT 保存联动启停+启动按库实态对齐，Descriptor 无 EnabledFn；观察模式默认开） |
 
 
 另：cert-job 动态行（`cert_jobs` 表逐单镜像）为签发工作项视图，不入引擎注册表。
@@ -164,6 +164,8 @@ task_runs 保留 90 天（audit-retention 每日清理）。
 - `RecordRunStart/RecordRunFinish` — legacy 直调路径（引擎外执行）
 
 ## 7. 修订记录
+
+- v2.0.3（2026-10-14，用户裁定「启用后按配置调度」）：autoban 调度模型收编——Descriptor 去除 EnabledFn（任务监控 enabled 列恒开，启停语义全在调度开关+事件页业务开关）；PUT /security/autoban 保存联动启停（enabled=true→StartLoop、false→StopLoop）；启动按库内业务开关实态对齐调度；手动开调度/手动触发但未启用由 Run 体首行业务门拦停（TaskLogf「手动调度，执行失败：未启用」+task_runs failed 行+StopLoop 重禁调度）；POST /security/autoban/run「立即执行」端点与前端按钮删除。
 
 - v2.0.2（2026-10-14，历史问题）：新增 autoban 循环任务（60s/主节点/EnabledFn=autoban_enabled 业务开关联动）——WAF 事件滑动窗口计数（摄取提交点喂入）→ 阈值判定 →「自动封禁名单」merge（清到期/保留手动/抑制过滤/超限挤最早到期）→ 重载 60s 节流暂存合并；观察模式（dry_run 默认开）仅记建议；每轮 TaskLogf 摘要行入 tasks/autoban.log。
 

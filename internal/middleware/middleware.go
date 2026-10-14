@@ -487,10 +487,9 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				admin.DELETE("/security/ip-lists/:id", h.DeleteIPList)
 				admin.POST("/security/ip-lists/:id/ips", h.AddIPToList)
 				admin.POST("/security/ip-lists/:id/remove-ip", h.RemoveIPFromList)
-				// 自动封禁（历史问题）：配置写/立即执行（主节点门在 handler 内）
+				// 自动封禁（历史问题）：配置写（主节点门在 handler 内；保存联动
+				// 调度启停——2026-10-14 裁定，/run 端点已废除）
 				admin.PUT("/security/autoban", h.UpdateAutobanConfig)
-				admin.POST("/security/autoban/run", h.RunAutobanNow)
-
 			}
 
 			// User + Admin

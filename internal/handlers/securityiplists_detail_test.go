@@ -241,3 +241,76 @@ func TestListIPLists_emptyEntriesOnSystemRows(t *testing.T) {
 		}
 	}
 }
+
+// ---- 系统名单置顶（2026-10-14 用户裁定） ----
+
+// Given 系统名单×4（威胁三源+自动封禁）与用户自建列表并存，且用户列表的
+// 更新时间最新（若按更新时间全局排序会排最前）。
+// When GET /security/ip-lists。
+// Then 系统名单恒排在用户列表之前（系统组内按更新时间序——最新更新的系统
+// 名单组内第一），用户组随后。
+func TestListIPLists_systemListsPinnedFirst(t *testing.T) {
+	newBackupTestHandlers(t)
+	for _, name := range []string{"用户甲", "用户乙"} {
+		if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, category, entries, system, created_at, updated_at)
+			VALUES (?, '', '[]', 0, datetime('now'), datetime('now'))`, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 一个威胁名单的更新时间顶到组内最新（组内排序判据）；刻意选 id 最大的
+	// 系统名单——旧的 ORDER BY id 序下首行是 id 最小的威胁名单，本判据才会红。
+	if _, err := db.DB.Exec(`UPDATE security_ip_lists SET updated_at=datetime('now','+1 hour') WHERE system=1 AND name=?`, threatSystemListNameForOrderTest(t)); err != nil {
+		t.Fatal(err)
+	}
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists", h.ListIPLists)
+
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/ip-lists", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Data []struct {
+			Name   string `json:"name"`
+			System bool   `json:"system"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	rows := payload.Data
+	if len(rows) < 6 {
+		t.Fatalf("行数=%d, want ≥6（4 系统+2 用户）", len(rows))
+	}
+	sysCount := 0
+	for i, row := range rows {
+		if row.System {
+			if i >= 4 {
+				t.Fatalf("系统名单必须置顶：第 %d 行仍是系统名单 %q", i, row.Name)
+			}
+			sysCount++
+		} else if i < 4 {
+			t.Fatalf("前 4 行必须是系统名单：第 %d 行是用户列表 %q", i, row.Name)
+		}
+	}
+	if sysCount != 4 {
+		t.Fatalf("系统名单=%d, want 4", sysCount)
+	}
+	if rows[0].Name != threatSystemListNameForOrderTest(t) {
+		t.Fatalf("系统组内应按更新时间序（最新在前），首行=%q", rows[0].Name)
+	}
+}
+
+// threatSystemListNameForOrderTest 取 id 最大的威胁名单名（置顶排序测试的组内
+// 判据名单——选 id 最大者使旧 id 序下它不在首行，判据可红）。
+func threatSystemListNameForOrderTest(t *testing.T) string {
+	t.Helper()
+	var name string
+	if err := db.DB.QueryRow(`SELECT name FROM security_ip_lists WHERE system=1 AND name<>? ORDER BY id DESC LIMIT 1`, services.AutobanPresetListName).Scan(&name); err != nil {
+		t.Fatalf("threat list missing: %v", err)
+	}
+	return name
+}

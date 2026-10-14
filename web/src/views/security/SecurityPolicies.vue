@@ -571,8 +571,9 @@
               <el-form-item label="区域选择">
                 <!-- 历史问题 二十三次（用户裁决）：区域精确到市——省级联选择；只选省 =
                      整省生效（存量语义），展开选市 = 省+市联合匹配（省/市 形态）。
-                     域 G：「海外」仍为兜底一级条目（解析失败/IPv6）；
-                     「海外国家」分组提供已解析海外行的国家级选择。 -->
+                     v2.3.7 修正：独立「海外」一级叶子取消——「海外国家」父节点
+                     可勾选，勾选 = 全部海外（解析失败/IPv6 兜底哨兵 ∪ 全部
+                     已解析国名）；展开按国家粒度勾选，标签中文、提交英文国名。 -->
                 <el-cascader
                   v-model="geoipCountries"
                   :options="regionCascaderOptions"
@@ -926,32 +927,48 @@ interface PolicySummary { id: number; name: string; mode: string; enabled: boole
 
 
 
-interface RegionTree { provinces: string[]; cities: Record<string, string[]>; countries?: string[] }
+interface RegionTree {
+  provinces: string[]
+  cities: Record<string, string[]>
+  countries?: string[]
+  // 海外国家英文→中文映射（regions API 并行字段，单源 geoipnames.CountryNamesCN）；
+  // 缺失（旧后端/请求失败）时子节点回退英文标签。
+  country_names_cn?: Record<string, string>
+}
 const regionTree = ref<RegionTree>({ provinces: [], cities: {} })
 // 级联选项：各省为父节点（选父 = 整省），省内城市为子节点（省/市 联合匹配）；
-// 「海外」仍为一级叶子（解析失败/IPv6 的兜底条目），「海外国家」为分组父节点
-//（disabled 不可选，仅承载 children）——已解析海外行按国家粒度选择，选择值
-// 仍为扁平字符串数组，下游（geoip_countries 提交/回显）零改动。
+// 独立「海外」一级叶子不再展示（v2.3.7 修正）——「海外国家」为分组父节点且
+// 可勾选（checkStrictly）：勾选父节点提交「海外」= 全部海外语义（解析失败/
+// IPv6 兜底哨兵 ∪ 全部已解析国名，与发射端 geoipLocOperator 的海外条目展开
+// 语义一致）；子节点按国家粒度选择，提交英文国名（匹配键形态不变，标签用
+// 中文）。选择值仍为扁平字符串数组，下游（geoip_countries 提交/回显）零改动。
 const regionCascaderOptions = computed(() => {
-  const options: Array<{ value: string; label: string; disabled?: boolean; children?: Array<{ value: string; label: string }> }> =
-    regionTree.value.provinces.map((prov) => {
-      const cities = regionTree.value.cities[prov] || []
-      if (cities.length === 0) {
-        return { value: prov, label: prov }
-      }
-      return {
-        value: prov,
-        label: prov,
-        children: cities.map((city) => ({ value: `${prov}/${city}`, label: city })),
-      }
-    })
-  const overseas = regionTree.value.countries || []
-  if (overseas.length > 0) {
+  type RegionNode = { value: string; label: string; children?: Array<{ value: string; label: string }> }
+  const options: Array<RegionNode> = []
+  for (const prov of regionTree.value.provinces) {
+    // 「海外」哨兵不再作独立一级叶子——提交值由「海外国家」父节点承载
+    if (prov === '海外') continue
+    const cities = regionTree.value.cities[prov] || []
+    if (cities.length === 0) {
+      options.push({ value: prov, label: prov })
+      continue
+    }
     options.push({
-      value: 'overseas-countries-group',
+      value: prov,
+      label: prov,
+      children: cities.map((city) => ({ value: `${prov}/${city}`, label: city })),
+    })
+  }
+  const overseas = regionTree.value.countries || []
+  if (regionTree.value.provinces.length > 0 || overseas.length > 0) {
+    const zhNames = regionTree.value.country_names_cn || {}
+    options.push({
+      value: '海外',
       label: '海外国家',
-      disabled: true,
-      children: overseas.map((country) => ({ value: country, label: country })),
+      children:
+        overseas.length > 0
+          ? overseas.map((country) => ({ value: country, label: zhNames[country] || country }))
+          : undefined,
     })
   }
   return options
@@ -2707,7 +2724,7 @@ const confirmExtract = async (): Promise<void> => {
   if (extractForm.value.category.length > 32) { ElMessage.warning('分类不能超过 32 字符'); return }
   const sourceEntries = extractSourceEntries.value.map((value) => value.trim()).filter((value) => value !== '')
   if (sourceEntries.length === 0) { ElMessage.warning('内联名单为空，无需提取'); return }
-  if (sourceEntries.length > 500) { ElMessage.warning('每个列表最多 500 条条目'); return }
+  if (sourceEntries.length > 2000) { ElMessage.warning('每个列表最多 2000 条条目'); return }
   try {
     await ElMessageBox.confirm(`确定创建列表「${name}」（${sourceEntries.length} 条）并转为引用？内联条目将清空，拦截语义不变。`, '确认', { type: 'warning' })
   } catch { return }
@@ -3053,9 +3070,14 @@ const openRuleInNewTab = (caddyId: string): void => {
 const fetchRegions = async () => {
   try {
     const res = await request.get<APIResponse<RegionTree>>('/security/ip2region/regions')
-    regionTree.value = { provinces: res.data?.provinces || [], cities: res.data?.cities || {}, countries: res.data?.countries || [] }
+    regionTree.value = {
+      provinces: res.data?.provinces || [],
+      cities: res.data?.cities || {},
+      countries: res.data?.countries || [],
+      country_names_cn: res.data?.country_names_cn || {},
+    }
   } catch {
-    regionTree.value = { provinces: [], cities: {}, countries: [] }
+    regionTree.value = { provinces: [], cities: {}, countries: [], country_names_cn: {} }
   }
 }
 

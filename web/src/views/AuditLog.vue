@@ -252,6 +252,8 @@ const ACTION_TAG_TABLE: Record<string, string> = {
   // 自动封禁（历史问题）：封禁=阻断（danger），到期自动解封=恢复（success）。
   '自动封禁': 'danger',
   '自动解封': 'success',
+  // 容量收敛：名单触顶挤出/丢弃的告警性系统动作（warning——不是错误，但需关注）。
+  '容量收敛': 'warning',
 }
 const actionTagType = (action: string): string => ACTION_TAG_TABLE[action] ?? 'info'
 

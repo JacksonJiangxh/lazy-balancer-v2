@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"lazy-balancer-v2/geoipnames"
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
@@ -3080,7 +3081,9 @@ func ip2RegionShortenName(name string) string {
 // v4 xdb 第 4 段为 ISP——实测 114.114.114.114=中国|江苏省|南京市|0|CN、
 // 180.101.245.246=中国|江苏省|南京市|电信|CN）；海外 → "国家·省州·城市·ISP(IDC)"
 // 精确拼接（2026-09-13 用户裁定，弹框展示完整精度，列表侧由前端 compactLocation
-// 精简）；Reserved → "保留地址"；未知/畸形 → ""。
+// 精简；v2.3.7 修正起国家段经 geoipnames.CountryChinese 中文化——事件列表/
+// 弹框显示「美国·California」，未收录国名回退英文原名）；Reserved → "保留地址"；
+// 未知/畸形 → ""。
 func formatIP2RegionLocation(region string) string {
 	fields := strings.Split(region, "|")
 	if len(fields) < 5 || fields[0] == "" || fields[0] == "0" {
@@ -3092,8 +3095,9 @@ func formatIP2RegionLocation(region string) string {
 	if fields[0] != "中国" {
 		// 海外精确化(2026-09-13 用户裁定):与国内同构拼接非 0 段
 		// 国家·省州·城市·ISP(IDC)——弹框展示完整精度;列表仍由前端
-		// compactLocation 精简(海外取首段即国家)。
-		parts := []string{fields[0]}
+		// compactLocation 精简(海外取首段即国家)。国家段中文化
+		// (v2.3.7 修正):仅展示层翻译,X-LB-GeoIP-Loc 发射链不动。
+		parts := []string{geoipnames.CountryChinese(fields[0])}
 		for _, f := range fields[1:4] {
 			if f != "" && f != "0" {
 				parts = append(parts, f)
@@ -4176,6 +4180,18 @@ func (h *Handlers) GetIP2RegionInfo(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: info})
 }
 
+// ip2RegionRegionsResponse regions 响应体：地域树 + country_names_cn 并行
+// 字段。树结构（provinces/cities/countries）保持旧形态（存量消费方零破坏）；
+// zh 映射是 geoipnames 二进制静态表（非 xdb 派生态），在响应层透传而不入树
+// ——regions.json 缓存体积与重建逻辑零改动。
+type ip2RegionRegionsResponse struct {
+	services.IP2RegionRegionTree
+	// CountryNamesCN：海外国家英文→中文映射（单源 geoipnames.CountryNamesCN
+	// 全表透传，v2.3.7 修正）——前端级联「海外国家」子节点中文标签；缺失时
+	// 前端回退英文标签（向后兼容）。
+	CountryNamesCN map[string]string `json:"country_names_cn"`
+}
+
 func (h *Handlers) GetIP2RegionRegions(c *gin.Context) {
 	// 与校验端（ValidateGeoIPCountries）同源：live searcher 优先、缓存兜底，
 	// 避免带外替换 xdb 后两端分叉。
@@ -4189,7 +4205,10 @@ func (h *Handlers) GetIP2RegionRegions(c *gin.Context) {
 			Countries: []string{},
 		}
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: tree})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: ip2RegionRegionsResponse{
+		IP2RegionRegionTree: *tree,
+		CountryNamesCN:      geoipnames.CountryNamesCN,
+	}})
 }
 
 func (h *Handlers) UpdateIP2RegionAutoUpdate(c *gin.Context) {
