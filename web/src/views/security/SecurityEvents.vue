@@ -418,14 +418,13 @@ const saveAutobanConfig = async (): Promise<void> => {
 // MessageBox 挂 body → 样式放非 scoped 块。纯静态文案、无任何用户输入插值，无注入面。
 const AUTOBAN_ENABLE_CONFIRM_HTML = `
 <div class="autoban-confirm">
-  <div class="autoban-confirm-title">启用前须知</div>
-  <ul class="autoban-confirm-list">
-    <li>新封禁最迟约 1 分钟后生效（重载按分钟节流合并）</li>
-    <li>每次配置重载为优雅热载，进行中的请求不受影响，但已建立的长连接（WebSocket / SSE 等）可能被断开，客户端会自动重连</li>
-    <li>持续攻击期间每分钟至多一次全量配置渲染与重载，存在一定性能开销</li>
-  </ul>
-  <div class="autoban-confirm-title autoban-confirm-title--gap">使用建议</div>
-  <p class="autoban-confirm-text">对大多数部署而言，IP 威胁库 + CRS + 地域拦截已能挡住 99% 以上的恶意请求，少量恶意 IP 手动拉黑即可。确认要启用自动封禁吗？建议先以观察模式运行，确认封禁建议准确后再转为正式封禁。<br/><b>启用后将自动创建「自动封禁 IP 黑名单」策略（引用自动封禁名单）——请到「安全策略」把它关联到需要防护的规则，封禁才会生效。</b></p>
+  <p class="autoban-confirm-lead">确认启用自动封禁？达到阈值的 IP 将被自动加入封禁名单，到期自动解封。</p>
+  <div class="autoban-confirm-notes">
+    <div>· 新封禁约 1 分钟内生效，重载时长连接可能被重置</div>
+    <div>· 持续攻击时每分钟至多一次重载，有少量性能开销</div>
+    <div>· 建议先以观察模式运行，确认建议准确后再正式封禁</div>
+  </div>
+  <div class="autoban-confirm-howto">生效方式：在 IP 访问控制（黑名单）策略中引用「自动封禁名单」地址列表</div>
 </div>`
 const confirmAutobanApply = async (): Promise<boolean> => {
   try {
@@ -792,15 +791,10 @@ onMounted(() => {
 /* 自动封禁启用确认框（dangerouslyUseHTMLString 精排，2026-10-14 裁定）：
    MessageBox 挂 body，scoped 样式不可达 → 全局作用域。两段式（启用前须知三条
    列表 + 使用建议正文），13px 正文紧凑排布，弹框宽 480px（customStyle 指定） */
-.autoban-confirm { font-size: 13px; line-height: 1.75; color: var(--el-text-color-regular, #606266); text-align: left; }
-.autoban-confirm-title { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: var(--el-text-color-primary, #303133); margin: 0 0 8px; }
-.autoban-confirm-title::before { content: ''; width: 3px; height: 13px; border-radius: 2px; background: var(--el-color-primary, #409eff); flex: none; }
-.autoban-confirm-title--gap { margin-top: 16px; }
-.autoban-confirm-title--gap::before { background: var(--el-color-success, #67c23a); }
-.autoban-confirm-list { margin: 0 0 4px; padding: 0; list-style: none; }
-.autoban-confirm-list li { position: relative; padding-left: 14px; margin: 0 0 6px; color: var(--el-text-color-regular, #606266); }
-.autoban-confirm-list li::before { content: ''; position: absolute; left: 2px; top: 9px; width: 4px; height: 4px; border-radius: 50%; background: var(--el-color-warning, #e6a23c); }
-.autoban-confirm-text { margin: 0; color: var(--el-text-color-regular, #606266); }
+.autoban-confirm { text-align: left; }
+.autoban-confirm-lead { margin: 0 0 14px; font-size: 14px; line-height: 1.7; color: var(--el-text-color-primary, #303133); }
+.autoban-confirm-notes { margin: 0 0 14px; padding: 10px 14px; border-radius: 6px; background: var(--el-fill-color-light, #f5f7fa); font-size: 12.5px; line-height: 2; color: var(--el-text-color-regular, #606266); }
+.autoban-confirm-howto { font-size: 12.5px; line-height: 1.7; color: var(--el-text-color-secondary, #909399); }
 /* MessageBox 四区统一版式：外框零内边距，标题/正文/按钮区各自 24px 侧距——
    与 Element Plus 默认窄内边距（15px）整体覆盖，视觉边距一致 */
 :global(.autoban-confirm-box) { padding: 0; }
