@@ -418,13 +418,19 @@ const saveAutobanConfig = async (): Promise<void> => {
 // MessageBox 挂 body → 样式放非 scoped 块。纯静态文案、无任何用户输入插值，无注入面。
 const AUTOBAN_ENABLE_CONFIRM_HTML = `
 <div class="autoban-confirm">
-  <p class="autoban-confirm-lead">确认启用自动封禁？达到阈值的 IP 将被自动加入封禁名单，到期自动解封。</p>
-  <div class="autoban-confirm-notes">
-    <div>· 新封禁约 1 分钟内生效，重载时长连接可能被重置</div>
-    <div>· 持续攻击时每分钟至多一次重载，有少量性能开销</div>
-    <div>· 建议先以观察模式运行，确认建议准确后再正式封禁</div>
+  <div class="autoban-confirm-hero">
+    <div class="autoban-confirm-icon"><svg viewBox="0 0 1024 1024" width="22" height="22"><path d="M512 64a448 448 0 1 1 0 896 448 448 0 0 1 0-896z m0 192a32 32 0 0 0-32 32v256a32 32 0 0 0 64 0V288a32 32 0 0 0-32-32z m0 416a48 48 0 1 0 0-96 48 48 0 0 0 0 96z" fill="currentColor"/></svg></div>
+    <div class="autoban-confirm-head">
+      <div class="autoban-confirm-heading">确认启用自动封禁？</div>
+      <div class="autoban-confirm-sub">达到阈值的 IP 将被自动加入封禁名单，到期自动解封</div>
+    </div>
   </div>
-  <div class="autoban-confirm-howto">生效方式：在 IP 访问控制（黑名单）策略中引用「自动封禁名单」地址列表</div>
+  <div class="autoban-confirm-notes">
+    <div class="autoban-confirm-note"><span class="autoban-confirm-dot"></span>新封禁约 1 分钟内生效，重载时长连接可能被重置</div>
+    <div class="autoban-confirm-note"><span class="autoban-confirm-dot"></span>持续攻击时每分钟至多一次重载，有少量性能开销</div>
+    <div class="autoban-confirm-note"><span class="autoban-confirm-dot"></span>建议先以观察模式运行，确认建议准确后再正式封禁</div>
+  </div>
+  <div class="autoban-confirm-howto"><span class="autoban-confirm-howto-label">生效方式</span>在 IP 访问控制（黑名单）策略中引用「自动封禁名单」地址列表</div>
 </div>`
 const confirmAutobanApply = async (): Promise<boolean> => {
   try {
@@ -792,9 +798,15 @@ onMounted(() => {
    MessageBox 挂 body，scoped 样式不可达 → 全局作用域。两段式（启用前须知三条
    列表 + 使用建议正文），13px 正文紧凑排布，弹框宽 480px（customStyle 指定） */
 .autoban-confirm { text-align: left; }
-.autoban-confirm-lead { margin: 0 0 14px; font-size: 14px; line-height: 1.7; color: var(--el-text-color-primary, #303133); }
-.autoban-confirm-notes { margin: 0 0 14px; padding: 10px 14px; border-radius: 6px; background: var(--el-fill-color-light, #f5f7fa); font-size: 12.5px; line-height: 2; color: var(--el-text-color-regular, #606266); }
-.autoban-confirm-howto { font-size: 12.5px; line-height: 1.7; color: var(--el-text-color-secondary, #909399); }
+.autoban-confirm-hero { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 18px; }
+.autoban-confirm-icon { flex: none; width: 42px; height: 42px; border-radius: 50%; display: flex; align-items: center; justify-content: center; background: var(--el-color-warning-light-9, #fdf6ec); color: var(--el-color-warning, #e6a23c); }
+.autoban-confirm-heading { font-size: 15px; font-weight: 600; color: var(--el-text-color-primary, #303133); line-height: 1.5; }
+.autoban-confirm-sub { margin-top: 4px; font-size: 13px; line-height: 1.6; color: var(--el-text-color-regular, #606266); }
+.autoban-confirm-notes { margin: 0 0 14px; padding: 12px 16px; border-radius: 8px; background: var(--el-fill-color-light, #f5f7fa); border: 1px solid var(--el-border-color-lighter, #ebeef5); }
+.autoban-confirm-note { display: flex; align-items: baseline; gap: 10px; font-size: 12.5px; line-height: 2; color: var(--el-text-color-regular, #606266); }
+.autoban-confirm-dot { flex: none; width: 5px; height: 5px; border-radius: 50%; background: var(--el-color-warning, #e6a23c); transform: translateY(-2px); }
+.autoban-confirm-howto { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; line-height: 1.7; color: var(--el-text-color-secondary, #909399); }
+.autoban-confirm-howto-label { flex: none; font-size: 11px; padding: 1px 8px; border-radius: 10px; color: var(--el-color-primary, #409eff); background: var(--el-color-primary-light-9, #ecf5ff); }
 /* MessageBox 四区统一版式：外框零内边距，标题/正文/按钮区各自 24px 侧距——
    与 Element Plus 默认窄内边距（15px）整体覆盖，视觉边距一致 */
 :global(.autoban-confirm-box) { padding: 0; }
