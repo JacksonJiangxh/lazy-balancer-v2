@@ -306,17 +306,20 @@
           subtitle="可复用 IP/CIDR 集合，供安全策略引用（黑白名单 / 信任名单）" />
       </template>
       <el-form :model="ipListForm" label-width="80px" label-position="right" :disabled="ipListDialogReadOnly" v-loading="loadingIpListDetail">
+        <!-- 历史问题：自动封禁预置名单名称/分类/描述为内置字段（后端 400 守卫同口径），
+             前端直接禁用灰态——禁止修改的字段不可输入，而非提交后报 400 -->
+        <div v-if="editingIpListPreset" class="form-tip-line">内置名单字段不可修改，仅条目可编辑（手动封禁 / 解封）</div>
         <el-form-item label="名称" required>
-          <el-input v-model="ipListForm.name" placeholder="列表名称" maxlength="50" show-word-limit />
+          <el-input v-model="ipListForm.name" placeholder="列表名称" maxlength="50" show-word-limit :disabled="editingIpListPreset" />
         </el-form-item>
         <el-form-item label="分类">
-          <el-select v-model="ipListForm.category" allow-create filterable default-first-option placeholder="选择或输入分类" style="width: 100%">
+          <el-select v-model="ipListForm.category" allow-create filterable default-first-option placeholder="选择或输入分类" style="width: 100%" :disabled="editingIpListPreset">
             <el-option v-for="c in IP_LIST_CATEGORIES" :key="c" :label="c" :value="c" />
           </el-select>
           <div class="form-tip-line">预设分类可直接选择，也可自定义（≤32 字符）</div>
         </el-form-item>
         <el-form-item label="描述">
-          <el-input v-model="ipListForm.description" placeholder="列表用途说明" maxlength="200" show-word-limit />
+          <el-input v-model="ipListForm.description" placeholder="列表用途说明" maxlength="200" show-word-limit :disabled="editingIpListPreset" />
         </el-form-item>
         <el-form-item label="条目" required>
           <div class="entries-block">
