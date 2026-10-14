@@ -206,10 +206,10 @@
       <template #header>
         <DialogHeader :icon="Lock" title="自动封禁配置" subtitle="WAF 事件滑动窗口计数达到阈值即写入「自动封禁名单」，到期自动解封" />
       </template>
-      <el-form :model="autobanForm" label-width="96px" label-position="right" class="autoban-config-form">
+      <el-form :model="autobanForm" label-width="96px" label-position="right">
         <el-form-item label="观察模式">
           <el-switch v-model="autobanForm.dry_run" />
-          <span class="form-tip-inline">开启时仅记录达阈值建议、不写入名单（推荐先观察校准阈值）</span>
+          <div class="form-tip-line">开启时仅记录达阈值建议、不写入名单（推荐先观察校准阈值）</div>
         </el-form-item>
         <el-form-item label="统计口径">
           <el-radio-group v-model="autobanForm.scope">
@@ -218,17 +218,17 @@
         </el-form-item>
         <el-form-item label="统计窗口">
           <el-input-number v-model="autobanForm.window_minutes" :min="1" :max="60" :step="5" controls-position="right" style="width: 140px" />
-          <span class="form-tip-inline">分钟（同一 IP 窗口内累计计数，跨窗口自动重置）</span>
+          <div class="form-tip-line">分钟（同一 IP 窗口内累计计数，跨窗口自动重置）</div>
         </el-form-item>
         <el-form-item label="封禁阈值">
           <el-input-number v-model="autobanForm.threshold" :min="1" :max="10000" :step="10" controls-position="right" style="width: 140px" />
-          <span class="form-tip-inline">窗口内命中次数</span>
+          <div class="form-tip-line">窗口内命中次数</div>
         </el-form-item>
         <el-form-item label="封禁时长">
           <el-select v-model="autobanForm.duration" style="width: 160px">
             <el-option v-for="d in AUTOBAN_DURATIONS" :key="d.value" :label="d.label" :value="d.value" />
           </el-select>
-          <span class="form-tip-inline">到期自动解封（从名单移除）</span>
+          <div class="form-tip-line">到期自动解封（从名单移除）</div>
         </el-form-item>
       </el-form>
       <div class="info-note-bar"><span class="info-note-desc">修改统计窗口或口径会立即重置计数器（旧计数与新口径不可混算）</span></div>
@@ -710,8 +710,6 @@ onMounted(() => {
 /* 卡片主体=配置入口（2026-10-14 裁定）：标题/参数区可点，hover 灰底+pointer 反馈；
    padding+负 margin 扩大热区而不改变行内布局 */
 .autoban-main { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex: 1; min-width: 0; }
-/* 自动封禁弹框：行内提示改块级换行（用户裁定 2026-10-14——行内被控件挤折行） */
-:deep(.autoban-config-form .form-tip-inline) { display: block; margin: 2px 0 0; line-height: 1.5; }
 .autoban-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: #111827; flex-shrink: 0; }
 .autoban-title .title-icon { font-size: 16px; color: #3b82f6; }
 .autoban-stats { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: 1; min-width: 0; font-size: 12px; color: var(--text-secondary, #6b7280); }
@@ -719,7 +717,6 @@ onMounted(() => {
 .autoban-danger { color: #f56c6c !important; }
 .autoban-actions { flex-shrink: 0; display: flex; gap: 8px; }
 .autoban-warn-bar { margin-top: 10px; }
-.form-tip-inline { margin-left: 10px; font-size: 12px; color: var(--text-secondary, #9ca3af); }
 
 /* 工具行单行排布（1280px 视口全控件 + 筛选/重置一行放下）：nowrap 禁止换行，
    各控件定宽不收缩，极端窄视口降级为横向滚动而非把按钮顶到第二行 */
