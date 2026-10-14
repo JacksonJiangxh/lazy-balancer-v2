@@ -6,6 +6,9 @@ package services
 // 抑制 handlers 侧成功清除，直至下次干净渲染恢复常规语义。
 
 import (
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,6 +31,30 @@ func TestTrustedProxyDegradation_bannerRecordsOnApply(t *testing.T) {
 		if r.Method == http.MethodGet && r.URL.Path == "/config/" {
 			_, _ = w.Write([]byte(`{}`))
 			return
+		}
+		// RC-1（第 75 轮）：模拟真 Caddy 严格解码——Config StrictUnmarshalJSON
+		// 拒未知顶层字段返 400。旧桩恒 200 掩盖了内部键 __lazy_balancer_*
+		// 漏进载荷导致降级配置被硬拒的缺陷（D3 可用性优先被反转）。
+		body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"read body failed"}`))
+			return
+		}
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(body, &payload); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"json decode failed"}`))
+			return
+		}
+		for key := range payload {
+			switch key {
+			case "admin", "apps", "logging", "storage": // Caddy Config 已知顶层字段
+			default:
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"unknown field %q"}`, key)))
+				return
+			}
 		}
 		_, _ = w.Write([]byte(`{}`))
 		applied <- r.URL.Path

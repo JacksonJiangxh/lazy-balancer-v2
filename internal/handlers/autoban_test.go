@@ -4,7 +4,7 @@ package handlers
 //   GET/PUT /security/autoban 六项配置（校验/审计；保存联动调度启停）
 //   POST /security/autoban/run 已废除（2026-10-14 裁定：调度唯一前提=启用）
 //   GET  /security/autoban/status 运行态+今日封禁+名单数+观察建议+引用状态
-//   预置「自动封禁名单」（system=1）删 400/条目可改 200/手动解封写抑制表/导出 TXT
+//   预置「自动封禁名单」（system=1）删 400/条目可改 200/删除条目即解封/导出 TXT
 
 import (
 	"encoding/json"
@@ -205,6 +205,12 @@ func servicesAutobanTodayStr(t *testing.T) string {
 func TestAutobanStatus_shape(t *testing.T) {
 	router := newAutobanTestEnv(t)
 	seedAutobanListEntries(t, `[{"value":"198.51.100.1","remark":"自动封禁","created_at":"`+servicesAutobanTodayStr(t)+`"},{"value":"198.51.100.2","remark":"事件处置"}]`)
+	// 今日封禁=审计事件计数（2026-10-15 用户裁定）：与名单条目现状解耦——
+	// 种一条今日「自动封禁」审计行，名单条目（含已封禁形态）不再参与计数。
+	if _, err := db.AuditDB.Exec(`INSERT INTO audit_log (username, action, resource, detail, ip_address, created_at) VALUES ('system', ?, 'IP 地址列表', 'IP：198.51.100.1', '', ?)`,
+		services.AutobanAuditAction, servicesAutobanTodayStr(t)); err != nil {
+		t.Fatal(err)
+	}
 	rec := getRequest(t, router, "/security/autoban/status")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
@@ -275,7 +281,7 @@ func TestAutobanPreset_updateEntriesAllowed(t *testing.T) {
 	}
 }
 
-func TestAutobanPreset_addAndRemoveManageSuppression(t *testing.T) {
+func TestAutobanPreset_addAndRemoveEntries(t *testing.T) {
 	router := newAutobanTestEnv(t)
 	id := autobanPresetID(t)
 	rec := postJSON(t, router, fmt.Sprintf("/security/ip-lists/%d/ips", id), map[string]any{"value": "203.0.113.5"})
@@ -286,19 +292,17 @@ func TestAutobanPreset_addAndRemoveManageSuppression(t *testing.T) {
 	if len(entries) != 1 || entries[0].Value != "203.0.113.5" || entries[0].Remark != services.AutobanManualUnbanRemark {
 		t.Fatalf("追加后条目=%+v（remark 须为手动封禁）", entries)
 	}
-	// 解封 → removed:true + 抑制表 30 天行
+	// 删除条目即解封（2026-10-15 用户裁定）：removed:true + 条目离开名单，
+	// 无抑制表写入——IP 重新达标会被再次封禁。
 	rec = postJSON(t, router, fmt.Sprintf("/security/ip-lists/%d/remove-ip", id), map[string]any{"value": "203.0.113.5"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("移除 status=%d body=%s, want 200", rec.Code, rec.Body.String())
 	}
-	var until string
-	err := db.DB.QueryRow(`SELECT suppressed_until FROM autoban_suppressed WHERE ip='203.0.113.5'`).Scan(&until)
-	if err != nil {
-		t.Fatalf("解封必须写抑制表: %v", err)
+	if body := rec.Body.String(); !strings.Contains(body, `"removed":true`) {
+		t.Fatalf("移除响应须 removed:true, body=%s", body)
 	}
-	ts, perr := time.ParseInLocation("2006-01-02 15:04:05", until, time.UTC)
-	if perr != nil || !ts.After(time.Now().UTC().Add(29*24*time.Hour)) {
-		t.Fatalf("suppressed_until=%q, want ≈now+30d", until)
+	if entries := readAutobanListEntries(t, id); len(entries) != 0 {
+		t.Fatalf("移除后条目应清空, 得到 %+v", entries)
 	}
 }
 
@@ -352,45 +356,6 @@ func TestAutobanListEntryCap_matchesHandlerCap(t *testing.T) {
 	if services.AutobanListEntryCap != ipListMaxEntries {
 		t.Fatalf("services.AutobanListEntryCap=%d != handlers ipListMaxEntries=%d（两值漂移会让任务写入被校验拒绝）",
 			services.AutobanListEntryCap, ipListMaxEntries)
-	}
-}
-
-// ---- AU-3（第 74 轮）：预置名单全量保存对被移除值补写解封抑制 ----
-
-// Given 预置名单含三个条目（自动/手动/自动）。
-// When 弹框全量保存（PUT entries 全量替换）移除两个旧值、保留一个、新增一个。
-// Then 被移除值必须同事务补写 30 天解封抑制（下轮不得重封，与 remove-ip 路径
-// 的 UI 承诺一致）；保留值与新增值不写抑制。
-func TestAutobanPreset_fullPutSuppressesRemovedValues(t *testing.T) {
-	router := newAutobanTestEnv(t)
-	id := autobanPresetID(t)
-	seedAutobanListEntries(t, `[
-		{"value":"198.51.100.1","remark":"自动封禁"},
-		{"value":"198.51.100.2","remark":"手动封禁"},
-		{"value":"198.51.100.3","remark":"自动封禁"}]`)
-
-	rec := putJSON(t, router, fmt.Sprintf("/security/ip-lists/%d", id), map[string]any{
-		"entries": `[{"value":"198.51.100.2","remark":"手动封禁"},{"value":"203.0.113.8","remark":"手动封禁"}]`,
-	})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
-	}
-	for _, removed := range []string{"198.51.100.1", "198.51.100.3"} {
-		var until string
-		if err := db.DB.QueryRow(`SELECT suppressed_until FROM autoban_suppressed WHERE ip=?`, removed).Scan(&until); err != nil {
-			t.Fatalf("被移除值 %s 必须补写解封抑制: %v", removed, err)
-		}
-		ts, perr := time.ParseInLocation("2006-01-02 15:04:05", until, time.UTC)
-		if perr != nil || !ts.After(time.Now().UTC().Add(29*24*time.Hour)) {
-			t.Fatalf("%s suppressed_until=%q, want ≈now+30d", removed, until)
-		}
-	}
-	var n int
-	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM autoban_suppressed WHERE ip IN ('198.51.100.2','203.0.113.8')`).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 0 {
-		t.Fatalf("保留/新增值不得写抑制, 得到 %d 行", n)
 	}
 }
 
@@ -481,7 +446,7 @@ func TestAutobanPreset_categoryDescriptionLocked(t *testing.T) {
 	// 回归形状：同值提交（分类/描述与种子一致）放行
 	rec = putJSON(t, router, fmt.Sprintf("/security/ip-lists/%d", id), map[string]any{
 		"category":    "自动封禁",
-		"description": "自动封禁命中 IP（自动封禁任务维护；可手动追加或解封）",
+		"description": "自动封禁命中 IP（自动封禁任务维护；可手动追加或删除条目）",
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("同值提交 status=%d body=%s, want 200（仅拦「变更」）", rec.Code, rec.Body.String())

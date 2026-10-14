@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -260,7 +259,7 @@ type ipListRow struct {
 	// System=内置只读名单（威胁情报库三源，v2.3.2 名单化）——前端据此只读化。
 	System bool `json:"system"`
 	// PresetAutoban=预置「自动封禁名单」（F73-A）：system=1 但条目可改/禁删
-	// ——前端据此渲染编辑形态与解封/到期列（与威胁名单只读形态区分）。
+	// ——前端据此渲染编辑形态与到期列（与威胁名单只读形态区分）。
 	PresetAutoban bool `json:"preset_autoban"`
 }
 
@@ -522,7 +521,7 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 		return
 	}
 	// 内置只读名单（威胁情报库，system=1）：内容只读，由更新任务独占维护。
-	// F73-A 例外：自动封禁预置名单条目可改（手动追加/解封经弹框），但名称/
+	// F73-A 例外：自动封禁预置名单条目可改（手动追加/删除条目经弹框），但名称/
 	// 分类/描述三字段锁定（2026-10-14 用户裁定）——自动封禁任务按名单名定位
 	// 预置行，改名即失联；分类/描述是预置行身份的一部分，同样禁改。
 	autobanPreset := system != 0 && name == services.AutobanPresetListName
@@ -551,7 +550,6 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 	if req.Category != nil {
 		category = *req.Category
 	}
-	oldEntriesJSON := entriesJSON
 	if req.Entries != nil {
 		entriesJSON = *req.Entries
 	}
@@ -619,32 +617,6 @@ WHERE COALESCE(ip_acl_enabled,0)=1 AND COALESCE(ip_acl_mode,'')='allow'
 	if rows, _ := result.RowsAffected(); rows == 0 {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "IP 地址列表不存在"})
 		return
-	}
-	// AU-3（第 74 轮）：预置名单全量保存（entries 全量替换）对「被移除值」
-	// 同事务补写解封抑制——弹框全量保存等价于逐行解封，不写抑制表会下轮重封，
-	// 与 remove-ip 路径（同事务抑制）的 UI 承诺矛盾。差集=旧值−新值；旧值
-	// JSON 畸形（带外脏行）按空集处理——宁可漏抑制，不错抑制未知值。
-	if autobanPreset && req.Entries != nil {
-		var oldParsed []models.IPListEntry
-		_ = json.Unmarshal([]byte(oldEntriesJSON), &oldParsed)
-		newValues := make(map[string]struct{}, len(entries))
-		for _, e := range entries {
-			newValues[e.Value] = struct{}{}
-		}
-		suppressUntil := time.Now().UTC().Add(services.AutobanSuppressWindow()).Format(services.AutobanTimeLayout)
-		for _, e := range oldParsed {
-			if e.Value == "" {
-				continue
-			}
-			if _, kept := newValues[e.Value]; kept {
-				continue
-			}
-			if _, err := tx.ExecContext(c.Request.Context(), `INSERT INTO autoban_suppressed (ip, suppressed_until) VALUES (?, ?)
-				ON CONFLICT(ip) DO UPDATE SET suppressed_until=excluded.suppressed_until`, e.Value, suppressUntil); err != nil {
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "写入解封抑制失败: " + err.Error()})
-				return
-			}
-		}
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "更新",
@@ -900,8 +872,8 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 		return
 	}
 	if system != 0 {
-		// F73-A 例外：自动封禁预置名单允许手动解封（移除=解封，同事务写
-		// autoban_suppressed 抑制表 30 天，防「解封→下轮立即重封」拉锯）；
+		// F73-A 例外：自动封禁预置名单允许条目管理（删除条目即解封——
+		// 2026-10-15 用户裁定：无抑制窗口，IP 重新达标会被再次封禁）；
 		// 威胁情报名单保持只读。
 		if listName != services.AutobanPresetListName {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "内置名单只读，由威胁情报库更新任务维护"})
@@ -938,15 +910,6 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 	if _, err := tx.ExecContext(c.Request.Context(), `UPDATE security_ip_lists SET entries=?, updated_by=?, updated_at=datetime('now') WHERE id=?`, string(mergedJSON), int(contextUserID(c)), id); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
-	}
-	if system != 0 {
-		// 预置名单解封抑制：与条目移除同事务原子落库（抑制表在主库）。
-		if _, err := tx.ExecContext(c.Request.Context(), `INSERT INTO autoban_suppressed (ip, suppressed_until) VALUES (?, ?)
-			ON CONFLICT(ip) DO UPDATE SET suppressed_until=excluded.suppressed_until`,
-			req.Value, time.Now().UTC().Add(services.AutobanSuppressWindow()).Format(services.AutobanTimeLayout)); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "写入解封抑制失败: " + err.Error()})
-			return
-		}
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "写入",

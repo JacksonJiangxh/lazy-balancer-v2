@@ -4,6 +4,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -50,6 +53,69 @@ func TestSecurityBlockedCounter_ServeHTTP(t *testing.T) {
 	wantTotal := before + 3 // coraza 403 + coraza 429 + ratelimit 429 三笔
 	if after != wantTotal {
 		t.Fatalf("counter=%v, want %v (before=%v)", after, wantTotal, before)
+	}
+}
+
+// 第 75 轮（预检拦耗时口径）：拦截耗时写点的分段选键——
+// 形状①预检段拦：起始头仍=注入原值（链未抵达 timing_pre 收点）→ 写 :pre
+// （决策后、403 写出前的纯预检评估），不得写 :end（防同 ID 双行）；
+// 形状②WAF/限流段拦：起始头已被 timing_pre 重写为分段锚点 → 写 :end
+// （链首至此全链，读侧 end-:pre 得 WAF 段），不得写 :pre。
+func TestSecurityBlockedCounter_timingSegmentSelection(t *testing.T) {
+	const id = "0123456789abcdef"
+	cases := []struct {
+		name          string
+		nextErr       error
+		rewriteInNext bool // next 模拟 timing_pre 已过（重写起始头为锚点）
+		wantKey       string
+	}{
+		{"precheck interruption writes :pre", caddyhttp.HandlerError{StatusCode: 403, ID: id}, false, ":pre"},
+		{"precheck interruption stage page 481 writes :pre", caddyhttp.HandlerError{StatusCode: 481, ID: id}, false, ":pre"},
+		{"waf interruption after pre writes :end", caddyhttp.HandlerError{StatusCode: 403, ID: id}, true, ":end"},
+		{"ratelimit 429 after pre writes :end", caddyhttp.HandlerError{StatusCode: http.StatusTooManyRequests, ID: "rA9kX2mPq"}, true, ":end"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath, flush := setupSecurityTimingWriter(t)
+			h := &SecurityBlockedCounter{Rule: "lb_seg_rule"}
+			next := caddyhttp.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) error {
+				if tc.rewriteInNext {
+					// 模拟 timing_pre 的锚点交接契约：重写值严格大于注入原值
+					//（时钟分辨率下同值会被误判为预检段拦——见实现注释）。
+					old, _ := strconv.ParseInt(r.Header.Get(securityTimingStartHeader), 10, 64)
+					r.Header.Set(securityTimingStartHeader, strconv.FormatInt(old+1, 10))
+				}
+				return tc.nextErr
+			})
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+
+			if err := h.ServeHTTP(httptest.NewRecorder(), req, next); err != tc.nextErr {
+				t.Fatalf("ServeHTTP = %v; want passthrough %v", err, tc.nextErr)
+			}
+			// timing ID 由 ServeHTTP 注入（覆盖客户端伪造值）——运行时取真实关联键
+			id := req.Header.Get(securityTimingHeader)
+			if len(id) != 16 {
+				t.Fatalf("timing id header = %q; want 16-char injected id", id)
+			}
+			flush()
+
+			data, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+			if len(lines) != 1 {
+				t.Fatalf("lines=%v; want exactly 1 timing row (no double write)", lines)
+			}
+			want := id + tc.wantKey
+			if !strings.HasPrefix(lines[0], want+" ") {
+				t.Fatalf("row=%q; want prefix %q", lines[0], want)
+			}
+			us, perr := strconv.ParseInt(strings.TrimSpace(lines[0][len(want)+1:]), 10, 64)
+			if perr != nil || us < 0 {
+				t.Fatalf("duration=%q; want non-negative integer µs", lines[0])
+			}
+		})
 	}
 }
 

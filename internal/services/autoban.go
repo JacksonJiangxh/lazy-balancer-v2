@@ -16,8 +16,8 @@
 // 名单形态：预置 security_ip_lists 行（system=1，name=自动封禁名单，DB entries）。
 // 条目扩展 created_at/expires_at（RFC 墙钟串、UTC 存储）——投影层
 // （loadIPListEntriesVia）过滤已到期条目，到期即「自动解封」；手动条目
-// （remark≠自动封禁）永不被任务挤出。手动解封写 autoban_suppressed 抑制表
-// （30 天窗口），期内该 IP 不再被自动封禁。
+// （remark≠自动封禁）永不被任务挤出。删除条目即解封（2026-10-15 用户裁定：
+// 删除后重新达标会被再次封禁，无解封冷却）。
 package services
 
 import (
@@ -43,9 +43,10 @@ const (
 	AutobanEntryRemark = "自动封禁"
 	// AutobanManualUnbanRemark 手动追加条目的默认备注（地址列表页手动封禁）。
 	AutobanManualUnbanRemark = "手动封禁"
+	// AutobanAuditAction 封禁审计动作名（merge 写点与 AutobanBannedToday
+	// 计数共用单源——两处字面量漂移会让今日封禁恒 0）。
+	AutobanAuditAction = "自动封禁"
 
-	// autobanSuppressDays 手动解封抑制窗口：期内不再自动封禁（防解封→重封拉锯）。
-	autobanSuppressDays = 30 * 24 * time.Hour
 	// autobanReloadThrottle 重载节流窗口：名单变化后至少间隔 60s 才真实重载，
 	// 窗口内的变化暂存合并到下一轮。
 	autobanReloadThrottle = time.Minute
@@ -121,6 +122,14 @@ var autobanIsMaster = func() bool {
 	return te != nil && te.IsMaster()
 }
 
+// AutobanIsMaster autoban 调度面节点角色（/status is_master 数据源；与 Run 体
+// 业务门/喂入门同源——引擎角色，测试缝可覆写）。
+func AutobanIsMaster() bool { return autobanIsMaster() }
+
+// autobanRecheckEnabled AB-2 复查缝（生产=直读 AutobanEnabled；钉测注入
+// 「首读 false 后、复查前」的 PUT enabled=1 + StartLoop 交错窗）。
+var autobanRecheckEnabled = AutobanEnabled
+
 // autobanReloader 名单内容变化后的 Caddy 重载回调（AU-1 契约：在 CaddyOpLock
 // 临界区内被调用，必须为 InLock 变体——生产=GenerateAndApplyConfigForceInLock，
 // 不得注入自取 CaddyOpLock 的 Force 变体）。
@@ -155,6 +164,20 @@ func GetAutobanConfig() AutobanConfig {
 }
 
 // ValidateAutobanConfig 写侧校验：阈值 1-10000、窗口 1-60 分钟、时长/口径枚举。
+//
+// F75C-4（第 75 轮审计·设计评审，显式声明）：六列配置的三条归一通道语义
+// **有意分歧**，各自贴合通道处境，不做统一——
+//   - 保存侧（本函数，PUT /security/autoban）：**拒绝**——面板表单是用户
+//     直接意图，非法值响亮 400 让用户改输入；
+//   - 导入侧（handlers.validateV2BackupAutobanConfig）：**钳制/归一**——
+//     备份是历史快照，越界数值钳到同边界、缺省形态归缺省、非空非法枚举
+//     响亮拒绝（整包 400，与保存侧枚举口径一致）；钳制留痕并入导入审计；
+//   - 回填侧（db 包启动回填 defaultUpdates）：**复位默认**——带外改库污染
+//     无用户在场，启动时静默收敛到治理默认（双锚钉测对齐），运行期窗口内
+//     由消费侧护栏（RunAutobanCycle）拒绝执行兜底。
+//
+// 三通道边界单源：本函数与 ValidAutobanDuration/ValidAutobanScope（db 包
+// 不反向依赖，SQL 字面量与迁移 DDL DEFAULT 同款双锚）。
 func ValidateAutobanConfig(cfg AutobanConfig) error {
 	if cfg.Threshold < 1 || cfg.Threshold > 10000 {
 		return errors.New("阈值须在 1-10000 之间")
@@ -212,6 +235,8 @@ func AutobanEnabled() bool {
 type autobanCounter struct {
 	Count       int
 	WindowStart time.Time
+	// LastSeen 窗口内末次命中（feed 更新点记录；建议列表「首末时间」数据源）。
+	LastSeen time.Time
 	// Reached 本窗口内已达到过封禁阈值（计数分级日志的判据：threshold 行
 	// 每 IP 每窗口恰一行；窗口过期清零时若为真落 expire 行）。
 	Reached bool
@@ -311,6 +336,7 @@ func autobanObserveEventScoped(cfg AutobanConfig, ip, action, ruleTriggered stri
 			w.Reached = false
 		}
 		w.Count++
+		w.LastSeen = now
 		// 首次达到阈值 → 恰一行 threshold（跨阈值后不再重复记）。
 		if !w.Reached && cfg.Threshold > 0 && w.Count >= cfg.Threshold {
 			w.Reached = true
@@ -335,17 +361,28 @@ func autobanObserveEventScoped(cfg AutobanConfig, ip, action, ruleTriggered stri
 type AutobanSuggestion struct {
 	IP    string `json:"ip"`
 	Count int    `json:"count"`
+	// WindowStart/LastSeen 窗口内首次/末次命中（feed 更新点记录；/status
+	// 建议列表「窗口内首末时间」数据源）。
+	WindowStart time.Time `json:"window_start"`
+	LastSeen    time.Time `json:"last_seen"`
 }
 
-// autobanCandidates 评估候选：修剪过期桶后返回 count≥threshold 的 IP（计数降序，
-// 截 autobanSuggestionCap）。曾达标 IP 的过期桶修剪时落一行 expire（与 Feed
-// 路径同文案——窗口过期清零的唯一两条发射面）。
+// autobanCandidates 评估候选：先评估后修剪（AB-1，第 75 轮）——过期桶若计数
+// 已跨阈值（桶尾达标形态：最后采样在窗口尾、周期 tick 晚于窗口到期）必须并入
+// 候选再删，否则该 IP 永不封禁；未跨阈值的过期桶照常修剪不产生候选。曾达标
+// IP 的过期桶修剪时落一行 expire（与 Feed 路径同文案——窗口过期清零的唯一
+// 两条发射面）。
 func autobanCandidates(threshold int, window time.Duration) []AutobanSuggestion {
 	now := autobanNow()
 	var expiredReached []string
 	autobanMu.Lock()
+	var expiredCandidates []AutobanSuggestion
 	for ip, w := range autobanWindows {
 		if !w.WindowStart.IsZero() && now.Sub(w.WindowStart) >= window {
+			// AB-1：先评估——过期桶已跨阈值的并入候选，再删桶。
+			if w.Count >= threshold {
+				expiredCandidates = append(expiredCandidates, AutobanSuggestion{IP: ip, Count: w.Count, WindowStart: w.WindowStart, LastSeen: w.LastSeen})
+			}
 			if w.Reached {
 				expiredReached = append(expiredReached, ip)
 			}
@@ -355,9 +392,10 @@ func autobanCandidates(threshold int, window time.Duration) []AutobanSuggestion 
 	var out []AutobanSuggestion
 	for ip, w := range autobanWindows {
 		if w.Count >= threshold {
-			out = append(out, AutobanSuggestion{IP: ip, Count: w.Count})
+			out = append(out, AutobanSuggestion{IP: ip, Count: w.Count, WindowStart: w.WindowStart, LastSeen: w.LastSeen})
 		}
 	}
+	out = append(out, expiredCandidates...)
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Count != out[j].Count {
 			return out[i].Count > out[j].Count
@@ -374,11 +412,27 @@ func autobanCandidates(threshold int, window time.Duration) []AutobanSuggestion 
 	return out
 }
 
+// autobanSuggestionDisplayCap /status 建议列表展示上限（Count 降序 Top N——
+// 仅展示截断：审计/TaskLogf 消费 candidates 全量，不受影响）。
+const autobanSuggestionDisplayCap = 50
+
 // AutobanSuggestions 上一轮观察建议（/status 建议列表数据源；未运行过=空）。
+// 展示截断：按 Count 降序 Top 50（2026-10-15 用户裁定——dry-run 洪峰下
+// 前端逐行渲染有界）。
 func AutobanSuggestions() []AutobanSuggestion {
 	autobanMu.Lock()
 	defer autobanMu.Unlock()
-	return append([]AutobanSuggestion(nil), autobanSuggestions...)
+	out := append([]AutobanSuggestion(nil), autobanSuggestions...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].IP < out[j].IP
+	})
+	if len(out) > autobanSuggestionDisplayCap {
+		out = out[:autobanSuggestionDisplayCap]
+	}
+	return out
 }
 
 func autobanSetSuggestions(s []AutobanSuggestion) {
@@ -387,79 +441,17 @@ func autobanSetSuggestions(s []AutobanSuggestion) {
 	autobanSuggestions = s
 }
 
-// ---- 抑制表（手动解封 30 天窗口） ----
-
-// D6（第 74 轮，2026-10-15 用户裁定豁免不修）：抑制表为节点本地数据——不从
-// 集群快照传播（升主/还原后抑制失效，期内 IP 可被重封一次）且到期判定取本机
-// UTC 时钟（节点间时钟漂移可提前/延后解封）。失效方向均为「多封一次」的保守
-// 侧，不破坏封禁正确性；登记于 AGENTS.md 审计豁免清单，后续审计不得重报。
-
-// SuppressAutobanIP 手动解封抑制：UPSERT 到 now+30 天（重复解封续期）。
-// 测试缝（AU-4）：生产解封路径（remove-ip/预置名单全量保存）在 handlers 自身
-// 事务内落抑制行——本函数仅供测试驱动抑制表，勿在生产链路新增调用。
-func SuppressAutobanIP(ip string) error {
-	if db.DB == nil || ip == "" {
-		return nil
-	}
-	until := autobanNow().Add(autobanSuppressDays).Format(autobanTimeLayout)
-	_, err := db.DB.Exec(`INSERT INTO autoban_suppressed (ip, suppressed_until) VALUES (?, ?)
-		ON CONFLICT(ip) DO UPDATE SET suppressed_until=excluded.suppressed_until`, ip, until)
-	return err
-}
-
-// AutobanSuppressWindow 手动解封抑制窗口（30 天；handlers 解封路径在自身
-// 事务内落抑制行，与条目移除原子）。
-func AutobanSuppressWindow() time.Duration { return autobanSuppressDays }
-
-// AutobanTimeLayout 条目/抑制时间戳形态（UTC 墙钟串，前端按 DB datetime
-// 同款 +Z 规范化消费）。
-const AutobanTimeLayout = autobanTimeLayout
-
-// autobanSuppressedSet 当前生效的抑制集合（suppressed_until > now）。
-func autobanSuppressedSet(now time.Time) map[string]struct{} {
-	set := make(map[string]struct{})
-	if db.DB == nil {
-		return set
-	}
-	rows, err := db.DB.Query(`SELECT ip FROM autoban_suppressed WHERE suppressed_until > ?`, now.Format(autobanTimeLayout))
-	if err != nil {
-		return set
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var ip string
-		if rows.Scan(&ip) == nil {
-			set[ip] = struct{}{}
-		}
-	}
-	return set
-}
-
-// autobanCleanupSuppression 删除已过期抑制行（Run 轮内自然清理），返回删除数。
-func autobanCleanupSuppression() int64 {
-	if db.DB == nil {
-		return 0
-	}
-	res, err := db.DB.Exec(`DELETE FROM autoban_suppressed WHERE suppressed_until <= ?`, autobanNow().Format(autobanTimeLayout))
-	if err != nil {
-		return 0
-	}
-	n, _ := res.RowsAffected()
-	return n
-}
-
 // ---- 名单 merge ----
 
 // autobanMergeOutcome 单轮 merge 结果（TaskLogf 摘要与审计数据源）。
 type autobanMergeOutcome struct {
-	ListID            int64
-	Expired           []string // 到期自动解封的 IP
-	Banned            []string // 本轮新封禁的 IP
-	SkippedSuppressed int      // 抑制期内跳过数
-	Evicted           int      // 超限挤出的自动条目数
-	DroppedNew        int      // 容量不足丢弃的新封数
-	Total             int      // merge 后名单总条数
-	Changed           bool
+	ListID     int64
+	Expired    []string // 到期自动解封的 IP
+	Banned     []string // 本轮新封禁的 IP
+	Evicted    int      // 超限挤出的自动条目数
+	DroppedNew int      // 容量不足丢弃的新封数
+	Total      int      // merge 后名单总条数
+	Changed    bool
 }
 
 // parseAutobanEntryTime 解析条目时间戳（UTC 墙钟串）；畸形视为零值（调用方
@@ -477,7 +469,7 @@ func parseAutobanEntryTime(s string) time.Time {
 }
 
 // autobanMergeEntries 单次 merge（纯 DB 侧，无重载/审计副作用——便于钉测）：
-// 清到期 → 抑制/已在名单过滤 → 追加新封 → 超限挤最早到期自动条目 → 回写。
+// 清到期 → 已在名单过滤 → 追加新封 → 超限挤最早到期自动条目 → 回写。
 func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (autobanMergeOutcome, error) {
 	var out autobanMergeOutcome
 	if db.DB == nil {
@@ -512,8 +504,7 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 		inList[e.Value] = struct{}{}
 	}
 
-	// 2) 新封过滤：已在名单/抑制期内跳过；其余追加（permanent 不带 expires_at）。
-	suppressed := autobanSuppressedSet(now)
+	// 2) 新封过滤：已在名单跳过；其余追加（permanent 不带 expires_at）。
 	duration := autobanDurations[cfg.Duration]
 	var toAdd []models.IPListEntry
 	for _, c := range candidates {
@@ -521,10 +512,6 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 			continue
 		}
 		if _, exists := inList[c.IP]; exists {
-			continue
-		}
-		if _, ok := suppressed[c.IP]; ok {
-			out.SkippedSuppressed++
 			continue
 		}
 		entry := models.IPListEntry{Value: c.IP, Remark: AutobanEntryRemark, CreatedAt: nowStr}
@@ -730,14 +717,20 @@ func AutobanDisableFlush() {
 // ---- Run 循环 ----
 
 // RunAutobanCycle 单轮执行（引擎 autoban 任务体）：业务门（未启用=失败+重禁
-// 调度）→ 修剪计数器 → 评估候选 → 观察建议或名单 merge → 审计/重载/每轮摘要行。
+// 调度）→ 配置护栏（无效=失败+自停）→ 修剪计数器 → 评估候选 → 观察建议或
+// 名单 merge → 审计/重载/每轮摘要行。
 //
 // 业务门（2026-10-14 用户裁定）：本任务只能由「启用后按配置调度执行」——
 // Descriptor 不设 EnabledFn（调度面无业务门，任务监控 enabled 列恒开，启停
 // 语义全在调度开关+事件页业务开关），未启用期间的手动开调度/手动触发到
 // Run 体首行拦下：落痕+落 failed 行+StopLoop 重禁调度，防未启用空转续跑。
+// AB-2（第 75 轮）：StopLoop 前复查一次——首读 false 与停环之间存在
+// 「PUT enabled=1 + StartLoop」交错窗，无条件停环会把并发重新启用的新调度
+// 误杀（enabled=1 而调度停，无自动恢复）；复查仍 false 才停，复查转 true
+// 视为已被并发启用、本轮按启用继续。残留窗收窄至复查与 StopLoop 之间，
+// 彻底消除需引擎代际令牌（不在本修复范围）。
 func RunAutobanCycle(rc taskengine.RunContext) error {
-	if !AutobanEnabled() {
+	if !AutobanEnabled() && !autobanRecheckEnabled() {
 		if te := TaskEngine(); te != nil {
 			te.StopLoop(AutobanTaskID)
 		}
@@ -750,14 +743,21 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 	// 「count>=threshold」把全量候选收进名单；duration 非法经 autobanDurations
 	// 查表得 0 被当「永久」（候选全落永久封禁条目）；window<=0 让窗口失真。
 	// 带外脏行由启动回填（db.go defaultUpdates 六列）在下次启动收敛；校验单源
-	// 复用写侧 ValidateAutobanConfig（导入/写侧/消费侧三通道同一口径）。
+	// 复用写侧 ValidateAutobanConfig（导入/写侧/消费侧三通道同一口径——通道
+	// 语义差异见 ValidateAutobanConfig 注释，F75C-4）。
+	// AB-3（第 75 轮 Ruling=自停）：无效配置是带外污染造成的**持续态**（保存
+	// 侧与导入侧各自归一后不可再产生），每轮拒绝=无意义空转（约 1440 条
+	// failed 行/天）——与业务门同构：留痕（WARN+failed 行）后 StopLoop；恢复
+	// 路径=PUT 保存有效配置（校验过即联动 StartLoop）或重启（启动回填收敛）。
 	if err := ValidateAutobanConfig(cfg); err != nil {
-		TaskLogfWarn(AutobanTaskID, "config", "配置无效，已拒绝执行：%v", err)
-		return fmt.Errorf("自动封禁配置无效，已拒绝执行：%v（库值可能被带外写入污染；重启后启动回填将收敛）", err)
+		TaskLogfWarn(AutobanTaskID, "config", "配置无效，已拒绝执行并停止调度：%v", err)
+		if te := TaskEngine(); te != nil {
+			te.StopLoop(AutobanTaskID)
+		}
+		return fmt.Errorf("自动封禁配置无效，已停止调度：%v（修正配置并保存后恢复；库值可能被带外写入污染，重启后启动回填将收敛）", err)
 	}
 	window := time.Duration(cfg.WindowMinutes) * time.Minute
 	autobanFlushPendingReload()
-	autobanCleanupSuppression()
 	candidates := autobanCandidates(cfg.Threshold, window)
 
 	if cfg.DryRun {
@@ -791,7 +791,7 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 	if out.Changed {
 		// 审计逐 IP「自动封禁」+ 每批「到期自动解封」汇总（系统操作者）。
 		for _, ip := range out.Banned {
-			RecordAuditLog("system", "自动封禁", "IP 地址列表",
+			RecordAuditLog("system", AutobanAuditAction, "IP 地址列表",
 				FormatAuditDetail("IP："+ip,
 					fmt.Sprintf("命中：%d 次/%d 分钟", cfg.Threshold, cfg.WindowMinutes),
 					"时长："+AutobanDurationLabel(cfg.Duration),
@@ -807,8 +807,8 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 				fmt.Sprintf("自动封禁容量收敛：挤出 %d、丢弃 %d（上限 %d）", out.Evicted, out.DroppedNew, AutobanListEntryCap), "")
 		}
 	}
-	TaskLogf(AutobanTaskID, "cycle", "本轮：计数 %d IP / 活跃 %d 个 IP / 候选 %d / 新封 %d / 到期解封 %d / 抑制跳过 %d / 名单 %d 条%s",
-		autobanTrackedCount(), autobanReachedCount(), len(candidates), len(out.Banned), len(out.Expired), out.SkippedSuppressed, out.Total, reloadNote(out.Changed, reloadState))
+	TaskLogf(AutobanTaskID, "cycle", "本轮：计数 %d IP / 活跃 %d 个 IP / 候选 %d / 新封 %d / 到期解封 %d / 名单 %d 条%s",
+		autobanTrackedCount(), autobanReachedCount(), len(candidates), len(out.Banned), len(out.Expired), out.Total, reloadNote(out.Changed, reloadState))
 	return nil
 }
 
@@ -891,24 +891,45 @@ func AutobanListEntries() ([]models.IPListEntry, int64, error) {
 	return entries, id, nil
 }
 
-// AutobanBannedToday 今日自动封禁数：自动条目（remark=自动封禁）created_at
-// 落在配置时区的今天。
+// autobanEntryExpired 条目到期判定（AB-4 第 75 轮：与渲染投影层
+// loadIPListEntriesVia 的 F73-A 过滤共用单一判据——expires_at 可解析且
+// <= now 视为已到期；空/畸形 expires_at 保留条目不误删）。
+func autobanEntryExpired(e models.IPListEntry, now time.Time) bool {
+	if e.ExpiresAt == "" {
+		return false
+	}
+	exp := parseAutobanEntryTime(e.ExpiresAt)
+	return !exp.IsZero() && !exp.After(now)
+}
+
+// AutobanActiveEntries 生效条目视图（AB-4 第 75 轮）：过滤已到期未清理条目
+// ——/status list_entries 与渲染生效面同口径，Run 轮清理间隙不再虚高。
+func AutobanActiveEntries(entries []models.IPListEntry) []models.IPListEntry {
+	now := autobanNow()
+	active := make([]models.IPListEntry, 0, len(entries))
+	for _, e := range entries {
+		if !autobanEntryExpired(e, now) {
+			active = append(active, e)
+		}
+	}
+	return active
+}
+
+// AutobanBannedToday 今日自动封禁数（事件性统计，2026-10-15 用户裁定）：
+// 审计留痕中今天的「自动封禁」系统动作次数——与名单现状解耦，删除条目/
+// 到期解封不回退今日计数，同 IP 重新封禁累计次数。数据源=audit_log
+// （created_at UTC 墙钟串，action/created_at 双索引；默认保留 3 个月，
+// 覆盖当日）；审计库未初始化/查询失败按 0（状态卡统计位容错）。
 func AutobanBannedToday() int {
-	entries, _, err := AutobanListEntries()
-	if err != nil {
+	if db.AuditDB == nil {
 		return 0
 	}
 	loc := CurrentLocation()
-	today := autobanNow().In(loc).Format("2006-01-02")
-	n := 0
-	for _, e := range entries {
-		if e.Remark != AutobanEntryRemark {
-			continue
-		}
-		ts := parseAutobanEntryTime(e.CreatedAt)
-		if !ts.IsZero() && ts.In(loc).Format("2006-01-02") == today {
-			n++
-		}
+	now := autobanNow().In(loc)
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc).UTC().Format(autobanTimeLayout)
+	var n int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action=? AND created_at >= ?`, AutobanAuditAction, dayStart).Scan(&n); err != nil {
+		return 0
 	}
 	return n
 }

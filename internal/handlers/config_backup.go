@@ -1753,6 +1753,8 @@ func validateV2BackupAdminTLS(config map[string]any) error {
 // security_policies mode 族「无值归一」）、非空非法与非字符串形态响亮拒绝。
 // 返回钳制/归一留痕（导入侧并入审计明细；预览侧忽略）。归一写回 backup.Config
 // 在 checksum 校验之后执行，不影响完整性判定。
+// F75C-4（第 75 轮）：三通道归一语义分歧（保存拒/导入钳/回填复位默认）的
+// 显式声明锚在 services.ValidateAutobanConfig 注释——本函数即「导入钳」通道。
 func validateV2BackupAutobanConfig(config map[string]any) ([]string, error) {
 	if config == nil {
 		return nil, nil
@@ -1831,9 +1833,11 @@ func validateV2BackupAutobanConfig(config map[string]any) ([]string, error) {
 // 对畸形按未启用丢弃（fail-closed），真实 IP 还原静默失效而面板仍宣称已启用。
 // 复用保存侧校验单一口径：形态门+归一+引用存在性+内联∪引用展开总量上限；
 // 载荷未携带的键按库内存量值参与合成判定（与保存侧 PATCH 语义一致）。
-// tables 为备份携带表：refs 存在性/条目/上限按「备份内优先 ∪ 库内存量」解析
-// （引用名单随备份全量替换，跨节点还原不得误拒——镜像 W2/U3-F5 备份内解析
-// 哲学）。归一写回 backup.Config 在 checksum 校验之后执行。
+// tables 为备份携带表：RC-2/F75C-3（第 75 轮审计）按「备份是否携带
+// security_ip_lists 表」分流——携带时 refs 存在性/条目/上限仅按备份行集合
+// 解析（W2 全量替换先例：备份行才是导入后的真实数据，指向库内但不在备份内
+// 的 id 导入后必然悬空，400 拒绝）；未携带时按库内解析（「缺席=保留本地」，
+// 迟到表 era 备份不误拒）。归一写回 backup.Config 在 checksum 校验之后执行。
 func validateV2BackupTrustedProxyConfig(config map[string]any, tables map[string][]map[string]any) error {
 	if config == nil {
 		return nil
@@ -1879,12 +1883,14 @@ func validateV2BackupTrustedProxyConfig(config map[string]any, tables map[string
 }
 
 // trustedProxyBackupListSource 从备份 security_ip_lists 行构建名单解析源
-// （id → 名称+条目原文）。表未携带=空源（解析全走库内——导入后名单表保持
-// 现状，库内解析即导入后实态）。
-func trustedProxyBackupListSource(tables map[string][]map[string]any) map[int64]trustedProxyListSource {
+// （RC-2/F75C-3，第 75 轮审计）：表未携带=零值源（carried=false，未命中 id
+// 按库内解析——导入后名单表保持现状，库内解析即导入后实态）；表携带=
+// carried=true，refs 存在性仅按备份行集合解析（W2 全量替换先例：备份行才是
+// 导入后的真实数据，库内命中不代表导入后存在——悬空在校验期 400 拒绝）。
+func trustedProxyBackupListSource(tables map[string][]map[string]any) trustedProxyBackupSource {
 	rows, exists := tables["security_ip_lists"]
 	if !exists {
-		return nil
+		return trustedProxyBackupSource{}
 	}
 	source := make(map[int64]trustedProxyListSource, len(rows))
 	for _, row := range rows {
@@ -1896,7 +1902,7 @@ func trustedProxyBackupListSource(tables map[string][]map[string]any) map[int64]
 		name, _ := row["name"].(string)
 		source[int64(id)] = trustedProxyListSource{name: name, entries: entries}
 	}
-	return source
+	return trustedProxyBackupSource{lists: source, carried: true}
 }
 
 func backupBooleanEnabled(value any) bool {

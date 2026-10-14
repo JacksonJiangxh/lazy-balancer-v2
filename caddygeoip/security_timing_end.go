@@ -11,12 +11,13 @@ func init() {
 	caddy.RegisterModule(SecurityTimingEnd{})
 }
 
-// SecurityTimingEnd 是安全链末尾的耗时收点(2026-09-27 双点计时修复):
-// blocked_counter 计「拦截事件」的耗时(HandlerError 返回时链未到
-// reverse_proxy,耗时=纯安全评估,已准确);放行事件的耗时若也在
-// blocked_counter 的 next 返回后计,会混入上游代理往返(实测 329ms 中主要
-// 是上游响应时间而非 WAF 评估)——本处理器置于安全链末尾、reverse_proxy
-// 之前,读 blocked_counter 注入的起始纳秒头计算纯评估耗时写入侧车文件。
+// SecurityTimingEnd 是安全链末尾的耗时收点(2026-09-27 双点计时;第 75 轮起
+// :end 呈二态——logged 事件读本收点,拦截事件由 blocked_counter 写):
+// logged 事件(检测记录/放行)在链尾读「起始纳秒头」计算耗时——该头已被
+// SecurityTimingPre 重写为预检完成锚点,故此处 :end=预检后→链末=WAF 段值
+// (读侧直接取用,不再减 :pre);拦截事件链未达本收点,:end 由 blocked_counter
+// 在中断检出点写(链首→中断全链,读侧 - :pre 得 WAF 段)。两态都只含安全
+// 评估,不含 reverse_proxy 上游往返。
 //
 // 覆盖:放行+检测记录(logged)事件在 coraza ProcessLogging 之前已完成
 // 全部策略评估,此处读值即纯安全链耗时;信任直通(passthrough)时安全链
@@ -34,9 +35,9 @@ func (SecurityTimingEnd) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// ServeHTTP 计算全链纯评估耗时（键 <timing_id>:end）写入侧车文件，原样透传
-// 下游（reverse_proxy）。计时读头逻辑收敛于 recordSecurityTiming（PLUG-R1，
-// security_timing.go）。
+// ServeHTTP 计算 logged 事件耗时（键 <timing_id>:end，自预检完成锚点起算=
+// WAF 段值）写入侧车文件，原样透传下游（reverse_proxy）。计时读头逻辑收敛于
+// recordSecurityTiming（PLUG-R1，security_timing.go）。
 func (h *SecurityTimingEnd) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	recordSecurityTiming(r, ":end")
 	return next.ServeHTTP(w, r)

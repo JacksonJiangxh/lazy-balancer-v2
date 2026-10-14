@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 // F62-30(第 62 轮审计):写侧三文件此前零测试——补并发追加/空 ID 短路/目录
@@ -253,5 +255,68 @@ func TestSecurityTimingWriter_releaseDrainsQueue(t *testing.T) {
 	}
 	if string(dataAfter) != string(data) {
 		t.Fatal("append after release must drop silently (writer stopped)")
+	}
+}
+
+// 第 75 轮（预检拦耗时口径）：分段锚点交接契约——timing_pre 放行路径在记录
+// :pre 后，把起始纳秒头重写为「预检完成」锚点。下游 SecurityTimingEnd 的 :end
+// 自此从预检后起算（WAF 段值）；blocked_counter 以「起始头是否仍等于注入原值」
+// 判定拦截出处（原值=预检段拦，头未动 → 写 :pre 决策耗时；已重写=WAF/限流段
+// 拦 → 写 :end 全链）。放行形态：:pre 落盘 + 头已重写为更大纳秒值。
+func TestSecurityTimingPre_passAnchorsSegmentViaHeaderRewrite(t *testing.T) {
+	logPath, flush := setupSecurityTimingWriter(t)
+	h := &SecurityTimingPre{}
+	const id = "abcdef0123456789"
+	startNs := time.Now().UnixNano()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set(securityTimingHeader, id)
+	req.Header.Set(securityTimingStartHeader, strconv.FormatInt(startNs, 10))
+	next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
+
+	// When
+	if err := h.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	flush()
+
+	// Then：:pre 行落盘（放行口径不变）
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := strings.TrimSpace(string(data))
+	parts := strings.SplitN(line, " ", 2)
+	if len(parts) != 2 || parts[0] != id+":pre" {
+		t.Fatalf("line=%q; want %q <us>", line, id+":pre")
+	}
+	// And：起始头重写为分段锚点（严格晚于注入值；下游 :end/WAF 段由此起算）
+	rewritten, perr := strconv.ParseInt(req.Header.Get(securityTimingStartHeader), 10, 64)
+	if perr != nil || rewritten <= startNs {
+		t.Fatalf("start header = %q; want rewritten to ns > %d (segment anchor)",
+			req.Header.Get(securityTimingStartHeader), startNs)
+	}
+	// And：ID 头保持（coraza 审计关联键不受锚点交接影响）
+	if req.Header.Get(securityTimingHeader) != id {
+		t.Fatalf("timing id header = %q; want %q (audit correlation)", req.Header.Get(securityTimingHeader), id)
+	}
+}
+
+// 第 75 轮：畸形形态——缺关联头对的请求零写入、零改写、不 panic（静默降级）。
+func TestSecurityTimingPre_missingHeadersNoop(t *testing.T) {
+	logPath, flush := setupSecurityTimingWriter(t)
+	h := &SecurityTimingPre{}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
+
+	if err := h.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	flush()
+
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Error("missing headers must not create/write sidecar file")
+	}
+	if req.Header.Get(securityTimingStartHeader) != "" {
+		t.Error("missing headers must not set segment anchor header")
 	}
 }

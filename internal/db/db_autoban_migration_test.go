@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// 自动封禁（F73-A）迁移钉：六项配置列 + 预置名单行 + 抑制表。
+// 自动封禁（F73-A）迁移钉：六项配置列 + 预置名单行。
 // fresh DDL 携带全部形状；存量库经 Initialize/runMigrations 幂等补齐
 //（global_config 列走 newColumns 唯一登记通道——CORE-R1 口径）。
 
@@ -24,10 +24,9 @@ var autobanColumnsExpected = []struct{ column, dflt string }{
 // 独立声明避免 db→services 反向依赖；两处不一致时本测试红）。
 const autobanPresetListName = "自动封禁名单"
 
-// TestInitialize_freshSchemaCarriesAutobanColumnsSeedAndSuppressionTable：
-// 全新安装即携带六列（NOT NULL+默认值）、预置 security_ip_lists 行（system=1）
-// 与 autoban_suppressed 抑制表。
-func TestInitialize_freshSchemaCarriesAutobanColumnsSeedAndSuppressionTable(t *testing.T) {
+// TestInitialize_freshSchemaCarriesAutobanColumnsAndSeed：
+// 全新安装即携带六列（NOT NULL+默认值）与预置 security_ip_lists 行（system=1）。
+func TestInitialize_freshSchemaCarriesAutobanColumnsAndSeed(t *testing.T) {
 	dir := t.TempDir()
 	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
 	t.Cleanup(func() {
@@ -62,20 +61,10 @@ func TestInitialize_freshSchemaCarriesAutobanColumnsSeedAndSuppressionTable(t *t
 	if entriesSet != 1 || entries != "[]" {
 		t.Fatalf("preset list entries=%q (set=%d), want '[]'", entries, entriesSet)
 	}
-
-	for _, col := range []string{"ip", "suppressed_until"} {
-		var cnt int
-		if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('autoban_suppressed') WHERE name=?`, col).Scan(&cnt); err != nil {
-			t.Fatalf("inspect autoban_suppressed.%s: %v", col, err)
-		}
-		if cnt != 1 {
-			t.Fatalf("autoban_suppressed.%s missing", col)
-		}
-	}
 }
 
 // TestRunMigrations_addsAutobanColumnsAndSeedToLegacyDB：存量库（无六列/无预置
-// 行/无抑制表）经迁移补齐，存量行读回默认值；重复迁移幂等（预置行不重复）。
+// 行）经迁移补齐，存量行读回默认值；重复迁移幂等（预置行不重复）。
 func TestRunMigrations_addsAutobanColumnsAndSeedToLegacyDB(t *testing.T) {
 	database := openMigrationTestDB(t)
 	if err := createTables(); err != nil {
@@ -96,9 +85,6 @@ func TestRunMigrations_addsAutobanColumnsAndSeedToLegacyDB(t *testing.T) {
 			}
 		}
 	}
-	if _, err := database.Exec(`DROP TABLE IF EXISTS autoban_suppressed`); err != nil {
-		t.Fatalf("drop suppression table: %v", err)
-	}
 	var preset int
 	if err := database.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=?`, autobanPresetListName).Scan(&preset); err != nil {
 		t.Fatalf("count preset: %v", err)
@@ -109,8 +95,8 @@ func TestRunMigrations_addsAutobanColumnsAndSeedToLegacyDB(t *testing.T) {
 		}
 	}
 	// 生产升级序列=Initialize 每次启动先 createTables 再 runMigrations——
-	// 抑制表/预置行由 schema 段承担（CREATE IF NOT EXISTS / NOT EXISTS 种子），
-	// 这里按真实顺序重放 schema 段（模拟存量旧库升级到新版后的首个启动）。
+	// 预置行由 schema 段承担（NOT EXISTS 种子），这里按真实顺序重放 schema 段
+	//（模拟存量旧库升级到新版后的首个启动）。
 	if err := createTables(); err != nil {
 		t.Fatalf("replay createTables: %v", err)
 	}
@@ -132,14 +118,6 @@ func TestRunMigrations_addsAutobanColumnsAndSeedToLegacyDB(t *testing.T) {
 			t.Fatalf("global_config.%s is NULL, want column default", tc.column)
 		}
 	}
-	// 抑制表在
-	var tables int
-	if err := database.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='autoban_suppressed'`).Scan(&tables); err != nil {
-		t.Fatalf("check autoban_suppressed: %v", err)
-	}
-	if tables != 1 {
-		t.Fatal("autoban_suppressed table missing after migration")
-	}
 	// 预置行恰好一条（幂等种子不得重复）
 	var rows int
 	var system int
@@ -148,5 +126,39 @@ func TestRunMigrations_addsAutobanColumnsAndSeedToLegacyDB(t *testing.T) {
 	}
 	if rows != 1 || system != 1 {
 		t.Fatalf("preset rows=%d system=%d, want exactly 1 row with system=1", rows, system)
+	}
+}
+
+// TestInitialize_normalizesAutobanPresetDescription：存量预置行携带旧描述
+// （「可手动追加或解封」）时，启动迁移归一为「删除条目」口径（2026-10-15
+// 用户裁定：删除即解封，说明文案去「解封」操作词）。仅命中旧文案的种子行
+// ——预置行描述禁改（UpdateIPList 400 守卫），不存在用户自定义形态；
+// 威胁名单描述不受影响。
+func TestInitialize_normalizesAutobanPresetDescription(t *testing.T) {
+	dir := t.TempDir()
+	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
+	t.Cleanup(func() { DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB; _ = Close() })
+
+	// 先旧版建库+种出预置行，再回写旧文案（模拟存量部署）。
+	if err := Initialize(dir); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	if _, err := DB.Exec(`UPDATE security_ip_lists SET description='自动封禁命中 IP（自动封禁任务维护；可手动追加或解封）' WHERE name=?`, autobanPresetListName); err != nil {
+		t.Fatalf("stamp legacy description: %v", err)
+	}
+	if err := Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// 重启 Initialize → 描述归一。
+	if err := Initialize(dir); err != nil {
+		t.Fatalf("re-initialize: %v", err)
+	}
+	var got string
+	if err := DB.QueryRow(`SELECT description FROM security_ip_lists WHERE name=?`, autobanPresetListName).Scan(&got); err != nil {
+		t.Fatalf("read description: %v", err)
+	}
+	if got != "自动封禁命中 IP（自动封禁任务维护；可手动追加或删除条目）" {
+		t.Fatalf("description=%q, want 删除条目口径归一", got)
 	}
 }

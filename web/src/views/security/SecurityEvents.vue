@@ -24,6 +24,8 @@
               <el-tag :type="autobanStatus.enabled ? (autobanStatus.dry_run ? 'warning' : 'success') : 'info'" size="small" effect="plain">
                 {{ autobanStatus.enabled ? (autobanStatus.dry_run ? '观察模式' : '运行中') : '未启用' }}
               </el-tag>
+              <!-- F75C-2（第 75 轮）：调度仅主节点执行——从端徽章标示+写按钮禁用 -->
+              <el-tag v-if="!autobanStatus.is_master" type="info" size="small" effect="plain">仅主节点调度</el-tag>
             </div>
             <div class="autoban-stats">
               <span class="autoban-stat">口径 <b>{{ autobanScopeText }}</b></span>
@@ -41,10 +43,10 @@
           </div>
         <div class="autoban-actions">
           <template v-if="autobanStatus.enabled">
-            <el-button size="small" type="danger" plain :loading="autobanToggling" @click="toggleAutobanEnabled">禁用</el-button>
-            <el-button size="small" plain @click="openAutobanConfig">编辑</el-button>
+            <el-button size="small" type="danger" plain :disabled="!autobanStatus.is_master" :loading="autobanToggling" @click="toggleAutobanEnabled">禁用</el-button>
+            <el-button size="small" plain :disabled="!autobanStatus.is_master" @click="openAutobanConfig">编辑</el-button>
           </template>
-          <el-button v-else size="small" type="success" plain @click="openAutobanConfigForEnable">启用</el-button>
+          <el-button v-else size="small" type="success" plain :disabled="!autobanStatus.is_master" @click="openAutobanConfigForEnable">启用</el-button>
         </div>
       </div>
       <!-- 未关联策略黄条：名单未被启用中的安全策略引用，封禁不生效 -->
@@ -54,11 +56,16 @@
       <!-- 观察模式建议列表：dry-run 下达阈值 IP（不封禁，供评估阈值/口径） -->
       <template v-if="autobanStatus.enabled && autobanStatus.dry_run && (autobanStatus.suggestions?.length ?? 0) > 0">
         <div class="info-note-bar autoban-warn-bar">
-          <span class="info-note-desc">观察模式：以下 IP 在 {{ autobanStatus.window_minutes }} 分钟窗口内命中 {{ autobanStatus.threshold }} 次阈值（仅记录建议，不写入名单）</span>
+          <span class="info-note-desc">观察模式：以下 IP 在 {{ autobanStatus.window_minutes }} 分钟窗口内命中 {{ autobanStatus.threshold }} 次阈值（仅记录建议，不写入名单；建议封禁时长 {{ autobanDurationText }}；最多展示命中最多的 50 条）</span>
         </div>
-        <el-table :data="autobanStatus.suggestions" size="small" max-height="200" :header-cell-style="{ background: '#f9fafb' }">
-          <el-table-column prop="ip" label="IP" min-width="160" />
-          <el-table-column prop="count" label="命中次数" width="110" align="center" />
+        <el-table :data="autobanStatus.suggestions" size="small" max-height="320" :header-cell-style="{ background: '#f9fafb' }">
+          <el-table-column prop="ip" label="IP" min-width="150" />
+          <el-table-column label="命中次数" width="110" align="right">
+            <template #default="{ row }"><span :style="suggestionCountStyle(row.count)">{{ row.count }}</span></template>
+          </el-table-column>
+          <el-table-column label="窗口内首末" min-width="160">
+            <template #default="{ row }"><span class="text-secondary">{{ suggestionWindowSpan(row) }}</span></template>
+          </el-table-column>
         </el-table>
       </template>
     </el-card>
@@ -202,7 +209,7 @@
     <!-- 自动封禁配置弹框（F73-A）：六项配置+口径/窗口变更重置提示 -->
     <el-dialog v-model="autobanDialogVisible" width="min(600px, 94vw)" top="8vh" append-to-body class="dialog-body-inset">
       <template #header>
-        <DialogHeader :icon="Lock" title="自动封禁配置" subtitle="WAF 事件固定窗口计数达到阈值即写入「自动封禁名单」，到期自动解封" />
+        <DialogHeader :icon="Lock" title="自动封禁配置" subtitle="WAF 事件固定窗口计数达到阈值即写入「自动封禁名单」（调度开启时到期自动解封）" />
       </template>
       <el-form :model="autobanForm" label-width="96px" label-position="right">
         <el-form-item label="观察模式">
@@ -333,11 +340,12 @@ interface SecurityEvent { id: number; event_time: string; rule_caddy_id: string;
 
 // —— 自动封禁（F73-A）：状态卡/配置弹框 ——
 
-interface AutobanSuggestion { ip: string; count: number }
+interface AutobanSuggestion { ip: string; count: number; window_start?: string; last_seen?: string }
 interface AutobanStatus {
   enabled: boolean; dry_run: boolean; threshold: number; window_minutes: number
   duration: string; scope: string; banned_today: number; list_entries: number
   list_referenced: boolean; tracked_ips: number; suggestions: AutobanSuggestion[]
+  is_master: boolean; role: string
   running: boolean; last_run: string; last_status: string
 }
 const AUTOBAN_DURATIONS = [
@@ -353,12 +361,31 @@ const AUTOBAN_SCOPES = [
 const autobanStatus = ref<AutobanStatus>({
   enabled: false, dry_run: true, threshold: 100, window_minutes: 5, duration: '1h', scope: 'all',
   banned_today: 0, list_entries: 0, list_referenced: true, tracked_ips: 0, suggestions: [],
+  is_master: true, role: 'master',
   running: false, last_run: '', last_status: '',
 })
 const autobanStatusLoading = ref(false)
 const autobanToggling = ref(false)
 const autobanScopeText = computed(() => AUTOBAN_SCOPES.find((s) => s.value === autobanStatus.value.scope)?.label ?? autobanStatus.value.scope)
 const autobanDurationText = computed(() => AUTOBAN_DURATIONS.find((d) => d.value === autobanStatus.value.duration)?.label ?? autobanStatus.value.duration)
+
+// 命中次数色深（命中越多越深）：≥4×阈值深红加粗、≥2×阈值正红、其余浅红。
+const suggestionCountStyle = (count: number): string => {
+  const t = autobanStatus.value.threshold || 1
+  if (count >= t * 4) return 'color:#991b1b;font-weight:700'
+  if (count >= t * 2) return 'color:#dc2626;font-weight:600'
+  return 'color:#ef4444'
+}
+
+// 建议窗口首末（同一统计窗口内通常同日）：同日展示「时刻 ~ 时刻」，
+// 跨日展示完整起止；任一端缺失按 '—'。
+const suggestionWindowSpan = (row: AutobanSuggestion): string => {
+  const start = formatDate(row.window_start)
+  const end = formatDate(row.last_seen)
+  if (!start || !end) return '—'
+  if (start.length < 19 || end.length < 19) return `${start} ~ ${end}`
+  return start.slice(0, 10) === end.slice(0, 10) ? `${start.slice(11)} ~ ${end.slice(11)}` : `${start} ~ ${end}`
+}
 
 const fetchAutobanStatus = async (): Promise<void> => {
   autobanStatusLoading.value = true
@@ -488,7 +515,9 @@ const toggleAutobanEnabled = async (): Promise<void> => {
 // {acl,trust}），删除谓词，统一走 stageCategory 单一事实源。
 
 // Review66-Head ②：ctx 弹框耗时展示按族判定——仅 WAF 族（wafCrs/wafCustom/
-// body）经 WAF 段独立测量用加和式；预检族 duration_us≡precheck_us 单值展示。
+// body）经 WAF 段独立测量用加和式（duration_us=WAF 段，拦截/记录两形态同为
+// 纯段口径）；预检族 duration_us≡precheck_us 单值展示（预检决策耗时，拦截与
+// 放行同口径——第 75 轮起预检拦在决策后、403 写出前记录，不再混入链首全程）。
 const ctxWafFamily = computed(() => {
   const t = ctxEvent.value?.rule_triggered ?? ''
   return ['wafCrs', 'wafCustom', 'body'].includes(triggerStageFamily(t))

@@ -227,10 +227,14 @@ func TestImportConfigBackup_trustedProxyTextColumnsGate(t *testing.T) {
 		for i := range 2000 {
 			entries = append(entries, fmt.Sprintf(`{"value":"198.51.%d.%d"}`, i/254, i%254+1))
 		}
-		listID := seedTrustedRefList(t, "r74c-huge-list", "["+strings.Join(entries, ",")+"]")
-		backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, map[string]any{
+		// RC-2（第 75 轮）口径迁移：r55 夹具恒携带 security_ip_lists 表（全量
+		// 替换），refs 存在性仅按备份行解析——被引用的 2000 条名单须随备份行
+		// 到场（自洽备份），总量门判定面=备份行展开。
+		backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{
+			"security_ip_lists": {{"id": 5, "name": "r74c-huge-list", "entries": "[" + strings.Join(entries, ",") + "]"}},
+		}, map[string]any{
 			"trusted_proxy_ranges":     `["203.0.113.0/24"]`,
-			"trusted_proxy_range_refs": fmt.Sprintf("[%d]", listID),
+			"trusted_proxy_range_refs": "[5]",
 		})
 		response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
 		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "2000") {
@@ -260,11 +264,13 @@ func TestImportConfigBackup_trustedProxyTextColumnsGate(t *testing.T) {
 	t.Run("合法载荷归一落库", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
 		r55SeedCurrentAdmin(t)
-		listID := seedTrustedRefList(t, "r74c-ref-list", `[{"value":"198.51.100.0/24","remark":""}]`)
-		backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, map[string]any{
+		// RC-2（第 75 轮）口径迁移：被引用名单随备份行到场（自洽备份）。
+		backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{
+			"security_ip_lists": {{"id": 5, "name": "r74c-ref-list", "entries": `[{"value":"198.51.100.0/24","remark":""}]`}},
+		}, map[string]any{
 			"trusted_proxy_enabled":    true,
 			"trusted_proxy_ranges":     `["198.51.100.7"]`,
-			"trusted_proxy_range_refs": fmt.Sprintf("[%d]", listID),
+			"trusted_proxy_range_refs": "[5]",
 			"trusted_proxy_headers":    `["CF-Connecting-IP","X-Forwarded-For","CF-Connecting-IP"]`,
 		})
 		response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
@@ -279,8 +285,8 @@ func TestImportConfigBackup_trustedProxyTextColumnsGate(t *testing.T) {
 		if ranges != `["198.51.100.7/32"]` {
 			t.Fatalf("ranges=%s, want bare IP normalized to /32", ranges)
 		}
-		if refs != fmt.Sprintf("[%d]", listID) {
-			t.Fatalf("refs=%s, want [%d]", refs, listID)
+		if refs != "[5]" {
+			t.Fatalf("refs=%s, want [5]", refs)
 		}
 		if headers != `["CF-Connecting-IP","X-Forwarded-For"]` {
 			t.Fatalf("headers=%s, want dedup preserve order", headers)

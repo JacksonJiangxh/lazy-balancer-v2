@@ -107,12 +107,15 @@ func (h *SecurityBlockedCounter) Cleanup() error {
 // 合并 map+读后截断)。
 func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	// 安全处理耗时:注入 timing ID + 起始纳秒双头(coraza 审计日志收录 ID;
-	// SecurityTimingEnd 处理器在安全链末尾读起始头计算 passed 事件的纯评估
-	// 耗时)。起始头与 ID 头均在 proxyRequestHeaders 删除清单剥离,不上泄上游。
+	// SecurityTimingPre 记 :pre 后把起始头重写为「预检完成」分段锚点,
+	// SecurityTimingEnd 读锚点计算 logged 事件的 WAF 段耗时)。起始头与 ID 头
+	// 均在 proxyRequestHeaders 删除清单剥离,不上泄上游。
 	timingID := securityTimingID()
+	var timingStartVal string
 	if timingID != "" {
+		timingStartVal = strconv.FormatInt(time.Now().UnixNano(), 10)
 		r.Header.Set(securityTimingHeader, timingID)
-		r.Header.Set(securityTimingStartHeader, strconv.FormatInt(time.Now().UnixNano(), 10))
+		r.Header.Set(securityTimingStartHeader, timingStartVal)
 	}
 	start := time.Now()
 
@@ -130,12 +133,20 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		herr.StatusCode >= 400 && herr.StatusCode < 500 &&
 		(len(herr.ID) == 16 || herr.StatusCode == http.StatusTooManyRequests)
 
-	// 安全处理耗时——双点计时的「拦截点」:安全中断(HandlerError 返回)时
-	// 链未到 reverse_proxy,此处耗时=纯安全评估;放行事件的耗时由安全链末尾
-	// 的 SecurityTimingEnd 处理器记录(此处 next 返回值混入上游代理往返,
-	// 不能用——实测 329ms 中主要是上游响应时间而非 WAF 评估)。
+	// 安全处理耗时——分段选键(第 75 轮,预检拦口径):单一写点保证同 ID 恰一行,
+	// 无双行/取大者混乱。此刻中断已裁决、403 响应尚未写出(错误路由在 Server
+	// 层于本 handler 返回后才执行)——两种键都是纯评估口径:
+	//   起始头仍=注入原值 → 链未抵达预检收点(SecurityTimingPre 未重写锚点)
+	//     =预检段拦(IP ACL/GeoIP/信任/威胁)→ 写 :pre=预检决策耗时;
+	//   头已被重写 → 预检已放行,中断出自 WAF/限流段 → 写 :end=链首至此全链
+	//     (读侧 - :pre 得 WAF 段)。
+	// timingID 为空(随机源失败)时全程无计时,不写(下分支同门)。
 	if timingID != "" && isSecurityBlock {
-		AppendSecurityTiming(timingID+":end", time.Since(start).Microseconds()) // 分段键:end(预检拦时=end 即预检耗时)
+		if r.Header.Get(securityTimingStartHeader) == timingStartVal {
+			AppendSecurityTiming(timingID+":pre", time.Since(start).Microseconds())
+		} else {
+			AppendSecurityTiming(timingID+":end", time.Since(start).Microseconds())
+		}
 	}
 
 	if isSecurityBlock {

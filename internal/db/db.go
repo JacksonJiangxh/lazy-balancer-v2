@@ -588,14 +588,6 @@ func createTables() error {
 		system INTEGER NOT NULL DEFAULT 0
 	);
 
-	-- 自动封禁抑制表（F73-A）：手动解封的 IP 在 suppressed_until（UTC 墙钟串）
-	-- 前不再被自动封禁（30 天抑制窗口），避免「解封→下轮立即重封」拉锯。
-	-- ip 主键=每 IP 一行，重复解封以 UPSERT 续期。新表无存量形态，schema 段
-	-- CREATE IF NOT EXISTS 即幂等补齐。
-	CREATE TABLE IF NOT EXISTS autoban_suppressed (
-		ip TEXT PRIMARY KEY,
-		suppressed_until TEXT NOT NULL
-	);
 	-- 预置「自动封禁名单」行（F73-A）在 runMigrations 播种（威胁名单种子同位）
 	-- ——schema 段引用 system 列会在「无 system 列的存量旧表」上炸掉整份建表
 	-- 脚本（TestIPListsSystemColumn_legacyMigration 同款场景）。
@@ -1586,14 +1578,22 @@ func runMigrations() error {
 	}
 
 	// 自动封禁预置名单种子（F73-A）：system=1 禁删（DeleteIPList 拒绝）、条目
-	// 可改（手动追加/解封）、自动封禁任务独占追加自动条目（entries 在 DB——
-	// 与威胁名单的 RDB 文件形态不同，投影层按名映射路由）。幂等：按 name
-	// 恰好一行（name 非唯一键，INSERT..SELECT..WHERE NOT EXISTS 形态）。
-	// 与威胁种子同位：newColumns 补齐 system 列之后执行。
+	// 可改（手动追加/删除条目——删除即解封）、自动封禁任务独占追加自动条目
+	//（entries 在 DB——与威胁名单的 RDB 文件形态不同，投影层按名映射路由）。
+	// 幂等：按 name 恰好一行（name 非唯一键，INSERT..SELECT..WHERE NOT EXISTS
+	// 形态）。与威胁种子同位：newColumns 补齐 system 列之后执行。
 	if _, err := DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at)
-		SELECT '自动封禁名单', '自动封禁命中 IP（自动封禁任务维护；可手动追加或解封）', '自动封禁', '[]', 1, datetime('now'), datetime('now')
+		SELECT '自动封禁名单', '自动封禁命中 IP（自动封禁任务维护；可手动追加或删除条目）', '自动封禁', '[]', 1, datetime('now'), datetime('now')
 		WHERE NOT EXISTS (SELECT 1 FROM security_ip_lists WHERE name='自动封禁名单')`); err != nil {
 		return fmt.Errorf("failed to seed autoban preset list: %w", err)
+	}
+	// 预置行描述文案归一（2026-10-15「删除条目即解封」裁定）：存量行的旧种子
+	// 描述（「可手动追加或解封」）同步为删除条目口径。仅命中旧文案行——预置行
+	// 描述禁改（UpdateIPList 400 守卫），不存在用户自定义形态；威胁名单描述
+	// 不受影响。
+	if _, err := DB.Exec(`UPDATE security_ip_lists SET description='自动封禁命中 IP（自动封禁任务维护；可手动追加或删除条目）'
+		WHERE name='自动封禁名单' AND COALESCE(system,0)=1 AND description='自动封禁命中 IP（自动封禁任务维护；可手动追加或解封）'`); err != nil {
+		return fmt.Errorf("failed to normalize autoban preset description: %w", err)
 	}
 
 	// 规则三面同构迁移（2026-10-11 用户裁定「如果没有就都应该没有/时间戳格式

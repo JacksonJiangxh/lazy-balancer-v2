@@ -2,8 +2,8 @@ package services
 
 // 自动封禁（F73-A）核心行为钉：固定桶计数器（重置语义/上限保护）、摄取
 // 提交点喂入门（主节点+启用+口径+WAF 事件）、名单 merge（清到期/保留手动/
-// 抑制过滤/超限挤最早到期）、重载节流（<60s 暂存合并）、EnabledFn fail-closed、
-// 配置校验与口径/窗口变更重置、投影层过期条目过滤。
+// 已在名单过滤/超限挤最早到期）、重载节流（<60s 暂存合并）、EnabledFn
+// fail-closed、配置校验与口径/窗口变更重置、投影层过期条目过滤。
 
 import (
 	"encoding/json"
@@ -22,7 +22,7 @@ import (
 
 // ---- 夹具 ----
 
-// autobanTestClock 可注入时钟（重置语义/节流/抑制窗口断言的时间轴）。
+// autobanTestClock 可注入时钟（重置语义/节流/到期窗口断言的时间轴）。
 type autobanTestClock struct {
 	mu  sync.Mutex
 	now time.Time
@@ -369,10 +369,10 @@ func seedPresetEntries(t *testing.T, entries []models.IPListEntry) {
 }
 
 // Given 名单含「已到期自动条目/手动条目/未到期自动条目」；候选含「已在名单/
-// 抑制期内/新 IP」。
+// 新 IP」。
 // When 执行 merge。
-// Then 到期条目清除、手动条目保留、抑制 IP 不重封、新 IP 带到期时间追加。
-func TestAutobanMerge_expiryManualSuppression(t *testing.T) {
+// Then 到期条目清除、手动条目保留、已在名单 IP 不重复追加、新 IP 带到期时间追加。
+func TestAutobanMerge_expiryManualAndNewEntries(t *testing.T) {
 	f := installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
 	seedPresetEntries(t, []models.IPListEntry{
@@ -380,14 +380,10 @@ func TestAutobanMerge_expiryManualSuppression(t *testing.T) {
 		{Value: "198.51.100.2", Remark: "事件处置", CreatedAt: "2026-10-13 10:00:00"},                                               // 手动条目
 		{Value: "198.51.100.3", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:30:00", ExpiresAt: "2026-10-14 10:30:00"}, // 未到期
 	})
-	if err := SuppressAutobanIP("203.0.113.9"); err != nil {
-		t.Fatalf("suppress: %v", err)
-	}
 
 	out, err := autobanMergeEntries(AutobanConfig{Enabled: true, Threshold: 1, WindowMinutes: 5, Duration: "1h", Scope: "all", DryRun: false},
 		[]AutobanSuggestion{
 			{IP: "198.51.100.3", Count: 10},  // 已在名单→跳过
-			{IP: "203.0.113.9", Count: 10},   // 抑制期内→跳过
 			{IP: "203.0.113.10", Count: 120}, // 新封
 			{IP: "203.0.113.11", Count: 101}, // 新封
 		})
@@ -401,9 +397,6 @@ func TestAutobanMerge_expiryManualSuppression(t *testing.T) {
 	}
 	if e, exists := entries["198.51.100.2"]; !exists || e.Remark != "事件处置" {
 		t.Fatalf("手动条目必须原样保留，得到 %+v", e)
-	}
-	if _, exists := entries["203.0.113.9"]; exists {
-		t.Fatal("抑制期内 IP 不得重封")
 	}
 	newEntry, exists := entries["203.0.113.10"]
 	if !exists {
@@ -426,8 +419,50 @@ func TestAutobanMerge_expiryManualSuppression(t *testing.T) {
 	if !out.Changed {
 		t.Fatal("有清除+新增时 Changed 必须为 true")
 	}
-	if len(out.Banned) != 2 || len(out.Expired) != 1 || out.SkippedSuppressed != 1 {
-		t.Fatalf("merge 计数失真：banned=%v expired=%v suppressed=%d", out.Banned, out.Expired, out.SkippedSuppressed)
+	if len(out.Banned) != 2 || len(out.Expired) != 1 {
+		t.Fatalf("merge 计数失真：banned=%v expired=%v", out.Banned, out.Expired)
+	}
+}
+
+// 删除即解封（2026-10-15 用户裁定）：无抑制窗口——名单条目被手动删除后，
+// 同一 IP 重新达标必须重新封禁（钉住「不存在抑制过滤」的 merge 语义）。
+
+// Given 名单含某 IP 的自动条目（封禁中）。
+// When 手动删除该条目（remove-ip/弹框删除的等价形态：条目移除、无任何残留），
+// 且该 IP 再次跨阈值进入候选。
+// Then merge 重新封禁该 IP（带新 created_at/expires_at）。
+func TestAutobanMerge_reQualifiesAfterManualDelete(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
+	cfg := AutobanConfig{Enabled: true, Threshold: 1, WindowMinutes: 5, Duration: "1h", Scope: "all", DryRun: false}
+	candidates := []AutobanSuggestion{{IP: "203.0.113.9", Count: 10}}
+
+	// 封禁中：已在名单 → 不重复追加
+	seedPresetEntries(t, []models.IPListEntry{
+		{Value: "203.0.113.9", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:00:00", ExpiresAt: "2026-10-14 11:00:00"},
+	})
+	out, err := autobanMergeEntries(cfg, candidates)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if len(out.Banned) != 0 || out.Changed {
+		t.Fatalf("名单内 IP 不得重复封禁：banned=%v changed=%v", out.Banned, out.Changed)
+	}
+
+	// 手动删除条目（删除即解封，无抑制痕迹）
+	seedPresetEntries(t, []models.IPListEntry{})
+
+	// 重新达标 → 重新封禁
+	out, err = autobanMergeEntries(cfg, candidates)
+	if err != nil {
+		t.Fatalf("re-merge: %v", err)
+	}
+	if len(out.Banned) != 1 || out.Banned[0] != "203.0.113.9" {
+		t.Fatalf("删除后重新达标必须重新封禁，得到 banned=%v", out.Banned)
+	}
+	entry, exists := entryValues(presetEntries(t))["203.0.113.9"]
+	if !exists || entry.CreatedAt != "2026-10-14 10:00:00" {
+		t.Fatalf("重封条目=%+v, want 新 created_at=2026-10-14 10:00:00", entry)
 	}
 }
 
@@ -497,36 +532,6 @@ func TestAutobanMerge_evictsEarliestExpiringAutobanEntries(t *testing.T) {
 			t.Fatalf("evicted=%d, want 1", out.Evicted)
 		}
 	})
-}
-
-// ---- 抑制表 ----
-
-func TestAutobanSuppression_upsertAndExpiry(t *testing.T) {
-	f := installAutobanFixture(t, "2026-10-14 10:00:00")
-	if err := SuppressAutobanIP("203.0.113.1"); err != nil {
-		t.Fatalf("suppress: %v", err)
-	}
-	f.Advance(24 * time.Hour)
-	if err := SuppressAutobanIP("203.0.113.1"); err != nil {
-		t.Fatalf("suppress again: %v", err)
-	}
-	var rows int
-	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM autoban_suppressed WHERE ip='203.0.113.1'`).Scan(&rows); err != nil {
-		t.Fatal(err)
-	}
-	if rows != 1 {
-		t.Fatalf("重复解封应 UPSERT 单行，得到 %d 行", rows)
-	}
-	set := autobanSuppressedSet(f.Now())
-	if _, ok := set["203.0.113.1"]; !ok {
-		t.Fatal("抑制期内 IP 必须在抑制集合中")
-	}
-	// 30 天后过期
-	f.Advance(30*24*time.Hour + time.Minute)
-	set = autobanSuppressedSet(f.Now())
-	if _, ok := set["203.0.113.1"]; ok {
-		t.Fatal("抑制到期后必须离开抑制集合")
-	}
 }
 
 // ---- 重载节流（AU-1 持锁契约 + D4 三态） ----
@@ -733,16 +738,18 @@ func TestAutobanObserveBatch_commitPointFeed(t *testing.T) {
 	}
 }
 
-// ---- 计数器修剪：过期桶不产生候选 ----
+// ---- 计数器修剪：未跨阈值的过期桶不产生候选 ----
 
+// AB-1（第 75 轮）回归形状：过期且未跨阈值的桶照常修剪、不产生候选；已跨阈值
+// 的过期桶必须产生候选（正向钉在 TestAutobanRunCycle_expiredBucketStillBans）。
 func TestAutobanCandidates_pruneStaleBuckets(t *testing.T) {
 	f := installAutobanFixture(t, "2026-10-14 10:00:00")
-	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", true)
-	autobanObserveEvent("203.0.113.1", "blocked", "942100")
+	setAutobanConfigRaw(t, true, 2, 5, "1h", "all", true)
+	autobanObserveEvent("203.0.113.1", "blocked", "942100") // 1 次 < 阈值 2
 	f.Advance(6 * time.Minute)
-	cands := autobanCandidates(1, 5*time.Minute)
+	cands := autobanCandidates(2, 5*time.Minute)
 	if len(cands) != 0 {
-		t.Fatalf("窗口过期桶不得产生候选，得到 %v", cands)
+		t.Fatalf("过期且未跨阈值的桶不得产生候选，得到 %v", cands)
 	}
 	autobanMu.Lock()
 	_, stillThere := autobanWindows["203.0.113.1"]
@@ -754,15 +761,88 @@ func TestAutobanCandidates_pruneStaleBuckets(t *testing.T) {
 
 // ---- Status 辅助 ----
 
-func TestAutobanBannedToday_countsTodayAutobanEntries(t *testing.T) {
+// 观察模式建议展示截断（2026-10-15 用户裁定）：/status 建议列表按 Count 降序
+// Top 50——dry-run 洪峰下逐行渲染有界；审计/TaskLogf 走 candidates 全量，
+// 不受展示截断影响。
+func TestAutobanSuggestions_displayTruncatedToTop50(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
+	var seeds []AutobanSuggestion
+	for i := 60; i >= 1; i-- {
+		seeds = append(seeds, AutobanSuggestion{IP: fmt.Sprintf("10.0.0.%d", i), Count: i})
+	}
+	autobanSetSuggestions(seeds) // 喂入已降序——getter 仍负责降序+截断（防任意顺序依赖）
+
+	got := AutobanSuggestions()
+	if len(got) != 50 {
+		t.Fatalf("建议展示条数=%d, want 50（Top 50 截断）", len(got))
+	}
+	if got[0].IP != "10.0.0.60" || got[0].Count != 60 {
+		t.Fatalf("首行=%s/%d, want 10.0.0.60/60（按 Count 降序）", got[0].IP, got[0].Count)
+	}
+	if got[49].IP != "10.0.0.11" || got[49].Count != 11 {
+		t.Fatalf("末行=%s/%d, want 10.0.0.11/11", got[49].IP, got[49].Count)
+	}
+}
+
+// 建议窗口时间：WindowStart=窗口内首次命中、LastSeen=末次命中（feed 更新点
+// 记录），候选/建议携带供前端展示「窗口内首末时间」。
+func TestAutobanSuggestions_carryWindowFirstAndLastSeen(t *testing.T) {
+	f := installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 2, 5, "1h", "all", false)
+	autobanObserveEvent("203.0.113.7", "blocked", "941100")
+	f.Advance(2 * time.Minute)
+	autobanObserveEvent("203.0.113.7", "blocked", "941100")
+
+	cands := autobanCandidates(2, 5*time.Minute)
+	if len(cands) != 1 {
+		t.Fatalf("候选数=%d, want 1", len(cands))
+	}
+	first := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
+	last := time.Date(2026, 10, 14, 10, 2, 0, 0, time.UTC)
+	if !cands[0].WindowStart.Equal(first) {
+		t.Fatalf("WindowStart=%v, want %v（窗口内首次命中）", cands[0].WindowStart, first)
+	}
+	if !cands[0].LastSeen.Equal(last) {
+		t.Fatalf("LastSeen=%v, want %v（末次命中）", cands[0].LastSeen, last)
+	}
+}
+
+// 今日封禁=审计事件计数（2026-10-15 用户裁定）：删除条目（=解封）不回退今日
+// 计数。数据源=audit_log「自动封禁」系统动作行（created_at UTC 墙钟串），
+// 今日边界按配置时区零点换算 UTC 比较。
+func TestAutobanBannedToday_countsAuditBansOfDay(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	// 钉 UTC（默认包级 init=CST+8）：今日边界=「2026-10-14 00:00:00」UTC，
+	// 断言的 UTC 字面量与之严格对应。
+	previous := CurrentLocation().String()
+	if _, err := ConfigureLocation("UTC"); err != nil {
+		t.Fatalf("configure UTC: %v", err)
+	}
+	t.Cleanup(func() { _, _ = ConfigureLocation(previous) })
+	seedAudit := func(action, createdUTC string) {
+		t.Helper()
+		if _, err := db.AuditDB.Exec(`INSERT INTO audit_log (username, action, resource, detail, ip_address, created_at) VALUES ('system', ?, 'IP 地址列表', 'IP：x', '', ?)`,
+			action, createdUTC); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedAudit(AutobanAuditAction, "2026-10-14 01:00:00") // 今日 UTC
+	seedAudit(AutobanAuditAction, "2026-10-14 09:59:59") // 今日 UTC（边界内最后一秒）
+	seedAudit(AutobanAuditAction, "2026-10-13 23:59:59") // 昨日不计
+	seedAudit("更新", "2026-10-14 05:00:00")               // 非封禁动作不计
+	//（created_at >= 今日零点为开放上界：生产写入恒为当下时刻，无未来行形态）
+
 	seedPresetEntries(t, []models.IPListEntry{
-		{Value: "198.51.100.1", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:00:00"},
-		{Value: "198.51.100.2", Remark: AutobanEntryRemark, CreatedAt: "2026-10-13 09:00:00"},
-		{Value: "198.51.100.3", Remark: "事件处置", CreatedAt: "2026-10-14 09:00:00"},
+		{Value: "203.0.113.1", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:00:00", ExpiresAt: "2026-10-15 09:00:00"},
 	})
-	if n := AutobanBannedToday(); n != 1 {
-		t.Fatalf("今日自动封禁数=%d, want 1（仅今日+自动条目）", n)
+	if n := AutobanBannedToday(); n != 2 {
+		t.Fatalf("今日自动封禁数=%d, want 2（按审计事件计数：时区边界/昨日/非封禁均不混计）", n)
+	}
+
+	// 用户报告形状钉：封禁 → 删除条目（=解封）→ 今日封禁仍=原计数，不得清零。
+	seedPresetEntries(t, []models.IPListEntry{})
+	if n := AutobanBannedToday(); n != 2 {
+		t.Fatalf("删除条目后今日封禁不得清零：=%d, want 2", n)
 	}
 }
 

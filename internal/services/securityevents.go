@@ -172,11 +172,12 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 		Action:        "logged",
 	}
 	rec.AttributionRuleID = securityEventsFirstHeader(tx.Request.Headers, "x-lb-rule-id")
-	// 安全处理耗时（2026-09-27 分段计时）：blocked_counter 注入的 timing ID 在
-	// 请求头里,coraza 审计日志天然收录——按 ID+分段键查侧车文件。选值规则:
-	// 预检段规则(IP ACL/GeoIP/信任/威胁,id 1-14 与 800xxx)取 :pre(预检拦时
-	// :pre 未写,回退 :end=预检耗时);WAF 段规则(CRS 9xxxxx/自定义)取
-	// :end-:pre(隔离 WAF 评估成本,不含预检开销)。未命中保持 0,UI 显示「—」。
+	// 安全处理耗时（2026-09-27 分段计时；第 75 轮分段键二态化）：blocked_counter
+	// 注入的 timing ID 在请求头里,coraza 审计日志天然收录——按 ID+分段键查侧车
+	// 文件。选值规则:预检段规则(IP ACL/GeoIP/信任/威胁,id 1-14 与 800xxx)取
+	// :pre(预检拦由拦截写点代记,决策口径);WAF 段规则(CRS 9xxxxx/自定义)拦截
+	// 事件取 :end-:pre、logged 事件取 :end(=预检后锚点起算的 WAF 段值,见
+	// securityEventsStageDuration)。未命中保持 0,UI 显示「—」。
 	rec.RequestHeaders = securityEventsSerializeHeaders(tx.Request.Headers)
 	rec.RequestBody = securityEventsEncodeBody(tx.Request.Body)
 	if tx.IsInterrupted {
@@ -191,14 +192,15 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 	}
 	rec.AnomalyScore = securityEventsExtractAnomalyScore(doc.Messages)
 	// 安全处理耗时查表必须在 RuleTriggered 赋值之后——分段选值
-	// (securityEventsStageDuration)按规则归属选 :pre 或 :end-:pre,
+	// (securityEventsStageDuration)按规则归属与动作选 :pre/:end-:pre/:end,
 	// 空规则 ID 会恒走 WAF 分支(实测 rule 2 事件拿到 WAF 段值)。
 	if tid := securityEventsFirstHeader(tx.Request.Headers, "x-lb-security-timing-id"); tid != "" {
-		rec.DurationUs = securityEventsStageDuration(tid, rec.RuleTriggered)
+		rec.DurationUs = securityEventsStageDuration(tid, rec.RuleTriggered, tx.IsInterrupted)
 		if v, ok := securityTimingLookup(tid + ":pre"); ok {
 			rec.PrecheckUs = v
 		} else if securityEventsIsPrecheckRule(rec.RuleTriggered) {
-			rec.PrecheckUs = rec.DurationUs // 预检拦:链未到 pre 收点,duration 即预检耗时
+			// 降级形态(:pre 缺失,头对缺失/竞态):预检族 duration=兜底值,预检耗时同值
+			rec.PrecheckUs = rec.DurationUs
 		}
 	}
 	return rec, nil
@@ -1600,10 +1602,16 @@ func securityEventsIsPrecheckRule(ruleID string) bool {
 }
 
 // securityEventsStageDuration 按 timing ID+规则归属选分段耗时(µs)。
-// 预检段: :pre 优先(链到达 pre 收点),miss 回退 :end(预检拦:链未到 pre 收点,
-// blocked_counter 写的 :end 即预检耗时)。
-// WAF 段: :end-:pre(两端都有时隔离 WAF 成本);:pre miss(老形态/竞态)回退 :end。
-func securityEventsStageDuration(timingID, ruleID string) int64 {
+// 分段键二态契约（第 75 轮，与写侧 caddygeoip 分段选键/锚点交接配对）：
+//
+//	:pre=预检决策耗时(放行=timing_pre 收点记;预检拦=blocked_counter 代记);
+//	:end=拦截事件 链首→中断全链(blocked_counter) / logged 事件 预检后→链末
+//	     (timing_end 读重写后的分段锚点)=WAF 段值。
+//
+// 预检段规则: :pre 优先;miss 回退 :end(头对缺失/竞态降级形态)。
+// WAF 段规则按事件动作二态: 拦截(interrupted)=:end-:pre 隔离 WAF 成本;
+// logged=:end 即段值直接取用(锚点交接后减法会混入跨锚点垃圾差值)。
+func securityEventsStageDuration(timingID, ruleID string, interrupted bool) int64 {
 	if securityEventsIsPrecheckRule(ruleID) {
 		if v, ok := securityTimingLookup(timingID + ":pre"); ok {
 			return v
@@ -1615,8 +1623,14 @@ func securityEventsStageDuration(timingID, ruleID string) int64 {
 	}
 	endV, endOK := securityTimingLookup(timingID + ":end")
 	preV, preOK := securityTimingLookup(timingID + ":pre")
-	if endOK && preOK && endV >= preV {
-		return endV - preV
+	if interrupted {
+		if endOK && preOK && endV >= preV {
+			return endV - preV
+		}
+		if endOK {
+			return endV
+		}
+		return 0
 	}
 	if endOK {
 		return endV
