@@ -123,7 +123,7 @@ var toolUsage = map[string]string{
 	"get_system_task_history":      "查看指定任务的最近 50 次真实运行（开始/耗时/触发/结果）",
 	"list_system_tasks":            "查看系统全部定时/后台任务的运行状态、最近执行与下次排程（任务监控聚合视图）",
 	"trigger_system_task":          "手动触发指定任务（定时/循环/触发类）——仅主节点管理员",
-	"toggle_system_task":           "暂停/恢复指定任务的自动调度（enabled 布尔）",
+	"toggle_system_task":           "停止/恢复指定任务的自动调度（enabled 布尔）",
 	"control_system_task":          "重启常驻任务（action=restart——启停已由调度开关承担）",
 	"cancel_system_task":           "取消运行中的下载类任务（威胁库/CRS/IP2Region；已完成部分保留）",
 	"promote_cluster":              "将从节点提升为独立主节点（脱离集群）",

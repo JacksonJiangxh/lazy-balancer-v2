@@ -67,7 +67,10 @@ type Descriptor struct {
 	Run func(RunContext) error
 
 	CancelHook func() bool
-	EnabledFn  func() bool // false=暂停（引擎不调度）
+	// EnabledFn 业务开关门（F73-E 第 73 轮补全调度面消费）：false=不再调度
+	// ——tick 整分支跳过（零执行零落行零节拍推进），开关列显示「已停止」；
+	// 手动触发不受此门拦（显式用户意图）。
+	EnabledFn func() bool
 	// BootSync：Oneshot 任务在引擎初始化尾部同步执行一次（trigger=startup）
 	// ——启动型任务的唯一执行通道（曾 main.go 直调+legacy 记录旁路）。
 	BootSync   bool
@@ -762,7 +765,15 @@ func (e *Engine) tick() {
 				continue
 			}
 			slotFn := r.desc.NextSlotFn
+			enabledFn := r.desc.EnabledFn
 			r.mu.Unlock()
+			// F73-E（第 73 轮）：EnabledFn 业务门——false 时整分支跳过：不评估
+			// 槽（省 µs 级 SELECT）、不落槽缓存、零执行零落行零日志；节拍（槽
+			// 缓存每 tick 重读）天然不推进——恢复 true 后下一 tick 重读槽，到期
+			// 槽立即投递。
+			if enabledFn != nil && !enabledFn() {
+				continue
+			}
 			var next time.Time
 			if slotFn != nil {
 				next = slotFn()
@@ -779,8 +790,9 @@ func (e *Engine) tick() {
 			}
 		case KindPeriodic:
 			// 固定间隔：每轮独立执行（Run→exit→记录）；in-flight 跳过本轮。
-			// 角色不符时置零 lastCheck（不推进节拍）——角色获得后下一 tick
-			// 立即到期（U1-66-02：原实现在角色门判定前推进节拍，从节点
+			// 角色不符/业务开关关（EnabledFn=false，F73-E）时置零 lastCheck
+			// （不推进节拍）——角色获得/业务开启后下一 tick 立即到期
+			// （U1-66-02：原实现在角色门判定前推进节拍，从节点
 			// 时钟照常走，promote 后首轮要等残余 interval，最坏 6h/24h）。
 			allows := e.roleAllows(r.desc.RunsOn)
 			r.mu.Lock()
@@ -789,6 +801,7 @@ func (e *Engine) tick() {
 				continue
 			}
 			intervalFn := r.desc.IntervalFn
+			enabledFn := r.desc.EnabledFn
 			r.mu.Unlock()
 			// TASK-L4（第 69 轮）：IntervalFn 锁外求值——F-L1-68-05 同族收敛
 			// 补全（Scheduled NextSlotFn 已移锁外）。IntervalFn 若含 DB 读取
@@ -800,17 +813,23 @@ func (e *Engine) tick() {
 			if intervalFn != nil {
 				interval = intervalFn()
 			}
+			// F73-E（第 73 轮）：EnabledFn 锁外求值（F-L1-68-05/TASK-L4 同族
+			// ——wire 四族为 DB 直读形态）。false 与角色不符同款处理（U1-66-02
+			// 镜像）：到期不触发且不推进节拍（置零 lastCheck）——恢复 true 后
+			// 下一 tick 到期立即跑。在途 Run 不受门杀（门只作用于调度判定，
+			// 当前轮跑完、下一轮才停）。
+			enabled := enabledFn == nil || enabledFn()
 			r.mu.Lock()
 			due := r.loopEnabled && !r.running && (r.lastCheck.IsZero() || now.Sub(r.lastCheck) >= interval)
 			if due {
-				if allows {
+				if allows && enabled {
 					r.lastCheck = now
 				} else {
 					r.lastCheck = time.Time{}
 				}
 			}
 			r.mu.Unlock()
-			if due && allows {
+			if due && allows && enabled {
 				go func(rid string) { _, _ = e.runNow(rid, "auto", "") }(id)
 			}
 

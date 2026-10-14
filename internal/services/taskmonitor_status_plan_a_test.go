@@ -63,7 +63,7 @@ func TestCollectSystemTasks_statusColumnExecutionOnly(t *testing.T) {
 
 // cert-waiting-ca（Periodic）StatusFn 不再借用 stopped——无活跃证书任务时镜像=idle。
 func TestCertWaitingCAStatusMirror_idleWhenNoActiveJobs(t *testing.T) {
-	te := newWireTestEngine(t) // 装配 16 任务族（空库：无活跃证书任务）
+	te := newWireTestEngine(t) // 装配 17 任务族（空库：无活跃证书任务）
 	for _, m := range te.DescribeAll() {
 		if m.ID != "cert-waiting-ca" {
 			continue

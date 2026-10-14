@@ -35,8 +35,8 @@ func TestIPListsSystemColumn_seededThreatLists(t *testing.T) {
 		}
 		got = append(got, name)
 	}
-	if len(got) != 3 {
-		t.Fatalf("system lists=%d %v, want 3", len(got), got)
+	if len(got) != 4 {
+		t.Fatalf("system lists=%d %v, want 4（三威胁源 + 自动封禁名单，F73-A）", len(got), got)
 	}
 
 	// 幂等：二次迁移不重复种子
@@ -47,8 +47,8 @@ func TestIPListsSystemColumn_seededThreatLists(t *testing.T) {
 	if err := database.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE system=1`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 3 {
-		t.Fatalf("count=%d after re-seed, want 3", count)
+	if count != 4 {
+		t.Fatalf("count=%d after re-seed, want 4", count)
 	}
 }
 
@@ -75,7 +75,7 @@ func TestIPListsSystemColumn_legacyMigration(t *testing.T) {
 	if err := database.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE system=1`).Scan(&count); err != nil {
 		t.Fatalf("system column missing after migration: %v", err)
 	}
-	if count != 3 {
-		t.Fatalf("migrated system lists=%d, want 3", count)
+	if count != 4 {
+		t.Fatalf("migrated system lists=%d, want 4", count)
 	}
 }

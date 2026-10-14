@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -248,6 +249,9 @@ type ipListRow struct {
 	UpdatedAt   string            `json:"updated_at"`
 	// System=内置只读名单（威胁情报库三源，v2.3.2 名单化）——前端据此只读化。
 	System bool `json:"system"`
+	// PresetAutoban=预置「自动封禁名单」（F73-A）：system=1 但条目可改/禁删
+	// ——前端据此渲染编辑形态与解封/到期列（与威胁名单只读形态区分）。
+	PresetAutoban bool `json:"preset_autoban"`
 }
 
 // loadIPListRefPolicies 一次查询全部策略的两列 refs 并在 Go 侧解析引用关系。
@@ -344,9 +348,12 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 		}
 		// v2.3.2 弹框性能重构：列表载荷不再内联 entries（大名单 1.4 万条
 		// 会背 ~460KB/行）；弹框经 GET /security/ip-lists/:id 按需拉取。
-		if row.System {
+		// F73-A：自动封禁预置名单（system=1 但条目在 DB）不适用威胁库条数
+		// 覆写——threatCounts 无该名会得到 0 假空；条数取 json_array_length 真值。
+		if row.System && row.Name != services.AutobanPresetListName {
 			row.EntryCount = threatCounts[row.Name] // 条数以 threat_sources 为准
 		}
+		row.PresetAutoban = row.System && row.Name == services.AutobanPresetListName
 		row.RefPolicies = refs[int64(row.ID)]
 		if row.RefPolicies == nil {
 			row.RefPolicies = []ipListRefPolicy{}
@@ -376,7 +383,10 @@ func (h *Handlers) GetIPList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	if row.System {
+	// F73-A：预置自动封禁名单（system=1 但条目在 DB）走自定义分支——威胁文件
+	// 读取对该名恒失败（未映射威胁源）会让弹框 500。
+	row.PresetAutoban = row.System && row.Name == services.AutobanPresetListName
+	if row.System && !row.PresetAutoban {
 		// RDB 文件化: 系统列表条目从 .iplist 文件读取
 		vals, ferr := services.ReadThreatIplistForUI(row.Name)
 		if ferr != nil {
@@ -498,8 +508,15 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 		return
 	}
 	// 内置只读名单（威胁情报库，system=1）：内容只读，由更新任务独占维护。
-	if system != 0 {
+	// F73-A 例外：自动封禁预置名单条目可改（手动追加/解封经弹框），但名称
+	// 锁定——自动封禁任务按名单名定位预置行，改名即失联。
+	autobanPreset := system != 0 && name == services.AutobanPresetListName
+	if system != 0 && !autobanPreset {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "内置名单只读，由威胁情报库更新任务维护"})
+		return
+	}
+	if autobanPreset && req.Name != nil && *req.Name != name {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "自动封禁名单为预置名单，名称不可修改"})
 		return
 	}
 	if req.Name != nil {
@@ -608,11 +625,18 @@ func (h *Handlers) DeleteIPList(c *gin.Context) {
 		return
 	}
 	var system int
-	if err := tx.QueryRowContext(c.Request.Context(), "SELECT COALESCE(system,0) FROM security_ip_lists WHERE id=?", id).Scan(&system); err != nil {
+	var listName string
+	if err := tx.QueryRowContext(c.Request.Context(), "SELECT COALESCE(system,0), COALESCE(name,'') FROM security_ip_lists WHERE id=?", id).Scan(&system, &listName); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
 	if system != 0 {
+		// F73-A：预置「自动封禁名单」禁删（自动封禁任务按名定位+策略引用目标），
+		// 与威胁名单只读门文案区分——放行路径=移除对应条目。
+		if listName == services.AutobanPresetListName {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "自动封禁名单为预置名单，不可删除（如需放行请移除对应条目）"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "内置名单只读，由威胁情报库更新任务维护"})
 		return
 	}
@@ -679,9 +703,9 @@ func (h *Handlers) DeleteIPList(c *gin.Context) {
 			return
 		}
 	}
-	// 快照名称与条目数须在 DELETE 前取（同事务内删除后行已不可见）
-	var delName, delEntries string
-	_ = tx.QueryRowContext(c.Request.Context(), "SELECT COALESCE(name,''), COALESCE(entries,'[]') FROM security_ip_lists WHERE id=?", id).Scan(&delName, &delEntries)
+	// 快照条目数须在 DELETE 前取（名称已在前置门 listName 取得；同事务无写点）
+	var delEntries string
+	_ = tx.QueryRowContext(c.Request.Context(), "SELECT COALESCE(entries,'[]') FROM security_ip_lists WHERE id=?", id).Scan(&delEntries)
 	var delParsed []models.IPListEntry
 	_ = json.Unmarshal([]byte(delEntries), &delParsed)
 	result, err := tx.ExecContext(c.Request.Context(), "DELETE FROM security_ip_lists WHERE id=?", id)
@@ -695,7 +719,7 @@ func (h *Handlers) DeleteIPList(c *gin.Context) {
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "删除",
-		AuditDetail: fmt.Sprintf("名称：%s（#%s，%d 条）", delName, id, len(delParsed)),
+		AuditDetail: fmt.Sprintf("名称：%s（#%s，%d 条）", listName, id, len(delParsed)),
 		SuccessMsg:  "IP 地址列表已删除",
 	})
 }
@@ -734,8 +758,12 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 		return
 	}
 	if system != 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "内置名单只读，由威胁情报库更新任务维护"})
-		return
+		// F73-A 例外：自动封禁预置名单允许手动追加（手动封禁条目，任务 merge
+		// 永不挤出）；威胁情报名单保持只读。
+		if listName != services.AutobanPresetListName {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "内置名单只读，由威胁情报库更新任务维护"})
+			return
+		}
 	}
 	var entries []models.IPListEntry
 	if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
@@ -752,11 +780,17 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 			return
 		}
 	}
+	// 预置名单手动追加条目的默认备注：手动封禁（任务 merge 的挤出豁免判据
+	// 是 remark=自动封禁，手动条目天然豁免；备注区分来源便于面板展示）。
+	newEntryRemark := "事件处置"
+	if system != 0 {
+		newEntryRemark = services.AutobanManualUnbanRemark
+	}
 	if len(entries) >= ipListMaxEntries {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("条目数量不能超过 %d 条", ipListMaxEntries)})
 		return
 	}
-	entries = append(entries, models.IPListEntry{Value: req.Value, Remark: "事件处置"})
+	entries = append(entries, models.IPListEntry{Value: req.Value, Remark: newEntryRemark})
 	mergedJSON, err := json.Marshal(entries)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
@@ -815,8 +849,13 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 		return
 	}
 	if system != 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "内置名单只读，由威胁情报库更新任务维护"})
-		return
+		// F73-A 例外：自动封禁预置名单允许手动解封（移除=解封，同事务写
+		// autoban_suppressed 抑制表 30 天，防「解封→下轮立即重封」拉锯）；
+		// 威胁情报名单保持只读。
+		if listName != services.AutobanPresetListName {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "内置名单只读，由威胁情报库更新任务维护"})
+			return
+		}
 	}
 	var entries []models.IPListEntry
 	if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
@@ -849,10 +888,79 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
+	if system != 0 {
+		// 预置名单解封抑制：与条目移除同事务原子落库（抑制表在主库）。
+		if _, err := tx.ExecContext(c.Request.Context(), `INSERT INTO autoban_suppressed (ip, suppressed_until) VALUES (?, ?)
+			ON CONFLICT(ip) DO UPDATE SET suppressed_until=excluded.suppressed_until`,
+			req.Value, time.Now().UTC().Add(services.AutobanSuppressWindow()).Format(services.AutobanTimeLayout)); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "写入解封抑制失败: " + err.Error()})
+			return
+		}
+	}
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "写入",
 		AuditDetail: fmt.Sprintf("名称：%s（#%s）移除 IP %s（现共 %d 条）", listName, id, req.Value, len(kept)),
 		SuccessMsg:  "已移除",
 		Data:        gin.H{"removed": true},
 	})
+}
+
+// ExportIPList GET /security/ip-lists/:id/export：名单导出为 TXT（每行
+// 「IP/CIDR 备注」，备注为空仅 IP）。自定义名单读 DB entries；威胁名单
+// （entries 空）回退读 .iplist 文件条目（无备注列，仅 IP）。文本附件下载
+// （Content-Disposition），读路径全员可用（business 组）。
+func (h *Handlers) ExportIPList(c *gin.Context) {
+	id := c.Param("id")
+	var name, entriesJSON string
+	var system int
+	err := db.DB.QueryRowContext(c.Request.Context(),
+		`SELECT COALESCE(name,''), COALESCE(entries,'[]'), COALESCE(system,0) FROM security_ip_lists WHERE id=?`, id).
+		Scan(&name, &entriesJSON, &system)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "IP 地址列表不存在"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+		return
+	}
+	var entries []models.IPListEntry
+	if system == 0 || entriesJSON != "" && entriesJSON != "[]" {
+		// 自定义名单/自动封禁名单：DB entries（空串/畸形按空导出）。
+		_ = json.Unmarshal([]byte(entriesJSON), &entries)
+	}
+	if len(entries) == 0 && system == 1 {
+		// 威胁名单（RDB 文件化，entries 恒空）：导出 .iplist 文件条目；
+		// 文件缺失（源禁用/未更新）按空导出，不阻断下载。
+		if vals, ferr := services.ReadThreatIplistForUI(name); ferr == nil {
+			for _, v := range vals {
+				entries = append(entries, models.IPListEntry{Value: v})
+			}
+		}
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		v := strings.TrimSpace(e.Value)
+		if v == "" {
+			continue
+		}
+		b.WriteString(v)
+		if remark := strings.TrimSpace(e.Remark); remark != "" {
+			b.WriteString(" ")
+			b.WriteString(remark)
+		}
+		b.WriteString("\n")
+	}
+	filename := "ip-list-export.txt"
+	if name != "" {
+		filename = "ip-list-" + strconv.Itoa(safeAtoiOrZero(id)) + ".txt"
+	}
+	c.Header("Content-Disposition", `attachment; filename="`+filename+`"`)
+	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(b.String()))
+}
+
+// safeAtoiOrZero 导出文件名用的宽松 id 解析（路由段恒为数字，畸形归 0）。
+func safeAtoiOrZero(s string) int {
+	n, _ := strconv.Atoi(s)
+	return n
 }

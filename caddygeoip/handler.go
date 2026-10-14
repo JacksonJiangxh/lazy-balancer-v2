@@ -170,7 +170,8 @@ func (h *GeoIPHandler) Cleanup() error {
 // setGeoIPPlaceholders resolves the client IP against the database and
 // publishes the country fields on the request replacer. v2.2.0 起同值镜像为
 // X-LB-GeoIP-* 请求头（含 fail-closed 空串哨兵），供下游 coraza 的 GeoIP
-// SecRule 匹配；X-LB-GeoIP-Loc 是地域规则匹配键：海外/省/省-市（详见下方）。
+// SecRule 匹配；X-LB-GeoIP-Loc 是地域规则匹配键：国名/省/省-市，海外为
+// 解析失败与非国家值的兜底（详见下方）。
 func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	ctx := r.Context()
 	// R72 二十六次 D1（裁决：fail-closed 哨兵）：不可解析客户端（全部 IPv6 流量、
@@ -178,8 +179,9 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	// 错 → match=false → deny 模式地域拦截对 IPv6 静默零强制。现恒发全部变量，
 	// 空串哨兵下：海外项 country_name != "中国" 对空串成立（IPv6 按海外处理，
 	// 与 R57 fail-closed 立场一致）；省/市项对空串恒不匹配（不误伤）。
-	// 头镜像同语义：X-LB-GeoIP-Loc 哨兵恒为「海外」（承载 fail-closed 海外裁决），
-	// 省/市空串对 coraza 锚定正则（^(?:...)$）恒不匹配。
+	// 头镜像同语义：X-LB-GeoIP-Loc 先置「海外」哨兵（承载 fail-closed 海外裁决
+	// ——不可解析客户端保此值）；已解析行随后覆盖为国名（海外）或省/省-市（国内，
+	// 域 G 第 73 轮）。省/市空串对 coraza 锚定正则（^(?:...)$）恒不匹配。
 	caddyhttp.SetVar(ctx, "geoip.country_name", "")
 	caddyhttp.SetVar(ctx, "geoip.region", "")
 	caddyhttp.SetVar(ctx, "geoip.province", "")
@@ -232,15 +234,21 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	caddyhttp.SetVar(ctx, "geoip.city", city)
 	r.Header.Set("X-LB-GeoIP-City", city)
 	// X-LB-GeoIP-Loc：地域规则匹配键（coraza SecRule 的锚定正则全值目标）。
-	// 国家列非「中国」（含空/0/海外国名，与 D1 fail-closed 哨兵同口径）→
-	// 「海外」；国内 → 省 或 省/市（均为规范化值，与策略选项树同源，
-	// BuildCorazaDirectives 的 geoipLocOperator 按同形态编译条目）。
-	if fields[0] != "中国" {
-		r.Header.Set("X-LB-GeoIP-Loc", "海外")
-	} else if city != "" {
-		r.Header.Set("X-LB-GeoIP-Loc", province+"/"+city)
+	// 国内 → 省 或 省/市（均为规范化值，与策略选项树同源，BuildCorazaDirectives
+	// 的 geoipLocOperator 按同形态编译条目）；海外 → 归一化国名（域 G，第
+	// 73 轮——已解析海外行细化到国家，与选项树 Countries 同源同归一）；
+	// 国家列不可解析为国名（空/0/Reserved 非国家值）→「海外」哨兵，与 D1
+	// fail-closed 哨兵同口径（deny+海外仍拦此类客户端）。
+	if fields[0] == "中国" {
+		if city != "" {
+			r.Header.Set("X-LB-GeoIP-Loc", province+"/"+city)
+		} else {
+			r.Header.Set("X-LB-GeoIP-Loc", province)
+		}
+	} else if country := geoipnames.NormalizeCountry(fields[0]); country != "" {
+		r.Header.Set("X-LB-GeoIP-Loc", country)
 	} else {
-		r.Header.Set("X-LB-GeoIP-Loc", province)
+		r.Header.Set("X-LB-GeoIP-Loc", "海外")
 	}
 }
 

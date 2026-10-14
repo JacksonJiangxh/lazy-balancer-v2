@@ -298,9 +298,9 @@ func TestListIPLists_refCountsAndRefPolicies(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	// 16 个夹具行 + 3 个 system=1 内置名单种子（v2.3.2 名单化）
-	if resp.Code != 0 || len(resp.Data) != 19 {
-		t.Fatalf("code=%d rows=%d, want 19 rows（16 夹具 + 3 内置名单）", resp.Code, len(resp.Data))
+	// 16 个夹具行 + 4 个 system=1 内置名单种子（v2.3.2 名单化 + F73-A 自动封禁名单）
+	if resp.Code != 0 || len(resp.Data) != 20 {
+		t.Fatalf("code=%d rows=%d, want 20 rows（16 夹具 + 4 内置名单）", resp.Code, len(resp.Data))
 	}
 	for _, row := range resp.Data {
 		if int64(row.ID) == target {

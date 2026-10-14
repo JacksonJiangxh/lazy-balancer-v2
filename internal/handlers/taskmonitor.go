@@ -116,7 +116,7 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 
 // ToggleSystemTask 调度开关（admin；body {"enabled": bool}）。
 // v2.0：统一路由引擎循环开关（StartLoop/StopLoop）——Kind 决定语义：
-// 定时=暂停/恢复排程；循环=暂停/恢复循环；常驻=启停自管理循环；
+// 定时/循环=停止/恢复调度；常驻=启停自管理循环；
 // 触发=不可调度（前端显示禁用开关）。
 func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 	id := c.Param("id")
@@ -142,8 +142,8 @@ func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已恢复 " + m.Name + " 调度"})
 			} else {
 				te.StopLoop(id)
-				recordAudit(c, "暂停", "任务监控", m.Name+" 调度")
-				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已暂停 " + m.Name + " 调度"})
+				recordAudit(c, "停止", "任务监控", m.Name+" 调度")
+				c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已停止 " + m.Name + " 调度"})
 			}
 			return
 		}

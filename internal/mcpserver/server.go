@@ -34,7 +34,7 @@ type toolSpec struct {
 
 const controlTaskSchema = `{"type":"object","required":["action"],"properties":{"action":{"type":"string","enum":["start","stop","restart"],"description":"启动/停止/重启"}}}`
 
-const toggleTaskSchema = `{"type":"object","required":["enabled"],"properties":{"enabled":{"type":"boolean","description":"true=恢复 false=暂停"}}}`
+const toggleTaskSchema = `{"type":"object","required":["enabled"],"properties":{"enabled":{"type":"boolean","description":"true=恢复 false=停止"}}}`
 
 var tools = []toolSpec{
 	{"list_rules", "列出全部负载均衡规则", http.MethodGet, "/rules", nil, nil, emptySchema},
@@ -132,7 +132,7 @@ var tools = []toolSpec{
 	{"get_system_task_logs", "任务文本日志（尾部 256KB）", http.MethodGet, "/system/tasks/{id}/logs", []string{"id"}, nil, idSchema("id", "任务 ID", "string")},
 	{"get_system_task_history", "任务运行历史（task_runs 时间倒序）", http.MethodGet, "/system/tasks/{id}/history", []string{"id"}, nil, idSchema("id", "任务 ID", "string")},
 	{"trigger_system_task", "手动触发任务（全部非常驻任务族——以 GET /system/tasks 的 triggerable 字段为准；证书队列行用 cert-job:<job_id>）", http.MethodPost, "/system/tasks/{id}/trigger", []string{"id"}, nil, idSchema("id", "任务 ID（见 GET /system/tasks 的 can_trigger 族）", "string")},
-	{"toggle_system_task", "统一调度开关（定时=排程暂停/循环=循环暂停/常驻=启停；触发类不可调度）", http.MethodPost, "/system/tasks/{id}/toggle", []string{"id"}, nil, toggleTaskSchema},
+	{"toggle_system_task", "统一调度开关（定时/循环=停止/恢复调度、常驻=启停；触发类不可调度）", http.MethodPost, "/system/tasks/{id}/toggle", []string{"id"}, nil, toggleTaskSchema},
 	{"cancel_system_task", "取消运行中任务（仅下载类）", http.MethodPost, "/system/tasks/{id}/cancel", []string{"id"}, nil, idSchema("id", "任务 ID", "string")},
 	{"control_system_task", "重启常驻任务（action=restart——启停已由调度开关承担）", http.MethodPost, "/system/tasks/{id}/control", []string{"id"}, nil, controlTaskSchema},
 	{"update_cluster_settings", "更新集群同步设置", http.MethodPut, "/cluster/settings", nil, nil, bodySchema},

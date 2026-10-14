@@ -12,6 +12,8 @@
 // 城市级地域规则静默恒不命中）由单源根治，修改只改本包一处。
 package geoipnames
 
+import "strings"
+
 // ProvinceAliases 省列别名规范化（R72 二十三次）：xdb 原始省列存在双形态
 // （上海/上海市、广西/广西壮族自治区）、台湾城市误入省列（台中市等）与个别
 // 乱码（UEruemqi）。选项树与 CEL 发射变量统一用规范名，两边一致才能命中。
@@ -88,4 +90,36 @@ var AutonomousPrefectures = map[string]string{
 	"临夏": "临夏回族自治州", "甘南": "甘南藏族自治州",
 	// 地区（1：xdb 缺「地区」后缀）
 	"大兴安岭": "大兴安岭地区",
+}
+
+// OverseasCountries 海外国家名归一表（域 G，第 73 轮）。xdb 国家列（region
+// 第 1 列）非「中国」的行发射国名：v3.18.0 实测形态为完整英文国名（240 个
+// 国家列值中 238 个 ASCII 规范名，探针全量扫描），与省列的「ASCII=拼音残片」
+// 语义不同——国名列 ASCII 是规范形态，不做 ASCII 过滤。本表只处理已知异体：
+//
+//   - 「美国」：v3.18.0 存在唯一中文段（美国国防部）与 2 万余英文段并存，
+//     折叠为规范名 United States，选项树与发射变量同归一才能命中；
+//   - 「Reserved」：文档/保留段（RFC 5737 等）不是国家，映射空串——树不入
+//     该条目、发射回落「海外」哨兵（fail-closed 兜底）。
+//
+// 未列入表的值原样通过（纯白名单过滤）：选项树收集与 CEL/头发射两侧共用
+// NormalizeCountry，同进同出，不存在「树提供某国而发射变量发另一形态」的
+// 漂移面（PLUG-N3 单源立场）。
+var OverseasCountries = map[string]string{
+	"美国":       "United States",
+	"Reserved": "",
+}
+
+// NormalizeCountry 规范 xdb 国家列原始值：空白/「0」占位与归一表映射空串的
+// 值（非国家）返回空串（调用方据此兜底「海外」哨兵/不入树）；其余原样或按
+// 归一表折叠返回。
+func NormalizeCountry(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "0" {
+		return ""
+	}
+	if canonical, ok := OverseasCountries[trimmed]; ok {
+		return canonical
+	}
+	return trimmed
 }

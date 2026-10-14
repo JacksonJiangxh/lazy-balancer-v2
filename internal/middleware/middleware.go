@@ -487,6 +487,9 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				admin.DELETE("/security/ip-lists/:id", h.DeleteIPList)
 				admin.POST("/security/ip-lists/:id/ips", h.AddIPToList)
 				admin.POST("/security/ip-lists/:id/remove-ip", h.RemoveIPFromList)
+				// 自动封禁（F73-A）：配置写/立即执行（主节点门在 handler 内）
+				admin.PUT("/security/autoban", h.UpdateAutobanConfig)
+				admin.POST("/security/autoban/run", h.RunAutobanNow)
 
 			}
 
@@ -580,6 +583,10 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				business.GET("/security/block-pages", h.ListSecurityBlockPages)
 				business.GET("/security/ip-lists", h.ListIPLists)
 				business.GET("/security/ip-lists/:id", h.GetIPList)
+				business.GET("/security/ip-lists/:id/export", h.ExportIPList)
+				// 自动封禁（F73-A）：配置/状态读（全员可见，状态卡数据源）
+				business.GET("/security/autoban", h.GetAutobanConfig)
+				business.GET("/security/autoban/status", h.GetAutobanStatus)
 				business.GET("/security/crs/rules", h.ListCRSRules)
 				business.GET("/security/crs/rule-index", h.GetCRSRuleIndex)
 				business.GET("/security/crs/rules/:filename", h.GetCRSRuleContent)

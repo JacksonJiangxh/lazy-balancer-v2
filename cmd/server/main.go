@@ -211,6 +211,7 @@ func run() error {
 		isMaster = true
 	}
 	services.SetThreatReloader(caddyReloader)
+	services.SetAutobanReloader(caddyReloader) // F73-A：自动封禁名单变化后的重载（60s 节流在 services 层）
 	services.InitThreatUpdateManager()
 	services.GetThreatUpdateManager().SetMasterRole(isMaster)
 	crsManager.SetMasterRole(isMaster)

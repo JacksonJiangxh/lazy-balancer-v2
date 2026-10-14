@@ -166,8 +166,8 @@ func TestTaskEngineWire_PeriodicIntervalAndScheduledSlotPresent(t *testing.T) {
 			scheduled++
 		}
 	}
-	if periodic != 8 {
-		t.Fatalf("periodic tasks=%d, want 8（wire.go 注册面）", periodic)
+	if periodic != 9 {
+		t.Fatalf("periodic tasks=%d, want 9（wire.go 注册面；F73-A 起 autoban 循环族）", periodic)
 	}
 	if scheduled != 4 {
 		t.Fatalf("scheduled tasks=%d, want 4（threat/crs/ip2region/auto-backup）", scheduled)

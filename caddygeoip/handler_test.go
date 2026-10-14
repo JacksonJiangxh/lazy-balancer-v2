@@ -294,6 +294,50 @@ func TestServeHTTP_overseasSentinels_forUnresolvableClient(t *testing.T) {
 	}
 }
 
+// TestServeHTTP_overseasEmitsCountryName（域 G，第 73 轮）：已解析海外行
+// X-LB-GeoIP-Loc 发射归一化国名（United States）——非「海外」哨兵；非国家
+// 值（Reserved 文档段）形态仍回落「海外」哨兵（fail-closed 兜底不变：
+// 解析失败/库缺失/非国家值按海外处理）。
+func TestServeHTTP_overseasEmitsCountryName(t *testing.T) {
+	xdb := findTestXdb()
+	if xdb == "" {
+		t.Skip("no ip2region xdb available; place one under caddygeoip/testdata/ to run this test")
+	}
+	h := &GeoIPHandler{XdbPath: xdb}
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := h.Cleanup(); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	serve := func(t *testing.T, remote string) string {
+		t.Helper()
+		repl := caddy.NewReplacer()
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
+		req.RemoteAddr = remote
+		var downstream *http.Request
+		vars := map[string]any{}
+		req = req.WithContext(context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars))
+		if err := h.ServeHTTP(httptest.NewRecorder(), req, geoipTestNext(t, &downstream)); err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+		return downstream.Header.Get("X-LB-GeoIP-Loc")
+	}
+
+	// 8.8.8.8 → "United States|California|0|Google LLC|US"：海外行发国名。
+	if got := serve(t, "8.8.8.8:12345"); got != "United States" {
+		t.Fatalf("X-LB-GeoIP-Loc = %q; want United States（已解析海外行发国名）", got)
+	}
+	// 203.0.113.10 → "Reserved|Reserved|Reserved|0|0"：非国家值回落哨兵。
+	if got := serve(t, "203.0.113.10:12345"); got != "海外" {
+		t.Fatalf("X-LB-GeoIP-Loc = %q; want 海外（Reserved 非国家，兜底哨兵）", got)
+	}
+}
+
 // TestProvision_sharedSearcherSingletonPerXdbPath（审计 M2）：同 XdbPath 的
 // 多个 handler 必须共享同一 Ip2Region 实例——每 handler 各建一份会各开 20 个
 // searcher fd（50 条 GeoIP 规则≈1000 fd 逼近 soft limit，重载期翻倍），fd 耗尽

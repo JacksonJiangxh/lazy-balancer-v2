@@ -324,7 +324,7 @@ func GetIP2RegionProvinceList() []string {
 // treeCacheRevision 地域树缓存修订号——规范化规则（映射/别名/结构）变更时
 // 递增，旧缓存据此判定过期重建。ASCII 残留探测只能发现「缓存里有脏数据」，
 // 发现不了「该有而没有」的条目（如 r25 前整段被丢的 新疆/乌鲁木齐市）。
-const treeCacheRevision = "r26" // r26：自治州简称→全称（大理→大理白族自治州）
+const treeCacheRevision = "r27" // r27：海外分支收集国家名（Countries）——旧缓存静默缺国名集，必须重建
 
 // normalizeIP2Province 把 xdb 省列原始值规范化为规范省名：别名表归一（上海→
 // 上海市）、带「省」后缀原样通过；其余候选（精简 fixture 的「广东」、潜在非
@@ -370,14 +370,20 @@ func normalizeIP2City(raw string) string {
 }
 
 // IP2RegionRegionTree 地域树（R72 二十三次，用户裁决：区域精确到市）：省级
-// 列表 + 省→城市集映射，海外统一定为一级条目（不细分国家）。数据源为 xdb
-// 段索引全量扫描（每段 14B：startIP 4 + endIP 4 + dataLen 2 + dataPtr 4），
+// 列表 + 省→城市集映射；「海外」哨兵仍为一级条目（Provinces 末位，承载
+// 解析失败/库缺失的 fail-closed 兜底），域 G（第 73 轮）起海外已解析行细化
+// 为国家集（Countries——xdb 国家列归一后去重排序）。数据源为 xdb 段索引
+// 全量扫描（每段 14B：startIP 4 + endIP 4 + dataLen 2 + dataPtr 4），
 // region 数据按 dataPtr 去重读取（大量段共享同一 region 指针，实际读取量为
 // 唯一 region 数，远小于 77.5 万段）。
 type IP2RegionRegionTree struct {
 	Revision  string              `json:"revision,omitempty"`
 	Provinces []string            `json:"provinces"`
 	Cities    map[string][]string `json:"cities"`
+	// Countries：海外国家名集（域 G）——归一表折叠异体（美国→United States）、
+	// 剔除非国家值（Reserved/0/空）；v3.18.0 实测 238 国。前端「海外国家」
+	// 分组、校验 known 集、geoipLocOperator 精确集三处消费。
+	Countries []string `json:"countries"`
 	// DroppedASCIIProvinces / DroppedASCIICities：扫描中因不在映射表而被过滤的
 	// ASCII 省/城市段数（宁缺勿乱）。当前 v3.17.0 实测均为 0；未来 xdb 版本
 	// 新增拼音/乱码段时计数 >0 并进重建日志——丢失可见而非静默。
@@ -416,6 +422,7 @@ func regionTreeFromXDB(path string) *IP2RegionRegionTree {
 	}
 	seg := make([]byte, 14)
 	provinces := map[string]bool{}
+	countries := map[string]bool{}
 	cities := map[string]map[string]bool{}
 	var droppedASCIIProvinces, droppedASCIICities int
 	seen := map[uint32]bool{}
@@ -438,7 +445,13 @@ func regionTreeFromXDB(path string) *IP2RegionRegionTree {
 			continue
 		}
 		if strings.TrimSpace(fields[0]) != "中国" {
-			continue // 海外统一一级条目，不细分
+			// 域 G（第 73 轮）：海外行收集归一化国名（异体折叠/非国家值剔
+			// 除，见 geoipnames.OverseasCountries）；「海外」哨兵仍由 Provinces
+			// 末位承载（解析失败/库缺失兜底），已解析海外行发射国名。
+			if country := geoipnames.NormalizeCountry(fields[0]); country != "" {
+				countries[country] = true
+			}
+			continue
 		}
 		prov := normalizeIP2Province(fields[1])
 		if prov == "" {
@@ -482,6 +495,7 @@ func regionTreeFromXDB(path string) *IP2RegionRegionTree {
 		Revision:              treeCacheRevision,
 		Provinces:             make([]string, 0, len(provinces)+1),
 		Cities:                make(map[string][]string, len(cities)),
+		Countries:             make([]string, 0, len(countries)),
 		DroppedASCIIProvinces: droppedASCIIProvinces,
 		DroppedASCIICities:    droppedASCIICities,
 	}
@@ -489,10 +503,15 @@ func regionTreeFromXDB(path string) *IP2RegionRegionTree {
 		tree.Provinces = append(tree.Provinces, prov)
 	}
 	sort.Strings(tree.Provinces)
-	// 海外统一为一级条目（用户裁决：不区分国家/省市），固定末位——「海外」
-	// 的 UTF-8 字节序落在中文省名中间，参与排序会插在省份列表中间；校验端
-	// known 集合不依赖顺序，选项树展示与采样列表口径一致（海外恒在最后）。
+	// 海外哨兵仍为一级条目（域 G 保留）：固定末位——「海外」的 UTF-8 字节序
+	// 落在中文省名中间，参与排序会插在省份列表中间；校验端 known 集合不依赖
+	// 顺序，选项树展示与采样列表口径一致（海外恒在最后）。已解析海外行的
+	// 国家粒度由 Countries 承载（哨兵=解析失败/库缺失兜底，国家=已解析）。
 	tree.Provinces = append(tree.Provinces, "海外")
+	for country := range countries {
+		tree.Countries = append(tree.Countries, country)
+	}
+	sort.Strings(tree.Countries)
 	for prov, set := range cities {
 		list := make([]string, 0, len(set))
 		for city := range set {
@@ -582,6 +601,13 @@ func staleRegionTreeCache(path string) bool {
 			}
 		}
 	}
+	// 域 G：国名条目为英文（ASCII 是规范形态）不做 ASCII 过滤；空串条目
+	//（带外手改形态）判过期——空精确条目会让 geoipLocOperator 匹配空串 Loc。
+	for _, country := range tree.Countries {
+		if country == "" {
+			return true
+		}
+	}
 	return false
 }
 
@@ -606,7 +632,7 @@ func writeRegionTreeCache(tree *IP2RegionRegionTree) {
 	for _, cities := range tree.Cities {
 		cityTotal += len(cities)
 	}
-	WriteIP2RegionUpdateLog("INFO", "idle", fmt.Sprintf("地域树缓存已重建：%d 省级 / %d 城市（未映射 ASCII 段已过滤：省 %d / 城市 %d）", len(tree.Provinces), cityTotal, tree.DroppedASCIIProvinces, tree.DroppedASCIICities))
+	WriteIP2RegionUpdateLog("INFO", "idle", fmt.Sprintf("地域树缓存已重建：%d 省级 / %d 城市 / %d 海外国家（未映射 ASCII 段已过滤：省 %d / 城市 %d）", len(tree.Provinces), cityTotal, len(tree.Countries), tree.DroppedASCIIProvinces, tree.DroppedASCIICities))
 }
 
 // RebuildRegionTreeCacheForSync 供集群同步/lbbak 导入路径在 xdb 变更后调用
