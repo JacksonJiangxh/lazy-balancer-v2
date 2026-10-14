@@ -136,14 +136,14 @@ interface PolicyDetail {
 
 const props = defineProps<{ ip: string; location: string; ruleCaddyId?: string }>()
 
-// 紧凑归属地：国内只显市/海外恒「海外」/保留地址原样，弹窗/悬浮显示完整
+// 紧凑归属地：国内只显市/海外显国家（2026-10-13 用户裁定确认，覆盖 2026-09-13
+// 「海外恒显海外」旧裁定——GeoIP 海外国家细化配套）/保留地址原样，弹窗/悬浮
+// 显示完整
 const compactLocation = computed(() => {
   if (!props.location) return ''
   const parts = props.location.split('·').map(s => s.trim()).filter(Boolean)
-  // 分类先行（用户裁定 2026-09-13）：海外列表恒显「海外」（不显示国家/城市/
-  // ISP，完整精度仅弹框）；保留地址原样；国内只显市（下方细分）
   if (parts[0] === '保留地址') return '保留地址'
-  if (parts[0] !== '中国') return '海外'
+  if (parts[0] !== '中国') return parts[0]
   // 国内只显市(用户裁定 2026-09-13):三段+取第三段市(如「中国·广东·深圳」→
   // 「深圳」;自治区「中国·新疆·乌鲁木齐」→「乌鲁木齐」);两段取第二段省
   // (「中国·山东」→「山东」;「中国·新疆」→「新疆」);单段「中国」保持(防空标签)
