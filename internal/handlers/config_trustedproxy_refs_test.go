@@ -101,7 +101,7 @@ func TestUpdateConfig_trustedProxyRefs_rejectsMissingList(t *testing.T) {
 
 func TestUpdateConfig_trustedProxyRefs_rejectsOverTotalCap(t *testing.T) {
 	router := newTrustedProxyRefsRouter(t)
-	// 2001 条有效条目（直插绕过 500 条形状门——总上限门独立于写侧形状门）
+	// 2001 条有效条目（直插绕过 2000 条形状门——总上限门独立于写侧形状门）
 	entries := make([]string, 0, 2001)
 	for i := range 2001 {
 		entries = append(entries, fmt.Sprintf(`{"value":"10.1.%d.%d/24","remark":""}`, i/250, i%250))

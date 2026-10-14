@@ -3,10 +3,13 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestFormatIP2RegionLocation(t *testing.T) {
@@ -22,8 +25,12 @@ func TestFormatIP2RegionLocation(t *testing.T) {
 		{"province only", "中国|山东省|0|0|CN", "中国·山东"},
 		{"unknown province city", "中国|0|0|0|CN", "中国"},
 		{"overseas country only", "美国|0|0|0|US", "美国"},
-		{"overseas with region and idc", "United States|California|0|Google LLC|US", "United States·California·Google LLC"},
-		{"overseas with city and idc", "Australia|Queensland|Brisbane|Cloudflare|AU", "Australia·Queensland·Brisbane·Cloudflare"},
+		{"overseas with region and idc", "United States|California|0|Google LLC|US", "美国·California·Google LLC"},
+		{"overseas with city and idc", "Australia|Queensland|Brisbane|Cloudflare|AU", "澳大利亚·Queensland·Brisbane·Cloudflare"},
+		{"overseas full shape", "Japan|Tokyo|Shibuya|NTT|JP", "日本·Tokyo·Shibuya·NTT"},
+		// 未收录国名回退原名（CountryChinese 兜底语义——未来 xdb 新增国名
+		// 优雅降级英文，不产生死条目/空段）。
+		{"overseas unmapped fallback", "Xanadu|Region|City|0|XX", "Xanadu·Region·City"},
 		{"reserved v4 from xdb", "Reserved|Reserved|Reserved|0|0", "保留地址"},
 		{"unknown region", "0|0|0|0|0", ""},
 		{"empty", "", ""},
@@ -75,6 +82,50 @@ func TestEnrichIPLocation_emptyWithoutDatabaseNeverErrors(t *testing.T) {
 	}
 	if got := enrichIPLocation(""); got != "" {
 		t.Fatalf("enrichIPLocation(empty ip)=%q, want empty", got)
+	}
+}
+
+// v2.3.7 修正：GetIP2RegionRegions 响应携带 country_names_cn——海外国家英文→
+// 中文映射（单源 geoipnames.CountryNamesCN 全表透传），前端级联「海外国家」
+// 子节点中文标签依赖此字段；provinces/cities/countries 旧形态不变（存量消费
+// 方零破坏，前端对缺失字段回退英文标签）。
+func TestGetIP2RegionRegions_carriesCountryNamesCN(t *testing.T) {
+	// Given：无 xdb 环境（树兜底形态）——zh 映射是二进制静态表，不随库装载
+	// 状态缺席，任何形态都必须在场
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/security/ip2region/regions", nil)
+
+	// When
+	h.GetIP2RegionRegions(c)
+
+	// Then：envelope 内 countries 仍是字符串数组（旧形态），country_names_cn
+	// 并行在场且代表性映射正确
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			Countries      []string          `json:"countries"`
+			CountryNamesCN map[string]string `json:"country_names_cn"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal regions response: %v", err)
+	}
+	if resp.Data.CountryNamesCN == nil {
+		t.Fatal("country_names_cn missing——前端海外国家中文标签将整体回退英文")
+	}
+	for en, want := range map[string]string{"United States": "美国", "Japan": "日本", "Russia": "俄罗斯"} {
+		if got := resp.Data.CountryNamesCN[en]; got != want {
+			t.Errorf("country_names_cn[%q]=%q; want %q", en, got, want)
+		}
+	}
+	if len(resp.Data.CountryNamesCN) != 238 {
+		t.Errorf("country_names_cn entries=%d; want 238（单源全表透传，不得截断）", len(resp.Data.CountryNamesCN))
 	}
 }
 

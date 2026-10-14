@@ -3,8 +3,9 @@
 //
 // 数据流：security-events-ingestion 提交点（securityEventsProcessPass 每批
 // Commit 后）喂 autobanObserveBatch（主节点+启用+口径+WAF 事件四重过滤）→
-// 固定桶计数器；autoban 任务（60s 循环、主节点、EnabledFn=autoban_enabled）
-// 每轮评估候选并执行「观察建议或名单 merge」。
+// 固定桶计数器；autoban 任务（60s 循环、主节点；调度唯一前提=业务启用——
+// PUT 保存联动启停，Descriptor 无 EnabledFn，Run 体首行业务门兜底）每轮
+// 评估候选并执行「观察建议或名单 merge」。
 //
 // 名单形态：预置 security_ip_lists 行（system=1，name=自动封禁名单，DB entries）。
 // 条目扩展 created_at/expires_at（RFC 墙钟串、UTC 存储）——投影层
@@ -55,8 +56,9 @@ const autobanTimeLayout = "2006-01-02 15:04:05"
 var autobanMaxTrackedIPs = 100000
 
 // AutobanListEntryCap 名单条目上限（与 handlers ipListMaxEntries 同值——
-// handlers 侧有钉测锁定相等；merge 超限时挤最早到期的自动条目）。
-var AutobanListEntryCap = 500
+// handlers 侧有钉测锁定相等；merge 超限时挤最早到期的自动条目，仍不足按
+// 容量截断新封并落「容量收敛」留痕）。2026-10-14 用户裁定设大值（500→2000）。
+var AutobanListEntryCap = 2000
 
 // AutobanDuration/Clock/Scope：配置枚举与时长换算。
 var autobanDurations = map[string]time.Duration{
@@ -203,6 +205,9 @@ func AutobanEnabled() bool {
 type autobanCounter struct {
 	Count       int
 	WindowStart time.Time
+	// Reached 本窗口内已达到过封禁阈值（计数分级日志的判据：threshold 行
+	// 每 IP 每窗口恰一行；窗口过期清零时若为真落 expire 行）。
+	Reached bool
 }
 
 // autobanFeedItem 摄取提交点的最小喂入形态。
@@ -271,29 +276,51 @@ func autobanObserveEventScoped(ip, action, ruleTriggered, scope string) {
 		return
 	}
 	now := autobanNow()
-	window := time.Duration(GetAutobanConfig().WindowMinutes) * time.Minute
+	cfg := GetAutobanConfig()
+	window := time.Duration(cfg.WindowMinutes) * time.Minute
 	if window <= 0 {
 		window = 5 * time.Minute
 	}
+	var capWarn, expiredReached, thresholdHit bool
+	var thresholdCount, thresholdWindowMin int
 	autobanMu.Lock()
-	defer autobanMu.Unlock()
 	w, exists := autobanWindows[ip]
 	if !exists {
 		if len(autobanWindows) >= autobanMaxTrackedIPs {
-			if !autobanCapWarned {
-				autobanCapWarned = true
-				Logf("warn", "自动封禁计数器达 %d 键上限，新 IP 不再计数（既有键不受影响）", autobanMaxTrackedIPs)
-			}
-			return
+			capWarn = !autobanCapWarned
+			autobanCapWarned = true
+		} else {
+			w = &autobanCounter{}
+			autobanWindows[ip] = w
 		}
-		w = &autobanCounter{}
-		autobanWindows[ip] = w
 	}
-	if w.WindowStart.IsZero() || now.Sub(w.WindowStart) >= window {
-		w.Count = 0
-		w.WindowStart = now
+	if w != nil {
+		if w.WindowStart.IsZero() || now.Sub(w.WindowStart) >= window {
+			// 窗口过期清零：曾达标 IP 落一行 expire（计数分级日志，非逐事件）。
+			expiredReached = w.Reached
+			w.Count = 0
+			w.WindowStart = now
+			w.Reached = false
+		}
+		w.Count++
+		// 首次达到阈值 → 恰一行 threshold（跨阈值后不再重复记）。
+		if !w.Reached && cfg.Threshold > 0 && w.Count >= cfg.Threshold {
+			w.Reached = true
+			thresholdHit = true
+			thresholdCount = w.Count
+			thresholdWindowMin = cfg.WindowMinutes
+		}
 	}
-	w.Count++
+	autobanMu.Unlock()
+	if capWarn {
+		Logf("warn", "自动封禁计数器达 %d 键上限，新 IP 不再计数（既有键不受影响）", autobanMaxTrackedIPs)
+	}
+	if expiredReached {
+		TaskLogf(AutobanTaskID, "expire", "IP %s 计数窗口过期，清零", ip)
+	}
+	if thresholdHit {
+		TaskLogf(AutobanTaskID, "threshold", "IP %s 达到封禁阈值（%d 次/%d 分钟）", ip, thresholdCount, thresholdWindowMin)
+	}
 }
 
 // AutobanSuggestion 观察建议/候选形态。
@@ -303,13 +330,17 @@ type AutobanSuggestion struct {
 }
 
 // autobanCandidates 评估候选：修剪过期桶后返回 count≥threshold 的 IP（计数降序，
-// 截 autobanSuggestionCap）。
+// 截 autobanSuggestionCap）。曾达标 IP 的过期桶修剪时落一行 expire（与 Feed
+// 路径同文案——窗口过期清零的唯一两条发射面）。
 func autobanCandidates(threshold int, window time.Duration) []AutobanSuggestion {
 	now := autobanNow()
+	var expiredReached []string
 	autobanMu.Lock()
-	defer autobanMu.Unlock()
 	for ip, w := range autobanWindows {
 		if !w.WindowStart.IsZero() && now.Sub(w.WindowStart) >= window {
+			if w.Reached {
+				expiredReached = append(expiredReached, ip)
+			}
 			delete(autobanWindows, ip)
 		}
 	}
@@ -327,6 +358,10 @@ func autobanCandidates(threshold int, window time.Duration) []AutobanSuggestion 
 	})
 	if len(out) > autobanSuggestionCap {
 		out = out[:autobanSuggestionCap]
+	}
+	autobanMu.Unlock()
+	for _, ip := range expiredReached {
+		TaskLogf(AutobanTaskID, "expire", "IP %s 计数窗口过期，清零", ip)
 	}
 	return out
 }
@@ -530,9 +565,15 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 			_ = victim
 			continue
 		}
-		// 手动条目占满容量：丢弃剩余新封（最早到期的自动条目已无可挤）。
-		out.DroppedNew = len(toAdd)
-		toAdd = nil
+		// 自动条目已无可挤（kept 全手动或已清空）且总量仍超限：按容量截断
+		// 新封（候选按计数降序，高计数优先保留），其余丢弃并计数入 DroppedNew
+		//（容量收敛可观测：挤出/丢弃数随本轮 WARN 行与审计行落痕）。
+		keep := AutobanListEntryCap - len(kept)
+		if keep < 0 {
+			keep = 0
+		}
+		out.DroppedNew = len(toAdd) - keep
+		toAdd = toAdd[:keep]
 		break
 	}
 
@@ -601,9 +642,21 @@ func autobanFlushPendingReload() {
 
 // ---- Run 循环 ----
 
-// RunAutobanCycle 单轮执行（引擎 autoban 任务体；手动触发同体）：
-// 修剪计数器 → 评估候选 → 观察建议或名单 merge → 审计/重载/每轮摘要行。
+// RunAutobanCycle 单轮执行（引擎 autoban 任务体）：业务门（未启用=失败+重禁
+// 调度）→ 修剪计数器 → 评估候选 → 观察建议或名单 merge → 审计/重载/每轮摘要行。
+//
+// 业务门（2026-10-14 用户裁定）：本任务只能由「启用后按配置调度执行」——
+// Descriptor 不设 EnabledFn（调度面无业务门，任务监控 enabled 列恒开，启停
+// 语义全在调度开关+事件页业务开关），未启用期间的手动开调度/手动触发到
+// Run 体首行拦下：落痕+落 failed 行+StopLoop 重禁调度，防未启用空转续跑。
 func RunAutobanCycle(rc taskengine.RunContext) error {
+	if !AutobanEnabled() {
+		if te := TaskEngine(); te != nil {
+			te.StopLoop(AutobanTaskID)
+		}
+		TaskLogf(AutobanTaskID, "manual", "手动调度，执行失败：未启用")
+		return errors.New("自动封禁未启用，已停止调度（请先在安全事件页配置中启用）")
+	}
 	cfg := GetAutobanConfig()
 	window := time.Duration(cfg.WindowMinutes) * time.Minute
 	autobanFlushPendingReload()
@@ -612,8 +665,8 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 
 	if cfg.DryRun {
 		autobanSetSuggestions(candidates)
-		TaskLogf(AutobanTaskID, "cycle", "观察模式：计数 %d IP / 达阈值 %d（阈值 %d 次/%d 分钟，口径 %s）",
-			autobanTrackedCount(), len(candidates), cfg.Threshold, cfg.WindowMinutes, autobanScopeLabel(cfg.Scope))
+		TaskLogf(AutobanTaskID, "cycle", "观察模式：计数 %d IP / 活跃 %d 个 IP / 达阈值 %d（阈值 %d 次/%d 分钟，口径 %s）",
+			autobanTrackedCount(), autobanReachedCount(), len(candidates), cfg.Threshold, cfg.WindowMinutes, autobanScopeLabel(cfg.Scope))
 		return nil
 	}
 
@@ -635,13 +688,18 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 			RecordAuditLog("system", "自动解封", "IP 地址列表",
 				fmt.Sprintf("到期自动解封 %d 个 IP：%s", len(out.Expired), strings.Join(out.Expired, "、")), "")
 		}
-		if out.Evicted > 0 {
-			Logf("warn", "自动封禁名单容量收敛：挤出 %d 条自动条目、丢弃 %d 条新封（上限 %d）", out.Evicted, out.DroppedNew, AutobanListEntryCap)
+		if out.Evicted > 0 || out.DroppedNew > 0 {
+			// 容量收敛可观测（2026-10-14 用户裁定）：发生挤出/丢弃的那轮落
+			// WARN 级任务日志行（含计数）+ 系统操作者审计行。
+			TaskLogfWarn(AutobanTaskID, "capacity", "自动封禁名单容量收敛：挤出 %d、丢弃 %d（上限 %d）",
+				out.Evicted, out.DroppedNew, AutobanListEntryCap)
+			RecordAuditLog("system", "容量收敛", "IP 地址列表",
+				fmt.Sprintf("自动封禁容量收敛：挤出 %d、丢弃 %d（上限 %d）", out.Evicted, out.DroppedNew, AutobanListEntryCap), "")
 		}
 		autobanRequestReload("名单更新")
 	}
-	TaskLogf(AutobanTaskID, "cycle", "本轮：计数 %d IP / 候选 %d / 新封 %d / 到期解封 %d / 抑制跳过 %d / 名单 %d 条%s",
-		autobanTrackedCount(), len(candidates), len(out.Banned), len(out.Expired), out.SkippedSuppressed, out.Total, reloadNote(out.Changed))
+	TaskLogf(AutobanTaskID, "cycle", "本轮：计数 %d IP / 活跃 %d 个 IP / 候选 %d / 新封 %d / 到期解封 %d / 抑制跳过 %d / 名单 %d 条%s",
+		autobanTrackedCount(), autobanReachedCount(), len(candidates), len(out.Banned), len(out.Expired), out.SkippedSuppressed, out.Total, reloadNote(out.Changed))
 	return nil
 }
 
@@ -667,6 +725,20 @@ func autobanTrackedCount() int {
 	autobanMu.Lock()
 	defer autobanMu.Unlock()
 	return len(autobanWindows)
+}
+
+// autobanReachedCount 当前窗口内已达到过封禁阈值的 IP 数（每轮摘要行
+// 「活跃 M 个 IP」——与 threshold/expire 分级行同一集合口径）。
+func autobanReachedCount() int {
+	autobanMu.Lock()
+	defer autobanMu.Unlock()
+	n := 0
+	for _, w := range autobanWindows {
+		if w.Reached {
+			n++
+		}
+	}
+	return n
 }
 
 // AutobanTrackedIPs 当前计数器键数（/status tracked_ips）。

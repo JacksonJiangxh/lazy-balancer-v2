@@ -45,6 +45,62 @@ func TestGeoipNamesTables_pinnedCountsAndSpotMappings(t *testing.T) {
 	}
 }
 
+// 海外国家中文名表（v2.3.7 修正，用户反馈：GeoIP 选择器与归属地海外行裸显
+// 英文国名）——CountryNamesCN 键集与 v3.18.0 xdb 国家列归一后的 238 个规范
+// 英文国名逐一对应（探针全量扫描实证集，dev 容器 regions.json 缓存对齐）；
+// 中文译名取 ISO 3166 常用中文简称。「中国」行走国内分支、「Reserved」行走
+// 保留地址分支，均不进本表；CountryChinese 对未收录名回退原名（未来 xdb
+// 新增国名优雅降级英文，不产生死条目）。
+func TestGeoipNames_countryChineseTableAndFallback(t *testing.T) {
+	if len(CountryNamesCN) != 238 {
+		t.Errorf("CountryNamesCN entries=%d; want 238（v3.18.0 xdb 国家列全集；表内容变动须显式更新本钉）", len(CountryNamesCN))
+	}
+	// 代表性映射钉（大/常客国家 + 非 ASCII 特殊字符键必须原样收录）
+	cases := []struct{ en, zh string }{
+		{"United States", "美国"},
+		{"Japan", "日本"},
+		{"Russia", "俄罗斯"},
+		{"United Kingdom", "英国"},
+		{"Germany", "德国"},
+		{"France", "法国"},
+		{"South Korea", "韩国"},
+		{"Singapore", "新加坡"},
+		{"Côte d'Ivoire", "科特迪瓦"},
+		{"Curaçao", "库拉索"},
+		{"Réunion", "留尼汪"},
+		{"Türkiye", "土耳其"},
+		{"Åland", "奥兰"},
+	}
+	for _, tc := range cases {
+		if got := CountryNamesCN[tc.en]; got != tc.zh {
+			t.Errorf("CountryNamesCN[%q]=%q; want %q", tc.en, got, tc.zh)
+		}
+		if got := CountryChinese(tc.en); got != tc.zh {
+			t.Errorf("CountryChinese(%q)=%q; want %q", tc.en, got, tc.zh)
+		}
+	}
+	// 无映射回退原名（导出语义：永不空串、永不改动未收录名）
+	for _, name := range []string{"China", "Reserved", "火星国", ""} {
+		if got := CountryChinese(name); got != name {
+			t.Errorf("CountryChinese(%q)=%q; want 原名回退", name, got)
+		}
+	}
+	// 键集卫生：本表只收规范英文国名——中文异体由 NormalizeCountry 前置折叠、
+	// 空串非国家，键集不得混入（含 CJK 字符的键即表被污染）。
+	for en := range CountryNamesCN {
+		if en == "" {
+			t.Error("CountryNamesCN must not contain empty key")
+			continue
+		}
+		for _, r := range en {
+			if r >= 0x4E00 && r <= 0x9FFF {
+				t.Errorf("CountryNamesCN key %q contains CJK（中文异体属 NormalizeCountry 职责，本表只收规范英文名）", en)
+				break
+			}
+		}
+	}
+}
+
 // 域 G（第 73 轮）：海外国家名归一表 + NormalizeCountry 行为钉。表内容数据
 // 驱动——dev 容器 v3.18.0 xdb 全量扫描（240 个国家列值）：238 个英文规范名
 // 原样通过、中文异体「美国」（美国国防部段）折叠为规范名、非国家值

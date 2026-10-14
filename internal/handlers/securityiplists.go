@@ -22,7 +22,7 @@ const (
 	ipListMaxDescriptionLength = 200
 	ipListMaxCategoryLength    = 32
 	ipListMaxRemarkLength      = 100
-	ipListMaxEntries           = 500
+	ipListMaxEntries           = 2000
 	ipListMaxGlobalCount       = 200
 )
 
@@ -304,7 +304,10 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 	// RDB 文件化：system=1 行 entries=''（空串非 NULL，COALESCE 不替换），
 	// json_array_length('') 会抛 malformed JSON → 500。空串归 0；威胁库真实
 	// 条数在下方由 security_threat_sources.entry_count 覆写。
-	rows, err := db.DB.Query("SELECT id, name, COALESCE(description,''), COALESCE(category,''), CASE WHEN COALESCE(entries,'')='' THEN 0 ELSE json_array_length(COALESCE(entries,'[]')) END, COALESCE(created_by,0), COALESCE(created_at,''), COALESCE(updated_by,0), COALESCE(updated_at,''), COALESCE(system,0) FROM security_ip_lists ORDER BY id")
+	// 系统名单置顶（2026-10-14 用户裁定）：内置威胁名单×3+自动封禁名单恒排
+	// 在用户自建列表之前；系统组内按更新时间序（威胁库更新任务/封禁写入会
+	// 刷新 updated_at），用户组随后；id 兜底保证确定性全序。
+	rows, err := db.DB.Query("SELECT id, name, COALESCE(description,''), COALESCE(category,''), CASE WHEN COALESCE(entries,'')='' THEN 0 ELSE json_array_length(COALESCE(entries,'[]')) END, COALESCE(created_by,0), COALESCE(created_at,''), COALESCE(updated_by,0), COALESCE(updated_at,''), COALESCE(system,0) FROM security_ip_lists ORDER BY COALESCE(system,0) DESC, updated_at DESC, id ASC")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
@@ -508,8 +511,9 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 		return
 	}
 	// 内置只读名单（威胁情报库，system=1）：内容只读，由更新任务独占维护。
-	// F73-A 例外：自动封禁预置名单条目可改（手动追加/解封经弹框），但名称
-	// 锁定——自动封禁任务按名单名定位预置行，改名即失联。
+	// F73-A 例外：自动封禁预置名单条目可改（手动追加/解封经弹框），但名称/
+	// 分类/描述三字段锁定（2026-10-14 用户裁定）——自动封禁任务按名单名定位
+	// 预置行，改名即失联；分类/描述是预置行身份的一部分，同样禁改。
 	autobanPreset := system != 0 && name == services.AutobanPresetListName
 	if system != 0 && !autobanPreset {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "内置名单只读，由威胁情报库更新任务维护"})
@@ -517,6 +521,14 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 	}
 	if autobanPreset && req.Name != nil && *req.Name != name {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "自动封禁名单为预置名单，名称不可修改"})
+		return
+	}
+	if autobanPreset && req.Category != nil && *req.Category != category {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "自动封禁名单为预置名单，分类不可修改"})
+		return
+	}
+	if autobanPreset && req.Description != nil && *req.Description != description {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "自动封禁名单为预置名单，描述不可修改"})
 		return
 	}
 	if req.Name != nil {

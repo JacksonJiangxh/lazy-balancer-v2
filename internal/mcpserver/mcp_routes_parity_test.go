@@ -129,8 +129,7 @@ var mcpUncoveredRoutes = map[string]string{
 	"POST /api/v1/security/threat-lib/update":     "手动更新威胁库（低频管理面板操作；与 CRS/IP2Region 更新端点同族未覆盖）",
 	// —— 自动封禁（F73-A）：面板状态卡/配置弹框专用面 ——
 	"GET /api/v1/security/autoban":             "自动封禁六项配置读（面板配置弹框数据源）",
-	"PUT /api/v1/security/autoban":             "自动封禁配置写（低频管理面板操作）",
-	"POST /api/v1/security/autoban/run":        "手动执行一轮自动封禁（面板状态卡按钮；任务监控 trigger 端点同语义覆盖）",
+	"PUT /api/v1/security/autoban":             "自动封禁配置写（低频管理面板操作；保存联动调度启停）",
 	"GET /api/v1/security/autoban/status":      "自动封禁运行态/今日封禁/观察建议聚合（面板状态卡轮询数据源）",
 	"GET /api/v1/security/ip-lists/:id/export": "名单 TXT 导出下载（文本附件下载，面板地址列表页操作）",
 	// —— 规则库定时调度（v2.3.x）：三库排程设置为低频管理面板操作 ——
