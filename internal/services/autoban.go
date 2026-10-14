@@ -784,3 +784,42 @@ func AutobanBannedToday() int {
 	}
 	return n
 }
+
+// AutobanPresetPolicyName 启用时自动创建的阶段 1 策略名（用户裁定 2026-10-14：
+// 帮用户建好引用自动封禁名单的 IPACL deny 策略，但不关联规则——由用户到
+// 安全策略页自行绑定到需要防护的规则）。
+const AutobanPresetPolicyName = "自动封禁 IP 黑名单"
+
+// EnsureAutobanPolicy 启用自动封禁时幂等创建预置策略：stage1 / IPACL deny /
+// ip_acl_list_refs 仅引用「自动封禁名单」/ 不绑定任何规则。已存在（按名）则
+// 跳过。返回是否新建（用于审计与响应提示）。
+func EnsureAutobanPolicy() (bool, error) {
+	var exists int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_policies WHERE name=?`, AutobanPresetPolicyName).Scan(&exists); err != nil {
+		return false, fmt.Errorf("查询自动封禁策略失败: %w", err)
+	}
+	if exists > 0 {
+		return false, nil
+	}
+	var listID int64
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=1`, AutobanPresetListName).Scan(&listID); err != nil {
+		return false, fmt.Errorf("自动封禁名单不存在: %w", err)
+	}
+	refs := fmt.Sprintf("[%d]", listID)
+	res, err := db.DB.Exec(`INSERT INTO security_policies
+		(name, description, mode, anomaly_threshold, ip_acl_mode, ip_acl_list, ip_acl_enabled, ip_whitelist, ip_whitelist_enabled, ip_blacklist,
+		 rate_limit_enabled, rate_limit_rps, rate_limit_burst, crs_rule_groups, crs_excluded_rules, custom_rules, block_page_id, block_status_code,
+		 enabled, geoip_countries, geoip_mode, waf_check_response, log_request_body, ip_acl_list_refs, ip_whitelist_refs, policy_type, trust_detection)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		AutobanPresetPolicyName, "自动封禁功能启用时创建——引用「自动封禁名单」，请关联到需要防护的规则",
+		"off", 5, "deny", "[]", 1, "[]", 0, "[]",
+		0, 0, 0, "[]", "[]", "[]", 0, 0,
+		1, "[]", "off", 0, 0, refs, "[]", "stage1", 0)
+	if err != nil {
+		return false, fmt.Errorf("创建自动封禁策略失败: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return false, nil
+	}
+	return true, nil
+}
