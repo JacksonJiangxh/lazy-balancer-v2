@@ -202,7 +202,7 @@
     <!-- 自动封禁配置弹框（F73-A）：六项配置+口径/窗口变更重置提示 -->
     <el-dialog v-model="autobanDialogVisible" width="min(600px, 94vw)" top="8vh" append-to-body class="dialog-body-inset">
       <template #header>
-        <DialogHeader :icon="Lock" title="自动封禁配置" subtitle="WAF 事件滑动窗口计数达到阈值即写入「自动封禁名单」，到期自动解封" />
+        <DialogHeader :icon="Lock" title="自动封禁配置" subtitle="WAF 事件固定窗口计数达到阈值即写入「自动封禁名单」，到期自动解封" />
       </template>
       <el-form :model="autobanForm" label-width="96px" label-position="right">
         <el-form-item label="观察模式">
@@ -460,7 +460,7 @@ const toggleAutobanEnabled = async (): Promise<void> => {
   if (autobanToggling.value || !autobanStatus.value.enabled) return
   try {
     await ElMessageBox.confirm(
-      '确认禁用自动封禁？任务调度将停止，已有封禁条目按到期时间自然解封。',
+      '确认禁用自动封禁？任务调度将停止，禁用时会立即清除已到期的封禁条目并重载生效；未到期条目保留至到期，由其后的下一次配置重载解除。',
       '禁用自动封禁',
       { confirmButtonText: '确认禁用', cancelButtonText: '取消', type: 'warning' },
     )

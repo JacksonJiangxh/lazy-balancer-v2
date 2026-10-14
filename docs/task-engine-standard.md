@@ -22,7 +22,9 @@ Scheduled: loopEnabled && !running && EnabledFn()≠false && NextSlotFn() ≤ no
            （每 tick 重读槽——µs 级 SELECT；EnabledFn=false 整分支跳过：零评估零落行）
 Periodic : loopEnabled && !running && now-lastCheck ≥ IntervalFn() → Run
            （EnabledFn=false 同跳过且不推进节拍——恢复后下一 tick 到期即跑，F73-E 第 73 轮）
-Daemon   : 不进 tick——StartLoop 启动 Run 一次（阻塞）；StopLoop 取消 ctx
+Daemon   : 不进 tick——StartLoop 启动 Run 一次（阻塞）；StopLoop 取消 ctx；
+           EnabledFn 不可用（Daemon 调度面永不消费——Register 期响亮拒绝，
+           常驻业务门归 Run 体首行）
 Oneshot  : 不进 tick——仅 Trigger
 ```
 
@@ -165,9 +167,9 @@ task_runs 保留 90 天（audit-retention 每日清理）。
 
 ## 7. 修订记录
 
-- v2.0.3（2026-10-14，用户裁定「启用后按配置调度」）：autoban 调度模型收编——Descriptor 去除 EnabledFn（任务监控 enabled 列恒开，启停语义全在调度开关+事件页业务开关）；PUT /security/autoban 保存联动启停（enabled=true→StartLoop、false→StopLoop）；启动按库内业务开关实态对齐调度；手动开调度/手动触发但未启用由 Run 体首行业务门拦停（TaskLogf「手动调度，执行失败：未启用」+task_runs failed 行+StopLoop 重禁调度）；POST /security/autoban/run「立即执行」端点与前端按钮删除。
+- v2.0.3（2026-10-14，用户裁定「启用后按配置调度」）：autoban 调度模型收编——Descriptor 去除 EnabledFn（任务监控 enabled 列恒开，启停语义全在调度开关+事件页业务开关）；PUT /security/autoban 保存联动启停（enabled=true→StartLoop、false→StopLoop；第 74 轮补：禁用保存先收敛已到期条目与暂存重载再停调度——禁用后无循环 flush/到期清理点）；启动按库内业务开关实态对齐调度；手动开调度/手动触发但未启用由 Run 体首行业务门拦停（TaskLogf「手动调度，执行失败：未启用」+task_runs failed 行+StopLoop 重禁调度）；POST /security/autoban/run「立即执行」端点与前端按钮删除。
 
-- v2.0.2（2026-10-14，F73-A）：新增 autoban 循环任务（60s/主节点/EnabledFn=autoban_enabled 业务开关联动）——WAF 事件滑动窗口计数（摄取提交点喂入）→ 阈值判定 →「自动封禁名单」merge（清到期/保留手动/抑制过滤/超限挤最早到期）→ 重载 60s 节流暂存合并；观察模式（dry_run 默认开）仅记建议；每轮 TaskLogf 摘要行入 tasks/autoban.log。
+- v2.0.2（2026-10-14，F73-A）：新增 autoban 循环任务（60s/主节点/EnabledFn=autoban_enabled 业务开关联动）——WAF 事件固定窗口计数（摄取提交点喂入）→ 阈值判定 →「自动封禁名单」merge（清到期/保留手动/抑制过滤/超限挤最早到期）→ 重载 60s 节流暂存合并；观察模式（dry_run 默认开）仅记建议；每轮 TaskLogf 摘要行入 tasks/autoban.log。
 
 - v2.0.1（2026-10-14，F73-E）：EnabledFn 调度门补全——tick 的 Scheduled/Periodic 分支业务关即整支跳过（不落行不推进节拍，恢复后下一 tick 到期即跑；手动触发不受门拦）；术语统一「已暂停」→「已停止」（任务监控开关列/详情/tooltip、API 消息与本文档）。
 - v2.0（2026-10-01）：四类型标准重构。Kind 枚举 4 值替代 Continuous/Queue/Info；删除 SilentProbes/RecordFailuresOnly/SignalledWork/Singleton/AsKind/Cadence；NextSlotFn 返回 time.Time；Daemon 生命周期（StartLoop 调 Run 一次+阻塞）；cert-waiting-ca 默认调度关闭+唤醒/自停；自动备份遗留 1min 调度器删除（追补语义移入 nextAutoBackupSlot 的 last_run 感知）；ingestion 改自管理循环。

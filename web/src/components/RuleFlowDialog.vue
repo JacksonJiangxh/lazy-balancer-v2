@@ -213,8 +213,10 @@
                         </template>
                         <template v-if="group.details.geoipRegions && group.details.geoipRegions.length > 0">
                           <div class="flow-detail-block-title">地域拦截区域（{{ group.details.geoipRegions.length }} 个）</div>
+                          <!-- X1（第 74 轮）：国家条目展示层翻译（country_names_cn 单源），
+                               省份/省市联值/海外哨兵未命中回退原文；geoipRegions 值零改动 -->
                           <div class="flow-detail-chips">
-                            <el-tag v-for="region in group.details.geoipRegions" :key="region" size="small" effect="plain" class="flow-detail-chip">{{ region }}</el-tag>
+                            <el-tag v-for="region in group.details.geoipRegions" :key="region" size="small" effect="plain" class="flow-detail-chip">{{ countryLabel(countryZh, region) }}</el-tag>
                           </div>
                         </template>
                         <template v-if="group.details.rateLimit">
@@ -334,6 +336,7 @@ import type { RuleFlowPathRule } from '@/types/rules'
 import { hostPortKey } from '@/utils/upstreamKeys'
 import { weightPercent } from '@/utils/upstreamWeights'
 import { STAGE_TITLES, attachStageDetails, formatDurationUs, inferPolicyType, mergeIpEntries, parseIPList, parseRefIds } from '@/utils/securityStages'
+import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type {
   CrsRuleFileOption,
   RuleFlowTarget,
@@ -357,6 +360,9 @@ const props = defineProps<{
 const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>()
 
 const isTcp = computed(() => props.target?.protocol === 'tcp')
+// X1（第 74 轮）：海外国家中文映射（模块级缓存，setup 期触发一次拉取；模板
+// 读 ref 自动解包并注册响应依赖）。
+const countryZh = useCountryNamesCn()
 const protocolLabel = computed(() => {
   if (!props.target) return '-'
   if (props.target.protocol === 'tcp') return 'TCP'

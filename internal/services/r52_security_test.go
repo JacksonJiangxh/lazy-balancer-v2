@@ -87,6 +87,41 @@ func TestNormalizeLegacySecurityPolicyEnums_normalizesAndBumps_whenLegacyRowsExi
 	}
 }
 
+// TestNormalizeLegacySecurityPolicyEnums_disablesRateLimitWithInvalidRPS
+// G2（第 74 轮，用户裁定方案①）：rate_limit_rps 缺写侧归一入口的历史脏行
+// （enabled=1 & rps<1，修复前 Update 缺陷可落库）绑定启用规则时整份配置
+// 生成失败（render fail-visible）。启动归一关停业务开关（enabled=0，rps 库值
+// 保持原样不造假），与其他遗留行同事务归一+bump。
+func TestNormalizeLegacySecurityPolicyEnums_disablesRateLimitWithInvalidRPS(t *testing.T) {
+	setupSecurityEnumTestDB(t)
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, rate_limit_enabled, rate_limit_rps) VALUES
+		('dirty-rps', 'off', 1, 0), ('dirty-null-rps', 'off', 1, NULL), ('dirty-neg-rps', 'off', 1, -5), ('valid-rps', 'off', 1, 100), ('off-clean', 'off', 0, 0)`); err != nil {
+		t.Fatalf("seed rows: %v", err)
+	}
+	before := clusterVersion(t)
+
+	NormalizeLegacySecurityPolicyEnums(context.Background())
+
+	var dirty, dirtyNull, dirtyNeg, valid, offClean int
+	for _, tc := range []struct {
+		name string
+		dest *int
+	}{{"dirty-rps", &dirty}, {"dirty-null-rps", &dirtyNull}, {"dirty-neg-rps", &dirtyNeg}, {"valid-rps", &valid}, {"off-clean", &offClean}} {
+		if err := db.DB.QueryRow("SELECT rate_limit_enabled FROM security_policies WHERE name=?", tc.name).Scan(tc.dest); err != nil {
+			t.Fatalf("read %s: %v", tc.name, err)
+		}
+	}
+	if dirty != 0 || dirtyNull != 0 || dirtyNeg != 0 {
+		t.Fatalf("脏行必须启动归一关停（enabled=0）: rps0=%d null=%d neg=%d", dirty, dirtyNull, dirtyNeg)
+	}
+	if valid != 1 || offClean != 0 {
+		t.Fatalf("合法行不受影响: valid=%d offClean=%d", valid, offClean)
+	}
+	if v := clusterVersion(t); v != before+1 {
+		t.Fatalf("cluster_version=%d, want +1（归一随既有机制 bump）", v)
+	}
+}
+
 // TestNormalizeLegacySecurityPolicyEnums_noBump_whenNoLegacyRows 验证无遗留
 // 行时归一是纯 no-op：不 bump 集群版本（避免每次启动版本空转）。
 func TestNormalizeLegacySecurityPolicyEnums_noBump_whenNoLegacyRows(t *testing.T) {

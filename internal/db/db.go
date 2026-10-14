@@ -48,6 +48,10 @@ const (
 	DefaultHealthCheckUnhealthyThreshold = 3
 	DefaultTCPTryInterval                = 250
 	DefaultCertExpiryDays                = 30
+	// DefaultAnomalyThreshold（G6，第 74 轮）：security_policies.anomaly_threshold
+	// 类型①值列默认值——DDL DEFAULT（:604）+启动归一（security_normalize.go
+	// legacySecurityEnumBackfills）+DB 侧钉测三处单源。
+	DefaultAnomalyThreshold = 5
 )
 
 func CanonicalDomains(value string) (string, error) {
@@ -1142,6 +1146,19 @@ func runMigrations() error {
 		// R58 C-N5 + 导入钳制 R57 C-2 之外的最后防线）：NULL/<=0 归 30；用户已设
 		// 有效值（>0）恒不触碰。消费侧 GetCertExpiryThreshold 直读零兜底。
 		fmt.Sprintf("UPDATE global_config SET cert_expiry_days=%d WHERE cert_expiry_days IS NULL OR cert_expiry_days<=0", DefaultCertExpiryDays),
+		// D2（第 74 轮审计）：自动封禁六列每启动幂等回填（同上铁律的最后防线
+		// 形态）——带外直写/畸形备份导入的脏行（0-1 外布尔、枚举外文本、写侧
+		// 边界外数值）在下次启动收敛到治理默认；运行期窗口内的无效值由消费侧
+		// 护栏（RunAutobanCycle 执行前校验，拒绝执行+显性报错）承担，不静默兜底。
+		// 边界与枚举单源=services.ValidateAutobanConfig/ValidAutobanDuration/
+		// ValidAutobanScope（db 包不可反向依赖，SQL 字面量与迁移 DDL DEFAULT
+		// 同款双锚，db_autoban_migration_test/db_autoban_backfill_test 钉测对齐）。
+		"UPDATE global_config SET autoban_enabled=0 WHERE autoban_enabled IS NULL OR autoban_enabled NOT IN (0,1)",
+		"UPDATE global_config SET autoban_threshold=100 WHERE autoban_threshold IS NULL OR autoban_threshold<1 OR autoban_threshold>10000",
+		"UPDATE global_config SET autoban_window_minutes=5 WHERE autoban_window_minutes IS NULL OR autoban_window_minutes<1 OR autoban_window_minutes>60",
+		"UPDATE global_config SET autoban_duration='1h' WHERE autoban_duration IS NULL OR autoban_duration NOT IN ('10m','30m','1h','6h','12h','24h','permanent')",
+		"UPDATE global_config SET autoban_scope='all' WHERE autoban_scope IS NULL OR autoban_scope NOT IN ('blocked','logged','all')",
+		"UPDATE global_config SET autoban_dry_run=1 WHERE autoban_dry_run IS NULL OR autoban_dry_run NOT IN (0,1)",
 	}
 	for _, statement := range defaultUpdates {
 		if _, err := DB.Exec(statement); err != nil {

@@ -140,6 +140,7 @@ import { request } from '@/utils/api'
 import { formatDate } from '@/utils/date'
 import { parseIPList, parseRefIds, entryMatchesIp, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, formatDurationUs } from '@/utils/securityStages'
 import { useCrsRuleIndex } from '@/composables/useCrsRuleIndex'
+import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type { APIResponse } from '@/types'
 
 // 第 58 轮（用户裁定）：统一触发详情弹框——全部触发类型（IP 黑白名单/地域/威胁
@@ -414,9 +415,13 @@ const loadAll = async (): Promise<void> => {
   }
 }
 
+// X1（第 74 轮）：区域清单展示层翻译——country_names_cn 单源映射，未命中
+// （省份/省市联值/海外哨兵）回退原文；geoip_countries 值零改动。
+const countryZh = useCountryNamesCn()
 const geoLabel = computed(() => {
   try {
-    return ((JSON.parse(policy.value?.geoip_countries ?? '[]') as string[]) || []).filter(Boolean).join('、')
+    const zh = countryZh.value
+    return ((JSON.parse(policy.value?.geoip_countries ?? '[]') as string[]) || []).filter(Boolean).map((r) => countryLabel(zh, r)).join('、')
   } catch {
     return ''
   }

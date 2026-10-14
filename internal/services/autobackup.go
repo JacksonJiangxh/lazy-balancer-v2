@@ -118,6 +118,11 @@ type autoBackupSettingsRow struct {
 func loadAutoBackupSettings() (autoBackupSettingsRow, error) {
 	var row autoBackupSettingsRow
 	var lastRun sql.NullString
+	// B1-8（第 74 轮）：nil 库守卫（生产不可达）——EnabledFn/NextSlotFn 消费方
+	// fail-closed（err 路径=已停止/零值槽）。
+	if db.DB == nil {
+		return row, sql.ErrConnDone
+	}
 	err := db.DB.QueryRow(`SELECT COALESCE(auto_backup_enabled,0), COALESCE(auto_backup_frequency,'daily'),
 		COALESCE(auto_backup_time,'03:00'), COALESCE(auto_backup_day,1), auto_backup_last_run
 		FROM global_config WHERE id=1`).

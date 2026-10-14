@@ -463,3 +463,25 @@ func TestRenderDBTruth_CertExpiryDaysInvalidLogsExplicitError(t *testing.T) {
 		t.Fatalf("invalid cert_expiry_days must log explicit error with value, log=%q", buf.String())
 	}
 }
+
+// G5（第 74 轮）：caddy_log_size_mb 哨兵贯通钉——批 1+2 只钉了 <=0 fail-visible
+// （ZeroGlobalColumnsFailVisible），未钉「库值直发」方向。137 哨兵贯通到
+// logging.logs.*.writer.roll_size_mb（任何写死 100 回流即被识破）。
+func TestRenderDBTruth_LogSizeMB137SentinelPassThrough(t *testing.T) {
+	_, database := newClusterTestService(t)
+	seedGenerationRule(t, database, "lb-truth-logsize", false)
+	if _, err := database.Exec("UPDATE global_config SET caddy_log_size_mb=137"); err != nil {
+		t.Fatalf("set sentinel: %v", err)
+	}
+	generated := generateCaddyConfigFromStore(database)
+	if message, failed := generated[caddyConfigGenerationErrorKey].(string); failed {
+		t.Fatalf("generation failed: %s", message)
+	}
+	logging, _ := generated["logging"].(map[string]interface{})
+	logs, _ := logging["logs"].(map[string]interface{})
+	def, _ := logs["default"].(map[string]interface{})
+	writer, _ := def["writer"].(map[string]interface{})
+	if got := writer["roll_size_mb"]; got != 137 {
+		t.Fatalf("roll_size_mb=%v, want 137（库值直发，无写死 100 回流）", got)
+	}
+}

@@ -480,6 +480,23 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 	snapshot.BasicSettings.ThreatAutoUpdate = &threatAuto
 	snapshot.BasicSettings.ThreatScheduleDays = &threatDays
 	snapshot.BasicSettings.ThreatScheduleTime = &threatTime
+	// D1（第 74 轮审计）：自动封禁六项配置随 users 节同步（镜像 CL41-1/L5-67-01
+	// 指针装载+COALESCE 兜底恒携带，升主即按主端配置生效）。局部名 abn* 与上方
+	// 自动备份组 ab* 区分（同一函数作用域）。
+	var abnEnabled, abnDryRun bool
+	var abnThreshold, abnWindow int
+	var abnDuration, abnScope string
+	if err := store.QueryRowContext(ctx, `SELECT COALESCE(autoban_enabled,0), COALESCE(autoban_threshold,100),
+		COALESCE(autoban_window_minutes,5), COALESCE(autoban_duration,'1h'), COALESCE(autoban_scope,'all'), COALESCE(autoban_dry_run,1)
+		FROM global_config WHERE id=1`).Scan(&abnEnabled, &abnThreshold, &abnWindow, &abnDuration, &abnScope, &abnDryRun); err != nil {
+		return fmt.Errorf("读取自动封禁设置: %w", err)
+	}
+	snapshot.BasicSettings.AutobanEnabled = &abnEnabled
+	snapshot.BasicSettings.AutobanThreshold = &abnThreshold
+	snapshot.BasicSettings.AutobanWindowMinutes = &abnWindow
+	snapshot.BasicSettings.AutobanDuration = &abnDuration
+	snapshot.BasicSettings.AutobanScope = &abnScope
+	snapshot.BasicSettings.AutobanDryRun = &abnDryRun
 	return nil
 }
 

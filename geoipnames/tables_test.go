@@ -123,6 +123,11 @@ func TestGeoipNames_overseasCountriesTableAndNormalize(t *testing.T) {
 		{"Reserved", ""},                   // 非国家 → 兜底
 		{"United States", "United States"}, // 规范名原样通过
 		{"Japan", "Japan"},                 // 未列入表的规范名原样通过（纯白名单过滤）
+		// X4（第 74 轮）：「中国」走国内分支非海外国——显式归一空串（不入树、
+		// 不发国名，发射侧回落海外哨兵判定由国内分支接管）；含空白形态一并
+		// 归一（TrimSpace 对称——树侧判定本就 Trim，发射侧此前裸比较）。
+		{"中国", ""},
+		{" 中国 ", ""},
 	}
 	for _, tc := range cases {
 		if got := NormalizeCountry(tc.raw); got != tc.want {

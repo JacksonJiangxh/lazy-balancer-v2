@@ -110,12 +110,13 @@ var OverseasCountries = map[string]string{
 	"Reserved": "",
 }
 
-// NormalizeCountry 规范 xdb 国家列原始值：空白/「0」占位与归一表映射空串的
+// NormalizeCountry 规范 xdb 国家列原始值：空白/「0」占位/「中国」（国内分支
+// 值，X4 第 74 轮——含空白异形，与树侧 TrimSpace 判定对称）与归一表映射空串的
 // 值（非国家）返回空串（调用方据此兜底「海外」哨兵/不入树）；其余原样或按
 // 归一表折叠返回。
 func NormalizeCountry(raw string) string {
 	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || trimmed == "0" {
+	if trimmed == "" || trimmed == "0" || trimmed == "中国" {
 		return ""
 	}
 	if canonical, ok := OverseasCountries[trimmed]; ok {

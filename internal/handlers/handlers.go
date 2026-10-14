@@ -125,6 +125,13 @@ func boolText(value bool) string {
 // survive restarts and async paths to stay visible to operators.
 func (h *Handlers) recordCaddyApplyResult(err error) {
 	if err == nil {
+		// D3（第 74 轮）：渲染降级（如受信代理设置读取失败按未启用渲染）已随
+		// 配置成功应用——降级不是应用失败，横幅不得被成功清除吞掉。services
+		// applyConfigLockedOpt 已在应用成功时落审计行+写入降级横幅；此处保持
+		// 横幅可见，直至下次干净渲染（LastRenderDegradation 归空）恢复常规清除。
+		if degraded := services.LastRenderDegradation(); degraded != "" {
+			return
+		}
 		if db.DB != nil {
 			if _, err := db.DB.Exec(`UPDATE global_config SET caddy_apply_error='' WHERE id=1 AND caddy_apply_error<>''`); err != nil {
 				services.Logf("warn", "RH-2: 清除 caddy_apply_error 失败(陈旧失败横幅可能滞留): %v", err)

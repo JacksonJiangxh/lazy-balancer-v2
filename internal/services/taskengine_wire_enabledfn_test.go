@@ -59,6 +59,23 @@ func enabledOf(t *testing.T, te *taskengine.Engine, id string) bool {
 	return m.Enabled
 }
 
+// B1-8（第 74 轮）：wire Fn 闭包族 db.DB 直读无 nil 守卫（生产不可达——引擎
+// wire 晚于 db.Initialize；测试/降级形态可触达）。EnabledFn/NextSlotFn/StatusFn
+// 读 nil 库必须 fail-closed（Enabled=false/零值槽/空状态），不得 panic——
+// Lookup 驱动四族全部 Fn（含 threat 委托的 ThreatAutoUpdateEnabled 与
+// auto-backup 委托的 loadAutoBackupSettings）。
+func TestTaskEngineWire_nilDBFnsFailClosedEverywhere(t *testing.T) {
+	te := newWireTestEngine(t)
+	orig := db.DB
+	db.DB = nil
+	t.Cleanup(func() { db.DB = orig })
+	for _, id := range []string{"threat", "crs", "ip2region", "auto-backup"} {
+		if enabledOf(t, te, id) {
+			t.Fatalf("%s Fn 族读 nil 库应 fail-closed（Enabled=false），得到 true", id)
+		}
+	}
+}
+
 // Given crs EnabledFn 的 DB 读失败。
 // When 查询任务元数据。
 // Then Enabled=false（状态列「已停止」）——读库失败不得误报启用（fail-closed）。

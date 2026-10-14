@@ -234,22 +234,27 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	caddyhttp.SetVar(ctx, "geoip.city", city)
 	r.Header.Set("X-LB-GeoIP-City", city)
 	// X-LB-GeoIP-Loc：地域规则匹配键（coraza SecRule 的锚定正则全值目标）。
-	// 国内 → 省 或 省/市（均为规范化值，与策略选项树同源，BuildCorazaDirectives
-	// 的 geoipLocOperator 按同形态编译条目）；海外 → 归一化国名（域 G，第
-	// 73 轮——已解析海外行细化到国家，与选项树 Countries 同源同归一）；
-	// 国家列不可解析为国名（空/0/Reserved 非国家值）→「海外」哨兵，与 D1
-	// fail-closed 哨兵同口径（deny+海外仍拦此类客户端）。
-	if fields[0] == "中国" {
+	// geoipLocFor 承载三态判定（X4 第 74 轮抽出可钉）。
+	r.Header.Set("X-LB-GeoIP-Loc", geoipLocFor(fields[0], province, city))
+}
+
+// geoipLocFor 由 xdb 国家列与规范化省/市列计算 X-LB-GeoIP-Loc 值：
+// 国内（国家列 TrimSpace 后为「中国」——X4 第 74 轮 TrimSpace 对称，树侧
+// 收集判定同口径）→ 省 或 省/市；海外 → 归一化国名（域 G，第 73 轮——已
+// 解析海外行细化到国家，与选项树 Countries 同源同归一）；国家列不可解析为
+// 国名（空/0/Reserved/中国空白异形经 NormalizeCountry 折叠空串）→「海外」
+// 哨兵，与 D1 fail-closed 哨兵同口径（deny+海外仍拦此类客户端）。
+func geoipLocFor(rawCountry, province, city string) string {
+	if strings.TrimSpace(rawCountry) == "中国" {
 		if city != "" {
-			r.Header.Set("X-LB-GeoIP-Loc", province+"/"+city)
-		} else {
-			r.Header.Set("X-LB-GeoIP-Loc", province)
+			return province + "/" + city
 		}
-	} else if country := geoipnames.NormalizeCountry(fields[0]); country != "" {
-		r.Header.Set("X-LB-GeoIP-Loc", country)
-	} else {
-		r.Header.Set("X-LB-GeoIP-Loc", "海外")
+		return province
 	}
+	if country := geoipnames.NormalizeCountry(rawCountry); country != "" {
+		return country
+	}
+	return "海外"
 }
 
 // realClientIP 取真实客户端 IP：优先 Caddy client_ip 变量（v2.3.x）——

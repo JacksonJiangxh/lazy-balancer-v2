@@ -377,6 +377,7 @@ var backupBooleanConfigKeys = []string{
 	"sync_switches_migrated", "waf_mode4_migrated", // SYSRENDER27-P5-4: waf_mode4_migrated 补入(R56 枚举漏列)
 	"mfa_write_guard", "mfa_lockout_enabled",
 	"trusted_proxy_enabled", "trusted_proxy_strict", // v2.3.x 受信代理
+	"autoban_enabled", "autoban_dry_run", // D2(第 74 轮审计):自动封禁布尔两键——非布尔形态经 v2 类型门整包 400 点名
 }
 
 func isBackupBooleanColumn(table, column string) bool {
@@ -1743,6 +1744,161 @@ func validateV2BackupAdminTLS(config map[string]any) error {
 	return nil
 }
 
+// validateV2BackupAutobanConfig 自动封禁六列导入门（D2，第 74 轮审计；导入/
+// 预览双路径同序调用，镜像 validateV2BackupAdminTLS 位次）：布尔两键的类型门
+// 已由 backupBooleanConfigKeys 枚举（validateV2BackupBooleanTypes）承担；此处
+// 承担数值钳制与枚举校验——写侧（services.ValidateAutobanConfig）同口径，导入
+// 不宽于保存侧。越界数值钳到写侧同边界（镜像 clampBackupAuditRetentionMonths
+// 族）、非整数形态归一缺省；duration/scope 空串/null 归一缺省（镜像
+// security_policies mode 族「无值归一」）、非空非法与非字符串形态响亮拒绝。
+// 返回钳制/归一留痕（导入侧并入审计明细；预览侧忽略）。归一写回 backup.Config
+// 在 checksum 校验之后执行，不影响完整性判定。
+func validateV2BackupAutobanConfig(config map[string]any) ([]string, error) {
+	if config == nil {
+		return nil, nil
+	}
+	var notes []string
+	if raw, exists := config["autoban_threshold"]; exists && raw != nil {
+		if n, ok := backupInteger(raw); ok {
+			if n < 1 || n > 10000 {
+				clamped := n
+				if n < 1 {
+					clamped = 1
+				}
+				if n > 10000 {
+					clamped = 10000
+				}
+				config["autoban_threshold"] = clamped
+				notes = append(notes, fmt.Sprintf("autoban_threshold 越界（%d），已钳位为 %d", n, clamped))
+			}
+		} else {
+			config["autoban_threshold"] = 100
+			notes = append(notes, "autoban_threshold 非整数形态，已归一为 100")
+		}
+	}
+	if raw, exists := config["autoban_window_minutes"]; exists && raw != nil {
+		if n, ok := backupInteger(raw); ok {
+			if n < 1 || n > 60 {
+				clamped := n
+				if n < 1 {
+					clamped = 1
+				}
+				if n > 60 {
+					clamped = 60
+				}
+				config["autoban_window_minutes"] = clamped
+				notes = append(notes, fmt.Sprintf("autoban_window_minutes 越界（%d），已钳位为 %d", n, clamped))
+			}
+		} else {
+			config["autoban_window_minutes"] = 5
+			notes = append(notes, "autoban_window_minutes 非整数形态，已归一为 5")
+		}
+	}
+	for _, field := range []struct {
+		key     string
+		def     string
+		invalid func(string) bool
+		choices string
+	}{
+		{"autoban_duration", "1h", func(s string) bool { return !services.ValidAutobanDuration(s) }, "10m/30m/1h/6h/12h/24h/permanent"},
+		{"autoban_scope", "all", func(s string) bool { return !services.ValidAutobanScope(s) }, "blocked/logged/all"},
+	} {
+		raw, exists := config[field.key]
+		if !exists || raw == nil {
+			continue
+		}
+		value, ok := raw.(string)
+		if !ok {
+			// R48-3 同型：保存侧 JSON 绑定对非字符串同值 400，导入不得经
+			// backupString 静默归一放行。
+			return nil, fmt.Errorf("备份校验失败：全局配置 %s 需为字符串，实际类型 %T", field.key, raw)
+		}
+		if strings.TrimSpace(value) == "" {
+			config[field.key] = field.def
+			notes = append(notes, fmt.Sprintf("%s 空值，已归一为 %s", field.key, field.def))
+			continue
+		}
+		if field.invalid(value) {
+			return nil, fmt.Errorf("备份校验失败：全局配置 %s 取值无效（%s），须为 %s 之一", field.key, value, field.choices)
+		}
+	}
+	return notes, nil
+}
+
+// validateV2BackupTrustedProxyConfig 受信代理三 TEXT 列导入门（D3，第 74 轮
+// 审计；导入/预览双路径同序调用）：trusted_proxy_ranges/range_refs/headers 为
+// TEXT 列承载 JSON 数组文本，此前导入零门——手造备份可落任意畸形文本，渲染层
+// 对畸形按未启用丢弃（fail-closed），真实 IP 还原静默失效而面板仍宣称已启用。
+// 复用保存侧校验单一口径：形态门+归一+引用存在性+内联∪引用展开总量上限；
+// 载荷未携带的键按库内存量值参与合成判定（与保存侧 PATCH 语义一致）。
+// tables 为备份携带表：refs 存在性/条目/上限按「备份内优先 ∪ 库内存量」解析
+// （引用名单随备份全量替换，跨节点还原不得误拒——镜像 W2/U3-F5 备份内解析
+// 哲学）。归一写回 backup.Config 在 checksum 校验之后执行。
+func validateV2BackupTrustedProxyConfig(config map[string]any, tables map[string][]map[string]any) error {
+	if config == nil {
+		return nil
+	}
+	source := trustedProxyBackupListSource(tables)
+	req := models.UpdateConfigRequest{}
+	carried := false
+	for _, field := range []struct {
+		key string
+		dst **string
+	}{
+		{"trusted_proxy_ranges", &req.TrustedProxyRanges},
+		{"trusted_proxy_range_refs", &req.TrustedProxyRangeRefs},
+		{"trusted_proxy_headers", &req.TrustedProxyHeaders},
+	} {
+		raw, exists := config[field.key]
+		if !exists || raw == nil {
+			continue
+		}
+		value, ok := raw.(string)
+		if !ok {
+			return fmt.Errorf("备份校验失败：全局配置 %s 需为字符串（JSON 数组文本），实际类型 %T", field.key, raw)
+		}
+		*field.dst = &value
+		carried = true
+	}
+	if !carried {
+		return nil
+	}
+	if err := validateTrustedProxyFieldsWithSource(&req, source); err != nil {
+		return fmt.Errorf("备份校验失败：全局配置受信代理设置：%v", err)
+	}
+	if req.TrustedProxyRanges != nil {
+		config["trusted_proxy_ranges"] = *req.TrustedProxyRanges
+	}
+	if req.TrustedProxyRangeRefs != nil {
+		config["trusted_proxy_range_refs"] = *req.TrustedProxyRangeRefs
+	}
+	if req.TrustedProxyHeaders != nil {
+		config["trusted_proxy_headers"] = *req.TrustedProxyHeaders
+	}
+	return nil
+}
+
+// trustedProxyBackupListSource 从备份 security_ip_lists 行构建名单解析源
+// （id → 名称+条目原文）。表未携带=空源（解析全走库内——导入后名单表保持
+// 现状，库内解析即导入后实态）。
+func trustedProxyBackupListSource(tables map[string][]map[string]any) map[int64]trustedProxyListSource {
+	rows, exists := tables["security_ip_lists"]
+	if !exists {
+		return nil
+	}
+	source := make(map[int64]trustedProxyListSource, len(rows))
+	for _, row := range rows {
+		id, ok := backupInteger(row["id"])
+		if !ok {
+			continue
+		}
+		entries, _ := row["entries"].(string)
+		name, _ := row["name"].(string)
+		source[int64(id)] = trustedProxyListSource{name: name, entries: entries}
+	}
+	return source
+}
+
 func backupBooleanEnabled(value any) bool {
 	switch value := value.(type) {
 	case bool:
@@ -2477,6 +2633,17 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
+	// D2/D3（第 74 轮审计）：自动封禁六列与受信代理三 TEXT 列导入门（导入/
+	// 预览双路径同序；归一写回供下方 UPDATE 直写，库恒有效）。
+	autobanClampNotes, err := validateV2BackupAutobanConfig(backup.Config)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		return
+	}
+	if err := validateV2BackupTrustedProxyConfig(backup.Config, backup.Tables); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		return
+	}
 	jwtExpireClamped := false
 	if value, exists := backup.Config["jwt_expire_minutes"]; exists {
 		backup.Config["jwt_expire_minutes"], jwtExpireClamped = clampBackupJWTExpireMinutes(value)
@@ -2967,6 +3134,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 		auditParts = append(auditParts, fmt.Sprintf("runtime_log_size_mb 越界，已钳位为 %v", backup.Config["runtime_log_size_mb"]))
 	}
 	auditParts = append(auditParts, certNumericClamped...)
+	auditParts = append(auditParts, autobanClampNotes...)
 	if len(skipWarnings) > 0 {
 		// N+13 H2-F3：列表现含空域名规则与空内容拦截页两类跳过，标签泛化。
 		auditParts = append(auditParts, "跳过警告："+strings.Join(skipWarnings, "；"))

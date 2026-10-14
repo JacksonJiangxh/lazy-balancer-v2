@@ -132,6 +132,15 @@ func validateIPListRefsExistence(q policyQueryRower, aclIDs, wlIDs []int64) (str
 	return "", nil
 }
 
+// builtinIPListLabel 内置名单的用户可读类别（AU-6 第 74 轮：按名单名分流——
+// 自动封禁预置名单不是威胁情报名单，提示语不得误称）。
+func builtinIPListLabel(name string) string {
+	if name == services.AutobanPresetListName {
+		return "内置自动封禁名单"
+	}
+	return "内置威胁情报名单"
+}
+
 // validateBuiltinThreatListRefs 内置威胁名单引用门禁（2026-09-24 用户裁定）：
 // system=1 名单（威胁情报库三源）仅允许 IP ACL 黑名单（deny）引用——
 // 信任名单 / ACL 白名单（allow、bypass）/ CRS 排除作用域一律拒绝。
@@ -183,21 +192,22 @@ func validateBuiltinThreatListRefs(q policyQueryRower, aclIDs, wlIDs, excludedID
 		return 0, false
 	}
 	if id, hit := in(wlIDs); hit {
-		return fmt.Sprintf("「%s」是内置威胁情报名单，仅允许用于 IP 访问控制的黑名单模式，不能用于信任名单", builtin[id]), nil
+		return fmt.Sprintf("「%s」是%s，仅允许用于 IP 访问控制的黑名单模式，不能用于信任名单", builtin[id], builtinIPListLabel(builtin[id])), nil
 	}
 	if aclMode != "deny" {
 		if id, hit := in(aclIDs); hit {
-			return fmt.Sprintf("「%s」是内置威胁情报名单，仅允许用于 IP 访问控制的黑名单模式", builtin[id]), nil
+			return fmt.Sprintf("「%s」是%s，仅允许用于 IP 访问控制的黑名单模式", builtin[id], builtinIPListLabel(builtin[id])), nil
 		}
 	}
 	if id, hit := in(excludedIDs); hit {
-		return fmt.Sprintf("「%s」是内置威胁情报名单，仅允许用于 IP 访问控制的黑名单模式，不能用于 CRS 排除", builtin[id]), nil
+		return fmt.Sprintf("「%s」是%s，仅允许用于 IP 访问控制的黑名单模式，不能用于 CRS 排除", builtin[id], builtinIPListLabel(builtin[id])), nil
 	}
 	return "", nil
 }
 
 // validateIPListShape 校验列表载荷并返回解析后的条目：名称非空 ≤50、描述 ≤200、
-// 分类 ≤32、条目数 ≤500、value 过 validIPOrCIDR、remark ≤100。
+// 分类 ≤32、条目数 ≤2000（AU-7 第 74 轮修正：2026-10-14 用户裁定上限已 500→2000）、
+// value 过 validIPOrCIDR、remark ≤100。
 func validateIPListShape(name, description, category, entriesJSON string) ([]models.IPListEntry, error) {
 	if strings.TrimSpace(name) == "" {
 		return nil, fmt.Errorf("名称不能为空")
@@ -449,9 +459,10 @@ func (h *Handlers) CreateIPList(c *gin.Context) {
 	if dup > 0 {
 		// 与内置威胁名单重名给出专属提示（2026-09-24 用户裁定：用户名单
 		// 不允许与内置名单重名——选择器分组依赖名字区分归属）
-		var sysDup int
-		if err := tx.QueryRowContext(c.Request.Context(), "SELECT COUNT(*) FROM security_ip_lists WHERE LOWER(name)=LOWER(?) AND system=1", req.Name).Scan(&sysDup); err == nil && sysDup > 0 {
-			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "该名称为内置威胁情报名单保留，请换一个名称"})
+		var sysDupName string
+		if err := tx.QueryRowContext(c.Request.Context(), "SELECT name FROM security_ip_lists WHERE LOWER(name)=LOWER(?) AND system=1", req.Name).Scan(&sysDupName); err == nil && sysDupName != "" {
+			// AU-6（第 74 轮）：保留名提示按命中的内置名单名分流。
+			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: fmt.Sprintf("该名称为%s保留，请换一个名称", builtinIPListLabel(sysDupName))})
 			return
 		}
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "IP 列表名称已存在"})
@@ -540,6 +551,7 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 	if req.Category != nil {
 		category = *req.Category
 	}
+	oldEntriesJSON := entriesJSON
 	if req.Entries != nil {
 		entriesJSON = *req.Entries
 	}
@@ -589,9 +601,10 @@ WHERE COALESCE(ip_acl_enabled,0)=1 AND COALESCE(ip_acl_mode,'')='allow'
 	if dup > 0 {
 		// 改名撞内置名单同 Create 口径给专属提示（第 53 轮补充轮 B1 P5-3：
 		// 同一裁定语义在更新路径此前退化为通用提示）。
-		var sysDup int
-		if err := tx.QueryRowContext(c.Request.Context(), "SELECT COUNT(*) FROM security_ip_lists WHERE LOWER(name)=LOWER(?) AND system=1", name).Scan(&sysDup); err == nil && sysDup > 0 {
-			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "该名称为内置威胁情报名单保留，请换一个名称"})
+		var sysDupName string
+		if err := tx.QueryRowContext(c.Request.Context(), "SELECT name FROM security_ip_lists WHERE LOWER(name)=LOWER(?) AND system=1", name).Scan(&sysDupName); err == nil && sysDupName != "" {
+			// AU-6（第 74 轮）：保留名提示按命中的内置名单名分流。
+			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: fmt.Sprintf("该名称为%s保留，请换一个名称", builtinIPListLabel(sysDupName))})
 			return
 		}
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "IP 列表名称已存在"})
@@ -606,6 +619,32 @@ WHERE COALESCE(ip_acl_enabled,0)=1 AND COALESCE(ip_acl_mode,'')='allow'
 	if rows, _ := result.RowsAffected(); rows == 0 {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "IP 地址列表不存在"})
 		return
+	}
+	// AU-3（第 74 轮）：预置名单全量保存（entries 全量替换）对「被移除值」
+	// 同事务补写解封抑制——弹框全量保存等价于逐行解封，不写抑制表会下轮重封，
+	// 与 remove-ip 路径（同事务抑制）的 UI 承诺矛盾。差集=旧值−新值；旧值
+	// JSON 畸形（带外脏行）按空集处理——宁可漏抑制，不错抑制未知值。
+	if autobanPreset && req.Entries != nil {
+		var oldParsed []models.IPListEntry
+		_ = json.Unmarshal([]byte(oldEntriesJSON), &oldParsed)
+		newValues := make(map[string]struct{}, len(entries))
+		for _, e := range entries {
+			newValues[e.Value] = struct{}{}
+		}
+		suppressUntil := time.Now().UTC().Add(services.AutobanSuppressWindow()).Format(services.AutobanTimeLayout)
+		for _, e := range oldParsed {
+			if e.Value == "" {
+				continue
+			}
+			if _, kept := newValues[e.Value]; kept {
+				continue
+			}
+			if _, err := tx.ExecContext(c.Request.Context(), `INSERT INTO autoban_suppressed (ip, suppressed_until) VALUES (?, ?)
+				ON CONFLICT(ip) DO UPDATE SET suppressed_until=excluded.suppressed_until`, e.Value, suppressUntil); err != nil {
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "写入解封抑制失败: " + err.Error()})
+				return
+			}
+		}
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "更新",

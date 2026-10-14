@@ -186,6 +186,10 @@ func versionTableSchedule(table string) ([]int, string) {
 // versionTableNextUpdate 读版本表当前排程槽（空串=未排程）——TASK-L1 同批，
 // 引擎 NextSlotFn 的 DB 直读数据源（不经管理器实例）。
 func versionTableNextUpdate(table string) string {
+	// B1-8（第 74 轮）：nil 库守卫——NextSlotFn fail-closed（零值槽）。
+	if db.DB == nil {
+		return ""
+	}
 	var s string
 	if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM ` + table + ` WHERE id=1`).Scan(&s); err != nil {
 		return ""

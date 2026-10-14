@@ -82,6 +82,7 @@ import { request } from '@/utils/api'
 import { showSaveResult } from '@/utils/saveResult'
 import { useAuthStore } from '@/stores/auth'
 import { useTrustAssociation } from '@/composables/useTrustAssociation'
+import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type { IpListOption } from '@/composables/useIpListAdd'
 // 分组类型路由（U8-2）：inferPolicyType 为策略类型单一实现（securityStages 导出，禁第二实现）
 import { inferPolicyType, parseIPList, parseRefIds, entryMatchesIp, invalidateSharedEntriesCache, mergeIpEntryValues } from '@/utils/securityStages'
@@ -109,7 +110,8 @@ interface PolicyRow {
   trust_detection?: boolean
   mode?: string
   rate_limit_enabled?: boolean
-  geoip_enabled?: boolean
+  // X5（第 74 轮）：geoip_enabled 死字段删除——后端零下发（F63-B1-1 实证），
+  // 启用判定唯一口径 geoip_mode !== 'off'。
   geoip_mode?: string
   geoip_countries?: string
   has_geoip?: boolean
@@ -276,8 +278,7 @@ const normalizeRow = (p: PolicyRow): PolicyRow => ({
   trust_detection: p.trust_detection,
   mode: p.mode,
   rate_limit_enabled: p.rate_limit_enabled,
-  geoip_enabled: p.geoip_enabled,
-  geoip_mode: p.geoip_mode || 'off', // F64-B1-1:F63 修复字段被本投影白名单遗漏(geoActive 恒 false 回归)
+  geoip_mode: p.geoip_mode || 'off', // F64-B1-1:F63 修复字段被本投影白名单遗漏(geoActive 恒 false 回归);X5:geoip_enabled 死字段随行删除
   geoip_countries: p.geoip_countries || '[]',
   has_geoip: p.has_geoip,
   has_rate_limit: p.has_rate_limit,
@@ -357,6 +358,10 @@ interface RowView {
   geoActive: boolean
   geoRegions: string
 }
+
+// X1（第 74 轮）：海外国家中文映射（模块级缓存，regions API 单源；setup 期
+// 触发一次拉取，rows computed 内读 .value 注册响应依赖）。
+const countryZh = useCountryNamesCn()
 
 const rowView = (policy: PolicyRow): RowView => {
   // 信任口径（内联 ∪ 引用）先行计算——阶段 0 行整行语义即信任，ACL 行也要渲染信任动作。
@@ -447,11 +452,15 @@ const rowView = (policy: PolicyRow): RowView => {
     const regions: unknown = JSON.parse(policy.geoip_countries ?? '[]')
     if (Array.isArray(regions)) regionCount = regions.length
   } catch { /* 畸形按 0 处理 */ }
-  // F63-B1-1:geoip_enabled 后端不下发(接口零处),恒 undefined→false;
-  // 改用 geoip_mode !== 'off' 判定(后端实际下发)
+  // F63-B1-1:geoip_enabled 死字段已删（X5，第 74 轮）——启用判定唯一口径
+  // geoip_mode !== 'off'（后端实际下发）
   const geoActive = (policy.geoip_mode ?? 'off') !== 'off' && regionCount > 0
   view.geoActive = geoActive
-  view.geoRegions = regionCount > 0 ? (JSON.parse(policy.geoip_countries ?? '[]') as string[]).join('、') : '' 
+  // X1（第 74 轮）：区域清单展示层翻译——country_names_cn 单源映射（useCountryNamesCn
+  // 模块级缓存），未命中（省份/省市联值/海外哨兵/新国名）回退原文；geoip_countries
+  // 值本身零改动。
+  const zh = countryZh.value
+  view.geoRegions = regionCount > 0 ? (JSON.parse(policy.geoip_countries ?? '[]') as string[]).map((r) => countryLabel(zh, r)).join('、') : ''
   if (!policy.ip_acl_enabled) {
     // ACL 未启用：如地域拦截在用则明示「地域拦截在用（本事件可来自地域）」；
     // 关联地址列表动作仍可用（关联后随 ACL 启用生效）

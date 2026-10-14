@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"fmt"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -19,7 +20,8 @@ var legacySecurityEnumBackfills = []string{
 	// 库值唯一真相（批 3）：口径从 `=0` 扩为 `<=0`——写侧 max1/枚举白名单恒
 	// 产生正值，负值只能是带外直写；NULL 由 COALESCE(...,0) 归并同分支。
 	// 渲染侧对回填后仍无效的值 fail-visible（BuildCorazaDirectives）。
-	"UPDATE security_policies SET anomaly_threshold=5 WHERE COALESCE(anomaly_threshold,0)<=0",
+	// G6（第 74 轮）：字面量 5 改绑定 db.DefaultAnomalyThreshold 单源。
+	fmt.Sprintf("UPDATE security_policies SET anomaly_threshold=%d WHERE COALESCE(anomaly_threshold,0)<=0", db.DefaultAnomalyThreshold),
 	// SEC44-1（第 44 轮）：429 已剔除出拦截状态码白名单（限流专用语义，
 	// overviewmetrics.go 限流卡片按 code=429 计数，WAF 拦截页 429 会混入
 	// 限流指标口径）——存量 429 行归一为默认拦截状态码 403。
@@ -29,6 +31,12 @@ var legacySecurityEnumBackfills = []string{
 	// 403/404/503，0=未设置跟随默认 403 为类型②省略型合法值）——旧备份/带外
 	// 脏值（如 418）随启动归一，渲染层不再消费枚举外状态码。
 	"UPDATE security_policies SET block_status_code=403 WHERE block_status_code IS NOT NULL AND block_status_code NOT IN (0,400,401,403,404,503)",
+	// G2（第 74 轮，用户裁定方案①）：rate_limit_rps 历史脏行（enabled=1 &
+	// rps<1，修复前 Update 缺陷可落库）绑定启用规则时整份配置生成失败
+	// （渲染层 fail-visible）。启动归一关停业务开关——rps 库值保持原样
+	//（不造假默认值），INFO 摘要行披露归一计数；写侧 validateRateLimitShape
+	// 现行校验 rps>=1，本条仅兜历史形态。
+	"UPDATE security_policies SET rate_limit_enabled=0 WHERE rate_limit_enabled=1 AND COALESCE(rate_limit_rps,0)<1",
 }
 
 // ValidBlockStatusCode 报告 v 是否为拦截状态码合法值：写侧
@@ -108,8 +116,8 @@ func NormalizeLegacySecurityPolicyEnums(ctx context.Context) {
 		return
 	}
 	if isMaster {
-		Logf("info", "security enum normalize: normalized %d legacy empty-enum rows, cluster version bumped", changed)
+		Logf("info", "security enum normalize: normalized %d legacy rows (empty-enum/threshold/status-code/rate-limit dirty rows), cluster version bumped", changed)
 	} else {
-		Logf("info", "security enum normalize: normalized %d legacy empty-enum rows (slave, sync_security off, no version authority)", changed)
+		Logf("info", "security enum normalize: normalized %d legacy rows (empty-enum/threshold/status-code/rate-limit dirty rows; slave, sync_security off, no version authority)", changed)
 	}
 }

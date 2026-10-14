@@ -7,6 +7,7 @@ package services
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -528,8 +529,12 @@ func TestAutobanSuppression_upsertAndExpiry(t *testing.T) {
 	}
 }
 
-// ---- 重载节流 ----
+// ---- 重载节流（AU-1 持锁契约 + D4 三态） ----
 
+// Given 重载回调与节流时钟；生产调用方在 CaddyOpLock 临界区内请求重载
+// （AU-1：merge+重载同一临界区，注入回调为 InLock 变体）。
+// When 首次请求/节流窗口内再请求/窗口过后 flush。
+// Then 立即重载→暂存→合并执行；三态返回与暂存标记一致。
 func TestAutobanReloadThrottle(t *testing.T) {
 	f := installAutobanFixture(t, "2026-10-14 10:00:00")
 	reloads := 0
@@ -537,13 +542,17 @@ func TestAutobanReloadThrottle(t *testing.T) {
 	autobanReloader = func() error { reloads++; return nil }
 	t.Cleanup(func() { autobanReloader = oldFn })
 
-	autobanRequestReload("test")
-	if reloads != 1 {
-		t.Fatalf("首次请求应立即重载，reloads=%d", reloads)
+	CaddyOpLock.Lock()
+	state := autobanRequestReloadLocked("test")
+	CaddyOpLock.Unlock()
+	if state != autobanReloadApplied || reloads != 1 {
+		t.Fatalf("首次请求应立即重载，state=%d reloads=%d", state, reloads)
 	}
-	autobanRequestReload("test") // <60s → 暂存
-	if reloads != 1 {
-		t.Fatalf("节流窗口内不得立即重载，reloads=%d", reloads)
+	CaddyOpLock.Lock()
+	state = autobanRequestReloadLocked("test") // <60s → 暂存
+	CaddyOpLock.Unlock()
+	if state != autobanReloadDeferred || reloads != 1 {
+		t.Fatalf("节流窗口内不得立即重载，state=%d reloads=%d", state, reloads)
 	}
 	autobanMu.Lock()
 	pending := autobanReloadPending
@@ -561,6 +570,68 @@ func TestAutobanReloadThrottle(t *testing.T) {
 	autobanMu.Unlock()
 	if pending {
 		t.Fatal("执行后暂存标记必须清除")
+	}
+}
+
+// D4（第 74 轮）：重载失败必须留系统审计（来源=自动封禁名单，system 归因）
+// +置暂存再武装——下一轮 flush 强制重试；重试成功后补落成功审计。
+func TestAutobanReload_failureAuditsAndRearms(t *testing.T) {
+	f := installAutobanFixture(t, "2026-10-14 10:00:00")
+	oldFn := autobanReloader
+	autobanReloader = func() error { return errors.New("reload boom") }
+	t.Cleanup(func() { autobanReloader = oldFn })
+
+	CaddyOpLock.Lock()
+	state := autobanRequestReloadLocked("test")
+	CaddyOpLock.Unlock()
+	if state != autobanReloadErrored {
+		t.Fatalf("失败态 state=%d, want autobanReloadErrored", state)
+	}
+	var n int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='重载失败' AND resource='Caddy服务' AND username='system' AND detail LIKE '%自动封禁%'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("重载失败审计行=%d, want 1（system 归因+来源自动封禁）", n)
+	}
+	autobanMu.Lock()
+	pending := autobanReloadPending
+	autobanMu.Unlock()
+	if !pending {
+		t.Fatal("失败后必须置暂存再武装（下一轮 flush 重试）")
+	}
+
+	// 再武装生效：回调恢复+节流窗外 → flush 成功，暂存清除，成功审计补落
+	autobanReloader = func() error { return nil }
+	f.Advance(61 * time.Second)
+	autobanFlushPendingReload()
+	autobanMu.Lock()
+	pending = autobanReloadPending
+	autobanMu.Unlock()
+	if pending {
+		t.Fatal("重试成功后暂存必须清除")
+	}
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='重载' AND resource='Caddy服务' AND username='system' AND detail LIKE '%自动封禁%'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("重载成功审计行=%d, want 1", n)
+	}
+}
+
+// D4：摘要尾注三态——已重载/暂存/失败；无名单变化为空（不得恒称「已触发」）。
+func TestAutobanReloadNote_triState(t *testing.T) {
+	if got := reloadNote(false, autobanReloadApplied); got != "" {
+		t.Fatalf("无变化尾注=%q, want 空", got)
+	}
+	if got := reloadNote(true, autobanReloadApplied); !strings.Contains(got, "已重载") {
+		t.Fatalf("已重载尾注=%q", got)
+	}
+	if got := reloadNote(true, autobanReloadDeferred); !strings.Contains(got, "暂存") {
+		t.Fatalf("暂存尾注=%q", got)
+	}
+	if got := reloadNote(true, autobanReloadErrored); !strings.Contains(got, "失败") {
+		t.Fatalf("失败尾注=%q", got)
 	}
 }
 
@@ -959,5 +1030,165 @@ func TestAutobanCounter_tieredLogging(t *testing.T) {
 	autobanCandidates(3, 5*time.Minute)
 	if got := strings.Count(autobanLogNow(t), "IP 203.0.113.7 计数窗口过期，清零"); got != 2 {
 		t.Fatalf("修剪路径清零日志=%d 行, want 共 2:\n%s", got, autobanLogNow(t))
+	}
+}
+
+// ---- AU-1（第 74 轮）：merge 读改写+重载与名单写路径同一 CaddyOpLock 临界区 ----
+
+// Given 正式模式、候选达标；CaddyOpLock 被并发「名单写路径」临界区预持
+// （handlers AddIPToList/UpdateIPList 同型：持 CaddyOpLock → 读条目 → 追加 →
+// 回写 → 释放）。
+// When RunAutobanCycle 并发执行。
+// Then merge 必须阻塞至锁释放（写路径先完成自己的追加提交），释放后本轮完成
+// ——最终名单同时含写路径追加值与本轮新封值（不丢更新）。
+func TestAutobanRunCycle_mergeSerializesWithListWriterUnderCaddyOpLock(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
+	reloads := 0
+	oldFn := autobanReloader
+	autobanReloader = func() error { reloads++; return nil }
+	t.Cleanup(func() { autobanReloader = oldFn })
+	autobanObserveEvent("203.0.113.1", "blocked", "942100")
+
+	CaddyOpLock.Lock()
+	cycleDone := make(chan error, 1)
+	go func() { cycleDone <- RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}) }()
+
+	// merge 必须阻塞在锁外（写路径临界区内不得读取/回写名单）
+	select {
+	case err := <-cycleDone:
+		CaddyOpLock.Unlock()
+		t.Fatalf("merge 未与名单写路径互斥（提前完成 err=%v）——AU-1 丢更新窗口", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// 写路径完成自己的追加（此刻 autoban merge 仍被挡在锁外）
+	entries := append(presetEntries(t), models.IPListEntry{Value: "198.51.100.50", Remark: AutobanManualUnbanRemark, CreatedAt: "2026-10-14 10:00:00"})
+	raw, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE security_ip_lists SET entries=? WHERE id=?`, string(raw), presetListID(t)); err != nil {
+		t.Fatal(err)
+	}
+	CaddyOpLock.Unlock()
+
+	// 释放后 autoban 轮完成：最终名单=写路径追加+本轮新封（不丢更新）
+	select {
+	case err := <-cycleDone:
+		if err != nil {
+			t.Fatalf("cycle: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("锁释放后 autoban 轮未完成（疑死锁）")
+	}
+	got := entryValues(presetEntries(t))
+	if _, ok := got["198.51.100.50"]; !ok {
+		t.Fatal("并发名单写路径的追加在 merge 后必须保留（丢更新）")
+	}
+	if _, ok := got["203.0.113.1"]; !ok {
+		t.Fatal("本轮新封 IP 必须落名单")
+	}
+	if reloads != 1 {
+		t.Fatalf("reloads=%d, want 1（merge 变化后同临界区重载）", reloads)
+	}
+}
+
+// ---- AU-2（第 74 轮）：批入口一次读配置，scope+window 下传单事件路径 ----
+
+// Given 库配置窗口=1 分钟。
+// When autobanObserveEventScoped 显式接收下传的 scope/window。
+// Then 窗口内累计、越过下传窗口重置（若回退内层逐事件读库或写死兜底，
+// 2 分钟处仍是同窗口累计，断言即失败）；窗口无效（<=0）跳过计数、无写死
+// 5 分钟兜底（D2-③ 同函数落地）。
+func TestAutobanObserveBatch_scopeAndWindowPassedDown(t *testing.T) {
+	f := installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 100, 1, "1h", "all", true)
+	oneMin := AutobanConfig{Enabled: true, Threshold: 100, WindowMinutes: 1, Duration: "1h", Scope: "all", DryRun: true}
+
+	autobanObserveEventScoped(oneMin, "203.0.113.1", "blocked", "942100")
+	autobanObserveEventScoped(oneMin, "203.0.113.1", "blocked", "942100")
+	autobanMu.Lock()
+	w := autobanWindows["203.0.113.1"]
+	autobanMu.Unlock()
+	if w == nil || w.Count != 2 {
+		t.Fatalf("窗口内计数=%+v, want 2", w)
+	}
+
+	f.Advance(2 * time.Minute)
+	autobanObserveEventScoped(oneMin, "203.0.113.1", "blocked", "942100")
+	autobanMu.Lock()
+	w = autobanWindows["203.0.113.1"]
+	autobanMu.Unlock()
+	if w == nil || w.Count != 1 {
+		t.Fatalf("越过下传窗口后应重置计数（不得落 5 分钟写死兜底）, 得到 %+v", w)
+	}
+
+	autobanObserveEventScoped(AutobanConfig{Enabled: true, Threshold: 100, WindowMinutes: 0, Duration: "1h", Scope: "all", DryRun: true}, "203.0.113.2", "blocked", "942100")
+	autobanMu.Lock()
+	_, invalidWindowFed := autobanWindows["203.0.113.2"]
+	autobanMu.Unlock()
+	if invalidWindowFed {
+		t.Fatal("窗口无效时不得计数（无写死兜底）")
+	}
+}
+
+// ---- AU-8/D5（第 74 轮）：禁用路径收尾——到期清理一次+暂存重载强制收敛 ----
+
+// Given 名单含已到期自动条目/未到期自动条目/手动条目，且存在节流暂存的重载
+// （禁用后无循环 flush 点——AU-8 核心）。
+// When AutobanDisableFlush()（PUT 禁用路径在 StopLoop 前调用）。
+// Then 已到期自动条目立即清除+落「自动解封」审计；暂存重载绕过节流强制执行；
+// 未到期/手动条目保留；暂存标记清除。
+func TestAutobanDisableFlush_expiresOnceAndForceFlushes(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
+	seedPresetEntries(t, []models.IPListEntry{
+		{Value: "198.51.100.1", Remark: AutobanEntryRemark, CreatedAt: "2026-10-13 10:00:00", ExpiresAt: "2026-10-14 09:00:00"}, // 已到期
+		{Value: "198.51.100.2", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:30:00", ExpiresAt: "2026-10-14 11:00:00"}, // 未到期
+		{Value: "198.51.100.3", Remark: "事件处置", CreatedAt: "2026-10-13 10:00:00"},                                               // 手动
+	})
+	reloads := 0
+	oldFn := autobanReloader
+	autobanReloader = func() error { reloads++; return nil }
+	t.Cleanup(func() { autobanReloader = oldFn })
+	CaddyOpLock.Lock()
+	autobanRequestReloadLocked("禁用前变化") // 首问立即重载（reloads=1，节流起点）
+	autobanRequestReloadLocked("禁用前变化") // 次问节流窗口内→暂存
+	CaddyOpLock.Unlock()
+	autobanMu.Lock()
+	pending := autobanReloadPending
+	autobanMu.Unlock()
+	if !pending {
+		t.Fatal("前置：暂存必须置位")
+	}
+
+	AutobanDisableFlush()
+
+	got := entryValues(presetEntries(t))
+	if _, exists := got["198.51.100.1"]; exists {
+		t.Fatal("已到期自动条目必须在禁用收尾时清除（D5 到期解封收尾）")
+	}
+	if _, exists := got["198.51.100.2"]; !exists {
+		t.Fatal("未到期条目必须保留")
+	}
+	if _, exists := got["198.51.100.3"]; !exists {
+		t.Fatal("手动条目必须保留")
+	}
+	if reloads != 2 {
+		t.Fatalf("reloads=%d, want 2（到期清理变化重载 1 + 暂存强制收敛 1——禁用后无 flush 点，必须立即落盘）", reloads)
+	}
+	autobanMu.Lock()
+	pending = autobanReloadPending
+	autobanMu.Unlock()
+	if pending {
+		t.Fatal("禁用收尾后暂存必须清除（此后无下一轮）")
+	}
+	var n int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='自动解封' AND username='system' AND detail LIKE '%198.51.100.1%'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("到期解封审计行=%d, want 1", n)
 	}
 }

@@ -211,7 +211,10 @@ func run() error {
 		isMaster = true
 	}
 	services.SetThreatReloader(caddyReloader)
-	services.SetAutobanReloader(caddyReloader) // F73-A：自动封禁名单变化后的重载（60s 节流在 services 层）
+	// F73-A：自动封禁名单变化后的重载。AU-1（第 74 轮）：merge 读改写+重载
+	// 全程持 CaddyOpLock，注入必须为 InLock 变体（caddyReloader 自取锁，
+	// 临界区内重入=死锁）。
+	services.SetAutobanReloader(func() error { return caddyService.GenerateAndApplyConfigForceInLock() })
 	services.InitThreatUpdateManager()
 	services.GetThreatUpdateManager().SetMasterRole(isMaster)
 	crsManager.SetMasterRole(isMaster)

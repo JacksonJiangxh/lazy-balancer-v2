@@ -967,7 +967,11 @@ const regionCascaderOptions = computed(() => {
       label: '海外国家',
       children:
         overseas.length > 0
-          ? overseas.map((country) => ({ value: country, label: zhNames[country] || country }))
+          ? // X5（第 74 轮）：按展示标签（中文简称，未命中回退英文）排序——
+            // 后端 Countries 为英文字典序，中文标签直显时乱序；提交值不变。
+            overseas
+              .map((country) => ({ value: country, label: zhNames[country] || country }))
+              .sort((a, b) => a.label.localeCompare(b.label, 'zh-Hans-CN'))
           : undefined,
     })
   }
