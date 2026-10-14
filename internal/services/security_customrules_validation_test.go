@@ -11,7 +11,8 @@ import (
 func TestBuildCorazaDirectives_logActionOmitsScoreSetvar(t *testing.T) {
 	// Given a policy whose custom rule action is "log"（仅记录）
 	policy := &models.SecurityPolicy{
-		Mode: "blocking",
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
 		CustomRules: json.RawMessage(`[{"id":1,"name":"仅记录规则","enabled":true,"action":"log","score":5,"conditions":[` +
 			`{"target":"uri","operator":"contains","pattern":"/log"}]}]`),
 	}
@@ -33,7 +34,8 @@ func TestBuildCorazaDirectives_logActionOmitsScoreSetvar(t *testing.T) {
 func TestBuildCorazaDirectives_passActionKeepsScoreSetvar(t *testing.T) {
 	// Given a policy whose custom rule action is "pass"（放行计分）
 	policy := &models.SecurityPolicy{
-		Mode: "blocking",
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
 		CustomRules: json.RawMessage(`[{"id":2,"name":"放行计分规则","enabled":true,"action":"pass","score":5,"conditions":[` +
 			`{"target":"uri","operator":"contains","pattern":"/pass"}]}]`),
 	}

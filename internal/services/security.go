@@ -23,10 +23,15 @@ var crsDirectivesDir = "/app/waf/crs"
 // json.RawMessage；行缺失或 disabled 时返回 nil。GetSecurityPoliciesForRule 与
 // 测试辅助 GetSecurityPolicyForRule（security_policy_helpers_test.go）共用本扫描，
 // 保证两条读路径字段级一致。
+//
+// 库值唯一真相（批 3）：anomaly_threshold 列 COALESCE(...,0) 是「无效哨兵」
+// 而非默认值——NULL→0 与带外 <=0 同归渲染层显性报错（BuildCorazaDirectives
+// fail-visible），不再是旧口径的 COALESCE(...,5) 写死兜底。速率/状态列的
+// COALESCE(...,0) 是类型②省略型/条件消费的规范化（0=未启用/未设置）。
 func scanSecurityPolicyByID(policyID int) *models.SecurityPolicy {
 	var p models.SecurityPolicy
 	var ipWhitelist, ipBlacklist, crsRuleGroups, crsExcludedRules, customRules, geoipCountries string
-	err := db.DB.QueryRow(`SELECT id, name, COALESCE(description,''), COALESCE(mode,'off'), COALESCE(anomaly_threshold,5), COALESCE(ip_acl_mode,''), COALESCE(ip_acl_list,'[]'), COALESCE(ip_acl_enabled,0), COALESCE(ip_whitelist_enabled,1), COALESCE(ip_whitelist,'[]'), COALESCE(ip_blacklist,'[]'),
+	err := db.DB.QueryRow(`SELECT id, name, COALESCE(description,''), COALESCE(mode,'off'), COALESCE(anomaly_threshold,0), COALESCE(ip_acl_mode,''), COALESCE(ip_acl_list,'[]'), COALESCE(ip_acl_enabled,0), COALESCE(ip_whitelist_enabled,1), COALESCE(ip_whitelist,'[]'), COALESCE(ip_blacklist,'[]'),
 		COALESCE(rate_limit_enabled,0), COALESCE(rate_limit_rps,0), COALESCE(rate_limit_burst,0), COALESCE(crs_rule_groups,'[]'), COALESCE(crs_excluded_rules,'[]'), COALESCE(custom_rules,'[]'), COALESCE(block_page_id,0), COALESCE(block_status_code,0), enabled, COALESCE(created_at,''), COALESCE(updated_at,''), COALESCE(geoip_countries,'[]'), COALESCE(geoip_mode,'off'), COALESCE(waf_check_response,0), COALESCE(log_request_body,0), COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_refs,'[]'), COALESCE(policy_type,''), COALESCE(trust_detection,0)
 		FROM security_policies WHERE id=? AND enabled=1`, policyID).
 		Scan(&p.ID, &p.Name, &p.Description, &p.Mode, &p.AnomalyThreshold, &p.IPACLMode, &p.IPACLList, &p.IPACLEnabled, &p.IPWhitelistEnabled, &ipWhitelist, &ipBlacklist,
@@ -442,9 +447,15 @@ func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crs
 		if _, err := os.Stat(filepath.Join(crsDirectivesDir, "zz-user-overrides.conf")); err == nil {
 			sb.WriteString("Include /app/waf/crs/zz-user-overrides.conf\n")
 		}
-		if p.AnomalyThreshold > 0 {
-			sb.WriteString(fmt.Sprintf("SecAction \"id:900,phase:1,nolog,pass,setvar:tx.inbound_anomaly_score_threshold=%d\"\n", p.AnomalyThreshold))
+		// 库值唯一真相（批 3）：anomaly_threshold 类型①值型列——写侧 400
+		// （枚举 1/3/5/10/15/20）+ 启动回填（<=0→5）保证库恒有效，直读无条件
+		// 发射 id:900。无效值（NULL 读作哨兵 0/带外直写负值）在此显性报错
+		// （fail-visible），废除原 `>0` 守卫——它让脏行静默跳过 SecAction、
+		// CRS 回落引擎默认阈值，UI 宣称与实际行为漂移。
+		if p.AnomalyThreshold <= 0 {
+			return "", fmt.Errorf("策略 %q 异常阈值无效（anomaly_threshold=%d <=0）：该列为类型①值型列（写侧枚举 1/3/5/10/15/20+启动回填报证），疑似带外直写或旧备份绕过导入门", p.Name, p.AnomalyThreshold)
 		}
+		sb.WriteString(fmt.Sprintf("SecAction \"id:900,phase:1,nolog,pass,setvar:tx.inbound_anomaly_score_threshold=%d\"\n", p.AnomalyThreshold))
 		if len(groups) == 0 {
 			if p.WAFCheckResponse {
 				sb.WriteString("Include /app/waf/crs/rules/*.conf\n")

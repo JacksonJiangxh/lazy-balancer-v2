@@ -48,6 +48,7 @@ func TestRulePayload_pathRuleResponseModeValidation(t *testing.T) {
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			body := fmt.Sprintf(`{"name":"prresp-%d","protocol":"http","domain":"prresp-%d.test","listen_port":%d,"custom_routes_enabled":true,`+
+				`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,`+
 				`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}],"path_rules":[%s]}`, i, i, 19100+i, tc.pathRule)
 			request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 			request.Header.Set("Content-Type", "application/json")

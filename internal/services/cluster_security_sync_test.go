@@ -422,3 +422,32 @@ func TestClusterSnapshot_securityBindingsFullyOrdered(t *testing.T) {
 		t.Fatalf("bindings query=%q, want deterministic ORDER BY rule_caddy_id, policy_id", store.query)
 	}
 }
+
+// 库值唯一真相（批 3）：集群 apply 门值列归一——旧主快照/带外脏值不得在从
+// 节点复制静默漂移：anomaly_threshold<=0/nil→5、rate_limit_burst<0→0、
+// block_status_code 枚举外→403。rate_limit_rps 有意不归一（无默认可归，
+// 镜像语义下主从渲染同报错 fail-visible）。
+func TestApplySnapshot_normalizesPolicyValueColumns(t *testing.T) {
+	_, database := newClusterTestService(t)
+	snapshot := models.ClusterSnapshot{SecurityPolicies: json.RawMessage(`[
+		{"id":7,"name":"dirty","mode":"blocking","anomaly_threshold":0,"rate_limit_burst":-5,"block_status_code":418,"enabled":true},
+		{"id":8,"name":"nil-anomaly","mode":"off","anomaly_threshold":null,"enabled":true}
+	]`)}
+	if err := replaceSnapshotDB(context.Background(), database, snapshot); err != nil {
+		t.Fatalf("apply snapshot: %v", err)
+	}
+
+	var anomaly, burst, block int
+	if err := database.QueryRow(`SELECT anomaly_threshold, rate_limit_burst, block_status_code FROM security_policies WHERE id=7`).Scan(&anomaly, &burst, &block); err != nil {
+		t.Fatalf("read dirty policy: %v", err)
+	}
+	if anomaly != 5 || burst != 0 || block != 403 {
+		t.Fatalf("dirty policy value columns=(%d,%d,%d), want (5,0,403)", anomaly, burst, block)
+	}
+	if err := database.QueryRow(`SELECT anomaly_threshold FROM security_policies WHERE id=8`).Scan(&anomaly); err != nil {
+		t.Fatalf("read nil-anomaly policy: %v", err)
+	}
+	if anomaly != 5 {
+		t.Fatalf("nil anomaly_threshold applied as %d, want 5", anomaly)
+	}
+}

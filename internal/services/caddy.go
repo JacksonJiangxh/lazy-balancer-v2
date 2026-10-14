@@ -987,7 +987,7 @@ func loadSecurityPolicyContext(store caddyConfigStore) (*securityPolicyContext, 
 			args[i] = policyID
 		}
 		rows, err := store.Query(`
-			SELECT id, name, COALESCE(description,''), COALESCE(mode,'off'), COALESCE(anomaly_threshold,5),
+			SELECT id, name, COALESCE(description,''), COALESCE(mode,'off'), COALESCE(anomaly_threshold,0),
 			       COALESCE(ip_acl_mode,''), COALESCE(ip_acl_list,'[]'), COALESCE(ip_acl_enabled,0), COALESCE(ip_whitelist,'[]'), COALESCE(ip_whitelist_enabled,1), COALESCE(ip_blacklist,'[]'),
 			       COALESCE(rate_limit_enabled,0), COALESCE(rate_limit_rps,0), COALESCE(rate_limit_burst,0),
 			       COALESCE(crs_rule_groups,'[]'), COALESCE(crs_excluded_rules,'[]'), COALESCE(custom_rules,'[]'),
@@ -1386,12 +1386,12 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	rows, err := store.Query(`
 		SELECT COALESCE(caddy_id,''), name, protocol, COALESCE(domain,''), listen_port, strategy,
 		       IIF(dynamic_dns IN ('1',1),1,0), IIF(enable_dns_server IN ('1',1),1,0), COALESCE(dns_server,''), COALESCE(dns_family,'ipv4'),
-		       COALESCE(health_check_path,''), COALESCE(health_check_interval,10),
-		       COALESCE(health_check_timeout,2), COALESCE(health_check_unhealthy_threshold,3), COALESCE(health_check_healthy_threshold,2),
+		       COALESCE(health_check_path,''), health_check_interval,
+		       health_check_timeout, health_check_unhealthy_threshold, health_check_healthy_threshold,
 		       IIF(enable_tls IN ('1',1),1,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(tls_cert,''), COALESCE(tls_key,''),
 		       IIF(tls_http_redirect IN ('1',1),1,0),
 		       IIF(enabled IN ('1',1),1,0), IIF(enable_compress IN ('1',1),1,0), COALESCE(compress_types,'gzip'),
-		       IIF(enable_active_health_check IN ('1',1),1,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
+		       IIF(enable_active_health_check IN ('1',1),1,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), tcp_try_interval,
 	       COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0), COALESCE(host_header,''), COALESCE(health_check_host,''),
 		       IIF(log_enabled IN ('1',1),1,0), IIF(custom_routes_enabled IN ('1',1),1,0),
 		       COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
@@ -1618,9 +1618,9 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	}
 	if err := store.QueryRow(`
 		SELECT COALESCE(dns_provider,''), COALESCE(acme_email,''),
-		       COALESCE(caddy_log_level,'info'), COALESCE(caddy_log_size_mb,100),
-		       COALESCE(request_body_max_size_mb,0), COALESCE(http_read_timeout,60), COALESCE(http_write_timeout,60),
-		       COALESCE(http_idle_timeout,120), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,FALSE),
+		       COALESCE(caddy_log_level,'info'), caddy_log_size_mb,
+		       request_body_max_size_mb, http_read_timeout, http_write_timeout,
+		       http_idle_timeout, COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,FALSE),
 		       COALESCE(access_log_json,TRUE), COALESCE(access_log_format,''), COALESCE(proxy_dial_timeout,0),
 		       COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0)
 		FROM global_config WHERE id = 1
@@ -1629,6 +1629,9 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		&global.upstreamKeepaliveTimeout, &global.serverTokensHidden, &accessLogJSON, &accessLogFormat,
 		&global.proxyDialTimeout, &global.proxyResponseHeaderTimeout, &global.proxyReadTimeout, &global.proxyWriteTimeout,
 		&global.proxyStreamTimeout, &global.proxyFlushInterval, &global.proxyStreamCloseDelay); err != nil {
+		// 库值唯一真相（批 1+2）：类型①值型列（caddy_log_size_mb/request_body/
+		// http 三超时）直读——NOT NULL DEFAULT+每启动回填报证 NULL/无效不可达；
+		// 扫描失败（含 NULL）即渲染失败显性暴露，不再 COALESCE 数值默认掩盖。
 		return generationFailure("load global config: %v", err)
 	}
 
@@ -1700,16 +1703,23 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		}
 	}
 
-	applyTimeouts := func(server map[string]interface{}) {
-		if global.httpReadTimeout > 0 {
-			server["read_timeout"] = fmt.Sprintf("%ds", global.httpReadTimeout)
+	// 库值唯一真相（批 1+2）：http_read/write/idle_timeout 为类型①值型列——
+	// 渲染直读无条件发射（原「>0 才发射」的省略形态废除：0 已非合法库值），
+	// <=0 返回错误使配置生成失败（fail-visible）。
+	applyTimeouts := func(server map[string]interface{}) error {
+		if global.httpReadTimeout <= 0 {
+			return fmt.Errorf("全局读取超时无效（http_read_timeout=%d <=0）", global.httpReadTimeout)
 		}
-		if global.httpWriteTimeout > 0 {
-			server["write_timeout"] = fmt.Sprintf("%ds", global.httpWriteTimeout)
+		if global.httpWriteTimeout <= 0 {
+			return fmt.Errorf("全局写入超时无效（http_write_timeout=%d <=0）", global.httpWriteTimeout)
 		}
-		if global.httpIdleTimeout > 0 {
-			server["idle_timeout"] = fmt.Sprintf("%ds", global.httpIdleTimeout)
+		if global.httpIdleTimeout <= 0 {
+			return fmt.Errorf("全局空闲超时无效（http_idle_timeout=%d <=0）", global.httpIdleTimeout)
 		}
+		server["read_timeout"] = fmt.Sprintf("%ds", global.httpReadTimeout)
+		server["write_timeout"] = fmt.Sprintf("%ds", global.httpWriteTimeout)
+		server["idle_timeout"] = fmt.Sprintf("%ds", global.httpIdleTimeout)
+		return nil
 	}
 
 	servers := make(map[string]interface{})
@@ -1746,7 +1756,9 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		server := map[string]interface{}{
 			"listen": []string{fmt.Sprintf(":%d", port)},
 		}
-		applyTimeouts(server)
+		if err := applyTimeouts(server); err != nil {
+			return generationFailure("%v", err)
+		}
 
 		var routes []interface{}
 
@@ -2111,7 +2123,11 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 				MaxConnections: u.MaxConnections,
 			})
 		}
-		layer4Servers[fmt.Sprintf("tcp_%d", port)] = buildTCPServer(ruleConfig)
+		tcpServer, tcpErr := buildTCPServer(ruleConfig)
+		if tcpErr != nil {
+			return generationFailure("build TCP server for rule %s: %v", ruleConfig.CaddyID, tcpErr)
+		}
+		layer4Servers[fmt.Sprintf("tcp_%d", port)] = tcpServer
 	}
 
 	defaultSite := map[string]interface{}{
@@ -2127,7 +2143,9 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			},
 		},
 	}
-	applyTimeouts(defaultSite)
+	if err := applyTimeouts(defaultSite); err != nil {
+		return generationFailure("%v", err)
+	}
 
 	if _, exists := servers["http_80"]; !exists {
 		if len(redirectRoutes) > 0 {
@@ -2229,6 +2247,12 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		apps["tls"] = tlsApp
 	}
 
+	// 库值唯一真相（批 1+2）：caddy_log_size_mb 为类型①值型列，<=0 显性报错
+	// （buildCaddyLogging 的写死 100 兜底废除）；caddy_log_level 非本批治理
+	// 字段，空串=「未配置」语义在 buildCaddyLogging 内归 info（白名单披露）。
+	if caddyLogSizeMB <= 0 {
+		return generationFailure("Caddy 日志轮转大小无效（caddy_log_size_mb=%d <=0）", caddyLogSizeMB)
+	}
 	logging := buildCaddyLogging(caddyLogLevel, caddyLogSizeMB)
 
 	if logsMap, ok := logging["logs"].(map[string]interface{}); ok {
@@ -2320,13 +2344,13 @@ func parseAccessLogFormat(format string) map[string]interface{} {
 }
 
 func buildCaddyLogging(level string, sizeMB int) map[string]interface{} {
+	// sizeMB 由调用方校验恒 >0（库值唯一真相批 1+2：caddy_log_size_mb 类型①
+	// 值型列直读，无效值在调用点显性报错）；level 空串=「未配置」语义归 info
+	//（字符串缺省，非本批治理范围）。
 	if level == "" {
 		level = "info"
 	}
 	level = strings.ToUpper(level)
-	if sizeMB <= 0 {
-		sizeMB = 100
-	}
 	consoleEncoder := map[string]interface{}{"format": "console"}
 	fileWriter := func(filename string) map[string]interface{} {
 		return map[string]interface{}{
@@ -2592,16 +2616,24 @@ type UpstreamConfig struct {
 	OriginDomain string
 }
 
-func resolveRuleOverrides(rule SingleRuleConfig) (requestBodyMaxSizeMB int, upstreamKeepalive int, hideServer bool) {
+// resolveRuleOverrides 规则级覆盖解析（库值唯一真相批 1+2 改造）：
+//   - 请求体上限：规则级>0 用规则级，否则全局值。全局 request_body_max_size_mb
+//     为类型①值型列（NOT NULL DEFAULT 128+启动回填），恒有效——原「仍 <=0 则
+//     写死 128」兜底（D40-2-1 读侧归一）废除：库值无效（<=0）即渲染显性报错
+//     （fail-visible），错误经 buildHTTPHandleChain→generationFailure 使配置
+//     生成失败、旧配置保留。
+//   - keepalive：规则级>0 否则全局值；类型②省略型（0=省略=继承 Caddy/Go
+//     Transport 默认 2 分钟，历史问题 用户裁定），渲染不发 keep_alive。
+//   - Server 头隐藏：2026-09-06 裁定（T-3）仅暴露全局开关（基础设置），规则级
+//     server_tokens_hidden 0/1/2 覆盖为 API/MCP 预留字段——无 UI 入口、不作为
+//     产品功能维护，UI 编辑透传保留 API 已设值。
+func resolveRuleOverrides(rule SingleRuleConfig) (requestBodyMaxSizeMB int, upstreamKeepalive int, hideServer bool, err error) {
 	requestBodyMaxSizeMB = rule.RequestBodyMaxSizeMB
 	if requestBodyMaxSizeMB <= 0 {
 		requestBodyMaxSizeMB = rule.GlobalRequestBodyMaxSizeMB
 	}
 	if requestBodyMaxSizeMB <= 0 {
-		// D40-2-1(用户裁定:统一为 128M):存量 global=0 读侧归一 128——
-		// 「0=不限」语义废除,与 coraza 默认 RequestBodyLimit 对齐;存量库
-		// 不迁移数据,新库由 schema DEFAULT 128 承担。
-		requestBodyMaxSizeMB = 128
+		return 0, 0, false, fmt.Errorf("规则 %s 请求体大小限制无效（规则级与全局 request_body_max_size_mb 均 <=0，库值治理被带外写入破坏）", rule.CaddyID)
 	}
 
 	upstreamKeepalive = rule.UpstreamKeepaliveTimeout
@@ -2609,9 +2641,6 @@ func resolveRuleOverrides(rule SingleRuleConfig) (requestBodyMaxSizeMB int, upst
 		upstreamKeepalive = rule.GlobalUpstreamKeepaliveTimeout
 	}
 
-	// 2026-09-06 裁定（T-3）：Server 头隐藏仅暴露全局开关（基础设置），规则级
-	// server_tokens_hidden 0/1/2 覆盖为 API/MCP 预留字段——无 UI 入口、不作为
-	// 产品功能维护，UI 编辑透传保留 API 已设值。
 	hideServer = rule.GlobalServerTokensHidden
 	if rule.ServerTokensHidden == 1 {
 		hideServer = true
@@ -2619,7 +2648,7 @@ func resolveRuleOverrides(rule SingleRuleConfig) (requestBodyMaxSizeMB int, upst
 		hideServer = false
 	}
 
-	return requestBodyMaxSizeMB, upstreamKeepalive, hideServer
+	return requestBodyMaxSizeMB, upstreamKeepalive, hideServer, nil
 }
 
 func resolveProxyTimeouts(rule SingleRuleConfig) proxyTimeouts {
@@ -2893,10 +2922,14 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 
 		servers[serverName] = server
 	} else {
+		tcpServer, tcpErr := buildTCPServer(rule)
+		if tcpErr != nil {
+			return map[string]interface{}{"error": tcpErr}
+		}
 		apps := map[string]interface{}{
 			"layer4": map[string]interface{}{
 				"servers": map[string]interface{}{
-					fmt.Sprintf("tcp_%d", rule.ListenPort): buildTCPServer(rule),
+					fmt.Sprintf("tcp_%d", rule.ListenPort): tcpServer,
 				},
 			},
 		}
@@ -3408,9 +3441,16 @@ func buildRateLimitErrorRoute(ruleCaddyID string, domainHosts []string, security
 // single per-second zone caps at rps.
 // zone 键必须嵌入 policy_id：caddy-ratelimit 的 UsagePool 按 zone 名进程级共享
 // 计数器，同规则多策略（v2.2.0）若共用 {ruleID} 前缀会静默合并计数。
-func buildRateLimitHandler(ruleCaddyID string, policy *models.SecurityPolicy) map[string]interface{} {
-	if policy == nil || !policy.RateLimitEnabled || policy.RateLimitRPS <= 0 {
-		return nil
+// 库值唯一真相（批 3）：rate_limit_rps 类型①值型列（条件消费——rate_limit_
+// enabled 独立开关）写侧 400（rps>=1，validateRateLimitShape）+ 导入门 400
+// 保证 enabled 行恒有效；enabled=1 且 rps<=0（带外/旧数据）显性报错，废除原
+// 「rps<=0 静默 return nil」的 fail-open——UI 宣称限流启用而实际零强制。
+func buildRateLimitHandler(ruleCaddyID string, policy *models.SecurityPolicy) (map[string]interface{}, error) {
+	if policy == nil || !policy.RateLimitEnabled {
+		return nil, nil
+	}
+	if policy.RateLimitRPS <= 0 {
+		return nil, fmt.Errorf("规则 %s 绑定策略 %q 限流已启用但 rate_limit_rps 无效（%d <=0）：该列为类型①值型列（写侧 rps>=1 校验+导入门 400 拒收），疑似带外直写或旧备份绕过导入门", ruleCaddyID, policy.Name, policy.RateLimitRPS)
 	}
 	// 历史问题 C-N1：sweep_interval 是 caddy-ratelimit Handler 层字段（默认 1m），
 	// 不是 zone 字段——Caddy v2.11.4 对模块载荷 StrictUnmarshalJSON+
@@ -3444,7 +3484,7 @@ func buildRateLimitHandler(ruleCaddyID string, policy *models.SecurityPolicy) ma
 		"handler":        "rate_limit",
 		"rate_limits":    rateLimits,
 		"sweep_interval": "10m",
-	}
+	}, nil
 }
 
 // buildGeoipHandler returns the geoip2region handler, or nil when geoip is disabled.
@@ -3611,13 +3651,16 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 新-1(历史):request_body 限额必须先于全部 waf 处理器——coraza 的
 	// io.Copy 读体受 coraza 默认 128MiB 上限约束,用户限额>128MiB 时该上限先于用户限额生效
 	// (128MiB 内全量缓冲后受限额拒绝,超大 body DoS 面收敛)。
-	effectiveRequestBodyMaxSizeMB, effectiveUpstreamKeepaliveTimeout, effectiveServerTokensHidden := resolveRuleOverrides(rule)
-	if effectiveRequestBodyMaxSizeMB > 0 {
-		securityChain = append(securityChain, map[string]interface{}{
-			"handler":  "request_body",
-			"max_size": int64(effectiveRequestBodyMaxSizeMB) * 1024 * 1024,
-		})
+	// 库值唯一真相（批 1+2）：有效值恒 >0（写侧 400+回填报证），无条件发射；
+	// 无效即上方向错误。
+	effectiveRequestBodyMaxSizeMB, effectiveUpstreamKeepaliveTimeout, effectiveServerTokensHidden, overridesErr := resolveRuleOverrides(rule)
+	if overridesErr != nil {
+		return nil, overridesErr
 	}
+	securityChain = append(securityChain, map[string]interface{}{
+		"handler":  "request_body",
+		"max_size": int64(effectiveRequestBodyMaxSizeMB) * 1024 * 1024,
+	})
 	// 阶段 2（限流）→ 阶段 3（WAF）：全部绑定启用策略（policy_id ASC）的
 	// rate_limit 集中在所有 WAF 引擎之前（限流恒 429；被前位 WAF 拦的请求也
 	// 消耗后位策略配额为已裁定口径），随后每策略独立 coraza 引擎（自定义规则
@@ -3636,7 +3679,11 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	}
 	if securityLibsOK {
 		for _, policy := range policies {
-			if rateLimitHandler := buildRateLimitHandler(rule.CaddyID, policy); rateLimitHandler != nil {
+			rateLimitHandler, rateLimitErr := buildRateLimitHandler(rule.CaddyID, policy)
+			if rateLimitErr != nil {
+				return nil, rateLimitErr
+			}
+			if rateLimitHandler != nil {
 				securityChain = append(securityChain, rateLimitHandler)
 			}
 		}
@@ -3767,21 +3814,21 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			selectionPolicy["weights"] = normalizeWeights(upstreamWeights)
 		}
 		// 重试窗口（方案 C，2026-10-12 裁定——HTTP 与 TCP 值域通用（[-1,60000]），
-		// 但 td==0/-1 渲染语义按协议分叉）：td>0 → 按值发射窗口+间隔（间隔缺省
-		// 250ms）；HTTP 侧 td==0 → 保持现状兜底 5s/250ms（存量 HTTP 行恒 0，行为
-		// 不变）；HTTP 侧 td==-1 → 显式禁用重试——发射 retries=0 且不发射
+		// 但 td==0/-1 渲染语义按协议分叉）：td>0 → 按值发射窗口+间隔（tcp_try_interval
+		// 为类型①值型列，<=0 即库值治理被带外写入破坏→显性报错，原 250ms 写死
+		// 兜底废除）；HTTP 侧 td==0 → 保持现状兜底 5s/250ms（存量 HTTP 行恒 0，
+		// 行为不变）；HTTP 侧 td==-1 → 显式禁用重试——发射 retries=0 且不发射
 		// try_duration/try_interval；TCP 侧 td==0/-1 均零窗口不发射（l4 proxy 无
 		// retries 字段）。NTLM 接管态由 UI 修改器落 -1，渲染对 ntlm_compatible 零感知。
 		loadBalancing := map[string]interface{}{
 			"selection_policy": selectionPolicy,
 		}
 		if rule.TCPTryDuration > 0 {
-			tryInterval := rule.TCPTryInterval
-			if tryInterval <= 0 {
-				tryInterval = 250
+			if rule.TCPTryInterval <= 0 {
+				return nil, fmt.Errorf("规则 %s 重试间隔无效（tcp_try_interval=%d <=0，重试窗口 >0 时为必填值）", rule.CaddyID, rule.TCPTryInterval)
 			}
 			loadBalancing["try_duration"] = fmt.Sprintf("%dms", rule.TCPTryDuration)
-			loadBalancing["try_interval"] = fmt.Sprintf("%dms", tryInterval)
+			loadBalancing["try_interval"] = fmt.Sprintf("%dms", rule.TCPTryInterval)
 		} else if rule.TCPTryDuration == -1 {
 			loadBalancing["retries"] = 0
 		} else {
@@ -3792,14 +3839,17 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	}
 
 	if rule.Protocol == "http" {
+		// 库值唯一真相（批 1+2）：健康检查族为类型①值型列（NOT NULL DEFAULT+启动
+		// 回填+写侧 400+导入归一门），渲染直读零兜底——<=0 即库值治理被带外写入
+		// 破坏，显性报错使配置生成失败、旧配置保留（原 10s/3s/2s/2s 写死兜底废除）。
+		if rule.HealthCheckInterval <= 0 {
+			return nil, fmt.Errorf("规则 %s 健康检查间隔无效（health_check_interval=%d <=0）", rule.CaddyID, rule.HealthCheckInterval)
+		}
 		hcInterval := rule.HealthCheckInterval
-		if hcInterval <= 0 {
-			hcInterval = 10
+		if rule.HealthCheckUnhealthyThreshold <= 0 {
+			return nil, fmt.Errorf("规则 %s 健康检查失败阈值无效（health_check_unhealthy_threshold=%d <=0）", rule.CaddyID, rule.HealthCheckUnhealthyThreshold)
 		}
 		hcThreshold := rule.HealthCheckUnhealthyThreshold
-		if hcThreshold <= 0 {
-			hcThreshold = 3
-		}
 		healthChecks := map[string]interface{}{
 			"passive": map[string]interface{}{
 				"fail_duration": fmt.Sprintf("%ds", hcInterval*3),
@@ -3811,21 +3861,19 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			},
 		}
 		if rule.EnableActiveHealthCheck {
+			// hcPath 空串=「未配置路径」语义（渲染 /），字符串缺省非本批治理范围。
 			hcPath := rule.HealthCheckPath
 			if hcPath == "" {
 				hcPath = "/"
 			}
+			if rule.HealthCheckHealthyThreshold <= 0 {
+				return nil, fmt.Errorf("规则 %s 健康检查恢复阈值无效（health_check_healthy_threshold=%d <=0）", rule.CaddyID, rule.HealthCheckHealthyThreshold)
+			}
 			hcPasses := rule.HealthCheckHealthyThreshold
-			if hcPasses <= 0 {
-				hcPasses = 2
+			if rule.HealthCheckTimeout <= 0 {
+				return nil, fmt.Errorf("规则 %s 健康检查超时无效（health_check_timeout=%d <=0）", rule.CaddyID, rule.HealthCheckTimeout)
 			}
-			// 历史问题 历史问题: interval/timeout 与 passive/TCP 路径同口径默认化——导入路径
-			// 可达 0 值（validateV2BackupRules 不校验该组合），裸值会生成 "0s"。
 			hcTimeout := rule.HealthCheckTimeout
-			if hcTimeout <= 0 {
-				// LB-04：默认与写侧（CreateRule/校验副本）及读取 COALESCE 统一为 2。
-				hcTimeout = 2
-			}
 			active := map[string]interface{}{
 				"uri":      hcPath,
 				"timeout":  fmt.Sprintf("%ds", hcTimeout),
@@ -4033,7 +4081,10 @@ func normalizeWeights(weights []int) []int {
 }
 
 // buildTCPProxyRoute generates the layer4 proxy handler and route for a TCP rule.
-func buildTCPProxyRoute(rule SingleRuleConfig) map[string]interface{} {
+// 库值唯一真相（批 1+2）：健康检查族与 tcp_try_interval 为类型①值型列，渲染
+// 直读零兜底——<=0 返回显性错误（调用方 generationFailure/单规则 error 形态），
+// 原 10s/3s/2s/2s/250ms 写死兜底废除。
+func buildTCPProxyRoute(rule SingleRuleConfig) (map[string]interface{}, error) {
 	upstreamList := make([]interface{}, 0)
 	for _, u := range rule.Upstreams {
 		if !u.Enabled {
@@ -4085,28 +4136,29 @@ func buildTCPProxyRoute(rule SingleRuleConfig) map[string]interface{} {
 	// dead upstream fails over transparently instead of erroring to the
 	// client; rule-level values override when set.
 	// 2026-09 渲染审计：UI 语义「重试窗口 0=不重试」——0 不再兜底 5s，直接
-	// 不发射 try_duration/try_interval（故障切换窗口关闭）；>0 时 interval 缺省 250ms。
+	// 不发射 try_duration/try_interval（故障切换窗口关闭）；>0 时 tcp_try_interval
+	// 为类型①值型列直读，<=0 显性报错（原 250ms 写死兜底废除）。
 	tryDuration := rule.TCPTryDuration
 	if tryDuration > 0 {
-		tryInterval := rule.TCPTryInterval
-		if tryInterval <= 0 {
-			tryInterval = 250
+		if rule.TCPTryInterval <= 0 {
+			return nil, fmt.Errorf("规则 %s 重试间隔无效（tcp_try_interval=%d <=0，重试窗口 >0 时为必填值）", rule.CaddyID, rule.TCPTryInterval)
 		}
 		loadBalancing["try_duration"] = fmt.Sprintf("%dms", tryDuration)
-		loadBalancing["try_interval"] = fmt.Sprintf("%dms", tryInterval)
+		loadBalancing["try_interval"] = fmt.Sprintf("%dms", rule.TCPTryInterval)
 	}
 	if len(upstreamList) > 1 || rule.TCPTryDuration > 0 || rule.TCPTryInterval > 0 {
 		proxyHandler["load_balancing"] = loadBalancing
 	}
 
+	// 健康检查族（批 1+2）：类型①值型列直读，<=0 显性报错。
+	if rule.HealthCheckInterval <= 0 {
+		return nil, fmt.Errorf("规则 %s 健康检查间隔无效（health_check_interval=%d <=0）", rule.CaddyID, rule.HealthCheckInterval)
+	}
 	healthCheckInterval := rule.HealthCheckInterval
-	if healthCheckInterval <= 0 {
-		healthCheckInterval = 10
+	if rule.HealthCheckUnhealthyThreshold <= 0 {
+		return nil, fmt.Errorf("规则 %s 健康检查失败阈值无效（health_check_unhealthy_threshold=%d <=0）", rule.CaddyID, rule.HealthCheckUnhealthyThreshold)
 	}
 	unhealthyThreshold := rule.HealthCheckUnhealthyThreshold
-	if unhealthyThreshold <= 0 {
-		unhealthyThreshold = 3
-	}
 	healthChecks := map[string]interface{}{
 		"passive": map[string]interface{}{
 			"fail_duration": fmt.Sprintf("%ds", healthCheckInterval*3),
@@ -4114,16 +4166,14 @@ func buildTCPProxyRoute(rule SingleRuleConfig) map[string]interface{} {
 		},
 	}
 	if rule.EnableActiveHealthCheck {
+		if rule.HealthCheckTimeout <= 0 {
+			return nil, fmt.Errorf("规则 %s 健康检查超时无效（health_check_timeout=%d <=0）", rule.CaddyID, rule.HealthCheckTimeout)
+		}
 		healthCheckTimeout := rule.HealthCheckTimeout
-		if healthCheckTimeout <= 0 {
-			// 历史问题-1(历史):与 LB-04 统一 2s(写侧默认/COALESCE 读取/
-			// HTTP 渲染兜底三链均 2,独 TCP 链曾=5 分裂)。
-			healthCheckTimeout = 2
+		if rule.HealthCheckHealthyThreshold <= 0 {
+			return nil, fmt.Errorf("规则 %s 健康检查恢复阈值无效（health_check_healthy_threshold=%d <=0）", rule.CaddyID, rule.HealthCheckHealthyThreshold)
 		}
 		healthyThreshold := rule.HealthCheckHealthyThreshold
-		if healthyThreshold <= 0 {
-			healthyThreshold = 2
-		}
 		active := map[string]interface{}{
 			"interval": fmt.Sprintf("%ds", healthCheckInterval),
 			"timeout":  fmt.Sprintf("%ds", healthCheckTimeout),
@@ -4143,13 +4193,17 @@ func buildTCPProxyRoute(rule SingleRuleConfig) map[string]interface{} {
 	if rule.CaddyID != "" {
 		route["@id"] = rule.CaddyID
 	}
-	return route
+	return route, nil
 }
 
 // buildTCPServer generates a layer4 server entry (listen + routes) for a TCP rule.
-func buildTCPServer(rule SingleRuleConfig) map[string]interface{} {
+func buildTCPServer(rule SingleRuleConfig) (map[string]interface{}, error) {
+	proxyRoute, err := buildTCPProxyRoute(rule)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]interface{}{
 		"listen": []string{fmt.Sprintf(":%d", rule.ListenPort)},
-		"routes": []interface{}{buildTCPProxyRoute(rule)},
-	}
+		"routes": []interface{}{proxyRoute},
+	}, nil
 }

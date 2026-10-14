@@ -86,6 +86,7 @@ func TestCreateRule_tcpNormalizesStagePages(t *testing.T) {
 	// When：tcp 创建携带页引用
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{
 		"name":"tcp-pages","protocol":"tcp","listen_port":8083,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}],
 		"block_page_stage1_id":7,"block_page_stage1_status":401,
 		"block_page_stage3_id":8,"block_page_stage3_status":503
@@ -105,6 +106,7 @@ func TestCreateRule_tcpNormalizesStagePages(t *testing.T) {
 	// 回归：http 创建携带 → 保留
 	request = httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(`{
 		"name":"http-pages","protocol":"http","domain":"httppages.example.test","listen_port":8084,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}],
 		"block_page_stage1_id":7,"block_page_stage1_status":403,
 		"block_page_stage3_id":8,"block_page_stage3_status":503

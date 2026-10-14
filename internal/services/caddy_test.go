@@ -578,8 +578,13 @@ func TestDecodePathUpstreams_preservesHTTPSProtocol_andDefaultsEmptyProtocol(t *
 
 func TestBuildTCPProxyRoute_omitsActivePort_withoutExplicitOverride(t *testing.T) {
 	// Given
+	// 库值唯一真相批 1+2：健康检查族为值型列，构造即带有效值（0 值渲染报错）。
 	rule := SingleRuleConfig{
 		CaddyID: "rule-tcp", Protocol: "tcp", EnableActiveHealthCheck: true,
+		HealthCheckInterval:           10,
+		HealthCheckTimeout:            2,
+		HealthCheckUnhealthyThreshold: 3,
+		HealthCheckHealthyThreshold:   2,
 		Upstreams: []UpstreamConfig{
 			{Host: "10.0.0.10", Port: 3306, Enabled: true},
 			{Host: "10.0.0.11", Port: 3307, Enabled: true},
@@ -587,7 +592,10 @@ func TestBuildTCPProxyRoute_omitsActivePort_withoutExplicitOverride(t *testing.T
 	}
 
 	// When
-	route := buildTCPProxyRoute(rule)
+	route, routeErr := buildTCPProxyRoute(rule)
+	if routeErr != nil {
+		t.Fatalf("buildTCPProxyRoute: %v", routeErr)
+	}
 
 	// Then
 	proxy := firstHandler(t, route)
@@ -598,7 +606,11 @@ func TestBuildTCPProxyRoute_omitsActivePort_withoutExplicitOverride(t *testing.T
 	}
 
 	rule.TCPHealthCheckPort = 13306
-	active = mustMap(t, mustMap(t, firstHandler(t, buildTCPProxyRoute(rule))["health_checks"], "health checks")["active"], "active health check")
+	portRoute, portRouteErr := buildTCPProxyRoute(rule)
+	if portRouteErr != nil {
+		t.Fatalf("buildTCPProxyRoute with port: %v", portRouteErr)
+	}
+	active = mustMap(t, mustMap(t, firstHandler(t, portRoute)["health_checks"], "health checks")["active"], "active health check")
 	assertEqual(t, active["port"], 13306)
 }
 
@@ -656,6 +668,13 @@ func baseHTTPRule() SingleRuleConfig {
 		Domain:     "example.com, www.example.com",
 		ListenPort: 80,
 		Strategy:   "weighted_round_robin",
+		// 库值唯一真相批 1+2：健康检查族为值型列，渲染直读零兜底——测试规则
+		// 构造即带库态有效值（0 值渲染显性报错）。
+		HealthCheckInterval:           10,
+		HealthCheckTimeout:            2,
+		HealthCheckUnhealthyThreshold: 3,
+		HealthCheckHealthyThreshold:   2,
+		GlobalRequestBodyMaxSizeMB:    128,
 		Upstreams: []UpstreamConfig{
 			{Host: "10.0.0.10", Port: 8080, Weight: 2, Protocol: "http", Enabled: true},
 			{Host: "10.0.0.11", Port: 8080, Weight: 4, Protocol: "http", Enabled: true},
@@ -1263,13 +1282,21 @@ func TestGenerateSingleRuleCaddyConfig_parityWithProductionBuilders(t *testing.T
 		t.Run("tcp/"+strategy, func(t *testing.T) {
 			rule := SingleRuleConfig{
 				CaddyID: "rule-tcp", Protocol: "tcp", ListenPort: 3306, Strategy: strategy,
-				Upstreams: []UpstreamConfig{{Host: "10.0.0.10", Port: 3306, Weight: 2, Enabled: true}},
+				HealthCheckInterval:           10,
+				HealthCheckTimeout:            2,
+				HealthCheckUnhealthyThreshold: 3,
+				HealthCheckHealthyThreshold:   2,
+				Upstreams:                     []UpstreamConfig{{Host: "10.0.0.10", Port: 3306, Weight: 2, Enabled: true}},
 			}
 			config := GenerateSingleRuleCaddyConfig(rule)
 			apps := mustMap(t, config["apps"], "apps")
 			layer4 := mustMap(t, apps["layer4"], "layer4 app")
 			servers := mustMap(t, layer4["servers"], "layer4 servers")
-			assertEqual(t, servers["tcp_3306"], buildTCPServer(rule))
+			wantServer, serverErr := buildTCPServer(rule)
+			if serverErr != nil {
+				t.Fatalf("buildTCPServer: %v", serverErr)
+			}
+			assertEqual(t, servers["tcp_3306"], wantServer)
 		})
 	}
 }
@@ -1903,8 +1930,9 @@ func TestBuildCorazaDirectives_allowModeDeniesNonListedIPs(t *testing.T) {
 
 func TestBuildCorazaDirectives_chainedCustomRuleCarriesActionsOnlyOnStarter(t *testing.T) {
 	policy := &models.SecurityPolicy{
-		Mode:          "blocking",
-		CRSRuleGroups: json.RawMessage(`["9"]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CRSRuleGroups:    json.RawMessage(`["9"]`),
 		CustomRules: json.RawMessage(`[{"id":7,"name":"链式验证","enabled":true,"action":"block","conditions":[` +
 			`{"target":"uri","operator":"contains","pattern":"/admin"},` +
 			`{"target":"args","operator":"contains","pattern":"debug=1"},` +

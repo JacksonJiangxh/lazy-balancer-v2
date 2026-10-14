@@ -488,18 +488,10 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 	if data.Strategy == "" {
 		data.Strategy = "weighted_round_robin"
 	}
-	if data.HealthCheckInterval == 0 {
-		data.HealthCheckInterval = 10
-	}
-	if data.HealthCheckTimeout == 0 {
-		data.HealthCheckTimeout = 2
-	}
-	if data.HealthCheckUnhealthyThreshold == 0 {
-		data.HealthCheckUnhealthyThreshold = 3
-	}
-	if data.HealthCheckHealthyThreshold == 0 {
-		data.HealthCheckHealthyThreshold = 2
-	}
+	// 库值唯一真相（批 1+2）：健康检查族为类型①值型列——0=未设置的静默归一
+	// （0→10/2/3/2）废除，0 值由下方 <1 边界 400（前端表单初值=默认，清空提交
+	// 被拦）；UpdateRule 非 nil 指针/合并区先沿用存量再抵达本门。CompressTypes
+	// 空串归 gzip 为 HTTP 渲染语义（非本批治理字段）。
 	if data.CompressTypes == "" {
 		data.CompressTypes = "gzip"
 	}
@@ -672,14 +664,15 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		return fmt.Errorf("健康检查超时必须 ≥ 1 秒")
 	}
 
-	// 历史问题：双阈值负值 400（>=0 放行，0=默认语义，与渲染侧 <=0 兜底 3/2
-	// 一致）；放在 0→默认值归一之后，负值不被默认值吞掉。
-	if data.HealthCheckUnhealthyThreshold < 0 {
-		return fmt.Errorf("健康检查失败阈值不能为负数")
+	// 历史问题 曾钉「负值 400（>=0 放行，0=默认语义）」；库值唯一真相批 1+2：
+	// 阈值列转类型①值型，0 无效（渲染兜底 3/2 废除），<1 一律 400——
+	// UpdateRule 显式 0（指针可表达）由此拦截。
+	if data.HealthCheckUnhealthyThreshold < 1 {
+		return fmt.Errorf("健康检查失败阈值必须 ≥ 1")
 	}
 
-	if data.HealthCheckHealthyThreshold < 0 {
-		return fmt.Errorf("健康检查恢复阈值不能为负数")
+	if data.HealthCheckHealthyThreshold < 1 {
+		return fmt.Errorf("健康检查恢复阈值必须 ≥ 1")
 	}
 
 	// 阶段拦截页覆盖层：页引用存在性 + 状态码集合（Update nil 已合并为 0=

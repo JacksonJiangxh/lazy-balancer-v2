@@ -16,13 +16,31 @@ var legacySecurityEnumBackfills = []string{
 	// 历史问题 B-N5：历史问题 F3 之前落库的 threshold=0 行——UI 显示 0、发射端 >0 判断
 	// 跳过阈值 SecAction 而 CRS 回落默认 5（「UI 宣称 0、实际 5」的展示/行为
 	// 漂移，与空串枚举行同型）。归一到 Create 侧 max1(x,5) 的默认值 5。
-	"UPDATE security_policies SET anomaly_threshold=5 WHERE COALESCE(anomaly_threshold,0)=0",
+	// 库值唯一真相（批 3）：口径从 `=0` 扩为 `<=0`——写侧 max1/枚举白名单恒
+	// 产生正值，负值只能是带外直写；NULL 由 COALESCE(...,0) 归并同分支。
+	// 渲染侧对回填后仍无效的值 fail-visible（BuildCorazaDirectives）。
+	"UPDATE security_policies SET anomaly_threshold=5 WHERE COALESCE(anomaly_threshold,0)<=0",
 	// 历史问题（历史）：429 已剔除出拦截状态码白名单（限流专用语义，
 	// overviewmetrics.go 限流卡片按 code=429 计数，WAF 拦截页 429 会混入
 	// 限流指标口径）——存量 429 行归一为默认拦截状态码 403。
 	// security_block_pages 无 status_code 列（db.go:492-502，遗留列口径见
 	// db.go:1234-1236），429 仅可能存于 security_policies。
-	"UPDATE security_policies SET block_status_code=403 WHERE block_status_code=429",
+	// 库值唯一真相（批 3）：从 `=429` 扩为枚举外全集（写侧白名单 0/400/401/
+	// 403/404/503，0=未设置跟随默认 403 为类型②省略型合法值）——旧备份/带外
+	// 脏值（如 418）随启动归一，渲染层不再消费枚举外状态码。
+	"UPDATE security_policies SET block_status_code=403 WHERE block_status_code IS NOT NULL AND block_status_code NOT IN (0,400,401,403,404,503)",
+}
+
+// ValidBlockStatusCode 报告 v 是否为拦截状态码合法值：写侧
+// validateSecurityPolicyEnums 白名单（400/401/403/404/503）+ 0=未设置跟随
+// 默认 403（类型②省略型合法值，批 3 Ruling）。导入门（handlers）与集群
+// apply 门共用本谓词。
+func ValidBlockStatusCode(v int) bool {
+	switch v {
+	case 0, 400, 401, 403, 404, 503:
+		return true
+	}
+	return false
 }
 
 // NormalizeLegacySecurityPolicyEnums 启动时一次性归一 security_policies 的

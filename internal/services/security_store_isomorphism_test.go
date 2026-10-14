@@ -264,8 +264,11 @@ func TestLoadSecurityPolicyContext_toleratesAllNullColumns(t *testing.T) {
 	if string(p.CustomRules) != "[]" {
 		t.Fatalf("CustomRules = %q, want COALESCE 归一化后的 %q", string(p.CustomRules), "[]")
 	}
-	if p.AnomalyThreshold != 5 {
-		t.Fatalf("AnomalyThreshold = %d, want COALESCE 归一化后的 5", p.AnomalyThreshold)
+	// 库值唯一真相（批 3）：anomaly_threshold 的 COALESCE 语义从「默认 5」改
+	// 为「无效哨兵 0」——NULL 不再被写死 5 掩盖，mode!=off 的脏行在渲染层
+	// fail-visible（本行 mode COALESCE 为 off，不消费阈值，预载零报错）。
+	if p.AnomalyThreshold != 0 {
+		t.Fatalf("AnomalyThreshold = %d, want 无效哨兵 0（NULL 不再掩盖为 5，批 3）", p.AnomalyThreshold)
 	}
 	if p.BlockPageID != 0 {
 		t.Fatalf("BlockPageID = %d, want COALESCE 归一化后的 0", p.BlockPageID)

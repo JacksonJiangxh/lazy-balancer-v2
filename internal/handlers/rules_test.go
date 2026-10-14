@@ -35,6 +35,7 @@ func TestCreateRule_disabledRuleDoesNotQueueCertJob(t *testing.T) {
 		"name": "disabled-acme", "protocol": "http", "domain": "disabled-acme.test",
 		"listen_port": 443, "strategy": "weighted_round_robin",
 		"enable_tls": true, "tls_source": "acme_dns", "acme_config_id": 1, "enabled": enabled,
+		"health_check_interval": 10, "health_check_timeout": 2, "health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
 		"upstreams": []map[string]any{{"host": "10.0.0.1", "port": 8080, "weight": 1, "enabled": true}},
 	}
 	raw, _ := json.Marshal(body)

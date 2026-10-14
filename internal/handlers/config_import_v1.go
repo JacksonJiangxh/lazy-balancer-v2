@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 )
@@ -858,9 +859,9 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden,
 			host_header, enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_http_redirect,
 			enable_compress, compress_types, enabled, created_by, updated_by, updated_at, caddy_id, log_enabled)
-		VALUES (?, ?, ?, ?, ?, ?, 0, 0, '', '', ?, 5, ?, 2, ?, 0, 0, 250, 0, 0, 0, ?, ?, ?, 0, 0, ?, ?, ?, ?, 'gzip', ?, ?, ?, datetime('now'), ?, 0)`,
+		VALUES (?, ?, ?, ?, ?, ?, 0, 0, '', '', ?, ?, ?, 2, ?, 0, 0, 250, 0, 0, 0, ?, ?, ?, 0, 0, ?, ?, ?, ?, 'gzip', ?, ?, ?, datetime('now'), ?, 0)`,
 			r.Name, r.Description, r.Protocol, r.Domain, r.ListenPort, r.Strategy,
-			r.HealthInt, r.HealthFails, r.ActiveHC,
+			r.HealthInt, db.DefaultHealthCheckTimeout, r.HealthFails, r.ActiveHC,
 			r.HostHeader, r.EnableTLS, tlsSource(r), r.TLSCert, r.TLSKey, r.Redirect,
 			r.Compress, r.Enabled, userID, userID, caddyID)
 		if err != nil {

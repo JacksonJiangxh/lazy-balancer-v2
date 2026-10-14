@@ -80,6 +80,7 @@ func TestParseCRSExcludedRules_dualFormatAndDegrade(t *testing.T) {
 func TestBuildCorazaDirectives_legacyExcludedRulesEmissionUnchanged(t *testing.T) {
 	scopedExclusionFixture(t)
 	policy := &models.SecurityPolicy{
+		AnomalyThreshold: 5,
 		Mode:             "blocking",
 		CRSRuleGroups:    json.RawMessage(`["42"]`),
 		CRSExcludedRules: json.RawMessage(`["942100","ABCDEF","942100-abc","REQUEST-942.conf","1-999999","932100-932200"]`),
@@ -104,7 +105,8 @@ func TestBuildCorazaDirectives_legacyExcludedRulesEmissionUnchanged(t *testing.T
 func TestBuildCorazaDirectives_scopedExclusionExpandsGroupPerID(t *testing.T) {
 	scopedExclusionFixture(t)
 	policy := &models.SecurityPolicy{
-		Mode: "blocking",
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
 		CRSExcludedRules: json.RawMessage(
 			`[{"target":"42","scope":"ip","ips":"1.1.1.1,2.2.2.2"}]`),
 	}
@@ -141,7 +143,8 @@ func TestBuildCorazaDirectives_scopedExclusionMergesIPsAndListDedup(t *testing.T
 	listID, _ := res.LastInsertId()
 
 	policy := &models.SecurityPolicy{
-		Mode: "blocking",
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
 		CRSExcludedRules: json.RawMessage(`[
 			{"target":"942100","scope":"ip","ips":" 2.2.2.2 ,1.1.1.1","listRefs":[` + jsonInt(listID) + `]},
 			{"target":"942550","scope":"list","listRefs":[` + jsonInt(listID) + `,` + jsonInt(listID) + `]}
@@ -168,7 +171,8 @@ func jsonInt(v int64) string {
 func TestBuildCorazaDirectives_scopedExclusionStaleTargetsSkipped(t *testing.T) {
 	scopedExclusionFixture(t)
 	policy := &models.SecurityPolicy{
-		Mode: "blocking",
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
 		CRSExcludedRules: json.RawMessage(`[
 			{"target":"999999","scope":"ip","ips":"1.1.1.1"},
 			{"target":"99","scope":"list","listRefs":[7]}
@@ -191,7 +195,8 @@ func TestBuildCorazaDirectives_scopedExclusionEmptyListSkipped(t *testing.T) {
 	}
 	listID, _ := res.LastInsertId()
 	policy := &models.SecurityPolicy{
-		Mode: "blocking",
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
 		CRSExcludedRules: json.RawMessage(
 			`[{"target":"42","scope":"list","listRefs":[` + jsonInt(listID) + `]}]`),
 	}
@@ -204,8 +209,9 @@ func TestBuildCorazaDirectives_scopedExclusionEmptyListSkipped(t *testing.T) {
 func TestBuildCorazaDirectives_hybridRuleGroupsParentFileSupplement(t *testing.T) {
 	scopedExclusionFixture(t)
 	policy := &models.SecurityPolicy{
-		Mode:          "blocking",
-		CRSRuleGroups: json.RawMessage(`["942100"]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CRSRuleGroups:    json.RawMessage(`["942100"]`),
 	}
 	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
 	if !strings.Contains(directives, "Include /app/waf/crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf\n") {
@@ -226,8 +232,9 @@ func TestBuildCorazaDirectives_hybridRuleGroupsGroupCoveredSkipsSupplement(t *te
 	scopedExclusionFixture(t)
 	// 组已选中：glob 覆盖父文件 → 不补 Include、不补删（ID 选择冗余无害）
 	policy := &models.SecurityPolicy{
-		Mode:          "blocking",
-		CRSRuleGroups: json.RawMessage(`["42","942100"]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CRSRuleGroups:    json.RawMessage(`["42","942100"]`),
 	}
 	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
 	if !strings.Contains(directives, "Include /app/waf/crs/rules/REQUEST-942-*.conf\n") {
@@ -250,8 +257,9 @@ func TestBuildCorazaDirectives_hybridRuleGroupsGroupCoveredSkipsSupplement(t *te
 func TestBuildCorazaDirectives_hybridRuleGroupsStaleIDSkipped(t *testing.T) {
 	scopedExclusionFixture(t)
 	policy := &models.SecurityPolicy{
-		Mode:          "blocking",
-		CRSRuleGroups: json.RawMessage(`["999999"]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CRSRuleGroups:    json.RawMessage(`["999999"]`),
 	}
 	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
 	if strings.Contains(directives, "SecRuleRemoveById") {
@@ -276,8 +284,9 @@ func TestBuildCorazaDirectives_hybridRuleGroupsStaleIDSkipped(t *testing.T) {
 func TestBuildCorazaDirectives_infraGroupsForceIncluded(t *testing.T) {
 	scopedExclusionFixture(t)
 	policy := &models.SecurityPolicy{
-		Mode:          "blocking",
-		CRSRuleGroups: json.RawMessage(`["42"]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CRSRuleGroups:    json.RawMessage(`["42"]`),
 	}
 	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
 	idx901 := strings.Index(directives, "Include /app/waf/crs/rules/REQUEST-901-INITIALIZATION.conf")
@@ -333,6 +342,7 @@ func TestBuildCorazaDirectives_infraGroupsForceIncluded(t *testing.T) {
 func TestBuildCorazaDirectives_legacyInfraGroupOrderPreserved(t *testing.T) {
 	scopedExclusionFixture(t)
 	policy := &models.SecurityPolicy{
+		AnomalyThreshold: 5,
 		Mode:             "blocking",
 		WAFCheckResponse: true,
 		CRSRuleGroups:    json.RawMessage(`["42","01"]`),
@@ -355,14 +365,14 @@ func TestBuildCorazaDirectives_legacyInfraGroupOrderPreserved(t *testing.T) {
 
 func TestBuildCorazaDirectives_emptyGroupsKeepAllEffectiveSemantics(t *testing.T) {
 	scopedExclusionFixture(t)
-	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: "blocking"}, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 0))
 	if !strings.Contains(directives, "Include /app/waf/crs/rules/REQUEST-*.conf\n") {
 		t.Fatalf("empty groups must keep REQUEST-only all-effective include:\n%s", directives)
 	}
 	if strings.Contains(directives, "Include /app/waf/crs/rules/*.conf\n") {
 		t.Fatalf("WAFCheckResponse=false must not include RESPONSE files:\n%s", directives)
 	}
-	directives = mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: "blocking", WAFCheckResponse: true}, nil, "", false, 0))
+	directives = mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", WAFCheckResponse: true}, nil, "", false, 0))
 	if !strings.Contains(directives, "Include /app/waf/crs/rules/*.conf\n") {
 		t.Fatalf("empty groups + response check must keep all-file include:\n%s", directives)
 	}
@@ -370,7 +380,7 @@ func TestBuildCorazaDirectives_emptyGroupsKeepAllEffectiveSemantics(t *testing.T
 
 func TestBuildCorazaDirectives_groupOnlySelectionEmissionEquivalent(t *testing.T) {
 	scopedExclusionFixture(t)
-	policy := &models.SecurityPolicy{Mode: "blocking", CRSRuleGroups: json.RawMessage(`["42"]`)}
+	policy := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", CRSRuleGroups: json.RawMessage(`["42"]`)}
 	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
 	if !strings.Contains(directives, "Include /app/waf/crs/rules/REQUEST-942-*.conf\n") {
 		t.Fatalf("pure group selection must keep glob include:\n%s", directives)
@@ -415,11 +425,11 @@ func TestCRSExcludedEntry_IPsDualShapeRoundTrip(t *testing.T) {
 // 响应体永不进规则），关闭时不得出现（避免无谓的响应体缓冲）。
 func TestBuildCorazaDirectives_responseBodyMimeTypeEmitted(t *testing.T) {
 	scopedExclusionFixture(t)
-	on := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: "detection", WAFCheckResponse: true, CRSRuleGroups: json.RawMessage(`["51"]`)}, nil, "", false, 0))
+	on := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "detection", WAFCheckResponse: true, CRSRuleGroups: json.RawMessage(`["51"]`)}, nil, "", false, 0))
 	if !strings.Contains(on, "SecResponseBodyMimeType text/plain text/html text/xml application/json") {
 		t.Fatalf("WAFCheckResponse on must emit SecResponseBodyMimeType:\n%s", on)
 	}
-	off := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: "detection", CRSRuleGroups: json.RawMessage(`["42"]`)}, nil, "", false, 0))
+	off := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "detection", CRSRuleGroups: json.RawMessage(`["42"]`)}, nil, "", false, 0))
 	if strings.Contains(off, "SecResponseBodyMimeType") {
 		t.Fatalf("WAFCheckResponse off must not emit SecResponseBodyMimeType:\n%s", off)
 	}
@@ -431,6 +441,7 @@ func TestBuildCorazaDirectives_storedInitExclusionsSkipped(t *testing.T) {
 	scopedExclusionFixture(t)
 	for _, target := range []string{`"01"`, `"901200"`, `"REQUEST-901-INITIALIZATION.conf"`, `"900500-902000"`} {
 		policy := &models.SecurityPolicy{
+			AnomalyThreshold: 5,
 			Mode:             "blocking",
 			CRSRuleGroups:    json.RawMessage(`["42"]`),
 			CRSExcludedRules: json.RawMessage(`[` + target + `]`),
@@ -445,6 +456,7 @@ func TestBuildCorazaDirectives_storedInitExclusionsSkipped(t *testing.T) {
 	}
 	// scoped（ip 作用域）存量 901 排除同样跳过：不得出现针对 901 的 ctl 展开
 	policy := &models.SecurityPolicy{
+		AnomalyThreshold: 5,
 		Mode:             "blocking",
 		CRSRuleGroups:    json.RawMessage(`["42"]`),
 		CRSExcludedRules: json.RawMessage(`[{"target":"901200","scope":"ip","ips":"203.0.113.7"}]`),
@@ -455,6 +467,7 @@ func TestBuildCorazaDirectives_storedInitExclusionsSkipped(t *testing.T) {
 	}
 	// 非 901 排除不受影响（回归保护）：942 组号排除照常发射
 	policy = &models.SecurityPolicy{
+		AnomalyThreshold: 5,
 		Mode:             "blocking",
 		CRSRuleGroups:    json.RawMessage(`["42"]`),
 		CRSExcludedRules: json.RawMessage(`["42"]`),
@@ -479,6 +492,7 @@ func TestBuildCorazaDirectives_infraIncludeGuardedByExistence(t *testing.T) {
 	t.Cleanup(func() { crsDirectivesDir = old })
 
 	policy := &models.SecurityPolicy{
+		AnomalyThreshold: 5,
 		Mode:             "blocking",
 		WAFCheckResponse: true,
 		CRSRuleGroups:    json.RawMessage(`["42"]`),

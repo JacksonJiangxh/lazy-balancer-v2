@@ -223,10 +223,11 @@ func TestBuildCorazaDirectives_geoipMovedToPrecheck(t *testing.T) {
 		t.Fatalf("pure-geoip policy must emit no engine directives (geoip lives in precheck), got:\n%s", got)
 	}
 	blocking := &models.SecurityPolicy{
-		ID:             43,
-		Mode:           "blocking",
-		GeoIPMode:      "deny",
-		GeoIPCountries: json.RawMessage(`["海外"]`),
+		ID:               43,
+		Mode:             "blocking",
+		AnomalyThreshold: 5,
+		GeoIPMode:        "deny",
+		GeoIPCountries:   json.RawMessage(`["海外"]`),
 	}
 	directives := mustDirectives(BuildCorazaDirectives(blocking, nil, "", false, 0))
 	if strings.Contains(directives, "id:8,") || strings.Contains(directives, "GeoIP 区域拦截") {
@@ -561,7 +562,7 @@ func TestBuildHTTPHandleChain_stripsGeoIPHeadersBeforeUpstream(t *testing.T) {
 		{name: "with host header override", hostHeader: "api.example.com"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rule := SingleRuleConfig{CaddyID: "lb_strip", Protocol: "http", ListenPort: 80, HostHeader: tc.hostHeader}
+			rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_strip", Protocol: "http", ListenPort: 80, HostHeader: tc.hostHeader}
 			chain, err := buildHTTPHandleChain(rule, upstreams)
 			if err != nil {
 				t.Fatalf("buildHTTPHandleChain: %v", err)

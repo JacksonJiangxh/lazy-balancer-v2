@@ -32,7 +32,7 @@ func TestRuleWrite_cliRejectionBlocksCommit(t *testing.T) {
 
 	// When
 	rec := httptest.NewRecorder()
-	body := `{"name":"cli-gate","protocol":"http","domain":"cli-gate.example.test","listen_port":8093,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
+	body := `{"name":"cli-gate","protocol":"http","domain":"cli-gate.example.test","listen_port":8093,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(rec, request)
@@ -64,7 +64,7 @@ func TestRuleWrite_cliUnavailableFailsOpen(t *testing.T) {
 
 	// When
 	rec := httptest.NewRecorder()
-	body := `{"name":"cli-open","protocol":"http","domain":"cli-open.example.test","listen_port":8094,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
+	body := `{"name":"cli-open","protocol":"http","domain":"cli-open.example.test","listen_port":8094,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(rec, request)
@@ -220,9 +220,9 @@ func TestRuleWrites_applyErrorStatusMapping(t *testing.T) {
 		wantMsg  string
 	}{
 		{name: "create 拒绝400", seed: func() {}, mount: func(r *gin.Engine, h *Handlers) { r.POST("/rules", h.CreateRule) }, method: http.MethodPost, path: "/rules",
-			body: `{"name":"d2","protocol":"http","domain":"d2.example.test","listen_port":8095,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, rejected: true, wantMsg: "规则未创建"},
+			body: `{"name":"d2","protocol":"http","domain":"d2.example.test","listen_port":8095,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, rejected: true, wantMsg: "规则未创建"},
 		{name: "create 传输500", seed: func() {}, mount: func(r *gin.Engine, h *Handlers) { r.POST("/rules", h.CreateRule) }, method: http.MethodPost, path: "/rules",
-			body: `{"name":"d2t","protocol":"http","domain":"d2t.example.test","listen_port":8096,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, rejected: false, wantMsg: "规则未创建"},
+			body: `{"name":"d2t","protocol":"http","domain":"d2t.example.test","listen_port":8096,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`, rejected: false, wantMsg: "规则未创建"},
 		{name: "update 拒绝400", seed: func() {
 			seedAuditRule(t, "lb_d2", "before", "d2u.example.test", 8097, true, "manual", false)
 			seedAuditUpstream(t, "lb_d2")

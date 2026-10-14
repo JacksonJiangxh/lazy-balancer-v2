@@ -24,6 +24,7 @@ func TestCreateRule_persists_explicit_enabled_false(t *testing.T) {
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
 	body := `{"name":"copy","protocol":"tcp","listen_port":17001,"enabled":false,` +
+		`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,` +
 		`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
@@ -52,6 +53,7 @@ func TestCreateRule_defaults_to_enabled_when_field_absent(t *testing.T) {
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
 	body := `{"name":"classic","protocol":"tcp","listen_port":17002,` +
+		`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,` +
 		`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
@@ -168,6 +170,7 @@ func TestCreateRule_rejects_configured_admin_panel_port(t *testing.T) {
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
 	body := `{"name":"panel-port","protocol":"tcp","listen_port":8800,` +
+		`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,` +
 		`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
@@ -203,14 +206,17 @@ func TestUpdateRule_rejects_configured_admin_panel_port(t *testing.T) {
 	}
 }
 
-// ---- LB-04：读取口径 health_check_timeout NULL 默认 2（原 5，与写侧/渲染统一）----
+// ---- LB-04 曾钉「读取口径 health_check_timeout NULL 默认 2」；库值唯一真相
+// 批 1+2：health_check_timeout 为 NOT NULL 值型列（fresh DDL），NULL 行结构上
+// 不可达——存量库可空列 NULL 由启动回填报 2 后直读，读侧 COALESCE 归一退役。
+// 展示层直读库值，无缺省替换。
 
-func TestListRules_defaults_NULL_health_check_timeout_to_2(t *testing.T) {
-	// Given：存量 NULL timeout 行（导入/直改 DB 形态）
+func TestListRules_displaysStoredHealthCheckTimeoutVerbatim(t *testing.T) {
+	// Given：治理后合法落库值（如 7）——列表接口原样展示，不替换默认
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enabled,health_check_timeout)
-		VALUES ('lb_hcnull','hc-null','http','hcnull.example.test',18083,'weighted_round_robin',1,NULL)`); err != nil {
+		VALUES ('lb_hcnull','hc-null','http','hcnull.example.test',18083,'weighted_round_robin',1,7)`); err != nil {
 		t.Fatalf("seed rule: %v", err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,enabled,protocol) VALUES ('lb_hcnull','127.0.0.1',9000,1,'http')`); err != nil {
@@ -224,7 +230,7 @@ func TestListRules_defaults_NULL_health_check_timeout_to_2(t *testing.T) {
 	// When
 	router.ServeHTTP(response, request)
 
-	// Then：列表响应中该规则的 health_check_timeout 按统一默认 2 回显
+	// Then：列表响应中该规则的 health_check_timeout 原样回显库值 7（无缺省替换）
 	if response.Code != http.StatusOK {
 		t.Fatalf("list rules status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -242,8 +248,8 @@ func TestListRules_defaults_NULL_health_check_timeout_to_2(t *testing.T) {
 		if rule.CaddyID != "lb_hcnull" {
 			continue
 		}
-		if rule.HealthCheckTimeout != 2 {
-			t.Fatalf("NULL health_check_timeout read back as %d, want 2 (unified default)", rule.HealthCheckTimeout)
+		if rule.HealthCheckTimeout != 7 {
+			t.Fatalf("stored health_check_timeout read back as %d, want 7 (库值直读，无默认替换)", rule.HealthCheckTimeout)
 		}
 		return
 	}
@@ -394,15 +400,22 @@ func TestUpdateRule_persists_explicit_health_check_thresholds(t *testing.T) {
 		t.Fatalf("explicit thresholds must persist: unhealthy=%d healthy=%d, want 7/6", unhealthy, healthy)
 	}
 
-	// 形状二：显式 0 → 落库 0（0=渲染默认 3/2 语义，与渲染兜底一致）
+	// 形状二（库值唯一真相批 1+2 改判）：显式 0 → 400——阈值列为类型①值型，
+	// 0 无效（原 历史问题「显式 0=落库 0，渲染兜底 3/2」随渲染兜底废除一并退役；
+	// 0=「沿用存量」仅是非指针字段的 API 编码，指针阈值列显式 0 直达 <1 门）。
 	seedHCThresholdRule(t, "lb_hc_zero", 17113)
 	rec = put("lb_hc_zero", `{"health_check_unhealthy_threshold":0,"health_check_healthy_threshold":0}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "阈值必须 ≥ 1") {
+		t.Fatalf("explicit zero thresholds must 400, got %d %s", rec.Code, rec.Body.String())
+	}
+	// 形状三：合法显式阈值照常落库
+	rec = put("lb_hc_zero", `{"health_check_unhealthy_threshold":5,"health_check_healthy_threshold":4}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("update status=%d body=%s, want 200", rec.Code, rec.Body.String())
 	}
 	unhealthy, healthy = readHCThresholds(t, "lb_hc_zero")
-	if unhealthy != 0 || healthy != 0 {
-		t.Fatalf("explicit zero thresholds must persist: unhealthy=%d healthy=%d, want 0/0", unhealthy, healthy)
+	if unhealthy != 5 || healthy != 4 {
+		t.Fatalf("explicit thresholds must persist: unhealthy=%d healthy=%d, want 5/4", unhealthy, healthy)
 	}
 }
 
@@ -421,13 +434,13 @@ func TestCreateRule_rejects_negative_health_check_thresholds(t *testing.T) {
 		return response
 	}
 
-	rec := post(`{"name":"neg-unhealthy","protocol":"tcp","listen_port":17121,"health_check_unhealthy_threshold":-1,` +
+	rec := post(`{"name":"neg-unhealthy","protocol":"tcp","listen_port":17121,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":-1,` +
 		`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`)
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "失败阈值") {
 		t.Fatalf("negative unhealthy threshold must 400, got %d %s", rec.Code, rec.Body.String())
 	}
 
-	rec = post(`{"name":"neg-healthy","protocol":"tcp","listen_port":17122,"health_check_healthy_threshold":-1,` +
+	rec = post(`{"name":"neg-healthy","protocol":"tcp","listen_port":17122,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":-1,` +
 		`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`)
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "恢复阈值") {
 		t.Fatalf("negative healthy threshold must 400, got %d %s", rec.Code, rec.Body.String())

@@ -94,6 +94,12 @@ func mpGenHTTPRule(caddyID, domain string) SingleRuleConfig {
 		Domain:     domain,
 		ListenPort: 8080,
 		Strategy:   "weighted_round_robin",
+		// 库值唯一真相批 1+2：值型列构造即带库态有效值（0 值渲染显性报错）。
+		HealthCheckInterval:           10,
+		HealthCheckTimeout:            2,
+		HealthCheckUnhealthyThreshold: 3,
+		HealthCheckHealthyThreshold:   2,
+		GlobalRequestBodyMaxSizeMB:    128,
 		Upstreams: []UpstreamConfig{
 			{Host: "10.0.0.10", Port: 8080, Weight: 1, Protocol: "http", Enabled: true},
 		},

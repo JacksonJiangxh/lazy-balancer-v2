@@ -78,8 +78,9 @@ func TestDirectiveLineLength_engineGuardViaGiantCustomPattern(t *testing.T) {
 func TestDirectiveLineLength_normalListsPass(t *testing.T) {
 	// Given：大名单（回归形状——名单走文件投影，护栏不误伤）
 	policy := &models.SecurityPolicy{
-		Mode:        "blocking",
-		IPBlacklist: jsonRawIPList(oversizedIPList(5000)),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		IPBlacklist:      jsonRawIPList(oversizedIPList(5000)),
 	}
 
 	// When

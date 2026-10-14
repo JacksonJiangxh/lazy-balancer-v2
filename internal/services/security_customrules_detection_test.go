@@ -11,7 +11,8 @@ import (
 func TestCustomRuleBlockActionSurvivesDetectionMode(t *testing.T) {
 	// Given a detection-mode policy with a blocking custom rule
 	policy := &models.SecurityPolicy{
-		Mode: "detection",
+		AnomalyThreshold: 5,
+		Mode:             "detection",
 		CustomRules: json.RawMessage(`[{"id":21,"name":"硬拦截","enabled":true,"action":"block","score":5,"conditions":[` +
 			`{"target":"uri","operator":"contains","pattern":"/hard-block"}]}]`),
 	}

@@ -158,6 +158,11 @@ func TestBuildCorazaDirectives_BodyAccessTruthTable(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.mode+"/"+tc.rulesState+"/ip="+boolStr(tc.ipControl), func(t *testing.T) {
 			p := &models.SecurityPolicy{Mode: tc.mode, Enabled: true}
+			// 批 3：blocking/detection 消费 anomaly_threshold（类型①值型列）——
+			// 表内 CRS-active 模式给合法值 5，off/custom_only 不消费不设值。
+			if tc.mode == "blocking" || tc.mode == "detection" {
+				p.AnomalyThreshold = 5
+			}
 			switch tc.rulesState {
 			case "parked-enabled":
 				p.CustomRules = rulesJSON(true)
@@ -231,7 +236,7 @@ func boolStr(b bool) string {
 // 本策略信任集照常拦截(「信任仅豁免所属策略」裁定边界恢复)。
 func TestBuildCorazaDirectives_multiPolicyDenySelfTrustExclusion(t *testing.T) {
 	// Given:多策略模式(flag=true)+deny 名单+本策略信任名单
-	p := &models.SecurityPolicy{Mode: "blocking", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["198.51.100.9"]`, IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["10.0.0.1"]`)}
+	p := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["198.51.100.9"]`, IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["10.0.0.1"]`)}
 	// When
 	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0))
 	// Then:id:2 以链式自排除形态存在(非抑制删除、非平原形态)
@@ -249,7 +254,7 @@ func TestBuildCorazaDirectives_multiPolicyDenySelfTrustExclusion(t *testing.T) {
 
 func TestBuildCorazaDirectives_multiPolicyDenyNoTrustPlain(t *testing.T) {
 	// Given:多策略+deny 名单+信任关闭(无排除项→平原 id:2,形状不变)
-	p := &models.SecurityPolicy{Mode: "blocking", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["198.51.100.9"]`, IPWhitelistEnabled: false, IPWhitelist: json.RawMessage(`[]`)}
+	p := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["198.51.100.9"]`, IPWhitelistEnabled: false, IPWhitelist: json.RawMessage(`[]`)}
 	// When
 	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0))
 	// Then
@@ -263,7 +268,7 @@ func TestBuildCorazaDirectives_multiPolicyDenyNoTrustPlain(t *testing.T) {
 
 func TestBuildCorazaDirectives_singlePolicyTrustNoChain(t *testing.T) {
 	// Given:单策略(flag=false)+deny+信任(回归形状:同实例 DetectionOnly 已正确,无链)
-	p := &models.SecurityPolicy{Mode: "blocking", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["198.51.100.9"]`, IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["10.0.0.1"]`)}
+	p := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["198.51.100.9"]`, IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["10.0.0.1"]`)}
 	// When
 	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", false, 0))
 	// Then
@@ -277,7 +282,7 @@ func TestBuildCorazaDirectives_singlePolicyTrustNoChain(t *testing.T) {
 
 func TestBuildCorazaDirectives_multiPolicyBlacklistSelfTrustExclusion(t *testing.T) {
 	// Given:多策略+旧版黑名单+本策略信任
-	p := &models.SecurityPolicy{Mode: "blocking", IPBlacklist: json.RawMessage(`["198.51.100.9"]`), IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["10.0.0.1"]`)}
+	p := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPBlacklist: json.RawMessage(`["198.51.100.9"]`), IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["10.0.0.1"]`)}
 	// When
 	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0))
 	// Then:id:4 链式自排除
@@ -288,7 +293,7 @@ func TestBuildCorazaDirectives_multiPolicyBlacklistSelfTrustExclusion(t *testing
 
 func TestBuildCorazaDirectives_multiPolicyAllowSelfTrustExclusion(t *testing.T) {
 	// Given:多策略+allow 模式+本策略信任(信任 IP 不在白名单时不拦,预检记录)
-	p := &models.SecurityPolicy{Mode: "blocking", IPACLEnabled: true, IPACLMode: "allow", IPACLList: `["1.2.3.4"]`, IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["10.0.0.1"]`)}
+	p := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPACLEnabled: true, IPACLMode: "allow", IPACLList: `["1.2.3.4"]`, IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["10.0.0.1"]`)}
 	// When
 	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0))
 	// Then:id:2 链式(!@ipListFast allow AND !@ipListFast trust → deny)

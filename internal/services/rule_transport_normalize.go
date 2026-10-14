@@ -15,12 +15,21 @@ package services
 // DB 存储格式的统一（消除三种并存）由迁移层 normalizeRuleTimestampsMigration
 // 与从端写入侧（平面格式直写）承担，与本函数正交。
 
-import "lazy-balancer-v2/internal/models"
+import (
+	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/models"
+)
 
 // normalizeRuleForTransport 规则传输归一（单一事实源）：
 // ① body 上限钳 [0,4096]（历史问题 C-F1）；
 // ② TCP+TLS 死形态清除（历史问题 A-N1）；
 // ③ TCP 行 HTTP 专属七字段归零（LBH-A-U1 同族，2026-10-11 裁定并入导出侧）。
+// ④ 健康检查族/tcp_try_interval 值型列回填（库值唯一真相批 1+2，2026-10-14
+//
+//	用户裁定）：<=0 归治理默认（db.Default* 常量）——主端带外脏行/旧版本
+//	主端快照在传输门归一，三面（导出/从端落库/备份导入）同构，rules 节哈希
+//	主从相等的不变量基础；渲染层对这批列已零兜底，脏值不允许越过本门。
+//
 // 调用方：snapshotRules（主端导出）、insertSnapshotRules（从端落库）、
 // 备份导入后置归一——三面同构是 rules 节哈希主从相等的不变量基础。
 //
@@ -37,6 +46,23 @@ func normalizeRuleForTransport(rule *models.LbRule) {
 		rule.RequestBodyMaxSizeMB = 0
 	} else if rule.RequestBodyMaxSizeMB > 4096 {
 		rule.RequestBodyMaxSizeMB = 4096
+	}
+	// ④ 健康检查族/tcp_try_interval 值型列回填（库值唯一真相批 1+2）：渲染层
+	// 零兜底，脏值在传输门归治理默认。仅规范 <=0；用户已设有效值不触碰。
+	if rule.HealthCheckInterval <= 0 {
+		rule.HealthCheckInterval = db.DefaultHealthCheckInterval
+	}
+	if rule.HealthCheckTimeout <= 0 {
+		rule.HealthCheckTimeout = db.DefaultHealthCheckTimeout
+	}
+	if rule.HealthCheckUnhealthyThreshold <= 0 {
+		rule.HealthCheckUnhealthyThreshold = db.DefaultHealthCheckUnhealthyThreshold
+	}
+	if rule.HealthCheckHealthyThreshold <= 0 {
+		rule.HealthCheckHealthyThreshold = db.DefaultHealthCheckHealthyThreshold
+	}
+	if rule.TCPTryInterval <= 0 {
+		rule.TCPTryInterval = db.DefaultTCPTryInterval
 	}
 	if rule.Protocol == "tcp" {
 		if rule.EnableTLS {

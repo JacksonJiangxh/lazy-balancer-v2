@@ -445,13 +445,31 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 	}
 
 	// 历史问题 历史问题：上限 4096MB——无上限时天文数字在渲染侧 int64 乘法（MB→字节）
-	// 回绕可正可负：负/零让 Caddy requestbody 处理器不生效（限制静默取消）。
-	if req.RequestBodyMaxSizeMB != nil && (*req.RequestBodyMaxSizeMB < 0 || *req.RequestBodyMaxSizeMB > 4096) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "request_body_max_size_mb 必须在 0-4096 MB 之间"})
+	// 回绕可正可负。库值唯一真相（批 1+2）：request_body_max_size_mb 为类型①
+	// 值型列（0 无效，1-4096），0 不再是「跟随全局/不限」——落库值恒有效，
+	// 渲染直读零兜底。
+	if req.RequestBodyMaxSizeMB != nil && (*req.RequestBodyMaxSizeMB < 1 || *req.RequestBodyMaxSizeMB > 4096) {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "request_body_max_size_mb 必须在 1-4096 MB 之间"})
 		return
 	}
-	if (req.HTTPReadTimeout != nil && *req.HTTPReadTimeout < 0) || (req.HTTPWriteTimeout != nil && *req.HTTPWriteTimeout < 0) || (req.HTTPIdleTimeout != nil && *req.HTTPIdleTimeout < 0) || (req.UpstreamKeepaliveTimeout != nil && *req.UpstreamKeepaliveTimeout < 0) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "超时时间不能为负数"})
+	// 库值唯一真相（批 1+2）：http_read/write/idle_timeout 为类型①值型列
+	// （NOT NULL DEFAULT 60/60/120+启动回填），>=1 合法——0 的「省略=引擎默认」
+	// 语义废除（渲染无条件发射库值）。upstream_keepalive_timeout 保持类型②
+	// 省略型（0=继承 Caddy/Go Transport 默认 2 分钟，历史问题 用户裁定），仅拒负数。
+	if req.HTTPReadTimeout != nil && *req.HTTPReadTimeout < 1 {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "http_read_timeout 必须大于 0"})
+		return
+	}
+	if req.HTTPWriteTimeout != nil && *req.HTTPWriteTimeout < 1 {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "http_write_timeout 必须大于 0"})
+		return
+	}
+	if req.HTTPIdleTimeout != nil && *req.HTTPIdleTimeout < 1 {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "http_idle_timeout 必须大于 0"})
+		return
+	}
+	if req.UpstreamKeepaliveTimeout != nil && *req.UpstreamKeepaliveTimeout < 0 {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Keepalive超时不能为负数"})
 		return
 	}
 	if (req.ProxyDialTimeout != nil && *req.ProxyDialTimeout < 0) ||

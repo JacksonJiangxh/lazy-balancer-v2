@@ -148,7 +148,7 @@ func TestTrustedDetection_id12InPrecheckAndEngines(t *testing.T) {
 // BuildCorazaDirectives 的 stage0DetectionTrust 变参（第 6 参）：引擎内 id:12
 // 由渲染链按规则绑定的 stage0 保留检测策略并集透传。
 func TestBuildCorazaDirectives_stage0DetectionTrustEmitsId12(t *testing.T) {
-	policy := &models.SecurityPolicy{Mode: "blocking"}
+	policy := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}
 	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, []string{"10.0.0.9", "192.168.1.0/24"}))
 	want := `"id:12,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly"`
 	if !strings.Contains(directives, want) || !strings.Contains(directives, "@ipListFast ") {

@@ -93,6 +93,7 @@ func TestPathRuleUpstreams_duplicateRejected(t *testing.T) {
 	router.POST("/rules", handler.CreateRule)
 
 	body := `{"name":"path-dup","protocol":"http","domain":"pathdup.test","listen_port":18581,"custom_routes_enabled":true,` +
+		`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,` +
 		`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}],` +
 		`"path_rules":[{"path":"/a","match_type":"prefix","upstreams":[{"address":"Up.Test","port":9001},{"address":"up.test ","port":9001}]}]}`
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
@@ -127,6 +128,7 @@ func TestCreateRule_tcpNormalizationPrecedesTLSValidation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Given：TCP 创建载荷携带 TLS 死形态（UI 不发，API/MCP 直构可达）
 			body := fmt.Sprintf(`{"name":%q,"protocol":"tcp","listen_port":%d,%s,`+
+				`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,`+
 				`"upstreams":[{"host":"10.0.0.1","port":9000,"enabled":true}]}`, tc.name, tc.port, tc.tls)
 			request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 			request.Header.Set("Content-Type", "application/json")
@@ -168,6 +170,7 @@ func TestCreateRule_tcpDropsHTTPOnlyFieldFamily(t *testing.T) {
 		`"host_header":"dead.example","health_check_path":"/healthz",` +
 		`"enable_compress":true,"compress_types":"zstd",` +
 		`"request_body_max_size_mb":64,"upstream_keepalive_timeout":30,"server_tokens_hidden":1,` +
+		`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,` +
 		`"upstreams":[{"host":"10.0.0.1","port":9000,"enabled":true}]}`
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")

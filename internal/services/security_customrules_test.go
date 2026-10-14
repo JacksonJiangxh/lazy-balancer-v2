@@ -103,8 +103,9 @@ func TestResolvePolicyCustomRules_chunkFailureDoesNotInflateDanglingLog(t *testi
 func TestBuildCorazaDirectives_customRuleDenyOmitsStatusCode(t *testing.T) {
 	// Given a blocking policy with a custom block rule carrying a custom status code
 	policy := &models.SecurityPolicy{
-		Mode:          "blocking",
-		CRSRuleGroups: json.RawMessage(`["9"]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CRSRuleGroups:    json.RawMessage(`["9"]`),
 		CustomRules: json.RawMessage(`[{"id":12,"name":"拒绝规则","enabled":true,"action":"block","score":5,"conditions":[` +
 			`{"target":"uri","operator":"contains","pattern":"/blocked"}]}]`),
 	}
@@ -123,9 +124,10 @@ func TestBuildCorazaDirectives_customRuleDenyOmitsStatusCode(t *testing.T) {
 
 func TestBuildCorazaDirectives_userAgentTargetUsesColonNotation(t *testing.T) {
 	policy := &models.SecurityPolicy{
-		Mode:          "blocking",
-		CRSRuleGroups: json.RawMessage(`["9"]`),
-		CustomRules:   json.RawMessage(`[{"id":9,"name":"ua","enabled":true,"action":"pass","score":1,"conditions":[{"target":"user_agent","operator":"contains","pattern":"sqlmap"}]}]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CRSRuleGroups:    json.RawMessage(`["9"]`),
+		CustomRules:      json.RawMessage(`[{"id":9,"name":"ua","enabled":true,"action":"pass","score":1,"conditions":[{"target":"user_agent","operator":"contains","pattern":"sqlmap"}]}]`),
 	}
 	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
 	if !strings.Contains(directives, "REQUEST_HEADERS:User-Agent") {
@@ -141,8 +143,9 @@ func TestBuildCorazaDirectives_userAgentTargetUsesColonNotation(t *testing.T) {
 // 空格分词，「等于 /admin」实际是「包含单词 admin」），与 UI「等于」承诺不符。
 func TestBuildCorazaDirectives_equalsOperatorEmitsStreq(t *testing.T) {
 	policy := &models.SecurityPolicy{
-		Mode:        "blocking",
-		CustomRules: json.RawMessage(`[{"id":11,"name":"等于规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"equals","pattern":"/admin"}]}]`),
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CustomRules:      json.RawMessage(`[{"id":11,"name":"等于规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"equals","pattern":"/admin"}]}]`),
 	}
 	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
 	if !strings.Contains(directives, `SecRule REQUEST_URI "@streq /admin"`) {

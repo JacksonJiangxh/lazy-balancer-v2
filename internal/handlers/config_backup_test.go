@@ -2787,3 +2787,85 @@ func TestValidateV2BackupSecurityPolicies_rejectsUnknownPolicyType(t *testing.T)
 		})
 	}
 }
+
+// 库值唯一真相（批 3）：安全策略值列导入门归一——旧备份可携带治理前形态
+// （anomaly_threshold=0/NULL、burst 负值、block_status_code 枚举外如 429/418），
+// 在导入门写回归一值后 restoreTable 直写，库恒有效（渲染层已零兜底/fail-
+// visible）；缺失键由 backupTableNullDefaults 的 NULL→默认通道承担。
+// rate_limit_rps 不归一：enabled=1 时 rps<1 保持 400 拒绝（写侧同口径）。
+func TestValidateV2BackupSecurityPolicies_normalizesLegacyValueColumns(t *testing.T) {
+	t.Run("dirty-row-normalized", func(t *testing.T) {
+		tables := map[string][]map[string]any{
+			"security_policies": {{
+				"name":              "legacy",
+				"anomaly_threshold": int64(0),
+				"rate_limit_burst":  int64(-5),
+				"block_status_code": int64(451),
+			}},
+		}
+		if err := validateV2BackupSecurityPolicies(tables); err != nil {
+			t.Fatalf("normalize-on-import must not reject: %v", err)
+		}
+		row := tables["security_policies"][0]
+		if got := row["anomaly_threshold"]; got != int64(5) {
+			t.Fatalf("anomaly_threshold=%v (%T), want 5", got, got)
+		}
+		if got := row["rate_limit_burst"]; got != int64(0) {
+			t.Fatalf("rate_limit_burst=%v (%T), want 0", got, got)
+		}
+		if got := row["block_status_code"]; got != int64(403) {
+			t.Fatalf("block_status_code=%v (%T), want 403（451 非写侧白名单，枚举外归一默认；429 同）", got, got)
+		}
+	})
+	t.Run("null-anomaly-normalized", func(t *testing.T) {
+		tables := map[string][]map[string]any{
+			"security_policies": {{"name": "nullish", "anomaly_threshold": nil}},
+		}
+		if err := validateV2BackupSecurityPolicies(tables); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		if got := tables["security_policies"][0]["anomaly_threshold"]; got != int64(5) {
+			t.Fatalf("anomaly_threshold=%v (%T), want 5", got, got)
+		}
+	})
+	t.Run("valid-values-untouched", func(t *testing.T) {
+		tables := map[string][]map[string]any{
+			"security_policies": {{
+				"name":              "valid",
+				"anomaly_threshold": int64(10),
+				"rate_limit_burst":  int64(50),
+				"block_status_code": int64(503),
+			}},
+		}
+		if err := validateV2BackupSecurityPolicies(tables); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		row := tables["security_policies"][0]
+		if row["anomaly_threshold"] != int64(10) || row["rate_limit_burst"] != int64(50) || row["block_status_code"] != int64(503) {
+			t.Fatalf("valid values must pass through: %v", row)
+		}
+	})
+	t.Run("garbage-anomaly-normalized", func(t *testing.T) {
+		tables := map[string][]map[string]any{
+			"security_policies": {{"name": "garbage", "anomaly_threshold": "abc"}},
+		}
+		if err := validateV2BackupSecurityPolicies(tables); err != nil {
+			t.Fatalf("non-integer anomaly must normalize, not reject (渲染层 fail-visible 语义归属 services): %v", err)
+		}
+		if got := tables["security_policies"][0]["anomaly_threshold"]; got != int64(5) {
+			t.Fatalf("anomaly_threshold=%v (%T), want 5", got, got)
+		}
+	})
+	t.Run("enabled-rps-zero-still-rejected", func(t *testing.T) {
+		tables := map[string][]map[string]any{
+			"security_policies": {{
+				"name":               "rl",
+				"rate_limit_enabled": true,
+				"rate_limit_rps":     int64(0),
+			}},
+		}
+		if err := validateV2BackupSecurityPolicies(tables); err == nil {
+			t.Fatal("enabled=1 + rps=0 must stay rejected (写侧同口径), not normalized")
+		}
+	})
+}

@@ -60,13 +60,17 @@ type configChangePlan struct {
 }
 
 func loadConfigSnapshot() (configSnapshot, error) {
+	// 库值唯一真相（批 1+2）：类型①值型列（caddy_log_size_mb/request_body/
+	// http 三超时）直读——变更预览展示库值原样，不再 COALESCE 数值默认掩盖
+	//（NOT NULL DEFAULT+每启动回填报证不可达；upstream_keepalive_timeout 为
+	// 类型②省略型保留 COALESCE 0）。
 	var old configSnapshot
 	err := db.DB.QueryRow(`SELECT COALESCE(acme_email,''), COALESCE(dns_provider,'dnspod'), COALESCE(dns_credentials,''),
 		COALESCE(cert_expiry_days,30), COALESCE(cert_renewal_days,30), COALESCE(cert_renewal_attempts,5),
 		COALESCE(default_ca_provider_id,0), COALESCE(log_level,'info'),
 		COALESCE(timezone,'Asia/Shanghai'),
-		COALESCE(caddy_log_level,'info'), COALESCE(caddy_log_size_mb,100), COALESCE(request_body_max_size_mb,0),
-		COALESCE(http_read_timeout,60), COALESCE(http_write_timeout,60), COALESCE(http_idle_timeout,120),
+		COALESCE(caddy_log_level,'info'), caddy_log_size_mb, request_body_max_size_mb,
+		http_read_timeout, http_write_timeout, http_idle_timeout,
 		COALESCE(upstream_keepalive_timeout,0),
 		COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 		COALESCE(server_tokens_hidden,FALSE),
