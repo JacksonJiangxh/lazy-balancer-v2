@@ -382,3 +382,44 @@ func TestAutobanPreset_categoryDescriptionLocked(t *testing.T) {
 		t.Fatalf("同值提交 status=%d body=%s, want 200（仅拦「变更」）", rec.Code, rec.Body.String())
 	}
 }
+
+// 启用时自动创建预置策略（用户裁定 2026-10-14）：stage1/IPACL deny/仅引用自动
+// 封禁名单/零规则绑定；幂等（二次启用不重复建）。基线钉豁免 RED（新行为）。
+func TestAutobanPresetPolicyIdempotent(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	// 迁移可能已播种预置名单（id 自增）——按名取真实 id，缺失才补种。
+	var listID int64
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name='自动封禁名单' AND COALESCE(system,0)=1`).Scan(&listID); err != nil {
+		if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (id,name,category,entries,system) VALUES (99,'自动封禁名单','自动封禁','[]',1)`); err != nil {
+			t.Fatalf("seed list: %v", err)
+		}
+		listID = 99
+	}
+	c1, err1 := services.EnsureAutobanPolicy()
+	if err1 != nil || !c1 {
+		t.Fatalf("首次应创建: created=%v err=%v", c1, err1)
+	}
+	var count int
+	db.DB.QueryRow(`SELECT COUNT(*) FROM security_policies WHERE name=?`, services.AutobanPresetPolicyName).Scan(&count)
+	if count != 1 {
+		t.Fatalf("策略数=%d want 1", count)
+	}
+	var refs string
+	db.DB.QueryRow(`SELECT ip_acl_list_refs FROM security_policies WHERE name=?`, services.AutobanPresetPolicyName).Scan(&refs)
+	if refs != fmt.Sprintf("[%d]", listID) {
+		t.Fatalf("refs=%q want [%d]（仅引用自动封禁名单）", refs, listID)
+	}
+	var binds int
+	db.DB.QueryRow(`SELECT COUNT(*) FROM security_policy_bindings WHERE policy_id=(SELECT id FROM security_policies WHERE name=?)`, services.AutobanPresetPolicyName).Scan(&binds)
+	if binds != 0 {
+		t.Fatalf("规则绑定=%d want 0（不关联规则）", binds)
+	}
+	c2, err2 := services.EnsureAutobanPolicy()
+	if err2 != nil || c2 {
+		t.Fatalf("二次应跳过: created=%v err=%v", c2, err2)
+	}
+	db.DB.QueryRow(`SELECT COUNT(*) FROM security_policies WHERE name=?`, services.AutobanPresetPolicyName).Scan(&count)
+	if count != 1 {
+		t.Fatalf("幂等后策略数=%d want 1", count)
+	}
+}

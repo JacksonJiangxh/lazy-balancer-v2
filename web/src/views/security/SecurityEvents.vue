@@ -425,7 +425,7 @@ const AUTOBAN_ENABLE_CONFIRM_HTML = `
     <li>持续攻击期间每分钟至多一次全量配置渲染与重载，存在一定性能开销</li>
   </ul>
   <div class="autoban-confirm-title autoban-confirm-title--gap">使用建议</div>
-  <p class="autoban-confirm-text">对大多数部署而言，IP 威胁库 + CRS + 地域拦截已能挡住 99% 以上的恶意请求，少量恶意 IP 手动拉黑即可。确认要启用自动封禁吗？建议先以观察模式运行，确认封禁建议准确后再转为正式封禁。</p>
+  <p class="autoban-confirm-text">对大多数部署而言，IP 威胁库 + CRS + 地域拦截已能挡住 99% 以上的恶意请求，少量恶意 IP 手动拉黑即可。确认要启用自动封禁吗？建议先以观察模式运行，确认封禁建议准确后再转为正式封禁。<br/><b>启用后将自动创建「自动封禁 IP 黑名单」策略（引用自动封禁名单）——请到「安全策略」把它关联到需要防护的规则，封禁才会生效。</b></p>
 </div>`
 const confirmAutobanApply = async (): Promise<boolean> => {
   try {
@@ -801,13 +801,15 @@ onMounted(() => {
 .autoban-confirm-list li { position: relative; padding-left: 14px; margin: 0 0 6px; color: var(--el-text-color-regular, #606266); }
 .autoban-confirm-list li::before { content: ''; position: absolute; left: 2px; top: 9px; width: 4px; height: 4px; border-radius: 50%; background: var(--el-color-warning, #e6a23c); }
 .autoban-confirm-text { margin: 0; color: var(--el-text-color-regular, #606266); }
-/* MessageBox 结构修正：无默认图标时消息区占满、按钮区上边距收敛 */
-:global(.autoban-confirm-box .el-message-box__container) { padding: 0 28px; }
-:global(.autoban-confirm-box .el-message-box__message) { display: block; padding: 10px 0 0; }
-:global(.autoban-confirm-box .el-message-box__title) { padding-left: 28px; }
-:global(.autoban-confirm-box .el-message-box__btns) { padding: 14px 28px 6px 0; }
-:global(.autoban-confirm-box .el-message-box__header) { padding-bottom: 4px; }
-.autoban-confirm-list { margin: 0; padding-left: 20px; }
+/* MessageBox 四区统一版式：外框零内边距，标题/正文/按钮区各自 24px 侧距——
+   与 Element Plus 默认窄内边距（15px）整体覆盖，视觉边距一致 */
+:global(.autoban-confirm-box) { padding: 0; }
+:global(.autoban-confirm-box .el-message-box__header) { padding: 20px 24px 8px; }
+:global(.autoban-confirm-box .el-message-box__title) { padding: 0; font-size: 16px; font-weight: 600; }
+:global(.autoban-confirm-box .el-message-box__container) { padding: 0 24px; }
+:global(.autoban-confirm-box .el-message-box__message) { display: block; padding: 4px 0 0; }
+:global(.autoban-confirm-box .el-message-box__btns) { padding: 18px 24px 20px 0; }
+.autoban-confirm-list { margin: 0; padding: 0; list-style: none; }
 .autoban-confirm-list li + li { margin-top: 4px; }
 .autoban-confirm-text { margin: 0; }
 </style>
