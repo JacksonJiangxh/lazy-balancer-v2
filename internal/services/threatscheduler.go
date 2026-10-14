@@ -40,6 +40,11 @@ func SetThreatAutoUpdate(enabled bool) error {
 
 // ThreatAutoUpdateEnabled 读任务级总闸（读错 fail-closed=视为关）。
 func ThreatAutoUpdateEnabled() bool {
+	// B1-8（历史）：nil 库守卫（生产不可达——引擎 wire 晚于 db.Initialize）
+	// ——wire Fn 族读 nil 库 fail-closed，不 panic。
+	if db.DB == nil {
+		return false
+	}
 	var v int
 	if err := db.DB.QueryRow(`SELECT COALESCE(threat_auto_update,1) FROM global_config WHERE id=1`).Scan(&v); err != nil {
 		return false

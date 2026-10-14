@@ -43,6 +43,11 @@ func (h *Handlers) UpdateAutobanConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
+	if !req.Enabled {
+		// AU-8/D5（历史）：禁用路径先收尾再停调度——禁用后无循环 flush/
+		// 到期清理点，最后一次封禁的暂存重载与已到期条目必须在此收敛落盘。
+		services.AutobanDisableFlush()
+	}
 	if te := services.TaskEngine(); te != nil {
 		if req.Enabled {
 			te.StartLoop(services.AutobanTaskID)

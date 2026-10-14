@@ -219,20 +219,24 @@ func stopCaddy(adminURL string) error {
 
 func (h *Handlers) GetConfig(c *gin.Context) {
 	var cfg models.GlobalConfig
+	// G4（历史）：治理默认值列的读路径 SQL 字面量是默认值的第三次复制
+	//（DDL DEFAULT+启动回填+此处）——改参数绑定 db.Default* 常量单源化，
+	// 常量变更不再需要三处同步。非治理列（log 级别/布尔/保留期等）字面量
+	// 原状（不在库值唯一真相治理批次内）。
 	err := db.DB.QueryRow(`
 		SELECT id, caddy_config, dns_provider,
-		       COALESCE(acme_email,'') as acme_email, COALESCE(cert_expiry_days,30) as cert_expiry_days,
+		       COALESCE(acme_email,'') as acme_email, COALESCE(cert_expiry_days,?) as cert_expiry_days,
 		       COALESCE(cert_renewal_days,30) as cert_renewal_days,
 		       COALESCE(cert_renewal_attempts,5) as cert_renewal_attempts,
 		       COALESCE(default_ca_provider_id,0) as default_ca_provider_id,
 		       log_level,
 
 		       COALESCE(caddy_log_level,'info') as caddy_log_level,
-		       COALESCE(caddy_log_size_mb,100) as caddy_log_size_mb,
-		       CASE WHEN COALESCE(request_body_max_size_mb,0)>0 THEN request_body_max_size_mb ELSE 128 END as request_body_max_size_mb,
-		       COALESCE(http_read_timeout,60) as http_read_timeout,
-		       COALESCE(http_write_timeout,60) as http_write_timeout,
-		       COALESCE(http_idle_timeout,120) as http_idle_timeout,
+		       COALESCE(caddy_log_size_mb,?) as caddy_log_size_mb,
+		       CASE WHEN COALESCE(request_body_max_size_mb,0)>0 THEN request_body_max_size_mb ELSE ? END as request_body_max_size_mb,
+		       COALESCE(http_read_timeout,?) as http_read_timeout,
+		       COALESCE(http_write_timeout,?) as http_write_timeout,
+		       COALESCE(http_idle_timeout,?) as http_idle_timeout,
 		       COALESCE(upstream_keepalive_timeout,0) as upstream_keepalive_timeout,
 		       COALESCE(proxy_dial_timeout,0) as proxy_dial_timeout,
 		       COALESCE(proxy_response_header_timeout,0) as proxy_response_header_timeout,
@@ -262,7 +266,12 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	       is_master, COALESCE(master_url, '') as master_url, sync_interval,
 	       last_sync, updated_at
 		FROM global_config WHERE id = 1
-	`).Scan(
+	`,
+		// G4：占位符序=cert_expiry_days/caddy_log_size_mb/request_body_max_size_mb/
+		// http_read_timeout/http_write_timeout/http_idle_timeout。
+		db.DefaultCertExpiryDays, db.DefaultCaddyLogSizeMB, db.DefaultRequestBodyMaxSizeMB,
+		db.DefaultHTTPReadTimeout, db.DefaultHTTPWriteTimeout, db.DefaultHTTPIdleTimeout,
+	).Scan(
 		&cfg.ID, &cfg.CaddyConfig, &cfg.DNSProvider,
 		&cfg.ACMEEmail, &cfg.CertExpiryDays, &cfg.CertRenewalDays, &cfg.CertRenewalAttempts, &cfg.DefaultCAProviderID,
 		&cfg.LogLevel,

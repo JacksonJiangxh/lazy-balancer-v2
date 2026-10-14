@@ -216,6 +216,33 @@ var CaddyOpLock = &CaddyWriteLock{}
 // 跳过 /load 调用（Caddy 端本就零 provision），调用方据此不落「重载」审计。
 var errSameConfig = errors.New("config byte-identical to running config")
 
+// caddyConfigDegradationKey 渲染降级标记（D3，历史）：渲染层某组件读库/
+// 解析失败按安全侧兜底渲染（可用性优先，不 fail-visible——一份带外脏行不得
+// 阻断整份配置生成），但「渲染产物与 UI 宣称分叉」的事实随配置图携带，apply
+// 成功后落审计行+caddy_apply_error 横幅，面板可见。
+const caddyConfigDegradationKey = "__lazy_balancer_generation_degradation"
+
+// lastRenderDegradation 记录最近一次成功应用的配置携带的降级说明（空=无降级）。
+// recordCaddyApplyResult 的成功清除先查本值——降级不是应用失败，横幅不得被
+// 成功清除吞掉；下次干净渲染+成功 apply 时置空，横幅随清除恢复正常语义。
+var (
+	renderDegradationMu    sync.Mutex
+	lastRenderDegradationV string
+)
+
+// LastRenderDegradation 返回最近一次成功应用的配置携带的渲染降级说明。
+func LastRenderDegradation() string {
+	renderDegradationMu.Lock()
+	defer renderDegradationMu.Unlock()
+	return lastRenderDegradationV
+}
+
+func setLastRenderDegradation(msg string) {
+	renderDegradationMu.Lock()
+	lastRenderDegradationV = msg
+	renderDegradationMu.Unlock()
+}
+
 // IsSameConfig 报告错误为「配置同字节未变化」短路。
 func IsSameConfig(err error) bool { return errors.Is(err, errSameConfig) }
 
@@ -313,6 +340,20 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 	// 整轮渲染 apply 成功（=本轮全部在役名单已投影且被 Caddy 接受）后统一
 	// GC 名单投影文件（历史补充轮 历史问题）——此时引用集落齐，差集安全。
 	maybeGCStaleIPListFiles()
+	// D3（历史）：渲染降级随配置图到达此处——成功应用后落审计行+
+	// caddy_apply_error 横幅（不阻断应用）；干净渲染置空状态，handlers 侧
+	// recordCaddyApplyResult(nil) 据此恢复常规清除。
+	if degraded, _ := config[caddyConfigDegradationKey].(string); degraded != "" {
+		setLastRenderDegradation(degraded)
+		RecordAuditLog("system", "应用降级", "Caddy配置", degraded, "")
+		if db.DB != nil {
+			if _, err := db.DB.Exec(`UPDATE global_config SET caddy_apply_error=? WHERE id=1`, degraded); err != nil {
+				Logf("warn", "D3: 持久化渲染降级横幅失败: %v", err)
+			}
+		}
+	} else {
+		setLastRenderDegradation("")
+	}
 	return nil
 }
 
@@ -1144,36 +1185,38 @@ func GenerateCaddyConfig(overrides ...*models.UpdateConfigRequest) map[string]in
 }
 
 // trustedProxyServerFields 渲染受信代理（CDN 真实 IP）的 server 级字段
-// （v2.3.x）：enabled=false 或读错时返回空 map（读错 fail-closed=不注入，
-// 与「未启用」同形——宁可退回 socket IP 也不采信未校验的头）。启用时：
+// （v2.3.x）：enabled=false 时返回 (nil, "")（未启用非降级）；读错/解析失败时
+// 返回 (nil, 降级说明)——按未启用渲染（fail-closed=不注入，与「未启用」同形
+// ——宁可退回 socket IP 也不采信未校验的头），但降级说明随配置图携带落横幅
+// （D3，历史：面板「已启用」与实际渲染分叉必须可见）。启用时：
 // trusted_proxies 静态网段（内联 ∪ 引用名单展开，2026-10-12）+
 // trusted_proxies_strict（1/0 恒输出）+ client_ip_headers（非空才输出，
 // 空=仅 X-Forwarded-For）。store 形参保证事务内渲染（ApplyConfigFromTx）
 // 读到未提交的设置与名单。
-func trustedProxyServerFields(store caddyConfigStore) map[string]interface{} {
+func trustedProxyServerFields(store caddyConfigStore) (map[string]interface{}, string) {
 	var enabled, strict bool
 	var rangesJSON, refsJSON, headersJSON string
 	if err := store.QueryRow(`SELECT COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_ranges,'[]'), COALESCE(trusted_proxy_range_refs,'[]'), COALESCE(trusted_proxy_headers,'[]'), COALESCE(trusted_proxy_strict,1) FROM global_config WHERE id = 1`).
 		Scan(&enabled, &rangesJSON, &refsJSON, &headersJSON, &strict); err != nil {
 		Logf("error", "读取受信代理设置失败（按未启用渲染）: %v", err)
-		return nil
+		return nil, fmt.Sprintf("受信代理设置读取失败，本轮渲染按未启用处理（CDN 真实 IP 还原失效，面板显示的启用态与实际渲染分叉）: %v", err)
 	}
 	if !enabled {
-		return nil
+		return nil, ""
 	}
 	var ranges, headers []string
 	if err := json.Unmarshal([]byte(rangesJSON), &ranges); err != nil {
 		Logf("error", "解析受信代理网段失败（按未启用渲染）: %v", err)
-		return nil
+		return nil, fmt.Sprintf("受信代理网段配置解析失败，本轮渲染按未启用处理（CDN 真实 IP 还原失效，面板显示的启用态与实际渲染分叉）: %v", err)
 	}
 	if err := json.Unmarshal([]byte(headersJSON), &headers); err != nil {
 		Logf("error", "解析受信代理请求头失败（按未启用渲染）: %v", err)
-		return nil
+		return nil, fmt.Sprintf("受信代理请求头配置解析失败，本轮渲染按未启用处理（CDN 真实 IP 还原失效，面板显示的启用态与实际渲染分叉）: %v", err)
 	}
 	merged, err := expandTrustedProxyRanges(store, ranges, refsJSON)
 	if err != nil {
 		Logf("error", "展开受信代理引用名单失败（按未启用渲染）: %v", err)
-		return nil
+		return nil, fmt.Sprintf("受信代理引用名单展开失败，本轮渲染按未启用处理（CDN 真实 IP 还原失效，面板显示的启用态与实际渲染分叉）: %v", err)
 	}
 	fields := map[string]interface{}{
 		"trusted_proxies": map[string]interface{}{
@@ -1189,7 +1232,7 @@ func trustedProxyServerFields(store caddyConfigStore) map[string]interface{} {
 	if len(headers) > 0 {
 		fields["client_ip_headers"] = headers
 	}
-	return fields
+	return fields, ""
 }
 
 // expandTrustedProxyRanges 合并内联网段与引用名单条目（2026-10-12）：
@@ -1255,16 +1298,18 @@ func expandTrustedProxyRanges(store caddyConfigStore, inline []string, refsJSON 
 // （含 :80 默认站）；layer4/admin 不在此函数视野内，天然不注入。
 // 产出为共享实例（fields 同一份 map 经 maps.Copy 逐键并入各 server，
 // 值内嵌套结构仍被多 server 共享引用）——消费方禁变异，如需改动须先深拷贝。
-func mergeTrustedProxyServerFields(servers map[string]interface{}, store caddyConfigStore) {
-	fields := trustedProxyServerFields(store)
+// 返回渲染降级说明（D3，历史；空=无降级），调用方随配置图携带。
+func mergeTrustedProxyServerFields(servers map[string]interface{}, store caddyConfigStore) string {
+	fields, degraded := trustedProxyServerFields(store)
 	if len(fields) == 0 {
-		return
+		return degraded
 	}
 	for _, serverVal := range servers {
 		if srv, ok := serverVal.(map[string]interface{}); ok {
 			maps.Copy(srv, fields)
 		}
 	}
+	return degraded
 }
 
 // acmeCertCandidatesQuery 只取「启用 + TLS + acme_dns」规则名下未禁用任务的
@@ -2215,8 +2260,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	}
 
 	// 受信代理（CDN 真实 IP）：每个 HTTP server（含 :80 默认站）注入；
-	// 未启用时零字段（行为不变）。
-	mergeTrustedProxyServerFields(servers, store)
+	// 未启用时零字段（行为不变）。降级说明随配置图携带（D3）。
+	trustedProxyDegraded := mergeTrustedProxyServerFields(servers, store)
 
 	apps := map[string]interface{}{
 		// observe_catchall_hosts：Host 头驱动标签基数面——任意 Host 命中落地页
@@ -2310,6 +2355,9 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		},
 		"apps":    apps,
 		"logging": logging,
+	}
+	if trustedProxyDegraded != "" {
+		conf[caddyConfigDegradationKey] = trustedProxyDegraded
 	}
 	if filesSnapshot != nil {
 		conf[caddyCertFilesSnapshotKey] = filesSnapshot
@@ -2947,8 +2995,9 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 	// 受信代理（CDN 真实 IP）：单规则预览路径同样注入（读已提交库，
 	// 与 GenerateSingleRuleCaddyConfig 的只读语义一致）。db.DB 缺失
 	//（纯内存单规则测试等）时跳过——与「读错按未启用渲染」同口径。
+	trustedProxyDegraded := ""
 	if db.DB != nil {
-		mergeTrustedProxyServerFields(servers, db.DB)
+		trustedProxyDegraded = mergeTrustedProxyServerFields(servers, db.DB)
 	}
 
 	apps := map[string]interface{}{
@@ -2977,6 +3026,9 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 			"listen": "127.0.0.1:2019",
 		},
 		"apps": apps,
+	}
+	if trustedProxyDegraded != "" {
+		conf[caddyConfigDegradationKey] = trustedProxyDegraded
 	}
 
 	return conf
@@ -3450,7 +3502,7 @@ func buildRateLimitHandler(ruleCaddyID string, policy *models.SecurityPolicy) (m
 		return nil, nil
 	}
 	if policy.RateLimitRPS <= 0 {
-		return nil, fmt.Errorf("规则 %s 绑定策略 %q 限流已启用但 rate_limit_rps 无效（%d <=0）：该列为类型①值型列（写侧 rps>=1 校验+导入门 400 拒收），疑似带外直写或旧备份绕过导入门", ruleCaddyID, policy.Name, policy.RateLimitRPS)
+		return nil, fmt.Errorf("规则 %s 绑定策略 %q 限流已启用但 rate_limit_rps 无效（%d <=0）：该列为类型①值型列（写侧 rps>=1 校验+导入门 400 拒收+启动归一关停 enabled=1&rps<1 的历史脏行），疑似带外直写或旧备份绕过导入门", ruleCaddyID, policy.Name, policy.RateLimitRPS)
 	}
 	// 历史问题 C-N1：sweep_interval 是 caddy-ratelimit Handler 层字段（默认 1m），
 	// 不是 zone 字段——Caddy v2.11.4 对模块载荷 StrictUnmarshalJSON+
@@ -3817,7 +3869,8 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		// 但 td==0/-1 渲染语义按协议分叉）：td>0 → 按值发射窗口+间隔（tcp_try_interval
 		// 为类型①值型列，<=0 即库值治理被带外写入破坏→显性报错，原 250ms 写死
 		// 兜底废除）；HTTP 侧 td==0 → 保持现状兜底 5s/250ms（存量 HTTP 行恒 0，
-		// 行为不变）；HTTP 侧 td==-1 → 显式禁用重试——发射 retries=0 且不发射
+		// 行为不变；反兜底扫描 allowlist 携 Ruling——render_anti_fallback_scan_test.go
+		// buildHTTPHandleChain 条目）；HTTP 侧 td==-1 → 显式禁用重试——发射 retries=0 且不发射
 		// try_duration/try_interval；TCP 侧 td==0/-1 均零窗口不发射（l4 proxy 无
 		// retries 字段）。NTLM 接管态由 UI 修改器落 -1，渲染对 ntlm_compatible 零感知。
 		loadBalancing := map[string]interface{}{

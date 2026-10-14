@@ -26,6 +26,19 @@ func TestRegister_rejectsScheduledWithoutNextSlotFn(t *testing.T) {
 	}
 }
 
+// B1-6（历史）：Daemon 不进 tick——EnabledFn 在调度面静默忽略且文档
+// 未声明。注册期响亮拒绝，防注册方误以为业务门生效（常驻业务门归 Run 体
+// 首行，autoban 形态）。
+func TestRegister_rejectsDaemonWithEnabledFn(t *testing.T) {
+	e := NewEngine(Options{})
+	err := e.Register(Descriptor{ID: "daemon-gated", Family: "x", Kind: KindDaemon,
+		EnabledFn: func() bool { return false },
+		Run:       func(RunContext) error { return nil }})
+	if err == nil || !strings.Contains(err.Error(), "EnabledFn") {
+		t.Fatalf("daemon with EnabledFn must be rejected loudly, got %v", err)
+	}
+}
+
 // 回归：配套合法的注册照常接受。
 func TestRegister_acceptsWellFormedKinds(t *testing.T) {
 	e := NewEngine(Options{})

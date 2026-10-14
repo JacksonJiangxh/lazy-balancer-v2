@@ -1,11 +1,17 @@
-// Package services 自动封禁（历史问题）：WAF 事件滑动窗口计数 → 阈值判定 →
+// Package services 自动封禁（历史问题）：WAF 事件固定窗口计数 → 阈值判定 →
 // 「自动封禁名单」条目 merge → 引用策略重载（节流）。
+//
+// 窗口语义（AU-5 显式声明）：固定窗口按事件到达对齐分桶（桶长=统计窗口），
+// 桶满跨界即重置——不是物理滑动的平滑窗口。跨桶边界的短时突发可能被分散到
+// 相邻两桶（单桶计数低估瞬时速率），相邻桶也可接力累计（被高估）；语义真值
+// 以「同一桶内累计」为准，UI/API 文案统一称「固定窗口」。
 //
 // 数据流：security-events-ingestion 提交点（securityEventsProcessPass 每批
 // Commit 后）喂 autobanObserveBatch（主节点+启用+口径+WAF 事件四重过滤）→
-// 固定桶计数器；autoban 任务（60s 循环、主节点；调度唯一前提=业务启用——
+// 固定窗口计数器；autoban 任务（60s 循环、主节点；调度唯一前提=业务启用——
 // PUT 保存联动启停，Descriptor 无 EnabledFn，Run 体首行业务门兜底）每轮
-// 评估候选并执行「观察建议或名单 merge」。
+// 评估候选并执行「观察建议或名单 merge」。merge 读改写+重载全程持
+// CaddyOpLock（AU-1：与 handlers 名单写路径互斥，重载回调为 InLock 变体）。
 //
 // 名单形态：预置 security_ip_lists 行（system=1，name=自动封禁名单，DB entries）。
 // 条目扩展 created_at/expires_at（RFC 墙钟串、UTC 存储）——投影层
@@ -115,8 +121,9 @@ var autobanIsMaster = func() bool {
 	return te != nil && te.IsMaster()
 }
 
-// autobanReloader 名单内容变化后的 Caddy 重载（main.go 注入 caddyReloader，
-// 与 SetThreatReloader 同点注入）。
+// autobanReloader 名单内容变化后的 Caddy 重载回调（AU-1 契约：在 CaddyOpLock
+// 临界区内被调用，必须为 InLock 变体——生产=GenerateAndApplyConfigForceInLock，
+// 不得注入自取 CaddyOpLock 的 Force 变体）。
 var autobanReloader func() error
 
 // SetAutobanReloader 注册重载回调（nil=清除，测试用）。
@@ -200,7 +207,7 @@ func AutobanEnabled() bool {
 	return en == 1
 }
 
-// ---- 计数器（固定桶滑动窗口） ----
+// ---- 计数器（固定窗口） ----
 
 type autobanCounter struct {
 	Count       int
@@ -257,30 +264,31 @@ func autobanObserveBatch(items []autobanFeedItem) {
 	if len(items) == 0 || !autobanIsMaster() || !AutobanEnabled() {
 		return
 	}
-	scope := GetAutobanConfig().Scope
+	// AU-2（历史）：热路径每批只读一次配置——整份 cfg 下传单事件路径
+	//（scope/window/threshold），不再逐事件 SELECT（O(事件) 库查询）。
+	cfg := GetAutobanConfig()
 	for _, it := range items {
-		autobanObserveEventScoped(it.IP, it.Action, it.RuleTriggered, scope)
+		autobanObserveEventScoped(cfg, it.IP, it.Action, it.RuleTriggered)
 	}
 }
 
-// autobanObserveEvent 单事件喂入（门：主节点+启用+口径+WAF 事件；口径当轮直读）。
+// autobanObserveEvent 单事件喂入（测试缝 AU-4：生产摄取只走 autobanObserveBatch；
+// 本函数仅供测试驱动单事件计数行为）。门：主节点+启用+口径+WAF 事件；配置当轮直读。
 func autobanObserveEvent(ip, action, ruleTriggered string) {
 	if !autobanIsMaster() || !AutobanEnabled() || ruleTriggered == "" {
 		return
 	}
-	autobanObserveEventScoped(ip, action, ruleTriggered, GetAutobanConfig().Scope)
+	autobanObserveEventScoped(GetAutobanConfig(), ip, action, ruleTriggered)
 }
 
-func autobanObserveEventScoped(ip, action, ruleTriggered, scope string) {
-	if ip == "" || ruleTriggered == "" || !autobanActionMatches(scope, action) {
+func autobanObserveEventScoped(cfg AutobanConfig, ip, action, ruleTriggered string) {
+	// 窗口无效（<=0，D2 消费侧护栏）跳过计数——不落写死兜底（旧 5 分钟
+	// 兜底已删，历史 D2-③）。
+	window := time.Duration(cfg.WindowMinutes) * time.Minute
+	if ip == "" || ruleTriggered == "" || window <= 0 || !autobanActionMatches(cfg.Scope, action) {
 		return
 	}
 	now := autobanNow()
-	cfg := GetAutobanConfig()
-	window := time.Duration(cfg.WindowMinutes) * time.Minute
-	if window <= 0 {
-		window = 5 * time.Minute
-	}
 	var capWarn, expiredReached, thresholdHit bool
 	var thresholdCount, thresholdWindowMin int
 	autobanMu.Lock()
@@ -381,7 +389,14 @@ func autobanSetSuggestions(s []AutobanSuggestion) {
 
 // ---- 抑制表（手动解封 30 天窗口） ----
 
+// D6（历史，2026-10-15 用户裁定豁免不修）：抑制表为节点本地数据——不从
+// 集群快照传播（升主/还原后抑制失效，期内 IP 可被重封一次）且到期判定取本机
+// UTC 时钟（节点间时钟漂移可提前/延后解封）。失效方向均为「多封一次」的保守
+// 侧，不破坏封禁正确性；登记于 AGENTS.md 审计豁免清单，后续审计不得重报。
+
 // SuppressAutobanIP 手动解封抑制：UPSERT 到 now+30 天（重复解封续期）。
+// 测试缝（AU-4）：生产解封路径（remove-ip/预置名单全量保存）在 handlers 自身
+// 事务内落抑制行——本函数仅供测试驱动抑制表，勿在生产链路新增调用。
 func SuppressAutobanIP(ip string) error {
 	if db.DB == nil || ip == "" {
 		return nil
@@ -602,26 +617,54 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 
 // ---- 重载节流 ----
 
-// autobanRequestReload 名单变化后请求重载：距上次真实重载 ≥60s 立即执行，
-// 否则置暂存（下一轮 Run 的 autobanFlushPendingReload 合并执行）。
-func autobanRequestReload(reason string) {
-	if autobanReloader == nil {
-		return
-	}
+// autobanReloadState 本轮重载请求的终态（D4：摘要尾注与暂存标记一致——
+// 失败时不得宣称「已触发」）。
+type autobanReloadState int
+
+const (
+	autobanReloadNone     autobanReloadState = iota // 无名单变化，未请求重载
+	autobanReloadApplied                            // 已重载（配置已收敛）
+	autobanReloadDeferred                           // 节流窗口内，暂存至下一轮合并执行
+	autobanReloadErrored                            // 重载失败（已留审计+置暂存再武装）
+)
+
+// autobanMarkReloadFailed 重载失败统一处置（D4，镜像 threat_reload_pending）：
+// 系统重载审计留痕 + 置暂存再武装（下一轮 flush/重新启用后重试）。
+func autobanMarkReloadFailed(reason string, err error) {
+	recordSystemReloadAudit("autoban", err)
 	autobanMu.Lock()
-	if autobanLastReload.IsZero() || autobanNow().Sub(autobanLastReload) >= autobanReloadThrottle {
-		autobanLastReload = autobanNow()
-		autobanMu.Unlock()
-		if err := autobanReloader(); err != nil {
-			Logf("warn", "自动封禁名单重载失败（%s）: %v", reason, err)
-		}
-		return
-	}
 	autobanReloadPending = true
 	autobanMu.Unlock()
+	Logf("error", "自动封禁名单重载失败（%s，已置暂存待重试）: %v", reason, err)
 }
 
-// autobanFlushPendingReload Run 轮首调用：暂存重载在节流窗口外时合并执行。
+// autobanRequestReloadLocked 名单变化后请求重载：距上次真实重载 ≥60s 立即执行，
+// 否则置暂存（下一轮 Run 的 autobanFlushPendingReload 合并执行）。
+// 调用契约（AU-1）：调用方已持 CaddyOpLock（merge 读改写+重载同一临界区），
+// 注入回调为 InLock 变体——本函数不得再取 CaddyOpLock。
+func autobanRequestReloadLocked(reason string) autobanReloadState {
+	if autobanReloader == nil {
+		return autobanReloadNone
+	}
+	autobanMu.Lock()
+	now := autobanNow()
+	if !autobanLastReload.IsZero() && now.Sub(autobanLastReload) < autobanReloadThrottle {
+		autobanReloadPending = true
+		autobanMu.Unlock()
+		return autobanReloadDeferred
+	}
+	autobanLastReload = now
+	autobanMu.Unlock()
+	if err := autobanReloader(); err != nil {
+		autobanMarkReloadFailed(reason, err)
+		return autobanReloadErrored
+	}
+	recordSystemReloadAudit("autoban", nil)
+	return autobanReloadApplied
+}
+
+// autobanFlushPendingReload Run 轮首调用：暂存重载在节流窗口外时合并执行
+// （此处自取 CaddyOpLock——重载回调为 InLock 变体，须与 handler 写路径互斥）。
 func autobanFlushPendingReload() {
 	autobanMu.Lock()
 	if !autobanReloadPending || autobanReloader == nil {
@@ -635,9 +678,53 @@ func autobanFlushPendingReload() {
 	autobanReloadPending = false
 	autobanLastReload = autobanNow()
 	autobanMu.Unlock()
-	if err := autobanReloader(); err != nil {
-		Logf("warn", "自动封禁名单暂存重载失败: %v", err)
+	CaddyOpLock.Lock()
+	err := autobanReloader()
+	CaddyOpLock.Unlock()
+	if err != nil {
+		autobanMarkReloadFailed("暂存重载", err)
+		return
 	}
+	recordSystemReloadAudit("autoban", nil)
+}
+
+// autobanForceFlushPendingReload 暂存重载的节流豁免收敛（仅禁用路径：此后
+// 无下一轮 flush 点，禁用前暂存的变化必须立即落盘生效；常规路径走
+// autobanFlushPendingReload 的节流约束）。
+func autobanForceFlushPendingReload() {
+	autobanMu.Lock()
+	if !autobanReloadPending || autobanReloader == nil {
+		autobanMu.Unlock()
+		return
+	}
+	autobanReloadPending = false
+	autobanLastReload = autobanNow()
+	autobanMu.Unlock()
+	CaddyOpLock.Lock()
+	err := autobanReloader()
+	CaddyOpLock.Unlock()
+	if err != nil {
+		autobanMarkReloadFailed("禁用收尾强制重载", err)
+		return
+	}
+	recordSystemReloadAudit("autoban", nil)
+}
+
+// AutobanDisableFlush 禁用路径收尾（AU-8/D5，PUT 保存 enabled=false 后、
+// StopLoop 前调用）：①到期自动条目清理一次（禁用后无循环清理点——最后一批
+// 已到期条目立即解封并留「自动解封」审计）；②暂存重载强制收敛一次（绕过节流
+// ——禁用前节流暂存的名单变化与本次清理变化必须落盘生效）。重载失败按 D4
+// 留痕+保持暂存（重新启用后下一轮 flush 重试）。
+func AutobanDisableFlush() {
+	cfg := GetAutobanConfig()
+	CaddyOpLock.Lock()
+	out, err := autobanMergeEntries(cfg, nil)
+	if err == nil && out.Changed {
+		autobanAuditExpiredUnban(out.Expired)
+		autobanRequestReloadLocked("自动封禁禁用收尾")
+	}
+	CaddyOpLock.Unlock()
+	autobanForceFlushPendingReload()
 }
 
 // ---- Run 循环 ----
@@ -658,6 +745,16 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 		return errors.New("自动封禁未启用，已停止调度（请先在安全事件页配置中启用）")
 	}
 	cfg := GetAutobanConfig()
+	// D2③（历史）：消费侧护栏——直读配置执行前显式校验（库值唯一真相
+	// 铁律：无效值拒绝执行+显性报错，禁止静默兜底）。threshold<=0 会让
+	// 「count>=threshold」把全量候选收进名单；duration 非法经 autobanDurations
+	// 查表得 0 被当「永久」（候选全落永久封禁条目）；window<=0 让窗口失真。
+	// 带外脏行由启动回填（db.go defaultUpdates 六列）在下次启动收敛；校验单源
+	// 复用写侧 ValidateAutobanConfig（导入/写侧/消费侧三通道同一口径）。
+	if err := ValidateAutobanConfig(cfg); err != nil {
+		TaskLogfWarn(AutobanTaskID, "config", "配置无效，已拒绝执行：%v", err)
+		return fmt.Errorf("自动封禁配置无效，已拒绝执行：%v（库值可能被带外写入污染；重启后启动回填将收敛）", err)
+	}
 	window := time.Duration(cfg.WindowMinutes) * time.Minute
 	autobanFlushPendingReload()
 	autobanCleanupSuppression()
@@ -670,8 +767,24 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 		return nil
 	}
 
-	out, err := autobanMergeEntries(cfg, candidates)
-	if err != nil {
+	var out autobanMergeOutcome
+	reloadState := autobanReloadNone
+	// AU-1（历史）：merge 读改写+重载并入同一 CaddyOpLock 临界区——与
+	// handlers 名单写路径（AddIPToList/UpdateIPList 持 caddyOpMu=CaddyOpLock
+	// 的读改写）交错会丢更新/复活条目；重载回调为 InLock 变体，临界区内直呼。
+	if err := func() error {
+		CaddyOpLock.Lock()
+		defer CaddyOpLock.Unlock()
+		o, err := autobanMergeEntries(cfg, candidates)
+		if err != nil {
+			return err
+		}
+		out = o
+		if out.Changed {
+			reloadState = autobanRequestReloadLocked("名单更新")
+		}
+		return nil
+	}(); err != nil {
 		return err
 	}
 	autobanSetSuggestions(nil)
@@ -684,10 +797,7 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 					"时长："+AutobanDurationLabel(cfg.Duration),
 					AuditResultPart("success")), "")
 		}
-		if len(out.Expired) > 0 {
-			RecordAuditLog("system", "自动解封", "IP 地址列表",
-				fmt.Sprintf("到期自动解封 %d 个 IP：%s", len(out.Expired), strings.Join(out.Expired, "、")), "")
-		}
+		autobanAuditExpiredUnban(out.Expired)
 		if out.Evicted > 0 || out.DroppedNew > 0 {
 			// 容量收敛可观测（2026-10-14 用户裁定）：发生挤出/丢弃的那轮落
 			// WARN 级任务日志行（含计数）+ 系统操作者审计行。
@@ -696,18 +806,36 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 			RecordAuditLog("system", "容量收敛", "IP 地址列表",
 				fmt.Sprintf("自动封禁容量收敛：挤出 %d、丢弃 %d（上限 %d）", out.Evicted, out.DroppedNew, AutobanListEntryCap), "")
 		}
-		autobanRequestReload("名单更新")
 	}
 	TaskLogf(AutobanTaskID, "cycle", "本轮：计数 %d IP / 活跃 %d 个 IP / 候选 %d / 新封 %d / 到期解封 %d / 抑制跳过 %d / 名单 %d 条%s",
-		autobanTrackedCount(), autobanReachedCount(), len(candidates), len(out.Banned), len(out.Expired), out.SkippedSuppressed, out.Total, reloadNote(out.Changed))
+		autobanTrackedCount(), autobanReachedCount(), len(candidates), len(out.Banned), len(out.Expired), out.SkippedSuppressed, out.Total, reloadNote(out.Changed, reloadState))
 	return nil
 }
 
-func reloadNote(changed bool) string {
-	if changed {
-		return "（已触发重载/暂存）"
+// autobanAuditExpiredUnban 到期自动解封审计（Run 轮与禁用收尾共用单一实现，
+// 系统操作者归因）。
+func autobanAuditExpiredUnban(ips []string) {
+	if len(ips) == 0 {
+		return
 	}
-	return ""
+	RecordAuditLog("system", "自动解封", "IP 地址列表",
+		fmt.Sprintf("到期自动解封 %d 个 IP：%s", len(ips), strings.Join(ips, "、")), "")
+}
+
+func reloadNote(changed bool, state autobanReloadState) string {
+	if !changed {
+		return ""
+	}
+	switch state {
+	case autobanReloadApplied:
+		return "（已重载）"
+	case autobanReloadDeferred:
+		return "（重载暂存，下一轮合并执行）"
+	case autobanReloadErrored:
+		return "（重载失败，已留痕待重试）"
+	default:
+		return ""
+	}
 }
 
 func autobanScopeLabel(scope string) string {

@@ -84,12 +84,18 @@ func GetSecurityPoliciesForRule(ruleCaddyID string) []*models.SecurityPolicy {
 
 // geoipCountries parses the policy's geoip_countries JSON array, skipping
 // blank entries. A missing or malformed payload yields nil.
+// D7（历史）：畸形 JSON 不再静默——WARN 留痕后按无地域规则渲染。
+// 不 fail-visible 的推演披露：geoip_countries 是单策略 TEXT 列，fail-visible
+// 会让一份带外脏行阻断整份配置生成（全部规则重载失败），与 D3 受信代理
+// 裁定同向（可用性优先+降级可见）；写侧/导入门已拒绝该形态，WARN 面向
+// 带外直写/旧备份绕过残留。
 func geoipCountries(p *models.SecurityPolicy) []string {
 	if p == nil || len(p.GeoIPCountries) == 0 {
 		return nil
 	}
 	var entries []string
 	if err := json.Unmarshal(p.GeoIPCountries, &entries); err != nil {
+		Logf("warn", "策略 %q（#%d）geoip_countries 畸形 JSON，渲染按无地域规则处理: %v", p.Name, p.ID, err)
 		return nil
 	}
 	out := make([]string, 0, len(entries))
@@ -616,21 +622,38 @@ func geoipLocOperator(countries []string, allowMode bool, exactSet map[string]bo
 	// 改造后已解析海外行发国名，存量「禁止海外」规则的「海外」条目必须覆盖
 	// 「哨兵 ∪ 树 Countries 全集」，否则已解析海外流量漏放（deny）/误拒（allow）。
 	// exactSet 为空（树缺失）时仅保留哨兵（fail-safe 不产生死条目）。
-	alts := make([]string, 0, len(countries)+len(exactSet))
+	// G1+B1-7（历史）：展开集先收集后 sort.Strings 定序——exactSet map
+	// 迭代序非确定，内联展开会让同 DB 视图两次渲染产出不同算子字节，
+	// errSameConfig 同字节短路门失效（每次写路径真重载+预检池键漂移）；
+	// 混选「海外+国名」时展开集与显式国名条目按全 alternative 去重。
+	expanded := make([]string, 0, len(exactSet))
+	for country := range exactSet {
+		expanded = append(expanded, regexp.QuoteMeta(country))
+	}
+	sort.Strings(expanded)
+
+	seen := make(map[string]bool, len(countries)+len(expanded))
+	alts := make([]string, 0, len(countries)+len(expanded))
+	add := func(a string) {
+		if !seen[a] {
+			seen[a] = true
+			alts = append(alts, a)
+		}
+	}
 	for _, entry := range countries {
 		quoted := regexp.QuoteMeta(entry)
 		if entry == geoipLocOverseas {
-			alts = append(alts, quoted)
-			for country := range exactSet {
-				alts = append(alts, regexp.QuoteMeta(country))
+			add(quoted)
+			for _, alt := range expanded {
+				add(alt)
 			}
 			continue
 		}
 		if strings.Contains(entry, "/") || exactSet[entry] {
-			alts = append(alts, quoted)
+			add(quoted)
 			continue
 		}
-		alts = append(alts, quoted+"(?:/.*)?")
+		add(quoted + "(?:/.*)?")
 	}
 	op := "@rx ^(?:" + strings.Join(alts, "|") + ")$"
 	if allowMode {

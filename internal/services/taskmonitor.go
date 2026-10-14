@@ -28,14 +28,15 @@ const (
 type TaskStatus string
 
 const (
-	TaskStatusRunning   TaskStatus = "running"
-	TaskStatusIdle      TaskStatus = "idle"
-	TaskStatusFailed    TaskStatus = "failed"
-	TaskStatusCancelled TaskStatus = "cancelled"
-	TaskStatusDisabled  TaskStatus = "disabled"
-	TaskStatusQueued    TaskStatus = "queued"
+	TaskStatusRunning  TaskStatus = "running"
+	TaskStatusIdle     TaskStatus = "idle"
+	TaskStatusFailed   TaskStatus = "failed"
+	TaskStatusDisabled TaskStatus = "disabled"
+	TaskStatusQueued   TaskStatus = "queued"
 	// 方案 A（2026-10-12）：stopped 退役——状态列只承载执行语义（调度语义归
 	// 开关列 loop_on&&enabled）；disabled 仅 cert-job 退役行集产出。
+	// B1-5（历史）：cancelled 常量删除——零产出零消费（取消只存在于
+	// task_runs.result 字段，非 TaskStatus 状态产出）。
 )
 
 // TaskInfo 是单任务族的聚合视图。
@@ -313,6 +314,10 @@ func localDisplayUTC(ts string) string {
 }
 
 func earliestThreatNextUpdate() string {
+	// B1-8（历史）：nil 库守卫——NextSlotFn fail-closed（零值槽）。
+	if db.DB == nil {
+		return ""
+	}
 	var next string
 	if err := db.DB.QueryRow(`SELECT MIN(COALESCE(NULLIF(next_update,''), '9999')) FROM security_threat_sources WHERE update_enabled=1`).Scan(&next); err != nil || next == "9999" {
 		return ""

@@ -355,6 +355,111 @@ func TestAutobanListEntryCap_matchesHandlerCap(t *testing.T) {
 	}
 }
 
+// ---- AU-3（历史）：预置名单全量保存对被移除值补写解封抑制 ----
+
+// Given 预置名单含三个条目（自动/手动/自动）。
+// When 弹框全量保存（PUT entries 全量替换）移除两个旧值、保留一个、新增一个。
+// Then 被移除值必须同事务补写 30 天解封抑制（下轮不得重封，与 remove-ip 路径
+// 的 UI 承诺一致）；保留值与新增值不写抑制。
+func TestAutobanPreset_fullPutSuppressesRemovedValues(t *testing.T) {
+	router := newAutobanTestEnv(t)
+	id := autobanPresetID(t)
+	seedAutobanListEntries(t, `[
+		{"value":"198.51.100.1","remark":"自动封禁"},
+		{"value":"198.51.100.2","remark":"手动封禁"},
+		{"value":"198.51.100.3","remark":"自动封禁"}]`)
+
+	rec := putJSON(t, router, fmt.Sprintf("/security/ip-lists/%d", id), map[string]any{
+		"entries": `[{"value":"198.51.100.2","remark":"手动封禁"},{"value":"203.0.113.8","remark":"手动封禁"}]`,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	for _, removed := range []string{"198.51.100.1", "198.51.100.3"} {
+		var until string
+		if err := db.DB.QueryRow(`SELECT suppressed_until FROM autoban_suppressed WHERE ip=?`, removed).Scan(&until); err != nil {
+			t.Fatalf("被移除值 %s 必须补写解封抑制: %v", removed, err)
+		}
+		ts, perr := time.ParseInLocation("2006-01-02 15:04:05", until, time.UTC)
+		if perr != nil || !ts.After(time.Now().UTC().Add(29*24*time.Hour)) {
+			t.Fatalf("%s suppressed_until=%q, want ≈now+30d", removed, until)
+		}
+	}
+	var n int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM autoban_suppressed WHERE ip IN ('198.51.100.2','203.0.113.8')`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("保留/新增值不得写抑制, 得到 %d 行", n)
+	}
+}
+
+// ---- AU-6（历史）：内置名单引用门提示语按名单名分流 ----
+
+// Given 自动封禁预置名单（system=1，非威胁情报源）。
+// When 信任名单引用它（内置名单引用门拒绝的唯一非法形态之一）。
+// Then 400 提示语称「内置自动封禁名单」，不得误称「威胁情报名单」。
+func TestCreatePolicy_builtinAutobanListRefMessageNamesAutoban(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/security/policies", h.CreateSecurityPolicy)
+	var autobanID int64
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=?`, services.AutobanPresetListName).Scan(&autobanID); err != nil {
+		t.Fatalf("自动封禁预置名单缺失: %v", err)
+	}
+	body := fmt.Sprintf(`{"name":"au6","policy_type":"stage0","ip_whitelist_refs":"[%d]"}`, autobanID)
+	req := httptest.NewRequest(http.MethodPost, "/security/policies", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "内置自动封禁名单") {
+		t.Fatalf("提示语应按名单名分流（内置自动封禁名单）: %s", resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "威胁情报") {
+		t.Fatalf("自动封禁名单不得被称作威胁情报名单: %s", resp.Body.String())
+	}
+}
+
+// ---- AU-8/D5（历史）：PUT 禁用路径收尾接线 ----
+
+// Given 名单含已到期自动条目+未到期自动条目；重载回调间谍。
+// When PUT enabled=false（禁用保存）。
+// Then 禁用收尾立即清除已到期条目并触发重载（禁用后无循环 flush 点）；未到期
+// 条目保留；调度照常联动停止。
+func TestAutobanConfig_putDisableFlushesExpiredEntries(t *testing.T) {
+	router := newAutobanTestEnv(t)
+	services.SetConfigLoadRerun(func(operator string) error { return nil })
+	t.Cleanup(func() { services.SetConfigLoadRerun(nil) })
+	te := services.InitTaskEngine("", t.TempDir()+"/app.log")
+	t.Cleanup(te.Stop)
+	id := autobanPresetID(t)
+	seedAutobanListEntries(t, `[
+		{"value":"198.51.100.1","remark":"自动封禁","created_at":"2026-10-13 10:00:00","expires_at":"2020-01-01 00:00:00"},
+		{"value":"198.51.100.2","remark":"自动封禁","created_at":"2026-10-14 09:30:00","expires_at":"2099-01-01 00:00:00"}]`)
+	reloads := 0
+	services.SetAutobanReloader(func() error { reloads++; return nil })
+	t.Cleanup(func() { services.SetAutobanReloader(nil) })
+
+	body := map[string]any{"enabled": false, "threshold": 100, "window_minutes": 5, "duration": "1h", "scope": "all", "dry_run": true}
+	if rec := putJSON(t, router, "/security/autoban", body); rec.Code != http.StatusOK {
+		t.Fatalf("禁用保存 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	entries := readAutobanListEntries(t, id)
+	if len(entries) != 1 || entries[0].Value != "198.51.100.2" {
+		t.Fatalf("禁用收尾必须清除已到期条目并保留未到期条目: %+v", entries)
+	}
+	if reloads == 0 {
+		t.Fatal("到期清理产生的名单变化必须触发重载（禁用后无循环 flush 点）")
+	}
+	if m, _ := te.Lookup(services.AutobanTaskID); m.LoopOn {
+		t.Fatal("禁用保存仍应联动停止调度")
+	}
+}
+
 // ---- 预置名单三字段锁定（2026-10-14 用户裁定：名称/分类/描述禁改） ----
 
 // Given 预置「自动封禁名单」（名称已禁改）。

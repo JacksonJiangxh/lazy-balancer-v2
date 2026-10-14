@@ -1,11 +1,14 @@
 package services
 
 // 库值唯一真相（批 1+2）机制级反兜底钉测：
-// 扫描 caddy.go 渲染函数体，断言不存在「零值守卫 + 数字字面量赋值」的写死
-// 兜底模式（`if x <= 0 { x = <N> }` / `if x == 0 { x = <N> }`）。规则→全局
-// 变量回退（x = rule.GlobalY）与错误返回不属兜底（治理允许的分层缺省/fail-
-// visible），不在扫描命中面。允许列表逐条携带 Ruling（类型②省略型/治理范围
-// 外），双向精确匹配：扫描出清单外命中=有人往渲染层塞了写死兜底（FAIL）；
+// 扫描 caddy.go 渲染函数体，断言不存在「零值守卫 + 字面量赋值」的写死
+// 兜底模式（`if x <= 0 { x = <N> }` / `if x == 0 { x = <N> }`）。G3（历史）
+// 形状扩展：字面量含 STRING（"5s"/"250ms" 类字符串兜底同在禁区）、命中面
+// 扩到 else 链（`if x > 0 {…} else { x = "…" }` 的尾 else 兜底形态）、
+// 赋值限定 plain `=`（:= 定义与 += 累加非兜底）。规则→全局变量回退
+//（x = rule.GlobalY）与错误返回不属兜底（治理允许的分层缺省/fail-visible），
+// 不在扫描命中面。允许列表逐条携带 Ruling（类型②省略型/治理范围外），
+// 双向精确匹配：扫描出清单外命中=有人往渲染层塞了写死兜底（FAIL）；
 // 清单条目在源码中消失=该条目已退役、清单过期（FAIL）——防允许列表腐化。
 
 import (
@@ -54,6 +57,17 @@ var antiFallbackAllowlist = map[string]map[string]string{
 	},
 	"buildHTTPHandleChain": {
 		"weight = 1": "上游权重 weight<=0→1：同上（范围外，历史问题 分组层归一删除后链构建层唯一存留点）",
+		// G3（历史）Ruling：HTTP 侧 try_duration==0 → 5s/250ms——存量 HTTP 行
+		// 恒 0（列语义「0=默认重试窗口」，2026-09 渲染审计+方案 C 协议分叉已披露
+		// UI/文档），行为不变的非治理形态；TCP 侧同列 0/-1 走显性报错/显式禁用，
+		// 协议分叉为披露语义非写死兜底。td==-1 分支发射 retries=0 为「显式禁用
+		// 重试」语义载体（cond 非零值守卫，不在扫描命中面）。
+		`loadBalancing["try_duration"] = "5s"`:                    "HTTP 侧 try_duration==0→5s：存量 HTTP 行恒 0（0=默认重试窗口语义），方案 C 协议分叉+UI 已披露——G3 Ruling 披露",
+		`loadBalancing["try_interval"] = "250ms"`:                 "HTTP 侧 try_interval==0→250ms：同上（与 5s 窗口成对发射）——G3 Ruling 披露",
+		`serverName = "{lb.upstream_sni}"`:                        "逐上游回源域名在场时 SNI 改走占位符（逐连接展开实证）——host_header 缺省形态的发射形态切换（占位符 vs 静态值），非无效库值兜底；upstream-sni-host 方案披露——G3 Ruling 披露",
+		`hostFallback = "{http.reverse_proxy.upstream.hostport}"`: "Host 回退 TLS 池形态：host_header 未配置时绑定上游 hostport 占位符（LBS-A-L2 池形态分流），类型②省略型同族——G3 Ruling 披露",
+		`hostFallback = "{http.request.hostport}"`:                "Host 回退常规池形态：host_header 未配置时绑定原始请求 hostport 占位符（现状复现）——G3 Ruling 披露",
+		`sniFallback = "{http.reverse_proxy.upstream.host}"`:      "SNI 回退：host_header 未配置时绑定上游 host 占位符（stdlib 空 server_name 默认的同义载体）——G3 Ruling 披露",
 	},
 	// 批 3 Ruling：block_status_code=类型②省略型（0=未设置，跟随默认 403）。
 	// static_response 必须显式携带状态码，「省略」只能以默认值替换实现；写侧
@@ -93,29 +107,55 @@ func TestRenderLayer_hasNoHardcodedZeroFallbacks(t *testing.T) {
 				if !ok {
 					return true
 				}
+				// G3：零值守卫条件含 GTR（`x > 0 {…} else {兜底}` 形态的尾 else）。
 				bin, ok := ifStmt.Cond.(*ast.BinaryExpr)
-				if !ok || (bin.Op != token.EQL && bin.Op != token.LEQ) {
+				if !ok || (bin.Op != token.EQL && bin.Op != token.LEQ && bin.Op != token.GTR) {
 					return true
 				}
 				lit, ok := bin.Y.(*ast.BasicLit)
 				if !ok || lit.Kind != token.INT || lit.Value != "0" {
 					return true
 				}
-				ast.Inspect(ifStmt.Body, func(m ast.Node) bool {
-					assign, ok := m.(*ast.AssignStmt)
-					if !ok {
-						return true
-					}
-					for _, rhs := range assign.Rhs {
-						if num, ok := rhs.(*ast.BasicLit); ok && num.Kind == token.INT {
-							var buf bytes.Buffer
-							_ = printer.Fprint(&buf, fset, assign)
-							violations[fn.Name.Name+":"+buf.String()] = fset.Position(assign.Pos()).String()
-							break
+				scanAssigns := func(branch ast.Node) {
+					ast.Inspect(branch, func(m ast.Node) bool {
+						assign, ok := m.(*ast.AssignStmt)
+						// G3：仅 plain `=`（:= 定义与 += 累加非兜底赋值）。
+						if !ok || assign.Tok != token.ASSIGN {
+							return true
 						}
+						for _, rhs := range assign.Rhs {
+							// G3：STRING 字面量兜底（"5s"/"250ms" 形态）与 INT 同罪。
+							if num, ok := rhs.(*ast.BasicLit); ok && (num.Kind == token.INT || num.Kind == token.STRING) {
+								var buf bytes.Buffer
+								_ = printer.Fprint(&buf, fset, assign)
+								violations[fn.Name.Name+":"+buf.String()] = fset.Position(assign.Pos()).String()
+								break
+							}
+						}
+						return true
+					})
+				}
+				scanAssigns(ifStmt.Body)
+				// G3：else 链纳入命中面——逐级 else-if 体（同为零值守卫时）+
+				// 终端 else 块（外层守卫的反向兜底形态）。
+				els := ifStmt.Else
+				for els != nil {
+					switch e := els.(type) {
+					case *ast.BlockStmt:
+						scanAssigns(e)
+						els = nil
+					case *ast.IfStmt:
+						if ebin, ok := e.Cond.(*ast.BinaryExpr); ok {
+							if elit, ok := ebin.Y.(*ast.BasicLit); ok && elit.Kind == token.INT && elit.Value == "0" &&
+								(ebin.Op == token.EQL || ebin.Op == token.LEQ || ebin.Op == token.GTR) {
+								scanAssigns(e.Body)
+							}
+						}
+						els = e.Else
+					default:
+						els = nil
 					}
-					return true
-				})
+				}
 				return true
 			})
 		}

@@ -338,6 +338,28 @@ func TestServeHTTP_overseasEmitsCountryName(t *testing.T) {
 	}
 }
 
+// TestGeoipLocFor_trimsChinaCountryColumn（X4，历史）：国家列「中国」判定
+// TrimSpace 对称——树侧收集判定本就 Trim（ip2region.go），发射侧此前裸比较
+// （" 中国" 异形行走海外分支后 NormalizeCountry 折叠出「中国」串发射，匹配
+// 键恒不命中）。国内 → 省/省-市；海外 → 归一化国名；不可解析 → 哨兵。
+func TestGeoipLocFor_trimsChinaCountryColumn(t *testing.T) {
+	cases := []struct{ country, province, city, want string }{
+		{"中国", "广东省", "深圳市", "广东省/深圳市"},
+		{"中国", "广东省", "", "广东省"},
+		{" 中国", "广东省", "", "广东省"},
+		{"\t中国 ", "广东省", "深圳市", "广东省/深圳市"},
+		{"United States", "", "", "United States"},
+		{" 美国", "", "", "United States"},
+		{"Reserved", "", "", "海外"},
+		{"", "广东省", "", "海外"},
+	}
+	for _, tc := range cases {
+		if got := geoipLocFor(tc.country, tc.province, tc.city); got != tc.want {
+			t.Errorf("geoipLocFor(%q,%q,%q)=%q; want %q", tc.country, tc.province, tc.city, got, tc.want)
+		}
+	}
+}
+
 // TestProvision_sharedSearcherSingletonPerXdbPath（审计 M2）：同 XdbPath 的
 // 多个 handler 必须共享同一 Ip2Region 实例——每 handler 各建一份会各开 20 个
 // searcher fd（50 条 GeoIP 规则≈1000 fd 逼近 soft limit，重载期翻倍），fd 耗尽

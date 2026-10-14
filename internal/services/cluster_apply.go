@@ -1264,6 +1264,32 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 		settingClauses = append(settingClauses, "threat_schedule_time=?")
 		settingArgs = append(settingArgs, *settings.ThreatScheduleTime)
 	}
+	// D1（历史）：自动封禁六项配置同口径入块（指针缺席=旧主端快照未
+	// 携带——跳过写入保留从端本地值，不清零；新主端恒携带全组，升主即生效）。
+	if settings.AutobanEnabled != nil {
+		settingClauses = append(settingClauses, "autoban_enabled=?")
+		settingArgs = append(settingArgs, *settings.AutobanEnabled)
+	}
+	if settings.AutobanThreshold != nil {
+		settingClauses = append(settingClauses, "autoban_threshold=?")
+		settingArgs = append(settingArgs, *settings.AutobanThreshold)
+	}
+	if settings.AutobanWindowMinutes != nil {
+		settingClauses = append(settingClauses, "autoban_window_minutes=?")
+		settingArgs = append(settingArgs, *settings.AutobanWindowMinutes)
+	}
+	if settings.AutobanDuration != nil {
+		settingClauses = append(settingClauses, "autoban_duration=?")
+		settingArgs = append(settingArgs, *settings.AutobanDuration)
+	}
+	if settings.AutobanScope != nil {
+		settingClauses = append(settingClauses, "autoban_scope=?")
+		settingArgs = append(settingArgs, *settings.AutobanScope)
+	}
+	if settings.AutobanDryRun != nil {
+		settingClauses = append(settingClauses, "autoban_dry_run=?")
+		settingArgs = append(settingArgs, *settings.AutobanDryRun)
+	}
 	if len(settingClauses) > 0 {
 		if _, err := tx.ExecContext(ctx, `UPDATE global_config SET `+strings.Join(settingClauses, ",")+` WHERE id=1`, settingArgs...); err != nil {
 			return fmt.Errorf("写入快照扩展设置: %w", err)

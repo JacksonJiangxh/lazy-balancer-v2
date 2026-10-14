@@ -255,6 +255,17 @@ type ClusterBasicSettings struct {
 	ThreatAutoUpdate   *bool   `json:"threat_auto_update,omitempty"`
 	ThreatScheduleDays *string `json:"threat_schedule_days,omitempty"`
 	ThreatScheduleTime *string `json:"threat_schedule_time,omitempty"`
+	// D1（历史）：自动封禁六项配置随 users 节同步——从节点提升为主节点
+	// 后调度按主端配置直接生效（镜像 历史问题 自动备份组/历史问题-01 威胁排程组）。
+	// 指针+omitempty 缺席语义：旧主端快照缺该组时从端 apply 跳过写入、保留本地
+	// 设置，不清零；新主端装载恒非 nil（COALESCE 兜底），快照恒携带。此前六列
+	// 不入快照：从端恒默认值（名单传播而配置不传播），升主后按陈旧配置静默运行。
+	AutobanEnabled       *bool   `json:"autoban_enabled,omitempty"`
+	AutobanThreshold     *int    `json:"autoban_threshold,omitempty"`
+	AutobanWindowMinutes *int    `json:"autoban_window_minutes,omitempty"`
+	AutobanDuration      *string `json:"autoban_duration,omitempty"`
+	AutobanScope         *string `json:"autoban_scope,omitempty"`
+	AutobanDryRun        *bool   `json:"autoban_dry_run,omitempty"`
 }
 
 type ClusterUser struct {

@@ -331,6 +331,14 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	if threatMgr := GetThreatUpdateManager(); threatMgr != nil {
 		threatMgr.SetMasterRole(true)
 	}
+	// D1（历史）：自动封禁调度恢复——从节点期间调度未开（启动门按
+	// 当时刻库内开关对齐；主端快照同步来的 enabled=1 不联动从端调度），升主后
+	// 库值已启用而调度永不开=静默停摆。按 AutobanEnabled() 重开 StartLoop；
+	// 未启用不开（否则首 tick 被 Run 体业务门拦停，每次升主落「未启用」假失败
+	// 行，与启动门同口径）。引擎 RoleMasterOnly 角色门+loopOn 保留语义不变。
+	if te := TaskEngine(); te != nil && AutobanEnabled() {
+		te.StartLoop(AutobanTaskID)
+	}
 	if masterURL != "" {
 		parsedMasterURL, err := url.Parse(masterURL)
 		if err != nil {

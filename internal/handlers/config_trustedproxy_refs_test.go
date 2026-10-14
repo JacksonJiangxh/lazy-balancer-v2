@@ -188,6 +188,14 @@ func TestConfigBackup_trustedProxyRangeRefsRoundTrip(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_range_refs='[3,7]' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
+	// D3（历史）导入门后语义：refs 存在性按「备份内优先 ∪ 库内」解析
+	//——真实备份的被引用名单随 security_ip_lists 表导出，此处种两行使备份
+	// 自洽（带外直写悬空 refs 的旧形态现在导入 400，见 r74c 门钉测）。
+	for _, id := range []int64{3, 7} {
+		if _, err := db.DB.Exec(`INSERT OR IGNORE INTO security_ip_lists (id, name, entries) VALUES (?, ?, '[]')`, id, fmt.Sprintf("roundtrip-%d", id)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	router := gin.New()
 	router.GET("/config/export", h.ExportConfigBackup)
 

@@ -241,10 +241,18 @@
         <el-descriptions :column="2" border size="small" class="tm-detail-descs">
           <el-descriptions-item label="运行节奏">{{ detailTask.cadence || '—' }}</el-descriptions-item>
           <el-descriptions-item label="调度开关">
-            <!-- v2.0 统一口径：非触发类显示 loop_on 态；方案 A（2026-10-12）：并判 enabled（业务关=已停止） -->
-            <el-tag v-if="detailTask.kind !== 'oneshot'" size="small" :type="detailTask.loop_on && detailTask.enabled !== false ? 'success' : 'warning'" effect="plain">{{ detailTask.loop_on && detailTask.enabled !== false ? '开启' : '已停止' }}</el-tag>
-            <el-tooltip v-else content="触发类任务不可调度——仅手动/代码触发执行" placement="top" :offset="8" :show-after="150" :show-arrow="false">
-              <el-tag size="small" type="info" effect="plain">不可调度</el-tag>
+            <!-- B1-4（历史）：调度/业务两开关拆行——此前单 tag 并判
+                 loop_on&&enabled，业务关时被误读为「调度被关」。本行只承载
+                 loop_on（引擎调度投递开关，列表「调度」列同源）；业务开关
+                 关闭时另起「业务开关」行并 tooltip 引导。 -->
+            <el-tooltip content="引擎调度投递开关（列表「调度」列同源）——业务开关关闭时调度自动跳过" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+              <el-tag v-if="detailTask.kind !== 'oneshot'" size="small" :type="detailTask.loop_on ? 'success' : 'warning'" effect="plain">{{ detailTask.loop_on ? '开启' : '关闭' }}</el-tag>
+              <el-tag v-else size="small" type="info" effect="plain">不可调度</el-tag>
+            </el-tooltip>
+          </el-descriptions-item>
+          <el-descriptions-item v-if="detailTask.kind !== 'oneshot' && detailTask.enabled === false" label="业务开关">
+            <el-tooltip content="任务业务开关未启用（如自动更新/自动备份关闭）——引擎跳过调度、状态列显示已停止；与调度开关独立，启用入口在对应业务页" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+              <el-tag size="small" type="warning" effect="plain">未启用</el-tag>
             </el-tooltip>
           </el-descriptions-item>
           <el-descriptions-item label="下次执行">{{ detailTask.next_run_at || '—' }}</el-descriptions-item>
@@ -632,7 +640,9 @@ const kindTagClass = (k: string) => (k === 'periodic' ? 'tm-tag-periodic' : '')
 const categoryOrder: Record<string, number> = { '安全防护': 0, '证书': 1, '备份': 2, '集群': 3, '系统': 4, '触发': 5 }
 const categoryTagType = (c: string): 'primary' | 'success' | 'warning' | 'info' =>
   c === '安全防护' ? 'primary' : c === '证书' ? 'success' : c === '备份' ? 'warning' : c === '触发' ? 'info' : 'info'
-const triggerLabels: Record<string, string> = { manual: '手动', auto: '自动', schedule: '排程', queue: '队列', 'slave-sync': '从节点同步', startup: '启动' }
+// B1-2（历史）：caddy-restart（Caddy 崩溃自愈 watcher 通道）此前裸显
+// 英文 token——补中文标签，未列触发值仍回退原文。
+const triggerLabels: Record<string, string> = { manual: '手动', auto: '自动', schedule: '排程', queue: '队列', 'slave-sync': '从节点同步', startup: '启动', 'caddy-restart': 'Caddy重启' }
 const triggerLabel = (t: string) => triggerLabels[t] || t || '—'
 // 结果串双源：引擎 task_runs 结果（success/failed/…/skipped）+ cert-job 动态行
 // 的 cert_jobs 状态机（issued/validating/…）——前者未命中时回退 certJobStatusLabel

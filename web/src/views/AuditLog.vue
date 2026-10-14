@@ -177,6 +177,7 @@ const ACTION_TAG_TABLE: Record<string, string> = {
   '清理失败': 'danger',
   '部分失败': 'danger',
   '应用失败': 'danger',
+  '应用降级': 'warning',
   '部署失败': 'danger',
   '认证拒绝': 'danger',
   '提升失败': 'danger',

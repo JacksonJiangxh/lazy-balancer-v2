@@ -336,6 +336,12 @@ func (e *Engine) Register(d Descriptor) error {
 	if d.Kind == KindScheduled && d.NextSlotFn == nil {
 		return fmt.Errorf("taskengine: %s 为 Scheduled 任务，必须提供 NextSlotFn", d.ID)
 	}
+	// B1-6（历史）：Daemon 不进周期 tick——EnabledFn 在调度面永不消费
+	//（静默忽略）。挂 EnabledFn 会让注册方误以为业务门生效，注册期响亮拒绝；
+	// 常驻业务门归 Run 体首行（autoban 形态，见 docs/task-engine-standard.md §4）。
+	if d.Kind == KindDaemon && d.EnabledFn != nil {
+		return fmt.Errorf("taskengine: %s 为常驻任务，EnabledFn 不参与调度（Daemon 不进 tick，静默忽略）——业务门须内置到 Run 体", d.ID)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.regs[d.ID] = &registration{desc: d}

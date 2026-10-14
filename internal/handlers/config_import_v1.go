@@ -658,6 +658,17 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
+		// D2/D3（历史）：自动封禁六列与受信代理三 TEXT 列导入门——
+		// 与 ImportConfigBackup 同序，畸形载荷预览即报不可导入（归一写回在
+		// 预览无可观察面，纯不变量对齐）。
+		if _, err := validateV2BackupAutobanConfig(backup.Config); err != nil {
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
+			return
+		}
+		if err := validateV2BackupTrustedProxyConfig(backup.Config, backup.Tables); err != nil {
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
+			return
+		}
 		// 2026-09-18 用户裁定:操作者缺席不再阻断——降级为预览 warning(分类
 		// 未选系统数据时操作者不受影响;选了也尊重用户选择)。
 		// CERT41-1:同序后 sections 已知——未选系统数据/备份 users 缺席不再误告

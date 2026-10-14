@@ -369,6 +369,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			// TASK-L1 同批：DB 直读不依赖管理器实例（EnabledFn :395-401 已同形态
 			// DB 直读）——测试环境不建管理器，生产管理器初始化晚于引擎注册，
 			// 管理器门会让首槽武装在窗口期读不到。
+			// B1-8（历史）：nil 库守卫——零值槽 fail-closed。
+			if db.DB == nil {
+				return time.Time{}
+			}
 			var en int
 			if err := db.DB.QueryRow("SELECT COALESCE(auto_update,1) FROM security_crs_version WHERE id=1").Scan(&en); err != nil || en != 1 {
 				return time.Time{}
@@ -379,6 +383,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			return parseUTCSlot(versionTableNextUpdate("security_crs_version"))
 		},
 		EnabledFn: func() bool { // 业务开关门（关=已停止——展示+调度面跳过，历史问题；DB 直读——manager 未初始化窗口也正确）
+			// B1-8（历史）：nil 库守卫（生产不可达）——fail-closed。
+			if db.DB == nil {
+				return false
+			}
 			var en int
 			// TASK-2（历史）：读库失败 fail-closed（显示已停止）——曾 err→true
 			// 把读错误报为启用（threat 侧 ThreatAutoUpdateEnabled 已是 fail-closed 口径）。
@@ -427,6 +435,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Category:    "安全防护", Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
 		NextSlotFn: func() time.Time {
 			// TASK-L1 同批：DB 直读不依赖管理器实例（与 crs 同形）
+			// B1-8（历史）：nil 库守卫——零值槽 fail-closed。
+			if db.DB == nil {
+				return time.Time{}
+			}
 			var en int
 			if err := db.DB.QueryRow("SELECT COALESCE(auto_update,1) FROM security_ip2region_version WHERE id=1").Scan(&en); err != nil || en != 1 {
 				return time.Time{}
@@ -434,6 +446,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			return parseUTCSlot(versionTableNextUpdate("security_ip2region_version"))
 		},
 		EnabledFn: func() bool { // 业务开关门（关=已停止——展示+调度面跳过，历史问题；DB 直读）
+			// B1-8（历史）：nil 库守卫（生产不可达）——fail-closed。
+			if db.DB == nil {
+				return false
+			}
 			var en int
 			// TASK-2（历史）：读库失败 fail-closed（与 crs 同批收敛）。
 			if err := db.DB.QueryRow("SELECT COALESCE(auto_update,1) FROM security_ip2region_version WHERE id=1").Scan(&en); err != nil {
@@ -442,6 +458,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			return en == 1
 		},
 		StatusFn: func() string {
+			// B1-8（历史）：nil 库守卫——空状态 fail-closed。
+			if db.DB == nil {
+				return ""
+			}
 			var status string
 			_ = db.DB.QueryRow("SELECT COALESCE(update_status,'') FROM security_ip2region_version WHERE id=1").Scan(&status)
 			// F-历史问题-02（历史）：同 CRS——仅在途阶段映射 running，
@@ -475,7 +495,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 
 	taskEngine.Register(taskengine.Descriptor{
 		ID: "autoban", Family: "security", Name: "自动封禁",
-		Description: "按滑动窗口统计 WAF 安全事件（口径可配：拦截/检测/全部），同一 IP 计数达阈值即写入「自动封禁名单」并在到期后自动解封；默认观察模式仅记录建议不封禁。计数数据源=安全事件采集提交点（仅主节点）",
+		Description: "按固定窗口统计 WAF 安全事件（口径可配：拦截/检测/全部），同一 IP 计数达阈值即写入「自动封禁名单」并在到期后自动解封；默认观察模式仅记录建议不封禁。计数数据源=安全事件采集提交点（仅主节点）",
 		Category:    "安全防护", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
 		IntervalFn: func() time.Duration { return time.Minute },
 		// 无 EnabledFn（2026-10-14 用户裁定）：调度唯一前提=业务启用（PUT
