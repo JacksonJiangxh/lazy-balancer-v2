@@ -365,6 +365,9 @@ type AutobanSuggestion struct {
 	// 建议列表「窗口内首末时间」数据源）。
 	WindowStart time.Time `json:"window_start"`
 	LastSeen    time.Time `json:"last_seen"`
+	// Location 归属地展示文本（仅 /status 建议列表富化：handlers 侧
+	// enrichIPLocation 单源装填；引擎候选/审计路径不消费，恒空串）。
+	Location string `json:"ip_location"`
 }
 
 // autobanCandidates 评估候选：先评估后修剪（AB-1，第 75 轮）——过期桶若计数
@@ -439,6 +442,12 @@ func autobanSetSuggestions(s []AutobanSuggestion) {
 	autobanMu.Lock()
 	defer autobanMu.Unlock()
 	autobanSuggestions = s
+}
+
+// AutobanSetSuggestionsForTest 直设建议暂存（handlers 层富化钉测用；nil=清空，
+// 与 SetAutobanReloader 同款测试缝约定）。
+func AutobanSetSuggestionsForTest(s []AutobanSuggestion) {
+	autobanSetSuggestions(s)
 }
 
 // ---- 名单 merge ----

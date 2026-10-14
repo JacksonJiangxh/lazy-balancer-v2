@@ -251,6 +251,41 @@ func TestAutobanStatus_shape(t *testing.T) {
 	}
 }
 
+// TestAutobanStatus_suggestionsCarryIPLocation：观察建议逐条携带归属地——与
+// 安全事件列表同源富化（handlers 侧 enrichIPLocation 单源装填）。保留地址无需
+// xdb 即可钉装填链路（私网前置拦截），普通 IP 无 xdb 时降级空串、永不报错。
+func TestAutobanStatus_suggestionsCarryIPLocation(t *testing.T) {
+	router := newAutobanTestEnv(t)
+	services.AutobanSetSuggestionsForTest([]services.AutobanSuggestion{
+		{IP: "192.0.2.9", Count: 2},
+		{IP: "10.0.0.1", Count: 5},
+	})
+	t.Cleanup(func() { services.AutobanSetSuggestionsForTest(nil) })
+	rec := getRequest(t, router, "/security/autoban/status")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Data struct {
+			Suggestions []services.AutobanSuggestion `json:"suggestions"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	if len(resp.Data.Suggestions) != 2 {
+		t.Fatalf("建议条数=%d, want 2", len(resp.Data.Suggestions))
+	}
+	// AutobanSuggestions 按 Count 降序：10.0.0.1（保留地址）在前。
+	first, second := resp.Data.Suggestions[0], resp.Data.Suggestions[1]
+	if first.IP != "10.0.0.1" || first.Location != "保留地址" {
+		t.Fatalf("建议[0] ip/location=%s/%q, want 10.0.0.1/保留地址", first.IP, first.Location)
+	}
+	if second.IP != "192.0.2.9" || second.Location != "" {
+		t.Fatalf("建议[1] ip/location=%s/%q, want 192.0.2.9/\"\"（无 xdb 降级空串）", second.IP, second.Location)
+	}
+}
+
 // ---- 预置名单例外 ----
 
 func TestAutobanPreset_deleteRejected(t *testing.T) {

@@ -95,6 +95,12 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 		return
 	}
 	isMaster := services.AutobanIsMaster()
+	suggestions := services.AutobanSuggestions()
+	for i := range suggestions {
+		// 归属地富化与安全事件列表同源（enrichIPLocation 单源：保留地址前置
+		// 拦截、无 xdb 降级空串、永不报错）。
+		suggestions[i].Location = enrichIPLocation(suggestions[i].IP)
+	}
 	resp := gin.H{
 		"enabled":         cfg.Enabled,
 		"dry_run":         cfg.DryRun,
@@ -106,7 +112,7 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 		"list_entries":    len(services.AutobanActiveEntries(entries)),
 		"list_referenced": h.autobanListReferenced(),
 		"tracked_ips":     services.AutobanTrackedIPs(),
-		"suggestions":     services.AutobanSuggestions(),
+		"suggestions":     suggestions,
 		"is_master":       isMaster,
 		"role":            map[bool]string{true: "master", false: "slave"}[isMaster],
 		"running":         false,
