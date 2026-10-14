@@ -43,12 +43,20 @@
         </el-tooltip>
         <div class="autoban-actions">
           <el-button
+            v-if="autobanStatus.enabled"
             size="small"
-            :type="autobanStatus.enabled ? 'danger' : 'success'"
+            type="danger"
             plain
             :loading="autobanToggling"
             @click="toggleAutobanEnabled"
-          >{{ autobanStatus.enabled ? '禁用' : '启用' }}</el-button>
+          >禁用</el-button>
+          <el-button
+            v-else
+            size="small"
+            type="success"
+            plain
+            @click="openAutobanConfigForEnable"
+          >启用</el-button>
         </div>
       </div>
       <!-- 未关联策略黄条：名单未被启用中的安全策略引用，封禁不生效 -->
@@ -432,9 +440,9 @@ const confirmAutobanEnable = async (): Promise<boolean> => {
     await ElMessageBox.confirm(AUTOBAN_ENABLE_CONFIRM_HTML, '启用自动封禁', {
       confirmButtonText: '确认启用',
       cancelButtonText: '取消',
-      type: 'warning',
       dangerouslyUseHTMLString: true,
-      customStyle: { width: '480px' },
+      customClass: 'autoban-confirm-box',
+      customStyle: { width: '520px', paddingTop: '16px' },
     })
     return true
   } catch {
@@ -444,21 +452,26 @@ const confirmAutobanEnable = async (): Promise<boolean> => {
 
 // 启用/禁用直切业务开关（2026-10-14 裁定）：保存即联动调度——enabled=true
 // 开 autoban 循环调度、false 停。PUT 需全量六项配置，从状态卡实态回填。
+// 启用入口（用户裁定 2026-10-14）：先弹配置框（表单预置开启），在配置框内
+// 保存/启用时才弹启用确认框——卡片按钮不直接确认启用。
+const openAutobanConfigForEnable = (): void => {
+  openAutobanConfig()
+  autobanForm.value.enabled = true
+}
+
 const toggleAutobanEnabled = async (): Promise<void> => {
-  if (autobanToggling.value) return
-  const next = !autobanStatus.value.enabled
-  if (next && !(await confirmAutobanEnable())) return
+  if (autobanToggling.value || autobanStatus.value.enabled) return
   autobanToggling.value = true
   try {
     await request.put('/security/autoban', {
-      enabled: next,
+      enabled: false,
       dry_run: autobanStatus.value.dry_run,
       threshold: autobanStatus.value.threshold,
       window_minutes: autobanStatus.value.window_minutes,
       duration: autobanStatus.value.duration,
       scope: autobanStatus.value.scope,
     })
-    ElMessage.success(next ? '自动封禁已启用（按配置调度执行）' : '自动封禁已禁用（调度已停止）')
+    ElMessage.success('自动封禁已禁用（调度已停止）')
     fetchAutobanStatus()
   } catch { /* 错误已由全局拦截器 toast */ }
   finally { autobanToggling.value = false }
@@ -782,9 +795,18 @@ onMounted(() => {
 /* 自动封禁启用确认框（dangerouslyUseHTMLString 精排，2026-10-14 裁定）：
    MessageBox 挂 body，scoped 样式不可达 → 全局作用域。两段式（启用前须知三条
    列表 + 使用建议正文），13px 正文紧凑排布，弹框宽 480px（customStyle 指定） */
-.autoban-confirm { font-size: 13px; line-height: 1.7; color: var(--el-text-color-regular, #606266); }
-.autoban-confirm-title { font-size: 13px; font-weight: 600; color: var(--el-text-color-primary, #303133); margin: 0 0 6px; }
-.autoban-confirm-title--gap { margin-top: 14px; }
+.autoban-confirm { font-size: 13px; line-height: 1.75; color: var(--el-text-color-regular, #606266); text-align: left; }
+.autoban-confirm-title { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: var(--el-text-color-primary, #303133); margin: 0 0 8px; }
+.autoban-confirm-title::before { content: ''; width: 3px; height: 13px; border-radius: 2px; background: var(--el-color-primary, #409eff); flex: none; }
+.autoban-confirm-title--gap { margin-top: 16px; }
+.autoban-confirm-title--gap::before { background: var(--el-color-success, #67c23a); }
+.autoban-confirm-list { margin: 0 0 4px; padding: 0; list-style: none; }
+.autoban-confirm-list li { position: relative; padding-left: 14px; margin: 0 0 6px; color: var(--el-text-color-regular, #606266); }
+.autoban-confirm-list li::before { content: ''; position: absolute; left: 2px; top: 9px; width: 4px; height: 4px; border-radius: 50%; background: var(--el-color-warning, #e6a23c); }
+.autoban-confirm-text { margin: 0; color: var(--el-text-color-regular, #606266); }
+/* MessageBox 结构修正：无默认图标时消息区占满、按钮区上边距收敛 */
+:global(.autoban-confirm-box .el-message-box__message) { display: block; padding: 4px 0 0; }
+:global(.autoban-confirm-box .el-message-box__btns) { padding-top: 14px; }
 .autoban-confirm-list { margin: 0; padding-left: 20px; }
 .autoban-confirm-list li + li { margin-top: 4px; }
 .autoban-confirm-text { margin: 0; }
