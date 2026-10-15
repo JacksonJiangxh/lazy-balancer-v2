@@ -65,7 +65,7 @@ func TestBuildIPPrecheck_trustListInclusion(t *testing.T) {
 	// Given：历史问题 allow=[1.2.3.4] trust=[5.6.7.8]；历史问题 deny=[9.9.9.9]
 	p1 := &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "allow", IPACLList: `["1.2.3.4"]`, IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["5.6.7.8"]`)}
 	p2 := &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["9.9.9.9"]`}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0, "lb_test"))
 
 	// Then(2026-09-15 用户裁定,信任 DetectionOnly 取代并入放行集):
 	trustRule := `"id:3,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly"`
@@ -92,7 +92,7 @@ func TestBuildIPPrecheck_trustDisabledNotIncluded(t *testing.T) {
 	// Given：历史问题 allow=[1.2.3.4] trust=[5.6.7.8] 但信任开关关闭；历史问题 deny=[9.9.9.9]
 	p1 := &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "allow", IPACLList: `["1.2.3.4"]`, IPWhitelistEnabled: false, IPWhitelist: json.RawMessage(`["5.6.7.8"]`)}
 	p2 := &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["9.9.9.9"]`}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0, "lb_test"))
 
 	// Then：allow 放行集应仅含 1.2.3.4（信任关闭→不并入）；
 	// 信任并集规则整体不发射（含信任 IP 的文件不应存在引用）。
@@ -174,7 +174,7 @@ func TestBuildCorazaDirectives_BodyAccessTruthTable(t *testing.T) {
 				p.IPACLMode = "deny"
 				p.IPACLList = `["10.0.0.0/8"]`
 			}
-			directives := mustDirectives(BuildCorazaDirectives(p, nil, "", false, 0))
+			directives := mustDirectives(BuildCorazaDirectives(p, nil, "", false, 0, "lb_test"))
 			if tc.mode == "custom_only" && tc.rulesState == "none" && !tc.ipControl {
 				if directives != "" {
 					t.Fatalf("空策略应产空串, got %q", directives)
@@ -200,7 +200,7 @@ func TestBuildCorazaDirectives_customOnlyIPControlSkipsBodyProcessors(t *testing
 	ipOnly := &models.SecurityPolicy{Mode: "custom_only", Enabled: true,
 		IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["10.0.0.0/8"]`}
 	// When
-	directives := mustDirectives(BuildCorazaDirectives(ipOnly, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(ipOnly, nil, "", false, 0, "lb_test"))
 	// Then：引擎为 IP 控制开启但 body access Off，id:9/10/11 三条死指令缺席
 	if !strings.Contains(directives, "SecRuleEngine On") {
 		t.Fatalf("IP 控制形状引擎必须 On:\n%s", directives)
@@ -216,7 +216,7 @@ func TestBuildCorazaDirectives_customOnlyIPControlSkipsBodyProcessors(t *testing
 	// 对照格：custom_only+启用自定义规则 → id:9/10/11 在场（body 条件规则依赖）
 	withRules := &models.SecurityPolicy{Mode: "custom_only", Enabled: true,
 		CustomRules: json.RawMessage(`[{"id":1,"name":"r","conditions":[{"target":"uri","operator":"starts_with","pattern":"/a"}],"action":"block","score":5,"enabled":true}]`)}
-	directives2 := mustDirectives(BuildCorazaDirectives(withRules, nil, "", false, 0))
+	directives2 := mustDirectives(BuildCorazaDirectives(withRules, nil, "", false, 0, "lb_test"))
 	for _, id := range []string{"id:9,", "id:10,", "id:11,"} {
 		if !strings.Contains(directives2, id) {
 			t.Errorf("custom_only+启用自定义规则必须发射 body processor 规则 %s:\n%s", id, directives2)
@@ -238,7 +238,7 @@ func TestBuildCorazaDirectives_multiPolicyDenySelfTrustExclusion(t *testing.T) {
 	// Given:多策略模式(flag=true)+deny 名单+本策略信任名单
 	p := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["198.51.100.9"]`, IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["10.0.0.1"]`)}
 	// When
-	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0))
+	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0, "lb_test"))
 	// Then:id:2 以链式自排除形态存在(非抑制删除、非平原形态)
 	if !strings.Contains(directives, "id:2,phase:1,deny,status:403,log,msg:'IP 黑名单拒绝',skipAfter:SECURITY_RULES_END,chain") {
 		t.Fatalf("multi-policy deny must emit chain-starter id:2 with deny in head (历史问题), got:\n%s", directives)
@@ -256,7 +256,7 @@ func TestBuildCorazaDirectives_multiPolicyDenyNoTrustPlain(t *testing.T) {
 	// Given:多策略+deny 名单+信任关闭(无排除项→平原 id:2,形状不变)
 	p := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["198.51.100.9"]`, IPWhitelistEnabled: false, IPWhitelist: json.RawMessage(`[]`)}
 	// When
-	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0))
+	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0, "lb_test"))
 	// Then
 	if !strings.Contains(directives, "id:2,phase:1,deny") {
 		t.Fatalf("no-trust multi-policy must keep plain id:2 deny, got:\n%s", directives)
@@ -270,7 +270,7 @@ func TestBuildCorazaDirectives_singlePolicyTrustNoChain(t *testing.T) {
 	// Given:单策略(flag=false)+deny+信任(回归形状:同实例 DetectionOnly 已正确,无链)
 	p := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["198.51.100.9"]`, IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["10.0.0.1"]`)}
 	// When
-	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", false, 0, "lb_test"))
 	// Then
 	if !strings.Contains(directives, "id:2,phase:1,deny") {
 		t.Fatalf("single policy must keep plain id:2 deny, got:\n%s", directives)
@@ -284,7 +284,7 @@ func TestBuildCorazaDirectives_multiPolicyBlacklistSelfTrustExclusion(t *testing
 	// Given:多策略+旧版黑名单+本策略信任
 	p := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPBlacklist: json.RawMessage(`["198.51.100.9"]`), IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["10.0.0.1"]`)}
 	// When
-	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0))
+	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0, "lb_test"))
 	// Then:id:4 链式自排除
 	if !strings.Contains(directives, "id:4,phase:1,deny,status:403,log,msg:'IP 黑名单',skipAfter:SECURITY_RULES_END,chain") {
 		t.Fatalf("multi-policy blacklist must emit chain-starter id:4 with deny in head (历史问题), got:\n%s", directives)
@@ -295,7 +295,7 @@ func TestBuildCorazaDirectives_multiPolicyAllowSelfTrustExclusion(t *testing.T) 
 	// Given:多策略+allow 模式+本策略信任(信任 IP 不在白名单时不拦,预检记录)
 	p := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPACLEnabled: true, IPACLMode: "allow", IPACLList: `["1.2.3.4"]`, IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["10.0.0.1"]`)}
 	// When
-	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0))
+	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0, "lb_test"))
 	// Then:id:2 链式(!@ipListFast allow AND !@ipListFast trust → deny)
 	if !strings.Contains(directives, "id:2,phase:1,deny,status:403,log,msg:'IP 白名单拒绝',skipAfter:SECURITY_RULES_END,chain") {
 		t.Fatalf("multi-policy allow must emit chain-starter id:2 with deny in head (历史问题), got:\n%s", directives)

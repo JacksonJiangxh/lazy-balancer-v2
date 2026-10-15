@@ -42,6 +42,15 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	// 自动更新调度器。tick 首行的 is_master 守卫只能拦住未发起的 tick；已越过
 	// 守卫的 in-flight 更新会在从节点上继续写版本行、替换规则树并 reload，
 	// 瞬时打破从节点只读不变量。
+	// C7（历史）：引擎角色显式直调收口——原仅经下方三管理器 SetMasterRole
+	// 间接传播（三者在场时各自转调 TaskEngine().SetRole(false) 后提前返回），
+	// 三管理器同时为 nil 时引擎角色不翻转（master-only 常驻/周期任务在从节点
+	// 继续运行，破坏只读不变量；生产 main.go 恒初始化三管理器故不可达，属防御
+	// 性收敛）。管理器路径保留：SetMasterRole 内部转调引擎=幂等重申（SetRole
+	// 重申非重启意图，历史问题-01）。
+	if te := TaskEngine(); te != nil {
+		te.SetRole(false)
+	}
 	if crsManager := GetCRSUpdateManager(); crsManager != nil {
 		crsManager.SetMasterRole(false)
 	}

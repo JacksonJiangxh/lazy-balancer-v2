@@ -259,7 +259,7 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 //     摄取+pending-delta+copytruncate 全套安全链——绝不无补采截断；daemon
 //     在场时文件本不会积到阈值，触发即等价一次普通 tick，无竞争）。
 //
-// （历史： 耗时侧车退役——耗时随审计行内嵌流转，
+// （历史：耗时侧车退役——耗时随审计行内嵌流转，
 // 本目录仅剩 audit.log 家族文件，无需独立截断兜底。）
 //
 // 返回动作明细（log-cleanup 任务日志与运行日志双写——清理了哪个文件必须

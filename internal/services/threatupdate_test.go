@@ -257,7 +257,7 @@ func TestThreatUpdate_listChangeHotPathZeroReload(t *testing.T) {
 	setupThreatTest(t, nil, nil, nil)
 	var reloads, refreshes int
 	SetThreatReloader(func() error { reloads++; return nil })
-	SetThreatProjectionRefresher(func() (bool, error) { refreshes++; return true, nil })
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) { refreshes++; return ProjectionConverged, nil })
 	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
 
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
@@ -319,7 +319,7 @@ func TestThreatUpdate_refreshesOnlyWhenChangedListReferenced(t *testing.T) {
 	setupThreatTest(t, nil, nil, nil)
 	var reloads, refreshes int
 	SetThreatReloader(func() error { reloads++; return nil })
-	SetThreatProjectionRefresher(func() (bool, error) { refreshes++; return true, nil })
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) { refreshes++; return ProjectionConverged, nil })
 	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
 
 	// When 首轮写入全部名单（无任何策略引用）
@@ -387,7 +387,7 @@ func TestThreatUpdate_trustedProxyReferencedHotPath(t *testing.T) {
 	setupThreatTest(t, nil, nil, nil)
 	var reloads, refreshes int
 	SetThreatReloader(func() error { reloads++; return nil })
-	SetThreatProjectionRefresher(func() (bool, error) { refreshes++; return true, nil })
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) { refreshes++; return ProjectionConverged, nil })
 	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
 
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
@@ -433,10 +433,10 @@ func TestThreatUpdate_refresherFailureFallsBackToReload(t *testing.T) {
 
 	for i, tc := range []struct {
 		name      string
-		refresher func() (bool, error)
+		refresher func() (IPListProjectionOutcome, error)
 	}{
-		{"刷新器报错", func() (bool, error) { return false, errors.New("boom") }},
-		{"未证实收敛", func() (bool, error) { return false, nil }},
+		{"刷新器报错", func() (IPListProjectionOutcome, error) { return ProjectionFallback, errors.New("boom") }},
+		{"未证实收敛", func() (IPListProjectionOutcome, error) { return ProjectionFallback, nil }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var reloads int
@@ -544,7 +544,7 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 		t.Error("热路径架构下被引用名单变化不得触发 /load（重载门已退役）")
 		return nil
 	})
-	SetThreatProjectionRefresher(func() (bool, error) { refreshes++; return true, nil })
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) { refreshes++; return ProjectionConverged, nil })
 	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
 
 	readHash := func() string {
@@ -721,9 +721,9 @@ func TestThreatUpdate_reloadPendingMarkerRetired(t *testing.T) {
 		reloads++
 		return errors.New("reload boom")
 	})
-	SetThreatProjectionRefresher(func() (bool, error) {
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) {
 		refreshes++
-		return false, nil // 未证实收敛 → 回退 /load（且 /load 失败）
+		return ProjectionFallback, nil // 未证实收敛 → 回退 /load（且 /load 失败）
 	})
 	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
 

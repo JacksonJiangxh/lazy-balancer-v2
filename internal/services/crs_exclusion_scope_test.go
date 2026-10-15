@@ -85,7 +85,7 @@ func TestBuildCorazaDirectives_legacyExcludedRulesEmissionUnchanged(t *testing.T
 		CRSRuleGroups:    json.RawMessage(`["42"]`),
 		CRSExcludedRules: json.RawMessage(`["942100","ABCDEF","942100-abc","REQUEST-942.conf","1-999999","932100-932200"]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, "SecRuleRemoveById 942100\n") {
 		t.Fatal("legal single ID must be emitted (legacy path)")
 	}
@@ -110,11 +110,13 @@ func TestBuildCorazaDirectives_scopedExclusionExpandsGroupPerID(t *testing.T) {
 		CRSExcludedRules: json.RawMessage(
 			`[{"target":"42","scope":"ip","ips":"1.1.1.1,2.2.2.2"}]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
-	// 组 42 在夹具索引中含 942100、942550 两条 → 逐 ID ctl，id 2000001 起顺序唯一
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
+	// 组 42 在夹具索引中含 942100、942550 两条 → 逐 ID ctl，id 2000001 起顺序
+	// 唯一。匹配集经投影 @ipListFast（历史 SEC-1，内联 @ipMatch 形态退役
+	// ——大名单撞 48KiB 护栏）；匹配内容断言在投影文件（readRenderedIPList）。
 	want := []string{
-		`SecRule REMOTE_ADDR "@ipMatch 1.1.1.1,2.2.2.2" "id:2000001,phase:1,pass,nolog,ctl:ruleRemoveById=942100"` + "\n",
-		`SecRule REMOTE_ADDR "@ipMatch 1.1.1.1,2.2.2.2" "id:2000002,phase:1,pass,nolog,ctl:ruleRemoveById=942550"` + "\n",
+		`"id:2000001,phase:1,pass,nolog,ctl:ruleRemoveById=942100"` + "\n",
+		`"id:2000002,phase:1,pass,nolog,ctl:ruleRemoveById=942550"` + "\n",
 	}
 	last := -1
 	for _, line := range want {
@@ -126,6 +128,9 @@ func TestBuildCorazaDirectives_scopedExclusionExpandsGroupPerID(t *testing.T) {
 			t.Fatalf("ctl lines out of order: %q", line)
 		}
 		last = idx
+	}
+	if got := readRenderedIPList(t, directives, "p0-crsxc-0"); got != "1.1.1.1/32\n2.2.2.2/32\n" {
+		t.Fatalf("匹配集投影文件=%q, want 两条聚合排序条目", got)
 	}
 	if strings.Contains(directives, "SecRuleRemoveById") {
 		t.Fatal("scoped payload must not emit config-time SecRuleRemoveById")
@@ -150,16 +155,29 @@ func TestBuildCorazaDirectives_scopedExclusionMergesIPsAndListDedup(t *testing.T
 			{"target":"942550","scope":"list","listRefs":[` + jsonInt(listID) + `,` + jsonInt(listID) + `]}
 		]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
-	// 条目 1：ips ∪ 列表条目合并去重保序 → 2.2.2.2,1.1.1.1,3.3.3.0/24
-	if !strings.Contains(directives,
-		`SecRule REMOTE_ADDR "@ipMatch 2.2.2.2,1.1.1.1,3.3.3.0/24" "id:2000001,phase:1,pass,nolog,ctl:ruleRemoveById=942100"`+"\n") {
-		t.Fatalf("entry 1 merged match set wrong:\n%s", directives)
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
+	// 条目 1：ips ∪ 列表条目合并去重保序 → 2.2.2.2,1.1.1.1,3.3.3.0/24；
+	// 条目 2：同一列表重复引用去重一次。两组合键不同（ips 字面不同）→ 两份
+	// 投影（p0-crsxc-0/1，历史 SEC-1 投影形态，内容断言在投影文件）。
+	got0 := readRenderedIPList(t, directives, "p0-crsxc-0")
+	if got0 != "1.1.1.1/32\n2.2.2.2/32\n3.3.3.0/24\n" {
+		t.Fatalf("entry 1 merged match set wrong: %q", got0)
 	}
-	// 条目 2：同一列表重复引用去重一次；id 跨条目顺序唯一（2000002）
-	if !strings.Contains(directives,
-		`SecRule REMOTE_ADDR "@ipMatch 1.1.1.1,3.3.3.0/24" "id:2000002,phase:1,pass,nolog,ctl:ruleRemoveById=942550"`+"\n") {
-		t.Fatalf("entry 2 merged match set / seq wrong:\n%s", directives)
+	got1 := readRenderedIPList(t, directives, "p0-crsxc-1")
+	if got1 != "1.1.1.1/32\n3.3.3.0/24\n" {
+		t.Fatalf("entry 2 merged match set (dup list refs deduped) wrong: %q", got1)
+	}
+	// id 跨条目顺序唯一（2000001/2000002），各自指向对应投影文件
+	for _, want := range []string{
+		`"id:2000001,phase:1,pass,nolog,ctl:ruleRemoveById=942100"`,
+		`"id:2000002,phase:1,pass,nolog,ctl:ruleRemoveById=942550"`,
+	} {
+		if !strings.Contains(directives, want) {
+			t.Fatalf("missing ctl emission %q in:\n%s", want, directives)
+		}
+	}
+	if strings.Count(directives, "id:200000") != 2 {
+		t.Fatalf("scoped ctl rules must be exactly two, seq-unique:\n%s", directives)
 	}
 }
 
@@ -180,7 +198,7 @@ func TestBuildCorazaDirectives_scopedExclusionStaleTargetsSkipped(t *testing.T) 
 	}
 	// db.DB 未初始化：listRefs 解析为空集 → 两条均跳过（陈旧 ID / 空合并集），
 	// 不 panic、不发射任何 ctl 行。
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if strings.Contains(directives, "ctl:ruleRemoveById") {
 		t.Fatalf("stale targets must be skipped:\n%s", directives)
 	}
@@ -200,7 +218,7 @@ func TestBuildCorazaDirectives_scopedExclusionEmptyListSkipped(t *testing.T) {
 		CRSExcludedRules: json.RawMessage(
 			`[{"target":"42","scope":"list","listRefs":[` + jsonInt(listID) + `]}]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if strings.Contains(directives, "ctl:ruleRemoveById") {
 		t.Fatalf("empty resolved list must skip emission:\n%s", directives)
 	}
@@ -213,7 +231,7 @@ func TestBuildCorazaDirectives_hybridRuleGroupsParentFileSupplement(t *testing.T
 		Mode:             "blocking",
 		CRSRuleGroups:    json.RawMessage(`["942100"]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, "Include /app/waf/crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf\n") {
 		t.Fatalf("parent file of selected ID must be included:\n%s", directives)
 	}
@@ -236,7 +254,7 @@ func TestBuildCorazaDirectives_hybridRuleGroupsGroupCoveredSkipsSupplement(t *te
 		Mode:             "blocking",
 		CRSRuleGroups:    json.RawMessage(`["42","942100"]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, "Include /app/waf/crs/rules/REQUEST-942-*.conf\n") {
 		t.Fatalf("selected group glob must be included:\n%s", directives)
 	}
@@ -245,7 +263,7 @@ func TestBuildCorazaDirectives_hybridRuleGroupsGroupCoveredSkipsSupplement(t *te
 	}
 	// 同文件全部 ID 被选 → Include 父文件但零补删
 	policy.CRSRuleGroups = json.RawMessage(`["942100","942550"]`)
-	directives = mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives = mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, "Include /app/waf/crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf\n") {
 		t.Fatalf("parent file must be included when all its IDs selected:\n%s", directives)
 	}
@@ -261,7 +279,7 @@ func TestBuildCorazaDirectives_hybridRuleGroupsStaleIDSkipped(t *testing.T) {
 		Mode:             "blocking",
 		CRSRuleGroups:    json.RawMessage(`["999999"]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if strings.Contains(directives, "SecRuleRemoveById") {
 		t.Fatalf("stale group ID must be skipped:\n%s", directives)
 	}
@@ -288,7 +306,7 @@ func TestBuildCorazaDirectives_infraGroupsForceIncluded(t *testing.T) {
 		Mode:             "blocking",
 		CRSRuleGroups:    json.RawMessage(`["42"]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	idx901 := strings.Index(directives, "Include /app/waf/crs/rules/REQUEST-901-INITIALIZATION.conf")
 	idx942 := strings.Index(directives, "Include /app/waf/crs/rules/REQUEST-942-")
 	idx949 := strings.Index(directives, "Include /app/waf/crs/rules/REQUEST-949-BLOCKING-EVALUATION.conf")
@@ -307,7 +325,7 @@ func TestBuildCorazaDirectives_infraGroupsForceIncluded(t *testing.T) {
 	// 改由强制 Include 按正确次序（901 最前、949/959 殿后）补齐，各恰一次。
 	policy.WAFCheckResponse = true
 	policy.CRSRuleGroups = json.RawMessage(`["01","42","49","59","80"]`)
-	directives = mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives = mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	for glob, exact := range map[string]string{
 		"REQUEST-901-*.conf":  "REQUEST-901-INITIALIZATION.conf",
 		"REQUEST-949-*.conf":  "REQUEST-949-BLOCKING-EVALUATION.conf",
@@ -329,7 +347,7 @@ func TestBuildCorazaDirectives_infraGroupsForceIncluded(t *testing.T) {
 	}
 	// 6 位基础设施 ID（M3 同口径剥离）→ 剥离后由强制 Include 补齐，949 仍恰一次
 	policy.CRSRuleGroups = json.RawMessage(`["42","949110"]`)
-	directives = mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives = mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if got := strings.Count(directives, "Include /app/waf/crs/rules/REQUEST-949-BLOCKING-EVALUATION.conf"); got != 1 {
 		t.Fatalf("949 included %d times after infra-ID strip, want exactly 1:\n%s", got, directives)
 	}
@@ -347,7 +365,7 @@ func TestBuildCorazaDirectives_legacyInfraGroupOrderPreserved(t *testing.T) {
 		WAFCheckResponse: true,
 		CRSRuleGroups:    json.RawMessage(`["42","01"]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if strings.Contains(directives, "REQUEST-901-*.conf") {
 		t.Fatalf("legacy infra group entry must be stripped, not emitted as glob:\n%s", directives)
 	}
@@ -365,14 +383,14 @@ func TestBuildCorazaDirectives_legacyInfraGroupOrderPreserved(t *testing.T) {
 
 func TestBuildCorazaDirectives_emptyGroupsKeepAllEffectiveSemantics(t *testing.T) {
 	scopedExclusionFixture(t)
-	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, "Include /app/waf/crs/rules/REQUEST-*.conf\n") {
 		t.Fatalf("empty groups must keep REQUEST-only all-effective include:\n%s", directives)
 	}
 	if strings.Contains(directives, "Include /app/waf/crs/rules/*.conf\n") {
 		t.Fatalf("WAFCheckResponse=false must not include RESPONSE files:\n%s", directives)
 	}
-	directives = mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", WAFCheckResponse: true}, nil, "", false, 0))
+	directives = mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", WAFCheckResponse: true}, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, "Include /app/waf/crs/rules/*.conf\n") {
 		t.Fatalf("empty groups + response check must keep all-file include:\n%s", directives)
 	}
@@ -381,7 +399,7 @@ func TestBuildCorazaDirectives_emptyGroupsKeepAllEffectiveSemantics(t *testing.T
 func TestBuildCorazaDirectives_groupOnlySelectionEmissionEquivalent(t *testing.T) {
 	scopedExclusionFixture(t)
 	policy := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", CRSRuleGroups: json.RawMessage(`["42"]`)}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, "Include /app/waf/crs/rules/REQUEST-942-*.conf\n") {
 		t.Fatalf("pure group selection must keep glob include:\n%s", directives)
 	}
@@ -389,7 +407,7 @@ func TestBuildCorazaDirectives_groupOnlySelectionEmissionEquivalent(t *testing.T
 		t.Fatalf("pure group selection must not emit parent-file include/removals:\n%s", directives)
 	}
 	policy.WAFCheckResponse = true
-	directives = mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives = mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, "Include /app/waf/crs/rules/RESPONSE-942-*.conf\n") {
 		t.Fatalf("response-side glob must survive hybrid rework:\n%s", directives)
 	}
@@ -425,11 +443,11 @@ func TestCRSExcludedEntry_IPsDualShapeRoundTrip(t *testing.T) {
 // 响应体永不进规则），关闭时不得出现（避免无谓的响应体缓冲）。
 func TestBuildCorazaDirectives_responseBodyMimeTypeEmitted(t *testing.T) {
 	scopedExclusionFixture(t)
-	on := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "detection", WAFCheckResponse: true, CRSRuleGroups: json.RawMessage(`["51"]`)}, nil, "", false, 0))
+	on := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "detection", WAFCheckResponse: true, CRSRuleGroups: json.RawMessage(`["51"]`)}, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(on, "SecResponseBodyMimeType text/plain text/html text/xml application/json") {
 		t.Fatalf("WAFCheckResponse on must emit SecResponseBodyMimeType:\n%s", on)
 	}
-	off := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "detection", CRSRuleGroups: json.RawMessage(`["42"]`)}, nil, "", false, 0))
+	off := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "detection", CRSRuleGroups: json.RawMessage(`["42"]`)}, nil, "", false, 0, "lb_test"))
 	if strings.Contains(off, "SecResponseBodyMimeType") {
 		t.Fatalf("WAFCheckResponse off must not emit SecResponseBodyMimeType:\n%s", off)
 	}
@@ -446,7 +464,7 @@ func TestBuildCorazaDirectives_storedInitExclusionsSkipped(t *testing.T) {
 			CRSRuleGroups:    json.RawMessage(`["42"]`),
 			CRSExcludedRules: json.RawMessage(`[` + target + `]`),
 		}
-		directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+		directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 		if strings.Contains(directives, "SecRuleRemoveById 901") || strings.Contains(directives, "SecRuleRemoveById 900500-902000") {
 			t.Fatalf("stored init exclusion %s must not reach SecRuleRemoveById:\n%s", target, directives)
 		}
@@ -461,7 +479,7 @@ func TestBuildCorazaDirectives_storedInitExclusionsSkipped(t *testing.T) {
 		CRSRuleGroups:    json.RawMessage(`["42"]`),
 		CRSExcludedRules: json.RawMessage(`[{"target":"901200","scope":"ip","ips":"203.0.113.7"}]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if strings.Contains(directives, "ruleRemoveById=901200") {
 		t.Fatalf("scoped stored init exclusion must not emit ctl removal:\n%s", directives)
 	}
@@ -472,7 +490,7 @@ func TestBuildCorazaDirectives_storedInitExclusionsSkipped(t *testing.T) {
 		CRSRuleGroups:    json.RawMessage(`["42"]`),
 		CRSExcludedRules: json.RawMessage(`["42"]`),
 	}
-	directives = mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives = mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, "SecRuleRemoveById 942000-942999") {
 		t.Fatalf("non-init exclusion must still emit:\n%s", directives)
 	}
@@ -497,7 +515,7 @@ func TestBuildCorazaDirectives_infraIncludeGuardedByExistence(t *testing.T) {
 		WAFCheckResponse: true,
 		CRSRuleGroups:    json.RawMessage(`["42"]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	for _, infra := range []string{"REQUEST-901-INITIALIZATION.conf", "REQUEST-949-BLOCKING-EVALUATION.conf", "RESPONSE-959-BLOCKING-EVALUATION.conf"} {
 		if strings.Contains(directives, "Include /app/waf/crs/rules/"+infra) {
 			t.Fatalf("missing infra file %s must not be force-included:\n%s", infra, directives)

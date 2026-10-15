@@ -677,7 +677,7 @@ func TestSecurityEventsTick_idleTickSkipsMappingLoad(t *testing.T) {
 }
 
 // （历史：历史问题-01 的 TestSecurityEventsTick_idleTickConsumesTimingSidecar
-// 随  侧车退役一并删除——耗时随审计行内嵌 lb_timing 字段
+// 随侧车退役一并删除——耗时随审计行内嵌 lb_timing 字段
 // 流转，空闲 tick 无侧车消费面。空闲提前返回契约由
 // TestSecurityEventsTick_idleTickSkipsMappingLoad 继续钉住。）
 

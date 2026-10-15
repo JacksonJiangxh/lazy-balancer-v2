@@ -175,18 +175,15 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 		j.Issuer = certificateIssuer(certPEM)
 		j.CertificateStatus = "unknown"
 		if j.ExpiresAt.Valid {
-			remaining := j.ExpiresAt.Time.Sub(now)
+			// 历史：剩余天数收敛 CertDaysRemaining 单源（两分支原同表达式
+			// 随 历史问题/历史问题 截断统一——提升为分支前单次计算）。
+			j.DaysRemaining = services.CertDaysRemaining(j.ExpiresAt.Time, now)
 			if !now.Before(j.ExpiresAt.Time) {
 				// 历史问题 D-N4/历史问题 D-2：过期天数与 certinfo.go 同表达式（int() 向零截断）。
-				// 历史问题 的 -int(Ceil(-x)) 与 floor(x) 逐值恒等（空操作），两端口径
-				// 不一致原样保留；历史问题 改为真截断（过期 1 天 3 小时：-1，不再 -2）。
-				j.DaysRemaining = int(remaining.Hours() / 24)
 				j.CertificateStatus = "expired"
 			} else {
 				// 历史问题 D-2：非过期分支同步截断（原 Ceil 使 23h 报 1 天，certinfo 报 0）
-				// ——两端口径完全一致。
-				j.DaysRemaining = int(remaining.Hours() / 24)
-				if remaining <= time.Duration(expiryDays)*24*time.Hour {
+				if remaining := j.ExpiresAt.Time.Sub(now); remaining <= time.Duration(expiryDays)*24*time.Hour {
 					j.CertificateStatus = "expiring"
 				} else {
 					j.CertificateStatus = "valid"
@@ -434,7 +431,8 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 	}
 	// 历史问题 C-发现3 TOCTOU：N4 守卫读规则 enabled 状态后、删除前，EnableRule
 	// （持 caddyOpMu）可完成启用并恢复任务，守卫放行被竞态绕过。caddyOpMu
-	// 覆盖 查询→守卫→disabled 翻转→取消→删除 全程，与 EnableRule 互斥：
+	// 覆盖 查询→守卫→disabled 翻转→删除 全程（取消已移出，CERT 历史问题 见下），
+	// 与 EnableRule 互斥：
 	// 删除先完成则 EnableRule 查不到任务行，走 EnableCertJobCreate 重建
 	// （续签链不断）；EnableRule 先完成则守卫读到 enabled=1 返回 409。
 	// 不变量（历史问题 S-1 修正）：'disabled' 对 worker 是终态——所有 worker 侧
@@ -446,14 +444,19 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 	// 无锁调用——其 UPDATE 均按旧状态 CAS 或 from 列表排除 'disabled'，与翻转
 	// 交错时命中 0 行（先于翻转→翻转 CAS 失败；翻转后→0 行；删除后→行不存在），
 	// 语义自洽。
+	// CERT 历史问题（历史，A76Cert）：caddyOpMu 覆盖 查询→守卫→disabled 翻转
+	// →删除 全程（历史问题 C-发现3 TOCTOU 不变量保持——与 EnableRule 互斥域不变，
+	// 翻转与 DELETE 仍同一临界区）；在途取消等待（qm.CancelJob ≤30s）移出
+	// 临界区（见下方取消点注释），本函数改手动配对解锁。
 	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
 	operationLock := certJobOperationLock(id)
 	operationLock.Lock()
 	defer operationLock.Unlock()
 	var ruleID, domain, status, certPEM, keyPEM string
 	var caProviderID int
-	if err := db.DB.QueryRow("SELECT rule_id, domain, status, COALESCE(ca_provider_id,0), COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id = ?", id).Scan(&ruleID, &domain, &status, &caProviderID, &certPEM, &keyPEM); dbQueryNotFound(c, err, "Job not found", "DeleteCertJob query job") {
+	if err := db.DB.QueryRow("SELECT rule_id, domain, status, COALESCE(ca_provider_id,0), COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id = ?", id).Scan(&ruleID, &domain, &status, &caProviderID, &certPEM, &keyPEM); err != nil {
+		h.caddyOpMu.Unlock()
+		dbQueryNotFound(c, err, "Job not found", "DeleteCertJob query job")
 		return
 	}
 	// 历史问题 N4 + 历史问题 S-2：删除持有证书的 issued/downloaded 任务、或删除仍在
@@ -477,10 +480,12 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 			WHERE caddy_id=? AND enabled=1 AND enable_tls=1 AND tls_source='acme_dns'
 			  AND lower(replace(domain,' ','')) IN (?,?)`,
 			ruleID, domain, reversedCertJobDomain(domain)).Scan(&active); err != nil {
+			h.caddyOpMu.Unlock()
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to check rule state"})
 			return
 		}
 		if active > 0 {
+			h.caddyOpMu.Unlock()
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: message})
 			return
 		}
@@ -490,11 +495,13 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 	}
 	result, err := db.DB.Exec("UPDATE cert_jobs SET status='disabled', updated_at=datetime('now') WHERE id=? AND status=?", id, status)
 	if err != nil {
+		h.caddyOpMu.Unlock()
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to disable job"})
 		return
 	}
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
+		h.caddyOpMu.Unlock()
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to verify disabled job"})
 		return
 	}
@@ -506,21 +513,39 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 		var currentStatus string
 		scanErr := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", id).Scan(&currentStatus)
 		if errors.Is(scanErr, sql.ErrNoRows) {
+			h.caddyOpMu.Unlock()
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "Job not found"})
 			return
 		}
 		if scanErr != nil {
+			h.caddyOpMu.Unlock()
 			services.Logf("error", "DeleteCertJob reread job %d status failed: %v", id, scanErr)
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取任务状态失败"})
 			return
 		}
+		h.caddyOpMu.Unlock()
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务状态已变更，请刷新后重试"})
 		return
 	}
-	cancelCertJob(id)
+	// CERT 历史问题（历史）：取消移出全局 CaddyOpLock 临界区——原顺序
+	// 翻转→取消→删除使取消的在途等待（qm.CancelJob ≤30s）让全局 Caddy 写
+	// 路径排队（与 rules.go:2027 域名迁移同型等待环）。临界区=守卫→翻转→
+	// DELETE（历史问题 C-发现3 不变量保持：翻转与 DELETE 同一临界区与 EnableRule
+	// 互斥）；顺序对调（删除→取消）依据：worker 全部状态迁移按旧态 CAS 且
+	// from 列表排除 'disabled'，删除窗内在途执行不可能复活/改写行；取消先于
+	// 失败恢复路径（CancelJob 会清 pending 并取消部署重试——先恢复后取消会把
+	// 恢复重入队的条目清掉，恢复语义要求先取消）。per-job operationLock 仍
+	// 全程持有：等待期间同任务 Retry/重复 Delete 保持互斥。
 	result, err = db.DB.Exec("DELETE FROM cert_jobs WHERE id = ?", id)
+	h.caddyOpMu.Unlock()
+	cancelCertJob(id)
 	if err != nil {
 		deleteErr := err
+		// 失败恢复重取 caddyOpMu：恢复写与 EnableRule 的 EnableCertJobCreate
+		//（无 CAS 写，历史问题 S-3）互斥需持锁；重取窗口内 EnableRule 可见 disabled
+		// 行并 Resume——恢复 CAS（status='disabled'）0 行命中→「恢复已跳过」
+		// 并入 deleteErr（500 如实呈现，删除本就失败；行存活+启用=一致终态）。
+		h.caddyOpMu.Lock()
 		if deleteCertJobPreRestoreHook != nil {
 			deleteCertJobPreRestoreHook(id)
 		}
@@ -581,6 +606,7 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 			}
 		}
 		services.Logf("error", "DeleteCertJob failed for job %d: %v", id, deleteErr)
+		h.caddyOpMu.Unlock()
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to delete job"})
 		return
 	}

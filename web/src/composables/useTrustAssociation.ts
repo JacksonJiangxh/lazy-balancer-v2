@@ -56,10 +56,6 @@ export const useTrustAssociation = (options: {
   const { adding, addIpToList } = useIpListAdd()
   const creating = ref(false)
 
-  /** 策略既有同侧列表：对应 refs 字段中第一个非系统列表 */
-  const resolveSideList = (policy: TrustPolicyLike, side: ListSide): TrustListRef | null =>
-    resolveSideLists(policy, side)[0] ?? null
-
   /** 同侧全部非系统列表（历史用户验收：多列表绑定时逐列表出按钮，不再只取第一个） */
   const resolveSideLists = (policy: TrustPolicyLike, side: ListSide): IpListOption[] => {
     const refs = parseRefIds(policy[SIDE_CONFIG[side].refField])
@@ -78,7 +74,8 @@ export const useTrustAssociation = (options: {
   /** 单击动作：把 IP 加入策略指定侧的列表（自动解析/创建目标列表并关联） */
   const ensureListAndJoin = async (policy: TrustPolicyLike, ip: string, side: ListSide): Promise<void> => {
     const cfg = SIDE_CONFIG[side]
-    const existing = resolveSideList(policy, side)
+    // 历史 F5：单数 resolveSideList 已删（唯一内部消费点内联为 plural 首项）
+    const existing = resolveSideLists(policy, side)[0] ?? null
     if (existing) {
       const opt: IpListOption = { id: existing.id, name: existing.name, entry_count: 0 }
       const done = await addIpToList(ip, opt, { verb: cfg.verb, successText: `已${cfg.verb}——已加入列表「${existing.name}」` })
@@ -162,5 +159,5 @@ export const useTrustAssociation = (options: {
   }
 
 
-  return { busyTrust: adding, creating, resolveSideList, resolveSideLists, joinSpecificList, ensureListAndJoin, removeFromSideRef }
+  return { busyTrust: adding, creating, resolveSideLists, joinSpecificList, ensureListAndJoin, removeFromSideRef }
 }

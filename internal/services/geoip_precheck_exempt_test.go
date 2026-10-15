@@ -28,7 +28,7 @@ func TestBuildIPPrecheckDirectives_allowExemptSkipsGeoChains(t *testing.T) {
 		GeoIPMode:      "deny",
 		GeoIPCountries: json.RawMessage(`["海外"]`),
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{allowPolicy, geoPolicy}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{allowPolicy, geoPolicy}, 0, "lb_test"))
 
 	if !strings.Contains(directives, `@ipListFast `) || !strings.Contains(directives, `u-allow-exempt`) || !strings.Contains(directives, `"id:13,phase:1,pass,nolog,skipAfter:SECURITY_RULES_END"`) {
 		t.Fatalf("directives must contain allow-membership geo exemption rule:\n%s", directives)
@@ -54,7 +54,7 @@ func TestBuildIPPrecheckDirectives_noAllowListNoExempt(t *testing.T) {
 		GeoIPMode:      "deny",
 		GeoIPCountries: json.RawMessage(`["海外"]`),
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{geoPolicy}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{geoPolicy}, 0, "lb_test"))
 	if strings.Contains(directives, "id:13,phase:1,pass") {
 		t.Fatalf("exemption rule must not be emitted without allow lists:\n%s", directives)
 	}
@@ -90,7 +90,7 @@ func TestBuildIPPrecheckDirectives_denyPrecedesExempt(t *testing.T) {
 		GeoIPMode:      "deny",
 		GeoIPCountries: json.RawMessage(`["海外"]`),
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{denyPolicy, allowPolicy, geoPolicy}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{denyPolicy, allowPolicy, geoPolicy}, 0, "lb_test"))
 	idxDeny := strings.Index(directives, `id:2,phase:1,deny`)
 	idxExempt := strings.Index(directives, `id:13,phase:1,pass`)
 	if idxDeny < 0 || idxExempt < 0 || idxDeny > idxExempt {
@@ -115,7 +115,7 @@ func TestEngineGate_allowExemptWithGeoChain(t *testing.T) {
 		GeoIPMode:      "deny",
 		GeoIPCountries: json.RawMessage(`["海外"]`),
 	}
-	compileForEngineGate(t, mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{allowPolicy, geoPolicy}, 0)))
+	compileForEngineGate(t, mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{allowPolicy, geoPolicy}, 0, "lb_test")))
 }
 
 // 历史 历史问题（历史问题）：deny 并集（id:2/4）须先于 allow 交集外拒绝（id:7）
@@ -139,7 +139,7 @@ func TestBuildIPPrecheckDirectives_denyPrecedesAllowDeny(t *testing.T) {
 		IPACLMode:    "allow",
 		IPACLList:    `["203.0.113.10"]`,
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{denyPolicy, allowPolicy}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{denyPolicy, allowPolicy}, 0, "lb_test"))
 	idxDeny := strings.Index(directives, `id:2,phase:1,deny`)
 	idxBlacklist := strings.Index(directives, `id:4,phase:1,deny`)
 	idxAllow := strings.Index(directives, `id:7,phase:1,deny`)
@@ -157,7 +157,7 @@ func TestBuildIPPrecheckDirectives_denyPrecedesAllowDeny(t *testing.T) {
 func TestEngineGate_precheckDirectivesWithLiftedStatus481(t *testing.T) {
 	deny := &models.SecurityPolicy{Enabled: true, IPACLMode: "deny", IPACLEnabled: true, IPACLList: `["192.0.2.0/24"]`}
 	policies := []*models.SecurityPolicy{deny}
-	directives, err := buildIPPrecheckDirectives(policies, 481)
+	directives, err := buildIPPrecheckDirectives(policies, 481, "lb_test")
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}

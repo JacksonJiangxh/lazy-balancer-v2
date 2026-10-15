@@ -145,8 +145,8 @@ func TestRefreshIPListProjectionsFromTx_hotPathZeroLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("热路径刷新: %v", err)
 	}
-	if !hot {
-		t.Fatal("名单-only 追加（发射面不变）应走热路径 hot=true")
+	if hot != ProjectionConverged {
+		t.Fatal("名单-only 追加（发射面不变）应走热路径 hot=ProjectionConverged")
 	}
 	// Then：零 /load（核心契约）+ 投影文件已按事务视图重写
 	if got := admin.loadCount(); got != 1 {
@@ -199,8 +199,8 @@ func TestRefreshIPListProjectionsFromTx_emptyToFirstEntryHotPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("热路径刷新: %v", err)
 	}
-	if !hot {
-		t.Fatal("空→首条（恒发射下为纯内容变化）应走热路径 hot=true")
+	if hot != ProjectionConverged {
+		t.Fatal("空→首条（恒发射下为纯内容变化）应走热路径 hot=ProjectionConverged")
 	}
 	if got := admin.loadCount(); got != 1 {
 		t.Fatalf("热路径后 /load 次数=%d, want 仍 1（零重载）", got)
@@ -242,8 +242,8 @@ func TestRefreshIPListProjectionsFromTx_clearToEmptyHotPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("刷新: %v", err)
 	}
-	if !hot {
-		t.Fatal("清空 N→0（恒发射下为纯内容变化）应走热路径 hot=true")
+	if hot != ProjectionConverged {
+		t.Fatal("清空 N→0（恒发射下为纯内容变化）应走热路径 hot=ProjectionConverged")
 	}
 	if got := admin.loadCount(); got != 1 {
 		t.Fatalf("热路径后 /load 次数=%d, want 仍 1（零重载）", got)
@@ -286,7 +286,7 @@ func TestRefreshIPListProjectionsFromTx_unreadableRunningConfigFallsBack(t *test
 	if err != nil {
 		t.Fatalf("运行配置不可读应回退而非报错: %v", err)
 	}
-	if hot {
-		t.Fatal("运行配置不可读时不得宣称热路径收敛, want hot=false")
+	if hot != ProjectionFallback {
+		t.Fatal("运行配置不可读时不得宣称热路径收敛, want ProjectionFallback")
 	}
 }

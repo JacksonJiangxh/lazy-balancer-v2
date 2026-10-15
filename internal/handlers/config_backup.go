@@ -157,6 +157,10 @@ var configBackupProtectedConfigKeys = map[string]bool{
 	// 历史问题 历史问题：本地节点运行态标记，非配置——导入旧备份会复活陈旧的
 	// 「应用失败」横幅（导入提交路径不经过 recordCaddyApplyResult 清空）。
 	"caddy_apply_error": true, "registration_confirm_failures": true,
+	// C5（历史集群/备份域）：自动备份节点本地运行态（下次槽追补基准），
+	// 非配置——还原旧备份会让基准回跳、立即多跑一次自动备份；导出剔除+
+	// 导入跳过（保护键双消费点同口径）。运行态字段参照 caddy_apply_error。
+	"auto_backup_last_run": true,
 	// CL14-新1(历史):恒同步列排除出备份——现行导出恒 1(UpdateSettings
 	// 拒绝禁用+启动迁移回填),排除无信息损失;防 v2.2.7 前存量备份携带 0 值
 	// 直写,致节点页「系统数据同步=关闭」假状态至重启(同步行为四个在线强制点

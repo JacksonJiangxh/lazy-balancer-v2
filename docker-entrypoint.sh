@@ -112,6 +112,9 @@ rm -f "$CADDY_STARTUP_REPLAY_DONE"
       # trigger 文件:lazy-balancer 侧监听后走与启动完全相同的 DB 渲染→校验→
       # 应用流程(权威修正——last_good 只是快速恢复桥,可能滞后于 DB)。
       # 首启豁免(V1):容器启动由 BootSync 权威载入,仅运行期崩溃自愈写触发。
+      # START-1(历史)例外:slow-start 后台环(admin 就绪逾 10 探针)无条件
+      # 补写本触发——该形态下 BootSync 载入已失败或将被迟到回放覆盖,见下方
+      # slow-start 块注释。
       if [ "$FIRST_START" -eq 0 ]; then
         echo restarted > /tmp/caddy-restarted
       fi
@@ -148,6 +151,28 @@ rm -f "$CADDY_STARTUP_REPLAY_DONE"
           kill -0 "$CADDY_PID" 2>/dev/null || exit 0
           if wget -q -O /dev/null -T 1 http://localhost:2019/config/ 2>/dev/null; then
             reapply_last_good
+            # START-1（历史）：slow-start 路径补写权威修正触发。本路径只在
+            # admin 就绪逾 10 探针（>10s）时进入：app 侧启动应用链
+            # （waitStartupReplayDone 30s 上限放行 + admin 就绪等待 + 应用）此刻
+            # 大概率已失败（admin 未就绪，应用POST refused/超时仅记日志，无重试）
+            # 或将被本处迟到的 last-good 回放覆盖——V1 首启豁免
+            # （reapply_last_good 内「首启不写 trigger」）假设的「BootSync 权威
+            # 载入必然落地」在 slow-start 形态下不成立。补写 /tmp/caddy-restarted
+            # 唤醒 app 侧 caddy-restart watcher（mtime 晚于进程启动=有效触发）
+            # 走与启动完全相同的 DB 渲染→校验→应用流程，无论边界竞态落在哪一侧
+            # 都强制重收敛；watcher 未启动时文件持久在场，启动后被拾取。快速路径
+            # （≤10 探针就绪）不受影响：豁免保持，无启动审计/任务日志双行。
+            # 运行期崩溃后 slow-start（FIRST_START=0）与 reapply_last_good 内的
+            # 触发写入重复，文件幂等、watcher 单次消费，无害。
+            # Ruling（方向取舍）：①提高 waitStartupReplayDone 超时——拿面板可用
+            # 性换窄竞态：慢磁盘/监督器僵死时 app 启动被扣押更久（面板是诊断
+            # 工具，不能失联），且超出新超时窗的就绪仍不收敛，否决；②就绪信号
+            # 前移（admin 就绪即写回放标记、先于 LKG 回放）——拆毁历史
+            # 「回放→标记→应用」构造性时序，重新引入 v2.3.7-beta 实锤的 LKG
+            # 覆盖硬币竞态，否决。本方向复用既有权威修正通道（触发文件+watcher），
+            # 快路径零影响、app 侧永不被扣押、自愈与启动同源（历史问题 裁定），
+            # 最鲁棒。
+            echo restarted > /tmp/caddy-restarted
             sup_log "Slow-start recovery: config re-applied after delayed admin readiness"
             exit 0
           fi

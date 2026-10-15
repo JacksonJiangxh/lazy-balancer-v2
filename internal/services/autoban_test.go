@@ -759,6 +759,72 @@ func TestAutobanCandidates_pruneStaleBuckets(t *testing.T) {
 	}
 }
 
+// ---- 解封清桶（历史 F2/AB-1 同族收敛） ----
+
+// Given 删除 IP 与对照 IP 均达阈值并入名单（真实计数路径）；随后删除 IP 经
+// handlers remove-ip/预置名单差集保存两路径共用的清桶入口解封，对照 IP 仅从
+// 名单移除（不清桶=旧实现形态）。
+// When 零新事件、越 2 个调度 tick（60s 周期，统计窗口 60min 未过期）后再评估。
+// Then 删除 IP 不再进候选、不重封；对照 IP 桶仍在 → 重新封禁（证明断言对
+// 「桶仍在」敏感——旧实现（无清桶）下删除 IP 与对照同形态，本钉测必红）。
+func TestAutobanForgetIPs_deleteThenNoNewEventsNoReban(t *testing.T) {
+	f := installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 3, 60, "permanent", "all", false)
+	cfg := AutobanConfig{Enabled: true, Threshold: 3, WindowMinutes: 60, Duration: "permanent", Scope: "all", DryRun: false}
+
+	// 封禁：两 IP 各 3 次真实计数达标 → 候选 → merge 落名单。
+	for range 3 {
+		autobanObserveEventScoped(cfg, "203.0.113.9", "blocked", "944100")
+		autobanObserveEventScoped(cfg, "198.51.100.7", "blocked", "944100")
+	}
+	cands := autobanCandidates(3, time.Hour)
+	if len(cands) != 2 {
+		t.Fatalf("given: 候选数=%d, want 2", len(cands))
+	}
+	if _, err := autobanMergeEntries(cfg, cands); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if _, ok := entryValues(presetEntries(t))["203.0.113.9"]; !ok {
+		t.Fatal("given: 删除 IP 未落名单")
+	}
+
+	// 删除：handlers remove-ip 端点与预置名单差集保存路径解封时共用的
+	// 计数清桶入口（两调用点接线由 handlers 侧扫描钉测锁定）。
+	AutobanForgetIPs([]string{"203.0.113.9"})
+	// 对照：仅移除名单条目、不清桶（=旧实现形态，留作必红对照）。
+	seedPresetEntries(t, []models.IPListEntry{})
+	if got := AutobanTrackedIPs(); got != 1 {
+		t.Fatalf("given: 清桶后计数键=%d, want 1（对照桶保留）", got)
+	}
+
+	// 零新事件，越 2 个调度 tick。
+	f.Advance(2 * time.Minute)
+
+	next := autobanCandidates(3, time.Hour)
+	seen := map[string]bool{}
+	for _, c := range next {
+		seen[c.IP] = true
+	}
+	if !seen["198.51.100.7"] {
+		t.Fatal("对照桶未清除时必须仍产出候选（断言敏感性前提）")
+	}
+	if seen["203.0.113.9"] {
+		t.Fatal("删除 IP 清桶后零新事件不得再进候选（旧行为：不清桶 → 此处命中 → 必红）")
+	}
+	out, err := autobanMergeEntries(cfg, next)
+	if err != nil {
+		t.Fatalf("re-merge: %v", err)
+	}
+	for _, ip := range out.Banned {
+		if ip == "203.0.113.9" {
+			t.Fatalf("删除 IP 不得在零新事件下重封，得到 banned=%v", out.Banned)
+		}
+	}
+	if _, ok := entryValues(presetEntries(t))["198.51.100.7"]; !ok {
+		t.Fatal("对照 IP（仅删名单未清桶）应在零新事件下被重封——旧实现形态钉")
+	}
+}
+
 // ---- Status 辅助 ----
 
 // 观察模式建议展示截断（2026-10-15 用户裁定）：/status 建议列表按 Count 降序

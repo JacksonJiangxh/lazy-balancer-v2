@@ -9,7 +9,7 @@
 |---|---|---|---|---|
 | **调度方式** | `NextSlotFn() → time.Time` 引擎每 tick 重读，槽到点执行 | `Run(ctx)` 引擎启动时调用一次，阻塞直到 ctx 取消 | `IntervalFn() → Duration` 每间隔执行一次 | 仅 `Trigger()`（手动/代码） |
 | **中间空窗** | **零活动**（零执行/零 task_runs/零日志） | Run 持续运行，引擎不干预 | 间隔等待 | 空闲 |
-| **task_runs** | 每次排程执行 1 行 | 每生命周期 1 行（boot 落行，终态随停止更新） | 每轮 1 行 | 每次触发 1 行 |
+| **task_runs** | 每次排程执行 1 行 | 每生命周期 1 行（boot 落行即记 success——启动是既成事实，2026-10-01 用户裁定；异常退出补记 failed） | 每轮 1 行 | 每次触发 1 行 |
 | **日志（tasks/{id}.log）** | [done]+业务行 | [start]+[done]+失败行+业务行 | 每轮 [done]+业务行 | [start]/[done]+业务行 |
 | **调度开关** | ✅ 停止/恢复调度 | ✅ 启停自管理循环 | ✅ 停止/恢复调度 | ❌ 显示禁用开关（页面一致性） |
 | **手动触发** | ✅ | ❌（启停即可） | ✅ | ✅（唯一执行方式） |
@@ -41,12 +41,13 @@ type Descriptor struct {
     Run        func(RunContext) error // Daemon: 阻塞直到 ctx.Done()
     CancelHook func() bool; EnabledFn func() bool
     StatusFn func() string
-    ManualRun, Cancelable bool
+    Cancelable bool
     RunsOn Role // 角色门唯一事实源（MasterOnly bool 双机制历史收敛删除——调度/手动触发守卫统一 roleAllows）
+    RestartOnRoleFlip bool // Run 体按角色分流时置位（2026-10-03 裁定，cluster-sync 引入）
 }
 ```
 
-已删除：`SilentProbes`/`RecordFailuresOnly`/`SignalledWork`/`AsKind`/`Cadence`/`Singleton`——Kind 单独决定全部行为；`ToggleFn`/`ToggleName`（LNK71-3，2026-10-11）——v2.0 调度开关统一（StartLoop/StopLoop）后声明族零消费退役，TaskMeta/TaskInfo 的 `toggleable`/`toggle_name` 序列化字段一并删除。
+已删除：`SilentProbes`/`RecordFailuresOnly`/`SignalledWork`/`AsKind`/`Cadence`/`Singleton`——Kind 单独决定全部行为；`ToggleFn`/`ToggleName`（LNK71-3，2026-10-11）——v2.0 调度开关统一（StartLoop/StopLoop）后声明族零消费退役，TaskMeta/TaskInfo 的 `toggleable`/`toggle_name` 序列化字段一并删除；`ManualRun`（历史勘误）——手动触发能力由 Kind 派生（DescribeAll `CanTrigger`），声明字段无消费。
 
 ## 2. 任务清单（17 注册任务）
 
@@ -67,7 +68,7 @@ type Descriptor struct {
 |---|---|---|
 | security-events-ingestion | `runIngestionLoop(ctx)`（内部 2s ticker） | 尾读 coraza 审计日志 |
 | cert-issuance | daemonLifecycleRun（真实 StartACME/StopACME 挂钩——B 完全标准化） | CAQueueManager+证书 worker（引擎 daemon 即生命周期所有者）——**RunsOn=MasterOnly** |
-| cluster-sync | daemonLifecycleRun（真实 SyncService.Start/Stop 挂钩） | SyncService 轮询（引擎 daemon 即生命周期所有者）——**RunsOn=SlaveOnly**（同步=从节点职能；角色翻转真实启停；Halted/Resume 内部状态机保留） |
+| cluster-sync | Run 体按角色分流：从节点=daemonLifecycleRun（真实 SyncService.Start/Stop 挂钩，Halted/Resume 内部状态机保留）；主节点=masterSyncServingLifecycleRun（服务面巡检：节点在线/版本滞后） | **RunsOn=RoleAny + RestartOnRoleFlip**（2026-10-03 裁定：两角色同启停语义，角色翻转换代重启使 Run 分支与角色同步切换；原「RunsOn=SlaveOnly」口径已随主节点巡检引入过期） |
 
 系统启动即运行（默认 StartLoop）；关闭调度=启动也不运行；允许手动停止和启用。
 

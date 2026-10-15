@@ -619,6 +619,27 @@ WHERE COALESCE(ip_acl_enabled,0)=1 AND COALESCE(ip_acl_mode,'')='allow'
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "IP 地址列表不存在"})
 		return
 	}
+	// 历史 F2/AB-1 同族收敛：预置名单差集全量保存中被移除的条目即解封
+	//（删除语义=解封起点，手动/自动条目同口径）——old−new 差集逐 IP 清零
+	// 计数桶（services.AutobanForgetIPs 单一入口，与 remove-ip 端点同族），
+	// 否则窗口内旧计数让 autoban 下一轮零新流量重封、解封被 ≤1 tick 撤销。
+	// 清桶先于提交无回滚副作用（同 remove-ip 路径注释）。
+	if autobanPreset && req.Entries != nil {
+		var oldEntries []models.IPListEntry
+		if err := json.Unmarshal([]byte(oldEntriesJSON), &oldEntries); err == nil {
+			newValues := make(map[string]struct{}, len(entries))
+			for _, e := range entries {
+				newValues[e.Value] = struct{}{}
+			}
+			removed := make([]string, 0, len(oldEntries))
+			for _, e := range oldEntries {
+				if _, kept := newValues[e.Value]; !kept {
+					removed = append(removed, e.Value)
+				}
+			}
+			services.AutobanForgetIPs(removed)
+		}
+	}
 	if h.tryIPListHotPathApply(c, tx, id, oldEntriesJSON != entriesJSON, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "更新",
 		AuditDetail: fmt.Sprintf("名称：%s（#%s，%d 条）", name, id, len(entries)),
@@ -927,6 +948,14 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
+	// 历史 F2/AB-1（用户裁定「删除即解封」语义闭环）：预置名单移除条目
+	// 即解封——同步清零该 IP 计数桶（经 services.AutobanForgetIPs 单一入口，
+	// 与差集保存路径同族收敛）。不清桶则窗口内旧计数让 autoban 下一轮在零
+	// 新流量下立即重封，解封被 ≤1 tick 撤销。清桶先于提交无回滚副作用：事务
+	// 失败回滚时条目仍在名单，merge 的已在名单过滤使空桶无行为影响。
+	if listName == services.AutobanPresetListName {
+		services.AutobanForgetIPs([]string{req.Value})
+	}
 	if h.tryIPListHotPathApply(c, tx, id, true, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "写入",
 		AuditDetail: fmt.Sprintf("名称：%s（#%s）移除 IP %s（现共 %d 条）", listName, id, req.Value, len(kept)),
@@ -944,16 +973,22 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 }
 
 // tryIPListHotPathApply 名单-only 变更的投影热路径（2026-10-15 用户裁定）。
-// 资格 = 条目实际变化 ∧ 被启用策略引用（受信代理引用面 2026-10-15 同步热
-// 路径化：合并网段投影 tp.txt 经 http.ip_sources.lb_file ≤1s stat 热感知，
-// 原静态展开「须 /load 收敛」的资格排除分支整体退役）。
-// 资格内以事务视图渲染重写投影文件（原子 tmp+rename）并与运行配置结构级
-// 比对：证实零发射面变化 → 提交+业务审计+热路径说明（零 /load，@ipListFast
-// 匹配器 ≤1s stat 热感知；不落「重载」审计——审计真实性）；未证实（发射面
-// 变化）/不可判定（运行配置不可读）/生成被拒 → 返回 false 落回 finishTxApply
-// 全量链（拒绝同口径 400+回滚）。已持 caddyOpMu（=CaddyOpLock，调用方写
-// 路径临界区），渲染与 /load 永不交错。返回 true = 请求已终结（调用方立即
-// return）。
+// 资格 = 条目实际变化 ∧ 被启用策略引用 ∧ 被受信代理/CRS 排除引用面覆盖
+// （引用面判定单源 IPListsReferencedByEnabledPolicy，历史 SEC-2 补全
+// trusted_proxy_range_refs 与 crs_excluded_rules scope=ip/list 的 ListRefs；
+// tp.txt 经 http.ip_sources.lb_file ≤1s stat 热感知）。
+// 资格内以事务视图渲染重写投影文件（原子 tmp+rename）并按三态收敛
+// （IPListProjectionOutcome，历史 CERT-1）：
+//   - Converged：提交+业务审计+热路径说明（零 /load，@ipListFast 匹配器
+//     ≤1s stat 热感知；不落「重载」审计——审计真实性）；
+//   - NeedForce：本轮渲染物化了证书文件而 JSON 字节一致——强制重载收敛
+//     （ApplyConfigFromTxCertAwareForce，击穿 errSameConfig），收尾镜像
+//     finishTxApply 三分支，落「重载」审计（确有真实重载）；
+//   - Fallback / 渲染被拒 / 运行配置不可读：返回 false 落回 finishTxApply
+//     全量链（拒绝同口径 400+回滚）。
+//
+// 已持 caddyOpMu（=CaddyOpLock，调用方写路径临界区），渲染与 /load 永不交错。
+// 返回 true = 请求已终结（调用方立即 return）。
 func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, entriesChanged bool, f txApplyFinish) bool {
 	if !entriesChanged {
 		return false // 元数据-only 变更零发射面影响，维持既有全量链（同字节短路）
@@ -966,8 +1001,62 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 		return false
 	}
 	hot, err := h.caddyService.RefreshIPListProjectionsFromTxInLock(tx)
-	if err != nil || !hot {
+	if err != nil {
 		return false
+	}
+	if hot == services.ProjectionFallback {
+		// 发射面变化/运行配置不可读 → 回退既有全量链（非强制形态足够：字节
+		// 不一致时真实 /load 必然发生，errSameConfig 不可能短路）。
+		return false
+	}
+	if hot == services.ProjectionNeedForce {
+		// CERT-1（历史）：本轮渲染经 MaterializeCertPairs 物化了证书文件
+		// 而配置 JSON 字节一致——零 /load 收尾会把新证书留在磁盘、旧证书留在
+		// Caddy 内存（历史问题 W1-1 失守）。走强制重载收敛：ApplyConfigFromTxCertAwareForce
+		// 以同一事务视图渲染+强制 /load（Cache-Control: must-revalidate 击穿
+		// errSameConfig），收尾分支镜像 finishTxApply 三分支（拒绝回滚/系统
+		// 失败退化提交/成功提交），重载审计照常落「重载」行（审计真实性：
+		// 本次确有真实重载）。
+		applyErr := h.caddyService.ApplyConfigFromTxCertAwareForce(tx)
+		if applyErr != nil {
+			if services.IsConfigRejected(applyErr) {
+				recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("Caddy 校验未通过", applyErr.Error(), services.AuditResultPart("failure")))
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 配置校验未通过，" + f.Resource + "未保存: " + applyErr.Error()})
+				return true
+			}
+			// 传输/系统失败 → 家族 2 退化语义：提交 + 业务审计 + 重载失败审计
+			// + caddy_apply_error 标记 + 200 带告警（与 finishTxApply 同口径）。
+			if err := tx.Commit(); err != nil {
+				recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", err.Error(), services.AuditResultPart("failure")))
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + err.Error()})
+				return true
+			}
+			h.recordCaddyApplyResult(applyErr)
+			recordAudit(c, f.AuditAction, f.Resource, f.AuditDetail)
+			recordAudit(c, "重载失败", "Caddy服务", applyErr.Error())
+			services.Logf("warn", "IP 名单热路径：%s（#%s）投影已重写，证书物化触发的强制重载失败: %v", f.Resource, id, applyErr)
+			status := f.SuccessStatus
+			if status == 0 {
+				status = http.StatusOK
+			}
+			c.JSON(status, models.APIResponse{Code: 0, Message: f.SuccessMsg + "；但 Caddy 配置应用失败：" + applyErr.Error(), Data: f.Data})
+			return true
+		}
+		if err := tx.Commit(); err != nil {
+			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", err.Error(), services.AuditResultPart("failure")))
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + err.Error()})
+			return true
+		}
+		h.recordCaddyApplyResult(nil)
+		recordAudit(c, f.AuditAction, f.Resource, f.AuditDetail)
+		recordAudit(c, "重载", "Caddy服务", services.FormatAuditDetail("IP 名单热路径证书物化，强制重载收敛", services.AuditResultPart("success")))
+		services.Logf("info", "IP 名单热路径：%s（#%s）投影文件已重写；本轮渲染物化了证书文件，已强制重载收敛", f.Resource, id)
+		status := f.SuccessStatus
+		if status == 0 {
+			status = http.StatusOK
+		}
+		c.JSON(status, models.APIResponse{Code: 0, Message: f.SuccessMsg, Data: f.Data})
+		return true
 	}
 	// 热路径收尾：镜像 finishTxApply 成功分支，但零 /load（无重载审计）。
 	if err := tx.Commit(); err != nil {

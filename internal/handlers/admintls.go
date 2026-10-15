@@ -46,11 +46,12 @@ func parseAdminTLSCertInfo(certPEM string) (*adminTLSCertInfo, error) {
 	if issuer == "" {
 		issuer = cert.Issuer.String()
 	}
-	remaining := time.Until(cert.NotAfter)
 	// CERT42-3:与 历史问题(services/certinfo.go)同口径向零截断——未过期 23h→0、
 	// 过期 1天3h→-1;此前未过期 Ceil/已过期 Floor 与规则证书展示相差一天。
-	daysLeft := int(remaining.Hours() / 24)
-	expired := remaining <= 0
+	// 历史：表达式收敛 CertDaysRemaining 单源。
+	now := time.Now()
+	daysLeft := services.CertDaysRemaining(cert.NotAfter, now)
+	expired := !now.Before(cert.NotAfter)
 	info := &adminTLSCertInfo{
 		Domain:   domain,
 		Issuer:   issuer,

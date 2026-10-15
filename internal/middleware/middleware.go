@@ -840,12 +840,10 @@ func jwtAuth(cfg *config.Config) gin.HandlerFunc {
 
 func apiKeyAuth(cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Skip if already authenticated via JWT
-		if userID, exists := c.Get("user_id"); exists && userID != nil {
-			c.Next()
-			return
-		}
-
+		// 历史 APISYS-F2：原「JWT 已认证则跳过」首行分支删除——生产链
+		// 不可达（挂载次序固定：v1.Use(apiKeyAuth) 先于 v1.Use(jwtAuth)，/mcp
+		// 路由仅 apiKeyAuth；全链无更早 user_id 写者），user_id 在本中间件
+		// 之前恒不存在。删除后不改变任何可达请求的判定路径。
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey == "" {
 			authHeader := c.GetHeader("Authorization")

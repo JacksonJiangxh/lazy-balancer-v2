@@ -150,13 +150,20 @@ func crsPoolFingerprint() string {
 // 策略归因的合成中断码（481+，securityPolicyContext.policySynthetic 按策略
 // 身份分配）；>0 时段内全部 deny 显式抬码（IP ACL/GeoIP/自定义规则/CRS
 // 949110），0 时逐字节保持现状（403 或缺省，单策略/无页路径回归形状）。
-// stage0DetectionTrust（第 6 参，可选变参）：发射面 flag 与内容二合一——变参
+// stage0DetectionTrust（第 7 参，可选变参）：发射面 flag 与内容二合一——变参
 // 出现即「存在 stage0 信任名单保留检测策略（trust_detection=1）」（恒发射
 // id:12；并集可空=空文件算子永不命中，与无规则等价，空↔非空纯内容变化走
 // 热路径，2026-10-15 始终发射收敛）；缺省=无此类策略（不发射）。并集元素为
 // 按规则绑定的信任地址（直通形态 trust_detection=0 由路由层 subroute 短路，
 // 不进本参数）。
-func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crsFingerprint string, multiPolicy bool, blockStatus int, stage0DetectionTrust ...[]string) (string, error) {
+// ruleCaddyID（第 6 参，历史 HP-1）：id:12 的 u-trust12 投影 scope 编入
+// 规则身份（u-trust12-<ruleCaddyID>）——stage0DetectionTrust 是逐规则并集
+// （policiesForRule），全局单文件名下异策略集多规则后渲染覆盖前者=信任集
+// 串染。空值显性报错（fail-loud）。
+func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crsFingerprint string, multiPolicy bool, blockStatus int, ruleCaddyID string, stage0DetectionTrust ...[]string) (string, error) {
+	if ruleCaddyID == "" {
+		return "", fmt.Errorf("u-trust12 引擎投影缺少规则身份（ruleCaddyID 为空）——id:12 逐规则渲染，scope 必须编入规则身份（历史 HP-1）")
+	}
 	var sb strings.Builder
 	// 历史问题 三十次 F1：嵌 coraza 池键指纹（见 crsPoolFingerprint）——CRS 文件
 	// 替换/手动改 overrides 后池键必须变化，否则新 Caddy 配置复用旧 WAF
@@ -264,8 +271,8 @@ func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crs
 	}
 	// SecAuditLogType lbfile：审计写插件（caddygeoip auditwriter.go，xcaddy
 	// 链入）——异步有界队列+bufio 批量落盘，刷盘前把进程内计时注册表的分段
-	// 耗时注入审计行顶层 lb_timing 字段（历史： 侧车
-	// 退役，摄取管道改读行内嵌字段）。零丢弃：队列满时阻塞等消化（退化价=
+	// 耗时注入审计行顶层 lb_timing 字段（历史：侧车退役，摄取管道改读
+	// 行内嵌字段）。零丢弃：队列满时阻塞等消化（退化价=
 	// serial 同步写）。coraza NewWAF 时 Init 打开文件（目录缺失=配置拒绝，
 	// 历史问题-1 语义不变）；轮转=copytruncate，长生命周期 fd 恒有效。
 	sb.WriteString(fmt.Sprintf("SecAuditEngine RelevantOnly\nSecAuditLog %s\nSecAuditLogType lbfile\nSecAuditLogFormat JSON\nSecAuditLogParts %s\n", auditLogPath, auditParts))
@@ -329,7 +336,7 @@ func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crs
 	// 记录不拦（事件动作=检测）。直通形态（trust_detection=0）由路由层
 	// subroute 短路,不经任何引擎。
 	if len(stage0DetectionTrust) > 0 {
-		operand, err := ipListRuleOperand("u-trust12", stage0DetectionTrust[0], false)
+		operand, err := ipListRuleOperand(precheckProjectionScope("trust12", ruleCaddyID), stage0DetectionTrust[0], false)
 		if err != nil {
 			return "", err
 		}
@@ -471,7 +478,9 @@ func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crs
 		}
 		// 运行时 ctl 规则：Include 之前（先于被禁规则插入 phase:1 序列）
 		if len(scoped) > 0 {
-			emitScopedCRSExclusions(&sb, p, scoped, store, chainIndex)
+			if err := emitScopedCRSExclusions(&sb, p, scoped, store, chainIndex); err != nil {
+				return "", err
+			}
 		}
 		emitBodyProcessorRules(&sb)
 		sb.WriteString("Include /app/waf/crs/crs-setup.conf\n")
@@ -946,9 +955,9 @@ func buildWafHandlerWithPolicy(ruleCaddyID string, policy *models.SecurityPolicy
 	var directives string
 	var err error
 	if stage0DetectionTrust == nil {
-		directives, err = BuildCorazaDirectives(policy, store, crsFp, multiPolicy, blockStatus)
+		directives, err = BuildCorazaDirectives(policy, store, crsFp, multiPolicy, blockStatus, ruleCaddyID)
 	} else {
-		directives, err = BuildCorazaDirectives(policy, store, crsFp, multiPolicy, blockStatus, stage0DetectionTrust)
+		directives, err = BuildCorazaDirectives(policy, store, crsFp, multiPolicy, blockStatus, ruleCaddyID, stage0DetectionTrust)
 	}
 	if err != nil {
 		return nil, err
@@ -1138,6 +1147,16 @@ func cidrIntersectParsed(pa, b *parsedEntry) string {
 	return ""
 }
 
+// precheckProjectionScope 把规则身份编入预检/引擎层 u-* 投影 scope（历史
+// HP-1）：scope 形态 u-<kind>-<ruleCaddyID>（如 u-deny-lb_2r8dosptk1）——投影
+// 实例身份=调用方规则，异策略集多规则各得独立文件（互不覆盖）。kind 取
+// deny/trust/trust12/bl/allow/allow-exempt。空 ruleCaddyID 由两个渲染入口
+// （buildIPPrecheckDirectives/BuildCorazaDirectives）统一显性报错（fail-loud
+// ——静默退回全局名会原样重建覆盖冲突），本 helper 纯拼接。
+func precheckProjectionScope(kind, ruleCaddyID string) string {
+	return "u-" + kind + "-" + ruleCaddyID
+}
+
 // buildIPPrecheckDirectives 合并全部绑定启用策略的 deny 侧 IP 控制（deny 模式
 // ACL 并集 id:2、allow 模式 ACL 交集外拒绝 id:7、遗留黑名单并集 id:4）与逐策略
 // GeoIP 链（800000+policyID）为一个极简 coraza 配置（阶段 1）。预检查器置于
@@ -1154,7 +1173,16 @@ func cidrIntersectParsed(pa, b *parsedEntry) string {
 // 策略的 403 兜底错误路由（buildBlockPageErrorRoute）；规则配了阶段 1 拦截页
 // 时调用方传 denyStatus=481，全部 deny 抬码落 481 阶段路由（阶段化模型）。
 // 无 deny 侧控制且无 GeoIP 策略时返回空串（不发射）。
-func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int) (string, error) {
+//
+// ruleCaddyID（历史 HP-1）：本函数逐规则渲染（policiesForRule——每条规则
+// 的绑定策略集不同，u-* 并集内容是调用方规则的函数），u-* 投影 scope 必须编入
+// 规则身份（u-deny-<ruleCaddyID> 等）；全局单文件名下异策略集多规则的后渲染
+// 会覆盖前者=漏拦+误拦（热路径稳定命名粒度教训的预检形态）。空值显性报错
+// （fail-loud，禁止静默退回全局名重建冲突）。
+func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int, ruleCaddyID string) (string, error) {
+	if ruleCaddyID == "" {
+		return "", fmt.Errorf("u-* 预检投影缺少规则身份（ruleCaddyID 为空）——预检逐规则渲染，scope 必须编入规则身份（历史 HP-1）")
+	}
 	var denyUnion, blacklistUnion []string
 	var allowLists [][]string
 	// 始终发射收敛（2026-10-15 用户裁定）：deny ACL 开启即计入发射面（并集可
@@ -1207,7 +1235,8 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 	sb.WriteString("SecResponseBodyAccess Off\n")
 	// 与 BuildCorazaDirectives 同款审计配置：IP 拒绝事件经 audit log 进入
 	// 安全事件管线（ RelevantOnly + deny 中断 = relevant）；写插件同 lbfile
-	// （历史侧车退役，耗时注入审计行——见 :257 注释）。
+	// （历史侧车退役，耗时注入审计行——见 BuildCorazaDirectives 的 lbfile
+	// 注释）。
 	sb.WriteString(fmt.Sprintf("SecAuditEngine RelevantOnly\nSecAuditLog %s\nSecAuditLogType lbfile\nSecAuditLogFormat JSON\nSecAuditLogParts ABIJDEFHKZ\n", auditLogPath))
 	// 2026-09-15 用户裁定:信任最高优先(任何规则不拦)+检测事件全记录——
 	// 预检层信任改 ctl:ruleEngine=DetectionOnly 先行(取代 S1 的「并入 allow
@@ -1231,7 +1260,7 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 	// 值=1 非刻意 opt-in，flag 门控会使全部默认站点凭空获得预检 id:3——门禁
 	// 钉测实证；空↔非空仍走全量链）。
 	if len(trustUnion) > 0 {
-		operand, err := ipListRuleOperand("u-trust", trustUnion, false)
+		operand, err := ipListRuleOperand(precheckProjectionScope("trust", ruleCaddyID), trustUnion, false)
 		if err != nil {
 			return "", err
 		}
@@ -1241,7 +1270,7 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 	// 与策略引擎的 id:12 同集（各自 coraza 事务独立生效）。发射面 flag 与内容
 	// 解耦（始终发射收敛，2026-10-15）：空并集投影空文件恒发射。
 	if hasStage0Detection {
-		operand, err := ipListRuleOperand("u-trust12", detectionTrust, false)
+		operand, err := ipListRuleOperand(precheckProjectionScope("trust12", ruleCaddyID), detectionTrust, false)
 		if err != nil {
 			return "", err
 		}
@@ -1254,14 +1283,14 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 		denyStatus = 403
 	}
 	if hasDenyACL {
-		operand, err := ipListRuleOperand("u-deny", denyUnion, false)
+		operand, err := ipListRuleOperand(precheckProjectionScope("deny", ruleCaddyID), denyUnion, false)
 		if err != nil {
 			return "", err
 		}
 		sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:2,phase:1,deny,status:%d,log,msg:'IP 黑名单拒绝',skipAfter:SECURITY_RULES_END\"\n", operand, denyStatus))
 	}
 	if len(blacklistUnion) > 0 {
-		operand, err := ipListRuleOperand("u-bl", blacklistUnion, false)
+		operand, err := ipListRuleOperand(precheckProjectionScope("bl", ruleCaddyID), blacklistUnion, false)
 		if err != nil {
 			return "", err
 		}
@@ -1279,7 +1308,7 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 		if len(allowIntersection) == 0 {
 			sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"@rx .*\" \"id:%d,phase:1,deny,status:%d,log,msg:'IP 白名单拒绝',skipAfter:SECURITY_RULES_END\"\n", ipPrecheckAllowRuleID, denyStatus))
 		} else {
-			operand, err := ipListRuleOperand("u-allow", allowIntersection, true)
+			operand, err := ipListRuleOperand(precheckProjectionScope("allow", ruleCaddyID), allowIntersection, true)
 			if err != nil {
 				return "", err
 			}
@@ -1291,7 +1320,7 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 	// 拦截（其 skipAfter 先行短路，豁免规则不参与评估）；置于 GeoIP 链之前——
 	// 白名单成员不再被区域拦截。交集为空（恒拒形态）时无成员可豁免，不发射。
 	if len(allowIntersection) > 0 {
-		operand, err := ipListRuleOperand("u-allow-exempt", allowIntersection, false)
+		operand, err := ipListRuleOperand(precheckProjectionScope("allow-exempt", ruleCaddyID), allowIntersection, false)
 		if err != nil {
 			return "", err
 		}
@@ -1361,8 +1390,8 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 }
 
 // buildIPPrecheckHandler returns the consolidated stage-1 precheck coraza handler
-func buildIPPrecheckHandler(policies []*models.SecurityPolicy, denyStatus int) (map[string]interface{}, error) {
-	directives, err := buildIPPrecheckDirectives(policies, denyStatus)
+func buildIPPrecheckHandler(policies []*models.SecurityPolicy, denyStatus int, ruleCaddyID string) (map[string]interface{}, error) {
+	directives, err := buildIPPrecheckDirectives(policies, denyStatus, ruleCaddyID)
 	if err != nil {
 		return nil, err
 	}
@@ -1659,13 +1688,22 @@ const crsScopedExclusionIDBase = 2000000
 // emitScopedCRSExclusions 发射作用域限定（scope=ip/list）的排除条目：每条先解析
 // 匹配集（ips 逗号条目 ∪ 全部 listRefs 的列表条目，跨条目去重保序；ListRefs 跨
 // 条目汇总后单批 LoadIPListEntriesByID），合并为空 → 跳过+warn（列表被清空/
-// 引用悬空时不发射空 ipMatch）；target 经 expandCRSScopedExclusionTargets 展开
+// 引用悬空时不发射空匹配）；target 经 expandCRSScopedExclusionTargets 展开
 // 为逐 ID（ctl:ruleRemoveById 不支持区间），每 ID 一条 phase:1 运行时 ctl 规则。
 // emitScopedCRSExclusions 发射作用域限定 ctl 规则。store 非-nil 时经其解析列表引用
 // （v2 导入事务视图——A-I1 不变式，审计 历史问题）；nil 回退 db.DB（测试/直调路径）。
 // chainIndex 为链级惰性索引取值闭包（M4）——单次 BuildCorazaDirectives 内与其他
 // 消费点共享一次缓存键计算。
-func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entries []CRSExcludedEntry, store caddyConfigStore, chainIndex func() *CRSRuleIndex) {
+//
+// 历史 SEC-1：匹配集不再内联 @ipMatch 展开——引用名单是大名单时单行撞
+// 48KiB 护栏（assertDirectiveLines 拒绝=整份配置无法保存），且与「策略名单
+// 统一投影 @ipListFast」的架构总述矛盾。改投影 @ipListFast（同族单源
+// writeIPListFile/ipListRuleOperand：稳定命名、原子写、同字节跳写、写失败沿
+// 渲染链路上报）。投影 scope 按匹配集**组合身份**编入（p<policyID>-crsxc-<n>，
+// n=组合首次出现序，键=ips+排序后 listRefs）：名单条目内容变化不改变组合键
+// →文件名稳定（@ipListFast ≤1s stat 热感知）；条目增删/重排才换名，旧文件由
+// 24h GC 回收。同组合多条目共享一份投影（配置字节恒定）。
+func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entries []CRSExcludedEntry, store caddyConfigStore, chainIndex func() *CRSRuleIndex) error {
 	var refIDs []int64
 	seenRef := make(map[int64]struct{})
 	for _, entry := range entries {
@@ -1684,6 +1722,8 @@ func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entr
 	}
 	index := chainIndex() // 复审：M4 惰性化漏改，改用链级一次取值
 	seq := 0
+	xcScopeSeq := 0
+	operandByMatchKey := make(map[string]string)
 	for _, entry := range entries {
 		match := make([]string, 0, 4)
 		seenIP := make(map[string]struct{})
@@ -1710,12 +1750,28 @@ func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entr
 			Logf("warn", "跳过作用域排除条目 %q（策略 %q）：ips/引用列表合并后为空", entry.Target, p.Name)
 			continue
 		}
+		// 组合键与解析内容无关（名单条目变化不换名）——ips 字面 + 排序后
+		// listRefs；同组合条目共享一份投影文件。
+		sortedRefs := append([]int64(nil), entry.ListRefs...)
+		sort.Slice(sortedRefs, func(i, j int) bool { return sortedRefs[i] < sortedRefs[j] })
+		matchKey := entry.IPs + "\x00" + fmt.Sprint(sortedRefs)
+		operand, ok := operandByMatchKey[matchKey]
+		if !ok {
+			var err error
+			operand, err = ipListRuleOperand(fmt.Sprintf("p%d-crsxc-%d", p.ID, xcScopeSeq), match, false)
+			if err != nil {
+				return err
+			}
+			xcScopeSeq++
+			operandByMatchKey[matchKey] = operand
+		}
 		for _, id := range expandCRSScopedExclusionTargets(entry.Target, index, p) {
 			seq++
-			sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"@ipMatch %s\" \"id:%d,phase:1,pass,nolog,ctl:ruleRemoveById=%s\"\n",
-				strings.Join(match, ","), crsScopedExclusionIDBase+seq, id))
+			sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:%d,phase:1,pass,nolog,ctl:ruleRemoveById=%s\"\n",
+				operand, crsScopedExclusionIDBase+seq, id))
 		}
 	}
+	return nil
 }
 
 // expandCRSScopedExclusionTargets 把作用域限定条目的 target 展开为逐规则 ID：

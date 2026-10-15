@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,8 +41,12 @@ const (
 
 // RunContext 交给任务体的执行上下文。
 type RunContext struct {
-	Ctx      context.Context
-	Trigger  string // manual | auto | startup
+	Ctx context.Context
+	// Trigger 触发值（开放字符串，调用方声明；task_runs.trigger 列原样落库）：
+	// 引擎内建 manual（Trigger/RunSync 手动）、auto（Periodic tick/Daemon）、
+	// startup（BootSync）；调用方自声明形态有 caddy-restart（Caddy 崩溃自愈
+	// watcher）、schedule（auto-backup 执行器）。前端按值映射展示标签。
+	Trigger  string
 	Operator string // 手动操作者（审计归人）
 	RunID    int64  // 引擎预插行 ID
 }
@@ -892,7 +897,19 @@ func TaskLogPath(taskID string) string {
 	if taskLogDir == "" {
 		return ""
 	}
-	return filepath.Join(taskLogDir, taskID+".log")
+	// APISYS-F3（历史）：任务 ID 路径净化——剔除路径分隔符 '/'、'\\'（保留
+	// 合法注册 ID 全字母表 [A-Za-z0-9_.:-]，startup:config-load 等既有 ID 零
+	// 变化）：目录穿越需经分隔符，剔除后 :id 用户可控面（GetSystemTaskLogs）
+	// 不可能逃出任务日志目录（可达性已核实仅管理+主节点只读，属纵深统一，
+	// 与 certjoblog sanitizePathComponent/logstats sanitizeRuleID 同族口径）。
+	sanitized := strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\':
+			return -1
+		}
+		return r
+	}, taskID)
+	return filepath.Join(taskLogDir, sanitized+".log")
 }
 
 // appendTaskLogLine 打开→追加→关闭共享实现（TASK-L10，历史：taskLogAppend

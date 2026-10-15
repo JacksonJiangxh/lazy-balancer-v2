@@ -1,8 +1,9 @@
 package services
 
 // 自动封禁收敛热路径钉测（2026-10-15，历史第三批）：名单内容变化（merge
-// 新封/清到期/容量挤出）后的生效路径——资格门（被启用策略引用 ∧ 非受信代理
-// 网段引用，与手动名单写路径同一查询核心）命中 → 投影热路径（零 /load，
+// 新封/清到期/容量挤出）后的生效路径——资格门（被启用策略引用，含受信代理
+// 网段引用面同日热路径化——原「∧ 非受信代理网段引用」排除合取项已退役，
+// 与手动名单写路径同一查询核心）命中 → 投影热路径（零 /load，
 // @ipListFast 匹配器 ≤1s stat 热感知）；资格未命中/不可判定/刷新器未注册/
 // 未证实收敛（发射面变化/运行配置不可读/渲染被拒）→ 回退既有全量重载
 // （节流+暂存+失败再武装语义原样）。节流 Ruling：热路径免节流（文件重写+
@@ -26,12 +27,12 @@ type autobanConvergeSpy struct {
 	reloads   int
 }
 
-func installAutobanConvergeSpy(t *testing.T, hot func() (bool, error)) *autobanConvergeSpy {
+func installAutobanConvergeSpy(t *testing.T, hot func() (IPListProjectionOutcome, error)) *autobanConvergeSpy {
 	t.Helper()
 	spy := &autobanConvergeSpy{}
 	oldRef, oldRel := autobanProjectionRefresher, autobanReloader
 	if hot != nil {
-		autobanProjectionRefresher = func() (bool, error) { spy.refreshes++; return hot() }
+		autobanProjectionRefresher = func() (IPListProjectionOutcome, error) { spy.refreshes++; return hot() }
 	}
 	autobanReloader = func() error { spy.reloads++; return nil }
 	t.Cleanup(func() { autobanProjectionRefresher, autobanReloader = oldRef, oldRel })
@@ -60,7 +61,7 @@ func TestAutobanConverge_gateHitHotPathZeroReload(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 2, 5, "1h", "all", false)
 	seedAutobanListReferencedByPolicy(t)
-	spy := installAutobanConvergeSpy(t, func() (bool, error) { return true, nil })
+	spy := installAutobanConvergeSpy(t, func() (IPListProjectionOutcome, error) { return ProjectionConverged, nil })
 
 	autobanObserveEvent("203.0.113.1", "blocked", "942100")
 	autobanObserveEvent("203.0.113.1", "blocked", "942100")
@@ -87,7 +88,7 @@ func TestAutobanConverge_gateHitHotPathZeroReload(t *testing.T) {
 func TestAutobanConverge_gateMissFallsBackToFullReload(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 2, 5, "1h", "all", false)
-	spy := installAutobanConvergeSpy(t, func() (bool, error) { return true, nil })
+	spy := installAutobanConvergeSpy(t, func() (IPListProjectionOutcome, error) { return ProjectionConverged, nil })
 
 	autobanObserveEvent("203.0.113.1", "blocked", "942100")
 	autobanObserveEvent("203.0.113.1", "blocked", "942100")
@@ -128,7 +129,7 @@ func TestAutobanConverge_hotNotConfirmedFallsBack(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
 	seedAutobanListReferencedByPolicy(t)
-	spy := installAutobanConvergeSpy(t, func() (bool, error) { return false, nil })
+	spy := installAutobanConvergeSpy(t, func() (IPListProjectionOutcome, error) { return ProjectionFallback, nil })
 
 	autobanObserveEvent("203.0.113.1", "blocked", "942100")
 	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
@@ -151,7 +152,7 @@ func TestAutobanConverge_trustedProxyRefHotPath(t *testing.T) {
 		"["+strconv.FormatInt(listID, 10)+"]"); err != nil {
 		t.Fatalf("seed trusted proxy refs: %v", err)
 	}
-	spy := installAutobanConvergeSpy(t, func() (bool, error) { return true, nil })
+	spy := installAutobanConvergeSpy(t, func() (IPListProjectionOutcome, error) { return ProjectionConverged, nil })
 
 	autobanObserveEvent("203.0.113.1", "blocked", "942100")
 	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
@@ -169,7 +170,7 @@ func TestAutobanConverge_hotPathFreeOfThrottle(t *testing.T) {
 	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
 	listID := presetListID(t)
 	seedHotPathPolicy(t, listID)
-	spy := installAutobanConvergeSpy(t, func() (bool, error) { return true, nil })
+	spy := installAutobanConvergeSpy(t, func() (IPListProjectionOutcome, error) { return ProjectionConverged, nil })
 
 	CaddyOpLock.Lock()
 	defer CaddyOpLock.Unlock()
@@ -199,7 +200,7 @@ func TestAutobanDisableFlush_hotPathWhenEligible(t *testing.T) {
 		{Value: "198.51.100.1", Remark: AutobanEntryRemark, CreatedAt: "2026-10-13 10:00:00", ExpiresAt: "2026-10-14 09:00:00"}, // 已到期
 		{Value: "198.51.100.2", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:30:00", ExpiresAt: "2026-10-14 11:00:00"}, // 未到期
 	})
-	spy := installAutobanConvergeSpy(t, func() (bool, error) { return true, nil })
+	spy := installAutobanConvergeSpy(t, func() (IPListProjectionOutcome, error) { return ProjectionConverged, nil })
 
 	AutobanDisableFlush()
 
@@ -259,7 +260,7 @@ func installAutobanHotPathIntegration(t *testing.T) (*CaddyService, *hotPathTest
 	}
 	spy := &autobanConvergeSpy{}
 	oldRef, oldRel := autobanProjectionRefresher, autobanReloader
-	autobanProjectionRefresher = func() (bool, error) { spy.refreshes++; return s.RefreshIPListProjectionsInLock() }
+	autobanProjectionRefresher = func() (IPListProjectionOutcome, error) { spy.refreshes++; return s.RefreshIPListProjectionsInLock() }
 	autobanReloader = func() error { spy.reloads++; return s.GenerateAndApplyConfigForceInLock() }
 	t.Cleanup(func() { autobanProjectionRefresher, autobanReloader = oldRef, oldRel })
 	return s, admin, spy, policyID
@@ -314,7 +315,7 @@ func TestAutobanCycle_emptyListFirstBanHotPath(t *testing.T) {
 	}
 	spy := &autobanConvergeSpy{}
 	oldRef, oldRel := autobanProjectionRefresher, autobanReloader
-	autobanProjectionRefresher = func() (bool, error) { spy.refreshes++; return s.RefreshIPListProjectionsInLock() }
+	autobanProjectionRefresher = func() (IPListProjectionOutcome, error) { spy.refreshes++; return s.RefreshIPListProjectionsInLock() }
 	autobanReloader = func() error { spy.reloads++; return s.GenerateAndApplyConfigForceInLock() }
 	t.Cleanup(func() { autobanProjectionRefresher, autobanReloader = oldRef, oldRel })
 

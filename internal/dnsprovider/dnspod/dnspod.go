@@ -215,6 +215,12 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 			}
 		}
 		if err != nil {
+			if ctx.Err() != nil {
+				// A-4（历史证书域双实现同步）：与 tencent deleteOne 同口径
+				//——ctx 取消/超时并入错误链，保留原始 provider 错误（整体覆写
+				// 会丢失具体 API 失败原因，诊断信息归零）。
+				err = errors.Join(err, ctx.Err())
+			}
 			if p.ownership == nil {
 				// 历史问题：failed 的唯一消费点是下方 ownership==nil 的 owned
 				// 回填；ownership 模式下失败条目由 ownership 留存（删除失败

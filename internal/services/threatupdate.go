@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -131,12 +132,14 @@ var threatReloader func() error
 // threatProjectionRefresher 投影热路径回调（main.go 注入
 // CaddyService.RefreshIPListProjections，2026-10-15 用户裁定 threatReloader
 // 重载门退役）：被启用策略引用的名单内容变化后重写投影文件收敛（零 /load，
-// @ipListFast 匹配器 ≤1s stat 热感知）。返回 false=未证实收敛（发射面变化/
-// 运行配置不可读）——调用方回退 threatReloader /load 收敛（宁可一次重载，
-// 不欠引用方渲染收敛）。历史问题 失败自愈标记（threatReloadPending）随之退役：
-// 热路径无失败态（回退即当轮 /load）；残留受信代理分支的失败由配置一致性
-// 看门狗漂移横幅 + 下次任意配置变更收敛兜底。
-var threatProjectionRefresher func() (bool, error)
+// @ipListFast 匹配器 ≤1s stat 热感知）。返回 ProjectionConverged=已证实收敛
+// ——ProjectionNeedForce（本轮渲染物化了证书文件，历史 CERT-1）与
+// ProjectionFallback（发射面变化/运行配置不可读）均未证实收敛，调用方回退
+// threatReloader 强制 /load 收敛（宁可一次重载，不欠引用方渲染收敛；强制
+// 形态同时满足 历史问题 W1-1）。历史问题 失败自愈标记（threatReloadPending）随之
+// 退役：热路径无失败态（回退即当轮 /load）；残留受信代理分支的失败由配置
+// 一致性看门狗漂移横幅 + 下次任意配置变更收敛兜底。
+var threatProjectionRefresher func() (IPListProjectionOutcome, error)
 
 // SetThreatReloader 注册残留 /load 回调（nil=清除，测试用）。
 func SetThreatReloader(fn func() error) {
@@ -144,7 +147,7 @@ func SetThreatReloader(fn func() error) {
 }
 
 // SetThreatProjectionRefresher 注册投影热路径回调（nil=清除，测试用）。
-func SetThreatProjectionRefresher(fn func() (bool, error)) {
+func SetThreatProjectionRefresher(fn func() (IPListProjectionOutcome, error)) {
 	threatProjectionRefresher = fn
 }
 
@@ -377,10 +380,12 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		// 未注册热路径（测试二进制/异常装配）：名单文件已更新，引用方投影
 		// 由下次任意配置变更的全量渲染收敛。
 		AppendThreatUpdateLog("WARN", "unchanged", "投影刷新器未注册，跳过热路径（引用方渲染由下次配置变更收敛）")
-	} else if hot, rerr := threatProjectionRefresher(); rerr != nil || !hot {
-		// fail-safe：投影刷新被拒（生成失败）/发射面变化/运行配置不可读
-		// → 回退 /load 收敛——宁可一次重载，不欠引用方渲染收敛。
-		AppendThreatUpdateLog("INFO", "reloading", "投影热路径未证实收敛（发射面变化或刷新失败），回退重载 Caddy 配置")
+	} else if hot, rerr := threatProjectionRefresher(); rerr != nil || hot != ProjectionConverged {
+		// fail-safe：投影刷新被拒（生成失败）/发射面变化/运行配置不可读/
+		// 证书材料被物化（NeedForce，历史 CERT-1——重载回调为强制形态，
+		// 击穿 errSameConfig 让新证书进 Caddy 内存）→ 回退 /load 收敛——宁可
+		// 一次重载，不欠引用方渲染收敛。
+		AppendThreatUpdateLog("INFO", "reloading", "投影热路径未证实收敛（发射面变化/证书物化或刷新失败），回退重载 Caddy 配置")
 		if threatReloader != nil {
 			err := threatReloader()
 			recordSystemReloadAudit("threat_update", err)
@@ -417,15 +422,22 @@ func ipListsReferencedByEnabledPolicyLabeled(logPrefix string, listIDs []int) bo
 	for _, id := range listIDs {
 		want[id] = true
 	}
-	rows, err := db.DB.Query(`SELECT COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_refs,'[]') FROM security_policies WHERE enabled=1`)
+	// 历史 SEC-2：引用面补全——除 ACL/信任引用外，CRS 排除 scope=ip/list
+	// 条目的 ListRefs（emitScopedCRSExclusions 投影消费，SEC-1 后同为
+	// @ipListFast 文件热感知面）与受信代理网段引用（global_config.
+	// trusted_proxy_range_refs，tp.txt 投影消费，仅 trusted_proxy_enabled=1
+	// 时渲染）都是渲染引用方；漏查会让「仅被这两面引用」的名单在写路径被
+	// 资格门误判未引用→无谓回退全量链/全量重载（保守口径缺口）。查询/解析
+	// 失败按「可能被引用」处理（历史问题 同口径）。
+	rows, err := db.DB.Query(`SELECT COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_refs,'[]'), COALESCE(crs_excluded_rules,'[]') FROM security_policies WHERE enabled=1`)
 	if err != nil {
 		Logf("error", "%s: 读取策略引用失败（按被引用处理）: %v", logPrefix, err)
 		return true
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var aclRefs, wlRefs string
-		if err := rows.Scan(&aclRefs, &wlRefs); err != nil {
+		var aclRefs, wlRefs, xcRules string
+		if err := rows.Scan(&aclRefs, &wlRefs, &xcRules); err != nil {
 			Logf("error", "%s: 扫描策略引用失败（按被引用处理）: %v", logPrefix, err)
 			return true
 		}
@@ -442,12 +454,47 @@ func ipListsReferencedByEnabledPolicyLabeled(logPrefix string, listIDs []int) bo
 				}
 			}
 		}
+		// CRS 排除作用域限定条目（scope=ip/list）的 ListRefs——与发射侧
+		// 同一解析单源 ParseCRSExcludedRules（scope=all 条目的 ListRefs 不
+		// 参与发射，不计入引用面）。
+		for _, entry := range ParseCRSExcludedRules(xcRules) {
+			if entry.Scope != "ip" && entry.Scope != "list" {
+				continue
+			}
+			for _, id := range entry.ListRefs {
+				if want[int(id)] {
+					return true
+				}
+			}
+		}
 	}
 	if err := rows.Err(); err != nil {
 		// 历史问题-⑪（历史主审补漏）：迭代失败与查询/解析失败同口径——按被引用
 		// 处理（fail-closed），漏查会跳过名单收敛致引用方渲染不收敛。
 		Logf("error", "%s: 遍历策略引用失败（按被引用处理）: %v", logPrefix, err)
 		return true
+	}
+	// 受信代理网段引用（全局单份；未启用时不渲染 tp.txt，引用面不存在）。
+	var tpEnabled int
+	var tpRefs string
+	if err := db.DB.QueryRow(`SELECT COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_range_refs,'[]') FROM global_config WHERE id=1`).Scan(&tpEnabled, &tpRefs); err != nil {
+		if err != sql.ErrNoRows {
+			Logf("error", "%s: 读取受信代理引用失败（按被引用处理）: %v", logPrefix, err)
+			return true
+		}
+		return false
+	}
+	if tpEnabled == 1 {
+		var ids []int
+		if err := json.Unmarshal([]byte(tpRefs), &ids); err != nil {
+			Logf("error", "%s: 受信代理引用 JSON 解析失败（按被引用处理）: %v", logPrefix, err)
+			return true
+		}
+		for _, id := range ids {
+			if want[id] {
+				return true
+			}
+		}
 	}
 	return false
 }

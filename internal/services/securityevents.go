@@ -178,12 +178,6 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 		Action:        "logged",
 	}
 	rec.AttributionRuleID = securityEventsFirstHeader(tx.Request.Headers, "x-lb-rule-id")
-	// 安全处理耗时（2026-09-27 分段计时；历史分段键二态化）：blocked_counter
-	// 注入的 timing ID 在请求头里,coraza 审计日志天然收录——按 ID+分段键查侧车
-	// 文件。选值规则:预检段规则(IP ACL/GeoIP/信任/威胁,id 1-14 与 800xxx)取
-	// :pre(预检拦由拦截写点代记,决策口径);WAF 段规则(CRS 9xxxxx/自定义)拦截
-	// 事件取 :end-:pre、logged 事件取 :end(=预检后锚点起算的 WAF 段值,见
-	// securityEventsStageDuration)。未命中保持 0,UI 显示「—」。
 	rec.RequestHeaders = securityEventsSerializeHeaders(tx.Request.Headers)
 	rec.RequestBody = securityEventsEncodeBody(tx.Request.Body)
 	if tx.IsInterrupted {
@@ -1503,7 +1497,7 @@ func runIngestionLoop(ctx context.Context) error {
 }
 
 // —— 安全处理耗时（2026-09-27 分段计时；历史侧车退役）——
-// 耗时不再经  侧车文件跨进程传递：审计写插件
+// 耗时不再经侧车文件跨进程传递：审计写插件
 // （caddygeoip auditwriter.go）在 Caddy 进程内把 per-request 分段耗时注入
 // 审计行顶层 lb_timing 字段（{"pre_us":N,"end_us":M}，缺席分段省略），摄取
 // 管道解析审计行时直接取值——零文件、零截断协议、零 tick 级查表，补采路径

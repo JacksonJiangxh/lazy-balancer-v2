@@ -279,6 +279,9 @@ func TestIPListProjectedFileName_forms(t *testing.T) {
 		"u-deny-abc123def456.txt",  // 旧内容寻址形态（迁移期回收）
 		"p12-acl-0123456789ab.txt", // 旧形态（策略 scope）
 		"orphan-deadbeef0012.txt",  // 旧形态（任意 scope 前缀，精确 12 位 hex）
+		// 历史 HP-1 新形态：u-<kind>-<ruleCaddyID>（CaddyID 含下划线）
+		"u-deny-lb_2r8dosptk1.txt", "u-trust12-lb_2r8dosptk1.txt", "u-allow-exempt-lb_ab12cd34ef56.txt",
+		"p5-crsxc-0.txt", // 历史 SEC-1 新形态：CRS 作用域排除投影（策略身份）
 	}
 	for _, name := range matched {
 		if !ipListProjectedFileName.MatchString(name) {
