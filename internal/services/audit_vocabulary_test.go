@@ -54,8 +54,12 @@ var auditVocabDynamicAllowlist = map[string]map[int][]string{
 	"handlers/autobackup.go":          {1: {"RunAutoBackupOnce"}},
 	"handlers/config_import_v1.go":    {1: {"ImportV1Config"}},
 	"handlers/handlers.go":            {1: {"finishTxApply"}, 2: {"finishTxApply"}},
-	"services/certificates.go":        {1: {"renewExpiringCertificates"}},
-	"services/downloadintegrity.go":   {2: {"recordDownloadIntegrity"}},
+	// tryIPListHotPathApply 的动作/对象透传 txApplyFinish 字段（热路径收尾镜像
+	// finishTxApply 家族语义；字面量词条在各名单写路径调用点核清，
+	// 2026-10-15 核清入白名单）。
+	"handlers/securityiplists.go":   {1: {"tryIPListHotPathApply"}, 2: {"tryIPListHotPathApply"}},
+	"services/certificates.go":      {1: {"renewExpiringCertificates"}},
+	"services/downloadintegrity.go": {2: {"recordDownloadIntegrity"}},
 	// RunAutobanCycle 的动作传 AutobanAuditAction 包级常量（字面值「自动封禁」
 	// 单源——merge 审计写点与 AutobanBannedToday 的 audit_log 计数共用同一
 	// 常量，两处字面量漂移会让今日封禁恒 0；2026-10-15 核清入白名单）。

@@ -125,8 +125,9 @@ func loadIPListFile(path string, fresh bool) (state *ipListFileState, err error)
 	ipListCache.RLock()
 	cached := ipListCache.states[path]
 	ipListCache.RUnlock()
-	// stat 形态命中即复用——构建期（fresh）同享：策略名单内容寻址（同路径=
-	// 同内容），威胁库原子换名 mtime 必变；N 规则引用同一文件只解析一次。
+	// stat 形态命中即复用——构建期（fresh）同享：策略名单稳定命名下同路径
+	// 同字节跳写（mtime 不变），威胁库/热路径原子重写 mtime 必变；N 规则引用
+	// 同一文件只解析一次。
 	if cached != nil && cached.mtime.Equal(info.ModTime()) && cached.size == info.Size() {
 		cached.lastCheckNano.Store(time.Now().UnixNano())
 		return cached, nil

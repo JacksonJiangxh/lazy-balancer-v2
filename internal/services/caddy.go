@@ -4030,9 +4030,10 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			"X-LB-GeoIP-Country", "X-LB-GeoIP-Country-Code", "X-LB-GeoIP-Region",
 			"X-LB-GeoIP-Province", "X-LB-GeoIP-City", "X-LB-GeoIP-Loc",
 			"X-LB-Rule-ID",
-			// 安全处理耗时关联头（v2.3.3）：blocked_counter 注入供 coraza 审计
-			// 日志收录,摄取管道按 ID 关联侧车文件耗时——coraza 之后链路不再
-			// 需要,与 X-LB-Rule-ID 同机制剥离,不上泄上游。
+			// 安全处理耗时关联头（v2.3.3）：blocked_counter 注入，coraza 审计
+			// 日志收录后由审计写插件作进程内计时注册表关联键（历史耗时随
+			// 审计行内嵌 lb_timing 流转）——coraza 之后链路不再需要,与
+			// X-LB-Rule-ID 同机制剥离,不上泄上游。
 			"X-Lb-Security-Timing-Id",
 			"X-Lb-Security-Timing-Start-Ns",
 		},
@@ -4104,6 +4105,54 @@ func (s *CaddyService) ApplyConfigFromTx(tx *sql.Tx) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.applyConfigLocked(generateCaddyConfigFromStore(tx))
+}
+
+// RefreshIPListProjectionsFromTxInLock 投影热路径（2026-10-15 用户裁定）：
+// 名单-only 变更的零 /load 收敛——以事务视图全量渲染（投影文件为渲染副作用，
+// 原子落盘新内容）后与运行配置做结构级比对：
+//   - (true, nil)  字节一致 → 零发射面变化，投影已落盘即收敛。零 /load，
+//     @ipListFast 匹配器按 mtime+size ≤1s stat 热感知新内容。调用方提交后
+//     直接成功收尾，不落「重载」审计（审计真实性）。
+//   - (false, nil) 字节不一致（发射面变化：名单清空/扩空致规则增减）或运行
+//     配置不可读（无法证实零变化）→ 调用方回退既有全量渲染+应用链
+//     （fail-open 与同字节短路同向：不轻率跳过 /load）。
+//   - (false, err) 事务视图渲染被拒（生成失败）→ 调用方回退全量链得到同口径
+//     拒绝（400+回滚，fail-closed 与 ApplyConfigFromTx 一致）。
+//
+// 已持 caddyOpMu（=CaddyOpLock）的调用方使用（handlers 名单写路径全程持锁）；
+// 锁内渲染与 ApplyConfigFromTx 同序，投影写盘与 /load 永不交错。
+func (s *CaddyService) RefreshIPListProjectionsFromTxInLock(tx *sql.Tx) (bool, error) {
+	return s.refreshIPListProjectionsInLock(tx)
+}
+
+// RefreshIPListProjections 投影热路径的 DB 视图变体（后台任务用，威胁库更新
+// 收敛——写库已完成，按已提交视图渲染）：自取 CaddyOpLock。返回语义同
+// RefreshIPListProjectionsFromTxInLock。
+func (s *CaddyService) RefreshIPListProjections() (bool, error) {
+	CaddyOpLock.Lock()
+	defer CaddyOpLock.Unlock()
+	return s.refreshIPListProjectionsInLock(db.DB)
+}
+
+func (s *CaddyService) refreshIPListProjectionsInLock(store caddyConfigStore) (bool, error) {
+	config := generateCaddyConfigFromStore(store)
+	if message, ok := config[caddyConfigGenerationErrorKey].(string); ok {
+		// 生成失败 = 该视图渲染不出合法配置——回退全量链按「配置被拒」拒绝
+		//（同 applyConfigLockedOpt 口径，调用方回退后得到一致错误语义）。
+		return false, &ConfigRejectedError{Err: errors.New(message)}
+	}
+	data, err := json.Marshal(caddyPayload(config))
+	if err != nil {
+		return false, fmt.Errorf("failed to marshal config: %w", err)
+	}
+	running, err := s.getRunningConfigBytes()
+	if err != nil {
+		return false, nil // 未知 → 不轻率宣称零变化，回退全量链
+	}
+	if !caddyConfigJSONEqual(running, data) {
+		return false, nil // 发射面变化（规则增减/路径变化）→ 全量链收敛
+	}
+	return true, nil
 }
 
 // ApplyConfigFromTxCertAwareForce：证书候选改读事务自身（历史问题 A-N1，restoreTable

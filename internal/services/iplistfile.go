@@ -1,8 +1,6 @@
 package services
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -39,42 +37,49 @@ func EnsureIPListDir() error {
 	return nil
 }
 
-// writeIPListFile 把聚合后的名单原子写入内容寻址文件（scope-sha256[:12].txt），
-// 返回绝对路径；空集合返回空串不写文件（调用方据此不发射规则）。文件已存在
-// 直接返回路径（幂等）；写失败返回 error——经渲染错误链路上报（保存侧事务
-// 回滚，fail-closed）。成功投影的路径计入本轮渲染引用集（GC 差集口径）。
-// GC 不在此触发（历史补充轮 历史问题）：渲染中途按上一轮陈旧引用集差集会误删
-// 在役文件——统一由整轮渲染 apply 成功后触发（maybeGCStaleIPListFiles，引用集
-// 落齐再差集；全部阈值为 time.Since 时长比较，无挂钟排程、与时区配置无关）。
+// writeIPListFile 把聚合后的名单原子写入稳定命名文件（<scope>.txt——scope
+// 字符串本身即投影实例身份：策略 id/并集描述符；名单改名/内容变化都不改变
+// 文件名，2026-10-15 热路径改造取代旧内容寻址 scope-sha256[:12].txt），返回
+// 绝对路径；空集合返回空串不写文件（调用方据此不发射规则）。同路径同字节
+// 跳写（全量渲染重投影不动，mtime 保持 → wafiplist stat 缓存命中零重建）；
+// 内容变化同路径原子换内容（配置字节不变，@ipListFast 匹配器 ≤1s stat 热感
+// 知——名单写路径零 /load 收敛的机制基础）。写失败返回 error——经渲染错误
+// 链路上报（保存侧事务回滚，fail-closed）。成功投影的路径计入本轮渲染引用
+// 集（GC 差集口径）。GC 不在此触发（历史补充轮 历史问题）：渲染中途按上一
+// 轮陈旧引用集差集会误删在役文件——统一由整轮渲染 apply 成功后触发
+// （maybeGCStaleIPListFiles，引用集落齐再差集；全部阈值为 time.Since 时长
+// 比较，无挂钟排程、与时区配置无关）。
 func writeIPListFile(scope string, merged []string) (string, error) {
 	merged = wafiplist.AggregateIPEntries(merged)
 	if len(merged) == 0 {
 		return "", nil
 	}
-	sum := sha256.Sum256([]byte(strings.Join(merged, "\n")))
-	name := fmt.Sprintf("%s-%s.txt", scope, hex.EncodeToString(sum[:])[:12])
-	path := filepath.Join(IPListDataDir, name)
-	noteIPListRenderRef(path)
-	if _, err := os.Stat(path); err == nil {
-		return path, nil
-	}
-	if err := EnsureIPListDir(); err != nil {
-		return "", err
-	}
-	// 唯一临时名（历史 历史问题）：并发渲染同一 (scope,内容) 命中同一正式路径
-	// 时，确定性 .tmp 会让 O_TRUNC 互踩对方的半截内容后 rename 出厂；CreateTemp
-	// 使每次写入独占临时文件，rename 串行原子生效。失败路径清理临时文件。
+	// 内容先于 stat 构建：稳定命名下「同路径」不再蕴含「同内容」——字节比对
+	// 才是跳写判据（内容寻址时代的 stat 命中=同内容前提已随热路径改造失效）。
 	var sb strings.Builder
 	for _, entry := range merged {
 		sb.WriteString(entry)
 		sb.WriteString("\n")
 	}
+	content := sb.String()
+	name := scope + ".txt"
+	path := filepath.Join(IPListDataDir, name)
+	noteIPListRenderRef(path)
+	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
+		return path, nil // 同字节跳写
+	}
+	if err := EnsureIPListDir(); err != nil {
+		return "", err
+	}
+	// 唯一临时名（历史 历史问题）：并发渲染同一 scope 命中同一正式路径时，
+	// CreateTemp 使每次写入独占临时文件，rename 串行原子生效。失败路径清理
+	// 临时文件。
 	tmp, err := os.CreateTemp(IPListDataDir, scope+"-*.tmp")
 	if err != nil {
 		return "", fmt.Errorf("创建 IP 名单临时文件失败 %s: %w", name, err)
 	}
 	tmpName := tmp.Name()
-	if _, err := tmp.WriteString(sb.String()); err != nil {
+	if _, err := tmp.WriteString(content); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("写入 IP 名单文件失败 %s: %w", name, err)
@@ -99,13 +104,18 @@ const ipListFileMaxAge = 24 * time.Hour
 // ipListGCInterval 是自动 GC 的最小间隔（每次成功投影后检查一次）。
 const ipListGCInterval = time.Hour
 
-// ipListProjectedFileName 匹配投影文件命名（scope-sha256[:12].txt）——差集
-// 清理只碰该形态，目录内其他文件（运维投放/误放）一律不动。
-var ipListProjectedFileName = regexp.MustCompile(`^.+-[0-9a-f]{12}\.txt$`)
+// ipListProjectedFileName 匹配投影文件命名——差集清理只碰该形态，目录内其他
+// 文件（运维投放/误放）一律不动。两个分支（2026-10-15 热路径改造）：
+//   - 新稳定命名 <scope>.txt（scope 为策略 id/并集描述符形态，精确白名单，
+//     用户手放文件不碰）；
+//   - 旧内容寻址 scope-sha256[:12].txt——迁移过渡分支：改造前落盘的旧哈希
+//     文件由既有 24h GC 自然回收（不写迁移），旧文件清尽后该分支恒不命中，
+//     自行失效。
+var ipListProjectedFileName = regexp.MustCompile(`^(u-[a-z0-9][a-z0-9-]*|p[0-9]+-(acl|trust|bl)|.+-[0-9a-f]{12})\.txt$`)
 
 // ipListRenderRefs 记录本进程渲染引用过的投影文件及最近引用时间：一次全量
-// 配置渲染会重新投影全部在役名单（内容寻址，stat 命中也计引用），故「长期
-// 未被引用 + 超龄」即孤儿（策略解绑/删除、威胁库内容换哈希后的旧文件）。
+// 配置渲染会重新投影全部在役名单（同字节跳写也计引用），故「长期
+// 未被引用 + 超龄」即孤儿（策略解绑/删除、发射面变化后的旧文件）。
 var ipListRenderRefs = struct {
 	sync.Mutex
 	lastRef map[string]time.Time

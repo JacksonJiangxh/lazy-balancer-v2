@@ -3,83 +3,45 @@ package caddygeoip
 import (
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strconv"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
-// 历史问题(历史):写侧三文件此前零测试——补并发追加/空 ID 短路/目录
-// 惰性创建的行为钉。
+// 计时注册表契约测试（历史：侧车退役，耗时写入进程内
+// 注册表，由审计写插件注入审计行——写侧三写点的行为钉）。
 
-// Given: 并发 50 goroutine 各追加一行
-// When: AppendSecurityTiming
-// Then: 有界队列+专职写 goroutine 保证 50 行完整落盘(无交错/丢行;
-// 50 < 队列容量 4096 无丢弃;PLUG-N1 历史由互斥锁串行写改造)
-func TestAppendSecurityTiming_concurrentAppend(t *testing.T) {
-	logPath, flush := setupSecurityTimingWriter(t)
-
-	var wg sync.WaitGroup
-	for i := range 50 {
-		wg.Add(1)
-		go func(n int) {
-			defer wg.Done()
-			AppendSecurityTiming(strings.Repeat("a", 8), int64(n))
-		}(i)
-	}
-	wg.Wait()
-	flush() // 停写排空——断言前所有已入队行落盘
-
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) != 50 {
-		t.Errorf("lines=%d; want 50 (mutex must serialize appends)", len(lines))
-	}
-	for _, l := range lines {
-		if !strings.HasPrefix(l, "aaaaaaaa ") {
-			t.Errorf("malformed line: %q", l)
-		}
-	}
+// useTestTimingRegistry 隔离全局注册表并收窄等待参数到测试量级。
+func useTestTimingRegistry(t *testing.T) {
+	t.Helper()
+	origWait, origPoll := auditTimingWaitLimit, auditTimingPollStep
+	auditTimingWaitLimit = 200 * time.Millisecond
+	auditTimingPollStep = time.Millisecond
+	auditTimingMu.Lock()
+	auditTimingEntries = make(map[string]*auditTimingEntry)
+	auditTimingMu.Unlock()
+	t.Cleanup(func() {
+		auditTimingWaitLimit, auditTimingPollStep = origWait, origPoll
+		auditTimingMu.Lock()
+		auditTimingEntries = make(map[string]*auditTimingEntry)
+		auditTimingMu.Unlock()
+	})
 }
 
-// Given: 空 ID
-// When: AppendSecurityTiming
-// Then: 短路(不建文件)
-func TestAppendSecurityTiming_emptyIdShortCircuit(t *testing.T) {
-	logPath, flush := setupSecurityTimingWriter(t)
-
-	AppendSecurityTiming("", 100)
-	flush()
-
-	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
-		t.Error("empty ID must short-circuit without creating file")
+// auditTimingLookup 测试取值 helper。
+func auditTimingLookupForTest(t *testing.T, id string) auditTimingSnapshot {
+	t.Helper()
+	auditTimingMu.Lock()
+	e := auditTimingEntries[id]
+	auditTimingMu.Unlock()
+	if e == nil {
+		return auditTimingSnapshot{}
 	}
-}
-
-// Given: 目录不存在
-// When: AppendSecurityTiming
-// Then: MkdirAll 兜底后正常写入
-func TestAppendSecurityTiming_mkdirFallback(t *testing.T) {
-	nested, flush := setupSecurityTimingWriter(t, "a", "b", "timing.log")
-
-	AppendSecurityTiming("testid01", 42)
-	flush()
-
-	data, err := os.ReadFile(nested)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.TrimSpace(string(data)) != "testid01 42" {
-		t.Errorf("content=%q; want %q", data, "testid01 42")
-	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return auditTimingSnapshot{preUs: e.preUs, preSet: e.preSet, endUs: e.endUs, endSet: e.endSet, closed: e.closed}
 }
 
 // Given: 正常调用
@@ -97,174 +59,48 @@ func TestSecurityTimingID_length(t *testing.T) {
 	}
 }
 
-// setupSecurityTimingWriter 重定向侧车路径到临时文件并启动写 goroutine
-// （PLUG-N1 历史：落盘改由 handler 生命周期内的专职写 goroutine 承担，
-// 测试须显式 acquire）。返回路径与 flush（停写排空——已入队行全部落盘，
-// fd 随写 goroutine 退出关闭，无泄漏；幂等，t.Cleanup 兜底再调一次并还原
-// 路径）。rel 缺省为 "timing.log"。
-func setupSecurityTimingWriter(t *testing.T, rel ...string) (logPath string, flush func()) {
-	t.Helper()
-	if len(rel) == 0 {
-		rel = []string{"timing.log"}
-	}
-	parts := append([]string{t.TempDir()}, rel...)
-	logPath = filepath.Join(parts...)
-	orig := securityTimingLogPath
-	securityTimingLogPath = logPath
-	securityTimingWriterAcquire()
-	released := false
-	flush = func() {
-		if released {
-			return
-		}
-		released = true
-		securityTimingWriterRelease()
-	}
-	t.Cleanup(func() {
-		flush()
-		securityTimingLogPath = orig
-	})
-	return logPath, flush
-}
-
 // PLUG-R1（历史 历史问题）：security_timing_pre/end 两 ServeHTTP 逐字重复收敛为
-// recordSecurityTiming helper——钉 helper 契约：合法头对写一行「<id><suffix> <us>」，
+// recordSecurityTiming helper——钉 helper 契约：合法头对写一段注册表耗时，
 // 缺头对零写入（静默降级语义不变）。
-func TestRecordSecurityTiming_writesSuffixedLine(t *testing.T) {
-	// Given 临时侧车路径（写 goroutine 在役）+ 携带关联头对的请求（起始时间 12345µs 前）
-	logPath, flush := setupSecurityTimingWriter(t)
+func TestRecordSecurityTiming_writesRegistrySegment(t *testing.T) {
+	useTestTimingRegistry(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set(securityTimingHeader, "abcdef0123456789")
 	req.Header.Set(securityTimingStartHeader, strconv.FormatInt(time.Now().UnixNano()-12345000, 10))
 
 	// When
-	recordSecurityTiming(req, ":pre")
-	flush() // 停写排空后断言
+	recordSecurityTiming(req, timingSegmentPre)
 
-	// Then：恰好一行 <id>:pre <us>，耗时为正整数
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	line := strings.TrimSpace(string(data))
-	parts := strings.SplitN(line, " ", 2)
-	if len(parts) != 2 || parts[0] != "abcdef0123456789:pre" {
-		t.Fatalf("line=%q, want %q", line, "abcdef0123456789:pre <us>")
-	}
-	if us, perr := strconv.ParseInt(parts[1], 10, 64); perr != nil || us <= 0 {
-		t.Fatalf("duration=%q, want positive integer µs", parts[1])
+	// Then：注册表出现 pre 段且耗时为正整数（12ms 前起算）
+	snap := auditTimingLookupForTest(t, "abcdef0123456789")
+	if !snap.preSet || snap.preUs <= 0 {
+		t.Fatalf("snapshot = %+v; want positive pre segment", snap)
 	}
 
-	// And 畸形形状：缺头对的请求零写入（写 goroutine 在役时同样静默跳过）
-	securityTimingWriterAcquire()
-	recordSecurityTiming(httptest.NewRequest(http.MethodGet, "/", nil), ":end")
-	securityTimingWriterRelease()
-	dataAfter, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(dataAfter) != string(data) {
-		t.Fatalf("missing headers must write nothing: before=%q after=%q", data, dataAfter)
-	}
-}
-
-// PLUG-N1（历史）：写 goroutine 未启动（无计时写点 handler 在役）时
-// Append 必须静默丢弃——不建文件、不阻塞、不 panic。耗时是增强信息，
-// 降级语义保持；落盘由 handler 生命周期内的专职写 goroutine 承担，
-// 请求路径不再直接持有/惰性创建 fd。
-func TestAppendSecurityTiming_dropsWhenWriterNotStarted(t *testing.T) {
-	// Given 临时侧车路径，但不启动写 goroutine
-	dir := t.TempDir()
-	orig := securityTimingLogPath
-	logPath := filepath.Join(dir, "timing.log")
-	securityTimingLogPath = logPath
-	t.Cleanup(func() { securityTimingLogPath = orig })
-
-	// When
-	AppendSecurityTiming("deadbeef01", 7)
-
-	// Then 不建文件（静默丢弃，而非请求路径惰性写盘）
-	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
-		t.Fatalf("append without writer must drop silently, stat err=%v", err)
-	}
-}
-
-// PLUG-N1（历史）：队列有界满丢——请求路径 Append 永不阻塞在磁盘 I/O
-// 上；队列满时新打点丢弃（耗时增强信息可丢，阻塞主路径不可接受）。
-func TestAppendSecurityTiming_queueFullDropsOverflow(t *testing.T) {
-	// Given 容量 2 的拥塞队列（无写 goroutine 排空，直接构造满态）
-	securityTimingStateMu.Lock()
-	origCh, origDone, origRefs := securityTimingCh, securityTimingDone, securityTimingRefs
-	securityTimingCh = make(chan string, 2)
-	securityTimingDone = nil
-	securityTimingRefs = 1 // 标记在役，防测试内 release 误关闭
-	securityTimingStateMu.Unlock()
-	t.Cleanup(func() {
-		securityTimingStateMu.Lock()
-		securityTimingCh, securityTimingDone, securityTimingRefs = origCh, origDone, origRefs
-		securityTimingStateMu.Unlock()
-	})
-
-	// When 连续追加 10 行（远超容量）
-	for i := range 10 {
-		AppendSecurityTiming("overflowid", int64(i))
+	// And 畸形形状：缺头对的请求零写入
+	recordSecurityTiming(httptest.NewRequest(http.MethodGet, "/", nil), timingSegmentEnd)
+	snapAfter := auditTimingLookupForTest(t, "abcdef0123456789")
+	if snapAfter.endSet {
+		t.Fatalf("missing headers must write nothing: %+v", snapAfter)
 	}
 
-	// Then 只保留前 2 行、其余丢弃——Append 全程无阻塞返回
-	securityTimingStateMu.RLock()
-	queued := len(securityTimingCh)
-	securityTimingStateMu.RUnlock()
-	if queued != 2 {
-		t.Fatalf("queued=%d; want 2 (bounded queue must drop overflow, not block)", queued)
-	}
-}
-
-// PLUG-N1（历史）：写 goroutine 生命周期——acquire 启动、release 停写
-// 并排空降盘（不丢已入队行）；release 后再 Append 静默丢弃。
-func TestSecurityTimingWriter_releaseDrainsQueue(t *testing.T) {
-	// Given 启动写 goroutine 的临时侧车
-	dir := t.TempDir()
-	orig := securityTimingLogPath
-	logPath := filepath.Join(dir, "timing.log")
-	securityTimingLogPath = logPath
-	t.Cleanup(func() { securityTimingLogPath = orig })
-	securityTimingWriterAcquire()
-
-	// When 追加 100 行（< 队列容量 4096）后立即 release
-	for i := range 100 {
-		AppendSecurityTiming("drainid001", int64(i))
-	}
-	securityTimingWriterRelease()
-
-	// Then 全部 100 行落盘（release 排空而非丢弃）
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) != 100 {
-		t.Fatalf("lines=%d; want 100 (release must drain queue before stopping)", len(lines))
-	}
-
-	// And release 后 Append 静默丢弃（写 goroutine 已停）
-	AppendSecurityTiming("afterstop1", 1)
-	dataAfter, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(dataAfter) != string(data) {
-		t.Fatal("append after release must drop silently (writer stopped)")
+	// And 降级形态：计时 ID 生成失败（空头值）零写入
+	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req2.Header.Set(securityTimingHeader, "")
+	recordSecurityTiming(req2, timingSegmentPre)
+	if got := auditTimingLookupForTest(t, ""); got.preSet {
+		t.Fatal("empty id must short-circuit")
 	}
 }
 
 // 历史（预检拦耗时口径）：分段锚点交接契约——timing_pre 放行路径在记录
-// :pre 后，把起始纳秒头重写为「预检完成」锚点。下游 SecurityTimingEnd 的 :end
+// pre 后，把起始纳秒头重写为「预检完成」锚点。下游 SecurityTimingEnd 的 end
 // 自此从预检后起算（WAF 段值）；blocked_counter 以「起始头是否仍等于注入原值」
-// 判定拦截出处（原值=预检段拦，头未动 → 写 :pre 决策耗时；已重写=WAF/限流段
-// 拦 → 写 :end 全链）。放行形态：:pre 落盘 + 头已重写为更大纳秒值。
+// 判定拦截出处（原值=预检段拦，头未动 → 写 pre 决策耗时；已重写=WAF/限流段
+// 拦 → 写 end 全链）。放行形态：pre 段落注册表 + 头已重写为更大纳秒值。
 func TestSecurityTimingPre_passAnchorsSegmentViaHeaderRewrite(t *testing.T) {
-	logPath, flush := setupSecurityTimingWriter(t)
+	useTestTimingRegistry(t)
 	h := &SecurityTimingPre{}
 	const id = "abcdef0123456789"
 	startNs := time.Now().UnixNano()
@@ -277,25 +113,19 @@ func TestSecurityTimingPre_passAnchorsSegmentViaHeaderRewrite(t *testing.T) {
 	if err := h.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
 		t.Fatalf("ServeHTTP: %v", err)
 	}
-	flush()
 
-	// Then：:pre 行落盘（放行口径不变）
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
+	// Then：pre 段落注册表（放行口径不变）
+	snap := auditTimingLookupForTest(t, id)
+	if !snap.preSet || snap.preUs <= 0 {
+		t.Fatalf("snapshot = %+v; want positive pre segment", snap)
 	}
-	line := strings.TrimSpace(string(data))
-	parts := strings.SplitN(line, " ", 2)
-	if len(parts) != 2 || parts[0] != id+":pre" {
-		t.Fatalf("line=%q; want %q <us>", line, id+":pre")
-	}
-	// And：起始头重写为分段锚点（严格晚于注入值；下游 :end/WAF 段由此起算）
+	// And：起始头重写为分段锚点（严格晚于注入值；下游 end/WAF 段由此起算）
 	rewritten, perr := strconv.ParseInt(req.Header.Get(securityTimingStartHeader), 10, 64)
 	if perr != nil || rewritten <= startNs {
 		t.Fatalf("start header = %q; want rewritten to ns > %d (segment anchor)",
 			req.Header.Get(securityTimingStartHeader), startNs)
 	}
-	// And：ID 头保持（coraza 审计关联键不受锚点交接影响）
+	// And：ID 头保持（审计写插件的注册表关联键不受锚点交接影响）
 	if req.Header.Get(securityTimingHeader) != id {
 		t.Fatalf("timing id header = %q; want %q (audit correlation)", req.Header.Get(securityTimingHeader), id)
 	}
@@ -303,7 +133,7 @@ func TestSecurityTimingPre_passAnchorsSegmentViaHeaderRewrite(t *testing.T) {
 
 // 历史：畸形形态——缺关联头对的请求零写入、零改写、不 panic（静默降级）。
 func TestSecurityTimingPre_missingHeadersNoop(t *testing.T) {
-	logPath, flush := setupSecurityTimingWriter(t)
+	useTestTimingRegistry(t)
 	h := &SecurityTimingPre{}
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
@@ -311,12 +141,50 @@ func TestSecurityTimingPre_missingHeadersNoop(t *testing.T) {
 	if err := h.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
 		t.Fatalf("ServeHTTP: %v", err)
 	}
-	flush()
 
-	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
-		t.Error("missing headers must not create/write sidecar file")
+	if len(auditTimingEntriesSnapshotForTest(t)) != 0 {
+		t.Error("missing headers must not write registry entries")
 	}
 	if req.Header.Get(securityTimingStartHeader) != "" {
 		t.Error("missing headers must not set segment anchor header")
 	}
+}
+
+// logged 事件链末收点：timing_end 读重写后的锚点计算 end 段（自锚点起算=WAF
+// 段值），原样透传下游。
+func TestSecurityTimingEnd_recordsEndSegmentFromAnchor(t *testing.T) {
+	useTestTimingRegistry(t)
+	h := &SecurityTimingEnd{}
+	const id = "0123456789abcdef"
+	anchor := time.Now().UnixNano() - 5_000_000 // 锚点 5ms 前（timing_pre 已交接）
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set(securityTimingHeader, id)
+	req.Header.Set(securityTimingStartHeader, strconv.FormatInt(anchor, 10))
+	passed := false
+	next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { passed = true; return nil })
+
+	if err := h.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if !passed {
+		t.Fatal("next must be invoked (pass-through)")
+	}
+	snap := auditTimingLookupForTest(t, id)
+	if !snap.endSet || snap.endUs < 5 {
+		t.Fatalf("snapshot = %+v; want end segment ≥5ms (from anchor)", snap)
+	}
+	if snap.closed {
+		t.Fatal("timing_end must not close the entry (terminal marker owned by blocked_counter)")
+	}
+}
+
+func auditTimingEntriesSnapshotForTest(t *testing.T) map[string]*auditTimingEntry {
+	t.Helper()
+	auditTimingMu.Lock()
+	defer auditTimingMu.Unlock()
+	out := make(map[string]*auditTimingEntry, len(auditTimingEntries))
+	for id, e := range auditTimingEntries {
+		out[id] = e
+	}
+	return out
 }

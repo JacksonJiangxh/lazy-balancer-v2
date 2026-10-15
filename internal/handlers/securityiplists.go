@@ -520,6 +520,7 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
+	oldEntriesJSON := entriesJSON // 条目变化判定基准（归一前快照，热路径资格用）
 	// 内置只读名单（威胁情报库，system=1）：内容只读，由更新任务独占维护。
 	// 历史问题 例外：自动封禁预置名单条目可改（手动追加/删除条目经弹框），但名称/
 	// 分类/描述三字段锁定（2026-10-14 用户裁定）——自动封禁任务按名单名定位
@@ -616,6 +617,13 @@ WHERE COALESCE(ip_acl_enabled,0)=1 AND COALESCE(ip_acl_mode,'')='allow'
 	}
 	if rows, _ := result.RowsAffected(); rows == 0 {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "IP 地址列表不存在"})
+		return
+	}
+	if h.tryIPListHotPathApply(c, tx, id, oldEntriesJSON != entriesJSON, txApplyFinish{
+		Resource: "IP 地址列表", AuditAction: "更新",
+		AuditDetail: fmt.Sprintf("名称：%s（#%s，%d 条）", name, id, len(entries)),
+		SuccessMsg:  "IP 地址列表已更新",
+	}) {
 		return
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
@@ -824,6 +832,14 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 		return
 	}
 
+	if h.tryIPListHotPathApply(c, tx, id, true, txApplyFinish{
+		Resource: "IP 地址列表", AuditAction: "写入",
+		AuditDetail: fmt.Sprintf("名称：%s（#%s）追加 IP %s（新增，现共 %d 条）", listName, id, req.Value, len(entries)),
+		SuccessMsg:  "已追加",
+		Data:        gin.H{"added": true},
+	}) {
+		return
+	}
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "写入",
 		AuditDetail: fmt.Sprintf("名称：%s（#%s）追加 IP %s（新增，现共 %d 条）", listName, id, req.Value, len(entries)),
@@ -911,12 +927,66 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
+	if h.tryIPListHotPathApply(c, tx, id, true, txApplyFinish{
+		Resource: "IP 地址列表", AuditAction: "写入",
+		AuditDetail: fmt.Sprintf("名称：%s（#%s）移除 IP %s（现共 %d 条）", listName, id, req.Value, len(kept)),
+		SuccessMsg:  "已移除",
+		Data:        gin.H{"removed": true},
+	}) {
+		return
+	}
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "写入",
 		AuditDetail: fmt.Sprintf("名称：%s（#%s）移除 IP %s（现共 %d 条）", listName, id, req.Value, len(kept)),
 		SuccessMsg:  "已移除",
 		Data:        gin.H{"removed": true},
 	})
+}
+
+// tryIPListHotPathApply 名单-only 变更的投影热路径（2026-10-15 用户裁定）。
+// 资格 = 条目实际变化 ∧ 被启用策略引用 ∧ 未被受信代理网段引用
+// （trusted_proxy_range_refs 渲染静态展开进配置本体，文件热感知不可达，须
+// 全量链 /load 收敛）。资格内以事务视图渲染重写投影文件（原子 tmp+rename）
+// 并与运行配置结构级比对：证实零发射面变化 → 提交+业务审计+热路径说明
+// （零 /load，@ipListFast 匹配器 ≤1s stat 热感知；不落「重载」审计——审计
+// 真实性）；未证实（发射面变化）/不可判定（运行配置不可读）/生成被拒 →
+// 返回 false 落回 finishTxApply 全量链（拒绝同口径 400+回滚）。已持
+// caddyOpMu（=CaddyOpLock，调用方写路径临界区），渲染与 /load 永不交错。
+// 返回 true = 请求已终结（调用方立即 return）。
+func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, entriesChanged bool, f txApplyFinish) bool {
+	if !entriesChanged {
+		return false // 元数据-only 变更零发射面影响，维持既有全量链（同字节短路）
+	}
+	listID, perr := strconv.ParseInt(id, 10, 64)
+	if perr != nil || listID <= 0 {
+		return false
+	}
+	if !services.IPListsReferencedByEnabledPolicy([]int{int(listID)}) ||
+		services.TrustedListsReferencedByTrustedProxy([]int{int(listID)}) {
+		return false
+	}
+	hot, err := h.caddyService.RefreshIPListProjectionsFromTxInLock(tx)
+	if err != nil || !hot {
+		return false
+	}
+	// 热路径收尾：镜像 finishTxApply 成功分支，但零 /load（无重载审计）。
+	if err := tx.Commit(); err != nil {
+		// 2026-09-07 审计 L5：SQLite commit 失败极罕见；apply 侧本次为纯投影
+		// 重写（无 /load），无运行配置回弹面——投影与 DB 的分叉由下次任意
+		// 渲染收敛（同字节跳写保护在役文件）。
+		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", err.Error(), services.AuditResultPart("failure")))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + err.Error()})
+		return true
+	}
+	h.recordCaddyApplyResult(nil) // 比对证实运行配置=已提交 DB 视图，清除既往失败标记
+	recordAudit(c, f.AuditAction, f.Resource, f.AuditDetail)
+	services.Logf("info", "IP 名单热路径：%s（#%s）投影文件已重写，零 Caddy 重载（匹配器 ≤1s 热感知生效）", f.Resource, id)
+	status := f.SuccessStatus
+	if status == 0 {
+		status = http.StatusOK
+	}
+	c.JSON(status, models.APIResponse{Code: 0, Message: f.SuccessMsg, Data: f.Data})
+	return true
 }
 
 // ExportIPList GET /security/ip-lists/:id/export：名单导出为 TXT（每行

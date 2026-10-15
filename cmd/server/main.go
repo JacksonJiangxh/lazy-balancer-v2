@@ -211,6 +211,11 @@ func run() error {
 		isMaster = true
 	}
 	services.SetThreatReloader(caddyReloader)
+	// 投影热路径（2026-10-15 用户裁定：威胁库重载门退役）——名单内容变化的
+	// 引用面收敛改走投影重写（零 /load，@ipListFast 匹配器 ≤1s stat 热感知）；
+	// threatReloader 仅残留受信代理网段引用面（静态展开需 /load）与热路径
+	// 未证实收敛时的 fail-safe 回退。
+	services.SetThreatProjectionRefresher(func() (bool, error) { return caddyService.RefreshIPListProjections() })
 	// 历史问题：自动封禁名单变化后的重载。AU-1（历史）：merge 读改写+重载
 	// 全程持 CaddyOpLock，注入必须为 InLock 变体（caddyReloader 自取锁，
 	// 临界区内重入=死锁）。

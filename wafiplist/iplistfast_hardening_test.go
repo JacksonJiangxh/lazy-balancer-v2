@@ -337,7 +337,7 @@ func TestIPListFast_scaleInvariants200k(t *testing.T) {
 
 // 构建期去重（v2.3.x 强化）：同一文件被多个规则引用时，一次 Caddy reload 内
 // N 个算子工厂调用共享同一份检索结构——stat 形态（mtime+size）命中即复用
-// （策略名单内容寻址：同路径=同内容；威胁库原子换名 mtime 必变）。
+// （策略名单稳定命名同字节跳写 mtime 不变；热路径原子重写/威胁库换名 mtime 必变）。
 func TestIPListFast_factoryDedupSharedState(t *testing.T) {
 	dir := useAllowedDir(t)
 	path := writeListFile(t, dir, "dedup.txt", []string{"203.0.113.7"})

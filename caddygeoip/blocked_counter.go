@@ -79,19 +79,13 @@ func (SecurityBlockedCounter) CaddyModule() caddy.ModuleInfo {
 
 // Provision 注册计数器到 Caddy 的 metrics registry(非默认 registry——
 // 默认 registry 的指标不暴露在 Caddy /metrics 端点);registerOrExisting
-// 保证 reload 幂等(重复注册复用实例,不 panic)。同时启动耗时侧车写管线
-// 引用（PLUG-N1 历史——本 handler 是拦截点耗时写点之一）。
+// 保证 reload 幂等(重复注册复用实例,不 panic)。计时写目标是进程内注册表
+// （auditTimingRecord，auditwriter.go）——无后台管线生命周期，本 handler
+// 不再持有 Provision/Cleanup 引用计数（历史侧车退役）。
 func (h *SecurityBlockedCounter) Provision(ctx caddy.Context) error {
 	if reg := ctx.GetMetricsRegistry(); reg != nil {
 		h.metrics = newSecurityBlockedCounterVec(reg)
 	}
-	securityTimingWriterAcquire()
-	return nil
-}
-
-// Cleanup 释放本 handler 的耗时侧车写管线引用（PLUG-N1 历史）。
-func (h *SecurityBlockedCounter) Cleanup() error {
-	securityTimingWriterRelease()
 	return nil
 }
 
@@ -99,15 +93,16 @@ func (h *SecurityBlockedCounter) Cleanup() error {
 // 4xx status,且 len(ID)==16[coraza tx.ID] 或 status==429[限流])时按规则计数;
 // 上游 4xx 不产 HandlerError(反向代理直写响应)不误计;返回值原样透传。
 //
-// 安全处理耗时(2026-09-27 用户裁定):请求进入时注入 X-Lb-Security-Timing-Id
-// 请求头(coraza 审计日志的 request.headers 天然收录该头——摄取管道从审计
-// 条目读出同一 ID 即可对上),next 返回后记录耗时到共享表——弹框「处理耗时」
-// 的数据源。写侧在本方法(拦截事件)+security_timing_pre/end(放行事件);
-// 读侧在 internal/services/securityevents.go 的 securityTimingLoad(tick 级
-// 合并 map+读后截断)。
+// 安全处理耗时(2026-09-27 用户裁定;历史侧车退役):请求进入时注入
+// X-Lb-Security-Timing-Id 请求头(coraza 审计日志 request.headers 天然收录——
+// 审计写插件从审计事务头提取该 ID 作进程内计时注册表的关联键),next 返回后
+// 把耗时写入注册表——经审计写插件注入审计行 lb_timing 字段,弹框「处理耗时」
+// 的数据源。写侧在本方法(拦截事件+终态标记)+security_timing_pre/end(放行
+// 事件分段);读侧在 internal/services/securityevents.go 的
+// securityEventsParseTransaction(直接读审计行内嵌 lb_timing)。
 func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	// 安全处理耗时:注入 timing ID + 起始纳秒双头(coraza 审计日志收录 ID;
-	// SecurityTimingPre 记 :pre 后把起始头重写为「预检完成」分段锚点,
+	// SecurityTimingPre 记 pre 后把起始头重写为「预检完成」分段锚点,
 	// SecurityTimingEnd 读锚点计算 logged 事件的 WAF 段耗时)。起始头与 ID 头
 	// 均在 proxyRequestHeaders 删除清单剥离,不上泄上游。
 	timingID := securityTimingID()
@@ -133,20 +128,27 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		herr.StatusCode >= 400 && herr.StatusCode < 500 &&
 		(len(herr.ID) == 16 || herr.StatusCode == http.StatusTooManyRequests)
 
-	// 安全处理耗时——分段选键(历史,预检拦口径):单一写点保证同 ID 恰一行,
-	// 无双行/取大者混乱。此刻中断已裁决、403 响应尚未写出(错误路由在 Server
-	// 层于本 handler 返回后才执行)——两种键都是纯评估口径:
+	// 安全处理耗时——分段选键(历史,预检拦口径):单一写点保证同 ID 恰一段,
+	// 无双段混乱。此刻中断已裁决、403 响应尚未写出(错误路由在 Server
+	// 层于本 handler 返回后才执行)——两种键都是纯评估口径(决策→计时→注册表
+	// →入队注入的顺序保证降级模式下耗时数字不受污染,见 auditwriter.go):
 	//   起始头仍=注入原值 → 链未抵达预检收点(SecurityTimingPre 未重写锚点)
-	//     =预检段拦(IP ACL/GeoIP/信任/威胁)→ 写 :pre=预检决策耗时;
-	//   头已被重写 → 预检已放行,中断出自 WAF/限流段 → 写 :end=链首至此全链
-	//     (读侧 - :pre 得 WAF 段)。
+	//     =预检段拦(IP ACL/GeoIP/信任/威胁)→ 写 pre=预检决策耗时;
+	//   头已被重写 → 预检已放行,中断出自 WAF/限流段 → 写 end=链首至此全链
+	//     (读侧 - pre 得 WAF 段)。
 	// timingID 为空(随机源失败)时全程无计时,不写(下分支同门)。
 	if timingID != "" && isSecurityBlock {
 		if r.Header.Get(securityTimingStartHeader) == timingStartVal {
-			AppendSecurityTiming(timingID+":pre", time.Since(start).Microseconds())
+			auditTimingRecord(timingID, timingSegmentPre, time.Since(start).Microseconds())
 		} else {
-			AppendSecurityTiming(timingID+":end", time.Since(start).Microseconds())
+			auditTimingRecord(timingID, timingSegmentEnd, time.Since(start).Microseconds())
 		}
+	}
+	// 终态标记:本 handler 是链最外层收点,post-next 时全部分段写点(timing_pre/
+	// timing_end/本方法)均已完成——审计写插件的 drain goroutine 见终态即注入
+	// 落盘,不再等待。计时数字在上方决策点测得,终态标记与注入均不改变数值。
+	if timingID != "" {
+		auditTimingClose(timingID)
 	}
 
 	if isSecurityBlock {
@@ -162,6 +164,5 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 // Interface guards(编译期契约,零运行时成本)。
 var (
 	_ caddy.Provisioner           = (*SecurityBlockedCounter)(nil)
-	_ caddy.CleanerUpper          = (*SecurityBlockedCounter)(nil)
 	_ caddyhttp.MiddlewareHandler = (*SecurityBlockedCounter)(nil)
 )

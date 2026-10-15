@@ -45,3 +45,11 @@ func securityLibrariesMissingDesc() string {
 	}
 	return missing
 }
+
+// SetSecurityLibsDirsForTest 注入 CRS/IP2Region 库路径（handlers 等跨包渲染类
+// 测试用——缺库形态安全链整体不渲染，名单投影/热路径无从谈起）。返回恢复函数。
+func SetSecurityLibsDirsForTest(crsDir, xdbPath string) (restore func()) {
+	oldCRS, oldXdb := crsDirectivesDir, ip2regionLivePath
+	crsDirectivesDir, ip2regionLivePath = crsDir, xdbPath
+	return func() { crsDirectivesDir, ip2regionLivePath = oldCRS, oldXdb }
+}

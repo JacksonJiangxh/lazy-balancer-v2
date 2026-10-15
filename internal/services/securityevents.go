@@ -74,7 +74,9 @@ type securityEventsAuditMessage struct {
 // securityEventsAuditTransaction mirrors the Coraza JSON audit envelope:
 // messages is a TOP-LEVEL sibling of transaction, not nested inside it.
 // coraza v3 审计格式没有 data.score 字段——异常评分藏在两处（见
-// securityEventsExtractAnomalyScore）。
+// securityEventsExtractAnomalyScore）。lb_timing 是本系统审计写插件
+// （caddygeoip auditwriter.go）注入的顶层扩展字段：安全链分段耗时（µs），
+// 指针区分「缺席」与 0（0µs 是合法计时值）。
 type securityEventsAuditTransaction struct {
 	Transaction struct {
 		UnixTimestamp int64  `json:"unix_timestamp"`
@@ -92,6 +94,10 @@ type securityEventsAuditTransaction struct {
 		IsInterrupted bool `json:"is_interrupted"`
 	} `json:"transaction"`
 	Messages []securityEventsAuditMessage `json:"messages"`
+	LbTiming struct {
+		Pre *int64 `json:"pre_us"`
+		End *int64 `json:"end_us"`
+	} `json:"lb_timing"`
 }
 
 // securityEventsTotalScoreRe 匹配 CRS 阻断/检测评估规则（949110/949111/959100
@@ -191,17 +197,18 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 		rec.RuleMsg = doc.Messages[0].Message
 	}
 	rec.AnomalyScore = securityEventsExtractAnomalyScore(doc.Messages)
-	// 安全处理耗时查表必须在 RuleTriggered 赋值之后——分段选值
-	// (securityEventsStageDuration)按规则归属与动作选 :pre/:end-:pre/:end,
-	// 空规则 ID 会恒走 WAF 分支(实测 rule 2 事件拿到 WAF 段值)。
-	if tid := securityEventsFirstHeader(tx.Request.Headers, "x-lb-security-timing-id"); tid != "" {
-		rec.DurationUs = securityEventsStageDuration(tid, rec.RuleTriggered, tx.IsInterrupted)
-		if v, ok := securityTimingLookup(tid + ":pre"); ok {
-			rec.PrecheckUs = v
-		} else if securityEventsIsPrecheckRule(rec.RuleTriggered) {
-			// 降级形态(:pre 缺失,头对缺失/竞态):预检族 duration=兜底值,预检耗时同值
-			rec.PrecheckUs = rec.DurationUs
-		}
+	// 安全处理耗时（2026-09-27 分段计时；历史侧车退役）：耗时由审计写插件
+	// （caddygeoip auditwriter.go）注入本行顶层 lb_timing 字段，直接取值。
+	// 选值规则:预检段规则(IP ACL/GeoIP/信任/威胁,id 1-14 与 800xxx)取 pre_us
+	// (预检拦由拦截写点代记,决策口径);WAF 段规则(CRS 9xxxxx/自定义)拦截
+	// 事件取 end_us-pre_us、logged 事件取 end_us(=预检后锚点起算的 WAF 段值,
+	// 见 securityEventsStageDurationEmbedded)。缺席字段保持 0,UI 显示「—」。
+	rec.DurationUs = securityEventsStageDurationEmbedded(doc.LbTiming.Pre, doc.LbTiming.End, rec.RuleTriggered, tx.IsInterrupted)
+	if doc.LbTiming.Pre != nil && *doc.LbTiming.Pre >= 0 {
+		rec.PrecheckUs = *doc.LbTiming.Pre
+	} else if securityEventsIsPrecheckRule(rec.RuleTriggered) {
+		// 降级形态(pre 缺席,头对缺失/竞态):预检族 duration=兜底值,预检耗时同值
+		rec.PrecheckUs = rec.DurationUs
 	}
 	return rec, nil
 }
@@ -1095,13 +1102,8 @@ func (t *securityEventsTailer) securityEventsTick() error {
 	if err != nil {
 		return fmt.Errorf("security events: read offset: %w", err)
 	}
-	// 安全处理耗时（2026-09-27 引入；历史问题-01 历史前置）：每 tick 消费
-	// 耗时侧车文件到 tick 级 map——必须先于下方空闲提前返回。侧车写侧
-	// （caddygeoip timing pre/end）逐请求无条件追加，而 audit log 是
-	// SecAuditEngine RelevantOnly 门控（仅相关事务落盘）——audit 文件无新增
-	// 字节 ≠ 侧车无新增字节；此前加载挂在空闲返回之后的 pass 路径上，静默
-	// 请求流（不产 relevant 事务）会让侧车只增不截。
-	securityTimingLoad()
+	// 安全处理耗时：历史侧车退役——耗时随审计行内嵌 lb_timing 字段流转，
+	// 本 tick 无需前置加载任何侧车文件；空闲提前返回的消费面语义不变。
 	if securityEventsShouldReset(offset, info.Size(), t.lastInfo, info) {
 		Logf("info", "security events ingestion: audit log rotated or truncated, resetting offset to 0")
 		offset = 0
@@ -1407,7 +1409,8 @@ func securityEventsIngestDeltaFrom(path string, from int64, archive bool) error 
 		return fmt.Errorf("security events: open delta source: %w", err)
 	}
 	defer f.Close()
-	securityTimingLoadReadOnly() // 历史问题-2:补采路径也需加载侧车耗时(只读不截断)
+	// 补采路径的耗时随审计行内嵌 lb_timing 字段自带（历史侧车退役，
+	// 历史问题-2 的「补采也需加载侧车」前置不再需要）。
 	rules, bindings, policyByID, err := securityEventsLoadMappings()
 	if err != nil {
 		return err
@@ -1499,130 +1502,37 @@ func runIngestionLoop(ctx context.Context) error {
 	}
 }
 
-// —— 安全处理耗时侧车文件（2026-09-27 用户裁定）——
-// 跨进程通信:写侧在 Caddy 二进制(caddygeoip/blocked_counter 经
-// AppendSecurityTiming 追加「<id> <us>」行),读侧在本进程(每 audit pass 前
-// securityTimingLoad 全量读入 tick 级 map);关联键=blocked_counter 注入请求头
-// X-Lb-Security-Timing-Id(coraza 审计日志 request.headers 天然收录)。
-// 生命周期:tick 级 map(pass 结束后下轮 Load 重建,旧条目自然丢弃);文件由
-// 读侧「读后截断」清理(每 tick 全量消费后归零;写侧无独立守护——读侧
-// 停摆的极端形态文件会增长,正常量级(数秒内消费的
-// <30B/行)远不触界。读失败(首启动/权限)静默降级——耗时缺失不阻断摄取。
-var securityTimingTickMap map[string]int64
+// —— 安全处理耗时（2026-09-27 分段计时；历史侧车退役）——
+// 耗时不再经  侧车文件跨进程传递：审计写插件
+// （caddygeoip auditwriter.go）在 Caddy 进程内把 per-request 分段耗时注入
+// 审计行顶层 lb_timing 字段（{"pre_us":N,"end_us":M}，缺席分段省略），摄取
+// 管道解析审计行时直接取值——零文件、零截断协议、零 tick 级查表，补采路径
+// 天然携带自身耗时。
 
-// securityTimingLogPath 与 caddygeoip.securityTimingLogPath 同值——两模块
-// 跨二进制,路径各自持有(约定见 caddygeoip/security_timing.go);var 而非
-// const 是为了测试可覆写(同 auditLogPath 模式)。
-var securityTimingLogPath = "/app/logs/waf-audit/security-timing.log"
-
-// securityTimingLoad 全量读入耗时侧车文件(微秒)到 tick 级 map(覆盖式重建)。
-// 文件量级:数秒消费窗口 × <30B/行,常态 <100KB;全量重读成本可忽略。
-func securityTimingLoad() {
-	// 合并式加载(2026-09-27 竞态修复): :pre 与 :end 可能落在不同截断周期——
-	// 替换式 map 会让先到的 :pre 随上轮截断丢失、后到的 :end 单独在场,查表
-	// miss 出 duration=0(实测 3 请求 2 miss)。合并进既有 map 跨 tick 保活,
-	// 超量(>5000)时清空——数秒消费窗口外的条目已无人查询,清空无副作用。
-	if securityTimingTickMap == nil {
-		securityTimingTickMap = make(map[string]int64, 64)
-	} else if len(securityTimingTickMap) > 5000 {
-		securityTimingTickMap = make(map[string]int64, 64)
-	}
-	data, err := os.ReadFile(securityTimingLogPath)
-	if err != nil {
-		return // 首启动/权限/无安全流量——静默,查表 miss(耗时 0)
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		id, us, ok := strings.Cut(line, " ")
-		if !ok || id == "" {
-			continue
-		}
-		v, err := strconv.ParseInt(us, 10, 64)
-		if err != nil || v < 0 {
-			continue
-		}
-		securityTimingTickMap[id] = v
-	}
-	// 读后截断:O_APPEND 语义下 Caddy 侧写句柄恒写文件尾,截断安全;窗口内
-	// (读→截断微秒级)新写入的行会丢——下轮读到(合并 map 跨 tick 保活,
-	// 已读条目不丢);仅读后写入且截断先于下轮的极端窗口丢一行,可接受。
-	_ = os.Truncate(securityTimingLogPath, 0)
-}
-
-// securityTimingLoadReadOnly 只读加载侧车文件到 tick map(不截断)——供
-// 补采路径使用(截断权归 tick 路径,补采只补齐冷启动后首窗口的查表数据)。
-func securityTimingLoadReadOnly() {
-	if securityTimingTickMap == nil {
-		securityTimingTickMap = make(map[string]int64, 64)
-	} else if len(securityTimingTickMap) > 5000 {
-		return
-	}
-	data, err := os.ReadFile(securityTimingLogPath)
-	if err != nil {
-		return
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		id, us, ok := strings.Cut(line, " ")
-		if !ok || id == "" {
-			continue
-		}
-		v, err := strconv.ParseInt(us, 10, 64)
-		if err != nil || v < 0 {
-			continue
-		}
-		securityTimingTickMap[id] = v
-	}
-}
-
-// securityTimingLookup 按 timing ID 查本 tick 的耗时(读侧——ParseTransaction 消费)。
-func securityTimingLookup(id string) (int64, bool) {
-	if securityTimingTickMap == nil {
-		return 0, false
-	}
-	v, ok := securityTimingTickMap[id]
-	return v, ok
-}
-
-// securityEventsIsPrecheckRule 判定规则 ID 是否预检段——IP ACL(2/4/5/7)、
-// 信任(3/12)、GeoIP(8)、威胁情报(14)与 GeoIP 区域规则(800xxx,6 位 8 开头)。
-// 与 stageCategorizeAttack 的预检分支同口径。
-func securityEventsIsPrecheckRule(ruleID string) bool {
-	switch ruleID {
-	case "2", "3", "4", "5", "7", "8", "12", "14":
-		return true
-	}
-	return len(ruleID) == 6 && strings.HasPrefix(ruleID, "8")
-}
-
-// securityEventsStageDuration 按 timing ID+规则归属选分段耗时(µs)。
-// 分段键二态契约（历史，与写侧 caddygeoip 分段选键/锚点交接配对）：
+// securityEventsStageDurationEmbedded 按规则归属与事件动作从审计行内嵌
+// lb_timing 字段选分段耗时（µs）。分段二态契约（第 75/76 轮，与写侧
+// caddygeoip 分段选键/锚点交接配对）：
 //
-//	:pre=预检决策耗时(放行=timing_pre 收点记;预检拦=blocked_counter 代记);
-//	:end=拦截事件 链首→中断全链(blocked_counter) / logged 事件 预检后→链末
-//	     (timing_end 读重写后的分段锚点)=WAF 段值。
+//	pre_us=预检决策耗时(放行=timing_pre 收点记;预检拦=blocked_counter 代记);
+//	end_us=拦截事件 链首→中断全链(blocked_counter) / logged 事件 预检后→链末
+//	       (timing_end 读重写后的分段锚点)=WAF 段值。
 //
-// 预检段规则: :pre 优先;miss 回退 :end(头对缺失/竞态降级形态)。
-// WAF 段规则按事件动作二态: 拦截(interrupted)=:end-:pre 隔离 WAF 成本;
-// logged=:end 即段值直接取用(锚点交接后减法会混入跨锚点垃圾差值)。
-func securityEventsStageDuration(timingID, ruleID string, interrupted bool) int64 {
+// 预检段规则: pre_us 优先;缺席回退 end_us(头对缺失/竞态降级形态)。
+// WAF 段规则按事件动作二态: 拦截(interrupted)=end_us-pre_us 隔离 WAF 成本;
+// logged=end_us 即段值直接取用(锚点交接后减法会混入跨锚点垃圾差值)。
+// 负值视同缺席(防御畸形注入;写侧时序值恒非负);双段均为负差退化 end_us。
+func securityEventsStageDurationEmbedded(pre, end *int64, ruleID string, interrupted bool) int64 {
+	preV, preOK := timingUsOrNil(pre)
+	endV, endOK := timingUsOrNil(end)
 	if securityEventsIsPrecheckRule(ruleID) {
-		if v, ok := securityTimingLookup(timingID + ":pre"); ok {
-			return v
+		if preOK {
+			return preV
 		}
-		if v, ok := securityTimingLookup(timingID + ":end"); ok {
-			return v
+		if endOK {
+			return endV
 		}
 		return 0
 	}
-	endV, endOK := securityTimingLookup(timingID + ":end")
-	preV, preOK := securityTimingLookup(timingID + ":pre")
 	if interrupted {
 		if endOK && preOK && endV >= preV {
 			return endV - preV
@@ -1636,4 +1546,23 @@ func securityEventsStageDuration(timingID, ruleID string, interrupted bool) int6
 		return endV
 	}
 	return 0
+}
+
+// timingUsOrNil 非负指针解引用（负值视同缺席）。
+func timingUsOrNil(v *int64) (int64, bool) {
+	if v == nil || *v < 0 {
+		return 0, false
+	}
+	return *v, true
+}
+
+// securityEventsIsPrecheckRule 判定规则 ID 是否预检段——IP ACL(2/4/5/7)、
+// 信任(3/12)、GeoIP(8)、威胁情报(14)与 GeoIP 区域规则(800xxx,6 位 8 开头)。
+// 与 stageCategorizeAttack 的预检分支同口径。
+func securityEventsIsPrecheckRule(ruleID string) bool {
+	switch ruleID {
+	case "2", "3", "4", "5", "7", "8", "12", "14":
+		return true
+	}
+	return len(ruleID) == 6 && strings.HasPrefix(ruleID, "8")
 }

@@ -249,19 +249,18 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 }
 
 // wafAuditHousekeeping waf-audit 目录超阈兜底（F-历史问题-01，历史）——
-// audit.log 轮转与 security-timing.log 读后截断的正常驱动面是
-// security-events-ingestion daemon 的 2s tick（SecurityEventsPollOnce）；
-// daemon 停机（任务被禁用/取消）时两文件无守护无界增长——写侧（Coraza
-// 审计流/caddygeoip 耗时侧车）在 Caddy 进程内持续追加，本进程不消费即
-// 只增不减。此处按 audit_log_size_mb 阈值在 log-cleanup 任务体（24h 节拍）
-// 内兜底：
+// audit.log 轮转的正常驱动面是 security-events-ingestion daemon 的 2s tick
+// （SecurityEventsPollOnce）；daemon 停机（任务被禁用/取消）时文件无守护
+// 无界增长——写侧（Coraza 审计流，经 caddygeoip 审计写插件异步批量落盘）
+// 在 Caddy 进程内持续追加，本进程不消费即只增不减。此处按 audit_log_size_mb
+// 阈值在 log-cleanup 任务体（24h 节拍）内兜底：
 //
 //   - audit.log 超阈 → SecurityEventsPollOnce()（与 daemon tick 同锁同路径，
 //     摄取+pending-delta+copytruncate 全套安全链——绝不无补采截断；daemon
 //     在场时文件本不会积到阈值，触发即等价一次普通 tick，无竞争）。
-//   - security-timing.log 超阈 → 直接截断。侧车仅是耗时增强数据，超阈即读侧
-//     长期未消费、残留行本不会被任何消费者读取；与正常「读后截断」同形语义
-//     （既有注释已接受读后写入的丢行窗口）。
+//
+// （历史： 耗时侧车退役——耗时随审计行内嵌流转，
+// 本目录仅剩 audit.log 家族文件，无需独立截断兜底。）
 //
 // 返回动作明细（log-cleanup 任务日志与运行日志双写——清理了哪个文件必须
 // 可见，2026-10-01 用户裁定口径）。
@@ -274,17 +273,6 @@ func wafAuditHousekeeping() []string {
 		if after, aerr := os.Stat(auditLogPath); aerr == nil && after.Size() < sizeBefore {
 			actions = append(actions, fmt.Sprintf("audit.log %.1fMB≥%dMB（摄取+轮转）",
 				float64(sizeBefore)/1024/1024, maxBytes/1024/1024))
-		}
-	}
-	// 耗时侧车：上方 audit.log 触发 poll 时 daemon tick 的 securityTimingLoad
-	// 已「读后截断」一并收敛；此处仍超阈 = 侧车独立积压（audit 静默请求流或
-	// daemon 停机），直接截断。
-	if info, err := os.Stat(securityTimingLogPath); err == nil && info.Size() >= maxBytes {
-		if terr := os.Truncate(securityTimingLogPath, 0); terr == nil {
-			actions = append(actions, fmt.Sprintf("security-timing.log %.1fMB≥%dMB（截断）",
-				float64(info.Size())/1024/1024, maxBytes/1024/1024))
-		} else {
-			Logf("error", "waf-audit 兜底：截断 %s 失败: %v", securityTimingLogPath, terr)
 		}
 	}
 	for _, action := range actions {

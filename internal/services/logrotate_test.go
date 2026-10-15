@@ -133,10 +133,10 @@ func TestTaskLogsHousekeeping_reportsDetails(t *testing.T) {
 }
 
 // F-历史问题-01（历史）：security-events-ingestion daemon 停机时
-// audit.log/security-timing.log 无守护无界增长（写侧在 Caddy 进程内持续追加，
-// 轮转/读后截断仅由 daemon 2s tick 驱动）——log-cleanup 任务体补 waf-audit
-// 超阈兜底：audit.log 走 SecurityEventsPollOnce 全套安全链（daemon 在场时
-// 等价一次普通 tick），耗时侧车独立超阈直接截断（「读后截断」同形语义）。
+// audit.log 无守护无界增长（写侧在 Caddy 进程内持续追加，轮转仅由 daemon
+// 2s tick 驱动）——log-cleanup 任务体补 waf-audit 超阈兜底：audit.log 走
+// SecurityEventsPollOnce 全套安全链（daemon 在场时等价一次普通 tick）。
+// （历史：侧车退役，耗时随审计行内嵌流转。）
 func TestRuntimeLogCleanupOnce_wafAuditFallbackWhenIngestionStopped(t *testing.T) {
 	oldDB, oldM, oldA := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -147,13 +147,12 @@ func TestRuntimeLogCleanupOnce_wafAuditFallbackWhenIngestionStopped(t *testing.T
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
 	offsetPath := filepath.Join(dir, "security_events.offset")
-	timingPath := filepath.Join(dir, "security-timing.log")
-	oldLogPath, oldOffsetPath, oldSizeBytes, oldTimingPath := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, securityTimingLogPath
-	auditLogPath, securityEventsOffsetPath, securityTimingLogPath = logPath, offsetPath, timingPath
+	oldLogPath, oldOffsetPath, oldSizeBytes := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes
+	auditLogPath, securityEventsOffsetPath = logPath, offsetPath
 	auditLogSizeBytes = func() int64 { return 1024 }
 	resetSecurityEventsPollState(t)
 	t.Cleanup(func() {
-		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, securityTimingLogPath = oldLogPath, oldOffsetPath, oldSizeBytes, oldTimingPath
+		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes = oldLogPath, oldOffsetPath, oldSizeBytes
 	})
 
 	// daemon 停机形态：audit.log 超阈（2KB > 1KB 阈值）且无人轮转。
@@ -172,21 +171,5 @@ func TestRuntimeLogCleanupOnce_wafAuditFallbackWhenIngestionStopped(t *testing.T
 	}
 	if len(res.WafAudit) == 0 {
 		t.Fatal("WafAudit 明细为空——兜底动作必须可见（2026-10-01 用户裁定口径）")
-	}
-
-	// 耗时侧车独立超阈（audit.log 未超阈）：直接截断收敛。
-	if err := os.WriteFile(logPath, []byte("tiny"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(timingPath, bytes.Repeat([]byte("y"), 2048), 0644); err != nil {
-		t.Fatal(err)
-	}
-	RuntimeLogCleanupOnce(filepath.Join(dir, "app.log"))
-	if st, err := os.Stat(timingPath); err != nil || st.Size() != 0 {
-		sz := int64(-1)
-		if st != nil {
-			sz = st.Size()
-		}
-		t.Fatalf("security-timing.log 兜底后 size=%d err=%v，应已截断为 0", sz, err)
 	}
 }
