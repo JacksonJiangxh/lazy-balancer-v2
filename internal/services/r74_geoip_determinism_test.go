@@ -85,7 +85,7 @@ func TestRenderDeterminism_geoipViewByteIdentical(t *testing.T) {
 
 	// G1 验收钉在 buildIPPrecheckDirectives（geoipLocOperator 的发射落点——
 	// 阶段 1 预检引擎段）：同 DB 视图两次渲染逐字节相同。
-	first, err := buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 403)
+	first, err := buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 403, "lb_test")
 	if err != nil {
 		t.Fatalf("first render: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestRenderDeterminism_geoipViewByteIdentical(t *testing.T) {
 		t.Fatalf("geoip expansion missing from directives:\n%s", first)
 	}
 	for range 50 {
-		again, err := buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 403)
+		again, err := buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 403, "lb_test")
 		if err != nil {
 			t.Fatalf("re-render: %v", err)
 		}

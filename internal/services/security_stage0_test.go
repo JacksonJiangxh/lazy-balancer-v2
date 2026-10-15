@@ -149,7 +149,7 @@ func TestTrustedDetection_id12InPrecheckAndEngines(t *testing.T) {
 // 由渲染链按规则绑定的 stage0 保留检测策略并集透传。
 func TestBuildCorazaDirectives_stage0DetectionTrustEmitsId12(t *testing.T) {
 	policy := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, []string{"10.0.0.9", "192.168.1.0/24"}))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test", []string{"10.0.0.9", "192.168.1.0/24"}))
 	want := `"id:12,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly"`
 	if !strings.Contains(directives, want) || !strings.Contains(directives, "@ipListFast ") {
 		t.Fatalf("engine must emit id:12 for stage0 detection trust union:\n%s", directives)
@@ -158,7 +158,7 @@ func TestBuildCorazaDirectives_stage0DetectionTrustEmitsId12(t *testing.T) {
 		t.Fatalf("id:12 名单文件=%q, want 两条聚合排序条目", got)
 	}
 	// 缺省（无第 6 参）零发射——存量调用形状不漂移。
-	plain := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	plain := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if strings.Contains(plain, "id:12,") {
 		t.Fatalf("engine without stage0 trust must not emit id:12:\n%s", plain)
 	}

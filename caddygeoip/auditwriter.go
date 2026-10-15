@@ -68,9 +68,11 @@ var (
 	// 兜底（低流量下 bufio 滞留行不超周期）。
 	auditFlushThreshold = 32 * 1024
 	auditFlushInterval  = 500 * time.Millisecond
-	// auditTimingWaitLimit drain 对迟到分段的限时等待：正常形态（blocked_counter
-	// 是链最外层收点，紧随 coraza 中间件 defer）等待 <1ms；上限仅兜底异常
-	// 形态（计时写点缺失），超时按已到场分段注入。
+	// auditTimingWaitLimit drain 对「条目在场但未终态」分段的限时等待：正常形态
+	// （blocked_counter 是链最外层收点，紧随 coraza 中间件 defer）等待 <1ms；
+	// 上限仅兜底异常形态（计时写点缺失），超时按已到场分段注入。未知 tid
+	// （注册表无条目）不进本等待——auditTimingWait 首轮查表未命中即返（AUD-1，
+	// 第 76 轮：单 drain goroutine 逐行满等=无背压阀下的 drain 沉陷）。
 	auditTimingWaitLimit = 2 * time.Second
 	auditTimingPollStep  = 200 * time.Microsecond
 	// auditSyncTimingWaitLimit 同步回退写（管线已关的重载窗口在途行）的计时
@@ -172,27 +174,40 @@ func auditTimingClose(id string) {
 
 // auditTimingWait 限时等待该请求的计时终态并返回快照。正常形态下 blocked_counter
 // 在 coraza 中间件 defer 之后数微秒内置位终态，等待≈一个调度间隙；上限只兜底
-// 计时写点缺失的异常形态（超时返回已到场分段，行不丢、缺段省略）。未知 id
-// （无 timing 头的审计行）立即返回空快照。
+// 「条目在场但未终态」的异常形态（计时写点缺失，超时返回已到场分段，行不丢、
+// 缺段省略）。id 为空（无 timing 头的审计行）或首轮查表无条目（未知 tid）立即
+// 返回空快照。
+//
+// AUD-1（第 76 轮）：未知 tid 首轮即返，不轮询到超时。「条目暂未创建」的唯一
+// 合法窗口是同一请求 goroutine 内 Write（coraza defer ProcessLogging）→
+// blocked_counter 收点置位终态之间的微秒级间隙，而 drain 侧先格式化（整行
+// json.Marshal）再查表，恒晚于该间隙——首轮未命中只可能是陈旧行（队列积压超
+// TTL，条目已被清扫）或写点缺失的异常行，分段数据永不到场。旧行为对未知 tid
+// 轮询满超时：单 drain goroutine × 逐行满等 2s × 入队阻塞式零丢弃（无背压阀）
+// = 积压行批量到场时 drain 沉陷、请求路径被拖住。代价：预检拦行的终态由
+// blocked_counter post-next 在 Write 后微秒级补写，首轮恰落在该间隙内的行
+// （drain 抢先完成格式化的极小竞态窗）不注入 lb_timing——耗时是增强信息，
+// 展示层报「—」，可接受。
 func auditTimingWait(id string, timeout time.Duration) auditTimingSnapshot {
 	if id == "" {
+		return auditTimingSnapshot{}
+	}
+	auditTimingMu.Lock()
+	e := auditTimingEntries[id]
+	auditTimingMu.Unlock()
+	if e == nil {
 		return auditTimingSnapshot{}
 	}
 	deadline := time.Now().Add(timeout)
 	var lastSeen auditTimingSnapshot
 	for {
-		auditTimingMu.Lock()
-		e := auditTimingEntries[id]
-		auditTimingMu.Unlock()
-		if e != nil {
-			e.mu.Lock()
-			snap := auditTimingSnapshot{preUs: e.preUs, preSet: e.preSet, endUs: e.endUs, endSet: e.endSet, closed: e.closed}
-			e.mu.Unlock()
-			if snap.closed {
-				return snap
-			}
-			lastSeen = snap
+		e.mu.Lock()
+		snap := auditTimingSnapshot{preUs: e.preUs, preSet: e.preSet, endUs: e.endUs, endSet: e.endSet, closed: e.closed}
+		e.mu.Unlock()
+		if snap.closed {
+			return snap
 		}
+		lastSeen = snap
 		if time.Now().After(deadline) {
 			// 超时：有部分分段就带部分分段（与退役前读侧「按到场键选值」同形）
 			return lastSeen

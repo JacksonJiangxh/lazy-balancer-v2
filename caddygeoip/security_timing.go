@@ -37,9 +37,9 @@ const (
 // →链末（timing_end 读重写后的分段锚点）。头对缺失或起始时间戳不可解析时静默
 // 跳过（耗时是增强信息，不产生请求路径错误）。
 //
-// 第 76 轮：写入目标从侧车文件 旧侧车逐行追加（有界 channel 非阻塞丢行）
-// 改为进程内注册表（auditTimingRecord）——写入恒成功，由审计写插件的 drain
-// goroutine 注入审计行后落盘（零丢弃）。
+// 第 76 轮：写入目标从旧侧车逐行追加（有界 channel 非阻塞丢行）改为进程内
+// 注册表（auditTimingRecord）——写入恒成功，由审计写插件的 drain goroutine
+// 注入审计行后落盘（零丢弃）。
 func recordSecurityTiming(r *http.Request, segment string) {
 	timingID := r.Header.Get(securityTimingHeader)
 	startNsStr := r.Header.Get(securityTimingStartHeader)

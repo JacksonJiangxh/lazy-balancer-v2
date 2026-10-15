@@ -70,7 +70,7 @@ func TestBuildCorazaDirectives_blockStatusLiftsDenyStatuses(t *testing.T) {
 	}
 
 	// When：以合成码 481 渲染
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 481))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 481, "lb_test"))
 
 	// Then：三处 deny 全部抬码 481；GeoIP 不在策略引擎（预检承接）
 	for _, want := range []string{
@@ -99,7 +99,7 @@ func TestBuildCorazaDirectives_blockStatusLiftsAllowModeDeny(t *testing.T) {
 		IPACLMode:        "allow",
 		IPACLList:        `["198.51.100.7"]`,
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 482))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 482, "lb_test"))
 	if !strings.Contains(directives, `id:2,phase:1,deny,status:482,log,msg:'IP 白名单拒绝'`) {
 		t.Fatalf("allow-mode deny must lift to 482:\n%s", directives)
 	}
@@ -116,7 +116,7 @@ func TestBuildCorazaDirectives_blockStatusLiftsChainedTrustExclusion(t *testing.
 		IPWhitelistEnabled: true,
 		IPWhitelist:        json.RawMessage(`["10.0.0.1"]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", true, 481))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", true, 481, "lb_test"))
 	if !strings.Contains(directives, `id:2,phase:1,deny,status:481,log,msg:'IP 黑名单拒绝',skipAfter:SECURITY_RULES_END,chain`) {
 		t.Fatalf("chained trust-exclusion head must lift to 481:\n%s", directives)
 	}
@@ -135,7 +135,7 @@ func TestBuildCorazaDirectives_blockStatusZeroKeepsLegacyShapes(t *testing.T) {
 		IPACLList:        `["203.0.113.0/24"]`,
 		CustomRules:      json.RawMessage(`[{"id":11,"name":"拒绝规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/admin"}]}]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, `id:2,phase:1,deny,status:403,log,msg:'IP 黑名单拒绝'`) {
 		t.Fatalf("blockStatus=0 must keep 403:\n%s", directives)
 	}
@@ -159,7 +159,7 @@ func TestBuildCorazaDirectives_blockStatusCRSLiftGatedOn949File(t *testing.T) {
 	useCRSDirectivesDir(t, dir)
 
 	// When：blocking 策略 + blockStatus=481
-	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 481))
+	directives := mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 481, "lb_test"))
 
 	// Then：抬码指令存在且位于最后一个 Include 行之后
 	const lift = `SecRuleUpdateActionById 949110 "deny,status:481"`
@@ -175,7 +175,7 @@ func TestBuildCorazaDirectives_blockStatusCRSLiftGatedOn949File(t *testing.T) {
 	emptyDir := t.TempDir()
 	useCRSDirectivesDir(t, emptyDir)
 	// When / Then：不发射抬码指令（949110 不会被注册，发射即编译失败）
-	directives = mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 481))
+	directives = mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 481, "lb_test"))
 	if strings.Contains(directives, "SecRuleUpdateActionById") {
 		t.Fatalf("949 file missing must not emit CRS status lift:\n%s", directives)
 	}

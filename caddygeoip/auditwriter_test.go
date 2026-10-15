@@ -252,6 +252,46 @@ func TestAuditWriter_noTimingHeaderOmitsField(t *testing.T) {
 	}
 }
 
+// Given: 审计行携带 timing ID 头但注册表无该条目（未知 tid：陈旧行积压超 TTL
+//
+//	被清扫/写点缺失异常行），等待上限收窄到可观测量级（200ms，useTestAuditPipeline）
+//
+// When: 事务入队（ProcessLogging）→ drain 侧处理
+// Then: 行在远小于上限的时间内落盘（<80ms——旧行为轮询满上限，恒 ≥200ms 本断言
+//
+//	必红），且不注入 lb_timing——AUD-1 钉：未知 tid 不阻塞单 drain goroutine
+//	（积压行批量到场时逐行满等=无背压阀下的 drain 沉陷，请求路径被入队阻塞拖住）
+func TestAuditPipeline_unknownTidDoesNotBlockDrain(t *testing.T) {
+	useTestAuditPipeline(t)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+
+	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives(strings.Join([]string{
+		"SecRuleEngine On",
+		"SecAuditEngine RelevantOnly",
+		"SecAuditLog " + logPath,
+		"SecAuditLogFormat JSON",
+		"SecAuditLogType lbfile",
+		"SecRule REQUEST_HEADERS:X-Probe \"@streq hit\" \"id:990003,phase:1,deny,status:403,log,msg:'probe'\"",
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("NewWAF: %v", err)
+	}
+
+	// timing ID 头在场（16 字符生产形态）但注册表无条目——不 record 不 close
+	const orphanTID = "0000000000000000"
+	start := time.Now()
+	driveProbeTx(t, waf, orphanTID)
+	line := waitAuditLine(t, logPath)
+	elapsed := time.Since(start)
+	if elapsed > 80*time.Millisecond {
+		t.Fatalf("unknown tid must not block drain (AUD-1): line landed after %v (limit 200ms, old polling behavior >=200ms)", elapsed)
+	}
+	if strings.Contains(line, "lb_timing") {
+		t.Fatalf("unknown tid must inject nothing: %s", line)
+	}
+}
+
 // waitAuditLines 轮询等待临时审计文件出现至少 n 行可解析 JSON（上限 2s）。
 func waitAuditLines(t *testing.T, path string, n int) []string {
 	t.Helper()
@@ -675,11 +715,13 @@ func TestAuditTimingRegistry_recordWaitClose(t *testing.T) {
 	useTestAuditPipeline(t)
 	const id = "0123456789abcdef"
 
-	// 未创建条目时 wait 超时返回空快照（不阻塞超限）
+	// AUD-1（第 76 轮）：未知 tid（注册表无条目）首轮即返空快照——不轮询到超时
+	// （旧行为本断言必红：轮询走满超时）。条目稍后创建也不追加等待（预检拦行
+	// 的微秒级建条窗口由 drain 侧格式化先行吸收，见 auditTimingWait 注释）。
 	start := time.Now()
 	snap := auditTimingWait(id, 30*time.Millisecond)
-	if time.Since(start) < 25*time.Millisecond {
-		t.Fatal("wait for unknown entry must honor timeout")
+	if elapsed := time.Since(start); elapsed > 5*time.Millisecond {
+		t.Fatalf("unknown entry must return immediately (AUD-1), took %v", elapsed)
 	}
 	if snap.preSet || snap.endSet {
 		t.Fatalf("unknown entry must yield empty snapshot: %+v", snap)

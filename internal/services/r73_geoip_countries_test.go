@@ -207,7 +207,7 @@ func TestBuildIPPrecheckDirectives_geoipCountryEntries(t *testing.T) {
 		ID: 7, Mode: "off", GeoIPMode: "deny",
 		GeoIPCountries: json.RawMessage(`["海外","United States","广东省"]`),
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p}, 0, "lb_test"))
 	if !strings.Contains(directives, `广东省(?:/.*)?`) {
 		t.Fatalf("province entry must keep suffix form:\n%s", directives)
 	}

@@ -1,6 +1,7 @@
 // Package services 自动封禁（F73-A）：WAF 事件固定窗口计数 → 阈值判定 →
 // 「自动封禁名单」条目 merge → 引用面收敛（投影热路径优先，2026-10-15：
-// 资格门——被启用策略引用∧非受信代理网段引用——命中即零 /load，@ipListFast
+// 资格门——被启用策略引用（含受信代理网段引用面，同日热路径化，原
+// 「∧非受信代理网段引用」排除合取项已退役）——命中即零 /load，@ipListFast
 // 匹配器 ≤1s stat 热感知；未命中/不可判定/未证实收敛回退全量重载，60s 节流
 // 暂存合并）。
 //
@@ -144,18 +145,21 @@ var autobanReloader func() error
 // autobanProjectionRefresher 投影热路径回调（main.go 注入
 // CaddyService.RefreshIPListProjectionsInLock，2026-10-15 用户裁定）：资格门
 // 命中后的零 /load 收敛——按已提交 DB 视图全量渲染（投影文件为渲染副作用，
-// 原子落盘新内容）后与运行配置结构级比对。返回 (true,nil)=已证实收敛（匹配器
-// ≤1s stat 热感知）；(false,*)=未证实收敛（发射面变化/运行配置不可读/渲染
-// 被拒）——调用方回退 autobanReloader 全量重载（宁可一次重载，不欠引用方
-// 渲染收敛）。InLock 变体（AU-1：merge 读改写+收敛同一 CaddyOpLock 临界区
-// 内直呼，不得自取锁）。
-var autobanProjectionRefresher func() (bool, error)
+// 原子落盘新内容）后与运行配置结构级比对。返回 (ProjectionConverged,nil)=已
+// 证实收敛（匹配器 ≤1s stat 热感知）；ProjectionNeedForce（本轮渲染物化了
+// 证书文件，第 76 轮 CERT-1）/ProjectionFallback（发射面变化/运行配置不可读）
+// 或渲染被拒——调用方回退 autobanReloader 全量重载（InLock 强制形态，宁可
+// 一次重载，不欠引用方渲染收敛，同时满足 R72 W1-1）。InLock 变体（AU-1：
+// merge 读改写+收敛同一 CaddyOpLock 临界区内直呼，不得自取锁）。
+var autobanProjectionRefresher func() (IPListProjectionOutcome, error)
 
 // SetAutobanReloader 注册全量重载回调（nil=清除，测试用）。
 func SetAutobanReloader(fn func() error) { autobanReloader = fn }
 
 // SetAutobanProjectionRefresher 注册投影热路径回调（nil=清除，测试用）。
-func SetAutobanProjectionRefresher(fn func() (bool, error)) { autobanProjectionRefresher = fn }
+func SetAutobanProjectionRefresher(fn func() (IPListProjectionOutcome, error)) {
+	autobanProjectionRefresher = fn
+}
 
 // ---- 配置读写 ----
 
@@ -463,6 +467,22 @@ func autobanSetSuggestions(s []AutobanSuggestion) {
 	autobanSuggestions = s
 }
 
+// AutobanForgetIPs 解封侧计数清零（第 76 轮 F2/AB-1，用户裁定「删除即解封」
+// 语义闭环）：从预置名单移除条目（remove-ip 端点、预置名单差集全量保存两条
+// 解封路径）时调用——不清桶则窗口内旧计数（Count≥threshold 未过期）让下一
+// 轮 merge 在零新流量下立即重封，解封在 ≤1 tick 内被撤销。清桶只重置旧计数：
+// 新流量重新计数、重新达标仍会再封（apidocs「IP 重新达标会被再次封禁」口径
+// 不变）。两解封路径共用本单一入口（新增解封面不得旁路）。
+func AutobanForgetIPs(ips []string) {
+	autobanMu.Lock()
+	defer autobanMu.Unlock()
+	for _, ip := range ips {
+		if ip != "" {
+			delete(autobanWindows, ip)
+		}
+	}
+}
+
 // AutobanSetSuggestionsForTest 直设建议暂存（handlers 层富化钉测用；nil=清空，
 // 与 SetAutobanReloader 同款测试缝约定）。
 func AutobanSetSuggestionsForTest(s []AutobanSuggestion) {
@@ -656,11 +676,12 @@ func autobanMarkReloadFailed(reason string, err error) {
 }
 
 // autobanListHotPathEligible 热路径资格门（与手动名单写路径同一查询核心
-// 单源）：被启用策略引用（ip_acl_list_refs/ip_whitelist_refs）。受信代理
-// 引用面 2026-10-15 同步热路径化（合并网段投影 tp.txt 经
-// http.ip_sources.lb_file ≤1s stat 热感知）——原「非受信代理网段引用」
-// Conjunct 整体退役。查询/解析失败按「被引用」处理（fail-closed——宁可
-// 回退一次全量重载，不欠引用方渲染收敛）。
+// 单源）：被启用策略引用（ip_acl_list_refs/ip_whitelist_refs）∪ 受信代理
+// 网段引用（trusted_proxy_range_refs，tp.txt 投影消费）∪ CRS 排除
+// scope=ip/list 条目的 ListRefs（p<id>-crsxc-N 投影消费）——引用面补全见
+// ipListsReferencedByEnabledPolicyLabeled（第 76 轮 SEC-2）。查询/解析失败
+// 按「被引用」处理（fail-closed——宁可回退一次全量重载，不欠引用方渲染
+// 收敛）。
 func autobanListHotPathEligible(listID int64) bool {
 	if listID <= 0 {
 		return false
@@ -688,13 +709,17 @@ func autobanListHotPathEligible(listID int64) bool {
 func autobanConvergeLocked(reason string, listID int64) autobanReloadState {
 	if autobanProjectionRefresher != nil && autobanListHotPathEligible(listID) {
 		hot, err := autobanProjectionRefresher()
-		if err == nil && hot {
+		if err == nil && hot == ProjectionConverged {
 			Logf("info", "自动封禁名单变化经投影热路径收敛（零 Caddy 重载，匹配器 ≤1s 热感知生效）")
 			return autobanReloadHotApplied
 		}
 		// 未证实收敛/刷新被拒 → 回退 /load 收敛——宁可一次重载，不欠引用方
-		// 渲染收敛（fail-safe 与威胁库收敛门同向）。
-		Logf("info", "自动封禁投影热路径未证实收敛（发射面变化或刷新失败），回退重载 Caddy 配置")
+		// 渲染收敛（fail-safe 与威胁库收敛门同向）。NeedForce（本轮渲染物化
+		// 了证书文件，第 76 轮 CERT-1）同样回退：回退回调为强制形态
+		// （GenerateAndApplyConfigForceInLock），击穿 errSameConfig 让新证书
+		// 进 Caddy 内存；Ruling：NeedForce 走既有 60s 节流暂存可接受——证书
+		// 续期与封禁写撞车是小概率事件，收敛延迟上界=下一轮周期（60s）。
+		Logf("info", "自动封禁投影热路径未证实收敛（发射面变化/证书物化或刷新失败），回退重载 Caddy 配置")
 	}
 	return autobanRequestReloadLocked(reason)
 }

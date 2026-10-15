@@ -59,8 +59,6 @@ func isTimberjackRotationCopy(name string) bool {
 	return trimmed[idx+1] >= '0' && trimmed[idx+1] <= '9'
 }
 
-func sizePtr(b int64) *int64 { return &b }
-
 func dirBytes(path string) (int64, int64, int) {
 	var active, rotated int64
 	count := 0

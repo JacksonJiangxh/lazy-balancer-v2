@@ -64,7 +64,7 @@ func TestDirectiveLineLength_engineGuardViaGiantCustomPattern(t *testing.T) {
 	}
 
 	// When
-	directives, err := BuildCorazaDirectives(policy, nil, "", false, 0)
+	directives, err := BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test")
 
 	// Then
 	if err == nil || !strings.Contains(err.Error(), "48KiB") {
@@ -84,7 +84,7 @@ func TestDirectiveLineLength_normalListsPass(t *testing.T) {
 	}
 
 	// When
-	directives, err := BuildCorazaDirectives(policy, nil, "", false, 0)
+	directives, err := BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test")
 
 	// Then：产物含 @ipListFast 文件引用且名单文件内容完整
 	if err != nil {

@@ -135,7 +135,7 @@ func TestBuildCorazaDirectives_mergedEmission_inlinePlusListEntries(t *testing.T
 	if policy == nil {
 		t.Fatal("expected bound policy to load")
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	// v2.3.x：inline + 列表条目合并进同一 @ipListFast 投影文件（聚合排序）
 	if got := readRenderedIPList(t, directives, "-acl"); got != "1.2.3.4/32\n10.0.0.0/8\n192.0.2.0/24\n" {
 		t.Fatalf("deny 名单文件须含 inline + list 聚合条目: %q", got)
@@ -158,7 +158,7 @@ func TestBuildCorazaDirectives_refsOnlyPolicyStillEmits(t *testing.T) {
 	if policy == nil {
 		t.Fatal("expected bound policy to load")
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if got := readRenderedIPList(t, directives, "-acl"); got != "203.0.113.0/24\n" {
 		t.Fatalf("refs-only policy must emit list entries via file: %q", got)
 	}
@@ -175,7 +175,7 @@ func TestBuildCorazaDirectives_unresolvedPolicyFallsBackToInline(t *testing.T) {
 		IPACLEnabled:  true,
 		IPACLListRefs: "[42]",
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	// 未解析引用（refs 指向不存在的列表）回退 inline-only——名单文件恰含 inline 条目
 	if got := readRenderedIPList(t, directives, "-acl"); got != "1.2.3.4/32\n" {
 		t.Fatalf("inline entries must survive (file=%q), 未解析引用不得追加内容", got)
@@ -198,7 +198,7 @@ func TestBuildCorazaDirectives_whitelistRefsMergedIntoTrustRule(t *testing.T) {
 	if policy == nil {
 		t.Fatal("expected bound policy to load")
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, "id:3,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly") {
 		t.Fatalf("trust rule must be emitted (DetectionOnly, 2026-09-15 裁定):\n%s", directives)
 	}
@@ -243,7 +243,7 @@ func TestBuildIPPrecheckDirectives_mergedDenyUnion(t *testing.T) {
 	p2 := &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`, IPACLListRefs: fmtListIDs(listB)}
 	resolvePolicyIPListRefs([]*models.SecurityPolicy{p1, p2}, nil)
 
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0, "lb_test"))
 	if !strings.Contains(directives, "id:2,phase:1,deny,status:403,log,msg:'IP 黑名单拒绝',skipAfter:SECURITY_RULES_END") {
 		t.Fatalf("deny union rule missing:\n%s", directives)
 	}
@@ -262,7 +262,7 @@ func TestBuildIPPrecheckDirectives_mergedAllowIntersection(t *testing.T) {
 	p2 := &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "allow", IPACLList: `[]`, IPACLListRefs: fmtListIDs(listID)}
 	resolvePolicyIPListRefs([]*models.SecurityPolicy{p1, p2}, nil)
 
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0, "lb_test"))
 	if !strings.Contains(directives, "id:7,phase:1,deny,status:403,log,msg:'IP 白名单拒绝',skipAfter:SECURITY_RULES_END") {
 		t.Fatalf("allow intersection rule missing:\n%s", directives)
 	}

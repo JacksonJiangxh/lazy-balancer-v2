@@ -19,6 +19,15 @@ func SelectRuleCertificate(candidates []CertificateCandidate, ruleDomains string
 	return "", false
 }
 
+// CertDaysRemaining 证书剩余天数单源（第 76 轮 CERT 域冗余收敛：原
+// certjobs/certinfo/certificates/admintls/helpers 五份同表达式——R66 的
+// -int(Ceil(-x)) 与 R67 真截断逐值恒等，表达式已统一，本函数固化单一出口）。
+// 口径=向零截断（CERT42-3/R67 D-2：未过期 23h→0、过期 1 天 3 小时→-1）；
+// 过期判定勿以返回值 ≤0 兼判（-1h 过期返回 0），另用 !now.Before(notAfter)。
+func CertDaysRemaining(notAfter, now time.Time) int {
+	return int(notAfter.Sub(now).Hours() / 24)
+}
+
 // GetCertExpiryThreshold returns the configured cert expiry warning threshold in days.
 // 库值唯一真相（批 3）：cert_expiry_days 类型①值型列直读（COALESCE 30 兜底
 // 删除）——NULL/<=0 由启动回填（db.go defaultUpdates）收敛；此处的降级分支
@@ -152,7 +161,7 @@ func FormatRuleCertInfo(certPEM, source, ruleDomains, caddyID string, expiryDays
 	const timeFmt = "2006-01-02 15:04:05"
 	info.NotBefore = cert.NotBefore.Format(timeFmt)
 	info.NotAfter = cert.NotAfter.Format(timeFmt)
-	info.DaysRemaining = int(cert.NotAfter.Sub(now).Hours() / 24)
+	info.DaysRemaining = CertDaysRemaining(cert.NotAfter, now)
 
 	switch {
 	case !now.Before(cert.NotAfter):

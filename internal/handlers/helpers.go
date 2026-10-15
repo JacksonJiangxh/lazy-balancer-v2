@@ -114,7 +114,7 @@ func parseTLSCertificate(certPEM, keyPEM string) (*CertificateInfo, error) {
 	// 与规则证书卡 formatDate 口径对齐。
 	info.NotBefore = x509Cert.NotBefore.In(services.CurrentLocation()).Format("2006-01-02")
 	info.NotAfter = x509Cert.NotAfter.In(services.CurrentLocation()).Format("2006-01-02")
-	info.DaysUntilExpiry = int(x509Cert.NotAfter.Sub(time.Now()).Hours() / 24)
+	info.DaysUntilExpiry = services.CertDaysRemaining(x509Cert.NotAfter, time.Now())
 
 	// Check if certificate is expired - warning only
 	if time.Now().After(x509Cert.NotAfter) {

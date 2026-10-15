@@ -1883,7 +1883,7 @@ func TestBuildCorazaDirectives_emitsAclExclusionsThresholdAndBlockStatus(t *test
 		t.Fatalf("exclusions/block page not loaded: excluded=%s block_page_id=%d", policy.CRSExcludedRules, policy.BlockPageID)
 	}
 
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	for _, want := range []string{
 		"@ipListFast ",
 		"SecRuleRemoveById 942100",
@@ -1916,7 +1916,7 @@ func TestBuildCorazaDirectives_allowModeDeniesNonListedIPs(t *testing.T) {
 		t.Fatalf("bind allow policy: %v", err)
 	}
 
-	directives := mustDirectives(BuildCorazaDirectives(GetSecurityPolicyForRule("lb_allow"), nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(GetSecurityPolicyForRule("lb_allow"), nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, `!@ipListFast `) {
 		t.Fatalf("allow mode must deny non-listed IPs via negated match:\n%s", directives)
 	}
@@ -1939,7 +1939,7 @@ func TestBuildCorazaDirectives_chainedCustomRuleCarriesActionsOnlyOnStarter(t *t
 			`{"target":"user_agent","operator":"contains","pattern":"sqlmap"}]` +
 			`}]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	lines := strings.Split(directives, "\n")
 	var chainLines []string
 	for _, line := range lines {

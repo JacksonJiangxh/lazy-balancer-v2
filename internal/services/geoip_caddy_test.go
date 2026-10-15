@@ -115,7 +115,7 @@ func TestBuildIPPrecheckDirectives_geoipChain(t *testing.T) {
 		GeoIPMode:      "deny",
 		GeoIPCountries: json.RawMessage(`["海外"]`),
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 0, "lb_test"))
 	if directives == "" {
 		t.Fatal("pure-geoip policy must emit precheck directives (stage 1 owns geoip)")
 	}
@@ -146,7 +146,7 @@ func TestBuildIPPrecheckDirectives_geoipProvincesJoinedAlternation(t *testing.T)
 		GeoIPMode:      "deny",
 		GeoIPCountries: json.RawMessage(`["广东省","北京市"]`),
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 0, "lb_test"))
 	want := `@rx ^(?:广东省(?:/.*)?|北京市(?:/.*)?)$`
 	if !strings.Contains(directives, want) {
 		t.Fatalf("precheck directives missing province alternation %q:\n%s", want, directives)
@@ -163,7 +163,7 @@ func TestBuildIPPrecheckDirectives_geoipDetectionPolicyStillDenies(t *testing.T)
 		GeoIPMode:      "deny",
 		GeoIPCountries: json.RawMessage(`["海外"]`),
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 0, "lb_test"))
 	starter := geoipRuleLine(t, directives)
 	if !strings.Contains(starter, `"id:800009,phase:1,deny,log,msg:'GeoIP 区域拦截',skipAfter:SECURITY_RULES_END,chain"`) {
 		t.Fatalf("detection policy geoip chain must deny in precheck:\n%s", starter)
@@ -183,7 +183,7 @@ func TestBuildIPPrecheckDirectives_geoipMultiPolicyOrderAndTrust(t *testing.T) {
 	p2 := &models.SecurityPolicy{
 		ID: 5, Mode: "blocking", GeoIPMode: "deny", GeoIPCountries: json.RawMessage(`["江苏"]`),
 	}
-	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0))
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0, "lb_test"))
 	idx1 := strings.Index(directives, "id:800003,")
 	idx2 := strings.Index(directives, "id:800005,")
 	// 全局豁免钉（2026-09-20 裁定）：信任并集 DetectionOnly 必须先于全部 GeoIP
@@ -219,7 +219,7 @@ func TestBuildCorazaDirectives_geoipMovedToPrecheck(t *testing.T) {
 		GeoIPMode:      "deny",
 		GeoIPCountries: json.RawMessage(`["海外"]`),
 	}
-	if got := mustDirectives(BuildCorazaDirectives(pure, nil, "", false, 0)); got != "" {
+	if got := mustDirectives(BuildCorazaDirectives(pure, nil, "", false, 0, "lb_test")); got != "" {
 		t.Fatalf("pure-geoip policy must emit no engine directives (geoip lives in precheck), got:\n%s", got)
 	}
 	blocking := &models.SecurityPolicy{
@@ -229,7 +229,7 @@ func TestBuildCorazaDirectives_geoipMovedToPrecheck(t *testing.T) {
 		GeoIPMode:        "deny",
 		GeoIPCountries:   json.RawMessage(`["海外"]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(blocking, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(blocking, nil, "", false, 0, "lb_test"))
 	if strings.Contains(directives, "id:8,") || strings.Contains(directives, "GeoIP 区域拦截") {
 		t.Fatalf("policy engine must not emit geoip rules anymore:\n%s", directives)
 	}
@@ -519,11 +519,11 @@ func TestBuildCorazaDirectives_geoipModeOff_noEmission(t *testing.T) {
 		GeoIPMode:      "off",
 		GeoIPCountries: json.RawMessage(`["海外","广东省"]`),
 	}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if strings.Contains(directives, "GeoIP 区域拦截") || strings.Contains(directives, "id:8") {
 		t.Fatalf("geoip_mode=off must not emit geoip rules, got:\n%s", directives)
 	}
-	if precheck := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 0)); strings.Contains(precheck, "GeoIP 区域拦截") || strings.Contains(precheck, "id:800042") {
+	if precheck := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 0, "lb_test")); strings.Contains(precheck, "GeoIP 区域拦截") || strings.Contains(precheck, "id:800042") {
 		t.Fatalf("geoip_mode=off must not emit precheck geoip chains, got:\n%s", precheck)
 	}
 }

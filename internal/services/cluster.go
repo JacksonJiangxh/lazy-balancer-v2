@@ -320,6 +320,13 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	}
 	// 自动备份：v2.0 引擎 Scheduled 驱动（RunsOn=MasterOnly 角色门）——
 	// promote 后由引擎 SetRole 使能，无需单独拉起。
+	// C7（第 76 轮）：引擎角色显式直调收口——与 BecomeSlave 侧对称（原仅经
+	// 三管理器 SetMasterRole 间接传播，三管理器同时为 nil 时引擎角色不翻转，
+	// master-only 任务升主后不恢复调度；生产恒初始化故不可达，防御性收敛）。
+	// 管理器路径保留（内部转调引擎=幂等重申）。
+	if te := TaskEngine(); te != nil {
+		te.SetRole(true)
+	}
 	if crsManager := GetCRSUpdateManager(); crsManager != nil {
 		crsManager.SetMasterRole(true)
 	}

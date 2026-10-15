@@ -60,7 +60,6 @@ type TaskInfo struct {
 	Runs24h      int          `json:"runs_24h"`
 	Success24h   int          `json:"success_24h"`
 	Fail24h      int          `json:"fail_24h"`
-	DetailHint   string       `json:"detail_hint,omitempty"` // 前端详情跳转提示
 }
 
 // TaskRunInfo 最近一次运行。
@@ -68,7 +67,7 @@ type TaskRunInfo struct {
 	StartedAt  string `json:"started_at"`
 	FinishedAt string `json:"finished_at"`
 	DurationMs int64  `json:"duration_ms"`
-	Trigger    string `json:"trigger"`            // manual/auto/schedule/queue/slave-sync
+	Trigger    string `json:"trigger"`            // manual/auto/startup/caddy-restart/schedule（queue=cert-job 动态行合成值；slave-sync 为历史版本遗留取值，仅展示层保留映射）
 	Operator   string `json:"operator,omitempty"` // 手动触发操作者（manual 触发归人；auto/startup=空）
 	Result     string `json:"result"`             // success/failed/cancelled/skipped/…
 	Message    string `json:"message,omitempty"`
@@ -138,7 +137,6 @@ func collectCertJobRows() []TaskInfo {
 			// TASK-3（第 70 轮 P4）：disabled 为恒终态退役行——重试门对其恒 429，
 			// Triggerable=false 让按钮呈现禁用态（点击必 429 是交互噪音）。
 			Triggerable: status != "disabled",
-			DetailHint:  "certificates",
 			LastRun: &TaskRunInfo{StartedAt: localDisplayUTC(updatedAt), FinishedAt: localDisplayUTC(updatedAt),
 				Trigger: "queue", Result: status, Message: message},
 		}
@@ -175,8 +173,8 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			ID: m.ID, Name: m.Name, Description: m.Description,
 			Category: m.Category, Kind: TaskKind(m.Kind),
 			Controllable: m.Controllable, Cancellable: m.Cancelable, Triggerable: m.CanTrigger,
-			Enabled: m.Enabled, DetailHint: m.Family,
-			LoopOn: m.LoopOn,
+			Enabled: m.Enabled,
+			LoopOn:  m.LoopOn,
 		}
 		// 节奏：循环=间隔，定时=排程槽，常驻=自管理，触发=手动
 		switch m.Kind {
@@ -184,6 +182,10 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			if m.IntervalSec > 0 {
 				ti.Cadence = "每 " + humanInterval(m.IntervalSec)
 			}
+		case taskengine.KindScheduled:
+			// C2（第 76 轮）：Scheduled 族节奏补显——原缺分支恒空，前端显示「—」；
+			// 槽位由 NextSlotFn 按用户配置派生（每日时刻等），具体时间归「下次执行」列。
+			ti.Cadence = "定时排程"
 		case taskengine.KindDaemon:
 			ti.Cadence = "常驻自管理"
 		case taskengine.KindOneshot:

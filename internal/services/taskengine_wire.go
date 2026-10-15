@@ -80,7 +80,7 @@ func parseUTCSlot(s string) time.Time {
 // （coveredSlotStepPast/slotCoveredByRun/crsNextSlotAware/ip2regionNextSlotAware 已退役——
 // 排程槽生命周期 2026-10-11：失败落定落库推进，NextSlotFn 纯读库。）
 
-// InitTaskEngine 建引擎、恢复孤儿运行、注册全部 16 任务并启动默认循环。
+// InitTaskEngine 建引擎、恢复孤儿运行、注册全部 17 任务并启动默认循环。
 // TASK-L8（第 69 轮）：非幂等——调用方保证单次装配；重复调用前须先
 // StopTaskEngine（否则旧 scheduleLoop goroutine 泄漏、双引擎双写 task_runs）。
 // 测试环境须先 db.Initialize。

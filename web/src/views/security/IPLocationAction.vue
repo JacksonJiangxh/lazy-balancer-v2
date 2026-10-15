@@ -392,6 +392,21 @@ interface RowView {
 // 触发一次拉取，rows computed 内读 .value 注册响应依赖）。
 const countryZh = useCountryNamesCn()
 
+// 第 76 轮 F4 收敛（A76Misc）：rowView 原三处「全策略×全条目」扫描在 rows
+// computed 内逐行重算（O(策略²×条目)，每次开弹层全量重跑）——提升为共享
+// computed：本 IP 是否被任一策略信任 + 命中本 IP 的非系统引用名单集合，
+// rowView 内退化为布尔读取/Set 查询（O(策略×条目) 一次）。
+const ipTrustedAnywhere = computed(() =>
+  policies.value.some((p) => mergedTrustEntries(p).some((e) => entryMatchesIp(e, props.ip.trim()))))
+const ipHitListIds = computed(() => {
+  const hit = new Set<number>()
+  for (const l of ipLists.value) {
+    if (l.system) continue
+    if ((ipListEntries.value[l.id] ?? []).some((e) => entryMatchesIp(e, props.ip.trim()))) hit.add(l.id)
+  }
+  return hit
+})
+
 const rowView = (policy: PolicyRow): RowView => {
   // 信任口径（内联 ∪ 引用）先行计算——阶段 0 行整行语义即信任，ACL 行也要渲染信任动作。
   // U9-68-P4-1：信任成员判定与 ACL 侧同为 CIDR 感知（entryMatchesIp）——内联/引用
@@ -435,22 +450,21 @@ const rowView = (policy: PolicyRow): RowView => {
   // 内容漂移），不再显示；主动作归「取消信任」（豁免方策略卡上）。
   const isStage0OrMixed = policyTypeOf(policy) === 'stage0' || policyTypeOf(policy) === 'mixed'
   view.canAddTrust = isStage0OrMixed && !view.inTrust
-    && !policies.value.some((p) => mergedTrustEntries(p).some((e) => entryMatchesIp(e, props.ip.trim())))
+    && !ipTrustedAnywhere.value
   view.canRemoveTrust = view.inTrust && view.trustEnabled && view.inTrustInlineExact
   view.trustDead = view.inTrust && !view.trustEnabled
   view.canClearDeadTrust = view.trustDead && view.inTrustInlineExact
   // 信任引用命中（全类型行）：信任 refs 中包含此 IP 的非系统列表 → 可移除。
-  // 条目来源 = ipListEntries 缓存（loadPolicies 拉取 acl+whitelist 全部 refs）。
+  // 条目来源 = ipListEntries 缓存（loadPolicies 拉取 acl+whitelist 全部 refs）；
+  // 命中判定走共享 ipHitListIds（第 76 轮 F4 收敛）。
   const trustRefIds = parseRefIds(policy.ip_whitelist_refs)
   view.removableTrustRefLists = ipLists.value
-    .filter((l) => trustRefIds.includes(l.id) && !l.system)
-    .filter((l) => (ipListEntries.value[l.id] ?? []).some((e) => entryMatchesIp(e, props.ip.trim())))
+    .filter((l) => trustRefIds.includes(l.id) && ipHitListIds.value.has(l.id))
     .map((l) => ({ id: l.id, name: l.name }))
   // ACL 引用命中（第 58 轮补）：黑/白名单状态行标注具体来源名单名
   const aclRefIds = parseRefIds(policy.ip_acl_list_refs)
   const aclHitNames = ipLists.value
-    .filter((l) => aclRefIds.includes(l.id) && !l.system)
-    .filter((l) => (ipListEntries.value[l.id] ?? []).some((e) => entryMatchesIp(e, props.ip.trim())))
+    .filter((l) => aclRefIds.includes(l.id) && ipHitListIds.value.has(l.id))
     .map((l) => l.name)
   const srcTag = (names: string[]): string =>
     names.length > 0 ? `（来自引用列表「${names.join('」「')}」）` : '（来自引用列表）'

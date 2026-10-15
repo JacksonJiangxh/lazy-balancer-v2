@@ -1414,7 +1414,7 @@ func (s *CertificateService) checkManualCertExpiration() {
 			continue
 		}
 
-		daysUntilExpiry := int(cert.NotAfter.Sub(now).Hours() / 24)
+		daysUntilExpiry := CertDaysRemaining(cert.NotAfter, now)
 
 		if now.After(cert.NotAfter) {
 			// CERT41-3:同一证书同日同档只告一次(10min 扫描周期去重);

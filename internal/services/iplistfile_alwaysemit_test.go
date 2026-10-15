@@ -42,30 +42,27 @@ func TestEngineGate_ipListFastEmptyFileOperatorAccepted(t *testing.T) {
 // 编译——策略引擎（空 deny ACL/空信任/stage0 空 id:12）与预检合并段（空并集）。
 func TestEngineGate_alwaysEmitRenderedShapes(t *testing.T) {
 	t.Run("engine-empty-deny-acl", func(t *testing.T) {
-		compileForEngineGate(t, mustDirectives(BuildCorazaDirectives(
-			&models.SecurityPolicy{Mode: "off", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`}, nil, "", false, 0)))
+		compileForEngineGate(t, mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: "off", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`}, nil, "", false, 0, "lb_test")))
 	})
 	t.Run("engine-empty-trust", func(t *testing.T) {
-		compileForEngineGate(t, mustDirectives(BuildCorazaDirectives(
-			&models.SecurityPolicy{Mode: "off", IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`[]`)}, nil, "", false, 0)))
+		compileForEngineGate(t, mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{Mode: "off", IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`[]`)}, nil, "", false, 0, "lb_test")))
 	})
 	t.Run("engine-stage0-detection-empty", func(t *testing.T) {
-		compileForEngineGate(t, mustDirectives(BuildCorazaDirectives(
-			&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 0, []string{})))
+		compileForEngineGate(t, mustDirectives(BuildCorazaDirectives(&models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}, nil, "", false, 0, "lb_test", []string{})))
 	})
 	t.Run("engine-empty-multi-chain", func(t *testing.T) {
 		// 多策略链式自排除（negTrustOperand）在 deny 名单为空时指向空投影
 		// 文件——链形状必须被引擎接受（SECLB33-1 同门禁口径）。信任名单非空
 		// 使链排除段保持既有形状（信任不收敛）。
 		p := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`, IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["198.51.100.7"]`)}
-		compileForEngineGate(t, mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0)))
+		compileForEngineGate(t, mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0, "lb_test")))
 	})
 	t.Run("precheck-empty-unions", func(t *testing.T) {
 		policies := []*models.SecurityPolicy{
 			{IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`},
 			{PolicyType: models.PolicyTypeStage0, IPWhitelistEnabled: true, TrustDetection: true, IPWhitelist: json.RawMessage(`[]`)},
 		}
-		directives, err := buildIPPrecheckDirectives(policies, 0)
+		directives, err := buildIPPrecheckDirectives(policies, 0, "lb_test")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -76,7 +73,7 @@ func TestEngineGate_alwaysEmitRenderedShapes(t *testing.T) {
 // deny ACL 开启且合并集为空：引擎开启、id:2 恒发射指向空投影文件（p0-acl.txt）。
 func TestBuildCorazaDirectives_emptyDenyACLAlwaysEmits(t *testing.T) {
 	policy := &models.SecurityPolicy{Mode: "off", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if !strings.Contains(directives, "SecRuleEngine On") {
 		t.Fatalf("deny ACL 开启（空名单）必须开启引擎:\n%s", directives)
 	}
@@ -93,7 +90,7 @@ func TestBuildCorazaDirectives_emptyDenyACLAlwaysEmits(t *testing.T) {
 // 发射面边界）。
 func TestBuildCorazaDirectives_emptyTrustKeepsContentGate(t *testing.T) {
 	policy := &models.SecurityPolicy{Mode: "off", IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`[]`)}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if directives != "" {
 		t.Fatalf("信任开启（空名单，默认 flag 非 opt-in）不得发射规则/开引擎: %q", directives)
 	}
@@ -103,7 +100,7 @@ func TestBuildCorazaDirectives_emptyTrustKeepsContentGate(t *testing.T) {
 // （变参非 nil 空切片=策略在），空↔非空纯内容变化走热路径。
 func TestBuildCorazaDirectives_stage0DetectionEmptyAlwaysEmitsID12(t *testing.T) {
 	policy := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, []string{}))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test", []string{}))
 	if !strings.Contains(directives, `"id:12,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly"`) {
 		t.Fatalf("保留检测策略在（空并集）必须恒发射 id:12:\n%s", directives)
 	}
@@ -116,7 +113,7 @@ func TestBuildCorazaDirectives_stage0DetectionEmptyAlwaysEmitsID12(t *testing.T)
 // （与无名单形态逐字节一致）。
 func TestBuildCorazaDirectives_emptyAllowACLKeepsContentGate(t *testing.T) {
 	policy := &models.SecurityPolicy{Mode: "off", IPACLEnabled: true, IPACLMode: "allow", IPACLList: `[]`}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if directives != "" {
 		t.Fatalf("allow 模式空名单（否定算子）不得发射任何规则/开引擎: %q", directives)
 	}
@@ -125,7 +122,7 @@ func TestBuildCorazaDirectives_emptyAllowACLKeepsContentGate(t *testing.T) {
 // 遗留黑名单空（内联字段非热路径）：维持内容门控——无 id:4、不开引擎。
 func TestBuildCorazaDirectives_emptyBlacklistKeepsContentGate(t *testing.T) {
 	policy := &models.SecurityPolicy{Mode: "off", IPBlacklist: json.RawMessage(`[]`)}
-	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0))
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if directives != "" || strings.Contains(directives, "id:4,") {
 		t.Fatalf("黑名单空（内容门控保留）不得发射 id:4/开引擎: %q", directives)
 	}
@@ -134,7 +131,7 @@ func TestBuildCorazaDirectives_emptyBlacklistKeepsContentGate(t *testing.T) {
 // 预检合并段：deny ACL 开启且并集为空 → id:2 恒发射指向空 u-deny 文件。
 func TestBuildIPPrecheckDirectives_emptyDenyACLAlwaysEmits(t *testing.T) {
 	policies := []*models.SecurityPolicy{{IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`}}
-	directives, err := buildIPPrecheckDirectives(policies, 0)
+	directives, err := buildIPPrecheckDirectives(policies, 0, "lb_test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +148,7 @@ func TestBuildIPPrecheckDirectives_emptyStage0DetectionAlwaysEmits(t *testing.T)
 	policies := []*models.SecurityPolicy{
 		{PolicyType: models.PolicyTypeStage0, IPWhitelistEnabled: true, TrustDetection: true, IPWhitelist: json.RawMessage(`[]`)},
 	}
-	directives, err := buildIPPrecheckDirectives(policies, 0)
+	directives, err := buildIPPrecheckDirectives(policies, 0, "lb_test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +166,7 @@ func TestBuildIPPrecheckDirectives_emptyTrustKeepsContentGate(t *testing.T) {
 	policies := []*models.SecurityPolicy{
 		{IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`[]`)},
 	}
-	directives, err := buildIPPrecheckDirectives(policies, 0)
+	directives, err := buildIPPrecheckDirectives(policies, 0, "lb_test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +178,7 @@ func TestBuildIPPrecheckDirectives_emptyTrustKeepsContentGate(t *testing.T) {
 // 预检合并段：allow 模式空名单（否定算子）维持内容门控——不发射 id:7。
 func TestBuildIPPrecheckDirectives_emptyAllowACLKeepsContentGate(t *testing.T) {
 	policies := []*models.SecurityPolicy{{IPACLEnabled: true, IPACLMode: "allow", IPACLList: `[]`}}
-	directives, err := buildIPPrecheckDirectives(policies, 0)
+	directives, err := buildIPPrecheckDirectives(policies, 0, "lb_test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +191,7 @@ func TestBuildIPPrecheckDirectives_emptyAllowACLKeepsContentGate(t *testing.T) {
 // 热路径可变名单的内容门控，不为恒空策略凭空造预检）。
 func TestBuildIPPrecheckDirectives_noFeaturesStillSkipsPrecheck(t *testing.T) {
 	policies := []*models.SecurityPolicy{{Mode: "off"}}
-	directives, err := buildIPPrecheckDirectives(policies, 0)
+	directives, err := buildIPPrecheckDirectives(policies, 0, "lb_test")
 	if err != nil {
 		t.Fatal(err)
 	}

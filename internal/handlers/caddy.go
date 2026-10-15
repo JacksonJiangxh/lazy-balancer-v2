@@ -70,6 +70,12 @@ var startupReplayWaitTimeout = 30 * time.Second
 // 协议关闭立即返回；标记永不出现（监督器夭折）等满超时后 WARN 放行；
 // 手动重载/caddy-restart 到场时标记必已存在（本容器生命周期内监督器首启
 // 必写过），首轮探测即返回。
+//
+// START-1（第 76 轮）：超时放行路径的收敛兜底在监督器侧——admin 就绪逾 10
+// 探针时 slow-start 后台环补写 /tmp/caddy-restarted（绕过 V1 首启豁免），
+// caddy-restart watcher 随后走与启动同源的 DB 渲染→校验→应用强制重收敛；
+// 本函数的超时是有界的面板可用性保障，不因拉高等待上限换取就绪竞态收窄
+// （docker-entrypoint.sh slow-start 块 Ruling 注释）。
 func waitStartupReplayDone() {
 	if !supervisorAlive() {
 		return

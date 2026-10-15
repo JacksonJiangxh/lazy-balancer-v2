@@ -106,12 +106,16 @@ const ipListGCInterval = time.Hour
 
 // ipListProjectedFileName 匹配投影文件命名——差集清理只碰该形态，目录内其他
 // 文件（运维投放/误放）一律不动。两个分支（2026-10-15 热路径改造）：
-//   - 新稳定命名 <scope>.txt（scope 为策略 id/并集描述符/受信代理 tp 形态，
-//     精确白名单，用户手放文件不碰）；
+//   - 新稳定命名 <scope>.txt：p[0-9]+-(acl|trust|bl|crsxc-[0-9]+)（策略身份；
+//     crsxc-[0-9]=CRS 作用域排除匹配集投影，第 76 轮 SEC-1，组合序号）、
+//     tp（受信代理全局单份）、u-<kind>-<ruleCaddyID>（第 76 轮 HP-1：预检/
+//     引擎层 u-* 投影 scope 编入规则身份，如 u-deny-lb_2r8dosptk1——CaddyID
+//     含下划线，字符类收 `_`；升级前旧全局名 u-deny.txt 等同字符类天然覆盖，
+//     由 24h GC 过渡回收）；精确白名单，用户手放文件不碰；
 //   - 旧内容寻址 scope-sha256[:12].txt——迁移过渡分支：改造前落盘的旧哈希
 //     文件由既有 24h GC 自然回收（不写迁移），旧文件清尽后该分支恒不命中，
 //     自行失效。
-var ipListProjectedFileName = regexp.MustCompile(`^(u-[a-z0-9][a-z0-9-]*|p[0-9]+-(acl|trust|bl)|tp|.+-[0-9a-f]{12})\.txt$`)
+var ipListProjectedFileName = regexp.MustCompile(`^(u-[a-z0-9][a-z0-9_-]*|p[0-9]+-(acl|trust|bl|crsxc-[0-9]+)|tp|.+-[0-9a-f]{12})\.txt$`)
 
 // ipListRenderRefs 记录本进程渲染引用过的投影文件及最近引用时间：一次全量
 // 配置渲染会重新投影全部在役名单（同字节跳写也计引用），故「长期

@@ -252,8 +252,9 @@ type SecurityEvent struct {
 	AnomalyScore  int    `json:"anomaly_score"`
 	RuleName      string `json:"rule_name"`
 	PolicyName    string `json:"policy_name"`
-	// DurationUs：安全链处理耗时（微秒;blocked_counter 注入 timing ID → 侧车
-	// 文件关联;历史行/未命中为 0，前端显示为「—」;亚毫秒精度 0.xxx ms 展示）。
+	// DurationUs：安全链处理耗时（微秒；审计写插件注入本行顶层 lb_timing 字段
+	// 直取——第 76 轮侧车退役;历史行/缺席为 0，前端显示为「—」;亚毫秒精度
+	// 0.xxx ms 展示）。
 	DurationUs int64 `json:"duration_us"`
 	// PrecheckUs：该请求预检段耗时快照（µs）——WAF 事件的触发详情弹框显示
 	// 「预检+WAF」完整分解;预检事件与 DurationUs 同值。
