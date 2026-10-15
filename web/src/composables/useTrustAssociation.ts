@@ -10,8 +10,11 @@ import type { APIResponse } from '@/types'
 // 单击动作共用。语义：
 //   1) 策略已关联同侧非系统地址列表 → 直接把 IP 加入该列表（确认+幂等+反馈
 //      复用 useIpListAdd，与事件处置入口同一链路）；
-//   2) 策略尚无同侧列表 → 自动创建「{策略名}{后缀}」（category=custom、空条目）
-//      → 关联到策略对应 refs 字段 → 加入 IP，一步完成「创建并加入」；
+//   2) 策略无同侧非系统列表（未关联，或仅关联系统内置名单——历史裁定
+//      系统名单在快捷处置中零暴露、不作为动作目标）→ 自动创建
+//      「{策略名}{后缀}」（category=custom、空条目）→ 关联到策略对应 refs
+//      字段 → 加入 IP，一步完成「创建并加入」；历史起 deny/allow/trust
+//      三侧全部接线此出口；
 //   3) 移除 = 从引用列表 remove-ip（关联保留，仅移除条目）。
 // 信任侧未启用（ip_whitelist_enabled=false）时不阻断操作，仅提示「暂不生效」。
 export type ListSide = 'deny' | 'allow' | 'trust'
@@ -83,9 +86,14 @@ export const useTrustAssociation = (options: {
       return
     }
     const tip = side === 'trust' && policy.ip_whitelist_enabled === false ? '（注意：该策略信任名单当前未启用，加入后暂不生效）' : ''
+    // 历史裁定：同侧仅系统内置名单时同样走本出口——此时「尚未关联」不成立，
+    // 确认文案按引用实况区分（系统名单不在快捷处置中点名/操作）。
+    const lead = parseRefIds(policy[cfg.refField]).length === 0
+      ? `策略「${policy.name}」尚未关联${cfg.verb}用地址列表`
+      : `策略「${policy.name}」同侧仅关联系统内置名单（快捷处置不直接操作系统名单）`
     try {
       await ElMessageBox.confirm(
-        `策略「${policy.name}」尚未关联${cfg.verb}用地址列表，将创建「${policy.name}${cfg.suffix}」并把 ${ip} 加入${tip}。是否继续？`,
+        `${lead}，将创建「${policy.name}${cfg.suffix}」并把 ${ip} 加入${tip}。是否继续？`,
         `创建列表并${cfg.verb}`,
         { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' },
       )

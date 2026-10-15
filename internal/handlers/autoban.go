@@ -45,7 +45,8 @@ func (h *Handlers) UpdateAutobanConfig(c *gin.Context) {
 	}
 	if !req.Enabled {
 		// AU-8/D5（历史）：禁用路径先收尾再停调度——禁用后无循环 flush/
-		// 到期清理点，最后一次封禁的暂存重载与已到期条目必须在此收敛落盘。
+		// 到期清理点，禁用前未收敛的名单变化（含暂存重载）与已到期条目必须
+		// 在此收敛落盘（热路径优先，全量重载回退）。
 		services.AutobanDisableFlush()
 	}
 	if te := services.TaskEngine(); te != nil {

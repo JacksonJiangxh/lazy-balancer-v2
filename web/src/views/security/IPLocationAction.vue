@@ -27,12 +27,22 @@
       <div v-if="location" class="ipo-loc-line">{{ location }}</div>
     </div>
 
+    <!-- 策略筛选（历史用户裁定）：策略数 >1 才出；选择后仅渲染该策略卡片，
+         会话级记忆上次选择；加载中禁用（与 seq 守卫/加载态兼容） -->
+    <div v-if="policies.length > 1" class="ipo-filter">
+      <el-select v-model="lastPolicyFilter" size="small" :disabled="policiesLoading" placeholder="筛选策略">
+        <el-option label="全部策略" value="all" />
+        <el-option v-for="p in policies" :key="p.id" :label="p.name" :value="p.id" />
+      </el-select>
+    </div>
+
     <div v-if="policiesLoading" class="ipo-tip">策略加载中…</div>
     <div v-else-if="policiesError" class="info-note-bar"><span class="info-note-desc">策略列表加载失败</span></div>
     <template v-else-if="rows.length > 0">
       <div v-if="groupedRows.offstage > 0" class="ipo-tip">另有 {{ groupedRows.offstage }} 条限流/WAF 策略不涉及 IP 管控</div>
-      <!-- 阶段 0 空态（历史用户裁定：提示创建，不自动代建） -->
-      <div v-if="groupedRows.stage0.length === 0 && rows.length > 0" class="ipo-sec">
+      <!-- 阶段 0 空态（历史用户裁定：提示创建，不自动代建）。判定基于全部
+           策略（不受下方筛选影响）——绑定存在但被筛掉时不出该引导 -->
+      <div v-if="!stage0BoundAny && rows.length > 0" class="ipo-sec">
         <div class="ipo-sec-title">阶段 0 · 信任名单</div>
         <div class="ipo-tip">未绑定信任策略——到「安全防护 → 安全策略」创建并绑定后可信任此 IP</div>
       </div>
@@ -56,8 +66,7 @@
           <div v-if="row.trustDead" class="ipo-legacy">该 IP 的信任条目存在，但策略的信任名单已关闭——条目暂不生效</div>
           <div v-if="rowActions(row).length > 0" class="ipo-acts">
             <template v-for="act in rowActions(row)" :key="act.key">
-              <span v-if="!act.run" class="ipo-act-hint">{{ act.label }}</span>
-              <el-tooltip v-else-if="act.tip" :content="act.tip" placement="top">
+              <el-tooltip v-if="act.tip" :content="act.tip" placement="top">
                 <el-button size="small" :type="act.type" plain :loading="act.loading" @click="act.run()">{{ act.label }}</el-button>
               </el-tooltip>
               <el-button v-else size="small" :type="act.type" plain :loading="act.loading" @click="act.run()">{{ act.label }}</el-button>
@@ -74,6 +83,16 @@
     <span v-if="location" class="ip-loc" :title="location">{{ compactLocation }}</span>
   </span>
 </template>
+
+<script lang="ts">
+// 独立 <script> 块 = 模块作用域；ref 别名导入避免与 setup 块的 vue 导入重名
+import { ref as moduleRef } from 'vue'
+
+// 策略筛选会话级记忆（历史用户裁定）：模块级 ref——弹层多次开关/跨入口
+// （安全日志/安全总览/观察建议）间保留上次选择，不落库；选中策略被删除时由
+// loadPolicies 复位为「全部策略」。
+const lastPolicyFilter = moduleRef<number | 'all'>('all')
+</script>
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
@@ -194,7 +213,7 @@ const trustApi = useTrustAssociation({
     return loadPolicies()
   },
 })
-const { busyTrust, creating: trustCreating, resolveSideLists, joinSpecificList, removeFromSideRef } = trustApi
+const { busyTrust, creating: trustCreating, resolveSideLists, joinSpecificList, ensureListAndJoin, removeFromSideRef } = trustApi
 
 const policies = ref<PolicyRow[]>([])
 const policiesLoading = ref(false)
@@ -316,6 +335,11 @@ const loadPolicies = async (): Promise<void> => {
     const res = await request.get<APIResponse<PolicyRow[]>>(url)
     if (seq !== loadPoliciesSeq) return
     policies.value = (res.data || []).map(normalizeRow)
+    // 策略筛选（历史）：选中策略已不存在（被删/停用出上下文）→ 复位「全部」，
+    // 避免筛选视图渲染空卡片流
+    if (lastPolicyFilter.value !== 'all' && !policies.value.some((p) => p.id === lastPolicyFilter.value)) {
+      lastPolicyFilter.value = 'all'
+    }
     // 名单条目按需拉取依赖 policies 的引用清单（列表载荷不含 entries）——
     // 须在 policies 就位后执行
     await loadIpLists()
@@ -587,11 +611,20 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
   }
 }
 
-const rows = computed<RowView[]>(() => policies.value.map(rowView))
+// 历史策略筛选：选中具体策略时仅渲染其卡片（rowView 计算随之收窄）；
+// 「全部策略」= 全量。陈旧选中项（策略被删）由 loadPolicies 复位为 'all'。
+const rows = computed<RowView[]>(() => policies.value
+  .filter((p) => lastPolicyFilter.value === 'all' || p.id === lastPolicyFilter.value)
+  .map(rowView))
+
+// 阶段 0 绑定存在性（全量口径，不受筛选影响）——驱动「未绑定信任策略」引导
+const stage0BoundAny = computed(() => policies.value.some((p) => policyTypeOf(p) === 'stage0'))
 
 // 行内上下文动作（历史交互重构）：按行状态只出现该出现的动作。
 // 顺序 = 信任（绿）→ 黑名单移除（红）→ 关联拦截/放行（红/蓝）→ 信任移除（绿）。
-interface RowAction { key: string; label: string; type: 'primary' | 'success' | 'warning' | 'danger' | 'info'; loading?: boolean; tip?: string; run?: () => void }
+// 历史裁定：「未关联…」死提示退役——无同侧非系统列表时一律出自动创建
+// 动作（run 必备，动作区只渲染可执行动作；无动作→整区不渲染）。
+interface RowAction { key: string; label: string; type: 'primary' | 'success' | 'warning' | 'danger' | 'info'; loading?: boolean; tip?: string; run: () => void }
 
 
 const rowActions = (row: RowView): RowAction[] => {
@@ -630,10 +663,15 @@ const rowActions = (row: RowView): RowAction[] => {
         })
       }
     } else {
+      // 历史裁定：无同侧非系统列表时出「自动创建并加入」出口（系统名单零
+      // 暴露），不再渲染「未关联」死提示
       acts.push({
-        key: 'trust-hint',
-        label: '该策略未关联信任地址列表——请到「安全防护 → 安全策略」编辑该策略并添加信任列表后操作',
-        type: 'info',
+        key: 'trust-create',
+        label: `信任此 IP（创建「${row.policy.name}-信任」并加入）`,
+        type: 'success',
+        loading: busyTrust.value || trustCreating.value,
+        tip: row.trustEnabled ? undefined : '该策略信任名单已关闭：加入后暂不生效，启用后自动生效',
+        run: () => { void ensureListAndJoin(row.policy, props.ip.trim(), 'trust') },
       })
     }
   }
@@ -662,9 +700,15 @@ const rowActions = (row: RowView): RowAction[] => {
       }
     } else {
       acts.push({
-        key: 'deny-hint',
-        label: '该策略未关联黑名单地址列表——请到「安全防护 → 安全策略」编辑该策略并添加黑名单列表后操作',
-        type: 'info',
+        key: 'deny-create',
+        label: `拦截此 IP（创建「${row.policy.name}-黑名单」并加入）`,
+        type: 'danger',
+        loading: isBusy(pid, 'associate-new'),
+        tip: aclOffTip,
+        run: () => {
+          if (!lockBusy(pid, 'associate-new')) return
+          void ensureListAndJoin(row.policy, props.ip.trim(), 'deny').finally(() => unlockBusy(pid, 'associate-new'))
+        },
       })
     }
   }
@@ -686,9 +730,15 @@ const rowActions = (row: RowView): RowAction[] => {
       }
     } else {
       acts.push({
-        key: 'allow-hint',
-        label: '该策略未关联白名单地址列表——请到「安全防护 → 安全策略」编辑该策略并添加白名单列表后操作',
-        type: 'info',
+        key: 'allow-create',
+        label: `放行此 IP（创建「${row.policy.name}-白名单」并加入）`,
+        type: 'primary',
+        loading: isBusy(pid, 'associate-a-new'),
+        tip: aclOffTip,
+        run: () => {
+          if (!lockBusy(pid, 'associate-a-new')) return
+          void ensureListAndJoin(row.policy, props.ip.trim(), 'allow').finally(() => unlockBusy(pid, 'associate-a-new'))
+        },
       })
     }
   }
@@ -893,6 +943,8 @@ const removeTrust = async (policy: PolicyRow): Promise<void> => {
 /* 动作区：语义配色按钮流 */
 .ip-location-popper .ipo-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .ip-location-popper .ipo-acts .el-button { margin-left: 0; }
-.ip-location-popper .ipo-act-hint { font-size: 11px; color: var(--el-text-color-secondary); flex-basis: 100%; }
 .ip-location-popper .ipo-tip { font-size: 12px; color: var(--text-secondary, #909399); padding: 4px 0; }
+/* 策略筛选（历史）：头部通栏下拉，收窄多策略弹框 */
+.ip-location-popper .ipo-filter { margin-bottom: 8px; }
+.ip-location-popper .ipo-filter .el-select { width: 100%; }
 </style>

@@ -39,6 +39,39 @@ func (jsonFormatterForTest) Format(al plugintypes.AuditLog) ([]byte, error) {
 
 func (jsonFormatterForTest) MIME() string { return "application/json" }
 
+// fullJSONFormatter 与 coraza 内置 JSON 格式化器同形（json.Marshal 直出完整
+// 信封）——用于核对快照→drain 链路的完整字段面（transaction/messages/headers/
+// body 全部经快照消费）。
+type fullJSONFormatter struct{}
+
+func (fullJSONFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
+	return json.Marshal(al)
+}
+
+func (fullJSONFormatter) MIME() string { return "application/json" }
+
+// blockingFormatter 首次 Format 阻塞至 release 关闭——钉「格式化已移出请求
+// 路径」：若 Write 仍在请求路径同步格式化，ProcessLogging 将无法在超时内返回。
+type blockingFormatter struct {
+	release chan struct{}
+}
+
+func (f *blockingFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
+	<-f.release
+	return json.Marshal(al)
+}
+
+func (*blockingFormatter) MIME() string { return "application/json" }
+
+// cannedFormatter 忽略审计内容返回固定正文——管线级测试（阻塞/轮转）无需构造
+// 完整 AuditLog（plugintypes 接口的 Args 返回类型是 coraza 内部类型，测试无法
+// 合成），只验证入队/刷盘语义。
+type cannedFormatter struct{ body []byte }
+
+func (f cannedFormatter) Format(plugintypes.AuditLog) ([]byte, error) { return f.body, nil }
+
+func (cannedFormatter) MIME() string { return "application/json" }
+
 // 审计写插件（lbfile）测试：入队/刷盘/轮转重开兼容/阻塞零丢/timing 注入。
 // 写侧契约（历史）：决策→计时（请求路径，纯评估口径）→终态标记；审计
 // Write 只格式化+入队（阻塞式有界队列，零丢弃）；专职 drain goroutine 等待
@@ -219,9 +252,278 @@ func TestAuditWriter_noTimingHeaderOmitsField(t *testing.T) {
 	}
 }
 
+// waitAuditLines 轮询等待临时审计文件出现至少 n 行可解析 JSON（上限 2s）。
+func waitAuditLines(t *testing.T, path string, n int) []string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var lines []string
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			lines = lines[:0]
+			for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" && json.Valid([]byte(line)) {
+					lines = append(lines, line)
+				}
+			}
+			if len(lines) >= n {
+				return lines
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("expected %d audit lines in %s within 2s, got %d", n, path, len(lines))
+	return nil
+}
+
+// driveProbeTx 驱动一次 phase:1 deny 事务（X-Probe=hit 规则），复刻生产时序：
+// ProcessLogging（审计 Write）先于调用方计时写点。返回事务 ID。
+func driveProbeTx(t *testing.T, waf coraza.WAF, timingID string) string {
+	t.Helper()
+	tx := waf.NewTransaction()
+	defer tx.Close()
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	if timingID != "" {
+		req.Header.Set(securityTimingHeader, timingID)
+	}
+	req.Header.Set("X-Probe", "hit")
+	tx.ProcessConnection(req.RemoteAddr, 0, "127.0.0.1", 8080)
+	tx.ProcessURI(req.URL.String(), req.Method, "HTTP/1.1")
+	for k, v := range req.Header {
+		for _, val := range v {
+			tx.AddRequestHeader(k, val)
+		}
+	}
+	tx.ProcessRequestHeaders()
+	if !tx.IsInterrupted() {
+		t.Fatal("rule must interrupt")
+	}
+	tx.ProcessLogging()
+	return tx.ID()
+}
+
+// Given: 快照化写侧（Write 只构建快照入队，drain 侧格式化）+ phase:2 body 规则
+// When: ProcessLogging（入队）→ tx.Close（变量集合 reset+事务归还池——live 引用
+//
+//	污染源）→ 计时终态 → 才放行 drain 侧格式化
+//
+// Then: 审计行完整（transaction.id/unix_timestamp/client_ip/server_id/method/
+//
+//	uri/headers/body/messages.data.id 全部为 Close 前的值）且含 lb_timing——
+//	入队后改原（Close reset）不影响输出；且 ProcessLogging 未被格式化阻塞。
+func TestAuditWriter_snapshotSurvivesTxCycle(t *testing.T) {
+	useTestAuditPipeline(t)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+
+	fmtr := &blockingFormatter{release: make(chan struct{})}
+	cfg := plugintypesConfigFor(t, logPath)
+	cfg.Formatter = fmtr
+	w := &lbAuditWriter{}
+	if err := w.Init(cfg); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives(strings.Join([]string{
+		"SecRuleEngine On",
+		"SecRequestBodyAccess On",
+		"SecAuditEngine RelevantOnly",
+		"SecAuditLog " + logPath,
+		"SecAuditLogFormat JSON",
+		"SecAuditLogType lbfile",
+		"SecAuditLogParts ABCIJDEFHKZ",
+		"SecRule ARGS:payload \"@streq hit\" \"id:990003,phase:2,deny,status:403,log,msg:'probe-body'\"",
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("NewWAF: %v", err)
+	}
+
+	const id = "abcdef0123456789"
+	tx := waf.NewTransaction()
+	defer tx.Close()
+	tx.SetServerName("example.com")
+	req := httptest.NewRequest(http.MethodPost, "/probe", nil)
+	req.Header.Set(securityTimingHeader, id)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tx.ProcessConnection(req.RemoteAddr, 0, "127.0.0.1", 8080)
+	tx.ProcessURI(req.URL.String(), req.Method, "HTTP/1.1")
+	for k, v := range req.Header {
+		for _, val := range v {
+			tx.AddRequestHeader(k, val)
+		}
+	}
+	tx.ProcessRequestHeaders()
+	if _, n, err := tx.WriteRequestBody([]byte("payload=hit")); err != nil || n != len("payload=hit") {
+		t.Fatalf("WriteRequestBody: n=%d err=%v", n, err)
+	}
+	if intr, err := tx.ProcessRequestBody(); err != nil || intr == nil {
+		t.Fatalf("rule must interrupt body phase: intr=%v err=%v", intr, err)
+	}
+	txID := tx.ID()
+
+	// 生产时序：ProcessLogging（审计 Write 入队）不能被格式化阻塞——格式化
+	// 已移出请求路径。
+	logged := make(chan struct{})
+	go func() {
+		tx.ProcessLogging()
+		close(logged)
+	}()
+	select {
+	case <-logged:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ProcessLogging blocked in formatter.Format — formatting still on request path")
+	}
+
+	// 改原：tx.Close reset 变量集合（headers/body 归零、事务归还 sync.Pool），
+	// 随后计时终态，最后才放行 drain 侧格式化。
+	tx.Close()
+	auditTimingRecord(id, "end", 77)
+	auditTimingClose(id)
+	close(fmtr.release)
+
+	line := waitAuditLine(t, logPath)
+	var doc struct {
+		Transaction struct {
+			ID            string `json:"id"`
+			UnixTimestamp int64  `json:"unix_timestamp"`
+			ClientIP      string `json:"client_ip"`
+			ServerID      string `json:"server_id"`
+			IsInterrupted bool   `json:"is_interrupted"`
+			Request       struct {
+				Method  string              `json:"method"`
+				URI     string              `json:"uri"`
+				Headers map[string][]string `json:"headers"`
+				Body    string              `json:"body"`
+			} `json:"request"`
+		} `json:"transaction"`
+		Messages []struct {
+			Message string `json:"message"`
+			Data    struct {
+				ID  int    `json:"id"`
+				Raw string `json:"raw"`
+			} `json:"data"`
+		} `json:"messages"`
+		LbTiming struct {
+			Pre *int64 `json:"pre_us"`
+			End *int64 `json:"end_us"`
+		} `json:"lb_timing"`
+	}
+	if err := json.Unmarshal([]byte(line), &doc); err != nil {
+		t.Fatalf("audit line not JSON: %v (%s)", err, line)
+	}
+	if doc.Transaction.ID != txID {
+		t.Fatalf("transaction.id = %q; want %q", doc.Transaction.ID, txID)
+	}
+	if doc.Transaction.UnixTimestamp == 0 {
+		t.Fatal("transaction.unix_timestamp missing")
+	}
+	if doc.Transaction.ClientIP == "" || doc.Transaction.ServerID == "" {
+		t.Fatalf("client_ip/server_id missing: %+v", doc.Transaction)
+	}
+	if !doc.Transaction.IsInterrupted {
+		t.Fatal("transaction.is_interrupted must be true (deny)")
+	}
+	if doc.Transaction.Request.Method != http.MethodPost || doc.Transaction.Request.URI != "/probe" {
+		t.Fatalf("request line = %s %s", doc.Transaction.Request.Method, doc.Transaction.Request.URI)
+	}
+	if got := securityTimingIDFromHeaders(doc.Transaction.Request.Headers); got != id {
+		t.Fatalf("timing header missing from snapshot headers: %v (got %q)", doc.Transaction.Request.Headers, got)
+	}
+	if doc.Transaction.Request.Body != "payload=hit" {
+		t.Fatalf("request body polluted by tx.Close: %q", doc.Transaction.Request.Body)
+	}
+	if len(doc.Messages) == 0 || doc.Messages[0].Data.ID != 990003 || !strings.Contains(doc.Messages[0].Data.Raw, "ARGS:payload") {
+		t.Fatalf("messages incomplete: %+v", doc.Messages)
+	}
+	if doc.LbTiming.End == nil || *doc.LbTiming.End != 77 {
+		t.Fatalf("lb_timing.end_us = %v; want 77", doc.LbTiming.End)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// Given: 管线已 release（重载窗口：旧 WAF release、在途事务仍 Write）
+// When: 关闭态入队
+// Then: 同步回退直写该行（短生命周期 fd O_APPEND），零丢弃；计时同步短等注入
+//
+//	（先行终态立即注入；无计时头的行照常落盘且无 lb_timing）。
+func TestAuditPipeline_releasedPipelineSyncWritesRow(t *testing.T) {
+	useTestAuditPipeline(t)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+
+	cfg := plugintypesConfigFor(t, logPath)
+	cfg.Formatter = fullJSONFormatter{}
+	w := &lbAuditWriter{}
+	if err := w.Init(cfg); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives(strings.Join([]string{
+		"SecRuleEngine On",
+		"SecAuditEngine RelevantOnly",
+		"SecAuditLog " + logPath,
+		"SecAuditLogFormat JSON",
+		"SecAuditLogType lbfile",
+		"SecRule REQUEST_HEADERS:X-Probe \"@streq hit\" \"id:990004,phase:1,deny,status:403,log,msg:'probe'\"",
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("NewWAF: %v", err)
+	}
+
+	const id1 = "1111111111111111"
+	const id2 = "2222222222222222"
+	id1Tx := driveProbeTx(t, waf, id1)
+	auditTimingRecord(id1, "end", 42)
+	auditTimingClose(id1)
+	lines := waitAuditLines(t, logPath, 1)
+	if !strings.Contains(lines[0], id1Tx) {
+		t.Fatalf("first row = %s", lines[0])
+	}
+
+	// 重载窗口：管线 release（drain 退出、fd 关闭、队列置 nil），writer 仍持引用。
+	w.pipeline.release()
+
+	// 关闭态写入 #1：timing 先置终态 → 同步短等立即注入。
+	auditTimingRecord(id2, "end", 7)
+	auditTimingClose(id2)
+	id2Tx := driveProbeTx(t, waf, id2)
+
+	// 关闭态写入 #2：无计时头 → 同步直写，零丢弃且不注入。
+	id3Tx := driveProbeTx(t, waf, "")
+
+	if err := w.Write(nil); err != nil {
+		t.Fatalf("Write(nil) must be no-op, got %v", err)
+	}
+
+	lines = waitAuditLines(t, logPath, 3)
+	var sawID2Timing, sawID3 bool
+	for _, line := range lines {
+		switch {
+		case strings.Contains(line, id2Tx):
+			if !strings.Contains(line, `"end_us":7`) {
+				t.Fatalf("sync-written row missing injected timing: %s", line)
+			}
+			sawID2Timing = true
+		case strings.Contains(line, id3Tx):
+			if strings.Contains(line, "lb_timing") {
+				t.Fatalf("no-timing row must omit lb_timing: %s", line)
+			}
+			sawID3 = true
+		}
+	}
+	if !sawID2Timing || !sawID3 {
+		t.Fatalf("sync fallback rows missing (zero-drop violated): %v", lines)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
 // Given: 有界队列（容量 2）且 drain 未消费
 // When: 先同步填满 2 条，再异步入队第 3 条
-// Then: 第 3 条阻塞等待（零丢弃），drain 启动后完成——退化价=现状同步写
+// Then: 第 3 条阻塞等待（零丢弃），drain 启动后完成——退化价=退役前 serial 同步写
 func TestAuditPipeline_enqueueBlocksWhenFullZeroDrop(t *testing.T) {
 	useTestAuditPipeline(t)
 	p := &auditPipeline{
@@ -234,13 +536,13 @@ func TestAuditPipeline_enqueueBlocksWhenFullZeroDrop(t *testing.T) {
 	}
 
 	// 同步填满队列（无 drain 消费）
-	p.enqueue(lbAuditItem{body: []byte(`{"a":1}`)})
-	p.enqueue(lbAuditItem{body: []byte(`{"b":2}`)})
+	p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"a":1}`)}})
+	p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"b":2}`)}})
 
 	// 第 3 条异步入队：队列满必须阻塞（而非丢弃/报错）
 	thirdDone := make(chan struct{})
 	go func() {
-		p.enqueue(lbAuditItem{body: []byte(`{"c":3}`)})
+		p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"c":3}`)}})
 		close(thirdDone)
 	}()
 	select {
@@ -273,7 +575,7 @@ func TestAuditPipeline_copytruncateCompatible(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 	// 直接 enqueue 无 tid 条目（不注入），验证纯刷盘链路
-	w.pipeline.enqueue(lbAuditItem{body: []byte(`{"n":1}`)})
+	w.pipeline.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"n":1}`)}})
 	line1 := waitAuditLine(t, logPath)
 	if !strings.Contains(line1, `"n":1`) {
 		t.Fatalf("first line = %s", line1)
@@ -281,7 +583,7 @@ func TestAuditPipeline_copytruncateCompatible(t *testing.T) {
 	if err := os.Truncate(logPath, 0); err != nil {
 		t.Fatal(err)
 	}
-	w.pipeline.enqueue(lbAuditItem{body: []byte(`{"n":2}`)})
+	w.pipeline.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"n":2}`)}})
 	deadline := time.Now().Add(2 * time.Second)
 	var data []byte
 	for time.Now().Before(deadline) {

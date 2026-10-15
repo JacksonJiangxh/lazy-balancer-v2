@@ -216,10 +216,15 @@ func run() error {
 	// threatReloader 仅残留受信代理网段引用面（静态展开需 /load）与热路径
 	// 未证实收敛时的 fail-safe 回退。
 	services.SetThreatProjectionRefresher(func() (bool, error) { return caddyService.RefreshIPListProjections() })
-	// 历史问题：自动封禁名单变化后的重载。AU-1（历史）：merge 读改写+重载
-	// 全程持 CaddyOpLock，注入必须为 InLock 变体（caddyReloader 自取锁，
-	// 临界区内重入=死锁）。
+	// 历史问题：自动封禁名单变化后的收敛。投影热路径优先（2026-10-15 用户裁定）：
+	// 资格门（被启用策略引用∧非受信代理网段引用）命中 →
+	// RefreshIPListProjectionsInLock 零 /load 收敛（@ipListFast 匹配器 ≤1s
+	// stat 热感知）；资格未命中/不可判定/未证实收敛 → autobanReloader 全量
+	// 重载回退（60s 节流暂存合并）。AU-1（历史）：merge 读改写+收敛全程
+	// 持 CaddyOpLock，两个注入必须为 InLock 变体（自取锁变体在临界区内重入
+	// =死锁）。
 	services.SetAutobanReloader(func() error { return caddyService.GenerateAndApplyConfigForceInLock() })
+	services.SetAutobanProjectionRefresher(func() (bool, error) { return caddyService.RefreshIPListProjectionsInLock() })
 	services.InitThreatUpdateManager()
 	services.GetThreatUpdateManager().SetMasterRole(isMaster)
 	crsManager.SetMasterRole(isMaster)
