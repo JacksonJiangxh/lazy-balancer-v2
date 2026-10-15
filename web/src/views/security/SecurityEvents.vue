@@ -512,7 +512,7 @@ const toggleAutobanEnabled = async (): Promise<void> => {
   if (autobanToggling.value || !autobanStatus.value.enabled) return
   try {
     await ElMessageBox.confirm(
-      '确认禁用自动封禁？任务调度将停止，禁用时会立即清除已到期的封禁条目并重载生效；未到期条目保留至到期，由其后的下一次配置重载解除。',
+      '确认禁用自动封禁？任务调度将停止，禁用时会立即清除已到期的封禁条目并即时生效；未到期条目保留至到期自动失效。',
       '禁用自动封禁',
       { confirmButtonText: '确认禁用', cancelButtonText: '取消', type: 'warning' },
     )

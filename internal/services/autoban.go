@@ -1,5 +1,8 @@
 // Package services 自动封禁（F73-A）：WAF 事件固定窗口计数 → 阈值判定 →
-// 「自动封禁名单」条目 merge → 引用策略重载（节流）。
+// 「自动封禁名单」条目 merge → 引用面收敛（投影热路径优先，2026-10-15：
+// 资格门——被启用策略引用∧非受信代理网段引用——命中即零 /load，@ipListFast
+// 匹配器 ≤1s stat 热感知；未命中/不可判定/未证实收敛回退全量重载，60s 节流
+// 暂存合并）。
 //
 // 窗口语义（AU-5 显式声明）：固定窗口按事件到达对齐分桶（桶长=统计窗口），
 // 桶满跨界即重置——不是物理滑动的平滑窗口。跨桶边界的短时突发可能被分散到
@@ -10,8 +13,9 @@
 // Commit 后）喂 autobanObserveBatch（主节点+启用+口径+WAF 事件四重过滤）→
 // 固定窗口计数器；autoban 任务（60s 循环、主节点；调度唯一前提=业务启用——
 // PUT 保存联动启停，Descriptor 无 EnabledFn，Run 体首行业务门兜底）每轮
-// 评估候选并执行「观察建议或名单 merge」。merge 读改写+重载全程持
-// CaddyOpLock（AU-1：与 handlers 名单写路径互斥，重载回调为 InLock 变体）。
+// 评估候选并执行「观察建议或名单 merge」。merge 读改写+收敛全程持
+// CaddyOpLock（AU-1：与 handlers 名单写路径互斥；两个注入回调均为 InLock
+// 变体，临界区内直呼不得自取锁）。
 //
 // 名单形态：预置 security_ip_lists 行（system=1，name=自动封禁名单，DB entries）。
 // 条目扩展 created_at/expires_at（RFC 墙钟串、UTC 存储）——投影层
@@ -47,8 +51,9 @@ const (
 	// 计数共用单源——两处字面量漂移会让今日封禁恒 0）。
 	AutobanAuditAction = "自动封禁"
 
-	// autobanReloadThrottle 重载节流窗口：名单变化后至少间隔 60s 才真实重载，
-	// 窗口内的变化暂存合并到下一轮。
+	// autobanReloadThrottle 重载节流窗口：全量重载回退路径至少间隔 60s 才真实
+	// 重载，窗口内的回退请求暂存合并到下一轮（投影热路径免节流——节流对象恒为
+	// 全量重载，见 autobanConvergeLocked Ruling）。
 	autobanReloadThrottle = time.Minute
 	// autobanSuggestionCap 观察建议保留上限（按计数降序截断）。
 	autobanSuggestionCap = 200
@@ -130,13 +135,27 @@ func AutobanIsMaster() bool { return autobanIsMaster() }
 // 「首读 false 后、复查前」的 PUT enabled=1 + StartLoop 交错窗）。
 var autobanRecheckEnabled = AutobanEnabled
 
-// autobanReloader 名单内容变化后的 Caddy 重载回调（AU-1 契约：在 CaddyOpLock
-// 临界区内被调用，必须为 InLock 变体——生产=GenerateAndApplyConfigForceInLock，
+// autobanReloader 全量重载回调（fail-safe 回退路径：热路径资格门未命中/
+// 不可判定/刷新器未注册/未证实收敛时使用；AU-1 契约：在 CaddyOpLock 临界区
+// 内被调用，必须为 InLock 变体——生产=GenerateAndApplyConfigForceInLock，
 // 不得注入自取 CaddyOpLock 的 Force 变体）。
 var autobanReloader func() error
 
-// SetAutobanReloader 注册重载回调（nil=清除，测试用）。
+// autobanProjectionRefresher 投影热路径回调（main.go 注入
+// CaddyService.RefreshIPListProjectionsInLock，2026-10-15 用户裁定）：资格门
+// 命中后的零 /load 收敛——按已提交 DB 视图全量渲染（投影文件为渲染副作用，
+// 原子落盘新内容）后与运行配置结构级比对。返回 (true,nil)=已证实收敛（匹配器
+// ≤1s stat 热感知）；(false,*)=未证实收敛（发射面变化/运行配置不可读/渲染
+// 被拒）——调用方回退 autobanReloader 全量重载（宁可一次重载，不欠引用方
+// 渲染收敛）。InLock 变体（AU-1：merge 读改写+收敛同一 CaddyOpLock 临界区
+// 内直呼，不得自取锁）。
+var autobanProjectionRefresher func() (bool, error)
+
+// SetAutobanReloader 注册全量重载回调（nil=清除，测试用）。
 func SetAutobanReloader(fn func() error) { autobanReloader = fn }
+
+// SetAutobanProjectionRefresher 注册投影热路径回调（nil=清除，测试用）。
+func SetAutobanProjectionRefresher(fn func() (bool, error)) { autobanProjectionRefresher = fn }
 
 // ---- 配置读写 ----
 
@@ -613,15 +632,17 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 
 // ---- 重载节流 ----
 
-// autobanReloadState 本轮重载请求的终态（D4：摘要尾注与暂存标记一致——
-// 失败时不得宣称「已触发」）。
+// autobanReloadState 本轮收敛请求的终态（D4：摘要尾注与暂存标记一致——
+// 失败时不得宣称「已触发」）。热路径收敛（HotApplied）是「已收敛」的零重载
+// 形态，审计真实性：不落「重载」系统审计、尾注不宣称已重载。
 type autobanReloadState int
 
 const (
-	autobanReloadNone     autobanReloadState = iota // 无名单变化，未请求重载
-	autobanReloadApplied                            // 已重载（配置已收敛）
-	autobanReloadDeferred                           // 节流窗口内，暂存至下一轮合并执行
-	autobanReloadErrored                            // 重载失败（已留审计+置暂存再武装）
+	autobanReloadNone       autobanReloadState = iota // 无名单变化，未请求收敛
+	autobanReloadApplied                              // 已重载（全量链收敛）
+	autobanReloadHotApplied                           // 投影热路径收敛（零重载，匹配器 ≤1s 热感知）
+	autobanReloadDeferred                             // 节流窗口内，暂存至下一轮合并执行（仅全量重载回退路径）
+	autobanReloadErrored                              // 全量重载失败（已留审计+置暂存再武装）
 )
 
 // autobanMarkReloadFailed 重载失败统一处置（D4，镜像 threat_reload_pending）：
@@ -634,10 +655,55 @@ func autobanMarkReloadFailed(reason string, err error) {
 	Logf("error", "自动封禁名单重载失败（%s，已置暂存待重试）: %v", reason, err)
 }
 
-// autobanRequestReloadLocked 名单变化后请求重载：距上次真实重载 ≥60s 立即执行，
-// 否则置暂存（下一轮 Run 的 autobanFlushPendingReload 合并执行）。
-// 调用契约（AU-1）：调用方已持 CaddyOpLock（merge 读改写+重载同一临界区），
-// 注入回调为 InLock 变体——本函数不得再取 CaddyOpLock。
+// autobanListHotPathEligible 热路径资格门（与手动名单写路径/威胁库收敛门同一
+// 查询核心单源，日志前缀区分来源）：被启用策略引用（ip_acl_list_refs/
+// ip_whitelist_refs）∧ 非受信代理网段引用（trusted_proxy_range_refs 渲染静态
+// 展开进配置本体，文件热感知不可达）。查询/解析失败按「被引用」处理
+// （fail-closed——宁可回退一次全量重载，不欠引用方渲染收敛）。
+func autobanListHotPathEligible(listID int64) bool {
+	if listID <= 0 {
+		return false
+	}
+	ids := []int{int(listID)}
+	return ipListsReferencedByEnabledPolicyLabeled("自动封禁", ids) &&
+		!trustedListsReferencedByTrustedProxyLabeled("自动封禁", ids)
+}
+
+// autobanConvergeLocked 名单内容变化（merge 新封/清到期/容量挤出）后的生效
+// 路径（热路径优先，2026-10-15 用户裁定）：
+//   - 资格门命中 ∧ 投影刷新器已注册 → 投影热路径（零 /load，@ipListFast
+//     匹配器 ≤1s stat 热感知）→ HotApplied；
+//   - 资格未命中/不可判定/刷新器未注册/未证实收敛（发射面变化/运行配置不可
+//     读/渲染被拒）→ 回退既有全量重载（autobanRequestReloadLocked 单源：
+//     60s 节流+暂存+失败再武装语义原样）。
+//
+// 节流 Ruling：节流（60s 窗口+暂存合并+禁用豁免强制）的存在理由是压制全量
+// /load 的成本与扰断，节流对象恒为「全量重载回退路径」。投影热路径是毫秒级
+// 幂等操作（渲染+字节比对+投影文件原子落盘），无 Caddy 重载扰断，且收敛只
+// 发生在 60s 任务周期/禁用收尾两个节拍上——天然限频无风暴可节流 → 热路径
+// 免节流、不消费 autobanLastReload 记账（窗口会计专属全量重载，防后续回退
+// 重载被热路径无谓推迟）。Applied/Deferred/Errored 三态原样保留给回退路径。
+//
+// 调用契约（AU-1）：调用方已持 CaddyOpLock（merge 读改写+收敛同一临界区），
+// 本函数不得再取锁。
+func autobanConvergeLocked(reason string, listID int64) autobanReloadState {
+	if autobanProjectionRefresher != nil && autobanListHotPathEligible(listID) {
+		hot, err := autobanProjectionRefresher()
+		if err == nil && hot {
+			Logf("info", "自动封禁名单变化经投影热路径收敛（零 Caddy 重载，匹配器 ≤1s 热感知生效）")
+			return autobanReloadHotApplied
+		}
+		// 未证实收敛/刷新被拒 → 回退 /load 收敛——宁可一次重载，不欠引用方
+		// 渲染收敛（fail-safe 与威胁库收敛门同向）。
+		Logf("info", "自动封禁投影热路径未证实收敛（发射面变化或刷新失败），回退重载 Caddy 配置")
+	}
+	return autobanRequestReloadLocked(reason)
+}
+
+// autobanRequestReloadLocked 名单变化后请求全量重载（热路径回退路径）：距上次
+// 真实重载 ≥60s 立即执行，否则置暂存（下一轮 Run 的 autobanFlushPendingReload
+// 合并执行）。调用契约（AU-1）：调用方已持 CaddyOpLock（merge 读改写+收敛
+// 同一临界区），注入回调为 InLock 变体——本函数不得再取 CaddyOpLock。
 func autobanRequestReloadLocked(reason string) autobanReloadState {
 	if autobanReloader == nil {
 		return autobanReloadNone
@@ -717,7 +783,7 @@ func AutobanDisableFlush() {
 	out, err := autobanMergeEntries(cfg, nil)
 	if err == nil && out.Changed {
 		autobanAuditExpiredUnban(out.Expired)
-		autobanRequestReloadLocked("自动封禁禁用收尾")
+		autobanConvergeLocked("自动封禁禁用收尾", out.ListID)
 	}
 	CaddyOpLock.Unlock()
 	autobanForceFlushPendingReload()
@@ -778,9 +844,10 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 
 	var out autobanMergeOutcome
 	reloadState := autobanReloadNone
-	// AU-1（第 74 轮）：merge 读改写+重载并入同一 CaddyOpLock 临界区——与
+	// AU-1（第 74 轮）：merge 读改写+收敛并入同一 CaddyOpLock 临界区——与
 	// handlers 名单写路径（AddIPToList/UpdateIPList 持 caddyOpMu=CaddyOpLock
-	// 的读改写）交错会丢更新/复活条目；重载回调为 InLock 变体，临界区内直呼。
+	// 的读改写）交错会丢更新/复活条目；收敛回调（投影热路径/全量重载）均为
+	// InLock 变体，临界区内直呼。
 	if err := func() error {
 		CaddyOpLock.Lock()
 		defer CaddyOpLock.Unlock()
@@ -790,7 +857,7 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 		}
 		out = o
 		if out.Changed {
-			reloadState = autobanRequestReloadLocked("名单更新")
+			reloadState = autobanConvergeLocked("名单更新", out.ListID)
 		}
 		return nil
 	}(); err != nil {
@@ -836,6 +903,8 @@ func reloadNote(changed bool, state autobanReloadState) string {
 		return ""
 	}
 	switch state {
+	case autobanReloadHotApplied:
+		return "（投影热路径收敛，零重载）"
 	case autobanReloadApplied:
 		return "（已重载）"
 	case autobanReloadDeferred:

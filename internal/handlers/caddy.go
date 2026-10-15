@@ -50,6 +50,43 @@ var caddySupervisorPidFile = "/tmp/lazy-balancer-caddy-supervisor.pid"
 // 测试调小）。LBH-B-U2 测试注入缝。
 var caddySupervisorWaitTimeout = 5 * time.Second
 
+// caddyStartupReplayMarkerFile 是监督器「启动回放阶段完成」标记（第 75 轮启动
+// 竞态修复；与 docker-entrypoint.sh 的 CADDY_STARTUP_REPLAY_DONE 同一路径）：
+// 监督器 reapply_last_good 尾部写（LKG 缺失/回放失败也写——标记语义是
+// 「admin 就绪+回放阶段已了结」，不是「回放成功」），app 启动配置载入等标记
+// 后再应用。包级 var 作测试注入缝（caddyPauseFile 同模式）。
+var caddyStartupReplayMarkerFile = "/tmp/lazy-balancer-caddy-startup-replayed"
+
+// startupReplayWaitTimeout 是启动载入等待回放标记的上限（生产 30s；测试调小）。
+// 有界放行：监督器夭折（标记永不出现）时退化语义=修复前（app 直接应用），
+// 不得挂死启动。测试注入缝。
+var startupReplayWaitTimeout = 30 * time.Second
+
+// waitStartupReplayDone 启动竞态修复（第 75 轮）：监督器首启 last-good 回放与
+// app BootSync 配置载入各等 admin 就绪即写，先后为硬币——app 渲染先落时，
+// 监督器回放的旧 LKG 快照覆盖新配置（v2.3.7-beta 发版实锤：新配置被盖到手动
+// 重载才生效）。协议：监督器回放阶段尾部写标记，app 启动载入等标记后再应用，
+// 时序构造性定死为「回放→标记→应用」。supervisorAlive 不在场（测试/裸跑）
+// 协议关闭立即返回；标记永不出现（监督器夭折）等满超时后 WARN 放行；
+// 手动重载/caddy-restart 到场时标记必已存在（本容器生命周期内监督器首启
+// 必写过），首轮探测即返回。
+func waitStartupReplayDone() {
+	if !supervisorAlive() {
+		return
+	}
+	deadline := time.Now().Add(startupReplayWaitTimeout)
+	for {
+		if _, err := os.Stat(caddyStartupReplayMarkerFile); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			services.Logf("warn", "等待 Caddy 监督器启动回放标记超时（%s），继续启动配置载入（监督器可能未按协议写标记，last-good 回放存在乱序覆盖风险）", startupReplayWaitTimeout)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // caddyProcRoot 是进程状态读取的根目录（生产=/proc；测试指向临时伪 /proc 目录）。
 var caddyProcRoot = "/proc"
 

@@ -4134,6 +4134,14 @@ func (s *CaddyService) RefreshIPListProjections() (bool, error) {
 	return s.refreshIPListProjectionsInLock(db.DB)
 }
 
+// RefreshIPListProjectionsInLock 投影热路径的 DB 视图 InLock 变体（自动封禁
+// merge 收敛用，AU-1 契约：名单读改写+收敛同一 CaddyOpLock 临界区，本变体
+// 不得自取锁——调用方已持锁，自取=重入死锁）。返回语义同
+// RefreshIPListProjections。
+func (s *CaddyService) RefreshIPListProjectionsInLock() (bool, error) {
+	return s.refreshIPListProjectionsInLock(db.DB)
+}
+
 func (s *CaddyService) refreshIPListProjectionsInLock(store caddyConfigStore) (bool, error) {
 	config := generateCaddyConfigFromStore(store)
 	if message, ok := config[caddyConfigGenerationErrorKey].(string); ok {

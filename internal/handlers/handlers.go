@@ -800,6 +800,13 @@ func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 		services.RecordAuditLog(actor, "启动警告", "系统配置", "启动校验发现无效规则配置："+err.Error(), "")
 	}
 
+	// 启动竞态修复（第 75 轮）：先等监督器「启动回放阶段完成」标记再继续——
+	// 监督器首启 last-good 回放与本 BootSync 应用各等 admin 就绪即写，先后为
+	// 硬币；本应用先落时监督器回放旧 LKG 覆盖新渲染（v2.3.7-beta 发版实锤）。
+	// 等标记把时序定死为「回放→标记→应用」。监督器不在场（测试/裸跑）立即
+	// 返回；标记缺失等满超时放行（waitStartupReplayDone 内注释）。
+	waitStartupReplayDone()
+
 	// Wait for Caddy to be ready (up to 10 seconds)
 	maxRetries := 20
 	retryDelay := 500 * time.Millisecond

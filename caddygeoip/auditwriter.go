@@ -13,9 +13,13 @@ package caddygeoip
 //     （internal/services/securityevents.go）直接从审计行取值，
 //     侧车文件与读侧 tick 级查表已整体退役。
 //
-//  2. 异步批量落盘：有界队列 + 阻塞式入队（零丢弃；队列满时请求路径阻塞等
-//     drain 消化，退化价=退役前 serial 同步写）。专职 drain goroutine 以
-//     bufio 批量刷盘（阈值/周期双触发）。
+//  2. 异步批量落盘 + 格式化后置：Write 只构建审计快照入队（formatter.Format
+//     已移出请求路径——快照是 headers map 深拷贝+不可变字符串持有的 memcpy 级
+//     开销，防 tx.Close 归还 sync.Pool 后的 live 引用污染），专职 drain goroutine
+//     用注册 formatter 格式化、限时等待计时终态、注入 lb_timing、bufio 批量刷盘
+//     （阈值/周期双触发）。入队阻塞式（零丢弃；队列满时请求路径阻塞等 drain
+//     消化，退化价=退役前 serial 同步写）；管线已关（重载窗口在途写入）时回退
+//     同步直写（短生命周期 fd O_APPEND 单行追加+计时同步短等注入），同样零丢弃。
 //
 // 时序契约（为什么注入在 drain 侧而非 Write 侧）：coraza-caddy 在 WAF 中间件
 // 退出时 defer tx.ProcessLogging()——审计 Write 严格早于 blocked_counter（外层
@@ -34,6 +38,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +46,7 @@ import (
 
 	"github.com/corazawaf/coraza/v3/experimental/plugins"
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
+	"github.com/corazawaf/coraza/v3/types"
 )
 
 // auditWriterName 是插件注册名——渲染层以 `SecAuditLogType lbfile` 选用
@@ -67,6 +73,10 @@ var (
 	// 形态（计时写点缺失），超时按已到场分段注入。
 	auditTimingWaitLimit = 2 * time.Second
 	auditTimingPollStep  = 200 * time.Microsecond
+	// auditSyncTimingWaitLimit 同步回退写（管线已关的重载窗口在途行）的计时
+	// 短等上限：等待发生在请求路径，正常形态 µs 级置位终态；上限只兜底异常
+	// 形态，超限按已到场分段落盘（行不丢、缺段省略）。
+	auditSyncTimingWaitLimit = 5 * time.Millisecond
 	// auditTimingEntryTTL 注册表条目存活上限：条目由周期性清扫回收（消费不删——
 	// 同一请求可产多条审计行[预检+策略引擎]，共享同一注册表条目）。
 	auditTimingEntryTTL = 30 * time.Second
@@ -245,21 +255,440 @@ func injectAuditTiming(body []byte, snap auditTimingSnapshot) []byte {
 	return out
 }
 
+// —— 审计快照（plugintypes.AuditLog 的自持拷贝）——
+//
+// coraza 内部 Log 持有事务变量的 live 引用（request/response headers map、args
+// 集合视图），tx.Close 会 reset 全部变量集合并把事务归还 sync.Pool 供下一请求
+// 复用——格式化若晚于 Close（drain 侧延迟格式化）读到的是被清空甚至被复写的
+// 数据。快照在 Write 时点（Close 之前）拷贝全部 formatter 消费面：字符串在 Go
+// 不可变直接持有，headers map/文件列表/消息切片重建隔离。畸形兼容：零值事务
+// （无 Transaction 的畸形 AuditLog）走零值快照，格式化输出 zero 对象，不 panic。
+
+// auditSnapshot 实现 plugintypes.AuditLog。字段标签与 coraza 内部 Log 逐一对齐
+// （transaction 恒在场、messages omitempty、parts 不入 JSON），注册 formatter
+// （内置 JSON=json.Marshal 直出）的输出信封与同步格式化时代逐字段一致。
+type auditSnapshot struct {
+	Parts_       types.AuditLogParts           `json:"-"`
+	Transaction_ auditSnapshotTransaction      `json:"transaction"`
+	Messages_    []plugintypes.AuditLogMessage `json:"messages,omitempty"`
+}
+
+func (s *auditSnapshot) Parts() types.AuditLogParts { return s.Parts_ }
+
+func (s *auditSnapshot) Transaction() plugintypes.AuditLogTransaction { return &s.Transaction_ }
+
+func (s *auditSnapshot) Messages() []plugintypes.AuditLogMessage { return s.Messages_ }
+
+// auditSnapshotTransaction 实现 plugintypes.AuditLogTransaction。request 恒在场
+// （coraza 的 tx.AuditLog 总是分配 Request_），pointer nil=原始缺失。
+type auditSnapshotTransaction struct {
+	Timestamp_       string                 `json:"timestamp"`
+	UnixTimestamp_   int64                  `json:"unix_timestamp"`
+	ID_              string                 `json:"id"`
+	ClientIP_        string                 `json:"client_ip"`
+	ClientPort_      int                    `json:"client_port"`
+	HostIP_          string                 `json:"host_ip"`
+	HostPort_        int                    `json:"host_port"`
+	ServerID_        string                 `json:"server_id"`
+	Request_         *auditSnapshotRequest  `json:"request,omitempty"`
+	Response_        *auditSnapshotResponse `json:"response,omitempty"`
+	Producer_        *auditSnapshotProducer `json:"producer,omitempty"`
+	HighestSeverity_ string                 `json:"highest_severity"`
+	IsInterrupted_   bool                   `json:"is_interrupted"`
+}
+
+func (t *auditSnapshotTransaction) Timestamp() string {
+	if t == nil {
+		return ""
+	}
+	return t.Timestamp_
+}
+
+func (t *auditSnapshotTransaction) UnixTimestamp() int64 {
+	if t == nil {
+		return 0
+	}
+	return t.UnixTimestamp_
+}
+
+func (t *auditSnapshotTransaction) ID() string {
+	if t == nil {
+		return ""
+	}
+	return t.ID_
+}
+
+func (t *auditSnapshotTransaction) ClientIP() string {
+	if t == nil {
+		return ""
+	}
+	return t.ClientIP_
+}
+
+func (t *auditSnapshotTransaction) ClientPort() int {
+	if t == nil {
+		return 0
+	}
+	return t.ClientPort_
+}
+
+func (t *auditSnapshotTransaction) HostIP() string {
+	if t == nil {
+		return ""
+	}
+	return t.HostIP_
+}
+
+func (t *auditSnapshotTransaction) HostPort() int {
+	if t == nil {
+		return 0
+	}
+	return t.HostPort_
+}
+
+func (t *auditSnapshotTransaction) ServerID() string {
+	if t == nil {
+		return ""
+	}
+	return t.ServerID_
+}
+
+func (t *auditSnapshotTransaction) HasRequest() bool {
+	return t != nil && t.Request_ != nil
+}
+
+// Request 缺席时返回 nil 接口（比 coraza 的 typed-nil 更保守：formatter 侧的
+// != nil 哨兵在此语义下成立）。
+func (t *auditSnapshotTransaction) Request() plugintypes.AuditLogTransactionRequest {
+	if t == nil || t.Request_ == nil {
+		return nil
+	}
+	return t.Request_
+}
+
+func (t *auditSnapshotTransaction) HasResponse() bool {
+	return t != nil && t.Response_ != nil
+}
+
+func (t *auditSnapshotTransaction) Response() plugintypes.AuditLogTransactionResponse {
+	if t == nil {
+		return nil
+	}
+	return t.Response_
+}
+
+func (t *auditSnapshotTransaction) Producer() plugintypes.AuditLogTransactionProducer {
+	if t == nil {
+		return nil
+	}
+	return t.Producer_
+}
+
+func (t *auditSnapshotTransaction) HighestSeverity() string {
+	if t == nil {
+		return ""
+	}
+	return t.HighestSeverity_
+}
+
+func (t *auditSnapshotTransaction) IsInterrupted() bool {
+	return t != nil && t.IsInterrupted_
+}
+
+// auditSnapshotRequest 实现 plugintypes.AuditLogTransactionRequest。嵌入原始请求
+// 接口仅为提升 Args()——其返回类型是 coraza 内部 collections.ConcatKeyed，外部
+// 包无法命名实现；其余访问器全部走本快照（影子方法遮蔽提升方法）。Args() 仅
+// OCSF 格式化器消费（本项目固定 JSON 渲染，JSON 输出经下方标签字段与内置
+// 格式化器一致：args 恒 {} 空对象）；其视图随 tx.Close 失效为空读，不产错误数据。
+type auditSnapshotRequest struct {
+	plugintypes.AuditLogTransactionRequest `json:"-"`
+	Method_                                string                                        `json:"method"`
+	Protocol_                              string                                        `json:"protocol"`
+	URI_                                   string                                        `json:"uri"`
+	HTTPVersion_                           string                                        `json:"http_version"`
+	Headers_                               map[string][]string                           `json:"headers"`
+	Body_                                  string                                        `json:"body"`
+	Files_                                 []plugintypes.AuditLogTransactionRequestFiles `json:"files"`
+	ArgsStub                               struct{}                                      `json:"args"`
+	Length_                                int32                                         `json:"length"`
+}
+
+func (r *auditSnapshotRequest) Method() string {
+	if r == nil {
+		return ""
+	}
+	return r.Method_
+}
+
+func (r *auditSnapshotRequest) Protocol() string {
+	if r == nil {
+		return ""
+	}
+	return r.Protocol_
+}
+
+func (r *auditSnapshotRequest) URI() string {
+	if r == nil {
+		return ""
+	}
+	return r.URI_
+}
+
+func (r *auditSnapshotRequest) HTTPVersion() string {
+	if r == nil {
+		return ""
+	}
+	return r.HTTPVersion_
+}
+
+func (r *auditSnapshotRequest) Headers() map[string][]string {
+	if r == nil {
+		return nil
+	}
+	return r.Headers_
+}
+
+func (r *auditSnapshotRequest) Body() string {
+	if r == nil {
+		return ""
+	}
+	return r.Body_
+}
+
+func (r *auditSnapshotRequest) Files() []plugintypes.AuditLogTransactionRequestFiles {
+	if r == nil {
+		return nil
+	}
+	return r.Files_
+}
+
+func (r *auditSnapshotRequest) Length() int32 {
+	if r == nil {
+		return 0
+	}
+	return r.Length_
+}
+
+// auditSnapshotFile 实现 plugintypes.AuditLogTransactionRequestFiles（值类型，
+// 与 coraza 内部形态一致）。
+type auditSnapshotFile struct {
+	Name_ string `json:"name"`
+	Size_ int64  `json:"size"`
+	Mime_ string `json:"mime"`
+}
+
+func (f auditSnapshotFile) Name() string { return f.Name_ }
+
+func (f auditSnapshotFile) Size() int64 { return f.Size_ }
+
+func (f auditSnapshotFile) Mime() string { return f.Mime_ }
+
+// auditSnapshotResponse 实现 plugintypes.AuditLogTransactionResponse。
+type auditSnapshotResponse struct {
+	Protocol_ string              `json:"protocol"`
+	Status_   int                 `json:"status"`
+	Headers_  map[string][]string `json:"headers"`
+	Body_     string              `json:"body"`
+}
+
+func (r *auditSnapshotResponse) Protocol() string {
+	if r == nil {
+		return ""
+	}
+	return r.Protocol_
+}
+
+func (r *auditSnapshotResponse) Status() int {
+	if r == nil {
+		return 0
+	}
+	return r.Status_
+}
+
+func (r *auditSnapshotResponse) Headers() map[string][]string {
+	if r == nil {
+		return nil
+	}
+	return r.Headers_
+}
+
+func (r *auditSnapshotResponse) Body() string {
+	if r == nil {
+		return ""
+	}
+	return r.Body_
+}
+
+// auditSnapshotProducer 实现 plugintypes.AuditLogTransactionProducer。
+type auditSnapshotProducer struct {
+	Connector_  string   `json:"connector"`
+	Version_    string   `json:"version"`
+	Server_     string   `json:"server"`
+	RuleEngine_ string   `json:"rule_engine"`
+	Stopwatch_  string   `json:"stopwatch"`
+	Rulesets_   []string `json:"rulesets"`
+}
+
+func (p *auditSnapshotProducer) Connector() string {
+	if p == nil {
+		return ""
+	}
+	return p.Connector_
+}
+
+func (p *auditSnapshotProducer) Version() string {
+	if p == nil {
+		return ""
+	}
+	return p.Version_
+}
+
+func (p *auditSnapshotProducer) Server() string {
+	if p == nil {
+		return ""
+	}
+	return p.Server_
+}
+
+func (p *auditSnapshotProducer) RuleEngine() string {
+	if p == nil {
+		return ""
+	}
+	return p.RuleEngine_
+}
+
+func (p *auditSnapshotProducer) Stopwatch() string {
+	if p == nil {
+		return ""
+	}
+	return p.Stopwatch_
+}
+
+func (p *auditSnapshotProducer) Rulesets() []string {
+	if p == nil {
+		return nil
+	}
+	return p.Rulesets_
+}
+
+// 快照类型接口合规钉（编译期）。
+var (
+	_ plugintypes.AuditLog                        = (*auditSnapshot)(nil)
+	_ plugintypes.AuditLogTransaction             = (*auditSnapshotTransaction)(nil)
+	_ plugintypes.AuditLogTransactionRequest      = (*auditSnapshotRequest)(nil)
+	_ plugintypes.AuditLogTransactionRequestFiles = auditSnapshotFile{}
+	_ plugintypes.AuditLogTransactionResponse     = (*auditSnapshotResponse)(nil)
+	_ plugintypes.AuditLogTransactionProducer     = (*auditSnapshotProducer)(nil)
+)
+
+// snapshotAuditLog 把 live AuditLog 拷贝为自持快照。接口 nil 检查穿透 typed-nil
+// （coraza 的 Response()/Producer() 返回 typed-nil 指针——接口非 nil 但底层为
+// nil，按缺失处理保持 JSON 信封一致：response/producer omitempty）。
+func snapshotAuditLog(al plugintypes.AuditLog) *auditSnapshot {
+	s := &auditSnapshot{Parts_: append(types.AuditLogParts(nil), al.Parts()...)}
+	if tx := al.Transaction(); !isNilInterface(tx) {
+		s.Transaction_ = *snapshotTransaction(tx)
+	}
+	s.Messages_ = append(s.Messages_, al.Messages()...)
+	return s
+}
+
+func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTransaction {
+	t := &auditSnapshotTransaction{
+		Timestamp_:       tx.Timestamp(),
+		UnixTimestamp_:   tx.UnixTimestamp(),
+		ID_:              tx.ID(),
+		ClientIP_:        tx.ClientIP(),
+		ClientPort_:      tx.ClientPort(),
+		HostIP_:          tx.HostIP(),
+		HostPort_:        tx.HostPort(),
+		ServerID_:        tx.ServerID(),
+		HighestSeverity_: tx.HighestSeverity(),
+		IsInterrupted_:   tx.IsInterrupted(),
+	}
+	if req := tx.Request(); !isNilInterface(req) {
+		r := &auditSnapshotRequest{
+			Method_:      req.Method(),
+			Protocol_:    req.Protocol(),
+			URI_:         req.URI(),
+			HTTPVersion_: req.HTTPVersion(),
+			Body_:        req.Body(),
+			Length_:      req.Length(),
+			ArgsStub:     struct{}{},
+		}
+		if hs := req.Headers(); hs != nil {
+			r.Headers_ = make(map[string][]string, len(hs))
+			for k, v := range hs {
+				r.Headers_[k] = append([]string(nil), v...)
+			}
+		}
+		for _, f := range req.Files() {
+			r.Files_ = append(r.Files_, auditSnapshotFile{Name_: f.Name(), Size_: f.Size(), Mime_: f.Mime()})
+		}
+		r.AuditLogTransactionRequest = req
+		t.Request_ = r
+	}
+	if resp := tx.Response(); !isNilInterface(resp) {
+		q := &auditSnapshotResponse{
+			Protocol_: resp.Protocol(),
+			Status_:   resp.Status(),
+			Body_:     resp.Body(),
+		}
+		if hs := resp.Headers(); hs != nil {
+			q.Headers_ = make(map[string][]string, len(hs))
+			for k, v := range hs {
+				q.Headers_[k] = append([]string(nil), v...)
+			}
+		}
+		t.Response_ = q
+	}
+	if prod := tx.Producer(); !isNilInterface(prod) {
+		p := &auditSnapshotProducer{
+			Connector_:  prod.Connector(),
+			Version_:    prod.Version(),
+			Server_:     prod.Server(),
+			RuleEngine_: prod.RuleEngine(),
+			Stopwatch_:  prod.Stopwatch(),
+		}
+		if rs := prod.Rulesets(); rs != nil {
+			p.Rulesets_ = append([]string(nil), rs...)
+		}
+		t.Producer_ = p
+	}
+	return t
+}
+
+// isNilInterface 判定接口值为 nil 或持 typed-nil 指针。
+func isNilInterface(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	}
+	return false
+}
+
 // —— 审计写插件与共享管线 ——
 
-// lbAuditItem 是队列元素：格式化后的审计行正文 + 计时关联键（空=无计时）。
+// lbAuditItem 是队列元素：审计快照 + 注册格式化器 + 计时关联键（空=无计时）。
+// 格式化已移出请求路径——Write 只构建快照，drain/同步回退侧用随行 formatter
+// 格式化（同一 target 的 writer 同构，但保守以 Write 时点的 formatter 为准）。
 type lbAuditItem struct {
-	body []byte
-	tid  string
+	snap      *auditSnapshot
+	formatter plugintypes.AuditLogFormatter
+	tid       string
 }
 
 // auditPipeline 是按目标路径共享的落盘管线（单 drain goroutine + 单 fd +
 // bufio）。多个 coraza WAF 实例（预检+各策略引擎，各自 NewWAF→独立 writer
 // 实例）追加同一审计文件时共享一条管线，避免 reload 池换血累积 goroutine/fd。
 type auditPipeline struct {
-	// mu 保护生命周期字段（queue/done/refs/closed）：enqueue 持 RLock 发送，
-	// release 持 Lock 关闭队列——与退役前 securityTimingWriter 同款互斥形态，
-	// 不会 send-on-closed。
+	// mu 保护生命周期字段（queue/done/refs/closed）：enqueue 全程持 RLock 发送
+	// （发送完成前 release 的 Lock 排队等待），release 持 Lock 置 queue=nil 并
+	// close——close(q) 与发送严格定序，不会 send-on-closed。
 	mu     sync.RWMutex
 	target string
 	queue  chan lbAuditItem
@@ -267,10 +696,11 @@ type auditPipeline struct {
 	refs   int
 	closed bool
 	// ioMu 保护 fd/bufio（仅 drain goroutine 触碰，独立于 mu 防止请求路径
-	// enqueue 的 RLock 与刷盘互斥）。
+	// enqueue 的 RLock 与刷盘互斥）。target/mode 创建后只读，无锁读。
 	ioMu sync.Mutex
 	fd   *os.File
 	bw   *bufio.Writer
+	mode os.FileMode
 }
 
 var (
@@ -292,6 +722,7 @@ func acquireAuditPipeline(target string, mode os.FileMode) (*auditPipeline, erro
 	}
 	p := &auditPipeline{
 		target: target,
+		mode:   mode,
 		queue:  make(chan lbAuditItem, auditQueueSize),
 		done:   make(chan struct{}),
 	}
@@ -324,18 +755,56 @@ func (p *auditPipeline) openFile(mode os.FileMode) error {
 }
 
 // enqueue 阻塞式入队（零丢弃）：队列满时等待 drain 消化——退化价=退役前
-// serial 同步写。管线已关（refs 归零后的尾部写入）静默丢弃。
-func (p *auditPipeline) enqueue(item lbAuditItem) {
+// serial 同步写。发送持 RLock 全程（release 的 Lock 排队等到发送完成），与
+// release 的 close(q) 定序互斥，不会 send-on-closed。管线已关（refs 归零后的
+// 重载窗口在途写入，q==nil）或 done 已闭时回退同步直写——同样零丢弃。
+func (p *auditPipeline) enqueue(item lbAuditItem) error {
 	p.mu.RLock()
 	q, done := p.queue, p.done
-	p.mu.RUnlock()
 	if q == nil {
-		return
+		p.mu.RUnlock()
+		return p.syncWrite(item)
 	}
+	// done 只在 drain 退出（晚于 release 的 Lock→close(q)）时闭合，而 close(q)
+	// 需要写锁、被本 RLock 排除——done 分支为防御性保留（未来重构若放宽锁序，
+	// 此处仍走零丢弃回退而非静默丢行）。
 	select {
 	case q <- item:
+		p.mu.RUnlock()
+		return nil
 	case <-done:
+		p.mu.RUnlock()
+		return p.syncWrite(item)
 	}
+}
+
+// syncWrite 是管线关闭后（重载窗口在途写入）的零丢弃回退：短生命周期 fd
+// O_APPEND 直写该行。与 drain 残余 bufio 批量写按行粒度交错——摄取按行解码+
+// transaction_id 幂等去重，乱序无影响。计时注入同步完成（短等终态：重载窗口
+// 内 blocked_counter 紧随 ProcessLogging，µs 级置位；上限只兜底异常形态，避免
+// 请求路径长等）。
+func (p *auditPipeline) syncWrite(item lbAuditItem) error {
+	if item.snap == nil || item.formatter == nil {
+		return nil
+	}
+	body, err := item.formatter.Format(item.snap)
+	if err != nil {
+		return err
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	if item.tid != "" {
+		snap := auditTimingWait(item.tid, auditSyncTimingWaitLimit)
+		body = injectAuditTiming(body, snap)
+	}
+	fd, err := os.OpenFile(p.target, os.O_CREATE|os.O_WRONLY|os.O_APPEND, p.mode)
+	if err != nil {
+		return err
+	}
+	defer fd.Close()
+	_, err = fd.Write(append(body, '\n'))
+	return err
 }
 
 // release 递减引用；最后一个引用释放时关闭队列——drain 排空余量、刷盘、关
@@ -390,10 +859,18 @@ func (p *auditPipeline) drain() {
 	}
 }
 
-// process 处理单条审计行：限时等待计时终态 → 注入 → bufio 写（阈值刷盘）。
-// 计时等待在请求路径之外（见文件头时序契约注释）。
+// process 处理单条审计行：注册 formatter 格式化快照（请求路径之外）→ 限时等待
+// 计时终态 → 注入 → bufio 写（阈值刷盘）。计时等待在请求路径之外（见文件头
+// 时序契约注释）。格式化失败/空输出跳过该行（与旧同步链 Write 返回错误同效，
+// coraza 已在写错误点记日志）。
 func (p *auditPipeline) process(item lbAuditItem) {
-	body := item.body
+	if item.snap == nil || item.formatter == nil {
+		return
+	}
+	body, err := item.formatter.Format(item.snap)
+	if err != nil || len(body) == 0 {
+		return
+	}
 	if item.tid != "" {
 		snap := auditTimingWait(item.tid, auditTimingWaitLimit)
 		body = injectAuditTiming(body, snap)
@@ -433,8 +910,9 @@ func (p *auditPipeline) closeFile() {
 }
 
 // lbAuditWriter 是 coraza 审计写插件实例（每个 coraza WAF 一个；多实例共享
-// 按路径的落盘管线）。Write 与退役前 serial writer 同步语义的差异仅在「格式化
-// 后入队」——格式化仍在请求路径（与 serial 相同成本），批量落盘在 drain。
+// 按路径的落盘管线）。Write 只构建审计快照入队（formatter.Format 已移出请求
+// 路径——黑名单预检计时窗内只剩快照拷贝，memcpy 级），格式化/计时等待/落盘
+// 全部后置到 drain（或管线关闭时的同步回退直写）。
 type lbAuditWriter struct {
 	formatter plugintypes.AuditLogFormatter
 	pipeline  *auditPipeline
@@ -462,19 +940,11 @@ func (w *lbAuditWriter) Write(al plugintypes.AuditLog) error {
 	if w.failed || w.pipeline == nil || w.formatter == nil || al == nil {
 		return nil
 	}
-	bts, err := w.formatter.Format(al)
-	if err != nil {
-		return err
-	}
-	if len(bts) == 0 {
-		return nil
-	}
 	tid := ""
 	if al.Transaction() != nil && al.Transaction().HasRequest() {
 		tid = securityTimingIDFromHeaders(al.Transaction().Request().Headers())
 	}
-	w.pipeline.enqueue(lbAuditItem{body: bts, tid: tid})
-	return nil
+	return w.pipeline.enqueue(lbAuditItem{snap: snapshotAuditLog(al), formatter: w.formatter, tid: tid})
 }
 
 func (w *lbAuditWriter) Close() error {

@@ -11,6 +11,13 @@ mkdir -p /app/data/caddy
 #   stopCaddy: 先建 pause → admin API 停 → 监督器见 pause 进入等待环
 #   startCaddy: 删 pause → 监督器 ≤1s 检测到 → 启动 Caddy(handler 等 admin 就绪)
 CADDY_PAUSE_FILE=/tmp/lazy-balancer-caddy-paused
+# 第 75 轮启动竞态修复：「启动回放阶段完成」标记——reapply_last_good 尾部写
+# （LKG 缺失/回放失败也写，语义=「admin 就绪+回放阶段已了结」），app 侧
+# ApplyConfigOnStartup（handlers/caddy.go waitStartupReplayDone）等本标记后再
+# 应用。消除监督器首启 LKG 回放与 app BootSync 应用的硬币竞态（app 渲染先落
+# 时旧 LKG 回放覆盖新配置——v2.3.7-beta 发版实锤）。时序构造性定死：
+# 回放 → 标记 → app 应用。
+CADDY_STARTUP_REPLAY_DONE=/tmp/lazy-balancer-caddy-startup-replayed
 
 # Initialize database on first run
 if [ ! -f /app/data/lazy-balancer.db ]; then
@@ -50,6 +57,10 @@ fi
 # 子壳：子壳内清除会与下方父壳 `echo $!` 写入竞态（实测 300/300 子壳 rm 恒晚于
 # 父壳写），误删刚写入的在位标记 → 永久失标（LBH-B-N2 回归）。
 rm -f /tmp/lazy-balancer-caddy-supervisor.pid
+# 第 75 轮启动竞态修复：回放标记同为「容器运行期」残留——上一生命周期的标记
+# 留存会让 app 在监督器本轮回放完成前误判就绪、提前应用（时序重开）。与上方
+# pid 标记同款父壳侧清除（INFRA-5：不可放子壳，子壳清除晚于本 exec 会有窗口）。
+rm -f "$CADDY_STARTUP_REPLAY_DONE"
 (
   # set +e: 监督器必须扛住 Caddy 的非零退出(被杀/崩溃)——外层 set -e 会在
   # caddy run 返回非零时杀死监督器本身(实测:kill -9 后监督器变僵尸不自愈)
@@ -104,6 +115,12 @@ rm -f /tmp/lazy-balancer-caddy-supervisor.pid
       if [ "$FIRST_START" -eq 0 ]; then
         echo restarted > /tmp/caddy-restarted
       fi
+      # 第 75 轮启动竞态修复:标记「回放阶段已了结」——app 启动载入
+      # (waitStartupReplayDone)等本标记后再应用。无条件写(回放失败/LKG 缺失
+      # 也写,否则 app 空等超时);两条调用路径(就绪主环+slow-start 后台环)
+      # 经本函数单点覆盖。运行期崩溃重放重写本标记:app 已消费或不在等待,
+      # 幂等无害。
+      : > "$CADDY_STARTUP_REPLAY_DONE"
     }
 
     # 等 admin 就绪后重应用 last-good 配置(重启后 Caddy 只有 Caddyfile 的
