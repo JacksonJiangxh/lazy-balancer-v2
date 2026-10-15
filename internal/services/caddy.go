@@ -1197,15 +1197,24 @@ func GenerateCaddyConfig(overrides ...*models.UpdateConfigRequest) map[string]in
 	return generateCaddyConfigFromStore(db.DB, overrides...)
 }
 
+// trustedProxyProjectionScope 是受信代理合并网段投影文件的稳定命名
+// （tp.txt，IPListDataDir 下）——受信代理无多实例形态（全局单份），文件名
+// 恒定 → 配置字节恒定，内容变化纯走文件热感知。已列入 GC 白名单
+// （ipListProjectedFileName），停用 24h 后自然回收。
+const trustedProxyProjectionScope = "tp"
+
 // trustedProxyServerFields 渲染受信代理（CDN 真实 IP）的 server 级字段
-// （v2.3.x）：enabled=false 时返回 (nil, "")（未启用非降级）；读错/解析失败时
-// 返回 (nil, 降级说明)——按未启用渲染（fail-closed=不注入，与「未启用」同形
-// ——宁可退回 socket IP 也不采信未校验的头），但降级说明随配置图携带落横幅
-// （D3，历史：面板「已启用」与实际渲染分叉必须可见）。启用时：
-// trusted_proxies 静态网段（内联 ∪ 引用名单展开，2026-10-12）+
-// trusted_proxies_strict（1/0 恒输出）+ client_ip_headers（非空才输出，
-// 空=仅 X-Forwarded-For）。store 形参保证事务内渲染（ApplyConfigFromTx）
-// 读到未提交的设置与名单。
+// （v2.3.x）：enabled=false 时返回 (nil, "")（未启用非降级）；读错/解析失败
+// /投影写失败时返回 (nil, 降级说明)——按未启用渲染（fail-closed=不注入，
+// 与「未启用」同形——宁可退回 socket IP 也不采信未校验的头），但降级说明
+// 随配置图携带落横幅（D3，历史：面板「已启用」与实际渲染分叉必须可见）。
+// 启用：内联 ∪ 引用名单合并网段投影到稳定路径文件（2026-10-15 热路径化，
+// trustedProxyProjectionScope）+ 发射 trusted_proxies:{source:lb_file,path}
+// （http.ip_sources.lb_file 文件源 ≤1s stat 热感知，名单/网段变化零 /load；
+// 存量 static 发射面在升级后首次渲染变化 → 一次全量重载自愈，此后配置字节
+// 恒定）+ trusted_proxies_strict（1/0 恒输出）+ client_ip_headers（非空才
+// 输出，空=仅 X-Forwarded-For）。store 形参保证事务内渲染
+// （ApplyConfigFromTx）读到未提交的设置与名单。
 func trustedProxyServerFields(store caddyConfigStore) (map[string]interface{}, string) {
 	var enabled, strict bool
 	var rangesJSON, refsJSON, headersJSON string
@@ -1231,10 +1240,19 @@ func trustedProxyServerFields(store caddyConfigStore) (map[string]interface{}, s
 		Logf("error", "展开受信代理引用名单失败（按未启用渲染）: %v", err)
 		return nil, fmt.Sprintf("受信代理引用名单展开失败，本轮渲染按未启用处理（CDN 真实 IP 还原失效，面板显示的启用态与实际渲染分叉）: %v", err)
 	}
+	// 投影热路径化（2026-10-15）：合并网段写入稳定路径文件（writeIPListFile
+	// 同族——聚合+原子换名+同字节跳写），发射 lb_file 文件源。内联网段同样
+	// 走文件 → 内联修改亦为零 /load 热路径（渲染时重写文件即可）。写失败按
+	// 既有降级口径处理（不注入+横幅说明）。
+	path, err := writeIPListFile(trustedProxyProjectionScope, merged)
+	if err != nil {
+		Logf("error", "受信代理网段投影写入失败（按未启用渲染）: %v", err)
+		return nil, fmt.Sprintf("受信代理网段投影写入失败，本轮渲染按未启用处理（CDN 真实 IP 还原失效，面板显示的启用态与实际渲染分叉）: %v", err)
+	}
 	fields := map[string]interface{}{
 		"trusted_proxies": map[string]interface{}{
-			"source": "static",
-			"ranges": merged,
+			"source": "lb_file",
+			"path":   path,
 		},
 	}
 	if strict {
@@ -1248,14 +1266,14 @@ func trustedProxyServerFields(store caddyConfigStore) (map[string]interface{}, s
 	return fields, ""
 }
 
-// expandTrustedProxyRanges 合并内联网段与引用名单条目（2026-10-12）：
-// refs 按 id 经 loadIPListEntriesVia 装载（system=1 读 .iplist 文件、
-// 自定义读 DB entries——与策略 refs 同一装载通道）；内联在前、引用按
-// refs 出现顺序追加；跨来源按规范前缀去重（裸 IP 补 /32 //128）；逐条
-// 经 CIDR 校验，非法条目跳过并留痕（名单写侧已过 validIPOrCIDR，此处
-// 仅防御带外改库/导入残留）。悬空引用（名单不存在）贡献零条目——保存侧
-// 存在性门与删除守卫保证常规路径不产生；装载失败整体 fail-closed 上抛
-// （调用方按未启用渲染，宁可退回 socket IP）。
+// expandTrustedProxyRanges 合并内联网段与引用名单条目（2026-10-12；2026-10-15
+// 起消费方=受信代理投影文件 tp.txt，不再内联进配置本体）：refs 按 id 经
+// loadIPListEntriesVia 装载（system=1 读 .iplist 文件、自定义读 DB entries
+// ——与策略 refs 同一装载通道）；内联在前、引用按 refs 出现顺序追加；跨来源
+// 按规范前缀去重（裸 IP 补 /32 //128）；逐条经 CIDR 校验，非法条目跳过并
+// 留痕（名单写侧已过 validIPOrCIDR，此处仅防御带外改库/导入残留）。悬空引用
+// （名单不存在）贡献零条目——保存侧存在性门与删除守卫保证常规路径不产生；
+// 装载失败整体 fail-closed 上抛（调用方按未启用渲染，宁可退回 socket IP）。
 func expandTrustedProxyRanges(store caddyConfigStore, inline []string, refsJSON string) ([]string, error) {
 	refIDs := parseIPListRefs(refsJSON)
 	if strings.TrimSpace(refsJSON) != "" && refIDs == nil {
@@ -3671,6 +3689,18 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	var passthroughUnion []string
 	if securityLibsOK {
 		detectionTrust, passthroughUnion = stage0TrustSets(policies)
+		// 始终发射收敛（2026-10-15）：id:12 发射面 flag 以 hasStage0TrustDetection
+		// 为准（AggregateIPEntries 空输入返回非 nil 空切片，nil-ness 不可作
+		// flag）——保留检测策略在而并集为空时以非 nil 空切片传递（id:12 恒
+		// 发射，空文件算子永不命中，空↔非空纯内容变化走热路径）；无保留检测
+		// 策略强制 nil（不发射）。
+		if hasStage0TrustDetection(policies) {
+			if len(detectionTrust) == 0 {
+				detectionTrust = []string{}
+			}
+		} else {
+			detectionTrust = nil
+		}
 	} else if rule.Protocol == "http" && len(policies) >= 1 {
 		Logf("warn", "安全规则库缺失（%s），规则 %s 的所有安全规则本次渲染不生效", securityLibrariesMissingDesc(), rule.CaddyID)
 	}
@@ -4113,11 +4143,18 @@ func (s *CaddyService) ApplyConfigFromTx(tx *sql.Tx) error {
 //   - (true, nil)  字节一致 → 零发射面变化，投影已落盘即收敛。零 /load，
 //     @ipListFast 匹配器按 mtime+size ≤1s stat 热感知新内容。调用方提交后
 //     直接成功收尾，不落「重载」审计（审计真实性）。
-//   - (false, nil) 字节不一致（发射面变化：名单清空/扩空致规则增减）或运行
+//   - (false, nil) 字节不一致（发射面变化：仅剩否定算子/非投影面形态）或运行
 //     配置不可读（无法证实零变化）→ 调用方回退既有全量渲染+应用链
 //     （fail-open 与同字节短路同向：不轻率跳过 /load）。
 //   - (false, err) 事务视图渲染被拒（生成失败）→ 调用方回退全量链得到同口径
 //     拒绝（400+回滚，fail-closed 与 ApplyConfigFromTx 一致）。
+//
+// 始终发射收敛（2026-10-15 用户裁定）：空名单也投影空文件并恒发射 @ipListFast
+// （空集=匹配器永不命中，与无规则语义等价）——收敛范围=发射面 flag 为真实
+// opt-in 的名单（deny·绕过 ACL、stage0 保留检测），空↔非空与中段同为纯
+// 内容变化全走热路径。信任名单（ip_whitelist_enabled 表默认值=1）、allow 模式
+// （否定算子）、遗留黑名单维持内容门控。存量运行配置升级后首次渲染因发射面
+// 新增触发一次全量重载，自愈收敛。
 //
 // 已持 caddyOpMu（=CaddyOpLock）的调用方使用（handlers 名单写路径全程持锁）；
 // 锁内渲染与 ApplyConfigFromTx 同序，投影写盘与 /load 永不交错。

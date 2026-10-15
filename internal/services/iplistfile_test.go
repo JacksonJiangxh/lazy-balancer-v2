@@ -134,10 +134,45 @@ func TestWriteIPListFile_identicalContentSkipsWrite(t *testing.T) {
 	}
 }
 
-func TestWriteIPListFile_emptyWritesNothing(t *testing.T) {
+// 空集合投影空文件（2026-10-15 始终发射裁定）：不再返回空串不写文件——稳定
+// 命名空文件照常落盘、路径照常返回，调用方恒发射 @ipListFast（空集永不命中
+// =与无规则语义等价），空↔非空由此降为纯内容变化全走投影热路径。
+func TestWriteIPListFile_emptyProjectsStableEmptyFile(t *testing.T) {
 	path, err := writeIPListFile("u-empty", nil)
-	if err != nil || path != "" {
-		t.Fatalf("空集合 path=%q err=%v, want 空串不写文件", path, err)
+	if err != nil || path == "" {
+		t.Fatalf("空集合 path=%q err=%v, want 非空路径（空文件投影）", path, err)
+	}
+	if base := filepath.Base(path); base != "u-empty.txt" {
+		t.Fatalf("文件名 %q, want u-empty.txt（稳定命名）", base)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil || len(content) != 0 {
+		t.Fatalf("空投影文件内容=%q err=%v, want 0 字节空文件", content, err)
+	}
+	// 幂等：同空内容重投影同路径（同字节跳写契约对空文件同样成立）
+	path2, err := writeIPListFile("u-empty", nil)
+	if err != nil || path2 != path {
+		t.Fatalf("空内容幂等写 path=%q err=%v, want %q", path2, err, path)
+	}
+}
+
+// ipListRuleOperand（2026-10-15 始终发射裁定）：空名单不再返回空串——投影空
+// 文件后恒返回 @ipListFast 算子（negated 前缀 !），空↔非空纯内容变化走热路径。
+func TestIPListRuleOperand_emptyListAlwaysEmits(t *testing.T) {
+	operand, err := ipListRuleOperand("u-operand-empty", nil, false)
+	if err != nil || operand == "" {
+		t.Fatalf("空名单 operand=%q err=%v, want 恒发射非空算子", operand, err)
+	}
+	wantPath := filepath.Join(IPListDataDir, "u-operand-empty.txt")
+	if operand != "@ipListFast "+wantPath {
+		t.Fatalf("operand=%q, want @ipListFast %s", operand, wantPath)
+	}
+	if content, err := os.ReadFile(wantPath); err != nil || len(content) != 0 {
+		t.Fatalf("空投影文件内容=%q err=%v, want 空文件已落盘", content, err)
+	}
+	negated, err := ipListRuleOperand("u-operand-empty", nil, true)
+	if err != nil || negated != "!"+operand {
+		t.Fatalf("negated operand=%q err=%v, want !%s", negated, err, operand)
 	}
 }
 

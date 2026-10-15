@@ -139,9 +139,10 @@ func TestAutobanConverge_hotNotConfirmedFallsBack(t *testing.T) {
 	}
 }
 
-// 受信代理网段引用（trusted_proxy_range_refs 渲染静态展开，文件热感知不可达）
-// → 资格门第二 Conjunct 不成立 → 回退全量重载（与手动路径资格门同判据）。
-func TestAutobanConverge_trustedProxyRefFallsBack(t *testing.T) {
+// 受信代理网段引用（trusted_proxy_range_refs）已热路径化（合并网段投影
+// tp.txt，lb_file 文件源 ≤1s stat 热感知）→ 资格门只看「被启用策略引用」，
+// 引用面变化经投影重写零重载收敛。
+func TestAutobanConverge_trustedProxyRefHotPath(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
 	listID := presetListID(t)
@@ -156,8 +157,8 @@ func TestAutobanConverge_trustedProxyRefFallsBack(t *testing.T) {
 	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
 		t.Fatalf("RunAutobanCycle: %v", err)
 	}
-	if spy.refreshes != 0 || spy.reloads != 1 {
-		t.Fatalf("受信代理网段引用必须回退全量重载：refreshes=%d reloads=%d", spy.refreshes, spy.reloads)
+	if spy.refreshes != 1 || spy.reloads != 0 {
+		t.Fatalf("受信代理网段引用名单应走投影热路径零重载：refreshes=%d reloads=%d, want 1/0", spy.refreshes, spy.reloads)
 	}
 }
 
@@ -294,17 +295,17 @@ func TestAutobanCycle_hotPathZeroLoadProjectionRewritten(t *testing.T) {
 	}
 }
 
-// Given 预置名单为空（deny ACL 段未发射，发射面=无 ACL）。
-// When 首次封禁使名单由空变非空（发射面变化：ACL 段出现）。
-// Then 热路径未证实收敛 → 回退全量重载（/load 次数 1→2），投影与运行配置按
-// 新发射面收敛——失败回退语义保留。
-func TestAutobanCycle_emissionChangeFallsBackToFullReload(t *testing.T) {
+// Given 预置名单为空且被启用策略引用（2026-10-15 始终发射收敛：首轮即恒发射
+// 空 @ipListFast，空投影就位）。
+// When 首次封禁使名单由空变非空（恒发射下为纯内容变化）。
+// Then 投影热路径收敛：零新增 /load、投影文件已含新封 IP、全量重载零调用。
+func TestAutobanCycle_emptyListFirstBanHotPath(t *testing.T) {
 	stubSecurityLibsAvailable(t)
 	installAutobanFixture(t, "2026-10-14 10:00:00")
 	newClusterTestService(t)
 	admin := newHotPathTestAdmin(t)
 	s := NewCaddyService(admin.srv.URL)
-	policyID := seedHotPathPolicy(t, presetListID(t)) // 名单为空 → 首轮不发射 ACL 段
+	policyID := seedHotPathPolicy(t, presetListID(t)) // 名单为空 → 首轮恒发射空投影
 	if err := s.GenerateAndApplyConfig(); err != nil {
 		t.Fatalf("首次全量应用: %v", err)
 	}
@@ -319,13 +320,13 @@ func TestAutobanCycle_emissionChangeFallsBackToFullReload(t *testing.T) {
 
 	autobanRunBanCycle(t, "203.0.113.77")
 
-	if spy.refreshes != 1 || spy.reloads != 1 {
-		t.Fatalf("发射面变化必须回退全量重载：refreshes=%d reloads=%d, want 1/1", spy.refreshes, spy.reloads)
+	if spy.refreshes != 1 || spy.reloads != 0 {
+		t.Fatalf("空→首封（恒发射下纯内容变化）必须热路径收敛：refreshes=%d reloads=%d, want 1/0", spy.refreshes, spy.reloads)
 	}
-	if got := admin.loadCount(); got != 2 {
-		t.Fatalf("/load 次数=%d, want 2（首次+回退全量）", got)
+	if got := admin.loadCount(); got != 1 {
+		t.Fatalf("/load 次数=%d, want 仍 1（零重载）", got)
 	}
 	if content := mustReadProjection(t, policyID); !strings.Contains(content, "203.0.113.77/32") {
-		t.Fatalf("回退后投影内容=%q, want 含新封 IP", content)
+		t.Fatalf("投影内容=%q, want 含新封 IP", content)
 	}
 }

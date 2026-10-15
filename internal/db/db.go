@@ -910,7 +910,8 @@ func runMigrations() error {
 		"global_config.trusted_proxy_enabled": "INTEGER NOT NULL DEFAULT 0",
 		"global_config.trusted_proxy_ranges":  "TEXT NOT NULL DEFAULT '[]'",
 		// 受信网段引用名单（2026-10-12）：JSON 数组文本，存 security_ip_lists 的
-		// id 列表（镜像策略 ip_acl_list_refs 形态）；渲染与内联 CIDR 合并展开。
+		// id 列表（镜像策略 ip_acl_list_refs 形态）；渲染与内联 CIDR 合并投影
+		// （2026-10-15 热路径化：tp.txt/lb_file 文件源，内容变化零 /load）。
 		"global_config.trusted_proxy_range_refs":      "TEXT NOT NULL DEFAULT '[]'",
 		"global_config.trusted_proxy_headers":         "TEXT NOT NULL DEFAULT '[]'",
 		"global_config.trusted_proxy_strict":          "INTEGER NOT NULL DEFAULT 1",

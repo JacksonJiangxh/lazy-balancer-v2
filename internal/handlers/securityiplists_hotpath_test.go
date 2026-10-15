@@ -130,6 +130,17 @@ func (f *hotPathIPListFixture) projectionContent(policyID int64) string {
 	return string(raw)
 }
 
+// trustedProxyProjectionContent 读受信代理合并网段投影（稳定命名 tp.txt）。
+func (f *hotPathIPListFixture) trustedProxyProjectionContent() string {
+	f.t.Helper()
+	path := filepath.Join(services.IPListDataDir, "tp.txt")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		f.t.Fatalf("读受信代理投影 %s: %v", path, err)
+	}
+	return string(raw)
+}
+
 func (f *hotPathIPListFixture) postJSON(path string, body any) *httptest.ResponseRecorder {
 	f.t.Helper()
 	return postJSON(f.t, f.router, path, body)
@@ -166,12 +177,12 @@ func TestAddIPToList_hotPathRewritesProjectionZeroReload(t *testing.T) {
 	}
 }
 
-// Given：名单被受信代理网段引用（trusted_proxy_range_refs 静态展开面）。
-// When：追加 IP。Then：热路径不适用——全量链真实 /load 收敛（配置本体含
-// 内联展开，文件热感知不可达）。
-func TestAddIPToList_trustedProxyReferencedReloads(t *testing.T) {
+// Given：名单被受信代理网段引用（trusted_proxy_range_refs）。When：追加 IP。
+// Then：受信代理引用面已热路径化（合并网段投影 tp.txt，lb_file 文件源 ≤1s
+// stat 热感知）——零 /load，名单投影与受信代理投影双双按新内容重写。
+func TestAddIPToList_trustedProxyReferencedHotPathZeroReload(t *testing.T) {
 	f := newHotPathIPListFixture(t)
-	listID, _ := f.seedReferencedList(`[{"value":"203.0.113.5","remark":""}]`)
+	listID, policyID := f.seedReferencedList(`[{"value":"203.0.113.5","remark":""}]`)
 	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_enabled=1, trusted_proxy_range_refs=? WHERE id=1`,
 		"["+strconv.FormatInt(listID, 10)+"]"); err != nil {
 		t.Fatal(err)
@@ -179,13 +190,24 @@ func TestAddIPToList_trustedProxyReferencedReloads(t *testing.T) {
 	if err := f.h.caddyService.GenerateAndApplyConfig(); err != nil {
 		t.Fatalf("首次应用: %v", err)
 	}
+	if got := f.loadCount(); got != 1 {
+		t.Fatalf("首次 /load=%d, want 1", got)
+	}
+	before := f.trustedProxyProjectionContent()
 
 	rec := f.postJSON(fmt.Sprintf("/security/ip-lists/%d/ips", listID), map[string]any{"value": "192.0.2.44"})
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"added":true`) {
 		t.Fatalf("追加 status=%d body=%s, want 200 added:true", rec.Code, rec.Body.String())
 	}
-	if got := f.loadCount(); got != 2 {
-		t.Fatalf("受信代理引用名单变化须全量链 /load 收敛: /load=%d, want 2", got)
+	if got := f.loadCount(); got != 1 {
+		t.Fatalf("受信代理引用名单变化应走热路径零重载: /load=%d, want 仍 1", got)
+	}
+	content := f.projectionContent(policyID)
+	if !strings.Contains(content, "203.0.113.5/32") || !strings.Contains(content, "192.0.2.44/32") {
+		t.Fatalf("名单投影内容=%q, want 含新旧全部条目", content)
+	}
+	if after := f.trustedProxyProjectionContent(); !strings.Contains(after, "192.0.2.44/32") || after == before {
+		t.Fatalf("受信代理投影应含新条目: before=%q after=%q", before, after)
 	}
 }
 

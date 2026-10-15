@@ -63,6 +63,10 @@ type ipListFileState struct {
 	size  int64
 	v4    []netip.Prefix // 升序、去重、不相交
 	v6    []netip.Prefix
+	// combined 是 v4∪v6 的只读快照（解析期一次成型）：GetIPRanges 式消费方
+	// （http.ip_sources.lb_file）逐请求取用，共享返回零分配。切片归缓存
+	// 所有，消费方 MUST NOT 修改。
+	combined []netip.Prefix
 	// lastCheckNano 是 Evaluate 节流的时间戳（原子读写，免锁热路径）。
 	lastCheckNano atomic.Int64
 }
@@ -76,14 +80,31 @@ type ipListFastOperator struct {
 	path string
 }
 
-func newIPListFast(options plugintypes.OperatorOptions) (plugintypes.Operator, error) {
-	path := strings.TrimSpace(options.Arguments)
+// NormalizeAllowedPath 白名单路径归一的导出入口（http.ip_sources.lb_file 的
+// Provision 持归一后路径作缓存键）。
+func NormalizeAllowedPath(path string) (string, error) {
+	return resolveAllowedPath(path)
+}
+
+// resolveAllowedPath 白名单路径归一（防目录穿越）：绝对路径 ∧ 在
+// AllowedPathPrefix 下 ∧ 无 .. 段。算子与导出入口（LoadPrefixesFresh/
+// ResolvePrefixes）共用单源。
+func resolveAllowedPath(path string) (string, error) {
 	cleaned := filepath.Clean(path)
 	if !filepath.IsAbs(cleaned) || !strings.HasPrefix(cleaned, AllowedPathPrefix) || strings.Contains(path, "..") {
-		return nil, fmt.Errorf("@ipListFast 路径越出白名单（须为 %s 下的绝对路径）: %q", AllowedPathPrefix, path)
+		return "", fmt.Errorf("名单路径越出白名单（须为 %s 下的绝对路径）: %q", AllowedPathPrefix, path)
+	}
+	return cleaned, nil
+}
+
+func newIPListFast(options plugintypes.OperatorOptions) (plugintypes.Operator, error) {
+	cleaned, err := resolveAllowedPath(strings.TrimSpace(options.Arguments))
+	if err != nil {
+		return nil, err
 	}
 	// 构建期 fail-closed（新鲜加载，不走缓存/节流）：文件缺失/不可读/含坏行
-	// → WAF 构建报错 → Caddy 校验拒绝、保存回滚。
+	// → WAF 构建报错 → Caddy 校验拒绝、保存回滚。空文件合法（始终发射收敛，
+	// 2026-10-15）：空集永不命中。
 	if _, err := loadIPListFileFresh(cleaned); err != nil {
 		return nil, err
 	}
@@ -110,6 +131,43 @@ func resolveIPListFile(path string) (*ipListFileState, error) {
 	return loadIPListFile(path, false)
 }
 
+// LoadPrefixesFresh 是构建期导出入口（http.ip_sources.lb_file 的 Provision
+// 消费，受信代理网段热路径化 2026-10-15）：与算子构建期同语义——新鲜加载，
+// 任何失败（缺失/不可读/坏行/超限/路径越白名单）直接报错（fail-closed →
+// Caddy 配置校验拒绝、保存回滚）；stat 命中共享缓存（同 reload 内多实例
+// 引用同一文件只解析一次）。返回切片为缓存共享只读快照，消费方 MUST NOT
+// 修改。
+func LoadPrefixesFresh(path string) ([]netip.Prefix, error) {
+	cleaned, err := resolveAllowedPath(path)
+	if err != nil {
+		return nil, err
+	}
+	state, err := loadIPListFile(cleaned, true)
+	if err != nil {
+		return nil, err
+	}
+	return state.combined, nil
+}
+
+// ResolvePrefixes 是运行期导出入口（lb_file 的 GetIPRanges 逐请求消费）：
+// 白名单同规；节流（StatCheckInterval）命中返回缓存快照；文件变化检出后
+// 重建；重建失败且有旧集 → fail-stale 返回旧集（IPRangeSource 契约——运行期
+// 取网段 MUST NOT fail，否则取消在途请求）。从未成功加载（Provision 已拦
+// 截，缓存被 GC 淘汰+文件消失的残余形态）→ error，由调用方按空集处理
+// （信任无来源，fail-closed）。返回切片为缓存共享只读快照，消费方 MUST NOT
+// 修改。
+func ResolvePrefixes(path string) ([]netip.Prefix, error) {
+	cleaned, err := resolveAllowedPath(path)
+	if err != nil {
+		return nil, err
+	}
+	state, err := resolveIPListFile(cleaned)
+	if err != nil {
+		return nil, err
+	}
+	return state.combined, nil
+}
+
 // loadIPListFile 读取并缓存名单文件：stat 形态（mtime+size）一致命中缓存，
 // 变化重建。严格解析——任何不可解析行报错（不静默跳过，防名单被削弱）。
 // 失败时缓存存在则 fail-stale 返回旧集合（fresh=true 的构建期除外：
@@ -117,10 +175,10 @@ func resolveIPListFile(path string) (*ipListFileState, error) {
 func loadIPListFile(path string, fresh bool) (state *ipListFileState, err error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return staleOrError(path, nil, fmt.Errorf("@ipListFast 名单不可读 %q: %w", path, err), fresh)
+		return staleOrError(path, nil, fmt.Errorf("IP 名单不可读 %q: %w", path, err), fresh)
 	}
 	if info.Size() > MaxFileBytes {
-		return staleOrError(path, nil, fmt.Errorf("@ipListFast 名单 %q 超过体积上限 %dMB", path, MaxFileBytes>>20), fresh)
+		return staleOrError(path, nil, fmt.Errorf("IP 名单 %q 超过体积上限 %dMB", path, MaxFileBytes>>20), fresh)
 	}
 	ipListCache.RLock()
 	cached := ipListCache.states[path]
@@ -195,7 +253,7 @@ func parseIPListFile(path string, info os.FileInfo) (*ipListFileState, error) {
 	parseCountForTest.Add(1)
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("@ipListFast 名单读取失败 %q: %w", path, err)
+		return nil, fmt.Errorf("IP 名单读取失败 %q: %w", path, err)
 	}
 	var entries []string
 	for lineNo, line := range strings.Split(string(raw), "\n") {
@@ -204,15 +262,16 @@ func parseIPListFile(path string, info os.FileInfo) (*ipListFileState, error) {
 			continue
 		}
 		if _, err := ParseIPEntry(line); err != nil {
-			return nil, fmt.Errorf("@ipListFast 名单 %q 第 %d 行不可解析: %q", path, lineNo+1, line)
+			return nil, fmt.Errorf("IP 名单 %q 第 %d 行不可解析: %q", path, lineNo+1, line)
 		}
 		entries = append(entries, line)
 	}
-	if len(entries) == 0 {
-		return nil, fmt.Errorf("@ipListFast 名单为空 %q", path)
-	}
+	// 空文件合法（2026-10-15 始终发射收敛）：渲染层空名单投影 0 字节空文件，
+	// 空集=匹配器永不命中（与无规则语义等价）——空↔非空纯内容变化走热路径，
+	// 构建期报错会使空名单策略的恒发射规则被 Caddy validate 拒绝。含坏行仍
+	// 报错（严格解析不变，防名单被静默削弱）。
 	if len(entries) > MaxEntries {
-		return nil, fmt.Errorf("@ipListFast 名单 %q 条目数 %d 超过上限 %d", path, len(entries), MaxEntries)
+		return nil, fmt.Errorf("IP 名单 %q 条目数 %d 超过上限 %d", path, len(entries), MaxEntries)
 	}
 	prefixes := AggregatePrefixes(entries)
 	state := &ipListFileState{mtime: info.ModTime(), size: info.Size()}
@@ -224,6 +283,7 @@ func parseIPListFile(path string, info os.FileInfo) (*ipListFileState, error) {
 			state.v6 = append(state.v6, p)
 		}
 	}
+	state.combined = append(append(make([]netip.Prefix, 0, len(state.v4)+len(state.v6)), state.v4...), state.v6...)
 	return state, nil
 }
 

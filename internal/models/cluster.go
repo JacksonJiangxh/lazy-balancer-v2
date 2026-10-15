@@ -220,7 +220,7 @@ type ClusterBasicSettings struct {
 	// v2.3.x 受信代理（CDN 真实 IP）：随 Caddy 全局轴同步——从节点渲染层
 	// （servers.trusted_proxies）与数据面取值与主节点一致。range_refs 为
 	// 引用的 IP 地址列表 id（JSON 数组文本，2026-10-12），引用的名单本体
-	// 在 security 节同步——从端渲染同样静态展开。
+	// 在 security 节同步——从端渲染同样投影（tp.txt/lb_file 热路径，2026-10-15）。
 	TrustedProxyEnabled   bool   `json:"trusted_proxy_enabled,omitempty"`
 	TrustedProxyRanges    string `json:"trusted_proxy_ranges,omitempty"`
 	TrustedProxyRangeRefs string `json:"trusted_proxy_range_refs,omitempty"`

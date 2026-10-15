@@ -150,10 +150,12 @@ func crsPoolFingerprint() string {
 // 策略归因的合成中断码（481+，securityPolicyContext.policySynthetic 按策略
 // 身份分配）；>0 时段内全部 deny 显式抬码（IP ACL/GeoIP/自定义规则/CRS
 // 949110），0 时逐字节保持现状（403 或缺省，单策略/无页路径回归形状）。
-// stage0DetectionTrust（第 6 参，可选变参）：阶段 0 信任名单策略（保留检测
-// 记录=trust_detection=1）按规则绑定的信任并集——每个策略引擎发射 id:12
-// DetectionOnly（信任 IP 全评估全记录不拦；与 mixed 存量信任的 id:3/5 同族
-// 但 id 独立；直通形态 trust_detection=0 由路由层 subroute 短路，不进本参数）。
+// stage0DetectionTrust（第 6 参，可选变参）：发射面 flag 与内容二合一——变参
+// 出现即「存在 stage0 信任名单保留检测策略（trust_detection=1）」（恒发射
+// id:12；并集可空=空文件算子永不命中，与无规则等价，空↔非空纯内容变化走
+// 热路径，2026-10-15 始终发射收敛）；缺省=无此类策略（不发射）。并集元素为
+// 按规则绑定的信任地址（直通形态 trust_detection=0 由路由层 subroute 短路，
+// 不进本参数）。
 func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crsFingerprint string, multiPolicy bool, blockStatus int, stage0DetectionTrust ...[]string) (string, error) {
 	var sb strings.Builder
 	// 历史问题 三十次 F1：嵌 coraza 池键指纹（见 crsPoolFingerprint）——CRS 文件
@@ -179,7 +181,13 @@ func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crs
 	// 不再构成开引擎理由——纯 GeoIP 策略产空串不出 handler。stage0 信任名单
 	// 策略的信任不属于本引擎（直通=路由层 subroute 短路零事件；保留检测=
 	// id:12 由预检与其他策略引擎承载）——stage0 策略产空串不出 handler。
-	emitIPControl := (p.IPWhitelistEnabled && p.PolicyType != models.PolicyTypeStage0 && len(ipWL) > 0) || len(ipBL) > 0 || (p.IPACLEnabled && len(ipACLList) > 0)
+	// 始终发射收敛（2026-10-15 用户裁定）：deny·绕过 ACL 开启即算 IP 控制
+	//（空名单恒发射空文件算子，永不命中=与无规则等价，空↔非空纯内容变化走
+	// 热路径）。信任名单不收敛：ip_whitelist_enabled 表默认值即 1（非刻意
+	// opt-in，flag 门控会使全部默认策略凭空获得引擎/信任规则——发射面膨胀，
+	// 门禁钉测实证），维持内容门控；allow ACL（否定算子）与遗留黑名单同理
+	// 维持内容门控（见下 ipListRuleOperand 调用点注释）。
+	emitIPControl := (p.IPWhitelistEnabled && p.PolicyType != models.PolicyTypeStage0 && len(ipWL) > 0) || len(ipBL) > 0 || (p.IPACLEnabled && (p.IPACLMode != "allow" || len(ipACLList) > 0))
 	customRules := policyCustomRulesCached(p, store)
 	hasCustomRules := false
 	for _, cr := range customRules {
@@ -279,7 +287,13 @@ func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crs
 	aclOperand := ""
 	trustOperand := ""
 	negTrustOperand := ""
-	if p.IPACLEnabled && len(ipACLList) > 0 {
+	// 信任名单维持内容门控（不收敛，2026-10-15：ip_whitelist_enabled 表默认
+	// 值=1 非刻意 opt-in，flag 门控会使全部默认策略凭空获得信任规则——门禁
+	// 钉测实证；空↔非空仍走全量链）。allow 模式的 ACL 规则为 !@ipListFast
+	//（否定算子）：空集=恒命中=全拒，与「无规则=全放」语义不等价且有全站
+	// 锁死风险——同样维持内容门控。遗留黑名单为内联字段，仅经策略保存（全
+	// 量链）变化，维持内容门控。
+	if p.IPACLEnabled && (p.IPACLMode != "allow" || len(ipACLList) > 0) {
 		operand, err := ipListRuleOperand(fmt.Sprintf("p%d-acl", p.ID), ipACLList, p.IPACLMode == "allow")
 		if err != nil {
 			return "", err
@@ -295,7 +309,7 @@ func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crs
 		negTrustOperand = "!" + operand
 	}
 	绕过Emitted := false
-	if p.IPACLEnabled && p.IPACLMode == "绕过" && len(ipACLList) > 0 {
+	if p.IPACLEnabled && p.IPACLMode == "绕过" {
 		sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:3,phase:1,pass,nolog,ctl:ruleEngine=Off,ctl:auditEngine=Off\"\n", aclOperand))
 		绕过Emitted = true
 	}
@@ -314,7 +328,7 @@ func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crs
 	// 时,绑定规则的每个策略引擎发射 id:12 DetectionOnly——信任 IP 全评估全
 	// 记录不拦（事件动作=检测）。直通形态（trust_detection=0）由路由层
 	// subroute 短路,不经任何引擎。
-	if len(stage0DetectionTrust) > 0 && len(stage0DetectionTrust[0]) > 0 {
+	if len(stage0DetectionTrust) > 0 {
 		operand, err := ipListRuleOperand("u-trust12", stage0DetectionTrust[0], false)
 		if err != nil {
 			return "", err
@@ -336,6 +350,9 @@ func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crs
 	// 链首段」(rule_parser.go:421)——deny/status/log/msg/skipAfter 必须在
 	// 首段并以 ,chain 收尾,续段仅 t:none(GeoIP id:8 同款生产形状);
 	// deny 在续段的形状被解析器整体拒绝(v2.2.11 出厂事故)。
+	// multiPolicyTrustExclusion 维持内容门控（信任名单不收敛，2026-10-15：
+	// ip_whitelist_enabled 表默认值=1 非刻意 opt-in——空信任会使链段凭空
+	// 增减且全部默认策略发射面膨胀，门禁钉测实证）。
 	multiPolicyTrustExclusion := multiPolicy && p.IPWhitelistEnabled && len(ipWL) > 0
 	// 拦截页按触发策略归因：blockStatus>0（本策略分配了合成中断码）时段内
 	// 全部 deny 显式抬码；==0 时逐字节保持现状（403 或缺省）——单策略/无页
@@ -587,6 +604,19 @@ func stage0TrustSets(policies []*models.SecurityPolicy) (detection, passthrough 
 		}
 	}
 	return aggregateIPEntries(detection), aggregateIPEntries(passthrough)
+}
+
+// hasStage0TrustDetection 报告绑定策略中是否存在 stage0 信任保留检测策略
+// （trust_detection=1）——id:12 的发射面 flag。始终发射收敛（2026-10-15 用户
+// 裁定）：与名单内容解耦，空并集投影空文件恒发射（空集永不命中=与无规则
+// 等价），空↔非空纯内容变化走热路径。
+func hasStage0TrustDetection(policies []*models.SecurityPolicy) bool {
+	for _, p := range policies {
+		if p != nil && p.PolicyType == models.PolicyTypeStage0 && p.IPWhitelistEnabled && p.TrustDetection {
+			return true
+		}
+	}
+	return false
 }
 
 // emitBodyProcessorRules 发射 JSON/XML body processor 激活与畸形 body 守卫
@@ -854,19 +884,17 @@ func emitCustomRules(sb *strings.Builder, customRules []models.CustomRule, block
 }
 
 // SecurityPolicyHasIPControl reports whether the policy applies any IP-level
-// control, mirroring the emission condition in BuildCorazaDirectives: a
-// non-empty trust list (ip_whitelist) applies when ip_whitelist_enabled is
-// on, a legacy blacklist (ip_blacklist) always applies, while the ACL list
-// (allow/deny/绕过) only applies when ip_acl_enabled is on. Referenced IP
-// lists count the same as inline entries
+// control, mirroring the emission condition in BuildCorazaDirectives. 始终发射
+// 收敛（2026-10-15）：deny·绕过 ACL 的开启 flag 即发射面（空名单恒发射空
+// 文件算子，永不命中=与无规则等价），镜像与内容解耦；信任名单（ip_whitelist_
+// enabled 表默认值=1 非刻意 opt-in）、allow 模式（否定算子）与遗留黑名单
+// 维持内容门控。Referenced IP lists count the same as inline entries
 // (refs-only policies still advertise IP control)——仅解析 refs JSON 本身，
 // 无需加载数据库（摘要/绑定路径与生成路径同判定）。
 func SecurityPolicyHasIPControl(p *models.SecurityPolicy) bool {
 	if p == nil {
 		return false
 	}
-	var ipACLList []string
-	json.Unmarshal([]byte(p.IPACLList), &ipACLList)
 	var ipWL []string
 	json.Unmarshal(p.IPWhitelist, &ipWL)
 	if p.IPWhitelistEnabled && len(ipWL) > 0 {
@@ -875,12 +903,17 @@ func SecurityPolicyHasIPControl(p *models.SecurityPolicy) bool {
 	if p.IPWhitelistEnabled && ipListRefsNonEmpty(p.IPWhitelistRefs) {
 		return true
 	}
-	var ipBL []string
-	json.Unmarshal(p.IPBlacklist, &ipBL)
-	if len(ipBL) > 0 {
+	if p.IPACLEnabled && p.IPACLMode != "allow" {
 		return true
 	}
-	return p.IPACLEnabled && (len(ipACLList) > 0 || ipListRefsNonEmpty(p.IPACLListRefs))
+	var ipACLList []string
+	json.Unmarshal([]byte(p.IPACLList), &ipACLList)
+	if p.IPACLEnabled && (len(ipACLList) > 0 || ipListRefsNonEmpty(p.IPACLListRefs)) {
+		return true
+	}
+	var ipBL []string
+	json.Unmarshal(p.IPBlacklist, &ipBL)
+	return len(ipBL) > 0
 }
 
 // CountEnabledCustomRules returns how many of the policy's referenced custom
@@ -903,11 +936,20 @@ func CountEnabledCustomRules(raw json.RawMessage) int {
 // store 与策略预载同源（A-I1）：自定义规则读取必须沿同一 store——tx 内生成
 // 时 db.DB 看不到未提交的 security_custom_rules 行，会静默丢失 WAF 规则。
 // store=nil 时由 resolvePolicyCustomRules 回退 db.DB（非批量路径保持现状）。
+// stage0DetectionTrust 契约（始终发射收敛，2026-10-15）：nil=无 stage0 保留
+// 检测策略（不发射 id:12）；非 nil（可空切片）=存在——恒发射 id:12（空集
+// 文件算子永不命中=与无规则等价，空↔非空纯内容变化走热路径）。
 func buildWafHandlerWithPolicy(ruleCaddyID string, policy *models.SecurityPolicy, store caddyConfigStore, crsFp string, multiPolicy bool, blockStatus int, bodyLimitMB int, stage0DetectionTrust []string) (map[string]interface{}, error) {
 	if policy == nil {
 		return nil, nil
 	}
-	directives, err := BuildCorazaDirectives(policy, store, crsFp, multiPolicy, blockStatus, stage0DetectionTrust)
+	var directives string
+	var err error
+	if stage0DetectionTrust == nil {
+		directives, err = BuildCorazaDirectives(policy, store, crsFp, multiPolicy, blockStatus)
+	} else {
+		directives, err = BuildCorazaDirectives(policy, store, crsFp, multiPolicy, blockStatus, stage0DetectionTrust)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1115,17 +1157,27 @@ func cidrIntersectParsed(pa, b *parsedEntry) string {
 func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int) (string, error) {
 	var denyUnion, blacklistUnion []string
 	var allowLists [][]string
+	// 始终发射收敛（2026-10-15 用户裁定）：deny ACL 开启即计入发射面（并集可
+	// 空=空文件算子永不命中，空↔非空纯内容变化走热路径）；allow 为否定算子
+	//（空集=恒命中=全拒，语义不等价）维持内容门控；黑名单为内联字段维持
+	// 内容门控。
+	hasDenyACL := false
 	for _, p := range policies {
 		if p == nil {
 			continue
 		}
 		aclList := mergedACLList(p)
-		if p.IPACLEnabled && len(aclList) > 0 {
+		if p.IPACLEnabled {
 			switch p.IPACLMode {
 			case "deny":
-				denyUnion = append(denyUnion, aclList...)
+				hasDenyACL = true
+				if len(aclList) > 0 {
+					denyUnion = append(denyUnion, aclList...)
+				}
 			case "allow":
-				allowLists = append(allowLists, aclList)
+				if len(aclList) > 0 {
+					allowLists = append(allowLists, aclList)
+				}
 			}
 		}
 		var blacklist []string
@@ -1140,7 +1192,12 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 		}
 	}
 	detectionTrust, _ := stage0TrustSets(policies)
-	if len(denyUnion) == 0 && len(blacklistUnion) == 0 && len(allowLists) == 0 && !hasGeoIP && len(detectionTrust) == 0 {
+	hasStage0Detection := hasStage0TrustDetection(policies)
+	// 早退条件以发射面 flag/内容表达：deny ACL 收敛到 flag（始终发射，
+	// 2026-10-15）；stage0 保留检测收敛到 flag（空并集恒发射 id:12）；信任
+	// 并集维持内容门控（ip_whitelist_enabled 表默认值=1 非刻意 opt-in，flag
+	// 门控会使全部默认站点凭空获得预检，门禁钉测实证）。
+	if !hasDenyACL && len(blacklistUnion) == 0 && len(allowLists) == 0 && !hasGeoIP && !hasStage0Detection && len(detectionTrust) == 0 {
 		return "", nil
 	}
 	var sb strings.Builder
@@ -1170,6 +1227,9 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 			}
 		}
 	}
+	// 信任并集维持内容门控（不收敛，2026-10-15：ip_whitelist_enabled 表默认
+	// 值=1 非刻意 opt-in，flag 门控会使全部默认站点凭空获得预检 id:3——门禁
+	// 钉测实证；空↔非空仍走全量链）。
 	if len(trustUnion) > 0 {
 		operand, err := ipListRuleOperand("u-trust", trustUnion, false)
 		if err != nil {
@@ -1178,8 +1238,9 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 		sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:3,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly\"\n", operand))
 	}
 	// 阶段 0 保留检测（trust_detection=1）：预检同形 id:12 DetectionOnly——
-	// 与策略引擎的 id:12 同集（各自 coraza 事务独立生效）。
-	if len(detectionTrust) > 0 {
+	// 与策略引擎的 id:12 同集（各自 coraza 事务独立生效）。发射面 flag 与内容
+	// 解耦（始终发射收敛，2026-10-15）：空并集投影空文件恒发射。
+	if hasStage0Detection {
 		operand, err := ipListRuleOperand("u-trust12", detectionTrust, false)
 		if err != nil {
 			return "", err
@@ -1192,7 +1253,7 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 	if denyStatus <= 0 {
 		denyStatus = 403
 	}
-	if len(denyUnion) > 0 {
+	if hasDenyACL {
 		operand, err := ipListRuleOperand("u-deny", denyUnion, false)
 		if err != nil {
 			return "", err
@@ -1280,6 +1341,9 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 		sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"!@ipMatch %s\" \"id:%d,phase:1,deny%s,log,msg:'GeoIP 区域拦截',skipAfter:SECURITY_RULES_END,chain\"\n", strings.Join(geoipPrivateRanges, ","), geoipPrecheckRuleBase+p.ID, geoipStatusFragment))
 		sb.WriteString(fmt.Sprintf(" SecRule REQUEST_HEADERS:X-LB-GeoIP-Loc \"%s\" \"t:none\"\n", escapeCorazaPattern(geoipLocOperator(geoipCountries(p), p.GeoIPMode == "allow", geoipCountryExact))))
 		if p.IPWhitelistEnabled {
+			// 信任维持内容门控（不收敛，2026-10-15：ip_whitelist_enabled 表
+			// 默认值=1 非刻意 opt-in，flag 门控会使每条 GeoIP 链凭空获得恒真
+			// 续段——门禁钉测实证）。
 			if trusted := mergedWhitelist(p); len(trusted) > 0 {
 				operand, err := ipListRuleOperand(fmt.Sprintf("p%d-trust", p.ID), trusted, true)
 				if err != nil {

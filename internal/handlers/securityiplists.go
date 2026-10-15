@@ -944,15 +944,16 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 }
 
 // tryIPListHotPathApply 名单-only 变更的投影热路径（2026-10-15 用户裁定）。
-// 资格 = 条目实际变化 ∧ 被启用策略引用 ∧ 未被受信代理网段引用
-// （trusted_proxy_range_refs 渲染静态展开进配置本体，文件热感知不可达，须
-// 全量链 /load 收敛）。资格内以事务视图渲染重写投影文件（原子 tmp+rename）
-// 并与运行配置结构级比对：证实零发射面变化 → 提交+业务审计+热路径说明
-// （零 /load，@ipListFast 匹配器 ≤1s stat 热感知；不落「重载」审计——审计
-// 真实性）；未证实（发射面变化）/不可判定（运行配置不可读）/生成被拒 →
-// 返回 false 落回 finishTxApply 全量链（拒绝同口径 400+回滚）。已持
-// caddyOpMu（=CaddyOpLock，调用方写路径临界区），渲染与 /load 永不交错。
-// 返回 true = 请求已终结（调用方立即 return）。
+// 资格 = 条目实际变化 ∧ 被启用策略引用（受信代理引用面 2026-10-15 同步热
+// 路径化：合并网段投影 tp.txt 经 http.ip_sources.lb_file ≤1s stat 热感知，
+// 原静态展开「须 /load 收敛」的资格排除分支整体退役）。
+// 资格内以事务视图渲染重写投影文件（原子 tmp+rename）并与运行配置结构级
+// 比对：证实零发射面变化 → 提交+业务审计+热路径说明（零 /load，@ipListFast
+// 匹配器 ≤1s stat 热感知；不落「重载」审计——审计真实性）；未证实（发射面
+// 变化）/不可判定（运行配置不可读）/生成被拒 → 返回 false 落回 finishTxApply
+// 全量链（拒绝同口径 400+回滚）。已持 caddyOpMu（=CaddyOpLock，调用方写
+// 路径临界区），渲染与 /load 永不交错。返回 true = 请求已终结（调用方立即
+// return）。
 func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, entriesChanged bool, f txApplyFinish) bool {
 	if !entriesChanged {
 		return false // 元数据-only 变更零发射面影响，维持既有全量链（同字节短路）
@@ -961,8 +962,7 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 	if perr != nil || listID <= 0 {
 		return false
 	}
-	if !services.IPListsReferencedByEnabledPolicy([]int{int(listID)}) ||
-		services.TrustedListsReferencedByTrustedProxy([]int{int(listID)}) {
+	if !services.IPListsReferencedByEnabledPolicy([]int{int(listID)}) {
 		return false
 	}
 	hot, err := h.caddyService.RefreshIPListProjectionsFromTxInLock(tx)

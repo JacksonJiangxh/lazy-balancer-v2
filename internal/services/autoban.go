@@ -655,18 +655,17 @@ func autobanMarkReloadFailed(reason string, err error) {
 	Logf("error", "自动封禁名单重载失败（%s，已置暂存待重试）: %v", reason, err)
 }
 
-// autobanListHotPathEligible 热路径资格门（与手动名单写路径/威胁库收敛门同一
-// 查询核心单源，日志前缀区分来源）：被启用策略引用（ip_acl_list_refs/
-// ip_whitelist_refs）∧ 非受信代理网段引用（trusted_proxy_range_refs 渲染静态
-// 展开进配置本体，文件热感知不可达）。查询/解析失败按「被引用」处理
-// （fail-closed——宁可回退一次全量重载，不欠引用方渲染收敛）。
+// autobanListHotPathEligible 热路径资格门（与手动名单写路径同一查询核心
+// 单源）：被启用策略引用（ip_acl_list_refs/ip_whitelist_refs）。受信代理
+// 引用面 2026-10-15 同步热路径化（合并网段投影 tp.txt 经
+// http.ip_sources.lb_file ≤1s stat 热感知）——原「非受信代理网段引用」
+// Conjunct 整体退役。查询/解析失败按「被引用」处理（fail-closed——宁可
+// 回退一次全量重载，不欠引用方渲染收敛）。
 func autobanListHotPathEligible(listID int64) bool {
 	if listID <= 0 {
 		return false
 	}
-	ids := []int{int(listID)}
-	return ipListsReferencedByEnabledPolicyLabeled("自动封禁", ids) &&
-		!trustedListsReferencedByTrustedProxyLabeled("自动封禁", ids)
+	return ipListsReferencedByEnabledPolicyLabeled("自动封禁", []int{int(listID)})
 }
 
 // autobanConvergeLocked 名单内容变化（merge 新封/清到期/容量挤出）后的生效

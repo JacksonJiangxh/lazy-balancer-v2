@@ -266,7 +266,7 @@ type GlobalConfig struct {
 	TrustedProxyEnabled bool   `json:"trusted_proxy_enabled"`
 	TrustedProxyRanges  string `json:"trusted_proxy_ranges"`
 	// 受信网段引用的 IP 地址列表 id（JSON 数组文本，2026-10-12）：与内联
-	// trusted_proxy_ranges 合并生效（渲染静态展开）。
+	// trusted_proxy_ranges 合并投影（2026-10-15 热路径化，tp.txt/lb_file）。
 	TrustedProxyRangeRefs string       `json:"trusted_proxy_range_refs"`
 	TrustedProxyHeaders   string       `json:"trusted_proxy_headers"`
 	TrustedProxyStrict    bool         `json:"trusted_proxy_strict"`
