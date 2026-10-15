@@ -1,9 +1,6 @@
 package services
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,10 +51,12 @@ func readRenderedIPList(t *testing.T, directives, scopeMarker string) string {
 	return ""
 }
 
-// writeIPListFile（v2.3.x）：内容寻址文件名（scope-sha256[:12]）、聚合后落盘、
-// 原子写（tmp+rename）、幂等（同内容重复写返回同路径不产生第二份）、
-// 空集合不写文件返回空串。
-func TestWriteIPListFile_contentAddressedAtomic(t *testing.T) {
+// writeIPListFile（2026-10-15 热路径改造）：稳定命名 <scope>.txt（scope 字符串
+// 本身即投影实例身份——策略 id/并集描述符；名单改名/内容变化都不改变文件名）、
+// 聚合后落盘、原子写（tmp+rename）、同字节跳写（全量渲染重投影 stat 命中且
+// 内容一致 → 不重写，mtime 保持）、内容变化 → 同路径原子换内容（配置字节
+// 不变，@ipListFast 匹配器 ≤1s stat 热感知）、空集合不写文件返回空串。
+func TestWriteIPListFile_stableNaming(t *testing.T) {
 	// Given
 	entries := []string{"10.0.0.128/25", "10.0.0.0/25", "203.0.113.7", "203.0.113.7"}
 
@@ -67,10 +66,9 @@ func TestWriteIPListFile_contentAddressedAtomic(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	// Then：文件名 scope-哈希 形态，内容聚合（兄弟归并 10.0.0.0/24 + 归一 /32）
-	base := filepath.Base(path1)
-	if !strings.HasPrefix(base, "u-bl-") || !strings.HasSuffix(base, ".txt") {
-		t.Fatalf("文件名 %q 不符 scope-hash.txt 形态", base)
+	// Then：文件名恰为 <scope>.txt，内容聚合（兄弟归并 10.0.0.0/24 + 归一 /32）
+	if base := filepath.Base(path1); base != "u-bl.txt" {
+		t.Fatalf("文件名 %q, want 恰为 u-bl.txt（稳定命名）", base)
 	}
 	content, err := os.ReadFile(path1)
 	if err != nil {
@@ -90,8 +88,49 @@ func TestWriteIPListFile_contentAddressedAtomic(t *testing.T) {
 	}
 	// 不同 scope 同内容 → 不同文件
 	path3, err := writeIPListFile("p1-trust", entries)
-	if err != nil || path3 == path1 || !strings.Contains(filepath.Base(path3), "p1-trust-") {
+	if err != nil || path3 == path1 || filepath.Base(path3) != "p1-trust.txt" {
 		t.Fatalf("scope 隔离失败: %q vs %q", path3, path1)
+	}
+
+	// 内容变化 → 同路径原子换内容（稳定命名的核心契约：名单内容变化不得
+	// 改变文件名/配置字节）
+	newEntries := []string{"192.0.2.44", "203.0.113.7"}
+	path4, err := writeIPListFile("u-bl", newEntries)
+	if err != nil || path4 != path1 {
+		t.Fatalf("内容变化应复用同一路径: path=%q err=%v, want %q", path4, err, path1)
+	}
+	content4, err := os.ReadFile(path1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content4) != "192.0.2.44/32\n203.0.113.7/32\n" {
+		t.Fatalf("内容变化后文件内容=%q, want 新集合聚合形态", content4)
+	}
+}
+
+// 同字节跳写：内容一致的重投影（全量渲染重投影不动）不得重写文件——mtime
+// 保持不变（wafiplist stat 形态缓存命中，运行期匹配器零重建）。
+func TestWriteIPListFile_identicalContentSkipsWrite(t *testing.T) {
+	entries := []string{"203.0.113.9"}
+	path, err := writeIPListFile("u-skip", entries)
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	first, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// When：同内容重投影
+	if _, err := writeIPListFile("u-skip", entries); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	// Then：mtime 未变（未发生重写）
+	second, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.ModTime().Equal(second.ModTime()) {
+		t.Fatalf("同内容重投影不应重写文件: mtime %v → %v", first.ModTime(), second.ModTime())
 	}
 }
 
@@ -103,17 +142,18 @@ func TestWriteIPListFile_emptyWritesNothing(t *testing.T) {
 }
 
 // gcStaleIPListFiles（F49-3 文件+缓存 GC）：成功投影后按「近期渲染引用的
-// 文件集」差集清理——超龄（mtime 早于 24h）且未引用的 scope-*.txt 被删；
-// 引用中的文件与重载窗口内（mtime 新）的未引用文件不动；非投影命名（非
-// scope-sha256[:12].txt 形态）文件不碰。
+// 文件集」差集清理——超龄（mtime 早于 24h）且未引用的投影命名文件被删
+// （含旧内容寻址形态：迁移过渡分支）；引用中的文件与重载窗口内（mtime 新）
+// 的未引用文件不动；非投影命名文件不碰。
 func TestGCStaleIPListFiles_removesOldUnreferencedOnly(t *testing.T) {
-	// Given：投影 A（引用中）与 B（将被遗弃）；另造超龄未引用文件 C、新鲜未
-	// 引用文件 D、非投影命名文件 E
-	pathA, err := writeIPListFile("gc-keep", []string{"203.0.113.1"})
+	// Given：投影 A（引用中）与 B（将被遗弃，新稳定命名 u- 形态）；另造超龄
+	// 未引用文件 C（旧内容寻址形态——迁移期 GC 自然回收钉）、新鲜未引用文件
+	// D、非投影命名文件 E
+	pathA, err := writeIPListFile("u-gckeep", []string{"203.0.113.1"})
 	if err != nil {
 		t.Fatalf("write A: %v", err)
 	}
-	pathB, err := writeIPListFile("gc-drop", []string{"198.51.100.1"})
+	pathB, err := writeIPListFile("u-gcdrop", []string{"198.51.100.1"})
 	if err != nil {
 		t.Fatalf("write B: %v", err)
 	}
@@ -132,7 +172,7 @@ func TestGCStaleIPListFiles_removesOldUnreferencedOnly(t *testing.T) {
 	if err := os.Chtimes(pathC, old, old); err != nil {
 		t.Fatal(err)
 	}
-	pathD, err := writeIPListFile("gc-fresh", []string{"192.0.2.9"})
+	pathD, err := writeIPListFile("u-gcfresh", []string{"192.0.2.9"})
 	if err != nil {
 		t.Fatalf("write D: %v", err)
 	}
@@ -193,15 +233,47 @@ func TestGCStaleIPListFiles_prunesStaleRefEntries(t *testing.T) {
 	}
 }
 
+// GC regex 形态（2026-10-15 热路径改造）：新稳定命名（<scope>.txt——u- 并集
+// 描述符 / p<id>-角色 白名单形态）与旧内容寻址形态（scope-sha256[:12].txt
+// ——迁移期 GC 自然回收）都命中；用户手放文件（非投影命名形态）不碰。
+func TestIPListProjectedFileName_forms(t *testing.T) {
+	matched := []string{
+		"u-deny.txt", "u-trust.txt", "u-trust12.txt", "u-bl.txt", "u-allow.txt", "u-allow-exempt.txt",
+		"p12-acl.txt", "p7-trust.txt", "p3-bl.txt",
+		"u-gcdrop.txt",             // 测试注入的 u- 描述符形态
+		"u-deny-abc123def456.txt",  // 旧内容寻址形态（迁移期回收）
+		"p12-acl-0123456789ab.txt", // 旧形态（策略 scope）
+		"orphan-deadbeef0012.txt",  // 旧形态（任意 scope 前缀，精确 12 位 hex）
+	}
+	for _, name := range matched {
+		if !ipListProjectedFileName.MatchString(name) {
+			t.Fatalf("投影命名 %q 应命中 GC regex", name)
+		}
+	}
+	unmatched := []string{
+		"notes.txt",                 // 用户手放
+		"backup.txt",                // 用户手放
+		"deny-list.txt",             // 非投影形态
+		"u-deny.TXT",                // 大小写不匹配（仅小写规范形态）
+		"p12-acl.txt.tmp",           // 投影临时文件（由 .tmp 清理支线处理）
+		"orphan-deadbeef001200.txt", // 13 位 hex ≠ 旧 12 位形态（hash 过渡分支精确 12 位）
+		"acl.txt",                   // 缺策略 id 前缀
+		"x12-acl.txt",               // 非 p<数字> 前缀
+	}
+	for _, name := range unmatched {
+		if ipListProjectedFileName.MatchString(name) {
+			t.Fatalf("非投影命名 %q 不应命中 GC regex（用户手放文件不碰）", name)
+		}
+	}
+}
+
 // 第 59 轮 R59-P3（U5-1）：writeIPListFile 不得使用确定性 .tmp 路径——并发渲染
-// 同一 (scope,内容) 时 WriteFile(O_TRUNC)+Rename 交错会把半截文件暴露到内容
-// 寻址正式路径。确定性 RED：预占旧确定性 tmp 路径为目录（WriteFile 恒失败），
-// 修复后（CreateTemp 唯一临时名）不受占位影响照常成功。
+// 同一 (scope,内容) 时 WriteFile(O_TRUNC)+Rename 交错会把半截文件暴露到正式
+// 路径。确定性 RED：预占旧确定性 tmp 路径为目录（WriteFile 恒失败），修复后
+// （CreateTemp 唯一临时名）不受占位影响照常成功。
 func TestWriteIPListFile_uniqueTempNotBlockedByStalePath(t *testing.T) {
 	entries := []string{"198.51.100.9"}
-	sum := sha256.Sum256([]byte(strings.Join(wafiplist.AggregateIPEntries(entries), "\n")))
-	name := fmt.Sprintf("%s-%s.txt", "r59tmp", hex.EncodeToString(sum[:])[:12])
-	stalePath := filepath.Join(IPListDataDir, name+".tmp")
+	stalePath := filepath.Join(IPListDataDir, "r59tmp.txt.tmp")
 	if err := os.MkdirAll(stalePath, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -211,12 +283,15 @@ func TestWriteIPListFile_uniqueTempNotBlockedByStalePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("旧确定性 tmp 被占位不应阻塞写入（唯一临时名）: %v", err)
 	}
+	if base := filepath.Base(path); base != "r59tmp.txt" {
+		t.Fatalf("正式路径 %q, want r59tmp.txt（稳定命名）", base)
+	}
 	content, err := os.ReadFile(path)
 	if err != nil || !strings.Contains(string(content), "198.51.100.9") {
 		t.Fatalf("正式路径内容不完整: %v %q", err, content)
 	}
 	// 成功路径不得遗留 .tmp 文件（占位目录本身不计）
-	matches, _ := filepath.Glob(filepath.Join(IPListDataDir, "r59tmp-*.tmp"))
+	matches, _ := filepath.Glob(filepath.Join(IPListDataDir, "r59tmp*.tmp"))
 	for _, m := range matches {
 		if info, err := os.Stat(m); err == nil && !info.IsDir() {
 			t.Fatalf("成功写入不得遗留 tmp: %v", matches)

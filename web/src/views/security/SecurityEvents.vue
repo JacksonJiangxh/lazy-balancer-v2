@@ -56,22 +56,34 @@
       <!-- 观察模式建议列表：dry-run 下达阈值 IP（不封禁，供评估阈值/口径） -->
       <template v-if="autobanStatus.enabled && autobanStatus.dry_run && (autobanStatus.suggestions?.length ?? 0) > 0">
         <div class="info-note-bar autoban-warn-bar">
-          <span class="info-note-desc">观察模式：以下 IP 在 {{ autobanStatus.window_minutes }} 分钟窗口内命中 {{ autobanStatus.threshold }} 次阈值（仅记录建议，不写入名单；建议封禁时长 {{ autobanDurationText }}；最多展示命中最多的 50 条）</span>
+          <span class="info-note-desc">观察模式：以下 IP 在 {{ autobanStatus.window_minutes }} 分钟窗口内达到 {{ autobanStatus.threshold }} 次阈值（仅记录建议，不写入名单）</span>
         </div>
         <el-table :data="autobanStatus.suggestions" size="small" max-height="320" :header-cell-style="{ background: '#f9fafb' }">
-          <el-table-column label="IP" width="200">
+          <el-table-column label="IP" min-width="230">
             <template #default="{ row }">
               <!-- 快捷处置弹框与事件表同款（无规则上下文：组件回退全量启用策略，SecurityOverview top_ips 同形态） -->
               <IPLocationAction :ip="row.ip" :location="row.ip_location || ''" />
             </template>
           </el-table-column>
-          <el-table-column label="命中次数" width="110" align="right">
+          <el-table-column label="命中次数" width="110" align="center" sortable :sort-by="'count'" :sort-orders="['descending']">
             <template #default="{ row }"><span :style="suggestionCountStyle(row.count)">{{ row.count }}</span></template>
           </el-table-column>
-          <el-table-column label="窗口内首末" min-width="160">
+          <el-table-column label="阈值倍数" min-width="150" align="center">
+            <template #default="{ row }">
+              <el-progress :percentage="Math.min(100, Math.round(row.count / Math.max(1, autobanStatus.threshold) * 100))" :stroke-width="8" :show-text="false" :color="suggestionProgressColor(row.count)" style="max-width: 130px; display: inline-block; vertical-align: middle;" />
+              <span class="text-secondary" style="margin-left: 6px;">{{ (row.count / Math.max(1, autobanStatus.threshold)).toFixed(1) }}×</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="窗口内首末" min-width="190">
             <template #default="{ row }"><span class="text-secondary">{{ suggestionWindowSpan(row) }}</span></template>
           </el-table-column>
+          <el-table-column label="建议时长" width="100" align="center">
+            <template #default>
+              <el-tag size="small" effect="plain" type="warning">{{ autobanDurationText }}</el-tag>
+            </template>
+          </el-table-column>
         </el-table>
+        <div class="form-tip-inline" v-if="(autobanStatus.suggestions?.length ?? 0) >= 50">仅展示命中次数最多的前 50 条，完整建议见任务日志</div>
       </template>
     </el-card>
 
@@ -380,6 +392,14 @@ const suggestionCountStyle = (count: number): string => {
   if (count >= t * 4) return 'color:#991b1b;font-weight:700'
   if (count >= t * 2) return 'color:#dc2626;font-weight:600'
   return 'color:#ef4444'
+}
+
+// 阈值倍数进度条配色（与命中次数色深同档）
+const suggestionProgressColor = (count: number): string => {
+  const t = autobanStatus.value.threshold || 1
+  if (count >= t * 4) return '#991b1b'
+  if (count >= t * 2) return '#dc2626'
+  return '#ef4444'
 }
 
 // 建议窗口首末（同一统计窗口内通常同日）：同日展示「时刻 ~ 时刻」，

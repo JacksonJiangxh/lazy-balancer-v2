@@ -18,9 +18,14 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// compileForEngineGate 把渲染指令送入 coraza 编译。过滤三类环境依赖行:
+// compileForEngineGate 把渲染指令送入 coraza 编译。过滤四类环境依赖行:
 //   - SecAuditLog <path>:引擎在 NewWAF 时打开审计日志文件(/app/logs 在
 //     开发/CI 不存在)——路径可写性不是被测对象;
+//   - SecAuditLogType lbfile:审计写插件按名注册（caddygeoip auditwriter.go
+//     init），仅在 xcaddy 构建的 Caddy 二进制内可用——主模块测试二进制未
+//     链入该插件，GetWriter("lbfile") 必然报「invalid logger」;插件注册与
+//     `SecAuditLogType lbfile` 的编译+写盘全链路由 caddygeoip 的
+//     TestAuditWriter_registeredAndInjectsLateTiming 端到端钉住;
 //   - Include <crs 路径>:CRS 文件仅存在于镜像内——引擎接受「文件缺失」
 //     与否不是被测对象(镜像内由 caddy validate 覆盖全量);
 //   - SecRuleUpdateActionById 949110:拦截页归因的 CRS 抬码指令——Include
@@ -35,7 +40,8 @@ func compileForEngineGate(t *testing.T, directives string) {
 	var kept []string
 	for _, line := range strings.Split(directives, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "SecAuditLog ") || strings.HasPrefix(trimmed, "Include ") ||
+		if strings.HasPrefix(trimmed, "SecAuditLog ") || strings.HasPrefix(trimmed, "SecAuditLogType ") ||
+			strings.HasPrefix(trimmed, "Include ") ||
 			strings.HasPrefix(trimmed, "SecRuleUpdateActionById ") {
 			continue
 		}

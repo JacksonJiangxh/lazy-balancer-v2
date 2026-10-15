@@ -22,8 +22,10 @@ func newPrecheckBehaviorWAF(t *testing.T, directives string) coraza.WAF {
 	var kept []string
 	for _, line := range strings.Split(directives, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "SecAuditLog ") {
-			continue // 审计日志路径在开发/CI 不存在（非被测对象）
+		if strings.HasPrefix(trimmed, "SecAuditLog ") || strings.HasPrefix(trimmed, "SecAuditLogType ") {
+			// 审计日志路径在开发/CI 不存在（非被测对象）；lbfile 写插件仅在
+			// Caddy 二进制内注册（caddygeoip 端到端钉测）。
+			continue
 		}
 		if strings.HasPrefix(trimmed, "SecAuditEngine ") {
 			kept = append(kept, "SecAuditEngine Off") // 同上：本测试只关心中断与否

@@ -90,7 +90,6 @@ func ResetThreatUpdateManagerForTest() {
 		threatUpdateManager.StopScheduler()
 	}
 	threatUpdateManager = &ThreatUpdateManager{}
-	threatReloadPending = false
 }
 
 func (m *ThreatUpdateManager) IsRunning() bool {
@@ -123,20 +122,29 @@ func (m *ThreatUpdateManager) StatusSnapshot() ThreatTaskStatus {
 	}
 }
 
-// threatReloader 名单内容变化后的 Caddy 重载（main.go 注入 caddyReloader）——
-// 引用名单的策略渲染产物（@ipListFast 文件）随新内容收敛，否则更新「成功」
-// 但拦截面不变。
+// threatReloader 残留 /load 收敛回调（main.go 注入 caddyReloader）：仅受信代理
+// 网段引用名单时使用——trusted_proxy_range_refs 渲染静态展开进配置本体，文件
+// 热感知不可达，仍需 /load 收敛（2026-10-15 重载门退役后的唯一残留触发面）。
 var threatReloader func() error
 
-// threatReloadPending 上一轮重载失败标记（第 59 轮 R59-P2 自愈）：失败后置位，
-// 下一轮即使全部源内容未变也强制重载一次（哈希已持久化，「unchanged」快路径
-// 永不再触发重载的缺口由本标记闭合）；成功即清位。进程重启后启动应用从 DB
-// 渲染，天然收敛，无需持久化。
-var threatReloadPending bool
+// threatProjectionRefresher 投影热路径回调（main.go 注入
+// CaddyService.RefreshIPListProjections，2026-10-15 用户裁定 threatReloader
+// 重载门退役）：被启用策略引用的名单内容变化后重写投影文件收敛（零 /load，
+// @ipListFast 匹配器 ≤1s stat 热感知）。返回 false=未证实收敛（发射面变化/
+// 运行配置不可读）——调用方回退 threatReloader /load 收敛（宁可一次重载，
+// 不欠引用方渲染收敛）。R59-P2 失败自愈标记（threatReloadPending）随之退役：
+// 热路径无失败态（回退即当轮 /load）；残留受信代理分支的失败由配置一致性
+// 看门狗漂移横幅 + 下次任意配置变更收敛兜底。
+var threatProjectionRefresher func() (bool, error)
 
-// SetThreatReloader 注册重载回调（nil=清除，测试用）。
+// SetThreatReloader 注册残留 /load 回调（nil=清除，测试用）。
 func SetThreatReloader(fn func() error) {
 	threatReloader = fn
+}
+
+// SetThreatProjectionRefresher 注册投影热路径回调（nil=清除，测试用）。
+func SetThreatProjectionRefresher(fn func() (bool, error)) {
+	threatProjectionRefresher = fn
 }
 
 // StartUpdate 异步启动更新任务（单实例在飞）；返回完成通道。rc 语义同 CRS。
@@ -305,7 +313,7 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		return
 	}
 	AppendThreatUpdateLog("INFO", "checking", fmt.Sprintf("开始更新威胁情报库（%d 个启用源）", len(sources)))
-	var changedIDs []int // 内容真实变化的名单 id（重载门的判定面）
+	var changedIDs []int // 内容真实变化的名单 id（收敛分支的判定面）
 	anyFailed := false
 	cancelled := false
 	demoted := false // F-L2-68-01：demote 在途中止标记（outcome=skipped，优先于 cancelled/failed）
@@ -352,32 +360,49 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		m.lastTaskOutcome = "success"
 	}
 	m.mu.Unlock()
-	// 名单内容变化 → 一次重载（引用名单的策略渲染随新内容收敛）。
-	// 重载门（2026-09-24 用户裁定）：变化的名单须被启用策略引用才重载——
-	// 无引用方的变化不打扰在役配置。2026-10-12 扩展：受信代理网段引用
-	// （trusted_proxy_range_refs）同为引用方——渲染静态展开同需收敛。
-	forceReload := threatReloadPending
-	if len(changedIDs) == 0 && !forceReload {
+	// 名单内容变化后的收敛（热路径架构，2026-10-15 用户裁定：threatReloader
+	// 重载门退役）：threat-<source>.iplist 同稳定路径原子重写（上面
+	// writeThreatIplistCompiled）+ 被启用策略引用面投影文件热路径重写即收敛，
+	// 零 /load——@ipListFast 匹配器按 mtime+size ≤1s stat 热感知。唯一残留
+	// /load 触发 = 受信代理网段引用（trusted_proxy_range_refs 渲染静态展开
+	// 进配置本体，文件热感知不可达，2026-10-12 扩展面延续）。
+	if len(changedIDs) == 0 {
 		AppendThreatUpdateLog("INFO", "unchanged", "全部源名单内容未变化，不重载 Caddy 配置")
-	} else if !forceReload && !threatListsReferencedByEnabledPolicy(changedIDs) && !trustedListsReferencedByTrustedProxy(changedIDs) {
+	} else if trustedListsReferencedByTrustedProxy(changedIDs) {
+		AppendThreatUpdateLog("INFO", "reloading", "名单被受信代理网段引用（渲染静态展开），重载 Caddy 配置")
+		if threatReloader != nil {
+			err := threatReloader()
+			// 数据类更新触发的重载统一留操作日志（2026-09-24 用户裁定补齐——
+			// 与 crs_update/ip2region_update 同口径）
+			recordSystemReloadAudit("threat_update", err)
+			if err != nil {
+				Logf("error", "威胁情报库: 名单变化后重载失败: %v", err)
+				AppendThreatUpdateLog("ERROR", "reloading", fmt.Sprintf("重载 Caddy 配置失败: %v", err))
+			}
+		}
+	} else if threatListsReferencedByEnabledPolicy(changedIDs) {
+		if threatProjectionRefresher == nil {
+			// 未注册热路径（测试二进制/异常装配）：名单文件已更新，引用方投影
+			// 由下次任意配置变更的全量渲染收敛。
+			AppendThreatUpdateLog("WARN", "unchanged", "投影刷新器未注册，跳过热路径（引用方渲染由下次配置变更收敛）")
+		} else if hot, rerr := threatProjectionRefresher(); rerr != nil || !hot {
+			// fail-safe：投影刷新被拒（生成失败）/发射面变化/运行配置不可读
+			// → 回退 /load 收敛——宁可一次重载，不欠引用方渲染收敛。
+			AppendThreatUpdateLog("INFO", "reloading", "投影热路径未证实收敛（发射面变化或刷新失败），回退重载 Caddy 配置")
+			if threatReloader != nil {
+				err := threatReloader()
+				recordSystemReloadAudit("threat_update", err)
+				if err != nil {
+					Logf("error", "威胁情报库: 名单变化后重载失败: %v", err)
+					AppendThreatUpdateLog("ERROR", "reloading", fmt.Sprintf("重载 Caddy 配置失败: %v", err))
+				}
+			}
+		} else {
+			Logf("info", "威胁情报库: 名单内容变化经投影热路径收敛（零 Caddy 重载，匹配器 ≤1s 热感知生效）")
+			AppendThreatUpdateLog("INFO", "hot", "名单内容变化经投影热路径收敛（零重载，匹配器 ≤1s 热感知生效）")
+		}
+	} else {
 		AppendThreatUpdateLog("INFO", "unchanged", "名单内容已变化但无启用策略或受信代理引用，不重载 Caddy 配置")
-	} else if threatReloader != nil {
-		if forceReload {
-			AppendThreatUpdateLog("INFO", "reloading", "上一轮重载失败，强制重载 Caddy 配置（自愈重试）")
-		} else {
-			AppendThreatUpdateLog("INFO", "reloading", "名单内容已变化且被策略或受信代理引用，重载 Caddy 配置")
-		}
-		err := threatReloader()
-		// 数据类更新触发的重载统一留操作日志（2026-09-24 用户裁定补齐——
-		// 与 crs_update/ip2region_update 同口径，此前威胁库重载无审计）
-		recordSystemReloadAudit("threat_update", err)
-		if err != nil {
-			threatReloadPending = true
-			Logf("error", "威胁情报库: 名单变化后重载失败（下轮将强制重试）: %v", err)
-			AppendThreatUpdateLog("ERROR", "reloading", fmt.Sprintf("重载 Caddy 配置失败: %v", err))
-		} else {
-			threatReloadPending = false
-		}
 	}
 }
 
@@ -393,29 +418,39 @@ func threatListIDBySource(source string) int {
 // threatListsReferencedByEnabledPolicy 报告任一名单 id 被启用策略引用
 // （ip_acl_list_refs/ip_whitelist_refs 均为 JSON 数字数组）。查询失败与
 // refs JSON 解析失败（P5-10，第 50 轮审计）均按「可能被引用」处理——
-// 宁可多一次重载，不欠引用方的渲染收敛。
+// 宁可多一次收敛，不欠引用方的渲染收敛。
 func threatListsReferencedByEnabledPolicy(listIDs []int) bool {
+	return ipListsReferencedByEnabledPolicyLabeled("威胁情报库", listIDs)
+}
+
+// IPListsReferencedByEnabledPolicy 名单写路径热路径资格判定（2026-10-15 用户
+// 裁定）的导出包装：与威胁库收敛门同一查询核心（单源），日志前缀区分来源。
+func IPListsReferencedByEnabledPolicy(listIDs []int) bool {
+	return ipListsReferencedByEnabledPolicyLabeled("IP 名单写路径", listIDs)
+}
+
+func ipListsReferencedByEnabledPolicyLabeled(logPrefix string, listIDs []int) bool {
 	want := map[int]bool{}
 	for _, id := range listIDs {
 		want[id] = true
 	}
 	rows, err := db.DB.Query(`SELECT COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_refs,'[]') FROM security_policies WHERE enabled=1`)
 	if err != nil {
-		Logf("error", "威胁情报库: 读取策略引用失败（按被引用处理）: %v", err)
+		Logf("error", "%s: 读取策略引用失败（按被引用处理）: %v", logPrefix, err)
 		return true
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var aclRefs, wlRefs string
 		if err := rows.Scan(&aclRefs, &wlRefs); err != nil {
-			Logf("error", "威胁情报库: 扫描策略引用失败（按被引用处理）: %v", err)
+			Logf("error", "%s: 扫描策略引用失败（按被引用处理）: %v", logPrefix, err)
 			return true
 		}
 		for _, raw := range []string{aclRefs, wlRefs} {
 			var ids []int
 			if err := json.Unmarshal([]byte(raw), &ids); err != nil {
 				// P5-10：解析失败按「可能被引用」处理（与查询失败同口径）。
-				Logf("error", "威胁情报库: 策略引用 JSON 解析失败（按被引用处理）: %v", err)
+				Logf("error", "%s: 策略引用 JSON 解析失败（按被引用处理）: %v", logPrefix, err)
 				return true
 			}
 			for _, id := range ids {
@@ -427,21 +462,32 @@ func threatListsReferencedByEnabledPolicy(listIDs []int) bool {
 	}
 	if err := rows.Err(); err != nil {
 		// R71-⑪（第 71 轮主审补漏）：迭代失败与查询/解析失败同口径——按被引用
-		// 处理（fail-closed），漏查会跳过名单重载致引用方渲染不收敛。
-		Logf("error", "威胁情报库: 遍历策略引用失败（按被引用处理）: %v", err)
+		// 处理（fail-closed），漏查会跳过名单收敛致引用方渲染不收敛。
+		Logf("error", "%s: 遍历策略引用失败（按被引用处理）: %v", logPrefix, err)
 		return true
 	}
 	return false
 }
 
-// trustedListsReferencedByTrustedProxy 报告任一名单 id 被
+func trustedListsReferencedByTrustedProxy(listIDs []int) bool {
+	return trustedListsReferencedByTrustedProxyLabeled("威胁情报库", listIDs)
+}
+
+// TrustedListsReferencedByTrustedProxy 名单写路径热路径资格判定（2026-10-15
+// 用户裁定）的导出包装：与威胁库收敛门同一查询核心（单源）。
+func TrustedListsReferencedByTrustedProxy(listIDs []int) bool {
+	return trustedListsReferencedByTrustedProxyLabeled("IP 名单写路径", listIDs)
+}
+
+// trustedListsReferencedByTrustedProxyLabeled 报告任一名单 id 被
 // global_config.trusted_proxy_range_refs 引用（2026-10-12，威胁库门同款
-// fail-safe）：IP 名单内容变化时若被受信网段引用 → 需重载（渲染静态展开
-// 须收敛）。查询/迭代/解析失败均按「可能被引用」处理——宁可多一次重载，
-// 不欠引用方的渲染收敛（与 threatListsReferencedByEnabledPolicy 同口径）。
+// fail-safe）：IP 名单内容变化时若被受信网段引用 → 渲染静态展开进配置本体，
+// 文件热感知不可达，须 /load 收敛。查询/迭代/解析失败均按「可能被引用」
+// 处理——宁可多一次重载，不欠引用方的渲染收敛（与
+// ipListsReferencedByEnabledPolicyLabeled 同口径）。
 // RV72-N3（第 72 轮复审）：trusted_proxy_enabled=0 时渲染不消费 refs
 // （caddy.go 受信代理块整体不渲染），refs 残留无收敛义务——不触发重载。
-func trustedListsReferencedByTrustedProxy(listIDs []int) bool {
+func trustedListsReferencedByTrustedProxyLabeled(logPrefix string, listIDs []int) bool {
 	want := map[int]bool{}
 	for _, id := range listIDs {
 		want[id] = true
@@ -449,7 +495,7 @@ func trustedListsReferencedByTrustedProxy(listIDs []int) bool {
 	var enabled int
 	var refs string
 	if err := db.DB.QueryRow(`SELECT COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_range_refs,'[]') FROM global_config WHERE id=1`).Scan(&enabled, &refs); err != nil {
-		Logf("error", "威胁情报库: 读取受信代理引用失败（按被引用处理）: %v", err)
+		Logf("error", "%s: 读取受信代理引用失败（按被引用处理）: %v", logPrefix, err)
 		return true
 	}
 	if enabled == 0 {
@@ -457,7 +503,7 @@ func trustedListsReferencedByTrustedProxy(listIDs []int) bool {
 	}
 	var ids []int
 	if err := json.Unmarshal([]byte(refs), &ids); err != nil {
-		Logf("error", "威胁情报库: 受信代理引用 JSON 解析失败（按被引用处理）: %v", err)
+		Logf("error", "%s: 受信代理引用 JSON 解析失败（按被引用处理）: %v", logPrefix, err)
 		return true
 	}
 	for _, id := range ids {

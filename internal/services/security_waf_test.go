@@ -111,9 +111,10 @@ func TestBuildCorazaDirectives_TrustListPrecedesACLRules(t *testing.T) {
 }
 
 func TestBuildCorazaDirectives_allowAndDenyModesUnchangedByBypass(t *testing.T) {
-	// Given allow and deny policies
-	allow := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPACLMode: "allow", IPACLList: `["198.51.100.7"]`, IPACLEnabled: true}
-	deny := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking", IPACLMode: "deny", IPACLList: `["203.0.113.0/24"]`, IPACLEnabled: true}
+	// Given allow and deny policies（显式相异 id——稳定命名 <scope>.txt 按
+	// 策略 id 定文件，零值 id 会让两个夹具共写 p0-acl.txt）
+	allow := &models.SecurityPolicy{ID: 41, AnomalyThreshold: 5, Mode: "blocking", IPACLMode: "allow", IPACLList: `["198.51.100.7"]`, IPACLEnabled: true}
+	deny := &models.SecurityPolicy{ID: 42, AnomalyThreshold: 5, Mode: "blocking", IPACLMode: "deny", IPACLList: `["203.0.113.0/24"]`, IPACLEnabled: true}
 
 	// When
 	allowDirectives := mustDirectives(BuildCorazaDirectives(allow, nil, "", false, 0))

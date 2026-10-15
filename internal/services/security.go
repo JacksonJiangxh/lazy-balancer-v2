@@ -254,7 +254,13 @@ func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crs
 	if p.LogRequestBody {
 		auditParts = "ABCIJDEFHKZ"
 	}
-	sb.WriteString(fmt.Sprintf("SecAuditEngine RelevantOnly\nSecAuditLog %s\nSecAuditLogFormat JSON\nSecAuditLogParts %s\n", auditLogPath, auditParts))
+	// SecAuditLogType lbfile：审计写插件（caddygeoip auditwriter.go，xcaddy
+	// 链入）——异步有界队列+bufio 批量落盘，刷盘前把进程内计时注册表的分段
+	// 耗时注入审计行顶层 lb_timing 字段（第 76 轮： 侧车
+	// 退役，摄取管道改读行内嵌字段）。零丢弃：队列满时阻塞等消化（退化价=
+	// serial 同步写）。coraza NewWAF 时 Init 打开文件（目录缺失=配置拒绝，
+	// SECLB23-P1-1 语义不变）；轮转=copytruncate，长生命周期 fd 恒有效。
+	sb.WriteString(fmt.Sprintf("SecAuditEngine RelevantOnly\nSecAuditLog %s\nSecAuditLogType lbfile\nSecAuditLogFormat JSON\nSecAuditLogParts %s\n", auditLogPath, auditParts))
 
 	// SecRule id map: 2 = ACL allow/deny, 3 = bypass-mode (legacy), 4 = legacy
 	// blacklist, 5 = trust list, 9 = JSON body processor 激活,
@@ -264,9 +270,11 @@ func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crs
 	// 信任名单改 ctl:ruleEngine=DetectionOnly——信任流量全评估不拦但全记录
 	// (动作=检测),不再是「never reach ACL denies」的静默跳过。
 	// v2.3.x：策略名单不再内联展开（配置体积 + coraza 64KiB 单行静默截断
-	// 悬崖），统一投影为 @ipListFast 内容寻址文件（写失败=渲染报错=
-	// 保存回滚，fail-closed）。同一策略的信任名单文件被 id:3/5、id:2/4 链
-	// 续段、GeoIP 预检第三续段共用（同 scope 同哈希 = 同一文件）。
+	// 悬崖），统一投影为 @ipListFast 稳定命名文件（<scope>.txt，写失败=渲染
+	// 报错=保存回滚，fail-closed；内容变化同路径原子换内容=配置字节不变，
+	// 名单写路径得以零 /load 收敛——2026-10-15 热路径改造）。同一策略的信任
+	// 名单文件被 id:3/5、id:2/4 链续段、GeoIP 预检第三续段共用（同 scope =
+	// 同一文件）。
 	trustScope := fmt.Sprintf("p%d-trust", p.ID)
 	aclOperand := ""
 	trustOperand := ""
@@ -1141,8 +1149,9 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 	sb.WriteString("SecRequestBodyAccess Off\n")
 	sb.WriteString("SecResponseBodyAccess Off\n")
 	// 与 BuildCorazaDirectives 同款审计配置：IP 拒绝事件经 audit log 进入
-	// 安全事件管线（ RelevantOnly + deny 中断 = relevant）。
-	sb.WriteString(fmt.Sprintf("SecAuditEngine RelevantOnly\nSecAuditLog %s\nSecAuditLogFormat JSON\nSecAuditLogParts ABIJDEFHKZ\n", auditLogPath))
+	// 安全事件管线（ RelevantOnly + deny 中断 = relevant）；写插件同 lbfile
+	// （第 76 轮侧车退役，耗时注入审计行——见 :257 注释）。
+	sb.WriteString(fmt.Sprintf("SecAuditEngine RelevantOnly\nSecAuditLog %s\nSecAuditLogType lbfile\nSecAuditLogFormat JSON\nSecAuditLogParts ABIJDEFHKZ\n", auditLogPath))
 	// 2026-09-15 用户裁定:信任最高优先(任何规则不拦)+检测事件全记录——
 	// 预检层信任改 ctl:ruleEngine=DetectionOnly 先行(取代 S1 的「并入 allow
 	// 放行集」):信任 IP 经 DetectionOnly 后,deny/黑名单/GeoIP/CRS 全评估

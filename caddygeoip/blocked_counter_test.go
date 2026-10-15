@@ -4,9 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -57,26 +55,28 @@ func TestSecurityBlockedCounter_ServeHTTP(t *testing.T) {
 }
 
 // 第 75 轮（预检拦耗时口径）：拦截耗时写点的分段选键——
-// 形状①预检段拦：起始头仍=注入原值（链未抵达 timing_pre 收点）→ 写 :pre
-// （决策后、403 写出前的纯预检评估），不得写 :end（防同 ID 双行）；
-// 形状②WAF/限流段拦：起始头已被 timing_pre 重写为分段锚点 → 写 :end
-// （链首至此全链，读侧 end-:pre 得 WAF 段），不得写 :pre。
+// 形状①预检段拦：起始头仍=注入原值（链未抵达 timing_pre 收点）→ 写 pre
+// （决策后、403 写出前的纯预检评估），不得写 end（防同 ID 双段）；
+// 形状②WAF/限流段拦：起始头已被 timing_pre 重写为分段锚点 → 写 end
+// （链首至此全链，读侧 end-pre 得 WAF 段），不得写 pre。
+// 第 76 轮：断言目标从侧车文件行改为进程内注册表快照；post-next 终态标记
+// （auditTimingClose）一并钉住——审计写插件 drain 依赖该标记停止等待。
 func TestSecurityBlockedCounter_timingSegmentSelection(t *testing.T) {
 	const id = "0123456789abcdef"
 	cases := []struct {
 		name          string
 		nextErr       error
 		rewriteInNext bool // next 模拟 timing_pre 已过（重写起始头为锚点）
-		wantKey       string
+		wantSegment   string
 	}{
-		{"precheck interruption writes :pre", caddyhttp.HandlerError{StatusCode: 403, ID: id}, false, ":pre"},
-		{"precheck interruption stage page 481 writes :pre", caddyhttp.HandlerError{StatusCode: 481, ID: id}, false, ":pre"},
-		{"waf interruption after pre writes :end", caddyhttp.HandlerError{StatusCode: 403, ID: id}, true, ":end"},
-		{"ratelimit 429 after pre writes :end", caddyhttp.HandlerError{StatusCode: http.StatusTooManyRequests, ID: "rA9kX2mPq"}, true, ":end"},
+		{"precheck interruption writes pre", caddyhttp.HandlerError{StatusCode: 403, ID: id}, false, "pre"},
+		{"precheck interruption stage page 481 writes pre", caddyhttp.HandlerError{StatusCode: 481, ID: id}, false, "pre"},
+		{"waf interruption after pre writes end", caddyhttp.HandlerError{StatusCode: 403, ID: id}, true, "end"},
+		{"ratelimit 429 after pre writes end", caddyhttp.HandlerError{StatusCode: http.StatusTooManyRequests, ID: "rA9kX2mPq"}, true, "end"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			logPath, flush := setupSecurityTimingWriter(t)
+			useTestTimingRegistry(t)
 			h := &SecurityBlockedCounter{Rule: "lb_seg_rule"}
 			next := caddyhttp.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) error {
 				if tc.rewriteInNext {
@@ -97,26 +97,45 @@ func TestSecurityBlockedCounter_timingSegmentSelection(t *testing.T) {
 			if len(id) != 16 {
 				t.Fatalf("timing id header = %q; want 16-char injected id", id)
 			}
-			flush()
 
-			data, err := os.ReadFile(logPath)
-			if err != nil {
-				t.Fatal(err)
+			snap := auditTimingLookupForTest(t, id)
+			if !snap.closed {
+				t.Fatal("blocked_counter post-next must close the timing entry (terminal marker)")
 			}
-			lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-			if len(lines) != 1 {
-				t.Fatalf("lines=%v; want exactly 1 timing row (no double write)", lines)
-			}
-			want := id + tc.wantKey
-			if !strings.HasPrefix(lines[0], want+" ") {
-				t.Fatalf("row=%q; want prefix %q", lines[0], want)
-			}
-			us, perr := strconv.ParseInt(strings.TrimSpace(lines[0][len(want)+1:]), 10, 64)
-			if perr != nil || us < 0 {
-				t.Fatalf("duration=%q; want non-negative integer µs", lines[0])
+			switch tc.wantSegment {
+			case "pre":
+				if !snap.preSet || snap.endSet {
+					t.Fatalf("snapshot = %+v; want exactly pre segment", snap)
+				}
+				if snap.preUs < 0 {
+					t.Fatalf("pre=%d; want non-negative µs", snap.preUs)
+				}
+			case "end":
+				if !snap.endSet || snap.preSet {
+					t.Fatalf("snapshot = %+v; want exactly end segment", snap)
+				}
+				if snap.endUs < 0 {
+					t.Fatalf("end=%d; want non-negative µs", snap.endUs)
+				}
 			}
 		})
 	}
+
+	// 非拦截形态（logged 放行）：无分段写点，但终态标记照常置位（drain 不等待）。
+	t.Run("logged passthrough closes entry without segments", func(t *testing.T) {
+		useTestTimingRegistry(t)
+		h := &SecurityBlockedCounter{Rule: "lb_seg_rule"}
+		next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		if err := h.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
+			t.Fatalf("ServeHTTP: %v", err)
+		}
+		id := req.Header.Get(securityTimingHeader)
+		snap := auditTimingLookupForTest(t, id)
+		if !snap.closed || snap.preSet || snap.endSet {
+			t.Fatalf("snapshot = %+v; want closed empty entry", snap)
+		}
+	})
 }
 
 // P4-1(第 28.5 轮审计):Provision/registerOrExisting 护栏——7723d76d registry
