@@ -27,12 +27,14 @@
       <div v-if="location" class="ipo-loc-line">{{ location }}</div>
     </div>
 
-    <!-- 策略筛选（历史用户裁定）：策略数 >1 才出；选择后仅渲染该策略卡片，
-         会话级记忆上次选择；加载中禁用（与 seq 守卫/加载态兼容） -->
-    <div v-if="policies.length > 1" class="ipo-filter">
-      <el-select v-model="lastPolicyFilter" size="small" :disabled="policiesLoading" placeholder="筛选策略">
+    <!-- 策略筛选（历史用户裁定）：有 IP 管控面且未被隐藏的策略数 >1 才出；
+         选择后仅渲染该策略卡片，会话级记忆上次选择；加载中禁用（与 seq 守卫/
+         加载态兼容）。:teleported="false" 把下拉面板留在弹层内——teleport 到
+         body 后的面板点击会被 el-popover 判为 outside 而关闭整个弹框（实测 bug） -->
+    <div v-if="filterablePolicies.length > 1" class="ipo-filter">
+      <el-select v-model="lastPolicyFilter" size="small" :disabled="policiesLoading" placeholder="筛选策略" :teleported="false" fit-input-width>
         <el-option label="全部策略" value="all" />
-        <el-option v-for="p in policies" :key="p.id" :label="p.name" :value="p.id" />
+        <el-option v-for="p in filterablePolicies" :key="p.id" :label="p.name" :value="p.id" />
       </el-select>
     </div>
 
@@ -75,6 +77,8 @@
         </div>
       </div>
     </template>
+    <!-- 全部策略被系统名单接管（裁定①隐藏）时如实说明，不误报「暂无策略」 -->
+    <div v-else-if="policies.length > 0" class="ipo-tip">启用策略的 IP 名单均由系统内置名单管理，本弹窗无快捷处置入口</div>
     <div v-else class="ipo-tip">暂无启用的安全策略</div>
   </el-popover>
 
@@ -335,14 +339,15 @@ const loadPolicies = async (): Promise<void> => {
     const res = await request.get<APIResponse<PolicyRow[]>>(url)
     if (seq !== loadPoliciesSeq) return
     policies.value = (res.data || []).map(normalizeRow)
-    // 策略筛选（历史）：选中策略已不存在（被删/停用出上下文）→ 复位「全部」，
-    // 避免筛选视图渲染空卡片流
-    if (lastPolicyFilter.value !== 'all' && !policies.value.some((p) => p.id === lastPolicyFilter.value)) {
-      lastPolicyFilter.value = 'all'
-    }
     // 名单条目按需拉取依赖 policies 的引用清单（列表载荷不含 entries）——
     // 须在 policies 就位后执行
     await loadIpLists()
+    // 策略筛选（历史）：选中策略已不在下拉池（被删/停用/refs 转为全系统
+    // 名单/纯 WAF 限流）→ 复位「全部」，避免筛选视图渲染空卡片流。
+    // 置于 loadIpLists 之后——「refs 全系统名单」判定依赖本轮名单 system 标记
+    if (lastPolicyFilter.value !== 'all' && !filterablePolicies.value.some((p) => p.id === lastPolicyFilter.value)) {
+      lastPolicyFilter.value = 'all'
+    }
     policiesError.value = false
   } catch {
     if (seq !== loadPoliciesSeq) return
@@ -612,8 +617,25 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
 }
 
 // 历史策略筛选：选中具体策略时仅渲染其卡片（rowView 计算随之收窄）；
-// 「全部策略」= 全量。陈旧选中项（策略被删）由 loadPolicies 复位为 'all'。
+// 「全部策略」= 全量。陈旧选中项（策略被删/出下拉池）由 loadPolicies 复位。
+// 历史实测裁定①：ACL refs 全部指向系统内置名单（威胁库/自动封禁）的策略
+// 卡整体隐藏——IP 管控职能已由系统名单承担，「创建 X-黑名单」是重复入口；
+// 无同侧引用（如纯地域策略）保留自动创建出口；引用含用户名单照旧逐列表按钮。
+const aclRefsAllSystem = (p: PolicyRow): boolean => {
+  const refs = parseRefIds(p.ip_acl_list_refs)
+  if (refs.length === 0) return false
+  return refs.every((id) => Boolean(ipLists.value.find((l) => l.id === id)?.system))
+}
+// 筛选下拉选项池（历史实测裁定③①）：仅「有 IP 管控面」（stage0/stage1/
+// mixed）且未被隐藏的策略；纯 WAF/限流（stage2/3）不入池（底部「另有 N 条」
+// 提示语承担其存在感）
+const filterablePolicies = computed(() => policies.value.filter((p) => {
+  const t = policyTypeOf(p)
+  return t !== 'stage2' && t !== 'stage3' && !aclRefsAllSystem(p)
+}))
+
 const rows = computed<RowView[]>(() => policies.value
+  .filter((p) => !aclRefsAllSystem(p))
   .filter((p) => lastPolicyFilter.value === 'all' || p.id === lastPolicyFilter.value)
   .map(rowView))
 
