@@ -218,8 +218,13 @@ func TestSecurityPolicyHasIPControl_refsOnlyTruthTable(t *testing.T) {
 		{"ACL refs only, toggle off", &models.SecurityPolicy{IPACLMode: "deny", IPACLList: "[]", IPACLListRefs: "[3]"}, false},
 		{"whitelist refs only, enabled", &models.SecurityPolicy{IPWhitelistEnabled: true, IPWhitelistRefs: "[3]"}, true},
 		{"whitelist refs only, toggle off", &models.SecurityPolicy{IPWhitelistRefs: "[3]"}, false},
-		{"malformed ACL refs", &models.SecurityPolicy{IPACLEnabled: true, IPACLList: "[]", IPACLListRefs: "bad"}, false},
-		{"no refs no inline", &models.SecurityPolicy{IPACLEnabled: true, IPACLList: "[]"}, false},
+		// 始终发射收敛（2026-10-15）：deny ACL 开启即恒发射（空名单投影空
+		// 文件算子），镜像与内容解耦；信任（默认 flag 非 opt-in）/allow 模式
+		//（否定算子）维持内容门控。
+		{"malformed ACL refs", &models.SecurityPolicy{IPACLEnabled: true, IPACLList: "[]", IPACLListRefs: "bad"}, true},
+		{"no refs no inline", &models.SecurityPolicy{IPACLEnabled: true, IPACLList: "[]"}, true},
+		{"allow mode enabled, empty", &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "allow", IPACLList: "[]"}, false},
+		{"trust enabled, empty", &models.SecurityPolicy{IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`[]`)}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

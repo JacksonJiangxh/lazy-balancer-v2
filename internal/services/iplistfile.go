@@ -40,7 +40,9 @@ func EnsureIPListDir() error {
 // writeIPListFile 把聚合后的名单原子写入稳定命名文件（<scope>.txt——scope
 // 字符串本身即投影实例身份：策略 id/并集描述符；名单改名/内容变化都不改变
 // 文件名，2026-10-15 热路径改造取代旧内容寻址 scope-sha256[:12].txt），返回
-// 绝对路径；空集合返回空串不写文件（调用方据此不发射规则）。同路径同字节
+// 绝对路径。空集合投影 0 字节空文件照常返回路径（2026-10-15 始终发射裁定：
+// 调用方恒发射 @ipListFast，空集=匹配器永不命中与无规则语义等价——空↔非空
+// 降为纯内容变化全走热路径；加载侧 wafiplist 空文件合法）。同路径同字节
 // 跳写（全量渲染重投影不动，mtime 保持 → wafiplist stat 缓存命中零重建）；
 // 内容变化同路径原子换内容（配置字节不变，@ipListFast 匹配器 ≤1s stat 热感
 // 知——名单写路径零 /load 收敛的机制基础）。写失败返回 error——经渲染错误
@@ -51,11 +53,9 @@ func EnsureIPListDir() error {
 // 比较，无挂钟排程、与时区配置无关）。
 func writeIPListFile(scope string, merged []string) (string, error) {
 	merged = wafiplist.AggregateIPEntries(merged)
-	if len(merged) == 0 {
-		return "", nil
-	}
 	// 内容先于 stat 构建：稳定命名下「同路径」不再蕴含「同内容」——字节比对
 	// 才是跳写判据（内容寻址时代的 stat 命中=同内容前提已随热路径改造失效）。
+	// 空集合 content 为空串，空文件落盘/跳写与普通内容同路径。
 	var sb strings.Builder
 	for _, entry := range merged {
 		sb.WriteString(entry)
@@ -106,12 +106,12 @@ const ipListGCInterval = time.Hour
 
 // ipListProjectedFileName 匹配投影文件命名——差集清理只碰该形态，目录内其他
 // 文件（运维投放/误放）一律不动。两个分支（2026-10-15 热路径改造）：
-//   - 新稳定命名 <scope>.txt（scope 为策略 id/并集描述符形态，精确白名单，
-//     用户手放文件不碰）；
+//   - 新稳定命名 <scope>.txt（scope 为策略 id/并集描述符/受信代理 tp 形态，
+//     精确白名单，用户手放文件不碰）；
 //   - 旧内容寻址 scope-sha256[:12].txt——迁移过渡分支：改造前落盘的旧哈希
 //     文件由既有 24h GC 自然回收（不写迁移），旧文件清尽后该分支恒不命中，
 //     自行失效。
-var ipListProjectedFileName = regexp.MustCompile(`^(u-[a-z0-9][a-z0-9-]*|p[0-9]+-(acl|trust|bl)|.+-[0-9a-f]{12})\.txt$`)
+var ipListProjectedFileName = regexp.MustCompile(`^(u-[a-z0-9][a-z0-9-]*|p[0-9]+-(acl|trust|bl)|tp|.+-[0-9a-f]{12})\.txt$`)
 
 // ipListRenderRefs 记录本进程渲染引用过的投影文件及最近引用时间：一次全量
 // 配置渲染会重新投影全部在役名单（同字节跳写也计引用），故「长期
@@ -217,15 +217,14 @@ func gcStaleIPListFiles(now time.Time, maxAge time.Duration) (removed int) {
 }
 
 // ipListRuleOperand 把策略名单投影为 @ipListFast 文件并返回 SecRule 算子
-// 表达式（negated=true 时前缀 !）；空名单返回空串（调用方跳过发射，
-// 维持现状零发射语义）。写失败返回 error 沿渲染链路上报。
+// 表达式（negated=true 时前缀 !）。空名单投影空文件后恒返回算子（2026-10-15
+// 始终发射裁定：空集=匹配器永不命中与无规则语义等价，空↔非空纯内容变化走
+// 热路径；调用方「空串跳过发射」的内容门控对热路径可变名单随之收敛）。
+// 写失败返回 error 沿渲染链路上报。
 func ipListRuleOperand(scope string, entries []string, negated bool) (string, error) {
 	path, err := writeIPListFile(scope, entries)
 	if err != nil {
 		return "", err
-	}
-	if path == "" {
-		return "", nil
 	}
 	operand := "@ipListFast " + path
 	if negated {

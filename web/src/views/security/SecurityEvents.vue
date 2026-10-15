@@ -286,7 +286,7 @@
             </el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="异常评分">{{ ctxEvent.anomaly_score > 0 ? ctxEvent.anomaly_score : '—' }}</el-descriptions-item>
-          <el-descriptions-item label="处理时长">{{ formatDurationUs(ctxWafFamily ? ctxEvent.duration_us + ctxEvent.precheck_us : ctxEvent.duration_us) }}{{ ctxWafFamily ? '' : '（预检耗时）' }}</el-descriptions-item>
+          <el-descriptions-item label="处理时长">{{ formatDurationUs(ctxWafFamily ? ctxEvent.duration_us + ctxEvent.precheck_us : ctxEvent.duration_us) }}{{ ctxWafFamily ? '' : '（预检耗时，含事件记录开销）' }}</el-descriptions-item>
           <el-descriptions-item v-if="ctxWafFamily && ctxEvent.precheck_us > 0" label="耗时分解">预检 {{ formatDurationUs(ctxEvent.precheck_us) }} + WAF 段 {{ formatDurationUs(ctxEvent.duration_us) }}</el-descriptions-item>
         </el-descriptions>
 

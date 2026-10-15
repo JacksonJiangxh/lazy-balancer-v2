@@ -180,7 +180,8 @@ func TestSecurityPolicyHasIPControl_truthTable(t *testing.T) {
 		want   bool
 	}{
 		{"neither: ACL disabled, lists empty", &models.SecurityPolicy{IPACLMode: "allow", IPACLList: "[]", IPWhitelist: json.RawMessage("[]")}, false},
-		{"ACL enabled but list empty", &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "deny", IPACLList: "[]"}, false},
+		// 始终发射收敛（2026-10-15）：deny ACL 开启即恒发射空文件算子，与内容解耦
+		{"ACL enabled but list empty", &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "deny", IPACLList: "[]"}, true},
 		{"ACL only: enabled allow-mode with entries", &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "allow", IPACLList: `["203.0.113.0/24"]`}, true},
 		{"trust only: whitelist populated, ACL disabled", &models.SecurityPolicy{IPACLList: "[]", IPWhitelist: json.RawMessage(`["198.51.100.9"]`), IPWhitelistEnabled: true}, true},
 		{"both: enabled ACL entries and trust list", &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["203.0.113.0/24"]`, IPWhitelist: json.RawMessage(`["198.51.100.9"]`)}, true},

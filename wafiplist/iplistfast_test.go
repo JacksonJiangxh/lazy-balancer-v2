@@ -205,3 +205,85 @@ func TestLoadIPListFile_staleGenerationDoesNotOverwriteNewer(t *testing.T) {
 		t.Fatal("旧代际解析覆盖了新代际缓存（写锁缺代际守卫）")
 	}
 }
+
+// 空文件合法（2026-10-15 始终发射收敛）：空名单投影空文件后 @ipListFast 构建
+// 期加载必须无错误（空集=匹配器永不命中，与无规则语义等价）——否则空名单
+// 策略的恒发射规则会在 Caddy validate 阶段被 fail-closed 拒绝。含坏行仍报错
+// （严格解析不变）；空→有内容的 mtime+size stat 变化照常热感知。
+func TestIPListFast_emptyFileLoadsNoErrorAndNeverMatches(t *testing.T) {
+	dir := useAllowedDir(t)
+	path := filepath.Join(dir, "empty.txt")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadIPListFileFresh(path)
+	if err != nil {
+		t.Fatalf("空文件构建期加载必须无错误: %v", err)
+	}
+	if len(state.v4) != 0 || len(state.v6) != 0 {
+		t.Fatalf("空文件集合 v4=%d v6=%d, want 0/0", len(state.v4), len(state.v6))
+	}
+	// 注释/空行文件同形（解析后 0 条目）
+	path2 := writeListFile(t, dir, "blank.txt", []string{"# 注释", "", "; 注释"})
+	if _, err := loadIPListFileFresh(path2); err != nil {
+		t.Fatalf("注释/空行文件加载必须无错误: %v", err)
+	}
+
+	op := newOp(t, path)
+	for _, v := range []string{"203.0.113.7", "10.0.0.1", "2001:db8::1", "not-an-ip"} {
+		if op.Evaluate(nil, v) {
+			t.Fatalf("空文件算子对 %q 不得命中", v)
+		}
+	}
+}
+
+// LoadPrefixesFresh/ResolvePrefixes 是 http.ip_sources.lb_file（受信代理网段
+// 热路径化）消费的导出入口：白名单与算子同规；fresh=fail-closed（构建期），
+// resolve=节流+fail-stale（运行期）。返回切片为缓存共享只读快照。
+func TestLoadAndResolvePrefixes_contract(t *testing.T) {
+	dir := useAllowedDir(t)
+	path := writeListFile(t, dir, "tp-accessor.txt", []string{"203.0.113.7", "10.8.0.0/16"})
+
+	fresh, err := LoadPrefixesFresh(path)
+	if err != nil {
+		t.Fatalf("LoadPrefixesFresh: %v", err)
+	}
+	if len(fresh) != 2 {
+		t.Fatalf("fresh=%v, want 2 条", fresh)
+	}
+
+	resolve, err := ResolvePrefixes(path)
+	if err != nil {
+		t.Fatalf("ResolvePrefixes: %v", err)
+	}
+	if len(resolve) != 2 {
+		t.Fatalf("resolve=%v, want 2 条", resolve)
+	}
+
+	// 白名单外路径拒绝（与算子同规，防目录穿越）。
+	for _, p := range []string{"/etc/passwd", "relative.txt"} {
+		if _, err := LoadPrefixesFresh(p); err == nil {
+			t.Fatalf("LoadPrefixesFresh(%q) 必须被白名单拒绝", p)
+		}
+		if _, err := ResolvePrefixes(p); err == nil {
+			t.Fatalf("ResolvePrefixes(%q) 必须被白名单拒绝", p)
+		}
+	}
+
+	// fail-stale：重建失败（坏行）且有旧集 → 返回旧集；从未加载 → error。
+	if err := os.WriteFile(path, []byte("garbage!!!\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	_ = os.Chtimes(path, future, future)
+	old := StatCheckInterval
+	StatCheckInterval = 0
+	t.Cleanup(func() { StatCheckInterval = old })
+	stale, err := ResolvePrefixes(path)
+	if err != nil || len(stale) != 2 {
+		t.Fatalf("fail-stale 必须返回旧集: got=%v err=%v", stale, err)
+	}
+	if _, err := LoadPrefixesFresh(path); err == nil {
+		t.Fatal("fresh 路径坏行必须报错（构建期 fail-closed）")
+	}
+}

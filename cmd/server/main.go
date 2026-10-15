@@ -212,17 +212,17 @@ func run() error {
 	}
 	services.SetThreatReloader(caddyReloader)
 	// 投影热路径（2026-10-15 用户裁定：威胁库重载门退役）——名单内容变化的
-	// 引用面收敛改走投影重写（零 /load，@ipListFast 匹配器 ≤1s stat 热感知）；
-	// threatReloader 仅残留受信代理网段引用面（静态展开需 /load）与热路径
-	// 未证实收敛时的 fail-safe 回退。
+	// 引用面收敛改走投影重写（零 /load，@ipListFast 匹配器与受信代理网段
+	// tp.txt/lb_file ≤1s stat 热感知）；threatReloader 仅残留热路径未证实
+	// 收敛时的 fail-safe 回退。
 	services.SetThreatProjectionRefresher(func() (bool, error) { return caddyService.RefreshIPListProjections() })
 	// F73-A：自动封禁名单变化后的收敛。投影热路径优先（2026-10-15 用户裁定）：
-	// 资格门（被启用策略引用∧非受信代理网段引用）命中 →
-	// RefreshIPListProjectionsInLock 零 /load 收敛（@ipListFast 匹配器 ≤1s
-	// stat 热感知）；资格未命中/不可判定/未证实收敛 → autobanReloader 全量
-	// 重载回退（60s 节流暂存合并）。AU-1（第 74 轮）：merge 读改写+收敛全程
-	// 持 CaddyOpLock，两个注入必须为 InLock 变体（自取锁变体在临界区内重入
-	// =死锁）。
+	// 资格门（被启用策略引用；受信代理引用面已随 tp.txt/lb_file 热路径化
+	// 退役）命中 → RefreshIPListProjectionsInLock 零 /load 收敛（@ipListFast
+	// 匹配器 ≤1s stat 热感知）；资格未命中/不可判定/未证实收敛 →
+	// autobanReloader 全量重载回退（60s 节流暂存合并）。AU-1（第 74 轮）：
+	// merge 读改写+收敛全程持 CaddyOpLock，两个注入必须为 InLock 变体（自取
+	// 锁变体在临界区内重入=死锁）。
 	services.SetAutobanReloader(func() error { return caddyService.GenerateAndApplyConfigForceInLock() })
 	services.SetAutobanProjectionRefresher(func() (bool, error) { return caddyService.RefreshIPListProjectionsInLock() })
 	services.InitThreatUpdateManager()

@@ -3,16 +3,16 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
 // 受信代理网段引用 IP 地址列表（trusted_proxy_range_refs，2026-10-12）：
-// 渲染静态展开 = 内联 CIDR ∪ 引用名单条目。展开形状四断言：内联在前、
-// 引用按 refs 出现顺序追加、跨来源按规范前缀去重、裸 IP 补 /32（v4）。
+// 内联 CIDR ∪ 引用名单条目合并投影（2026-10-15 热路径化，tp.txt/lb_file）。
 func TestTrustedProxyRender_expandsReferencedLists(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
@@ -43,7 +43,22 @@ func TestTrustedProxyRender_expandsReferencedLists(t *testing.T) {
 	if len(servers) == 0 {
 		t.Fatal("no servers rendered")
 	}
-	want := []string{"203.0.113.0/24", "192.0.2.7/32", "198.51.100.0/24", "203.0.113.99/32"}
+	// Then：发射 lb_file 源，合并网段（内联 ∪ 引用名单）投影进稳定路径文件
+	// （tp.txt）。内容口径=投影聚合（排序+去重+包含归并）后的并集——被内联
+	// /24 包含的 203.0.113.99/32 归并入 203.0.113.0/24（匹配语义逐 IP 等
+	// 价），裸 IP 补 /32、跨来源去重不变。
+	want := []string{"192.0.2.7/32", "198.51.100.0/24", "203.0.113.0/24"}
+	tpPath := filepath.Join(IPListDataDir, "tp.txt")
+	raw, err := os.ReadFile(tpPath)
+	if err != nil {
+		t.Fatalf("读受信代理投影 %s: %v", tpPath, err)
+	}
+	content := string(raw)
+	for _, entry := range want {
+		if !strings.Contains(content, entry) {
+			t.Fatalf("投影内容=%q, want 含 %s", content, entry)
+		}
+	}
 	for name, serverVal := range servers {
 		srv, ok := serverVal.(map[string]interface{})
 		if !ok {
@@ -53,9 +68,14 @@ func TestTrustedProxyRender_expandsReferencedLists(t *testing.T) {
 		if !ok {
 			t.Fatalf("server %s missing trusted_proxies", name)
 		}
-		got, _ := tp["ranges"].([]string)
-		if !equalStringSlices(got, want) {
-			t.Fatalf("server %s ranges=%v, want %v (内联在前/引用追加/去重/裸 IP 补 /32)", name, got, want)
+		if tp["source"] != "lb_file" {
+			t.Fatalf("server %s trusted_proxies.source=%v, want lb_file", name, tp["source"])
+		}
+		if path, _ := tp["path"].(string); path != tpPath {
+			t.Fatalf("server %s trusted_proxies.path=%v, want %s", name, tp["path"], tpPath)
+		}
+		if _, has := tp["ranges"]; has {
+			t.Fatalf("server %s trusted_proxies 不得再内联 ranges（lb_file 源）", name)
 		}
 	}
 }
@@ -76,7 +96,15 @@ func TestTrustedProxyRender_missingRefListContributesZero(t *testing.T) {
 		t.Fatalf("generation failed: %s", message)
 	}
 
-	// Then：ranges 仅内联
+	// Then：投影文件仅内联（悬空引用贡献零条目），发射 lb_file 源
+	tpPath := filepath.Join(IPListDataDir, "tp.txt")
+	raw, err := os.ReadFile(tpPath)
+	if err != nil {
+		t.Fatalf("读受信代理投影 %s: %v", tpPath, err)
+	}
+	if content := string(raw); strings.TrimSpace(content) != "203.0.113.0/24" {
+		t.Fatalf("投影内容=%q, want 仅内联 203.0.113.0/24（悬空引用贡献零条目）", content)
+	}
 	apps := generated["apps"].(map[string]interface{})
 	httpApp := apps["http"].(map[string]interface{})
 	servers := httpApp["servers"].(map[string]interface{})
@@ -89,46 +117,12 @@ func TestTrustedProxyRender_missingRefListContributesZero(t *testing.T) {
 		if !ok {
 			t.Fatalf("server %s missing trusted_proxies", name)
 		}
-		got, _ := tp["ranges"].([]string)
-		if !equalStringSlices(got, []string{"203.0.113.0/24"}) {
-			t.Fatalf("server %s ranges=%v, want [203.0.113.0/24]", name, got)
+		if tp["source"] != "lb_file" {
+			t.Fatalf("server %s trusted_proxies.source=%v, want lb_file", name, tp["source"])
 		}
-	}
-}
-
-// 重载联动门（威胁库门同款 fail-safe）：IP 名单内容变化时若被
-// trusted_proxy_range_refs 引用 → 触发配置重载（true）；未引用 → false；
-// refs JSON 解析失败按被引用处理（宁可多一次重载，不欠渲染收敛）。
-// RV72-N3：以上均以 trusted_proxy_enabled=1 为前提（停用形态见
-// TestTrustedListsReferencedByTrustedProxy_disabledGate）。
-func TestTrustedListsReferencedByTrustedProxy_gate(t *testing.T) {
-	overrideWafDirForTest(t)
-	newClusterTestService(t)
-	// Given：一条自定义名单（id 自增——内置威胁三源已占低位 id，读回真实 id）
-	res, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, entries) VALUES ('cdn-src', '[]')`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	listID, err := res.LastInsertId()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_enabled=1, trusted_proxy_range_refs=? WHERE id=1`, "["+jsonInt(listID)+"]"); err != nil {
-		t.Fatal(err)
-	}
-	if !trustedListsReferencedByTrustedProxy([]int{int(listID)}) {
-		t.Fatal("refs 含目标 id 时应为 true")
-	}
-	if trustedListsReferencedByTrustedProxy([]int{424242}) {
-		t.Fatal("refs 不含目标 id 时应为 false")
-	}
-
-	// 畸形 refs（带外改库形态）→ 按被引用处理（fail-closed）
-	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_range_refs='not-json' WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
-	if !trustedListsReferencedByTrustedProxy([]int{424242}) {
-		t.Fatal("refs JSON 解析失败须按可能被引用处理（true）——与威胁库门口径一致")
+		if path, _ := tp["path"].(string); path != tpPath {
+			t.Fatalf("server %s trusted_proxies.path=%v, want %s", name, tp["path"], tpPath)
+		}
 	}
 }
 
@@ -184,41 +178,4 @@ func TestUpdateSnapshotSettings_trustedProxyRangeRefsApplied(t *testing.T) {
 	if got != "[11]" {
 		t.Fatalf("applied trusted_proxy_range_refs=%q, want [11]", got)
 	}
-}
-
-// RV72-N3（第 72 轮复审）：受信代理重载门须判 trusted_proxy_enabled——
-// 总开关停用且 refs 残留（停用未清空/带外改库形态）时不参与渲染，
-// 名单变化不应触发重载。
-func TestTrustedListsReferencedByTrustedProxy_disabledGate(t *testing.T) {
-	overrideWafDirForTest(t)
-	newClusterTestService(t)
-	// Given：名单被 refs 引用，但 trusted_proxy_enabled=0
-	res, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, entries) VALUES ('cdn-disabled', '[]')`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	listID, err := res.LastInsertId()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_enabled=0, trusted_proxy_range_refs=? WHERE id=1`, "["+jsonInt(listID)+"]"); err != nil {
-		t.Fatal(err)
-	}
-
-	// When/Then：停用 → false（不触发重载）
-	if trustedListsReferencedByTrustedProxy([]int{int(listID)}) {
-		t.Fatal("trusted_proxy_enabled=0 时 refs 残留不应触发重载（渲染不消费 refs）")
-	}
-}
-
-func equalStringSlices(got, want []string) bool {
-	if len(got) != len(want) {
-		return false
-	}
-	for i := range got {
-		if got[i] != want[i] {
-			return false
-		}
-	}
-	return true
 }

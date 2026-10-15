@@ -2,6 +2,8 @@ package services
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -36,12 +38,24 @@ func TestTrustedProxyRender_serversInjectedWhenEnabled(t *testing.T) {
 		if !ok {
 			t.Fatalf("server %s missing trusted_proxies: %#v", name, server)
 		}
-		if tp["source"] != "static" {
-			t.Fatalf("server %s trusted_proxies.source=%v, want static", name, tp["source"])
+		if tp["source"] != "lb_file" {
+			t.Fatalf("server %s trusted_proxies.source=%v, want lb_file（热路径投影源）", name, tp["source"])
 		}
-		ranges, _ := tp["ranges"].([]string)
-		if len(ranges) != 2 || ranges[0] != "203.0.113.0/24" || ranges[1] != "198.51.100.7/32" {
-			t.Fatalf("server %s ranges=%v", name, tp["ranges"])
+		path, _ := tp["path"].(string)
+		wantPath := filepath.Join(IPListDataDir, "tp.txt")
+		if path != wantPath {
+			t.Fatalf("server %s trusted_proxies.path=%v, want %s", name, tp["path"], wantPath)
+		}
+		// 投影文件须已按合并网段落盘（内联 ∪ 引用名单的渲染副作用）
+		raw, err := os.ReadFile(wantPath)
+		if err != nil {
+			t.Fatalf("读受信代理投影 %s: %v", wantPath, err)
+		}
+		content := string(raw)
+		for _, want := range []string{"203.0.113.0/24", "198.51.100.7/32"} {
+			if !strings.Contains(content, want) {
+				t.Fatalf("投影内容=%q, want 含 %s", content, want)
+			}
 		}
 		if strict, ok := server["trusted_proxies_strict"]; !ok || strict != 1 {
 			t.Fatalf("server %s trusted_proxies_strict=%v, want 1", name, server["trusted_proxies_strict"])

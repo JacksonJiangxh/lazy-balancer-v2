@@ -5,10 +5,15 @@ package services
 //（投影文件为渲染副作用，原子落盘）后与运行配置做结构级比对：
 //   - 字节一致 → 名单-only 变更零发射面变化，投影已落盘即收敛（零 /load，
 //     @ipListFast 匹配器 ≤1s stat 热感知）→ 返回 true；
-//   - 字节不一致（发射面变化：名单清空/扩空致规则增减）→ 返回 false，调用方
+//   - 字节不一致（发射面变化：仅剩否定算子/非投影面形态）→ 返回 false，调用方
 //     回退既有全量渲染+应用链；
 //   - 运行配置不可读 → 返回 false（无法证实零变化即不轻率跳过 /load，
 //     fail-open 与同字节短路同向）。
+//
+// 始终发射收敛（2026-10-15 用户裁定）：空名单也投影空文件并恒发射 @ipListFast
+//（空集=匹配器永不命中，与无规则语义等价）——空↔非空与中段同为纯内容变化，
+// 全走热路径。存量运行配置（空名单无指令）升级后首次渲染因发射面新增触发一次
+// 全量重载，自愈收敛。
 
 import (
 	"io"
@@ -156,18 +161,73 @@ func TestRefreshIPListProjectionsFromTx_hotPathZeroLoad(t *testing.T) {
 	}
 }
 
-// 名单清空（发射面变化：合并集变空 → 规则不再发射）必须回退全量链——
-// hot=false、零 /load 由刷新方自行发起（调用方回退 finishTxApply）。
-func TestRefreshIPListProjectionsFromTx_emissionChangeFallsBack(t *testing.T) {
+// 空→首条（2026-10-15 始终发射收敛）：空名单策略首轮即恒发射 @ipListFast
+// （空文件投影就位），追加首条为纯内容变化——hot=true、零新增 /load。
+func TestRefreshIPListProjectionsFromTx_emptyToFirstEntryHotPath(t *testing.T) {
+	stubSecurityLibsAvailable(t)
+	newClusterTestService(t)
+	admin := newHotPathTestAdmin(t)
+	s := NewCaddyService(admin.srv.URL)
+
+	listID := seedHotPathList(t, `[]`)
+	policyID := seedHotPathPolicy(t, listID)
+
+	// 跨测试隔离：包级共享投影目录 + 每测试新库 policyID 重叠——清掉同名
+	// 旧投影，首轮「空文件已投影」断言才不受前序测试文件残留污染。
+	_ = os.Remove(filepath.Join(IPListDataDir, "p"+strconv.FormatInt(policyID, 10)+"-acl.txt"))
+
+	if err := s.GenerateAndApplyConfig(); err != nil {
+		t.Fatalf("首次应用: %v", err)
+	}
+	if got := admin.loadCount(); got != 1 {
+		t.Fatalf("首次 /load 次数=%d, want 1", got)
+	}
+	if content := mustReadProjection(t, policyID); content != "" {
+		t.Fatalf("首轮空名单投影=%q, want 空文件已投影", content)
+	}
+
+	tx, err := db.DB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE security_ip_lists SET entries=? WHERE id=?`,
+		`[{"value":"203.0.113.5","remark":""}]`, listID); err != nil {
+		t.Fatal(err)
+	}
+	hot, err := s.RefreshIPListProjectionsFromTxInLock(tx)
+	if err != nil {
+		t.Fatalf("热路径刷新: %v", err)
+	}
+	if !hot {
+		t.Fatal("空→首条（恒发射下为纯内容变化）应走热路径 hot=true")
+	}
+	if got := admin.loadCount(); got != 1 {
+		t.Fatalf("热路径后 /load 次数=%d, want 仍 1（零重载）", got)
+	}
+	if content := mustReadProjection(t, policyID); !strings.Contains(content, "203.0.113.5/32") {
+		t.Fatalf("热路径投影内容=%q, want 含首条", content)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// 清空 N→0（2026-10-15 始终发射收敛）：规则恒在，名单文件清空为纯内容变化
+// ——hot=true、零 /load、投影文件归零字节（匹配器空集永不命中=与无规则等价）。
+func TestRefreshIPListProjectionsFromTx_clearToEmptyHotPath(t *testing.T) {
 	stubSecurityLibsAvailable(t)
 	newClusterTestService(t)
 	admin := newHotPathTestAdmin(t)
 	s := NewCaddyService(admin.srv.URL)
 
 	listID := seedHotPathList(t, `[{"value":"203.0.113.5","remark":""}]`)
-	seedHotPathPolicy(t, listID)
+	policyID := seedHotPathPolicy(t, listID)
 	if err := s.GenerateAndApplyConfig(); err != nil {
 		t.Fatalf("首次应用: %v", err)
+	}
+	if got := admin.loadCount(); got != 1 {
+		t.Fatalf("首次 /load 次数=%d, want 1", got)
 	}
 
 	tx, err := db.DB.Begin()
@@ -182,11 +242,17 @@ func TestRefreshIPListProjectionsFromTx_emissionChangeFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("刷新: %v", err)
 	}
-	if hot {
-		t.Fatal("清空名单（发射面变化）不得宣称热路径收敛, want hot=false 回退全量链")
+	if !hot {
+		t.Fatal("清空 N→0（恒发射下为纯内容变化）应走热路径 hot=true")
 	}
 	if got := admin.loadCount(); got != 1 {
-		t.Fatalf("刷新方不得自行 /load: 次数=%d, want 仍 1", got)
+		t.Fatalf("热路径后 /load 次数=%d, want 仍 1（零重载）", got)
+	}
+	if content := mustReadProjection(t, policyID); content != "" {
+		t.Fatalf("清空后投影内容=%q, want 0 字节空文件", content)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
 }
 
