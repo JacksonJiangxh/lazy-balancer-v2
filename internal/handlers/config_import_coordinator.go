@@ -97,6 +97,10 @@ func (session *configImportSession) abort(importErr error) error {
 	if session.finished {
 		return importErr
 	}
+	// HP77-1（历史）：会话内 CLI 预检/强制应用等渲染已按未提交导入内容
+	// 重写投影文件——abort 必回滚 tx，磁盘同步回退到已提交态（零 /load；
+	// 快照阶段失败等未渲染形态为同字节 no-op）。已持 caddyOpMu（begin 起）。
+	session.h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 	if session.runtime != nil {
 		if restoreErr := session.h.restoreImportRuntime(*session.runtime); restoreErr != nil {
 			importErr = errors.Join(importErr, fmt.Errorf("恢复运行配置失败: %w", restoreErr))

@@ -33,9 +33,11 @@ type hotPathIPListFixture struct {
 	mu       sync.Mutex
 	posts    int
 	lastBody []byte
-	h        *Handlers
-	router   *gin.Engine
-	dir      string
+	// rejectNextLoads >0 时接下来 N 次 /load 返回 400（拒绝分支测试注入）。
+	rejectNextLoads int
+	h               *Handlers
+	router          *gin.Engine
+	dir             string
 }
 
 func newHotPathIPListFixture(t *testing.T) *hotPathIPListFixture {
@@ -50,6 +52,12 @@ func newHotPathIPListFixture(t *testing.T) *hotPathIPListFixture {
 			_, _ = w.Write(append(f.lastBody, '\n'))
 		case r.Method == http.MethodPost && r.URL.Path == "/load":
 			f.posts++
+			if f.rejectNextLoads > 0 {
+				f.rejectNextLoads--
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte("rejected"))
+				return
+			}
 			f.lastBody, _ = io.ReadAll(r.Body)
 			w.WriteHeader(http.StatusOK)
 		default:
@@ -91,6 +99,13 @@ func (f *hotPathIPListFixture) loadCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.posts
+}
+
+// rejectLoads 注入接下来 N 次 /load 的 400 拒绝（Caddy 拒绝配置形态）。
+func (f *hotPathIPListFixture) rejectLoads(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rejectNextLoads = n
 }
 
 // seed 名单+规则+deny ACL 策略（仅引用名单）+绑定，返回（名单 id, 策略 id）。

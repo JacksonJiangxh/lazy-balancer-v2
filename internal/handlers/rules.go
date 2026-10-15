@@ -660,7 +660,12 @@ func queryRuleDomainConflict(domain string, listenPort int, excludeCaddyID, extr
 // respondRuleApplyError 规则×5 apply 错误统一映射（裁定 2026-09-07 D2）：
 // 配置拒绝（CLI/admin 4xx/生成失败）→ 400「Caddy 配置应用失败，规则未<动词>: …」；
 // ErrUnvalidatedApply/传输失败 → 500 同文案。恢复失败并入消息（不改状态码分类）。
-func respondRuleApplyError(c *gin.Context, applyErr, restoreErr error, verb string) {
+// HP77-1（历史）：五个调用方的 applyErr 分支均伴随 tx 回滚——applyFromTxNote
+// 的 CLI 预检/事务内应用两轮渲染已按未提交内容重写投影文件（规则×绑定策略的
+// u-*/p<id> 投影），磁盘同步回退到已提交态（零 /load；单一收敛点=R-12 同族
+// 收敛，禁止单点补丁）。
+func (h *Handlers) respondRuleApplyError(c *gin.Context, applyErr, restoreErr error, verb string) {
+	h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 	if restoreErr != nil {
 		applyErr = errors.Join(applyErr, restoreErr)
 	}
@@ -1012,7 +1017,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_create", caddyID))
 	if applyErr != nil {
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
-		respondRuleApplyError(c, applyErr, restoreErr, "创建")
+		h.respondRuleApplyError(c, applyErr, restoreErr, "创建")
 		return
 	}
 	if err := tx.Commit(); err != nil {
@@ -1959,7 +1964,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_update", caddyID))
 	if applyErr != nil {
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
-		respondRuleApplyError(c, applyErr, restoreErr, "更新")
+		h.respondRuleApplyError(c, applyErr, restoreErr, "更新")
 		return
 	}
 	if err := tx.Commit(); err != nil {
@@ -2354,7 +2359,7 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 		if restoreErr != nil {
 			services.Logf("error", "问题: DeleteRule Caddy apply and runtime restore failed for caddy_id=%s: apply=%v restore=%v", caddyID, applyErr, restoreErr)
 		}
-		respondRuleApplyError(c, applyErr, restoreErr, "删除")
+		h.respondRuleApplyError(c, applyErr, restoreErr, "删除")
 		return
 	}
 	if err := h.removeRuleCertFiles(caddyID); err != nil {
@@ -3054,7 +3059,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_enable", caddyID))
 	if applyErr != nil {
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
-		respondRuleApplyError(c, applyErr, restoreErr, "启用")
+		h.respondRuleApplyError(c, applyErr, restoreErr, "启用")
 		return
 	}
 	if err := tx.Commit(); err != nil {
@@ -3288,7 +3293,7 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_disable", caddyID))
 	if applyErr != nil {
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
-		respondRuleApplyError(c, applyErr, restoreErr, "禁用")
+		h.respondRuleApplyError(c, applyErr, restoreErr, "禁用")
 		return
 	}
 	if err := tx.Commit(); err != nil {

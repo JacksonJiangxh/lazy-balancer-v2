@@ -16,7 +16,13 @@
           <span class="trg-hero-stage">{{ heroStage }}</span>
           <span class="trg-hero-ip">{{ row?.client_ip }}</span>
           <span v-if="row?.ip_location" class="trg-source-geo">{{ row.ip_location }}</span>
-          <span v-else-if="geoLabel" class="trg-source-geo">{{ geoLabel }}</span>
+          <!-- PM-3（历史）：geoLabel（策略 geoip_countries 区域清单）回退加
+               kind 门控——归属地位置只对地域事件（kind==='geo'，xdb 未装时
+               ip_location 为空的唯一回退位）展示区域清单有意义；非地域事件
+               （ACL/信任/WAF…）显示策略区域清单会被误读为该事件归属地。
+               Ruling（主审裁定）：选门控而非改标签语义——地域事件中区域清单
+               是有效信息，保留。 -->
+          <span v-else-if="kind === 'geo' && geoLabel" class="trg-source-geo">{{ geoLabel }}</span>
         </div>
         <div class="trg-hero-policy">
           <span class="trg-hero-policy-name">{{ policy?.name ?? (loading ? '加载中…' : policyMissing ? '（策略已删除）' : '（策略信息不可用）') }}</span>

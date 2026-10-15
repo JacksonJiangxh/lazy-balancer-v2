@@ -65,8 +65,12 @@ func loadConfigSnapshot() (configSnapshot, error) {
 	//（NOT NULL DEFAULT+每启动回填报证不可达；upstream_keepalive_timeout 为
 	// 类型②省略型保留 COALESCE 0）。
 	var old configSnapshot
+	// R2（历史）：cert_expiry_days 字面量 30 → db.DefaultCertExpiryDays 绑定
+	// 参数（caddy.go G4 形态）；同句 cert_renewal_days/attempts 属 cert_renewal_*
+	// 列族，不在本轮 cert_expiry_days 收敛范围。缺行仍整体报错（预览面拒绝
+	// 「以零值快照误报全字段变更」）。
 	err := db.DB.QueryRow(`SELECT COALESCE(acme_email,''), COALESCE(dns_provider,'dnspod'), COALESCE(dns_credentials,''),
-		COALESCE(cert_expiry_days,30), COALESCE(cert_renewal_days,30), COALESCE(cert_renewal_attempts,5),
+		COALESCE(cert_expiry_days,?), COALESCE(cert_renewal_days,30), COALESCE(cert_renewal_attempts,5),
 		COALESCE(default_ca_provider_id,0), COALESCE(log_level,'info'),
 		COALESCE(timezone,'Asia/Shanghai'),
 		COALESCE(caddy_log_level,'info'), caddy_log_size_mb, request_body_max_size_mb,
@@ -82,7 +86,7 @@ func loadConfigSnapshot() (configSnapshot, error) {
 		COALESCE(mfa_write_guard,0),
 		COALESCE(mfa_lockout_enabled,0),
 		COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_ranges,'[]'), COALESCE(trusted_proxy_range_refs,'[]'), COALESCE(trusted_proxy_headers,'[]'), COALESCE(trusted_proxy_strict,1)
-		FROM global_config WHERE id=1`).Scan(
+		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays).Scan(
 		&old.ACMEEmail, &old.DNSProvider, &old.DNSCredentials,
 		&old.CertExpiryDays, &old.CertRenewalDays, &old.CertRenewalAttempts,
 		&old.DefaultCAProviderID, &old.LogLevel,

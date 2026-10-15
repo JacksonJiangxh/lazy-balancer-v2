@@ -544,7 +544,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Description: "启动时从数据库装载运行态：规则库（CRS 种子/对账）→ 证书文件物化 → Caddy 配置渲染与应用（失败回退最后已知正确配置）。完成前面板不监听",
 		Category:    "系统",
 		Kind:        taskengine.KindOneshot,
-		BootSync:    true, // B1（历史后裁定）：启动执行=引擎同步触发（面板监听前完成）
+		RunsOn:      taskengine.RoleAny, // R3（历史）：BootSync 仅 RoleAny（注册期强制；启动执行面无角色语义）
+		BootSync:    true,               // B1（历史后裁定）：启动执行=引擎同步触发（面板监听前完成）
 		Run: func(rc taskengine.RunContext) error {
 			// V1（历史）：caddy-restart=Caddy 崩溃自愈 watcher 经引擎调度
 			// （曾 watcher 直调执行体绕过引擎——task_runs/单飞/日志双行）。

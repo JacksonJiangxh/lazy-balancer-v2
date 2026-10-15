@@ -268,9 +268,11 @@ func TestGCStaleIPListFiles_prunesStaleRefEntries(t *testing.T) {
 	}
 }
 
-// GC regex 形态（2026-10-15 热路径改造）：新稳定命名（<scope>.txt——u- 并集
-// 描述符 / p<id>-角色 白名单形态）与旧内容寻址形态（scope-sha256[:12].txt
-// ——迁移期 GC 自然回收）都命中；用户手放文件（非投影命名形态）不碰。
+// GC regex 形态（2026-10-15 热路径改造；历史 HP77-2/HP77-4 收口）：新稳定
+// 命名（<scope>.txt——u- 并集描述符 / p<id>-角色 白名单形态）、crsxc 组合键
+// 哈希形态（HP77-4）与旧内容寻址形态（scope-sha256[:12].txt——迁移期 GC 自然
+// 回收）都命中；大写/含点 rule id 形态命中（HP77-2：v2 导入可携带，旧字符类
+// 使孤儿永不回收）；用户手放文件（非投影命名形态）不碰。
 func TestIPListProjectedFileName_forms(t *testing.T) {
 	matched := []string{
 		"u-deny.txt", "u-trust.txt", "u-trust12.txt", "u-bl.txt", "u-allow.txt", "u-allow-exempt.txt",
@@ -281,7 +283,10 @@ func TestIPListProjectedFileName_forms(t *testing.T) {
 		"orphan-deadbeef0012.txt",  // 旧形态（任意 scope 前缀，精确 12 位 hex）
 		// 历史 HP-1 新形态：u-<kind>-<ruleCaddyID>（CaddyID 含下划线）
 		"u-deny-lb_2r8dosptk1.txt", "u-trust12-lb_2r8dosptk1.txt", "u-allow-exempt-lb_ab12cd34ef56.txt",
-		"p5-crsxc-0.txt", // 历史 SEC-1 新形态：CRS 作用域排除投影（策略身份）
+		"p5-crsxc-0.txt",            // 历史 SEC-1 序号形态（HP77-4 后存量，GC 过渡回收）
+		"p5-crsxc-0123456789ab.txt", // 历史 HP77-4 组合键哈希形态
+		// 历史 HP77-2：导入可携带大写/含点 rule id——孤儿必须可回收
+		"u-deny-lb_2R8d.ptk1.txt", "u-bl-My_Rule.1.txt", "u-trust-lbUPPER123.txt",
 	}
 	for _, name := range matched {
 		if !ipListProjectedFileName.MatchString(name) {
@@ -292,11 +297,13 @@ func TestIPListProjectedFileName_forms(t *testing.T) {
 		"notes.txt",                 // 用户手放
 		"backup.txt",                // 用户手放
 		"deny-list.txt",             // 非投影形态
-		"u-deny.TXT",                // 大小写不匹配（仅小写规范形态）
+		"u-deny.TXT",                // 扩展名大小写不匹配（.txt 规范形态）
 		"p12-acl.txt.tmp",           // 投影临时文件（由 .tmp 清理支线处理）
 		"orphan-deadbeef001200.txt", // 13 位 hex ≠ 旧 12 位形态（hash 过渡分支精确 12 位）
 		"acl.txt",                   // 缺策略 id 前缀
 		"x12-acl.txt",               // 非 p<数字> 前缀
+		"p5-crsxc-ab12.txt",         // crsxc 非 12 位 hex（非序号非哈希形态）
+		"u-.txt",                    // u- 后无身份段（首字符须字母数字——无路径逃逸面）
 	}
 	for _, name := range unmatched {
 		if ipListProjectedFileName.MatchString(name) {

@@ -116,12 +116,14 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 		return
 	}
 	var expiryDays int
-	if err := db.DB.QueryRow("SELECT COALESCE(cert_expiry_days,30) FROM global_config WHERE id=1").Scan(&expiryDays); err != nil {
+	// R2（历史）：字面量 30 → db.DefaultCertExpiryDays 绑定参数（caddy.go
+	// G4 形态，库值唯一真相单源）。
+	if err := db.DB.QueryRow("SELECT COALESCE(cert_expiry_days,?) FROM global_config WHERE id=1", db.DefaultCertExpiryDays).Scan(&expiryDays); err != nil {
 		// 历史问题（2026-09-05 证书域审计裁定）：展示阈值的读取失败不得放大为整个
-		// 任务列表 500——降级默认 30 并告警，对齐 历史 历史问题 的
+		// 任务列表 500——降级治理默认并告警，对齐 历史 历史问题 的
 		// checkManualCertExpiration 口径。
-		services.Logf("error", "ListCertJobs: read cert_expiry_days failed, using default 30: %v", err)
-		expiryDays = 30
+		services.Logf("error", "ListCertJobs: read cert_expiry_days failed, using default %d: %v", db.DefaultCertExpiryDays, err)
+		expiryDays = db.DefaultCertExpiryDays
 	}
 	// 历史问题(历史):cert_pem 只取首证书块——certificateIssuer 仅
 	// 解析首块,全链(LE ~6KB)全量传输纯属浪费;INSTR 定位首个 END 边界,

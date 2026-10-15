@@ -1020,6 +1020,10 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 		applyErr := h.caddyService.ApplyConfigFromTxCertAwareForce(tx)
 		if applyErr != nil {
 			if services.IsConfigRejected(applyErr) {
+				// HP77-1/HP77-5（历史）：强制被拒=tx 回滚——refresh 渲染已按
+				// 未提交条目重写投影，磁盘回退到已提交态（证书物化内容本即已提交
+				// PEM，物化无需撤销；见 RollbackIPListProjectionsToCommittedInLock 披露）。
+				h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 				recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("Caddy 校验未通过", applyErr.Error(), services.AuditResultPart("failure")))
 				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 配置校验未通过，" + f.Resource + "未保存: " + applyErr.Error()})
 				return true

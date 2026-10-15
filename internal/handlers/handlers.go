@@ -279,6 +279,9 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 	}
 	if services.IsConfigRejected(applyErr) {
 		// CLI 校验拒绝与 admin 4xx 同口径：不落库 + 400 + 失败审计。
+		// HP77-1（历史）：渲染副作用（稳定命名投影+证书物化）已按未提交
+		// 内容落盘——tx 回滚的同时把磁盘回退到已提交态（零 /load）。
+		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("Caddy 校验未通过", applyErr.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 配置校验未通过，" + f.Resource + "未保存: " + applyErr.Error()})
 		return
@@ -286,6 +289,8 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 	// 乱填保障（2026-09-06 补充裁定）：CLI 不可用 + 应用传输失败 = 未经任何
 	// Caddy 级校验——不得退化提交（无法排除坏配置），回滚 + 明确提示。
 	if errors.Is(applyErr, services.ErrUnvalidatedApply) {
+		// HP77-1 同收口：回滚分支磁盘回退到已提交态（零 /load）。
+		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("Caddy 应用失败且 CLI 校验不可用", applyErr.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Caddy 应用失败且 CLI 校验不可用，" + f.Resource + "未保存（服务与运行配置不受影响，恢复 Caddy/CLI 后重试）: " + applyErr.Error()})
 		return
