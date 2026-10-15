@@ -15,7 +15,8 @@
           <el-tag size="small" :type="sourceTagType" effect="dark">{{ categoryLabel }}</el-tag>
           <span class="trg-hero-stage">{{ heroStage }}</span>
           <span class="trg-hero-ip">{{ row?.client_ip }}</span>
-          <span v-if="geoLabel" class="trg-source-geo">{{ geoLabel }}</span>
+          <span v-if="row?.ip_location" class="trg-source-geo">{{ row.ip_location }}</span>
+          <span v-else-if="geoLabel" class="trg-source-geo">{{ geoLabel }}</span>
         </div>
         <div class="trg-hero-policy">
           <span class="trg-hero-policy-name">{{ policy?.name ?? (loading ? '加载中…' : policyMissing ? '（策略已删除）' : '（策略信息不可用）') }}</span>
