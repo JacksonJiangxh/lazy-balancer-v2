@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -19,6 +21,35 @@ func scopedExclusionFixture(t *testing.T) {
 	t.Helper()
 	seedCRSRuleIndexFixture(t)
 	seedInfraCRSFiles(t)
+}
+
+// crsxcProjectionFiles 提取渲染产物中全部 CRS 作用域排除投影（@ipListFast
+// 算子路径→文件内容）。HP77-4 后 scope 名=组合键哈希（p<id>-crsxc-<12hex>），
+// 测试不再钉实现文件名（T3 改行为断言：以名→内容的映射断言身份不变量）。
+func crsxcProjectionFiles(t *testing.T, directives string) map[string]string {
+	t.Helper()
+	out := make(map[string]string)
+	for _, line := range strings.Split(directives, "\n") {
+		idx := strings.Index(line, "@ipListFast ")
+		if idx < 0 || !strings.Contains(line, "-crsxc-") {
+			continue
+		}
+		rest := line[idx+len("@ipListFast "):]
+		end := strings.IndexAny(rest, "\" \t")
+		if end < 0 {
+			end = len(rest)
+		}
+		path := rest[:end]
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("读回 crsxc 投影 %s: %v", path, err)
+		}
+		out[filepath.Base(path)] = string(raw)
+	}
+	if len(out) == 0 {
+		t.Fatalf("渲染产物中未找到 crsxc 投影:\n%s", directives)
+	}
+	return out
 }
 
 // seedInfraCRSFiles 提供基础设施三件套（901/949/959）与 crsDirectivesDir——
@@ -129,7 +160,7 @@ func TestBuildCorazaDirectives_scopedExclusionExpandsGroupPerID(t *testing.T) {
 		}
 		last = idx
 	}
-	if got := readRenderedIPList(t, directives, "p0-crsxc-0"); got != "1.1.1.1/32\n2.2.2.2/32\n" {
+	if got := readRenderedIPList(t, directives, "-crsxc-"); got != "1.1.1.1/32\n2.2.2.2/32\n" {
 		t.Fatalf("匹配集投影文件=%q, want 两条聚合排序条目", got)
 	}
 	if strings.Contains(directives, "SecRuleRemoveById") {
@@ -158,14 +189,24 @@ func TestBuildCorazaDirectives_scopedExclusionMergesIPsAndListDedup(t *testing.T
 	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	// 条目 1：ips ∪ 列表条目合并去重保序 → 2.2.2.2,1.1.1.1,3.3.3.0/24；
 	// 条目 2：同一列表重复引用去重一次。两组合键不同（ips 字面不同）→ 两份
-	// 投影（p0-crsxc-0/1，第 76 轮 SEC-1 投影形态，内容断言在投影文件）。
-	got0 := readRenderedIPList(t, directives, "p0-crsxc-0")
-	if got0 != "1.1.1.1/32\n2.2.2.2/32\n3.3.3.0/24\n" {
-		t.Fatalf("entry 1 merged match set wrong: %q", got0)
+	// 投影（HP77-4：scope=组合键哈希，内容断言以名→内容映射承载，不再钉
+	// 实现文件名）。
+	files := crsxcProjectionFiles(t, directives)
+	if len(files) != 2 {
+		t.Fatalf("两个不同组合键必须两份投影, got %d: %v", len(files), files)
 	}
-	got1 := readRenderedIPList(t, directives, "p0-crsxc-1")
-	if got1 != "1.1.1.1/32\n3.3.3.0/24\n" {
-		t.Fatalf("entry 2 merged match set (dup list refs deduped) wrong: %q", got1)
+	contents := make([]string, 0, len(files))
+	for name, content := range files {
+		contents = append(contents, content)
+		if !strings.Contains(name, "-crsxc-") {
+			t.Fatalf("投影名 %q 不含 crsxc 哈希段", name)
+		}
+	}
+	sort.Strings(contents)
+	want0 := "1.1.1.1/32\n2.2.2.2/32\n3.3.3.0/24\n"
+	want1 := "1.1.1.1/32\n3.3.3.0/24\n"
+	if contents[0] != want0 || contents[1] != want1 {
+		t.Fatalf("投影内容=%q / %q, want %q 与 %q", contents[0], contents[1], want0, want1)
 	}
 	// id 跨条目顺序唯一（2000001/2000002），各自指向对应投影文件
 	for _, want := range []string{
@@ -525,4 +566,101 @@ func TestBuildCorazaDirectives_infraIncludeGuardedByExistence(t *testing.T) {
 	if !strings.Contains(directives, "Include /app/waf/crs/rules/REQUEST-942-") {
 		t.Fatalf("selected group glob must still emit:\n%s", directives)
 	}
+}
+
+// HP77-4（第 77 轮，行为钉测取代 T3 实现文件名钉）：crsxc scope=组合键哈希
+// （ips 字面+排序后 listRefs 的 sha256[:12]）——身份不变量：
+//
+//	①条目重排不改名（位置无关——旧「组合首次出现序」下重排使旧名承载他条目
+//	  匹配集）；
+//	②键不变的名字稳定，键变化的条目换名、其余条目名不受牵连（无重编号）；
+//	③listRefs 顺序无关（[a,b] 与 [b,a] 同键同名）；
+//	④同名必同内容（单次渲染内两键两文件、各含自己的匹配集）。
+func TestCRSXCScope_hashNamingIsContentIdentity(t *testing.T) {
+	scopedExclusionFixture(t)
+	render := func(entries string) (map[string]string, string) {
+		t.Helper()
+		policy := &models.SecurityPolicy{
+			AnomalyThreshold: 5,
+			Mode:             "blocking",
+			CRSExcludedRules: json.RawMessage(entries),
+		}
+		directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
+		return crsxcProjectionFiles(t, directives), directives
+	}
+
+	// 基线：条目 A(ips=1.1.1.1)、B(ips=2.2.2.2)。
+	base, baseDirectives := render(`[
+		{"target":"942100","scope":"ip","ips":"1.1.1.1"},
+		{"target":"942550","scope":"ip","ips":"2.2.2.2"}
+	]`)
+	if len(base) != 2 {
+		t.Fatalf("两键两投影, got %d", len(base))
+	}
+	nameA := ""
+	for name, content := range base {
+		if content == "1.1.1.1/32\n" {
+			nameA = name
+		}
+	}
+	if nameA == "" {
+		t.Fatalf("未找到 A 匹配集投影: %v", base)
+	}
+	// ① 重排（B 在前）→ 名字集合不变且 A 名不变（位置无关）。
+	reordered, _ := render(`[
+		{"target":"942550","scope":"ip","ips":"2.2.2.2"},
+		{"target":"942100","scope":"ip","ips":"1.1.1.1"}
+	]`)
+	if len(reordered) != 2 {
+		t.Fatalf("重排后仍两投影, got %d", len(reordered))
+	}
+	if _, ok := reordered[nameA]; !ok || reordered[nameA] != "1.1.1.1/32\n" {
+		t.Fatalf("重排后 A 名 %q 不复用或内容漂移: %v（HP77-4 位置身份残留）", nameA, reordered)
+	}
+	// ② 增删（去掉 A）→ B 名不变（无重编号牵连）。
+	afterRemove, _ := render(`[{"target":"942550","scope":"ip","ips":"2.2.2.2"}]`)
+	nameB := ""
+	for name := range base {
+		if name != nameA {
+			nameB = name
+		}
+	}
+	if len(afterRemove) != 1 || afterRemove[nameB] != "2.2.2.2/32\n" {
+		t.Fatalf("删除 A 后 B 应保持原名单一份投影: %v（want %q）", afterRemove, nameB)
+	}
+	// ③ listRefs 顺序无关：[a,b] 与 [b,a] 同键同名（名单须真实存在——引用
+	// 悬空时合并集为空被跳过发射）。
+	_, database := newClusterTestService(t)
+	resL1, err := database.Exec(`INSERT INTO security_ip_lists (name, entries) VALUES ('r77l1', '[{"value":"1.1.1.1","remark":""}]')`)
+	if err != nil {
+		t.Fatalf("seed list 1: %v", err)
+	}
+	resL2, err := database.Exec(`INSERT INTO security_ip_lists (name, entries) VALUES ('r77l2', '[{"value":"3.3.3.3","remark":""}]')`)
+	if err != nil {
+		t.Fatalf("seed list 2: %v", err)
+	}
+	l1, _ := resL1.LastInsertId()
+	l2, _ := resL2.LastInsertId()
+	withRefs, _ := render(`[{"target":"942100","scope":"list","ips":"","listRefs":[` + strconv.FormatInt(l1, 10) + `,` + strconv.FormatInt(l2, 10) + `]}]`)
+	refsReordered, _ := render(`[{"target":"942100","scope":"list","ips":"","listRefs":[` + strconv.FormatInt(l2, 10) + `,` + strconv.FormatInt(l1, 10) + `]}]`)
+	if len(withRefs) != 1 || len(refsReordered) != 1 {
+		t.Fatalf("listRefs 形态应各一份投影: %v / %v", withRefs, refsReordered)
+	}
+	for name := range withRefs {
+		if _, ok := refsReordered[name]; !ok {
+			t.Fatalf("listRefs 排序无关被破坏: %q 不在 %v", name, refsReordered)
+		}
+	}
+	// ④ 同名必同内容：基线内 A/B 名不同且内容互不串染（哈希碰撞面=12hex，
+	// 两键即异名）。
+	for name, content := range base {
+		want := "1.1.1.1/32\n"
+		if name == nameB {
+			want = "2.2.2.2/32\n"
+		}
+		if content != want {
+			t.Fatalf("投影 %q 内容=%q, want %q（同名必同内容）", name, content, want)
+		}
+	}
+	_ = baseDirectives
 }

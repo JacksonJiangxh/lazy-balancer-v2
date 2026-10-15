@@ -911,3 +911,41 @@ func TestThreatListsReferenced_iterationErrorTreatedAsReferenced(t *testing.T) {
 		t.Fatal("迭代错误须按被引用处理（true）——与查询失败/解析失败同口径（fail-closed）")
 	}
 }
+
+// T2（第 77 轮盲区补钉）：threat 通道 NeedForce→回退 /load 钉测——刷新返回
+// NeedForce（本轮渲染物化了证书文件，第 76 轮 CERT-1）时必须回退强制重载
+// 收敛（宁可一次重载，不欠引用方渲染收敛，R72 W1-1）；重载失败仅留痕，
+// 不中断任务、不计任务失败。
+func TestThreatUpdate_needForceFallsBackToReload(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	var reloads, refreshes, reloadErrs int
+	SetThreatReloader(func() error { reloads++; return nil })
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) { refreshes++; return ProjectionNeedForce, nil })
+	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
+
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if refreshes != 1 || reloads != 1 {
+		t.Fatalf("NeedForce 必须回退强制重载: refreshes=%d reloads=%d", refreshes, reloads)
+	}
+
+	// 重载失败形态：内容再变（NeedForce 同形）、重载失败——同样回退、失败
+	// 留痕、任务不失败。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("192.0.2.99\n"))
+	}))
+	t.Cleanup(srv.Close)
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name='ustc'`, srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	SetThreatReloader(func() error { reloads++; reloadErrs++; return errors.New("admin down") })
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("重载失败不得否决任务: %v", err)
+	}
+	if reloadErrs != 1 || reloads != 2 {
+		t.Fatalf("重载失败须留痕: reloads=%d reloadErrs=%d", reloads, reloadErrs)
+	}
+}

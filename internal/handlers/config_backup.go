@@ -3092,6 +3092,22 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 		c.JSON(status, models.APIResponse{Code: status, Message: message, Data: gin.H{"summary": counts, "disabled_conflicts": disabledConflicts, "warnings": failureWarnings}})
 		return
 	}
+	// PM-1（第 77 轮审计·A77PluginMisc）：备份导入是第三条解封面——本函数对
+	// security_ip_lists 全量替换（DELETE 全表+插备份行，deleteOrder/insertOrder
+	// W2 语义），commit 成功后内存 autobanWindows 若保留旧计数桶，还原旧备份后
+	// 零新流量 ≤1 tick 重封（与「删除即解封」同型撤销，AB-1 两接线点不覆盖导入
+	// 面）。门控=备份实际携带该表（迟到表「缺席=保留本地」形态本地名单未动，
+	// 计数桶保留）；此时点在 session.commit 之后且仍持 caddyOpMu（beginConfigImport
+	// 取锁），与 handlers 解封清桶（同锁临界区）全序、无回滚副作用。Ruling
+	// （2026-10-15 主审裁定）：选 ResetAutobanCounters 整体清桶而非按名单差集
+	// ForgetIPs——导入是全量替换语义：导入后名单世界=备份行集合（预置名单可
+	// 缺席/换 id/换条目），旧计数桶的全部前提失效；差集需跨事务快照旧条目+解析
+	// 备份 entries+按值比对，且覆盖不了「预置名单随备份整体消失」形态，复杂而不
+	// 更正确；Reset 代价=未受导入影响的 IP 计数清零重新累计（观察态一个窗口内
+	// 自愈）。预览端（ValidateConfigImport）零写入语义、不发生替换，不接清桶。
+	if _, listsReplaced := backup.Tables["security_ip_lists"]; listsReplaced {
+		services.ResetAutobanCounters()
+	}
 	// L6-66-04（第 66 轮审计）：CRS「reloading/success」流水在 commit 成功后
 	// 补写——commit 失败路径已在上方 return，任务日志不再出现「重载/更新
 	// 成功」与实际回滚态矛盾的行。

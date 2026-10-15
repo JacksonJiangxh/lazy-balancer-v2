@@ -4229,6 +4229,43 @@ func (s *CaddyService) refreshIPListProjectionsInLock(store caddyConfigStore) (I
 	return ProjectionConverged, nil
 }
 
+// RollbackIPListProjectionsToCommittedInLock 拒绝/回滚分支的磁盘回退（第 77 轮
+// HP77-1/HP77-5，用户裁定：拒绝=磁盘回滚到已提交态）：以已提交库值（db.DB）
+// 重渲染一次全量配置——投影文件经渲染副作用原子重写为已提交内容（同字节跳写
+// 保护在役文件），MaterializeCertPairs 把证书文件物化回归已提交 PEM——全程零
+// /load（不做运行配置读取与比对，不发射任何 admin 请求）。
+//
+// 语义披露（方案选型裁定）：
+//   - 「快照/恢复」方案（渲染前快照被覆写文件）被否：一次写请求内渲染发生
+//     多轮（CLI 预检/热路径 refresh/事务内 apply），快照需跨轮贯穿且逐写点
+//     钩挂，侵入面大；重渲染方案单点复用 generateCaddyConfigFromStore 的
+//     既有原子写+同字节跳写，语义即「磁盘=已提交库值」，与 TTSR 渲染「库值
+//     唯一真相」铁律同构。
+//   - 从未提交的渲染中新生成的投影文件（已提交态不引用该 scope，如 allow
+//     空集→非空的发射面出现形态）不删除——它们不被运行配置引用（零控制面
+//     效果的惰性孤儿），由既有 24h GC 回收；内容级回滚由在役投影形状承载。
+//   - NeedForce 强制被拒时，证书物化内容本就是已提交 PEM（物化=已提交态），
+//     需回退的是投影与 DB 侧（本方法覆盖）；「磁盘新证书 × Caddy 内存旧证书」
+//     的 W1-1 债务在拒绝后依然存在，与一切 apply 被拒形态同边界，由下次成功
+//     渲染/手动重载收敛（非本方法职责）。
+//   - 已提交视图渲染失败（数据损坏等）→ 仅 warn 不阻断拒绝收尾——拒绝分支
+//     的主语义（400/回滚）优先，磁盘分叉由下次成功渲染收敛（与修复前等同，
+//     双重故障才可达）。
+//
+// 锁契约：调用方必须已持 CaddyOpLock（=caddyOpMu，拒绝分支全部处于写路径
+// 临界区内），与 RefreshIPListProjectionsInLock 同约束。db.DB 只读，不触碰
+// 调用方未提交事务。
+func (s *CaddyService) RollbackIPListProjectionsToCommittedInLock() {
+	config := generateCaddyConfigFromStore(db.DB)
+	if message, ok := config[caddyConfigGenerationErrorKey].(string); ok {
+		// 已提交视图渲染失败（非常态）——拒绝主流程不受影响，留 warn 痕迹。
+		Logf("warn", "拒绝回滚：已提交视图重渲染失败，投影文件维持现状（下次成功渲染收敛）: %s", message)
+		return
+	}
+	// 投影写盘与证书物化发生在生成期；配置图就地丢弃——本方法只消费副作用，
+	// 不做运行配置比对、零 /load（拒绝语义：运行配置本就未被改动）。
+}
+
 // ApplyConfigFromTxCertAwareForce：证书候选改读事务自身（R65 A-N1，restoreTable
 // 保留原 id 重插证书行，已提交视图的旧行会经 MaterializeCertPairs 用旧 PEM 覆写
 // 导入刚落盘的新证书文件）+ 强制重载（R72 二十六次 W1-1：v2 导入在 apply 之前

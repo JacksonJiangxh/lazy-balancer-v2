@@ -717,7 +717,7 @@ func TestEngine_BootSyncTasksRunOnceWithStartupRow(t *testing.T) {
 	e := newTestEngine(t)
 	ran := 0
 	done := make(chan struct{})
-	e.Register(Descriptor{ID: "boot-one", Family: "startup", Name: "启动", Kind: KindOneshot, BootSync: true,
+	e.Register(Descriptor{ID: "boot-one", Family: "startup", Name: "启动", Kind: KindOneshot, RunsOn: RoleAny, BootSync: true,
 		Run: func(rc RunContext) error { ran++; close(done); return nil }})
 	e.RunBootSyncTasks()
 	<-done

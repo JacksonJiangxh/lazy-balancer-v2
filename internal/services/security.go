@@ -1,6 +1,8 @@
 package services
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -160,6 +162,12 @@ func crsPoolFingerprint() string {
 // 规则身份（u-trust12-<ruleCaddyID>）——stage0DetectionTrust 是逐规则并集
 // （policiesForRule），全局单文件名下异策略集多规则后渲染覆盖前者=信任集
 // 串染。空值显性报错（fail-loud）。
+//
+// HP77-3（第 77 轮裁定，维持 fail-loud 不收窄）：空身份的爆炸半径=整份配置
+// 被拒（保存失败/重载失败）。已裁定豁免不修——生产路径 ruleCaddyID 恒非空
+// （两个渲染入口都由规则身份驱动），空值=数据损坏/调用错位的显性信号；收窄
+// 为「跳过该规则+告警」会让受影响规则的 IP 控制面静默缺失（安全面静默缺口），
+// 比整份配置拒绝（fail-closed、横幅可见）更危险。本注释即裁定载体。
 func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crsFingerprint string, multiPolicy bool, blockStatus int, ruleCaddyID string, stage0DetectionTrust ...[]string) (string, error) {
 	if ruleCaddyID == "" {
 		return "", fmt.Errorf("u-trust12 引擎投影缺少规则身份（ruleCaddyID 为空）——id:12 逐规则渲染，scope 必须编入规则身份（第 76 轮 HP-1）")
@@ -1178,7 +1186,9 @@ func precheckProjectionScope(kind, ruleCaddyID string) string {
 // 的绑定策略集不同，u-* 并集内容是调用方规则的函数），u-* 投影 scope 必须编入
 // 规则身份（u-deny-<ruleCaddyID> 等）；全局单文件名下异策略集多规则的后渲染
 // 会覆盖前者=漏拦+误拦（热路径稳定命名粒度教训的预检形态）。空值显性报错
-// （fail-loud，禁止静默退回全局名重建冲突）。
+// （fail-loud，禁止静默退回全局名重建冲突）。爆炸半径=整份配置被拒——HP77-3
+// （第 77 轮）已裁定维持 fail-loud 不收窄（跳过+告警=IP 控制面静默缺失，
+// fail-closed 整拒更安全），载体见 BuildCorazaDirectives 同名注释。
 func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int, ruleCaddyID string) (string, error) {
 	if ruleCaddyID == "" {
 		return "", fmt.Errorf("u-* 预检投影缺少规则身份（ruleCaddyID 为空）——预检逐规则渲染，scope 必须编入规则身份（第 76 轮 HP-1）")
@@ -1699,10 +1709,13 @@ const crsScopedExclusionIDBase = 2000000
 // 48KiB 护栏（assertDirectiveLines 拒绝=整份配置无法保存），且与「策略名单
 // 统一投影 @ipListFast」的架构总述矛盾。改投影 @ipListFast（同族单源
 // writeIPListFile/ipListRuleOperand：稳定命名、原子写、同字节跳写、写失败沿
-// 渲染链路上报）。投影 scope 按匹配集**组合身份**编入（p<policyID>-crsxc-<n>，
-// n=组合首次出现序，键=ips+排序后 listRefs）：名单条目内容变化不改变组合键
-// →文件名稳定（@ipListFast ≤1s stat 热感知）；条目增删/重排才换名，旧文件由
-// 24h GC 回收。同组合多条目共享一份投影（配置字节恒定）。
+// 渲染链路上报）。投影 scope 按匹配集**组合键哈希**编入（p<policyID>-crsxc-<sha256[:12]>，
+// 第 77 轮 HP77-4 由「组合首次出现序 n」改哈希：序号是位置身份，条目增删/
+// 重排使 seq 重编号→旧文件名承载另一条目的匹配集（正常路径字节变化走
+// Fallback 自愈仅毫秒窗，与 HP77-1 拒绝不回滚叠加才持续）；组合键=ips 字面+
+// 排序后 listRefs，同名必同键、异键必异名，键不变则文件名稳定（名单条目
+// 内容变化热路径原位重写，@ipListFast ≤1s stat 热感知），键变化才换名（旧
+// 文件由 24h GC 回收）。同组合多条目共享一份投影（配置字节恒定）。
 func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entries []CRSExcludedEntry, store caddyConfigStore, chainIndex func() *CRSRuleIndex) error {
 	var refIDs []int64
 	seenRef := make(map[int64]struct{})
@@ -1722,7 +1735,6 @@ func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entr
 	}
 	index := chainIndex() // 复审：M4 惰性化漏改，改用链级一次取值
 	seq := 0
-	xcScopeSeq := 0
 	operandByMatchKey := make(map[string]string)
 	for _, entry := range entries {
 		match := make([]string, 0, 4)
@@ -1751,18 +1763,20 @@ func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entr
 			continue
 		}
 		// 组合键与解析内容无关（名单条目变化不换名）——ips 字面 + 排序后
-		// listRefs；同组合条目共享一份投影文件。
+		// listRefs；同组合条目共享一份投影文件。scope=组合键 sha256[:12]
+		//（HP77-4：位置序号改内容身份——同名必同键，重排/增删不使旧名承载
+		// 他条目匹配集）。
 		sortedRefs := append([]int64(nil), entry.ListRefs...)
 		sort.Slice(sortedRefs, func(i, j int) bool { return sortedRefs[i] < sortedRefs[j] })
 		matchKey := entry.IPs + "\x00" + fmt.Sprint(sortedRefs)
 		operand, ok := operandByMatchKey[matchKey]
 		if !ok {
+			keySum := sha256.Sum256([]byte(matchKey))
 			var err error
-			operand, err = ipListRuleOperand(fmt.Sprintf("p%d-crsxc-%d", p.ID, xcScopeSeq), match, false)
+			operand, err = ipListRuleOperand(fmt.Sprintf("p%d-crsxc-%s", p.ID, hex.EncodeToString(keySum[:])[:12]), match, false)
 			if err != nil {
 				return err
 			}
-			xcScopeSeq++
 			operandByMatchKey[matchKey] = operand
 		}
 		for _, id := range expandCRSScopedExclusionTargets(entry.Target, index, p) {

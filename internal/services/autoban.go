@@ -285,11 +285,14 @@ var autobanReloadPending bool
 var autobanLastReload time.Time
 var autobanCapWarned bool
 
-// ResetAutobanCounters 清空计数器（口径/窗口变更/测试用）。
+// ResetAutobanCounters 清空计数器（口径/窗口变更/测试用）：计数桶+上一轮观察
+// 建议一并清空——建议是同一窗口口径下的观察输出，口径变更/名单全量替换后旧
+// 建议对现状失真（P5 同款 ≤1 tick 展示残留，第 77 轮定性并入）。
 func ResetAutobanCounters() {
 	autobanMu.Lock()
 	defer autobanMu.Unlock()
 	autobanWindows = make(map[string]*autobanCounter)
+	autobanSuggestions = nil
 }
 
 // autobanActionMatches 口径过滤：scope=blocked 只统计拦截，logged 只统计检测，
@@ -481,12 +484,39 @@ func AutobanForgetIPs(ips []string) {
 			delete(autobanWindows, ip)
 		}
 	}
+	// P5（第 77 轮）：同步清 autobanSuggestions 对应 IP——建议列表是上一轮
+	// 观察快照，解封后仍展示该 IP 是 ≤1 tick 的展示残留（下一轮 Run 才重算
+	// 覆盖）；按值剔除，保留其余 IP 建议。
+	if len(autobanSuggestions) > 0 && len(ips) > 0 {
+		gone := make(map[string]struct{}, len(ips))
+		for _, ip := range ips {
+			if ip != "" {
+				gone[ip] = struct{}{}
+			}
+		}
+		kept := autobanSuggestions[:0]
+		for _, s := range autobanSuggestions {
+			if _, drop := gone[s.IP]; !drop {
+				kept = append(kept, s)
+			}
+		}
+		autobanSuggestions = kept
+	}
 }
 
 // AutobanSetSuggestionsForTest 直设建议暂存（handlers 层富化钉测用；nil=清空，
 // 与 SetAutobanReloader 同款测试缝约定）。
 func AutobanSetSuggestionsForTest(s []AutobanSuggestion) {
 	autobanSetSuggestions(s)
+}
+
+// AutobanSeedCounterForTest 直填计数桶（handlers 层接线钉测用——绕过喂入门
+// 主节点/启用/口径三重门，桶形态与 Feed 路径产出一致）。
+func AutobanSeedCounterForTest(ip string, count, threshold int) {
+	now := autobanNow()
+	autobanMu.Lock()
+	defer autobanMu.Unlock()
+	autobanWindows[ip] = &autobanCounter{Count: count, WindowStart: now, LastSeen: now, Reached: threshold > 0 && count >= threshold}
 }
 
 // ---- 名单 merge ----
@@ -816,7 +846,8 @@ func AutobanDisableFlush() {
 // ---- Run 循环 ----
 
 // RunAutobanCycle 单轮执行（引擎 autoban 任务体）：业务门（未启用=失败+重禁
-// 调度）→ 配置护栏（无效=失败+自停）→ 修剪计数器 → 评估候选 → 观察建议或
+// 调度）→ 配置护栏（无效=失败+自停）→ 修剪计数器 → 评估候选（dry-run 锁外；
+// 正式模式并入下方 merge 的 CaddyOpLock 临界区，PM-2 第 77 轮）→ 观察建议或
 // 名单 merge → 审计/重载/每轮摘要行。
 //
 // 业务门（2026-10-14 用户裁定）：本任务只能由「启用后按配置调度执行」——
@@ -857,24 +888,34 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 	}
 	window := time.Duration(cfg.WindowMinutes) * time.Minute
 	autobanFlushPendingReload()
-	candidates := autobanCandidates(cfg.Threshold, window)
 
 	if cfg.DryRun {
+		// 观察模式不写名单，无 TOCTOU 面——候选评估无需临界区。
+		candidates := autobanCandidates(cfg.Threshold, window)
 		autobanSetSuggestions(candidates)
 		TaskLogf(AutobanTaskID, "cycle", "观察模式：计数 %d IP / 活跃 %d 个 IP / 达阈值 %d（阈值 %d 次/%d 分钟，口径 %s）",
 			autobanTrackedCount(), autobanReachedCount(), len(candidates), cfg.Threshold, cfg.WindowMinutes, autobanScopeLabel(cfg.Scope))
 		return nil
 	}
 
+	var candidates []AutobanSuggestion
 	var out autobanMergeOutcome
 	reloadState := autobanReloadNone
 	// AU-1（第 74 轮）：merge 读改写+收敛并入同一 CaddyOpLock 临界区——与
 	// handlers 名单写路径（AddIPToList/UpdateIPList 持 caddyOpMu=CaddyOpLock
 	// 的读改写）交错会丢更新/复活条目；收敛回调（投影热路径/全量重载）均为
 	// InLock 变体，临界区内直呼。
+	// PM-2（第 77 轮）：候选评估（autobanCandidates，含 AB-1 过期桶先评估再删）
+	// 同入本临界区——曾评估在锁外、merge 进锁用陈旧候选：handlers 解封（持
+	// CaddyOpLock 的读改写+AutobanForgetIPs 清桶）落在「候选已评估」与「进锁
+	// merge」之间时，本轮把刚解封的 IP 加回名单，解封被 ≤1 tick 撤销。评估入
+	// 临界区后，解封清桶与本轮评估在锁上全序：解封先完成则候选为空（不回封），
+	// 本轮先完成则解封写路径随后删条目（解封生效）。锁序安全：临界区内仅
+	// autobanMu（叶锁，全仓无 autobanMu→CaddyOpLock 反向嵌套）。
 	if err := func() error {
 		CaddyOpLock.Lock()
 		defer CaddyOpLock.Unlock()
+		candidates = autobanCandidates(cfg.Threshold, window)
 		o, err := autobanMergeEntries(cfg, candidates)
 		if err != nil {
 			return err

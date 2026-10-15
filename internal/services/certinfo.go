@@ -29,25 +29,27 @@ func CertDaysRemaining(notAfter, now time.Time) int {
 }
 
 // GetCertExpiryThreshold returns the configured cert expiry warning threshold in days.
-// 库值唯一真相（批 3）：cert_expiry_days 类型①值型列直读（COALESCE 30 兜底
+// 库值唯一真相（批 3）：cert_expiry_days 类型①值型列直读（COALESCE 兜底
 // 删除）——NULL/<=0 由启动回填（db.go defaultUpdates）收敛；此处的降级分支
 // 仅覆盖带外直写/读故障，两分支均 error 级显性留痕后按 CERT42-5 读故障族
-// 口径取默认 30（对任务/展示类消费方 fail-visible=日志留痕，不静默）。
+// 口径取治理默认 db.DefaultCertExpiryDays（R2，第 77 轮：降级取值/日志文本
+// 全部单源到常量，禁字面量回流——见 handlers/config_get_test.go 消费点族扫描）。
+// 对任务/展示类消费方 fail-visible=日志留痕，不静默。
 func GetCertExpiryThreshold() int {
 	// SVC-F2（第 73 轮）：同包多数配置读取 helper 有 db.DB==nil 守卫——
 	// 未初始化库回退默认值，不得 nil deref（当前不可达，防御性一致）。
 	if db.DB == nil {
-		return 30
+		return db.DefaultCertExpiryDays
 	}
 	var days int
 	err := db.DB.QueryRow("SELECT cert_expiry_days FROM global_config WHERE id = 1").Scan(&days)
 	if err != nil {
-		Logf("error", "GetCertExpiryThreshold: failed to read global_config, using default 30: %v", err)
-		return 30
+		Logf("error", "GetCertExpiryThreshold: failed to read global_config, using default %d: %v", db.DefaultCertExpiryDays, err)
+		return db.DefaultCertExpiryDays
 	}
 	if days <= 0 {
-		Logf("error", "GetCertExpiryThreshold: cert_expiry_days 库值无效（%d <=0）——类型①值型列应恒为正（写侧 1-365 校验+启动回填报证），疑似带外直写；本轮降级默认 30 留痕", days)
-		return 30
+		Logf("error", "GetCertExpiryThreshold: cert_expiry_days 库值无效（%d <=0）——类型①值型列应恒为正（写侧 1-365 校验+启动回填报证），疑似带外直写；本轮降级默认 %d 留痕", days, db.DefaultCertExpiryDays)
+		return db.DefaultCertExpiryDays
 	}
 	return days
 }

@@ -105,17 +105,21 @@ const ipListFileMaxAge = 24 * time.Hour
 const ipListGCInterval = time.Hour
 
 // ipListProjectedFileName 匹配投影文件命名——差集清理只碰该形态，目录内其他
-// 文件（运维投放/误放）一律不动。两个分支（2026-10-15 热路径改造）：
-//   - 新稳定命名 <scope>.txt：p[0-9]+-(acl|trust|bl|crsxc-[0-9]+)（策略身份；
-//     crsxc-[0-9]=CRS 作用域排除匹配集投影，第 76 轮 SEC-1，组合序号）、
-//     tp（受信代理全局单份）、u-<kind>-<ruleCaddyID>（第 76 轮 HP-1：预检/
-//     引擎层 u-* 投影 scope 编入规则身份，如 u-deny-lb_2r8dosptk1——CaddyID
-//     含下划线，字符类收 `_`；升级前旧全局名 u-deny.txt 等同字符类天然覆盖，
-//     由 24h GC 过渡回收）；精确白名单，用户手放文件不碰；
+// 文件（运维投放/误放）一律不动。分支（2026-10-15 热路径改造；第 77 轮
+// HP77-2/HP77-4 收口）：
+//   - 新稳定命名 <scope>.txt：p[0-9]+-(acl|trust|bl|crsxc-…)（策略身份；
+//     crsxc-<12位hex>=CRS 作用域排除匹配集投影（第 77 轮 HP77-4 组合键哈希），
+//     crsxc-<纯数字>=第 76 轮首发序号形态（已被哈希取代，存量由 24h GC 过渡
+//     回收））、tp（受信代理全局单份）、u-<kind>-<ruleCaddyID>（第 76 轮
+//     HP-1：预检/引擎层 u-* 投影 scope 编入规则身份，如 u-deny-lb_2r8dosptk1
+//     ——字符类收 `_`，并收大写与 `.`（第 77 轮 HP77-2：v2 导入可携带大写/
+//     含点 rule id，旧字符类使这类孤儿永不回收；白名单仍不含路径分隔符，
+//     纯单段文件名，无路径逃逸面）；升级前旧全局名 u-deny.txt 等同字符类
+//     天然覆盖，由 24h GC 过渡回收）；精确白名单，用户手放文件不碰；
 //   - 旧内容寻址 scope-sha256[:12].txt——迁移过渡分支：改造前落盘的旧哈希
 //     文件由既有 24h GC 自然回收（不写迁移），旧文件清尽后该分支恒不命中，
 //     自行失效。
-var ipListProjectedFileName = regexp.MustCompile(`^(u-[a-z0-9][a-z0-9_-]*|p[0-9]+-(acl|trust|bl|crsxc-[0-9]+)|tp|.+-[0-9a-f]{12})\.txt$`)
+var ipListProjectedFileName = regexp.MustCompile(`^(u-[A-Za-z0-9][A-Za-z0-9._-]*|p[0-9]+-(acl|trust|bl|crsxc-([0-9]+|[0-9a-f]{12}))|tp|.+-[0-9a-f]{12})\.txt$`)
 
 // ipListRenderRefs 记录本进程渲染引用过的投影文件及最近引用时间：一次全量
 // 配置渲染会重新投影全部在役名单（同字节跳写也计引用），故「长期
@@ -157,6 +161,11 @@ func maybeGCStaleIPListFiles() {
 // 被渲染引用 且 mtime 早于 maxAge」的投影文件，并淘汰对应 wafiplist 运行期
 // 缓存（fail-stale 不得把已删文件的集合无限期留在内存）。删除失败仅 warn
 // ——孤儿文件不阻断渲染链路。返回删除数。
+//
+// OBS-1（第 77 轮，前提披露）：差集决策的前提是「渲染引用集=本进程在役投影
+// 全集，且**无旧版本进程并发写者**」——滚动升级窗口内若新旧双实例并跑同一
+// 数据卷，旧实例持有旧引用集，可能继续引用/重写本进程已判孤儿的文件，24h
+// 超龄门槛是对该窗口的缓冲突界（正确部署形态=串行替换，不双跑）。
 func gcStaleIPListFiles(now time.Time, maxAge time.Duration) (removed int) {
 	entries, err := os.ReadDir(IPListDataDir)
 	if err != nil {

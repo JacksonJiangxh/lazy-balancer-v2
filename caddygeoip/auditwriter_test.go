@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/corazawaf/coraza/v3"
+	"github.com/corazawaf/coraza/v3/experimental/plugins"
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
 )
 
@@ -62,6 +63,25 @@ func (f *blockingFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
 }
 
 func (*blockingFormatter) MIME() string { return "application/json" }
+
+// lbfenceFormatter AUD-1（第 77 轮）测试同步栅栏：Format 阻塞至 release 关闭，
+// 放行后按 json.Marshal 直出（信封与内置 JSON 格式化器一致，见 auditSnapshot
+// 注释）。经 plugins.RegisterAuditLogFormatter 注册为专用格式名 lbfence、由
+// 被测指令 SecAuditLogFormat lbfence 装入 coraza 写路径——drain 侧 process
+// 先 Format 后查计时注册表，栅栏把「主 goroutine 完成 record+close」定序在
+// drain 查表之前，消除迟到注入钉测对 goroutine 调度序的依赖（修复前：drain
+// 抢先完成格式化+首轮查表未命中 → auditTimingWait 未知 tid 即返 → lb_timing
+// 缺失 → 断言随机红）。
+type lbfenceFormatter struct {
+	release chan struct{}
+}
+
+func (f *lbfenceFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
+	<-f.release
+	return json.Marshal(al)
+}
+
+func (*lbfenceFormatter) MIME() string { return "application/json" }
 
 // cannedFormatter 忽略审计内容返回固定正文——管线级测试（阻塞/轮转）无需构造
 // 完整 AuditLog（plugintypes 接口的 Args 返回类型是 coraza 内部类型，测试无法
@@ -136,11 +156,21 @@ func TestAuditWriter_registeredAndInjectsLateTiming(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
 
+	// AUD-1（第 77 轮）同步栅栏：drain 侧 Format 点阻塞至主 goroutine 完成
+	// 「迟到分段 record+close」后放行——生产时序（Write 入队严格早于计时写点，
+	// coraza defer ProcessLogging 契约）原样保持，drain 查表被定序在写点之后，
+	// 断言不再依赖调度序。已知取舍窗口（与 auditTimingWait 的 AUD-1 注释同源，
+	// 此处钉明）：生产中 drain 抢先完成格式化并首轮查表的极小竞态窗内的行不
+	// 注入 lb_timing（耗时属增强信息，展示层报「—」，可接受）；本钉测锚定的
+	// 契约是「行到 drain 时终态已置位 → 必注入」，栅栏使该契约确定性成立。
+	fence := &lbfenceFormatter{release: make(chan struct{})}
+	plugins.RegisterAuditLogFormatter("lbfence", fence)
+
 	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives(strings.Join([]string{
 		"SecRuleEngine On",
 		"SecAuditEngine RelevantOnly",
 		"SecAuditLog " + logPath,
-		"SecAuditLogFormat JSON",
+		"SecAuditLogFormat lbfence",
 		"SecAuditLogType lbfile",
 		"SecAuditLogParts ABIJDEFHKZ",
 		"SecRule REQUEST_HEADERS:X-Probe \"@streq hit\" \"id:990001,phase:1,deny,status:403,log,msg:'probe'\"",
@@ -171,6 +201,8 @@ func TestAuditWriter_registeredAndInjectsLateTiming(t *testing.T) {
 	// blocked_counter 同位写点：决策已出，纯评估耗时入注册表，随后终态标记。
 	auditTimingRecord(id, "end", 42)
 	auditTimingClose(id)
+	// 栅栏放行：drain 此刻才执行 Format→查表，必见已终态条目（保序，零调度依赖）。
+	close(fence.release)
 
 	line := waitAuditLine(t, logPath)
 	var doc map[string]json.RawMessage

@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/dnsprovider/ownership"
 	"lazy-balancer-v2/internal/models"
 )
@@ -411,17 +412,20 @@ func parseSnapshotExpiry(value string) (time.Time, error) {
 // 三分类合并(2026-09-19):全局配置并入系统数据节(恒同步)——装载不再受
 // sync_global_config 开关裁剪(列已删除,快照恒携带)。
 func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store snapshotStore, snapshot *models.ClusterSnapshot) error {
+	// R2（第 77 轮）：cert_expiry_days 兜底经 db.DefaultCertExpiryDays 参数绑定
+	// （消费点族单源，读侧禁字面量回流——其余 COALESCE 字面量属 cert_renewal_*
+	// 列族/既有批 1+2 口径，不在本轮收敛范围）。
 	var caddyConfig string
 	var brandingJSON string
 	err := store.QueryRowContext(ctx, `SELECT COALESCE(cluster_version,0), COALESCE(caddy_config,'{}'), COALESCE(branding_json,''),
 		COALESCE(log_level,'info'),
 		COALESCE(task_log_size_mb,10), COALESCE(audit_log_size_mb,10), COALESCE(runtime_log_size_mb,100), COALESCE(audit_retention_months,3), COALESCE(jwt_expire_minutes,20), COALESCE(timezone,'Asia/Shanghai'),
-		COALESCE(acme_email,''), COALESCE(cert_expiry_days,30), COALESCE(cert_renewal_days,30), COALESCE(cert_renewal_attempts,5),
+		COALESCE(acme_email,''), COALESCE(cert_expiry_days,?), COALESCE(cert_renewal_days,30), COALESCE(cert_renewal_attempts,5),
 		COALESCE(default_ca_provider_id,0), COALESCE(dns_provider,''), COALESCE(dns_credentials,''), COALESCE(sync_interval,60),
 		COALESCE(admin_tls_enabled,0), COALESCE(admin_tls_mode,'selfsigned'), COALESCE(admin_tls_cert,''), COALESCE(admin_tls_key,''),
 		COALESCE(mfa_write_guard,0), COALESCE(mfa_lockout_enabled,0), COALESCE(github_proxy_url,'https://v4.gh-proxy.org/'),
 		COALESCE(oidc_config,'')
-		FROM global_config WHERE id=1`).Scan(&snapshot.Version, &caddyConfig, &brandingJSON,
+		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays).Scan(&snapshot.Version, &caddyConfig, &brandingJSON,
 		&snapshot.BasicSettings.LogLevel,
 		&snapshot.BasicSettings.TaskLogSizeMB, &snapshot.BasicSettings.AuditLogSizeMB, &snapshot.BasicSettings.RuntimeLogSizeMB, &snapshot.BasicSettings.AuditRetentionMonths, &snapshot.BasicSettings.JWTExpireMinutes, &snapshot.BasicSettings.Timezone,
 		&snapshot.BasicSettings.ACMEEmail, &snapshot.BasicSettings.CertExpiryDays, &snapshot.BasicSettings.CertRenewalDays, &snapshot.BasicSettings.CertRenewalAttempts,
@@ -566,10 +570,13 @@ func (s *ClusterService) snapshotSecurityPolicies(ctx context.Context, store sna
 // 的目标表，NULL 归一口径与 security_policies 一致（entries '[]'、审计列
 // 0/”），保证主从落库行为一致。
 func (s *ClusterService) snapshotSecurityIPLists(ctx context.Context, store snapshotStore) (json.RawMessage, error) {
-	// C6（第 76 轮）：entries 空值归一 COALESCE('') → '[]'——注释（本函数头）
-	// 与全链口径（handlers 读路径 COALESCE(entries,'[]')/备份
-	// restoreTableNullDefaults/自动封禁 merge）均为 '[]'，行为本就等价（空串
-	// 落库后读侧同归一），唯快照出口单点与注释不符，对齐消除口径分叉。
+	// C6（第 76 轮落地；第 77 轮定性修正）：entries 空值归一 COALESCE('') →
+	// '[]' 是**纠正方向**，不是等价改写——快照出口载荷字节由此改变（从端
+	// restoreTable/快照版本哈希拿到的是 '[]' 而非 ''），「行为等价」仅在下游
+	// 读路径再做一次 COALESCE 归一的前提下才成立（handlers 读路径
+	// COALESCE(entries,'[]')/备份 restoreTableNullDefaults/自动封禁 merge 同
+	// 归一），并非无差异 no-op。本点修正的是快照出口单点与全链 '[]' 单源
+	// 口径的分叉。
 	return s.dumpTableAsJSON(ctx, store, "security_ip_lists", "id,name,COALESCE(description,'') AS description,COALESCE(category,'') AS category,COALESCE(entries,'[]') AS entries,COALESCE(created_by,0) AS created_by,COALESCE(created_at,'') AS created_at,COALESCE(updated_by,0) AS updated_by,COALESCE(updated_at,'') AS updated_at,COALESCE(system,0) AS system", "id")
 }
 

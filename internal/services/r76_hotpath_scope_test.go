@@ -335,8 +335,8 @@ func TestR76_ScopedExclusionBigListProjectedAndEngineAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("大名单作用域排除必须经投影渲染成功（不得触 48KiB 护栏）: %v", err)
 	}
-	if !strings.Contains(directives, "@ipListFast ") || !strings.Contains(directives, "p0-crsxc-0.txt") {
-		t.Fatalf("排除匹配集必须投影 p0-crsxc-0.txt（@ipListFast）:\n%s", directives)
+	if !strings.Contains(directives, "@ipListFast ") || !strings.Contains(directives, "-crsxc-") {
+		t.Fatalf("排除匹配集必须投影 crsxc 哈希命名文件（@ipListFast）:\n%s", directives)
 	}
 	if !strings.Contains(directives, "ctl:ruleRemoveById=942100") {
 		t.Fatalf("作用域排除 ctl 规则缺失:\n%s", directives)
@@ -347,7 +347,7 @@ func TestR76_ScopedExclusionBigListProjectedAndEngineAccepted(t *testing.T) {
 		}
 	}
 	// 投影文件内容=ips ∪ 名单条目（聚合后——6000 条连续 10.x 聚合为大网段）。
-	proj := readRenderedIPList(t, directives, "p0-crsxc-0")
+	proj := readRenderedIPList(t, directives, "-crsxc-")
 	if !strings.Contains(proj, "203.0.113.5/32") || !strings.Contains(proj, "10.0.0.0/20") {
 		t.Fatalf("投影文件须含 ips 与聚合后的名单条目: %q…", proj[:min(200, len(proj))])
 	}

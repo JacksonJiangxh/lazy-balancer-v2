@@ -47,10 +47,18 @@ func (h *Handlers) GetRulesCertInfo(c *gin.Context) {
 	for index, id := range req.CaddyIDs {
 		args[index] = id
 	}
+	// R2（第 77 轮）：阈值经 GetCertExpiryThreshold 单源读取（services/certinfo.go
+	// 基准口径：global_config 缺行/读故障 error 留痕后降级治理默认），替换原子
+	// 查询里以字面量 30 兜底 cert_expiry_days 的 COALESCE 标量子查询——该形态
+	// 对「缺行」无效（标量子查询零行恒 NULL，Scan 进 int 失败→整批 500），与
+	// 单规则端点（同一基准函数降级成功）口径分叉。阈值对本请求恒定，作首参
+	// 绑定；独立切片（不得前插共享 args——下方 cert_jobs 候选查询按 IN 占位
+	// 复用 args，错位会让候选集恒空）。
+	queryArgs := append([]any{services.GetCertExpiryThreshold()}, args...)
 	rows, err := db.DB.QueryContext(c.Request.Context(), fmt.Sprintf(`
 		SELECT caddy_id, COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(domain,''), COALESCE(tls_cert,''),
-			(SELECT COALESCE(cert_expiry_days,30) FROM global_config WHERE id=1)
-		FROM lb_rules WHERE caddy_id IN (%s)`, placeholders), args...)
+			?
+		FROM lb_rules WHERE caddy_id IN (%s)`, placeholders), queryArgs...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "批量读取规则证书配置失败"})
 		return

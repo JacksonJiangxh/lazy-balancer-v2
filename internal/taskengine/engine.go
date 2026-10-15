@@ -78,6 +78,8 @@ type Descriptor struct {
 	EnabledFn func() bool
 	// BootSync：Oneshot 任务在引擎初始化尾部同步执行一次（trigger=startup）
 	// ——启动型任务的唯一执行通道（曾 main.go 直调+legacy 记录旁路）。
+	// R3（第 77 轮）：仅允许 RunsOn=RoleAny（注册期强制，启动执行面无角色
+	// 语义）；执行面另有 roleAllows 纵深门。
 	BootSync   bool
 	StatusFn   func() string // 状态镜像
 	Cancelable bool
@@ -347,6 +349,15 @@ func (e *Engine) Register(d Descriptor) error {
 	if d.Kind == KindDaemon && d.EnabledFn != nil {
 		return fmt.Errorf("taskengine: %s 为常驻任务，EnabledFn 不参与调度（Daemon 不进 tick，静默忽略）——业务门须内置到 Run 体", d.ID)
 	}
+	// R3（第 77 轮）：BootSync 仅 RoleAny——BootSync 执行面是引擎装配尾部的
+	// 同步启动触发（RunBootSyncTasks，trigger=startup），非角色调度面；声明
+	// 主/从限定会被角色门在对应侧启动期静默跳过成「永不执行的启动任务」。
+	// 与 Daemon∧EnabledFn 同风格注册期响亮拒绝；RunBootSyncTasks 内的
+	// roleAllows 门为纵深防御（绕过 Register 的直注形态仍被拦，见
+	// engine_bootsync_role_test.go ②）。
+	if d.BootSync && d.RunsOn != RoleAny {
+		return fmt.Errorf("taskengine: %s 为 BootSync 任务，RunsOn 必须显式声明 RoleAny（启动执行面无角色语义）", d.ID)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.regs[d.ID] = &registration{desc: d}
@@ -415,6 +426,13 @@ func (e *Engine) RunBootSyncTasks() {
 	}
 	e.mu.RUnlock()
 	for _, it := range items {
+		// R3（第 77 轮）：与 Trigger/RunSync/tick 同款角色门（纵深防御——
+		// 注册期已拒绝 BootSync∧RunsOn≠RoleAny，此处拦绕过 Register 的直注
+		// 形态）。RoleAny 恒真，现行唯一 BootSync 任务（startup:config-load，
+		// RunsOn=RoleAny）行为不变。
+		if !e.roleAllows(it.r.desc.RunsOn) {
+			continue
+		}
 		_, _ = e.runNow(it.id, "startup", "")
 	}
 }
@@ -897,17 +915,26 @@ func TaskLogPath(taskID string) string {
 	if taskLogDir == "" {
 		return ""
 	}
-	// APISYS-F3（第 76 轮）：任务 ID 路径净化——剔除路径分隔符 '/'、'\\'（保留
-	// 合法注册 ID 全字母表 [A-Za-z0-9_.:-]，startup:config-load 等既有 ID 零
-	// 变化）：目录穿越需经分隔符，剔除后 :id 用户可控面（GetSystemTaskLogs）
-	// 不可能逃出任务日志目录（可达性已核实仅管理+主节点只读，属纵深统一，
-	// 与 certjoblog sanitizePathComponent/logstats sanitizeRuleID 同族口径）。
+	// APISYS-F3（第 76 轮）/ P5 白名单统一（第 77 轮）：任务 ID 路径净化由
+	// 黑名单（剔除 '/'、'\\'）改白名单——只保留注册任务 ID 全字母表
+	// [A-Za-z0-9_.:-]，与 handlers sanitizeRuleID 白名单同族口径（净化范式
+	// 单一化，畸形 ID 不再产出黑名单遗漏字符的文件名）。注册 ID 全集
+	// （taskengine_wire.go 17 个：audit-retention/auto-backup/autoban/cert-*/
+	// cluster-sync/config-watchdog/crs/ip2region/log-cleanup/security-events-*/
+	// startup:config-load/threat）仅用小写+数字+'-'+'.'+一个 ':'，大写留作未来
+	// 余量——既有注册 ID 零变化。目录穿越需分隔符，白名单剔除后 :id 用户可控
+	// 面（GetSystemTaskLogs）不可能逃出任务日志目录（可达性已核实仅管理+主
+	// 节点只读，属纵深统一，与 certjoblog sanitizePathComponent/logstats
+	// sanitizeRuleID 同族）。
 	sanitized := strings.Map(func(r rune) rune {
-		switch r {
-		case '/', '\\':
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		case r == '_' || r == '.' || r == ':' || r == '-':
+			return r
+		default:
 			return -1
 		}
-		return r
 	}, taskID)
 	return filepath.Join(taskLogDir, sanitized+".log")
 }

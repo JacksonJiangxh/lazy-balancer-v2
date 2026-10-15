@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -123,5 +124,48 @@ func TestGetConfig_nullCertExpiryDaysFallsBackToConstant(t *testing.T) {
 	}
 	if body.Data.CertExpiryDays != db.DefaultCertExpiryDays {
 		t.Fatalf("NULL cert_expiry_days 须回退 db.DefaultCertExpiryDays(%d), got %d", db.DefaultCertExpiryDays, body.Data.CertExpiryDays)
+	}
+}
+
+// R2（第 77 轮）：cert_expiry_days 消费点族「默认值 30 字面量」回流钉——G4
+// 同型扫描从 GetConfig 单函数扩展到六消费点族：SQL COALESCE 字面量一律参数
+// 绑定 db.DefaultCertExpiryDays（caddy.go 形态），Go 降级分支一律取治理常量
+// （services/certinfo.go GetCertExpiryThreshold 基准）。库值唯一真相（批 3）
+// 的读侧防回流钉；caddy.go GetConfig 本体已由 TestGetConfig_noGovernedDefaultLiterals 覆盖。
+func TestCertExpiryDays_noDefaultLiteralsAcrossConsumers(t *testing.T) {
+	cases := []struct {
+		file     string
+		scope    string   // 非空=只扫该函数体（func 起点到下一个 "\nfunc"）
+		patterns []string // 命中即失败（禁止的默认值字面量形态）
+	}{
+		{"certinfo.go", "", []string{`COALESCE\(cert_expiry_days\s*,\s*30\)`}},
+		{"certjobs.go", "", []string{`COALESCE\(cert_expiry_days\s*,\s*30\)`, `expiryDays\s*:?=\s*30\b`}},
+		{"config_changes.go", "", []string{`COALESCE\(cert_expiry_days\s*,\s*30\)`}},
+		{"../services/cluster_report.go", "", []string{`COALESCE\(cert_expiry_days\s*,\s*30\)`, `expiryDays\s*:?=\s*30\b`}},
+		{"../services/cluster_snapshot.go", "func (s *ClusterService) loadSnapshotGlobalSettings(", []string{`COALESCE\(cert_expiry_days\s*,\s*30\)`}},
+		{"../services/certinfo.go", "func GetCertExpiryThreshold(", []string{`return\s+30\b`, `default 30`, `降级默认 30`}},
+	}
+	for _, tc := range cases {
+		src, err := os.ReadFile(filepath.FromSlash(tc.file))
+		if err != nil {
+			t.Fatalf("read %s: %v", tc.file, err)
+		}
+		body := string(src)
+		if tc.scope != "" {
+			start := strings.Index(body, tc.scope)
+			if start < 0 {
+				t.Fatalf("%s: scope %q not found", tc.file, tc.scope)
+			}
+			end := strings.Index(body[start:], "\nfunc ")
+			if end < 0 {
+				t.Fatalf("%s: scope %q end not found", tc.file, tc.scope)
+			}
+			body = body[start : start+end]
+		}
+		for _, pattern := range tc.patterns {
+			if regexp.MustCompile(pattern).MatchString(body) {
+				t.Errorf("%s cert_expiry_days 默认值字面量回流 %q——改用 db.DefaultCertExpiryDays 单源（R2/G4）", tc.file, pattern)
+			}
+		}
 	}
 }

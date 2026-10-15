@@ -134,30 +134,17 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: resp})
 }
 
-// autobanListReferenced 启用中的策略是否引用预置名单（黄条判据）。查询失败
-// fail-closed（按已引用处理——不弹黄条，避免误报「未生效」）。
+// autobanListReferenced 启用中的策略是否引用预置名单（黄条判据）。引用面判定
+// 单源 services.IPListsReferencedByEnabledPolicy（HP77-8，第 77 轮：原第二份
+// 窄引用实现只查 ip_acl_list_refs/ip_whitelist_refs，与热路径资格门 SEC-2
+// 补全后的四面口径分叉——仅被受信代理网段/CRS 排除 scope=ip/list ListRefs
+// 引用的名单会被黄条误报「名单未生效」；错误日志沿用单源通用前缀「IP 名单
+// 写路径」）。查询失败 fail-closed（按已引用处理——不弹黄条，避免误报「未
+// 生效」），与单源内部口径一致。
 func (h *Handlers) autobanListReferenced() bool {
 	var listID int64
 	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=1`, services.AutobanPresetListName).Scan(&listID); err != nil {
 		return true
 	}
-	rows, err := db.DB.Query(`SELECT COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_refs,'[]') FROM security_policies WHERE enabled=1`)
-	if err != nil {
-		return true
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var aclRefs, wlRefs string
-		if rows.Scan(&aclRefs, &wlRefs) != nil {
-			return true
-		}
-		for _, raw := range []string{aclRefs, wlRefs} {
-			for _, refID := range parseIPListRefsIDs(raw) {
-				if refID == listID {
-					return true
-				}
-			}
-		}
-	}
-	return false
+	return services.IPListsReferencedByEnabledPolicy([]int{int(listID)})
 }
