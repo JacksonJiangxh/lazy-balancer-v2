@@ -30,9 +30,10 @@ func TestSetupRouter_writeRoutesHaveExplicitAuditClassification(t *testing.T) {
 		"POST /api/v1/auth/mfa/verify-step": {},
 		// 三库手动更新：审计由任务体 defer 单记（2026-09-29 用户裁定 + 历史
 		// 历史问题-2 收敛——handler 补记已撤、operator 经 RunContext 归人）。
-		"POST /api/v1/security/crs/update":        {},
-		"POST /api/v1/security/ip2region/update":  {},
-		"POST /api/v1/security/threat-lib/update": {},
+		"POST /api/v1/security/crs/update":         {},
+		"POST /api/v1/security/ip2region/update":   {},
+		"POST /api/v1/security/threat-lib/update":  {},
+		"POST /api/v1/security/crawler-lib/update": {},
 		// 任务触发（历史问题-1，历史）：已升 Explicit——12 个可触发族中 7 族
 		// 任务体零审计，handler 对非自记族显式补记「触发/任务监控」（自记族
 		// 跳过，保 历史问题-2 单记裁定），不再属有意跳过。
