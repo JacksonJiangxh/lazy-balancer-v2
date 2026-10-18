@@ -164,6 +164,19 @@ test('⑥下钻分桶环绕：跨日界线键序列去重且覆盖视口', () =>
   void WORLD_W
 })
 
+test('⑦地图/地球引擎修复契约（历史问题/历史问题/历史问题/历史问题）', () => {
+  const mapSrc = readFileSync(join(ROOT, 'src/utils/threatScene.ts'), 'utf8')
+  const globeSrc = readFileSync(join(ROOT, 'src/utils/threatGlobe.ts'), 'utf8')
+  assert.match(mapSrc, /POINTY_TOP_HEX_VERTICES/, '地图点阵必须消费六边形顶点，而非圆弧')
+  assert.doesNotMatch(mapSrc, /path\.arc\(x, y, r|ctx2\.arc\(x, y, r/)
+  assert.match(mapSrc, /drillCountryAllowed\(opts\?\.drillCountries, country\)/, '地图必须执行下钻白名单')
+  for (const src of [mapSrc, globeSrc]) {
+    assert.doesNotMatch(src, /\baddArc\(origin: Centroid\)|\bsetControlsEnabled\(|\bpickCountryAt\(/, '零消费诊断 API 必须移除')
+  }
+  assert.doesNotMatch(mapSrc, /sawServerConfig/, 'setServer 不得只接受首次配置')
+  assert.match(mapSrc, /server = \[centroid\[0\], centroid\[1\]\]/)
+})
+
 // ---- 数据级：省板包含断言（逐行解析三个静态模块） ----
 
 interface BBox {

@@ -2325,6 +2325,114 @@ const selectedCompressTypes = (value: string | string[]): string[] => {
   return ['gzip']
 }
 
+const wizardFormFromRule = (fullRule: Rule): Partial<RuleForm> => ({
+  name: fullRule.name,
+  description: fullRule.description || '',
+  protocol: fullRule.protocol,
+  domain: fullRule.domain || '',
+  listen_port: fullRule.listen_port,
+  strategy: fullRule.strategy || 'weighted_round_robin',
+  dynamic_dns: fullRule.dynamic_dns || false,
+  enable_dns_server: fullRule.enable_dns_server || false,
+  dns_server: fullRule.dns_server || '',
+  dns_family: selectedDnsFamilies(fullRule.dns_family),
+  health_check_path: fullRule.health_check_path || '',
+  health_check_interval: fullRule.health_check_interval || 10,
+  health_check_timeout: fullRule.health_check_timeout || 2,
+  health_check_healthy_threshold: fullRule.health_check_healthy_threshold || 2,
+  health_check_unhealthy_threshold: fullRule.health_check_unhealthy_threshold || 3,
+  enable_active_health_check: fullRule.enable_active_health_check === true,
+  tcp_health_check_port: fullRule.tcp_health_check_port || 0,
+  tcp_proxy_protocol: fullRule.tcp_proxy_protocol === true,
+  tcp_try_duration: fullRule.tcp_try_duration || 0,
+  tcp_try_interval: fullRule.tcp_try_interval ?? 250,
+  health_check_host: fullRule.health_check_host || '',
+  upstreams: fullRule.upstreams?.map(u => ({
+    ...u,
+    dynamic_dns: false,
+    protocol: u.protocol || 'http',
+    max_connections: u.max_connections ?? 0,
+    origin_domain: u.origin_domain || '',
+  })) || [],
+  enable_tls: fullRule.enable_tls || false,
+  tls_source: fullRule.tls_source || 'manual',
+  acme_config_id: fullRule.acme_config_id || undefined,
+  ca_provider_id: fullRule.ca_provider_id ?? 0,
+  tls_cert: fullRule.tls_cert || '',
+  tls_key: fullRule.tls_key || '',
+  // GetRule 掩码私钥时仅回 tls_key_set：区分「未配置」与「已隐藏」，
+  // 提交空 tls_key 时后端保留原值。
+  tlsKeySet: fullRule.tls_key_set === true,
+  tls_http_redirect: fullRule.tls_http_redirect || false,
+  enable_compress: fullRule.enable_compress !== false,
+  compress_types: fullRule.compress_types ? selectedCompressTypes(fullRule.compress_types) : ['gzip'],
+  request_body_max_size_mb: fullRule.request_body_max_size_mb || 0,
+  upstream_keepalive_timeout: fullRule.upstream_keepalive_timeout || 0,
+  server_tokens_hidden: fullRule.server_tokens_hidden || 0,
+  // NTLM 接管态原样回填；编辑/复制均保留实际接管字段。
+  ntlm_compatible: fullRule.ntlm_compatible === 1 ? 1 : 0,
+  upstream_force_http1: fullRule.upstream_force_http1 === 1 ? 1 : 0,
+  enabled: fullRule.enabled,
+  log_enabled: fullRule.log_enabled || false,
+  custom_routes_enabled: fullRule.custom_routes_enabled === true,
+  path_rules: [...(fullRule.path_rules || [])]
+    .sort((left, right) => left.sort_order - right.sort_order)
+    .map((pathRule) => ({
+      ...pathRule,
+      // UI 哨兵：空串模式映射为 forward；提交时归一回空串。
+      response_mode: pathRule.response_mode || 'forward',
+      upstreams: pathRuleUpstreamsToPercent(pathRule.upstreams),
+    })),
+  proxy_dial_timeout: fullRule.proxy_dial_timeout || 0,
+  proxy_response_header_timeout: fullRule.proxy_response_header_timeout || 0,
+  proxy_read_timeout: fullRule.proxy_read_timeout || 0,
+  proxy_write_timeout: fullRule.proxy_write_timeout || 0,
+  proxy_stream_timeout: fullRule.proxy_stream_timeout || 0,
+  proxy_flush_interval: fullRule.proxy_flush_interval || 0,
+  proxy_stream_close_delay: fullRule.proxy_stream_close_delay || 0,
+})
+
+const buildRuleConfigView = (
+  rule: Rule,
+  caddyId: string,
+  config: object | null,
+  configNotExists: boolean,
+  compressTypes?: string[],
+): RuleConfigView => ({
+  id: rule.id || 0,
+  caddy_id: caddyId,
+  name: rule.name || '',
+  domain: rule.domain || '',
+  listen_port: rule.listen_port || 0,
+  protocol: rule.protocol || 'http',
+  strategy: rule.strategy || 'weighted_round_robin',
+  dynamic_dns: rule.dynamic_dns || false,
+  enable_dns_server: rule.enable_dns_server || false,
+  dns_server: rule.dns_server || '',
+  host_header: rule.host_header || '',
+  health_check_host: rule.health_check_host || '',
+  enable_tls: rule.enable_tls || false,
+  tls_source: rule.tls_source || 'manual',
+  tls_http_redirect: rule.tls_http_redirect || false,
+  enable_compress: rule.enable_compress !== false,
+  compress_types: compressTypes ?? (rule.compress_types ? selectedCompressTypes(rule.compress_types) : ['gzip']),
+  health_check_path: rule.health_check_path || '',
+  health_check_interval: rule.health_check_interval || 10,
+  health_check_timeout: rule.health_check_timeout || 2,
+  health_check_unhealthy_threshold: rule.health_check_unhealthy_threshold || 3,
+  enable_active_health_check: rule.enable_active_health_check === true,
+  tcp_health_check_port: rule.tcp_health_check_port || 0,
+  tcp_try_duration: rule.tcp_try_duration || 0,
+  tcp_try_interval: rule.tcp_try_interval ?? 250,
+  request_body_max_size_mb: rule.request_body_max_size_mb || 0,
+  upstream_keepalive_timeout: rule.upstream_keepalive_timeout || 0,
+  server_tokens_hidden: rule.server_tokens_hidden || 0,
+  upstreams: rule.upstreams || [],
+  enabled: rule.enabled !== false,
+  config,
+  config_not_exists: configNotExists,
+})
+
 const compressType = computed<string>({
   get: () => wizardForm.compress_types[0] ?? 'gzip',
   set: (v: string) => { wizardForm.compress_types = [v] },
@@ -2410,73 +2518,7 @@ const openWizard = async (rule?: Rule) => {
     }
     }
     editingRule.value = fullRule
-    const compressTypes = fullRule.compress_types ? selectedCompressTypes(fullRule.compress_types) : ['gzip']
-    Object.assign(wizardForm, {
-      name: fullRule.name,
-      description: fullRule.description || '',
-      protocol: fullRule.protocol,
-      domain: fullRule.domain || '',
-      listen_port: fullRule.listen_port,
-      strategy: fullRule.strategy || 'weighted_round_robin',
-      dynamic_dns: fullRule.dynamic_dns || false,
-      enable_dns_server: fullRule.enable_dns_server || false,
-      dns_server: fullRule.dns_server || '',
-      dns_family: selectedDnsFamilies(fullRule.dns_family),
-      health_check_path: fullRule.health_check_path || '',
-      health_check_interval: fullRule.health_check_interval || 10,
-      health_check_timeout: fullRule.health_check_timeout || 2,
-      health_check_healthy_threshold: fullRule.health_check_healthy_threshold || 2,
-      health_check_unhealthy_threshold: fullRule.health_check_unhealthy_threshold || 3,
-      enable_active_health_check: fullRule.enable_active_health_check === true,
-      tcp_health_check_port: fullRule.tcp_health_check_port || 0,
-      tcp_proxy_protocol: fullRule.tcp_proxy_protocol === true,
-      tcp_try_duration: fullRule.tcp_try_duration || 0,
-      tcp_try_interval: fullRule.tcp_try_interval ?? 250,
-      health_check_host: fullRule.health_check_host || '',
-      upstreams: fullRule.upstreams?.map(u => ({
-        ...u,
-        dynamic_dns: false,
-        protocol: u.protocol || 'http',
-        max_connections: u.max_connections ?? 0,
-        origin_domain: u.origin_domain || '',
-      })) || [],
-      enable_tls: fullRule.enable_tls || false,
-      tls_source: fullRule.tls_source || 'manual',
-      acme_config_id: fullRule.acme_config_id || undefined,
-      ca_provider_id: fullRule.ca_provider_id ?? 0,
-      tls_cert: fullRule.tls_cert || '',
-      tls_key: fullRule.tls_key || '',
-      // 历史问题：GetRule 掩码私钥时仅回 tls_key_set 标记——表单据此区分「未配置」
-      // 与「已隐藏」（提交空 tls_key 后端保留原值）
-      tlsKeySet: fullRule.tls_key_set === true,
-      tls_http_redirect: fullRule.tls_http_redirect || false,
-      enable_compress: fullRule.enable_compress !== false,
-      compress_types: compressTypes,
-      request_body_max_size_mb: fullRule.request_body_max_size_mb || 0,
-      upstream_keepalive_timeout: fullRule.upstream_keepalive_timeout || 0,
-      server_tokens_hidden: fullRule.server_tokens_hidden || 0,
-      // NTLM 接管态原样回填：7 字段实际值（-1/300 等经 || 0 保真），UI 呈灰态
-      ntlm_compatible: fullRule.ntlm_compatible === 1 ? 1 : 0,
-      upstream_force_http1: fullRule.upstream_force_http1 === 1 ? 1 : 0,
-      enabled: fullRule.enabled,
-      log_enabled: fullRule.log_enabled || false,
-      custom_routes_enabled: fullRule.custom_routes_enabled === true,
-      path_rules: [...(fullRule.path_rules || [])]
-        .sort((left, right) => left.sort_order - right.sort_order)
-        .map((pathRule) => ({
-          ...pathRule,
-          // UI 哨兵：空串模式映射为 'forward'（el-select 空串选项不显示标签）；提交归一 ''
-          response_mode: pathRule.response_mode || 'forward',
-          upstreams: pathRuleUpstreamsToPercent(pathRule.upstreams),
-        })),
-      proxy_dial_timeout: fullRule.proxy_dial_timeout || 0,
-      proxy_response_header_timeout: fullRule.proxy_response_header_timeout || 0,
-      proxy_read_timeout: fullRule.proxy_read_timeout || 0,
-      proxy_write_timeout: fullRule.proxy_write_timeout || 0,
-      proxy_stream_timeout: fullRule.proxy_stream_timeout || 0,
-      proxy_flush_interval: fullRule.proxy_flush_interval || 0,
-      proxy_stream_close_delay: fullRule.proxy_stream_close_delay || 0,
-    })
+    Object.assign(wizardForm, wizardFormFromRule(fullRule))
     weightsToPercent(wizardForm.upstreams)
     if (wizardForm.dynamic_dns) onDynamicDnsToggle(true)
   } else {
@@ -3259,70 +3301,10 @@ const openCopyWizard = async (rule: Rule) => {
       markTlsDetailFailed(rule.caddy_id)
     }
   }
-  const compressTypes = fullRule.compress_types ? selectedCompressTypes(fullRule.compress_types) : ['gzip']
-  Object.assign(wizardForm, {
+  Object.assign(wizardForm, wizardFormFromRule(fullRule), {
     name: `${fullRule.name}（副本）`,
-    description: fullRule.description || '',
-    protocol: fullRule.protocol,
-    domain: fullRule.domain || '',
-    listen_port: fullRule.listen_port,
-    strategy: fullRule.strategy || 'weighted_round_robin',
-    dynamic_dns: fullRule.dynamic_dns || false,
-    enable_dns_server: fullRule.enable_dns_server || false,
-    dns_server: fullRule.dns_server || '',
-    dns_family: selectedDnsFamilies(fullRule.dns_family),
-    health_check_path: fullRule.health_check_path || '',
-    health_check_interval: fullRule.health_check_interval || 10,
-    health_check_timeout: fullRule.health_check_timeout || 2,
-    health_check_healthy_threshold: fullRule.health_check_healthy_threshold || 2,
-    health_check_unhealthy_threshold: fullRule.health_check_unhealthy_threshold || 3,
-    enable_active_health_check: fullRule.enable_active_health_check === true,
-    tcp_health_check_port: fullRule.tcp_health_check_port || 0,
-    tcp_proxy_protocol: fullRule.tcp_proxy_protocol === true,
-    tcp_try_duration: fullRule.tcp_try_duration || 0,
-    tcp_try_interval: fullRule.tcp_try_interval ?? 250,
-    health_check_host: fullRule.health_check_host || '',
-    upstreams: fullRule.upstreams?.map(u => ({
-      ...u,
-      dynamic_dns: false,
-      protocol: u.protocol || 'http',
-      max_connections: u.max_connections ?? 0,
-      origin_domain: u.origin_domain || '',
-    })) || [],
-    enable_tls: fullRule.enable_tls || false,
-    tls_source: fullRule.tls_source || 'manual',
-    acme_config_id: fullRule.acme_config_id || undefined,
-    ca_provider_id: fullRule.ca_provider_id ?? 0,
-    tls_cert: fullRule.tls_cert || '',
-    tls_key: fullRule.tls_key || '',
-    tlsKeySet: fullRule.tls_key_set === true,
-    request_body_max_size_mb: fullRule.request_body_max_size_mb || 0,
-    upstream_keepalive_timeout: fullRule.upstream_keepalive_timeout || 0,
-    server_tokens_hidden: fullRule.server_tokens_hidden || 0,
-    // 复制携带 NTLM 形态（后端按零值族处理接管字段），接管态原样呈现
-    ntlm_compatible: fullRule.ntlm_compatible === 1 ? 1 : 0,
-    upstream_force_http1: fullRule.upstream_force_http1 === 1 ? 1 : 0,
-    log_enabled: fullRule.log_enabled || false,
-    custom_routes_enabled: fullRule.custom_routes_enabled === true,
-    path_rules: [...(fullRule.path_rules || [])]
-      .sort((left, right) => left.sort_order - right.sort_order)
-      .map((pathRule) => ({
-        ...pathRule,
-        response_mode: pathRule.response_mode || 'forward',
-        upstreams: pathRuleUpstreamsToPercent(pathRule.upstreams),
-      })),
-    proxy_dial_timeout: fullRule.proxy_dial_timeout || 0,
-    proxy_response_header_timeout: fullRule.proxy_response_header_timeout || 0,
-    proxy_read_timeout: fullRule.proxy_read_timeout || 0,
-    proxy_write_timeout: fullRule.proxy_write_timeout || 0,
-    proxy_stream_timeout: fullRule.proxy_stream_timeout || 0,
-    proxy_flush_interval: fullRule.proxy_flush_interval || 0,
-    proxy_stream_close_delay: fullRule.proxy_stream_close_delay || 0,
-    tls_http_redirect: fullRule.tls_http_redirect || false,
-    enable_compress: fullRule.enable_compress !== false,
-    compress_types: compressTypes,
     enabled: false,
-    })
+  })
   weightsToPercent(wizardForm.upstreams)
   if (wizardForm.dynamic_dns) onDynamicDnsToggle(true)
   hydratingWizard = false
@@ -3342,81 +3324,23 @@ const viewConfig = async (rule: Rule) => {
     const res = await request.get<APIResponse<RuleCaddyConfigResponse>>(`/rules/${targetId}/caddy-config`)
     if (requestSeq !== configRequestSeq || !configDialogVisible.value) return
      
-    // Build the display config
-    const compressTypes = rule.compress_types ? selectedCompressTypes(rule.compress_types) : ['gzip']
-    
-    ruleConfig.value = {
-      id: rule.id || 0,
-      caddy_id: res.data?.caddy_id || '',
-      name: rule.name || '',
-      domain: rule.domain || '',
-      listen_port: rule.listen_port || 0,
-      protocol: rule.protocol || 'http',
-      strategy: rule.strategy || 'weighted_round_robin',
-      dynamic_dns: rule.dynamic_dns || false,
-      enable_dns_server: rule.enable_dns_server || false,
-      dns_server: rule.dns_server || '',
-      host_header: rule.host_header || '',
-      health_check_host: rule.health_check_host || '',
-      enable_tls: rule.enable_tls || false,
-      tls_source: rule.tls_source || 'manual',
-      tls_http_redirect: rule.tls_http_redirect || false,
-      enable_compress: rule.enable_compress !== false,
-      compress_types: compressTypes,
-      health_check_path: rule.health_check_path || '',
-      health_check_interval: rule.health_check_interval || 10,
-      health_check_timeout: rule.health_check_timeout || 2,
-      health_check_unhealthy_threshold: rule.health_check_unhealthy_threshold || 3,
-      enable_active_health_check: rule.enable_active_health_check === true,
-      tcp_health_check_port: rule.tcp_health_check_port || 0,
-      tcp_try_duration: rule.tcp_try_duration || 0,
-      tcp_try_interval: rule.tcp_try_interval ?? 250,
-      request_body_max_size_mb: rule.request_body_max_size_mb || 0,
-      upstream_keepalive_timeout: rule.upstream_keepalive_timeout || 0,
-      server_tokens_hidden: rule.server_tokens_hidden || 0,
-      upstreams: rule.upstreams || [],
-      enabled: rule.enabled !== false,
-      config: res.data?.config ?? null,
-      config_not_exists: res.data?.config_not_exists === true,
-    }
+    ruleConfig.value = buildRuleConfigView(
+      rule,
+      res.data?.caddy_id || '',
+      res.data?.config ?? null,
+      res.data?.config_not_exists === true,
+    )
   } catch (error: unknown) {
     if (requestSeq !== configRequestSeq || !configDialogVisible.value) return
     // Error message is already shown by the global axios interceptor.
     console.error('view config failed', error)
-    ruleConfig.value = {
-      id: rule.id || 0,
-      caddy_id: '',
-      name: rule.name || '',
-      domain: rule.domain || '',
-      listen_port: rule.listen_port || 0,
-      protocol: rule.protocol || 'http',
-      strategy: rule.strategy || 'weighted_round_robin',
-      dynamic_dns: rule.dynamic_dns || false,
-      enable_dns_server: rule.enable_dns_server || false,
-      dns_server: rule.dns_server || '',
-      host_header: rule.host_header || '',
-      health_check_host: rule.health_check_host || '',
-      enable_tls: rule.enable_tls || false,
-      tls_source: rule.tls_source || 'manual',
-      tls_http_redirect: rule.tls_http_redirect || false,
-      enable_compress: rule.enable_compress !== false,
-      compress_types: ['gzip'],
-      health_check_path: rule.health_check_path || '',
-      health_check_interval: rule.health_check_interval || 10,
-      health_check_timeout: rule.health_check_timeout || 2,
-      health_check_unhealthy_threshold: rule.health_check_unhealthy_threshold || 3,
-      enable_active_health_check: rule.enable_active_health_check === true,
-      tcp_health_check_port: rule.tcp_health_check_port || 0,
-      tcp_try_duration: rule.tcp_try_duration || 0,
-      tcp_try_interval: rule.tcp_try_interval ?? 250,
-      request_body_max_size_mb: rule.request_body_max_size_mb || 0,
-      upstream_keepalive_timeout: rule.upstream_keepalive_timeout || 0,
-      server_tokens_hidden: rule.server_tokens_hidden || 0,
-      upstreams: rule.upstreams || [],
-      enabled: rule.enabled !== false,
-      config: { error: '获取配置失败', details: error instanceof Error ? error.message : undefined },
-      config_not_exists: false,
-    }
+    ruleConfig.value = buildRuleConfigView(
+      rule,
+      '',
+      { error: '获取配置失败', details: error instanceof Error ? error.message : undefined },
+      false,
+      ['gzip'],
+    )
   } finally {
     if (requestSeq === configRequestSeq) configLoading.value = false
   }

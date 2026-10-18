@@ -13,6 +13,21 @@ const HEAT_LADDER: Rgb[] = [
 // 地图/地球未命中国家点阵同色、同不透明度（用户裁定：沿用地图原透明度）。
 export const DOT_LAND = 'rgb(44,66,96)'
 
+/** pointy-top 六边形单位顶点（地图点阵复用；避免逐点三角函数计算）。 */
+export const POINTY_TOP_HEX_VERTICES: readonly (readonly [number, number])[] = [
+  [0, -1],
+  [Math.sqrt(3) / 2, -0.5],
+  [Math.sqrt(3) / 2, 0.5],
+  [0, 1],
+  [-Math.sqrt(3) / 2, 0.5],
+  [-Math.sqrt(3) / 2, -0.5],
+]
+
+/** 国家是否允许下钻；缺省不限，显式空列表表示全部禁止。 */
+export function drillCountryAllowed(allowed: readonly string[] | undefined, country: string): boolean {
+  return allowed === undefined || allowed.includes(country)
+}
+
 /** 热力色（log10 计数 1→1000 三段线性插值；count≤0=底色）。 */
 function heatColor(count: number): Rgb {
   const t = Math.min(1, Math.max(0, Math.log10(Math.max(1, count)) / 3))

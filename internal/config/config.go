@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -127,6 +128,11 @@ func Load(path string) *Config {
 					cfg.StaticDir = v
 				}
 				if v, ok := fileCfg["port"].(float64); ok {
+					// 历史问题-7（历史）：浮点截断不得静默——8000.9→8000 会让
+					// 「配置未生效」无从排查。
+					if v != math.Trunc(v) {
+						log.Printf("config: port %v is not an integer; truncated to %d", v, int(v))
+					}
 					cfg.Port = int(v)
 				}
 				if v, ok := fileCfg["caddy_admin_url"].(string); ok && v != "" {
@@ -136,6 +142,13 @@ func Load(path string) *Config {
 					cfg.CaddyMetricsURL = v
 				}
 				if v, ok := fileCfg["metrics_interval"].(float64); ok && v > 0 {
+					// 历史问题-7（历史）：下限钳位与截断均留痕（此前 1 被静默
+					// 抬到 5、1.9 被静默截断——看似「配置未生效」）。
+					if v < 5 {
+						log.Printf("config: metrics_interval %v below minimum 5; clamped to 5", v)
+					} else if v != math.Trunc(v) {
+						log.Printf("config: metrics_interval %v is not an integer; truncated to %d", v, int(v))
+					}
 					cfg.MetricsInterval = max(5, int(v))
 				}
 			}

@@ -442,10 +442,13 @@ func nearestSnapshotCertificateExpiry(certificates []models.ClusterCertificate, 
 }
 
 func parseSnapshotExpiry(value string) (time.Time, error) {
-	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05.999999999-07:00", "2006-01-02 15:04:05.999999999", "2006-01-02 15:04:05"} {
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05.999999999-07:00", "2006-01-02 15:04:05.999999999"} {
 		if parsed, err := time.Parse(layout, value); err == nil {
 			return parsed, nil
 		}
+	}
+	if parsed := parseUTCSlot(value); !parsed.IsZero() {
+		return parsed, nil
 	}
 	return time.Time{}, fmt.Errorf("无法解析证书过期时间 %q", value)
 }
@@ -481,7 +484,7 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 	if err != nil {
 		return fmt.Errorf("读取集群基础设置: %w", err)
 	}
-	snapshot.BasicSettings.BrandingJSON = brandingJSON
+	snapshot.BasicSettings.BrandingJSON = new(brandingJSON)
 	snapshot.CaddyConfig = &caddyConfig
 	if err := store.QueryRowContext(ctx, `SELECT COALESCE(caddy_log_level,'info'), COALESCE(caddy_log_size_mb,100),
 		COALESCE(access_log_json,1), COALESCE(access_log_format,''),

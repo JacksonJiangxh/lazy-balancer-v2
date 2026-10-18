@@ -105,7 +105,7 @@
               placeholder="请输入密码"
               size="large"
               :prefix-icon="Lock"
-              maxlength="24"
+              maxlength="72"
               show-password
             />
           </el-form-item>
@@ -182,7 +182,6 @@ const rules: FormRules = {
   ],
   password: [
     { required: true, message: '请输入密码', trigger: 'blur' },
-    { min: 8, message: '密码至少8位', trigger: 'blur' },
   ],
 }
 

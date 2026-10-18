@@ -405,39 +405,46 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	}
 	// 升主后按库实态统一恢复六个业务驱动任务，而非只恢复 autoban。
 	SyncBusinessTaskDrivers()
-	if masterURL != "" {
-		parsedMasterURL, err := url.Parse(masterURL)
-		if err != nil {
-			Logf("info", "parse old cluster master URL after promotion: %v", err)
-			RecordAuditLog("system", "清理失败", "证书指纹", FormatAuditDetail("旧主节点地址无效", err.Error()), "")
-			// 地址损坏时无法定位旧主节点 pin 文件——磁盘残留为已知边界
-			// （历史 F56B2-4 如实化）：残留仅在该 host:port 将来重新注册
-			// 为从节点时引发一次 PinMismatch，forget-pins 可恢复。
-			return nil
-		}
-		pinPath, err := clusterPinPathForDatabase(s.db, parsedMasterURL.Host)
-		if err != nil {
-			Logf("info", "locate old cluster master pin after promotion: %v", err)
-			RecordAuditLog("system", "清理失败", "证书指纹", FormatAuditDetail("旧主节点："+parsedMasterURL.Scheme+"://"+parsedMasterURL.Host, err.Error()), "")
-			// 同上：pin 路径定位失败，磁盘清理不可达，残留边界已知。
-			return nil
-		}
-		// 先读取已知指纹，再清理并通知：脱离通知的 transport 按连接读取 pin 文件
-		//（TOFU 会在文件缺失时重新写回），必须在清理前取出指纹并让通知"仅比对
-		// 不落盘"，否则通知握手晚于清理会把旧主节点指纹重新写回、再次信任已脱离
-		// 的节点。
-		pinFingerprint := ""
-		if content, readErr := os.ReadFile(pinPath); readErr == nil {
-			pinFingerprint = strings.TrimSpace(string(content))
-		}
-		if oldToken != "" {
-			// 通知旧主节点该从节点已脱离（best-effort：失败不阻断提升，主节点
-			// 会在上报超时后将其标记下线；成功则主节点节点列表立即更新并留痕）。
-			go notifyMasterDetach(context.WithoutCancel(ctx), masterURL, oldToken, pinFingerprint)
-		}
-		s.cleanupClusterPin(pinPath, parsedMasterURL.Scheme+"://"+parsedMasterURL.Host)
-	}
+	s.detachFromMaster(ctx, masterURL, oldToken)
 	return nil
+}
+
+// detachFromMaster 复用升主/换主的旧主脱离收尾：按已知 pin 仅比对通知
+// detached（best-effort），再清理旧主 pin。调用方负责在本地拓扑提交成功后调用。
+func (s *ClusterService) detachFromMaster(ctx context.Context, masterURL, oldToken string) {
+	if masterURL == "" {
+		return
+	}
+	parsedMasterURL, err := url.Parse(masterURL)
+	if err != nil {
+		Logf("info", "parse old cluster master URL after promotion: %v", err)
+		RecordAuditLog("system", "清理失败", "证书指纹", FormatAuditDetail("旧主节点地址无效", err.Error()), "")
+		// 地址损坏时无法定位旧主节点 pin 文件——磁盘残留为已知边界
+		// （历史 F56B2-4 如实化）：残留仅在该 host:port 将来重新注册
+		// 为从节点时引发一次 PinMismatch，forget-pins 可恢复。
+		return
+	}
+	pinPath, err := clusterPinPathForDatabase(s.db, parsedMasterURL.Host)
+	if err != nil {
+		Logf("info", "locate old cluster master pin after promotion: %v", err)
+		RecordAuditLog("system", "清理失败", "证书指纹", FormatAuditDetail("旧主节点："+parsedMasterURL.Scheme+"://"+parsedMasterURL.Host, err.Error()), "")
+		// 同上：pin 路径定位失败，磁盘清理不可达，残留边界已知。
+		return
+	}
+	// 先读取已知指纹，再清理并通知：脱离通知的 transport 按连接读取 pin 文件
+	//（TOFU 会在文件缺失时重新写回），必须在清理前取出指纹并让通知"仅比对
+	// 不落盘"，否则通知握手晚于清理会把旧主节点指纹重新写回、再次信任已脱离
+	// 的节点。
+	pinFingerprint := ""
+	if content, readErr := os.ReadFile(pinPath); readErr == nil {
+		pinFingerprint = strings.TrimSpace(string(content))
+	}
+	if oldToken != "" {
+		// 通知旧主节点该从节点已脱离（best-effort：失败不阻断提升，主节点
+		// 会在上报超时后将其标记下线；成功则主节点节点列表立即更新并留痕）。
+		go notifyMasterDetach(context.WithoutCancel(ctx), masterURL, oldToken, pinFingerprint)
+	}
+	s.cleanupClusterPin(pinPath, parsedMasterURL.Scheme+"://"+parsedMasterURL.Host)
 }
 
 func (s *ClusterService) cleanupClusterPin(pinPath, auditURL string) {

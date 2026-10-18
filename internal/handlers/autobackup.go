@@ -47,22 +47,27 @@ func autoBackupSafeFilename(name string) bool {
 	return filepath.Base(name) == name
 }
 
-// loadAutoBackupSectionsSetting 读取备份范围设置；空/非法/空数组 → nil（全部）。
+// loadAutoBackupSectionsSetting 读取备份范围设置；未设置（NULL/空串）→ nil
+// （全部）。数据库读失败、损坏 JSON 与空数组必须显式报错，绝不能静默退化
+// 为全量备份（否则管理员原以为只导局部，实际把全部凭证写入备份文件）。
 // 存量行可能携带三分类合并前的 legacy 键(global_config/waf_files)——读出即
 // 归一(2026-09-19 用户裁定),调度器/导出器消费当前三分类口径,无需迁移存量行。
-func loadAutoBackupSectionsSetting() []string {
+func loadAutoBackupSectionsSetting() ([]string, error) {
 	var raw sql.NullString
 	if err := db.DB.QueryRow(`SELECT auto_backup_sections FROM global_config WHERE id=1`).Scan(&raw); err != nil {
-		return nil
+		return nil, fmt.Errorf("读取备份范围: %w", err)
 	}
 	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
-		return nil
+		return nil, nil
 	}
 	var sections []string
-	if err := json.Unmarshal([]byte(raw.String), &sections); err != nil || len(sections) == 0 {
-		return nil
+	if err := json.Unmarshal([]byte(raw.String), &sections); err != nil {
+		return nil, fmt.Errorf("备份范围格式损坏: %w", err)
 	}
-	return normalizeBackupSectionKeys(sections)
+	if len(sections) == 0 {
+		return nil, errors.New("备份范围不能为空数组")
+	}
+	return normalizeBackupSectionKeys(sections), nil
 }
 
 // loadAutoBackupKeepSetting 读取保留份数；越界/读失败回退 7（写侧已限 1-30；
@@ -247,7 +252,11 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return autoBackupRowView{}, fail("创建备份目录失败", err)
 	}
-	payload, exportedSections, countsSummary, _, err := h.buildLbbakExport(ctx, loadAutoBackupSectionsSetting())
+	sections, err := loadAutoBackupSectionsSetting()
+	if err != nil {
+		return autoBackupRowView{}, fail("读取备份范围", err)
+	}
+	payload, exportedSections, countsSummary, _, err := h.buildLbbakExport(ctx, sections)
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return autoBackupRowView{}, cerr

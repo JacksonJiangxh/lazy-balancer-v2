@@ -41,3 +41,26 @@ func TestMFARecoveryCodes_regeneratesWithAuditTrail(t *testing.T) {
 		t.Fatal("recovery-codes regeneration produced no audit event（高敏动作须留痕）")
 	}
 }
+
+// B3-历史问题（历史）：MFA 启用态读取的 DB 错误此前被并入「MFA 未启用」
+// 400——DB 故障被误报为业务态。拆分：读失败 500，未启用保持 400。
+func TestMFARecoveryCodes_statusReadFailureReturns500(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'recycler','x','user',1)"); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if _, err := db.DB.Exec("ALTER TABLE users RENAME COLUMN mfa_enabled TO mfa_enabled_unreadable"); err != nil {
+		t.Fatalf("break mfa_enabled column: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/auth/mfa/recovery-codes", nil)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set("user_id", 1)
+	h.MFARecoveryCodes(ctx)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500（DB 故障不得报 400 MFA 未启用）", recorder.Code, recorder.Body.String())
+	}
+}

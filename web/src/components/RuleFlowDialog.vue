@@ -504,7 +504,11 @@ const ensureDetails = async (): Promise<void> => {
     // 引用名单条目：仅信任名单引用需条目值（阶段 0 明细逐条展示）；
     // ACL 明细为列表级汇总（名称+entry_count），不拉条目
     const refIds = new Set<number>()
+    const boundTrustPolicyIds = new Set(
+      props.model?.stages.find((stage) => stage.stage === 0)?.groups.map((group) => group.key) ?? [],
+    )
     for (const pol of props.policies) {
+      if (!boundTrustPolicyIds.has(pol.id)) continue
       for (const id of parseRefIds(pol.ip_whitelist_refs)) refIds.add(id)
     }
     const missing = [...refIds].filter((id) => !ipListEntryCache.value.has(id))

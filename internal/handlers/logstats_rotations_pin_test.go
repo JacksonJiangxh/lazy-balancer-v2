@@ -13,6 +13,7 @@ package handlers
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -87,5 +88,41 @@ func TestTimestampedRotationStats_familyShapes(t *testing.T) {
 					tc.base, active, rotated, tc.wantActive, tc.wantRotated)
 			}
 		})
+	}
+}
+
+// B2-07（历史）：gzip 压缩的运行日志族轮转副本（<base>.YYYYMMDD-HHMMSS.gz）
+// 此前两套实现分叉——聚合路径（aggregateDirStats）归入独立的 .gz 键、
+// dirBytes/timestampedRotationStats 完全漏计。统一为「归并到所属 base 的 rotated」。
+func TestGzippedRuntimeRotation_mergesIntoBaseBothPaths(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]int64{
+		"lazy-balancer.log":                    100,
+		"lazy-balancer.log.20260921-120000.gz": 150,
+		"lazy-balancer.log.20260920-115900":    50,
+	}
+	for name, size := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// dirBytes 路径：.gz 副本计入 rotated
+	active, rotated, _ := dirBytes(filepath.Join(dir, "lazy-balancer.log"))
+	if active != 100 || rotated != 200 {
+		t.Fatalf("dirBytes=(active=%d, rotated=%d), want (100, 200)（.gz 副本计入）", active, rotated)
+	}
+
+	// 聚合路径：.gz 副本归并到 base，不产生独立键
+	match := func(name string) bool {
+		return name == "lazy-balancer.log" || strings.HasPrefix(name, "lazy-balancer.log.")
+	}
+	stats := aggregateDirStats(dir, match)
+	st, ok := stats["lazy-balancer.log"]
+	if !ok || st.Active != 100 || st.Rotated != 200 || st.RotCount != 2 {
+		t.Fatalf("aggregateDirStats base=%+v ok=%v, want active=100 rotated=200 count=2", st, ok)
+	}
+	if _, stray := stats["lazy-balancer.log.20260921-120000.gz"]; stray {
+		t.Fatal("gzipped rotation must not surface as standalone entry")
 	}
 }

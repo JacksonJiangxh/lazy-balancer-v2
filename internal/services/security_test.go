@@ -2,9 +2,11 @@ package services
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -336,6 +338,35 @@ func TestIntersectIPLists_badEntryDoesNotFabricateIntersection(t *testing.T) {
 	for _, e := range got {
 		if e == "garbage-entry" {
 			t.Fatalf("交集不得含坏条目: %v", got)
+		}
+	}
+}
+
+func TestCountEnabledCustomRulesBatch_matchesSingles(t *testing.T) {
+	newClusterTestService(t)
+	_, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES
+		('on', '[]', 'block', 5, 1), ('off', '[]', 'block', 5, 0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onID, offID int
+	if err := db.DB.QueryRow(`SELECT id FROM security_custom_rules WHERE name='on'`).Scan(&onID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB.QueryRow(`SELECT id FROM security_custom_rules WHERE name='off'`).Scan(&offID); err != nil {
+		t.Fatal(err)
+	}
+	policies := []*models.SecurityPolicy{
+		{CustomRules: json.RawMessage(fmt.Sprintf("[%d,%d,999999]", onID, offID))},
+		{CustomRules: json.RawMessage(`[{"id":1,"enabled":true},{"id":2,"enabled":false}]`)},
+		{CustomRules: json.RawMessage(`[]`)},
+	}
+	got := CountEnabledCustomRulesBatch(policies)
+	want := []int{1, 1, 0}
+	for i := range want {
+		single := CountEnabledCustomRules(policies[i].CustomRules)
+		if got[i] != want[i] || got[i] != single {
+			t.Fatalf("batch[%d]=%d, want %d (single=%d)", i, got[i], want[i], single)
 		}
 	}
 }

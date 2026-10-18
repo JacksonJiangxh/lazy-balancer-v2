@@ -90,8 +90,10 @@
               <el-option label="自适应（推荐）" :value="-1" />
               <el-option label="全量（不采样）" :value="1" />
               <el-option label="关闭逐请求光流" :value="0" />
+              <el-option :label="trafficSampleN >= 2 ? `固定 1/${trafficSampleN}` : '固定 1/2'" :value="trafficSampleN >= 2 ? trafficSampleN : 2" />
             </el-select>
-            <div class="form-tip-line">大屏正常请求光流的逐请求采样；自适应会根据每秒事件量在 1/4、1/8 间自动切换。关闭后仅保留聚合流量统计，不影响安全事件日志。</div>
+            <el-input-number v-if="trafficSampleN >= 2" v-model="trafficSampleN" :disabled="isReadOnly" :min="2" :max="64" controls-position="right" style="width: 110px; margin-left: 8px" />
+            <div class="form-tip-line">大屏正常请求光流的逐请求采样；自适应会根据每秒事件量在 1/4、1/8 间自动切换，固定比例可设 1/2 至 1/64。关闭后仅保留聚合流量统计，不影响安全事件日志。</div>
           </el-form-item>
           <el-form-item label="下载代理">
             <el-select v-model="githubProxyUrl" :disabled="isReadOnly || !githubProxyLoaded" style="width: 160px" :placeholder="githubProxyLoaded ? '选择代理' : '未加载'">
@@ -477,6 +479,7 @@ import type { APIResponse } from '@/types'
 import { request, mfaAwareSuccess, formatBytes, ApiRequestError } from '@/utils/api'
 import { reloadAfterRestart } from '@/utils/restart'
 import { formatDate } from '@/utils/date'
+import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
 import { Setting, InfoFilled, Check, View, Upload, Download, Timer, Lock, Document } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import type { SystemInfo } from '@/types'
@@ -856,7 +859,7 @@ const restoreAutoBackup = async (row: AutoBackupRow): Promise<void> => {
   try {
     // 还原走导入 core(config_backup.go importConfigBackupCore),响应同样携带
     // data.warnings(操作账户替换/会话吊销/ACME 悬挂等)——与导入同口径展示
-    const res = await request.post<{ message?: string; data?: { warnings?: string[] } }>(`/auto-backup/${row.id}/restore`)
+    const res = await request.post<{ message?: string; data?: { warnings?: string[] } }>(`/auto-backup/${row.id}/restore`, undefined, { timeout: 0 })
     autoBackupVisible.value = false
     const warnings = res.data?.warnings ?? []
     const resultLines = [res.message || '配置还原成功', ...warnings]
@@ -1059,6 +1062,7 @@ const postImportValidation = async (sections: string[]): Promise<ImportValidatio
   }
   const res = await request.post<{ data: ImportValidation }>(endpoint, body, {
     headers: { 'Content-Type': isLbbak ? 'application/octet-stream' : 'application/json' },
+    timeout: 0,
   })
   return res.data
 }
@@ -1120,6 +1124,7 @@ const confirmImport = async (): Promise<void> => {
     }
     const res = await request.post<ImportResponse>(endpoint, importBody, {
       headers: { 'Content-Type': importFileIsLbbak.value ? 'application/octet-stream' : 'application/json' },
+      timeout: 0,
     })
     importDialogVisible.value = false
     const disabledConflicts = res.data?.disabled_conflicts ?? []
@@ -1289,7 +1294,7 @@ watch(() => [settings.value.security_events_retention_days, settings.value.secur
   seRowCap.value = c && c > 0 ? c : 1_000_000
 }, { immediate: true })
 watch(() => settings.value.threat_traffic_sample_n, (v) => {
-  trafficSampleN.value = v === -1 || v === 0 || v === 1 ? v : -1
+  trafficSampleN.value = normalizeTrafficSampleN(v)
 }, { immediate: true })
 async function detectSiteLocation(): Promise<void> {
   if (siteDetecting.value) return

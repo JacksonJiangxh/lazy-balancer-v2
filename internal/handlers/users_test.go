@@ -411,3 +411,63 @@ func TestListUsers_emptyTableReturnsEmptyArray(t *testing.T) {
 		t.Fatalf("空表 data 须为 []: %s", response.Body.String())
 	}
 }
+
+// B1-04（历史）：OIDC 门对 password 字段的拦截粒度——空密码串在策略层
+// 语义为「不修改」（validatePasswordPolicy 空值放行、passwordHash 仅在非空时
+// 生成），管理员更新 OIDC 用户角色/启停时载荷携带空 password 键不应被拒。
+func TestUpdateUser_oidcEmptyPasswordTreatedAsUnchanged(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedUserAuditTest(t, 1, "admin", "admin", true)
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,auth_provider,display_name) VALUES (7,'sso@example.com','','user',1,'oidc','IdP Name')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When: 管理员改 OIDC 用户角色并携带空 password 键 → 放行（空=不修改）
+	rec := serveUserMutation(h, http.MethodPut, "/users/7", `{"role":"admin","password":""}`, 1, h.UpdateUser)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty password must be treated as unchanged: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var role, hash string
+	if err := db.DB.QueryRow("SELECT role, password_hash FROM users WHERE id=7").Scan(&role, &hash); err != nil {
+		t.Fatal(err)
+	}
+	if role != "admin" || hash != "" {
+		t.Fatalf("role=%q hash=%q, want role=admin 且密码未动", role, hash)
+	}
+
+	// 回归形状：非空密码仍被 OIDC 门拦截
+	rec = serveUserMutation(h, http.MethodPut, "/users/7", `{"password":"Newpass123!"}`, 1, h.UpdateUser)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "OIDC") {
+		t.Fatalf("non-empty password: status=%d body=%s, want 400 OIDC 提示", rec.Code, rec.Body.String())
+	}
+}
+
+// B1-05（历史）：审计富化的 username 回填查询此前静默吞错（_ = Scan）——
+// DB 故障下操作照常 200 且审计详情缺失用户名。改为与其余 DB 错误同口径 500
+// （RENAME COLUMN 注入读失败，同 TestUserMutations_rejectWhenIdentityUnreadable 形状）。
+func TestUserMutations_failWhenUsernameUnreadable(t *testing.T) {
+	t.Run("toggle status", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		seedUserAuditTest(t, 1, "admin", "admin", true)
+		seedUserAuditTest(t, 7, "victim", "user", false)
+		if _, err := db.DB.Exec("ALTER TABLE users RENAME COLUMN username TO username_unreadable"); err != nil {
+			t.Fatalf("break username column: %v", err)
+		}
+		rec := serveUserMutation(h, http.MethodPut, "/users/7", `{"is_enabled":true}`, 1, h.ToggleUserStatus)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("toggle with unreadable username must 500, got %d %s", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("reset password", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		seedUserAuditTest(t, 1, "admin", "admin", true)
+		seedUserAuditTest(t, 7, "victim", "user", true)
+		if _, err := db.DB.Exec("ALTER TABLE users RENAME COLUMN username TO username_unreadable"); err != nil {
+			t.Fatalf("break username column: %v", err)
+		}
+		rec := serveUserMutation(h, http.MethodPut, "/users/7", `{"new_password":"Secret123!"}`, 1, h.ResetUserPassword)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("reset with unreadable username must 500, got %d %s", rec.Code, rec.Body.String())
+		}
+	})
+}

@@ -9,7 +9,13 @@ import {
   flowRegionKey,
   flowTimestamp,
   shouldAggregate,
+  normalizeTrafficSampleN,
 } from '../src/utils/threatFlowRules.ts'
+
+test('流量采样配置：保留后端 -1/0/1/2-64 全契约，拒绝越界与非整数（历史问题）', () => {
+  for (const value of [-1, 0, 1, 2, 4, 8, 64]) assert.equal(normalizeTrafficSampleN(value), value)
+  for (const value of [-2, 65, 1.5, Number.NaN, undefined, null]) assert.equal(normalizeTrafficSampleN(value), -1)
+})
 
 test('地域 key：中国精确到省，其他国家/未知归一', () => {
   assert.equal(flowRegionKey('中国·广东省·深圳市'), '中国·广东省')

@@ -1012,3 +1012,22 @@ func TestThreatUpdateRun_usesTaskRunStartedAt(t *testing.T) {
 		t.Fatalf("源行数=%d, want 3", seen)
 	}
 }
+
+func TestHealThreatFastFromText_skipsComments(t *testing.T) {
+	overrideWafDirForTest(t)
+	raw := "# header\n; note\n1.2.3.4\n\n"
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, _, ok := healThreatFastFromText("ustc")
+	if !ok {
+		t.Fatal("heal .fast from valid text failed")
+	}
+	if len(entries) != 1 || entries[0] != "1.2.3.4" {
+		t.Fatalf("healed entries=%v, comments must not become entries", entries)
+	}
+	if _, err := os.Stat(filepath.Join(wafDir, "threat-ustc.iplist.fast")); err != nil {
+		t.Fatalf("healed .fast missing: %v", err)
+	}
+}

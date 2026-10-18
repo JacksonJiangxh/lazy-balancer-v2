@@ -403,8 +403,21 @@ const countryZh = useCountryNamesCn()
 // computed 内逐行重算（O(策略²×条目)，每次开弹层全量重跑）——提升为共享
 // computed：本 IP 是否被任一策略信任 + 命中本 IP 的非系统引用名单集合，
 // rowView 内退化为布尔读取/Set 查询（O(策略×条目) 一次）。
-const ipTrustedAnywhere = computed(() =>
-  policies.value.some((p) => mergedTrustEntries(p).some((e) => entryMatchesIp(e, props.ip.trim()))))
+const trustHitSummary = computed(() => {
+  const ip = props.ip.trim()
+  let trusted = false
+  let detectionOwner: PolicyRow | undefined
+  let passthroughOwner: PolicyRow | undefined
+  for (const policy of policies.value) {
+    if (!mergedTrustEntries(policy).some((entry) => entryMatchesIp(entry, ip))) continue
+    trusted = true
+    if (!policy.ip_whitelist_enabled) continue
+    if (policy.trust_detection === true) detectionOwner ??= policy
+    else if (policy.trust_detection === false) passthroughOwner ??= policy
+  }
+  return { trusted, detectionOwner, passthroughOwner }
+})
+const ipTrustedAnywhere = computed(() => trustHitSummary.value.trusted)
 const ipHitListIds = computed(() => {
   const hit = new Set<number>()
   for (const l of ipLists.value) {
@@ -497,11 +510,8 @@ const rowView = (policy: PolicyRow): RowView => {
   }
 
   // 地域拦截维度（历史：GeoIP 策略不再误标「未启用」——明确展示地域维度）
-  let regionCount = 0
-  try {
-    const regions: unknown = JSON.parse(policy.geoip_countries ?? '[]')
-    if (Array.isArray(regions)) regionCount = regions.length
-  } catch { /* 畸形按 0 处理 */ }
+  const regions = parseIPList(policy.geoip_countries)
+  const regionCount = regions.length
   // 历史问题-1:geoip_enabled 死字段已删（X5，历史）——启用判定唯一口径
   // geoip_mode !== 'off'（后端实际下发）
   const geoActive = (policy.geoip_mode ?? 'off') !== 'off' && regionCount > 0
@@ -510,7 +520,7 @@ const rowView = (policy: PolicyRow): RowView => {
   // 模块级缓存），未命中（省份/省市联值/海外哨兵/新国名）回退原文；geoip_countries
   // 值本身零改动。
   const zh = countryZh.value
-  view.geoRegions = regionCount > 0 ? (JSON.parse(policy.geoip_countries ?? '[]') as string[]).map((r) => countryLabel(zh, r)).join('、') : ''
+  view.geoRegions = regionCount > 0 ? regions.map((r) => countryLabel(zh, r)).join('、') : ''
   if (!policy.ip_acl_enabled) {
     // ACL 未启用：如地域拦截在用则明示「地域拦截在用（本事件可来自地域）」；
     // 关联地址列表动作仍可用（关联后随 ACL 启用生效）
@@ -543,8 +553,7 @@ const rowView = (policy: PolicyRow): RowView => {
   // 全局——但后缀只对「实际命中」形态有意义（deny 命中 / allow 交集外被 id:7
   // 拒），未命中本来就不拦、allow 名单内本来合法放行，挂后缀反而误导；同时
   // 点名豁免策略（跨策略时用户需要知道去哪取消）。
-  const td1Owner = policies.value.find((p) => p.ip_whitelist_enabled && p.trust_detection === true && mergedTrustEntries(p).some((e) => entryMatchesIp(e, props.ip.trim())))
-  const td0Owner = policies.value.find((p) => p.ip_whitelist_enabled && p.trust_detection === false && mergedTrustEntries(p).some((e) => entryMatchesIp(e, props.ip.trim())))
+  const { detectionOwner: td1Owner, passthroughOwner: td0Owner } = trustHitSummary.value
   const exemptHitSuffix = td1Owner ? ` · 信任豁免中（由「${td1Owner.name}」放行）：命中不拦截，事件记为检测` : ''
   const passthruSuffix = !td1Owner && td0Owner ? ' · 信任直通中：跳过全部安全阶段，不产生事件' : ''
   if (policy.ip_acl_mode === 'deny') {

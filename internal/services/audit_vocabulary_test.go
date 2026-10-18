@@ -46,10 +46,10 @@ var auditVocabDynamicAllowlist = map[string]map[int][]string{
 	"handlers/caddy.go":                {2: {"UpdateConfig"}},
 	"handlers/cluster_registration.go": {1: {"clusterNodeAction"}},
 	"handlers/config_backup.go":        {1: {"importConfigBackupCore"}},
-	// applyLbbakWafFiles：动作透传 core 的 action（取值仅 导入/还原——历史
+	// applyLbbakWafFilesInLock：动作透传 core 的 action（取值仅 导入/还原——历史
 	// 修复还原路径归因漂移），词汇均在标准动作集内。warn 是同一 action 的
 	// 逐文件失败包装（action+"警告" ∈ 导入警告/还原警告，均 ≤4 词）。
-	"handlers/config_backup_lbbak.go": {1: {"applyLbbakWafFiles", "warn"}},
+	"handlers/config_backup_lbbak.go": {1: {"applyLbbakWafFilesInLock", "warn"}},
 	// TriggerTaskAsync 的对象（Family）由调用点字面量传入（任务监控/安全防护/
 	// 配置备份等，均 ≤5 词）；动作固定为字面量「触发」/「触发失败」。
 	"services/task_trigger.go":     {2: {"TriggerTaskAsync"}},

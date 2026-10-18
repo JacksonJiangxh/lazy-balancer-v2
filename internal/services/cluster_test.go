@@ -726,7 +726,7 @@ func TestReplaceSnapshotDB_replaces_resources_without_overwriting_role(t *testin
 		}},
 		Users:         []models.ClusterUser{{ID: 20, Username: "admin-master", PasswordHash: "hash", Role: "admin", IsEnabled: true}},
 		APIKeys:       []models.ClusterAPIKey{{ID: 30, Name: "ci", KeyHash: "key-hash", KeyPrefix: "lb_sk_master", CreatedBy: 20, IsEnabled: true}},
-		BasicSettings: models.ClusterBasicSettings{LogLevel: "debug", AccessLogJSON: true, Timezone: "Asia/Shanghai", SyncInterval: 120, ProxyDialTimeout: 8, ProxyResponseHeaderTimeout: 9, ProxyReadTimeout: 10, ProxyWriteTimeout: 11, ProxyStreamTimeout: 12, ProxyFlushInterval: 0, ProxyStreamCloseDelay: 3},
+		BasicSettings: models.ClusterBasicSettings{LogLevel: new("debug"), AccessLogJSON: new(true), Timezone: new("Asia/Shanghai"), SyncInterval: new(120), ProxyDialTimeout: new(8), ProxyResponseHeaderTimeout: new(9), ProxyReadTimeout: new(10), ProxyWriteTimeout: new(11), ProxyStreamTimeout: new(12), ProxyFlushInterval: new(0), ProxyStreamCloseDelay: new(3)},
 		CaddyConfig:   &caddyConfig,
 	}
 
@@ -766,7 +766,7 @@ func TestReplaceSnapshotDB_replaces_resources_without_overwriting_role(t *testin
 func TestReplaceSnapshotDB_clamps_invalid_jwt_expiry(t *testing.T) {
 	_, database := newClusterTestService(t)
 	for _, expiry := range []int{0, -1, 1441} {
-		snapshot := models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{JWTExpireMinutes: expiry}}
+		snapshot := models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{JWTExpireMinutes: new(expiry)}}
 		if err := replaceSnapshotDB(context.Background(), database, snapshot); err != nil {
 			t.Fatalf("replace snapshot with JWT expiry %d: %v", expiry, err)
 		}
@@ -943,7 +943,7 @@ func TestSyncService_applySnapshot_keeps_committed_snapshot_when_caddy_rejects_c
 	snapshot := v3SnapshotWithACMESection(models.ClusterSnapshot{
 		Version:       2,
 		Users:         []models.ClusterUser{{ID: 99, Username: "incoming", PasswordHash: "hash", Role: "admin", IsEnabled: true}},
-		BasicSettings: models.ClusterBasicSettings{LogLevel: "info", AccessLogJSON: true, Timezone: "Asia/Shanghai"},
+		BasicSettings: models.ClusterBasicSettings{LogLevel: new("info"), AccessLogJSON: new(true), Timezone: new("Asia/Shanghai")},
 	})
 
 	// When
@@ -984,7 +984,7 @@ func TestSyncService_applySnapshot_invalidates_cache_only_after_commit(t *testin
 	}))
 	defer caddyServer.Close()
 	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
-	snapshotA := v3SnapshotWithACMESection(models.ClusterSnapshot{Version: 1, Users: []models.ClusterUser{{ID: 1, Username: "user-a", PasswordHash: "hash", Role: "admin", IsEnabled: true}}, BasicSettings: models.ClusterBasicSettings{LogLevel: "info", Timezone: "Asia/Shanghai"}})
+	snapshotA := v3SnapshotWithACMESection(models.ClusterSnapshot{Version: 1, Users: []models.ClusterUser{{ID: 1, Username: "user-a", PasswordHash: "hash", Role: "admin", IsEnabled: true}}, BasicSettings: models.ClusterBasicSettings{LogLevel: new("info"), Timezone: new("Asia/Shanghai")}})
 	if err := syncService.applySnapshot(context.Background(), snapshotA); err != nil {
 		t.Fatalf("apply snapshot A: %v", err)
 	}
@@ -1030,7 +1030,7 @@ func TestSyncService_restart_callback_runs_when_synced_admin_TLS_changes(t *test
 	defer caddyServer.Close()
 	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
 	snapshot := v3SnapshotWithACMESection(models.ClusterSnapshot{Version: 2, BasicSettings: models.ClusterBasicSettings{
-		LogLevel: "info", AccessLogJSON: true, Timezone: "Asia/Shanghai", AdminTLSEnabled: true, AdminTLSMode: "selfsigned",
+		LogLevel: new("info"), AccessLogJSON: new(true), Timezone: new("Asia/Shanghai"), AdminTLSEnabled: new(true), AdminTLSMode: new("selfsigned"),
 	}})
 
 	// When
@@ -1223,7 +1223,9 @@ func TestClusterSnapshot_alwaysCarriesGlobalSettings(t *testing.T) {
 	if snapshot.CaddyConfig == nil {
 		t.Fatal("caddy config must always be carried (users section is always synced)")
 	}
-	if !snapshot.BasicSettings.AccessLogJSON || snapshot.BasicSettings.AccessLogFormat != "{request}" || snapshot.BasicSettings.CaddyLogLevel != "warn" {
+	if snapshot.BasicSettings.AccessLogJSON == nil || !*snapshot.BasicSettings.AccessLogJSON ||
+		snapshot.BasicSettings.AccessLogFormat == nil || *snapshot.BasicSettings.AccessLogFormat != "{request}" ||
+		snapshot.BasicSettings.CaddyLogLevel == nil || *snapshot.BasicSettings.CaddyLogLevel != "warn" {
 		t.Fatalf("access log settings must always be carried: %#v", snapshot.BasicSettings)
 	}
 }
@@ -1261,7 +1263,7 @@ func TestUpdateSnapshotSettings_preservesSlaveAccessLogSettingsWhenCaddySyncOff(
 
 	// When snapshot carries no caddy config (sync off)
 	apply(t, models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{
-		LogLevel: "debug", AccessLogJSON: true, AccessLogFormat: "master-format", JWTExpireMinutes: 20,
+		LogLevel: new("debug"), AccessLogJSON: new(true), AccessLogFormat: new("master-format"), JWTExpireMinutes: new(20),
 	}})
 
 	// Then slave-local access log settings survive, ungated settings applied
@@ -1280,11 +1282,87 @@ func TestUpdateSnapshotSettings_preservesSlaveAccessLogSettingsWhenCaddySyncOff(
 	// When snapshot carries caddy config (sync on)
 	caddyConfig := "{}"
 	apply(t, models.ClusterSnapshot{CaddyConfig: &caddyConfig, BasicSettings: models.ClusterBasicSettings{
-		AccessLogJSON: true, AccessLogFormat: "master-format", JWTExpireMinutes: 20,
+		AccessLogJSON: new(true), AccessLogFormat: new("master-format"), JWTExpireMinutes: new(20),
 	}})
 	gotJSON, gotFormat = readAccessLog(t)
 	if !gotJSON || gotFormat != "master-format" {
 		t.Fatalf("access log settings not applied with caddy sync: json=%v format=%q", gotJSON, gotFormat)
+	}
+}
+
+// 历史问题-4：旧主端 basic_settings 缺字段与显式零值不同。缺席字段必须
+// 全部跳过写入，不能将本节点现有配置清成 Go 零值。
+func TestUpdateSnapshotSettings_legacyAbsentFieldsPreserveEntireLocalRow(t *testing.T) {
+	_, database := newClusterTestService(t)
+	ctx := context.Background()
+	if _, err := database.Exec(`UPDATE global_config SET
+		log_level='warn',task_log_size_mb=77,audit_log_size_mb=78,runtime_log_size_mb=79,
+		audit_retention_months=8,jwt_expire_minutes=777,timezone='UTC',acme_email='local@example.test',
+		cert_expiry_days=44,cert_renewal_days=45,cert_renewal_attempts=6,default_ca_provider_id=88,
+		dns_provider='local-dns',dns_credentials='local-secret',sync_interval=321,
+		admin_tls_enabled=1,admin_tls_mode='upload',admin_tls_cert='local-cert',admin_tls_key='local-key',
+		mfa_write_guard=1,mfa_lockout_enabled=1,github_proxy_url='https://local.proxy',oidc_config='{"issuer":"local"}',
+		branding_json='{"app_name":"local"}',caddy_config='{"apps":{}}',access_log_json=0,
+		access_log_format='local-format',caddy_log_level='error',caddy_log_size_mb=66,
+		request_body_max_size_mb=64,http_read_timeout=61,http_write_timeout=62,http_idle_timeout=63,
+		upstream_keepalive_timeout=64,proxy_dial_timeout=65,proxy_response_header_timeout=66,
+		proxy_read_timeout=67,proxy_write_timeout=68,proxy_stream_timeout=69,proxy_flush_interval=70,
+		proxy_stream_close_delay=71,github_proxy_url='https://local.proxy',server_tokens_hidden=1,
+		trusted_proxy_enabled=1,trusted_proxy_ranges='["192.0.2.1"]',trusted_proxy_range_refs='[7]',
+		trusted_proxy_headers='["X-Local"]',trusted_proxy_strict=0
+		WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	readRow := func() string {
+		t.Helper()
+		rows, err := database.Query(`SELECT * FROM global_config WHERE id=1`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		columns, err := rows.Columns()
+		if err != nil {
+			t.Fatal(err)
+		}
+		values := make([]any, len(columns))
+		dest := make([]any, len(columns))
+		for i := range values {
+			dest[i] = &values[i]
+		}
+		if !rows.Next() {
+			t.Fatal("global_config row missing")
+		}
+		if err := rows.Scan(dest...); err != nil {
+			t.Fatal(err)
+		}
+		object := make(map[string]any, len(columns))
+		for i, column := range columns {
+			object[column] = values[i]
+		}
+		encoded, err := json.Marshal(object)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(encoded)
+	}
+	before := readRow()
+	var snapshot models.ClusterSnapshot
+	if err := json.Unmarshal([]byte(`{"basic_settings":{},"caddy_config":"{\"apps\":{}}"}`), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err := updateSnapshotSettings(ctx, tx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if after := readRow(); after != before {
+		t.Fatalf("legacy absent fields changed local global_config\nbefore=%s\nafter=%s", before, after)
 	}
 }
 

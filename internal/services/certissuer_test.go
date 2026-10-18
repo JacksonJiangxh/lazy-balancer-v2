@@ -650,6 +650,71 @@ func TestCAQueueManager_CancelJobsForRule_waits_for_fast_path_rollback(t *testin
 	}
 }
 
+func TestCertIssuer_deploymentFailed_doesNotDowngradeOutsideDeployableLifecycle(t *testing.T) {
+	for _, status := range []string{"issued", "failed", "disabled", "creating_order"} {
+		t.Run(status, func(t *testing.T) {
+			jobID, ruleID := seedCertificateJob(t, status)
+			if _, err := db.DB.Exec(`UPDATE cert_jobs SET deployment_attempts=2 WHERE id=?`, jobID); err != nil {
+				t.Fatal(err)
+			}
+			issuer := NewCertIssuer(nil)
+			issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) {
+				t.Error("non-deployable job must not schedule a retry")
+			}
+
+			_ = issuer.deploymentFailed(jobID, issuedCertificate{ruleID: ruleID, providerID: 1}, "late deployment failure", errors.New("late failure"))
+
+			var gotStatus string
+			var attempts int
+			if err := db.DB.QueryRow(`SELECT status,deployment_attempts FROM cert_jobs WHERE id=?`, jobID).Scan(&gotStatus, &attempts); err != nil {
+				t.Fatal(err)
+			}
+			if gotStatus != status || attempts != 2 {
+				t.Fatalf("late failure changed job to status=%q attempts=%d, want %q/2", gotStatus, attempts, status)
+			}
+		})
+	}
+}
+
+func TestRetryCertificateDeployment_missingExpiryRecoversFromCertificatePEM(t *testing.T) {
+	jobID, _ := seedCertificateJob(t, "downloaded")
+	useTemporaryCertDir(t)
+	notAfter := time.Now().Add(90 * 24 * time.Hour).Truncate(time.Second)
+	certPEM := testCertificatePEM(t, notAfter)
+	if _, err := db.DB.Exec(`UPDATE cert_jobs SET cert_pem=?,key_pem='stored-key',expires_at=NULL WHERE id=?`, certPEM, jobID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := retryCertificateDeployment(context.Background(), jobID, nil); err != nil {
+		t.Fatalf("retry imported downloaded job without expires_at: %v", err)
+	}
+	var status string
+	var expiresAt string
+	if err := db.DB.QueryRow(`SELECT status,COALESCE(expires_at,'') FROM cert_jobs WHERE id=?`, jobID).Scan(&status, &expiresAt); err != nil {
+		t.Fatal(err)
+	}
+	if status != "issued" || expiresAt == "" {
+		t.Fatalf("recovered job status=%q expires_at=%q, want issued with backfilled expiry", status, expiresAt)
+	}
+}
+
+func TestRetryCertificateDeployment_missingExpiryRejectsMalformedPEM(t *testing.T) {
+	jobID, _ := seedCertificateJob(t, "downloaded")
+	if _, err := db.DB.Exec(`UPDATE cert_jobs SET cert_pem='not-a-certificate',key_pem='stored-key',expires_at=NULL WHERE id=?`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := retryCertificateDeployment(context.Background(), jobID, nil); err == nil {
+		t.Fatal("malformed certificate without expires_at must fail visibly")
+	}
+	var status string
+	if err := db.DB.QueryRow(`SELECT status FROM cert_jobs WHERE id=?`, jobID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "downloaded" {
+		t.Fatalf("malformed material changed status to %q, want downloaded", status)
+	}
+}
+
 func TestCertIssuer_deploymentFailed_backs_off_and_stops_after_max_attempts(t *testing.T) {
 	// Given
 	jobID, ruleID := seedCertificateJob(t, "downloaded")

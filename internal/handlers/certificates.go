@@ -132,10 +132,8 @@ func (h *Handlers) CreateCertificateConfig(c *gin.Context) {
 		return
 	}
 
-	if req.DNSProvider == "" {
-		req.DNSProvider = "dnspod"
-	}
-
+	// B2-08（历史）：删除「空则默认 dnspod」死代码——binding:"required"
+	// 保证 dns_provider 非空，兜底不可达；缺字段请求由 400 契约拒绝。
 	provider, ok := dnsproviders.Get(req.DNSProvider)
 	if !ok {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Unknown DNS provider"})

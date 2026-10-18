@@ -137,9 +137,16 @@ func newClient(directoryURL, email, dataDir string, eab *acme.ExternalAccountBin
 
 var acmeAccountKeyMu sync.Mutex
 
+// eabKeyDigestRaw 原始 EAB key 的 sha256 摘要（空 key 亦有确定值——路径公式
+// 需要它）；历史问题-5（历史）：路径公式与元数据共用同一实现，此前两份内联
+// sha256+hex。
+func eabKeyDigestRaw(eabKey []byte) string {
+	sum := sha256.Sum256(eabKey)
+	return hex.EncodeToString(sum[:])
+}
+
 func acmeAccountKeyPath(dataDir, directoryURL, email, eabKID string, eabKey []byte) string {
-	eabKeySum := sha256.Sum256(eabKey)
-	eabKeyDigest := hex.EncodeToString(eabKeySum[:])
+	eabKeyDigest := eabKeyDigestRaw(eabKey)
 	sum := sha256.Sum256([]byte(directoryURL + "|" + email + "|" + eabKID + "|" + eabKeyDigest))
 	return filepath.Join(dataDir, "acme_accounts", hex.EncodeToString(sum[:])+".key")
 }
@@ -217,13 +224,12 @@ func loadOrCreateAccountKey(dataDir, directoryURL, email, eabKID string, eabKey 
 }
 
 // eabKeyDigestOf 计算原始 EAB key 的 sha256 摘要（与 acmeAccountKeyPath 的路径
-// 公式同源）；空 key 产空串（无 EAB 场景的元数据统一形态）。
+// 公式同源——eabKeyDigestRaw）；空 key 产空串（无 EAB 场景的元数据统一形态）。
 func eabKeyDigestOf(eabKey []byte) string {
 	if len(eabKey) == 0 {
 		return ""
 	}
-	sum := sha256.Sum256(eabKey)
-	return hex.EncodeToString(sum[:])
+	return eabKeyDigestRaw(eabKey)
 }
 
 // accountEABKeyDigest 计算 EAB HMAC 密钥摘要（无 EAB 时为空——路径公式对空 key

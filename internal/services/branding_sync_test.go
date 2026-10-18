@@ -57,8 +57,8 @@ func TestBuildSnapshot_alwaysCarriesBranding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snap.BasicSettings.BrandingJSON != `{"app_name":"Y"}` {
-		t.Errorf("BrandingJSON=%q, want mirror content always carried", snap.BasicSettings.BrandingJSON)
+	if snap.BasicSettings.BrandingJSON == nil || *snap.BasicSettings.BrandingJSON != `{"app_name":"Y"}` {
+		t.Errorf("BrandingJSON=%v, want mirror content always carried", snap.BasicSettings.BrandingJSON)
 	}
 }
 
@@ -76,7 +76,7 @@ func TestApplySnapshot_writesBrandingFileAndLanding(t *testing.T) {
 	snapshot := models.ClusterSnapshot{
 		Version: 5,
 		BasicSettings: models.ClusterBasicSettings{
-			BrandingJSON: `{"app_name":"我的网关","landing_text":"欢迎使用我的网关"}`,
+			BrandingJSON: new(`{"app_name":"我的网关","landing_text":"欢迎使用我的网关"}`),
 		},
 	}
 	snapshot.SectionHashes = ComputeSnapshotSectionHashes(&snapshot)
@@ -106,6 +106,68 @@ func TestApplySnapshot_writesBrandingFileAndLanding(t *testing.T) {
 	st2, _ := os.Stat(filepath.Join(dataDir, "branding.json"))
 	if !st2.ModTime().Equal(st.ModTime()) {
 		t.Error("unchanged branding must not rewrite file (mtime churned)")
+	}
+}
+
+// D2-历史问题：原子 rename 替换不得在原 inode 上截断写入。硬链接作为旧 inode
+// 观测点：新路径读到新内容时，旧链接必须仍保留旧字节。
+func TestMaterializeBranding_atomicReplaceDoesNotMutateExistingInode(t *testing.T) {
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, "branding.json")
+	oldContent := `{"app_name":"old","landing_text":"old"}`
+	if err := os.WriteFile(path, []byte(oldContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldLink := filepath.Join(dataDir, "branding-old-inode.json")
+	if err := os.Link(path, oldLink); err != nil {
+		t.Fatal(err)
+	}
+	newContent := `{"app_name":"new","landing_text":"new"}`
+	if err := MaterializeBranding(dataDir, newContent); err != nil {
+		t.Fatal(err)
+	}
+	gotOld, err := os.ReadFile(oldLink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotOld) != oldContent {
+		t.Fatalf("existing inode was truncated in place: %q", gotOld)
+	}
+	gotNew, err := os.ReadFile(path)
+	if err != nil || string(gotNew) != newContent {
+		t.Fatalf("new branding content=%q err=%v", gotNew, err)
+	}
+	matches, err := filepath.Glob(filepath.Join(dataDir, ".branding-*.tmp"))
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("atomic temp files remain: %v err=%v", matches, err)
+	}
+}
+
+// 历史问题-4：旧主端未携带 branding_json 时是缺席而非显式空串；
+// 本地文件与 landing 必须保留，只有非 nil 空串才执行默认模板重置。
+func TestApplySnapshot_absentLegacyBrandingPreservesLocalFile(t *testing.T) {
+	_, database := newClusterTestService(t)
+	dataDir := t.TempDir()
+	custom := `{"app_name":"local","landing_text":"local-landing"}`
+	if err := os.WriteFile(filepath.Join(dataDir, "branding.json"), []byte(custom), 0644); err != nil {
+		t.Fatal(err)
+	}
+	defer SetDefaultLandingBody(DefaultLandingText)
+	injectLandingFromBranding(custom)
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer caddyServer.Close()
+	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL, DataDir: dataDir}, NewCaddyService(caddyServer.URL))
+	snapshot := models.ClusterSnapshot{Version: 5}
+	snapshot.SectionHashes = ComputeSnapshotSectionHashes(&snapshot)
+	if err := syncService.applySnapshot(context.Background(), snapshot); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(dataDir, "branding.json"))
+	if err != nil || string(content) != custom {
+		t.Fatalf("legacy absent branding replaced local file=%q err=%v", content, err)
+	}
+	if got := DefaultLandingBody(); got != "local-landing" {
+		t.Fatalf("legacy absent branding reset landing=%q", got)
 	}
 }
 
@@ -189,7 +251,7 @@ func TestUpdateSnapshotSettings_mirrorsBrandingColumn(t *testing.T) {
 		}
 	}
 	apply(models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{
-		BrandingJSON: `{"app_name":"我的网关"}`, JWTExpireMinutes: 20,
+		BrandingJSON: new(`{"app_name":"我的网关"}`), JWTExpireMinutes: new(20),
 	}})
 	var mirrored string
 	if err := database.QueryRow(`SELECT COALESCE(branding_json,'') FROM global_config WHERE id=1`).Scan(&mirrored); err != nil || mirrored != `{"app_name":"我的网关"}` {
@@ -197,7 +259,7 @@ func TestUpdateSnapshotSettings_mirrorsBrandingColumn(t *testing.T) {
 	}
 	// 主端镜像清空(文件缺失形态)同样传播——空串是合法收敛值。
 	apply(models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{
-		BrandingJSON: "", JWTExpireMinutes: 20,
+		BrandingJSON: new(""), JWTExpireMinutes: new(20),
 	}})
 	if err := database.QueryRow(`SELECT COALESCE(branding_json,'') FROM global_config WHERE id=1`).Scan(&mirrored); err != nil || mirrored != "" {
 		t.Fatalf("cleared mirror=%q err=%v, want empty", mirrored, err)

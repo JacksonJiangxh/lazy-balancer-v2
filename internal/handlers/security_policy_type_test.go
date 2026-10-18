@@ -23,6 +23,7 @@ import (
 func TestCreateSecurityPolicy_explicitTypeNormalizesOutOfStageFields(t *testing.T) {
 	// Given：显式 stage1 但携带 WAF/限流内容
 	setupSecurityPolicyTestDB(t)
+	useCRSRuleIndexFixture(t)
 	router := newSecurityRouter(t)
 	body := `{"name":"typed-acl","policy_type":"stage1","mode":"blocking","crs_rule_groups":"[\"42\"]",
 		"custom_rules":"[1]","rate_limit_enabled":true,"rate_limit_rps":100,

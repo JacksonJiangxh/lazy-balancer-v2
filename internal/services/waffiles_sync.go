@@ -323,6 +323,14 @@ func BuildWafFileBundle() *WafFileBundle {
 	return bundle
 }
 
+// BuildWafFileBundleInLock 是 BuildWafFileBundle 的「调用方已持 WafFileLock」
+// 变体：供需要在同一临界区内同时冻结 DB 快照与文件 bundle 的调用方使用
+// （lbbak 导出）。契约：调用方必须先 WafFileLock().Lock()，本函数不自锁。
+func BuildWafFileBundleInLock() *WafFileBundle {
+	bundle, _ := buildWafFileBundleLocked()
+	return bundle
+}
+
 // wafFilesRefDiffers reports whether the slave's live files fail to match
 // any artifact referenced by the snapshot.
 // rewriteVersionIfMissingOrStale 保证 .version 与主节点声明的 tag 一致（历史问题 A-#4）：

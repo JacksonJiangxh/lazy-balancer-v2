@@ -692,11 +692,12 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 type autobanReloadState int
 
 const (
-	autobanReloadNone       autobanReloadState = iota // 无名单变化，未请求收敛
-	autobanReloadApplied                              // 已重载（全量链收敛）
-	autobanReloadHotApplied                           // 投影热路径收敛（零重载，匹配器 ≤1s 热感知）
-	autobanReloadDeferred                             // 节流窗口内，暂存至下一轮合并执行（仅全量重载回退路径）
-	autobanReloadErrored                              // 全量重载失败（已留审计+置暂存再武装）
+	autobanReloadNone         autobanReloadState = iota // 无名单变化，未请求收敛
+	autobanReloadApplied                                // 已重载（全量链收敛）
+	autobanReloadHotApplied                             // 投影热路径收敛（零重载，匹配器 ≤1s 热感知）
+	autobanReloadUnreferenced                           // 名单无发射面引用，零重载
+	autobanReloadDeferred                               // 节流窗口内，暂存至下一轮合并执行（仅全量重载回退路径）
+	autobanReloadErrored                                // 全量重载失败（已留审计+置暂存再武装）
 )
 
 // autobanMarkReloadFailed 重载失败统一处置（D4，镜像 threat_reload_pending）：
@@ -741,7 +742,13 @@ func autobanListHotPathEligible(listID int64) bool {
 // 调用契约（AU-1）：调用方已持 CaddyOpLock（merge 读改写+收敛同一临界区），
 // 本函数不得再取锁。
 func autobanConvergeLocked(reason string, listID int64) autobanReloadState {
-	if autobanProjectionRefresher != nil && autobanListHotPathEligible(listID) {
+	if !autobanListHotPathEligible(listID) {
+		// 查询/解析失败在资格门内按被引用处理，因此 false 是确定的
+		// 无引用：没有任何发射面消费该名单，DB 更新无需 /load 或投影重写。
+		Logf("info", "自动封禁名单未被任何启用策略、受信代理或 CRS 排除引用，跳过收敛重载")
+		return autobanReloadUnreferenced
+	}
+	if autobanProjectionRefresher != nil {
 		hot, err := autobanProjectionRefresher()
 		if err == nil && hot == ProjectionConverged {
 			Logf("info", "自动封禁名单变化经投影热路径收敛（零 Caddy 重载，匹配器 ≤1s 热感知生效）")
@@ -978,6 +985,8 @@ func reloadNote(changed bool, state autobanReloadState) string {
 	switch state {
 	case autobanReloadHotApplied:
 		return "（投影热路径收敛，零重载）"
+	case autobanReloadUnreferenced:
+		return "（名单未被引用，零重载）"
 	case autobanReloadApplied:
 		return "（已重载）"
 	case autobanReloadDeferred:

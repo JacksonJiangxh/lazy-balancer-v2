@@ -64,7 +64,7 @@ func TestUpdateSnapshotSettings_autoBackupSettingsAppliedWhenPresent(t *testing.
 		t.Fatal(err)
 	}
 	if err := updateSnapshotSettings(ctx, tx, models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{
-		JWTExpireMinutes:    20,
+		JWTExpireMinutes:    new(20),
 		AutoBackupEnabled:   &enabled,
 		AutoBackupFrequency: &freq,
 		AutoBackupTime:      &tm,
@@ -109,7 +109,7 @@ func TestUpdateSnapshotSettings_autoBackupSettingsAbsentPreservesLocal(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateSnapshotSettings(ctx, tx, models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{JWTExpireMinutes: 20}}); err != nil {
+	if err := updateSnapshotSettings(ctx, tx, models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{JWTExpireMinutes: new(20)}}); err != nil {
 		t.Fatalf("apply settings: %v", err)
 	}
 	if err := tx.Commit(); err != nil {

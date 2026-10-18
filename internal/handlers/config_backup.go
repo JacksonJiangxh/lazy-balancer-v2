@@ -25,6 +25,11 @@ import (
 
 var configBackupTables = []string{"lb_rules", "upstreams", "path_rules", "users", "api_keys", "ca_providers", "certificate_configs", "cert_jobs", "security_policies", "security_policy_bindings", "security_custom_rules", "security_block_pages", "security_ip_lists", "security_crs_version", "security_ip2region_version", "security_threat_sources", "security_crawler_sources"}
 
+// importVersionSeedSentinel 标记本次导入为「未导入版本表且导入前无行」临时
+// 插入的占位行：rearm 看到 id=1 已存在便不再补真实种子；提交后仅以该哨兵
+// 版本+CAS 条件删除，绝不按「导入前不存在」的无条件 DELETE 误删并发更新行。
+const importVersionSeedSentinel = "__lazy_balancer_import_seed__"
+
 // SEM44-1(历史 历史问题):迟到表容缺清单——Version=2 导出清单首发(ff632cd,
 // v2.0.10,8 表)与安全族并入(4e46f85,v2.1.1,12 表)之后才加入导出清单的表:
 //
@@ -182,6 +187,18 @@ const (
 )
 
 var requeueNonTerminalCertJobs = services.RequeueNonTerminalCertJobs
+
+// configImportBeforeLock 仅测试注入：在导入取得 caddyOpMu/开启事务前触发，
+// 用于构造「预锁读与加锁之间 live 状态变化」的 TOCTOU 回归。
+var configImportBeforeLock func()
+
+// configBackupExportAfterDBSnapshot 仅测试注入：DB 快照读取完成、WAF bundle
+// 构建之前触发，用于断言文件锁在快照期间已持有（历史问题 原子性）。
+var configBackupExportAfterDBSnapshot func()
+
+// invalidateImportTaskLogCache 测试缝：导入落库 task_log_size_mb 后必须立即
+// 失效服务端 5 分钟 TTL 缓存。
+var invalidateImportTaskLogCache = services.InvalidateTaskLogSizeCache
 
 // 历史问题 新发现#1：备份 schema 布尔列全量枚举（校验门与恢复归一双侧共用）。
 // 类型绕过的影响面是整个枚举而非单个字段——校验侧 backupBooleanEnabled 此前
@@ -1435,11 +1452,18 @@ func validateV2BackupTLSShapeSoft(tables map[string][]map[string]any, softLiveAC
 func validateV2BackupCertJobs(tables map[string][]map[string]any) error {
 	jobsByRule := make(map[string][]string)
 	for _, job := range tables["cert_jobs"] {
+		domain := backupString(job["domain"])
+		if canonical, err := services.CanonicalACMEDomains(domain); err == nil {
+			// 持久化与运行期查找共用排序规范形式；非法形态留给下方启用 ACME
+			// 不变量按既有错误口径拒绝，禁用/历史行保持原容错语义。
+			job["domain"] = canonical
+			domain = canonical
+		}
 		if backupString(job["status"]) == "disabled" {
 			continue
 		}
 		if ruleID, ok := job["rule_id"].(string); ok && ruleID != "" {
-			jobsByRule[ruleID] = append(jobsByRule[ruleID], backupString(job["domain"]))
+			jobsByRule[ruleID] = append(jobsByRule[ruleID], domain)
 		}
 	}
 	for index, rule := range tables["lb_rules"] {
@@ -2022,6 +2046,12 @@ func validateV2BackupTrustedProxyConfig(config map[string]any, tables map[string
 func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]map[string]any) error {
 	if config == nil {
 		return nil
+	}
+	if raw, exists := config["sync_interval"]; exists && raw != nil {
+		value, ok := backupInteger(raw)
+		if !ok || value < 10 || value > 86400 {
+			return fmt.Errorf("备份的 sync_interval 必须是 10 到 86400 之间的整数")
+		}
 	}
 	if raw, exists := config["timezone"]; exists && raw != nil {
 		tz := backupString(raw)
@@ -2710,6 +2740,38 @@ func clampBackupConfigInts(config map[string]any) []string {
 	return notes
 }
 
+// installImportVersionSentinels 在导入事务内为「未导入且导入前无行」的版本表
+// 写入临时哨兵行（auto_update=0），阻止提交后的首槽 rearm 补真实种子行。
+func installImportVersionSentinels(ctx context.Context, tx *sql.Tx, tables map[string][]map[string]any, libraryImported bool, existedBefore map[string]bool) error {
+	if !libraryImported {
+		return nil
+	}
+	for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
+		if _, imported := tables[table]; imported || existedBefore[table] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO `+table+` (id, version, auto_update) VALUES (1, ?, 0)`, importVersionSeedSentinel); err != nil {
+			return fmt.Errorf("写入 %s 导入占位行: %w", table, err)
+		}
+	}
+	return nil
+}
+
+// removeImportVersionSentinel 仅删除本次导入写入且仍保持哨兵形态的行——任何
+// 并发更新（版本/开关/状态/排程变化）都会使 CAS 条件失配，行保留给真实写者。
+func removeImportVersionSentinel(ctx context.Context, table string) (bool, error) {
+	result, err := db.DB.ExecContext(ctx, `DELETE FROM `+table+` WHERE id=1 AND version=? AND COALESCE(auto_update,1)=0
+		AND COALESCE(next_update,'')='' AND COALESCE(update_status,'') IN ('','idle')`, importVersionSeedSentinel)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
 // errUnknownBackupSection:buildLbbakExport 的 4xx 语义哨兵——薄壳端点据此
 // 保持原 400 文案,其余错误一律 500「导出失败: …」。三分类合并后
 // 「仅全局配置」形态不可达(global_config 是 users 别名,恒有表),
@@ -2738,6 +2800,13 @@ func (h *Handlers) buildLbbakExport(ctx context.Context, sel []string) (payload 
 		Sections: exportedSections,
 		Meta:     configBackupMeta{App: "lazy-balancer-v2", Version: 2, ExportedAt: time.Now().UTC().Format(time.RFC3339)},
 		Tables:   map[string][]map[string]any{},
+	}
+	// 历史问题-5：DB 快照与 WAF 文件 bundle 必须来自同一稳定代。锁序
+	// wafFileMu→DB 与 CRS/威胁库更新器一致（写者在同一锁内写文件与版本行）。
+	wafFilePhase := sectionTables["security_crs_version"]
+	if wafFilePhase {
+		services.WafFileLock().Lock()
+		defer services.WafFileLock().Unlock()
 	}
 	tx, err := db.DB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
@@ -2775,6 +2844,9 @@ func (h *Handlers) buildLbbakExport(ctx context.Context, sel []string) (payload 
 	if err := tx.Commit(); err != nil {
 		return nil, nil, "", false, err
 	}
+	if configBackupExportAfterDBSnapshot != nil {
+		configBackupExportAfterDBSnapshot()
+	}
 	// v2.3.0(用户裁定 2026-09-18):导出恒为 lbbak tar.gz 包——勾选「规则库
 	// 数据库」时附 CRS/IP2Region 文件本体,未勾选时仅 config.json;纯 JSON 仅作
 	// 旧备份导入兼容,不再产出。
@@ -2783,8 +2855,8 @@ func (h *Handlers) buildLbbakExport(ctx context.Context, sel []string) (payload 
 		return nil, nil, "", false, err
 	}
 	var bundle *services.WafFileBundle
-	if sectionTables["security_crs_version"] {
-		bundle = services.BuildWafFileBundle()
+	if wafFilePhase {
+		bundle = services.BuildWafFileBundleInLock()
 	}
 	payload, err = buildLbbakPayload(backupJSON, bundle)
 	if err != nil {
@@ -3143,13 +3215,40 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		operatorReplaced = true
 		recordAudit(c, action+"警告", "配置备份", "备份不含当前操作账户——系统数据将被替换，"+action+"后请使用备份内的管理员账户登录")
 	}
+	// CERT41-1 反向:导规则不导 cert 配置且备份从未携带 cert 表时,上方 TLS
+	// 形态软校验已计数悬挂引用——降级警告进审计(与 历史问题 同格,不阻断)。
+	if acmeDanglingImported > 0 {
+		recordAudit(c, action+"警告", "配置备份", fmt.Sprintf(action+"后 %d 条启用 ACME 规则的提供商引用悬挂(引用未随备份导入且现有配置缺失)——下一次签发/续签将失败,请补齐 DNS 提供商配置", acmeDanglingImported))
+	}
 	// 历史问题:「系统数据」替换 ACME 配置表时,live 启用规则的引用可能悬挂
 	// (与 历史问题 删除 409 守卫同果)——预检并降级警告(不阻断,尊重用户选择)。
-	// 历史问题-F1:lb_rules 同批替换时跳过预检——预检读的是「导入前」live 规则,
-	// 这些规则马上被备份规则整体替换,恒误报。
+	// 历史问题-F1:lb_rules 同批替换时跳过预检。预检必须读加锁后的事务视图：
+	// 锁外读会在「读→取得 caddyOpMu」窗口与规则更新竞态（历史问题-2）。
 	acmeDanglingRules := 0
+	// 历史问题：导入前快照自动备份开关——提交后仅在 off→on 转换时重置水位线。
+	oldAutoBackupEnabled := 0
+	// 历史问题 配套：两版本表单行是否存在同样在加锁后的同一事务快照内读取。
+	versionRowExistedBefore := map[string]bool{}
+	// 历史问题-1：文件相位先行取 wafFileMu，再开 DB 事务——与 CRS/威胁库更新器
+	// 的 WAF→DB 锁序一致，消除事务→wafFileMu 的 AB-BA。无 WAF 文件时不取锁。
+	wafFilePhase := sectionTables["security_crs_version"] && lbbakFiles != nil &&
+		(lbbakFiles.CRSTarGz != nil || lbbakFiles.Xdb != nil || len(lbbakFiles.ThreatIplists) > 0)
+	if wafFilePhase {
+		services.WafFileLock().Lock()
+		defer services.WafFileLock().Unlock()
+	}
+	if configImportBeforeLock != nil {
+		configImportBeforeLock()
+	}
+	session, err := h.beginConfigImport(ctx)
+	if err != nil {
+		respondImportBeginError(c, err)
+		return
+	}
+	defer session.close()
+	tx := session.tx
 	if (sectionTables["certificate_configs"] || sectionTables["ca_providers"]) && !sectionTables["lb_rules"] {
-		if rows, qerr := db.DB.Query(`SELECT COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0) FROM lb_rules WHERE enabled=1 AND tls_source='acme_dns'`); qerr == nil {
+		if rows, qerr := tx.QueryContext(ctx, `SELECT COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0) FROM lb_rules WHERE enabled=1 AND tls_source='acme_dns'`); qerr == nil {
 			for rows.Next() {
 				var acmeID, caID int
 				if rows.Scan(&acmeID, &caID) != nil {
@@ -3167,35 +3266,18 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	if acmeDanglingRules > 0 {
 		recordAudit(c, action+"警告", "配置备份", fmt.Sprintf(action+"后 %d 条启用 ACME 规则的提供商引用悬挂——下一次签发/续签将失败,请补齐 DNS 提供商配置", acmeDanglingRules))
 	}
-	// CERT41-1 反向:导规则不导 cert 配置且备份从未携带 cert 表时,上方 TLS
-	// 形态软校验已计数悬挂引用——降级警告进审计(与 历史问题 同格,不阻断)。
-	if acmeDanglingImported > 0 {
-		recordAudit(c, action+"警告", "配置备份", fmt.Sprintf(action+"后 %d 条启用 ACME 规则的提供商引用悬挂(引用未随备份导入且现有配置缺失)——下一次签发/续签将失败,请补齐 DNS 提供商配置", acmeDanglingImported))
-	}
-	// 历史问题：导入前快照自动备份开关——提交后仅在 off→on 转换时重置水位线。
-	var oldAutoBackupEnabled int
 	if db.DB != nil {
-		_ = db.DB.QueryRow(`SELECT COALESCE(auto_backup_enabled,0) FROM global_config WHERE id=1`).Scan(&oldAutoBackupEnabled)
+		_ = tx.QueryRowContext(ctx, `SELECT COALESCE(auto_backup_enabled,0) FROM global_config WHERE id=1`).Scan(&oldAutoBackupEnabled)
 	}
-	// 历史问题 配套：记录两版本表单行在导入前是否存在——重装首槽会为缺行补
-	// 种子行，导入未携带该表时必须撤销「本次新补」的种子，但不能删除本地
-	// 既有行（分类/纯 JSON 导入的「保留本地」语义）。
-	versionRowExistedBefore := map[string]bool{}
-	if db.DB != nil {
-		for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
-			var count int
-			if err := db.DB.QueryRow("SELECT COUNT(*) FROM " + table + " WHERE id=1").Scan(&count); err == nil {
-				versionRowExistedBefore[table] = count > 0
-			}
+	for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE id=1").Scan(&count); err == nil {
+			versionRowExistedBefore[table] = count > 0
+		} else {
+			// 读失败按「既有行」保守处理：不得让清理误删无法确认归属的行。
+			versionRowExistedBefore[table] = true
 		}
 	}
-	session, err := h.beginConfigImport(ctx)
-	if err != nil {
-		respondImportBeginError(c, err)
-		return
-	}
-	defer session.close()
-	tx := session.tx
 	// W2：security_ip_lists 先删/先插 security_policies——refs 是策略行上的
 	// JSON 引用（无外键，顺序本自由），固定 lists→policies 与集群 apply 侧
 	// 一致，保证插入后引用即时指向存在行。
@@ -3482,7 +3564,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	// 热换内存缓存(完整更新流程,2026-09-18 用户裁定)。
 	wafApply := lbbakWafApplyResult{}
 	if lbbakFiles != nil && sectionTables["security_crs_version"] {
-		wafApply = applyLbbakWafFiles(c, action, lbbakFiles, services.SanitizeBundleVersion(ip2regionTagFromBackup(backup.Tables)))
+		wafApply = applyLbbakWafFilesInLock(c, action, lbbakFiles, services.SanitizeBundleVersion(ip2regionTagFromBackup(backup.Tables)))
 		// 历史问题：未落盘文件对应版本记录在提交前同批丢弃（此前失败仍 commit
 		// 版本行——记录与文件分裂且响应谎报更新成功）。
 		for _, item := range []struct {
@@ -3535,10 +3617,17 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	}
 	_, crsVersionImported := backup.Tables["security_crs_version"]
 	_, ip2RegionVersionImported := backup.Tables["security_ip2region_version"]
+	rearmSecurityLibrarySlots := securityLibraryTablesImported || backup.Config != nil
+	if err := installImportVersionSentinels(ctx, tx, backup.Tables, rearmSecurityLibrarySlots, versionRowExistedBefore); err != nil {
+		err = session.abort(err)
+		recordAudit(c, action+"失败", "配置备份", err.Error())
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
+		return
+	}
 	if err := session.commit(affectedRuleIDs, pendingCertificates); err != nil {
 		status := http.StatusInternalServerError
 		message := "配置" + action + "失败: " + err.Error()
-		if importFailurePhase(err) == importPhaseCaddy {
+		if importFailureCaddyRejected(err) {
 			status = http.StatusBadRequest
 			message = "备份生成的配置未通过 Caddy 验证，未执行" + action + ": " + err.Error()
 		}
@@ -3628,6 +3717,8 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	// 历史问题：提交后立即应用运行期设置（此前导入只 SyncBusinessTaskDrivers
 	// + 清缓存，log_level 变更要等重启；管理面板 HTTPS 变更需重启才能生效）。
 	services.ApplyLogLevel()
+	// 历史问题：导入可改 task_log_size_mb——服务端 5 分钟 TTL 缓存必须立即失效。
+	invalidateImportTaskLogCache()
 	adminTLSRestartWarning := ""
 	if services.RuntimeAdminTLSChanged(services.LoadAdminTLSConfig()) {
 		adminTLSRestartWarning = "管理面板 HTTPS 配置已" + action + "，需重启后生效（当前进程继续使用启动时的证书）"
@@ -3736,18 +3827,25 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	// 历史问题：四族规则库（CRS/IP2Region/威胁库/爬虫库）的「启用且空槽」
 	// 行重新武装首槽——导入替换了版本表行，不重装则 NextSlotFn 永不到期，
 	// 自动更新静默停摆直到重启。
-	if securityLibraryTablesImported {
+	if rearmSecurityLibrarySlots {
 		services.RearmSecurityLibrarySlots()
-		// rearm 会为单行版本表补种子行（启动武装语义）；本次导入明确跳过版本
-		// 表（无文件=记录与文件分叉）时撤销该种子行，维持「未导入=零行」。
-		if !crsVersionImported && !versionRowExistedBefore["security_crs_version"] {
-			if _, err := db.DB.Exec(`DELETE FROM security_crs_version WHERE id=1`); err != nil {
-				services.Logf("warn", "配置导入：撤销 CRS 版本种子行失败: %v", err)
+		// rearm 对临时哨兵行不补槽（auto_update=0）；提交后仅在哨兵形态未变
+		// 时 CAS 删除，维持「未导入=零行」且绝不覆盖并发真实更新。
+		for _, item := range []struct {
+			table    string
+			imported bool
+		}{
+			{"security_crs_version", crsVersionImported},
+			{"security_ip2region_version", ip2RegionVersionImported},
+		} {
+			if item.imported || versionRowExistedBefore[item.table] {
+				continue
 			}
-		}
-		if !ip2RegionVersionImported && !versionRowExistedBefore["security_ip2region_version"] {
-			if _, err := db.DB.Exec(`DELETE FROM security_ip2region_version WHERE id=1`); err != nil {
-				services.Logf("warn", "配置导入：撤销 IP2Region 版本种子行失败: %v", err)
+			removed, err := removeImportVersionSentinel(ctx, item.table)
+			if err != nil {
+				services.Logf("warn", "配置导入：撤销 %s 版本种子行失败: %v", item.table, err)
+			} else if !removed {
+				services.Logf("info", "配置导入：%s 占位行已被并发更新，保留该行", item.table)
 			}
 		}
 	}

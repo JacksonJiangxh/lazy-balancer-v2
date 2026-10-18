@@ -16,7 +16,7 @@ import {
 } from '@/utils/threatProjection'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
-import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts } from '@/utils/threatShared'
+import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, POINTY_TOP_HEX_VERTICES, drillCountryAllowed } from '@/utils/threatShared'
 import { COUNTRY_CENTROIDS, FALLBACK_CENTROID, type Centroid } from '@/utils/countryCentroids'
 import { loadAdmin1Tables } from '@/utils/admin1Loader'
 import { FLOW_ATTACK_COLOR as ATTACK_COLOR, FLOW_NORMAL_COLOR as NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowAttackWidth, flowNormalWidth } from '@/utils/threatTheme'
@@ -66,7 +66,6 @@ export interface ThreatSceneOptions {
 }
 
 export interface ThreatScene {
-  addArc(origin: Centroid): void
   addArcForLocation(ipLocation: string, weight?: number): void
   /** 正常请求光流（固定青色；逐请求事件流消费）。 */
   addNormalArcForLocation(ipLocation: string, weight?: number): void
@@ -77,10 +76,6 @@ export interface ThreatScene {
   zoomOut(): void
   /** 复位视角（总览/本站居中，600ms）。 */
   resetView(): void
-  /** 程序化启停交互（验证接缝；禁用时点击拾取仍工作）。 */
-  setControlsEnabled(enabled: boolean): void
-  /** 拾取诊断：屏幕坐标 → 命中国家（null=未命中）。 */
-  pickCountryAt(clientX: number, clientY: number): string | null
   /** 相机状态（诊断；cx/cy 为地理坐标中心）。 */
   cameraState(): { zoom: number; cx: number; cy: number; dist: number; pos: [number, number, number] }
   setPaused(paused: boolean): void
@@ -156,8 +151,7 @@ function makeLabelElement(text: string, color: string): HTMLDivElement {
 
 export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOptions): ThreatScene {
   const onDrillChange = opts?.onDrillChange
-  let sawServerConfig = !!opts?.serverCentroid
-  let siteConfigured = opts?.siteConfigured ?? sawServerConfig
+  let siteConfigured = opts?.siteConfigured ?? !!opts?.serverCentroid
   let server: Centroid = opts?.serverCentroid ?? [0, (LAT_TOP + LAT_BOTTOM) / 2]
 
   // ---- 基建 ----
@@ -225,11 +219,16 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
    * 2026-10-17：地图点阵改成地球页面的六边形样式，替代圆点）。 */
   function dotPath(ctx2: CanvasRenderingContext2D, x: number, y: number, r: number): void {
     ctx2.beginPath()
-    ctx2.arc(x, y, r, 0, Math.PI * 2)
+    dotSubPath(ctx2, x, y, r)
   }
-  function dotSubPath(path: Path2D, x: number, y: number, r: number): void {
-    path.moveTo(x + r, y)
-    path.arc(x, y, r, 0, Math.PI * 2)
+  function dotSubPath(path: CanvasRenderingContext2D | Path2D, x: number, y: number, r: number): void {
+    const first = POINTY_TOP_HEX_VERTICES[0]
+    path.moveTo(x + first[0] * r, y + first[1] * r)
+    for (let i = 1; i < POINTY_TOP_HEX_VERTICES.length; i++) {
+      const vertex = POINTY_TOP_HEX_VERTICES[i]
+      path.lineTo(x + vertex[0] * r, y + vertex[1] * r)
+    }
+    path.closePath()
   }
   interface Dot { lon: number; lat: number; key: string }
   function inCountryBbox(i: number, lon: number, lat: number): boolean {
@@ -499,7 +498,6 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   // ---- 交互 ----
-  let controlsEnabled = true
   let dragging = false
   let dragMoved = false
   let dragLast: Centroid2D | null = null
@@ -511,7 +509,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   function onPointerDown(event: PointerEvent): void {
-    if (!controlsEnabled || event.button !== 0) return
+    if (event.button !== 0) return
     dragging = true
     dragMoved = false
     dragLast = canvasPoint(event)
@@ -521,7 +519,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
 
   function onPointerMove(event: PointerEvent): void {
     const p = canvasPoint(event)
-    if (dragging && dragLast && controlsEnabled) {
+    if (dragging && dragLast) {
       const dx = p.x - dragLast.x
       const dy = p.y - dragLast.y
       if (Math.abs(p.x - (dragStart?.x ?? 0)) + Math.abs(p.y - (dragStart?.y ?? 0)) > 4) dragMoved = true
@@ -542,7 +540,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   function onClick(event: MouseEvent): void {
-    if (!controlsEnabled || dragMoved) {
+    if (dragMoved) {
       dragMoved = false
       return
     }
@@ -560,7 +558,6 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   function onWheel(event: WheelEvent): void {
     // v2.3.8（用户裁定 2026-10-17）：滚轮不参与缩放——地图尺寸由总览/下钻
     // 视图固定，缩放仅经点击下钻/返回流程控制。
-    if (!controlsEnabled) return
     event.preventDefault()
   }
 
@@ -620,6 +617,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
 
   async function drillToCountry(country: string): Promise<void> {
     country = normalizeCountryName(country)
+    if (!drillCountryAllowed(opts?.drillCountries, country)) return
     const c = THREAT_COUNTRIES.find((x) => x.name === country)
     if (!c) return
     const seq = ++drillSeq
@@ -1099,10 +1097,6 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   return {
-    addArc(origin: Centroid): void {
-      spawnArc(origin, false)
-      startLoop()
-    },
     addArcForLocation(ipLocation: string, weight = 1): void {
       if (!ipLocation) return
       const [country, province] = ipLocation.split('·')
@@ -1155,14 +1149,19 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       startLoop()
     },
     setServer(centroid: Centroid | null): void {
-      if (centroid && !sawServerConfig) {
-        sawServerConfig = true
-        siteConfigured = true
-        server = [centroid[0], centroid[1]]
+      if (!centroid) return
+      const changed = !siteConfigured || server[0] !== centroid[0] || server[1] !== centroid[1]
+      siteConfigured = true
+      server = [centroid[0], centroid[1]]
+      // 与地球引擎一致：每次坐标变更都更新信标/弧线/返回视角；总览随新站
+      // 坐标居中，下钻态保持用户当前取景。相同坐标重放不重置平移视角。
+      if (changed && !drillLayerCountry) {
         cam.camX = server[0]
         cam.camY = latToY(server[1])
-        startLoop()
+        staticDirty = true
       }
+      if (paused) renderOnce()
+      else startLoop()
     },
     zoomOut(): void {
       drillSeq += 1
@@ -1174,21 +1173,6 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       drillSeq += 1
       clearProvinceLayer()
       flyToOverview()
-    },
-    setControlsEnabled(enabled: boolean): void {
-      controlsEnabled = enabled
-      if (!enabled) {
-        dragging = false
-        dragLast = null
-      }
-    },
-    pickCountryAt(clientX: number, clientY: number): string | null {
-      const rect = canvas.getBoundingClientRect()
-      const geo = screenToLonLat(clientX - rect.left, clientY - rect.top, cam)
-      for (const country of THREAT_COUNTRIES) {
-        if (pointInPolys(geo.lon, geo.lat, country.polys)) return country.name
-      }
-      return null
     },
     cameraState(): { zoom: number; cx: number; cy: number; dist: number; pos: [number, number, number] } {
       return {

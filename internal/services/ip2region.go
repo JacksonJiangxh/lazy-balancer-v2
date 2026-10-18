@@ -547,7 +547,11 @@ var (
 )
 
 func getCachedRegionTree() *IP2RegionRegionTree {
-	data, err := os.ReadFile(ip2RegionLivePathForTreeCache())
+	return readRegionTreeCache(ip2RegionLivePathForTreeCache())
+}
+
+func readRegionTreeCache(path string) *IP2RegionRegionTree {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
@@ -563,7 +567,7 @@ func ip2RegionLivePathForTreeCache() string { return ip2regionLivePath + ".regio
 // staleRegionTreeCache 缓存过期判定：缺失、解析失败，或仍含 ASCII 城市/
 // 省名（拼音规范化落地前的旧产物；「海外」除外）。
 func staleRegionTreeCache(path string) bool {
-	tree := getCachedRegionTree()
+	tree := readRegionTreeCache(path)
 	if tree == nil {
 		return true
 	}

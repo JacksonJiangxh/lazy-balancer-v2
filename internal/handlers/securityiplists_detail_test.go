@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -175,6 +177,11 @@ func TestGetIPList_systemListReadsIplistFile(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE system=1 AND name=?`, db.ThreatListNameBySource("ustc")).Scan(&id); err != nil {
 		t.Fatalf("种子威胁名单缺失: %v", err)
 	}
+	// category 可被历史/带外数据改写，且 DB entries 可能是陈旧值；详情路由
+	// 必须按名单名→威胁源，而不是 category 或 DB 残留条目。
+	if _, err := db.DB.Exec(`UPDATE security_ip_lists SET category='搜索引擎爬虫', entries='[{"value":"9.9.9.9"}]' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
 	gin.SetMode(gin.TestMode)
 	h := &Handlers{}
 	router := gin.New()
@@ -202,6 +209,34 @@ func TestGetIPList_systemListReadsIplistFile(t *testing.T) {
 	}
 	if !strings.Contains(resp2.Body.String(), `"entry_count":0`) {
 		t.Fatalf("文件缺失 entry_count=0: %s", resp2.Body.String()[:min(300, len(resp2.Body.String()))])
+	}
+}
+
+func TestExportIPList_threatUsesFileTruth(t *testing.T) {
+	newBackupTestHandlers(t)
+	wafDir := t.TempDir()
+	restoreWaf := services.OverrideThreatWafDirForTest(wafDir)
+	defer restoreWaf()
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("192.0.2.0/24\n198.51.100.7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var id int64
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE system=1 AND name=?`, db.ThreatListNameBySource("ustc")).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE security_ip_lists SET entries='[{"value":"9.9.9.9","remark":"stale"}]' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists/:id/export", h.ExportIPList)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/ip-lists/"+strconv.FormatInt(id, 10)+"/export", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if got, want := resp.Body.String(), "192.0.2.0/24\n198.51.100.7\n"; got != want {
+		t.Fatalf("threat export=%q, want file truth %q (stale DB entries must be ignored)", got, want)
 	}
 }
 
@@ -239,6 +274,28 @@ func TestListIPLists_emptyEntriesOnSystemRows(t *testing.T) {
 				t.Fatalf("威胁库 entry_count 须取自 threat_sources: got %v want 14189", row["entry_count"])
 			}
 		}
+	}
+}
+
+func TestListIPLists_threatCountScanFailureWarns(t *testing.T) {
+	newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET entry_count='not-a-number' WHERE name='ustc'`); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	oldOutput := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldOutput) })
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists", h.ListIPLists)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/ip-lists", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("auxiliary count scan failure should retain degraded 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(logs.String(), "威胁库条数扫描失败") {
+		t.Fatalf("scan failure must be visible, logs=%q", logs.String())
 	}
 }
 

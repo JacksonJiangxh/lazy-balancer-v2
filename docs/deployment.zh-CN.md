@@ -22,7 +22,7 @@
 | `JWT_SECRET` | 自动生成 | JWT 签名密钥；生产建议显式设置 |
 | `LOG_FILE` | `/app/logs/lazy-balancer.log` | 运行日志文件路径（恒启用，LOG_FILE 仅覆盖路径） |
 | `NODE_NAME` | `node-1` | 集群注册的默认节点名 |
-| `BACKUP_DIR` | 自动备份落盘目录（默认 `data_dir` 同级 `backup`，容器默认 `/app/backup`） |
+| `BACKUP_DIR` | `data_dir` 同级 `backup`（容器 `/app/backup`） | 自动备份落盘目录 |
 | `APP_VERSION` | 构建时注入 | 显示版本号 |
 | `TZ` | 数据库 `timezone` | 进程时区 |
 

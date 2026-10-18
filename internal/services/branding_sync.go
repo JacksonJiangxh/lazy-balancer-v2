@@ -77,8 +77,29 @@ func MaterializeBranding(dataDir, content string) error {
 		injectLandingFromBranding(content)
 		return nil
 	}
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		return fmt.Errorf("写入品牌配置文件: %w", err)
+	mode := os.FileMode(0o644)
+	if info, statErr := os.Stat(path); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+	temporary, err := os.CreateTemp(dataDir, ".branding-*.tmp")
+	if err != nil {
+		return fmt.Errorf("创建品牌配置临时文件: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(mode); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("设置品牌配置文件权限: %w", err)
+	}
+	if _, err := temporary.WriteString(content); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("写入品牌配置临时文件: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("关闭品牌配置临时文件: %w", err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("原子替换品牌配置文件: %w", err)
 	}
 	injectLandingFromBranding(content)
 	return nil

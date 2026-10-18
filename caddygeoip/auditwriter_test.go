@@ -277,13 +277,15 @@ func TestAuditWriter_noTimingHeaderOmitsField(t *testing.T) {
 	if !tx.IsInterrupted() {
 		t.Fatal("rule must interrupt")
 	}
-	start := time.Now()
+	auditTimingPollCountForTest.Store(0)
 	tx.ProcessLogging()
-	if time.Since(start) > 100*time.Millisecond {
-		t.Fatalf("ProcessLogging waited %v without timing header; must skip wait", time.Since(start))
-	}
 
 	line := waitAuditLine(t, logPath)
+	// U80 E-CM-06：零轮询钉替代挂钟阈值——无计时头行 id 为空，auditTimingWait
+	// 短路返回，drain 全程零轮询（旧轮询实现此处恒 >0）。
+	if n := auditTimingPollCountForTest.Load(); n != 0 {
+		t.Fatalf("no timing header must skip wait entirely: drain polled %d times", n)
+	}
 	if strings.Contains(line, "lb_timing") {
 		t.Fatalf("lb_timing must be omitted without timing header: %s", line)
 	}
@@ -294,10 +296,11 @@ func TestAuditWriter_noTimingHeaderOmitsField(t *testing.T) {
 //	被清扫/写点缺失异常行），等待上限收窄到可观测量级（200ms，useTestAuditPipeline）
 //
 // When: 事务入队（ProcessLogging）→ drain 侧处理
-// Then: 行在远小于上限的时间内落盘（<80ms——旧行为轮询满上限，恒 ≥200ms 本断言
+// Then: 行落盘且 drain 全程零轮询（旧行为轮询满上限 200ms/步 1ms 恒约 200 次，
 //
-//	必红），且不注入 lb_timing——AUD-1 钉：未知 tid 不阻塞单 drain goroutine
-//	（积压行批量到场时逐行满等=无背压阀下的 drain 沉陷，请求路径被入队阻塞拖住）
+//	零轮询钉对其必红），且不注入 lb_timing——AUD-1 钉：未知 tid 不阻塞单
+//	drain goroutine（积压行批量到场时逐行满等=无背压阀下的 drain 沉陷，
+//	请求路径被入队阻塞拖住）
 func TestAuditPipeline_unknownTidDoesNotBlockDrain(t *testing.T) {
 	useTestAuditPipeline(t)
 	dir := t.TempDir()
@@ -317,12 +320,14 @@ func TestAuditPipeline_unknownTidDoesNotBlockDrain(t *testing.T) {
 
 	// timing ID 头在场（16 字符生产形态）但注册表无条目——不 record 不 close
 	const orphanTID = "0000000000000000"
-	start := time.Now()
+	auditTimingPollCountForTest.Store(0)
 	driveProbeTx(t, waf, orphanTID)
 	line := waitAuditLine(t, logPath)
-	elapsed := time.Since(start)
-	if elapsed > 80*time.Millisecond {
-		t.Fatalf("unknown tid must not block drain (AUD-1): line landed after %v (limit 200ms, old polling behavior >=200ms)", elapsed)
+	// U80 E-CM-06：零轮询钉替代挂钟阈值——行落盘时 drain 的等待已完成，
+	// 未知 tid 首轮查表未命中即返（零轮询）；旧行为轮询满 200ms 上限
+	// （poll step 1ms → 恒约 200 次），本断言对旧实现必红。
+	if n := auditTimingPollCountForTest.Load(); n != 0 {
+		t.Fatalf("unknown tid must not block drain (AUD-1): drain polled %d times, want 0", n)
 	}
 	if strings.Contains(line, "lb_timing") {
 		t.Fatalf("unknown tid must inject nothing: %s", line)
@@ -816,10 +821,11 @@ func TestAuditTimingRegistry_recordWaitClose(t *testing.T) {
 	// AUD-1（历史）：未知 tid（注册表无条目）首轮即返空快照——不轮询到超时
 	// （旧行为本断言必红：轮询走满超时）。条目稍后创建也不追加等待（预检拦行
 	// 的微秒级建条窗口由 drain 侧格式化先行吸收，见 auditTimingWait 注释）。
-	start := time.Now()
+	// U80 E-CM-06：零轮询钉替代挂钟阈值（CI 负载抖动下挂钟断言会假红）。
+	auditTimingPollCountForTest.Store(0)
 	snap := auditTimingWait(id, 30*time.Millisecond)
-	if elapsed := time.Since(start); elapsed > 5*time.Millisecond {
-		t.Fatalf("unknown entry must return immediately (AUD-1), took %v", elapsed)
+	if n := auditTimingPollCountForTest.Load(); n != 0 {
+		t.Fatalf("unknown entry must return immediately without polling (AUD-1), polls=%d", n)
 	}
 	if snap.preSet || snap.endSet {
 		t.Fatalf("unknown entry must yield empty snapshot: %+v", snap)
@@ -834,10 +840,10 @@ func TestAuditTimingRegistry_recordWaitClose(t *testing.T) {
 
 	auditTimingRecord(id, "end", 22)
 	auditTimingClose(id)
-	start = time.Now()
+	auditTimingPollCountForTest.Store(0)
 	snap = auditTimingWait(id, time.Second)
-	if time.Since(start) > 100*time.Millisecond {
-		t.Fatal("closed entry must return immediately")
+	if n := auditTimingPollCountForTest.Load(); n != 0 {
+		t.Fatalf("closed entry must return on first read without polling, polls=%d", n)
 	}
 	if !snap.closed || snap.preUs != 11 || snap.endUs != 22 || !snap.preSet || !snap.endSet {
 		t.Fatalf("final snapshot = %+v; want closed pre=11 end=22", snap)

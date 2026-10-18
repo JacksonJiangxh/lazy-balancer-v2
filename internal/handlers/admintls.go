@@ -330,6 +330,19 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		cert, key = certPEM, keyPEM
 		uploadedCertificate = true
 	}
+	// B2-03（历史）：切换到非 upload 来源时清空已上传证书材料——
+	// selfsigned 由 ResolveCertificate 自生成，残留 upload 材料无消费者，
+	// 且会随备份/导入继续传播（upload 模式禁用保留既有钉测锁定，不受影响）。
+	if mode != "upload" {
+		cert, key = "", ""
+	}
+	// B2-04（历史）：值未变更不写库不重启——此前无条件 UPDATE+
+	// restartProcess，设置页重复保存产生无谓进程重启。未变更即无状态迁移，
+	// 不再重复校验（存量值保存时已过同一校验链）。
+	if enabled == current.Enabled && mode == current.Mode && cert == current.Cert && key == current.Key {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "配置未变更，无需重启"})
+		return
+	}
 
 	// 形态校验（mode 值域 + 启用态必选来源 + upload 配对/有效期）与 v2 备份
 	// 导入（config_backup.go）共用同一实现（历史问题 LBH-F6 收敛：原内联校验与

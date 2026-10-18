@@ -52,9 +52,11 @@ func TestGenerateCaddyConfig_ruleLevelRequestBodyOverridesGlobal(t *testing.T) {
 // 全局断裂漏检多年——本测试以非默认形态钉住全部全局→渲染链。
 func TestGenerateCaddyConfig_allGlobalOverridesReachRender(t *testing.T) {
 	_, database := newClusterTestService(t)
-	seedGenerationRule(t, database, "lb贯通", false)
+	seedGenerationRule(t, database, "lb_global_sentinel", false)
 	seedGenerationRule(t, database, "lb_global_probe", false)
-	database.Exec("UPDATE lb_rules SET protocol='http' WHERE caddy_id='lb_global_probe'")
+	if _, err := database.Exec("UPDATE lb_rules SET protocol='http' WHERE caddy_id='lb_global_probe'"); err != nil {
+		t.Fatalf("set probe protocol: %v", err)
+	}
 	sentinel := map[string]any{
 		"request_body_max_size_mb": 64, "http_read_timeout": 33, "http_write_timeout": 44,
 		"http_idle_timeout": 55, "upstream_keepalive_timeout": 66,

@@ -83,9 +83,9 @@ func TestAutobanConverge_gateHitHotPathZeroReload(t *testing.T) {
 	}
 }
 
-// 资格门未命中（无启用策略引用）→ 回退既有全量重载；热路径刷新器虽已注册
-// 但不得被调用。
-func TestAutobanConverge_gateMissFallsBackToFullReload(t *testing.T) {
+// 资格门未命中且无启用策略/受信代理/CRS 排除引用 → 无发射面，名单落库后
+// 不需要任何收敛重载；热路径刷新器与全量重载都不得调用。
+func TestAutobanConverge_unreferencedSkipsReload(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 2, 5, "1h", "all", false)
 	spy := installAutobanConvergeSpy(t, func() (IPListProjectionOutcome, error) { return ProjectionConverged, nil })
@@ -96,13 +96,13 @@ func TestAutobanConverge_gateMissFallsBackToFullReload(t *testing.T) {
 		t.Fatalf("RunAutobanCycle: %v", err)
 	}
 	if len(presetEntries(t)) != 1 {
-		t.Fatalf("回退路径下 merge 结果必须照常落名单，得到 %+v", presetEntries(t))
+		t.Fatalf("未引用路径下 merge 结果必须照常落名单，得到 %+v", presetEntries(t))
 	}
-	if spy.refreshes != 0 || spy.reloads != 1 {
-		t.Fatalf("资格未命中必须回退全量重载且不碰热路径：refreshes=%d reloads=%d", spy.refreshes, spy.reloads)
+	if spy.refreshes != 0 || spy.reloads != 0 {
+		t.Fatalf("未被引用名单无发射面，必须零收敛调用：refreshes=%d reloads=%d", spy.refreshes, spy.reloads)
 	}
-	if log := autobanLogNow(t); !strings.Contains(log, "已重载") {
-		t.Fatalf("全量重载回退的任务日志尾注=%q, want 已重载", log)
+	if log := autobanLogNow(t); !strings.Contains(log, "未被引用") || strings.Contains(log, "已重载") {
+		t.Fatalf("未引用名单的任务日志尾注=%q, want 未被引用零重载", log)
 	}
 }
 

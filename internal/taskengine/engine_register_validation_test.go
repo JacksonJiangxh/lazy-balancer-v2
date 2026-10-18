@@ -17,6 +17,7 @@ func validRegisterDescriptor() Descriptor {
 
 func TestEngineRegister_rejectsInvalidKind(t *testing.T) {
 	e := NewEngine(Options{})
+	t.Cleanup(e.Stop) // 历史问题-6（历史）：引擎须停止——否则 scheduleLoop goroutine 跨测试泄漏
 	d := validRegisterDescriptor()
 	d.Kind = Kind("bogus")
 	if err := e.Register(d); err == nil {
@@ -26,6 +27,7 @@ func TestEngineRegister_rejectsInvalidKind(t *testing.T) {
 
 func TestEngineRegister_rejectsInvalidRunsOn(t *testing.T) {
 	e := NewEngine(Options{})
+	t.Cleanup(e.Stop) // 历史问题-6（历史）：引擎须停止——否则 scheduleLoop goroutine 跨测试泄漏
 	d := validRegisterDescriptor()
 	d.RunsOn = Role("bogus")
 	if err := e.Register(d); err == nil {
@@ -35,6 +37,7 @@ func TestEngineRegister_rejectsInvalidRunsOn(t *testing.T) {
 
 func TestEngineRegister_rejectsBootSyncNonOneshot(t *testing.T) {
 	e := NewEngine(Options{})
+	t.Cleanup(e.Stop) // 历史问题-6（历史）：引擎须停止——否则 scheduleLoop goroutine 跨测试泄漏
 	d := validRegisterDescriptor()
 	d.BootSync = true
 	if err := e.Register(d); err == nil {
@@ -44,6 +47,7 @@ func TestEngineRegister_rejectsBootSyncNonOneshot(t *testing.T) {
 
 func TestEngineRegister_rejectsMissingKind(t *testing.T) {
 	e := NewEngine(Options{})
+	t.Cleanup(e.Stop) // 历史问题-6（历史）：引擎须停止——否则 scheduleLoop goroutine 跨测试泄漏
 	d := validRegisterDescriptor()
 	d.Kind = ""
 	if err := e.Register(d); err == nil {
@@ -54,6 +58,7 @@ func TestEngineRegister_rejectsMissingKind(t *testing.T) {
 func TestEngineRegister_rejectsDuplicateID(t *testing.T) {
 	// Given：同引擎内已有一个有效任务。
 	e := NewEngine(Options{})
+	t.Cleanup(e.Stop) // 历史问题-6（历史）：引擎须停止——否则 scheduleLoop goroutine 跨测试泄漏
 	d := validRegisterDescriptor()
 	if err := e.Register(d); err != nil {
 		t.Fatal(err)
@@ -66,6 +71,7 @@ func TestEngineRegister_rejectsDuplicateID(t *testing.T) {
 
 func TestEngineRegister_rejectsMissingName(t *testing.T) {
 	e := NewEngine(Options{})
+	t.Cleanup(e.Stop) // 历史问题-6（历史）：引擎须停止——否则 scheduleLoop goroutine 跨测试泄漏
 	d := validRegisterDescriptor()
 	d.Name = ""
 	if err := e.Register(d); err == nil {
@@ -75,6 +81,7 @@ func TestEngineRegister_rejectsMissingName(t *testing.T) {
 
 func TestEngineRegister_rejectsNilRun(t *testing.T) {
 	e := NewEngine(Options{})
+	t.Cleanup(e.Stop) // 历史问题-6（历史）：引擎须停止——否则 scheduleLoop goroutine 跨测试泄漏
 	d := validRegisterDescriptor()
 	d.Run = nil
 	if err := e.Register(d); err == nil {

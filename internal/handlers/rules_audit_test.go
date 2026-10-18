@@ -1980,3 +1980,82 @@ func waitTestChannel(t *testing.T, ch <-chan struct{}, label string) {
 		t.Fatalf("等待超时: %s", label)
 	}
 }
+
+func TestRuleCertCancellation_releasesCaddyOpLock(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T) (*Handlers, *gin.Engine, *http.Request, string)
+	}{
+		{
+			name: "update leaving ACME",
+			setup: func(t *testing.T) (*Handlers, *gin.Engine, *http.Request, string) {
+				harness := newUpdateAuditRuleHandlers(t, "lb_cancel_lock_update", 0, false)
+				seedACMEManualSwitchFixture(t, "lb_cancel_lock_update", "cancel-lock-update.example.test", "failed")
+				router := gin.New()
+				router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
+				request := httptest.NewRequest(http.MethodPut, "/rules/lb_cancel_lock_update", strings.NewReader(`{"name":"after","enable_tls":false}`))
+				request.Header.Set("Content-Type", "application/json")
+				return harness.handler, router, request, "update"
+			},
+		},
+		{
+			name: "disable ACME rule",
+			setup: func(t *testing.T) (*Handlers, *gin.Engine, *http.Request, string) {
+				h, _, _ := newAuditRuleHandlers(t, 0)
+				seedAuditRule(t, "lb_cancel_lock_disable", "cancel-lock-disable", "cancel-lock-disable.example.test", 8080, true, "acme_dns", true)
+				seedAuditUpstream(t, "lb_cancel_lock_disable")
+				router := gin.New()
+				router.POST("/rules/:caddy_id/disable", h.DisableRule)
+				return h, router, httptest.NewRequest(http.MethodPost, "/rules/lb_cancel_lock_disable/disable", nil), "disable"
+			},
+		},
+		{
+			name: "delete rule",
+			setup: func(t *testing.T) (*Handlers, *gin.Engine, *http.Request, string) {
+				h, _, _ := newAuditRuleHandlers(t, 0)
+				seedAuditRule(t, "lb_cancel_lock_delete", "cancel-lock-delete", "cancel-lock-delete.example.test", 8080, true, "acme_dns", true)
+				seedAuditUpstream(t, "lb_cancel_lock_delete")
+				router := gin.New()
+				router.DELETE("/rules/:caddy_id", h.DeleteRule)
+				return h, router, httptest.NewRequest(http.MethodDelete, "/rules/lb_cancel_lock_delete", nil), "delete"
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			services.ResetCAQueueManagerForTest()
+			services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+			t.Cleanup(services.ResetCAQueueManagerForTest)
+			handler, router, request, label := tt.setup(t)
+			entered := make(chan struct{}, 1)
+			release := make(chan struct{})
+			oldCancel := cancelRuleJobs
+			cancelRuleJobs = func(context.Context, *services.CAQueueManager, string) error {
+				entered <- struct{}{}
+				<-release
+				return nil
+			}
+			t.Cleanup(func() { cancelRuleJobs = oldCancel })
+			done := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+				done <- response
+			}()
+			waitTestChannel(t, entered, label+" cancel entered")
+
+			// The global Caddy operation lock must be free during the bounded wait.
+			if !handler.caddyOpMu.TryLock() {
+				close(release)
+				<-done
+				t.Fatalf("%s held caddyOpMu while waiting for certificate cancellation", label)
+			}
+			handler.caddyOpMu.Unlock()
+			close(release)
+			response := <-done
+			if response.Code != http.StatusOK {
+				t.Fatalf("%s status=%d body=%s, want 200", label, response.Code, response.Body.String())
+			}
+		})
+	}
+}

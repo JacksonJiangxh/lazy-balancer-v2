@@ -516,9 +516,6 @@ func TestBuildRateLimitHandler_sweepIntervalAtHandlerLevel(t *testing.T) {
 	// 历史问题 C-N1：sweep_interval 必须在 handler 层而非 zone 级——Caddy v2.11.4
 	// 对模块载荷 DisallowUnknownFields，zone 级未知字段使整个配置加载 400
 	// （开启限流即配置停摆，README 核心功能不可用）。
-	sec, burst := map[string]interface{}{}, map[string]interface{}{}
-	_ = sec
-	_ = burst
 	policy := &models.SecurityPolicy{RateLimitEnabled: true, RateLimitRPS: 5, RateLimitBurst: 10}
 	handler, err := buildRateLimitHandler("lb_test", policy)
 	if err != nil {

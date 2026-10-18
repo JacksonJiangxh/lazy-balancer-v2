@@ -13,7 +13,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { ref, shallowRef } from 'vue'
+import { watchDebounced } from '@vueuse/core'
 import { highlightCode } from '@/utils/highlight'
 
 const props = withDefaults(defineProps<{
@@ -27,11 +28,19 @@ const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 
 const preRef = ref<HTMLElement | null>(null)
 
-const highlighted = computed(() => {
+const highlighted = shallowRef('')
+const updateHighlight = (): void => {
   const html = highlightCode(props.modelValue, props.language)
   // Keep the highlight layer in sync height-wise when content ends with a newline.
-  return props.modelValue.endsWith('\n') ? html + '<br>' : html
-})
+  highlighted.value = props.modelValue.endsWith('\n') ? html + '<br>' : html
+}
+// 输入事件只更新 textarea；Prism 全文高亮在停顿后执行，连续输入最长每 500ms
+// 补一次，避免每个键击都阻塞主线程。组件卸载时 watchDebounced 自动清理定时器。
+watchDebounced(
+  () => [props.modelValue, props.language] as const,
+  updateHighlight,
+  { debounce: 160, maxWait: 500, immediate: true },
+)
 
 const onInput = (e: Event) => {
   emit('update:modelValue', (e.target as HTMLTextAreaElement).value)

@@ -1019,10 +1019,11 @@ func TestGetAllSecurityBindings_nullEnabledReadsDisabled(t *testing.T) {
 func TestListSecurityPolicies_summaryIncludesCRSRuleGroups(t *testing.T) {
 	// Given 一条配置 CRS 规则组 ["42","43"] 的策略
 	setupSecurityPolicyTestDB(t)
+	useCRSRuleIndexFixture(t)
 	router := newSecurityRouter(t)
 	if r := postJSON(t, router, "/security/policies", map[string]any{
 		"name": "带组策略", "mode": "blocking", "enabled": true,
-		"crs_rule_groups": `["42","43"]`,
+		"crs_rule_groups": `["20","42"]`,
 	}); r.Code != http.StatusOK {
 		t.Fatalf("create status=%d body=%s", r.Code, r.Body.String())
 	}
@@ -1047,7 +1048,7 @@ func TestListSecurityPolicies_summaryIncludesCRSRuleGroups(t *testing.T) {
 	if len(resp.Data) != 1 {
 		t.Fatalf("summaries=%+v, want 1 policy", resp.Data)
 	}
-	if string(resp.Data[0].CRSRuleGroups) != `["42","43"]` {
-		t.Fatalf("crs_rule_groups=%s, want %s", resp.Data[0].CRSRuleGroups, `["42","43"]`)
+	if string(resp.Data[0].CRSRuleGroups) != `["20","42"]` {
+		t.Fatalf("crs_rule_groups=%s, want %s", resp.Data[0].CRSRuleGroups, `["20","42"]`)
 	}
 }

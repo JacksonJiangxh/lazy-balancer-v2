@@ -16,6 +16,13 @@ import (
 // 包级变量以便测试覆盖到临时目录；生产默认容器内 /app/data 不变。
 var crawlerIPListFile = "/app/data/crawler-ip-lists.json"
 
+// SetCrawlerIPListFileForTest 重定向快照交换文件路径，仅供测试隔离使用（返回还原函数）。
+func SetCrawlerIPListFileForTest(path string) func() {
+	old := crawlerIPListFile
+	crawlerIPListFile = path
+	return func() { crawlerIPListFile = old }
+}
+
 // crawlerBuiltinSnapshot 新实例内置首版（v2.3.8：官方源已核实的快照子集，
 // 新实例启动即用，无需等待首轮下载；后续由更新任务覆盖为最新官方数据）。
 var crawlerBuiltinSnapshot = map[string][]string{

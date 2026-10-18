@@ -570,6 +570,10 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "备份文件不能超过 48MB"})
 		return
 	}
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件读取失败: " + err.Error()})
+		return
+	}
 	// 历史问题：BOM 剥离必须先于 lbbak 魔数检测（与导入核心同序）——带 BOM 的
 	// lbbak 否则被当作纯 JSON 解析失败；BOM 与 gzip 魔数不冲突。
 	body = bytes.TrimPrefix(body, []byte("\xef\xbb\xbf"))
@@ -584,7 +588,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		body = payload.ConfigJSON
 		c.Set("lbbak_payload", payload)
 	}
-	if err != nil || len(body) == 0 {
+	if len(body) == 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件内容为空"})
 		return
 	}
@@ -843,13 +847,17 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "备份文件不能超过 48MB"})
 		return
 	}
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件读取失败: " + err.Error()})
+		return
+	}
 	// lbbak(tar.gz)是 V2 形态:提前给出正确端点指引,避免落入 JSON 解析
 	// 「不是有效的 JSON」困惑(安全面本就必拒,仅提示质量)。
 	if len(body) > 2 && body[0] == 0x1f && body[1] == 0x8b {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "V1 导入仅支持旧版 JSON 备份；lbbak 备份请使用 /api/v1/config/import"})
 		return
 	}
-	if err != nil || len(body) == 0 {
+	if len(body) == 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件内容为空"})
 		return
 	}
@@ -969,7 +977,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	if err := session.commit(affectedRuleIDs, pendingCerts); err != nil {
 		status := http.StatusInternalServerError
 		message := "配置导入失败: " + err.Error()
-		if importFailurePhase(err) == importPhaseCaddy {
+		if importFailureCaddyRejected(err) {
 			status = http.StatusBadRequest
 			message = "备份生成的配置未通过 Caddy 验证，未执行导入: " + err.Error()
 		}

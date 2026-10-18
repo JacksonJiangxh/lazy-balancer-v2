@@ -342,6 +342,59 @@ func TestSplitSecurityPolicy_capBoundaryAndStage2GateCoexist(t *testing.T) {
 	}
 }
 
+func TestSplitSecurityPolicy_rejectsChildNameOverLimit(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := splitRouter(t)
+	name := strings.Repeat("界", 96)
+	res, err := db.DB.Exec(`INSERT INTO security_policies (name,mode,policy_type,enabled) VALUES (?,'blocking','mixed',1)`, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_long','long','http','long.test',8080,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES ('lb_long',?)`, id); err != nil {
+		t.Fatal(err)
+	}
+	response := postSplit(t, router, int(id))
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "100") {
+		t.Fatalf("over-limit child name status=%d body=%s, want named 400", response.Code, response.Body.String())
+	}
+	var policies, bindings int
+	_ = db.DB.QueryRow(`SELECT COUNT(*) FROM security_policies`).Scan(&policies)
+	_ = db.DB.QueryRow(`SELECT COUNT(*) FROM security_policy_bindings`).Scan(&bindings)
+	if policies != 1 || bindings != 1 {
+		t.Fatalf("rejected split must leave original policy/binding unchanged: policies=%d bindings=%d", policies, bindings)
+	}
+}
+
+func TestSplitSecurityPolicy_rejectsZeroFeatureMixed(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := splitRouter(t)
+	res, err := db.DB.Exec(`INSERT INTO security_policies (name,mode,policy_type,enabled) VALUES ('empty-mixed','off','mixed',1)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_empty','empty','http','empty.test',8080,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES ('lb_empty',?)`, id); err != nil {
+		t.Fatal(err)
+	}
+	response := postSplit(t, router, int(id))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("zero-feature split status=%d body=%s, want 400", response.Code, response.Body.String())
+	}
+	var policies, bindings int
+	_ = db.DB.QueryRow(`SELECT COUNT(*) FROM security_policies`).Scan(&policies)
+	_ = db.DB.QueryRow(`SELECT COUNT(*) FROM security_policy_bindings`).Scan(&bindings)
+	if policies != 1 || bindings != 1 {
+		t.Fatalf("zero-feature split must not delete original protection: policies=%d bindings=%d", policies, bindings)
+	}
+}
+
 func TestSplitSecurityPolicy_nonMixedRejected(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := splitRouter(t)

@@ -127,6 +127,16 @@ func (s *Store) MatchingValue(provider, zone, fqdn, value string) ([]Record, err
 	return matching, nil
 }
 
+// sameRecord 语义相等（历史问题，历史）：Record 结构内联 == 比较含
+// time.Time（wall/ext/loc 指针 + monotonic）——从文件读回经 Matching/
+// MatchingValue 得到的记录与调用方持有的原值逻辑时间相同，但 == 可能为
+// false（JSON 解码丢弃 monotonic、loc 指针不同），Remove 静默 no-op 留下
+// 未清理记录。CreatedAt 用 Equal，其余字段逐项比较。
+func sameRecord(a, b Record) bool {
+	return a.Provider == b.Provider && a.Zone == b.Zone && a.FQDN == b.FQDN &&
+		a.Value == b.Value && a.RecordID == b.RecordID && a.CreatedAt.Equal(b.CreatedAt)
+}
+
 func (s *Store) Remove(removed Record) error {
 	fileMu.Lock()
 	defer fileMu.Unlock()
@@ -136,7 +146,7 @@ func (s *Store) Remove(removed Record) error {
 	}
 	remaining := make([]Record, 0, len(current.Records))
 	for _, record := range current.Records {
-		if record != removed {
+		if !sameRecord(record, removed) {
 			remaining = append(remaining, record)
 		}
 	}

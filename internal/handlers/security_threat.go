@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -38,10 +39,20 @@ type threatSourceDTO struct {
 }
 
 func (h *Handlers) GetThreatLib(c *gin.Context) {
-	rows, err := db.DB.Query(`SELECT t.id, t.name, t.display_name, t.url, t.format, t.update_enabled,
+	sourceNames := make([]string, 0, len(db.ThreatSystemLists))
+	args := make([]interface{}, 0, len(db.ThreatSystemLists))
+	for _, sl := range db.ThreatSystemLists {
+		sourceNames = append(sourceNames, "?")
+		args = append(args, sl.Source)
+	}
+	where := "0"
+	if len(sourceNames) > 0 {
+		where = "t.name IN (" + strings.Join(sourceNames, ",") + ")"
+	}
+	rows, err := db.DB.Query(fmt.Sprintf(`SELECT t.id, t.name, t.display_name, t.url, t.format, t.update_enabled,
 		t.entry_count, t.version, t.update_status, t.message, COALESCE(t.last_checked,''), COALESCE(t.next_update,'')
 		FROM security_threat_sources t
-		WHERE t.name IN ('ustc','firehol_l1','et_compromised') ORDER BY t.id`)
+		WHERE %s ORDER BY t.id`, where), args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取威胁情报库失败: " + err.Error()})
 		return

@@ -554,9 +554,9 @@ func createTables() error {
 	);
 
 	-- Create indexes
-	-- idx_nodes_status 无查询消费（status 唯一读点是审批点查 + is_approved 过滤，
-	-- 走 id 主键/无索引需求）；与 status 列同批迁移删除。
-	CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
+	-- 历史问题-5（历史）：idx_nodes_status 零查询消费（status 唯一读点是审批
+	-- 点查 + is_approved 过滤，走 id 主键/无索引需求）——DDL 与两处表重建迁移
+	-- 均不再创建，存量库由下方 DROP INDEX 迁移回收（省每次写入的索引维护）。
 
 	CREATE TABLE IF NOT EXISTS cluster_register_tokens (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -754,6 +754,10 @@ func createTables() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_task_runs_task_time ON task_runs(task_id, started_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_task_runs_time ON task_runs(started_at DESC);
+	-- 历史问题（历史）：RunOverview 的「每任务最新行」（id IN (SELECT MAX(id)
+	-- ... GROUP BY task_id)）此前每 10s 全表扫描 task_runs；(task_id, id) 复合
+	-- 索引让 GROUP BY task_id 走索引有序扫描（免回表），代价降到索引面。
+	CREATE INDEX IF NOT EXISTS idx_task_runs_task_latest ON task_runs(task_id, id);
 	-- 任务调度偏好（历史问题，历史）：节点本地持久化用户显式启停，
 	-- 进程重启/角色翻转后据此覆盖默认启动清单；业务驱动任务以业务字段为
 	-- 唯一事实源，不写本表。节点本地表：不进入集群快照/备份导出。
@@ -1168,6 +1172,11 @@ func runMigrations() error {
 	}
 	if err := migrateNodesDeadColumns(); err != nil {
 		return fmt.Errorf("failed to migrate nodes legacy columns: %w", err)
+	}
+	// 历史问题-5（历史）：idx_nodes_status 死索引回收——零查询消费；DDL 与
+	// 两处 nodes 表重建迁移已停止创建，存量库由此处一次性删除。
+	if _, err := DB.Exec("DROP INDEX IF EXISTS idx_nodes_status"); err != nil {
+		return fmt.Errorf("failed to drop dead nodes status index: %w", err)
 	}
 	// D403-历史问题 结构性兜底：上方整表重建迁移若以陈旧 DDL 重建而丢列，这里幂等
 	// 补齐收敛——重建迁移自身漏列不再造成列永久丢失（数据按列默认值回填）。
@@ -2613,7 +2622,7 @@ func migrateNodesDeadColumns() error {
 		SELECT id,name,COALESCE(mode,'slave'),ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at FROM nodes;
 		DROP TABLE nodes;
 		ALTER TABLE nodes_without_legacy_sync RENAME TO nodes;
-		CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);`); err != nil {
+		`); err != nil {
 			return fmt.Errorf("rebuild nodes table: %w", err)
 		}
 		return nil
@@ -3197,8 +3206,7 @@ func migrateNodesDropMasterID() error {
 	INSERT INTO nodes_new (id,name,mode,ip_address,port,protocol,is_approved,sync_interval,status,cluster_token_hash,access_url,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at)
 		SELECT id,name,mode,ip_address,port,protocol,is_approved,sync_interval,status,cluster_token_hash,COALESCE(access_url,''),registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at FROM nodes;
 	DROP TABLE nodes;
-	ALTER TABLE nodes_new RENAME TO nodes;
-	CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);`
+	ALTER TABLE nodes_new RENAME TO nodes;`
 		if _, err := tx.Exec(rebuild); err != nil {
 			return fmt.Errorf("rebuild nodes: %w", err)
 		}

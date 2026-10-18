@@ -162,6 +162,9 @@ func newBackupTestHandlers(t *testing.T) *Handlers {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		// B1-07（历史）：直换包级句柄必须同步复位 currentDB（SetDB
+		// 契约见其注释）——否则后台循环/GetDB 继续持有已关闭的测试库句柄。
+		db.SetDB(oldDB)
 	})
 	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

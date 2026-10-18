@@ -8,7 +8,21 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { heatEntriesEqual, arcEndpoints } from '../src/utils/threatShared.ts'
+import { heatEntriesEqual, arcEndpoints, POINTY_TOP_HEX_VERTICES, drillCountryAllowed } from '../src/utils/threatShared.ts'
+
+test('六边形点阵：pointy-top 六顶点且上下尖角（历史问题）', () => {
+  assert.equal(POINTY_TOP_HEX_VERTICES.length, 6)
+  assert.deepEqual(POINTY_TOP_HEX_VERTICES[0], [0, -1])
+  assert.deepEqual(POINTY_TOP_HEX_VERTICES[3], [0, 1])
+  assert.ok(POINTY_TOP_HEX_VERTICES.every(([x, y]) => Math.abs(x) <= Math.sqrt(3) / 2 && Math.abs(y) <= 1))
+})
+
+test('下钻白名单：缺省不限，显式列表只放行列内国家（历史问题）', () => {
+  assert.equal(drillCountryAllowed(undefined, '美国'), true)
+  assert.equal(drillCountryAllowed(['中国'], '中国'), true)
+  assert.equal(drillCountryAllowed(['中国'], '美国'), false)
+  assert.equal(drillCountryAllowed([], '中国'), false)
+})
 
 test('A 热力指纹：相同输入 true，计数/长度/重复键变化 false', () => {
   const prev = new Map<string, number>([['中国', 12], ['美国', 5]])

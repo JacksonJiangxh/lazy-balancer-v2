@@ -7,13 +7,13 @@ package handlers
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 
-	"bytes"
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
@@ -291,10 +291,11 @@ func (h *Handlers) GetSystemTaskLogs(c *gin.Context) {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"content": ""}})
 		return
 	}
-	data, err := os.ReadFile(path)
+	// 尾部 256KB（日志弹框消费口径，防超长载荷）。先 Seek 再限量读，
+	// 不把最大 1GB 的任务日志整文件读入内存。
+	const tail = 256 << 10
+	info, err := os.Stat(path)
 	if err != nil {
-		// 历史问题-4：文件不存在=空内容（任务尚未产生日志）；读失败=500（曾一律 200
-		// 空内容，与不存在不可区分）。
 		if errors.Is(err, os.ErrNotExist) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"content": ""}})
 			return
@@ -302,13 +303,25 @@ func (h *Handlers) GetSystemTaskLogs(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
 		return
 	}
-	// 尾部 256KB（日志弹框消费口径，防超长载荷）
-	const tail = 256 << 10
-	if len(data) > tail {
-		data = data[len(data)-tail:]
-		if i := bytes.IndexByte(data, '\n'); i >= 0 {
-			data = data[i+1:]
-		}
+	startOffset := int64(0)
+	if info.Size() > tail {
+		startOffset = info.Size() - tail
 	}
+	file, err := os.Open(path)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
+		return
+	}
+	defer file.Close()
+	if _, err := file.Seek(startOffset, io.SeekStart); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(file, int64(tail)))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
+		return
+	}
+	data = tailLogWindow(data, startOffset)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"content": string(data)}})
 }

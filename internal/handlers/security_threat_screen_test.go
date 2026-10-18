@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -323,6 +324,52 @@ func TestGetSecurityThreatScreen_metricsDBNilReturnsZeroShape(t *testing.T) {
 	}
 	if payload.Data.TotalEvents != 0 || payload.Data.ActiveSources != 0 || payload.Data.Countries == nil || payload.Data.ChinaProvinces == nil {
 		t.Fatalf("零值形状应完整: %+v", payload.Data)
+	}
+	var raw struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"rollup_ready", "rollup_stale", "rollup_last_success", "logged_events", "ratelimit_available", "top_rules", "top_targets", "hourly_hist", "attack_type_share", "recent_rate"} {
+		if _, ok := raw.Data[key]; !ok {
+			t.Fatalf("zero response missing key %q: %s", key, recorder.Body.String())
+		}
+	}
+}
+
+func TestGetSecurityThreatScreen_histogramKeepsPreBucketPrefix(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	base := time.Date(2026, 10, 18, 12, 30, 0, 0, time.UTC)
+	installThreatClock(t, base)
+	seedThreatScreenEvent(t, "2026-10-16 14:00:10", "203.0.113.7", "942100", "SQL Injection", "blocked")
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	var payload threatScreenR79Payload
+	for range 3 {
+		payload = getThreatScreenR79(t, router, "/security/overview/threat-screen?hours=48")
+		if payload.Data.TotalEvents == 1 {
+			break
+		}
+	}
+	if payload.Data.TotalEvents != 1 {
+		t.Fatalf("total_events=%d, want 1", payload.Data.TotalEvents)
+	}
+	var raw struct {
+		Data struct {
+			Hourly []struct {
+				Value int `json:"value"`
+			} `json:"hourly_hist"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(getRequest(t, router, "/security/overview/threat-screen?hours=48").Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	sum := 0
+	for _, bucket := range raw.Data.Hourly {
+		sum += bucket.Value
+	}
+	if sum != payload.Data.TotalEvents {
+		t.Fatalf("hourly sum=%d, want total_events=%d (oldest bucket absorbs prefix)", sum, payload.Data.TotalEvents)
 	}
 }
 
@@ -727,6 +774,48 @@ func TestTriggerTypeForRule_fullTaxonomy(t *testing.T) {
 		if got := triggerTypeForRule(id); got != want {
 			t.Errorf("triggerTypeForRule(%q)=%q, want %q", id, got, want)
 		}
+	}
+}
+
+func TestAttackFamily_sixDigitCustomIDs(t *testing.T) {
+	for _, id := range []string{"100000", "199999", "700000", "799999"} {
+		if got := categorizeAttack(id, ""); got != "自定义规则" {
+			t.Fatalf("categorizeAttack(%s)=%q, want 自定义规则", id, got)
+		}
+		if got := stageCategorizeAttack(id, ""); got != "WAF" {
+			t.Fatalf("stageCategorizeAttack(%s)=%q, want WAF", id, got)
+		}
+	}
+	if !strings.Contains(customRuleFamilyCondition, "[1-7][0-9][0-9][0-9][0-9][0-9]") {
+		t.Fatalf("custom SQL family must cover 1xxxxx-7xxxxx: %s", customRuleFamilyCondition)
+	}
+	// 8xxxxx 仍由地域/爬虫段独占，9xxxxx 仍是 CRS。
+	for id, want := range map[string]string{"800000": "地域拦截", "899999": "爬虫Bot", "900000": "其他"} {
+		if got := categorizeAttack(id, ""); got != want {
+			t.Fatalf("categorizeAttack(%s)=%q, want %q", id, got, want)
+		}
+	}
+}
+
+func TestThreatFixMinute_groupByUsesExpressions(t *testing.T) {
+	raw, err := os.ReadFile("security_threat_screen.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(raw)
+	start := strings.Index(source, "func threatFixMinute(")
+	if start < 0 {
+		t.Fatal("threatFixMinute not found")
+	}
+	body := source[start:]
+	if end := strings.Index(body, "\nfunc threatLocationParts("); end > 0 {
+		body = body[:end]
+	}
+	if strings.Contains(body, "GROUP BY client_ip, 2,") {
+		t.Fatal("rollup GROUP BY must not depend on select-list ordinals")
+	}
+	if !strings.Contains(body, "GROUP BY client_ip, COALESCE(NULLIF(rule_name,''), COALESCE(rule_triggered,''))") {
+		t.Fatal("rollup GROUP BY must repeat the normalized rule-name expression")
 	}
 }
 

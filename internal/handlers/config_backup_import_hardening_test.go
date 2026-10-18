@@ -10,16 +10,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	_ "unsafe"
 
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/services"
 )
-
-//go:linkname audit79ServicesCrawlerIPListFile lazy-balancer-v2/internal/services.crawlerIPListFile
-var audit79ServicesCrawlerIPListFile string
 
 func audit79SeedAdmin(t *testing.T) {
 	t.Helper()
@@ -445,10 +441,11 @@ func TestImportConfigBackup_rebuildsCrawlerSnapshot(t *testing.T) {
 	// Given a stale runtime snapshot and a backup carrying a different crawler list.
 	h := newBackupTestHandlers(t)
 	audit79SeedAdmin(t)
-	oldPath := audit79ServicesCrawlerIPListFile
-	audit79ServicesCrawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
-	t.Cleanup(func() { audit79ServicesCrawlerIPListFile = oldPath })
-	if err := os.WriteFile(audit79ServicesCrawlerIPListFile, []byte(`{"googlebot":["192.0.2.0/24"]}`), 0o600); err != nil {
+	// B3-历史问题（历史）：go:linkname 改写 services 未导出变量 →
+	// 正式测试缝 services.SetCrawlerIPListFileForTest（返回还原闭包）。
+	snapshotPath := filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	t.Cleanup(services.SetCrawlerIPListFileForTest(snapshotPath))
+	if err := os.WriteFile(snapshotPath, []byte(`{"googlebot":["192.0.2.0/24"]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	body := r41BackupJSON(t, []string{"security"}, map[string][]map[string]any{
@@ -463,7 +460,7 @@ func TestImportConfigBackup_rebuildsCrawlerSnapshot(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
-	raw, err := os.ReadFile(audit79ServicesCrawlerIPListFile)
+	raw, err := os.ReadFile(snapshotPath)
 	if err != nil {
 		t.Fatal(err)
 	}

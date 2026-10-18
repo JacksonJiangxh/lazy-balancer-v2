@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -31,6 +32,19 @@ func (s *ClusterService) IsMaster(ctx context.Context) (bool, error) {
 func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, registration models.ClusterRegistration) error {
 	s.roleMu.Lock()
 	defer s.roleMu.Unlock()
+	var previousMasterURL, previousToken string
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(master_url,''),COALESCE(cluster_token,'') FROM global_config WHERE id=1`).Scan(&previousMasterURL, &previousToken); err != nil {
+		return fmt.Errorf("读取当前集群拓扑: %w", err)
+	}
+	// 换主与升主同样需要排干旧拓扑已准入的拉取：否则旧主快照的提交后
+	// 阶段可能越过新凭据落库点，继续物化旧配置/触发旧 Caddy 重载。
+	drainer := syncDrainerFor(s.db)
+	if drainer != nil {
+		if err := drainer.DrainPulls(ctx); err != nil {
+			drainer.reopenPullAdmission()
+			return fmt.Errorf("等待在途同步拉取结束: %w", err)
+		}
+	}
 	// 历史问题（RG-CLUSTER-STATUS-RESET）：last_sync 与 applied_version 同语义
 	// ——旧集群的同步时间对新集群无意义，同一 UPDATE 里置 NULL，状态卡不残留
 	// 旧集群时间（Status() 仅对 Valid 值格式化）。
@@ -52,8 +66,16 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 			Logf("warn", "切成从节点后持久化 cluster-sync 调度偏好失败（当前进程已恢复）: %v", err)
 		}
 	}
-	// 自动备份：v2.0 引擎 Scheduled 驱动（RunsOn=MasterOnly 角色门）——
-	// 降级后由引擎 SetRole 停调度，无需单独停止。
+	if drainer != nil {
+		// DrainPulls 只是换主屏障，不是永久 Stop；新拓扑必须恢复拉取准入。
+		// Halted 的 daemon 仍由 handler 的 Resume 负责重启。
+		drainer.reopenPullAdmission()
+	}
+	// 仅在主节点地址实际变化时通知旧主。相同主节点重新注册可能刚复用
+	// 节点行， detached 会误删本次新注册。
+	if previousToken != "" && strings.TrimRight(previousMasterURL, "/") != strings.TrimRight(masterURL, "/") {
+		s.detachFromMaster(ctx, previousMasterURL, previousToken)
+	}
 	ResetConfigDrift()
 	return nil
 }

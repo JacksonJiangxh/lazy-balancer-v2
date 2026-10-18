@@ -71,7 +71,7 @@ func TestTaskLoopPrefs_businessDrivenTaskIgnoresPreference(t *testing.T) {
 		t.Fatal(err)
 	}
 	was := te.IsRunning("threat")
-	applyTaskLoopPrefs(te)
+	applyTaskLoopPrefs(te, loadTaskLoopPrefs())
 	if got := te.IsRunning("threat"); got != was {
 		t.Fatalf("业务驱动任务 threat 的调度被偏好改写：%v -> %v", was, got)
 	}
@@ -89,7 +89,7 @@ func TestTaskLoopPrefs_internalWakeDoesNotRewritePreference(t *testing.T) {
 	if !te.IsRunning("cert-waiting-ca") {
 		t.Fatal("有活唤醒应临时恢复运行（现有 历史问题 语义）")
 	}
-	if enabled, ok := loadTaskLoopPref("cert-waiting-ca"); !ok || enabled {
+	if enabled, ok := loadTaskLoopPrefs()["cert-waiting-ca"]; !ok || enabled {
 		t.Fatalf("内部唤醒不得改写用户偏好：enabled=%v found=%v", enabled, ok)
 	}
 	te2 := reinitTaskEngineForTest(t)
@@ -120,7 +120,7 @@ func TestTaskLoopPrefs_concurrentWriteAndRepeatedInitIdempotent(t *testing.T) {
 		}
 	}
 	for range 3 {
-		applyTaskLoopPrefs(te)
+		applyTaskLoopPrefs(te, loadTaskLoopPrefs())
 	}
 	var n int
 	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM task_loop_prefs WHERE task_id=?`, id).Scan(&n); err != nil {

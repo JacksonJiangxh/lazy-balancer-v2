@@ -7,6 +7,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
 import { canSaveIpList, needsEmptyListConfirm } from '../src/utils/ipListSaveGuard.ts'
 import { formatIpListEntryLine, parseIpListEntryLine } from '../src/utils/ipListCsv.ts'
@@ -16,6 +17,20 @@ import {
   sharedEntriesCache,
   writeSharedEntries,
 } from '../src/utils/securityStages.ts'
+
+test('IP 快捷处置：信任命中只全扫一次，GeoIP 区域只解析一次（历史问题/历史问题）', () => {
+  const src = readFileSync(new URL('../src/views/security/IPLocationAction.vue', import.meta.url), 'utf8')
+  assert.match(src, /const trustHitSummary = computed/, '信任命中与豁免策略应共享一次计算')
+  assert.doesNotMatch(src, /const td[01]Owner = policies\.value\.find/, '逐行不得再全策略扫描')
+  assert.doesNotMatch(src, /JSON\.parse\(policy\.geoip_countries/, 'GeoIP 区域不得重复 JSON.parse')
+  assert.match(src, /const regions = parseIPList\(policy\.geoip_countries\)/)
+})
+
+test('规则流程只拉本规则阶段 0 策略的信任引用（历史问题）', () => {
+  const src = readFileSync(new URL('../src/components/RuleFlowDialog.vue', import.meta.url), 'utf8')
+  assert.match(src, /boundTrustPolicyIds/)
+  assert.match(src, /if \(!boundTrustPolicyIds\.has\(pol\.id\)\) continue/)
+})
 
 const isIp = (value: string): boolean => /^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/.test(value)
 

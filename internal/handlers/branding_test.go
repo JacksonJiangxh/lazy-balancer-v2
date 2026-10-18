@@ -21,6 +21,8 @@ func initBrandingTestDB(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		// B1-07（历史）：同步复位 currentDB，后台循环不得持有已关闭测试库
+		db.SetDB(oldDB)
 	})
 }
 

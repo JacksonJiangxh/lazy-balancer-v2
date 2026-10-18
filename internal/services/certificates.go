@@ -48,8 +48,9 @@ const (
 // (临期→已过期)当日可再告(新事件);跨日重新告警。进程内状态,重启后
 // 当日重告一次(可接受,胜过持久化复杂度)。
 type manualCertExpiryAlertGate struct {
-	mu   sync.Mutex
-	seen map[string]manualCertExpiryAlertRecord
+	mu        sync.Mutex
+	activeDay string
+	seen      map[string]manualCertExpiryAlertRecord
 }
 
 type manualCertExpiryAlertRecord struct {
@@ -62,8 +63,8 @@ func newManualCertExpiryAlertGate() *manualCertExpiryAlertGate {
 }
 
 // shouldAlert 判定本次扫描是否应告警:是则记录并返回 true。nil 接收者
-// 防御性放行(不抑制)。map 以证书 ID 为键,条目随规则数有界,当日值被
-// 覆写,无累积泄漏。
+// 防御性放行(不抑制)。map 以证书 ID 为键；日界滚动时整体清空，已删除
+// 规则的残留 ID 不会跨日累积。
 func (g *manualCertExpiryAlertGate) shouldAlert(caddyID string, level int, now time.Time) bool {
 	if g == nil {
 		return true
@@ -71,6 +72,13 @@ func (g *manualCertExpiryAlertGate) shouldAlert(caddyID string, level int, now t
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	day := now.Format("2006-01-02")
+	if g.activeDay != day {
+		// 日界滚动时丢弃前一天全部证书键：删除规则的历史 ID 不得跨日累积。
+		g.activeDay = day
+		g.seen = make(map[string]manualCertExpiryAlertRecord)
+	} else if g.seen == nil {
+		g.seen = make(map[string]manualCertExpiryAlertRecord)
+	}
 	if record, ok := g.seen[caddyID]; ok && record.day == day && record.level >= level {
 		return false
 	}

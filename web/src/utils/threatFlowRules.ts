@@ -48,6 +48,11 @@ export function shouldAggregate(count: number): boolean {
   return count > FLOW_AGGREGATE_THRESHOLD
 }
 
+/** 后端采样契约：-1=自适应、0=关闭、1=全量、2-64=固定 1/N。 */
+export function normalizeTrafficSampleN(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= -1 && value <= 64 ? value : -1
+}
+
 /** 按 region + 秒桶分组；保持输入顺序，供光流和弹框共同消费。 */
 export function flowGroupEvents<T extends FlowEventLike>(events: readonly T[], now = Date.now()): FlowGroup<T>[] {
   const groups = new Map<string, FlowGroup<T>>()

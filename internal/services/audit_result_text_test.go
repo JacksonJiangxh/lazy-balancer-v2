@@ -87,3 +87,14 @@ func TestAuditResultText_literalArgsCovered(t *testing.T) {
 	}
 	t.Fatalf("AuditResultPart 字面量结果码缺中文映射（请在 auditResultTextMap 补齐）:\n%s", b.String())
 }
+
+func TestAuditResultText_ticketFailureCodes(t *testing.T) {
+	for _, code := range []string{"invalid_ticket", "invalid_signature", "expired", "replay", "user_unavailable", "database_error"} {
+		if got := AuditResultText(code); got == code || got == "" {
+			t.Fatalf("ticket failure code %q must have a Chinese audit rendering, got %q", code, got)
+		}
+	}
+	if got := AuditResultText("unknown_ticket_reason"); got != "unknown_ticket_reason" {
+		t.Fatalf("unknown codes must pass through unchanged, got %q", got)
+	}
+}

@@ -182,8 +182,15 @@ const fetchIndex = async (openSeq: number | null): Promise<void> => {
 
 // 发起/复用在途请求：inflight 非空=已有任一消费方的在途请求，直接复用（跨实例去重）
 const startFetch = (openSeq: number | null): Promise<void> => {
-  if (inflight) return inflight
+  // 新会话必须先登记：旧请求若因此失效，settled 后链式补取最新会话，
+  // 不得让后直接复用旧 inflight 的调用方空等且永不 loaded。
   requestedSeq = openSeq
+  if (inflight) {
+    return inflight.then(() => {
+      if (loadedSeq === openSeq || requestedSeq !== openSeq) return
+      return startFetch(openSeq)
+    })
+  }
   inflight = fetchIndex(openSeq).finally(() => { inflight = null })
   return inflight
 }

@@ -198,12 +198,13 @@ func RemoveCertJobLogFiles(ruleID string) error {
 	lockCertJobLog(ruleID).Lock()
 	defer lockCertJobLog(ruleID).Unlock()
 	path := CertJobLogPath(ruleID)
+	candidates := make([]string, 0, maxRotatedFiles+2)
+	candidates = append(candidates, path, path+".gz")
+	for index := 1; index <= maxRotatedFiles; index++ {
+		candidates = append(candidates, fmt.Sprintf("%s.%d", path, index))
+	}
 	var cleanupErrors []error
-	for index := 0; index <= maxRotatedFiles; index++ {
-		candidate := path
-		if index > 0 {
-			candidate = fmt.Sprintf("%s.%d", path, index)
-		}
+	for _, candidate := range candidates {
 		if err := os.Remove(candidate); err != nil && !os.IsNotExist(err) {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("删除证书任务日志 %s: %w", candidate, err))
 		}

@@ -140,6 +140,9 @@ func TestStageBlockPages_stage3LiftsAllPolicySegmentsAndRoute(t *testing.T) {
 	for _, routeValue := range errorRoutes {
 		route := mustMap(t, routeValue, "error route")
 		expr, _ := routeMatcher(t, route)["expression"].(string)
+		if strings.Contains(expr, "== 483") || strings.Contains(expr, "== 484") {
+			t.Fatalf("stage3 override emitted unreachable per-policy route %s", expr)
+		}
 		if strings.Contains(expr, "== 482") {
 			stageRoute = route
 		}
@@ -150,6 +153,40 @@ func TestStageBlockPages_stage3LiftsAllPolicySegmentsAndRoute(t *testing.T) {
 	handler := firstHandler(t, stageRoute)
 	assertEqual(t, handler["body"], "<html>stage-three</html>")
 	assertEqual(t, handler["status_code"], 503)
+}
+
+func TestStageBlockPages_stage3OverrideKeepsSharedPolicyRouteForUncoveredRule(t *testing.T) {
+	stubSecurityLibsAvailable(t)
+	useTemporaryCertDir(t)
+	_, database := newClusterTestService(t)
+	seedHTTPRuleForGeneration(t, database, "lb_st_cover", "cover.example.test", 8080)
+	seedHTTPRuleForGeneration(t, database, "lb_st_plain", "plain.example.test", 8080)
+	seedSecurityBlockPage(t, database, 7, "<html>shared</html>")
+	seedSecurityBlockPage(t, database, 9, "<html>stage-three</html>")
+	policyID := mpGenBindPolicy(t, database, "lb_st_cover", "shared-policy", mpGenPolicySpec{
+		mode: "blocking", enabled: true, blockPageID: 7, blockStatusCode: 451,
+		ipACLEnabled: true, ipACLMode: "deny", ipACLList: `["203.0.113.0/24"]`,
+	})
+	if _, err := database.Exec(`INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES ('lb_st_plain',?)`, policyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE lb_rules SET block_page_stage3_id=9,block_page_stage3_status=503 WHERE caddy_id='lb_st_cover'`); err != nil {
+		t.Fatal(err)
+	}
+
+	generated := generateCaddyConfigFromStore(database)
+	errorRoutes, _ := serverErrorRoutes(t, generated, "http_8080")
+	var has482, has483 bool
+	var expressions []string
+	for _, routeValue := range errorRoutes {
+		expr, _ := routeMatcher(t, mustMap(t, routeValue, "error route"))["expression"].(string)
+		expressions = append(expressions, expr)
+		has482 = has482 || strings.Contains(expr, "== 482")
+		has483 = has483 || strings.Contains(expr, "== 483")
+	}
+	if !has482 || !has483 {
+		t.Fatalf("stage override must keep 482 and shared policy 483 route: 482=%v 483=%v expressions=%v", has482, has483, expressions)
+	}
 }
 
 func TestStageBlockPages_sameServerMultipleHostsKeepOwnStagePage(t *testing.T) {

@@ -19,6 +19,7 @@
 package wafiplist
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"net/netip"
@@ -146,7 +147,7 @@ func NormalizeAllowedPath(path string) (string, error) {
 // 绝对路径 ∧ 在 AllowedPathPrefix 下。Clean 已折叠全部 `..` 段（含越过根的
 // 形态），因此不再对原始串做 contains("..")——那会误拒文件名合法的
 // `a..b.txt`，且错误信息误导排查。算子与导出入口（LoadPrefixesFresh/
-// ResolvePrefixes）共用单源。
+// NormalizeAllowedPath）共用单源。
 func resolveAllowedPath(path string) (string, error) {
 	cleaned := filepath.Clean(path)
 	if !filepath.IsAbs(cleaned) || !strings.HasPrefix(cleaned, AllowedPathPrefix) {
@@ -207,25 +208,17 @@ func LoadPrefixesFresh(path string) ([]netip.Prefix, error) {
 	return state.combined, nil
 }
 
-// ResolvePrefixes 是运行期导出入口（lb_file 的 GetIPRanges 逐请求消费）：
-// 白名单同规；节流（StatCheckInterval）命中返回缓存快照；文件变化检出后
-// 重建；重建失败且有旧集 → fail-stale 返回旧集（IPRangeSource 契约——运行期
-// 取网段 MUST NOT fail，否则取消在途请求）。从未成功加载（Provision 已拦
-// 截，缓存被 GC 淘汰+文件消失的残余形态）→ error，由调用方按空集处理
-// （信任无来源，fail-closed）。返回切片为缓存共享只读快照，消费方 MUST NOT
-// 修改。
-func ResolvePrefixes(path string) ([]netip.Prefix, error) {
-	cleaned, err := resolveAllowedPath(path)
-	if err != nil {
-		return nil, err
-	}
-	return ResolvePrefixesNormalized(cleaned)
-}
-
 // ResolvePrefixesNormalized 是已完成 NormalizeAllowedPath 的调用方专用热路径
 // 入口（目前仅 caddygeoip.FileIPRangeSource 的 provisioned 字段）。跳过重复的
 // Clean/白名单校验，直接执行节流缓存解析；调用方 MUST 保证 path 来自归一结果，
-// 不得把用户原始输入直接传入。fail-stale 与只读快照契约同 ResolvePrefixes。
+// 不得把用户原始输入直接传入。
+//
+// 运行期契约（lb_file 的 GetIPRanges 逐请求消费）：节流（StatCheckInterval）
+// 命中返回缓存快照；文件变化检出后重建；重建失败且有旧集 → fail-stale 返回
+// 旧集（IPRangeSource 契约——运行期取网段 MUST NOT fail，否则取消在途请求）。
+// 从未成功加载（Provision 已拦截，缓存被 GC 淘汰+文件消失的残余形态）→
+// error，由调用方按空集处理（信任无来源，fail-closed）。返回切片为缓存共享
+// 只读快照，消费方 MUST NOT 修改。
 func ResolvePrefixesNormalized(path string) ([]netip.Prefix, error) {
 	state, err := resolveIPListFile(path)
 	if err != nil {
@@ -336,20 +329,23 @@ func parseIPListFile(path string, info os.FileInfo) (*ipListFileState, error) {
 		capHint = MaxEntries + 1
 	}
 	prefixes := make([]netip.Prefix, 0, capHint)
-	content := string(raw)
-	for lineNo, start := 1, 0; start <= len(content); lineNo++ {
-		line := content[start:]
-		if i := strings.IndexByte(line, '\n'); i >= 0 {
+	// U80 E-CM-07：直接在原始字节上按行迭代（bytes.IndexByte + TrimSpace），
+	// 不再整文件复制成 string（MaxFileBytes 64MB 上限时 raw+string 双份常驻
+	// =2× 文件体积峰值）；仅实际条目行短生命周期转 string 供 ParseIPEntry，
+	// 空行/注释行零分配跳过。
+	for lineNo, start := 1, 0; start <= len(raw); lineNo++ {
+		line := raw[start:]
+		if i := bytes.IndexByte(line, '\n'); i >= 0 {
 			line = line[:i]
 			start += i + 1
 		} else {
-			start = len(content) + 1 // 末行（无换行）
+			start = len(raw) + 1 // 末行（无换行）
 		}
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || line[0] == '#' || line[0] == ';' {
 			continue
 		}
-		prefix, perr := ParseIPEntry(line)
+		prefix, perr := ParseIPEntry(string(line))
 		if perr != nil {
 			return nil, fmt.Errorf("IP 名单 %q 第 %d 行不可解析: %q", path, lineNo, line)
 		}

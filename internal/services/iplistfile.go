@@ -61,7 +61,22 @@ func EnsureIPListDir() error {
 // 轮陈旧引用集差集会误删在役文件——统一由整轮渲染 apply 成功后触发
 // （maybeGCStaleIPListFiles，引用集落齐再差集；全部阈值为 time.Since 时长
 // 比较，无挂钟排程、与时区配置无关）。
+func validIPListScope(scope string) bool {
+	if scope == "" || len(scope) > 128 {
+		return false
+	}
+	for _, r := range scope {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '_' && r != '-' && r != '.' {
+			return false
+		}
+	}
+	return true
+}
+
 func writeIPListFile(scope string, merged []string) (string, error) {
+	if !validIPListScope(scope) {
+		return "", fmt.Errorf("IP 名单投影 scope 含非法字符或超出长度限制: %q", scope)
+	}
 	merged = wafiplist.AggregateIPEntries(merged)
 	// 内容先于 stat 构建：稳定命名下「同路径」不再蕴含「同内容」——字节比对
 	// 才是跳写判据（内容寻址时代的 stat 命中=同内容前提已随热路径改造失效）。

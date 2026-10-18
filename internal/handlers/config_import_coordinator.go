@@ -25,9 +25,20 @@ const (
 	importPhaseQueue       importPhase = "queue"
 )
 
+var (
+	removeImportRuleLogFiles    = services.RemoveRuleLogFiles
+	removeImportCertJobLogFiles = services.RemoveCertJobLogFiles
+	cancelImportInFlightRuns    = func() {
+		if te := services.TaskEngine(); te != nil {
+			te.CancelInFlightRuns()
+		}
+	}
+)
+
 type importCoordinatorError struct {
-	phase importPhase
-	err   error
+	phase         importPhase
+	err           error
+	caddyRejected bool
 }
 
 func (err *importCoordinatorError) Error() string { return importFailureAuditDescription(err) }
@@ -45,7 +56,10 @@ func importFailureAuditDescription(err error) string {
 	case importPhaseCertificate:
 		description = "导入失败（证书准备失败，数据库未变更）"
 	case importPhaseCaddy:
-		description = "导入失败（Caddy 验证失败，数据库未变更）"
+		description = "导入失败（Caddy 应用失败，数据库未变更）"
+		if coordinatorErr.caddyRejected {
+			description = "导入失败（Caddy 验证失败，数据库未变更）"
+		}
 	case importPhaseVersion:
 		description = "导入失败（集群版本更新失败，数据库未变更）"
 	case importPhaseCommit:
@@ -59,13 +73,14 @@ func importFailureAuditDescription(err error) string {
 }
 
 type configImportSession struct {
-	h               *Handlers
-	ctx             context.Context
-	tx              *sql.Tx
-	recovery        importQueueRecovery
-	existingRuleIDs []string
-	runtime         *importRuntimeSnapshot
-	finished        bool
+	h                     *Handlers
+	ctx                   context.Context
+	tx                    *sql.Tx
+	recovery              importQueueRecovery
+	existingRuleIDs       []string
+	runtime               *importRuntimeSnapshot
+	runtimeApplyAttempted bool
+	finished              bool
 }
 
 // errCertQueueDrainIncomplete 证书队列排空未完成（历史问题）：PauseAndDrain
@@ -75,6 +90,9 @@ var errCertQueueDrainIncomplete = errors.New("证书任务执行中，请稍后�
 
 func (h *Handlers) beginConfigImport(ctx context.Context) (*configImportSession, error) {
 	h.caddyOpMu.Lock()
+	// 历史问题：导入将全量替换业务数据——先取消在途 Scheduled/Periodic/Oneshot
+	// Run（Daemon 不在范围），避免其提交在导入事务之后形成 last-writer-wins。
+	cancelImportInFlightRuns()
 	session := &configImportSession{h: h, ctx: ctx, recovery: importQueueRecovery{manager: services.GetCAQueueManager()}}
 	ruleIDs, err := currentRuleIDs(ctx)
 	if err != nil {
@@ -131,6 +149,16 @@ func (session *configImportSession) abort(importErr error) error {
 	// 快照阶段失败等未渲染形态为同字节 no-op）。已持 caddyOpMu（begin 起）。
 	session.h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 	if session.runtime != nil {
+		if session.runtimeApplyAttempted {
+			// 事务内 apply 可能已成功写入未提交配置与 LKG。先释放事务写锁，
+			// 再以已提交视图重渲染/强制应用：即使恢复 /load 失败，
+			// RestoreRuntimeToCommittedInLock 也会把已提交字节写回 LKG。
+			certErr := services.RestoreCertFiles(session.runtime.certFiles)
+			restoreErr := session.h.recoverCommittedViewAfterCommitFailure(session.tx)
+			importErr = errors.Join(importErr, certErr, restoreErr)
+			session.finished = true
+			return finishImportFailure(session.tx, &session.recovery, importErr)
+		}
 		if restoreErr := session.h.restoreImportRuntime(*session.runtime); restoreErr != nil {
 			importErr = errors.Join(importErr, fmt.Errorf("恢复运行配置失败: %w", restoreErr))
 		}
@@ -158,10 +186,11 @@ func (session *configImportSession) commit(affectedRuleIDs []string, certificate
 	// 事务视图渲染）。校验器不可用放行——下方 ApplyConfigFromTxCertAwareForce
 	// 仍是门控（全有全无）。
 	if err := session.h.caddyService.ValidateTxRenderViaCLI(session.tx); err != nil && !errors.Is(err, services.ErrCLIValidatorUnavailable) {
-		return &importCoordinatorError{phase: importPhaseCaddy, err: session.abort(err)}
+		return &importCoordinatorError{phase: importPhaseCaddy, err: session.abort(err), caddyRejected: services.IsConfigRejected(err)}
 	}
+	session.runtimeApplyAttempted = true
 	if err := session.h.caddyService.ApplyConfigFromTxCertAwareForce(session.tx); err != nil {
-		return &importCoordinatorError{phase: importPhaseCaddy, err: session.abort(err)}
+		return &importCoordinatorError{phase: importPhaseCaddy, err: session.abort(err), caddyRejected: services.IsConfigRejected(err)}
 	}
 	if err := services.BumpClusterVersion(session.ctx, session.tx); err != nil {
 		return &importCoordinatorError{phase: importPhaseVersion, err: session.abort(err)}
@@ -195,8 +224,14 @@ func importFailurePhase(err error) importPhase {
 	return ""
 }
 
+func importFailureCaddyRejected(err error) bool {
+	var coordinatorErr *importCoordinatorError
+	return errors.As(err, &coordinatorErr) && coordinatorErr.phase == importPhaseCaddy && coordinatorErr.caddyRejected
+}
+
 // cleanupDisappearedRuleArtifacts 清理本次导入中消失规则的产物（历史问题 C-F1/F2）：
-// 证书文件 + 孤儿 cert_jobs 行。提交成功后调用；失败仅审计留痕，不否决导入。
+// 证书文件、孤儿 cert_jobs 行、指标与规则/证书日志。提交成功后调用；失败仅
+// 审计留痕，不否决导入。
 func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 	currentIDs, err := currentRuleIDs(session.ctx)
 	if err != nil {
@@ -221,6 +256,16 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 		if err := services.RemoveCertFiles(id); err != nil {
 			services.Logf("warn", "导入清理：删除消失规则 %s 的证书文件失败: %v", id, err)
 		}
+		if db.MetricsDB != nil {
+			if _, err := db.MetricsDB.ExecContext(session.ctx, "DELETE FROM metrics_history WHERE rule_id=?", id); err != nil {
+				services.Logf("error", "导入清理：删除消失规则 %s 的指标失败: %v", id, err)
+			}
+		}
+		removeImportRuleLogFiles(id)
+		if err := removeImportCertJobLogFiles(id); err != nil {
+			services.Logf("error", "导入清理：删除消失规则 %s 的证书日志失败: %v", id, err)
+			services.RecordAuditLog("system", "清理失败", "证书日志", fmt.Sprintf("导入后清理规则 %s 的证书日志失败：%v", id, err), "")
+		}
 	}
 	// 与 v2 导入事务内的孤儿清理同语句（幂等重复无害）；覆盖 v1 路径与
 	// 理论上的绕过路径。
@@ -238,5 +283,5 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 		services.RecordAuditLog("system", "清理失败", "证书任务", fmt.Sprintf("导入后清理失效证书任务失败：%v", err), "")
 		return
 	}
-	services.RecordAuditLog("system", "清理", "证书产物", fmt.Sprintf("导入移除 %d 条规则，已清理其证书文件与任务行", len(disappeared)), "")
+	services.RecordAuditLog("system", "清理", "证书产物", fmt.Sprintf("导入移除 %d 条规则，已清理其证书文件、任务行、指标与日志", len(disappeared)), "")
 }

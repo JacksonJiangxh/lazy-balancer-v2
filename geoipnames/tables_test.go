@@ -5,7 +5,9 @@ import "testing"
 // 共享表内容钉（PLUG-N3，历史）：四张表从 internal/services 与
 // caddygeoip 的镜像双份收敛为单源——钉条目数（防意外截断/漏行）与关键
 // 映射（防键值漂移）。条目数基线取自收敛前镜像测试的核验值
-// （22/13/45/31，两侧逐条人工比对一致）。
+// （22/13/45/31，两侧逐条人工比对一致）；U80 E-CM-04 起 ProvinceAliases
+// 剔除 11 条恒等别名（key==value 死条目，未命中即原样返回不影响输出），
+// 基线 22→11，并加零恒等钉防回潮。
 func TestGeoipNamesTables_pinnedCountsAndSpotMappings(t *testing.T) {
 	// Given/When/Then：条目数钉
 	counts := []struct {
@@ -13,7 +15,7 @@ func TestGeoipNamesTables_pinnedCountsAndSpotMappings(t *testing.T) {
 		got  int
 		want int
 	}{
-		{"ProvinceAliases", len(ProvinceAliases), 22},
+		{"ProvinceAliases", len(ProvinceAliases), 11},
 		{"TaiwanCities", len(TaiwanCities), 13},
 		{"CityPinyinFixes", len(CityPinyinFixes), 45},
 		{"AutonomousPrefectures", len(AutonomousPrefectures), 31},
@@ -21,6 +23,21 @@ func TestGeoipNamesTables_pinnedCountsAndSpotMappings(t *testing.T) {
 	for _, c := range counts {
 		if c.got != c.want {
 			t.Errorf("%s entries=%d; want %d (表内容变动须显式更新本钉——漂移曾致城市级地域规则静默恒不命中)", c.name, c.got, c.want)
+		}
+	}
+
+	// And：零恒等映射钉（E-CM-04——恒等别名是死条目，canonical* 未命中
+	// 本就原样返回）
+	for name, table := range map[string]map[string]string{
+		"ProvinceAliases":       ProvinceAliases,
+		"CityPinyinFixes":       CityPinyinFixes,
+		"AutonomousPrefectures": AutonomousPrefectures,
+		"OverseasCountries":     OverseasCountries,
+	} {
+		for k, v := range table {
+			if k == v {
+				t.Errorf("%s 含恒等映射 %q（死条目，删除）", name, k)
+			}
 		}
 	}
 

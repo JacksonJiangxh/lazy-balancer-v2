@@ -340,7 +340,10 @@ func TestLoadAutoBackupSectionsSetting_normalizesLegacyKeys(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_sections='["users","global_config","rules","waf_files","security"]' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	got := loadAutoBackupSectionsSetting()
+	got, err := loadAutoBackupSectionsSetting()
+	if err != nil {
+		t.Fatalf("load legacy sections: %v", err)
+	}
 	want := []string{"users", "rules", "security"}
 	if len(got) != len(want) {
 		t.Fatalf("loaded sections=%v, want %v", got, want)
@@ -349,6 +352,45 @@ func TestLoadAutoBackupSectionsSetting_normalizesLegacyKeys(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("loaded sections=%v, want %v", got, want)
 		}
+	}
+}
+
+func TestRunAutoBackupOnce_rejectsDamagedSections(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_sections='{broken' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := h.RunAutoBackupOnce(context.Background(), "manual", "tester", 0)
+
+	if err == nil || !strings.Contains(err.Error(), "备份范围") {
+		t.Fatalf("RunAutoBackupOnce err=%v, want damaged-sections error", err)
+	}
+	var failed, succeeded int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM auto_backups WHERE status='failed' AND message LIKE '%备份范围%'`).Scan(&failed); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM auto_backups WHERE status='success'`).Scan(&succeeded); err != nil {
+		t.Fatal(err)
+	}
+	if failed != 1 || succeeded != 0 {
+		t.Fatalf("backup rows failed=%d success=%d, want 1/0", failed, succeeded)
+	}
+	if countAutoBackupAudit(t, "备份失败") == 0 {
+		t.Fatal("damaged sections must leave a failure audit")
+	}
+}
+
+func TestRunAutoBackupOnce_reportsSectionsReadFailure(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`DROP TABLE global_config`); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := h.RunAutoBackupOnce(context.Background(), "schedule", "system", 0)
+
+	if err == nil || !strings.Contains(err.Error(), "读取备份范围") {
+		t.Fatalf("RunAutoBackupOnce err=%v, want sections read failure", err)
 	}
 }
 

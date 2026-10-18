@@ -108,6 +108,26 @@ func TestWriteIPListFile_stableNaming(t *testing.T) {
 	}
 }
 
+// SVC-80-D1-01：scope 是文件名片段，必须拒绝路径分隔/绝对路径等逃逸形态；
+// 大写、点、下划线与连字符是既有导入兼容字符，不得被守卫误伤。
+func TestWriteIPListFile_scopeCharsetGuard(t *testing.T) {
+	for _, scope := range []string{"", "../escape", "/absolute", `..\\escape`, "u-deny-lb/evil", "u-deny-lb\x00evil", "u-deny-中文"} {
+		if path, err := writeIPListFile(scope, []string{"203.0.113.7"}); err == nil {
+			t.Fatalf("unsafe scope %q unexpectedly wrote %s", scope, path)
+		}
+	}
+	path, err := writeIPListFile("u-deny-LB_Upper.example-1", []string{"203.0.113.7"})
+	if err != nil {
+		t.Fatalf("compatible scope rejected: %v", err)
+	}
+	if got := filepath.Base(path); got != "u-deny-LB_Upper.example-1.txt" {
+		t.Fatalf("compatible projection name=%q", got)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(IPListDataDir), "escape.txt")); !os.IsNotExist(err) {
+		t.Fatalf("path traversal created outside projection dir: %v", err)
+	}
+}
+
 // 同字节跳写：内容一致的重投影（全量渲染重投影不动）不得重写文件——mtime
 // 保持不变（wafiplist stat 形态缓存命中，运行期匹配器零重建）。
 func TestWriteIPListFile_identicalContentSkipsWrite(t *testing.T) {

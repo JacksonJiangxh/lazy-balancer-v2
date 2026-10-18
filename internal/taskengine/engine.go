@@ -158,6 +158,12 @@ type Engine struct {
 
 	// daemonRestartDelays 常驻异常退出后的有界重拉退避表（历史问题-04）
 	daemonRestartDelays []time.Duration
+
+	// schedPaused 装配期暂停 tick 调度（历史问题，历史）：BootSync
+	// （startup:config-load 等）完成前周期/定时任务不得抢跑（配置未加载即
+	// 执行首轮）。仅装配路径经 Options.StartPaused 置位；仅暂停 tick 投递，
+	// Trigger/RunSync/StartLoop/RunBootSyncTasks 不受影响。
+	schedPaused atomic.Bool
 }
 
 type Options struct {
@@ -166,6 +172,10 @@ type Options struct {
 	// 重拉退避（历史 历史问题-04）：长度=最大重拉次数，逐次消耗。空=引擎
 	// 默认 1s/5s/30s（三次用尽后停止调度并留痕，防紧循环）。
 	DaemonRestartDelays []time.Duration
+	// StartPaused（历史问题，历史）：以暂停 tick 形态启动——装配方在
+	// RunBootSyncTasks 完成后必须调 ResumeScheduling，否则周期/定时任务
+	// 永不调度。
+	StartPaused bool
 }
 
 // 默认常驻重拉退避（1s/5s/30s）与「健康运行」判定阈值：Run 存活超过该
@@ -188,9 +198,15 @@ func NewEngine(opts Options) *Engine {
 		startedAt:           time.Now(),
 		daemonRestartDelays: append([]time.Duration(nil), delays...),
 	}
+	e.schedPaused.Store(opts.StartPaused)
 	go e.scheduleLoop()
 	return e
 }
+
+// ResumeScheduling 结束装配暂停（历史问题，历史）：仅在 Options.StartPaused
+// 启动的引擎上有语义——InitTaskEngine 在 RunBootSyncTasks 之后调用，
+// BootSync 完成前 tick 不投递周期/定时任务。幂等。
+func (e *Engine) ResumeScheduling() { e.schedPaused.Store(false) }
 
 func (e *Engine) StartedAt() time.Time { return e.startedAt }
 
@@ -340,9 +356,23 @@ func (e *Engine) tryStartDaemon(r *registration, restartIntent bool) {
 		e.mu.RUnlock()
 		return
 	}
+	// 历史问题（历史）：角色门内化进 CAS 临界区（锁序 e.mu→roleMu→r.mu，
+	// 与 runNow 的 roleMu→r.mu 同向）——此前角色只是调用方预检，预检与
+	// running 占位之间存在窗口：demote 在预检后完成 SetRole 的 cancel 遍历、
+	// 未及本次登记，master-only daemon 即在 slave 上存活。现角色复查与
+	// cancel 登记同属一个 roleMu 读临界区：SetRole 写锁要么先于本门
+	// （role=false 直接拒绝启动），要么后于登记（demote 的 cancel 遍历
+	// 必命中本次登记的 cancel）。
+	e.roleMu.RLock()
+	if !e.roleAllowsLocked(r.desc.RunsOn) {
+		e.roleMu.RUnlock()
+		e.mu.RUnlock()
+		return
+	}
 	r.mu.Lock()
 	if !r.loopEnabled {
 		r.mu.Unlock()
+		e.roleMu.RUnlock()
 		e.mu.RUnlock()
 		return
 	}
@@ -353,6 +383,7 @@ func (e *Engine) tryStartDaemon(r *registration, restartIntent bool) {
 			r.pendingRestart = true
 		}
 		r.mu.Unlock()
+		e.roleMu.RUnlock()
 		e.mu.RUnlock()
 		return
 	}
@@ -362,6 +393,7 @@ func (e *Engine) tryStartDaemon(r *registration, restartIntent bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 	r.mu.Unlock()
+	e.roleMu.RUnlock()
 	e.mu.RUnlock()
 	e.startDaemon(r.desc.ID, r, ctx, cancel)
 }
@@ -523,6 +555,35 @@ func (e *Engine) Cancel(id string) bool {
 	return true
 }
 
+// CancelInFlightRuns 取消全部在途 Scheduled/Periodic/Oneshot Run（历史问题，
+// 历史）：配置导入/还原全量替换的前置排空——证书队列 PauseAndDrain
+// 之外的其余任务族在途执行会在导入提交后把旧库状态写回新库
+// （last-writer-wins）。Run 体经 rc.Ctx 收到取消，按既有语义落
+// cancelled/skipped 终态。Daemon 不在此列（常驻族取消即停摆、需显式
+// 拉起，生命周期归角色门/启停管理）。返回本次取消的在途 Run 数。
+func (e *Engine) CancelInFlightRuns() int {
+	e.mu.RLock()
+	regs := make([]*registration, 0, len(e.regs))
+	for _, r := range e.regs {
+		if r.desc.Kind != KindDaemon {
+			regs = append(regs, r)
+		}
+	}
+	e.mu.RUnlock()
+	cancelled := 0
+	for _, r := range regs {
+		r.mu.Lock()
+		c := r.cancel
+		running := r.running
+		r.mu.Unlock()
+		if c != nil && running {
+			c()
+			cancelled++
+		}
+	}
+	return cancelled
+}
+
 // ---- StartLoop/StopLoop：循环启停 ----
 // Periodic/Scheduled: 设 loopEnabled（引擎按间隔/槽调度）
 // Daemon: 启动/停止自管理循环
@@ -661,8 +722,7 @@ func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, ca
 		// 异常退出（非取消）＝Run 返回错误或 panic（历史问题-01 隔离）。
 		abnormal := err != nil && ctx.Err() == nil
 
-		var relaunchCtx context.Context
-		var relaunchCancel context.CancelFunc
+		var relaunchIntent bool
 		// 历史 历史问题-04：异常退出有界重拉（退避在锁外等待）。
 		var relaunchDelay time.Duration
 		var relaunchAttempt int
@@ -677,17 +737,12 @@ func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, ca
 		if r.pendingRestart {
 			r.pendingRestart = false
 			if r.loopEnabled && !abnormal && !stopped && allows {
-				r.running = true
-				relaunchCtx, relaunchCancel = context.WithCancel(context.Background())
-				r.cancel = relaunchCancel
-				// 竞态兜底：首次读 stopped 后、本临界区前 Stop() 恰好
-				// 完成（其 cancel 遍历未及本次登记）——临界区内复核。
-				if e.stopped.Load() {
-					relaunchCancel()
-					relaunchCtx = nil
-					r.cancel = nil
-					r.running = false
-				}
+				// 历史问题（历史）：换代不再在本临界区内联登记 cancel——
+				// 快照 allows 与登记之间 demote 可插入（SetRole 的 cancel
+				// 遍历未及新登记），master-only daemon 会在 slave 上存活。
+				// 改为锁外经 tryStartDaemon 统一 CAS 入口重拉（角色门已
+				// 内化进其 CAS 临界区，以新鲜角色复核）。
+				relaunchIntent = true
 			}
 		}
 		// 异常退出（非取消）且仍在调度=故障自愈：按有界退避重拉。修复前仅
@@ -727,8 +782,11 @@ func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, ca
 		} else {
 			taskLogAppend(id, fmt.Sprintf("[done] stopped 耗时=%dms 触发=auto（取消/正常退出）", dur))
 		}
-		if relaunchCtx != nil {
-			e.startDaemon(id, r, relaunchCtx, relaunchCancel) // 历史问题-3：restart 意图落地——新代接续
+		if relaunchIntent {
+			// 历史问题-3：restart 意图落地——新代经统一 CAS 入口接续
+			// （restartIntent=false：pendingRestart 已在本代消费；其间
+			// 并发 StartLoop/角色翻转的新占位优先，不重复拉起）。
+			e.tryStartDaemon(r, false)
 		}
 		if relaunchDelay > 0 {
 			e.scheduleDaemonRelaunch(r, relaunchDelay)
@@ -837,6 +895,19 @@ func safeInterval(kind string, fn func() time.Duration) (v time.Duration) {
 	return fn()
 }
 
+// safeString（历史问题，历史）：StatusFn 同族隔离——fail-closed 返回空串
+// （状态镜像缺失，视图降级为无镜像，不得让单任务闭包 panic 杀死
+// Lookup/DescribeAll 整页）。
+func safeString(kind string, fn func() string) (v string) {
+	defer func() {
+		if p := recover(); p != nil {
+			warnSchedFnPanic(kind, p)
+			v = ""
+		}
+	}()
+	return fn()
+}
+
 // ---- 历史与统计 ----
 
 func (e *Engine) History(id string, limit int) []RunRecord {
@@ -918,8 +989,16 @@ func (e *Engine) runNow(id, trigger, operator string) (int64, error) {
 	r.running = true
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
+	// 历史问题（历史）：Stop×runNow 竞态兜底——本临界区登记前 Stop() 可能
+	// 已完成 regs 的 cancel 遍历（未及本次登记）；临界区内复核 stopped，
+	// 已停即锁外取消，Run 体落 cancelled 终态而非在引擎停止后跑完
+	// （与 daemon 退出清理的 stopped 复核同型）。
+	stopAfterRegister := e.stopped.Load()
 	r.mu.Unlock()
 	e.roleMu.RUnlock()
+	if stopAfterRegister {
+		cancel()
+	}
 
 	// 记录策略（按 Kind，零 flag）：
 	// Scheduled/Periodic/Oneshot: 每次执行落行；Daemon: 仅 startDaemon 落行
@@ -957,7 +1036,10 @@ func (e *Engine) runNow(id, trigger, operator string) (int64, error) {
 	var nextSlot time.Time
 	hasSlotFn := r.desc.Kind == KindScheduled && r.desc.NextSlotFn != nil
 	if hasSlotFn {
-		nextSlot = r.desc.NextSlotFn()
+		// 历史问题-2/历史问题（历史）：与 tick/Lookup/DescribeAll 同口径的
+		// panic 隔离——NextSlotFn 是装配方闭包（生产为 DB 直读），裸调
+		// panic 会经 runNow 上抛给调用方（tick goroutine/手动触发链）。
+		nextSlot = safeSlot(id+".NextSlotFn", r.desc.NextSlotFn)
 	}
 	r.mu.Lock()
 	r.running = false
@@ -1038,6 +1120,9 @@ func (e *Engine) runScheduleTicker() (stopped bool) {
 }
 
 func (e *Engine) tick() {
+	if e.schedPaused.Load() {
+		return // 历史问题（历史）：装配暂停期不投递（BootSync 前置不变量）
+	}
 	now := time.Now()
 	e.mu.RLock()
 	ids := make([]string, 0, len(e.regs))
@@ -1277,6 +1362,9 @@ func globalInsertRunAt(taskID, family, trigger, startedAt, operator string) int6
 	}
 	res, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, trigger, operator, status, started_at) VALUES (?,?,?,?, 'running',?)`, taskID, family, trigger, operator, startedAt)
 	if err != nil {
+		// 历史问题（历史）：插入失败不得静默——runID=0 时后续 finishRun
+		// 全系 no-op，该轮执行在任务历史彻底蒸发（零信号）。
+		log.Printf("WARNING: taskengine: task_runs 插入失败（%s 本轮无运行记录行）: %v", taskID, err)
 		return 0
 	}
 	id, _ := res.LastInsertId()
@@ -1287,14 +1375,20 @@ func (e *Engine) finishRun(runID int64, status string, durMs int64) {
 	if runID <= 0 || db.DB == nil {
 		return
 	}
-	_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=? WHERE id=?`, status, engineNowStr(), durMs, runID)
+	// 历史问题（历史）：终态更新失败留痕——否则该行滞留 running 终态，
+	// 只能等进程重启被 RecoverOrphans 回收成 interrupted（失真）。
+	if _, err := db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=? WHERE id=?`, status, engineNowStr(), durMs, runID); err != nil {
+		log.Printf("WARNING: taskengine: task_runs 终态更新失败（run=%d 滞留 running，目标=%s）: %v", runID, status, err)
+	}
 }
 
 func (e *Engine) finishRunWithMessage(runID int64, status string, durMs int64, message string) {
 	if runID <= 0 || db.DB == nil {
 		return
 	}
-	_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=?, message=? WHERE id=?`, status, engineNowStr(), durMs, message, runID)
+	if _, err := db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=?, message=? WHERE id=?`, status, engineNowStr(), durMs, message, runID); err != nil {
+		log.Printf("WARNING: taskengine: task_runs 终态更新失败（run=%d 滞留 running，目标=%s）: %v", runID, status, err)
+	}
 }
 
 // RecordRunStart/Finish 族侧记录（legacy 路径：非引擎调用的直接执行）
@@ -1303,14 +1397,21 @@ func RecordRunStart(taskID, family, trigger string) int64 {
 }
 
 func RecordRunFinish(runID int64, status string, durMs int64, message string) {
-	if runID <= 0 {
+	// 历史问题-3（历史）：与同文件其余导出 DB 函数同形的 nil 防护——
+	// legacy 直调路径在装配顺序变化/测试环境下 db.DB 可能为 nil（裸 Exec
+	// 即 panic）。
+	if runID <= 0 || db.DB == nil {
 		return
 	}
 	if message != "" {
-		_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=?, message=? WHERE id=?`, status, engineNowStr(), durMs, message, runID)
+		if _, err := db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=?, message=? WHERE id=?`, status, engineNowStr(), durMs, message, runID); err != nil {
+			log.Printf("WARNING: taskengine: task_runs 终态更新失败（run=%d 滞留 running，目标=%s）: %v", runID, status, err)
+		}
 		return
 	}
-	_, _ = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=? WHERE id=?`, status, engineNowStr(), durMs, runID)
+	if _, err := db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=? WHERE id=?`, status, engineNowStr(), durMs, runID); err != nil {
+		log.Printf("WARNING: taskengine: task_runs 终态更新失败（run=%d 滞留 running，目标=%s）: %v", runID, status, err)
+	}
 }
 
 // ---- 元数据 ----
@@ -1374,9 +1475,10 @@ func (e *Engine) Lookup(id string) (TaskMeta, bool) {
 		m.Enabled = safeBool(id+".EnabledFn", r.desc.EnabledFn)
 	}
 	// 状态镜像角色门：与 DescribeAll 同门（2026-10-03 裁定）——角色不符
-	// 不采纳，单任务查询不旁路。
+	// 不采纳，单任务查询不旁路。历史问题（历史）：StatusFn 闭包 panic
+	// 经 safeString 隔离（与 IntervalFn/NextSlotFn/EnabledFn 同口径）。
 	if r.desc.StatusFn != nil && e.roleAllows(r.desc.RunsOn) {
-		m.StatusMirror = r.desc.StatusFn()
+		m.StatusMirror = safeString(id+".StatusFn", r.desc.StatusFn)
 	}
 	return m, true
 }
@@ -1427,8 +1529,9 @@ func (e *Engine) DescribeAll() []TaskMeta {
 		// ip2region update_status 均有主端快照镜像）——采纳即伪造本节点
 		// running。角色不符一律不采纳（空）→ 视图层呈现本节点实态；
 		// 主节点行为不变（StatusFn 保留，主侧为真实业务态）。
+		// 历史问题（历史）：StatusFn 闭包 panic 经 safeString 隔离。
 		if s.desc.StatusFn != nil && e.roleAllows(s.desc.RunsOn) {
-			m.StatusMirror = s.desc.StatusFn()
+			m.StatusMirror = safeString(s.id+".StatusFn", s.desc.StatusFn)
 		}
 		out = append(out, m)
 	}
@@ -1476,10 +1579,14 @@ func (e *Engine) Stats24h(taskID string) TaskRunsStats {
 	if db.DB == nil {
 		return st
 	}
-	_ = db.DB.QueryRow(`SELECT COUNT(*),
+	// 历史问题-4（历史）：Scan 错误不得静默丢弃——与同文件 History/
+	// RunOverview 同口径留痕（计数降级为零值，视图仍可用）。
+	if err := db.DB.QueryRow(`SELECT COUNT(*),
 		COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0)
-		FROM task_runs WHERE task_id=? AND started_at > datetime(?, '-1 day')`, taskID, engineNowStr()).Scan(&st.Runs, &st.Success, &st.Fail)
+		FROM task_runs WHERE task_id=? AND started_at > datetime(?, '-1 day')`, taskID, engineNowStr()).Scan(&st.Runs, &st.Success, &st.Fail); err != nil {
+		log.Printf("WARNING: taskengine: 24h 统计查询失败（%s 计数降级为零）: %v", taskID, err)
+	}
 	return st
 }
 

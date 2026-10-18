@@ -43,6 +43,8 @@ type issuedCertificate struct {
 	deploymentAttempt int
 }
 
+var deploymentLifecycleJobStatuses = []string{"downloaded", "cleanup_dns", "cleanup_warning"}
+
 type certificateDeploymentError struct {
 	err error
 }
@@ -192,16 +194,27 @@ func RetryCertificateDeploymentNow(jobID int, ruleID string) bool {
 
 func retryCertificateDeployment(ctx context.Context, jobID int, reloader func() error) error {
 	var material issuedCertificate
+	var expiresAt sql.NullTime
 	// 部署重试须接受与 confirmCertificateDeployment 相同的可部署状态集：启动恢复把
 	// cleanup_dns/cleanup_warning 任务调度到这里，若只收 'downloaded' 会因定时器静默
 	// 吞掉 ErrNoRows 而永久卡死；放宽后重试循环才能推进（成功→issued，反复失败→failed）。
 	if err := db.DB.QueryRowContext(ctx, `SELECT rule_id, COALESCE(cert_pem,''), COALESCE(key_pem,''), expires_at,
 		COALESCE(ca_provider_id,0), COALESCE(deployment_attempts,0)
 		FROM cert_jobs WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')`, jobID).Scan(
-		&material.ruleID, &material.certPEM, &material.keyPEM, &material.notAfter,
+		&material.ruleID, &material.certPEM, &material.keyPEM, &expiresAt,
 		&material.providerID, &material.deploymentAttempt,
 	); err != nil {
 		return fmt.Errorf("load downloaded certificate for deployment: %w", err)
+	}
+	material.notAfter = expiresAt.Time
+	if !expiresAt.Valid {
+		// 旧备份/导入可能携带 downloaded + 证书材料但 expires_at=NULL。
+		// 从 PEM 恢复唯一权威有效期；成功部署会随材料回写该列，后续续期可见。
+		notAfter, err := parseCertNotAfter(material.certPEM)
+		if err != nil {
+			return fmt.Errorf("load downloaded certificate expiry from PEM: %w", err)
+		}
+		material.notAfter = notAfter
 	}
 	manager := GetCAQueueManager()
 	if manager != nil && manager.IsRuleBlocked(material.ruleID) {
@@ -213,7 +226,7 @@ func retryCertificateDeployment(ctx context.Context, jobID int, reloader func() 
 func (s *CertIssuer) deploymentFailed(jobID int, material issuedCertificate, message string, err error) error {
 	var previousAttempt int
 	// 历史 历史问题: 使用 QueryRowContext 以响应 worker 取消信号（此处函数无 ctx，用 Background 兜底）。
-	if queryErr := db.DB.QueryRowContext(context.Background(), "SELECT COALESCE(deployment_attempts,0) FROM cert_jobs WHERE id=? AND status!='disabled'", jobID).Scan(&previousAttempt); queryErr != nil {
+	if queryErr := db.DB.QueryRowContext(context.Background(), "SELECT COALESCE(deployment_attempts,0) FROM cert_jobs WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')", jobID).Scan(&previousAttempt); queryErr != nil {
 		return &certificateDeploymentError{err: errors.Join(err, queryErr)}
 	}
 	if material.deploymentAttempt > previousAttempt {
@@ -246,7 +259,7 @@ func (s *CertIssuer) deploymentFailed(jobID int, material issuedCertificate, mes
 		fields["expires_at"] = material.notAfter
 		fields["ca_provider_id"] = material.providerID
 	}
-	updateErr := transitionJob(db.DB, jobID, jobStatusesExceptDisabled, status, fields)
+	updateErr := transitionJob(db.DB, jobID, deploymentLifecycleJobStatuses, status, fields)
 	// 历史问题（历史）：部署失败必须落 certjob-*.log（此前部署链零 WriteCertJobLog，
 	// 磁盘日志只剩签发阶段，排障需反查 DB）。ERROR 行业务行恒写；状态回写失败
 	// （CAS 冲突/DB 故障）补 WARN 行，且不改变部署失败语义与签发结果。

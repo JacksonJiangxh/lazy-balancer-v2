@@ -285,7 +285,7 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 		{"crawler segment lower bound", "810016", "", "爬虫Bot"},
 		{"crawler segment upper bound", "899999", "", "爬虫Bot"},
 		{"empty input", "", "", "其他"},
-		{"unmatched id", "123456", "something else", "其他"},
+		{"custom rule six-digit id", "123456", "something else", "自定义规则"},
 		// SEC-R1（历史）收敛前语义钉：未列名 3 位前缀的 9xxxxx（CRS 保留段
 		// 余数）在概览视图走 fall-through——msg 命中 IP 黑白名单门仍归 IP 访问
 		// 控制，裸形态归「其他」（阶段视图则整段归 WAF，两视图有意分叉）。

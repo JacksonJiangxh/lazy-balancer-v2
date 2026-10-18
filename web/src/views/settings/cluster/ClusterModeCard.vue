@@ -220,8 +220,8 @@ const submitRegistration = async (): Promise<void> => {
 
 .card-header { display: flex; align-items: center; }
 .card-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--text-primary); }
-/* 复刻 EP .el-form-item__label 计算样式(右对齐/32px 行高/12px 右内边距),
- * 与下方「同步间隔」等 el-form-item 标签像素级一致(2026-09-19 用户报样式回归) */
+/* el-form-item 内的原生弹性行：输入框、单位与帮助图标水平对齐；
+ * 标签宽度/对齐统一由 Element Plus 表单项负责。 */
 .interval-row { display: flex; align-items: center; gap: 8px; }
 
 @media (max-width: 768px) {

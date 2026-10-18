@@ -1,8 +1,6 @@
 package wafiplist
 
 import (
-	"encoding/binary"
-	"math"
 	"net/netip"
 	"sort"
 	"strings"
@@ -78,10 +76,9 @@ func AggregateParsedPrefixes(parsed []netip.Prefix) []netip.Prefix {
 				push = false
 				break
 			}
-			// 栈顶段在 p 之前结束（不重叠不相邻）→ 不会再与 p 及之后交互
-			if prefixLastAddr(top).Compare(p.Addr()) < 0 {
-				break
-			}
+			// 其余形态（不重叠、相邻但非兄弟）出栈推入：CIDR 前缀区间非嵌套
+			// 即不相交；排序保证 top 起点 ≤ p 起点，不相交则 top 整段在 p
+			// 之前，也不会与后续条目（起点更靠后）相交。
 			break
 		}
 		if push {
@@ -115,26 +112,4 @@ func AggregateIPEntries(entries []string) []string {
 		out = append(out, p.String())
 	}
 	return append(out, passthrough...)
-}
-
-// prefixLastAddr 计算前缀的末地址（广播地址），用于区间相交/相邻判定。
-func prefixLastAddr(p netip.Prefix) netip.Addr {
-	if p.Addr().Is4() {
-		a := p.Addr().As4()
-		last := binary.BigEndian.Uint32(a[:]) | (math.MaxUint32 >> p.Bits())
-		return netip.AddrFrom4([4]byte{byte(last >> 24), byte(last >> 16), byte(last >> 8), byte(last)})
-	}
-	a := p.Addr().As16()
-	hi := binary.BigEndian.Uint64(a[:8])
-	lo := binary.BigEndian.Uint64(a[8:])
-	if p.Bits() <= 64 {
-		hi |= math.MaxUint64 >> p.Bits()
-		lo = math.MaxUint64
-	} else {
-		lo |= math.MaxUint64 >> (p.Bits() - 64)
-	}
-	var b [16]byte
-	binary.BigEndian.PutUint64(b[:8], hi)
-	binary.BigEndian.PutUint64(b[8:], lo)
-	return netip.AddrFrom16(b)
 }

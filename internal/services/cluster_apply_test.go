@@ -208,7 +208,7 @@ func TestSyncService_applySnapshot_restarts_for_uploaded_admin_certificate_rotat
 	defer caddyServer.Close()
 	service := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
 	snapshot := v3SnapshotWithACMESection(models.ClusterSnapshot{Version: 2, BasicSettings: models.ClusterBasicSettings{
-		LogLevel: "info", Timezone: "Asia/Shanghai", AdminTLSEnabled: true, AdminTLSMode: "upload", AdminTLSCert: "new-cert", AdminTLSKey: "new-key",
+		LogLevel: new("info"), Timezone: new("Asia/Shanghai"), AdminTLSEnabled: new(true), AdminTLSMode: new("upload"), AdminTLSCert: new("new-cert"), AdminTLSKey: new("new-key"),
 	}})
 
 	if err := service.applySnapshot(context.Background(), snapshot); err != nil {
@@ -423,8 +423,8 @@ func TestSyncService_applySnapshot_preservesOIDCIdentityAndConfig(t *testing.T) 
 	if gotUser.AuthProvider != "oidc" || gotUser.OIDCSubject != "sub-1" || gotUser.OIDCIssuer != "https://idp.example.com" {
 		t.Fatalf("snapshot user OIDC identity lost: %+v", gotUser)
 	}
-	if snapshot.BasicSettings.OIDCConfig == "" || !strings.Contains(snapshot.BasicSettings.OIDCConfig, "idp.example.com") {
-		t.Fatalf("snapshot global oidc_config lost: %q", snapshot.BasicSettings.OIDCConfig)
+	if snapshot.BasicSettings.OIDCConfig == nil || !strings.Contains(*snapshot.BasicSettings.OIDCConfig, "idp.example.com") {
+		t.Fatalf("snapshot global oidc_config lost: %v", snapshot.BasicSettings.OIDCConfig)
 	}
 	// When: 应用到干净从库
 	err = syncService.applySnapshot(context.Background(), snapshot)

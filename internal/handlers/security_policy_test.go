@@ -249,6 +249,7 @@ func TestListSecurityPolicies_summaryCarriesUpdatedByAndUpdatedAt(t *testing.T) 
 func TestGetSecurityPolicy_returnsRawJSONFieldsAsStrings(t *testing.T) {
 	// Given a policy whose array columns are populated
 	setupSecurityPolicyTestDB(t)
+	useCRSRuleIndexFixture(t)
 	router := newSecurityRouter(t)
 	id := createTestPolicy(t, router, map[string]any{
 		"name":               "详情策略",
@@ -701,6 +702,7 @@ func TestListSecurityPolicies_summaryCarriesWAFCheckResponse(t *testing.T) {
 func TestUpdateSecurityPolicy_crsFieldsNormalizeAndValidate(t *testing.T) {
 	// Given a policy created with populated CRS fields
 	setupSecurityPolicyTestDB(t)
+	useCRSRuleIndexFixture(t)
 	router := newSecurityRouter(t)
 	id := createTestPolicy(t, router, map[string]any{
 		"name":               "CRS字段策略",
@@ -740,14 +742,14 @@ func TestUpdateSecurityPolicy_crsFieldsNormalizeAndValidate(t *testing.T) {
 	}
 
 	// And a valid array persists as-is
-	recorder = putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"crs_rule_groups": `["41","33"]`})
+	recorder = putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"crs_rule_groups": `["20","42"]`})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("valid update status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	if err := db.DB.QueryRow("SELECT crs_rule_groups FROM security_policies WHERE id=?", id).Scan(&groups); err != nil {
 		t.Fatalf("read back groups: %v", err)
 	}
-	if groups != `["41","33"]` {
+	if groups != `["20","42"]` {
 		t.Fatalf("crs_rule_groups = %q, want stored as-is", groups)
 	}
 }

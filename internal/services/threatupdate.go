@@ -819,9 +819,11 @@ func healThreatFastFromText(source string) ([]string, string, bool) {
 	}
 	entries := make([]string, 0, 1024)
 	for _, line := range strings.Split(string(data), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			entries = append(entries, line)
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
 		}
+		entries = append(entries, line)
 	}
 	sum := fmt.Sprintf("%x", sha256.Sum256(data))
 	AppendThreatUpdateLog("INFO", "healed", fmt.Sprintf("源 %s .fast 缺失，已从现有文本重建（未重新下载）", source))

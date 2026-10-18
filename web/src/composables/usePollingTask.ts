@@ -26,6 +26,7 @@ export const usePollingTask = (
   options: PollingTaskOptions = {},
 ): PollingTask => {
   const controller = new AbortController()
+  const taskControllers = new Set<AbortController>()
   let disposed = false
   let sequence = 0
   let inFlight: Promise<void> | null = null
@@ -37,20 +38,26 @@ export const usePollingTask = (
     while (!disposed && pending) {
       pending = false
       const taskSequence = ++sequence
-      const isCurrent = (): boolean => !disposed && taskSequence === sequence
+      // 每轮独立 AbortController：pause/stop 可取消真实请求，resume 后下一轮
+      // 自动获得未 abort 的新 signal；永久 signal 仍只随 stop 终止。
+      const taskController = new AbortController()
+      taskControllers.add(taskController)
+      const isCurrent = (): boolean => !disposed && !taskController.signal.aborted && taskSequence === sequence
       try {
-        await task({ signal: controller.signal, sequence: taskSequence, isCurrent })
+        await task({ signal: taskController.signal, sequence: taskSequence, isCurrent })
       } catch (error: unknown) {
         // FI-14：onError 是消费方回调——若其自身抛错，异常会经 drain→run() 的
         // Promise 拒绝逃逸，而定时器/可见性处用 void run() 丢弃 Promise，成为
         // unhandled rejection。回调异常就地记录并吞掉，不中断 drain、不影响下一轮。
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && !taskController.signal.aborted) {
           try {
             options.onError?.(error)
           } catch (callbackError: unknown) {
             console.error('usePollingTask onError callback threw:', callbackError)
           }
         }
+      } finally {
+        taskControllers.delete(taskController)
       }
     }
   }
@@ -111,6 +118,7 @@ export const usePollingTask = (
     disposed = true
     invalidate()
     controller.abort()
+    for (const active of taskControllers) active.abort()
     pauseInterval()
     if (visibilityHandler !== null && typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', visibilityHandler)
@@ -120,10 +128,11 @@ export const usePollingTask = (
 
   // 历史问题(历史):非终态暂停/恢复——stop() 永久置位 disposed,弹框级
   // stop/start 循环的消费方(SecurityRules 更新进度)首轮 stop 后轮询永久
-  // 失效。pause 仅停定时器与在途任务(invalidate 使过期结果丢弃),resume
-  // 可反复调用;语义与 stop 不同:不 abort controller、非终态(S历史问题 起同步摘除 visibility 监听)。
+  // 失效。pause 停定时器、作废序列并 abort 每轮在途任务，resume 可反复调用；
+  // 与 stop 的区别是不 abort 永久 signal、非终态（S历史问题 起同步摘除 visibility 监听）。
   const pause = (): void => {
     invalidate()
+    for (const active of taskControllers) active.abort()
     pauseInterval()
     // S历史问题(历史):同步摘除 visibility 监听——否则暂停期间标签页
     // 可见性翻转会在 handler 里 beginInterval() 复活定时器(违反 pause

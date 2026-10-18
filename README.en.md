@@ -1,6 +1,6 @@
 # Lazy Balancer V2
 
-[English](README.en.md) | 简体中文
+English | [简体中文](README.md)
 
 A visual load balancing platform built on **Caddy v2.11**, with a full WAF security stack, delivered as a single container.
 

@@ -34,7 +34,7 @@ func TestSyncService_applySnapshot_reload_blocks_while_caddy_op_lock_held(t *tes
 	snapshot := v3SnapshotWithACMESection(models.ClusterSnapshot{
 		Version:       7,
 		Users:         []models.ClusterUser{{ID: 7, Username: "lock-order-admin", PasswordHash: "hash", Role: "admin", IsEnabled: true}},
-		BasicSettings: models.ClusterBasicSettings{LogLevel: "info", Timezone: "Asia/Shanghai"},
+		BasicSettings: models.ClusterBasicSettings{LogLevel: new("info"), Timezone: new("Asia/Shanghai")},
 	})
 
 	CaddyOpLock.Lock()

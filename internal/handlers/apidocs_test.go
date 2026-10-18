@@ -820,3 +820,44 @@ func TestBuildOpenAPIYAML_tasksPathParametersStayString(t *testing.T) {
 		t.Fatalf("PUT /users/{id} parameters=%+v, want id integer", parameters)
 	}
 }
+
+// 历史问题-4（历史）：威胁大屏文档响应示例键集必须与实现一致——
+// rollup 改造（top_rules/attack_type_share/recent_rate/rollup_* 披露）后文档滞后。
+// 钉测直接调用真实 handler 取响应键集，与 apiDocRoutes 示例双向比对。
+func TestAPIDocs_threatScreenExampleKeysMatchImplementation(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	recorder := getRequest(t, router, "/security/overview/threat-screen")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var impl struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &impl); err != nil {
+		t.Fatalf("parse implementation response: %v", err)
+	}
+
+	var docExample map[string]any
+	for _, route := range apiDocRoutes {
+		if route.Method == http.MethodGet && route.Path == "/security/overview/threat-screen" {
+			if err := json.Unmarshal([]byte(route.Response), &docExample); err != nil {
+				t.Fatalf("parse doc example: %v", err)
+			}
+		}
+	}
+	if docExample == nil {
+		t.Fatal("apiDocRoutes missing GET /security/overview/threat-screen entry")
+	}
+
+	for key := range impl.Data {
+		if _, ok := docExample[key]; !ok {
+			t.Errorf("实现响应键 %q 未在文档示例中", key)
+		}
+	}
+	for key := range docExample {
+		if _, ok := impl.Data[key]; !ok {
+			t.Errorf("文档示例键 %q 实现未返回", key)
+		}
+	}
+}

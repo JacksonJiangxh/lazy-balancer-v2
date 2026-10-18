@@ -897,7 +897,7 @@ func securityEventsAttributePolicy(ruleCaddyID, ruleTriggered, action, clientIP 
 				if p == nil {
 					continue
 				}
-				if skipMissing != p.IPRefMissing {
+				if skipMissing == p.IPRefMissing {
 					continue
 				}
 				if fallbackMatch(p, requireCapability) {
@@ -954,9 +954,14 @@ func securityEventsReadOffset(path string) (int64, error) {
 func securityEventsWriteOffset(path string, offset int64) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(offset, 10)), 0o644); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // securityEventsShouldReset reports whether the tailer must restart at offset

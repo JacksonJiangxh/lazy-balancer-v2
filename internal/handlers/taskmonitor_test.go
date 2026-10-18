@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -318,6 +319,48 @@ func TestTaskWriteHandlers_unifiedStatusCodes(t *testing.T) {
 			router.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body)))
 			if resp.Code != http.StatusServiceUnavailable {
 				t.Fatalf("引擎未初始化 status=%d body=%s, want 503", resp.Code, resp.Body.String())
+			}
+		})
+	}
+}
+
+// 历史问题/B3-历史问题：任务日志只读尾窗；偏移起点的残段（含整窗无换行的
+// 巨型行）统一经 tailLogWindow 丢弃，小文件保持原样。
+func TestGetSystemTaskLogs_boundedTailDropsPartialFirstLine(t *testing.T) {
+	dir := t.TempDir()
+	oldLogDir := taskengine.LogDir()
+	taskengine.SetLogDir(dir)
+	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/system/tasks/:id/logs", h.GetSystemTaskLogs)
+
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "small unchanged", content: "first\nsecond\n", want: "first\nsecond\n"},
+		{name: "partial line dropped", content: strings.Repeat("x", 256<<10) + "\ncomplete\n", want: "complete\n"},
+		{name: "giant line window empty", content: strings.Repeat("x", (256<<10)+32), want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(taskengine.TaskLogPath("bounded"), []byte(tc.content), 0644); err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/system/tasks/bounded/logs", nil))
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var payload struct {
+				Data map[string]string `json:"data"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if got := payload.Data["content"]; got != tc.want {
+				t.Fatalf("content length=%d value=%q, want length=%d %q", len(got), got, len(tc.want), tc.want)
 			}
 		})
 	}

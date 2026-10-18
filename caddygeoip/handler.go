@@ -262,9 +262,9 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	// 恒真,直接执行块内逻辑。
 	if raw := fields[1]; raw != "" && raw != "0" {
 		// 历史问题 二十三次：省列规范化——xdb 存在双形态（上海/上海市）与
-		// 台湾城市误入省列；策略选项树（internal/services/ip2region.go
-		// normalizeIP2Province，两侧同款表需同步维护）用规范名，发射
-		// 变量同规范化后 CEL 等值匹配才成立。
+		// 台湾城市误入省列；规范表已单源收敛进 geoipnames 包（选项树侧
+		// ProvinceForTree / 发射侧 ProvinceForEmit 同表驱动，见 region.go），
+		// 发射变量与选项树同规范化后 CEL 等值匹配才成立。
 		province = normalizeProvince(raw)
 	}
 	caddyhttp.SetVar(ctx, "geoip.province", province)

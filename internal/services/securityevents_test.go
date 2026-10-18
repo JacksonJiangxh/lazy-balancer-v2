@@ -1249,12 +1249,41 @@ func TestSecurityEventsPendingDeltaMarker_atomicWriteAndRead(t *testing.T) {
 	if got == nil || got.Path != p.Path || got.Offset != p.Offset || got.Size != p.Size {
 		t.Fatalf("read back=%+v, want %+v", got, p)
 	}
-	// And：损坏（半写）内容被读取端容错视为无标记
+	// And：损坏（半写）内容必须留痕并清除，不得静默视为无标记。
 	if err := os.WriteFile(securityEventsPendingDeltaPath(), []byte(`{"path": "broken`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if got := securityEventsReadPendingDelta(); got != nil {
 		t.Fatalf("corrupt marker must read as nil, got %+v", got)
+	}
+	if _, err := os.Stat(securityEventsPendingDeltaPath()); !os.IsNotExist(err) {
+		t.Fatalf("corrupt marker must be removed after visible handling, stat err=%v", err)
+	}
+	// Rename 失败也必须清理临时文件。
+	if err := os.Remove(securityEventsPendingDeltaPath()); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(securityEventsPendingDeltaPath(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := securityEventsWritePendingDelta(p); err == nil {
+		t.Fatal("rename onto a directory must fail")
+	}
+	if _, err := os.Stat(securityEventsPendingDeltaPath() + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("tmp file must be removed after rename failure, stat err=%v", err)
+	}
+}
+
+func TestSecurityEventsWriteOffset_renameFailureCleansTmp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "security_events.offset")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := securityEventsWriteOffset(path, 123); err == nil {
+		t.Fatal("rename onto a directory must fail")
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("offset tmp must be removed after rename failure, stat err=%v", err)
 	}
 }
 

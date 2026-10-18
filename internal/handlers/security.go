@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -110,9 +109,6 @@ func validateSecurityCustomRule(rule *models.SecurityCustomRule) error {
 const securityCustomRuleMaxGlobalCount = 200
 
 func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	var req models.SecurityCustomRule
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -121,6 +117,8 @@ func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	if err := validateSecurityCustomRule(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
@@ -161,9 +159,6 @@ func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 }
 
 func (h *Handlers) UpdateSecurityCustomRule(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	id := c.Param("id")
 	var req models.UpdateCustomRuleRequest
 	if !guardConfiguredJSONBody(c) {
@@ -173,6 +168,8 @@ func (h *Handlers) UpdateSecurityCustomRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	// 历史问题 B-N1：省略即保持现值（与 UpdateSecurityPolicy 同口径）——enabled 是本
 	// 端点唯一「零值语义恰为禁用」的字段，MCP 无约束 body 的部分更新此前会把
 	// 零值 false 直写落库，WAF 静默少一条拦截规则且审计无痕迹。先读现值合并为
@@ -370,9 +367,6 @@ func (h *Handlers) ListSecurityBlockPages(c *gin.Context) {
 }
 
 func (h *Handlers) CreateSecurityBlockPage(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	var req models.SecurityBlockPage
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -381,6 +375,8 @@ func (h *Handlers) CreateSecurityBlockPage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	if strings.TrimSpace(req.Name) == "" {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面名称不能为空"})
 		return
@@ -442,9 +438,6 @@ func (h *Handlers) CreateSecurityBlockPage(c *gin.Context) {
 }
 
 func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	id := c.Param("id")
 	var req models.SecurityBlockPage
 	if !guardConfiguredJSONBody(c) {
@@ -454,6 +447,8 @@ func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	if strings.TrimSpace(req.Name) == "" {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面名称不能为空"})
 		return
@@ -703,6 +698,11 @@ func (h *Handlers) ListSecurityPolicies(c *gin.Context) {
 			return
 		}
 	}
+	type policyListRow struct {
+		p                models.SecurityPolicy
+		crsExcludedCount int
+	}
+	loadedPolicies := make([]policyListRow, 0)
 	for rows.Next() {
 		var p models.SecurityPolicy
 		if err := scanSecurityPolicy(rows, &p); err != nil {
@@ -716,16 +716,21 @@ func (h *Handlers) ListSecurityPolicies(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "解析策略 CRS 排除列表失败"})
 			return
 		}
-		ruleCount := bindingCounts[p.ID]
-		// 历史问题 三十次追加 a：GeoIP/自定义规则的 has 计算（供 ruleProtections 显示行）。
+		loadedPolicies = append(loadedPolicies, policyListRow{p: p, crsExcludedCount: len(crsExcluded)})
+	}
+	policyPointers := make([]*models.SecurityPolicy, len(loadedPolicies))
+	for i := range loadedPolicies {
+		policyPointers[i] = &loadedPolicies[i].p
+	}
+	customRuleCounts := services.CountEnabledCustomRulesBatch(policyPointers)
+	for i := range loadedPolicies {
+		p := loadedPolicies[i].p
+		customRulesCount := customRuleCounts[i]
 		hasGeoIP := services.PolicyHasGeoIP(&p)
-		// 历史问题-2:CountEnabledCustomRules 每行原调 2 次(HasCustomRules 与
-		// CustomRulesCount)——提局部变量复用,半减 DB/JSON 解析开销。
-		customRulesCount := services.CountEnabledCustomRules(p.CustomRules)
 		policies = append(policies, models.SecurityPolicySummary{
-			ID: p.ID, Name: p.Name, Mode: p.Mode, Enabled: p.Enabled, RuleCount: ruleCount,
+			ID: p.ID, Name: p.Name, Mode: p.Mode, Enabled: p.Enabled, RuleCount: bindingCounts[p.ID],
 			HasWAF: p.Mode == "blocking" || p.Mode == "detection", HasIPControl: services.SecurityPolicyHasIPControl(&p), HasRateLimit: p.RateLimitEnabled && p.RateLimitRPS > 0,
-			HasGeoIP: hasGeoIP, HasCustomRules: p.Mode != "off" && customRulesCount > 0, // S7:off=全关不宣称
+			HasGeoIP: hasGeoIP, HasCustomRules: p.Mode != "off" && customRulesCount > 0,
 			AnomalyThreshold:   p.AnomalyThreshold,
 			IPACLMode:          p.IPACLMode,
 			IPACLEnabled:       p.IPACLEnabled,
@@ -738,7 +743,7 @@ func (h *Handlers) ListSecurityPolicies(c *gin.Context) {
 			IPBlacklist:        rawJSONString(p.IPBlacklist),
 			RateLimitRPS:       p.RateLimitRPS,
 			RateLimitBurst:     p.RateLimitBurst,
-			CRSExcludedCount:   len(crsExcluded),
+			CRSExcludedCount:   loadedPolicies[i].crsExcludedCount,
 			CRSRuleGroups:      p.CRSRuleGroups,
 			CustomRulesCount:   customRulesCount,
 			UpdatedBy:          p.UpdatedBy,
@@ -923,9 +928,6 @@ func policyWhitelistDefault(v *bool) bool {
 }
 
 func (h *Handlers) CreateSecurityPolicy(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	var req models.CreateSecurityPolicyRequest
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -934,6 +936,8 @@ func (h *Handlers) CreateSecurityPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	if strings.TrimSpace(req.Name) == "" {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略名称不能为空"})
 		return
@@ -1217,6 +1221,14 @@ func validateAndNormalizeCRSField(name string, val *string) error {
 		if trimmed != entry {
 			return fmt.Errorf("%s 条目不能包含首尾空白: %q", name, entry)
 		}
+		if name == "crs_rule_groups" && services.IsCRSGroupCode(trimmed) && !services.IsCRSInfraGroupCode(trimmed) {
+			if index == nil {
+				index = services.GetCRSRuleIndex()
+			}
+			if !index.HasGroup(trimmed) {
+				return fmt.Errorf("规则组不存在于当前 CRS: %q", entry)
+			}
+		}
 	}
 	// F0 写入面规范化（v2.2.3）：剥离基础设施组（901/949/959 组号及其文件内
 	// 规则 ID）——它们由发射面强制包含，开放配置只会制造「忘选即静默失效」的
@@ -1380,9 +1392,6 @@ func crsExcludedListRefs(payload string) []int64 {
 }
 
 func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	id := c.Param("id")
 	var req models.UpdateSecurityPolicyRequest
 	if !guardConfiguredJSONBody(c) {
@@ -1392,6 +1401,8 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	if req.Name != nil && strings.TrimSpace(*req.Name) == "" {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略名称不能为空"})
 		return
@@ -2022,6 +2033,45 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 		// ID 引用→名称（2026-09-25 用户裁定）：refs/自定义规则/拦截页在审计里
 		// 以名称呈现。解析失败（JSON 畸形/查询失败）回落原始文本——审计可读性
 		// 不阻断写路径。
+		refNameCache := map[string]map[int]string{}
+		loadRefNames := func(table string, ids []int) map[int]string {
+			names := refNameCache[table]
+			if names == nil {
+				names = map[int]string{}
+				refNameCache[table] = names
+			}
+			var missing []int
+			for _, id := range ids {
+				if _, ok := names[id]; !ok {
+					missing = append(missing, id)
+				}
+			}
+			if len(missing) == 0 {
+				return names
+			}
+			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(missing)), ",")
+			args := make([]interface{}, len(missing))
+			for i, id := range missing {
+				args[i] = id
+			}
+			rows, err := tx.QueryContext(c.Request.Context(), `SELECT id, COALESCE(name,'') FROM `+table+` WHERE id IN (`+placeholders+`)`, args...)
+			if err == nil {
+				for rows.Next() {
+					var id int
+					var name string
+					if rows.Scan(&id, &name) == nil {
+						names[id] = name
+					}
+				}
+				rows.Close()
+			}
+			for _, id := range missing {
+				if _, ok := names[id]; !ok {
+					names[id] = ""
+				}
+			}
+			return names
+		}
 		namesOfRefs := func(table, refsJSON string) string {
 			var ids []int
 			if err := json.Unmarshal([]byte(refsJSON), &ids); err != nil {
@@ -2030,16 +2080,16 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 			if len(ids) == 0 {
 				return "（空）"
 			}
-			names := make([]string, 0, len(ids))
+			names := loadRefNames(table, ids)
+			out := make([]string, 0, len(ids))
 			for _, refID := range ids {
-				var name string
-				if err := tx.QueryRowContext(c.Request.Context(), `SELECT COALESCE(name,'') FROM `+table+` WHERE id=?`, refID).Scan(&name); err != nil || name == "" {
-					names = append(names, fmt.Sprintf("#%d", refID))
+				if name := names[refID]; name != "" {
+					out = append(out, name)
 				} else {
-					names = append(names, name)
+					out = append(out, fmt.Sprintf("#%d", refID))
 				}
 			}
-			return strings.Join(names, "、")
+			return strings.Join(out, "、")
 		}
 		deltaRefs := func(label, table string, nv *string, ov string) {
 			if nv != nil && *nv != ov {
@@ -2146,9 +2196,6 @@ func (h *Handlers) DeleteSecurityPolicy(c *gin.Context) {
 const maxBindingsPerRule = 8
 
 func (h *Handlers) BindRuleToPolicy(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	policyID := c.Param("id")
 	var req struct {
 		RuleCaddyID string `json:"rule_caddy_id" binding:"required"`
@@ -2160,6 +2207,8 @@ func (h *Handlers) BindRuleToPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	// 绑定/解绑必须同事务：存在性校验与写入同事务执行，避免检查与 INSERT 之间
 	// 规则/策略被并发删除产生悬挂绑定（无 FK，经集群同步扩散，历史问题 D）；INSERT
 	// 失败时旧绑定已被 DELETE 删除，需回滚恢复。
@@ -2270,9 +2319,6 @@ func (h *Handlers) BindRuleToPolicy(c *gin.Context) {
 // 原子替换一规则的全部策略绑定。校验与替换核心在 setRulePoliciesInTx
 // （历史与批量端点 /security/rules/policies/batch 同源——R-12 单实现）。
 func (h *Handlers) SetRuleSecurityPolicies(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	ruleCaddyID := c.Param("caddy_id")
 	var req struct {
 		PolicyIDs []int `json:"policy_ids"`
@@ -2284,6 +2330,8 @@ func (h *Handlers) SetRuleSecurityPolicies(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
@@ -2427,9 +2475,6 @@ func normalizeRuleIDs(ids []string) []string {
 // bind 侧与单条 bind/batch-bind 端点同源两道规则级门：maxBindingsPerRule 上限、
 // stage2 唯一绑定（历史 NEW-1，批量化预取避免逐规则查询）。
 func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	policyID, err := strconv.Atoi(c.Param("id"))
 	if err != nil || policyID <= 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid policy ID"})
@@ -2447,6 +2492,8 @@ func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	if len(req.Bind)+len(req.Unbind) > maxBulkBindings {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("单次最多提交 %d 条规则", maxBulkBindings)})
 		return
@@ -2640,9 +2687,6 @@ func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 // （单渲染——批量绑定的成本模型与逐条调 PUT /security/rules/:id/policies
 // N 次渲染对齐）。响应 {bound:n, skipped:[{rule_id,reason}]}。
 func (h *Handlers) BatchBindSecurityPolicies(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	var req struct {
 		RuleIDs   []string `json:"rule_ids"`
 		PolicyIDs []int    `json:"policy_ids"`
@@ -2655,6 +2699,8 @@ func (h *Handlers) BatchBindSecurityPolicies(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	if req.Mode == "" {
 		req.Mode = "merge"
 	}
@@ -2924,6 +2970,10 @@ func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
 		}
 		return false
 	}()
+	if utf8.RuneCountInString(p.Name)+utf8.RuneCountInString(stageSuffix[models.PolicyTypeStage3]) > 100 {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拆分后的子策略名称将超过 100 字符，请先缩短原策略名称"})
+		return
+	}
 	if trustEntriesNonEmpty {
 		if err := insertChild(models.PolicyTypeStage0, p.Name+stageSuffix[models.PolicyTypeStage0], "off", "deny", "[]", false,
 			p.IPWhitelist, p.IPWhitelistEnabled, json.RawMessage("[]"), false, 0, 0, "[]", "[]", "[]", 0, 0,
@@ -2984,6 +3034,10 @@ func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
 		return
 	}
 	ruleRows.Close()
+	if !trustEntriesNonEmpty && !features.G1 && !features.G2 && !features.G3 {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该混合策略没有可拆分的特征组，无需拆分"})
+		return
+	}
 	type skippedRule struct {
 		RuleID string `json:"rule_id"`
 		Reason string `json:"reason"`
@@ -3185,13 +3239,31 @@ func enrichIPLocation(ip string) string {
 	return formatIP2RegionLocation(services.LookupRegion(ip))
 }
 
-// isReservedIP 判定保留/私网/回环/链路本地/未指定地址(net.ParseIP 内建分类)。
+var reservedIPPrefixes = [...]netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),     // 本网络/未指定
+	netip.MustParsePrefix("100.64.0.0/10"), // CGNAT
+	netip.MustParsePrefix("192.0.0.0/24"),  // IETF 协议分配
+	netip.MustParsePrefix("198.18.0.0/15"), // 基准测试
+	netip.MustParsePrefix("240.0.0.0/4"),   // 保留/广播
+	netip.MustParsePrefix("2001:db8::/32"), // 文档示例
+}
+
+// isReservedIP 判定保留/私网/回环/链路本地/未指定/组播及特殊用途地址。
 func isReservedIP(ip string) bool {
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
+	parsed, err := netip.ParseAddr(ip)
+	if err != nil {
 		return false
 	}
-	return parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast() || parsed.IsUnspecified()
+	parsed = parsed.Unmap()
+	if parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast() || parsed.IsUnspecified() || parsed.IsMulticast() {
+		return true
+	}
+	for _, prefix := range reservedIPPrefixes {
+		if prefix.Contains(parsed) {
+			return true
+		}
+	}
+	return false
 }
 
 // ruleTriggeredFamilyPrefixes 触发规则筛选的 family 标签 → ID 前缀集合
@@ -3225,10 +3297,9 @@ var ruleTriggeredFamilyPrefixes = map[string][]string{
 
 // customRuleFamilyCondition 自定义规则族的 ID 形态条件——与 attackFamilyClassOf
 // 的自定义判定（SEC-R1 收敛单一事实源，两个 Go 视图函数共用）严格同口径：5 位任意
-// 数字 ID（emit=crID+10000，10000-99999，不以 1 开头的 2xxxx-9xxxx 也在内）
-// 或 ≥7 位且以 1 开头（无 id 规则的合成 ID 1000000+）。6 位 1xxxxx（100000-
-// 199999）属 CRS 保留段余数、无发射源，共享谓词判「其他」，本条件
-// 同样不归本族——旧 "10"-"19" LIKE 前缀因无长度约束会误并此类 ID（SC-3）。
+// 数字 ID（emit=crID+10000，10000-789999：5 位任意数字与 6 位 1xxxxx-
+// 7xxxxx 均在可达范围）或 ≥7 位且以 1 开头（无 id 规则的合成 ID 1000000+）。
+// 8xxxxx/9xxxxx 由地域爬虫与 CRS 段独占，不归本族。
 // appendFamilyPrefixCondition(2026-09-10 审计 S4):单数字族(id 2/3/4/5/7/8/11)
 // 为精确匹配——LIKE 前缀会让自定义规则 5 位 ID(24567 等)交叉命中 IP/地域族;
 // 多字符前缀(949/959/920/921)对应 6 位 CRS ID,保持前缀语义。
@@ -3252,7 +3323,7 @@ func appendFamilyPrefixCondition(ors *[]string, args *[]any, prefix string) {
 	*args = append(*args, prefix+"___")
 }
 
-const customRuleFamilyCondition = "(rule_triggered GLOB '[0-9][0-9][0-9][0-9][0-9]' OR rule_triggered GLOB '1[0-9][0-9][0-9][0-9][0-9][0-9]*')"
+const customRuleFamilyCondition = "(rule_triggered GLOB '[0-9][0-9][0-9][0-9][0-9]' OR rule_triggered GLOB '[1-7][0-9][0-9][0-9][0-9][0-9]' OR rule_triggered GLOB '1[0-9][0-9][0-9][0-9][0-9][0-9]*')"
 
 // geoipFamilyCondition 地域拦截族的预检精确段形态条件（阶段化模型：
 // buildIPPrecheckDirectives 逐策略链 id=800000+policyID）——6 位 8xxxxx。
@@ -3619,10 +3690,14 @@ func attackFamilyClassOf(ruleTriggered, ruleMsg string) attackFamilyClass {
 		// CRS 恒 6 位)——先于 9 前缀判定,crID≥82000 发射 92000-99999 时不再被
 		// 遮蔽误标;与 customRuleFamilyCondition(SC-3)长度判据同口径。
 		return attackFamilyCustomRule
+	case len(ruleTriggered) == 6 && ruleTriggered[0] >= '1' && ruleTriggered[0] <= '7':
+		// DB 自定义规则 id 10000-789999 发射为 id+10000，6 位 1xxxxx-7xxxxx
+		// 是真实可达形态；8xxxxx/9xxxxx 分别由地域爬虫与 CRS 分支独占。
+		return attackFamilyCustomRule
 	case strings.HasPrefix(ruleTriggered, "1") && len(ruleTriggered) >= 7:
 		// 自定义规则触发 id 的第二种形状：历史问题 起无 id 规则的合成 id 1000000+n
-		// （7 位，1000000-1999999）。6 位 1xxxxx 无归属源（CRS 保留段
-		// 100000-999999 的余数），不归本族。本口径是「自定义规则」ID 形态的
+		// （7 位，1000000-1999999）。6 位自定义 ID 已由上方分支覆盖；本分支
+		// 仅判无 id 规则的合成 ID。本口径是「自定义规则」ID 形态的
 		// 权威（SC-3）：SQL 筛选族 customRuleFamilyCondition 与前端
 		// triggeredLabel 须与本分支保持一致。
 		return attackFamilyCustomRule
@@ -3849,6 +3924,22 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 		overview.ActivePolicies = active
 	}
 
+	overview.CRSVersion = services.CRSBundledVersion
+	overview.UpdateStatus = "idle"
+	var crsVersion, crsUpdateStatus string
+	// SC-11：查询失败纳入 trackErr（对齐 ActivePolicies 口径与本函数 历史问题 D2
+	// 自述标准「任一查询失败都必须显式报错」）。无行（ErrNoRows）是全新安装的
+	// 合法状态，保持 200 捆绑版本回落（fallsBackToBundledCRSVersion 钉住），
+	// 不计入故障。
+	if err := db.DB.QueryRow(`SELECT version, COALESCE(update_status,'idle') FROM security_crs_version WHERE id=1`).Scan(&crsVersion, &crsUpdateStatus); err == nil {
+		if crsVersion != "" {
+			overview.CRSVersion = crsVersion
+		}
+		overview.UpdateStatus = crsUpdateStatus
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		trackErr(err)
+	}
+
 	// 7-day trend: always the full today-6 … today slice (local dates), zero-filled.
 	// 时区偏移在 Go 侧拼好（负偏移如 America/New_York 为 "-240 minutes"）；SQLite 的
 	// MetricsDB 未装配：主库字段（活跃策略/库状态）照常返回，metrics 面板零值
@@ -3859,6 +3950,11 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 		overview.TopIPs = []models.SecurityTopIP{}
 		overview.AttackTypes = []models.SecurityAttackType{}
 		overview.AttackTypesStage = []models.SecurityAttackType{}
+		if firstErr != nil {
+			services.Logf("error", "security overview: query failed: %v", firstErr)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "安全总览查询失败"})
+			return
+		}
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: overview})
 		return
 	}
@@ -3995,21 +4091,6 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 	}
 	overview.AttackTypes = attackTypes
 
-	overview.CRSVersion = services.CRSBundledVersion
-	overview.UpdateStatus = "idle"
-	var crsVersion, crsUpdateStatus string
-	// SC-11：查询失败纳入 trackErr（对齐 ActivePolicies 口径与本函数 历史问题 D2
-	// 自述标准「任一查询失败都必须显式报错」）。无行（ErrNoRows）是全新安装的
-	// 合法状态，保持 200 捆绑版本回落（fallsBackToBundledCRSVersion 钉住），
-	// 不计入故障。
-	if err := db.DB.QueryRow(`SELECT version, COALESCE(update_status,'idle') FROM security_crs_version WHERE id=1`).Scan(&crsVersion, &crsUpdateStatus); err == nil {
-		if crsVersion != "" {
-			overview.CRSVersion = crsVersion
-		}
-		overview.UpdateStatus = crsUpdateStatus
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		trackErr(err)
-	}
 	if firstErr != nil {
 		services.Logf("error", "security overview: query failed: %v", firstErr)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "安全总览查询失败"})

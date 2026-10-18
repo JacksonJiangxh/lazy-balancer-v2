@@ -266,6 +266,9 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	//（DDL DEFAULT+启动回填+此处）——改参数绑定 db.Default* 常量单源化，
 	// 常量变更不再需要三处同步。非治理列（log 级别/布尔/保留期等）字面量
 	// 原状（不在库值唯一真相治理批次内）。
+	// B1-09（历史）：threat_traffic_sample_n/security_events_retention_days/
+	// security_events_row_cap 三处兜底字面量与 DDL DEFAULT+迁移回填对齐
+	// （4/90/1000000；均 NOT NULL+回填，兜底实际不可达）。
 	err := db.DB.QueryRow(`
 		SELECT id, caddy_config, dns_provider,
 		       COALESCE(acme_email,'') as acme_email, COALESCE(cert_expiry_days,?) as cert_expiry_days,
@@ -309,9 +312,9 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	       COALESCE(server_map_lat,0) as server_map_lat,
 	       COALESCE(server_map_lon,0) as server_map_lon,
 	       COALESCE(threat_screen_mode,'map') as threat_screen_mode,
-	       COALESCE(threat_traffic_sample_n,8) as threat_traffic_sample_n,
-	       COALESCE(security_events_retention_days,0) as security_events_retention_days,
-	       COALESCE(security_events_row_cap,0) as security_events_row_cap,
+	       COALESCE(threat_traffic_sample_n,4) as threat_traffic_sample_n,
+	       COALESCE(security_events_retention_days,90) as security_events_retention_days,
+	       COALESCE(security_events_row_cap,1000000) as security_events_row_cap,
 	       is_master, COALESCE(master_url, '') as master_url, sync_interval,
 	       last_sync, updated_at
 		FROM global_config WHERE id = 1
@@ -791,11 +794,16 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 	// 陈旧 caddy_apply_error 不再长亮横幅）。
 	h.recordCaddyApplyResult(nil)
 	services.ApplyLogLevel()
+	// 历史问题（历史）：task_log_size_mb 经本端点写库，服务端 5 分钟 TTL
+	// 缓存此前零失效点——改设置后最长 5 分钟仍按旧阈值滚动任务日志。无条件
+	// 失效（幂等、零成本；其余写入口已在各自域补齐）。
+	services.InvalidateTaskLogSizeCache()
 	if req.Timezone != nil {
 		if _, err := services.ConfigureLocation(*req.Timezone); err != nil {
-			recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("应用时区失败", err.Error(), services.AuditResultPart("failure")))
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "应用时区失败: " + err.Error()})
-			return
+			// B1-06（历史）：时区已在写库前经 time.LoadLocation 预校验，
+			// 此分支仅可能为环境级异常；配置已提交并应用，宣告 500 更新失败会
+			// 误导客户端（重试=重复写同一已生效值）。降级为错误日志，响应保持成功。
+			services.Logf("error", "配置已提交并应用，但运行时应用时区失败（提交前已预校验，疑似环境异常）: %v", err)
 		}
 	}
 
@@ -1081,9 +1089,9 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxPutCaddyConfigBytes)
 
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
+	// B1-02（历史）：先读请求体再取写锁（ValidateConfig LBH79-历史问题
+	// 同序）——已认证客户端的慢速/chunked 上传在持锁期间读 body 会阻塞全部
+	// 规则/配置写与后台强制重载。
 	var req struct {
 		Content string `json:"content"`
 	}
@@ -1096,6 +1104,9 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求无效"})
 		return
 	}
+
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 
 	var configData map[string]interface{}
 	if err := json.Unmarshal([]byte(req.Content), &configData); err != nil {

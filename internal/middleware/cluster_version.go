@@ -268,6 +268,12 @@ func isSynchronizedWrite(method, path string) bool {
 			return true
 		}
 	}
+	// 历史问题-1（历史）：大屏流量采集租约 POST/DELETE 是 Caddy admin 的纯
+	// 代理（内存租约，不写任何同步表）——security 前缀捕获让触发器安装失败
+	// 的降级态把「打开/关闭大屏」这条热路径误伤成 500，与 MFA 三路由同型。
+	if strings.HasPrefix(path, "/api/v1/security/overview/threat-screen/") {
+		return false
+	}
 	for _, prefix := range []string{"/api/v1/rules", "/api/v1/users", "/api/v1/api-keys", "/api/v1/certificate-configs", "/api/v1/security"} {
 		if strings.HasPrefix(path, prefix) {
 			return true

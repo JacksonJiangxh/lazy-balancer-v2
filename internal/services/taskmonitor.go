@@ -7,7 +7,6 @@ package services
 
 import (
 	"fmt"
-	"os"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -42,7 +41,6 @@ type TaskInfo struct {
 	Controllable   bool            `json:"controllable"`         // 常驻循环可启停（start/stop/restart）
 	Triggerable    bool            `json:"triggerable"`          // 支持手动触发（ManualRun 语义族）
 	StartedAt      string          `json:"started_at,omitempty"` // 常驻族启动时刻；其他类型空
-	LogSizeBytes   int64           `json:"log_size_bytes"`       // 本任务日志文件大小（字节）
 	LoopOn         bool            `json:"loop_on"`              // 调度开关当前态（定时/循环/常驻调度列绑定值；用户显式启停持久化于 task_loop_prefs，无记录走默认启动清单）
 	BusinessDriven bool            `json:"business_driven"`      // 仅由业务页驱动调度（任务监控 toggle 只读）
 	LastRun        *TaskRunInfo    `json:"last_run,omitempty"`
@@ -141,9 +139,6 @@ func collectCertJobRows() []TaskInfo {
 				Trigger: "queue", Result: status, Message: message},
 		}
 		ti.Success24h, ti.Fail24h = success, fail
-		if info, err := os.Stat(CertJobLogPath(ruleID)); err == nil {
-			ti.LogSizeBytes = info.Size()
-		}
 		ti.Status = TaskStatusIdle
 		switch status {
 		case "failed":
@@ -253,10 +248,6 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 				}
 			}
 		}
-		// 每任务日志文件大小（tasks/{id}.log stat）
-		if info, err := os.Stat(taskengine.TaskLogPath(m.ID)); err == nil {
-			ti.LogSizeBytes = info.Size()
-		}
 		st := runStats[m.ID]
 		ti.Runs24h, ti.Success24h, ti.Fail24h = st.Runs, st.Success, st.Fail
 		// 常驻族启动时刻——「常驻 · 启动于」。用该 daemon 最近 boot 行时刻
@@ -306,10 +297,8 @@ func localDisplayUTC(ts string) string {
 	if ts == "" {
 		return ts
 	}
-	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339} {
-		if t, err := time.Parse(layout, ts); err == nil {
-			return t.In(CurrentLocation()).Format("2006-01-02 15:04:05")
-		}
+	if t := parseUTCSlot(ts); !t.IsZero() {
+		return t.In(CurrentLocation()).Format("2006-01-02 15:04:05")
 	}
 	return ts
 }

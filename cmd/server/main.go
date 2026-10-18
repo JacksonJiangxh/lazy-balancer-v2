@@ -97,7 +97,12 @@ func run() error {
 	}
 
 	var tz string
-	if err := db.DB.QueryRow("SELECT COALESCE(timezone,'Asia/Shanghai') FROM global_config WHERE id=1").Scan(&tz); err == nil && tz != "" {
+	if err := db.DB.QueryRow("SELECT COALESCE(timezone,'Asia/Shanghai') FROM global_config WHERE id=1").Scan(&tz); err != nil {
+		// 历史问题-4（历史）：时区读取失败不得静默——此前整库读错误直接落
+		// 「按进程默认时区运行」，所有墙面时间（任务排程/task_runs/审计）
+		// 与实际配置时区分叉且无任何信号。
+		services.Logf("error", "failed to read timezone from global_config (falling back to process default): %v", err)
+	} else if tz != "" {
 		if err := os.Setenv("TZ", tz); err != nil {
 			services.Logf("error", "failed to set TZ environment: %v", err)
 		} else if loc, err := services.ConfigureLocation(tz); err != nil {
@@ -288,7 +293,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("管理面板 HTTPS 启用失败: %w", err)
 		}
-		log.Printf("管理面板 HTTPS 监听 %s（证书来源：%s，HTTP 明文请求 301 跳转）", addr, tlsCfg.Mode)
+		log.Printf("管理面板 HTTPS 监听 %s（证书来源：%s，HTTP 明文请求 302 跳转）", addr, tlsCfg.Mode)
 		server.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,

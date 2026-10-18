@@ -314,7 +314,13 @@ func (h *Handlers) MFARecoveryCodes(c *gin.Context) {
 	}
 	userID := int(contextUserID(c))
 	var enabled bool
-	if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", userID).Scan(&enabled); err != nil || !enabled {
+	// B3-历史问题（历史）：DB 读失败不得并入「MFA 未启用」400——
+	// 基础设施故障 500，业务态未启用保持 400。
+	if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", userID).Scan(&enabled); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 MFA 状态失败"})
+		return
+	}
+	if !enabled {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "MFA 未启用"})
 		return
 	}
@@ -355,8 +361,14 @@ func (h *Handlers) MFAVerifyStep(c *gin.Context) {
 	// 重签 JWT：保留原身份声明，仅刷新 mfa_ts（与 respondLogin 同构；node_mode 重读）
 	var user models.User
 	var passwordVersion int64
+	// B3-历史问题（历史）：重读用户的 DB 错误不得并入 401「用户不可用」
+	// ——基础设施故障 500；行缺失/禁用保持 401（JWT 仍有效但账号已不可用）。
 	if err := db.DB.QueryRow(`SELECT id, username, role, display_name, is_enabled, created_at, last_login, password_version FROM users WHERE id=?`, userID).
-		Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &passwordVersion); err != nil || !user.IsEnabled {
+		Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &passwordVersion); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户信息失败"})
+		return
+	}
+	if !user.IsEnabled {
 		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "用户不可用"})
 		return
 	}

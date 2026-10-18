@@ -19,7 +19,9 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"database/sql"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -185,6 +187,128 @@ func TestIPListHotPath_needForceRejectedRestoresCommittedState(t *testing.T) {
 	}
 	if entries != `[{"value":"203.0.113.5","remark":""}]` {
 		t.Fatalf("拒绝后名单条目=%q, want 已提交值", entries)
+	}
+}
+
+func installIPListCommitFailure(t *testing.T) {
+	t.Helper()
+	old := ipListCommitTxForTest
+	ipListCommitTxForTest = func(tx *sql.Tx) error {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			return err
+		}
+		return errors.New("injected commit failure")
+	}
+	t.Cleanup(func() { ipListCommitTxForTest = old })
+}
+
+func assertCommittedHotPathList(t *testing.T, listID int64) {
+	t.Helper()
+	var entries string
+	if err := db.DB.QueryRow(`SELECT entries FROM security_ip_lists WHERE id=?`, listID).Scan(&entries); err != nil {
+		t.Fatal(err)
+	}
+	if entries != `[{"value":"203.0.113.5","remark":""}]` {
+		t.Fatalf("list entries=%q, want committed value", entries)
+	}
+}
+
+func TestIPListHotPath_convergedCommitFailureRestoresProjection(t *testing.T) {
+	f := newHotPathIPListFixture(t)
+	listID, policyID := f.seedReferencedList(`[{"value":"203.0.113.5","remark":""}]`)
+	if err := f.h.caddyService.GenerateAndApplyConfig(); err != nil {
+		t.Fatalf("首次应用: %v", err)
+	}
+	committed := f.projectionContent(policyID)
+	installIPListCommitFailure(t)
+	rec := f.postJSON(fmt.Sprintf("/security/ip-lists/%d/ips", listID), map[string]string{"value": "198.51.100.7"})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", rec.Code, rec.Body.String())
+	}
+	if got := f.projectionContent(policyID); got != committed {
+		t.Fatalf("Converged commit failure projection=%q, want %q", got, committed)
+	}
+	if got := f.loadCount(); got != 1 {
+		t.Fatalf("Converged rollback load=%d, want 1", got)
+	}
+	assertCommittedHotPathList(t, listID)
+}
+
+func TestIPListHotPath_needForceCommitFailureRestoresCommittedView(t *testing.T) {
+	f := newHotPathIPListFixture(t)
+	certDir := t.TempDir()
+	t.Cleanup(services.SetCertDirForTest(certDir))
+	certV1, keyV1 := r77TestCertPEM(t, "hot.example.test")
+	certV2, keyV2 := r77TestCertPEM(t, "hot.example.test")
+	listID, policyID := f.seedReferencedList(`[{"value":"203.0.113.5","remark":""}]`)
+	if _, err := db.DB.Exec(`UPDATE lb_rules SET enable_tls=1, tls_source='manual', tls_cert=?, tls_key=? WHERE caddy_id='lb-hot'`, certV1, keyV1); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.caddyService.GenerateAndApplyConfig(); err != nil {
+		t.Fatalf("首次应用: %v", err)
+	}
+	if _, err := db.DB.Exec(`UPDATE lb_rules SET tls_cert=?, tls_key=? WHERE caddy_id='lb-hot'`, certV2, keyV2); err != nil {
+		t.Fatal(err)
+	}
+	committed := f.projectionContent(policyID)
+	installIPListCommitFailure(t)
+	rec := f.postJSON(fmt.Sprintf("/security/ip-lists/%d/ips", listID), map[string]string{"value": "198.51.100.7"})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", rec.Code, rec.Body.String())
+	}
+	if got := f.projectionContent(policyID); got != committed {
+		t.Fatalf("NeedForce commit failure projection=%q, want %q", got, committed)
+	}
+	if got := f.loadCount(); got != 2 {
+		t.Fatalf("NeedForce commit failure loads=%d, want 2 (initial+force; committed view already loaded)", got)
+	}
+	assertCommittedHotPathList(t, listID)
+}
+
+func TestIPListHotPath_commitFailureBranchesRestoreCommittedView(t *testing.T) {
+	// SQLite 测试夹具另有可执行 seam 行为测试；本门锁定三个分支各自的恢复收口。
+	raw, err := os.ReadFile("securityiplists.go")
+	if err != nil {
+		t.Fatalf("read securityiplists.go: %v", err)
+	}
+	source := string(raw)
+	start := strings.Index(source, "func (h *Handlers) tryIPListHotPathApply(")
+	if start < 0 {
+		t.Fatal("tryIPListHotPathApply not found")
+	}
+	body := source[start:]
+	if end := strings.Index(body, "\n// ExportIPList "); end > 0 {
+		body = body[:end]
+	}
+	needle := "if err := commitIPListTx(tx); err != nil {"
+	searchFrom := 0
+	for branch := 1; ; branch++ {
+		index := strings.Index(body[searchFrom:], needle)
+		if index < 0 {
+			if branch != 4 {
+				t.Fatalf("commit failure branches=%d, want 3", branch-1)
+			}
+			break
+		}
+		branchStart := searchFrom + index
+		searchFrom = branchStart + len(needle)
+		windowEnd := branchStart + 500
+		if windowEnd > len(body) {
+			windowEnd = len(body)
+		}
+		window := body[branchStart:windowEnd]
+		switch branch {
+		case 1, 2: // NeedForce 退化提交 + 成功提交
+			if !strings.Contains(window, "recoverCommittedViewAfterCommitFailure(tx)") {
+				t.Fatalf("NeedForce commit branch %d missing committed-view recovery", branch)
+			}
+		case 3: // Converged：零 /load，仅投影回滚
+			if !strings.Contains(window, "RollbackIPListProjectionsToCommittedInLock()") {
+				t.Fatalf("Converged commit branch missing projection rollback")
+			}
+		default:
+			t.Fatalf("unexpected extra commit branch %d", branch)
+		}
 	}
 }
 

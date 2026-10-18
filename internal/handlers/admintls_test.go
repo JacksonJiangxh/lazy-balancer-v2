@@ -359,3 +359,80 @@ func TestUpdateAdminTLS_auditDetailRecordsCertificateReplacement(t *testing.T) {
 		}
 	})
 }
+
+// B2-03（历史）：upload → selfsigned 切换此前把已上传证书/私钥继续留在
+// global_config（selfsigned 由 ResolveCertificate 自生成，残留 upload 材料无消费者，
+// 且随备份/导入继续传播）。切换后必须清空；upload 模式禁用保留既有钉测已锁。
+func TestUpdateAdminTLS_switchingToSelfsignedClearsUploadedMaterial(t *testing.T) {
+	initializeRuleFeatureTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET admin_tls_enabled=1,admin_tls_mode='upload',
+		admin_tls_cert='existing cert',admin_tls_key='existing key' WHERE id=1`); err != nil {
+		t.Fatalf("seed admin TLS config: %v", err)
+	}
+	oldExit := exitProcess
+	exited := make(chan struct{}, 1)
+	exitProcess = func(int) { exited <- struct{}{} }
+	t.Cleanup(func() { exitProcess = oldExit })
+	handler := &Handlers{cfg: &config.Config{DataDir: t.TempDir()}}
+	router := gin.New()
+	router.POST("/admin-tls", handler.UpdateAdminTLS)
+	request := httptest.NewRequest(http.MethodPost, "/admin-tls",
+		strings.NewReader(`{"enabled":true,"mode":"selfsigned"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var mode, cert, key string
+	if err := db.DB.QueryRow("SELECT admin_tls_mode,admin_tls_cert,admin_tls_key FROM global_config WHERE id=1").Scan(&mode, &cert, &key); err != nil {
+		t.Fatalf("read admin TLS config: %v", err)
+	}
+	if mode != "selfsigned" || cert != "" || key != "" {
+		t.Fatalf("saved=(%q,%q,%q), want selfsigned 且证书材料清空", mode, cert, key)
+	}
+	// 变更路径必重启——且须在本测试内收走 500ms 延迟的 exitProcess 调用，
+	// 否则残留 goroutine 会打进后续测试的 stub（跨测试污染实证）。
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("restart was not scheduled")
+	}
+}
+
+// B2-04（历史）：值未变更时 PUT /admin-tls 此前仍写库并触发进程重启
+// （设置页重复保存=无谓停机）。未变更 → 200「未变更」、不写库、不重启。
+func TestUpdateAdminTLS_unchangedConfigSkipsWriteAndRestart(t *testing.T) {
+	initializeRuleFeatureTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET admin_tls_enabled=1,admin_tls_mode='selfsigned',
+		admin_tls_cert='',admin_tls_key='' WHERE id=1`); err != nil {
+		t.Fatalf("seed admin TLS config: %v", err)
+	}
+	oldExit := exitProcess
+	exited := make(chan struct{}, 1)
+	exitProcess = func(int) { exited <- struct{}{} }
+	t.Cleanup(func() { exitProcess = oldExit })
+	handler := &Handlers{cfg: &config.Config{DataDir: t.TempDir()}}
+	router := gin.New()
+	router.POST("/admin-tls", handler.UpdateAdminTLS)
+	request := httptest.NewRequest(http.MethodPost, "/admin-tls",
+		strings.NewReader(`{"enabled":true,"mode":"selfsigned"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "未变更") {
+		t.Fatalf("body=%s, want 未变更提示", response.Body.String())
+	}
+	select {
+	case <-exited:
+		t.Fatal("未变更配置不得触发重启")
+	case <-time.After(800 * time.Millisecond):
+	}
+}

@@ -171,6 +171,8 @@ const (
 	// 避免单请求长时间占锁/占连接。默认 24h 窗口一轮完成；更大窗口跨请求
 	// 续做。
 	threatRollupMaxBatchesPerCall = 25
+	// threatRollupRepairMinutes 迟到事件回填窗口（≥摄取停顿 + 一轮 warmer）。
+	threatRollupRepairMinutes = 10
 	// threatRollupTargetReadyKey 目标维度 rollup 就绪标记（历史 历史问题）：
 	// 升级后缺失 → 强制重置覆盖区间重固——否则既有 coverage 宣称已覆盖，
 	// 历史窗口的目标计数永久缺失（top_targets 与其余卡片窗口分裂）。
@@ -378,9 +380,15 @@ func ensureThreatRollup(hours int) error {
 		if err != nil {
 			return err
 		}
-		if err := threatFixMinute(tx, lastComplete); err != nil {
-			tx.Rollback()
-			return err
+		repairStart := lastComplete.Add(-time.Duration(threatRollupRepairMinutes-1) * time.Minute)
+		if repairStart.Before(dFrom) {
+			repairStart = dFrom
+		}
+		for m := repairStart; !m.After(lastComplete); m = m.Add(time.Minute) {
+			if err := threatFixMinute(tx, m); err != nil {
+				tx.Rollback()
+				return err
+			}
 		}
 		if !currentMinute.Equal(lastComplete) {
 			if err := threatFixMinute(tx, currentMinute); err != nil {
@@ -534,17 +542,10 @@ var queryThreatRecentBlocked = func(sinceMinute string) (int, error) {
 func threatFixMinute(tx *sql.Tx, m time.Time) error {
 	next := m.Add(time.Minute)
 	minuteStr := m.Format("2006-01-02 15:04")
-	if _, err := tx.Exec(`DELETE FROM security_event_rollup WHERE minute = ?`, minuteStr); err != nil {
-		return err
-	}
-	// 历史 历史问题：目标维度同批重固（rollup 主键无法承载 rule_caddy_id）。
-	if _, err := tx.Exec(`DELETE FROM security_event_target_rollup WHERE minute = ?`, minuteStr); err != nil {
-		return err
-	}
 	rows, err := tx.Query(`SELECT client_ip, COALESCE(NULLIF(rule_name,''), COALESCE(rule_triggered,'')), COALESCE(rule_triggered,''), COALESCE(rule_msg,''), action, COALESCE(rule_caddy_id,''), COUNT(*)
 		FROM security_events
 		WHERE event_time >= ? AND event_time < ?
-		GROUP BY client_ip, 2, rule_triggered, rule_msg, action, 6`, m.Format("2006-01-02 15:04:05"), next.Format("2006-01-02 15:04:05"))
+		GROUP BY client_ip, COALESCE(NULLIF(rule_name,''), COALESCE(rule_triggered,'')), COALESCE(rule_triggered,''), COALESCE(rule_msg,''), action, COALESCE(rule_caddy_id,'')`, m.Format("2006-01-02 15:04:05"), next.Format("2006-01-02 15:04:05"))
 	if err != nil {
 		return err
 	}
@@ -573,6 +574,29 @@ func threatFixMinute(tx *sql.Tx, m time.Time) error {
 		return err
 	}
 	rows.Close()
+	newTotal := 0
+	for _, count := range agg {
+		newTotal += count
+	}
+	var oldTotal int
+	if err := tx.QueryRow(`SELECT COALESCE(SUM(count),0) FROM security_event_rollup WHERE minute=?`, minuteStr).Scan(&oldTotal); err != nil {
+		return err
+	}
+	if newTotal < oldTotal {
+		// 原始事件已被保留期/行帽裁剪：重建只会降低持久计数。保留两张
+		// rollup 原行（维度冻结在旧归属地代际）；新分钟仍按新谓词固化。
+		return nil
+	}
+	if newTotal == 0 && oldTotal == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(`DELETE FROM security_event_rollup WHERE minute = ?`, minuteStr); err != nil {
+		return err
+	}
+	// 历史 历史问题：目标维度同批重固（rollup 主键无法承载 rule_caddy_id）。
+	if _, err := tx.Exec(`DELETE FROM security_event_target_rollup WHERE minute = ?`, minuteStr); err != nil {
+		return err
+	}
 	stmt, err := tx.Prepare(`INSERT INTO security_event_rollup (minute, country, province, family, rule, action, count) VALUES (?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
@@ -606,6 +630,9 @@ func threatLocationParts(location string) (string, string) {
 	province := ""
 	if len(parts) > 0 {
 		country = strings.TrimSpace(parts[0])
+	}
+	if country == "保留地址" {
+		return "", ""
 	}
 	if country == "中国" && len(parts) > 1 {
 		province = strings.TrimSpace(parts[1])
@@ -759,6 +786,41 @@ func (h *Handlers) DetectThreatScreenSite(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"ip": ip, "location": location, "lat": lat, "lon": lon, "source": source}})
 }
 
+// threatHourlyBuckets 生成威胁大屏滑动直方图槽（小时或日桶）；返回桶起点
+// （用于落桶）与已零填充的槽。hours<=24 为本地小时槽，否则日桶（上限 30）。
+func threatHourlyBuckets(hours int, now time.Time, offset int) ([]time.Time, []models.SecurityAttackType) {
+	shift := time.Duration(offset) * time.Second
+	shiftedNow := now.UTC().Add(shift)
+	var bucketStarts []time.Time
+	var bucketNames []string
+	if hours <= 24 {
+		curHour := shiftedNow.Truncate(time.Hour)
+		start := curHour.Add(-time.Duration(hours-1) * time.Hour)
+		for i := range hours {
+			tb := start.Add(time.Duration(i) * time.Hour)
+			bucketStarts = append(bucketStarts, tb)
+			bucketNames = append(bucketNames, fmt.Sprintf("%02d:00", tb.Hour()))
+		}
+	} else {
+		n := (hours + 23) / 24
+		if n > 30 {
+			n = 30
+		}
+		dayStart := time.Date(shiftedNow.Year(), shiftedNow.Month(), shiftedNow.Day(), 0, 0, 0, 0, time.UTC)
+		start := dayStart.AddDate(0, 0, -(n - 1))
+		for i := range n {
+			tb := start.AddDate(0, 0, i)
+			bucketStarts = append(bucketStarts, tb)
+			bucketNames = append(bucketNames, tb.Format("01-02"))
+		}
+	}
+	hourly := make([]models.SecurityAttackType, len(bucketNames))
+	for i := range hourly {
+		hourly[i] = models.SecurityAttackType{Name: bucketNames[i], Value: 0}
+	}
+	return bucketStarts, hourly
+}
+
 // GetSecurityThreatScreen GET /security/overview/threat-screen?hours=24
 // 返回大屏聚合：窗口总量/拦截率/logged 数/限流拦截数（Caddy metrics 429，
 // 重载口径）/活跃攻击源（近 10min 去重）/国家计数 map（ip_location 首段，
@@ -774,19 +836,33 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 			hours = n
 		}
 	}
+	now := threatScreenNow()
+	loc := services.CurrentLocation()
+	_, offset := now.In(loc).Zone()
 	zero := func() gin.H {
+		_, hourly := threatHourlyBuckets(hours, now, offset)
 		return gin.H{
-			"hours":            hours,
-			"window_start":     "",
-			"total_events":     0,
-			"blocked_events":   0,
-			"block_rate":       0.0,
-			"ratelimit_blocks": 0.0,
-			"active_sources":   0,
-			"countries":        map[string]int{},
-			"china_provinces":  map[string]int{},
-			"top_countries":    []models.SecurityAttackType{},
-			"top_attack_types": []models.SecurityAttackType{},
+			"hours":               hours,
+			"window_start":        "",
+			"rollup_ready":        false,
+			"rollup_stale":        threatRollupStale(),
+			"rollup_last_success": "",
+			"total_events":        0,
+			"blocked_events":      0,
+			"logged_events":       0,
+			"block_rate":          0.0,
+			"ratelimit_blocks":    0.0,
+			"ratelimit_available": false,
+			"active_sources":      0,
+			"countries":           map[string]int{},
+			"china_provinces":     map[string]int{},
+			"top_countries":       []models.SecurityAttackType{},
+			"top_attack_types":    []models.SecurityAttackType{},
+			"top_rules":           []models.SecurityAttackType{},
+			"top_targets":         []models.SecurityAttackType{},
+			"hourly_hist":         hourly,
+			"attack_type_share":   []models.SecurityAttackType{},
+			"recent_rate":         0.0,
 		}
 	}
 	if db.MetricsDB == nil {
@@ -795,8 +871,8 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		return
 	}
 
-	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05")
-	activeSince := time.Now().UTC().Add(-threatActiveSourceWindow).Truncate(time.Second).Format("2006-01-02 15:04:05")
+	since := now.UTC().Add(-time.Duration(hours) * time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05")
+	activeSince := now.UTC().Add(-threatActiveSourceWindow).Truncate(time.Second).Format("2006-01-02 15:04:05")
 
 	// 任一查询失败显式报错（历史问题 D2 单错误收敛，trackErr 同 GetSecurityOverview）
 	var firstErr error
@@ -835,47 +911,13 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 	chinaProvinces := map[string]int{}
 	familyCounts := map[string]int{}
 	ruleCounts := map[string]int{}
-	sinceMinute := time.Now().UTC().Add(-time.Duration(hours) * time.Hour).Truncate(time.Minute).Format("2006-01-02 15:04")
-	loc := services.CurrentLocation()
-	_, offset := time.Now().In(loc).Zone()
-	// hourly_hist 滑动窗口（不再按本地固定 0..23 小时折叠）：
-	//   - hours<=24：窗口末端每整点一小时桶，共 hours 槽（名称 HH:00，
-	//     末槽=当前小时）；
-	//   - hours>24：24h 日桶，共 ceil(hours/24) 槽、上限 30（名称 MM-DD，
-	//     末槽=今天）。
-	// 桶边界在「UTC+配置时区偏移」移位帧内计算（与既有偏移口径一致；
-	// rollup 分钟串为 UTC，扫描时加同一偏移落桶）。
-	shift := time.Duration(offset) * time.Second
-	shiftedNow := time.Now().UTC().Add(shift)
+	sinceMinute := now.UTC().Add(-time.Duration(hours) * time.Hour).Truncate(time.Minute).Format("2006-01-02 15:04")
+	bucketStarts, hourly := threatHourlyBuckets(hours, now, offset)
 	bucketStep := time.Hour
-	var bucketStarts []time.Time
-	var bucketNames []string
-	if hours <= 24 {
-		curHour := shiftedNow.Truncate(time.Hour)
-		start := curHour.Add(-time.Duration(hours-1) * time.Hour)
-		for i := range hours {
-			tb := start.Add(time.Duration(i) * time.Hour)
-			bucketStarts = append(bucketStarts, tb)
-			bucketNames = append(bucketNames, fmt.Sprintf("%02d:00", tb.Hour()))
-		}
-	} else {
+	if hours > 24 {
 		bucketStep = 24 * time.Hour
-		n := (hours + 23) / 24
-		if n > 30 {
-			n = 30
-		}
-		dayStart := time.Date(shiftedNow.Year(), shiftedNow.Month(), shiftedNow.Day(), 0, 0, 0, 0, time.UTC)
-		start := dayStart.AddDate(0, 0, -(n - 1))
-		for i := range n {
-			tb := start.AddDate(0, 0, i)
-			bucketStarts = append(bucketStarts, tb)
-			bucketNames = append(bucketNames, tb.Format("01-02"))
-		}
 	}
-	hourly := make([]models.SecurityAttackType, len(bucketNames))
-	for i := range hourly {
-		hourly[i] = models.SecurityAttackType{Name: bucketNames[i], Value: 0}
-	}
+	shift := time.Duration(offset) * time.Second
 	if rollRows, err := db.MetricsDB.Query(`SELECT minute, country, province, family, rule, action, count FROM security_event_rollup WHERE minute >= ?`, sinceMinute); err != nil {
 		trackErr(err)
 	} else {
@@ -901,7 +943,10 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 			mt, err := time.ParseInLocation("2006-01-02 15:04", minute, time.UTC)
 			if err == nil && len(bucketStarts) > 0 {
 				idx := int(mt.Add(shift).Sub(bucketStarts[0]) / bucketStep)
-				if idx >= 0 && idx < len(hourly) {
+				if idx < 0 {
+					idx = 0
+				}
+				if idx < len(hourly) {
 					hourly[idx].Value += count
 				}
 			}

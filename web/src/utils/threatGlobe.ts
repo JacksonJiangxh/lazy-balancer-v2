@@ -13,7 +13,7 @@ import { COUNTRY_CENTROIDS, FALLBACK_CENTROID } from '@/utils/countryCentroids'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { loadAdmin1Tables, loadedAdmin1Tables } from '@/utils/admin1Loader'
-import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, adminShortName, normalizeCountryName, aggregateCountryCounts } from '@/utils/threatShared'
+import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, adminShortName, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed } from '@/utils/threatShared'
 import type { ThreatScene, ThreatSceneOptions, CountryHeat } from '@/utils/threatScene'
 import { FLOW_ATTACK_ARC_COLORS, FLOW_NORMAL_ARC_COLORS, FLOW_FLIGHT_MS, flowArcLabel, flowAttackWidth, flowNormalWidth } from '@/utils/threatTheme'
 
@@ -127,20 +127,17 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   // 同步点阵/H3 会挡住 renderer 尺寸更新，canvas 按 window 尺寸停留，
   // 球心偏右 → 「从右侧飘入」。
   let layerReady = false
-  // 世界点阵与地图版同源：1.1° 错列网格 + 点内多边形判定（~1.3 万点）。
+  // 世界点阵与地图版同源错列网格 + 点内多边形判定；球面步长独立校准。
   // 用单个 THREE.Points 承载，一次 draw call；不再走 H3（res3 首屏 4.4s
   // 主线程长任务，res2 点阵又明显稀疏——两条路都不可接受）。
-  // 点阵间距：1.1° → 0.95°（约 +34% 点量），视觉间隙更小；世界/下钻同源。
-  // 地图点阵密集度已被用户确认合理；球面按同一网格局加密到 0.8°
-  // （球面投影下 0.95° 的可见点量明显少于地图）。
-  // 地图密度合理，但球面 24k 点实测只有 ~26fps；0.9° 在观感接近的同时
-  // 保留 60fps 余量，点径同步按地图比例微调。
+  // 点阵间距 0.9°：世界/下钻同源错列网格，在观感接近更密网格的同时
+  // 保留 60fps 余量，点径与地图版按各自投影分别校准。
   const DOT_STEP = 0.9
   // 与地图共用同一基色/不透明度（用户裁定：沿用地图口径）。
   const DOT_BASE = 'rgb(44,66,96)'
   // 地图点阵半径随 cam.zoom 放大；球面点径固定屏幕像素会让下钻显得稀。
-  // 点阵贴地表的高度：0.03 球半径会在球缘产生 3% 视差，hover 拾取按
-  // 球面 100 计算而点画在 103 上，观感就是「高亮被弧度带偏」。
+  // 点阵与 hover 拾取共用 DOT_ALTITUDE 壳层；0.005 的微小抬高避免
+  // z-fighting，同时控制球缘视差，不让高亮偏离目标国家。
   const DOT_ALTITUDE = 0.005
   const WORLD_DOT_SIZE = 3.2
   const DRILL_DOT_SIZE = 6.2
@@ -385,7 +382,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
    *  drilledName+flyTo，省板为空（被选国家成空洞）。 */
   async function drillCountry(name: string): Promise<void> {
     name = normalizeCountryName(name)
-    if (opts?.drillCountries && !opts.drillCountries.includes(name)) return
+    if (!drillCountryAllowed(opts?.drillCountries, name)) return
     const seq = ++drillSeq
     if (name !== '中国') {
       const tables = await loadAdmin1Tables()
@@ -563,7 +560,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     const positions = new Float32Array(dots.length * 3)
     const v = new THREE.Vector3()
     for (let i = 0; i < dots.length; i++) {
-      // 0.03 球半径抬高，避免与球面 z-fighting，又不产生悬浮感。
+      // 以 DOT_ALTITUDE 微小抬高，避免与球面 z-fighting，又不产生悬浮感。
       v.copy((globe as unknown as { getCoords: (lat: number, lng: number, alt: number) => THREE.Vector3 }).getCoords(dots[i].lat, dots[i].lng, DOT_ALTITUDE))
       positions[i * 3] = v.x
       positions[i * 3 + 1] = v.y
@@ -589,7 +586,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     updateDotColors()
   }
 
-  /** 世界点阵：与地图版同一 1.1° 网格/同源国家多边形（~1.3 万点）。 */
+  /** 世界点阵：与地图版同源错列网格/国家多边形（球面步长独立校准）。 */
   function buildWorldDots(): void {
     if (worldDots) return
     const dots: WorldDot[] = []
@@ -631,7 +628,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     dotsPoints.visible = !drilledName
   }
 
-  /** 下钻省点阵：与地图版同一 1.1° 网格/错列，按 admin 短名染色。 */
+  /** 下钻省点阵：与世界层同错列网格，按 admin 短名染色。 */
   function ensureProvinceDotSet(country: string): { dots: WorldDot[]; positions: Float32Array } {
     const cached = provinceDotCache.get(country)
     if (cached) return cached
@@ -805,9 +802,6 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   return {
-    addArc(origin: Centroid): void {
-      spawnArc(origin, false)
-    },
     addArcForLocation(ipLocation: string, weight = 1): void {
       if (!ipLocation) return
       const [country, province] = ipLocation.split('·')
@@ -878,15 +872,6 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       globe.controls().autoRotate = !paused
       globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, 600)
       applyLayer()
-    },
-    setControlsEnabled(enabled: boolean): void {
-      globe.controls().enabled = enabled
-    },
-    pickCountryAt(clientX: number, clientY: number): string | null {
-      const geo = screenToLatLng(clientX, clientY)
-      if (!geo) return null
-      const hit = THREAT_COUNTRIES.find((c) => pointInEntries(geo.lng, geo.lat, [c]))
-      return hit?.name ?? null
     },
     cameraState(): { zoom: number; cx: number; cy: number; dist: number; pos: [number, number, number] } {
       const pov = globe.pointOfView()

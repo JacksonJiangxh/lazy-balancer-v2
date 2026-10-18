@@ -58,8 +58,30 @@ func (h *Handlers) GetCrawlerLib(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
 		return
 	}
+	listRows, err := db.DB.Query(`SELECT name, id FROM security_ip_lists WHERE system=1`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
+		return
+	}
+	listIDs := map[string]int{}
+	for listRows.Next() {
+		var name string
+		var id int
+		if err := listRows.Scan(&name, &id); err != nil {
+			listRows.Close()
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
+			return
+		}
+		listIDs[name] = id
+	}
+	if err := listRows.Err(); err != nil {
+		listRows.Close()
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
+		return
+	}
+	listRows.Close()
 	for i := range sources {
-		_ = db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND system=1`, services.CrawlerIPListName(sources[i].Name)).Scan(&sources[i].ListID)
+		sources[i].ListID = listIDs[services.CrawlerIPListName(sources[i].Name)]
 	}
 	days, hhmm := services.CrawlerSchedule()
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{

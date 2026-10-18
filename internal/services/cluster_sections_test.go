@@ -37,6 +37,38 @@ func overrideWafPathsForServicesTest(t *testing.T) (crsDir, xdbPath string) {
 	return crsDir, xdbPath
 }
 
+// SVC-80-D1-02：driver.Rows.Next 的非 EOF 错误只能经 rows.Err 观测。
+// 已应用哈希读到部分结果时必须回退全量重放，不得把截断视图当完整记录。
+func TestReadAppliedSectionHashes_iterationErrorDropsPartialView(t *testing.T) {
+	fake := sql.OpenDB(&fakeIterErrConnector{failNeedle: "FROM cluster_applied_sections"})
+	t.Cleanup(func() { _ = fake.Close() })
+	if got := readAppliedSectionHashes(fake); got != nil {
+		t.Fatalf("iteration error returned partial applied hashes: %#v", got)
+	}
+}
+
+// 版本行差分读取失败时偏向重放；空快照与截断本地视图不得误判为一致。
+func TestSnapshotSecurityVersionRowsDiffer_iterationErrorForcesReplay(t *testing.T) {
+	for _, needle := range []string{"FROM security_crs_version", "FROM security_ip2region_version"} {
+		t.Run(needle, func(t *testing.T) {
+			fake := sql.OpenDB(&fakeIterErrConnector{failNeedle: needle})
+			t.Cleanup(func() { _ = fake.Close() })
+			tx, err := fake.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			snapshot := models.ClusterSnapshot{
+				SecurityCRSVersion:       []models.ClusterSecurityCRSVersion{},
+				SecurityIP2RegionVersion: []models.ClusterSecurityIP2RegionVersion{},
+			}
+			if !snapshotSecurityVersionRowsDiffer(context.Background(), tx, snapshot) {
+				t.Fatalf("%s iteration error was treated as identical versions", needle)
+			}
+		})
+	}
+}
+
 func TestComputeSectionSkips_switchOffAndHashMatch(t *testing.T) {
 	_, database := newClusterTestService(t)
 	ctx := context.Background()
@@ -123,7 +155,7 @@ func TestSyncSections_threeCategoryMerge(t *testing.T) {
 func TestSectionPayload_usersCarriesGlobalConfig(t *testing.T) {
 	caddy := `{"apps":{}}`
 	s := &models.ClusterSnapshot{
-		BasicSettings: models.ClusterBasicSettings{LogLevel: "debug"},
+		BasicSettings: models.ClusterBasicSettings{LogLevel: new("debug")},
 		CaddyConfig:   &caddy,
 		WafFiles:      &models.ClusterWafFilesRef{CRSVersion: "v4.28.0", CRSSha256: "abc"},
 	}

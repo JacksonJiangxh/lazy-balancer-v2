@@ -634,15 +634,7 @@ watch(() => props.modelValue, (v) => {
 </script>
 
 <style scoped>
-/* ① 来源卡：类型着色（全类型同构，仅色相区分） */
-.trg-source--geo { border-color: var(--el-color-warning-light-7); background: var(--el-color-warning-light-9); }
-.trg-source--threat { border-color: var(--el-color-danger-light-7); background: var(--el-color-danger-light-9); }
-.trg-source--trust { border-color: var(--el-color-success-light-7); background: var(--el-color-success-light-9); }
-.trg-source--acl { border-color: var(--el-color-danger-light-7); background: var(--el-color-danger-light-9); }
-.trg-source--waf-crs, .trg-source--waf-custom { border-color: var(--el-color-primary-light-7); background: var(--el-color-primary-light-9); }
-.trg-source--body { border-color: var(--el-color-info-light-7); background: var(--el-color-info-light-9); }
-
-/* ① 命中概览（trg-hero）：类型着色同来源卡 + 三行结构 */
+/* ① 命中概览（trg-hero）：基础布局在前，类型着色在后覆盖默认 danger 色 */
 .trg-hero { border: 1px solid var(--el-color-danger-light-7); background: var(--el-color-danger-light-9); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
 .trg-hero-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .trg-hero-stage { font-weight: 700; font-size: 14px; }
@@ -652,6 +644,13 @@ watch(() => props.modelValue, (v) => {
 .trg-hero-hit { font-size: 13px; margin-top: 4px; color: var(--el-text-color-primary); }
 .trg-hero-time { font-size: 12px; margin-top: 4px; color: var(--el-text-color-secondary); }
 .trg-hero-meta { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--el-text-color-secondary); flex-wrap: wrap; }
+/* ① 来源卡与命中概览：类型着色（全类型同构，仅色相区分） */
+.trg-source--geo { border-color: var(--el-color-warning-light-7); background: var(--el-color-warning-light-9); }
+.trg-source--threat { border-color: var(--el-color-danger-light-7); background: var(--el-color-danger-light-9); }
+.trg-source--trust { border-color: var(--el-color-success-light-7); background: var(--el-color-success-light-9); }
+.trg-source--acl { border-color: var(--el-color-danger-light-7); background: var(--el-color-danger-light-9); }
+.trg-source--waf-crs, .trg-source--waf-custom { border-color: var(--el-color-primary-light-7); background: var(--el-color-primary-light-9); }
+.trg-source--body { border-color: var(--el-color-info-light-7); background: var(--el-color-info-light-9); }
 .trg-source-geo { color: var(--el-text-color-secondary); font-size: 12px; }
 /* ②③ 信息卡：统一标题+分隔线+KV 行 */
 .trg-card { border: 1px solid var(--el-border-color); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }

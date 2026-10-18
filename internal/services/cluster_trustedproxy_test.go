@@ -22,8 +22,10 @@ func TestLoadSnapshotGlobalSettings_carriesTrustedProxySettings(t *testing.T) {
 		t.Fatalf("load snapshot settings: %v", err)
 	}
 	s := snapshot.BasicSettings
-	if !s.TrustedProxyEnabled || s.TrustedProxyRanges != `["203.0.113.0/24"]` ||
-		s.TrustedProxyHeaders != `["CF-Connecting-IP","X-Forwarded-For"]` || s.TrustedProxyStrict {
+	if s.TrustedProxyEnabled == nil || !*s.TrustedProxyEnabled ||
+		s.TrustedProxyRanges == nil || *s.TrustedProxyRanges != `["203.0.113.0/24"]` ||
+		s.TrustedProxyHeaders == nil || *s.TrustedProxyHeaders != `["CF-Connecting-IP","X-Forwarded-For"]` ||
+		s.TrustedProxyStrict == nil || *s.TrustedProxyStrict {
 		t.Fatalf("trusted proxy settings=%+v, want DB values", s)
 	}
 	wire, err := json.Marshal(s)
@@ -53,11 +55,11 @@ func TestUpdateSnapshotSettings_trustedProxySettingsApplied(t *testing.T) {
 	if err := updateSnapshotSettings(ctx, tx, models.ClusterSnapshot{
 		CaddyConfig: &caddyConfig,
 		BasicSettings: models.ClusterBasicSettings{
-			JWTExpireMinutes:    20,
-			TrustedProxyEnabled: true,
-			TrustedProxyRanges:  `["198.51.100.0/24"]`,
-			TrustedProxyHeaders: `["X-Forwarded-For"]`,
-			TrustedProxyStrict:  true,
+			JWTExpireMinutes:    new(20),
+			TrustedProxyEnabled: new(true),
+			TrustedProxyRanges:  new(`["198.51.100.0/24"]`),
+			TrustedProxyHeaders: new(`["X-Forwarded-For"]`),
+			TrustedProxyStrict:  new(true),
 		},
 	}); err != nil {
 		t.Fatalf("apply settings: %v", err)

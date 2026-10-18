@@ -542,10 +542,12 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 		for trows.Next() {
 			var src string
 			var cnt int
-			if trows.Scan(&src, &cnt) == nil {
-				if listName := db.ThreatListNameBySource(src); listName != "" {
-					threatCounts[listName] = cnt
-				}
+			if err := trows.Scan(&src, &cnt); err != nil {
+				services.Logf("warn", "威胁库条数扫描失败（系统名单条数可能不完整）: %v", err)
+				continue
+			}
+			if listName := db.ThreatListNameBySource(src); listName != "" {
+				threatCounts[listName] = cnt
 			}
 		}
 		// SEC-A-3（历史）：迭代失败与查询失败同待遇（历史问题-4 降级语义——
@@ -611,7 +613,7 @@ func (h *Handlers) GetIPList(c *gin.Context) {
 	// 历史问题：预置自动封禁名单（system=1 但条目在 DB）走自定义分支——威胁文件
 	// 读取对该名恒失败（未映射威胁源）会让弹框 500。
 	row.PresetAutoban = row.System && row.Name == services.AutobanPresetListName
-	if row.System && !row.PresetAutoban && row.Category != "搜索引擎爬虫" {
+	if row.System && !row.PresetAutoban && services.IsThreatSystemListName(row.Name) {
 		// RDB 文件化: 威胁名单条目从 .iplist 文件读取；爬虫地址库仍由
 		// DB entries 提供（不得误走威胁文件路径返回空集）。
 		vals, ferr := services.ReadThreatIplistForUI(row.Name)
@@ -639,9 +641,6 @@ func (h *Handlers) GetIPList(c *gin.Context) {
 }
 
 func (h *Handlers) CreateIPList(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	var req models.CreateIPListRequest
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -650,6 +649,8 @@ func (h *Handlers) CreateIPList(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	if strings.TrimSpace(req.Entries) == "" {
 		req.Entries = "[]"
 	}
@@ -706,9 +707,6 @@ func (h *Handlers) CreateIPList(c *gin.Context) {
 }
 
 func (h *Handlers) UpdateIPList(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	id := c.Param("id")
 	var req models.UpdateIPListRequest
 	if !guardConfiguredJSONBody(c) {
@@ -718,6 +716,8 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "开启数据库事务失败"})
@@ -991,9 +991,6 @@ func (h *Handlers) DeleteIPList(c *gin.Context) {
 }
 
 func (h *Handlers) AddIPToList(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	id := c.Param("id")
 	var req models.AddIPToListRequest
 	if !guardConfiguredJSONBody(c) {
@@ -1003,6 +1000,8 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	if !validIPOrCIDR(req.Value) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的 IP/CIDR：" + req.Value})
 		return
@@ -1089,10 +1088,6 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 // 无害）；成功移除 200 {removed:true}。移除/追加经 finishTxApply 同链触发
 // 引用策略重载。
 func (h *Handlers) RemoveIPFromList(c *gin.Context) {
-	// 历史 历史问题：家族 3 写路径统一持锁（同文件 Create/Update/Delete/Add 均持，
-	// 唯本端点历史新增时漂移漏锁——apply 与持锁写并发交错可丢配置更新）
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
 	id := c.Param("id")
 	var req models.AddIPToListRequest
 	if !guardConfiguredJSONBody(c) {
@@ -1102,6 +1097,10 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	// 历史 历史问题：家族 3 写路径统一持锁（同文件 Create/Update/Delete/Add 均持，
+	// 唯本端点历史新增时漂移漏锁——apply 与持锁写并发交错可丢配置更新）
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	if !validIPOrCIDR(req.Value) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的 IP/CIDR：" + req.Value})
 		return
@@ -1215,6 +1214,17 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 	})
 }
 
+// ipListCommitTxForTest 仅测试注入 commit 失败（nil=生产直通）。测试实现应
+// 先回滚事务再返回错误，确保恢复逻辑读到已提交视图。
+var ipListCommitTxForTest func(*sql.Tx) error
+
+func commitIPListTx(tx *sql.Tx) error {
+	if ipListCommitTxForTest != nil {
+		return ipListCommitTxForTest(tx)
+	}
+	return tx.Commit()
+}
+
 // tryIPListHotPathApply 名单-only 变更的投影热路径（2026-10-15 用户裁定）。
 // 资格 = 条目实际变化 ∧ 被启用策略引用 ∧ 被受信代理/CRS 排除引用面覆盖
 // （引用面判定单源 IPListsReferencedByEnabledPolicy，历史 SEC-2 补全
@@ -1273,9 +1283,11 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 			}
 			// 传输/系统失败 → 家族 2 退化语义：提交 + 业务审计 + 重载失败审计
 			// + caddy_apply_error 标记 + 200 带告警（与 finishTxApply 同口径）。
-			if err := tx.Commit(); err != nil {
-				recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", err.Error(), services.AuditResultPart("failure")))
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + err.Error()})
+			if err := commitIPListTx(tx); err != nil {
+				restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+				joined := errors.Join(err, restoreErr)
+				recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", joined.Error(), services.AuditResultPart("failure")))
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + joined.Error()})
 				return true
 			}
 			h.recordCaddyApplyResult(applyErr)
@@ -1289,9 +1301,11 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 			c.JSON(status, models.APIResponse{Code: 0, Message: f.SuccessMsg + "；但 Caddy 配置应用失败：" + applyErr.Error(), Data: f.Data})
 			return true
 		}
-		if err := tx.Commit(); err != nil {
-			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", err.Error(), services.AuditResultPart("failure")))
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + err.Error()})
+		if err := commitIPListTx(tx); err != nil {
+			restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+			joined := errors.Join(err, restoreErr)
+			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", joined.Error(), services.AuditResultPart("failure")))
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + joined.Error()})
 			return true
 		}
 		h.recordCaddyApplyResult(nil)
@@ -1306,10 +1320,13 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 		return true
 	}
 	// 热路径收尾：镜像 finishTxApply 成功分支，但零 /load（无重载审计）。
-	if err := tx.Commit(); err != nil {
-		// 2026-09-07 审计 L5：SQLite commit 失败极罕见；apply 侧本次为纯投影
-		// 重写（无 /load），无运行配置回弹面——投影与 DB 的分叉由下次任意
-		// 渲染收敛（同字节跳写保护在役文件）。
+	if err := commitIPListTx(tx); err != nil {
+		// 先回滚释放 SQLite 写锁，再从已提交 DB 视图重写投影；本分支
+		// 没有 /load 副作用，保持零重载恢复语义。
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			err = errors.Join(err, rbErr)
+		}
+		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + err.Error()})
 		return true
@@ -1345,18 +1362,18 @@ func (h *Handlers) ExportIPList(c *gin.Context) {
 		return
 	}
 	var entries []models.IPListEntry
-	if system == 0 || entriesJSON != "" && entriesJSON != "[]" {
-		// 自定义名单/自动封禁名单：DB entries（空串/畸形按空导出）。
-		_ = json.Unmarshal([]byte(entriesJSON), &entries)
-	}
-	if len(entries) == 0 && system == 1 {
-		// 威胁名单（RDB 文件化，entries 恒空）：导出 .iplist 文件条目；
-		// 文件缺失（源禁用/未更新）按空导出，不阻断下载。
+	if system == 1 && services.IsThreatSystemListName(name) {
+		// 威胁名单以 .iplist/.fast 代际文件为唯一真相；DB entries 可能
+		// 是文件化前遗留内容，不得优先导出。文件缺失按空导出。
 		if vals, ferr := services.ReadThreatIplistForUI(name); ferr == nil {
+			entries = make([]models.IPListEntry, 0, len(vals))
 			for _, v := range vals {
 				entries = append(entries, models.IPListEntry{Value: v})
 			}
 		}
+	} else {
+		// 自定义/自动封禁/爬虫名单：DB entries（空串/畸形按空导出）。
+		_ = json.Unmarshal([]byte(entriesJSON), &entries)
 	}
 	var b strings.Builder
 	for _, e := range entries {

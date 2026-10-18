@@ -292,16 +292,27 @@ func validateLbbakXdbPayload(data []byte) error {
 // 历史问题/历史问题/03/08:逐文件结果返回（不再是单一 warning）——落盘失败的
 // CRS/xdb 由调用方在事务内丢弃对应版本表、威胁库逐源失败并入响应告警；
 // xdb 落盘前必须通过装载验证（坏文件拒绝并保留本地文件）。
-// 历史问题-02：本函数是 WAF 数据文件写者（CRS 树交换/xdb/威胁 .iplist+.fast），
-// 全文件相位持 services wafFileMu——与三库更新器串行（调用方已在
-// caddyOpMu 内，wafFileMu 为叶锁不反向嵌套）。
+// applyLbbakWafFiles 自锁包装（独立调用/测试路径）：有文件时持
+// services.WafFileLock 后委托 InLock 变体。
+// 历史问题-02：WAF 文件写者（CRS 树交换/xdb/威胁 .iplist+.fast）必须与三库
+// 更新器串行；导入核心走 InLock 变体，在开启 DB 事务前先行取锁。
 func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip2regionTag string) lbbakWafApplyResult {
+	if payload.CRSTarGz == nil && payload.Xdb == nil && len(payload.ThreatIplists) == 0 {
+		return lbbakWafApplyResult{}
+	}
+	services.WafFileLock().Lock()
+	defer services.WafFileLock().Unlock()
+	return applyLbbakWafFilesInLock(c, action, payload, ip2regionTag)
+}
+
+// applyLbbakWafFilesInLock 在有 WAF 文件时要求调用方已持
+// services.WafFileLock（导入核心在开启 DB 事务前取锁，与 CRS/威胁库更新器
+// 的 WAF→DB 锁序一致，消除 DB tx→wafFileMu 的 AB-BA 反转）；不自锁，避免重入。
+func applyLbbakWafFilesInLock(c *gin.Context, action string, payload *lbbakPayload, ip2regionTag string) lbbakWafApplyResult {
 	var result lbbakWafApplyResult
 	if payload.CRSTarGz == nil && payload.Xdb == nil && len(payload.ThreatIplists) == 0 {
 		return result
 	}
-	services.WafFileLock().Lock()
-	defer services.WafFileLock().Unlock()
 	threatFailed := map[string]struct{}{}
 	threatLanded := false
 	bundle := &services.WafFileBundle{IP2RegionTag: ip2regionTag}

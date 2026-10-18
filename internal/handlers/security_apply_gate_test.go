@@ -3,6 +3,7 @@ package handlers
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -149,5 +150,38 @@ func TestSecurityWrites_serializeWithRuleWrites(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("释放锁后安全写未完成（疑似死锁）")
+	}
+}
+
+func TestSecurityWriteBodies_bindBeforeCaddyOpLock(t *testing.T) {
+	tests := []struct {
+		file      string
+		functions []string
+	}{
+		{"security.go", []string{"CreateSecurityCustomRule", "UpdateSecurityCustomRule", "CreateSecurityBlockPage", "UpdateSecurityBlockPage", "CreateSecurityPolicy", "UpdateSecurityPolicy", "BindRuleToPolicy", "SetRuleSecurityPolicies", "BulkUpdatePolicyBindings", "BatchBindSecurityPolicies"}},
+		{"securityiplists.go", []string{"CreateIPList", "UpdateIPList", "AddIPToList", "RemoveIPFromList"}},
+	}
+	for _, tc := range tests {
+		raw, err := os.ReadFile(tc.file)
+		if err != nil {
+			t.Fatalf("read %s: %v", tc.file, err)
+		}
+		source := string(raw)
+		for _, name := range tc.functions {
+			start := strings.Index(source, "func (h *Handlers) "+name+"(")
+			if start < 0 {
+				t.Errorf("%s: %s not found", tc.file, name)
+				continue
+			}
+			body := source[start:]
+			if end := strings.Index(body, "\nfunc "); end > 0 {
+				body = body[:end]
+			}
+			bind := strings.Index(body, "c.ShouldBindJSON")
+			lock := strings.Index(body, "h.caddyOpMu.Lock()")
+			if bind < 0 || lock < 0 || bind > lock {
+				t.Errorf("%s.%s: request body must be bound before caddyOpMu (bind=%d lock=%d)", tc.file, name, bind, lock)
+			}
+		}
 	}
 }

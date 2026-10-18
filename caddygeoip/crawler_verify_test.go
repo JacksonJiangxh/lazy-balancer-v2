@@ -310,3 +310,65 @@ func TestVerifyCrawlerIPRange_invalidAddrNoPanic(t *testing.T) {
 		t.Fatal("valid address regression: expected match")
 	}
 }
+
+// ---- 历史 E-CM-05：地址归一化（Unmap/zone），方向 fail-closed ----
+
+// Given: 客户端 IP 为 4in6 映射形态，PTR 属引擎官方域，正向回验返回 v4 规范串
+// When: 双跳验证
+// Then: 同地址不同文本形态须判等通过（Unmap 归一）；正向不含原 IP 仍拒绝。
+func TestVerifyCrawlerDNS_v4MappedFormsUnified(t *testing.T) {
+	ResetCrawlerVerifyCacheForTest(&fakeResolver{
+		ptr: map[string][]string{
+			"::ffff:66.249.66.1": {"crawl-66-249-66-1.googlebot.com."},
+			"::ffff:66.249.66.2": {"crawl-66-249-66-2.googlebot.com."},
+		},
+		host: map[string][]string{
+			"crawl-66-249-66-1.googlebot.com": {"66.249.66.1"}, // 正向返回 v4 规范串
+			"crawl-66-249-66-2.googlebot.com": {"66.249.66.9"}, // 正向不含原 IP
+		},
+	})
+	// 目标形状：4in6 客户端 + v4 规范正向应答 = 同地址，须通过
+	// （旧字符串比较 "::ffff:66.249.66.1" == "66.249.66.1" 恒假 → 真爬虫误杀）。
+	if !VerifyCrawler("::ffff:66.249.66.1", "googlebot") {
+		t.Error("4in6 客户端与 v4 正向应答同地址应通过（Unmap 归一）")
+	}
+	// 回归形状：映射形态但正向回验不含原 IP → 仍 fail-closed。
+	if VerifyCrawler("::ffff:66.249.66.2", "googlebot") {
+		t.Error("4in6 客户端正向不含原 IP 仍须拒绝")
+	}
+	// 畸形形状：带 zone 地址不得命中（fail-closed）。
+	if VerifyCrawler("2001:db8::1%eth0", "googlebot") {
+		t.Error("带 zone 地址必须 fail-closed")
+	}
+}
+
+// Given: 官方段名单含 v4 段与 v6 段
+// When: 查询 4in6 映射形态/段外映射形态/原生 v6/带 zone 地址
+// Then: 映射形态归一命中 v4 段；段外与 zone 形态 fail-closed；v6 不受影响。
+func TestVerifyCrawlerIPRange_v4MappedAndZoneNormalized(t *testing.T) {
+	oldFile := crawlerIPListFile
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	t.Cleanup(func() { crawlerIPListFile = oldFile })
+	if err := os.WriteFile(crawlerIPListFile, []byte(`{"so360spider":["42.236.8.0/21","2408:4000::/32"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetCrawlerIPRangeCacheForTest()
+
+	// 目标形状：4in6 映射形态命中 v4 段（Unmap 归一；旧实现 netip v4 前缀
+	// 不含 4in6 地址，恒不命中 → 真爬虫被误判为伪装）。
+	if !verifyCrawlerIPRangeFromList("::ffff:42.236.8.1", "so360spider") {
+		t.Fatal("4in6 映射形态应命中 v4 官方段（Unmap 归一）")
+	}
+	// 回归形状 1：映射形态但段外 → fail-closed。
+	if verifyCrawlerIPRangeFromList("::ffff:42.236.16.1", "so360spider") {
+		t.Fatal("映射形态段外地址不得命中")
+	}
+	// 回归形状 2：原生 v6 命中 v6 段不受影响。
+	if !verifyCrawlerIPRangeFromList("2408:4000::1", "so360spider") {
+		t.Fatal("原生 v6 段内地址应命中")
+	}
+	// 畸形形状：带 zone 地址 fail-closed。
+	if verifyCrawlerIPRangeFromList("2408:4000::1%eth0", "so360spider") {
+		t.Fatal("带 zone 地址必须 fail-closed")
+	}
+}

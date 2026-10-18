@@ -256,14 +256,26 @@ func tlsWildcardMatch(pattern, domain string) bool {
 	return label != "" && !strings.Contains(label, ".")
 }
 
-func getOutboundIP() string {
+// dialOutboundIP 探测本机出口 IP（UDP dial 不写包，仅借路由决策读本地地址）。
+// 探测失败或地址类型意外（B2-06 历史：原 unchecked type assertion）
+// 回退 127.0.0.1 并返回 ok=false——单源实现，cluster_mode.go localOutboundIP
+// （需 ok 位做审计点名）与本函数（系统信息展示）共用。
+func dialOutboundIP() (string, bool) {
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
-		return "127.0.0.1"
+		return "127.0.0.1", false
 	}
 	defer conn.Close()
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
+	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return "127.0.0.1", false
+	}
+	return localAddr.IP.String(), true
+}
+
+func getOutboundIP() string {
+	ip, _ := dialOutboundIP()
+	return ip
 }
 
 func loadHostname() string {

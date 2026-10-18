@@ -101,3 +101,23 @@ func TestMFAVerifyStep_rejectsRecoveryCode(t *testing.T) {
 		t.Fatalf("recovery code must remain consumable via login path after TOTP-only rejection: ok=%v err=%v", ok, verr)
 	}
 }
+
+// B3-历史问题（历史）：step-up 验码通过后的用户重读，DB 错误此前与
+// 「用户不存在/禁用」同报 401 用户不可用——DB 故障被降级成认证拒绝。
+// 拆分：读失败 500；行缺失/禁用保持 401。
+func TestMFAVerifyStep_userReloadFailureReturns500(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	secret := seedMfaVerifyStepUser(t)
+	if _, err := db.DB.Exec("ALTER TABLE users RENAME COLUMN password_version TO password_version_unreadable"); err != nil {
+		t.Fatalf("break password_version column: %v", err)
+	}
+	code, err := totp.GenerateCodeCustom(secret, time.Now(), totp.ValidateOpts{Period: 30, Skew: 0, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1})
+	if err != nil {
+		t.Fatalf("generate totp: %v", err)
+	}
+	router := mfaVerifyStepRouter(h, "jwt")
+	rec := postMfaVerifyStep(router, fmt.Sprintf(`{"code":%q}`, code))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500（DB 故障不得报 401 用户不可用）", rec.Code, rec.Body.String())
+	}
+}

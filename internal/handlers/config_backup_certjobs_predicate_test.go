@@ -81,3 +81,57 @@ func TestImportConfigBackup_keepsDisabledACMERuleCertJobs(t *testing.T) {
 		t.Fatalf("禁用 ACME 规则的 cert_jobs 行=%d, want 1（保留供再启用续期）", jobCount)
 	}
 }
+
+func TestValidateV2BackupCertJobs_canonicalizesStoredDomain(t *testing.T) {
+	const rawDomain = "WWW.JobDomain.example.test,JOBDOMAIN.example.test"
+	if got := canonicalACMEDomainForJobLookup(rawDomain); got != "jobdomain.example.test,www.jobdomain.example.test" {
+		t.Fatalf("canonical helper returned %q", got)
+	}
+	tables := map[string][]map[string]any{
+		"lb_rules": {{
+			"caddy_id": "lb_jobdomain", "name": "jobdomain", "protocol": "http",
+			"domain": "WWW.JobDomain.example.test, jobdomain.example.test", "enabled": 0,
+			"enable_tls": 1, "tls_source": "acme_dns",
+		}},
+		"cert_jobs": {{
+			"rule_id": "lb_jobdomain", "domain": " WWW.JobDomain.example.test, JOBDOMAIN.example.test ", "status": "disabled",
+		}},
+	}
+	if err := validateV2BackupCertJobs(tables); err != nil {
+		t.Fatalf("validate cert jobs: %v", err)
+	}
+	if got := tables["cert_jobs"][0]["domain"]; got != "jobdomain.example.test,www.jobdomain.example.test" {
+		t.Fatalf("normalized domain=%v, want canonical", got)
+	}
+}
+
+func TestImportConfigBackup_canonicalizesACMEJobDomains(t *testing.T) {
+	// Given a disabled ACME rule whose resumable job uses a case/order-variant domain.
+	h := newBackupTestHandlers(t)
+	backup := completeBackupJSON(t, map[string][]map[string]any{
+		"lb_rules": {{
+			"caddy_id": "lb_jobdomain", "name": "jobdomain", "protocol": "http",
+			"domain": "WWW.JobDomain.example.test, jobdomain.example.test", "listen_port": 8082,
+			"enabled": 0, "enable_tls": 1, "tls_source": "acme_dns",
+		}},
+		"cert_jobs": {{
+			"rule_id": "lb_jobdomain", "domain": " WWW.JobDomain.example.test, JOBDOMAIN.example.test ", "status": "disabled",
+		}},
+	})
+
+	// When importing the backup.
+	response := postBackupImport(t, h, backup)
+
+	// Then the sole resumable job is stored under the canonical lookup key.
+	if response.Code != http.StatusOK {
+		t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var domain string
+	var count int
+	if err := db.DB.QueryRow(`SELECT domain, COUNT(*) FROM cert_jobs WHERE rule_id='lb_jobdomain'`).Scan(&domain, &count); err != nil {
+		t.Fatalf("read imported cert job: %v", err)
+	}
+	if count != 1 || domain != "jobdomain.example.test,www.jobdomain.example.test" {
+		t.Fatalf("cert jobs count=%d domain=%q, want one canonical domain", count, domain)
+	}
+}

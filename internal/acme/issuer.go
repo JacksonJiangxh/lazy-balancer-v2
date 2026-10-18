@@ -272,6 +272,10 @@ func zoneFromDomain(domain string) string {
 	return zone
 }
 
+// validationPollInterval 验证轮询节拍（测试接缝：真实 CA 轮询 5s；测试缩短
+// 以观察进度日志节流。生产不得改写）。
+var validationPollInterval = 5 * time.Second
+
 // waitForValidation polls both the challenge URL and the authorization URL
 // until the authorization reaches a final state. Polling the challenge as
 // well is required for ZeroSSL compatibility: its authorization status can
@@ -290,7 +294,7 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(validationPollInterval)
 	defer ticker.Stop()
 
 	var lastChalStatus, lastAuthStatus string
@@ -342,6 +346,9 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 		if tickerIterations%6 == 0 {
 			log(fmt.Sprintf("仍在等待 CA 验证 (challenge: %s, 授权: %s)", lastChalStatus, lastAuthStatus))
 		}
+		// 历史问题-1（历史）：此前计数恒零——%6 恒真，等待期每轮刷一条进度
+		// 日志（ZeroSSL 数分钟窗口即数百行）。按 6 轮节流。
+		tickerIterations++
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("等待 CA 验证超时 (challenge: %s, 授权: %s)", lastChalStatus, lastAuthStatus)

@@ -287,13 +287,18 @@ func (r *fakeEmptyRows) Next([]driver.Value) error {
 	return io.EOF
 }
 
+type fakeIterErrTx struct{}
+
+func (fakeIterErrTx) Commit() error   { return nil }
+func (fakeIterErrTx) Rollback() error { return nil }
+
 type fakeIterErrConn struct{ failNeedle string }
 
 func (c *fakeIterErrConn) Prepare(string) (driver.Stmt, error) {
 	return nil, errors.New("未实现 Prepare")
 }
 func (c *fakeIterErrConn) Close() error              { return nil }
-func (c *fakeIterErrConn) Begin() (driver.Tx, error) { return nil, errors.New("未实现 Begin") }
+func (c *fakeIterErrConn) Begin() (driver.Tx, error) { return fakeIterErrTx{}, nil }
 func (c *fakeIterErrConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	columns := []string{"a"}
 	if strings.Contains(query, c.failNeedle) {

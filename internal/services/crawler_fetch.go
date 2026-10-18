@@ -51,13 +51,6 @@ func findBoundedCrawlerTokens(re *regexp.Regexp, body string, v6 bool) []string 
 	return out
 }
 
-// parseCrawlerCIDRs 从任意 JSON/HTML 文本提取 CIDR 与裸 IP 并去重（宽松形态：
-// 未知格式/纯文本）。
-func parseCrawlerCIDRs(body string) []string {
-	out, _ := parseCrawlerCIDRsForFormat(body, "")
-	return out
-}
-
 // parseCrawlerCIDRsForFormat 按源声明格式提取（历史问题：消费 crawlerSource.Format）：
 //   - json：响应必须是合法 JSON（错误页/限流页 → error，调用方保留上次快照）；
 //   - html/plain/空：仅词法提取；

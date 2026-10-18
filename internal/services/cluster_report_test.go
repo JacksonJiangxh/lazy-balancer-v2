@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"encoding/json"
 	"lazy-balancer-v2/internal/config"
 	"lazy-balancer-v2/internal/models"
 )
@@ -65,5 +66,47 @@ func TestSyncService_RegisterWithMaster_returnsActionableErrorOnUnfollowedRedire
 	}
 	if strings.Contains(err.Error(), "unexpected end of JSON input") {
 		t.Fatalf("registration error=%q leaked raw JSON parse failure instead of guidance", err)
+	}
+}
+
+// 历史问题：临期统计覆盖仍可能代表当前证书材料的 downloaded/failed 行，
+// 不只 issued；waiting_ca 不属于部署完成/待部署证书材料口径。
+func TestSyncService_Report_countsExpiringCertificatesAcrossDeployableStates(t *testing.T) {
+	_, database := newClusterTestService(t)
+	reported := make(chan models.ClusterReport, 1)
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var report models.ClusterReport
+		if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		reported <- report
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer master.Close()
+	caddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer caddy.Close()
+	if _, err := database.Exec(`UPDATE global_config SET is_master=0,master_url=?,cluster_token='cluster-token' WHERE id=1`, master.URL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,expires_at) VALUES
+		('lb_issued','issued.example.test','issued',datetime('now','+2 days')),
+		('lb_downloaded','downloaded.example.test','downloaded',datetime('now','+3 days')),
+		('lb_failed','failed.example.test','failed',datetime('now','+4 days')),
+		('lb_waiting','waiting.example.test','waiting_ca',datetime('now','+5 days')),
+		('lb_future','future.example.test','issued',datetime('now','+90 days'))`); err != nil {
+		t.Fatal(err)
+	}
+	service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, NewCaddyService(caddy.URL))
+	if err := service.Report(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case report := <-reported:
+		if report.Health.CertsExpiring30d != 3 {
+			t.Fatalf("expiring count=%d, want issued/downloaded/failed = 3", report.Health.CertsExpiring30d)
+		}
+	default:
+		t.Fatal("master did not receive cluster report")
 	}
 }

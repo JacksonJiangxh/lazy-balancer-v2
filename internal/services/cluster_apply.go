@@ -225,8 +225,8 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 历史问题：落盘失败不得只审计——写 apply_ok_branding_failed 标记
 	// （apply_ok_reload_failed 同族），304 分支据此全量重拉并在下一轮强制
 	// 重试；users 节被哈希跳过时标记同样强制重试。
-	if !skip.skip("users") || brandingRetry || reloadCompensation {
-		if brandingErr := applySnapshotBrandingChecked(s.cfg, snapshot.BasicSettings.BrandingJSON); brandingErr != nil {
+	if snapshot.BasicSettings.BrandingJSON != nil && (!skip.skip("users") || brandingRetry || reloadCompensation) {
+		if brandingErr := applySnapshotBrandingChecked(s.cfg, *snapshot.BasicSettings.BrandingJSON); brandingErr != nil {
 			Logf("error", "同步品牌配置未落盘（数据库已应用，文件未收敛，下轮重试）: %v", brandingErr)
 			s.persistSyncError(ctx, syncBrandingFailureMarkerPrefix+": 品牌配置落盘失败（数据库已应用，文件未收敛，下轮同步重试）", models.SyncErrorCodeApplyFailed)
 		}
@@ -591,8 +591,8 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 		if err := updateSnapshotSettings(ctx, tx, snapshot); err != nil {
 			return err
 		}
-	} else {
-		if _, err := tx.ExecContext(ctx, `UPDATE global_config SET sync_interval=? WHERE id=1 AND COALESCE(is_master,1)=0`, snapshot.BasicSettings.SyncInterval); err != nil {
+	} else if snapshot.BasicSettings.SyncInterval != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE global_config SET sync_interval=? WHERE id=1 AND COALESCE(is_master,1)=0`, *snapshot.BasicSettings.SyncInterval); err != nil {
 			return fmt.Errorf("写入同步间隔: %w", err)
 		}
 	}
@@ -1213,53 +1213,183 @@ func insertSnapshotPathRules(ctx context.Context, tx *sql.Tx, ruleID string, pat
 
 func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.ClusterSnapshot) error {
 	settings := snapshot.BasicSettings
-	if settings.JWTExpireMinutes <= 0 || settings.JWTExpireMinutes > 1440 {
-		settings.JWTExpireMinutes = 20
+	if settings.JWTExpireMinutes != nil && (*settings.JWTExpireMinutes <= 0 || *settings.JWTExpireMinutes > 1440) {
+		settings.JWTExpireMinutes = new(20)
 	}
-	// branding_json 镜像列随 apply 落库(2026-09-19 生产实证修复):
-	// RefreshBrandingMirror 带 is_master=1 守卫(仅主端),从端原本只写
-	// 文件不写列——users 节哈希并入 basic_settings 后该列参与从端本地
-	// 重建,镜像缺失使从端与主端哈希永久分歧。列与文件同源同值,触发器
-	// WHEN is_master=1 守卫保证从端写入不 bump cluster_version。
-	query := `UPDATE global_config SET log_level=?,task_log_size_mb=?,audit_log_size_mb=?,runtime_log_size_mb=?,audit_retention_months=?,jwt_expire_minutes=?,timezone=?,acme_email=?,cert_expiry_days=?,cert_renewal_days=?,cert_renewal_attempts=?,default_ca_provider_id=?,dns_provider=?,dns_credentials=?,sync_interval=?,admin_tls_enabled=?,admin_tls_mode=?,admin_tls_cert=?,admin_tls_key=?,mfa_write_guard=?,mfa_lockout_enabled=?,github_proxy_url=?,oidc_config=?,branding_json=?`
-	// github_token 有意不下发（历史 历史问题，裁定保留）：节点本地机密——三个
-	// GitHub 调度器（CRS/IP2Region/威胁库）均 isMaster 专属，从节点从不直调
-	// GitHub，令牌无同步需求；对照 OIDC client_secret 下发是因从节点需本地
-	// 完成登录校验，性质不同。
-	args := []any{settings.LogLevel, settings.TaskLogSizeMB, settings.AuditLogSizeMB, settings.RuntimeLogSizeMB, settings.AuditRetentionMonths, settings.JWTExpireMinutes, settings.Timezone, settings.ACMEEmail, settings.CertExpiryDays, settings.CertRenewalDays, settings.CertRenewalAttempts, settings.DefaultCAProviderID, settings.DNSProvider, settings.DNSCredentials, settings.SyncInterval, settings.AdminTLSEnabled, settings.AdminTLSMode, settings.AdminTLSCert, settings.AdminTLSKey, settings.MFAWriteGuard, settings.MFALockoutEnabled, settings.GitHubProxyURL, settings.OIDCConfig, settings.BrandingJSON}
+	var baseClauses []string
+	var baseArgs []any
+	addBase := func(column string, value any) {
+		baseClauses = append(baseClauses, column+"=?")
+		baseArgs = append(baseArgs, value)
+	}
+	if settings.LogLevel != nil {
+		addBase("log_level", *settings.LogLevel)
+	}
+	if settings.TaskLogSizeMB != nil {
+		addBase("task_log_size_mb", *settings.TaskLogSizeMB)
+	}
+	if settings.AuditLogSizeMB != nil {
+		addBase("audit_log_size_mb", *settings.AuditLogSizeMB)
+	}
+	if settings.RuntimeLogSizeMB != nil {
+		addBase("runtime_log_size_mb", *settings.RuntimeLogSizeMB)
+	}
+	if settings.AuditRetentionMonths != nil {
+		addBase("audit_retention_months", *settings.AuditRetentionMonths)
+	}
+	if settings.JWTExpireMinutes != nil {
+		addBase("jwt_expire_minutes", *settings.JWTExpireMinutes)
+	}
+	if settings.Timezone != nil {
+		addBase("timezone", *settings.Timezone)
+	}
+	if settings.ACMEEmail != nil {
+		addBase("acme_email", *settings.ACMEEmail)
+	}
+	if settings.CertExpiryDays != nil {
+		addBase("cert_expiry_days", *settings.CertExpiryDays)
+	}
+	if settings.CertRenewalDays != nil {
+		addBase("cert_renewal_days", *settings.CertRenewalDays)
+	}
+	if settings.CertRenewalAttempts != nil {
+		addBase("cert_renewal_attempts", *settings.CertRenewalAttempts)
+	}
+	if settings.DefaultCAProviderID != nil {
+		addBase("default_ca_provider_id", *settings.DefaultCAProviderID)
+	}
+	if settings.DNSProvider != nil {
+		addBase("dns_provider", *settings.DNSProvider)
+	}
+	if settings.DNSCredentials != nil {
+		addBase("dns_credentials", *settings.DNSCredentials)
+	}
+	if settings.SyncInterval != nil {
+		addBase("sync_interval", *settings.SyncInterval)
+	}
+	if settings.AdminTLSEnabled != nil {
+		addBase("admin_tls_enabled", *settings.AdminTLSEnabled)
+	}
+	if settings.AdminTLSMode != nil {
+		addBase("admin_tls_mode", *settings.AdminTLSMode)
+	}
+	if settings.AdminTLSCert != nil {
+		addBase("admin_tls_cert", *settings.AdminTLSCert)
+	}
+	if settings.AdminTLSKey != nil {
+		addBase("admin_tls_key", *settings.AdminTLSKey)
+	}
+	if settings.MFAWriteGuard != nil {
+		addBase("mfa_write_guard", *settings.MFAWriteGuard)
+	}
+	if settings.MFALockoutEnabled != nil {
+		addBase("mfa_lockout_enabled", *settings.MFALockoutEnabled)
+	}
+	if settings.GitHubProxyURL != nil {
+		addBase("github_proxy_url", *settings.GitHubProxyURL)
+	}
+	if settings.OIDCConfig != nil {
+		addBase("oidc_config", *settings.OIDCConfig)
+	}
+	// branding_json 缺席=旧主端未携带，保留本地；非 nil 空串才是显式清空。
+	if settings.BrandingJSON != nil {
+		addBase("branding_json", *settings.BrandingJSON)
+	}
 	if snapshot.CaddyConfig != nil {
-		// 历史问题 A-N1：全局 body 上限钳制 [1,4096]（与 insertSnapshotRules 的行级
-		// 归一、写侧校验、导入钳制同边界）——渲染侧 int64(MB)*1024*1024 回绕会让
-		// 限制静默取消。库值唯一真相（批 1+2）：request_body_max_size_mb 与
-		// http 三超时/caddy_log_size_mb 为类型①值型列——旧版本主端快照携带的
-		// 0/越界值在从端落库前归治理默认，渲染层已零兜底。
-		if settings.RequestBodyMaxSizeMB <= 0 {
-			settings.RequestBodyMaxSizeMB = db.DefaultRequestBodyMaxSizeMB
-		} else if settings.RequestBodyMaxSizeMB > 4096 {
-			settings.RequestBodyMaxSizeMB = 4096
+		addBase("caddy_config", *snapshot.CaddyConfig)
+		// 历史问题 A-N1：仅归一「在场但非法」的值；nil 是旧主端缺席，跳过而非补默认。
+		if settings.RequestBodyMaxSizeMB != nil {
+			normalized := *settings.RequestBodyMaxSizeMB
+			if normalized <= 0 {
+				normalized = db.DefaultRequestBodyMaxSizeMB
+			} else if normalized > 4096 {
+				normalized = 4096
+			}
+			settings.RequestBodyMaxSizeMB = new(normalized)
 		}
-		if settings.HTTPReadTimeout <= 0 {
-			settings.HTTPReadTimeout = db.DefaultHTTPReadTimeout
+		normalizePositive := func(field **int, fallback int) {
+			if *field == nil || **field > 0 {
+				return
+			}
+			*field = new(fallback)
 		}
-		if settings.HTTPWriteTimeout <= 0 {
-			settings.HTTPWriteTimeout = db.DefaultHTTPWriteTimeout
+		normalizePositive(&settings.HTTPReadTimeout, db.DefaultHTTPReadTimeout)
+		normalizePositive(&settings.HTTPWriteTimeout, db.DefaultHTTPWriteTimeout)
+		normalizePositive(&settings.HTTPIdleTimeout, db.DefaultHTTPIdleTimeout)
+		normalizePositive(&settings.CaddyLogSizeMB, db.DefaultCaddyLogSizeMB)
+		if settings.AccessLogJSON != nil {
+			addBase("access_log_json", *settings.AccessLogJSON)
 		}
-		if settings.HTTPIdleTimeout <= 0 {
-			settings.HTTPIdleTimeout = db.DefaultHTTPIdleTimeout
+		if settings.AccessLogFormat != nil {
+			addBase("access_log_format", *settings.AccessLogFormat)
 		}
-		if settings.CaddyLogSizeMB <= 0 {
-			settings.CaddyLogSizeMB = db.DefaultCaddyLogSizeMB
+		if settings.CaddyLogLevel != nil {
+			addBase("caddy_log_level", *settings.CaddyLogLevel)
 		}
-		query += ",caddy_config=?,access_log_json=?,access_log_format=?,caddy_log_level=?,caddy_log_size_mb=?,request_body_max_size_mb=?,http_read_timeout=?,http_write_timeout=?,http_idle_timeout=?,upstream_keepalive_timeout=?,proxy_dial_timeout=?,proxy_response_header_timeout=?,proxy_read_timeout=?,proxy_write_timeout=?,proxy_stream_timeout=?,proxy_flush_interval=?,proxy_stream_close_delay=?,server_tokens_hidden=?,trusted_proxy_enabled=?,trusted_proxy_ranges=?,trusted_proxy_range_refs=?,trusted_proxy_headers=?,trusted_proxy_strict=?"
-		args = append(args, *snapshot.CaddyConfig, settings.AccessLogJSON, settings.AccessLogFormat, settings.CaddyLogLevel, settings.CaddyLogSizeMB,
-			settings.RequestBodyMaxSizeMB, settings.HTTPReadTimeout, settings.HTTPWriteTimeout, settings.HTTPIdleTimeout,
-			settings.UpstreamKeepaliveTimeout, settings.ProxyDialTimeout, settings.ProxyResponseHeaderTimeout, settings.ProxyReadTimeout, settings.ProxyWriteTimeout, settings.ProxyStreamTimeout, settings.ProxyFlushInterval, settings.ProxyStreamCloseDelay,
-			settings.ServerTokensHidden, settings.TrustedProxyEnabled, settings.TrustedProxyRanges, settings.TrustedProxyRangeRefs, settings.TrustedProxyHeaders, settings.TrustedProxyStrict)
+		if settings.CaddyLogSizeMB != nil {
+			addBase("caddy_log_size_mb", *settings.CaddyLogSizeMB)
+		}
+		if settings.RequestBodyMaxSizeMB != nil {
+			addBase("request_body_max_size_mb", *settings.RequestBodyMaxSizeMB)
+		}
+		if settings.HTTPReadTimeout != nil {
+			addBase("http_read_timeout", *settings.HTTPReadTimeout)
+		}
+		if settings.HTTPWriteTimeout != nil {
+			addBase("http_write_timeout", *settings.HTTPWriteTimeout)
+		}
+		if settings.HTTPIdleTimeout != nil {
+			addBase("http_idle_timeout", *settings.HTTPIdleTimeout)
+		}
+		if settings.UpstreamKeepaliveTimeout != nil {
+			addBase("upstream_keepalive_timeout", *settings.UpstreamKeepaliveTimeout)
+		}
+		if settings.ProxyDialTimeout != nil {
+			addBase("proxy_dial_timeout", *settings.ProxyDialTimeout)
+		}
+		if settings.ProxyResponseHeaderTimeout != nil {
+			addBase("proxy_response_header_timeout", *settings.ProxyResponseHeaderTimeout)
+		}
+		if settings.ProxyReadTimeout != nil {
+			addBase("proxy_read_timeout", *settings.ProxyReadTimeout)
+		}
+		if settings.ProxyWriteTimeout != nil {
+			addBase("proxy_write_timeout", *settings.ProxyWriteTimeout)
+		}
+		if settings.ProxyStreamTimeout != nil {
+			addBase("proxy_stream_timeout", *settings.ProxyStreamTimeout)
+		}
+		if settings.ProxyFlushInterval != nil {
+			addBase("proxy_flush_interval", *settings.ProxyFlushInterval)
+		}
+		if settings.ProxyStreamCloseDelay != nil {
+			addBase("proxy_stream_close_delay", *settings.ProxyStreamCloseDelay)
+		}
+		if settings.ServerTokensHidden != nil {
+			addBase("server_tokens_hidden", *settings.ServerTokensHidden)
+		}
+		if settings.TrustedProxyEnabled != nil {
+			addBase("trusted_proxy_enabled", *settings.TrustedProxyEnabled)
+		}
+		if settings.TrustedProxyRanges != nil {
+			addBase("trusted_proxy_ranges", *settings.TrustedProxyRanges)
+		}
+		if settings.TrustedProxyRangeRefs != nil {
+			addBase("trusted_proxy_range_refs", *settings.TrustedProxyRangeRefs)
+		}
+		if settings.TrustedProxyHeaders != nil {
+			addBase("trusted_proxy_headers", *settings.TrustedProxyHeaders)
+		}
+		if settings.TrustedProxyStrict != nil {
+			addBase("trusted_proxy_strict", *settings.TrustedProxyStrict)
+		}
 	}
-	query += " WHERE id=1"
-	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
-		return fmt.Errorf("写入快照基础设置: %w", err)
+	if len(baseClauses) > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE global_config SET `+strings.Join(baseClauses, ",")+` WHERE id=1`, baseArgs...); err != nil {
+			return fmt.Errorf("写入快照基础设置: %w", err)
+		}
 	}
+	// github_token 有意不下发（历史 历史问题，裁定保留）：节点本地机密。
 	// 历史问题(历史):自动备份设置组随 users 节落库。指针缺席=旧主端
 	// 快照未携带该组——跳过写入保留从端本地值(镜像 branding_json 缺席语义,
 	// 不清零);新主端恒携带全组。last_run 为节点本地运行态,永不在此写入。
@@ -1357,6 +1487,9 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 			return fmt.Errorf("写入快照扩展设置: %w", err)
 		}
 	}
+	// 历史问题：同步来的 task_log_size_mb 必须立即越过 TTL 缓存生效，
+	// 否则从节点最长 5 分钟仍按旧阈值轮转。幂等且无失败面。
+	InvalidateTaskLogSizeCache()
 	return nil
 }
 
@@ -1422,6 +1555,9 @@ func snapshotSecurityVersionRowsDiffer(ctx context.Context, tx *sql.Tx, snapshot
 				localCRS = append(localCRS, v)
 			}
 		}
+		if err := rows.Err(); err != nil {
+			return true
+		}
 	}
 	localIP2R := make([]models.ClusterSecurityIP2RegionVersion, 0)
 	rows2, err2 := tx.QueryContext(ctx, `SELECT id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,''),COALESCE(schedule_days,'1,2,3,4,5,6,7'),COALESCE(schedule_time,'04:00') FROM security_ip2region_version ORDER BY id`)
@@ -1432,6 +1568,9 @@ func snapshotSecurityVersionRowsDiffer(ctx context.Context, tx *sql.Tx, snapshot
 			if err := rows2.Scan(&v.ID, &v.Version, &v.UpdatedAt, &v.AutoUpdate, &v.UpdateStatus, &v.Message, &v.LastChecked, &v.NextUpdate, &v.Trigger, &v.StartedAt, &v.FinishedAt, &v.ScheduleDays, &v.ScheduleTime); err == nil {
 				localIP2R = append(localIP2R, v)
 			}
+		}
+		if err := rows2.Err(); err != nil {
+			return true
 		}
 	}
 	return snapJSON(localCRS) != wantCRS || snapJSON(localIP2R) != wantIP2R

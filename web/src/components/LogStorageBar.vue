@@ -22,7 +22,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, onMounted } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { request, formatBytes } from '@/utils/api'
 
 interface LogStorageInfo {
@@ -40,7 +40,7 @@ interface LogStorageInfo {
   config_source: string
 }
 
-const props = defineProps<{ logKey: string; caddyId?: string }>()
+const props = defineProps<{ logKey: string; caddyId?: string; refreshKey?: number }>()
 
 const info = ref<LogStorageInfo | null>(null)
 
@@ -101,18 +101,22 @@ const noteText = computed(() => {
 
 const tooltipContent = computed(() => `${info.value?.config_source || ''}${info.value?.retention_note ? ' · ' + info.value.retention_note : ''}`)
 
-onMounted(async () => {
+let loadStatsSeq = 0
+const loadStats = async (): Promise<void> => {
+  const seq = ++loadStatsSeq
   try {
     // U04d-06：服务端按 key 收窄（只统计所看那一行）；缺省全量会为每个弹框
     // 做全部 DB 计数与目录统计。
     const params: Record<string, string> = { key: props.logKey }
     if (props.caddyId) params.caddy_id = props.caddyId
     const res = await request.get<{ data?: { logs?: LogStorageInfo[] } }>('/logs/stats', { params })
-    info.value = res.data?.logs?.find((l) => l.key === props.logKey) || null
+    if (seq === loadStatsSeq) info.value = res.data?.logs?.find((l) => l.key === props.logKey) || null
   } catch (e) {
-    console.error('Failed to load log stats:', e)
+    if (seq === loadStatsSeq) console.error('Failed to load log stats:', e)
   }
-})
+}
+// 保留/清理会改变日志占用；父级刷新业务列表时递增 refreshKey，同步刷新统计。
+watch(() => props.refreshKey, () => { void loadStats() }, { immediate: true })
 </script>
 
 <style scoped>

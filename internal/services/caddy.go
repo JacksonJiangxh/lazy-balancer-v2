@@ -2052,17 +2052,21 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 				emittedSynthetic[key] = struct{}{}
 				errorRoutes = append(errorRoutes, buildBlockPageAttributionRoute(stage.code, hosts, content, stage.status, securityCtx.blockPageTypeByID[stage.pageID]))
 			}
-			for _, policy := range policiesForRule(securityCtx, r.CaddyID) {
-				code := securityCtx.policySynthetic[policy.ID]
-				if code == 0 {
-					continue
+			// 阶段 3 覆盖层在场时该规则所有策略段恒抬 482，483+ 归因路由
+			// 对本规则不可达；若策略共享给未覆盖规则，后者仍会按需发射。
+			if r.BlockPageStage3ID == 0 || securityCtx.blockPageByID[r.BlockPageStage3ID] == "" {
+				for _, policy := range policiesForRule(securityCtx, r.CaddyID) {
+					code := securityCtx.policySynthetic[policy.ID]
+					if code == 0 {
+						continue
+					}
+					key := fmt.Sprintf("policy:%d", code)
+					if _, done := emittedSynthetic[key]; done {
+						continue
+					}
+					emittedSynthetic[key] = struct{}{}
+					errorRoutes = append(errorRoutes, buildBlockPageAttributionRoute(code, nil, securityCtx.blockPageByID[policy.BlockPageID], policy.BlockStatusCode, securityCtx.blockPageTypeByID[policy.BlockPageID]))
 				}
-				key := fmt.Sprintf("policy:%d", code)
-				if _, done := emittedSynthetic[key]; done {
-					continue
-				}
-				emittedSynthetic[key] = struct{}{}
-				errorRoutes = append(errorRoutes, buildBlockPageAttributionRoute(code, nil, securityCtx.blockPageByID[policy.BlockPageID], policy.BlockStatusCode, securityCtx.blockPageTypeByID[policy.BlockPageID]))
 			}
 		}
 		if len(errorRoutes) > 0 {
@@ -4130,7 +4134,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	if timeouts.streamCloseDelay > 0 {
 		proxyConfig["stream_close_delay"] = fmt.Sprintf("%ds", timeouts.streamCloseDelay)
 	}
-	needsTransport := hasHTTPSUpstream || rule.EnableDnsServer || effectiveUpstreamKeepaliveTimeout > 0 || timeouts.dial > 0 || timeouts.responseHeader > 0 || timeouts.read > 0 || timeouts.write > 0 || (rule.UpstreamForceHTTP1 == 1 && hasHTTPSUpstream)
+	needsTransport := hasHTTPSUpstream || rule.EnableDnsServer || effectiveUpstreamKeepaliveTimeout > 0 || timeouts.dial > 0 || timeouts.responseHeader > 0 || timeouts.read > 0 || timeouts.write > 0
 	if needsTransport {
 		transportConfig := map[string]interface{}{"protocol": "http"}
 		if hasHTTPSUpstream {

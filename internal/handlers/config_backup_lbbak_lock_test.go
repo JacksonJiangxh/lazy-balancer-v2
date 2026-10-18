@@ -180,6 +180,95 @@ func TestBuildLbbakExport_blocks_while_waf_file_lock_held(t *testing.T) {
 	}
 }
 
+func TestBuildLbbakExport_holdsWafLockAcrossDBSnapshot(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	crsDir, _ := overrideTestWafPaths(t)
+	if err := os.WriteFile(filepath.Join(crsDir, "VERSION"), []byte("v4.29.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", "REQUEST-901.conf"), []byte("SecRule a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldHook := configBackupExportAfterDBSnapshot
+	configBackupExportAfterDBSnapshot = func() {
+		locker, ok := services.WafFileLock().(interface {
+			TryLock() bool
+			Unlock()
+		})
+		if !ok {
+			t.Error("WAF lock does not expose TryLock")
+			return
+		}
+		if locker.TryLock() {
+			locker.Unlock()
+			t.Error("DB snapshot completed without holding WAF file lock")
+		}
+	}
+	t.Cleanup(func() { configBackupExportAfterDBSnapshot = oldHook })
+
+	payload, _, _, includesWafFiles, err := h.buildLbbakExport(context.Background(), []string{"security"})
+
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if !includesWafFiles || len(payload) == 0 {
+		t.Fatalf("export missing WAF files: includes=%v len=%d", includesWafFiles, len(payload))
+	}
+}
+
+func TestLbbakImport_waitsForWafLockBeforeDBTransaction(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	g := newBackupSectionRouter(h)
+	crsDir, _ := overrideTestWafPaths(t)
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (6,'local-admin-lockorder','hash','admin',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(crsDir, "rules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "VERSION"), []byte("v4.29.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", "REQUEST-901.conf"), []byte("SecRule a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exportRec := httptest.NewRecorder()
+	g.ServeHTTP(exportRec, httptest.NewRequest(http.MethodGet, "/config/export?sections=rules,waf_files", nil))
+	if exportRec.Code != http.StatusOK {
+		t.Fatalf("export status=%d body=%s", exportRec.Code, exportRec.Body.String())
+	}
+	payload := exportRec.Body.Bytes()
+
+	services.WafFileLock().Lock()
+	importDone := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/config/import?sections=rules,waf_files", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/octet-stream")
+		g.ServeHTTP(rec, req)
+		importDone <- rec.Code
+	}()
+	time.Sleep(300 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, dbErr := db.DB.ExecContext(ctx, `UPDATE global_config SET log_level=log_level WHERE id=1`)
+	cancel()
+	services.WafFileLock().Unlock()
+
+	var importCode int
+	select {
+	case importCode = <-importDone:
+	case <-time.After(20 * time.Second):
+		t.Fatal("import did not finish after releasing WAF lock")
+	}
+	if dbErr != nil {
+		t.Fatalf("DB writer blocked while import waited for WAF lock (DB tx -> wafFileMu order): %v", dbErr)
+	}
+	if importCode != http.StatusOK {
+		t.Fatalf("import status=%d, want 200", importCode)
+	}
+}
+
 // ── 历史问题-04：CRS 分阶段流水「reloading/success」必须落在 commit 成功之后 ──
 
 // Given lbbak 备份（含 CRS 文件）导入，Caddy stub 拒绝一切请求使 session.commit

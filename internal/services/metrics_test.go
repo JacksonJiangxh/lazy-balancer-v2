@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/models"
 )
 
 // isolateMetricsState 隔离包级状态转换 map（N+9 历史问题），测试间互不串扰。
@@ -454,6 +455,23 @@ func TestMetricsService_updateOverview_keepsPreviousCountsOnQueryFailure(t *test
 	}
 	if got.TotalRules != 3 {
 		t.Fatalf("total rules=%d, want 3 (previous value kept on COUNT failure)", got.TotalRules)
+	}
+}
+
+func TestMetricsService_updateOverview_nilDBPreservesCountsAndSamples(t *testing.T) {
+	oldDB := db.DB
+	db.DB = nil
+	t.Cleanup(func() { db.DB = oldDB })
+	service := &MetricsService{overview: models.MetricsOverview{ActiveRules: 7, TotalRules: 9, OnlineNodes: 2}}
+
+	// When/Then：启动/拆除窗口 DB 未初始化不得 panic；计数保留而流量样本照常推进。
+	service.updateOverview(parsedMetrics{requestsTotal: 123, requests2xx: 120})
+	got := service.GetOverview()
+	if got.ActiveRules != 7 || got.TotalRules != 9 || got.OnlineNodes != 2 {
+		t.Fatalf("nil DB reset counts: %+v", got)
+	}
+	if got.TotalRequests != 123 || got.Status2xx != 120 {
+		t.Fatalf("nil DB dropped metrics sample: %+v", got)
 	}
 }
 

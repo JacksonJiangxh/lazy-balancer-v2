@@ -118,6 +118,8 @@ type SyncService struct {
 	pullAdmissionMu        sync.Mutex
 	pullApplyMu            sync.Mutex
 	pullMu                 sync.Mutex
+	wakeMu                 sync.Mutex
+	wakeCh                 chan struct{}
 	mu                     sync.Mutex
 	cancel                 context.CancelFunc
 	done                   chan struct{}
@@ -476,6 +478,10 @@ func (s *SyncService) Resume() {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	if syncLifecycleState(s.state.Load()) != syncStateHalted {
+		// 历史问题-1：健康的从节点重新注册时循环仍在旧 interval 的 sleep 中；
+		// Resume 对非 Halted 态原本是 no-op，最长要等 sync_interval 才重读
+		// 新 master_url/token。唤醒当前等待，让下一轮立即用新状态拉取。
+		s.Wake()
 		return
 	}
 	s.mu.Lock()
@@ -485,6 +491,37 @@ func (s *SyncService) Resume() {
 		<-done
 	}
 	s.startLocked(true)
+}
+
+// Wake 中断当前同步循环的等待（不取消在途 Pull/Report）。调用方保证只在
+// 需要立即重读集群状态时使用；唤醒后 run 的正常退避/interval 逻辑不变。
+func (s *SyncService) Wake() {
+	s.wakeMu.Lock()
+	defer s.wakeMu.Unlock()
+	if s.wakeCh == nil {
+		s.wakeCh = make(chan struct{})
+	}
+	close(s.wakeCh)
+	s.wakeCh = make(chan struct{})
+}
+
+func (s *SyncService) defaultWaitDelay(ctx context.Context, delay time.Duration) bool {
+	s.wakeMu.Lock()
+	if s.wakeCh == nil {
+		s.wakeCh = make(chan struct{})
+	}
+	wake := s.wakeCh
+	s.wakeMu.Unlock()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-wake:
+		return true
+	case <-timer.C:
+		return true
+	}
 }
 
 func (s *SyncService) startLocked(resume bool) {
@@ -589,6 +626,12 @@ func syncDrainerFor(database *sql.DB) *SyncService {
 	service := syncDrainers[database]
 	syncDrainersMu.Unlock()
 	return service
+}
+
+func (s *SyncService) reopenPullAdmission() {
+	s.pullAdmissionMu.Lock()
+	s.pullsStopped = false
+	s.pullAdmissionMu.Unlock()
 }
 
 // DrainPulls 停止拉取准入并把在途 Pull 等到落定（含已通过 admission 的
@@ -1539,16 +1582,7 @@ func (s *SyncService) run(ctx context.Context) {
 	}
 	waitDelay := s.waitRunDelay
 	if waitDelay == nil {
-		waitDelay = func(ctx context.Context, delay time.Duration) bool {
-			timer := time.NewTimer(delay)
-			defer timer.Stop()
-			select {
-			case <-ctx.Done():
-				return false
-			case <-timer.C:
-				return true
-			}
-		}
+		waitDelay = s.defaultWaitDelay
 	}
 	retryDelay := time.Second
 	for {

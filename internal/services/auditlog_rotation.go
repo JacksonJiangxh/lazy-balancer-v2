@@ -3,6 +3,7 @@ package services
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -354,22 +355,32 @@ func securityEventsWritePendingDelta(p securityEventsPendingDelta) error {
 	path := securityEventsPendingDeltaPath()
 	tmp := path + ".tmp"
 	if werr := os.WriteFile(tmp, data, 0o644); werr != nil {
+		_ = os.Remove(tmp)
 		return werr
 	}
 	if werr := os.Rename(tmp, path); werr != nil {
+		_ = os.Remove(tmp)
 		return werr
 	}
 	return nil
 }
 
-// securityEventsReadPendingDelta 读取待补采标记；不存在或损坏返回 nil。
+// securityEventsReadPendingDelta 读取待补采标记；不存在返回 nil。损坏标记
+// 留 WARN 并清除，避免被静默当作无标记后继续轮转。
 func securityEventsReadPendingDelta() *securityEventsPendingDelta {
-	data, err := os.ReadFile(securityEventsPendingDeltaPath())
+	path := securityEventsPendingDeltaPath()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
+		throttledAuditFailureLogf("audit log rotation: pending delta marker read failed: %v", err)
 		return nil
 	}
 	var p securityEventsPendingDelta
 	if err := json.Unmarshal(data, &p); err != nil || p.Path == "" {
+		throttledAuditFailureLogf("audit log rotation: pending delta marker corrupt, dropping: %s", path)
+		_ = os.Remove(path)
 		return nil
 	}
 	return &p

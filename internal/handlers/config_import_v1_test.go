@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 	_ "unsafe"
 
@@ -113,6 +114,46 @@ func newImportRollbackHarness(t *testing.T) importRollbackHarness {
 	}
 }
 
+func TestConfigImportEndpoints_distinguishUnreadableAndEmptyBodies(t *testing.T) {
+	for _, endpoint := range []struct {
+		name  string
+		path  string
+		mount func(*gin.Engine, *Handlers)
+	}{
+		{name: "validate", path: "/config/import/validate", mount: func(r *gin.Engine, h *Handlers) { r.POST("/config/import/validate", h.ValidateConfigImport) }},
+		{name: "v1 import", path: "/config/import/v1", mount: func(r *gin.Engine, h *Handlers) { r.POST("/config/import/v1", h.ImportV1Config) }},
+	} {
+		t.Run(endpoint.name, func(t *testing.T) {
+			h := newBackupTestHandlers(t)
+			router := gin.New()
+			endpoint.mount(router, h)
+
+			// Given a request body whose transport fails while being read.
+			request := httptest.NewRequest(http.MethodPost, endpoint.path, iotest.ErrReader(errors.New("injected body read failure")))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			// Then the transport failure is reported as such, not as an empty backup.
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "读取失败") || !strings.Contains(response.Body.String(), "injected body read failure") {
+				t.Fatalf("read error status=%d body=%s, want 400 with transport cause", response.Code, response.Body.String())
+			}
+			if strings.Contains(response.Body.String(), "内容为空") {
+				t.Fatalf("read error was misreported as empty content: %s", response.Body.String())
+			}
+
+			// Regression: a successfully read empty body retains the empty-backup response.
+			emptyRequest := httptest.NewRequest(http.MethodPost, endpoint.path, strings.NewReader(""))
+			emptyRequest.Header.Set("Content-Type", "application/json")
+			emptyResponse := httptest.NewRecorder()
+			router.ServeHTTP(emptyResponse, emptyRequest)
+			if emptyResponse.Code != http.StatusBadRequest || !strings.Contains(emptyResponse.Body.String(), "内容为空") {
+				t.Fatalf("empty body status=%d body=%s, want empty-backup 400", emptyResponse.Code, emptyResponse.Body.String())
+			}
+		})
+	}
+}
+
 func TestImportV1Config_rolls_back_when_certificate_materialization_fails(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
@@ -143,6 +184,62 @@ func TestImportV1Config_rolls_back_when_certificate_materialization_fails(t *tes
 	}
 	if oldRules != 1 {
 		t.Fatalf("old rule count=%d, want 1", oldRules)
+	}
+}
+
+func TestImportV1Config_cleansDisappearedRuleMetricsAndLogs(t *testing.T) {
+	// Given an old rule with metrics and log artifacts, plus unrelated global metrics.
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,enabled) VALUES ('lb_stale_artifacts','old-rule','http',8080,1)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, ruleID := range []any{"lb_stale_artifacts", nil} {
+		if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_history
+			(rule_id,timestamp,requests_total,requests_2xx,requests_3xx,requests_4xx,requests_5xx,bytes_in,bytes_out)
+			VALUES (?,datetime('now'),1,1,0,0,0,10,20)`, ruleID); err != nil {
+			t.Fatalf("seed metrics %v: %v", ruleID, err)
+		}
+	}
+	oldRuleCleanup, oldCertCleanup := removeImportRuleLogFiles, removeImportCertJobLogFiles
+	var ruleLogIDs, certLogIDs []string
+	removeImportRuleLogFiles = func(ruleID string) { ruleLogIDs = append(ruleLogIDs, ruleID) }
+	removeImportCertJobLogFiles = func(ruleID string) error {
+		certLogIDs = append(certLogIDs, ruleID)
+		return nil
+	}
+	t.Cleanup(func() {
+		removeImportRuleLogFiles, removeImportCertJobLogFiles = oldRuleCleanup, oldCertCleanup
+	})
+	backup := `{
+		"proxy_config":{"config":[{"pk":1,"fields":{"proxy_name":"new-rule","protocol":true,"listen":8443,"server_name":"example.test","status":true,"upstream_list":[1]}}]},
+		"upstream_config":{"config":[{"pk":1,"fields":{"status":true,"address":"127.0.0.1","port":9000,"weight":100}}]}
+	}`
+	router := gin.New()
+	router.POST("/config/import/v1", h.ImportV1Config)
+
+	// When replacing the old rules through a V1 import.
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/config/import/v1", strings.NewReader(backup))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+
+	// Then only the disappeared rule's artifacts are removed.
+	if response.Code != http.StatusOK {
+		t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var staleMetrics, globalMetrics int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_history WHERE rule_id='lb_stale_artifacts'`).Scan(&staleMetrics); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_history WHERE rule_id IS NULL`).Scan(&globalMetrics); err != nil {
+		t.Fatal(err)
+	}
+	if staleMetrics != 0 || globalMetrics != 1 {
+		t.Fatalf("metrics stale=%d global=%d, want 0/1", staleMetrics, globalMetrics)
+	}
+	if len(ruleLogIDs) != 1 || ruleLogIDs[0] != "lb_stale_artifacts" || len(certLogIDs) != 1 || certLogIDs[0] != "lb_stale_artifacts" {
+		t.Fatalf("log cleanup rule=%v cert=%v, want old rule exactly once", ruleLogIDs, certLogIDs)
 	}
 }
 

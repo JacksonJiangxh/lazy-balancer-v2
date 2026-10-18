@@ -22,8 +22,14 @@ func TestCollectCertJobRows_TerminalCounts(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close(); db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA })
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
-	db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r1','a.test','issued',?)`, now)
-	db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r2','b.test','failed',?)`, now)
+	// D2-历史问题（历史）：种子写入错误不得丢弃——静默失败会让整条断言链
+	// 在空表上「通过」。
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r1','a.test','issued',?)`, now); err != nil {
+		t.Fatalf("seed issued row: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r2','b.test','failed',?)`, now); err != nil {
+		t.Fatalf("seed failed row: %v", err)
+	}
 	rows := collectCertJobRows()
 	byDomain := map[string]TaskInfo{}
 	for _, r := range rows {
@@ -115,8 +121,12 @@ func TestCollectCertJobRows_excludesSyncedMaterialRows(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close(); db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA })
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
-	db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at) VALUES ('r1','ghost.test','issued','从主节点同步，源任务状态：issued',?)`, now)
-	db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at) VALUES ('r2','real.test','issued','',?)`, now)
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at) VALUES ('r1','ghost.test','issued','从主节点同步，源任务状态：issued',?)`, now); err != nil {
+		t.Fatalf("seed ghost row: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at) VALUES ('r2','real.test','issued','',?)`, now); err != nil {
+		t.Fatalf("seed real row: %v", err)
+	}
 	// 历史问题：镜像行过滤绑定「本节点当前为从节点」——物化行只在从节点存在，
 	// 主节点（promote 后）这些行归本节点，必须可见（见 mirrorFilterOnlyOnSlave）。
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
@@ -154,7 +164,9 @@ func TestCollectCertJobRows_oldTerminalStillShown(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close(); db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA })
 	old := time.Now().UTC().AddDate(0, 0, -3).Format("2006-01-02 15:04:05")
-	db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r9','old.test','issued',?)`, old)
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r9','old.test','issued',?)`, old); err != nil {
+		t.Fatalf("seed old row: %v", err)
+	}
 	rows := collectCertJobRows()
 	found := false
 	for _, r := range rows {

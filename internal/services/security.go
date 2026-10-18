@@ -910,10 +910,9 @@ func emitCustomRules(sb *strings.Builder, customRules []models.CustomRule, block
 
 // SecurityPolicyHasIPControl reports whether the policy applies any IP-level
 // control, mirroring the emission condition in BuildCorazaDirectives. 始终发射
-// 收敛（2026-10-15）：deny·绕过 ACL 的开启 flag 即发射面（空名单恒发射空
-// 文件算子，永不命中=与无规则等价），镜像与内容解耦；信任名单（ip_whitelist_
-// enabled 表默认值=1 非刻意 opt-in）、allow 模式（否定算子）与遗留黑名单
-// 维持内容门控。Referenced IP lists count the same as inline entries
+// 收敛（2026-10-15）：ACL 的开启 flag 即发射面（allow+空名单是否定空集，
+// 语义为拒绝全部；deny/绕过 空名单不命中），镜像与内容解耦；信任名单
+// （ip_whitelist_enabled 表默认值=1 非刻意 opt-in）与遗留黑名单维持内容门控。Referenced IP lists count the same as inline entries
 // (refs-only policies still advertise IP control)——仅解析 refs JSON 本身，
 // 无需加载数据库（摘要/绑定路径与生成路径同判定）。
 func SecurityPolicyHasIPControl(p *models.SecurityPolicy) bool {
@@ -928,12 +927,7 @@ func SecurityPolicyHasIPControl(p *models.SecurityPolicy) bool {
 	if p.IPWhitelistEnabled && ipListRefsNonEmpty(p.IPWhitelistRefs) {
 		return true
 	}
-	if p.IPACLEnabled && p.IPACLMode != "allow" {
-		return true
-	}
-	var ipACLList []string
-	json.Unmarshal([]byte(p.IPACLList), &ipACLList)
-	if p.IPACLEnabled && (len(ipACLList) > 0 || ipListRefsNonEmpty(p.IPACLListRefs)) {
+	if p.IPACLEnabled {
 		return true
 	}
 	var ipBL []string
@@ -953,6 +947,77 @@ func CountEnabledCustomRules(raw json.RawMessage) int {
 		}
 	}
 	return count
+}
+
+// CountEnabledCustomRulesBatch 批量统计策略的自定义规则引用：所有 ID 引用合并
+// 为分块 IN 查询，避免列表逐策略 N+1；内嵌对象形态回退单条纯解析。仅用于已
+// 提交库视图（列表摘要），事务内渲染仍走 resolvePolicyCustomRules(store)。
+func CountEnabledCustomRulesBatch(policies []*models.SecurityPolicy) []int {
+	counts := make([]int, len(policies))
+	idSets := make([]map[int]struct{}, len(policies))
+	all := make(map[int]struct{})
+	for i, p := range policies {
+		if p == nil {
+			continue
+		}
+		var ids []int
+		if err := json.Unmarshal(p.CustomRules, &ids); err != nil {
+			counts[i] = CountEnabledCustomRules(p.CustomRules)
+			continue
+		}
+		set := make(map[int]struct{}, len(ids))
+		for _, id := range ids {
+			set[id] = struct{}{}
+			all[id] = struct{}{}
+		}
+		idSets[i] = set
+	}
+	if len(all) == 0 || db.DB == nil {
+		return counts
+	}
+	ids := make([]int, 0, len(all))
+	for id := range all {
+		ids = append(ids, id)
+	}
+	enabled := make(map[int]bool, len(ids))
+	for start := 0; start < len(ids); start += policyCustomRuleChunkSize {
+		end := start + policyCustomRuleChunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]interface{}, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		rows, err := db.DB.Query("SELECT id, COALESCE(enabled,1) FROM security_custom_rules WHERE id IN ("+placeholders+")", args...)
+		if err != nil {
+			Logf("warn", "策略列表: 批量读取自定义规则失败（该块计数为 0）: %v", err)
+			continue
+		}
+		for rows.Next() {
+			var id int
+			var on bool
+			if err := rows.Scan(&id, &on); err != nil {
+				Logf("warn", "策略列表: 自定义规则行扫描失败（该行丢弃）: %v", err)
+				continue
+			}
+			enabled[id] = on
+		}
+		if err := rows.Err(); err != nil {
+			Logf("warn", "策略列表: 自定义规则迭代失败（该块计数可能不完整）: %v", err)
+		}
+		rows.Close()
+	}
+	for i, set := range idSets {
+		for id := range set {
+			if enabled[id] {
+				counts[i]++
+			}
+		}
+	}
+	return counts
 }
 
 // buildWafHandlerWithPolicy returns the coraza WAF handler for the given policy,
@@ -2086,6 +2151,9 @@ func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, gr
 				idTargets = append(idTargets, g)
 			}
 			continue
+		}
+		if !chainIndex().HasGroup(g) {
+			Logf("warn", "CRS 规则组 %q（策略 %q）不存在于本地规则索引，Include 可能零匹配", g, p.Name)
 		}
 		groupSet[g] = struct{}{}
 		sb.WriteString(fmt.Sprintf("Include /app/waf/crs/rules/REQUEST-9%[1]s-*.conf\n", g))

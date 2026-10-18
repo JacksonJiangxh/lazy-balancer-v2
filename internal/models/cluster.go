@@ -248,68 +248,68 @@ type ClusterSectionSyncStatus struct {
 }
 
 type ClusterBasicSettings struct {
-	LogLevel string `json:"log_level"`
+	LogLevel *string `json:"log_level,omitempty"`
 	// BrandingJSON 是主节点 branding.json 原文镜像(2026-09-11 裁定):随
 	// 快照下发,从节点落盘本地文件后生效。三分类合并后随系统数据节
-	// (恒同步)恒携带。
-	BrandingJSON         string `json:"branding_json,omitempty"`
-	AccessLogJSON        bool   `json:"access_log_json,omitempty"`
-	AccessLogFormat      string `json:"access_log_format,omitempty"`
-	TaskLogSizeMB        int    `json:"task_log_size_mb"`
-	AuditLogSizeMB       int    `json:"audit_log_size_mb"`
-	RuntimeLogSizeMB     int    `json:"runtime_log_size_mb"`
-	AuditRetentionMonths int    `json:"audit_retention_months"`
+	// (恒同步)恒携带。指针区分旧主端缺席与显式空串。
+	BrandingJSON         *string `json:"branding_json,omitempty"`
+	AccessLogJSON        *bool   `json:"access_log_json,omitempty"`
+	AccessLogFormat      *string `json:"access_log_format,omitempty"`
+	TaskLogSizeMB        *int    `json:"task_log_size_mb,omitempty"`
+	AuditLogSizeMB       *int    `json:"audit_log_size_mb,omitempty"`
+	RuntimeLogSizeMB     *int    `json:"runtime_log_size_mb,omitempty"`
+	AuditRetentionMonths *int    `json:"audit_retention_months,omitempty"`
 	// v2.3.8 安全事件保留与流量采样：随 users 节同步（从节点/升主后
 	// 保留策略与大屏采样口径与主节点一致）；指针+omitempty 用于旧主端
 	// 快照缺席时保留从端本地值。
-	SecurityEventsRetentionDays *int   `json:"security_events_retention_days,omitempty"`
-	SecurityEventsRowCap        *int   `json:"security_events_row_cap,omitempty"`
-	ThreatTrafficSampleN        *int   `json:"threat_traffic_sample_n,omitempty"`
-	JWTExpireMinutes            int    `json:"jwt_expire_minutes"`
-	Timezone                    string `json:"timezone"`
-	ACMEEmail                   string `json:"acme_email"`
-	CertExpiryDays              int    `json:"cert_expiry_days"`
-	CertRenewalDays             int    `json:"cert_renewal_days"`
-	CertRenewalAttempts         int    `json:"cert_renewal_attempts"`
-	DefaultCAProviderID         int    `json:"default_ca_provider_id"`
-	DNSProvider                 string `json:"dns_provider"`
-	DNSCredentials              string `json:"dns_credentials"`
-	SyncInterval                int    `json:"sync_interval"`
-	CaddyLogLevel               string `json:"caddy_log_level,omitempty"`
-	CaddyLogSizeMB              int    `json:"caddy_log_size_mb,omitempty"`
-	RequestBodyMaxSizeMB        int    `json:"request_body_max_size_mb,omitempty"`
-	HTTPReadTimeout             int    `json:"http_read_timeout,omitempty"`
-	HTTPWriteTimeout            int    `json:"http_write_timeout,omitempty"`
-	HTTPIdleTimeout             int    `json:"http_idle_timeout,omitempty"`
-	UpstreamKeepaliveTimeout    int    `json:"upstream_keepalive_timeout,omitempty"`
-	ProxyDialTimeout            int    `json:"proxy_dial_timeout,omitempty"`
-	ProxyResponseHeaderTimeout  int    `json:"proxy_response_header_timeout,omitempty"`
-	ProxyReadTimeout            int    `json:"proxy_read_timeout,omitempty"`
-	ProxyWriteTimeout           int    `json:"proxy_write_timeout,omitempty"`
-	ProxyStreamTimeout          int    `json:"proxy_stream_timeout,omitempty"`
-	ProxyFlushInterval          int    `json:"proxy_flush_interval,omitempty"`
-	ProxyStreamCloseDelay       int    `json:"proxy_stream_close_delay,omitempty"`
-	GitHubProxyURL              string `json:"github_proxy_url,omitempty"`
-	ServerTokensHidden          bool   `json:"server_tokens_hidden,omitempty"`
+	SecurityEventsRetentionDays *int    `json:"security_events_retention_days,omitempty"`
+	SecurityEventsRowCap        *int    `json:"security_events_row_cap,omitempty"`
+	ThreatTrafficSampleN        *int    `json:"threat_traffic_sample_n,omitempty"`
+	JWTExpireMinutes            *int    `json:"jwt_expire_minutes,omitempty"`
+	Timezone                    *string `json:"timezone,omitempty"`
+	ACMEEmail                   *string `json:"acme_email,omitempty"`
+	CertExpiryDays              *int    `json:"cert_expiry_days,omitempty"`
+	CertRenewalDays             *int    `json:"cert_renewal_days,omitempty"`
+	CertRenewalAttempts         *int    `json:"cert_renewal_attempts,omitempty"`
+	DefaultCAProviderID         *int    `json:"default_ca_provider_id,omitempty"`
+	DNSProvider                 *string `json:"dns_provider,omitempty"`
+	DNSCredentials              *string `json:"dns_credentials,omitempty"`
+	SyncInterval                *int    `json:"sync_interval,omitempty"`
+	CaddyLogLevel               *string `json:"caddy_log_level,omitempty"`
+	CaddyLogSizeMB              *int    `json:"caddy_log_size_mb,omitempty"`
+	RequestBodyMaxSizeMB        *int    `json:"request_body_max_size_mb,omitempty"`
+	HTTPReadTimeout             *int    `json:"http_read_timeout,omitempty"`
+	HTTPWriteTimeout            *int    `json:"http_write_timeout,omitempty"`
+	HTTPIdleTimeout             *int    `json:"http_idle_timeout,omitempty"`
+	UpstreamKeepaliveTimeout    *int    `json:"upstream_keepalive_timeout,omitempty"`
+	ProxyDialTimeout            *int    `json:"proxy_dial_timeout,omitempty"`
+	ProxyResponseHeaderTimeout  *int    `json:"proxy_response_header_timeout,omitempty"`
+	ProxyReadTimeout            *int    `json:"proxy_read_timeout,omitempty"`
+	ProxyWriteTimeout           *int    `json:"proxy_write_timeout,omitempty"`
+	ProxyStreamTimeout          *int    `json:"proxy_stream_timeout,omitempty"`
+	ProxyFlushInterval          *int    `json:"proxy_flush_interval,omitempty"`
+	ProxyStreamCloseDelay       *int    `json:"proxy_stream_close_delay,omitempty"`
+	GitHubProxyURL              *string `json:"github_proxy_url,omitempty"`
+	ServerTokensHidden          *bool   `json:"server_tokens_hidden,omitempty"`
 	// v2.3.x 受信代理（CDN 真实 IP）：随 Caddy 全局轴同步——从节点渲染层
 	// （servers.trusted_proxies）与数据面取值与主节点一致。range_refs 为
 	// 引用的 IP 地址列表 id（JSON 数组文本，2026-10-12），引用的名单本体
 	// 在 security 节同步——从端渲染同样投影（tp.txt/lb_file 热路径，2026-10-15）。
-	TrustedProxyEnabled   bool   `json:"trusted_proxy_enabled,omitempty"`
-	TrustedProxyRanges    string `json:"trusted_proxy_ranges,omitempty"`
-	TrustedProxyRangeRefs string `json:"trusted_proxy_range_refs,omitempty"`
-	TrustedProxyHeaders   string `json:"trusted_proxy_headers,omitempty"`
-	TrustedProxyStrict    bool   `json:"trusted_proxy_strict,omitempty"`
-	AdminTLSEnabled       bool   `json:"admin_tls_enabled,omitempty"`
-	AdminTLSMode          string `json:"admin_tls_mode,omitempty"`
-	AdminTLSCert          string `json:"admin_tls_cert,omitempty"`
-	AdminTLSKey           string `json:"admin_tls_key,omitempty"`
+	TrustedProxyEnabled   *bool   `json:"trusted_proxy_enabled,omitempty"`
+	TrustedProxyRanges    *string `json:"trusted_proxy_ranges,omitempty"`
+	TrustedProxyRangeRefs *string `json:"trusted_proxy_range_refs,omitempty"`
+	TrustedProxyHeaders   *string `json:"trusted_proxy_headers,omitempty"`
+	TrustedProxyStrict    *bool   `json:"trusted_proxy_strict,omitempty"`
+	AdminTLSEnabled       *bool   `json:"admin_tls_enabled,omitempty"`
+	AdminTLSMode          *string `json:"admin_tls_mode,omitempty"`
+	AdminTLSCert          *string `json:"admin_tls_cert,omitempty"`
+	AdminTLSKey           *string `json:"admin_tls_key,omitempty"`
 	// v2.1.8 MFA 全局开关（决策3：从节点行为与主节点一致）。
-	MFAWriteGuard bool `json:"mfa_write_guard"`
+	MFAWriteGuard *bool `json:"mfa_write_guard,omitempty"`
 	// v2.3.0:OIDC 配置(原样 JSON 字符串)随 global 节同步——从节点回调独立
 	// 闭环需要本地可读 issuer/client 凭证(JWKS 验签在从节点本地完成)。
-	OIDCConfig        string `json:"oidc_config,omitempty"`
-	MFALockoutEnabled bool   `json:"mfa_lockout_enabled"`
+	OIDCConfig        *string `json:"oidc_config,omitempty"`
+	MFALockoutEnabled *bool   `json:"mfa_lockout_enabled,omitempty"`
 	// v2.3.x 历史问题:自动备份设置随 users 节同步——从节点提升为主节点后调度
 	// 直接生效,无需重启。指针+omitempty 缺席语义(镜像 branding_json
 	// d55a675 偏斜处理):旧主端快照缺该组字段时从端 apply 跳过写入、保留

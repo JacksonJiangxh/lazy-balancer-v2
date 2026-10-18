@@ -42,6 +42,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -127,6 +128,10 @@ var (
 	auditTimingCreateCount int
 	auditTimingSweepMin    = 4096
 	auditTimingLastSweep   time.Time
+	// auditTimingPollCountForTest 轮询总次数（测试观测钉：未知 tid/已终态
+	// 条目/无计时头行必须零轮询立即返回——替代挂钟阈值断言，消除 CI 负载
+	// 抖动假红）。仅 auditTimingWait 轮询步 incr，成本可忽略。
+	auditTimingPollCountForTest atomic.Int64
 )
 
 // auditTimingRecord 写入一个分段计时（µs）。id 为空（计时 ID 生成失败的降级
@@ -230,6 +235,7 @@ func auditTimingWait(id string, timeout time.Duration) auditTimingSnapshot {
 			// 超时：有部分分段就带部分分段（与退役前读侧「按到场键选值」同形）
 			return lastSeen
 		}
+		auditTimingPollCountForTest.Add(1)
 		time.Sleep(auditTimingPollStep)
 	}
 }

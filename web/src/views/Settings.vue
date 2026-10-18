@@ -43,6 +43,7 @@
 import { ref, onMounted, computed, watch } from 'vue'
 import { request } from '@/utils/api'
 import { DEFAULT_ACCESS_LOG_FORMAT } from '@/utils/caddyDefaults'
+import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
 import { useAuthStore } from '@/stores/auth'
 import { Setting } from '@element-plus/icons-vue'
 import BasicSettings from './settings/BasicSettings.vue'
@@ -186,7 +187,7 @@ const applyCaddyKeys = (data: ConfigPayload) => {
   settings.value.server_map_lon = data.server_map_lon ?? 0
   settings.value.threat_screen_mode = data.threat_screen_mode === 'globe' ? 'globe' : 'map'
   settings.value.security_events_retention_days = data.security_events_retention_days && data.security_events_retention_days > 0 ? data.security_events_retention_days : 90
-  settings.value.threat_traffic_sample_n = [-1, 0, 1].includes(data.threat_traffic_sample_n ?? -1) ? (data.threat_traffic_sample_n ?? -1) : -1
+  settings.value.threat_traffic_sample_n = normalizeTrafficSampleN(data.threat_traffic_sample_n)
   settings.value.security_events_row_cap = data.security_events_row_cap && data.security_events_row_cap > 0 ? data.security_events_row_cap : 1_000_000
 }
 

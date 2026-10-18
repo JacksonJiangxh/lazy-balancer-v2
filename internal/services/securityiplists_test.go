@@ -1,12 +1,14 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"reflect"
 	"strings"
 	"testing"
@@ -119,6 +121,48 @@ func TestLoadIPListEntriesByID_valuesOnlyAndMissingSkipped(t *testing.T) {
 	}
 }
 
+func TestResolvePolicyIPListRefs_logsDanglingRefs(t *testing.T) {
+	newClusterTestService(t)
+	p := &models.SecurityPolicy{Name: "悬空引用留痕策略", IPACLList: `["1.2.3.4"]`, IPACLListRefs: `[999]`}
+	var logs bytes.Buffer
+	oldOutput := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldOutput) })
+
+	resolvePolicyIPListRefs([]*models.SecurityPolicy{p}, nil)
+	if !strings.Contains(logs.String(), `引用的 IP 列表(id=999)不存在`) {
+		t.Fatalf("dangling ref must be visible in logs: %q", logs.String())
+	}
+	if p.IPRefMissing {
+		t.Fatal("dangling refs retain documented inline-only behavior, not IPRefMissing")
+	}
+	if got := mergedACLList(p); len(got) != 1 || got[0] != "1.2.3.4/32" {
+		t.Fatalf("merged ACL=%v, want inline preserved", got)
+	}
+}
+
+func TestResolvePolicyIPListRefs_malformedCustomListFailsClosed(t *testing.T) {
+	newClusterTestService(t)
+	listID := seedIPList(t, "corrupt-custom", `not-json`)
+	p := &models.SecurityPolicy{Name: "畸形名单策略", IPACLList: `["1.2.3.4"]`, IPACLListRefs: fmtListIDs(listID)}
+
+	resolvePolicyIPListRefs([]*models.SecurityPolicy{p}, nil)
+	if !p.IPRefMissing {
+		t.Fatal("malformed custom entries must mark IPRefMissing and skip narrowed rendering")
+	}
+	_, failed, _ := loadIPListEntriesVia(db.DB, []int64{listID})
+	if !failed[listID] {
+		t.Fatalf("malformed custom list must be failedIDs: %v", failed)
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE resource='安全策略' AND action='渲染跳过' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read render-skip audit: %v", err)
+	}
+	if !strings.Contains(detail, "IP 列表(id=") || strings.Contains(detail, "威胁库列表") || strings.Contains(detail, "<nil>") {
+		t.Fatalf("failure detail must be kind-neutral and include a real cause: %q", detail)
+	}
+}
+
 func TestBuildCorazaDirectives_mergedEmission_inlinePlusListEntries(t *testing.T) {
 	newClusterTestService(t)
 	listID := seedIPList(t, "merged-src", `[{"value":"10.0.0.0/8","remark":""},{"value":"192.0.2.0/24","remark":""}]`)
@@ -218,12 +262,11 @@ func TestSecurityPolicyHasIPControl_refsOnlyTruthTable(t *testing.T) {
 		{"ACL refs only, toggle off", &models.SecurityPolicy{IPACLMode: "deny", IPACLList: "[]", IPACLListRefs: "[3]"}, false},
 		{"whitelist refs only, enabled", &models.SecurityPolicy{IPWhitelistEnabled: true, IPWhitelistRefs: "[3]"}, true},
 		{"whitelist refs only, toggle off", &models.SecurityPolicy{IPWhitelistRefs: "[3]"}, false},
-		// 始终发射收敛（2026-10-15）：deny ACL 开启即恒发射（空名单投影空
-		// 文件算子），镜像与内容解耦；信任（默认 flag 非 opt-in）/allow 模式
-		//（否定算子）维持内容门控。
+		// 始终发射收敛（2026-10-15）：ACL 开启即恒发射（allow+空名单
+		// 表示拒绝全部）；信任名单（默认 flag 非 opt-in）维持内容门控。
 		{"malformed ACL refs", &models.SecurityPolicy{IPACLEnabled: true, IPACLList: "[]", IPACLListRefs: "bad"}, true},
 		{"no refs no inline", &models.SecurityPolicy{IPACLEnabled: true, IPACLList: "[]"}, true},
-		{"allow mode enabled, empty", &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "allow", IPACLList: "[]"}, false},
+		{"allow mode enabled, empty", &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "allow", IPACLList: "[]"}, true},
 		{"trust enabled, empty", &models.SecurityPolicy{IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`[]`)}, false},
 	}
 	for _, tc := range cases {

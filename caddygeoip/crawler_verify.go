@@ -120,6 +120,15 @@ func VerifyCrawler(ip, engineID string) bool {
 // verifyCrawlerDNS 双跳验证本体（无缓存、需已持信号量）。第二个返回值表示
 // 结论是否可缓存：PTR/正向回验的确定性否定为 true，任何解析错误/超时为 false。
 func verifyCrawlerDNS(ip, engineID string) (bool, bool) {
+	// U80 E-CM-05：地址归一化比较——netip 解析 + Unmap。客户端 IP 可能是
+	// 4in6 映射形态（::ffff:a.b.c.d），而 DNS 正向应答恒为 v4 规范串，
+	// 字符串比较会恒不命中把真爬虫误杀；带 zone/不可解析输入 fail-closed
+	// （确定性否定，可缓存）。
+	want, perr := netip.ParseAddr(ip)
+	if perr != nil || want.Zone() != "" {
+		return false, true
+	}
+	want = want.Unmap()
 	ctx, cancel := context.WithTimeout(context.Background(), crawlerDNSQueryTimeout)
 	defer cancel()
 	names, err := crawlerVerifyResolver.LookupAddr(ctx, ip)
@@ -143,7 +152,11 @@ func verifyCrawlerDNS(ip, engineID string) (bool, bool) {
 			continue
 		}
 		for _, a := range addrs {
-			if a == ip {
+			got, gerr := netip.ParseAddr(a)
+			if gerr != nil || got.Zone() != "" {
+				continue // 非法回验地址不计命中（fail-closed）
+			}
+			if got.Unmap() == want {
 				return true, true
 			}
 		}
@@ -245,10 +258,13 @@ func verifyCrawlerIPRangeFromList(ipStr, engineID string) bool {
 	}
 	// 历史问题：畸形地址不得 panic（MustParseAddr 旧实现可直接崩进程）——
 	// 解析失败即 fail-closed。
+	// U80 E-CM-05：带 zone 拒绝 + 4in6 映射形态 Unmap 归一——netip 的 v4
+	// 前缀不含 4in6 地址，不归一则映射形态的真爬虫恒不命中（误判为伪装）。
 	ip, err := netip.ParseAddr(ipStr)
-	if err != nil {
+	if err != nil || ip.Zone() != "" {
 		return false
 	}
+	ip = ip.Unmap()
 	for _, prefix := range entries {
 		if prefix.Contains(ip) {
 			return true

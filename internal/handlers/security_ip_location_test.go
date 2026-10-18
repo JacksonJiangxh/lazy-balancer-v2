@@ -47,13 +47,20 @@ func TestFormatIP2RegionLocation(t *testing.T) {
 
 func TestEnrichIPLocation_reservedIPs(t *testing.T) {
 	// Given: 保留/私网/回环地址(含 IPv6——xdb 仅 IPv4,靠 net.ParseIP 前置拦截)
-	for _, ip := range []string{"::1", "127.0.0.1", "192.168.1.1", "10.0.0.1", "169.254.1.1", "fe80::1", "0.0.0.0"} {
+	for _, ip := range []string{"::1", "127.0.0.1", "192.168.1.1", "10.0.0.1", "169.254.1.1", "fe80::1", "0.0.0.0", "0.0.0.1", "100.64.0.1", "192.0.0.1", "198.18.0.1", "224.0.0.1", "240.0.0.1", "2001:db8::1", "ff02::1"} {
 		// When: 归属地富化
 		got := enrichIPLocation(ip)
 		// Then: 识别为保留地址
 		if got != "保留地址" {
 			t.Fatalf("enrichIPLocation(%q)=%q, want 保留地址", ip, got)
 		}
+	}
+}
+
+func TestThreatLocationParts_reservedIsNotCountry(t *testing.T) {
+	country, province := threatLocationParts("保留地址")
+	if country != "" || province != "" {
+		t.Fatalf("reserved location must not aggregate as a country: (%q,%q)", country, province)
 	}
 }
 

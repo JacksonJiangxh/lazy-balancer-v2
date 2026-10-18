@@ -33,7 +33,7 @@
         <el-table-column label="大小" width="90" align="center">
           <template #default="{ row }">
             <el-tooltip content="拦截响应体字节数——评估拦截面传输压力（出站流量 ≈ 每秒拦截次数 × 页面大小，64KB 上限）" placement="top">
-              <span>{{ contentSize(row.content) }}</span>
+              <span>{{ contentSizes.get(row.id) }}</span>
             </el-tooltip>
           </template>
         </el-table-column>
@@ -157,9 +157,12 @@ const dialogTitle = computed(() => {
 })
 
 
-// 内容大小（响应体字节数）：用于评估拦截面传输压力（用户裁定新列）；
-// 格式化走 formatBytes 单一事实源（历史 历史问题）
-const contentSize = (content?: string): string => formatBytes(new Blob([content ?? '']).size)
+// 内容大小（响应体 UTF-8 字节数）：仅在页面列表变化时逐条计算一次，
+// 避免每次表格渲染都为每行创建 Blob/重新编码；格式化走 formatBytes 单一事实源。
+const contentSizes = computed(() => {
+  const encoder = new TextEncoder()
+  return new Map(pages.value.map((page) => [page.id, formatBytes(encoder.encode(page.content).byteLength)]))
+})
 const form = ref({ name: '', description: '', content: '', content_type: 'text/html; charset=utf-8' })
 
 // 可选内容类型（与后端 models.BlockPageContentTypes 白名单同口径）

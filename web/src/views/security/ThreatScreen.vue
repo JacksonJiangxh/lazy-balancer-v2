@@ -685,12 +685,13 @@ const threatGauge = computed(() => {
 let trafficBaseline: TrafficBaseline | null = null
 const trafficError = ref(false)
 const trafficSampled = ref(false)
-const trafficTask = usePollingTask(async () => {
+const trafficTask = usePollingTask(async ({ signal, isCurrent }) => {
   const res = await request.get<APIResponse<{
     countries: Record<string, { attack: number; normal: number }>
     available?: boolean
     sample_n?: number
-  }>>('/security/overview/threat-screen/traffic', { silent: true })
+  }>>('/security/overview/threat-screen/traffic', { silent: true, signal })
+  if (!isCurrent()) return
   if (res.data?.available === false) {
     trafficError.value = true
     trafficBaseline = null // 恢复可用后重建基线，避免把停机期差值当增量
@@ -770,7 +771,7 @@ async function loadServerCentroid(): Promise<void> {
 
 // ============ 事件流 ============
 const feedError = ref(false)
-const feedTask = usePollingTask(async () => {
+const feedTask = usePollingTask(async ({ signal, isCurrent }) => {
   const isInitialBatch = sinceId.value === 0
   let cursor = sinceId.value
   let hasMore = true
@@ -781,8 +782,9 @@ const feedTask = usePollingTask(async () => {
   for (let page = 0; page < FEED_MAX_PAGES && hasMore; page++) {
     const res = await request.get<APIResponse<{ events: FeedEvent[]; next_since_id?: number; has_more?: boolean }>>(
       `/security/events/feed?since_id=${cursor}&limit=${FEED_PAGE_LIMIT}`,
-      { silent: true },
+      { silent: true, signal },
     )
+    if (!isCurrent()) return
     const batch = res.data?.events ?? []
     events.push(...batch)
     const nextSince = res.data?.next_since_id
@@ -790,6 +792,7 @@ const feedTask = usePollingTask(async () => {
     hasMore = res.data?.has_more === true
     if (batch.length === 0) break
   }
+  if (!isCurrent()) return
   feedError.value = false
   sinceId.value = cursor
   if (events.length === 0) return
@@ -801,8 +804,9 @@ const feedTask = usePollingTask(async () => {
   }
 }, { interval: FEED_POLL_MS, onError: () => { feedError.value = true } })
 
-const statsTask = usePollingTask(async () => {
-  const res = await request.get<APIResponse<ThreatScreenStats>>(`/security/overview/threat-screen?hours=${windowHours.value}`, { silent: true })
+const statsTask = usePollingTask(async ({ signal, isCurrent }) => {
+  const res = await request.get<APIResponse<ThreatScreenStats>>(`/security/overview/threat-screen?hours=${windowHours.value}`, { silent: true, signal })
+  if (!isCurrent()) return
   if (!res.data) throw new Error('threat-screen payload missing')
   stats.value = res.data
   statsError.value = false
@@ -817,11 +821,12 @@ const statsTask = usePollingTask(async () => {
 let flowSince = 0
 let adaptiveStable = 0
 let adaptiveLastSwitch = 0
-const flowTask = usePollingTask(async () => {
+const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
   const res = await request.get<APIResponse<{ enabled?: boolean; events?: NormalFlowEvent[]; next_seq?: number; sample_n?: number }>>(
     `/security/overview/threat-screen/events?since=${flowSince}&limit=1000`,
-    { silent: true },
+    { silent: true, signal },
   )
+  if (!isCurrent()) return
   const data = res.data
   if (!data?.enabled) return
   const events = data.events ?? []

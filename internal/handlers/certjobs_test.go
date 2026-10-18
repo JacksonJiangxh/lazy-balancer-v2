@@ -770,6 +770,29 @@ func TestGetCertJobLogs_concatenates_all_rotated_backups_oldest_first(t *testing
 	}
 }
 
+// B3-历史问题：证书日志尾窗与系统/Caddy 日志共用 tailLogWindow 的残段口径。
+func TestReadCertJobLogFile_tailWindowDropsPartialFirstLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cert.log")
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "small unchanged", content: "first\nsecond\n", want: "first\nsecond\n"},
+		{name: "partial line dropped", content: strings.Repeat("x", 128<<10) + "\ncomplete\n", want: "complete\n"},
+		{name: "giant line window empty", content: strings.Repeat("x", (128<<10)+32), want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(tc.content), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if got := readCertJobLogFile(path); got != tc.want {
+				t.Fatalf("content length=%d, want %d (%q)", len(got), len(tc.want), tc.want)
+			}
+		})
+	}
+}
+
 // 历史问题（2026-09-05 证书域审计裁定）：cert_expiry_days 读取失败不得放大为整个
 // 任务列表 500——降级默认 30 并告警，对齐 历史 历史问题 的 checkManualCertExpiration
 // 口径。种子任务 20 天后过期：默认阈值 30 下应判 expiring，证明降级取值真实生效。

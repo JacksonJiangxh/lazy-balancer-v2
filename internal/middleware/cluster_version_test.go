@@ -84,6 +84,11 @@ func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testi
 		{"DELETE", "/api/v1/security/block-pages/:id", true},
 		{"PUT", "/api/v1/security/crs/auto-update", true},
 		{"POST", "/api/v1/security/crs/update", true},
+		// 历史问题-1（历史）：大屏流量采集租约是 Caddy admin 的纯代理
+		//（内存租约，不写任何同步表）——不得按 security 前缀误分类为
+		// 同步写（触发器降级态会把它误伤成 500）。
+		{"POST", "/api/v1/security/overview/threat-screen/collector", false},
+		{"DELETE", "/api/v1/security/overview/threat-screen/collector", false},
 		{"GET", "/api/v1/security/policies", false},
 		{"GET", "/api/v1/security/custom-rules", false},
 	}

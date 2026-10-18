@@ -64,6 +64,12 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
 	var req models.UpdateCAProviderRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		// B1-03（历史）：MaxBytesReader 超限映射 413，与导入/
+		// PutCaddyConfig/admin-tls 同口径（此前并入 400）。
+		if isRequestBodyTooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid request: " + err.Error()})
 		return
 	}

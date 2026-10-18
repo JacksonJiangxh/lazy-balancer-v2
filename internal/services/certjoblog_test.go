@@ -101,6 +101,41 @@ func captureCertJobLogWarns(t *testing.T) func() []string {
 	}
 }
 
+// D2-历史问题：删除规则时必须同时清掉当前日志、.N 轮转副本与 .log.gz
+// 压缩归档；同目录其他规则文件不受影响。
+func TestRemoveCertJobLogFiles_removesCompressedAndRotatedGenerations(t *testing.T) {
+	useCertJobLogTestEnv(t, 1<<20)
+	base := CertJobLogPath("lb_remove_all")
+	if err := os.MkdirAll(filepath.Dir(base), 0755); err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{base, base + ".gz"}
+	for i := 1; i <= maxRotatedFiles; i++ {
+		paths = append(paths, fmt.Sprintf("%s.%d", base, i))
+	}
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte("log\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unrelated := base + ".other"
+	if err := os.WriteFile(unrelated, []byte("keep\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RemoveCertJobLogFiles("lb_remove_all"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("certificate log generation remains %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Fatalf("unrelated file removed: %v", err)
+	}
+}
+
 // 历史问题（2026-09-05 证书域审计裁定）：轮转失败不得静默吞没——此前
 // os.Remove/os.Rename 的错误全部丢弃，坏轮转（如备份槽位被非空目录占据）无任何
 // 留痕。确定性触发：.5 槽位放非空目录，os.Remove 报 ENOTEMPTY（非 IsNotExist）。

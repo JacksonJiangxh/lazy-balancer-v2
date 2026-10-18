@@ -33,6 +33,8 @@ func newAutobanTestEnv(t *testing.T) *gin.Engine {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		// B1-07（历史）：同步复位 currentDB，后台循环不得持有已关闭测试库
+		db.SetDB(oldDB)
 	})
 	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -426,10 +428,10 @@ func TestCreatePolicy_builtinAutobanListRefMessageNamesAutoban(t *testing.T) {
 
 // ---- AU-8/D5（历史）：PUT 禁用路径收尾接线 ----
 
-// Given 名单含已到期自动条目+未到期自动条目；重载回调间谍。
+// Given 名单含已到期自动条目+未到期自动条目；重载回调间谍；名单无任何发射面引用。
 // When PUT enabled=false（禁用保存）。
-// Then 禁用收尾立即清除已到期条目并触发重载（禁用后无循环 flush 点）；未到期
-// 条目保留；调度照常联动停止。
+// Then 禁用收尾立即清除已到期条目且无需重载（无引用=零发射面、零 /load）；
+// 未到期条目保留；调度照常联动停止。
 func TestAutobanConfig_putDisableFlushesExpiredEntries(t *testing.T) {
 	router := newAutobanTestEnv(t)
 	services.SetConfigLoadRerun(func(operator string) error { return nil })
@@ -452,8 +454,8 @@ func TestAutobanConfig_putDisableFlushesExpiredEntries(t *testing.T) {
 	if len(entries) != 1 || entries[0].Value != "198.51.100.2" {
 		t.Fatalf("禁用收尾必须清除已到期条目并保留未到期条目: %+v", entries)
 	}
-	if reloads == 0 {
-		t.Fatal("到期清理产生的名单变化必须触发重载（禁用后无循环 flush 点）")
+	if reloads != 0 {
+		t.Fatalf("无引用名单的到期清理不得触发 /load，reloads=%d", reloads)
 	}
 	if m, _ := te.Lookup(services.AutobanTaskID); m.LoopOn {
 		t.Fatal("禁用保存仍应联动停止调度")

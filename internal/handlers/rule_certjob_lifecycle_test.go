@@ -3,6 +3,8 @@ package handlers
 import (
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -161,4 +163,88 @@ func TestUpdateRule_manualResave_healsOrphanCertJobs(t *testing.T) {
 	if n := countRuleCertJobs(t, "lb_r10_heal"); n != 0 {
 		t.Fatalf("orphan cert jobs=%d, want 0（manual→manual 重存必须收敛历史残留）", n)
 	}
+}
+
+func TestUpdateRule_leavingACMEConvergesCertificateFiles(t *testing.T) {
+	seedFiles := func(t *testing.T, ruleID string) (string, string) {
+		t.Helper()
+		certPath, keyPath := services.CertFilePaths(ruleID)
+		if err := os.MkdirAll(filepath.Dir(certPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(certPath, []byte("old-acme-cert"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(keyPath, []byte("old-acme-key"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return certPath, keyPath
+	}
+
+	t.Run("disable TLS removes obsolete ACME files", func(t *testing.T) {
+		oldCertDir := testServicesCertDir
+		testServicesCertDir = t.TempDir()
+		t.Cleanup(func() { testServicesCertDir = oldCertDir })
+		harness := newUpdateAuditRuleHandlers(t, "lb_files_disable", 0, false)
+		seedACMEManualSwitchFixture(t, "lb_files_disable", "files-disable.example.test", "failed")
+		certPath, keyPath := seedFiles(t, "lb_files_disable")
+
+		response := putUpdateRule(t, harness, "lb_files_disable", `{"name":"after","enable_tls":false}`)
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+		}
+		for _, path := range []string{certPath, keyPath} {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("obsolete ACME file %s still exists, stat err=%v", path, err)
+			}
+		}
+	})
+
+	t.Run("manual replacement installs new files", func(t *testing.T) {
+		oldCertDir := testServicesCertDir
+		testServicesCertDir = t.TempDir()
+		t.Cleanup(func() { testServicesCertDir = oldCertDir })
+		harness := newUpdateAuditRuleHandlers(t, "lb_files_manual", 0, false)
+		seedACMEManualSwitchFixture(t, "lb_files_manual", "files-manual.example.test", "failed")
+		certPath, keyPath := seedFiles(t, "lb_files_manual")
+		certPEM, keyPEM, err := generateTestCert("files-manual.example.test", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		response := putUpdateRule(t, harness, "lb_files_manual", fmt.Sprintf(
+			`{"name":"after","enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q}`, certPEM, keyPEM))
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+		}
+		for path, want := range map[string]string{certPath: certPEM, keyPath: keyPEM} {
+			raw, err := os.ReadFile(path)
+			if err != nil || string(raw) != want {
+				t.Fatalf("manual certificate file %s was not installed: err=%v", path, err)
+			}
+		}
+	})
+
+	t.Run("apply rejection restores ACME files", func(t *testing.T) {
+		oldCertDir := testServicesCertDir
+		testServicesCertDir = t.TempDir()
+		t.Cleanup(func() { testServicesCertDir = oldCertDir })
+		harness := newUpdateAuditRuleHandlers(t, "lb_files_rollback", 1, false)
+		seedACMEManualSwitchFixture(t, "lb_files_rollback", "files-rollback.example.test", "failed")
+		certPath, keyPath := seedFiles(t, "lb_files_rollback")
+
+		response := putUpdateRule(t, harness, "lb_files_rollback", `{"name":"after","enable_tls":false}`)
+
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
+		}
+		for path, want := range map[string]string{certPath: "old-acme-cert", keyPath: "old-acme-key"} {
+			raw, err := os.ReadFile(path)
+			if err != nil || string(raw) != want {
+				t.Fatalf("rollback file %s=%q err=%v, want original ACME material", path, raw, err)
+			}
+		}
+	})
 }

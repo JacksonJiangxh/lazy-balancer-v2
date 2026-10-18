@@ -124,6 +124,43 @@ func TestThreatLib_excludesCrawlerAddressSources(t *testing.T) {
 	}
 }
 
+func TestThreatLib_usesThreatSystemListRegistry(t *testing.T) {
+	original := db.ThreatSystemLists
+	extended := append([]db.ThreatSystemList{}, original...)
+	extended = append(extended, db.ThreatSystemList{Source: "future_source", Name: "未来威胁名单"})
+	db.ThreatSystemLists = extended
+	t.Cleanup(func() { db.ThreatSystemLists = original })
+	router := newThreatTestRouter(t)
+	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (id,name,display_name,url,update_enabled,entry_count)
+		VALUES (1040,'future_source','未来威胁源','https://example.com/future.txt',1,7)`); err != nil {
+		t.Fatal(err)
+	}
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/threat-lib", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Sources []struct {
+				Name   string `json:"name"`
+				ListID int    `json:"list_id"`
+			} `json:"sources"`
+			TotalEntries int `json:"total_entries"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data.Sources) != len(extended) || payload.Data.TotalEntries != 7 {
+		t.Fatalf("registry-driven sources=%d total=%d, want %d/7: %s", len(payload.Data.Sources), payload.Data.TotalEntries, len(extended), resp.Body.String())
+	}
+	last := payload.Data.Sources[len(payload.Data.Sources)-1]
+	if last.Name != "future_source" || last.ListID == 0 {
+		t.Fatalf("future registry source missing list link: %+v", last)
+	}
+}
+
 func TestThreatLib_flagsOnlyToggleUpdateEnabled(t *testing.T) {
 	// Given
 	router := newThreatTestRouter(t)

@@ -137,8 +137,8 @@ func TestLoadSnapshotGlobalSettings_carriesTrustedProxyRangeRefs(t *testing.T) {
 	if err := service.loadSnapshotGlobalSettings(context.Background(), database, &snapshot); err != nil {
 		t.Fatalf("load snapshot settings: %v", err)
 	}
-	if snapshot.BasicSettings.TrustedProxyRangeRefs != "[7,9]" {
-		t.Fatalf("trusted_proxy_range_refs=%q, want [7,9]", snapshot.BasicSettings.TrustedProxyRangeRefs)
+	if snapshot.BasicSettings.TrustedProxyRangeRefs == nil || *snapshot.BasicSettings.TrustedProxyRangeRefs != "[7,9]" {
+		t.Fatalf("trusted_proxy_range_refs=%v, want [7,9]", snapshot.BasicSettings.TrustedProxyRangeRefs)
 	}
 	wire, err := json.Marshal(snapshot.BasicSettings)
 	if err != nil {
@@ -161,8 +161,8 @@ func TestUpdateSnapshotSettings_trustedProxyRangeRefsApplied(t *testing.T) {
 	if err := updateSnapshotSettings(ctx, tx, models.ClusterSnapshot{
 		CaddyConfig: &caddyConfig,
 		BasicSettings: models.ClusterBasicSettings{
-			JWTExpireMinutes:      20,
-			TrustedProxyRangeRefs: "[11]",
+			JWTExpireMinutes:      new(20),
+			TrustedProxyRangeRefs: new("[11]"),
 		},
 	}); err != nil {
 		t.Fatalf("apply settings: %v", err)

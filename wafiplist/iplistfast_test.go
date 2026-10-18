@@ -263,8 +263,9 @@ func TestResolvePrefixesNormalized_contract(t *testing.T) {
 	}
 }
 
-// LoadPrefixesFresh/ResolvePrefixes 是白名单校验导出入口：fresh=构建期
-// fail-closed，resolve=运行期节流+fail-stale；返回缓存共享只读快照。
+// LoadPrefixesFresh 与 NormalizeAllowedPath+ResolvePrefixesNormalized 组合是
+// 白名单校验导出入口：fresh=构建期 fail-closed，组合=运行期节流+fail-stale；
+// 返回缓存共享只读快照。
 func TestLoadAndResolvePrefixes_contract(t *testing.T) {
 	dir := useAllowedDir(t)
 	path := writeListFile(t, dir, "tp-accessor.txt", []string{"203.0.113.7", "10.8.0.0/16"})
@@ -277,9 +278,15 @@ func TestLoadAndResolvePrefixes_contract(t *testing.T) {
 		t.Fatalf("fresh=%v, want 2 条", fresh)
 	}
 
-	resolve, err := ResolvePrefixes(path)
+	// 运行期形态 = 归一（白名单）+ 热路径入口（U80 E-CM-01：原 ResolvePrefixes
+	// 包装无生产调用方已删除，测试直用生产同款两步组合）。
+	cleaned, err := NormalizeAllowedPath(path)
 	if err != nil {
-		t.Fatalf("ResolvePrefixes: %v", err)
+		t.Fatalf("NormalizeAllowedPath: %v", err)
+	}
+	resolve, err := ResolvePrefixesNormalized(cleaned)
+	if err != nil {
+		t.Fatalf("ResolvePrefixesNormalized: %v", err)
 	}
 	if len(resolve) != 2 {
 		t.Fatalf("resolve=%v, want 2 条", resolve)
@@ -290,8 +297,8 @@ func TestLoadAndResolvePrefixes_contract(t *testing.T) {
 		if _, err := LoadPrefixesFresh(p); err == nil {
 			t.Fatalf("LoadPrefixesFresh(%q) 必须被白名单拒绝", p)
 		}
-		if _, err := ResolvePrefixes(p); err == nil {
-			t.Fatalf("ResolvePrefixes(%q) 必须被白名单拒绝", p)
+		if _, err := NormalizeAllowedPath(p); err == nil {
+			t.Fatalf("NormalizeAllowedPath(%q) 必须被白名单拒绝", p)
 		}
 	}
 
@@ -304,7 +311,7 @@ func TestLoadAndResolvePrefixes_contract(t *testing.T) {
 	old := StatCheckInterval
 	StatCheckInterval = 0
 	t.Cleanup(func() { StatCheckInterval = old })
-	stale, err := ResolvePrefixes(path)
+	stale, err := ResolvePrefixesNormalized(cleaned)
 	if err != nil || len(stale) != 2 {
 		t.Fatalf("fail-stale 必须返回旧集: got=%v err=%v", stale, err)
 	}

@@ -2160,7 +2160,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "写入数据库失败（更新自定义路径规则）: " + err.Error()})
 		return
 	}
-	if protocolChanged && req.Protocol == "tcp" {
+	// 离开 ACME（禁用 TLS / 切换手动 / 切到 TCP）后，旧 ACME 私钥不再被
+	// 规则引用，与任务行同事务语义清理；manual 替换会由下方渲染重新物化
+	// 新证书，应用失败则由 runtimeSnapshot 恢复旧文件。
+	if (protocolChanged && req.Protocol == "tcp") || (existingRule.TLSSource == "acme_dns" && orphanACME) {
 		if err := services.RemoveCertFiles(caddyID); err != nil {
 			restoreErr := services.RestoreCertFiles(runtimeSnapshot.certFiles)
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧证书文件失败: " + errors.Join(err, restoreErr).Error()})
@@ -2194,11 +2197,19 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			recordAudit(c, "更新", "证书任务", fmt.Sprintf("规则 %s %s（%d 个）", caddyID, delReason, switchedCertJobs))
 		}
 		if qm := services.GetCAQueueManager(); qm != nil {
-			cancelCtx, cancel := context.WithTimeout(c.Request.Context(), cancelRuleJobsTimeout)
-			if err := cancelRuleJobs(cancelCtx, qm, caddyID); err != nil {
-				services.Logf("warn", "UpdateRule cert job cancel for %s failed: %v (continuing)", caddyID, err)
-			}
-			cancel()
+			// B2-01：有界取消等待不得占住全局 Caddy 操作锁；队列屏障阻止
+			// 等待期间的新任务入队，panic 时 defer 先恢复锁再走补偿链。
+			blockToken := qm.BlockJobsForRule(caddyID)
+			h.caddyOpMu.Unlock()
+			func() {
+				defer h.caddyOpMu.Lock()
+				cancelCtx, cancel := context.WithTimeout(c.Request.Context(), cancelRuleJobsTimeout)
+				defer cancel()
+				if err := cancelRuleJobs(cancelCtx, qm, caddyID); err != nil {
+					services.Logf("warn", "UpdateRule cert job cancel for %s failed: %v (continuing)", caddyID, err)
+				}
+			}()
+			qm.UnblockJobsForRule(caddyID, blockToken)
 		}
 	}
 
@@ -2483,9 +2494,13 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 			compensationStarted = true
 		}()
 		drainRuleJobs := cancelRuleJobs
-		cancelCtx, cancel := context.WithTimeout(c.Request.Context(), cancelRuleJobsTimeout)
-		cancelErr := drainRuleJobs(cancelCtx, queueManager, caddyID)
-		cancel()
+		h.caddyOpMu.Unlock()
+		cancelErr := func() error {
+			defer h.caddyOpMu.Lock()
+			cancelCtx, cancel := context.WithTimeout(c.Request.Context(), cancelRuleJobsTimeout)
+			defer cancel()
+			return drainRuleJobs(cancelCtx, queueManager, caddyID)
+		}()
 		if cancelErr != nil {
 			if err := queueManager.StartRuleDeletionCompensation(services.RuleDeletionCompensation{
 				RuleID: caddyID, Token: blockToken, Snapshot: certJobsSnapshot,
@@ -3578,11 +3593,17 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 
 	// 取消仍在排队或执行中的签发协程，避免已禁用规则继续占用 CA 配额
 	if qm := services.GetCAQueueManager(); qm != nil {
-		cancelCtx, cancel := context.WithTimeout(c.Request.Context(), cancelRuleJobsTimeout)
-		if err := cancelRuleJobs(cancelCtx, qm, caddyID); err != nil {
-			services.Logf("error", "DisableRule certificate cancellation timed out for caddy_id=%s: %v", caddyID, err)
-		}
-		cancel()
+		blockToken := qm.BlockJobsForRule(caddyID)
+		h.caddyOpMu.Unlock()
+		func() {
+			defer h.caddyOpMu.Lock()
+			cancelCtx, cancel := context.WithTimeout(c.Request.Context(), cancelRuleJobsTimeout)
+			defer cancel()
+			if err := cancelRuleJobs(cancelCtx, qm, caddyID); err != nil {
+				services.Logf("error", "DisableRule certificate cancellation timed out for caddy_id=%s: %v", caddyID, err)
+			}
+		}()
+		qm.UnblockJobsForRule(caddyID, blockToken)
 	}
 
 	recordAudit(c, "禁用", "负载规则", services.FormatAuditDetail(services.AuditRulePart(caddyID), "状态：已禁用"))

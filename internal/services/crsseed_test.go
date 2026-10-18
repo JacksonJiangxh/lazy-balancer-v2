@@ -282,6 +282,19 @@ func TestPersistCRSSnapshotFrom_roundTrip(t *testing.T) {
 	}
 }
 
+func TestPersistCRSSnapshotFrom_blocksWhileWafFileLockHeld(t *testing.T) {
+	root := t.TempDir()
+	liveDir := filepath.Join(root, "waf", "crs")
+	snapshotDir := filepath.Join(root, "data", "crs")
+	writeTestFile(t, filepath.Join(liveDir, "rules", crsProbeFile), "SecRule installed")
+
+	probeBlocksUnderWafFileLock(t, "CRS 快照持久化", func() {
+		if err := persistCRSSnapshotFrom(liveDir, snapshotDir, "v4.15.0"); err != nil {
+			t.Errorf("persist snapshot: %v", err)
+		}
+	})
+}
+
 func TestSeedCRSRules_healsDegenerateSnapshotWithLiveVersion(t *testing.T) {
 	root := t.TempDir()
 	liveDir := filepath.Join(root, "waf", "crs")

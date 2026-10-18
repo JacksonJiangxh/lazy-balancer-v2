@@ -697,6 +697,7 @@ func TestAutobanRunCycle_dryRunStoresSuggestionsOnly(t *testing.T) {
 func TestAutobanRunCycle_bansAndReloads(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 2, 5, "1h", "all", false)
+	seedAutobanListReferencedByPolicy(t)
 	reloads := 0
 	oldFn := autobanReloader
 	autobanReloader = func() error { reloads++; return nil }
@@ -1222,6 +1223,7 @@ func TestAutobanCounter_tieredLogging(t *testing.T) {
 func TestAutobanRunCycle_mergeSerializesWithListWriterUnderCaddyOpLock(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
+	seedAutobanListReferencedByPolicy(t)
 	reloads := 0
 	oldFn := autobanReloader
 	autobanReloader = func() error { reloads++; return nil }

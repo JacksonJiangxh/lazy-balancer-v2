@@ -16,7 +16,8 @@ type ToolSpec struct {
 	// method==HTTP GET，与真实只读能力集漂移（读语义探测 POST 误标 false、
 	// export_config 误标 true——外部契约变更，发布时向 MCP 使用者披露）。
 	// 历史问题（历史）：test_certificate_config 移出探测集（写 DNS TXT），
-	// 当前探测集 4 项。
+	// 当前探测集 3 项（parse_certificate/validate_import/preview_config，
+	// 单一事实源 ReadOnlyProbeTools）。
 	ReadOnly    bool            `json:"read_only"`
 	InputSchema json.RawMessage `json:"input_schema,omitempty"`
 	Usage       string          `json:"usage,omitempty"`

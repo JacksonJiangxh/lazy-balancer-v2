@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"bytes"
 	"crypto/x509"
 	"database/sql"
 	"encoding/pem"
@@ -725,16 +724,12 @@ func readCertJobLogFile(path string) string {
 		return ""
 	}
 
-	data, err := io.ReadAll(f)
+	data, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)))
 	if err != nil {
 		return ""
 	}
 
-	if startOffset > 0 {
-		if idx := bytes.IndexByte(data, '\n'); idx != -1 {
-			data = data[idx+1:]
-		}
-	}
+	data = tailLogWindow(data, startOffset)
 
 	const maxLines = 500
 	lines := strings.Split(string(data), "\n")

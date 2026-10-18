@@ -115,11 +115,11 @@
              服务端筛选（rule_name/rule_triggered/policy_name LIKE）。 -->
         <el-input v-model="filters.rule_name" placeholder="负载规则" clearable style="width: 100px" @keyup.enter="applyFilters" />
         <!-- 触发规则筛选：多选 + 头部全选（勾的就是看的，统一正向心智）。
-             全选（四类全中且无自定义 tag）或空选 = 不过滤，不发送参数；子集或含
+             全选（八类全中且无自定义 tag）或空选 = 不过滤，不发送参数；子集或含
              自定义 tag 时全部选中值英文逗号连接发送 rule_triggered（后端逐段按
              family/前缀/纯数字 ID 解析，OR 连接）。filterable + allow-create：可直接
              输入 CRS 规则 ID（如 942100）等自定义 tag 混入同一参数；自定义 tag 不参与
-             全选判定（只看 4 个类别是否全中）。 -->
+             全选判定（只看 8 个类别是否全中）。 -->
         <el-select
           v-model="filters.rule_triggered"
           multiple
@@ -173,9 +173,9 @@
             <span v-else>—</span>
           </template>
         </el-table-column>
-        <el-table-column label="触发类型" min-width="100" class-name="col-nowrap">
+        <el-table-column label="触发阶段" min-width="100" class-name="col-nowrap">
           <template #default="{ row }">
-            <!-- 触发阶段四分类：信任名单 / IP 访问控制（黑白名单+地域+威胁库，点击看触发详情）/
+            <!-- 触发阶段展示：信任名单 / IP 访问控制（黑白名单+地域+威胁库，点击看触发详情）/
                  WAF（CRS=详情+快捷排除弹框；自定义=规则详情弹框）/ 请求体异常（纯文本） -->
             <el-link v-if="stageCategory(row) === 'waf'" type="primary" @click="openTriggerDetail(row)">WAF</el-link>
             <el-link v-else-if="['acl', 'trust'].includes(stageCategory(row))" type="primary" @click="openTriggerDetail(row)">{{ stageLabel(row) }}</el-link>
@@ -223,7 +223,7 @@
       </el-table>
 
       <div style="margin-top: 16px; display: flex; align-items: center; flex-wrap: wrap; row-gap: 8px;">
-        <LogStorageBar log-key="security_events" style="margin-right: auto" />
+        <LogStorageBar log-key="security_events" :refresh-key="logStorageRefreshKey" style="margin-right: auto" />
         <el-pagination
           v-model:current-page="page"
           v-model:page-size="pageSize"
@@ -705,8 +705,9 @@ const openCtxDialog = (row: SecurityEvent): void => {
 const page = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
+const logStorageRefreshKey = ref(0)
 
-// 触发阶段筛选为固定预置四类（历史用户裁定：固定预置值，不接受任意值）。
+// 触发阶段筛选为固定预置八类（历史用户裁定：固定预置值，不接受任意值）。
 // 令牌 → 后端族段映射：请求侧展开为族名逗号串（后端逐段 OR）。
 // 历史 历史问题：限流（429）无 sec_events 数据源，不再作为筛选项/分类。
 const TRIGGERED_CATEGORIES = ['爬虫Bot', '地域拦截', 'IP 访问控制', '信任名单', '威胁情报库', '请求体异常', 'WAF·CRS', 'WAF·自定义'] as const
@@ -726,13 +727,13 @@ const TRIGGERED_FAMILY_SEGMENTS: Record<TriggeredCategory, string[]> = {
 
 const filters = ref({ action: '', ip: '', uri: '', rule_name: '', rule_triggered: [...TRIGGERED_CATEGORIES] as string[], policy_name: '', timeRange: null as [string, string] | null })
 
-// 头部全选复选框三态：四类全中=全选；部分中=半选
+// 头部全选复选框三态：八类全中=全选；部分中=半选
 const triggeredCheckAll = computed(() => TRIGGERED_CATEGORIES.every((c) => filters.value.rule_triggered.includes(c)))
 const triggeredIndeterminate = computed(() => {
   const hit = TRIGGERED_CATEGORIES.filter((c) => filters.value.rule_triggered.includes(c)).length
   return hit > 0 && hit < TRIGGERED_CATEGORIES.length
 })
-// 全选：勾选=四类全选、取消=全清（固定预置值，无自定义形态）
+// 全选：勾选=八类全选、取消=全清（固定预置值，无自定义形态）
 const toggleTriggeredAll = (checked: CheckboxValueType) => {
   filters.value.rule_triggered = checked ? [...TRIGGERED_CATEGORIES] : []
 }
@@ -779,11 +780,11 @@ const fetchEvents = async () => {
     if (filters.value.action) p.set('action', filters.value.action)
     if (filters.value.ip) p.set('ip', filters.value.ip)
     if (filters.value.rule_name) p.set('rule_name', filters.value.rule_name)
-    // 触发规则：全选（四类全中且无自定义 tag）或空选 = 不过滤，不发送参数；
-    // 子集（1~5 个类别）或含自定义 tag 时，全部选中值英文逗号连接发送 rule_triggered
+    // 触发规则：全选（八类全中且无自定义 tag）或空选 = 不过滤，不发送参数；
+    // 子集（1~7 个类别）或含自定义 tag 时，全部选中值英文逗号连接发送 rule_triggered
     //（后端逐段独立解析、OR 连接；含逗号的消息关键词会整串回退为消息搜索，前端只管连接）
     // 历史 历史问题：allow-create 自定义 tag（如 CRS 规则 ID 942100）原样
-    // 并入发送段（后端逐段独立解析 OR）；免发送条件=四类全中且无自定义 tag。
+    // 并入发送段（后端逐段独立解析 OR）；免发送条件=八类全中且无自定义 tag。
     const triggeredSelected = filters.value.rule_triggered
     const categorySelected = triggeredSelected.filter((v): v is TriggeredCategory =>
       (TRIGGERED_CATEGORIES as readonly string[]).includes(v))
@@ -801,6 +802,7 @@ const fetchEvents = async () => {
     if (requestSeq !== fetchEventsSeq) return
     events.value = res.data?.events || []
     total.value = res.data?.total || 0
+    logStorageRefreshKey.value++
   } catch {
     // 历史问题 D-N5：瞬态失败保留末次成功数据（对齐 AuditLog 口径）——此前清空列表
     // 却保留陈旧 total，空态文案「暂无安全事件」在排障窗口内误导为「无攻击」。
@@ -885,7 +887,7 @@ onMounted(() => {
 .triggered-filter-popper .el-select-dropdown__header .el-checkbox { display: flex; height: unset; margin-right: 0; }
 .triggered-filter-popper .el-select-dropdown__header .el-checkbox .el-checkbox__label { padding-left: 8px; }
 /* 选中项不加粗：EP 2.14 多选下拉 is-selected 默认 font-weight:bold，该筛选常态
-   全选（四类全勾）导致整列粗体，覆写回 normal（选中色与右侧 ✓ 保留） */
+   全选（八类全勾）导致整列粗体，覆写回 normal（选中色与右侧 ✓ 保留） */
 .triggered-filter-popper .el-select-dropdown__item.is-selected { font-weight: normal; }
 
 /* 自动封禁启用确认框（dangerouslyUseHTMLString 精排，2026-10-14 裁定）：

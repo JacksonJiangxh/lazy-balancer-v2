@@ -265,6 +265,22 @@ func (m *CRSUpdateManager) setStage(status CRSUpdateStatus, message string) {
 	WriteCRSUpdateLog(level, string(status), message)
 }
 
+// recordLatestSkip 记录「已是最新版本」终态（DB 行与内存状态单点实现）。
+func (m *CRSUpdateManager) recordLatestSkip(trigger string) {
+	if _, err := db.DB.Exec(
+		"UPDATE security_crs_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotAdvanceSQL+" WHERE id=1",
+		trigger, versionTableNextSlot("security_crs_version", time.Now().UTC()),
+	); err != nil {
+		Logf("warn", "crs update: failed to record latest-version skip: %v", err)
+	}
+	m.mu.Lock()
+	m.state.status = CRSStatusSuccess
+	m.state.message = "已是最新版本"
+	m.state.finishedAt = time.Now().UTC()
+	m.state.version = currentCRSVersion()
+	m.mu.Unlock()
+}
+
 // run executes the full update pipeline synchronously.
 func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	operator := "system"
@@ -369,18 +385,7 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	currentVersion := currentCRSVersion()
 	if tag == currentVersion {
 		WriteCRSUpdateLog("INFO", string(CRSStatusSuccess), "已是最新版本，无需更新")
-		if _, err := db.DB.Exec(
-			"UPDATE security_crs_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotAdvanceSQL+" WHERE id=1",
-			trigger, versionTableNextSlot("security_crs_version", time.Now().UTC()),
-		); err != nil {
-			Logf("warn", "crs update: failed to record latest-version skip: %v", err)
-		}
-		m.mu.Lock()
-		m.state.status = CRSStatusSuccess
-		m.state.message = "已是最新版本"
-		m.state.finishedAt = time.Now().UTC()
-		m.state.version = currentCRSVersion()
-		m.mu.Unlock()
+		m.recordLatestSkip(trigger)
 		return
 	}
 	if cmp, cmpErr := CompareCRSVersions(tag, currentVersion); cmpErr != nil && currentVersion != "" && !strings.EqualFold(currentVersion, "unknown") {
@@ -391,21 +396,7 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		return
 	} else if cmpErr == nil && cmp <= 0 {
 		WriteCRSUpdateLog("INFO", string(CRSStatusSuccess), "已是最新版本，无需更新")
-		if _, err := db.DB.Exec(
-			// 排程槽——手动触发不得改变下一次预约执行时间；现存未来槽不被回拨。
-			"UPDATE security_crs_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotAdvanceSQL+" WHERE id=1",
-			trigger, versionTableNextSlot("security_crs_version", time.Now().UTC()),
-		); err != nil {
-			Logf("warn", "crs update: failed to record latest-version skip: %v", err)
-		}
-		m.mu.Lock()
-		m.state.status = CRSStatusSuccess
-		m.state.message = "已是最新版本"
-		m.state.finishedAt = time.Now().UTC()
-		// S历史问题-11:跳过分支补 version——StatusSnapshot 内存态优先后 version
-		// 此前从有值退化为空串,状态端点数据不自洽。
-		m.state.version = currentCRSVersion()
-		m.mu.Unlock()
+		m.recordLatestSkip(trigger)
 		return
 	}
 

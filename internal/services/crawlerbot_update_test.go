@@ -26,7 +26,10 @@ func TestCrawlerBotUpdate_fullCycle(t *testing.T) {
 	defer ts.Close()
 
 	// 通用 CIDR 提取：合法 CIDR 保留、裸 IP 归一 /32、非 IP 数字串跳过
-	got := parseCrawlerCIDRs(body + "\n42.236.12.130\nnot.an.ip.version.1.2.3.4.5\n")
+	got, err := parseCrawlerCIDRsForFormat(body+"\n42.236.12.130\nnot.an.ip.version.1.2.3.4.5\n", "")
+	if err != nil {
+		t.Fatalf("parse crawler CIDRs: %v", err)
+	}
 	joined := strings.Join(got, ",")
 	if !strings.Contains(joined, "66.249.66.0/24") || !strings.Contains(joined, "66.249.67.0/24") {
 		t.Fatalf("CIDR 提取缺失: %v", got)

@@ -167,9 +167,11 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 				// 自定义列表：读 DB entries JSON
 				var list []models.IPListEntry
 				if err := json.Unmarshal([]byte(raw), &list); err != nil {
-					// SEC-A-F1（历史）：Unmarshal 失败同 Scan 失败——静默
-					// continue 会让该列表在 entries 缺席且零信号。
-					Logf("warn", "渲染: 自定义 IP 列表(id=%d) entries 解析失败（该列表按缺失处理）: %v", id, err)
+					// 畸形自定义名单必须进入 failedIDs：引用策略走严格跳过，
+					// 不得以缺内容的合并集静默收窄防护；不向全局 firstErr 上抛，
+					// 避免未引用该名单的渲染被无关脏行整体阻断。
+					Logf("error", "渲染: 自定义 IP 列表(id=%d) entries 解析失败（引用策略将跳过渲染）: %v", id, err)
+					failed[id] = true
 					continue
 				}
 				// 历史问题：过期条目（expires_at 可解析且 <= now）不再下发——到期即
@@ -293,6 +295,11 @@ func threatSourceByListName(listName string) string {
 	return ""
 }
 
+// IsThreatSystemListName 报告列表名是否登记为威胁情报系统名单。
+func IsThreatSystemListName(listName string) bool {
+	return threatSourceByListName(listName) != ""
+}
+
 func LoadIPListEntriesByID(ids []int64) (map[int64][]string, error) {
 	if len(ids) == 0 || db.DB == nil {
 		return map[int64][]string{}, nil
@@ -301,6 +308,27 @@ func LoadIPListEntriesByID(ids []int64) (map[int64][]string, error) {
 	// ——委托 loadIPListEntriesVia(分块+错误通道),不再吞错返回恒 nil error。
 	entries, _, err := loadIPListEntriesVia(db.DB, ids)
 	return entries, err
+}
+
+// danglingIPListRefs 返回既未装载成功也未标记失败的引用 id（列表已删除或导入残留）。
+func danglingIPListRefs(p *models.SecurityPolicy, listsByID map[int64][]string, failedIDs map[int64]bool) []int64 {
+	if p == nil {
+		return nil
+	}
+	seen := make(map[int64]struct{})
+	var dangling []int64
+	for _, raw := range []string{p.IPACLListRefs, p.IPWhitelistRefs} {
+		for _, id := range parseIPListRefs(raw) {
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			if _, loaded := listsByID[id]; !loaded && !failedIDs[id] {
+				dangling = append(dangling, id)
+			}
+		}
+	}
+	return dangling
 }
 
 // resolvePolicyIPListRefs 在策略加载路径上完成引用解析：跨整个已加载批次收集
@@ -342,27 +370,34 @@ func resolvePolicyIPListRefs(policies []*models.SecurityPolicy, store caddyConfi
 	if effective == nil {
 		return
 	}
-	listsByID, failedIDs, err := loadIPListEntriesVia(effective, refIDs)
-	if len(listsByID) == 0 && len(failedIDs) == 0 {
-		return
+	listsByID, failedIDs, loadErr := loadIPListEntriesVia(effective, refIDs)
+	markLoadFailure := func(p *models.SecurityPolicy, id int64) {
+		refErr := fmt.Sprintf("策略 %q 引用的 IP 列表(id=%d)装载失败", p.Name, id)
+		if loadErr != nil {
+			refErr += fmt.Sprintf(": %v", loadErr)
+		}
+		if auditFailureShouldLog(refErr) {
+			Logf("error", "%s——该策略将被跳过渲染", refErr)
+			RecordAuditLog("system", "渲染跳过", "安全策略", refErr+"，已跳过该策略渲染", "")
+		}
 	}
 	for _, p := range policies {
 		if p == nil {
 			continue
 		}
-		// RDB 严格模式：策略引用的任一列表装载失败（威胁库 .iplist 缺失）→
-		// 标记跳过渲染，绝不以空集静默收窄 ACL 保护面。
-		// 历史问题：本函数在事件摄取 tick 内随归因映射重载执行，缺失文件持续
-		// 存在时会每 tick 重复留痕——同一 policy+list+错误文本按
-		// auditFailureShouldLog 单源限流（60s 窗口），避免审计库/日志噪声。
+		for _, id := range danglingIPListRefs(p, listsByID, failedIDs) {
+			msg := fmt.Sprintf("策略 %q 引用的 IP 列表(id=%d)不存在（列表已删除或导入残留），仅保留 inline 条目", p.Name, id)
+			if auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
+		}
+		// RDB 严格模式：策略引用的任一列表装载失败（威胁库 .iplist 缺失或
+		// 自定义 entries 畸形）→ 标记跳过渲染，绝不以空集静默收窄 ACL 保护面。
+		// 历史问题：同一 policy+list+错误文本按 auditFailureShouldLog 限流。
 		for _, id := range parseIPListRefs(p.IPACLListRefs) {
 			if failedIDs[id] {
 				p.IPRefMissing = true
-				refErr := fmt.Sprintf("策略 %q 引用的威胁库列表(id=%d)装载失败: %v", p.Name, id, err)
-				if auditFailureShouldLog(refErr) {
-					Logf("error", "%s——该策略将被跳过渲染", refErr)
-					RecordAuditLog("system", "渲染跳过", "安全策略", fmt.Sprintf("策略 %q 引用的威胁库列表(id=%d)装载失败，已跳过该策略渲染: %v", p.Name, id, err), "")
-				}
+				markLoadFailure(p, id)
 				break
 			}
 		}
@@ -370,11 +405,7 @@ func resolvePolicyIPListRefs(policies []*models.SecurityPolicy, store caddyConfi
 			for _, id := range parseIPListRefs(p.IPWhitelistRefs) {
 				if failedIDs[id] {
 					p.IPRefMissing = true
-					refErr := fmt.Sprintf("策略 %q 引用的威胁库列表(id=%d)装载失败: %v", p.Name, id, err)
-					if auditFailureShouldLog(refErr) {
-						Logf("error", "%s——该策略将被跳过渲染", refErr)
-						RecordAuditLog("system", "渲染跳过", "安全策略", fmt.Sprintf("策略 %q 引用的威胁库列表(id=%d)装载失败，已跳过该策略渲染: %v", p.Name, id, err), "")
-					}
+					markLoadFailure(p, id)
 					break
 				}
 			}

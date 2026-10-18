@@ -3,7 +3,6 @@ package handlers
 import (
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -162,16 +161,7 @@ func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
 // localOutboundIP(历史问题-5):探测失败时回退 127.0.0.1 并返回 ok=false——
 // 注册的访问地址是坏值,调用方必须在审计中点名。
 func localOutboundIP() (string, bool) {
-	connection, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "127.0.0.1", false
-	}
-	defer connection.Close()
-	address, ok := connection.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		return "127.0.0.1", false
-	}
-	return address.IP.String(), true
+	return dialOutboundIP()
 }
 
 // switchToSlaveAuditDetail 构建切换从节点的审计详情;出口 IP 探测失败

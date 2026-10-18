@@ -336,7 +336,7 @@ interface TaskInfo {
   kind: 'scheduled' | 'daemon' | 'periodic' | 'oneshot'
   status: string; cancellable: boolean; controllable?: boolean; triggerable?: boolean
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
-  loop_on?: boolean; started_at?: string; log_size_bytes?: number; business_driven?: boolean // 常驻族：循环启停态/引擎启动时刻
+  loop_on?: boolean; started_at?: string; business_driven?: boolean // 常驻族：循环启停态/引擎启动时刻
 }
 interface RunRecord {
   id: number; task_id: string; family: string; trigger: string; operator?: string; status: string

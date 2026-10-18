@@ -89,6 +89,19 @@ func TestCrawlerLib_getListsSourcesWithTotal(t *testing.T) {
 	}
 }
 
+func TestCrawlerLib_listLookupFailureReturns500(t *testing.T) {
+	router := newCrawlerTestRouter(t)
+	seedCrawlerSource(t, 1, "googlebot", 170)
+	if _, err := db.DB.Exec(`DROP TABLE security_ip_lists`); err != nil {
+		t.Fatal(err)
+	}
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/crawler-lib", nil))
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("list lookup failure must not return a partial 200: status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
 func TestCrawlerLibFlags_updateAndNotFound(t *testing.T) {
 	// Given
 	router := newCrawlerTestRouter(t)

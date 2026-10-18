@@ -72,7 +72,7 @@ func TestSyncService_applySnapshot_wafApply_blocks_while_waf_file_lock_held(t *t
 	snapshot := v3SnapshotWithACMESection(models.ClusterSnapshot{
 		Version:       7,
 		Users:         []models.ClusterUser{{ID: 7, Username: "waf-lock-admin", PasswordHash: "hash", Role: "admin", IsEnabled: true}},
-		BasicSettings: models.ClusterBasicSettings{LogLevel: "info", Timezone: "Asia/Shanghai"},
+		BasicSettings: models.ClusterBasicSettings{LogLevel: new("info"), Timezone: new("Asia/Shanghai")},
 		WafFiles:      ref,
 	})
 

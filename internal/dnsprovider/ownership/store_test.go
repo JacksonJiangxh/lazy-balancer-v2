@@ -399,3 +399,37 @@ func TestStore_concurrent_stores_mixed_operations(t *testing.T) {
 		}
 	}
 }
+
+// 历史问题（历史）：Remove 的相等判定必须按语义（CreatedAt.Equal）——
+// Record 内联 == 比较含 time.Time 的表示细节（monotonic 位、loc 指针），
+// 语义相同的记录被判不等 → Remove 静默 no-op，记录永久残留两种真实形态：
+//  1. 调用方持有写入时的原值（time.Now() 带 monotonic）与文件读回值比较；
+//  2. 文件记录时区与当前进程 Local 不同（时区设置变更后重启）——两侧各
+//     解析出独立 FixedZone 指针。
+func TestStore_Remove_semantic_match_after_reload(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		createdAt time.Time
+	}{
+		{"in_memory_original_with_monotonic", time.Now()},
+		{"non_local_fixed_zone", time.Now().Add(-time.Minute).In(time.FixedZone("legacy", 3600))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newStore(t)
+			record := Record{Provider: "dnspod", Zone: "example.com", FQDN: "_acme-challenge.example.com.",
+				Value: "alpha", RecordID: "200", CreatedAt: tc.createdAt}
+			if err := store.Add(record); err != nil {
+				t.Fatalf("add: %v", err)
+			}
+			// When：持有写入原值 Remove（Add 保留调用方时间戳——CreatedAt 非零
+			// 时不重写；形态 2 的 FixedZone 与形态 1 的 monotonic 均在此）。
+			if err := store.Remove(record); err != nil {
+				t.Fatalf("remove: %v", err)
+			}
+			// Then：语义相等的记录必须被删除（旧内联 == 比较 no-op 残留）。
+			if records := readStoreRecords(t, store); len(records) != 0 {
+				t.Fatalf("语义相等的记录未被删除（Remove no-op）：%+v", records)
+			}
+		})
+	}
+}

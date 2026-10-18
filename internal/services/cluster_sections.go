@@ -244,6 +244,10 @@ func readAppliedSectionHashes(dbh *sql.DB) map[string]string {
 			applied[sec] = hash
 		}
 	}
+	if err := rows.Err(); err != nil {
+		Logf("warn", "遍历已应用节哈希失败（漂移检测将回退全量重放口径）: %v", err)
+		return nil
+	}
 	return applied
 }
 

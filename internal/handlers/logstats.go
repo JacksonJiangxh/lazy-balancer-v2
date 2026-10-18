@@ -103,10 +103,13 @@ func timestampedRotationStats(path string) (int64, int) {
 			continue
 		}
 		name := e.Name()
-		// 运行日志族(base 含 .log):rest = .YYYYMMDD-HHMMSS(16 字符)
+		// 运行日志族(base 含 .log):rest = .YYYYMMDD-HHMMSS(16 字符)；
+		// B2-07（历史）：gzip 压缩副本 .YYYYMMDD-HHMMSS.gz 同族计入
+		// （此前漏计，与聚合路径分叉）。
 		if strings.HasPrefix(name, base) {
 			rest := name[len(base):]
-			if len(rest) == 16 && rest[0] == '.' && isDigits(rest[1:9]) && rest[9] == '-' && isDigits(rest[10:]) {
+			core := strings.TrimSuffix(rest, ".gz")
+			if len(core) == 16 && core[0] == '.' && isDigits(core[1:9]) && core[9] == '-' && isDigits(core[10:]) {
 				if info, err := e.Info(); err == nil {
 					total += info.Size()
 					cnt++
@@ -253,10 +256,13 @@ func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[s
 			}
 		}
 	}
-	if len(name) > 17 {
-		rest := name[len(name)-16:]
+	// 运行日志族 base.YYYYMMDD-HHMMSS[.gz]（rest 恰 16 字符；B2-07 历史
+	// 审计：gzip 压缩副本同族归并，此前落入通用 .gz 独立键与 dirBytes 分叉）
+	core := strings.TrimSuffix(name, ".gz")
+	if len(core) > 17 {
+		rest := core[len(core)-16:]
 		if rest[0] == '.' && isDigits(rest[1:9]) && rest[9] == '-' && isDigits(rest[10:]) {
-			if base := name[:len(name)-16]; base != "" {
+			if base := core[:len(core)-16]; base != "" {
 				if _, ok := bases[base]; ok {
 					return base, true
 				}

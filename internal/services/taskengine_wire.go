@@ -94,7 +94,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	_ = os.MkdirAll(tasksLogDir, 0755)
 	taskengine.SetLogDir(tasksLogDir)
 	taskengine.SetTaskLogSizeBytesFn(getTaskLogSizeBytes)
-	taskEngine = taskengine.NewEngine(taskengine.Options{})
+	// 历史问题（历史）：以暂停 tick 形态建引擎——BootSync（startup:config-load）
+	// 完成前面板装配期的周期/定时任务不得抢跑（配置未加载即执行首轮）；下方
+	// RunBootSyncTasks 之后 ResumeScheduling 恢复调度。
+	taskEngine = taskengine.NewEngine(taskengine.Options{StartPaused: true})
 	// 角色种子（v2.0 角色门前置）：按 DB 角色初始化——从节点不瞬启
 	// master-only daemon（否则 boot 行噪音：启动→SetRole 停止）。
 	// 历史问题-1 修复：曾在此前多建一个引擎（种子落在被弃实例上失效+泄漏）。
@@ -575,12 +578,16 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	armSecurityLibraryFirstSlots()
 	// 历史问题：套用用户显式启停偏好——覆盖默认启动清单（停止态不复活；
 	// 用户主动开启的默认关闭任务恢复调度）；业务驱动任务跳过。
-	applyTaskLoopPrefs(taskEngine)
+	// D2-历史问题（历史）：复用上方已读取的偏好快照，不再二次查表。
+	applyTaskLoopPrefs(taskEngine, taskLoopPrefs)
 	// 业务驱动任务启动均按业务实态对齐（唯一清单见 businessTaskDrivers）。
 	SyncBusinessTaskDrivers()
 	// B1：BootSync 任务同步执行（startup:config-load——面板监听前完成，
 	// 替代 main.go 直调+legacy startupPhase 记录旁路）
 	taskEngine.RunBootSyncTasks()
+	// 历史问题（历史）：BootSync 完成后解除 tick 暂停——此前 ticker 在
+	// NewEngine 即起跑，周期/定时任务可在配置载入前执行首轮。
+	taskEngine.ResumeScheduling()
 	return taskEngine
 }
 

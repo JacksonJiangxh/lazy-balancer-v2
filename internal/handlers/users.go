@@ -146,7 +146,11 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	// 2026-09-18 用户裁定:OIDC 用户显示名/密码源自 IdP,管理员亦不可改
 	// (角色/启停是本地管理语义,不受限)。历史问题:username 同为 IdP 源属性
 	// (JIT 取 preferred_username),与显示名/密码同一裁定口径一并拦截。
-	if req.DisplayName != nil || req.Password != nil || req.Username != nil {
+	// B1-04（历史）：空 password 键在策略层语义为「不修改」
+	// （validatePasswordPolicy 空值放行、passwordHash 仅非空生成）——携带
+	// 空串不算改密尝试，不得触发 OIDC 门；非空仍拦截。
+	passwordChangeRequested := req.Password != nil && *req.Password != ""
+	if req.DisplayName != nil || passwordChangeRequested || req.Username != nil {
 		oidcUser, err := isOIDCUser(c.Request.Context(), id)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户身份失败"})
@@ -494,7 +498,12 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 		return
 	}
 	var statusUsername string
-	_ = tx.QueryRowContext(c.Request.Context(), "SELECT username FROM users WHERE id = ?", id).Scan(&statusUsername)
+	// B1-05（历史）：审计富化回填不再静默吞错——读失败与其余 DB
+	// 错误同口径 500（tx 未提交，操作随回滚不生效）。
+	if err := tx.QueryRowContext(c.Request.Context(), "SELECT username FROM users WHERE id = ?", id).Scan(&statusUsername); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新用户状态失败"})
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新用户状态失败"})
 		return
@@ -582,7 +591,11 @@ func (h *Handlers) ResetUserPassword(c *gin.Context) {
 		return
 	}
 	var resetUsername string
-	_ = tx.QueryRowContext(c.Request.Context(), "SELECT username FROM users WHERE id = ?", id).Scan(&resetUsername)
+	// B1-05（历史）：同 ToggleUserStatus——审计富化回填读失败 500。
+	if err := tx.QueryRowContext(c.Request.Context(), "SELECT username FROM users WHERE id = ?", id).Scan(&resetUsername); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "重置密码失败"})
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "重置密码失败"})
 		return
