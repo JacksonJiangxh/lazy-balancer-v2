@@ -252,39 +252,45 @@ type ClusterBasicSettings struct {
 	// BrandingJSON 是主节点 branding.json 原文镜像(2026-09-11 裁定):随
 	// 快照下发,从节点落盘本地文件后生效。三分类合并后随系统数据节
 	// (恒同步)恒携带。
-	BrandingJSON               string `json:"branding_json,omitempty"`
-	AccessLogJSON              bool   `json:"access_log_json,omitempty"`
-	AccessLogFormat            string `json:"access_log_format,omitempty"`
-	TaskLogSizeMB              int    `json:"task_log_size_mb"`
-	AuditLogSizeMB             int    `json:"audit_log_size_mb"`
-	RuntimeLogSizeMB           int    `json:"runtime_log_size_mb"`
-	AuditRetentionMonths       int    `json:"audit_retention_months"`
-	JWTExpireMinutes           int    `json:"jwt_expire_minutes"`
-	Timezone                   string `json:"timezone"`
-	ACMEEmail                  string `json:"acme_email"`
-	CertExpiryDays             int    `json:"cert_expiry_days"`
-	CertRenewalDays            int    `json:"cert_renewal_days"`
-	CertRenewalAttempts        int    `json:"cert_renewal_attempts"`
-	DefaultCAProviderID        int    `json:"default_ca_provider_id"`
-	DNSProvider                string `json:"dns_provider"`
-	DNSCredentials             string `json:"dns_credentials"`
-	SyncInterval               int    `json:"sync_interval"`
-	CaddyLogLevel              string `json:"caddy_log_level,omitempty"`
-	CaddyLogSizeMB             int    `json:"caddy_log_size_mb,omitempty"`
-	RequestBodyMaxSizeMB       int    `json:"request_body_max_size_mb,omitempty"`
-	HTTPReadTimeout            int    `json:"http_read_timeout,omitempty"`
-	HTTPWriteTimeout           int    `json:"http_write_timeout,omitempty"`
-	HTTPIdleTimeout            int    `json:"http_idle_timeout,omitempty"`
-	UpstreamKeepaliveTimeout   int    `json:"upstream_keepalive_timeout,omitempty"`
-	ProxyDialTimeout           int    `json:"proxy_dial_timeout,omitempty"`
-	ProxyResponseHeaderTimeout int    `json:"proxy_response_header_timeout,omitempty"`
-	ProxyReadTimeout           int    `json:"proxy_read_timeout,omitempty"`
-	ProxyWriteTimeout          int    `json:"proxy_write_timeout,omitempty"`
-	ProxyStreamTimeout         int    `json:"proxy_stream_timeout,omitempty"`
-	ProxyFlushInterval         int    `json:"proxy_flush_interval,omitempty"`
-	ProxyStreamCloseDelay      int    `json:"proxy_stream_close_delay,omitempty"`
-	GitHubProxyURL             string `json:"github_proxy_url,omitempty"`
-	ServerTokensHidden         bool   `json:"server_tokens_hidden,omitempty"`
+	BrandingJSON         string `json:"branding_json,omitempty"`
+	AccessLogJSON        bool   `json:"access_log_json,omitempty"`
+	AccessLogFormat      string `json:"access_log_format,omitempty"`
+	TaskLogSizeMB        int    `json:"task_log_size_mb"`
+	AuditLogSizeMB       int    `json:"audit_log_size_mb"`
+	RuntimeLogSizeMB     int    `json:"runtime_log_size_mb"`
+	AuditRetentionMonths int    `json:"audit_retention_months"`
+	// v2.3.8 安全事件保留与流量采样：随 users 节同步（从节点/升主后
+	// 保留策略与大屏采样口径与主节点一致）；指针+omitempty 用于旧主端
+	// 快照缺席时保留从端本地值。
+	SecurityEventsRetentionDays *int   `json:"security_events_retention_days,omitempty"`
+	SecurityEventsRowCap        *int   `json:"security_events_row_cap,omitempty"`
+	ThreatTrafficSampleN        *int   `json:"threat_traffic_sample_n,omitempty"`
+	JWTExpireMinutes            int    `json:"jwt_expire_minutes"`
+	Timezone                    string `json:"timezone"`
+	ACMEEmail                   string `json:"acme_email"`
+	CertExpiryDays              int    `json:"cert_expiry_days"`
+	CertRenewalDays             int    `json:"cert_renewal_days"`
+	CertRenewalAttempts         int    `json:"cert_renewal_attempts"`
+	DefaultCAProviderID         int    `json:"default_ca_provider_id"`
+	DNSProvider                 string `json:"dns_provider"`
+	DNSCredentials              string `json:"dns_credentials"`
+	SyncInterval                int    `json:"sync_interval"`
+	CaddyLogLevel               string `json:"caddy_log_level,omitempty"`
+	CaddyLogSizeMB              int    `json:"caddy_log_size_mb,omitempty"`
+	RequestBodyMaxSizeMB        int    `json:"request_body_max_size_mb,omitempty"`
+	HTTPReadTimeout             int    `json:"http_read_timeout,omitempty"`
+	HTTPWriteTimeout            int    `json:"http_write_timeout,omitempty"`
+	HTTPIdleTimeout             int    `json:"http_idle_timeout,omitempty"`
+	UpstreamKeepaliveTimeout    int    `json:"upstream_keepalive_timeout,omitempty"`
+	ProxyDialTimeout            int    `json:"proxy_dial_timeout,omitempty"`
+	ProxyResponseHeaderTimeout  int    `json:"proxy_response_header_timeout,omitempty"`
+	ProxyReadTimeout            int    `json:"proxy_read_timeout,omitempty"`
+	ProxyWriteTimeout           int    `json:"proxy_write_timeout,omitempty"`
+	ProxyStreamTimeout          int    `json:"proxy_stream_timeout,omitempty"`
+	ProxyFlushInterval          int    `json:"proxy_flush_interval,omitempty"`
+	ProxyStreamCloseDelay       int    `json:"proxy_stream_close_delay,omitempty"`
+	GitHubProxyURL              string `json:"github_proxy_url,omitempty"`
+	ServerTokensHidden          bool   `json:"server_tokens_hidden,omitempty"`
 	// v2.3.x 受信代理（CDN 真实 IP）：随 Caddy 全局轴同步——从节点渲染层
 	// （servers.trusted_proxies）与数据面取值与主节点一致。range_refs 为
 	// 引用的 IP 地址列表 id（JSON 数组文本，2026-10-12），引用的名单本体

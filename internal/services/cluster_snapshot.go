@@ -541,6 +541,17 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 	snapshot.BasicSettings.CrawlerAutoUpdate = &crawlerAuto
 	snapshot.BasicSettings.CrawlerScheduleDays = &crawlerDays
 	snapshot.BasicSettings.CrawlerScheduleTime = &crawlerTime
+	// v2.3.8：安全事件保留与大屏采样随 users 节同步（从节点/升主后口径一致）。
+	var seDays, seCap, trafficSample int
+	if err := store.QueryRowContext(ctx, `SELECT COALESCE(security_events_retention_days,90),
+		COALESCE(security_events_row_cap,1000000), COALESCE(threat_traffic_sample_n,-1)
+		FROM global_config WHERE id=1`).Scan(&seDays, &seCap, &trafficSample); err != nil {
+		return fmt.Errorf("读取安全事件保留/流量采样设置: %w", err)
+	}
+	snapshot.BasicSettings.SecurityEventsRetentionDays = &seDays
+	snapshot.BasicSettings.SecurityEventsRowCap = &seCap
+	snapshot.BasicSettings.ThreatTrafficSampleN = &trafficSample
+
 	// D1（历史）：自动封禁六项配置随 users 节同步（镜像 历史问题/历史问题-01
 	// 指针装载+COALESCE 兜底恒携带，升主即按主端配置生效）。局部名 abn* 与上方
 	// 自动备份组 ab* 区分（同一函数作用域）。

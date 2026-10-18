@@ -1316,6 +1316,18 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	}
 	// D1（历史）：自动封禁六项配置同口径入块（指针缺席=旧主端快照未
 	// 携带——跳过写入保留从端本地值，不清零；新主端恒携带全组，升主即生效）。
+	if settings.SecurityEventsRetentionDays != nil {
+		settingClauses = append(settingClauses, "security_events_retention_days=?")
+		settingArgs = append(settingArgs, *settings.SecurityEventsRetentionDays)
+	}
+	if settings.SecurityEventsRowCap != nil {
+		settingClauses = append(settingClauses, "security_events_row_cap=?")
+		settingArgs = append(settingArgs, *settings.SecurityEventsRowCap)
+	}
+	if settings.ThreatTrafficSampleN != nil {
+		settingClauses = append(settingClauses, "threat_traffic_sample_n=?")
+		settingArgs = append(settingArgs, *settings.ThreatTrafficSampleN)
+	}
 	if settings.AutobanEnabled != nil {
 		settingClauses = append(settingClauses, "autoban_enabled=?")
 		settingArgs = append(settingArgs, *settings.AutobanEnabled)
