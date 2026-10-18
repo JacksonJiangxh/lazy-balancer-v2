@@ -95,8 +95,9 @@ const settings = ref<SettingsConfig>({
   server_map_lat: 0,
   server_map_lon: 0,
   threat_screen_mode: 'map',
-  security_events_retention_days: 0,
-  security_events_row_cap: 0,
+  security_events_retention_days: 90,
+  threat_traffic_sample_n: -1,
+  security_events_row_cap: 1_000_000,
   trusted_proxy_enabled: false,
   trusted_proxy_ranges: '[]',
   trusted_proxy_range_refs: '[]',
@@ -184,8 +185,9 @@ const applyCaddyKeys = (data: ConfigPayload) => {
   settings.value.server_map_lat = data.server_map_lat ?? 0
   settings.value.server_map_lon = data.server_map_lon ?? 0
   settings.value.threat_screen_mode = data.threat_screen_mode === 'globe' ? 'globe' : 'map'
-  settings.value.security_events_retention_days = data.security_events_retention_days ?? 0
-  settings.value.security_events_row_cap = data.security_events_row_cap ?? 0
+  settings.value.security_events_retention_days = data.security_events_retention_days && data.security_events_retention_days > 0 ? data.security_events_retention_days : 90
+  settings.value.threat_traffic_sample_n = [-1, 0, 1].includes(data.threat_traffic_sample_n ?? -1) ? (data.threat_traffic_sample_n ?? -1) : -1
+  settings.value.security_events_row_cap = data.security_events_row_cap && data.security_events_row_cap > 0 ? data.security_events_row_cap : 1_000_000
 }
 
 const applyCertKeys = (data: ConfigPayload) => {

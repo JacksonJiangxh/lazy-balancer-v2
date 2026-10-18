@@ -10,9 +10,11 @@
         <div class="title"><i></i>{{ isGlobeMode ? 'GLOBAL THREAT SPHERE' : 'GLOBAL THREAT MAP' }}</div>
         <div class="readout">CAM <b>{{ camReadout }}</b></div>
         <div class="readout">TGT <b>{{ tgtReadout }}</b></div>
+        <div class="readout">FLOW <b>{{ flowSampleLabel }}</b></div>
       </div>
       <div class="hud-tr" aria-label="图例">
-        <div class="row">攻击弹道 <span class="legend-arc"></span></div>
+        <div class="row">正常请求 <span class="legend-arc normal"></span></div>
+        <div class="row">攻击光流 <span class="legend-arc"></span></div>
         <div class="row">国家命中 少 <span class="legend-ramp"></span> 多</div>
       </div>
 
@@ -25,12 +27,13 @@
 
       <!-- 攻击事件弹框：feed 新事件到达即弹（最多 3 条，4.5s 淡出） -->
       <transition-group name="toast" tag="div" class="toasts">
-        <div v-for="t in attackToasts" :key="t.id" class="toast" :class="t.action === 'blocked' ? 'sev-high' : 'sev-low'">
+        <div v-for="t in attackToasts" :key="t.id" class="toast" :class="t.action === 'blocked' || t.action === 'mixed' ? 'sev-high' : 'sev-low'">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5 4.5 5.4v6.1c0 4.6 3.2 8.6 7.5 9.9 4.3-1.3 7.5-5.3 7.5-9.9V5.4Z"/><path d="m9 12 2 2 4-4.5"/></svg>
           <b>{{ t.country }}</b>
           <span class="ip">{{ t.ip }}</span>
           <span class="dim">{{ t.stage }} · {{ t.durationMs }}ms</span>
-          <span class="sev" :class="t.action === 'blocked' ? 'sev-high' : 'sev-low'">{{ t.action === 'blocked' ? '已拦截' : '检测' }}</span>
+          <span v-if="(t.count ?? 1) > 1" class="agg">×{{ t.count }}</span>
+          <span class="sev" :class="t.action === 'blocked' || t.action === 'mixed' ? 'sev-high' : 'sev-low'">{{ t.action === 'blocked' ? '已拦截' : t.action === 'mixed' ? '攻击' : '检测' }}</span>
         </div>
       </transition-group>
 
@@ -279,6 +282,7 @@ import { usePollingTask } from '@/composables/usePollingTask'
 import { useCountUp } from '@/composables/useCountUp'
 import { formatDate } from '@/utils/date'
 import { trafficDelta, threatIndex, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '@/utils/threatScreenMetrics'
+import { flowBucket, flowBucketKey, flowGroupEvents, flowRegionKey, flowTimestamp, shouldAggregate } from '@/utils/threatFlowRules'
 import type { ThreatScene, ThreatSceneOptions } from '@/utils/threatScene'
 
 // 威胁大屏（v2.3.8 Threat Wall 版式）：三栏 HUD 网格（左事件流/中引擎舞台/
@@ -322,6 +326,13 @@ interface FeedEvent {
   anomaly_score?: number
 }
 
+interface NormalFlowEvent {
+  seq: number
+  country: string
+  province?: string
+  at: number
+}
+
 const FEED_LIMIT = 50
 const FEED_POLL_MS = 3000
 const STATS_POLL_MS = 30000
@@ -341,7 +352,8 @@ const mapHost = ref<HTMLElement | null>(null)
 const zoomedName = ref<string | null>(null)
 let threatMap: ThreatScene | null = null
 
-let arcQueue: string[] = []
+interface ArcTick { key: string; ts: number }
+let arcQueue: ArcTick[] = []
 let arcFlushTimer: number | undefined = undefined
 let disposed = false
 
@@ -451,11 +463,14 @@ const typeColorFor = (name: string): string => {
 // ============ 实时时钟（秒级） ============
 const clockText = ref('--:--:--')
 const clockDate = ref('')
+// 实时事件时间窗过滤的时钟源（1h/24h/168h）；每秒推进，旧事件到点即隐藏。
+const feedNow = ref(Date.now())
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六']
 const camReadout = ref('--')
 const tgtReadout = ref('--')
 function tickClock(): void {
   const now = new Date()
+  feedNow.value = now.getTime()
   const p2 = (n: number): string => String(n).padStart(2, '0')
   clockText.value = `${p2(now.getHours())}:${p2(now.getMinutes())}:${p2(now.getSeconds())}`
   clockDate.value = `${now.getFullYear()}-${p2(now.getMonth() + 1)}-${p2(now.getDate())} 星期${WEEKDAYS[now.getDay()]}`
@@ -473,6 +488,8 @@ interface AttackToast {
   stage: string
   action: string
   durationMs: string
+  /** >1 表示同一地区/秒聚合的请求数 */
+  count?: number
 }
 const attackToasts = ref<AttackToast[]>([])
 const TOAST_MAX = 3
@@ -489,19 +506,43 @@ function triggerLabel(ev: FeedEvent): string {
   return ev.trigger_type || ev.attack_type || '—'
 }
 function pushAttackToasts(events: FeedEvent[]): void {
-  // 100/s 攻击下每 3s 可达 300 条；只为最新 3 条建 toast/定时器，
-  // 避免每条事件一个 setTimeout 的定时器风暴（原实现全量循环）。
-  const blocked = events.filter((ev) => ev.action === 'blocked').slice(-TOAST_MAX)
-  for (const ev of blocked) {
-    const durMs = Math.max(0.1, (ev.duration_us ?? 0) / 1000)
-    const toast: AttackToast = {
-      id: ev.id,
-      country: (ev.ip_location || '未知').split('·')[0] || '未知',
-      ip: ev.client_ip,
-      stage: triggerLabel(ev),
-      action: ev.action,
-      durationMs: durMs >= 100 ? Math.round(durMs).toString() : durMs.toFixed(1),
+  // 检测/拦截都视为攻击；同一地区（中国精确到省）同一秒 >10 条聚合成
+  // 一个带 ×N 的弹框，其余逐条弹。聚合规则与光流共用 threatFlowRules。
+  if (events.length === 0) return
+  const next: AttackToast[] = []
+  for (const group of flowGroupEvents(events)) {
+    const list = group.items
+    const count = list.length
+    if (shouldAggregate(count)) {
+      const ev = list[list.length - 1]
+      const actions = new Set(list.map((x) => x.action))
+      const action = actions.size > 1 ? 'mixed' : ev.action
+      const durMs = Math.max(0.1, (ev.duration_us ?? 0) / 1000)
+      next.push({
+        id: ev.id,
+        country: group.region.split('·')[0] || '未知',
+        ip: ev.client_ip,
+        stage: triggerLabel(ev),
+        action,
+        durationMs: durMs >= 100 ? Math.round(durMs).toString() : durMs.toFixed(1),
+        count,
+      })
+    } else {
+      for (const ev of list) {
+        const durMs = Math.max(0.1, (ev.duration_us ?? 0) / 1000)
+        next.push({
+          id: ev.id,
+          country: group.region.split('·')[0] || '未知',
+          ip: ev.client_ip,
+          stage: triggerLabel(ev),
+          action: ev.action,
+          durationMs: durMs >= 100 ? Math.round(durMs).toString() : durMs.toFixed(1),
+        })
+      }
     }
+  }
+  next.sort((a, b) => b.id - a.id)
+  for (const toast of next.slice(0, TOAST_MAX)) {
     attackToasts.value = [toast, ...attackToasts.value].slice(0, TOAST_MAX)
     const timer = window.setTimeout(() => {
       attackToasts.value = attackToasts.value.filter((t) => t.id !== toast.id)
@@ -570,40 +611,40 @@ function sevLabel(ev: FeedEvent): string {
   const s = sevOf(ev)
   return s === 'high' ? '高危' : s === 'mid' ? '中危' : '低危'
 }
+
+const windowFeed = computed(() => {
+  const cutoff = feedNow.value - windowHours.value * 3600_000
+  return feedItems.value.filter((ev) => {
+    const t = flowTimestamp(ev.event_time)
+    return !Number.isFinite(t) || t >= cutoff
+  })
+})
 const sevFilter = ref<'all' | Sev>('all')
 const sevFilters = computed(() => {
   let high = 0, mid = 0, low = 0
-  for (const ev of feedItems.value) {
+  for (const ev of windowFeed.value) {
     const s = sevOf(ev)
     if (s === 'high') high++
     else if (s === 'mid') mid++
     else low++
   }
   return [
-    { key: 'all' as const, label: '全部', count: feedItems.value.length },
+    { key: 'all' as const, label: '全部', count: windowFeed.value.length },
     { key: 'high' as const, label: '高危', count: high },
     { key: 'mid' as const, label: '中危', count: mid },
     { key: 'low' as const, label: '低危', count: low },
   ]
 })
 const filteredFeed = computed(() =>
-  sevFilter.value === 'all' ? feedItems.value : feedItems.value.filter((ev) => sevOf(ev) === sevFilter.value),
+  sevFilter.value === 'all' ? windowFeed.value : windowFeed.value.filter((ev) => sevOf(ev) === sevFilter.value),
 )
 
-function arcAggregationKey(location: string): string {
-  const [country, province] = location.split('·')
-  if (!country) return ''
-  // 地球按国家质心落弧；地图中国按省质心落弧。先在此归一，避免同一
-  // 省/国家下不同城市在队列里各占一条，最终叠成 30 条重合弧。
-  if (screenMode.value !== 'globe' && country === '中国' && province) return `${country}·${province}`
-  return country
-}
 
 function enqueueArcs(events: FeedEvent[]): void {
   for (const event of events) {
     if (!event.ip_location) continue
-    const key = arcAggregationKey(event.ip_location)
-    if (key) arcQueue.push(key)
+    const key = flowRegionKey(event.ip_location)
+    if (key) arcQueue.push({ key, ts: flowTimestamp(event.event_time ?? '') })
   }
 }
 
@@ -612,11 +653,18 @@ function flushArcs(): void {
     arcQueue = []
     return
   }
-  // v2.3.8 同源聚合（100 atk/s 压力设计）：同一归属地合并为一条加权弧——
-  // 弧线池上限 30 表达的是「来源分布」而非「逐事件」，同源加粗优于逐条丢弃。
-  const byLocation = new Map<string, number>()
-  for (const location of arcQueue) byLocation.set(location, (byLocation.get(location) ?? 0) + 1)
-  for (const [location, weight] of byLocation) threatMap.addArcForLocation(location, weight)
+  // 同一地区同一秒 >10 条合并为一条加权弧；≤10 逐条表达（攻击类型不区分）。
+  const groups = new Map<string, { key: string; count: number }>()
+  for (const item of arcQueue) {
+    const g = flowBucketKey(item.key, flowBucket(item.ts))
+    const cur = groups.get(g)
+    if (cur) cur.count += 1
+    else groups.set(g, { key: item.key, count: 1 })
+  }
+  for (const { key, count } of groups.values()) {
+    if (shouldAggregate(count)) threatMap.addArcForLocation(key, count)
+    else for (let i = 0; i < count; i++) threatMap.addArcForLocation(key, 1)
+  }
   arcQueue = []
 }
 
@@ -667,7 +715,9 @@ const trafficTask = usePollingTask(async () => {
     }
     return
   }
-  threatMap?.setTraffic(sample.normalDeltas)
+  // 采样关闭时用累计计数器生成地区聚合正常光流；开启逐请求事件流后，
+  // 正常光流由 flowTask 消费事件生成，避免两条数据源重复画弧。
+  if (flowSampleN.value === 0) threatMap?.setTraffic(sample.normalDeltas)
   normalTotal.value += sample.normalTotal
   attackTotal.value += sample.attackTotal
   normalWindow.value = [...normalWindow.value, sample.normalQps].slice(-NORMAL_WINDOW_MAX)
@@ -685,13 +735,25 @@ function setWindow(hours: number): void {
 // 本站坐标 + 大屏模式（threat_screen_mode：map/globe）——/config 读一次。
 // 历史 历史问题：不阻塞引擎/轮询启动（见 onMounted）。
 const screenMode = ref('map')
+const flowSampleN = ref(-1)
+// 自适应模式初始全量；按「事件数 × 当前采样因子」估算真实速率后调整。
+const activeSampleN = ref(1)
+const flowSampleLabel = computed(() => {
+  if (flowSampleN.value === 0) return 'OFF'
+  const n = activeSampleN.value
+  return n <= 1 ? 'FULL' : `1/${n}`
+})
 const isGlobeMode = computed(() => screenMode.value === 'globe')
 const serverLatLon: [number, number] = [0, 0]
 const siteConfigured = ref(false)
 async function loadServerCentroid(): Promise<void> {
   try {
-    const res = await request.get<APIResponse<{ server_map_lat?: number; server_map_lon?: number; threat_screen_mode?: string }>>('/config?_ts=' + Date.now(), { silent: true })
+    const res = await request.get<APIResponse<{ server_map_lat?: number; server_map_lon?: number; threat_screen_mode?: string; threat_traffic_sample_n?: number }>>('/config?_ts=' + Date.now(), { silent: true })
     screenMode.value = res.data?.threat_screen_mode === 'globe' ? 'globe' : 'map'
+    const rawSample = res.data?.threat_traffic_sample_n ?? -1
+    flowSampleN.value = rawSample === -1 || rawSample === 0 || rawSample === 1 ? rawSample : -1
+    activeSampleN.value = flowSampleN.value === 0 ? 0 : flowSampleN.value === -1 ? 1 : flowSampleN.value
+    acquireCollector()
     serverLatLon[0] = res.data?.server_map_lat ?? 0
     serverLatLon[1] = res.data?.server_map_lon ?? 0
     siteConfigured.value = serverLatLon[0] !== 0 || serverLatLon[1] !== 0
@@ -751,6 +813,62 @@ const statsTask = usePollingTask(async () => {
   onError: () => { statsError.value = true },
 })
 
+// ============ 逐请求正常流量事件流（大屏打开时轮询；关闭后停止） ============
+let flowSince = 0
+let adaptiveStable = 0
+let adaptiveLastSwitch = 0
+const flowTask = usePollingTask(async () => {
+  const res = await request.get<APIResponse<{ enabled?: boolean; events?: NormalFlowEvent[]; next_seq?: number; sample_n?: number }>>(
+    `/security/overview/threat-screen/events?since=${flowSince}&limit=1000`,
+    { silent: true },
+  )
+  const data = res.data
+  if (!data?.enabled) return
+  const events = data.events ?? []
+  // 有界光流池：同一轮按地区聚合；总弧数上限 30（与引擎池一致）。
+  // ≤10 且预算足够时逐条表达，超出预算或 >10 的地区合并为一条加权光流。
+  const byLocation = new Map<string, number>()
+  for (const ev of events) {
+    if (!ev.country) continue
+    const location = ev.province ? `${ev.country}·${ev.province}` : ev.country
+    byLocation.set(location, (byLocation.get(location) ?? 0) + 1)
+  }
+  let budget = 30
+  for (const [location, count] of [...byLocation].sort((a, b) => b[1] - a[1])) {
+    if (budget <= 0) break
+    if (count > 10 || count > budget) {
+      threatMap?.addNormalArcForLocation(location, count)
+      budget--
+      continue
+    }
+    for (let i = 0; i < count && budget > 0; i++) {
+      threatMap?.addNormalArcForLocation(location, 1)
+      budget--
+    }
+  }
+  if (typeof data.next_seq === 'number') flowSince = data.next_seq
+  if (flowSampleN.value === -1 && activeSampleN.value > 0) {
+    // events.length 已经被当前采样因子缩小；先还原真实速率再判定，否则
+    // 1/8 下 125 条会被误判成「低速」反复切回全量。
+    const sampleForRate = data.sample_n && data.sample_n > 0 ? data.sample_n : activeSampleN.value
+    const observedRate = events.length * sampleForRate
+    const target = observedRate > 600 ? 8 : observedRate > 150 ? 4 : 1
+    if (target === activeSampleN.value) {
+      adaptiveStable = 0
+      adaptiveLastSwitch = 0
+    } else {
+      adaptiveStable++
+      const now = Date.now()
+      if (adaptiveStable >= 2 && now - adaptiveLastSwitch > 4000) {
+        activeSampleN.value = target
+        adaptiveStable = 0
+        adaptiveLastSwitch = now
+        acquireCollector()
+      }
+    }
+  }
+}, { interval: 1000, onError: () => { /* 事件流不可用不阻断大屏 */ } })
+
 // ============ 引擎装载（与配置并行，import 失败可重试） ============
 const engineError = ref(false)
 let mountedMode: 'map' | 'globe' | null = null
@@ -792,6 +910,13 @@ async function mountEngine(): Promise<void> {
     threatMap = engine
     mountedMode = mode
     ;(window as unknown as Record<string, unknown>).__threatScene = engine
+    // 首屏竞态：statsTask 与引擎并行，统计先返回时 threatMap 尚未创建，
+    // setCountries 无处落地；引擎创建后必须回放当前快照，否则球面热力
+    // 永远是 0（图例/右栏有数、球面无色）。
+    if (stats.value) {
+      engine.setCountries(Object.entries(stats.value.countries ?? {}).map(([name, count]) => ({ name, count })))
+      engine.setProvinces(Object.entries(stats.value.china_provinces ?? {}).map(([name, count]) => ({ name, count })))
+    }
     applyMapPause()
     if (siteConfigured.value) engine.setServer([serverLatLon[1], serverLatLon[0]])
   } catch (error: unknown) {
@@ -819,10 +944,12 @@ function togglePause(): void {
     feedTask.pause()
     statsTask.pause()
     trafficTask.pause()
+    flowTask.pause()
   } else {
     feedTask.resume()
     statsTask.resume()
     trafficTask.resume()
+    flowTask.resume()
   }
   applyMapPause()
 }
@@ -850,7 +977,38 @@ function onKeydown(event: KeyboardEvent): void {
 
 function onVisibilityChange(): void {
   if (document.hidden) threatMap?.setPaused(true)
-  else applyMapPause()
+  else {
+    acquireCollector()
+    applyMapPause()
+  }
+}
+
+// 大屏流量采集租约：只在屏幕打开时让 Caddy 计数；关闭/崩溃由 TTL 兜底。
+function newCollectorLeaseId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  } catch { /* 非安全上下文可能抛 SecurityError */ }
+  return `threat-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+const collectorLeaseId = newCollectorLeaseId()
+const COLLECTOR_TTL_MS = 30000
+const COLLECTOR_HEARTBEAT_MS = 10000
+let collectorTimer = 0
+
+function acquireCollector(): void {
+  if (disposed) return
+  request.post(
+    '/security/overview/threat-screen/collector',
+    { lease_id: collectorLeaseId, ttl_ms: COLLECTOR_TTL_MS, sample_n: activeSampleN.value }, // -1 自适应由 activeSampleN 决定
+    { silent: true },
+  ).catch(() => { /* 端点不可用/从节点限制：不阻塞大屏展示 */ })
+}
+
+function releaseCollector(): void {
+  request.delete('/security/overview/threat-screen/collector', {
+    data: { lease_id: collectorLeaseId },
+    silent: true,
+  }).catch(() => { /* TTL 兜底 */ })
 }
 
 let configTimeout = 0
@@ -863,10 +1021,13 @@ onMounted(() => {
   arcFlushTimer = window.setInterval(flushArcs, ARC_FLUSH_MS)
   tickClock()
   clockTimer = window.setInterval(tickClock, 1000)
+  acquireCollector()
+  collectorTimer = window.setInterval(acquireCollector, COLLECTOR_HEARTBEAT_MS)
   feedTask.start()
   statsTask.start()
   trafficTask.start()
-  void Promise.allSettled([feedTask.run(), statsTask.run(), trafficTask.run()])
+  flowTask.start()
+  void Promise.allSettled([feedTask.run(), statsTask.run(), trafficTask.run(), flowTask.run()])
   // 配置最多等 4s（模式/本站坐标）；到达或超时都立即装载引擎。配置晚到且
   // 模式不同则 mountEngine 内部重装。
   const configPromise = loadServerCentroid().then(() => {
@@ -889,11 +1050,15 @@ onBeforeUnmount(() => {
   configTimeout = 0
   clearInterval(clockTimer)
   clockTimer = 0
+  clearInterval(collectorTimer)
+  collectorTimer = 0
+  releaseCollector()
   for (const t of toastTimers.values()) clearTimeout(t)
   toastTimers.clear()
   feedTask.stop()
   statsTask.stop()
   trafficTask.stop()
+  flowTask.stop()
   threatMap?.dispose()
   threatMap = null
   mountedMode = null
@@ -1135,6 +1300,7 @@ onBeforeUnmount(() => {
 .hud-tr .row { display: flex; align-items: center; gap: 8px; }
 .legend-ramp { width: 72px; height: 4px; background: linear-gradient(90deg, #ff9f1c, #ff4d4d); box-shadow: 0 0 10px rgba(255, 106, 61, 0.6); }
 .legend-arc { width: 26px; height: 2px; background: linear-gradient(90deg, transparent, #ff9f1c, #fff3c4); box-shadow: 0 0 6px #ff9f1c; }
+.legend-arc.normal { background: linear-gradient(90deg, transparent, #38bdf8, #e0f7ff); box-shadow: 0 0 6px #38bdf8; }
 
 .back-btn { position: absolute; z-index: 4; bottom: 52px; left: 50%; transform: translateX(-50%); }
 .hint { position: absolute; z-index: 2; right: 16px; bottom: 44px; font-size: 11px; color: #56709f; pointer-events: none; }
@@ -1154,6 +1320,7 @@ onBeforeUnmount(() => {
 .toast b { font-size: 14px; letter-spacing: 0.1em; color: #e2ecff; }
 .toast .ip { font-family: 'Share Tech Mono', ui-monospace, monospace; color: #fff; }
 .toast .dim { color: #8ea7d6; overflow: hidden; text-overflow: ellipsis; }
+.toast .agg { font: 11px/1 ui-monospace, monospace; color: #ffd166; border: 1px solid rgba(255, 209, 102, 0.45); padding: 2px 4px; }
 .toast-enter-active { transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1); }
 .toast-leave-active { transition: all 0.4s ease; position: absolute; }
 .toast-leave-to { opacity: 0; transform: translateY(-8px) scale(0.96); }

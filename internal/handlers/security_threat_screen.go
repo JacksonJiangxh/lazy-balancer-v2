@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -628,6 +629,59 @@ type trafficSnapshot struct {
 // available=false）——大屏 1-2s 轮询容忍瞬时不可达，不 500。
 func threatTrafficEmptyDegrade() gin.H {
 	return gin.H{"countries": map[string]trafficCountry{}, "available": false, "sample_n": 1}
+}
+
+// ControlThreatScreenCollector POST/DELETE /security/overview/threat-screen/collector
+// 代理 Caddy admin 的流量采集租约：大屏打开时申请/续租，关闭时释放；
+// 插件在无租约时跳过所有流量采集热路径（安全日志不受影响）。
+func (h *Handlers) ControlThreatScreenCollector(c *gin.Context) {
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 4096))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求体读取失败"})
+		return
+	}
+	target := strings.TrimRight(h.cfg.CaddyAdminURL, "/") + "/lb/traffic-collector"
+	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, target, bytes.NewReader(body))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "采集控制请求构造失败"})
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		services.Logf("warn", "threat-screen collector: admin request failed: %v", err)
+		c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "流量采集控制不可达"})
+		return
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	c.Data(resp.StatusCode, "application/json", respBody)
+}
+
+// GetThreatScreenFlowEvents GET /security/overview/threat-screen/events
+// 代理 Caddy admin 逐请求正常流量环形缓冲；since_seq 增量拉取，仅大屏打开时
+// 前端轮询。响应透传 enabled/sample_n/events/next_seq。
+func (h *Handlers) GetThreatScreenFlowEvents(c *gin.Context) {
+	target := strings.TrimRight(h.cfg.CaddyAdminURL, "/") + "/lb/traffic-events"
+	if raw := c.Request.URL.RawQuery; raw != "" {
+		target += "?" + raw
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, target, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "事件流请求构造失败"})
+		return
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		services.Logf("warn", "threat-screen events: admin request failed: %v", err)
+		c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "逐请求事件流不可达"})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	c.Data(resp.StatusCode, "application/json", body)
 }
 
 // GetThreatScreenTraffic GET /security/overview/threat-screen/traffic

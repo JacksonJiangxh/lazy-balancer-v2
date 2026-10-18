@@ -13,7 +13,15 @@ export const LAT_TOP = 83
 // 底部占位带宽；-55 保留南美/新西兰最南端（合恩角 ~-56 以点阵粒度可忽略）。
 export const LAT_BOTTOM = -55
 export const WORLD_W = 360
-export const WORLD_D = LAT_TOP - LAT_BOTTOM
+
+// Web Mercator：x 仍为 1°/单位；y 按 Mercator 展开，赤道处 1°=1 单位，
+// 高纬纵向拉开——解决等距圆柱映射下高纬国家被横向拉扁的问题。
+// WORLD_D 不再是纬度差，而是投影后的世界高度。
+const MERCATOR_R = 180 / Math.PI
+const mercator = (lat: number): number => Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360))
+const Y_TOP = mercator(LAT_TOP)
+const Y_BOTTOM = mercator(LAT_BOTTOM)
+export const WORLD_D = (Y_TOP - Y_BOTTOM) * MERCATOR_R
 
 export function wrapDeg(delta: number): number {
   return (((delta % 360) + 540) % 360) - 180
@@ -24,11 +32,13 @@ export function wrapLon(lon: number): number {
 }
 
 export function latToY(lat: number): number {
-  return LAT_TOP - lat
+  const clamped = Math.max(LAT_BOTTOM, Math.min(LAT_TOP, lat))
+  return (Y_TOP - mercator(clamped)) * MERCATOR_R
 }
 
 export function yToLat(y: number): number {
-  return LAT_TOP - y
+  const m = Y_TOP - y / MERCATOR_R
+  return ((2 * Math.atan(Math.exp(m)) - Math.PI / 2) * 180) / Math.PI
 }
 
 export interface Cam2D {

@@ -10,7 +10,8 @@ const HEAT_LADDER: Rgb[] = [
   [226, 84, 84], // #e25454
 ]
 
-export const DOT_LAND = 'rgb(27,42,65)'
+// 地图/地球未命中国家点阵同色、同不透明度（用户裁定：沿用地图原透明度）。
+export const DOT_LAND = 'rgb(44,66,96)'
 
 /** 热力色（log10 计数 1→1000 三段线性插值；count≤0=底色）。 */
 function heatColor(count: number): Rgb {
@@ -82,4 +83,21 @@ export function arcEndpoints(
   origin: readonly [number, number],
 ): { startLat: number; startLng: number; endLat: number; endLng: number } {
   return { startLat: origin[1], startLng: origin[0], endLat: self[1], endLng: self[0] }
+}
+
+/** 中国领土口径：世界边界数据中 Taiwan 为独立条目，但威胁大屏按中国的一部分
+ *  展示/高亮/下钻（用户裁定 2026-10-18）。所有国家名消费点在查表前归一到
+ *  中国，计数在写入时合并。 */
+export function normalizeCountryName(name: string): string {
+  return name === 'Taiwan' || name === '台湾' ? '中国' : name
+}
+
+/** 国家计数归一+合并：台湾计数并入中国，避免 hover 中国时台湾计数缺失。 */
+export function aggregateCountryCounts(entries: readonly { name: string; count: number }[]): Map<string, number> {
+  const out = new Map<string, number>()
+  for (const e of entries) {
+    const key = normalizeCountryName(e.name)
+    out.set(key, (out.get(key) ?? 0) + e.count)
+  }
+  return out
 }

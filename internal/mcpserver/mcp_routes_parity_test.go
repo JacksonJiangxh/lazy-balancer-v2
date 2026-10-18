@@ -58,6 +58,9 @@ var mcpUncoveredRoutes = map[string]string{
 	"GET /api/v1/security/events/feed":                         "威胁大屏增量事件流（since_id 游标）：大屏 3 秒轮询专用形态；Agent 可用 list_security_events 按时间倒序等价查询",
 	"POST /api/v1/security/overview/threat-screen/site-detect": "大屏本站坐标自动检测：设置页显式按钮的出站探测（公网 IP 回显+本地 GeoIP 定位）；Agent 无面板表单回填场景，且出站请求不应由自动化触发冗余执行",
 	"GET /api/v1/security/overview/threat-screen/traffic":      "大屏实时流量快照代理（Caddy admin 计数器）：光流可视化专用 1-2s 轮询数据源；Agent 无消费场景",
+	"POST /api/v1/security/overview/threat-screen/collector":   "大屏流量采集租约申请/续租：浏览器生命周期内部动作，Agent 无 UI 会话场景且不应远程控制采集开关",
+	"GET /api/v1/security/overview/threat-screen/events":       "大屏逐请求正常流量增量事件流：前端光流可视化专用，Agent 无消费场景",
+	"DELETE /api/v1/security/overview/threat-screen/collector": "大屏流量采集租约释放：浏览器生命周期内部动作，Agent 无 UI 会话场景",
 	// —— IP 快捷弹框处置（历史新增：前端弹框专用；Agent 侧 get_ip_list →
 	//    update_ip_list 全量写回可达成移除，专用工具冗余）——
 	"POST /api/v1/security/ip-lists/:id/remove-ip": "IP 快捷弹框移除处置端点：从地址列表移除单条 IP；Agent 可用 get_ip_list+update_ip_list 组合等价完成",

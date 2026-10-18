@@ -29,32 +29,21 @@ func SecurityEventsRetentionMax() int {
 // securityEventsRetentionPolicy 是安全事件保留策略的解析结果（单源——清理体、
 // 行帽展示与面板摘要共用同一次读逻辑，避免多处口径分裂）。
 type securityEventsRetentionPolicy struct {
-	Days         int  // 生效保留天数
-	Max          int  // 生效行数上限
-	Months       int  // 旧通道月数（audit_retention_months；0=未配置）
-	ExplicitDays bool // security_events_retention_days 显式设置（>0）
+	Days int // 生效保留天数
+	Max  int // 生效行数上限
 }
 
 // SecurityEventsRetentionSummary 返回安全事件保留口径的可读摘要（日志统计面板
-// security_events 行展示）。历史问题：面板此前恒复用审计保留月数文案，显式
-// security_events_retention_days 设置被无视——摘要改由本函数单源生成；未显式
-// 设置时回退旧通道（audit_retention_months×30 天）的月表述。
+// security_events 行展示）。安全事件保留完全由本表两个配置项决定，不再读取
+// audit_retention_months（审计表独立口径）。
 func SecurityEventsRetentionSummary() string {
 	policy := securityEventsRetentionPolicyFromDB()
-	if policy.ExplicitDays {
-		return fmt.Sprintf("每日清理 · 保留 %d 天", policy.Days)
-	}
-	if policy.Months > 0 {
-		return fmt.Sprintf("每日清理 · 保留 %d 个月", policy.Months)
-	}
 	return fmt.Sprintf("每日清理 · 保留 %d 天", policy.Days)
 }
 
-// securityEventsRetentionPolicyFromDB 读取保留策略（v2.3.8 起双通道）：
-// ①显式设置 security_events_retention_days / security_events_row_cap（0=
-// 未设置走旧通道）；②旧通道 audit_retention_months×30 天 + 内置 100 万行
-// 上限。100/s 攻击压力设计（2026-10-17 用户裁定：保留期/条数均为用户可设，
-// 超限滚动更新）。
+// securityEventsRetentionPolicyFromDB 读取安全事件保留策略（独立配置项）：
+// security_events_retention_days / security_events_row_cap；0/缺省使用内置
+// 默认 90 天 / 100 万行。审计日志保留月数只作用于 audit_logs，不参与本表。
 func securityEventsRetentionPolicyFromDB() securityEventsRetentionPolicy {
 	policy := securityEventsRetentionPolicy{Days: securityEventsRetentionDefaultDays, Max: securityEventsRetentionDefaultMax}
 	database := db.DB
@@ -62,16 +51,12 @@ func securityEventsRetentionPolicyFromDB() securityEventsRetentionPolicy {
 		return policy
 	}
 	var explicitDays, explicitCap int
-	if err := database.QueryRow(`SELECT COALESCE(audit_retention_months,0), COALESCE(security_events_retention_days,0), COALESCE(security_events_row_cap,0) FROM global_config WHERE id=1`).Scan(&policy.Months, &explicitDays, &explicitCap); err != nil {
-		policy.Months = 0
+	if err := database.QueryRow(`SELECT COALESCE(security_events_retention_days,0), COALESCE(security_events_row_cap,0) FROM global_config WHERE id=1`).Scan(&explicitDays, &explicitCap); err != nil {
 		Logf("warn", "security events retention: read retention settings failed, falling back to %d days: %v", policy.Days, err)
 		return policy
 	}
 	if explicitDays > 0 {
 		policy.Days = explicitDays
-		policy.ExplicitDays = true
-	} else if policy.Months > 0 {
-		policy.Days = policy.Months * 30
 	}
 	if explicitCap > 0 {
 		policy.Max = explicitCap

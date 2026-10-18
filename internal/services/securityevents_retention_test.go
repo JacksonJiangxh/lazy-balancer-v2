@@ -38,7 +38,7 @@ func countSecurityEventsByType(t *testing.T, eventType string) int {
 func TestSecurityEventsRetentionCleanup_deletesEventsOlderThanConfiguredDays(t *testing.T) {
 	// Given: a 30-day retention window and events older and newer than the cutoff
 	setupSecurityEventsRetentionTestDB(t)
-	if _, err := db.DB.Exec(`UPDATE global_config SET audit_retention_months=1 WHERE id=1`); err != nil {
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=30 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, event_type) VALUES
@@ -66,7 +66,7 @@ func TestSecurityEventsRetentionCleanup_keepsAllBelowSafetyMax(t *testing.T) {
 	// 其与年龄裁剪共用批循环，分批/取消同构风险已由 batchesAgeDelete/
 	// stopsPromptly 两钉覆盖。
 	setupSecurityEventsRetentionTestDB(t)
-	if _, err := db.DB.Exec(`UPDATE global_config SET audit_retention_months=120 WHERE id=1`); err != nil {
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=3650 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 5; i++ {
@@ -92,7 +92,7 @@ func TestSecurityEventsRetentionCleanup_keepsAllBelowSafetyMax(t *testing.T) {
 func TestSecurityEventsRetentionSettings_appliesDefaultsWhenZero(t *testing.T) {
 	// Given: non-positive retention values stored in global_config
 	setupSecurityEventsRetentionTestDB(t)
-	if _, err := db.DB.Exec(`UPDATE global_config SET audit_retention_months=0 WHERE id=1`); err != nil {
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=0 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -109,7 +109,7 @@ func TestSecurityEventsRetentionCleanup_usesDefaultDaysWhenConfigZero(t *testing
 	// Given: zeroed retention config and events straddling the default 90-day window
 	// (GEO25-2: 默认从 30 天提升到与操作日志同口径的 90 天/3 个月)
 	setupSecurityEventsRetentionTestDB(t)
-	if _, err := db.DB.Exec(`UPDATE global_config SET audit_retention_months=0 WHERE id=1`); err != nil {
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=0 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, event_type) VALUES
@@ -133,7 +133,7 @@ func TestSecurityEventsRetentionCleanup_usesDefaultDaysWhenConfigZero(t *testing
 func TestSecurityEventsRetention_engineTriggerDeletesExpired(t *testing.T) {
 	// Given：引擎驱动路径 + 过期与保留事件。
 	setupSecurityEventsRetentionTestDB(t)
-	if _, err := db.DB.Exec(`UPDATE global_config SET audit_retention_months=1 WHERE id=1`); err != nil {
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=30 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, event_type) VALUES
@@ -168,7 +168,7 @@ func TestSecurityEventsRetentionCleanup_stopsPromptlyWhenContextCanceled(t *test
 	// 种子随批次缩放，保证「首批后立即取消」语义不依赖具体批大小）+ 已取消的 ctx
 	seedTotal := 3 * securityEventsRetentionDeleteBatch
 	setupSecurityEventsRetentionTestDB(t)
-	if _, err := db.DB.Exec(`UPDATE global_config SET audit_retention_months=1 WHERE id=1`); err != nil {
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=30 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	var sb strings.Builder
@@ -218,7 +218,7 @@ func TestSecurityEventsRetentionCleanup_batchesAgeDelete(t *testing.T) {
 	// 小于单批上限，实际只走一次 DELETE，「分批」断言恒成立却从未覆盖批循环。
 	seedTotal := securityEventsRetentionDeleteBatch + 1000
 	setupSecurityEventsRetentionTestDB(t)
-	if _, err := db.DB.Exec(`UPDATE global_config SET audit_retention_months=1 WHERE id=1`); err != nil {
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=30 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	var sb strings.Builder
@@ -269,7 +269,7 @@ func countRollupRowsBefore(t *testing.T, cutoff string) int {
 func TestSecurityEventRollupRetention_batches(t *testing.T) {
 	// Given：40 天前的 150 个分钟组（每行 1 条）+ 昨天的分钟组 + 当前分钟
 	setupSecurityEventsRetentionTestDB(t)
-	if _, err := db.DB.Exec(`UPDATE global_config SET audit_retention_months=1 WHERE id=1`); err != nil {
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=30 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	old := time.Now().UTC().AddDate(0, 0, -40).Truncate(time.Minute)

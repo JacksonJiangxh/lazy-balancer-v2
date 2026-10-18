@@ -309,6 +309,7 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	       COALESCE(server_map_lat,0) as server_map_lat,
 	       COALESCE(server_map_lon,0) as server_map_lon,
 	       COALESCE(threat_screen_mode,'map') as threat_screen_mode,
+	       COALESCE(threat_traffic_sample_n,8) as threat_traffic_sample_n,
 	       COALESCE(security_events_retention_days,0) as security_events_retention_days,
 	       COALESCE(security_events_row_cap,0) as security_events_row_cap,
 	       is_master, COALESCE(master_url, '') as master_url, sync_interval,
@@ -328,7 +329,7 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 		&cfg.UpstreamKeepaliveTimeout, &cfg.ProxyDialTimeout, &cfg.ProxyResponseHeaderTimeout, &cfg.ProxyReadTimeout, &cfg.ProxyWriteTimeout, &cfg.ProxyStreamTimeout, &cfg.ProxyFlushInterval, &cfg.ProxyStreamCloseDelay,
 		&cfg.ServerTokensHidden, &cfg.TaskLogSizeMB, &cfg.AuditLogSizeMB, &cfg.RuntimeLogSizeMB, &cfg.AccessLogJSON, &cfg.AccessLogFormat, &cfg.AuditRetentionMonths, &cfg.JWTExpireMinutes, &cfg.Timezone, &cfg.GitHubProxyURL, &cfg.GitHubToken, &cfg.MFAWriteGuard, &cfg.MFALockoutEnabled,
 		&cfg.TrustedProxyEnabled, &cfg.TrustedProxyRanges, &cfg.TrustedProxyRangeRefs, &cfg.TrustedProxyHeaders, &cfg.TrustedProxyStrict,
-		&cfg.ServerMapLat, &cfg.ServerMapLon, &cfg.ThreatScreenMode,
+		&cfg.ServerMapLat, &cfg.ServerMapLon, &cfg.ThreatScreenMode, &cfg.ThreatTrafficSampleN,
 		&cfg.SecurityEventsRetentionDays, &cfg.SecurityEventsRowCap,
 		&cfg.IsMaster, &cfg.MasterURL, &cfg.SyncInterval, &cfg.LastSync, &cfg.UpdatedAt)
 
@@ -595,6 +596,11 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "威胁大屏模式仅支持 map 或 globe"})
 		return
 	}
+	// 大屏逐请求流量采样：-1=自适应，0=关闭，1=全量，4/8=1/N。
+	if req.ThreatTrafficSampleN != nil && (*req.ThreatTrafficSampleN < -1 || *req.ThreatTrafficSampleN > 64) {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "大屏流量采样必须在 -1 到 64 之间"})
+		return
+	}
 	// 安全事件保留（v2.3.8）：天数 0-3650、行数上限 0-1 亿（0=自动通道）
 	if req.SecurityEventsRetentionDays != nil && (*req.SecurityEventsRetentionDays < 0 || *req.SecurityEventsRetentionDays > 3650) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "安全事件保留天数必须在 0 到 3650 之间"})
@@ -721,6 +727,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 				server_map_lat = COALESCE(?, server_map_lat),
 				server_map_lon = COALESCE(?, server_map_lon),
 				threat_screen_mode = COALESCE(?, threat_screen_mode),
+				threat_traffic_sample_n = COALESCE(?, threat_traffic_sample_n),
 				security_events_retention_days = COALESCE(?, security_events_retention_days),
 				security_events_row_cap = COALESCE(?, security_events_row_cap),
 				updated_at = datetime('now')
@@ -731,7 +738,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		req.UpstreamKeepaliveTimeout, req.ProxyDialTimeout, req.ProxyResponseHeaderTimeout, req.ProxyReadTimeout, req.ProxyWriteTimeout, req.ProxyStreamTimeout, req.ProxyFlushInterval, req.ProxyStreamCloseDelay,
 		req.ServerTokensHidden, req.TaskLogSizeMB, req.AuditLogSizeMB, req.RuntimeLogSizeMB, req.AccessLogJSON, req.AccessLogFormat, req.AccessLogFormat, req.AuditRetentionMonths, req.JWTExpireMinutes, req.Timezone, req.GitHubProxyURL, req.GitHubToken, req.GitHubToken, req.MFAWriteGuard, req.MFALockoutEnabled,
 		req.TrustedProxyEnabled, req.TrustedProxyRanges, req.TrustedProxyRangeRefs, req.TrustedProxyHeaders, req.TrustedProxyStrict,
-		req.ServerMapLat, req.ServerMapLon, req.ThreatScreenMode, req.SecurityEventsRetentionDays, req.SecurityEventsRowCap)
+		req.ServerMapLat, req.ServerMapLon, req.ThreatScreenMode, req.ThreatTrafficSampleN, req.SecurityEventsRetentionDays, req.SecurityEventsRowCap)
 	if err != nil {
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("配置写入数据库失败", err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "配置写入数据库失败"})

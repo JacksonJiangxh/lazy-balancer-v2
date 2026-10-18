@@ -22,6 +22,15 @@ func resetTrafficState(t *testing.T) {
 	trafficMu.Unlock()
 	trafficSecondState.Store(0)
 	trafficSampleN.Store(1)
+	trafficLeasesMu.Lock()
+	trafficLeases = map[string]trafficLease{}
+	if trafficLeaseTimer != nil {
+		trafficLeaseTimer.Stop()
+		trafficLeaseTimer = nil
+	}
+	// 旧测试直接调用 trafficRecord，默认视为采集开启；租约测试会显式关闭。
+	trafficCollectorEnabled.Store(true)
+	trafficLeasesMu.Unlock()
 }
 
 func TestTrafficRecord_attackNormalBuckets(t *testing.T) {
@@ -191,11 +200,11 @@ func TestTrafficAdminRoute_registerOnceAndServe(t *testing.T) {
 	// 2 条都必须失败。
 	resetTrafficState(t)
 	routes := (TrafficStatsAdmin{}).Routes()
-	if len(routes) != 1 {
-		t.Fatalf("Routes()=%d, want exactly 1", len(routes))
+	if len(routes) != 3 {
+		t.Fatalf("Routes()=%d, want exactly 3", len(routes))
 	}
-	if routes[0].Pattern != "/lb/traffic-stats" {
-		t.Fatalf("route pattern=%q, want /lb/traffic-stats", routes[0].Pattern)
+	if routes[0].Pattern != "/lb/traffic-stats" || routes[1].Pattern != "/lb/traffic-collector" || routes[2].Pattern != "/lb/traffic-events" {
+		t.Fatalf("route patterns=%q/%q/%q", routes[0].Pattern, routes[1].Pattern, routes[2].Pattern)
 	}
 
 	// serveTrafficStats 直出快照（HTTP 形状）

@@ -19,6 +19,7 @@ import {
   LAT_TOP,
   LAT_BOTTOM,
   WORLD_D,
+  latToY,
   WORLD_W,
   DRILL_UNIFIED_ZOOM,
   worldToScreen,
@@ -41,7 +42,7 @@ const H = 900
 const SITE: [number, number] = [108.9, 34]
 const CAM: Cam2D = {
   camX: SITE[0],
-  camY: LAT_TOP - SITE[1],
+  camY: latToY(SITE[1]),
   zoom: 3,
   width: W,
   height: H,
@@ -115,7 +116,9 @@ test('④下钻口径：统一倍率=9、主环取景中心为 bbox 中心、南
   // 总览 zoom 下可视高 ≥ 世界高 → 相机恒居中；下钻倍率下越界拖动被钳在
   // [visH/2, WORLD_D - visH/2]，画面永不越出 -55° 南界。
   assert.equal(LAT_BOTTOM, -55)
-  assert.equal(WORLD_D, LAT_TOP - LAT_BOTTOM)
+  // Mercator：世界高不再是纬度差，而是投影后高度（高纬纵向展开）。
+  assert.ok(WORLD_D > LAT_TOP - LAT_BOTTOM, `Mercator 世界高异常: ${WORLD_D}`)
+  assert.ok(Math.abs(WORLD_D - (latToY(LAT_BOTTOM) - latToY(LAT_TOP))) < 1e-9, 'WORLD_D 与 latToY 投影不同源')
   const overviewCam = { camX: 0, camY: WORLD_D - 1, zoom: 3, width: W, height: H }
   assert.ok(H / 3 >= WORLD_D)
   assert.equal(panBy(overviewCam, 0, -100000).camY, WORLD_D / 2, '世界完整可见时相机必须纵向居中')

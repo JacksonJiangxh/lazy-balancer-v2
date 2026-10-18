@@ -31,9 +31,16 @@
             <el-input-number v-model="settings.runtime_log_size_mb" :disabled="isReadOnly" :min="1" :max="1024" controls-position="right" style="width: 120px;" />
             <span class="form-tip-inline">MB，轮转阈值</span>
           </el-form-item>
-          <el-form-item label="日志保留">
+          <el-form-item label="操作审计保留">
             <el-input-number v-model="settings.audit_retention_months" :disabled="isReadOnly" :min="1" :max="12" controls-position="right" style="width: 120px;" />
-            <span class="form-tip-inline">个月，超期自动清理</span>
+            <span class="form-tip-inline">个月，仅操作审计日志超期自动清理</span>
+          </el-form-item>
+          <el-form-item label="安全事件保留">
+            <el-input-number v-model="seRetentionDays" :disabled="isReadOnly" :min="1" :max="3650" :step="30" controls-position="right" style="width: 120px;" />
+            <span class="form-tip-inline">天</span>
+            <el-input-number v-model="seRowCap" :disabled="isReadOnly" :min="1000" :max="100000000" :step="100000" controls-position="right" style="width: 170px; margin-left: 10px;" />
+            <span class="form-tip-inline">行数上限</span>
+            <div class="form-tip-line">安全事件日志滚动保留：超出保留天数或行数上限时按最旧优先滚动删除。默认 90 天 / 1,000,000 行；高攻击流量部署可按需上调。</div>
           </el-form-item>
           <el-form-item label="登录过期">
             <el-input-number v-model="settings.jwt_expire_minutes" :disabled="isReadOnly" :min="1" :max="1440" controls-position="right" style="width: 120px;" />
@@ -78,14 +85,15 @@
             </el-radio-group>
             <div class="form-tip-line">威胁大屏中央攻击流光的呈现方式；进入大屏时生效（已打开的大屏重新进入后切换）</div>
           </el-form-item>
-          <el-form-item label="安全事件保留">
-            <el-input-number v-model="seRetentionDays" :disabled="isReadOnly" :min="0" :max="3650" :step="30" controls-position="right" style="width: 130px;" />
-            <span class="form-tip-inline">天</span>
-            <el-input-number v-model="seRowCap" :disabled="isReadOnly" :min="0" :max="100000000" :step="100000" controls-position="right" style="width: 170px; margin-left: 10px;" />
-            <span class="form-tip-inline">行数上限</span>
-            <div class="form-tip-line">安全事件滚动保留：超出保留天数或行数上限时按最旧优先滚动删除；0 表示自动（跟随审计日志保留月数 / 内置 100 万行）。高攻击流量部署可按需上调</div>
+          <el-form-item label="流量采样">
+            <el-select v-model="trafficSampleN" :disabled="isReadOnly" style="width: 160px">
+              <el-option label="自适应（推荐）" :value="-1" />
+              <el-option label="全量（不采样）" :value="1" />
+              <el-option label="关闭逐请求光流" :value="0" />
+            </el-select>
+            <div class="form-tip-line">大屏正常请求光流的逐请求采样；自适应会根据每秒事件量在 1/4、1/8 间自动切换。关闭后仅保留聚合流量统计，不影响安全事件日志。</div>
           </el-form-item>
-          <el-form-item label="GitHub 加速">
+          <el-form-item label="下载代理">
             <el-select v-model="githubProxyUrl" :disabled="isReadOnly || !githubProxyLoaded" style="width: 160px" :placeholder="githubProxyLoaded ? '选择代理' : '未加载'">
               <el-option
                 v-for="option in githubProxyOptions"
@@ -94,10 +102,10 @@
                 :value="option.value"
               />
             </el-select>
-            <span v-if="githubProxyLoaded" class="form-tip-inline">CRS 规则库与 IP2Region 的下载代理</span>
+            <span v-if="githubProxyLoaded" class="form-tip-inline">GitHub 下载代理，加速 CRS 规则库与 IP2Region</span>
             <span v-else class="form-tip-inline">代理设置未加载：已禁用编辑且保存不会写入该项</span>
           </el-form-item>
-          <el-form-item label="GitHub 令牌">
+          <el-form-item label="访问令牌">
             <el-input
               v-model="githubTokenInput"
               type="password"
@@ -120,7 +128,7 @@
             <el-switch v-model="settings.mfa_lockout_enabled" :disabled="isReadOnly" />
             <span class="form-tip-inline">密码或验证码失败 5 次锁 10 分钟（关闭则不锁定）</span>
           </el-form-item>
-          <el-form-item label="强制 HTTPS">
+          <el-form-item label="强制加密">
             <el-switch v-model="adminTls.enabled" :disabled="isReadOnly" @change="onAdminTlsToggle" />
             <el-button v-if="adminTls.enabled" size="small" style="margin-left: 8px;" @click="openAdminTlsDialog">配置证书</el-button>
             <el-text v-if="adminTlsDirty" type="warning" size="small" style="margin-left: 8px">已暂存，点击下方保存后生效</el-text>
@@ -1156,6 +1164,7 @@ interface BasicSettingsConfig {
   threat_screen_mode?: string
   security_events_retention_days?: number
   security_events_row_cap?: number
+  threat_traffic_sample_n?: number
   server_map_lon?: number
   jwt_expire_minutes: number
   timezone: string
@@ -1270,13 +1279,17 @@ const siteDetecting = ref(false)
 // v2.3.8 威胁大屏中央视觉模式（map/globe）：独立持有，父组件配置装载后经
 // watch 同步（settings 为父级响应式对象）
 const threatScreenMode = ref<'map' | 'globe'>('map')
-// v2.3.8 安全事件滚动保留（0=自动）
-const seRetentionDays = ref(0)
-const seRowCap = ref(0)
+// 安全事件滚动保留：默认显式 90 天 / 1,000,000 行（不再用 0=自动）
+const seRetentionDays = ref(90)
+const seRowCap = ref(1_000_000)
+const trafficSampleN = ref(-1)
 watch(() => settings.value.threat_screen_mode, (v) => { threatScreenMode.value = v === 'globe' ? 'globe' : 'map' }, { immediate: true })
 watch(() => [settings.value.security_events_retention_days, settings.value.security_events_row_cap] as const, ([d, c]) => {
-  seRetentionDays.value = d ?? 0
-  seRowCap.value = c ?? 0
+  seRetentionDays.value = d && d > 0 ? d : 90
+  seRowCap.value = c && c > 0 ? c : 1_000_000
+}, { immediate: true })
+watch(() => settings.value.threat_traffic_sample_n, (v) => {
+  trafficSampleN.value = v === -1 || v === 0 || v === 1 ? v : -1
 }, { immediate: true })
 async function detectSiteLocation(): Promise<void> {
   if (siteDetecting.value) return
@@ -1494,6 +1507,7 @@ const handleSave = async () => {
       threat_screen_mode: threatScreenMode.value,
       security_events_retention_days: seRetentionDays.value,
       security_events_row_cap: seRowCap.value,
+      threat_traffic_sample_n: trafficSampleN.value,
       mfa_write_guard: settings.value.mfa_write_guard,
       mfa_lockout_enabled: settings.value.mfa_lockout_enabled,
       // 未加载时省略该键（后端保持现值）——不得以默认值覆盖用户选择

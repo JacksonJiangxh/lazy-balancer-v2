@@ -997,41 +997,46 @@ func runMigrations() error {
 		// 受信网段引用名单（2026-10-12）：JSON 数组文本，存 security_ip_lists 的
 		// id 列表（镜像策略 ip_acl_list_refs 形态）；渲染与内联 CIDR 合并投影
 		// （2026-10-15 热路径化：tp.txt/lb_file 文件源，内容变化零 /load）。
-		"global_config.trusted_proxy_range_refs":       "TEXT NOT NULL DEFAULT '[]'",
-		"global_config.trusted_proxy_headers":          "TEXT NOT NULL DEFAULT '[]'",
-		"global_config.trusted_proxy_strict":           "INTEGER NOT NULL DEFAULT 1",
-		"global_config.default_ca_provider_id":         "INTEGER DEFAULT 0",
-		"global_config.cert_renewal_days":              "INTEGER DEFAULT 30",
-		"global_config.cert_renewal_attempts":          "INTEGER DEFAULT 5",
-		"global_config.task_log_size_mb":               "INTEGER DEFAULT 10",
-		"global_config.audit_log_size_mb":              "INTEGER DEFAULT 10",
-		"global_config.caddy_apply_error":              "TEXT DEFAULT ''",
-		"global_config.runtime_log_size_mb":            "INTEGER DEFAULT 100",
-		"global_config.acme_email":                     "VARCHAR(255)",
-		"global_config.cert_expiry_days":               "INTEGER DEFAULT 30",
-		"global_config.caddy_log_level":                "VARCHAR(10) DEFAULT 'info'",
-		"global_config.caddy_log_size_mb":              "INTEGER NOT NULL DEFAULT 100",
-		"global_config.request_body_max_size_mb":       "INTEGER NOT NULL DEFAULT 128",
-		"global_config.http_read_timeout":              "INTEGER NOT NULL DEFAULT 60",
-		"global_config.http_write_timeout":             "INTEGER NOT NULL DEFAULT 60",
-		"global_config.http_idle_timeout":              "INTEGER NOT NULL DEFAULT 120",
-		"global_config.upstream_keepalive_timeout":     "INTEGER DEFAULT 0",
-		"global_config.server_tokens_hidden":           "BOOLEAN DEFAULT FALSE",
-		"global_config.admin_tls_enabled":              "BOOLEAN DEFAULT 0",
-		"global_config.admin_tls_mode":                 "VARCHAR(20) DEFAULT 'selfsigned'",
-		"global_config.admin_tls_cert":                 "TEXT DEFAULT ''",
-		"global_config.admin_tls_key":                  "TEXT DEFAULT ''",
-		"global_config.access_log_json":                "BOOLEAN DEFAULT TRUE",
-		"global_config.access_log_format":              "TEXT DEFAULT ''",
-		"global_config.audit_retention_months":         "INTEGER DEFAULT 3",
-		"global_config.jwt_expire_minutes":             "INTEGER DEFAULT 20",
-		"global_config.timezone":                       "VARCHAR(50) DEFAULT 'Asia/Shanghai'",
-		"global_config.github_proxy_url":               "TEXT NOT NULL DEFAULT 'https://v4.gh-proxy.org/'",
-		"global_config.github_token":                   "TEXT NOT NULL DEFAULT ''",
-		"global_config.server_map_lat":                 "REAL NOT NULL DEFAULT 0",
-		"global_config.threat_screen_mode":             "TEXT NOT NULL DEFAULT 'map'",
-		"global_config.security_events_retention_days": "INTEGER NOT NULL DEFAULT 0",
-		"global_config.security_events_row_cap":        "INTEGER NOT NULL DEFAULT 0",
+		"global_config.trusted_proxy_range_refs":                "TEXT NOT NULL DEFAULT '[]'",
+		"global_config.trusted_proxy_headers":                   "TEXT NOT NULL DEFAULT '[]'",
+		"global_config.trusted_proxy_strict":                    "INTEGER NOT NULL DEFAULT 1",
+		"global_config.default_ca_provider_id":                  "INTEGER DEFAULT 0",
+		"global_config.cert_renewal_days":                       "INTEGER DEFAULT 30",
+		"global_config.cert_renewal_attempts":                   "INTEGER DEFAULT 5",
+		"global_config.task_log_size_mb":                        "INTEGER DEFAULT 10",
+		"global_config.audit_log_size_mb":                       "INTEGER DEFAULT 10",
+		"global_config.caddy_apply_error":                       "TEXT DEFAULT ''",
+		"global_config.runtime_log_size_mb":                     "INTEGER DEFAULT 100",
+		"global_config.acme_email":                              "VARCHAR(255)",
+		"global_config.cert_expiry_days":                        "INTEGER DEFAULT 30",
+		"global_config.caddy_log_level":                         "VARCHAR(10) DEFAULT 'info'",
+		"global_config.caddy_log_size_mb":                       "INTEGER NOT NULL DEFAULT 100",
+		"global_config.request_body_max_size_mb":                "INTEGER NOT NULL DEFAULT 128",
+		"global_config.http_read_timeout":                       "INTEGER NOT NULL DEFAULT 60",
+		"global_config.http_write_timeout":                      "INTEGER NOT NULL DEFAULT 60",
+		"global_config.http_idle_timeout":                       "INTEGER NOT NULL DEFAULT 120",
+		"global_config.upstream_keepalive_timeout":              "INTEGER DEFAULT 0",
+		"global_config.server_tokens_hidden":                    "BOOLEAN DEFAULT FALSE",
+		"global_config.admin_tls_enabled":                       "BOOLEAN DEFAULT 0",
+		"global_config.admin_tls_mode":                          "VARCHAR(20) DEFAULT 'selfsigned'",
+		"global_config.admin_tls_cert":                          "TEXT DEFAULT ''",
+		"global_config.admin_tls_key":                           "TEXT DEFAULT ''",
+		"global_config.access_log_json":                         "BOOLEAN DEFAULT TRUE",
+		"global_config.access_log_format":                       "TEXT DEFAULT ''",
+		"global_config.audit_retention_months":                  "INTEGER DEFAULT 3",
+		"global_config.jwt_expire_minutes":                      "INTEGER DEFAULT 20",
+		"global_config.timezone":                                "VARCHAR(50) DEFAULT 'Asia/Shanghai'",
+		"global_config.github_proxy_url":                        "TEXT NOT NULL DEFAULT 'https://v4.gh-proxy.org/'",
+		"global_config.github_token":                            "TEXT NOT NULL DEFAULT ''",
+		"global_config.server_map_lat":                          "REAL NOT NULL DEFAULT 0",
+		"global_config.threat_screen_mode":                      "TEXT NOT NULL DEFAULT 'map'",
+		"global_config.threat_traffic_sample_n":                 "INTEGER NOT NULL DEFAULT 4",
+		"global_config.threat_traffic_sample_migrated4":         "INTEGER NOT NULL DEFAULT 0",
+		"global_config.threat_traffic_sample_adaptive_migrated": "INTEGER NOT NULL DEFAULT 0",
+		// 安全事件保留显式化：默认 90 天 / 100 万行由配置本身承载，
+		// 不再用 0 隐式映射服务层写死默认值。
+		"global_config.security_events_retention_days": "INTEGER NOT NULL DEFAULT 90",
+		"global_config.security_events_row_cap":        "INTEGER NOT NULL DEFAULT 1000000",
 		"global_config.server_map_lon":                 "REAL NOT NULL DEFAULT 0",
 		"lb_rules.log_enabled":                         "BOOLEAN DEFAULT 0",
 		"lb_rules.custom_routes_enabled":               "BOOLEAN NOT NULL DEFAULT 0",
@@ -1167,6 +1172,15 @@ func runMigrations() error {
 	// D403-历史问题 结构性兜底：上方整表重建迁移若以陈旧 DDL 重建而丢列，这里幂等
 	// 补齐收敛——重建迁移自身漏列不再造成列永久丢失（数据按列默认值回填）。
 	if err := ensureNewColumns(newColumns, newColumnBackfills); err != nil {
+		return err
+	}
+	if err := migrateSecurityEventRetentionDefaults(); err != nil {
+		return err
+	}
+	if err := migrateThreatTrafficSampleDefault4(); err != nil {
+		return err
+	}
+	if err := migrateThreatTrafficSampleAdaptive(); err != nil {
 		return err
 	}
 	// 内置备选拦截页（2026-09-25 裁定）：必须在 ensureNewColumns 之后执行——存量库
@@ -2234,6 +2248,54 @@ func migrateCanonicalDomains() error {
 	}
 	committed = true
 	return nil
+}
+
+// migrateThreatTrafficSampleAdaptive 一次性把旧的固定 4/8 默认切到自适应；
+// marker 置 1 后用户后续选择 4/8 不再被覆盖。
+func migrateThreatTrafficSampleAdaptive() error {
+	var done int
+	if err := DB.QueryRow(`SELECT COALESCE(threat_traffic_sample_adaptive_migrated,0) FROM global_config WHERE id=1`).Scan(&done); err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if done != 0 {
+		return nil
+	}
+	if _, err := DB.Exec(`UPDATE global_config
+		SET threat_traffic_sample_n = CASE WHEN COALESCE(threat_traffic_sample_n,0) IN (4,8) THEN -1 ELSE threat_traffic_sample_n END,
+		    threat_traffic_sample_adaptive_migrated = 1
+		WHERE id = 1`); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateThreatTrafficSampleDefault4 一次性把旧默认 8 调为 1/4；用户后续选择
+// 8 时 marker 已置 1，不再被启动迁移覆盖。
+func migrateThreatTrafficSampleDefault4() error {
+	var done int
+	if err := DB.QueryRow(`SELECT COALESCE(threat_traffic_sample_migrated4,0) FROM global_config WHERE id=1`).Scan(&done); err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if done != 0 {
+		return nil
+	}
+	if _, err := DB.Exec(`UPDATE global_config
+		SET threat_traffic_sample_n = CASE WHEN COALESCE(threat_traffic_sample_n,8) = 8 THEN 4 ELSE threat_traffic_sample_n END,
+		    threat_traffic_sample_migrated4 = 1
+		WHERE id = 1`); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateSecurityEventRetentionDefaults 把旧库的 0=自动 语义回填为显式默认值：
+// 保留天数 90 天、行数上限 100 万。配置项不再迁就服务层写死默认值。
+func migrateSecurityEventRetentionDefaults() error {
+	_, err := DB.Exec(`UPDATE global_config
+		SET security_events_retention_days = CASE WHEN COALESCE(security_events_retention_days,0) = 0 THEN 90 ELSE security_events_retention_days END,
+		    security_events_row_cap = CASE WHEN COALESCE(security_events_row_cap,0) = 0 THEN 1000000 ELSE security_events_row_cap END
+		WHERE id = 1`)
+	return err
 }
 
 // ensureNewColumns 按清单逐列补齐（幂等：列已存在零命中）。D403-历史问题 提取自

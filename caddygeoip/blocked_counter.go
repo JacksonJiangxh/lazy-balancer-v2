@@ -121,10 +121,22 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		if timingID != "" {
 			auditTimingClose(timingID)
 		}
+		// 采集关闭时只做一次 atomic load：不读 GeoIP 变量、不做 map/原子计数。
+		// 安全事件日志与 timingClose 仍始终执行。
+		if !trafficCollectorActive() {
+			return
+		}
 		// 国名只取 geoip handler 写入的 Caddy 服务端变量。无 GeoIP handler
 		// 时变量缺席即跳过，客户端自带的同名请求头永不可信。
 		country, _ := caddyhttp.GetVar(r.Context(), "geoip.country_name").(string)
 		trafficRecord(country, isSecurityBlock)
+		if !isSecurityBlock && country != "" {
+			province, _ := caddyhttp.GetVar(r.Context(), "geoip.province").(string)
+			if country != "中国" {
+				province = ""
+			}
+			trafficEventRecord(country, province)
+		}
 	}()
 
 	err := next.ServeHTTP(w, r)

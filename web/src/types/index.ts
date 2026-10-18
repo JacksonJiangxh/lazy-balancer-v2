@@ -280,6 +280,7 @@ export interface GlobalConfigData {
   server_map_lat: number
   server_map_lon: number
   threat_screen_mode: string
+  threat_traffic_sample_n: number
   security_events_retention_days: number
   security_events_row_cap: number
   jwt_expire_minutes: number

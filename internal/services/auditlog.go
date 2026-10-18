@@ -70,6 +70,7 @@ var ConfigFieldSections = map[string]string{
 	"threat_screen_mode":             "基础设置",
 	"security_events_retention_days": "基础设置",
 	"security_events_row_cap":        "基础设置",
+	"threat_traffic_sample_n":        "基础设置",
 }
 
 func GetConfigSection(field string) string {

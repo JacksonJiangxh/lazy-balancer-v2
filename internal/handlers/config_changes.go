@@ -54,6 +54,7 @@ type configSnapshot struct {
 	ServerMapLat                float64
 	ServerMapLon                float64
 	ThreatScreenMode            string
+	ThreatTrafficSampleN        int
 	SecurityEventsRetentionDays int
 	SecurityEventsRowCap        int
 }
@@ -92,7 +93,7 @@ func loadConfigSnapshot() (configSnapshot, error) {
 		COALESCE(mfa_write_guard,0),
 		COALESCE(mfa_lockout_enabled,0),
 		COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_ranges,'[]'), COALESCE(trusted_proxy_range_refs,'[]'), COALESCE(trusted_proxy_headers,'[]'), COALESCE(trusted_proxy_strict,1),
-		COALESCE(server_map_lat,0), COALESCE(server_map_lon,0), COALESCE(threat_screen_mode,'map'), COALESCE(security_events_retention_days,0), COALESCE(security_events_row_cap,0)
+		COALESCE(server_map_lat,0), COALESCE(server_map_lon,0), COALESCE(threat_screen_mode,'map'), COALESCE(threat_traffic_sample_n,8), COALESCE(security_events_retention_days,0), COALESCE(security_events_row_cap,0)
 		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays).Scan(
 		&old.ACMEEmail, &old.DNSProvider, &old.DNSCredentials,
 		&old.CertExpiryDays, &old.CertRenewalDays, &old.CertRenewalAttempts,
@@ -108,7 +109,7 @@ func loadConfigSnapshot() (configSnapshot, error) {
 		&old.GitHubToken,
 		&old.MFAWriteGuard, &old.MFALockoutEnabled,
 		&old.TrustedProxyEnabled, &old.TrustedProxyRanges, &old.TrustedProxyRangeRefs, &old.TrustedProxyHeaders, &old.TrustedProxyStrict,
-		&old.ServerMapLat, &old.ServerMapLon, &old.ThreatScreenMode, &old.SecurityEventsRetentionDays, &old.SecurityEventsRowCap)
+		&old.ServerMapLat, &old.ServerMapLon, &old.ThreatScreenMode, &old.ThreatTrafficSampleN, &old.SecurityEventsRetentionDays, &old.SecurityEventsRowCap)
 	return old, err
 }
 
@@ -153,6 +154,7 @@ func planConfigChanges(req models.UpdateConfigRequest, old configSnapshot) confi
 	add("server_map_lat", "大屏本站坐标", req.ServerMapLat != nil && *req.ServerMapLat != old.ServerMapLat)
 	add("server_map_lon", "大屏本站坐标", req.ServerMapLon != nil && *req.ServerMapLon != old.ServerMapLon)
 	add("threat_screen_mode", "大屏视觉模式", req.ThreatScreenMode != nil && *req.ThreatScreenMode != old.ThreatScreenMode)
+	add("threat_traffic_sample_n", "大屏流量采样", req.ThreatTrafficSampleN != nil && *req.ThreatTrafficSampleN != old.ThreatTrafficSampleN)
 	add("security_events_retention_days", "安全事件保留天数", req.SecurityEventsRetentionDays != nil && *req.SecurityEventsRetentionDays != old.SecurityEventsRetentionDays)
 	add("security_events_row_cap", "安全事件行数上限", req.SecurityEventsRowCap != nil && *req.SecurityEventsRowCap != old.SecurityEventsRowCap)
 	add("jwt_expire_minutes", "登录过期时间", req.JWTExpireMinutes != nil && *req.JWTExpireMinutes != old.JWTExpireMinutes)

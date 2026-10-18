@@ -687,6 +687,10 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				business.GET("/security/overview/threat-screen", h.GetSecurityThreatScreen)
 				// 实时流量快照代理（Plan B 全请求光流数据源，1-2s 轮询）
 				business.GET("/security/overview/threat-screen/traffic", h.GetThreatScreenTraffic)
+				// 大屏流量采集租约：打开屏幕申请、关闭释放；无租约时 Caddy 跳过采集。
+				business.POST("/security/overview/threat-screen/collector", h.ControlThreatScreenCollector)
+				business.DELETE("/security/overview/threat-screen/collector", h.ControlThreatScreenCollector)
+				business.GET("/security/overview/threat-screen/events", h.GetThreatScreenFlowEvents)
 				business.GET("/security/events/feed", h.GetSecurityEventFeed)
 				business.GET("/security/rate-limit-blocks", h.GetSecurityRateLimitBlocks)
 				business.GET("/security/events", h.ListSecurityEvents)

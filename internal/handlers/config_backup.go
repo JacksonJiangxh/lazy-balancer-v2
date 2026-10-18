@@ -2096,6 +2096,12 @@ func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]
 			}
 		}
 	}
+	if raw, exists := config["threat_traffic_sample_n"]; exists && raw != nil {
+		value, ok := backupInteger(raw)
+		if !ok || value < -1 || value > 64 {
+			return fmt.Errorf("备份的大屏流量采样必须是 -1 到 64 之间的整数")
+		}
+	}
 	for _, item := range []struct {
 		key   string
 		max   int

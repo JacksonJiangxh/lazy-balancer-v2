@@ -21,6 +21,7 @@ package caddygeoip
 
 import (
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -146,7 +147,7 @@ func trafficRecord(country string, attack bool) {
 func trafficSnapshotJSON() []byte {
 	trafficMu.RLock()
 	defer trafficMu.RUnlock()
-	b := []byte(`{"countries":{`)
+	b := []byte(`{"enabled":` + strconv.FormatBool(trafficCollectorActive()) + `,"countries":{`)
 	first := true
 	for country, e := range trafficCountries {
 		if first {
@@ -230,6 +231,14 @@ func (TrafficStatsAdmin) Routes() []caddy.AdminRoute {
 		{
 			Pattern: "/lb/traffic-stats",
 			Handler: caddy.AdminHandlerFunc(serveTrafficStats),
+		},
+		{
+			Pattern: "/lb/traffic-collector",
+			Handler: caddy.AdminHandlerFunc(serveTrafficCollector),
+		},
+		{
+			Pattern: "/lb/traffic-events",
+			Handler: caddy.AdminHandlerFunc(serveTrafficEvents),
 		},
 	}
 }

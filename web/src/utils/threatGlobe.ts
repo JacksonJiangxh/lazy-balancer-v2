@@ -12,10 +12,10 @@ import type { Centroid } from '@/utils/countryCentroids'
 import { COUNTRY_CENTROIDS, FALLBACK_CENTROID } from '@/utils/countryCentroids'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
-import type { Admin1Province } from '@/utils/admin1Provinces'
 import { loadAdmin1Tables, loadedAdmin1Tables } from '@/utils/admin1Loader'
-import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints } from '@/utils/threatShared'
+import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, adminShortName, normalizeCountryName, aggregateCountryCounts } from '@/utils/threatShared'
 import type { ThreatScene, ThreatSceneOptions, CountryHeat } from '@/utils/threatScene'
+import { FLOW_ATTACK_ARC_COLORS, FLOW_NORMAL_ARC_COLORS, FLOW_FLIGHT_MS, flowArcLabel, flowAttackWidth, flowNormalWidth } from '@/utils/threatTheme'
 
 interface GeoFeature {
   type: 'Feature'
@@ -30,10 +30,14 @@ interface ArcDatum {
   endLng: number
   color: string[]
   strokeW: number
+  weight: number
+  label?: string
   born: number
 }
 
 const LAND_DARK = 'rgb(27,42,65)'
+// 世界总览相机高度：2.4 实测球体偏小；1.8 放大约 1/3。
+const WORLD_ALTITUDE = 1.63
 const MAX_ARCS = 30
 const ARC_TTL = 4200
 
@@ -58,25 +62,6 @@ function buildCountryFeatures(counts: Map<string, number>): GeoFeature[] {
     type: 'Feature',
     properties: { name: c.name, count: counts.get(c.name) ?? 0 },
     geometry: { type: 'MultiPolygon', coordinates: toMultiPolygon(c.polys) },
-  }))
-}
-
-/** 下钻态：国家一级行政区 FeatureCollection（中国走高精度 34 省表）。
- *  tables 为按需加载的省界表（未加载时由调用方保证已 await）。 */
-function buildProvinceFeatures(country: string, counts: Map<string, number>, tables: Record<string, Admin1Province[]>): GeoFeature[] {
-  if (country === '中国') {
-    return CHINA_PROVINCES.map((p) => ({
-      type: 'Feature',
-      properties: { name: p.short, count: counts.get(p.name) ?? counts.get(p.short) ?? 0 },
-      geometry: { type: 'MultiPolygon', coordinates: toMultiPolygon(p.polys) },
-    }))
-  }
-  const provinces = tables[country]
-  if (!provinces) return []
-  return provinces.map((p) => ({
-    type: 'Feature',
-    properties: { name: p.name, count: counts.get(p.name) ?? 0 },
-    geometry: { type: 'MultiPolygon', coordinates: toMultiPolygon(p.polys) },
   }))
 }
 
@@ -131,22 +116,52 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   // 下钻时复用同一批对象，three-globe 的 DataBindMapper 可按对象身份复用
   // 已生成的 hex 几何，避免每次点击国家都重跑 176 国 H3 hexbin。
   let worldFeatureCache: (GeoFeature & { properties: { hover?: boolean; dim?: boolean } })[] | null = null
-  const provinceFeatureCache = new Map<string, (GeoFeature & { properties: { hover?: boolean; dim?: boolean } })[]>()
   function ensureWorldFeatures(): (GeoFeature & { properties: { hover?: boolean; dim?: boolean } })[] {
     if (!worldFeatureCache) worldFeatureCache = buildCountryFeatures(new Map()) as (GeoFeature & { properties: { hover?: boolean; dim?: boolean } })[]
     return worldFeatureCache
   }
-  function ensureProvinceFeatures(country: string): (GeoFeature & { properties: { hover?: boolean; dim?: boolean } })[] {
-    let cached = provinceFeatureCache.get(country)
-    if (!cached) {
-      cached = buildProvinceFeatures(country, new Map(), loadedAdmin1Tables() ?? {}) as (GeoFeature & { properties: { hover?: boolean; dim?: boolean } })[]
-      provinceFeatureCache.set(country, cached)
-    }
-    return cached
-  }
   let countryCounts = new Map<string, number>()
   let provinceCounts = new Map<string, number>()
   let drilledName: string | null = null
+  // 首帧先出球体/尺寸正确，再在第二帧后构建世界点阵；否则构造期
+  // 同步点阵/H3 会挡住 renderer 尺寸更新，canvas 按 window 尺寸停留，
+  // 球心偏右 → 「从右侧飘入」。
+  let layerReady = false
+  // 世界点阵与地图版同源：1.1° 错列网格 + 点内多边形判定（~1.3 万点）。
+  // 用单个 THREE.Points 承载，一次 draw call；不再走 H3（res3 首屏 4.4s
+  // 主线程长任务，res2 点阵又明显稀疏——两条路都不可接受）。
+  // 点阵间距：1.1° → 0.95°（约 +34% 点量），视觉间隙更小；世界/下钻同源。
+  // 地图点阵密集度已被用户确认合理；球面按同一网格局加密到 0.8°
+  // （球面投影下 0.95° 的可见点量明显少于地图）。
+  // 地图密度合理，但球面 24k 点实测只有 ~26fps；0.9° 在观感接近的同时
+  // 保留 60fps 余量，点径同步按地图比例微调。
+  const DOT_STEP = 0.9
+  // 与地图共用同一基色/不透明度（用户裁定：沿用地图口径）。
+  const DOT_BASE = 'rgb(44,66,96)'
+  // 地图点阵半径随 cam.zoom 放大；球面点径固定屏幕像素会让下钻显得稀。
+  // 点阵贴地表的高度：0.03 球半径会在球缘产生 3% 视差，hover 拾取按
+  // 球面 100 计算而点画在 103 上，观感就是「高亮被弧度带偏」。
+  const DOT_ALTITUDE = 0.005
+  const WORLD_DOT_SIZE = 3.2
+  const DRILL_DOT_SIZE = 6.2
+  interface WorldDot { lat: number; lng: number; key: string }
+  let worldDots: WorldDot[] | null = null
+  let worldDotPositions: Float32Array | null = null
+  let activeDots: WorldDot[] | null = null
+  let activeCounts = new Map<string, number>()
+  const provinceDotCache = new Map<string, { dots: WorldDot[]; positions: Float32Array }>()
+  let dotsPoints: THREE.Points | null = null
+  let hoveredDotCountry: string | null = null
+  const dotBboxes = THREAT_COUNTRIES.map((c) => {
+    let minLon = 180, maxLon = -180, minLat = 90, maxLat = -90
+    for (const poly of c.polys) for (const ring of poly) for (let k = 0; k + 1 < ring.length; k += 2) {
+      if (ring[k] < minLon) minLon = ring[k]
+      if (ring[k] > maxLon) maxLon = ring[k]
+      if (ring[k + 1] < minLat) minLat = ring[k + 1]
+      if (ring[k + 1] > maxLat) maxLat = ring[k + 1]
+    }
+    return { minLon, maxLon, minLat, maxLat }
+  })
   const arcs: ArcDatum[] = []
   let disposed = false
   let paused = false
@@ -160,24 +175,98 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   // 两段式构造（v2.3.8 定稿）：自研射线交互不依赖库内拾取，两段式无副作用；
   // animateIn:false 必须经配置传入（new 形态 props 不透传——「右下角飘入」
   // 在 new 形态下持续存在的根因）；width/height 同步容器实测尺寸。
+  const initW = Math.max(1, container.clientWidth || Math.floor(container.getBoundingClientRect().width) || 0)
+  const initH = Math.max(1, container.clientHeight || Math.floor(container.getBoundingClientRect().height) || 0)
   const globe = (Globe as unknown as (config: Record<string, unknown>) => (el: HTMLElement) => GlobeInstance)({
     rendererConfig: { antialias: true, alpha: true },
-    width: container.clientWidth || 800,
-    height: container.clientHeight || 600,
     animateIn: false,
   })(container)
+  // 构造 config 的 width/height 在此库版本下不可靠（实测首帧仍按 window
+  // 1600×1000 建 canvas → 球心偏右，随后 syncSize 才缩回 → 视觉「从右侧
+  // 飘入」）。构造后立即显式定尺寸，且 path 层 rendererSize 同源，避免
+  // 弧线按窗口尺寸投影。
+  globe.width(initW).height(initH)
+  ;(globe as unknown as { rendererSize?: (v: unknown) => void }).rendererSize?.(
+    new THREE.Vector2(initW, initH),
+  )
+  // Kapsule 的 width 更新会批到动画帧；H3 构建若在同帧同步发生，canvas
+  // 会继续以构造默认 window 尺寸显示一帧以上。这里直接同步 renderer 与
+  // scene-container，保证第一帧就是容器尺寸。
+  const renderer = (globe as unknown as { renderer?: () => THREE.WebGLRenderer }).renderer?.()
+  if (renderer) {
+    // 客户端 DPR=2 时 canvas 实际 1808×1402，透明度+深度测试点阵 60fps
+    // 会让 CPU/GPU 占用明显偏高；上限 1.5 保留清晰度并显著降载。
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5))
+    renderer.setSize(initW, initH)
+    const sceneEl = container.querySelector('.scene-container') as HTMLElement | null
+    if (sceneEl) {
+      sceneEl.style.width = `${initW}px`
+      sceneEl.style.height = `${initH}px`
+    }
+    const cam = (globe as unknown as { camera?: () => THREE.PerspectiveCamera }).camera?.()
+    if (cam) {
+      cam.aspect = initW / initH
+      cam.updateProjectionMatrix()
+    }
+  }
 
 
-  // 海洋球面深海军蓝（纯黑不合理——用户裁定 2026-10-17）
-  const gMat = globe.globeMaterial() as THREE.MeshPhongMaterial
-  if (gMat && gMat.color) gMat.color.set('#0a1e42')
+  // ---- 30fps 渲染节流（v2.3.8 用户反馈） ----
+  // globe.gl 内部固定用 requestAnimationFrame 自循环，无 FPS 配置项。这里只
+  // 拦截其 _animationCycle 回调，把渲染节流到 30fps；其它 RAF（Vue/自研帧循环/
+  // hover）原样放行。拖拽/旋转仍然响应，只是画面刷新 30fps。
+  const originalRAF = window.requestAnimationFrame
+  const nativeRAF = originalRAF.bind(window)
+  const globeCycle = (globe as unknown as { _animationCycle?: FrameRequestCallback })._animationCycle
+  // 自适应帧率：静止自动旋转 60fps（用户实测 30fps 自动旋转观感卡顿）；
+  // 拖拽/悬停/缩放同样 60fps。保留累计时间预算结构，后续可只改常量
+  // 降档。
+  const IDLE_FRAME_INTERVAL = 1000 / 60
+  const ACTIVE_FRAME_INTERVAL = 1000 / 60
+  const ACTIVE_WINDOW = 350
+  let lastGlobeFrame = 0
+  let frameCredit = 0
+  const throttledRAF = (cb: FrameRequestCallback): number => {
+    if (cb !== globeCycle) return nativeRAF(cb)
+    const run = (t: number): void => {
+      if (disposed || paused) return
+      if (lastGlobeFrame === 0) lastGlobeFrame = t
+      const delta = Math.min(100, t - lastGlobeFrame)
+      lastGlobeFrame = t
+      frameCredit += delta
+      const frameInterval = performance.now() - lastInteraction < ACTIVE_WINDOW
+        ? ACTIVE_FRAME_INTERVAL
+        : IDLE_FRAME_INTERVAL
+      if (frameCredit >= frameInterval) {
+        frameCredit = Math.min(frameInterval, frameCredit - frameInterval)
+        cb(t)
+      } else {
+        nativeRAF(run)
+      }
+    }
+    return nativeRAF(run)
+  }
+  window.requestAnimationFrame = throttledRAF
+
+  // 世界点阵承载层（自定义单 Points 对象，不参与 H3）
+  globe
+    .customLayerData([])
+    .customThreeObject(() => (dotsPoints as unknown as THREE.Object3D) || new THREE.Object3D())
+    .customThreeObjectUpdate(() => { /* 颜色由 updateDotColors 原地更新 */ })
+
+  // 海洋球面基色与地图背景同色（#030a1c），并用 Basic 材质去掉光照加成：
+  // 地图点阵透明度/基色是用户认可的口径，球面必须同样让 #1b2a41 点可见。
+  const oceanMat = new THREE.MeshBasicMaterial({ color: '#030a1c' })
+  globe.globeMaterial(oceanMat)
   globe
     .backgroundColor('rgba(0,0,0,0)')
     .showAtmosphere(true)
     .atmosphereColor('#3ad1ff')
     .atmosphereAltitude(0.16)
-    .hexPolygonsData(ensureWorldFeatures())
-    .hexPolygonResolution(3)
+    .hexPolygonsData([])
+    // 世界总览按分辨率 2 生成（res3 实测首屏 4.4s 主线程长任务，打开即卡死）；
+    // 省级下钻同样用 2，确保首屏与下钻都不触发 H3 炸弹。
+    .hexPolygonResolution(2)
     .hexPolygonMargin(0.25)
     .hexPolygonUseDots(false)
     .hexPolygonColor((f: object) => {
@@ -189,6 +278,14 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       return heatCss(props.count)
     })
     .hexPolygonsTransitionDuration(0)
+    // 下钻态他国暗度衬底用普通多边形层，避免把 176 国再次送进 H3 hexbin
+    //（首次下钻 3s 长任务根因）；世界态恒为空。
+    .polygonsData([])
+    .polygonAltitude(0.002)
+    .polygonCapColor(() => 'rgba(27, 42, 65, 0.35)')
+    .polygonSideColor(() => 'rgba(0,0,0,0)')
+    .polygonStrokeColor(() => 'rgba(80, 120, 180, 0.12)')
+    .polygonsTransitionDuration(0)
     .ringsData(siteConfigured ? [{ lat: server[1], lng: server[0] }] : [])
     .ringLat('lat')
     .ringLng('lng')
@@ -206,7 +303,15 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     .arcStroke('strokeW' as never)
     .arcDashLength(0.45)
     .arcDashGap(2)
-    .arcDashAnimateTime(2200)
+    .arcDashAnimateTime(FLOW_FLIGHT_MS)
+    // 聚合光流计数标签（世界/下钻共用；无标签时数据为空）
+    .labelsData([])
+    .labelLat('lat')
+    .labelLng('lng')
+    .labelText('text')
+    .labelSize(0.65)
+    .labelColor(() => '#ffd166')
+    .labelDotRadius(0)
     .pointsData(siteConfigured ? [{ lat: server[1], lng: server[0], size: 0.45 }] : [])
     .pointLat('lat')
     .pointLng('lng')
@@ -219,12 +324,15 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   globe.controls().autoRotateSpeed = 0.45
   // 滚轮不参与缩放（用户裁定：两页面交互一致，缩放仅经下钻/返回）
   globe.controls().enableZoom = false
-  globe.pointOfView({ lat: server[1], lng: server[0], altitude: 2.4 }, 0)
+  globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, 0)
 
   // ---- 自研拾取：屏幕点 → 相机射线 ∩ 球面 → 经纬度 → 国家/省份 ----
   function screenToLatLng(px: number, py: number): { lat: number; lng: number } | null {
     const cam = globe.camera() as THREE.PerspectiveCamera
-    const r = container.getBoundingClientRect()
+    // 用 canvas 自身矩形（而非外层 container）：canvas 是实际渲染/指针目标，
+    // 容器若有 padding/偏移会让 hover/点击整体平移。
+    const cv = container.querySelector('canvas')
+    const r = (cv ?? container).getBoundingClientRect()
     const ndcX = ((px - r.left) / r.width) * 2 - 1
     const ndcY = -(((py - r.top) / r.height) * 2 - 1)
     cam.updateMatrixWorld()
@@ -238,7 +346,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       .add(up.multiplyScalar(ndcY * Math.tan(fovHalf)))
       .normalize()
     const origin = new THREE.Vector3().setFromMatrixPosition(cam.matrixWorld)
-    const R = globe.getGlobeRadius()
+    // 与点阵同一壳层求交（不是球面）：消除高纬/球缘的视差。
+    const R = globe.getGlobeRadius() * (1 + DOT_ALTITUDE)
     // 射线 ∩ 球（球心原点）：|o + t·d|² = R²
     const b = origin.dot(ray)
     const c = origin.dot(origin) - R * R
@@ -275,6 +384,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
    *  无省层数据（含 admin1 chunk 加载失败）时不进入下钻——原实现直接
    *  drilledName+flyTo，省板为空（被选国家成空洞）。 */
   async function drillCountry(name: string): Promise<void> {
+    name = normalizeCountryName(name)
     if (opts?.drillCountries && !opts.drillCountries.includes(name)) return
     const seq = ++drillSeq
     if (name !== '中国') {
@@ -303,13 +413,13 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       // 命中其他国家：切换下钻（手势语义与地图版统一）
       const other = THREAT_COUNTRIES.find((c) => c.name !== drilledName && pointInEntries(geo.lng, geo.lat, [c]))
       if (other) {
-        await drillCountry(other.name)
+        await drillCountry(normalizeCountryName(other.name))
         return
       }
       // 空白：返回世界
       drillSeq += 1
       drilledName = null
-      globe.pointOfView({ lat: server[1], lng: server[0], altitude: 2.4 }, 700)
+      globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, 700)
       globe.controls().autoRotate = !paused
       applyLayer()
       onDrillChange?.(null)
@@ -317,7 +427,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     }
     const hit = THREAT_COUNTRIES.find((c) => pointInEntries(geo.lng, geo.lat, [c]))
     if (!hit) return
-    await drillCountry(hit.name)
+    await drillCountry(normalizeCountryName(hit.name))
   }
 
   // ---- hover：国家/省 hex 标记重着色 + 悬浮名（与地图版同构：pointermove 只
@@ -327,28 +437,27 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   hoverTipEl.style.cssText = 'position:absolute;z-index:6;pointer-events:none;display:none;padding:5px 10px;background:rgba(4,12,32,.92);border:1px solid rgba(80,170,255,.45);color:#e2ecff;font:12px "Noto Sans SC","PingFang SC",sans-serif;white-space:nowrap;border-radius:2px'
   container.appendChild(hoverTipEl)
   let hoverKeyCache: string | null = null
+  // 交互后 350ms 内保持 60fps，静止自动旋转降到 30fps。
+  let lastInteraction = 0
   let pendingMove: { x: number; y: number } | null = null
-  /** 当前 hex 特征数组（稳定对象引用——hover 只替换属性变化的特征对象）。 */
-  let hexFeatures: (GeoFeature & { properties: { hover?: boolean; dim?: boolean } })[] = []
+  // 自转时指针可能不动而国家从光标下滑过：保留最后指针位置并低频复测，
+  // 否则高亮/浮签停在旧国家，视觉上就是「hover 位置错位」。
+  let hoverPoint: { x: number; y: number } | null = null
+  let lastHoverPick = 0
 
   function setHexHover(name: string | null): void {
-    let changed = false
-    const arr = hexFeatures.map((feature) => {
-      const want = feature.properties.name === name
-      if (feature.properties.hover === want) return feature
-      changed = true
-      // 逐特征属性差量：只替换属性变化的那几个对象（hover 名称切换=2 个）
-      return { ...feature, properties: { ...feature.properties, hover: want } } as typeof feature
-    })
-    if (!changed) return
-    hexFeatures = arr
-    globe.hexPolygonsData(arr)
+    // 世界/下钻都由同一 Points 点阵承载，hover 只改点色，不再重建 hex。
+    hoveredDotCountry = name
+    updateDotColors()
   }
 
   /** 帧内 hover 拾取（每帧最多一次）。 */
   function processHover(): void {
-    const move = pendingMove
+    const now = performance.now()
+    const move = pendingMove ?? (hoverPoint && now - lastHoverPick >= 120 ? hoverPoint : null)
     if (!move) return
+    if (!pendingMove && now - lastHoverPick < 120) return
+    lastHoverPick = now
     pendingMove = null
     const geo = screenToLatLng(move.x, move.y)
     if (!geo) {
@@ -371,18 +480,19 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       }
       if (!name) {
         const other = THREAT_COUNTRIES.find((c) => c.name !== drilledName && pointInEntries(geo.lng, geo.lat, [c]))
-        if (other) { name = other.name; count = countryCounts.get(name) ?? 0 }
+        if (other) { name = normalizeCountryName(other.name); count = countryCounts.get(name) ?? 0 }
       }
     } else {
       const hit = THREAT_COUNTRIES.find((c) => pointInEntries(geo.lng, geo.lat, [c]))
-      if (hit) { name = hit.name; count = countryCounts.get(name) ?? 0 }
+      if (hit) { name = normalizeCountryName(hit.name); count = countryCounts.get(name) ?? 0 }
     }
     if (name !== hoverKeyCache) {
       hoverKeyCache = name
       setHexHover(name)
     }
     if (name) {
-      const r = container.getBoundingClientRect()
+      const cv = container.querySelector('canvas')
+      const r = (cv ?? container).getBoundingClientRect()
       hoverTipEl.style.display = 'block'
       hoverTipEl.textContent = `${name} ${count}`
       hoverTipEl.style.left = `${move.x - r.left + 14}px`
@@ -393,47 +503,194 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   function onCanvasMove(ev: PointerEvent): void {
-    pendingMove = { x: ev.clientX, y: ev.clientY }
+    lastInteraction = performance.now()
+    hoverPoint = { x: ev.clientX, y: ev.clientY }
+    pendingMove = { ...hoverPoint }
+  }
+
+  function onCanvasDown(): void {
+    lastInteraction = performance.now()
+  }
+
+  function onCanvasWheel(): void {
+    lastInteraction = performance.now()
   }
 
   function onPointerLeave(): void {
     pendingMove = null
+    hoverPoint = null
     hoverKeyCache = null
     hoverTipEl.style.display = 'none'
     setHexHover(null)
   }
 
+  function dotTexture(): THREE.CanvasTexture {
+    const canvas = document.createElement('canvas')
+    canvas.width = canvas.height = 32
+    const ctx = canvas.getContext('2d')
+    if (ctx) {
+      ctx.fillStyle = '#ffffff'
+      ctx.beginPath()
+      ctx.arc(16, 16, 14, 0, Math.PI * 2)
+      ctx.fill()
+    }
+    const tex = new THREE.CanvasTexture(canvas)
+    tex.needsUpdate = true
+    return tex
+  }
+
+  function updateDotColors(): void {
+    if (!dotsPoints || !activeDots) return
+    const colorAttr = dotsPoints.geometry.getAttribute('color') as THREE.BufferAttribute | undefined
+    if (!colorAttr) return
+    const arr = colorAttr.array as Float32Array
+    const c = new THREE.Color()
+    for (let i = 0; i < activeDots.length; i++) {
+      const d = activeDots[i]
+      if (hoveredDotCountry && d.key === hoveredDotCountry) c.setRGB(0.56, 0.9, 1)
+      else {
+        const n = activeCounts.get(d.key) ?? 0
+        c.setStyle(n > 0 ? heatCss(n) : DOT_BASE)
+      }
+      arr[i * 3] = c.r
+      arr[i * 3 + 1] = c.g
+      arr[i * 3 + 2] = c.b
+    }
+    colorAttr.needsUpdate = true
+  }
+
+  function dotPositions(dots: WorldDot[]): Float32Array {
+    const positions = new Float32Array(dots.length * 3)
+    const v = new THREE.Vector3()
+    for (let i = 0; i < dots.length; i++) {
+      // 0.03 球半径抬高，避免与球面 z-fighting，又不产生悬浮感。
+      v.copy((globe as unknown as { getCoords: (lat: number, lng: number, alt: number) => THREE.Vector3 }).getCoords(dots[i].lat, dots[i].lng, DOT_ALTITUDE))
+      positions[i * 3] = v.x
+      positions[i * 3 + 1] = v.y
+      positions[i * 3 + 2] = v.z
+    }
+    return positions
+  }
+
+  /** 切换当前点阵（世界国家 / 下钻省）：同一 Points 对象换 geometry 属性。 */
+  function setActiveDots(dots: WorldDot[], positions: Float32Array, counts: Map<string, number>): void {
+    activeDots = dots
+    activeCounts = counts
+    if (!dotsPoints) return
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(dots.length * 3), 3))
+    const old = dotsPoints.geometry
+    dotsPoints.geometry = geometry
+    old.dispose()
+    dotsPoints.visible = true
+    const pm = dotsPoints.material as THREE.PointsMaterial
+    pm.size = drilledName ? DRILL_DOT_SIZE : WORLD_DOT_SIZE
+    updateDotColors()
+  }
+
+  /** 世界点阵：与地图版同一 1.1° 网格/同源国家多边形（~1.3 万点）。 */
+  function buildWorldDots(): void {
+    if (worldDots) return
+    const dots: WorldDot[] = []
+    let row = 0
+    for (let lat = -54.5; lat < 84; lat += DOT_STEP, row++) {
+      const offset = row % 2 === 1 ? DOT_STEP / 2 : 0
+      for (let lon = -179.5 + offset; lon < 180; lon += DOT_STEP) {
+        for (let ci = 0; ci < THREAT_COUNTRIES.length; ci++) {
+          const b = dotBboxes[ci]
+          if (lon < b.minLon || lon > b.maxLon || lat < b.minLat || lat > b.maxLat) continue
+          if (!sharedPointInPolys(lon, lat, THREAT_COUNTRIES[ci].polys)) continue
+          dots.push({ lat, lng: lon, key: normalizeCountryName(THREAT_COUNTRIES[ci].name) })
+          break
+        }
+      }
+    }
+    worldDots = dots
+    worldDotPositions = dotPositions(dots)
+    // 无贴图、非透明、开启深度写入：PointsMaterial 的最轻路径。
+    // 圆形/六边形都需要纹理采样 + alphaTest + 透明混合；在 1.3 万点、
+    // 60fps 旋转球体上这部分是持续的每帧成本。方形点视觉上仍是点阵，
+    // 但 CPU/GPU 明显更低。
+    const material = new THREE.PointsMaterial({
+      size: WORLD_DOT_SIZE,
+      vertexColors: true,
+      // 圆形观感：贴图只提供 alpha 轮廓；alphaTest 丢弃轮廓外像素，
+      // 保持不透明管线（不做透明混合），成本低于 transparent 圆点。
+      map: dotTexture(),
+      alphaTest: 0.5,
+      transparent: false,
+      depthWrite: true,
+      sizeAttenuation: false,
+    })
+    dotsPoints = new THREE.Points(new THREE.BufferGeometry(), material)
+    dotsPoints.frustumCulled = false
+    dotsPoints.renderOrder = 2
+    globe.customLayerData([{ kind: 'world-dots' }])
+    setActiveDots(dots, worldDotPositions, countryCounts)
+    dotsPoints.visible = !drilledName
+  }
+
+  /** 下钻省点阵：与地图版同一 1.1° 网格/错列，按 admin 短名染色。 */
+  function ensureProvinceDotSet(country: string): { dots: WorldDot[]; positions: Float32Array } {
+    const cached = provinceDotCache.get(country)
+    if (cached) return cached
+    const source = provinceSource(country)
+    let minLon = 180, maxLon = -180, minLat = 90, maxLat = -90
+    for (const pv of source) {
+      for (const poly of pv.polys) for (const ring of poly) for (let k = 0; k + 1 < ring.length; k += 2) {
+        if (ring[k] < minLon) minLon = ring[k]
+        if (ring[k] > maxLon) maxLon = ring[k]
+        if (ring[k + 1] < minLat) minLat = ring[k + 1]
+        if (ring[k + 1] > maxLat) maxLat = ring[k + 1]
+      }
+    }
+    const dots: WorldDot[] = []
+    let row = 0
+    for (let lat = minLat; lat <= maxLat; lat += DOT_STEP, row++) {
+      const offset = row % 2 === 1 ? DOT_STEP / 2 : 0
+      for (let lon = minLon + offset; lon <= maxLon; lon += DOT_STEP) {
+        for (const pv of source) {
+          if (!sharedPointInPolys(lon, lat, pv.polys)) continue
+          dots.push({ lat, lng: lon, key: adminShortName(pv.name) })
+          break
+        }
+      }
+    }
+    const result = { dots, positions: dotPositions(dots) }
+    provinceDotCache.set(country, result)
+    return result
+  }
+
   /** 板块层重建：世界=国家六边形板（热力）；下钻=省板（全亮）+他国板（暗度
    * 衬底，与地图版下钻同视觉——用户裁定 2026-10-17）。 */
   function applyLayer(): void {
-    type HexF = GeoFeature & { properties: { hover?: boolean; dim?: boolean } }
-    const world = ensureWorldFeatures()
+    if (!layerReady) return
+    globe.hexPolygonsData([])
+    globe.polygonsData([])
     if (drilledName) {
-      const provinces = ensureProvinceFeatures(drilledName) as HexF[]
-      for (const f of provinces) f.properties.count = provinceCounts.get(f.properties.name) ?? 0
-      for (const f of world) f.properties.dim = f.properties.name !== drilledName
-      const others = world.filter((f) => f.properties.name !== drilledName) as HexF[]
-      hexFeatures = [...provinces, ...others]
-      globe.hexPolygonsData([...hexFeatures]) // 新数组触发 accessor 刷新；对象身份不变→几何复用
+      const set = ensureProvinceDotSet(drilledName)
+      setActiveDots(set.dots, set.positions, provinceCounts)
       provincePolysCache = provinceSource(drilledName).map((p) => ({ polys: p.polys }))
     } else {
-      for (const f of world) {
-        f.properties.dim = false
-        f.properties.hover = false
-      }
-      hexFeatures = world
-      globe.hexPolygonsData([...hexFeatures])
+      if (!worldDots || !worldDotPositions) return
+      setActiveDots(worldDots, worldDotPositions, countryCounts)
       provincePolysCache = []
     }
   }
 
   // click 处理为 async（按需加载省界）——命名包装器承担 add/removeEventListener
   // 同一引用；void 丢弃 Promise 是刻意的（内部处理全部失败分支）。
-  const onCanvasClick = (ev: MouseEvent): void => { void handleCanvasClick(ev) }
+  const onCanvasClick = (ev: MouseEvent): void => {
+    lastInteraction = performance.now()
+    void handleCanvasClick(ev)
+  }
   const cv = container.querySelector('canvas')
   if (cv) {
     cv.addEventListener('click', onCanvasClick)
     cv.addEventListener('pointermove', onCanvasMove)
+    cv.addEventListener('pointerdown', onCanvasDown)
+    cv.addEventListener('wheel', onCanvasWheel, { passive: true })
     cv.addEventListener('pointerleave', onPointerLeave)
   }
 
@@ -451,6 +708,10 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     if (done || syncTries > 60) clearInterval(syncTimer)
   }, 250)
   window.addEventListener('resize', syncSize)
+  // 容器尺寸可能晚于构造稳定（面板/字体/滚动条）；只靠 250ms 轮询且
+  // 首次相等即停会漏掉后续回缩，导致 canvas 长期宽于容器、球心偏右。
+  const ro = new ResizeObserver(() => syncSize())
+  ro.observe(container)
 
   // 垂直扫描带（移植 shader）+ 帧驱动
   let scanMat: THREE.ShaderMaterial | null = null
@@ -496,22 +757,31 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       if (arcs.length > 0 && now - arcs[0].born > ARC_TTL) {
         arcs.shift()
         globe.arcsData([...arcs])
+        syncArcLabels()
       }
     }
   }
+  // 两个 RAF：第一个让首帧（球体 + 正确尺寸）真正上屏，第二个再做 H3。
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (disposed) return
+    layerReady = true
+    buildWorldDots()
+    applyHotspots()
+    if (!drilledName) applyLayer()
+  }))
   let rafId = requestAnimationFrame(frame)
 
-  /** 热点光点：命中国家 log10 计数定尺寸（与地图版信标同语义），叠加本站点。 */
+  /** 仅保留本站点；命中国家不再叠加红色光球——国家热力由点阵染色表达。 */
   function applyHotspots(): void {
-    const hot: { lat: number; lng: number; size: number; color?: string }[] = []
-    if (siteConfigured) hot.push({ lat: server[1], lng: server[0], size: 0.45, color: '#e2e8f0' })
-    for (const [name, count] of countryCounts) {
-      if (count <= 0) continue
-      const c = COUNTRY_CENTROIDS[name]
-      if (!c) continue
-      hot.push({ lat: c[1], lng: c[0], size: 0.25 + Math.min(1, Math.log10(count) / 3) * 0.85, color: '#ff4d4d' })
-    }
-    globe.pointsData(hot)
+    globe.pointsData(siteConfigured ? [{ lat: server[1], lng: server[0], size: 0.45, color: '#e2e8f0' }] : [])
+  }
+
+  function syncArcLabels(): void {
+    globe.labelsData(
+      arcs
+        .filter((a) => a.label)
+        .map((a) => ({ lat: a.startLat, lng: a.startLng, text: a.label })),
+    )
   }
 
   function spawnArc(from: Centroid, normal: boolean, weight = 1): void {
@@ -522,11 +792,16 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     if (arcs.length >= MAX_ARCS) arcs.shift()
     arcs.push({
       ...arcEndpoints(server, from),
-      color: normal ? ['rgba(61,220,132,0.1)', 'rgba(61,220,132,0.85)'] : ['rgba(255,122,47,0.1)', 'rgba(255,77,77,0.95)'],
-      strokeW: Math.min(3, 0.5 + Math.log10(Math.max(1, weight))),
+      // 正常请求固定青色；检测/拦截统一攻击橙红。
+      color: normal ? [...FLOW_NORMAL_ARC_COLORS] : [...FLOW_ATTACK_ARC_COLORS],
+      // 与地图同一视觉公式（shared/threatTheme）。
+      strokeW: normal ? flowNormalWidth(weight) : flowAttackWidth(weight),
+      weight,
+      label: flowArcLabel(weight),
       born: performance.now(),
     })
     globe.arcsData([...arcs])
+    syncArcLabels()
   }
 
   return {
@@ -535,30 +810,50 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     },
     addArcForLocation(ipLocation: string, weight = 1): void {
       if (!ipLocation) return
-      const country = ipLocation.split('·')[0]
+      const [country, province] = ipLocation.split('·')
       if (!country) return
-      spawnArc(COUNTRY_CENTROIDS[country] ?? FALLBACK_CENTROID, false, weight)
+      let from: Centroid = COUNTRY_CENTROIDS[country] ?? FALLBACK_CENTROID
+      if (country === '中国' && province) {
+        const pv = CHINA_PROVINCES.find((x) => x.short === province || x.name === province)
+        if (pv) from = [pv.centroid[0], pv.centroid[1]]
+      }
+      spawnArc(from, false, weight)
+    },
+    addNormalArcForLocation(ipLocation: string, weight = 1): void {
+      if (!ipLocation) return
+      const [country, province] = ipLocation.split('·')
+      if (!country) return
+      let from: Centroid = COUNTRY_CENTROIDS[country] ?? FALLBACK_CENTROID
+      if (country === '中国' && province) {
+        const pv = CHINA_PROVINCES.find((x) => x.short === province || x.name === province)
+        if (pv) from = [pv.centroid[0], pv.centroid[1]]
+      }
+      spawnArc(from, true, weight)
     },
     setCountries(entries: CountryHeat[]): void {
-      if (heatEntriesEqual(countryCounts, entries)) return
-      countryCounts = new Map(entries.map((e) => [e.name, e.count]))
+      const nextCounts = aggregateCountryCounts(entries)
+      if (heatEntriesEqual(countryCounts, [...nextCounts].map(([name, count]) => ({ name, count })))) return
+      countryCounts = nextCounts
       const cached = ensureWorldFeatures()
       for (const f of cached) f.properties.count = countryCounts.get(f.properties.name) ?? 0
       applyHotspots()
-      if (!drilledName) applyLayer()
+      if (!drilledName) {
+        updateDotColors()
+        applyLayer()
+      }
     },
     setProvinces(entries: CountryHeat[]): void {
       if (heatEntriesEqual(provinceCounts, entries)) return
       provinceCounts = new Map(entries.map((e) => [e.name, e.count]))
       if (drilledName) {
-        for (const f of ensureProvinceFeatures(drilledName)) f.properties.count = provinceCounts.get(f.properties.name) ?? 0
-        applyLayer()
+        activeCounts = provinceCounts
+        updateDotColors()
       }
     },
     setTraffic(entries: CountryHeat[]): void {
-      const top = [...entries].sort((a, b) => b.count - a.count).slice(0, 8)
-      for (const entry of top) {
-        if (entry.count > 0) spawnArc(COUNTRY_CENTROIDS[entry.name] ?? FALLBACK_CENTROID, true)
+      // 正常请求固定青色，按地区权重聚合；>10 带 ×N 标签。
+      for (const entry of entries) {
+        if (entry.count > 0) spawnArc(COUNTRY_CENTROIDS[entry.name] ?? FALLBACK_CENTROID, true, entry.count)
       }
     },
     setServer(centroid: Centroid | null): void {
@@ -570,18 +865,18 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       siteConfigured = true
       globe.ringsData([{ lat: server[1], lng: server[0] }])
       applyHotspots()
-      if (!drilledName) globe.pointOfView({ lat: server[1], lng: server[0], altitude: 2.4 }, 600)
+      if (!drilledName) globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, 600)
     },
     zoomOut(): void {
       drilledName = null
       globe.controls().autoRotate = !paused
-      globe.pointOfView({ lat: server[1], lng: server[0], altitude: 2.4 }, 600)
+      globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, 600)
       applyLayer()
     },
     resetView(): void {
       drilledName = null
       globe.controls().autoRotate = !paused
-      globe.pointOfView({ lat: server[1], lng: server[0], altitude: 2.4 }, 600)
+      globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, 600)
       applyLayer()
     },
     setControlsEnabled(enabled: boolean): void {
@@ -607,26 +902,38 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
         globe.pauseAnimation()
       } else if (!disposed && rafId === 0) {
         last = performance.now()
+        lastGlobeFrame = 0
+        frameCredit = 0
         rafId = requestAnimationFrame(frame)
         globe.resumeAnimation()
       }
     },
     dispose(): void {
       disposed = true
+      if (window.requestAnimationFrame === throttledRAF) window.requestAnimationFrame = originalRAF
       window.removeEventListener('resize', syncSize)
+      ro.disconnect()
       clearInterval(syncTimer)
       const cvd = container.querySelector('canvas')
       if (cvd) {
         cvd.removeEventListener('click', onCanvasClick)
         cvd.removeEventListener('pointermove', onCanvasMove)
+        cvd.removeEventListener('pointerdown', onCanvasDown)
+        cvd.removeEventListener('wheel', onCanvasWheel)
         cvd.removeEventListener('pointerleave', onPointerLeave)
       }
       cancelAnimationFrame(rafId)
       globe.pauseAnimation()
       globe.hexPolygonsData([])
       globe.arcsData([])
+      globe.labelsData([])
       globe.ringsData([])
       globe.pointsData([])
+      if (dotsPoints) {
+        dotsPoints.geometry.dispose()
+        ;(dotsPoints.material as THREE.Material).dispose()
+        dotsPoints = null
+      }
       if (scanMat) {
         scanMat.dispose()
         scanMat = null

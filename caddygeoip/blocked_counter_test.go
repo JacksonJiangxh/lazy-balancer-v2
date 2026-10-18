@@ -261,3 +261,25 @@ func TestRegisterOrExisting(t *testing.T) {
 		t.Fatalf("cross-reload instance not zeroed: count=%v, want 0", got)
 	}
 }
+
+// 采集租约关闭时热路径跳过 trafficRecord：即使请求带 GeoIP 变量也不得产生桶。
+func TestSecurityBlockedCounter_collectorDisabledSkipsTraffic(t *testing.T) {
+	resetTrafficState(t)
+	trafficCollectorEnabled.Store(false)
+	t.Cleanup(func() { trafficCollectorEnabled.Store(true) })
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(context.WithValue(req.Context(), caddyhttp.VarsCtxKey, map[string]any{
+		"geoip.country_name": "中国",
+	}))
+	h := &SecurityBlockedCounter{Rule: "lb_collector_disabled"}
+	next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
+	if err := h.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	trafficMu.RLock()
+	defer trafficMu.RUnlock()
+	if len(trafficCountries) != 0 {
+		t.Fatalf("collector disabled created buckets: %+v", trafficCountries)
+	}
+}

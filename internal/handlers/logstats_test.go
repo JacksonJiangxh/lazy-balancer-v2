@@ -261,7 +261,7 @@ func TestGetLogStats_securityEventsRetentionUsesExplicitSettings(t *testing.T) {
 		t.Errorf("limit_bytes=%v, want 默认 audit_log_size_mb=10MB", row.LimitBytes)
 	}
 
-	// 回归形态：未显式设置时回退旧通道月表述。
+	// 回归形态：未显式设置时使用安全事件独立默认 90 天，不再回退审计月数。
 	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=0 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
@@ -270,8 +270,8 @@ func TestGetLogStats_securityEventsRetentionUsesExplicitSettings(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Data.Logs) != 1 || !strings.Contains(resp.Data.Logs[0].RetentionNote, "3 个月") {
-		t.Errorf("retention_note=%q, want 回退月表述「3 个月」", resp.Data.Logs[0].RetentionNote)
+	if len(resp.Data.Logs) != 1 || !strings.Contains(resp.Data.Logs[0].RetentionNote, "90 天") {
+		t.Errorf("retention_note=%q, want 独立默认「90 天」", resp.Data.Logs[0].RetentionNote)
 	}
 }
 
