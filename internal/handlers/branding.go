@@ -372,7 +372,14 @@ func (h *Handlers) GetBranding(c *gin.Context) {
 		}
 		if needApply {
 			go func() {
-				if isMaster, err := services.RoleOf(context.Background(), db.DB); err == nil && !isMaster {
+				isMaster, roleErr := services.RoleOf(context.Background(), db.DB)
+				if roleErr != nil {
+					// 历史问题-3b（历史）：角色读失败不得按主节点继续写（fail-open）
+					// ——公开 GET 触发的异步重应用在从节点上会造成本地 /load 漂移。
+					services.Logf("warn", "branding：读取节点角色失败，跳过本地 Caddy 重应用: %v", roleErr)
+					return
+				}
+				if !isMaster {
 					return
 				}
 				if err := h.applyCaddyConfigE(); err != nil {
@@ -529,7 +536,15 @@ func SeedDefaultBlockPage(dataDir string) (bool, error) {
 	if db.DB == nil {
 		return false, nil
 	}
-	if isMaster, err := services.RoleOf(context.Background(), db.DB); err == nil && !isMaster {
+	isMaster, roleErr := services.RoleOf(context.Background(), db.DB)
+	if roleErr != nil {
+		// 历史问题-3b（历史）：角色不可判定时跳过写（fail-closed）——本函数会
+		// 写同步表 security_block_pages，从节点瞬时读错会让本地渲染覆盖主端
+		// 同步内容。与下方「owned by master」语义一致。
+		services.Logf("warn", "branding：读取节点角色失败，跳过默认拦截页播种: %v", roleErr)
+		return false, nil
+	}
+	if !isMaster {
 		// The default block page content is owned by the master and arrives on
 		// slaves via cluster sync; branding.json is node-local, so re-rendering
 		// here would overwrite the synced content with local defaults.

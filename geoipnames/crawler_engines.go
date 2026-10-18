@@ -75,9 +75,10 @@ var crawlerEngines = []CrawlerEngine{
 		Name:    "360",
 		UARegex: regexp.MustCompile(`(?i)360Spider`),
 		// 官方声明不支持 nslookup（so.com/help/spider_ip.html）——IP 段验证；
-		// 段=官方公布全表归纳（42.236.10-15.x 归纳为 /21，含表外少量同段位）
+		// 段=官方公布全表归纳（42.236.10-15.x 归纳为 /21，含表外少量同段位；
+		// 历史问题-04 历史补齐 17.* / 101.* / 180.153.236.*）
 		VerifyMethod: CrawlerVerifyIPRange,
-		IPRanges:     []string{"42.236.8.0/21", "180.163.220.0/24"},
+		IPRanges:     []string{"42.236.8.0/21", "42.236.17.0/24", "42.236.101.0/24", "180.153.236.0/24", "180.163.220.0/24"},
 	},
 	{
 		ID:          "yisouspider",

@@ -246,3 +246,46 @@ func TestHTTPRedirectMux_Accept_backsOffTemporaryErrorsWithoutTimeout(t *testing
 	case <-time.After(50 * time.Millisecond):
 	}
 }
+
+// 历史问题-1：嗅探槽耗尽时不得静默关闭连接（原实现 Close——静默连接占满
+// 128 槽后管理面板的全部新连接含 TLS 握手被拒）。修复后溢出连接交 TLS
+// 接受路径：Accept 必须返回该连接而不是无限等待。
+func TestHTTPRedirectMux_sniffSlotExhaustionHandsConnectionToTLS(t *testing.T) {
+	listener := &fakeListener{
+		results:  make(chan acceptResult, 1),
+		accepted: make(chan struct{}, 1),
+		closed:   make(chan struct{}),
+	}
+	mux := newHTTPRedirectMuxWithSleeper(listener, func(time.Duration) {})
+	t.Cleanup(func() {
+		_ = listener.Close()
+		_ = mux.Close()
+	})
+	// Given：嗅探槽全部占用（128 条慢连接的在役形状）。
+	for range maxProtocolSniffers {
+		mux.slots <- struct{}{}
+	}
+	serverConnection, clientConnection := net.Pipe()
+	t.Cleanup(func() { _ = clientConnection.Close() })
+
+	// When：新连接从 accept 队列到达。
+	listener.results <- acceptResult{connection: serverConnection}
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		connection, err := mux.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- connection
+	}()
+
+	// Then：连接交给 TLS 路径（而不是关闭），面板监听保持可用。
+	select {
+	case connection := <-accepted:
+		if connection != serverConnection {
+			t.Fatalf("accepted connection=%v, want the overflow connection", connection)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("overflow connection was closed instead of being handed to the TLS path")
+	}
+}

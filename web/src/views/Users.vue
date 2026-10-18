@@ -14,6 +14,15 @@
       </el-button>
     </div>
 
+    <el-alert v-if="loadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+      <template #title>
+        <div class="polling-error-title">
+          <span>用户列表加载失败：表格为空不代表没有用户</span>
+          <el-button link type="danger" @click="fetchUsers">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
+
     <el-card v-if="showForm" class="form-card">
       <template #header>
         <div class="card-header">
@@ -283,6 +292,7 @@ import { computed, nextTick, reactive, ref, onMounted } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { request, mfaAwareSuccess, normalizeMfaCodeInput, validateMfaCodeInput } from '@/utils/api'
 import { formatDate } from '@/utils/date'
+import { copyText } from '@/utils/copy'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { UserFilled, User, Plus, Key, Lock, Warning } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
@@ -311,6 +321,8 @@ const fetchOIDCStatus = async () => {
 const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 const users = ref<UserListItem[]>([])
+// 历史问题-F5：列表加载失败与真实空列表不可区分 → 显性错误态 + 重试
+const loadError = ref(false)
 const mfaWriteGuard = ref(false)
 const showForm = ref(false)
 
@@ -355,6 +367,7 @@ const fetchUsers = async () => {
     const res = await request.get<APIResponse<UserListItem[]>>('/users')
     if (requestSeq === usersRequestSeq) {
       users.value = res.data || []
+      loadError.value = false
       const maxPage = Math.max(1, Math.ceil(users.value.length / pageSize.value))
       if (currentPage.value > maxPage) currentPage.value = maxPage
     }
@@ -362,6 +375,7 @@ const fetchUsers = async () => {
     // Error toast is already shown by the global axios interceptor; swallow here
     // so fire-and-forget refresh calls don't surface as unhandled rejections.
     console.error('Failed to fetch users:', error)
+    if (requestSeq === usersRequestSeq) loadError.value = true
   }
 }
 
@@ -705,12 +719,11 @@ const activateMfa = async (): Promise<void> => {
 }
 
 const copyMfaRecovery = async (): Promise<void> => {
-  try {
-    await navigator.clipboard.writeText(mfaBinding.value.recoveryCodes.join('\n'))
-    ElMessage.success('恢复代码已复制')
-  } catch {
-    ElMessage.warning('复制失败，请手动选择复制')
-  }
+  // 历史问题-F7：走统一 copyText（clipboard API + textarea 降级）——面板默认
+  // HTTP 部署属非安全上下文，navigator.clipboard 不可用，原实现在该场景恒失败。
+  const ok = await copyText(mfaBinding.value.recoveryCodes.join('\n'))
+  if (ok) ElMessage.success('恢复代码已复制')
+  else ElMessage.warning('复制失败，请手动选择复制')
 }
 
 onMounted(() => {

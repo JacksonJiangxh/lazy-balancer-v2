@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,6 +38,39 @@ type idleSyncWorker struct{}
 
 func (idleSyncWorker) Start() {}
 func (idleSyncWorker) Stop()  {}
+
+type countingSyncWorker struct {
+	starts atomic.Int32
+	stops  atomic.Int32
+}
+
+func (w *countingSyncWorker) Start() { w.starts.Add(1) }
+func (w *countingSyncWorker) Stop()  { w.stops.Add(1) }
+
+// 历史问题-2：Shutdown 后 StartSync 必须成为 no-op——进程退出与 taskengine
+// daemon 换代并发时，已 teardown 的同步循环不得被重新拉起。
+func TestRuntimeLifecycle_ShutdownGatesLaterStarts(t *testing.T) {
+	worker := &countingSyncWorker{}
+	lifecycle := newRuntimeLifecycle(worker, func() certificateWorker {
+		return &blockingCertificateWorker{stop: make(chan struct{}), exited: make(chan struct{})}
+	})
+	lifecycle.StartSync()
+	lifecycle.StartSync() // 重复启动由 worker 自身幂等，此处只断言生命周期门
+
+	lifecycle.Shutdown()
+	if got := worker.stops.Load(); got != 1 {
+		t.Fatalf("StopSync invocations=%d, want 1", got)
+	}
+
+	lifecycle.StartSync() // Shutdown 后必须被 stopped 门拒绝
+	if got := worker.starts.Load(); got != 2 {
+		t.Fatalf("StartSync after Shutdown must be a no-op: starts=%d (before shutdown=2)", got)
+	}
+	lifecycle.Shutdown() // 幂等
+	if got := worker.stops.Load(); got != 1 {
+		t.Fatalf("second Shutdown must not stop again: stops=%d", got)
+	}
+}
 
 func TestRuntimeLifecycle_StopACME_waitsForWorkerExit(t *testing.T) {
 	// Given

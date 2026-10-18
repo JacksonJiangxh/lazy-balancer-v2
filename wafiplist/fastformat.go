@@ -30,9 +30,9 @@ type FastFileState struct {
 // 族校验（历史问题）：v4 切片只接受纯 IPv4 前缀，v6 切片只接受纯 IPv6 前缀
 // （4in6 映射形态须先 Unmap 归 v4）。族错配返回 error 而不是 panic/静默腐化
 // ——As4 对 v6 入参 panic；As16 对 v4 会写出「4-in-6 地址 + v4 bits」的
-// 可加载但永不命中形态。主机位未掩码的条目（如 1.2.3.200/24）能通过读侧
-// 全部校验（单条无前驱可比较嵌套），却让二分查询用未掩码地址比较而假阴性
-// ——写侧必须先掩码。
+// 可加载但永不命中形态。主机位未掩码的条目（如 1.2.3.200/24）会让二分查询
+// 用未掩码地址比较而假阴性——写侧必须先掩码；读侧亦对每项校验 p==p.Masked()
+// （E83-历史问题：.fast 是跨进程输入，不单靠写侧自律）。
 //
 // 原子写用独占临时名（CreateTemp，历史问题）：固定 path+".tmp" 在并发/多调用
 // 方下互相覆盖（rename ENOENT 或旧代际覆盖新代际）。本函数自身不持锁，
@@ -164,6 +164,13 @@ func ReadFastFile(path string) (*FastFileState, error) {
 			return nil, fmt.Errorf("fastfile: v4 entry %d bits out of range: %d", i, bits)
 		}
 		state.V4[i] = netip.PrefixFrom(netip.AddrFrom4(addr), bits)
+		// E83-历史问题：主机位必须已掩码——与写侧同一不变量。未掩码条目
+		// （1.2.3.200/24）地址升序/不相交校验都可能通过，但二分查询用
+		// 未掩码地址比较会假阴性（威胁名单静默漏拦）。读侧是跨进程输入
+		// （节点回传的 .fast），不能只依赖写侧自律。
+		if state.V4[i] != state.V4[i].Masked() {
+			return nil, fmt.Errorf("fastfile: v4 entry %d host bits not masked: %s", i, state.V4[i])
+		}
 		if i > 0 && state.V4[i-1].Addr().Compare(state.V4[i].Addr()) > 0 {
 			return nil, fmt.Errorf("fastfile: v4 entries not in ascending order at %d", i)
 		}
@@ -185,6 +192,10 @@ func ReadFastFile(path string) (*FastFileState, error) {
 			return nil, fmt.Errorf("fastfile: v6 entry %d bits out of range: %d", i, bits)
 		}
 		state.V6[i] = netip.PrefixFrom(netip.AddrFrom16(addr), bits)
+		// E83-历史问题：v6 同口径——主机位未掩码即拒。
+		if state.V6[i] != state.V6[i].Masked() {
+			return nil, fmt.Errorf("fastfile: v6 entry %d host bits not masked: %s", i, state.V6[i])
+		}
 		if i > 0 && state.V6[i-1].Addr().Compare(state.V6[i].Addr()) > 0 {
 			return nil, fmt.Errorf("fastfile: v6 entries not in ascending order at %d", i)
 		}

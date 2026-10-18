@@ -214,6 +214,18 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 	if payload.ConfigJSON == nil {
 		return nil, errors.New("lbbak 缺少 config.json")
 	}
+	// B2-历史问题（历史）：manifest 逐条目 sha256 是 lbbak 的完整性承诺——
+	// config.json / CRS / xdb 必须在 manifest 中登记后才可使用；此前只校验
+	// 「已登记的条目」，手造 {"checksum":{}} 可让这三类核心载荷未经任何摘要
+	// 校验即落库。威胁 .iplist 的未登记形态保留既有兼容告警（F-B1 裁定）。
+	for _, required := range []string{lbbakEntryConfig, lbbakEntryCRS, lbbakEntryXdb} {
+		if _, exists := entries[required]; !exists {
+			continue
+		}
+		if _, registered := manifest.Checksum[required]; !registered {
+			return nil, fmt.Errorf("manifest 未登记条目 %s 的校验和(完整性校验缺失)", required)
+		}
+	}
 	if data, exists := entries[lbbakEntryCRS]; exists {
 		payload.CRSTarGz = data
 		payload.CRSSha256 = manifest.Checksum[lbbakEntryCRS]
@@ -249,6 +261,69 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 		sort.Strings(payload.UnregisteredThreatEntries)
 	}
 	return payload, nil
+}
+
+// reconcileImportedThreatFiles 威胁名单文件与还原后源表收敛（历史问题-03，历史）：
+// 导出只为非空源写 .iplist 条目，而导入源表是全量替换——备份中「空/缺席」的源
+// 不会覆盖本地旧文件，运行时 WAF 仍按旧名单拦截（DB 与执行面分叉）。此处按
+// 导入后的源集合删除多余/空源文件；调用方必须已持 WafFileLock。
+func reconcileImportedThreatFiles(tables map[string][]map[string]any, payload *lbbakPayload, failedSources []string) []string {
+	rows, carried := tables["security_threat_sources"]
+	if !carried || payload == nil {
+		return nil // 表缺席=保留本地现状
+	}
+	failed := make(map[string]bool, len(failedSources))
+	for _, source := range failedSources {
+		failed[source] = true
+	}
+	kept := make(map[string]bool, len(rows))
+	var warnings []string
+	removePair := func(source, reason string) {
+		for _, path := range []string{
+			filepath.Join(services.WafDir(), "threat-"+source+".iplist"),
+			filepath.Join(services.WafDir(), "threat-"+source+".iplist.fast"),
+		} {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				warnings = append(warnings, "删除威胁库 "+source+" 本地文件失败: "+err.Error())
+			}
+		}
+		warnings = append(warnings, "威胁库 "+source+" "+reason)
+	}
+	for _, row := range rows {
+		name := backupString(row["name"])
+		if name == "" {
+			continue
+		}
+		kept[name] = true
+		if _, hasFile := payload.ThreatIplists[name]; hasFile || failed[name] {
+			continue // 随包文件已落盘（失败源保留本地文件与记录）
+		}
+		removePair(name, "在备份中为空，已删除本地旧名单文件（记录按备份）")
+	}
+	// 源表全量替换后不再存在的源：本地残留文件同样删除。
+	entries, err := os.ReadDir(services.WafDir())
+	if err != nil {
+		warnings = append(warnings, "扫描威胁库目录失败: "+err.Error())
+		return warnings
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "threat-") {
+			continue
+		}
+		source := strings.TrimPrefix(name, "threat-")
+		source = strings.TrimSuffix(strings.TrimSuffix(source, ".fast"), ".iplist")
+		if source == "" || kept[source] || failed[source] {
+			continue
+		}
+		if err := os.Remove(filepath.Join(services.WafDir(), name)); err != nil && !os.IsNotExist(err) {
+			warnings = append(warnings, "删除威胁库 "+source+" 本地文件失败: "+err.Error())
+		}
+	}
+	return warnings
 }
 
 // lbbakWafApplyResult 逐文件落盘结果（历史问题/03/08）：此前失败仅返回单条

@@ -1,8 +1,8 @@
 import { useAuthStore } from '@/stores/auth'
+// 与后端 COALESCE 默认一致的兜底时区与格式化器单源（历史问题-F11）：抽到无依赖
+// 模块供 node 行为测试直测 h23 口径；本文件保留缓存/回退策略。
+import { DEFAULT_TZ, createTzFormatter, formatDateParts } from '@/utils/timeZoneFormat'
 
-// 与后端 COALESCE 默认一致的兜底时区：备份导入/集群同步路径可能写入未校验的 tz（如 "GMT+8"），
-// 非法值会使 Intl.DateTimeFormat 抛 RangeError，导致所有 formatDate 调用点渲染崩溃（D-1）。
-const DEFAULT_TZ = 'Asia/Shanghai'
 let warnedInvalidTz = false
 
 const configTz = (): string => {
@@ -21,15 +21,6 @@ const configTz = (): string => {
 
 const isIsoLike = (value: string): boolean => value.includes('T') || value.endsWith('Z') || /[+-]\d{2}:?\d{2}$/.test(value)
 
-const tzFormat = (timeZone: string, withTime: boolean): Intl.DateTimeFormat =>
-  new Intl.DateTimeFormat('en-US', {
-    timeZone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    ...(withTime ? { hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' as const } : {}),
-  })
-
 // 模块级 formatter 缓存（S-01）：Dashboard 每轮询对 60 点 × 2 图表调用 tzFormatter，
 // 每 5s 约构造 120 个 Intl.DateTimeFormat（Intl 构造带 locale 数据解析，纯函数重复计算）。
 // key = `${tz}|${withTime}`；只缓存成功构造的实例，非法 tz 回退路径不受影响（回退后同样走缓存）。
@@ -43,7 +34,7 @@ const tzFormatter = (withTime: boolean): Intl.DateTimeFormat => {
   const cached = tzFormatterCache.get(cacheKey)
   if (cached) return cached
   try {
-    const formatter = tzFormat(tz, withTime)
+    const formatter = createTzFormatter(tz, withTime)
     tzFormatterCache.set(cacheKey, formatter)
     return formatter
   } catch {
@@ -53,7 +44,7 @@ const tzFormatter = (withTime: boolean): Intl.DateTimeFormat => {
     }
     // 回退后同样走缓存：避免每次调用都重建 DEFAULT_TZ 实例（S-01）
     const fallbackKey = `${DEFAULT_TZ}|${withTime}`
-    const fallback = tzFormatterCache.get(fallbackKey) ?? tzFormat(DEFAULT_TZ, withTime)
+    const fallback = tzFormatterCache.get(fallbackKey) ?? createTzFormatter(DEFAULT_TZ, withTime)
     tzFormatterCache.set(fallbackKey, fallback)
     // 非法键同样缓存回退实例（D-3）：后续调用命中缓存，不再重复构造/抛 RangeError
     tzFormatterCache.set(cacheKey, fallback)
@@ -61,13 +52,8 @@ const tzFormatter = (withTime: boolean): Intl.DateTimeFormat => {
   }
 }
 
-const formatInConfigTz = (d: Date, withTime: boolean): string => {
-  const parts = tzFormatter(withTime).formatToParts(d)
-  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? ''
-  const date = `${get('year')}-${get('month')}-${get('day')}`
-  if (!withTime) return date
-  return `${date} ${get('hour')}:${get('minute')}:${get('second')}`
-}
+const formatInConfigTz = (d: Date, withTime: boolean): string =>
+  formatDateParts(d, tzFormatter(withTime), withTime)
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null
 

@@ -21,7 +21,8 @@ func forceRenameFailure(t *testing.T) {
 }
 
 func TestCopyFile_atomicWriteNoTmpResidue(t *testing.T) {
-	// Given 历史问题 历史问题：copyFile 先写 dst+".tmp" 再原子重命名
+	// Given 历史问题 历史问题：copyFile 原子落盘（D1-历史问题 起为同目录唯一临时名
+	// .<base>-<rand>.tmp + fsync；成功后只留目标文件）
 	root := t.TempDir()
 	src := filepath.Join(root, "src.xdb")
 	dst := filepath.Join(root, "sub", "live.xdb")
@@ -368,5 +369,35 @@ func TestCRSUpdate_recordsReloadFailureAudit(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("reload failure audit rows=%d, want 1", n)
+	}
+}
+
+// 历史问题-03（历史）：重载失败回滚（树还原 + VERSION 标记 + DB 版本行）
+// 必须在同一 wafFileMu 临界区内完成——旧实现 restoreBackup 取锁后立即释放，
+// 标记/版本行锁外写（持锁读者可见「旧树+新标记」，并发导入可被覆盖标记）。
+func TestCRSRollbackAfterReloadFailure_blocksWhileWafFileLockHeld(t *testing.T) {
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.15.0", true) // DB 行已是新版本（待回滚）
+	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-901-INITIALIZATION.conf"), "SecRule live")
+	writeTestFile(t, filepath.Join(crsTransientPath(m.crsDir, "rules.bak"), "REQUEST-901-INITIALIZATION.conf"), "SecRule old")
+	writeTestFile(t, filepath.Join(m.crsDir, crsVersionFile), "v4.15.0\n")
+
+	probeBlocksUnderWafFileLock(t, "CRS 重载失败回滚（树+VERSION+版本行）", func() {
+		m.rollbackAfterReloadFailure("v4.14.0")
+	})
+
+	data, err := os.ReadFile(filepath.Join(m.crsDir, "rules", "REQUEST-901-INITIALIZATION.conf"))
+	if err != nil || string(data) != "SecRule old" {
+		t.Fatalf("rules 树未回滚: %q,%v", data, err)
+	}
+	if got := readCRSVersionMarker(m.crsDir); got != "v4.14.0" {
+		t.Fatalf("VERSION 标记=%q, want v4.14.0（同代回滚）", got)
+	}
+	var version string
+	if err := db.DB.QueryRow(`SELECT version FROM security_crs_version WHERE id=1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != "v4.14.0" {
+		t.Fatalf("DB 版本行=%q, want v4.14.0（恢复下轮重试能力）", version)
 	}
 }

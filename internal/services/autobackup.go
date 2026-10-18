@@ -67,9 +67,22 @@ func writeAutoBackupEnabled(w autoBackupConfigWriter, enabled bool) error {
 }
 
 // SetAutoBackupEnabled 写自动备份业务开关并同步任务调度；off→on 保留
-// 既有水位线语义（停用期不追补），与设置页保存同口径。
+// 既有水位线语义（停用期不追补），与设置页保存同口径。D1-历史问题：两条 Exec
+// （enabled 与启用时的水位线）必须同事务——生产设置页走
+// SetAutoBackupEnabledTx，本入口仅测试消费，此前直写形态可能留下半态。
 func SetAutoBackupEnabled(enabled bool) error {
-	if err := writeAutoBackupEnabled(db.DB, enabled); err != nil {
+	if db.DB == nil {
+		return errors.New("数据库未初始化")
+	}
+	tx, err := db.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := writeAutoBackupEnabled(tx, enabled); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
 		return err
 	}
 	syncTaskLoop("auto-backup", enabled)
@@ -242,19 +255,48 @@ func runAutoBackupScheduled(ctx context.Context, engineRunID int64) error {
 	if exec == nil {
 		return errors.New("自动备份执行器未就绪")
 	}
+	// 历史问题-01：水位线槽必须在执行**开始前**固定。补跑跨槽边界结束（如 02:58
+	// 启动补昨日 03:00、03:00:10 结束）时用完成时刻重算会写到尚未执行的今日槽，
+	// nextAutoBackupSlot 判定「已跑」并步进到明日——当日备份静默漏跑。
+	startedAt := time.Now()
 	execErr := exec(ctx, "schedule", "system", engineRunID) // engineRunID=引擎已记行——执行器跳过自记（单写方）
 	if ctx.Err() != nil {
 		// 取消（角色降级/引擎停止）不等于本槽已完成：推进水位线会把漏掉的
 		// 备份槽记作已执行，恢复后不再补跑（历史问题-10）。
 		return execErr
 	}
-	row, err := loadAutoBackupSettings()
-	if err == nil {
-		if dueSlot, ok := autoBackupDueSlot(time.Now(), row.freq, row.hhmm, row.day, CurrentLocation()); ok {
-			if _, uerr := db.DB.Exec(`UPDATE global_config SET auto_backup_last_run=? WHERE id=1`, dueSlot.Format(time.RFC3339)); uerr != nil {
-				Logf("warn", "自动备份：更新 auto_backup_last_run 失败: %v", uerr)
-			}
-		}
-	}
+	advanceAutoBackupWatermark(startedAt)
 	return execErr
+}
+
+// autoBackupWatermarkSlot 返回本次执行应写入水位线的槽（历史问题-01）：以触发
+// 时刻 startedAt 计算 ≤startedAt 的最近调度槽（=引擎实际触发/补跑的槽），
+// 且仅当该槽晚于既有水位线（不倒退、不重复入账）。
+func autoBackupWatermarkSlot(startedAt time.Time) (time.Time, bool) {
+	row, err := loadAutoBackupSettings()
+	if err != nil {
+		return time.Time{}, false
+	}
+	loc := CurrentLocation()
+	due, ok := autoBackupDueSlot(startedAt.In(loc), row.freq, row.hhmm, row.day, loc)
+	if !ok {
+		return time.Time{}, false
+	}
+	if row.lastRun != nil && !due.After(*row.lastRun) {
+		return time.Time{}, false
+	}
+	return due, true
+}
+
+// advanceAutoBackupWatermark 把水位线推进到本次实际执行的槽；SQL 侧同样带
+// 「仅前进」守卫（并发手动/定时执行的更晚槽不被回退）。
+func advanceAutoBackupWatermark(startedAt time.Time) {
+	slot, ok := autoBackupWatermarkSlot(startedAt)
+	if !ok {
+		return
+	}
+	formatted := slot.Format(time.RFC3339)
+	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_last_run=? WHERE id=1 AND (auto_backup_last_run IS NULL OR auto_backup_last_run='' OR datetime(auto_backup_last_run) < datetime(?))`, formatted, formatted); err != nil {
+		Logf("warn", "自动备份：更新 auto_backup_last_run 失败: %v", err)
+	}
 }

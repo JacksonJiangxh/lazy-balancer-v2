@@ -959,31 +959,47 @@ export const formatDurationUs = (us: number | undefined): string => {
 export const IP_LIST_CATEGORIES = ['搜索引擎爬虫', 'CDN 节点', '云服务商', '办公网络', '数据中心', '可信地址', '恶意 IP', '其他'] as const
 
 // triggerStageFamily 触发 id→阶段族归类（FE65-2 收敛：TriggerDetailDialog kind 与
-// SecurityEvents stageCategory 的平行实现统一改引本函数——原 历史问题 导出版本带
-// msg 门且与两视图分支序不一致（id:8/11/14、1 开头 ≥7 位合成自定义各执一词），
-// 且当时零消费方，故按两视图一致的观察语义重写为唯一实现）。
-// 返回（细粒度，两视图各自投影）:
-//   'trust'|'ipAcl'|'geoip'|'threat'|'wafCustom'|'wafCrs'|'body'|'other'
-// 视图投影：SecurityEvents —— trust→trust，ipAcl/geoip/threat→acl（阶段 1 合并
-// 口径：黑白名单、地域、威胁情报同列），wafCrs/wafCustom→waf，body→body；
-// TriggerDetailDialog —— geoip→geo、threat→threat、wafCrs→waf-crs、wafCustom→
-// waf-custom，其余同名。分支序与等价性矩阵（两视图原实现对齐验证）：
-//   ''→other；11→body；9\\d{5}→wafCrs；\\d{5}与 1 开头≥7 位→wafCustom（合成
-//   自定义，历史问题）；3/12→trust；14→threat；800000-899999→geoip；2/4/5/7/8
-//   （含遗留共享 GeoIP id:8，历史问题 列表列同口径）→ipAcl；其余→other。
+// SecurityEvents stageCategory 的平行实现统一改引本函数）。
+//
+// 历史问题-F1（历史问题）：映射必须与后端 v2.3.8 权威分类同步——
+//   ① attackFamilyClassOf（internal/handlers/security.go）——ID 形态族：
+//      5 位任意 = 自定义（发射 id=crID+10000 落 10000-99999；CRS 恒 6 位）；
+//      6 位 1-7 开头 = DB 自定义规则 id 10000-789999 发射 id+10000；
+//      7 位+ 1 开头 = 无 id 规则合成 id 1000000+n。
+//      原实现只认 5 位与 1 开头≥7 位 → 6 位自定义（100000-799999）落 other，
+//      详情弹框按 default 误归 ACL。
+//   ② triggerTypeForRule（internal/handlers/security_threat_screen.go）——数值段：
+//      爬虫两族 [810000,900000)（豁免 [810000,850000) + 伪装 [850000,900000)）
+//      独立于地域 [800000,810000)；原实现把整段 800000-899999 归 geoip，
+//      爬虫事件详情显示「地域拦截规则（区域：…）」。
+// 返回（细粒度，消费方各自投影）:
+//   'trust'|'ipAcl'|'geoip'|'crawler'|'threat'|'wafCustom'|'wafCrs'|'body'|'other'
+// 视图投影：SecurityEvents —— trust→trust，crawler→crawler（独立阶段标签「爬虫
+// 校验」），ipAcl/geoip/threat→acl（阶段 1 合并口径：黑白名单、地域、威胁情报
+// 同列），wafCrs/wafCustom→waf，body→body；TriggerDetailDialog —— geoip→geo、
+// crawler→crawler、threat→threat、wafCrs→waf-crs、wafCustom→waf-custom。
 //   FE-9（历史登记）：合成自定义 id 上界段 [900000,1000000)（DB 规则 id
-//   ≥90000 → 触发 id ≥910000，会与 9\\d{5} CRS 段重叠）——自定义规则 id 达 9 万
+//   ≥90000 → 触发 id ≥910000，会与 9\d{5} CRS 段重叠）——自定义规则 id 达 9 万
 //   不现实（不可达），边界不修，仅登记留痕。
-export const triggerStageFamily = (ruleTriggered: string): 'trust' | 'ipAcl' | 'geoip' | 'threat' | 'wafCustom' | 'wafCrs' | 'body' | 'other' => {
-  const t = ruleTriggered ?? ''
+export type TriggerStageFamily = 'trust' | 'ipAcl' | 'geoip' | 'crawler' | 'threat' | 'wafCustom' | 'wafCrs' | 'body' | 'other'
+
+export const triggerStageFamily = (ruleTriggered: string): TriggerStageFamily => {
+  const t = (ruleTriggered ?? '').trim()
   if (!t) return 'other'
   if (t === '11') return 'body'
+  // ① 自定义规则 ID 形态（与后端 attackFamilyClassOf 分支同序）
+  if (/^\d{5}$/.test(t)) return 'wafCustom'
+  if (/^[1-7]\d{5}$/.test(t)) return 'wafCustom'
+  if (/^1\d{6,}$/.test(t)) return 'wafCustom'
+  // CRS 恒 6 位 9 开头（5 位 9xxxx 已由上方自定义分支覆盖）
   if (/^9\d{5}$/.test(t)) return 'wafCrs'
-  if (/^\d{5}$/.test(t) || /^1\d{6,}$/.test(t)) return 'wafCustom'
   const n = Number(t)
+  if (!Number.isFinite(n)) return 'other'
   if (n === 3 || n === 12) return 'trust'
   if (n === 14) return 'threat'
-  if (n >= 800000 && n < 900000) return 'geoip'
+  // ② 数值段：爬虫两族与地域段互斥（后端 历史问题 口径）
+  if (n >= 810000 && n < 900000) return 'crawler'
+  if (n >= 800000 && n < 810000) return 'geoip'
   if (n === 2 || n === 4 || n === 5 || n === 7 || n === 8) return 'ipAcl'
   return 'other'
 }

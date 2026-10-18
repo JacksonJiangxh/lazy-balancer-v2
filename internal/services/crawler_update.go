@@ -13,8 +13,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
+	"strings"
 	"time"
 
+	"lazy-balancer-v2/geoipnames"
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/taskengine"
 )
@@ -22,6 +25,50 @@ import (
 // CrawlerUpdateManager 爬虫地址库更新入口（与威胁库同为 Manager 形态；
 // 当前无运行态字段，单例仅统一生命周期与调用契约）。
 type CrawlerUpdateManager struct{}
+
+// validateCrawlerEntriesSanity 非结构化源（html/plain）的合理性门（历史问题-02）：
+// 解析结果至少一条须落在该引擎声明的官方段（geoipnames 单一事实源）内，
+// 否则视为错误页/版本串污染，保留上次快照。JSON 源已由结构化字段校验承担。
+func validateCrawlerEntriesSanity(engineID, format string, entries []string) error {
+	if strings.EqualFold(strings.TrimSpace(format), "json") {
+		return nil
+	}
+	if len(entries) == 0 {
+		return errors.New("解析无产出（疑似错误页/限流页），保留上次快照")
+	}
+	declared := crawlerEngineDeclaredRanges(engineID)
+	if len(declared) == 0 {
+		return nil // 引擎未声明官方段：无可对照的合理性口径
+	}
+	parsed := make([]netip.Prefix, 0, len(entries))
+	for _, entry := range entries {
+		if prefix, err := netip.ParsePrefix(entry); err == nil {
+			parsed = append(parsed, prefix)
+		}
+	}
+	for _, raw := range declared {
+		official, err := netip.ParsePrefix(raw)
+		if err != nil {
+			continue
+		}
+		for _, prefix := range parsed {
+			if official.Contains(prefix.Addr()) || prefix.Contains(official.Addr()) {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("解析结果（%d 条）未落在 %s 声明的官方 IP 段内（疑似错误页/版本串污染），保留上次快照", len(entries), engineID)
+}
+
+// crawlerEngineDeclaredRanges 返回引擎声明的官方 IP 段（geoipnames 单一源）。
+func crawlerEngineDeclaredRanges(engineID string) []string {
+	for _, engine := range geoipnames.CrawlerEngines() {
+		if engine.ID == engineID {
+			return engine.IPRanges
+		}
+	}
+	return nil
+}
 
 var crawlerUpdateManager = &CrawlerUpdateManager{}
 
@@ -117,6 +164,12 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		// 历史问题：按源声明格式解析（json 源的非 JSON 响应=错误页 → 失败并
 		// 保留上次快照；词法边界已排除版本号/日期等 IP 同形 token）。
 		entries, perr := parseCrawlerCIDRsForFormat(body, src.Format)
+		if perr == nil {
+			// 历史问题-02（历史）：非结构化源（html/plain）增加合理性门——
+			// 错误页/限流页只要含四段数字就可能覆盖豁免名单；解析结果至少一条
+			// 必须落在该引擎声明的官方段内，否则保留上次快照。
+			perr = validateCrawlerEntriesSanity(src.Name, src.Format, entries)
+		}
 		if perr != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("源 %s 解析失败: %w", src.Name, perr)

@@ -218,12 +218,11 @@ import { useAuthStore } from '@/stores/auth'
 import type { PageId } from '@/stores/auth'
 import { request, mfaAwareSuccess, ApiRequestError } from '@/utils/api'
 import { isCurrentPasswordRejection } from '@/utils/profileUpdate'
-import { ElMessageBox } from 'element-plus'
 import {Timer,  DataAnalysis, List, Setting, Cpu, User, Connection, Lock, Key, Document, Warning, Notebook } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import AppLogo from '@/components/AppLogo.vue'
 import { appName, footerHtml } from '@/utils/branding'
-import { reloadAfterRestart } from '@/utils/restart'
+import { restartServiceWithFeedback } from '@/utils/restart'
 
 const authStore = useAuthStore()
 const collapsed = ref(false)
@@ -381,27 +380,17 @@ const fetchDriftStatus = async () => {
 }
 
 const handleRestartForDrift = async () => {
-  try {
-    await ElMessageBox.confirm(
-      '将重启服务以重新应用全部规则配置，期间服务短暂不可用。确认重启？',
-      '重启服务恢复',
-      { confirmButtonText: '确认重启', cancelButtonText: '取消', type: 'warning' },
-    )
-  } catch {
-    return
-  }
+  if (restarting.value) return
   restarting.value = true
-  try {
-    await request.post('/system/restart')
-  } catch {
-    // 重启请求失败（全局拦截器已提示），复位按钮允许重试
-    restarting.value = false
-    return
-  }
-  mfaAwareSuccess('服务正在重启，就绪后自动刷新页面')
-  // 保持 restarting=true 直到 reload（防就绪等待窗口内二次点击）；超时或失败才复位
-  const reloaded = await reloadAfterRestart(() => disposed)
-  if (!reloaded) restarting.value = false
+  // 历史问题-F10：确认/重启/就绪轮询流程单源（utils/restart），与设置页同一实现
+  const result = await restartServiceWithFeedback({
+    confirmMessage: '将重启服务以重新应用全部规则配置，期间服务短暂不可用。确认重启？',
+    confirmTitle: '重启服务恢复',
+    confirmButtonText: '确认重启',
+    successMessage: '服务正在重启，就绪后自动刷新页面',
+    isDisposed: () => disposed,
+  })
+  if (result !== 'reloaded') restarting.value = false
 }
 
 onMounted(() => {

@@ -21,6 +21,18 @@ import (
 
 const apiBase = "https://dnsapi.cn/"
 
+// logf 是包级日志接缝（历史问题-3，镜像 ownership/acme 同型接缝）：运维告警
+// 进入统一日志级别/格式链，而不是裸 log.Printf 另走一条链路。main 启动
+// 早期经 SetLogf 装配；零值回退标准库。
+var logf = func(level, format string, args ...any) { log.Printf(format, args...) }
+
+// SetLogf 装配包级日志函数（main 启动早期调用；nil 忽略）。
+func SetLogf(f func(level, format string, args ...any)) {
+	if f != nil {
+		logf = f
+	}
+}
+
 // Domain.List 分页参数：length 上限 3000（超出强制分页），maxPages 仅防御
 // 忽略 offset 的异常服务端，避免死循环。
 const (
@@ -112,7 +124,7 @@ func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, t
 				// DNS，而 ownership 无条目可追踪（「删除失败不 Remove」的前提不
 				// 成立）。告警留痕 + 回填内存兜底表：cleanUp 的 ownership 分支会
 				// 排空兜底表并重试删除，避免该记录永久残留（无追踪窗口收口）。
-				log.Printf("WARNING: dnspod: 所有权写入失败且回滚删除失败，TXT %s (recordID=%s) 可能残留: %v", tokenFQDN, recordID, rollbackErr)
+				logf("warn", "dnspod: 所有权写入失败且回滚删除失败，TXT %s (recordID=%s) 可能残留: %v", tokenFQDN, recordID, rollbackErr)
 				p.mu.Lock()
 				p.owned[domainID+"|"+subDomain] = append(p.owned[domainID+"|"+subDomain], ownedRecord{recordID: recordID, value: value})
 				p.mu.Unlock()

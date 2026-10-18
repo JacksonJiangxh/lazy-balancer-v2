@@ -1,21 +1,31 @@
-// 自动封禁状态卡黄条判据（审计 81 历史问题-02）：ban_effective 为生效面单一判据；
-// list_referenced（四面引用集）仅保留为后端内部字段，不得再驱动黄条。
+// 自动封禁状态卡黄条判据（审计 81 历史问题-02；审计 83 历史问题 行为化：原源码
+// 正则断言改为纯函数行为断言）。
 //
 // 运行：cd web && npm test
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
 
-const src = readFileSync(new URL('../src/views/security/SecurityEvents.vue', import.meta.url), 'utf8')
+import { isAutobanIneffective } from '../src/utils/autobanStatus.ts'
 
-test('黄条判据：使用 ban_effective === false，不再用 list_referenced', () => {
-  assert.match(src, /autobanStatus\.enabled && autobanStatus\.ban_effective === false/)
-  assert.doesNotMatch(src, /autobanStatus\.list_referenced === false/, 'list_referenced 不得再驱动 UI')
+test('启用且 ban_effective === false 时展示黄条', () => {
+  assert.equal(isAutobanIneffective({ enabled: true, ban_effective: false }), true)
 })
 
-test('状态契约：ban_effective 已声明且默认 true（成功响应前 fail-closed 不弹黄条）', () => {
-  assert.match(src, /ban_effective: boolean/)
-  assert.match(src, /ban_effective: true/)
-  assert.match(src, /list_referenced: boolean/, 'list_referenced 作为后端内部字段保留')
+test('list_referenced 形态不再驱动黄条（判据只看 ban_effective）', () => {
+  // 历史回归：仅被白名单/受信代理引用时 list_referenced=true，但名单未被 deny
+  // 策略引用 → ban_effective=false。若判据误用 list_referenced 会两头都错：
+  const onlyReferencedButEffective = { enabled: true, ban_effective: true } as const
+  assert.equal(isAutobanIneffective(onlyReferencedButEffective), false)
+  const referencedButNotEffective = { enabled: true, ban_effective: false } as const
+  assert.equal(isAutobanIneffective(referencedButNotEffective), true)
+})
+
+test('未启用时不提示（黄条仅针对已启用但未生效）', () => {
+  assert.equal(isAutobanIneffective({ enabled: false, ban_effective: false }), false)
+  assert.equal(isAutobanIneffective({ enabled: false, ban_effective: true }), false)
+})
+
+test('fail-closed 默认：成功响应前 ban_effective 缺省不弹黄条', () => {
+  assert.equal(isAutobanIneffective({ enabled: true }), false)
 })

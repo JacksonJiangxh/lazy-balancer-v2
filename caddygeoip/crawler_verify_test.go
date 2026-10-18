@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sync"
@@ -415,5 +416,64 @@ func TestVerifyCrawlerIPRange_v4MappedAndZoneNormalized(t *testing.T) {
 	// 畸形形状：带 zone 地址 fail-closed。
 	if verifyCrawlerIPRangeFromList("2408:4000::1%eth0", "so360spider") {
 		t.Fatal("带 zone 地址必须 fail-closed")
+	}
+}
+
+// E83-历史问题：并发加载代际守卫——慢读者读到 rename 前的旧 inode，不得在新
+// 快照落定后把旧内容写回（否则官方段更新后旧段最多沿用 10 分钟）。
+func TestCrawlerIPRangeSnapshot_staleGenerationDoesNotOverwrite(t *testing.T) {
+	resetCrawlerIPRangeCacheForTest()
+	t.Cleanup(resetCrawlerIPRangeCacheForTest)
+	freshMod := time.Now()
+	fresh := &crawlerIPRangeSnapshot{
+		prefixes: map[string][]netip.Prefix{"so360spider": {netip.MustParsePrefix("42.236.8.0/21")}},
+		loadedAt: freshMod, ok: true, modTime: freshMod, size: 128,
+	}
+	if got := commitCrawlerIPRangeSnapshot(fresh); got != fresh {
+		t.Fatal("first successful snapshot must be committed")
+	}
+
+	stale := &crawlerIPRangeSnapshot{
+		prefixes: map[string][]netip.Prefix{"so360spider": {netip.MustParsePrefix("140.0.0.0/24")}},
+		loadedAt: time.Now(), ok: true,
+		modTime: freshMod.Add(-time.Hour), size: 96,
+	}
+	if got := commitCrawlerIPRangeSnapshot(stale); got != fresh {
+		t.Fatal("旧代际（更早 mtime）读取结果不得覆盖新快照")
+	}
+	crawlerFileCacheMu.Lock()
+	cached := crawlerFileCacheSnap
+	crawlerFileCacheMu.Unlock()
+	if cached != fresh || !cached.prefixes["so360spider"][0].Contains(netip.MustParseAddr("42.236.8.1")) {
+		t.Fatalf("cache content was polluted by a stale reader: %#v", cached)
+	}
+}
+
+// E83-历史问题 反向形状：并发成功快照落定后，较早开始的失败读取不得把它降级成
+// 空集（fail-closed 空窗）。TTL 到期后的失败读取（晚于成功落定）照常覆盖。
+func TestCrawlerIPRangeSnapshot_freshSuccessNotDowngradedByOldFailure(t *testing.T) {
+	resetCrawlerIPRangeCacheForTest()
+	t.Cleanup(resetCrawlerIPRangeCacheForTest)
+	fresh := &crawlerIPRangeSnapshot{
+		prefixes: map[string][]netip.Prefix{"googlebot": {netip.MustParsePrefix("66.249.66.0/24")}},
+		loadedAt: time.Now(), ok: true, modTime: time.Now(), size: 128,
+	}
+	commitCrawlerIPRangeSnapshot(fresh)
+
+	readStartedBefore := &crawlerIPRangeSnapshot{
+		prefixes: map[string][]netip.Prefix{},
+		loadedAt: time.Now().Add(-time.Second), ok: false,
+	}
+	if got := commitCrawlerIPRangeSnapshot(readStartedBefore); got != fresh {
+		t.Fatal("成功快照已刷新后，更早开始的失败读取不得降级快照")
+	}
+
+	// 对照：TTL 到期后发起的失败读取（晚于成功落定）仍须 fail-closed 覆盖。
+	laterFailure := &crawlerIPRangeSnapshot{
+		prefixes: map[string][]netip.Prefix{},
+		loadedAt: time.Now().Add(time.Second), ok: false,
+	}
+	if got := commitCrawlerIPRangeSnapshot(laterFailure); got != laterFailure {
+		t.Fatal("成功快照过期后的失败读取应覆盖为空快照（fail-closed）")
 	}
 }

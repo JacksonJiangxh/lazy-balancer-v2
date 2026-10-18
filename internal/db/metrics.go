@@ -44,6 +44,30 @@ func nextQuarantinePath(path string) string {
 	}
 }
 
+// quarantineRename 是 os.Rename 的注入缝（测试覆盖伴生文件改名失败路径）。
+var quarantineRename = os.Rename
+
+// quarantineCompanions 把主库 path 的 -wal/-shm 伴生文件一并改名为
+// <companion>.corrupt.<unix秒>（历史问题-3）。伴生文件承载未检查点化页与共享
+// 内存：主库改名后若静默留下旧 WAL，重建的新库下次打开会重放脏 WAL，再现
+// 损坏。因此任一伴生文件改名失败必须返回错误（由调用方中止重建/响亮失败），
+// 不得忽略。缺失伴生文件按正常路径跳过。
+func quarantineCompanions(path string) error {
+	var errs []error
+	for _, companion := range []string{path + "-wal", path + "-shm"} {
+		if _, err := os.Stat(companion); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("stat %s: %w", filepath.Base(companion), err))
+			}
+			continue
+		}
+		if err := quarantineRename(companion, nextQuarantinePath(companion)); err != nil {
+			errs = append(errs, fmt.Errorf("quarantine companion %s: %w", filepath.Base(companion), err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // quarantineCorruptSQLiteFile 检查 path 指向的库文件：存在、非空、且前
 // 16 字节不是 SQLite 魔数（头部页被清零/覆写的损坏形态）时，连同可能
 // 残留的 -wal/-shm 伴生文件一并改名为 <path>.corrupt.<unix秒> 隔离，
@@ -69,10 +93,8 @@ func quarantineCorruptSQLiteFile(path string) (string, error) {
 	if err := os.Rename(path, quarantined); err != nil {
 		return "", fmt.Errorf("quarantine corrupted database file: %w", err)
 	}
-	for _, companion := range []string{path + "-wal", path + "-shm"} {
-		if _, err := os.Stat(companion); err == nil {
-			_ = os.Rename(companion, nextQuarantinePath(companion))
-		}
+	if err := quarantineCompanions(path); err != nil {
+		return "", err
 	}
 	return quarantined, nil
 }
@@ -168,10 +190,8 @@ func quarantineMetricsFileUnconditionally(path string) (string, error) {
 	if err := os.Rename(path, quarantined); err != nil {
 		return "", fmt.Errorf("quarantine corrupted database file: %w", err)
 	}
-	for _, companion := range []string{path + "-wal", path + "-shm"} {
-		if _, err := os.Stat(companion); err == nil {
-			_ = os.Rename(companion, nextQuarantinePath(companion))
-		}
+	if err := quarantineCompanions(path); err != nil {
+		return "", err
 	}
 	return quarantined, nil
 }

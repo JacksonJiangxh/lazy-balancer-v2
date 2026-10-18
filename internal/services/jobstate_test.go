@@ -230,9 +230,12 @@ func TestTransitionJob_allowsOnlyOneConcurrentWriter(t *testing.T) {
 func TestCertJobStatusWrites_useApprovedEntryPoints(t *testing.T) {
 	// Given
 	approved := map[string]map[string]bool{
-		"db/db.go":                  {"createTables": true, "migrateCertJobsStatusConstraint": true},
-		"services/jobstate.go":      {"transitionJob": true},
-		"services/certificates.go":  {"restoreCertJobsForRule": true, "CreateOrRequeueCertJobWithChange": true},
+		"db/db.go":             {"createTables": true, "migrateCertJobsStatusConstraint": true},
+		"services/jobstate.go": {"transitionJob": true},
+		// upsertQueuedCertJob：原 CreateOrRequeueCertJobWithChange 内联的
+		// 「排队签发」upsert 闭包（历史问题-01 抽为单源，供补建路径复用）——
+		// 与原批准点同语义（INSERT..ON CONFLICT 置 queued），不是新绕行写点。
+		"services/certificates.go":  {"restoreCertJobsForRule": true, "CreateOrRequeueCertJobWithChange": true, "upsertQueuedCertJob": true},
 		"services/cluster_apply.go": {"replaceSnapshotTx": true},
 		"handlers/certjobs.go":      {"RetryCertJob": true, "retryCertJobByID": true, "DeleteCertJob": true},
 		"handlers/rules.go":         {"UpdateRule": true, "EnableRule": true, "DisableRule": true, "retireCertJobsForDomain": true},

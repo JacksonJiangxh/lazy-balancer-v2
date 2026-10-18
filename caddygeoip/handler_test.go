@@ -360,6 +360,38 @@ func TestGeoipLocFor_trimsChinaCountryColumn(t *testing.T) {
 	}
 }
 
+// E83-历史问题：发射侧国家列 TrimSpace——变量/头/统计桶与 geoipLocFor 同口径。
+// 空白异形行（" 中国"）修复前出现 Loc=广东省 但 country_name=" 中国" 的
+// 自相矛盾取值。
+func TestParseGeoIPRegion_trimsCountryForEmission(t *testing.T) {
+	cases := []struct {
+		region      string
+		wantCountry string
+		wantLoc     string
+	}{
+		{"中国|广东省|深圳市|0|ISP", "中国", "广东省/深圳市"},
+		{" 中国|广东省|深圳市|0|ISP", "中国", "广东省/深圳市"},
+		{"\t中国 |广东省|0|0|ISP", "中国", "广东省"},
+		{"United States|0|0|0|ISP", "United States", "United States"},
+		{" 美国|0|0|0|ISP", "美国", "United States"},
+	}
+	for _, tc := range cases {
+		got, ok := parseGeoIPRegion(tc.region)
+		if !ok {
+			t.Fatalf("parseGeoIPRegion(%q) rejected a %d-field row", tc.region, 5)
+		}
+		if got.Country != tc.wantCountry {
+			t.Errorf("parseGeoIPRegion(%q).Country=%q, want %q（发射侧必须 TrimSpace）", tc.region, got.Country, tc.wantCountry)
+		}
+		if got.Loc != tc.wantLoc {
+			t.Errorf("parseGeoIPRegion(%q).Loc=%q, want %q", tc.region, got.Loc, tc.wantLoc)
+		}
+	}
+	if _, ok := parseGeoIPRegion("中国|广东省"); ok {
+		t.Fatal("截断行（<5 列）必须拒绝发射")
+	}
+}
+
 // TestProvision_sharedSearcherSingletonPerXdbPath（审计 M2）：同 XdbPath 的
 // 多个 handler 必须共享同一 Ip2Region 实例——每 handler 各建一份会各开 20 个
 // searcher fd（50 条 GeoIP 规则≈1000 fd 逼近 soft limit，重载期翻倍），fd 耗尽

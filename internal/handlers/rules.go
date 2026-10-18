@@ -1278,7 +1278,10 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			if restoreErr := restoreCreatedRule(); restoreErr != nil {
 				services.Logf("error", "问题: CreateRule ACME compensation failed for caddy_id=%s: %v", caddyID, restoreErr)
 			}
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "创建证书任务失败: " + err.Error()})
+			// 历史问题-05：证书签发任务未运行（队列 paused/inactive）与手工签发
+			// 同口径 409，不再折成 500 误报内部故障。
+			status, message := certEnqueueErrorResponse("创建证书任务失败", err)
+			c.JSON(status, models.APIResponse{Code: status, Message: message})
 			return
 		}
 	}
@@ -1292,6 +1295,16 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	recordAudit(c, "创建", "负载规则", services.FormatAuditDetail(createAuditParts...))
 	reloadNote()
 	c.JSON(http.StatusCreated, models.APIResponse{Code: 0, Message: "规则已创建", Data: gin.H{"caddy_id": caddyID}})
+}
+
+// certEnqueueErrorResponse 证书任务入队失败的状态/文案单源（历史问题-05）：
+// 证书签发任务未运行（队列 paused/inactive）→ 409 点名可操作原因，与手工
+// 签发端点同口径；其余内部失败维持 500。
+func certEnqueueErrorResponse(prefix string, err error) (int, string) {
+	if errors.Is(err, services.ErrCertificateQueueInactive) {
+		return http.StatusConflict, prefix + "：证书签发任务已停止，请先在任务监控中恢复后再试（" + err.Error() + "）"
+	}
+	return http.StatusInternalServerError, prefix + ": " + err.Error()
 }
 
 // retireOldDomainCertJobOrAudit LBH-A-2（历史 历史问题）：UpdateRule 域名迁移
@@ -2417,7 +2430,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 					c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: fmt.Sprintf("创建证书任务失败且恢复失败: %v; %v", err, restoreErr)})
 					return
 				}
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "创建证书任务失败: " + err.Error()})
+				status, message := certEnqueueErrorResponse("创建证书任务失败", err)
+				c.JSON(status, models.APIResponse{Code: status, Message: message})
 				return
 			}
 		}
@@ -3374,7 +3388,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		}
 		return errors.Join(caddyErr, dbErr, jobsErr)
 	}
-	failEnable := func(message string) {
+	failEnableWithStatus := func(message string, status int) {
 		// LBH79-历史问题：启用端点为 Explicit 审计策略，中间件不兜底；此前
 		// 提交后的失败（CA 解析/任务读取/Resume 0 行等）只回滚无操作审计，
 		// 运维无法追溯谁在何时启用了哪条规则以及失败原因。
@@ -3387,7 +3401,13 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		}
 		recordAudit(c, "启用失败", "负载规则", services.FormatAuditDetail(
 			services.AuditRulePart(caddyID), message, services.AuditResultPart("failure")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: message})
+		c.JSON(status, models.APIResponse{Code: status, Message: message})
+	}
+	failEnable := func(message string) { failEnableWithStatus(message, http.StatusInternalServerError) }
+	// 历史问题-05：入队失败按错误种类定状态（证书签发任务未运行 → 409）。
+	failCertEnqueue := func(prefix string, enqueueErr error) {
+		status, message := certEnqueueErrorResponse(prefix, enqueueErr)
+		failEnableWithStatus(message, status)
 	}
 
 	domain := ruleDomain
@@ -3441,7 +3461,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 			}
 			enqueuedJobID, err = services.CreateOrRequeueCertJob(caddyID, domain, caProviderID, queueManager)
 			if err != nil {
-				failEnable("创建证书任务失败: " + err.Error())
+				failCertEnqueue("创建证书任务失败", err)
 				return
 			}
 			recordAudit(c, "创建", "证书任务", fmt.Sprintf("启用规则 %s，创建证书任务 (%s)", caddyID, domain))
@@ -3486,7 +3506,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 			}
 			enqueuedJobID, err = services.CreateOrRequeueCertJob(caddyID, domain, caProviderID, queueManager)
 			if err != nil {
-				failEnable("续签排队失败: " + err.Error())
+				failCertEnqueue("续签排队失败", err)
 				return
 			}
 			recordAudit(c, "续签", "证书任务", fmt.Sprintf("启用规则 %s，证书即将过期，重新排队续签", caddyID))
@@ -3497,7 +3517,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 			}
 			enqueuedJobID, err = services.CreateOrRequeueCertJob(caddyID, domain, caProviderID, queueManager)
 			if err != nil {
-				failEnable("重试排队失败: " + err.Error())
+				failCertEnqueue("重试排队失败", err)
 				return
 			}
 			recordAudit(c, "重试", "证书任务", fmt.Sprintf("启用规则 %s，任务之前已暂停/失败，重新排队", caddyID))

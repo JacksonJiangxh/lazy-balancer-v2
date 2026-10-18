@@ -788,6 +788,12 @@ func TestSyncService_run_stopsAfterReportingHigherMasterSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	cluster := NewClusterService(database, "")
+	// 历史问题-历史问题：ReportNode 现在带 SQL 级主节点角色条件（降级竞态不可写）。
+	// 本用例在同一库上模拟「主节点接收从节点上报」，必须先把角色落成主节点，
+	// 否则会被角色守卫按降级拒绝（从端上报本身由 HTTP requireMaster 先行门禁）。
+	if _, err := database.Exec("UPDATE global_config SET is_master=1 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
 	if err := cluster.ReportNode(context.Background(), int(nodeID), report, time.Now()); err != nil {
 		t.Fatal(err)
 	}

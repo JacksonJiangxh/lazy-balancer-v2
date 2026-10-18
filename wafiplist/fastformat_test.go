@@ -196,3 +196,53 @@ func TestFastFile_NestedPrefixesRejected(t *testing.T) {
 		t.Fatalf("adjacent disjoint prefixes must load, got: %v", err)
 	}
 }
+
+// E83-历史问题：读侧必须校验主机位已掩码——.fast 是跨进程输入（节点回传），
+// 单条未掩码条目可通过 bits/升序/嵌套全部校验，却让二分查询用未掩码地址
+// 比较而假阴性（威胁名单静默漏拦）。
+func TestFastFile_UnmaskedEntriesRejected(t *testing.T) {
+	dir := t.TempDir()
+
+	// 单条未掩码 v4：1.2.3.200/24（无前驱可比较嵌套；修复前可加载）。
+	v4Path := filepath.Join(dir, "unmasked-v4.fast")
+	data := make([]byte, 0, 16+5)
+	data = append(data, []byte(fastFileMagic)...)
+	data = append(data, 0, 0, 0, 1) // v4_count=1
+	data = append(data, 0, 0, 0, 0) // v6_count=0
+	data = append(data, 0, 0, 0, 0) // 保留 4 字节
+	data = append(data, 1, 2, 3, 200, 24)
+	if err := os.WriteFile(v4Path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFastFile(v4Path); err == nil {
+		t.Fatal("unmasked v4 host bits must be rejected（二分假阴性）")
+	}
+
+	// 单条未掩码 v6：2001:db8::1/32。
+	v6Addr := netip.MustParseAddr("2001:db8::1").As16()
+	v6Path := filepath.Join(dir, "unmasked-v6.fast")
+	data = make([]byte, 0, 16+17)
+	data = append(data, []byte(fastFileMagic)...)
+	data = append(data, 0, 0, 0, 0) // v4_count=0
+	data = append(data, 0, 0, 0, 1) // v6_count=1
+	data = append(data, 0, 0, 0, 0) // 保留 4 字节
+	data = append(data, v6Addr[:]...)
+	data = append(data, 32)
+	if err := os.WriteFile(v6Path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFastFile(v6Path); err == nil {
+		t.Fatal("unmasked v6 host bits must be rejected（二分假阴性）")
+	}
+
+	// 反例：写侧产物（掩码后）照常加载。
+	okPath := filepath.Join(dir, "masked.fast")
+	if err := WriteFastFile(okPath, []netip.Prefix{
+		netip.MustParsePrefix("1.2.3.200/24"),
+	}, []netip.Prefix{netip.MustParsePrefix("2001:db8::1/32")}); err != nil {
+		t.Fatalf("WriteFastFile: %v", err)
+	}
+	if _, err := ReadFastFile(okPath); err != nil {
+		t.Fatalf("masked entries from WriteFastFile must load, got: %v", err)
+	}
+}

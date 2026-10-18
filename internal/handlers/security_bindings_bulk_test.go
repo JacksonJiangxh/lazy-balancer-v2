@@ -385,3 +385,28 @@ func TestSetRuleSecurityPolicies_dbErrorReturns500(t *testing.T) {
 		t.Fatalf("body=%s, want 读取/写入策略绑定失败", recorder.Body.String())
 	}
 }
+
+// A83A-历史问题（历史）：bind+unbind 数量上限必须按归一（TrimSpace+去重）
+// 后的集合判定——101 个重复/空白项归一后仅 1 条规则，旧实现先按原始长度 400。
+func TestBulkUpdatePolicyBindings_sizeLimitAfterNormalization(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router, _ := newBulkBindingsRouter(t)
+	seedHTTPRule(t, "lb_bulk_norm")
+	policy := createMultiPolicy(t, router, "bulk-norm")
+	bind := make([]string, 0, 101)
+	for i := 0; i < 101; i++ {
+		if i%2 == 0 {
+			bind = append(bind, " lb_bulk_norm ")
+			continue
+		}
+		bind = append(bind, "lb_bulk_norm")
+	}
+	recorder := postJSON(t, router, fmt.Sprintf("/security/policies/%d/bindings/bulk", policy), map[string]any{
+		"bind":   bind,
+		"unbind": []string{},
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("归一后仅 1 条规则: status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_bulk_norm"), []int{policy})
+}

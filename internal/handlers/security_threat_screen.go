@@ -193,6 +193,12 @@ const (
 	// threatRollupGeoIPGenerationKey 固化时使用的归属地库代际（历史问题）：
 	// 与当前代际不一致 → 重固窗口（库恢复后历史空归属地维度自愈）。
 	threatRollupGeoIPGenerationKey = "threat_rollup_geoip_generation"
+	// threatRollupRebuildFromKey 未完成的全量重建意图起点（A83A-历史问题-01）：
+	// 目标维度就绪标记缺失 / GeoIP 代际变化的触发窗口起点。意图存在期间每次
+	// 固化都按 fullRebuild 处理并把回填下界扩到该起点，覆盖底端推进到起点后
+	// 删除——修复「单次调用最多 23h，其余分钟的增量路径无新事件即 no-op，
+	// 目标维度/归属地永不补算、就绪标记却已写入」的自愈中断。
+	threatRollupRebuildFromKey = "threat_rollup_rebuild_from"
 	// threatRollupStaleAfter 固化陈旧阈值（历史 历史问题）：warmer 每 60s
 	// 一轮，超过 3 分钟无成功固化视为陈旧——请求路径改为同步固化，持续失败
 	// 以 500 显式暴露，不得把旧值伪装成最新 200。
@@ -404,12 +410,12 @@ func ensureThreatRollupWithYields(hours int) error {
 		lastFixed.Before(dFrom.Add(-time.Minute))
 	// 历史问题：目标维度 rollup 升级标记缺失（旧库首次运行含此修复的版本）→
 	// 覆盖区间同按空处理，窗口内分钟全部重固并补出 rule_caddy_id 计数。
-	rebuildAll := false
+	rebuildNeeded := false
 	if _, targetReady, terr := loadThreatRollupState(database, threatRollupTargetReadyKey); terr != nil {
 		return terr
 	} else if !targetReady {
 		emptyCoverage = true
-		rebuildAll = true
+		rebuildNeeded = true
 	}
 	// 历史问题：归属地维度只在固化时计算——xdb 在缺口分钟内不可用（启动期/
 	// 热换窗口）会让该窗 country/province 永久为空。归属地库代际变化（首次
@@ -420,11 +426,35 @@ func ensureThreatRollupWithYields(hours int) error {
 		return gerr
 	} else if !genOK || curGen != geoipGen {
 		emptyCoverage = true
-		rebuildAll = true
+		rebuildNeeded = true
 	}
 	if emptyCoverage {
 		coveredFrom = dTo.Add(time.Minute)
 		lastFixed = dTo
+	}
+	// A83A-历史问题-01（历史）：重建意图跨调用持久化。旧实现只在触发
+	// 那一轮把 rebuildAll 置真——单次最多回填 23h（批数上限），宽窗口其余
+	// 分钟的增量路径在「无新事件」时直接 no-op，目标维度/归属地永不补算，
+	// 而目标就绪标记已在首轮写入（后续调用 rebuildAll=false），自愈中断且
+	// backfill_incomplete 不再披露。持久化起点并据此扩展回填下界，使后续
+	// 任意窗口的调用都继续全量重建，直到覆盖底端到达意图起点。
+	rebuildFrom, hasRebuildFrom, err := loadThreatRollupState(database, threatRollupRebuildFromKey)
+	if err != nil {
+		return err
+	}
+	if rebuildNeeded {
+		if !hasRebuildFrom || dFrom.Before(rebuildFrom) {
+			rebuildFrom = dFrom
+		}
+		hasRebuildFrom = true
+		if _, err := database.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+			threatRollupRebuildFromKey, rebuildFrom.Format("2006-01-02 15:04")); err != nil {
+			return err
+		}
+	}
+	rebuildAll := hasRebuildFrom
+	if rebuildAll && rebuildFrom.Before(dFrom) {
+		dFrom = rebuildFrom
 	}
 	saveCoverage := func(tx *sql.Tx, from, until time.Time) error {
 		if _, err := tx.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, threatRollupCoveredFromKey, from.Format("2006-01-02 15:04")); err != nil {
@@ -568,6 +598,14 @@ func ensureThreatRollupWithYields(hours int) error {
 			return err
 		}
 	}
+	// A83A-历史问题-01：覆盖底端已推进到持久化重建起点——意图窗口内的旧侧分钟
+	// （以及本轮新侧/最新段）均已按全量重建固化，清除意图标记，恢复正常增量
+	// 语义。批数用尽未到达时保留标记，后续调用继续全量重建。
+	if rebuildAll && !coveredFrom.After(rebuildFrom) {
+		if _, err := database.Exec(`DELETE FROM metrics_state WHERE key=?`, threatRollupRebuildFromKey); err != nil {
+			return err
+		}
+	}
 	markThreatRollupSuccess()
 	return nil
 }
@@ -692,7 +730,9 @@ var queryThreatRecentBlocked = func(sinceMinute string) (int, error) {
 	return blocked, err
 }
 
-const threatRollupEventHighwaterPrefix = "threat_rollup_max_event_id:"
+// threatRollupEventHighwaterPrefix 分钟高水位键前缀——与保留清理共用单一
+// 事实源（A83A-历史问题：写入/删除两份硬编码曾漂移为「只写不删」）。
+const threatRollupEventHighwaterPrefix = services.ThreatRollupEventHighwaterPrefix
 
 func loadThreatRollupEventHighwater(tx *sql.Tx, minute string) (int64, error) {
 	var raw string

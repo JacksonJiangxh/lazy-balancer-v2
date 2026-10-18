@@ -86,6 +86,11 @@ func TestVersionTasks_slaveRoleRejectsManualTrigger(t *testing.T) {
 		if _, err := db.DB.Exec(`UPDATE `+tc.table+` SET auto_update=1,next_update=? WHERE id=1`, past); err != nil {
 			t.Fatal(err)
 		}
+		// 从节点态必须同时体现在 DB（单源角色）：历史问题-1 的角色对账会按 DB
+		// 修正引擎角色，仅 SetRole(false) 而 DB 仍为主节点会在下一 tick 被翻回。
+		if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+			t.Fatal(err)
+		}
 		te.SetRole(false)
 		if err := te.Trigger(tc.id, "manual", ""); err == nil {
 			t.Errorf("%s 从节点手动触发未被角色门拒绝", tc.id)
@@ -120,6 +125,12 @@ func TestVersionTasks_slaveRoleSuppressesTick(t *testing.T) {
 			}
 			past := time.Now().UTC().Add(-time.Hour).Format(crsTimeLayout)
 			if _, err := db.DB.Exec(`UPDATE `+table+` SET auto_update=1,next_update=? WHERE id=1`, past); err != nil {
+				t.Fatal(err)
+			}
+			// 从节点态必须同时体现在 DB（单源角色）：历史问题-1 的 60s 角色对账
+			// 会按 DB 修正引擎角色——仅 SetRole(false) 而 DB 仍为主节点时，
+			// 对账会把引擎翻回主角色，本用例的从角色前提随之失效。
+			if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
 				t.Fatal(err)
 			}
 			te.SetRole(false)

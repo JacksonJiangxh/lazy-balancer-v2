@@ -198,7 +198,9 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 	// 解析的策略（直接构造/非生成路径）由 helper 回退 inline-only。
 	ipWL := mergedWhitelist(p)
 	var ipBL []string
-	json.Unmarshal(p.IPBlacklist, &ipBL)
+	if err := json.Unmarshal(p.IPBlacklist, &ipBL); err != nil {
+		logMalformedInlineIPList(p.ID, "ip_blacklist", err)
+	}
 	ipBL = aggregateIPEntries(ipBL)
 	ipACLList := mergedACLList(p)
 
@@ -776,6 +778,12 @@ func conditionsEmissionIssue(conditions []models.CustomRuleCondition) string {
 // （无 conditions、靠 target/operator/pattern 发射），并对该形状同样校验 target/
 // operator 合法性。
 func customRuleEmissionIssue(cr models.CustomRule) string {
+	// 历史问题-01（历史）：负 ID 不受下方 ≥790000 门约束——cr.ID=-9990
+	// 发射 id:10 与引擎 body processor 冲突，cr.ID<=-10000 产出负 SecRule id；
+	// 二者均使 coraza 拒绝整份配置（违背「单条坏规则不得拖垮整站」的守卫契约）。
+	if cr.ID < 0 {
+		return "规则 id 为负数"
+	}
 	// 带外旧库/集群快照可能绕过写侧校验；非法分值会产出 "+-5" 等整份
 	// 配置级编译错误，非法动作会静默改变语义。0 分与空动作保留旧版缺省形状。
 	if cr.Score != 0 && !customRuleValidScores[cr.Score] {
@@ -955,7 +963,9 @@ func SecurityPolicyHasIPControl(p *models.SecurityPolicy) bool {
 		return true
 	}
 	var ipBL []string
-	json.Unmarshal(p.IPBlacklist, &ipBL)
+	if err := json.Unmarshal(p.IPBlacklist, &ipBL); err != nil {
+		logMalformedInlineIPList(p.ID, "ip_blacklist", err)
+	}
 	return len(aggregateIPEntries(ipBL)) > 0
 }
 
@@ -1411,7 +1421,9 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 			}
 		}
 		var blacklist []string
-		json.Unmarshal(p.IPBlacklist, &blacklist)
+		if err := json.Unmarshal(p.IPBlacklist, &blacklist); err != nil {
+			logMalformedInlineIPList(p.ID, "ip_blacklist", err)
+		}
 		blacklistUnion = append(blacklistUnion, blacklist...)
 	}
 	hasGeoIP := false
@@ -1701,6 +1713,7 @@ func resolvePolicyCustomRules(raw json.RawMessage, store caddyConfigStore) []mod
 		}
 		var rules []models.CustomRule
 		queriedIDs := make(map[int]struct{}, len(ids))
+		scanFailedIDs := make(map[int]struct{}, 0)
 		seenIDs := make(map[int]struct{}, len(ids))
 		for start := 0; start < len(ids); start += policyCustomRuleChunkSize {
 			end := start + policyCustomRuleChunkSize
@@ -1724,15 +1737,23 @@ func resolvePolicyCustomRules(raw json.RawMessage, store caddyConfigStore) []mod
 				queriedIDs[id] = struct{}{}
 			}
 			for rows.Next() {
+				var rowID int
 				var cr models.CustomRule
 				var conditionsJSON string
-				if err := rows.Scan(&cr.ID, &cr.Name, &conditionsJSON, &cr.Action, &cr.Score, &cr.Enabled); err != nil {
-					msg := fmt.Sprintf("解析策略自定义规则行扫描失败（规则 id=%d）: %v", cr.ID, err)
+				// 历史问题-02（历史）：先单独接收 id——Scan 中途失败时该
+				// 列已赋值，可把本行从「悬空引用」计数中排除（行存在但解析失败
+				// 不是「规则已删除」，旧实现把它计入 N 个不存在）。
+				if err := rows.Scan(&rowID, &cr.Name, &conditionsJSON, &cr.Action, &cr.Score, &cr.Enabled); err != nil {
+					if rowID != 0 {
+						scanFailedIDs[rowID] = struct{}{}
+					}
+					msg := fmt.Sprintf("解析策略自定义规则行扫描失败（规则 id=%d）: %v", rowID, err)
 					if auditFailureShouldLog(msg) {
 						Logf("warn", "%s", msg)
 					}
 					continue
 				}
+				cr.ID = rowID
 				// S历史问题-5:跨 500 分块重复引用查重——同 ID 双 SecRule 会被
 				// coraza 编译拒绝,毒化策略无法落库。
 				// 历史问题(历史):O(m²) 线性扫→map 判重(queriedIDs
@@ -1756,7 +1777,19 @@ func resolvePolicyCustomRules(raw json.RawMessage, store caddyConfigStore) []mod
 		// 其 id 从未读回，计入悬空会把「查询失败」误报为「规则已删除」。
 		// 历史问题 B-S6：queried 按去重后的 id 计数——custom_rules 数组含重复 id 时
 		// IN 只返回一行，不去重会把「重复引用」误报为「历史问题 个不存在」。
-		if dropped := len(queriedIDs) - len(rules); dropped > 0 {
+		// 历史问题-02（历史）：行扫描失败（行存在、内容不可解析）不得
+		// 计入「不存在」——按 queried∩未成功∩非 scan 失败 逐 id 判定。
+		dropped := 0
+		for id := range queriedIDs {
+			if _, ok := seenIDs[id]; ok {
+				continue
+			}
+			if _, failed := scanFailedIDs[id]; failed {
+				continue
+			}
+			dropped++
+		}
+		if dropped > 0 {
 			Logf("warn", "策略引用的自定义规则有 %d 个不存在，已跳过", dropped)
 		}
 		return rules

@@ -1039,8 +1039,22 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "存储的 IP 列表条目已损坏，请删除后重建"})
 		return
 	}
-	for _, entry := range entries {
-		if entry.Value == req.Value {
+	// 预置名单手动追加条目的默认备注：手动封禁（任务 merge 的挤出豁免判据
+	// 是 remark=自动封禁，手动条目天然豁免；备注区分来源便于面板展示）。
+	newEntryRemark := "事件处置"
+	if system != 0 {
+		newEntryRemark = services.AutobanManualUnbanRemark
+	}
+	// 历史问题（历史）：同值判重必须区分「生效中」与「已到期未清理」——
+	// 自动封禁关闭时过期条目永不清理，旧实现命中即 added:false，手动封禁成为
+	// 静默 no-op（渲染生效集仍为空）。到期条目原位覆盖为手动条目（清空
+	// expires_at），生效条目保持幂等返回。
+	added := true
+	for i, entry := range entries {
+		if entry.Value != req.Value {
+			continue
+		}
+		if len(services.AutobanActiveEntries([]models.IPListEntry{entry})) > 0 {
 			if err := tx.Commit(); err != nil {
 				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + err.Error()})
 				return
@@ -1048,18 +1062,17 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"added": false}})
 			return
 		}
+		entries[i] = models.IPListEntry{Value: req.Value, Remark: newEntryRemark}
+		added = false
+		break
 	}
-	// 预置名单手动追加条目的默认备注：手动封禁（任务 merge 的挤出豁免判据
-	// 是 remark=自动封禁，手动条目天然豁免；备注区分来源便于面板展示）。
-	newEntryRemark := "事件处置"
-	if system != 0 {
-		newEntryRemark = services.AutobanManualUnbanRemark
+	if added {
+		if len(entries) >= ipListMaxEntries {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("条目数量不能超过 %d 条", ipListMaxEntries)})
+			return
+		}
+		entries = append(entries, models.IPListEntry{Value: req.Value, Remark: newEntryRemark})
 	}
-	if len(entries) >= ipListMaxEntries {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("条目数量不能超过 %d 条", ipListMaxEntries)})
-		return
-	}
-	entries = append(entries, models.IPListEntry{Value: req.Value, Remark: newEntryRemark})
 	mergedJSON, err := json.Marshal(entries)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
@@ -1070,9 +1083,14 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 		return
 	}
 
+	// 历史问题：覆盖已到期条目的动作在审计/提示中显式区分（不是「新增」）。
+	actionLabel := "新增"
+	if !added {
+		actionLabel = "覆盖已到期条目"
+	}
 	if h.tryIPListHotPathApply(c, tx, id, true, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "写入",
-		AuditDetail: fmt.Sprintf("名称：%s（#%s）追加 IP %s（新增，现共 %d 条）", listName, id, req.Value, len(entries)),
+		AuditDetail: fmt.Sprintf("名称：%s（#%s）追加 IP %s（%s，现共 %d 条）", listName, id, req.Value, actionLabel, len(entries)),
 		SuccessMsg:  "已追加",
 		Data:        gin.H{"added": true},
 	}) {
@@ -1080,7 +1098,7 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "写入",
-		AuditDetail: fmt.Sprintf("名称：%s（#%s）追加 IP %s（新增，现共 %d 条）", listName, id, req.Value, len(entries)),
+		AuditDetail: fmt.Sprintf("名称：%s（#%s）追加 IP %s（%s，现共 %d 条）", listName, id, req.Value, actionLabel, len(entries)),
 		SuccessMsg:  "已追加",
 		Data:        gin.H{"added": true},
 	})
@@ -1369,11 +1387,18 @@ func (h *Handlers) ExportIPList(c *gin.Context) {
 	if system == 1 && services.IsThreatSystemListName(name) {
 		// 威胁名单以 .iplist/.fast 代际文件为唯一真相；DB entries 可能
 		// 是文件化前遗留内容，不得优先导出。文件缺失按空导出。
-		if vals, ferr := services.ReadThreatIplistForUI(name); ferr == nil {
-			entries = make([]models.IPListEntry, 0, len(vals))
-			for _, v := range vals {
-				entries = append(entries, models.IPListEntry{Value: v})
-			}
+		vals, ferr := services.ReadThreatIplistForUI(name)
+		if ferr != nil {
+			// 历史问题（历史）：只有「文件不存在」按空导出；读取/解析
+			// 故障必须显式 500——否则调用方拿到 200 空文件无法区分「名单为空」，
+			// 与同域读端点（GetIPList）的失败口径一致。
+			services.Logf("error", "导出威胁名单 %q 读取失败: %v", name, ferr)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取威胁名单文件失败: " + ferr.Error()})
+			return
+		}
+		entries = make([]models.IPListEntry, 0, len(vals))
+		for _, v := range vals {
+			entries = append(entries, models.IPListEntry{Value: v})
 		}
 	} else {
 		// 自定义/自动封禁/爬虫名单：DB entries（空串/畸形按空导出）。

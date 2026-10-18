@@ -4,10 +4,10 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
 
 import { createLazyLoader } from '../src/utils/lazyOnce.ts'
 import { usePollingTask } from '../src/composables/usePollingTask.ts'
+import { createSessionSingleFlight } from '../src/utils/sessionSingleFlight.ts'
 
 test('暂停轮询：中止在途任务信号、作废旧结果，恢复后用新信号（历史问题）', async () => {
   const gate = Promise.withResolvers<void>()
@@ -38,10 +38,86 @@ test('暂停轮询：中止在途任务信号、作废旧结果，恢复后用�
   polling.stop()
 })
 
-test('CRS 新对话框会话不会被旧单飞请求饿死（历史问题 源码契约）', () => {
-  const src = readFileSync(new URL('../src/composables/useCrsRuleIndex.ts', import.meta.url), 'utf8')
-  assert.match(src, /requestedSeq = openSeq\s+if \(inflight\)/, '新会话必须先登记，再复用旧请求')
-  assert.match(src, /inflight\.then\(/, '旧请求若已失效，必须链式补取新会话')
+test('CRS 新对话框会话不会被旧单飞请求饿死（历史问题 行为）', async () => {
+  // 场景：会话 1 的请求在途 → 会话 2 打开（旧请求失效）→ 旧请求后到。
+  // 期望：旧结果丢弃、会话 2 追加一次请求并落地；（原子实现会让会话 2 空等且永不 loaded）
+  const loads: number[] = []
+  const applied: Array<{ session: number; value: string }> = []
+  const first = Promise.withResolvers<string>()
+  const second = Promise.withResolvers<string>()
+  const loader = createSessionSingleFlight<string>({
+    load: (session) => {
+      loads.push(session)
+      return session === 1 ? first.promise : second.promise
+    },
+    apply: (value, session) => { applied.push({ session, value }) },
+  })
+  const p1 = loader.ensure(1)
+  const p2 = loader.ensure(2)
+  assert.deepEqual(loads, [1], '会话 2 打开时复用旧在途请求，不并发双发')
+  first.resolve('stale')
+  await p1
+  // 旧请求 settled 后链式补取会话 2
+  assert.deepEqual(loads, [1, 2], '旧请求失效后必须补取新会话')
+  second.resolve('fresh')
+  await Promise.all([p1, p2])
+  assert.deepEqual(applied, [{ session: 2, value: 'fresh' }], '旧会话返回必须丢弃')
+  assert.equal(loader.loadedSession(), 2)
+})
+
+test('同会话并发 ensure 只发一次请求（单飞）', async () => {
+  let calls = 0
+  const gate = Promise.withResolvers<string>()
+  const loader = createSessionSingleFlight<string>({
+    load: () => { calls++; return gate.promise },
+    apply: () => {},
+  })
+  const p = Promise.all([loader.ensure(7), loader.ensure(7), loader.ensure(7)])
+  assert.equal(calls, 1)
+  gate.resolve('ok')
+  await p
+  assert.equal(calls, 1)
+  await loader.ensure(7)
+  assert.equal(calls, 1, '已加载会话直接命中缓存')
+})
+
+test('失败不闩死：同会话再次 ensure 重试', async () => {
+  let calls = 0
+  const applied: string[] = []
+  const loader = createSessionSingleFlight<string>({
+    load: async () => {
+      calls++
+      if (calls === 1) throw new Error('network')
+      return 'recovered'
+    },
+    apply: (value) => { applied.push(value) },
+  })
+  await loader.ensure(3)
+  assert.equal(loader.loadedSession(), null)
+  await loader.ensure(3)
+  assert.equal(calls, 2)
+  assert.deepEqual(applied, ['recovered'])
+  assert.equal(loader.loadedSession(), 3)
+})
+
+test('旧会话失败不消耗新会话的加载态', async () => {
+  const first = Promise.withResolvers<string>()
+  const second = Promise.withResolvers<string>()
+  const loadingStates: boolean[] = []
+  const applied: string[] = []
+  const loader = createSessionSingleFlight<string>({
+    load: (session) => (session === 1 ? first.promise : second.promise),
+    apply: (value) => { applied.push(value) },
+    onLoadingChange: (value) => { loadingStates.push(value) },
+  })
+  const p1 = loader.ensure(1)
+  const p2 = loader.ensure(2)
+  first.reject(new Error('stale failure'))
+  await Promise.resolve()
+  second.resolve('fresh')
+  await Promise.all([p1, p2])
+  assert.deepEqual(applied, ['fresh'])
+  assert.equal(loadingStates.at(-1), false, '最终必须收尾为未加载态')
 })
 
 test('并发 ensure 只调用一次 loader（单飞）', async () => {

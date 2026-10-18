@@ -38,8 +38,7 @@ var crawlerBuiltinSnapshot = map[string][]string{
 		"13.71.172.224/28", "139.217.52.0/28", "191.233.204.0/24",
 	},
 	"so360spider": {
-		"42.236.12.130/32", "42.236.13.135/32", "42.236.14.108/32", "42.236.15.7/32",
-		"180.163.220.41/32", "180.163.220.42/32", "180.163.220.43/32",
+		"42.236.8.0/21", "42.236.17.0/24", "42.236.101.0/24", "180.153.236.0/24", "180.163.220.0/24",
 	},
 }
 
@@ -101,6 +100,11 @@ func (m *CrawlerUpdateManager) Prime() error {
 		return err
 	}
 	if err := migrateCrawlerIPListNames(); err != nil {
+		return err
+	}
+	// 历史问题-05：启动期把内置源的 canonical url/format 刷新到存量行（用户开关/
+	// 状态/排程保持不变），修复「URL/格式修正只对新库生效」的升级盲区。
+	if err := refreshCrawlerSources(); err != nil {
 		return err
 	}
 	all, err := loadCrawlerIPListsFromDB()

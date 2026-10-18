@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -51,6 +52,10 @@ func (h *Handlers) ReportClusterNode(c *gin.Context) {
 	nodeID := c.GetInt("cluster_node_id")
 	if req.Detached {
 		if err := h.clusterService.DeleteNode(c.Request.Context(), nodeID); err != nil {
+			if errors.Is(err, services.ErrNotMasterNode) {
+				clusterError(c, http.StatusForbidden, err.Error(), err)
+				return
+			}
 			clusterError(c, http.StatusInternalServerError, "节点脱离处理失败", err)
 			return
 		}
@@ -59,6 +64,10 @@ func (h *Handlers) ReportClusterNode(c *gin.Context) {
 		return
 	}
 	if err := h.clusterService.ReportNode(c.Request.Context(), nodeID, req, time.Now()); err != nil {
+		if errors.Is(err, services.ErrNotMasterNode) {
+			clusterError(c, http.StatusForbidden, err.Error(), err)
+			return
+		}
 		clusterError(c, http.StatusInternalServerError, "节点状态上报失败", err)
 		return
 	}

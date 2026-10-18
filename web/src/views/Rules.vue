@@ -24,6 +24,25 @@
       <div class="polling-error-meta">{{ certPollingErrorDescription }}</div>
     </el-alert>
 
+    <el-alert v-if="certInfoError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+      <template #title>
+        <div class="polling-error-title">
+          <span>证书详情加载失败：TLS 列可能显示为「加载失败」（非真实证书状态）</span>
+          <el-button link type="danger" :loading="loading" @click="retryCertInfo">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
+
+    <el-alert v-if="healthPollingError.errorMessage.value" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+      <template #title>
+        <div class="polling-error-title">
+          <span>上游健康状态加载失败：{{ healthPollingError.errorMessage.value }}</span>
+          <el-button link type="danger" :loading="loading" @click="retryHealthPolling">立即重试</el-button>
+        </div>
+      </template>
+      <div class="polling-error-meta">{{ healthPollingErrorDescription }}</div>
+    </el-alert>
+
     <el-alert v-if="securityBindingsError" type="warning" :closable="false" show-icon class="polling-error-alert">
       <template #title>
         <div class="polling-error-title">
@@ -382,6 +401,7 @@
                 <span v-else-if="wizardForm.protocol === 'http'">建议使用 80 或其他非保留端口</span>
                 <span v-else>建议使用 10000-60000 范围内的端口</span>
               </span>
+              <div class="form-tip-line">服务端还会按当前部署校验实际管理端口（面板监听端口与 Caddy admin 端口），自定义端口以保存结果为准</div>
             </el-form-item>
 
             <el-form-item label="启用 HTTPS" v-if="wizardForm.protocol === 'http'">
@@ -1437,23 +1457,6 @@ const fetchSecurityBindings = async () => {
 }
 const retrySecurityBindings = (): void => { void fetchSecurityBindings() }
 
-// 每条规则的四阶段分组投影缓存（规则/绑定/策略/名单/拦截页任一变化即整体重算——
-// 分页后可见行规模小，重算成本可忽略）
-const ruleStageModelMap = computed<Map<string, RuleStageModel>>(() => {
-  const map = new Map<string, RuleStageModel>()
-  for (const rule of rules.value) {
-    map.set(rule.caddy_id, buildStageModel(
-      securityBindings.value[rule.caddy_id] || [],
-      securityPolicies.value,
-      ipLists.value,
-      blockPages.value,
-      rule,
-    ))
-  }
-
-  return map
-})
-
 // 锁摘要 popover 实例登记（el-popover 组件公开 hide() 方法，其实例类型未导出——
 // 命名校验后落登记表；跳转流程弹框前显式关闭，防 popover 残留遮挡）
 const lockPopovers: Record<string, { hide: () => void }> = {}
@@ -1505,9 +1508,31 @@ watch(searchQuery, () => {
   currentPage.value = 1
 })
 
+// 每条规则的四阶段分组投影缓存（规则/绑定/策略/名单/拦截页任一变化即整体重算）。
+// 历史问题-F13：只投影当前页可见规则（原实现对全部规则重算，绑定/策略/名单任一
+// 变化即 O(R×阶段数) 全量重建）。流程弹框的目标行恒来自表格行；非可见行经
+// ruleStageModel 的兜底分支即时构建。
+const ruleStageModelMap = computed<Map<string, RuleStageModel>>(() => {
+  const map = new Map<string, RuleStageModel>()
+  for (const rule of pagedRules.value) {
+    map.set(rule.caddy_id, buildStageModel(
+      securityBindings.value[rule.caddy_id] || [],
+      securityPolicies.value,
+      ipLists.value,
+      blockPages.value,
+      rule,
+    ))
+  }
+  return map
+})
+
+
 
 const users = ref<UserListItem[]>([])
 const certInfoMap = ref<Record<string, CertInfo | null>>({})
+// 历史问题-F4：证书详情加载失败显性化——原实现仅 console，TLS 列回落「未签发/手动」
+// 且页面无任何提示（与同页证书任务轮询的错误横幅不一致）。
+const certInfoError = ref(false)
 const certJobMap = ref<Record<string, CertJob>>({})
 const pendingCertInfoRefresh = new Set<string>()
 const ruleTogglePending = ref<Record<string, boolean>>({})
@@ -1572,6 +1597,7 @@ const fetchCertInfo = async (caddyIds?: readonly string[]): Promise<boolean> => 
     })
   }
   if (tlsRules.length === 0) {
+    certInfoError.value = false
     return true
   }
   try {
@@ -1590,11 +1616,20 @@ const fetchCertInfo = async (caddyIds?: readonly string[]): Promise<boolean> => 
       if (certInfoGenerations.get(id) === generation) patch[id] = certInfo[id] ?? null
     })
     certInfoMap.value = { ...certInfoMap.value, ...patch }
+    certInfoError.value = false
     return true
   } catch (error: unknown) {
-    if (!axios.isCancel(error) && !disposed) console.error('Failed to fetch certificate info:', error)
+    if (!axios.isCancel(error) && !disposed) {
+      console.error('Failed to fetch certificate info:', error)
+      certInfoError.value = true
+    }
     return false
   }
+}
+
+// 历史问题-F4：证书详情重试入口（横幅按钮）——重试全量 TLS 规则详情。
+const retryCertInfo = (): void => {
+  void fetchCertInfo()
 }
 
 const fetchCertJobs = async (): Promise<void> => {
@@ -1677,6 +1712,8 @@ const canDeleteRule = (row: Rule) => {
 
 const tlsTagType = (row: Rule) => {
   const cert = certInfoMap.value[row.caddy_id]
+  // 历史问题-F4：详情加载失败且无缓存 → danger（不得回落为「未签发/手动」正常态）
+  if (certInfoError.value && cert === undefined) return 'danger'
   const jobStatus = certJobMap.value[row.caddy_id]?.status
   // 重新签发进行中（含切换 CA）优先呈现活动态——在役证书 valid 不再抢先显示
   //「已签发」（历史用户报告：签发任务执行中标签无变化）。
@@ -1696,6 +1733,7 @@ const tlsTagType = (row: Rule) => {
 
 const tlsTagLabel = (row: Rule) => {
   const cert = certInfoMap.value[row.caddy_id]
+  if (certInfoError.value && cert === undefined) return '加载失败'
   const jobStatus = certJobMap.value[row.caddy_id]?.status
   // 活动签发态（含限流冷却）优先用任务阶段性短标签（certJobStatusLabel 2-4 字，
   // 适配 106px 列宽）——重新签发/切 CA 期间每个阶段实时可见。
@@ -1851,6 +1889,15 @@ const fetchHealthStatus = async () => {
     const res = await request.get<APIResponse<UpstreamHealthResponse>>('/config/health', { signal: healthPolling.signal, silent: true })
     if (disposed) return
     const healthData = res.data || {}
+    // 历史问题-F13：扁平索引（host:port → detail）一次构建——原 probeUpstream 对每个
+    // 上游再遍历全部 server 映射（O(R×S×U) → O(S+U)）。首见优先（与原扫描顺序等价）。
+    const healthDetailIndex = new Map<string, { healthy: boolean; unknown: boolean; dynamic?: boolean; degraded?: boolean; num_requests?: number; fails?: number }>()
+    for (const serverHealth of Object.values(healthData)) {
+      if (!serverHealth || typeof serverHealth !== 'object') continue
+      for (const [key, detail] of Object.entries(serverHealth)) {
+        if (!healthDetailIndex.has(key)) healthDetailIndex.set(key, detail)
+      }
+    }
     const mapped: Record<string, { healthy: number; unhealthy: number; degraded: number; unknown: number; na: number; total: number; upstreams: Record<string, { healthy: boolean; unknown: boolean; dynamic?: boolean; degraded?: boolean; num_requests?: number; fails?: number }> }> = {}
     for (const rule of rules.value) {
       const enabledUpstreams = getEnabledUpstreams(rule)
@@ -1871,21 +1918,16 @@ const fetchHealthStatus = async () => {
           let isDynamic = false
           let numRequests = 0
           let fails = 0
-          for (const serverHealth of Object.values(healthData)) {
-            if (serverHealth && typeof serverHealth === 'object') {
-              if (upstreamKey in serverHealth) {
-                const detail = serverHealth[upstreamKey]
-                isUnknown = detail.unknown === true
-                isDynamic = detail.dynamic === true
-                if (!isUnknown) {
-                  isHealthy = detail.healthy !== false
-                  isDegraded = detail.degraded === true
-                }
-                numRequests = detail.num_requests || 0
-                fails = detail.fails || 0
-                break
-              }
+          const detail = healthDetailIndex.get(upstreamKey)
+          if (detail) {
+            isUnknown = detail.unknown === true
+            isDynamic = detail.dynamic === true
+            if (!isUnknown) {
+              isHealthy = detail.healthy !== false
+              isDegraded = detail.degraded === true
             }
+            numRequests = detail.num_requests || 0
+            fails = detail.fails || 0
           }
           return { healthy: isHealthy, unknown: isUnknown, dynamic: isDynamic, degraded: isDegraded, num_requests: numRequests, fails }
         }
@@ -1917,9 +1959,16 @@ const fetchHealthStatus = async () => {
         }
       }
     }
-    if (!disposed) healthStatus.value = mapped
+    if (!disposed) {
+      healthStatus.value = mapped
+      healthPollingError.clear()
+    }
   } catch (error: unknown) {
-    if (!disposed) console.error('Failed to fetch health status:', error)
+    // pause/stop/卸载触发的取消不是失败（不得弹错误横幅）
+    if (!disposed && !axios.isCancel(error)) {
+      console.error('Failed to fetch health status:', error)
+      healthPollingError.recordError(error)
+    }
   }
 }
 
@@ -3646,10 +3695,25 @@ watch(ruleLogAutoRefresh, (val) => {
   else stopRuleLogPolling()
 })
 
+// 历史问题-F4：健康轮询错误态（复用 usePollingErrorState，与证书任务轮询同口径）——
+// 原实现仅 console，/config/health 失败时健康列回落「-」且无任何提示。
+const healthPollingError = usePollingErrorState()
 const healthPolling = usePollingTask(async () => fetchHealthStatus(), {
   interval: 15000,
-  onError: (error) => console.error('Failed to poll health status:', error),
+  onError: (error) => {
+    console.error('Failed to poll health status:', error)
+    healthPollingError.recordError(error)
+  },
 })
+const healthPollingErrorDescription = computed(() => {
+  const lastError = formatDate(healthPollingError.lastErrorAt.value)
+  const retryAt = formatDate(healthPollingError.retryAt.value)
+  return retryAt ? `最后错误：${lastError}；契约响应异常，自动重试已退避至 ${retryAt}` : `最后错误：${lastError}`
+})
+const retryHealthPolling = async (): Promise<void> => {
+  healthPollingError.resetBackoff()
+  await healthPolling.run()
+}
 const certPollingError = usePollingErrorState()
 const certPollingErrorDescription = computed(() => {
   const lastError = formatDate(certPollingError.lastErrorAt.value)

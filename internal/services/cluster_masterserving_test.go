@@ -147,6 +147,11 @@ func TestTaskEngineWire_ClusterSyncRoleFlipGenerations(t *testing.T) {
 		t.Fatal("主节点不应触碰从节点同步挂钩（主分支=巡检）")
 	}
 
+	// demote 必须同时落库（历史问题-1 角色对账按 DB 修正引擎）：仅 SetRole(false)
+	// 而 DB 仍为主节点时，对账会在测试窗口内把引擎翻回主角色（换代竞态）。
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
 	te.SetRole(false) // demote：换代 → 从分支
 	waitForCond(t, 2*time.Second, func() bool { return syncStarts.Load() >= 1 })
 	if syncStops.Load() != 0 {
@@ -156,6 +161,9 @@ func TestTaskEngineWire_ClusterSyncRoleFlipGenerations(t *testing.T) {
 		return strings.Count(readClusterSyncLog(t), "[done] stopped") >= 1
 	})
 
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
 	te.SetRole(true) // promote：换代回主分支
 	waitForCond(t, 2*time.Second, func() bool { return syncStops.Load() >= 1 })
 	waitForCond(t, 2*time.Second, func() bool { return te.IsRunning("cluster-sync") })
@@ -351,6 +359,10 @@ func TestMasterServingRound_dbErrorWarnsAndContinues(t *testing.T) {
 func TestTaskEngineWire_CertIssuanceSlaveShowsLocalState(t *testing.T) {
 	te := newWireTestEngine(t)
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status) VALUES ('r1','a.test','pending')`); err != nil {
+		t.Fatal(err)
+	}
+	// DB 从角色先落库（历史问题-1 对账按 DB 修正引擎，避免等待窗口被翻回主）。
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	te.SetRole(false)

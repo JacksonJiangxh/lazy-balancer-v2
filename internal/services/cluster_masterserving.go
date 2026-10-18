@@ -213,12 +213,13 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 		return
 	}
 	w.quietRounds = 0
-	switch {
-	case len(nodes) == 0:
+	// D1-历史问题：异常轮已在上方提前返回，此处 offlineCount/lagging 恒为 0——
+	// 原 switch 的第二个 case 是恒真死分支，按无条件输出收敛。
+	if len(nodes) == 0 {
 		TaskLogf("cluster-sync", "serving", "服务面正常：无从节点注册")
-	case offlineCount == 0 && lagging == 0:
-		TaskLogf("cluster-sync", "serving", "服务面正常：从节点 %d 在线，最新版本 %d", online, clusterVersion)
+		return
 	}
+	TaskLogf("cluster-sync", "serving", "服务面正常：从节点 %d 在线，最新版本 %d", online, clusterVersion)
 }
 
 // （历史问题-02：原手工 parseNodeLastSeen 三布局解析已删除——last_seen 统一由

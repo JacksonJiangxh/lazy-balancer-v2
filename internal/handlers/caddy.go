@@ -967,6 +967,13 @@ func formatDriftBanner(missing, extra []string) string {
 }
 
 func (h *Handlers) GetCaddyConfig(c *gin.Context) {
+	// B1-历史问题：原始运行配置可能含经 PUT /caddy/config 逃生口写入的内联私钥
+	// 或敏感 header——与 GetConfig 的 caddy_config 脱敏同口径：非管理员及
+	// 只读 API Key 一律拒绝（路由已收敛到 admin 组，此处为纵深防御）。
+	if c.GetString("role") != "admin" || (c.GetString("auth_type") == "api_key" && c.GetBool("api_key_read_only")) {
+		c.JSON(http.StatusForbidden, models.APIResponse{Code: 403, Message: "仅管理员可读取原始 Caddy 配置"})
+		return
+	}
 	client := &http.Client{Timeout: 5 * time.Second}
 	// D5-S3：与 GetCaddyStatus 同源取 cfg.CaddyAdminURL——此前硬编码
 	// localhost:2019，自定义 admin 地址的部署读到的是错误端点。

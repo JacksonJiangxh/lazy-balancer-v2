@@ -670,6 +670,10 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		// 也进预览，「导入/预览双路径同序」不变量补齐（预览不回显该值，无可观察
 		// 面分叉，纯不变量对齐）。
 		normalizeBlockPageContentTypes(backup.Tables)
+		// B3-历史问题：与 ImportConfigBackup 同序——域名归一 + 冲突置禁用前移到
+		// 逐行校验之前（冲突可自愈备份不得在预览误报不可导入）。
+		canonicalizeBackupRuleDomains(backup.Tables["lb_rules"])
+		disabledConflicts := disableV2RuleConflicts(backup.Tables["lb_rules"])
 		// 历史问题 历史问题: 与 ImportConfigBackup 同序——skip 之后、逐行校验之前校验
 		// upstreams/path_rules 引用存在性，预览结果与实际导入一致（否则悬挂引用
 		// 备份在预览显示可导入、实际导入才 400）。
@@ -691,7 +695,6 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
-		disabledConflicts := disableV2RuleConflicts(backup.Tables["lb_rules"])
 		// 历史问题 历史问题：与 ImportConfigBackup 同序——TLS 形态校验在冲突置禁用之后
 		// 执行，预览结果与实际导入一致（冲突可自愈备份不得在预览误报不可导入）。
 		// CERT41-1:与 ImportConfigBackup 同序——「导规则不导 cert 配置且备份

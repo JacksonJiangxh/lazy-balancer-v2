@@ -26,8 +26,12 @@ var (
 	ErrInvalidClusterAuth   = errors.New("集群凭证无效")
 	// ErrNodeNotPending(历史问题-3):审批/拒绝动作命中非 pending 状态的节点
 	// (重复审批/已处理)——handler 侧映射 409。
-	ErrNodeNotPending      = errors.New("节点不在待审批状态")
-	ErrAlreadyMaster       = errors.New("当前节点已是主节点")
+	ErrNodeNotPending = errors.New("节点不在待审批状态")
+	ErrAlreadyMaster  = errors.New("当前节点已是主节点")
+	// ErrNotMasterNode（历史问题-历史问题）：请求已通过 handler 角色门，但在节点簿记
+	// 写语句执行前角色已降级（TOCTOU）。handler 应映射 403，与 requireMaster
+	// 同文案。
+	ErrNotMasterNode       = errors.New("该操作仅允许在主节点执行")
 	ErrInvalidSyncInterval = errors.New("同步间隔需在 10-86400 秒之间")
 	// ErrSyncUsersLocked 系统数据恒同步不可禁用(S历史问题:handler 映射 400)。
 	ErrSyncUsersLocked = errors.New("系统数据为恒同步项（含用户/密钥/ACME），不允许禁用；证书随负载规则开关")
@@ -99,6 +103,25 @@ func tokenHash(token string) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// masterRoleConditionSQL 是节点簿记写语句的 SQL 级角色条件（历史问题-历史问题）：
+// handler 的 requireMaster 与本次写之间没有共享锁，BecomeSlave 可在窗口内
+// 提交 is_master=0——带该条件的写语句在降级后恒 0 行，消除「降级后仍审批/
+// 上报/改访问地址」的 TOCTOU 类别。
+const masterRoleConditionSQL = `(SELECT COALESCE(is_master,1) FROM global_config WHERE id=1)=1`
+
+// nodeWriteMissError 在带角色条件的节点写命中 0 行后区分「已降级」与
+// 「节点不存在」：角色读取失败按内部错误上抛（不误报 404/403）。
+func (s *ClusterService) nodeWriteMissError(ctx context.Context) error {
+	isMaster, err := RoleOf(ctx, s.db)
+	if err != nil {
+		return fmt.Errorf("复核节点角色: %w", err)
+	}
+	if !isMaster {
+		return ErrNotMasterNode
+	}
+	return ErrNodeNotFound
+}
+
 func permanentClusterToken(registrationSecret string) string {
 	hash := sha256.Sum256([]byte("lazy-balancer-cluster:" + registrationSecret))
 	return "lb_cluster_" + hex.EncodeToString(hash[:])
@@ -154,6 +177,16 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 		return models.ClusterRegistration{}, fmt.Errorf("开始注册事务: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// 历史问题-历史问题：事务内角色复核（SQL 级）。降级已提交则拒绝注册/覆盖，避免
+	// 旧主节点在降级窗口继续写入节点簿记。
+	var masterNow bool
+	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&masterNow); err != nil {
+		return models.ClusterRegistration{}, fmt.Errorf("复核节点角色: %w", err)
+	}
+	if !masterNow {
+		return models.ClusterRegistration{}, ErrNotMasterNode
+	}
 
 	result, err := tx.ExecContext(ctx, `UPDATE cluster_register_tokens SET used_at=? WHERE token_hash=? AND used_at IS NULL AND expires_at>?`,
 		now.UTC(), tokenHash(req.Token), now.UTC())
@@ -220,7 +253,7 @@ func (s *ClusterService) UpdateNodeAccessURL(ctx context.Context, nodeID int, ac
 	if err := models.ValidateClusterAccessURL(accessURL); err != nil {
 		return err
 	}
-	result, err := s.db.ExecContext(ctx, "UPDATE nodes SET access_url=? WHERE id=?", accessURL, nodeID)
+	result, err := s.db.ExecContext(ctx, "UPDATE nodes SET access_url=? WHERE id=? AND "+masterRoleConditionSQL, accessURL, nodeID)
 	if err != nil {
 		return fmt.Errorf("更新节点访问地址: %w", err)
 	}
@@ -229,13 +262,13 @@ func (s *ClusterService) UpdateNodeAccessURL(ctx context.Context, nodeID int, ac
 		return fmt.Errorf("读取节点访问地址更新结果: %w", err)
 	}
 	if updated != 1 {
-		return ErrNodeNotFound
+		return s.nodeWriteMissError(ctx)
 	}
 	return nil
 }
 
 func (s *ClusterService) ApproveNode(ctx context.Context, nodeID int) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE nodes SET is_approved=1, status='online', registration_secret_expires_at=datetime('now','+24 hours'), cluster_token_hash=NULL, cluster_token_delivered=0 WHERE id=? AND status='pending' AND COALESCE(registration_secret,'')<>''`, nodeID)
+	result, err := s.db.ExecContext(ctx, `UPDATE nodes SET is_approved=1, status='online', registration_secret_expires_at=datetime('now','+24 hours'), cluster_token_hash=NULL, cluster_token_delivered=0 WHERE id=? AND status='pending' AND COALESCE(registration_secret,'')<>'' AND `+masterRoleConditionSQL, nodeID)
 	if err != nil {
 		return fmt.Errorf("批准节点: %w", err)
 	}
@@ -244,6 +277,14 @@ func (s *ClusterService) ApproveNode(ctx context.Context, nodeID int) error {
 		return fmt.Errorf("读取审批结果: %w", err)
 	}
 	if updated != 1 {
+		// 历史问题-历史问题：先区分「已降级」（403 语义）与节点状态/存在性问题。
+		isMaster, roleErr := RoleOf(ctx, s.db)
+		if roleErr != nil {
+			return fmt.Errorf("复核节点角色: %w", roleErr)
+		}
+		if !isMaster {
+			return ErrNotMasterNode
+		}
 		// 历史问题-3:0 行命中分判——节点存在但非 pending(重复审批/已拒绝)
 		// 返回 409 语义错误;不存在维持 404。
 		var status string
@@ -306,8 +347,18 @@ type clusterVersionExecutor interface {
 }
 
 func BumpClusterVersion(ctx context.Context, executor clusterVersionExecutor) error {
-	if _, err := executor.ExecContext(ctx, "UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1"); err != nil {
+	result, err := executor.ExecContext(ctx, "UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1")
+	if err != nil {
 		return fmt.Errorf("递增集群版本: %w", err)
+	}
+	// D1-历史问题：global_config 行缺失/异常时 Exec 返回 0 行且 nil error，集群
+	// 版本不递增，从节点可能继续 304 不拉新内容——按 fail-visible 报错。
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("读取集群版本递增结果: %w", err)
+	}
+	if updated != 1 {
+		return fmt.Errorf("递增集群版本命中 %d 行（global_config 行缺失或已损坏）", updated)
 	}
 	return nil
 }
@@ -352,16 +403,17 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	// 通过 admission 的 apply）可能在升主提交后继续把从节点数据写回库。
 	// 排干失败（ctx 到期）即中止提升，不做半程角色翻转。
 	if drainer := syncDrainerFor(s.db); drainer != nil {
+		// 历史问题-历史问题：排干失败的返回路径同样必须重开准入（defer 必须先于
+		// DrainPulls 注册）。DrainPulls 自身已置 pullsStopped=true，原实现只在
+		// 成功后注册 defer：失败路径若 cluster-sync 已停（用户关闭）或
+		// TaskEngine()==nil，准入永久关闭——从节点「立即同步」被 beginPull 拒绝
+		// 且哨兵不落库，静默脱同步直到再次 Promote/BecomeSlave/重启。
+		defer drainer.reopenPullAdmission()
 		if err := drainer.DrainPulls(ctx); err != nil {
 			return fmt.Errorf("等待在途同步拉取结束: %w", err)
 		}
-		// 历史问题-02：排干成功后的任意返回路径都必须重开准入。原实现依赖
-		// 「失败 → 重启 cluster-sync → startLocked 重开」的隐式链：当用户此前
-		// 关闭了 cluster-sync（clusterSyncWasOn=false）或 TaskEngine()==nil 时，
-		// 失败路径不重启循环，准入永久关闭 → 从节点「立即同步」被 beginPull
-		// 拒绝（errSyncPullStopped 不落库，静默）。成功升主后再降级也有
-		// BecomeSlave 的显式重开，此处兜底保持不变量。
-		defer drainer.reopenPullAdmission()
+		// 历史问题-02：排干成功后的任意返回路径都必须重开准入。成功升主后再降级
+		// 也有 BecomeSlave 的显式重开，此处兜底保持不变量。
 	}
 	var registrationID int
 	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(registration_id,0) FROM global_config WHERE id=1").Scan(&registrationID); err != nil {

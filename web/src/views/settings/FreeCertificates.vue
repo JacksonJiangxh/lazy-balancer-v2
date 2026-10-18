@@ -1,5 +1,14 @@
 <template>
   <div>
+    <el-alert v-if="loadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+      <template #title>
+        <div class="polling-error-title">
+          <span>证书配置数据加载失败：证书配置/DNS 提供商/CA 提供商列表可能为空（非真实状态）</span>
+          <el-button link type="danger" @click="retryLoad">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
+
     <el-card class="settings-card">
       <template #header>
         <div class="card-header">
@@ -313,6 +322,12 @@ const savingGlobal = ref(false)
 const savingConfig = ref(false)
 const configs = ref<CertConfig[]>([])
 const providers = ref<DNSProvider[]>([])
+// 历史问题-F5：证书配置/DNS 提供商/CA 提供商加载失败显性化（原仅 console，
+// 空列表与真实无数据不可区分）——聚合为单条横幅 + 重试。
+const configsError = ref(false)
+const providersError = ref(false)
+const caProvidersError = ref(false)
+const loadError = computed(() => configsError.value || providersError.value || caProvidersError.value)
 const dialogVisible = ref(false)
 const editingId = ref<number | null>(null)
 const testingId = ref<number | null>(null)
@@ -377,8 +392,10 @@ const fetchConfigs = async () => {
   try {
     const res = await request.get<APIResponse<CertConfig[]>>('/certificate-configs')
     configs.value = res.data || []
+    configsError.value = false
   } catch (error) {
     console.error('Failed to fetch cert configs:', error)
+    configsError.value = true
   }
 }
 
@@ -386,8 +403,10 @@ const fetchProviders = async () => {
   try {
     const res = await request.get<APIResponse<DNSProvider[]>>('/dns-providers')
     providers.value = res.data || []
+    providersError.value = false
   } catch (error) {
     console.error('Failed to fetch DNS providers:', error)
+    providersError.value = true
   }
 }
 
@@ -416,12 +435,21 @@ const fetchCAProviders = async () => {
   try {
     const res = await request.get<APIResponse<CAProvider[]>>('/ca-providers')
     caProviders.value = res.data || []
+    caProvidersError.value = false
   } catch (caught: unknown) {
     // Error toast is already shown by the global axios interceptor.
     console.error('Failed to fetch CA providers:', caught)
+    caProvidersError.value = true
   } finally {
     loadingCAProviders.value = false
   }
+}
+
+// 重试所有失败来源（成功来源重复拉取无副作用）
+const retryLoad = (): void => {
+  if (configsError.value) void fetchConfigs()
+  if (providersError.value) void fetchProviders()
+  if (caProvidersError.value) void fetchCAProviders()
 }
 
 const openCAProviderDialog = (p: CAProvider) => {

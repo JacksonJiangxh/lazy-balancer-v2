@@ -291,17 +291,11 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 		recordSystemReloadAudit("crs_update", err)
 		if err != nil {
 			WriteCRSUpdateLog("ERROR", string(CRSStatusReloading), fmt.Sprintf("重载失败: %v", err))
-			m.restoreBackup()
-			// U02/历史问题：restoreBackup 只恢复规则树/setup，live VERSION 仍是新 tag
-			// ——必须同代回滚，否则启动对账会把 DB 校正为新版本并永久短路更新。
-			writeCRSVersionMarker(m.crsDir, prevTag)
-			// 版本行回滚到旧值，恢复下轮重试能力
-			if _, rbErr := db.DB.Exec(
-				"UPDATE security_crs_version SET version=?, updated_at=datetime('now') WHERE id=1",
-				prevTag,
-			); rbErr != nil {
-				WriteCRSUpdateLog("ERROR", string(CRSStatusReloading), fmt.Sprintf("版本行回滚失败（重启后 ReconcileCRSState 自愈）: %v", rbErr))
-			}
+			// U02/历史问题：回滚必须同代（树 + live VERSION + DB 版本行）——旧实现
+			// restoreBackup 取锁后立即释放，标记/版本行在锁外写（历史问题-03 第 83
+			// 轮审计：持锁读者可见「旧树+新标记」；并发导入可在窗口内被本轮
+			// 标记覆盖）。
+			m.rollbackAfterReloadFailure(prevTag)
 			return &crsReloadError{cause: fmt.Errorf("重载 Caddy: %w", err)}
 		}
 	}
@@ -442,6 +436,32 @@ func persistCRSSnapshotFromInLock(liveDir, snapshotDir, version string) error {
 		return fmt.Errorf("快照版本标记: %w", err)
 	}
 	return nil
+}
+
+// rollbackAfterReloadFailure 重载失败回滚（历史问题-03 历史）：树还原、
+// live VERSION 标记回写与 DB 版本行回滚在同一 wafFileMu 临界区内完成——旧
+// 实现 restoreBackup() 取锁后立即释放，标记/版本行在锁外写：持锁读者
+// （BuildWafFileRef/Bundle 读相位）可导出「旧树 + 新标记/新版本行」，并发的
+// lbbak 导入可在释放窗口换树后被本轮回滚标记覆盖，形成跨代污染。prevTag 为空
+// （锁内读版本失败）时显式 ERROR 留痕并跳过标记回写（writeCRSVersionMarker 对
+// 空版本是静默 no-op，不得让「未回写」不可见）。
+func (m *CRSUpdateManager) rollbackAfterReloadFailure(prevTag string) {
+	wafFileMu.Lock()
+	defer wafFileMu.Unlock()
+	m.restoreBackupInLock()
+	if prevTag == "" {
+		WriteCRSUpdateLog("ERROR", string(CRSStatusReloading),
+			"回滚时无法确定更新前的 CRS 版本（VERSION 标记/版本行保持现状，重启后 ReconcileCRSState 校正）")
+		return
+	}
+	writeCRSVersionMarker(m.crsDir, prevTag)
+	// 版本行回滚到旧值，恢复下轮重试能力；失败留痕并依赖启动对账自愈。
+	if _, rbErr := db.DB.Exec(
+		"UPDATE security_crs_version SET version=?, updated_at=datetime('now') WHERE id=1",
+		prevTag,
+	); rbErr != nil {
+		WriteCRSUpdateLog("ERROR", string(CRSStatusReloading), fmt.Sprintf("版本行回滚失败（重启后 ReconcileCRSState 自愈）: %v", rbErr))
+	}
 }
 
 // restoreBackup puts rules.bak and crs-setup.conf.bak back in place and undoes
@@ -642,11 +662,11 @@ func moveTree(src, dst string) error {
 	return os.RemoveAll(src)
 }
 
-// copyFile 复制单个文件：先写 dst+".tmp" 再原子重命名（镜像 copyAuditLogTo，
-// 历史问题 历史问题），崩溃中拷贝只会留下临时文件，读者/Reload 永远看到完整旧文件或
-// 完整新文件，不会读到截断半成品（xdb live 路径被截断会让下次 Reload 失败）。
-// 重命名失败时清理临时文件。注意内部使用 os.Rename 而非 osRename seam：
-// moveTree 的 copyDir 回退依赖 copyFile 在「目录不可 rename」环境下仍可用。
+// copyFile 复制单个文件：单源原子落盘（tmp+fsync+父目录 fsync，D1-历史问题），
+// 崩溃中拷贝只会留下临时文件，读者/Reload 永远看到完整旧文件或完整新文件，
+// 不会读到截断半成品（xdb live 路径被截断会让下次 Reload 失败）。注意内部
+// 使用 os.Rename 而非 osRename seam：moveTree 的 copyDir 回退依赖 copyFile
+// 在「目录不可 rename」环境下仍可用。
 func copyFile(src, dst string) error {
 	data, err := os.ReadFile(src)
 	if err != nil {
@@ -655,15 +675,7 @@ func copyFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
 	}
-	tmp := dst + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return writeFileAtomicSynced(dst, data, 0644)
 }
 
 func copyDir(src, dst string) error {

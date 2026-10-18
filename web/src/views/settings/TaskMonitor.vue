@@ -73,13 +73,19 @@
     <el-card class="tm-cq-banner">
       <div class="tm-cq-banner-inner">
         <div class="tm-cq-banner-title"><el-icon class="title-icon"><Lock /></el-icon><span>ACME 证书任务队列</span></div>
-        <div class="tm-cq-banner-stats">
+        <div v-if="certQueueError" class="tm-cq-banner-stats">
+          <span class="tm-cq-chip">排队 <b>—</b></span>
+          <span class="tm-cq-chip">进行中 <b>—</b></span>
+          <span class="tm-cq-chip">等 CA <b>—</b></span>
+        </div>
+        <div v-else class="tm-cq-banner-stats">
           <span class="tm-cq-chip">排队 <b>{{ certQueue.truncated ? '≥' : '' }}{{ certQueue.queued }}</b></span>
           <span class="tm-cq-chip">进行中 <b class="tm-c-run">{{ certQueue.truncated ? '≥' : '' }}{{ certQueue.running }}</b></span>
           <span class="tm-cq-chip">等 CA <b class="tm-c-wait">{{ certQueue.truncated ? '≥' : '' }}{{ certQueue.waiting }}</b></span>
         </div>
         <div class="tm-cq-banner-live">
-          <template v-if="certQueue.jobs.length">
+          <span v-if="certQueueError" class="tm-cq-idle">证书队列状态加载失败（下一轮轮询自动重试）</span>
+          <template v-else-if="certQueue.jobs.length">
             <span v-for="j in certQueue.jobs.slice(0, 4)" :key="j.id" class="tm-cq-domain-chip">
               {{ j.domain }}<i :class="'tm-cq-dot tm-cq-dot--' + j.status" />
             </span>
@@ -87,8 +93,8 @@
           </template>
           <span v-else class="tm-cq-idle">空闲——临期证书由「证书续期扫描」自动入队</span>
         </div>
-        <el-tag :type="certQueue.running > 0 ? 'primary' : 'success'" size="small" effect="plain">
-          {{ certQueue.running > 0 ? '签发进行中' : '空闲' }}
+        <el-tag :type="certQueueError ? 'danger' : certQueue.running > 0 ? 'primary' : 'success'" size="small" effect="plain">
+          {{ certQueueError ? '加载失败' : certQueue.running > 0 ? '签发进行中' : '空闲' }}
         </el-tag>
       </div>
     </el-card>
@@ -323,6 +329,7 @@ import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { formatDate } from '@/utils/date'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
+import { useClampedPagination } from '@/composables/useClampedPagination'
 import { statusColor } from '@/utils/chartTheme'
 import { certJobStatusLabel, type CertJobStatus } from '@/utils/certJobStatus'
 import DialogHeader from '@/components/DialogHeader.vue'
@@ -419,6 +426,8 @@ interface CertJobRow { id: number; domain: string; status: string; updated_at?: 
 const certQueue = ref<{ queued: number; running: number; waiting: number; total: number; jobs: CertJobRow[]; truncated: boolean }>({
   queued: 0, running: 0, waiting: 0, total: 0, jobs: [], truncated: false,
 })
+// 历史问题-F5：队列加载失败不得呈现为「全 0 / 空闲」——显式错误态（下一轮轮询自愈）
+const certQueueError = ref(false)
 // 服务端聚合计数（/certificates/jobs 未提供时按可见行推导，且只在 total 超页时
 // 声明「≥」——历史 历史问题：原 page_size=50 忽略 total，>50 任务时计数偏小）
 const CERT_QUEUE_PAGE_SIZE = 200
@@ -443,6 +452,7 @@ const fetchCertQueue = async () => {
       waiting = live.filter(j => j.status === 'waiting_ca').length
     }
     const liveJobs = list.filter(j => !['issued', 'failed', 'disabled'].includes(j.status))
+    certQueueError.value = false
     certQueue.value = {
       total: liveCount,
       // status_counts 为空时才依赖首页下界；有聚合计数则完整。
@@ -452,7 +462,10 @@ const fetchCertQueue = async () => {
       waiting,
       jobs: liveJobs.slice(0, 6),
     }
-  } catch { /* 静默：独立卡数据下一轮轮询自愈 */ }
+  } catch {
+    // 静默自动重试（下一轮轮询），但错误态必须显性——0 值会被误读为「无排队」
+    certQueueError.value = true
+  }
 }
 
 // ===== 概览统计 =====
@@ -475,7 +488,10 @@ const filteredTasks = computed(() => {
 })
 const page = ref(1)
 const pageSize = ref(20)
-const pagedTasks = computed(() => filteredTasks.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
+// 历史问题-F6：页码夹紧单源（useClampedPagination）——任务列表收缩（cert-job 动态行
+// 完成消失）或增大 pageSize 后自动回夹，不再停留在空页。原 slice 无夹紧，仅筛选
+// 变化复位。
+const { pagedItems: pagedTasks } = useClampedPagination(filteredTasks, page, pageSize)
 // 筛选条件变化回第 1 页（避免高页码 + 收窄结果落在空页）
 watch([kindFilter, categoryFilter], () => { page.value = 1 })
 

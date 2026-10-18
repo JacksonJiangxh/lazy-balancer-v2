@@ -35,10 +35,26 @@ func CanonicalCrawlerSource(name string) (url, format string, ok bool) {
 }
 
 // ensureCrawlerSources 幂等种子（display_name 区分于威胁源；不更新威胁源行）。
+// 只保证内置行存在——运行期不覆盖既有 url/format（历史问题-05 的 canonical 刷新
+// 在启动路径 refreshCrawlerSources 中执行；更新任务每轮调用本函数只为补建
+// 缺失行，不得改写既有配置）。
 func ensureCrawlerSources() error {
 	for _, src := range crawlerBotSources {
 		if _, err := db.DB.Exec(`INSERT OR IGNORE INTO security_crawler_sources (name, display_name, url, format) VALUES (?, ?, ?, ?)`,
 			src.Name, crawlerDisplayName(src.Name), src.URL, src.Format); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// refreshCrawlerSources 启动期按 name 刷新内置源的 canonical url/format
+// （历史问题-05 历史）：URL/解析格式修正必须到达存量部署，否则旧实例
+// 继续每日产出错误名单。用户只能改 update_enabled，状态/排程/开关列保持原值。
+func refreshCrawlerSources() error {
+	for _, src := range crawlerBotSources {
+		if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET url=?, format=?, updated_at=datetime('now') WHERE name=?`,
+			src.URL, src.Format, src.Name); err != nil {
 			return err
 		}
 	}

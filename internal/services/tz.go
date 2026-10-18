@@ -50,17 +50,27 @@ func StartTimezoneRefresh(ctx context.Context) <-chan struct{} {
 	timezoneRefresh.done = done
 	go func() {
 		defer close(done)
-		if err := refreshLocation(); err != nil {
-			Logf("error", "refresh timezone: %v", err)
+		// D1-历史问题：30s tick 下持久失败逐轮同消息（最坏 2880 行/天）——改状态
+		// 转换口径（ok→fail 一次 warn、持续静默、fail→ok 一次 info），与
+		// metrics 采集族共用 logStateTransition。
+		refresh := func() {
+			if err := refreshLocation(); err != nil {
+				if logStateTransition("timezone-refresh", true) != "" {
+					Logf("warn", "refresh timezone: %v", err)
+				}
+				return
+			}
+			if logStateTransition("timezone-refresh", false) != "" {
+				Logf("info", "refresh timezone recovered")
+			}
 		}
+		refresh()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				if err := refreshLocation(); err != nil {
-					Logf("error", "refresh timezone: %v", err)
-				}
+				refresh()
 			case <-workerCtx.Done():
 				return
 			}

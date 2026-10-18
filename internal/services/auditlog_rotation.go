@@ -360,17 +360,9 @@ func securityEventsWritePendingDelta(p securityEventsPendingDelta) error {
 	if err != nil {
 		return err
 	}
-	path := securityEventsPendingDeltaPath()
-	tmp := path + ".tmp"
-	if werr := os.WriteFile(tmp, data, 0o644); werr != nil {
-		_ = os.Remove(tmp)
-		return werr
-	}
-	if werr := os.Rename(tmp, path); werr != nil {
-		_ = os.Remove(tmp)
-		return werr
-	}
-	return nil
+	// D1-历史问题：单源原子落盘（tmp+fsync+父目录 fsync）——半写/掉电丢失标记
+	// 会让轮转窗口事件永久丢失。
+	return writeFileAtomicSynced(securityEventsPendingDeltaPath(), data, 0o644)
 }
 
 // securityEventsReadPendingDelta 读取待补采标记；不存在返回 nil。损坏标记

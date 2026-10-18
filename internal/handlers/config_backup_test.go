@@ -1113,8 +1113,9 @@ func TestImportConfigBackup_reports_partial_failure_when_certificate_job_recover
 	// When
 	router.ServeHTTP(response, request)
 
-	// Then
-	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "配置已导入但证书任务恢复失败") || !strings.Contains(response.Body.String(), "requeue failed") {
+	// Then：历史问题-06 起配置已提交的部分失败回 200 + partial=true（不再是 500
+	// ——前端按「已回滚」处理且不刷新会诱发重复导入）。
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "证书任务恢复失败") || !strings.Contains(response.Body.String(), "requeue failed") || !strings.Contains(response.Body.String(), `"partial":true`) {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 }
@@ -1136,8 +1137,8 @@ func TestImportConfigBackup_queueFailureStillRunsPostCommitConvergence(t *testin
 	t.Cleanup(func() { invalidateImportTaskLogCache = oldInvalidate })
 
 	rec := r78Import(h, t, r78BackupJSON(t, nil, nil, nil))
-	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "证书任务恢复失败") {
-		t.Fatalf("status=%d body=%s, want partial failure", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "证书任务恢复失败") || !strings.Contains(rec.Body.String(), `"partial":true`) {
+		t.Fatalf("status=%d body=%s, want partial success (200+partial)", rec.Code, rec.Body.String())
 	}
 	if invalidations != 1 {
 		t.Fatalf("post-commit convergence invalidations=%d, want 1 after queue failure", invalidations)

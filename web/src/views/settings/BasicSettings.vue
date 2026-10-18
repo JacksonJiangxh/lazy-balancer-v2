@@ -112,10 +112,11 @@
               show-password
               style="width: 320px"
               :placeholder="settings.has_github_token ? '已配置（留空保持不变）' : '未配置（未认证限流 60 次/小时）'"
+              :disabled="isReadOnly"
               maxlength="255"
               @input="githubTokenClearPending = false"
             />
-            <el-button v-if="settings.has_github_token && !githubTokenClearPending" type="danger" link size="small" style="margin-left: 8px" @click="clearGithubToken">清除</el-button>
+            <el-button v-if="settings.has_github_token && !githubTokenClearPending" type="danger" link size="small" style="margin-left: 8px" :disabled="isReadOnly" @click="clearGithubToken">清除</el-button>
             <el-text v-if="githubTokenClearPending" type="danger" size="small" style="margin-left: 8px">已标记清除，保存后生效</el-text>
             <div class="form-tip-line">可选 GITHUB_TOKEN：令牌认证后 GitHub API 限流由 60 提升至 5000 次/小时，缓解规则库自动更新 403；令牌仅随 GitHub 直连发送，不经第三方代理；点「清除」可撤销已配置令牌（保存后生效）。<el-link type="primary" href="https://github.com/settings/tokens" target="_blank" rel="noopener">前往 GitHub 创建令牌</el-link>（只需公共仓库只读权限，无需勾选任何 scope）</div>
           </el-form-item>
@@ -475,7 +476,7 @@ import { useAuthStore } from '@/stores/auth'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { APIResponse } from '@/types'
 import { request, mfaAwareSuccess, formatBytes, ApiRequestError } from '@/utils/api'
-import { reloadAfterRestart } from '@/utils/restart'
+import { restartServiceWithFeedback } from '@/utils/restart'
 import { formatDate } from '@/utils/date'
 import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
 import { displaySecurityEventsRowCap } from '@/utils/configValues'
@@ -1470,27 +1471,15 @@ const restarting = ref(false)
 
 const handleRestart = async () => {
   if (isReadOnly.value || restarting.value) return
-  try {
-    await ElMessageBox.confirm('重启期间服务短暂不可用，容器将自动拉起，就绪后自动刷新页面。确认重启？', '重启服务', {
-      confirmButtonText: '重启',
-      cancelButtonText: '取消',
-      type: 'warning',
-    })
-  } catch {
-    return
-  }
   restarting.value = true
-  try {
-    await request.post('/system/restart')
-  } catch {
-    // 重启请求失败（全局拦截器已提示），复位按钮允许重试
-    restarting.value = false
-    return
-  }
-  mfaAwareSuccess('服务正在重启，就绪后自动刷新页面')
-  // 保持 restarting=true 直到 reload（防就绪等待窗口内二次点击）；超时或失败才复位
-  const reloaded = await reloadAfterRestart(() => disposed)
-  if (!reloaded) restarting.value = false
+  // 历史问题-F10：确认/重启/就绪轮询流程单源（utils/restart），与漂移恢复横幅同一实现
+  const result = await restartServiceWithFeedback({
+    confirmMessage: '重启期间服务短暂不可用，容器将自动拉起，就绪后自动刷新页面。确认重启？',
+    confirmTitle: '重启服务',
+    successMessage: '服务正在重启，就绪后自动刷新页面',
+    isDisposed: () => disposed,
+  })
+  if (result !== 'reloaded') restarting.value = false
 }
 
 const handleSave = async () => {

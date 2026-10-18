@@ -10,11 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -72,12 +70,7 @@ func (s *ClusterService) IssueServiceControlTicket(ctx context.Context, nodeID i
 	if err != nil {
 		return models.ClusterServiceControlIssue{}, err
 	}
-	if protocol != "https" {
-		protocol = "http"
-	}
-	if accessURL == "" {
-		accessURL = protocol + "://" + net.JoinHostPort(ipAddress, strconv.Itoa(port))
-	}
+	accessURL = resolveNodeAccessURL(ipAddress, port, protocol, accessURL)
 	return models.ClusterServiceControlIssue{Ticket: ticket, NodeName: name, URL: accessURL}, nil
 }
 
@@ -111,17 +104,8 @@ func (s *ClusterService) ForgetNodePin(ctx context.Context, nodeID int) (string,
 		}
 		return "", fmt.Errorf("读取节点访问地址: %w", err)
 	}
-	if protocol != "https" {
-		protocol = "http"
-	}
-	if accessURL == "" {
-		accessURL = protocol + "://" + net.JoinHostPort(ipAddress, strconv.Itoa(port))
-	}
-	parsed, err := url.Parse(accessURL)
-	if err != nil || parsed.Host == "" {
-		return "", fmt.Errorf("节点访问地址无效: %q", accessURL)
-	}
-	pinPath, err := clusterPinPathForDatabase(s.db, parsed.Host)
+	accessURL = resolveNodeAccessURL(ipAddress, port, protocol, accessURL)
+	pinPath, host, err := nodePinPathFromAccessURL(s.db, accessURL)
 	if err != nil {
 		return "", err
 	}
@@ -131,7 +115,7 @@ func (s *ClusterService) ForgetNodePin(ctx context.Context, nodeID int) (string,
 		}
 		return "", fmt.Errorf("删除节点证书指纹: %w", err)
 	}
-	return parsed.Host, nil
+	return host, nil
 }
 
 // ValidateServiceControlTicket 从节点侧：验签 + 过期 + 节点归属 + 动作绑定 +

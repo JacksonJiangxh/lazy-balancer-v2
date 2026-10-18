@@ -341,9 +341,11 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     const seq = ++drillSeq
     if (name !== '中国') {
       const tables = await loadAdmin1Tables()
-      if (seq !== drillSeq) return
+      // 历史问题-F5：chunk 加载期间用户退出大屏 → disposed 后不得再操作已销毁
+      // 的 globe（pointOfView/applyLayer 抛错会经 void 调用成为 unhandled rejection）。
+      if (seq !== drillSeq || disposed) return
       if (!tables) {
-        opts?.onProvinceLoadError?.()
+        if (!disposed) opts?.onProvinceLoadError?.()
         return
       }
       if (!tables[name]?.length) return
@@ -848,6 +850,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     },
     dispose(): void {
       disposed = true
+      // 历史问题-F5：作废在途省界加载（下钻续体在 await 后检查 disposed，双保险）
+      drillSeq += 1
       if (window.requestAnimationFrame === throttledRAF) window.requestAnimationFrame = originalRAF
       window.removeEventListener('resize', syncSize)
       ro.disconnect()
@@ -869,9 +873,15 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       globe.pointsData([])
       if (dotsPoints) {
         dotsPoints.geometry.dispose()
-        ;(dotsPoints.material as THREE.Material).dispose()
+        const dotsMaterial = dotsPoints.material as THREE.PointsMaterial
+        // 历史问题-F6：Material.dispose() 不释放贴图——dotTexture 的 CanvasTexture
+        // 必须显式释放，否则反复进出大屏累积 Canvas/GPU 资源。
+        dotsMaterial.map?.dispose()
+        dotsMaterial.dispose()
         dotsPoints = null
       }
+      // 历史问题-F6：海面材质（globe.globeMaterial）随实例销毁释放
+      oceanMat.dispose()
       if (scanMat) {
         scanMat.dispose()
         scanMat = null

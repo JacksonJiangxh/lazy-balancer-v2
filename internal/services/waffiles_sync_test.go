@@ -601,7 +601,10 @@ func TestUntarGzTo_restoreFailure_joinedIntoReturnedError(t *testing.T) {
 		_ = os.RemoveAll(staging)
 		_ = os.RemoveAll(destDir)
 	})
-	tmpMarker := filepath.Join(destDir, "a-new.conf.tmp")
+	// D1-历史问题：copyFile 改用单源原子落盘，临时文件为同目录唯一名
+	// （.<base>-<rand>.tmp）——按 glob 观测写入窗口，不再依赖固定
+	// 的 a-new.conf.tmp。
+	tmpPattern := filepath.Join(destDir, ".a-new.conf-*.tmp")
 	stopWatch := make(chan struct{})
 	watchDone := make(chan struct{})
 	go func() {
@@ -612,7 +615,7 @@ func TestUntarGzTo_restoreFailure_joinedIntoReturnedError(t *testing.T) {
 				return
 			default:
 			}
-			if _, statErr := os.Stat(tmpMarker); statErr == nil {
+			if matches, _ := filepath.Glob(tmpPattern); len(matches) > 0 {
 				if mkErr := os.MkdirAll(blocker, 0755); mkErr != nil {
 					return
 				}

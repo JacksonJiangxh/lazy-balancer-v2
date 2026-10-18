@@ -286,8 +286,11 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 			return
 		}
 	}
-	if err := tx.QueryRowContext(c.Request.Context(), `SELECT id,username,role,display_name,is_enabled,created_at,last_login,COALESCE(auth_provider,'local') FROM users WHERE id=?`, id).
-		Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &authProvider); err != nil {
+	// B1-历史问题：响应必须回填 mfa_enabled（与 GET /users 同口径）——此前
+	// NewUserResponse 无该字段，PUT 响应恒为 false，API 消费者/脚本误判。
+	var mfaEnabled int
+	if err := tx.QueryRowContext(c.Request.Context(), `SELECT id,username,role,display_name,is_enabled,created_at,last_login,COALESCE(auth_provider,'local'),COALESCE(mfa_enabled,0) FROM users WHERE id=?`, id).
+		Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &authProvider, &mfaEnabled); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户失败"})
 		return
 	}
@@ -303,7 +306,9 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	} else {
 		recordAudit(c, "更新", "用户", services.FormatAuditDetail(services.AuditUserPart(id, user.Username), fmt.Sprintf("变更：%s", strings.Join(changed, "、"))))
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "用户更新成功", Data: models.NewUserResponse(user)})
+	response := models.NewUserResponse(user)
+	response.MFAEnabled = mfaEnabled == 1
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "用户更新成功", Data: response})
 }
 
 // isOIDCUser 判定用户是否 OIDC 来源(历史问题:读失败与「非 OIDC」分判——
@@ -443,8 +448,10 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 		return
 	}
 
+	// B1-历史问题：*bool——缺省/拼错字段不得被零值当成「禁用」。{
+	// 请求体 {} 此前绑定成功且 IsEnabled=false，直接把用户静默停用。
 	var req struct {
-		IsEnabled bool `json:"is_enabled"`
+		IsEnabled *bool `json:"is_enabled"`
 	}
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -453,10 +460,15 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求格式错误"})
 		return
 	}
+	if req.IsEnabled == nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "缺少 is_enabled 字段"})
+		return
+	}
+	enable := *req.IsEnabled
 
 	// SYSRENDE历史问题-3(历史):自禁用防护——禁用自己=当前会话立即
 	// 失效,与 DeleteUser 自保护(历史问题-2)不对称。UI 已挡/API 未挡。
-	if !req.IsEnabled {
+	if !enable {
 		if userIDInt := int(contextUserID(c)); userIDInt == id {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "不能禁用当前登录用户"})
 			return
@@ -464,7 +476,7 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 	}
 
 	// 初始管理员不可禁用(同 DeleteUser 保护)
-	if !req.IsEnabled && id == setupAdminUserID {
+	if !enable && id == setupAdminUserID {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "初始管理员不可禁用"})
 		return
 	}
@@ -480,8 +492,8 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 		}
 	}()
 	query := "UPDATE users SET is_enabled = ? WHERE id = ?"
-	args := []any{req.IsEnabled, id}
-	if !req.IsEnabled {
+	args := []any{enable, id}
+	if !enable {
 		query += " AND (role <> 'admin' OR is_enabled = 0 OR EXISTS (SELECT 1 FROM users WHERE id <> ? AND role = 'admin' AND is_enabled = 1))"
 		args = append(args, id)
 	}
@@ -519,7 +531,7 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 	}
 
 	status := "disabled"
-	if req.IsEnabled {
+	if enable {
 		status = "enabled"
 	}
 	recordAudit(c, "修改状态", "用户", services.FormatAuditDetail(services.AuditUserPart(id, statusUsername), services.AuditResultPart(status)))

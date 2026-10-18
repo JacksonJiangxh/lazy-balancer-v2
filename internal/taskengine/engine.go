@@ -135,6 +135,10 @@ type registration struct {
 	// 历史 历史问题-04：常驻异常退出有界重拉状态。
 	abnormalRestarts int  // 连续异常退出次数（健康运行一段后或显式重启归零）
 	relaunchPending  bool // 退避等待中的重拉已排定（防重复排定）
+	// restartExhausted 标记「自愈预算用尽且已停止调度」（历史问题-03）：此时
+	// loopEnabled=false，与用户主动停止同形；监控视图需区分两者才能把
+	// 「永久停摆」呈现为 failed。用户显式重启/新工作唤醒会复位。
+	restartExhausted bool
 }
 
 // ---- Engine ----
@@ -219,7 +223,17 @@ func (e *Engine) StartedAt() time.Time { return e.startedAt }
 // IsStopped 返回引擎是否已停止（测试装配据此避免复用停止实例）。
 func (e *Engine) IsStopped() bool { return e.stopped.Load() }
 
-func (e *Engine) Stop() {
+// engineStopDrainTimeout 是 Stop 等待在途 Run/daemon 的兜底上限（历史问题-2）：
+// cert 四 tick / log-cleanup / audit-retention 等 Run 体不消费 rc.Ctx，
+// 取消等价 no-op——无界 Wait 会被单个长跑清理任务拖到容器 grace 期结束
+// 后 SIGKILL，审计/日志尾部丢失。
+const engineStopDrainTimeout = 30 * time.Second
+
+func (e *Engine) Stop() { e.StopWithTimeout(engineStopDrainTimeout) }
+
+// StopWithTimeout 与 Stop 同语义，但有界等待在途 Run/daemon 落定：超时后
+// 记录仍未退出的任务并放弃等待（进程退出优先；未落定行由孤儿恢复处理）。
+func (e *Engine) StopWithTimeout(timeout time.Duration) {
 	e.mu.Lock()
 	if e.stopped.Load() {
 		e.mu.Unlock()
@@ -236,8 +250,38 @@ func (e *Engine) Stop() {
 	}
 	e.mu.Unlock()
 	<-e.schedDone
-	e.runWG.Wait()    // 等全部 Scheduled/Periodic/Oneshot 在途 Run 落定终态
-	e.daemonWG.Wait() // 等全部 daemon goroutine 退出——防止跨测试/跨引擎残留（2026-10-04）
+	if timeout <= 0 {
+		timeout = engineStopDrainTimeout
+	}
+	settled := make(chan struct{})
+	go func() {
+		e.runWG.Wait()    // 等全部 Scheduled/Periodic/Oneshot 在途 Run 落定终态
+		e.daemonWG.Wait() // 等全部 daemon goroutine 退出——防止跨测试/跨引擎残留（2026-10-04）
+		close(settled)
+	}()
+	select {
+	case <-settled:
+	case <-time.After(timeout):
+		log.Printf("WARNING: taskengine: 引擎停止等待在途任务超时（%s），放弃等待继续退出；未落定任务: %s",
+			timeout, strings.Join(e.unsettledTaskIDs(), ","))
+	}
+}
+
+// unsettledTaskIDs 列出 Stop 超时后仍未退出 Run 的任务（诊断用）。
+func (e *Engine) unsettledTaskIDs() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	ids := make([]string, 0, 4)
+	for id, r := range e.regs {
+		r.mu.Lock()
+		running := r.running
+		r.mu.Unlock()
+		if running {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 func (e *Engine) SetRole(isMaster bool) {
@@ -665,6 +709,7 @@ func (e *Engine) StartLoop(id string) {
 		// 用户显式重启（关→开）=新一轮预算：清空历史异常重拉计数。
 		r.abnormalRestarts = 0
 		r.relaunchPending = false
+		r.restartExhausted = false
 	}
 	r.lastCheck = time.Time{}
 	r.mu.Unlock()
@@ -702,6 +747,12 @@ func (e *Engine) RearmLoop(id string, hasWork ...bool) {
 	r.mu.Lock()
 	if 绕过 {
 		r.loopEnabled = true
+		// 新工作唤醒=显式恢复调度：仅在自愈已用尽时重置预算（普通唤醒
+		// 不得清零崩溃循环的退避预算）。
+		if r.restartExhausted {
+			r.abnormalRestarts = 0
+			r.restartExhausted = false
+		}
 	} else if !r.loopEnabled {
 		r.mu.Unlock()
 		return
@@ -822,8 +873,11 @@ func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, ca
 				} else {
 					abnormalExhausted = true
 					// 与日志和监控语义一致：预算用尽即真实停止调度。
+					// restartExhausted 让监控视图把「自愈用尽」与用户主动停止
+					// 区分开（历史问题-03）——后者不得呈现 failed。
 					// 后续 StartLoop 观察到关→开过渡，才会重置预算并手动恢复。
 					r.loopEnabled = false
+					r.restartExhausted = true
 				}
 			}
 		}
@@ -1025,41 +1079,64 @@ func (e *Engine) RecoverOrphans() int64 {
 
 // ---- 执行 ----
 
-func (e *Engine) runNow(id, trigger, operator string) (int64, error) {
+// runReservation 一次执行占位的句柄（F-历史问题）：reserveRun 在调用线程完成
+// 全部入口门与单飞 CAS；executeRun 执行完成后由 release 统一复位状态。
+type runReservation struct {
+	engine *Engine
+	r      *registration
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func (res *runReservation) release() {
+	res.r.mu.Lock()
+	res.r.running = false
+	res.r.cancel = nil
+	res.r.mu.Unlock()
+	res.cancel()
+	res.engine.inFlight.Add(-1)
+	res.engine.runWG.Done()
+}
+
+// reserveRun 原子占位：stopped/paused/角色/单飞 CAS 与 runNow 同口径。
+// 任何失败同步返回错误（调用方可在写 HTTP 响应前映射状态码）。
+func (e *Engine) reserveRun(id, trigger string) (*runReservation, error) {
 	e.mu.Lock()
 	if e.stopped.Load() {
 		e.mu.Unlock()
-		return 0, ErrEngineStopped
+		return nil, ErrEngineStopped
 	}
 	// Pause 与登记共用 e.mu：一旦 PauseScheduling 返回，越过 tick 入口
 	// 检查的迟到 goroutine 与各手动入口都无法再增加 inFlight。
 	// RunBootSyncTasks 的 startup 是装配暂停期的唯一合法豁免。
 	if e.schedPaused.Load() && trigger != "startup" {
 		e.mu.Unlock()
-		return 0, ErrSchedulingPaused
+		return nil, ErrSchedulingPaused
 	}
 	r := e.regs[id]
 	e.runWG.Add(1)
 	e.inFlight.Add(1)
 	e.mu.Unlock()
-	defer func() {
+	if r == nil {
 		e.inFlight.Add(-1)
 		e.runWG.Done()
-	}()
-	if r == nil {
-		return 0, ErrNotFound
+		return nil, ErrNotFound
 	}
 	// 单飞 CAS：全部 Kind 统一拒绝并发（Daemon 无此路径——Trigger 不暴露）
 	e.roleMu.RLock()
 	if !e.roleAllowsLocked(r.desc.RunsOn) {
 		e.roleMu.RUnlock()
-		return 0, errors.New("taskengine: 该操作仅允许在主节点执行")
+		e.inFlight.Add(-1)
+		e.runWG.Done()
+		return nil, errors.New("taskengine: 该操作仅允许在主节点执行")
 	}
 	r.mu.Lock()
 	if r.running {
 		r.mu.Unlock()
 		e.roleMu.RUnlock()
-		return 0, ErrAlreadyRunning
+		e.inFlight.Add(-1)
+		e.runWG.Done()
+		return nil, ErrAlreadyRunning
 	}
 	r.running = true
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1074,7 +1151,36 @@ func (e *Engine) runNow(id, trigger, operator string) (int64, error) {
 	if stopAfterRegister {
 		cancel()
 	}
+	return &runReservation{engine: e, r: r, ctx: ctx, cancel: cancel}, nil
+}
 
+func (e *Engine) runNow(id, trigger, operator string) (int64, error) {
+	res, err := e.reserveRun(id, trigger)
+	if err != nil {
+		return 0, err
+	}
+	defer res.release()
+	return e.executeRun(res, id, trigger, operator)
+}
+
+// RunAsync 原子占位后异步执行一次（F-历史问题）：入口失败在任何 HTTP 响应
+// 之前同步返回（可映射 409/503），成功即已占位——「已受理」不再说谎。
+func (e *Engine) RunAsync(id, trigger, operator string) error {
+	res, err := e.reserveRun(id, trigger)
+	if err != nil {
+		return err
+	}
+	go func() {
+		defer res.release()
+		_, _ = e.executeRun(res, id, trigger, operator)
+	}()
+	return nil
+}
+
+// executeRun 执行已占位的运行（原 runNow 主体）。
+func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (int64, error) {
+	r := res.r
+	ctx := res.ctx
 	// 记录策略（按 Kind，零 flag）：
 	// Scheduled/Periodic/Oneshot: 每次执行落行；Daemon: 仅 startDaemon 落行
 	runID := globalInsertRunAt(id, r.desc.Family, trigger, engineNowStr(), operator)
@@ -1116,14 +1222,11 @@ func (e *Engine) runNow(id, trigger, operator string) (int64, error) {
 		// panic 会经 runNow 上抛给调用方（tick goroutine/手动触发链）。
 		nextSlot = safeSlot(id+".NextSlotFn", r.desc.NextSlotFn)
 	}
-	r.mu.Lock()
-	r.running = false
-	r.cancel = nil
 	if hasSlotFn {
+		r.mu.Lock()
 		r.nextScheduledTime = nextSlot
+		r.mu.Unlock()
 	}
-	r.mu.Unlock()
-	cancel()
 
 	if status == "failed" && runErr != nil {
 		e.finishRunWithMessage(runID, status, dur, truncMsg(runErr))
@@ -1505,7 +1608,10 @@ type TaskMeta struct {
 	Cancelable   bool   `json:"cancelable"`
 	LoopOn       bool   `json:"loop_on"`
 	Running      bool   `json:"running"` // Daemon：Run 实际存活（角色门/停止后=false）
-	CanTrigger   bool   `json:"can_trigger"`
+	// RestartExhausted：Daemon 自愈预算用尽且已停止调度（此时 LoopOn=false，
+	// 与用户主动停止同形——监控据此把永久停摆呈现为 failed，历史问题-03）。
+	RestartExhausted bool `json:"restart_exhausted,omitempty"`
+	CanTrigger       bool `json:"can_trigger"`
 }
 
 // Lookup 单任务元数据（历史问题-2：handler 为取单字段跑全量 DescribeAll
@@ -1518,11 +1624,12 @@ func (e *Engine) Lookup(id string) (TaskMeta, bool) {
 		return TaskMeta{}, false
 	}
 	r.mu.Lock()
-	loopOn, running := r.loopEnabled, r.running
+	loopOn, running, exhausted := r.loopEnabled, r.running, r.restartExhausted
 	r.mu.Unlock()
 	m := TaskMeta{
 		ID: id, Family: r.desc.Family, Name: r.desc.Name,
-		Description: r.desc.Description, Category: r.desc.Category, Kind: r.desc.Kind,
+		RestartExhausted: exhausted,
+		Description:      r.desc.Description, Category: r.desc.Category, Kind: r.desc.Kind,
 		// 类型派生（2026-10-11 用户裁定，取代 ManualRun 白名单）：定时/循环/
 		// 触发均可手动调度；常驻族恒不可（启停语义，调度开关+重启承担）。
 		CanTrigger:   r.desc.Kind != KindDaemon,
@@ -1552,18 +1659,19 @@ func (e *Engine) Lookup(id string) (TaskMeta, bool) {
 
 func (e *Engine) DescribeAll() []TaskMeta {
 	type snap struct {
-		id      string
-		desc    Descriptor
-		loopOn  bool
-		running bool
+		id        string
+		desc      Descriptor
+		loopOn    bool
+		running   bool
+		exhausted bool
 	}
 	e.mu.RLock()
 	snaps := make([]snap, 0, len(e.regs))
 	for id, r := range e.regs {
 		r.mu.Lock()
-		loopOn, running := r.loopEnabled, r.running
+		loopOn, running, exhausted := r.loopEnabled, r.running, r.restartExhausted
 		r.mu.Unlock()
-		snaps = append(snaps, snap{id: id, desc: r.desc, loopOn: loopOn, running: running})
+		snaps = append(snaps, snap{id: id, desc: r.desc, loopOn: loopOn, running: running, exhausted: exhausted})
 	}
 	e.mu.RUnlock()
 
@@ -1572,11 +1680,12 @@ func (e *Engine) DescribeAll() []TaskMeta {
 		m := TaskMeta{
 			ID: s.id, Family: s.desc.Family, Name: s.desc.Name,
 			Description: s.desc.Description, Category: s.desc.Category, Kind: s.desc.Kind,
-			CanTrigger:   s.desc.Kind != KindDaemon,
-			Cancelable:   s.desc.Cancelable,
-			LoopOn:       s.loopOn,
-			Running:      s.running,
-			Controllable: s.desc.Kind == KindDaemon, // 常驻族可启停（真实生命周期挂钩——B 完全标准化）
+			CanTrigger:       s.desc.Kind != KindDaemon,
+			Cancelable:       s.desc.Cancelable,
+			LoopOn:           s.loopOn,
+			Running:          s.running,
+			RestartExhausted: s.exhausted,
+			Controllable:     s.desc.Kind == KindDaemon, // 常驻族可启停（真实生命周期挂钩——B 完全标准化）
 		}
 		// 历史问题-04：闭包 panic 隔离（与 Lookup/tick 同口径）
 		if s.desc.IntervalFn != nil {

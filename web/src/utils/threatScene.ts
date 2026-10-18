@@ -614,6 +614,8 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   let drillSeq = 0
+  // 历史问题-F5：销毁标记——省界 chunk 在途时退出大屏，续体不得再操作已卸载视图
+  let disposed = false
 
   async function drillToCountry(country: string): Promise<void> {
     country = normalizeCountryName(country)
@@ -636,7 +638,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       : Math.min(WORLD_D - visH / 2, Math.max(visH / 2, latToY(clat)))
     // 中国走内置高精度表（无需异步）；其余国家按需加载省界 chunk。
     const provinces = await loadProvinceRows(country)
-    if (seq !== drillSeq) return // 加载期间又点击了别国/返回 → 丢弃
+    if (seq !== drillSeq || disposed) return // 加载期间又点击了别国/返回/退出大屏 → 丢弃
     // 无省层数据（含加载失败）：不进入下钻、不切换提示/返回按钮——
     // 原实现先 flyTo+onDrillChange 再发现无数据，画面成「被选国家空洞」。
     if (!provinces || provinces.length === 0) return
@@ -1196,6 +1198,9 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     },
     dispose(): void {
       cacheDisposed = true
+      // 历史问题-F5：作废在途下钻（drillToCountry 的 await 后继体检查 disposed）
+      disposed = true
+      drillSeq += 1
       cancelAnimationFrame(rafId)
       rafId = 0
       resizeObserver?.disconnect()

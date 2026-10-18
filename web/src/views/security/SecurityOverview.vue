@@ -23,6 +23,12 @@
       class="mb-5 error-banner"
     />
 
+    <!-- 历史问题-02：原始事件保留窗口口径（后端 raw_retention_note 非空才展示，避免全新部署噪音） -->
+    <div v-if="overview.raw_retention_note" class="info-note-bar">
+      <span class="info-note-desc">{{ overview.raw_retention_note }}</span>
+      <span v-if="rawCoverageLabel" class="info-note-sub">原始事件覆盖起点：{{ rawCoverageLabel }}</span>
+    </div>
+
     <el-row :gutter="20" class="mb-5">
       <el-col :xs="24" :md="10">
         <el-card shadow="always" class="overview-card">
@@ -88,7 +94,7 @@
                   <!-- disable-transitions：异步数据到达时标签实例新建会重播 EP
                        zoom-in-center（先漂后归位，2026-09-25 用户反馈修复，Dashboard 判例同款） -->
                   <el-tag v-if="overview.crs_available === false" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>缺失</el-tag>
-                  <el-tag v-else-if="overview.update_status" :type="statusTagType(overview.update_status)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ statusLabel(overview.update_status) }}</el-tag>
+                  <el-tag v-else-if="overview.update_status" :type="libraryStatusTagType(overview.update_status)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ libraryStatusLabel(overview.update_status) }}</el-tag>
                 </div>
               </div>
             </div>
@@ -101,7 +107,7 @@
                   <el-tag v-if="ip2regionError" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>加载失败</el-tag>
                   <el-tag v-else-if="overview.ip2region_available === false" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>缺失</el-tag>
                   <el-tag v-else-if="ip2regionVersion === 'unknown'" type="info" size="small" effect="plain" style="margin-top: 4px" disable-transitions>未安装</el-tag>
-                  <el-tag v-else-if="ip2regionStatus" :type="statusTagType(ip2regionStatus)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ statusLabel(ip2regionStatus) }}</el-tag>
+                  <el-tag v-else-if="ip2regionStatus" :type="libraryStatusTagType(ip2regionStatus)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ libraryStatusLabel(ip2regionStatus) }}</el-tag>
                 </div>
               </div>
             </div>
@@ -112,7 +118,7 @@
                   <div class="stat-box__value">{{ threatLatestVersion || '未更新' }}</div>
                   <div class="stat-box__label">威胁情报库</div>
                   <el-tag v-if="threatError" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>加载失败</el-tag>
-                  <el-tag v-else-if="threatStatus" :type="statusTagType(threatStatus)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ statusLabel(threatStatus) }}</el-tag>
+                  <el-tag v-else-if="threatStatus" :type="libraryStatusTagType(threatStatus)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ libraryStatusLabel(threatStatus) }}</el-tag>
                 </div>
               </div>
             </div>
@@ -123,7 +129,7 @@
                   <div class="stat-box__value">{{ crawlerLatestVersion || '未更新' }}</div>
                   <div class="stat-box__label">爬虫地址库</div>
                   <el-tag v-if="crawlerError" type="danger" size="small" effect="plain" style="margin-top: 4px" disable-transitions>加载失败</el-tag>
-                  <el-tag v-else-if="crawlerStatus" :type="statusTagType(crawlerStatus)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ statusLabel(crawlerStatus) }}</el-tag>
+                  <el-tag v-else-if="crawlerStatus" :type="libraryStatusTagType(crawlerStatus)" size="small" effect="plain" style="margin-top: 4px" disable-transitions>{{ libraryStatusLabel(crawlerStatus) }}</el-tag>
                 </div>
               </div>
             </div>
@@ -269,7 +275,7 @@ import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
 import { formatDate } from '@/utils/date'
-import { compareVersion } from '@/utils/securityStages'
+import { libraryStatusLabel, libraryStatusTagType, summarizeLibrarySources, type LibrarySourceRow } from '@/utils/securityLibraries'
 import '@/utils/echarts' // 统一注册（副作用，全站单点）
 import VChart from 'vue-echarts'
 import type { APIResponse } from '@/types'
@@ -281,50 +287,15 @@ interface TrendPoint { date: string; blocked: number; detected: number }
 interface TopIP { ip: string; ip_location: string; blocked: number; detected: number; last_time: string; attack_type: string; attack_type_stage?: string
 }
 interface AttackType { name: string; value: number }
-interface Overview { today_blocked: number; today_detected: number; active_policies: number; crs_version: string; crs_available?: boolean; ip2region_available?: boolean; update_status?: string; trend: TrendPoint[]; top_ips: TopIP[]; attack_types: AttackType[]; attack_types_stage: AttackType[] }
+interface Overview {
+  today_blocked: number; today_detected: number; active_policies: number; crs_version: string
+  crs_available?: boolean; ip2region_available?: boolean; update_status?: string
+  trend: TrendPoint[]; top_ips: TopIP[]; attack_types: AttackType[]; attack_types_stage: AttackType[]
+  // 历史问题-02：原始事件保留窗口口径（GET /security/overview 返回）
+  raw_coverage_from?: string
+  raw_retention_note?: string
+}
 interface SecurityEvent { id: number; event_time: string; client_ip: string; rule_caddy_id: string; rule_name: string; policy_name: string; ip_location?: string }
-
-type TagType = 'success' | 'warning' | 'danger' | 'info'
-
-function statusLabel(status: string): string {
-  switch (status) {
-    case 'idle':
-    case 'success':
-      return '已最新'
-    case 'checking':
-      return '检查中'
-    case 'downloading':
-      return '下载中'
-    case 'installing':
-      return '安装中'
-    case 'running':
-      return '更新中'
-    case 'reloading':
-      return '重载中'
-    case 'failed':
-      return '更新失败'
-    default:
-      return status
-  }
-}
-
-function statusTagType(status: string): TagType {
-  switch (status) {
-    case 'idle':
-    case 'success':
-      return 'success'
-    case 'checking':
-    case 'downloading':
-    case 'installing':
-    case 'running':
-    case 'reloading':
-      return 'warning'
-    case 'failed':
-      return 'danger'
-    default:
-      return 'info'
-  }
-}
 
 const attackByStage = ref(true)
 
@@ -337,11 +308,14 @@ const topIpAttackLabel = (row: TopIP): string => {
   if (!attackByStage.value) return row.attack_type || '—'
   return row.attack_type_stage || '—'
 }
-const overview = ref<Overview>({ today_blocked: 0, today_detected: 0, active_policies: 0, crs_version: '', trend: [], top_ips: [], attack_types: [], attack_types_stage: [] })
+const overview = ref<Overview>({ today_blocked: 0, today_detected: 0, active_policies: 0, crs_version: '', trend: [], top_ips: [], attack_types: [], attack_types_stage: [], raw_coverage_from: '', raw_retention_note: '' })
 // 分布图展示模式：勾选=按阶段五桶（默认，与触发阶段口径一致）；取消=具体分类
 // 总览加载失败（如 metrics 库故障导致后端 500）时置位：避免把全零面板
 // 误当「无攻击」，用户目标与 历史问题 D2 的后端显式报错对齐（历史问题 F1）。
 const overviewError = ref(false)
+// 历史问题-02：原始保留窗口口径——raw_coverage_from 为原始表最早事件（UTC 墙钟串，
+// formatDate 归一展示）；note 非空时提示「趋势/Top IP 仅覆盖原始保留窗口」。
+const rawCoverageLabel = computed(() => formatDate(overview.value.raw_coverage_from) || '')
 
 const trendChartOption = computed(() => {
   const dates = overview.value.trend.map(t => t.date)
@@ -432,36 +406,19 @@ const fetchIP2RegionInfo = async () => {
   }
 }
 
-// 多源规则库总览投影（威胁情报库/爬虫地址库共用）：版本取最近日期，
-// 状态=更新中>失败>成功>未更新。
-interface OverviewLibrarySource { version: string; update_status: string }
-const summarizeOverviewLibrary = (sources: OverviewLibrarySource[]) => {
-  const latestVersion = sources.map(s => s.version).filter(Boolean).sort(compareVersion).pop() || ''
-  const running = sources.some(s => s.update_status === 'running')
-  const failed = !running && sources.some(s => s.update_status === 'failed')
-  return { latestVersion, running, failed }
-}
-const overviewLibraryStatus = (running: boolean, failed: boolean, latestVersion: string) => {
-  if (running) return 'running'
-  if (failed) return 'failed'
-  if (latestVersion) return 'success'
-  return ''
-}
-
 // 威胁情报库 stat（v2.3.x）：最近版本（各源 version 最大者）+ 运行状态。
 // total_entries 未展示（「合并生效条数」口径需后端去重统计，当前仅版本可呈现）。
 const threatLatestVersion = ref('')
-const threatRunning = ref(false)
-const threatFailed = ref(false)
 const threatError = ref(false)
-const threatStatus = computed(() => overviewLibraryStatus(threatRunning.value, threatFailed.value, threatLatestVersion.value))
+// 状态由单一聚合源产出（utils/securityLibraries.summarizeLibrarySources）——
+// 与「规则集」页同口径；空源/无版本为 never（未更新），不再返回 '' 静默无标签。
+const threatStatus = ref('')
 const fetchThreatLib = async () => {
   try {
-    const res = await request.get<APIResponse<{ sources: OverviewLibrarySource[]; total_entries?: number }>>('/security/threat-lib')
-    const summary = summarizeOverviewLibrary(res.data?.sources || [])
+    const res = await request.get<APIResponse<{ sources: LibrarySourceRow[]; total_entries?: number }>>('/security/threat-lib')
+    const summary = summarizeLibrarySources(res.data?.sources || [], formatDate)
     threatLatestVersion.value = summary.latestVersion
-    threatRunning.value = summary.running
-    threatFailed.value = summary.failed
+    threatStatus.value = summary.status
     threatError.value = false
   } catch {
     threatError.value = true
@@ -470,17 +427,14 @@ const fetchThreatLib = async () => {
 
 // 爬虫地址库 stat：与威胁情报库同口径，但读独立端点/独立任务状态。
 const crawlerLatestVersion = ref('')
-const crawlerRunning = ref(false)
-const crawlerFailed = ref(false)
 const crawlerError = ref(false)
-const crawlerStatus = computed(() => overviewLibraryStatus(crawlerRunning.value, crawlerFailed.value, crawlerLatestVersion.value))
+const crawlerStatus = ref('')
 const fetchCrawlerLib = async () => {
   try {
-    const res = await request.get<APIResponse<{ sources: OverviewLibrarySource[]; total_entries?: number }>>('/security/crawler-lib')
-    const summary = summarizeOverviewLibrary(res.data?.sources || [])
+    const res = await request.get<APIResponse<{ sources: LibrarySourceRow[]; total_entries?: number }>>('/security/crawler-lib')
+    const summary = summarizeLibrarySources(res.data?.sources || [], formatDate)
     crawlerLatestVersion.value = summary.latestVersion
-    crawlerRunning.value = summary.running
-    crawlerFailed.value = summary.failed
+    crawlerStatus.value = summary.status
     crawlerError.value = false
   } catch {
     crawlerError.value = true

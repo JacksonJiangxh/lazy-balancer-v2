@@ -13,7 +13,7 @@
 
 > 不挂载 `/app/waf` 时，容器重建会将 CRS 回退到镜像捆绑版本；系统自动将更新后的规则树快照持久化到数据卷并在启动时对账恢复。数据库是配置的唯一真实来源。
 
-> Docker Desktop（macOS/Windows）用户：`/app/data` 推荐 named volume（`lb-data:/app/data` 形态，见仓库 docker-compose.yml）；bind mount 经 FUSE 共享层有 SQLite WAL 丢页风险（Linux 宿主 bind mount 无此问题）。
+> Docker Desktop（macOS/Windows）用户：`/app/data` 推荐 named volume（`lb-data:/app/data` 形态）；bind mount 经 FUSE 共享层有 SQLite WAL 丢页风险（Linux 宿主 bind mount 无此问题）。同时请用「端口」一节的 `-p` 端口映射启动（host 网络仅推荐 Linux）；仓库 docker-compose.yml 的主节点固定 host 网络，仅适用于 Linux 场景。
 
 ## 环境变量
 
@@ -83,7 +83,7 @@
 - **请求头**：按优先级排列可信头，留空等价于仅 `X-Forwarded-For`；面板提供 Cloudflare / Akamai / Fastly / AWS CloudFront / 阿里云 CDN/ESA / 腾讯云 CDN/EdgeOne 等预设，仅一键填充头名，网段仍需按官方列表维护。
 - **严格模式**：默认开启，取「最右可信」值；关闭后取最左值，可被客户端伪造，仅用于特殊代理链。
 
-保存后约 1 秒内热生效（网段变更无需重载配置）。受信代理与「面板直连」是两套语义：前者还原**代理流量**的真实客户端 IP，后者约束**管理面板**的访问路径。
+保存后约 1 秒内热生效，无需手动重载；保存会在同一事务内执行一次 Caddy 热应用（`/load`），提交成功后记录重载审计——因此网段变更会产生一次配置重载记录，属预期行为。受信代理与「面板直连」是两套语义：前者还原**代理流量**的真实客户端 IP，后者约束**管理面板**的访问路径。
 
 ## 面板访问与安全语义（多节点/反代须知）
 

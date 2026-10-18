@@ -19,7 +19,30 @@ import (
 var (
 	cidrTokenRE   = regexp.MustCompile(`(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?`)
 	cidrTokenV6RE = regexp.MustCompile(`(?i)(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{0,4}(?:/\d{1,3})?`)
+	// 历史问题-01（历史）：360 官方页面只公示通配段（`42.236.10.*`），
+	// 词法 CIDR 正则无法命中——旧实现把 UA 版本串 `Chrome/140.0.0.0` 收成
+	// /32 并覆盖正确名单（真实 360 爬虫失去豁免、无关地址获得豁免）。
+	cidrWildcardRE = regexp.MustCompile(`(?:\d{1,3}\.){3}\*`)
 )
+
+// crawlerVersionPrefix 判定 token 起始处是否为 URL/版本串前缀（`Chrome/`、
+// `Edg/`、`v1.2.3.4`）——此类四段数字是 UA/版本号而非网段，边界仅排除
+// 数字/点不足以拦截（历史问题-02 历史）。
+func crawlerVersionPrefix(body string, start int) bool {
+	if start == 0 {
+		return false
+	}
+	switch body[start-1] {
+	case 'v', 'V':
+		return true
+	case '/':
+		if start >= 2 {
+			prev := body[start-2]
+			return prev >= 'A' && prev <= 'Z' || prev >= 'a' && prev <= 'z'
+		}
+	}
+	return false
+}
 
 // crawlerTokenBoundary 判定 token 边界外字符是否属于「同类」——数字/点（v4）
 // 或十六进制/冒号/点（v6）。Go RE2 无 lookaround，用索引手工判界（避免消费
@@ -40,6 +63,9 @@ func findBoundedCrawlerTokens(re *regexp.Regexp, body string, v6 bool) []string 
 	out := make([]string, 0, len(idxs))
 	for _, idx := range idxs {
 		start, end := idx[0], idx[1]
+		if crawlerVersionPrefix(body, start) {
+			continue
+		}
 		if start > 0 && crawlerTokenBoundary(body[start-1], v6) {
 			continue
 		}
@@ -93,6 +119,11 @@ func parseCrawlerCIDRsForFormat(body, format string) ([]string, error) {
 		return nil, fmt.Errorf("响应不是合法 JSON（疑似错误页），保留上次快照")
 	}
 	// 2) 通用词法（HTML/纯文本/未结构化 JSON）。
+	// 历史问题-01：官方通配段 `a.b.c.*` 先按 /24 归一（360 页面只公示通配形态）；
+	// 版本串前缀已在 findBoundedCrawlerTokens 过滤（Chrome/140.0.0.0 等）。
+	for _, tok := range findBoundedCrawlerTokens(cidrWildcardRE, body, false) {
+		add(strings.TrimSuffix(tok, "*") + "0/24")
+	}
 	for _, tok := range findBoundedCrawlerTokens(cidrTokenRE, body, false) {
 		add(tok)
 	}

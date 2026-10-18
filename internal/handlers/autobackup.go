@@ -57,6 +57,12 @@ func loadAutoBackupSectionsSetting() ([]string, error) {
 	if err := db.DB.QueryRow(`SELECT auto_backup_sections FROM global_config WHERE id=1`).Scan(&raw); err != nil {
 		return nil, fmt.Errorf("读取备份范围: %w", err)
 	}
+	return decodeAutoBackupSectionsRaw(raw)
+}
+
+// decodeAutoBackupSectionsRaw 备份范围存储值 → 有效分类集合单源（读设置与
+// 调度执行共用）：NULL/空串 → nil（全量）；空数组/损坏 JSON/未知分类 → 错误。
+func decodeAutoBackupSectionsRaw(raw sql.NullString) ([]string, error) {
 	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
 		return nil, nil
 	}
@@ -67,7 +73,23 @@ func loadAutoBackupSectionsSetting() ([]string, error) {
 	if len(sections) == 0 {
 		return nil, errors.New("备份范围不能为空数组")
 	}
-	return normalizeBackupSectionKeys(sections), nil
+	normalized := normalizeBackupSectionKeys(sections)
+	// B2-历史问题：未知分类名同样显式报错——此前仅导出时才 400，调度每轮失败
+	// 而设置页无信号。
+	if _, _, ok := configBackupSectionTables(normalized); !ok {
+		return nil, fmt.Errorf("备份范围包含未知分类: %s", strings.Join(normalized, ","))
+	}
+	return normalized, nil
+}
+
+// allBackupSectionKeys 当前三分类的键序（GET 设置读侧把「未设置=全量」
+// 展开成同一份有效范围，响应与执行语义不再分叉——B2-历史问题）。
+func allBackupSectionKeys() []string {
+	keys := make([]string, 0, len(configBackupSections))
+	for _, sec := range configBackupSections {
+		keys = append(keys, sec.Key)
+	}
+	return keys
 }
 
 // loadAutoBackupKeepSetting 读取保留份数；越界/读失败回退 7（写侧已限 1-30；
@@ -399,12 +421,18 @@ func (h *Handlers) AutoBackupSettings(c *gin.Context) {
 	if day < 1 || day > dayHigh {
 		day = 1
 	}
-	sections := []string{}
-	if sectionsRaw.Valid {
-		var stored []string
-		if json.Unmarshal([]byte(sectionsRaw.String), &stored) == nil && len(stored) > 0 {
-			sections = normalizeBackupSectionKeys(stored)
-		}
+	// B2-历史问题：读侧与执行侧（loadAutoBackupSectionsSetting）同一语义——
+	// NULL/空串=全量，展开为三分类全键；损坏 JSON/[]/未知分类显式 500，
+	// 不再静默呈现空数组（调度侧这些形态本来就每轮失败）。复用本查询已
+	// 扫描的原始值，避免额外一次 DB 读（读侧语义单源在解码 helper）。
+	storedSections, sectionsErr := decodeAutoBackupSectionsRaw(sectionsRaw)
+	if sectionsErr != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取备份范围失败: " + sectionsErr.Error()})
+		return
+	}
+	sections := storedSections
+	if sections == nil {
+		sections = allBackupSectionKeys()
 	}
 	backups := []autoBackupRowView{}
 	rows, err := db.DB.Query(`SELECT ` + autoBackupRowColumns + ` FROM auto_backups ORDER BY created_at DESC, id DESC`)
@@ -575,16 +603,14 @@ func autoBackupSectionLabels(sections []string) []string {
 	return labels
 }
 
-// autoBackupTriggerMu 手动触发单飞门（历史问题）：请求线程只负责抢占+接受，
-// 实际备份在后台任务执行（te.RunSync），完成后释放。
-var autoBackupTriggerMu sync.Mutex
-
 // RunAutoBackupNow POST /api/v1/auto-backup/run：手动触发一次完整备份。
 //
 // 历史问题（历史）：响应前转后台——此前同步 te.RunSync 让「备份 >60s」
-// 撞 main.go WriteTimeout(60s) 截断响应；现抢占单飞门后立即 202 返回，
-// 备份由引擎在后台执行（task_runs/auto_backups 均照常落行），前端轮询
-// 备份列表/任务历史查看结果。双击/并发触发 → 409（不排队）。
+// 撞 main.go WriteTimeout(60s) 截断响应。
+// F-历史问题 / 历史问题-02（历史）：占位改为引擎原子预留（RunAsync）——
+// 入口门（paused/stopped/角色/单飞）与 running CAS 在请求线程内完成，
+// 失败在 202 之前同步映射 409/403/503 并留审计；不再出现「已受理但后台
+// 被静默拒绝」。运行期失败仍由引擎 task_runs/日志记录。
 func (h *Handlers) RunAutoBackupNow(c *gin.Context) {
 	if !h.requireAutoBackupMaster(c) {
 		return
@@ -598,30 +624,23 @@ func (h *Handlers) RunAutoBackupNow(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
 		return
 	}
-	if !autoBackupTriggerMu.TryLock() {
-		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "已有备份任务正在执行，请稍后重试"})
-		return
-	}
-	// 历史问题-02：本层门只串行手动触发——定时备份（03:00 起可能跑数分钟）在途
-	// 时 TryLock 必成功，随后 goroutine 撞引擎单飞会静默丢弃（仅写 warn），
-	// 用户却已收到「已开始」。202 之前同步检出引擎在途（与任务监控触发同门）。
-	if te.IsTaskInFlight("auto-backup") {
-		autoBackupTriggerMu.Unlock()
-		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "已有备份任务正在执行（含定时备份），请稍后重试"})
-		return
-	}
-	go func() {
-		defer autoBackupTriggerMu.Unlock()
-		// B2（历史后裁定）：单轨化——经引擎 RunSync（手动执行与任务监控
-		// 触发同一通道；引擎 CAS 单飞 + 本层门双保险）。
-		if _, err := te.RunSync("auto-backup", "manual", operator); err != nil {
-			if errors.Is(err, taskengine.ErrAlreadyRunning) {
-				services.Logf("warn", "手动备份：引擎报告任务运行中（后台触发被拒）")
-				return
-			}
-			services.Logf("error", "手动备份后台执行失败: %v", err)
+	if err := te.RunAsync("auto-backup", "manual", operator); err != nil {
+		recordAudit(c, "触发失败", "自动备份", "手动触发备份失败: "+err.Error())
+		switch {
+		case errors.Is(err, taskengine.ErrAlreadyRunning):
+			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "已有备份任务正在执行（含定时备份），请稍后重试"})
+		case errors.Is(err, taskengine.ErrSchedulingPaused):
+			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务调度已暂停（配置导入进行中），请稍后重试"})
+		case errors.Is(err, taskengine.ErrEngineStopped):
+			c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎已停止，无法触发备份"})
+		case strings.Contains(err.Error(), "仅允许在主节点执行"):
+			c.JSON(http.StatusForbidden, models.APIResponse{Code: 403, Message: err.Error()})
+		default:
+			services.Logf("error", "手动备份触发失败: %v", err)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "触发备份失败: " + err.Error()})
 		}
-	}()
+		return
+	}
 	c.JSON(http.StatusAccepted, models.APIResponse{Code: 0, Message: "手动备份已开始，完成后可在备份列表查看"})
 }
 

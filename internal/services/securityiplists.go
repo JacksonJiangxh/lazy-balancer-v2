@@ -56,6 +56,16 @@ func ipListRefsNonEmpty(raw string) bool {
 	return len(parseIPListRefs(raw)) > 0
 }
 
+// logMalformedInlineIPList 渲染期内联 IP 名单 JSON 畸形留痕（历史问题-03 第 83
+// 轮审计，限流）。写侧/导入侧已拒非 JSON，仅带外改库/旧库残留可达；旧实现
+// 静默按空集处理——deny ACL / 黑名单方向即 fail-open 且零告警。
+func logMalformedInlineIPList(policyID int, field string, err error) {
+	msg := fmt.Sprintf("渲染: 策略 #%d 内联 IP 名单 %s 解析失败（该列按空集处理）: %v", policyID, field, err)
+	if auditFailureShouldLog(msg) {
+		Logf("warn", "%s", msg)
+	}
+}
+
 // expandPolicyIPRefs 把策略的 inline IP 条目与引用的 IP 列表条目合并为生效集：
 // inline 条目优先，其后按 refs 出现顺序追加各列表条目；跨来源逐值去重；
 // listsByID 缺失的 id 与内嵌 null 值跳过。纯函数，不触碰数据库。
@@ -64,7 +74,7 @@ func expandPolicyIPRefs(p *models.SecurityPolicy, listsByID map[int64][]string) 
 	if p == nil {
 		return exp
 	}
-	merge := func(inlineRaw string, refsRaw string) []string {
+	merge := func(field, inlineRaw string, refsRaw string) []string {
 		var merged []string
 		seen := make(map[string]struct{})
 		addAll := func(entries []string) {
@@ -80,7 +90,9 @@ func expandPolicyIPRefs(p *models.SecurityPolicy, listsByID map[int64][]string) 
 			}
 		}
 		var inline []string
-		json.Unmarshal([]byte(inlineRaw), &inline)
+		if err := json.Unmarshal([]byte(inlineRaw), &inline); err != nil {
+			logMalformedInlineIPList(p.ID, field, err)
+		}
 		addAll(inline)
 		for _, id := range parseIPListRefs(refsRaw) {
 			addAll(listsByID[id])
@@ -91,8 +103,8 @@ func expandPolicyIPRefs(p *models.SecurityPolicy, listsByID map[int64][]string) 
 	// 发射端 mergedACLList/mergedWhitelist 按规则×策略逐次调用，若在此处不
 	// 聚合，万条级合并集（如 USTC 11415 条）会被每次调用全量重聚合——保存
 	// 耗时随绑定规则数线性放大。聚合幂等，此处一次完成后发射端直接返回。
-	exp.ACLList = aggregateIPEntries(merge(p.IPACLList, p.IPACLListRefs))
-	exp.Whitelist = aggregateIPEntries(merge(string(p.IPWhitelist), p.IPWhitelistRefs))
+	exp.ACLList = aggregateIPEntries(merge("ip_acl_list", p.IPACLList, p.IPACLListRefs))
+	exp.Whitelist = aggregateIPEntries(merge("ip_whitelist", string(p.IPWhitelist), p.IPWhitelistRefs))
 	return exp
 }
 
@@ -435,7 +447,9 @@ func mergedACLList(p *models.SecurityPolicy) []string {
 		return p.MergedACLList // 扩展开期已聚合（见 expandPolicyIPRefs），直接返回
 	}
 	var list []string
-	json.Unmarshal([]byte(p.IPACLList), &list)
+	if err := json.Unmarshal([]byte(p.IPACLList), &list); err != nil {
+		logMalformedInlineIPList(p.ID, "ip_acl_list", err)
+	}
 	return aggregateIPEntries(list)
 }
 
@@ -445,7 +459,9 @@ func mergedWhitelist(p *models.SecurityPolicy) []string {
 		return p.MergedWhitelist // 同上：扩开期已聚合
 	}
 	var list []string
-	json.Unmarshal(p.IPWhitelist, &list)
+	if err := json.Unmarshal(p.IPWhitelist, &list); err != nil {
+		logMalformedInlineIPList(p.ID, "ip_whitelist", err)
+	}
 	return aggregateIPEntries(list)
 }
 

@@ -204,13 +204,9 @@ func SetIP2RegionVersion(version string) {
 // writeProvincesCache atomically writes the province JSON cache by writing to a
 // temporary file then renaming, so concurrent readers never see a partial file.
 // SEC-历史问题（历史）：写/换名错误沿返回值上抛——此前静默吞错，调用点
-// 无从留痕。
+// 无从留痕。D1-历史问题：改用单源原子落盘（tmp+fsync+父目录 fsync）。
 func writeProvincesCache(path string, data []byte) error {
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, path)
+	return writeFileAtomicSynced(path, data, 0644)
 }
 
 // GetCachedProvinces returns the province list from the JSON cache file,

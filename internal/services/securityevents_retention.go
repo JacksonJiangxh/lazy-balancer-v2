@@ -20,6 +20,11 @@ const (
 	securityEventsRetentionDeleteBatch = 20000
 )
 
+// ThreatRollupEventHighwaterPrefix 分钟事件高水位键前缀（单源）：写入侧=大屏
+// rollup 固化（handlers 包引用本常量），清理侧=保留任务按同一 rollupCutoff
+// 删除——两处不得各自硬编码（A83A-历史问题 历史：写入存在而清理缺失）。
+const ThreatRollupEventHighwaterPrefix = "threat_rollup_max_event_id:"
+
 // SecurityEventsRetentionMax 返回安全事件行数上限（v2.3.8 起可经
 // security_events_row_cap 显式设置，0=内置默认）。
 func SecurityEventsRetentionMax() int {
@@ -220,8 +225,36 @@ func securityEventsRetentionCleanup(ctx context.Context) int {
 	if targetDeleted > 0 {
 		Logf("info", "security events retention: target rollup cleanup removed %d rows older than %s", targetDeleted, rollupCutoff)
 	}
+	// A83A-历史问题（历史）：分钟事件高水位键 threat_rollup_max_event_id:<minute>
+	// 与 rollup 同生命周期——此前每分钟一行常驻 metrics_state（约 1440 行/天、
+	// 52.5 万行/年），全仓无删除点。按同一 rollupCutoff 清理（键后缀为
+	// 'YYYY-MM-DD HH:MM' 同形态，字符串比较即时间序）。
+	highwaterDeleted := 0
+	for {
+		res, err := database.Exec(`DELETE FROM metrics_state WHERE key IN (
+			SELECT key FROM metrics_state WHERE key LIKE ? AND substr(key, ?) < ? LIMIT 500)`,
+			ThreatRollupEventHighwaterPrefix+"%", len(ThreatRollupEventHighwaterPrefix)+1, rollupCutoff)
+		if err != nil {
+			Logf("warn", "security events retention: rollup highwater cleanup failed: %v", err)
+			break
+		}
+		affected, _ := res.RowsAffected()
+		highwaterDeleted += int(affected)
+		if affected == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			Logf("info", "security events retention: rollup highwater cleanup canceled mid-pass (deleted %d)", highwaterDeleted)
+			return total
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if highwaterDeleted > 0 {
+		Logf("info", "security events retention: rollup highwater cleanup removed %d keys older than %s", highwaterDeleted, rollupCutoff)
+	}
 	// v2.3.8：本轮有删除时截断 WAL（含仅 rollup 清理；100/s 持续写入+滚动删除下防 WAL 无界）
-	if total > 0 || rollupDeleted > 0 || targetDeleted > 0 {
+	if total > 0 || rollupDeleted > 0 || targetDeleted > 0 || highwaterDeleted > 0 {
 		if _, err := database.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 			Logf("warn", "security events retention: wal checkpoint failed: %v", err)
 		}

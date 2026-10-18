@@ -70,6 +70,45 @@ func TaskEngine() *taskengine.Engine { return taskEngine }
 // 用于需要独立描述符集合的 API 行为测试，禁止用于绕过 Register 校验。
 func SetTaskEngineForTest(te *taskengine.Engine) { taskEngine = te }
 
+// reconcileTaskEngineRole 把引擎角色对齐到 DB 单源角色（历史问题-1）。
+//
+// 引擎角色此前只在 InitTaskEngine 播种一次：播种连续失败即 SetRole(false)，
+// 若 DB 实为主节点则形成「DB=主/引擎=从」的进程内半主半从——master-only
+// 任务全部静默停摆，且再次 Promote 返回 ErrAlreadyMaster 无法自愈。本函数
+// 由低频率巡检（config-watchdog，60s）调用，使角色成为可收敛的 DB 投影。
+//
+// 并发安全：与 ClusterService.Promote/BecomeSlave 的 roleMu 串行——两处
+// 翻转都在持 roleMu 时完成「DB 更新 + SetRole」。不串行则对账可能读到翻转
+// 前的旧角色，并在降级落定后把引擎重新升主（从节点启动 master-only daemon
+// 写库）。锁序 roleMu → 引擎内部锁，与翻转路径同序，无反向获取。
+func reconcileTaskEngineRole() {
+	database := db.DB
+	te := taskEngine
+	if database == nil || te == nil {
+		return
+	}
+	instances := clusterServicesFor(database)
+	for _, instance := range instances {
+		instance.roleMu.Lock()
+	}
+	defer func() {
+		for index := len(instances) - 1; index >= 0; index-- {
+			instances[index].roleMu.Unlock()
+		}
+	}()
+	roleMaster, err := RoleOf(context.Background(), database)
+	if err != nil {
+		Logf("warn", "任务引擎角色对账读取失败（下一轮看门狗重试）: %v", err)
+		return
+	}
+	if roleMaster == te.IsMaster() {
+		return
+	}
+	Logf("warn", "任务引擎角色与数据库不一致（数据库主节点=%v，引擎主节点=%v），按数据库修正",
+		roleMaster, te.IsMaster())
+	te.SetRole(roleMaster)
+}
+
 // mustRegisterTask 装配期统一注册入口：描述符非法属于静态装配错误，
 // 必须启动即响亮失败，不得静默少一个任务。
 func mustRegisterTask(te *taskengine.Engine, d taskengine.Descriptor) {
@@ -133,6 +172,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Kind:        taskengine.KindPeriodic,
 		IntervalFn:  func() time.Duration { return 60 * time.Second },
 		Run: func(rc taskengine.RunContext) error {
+			// 历史问题-1：低频率角色对账（与漂移检查同轮）。启动播种失败或
+			// 任何进程内角色漂移在此收敛，master-only 任务不会永久停摆。
+			reconcileTaskEngineRole()
 			WatchdogCheckOnce()
 			return nil
 		},

@@ -20,7 +20,9 @@ import (
 	"lazy-balancer-v2/internal/acme"
 	"lazy-balancer-v2/internal/config"
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/dnsprovider/dnspod"
 	"lazy-balancer-v2/internal/dnsprovider/ownership"
+	"lazy-balancer-v2/internal/dnsprovider/tencent"
 	"lazy-balancer-v2/internal/handlers"
 	"lazy-balancer-v2/internal/middleware"
 
@@ -79,6 +81,9 @@ func run() error {
 	// 日志接缝在此装配——装配后其告警进入统一日志级别链（services.Logf）。
 	acme.SetLogf(services.Logf)
 	ownership.SetLogf(services.Logf)
+	// 历史问题-3：dnsprovider 两实现的 TXT 残留告警接缝（修复前裸 log.Printf）。
+	dnspod.SetLogf(services.Logf)
+	tencent.SetLogf(services.Logf)
 	if err := handlers.EnsureBrandingFile(cfg.DataDir); err != nil {
 		services.Logf("warn", "failed to ensure branding file: %v", err)
 	}
@@ -235,11 +240,13 @@ func run() error {
 		defer close(metricsDone)
 		metricsService.Start()
 	}()
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT is_master FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
+	// 历史问题-3a：角色读取走单源 services.RoleOf（COALESCE(is_master,1) 与
+	// readonly/cluster_version/任务引擎同口径）——此前裸 SELECT 对 NULL 扫描
+	// 失败并按从节点处理，与其余守卫语义分叉。仅用于爬虫名单播种；读取失败
+	// 仍按从节点处理（fail-closed）。
+	isMaster, err := services.RoleOf(context.Background(), db.DB)
+	if err != nil {
 		services.Logf("error", "failed to read cluster role: %v", err)
-		// 仅用于爬虫名单播种；读取失败按从节点处理（fail-closed），
-		// 与任务引擎同一列的角色失败语义对齐。
 		isMaster = false
 	}
 	// 历史问题：自动封禁名单变化后的收敛。投影热路径优先（2026-10-15 用户裁定）：

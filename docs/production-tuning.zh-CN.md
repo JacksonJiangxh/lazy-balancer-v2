@@ -66,10 +66,14 @@ docker logs lazy-balancer 2>&1 | grep -c "receive buffer"  # 重启后应为 0
 
 ### 2.1 上游连接复用（收益最大的单项优化）
 
-到上游默认每请求新建 TCP 连接；开启 keepalive 后空闲连接复用，省去每请求的
-TCP 握手 + 慢启动。高 QPS 场景延迟与上游负载双降。
+到上游默认继承 Caddy/Go Transport 的空闲连接复用（空闲超时 2 分钟），并非每请求
+新建 TCP 连接；复用省去重复的 TCP 握手 + 慢启动。高 QPS 场景延迟与上游负载双降。
 
-- **全局默认**：设置 → Caddy 设置 → 上游 KeepAlive 空闲超时（`upstream_keepalive_timeout`）
+该字段是**空闲超时**而非「开启/关闭复用」的开关：0 = 不改写默认（继承 Caddy/Go
+Transport 的 2 分钟），>0 时渲染为 reverse_proxy transport 的
+`keep_alive.idle_timeout`，只调整复用窗口长短。
+
+- **全局默认**：设置 → Caddy 设置 → 上游 KeepAlive 空闲超时（`upstream_keepalive_timeout`，0 = 继承默认）
 - **规则级覆盖**：规则编辑 → 传输设置（规则值 >0 时覆盖全局）
 - **建议值**：60–120 秒（小于上游服务器自身的空闲超时，避免复用已被上游关闭的连接）
 - 上游为 HTTPS 时复用同时省 TLS 握手，收益更大
@@ -123,7 +127,7 @@ TCP 握手 + 慢启动。高 QPS 场景延迟与上游负载双降。
 off → detection（观察 3–7 天，事件日志零误报确认） → blocking
 ```
 
-detection 模式仅记录不拦截；切换 blocking 前用安全事件页确认误报率，
+detection 模式 CRS 仅记录不拦截（自定义规则仍按规则内动作执行）；切换 blocking 前用安全事件页确认误报率，
 误报处理优先用「CRS 排除规则」或自定义放行规则，而非调低阈值。
 
 ### 3.2 CRS 规则组裁剪

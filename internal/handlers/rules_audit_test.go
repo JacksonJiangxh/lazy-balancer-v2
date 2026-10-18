@@ -338,8 +338,9 @@ func TestEnableRule_restores_cert_job_fields_when_requeue_fails(t *testing.T) {
 
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_enable_restore/enable", nil))
 
-	if response.Code != http.StatusInternalServerError {
-		t.Fatalf("enable status=%d body=%s, want 500", response.Code, response.Body.String())
+	// 历史问题-05：队列未运行（paused/stopped）→ 409 点名可操作原因，不再折成 500。
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "证书签发任务已停止") {
+		t.Fatalf("enable status=%d body=%s, want 409 queue-inactive", response.Code, response.Body.String())
 	}
 	var enabled bool
 	var status, message, errorCode string

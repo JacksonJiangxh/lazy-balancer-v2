@@ -103,7 +103,17 @@ const metricsStateEvictCap = 64
 // logMetricsStateTransition 报告 key 类别的失败状态转换：
 // ok→fail 返回 "warn"；fail→ok 返回 "info"；状态不变返回 ""。
 // 初始状态视为 ok：首次失败记一次 warn，首次成功静默（无恢复可记）。
+//
+// D1-历史问题：状态机本体已是通用实现（logStateTransition），metrics 采集族与
+// 低频巡检循环（时区刷新/运行日志尺寸刷新）共用——持久失败的下行 SQL 在
+// 30s tick 下不再各打 2880 行/天同一消息。键空间按调用方前缀隔离。
 func logMetricsStateTransition(key string, failed bool) string {
+	return logStateTransition(key, failed)
+}
+
+// logStateTransition 是状态转换日志的通用状态机（同一 key 独立跟踪）：
+// ok→fail="warn"、fail→ok="info"、持续同态=""。
+func logStateTransition(key string, failed bool) string {
 	metricsStateMu.Lock()
 	defer metricsStateMu.Unlock()
 	prev, seen := metricsStateFailed[key]

@@ -1107,6 +1107,17 @@ func validateRuleACMEReferences(input acmeReferenceInput) error {
 // security_block_pages（悬空引用会使阶段路由回落 403 兜底且 UI 显示「已失效」）。
 // 规则保存（validateRulePayloadBeforeSave）与批量设置（batch-block-pages）共用。
 func validateStageBlockPageRef(pageID, status int, label string) error {
+	return validateStageBlockPageRefWith(pageID, status, label, func(id int) (bool, error) {
+		var pageOK bool
+		err := db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM security_block_pages WHERE id = ?)", id).Scan(&pageOK)
+		return pageOK, err
+	})
+}
+
+// validateStageBlockPageRefWith 同 validateStageBlockPageRef，页存在性由调用方
+// 提供（历史 B3-历史问题）：v2 导入的页集合必须按「备份携带 security_block_pages
+// 则备份行、缺席则 live」解析（与 历史问题 B-N3 口径一致），不能直连 db.DB。
+func validateStageBlockPageRefWith(pageID, status int, label string, pageExists func(id int) (bool, error)) error {
 	switch status {
 	case 0, 400, 401, 403, 404, 503:
 	default:
@@ -1122,8 +1133,8 @@ func validateStageBlockPageRef(pageID, status int, label string) error {
 		return &configValidationError{message: fmt.Sprintf("%s拦截页状态码 %d 需要先选择拦截页（未选择拦截页时状态码必须为 0）", label, status)}
 	}
 	if pageID > 0 {
-		var pageOK bool
-		if err := db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM security_block_pages WHERE id = ?)", pageID).Scan(&pageOK); err != nil {
+		pageOK, err := pageExists(pageID)
+		if err != nil {
 			return fmt.Errorf("校验%s拦截页引用失败: %v", label, err)
 		}
 		if !pageOK {

@@ -87,6 +87,14 @@ func safeRuleID(ruleID string) bool {
 	return true
 }
 
+// ValidCertRuleID 报告 ruleID 是否满足证书文件路径字母表（非空、≤64、仅
+// [a-z0-9_-]），与 safeRuleID 完全同源。导出供导入口等跨包调用方复用同一
+// 字母表（历史问题-07：v2 导入允许含 '.' 的 caddy_id，证书物化路径却拒绝——
+// 必须在导入校验阶段 fail-fast 点名，而不是在证书阶段整体回滚）。
+func ValidCertRuleID(ruleID string) bool {
+	return safeRuleID(ruleID)
+}
+
 func CertFilePaths(ruleID string) (certPath, keyPath string) {
 	if !safeRuleID(ruleID) {
 		return "", ""

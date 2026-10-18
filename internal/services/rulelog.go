@@ -2,6 +2,7 @@ package services
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -17,16 +18,32 @@ func RuleLogPath(ruleID string) string {
 	return filepath.Join(ruleLogDir, fmt.Sprintf("%s.log", sanitizeRuleLogName(ruleID)))
 }
 
-// sanitizeRuleLogName strips anything outside the caddy_id alphabet so an
-// imported rule ID cannot escape the rule log directory.
-func sanitizeRuleLogName(value string) string {
-	out := make([]rune, 0, len(value))
-	for _, r := range value {
+// RuleLogFileComponent 是规则访问日志文件名主体的单源（写侧 RuleLogPath 与
+// handlers 读侧共用）。语义见 sanitizeRuleLogName：合法字母表 ID 原样返回，
+// 其它字符按可逆编码转为文件名安全形态。
+func RuleLogFileComponent(ruleID string) string {
+	return sanitizeRuleLogName(ruleID)
+}
+
+// sanitizeRuleLogName 把 ruleID 转为规则日志文件名主体（L4/D1-历史问题）。
+// caddy_id 字母表 [A-Za-z0-9_-] 内的 ID 原样保留（既有文件命名零变化）；
+// 含其他字符的导入 ID（v2 导入允许 '.'）不再剔除字符——剔除不可逆且会让
+// `lb.dot` 与 `lbdot` 共用同一日志文件（删除/读取互相污染），改为
+// "%" + hex(utf8)：'%' 不在字母表内，与任何合法 ID 不可能碰撞，且编码
+// 可逆（不同 ID 恒得不同文件名）。
+func sanitizeRuleLogName(ruleID string) string {
+	safe := true
+	for _, r := range ruleID {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
-			out = append(out, r)
+			continue
 		}
+		safe = false
+		break
 	}
-	return string(out)
+	if safe {
+		return ruleID
+	}
+	return "%" + hex.EncodeToString([]byte(ruleID))
 }
 
 // ReadRuleLogFrom reads the access log from offset to EOF and returns the new

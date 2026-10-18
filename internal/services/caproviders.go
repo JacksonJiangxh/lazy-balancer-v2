@@ -135,6 +135,68 @@ var ErrCAProviderMaxConcurrentTooHigh = errors.New("max_concurrent must be <= 10
 // ErrCAProviderMinIntervalTooHigh is returned when min_interval_ms exceeds the allowed upper bound.
 var ErrCAProviderMinIntervalTooHigh = errors.New("min_interval_ms must be <= 60000")
 
+// ErrCAProviderInUse 标记「禁用被启用中 ACME 规则引用的 CA 提供商」（历史问题-04）。
+// 与 DNS 配置禁用守卫（handlers/certificates.go）同口径：引用方存在即拒绝，
+// 避免禁用后新签发/续签静默改用其它 CA（改写 cert_jobs.ca_provider_id、消耗
+// 另一 CA 配额）而队列内旧任务却按「CA Provider 不可用」失败的行为分裂。
+var ErrCAProviderInUse = errors.New("CA 提供商正被启用中的 ACME 规则引用")
+
+// CAProviderInUseError 携带引用明细，供 handler 回显 409 文案（列表最多 5 条，
+// Total 为完整引用数）。
+type CAProviderInUseError struct {
+	Rules []string
+	Total int
+}
+
+func (e *CAProviderInUseError) Error() string {
+	if e == nil {
+		return ErrCAProviderInUse.Error()
+	}
+	message := fmt.Sprintf("该 CA 提供商正被 %d 条启用中的 ACME 规则引用，禁用后这些规则将无法自动签发/续签证书，请先修改规则的 CA 提供商后再禁用", e.Total)
+	if len(e.Rules) > 0 {
+		message += "：" + strings.Join(e.Rules, "、")
+		if e.Total > len(e.Rules) {
+			message += fmt.Sprintf(" 等 %d 条规则", e.Total)
+		}
+	}
+	return message
+}
+
+func (e *CAProviderInUseError) Unwrap() error { return ErrCAProviderInUse }
+
+// caProviderReferences 统计引用指定 CA 提供商的启用中 ACME 规则（最多返回
+// 5 条明细用于 409 文案）。
+func caProviderReferences(tx *sql.Tx, providerID int) ([]string, int, error) {
+	rows, err := tx.Query(`SELECT caddy_id, COALESCE(domain,'') FROM lb_rules
+		WHERE ca_provider_id=? AND enabled=1 AND enable_tls=1 AND tls_source='acme_dns'
+		ORDER BY caddy_id`, providerID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("查询 CA 提供商规则引用: %w", err)
+	}
+	defer rows.Close()
+	var references []string
+	total := 0
+	for rows.Next() {
+		var caddyID, domain string
+		if err := rows.Scan(&caddyID, &domain); err != nil {
+			return nil, 0, fmt.Errorf("读取 CA 提供商规则引用: %w", err)
+		}
+		total++
+		if len(references) >= 5 {
+			continue
+		}
+		if domain != "" {
+			references = append(references, fmt.Sprintf("%s (%s)", domain, caddyID))
+		} else {
+			references = append(references, caddyID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("遍历 CA 提供商规则引用: %w", err)
+	}
+	return references, total, nil
+}
+
 // UpdateCAProvider updates a CA provider and returns the pre-update row as read
 // inside the same transaction (CERT-N1, 历史：调用方（handler 审计 changed
 // 清单）以事务内旧行为比对基线，消除「事务外预读 → 事务提交」窗口内并发
@@ -232,6 +294,17 @@ func (s *CAProviderService) UpdateCAProvider(id int, req models.UpdateCAProvider
 	// 后提交者恒 0 行 → ErrCAProviderLastEnabled，不再依赖 _txlock=immediate 的
 	// 事务序列化兜底。
 	disabling := req.Enabled != nil && !*req.Enabled && wasEnabled
+	// 历史问题-04：禁用引用守卫与 DNS 配置禁用同口径（失败即 409，点名引用方）。
+	// 放在事务内、UPDATE 之前：与写锁同事务，判定与写入原子。
+	if disabling {
+		references, total, refErr := caProviderReferences(tx, id)
+		if refErr != nil {
+			return models.CAProvider{}, refErr
+		}
+		if total > 0 {
+			return models.CAProvider{}, &CAProviderInUseError{Rules: references, Total: total}
+		}
+	}
 	query := `
 		UPDATE ca_providers SET name=?, provider=?, directory_url=?, credentials=?, max_concurrent=?, min_interval_ms=?, enabled=?, updated_at=datetime('now')
 		WHERE id=?

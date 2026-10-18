@@ -335,3 +335,57 @@ func TestNextQuarantinePath_returnsCandidateOnPersistentStatError(t *testing.T) 
 		t.Fatalf("persistent stat error not logged, log=%q", logBuf.String())
 	}
 }
+
+// 历史问题-3：伴生文件（-wal/-shm）改名失败必须上抛——静默留下旧 WAL 会让
+// 重建的新库下次打开时重放脏页，再现损坏。主文件已隔离后由调用方中止重建。
+func TestQuarantineCorruptSQLiteFile_companionRenameErrorPropagates(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "metrics.db")
+	if err := os.WriteFile(path, []byte("not-a-sqlite-header"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+"-wal", []byte("stale-wal"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	saved := quarantineRename
+	quarantineRename = func(src, dst string) error {
+		if strings.HasSuffix(src, "-wal") {
+			return errors.New("device busy")
+		}
+		return os.Rename(src, dst)
+	}
+	t.Cleanup(func() { quarantineRename = saved })
+
+	quarantined, err := quarantineCorruptSQLiteFile(path)
+	if err == nil {
+		t.Fatalf("伴生文件改名失败必须上抛，quarantined=%q", quarantined)
+	}
+	if !strings.Contains(err.Error(), "-wal") {
+		t.Fatalf("err=%v, want 点名 -wal", err)
+	}
+	if _, statErr := os.Stat(path + "-wal"); statErr != nil {
+		t.Fatalf("失败路径不应移动 -wal: %v", statErr)
+	}
+}
+
+// 历史问题-3 正常路径：-wal/-shm 一并隔离，原位不再残留。
+func TestQuarantineCompanions_renamesWalAndShm(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "metrics.db")
+	for _, name := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.WriteFile(name, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := quarantineCompanions(path); err != nil {
+		t.Fatalf("quarantine companions: %v", err)
+	}
+	for _, companion := range []string{path + "-wal", path + "-shm"} {
+		if _, err := os.Stat(companion); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s 原位仍存在 err=%v", companion, err)
+		}
+		if matches, _ := filepath.Glob(companion + ".corrupt.*"); len(matches) != 1 {
+			t.Fatalf("%s 隔离件=%v, want 1", companion, matches)
+		}
+	}
+}

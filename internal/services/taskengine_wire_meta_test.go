@@ -130,13 +130,15 @@ func TestTaskEngineWire_DaemonsFullyControllable(t *testing.T) {
 	// cluster-sync RoleAny：主节点角色下真实运行（主分支=服务面巡检）
 	te.SetRole(true)
 	te.StartLoop("cluster-sync")
-	time.Sleep(150 * time.Millisecond)
+	// D2-历史问题：固定 150ms sleep 在 CI 负载下会产生假红——与同域既有模式
+	// （waitForCond）对齐。
+	waitForCond(t, 2*time.Second, func() bool { return te.IsRunning("cluster-sync") })
 	if !te.IsRunning("cluster-sync") {
 		t.Fatal("主节点 cluster-sync 应真实运行（2026-10-03 裁定：统一生命周期，镜像废除）")
 	}
 	// 从节点角色下同样真实运行（从分支=同步轮询；Run 体按角色分流）
 	te.SetRole(false)
-	time.Sleep(150 * time.Millisecond)
+	waitForCond(t, 2*time.Second, func() bool { return te.IsRunning("cluster-sync") })
 	if !te.IsRunning("cluster-sync") {
 		t.Fatal("从节点 cluster-sync 应真实运行（同步轮询）")
 	}
@@ -231,6 +233,10 @@ func TestTaskEngineWire_PeriodicIntervalAndScheduledSlotPresent(t *testing.T) {
 // Then 全部返回「仅允许在主节点执行」，任务体不执行。
 func TestTaskEngineWire_MasterOnlyFamiliesTriggerRejectedOnSlave(t *testing.T) {
 	te := newWireTestEngine(t)
+	// 从节点态须与 DB 单源一致（历史问题-1 角色对账会按 DB 修正引擎角色）。
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
 	te.SetRole(false) // 从节点
 	for _, id := range []string{"cert-renewal-scan", "cert-reconcile", "auto-backup"} {
 		err := te.Trigger(id, "manual", "tester")

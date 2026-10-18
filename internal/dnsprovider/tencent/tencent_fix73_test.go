@@ -1,6 +1,7 @@
 package tencent
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -59,6 +60,15 @@ func TestProvider_Present_ownershipAddAndRollbackFailureRefillsFallback(t *testi
 		t.Fatalf("create persistent provider: %v", err)
 	}
 	provider.client.WithHttpTransport(transport)
+	// 历史问题-3：告警必须经包级 logf 接缝（统一日志级别/格式链），不得裸 log.Printf。
+	var captured strings.Builder
+	oldLogf := logf
+	logf = func(level, format string, args ...any) {
+		if level == "warn" {
+			captured.WriteString(fmt.Sprintf(format, args...))
+		}
+	}
+	t.Cleanup(func() { logf = oldLogf })
 	if err := os.Chmod(dataDir, 0o555); err != nil {
 		t.Fatalf("make ownership dir read-only: %v", err)
 	}
@@ -70,6 +80,9 @@ func TestProvider_Present_ownershipAddAndRollbackFailureRefillsFallback(t *testi
 	// Then：双失败上报 + 记录回填内存兜底表
 	if err == nil {
 		t.Fatal("ownership.Add 失败 + 回滚删除失败必须上报，不得静默")
+	}
+	if !strings.Contains(captured.String(), "tencent: 所有权写入失败") {
+		t.Fatalf("残留告警必须经 logf 接缝进入统一日志链，captured=%q", captured.String())
 	}
 	provider.mu.Lock()
 	entries := append([]ownedRecord(nil), provider.owned["example.com|_acme-challenge"]...)

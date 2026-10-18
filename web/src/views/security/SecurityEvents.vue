@@ -64,7 +64,7 @@
       </div>
       <!-- 未生效黄条（历史问题-02）：判据=ban_effective（名单非空且被启用+deny 的策略引用），
            不再用 list_referenced（四面引用集会把「仅被白名单/受信代理引用」误当生效） -->
-      <div v-if="autobanStatus.enabled && autobanStatus.ban_effective === false" class="info-note-bar autoban-warn-bar">
+      <div v-if="autobanIneffective" class="info-note-bar autoban-warn-bar">
         <span class="info-note-desc">「自动封禁名单」尚未生效——名单为空，或尚未被启用中的 IP 访问控制（deny）策略引用；请到「安全规则 → IP 地址列表」将该名单引用到 IP 访问控制（deny）策略</span>
       </div>
       <!-- 观察模式建议列表：dry-run 下达阈值 IP（不封禁，供评估阈值/口径） -->
@@ -186,7 +186,7 @@
             <!-- 触发阶段展示：信任名单 / IP 访问控制（黑白名单+地域+威胁库，点击看触发详情）/
                  WAF（CRS=详情+快捷排除弹框；自定义=规则详情弹框）/ 请求体异常（纯文本） -->
             <el-link v-if="stageCategory(row) === 'waf'" type="primary" @click="openTriggerDetail(row)">WAF</el-link>
-            <el-link v-else-if="['acl', 'trust'].includes(stageCategory(row))" type="primary" @click="openTriggerDetail(row)">{{ stageLabel(row) }}</el-link>
+            <el-link v-else-if="['acl', 'crawler', 'trust'].includes(stageCategory(row))" type="primary" @click="openTriggerDetail(row)">{{ stageLabel(row) }}</el-link>
             <el-tooltip v-else-if="showTriggeredMsg(row)" :content="row.rule_msg" placement="top" :show-after="200">
               <span class="cell-tip">{{ stageLabel(row) }}</span>
             </el-tooltip>
@@ -375,6 +375,7 @@ import { useAuthStore } from '@/stores/auth'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import TriggerDetailDialog from '@/components/events/TriggerDetailDialog.vue'
 import { formatDurationUs, triggerStageFamily } from '@/utils/securityStages'
+import { isAutobanIneffective } from '@/utils/autobanStatus'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
 import { formatDate } from '@/utils/date'
 import type { APIResponse } from '@/types'
@@ -417,6 +418,8 @@ const autobanStatusLoading = ref(false)
 const autobanToggling = ref(false)
 // 状态读取失败（历史问题/F17）：错误态不得按「确定状态」展示——写入口一律禁用
 const autobanStatusError = ref(false)
+// 黄条判据单源（utils/autobanStatus，行为钉测）：仅 enabled ∧ ban_effective===false
+const autobanIneffective = computed(() => isAutobanIneffective(autobanStatus.value))
 const authStore = useAuthStore()
 // 四写入口统一门控（启用/禁用/编辑/保存）：全局只读契约 ∧ 主节点 ∧ 状态已加载
 const autobanWritable = computed(() => authStore.readOnlyReason === null && autobanStatus.value.is_master && !autobanStatusError.value && !autobanStatusLoading.value)
@@ -598,11 +601,15 @@ const ctxWafFamily = computed(() => {
 // 实现，原 历史问题 双实现并存欠账）——本视图五桶 = 细粒度族的合并投影：
 // ipAcl/geoip/threat 同归「IP 访问控制」（阶段 1 合并口径），wafCrs/wafCustom
 // 同归「WAF」；trust/body/other 同名直通。
-const stageCategory = (row: SecurityEvent): 'trust' | 'acl' | 'waf' | 'body' | 'other' => {
+// 历史问题-F1：crawler 独立成类（后端 v2.3.8 将已验证爬虫/伪装从地域段拆出）——
+// 阶段列显示「爬虫校验」而非笼统归入 IP 访问控制；仍是阶段 1 预检事件，
+// 点击进入同一触发详情弹框。
+const stageCategory = (row: SecurityEvent): 'trust' | 'acl' | 'crawler' | 'waf' | 'body' | 'other' => {
   const t = row.rule_triggered
   if (!t) return 'other'
   switch (triggerStageFamily(t)) {
     case 'trust': return 'trust'
+    case 'crawler': return 'crawler'
     case 'ipAcl': case 'geoip': case 'threat': return 'acl'
     case 'wafCrs': case 'wafCustom': return 'waf'
     case 'body': return 'body'
@@ -612,6 +619,7 @@ const stageCategory = (row: SecurityEvent): 'trust' | 'acl' | 'waf' | 'body' | '
 const stageLabel = (row: SecurityEvent): string => {
   switch (stageCategory(row)) {
     case 'trust': return '信任名单'
+    case 'crawler': return '爬虫校验'
     case 'acl': return 'IP 访问控制'
     case 'waf': return 'WAF'
     case 'body': return '请求体异常'

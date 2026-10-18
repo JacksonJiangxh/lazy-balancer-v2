@@ -97,7 +97,18 @@ func (m *httpRedirectMux) dispatch() {
 		case m.slots <- struct{}{}:
 			go m.sniff(connection)
 		default:
-			_ = connection.Close()
+			// 历史问题-1：嗅探槽耗尽不得拒绝所有新连接——原实现直接 Close，
+			// 攻击者维持 128 条不发首字节的连接（128/5s≈26 conn/s）即可让
+			// 管理面板的全部新连接（含 TLS）在 sniff 前被静默断开。
+			// 交 TLS 接受路径兜底：管理面板保持可用；纯 HTTP 客户端在握手
+			// 阶段失败（丢 302 重定向，可接受降级）。http.Server 的
+			// ReadHeaderTimeout 约束这类连接存活期；slots 仍为嗅探 worker
+			// 上限（慢客户端不会无限堆积 goroutine）。
+			select {
+			case m.tlsConnections <- connection:
+			case <-m.done:
+				_ = connection.Close()
+			}
 		}
 	}
 }

@@ -136,6 +136,8 @@ func (h *Handlers) ForgetClusterNodePin(c *gin.Context) {
 	if err != nil {
 		status := http.StatusInternalServerError
 		switch {
+		case errors.Is(err, services.ErrNotMasterNode):
+			status = http.StatusForbidden
 		case errors.Is(err, services.ErrNodeNotFound):
 			status = http.StatusNotFound
 		case errors.Is(err, services.ErrNoClusterPin):

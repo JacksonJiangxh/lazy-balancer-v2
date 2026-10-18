@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -96,4 +97,61 @@ func TestCertTasksStatus_businessActivityDoesNotOverrideStoppedExecution(t *test
 			t.Errorf("%s 调度已停但 status=%q，want idle（业务活跃≠任务执行中）", ti.ID, ti.Status)
 		}
 	}
+}
+
+// 历史问题-03：常驻任务自愈预算用尽后 loop_on=false（与用户主动停止同形），
+// 修复前状态列回落 idle——采集/签发永久停摆与「用户主动停止」不可区分。
+// 引擎以 RestartExhausted 标记暴露真实停摆来源，监控必须呈现 failed。
+func TestCollectEngineFamilies_daemonRestartExhaustedShowsFailed(t *testing.T) {
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize test database: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	e := taskengine.NewEngine(taskengine.Options{
+		TickInterval:        10 * time.Millisecond,
+		DaemonRestartDelays: []time.Duration{time.Millisecond},
+	})
+	t.Cleanup(e.Stop)
+	if err := e.Register(taskengine.Descriptor{
+		ID: "audit83-exhaust", Family: "test", Name: "自愈用尽探针",
+		Kind: taskengine.KindDaemon, RunsOn: taskengine.RoleAny,
+		Run: func(taskengine.RunContext) error { return errors.New("boom") },
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	e.StartLoop("audit83-exhaust")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		meta, ok := e.Lookup("audit83-exhaust")
+		if ok && meta.RestartExhausted {
+			if meta.LoopOn {
+				t.Fatal("自愈用尽后 loop_on 必须为 false（与日志「已停止调度」一致）")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("daemon 未在期限内进入自愈用尽态")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	rows := collectEngineFamilies(e)
+	for _, row := range rows {
+		if row.ID != "audit83-exhaust" {
+			continue
+		}
+		if row.Status != TaskStatusFailed {
+			t.Fatalf("自愈用尽 status=%q, want failed（修复前恒 idle，永久停摆无信号）", row.Status)
+		}
+		if row.LoopOn {
+			t.Fatal("状态列判据不得改写调度开关（loop_on 仍由引擎唯一事实源）")
+		}
+		return
+	}
+	t.Fatal("任务视图缺少 audit83-exhaust 行")
 }

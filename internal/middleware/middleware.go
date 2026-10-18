@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lazy-balancer-v2/internal/config"
@@ -68,8 +69,9 @@ func (limiter *authenticationAuditLimiter) allow(key string, now time.Time) bool
 	}
 	// SYSMW-U1（历史 历史问题）：硬上限——上方清扫只清 >=2min 陈旧键，洪水期
 	// 唯一键高速涌入时全部键新鲜、清扫零效果，map 曾无界增长。清扫后仍达
-	// 4096 则丢弃新键：不进 map 也不记审计（审计丢失可接受，内存必须有界），
-	// 与 loginRateBuckets「超限本轮放行不添桶」（历史问题-历史问题/U6c-历史问题）同族。
+	// 4096 则丢弃新键：不进 map 也不记审计（审计丢失可接受，内存必须有界）。
+	// 注意与 loginRateBuckets 不同：限流桶必须保持强制力，容量满改 LRU
+	// 淘汰而非丢键放行（历史问题-1）；审计限流丢弃只损失一条告警、不放行。
 	// 既有键超窗刷新不占新键额，不受影响。
 	if _, exists := limiter.events[key]; !exists && len(limiter.events) >= 4096 {
 		return false
@@ -154,6 +156,31 @@ type loginRateBucket struct {
 	count      int
 	until      time.Time
 	generation uint64
+	// lastUsed 是最近一次命中的 UnixNano，供容量满时 LRU 淘汰（E/历史问题-1）。
+	// 原子读写：淘汰在 map 锁内扫描，命中路径不额外获取 bucket.mu。
+	lastUsed atomic.Int64
+}
+
+// rateLimitBucketCapacity 是共享桶表硬上限（内存必须有界）。
+const rateLimitBucketCapacity = 1024
+
+// evictLeastRecentlyUsedRateLimitBucketLocked 淘汰最久未命中的桶为新键腾位。
+// 历史问题-1：修复前容量满时新键 fail-open 放行（不建桶=本分钟对分布式来源
+// 零限流）——攻击者可推满桶表形成暴力尝试窗口。改为有界 LRU：新来源仍拿到
+// 自己的计数桶（照常 10/min 限流），内存上限不变。
+// 调用方须持有 loginRateBuckets.Lock。
+func evictLeastRecentlyUsedRateLimitBucketLocked() {
+	var victim string
+	oldest := int64(1<<63 - 1)
+	for key, bucket := range loginRateBuckets.entries {
+		if used := bucket.lastUsed.Load(); used < oldest {
+			oldest = used
+			victim = key
+		}
+	}
+	if victim != "" {
+		delete(loginRateBuckets.entries, victim)
+	}
 }
 
 var loginRateBuckets = struct {
@@ -170,20 +197,23 @@ func loginRateLimit() gin.HandlerFunc {
 	return clusterRateLimit("login", 10, "登录尝试过于频繁，请稍后再试")
 }
 
-// acquireRateLimitBucket 在首次记账时创建，容量满返回 false 由调用方 fail-open。
-func acquireRateLimitBucket(ip, scope string, now time.Time) (*loginRateBucket, bool) {
+// acquireRateLimitBucket 在首次记账时创建；容量满按 LRU 淘汰最久未命中的
+// 桶腾位（历史问题-1：不再 fail-open——新来源照常限流且内存有界）。
+func acquireRateLimitBucket(ip, scope string, now time.Time) *loginRateBucket {
 	loginRateBuckets.Lock()
 	defer loginRateBuckets.Unlock()
 	key := ip + "|" + scope
 	if bucket, ok := loginRateBuckets.entries[key]; ok {
-		return bucket, true
+		bucket.lastUsed.Store(now.UnixNano())
+		return bucket
 	}
-	if len(loginRateBuckets.entries) >= 1024 {
-		return nil, false
+	if len(loginRateBuckets.entries) >= rateLimitBucketCapacity {
+		evictLeastRecentlyUsedRateLimitBucketLocked()
 	}
 	bucket := &loginRateBucket{until: now.Add(time.Minute)}
+	bucket.lastUsed.Store(now.UnixNano())
 	loginRateBuckets.entries[key] = bucket
-	return bucket, true
+	return bucket
 }
 
 // clusterRegisterRateLimit 注册端点限流(历史问题,历史):唯一公开、
@@ -201,11 +231,7 @@ func clusterRateLimit(scope string, limit int, message string) gin.HandlerFunc {
 		now := time.Now()
 		ip := c.ClientIP()
 
-		bucket, ok := acquireRateLimitBucket(ip, scope, now)
-		if !ok {
-			c.Next() // 超限本轮放行（不添桶）——1min 清理周期内自愈
-			return
-		}
+		bucket := acquireRateLimitBucket(ip, scope, now)
 		bucket.mu.Lock()
 		if now.After(bucket.until) {
 			bucket.count = 0
@@ -252,15 +278,15 @@ func clusterMachineRateLimit(scope string, source clusterCredentialSource) gin.H
 		var credentialBucket *loginRateBucket
 		var credentialGeneration uint64
 		if fingerprint != "" {
-			var allowed, capacityFull bool
-			credentialBucket, credentialGeneration, allowed, capacityFull = reserveRateLimitBucket(ip, scope+"|credential:"+fingerprint, now, credentialLimit)
-			if !allowed && !capacityFull {
+			var allowed bool
+			credentialBucket, credentialGeneration, allowed = reserveRateLimitBucket(ip, scope+"|credential:"+fingerprint, now, credentialLimit)
+			if !allowed {
 				abortClusterMachineRateLimit(c)
 				return
 			}
 		}
-		ipBucket, ipGeneration, ipAllowed, ipCapacityFull := reserveRateLimitBucket(ip, scope+"|ip", now, ipLimit)
-		if !ipAllowed && !ipCapacityFull {
+		ipBucket, ipGeneration, ipAllowed := reserveRateLimitBucket(ip, scope+"|ip", now, ipLimit)
+		if !ipAllowed {
 			releaseRateLimitReservation(credentialBucket, credentialGeneration, false)
 			abortClusterMachineRateLimit(c)
 			return
@@ -290,18 +316,19 @@ func clusterCredentialFingerprint(c *gin.Context, source clusterCredentialSource
 	return hex.EncodeToString(hash[:])
 }
 
-func reserveRateLimitBucket(ip, scope string, now time.Time, limit int) (*loginRateBucket, uint64, bool, bool) {
+func reserveRateLimitBucket(ip, scope string, now time.Time, limit int) (*loginRateBucket, uint64, bool) {
 	key := ip + "|" + scope
 	loginRateBuckets.Lock()
 	bucket, exists := loginRateBuckets.entries[key]
 	if !exists {
-		if len(loginRateBuckets.entries) >= 1024 {
-			loginRateBuckets.Unlock()
-			return nil, 0, false, true
+		// 历史问题-1：容量满不再 fail-open 跳过限流——LRU 淘汰腾位后照常预占。
+		if len(loginRateBuckets.entries) >= rateLimitBucketCapacity {
+			evictLeastRecentlyUsedRateLimitBucketLocked()
 		}
 		bucket = &loginRateBucket{until: now.Add(time.Minute)}
 		loginRateBuckets.entries[key] = bucket
 	}
+	bucket.lastUsed.Store(now.UnixNano())
 	bucket.mu.Lock()
 	loginRateBuckets.Unlock()
 	defer bucket.mu.Unlock()
@@ -311,10 +338,10 @@ func reserveRateLimitBucket(ip, scope string, now time.Time, limit int) (*loginR
 		bucket.generation++
 	}
 	if bucket.count >= limit {
-		return bucket, bucket.generation, false, false
+		return bucket, bucket.generation, false
 	}
 	bucket.count++
-	return bucket, bucket.generation, true, false
+	return bucket, bucket.generation, true
 }
 
 func releaseRateLimitReservation(bucket *loginRateBucket, generation uint64, failed bool) {
@@ -510,6 +537,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				admin.PUT("/admin-tls", h.UpdateAdminTLS)
 				admin.POST("/system/restart", h.RestartService)
 				admin.PUT("/caddy/config", h.PutCaddyConfig)
+				admin.GET("/caddy/config", h.GetCaddyConfig)
 				admin.POST("/caddy/start", h.StartCaddy)
 				admin.POST("/caddy/stop", h.StopCaddy)
 				admin.POST("/caddy/restart", h.RestartCaddy)
@@ -745,7 +773,6 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 
 				// Caddy
 				business.GET("/caddy/status", h.GetCaddyStatus)
-				business.GET("/caddy/config", h.GetCaddyConfig)
 				business.GET("/caddy/logs", h.GetCaddyLogs)
 				business.GET("/caddy/host-metrics", h.GetHostMetrics)
 

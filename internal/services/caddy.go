@@ -415,12 +415,18 @@ func (s *CaddyService) persistLastGoodLocked(data []byte) {
 		return
 	}
 	tmp := s.lastGoodPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// D1-历史问题：0 字节 last-good 会让启动兜底失效——与 certstore 原子写同口径
+	// （临时文件 fsync + 父目录 fsync 后 rename）。
+	if err := writeSyncedFile(tmp, data, 0o600); err != nil {
 		Logf("error", "last-known-good: write temp file failed: %v", err)
 		return
 	}
 	if err := os.Rename(tmp, s.lastGoodPath); err != nil {
 		Logf("error", "last-known-good: rename into place failed: %v", err)
+		return
+	}
+	if err := syncParentDir(s.lastGoodPath); err != nil {
+		Logf("error", "last-known-good: sync parent dir failed: %v", err)
 	}
 }
 
@@ -770,13 +776,25 @@ func cloneUpstreamHealthDetails(src map[string]map[string]*UpstreamHealthDetail)
 	return clone
 }
 
+// upstreamHealthAggregateTimeout 限制健康聚合一轮三轮 admin 读取的整体
+// deadline（D1-历史问题）：单请求 client 超时 30s × 3 串行最坏 ~90s，且单飞
+// 让所有并发轮询者等待同一个 call.done。整体截止后按既有降级语义返回：
+// metrics 缺失=空表，config 读取失败=错误（不静默空表）。
+var upstreamHealthAggregateTimeout = 10 * time.Second
+
 func (s *CaddyService) getUpstreamHealthDetailedUncached() (map[string]map[string]*UpstreamHealthDetail, error) {
 	healthStatus := make(map[string]map[string]*UpstreamHealthDetail)
 
-	upstreamHealth := s.getUpstreamHealthFromMetrics()
-	upstreamMetrics := s.getUpstreamMetrics()
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamHealthAggregateTimeout)
+	defer cancel()
+	upstreamHealth := s.getUpstreamHealthFromMetrics(ctx)
+	upstreamMetrics := s.getUpstreamMetrics(ctx)
 
-	resp, err := s.client.Get(s.adminURL + "/config/")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.adminURL+"/config/", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -991,10 +1009,15 @@ type upstreamMetric struct {
 }
 
 // getUpstreamMetrics fetches num_requests and fails from /reverse_proxy/upstreams
-func (s *CaddyService) getUpstreamMetrics() map[string]*upstreamMetric {
+func (s *CaddyService) getUpstreamMetrics(ctx context.Context) map[string]*upstreamMetric {
 	result := make(map[string]*upstreamMetric)
 
-	resp, err := s.client.Get(s.adminURL + "/reverse_proxy/upstreams")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.adminURL+"/reverse_proxy/upstreams", nil)
+	if err != nil {
+		Logf("error", "Failed to build reverse_proxy/upstreams request: %v", err)
+		return result
+	}
+	resp, err := s.client.Do(req)
 	if err != nil {
 		Logf("error", "Failed to get reverse_proxy/upstreams: %v", err)
 		return result
@@ -1055,10 +1078,14 @@ var (
 	caddyLayer4ProxyHealthyMetricPrefix  = []byte("caddy_layer4_proxy_upstream_healthy{")
 )
 
-func (s *CaddyService) getUpstreamHealthFromMetrics() map[string]bool {
+func (s *CaddyService) getUpstreamHealthFromMetrics(ctx context.Context) map[string]bool {
 	result := make(map[string]bool)
 
-	resp, err := s.client.Get(s.metricsURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.metricsURL, nil)
+	if err != nil {
+		return result
+	}
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return result
 	}

@@ -145,6 +145,27 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 			services.RecordAuditLog("system", "导入警告", "配置备份", "导入前排空在途任务超时，已继续导入（可能在导入后仍有任务提交）", "")
 		}
 	}
+	// 历史问题-02（历史）：CA 队列 PauseAndDrain 必须先于 caddyOpMu——在途
+	// 证书部署会经 caddyReloader 取 caddyOpMu（services/caddy.go 203-208）；
+	// 旧顺序「先持锁再排空」形成自锁：部署 worker 等锁、导入等排空，30s 后
+	// 必然 409。与上方任务引擎「先排空再取锁」铁律同序。排空在 WAF 预锁之前，
+	// 避免持 WAF 锁阻塞更新任务。
+	recovery := importQueueRecovery{manager: services.GetCAQueueManager()}
+	if recovery.manager != nil {
+		recovery.wasActive = recovery.manager.IsActive()
+		// 历史问题：排空结果必须被消费——未完全排空（30s 超时仍有执行中任务）
+		// 不得继续导入。
+		if !recovery.manager.PauseAndDrain() {
+			// 历史问题-02：先恢复队列再释放会话锁——否则第二个导入可在锁窗口内
+			// 看到「队列 inactive」并在第一个导入 Resume 后与之并发。
+			if recovery.wasActive {
+				recovery.manager.Resume()
+			}
+			releaseSession()
+			resumeEngine()
+			return nil, errCertQueueDrainIncomplete
+		}
+	}
 	releaseBeforeLock := releaseSession
 	if prelock != nil {
 		if release := prelock(); release != nil {
@@ -160,27 +181,16 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 		resumeEngine()
 	}
 	h.caddyOpMu.Lock()
-	session := &configImportSession{h: h, ctx: ctx, recovery: importQueueRecovery{manager: services.GetCAQueueManager()}, resumeEngine: resumeEngine, releaseBeforeLock: releaseBeforeLock}
+	session := &configImportSession{h: h, ctx: ctx, recovery: recovery, resumeEngine: resumeEngine, releaseBeforeLock: releaseBeforeLock}
 	ruleIDs, err := currentRuleIDs(ctx)
 	if err != nil {
+		// CA 已暂停：必须在释放会话锁之前恢复既有活动态——否则第二个导入可
+		// 在窗口内把「队列 inactive」当作稳定状态，随后与本导入的 Resume 并发。
+		err = finishImportFailure(nil, &session.recovery, fmt.Errorf("读取现有规则: %w", err))
 		releaseBegin()
-		return nil, fmt.Errorf("读取现有规则: %w", err)
+		return nil, err
 	}
 	session.existingRuleIDs = ruleIDs
-	if session.recovery.manager != nil {
-		session.recovery.wasActive = session.recovery.manager.IsActive()
-		// 历史问题：排空结果必须被消费——未完全排空（30s 超时仍有执行中任务）
-		// 不得继续导入。
-		if !session.recovery.manager.PauseAndDrain() {
-			releaseBegin()
-			// 本次 Pause 已停掉新任务登记；恢复既有活动态交给 finishImportFailure
-			// 语义——此处无事务可回滚，直接恢复队列避免永久暂停。
-			if session.recovery.wasActive {
-				session.recovery.manager.Resume()
-			}
-			return nil, errCertQueueDrainIncomplete
-		}
-	}
 	session.tx, err = db.DB.BeginTx(ctx, nil)
 	if err != nil {
 		err = finishImportFailure(nil, &session.recovery, err)

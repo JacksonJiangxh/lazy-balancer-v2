@@ -3646,3 +3646,35 @@ func TestSecurityEventsAttributePolicy_emptyAllowOwnsFailClosedSurface(t *testin
 		t.Fatal("non-empty allow mode must keep the documented id:2 fallback semantics")
 	}
 }
+
+// 历史问题-06（历史）：头截断改为「预计算体积一次扣除」后，大量短头
+// （旧实现 O(n²) 逐键重编码）仍必须：不超上限、保持合法 JSON、丢弃计数与
+// 实际缺失条数一致。
+func TestSecurityEventsSerializeHeaders_manyHeadersDroppedConsistently(t *testing.T) {
+	headers := map[string][]string{"Host": {"a.example.com"}}
+	for i := 0; i < 2000; i++ {
+		headers[fmt.Sprintf("X-T-%04d", i)] = []string{strings.Repeat("v", 100)}
+	}
+	got := securityEventsSerializeHeaders(headers)
+	if len(got) > securityEventsHeadersCap {
+		t.Fatalf("len=%d exceeds cap %d", len(got), securityEventsHeadersCap)
+	}
+	var roundTrip map[string][]string
+	if err := json.Unmarshal([]byte(got), &roundTrip); err != nil {
+		t.Fatalf("truncated headers must stay valid JSON: %v", err)
+	}
+	marker := roundTrip["_lb_dropped_headers"]
+	if len(marker) != 1 {
+		t.Fatalf("marker=%v, want one dropped count", marker)
+	}
+	var dropped int
+	if _, err := fmt.Sscanf(marker[0], "%d", &dropped); err != nil {
+		t.Fatalf("marker=%q: %v", marker[0], err)
+	}
+	if kept := len(roundTrip) - 1; kept+dropped != len(headers) {
+		t.Fatalf("kept=%d + dropped=%d != total=%d", kept, dropped, len(headers))
+	}
+	if _, ok := roundTrip["Host"]; !ok {
+		t.Fatal("small Host header should be kept")
+	}
+}

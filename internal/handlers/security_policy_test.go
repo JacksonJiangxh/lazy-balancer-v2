@@ -29,6 +29,9 @@ func setupSecurityPolicyTestDB(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		// 历史问题（历史，B1-07 家族漏收敛点）：直换包级句柄必须同步复位
+		// currentDB——否则 GetDB()/后台循环继续持有已关闭的测试库句柄。
+		db.SetDB(oldDB)
 	})
 }
 

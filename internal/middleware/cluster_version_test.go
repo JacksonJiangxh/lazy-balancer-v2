@@ -1162,32 +1162,45 @@ func TestClusterVersionTriggers_bumpForTrustedProxyColumns(t *testing.T) {
 // Given loginRateBuckets 已满 1024 桶（容量上限）。
 // When clusterRateLimit 命中新 IP（U6c-历史问题：曾建桶无检查——分布式攻击可推满
 // 共享 map 使登录限流对新源 fail-open）。
-// Then 新桶不建、请求放行不 panic（与 loginRateLimit 同族语义）。
+// Then LRU 淘汰最久未命中桶为新 IP 建桶：请求照常记账（历史问题-1 起不再放行
+// 不计数），map 规模保持上限。
 func TestClusterRateLimitRespectsBucketCap(t *testing.T) {
+	now := time.Now()
 	loginRateBuckets.Lock()
-	for i := 0; i < 1024; i++ {
-		loginRateBuckets.entries[fmt.Sprintf("cap-%d", i)] = &loginRateBucket{until: time.Now().Add(time.Minute), count: 1}
+	savedEntries := loginRateBuckets.entries
+	loginRateBuckets.entries = make(map[string]*loginRateBucket)
+	for i := range 1024 {
+		bucket := &loginRateBucket{until: now.Add(time.Minute), count: 1}
+		bucket.lastUsed.Store(now.Add(time.Duration(i) * time.Millisecond).UnixNano())
+		loginRateBuckets.entries[fmt.Sprintf("cap-%d", i)] = bucket
 	}
 	loginRateBuckets.Unlock()
 	t.Cleanup(func() {
 		loginRateBuckets.Lock()
-		for k := range loginRateBuckets.entries {
-			if strings.HasPrefix(k, "cap-") {
-				delete(loginRateBuckets.entries, k)
-			}
-		}
+		loginRateBuckets.entries = savedEntries
 		loginRateBuckets.Unlock()
 	})
 	h := clusterRateLimit("test", 30, "测试限流")
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/cluster/service-control", nil)
 	c.Request.RemoteAddr = "203.0.113.77:1234"
-	h(c) // 不 panic、不新增桶即通过
+	h(c) // 不 panic
 	loginRateBuckets.Lock()
-	_, exists := loginRateBuckets.entries["203.0.113.77|test"]
+	bucket, exists := loginRateBuckets.entries["203.0.113.77|test"]
+	_, oldestEvicted := loginRateBuckets.entries["cap-0"]
+	size := len(loginRateBuckets.entries)
 	loginRateBuckets.Unlock()
-	if exists {
-		t.Fatal("容量满时应跳过建桶（fail-open 放行——与 loginRateLimit 同族）")
+	if !exists {
+		t.Fatal("容量满时必须 LRU 淘汰建桶——跳过建桶=新来源本分钟零限流（fail-open）")
+	}
+	if bucket.count != 1 {
+		t.Fatalf("新桶计数=%d，want 1（请求必须被真实记账）", bucket.count)
+	}
+	if oldestEvicted {
+		t.Fatal("LRU 淘汰应移除最久未命中的桶（cap-0）")
+	}
+	if size > rateLimitBucketCapacity {
+		t.Fatalf("桶表越界：%d > %d", size, rateLimitBucketCapacity)
 	}
 }
 

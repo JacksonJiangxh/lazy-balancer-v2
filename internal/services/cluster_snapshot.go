@@ -61,7 +61,15 @@ func resetSnapshotRowIsolationThrottle() {
 
 // warnCorruptedSnapshotRow 显式隔离（跳过）单行损坏数据并留下结构化告警：
 // 快照是主→从的整包下发通道，一行 JSON 畸形不得让全部规则/策略/节点数据
-// 500——坏行不进入快照（从节点保留本地既有行），告警必须点名表与行 ID。
+// 500。告警必须点名表与行 ID。
+//
+// D2-历史问题 语义如实化：隔离**不是**「从节点保留本地既有行」——快照节是全量
+// 替换语义（users 节先 clearSyncTables(api_keys, users)、security 节先
+// DELETE security_custom_rules 再插入 payload），且节哈希按剔除坏行后的
+// payload 计算，从节点不会因哈希不一致跳过。因此主节点某行损坏时，从节点
+// 下一次 apply 后该行**消失**（api_keys 表现为认证消失、custom_rules 表现为
+// 拦截规则消失），主节点修复该行后下一次同步自然自愈。该 fail-open 隔离是
+// 有意取舍（防单行坏数据瘫痪全量同步），调用方 skip 后必须继续。
 func warnCorruptedSnapshotRow(table string, rowID any, err error) {
 	key := fmt.Sprintf("%s:%v", table, rowID)
 	now := time.Now()
@@ -81,7 +89,7 @@ func warnCorruptedSnapshotRow(table string, rowID any, err error) {
 	}
 	Logf("error", "集群快照隔离损坏行：表 %s 行 %v 解析失败（该行不下发，健康行照常同步；请修复主节点数据）: %v", table, rowID, err)
 	RecordAuditLog("system", "同步失败", "集群快照",
-		FormatAuditDetail(fmt.Sprintf("表 %s 行 %v", table, rowID), "行数据解析失败，已隔离该行", err.Error()), "")
+		FormatAuditDetail(fmt.Sprintf("表 %s 行 %v", table, rowID), "行数据解析失败，未随快照下发（从节点全量替换后该行消失，主节点修复后自愈）", err.Error()), "")
 }
 
 type snapshotStore interface {
@@ -135,7 +143,8 @@ func (s *ClusterService) Snapshot(ctx context.Context, sinceVersion int, clientF
 func (s *ClusterService) ConfirmRegistration(ctx context.Context, token string) error {
 	// 历史问题（历史）：清列与上方旧协议交付确认（:84）对齐——过期时间戳
 	// 一并置 NULL，不与已清空的 secret 残留分叉。
-	result, err := s.db.ExecContext(ctx, "UPDATE nodes SET registration_secret=NULL, registration_secret_expires_at=NULL WHERE cluster_token_hash=?", tokenHash(token))
+	// 历史问题-历史问题：SQL 级角色条件——降级窗口内的确认不得再写节点簿记。
+	result, err := s.db.ExecContext(ctx, "UPDATE nodes SET registration_secret=NULL, registration_secret_expires_at=NULL WHERE cluster_token_hash=? AND "+masterRoleConditionSQL, tokenHash(token))
 	if err != nil {
 		return fmt.Errorf("确认集群令牌交付: %w", err)
 	}
@@ -144,6 +153,13 @@ func (s *ClusterService) ConfirmRegistration(ctx context.Context, token string) 
 		return fmt.Errorf("读取集群令牌确认结果: %w", err)
 	}
 	if updated == 0 {
+		isMaster, roleErr := RoleOf(ctx, s.db)
+		if roleErr != nil {
+			return fmt.Errorf("复核节点角色: %w", roleErr)
+		}
+		if !isMaster {
+			return ErrNotMasterNode
+		}
 		return ErrInvalidClusterAuth
 	}
 	return nil
@@ -173,7 +189,9 @@ func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnap
 	// D2-S2：开关读取失败必须报错——空缓存键 + nil 开关会把主节点 sync_users=0
 	// 等关闭保护在该份快照内绕过（从节点 computeSectionSkips 回退全开默认值），
 	// 且无自愈路径。无法确认权威开关状态时不得发布快照。
-	switches, err := readSyncSwitches(ctx, s.db)
+	// D2-历史问题：开关读取与快照内容共用同一事务视图（此前走 s.db，事务外读取
+	// 可能拿到不同时点数据；单连接池下更会对自身连接永久等待）。
+	switches, err := readSyncSwitches(ctx, tx)
 	if err != nil {
 		return models.ClusterSnapshot{}, nil, "", fmt.Errorf("读取同步开关: %w", err)
 	}
@@ -223,7 +241,8 @@ func (s *ClusterService) buildFullSnapshot(ctx context.Context, store snapshotSt
 	}
 	snapshot.WafFiles = BuildWafFileRef()
 	// D2-S2：与缓存键侧同口径——读不到权威开关时不得发布 nil 开关快照。
-	switches, err := readSyncSwitches(ctx, s.db)
+	// D2-历史问题：走调用方 store（cachedSnapshot 的 tx），与快照内容同事务视图。
+	switches, err := readSyncSwitches(ctx, store)
 	if err != nil {
 		return models.ClusterSnapshot{}, fmt.Errorf("读取主节点同步开关: %w", err)
 	}

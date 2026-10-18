@@ -387,16 +387,47 @@ func (s *ClusterService) ReportNode(ctx context.Context, nodeID int, report mode
 	if err != nil {
 		return fmt.Errorf("编码节点健康状态: %w", err)
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE nodes SET status='online',last_seen=?,reported_version=?,health_json=?,last_sync_at=?,last_sync_error=? WHERE id=? AND is_approved=1`, now.UTC(), report.AppliedVersion, string(encoded), nullableString(report.LastSyncAt), report.LastSyncError, nodeID)
+	result, err := s.db.ExecContext(ctx, `UPDATE nodes SET status='online',last_seen=?,reported_version=?,health_json=?,last_sync_at=?,last_sync_error=? WHERE id=? AND is_approved=1 AND `+masterRoleConditionSQL, now.UTC(), report.AppliedVersion, string(encoded), nullableString(report.LastSyncAt), report.LastSyncError, nodeID)
 	if err != nil {
 		return fmt.Errorf("更新节点上报: %w", err)
 	}
 	rows, err := result.RowsAffected()
-	if err != nil || rows != 1 {
-		return ErrNodeNotFound
+	if err != nil {
+		return fmt.Errorf("读取节点上报结果: %w", err)
+	}
+	if rows != 1 {
+		// 历史问题-历史问题：降级窗口内的上报按 403 语义拒绝，而不是误报 404。
+		return s.nodeWriteMissError(ctx)
 	}
 	s.storeSectionReport(nodeID, report.SectionHashes)
 	return nil
+}
+
+// resolveNodeAccessURL 推导节点访问地址的单源实现（D2-历史问题）：显式
+// access_url 优先，否则 protocol://ip:port；protocol 非 https 一律归一为 http
+// （原四处逐字重复，口径漂移风险）。
+func resolveNodeAccessURL(ipAddress string, port int, protocol, accessURL string) string {
+	if protocol != "https" {
+		protocol = "http"
+	}
+	if accessURL == "" {
+		accessURL = protocol + "://" + net.JoinHostPort(ipAddress, strconv.Itoa(port))
+	}
+	return accessURL
+}
+
+// nodePinPathFromAccessURL 由节点访问地址定位其 TOFU pin 文件（单源：
+// ForgetNodePin/DeleteNode 原各自重复「解析 URL → clusterPinPathForDatabase」）。
+func nodePinPathFromAccessURL(database *sql.DB, accessURL string) (pinPath, host string, err error) {
+	parsed, err := url.Parse(accessURL)
+	if err != nil || parsed.Host == "" {
+		return "", "", fmt.Errorf("节点访问地址无效: %q", accessURL)
+	}
+	pinPath, err = clusterPinPathForDatabase(database, parsed.Host)
+	if err != nil {
+		return "", "", err
+	}
+	return pinPath, parsed.Host, nil
 }
 
 func (s *ClusterService) DeleteNode(ctx context.Context, nodeID int) error {
@@ -407,30 +438,24 @@ func (s *ClusterService) DeleteNode(ctx context.Context, nodeID int) error {
 	var port int
 	addrErr := s.db.QueryRowContext(ctx, `SELECT ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,'') FROM nodes WHERE id=?`, nodeID).
 		Scan(&ipAddress, &port, &protocol, &accessURL)
-	result, err := s.db.ExecContext(ctx, "DELETE FROM nodes WHERE id=?", nodeID)
+	result, err := s.db.ExecContext(ctx, "DELETE FROM nodes WHERE id=? AND "+masterRoleConditionSQL, nodeID)
 	if err != nil {
 		return fmt.Errorf("删除节点: %w", err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil || rows != 1 {
-		return ErrNodeNotFound
+		// 历史问题-历史问题：降级窗口内的删除按 403 语义拒绝（节点仍在），而非 404。
+		return s.nodeWriteMissError(ctx)
 	}
 	s.clearSectionReport(nodeID)
 	// 行已删:清 pin(读址失败/无 pin/地址无效均不影响删除结果,仅留痕)。
 	if addrErr == nil {
-		if protocol != "https" {
-			protocol = "http"
-		}
-		if accessURL == "" {
-			accessURL = protocol + "://" + net.JoinHostPort(ipAddress, strconv.Itoa(port))
-		}
-		if parsed, perr := url.Parse(accessURL); perr == nil && parsed.Host != "" {
-			if pinPath, pperr := clusterPinPathForDatabase(s.db, parsed.Host); pperr == nil {
-				if rerr := os.Remove(pinPath); rerr == nil {
-					RecordAuditLog("system", "清除", "证书指纹", FormatAuditDetail(fmt.Sprintf("节点删除伴随清除 pin：%s", parsed.Host), AuditResultPart("success")), "")
-				} else if !errors.Is(rerr, os.ErrNotExist) {
-					Logf("warn", "节点删除后清除 pin 失败(%s): %v", parsed.Host, rerr)
-				}
+		accessURL = resolveNodeAccessURL(ipAddress, port, protocol, accessURL)
+		if pinPath, host, perr := nodePinPathFromAccessURL(s.db, accessURL); perr == nil {
+			if rerr := os.Remove(pinPath); rerr == nil {
+				RecordAuditLog("system", "清除", "证书指纹", FormatAuditDetail(fmt.Sprintf("节点删除伴随清除 pin：%s", host), AuditResultPart("success")), "")
+			} else if !errors.Is(rerr, os.ErrNotExist) {
+				Logf("warn", "节点删除后清除 pin 失败(%s): %v", host, rerr)
 			}
 		}
 	}

@@ -69,6 +69,12 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 			clusterError(c, http.StatusUnauthorized, "注册令牌无效或已过期", err)
 			return
 		}
+		if errors.Is(err, services.ErrNotMasterNode) {
+			// 历史问题-历史问题：SQL 级角色条件命中 0 行（降级竞态）→ 403，与
+			// requireMaster 同文案，不折叠成 500。
+			clusterError(c, http.StatusForbidden, err.Error(), err)
+			return
+		}
 		if errors.Is(err, models.ErrInvalidClusterNodeName) {
 			// 历史问题-05：归一后为空的节点名属客户端可修正输入，映射 400。
 			services.RecordAuditLog("system", "注册失败", "集群节点", services.FormatAuditDetail(registerAuditField(req.Name), registerAuditField(req.IPAddress), err.Error()), c.ClientIP())
@@ -131,6 +137,10 @@ func (h *Handlers) ConfirmClusterRegistration(c *gin.Context) {
 		return
 	}
 	if err := h.clusterService.ConfirmRegistration(c.Request.Context(), authenticatedClusterToken(c)); err != nil {
+		if errors.Is(err, services.ErrNotMasterNode) {
+			clusterError(c, http.StatusForbidden, err.Error(), err)
+			return
+		}
 		// 历史问题:同 RegistrationStatus 分判。
 		if errors.Is(err, services.ErrInvalidClusterAuth) || errors.Is(err, services.ErrNodeNotFound) || errors.Is(err, services.ErrInvalidRegisterToken) {
 			clusterError(c, http.StatusUnauthorized, "确认集群注册失败", err)
@@ -177,6 +187,9 @@ func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation fu
 	}
 	if err := operation(id); err != nil {
 		status := http.StatusInternalServerError
+		if errors.Is(err, services.ErrNotMasterNode) {
+			status = http.StatusForbidden
+		}
 		if errors.Is(err, services.ErrNodeNotFound) {
 			status = http.StatusNotFound
 		}

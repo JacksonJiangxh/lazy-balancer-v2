@@ -35,6 +35,8 @@ func TestGetCaddyConfig_dialsConfiguredAdminURL(t *testing.T) {
 	t.Cleanup(fake.Close)
 	h := &Handlers{cfg: &config.Config{CaddyAdminURL: fake.URL}}
 	router := gin.New()
+	// B1-历史问题：原始运行配置读取已收敛为管理员语义（业务组路由 + handler 复核）。
+	router.Use(func(c *gin.Context) { c.Set("role", "admin"); c.Next() })
 	router.GET("/config", h.GetCaddyConfig)
 
 	// When

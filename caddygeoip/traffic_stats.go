@@ -123,6 +123,10 @@ func trafficEntryFor(country string) *trafficEntry {
 // trafficRecord 记一次请求（country 非国家值=未解析/私网保留段——跳过；
 // 抽样期按 1/N 计数并 ×N 还原）。
 func trafficRecord(country string, attack bool) {
+	// E83-历史问题：国名键与发射侧/校验侧同口径 TrimSpace——否则空白异形
+	// 国家列（" 中国"）通过校验（校验本身 Trim）却建成带空格的独立脏桶，
+	// 大屏出现两个「中国」桶。发射侧已归一，此处为纵深防御。
+	country = strings.TrimSpace(country)
 	if !trafficCountryKeyValid(country) {
 		return
 	}

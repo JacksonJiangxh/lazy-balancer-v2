@@ -281,6 +281,7 @@ import { request } from '@/utils/api'
 import type { APIResponse } from '@/types'
 import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
+import { isRealtimeFlowEvent } from '@/utils/threatFlowRules'
 import { useCountUp } from '@/composables/useCountUp'
 import { formatDate } from '@/utils/date'
 import { trafficDelta, threatIndex, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '@/utils/threatScreenMetrics'
@@ -807,10 +808,16 @@ const feedTask = usePollingTask(async ({ signal, isCurrent }) => {
   sinceId.value = cursor
   if (events.length === 0) return
   feedItems.value = [...events, ...feedItems.value].sort((a, b) => b.id - a.id).slice(0, FEED_LIMIT)
-  // 弧线/弹框仅对增量批次：首批（入场回溯）不回放——消除「开局三连流光」
+  // 弧线/弹框仅对增量批次：首批（入场回溯）不回放——消除「开局三连流光」。
+  // 历史问题-03：增量批次同样需实时性门——入库延迟/轮转回填会把历史事件塞进
+  // 增量页，直接绘制会冒充「正在发生」；仅 5 分钟内事件做动效（列表照旧按
+  // windowFeed 时间窗口展示）。
   if (!isInitialBatch) {
-    enqueueArcs(events)
-    pushAttackToasts(events)
+    const fresh = events.filter((ev) => isRealtimeFlowEvent(ev.event_time))
+    if (fresh.length > 0) {
+      enqueueArcs(fresh)
+      pushAttackToasts(fresh)
+    }
   }
 }, { interval: FEED_POLL_MS, onError: () => { feedError.value = true } })
 
@@ -920,7 +927,9 @@ async function mountEngine(): Promise<void> {
     const engine = create(mapHost.value, {
       serverCentroid: siteConfigured.value ? [serverLatLon[1], serverLatLon[0]] : null,
       siteConfigured: siteConfigured.value,
-      drillCountries: ['中国'],
+      // 历史问题-F4：原硬编码 ['中国'] 使非中国下钻全部被 drillCountryAllowed 拦截
+      // （静默无动作），与 admin1Provinces「全球省级行政界」/ admin1Loader「首次
+      // 下钻才拉取」及全量国家省层钉测冲突。省略 = 不限国家（threatShared 缺省语义）。
       onDrillChange: (name: string | null) => { zoomedName.value = name },
       onProvinceLoadError: () => { ElMessage.warning('省界数据加载失败，本次下钻未展开；可再次点击国家重试') },
     })

@@ -10,6 +10,7 @@ A visual load balancing platform built on **Caddy v2.11**, with a full WAF secur
 |---|---|
 | Load Balancing | HTTP/HTTPS/TCP L4 proxy, multiple strategies, health checks, path routing |
 | WAF Security | OWASP CRS + custom rules + IP control + GeoIP blocking + rate limiting |
+| Crawler Exemption | Verify real search-engine/AI crawlers via UA + reverse DNS or official IP ranges and exempt them from GeoIP blocking; scheduled official crawler IP library updates |
 | Free Certificates | ACME auto-issuance (DNS-01), auto-renewal |
 | Primary-Replica Cluster | Incremental sync, tamper-proof signatures, read-only replicas, one-click promotion |
 | Monitoring | Traffic/latency P50-P99, upstream health, security event dashboard |
@@ -17,6 +18,8 @@ A visual load balancing platform built on **Caddy v2.11**, with a full WAF secur
 | Auto Backup | Scheduled daily/weekly/monthly config backups to the server `backup` directory, one-click restore |
 
 ## Quick Start
+
+**Linux (recommended, host network)**:
 
 ```bash
 docker run -d --name lazy-balancer --network host \
@@ -28,9 +31,22 @@ docker run -d --name lazy-balancer --network host \
   v55448330/lazy-balancer-v2:latest
 ```
 
+**Docker Desktop (macOS/Windows, bridge network with port mapping)**:
+
+```bash
+docker run -d --name lazy-balancer \
+  --restart unless-stopped \
+  --ulimit nofile=1048576:1048576 \
+  -p 8000:8000 -p 80:80 -p 443:443 -p 443:443/udp \
+  -v lb-data:/app/data -v $(pwd)/certs:/app/certs \
+  -v $(pwd)/logs:/app/logs -v $(pwd)/waf:/app/waf \
+  -v $(pwd)/backup:/app/backup \
+  v55448330/lazy-balancer-v2:latest
+```
+
 Mounts: `/app/data` database and config (required), `/app/certs` certificates and private keys (required), `/app/backup` auto-backup output directory (required — without it, backup files are lost when the container is recreated), `/app/logs` logs (recommended), `/app/waf` rule sets and GeoIP (recommended).
 
-> Docker Desktop (macOS/Windows): prefer a named volume for `/app/data` (`-v lb-data:/app/data`); bind mounts go through the FUSE sharing layer and risk SQLite WAL page loss (bind mounts on Linux hosts are unaffected).
+> Host networking is recommended on Linux hosts only. Docker Desktop support for host networking varies by version/settings — use the `-p` command above and keep `/app/data` on the named volume (`lb-data`); bind mounts go through the FUSE sharing layer and risk SQLite WAL page loss (bind mounts on Linux hosts are unaffected). The repository `docker-compose.yml` pins the primary node to host networking and is intended for Linux development/deployment only.
 
 Open `http://localhost:8000` for the admin panel. First visit opens an initialization wizard; no default credentials.
 
@@ -38,7 +54,7 @@ Open `http://localhost:8000` for the admin panel. First visit opens an initializ
 <summary>Docker Compose / Build from Source</summary>
 
 ```bash
-# Docker Compose
+# Docker Compose (Linux; the primary node uses host networking)
 docker compose up -d
 
 # Build from source

@@ -317,7 +317,14 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	var reloadErr error
 	if mustReload {
 		CaddyOpLock.Lock()
-		reloadErr = s.caddy.ApplyConfigForce(GenerateCaddyConfig())
+		if s.caddy == nil {
+			// D2-历史问题：nil CaddyService 是合法构造（测试/独立运维路径）。
+			// 按「不可判定」走既有重载失败标记语义（marker→304 补偿重拉），
+			// 而不是解引用 panic。
+			reloadErr = errors.New("Caddy 服务未初始化")
+		} else {
+			reloadErr = s.caddy.ApplyConfigForce(GenerateCaddyConfig())
+		}
 		CaddyOpLock.Unlock()
 	}
 	if reloadErr != nil {

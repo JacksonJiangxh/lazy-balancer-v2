@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -560,5 +562,73 @@ func TestAutobanPreset_categoryDescriptionLocked(t *testing.T) {
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("同值提交 status=%d body=%s, want 200（仅拦「变更」）", rec.Code, rec.Body.String())
+	}
+}
+
+// ---- A83A-历史问题（历史）：过期自动封禁条目的手动封禁 ----
+
+// Given 预置名单含一条已到期未清理的自动封禁条目（自动封禁关闭时不会清理）。
+// When 从事件页对该 IP 手动封禁（AddIPToList）。
+// Then 条目必须被覆盖为生效中的手动条目（清空 expires_at），而不是命中即
+// added:false 的静默 no-op（渲染生效集仍为空）。
+func TestAddIPToList_replacesExpiredAutobanEntry(t *testing.T) {
+	router := newAutobanTestEnv(t)
+	id := autobanPresetID(t)
+	seedAutobanListEntries(t, `[{"value":"198.51.100.9","remark":"自动封禁","created_at":"2026-10-01 00:00:00","expires_at":"2020-01-01 00:00:00"}]`)
+
+	recorder := postJSON(t, router, fmt.Sprintf("/security/ip-lists/%d/ips", id), map[string]any{"value": "198.51.100.9"})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"added":true`) {
+		t.Fatalf("body=%s, want added:true（覆盖过期条目=实际新增生效封禁）", recorder.Body.String())
+	}
+	entries := readAutobanListEntries(t, id)
+	if len(entries) != 1 {
+		t.Fatalf("entries=%+v, want 单条原位覆盖（不得重复追加）", entries)
+	}
+	if entries[0].Value != "198.51.100.9" || entries[0].ExpiresAt != "" || entries[0].Remark != services.AutobanManualUnbanRemark {
+		t.Fatalf("entry=%+v, want 手动封禁条目且 expires_at 清空", entries[0])
+	}
+	if len(services.AutobanActiveEntries(entries)) != 1 {
+		t.Fatalf("渲染生效集仍为空: %+v", entries)
+	}
+
+	// 回归形状：已生效条目重复手动封禁仍幂等 added:false。
+	recorder = postJSON(t, router, fmt.Sprintf("/security/ip-lists/%d/ips", id), map[string]any{"value": "198.51.100.9"})
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"added":false`) {
+		t.Fatalf("重复添加: status=%d body=%s, want 200+added:false", recorder.Code, recorder.Body.String())
+	}
+}
+
+// A83A-历史问题（历史）：威胁名单导出时文件读取/解析故障必须显式 500——
+// 旧实现吞掉非 NotExist 错误返回 200 空 TXT，调用方无法区分「名单为空」。
+func TestExportIPList_threatFileReadErrorReturns500(t *testing.T) {
+	router := newAutobanTestEnv(t)
+	wafDir := t.TempDir()
+	t.Cleanup(services.OverrideThreatWafDirForTest(wafDir))
+	// .iplist 路径为目录：os.ReadFile 返回 EISDIR（非「文件不存在」）。
+	if err := os.Mkdir(filepath.Join(wafDir, "threat-ustc.iplist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	name := db.ThreatListNameBySource("ustc")
+	res, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, entries, system) VALUES (?, '[]', 1)`, name)
+	if err != nil {
+		t.Fatalf("seed threat list row: %v", err)
+	}
+	id, _ := res.LastInsertId()
+
+	rec := getRequest(t, router, fmt.Sprintf("/security/ip-lists/%d/export", id))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500（读取故障不得伪装空导出）", rec.Code, rec.Body.String())
+	}
+
+	// 回归形状：文件缺失仍按空导出 200（禁用/未更新源）。
+	if err := os.Remove(filepath.Join(wafDir, "threat-ustc.iplist")); err != nil {
+		t.Fatal(err)
+	}
+	rec = getRequest(t, router, fmt.Sprintf("/security/ip-lists/%d/export", id))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("missing file: status=%d body=%s, want 200 空导出", rec.Code, rec.Body.String())
 	}
 }

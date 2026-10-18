@@ -282,39 +282,69 @@ func securityEventsSerializeHeaders(headers map[string][]string) string {
 	if len(raw) <= securityEventsHeadersCap {
 		return string(raw)
 	}
+	// 历史问题-06（历史）：旧实现「删一个键 → 整表 json.Marshal」是
+	// O(n²)——单请求头总量上限 1MB 时可有数千个短头，一次请求即让摄取单线程
+	// 循环数千次全量编码（审计面 DoS 放大）。改为预计算每个键的序列化字节
+	// （键/值各自 marshal，转义已计入），按体积降序一次扣除到目标以下，正常
+	// 路径只做一次整表 marshal；估算偏差仅由下方兜底分支处理（每次至少丢
+	// 一半剩余键，迭代次数对数级）。
+	type headerKeySize struct {
+		key  string
+		size int
+	}
+	keys := make([]headerKeySize, 0, len(headers))
+	total := 2 // 外层 {}
+	for k, v := range headers {
+		kb, kerr := json.Marshal(k)
+		vb, verr := json.Marshal(v)
+		if kerr != nil || verr != nil {
+			return ""
+		}
+		size := len(kb) + len(vb) + 2 // "key":value + 分隔逗号/冒号
+		keys = append(keys, headerKeySize{key: k, size: size})
+		total += size
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].size > keys[j].size })
 	trimmed := make(map[string][]string, len(headers)+1)
 	for k, v := range headers {
 		trimmed[k] = v
 	}
-	keys := make([]string, 0, len(trimmed))
-	for k := range trimmed {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		return securityEventsHeaderValueSize(trimmed[keys[i]]) > securityEventsHeaderValueSize(trimmed[keys[j]])
-	})
+	// 丢弃标记键的精确形态开销（dropped 位数按 6 位上限预留）。
+	markerOverhead := len(`"_lb_dropped_headers":["000000"]`) + 1
+	estimated := total
 	dropped := 0
-	for _, k := range keys {
-		delete(trimmed, k)
+	for _, ks := range keys {
+		if estimated+markerOverhead <= securityEventsHeadersCap {
+			break
+		}
+		delete(trimmed, ks.key)
+		estimated -= ks.size
 		dropped++
+	}
+	if dropped == 0 {
+		return string(raw)
+	}
+	trimmed["_lb_dropped_headers"] = []string{strconv.Itoa(dropped)}
+	raw, err = json.Marshal(trimmed)
+	if err != nil {
+		return ""
+	}
+	for len(raw) > securityEventsHeadersCap && dropped < len(keys) {
+		batch := (len(keys) - dropped) / 2
+		if batch < 1 {
+			batch = 1
+		}
+		for i := 0; i < batch && dropped < len(keys); i++ {
+			delete(trimmed, keys[dropped].key)
+			dropped++
+		}
 		trimmed["_lb_dropped_headers"] = []string{strconv.Itoa(dropped)}
 		raw, err = json.Marshal(trimmed)
 		if err != nil {
 			return ""
 		}
-		if len(raw) <= securityEventsHeadersCap {
-			break
-		}
 	}
 	return string(raw)
-}
-
-func securityEventsHeaderValueSize(values []string) int {
-	n := 0
-	for _, v := range values {
-		n += len(v)
-	}
-	return n
 }
 
 // securityEventsEncodeBody 落库事件请求体：64KB 上限。UTF-8 文本原样存储，
@@ -968,16 +998,9 @@ func securityEventsReadOffset(path string) (int64, error) {
 
 // securityEventsWriteOffset persists the byte offset atomically (plain integer).
 func securityEventsWriteOffset(path string, offset int64) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(offset, 10)), 0o644); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	// D1-历史问题：单源原子落盘（tmp+fsync+父目录 fsync）——0 字节偏移文件会让
+	// 尾读从头重放（重复摄取），掉电丢失则可能跳读窗口。
+	return writeFileAtomicSynced(path, []byte(strconv.FormatInt(offset, 10)), 0o644)
 }
 
 // securityEventsShouldReset reports whether the tailer must restart at offset

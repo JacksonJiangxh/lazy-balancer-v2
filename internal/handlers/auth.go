@@ -569,10 +569,13 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 
 	var user models.User
 	var authProvider string
+	// B3-历史问题（历史）：响应回填 mfa_enabled（与 GET /users/me、登录响应
+	// 同口径）——此前 PATCH /users/me 恒返回 false，MFA 已启用用户被误导。
+	var mfaEnabled int
 	err = tx.QueryRowContext(c.Request.Context(), `
-		SELECT id, username, role, display_name, is_enabled, created_at, last_login, COALESCE(auth_provider,'local')
+		SELECT id, username, role, display_name, is_enabled, created_at, last_login, COALESCE(auth_provider,'local'), COALESCE(mfa_enabled,0)
 		FROM users WHERE id = ?
-	`, userIDInt).Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &authProvider)
+	`, userIDInt).Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &authProvider, &mfaEnabled)
 	user.AuthProvider = authProvider
 
 	if err != nil {
@@ -590,7 +593,9 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 	} else {
 		recordAudit(c, "更新信息", "用户", services.FormatAuditDetail(services.AuditUserPart(user.ID, user.Username), fmt.Sprintf("变更：%s", strings.Join(changed, "、"))))
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: models.NewUserResponse(user)})
+	response := models.NewUserResponse(user)
+	response.MFAEnabled = mfaEnabled == 1
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: response})
 }
 
 func (h *Handlers) GetSetupStatus(c *gin.Context) {

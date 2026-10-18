@@ -652,6 +652,15 @@ func syncDrainerFor(database *sql.DB) *SyncService {
 	return service
 }
 
+// brandingDirectory 返回品牌配置文件所在数据目录（cfg 可能为 nil——构造契约
+// 允许 NewSyncService(db, nil, nil)，此时按空目录跳过文件态操作）。
+func (s *SyncService) brandingDirectory() string {
+	if s == nil || s.cfg == nil {
+		return ""
+	}
+	return s.cfg.DataDir
+}
+
 func (s *SyncService) reopenPullAdmission() {
 	s.pullAdmissionMu.Lock()
 	s.pullsStopped = false
@@ -881,6 +890,23 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 				resp.Body.Close()
 				sinceVersion, sinceFingerprint = 0, ""
 				continue
+			}
+			// D2-历史问题：品牌文件态自愈。304 稳态下 applySnapshot 不运行，品牌
+			// 文件没有物化通道——文件被删除/损坏会永久停留默认品牌（进程重启时
+			// EnsureBrandingFile 也只会写全空模板）。按 global_config.branding_json
+			// 镜像重写文件，零 Caddy 重载；失败用状态转换日志限噪。
+			if healed, herr := ReconcileBrandingFile(s.brandingDirectory()); herr != nil {
+				if logStateTransition("cluster-branding-reconcile", true) != "" {
+					Logf("warn", "同步周期品牌文件自愈失败（下轮重试）: %v", herr)
+				}
+			} else {
+				if logStateTransition("cluster-branding-reconcile", false) != "" {
+					Logf("info", "同步周期品牌文件自愈恢复")
+				}
+				if healed {
+					Logf("warn", "本地品牌配置文件缺失或与主节点镜像不一致，已按同步镜像重建")
+					RecordAuditLog("system", "同步自愈", "集群同步", FormatAuditDetail("品牌配置文件缺失或损坏", "已按主节点品牌镜像重建（零 Caddy 重载）"), "")
+				}
 			}
 			// WAF 文件兜底（历史问题）：apply 期 fetchWafFiles/ApplyWafFileBundle
 			// 失败仅记日志不向上传播（cluster_apply.go），记录哈希已提交而本地

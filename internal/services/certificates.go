@@ -439,6 +439,18 @@ func (s *CertificateService) scheduleDeploymentRetry(jobID int, ruleID string, d
 			for _, callback := range running {
 				waitDoneOrTimeout(callback.done, s.cancelWaitTimeout, jobID, "在途部署回调")
 			}
+			// 历史问题-03：waitDoneOrTimeout 超时后的契约是「放弃本轮调度」。原实现
+			// 无条件 continue，仍在 map 中的同一回调会让循环每 cancelWaitTimeout
+			// 重复一轮且永不建 timer。回调仍在=本轮放弃：deployment_available_after
+			// 已落库，30s 补扫/Resume 会再次拾起；DeployLock 与终态 CAS 保证滞留
+			// 回调即便最终退出也不会并发部署同一证书。
+			s.timerMu.Lock()
+			stillRunning := len(s.deploymentCallbacks[jobID]) > 0
+			s.timerMu.Unlock()
+			if stillRunning {
+				Logf("warn", "证书任务 %d：在途部署回调未在 %s 内退出，放弃本轮部署重试调度（补扫/恢复接管）", jobID, s.cancelWaitTimeout)
+				return
+			}
 			continue
 		}
 		entry := &deploymentTimer{done: make(chan struct{}), ruleID: ruleID}
@@ -751,11 +763,17 @@ func CertWaitingCATickOnce() {
 	})
 }
 
-// CertReconcileOnce 状态对账（缺失证书文件/孤儿任务清理）。
+// CertReconcileOnce 状态对账（缺失证书文件/孤儿任务清理/缺失任务补建）。
 func CertReconcileOnce() {
 	rebuilt := reconcileMissingCertFiles(db.DB)
 	swept := sweepOrphanedCertJobs(context.Background())
-	TaskLogf("cert-reconcile", "reconcile", "状态对账完成：断链重建 %d 个、孤儿清理 %d 个（一致时为 0）", rebuilt, swept)
+	// 历史问题-01 兜底：6h 对账同时补建「启用 ACME 但无任务行」的规则——覆盖
+	// 提升窗口之外的行丢失（快照整树替换后残留的中间态）。
+	created, backfillErr := BackfillMissingACMECertJobs(context.Background(), GetCAQueueManager())
+	if backfillErr != nil {
+		Logf("warn", "证书任务对账补建失败: %v", backfillErr)
+	}
+	TaskLogf("cert-reconcile", "reconcile", "状态对账完成：断链重建 %d 个、孤儿清理 %d 个、任务补建 %d 个（一致时为 0）", rebuilt, swept, created)
 }
 
 // requeueWaitingCAJobs re-enqueues cert jobs parked in 'waiting_ca' once
@@ -840,6 +858,13 @@ func (s *CertificateService) requeueWaitingCAJobs() {
 // the process last exited. Jobs whose rule or CA provider no longer exist are
 // marked as failed.
 func (s *CertificateService) recoverCertJobs(ctx context.Context) {
+	// 历史问题-01：先补建缺失任务行（提升/启动时从端快照只带已签发材料，未签发
+	// 规则的 cert_jobs 行在主从切换后不存在），再恢复既有非终态任务。
+	if created, err := BackfillMissingACMECertJobs(ctx, GetCAQueueManager()); err != nil {
+		Logf("error", "补建缺失证书任务失败: %v", err)
+	} else if created > 0 {
+		TaskLogf("cert-issuance", "recover", "补建缺失证书任务 %d 个（提升/启动恢复）", created)
+	}
 	if err := requeueNonTerminalCertJobs(ctx, s.deploymentRetry); err != nil {
 		Logf("error", "Failed to recover non-terminal cert jobs: %v", err)
 	}
@@ -1143,6 +1168,50 @@ func (s *CertificateService) Stop() {
 	<-s.done
 }
 
+// ErrCertificateQueueInactive 标记「证书签发任务未运行（队列未激活/已暂停）」
+// 导致的入队拒绝。这是运维态而非内部故障：与手工签发的 409 口径一致
+// （历史问题-05），handler 必须映射 409/503 并点明「证书签发任务已停止」，不得
+// 折成 500 让规则保存看起来像内部错误。
+var ErrCertificateQueueInactive = errors.New("证书签发任务未运行")
+
+// upsertQueuedCertJob 持久化「排队签发」任务行（原 EnqueueIfActive transition
+// 闭包单源）。返回任务 id 与是否发生状态迁移；disabled 行仅在规则仍启用
+// ACME 且规范化域名匹配时复活。
+func upsertQueuedCertJob(ruleID string, list []string, caProviderID int) (int, bool, error) {
+	joined := strings.Join(list, ",")
+	reversed := joined
+	if len(list) == 2 {
+		reversed = list[1] + "," + list[0]
+	}
+	var id int
+	err := db.DB.QueryRow(`
+		INSERT INTO cert_jobs (rule_id, domain, status, message, ca_provider_id)
+		VALUES (?, ?, 'queued', '等待排队签发', ?)
+		ON CONFLICT(rule_id, domain) DO UPDATE SET
+			status = 'queued',
+			message = '重新排队签发',
+			renewal_attempts = 0,
+			ca_available_after = NULL,
+			last_error_code = NULL,
+			ca_provider_id = excluded.ca_provider_id,
+			updated_at = datetime('now')
+		WHERE cert_jobs.status IN ('waiting_ca','issued','failed','downloaded')
+		   OR (cert_jobs.status='disabled' AND EXISTS (
+			SELECT 1 FROM lb_rules r
+			WHERE r.caddy_id=cert_jobs.rule_id AND r.enabled=1 AND r.enable_tls=1
+			  AND r.tls_source='acme_dns' AND lower(replace(r.domain,' ','')) IN (?,?)
+		   ))
+		RETURNING id
+	`, ruleID, joined, caProviderID, joined, reversed).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		if err := db.DB.QueryRow("SELECT id FROM cert_jobs WHERE rule_id=? AND domain=?", ruleID, joined).Scan(&id); err != nil {
+			return 0, false, err
+		}
+		return id, false, nil
+	}
+	return id, err == nil, err
+}
+
 // CreateOrRequeueCertJob creates a queued cert job for the rule and enqueues it.
 // Uses an atomic INSERT ... ON CONFLICT to avoid races between concurrent callers.
 func CreateOrRequeueCertJob(ruleID, domains string, caProviderID int, qm *CAQueueManager) (int, error) {
@@ -1153,6 +1222,9 @@ func CreateOrRequeueCertJob(ruleID, domains string, caProviderID int, qm *CAQueu
 	if jobID > 0 && qm.IsJobActive(jobID) {
 		return jobID, nil
 	}
+	if qm != nil && !qm.IsActive() {
+		return jobID, fmt.Errorf("%w（任务 %d 未入队）", ErrCertificateQueueInactive, jobID)
+	}
 	return jobID, fmt.Errorf("certificate job %d was not queued", jobID)
 }
 
@@ -1162,10 +1234,6 @@ func CreateOrRequeueCertJobWithChange(ruleID, domains string, caProviderID int, 
 		return 0, false, fmt.Errorf("invalid ACME domains: %s", domains)
 	}
 	joined := strings.Join(list, ",")
-	reversed := joined
-	if len(list) == 2 {
-		reversed = list[1] + "," + list[0]
-	}
 
 	// Defensive: if no explicit CA provider was supplied, use the rule's own
 	// setting rather than falling back to the global default.
@@ -1181,33 +1249,7 @@ func CreateOrRequeueCertJobWithChange(ruleID, domains string, caProviderID int, 
 		return 0, false, fmt.Errorf("CA queue manager not initialized")
 	}
 	jobID, changed, err := qm.EnqueueIfActive(caProviderID, 0, ruleID, joined, func() (int, bool, error) {
-		var id int
-		err := db.DB.QueryRow(`
-			INSERT INTO cert_jobs (rule_id, domain, status, message, ca_provider_id)
-			VALUES (?, ?, 'queued', '等待排队签发', ?)
-			ON CONFLICT(rule_id, domain) DO UPDATE SET
-				status = 'queued',
-				message = '重新排队签发',
-				renewal_attempts = 0,
-				ca_available_after = NULL,
-				last_error_code = NULL,
-				ca_provider_id = excluded.ca_provider_id,
-				updated_at = datetime('now')
-			WHERE cert_jobs.status IN ('waiting_ca','issued','failed','downloaded')
-			   OR (cert_jobs.status='disabled' AND EXISTS (
-				SELECT 1 FROM lb_rules r
-				WHERE r.caddy_id=cert_jobs.rule_id AND r.enabled=1 AND r.enable_tls=1
-				  AND r.tls_source='acme_dns' AND lower(replace(r.domain,' ','')) IN (?,?)
-			   ))
-			RETURNING id
-		`, ruleID, joined, caProviderID, joined, reversed).Scan(&id)
-		if errors.Is(err, sql.ErrNoRows) {
-			if err := db.DB.QueryRow("SELECT id FROM cert_jobs WHERE rule_id=? AND domain=?", ruleID, joined).Scan(&id); err != nil {
-				return 0, false, err
-			}
-			return id, false, nil
-		}
-		return id, err == nil, err
+		return upsertQueuedCertJob(ruleID, list, caProviderID)
 	})
 	if err != nil {
 		return jobID, false, fmt.Errorf("create or enqueue cert job: %w", err)
@@ -1215,6 +1257,9 @@ func CreateOrRequeueCertJobWithChange(ruleID, domains string, caProviderID int, 
 	if !changed {
 		if jobID != 0 {
 			return jobID, false, nil
+		}
+		if !qm.IsActive() {
+			return 0, false, fmt.Errorf("%w（任务未入队）", ErrCertificateQueueInactive)
 		}
 		return 0, false, fmt.Errorf("CA queue is paused")
 	}
@@ -1225,6 +1270,93 @@ func CreateOrRequeueCertJobWithChange(ruleID, domains string, caProviderID int, 
 	// 历史问题：入队成功即真实工作，唤醒不重查活跃态（避免瞬时失败漏唤醒）。
 	WakeCertWaitingCAForEnqueuedJob()
 	return jobID, true, nil
+}
+
+// BackfillMissingACMECertJobs 为「启用且启用 ACME 的规则」补建缺失的
+// cert_jobs 行（历史问题-01）。
+//
+// 主从快照只携带已签发证书材料（cluster_snapshot.go 的 certs 组选），从端
+// apply 清空 cert_jobs 后仅回插材料行且统一为 issued；提升时凡「从未签发成功/
+// 首发失败/正在签发/证书已过期/材料缺失」的规则在新主节点上没有任务行。续期
+// 扫描、首发重试、补扫、对账一律 JOIN cert_jobs，规则存在但行缺失时永不命中
+// ——自动签发/续期链静默中断。提升/启动恢复（cert-issuance 唤醒证书服务）与
+// 6h 对账都调用本函数收敛。
+//
+// 任务行先落库（queued），队列激活时才一并入队；队列未激活时行保持 queued，
+// 由 Resume 的 requeueLifecycleStrandedJobs / cert-waiting-ca 补扫接管。
+// 返回新建/复活的规则数。
+func BackfillMissingACMECertJobs(ctx context.Context, qm *CAQueueManager) (int, error) {
+	if db.DB == nil {
+		return 0, errors.New("数据库未初始化")
+	}
+	rows, err := db.DB.QueryContext(ctx, `
+		SELECT r.caddy_id, COALESCE(r.domain,''), COALESCE(r.ca_provider_id,0)
+		FROM lb_rules r
+		WHERE r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns'
+		  AND trim(COALESCE(r.domain,''))<>''
+		  AND NOT EXISTS (
+			SELECT 1 FROM cert_jobs j
+			WHERE j.rule_id=r.caddy_id AND j.status<>'disabled'
+		  )
+		ORDER BY r.caddy_id`)
+	if err != nil {
+		return 0, fmt.Errorf("查询缺失证书任务的 ACME 规则: %w", err)
+	}
+	type missingJobRule struct {
+		ruleID     string
+		domain     string
+		caProvider int
+	}
+	var candidates []missingJobRule
+	for rows.Next() {
+		var candidate missingJobRule
+		if err := rows.Scan(&candidate.ruleID, &candidate.domain, &candidate.caProvider); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("读取缺失证书任务的规则: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("遍历缺失证书任务的规则: %w", err)
+	}
+	rows.Close()
+
+	created := 0
+	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return created, err
+		}
+		list := normalizeAndValidateDomains(candidate.domain)
+		if list == nil {
+			// 导入可产生非法 ACME 域（导入校验不验域合法性）——跳过并留痕，
+			// 不阻断其余规则的补建。
+			Logf("warn", "证书任务补建跳过规则 %s：ACME 域名不可规范化（%q）", candidate.ruleID, candidate.domain)
+			continue
+		}
+		jobID, changed, uerr := upsertQueuedCertJob(candidate.ruleID, list, candidate.caProvider)
+		if uerr != nil {
+			Logf("error", "证书任务补建失败 rule=%s: %v", candidate.ruleID, uerr)
+			continue
+		}
+		if changed {
+			created++
+		}
+		if qm == nil || !qm.IsActive() || jobID <= 0 {
+			continue
+		}
+		// 行已 queued：transition 返回 changed=true 只表示「允许入队」。
+		if _, _, eerr := qm.EnqueueIfActive(candidate.caProvider, jobID, candidate.ruleID, strings.Join(list, ","), func() (int, bool, error) {
+			return jobID, true, nil
+		}); eerr != nil {
+			Logf("warn", "证书任务补建后入队失败 rule=%s job=%d（行保持 queued，恢复补扫接管）: %v", candidate.ruleID, jobID, eerr)
+		}
+	}
+	if created > 0 {
+		Logf("info", "证书任务补建：为 %d 个启用 ACME 规则创建排队任务", created)
+		RecordAuditLog("system", "创建", "证书任务", FormatAuditDetail(AuditSourcePart("promote_or_startup"), fmt.Sprintf("为 %d 个启用 ACME 规则补建证书任务", created)), "")
+	}
+	return created, nil
 }
 
 // HasCertJob reports whether any certificate job row exists for the given

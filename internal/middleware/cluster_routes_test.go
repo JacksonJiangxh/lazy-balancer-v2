@@ -292,14 +292,19 @@ func TestClusterMachineRateLimit_ignoresHeadersNotUsedByRouteAuth(t *testing.T) 
 	}
 }
 
-func TestClusterMachineRateLimit_capacityFullFailsOpen(t *testing.T) {
+func TestClusterMachineRateLimit_capacityFullEvictsLRUAndKeepsLimiting(t *testing.T) {
 	// Given：共享桶容量已满；合法节点的机器认证不得被误报为限流。
+	// 历史问题-1：容量满不得 fail-open（不建桶=本分钟对该来源零限流）——
+	// 改为 LRU 淘汰最久未命中桶后照常预占。
 	database, token := newClusterAuthContractDatabase(t)
 	loginRateBuckets.Lock()
 	savedEntries := loginRateBuckets.entries
 	loginRateBuckets.entries = make(map[string]*loginRateBucket)
+	now := time.Now()
 	for index := range 1024 {
-		loginRateBuckets.entries[fmt.Sprintf("machine-cap-%d", index)] = &loginRateBucket{until: time.Now().Add(time.Minute), count: 1}
+		bucket := &loginRateBucket{until: now.Add(time.Minute), count: 1}
+		bucket.lastUsed.Store(now.Add(time.Duration(index) * time.Millisecond).UnixNano())
+		loginRateBuckets.entries[fmt.Sprintf("machine-cap-%d", index)] = bucket
 	}
 	loginRateBuckets.Unlock()
 	t.Cleanup(func() {
@@ -319,9 +324,23 @@ func TestClusterMachineRateLimit_capacityFullFailsOpen(t *testing.T) {
 	// When
 	router.ServeHTTP(response, request)
 
-	// Then：容量满按既有 fail-open 语义放行，而不是配额满的 429。
+	// Then：配额内放行，且新来源真实获得桶（未 fail-open 跳过限流）。
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("capacity-full valid request status=%d body=%s, want 204", response.Code, response.Body.String())
+	}
+	loginRateBuckets.Lock()
+	_, newKeyBucketed := loginRateBuckets.entries["198.51.100.73|capacity-full|ip"]
+	_, oldestEvicted := loginRateBuckets.entries["machine-cap-0"]
+	buckets := len(loginRateBuckets.entries)
+	loginRateBuckets.Unlock()
+	if !newKeyBucketed {
+		t.Fatal("容量满时新来源必须获得计数桶（LRU 淘汰腾位），否则限流 fail-open")
+	}
+	if oldestEvicted {
+		t.Fatal("LRU 淘汰应移除最久未命中的桶（machine-cap-0）")
+	}
+	if buckets > rateLimitBucketCapacity {
+		t.Fatalf("桶表越界：%d > %d", buckets, rateLimitBucketCapacity)
 	}
 }
 

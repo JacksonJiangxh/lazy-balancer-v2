@@ -111,6 +111,7 @@ import type { IpListOption } from '@/composables/useIpListAdd'
 import { inferPolicyType, parseIPList, parseRefIds, entryMatchesIp, invalidateSharedEntriesCache, ensureSharedEntries, sharedEntriesCache, subscribeSharedEntriesCache, mergeIpEntryValues } from '@/utils/securityStages'
 import { popperViewportSafe } from '@/utils/popper'
 import type { SecurityPolicyType, SecurityPolicyTypeInput } from '@/utils/securityStages'
+import { planTrustRemoval } from '@/utils/trustRemoval'
 import type { APIResponse } from '@/types'
 
 // 列表接口与详情接口共用同一组 SELECT 列，列表行直接携带完整 ACL 字段
@@ -616,9 +617,24 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
   // 历史问题 对齐：信任生效仅由本弹窗不可移除的条目（内联 CIDR 覆盖 / 系统名单精确
   // 条目）提供时，「取消信任」是空操作——不再弹确认框走流程后谎报成功，直接
   // 指引到对应编辑面。
-  const inlineExact = parseIPList(row.policy.ip_whitelist).includes(ip)
-  const exactRefLists = row.removableTrustRefLists.filter((m) => (ipListEntries.value[m.id] ?? []).some((e) => e === ip))
-  if (!inlineExact && exactRefLists.length === 0) {
+  // 历史问题-F2：处置计划单源（utils/trustRemoval）——可移除条目（内联精确 +
+  // 命中引用列表精确条目）与不可移除的残余 CIDR 信任一次算清。原实现仅在
+  // 「无内联精确条目」时守卫；IP 同时由内联精确条目与引用 CIDR 信任时跳过
+  // 守卫，移除后仍持续信任却弹「已取消信任 / 恢复拦截」的谎报。
+  const plan = planTrustRemoval({
+    ip,
+    inlineWhitelist: row.policy.ip_whitelist,
+    whitelistRefs: row.policy.ip_whitelist_refs,
+    lists: ipLists.value,
+    removableListIds: row.removableTrustRefLists.map((m) => m.id),
+    listEntries: (id) => ipListEntries.value[id] ?? [],
+  })
+  const residualTrustSources = plan.residualSources
+  const exactRefLists = row.removableTrustRefLists.filter((m) => plan.exactRefListIds.includes(m.id))
+  const residualNote = residualTrustSources.length > 0
+    ? `；该 IP 仍由${residualTrustSources.join('、')}提供信任，需到策略/列表编辑中移除后才恢复拦截`
+    : ''
+  if (!plan.hasRemovable) {
     if (parseIPList(row.policy.ip_whitelist).some((e) => entryMatchesIp(e, ip))) {
       ElMessage.info('该 IP 由内联 CIDR 提供信任，请在策略编辑中移除对应条目')
     } else if (parseRefIds(row.policy.ip_whitelist_refs).some((id) => ipHitListIds.value.has(id))) {
@@ -632,7 +648,7 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
   try {
     try {
       await ElMessageBox.confirm(
-        `将把 ${props.ip} 从策略「${row.policy.name}」的信任名单（内联与全部引用列表）移除，黑名单/规则命中即恢复拦截。是否继续？`,
+        `将把 ${props.ip} 从策略「${row.policy.name}」的信任名单可移除条目（内联精确条目与命中引用列表的精确条目）移除${residualNote}。是否继续？`,
         '取消信任',
         { confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning' },
       )
@@ -647,7 +663,11 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
     for (const m of exactRefLists) {
       await request.post(`/security/ip-lists/${m.id}/remove-ip`, { value: props.ip })
     }
-    ElMessage.success(`已取消 ${props.ip} 对「${row.policy.name}」的信任`)
+    if (residualTrustSources.length > 0) {
+      ElMessage.warning(`已移除 ${props.ip} 的可移除信任条目；但该 IP 仍由${residualTrustSources.join('、')}提供信任，拦截尚未恢复`)
+    } else {
+      ElMessage.success(`已取消 ${props.ip} 对「${row.policy.name}」的信任`)
+    }
     invalidateSharedEntriesCache()
     await loadPolicies()
   } catch {

@@ -124,7 +124,10 @@ func (h *Handlers) GetAppLogs(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取日志失败: " + err.Error()})
 		return
 	}
-	data, err := io.ReadAll(f)
+	// B3-历史问题（历史）：Stat 与读取之间日志增长/文件被替换为 FIFO 时，
+	// 无界 io.ReadAll 会读入远超 maxBytes 的数据。与任务日志/证书任务日志
+	// 尾读同口径加上限（窗口本身 ≤128KB）。
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取日志失败: " + err.Error()})
 		return

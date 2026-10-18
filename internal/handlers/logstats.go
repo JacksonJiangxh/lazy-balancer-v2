@@ -103,6 +103,16 @@ func timestampedRotationStats(path string) (int64, int) {
 			continue
 		}
 		name := e.Name()
+		// B2-历史问题（历史）：整文件 gzip 归档 <base>.gz（如
+		// certjob-lb_x.log.gz）同属该文件的轮转副本——按规则/证书收窄路径
+		// (dirBytes) 此前漏计，与聚合路径展示分叉。
+		if name == base+".gz" {
+			if info, err := e.Info(); err == nil {
+				total += info.Size()
+				cnt++
+			}
+			continue
+		}
 		// 运行日志族(base 含 .log):rest = .YYYYMMDD-HHMMSS(16 字符)；
 		// B2-07（历史）：gzip 压缩副本 .YYYYMMDD-HHMMSS.gz 同族计入
 		// （此前漏计，与聚合路径分叉）。
@@ -287,18 +297,6 @@ func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[s
 		}
 	}
 	return "", false
-}
-
-// sanitizeRuleID 与写入侧 sanitizePathComponent / sanitizeRuleLogName 同口径，
-// 只保留 caddy_id 字母表 [A-Za-z0-9_-]，其余字符剔除。
-func sanitizeRuleID(value string) string {
-	out := make([]rune, 0, len(value))
-	for _, r := range value {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
-			out = append(out, r)
-		}
-	}
-	return string(out)
 }
 
 func globalConfigInt(column string, fallback int64) int64 {
@@ -647,21 +645,20 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		})
 	}
 	ruleID := strings.TrimSpace(c.Query("caddy_id"))
-	if ruleID != "" {
-		// caddy_id 仅允许 caddy_id 字母表（[A-Za-z0-9_-]）；读者侧与写入侧
-		// sanitizePathComponent/sanitizeRuleLogName 同口径校验，非法值（如路径穿越）
-		// 直接 400，绝不参与 filepath.Join 拼接。
-		if sanitized := sanitizeRuleID(ruleID); sanitized != ruleID {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的规则 ID"})
-			return
-		}
+	if ruleID != "" && (strings.ContainsAny(ruleID, "/\\") || ruleID == "." || ruleID == "..") {
+		// D1-历史问题（历史）：读侧不再要求「净化结果==原值」——写入端规则日志
+		// 文件名改为可逆编码（合法字母表原样、其余字符 %hex），含点等 v2 导入
+		// ID 的日志因此可读。这里只保留路径穿越形状的拒绝；文件名一律经
+		// services.RuleLogFileComponent 生成，输出恒为安全字符集。
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的规则 ID"})
+		return
 	}
 	if info := byKey("certjob"); info != nil && want("certjob") {
 		// 历史问题-02 读侧同源：与写入端 CertJobLogPath 同取 {任务日志目录}/certjobs
 		// （曾读写死 /app/logs 根——B3 惰性化后写入端已迁，不同源恒 0B）。
 		certJobDir := services.CertJobLogDir()
 		if ruleID != "" {
-			cjA, cjR, cjC := dirBytes(filepath.Join(certJobDir, "certjob-"+ruleID+".log"))
+			cjA, cjR, cjC := dirBytes(services.CertJobLogPath(ruleID))
 			info.SizeBytes, info.RotatedBytes, info.RotatedCount = cjA, cjR, cjC
 			info.Name = "证书任务日志 #" + ruleID
 		} else {
@@ -679,7 +676,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	}
 	if info := byKey("rule_access"); info != nil && want("rule_access") {
 		if ruleID != "" {
-			raA, raR, raC := dirBytes(filepath.Join(fixedLogsDir, "rules", ruleID+".log"))
+			raA, raR, raC := dirBytes(filepath.Join(fixedLogsDir, "rules", services.RuleLogFileComponent(ruleID)+".log"))
 			info.SizeBytes, info.RotatedBytes, info.RotatedCount = raA, raR, raC
 			info.Name = "访问日志 #" + ruleID
 		} else {

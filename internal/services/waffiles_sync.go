@@ -430,11 +430,8 @@ func rewriteVersionIfMissingOrStale(path, tag string) error {
 	if current, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(current)) == strings.TrimSpace(tag) {
 		return nil
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(tag), 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	// D1-历史问题：单源原子落盘（tmp+fsync+父目录 fsync）。
+	return writeFileAtomicSynced(path, []byte(tag), 0644)
 }
 
 func wafFilesRefDiffers(r *models.ClusterWafFilesRef) bool {
@@ -547,13 +544,9 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 			if got := hex.EncodeToString(sum[:]); got != bundle.IP2RegionSha {
 				return crsChanged, xdbChanged, threatChanged, newWafFileApplyError("xdb", fmt.Errorf("同步 IP2Region数据库哈希不匹配（声明 %s，实际 %s），已拒绝落盘", bundle.IP2RegionSha, got))
 			}
-			tmp := ip2regionLivePath + ".sync"
-			if err := os.WriteFile(tmp, bundle.Xdb, 0644); err != nil {
-				_ = os.Remove(tmp) // 历史 历史问题：ENOSPC 等中途失败不遗留半截 .sync
-				return crsChanged, xdbChanged, threatChanged, newWafFileApplyError("xdb", fmt.Errorf("写入同步 IP2Region数据库: %w", err))
-			}
-			if err := os.Rename(tmp, ip2regionLivePath); err != nil {
-				_ = os.Remove(tmp)
+			// D1-历史问题：单源原子落盘（tmp+fsync+父目录 fsync；临时文件点前缀，
+			// 不会被 waf bundle 打包）。
+			if err := writeFileAtomicSynced(ip2regionLivePath, bundle.Xdb, 0644); err != nil {
 				return crsChanged, xdbChanged, threatChanged, newWafFileApplyError("xdb", fmt.Errorf("落盘同步 IP2Region数据库: %w", err))
 			}
 			if tagErr := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", bundle.IP2RegionTag); tagErr != nil {
@@ -602,14 +595,10 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 		// 两个调用方（cluster_apply 的 aerr 分支 / lbbak 导入）err 路径均不
 		// 消费 changed 标志，无需逐 err 路径置回。
 		threatChanged = true
-		tmp := fastPath + ".tmp"
-		if err := os.WriteFile(tmp, tf.Content, 0644); err != nil {
-			_ = os.Remove(tmp) // 历史问题-2：写失败（ENOSPC 等）不遗留半截 .tmp
+		// D1-历史问题：单源原子落盘（tmp+fsync+父目录 fsync；临时文件点前缀，
+		// 不会被 waf bundle 打包）。
+		if err := writeFileAtomicSynced(fastPath, tf.Content, 0644); err != nil {
 			return crsChanged, xdbChanged, threatChanged, fmt.Errorf("写威胁库 .fast %s: %w", tf.Name, err)
-		}
-		if err := os.Rename(tmp, fastPath); err != nil {
-			os.Remove(tmp)
-			return crsChanged, xdbChanged, threatChanged, fmt.Errorf("rename 威胁库 .fast %s: %w", tf.Name, err)
 		}
 	}
 	return crsChanged, xdbChanged, threatChanged, nil

@@ -363,3 +363,34 @@ func TestSecurityEventsRetentionCleanup_trimsOldestWhenRowCapExceeded(t *testing
 		t.Fatalf("cleanup 返回已删=%d，want 2", deleted)
 	}
 }
+
+// A83A-历史问题（历史）：分钟事件高水位键与 rollup 同生命周期清理——
+// 写入侧每分钟一行 metrics_state，旧实现无任何删除点（1440 键/天常驻）。
+func TestSecurityEventsRetentionCleanup_prunesRollupHighwaterKeys(t *testing.T) {
+	setupSecurityEventsRetentionTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=30 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	oldMinute := time.Now().UTC().AddDate(0, 0, -40).Format("2006-01-02 15:04")
+	recentMinute := time.Now().UTC().Add(-time.Minute).Format("2006-01-02 15:04")
+	if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, '5'), (?, '7')`,
+		ThreatRollupEventHighwaterPrefix+oldMinute, ThreatRollupEventHighwaterPrefix+recentMinute); err != nil {
+		t.Fatal(err)
+	}
+
+	securityEventsRetentionCleanup(context.Background())
+
+	var oldCount, recentCount int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_state WHERE key=?`, ThreatRollupEventHighwaterPrefix+oldMinute).Scan(&oldCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_state WHERE key=?`, ThreatRollupEventHighwaterPrefix+recentMinute).Scan(&recentCount); err != nil {
+		t.Fatal(err)
+	}
+	if oldCount != 0 {
+		t.Fatalf("超过 rollup 保留期的高水位键未清理（count=%d）", oldCount)
+	}
+	if recentCount != 1 {
+		t.Fatalf("近期高水位键被误删（count=%d）", recentCount)
+	}
+}

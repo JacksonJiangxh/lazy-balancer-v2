@@ -10,8 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"strconv"
 	"strings"
 	"time"
 
@@ -81,12 +79,7 @@ func (s *ClusterService) GenerateLoginTicket(ctx context.Context, claims models.
 	mac := hmac.New(sha256.New, key)
 	_, _ = mac.Write([]byte(encodedPayload))
 	ticket := encodedPayload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	if protocol != "https" {
-		protocol = "http"
-	}
-	if accessURL == "" {
-		accessURL = protocol + "://" + net.JoinHostPort(ipAddress, strconv.Itoa(port))
-	}
+	accessURL = resolveNodeAccessURL(ipAddress, port, protocol, accessURL)
 	return models.ClusterLoginTicketResponse{Ticket: ticket, URL: accessURL, NodeName: nodeName}, nil
 }
 

@@ -95,11 +95,20 @@ func MaterializeBranding(dataDir, content string) error {
 		_ = temporary.Close()
 		return fmt.Errorf("写入品牌配置临时文件: %w", err)
 	}
+	// D1-历史问题：tmp+rename 缺 fsync 可留 0 字节品牌文件（与 certstore 原子写
+	// 同口径：临时文件 fsync + 父目录 fsync）。
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("同步品牌配置临时文件: %w", err)
+	}
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("关闭品牌配置临时文件: %w", err)
 	}
 	if err := os.Rename(temporaryPath, path); err != nil {
 		return fmt.Errorf("原子替换品牌配置文件: %w", err)
+	}
+	if err := syncParentDir(path); err != nil {
+		return fmt.Errorf("同步品牌配置目录: %w", err)
 	}
 	injectLandingFromBranding(content)
 	return nil
@@ -128,6 +137,34 @@ func applySnapshotBranding(dataDir, content string) {
 	} else {
 		RecordAuditLog("system", "同步", "集群同步", "品牌配置已同步生效", "")
 	}
+}
+
+// ReconcileBrandingFile 核对本地 branding.json 与 global_config.branding_json
+// 镜像，不一致（缺失/损坏/陈旧）时按镜像重写并注入 landing——零 Caddy 重载
+// （D2-历史问题）。从节点稳态 304 下 applySnapshot 不运行，品牌文件没有物化
+// 通道：文件被删除或损坏后会永久停留默认品牌，直到 users 节发生任意变更。
+// 返回是否发生重写；内容一致时为 false（零 mtime 扰动）。
+func ReconcileBrandingFile(dataDir string) (bool, error) {
+	if db.DB == nil || dataDir == "" {
+		return false, nil
+	}
+	var content string
+	if err := db.DB.QueryRow("SELECT COALESCE(branding_json,'') FROM global_config WHERE id=1").Scan(&content); err != nil {
+		return false, fmt.Errorf("读取品牌配置镜像: %w", err)
+	}
+	expected := content
+	if expected == "" {
+		// 与 applySnapshotBranding 同语义：镜像为空收敛为全空模板。
+		expected = emptyBrandingTemplate
+	}
+	path := filepath.Join(dataDir, "branding.json")
+	if actual, err := os.ReadFile(path); err == nil && string(actual) == expected {
+		return false, nil
+	}
+	if err := MaterializeBranding(dataDir, content); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // injectLandingFromBranding 从 branding JSON 原文提取 landing_text 并注入

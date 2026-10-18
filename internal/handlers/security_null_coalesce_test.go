@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -139,5 +140,28 @@ func TestSecurityEntityEndpoints_nullColumnsDoNot500(t *testing.T) {
 		if code == http.StatusInternalServerError {
 			t.Errorf("%s status=500（NULL 可空列不得拖垮端点）", endpoint)
 		}
+	}
+}
+
+// A83A-历史问题（历史）：事件列表投影补齐 COALESCE——rule_name/
+// policy_name/duration_us/precheck_us/request_headers/request_body 均为可空
+// 列（schema 仅 DEFAULT 无 NOT NULL），带外/异常写入显式 NULL 时旧实现整页 500。
+func TestListSecurityEvents_nullProjectionColumnsReturn200(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityEventsRouter(t)
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events
+		(event_time, client_ip, method, uri, event_type, rule_triggered, action,
+		 rule_name, policy_name, duration_us, precheck_us, request_headers, request_body)
+		VALUES ('2026-10-19 10:00:00', '203.0.113.9', 'GET', '/null', 'crs', '942100', 'blocked',
+		 NULL, NULL, NULL, NULL, NULL, NULL)`); err != nil {
+		t.Fatalf("seed null event: %v", err)
+	}
+
+	recorder := getRequest(t, router, "/security/events")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200（NULL 可空列按零值投影）", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"total":1`) {
+		t.Fatalf("body=%s, want total:1", recorder.Body.String())
 	}
 }

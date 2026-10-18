@@ -130,9 +130,6 @@ func persistDownloadIntegrityRecords(records map[string]downloadIntegrityRecord)
 	if err := os.MkdirAll(filepath.Dir(downloadIntegrityPath), 0o755); err != nil {
 		return err
 	}
-	tmp := downloadIntegrityPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, downloadIntegrityPath)
+	// D1-历史问题：tmp+rename 缺 fsync 可留下 0 字节记录（基线丢失/误重建）。
+	return writeFileAtomicSynced(downloadIntegrityPath, data, 0o644)
 }

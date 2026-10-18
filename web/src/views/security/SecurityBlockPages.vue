@@ -14,10 +14,20 @@
       </el-button>
     </div>
 
+    <el-alert v-if="loadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+      <template #title>
+        <div class="polling-error-title">
+          <span>拦截页面加载失败：列表为空不代表没有页面</span>
+          <el-button link type="danger" :loading="loading" @click="fetchData">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
+
     <el-card class="list-card">
       <el-table :data="pagedPages" v-loading="loading" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="">
         <template #empty>
-          <el-empty description="暂无拦截页面" :image-size="60" />
+          <el-empty v-if="!loadError" description="暂无拦截页面" :image-size="60" />
+          <span v-else class="text-secondary">加载失败</span>
         </template>
         <el-table-column prop="name" label="页面名称" min-width="180">
           <template #default="{ row }">
@@ -140,6 +150,8 @@ const pageSize = ref(10)
 const saving = ref(false)
 const users = ref<UserListItem[]>([])
 const pages = ref<BlockPage[]>([])
+// 历史问题-F5：拦截页加载失败不得显示「暂无拦截页面」（与真实空列表不可区分）
+const loadError = ref(false)
 // 分页夹紧+切片：useClampedPagination 单一范式（历史 历史问题，取代 computed
 // 内副作用赋值反模式）
 const { pagedItems: pagedPages } = useClampedPagination(pages, page, pageSize)
@@ -195,10 +207,16 @@ const fetchData = async () => {
       request.get<APIResponse<BlockPage[]>>('/security/block-pages'),
       request.get<APIResponse<UserListItem[]>>('/users'),
     ])
-    if (pagesRes.status === 'fulfilled') pages.value = pagesRes.value.data || []
+    if (pagesRes.status === 'fulfilled') {
+      pages.value = pagesRes.value.data || []
+      loadError.value = false
+    }
     if (usersRes.status === 'fulfilled') users.value = usersRes.value.data || []
     // 全局拦截器已弹 toast，这里仅记录（用户列失败时更新者显示 '-'）
-    if (pagesRes.status === 'rejected') console.error('Failed to load block pages:', pagesRes.reason)
+    if (pagesRes.status === 'rejected') {
+      console.error('Failed to load block pages:', pagesRes.reason)
+      loadError.value = true
+    }
     if (usersRes.status === 'rejected') console.error('Failed to load block page users:', usersRes.reason)
   } finally { loading.value = false }
 }

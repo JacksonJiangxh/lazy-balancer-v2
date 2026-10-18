@@ -59,6 +59,27 @@ func TestTrafficRecord_attackNormalBuckets(t *testing.T) {
 	}
 }
 
+// E83-历史问题：统计桶键与发射侧/校验侧同口径 TrimSpace——空白异形国名不得
+// 建出与正式国名并存的脏桶（前端会显示两个「中国」）。
+func TestTrafficRecord_trimsCountryKey(t *testing.T) {
+	resetTrafficState(t)
+	trafficRecord(" 中国 ", false)
+	trafficRecord("\t中国", true)
+
+	trafficMu.RLock()
+	defer trafficMu.RUnlock()
+	e := trafficCountries["中国"]
+	if e == nil || e.normal.Load() != 1 || e.attack.Load() != 1 {
+		t.Fatalf("trimmed bucket=%+v, want normal=1 attack=1", e)
+	}
+	if _, exists := trafficCountries[" 中国 "]; exists {
+		t.Fatal("带空白的国名不得建桶（与发射侧/校验侧口径分裂）")
+	}
+	if got := len(trafficCountries); got != 1 {
+		t.Fatalf("country buckets=%d, want 1（同一国家唯一桶）", got)
+	}
+}
+
 // E81-历史问题：xdb 私网/保留段行的国家列为 "0"/"Reserved"，不是国家值——计数桶
 // 与事件流都不得为其建键（聚合端点已过滤 ""/"0"/"Reserved"，两端口径统一）。
 func TestTrafficRecord_rejectsNonCountryKeys(t *testing.T) {

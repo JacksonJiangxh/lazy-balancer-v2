@@ -153,6 +153,11 @@ func ResetCAQueueManagerForTest() {
 	caQueueManagerOnce = sync.Once{}
 }
 
+// caCancelWaitTimeout 是取消/删除路径等待在途执行退出的整体上限（D1-历史问题）：
+// 逐 job 串行 30s 会让多任务挂起时 HTTP 调用方最坏等 N×30s。var 而非 const：
+// 测试注入缩短时限以覆盖超时路径，生产代码不得改写。
+var caCancelWaitTimeout = 30 * time.Second
+
 // CancelJob aborts an in-flight issuance for the given job across all
 // provider queues; deletion handlers call this before removing the row so a
 // worker cannot keep issuing and deploying after the job is gone.
@@ -187,11 +192,14 @@ func (m *CAQueueManager) CancelJob(jobID int) {
 	}
 	// 在途执行退出等待必须有界：issuer 执行若不响应 ctx 取消（如 DNS 传播轮询
 	// 异常路径），HTTP 调用方（DeleteCertJob 等）会被永久挂起（历史问题 历史问题）。
+	// 所有 done 共享一个截止时间（D1-历史问题），不做逐 job 串行等待。
+	deadline := time.After(caCancelWaitTimeout)
 	for _, executionDone := range done {
 		select {
 		case <-executionDone:
-		case <-time.After(30 * time.Second):
-			Logf("warn", "取消证书任务 %d：等待在途执行退出超时（30s），继续后续流程", jobID)
+		case <-deadline:
+			Logf("warn", "取消证书任务 %d：等待在途执行退出超时（%s），继续后续流程", jobID, caCancelWaitTimeout)
+			return
 		}
 	}
 }
@@ -229,16 +237,19 @@ func (m *CAQueueManager) CancelJobsForRule(ctx context.Context, ruleID string) e
 		cancel()
 	}
 	done = append(done, deploymentDone...)
-	// 在途执行退出等待除 ctx 外还需 30s 上限：客户端不断连时 ctx.Done 不触发，
-	// issuer 异常不响应取消会把 DeleteRule 等 HTTP 调用方永久挂起（历史问题 A-2，
-	// 与 CancelJob 的 30s 模式同款）。
+	// 在途执行退出等待除 ctx 外还需有界上限：客户端不断连时 ctx.Done 不触发，
+	// issuer 异常不响应取消会把 DeleteRule 等 HTTP 调用方永久挂起（历史问题 A-2）。
+	// 所有 done 共享一个截止时间（D1-历史问题）——逐 job 串行 30s 在规则多任务
+	// 挂起时最坏 N×30s。
+	deadline := time.After(caCancelWaitTimeout)
 	for _, executionDone := range done {
 		select {
 		case <-executionDone:
 		case <-ctx.Done():
 			return fmt.Errorf("等待规则 %s 的证书任务退出: %w", ruleID, ctx.Err())
-		case <-time.After(30 * time.Second):
-			Logf("warn", "取消规则 %s 证书任务：等待在途执行退出超时（30s），继续后续流程", ruleID)
+		case <-deadline:
+			Logf("warn", "取消规则 %s 证书任务：等待在途执行退出超时（%s），继续后续流程", ruleID, caCancelWaitTimeout)
+			return nil
 		}
 	}
 	return nil
@@ -1130,8 +1141,29 @@ func (q *caQueue) handleExecutionCancellation(execution queueExecution) {
 		return
 	}
 	if errors.Is(execution.ctx.Err(), context.DeadlineExceeded) {
-		failJob(execution.item.jobID, "证书签发执行超时")
+		handleExecutionTimeout(execution.item.jobID)
 	}
+}
+
+// handleExecutionTimeout 归类执行超时（DeadlineExceeded）的终态（历史问题-02，
+// 历史问题-02 同族未收敛点）：证书材料先于部署落库（Issue 的 downloaded 中间态），
+// 若超时发生在材料已落库之后，无条件 failJob 会把任务打成终态 failed——此时
+// 续期扫描（新证书不在窗口）、首发失败重试（有 expires_at）、部署补扫（只收
+// downloaded/cleanup_*）、启动恢复（终态跳过）、对账（只重建 issued/downloaded）
+// 全部不可达，新证书材料搁浅且 HTTPS 规则无 TLS。材料在身的部署生命周期任务
+// 保持可部署态并立即重排部署（30s 补扫/Resume 同口径接管）；无材料的失败维持
+// failJob 语义。
+func handleExecutionTimeout(jobID int) {
+	var status, certPEM, keyPEM string
+	if err := db.DB.QueryRow("SELECT status, COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id=?", jobID).Scan(&status, &certPEM, &keyPEM); err == nil {
+		if certPEM != "" && keyPEM != "" && JobLifecycle(status) == JobLifecycleDownloaded {
+			if _, err := db.DB.Exec("UPDATE cert_jobs SET deployment_available_after=datetime('now'), message='执行超时：证书材料已落库，等待重新部署' WHERE id=? AND status=?", jobID, status); err != nil {
+				Logf("error", "CA queue: failed to defer deployment retry for timed-out job %d: %v", jobID, err)
+			}
+			return
+		}
+	}
+	failJob(jobID, "证书签发执行超时")
 }
 
 func (q *caQueue) stop() {
@@ -1305,9 +1337,9 @@ func maxRenewalAttemptsMessage(message string, maxAttempts int) string {
 	return fmt.Sprintf("%s（%s %d，停止自动重试，可手动重试）", message, marker, maxAttempts)
 }
 
-// failJobTransition 是 failJob/failJobFromStatus 的共享实现（历史问题 历史）：
-// 二者唯一差异是允许的来源状态集合（fromSet），其余（尝试次数封顶文案、消息
-// 截断、UPDATE、留痕）完全同构。
+// failJobTransition 是失败终态迁移的共享实现（历史问题 历史；历史问题-06 起
+// failJobFromStatus 无调用方已删除，本函数唯一消费方为 failJob）：尝试次数
+// 封顶文案、消息截断、UPDATE、留痕。
 func failJobTransition(jobID int, fromSet []string, message string) {
 	if attempts := currentRenewalAttempts(jobID); attempts+1 >= GetCertRenewalAttempts() {
 		message = maxRenewalAttemptsMessage(message, GetCertRenewalAttempts())
@@ -1323,11 +1355,6 @@ func failJobTransition(jobID int, fromSet []string, message string) {
 // failJob 把任务标记为 failed（来源=任意非终态状态）。
 func failJob(jobID int, message string) {
 	failJobTransition(jobID, nonTerminalJobStatuses, message)
-}
-
-// failJobFromStatus 仅在任务处于 expectedStatus 时标记为 failed（CAS 语义）。
-func failJobFromStatus(jobID int, expectedStatus, message string) {
-	failJobTransition(jobID, []string{expectedStatus}, message)
 }
 
 // currentRenewalAttempts 读取任务当前续签失败次数（读取失败按 0 处理，

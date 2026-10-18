@@ -17,6 +17,18 @@ import (
 	"lazy-balancer-v2/internal/dnsprovider/ownership"
 )
 
+// logf 是包级日志接缝（历史问题-3，镜像 ownership/acme 同型接缝）：运维告警
+// 进入统一日志级别/格式链，而不是裸 log.Printf 另走一条链路。main 启动
+// 早期经 SetLogf 装配；零值回退标准库。
+var logf = func(level, format string, args ...any) { log.Printf(format, args...) }
+
+// SetLogf 装配包级日志函数（main 启动早期调用；nil 忽略）。
+func SetLogf(f func(level, format string, args ...any)) {
+	if f != nil {
+		logf = f
+	}
+}
+
 // ownedRecord 记录本实例创建的记录 ID 及其挑战值，CleanUpValue 据此只删
 // 属于本次签发的记录。
 type ownedRecord struct {
@@ -87,7 +99,7 @@ func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, t
 				// A-2（历史）：ownership.Add 失败且回滚删除亦失败——TXT 已落
 				// DNS，而 ownership 无条目可追踪。告警留痕 + 回填内存兜底表：
 				// cleanUp 的 ownership 分支会排空兜底表并重试删除，避免永久残留。
-				log.Printf("WARNING: tencent: 所有权写入失败且回滚删除失败，TXT %s (recordID=%d) 可能残留: %v", tokenFQDN, recordID, rollbackErr)
+				logf("warn", "tencent: 所有权写入失败且回滚删除失败，TXT %s (recordID=%d) 可能残留: %v", tokenFQDN, recordID, rollbackErr)
 				p.mu.Lock()
 				p.owned[zone+"|"+subDomain] = append(p.owned[zone+"|"+subDomain], ownedRecord{recordID: recordID, value: value})
 				p.mu.Unlock()

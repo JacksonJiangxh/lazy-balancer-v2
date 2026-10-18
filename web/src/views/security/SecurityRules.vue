@@ -39,14 +39,14 @@
         <el-table-column label="版本" width="120">
           <template #default="{ row }"><span class="lib-version">{{ row.version }}</span></template>
         </el-table-column>
-        <el-table-column label="条目数" width="110" align="right">
+        <el-table-column label="数量" width="110" align="right">
           <template #default="{ row }"><span class="lib-count">{{ row.count }}</span></template>
         </el-table-column>
         <el-table-column label="状态" width="110">
           <template #default="{ row }">
             <!-- 失败 hover 长文案已撤（2026-09-25 用户裁定）：用户直接看更新日志，
                  状态标签自身已表达失败态 -->
-            <el-tag :type="crsStatusTagType(row.status)" size="small" effect="light">{{ crsStatusLabel(row.status) }}</el-tag>
+            <el-tag :type="libraryStatusTagType(row.status)" size="small" effect="light">{{ libraryStatusLabel(row.status) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="自动更新" width="90" align="center">
@@ -98,11 +98,22 @@
           </div>
         </el-tab-pane>
       <el-tab-pane label="自定义规则" name="custom">
+            <el-alert v-if="customRulesError || usersError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+              <template #title>
+                <div class="polling-error-title">
+                  <span>{{ customRulesError ? '自定义规则加载失败：表格为空不代表没有规则' : '用户名册加载失败：更新者列显示为 -（规则数据不受影响）' }}</span>
+                  <el-button link type="danger" :loading="loadingCustom" @click="retryCustomRules">立即重试</el-button>
+                </div>
+              </template>
+            </el-alert>
             <div class="table-toolbar">
               <el-button v-if="!isReadOnly" type="primary" :icon="Plus" @click="openRuleDialog()">新建规则</el-button>
             </div>
             <el-table :data="customRulesPaged" v-loading="loadingCustom" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="">
-            <template #empty><el-empty description="暂无自定义规则" :image-size="60" /></template>
+            <template #empty>
+              <el-empty v-if="!customRulesError" description="暂无自定义规则" :image-size="60" />
+              <span v-else class="text-secondary">加载失败</span>
+            </template>
             <el-table-column prop="name" label="规则名称" min-width="150">
               <template #default="{ row }">
                 <el-link type="primary" @click="openRuleDialog(row)">{{ row.name }}</el-link>
@@ -144,12 +155,23 @@
           </div>
         </el-tab-pane>
         <el-tab-pane label="IP 地址列表" name="ip-lists">
+            <el-alert v-if="ipListsError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+              <template #title>
+                <div class="polling-error-title">
+                  <span>IP 地址列表加载失败：表格为空不代表没有名单</span>
+                  <el-button link type="danger" :loading="loadingIpLists" @click="retryIpLists">立即重试</el-button>
+                </div>
+              </template>
+            </el-alert>
           <div class="table-toolbar ip-list-toolbar">
             <el-input v-model="ipListSearch" placeholder="搜索名称或分类" clearable :prefix-icon="Search" class="search-input" />
             <el-button v-if="!isReadOnly" type="primary" :icon="Plus" @click="openIpListDialog()">新建列表</el-button>
           </div>
           <el-table :data="ipListsPaged" v-loading="loadingIpLists" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="">
-            <template #empty><el-empty description="暂无 IP 地址列表" :image-size="60" /></template>
+            <template #empty>
+              <el-empty v-if="!ipListsError" description="暂无 IP 地址列表" :image-size="60" />
+              <span v-else class="text-secondary">加载失败</span>
+            </template>
             <el-table-column prop="name" label="名称" min-width="150">
               <template #default="{ row }">
                 <el-link type="primary" @click="openIpListDialog(row)">{{ row.name }}</el-link>
@@ -497,7 +519,7 @@
         </el-table-column>
         <el-table-column label="状态" width="110">
           <template #default="{ row }">
-            <el-tag :type="crsStatusTagType(row.update_status)" size="small" effect="light">{{ crsStatusLabel(row.update_status) }}</el-tag>
+            <el-tag :type="libraryStatusTagType(row.update_status)" size="small" effect="light">{{ libraryStatusLabel(row.update_status) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="自动更新" width="90" align="center">
@@ -555,7 +577,7 @@
         </el-table-column>
         <el-table-column label="状态" width="110">
           <template #default="{ row }">
-            <el-tag :type="crsStatusTagType(row.update_status)" size="small" effect="light">{{ crsStatusLabel(row.update_status) }}</el-tag>
+            <el-tag :type="libraryStatusTagType(row.update_status)" size="small" effect="light">{{ libraryStatusLabel(row.update_status) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="自动更新" width="90" align="center">
@@ -592,7 +614,8 @@
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { Aim, Filter, List, Location, Lock, Search, Notebook, Plus, WarningFilled, Link } from '@element-plus/icons-vue'
 import { formatDate, parseDbTimeMs } from '@/utils/date'
-import { compareVersion, IP_LIST_CATEGORIES, invalidateSharedEntriesCache } from '@/utils/securityStages'
+import { IP_LIST_CATEGORIES, invalidateSharedEntriesCache } from '@/utils/securityStages'
+import { libraryHealthTag, librarySourceHealthTag, libraryStatusLabel, libraryStatusTagType, summarizeLibrarySources } from '@/utils/securityLibraries'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import RuleLibScheduleEditor from '@/components/RuleLibScheduleEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
@@ -697,7 +720,7 @@ const libRows = computed<LibRow[]>(() => {
       version: crsInfoError.value ? '—' : crsInfo.value.available === false ? '未安装' : (crsInfo.value.version || '—'),  // 缺失态文案与 IP 库统一「未安装」（2026-09-24 用户裁定）
       // 库容量=GET /security/crs 的 rule_count（服务端全量）；分页 total 只反映
       // 当前搜索条件下的结果集，二者不可共用（历史问题）。
-      count: crsInfoError.value || !crsInfo.value.rule_count ? '—' : crsInfo.value.rule_count.toLocaleString() + ' 文件',
+      count: crsInfoError.value || !crsInfo.value.rule_count ? '—' : crsInfo.value.rule_count.toLocaleString() + ' 个文件',
       status: crsInfoError.value ? 'failed' : crsInfo.value.available === false ? 'missing' : crsInfo.value.update_status,
       autoUpdate: crsInfo.value.auto_update,
       lastChecked: formatDate(crsInfo.value.last_checked) || '—',
@@ -707,27 +730,16 @@ const libRows = computed<LibRow[]>(() => {
       key: 'ip2region', icon: Location, iconClass: 'lib-icon--ip', name: 'IP 地理库', sub: 'IP 地理归属数据库',
       version: ip2regionInfoError.value ? '—' : ip2regionInfo.value.available === false ? '未安装' : ip2regionVersionLabel.value,
       count: !ip2regionInfoError.value && ip2regionInfo.value.db_size && ip2regionInfo.value.version && ip2regionInfo.value.version !== 'unknown' ? ip2regionInfo.value.db_size.toLocaleString() : '—',
-      status: ip2regionInfoError.value ? 'failed' : ip2regionInfo.value.available === false ? 'missing' : (ip2regionStatusForTag.value === 'not-installed' ? 'idle' : ip2regionStatusForTag.value),
+      status: ip2regionInfoError.value ? 'failed' : ip2regionInfo.value.available === false ? 'missing' : ip2regionStatusForTag.value,
       autoUpdate: ip2regionInfo.value.auto_update,
       lastChecked: formatDate(ip2regionInfo.value.last_checked) || '—',
       nextUpdate: formatDate(ip2regionInfo.value.next_update) || '—',
     },
   ]
-  // 威胁情报库与爬虫地址库共用「多源聚合成一行」的同一口径：
-  // 版本=最近更新日期，条目=源合计，状态=更新中>失败>成功>未更新。
-  const summarize = (srcs: ThreatSource[]) => {
-    const totalEntries = srcs.reduce((sum, x) => sum + x.entry_count, 0)
-    const latestVersion = srcs.map(x => x.version).filter(Boolean).sort(compareVersion).pop() || ''
-    const anyFailed = srcs.find(x => x.update_status === 'failed')
-    const anyRunning = srcs.some(x => x.update_status === 'running')
-    return {
-      totalEntries,
-      latestVersion,
-      status: anyRunning ? 'running' : anyFailed ? 'failed' : latestVersion ? 'success' : 'idle',
-      lastChecked: srcs.map(x => formatDate(x.last_checked)).filter(Boolean).sort().pop() || '—',
-      nextUpdate: srcs.map(x => formatDate(x.next_update)).filter(Boolean).sort().shift() || '—',
-    }
-  }
+  // 威胁情报库与爬虫地址库共用「多源聚合成一行」单源（历史问题-F2）：
+  // 与安全总览同一实现（utils/securityLibraries），空源/无版本为 never（未更新），
+  // 不再折叠为 idle「已最新」。
+  const summarize = (srcs: ThreatSource[]) => summarizeLibrarySources(srcs, formatDate)
   if (threatLibError.value || threatSources.value.length > 0) {
     const summary = threatLibError.value
       ? { totalEntries: 0, latestVersion: '', status: 'failed', lastChecked: '—', nextUpdate: '—' }
@@ -766,31 +778,22 @@ const libRows = computed<LibRow[]>(() => {
 // 卡头库健康标签组（2026-09-24 用户裁定）：逐库彩色标签，异常 danger/
 // 正常 success；缺库（后端渲染层已停用全部安全规则，见
 // SecurityLibrariesAvailable）时模板追加红色警示后缀。
-const libHealthTags = computed<Array<{ label: string; type: 'success' | 'danger' | 'warning' }>>(() => {
-  const tags: Array<{ label: string; type: 'success' | 'danger' | 'warning' }> = [
-    crsInfoError.value
-      ? { label: 'CRS 规则库 · 加载失败', type: 'danger' }
-      : crsInfo.value.available === false
-        ? { label: 'CRS 规则库 · 缺失', type: 'danger' }
-        : { label: 'CRS 规则库 · 正常', type: 'success' },
-    ip2regionInfoError.value
-      ? { label: 'IP 地理库 · 加载失败', type: 'danger' }
-      : ip2regionInfo.value.available === false
-        ? { label: 'IP 地理库 · 缺失', type: 'danger' }
-        : { label: 'IP 地理库 · 正常', type: 'success' },
-  ]
-  const sourceHealth = (srcs: ThreatSource[], label: string, loadError: boolean): { label: string; type: 'success' | 'warning' | 'danger' } => {
-    if (loadError) return { label: `${label} · 加载失败`, type: 'danger' }
-    const updating = srcs.some(x => x.update_status === 'running')
-    const failed = srcs.filter(x => x.update_status === 'failed').length
-    if (updating) return { label: `${label} · 更新中`, type: 'warning' }
-    if (failed > 0) return { label: `${label} · ${failed} 源更新失败`, type: 'warning' }
-    return { label: `${label} · 正常`, type: 'success' }
-  }
-  tags.push(sourceHealth(threatSources.value, '威胁情报库', threatLibError.value))
-  tags.push(sourceHealth(crawlerSources.value, '爬虫地址库', crawlerLibError.value))
-  return tags
-})
+const libHealthTags = computed(() => [
+  // 历史问题-F1/F2：健康标签单源（utils/securityLibraries）——IP 库未安装时
+  // 显示「未安装」警示，不再与版本列「未安装」/状态列「已最新」互相矛盾。
+  libraryHealthTag('CRS 规则库', {
+    loadError: crsInfoError.value,
+    available: crsInfo.value.available,
+    status: crsInfoError.value ? 'failed' : crsInfo.value.update_status,
+  }),
+  libraryHealthTag('IP 地理库', {
+    loadError: ip2regionInfoError.value,
+    available: ip2regionInfo.value.available,
+    status: ip2regionInfoError.value ? 'failed' : ip2regionStatusForTag.value,
+  }),
+  librarySourceHealthTag('威胁情报库', threatSources.value, threatLibError.value),
+  librarySourceHealthTag('爬虫地址库', crawlerSources.value, crawlerLibError.value),
+])
 const libSummaryWarn = computed(() => crsInfo.value.available === false || ip2regionInfo.value.available === false)
 
 // 自动更新开关：按行分发到三个库的既有端点（开关状态以服务端为准，
@@ -909,30 +912,6 @@ const getUpdaterName = (userId?: number) => {
   return user?.display_name || user?.username || '-'
 }
 
-const crsStageLabels: Record<string, string> = {
-  running: '更新中',
-  checking: '检查更新',
-  downloading: '下载规则库',
-  installing: '安装规则库',
-  reloading: '重载配置',
-  success: '已最新',
-  failed: '更新失败',
-  idle: '已最新',
-}
-const crsStatusLabel = (s: string): string => s === 'missing' ? '缺失' : (crsStageLabels[s] || s || '—')
-
-const crsStatusTagType = (s: string): 'success' | 'warning' | 'danger' | 'info' => {
-  if (s === 'missing') return 'danger'
-  if (!s || s === 'idle') return 'info'
-  if (s === 'checking' || s === 'downloading' || s === 'installing' || s === 'reloading' || s === 'running') return 'warning'
-  if (s === 'success' || s === '已最新') return 'success'
-  if (s === 'failed' || s === '更新失败') return 'danger'
-  if (s.includes('失败') || s.includes('错误')) return 'danger'
-  if (s.includes('最新')) return 'success'
-  if (s.includes('中')) return 'warning'
-  return 'info'
-}
-
 const crsInfo = ref({ version: '', auto_update: true, updated_at: '', last_checked: '', next_update: '', update_status: '', message: '', available: true, rule_count: 0, schedule_days: [1, 2, 3, 4, 5, 6, 7] as number[], schedule_time: '04:00' })
 
 const ip2regionInfo = ref({ version: '', db_size: 0, auto_update: true, updated_at: '', last_checked: '', next_update: '', update_status: '', message: '', available: true, schedule_days: [1, 2, 3, 4, 5, 6, 7] as number[], schedule_time: '04:00' })
@@ -965,6 +944,8 @@ const currentFilename = ref('')
 const currentContent = ref('')
 
 const customRules = ref<CustomRule[]>([])
+// 历史问题-F5：列表加载失败显性化（原空 catch，失败与「暂无自定义规则」不可区分）
+const customRulesError = ref(false)
 const customPage = ref(1)
 const customPageSize = ref(10)
 // 分页夹紧+切片：useClampedPagination 单一范式（历史 历史问题）——删除末页
@@ -1015,10 +996,18 @@ const editingIpListId = ref<number | null>(null)
 const savingIpList = ref(false)
 const ipListForm = ref<{ name: string; description: string; category: string; entries: IPListEntry[] }>({ name: '', description: '', category: '', entries: [] })
 
+const ipListsError = ref(false)
 const fetchIpLists = async () => {
   loadingIpLists.value = true
-  try { const res = await request.get<APIResponse<IPListRow[]>>('/security/ip-lists'); ipLists.value = res.data || [] } catch {} finally { loadingIpLists.value = false }
+  try {
+    const res = await request.get<APIResponse<IPListRow[]>>('/security/ip-lists')
+    ipLists.value = res.data || []
+    ipListsError.value = false
+  } catch {
+    ipListsError.value = true
+  } finally { loadingIpLists.value = false }
 }
+const retryIpLists = (): void => { void fetchIpLists() }
 
 const editingIpListSystem = ref(false)
 const loadingIpListDetail = ref(false)
@@ -1329,6 +1318,15 @@ const regexTestStrings = ref<Record<number, string>>({})
 const uaCollapsed = ref<Record<number, boolean>>({})
 const regexCollapsed = ref<Record<number, boolean>>({})
 
+// 历史问题-F8：三个按条件下标索引的会话态必须在每次打开弹框时清空——原实现跨
+// 规则复用，先编辑规则 A 输入测试串再打开规则 B，同下标条件会显示 A 的测试串
+// 与「匹配/不匹配」结果，误导正则调试。
+const resetRuleDialogSession = (): void => {
+  regexTestStrings.value = {}
+  uaCollapsed.value = {}
+  regexCollapsed.value = {}
+}
+
 const regexResultClass = (cond: CustomRuleCondition, idx: number): string => {
   if (!cond.pattern) return ''
   const { re, valid } = buildJSRegex(cond.pattern)
@@ -1453,8 +1451,32 @@ const fetchRules = async () => {
     if (requestSeq === rulesRequestSeq) loadingRules.value = false
   }
 }
-const fetchCustomRules = async () => { loadingCustom.value = true; try { const res = await request.get<APIResponse<CustomRule[]>>('/security/custom-rules'); customRules.value = res.data || [] } catch {} finally { loadingCustom.value = false } }
-const fetchUsers = async () => { try { const res = await request.get<APIResponse<UserListItem[]>>('/users'); users.value = res.data || [] } catch {} }
+const fetchCustomRules = async () => {
+  loadingCustom.value = true
+  try {
+    const res = await request.get<APIResponse<CustomRule[]>>('/security/custom-rules')
+    customRules.value = res.data || []
+    customRulesError.value = false
+  } catch {
+    customRulesError.value = true
+  } finally { loadingCustom.value = false }
+}
+const retryCustomRules = (): void => {
+  void fetchCustomRules()
+  if (usersError.value) void fetchUsers()
+}
+// 历史问题-F5：用户名册失败只影响「更新者」列（显示 '-'），不冒充规则数据空态——
+// 与自定义规则错误共用横幅但文案区分。
+const usersError = ref(false)
+const fetchUsers = async () => {
+  try {
+    const res = await request.get<APIResponse<UserListItem[]>>('/users')
+    users.value = res.data || []
+    usersError.value = false
+  } catch {
+    usersError.value = true
+  }
+}
 
 let ruleContentSeq = 0
 const openRuleContent = async (row: CRSRuleFile) => {
@@ -1590,6 +1612,7 @@ const {
 } = ip2regionDialog
 
 const openRuleDialog = (row?: CustomRule) => {
+  resetRuleDialogSession()
   editingRuleId.value = row?.id ?? null
   if (row) {
     // 存量空条件规则：自动补一条空条件行，让用户可见地修正而非卡在无法保存的死角

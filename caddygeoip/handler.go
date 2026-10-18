@@ -261,25 +261,52 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	if err != nil || region == "" {
 		return
 	}
-	fields := strings.Split(region, "|")
-	if len(fields) < 5 {
+	emitted, ok := parseGeoIPRegion(region)
+	if !ok {
 		return
 	}
-	caddyhttp.SetVar(ctx, "geoip.country_name", fields[0])
-	caddyhttp.SetVar(ctx, "geoip.region", region)
-	r.Header.Set("X-LB-GeoIP-Country", fields[0])
-	r.Header.Set("X-LB-GeoIP-Region", region)
-	// 历史问题(历史):上方 :179 已保证 len(fields)>=5,原两处 len>=3 守卫
+	province, city = emitted.Province, emitted.City
+	caddyhttp.SetVar(ctx, "geoip.country_name", emitted.Country)
+	caddyhttp.SetVar(ctx, "geoip.region", emitted.Region)
+	r.Header.Set("X-LB-GeoIP-Country", emitted.Country)
+	r.Header.Set("X-LB-GeoIP-Region", emitted.Region)
+	caddyhttp.SetVar(ctx, "geoip.province", province)
+	r.Header.Set("X-LB-GeoIP-Province", province)
+	caddyhttp.SetVar(ctx, "geoip.city", city)
+	r.Header.Set("X-LB-GeoIP-City", city)
+	// X-LB-GeoIP-Loc：地域规则匹配键（coraza SecRule 的锚定正则全值目标）。
+	r.Header.Set("X-LB-GeoIP-Loc", emitted.Loc)
+}
+
+// geoIPRegionFields 是 xdb region 行的发射侧投影：变量、X-LB-GeoIP-* 头与
+// 流量统计桶全部消费同一份归一值，避免多路径各自取原始列造成口径漂移。
+type geoIPRegionFields struct {
+	Country  string // xdb 国家列（TrimSpace 归一）
+	Region   string // xdb 原始 region 串（region 变量/头沿用）
+	Province string // 省列规范化值
+	City     string // 城市列规范化值
+	Loc      string // 地域规则匹配键
+}
+
+// parseGeoIPRegion 把 xdb region 行解析为发射字段（E83-历史问题）。
+// 国家列统一 TrimSpace——E83-历史问题 前变量/头发射原始列，而 geoipLocFor 与
+// geoipnames.NormalizeCountry 都 TrimSpace：空白异形行（" 中国"）会出现
+// Loc=广东省 但 country_name=" 中国" 的自相矛盾取值，统计桶也建成脏键。
+func parseGeoIPRegion(region string) (geoIPRegionFields, bool) {
+	fields := strings.Split(region, "|")
+	if len(fields) < 5 {
+		return geoIPRegionFields{}, false
+	}
+	out := geoIPRegionFields{Country: strings.TrimSpace(fields[0]), Region: region}
+	// 历史问题(历史):上方 len(fields)>=5 已保证,原两处 len>=3 守卫
 	// 恒真,直接执行块内逻辑。
 	if raw := fields[1]; raw != "" && raw != "0" {
 		// 历史问题 二十三次：省列规范化——xdb 存在双形态（上海/上海市）与
 		// 台湾城市误入省列；规范表已单源收敛进 geoipnames 包（选项树侧
 		// ProvinceForTree / 发射侧 ProvinceForEmit 同表驱动，见 region.go），
 		// 发射变量与选项树同规范化后 CEL 等值匹配才成立。
-		province = normalizeProvince(raw)
+		out.Province = normalizeProvince(raw)
 	}
-	caddyhttp.SetVar(ctx, "geoip.province", province)
-	r.Header.Set("X-LB-GeoIP-Province", province)
 	// 历史问题 二十三次：市级粒度——region 第 3 列为城市；无效值（空/0）置空串，
 	// 使 CEL {http.vars.geoip.city} == X 对无城市段恒不命中。
 	// 历史问题 二十五次：城市列经 normalizeCity 规范化——xdb 部分段城市列为拼音/
@@ -288,15 +315,13 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	// 台湾城市误入省列的段：城市名在省列（城市列是该段的乱码罗马化值）——
 	// 城市变量改发省列值，与树侧归并语义一致，使「台湾省/台中市」可命中。
 	if rawProv := strings.TrimSpace(fields[1]); geoipnames.TaiwanCities[rawProv] {
-		city = rawProv
+		out.City = rawProv
 	} else if c := strings.TrimSpace(fields[2]); c != "" && c != "0" {
-		city = normalizeCity(c)
+		out.City = normalizeCity(c)
 	}
-	caddyhttp.SetVar(ctx, "geoip.city", city)
-	r.Header.Set("X-LB-GeoIP-City", city)
-	// X-LB-GeoIP-Loc：地域规则匹配键（coraza SecRule 的锚定正则全值目标）。
 	// geoipLocFor 承载三态判定（X4 历史抽出可钉）。
-	r.Header.Set("X-LB-GeoIP-Loc", geoipLocFor(fields[0], province, city))
+	out.Loc = geoipLocFor(fields[0], out.Province, out.City)
+	return out, true
 }
 
 // geoipLocFor 由 xdb 国家列与规范化省/市列计算 X-LB-GeoIP-Loc 值：

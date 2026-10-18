@@ -24,6 +24,15 @@
       </div>
     </div>
 
+    <el-alert v-if="loadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+      <template #title>
+        <div class="polling-error-title">
+          <span>API 密钥加载失败：密钥列表为空不代表没有密钥</span>
+          <el-button link type="danger" @click="fetchKeys">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
+
     <el-row v-loading="loading" :gutter="20">
       <el-col v-for="key in keys" :key="key.id" :span="8" class="key-col">
         <el-card class="key-card" shadow="hover" :class="{ 'key-card-disabled': !key.is_enabled }">
@@ -93,7 +102,7 @@
       </el-col>
     </el-row>
 
-    <el-card v-if="!loading && keys.length === 0" class="empty-card">
+    <el-card v-if="!loading && keys.length === 0 && !loadError" class="empty-card">
       <el-empty description="暂无 API 密钥" :image-size="80" />
     </el-card>
 
@@ -376,6 +385,8 @@ const isAdmin = computed(() => authStore.user?.role === 'admin')
 
 const keys = ref<readonly APIKey[]>([])
 const loading = ref(false)
+// 历史问题-F5：加载失败不得呈现为「暂无 API 密钥」——显性错误态 + 重试
+const loadError = ref(false)
 const creating = ref(false)
 const createDialogVisible = ref(false)
 const createNameError = ref('')
@@ -441,11 +452,15 @@ const fetchKeys = async () => {
   loading.value = true
   try {
     const res = await request.get<APIResponse<readonly APIKey[]>>('/users/me/api-keys')
-    if (requestSeq === keysRequestSeq) keys.value = res.data || []
+    if (requestSeq === keysRequestSeq) {
+      keys.value = res.data || []
+      loadError.value = false
+    }
   } catch (error: unknown) {
     // Error toast is already shown by the global axios interceptor; swallow here
     // so fire-and-forget refresh calls don't surface as unhandled rejections.
     console.error('Failed to fetch keys:', error)
+    if (requestSeq === keysRequestSeq) loadError.value = true
   } finally {
     if (requestSeq === keysRequestSeq) loading.value = false
   }

@@ -58,7 +58,14 @@ func (s *SyncService) Report(ctx context.Context) error {
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cert_jobs WHERE status IN ('issued','downloaded','failed','cleanup_dns','cleanup_warning') AND expires_at IS NOT NULL AND datetime(expires_at)<=datetime('now','+`+expiryModifier+` days')`).Scan(&expiringCount); err != nil {
 		return fmt.Errorf("统计即将到期证书: %w", err)
 	}
-	_, caddyErr := s.caddy.GetConfig()
+	// D2-历史问题：构造契约允许 caddy=nil（测试/独立运维路径）；nil 下按
+	// 「不可判定 → degraded，CaddyOK=false」上报，而不是解引用 panic。
+	var caddyErr error
+	if s.caddy == nil {
+		caddyErr = errors.New("Caddy 服务未初始化")
+	} else {
+		_, caddyErr = s.caddy.GetConfig()
+	}
 	serviceStatus := "ok"
 	if caddyErr != nil || lastSyncError != "" {
 		serviceStatus = "degraded"

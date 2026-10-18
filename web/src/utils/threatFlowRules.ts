@@ -27,6 +27,20 @@ export function flowTimestamp(value: string): number {
   return Number.isFinite(t) ? t : NaN
 }
 
+/** 增量批次动效（流光/弹框）的实时性上限（历史问题-03）：入库延迟/轮转回填会把
+ *  数小时前的事件塞进增量批次，直接绘制会表现为「正在发生」。列表仍按窗口展示。 */
+export const FLOW_REALTIME_MAX_AGE_MS = 5 * 60_000
+
+/** 事件时间是否属于可绘制为实时攻击的新鲜事件（不可解析时间一律视为不新鲜）。 */
+export function isRealtimeFlowEvent(
+  eventTime: string | undefined,
+  now = Date.now(),
+  maxAgeMs = FLOW_REALTIME_MAX_AGE_MS,
+): boolean {
+  const ts = flowTimestamp(eventTime ?? '')
+  return Number.isFinite(ts) && now - ts <= maxAgeMs
+}
+
 /** 攻击只按地域聚合；中国精确到省（地图/地球同一口径）。 */
 export function flowRegionKey(ipLocation: string | undefined): string {
   if (!ipLocation) return '未知'

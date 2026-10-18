@@ -10,6 +10,7 @@ import {
   flowGroupEvents,
   flowRegionKey,
   flowTimestamp,
+  isRealtimeFlowEvent,
   nextAdaptiveSampleN,
   nextFlowCursor,
   reconstructObservedRate,
@@ -131,4 +132,21 @@ test('历史问题-5：采集租约重置后游标回零，正常递增与缺失
   assert.equal(nextFlowCursor(500, { enabled: true, next_seq: 501 }), 501)
   assert.equal(nextFlowCursor(500, { enabled: true, next_seq: 500 }), 500)
   assert.equal(nextFlowCursor(500, { enabled: true }), 500)
+})
+
+
+test('历史问题-03：增量批次动效实时性门——回填/延迟到达的历史事件不得冒充实时攻击', () => {
+  const now = Date.parse('2026-10-19T12:00:00Z')
+  // 新鲜：2 分钟前 / 边界 5 分钟前
+  assert.equal(isRealtimeFlowEvent('2026-10-19 11:58:00', now), true)
+  assert.equal(isRealtimeFlowEvent('2026-10-19 11:55:00', now), true)
+  // 陈旧：5 分 1 秒前 / 数小时前（轮转回填）
+  assert.equal(isRealtimeFlowEvent('2026-10-19 11:54:59', now), false)
+  assert.equal(isRealtimeFlowEvent('2026-10-19 03:00:00', now), false)
+  // 无法解析的时间不得绘制为实时
+  assert.equal(isRealtimeFlowEvent('', now), false)
+  assert.equal(isRealtimeFlowEvent(undefined, now), false)
+  assert.equal(isRealtimeFlowEvent('not-a-date', now), false)
+  // RFC3339 与 DB 墙钟串同口径（均按 UTC）
+  assert.equal(isRealtimeFlowEvent('2026-10-19T11:59:30Z', now), true)
 })

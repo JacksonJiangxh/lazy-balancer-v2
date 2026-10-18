@@ -109,6 +109,14 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("写入 IP 名单文件失败 %s: %w", name, err)
 	}
+	// D1-历史问题：tmp+rename 缺 fsync 时掉电/内核崩溃可留下 0 字节投影文件——
+	// wafiplist 对空文件按「永不命中」接受，deny/blacklist 语义即静默 fail-open。
+	// 与 certstore 的原子写同口径：临时文件落盘 + 父目录 fsync 后 rename 生效。
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return "", fmt.Errorf("同步 IP 名单文件失败 %s: %w", name, err)
+	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("关闭 IP 名单临时文件失败 %s: %w", name, err)
@@ -116,6 +124,9 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("原子替换 IP 名单文件失败 %s: %w", name, err)
+	}
+	if err := syncParentDir(path); err != nil {
+		return "", fmt.Errorf("同步 IP 名单目录失败 %s: %w", name, err)
 	}
 	return path, nil
 }

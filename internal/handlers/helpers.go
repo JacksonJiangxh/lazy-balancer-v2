@@ -214,6 +214,16 @@ func tlsCertificateWarnings(certPEM, keyPEM, domain string) []string {
 			}
 		}
 	}
+	// B2-历史问题（历史）：有效期同样以非阻断警告呈现——过期/未生效的自
+	// 手动证书允许先落库后轮换（管理面板 TLS 上传仍硬拒），但保存/导入审计
+	// 与响应 warnings 必须显式可见。此前 parseTLSCertificate 已算出 Warning，
+	// 规则保存路径却丢弃未用。
+	now := time.Now()
+	if now.After(leaf.NotAfter) {
+		warnings = append(warnings, "证书已过期 (过期时间: "+leaf.NotAfter.In(services.CurrentLocation()).Format("2006-01-02")+")")
+	} else if now.Before(leaf.NotBefore) {
+		warnings = append(warnings, "证书尚未生效 (生效时间: "+leaf.NotBefore.In(services.CurrentLocation()).Format("2006-01-02")+")")
+	}
 	for _, name := range strings.Split(domain, ",") {
 		name = strings.TrimSpace(name)
 		if name == "" {

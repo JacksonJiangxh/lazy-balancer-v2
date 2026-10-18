@@ -209,9 +209,10 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		} else if m.Kind == taskengine.KindDaemon {
 			if m.Running {
 				ti.Status = TaskStatusRunning
-			} else if m.LoopOn && latestRun != nil && latestRun.Status == "failed" {
-				// 历史问题-04：调度开但 Run 已死（有界重拉窗口/次数用尽）——必须
-				// 呈现 failed。修复前恒 idle「空闲」，采集/签发永久停摆无信号。
+			} else if (m.LoopOn || m.RestartExhausted) && latestRun != nil && latestRun.Status == "failed" {
+				// 历史问题-04 + 历史问题-03：Run 已死（有界重拉窗口）或自愈预算
+				// 用尽（此时 LoopOn=false，与用户主动停止同形）——必须呈现
+				// failed。修复前恒 idle「空闲」，采集/签发永久停摆无信号。
 				ti.Status = TaskStatusFailed
 			} else {
 				ti.Status = TaskStatusIdle // 未跑=空闲（调度关由开关列表达）

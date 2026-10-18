@@ -70,6 +70,12 @@ func (h *Handlers) ListSecurityCustomRules(c *gin.Context) {
 }
 
 func validateSecurityCustomRule(rule *models.SecurityCustomRule) error {
+	// 历史问题-01（历史）：负 ID 发射 id:crID+10000 会生成重复（id:10 撞
+	// body processor）或负 SecRule id，整份 coraza 配置被拒——本函数是
+	// Create/Update/导入三路径的单一收口点，在此拒绝（发射侧另有兜底跳过）。
+	if rule.ID < 0 {
+		return fmt.Errorf("规则 id 不能为负数")
+	}
 	if strings.TrimSpace(rule.Name) == "" {
 		return fmt.Errorf("规则名称不能为空")
 	}
@@ -2063,7 +2069,11 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 	// 策略编辑页共用此端点，操作人/具体改了什么/IP 是什么必须在日志可追溯；
 	// 同值全量提交（编辑页未改点保存）落「（无字段变化）」而非全字段噪音。
 	var policyName string
-	_ = tx.QueryRowContext(c.Request.Context(), "SELECT name FROM security_policies WHERE id=?", id).Scan(&policyName)
+	// 历史问题（历史）：策略名读取失败不得静默——审计详情会退化为
+	// 「策略「」(#id)」，操作人/对象归因不可读；与同域失败留痕口径一致。
+	if err := tx.QueryRowContext(c.Request.Context(), "SELECT name FROM security_policies WHERE id=?", id).Scan(&policyName); err != nil {
+		services.Logf("warn", "更新策略 #%s 审计名读取失败（审计详情以空名记录）: %v", id, err)
+	}
 	auditDetail := fmt.Sprintf("策略「%s」(#%s)", policyName, id)
 	var changedFields []string
 	if storedFound {
@@ -2559,14 +2569,17 @@ func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
-	if len(req.Bind)+len(req.Unbind) > maxBulkBindings {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("单次最多提交 %d 条规则", maxBulkBindings)})
-		return
-	}
 	// 规则 id 归一（TrimSpace）+ 去重（历史 NEW-3）：空白/重复 id 不得进入
 	// 校验与写入；去重后的集合同时作为两道规则级门与写入的输入。
 	bindIDs := normalizeRuleIDs(req.Bind)
 	unbindIDs := normalizeRuleIDs(req.Unbind)
+	// 历史问题（历史）：数量上限按**归一后**集合判定——同端点其余校验
+	// （冲突检测、计数、规则级门）都用归一后集合；先按原始长度判定会让 101 个
+	// 重复/空白项（归一后仅 1 条规则）被误拒。
+	if len(bindIDs)+len(unbindIDs) > maxBulkBindings {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("单次最多提交 %d 条规则", maxBulkBindings)})
+		return
+	}
 	// 禁止同一规则同时出现在 bind 与 unbind（语义冲突）。
 	unbindSet := make(map[string]struct{}, len(unbindIDs))
 	for _, id := range unbindIDs {
@@ -3413,6 +3426,13 @@ func ruleTriggeredPartStructured(input string) bool {
 	if input == "WAF 规则（CRS）" || strings.HasPrefix("WAF 规则（CRS）", input) {
 		return true
 	}
+	// 历史问题（历史）：前端事件页多选筛选值为「WAF·CRS」（SecurityEvents.vue
+	// 筛选项/triggeredLabel），旧实现只识别显示标签「WAF 规则（CRS）」——多值任一段
+	// 不可结构化即整串回退字面量 LIKE，而 rule_triggered 只存规则 ID，查询恒空
+	// （正向）/排除失效（反向）。两个标签必须同等结构化。
+	if input == "WAF·CRS" || strings.HasPrefix("WAF·CRS", input) {
+		return true
+	}
 	if _, ok := ruleTriggeredFamilyPrefixes[input]; ok {
 		return true
 	}
@@ -3437,18 +3457,25 @@ func ruleTriggeredMultiFilterSQL(input string, args *[]any) string {
 	if !strings.Contains(input, ",") {
 		return ruleTriggeredFilterSQL(input, args)
 	}
-	parts := strings.Split(input, ",")
+	// 历史问题（历史）：尾随/连续逗号产生的空段必须先剔除——空段不可
+	// 结构化会令整串回退字面量 LIKE（静默错结果），而不是按剩余有效段 OR。
+	rawParts := strings.Split(input, ",")
+	parts := make([]string, 0, len(rawParts))
+	for _, p := range rawParts {
+		if p = strings.TrimSpace(p); p != "" {
+			parts = append(parts, p)
+		}
+	}
+	if len(parts) == 0 {
+		return ruleTriggeredFilterSQL(input, args)
+	}
 	for _, p := range parts {
-		if !ruleTriggeredPartStructured(strings.TrimSpace(p)) {
+		if !ruleTriggeredPartStructured(p) {
 			return ruleTriggeredFilterSQL(input, args)
 		}
 	}
 	ors := make([]string, 0, len(parts))
 	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
 		ors = append(ors, ruleTriggeredFilterSQL(p, args))
 	}
 	if len(ors) == 0 {
@@ -3503,8 +3530,15 @@ func ruleTriggeredFilterSQL(input string, args *[]any) string {
 		matched = true
 		ors = append(ors, wafCRSCondition)
 	}
+	// 历史问题（历史）：紧凑标签「WAF·CRS」的部分输入同样宽匹配——否则
+	// 「WAF·」只命中前缀集为空的「WAF·自定义」，ors 为空时拼出 `AND ()` 令
+	// SQLite 语法错误（ListSecurityEvents 500）。
+	if strings.HasPrefix("WAF·CRS", input) {
+		matched = true
+		ors = append(ors, wafCRSCondition)
+	}
 	if matched {
-		if strings.HasPrefix("自定义规则", input) {
+		if strings.HasPrefix("自定义规则", input) || strings.HasPrefix("WAF·自定义", input) {
 			ors = append(ors, customRuleFamilyCondition)
 		}
 		if strings.HasPrefix("地域拦截", input) {
@@ -3513,7 +3547,11 @@ func ruleTriggeredFilterSQL(input string, args *[]any) string {
 		if strings.HasPrefix("爬虫Bot", input) {
 			ors = append(ors, crawlerFamilyCondition)
 		}
-		return "(" + strings.Join(ors, " OR ") + ")"
+		if len(ors) > 0 {
+			return "(" + strings.Join(ors, " OR ") + ")"
+		}
+		// 前缀命中的 family 前缀集为空且无可并入的形态条件：不得返回 "()"，
+		// 落到下方消息关键词路径（保守但语法合法）。
 	}
 	// 纯数字输入（CRS 规则 ID）：「精确 OR 前缀」匹配避免双 % 全字段扫描；
 	// 其余按消息关键词双 LIKE（rule_msg 无结构可言）。
@@ -3687,8 +3725,11 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 	}
 
 	queryArgs := append(args, pageSize, offset)
-	rows, err := db.MetricsDB.Query(`SELECT e.id, e.event_time, e.rule_caddy_id, e.policy_id, e.client_ip, e.method, e.uri, e.event_type, e.rule_triggered, e.rule_msg, e.action, COALESCE(e.anomaly_score, 0),
-		e.rule_name, e.policy_name, e.duration_us, e.precheck_us, e.request_headers, e.request_body
+	// 历史问题（历史）：事件表这些列 schema 可空（仅 DEFAULT、无 NOT NULL），
+	// 带外/异常写入显式 NULL 会让整页 500——列表投影统一 COALESCE，与策略/拦截页/
+	// 自定义规则的 NULL 容忍口径一致（security_null_coalesce_test.go）。
+	rows, err := db.MetricsDB.Query(`SELECT e.id, e.event_time, COALESCE(e.rule_caddy_id,''), COALESCE(e.policy_id,0), COALESCE(e.client_ip,''), COALESCE(e.method,''), COALESCE(e.uri,''), COALESCE(e.event_type,''), COALESCE(e.rule_triggered,''), COALESCE(e.rule_msg,''), COALESCE(e.action,''), COALESCE(e.anomaly_score, 0),
+		COALESCE(e.rule_name,''), COALESCE(e.policy_name,''), COALESCE(e.duration_us,0), COALESCE(e.precheck_us,0), COALESCE(e.request_headers,''), COALESCE(e.request_body,'')
 		FROM security_events e`+where+" ORDER BY e.event_time DESC, e.id DESC LIMIT ? OFFSET ?", queryArgs...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})

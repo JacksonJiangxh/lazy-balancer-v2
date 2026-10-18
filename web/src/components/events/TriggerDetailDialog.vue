@@ -60,6 +60,13 @@
           <div v-if="allHitLists.length === 0 && !inlineAclHit && kind === 'acl' && !isAllowOutside" class="trg-tip">未定位到命中的地址列表（策略名单可能已变更；事件为历史记录）</div>
         </template>
 
+        <!-- 爬虫校验：验证结果与豁免引擎（v2.3.8 独立族，不再误标地域） -->
+        <template v-else-if="kind === 'crawler'">
+          <div class="trg-kv"><span class="k">判定</span><span>{{ Number(row?.rule_triggered) >= 850000 ? '伪装爬虫 UA：请求被拒绝并记录攻击事件' : '已验证搜索引擎/AI 爬虫：豁免地域拦截（IP 名单/WAF/限流仍全量生效）' }}</span></div>
+          <div class="trg-kv"><span class="k">豁免引擎</span><span>{{ crawlerEngineIds.length > 0 ? crawlerEngineIds.join('、') : '未配置' }}</span></div>
+          <div class="trg-tip">验证口径：UA + 反向 DNS 双跳（360 按官方 IP 段）；引擎勾选与观察级说明见「安全防护 → 安全策略 → 地域拦截」。</div>
+        </template>
+
         <!-- 信任名单：直通/保留检测语义说明 -->
         <template v-else-if="kind === 'trust'">
           <div class="trg-kv"><span class="k">命中名单</span><span>{{ trustHitListsText || '策略信任名单（内联）' }}</span></div>
@@ -177,7 +184,7 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void }>()
 
-type Kind = 'acl' | 'geo' | 'threat' | 'trust' | 'waf-crs' | 'waf-custom' | 'body' | 'other'
+type Kind = 'acl' | 'geo' | 'crawler' | 'threat' | 'trust' | 'waf-crs' | 'waf-custom' | 'body' | 'other'
 
 // FE65-2：kind 改由共享 triggerStageFamily 投影（securityStages 唯一实现，原
 // 历史问题 双实现并存欠账）——细粒度族映射到本弹框展示 Kind（geoip→geo、
@@ -191,6 +198,7 @@ const kind = computed<Kind>(() => {
     case 'trust': return 'trust'
     case 'ipAcl': return 'acl'
     case 'geoip': return 'geo'
+    case 'crawler': return 'crawler'
     case 'threat': return 'threat'
     case 'wafCrs': return 'waf-crs'
     case 'wafCustom': return 'waf-custom'
@@ -207,6 +215,7 @@ const isWafFamily = computed(() => ['waf-crs', 'waf-custom', 'body'].includes(ki
 const categoryLabel = computed(() => {
   switch (kind.value) {
     case 'geo': return '地域拦截'
+    case 'crawler': return '爬虫Bot'
     case 'threat': return '威胁情报库'
     case 'trust': return '信任名单'
     case 'waf-crs': return 'WAF · CRS'
@@ -217,9 +226,10 @@ const categoryLabel = computed(() => {
 })
 const sourceTagType = computed(() =>
   kind.value === 'geo' ? 'warning'
-    : kind.value === 'threat' || kind.value === 'waf-crs' ? 'danger'
-      : kind.value === 'trust' ? 'success'
-        : kind.value === 'waf-custom' || kind.value === 'acl' ? 'danger' : 'info')
+    : kind.value === 'crawler' ? 'info'
+      : kind.value === 'threat' || kind.value === 'waf-crs' ? 'danger'
+        : kind.value === 'trust' ? 'success'
+          : kind.value === 'waf-custom' || kind.value === 'acl' ? 'danger' : 'info')
 
 // 命中概览（用户裁定：一眼可读）——阶段名 / 命中源
 const formatTriggerTime = (v: string): string => formatDate(v)
@@ -251,6 +261,7 @@ const heroStage = computed(() => {
     case 'trust': return '阶段 0 · 信任名单'
     case 'acl': return '阶段 1 · IP 访问控制'
     case 'geo': return '阶段 1 · 地域拦截'
+    case 'crawler': return '阶段 1 · 爬虫校验'
     case 'threat': return '阶段 1 · 威胁情报库'
     case 'waf-crs': case 'waf-custom': return '阶段 3 · WAF'
     case 'body': return '阶段 3 · 请求体检测'
@@ -262,6 +273,7 @@ const dimensionTitle = computed(() => {
     case 'trust': return '信任名单'
     case 'acl': return 'IP 黑白名单'
     case 'geo': return '地域拦截'
+    case 'crawler': return '爬虫校验'
     case 'threat': return '威胁情报库'
     case 'waf-crs': case 'waf-custom': return 'WAF'
     case 'body': return '请求体检测'
@@ -273,6 +285,7 @@ const relevantSummary = computed(() => {
   switch (kind.value) {
     case 'trust': return trustSummary.value
     case 'geo': return geoSummary.value
+    case 'crawler': return crawlerSummary.value
     case 'threat': return `威胁情报库引用 · ${aclSummary.value}`
     case 'waf-crs': case 'waf-custom': return wafSummary.value
     case 'body': return '—'
@@ -294,6 +307,12 @@ const heroHitSource = computed(() => {
     }
     case 'geo':
       return `地域拦截规则 id:${ev.rule_triggered}（区域：${geoLabel.value || '未知'}）`
+    case 'crawler': {
+      // 810000-849999 = 已验证爬虫豁免（放行）；850000-899999 = 爬虫伪装拦截
+      const n = Number(ev.rule_triggered)
+      if (n >= 850000) return `爬虫伪装拦截（id:${ev.rule_triggered}）`
+      return `已验证爬虫豁免（id:${ev.rule_triggered}）`
+    }
     case 'threat': {
       const names = allHitLists.value.filter((l) => l.system).map((l) => `「${l.name}」`)
       return names.length > 0 ? `威胁情报库 ${names.join('、')}` : `威胁情报库预检（id:${ev.rule_triggered}）`
@@ -340,6 +359,8 @@ interface PolicyRow {
   crs_rule_groups?: string
   custom_rules?: string
   trust_detection?: boolean
+  geoip_crawler_exempt?: boolean
+  geoip_crawler_engines?: string
 }
 const policy = ref<PolicyRow | null>(null)
 // 全部启用策略（历史追加修复：跨策略信任豁免判定——预检 DetectionOnly
@@ -455,6 +476,21 @@ const geoSummary = computed(() => {
   if (!p) return '—'
   if (!p.geoip_mode || p.geoip_mode === 'off') return '未启用'
   return `${p.geoip_mode === 'allow' ? '仅允许' : '拦截'}区域：${geoLabel.value || '—'}`
+})
+// 爬虫豁免维度（历史问题-F1）：事件来自 v2.3.8 爬虫两族，展示本策略的豁免引擎
+const crawlerEngineIds = computed<string[]>(() => {
+  try {
+    const raw = JSON.parse(policy.value?.geoip_crawler_engines ?? '[]') as unknown
+    return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string' && v !== '') : []
+  } catch {
+    return []
+  }
+})
+const crawlerSummary = computed(() => {
+  const p = policy.value
+  if (!p) return '—'
+  if (p.geoip_crawler_exempt !== true) return '未启用爬虫豁免'
+  return `已启用 · 豁免引擎 ${crawlerEngineIds.value.length} 个${crawlerEngineIds.value.length > 0 ? `（${crawlerEngineIds.value.join('、')}）` : ''}`
 })
 const wafSummary = computed(() => {
   const p = policy.value
@@ -646,6 +682,7 @@ watch(() => props.modelValue, (v) => {
 .trg-hero-meta { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--el-text-color-secondary); flex-wrap: wrap; }
 /* ① 来源卡与命中概览：类型着色（全类型同构，仅色相区分） */
 .trg-source--geo { border-color: var(--el-color-warning-light-7); background: var(--el-color-warning-light-9); }
+.trg-source--crawler { border-color: var(--el-color-info-light-7); background: var(--el-color-info-light-9); }
 .trg-source--threat { border-color: var(--el-color-danger-light-7); background: var(--el-color-danger-light-9); }
 .trg-source--trust { border-color: var(--el-color-success-light-7); background: var(--el-color-success-light-9); }
 .trg-source--acl { border-color: var(--el-color-danger-light-7); background: var(--el-color-danger-light-9); }

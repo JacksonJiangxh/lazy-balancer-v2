@@ -184,7 +184,7 @@ func TestParseLbbak_rejectsUnsafeThreatEntryNames(t *testing.T) {
 		t.Run(entryName, func(t *testing.T) {
 			// Given a structurally valid archive with an unsafe threat entry name.
 			raw := craftLbbakRaw(t, map[string][]byte{
-				"manifest.json": []byte(`{"format":"lbbak","checksum":{}}`),
+				"manifest.json": []byte(`{"format":"lbbak","checksum":{"config.json":"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"}}`),
 				"config.json":   []byte(`{}`),
 				entryName:       []byte("203.0.113.1\n"),
 			})
@@ -197,7 +197,7 @@ func TestParseLbbak_rejectsUnsafeThreatEntryNames(t *testing.T) {
 	}
 	// Regression: the canonical built-in entry remains valid.
 	raw := craftLbbakRaw(t, map[string][]byte{
-		"manifest.json":      []byte(`{"format":"lbbak","checksum":{}}`),
+		"manifest.json":      []byte(`{"format":"lbbak","checksum":{"config.json":"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"}}`),
 		"config.json":        []byte(`{}`),
 		"threat/ustc.iplist": []byte("203.0.113.1\n"),
 	})

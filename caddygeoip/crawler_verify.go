@@ -16,6 +16,7 @@ package caddygeoip
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -219,8 +220,16 @@ var crawlerIPListFile = "/app/data/crawler-ip-lists.json"
 // 的空快照——只按短重试间隔节流（E81-历史问题），成功快照按完整重载间隔缓存。
 type crawlerIPRangeSnapshot struct {
 	prefixes map[string][]netip.Prefix
+	// loadedAt 是本快照开始读取的时刻（TTL 基准）。
 	loadedAt time.Time
 	ok       bool
+	// modTime/size 是读取时打开 inode 的 stat 形态（内容代际）：写侧经
+	// rename 换文件，慢读者可能读到 rename 前的旧 inode 并在新快照落定后
+	// 才提交——以代际较旧者判定丢弃（E83-历史问题，与 wafiplist 历史问题 同型）。
+	modTime time.Time
+	size    int64
+	// committedAt 是落定时刻：失败读取与并发成功快照的先后判定依据。
+	committedAt time.Time
 }
 
 var (
@@ -237,10 +246,11 @@ const crawlerIPListReloadInterval = 10 * time.Minute
 var crawlerIPListRetryInterval = 10 * time.Second
 
 // loadCrawlerIPRangeSnapshot 返回当前快照（成功快照超过 10min、失败快照超过
-// 重试间隔时重读）。读盘与解析在锁外完成（双检 + 原子快照替换）：文件大/
-// 磁盘慢时不再阻塞并发判定。读取/JSON/解析失败同样写入节流时间戳并返回空
-// 快照（fail-closed + 失败也节流，旧实现失败路径不写时间戳，缺失文件时每次
-// 判定都尝试读盘）。
+// 重试间隔时重读）。读盘与解析在锁外完成（双检 + 原子快照替换 + 内容代际
+// 守卫）：文件大/磁盘慢时不再阻塞并发判定，慢读者也不会把 rename 前的旧
+// 内容写回新快照（E83-历史问题，见 commitCrawlerIPRangeSnapshot）。读取/JSON/
+// 解析失败同样写入节流时间戳并返回空快照（fail-closed + 失败也节流，旧实现
+// 失败路径不写时间戳，缺失文件时每次判定都尝试读盘）。
 func loadCrawlerIPRangeSnapshot() *crawlerIPRangeSnapshot {
 	now := time.Now()
 	crawlerFileCacheMu.Lock()
@@ -258,24 +268,56 @@ func loadCrawlerIPRangeSnapshot() *crawlerIPRangeSnapshot {
 	crawlerFileCacheMu.Unlock()
 
 	next := &crawlerIPRangeSnapshot{prefixes: map[string][]netip.Prefix{}, loadedAt: now}
-	if data, err := os.ReadFile(crawlerIPListFile); err == nil {
-		var all map[string][]string
-		if err := json.Unmarshal(data, &all); err == nil {
-			next.ok = true
-			for engine, cidrs := range all {
-				prefixes := make([]netip.Prefix, 0, len(cidrs))
-				for _, cidr := range cidrs {
-					if p, err := netip.ParsePrefix(cidr); err == nil {
-						prefixes = append(prefixes, p)
+	if file, err := os.Open(crawlerIPListFile); err == nil {
+		// stat 与读取针对同一已打开 inode：rename 换文件后旧 fd 读到的仍是
+		// 旧代际内容，st 因此如实标识所读内容（不能读后按路径再 stat）。
+		if st, statErr := file.Stat(); statErr == nil {
+			data, readErr := io.ReadAll(file)
+			if readErr == nil {
+				var all map[string][]string
+				if err := json.Unmarshal(data, &all); err == nil {
+					next.ok = true
+					next.modTime, next.size = st.ModTime(), st.Size()
+					for engine, cidrs := range all {
+						prefixes := make([]netip.Prefix, 0, len(cidrs))
+						for _, cidr := range cidrs {
+							if p, err := netip.ParsePrefix(cidr); err == nil {
+								prefixes = append(prefixes, p)
+							}
+						}
+						next.prefixes[engine] = prefixes
 					}
 				}
-				next.prefixes[engine] = prefixes
 			}
 		}
+		_ = file.Close()
 	}
+	return commitCrawlerIPRangeSnapshot(next)
+}
+
+// commitCrawlerIPRangeSnapshot 在锁内落定快照，并拒绝旧代际/陈旧失败覆盖：
+//   - 成功 vs 成功：当前快照的内容代际（mtime+size）更新时，旧代际读取结果
+//     丢弃（并发慢读者不得把 rename 前的旧内容写回）。
+//   - 失败 vs 成功：成功快照在本失败读取开始之后才落定 → 保留成功快照
+//     （瞬时读错不得把刚刷新的名单降级成空集 fail-closed）。
+//
+// 其余形态（TTL 到期后的失败读取、无当前快照、同代际）照常覆盖。
+func commitCrawlerIPRangeSnapshot(next *crawlerIPRangeSnapshot) *crawlerIPRangeSnapshot {
 	crawlerFileCacheMu.Lock()
+	defer crawlerFileCacheMu.Unlock()
+	current := crawlerFileCacheSnap
+	if current != nil {
+		newerGeneration := current.modTime.After(next.modTime) ||
+			(current.modTime.Equal(next.modTime) && current.size > next.size)
+		if current.ok && next.ok && newerGeneration {
+			return current
+		}
+		if current.ok && !next.ok && current.committedAt.After(next.loadedAt) {
+			return current
+		}
+	}
+	next.committedAt = time.Now()
 	crawlerFileCacheSnap = next
-	crawlerFileCacheMu.Unlock()
 	return next
 }
 

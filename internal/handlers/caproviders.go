@@ -83,6 +83,12 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 			return
 		}
+		if errors.Is(err, services.ErrCAProviderInUse) {
+			// 历史问题-04（历史）：禁用被规则/任务引用的 CA 提供商 → 409 点名
+			// 引用方（对齐 DNS 配置禁用守卫），不再静默改派到其他 CA。
+			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: err.Error()})
+			return
+		}
 		switch {
 		case errors.Is(err, services.ErrCAProviderInvalidProvider):
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "提供商类型必须是 letsencrypt 或 zerossl"})

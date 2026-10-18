@@ -79,6 +79,11 @@ type oidcProvEntry struct {
 const (
 	oidcStateTTL    = 10 * time.Minute
 	oidcNegCacheTTL = 5 * time.Second // discovery 失败负缓存 TTL
+	// oidcReturnToMaxBytes 登录 return_to 的字节上限（历史 B1-历史问题）：
+	// state 条目按条数封顶但此前单条 return_to 无界——未认证攻击者可用
+	// 4096 条 ~1MB 的 return_to 近似保留数 GB 内存。站内前端页面键远短于此，
+	// 超限一律按非法值丢弃（fail-safe，跳回默认首页）。
+	oidcReturnToMaxBytes = 2048
 )
 
 // oidcStateMaxEntries 在册 state 条目上限(历史问题:未认证泛洪内存封顶;
@@ -873,22 +878,10 @@ func (h *Handlers) OIDCSettingsUpdate(c *gin.Context) {
 		// 历史问题:url.Parse + scheme 白名单——HasPrefix("http") 放行
 		// 「httpxy://…」类伪 scheme。空 issuer 保留清除语义。
 		if *req.Issuer != "" {
-			u, perr := url.Parse(issuer)
-			if issuer == "" || perr != nil || u.Host == "" {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "服务地址须为 https URL"})
-				return
-			}
-			// 历史问题（历史收紧）：issuer 仅允许 https；http 只保留回环地址
-			// （127.0.0.0/8、::1）供本机 mock/测试——其余 http 会把 client_secret
-			// 明文 POST 到 token_endpoint。
-			if u.Scheme == "http" {
-				host := u.Hostname()
-				if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
-					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "OIDC 服务地址须为 https（http 仅允许回环地址用于本机测试）"})
-					return
-				}
-			} else if u.Scheme != "https" {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "服务地址须为 https URL"})
+			// 历史问题/历史问题/B1-历史问题：url.Parse + scheme 白名单单源——
+			// HasPrefix("http") 放行「httpxy://…」类伪 scheme；空 issuer 保留清除语义。
+			if err := validateOIDCIssuerURL(issuer); err != nil {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 				return
 			}
 		}
@@ -991,6 +984,12 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请提供服务地址"})
 		return
 	}
+	// B1-历史问题：探测路径与保存路径同一 scheme 策略——任何出站
+	// (discovery/token/jwks) 前先拒绝非 https（回环除外）。
+	if err := validateOIDCIssuerURL(issuer); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		return
+	}
 	// SEC-2:机器身份(API Key/MCP)不开放「任指 URL」探测——issuer 须与已
 	// 保存配置一致(先例端点探测的都是已存实体);管理员 JWT 面板编辑流不受限。
 	if c.GetString("auth_type") == "api_key" {
@@ -1011,18 +1010,31 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"ok": false, "error": err.Error()}})
 		return
 	}
-	// JWKS 可达性:验证器远端密钥拉取(一次签验失败即证可达性/格式)。
+	// B1-历史问题：JWKS 可达性——此前注释声称「一次签验失败即证可达性」，实际
+	// 只反序列化 discovery 文档，jwks_uri 不可达/格式错误直到首次登录验签才炸。
+	// 测试阶段必须显式 GET jwks_uri（有界客户端 + 响应上限 + keys 非空）。
 	var providerClaims struct {
-		Issuer string   `json:"issuer"`
-		Name   string   `json:"name"`
-		Scopes []string `json:"scopes_supported"`
+		Issuer  string   `json:"issuer"`
+		Name    string   `json:"name"`
+		Scopes  []string `json:"scopes_supported"`
+		JWKSURI string   `json:"jwks_uri"`
 	}
-	_ = p.Claims(&providerClaims)
+	if err := p.Claims(&providerClaims); err != nil {
+		recordAudit(c, "测试失败", "OIDC 配置", services.FormatAuditDetail(issuer, services.AuditResultPart("failure")))
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"ok": false, "error": "读取发现文档失败: " + err.Error()}})
+		return
+	}
+	jwksErr := probeOIDCJWKS(providerClaims.JWKSURI)
 	name := providerClaims.Name
 	if name == "" {
 		if u, err := url.Parse(issuer); err == nil {
 			name = u.Host
 		}
+	}
+	if jwksErr != nil {
+		recordAudit(c, "测试失败", "OIDC 配置", services.FormatAuditDetail(fmt.Sprintf("%s(%s)", name, issuer), services.AuditResultPart("failure")))
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"ok": false, "error": "JWKS 探测失败: " + jwksErr.Error()}})
+		return
 	}
 	// 凭证离线校验:client_credentials 探测——invalid_client 即凭证错(secret
 	// 值/ID 混淆等),在「测试」阶段暴露而非登录才炸;其余错误(unsupported_grant_type
@@ -1057,12 +1069,46 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 		"token_endpoint":         p.Endpoint().TokenURL,
 		"scopes":                 providerClaims.Scopes,
 		"credentials_checked":    credentialsChecked,
+		"jwks_checked":           true,
 	}})
 }
 
 // oidcProbeClient 凭证探测专用客户端:出站请求必须有界(挂起的 token 端点
 // 不得挂起 handler goroutine),与 discovery 8s 口径同族。
 var oidcProbeClient = &http.Client{Timeout: 10 * time.Second}
+
+// probeOIDCJWKS 探测 jwks_uri：HTTP 200 + 合法 JSON（keys 非空）才算通过。
+// 响应上限 1MB（密钥集远小于此），URL 与 discovery/token 同一 scheme 策略。
+func probeOIDCJWKS(jwksURI string) error {
+	if jwksURI == "" {
+		return errors.New("发现文档缺少 jwks_uri")
+	}
+	if err := validateOIDCIssuerURL(jwksURI); err != nil {
+		return fmt.Errorf("jwks_uri 不合规: %w", err)
+	}
+	resp, err := oidcProbeClient.Get(jwksURI)
+	if err != nil {
+		return fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("返回 HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("读取失败: %w", err)
+	}
+	var doc struct {
+		Keys []json.RawMessage `json:"keys"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return fmt.Errorf("格式错误: %w", err)
+	}
+	if len(doc.Keys) == 0 {
+		return errors.New("密钥集为空")
+	}
+	return nil
+}
 
 // probeClientCredentials 用 client_credentials 向令牌端点探测凭证:
 //   - 200:凭证正确(checked=true)
@@ -1073,6 +1119,11 @@ var oidcProbeClient = &http.Client{Timeout: 10 * time.Second}
 func probeClientCredentials(tokenURL, clientID, clientSecret string) (bool, error) {
 	if clientID == "" || clientSecret == "" {
 		return false, nil // 无凭证可验(仅探测发现可达性)
+	}
+	// B1-历史问题：discovery 的 token_endpoint 同样受 scheme 策略约束——
+	// 不得把 client_secret 明文 POST 到非 https 的非回环地址。
+	if err := validateOIDCIssuerURL(tokenURL); err != nil {
+		return false, fmt.Errorf("令牌端点地址不合规: %w", err)
 	}
 	// scope 候选:①api://<client_id>/.default(Entra 等先验 scope 后验 secret 的
 	// 提供商——实测 openid 会被 AADSTS1002012 拒而漏检 invalid_client);②openid(常规)。
@@ -1156,11 +1207,35 @@ func (h *Handlers) OIDCSettingsDelete(c *gin.Context) {
 // 重定向防护成为跨层单点依赖。此处收紧为「前导单个 / 且非 // 与 /\」，前端白名单
 // 退化为第二道防线（纵深防御）。
 func sanitizeOIDCReturnTo(raw string) string {
-	if raw == "" {
+	if raw == "" || len(raw) > oidcReturnToMaxBytes {
+		// B1-历史问题：超长值直接丢弃——未认证入口不得承载任意大小的内存驻留。
 		return ""
 	}
 	if !strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") || strings.HasPrefix(raw, "/\\") {
 		return ""
 	}
 	return raw
+}
+
+// validateOIDCIssuerURL 校验 OIDC 出站 URL 的 scheme/host 策略（历史问题；
+// B1-历史问题 收敛为单源）：仅允许 https；http 仅允许回环地址（127.0.0.0/8、::1）
+// 供本机 mock/测试。保存路径与「测试」探测路径（discovery/token/jwks）必须在
+// 任何出站请求前执行同一校验——此前测试端点绕过保存校验，管理员会话被借用时
+// 可探测内网或把 client_secret 明文 POST 到任指地址。
+func validateOIDCIssuerURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return errors.New("服务地址须为 https URL")
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if ip := net.ParseIP(u.Hostname()); ip == nil || !ip.IsLoopback() {
+			return errors.New("OIDC 服务地址须为 https（http 仅允许回环地址用于本机测试）")
+		}
+		return nil
+	default:
+		return errors.New("服务地址须为 https URL")
+	}
 }

@@ -244,3 +244,68 @@ func TestRuleTriggeredFilter_3CharPrefixAnchorsSixDigits(t *testing.T) {
 		t.Fatalf("协议异常族应含 6 位锚定模式（920___）: sql=%q args=%v", sql, args)
 	}
 }
+
+// ---- 历史 A83A-历史问题 / 历史问题 ----
+
+// 历史问题：前端事件页多选筛选值为「WAF·CRS」（SecurityEvents.vue），旧结构化
+// 判定只认显示标签「WAF 规则（CRS）」——多值任一段不可结构化即整串回退字面量
+// LIKE，而 rule_triggered 只存规则 ID，查询恒空（正向）/排除失效（反向）。
+func TestRuleTriggeredMultiFilterSQL_compactWAFCRSLabel(t *testing.T) {
+	var args []any
+	got := ruleTriggeredMultiFilterSQL("WAF·CRS,IP 访问控制", &args)
+	if strings.Contains(got, "%WAF·CRS,IP 访问控制%") {
+		t.Fatalf("「WAF·CRS」多选回退为字面量 LIKE（查询恒空）: %q", got)
+	}
+	if !strings.Contains(got, "GLOB '9[0-9][0-9][0-9][0-9][0-9]'") {
+		t.Fatalf("「WAF·CRS」段缺少 CRS 9xxxxx 形态条件: %q", got)
+	}
+	if !strings.Contains(got, " OR ") {
+		t.Fatalf("多段必须 OR 连接: %q", got)
+	}
+	// 单值契约：与单输入路径逐字节一致（args 同步）。
+	var a1, a2 []any
+	if g1, g2 := ruleTriggeredMultiFilterSQL("WAF·CRS", &a1), ruleTriggeredFilterSQL("WAF·CRS", &a2); g1 != g2 {
+		t.Fatalf("single WAF·CRS: multi=%q single=%q", g1, g2)
+	}
+}
+
+// 历史问题：「WAF·」「WAF·自」等部分输入（allow-create 可输入）不得生成空 OR
+// 条件 "()"（拼入 AND () 令 SQLite 语法错误 → 事件列表 500）。
+func TestRuleTriggeredFilterSQL_partialWAFPrefixNeverEmpty(t *testing.T) {
+	for _, input := range []string{"WAF·", "WAF·自", "WAF·C"} {
+		var args []any
+		got := ruleTriggeredFilterSQL(input, &args)
+		if got == "" || strings.Contains(got, "()") {
+			t.Fatalf("输入 %q 生成空条件（SQL 语法错误）: %q", input, got)
+		}
+	}
+	// 「WAF·」同时覆盖 CRS 与自定义两族。
+	var args []any
+	got := ruleTriggeredFilterSQL("WAF·", &args)
+	if !strings.Contains(got, "GLOB '9[0-9][0-9][0-9][0-9][0-9]'") {
+		t.Fatalf("WAF· 部分输入缺少 CRS 族: %q", got)
+	}
+	if !strings.Contains(got, "GLOB '[0-9][0-9][0-9][0-9][0-9]'") {
+		t.Fatalf("WAF· 部分输入缺少自定义规则族: %q", got)
+	}
+}
+
+// 历史问题：尾随/连续逗号产生的空段必须忽略并按剩余有效段结构化，不得因空段
+// 回退字面量 LIKE（静默错结果）。
+func TestRuleTriggeredMultiFilterSQL_ignoresEmptySegments(t *testing.T) {
+	for _, input := range []string{"IP 访问控制,", "IP 访问控制,,WAF·CRS", ",IP 访问控制"} {
+		var args []any
+		got := ruleTriggeredMultiFilterSQL(input, &args)
+		if got == "()" {
+			t.Fatalf("输入 %q 生成空条件: %q", input, got)
+		}
+		for _, a := range args {
+			if pat, ok := a.(string); ok && pat == "%"+input+"%" {
+				t.Fatalf("输入 %q 因空段回退为字面量 LIKE（args=%v）", input, args)
+			}
+		}
+		if strings.Contains(input, ",") && input != "IP 访问控制," && !strings.Contains(got, " OR ") {
+			t.Fatalf("输入 %q 的有效段未 OR 连接: %q", input, got)
+		}
+	}
+}
