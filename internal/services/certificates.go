@@ -30,6 +30,10 @@ type CertificateService struct {
 	timersPaused        bool
 	stopping            bool
 	retryDeployment     func(context.Context, int) error
+	// started 标记 Start() 已进入（D2-历史问题）：done 只由 Start 的 defer 关闭，
+	// 未启动即 Stop 会永久阻塞。生产唯一调用方保证先 Start，但契约不应依赖
+	// 调用顺序；未启动时 Stop 直接返回（cancel 已生效，后续 Start 立即退出）。
+	started atomic.Bool
 	// expiryAlertGate 手动证书过期提醒的当日去重门(CERT41-3)——同一证书
 	// 同日同档位只告警一次;nil 时放行不抑制(测试直构防御)。
 	expiryAlertGate *manualCertExpiryAlertGate
@@ -323,6 +327,12 @@ func requeueCertJobsSnapshot(ctx context.Context, snapshot CertJobsSnapshot, man
 			}
 		}
 		if err := manager.enqueueCompensation(job.caProviderID, job.id, job.ruleID, job.domain); err != nil {
+			if errors.Is(err, errCAQueueInactive) {
+				// 队列暂停/未激活：任务已转 queued，恢复时由 stranded 扫描接管。
+				// 不得把租约拖入永久退避（DeleteRule 超时补偿的孤儿屏障）。
+				Logf("info", "证书任务补偿重排队延后：CA 队列未激活，任务 %d 保持 queued 待恢复扫描", job.id)
+				continue
+			}
 			if errors.Is(err, errCAProviderUnavailable) {
 				// N+9 历史问题：provider 不可用是已定局的业务失败——enqueueLocked 内
 				// failJob 已把任务置 failed 并写 job-status/审计。上抛会让补偿退避
@@ -576,12 +586,9 @@ func (s *CertificateService) resumeDeploymentRetries() {
 	s.rescanDroppedDeploymentRetries()
 }
 
-// rescanDroppedDeploymentRetries 重新调度暂停期间被丢弃的部署重试：暂停时
-// scheduleDeploymentRetry 直接返回，'downloaded' 任务只能靠本补扫重排；恢复
-// 暂停后补一次扫描，避免部署重试静默丢失直到进程重启。历史问题 A-2 起窗口未过
-// 的任务也一并重排（delay=剩余等待），与启动恢复 requeueNonTerminalCertJobs
-// 同口径——此前只拾「窗口已过」，窗口在补扫之后到期则 timer 已被暂停取消、
-// 周期 ticker 均不覆盖 downloaded，重试静默丢失直至重启。
+// rescanDroppedDeploymentRetries 重新调度暂停期间被丢弃、或部署失败状态回写
+// 失败而未登记 timer 的部署重试：`downloaded` 需已有 available_after；`cleanup_*`
+// 的失败写回可能连窗口列都没更新，仍须由周期补扫拾起（历史问题-07）。
 func (s *CertificateService) rescanDroppedDeploymentRetries() {
 	if db.DB == nil {
 		return
@@ -594,8 +601,8 @@ func (s *CertificateService) rescanDroppedDeploymentRetries() {
 		       COALESCE(j.deployment_available_after,'')
 		FROM cert_jobs j
 		LEFT JOIN lb_rules r ON r.caddy_id=j.rule_id
-		WHERE j.status='downloaded'
-		  AND j.deployment_available_after IS NOT NULL
+		WHERE (j.status='downloaded' AND j.deployment_available_after IS NOT NULL)
+		   OR j.status IN ('cleanup_dns','cleanup_warning')
 	`)
 	if err != nil {
 		Logf("error", "resume deployment retries: scan failed: %v", err)
@@ -651,6 +658,7 @@ func (s *CertificateService) rescanDroppedDeploymentRetries() {
 }
 
 func (s *CertificateService) Start() {
+	s.started.Store(true)
 	defer close(s.done)
 	// 仅恢复上次运行遗留任务；四个周期任务统一由任务引擎驱动。
 	s.recoverJobs(s.ctx)
@@ -1127,6 +1135,11 @@ func (s *CertificateService) Stop() {
 	s.timerMu.Unlock()
 	s.pauseDeploymentRetries()
 	s.cancel()
+	// D2-历史问题：done 仅由 Start 的 defer 关闭——Start 未执行的 Stop 不得裸
+	// 等待（原实现永久阻塞）。cancel 已生效，若随后 Start 被调用会立即退出。
+	if !s.started.Load() {
+		return
+	}
 	<-s.done
 }
 
@@ -1244,8 +1257,8 @@ func (s *CertificateService) renewExpiringCertificates() {
 
 	// CL18-新2(历史):COALESCE 口径对齐全域(NULL 视为主节点,历史问题)+
 	// 失败留痕(对照 历史问题 A-N1,此前静默跳过整个过期检查)。
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
+	isMaster, err := RoleOf(context.Background(), db.DB)
+	if err != nil {
 		Logf("error", "cert expiration loop: failed to read cluster role, skipping this cycle: %v", err)
 		return
 	}
@@ -1304,7 +1317,7 @@ func (s *CertificateService) renewExpiringCertificates() {
 		message := "等待排队续期"
 		action := "续签排队"
 		source := "renewal"
-		if !j.ExpiresAt.Valid {
+		if !j.ExpiresAt.Valid && j.Status == "failed" {
 			message = "首次签发失败，冷却结束自动重试"
 			action = "重试排队"
 			source = "first_issuance_retry"
@@ -1321,6 +1334,16 @@ func (s *CertificateService) renewExpiringCertificates() {
 			continue
 		}
 		if !changed {
+			// 历史问题-04：摘要行已宣告「检测到 N 个临期/待重试任务」，但 !changed
+			// 有三条出口——在途守卫（良性）、队列暂停（导入 PauseAndDrain/
+			// 生命周期停止）、规则删除屏障。后两者此前完全静默：任务本轮没
+			// 入队也无任何痕迹，最多推迟一个 6h 扫描周期。在途仍保持静默。
+			switch {
+			case !qm.IsActive():
+				Logf("warn", "证书任务 %d 续期未入队：CA 队列已暂停（导入/生命周期暂停中），待恢复后的扫描重试", j.ID)
+			case qm.IsRuleBlocked(j.RuleID):
+				Logf("warn", "证书任务 %d 续期未入队：规则 %s 处于删除屏障，解除后由后续扫描重试", j.ID, j.RuleID)
+			}
 			continue
 		}
 		RecordAuditLog("system", action, "证书任务", FormatAuditDetail(AuditJobPart(j.ID), AuditRulePart(j.RuleID), AuditSourcePart(source)), "")
@@ -1332,10 +1355,14 @@ func (s *CertificateService) checkManualCertExpiration() {
 	defer s.mu.Unlock()
 
 	// Pre-read all manual certificates into memory, then close cursor before parsing
+	// 历史问题-06：与其余全部扫描/渲染口径对齐（enabled=1）——禁用规则的证书
+	// 不进入任何 TLS 连接策略，此前漏筛 enabled 会每天对禁用规则产出
+	// 问题「证书已过期」并每 10 分钟计数一次，稀释真实告警。
 	rows, err := db.DB.Query(`
 		SELECT caddy_id, name, domain, tls_cert 
 		FROM lb_rules 
-		WHERE enable_tls = 1 AND COALESCE(tls_source,'manual') = 'manual' AND tls_cert != ''
+		WHERE enable_tls = 1 AND COALESCE(enabled,0) = 1
+		  AND COALESCE(tls_source,'manual') = 'manual' AND tls_cert != ''
 	`)
 	if err != nil {
 		Logf("error", "Failed to query TLS certificates for expiration check: %v", err)
@@ -1469,13 +1496,19 @@ func (s *CertificateService) CheckExpiration() []models.CertJob {
 	// CERT42-5 告警 + C2 非正回退语义收敛于 GetCertRenewalDays（历史问题-2）。
 	days := GetCertRenewalDays()
 
+	// 历史问题-01：历史/导入的 issued + NULL expires_at 也必须进入候选扫描。
+	// scanRenewalCandidates 会按 PEM 的真实 NotAfter 跳过仍在窗口外的证书；
+	// 临期或材料缺失的行则进入续期，不再因 NULL 永久失联。
 	rows, err := db.DB.Query(`
 		SELECT j.id, j.rule_id, j.domain, j.status, j.expires_at, j.ca_provider_id, COALESCE(j.renewal_attempts,0), j.ca_available_after, COALESCE(j.last_error_code,''),r.domain
 		FROM cert_jobs j
 		JOIN lb_rules r ON r.caddy_id=j.rule_id
-		WHERE j.expires_at IS NOT NULL
-		  AND datetime(j.expires_at) <= datetime('now', '+' || ? || ' days')
-		  AND j.status IN ('issued', 'failed', 'waiting_ca')
+		WHERE (
+			(j.expires_at IS NOT NULL
+			 AND datetime(j.expires_at) <= datetime('now', '+' || ? || ' days')
+			 AND j.status IN ('issued', 'failed', 'waiting_ca'))
+			OR (j.expires_at IS NULL AND j.status = 'issued')
+		  )
 		  AND (j.status != 'waiting_ca' OR j.ca_available_after IS NULL OR datetime(j.ca_available_after) <= datetime('now'))
 		  AND r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns'
 		ORDER BY j.expires_at ASC

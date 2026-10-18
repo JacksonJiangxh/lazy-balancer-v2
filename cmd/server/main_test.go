@@ -38,10 +38,26 @@ func TestRestartRequiredHandler_shutsDownHTTPServer(t *testing.T) {
 
 	// Then
 	if serverErr != nil {
-		t.Fatalf("wait for server stop: %v", serverErr)
+		t.Fatalf("wait for server stop: %v", err)
 	}
 	if err := <-serverErrors; !errors.Is(err, http.ErrServerClosed) {
 		t.Fatalf("serve error=%v, want http.ErrServerClosed", err)
+	}
+}
+
+func TestNewAdminHTTPServer_largeTransferTimeouts(t *testing.T) {
+	server := newAdminHTTPServer(":8080", nil)
+	if server.ReadHeaderTimeout != 10*time.Second {
+		t.Fatalf("ReadHeaderTimeout=%s, want 10s slow-header guard", server.ReadHeaderTimeout)
+	}
+	if server.ReadTimeout != 5*time.Minute {
+		t.Fatalf("ReadTimeout=%s, want 5m for 48MB imports", server.ReadTimeout)
+	}
+	if server.WriteTimeout != 10*time.Minute {
+		t.Fatalf("WriteTimeout=%s, want 10m for large backup downloads", server.WriteTimeout)
+	}
+	if server.IdleTimeout != 120*time.Second {
+		t.Fatalf("IdleTimeout=%s, want existing 120s", server.IdleTimeout)
 	}
 }
 

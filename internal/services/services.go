@@ -559,24 +559,28 @@ func (m *MetricsService) storeMetrics(metrics parsedMetrics) error {
 }
 
 func (m *MetricsService) updateOverview(metrics parsedMetrics) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// D1-历史问题：三条查询（含 nodes 的 datetime 统计）必须在读锁之外执行——
+	// 原实现持写锁查库，DB busy/慢 IO 会阻塞 GetOverview 及全部读方（采集
+	// 周期 30s）。前值只在读锁内快照一次，查询失败沿用该快照。
+	m.mu.RLock()
+	previousOverview := m.overview
+	m.mu.RUnlock()
 
 	// Get active rules count (fast read-only query)
 	// 历史 B3: 错误必须显式处理，否则 DB 故障时 overview 三项指标静默归零。
 	// 查询失败时保留既有 overview 行中的前值（与 onlineNodes 分支同口径）：
 	// 此前变量零值初始化，日志声称 "keeping previous value" 实际写入 0。
-	activeRules, totalRules := m.overview.ActiveRules, m.overview.TotalRules
-	onlineNodes := m.overview.OnlineNodes
+	activeRules, totalRules := previousOverview.ActiveRules, previousOverview.TotalRules
+	onlineNodes := previousOverview.OnlineNodes
 	database := db.DB
 	if database != nil {
 		if err := database.QueryRow("SELECT COUNT(*) FROM lb_rules WHERE enabled = 1").Scan(&activeRules); err != nil {
-			Logf("error", "updateOverview: query active rules failed: %v (keeping previous value=%d)", err, m.overview.ActiveRules)
-			activeRules = m.overview.ActiveRules
+			Logf("error", "updateOverview: query active rules failed: %v (keeping previous value=%d)", err, previousOverview.ActiveRules)
+			activeRules = previousOverview.ActiveRules
 		}
 		if err := database.QueryRow("SELECT COUNT(*) FROM lb_rules").Scan(&totalRules); err != nil {
-			Logf("error", "updateOverview: query total rules failed: %v (keeping previous value=%d)", err, m.overview.TotalRules)
-			totalRules = m.overview.TotalRules
+			Logf("error", "updateOverview: query total rules failed: %v (keeping previous value=%d)", err, previousOverview.TotalRules)
+			totalRules = previousOverview.TotalRules
 		}
 
 		// 在线节点数口径与 ComputeNodeStatus 统一：nodes.status 只在注册/上报时写入、
@@ -595,11 +599,13 @@ func (m *MetricsService) updateOverview(metrics parsedMetrics) {
 		  AND last_seen IS NOT NULL
 		  AND datetime(last_seen) >= datetime('now', printf('-%d seconds', MAX(? * COALESCE((SELECT CASE WHEN sync_interval < 10 THEN 60 ELSE sync_interval END FROM global_config WHERE id=1), 60), 120)))
 	`, nodeOfflineMultiplier).Scan(&onlineNodes); err != nil {
-			Logf("error", "updateOverview: query online nodes failed: %v (keeping previous value=%d)", err, m.overview.OnlineNodes)
-			onlineNodes = m.overview.OnlineNodes
+			Logf("error", "updateOverview: query online nodes failed: %v (keeping previous value=%d)", err, previousOverview.OnlineNodes)
+			onlineNodes = previousOverview.OnlineNodes
 		}
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var rps float64
 	now := time.Now()
 	if m.hasLastSample && metrics.requestsTotal >= m.lastTotal {

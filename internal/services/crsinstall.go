@@ -350,20 +350,20 @@ func (m *CRSUpdateManager) swapCRSTreeFromStaging(staging, setupPath string, pen
 	defer wafFileMu.Unlock()
 	rulesPath := filepath.Join(m.crsDir, "rules")
 	if err := os.RemoveAll(rulesPath); err != nil {
-		m.restoreBackup()
+		m.restoreBackupInLock()
 		return "", fmt.Errorf("清理现有 rules: %w", err)
 	}
 	if err := moveTree(filepath.Join(staging, "rules"), rulesPath); err != nil {
-		m.restoreBackup()
+		m.restoreBackupInLock()
 		return "", fmt.Errorf("安装新 rules: %w", err)
 	}
 	newSetup := filepath.Join(staging, "crs-setup.conf.example")
 	if err := copyFile(newSetup, setupPath); err != nil {
-		m.restoreBackup()
+		m.restoreBackupInLock()
 		return "", fmt.Errorf("写入 crs-setup.conf: %w", err)
 	}
 	if err := copyFile(newSetup, filepath.Join(m.crsDir, "crs-setup.stock.conf")); err != nil {
-		m.restoreBackup()
+		m.restoreBackupInLock()
 		return "", fmt.Errorf("写入 crs-setup.stock.conf 基线: %w", err)
 	}
 	// 历史问题 新-2：overrides 迁移写入推迟到此处（rules 与新 setup 均已落盘）——
@@ -376,7 +376,7 @@ func (m *CRSUpdateManager) swapCRSTreeFromStaging(staging, setupPath string, pen
 	// 更新自愈。
 	if pendingOverrides != nil {
 		if err := os.WriteFile(filepath.Join(m.crsDir, "zz-user-overrides.conf"), pendingOverrides, 0644); err != nil {
-			m.restoreBackup()
+			m.restoreBackupInLock()
 			return "", fmt.Errorf("写入 zz-user-overrides.conf: %w", err)
 		}
 	}
@@ -393,7 +393,7 @@ func (m *CRSUpdateManager) swapCRSTreeFromStaging(staging, setupPath string, pen
 		// 版本行仍旧会让 crsPoolFingerprint 命中旧池（新规则静默不生效），且
 		// 后续任务内重试会用已变的树覆盖原始备份基线。此刻原备份仍可用：回滚
 		// 规则树并返回明确错误，downloadAndInstall 不会调用 reloader。
-		m.restoreBackup()
+		m.restoreBackupInLock()
 		return prevTag, fmt.Errorf("写入 CRS 版本行失败（已回滚规则树）: %w", err)
 	}
 	// 历史问题：VERSION 标记与规则树/DB 版本行同锁同代——读者（BuildWafFileRef）
@@ -408,6 +408,22 @@ func (m *CRSUpdateManager) swapCRSTreeFromStaging(staging, setupPath string, pen
 func persistCRSSnapshotFrom(liveDir, snapshotDir, version string) error {
 	wafFileMu.Lock()
 	defer wafFileMu.Unlock()
+	return persistCRSSnapshotFromInLock(liveDir, snapshotDir, version)
+}
+
+// persistCRSSnapshotFromInLock 是调用方已持 wafFileMu 的快照持久化实现。
+func persistCRSSnapshotFromInLock(liveDir, snapshotDir, version string) error {
+	// 历史问题（历史）：树交换段释放锁到本段重新取锁之间，lbbak 导入 /
+	// cluster apply 可换掉整棵树并写入自己的 VERSION——此时快照会把并发
+	// 导入的树标记成本次更新的 tag（假快照）。以 live VERSION 做代际校验：
+	// 与期望版本不一致则保留旧快照并告警，不产出错误标签。
+	if marker, err := os.ReadFile(filepath.Join(liveDir, crsVersionFile)); err != nil {
+		return fmt.Errorf("读取 live 版本标记: %w", err)
+	} else if strings.TrimSpace(string(marker)) != version {
+		Logf("warn", "crs update: skip snapshot persist for %q（live VERSION=%q 已由并发导入/应用替换，保留旧快照）",
+			version, strings.TrimSpace(string(marker)))
+		return nil
+	}
 
 	if err := os.RemoveAll(snapshotDir); err != nil {
 		return fmt.Errorf("清理旧快照: %w", err)
@@ -437,6 +453,18 @@ func persistCRSSnapshotFrom(liveDir, snapshotDir, version string) error {
 // a rollback would misalign the next migration's diff baseline and silently
 // revert upstream default changes as "customizations".
 func (m *CRSUpdateManager) restoreBackup() {
+	// 历史问题（历史）：失败/回滚路径的还原同为树变更（restoreRulesBackup
+	// moveTree live rules），必须在 wafFileMu 内执行——持锁读者
+	// BuildWafFileBundle/BuildWafFileRef 否则可导出缺失/混合 rules 树并经
+	// waf_files 节扩散到从节点。swapCRSTreeFromStaging 已持锁，其内部调用
+	// restoreBackupInLock（不得在此重入）。
+	wafFileMu.Lock()
+	defer wafFileMu.Unlock()
+	m.restoreBackupInLock()
+}
+
+// restoreBackupInLock 是 restoreBackup 的锁内实现（调用方须持 wafFileMu）。
+func (m *CRSUpdateManager) restoreBackupInLock() {
 	rulesPath := filepath.Join(m.crsDir, "rules")
 	rulesBak := crsTransientPath(m.crsDir, "rules.bak")
 	if _, err := os.Stat(rulesBak); err == nil {

@@ -50,17 +50,30 @@ func (h *Handlers) ControlClusterNodeService(c *gin.Context) {
 	if !h.requireMaster(c) {
 		return
 	}
+	// B2-历史问题（历史）：特权服务控制的所有失败早退（编号非法/体解析失败/
+	// 动作不支持/票据签发失败）此前零审计，越权探测与故障签发在操作日志中不可见。
+	// 统一经 recordAudit 留痕「失败」；动作串经 registerAuditField 截断去控制字符。
+	auditFailure := func(nodeID int, detail string) {
+		nodePart := "节点 " + c.Param("id")
+		if nodeID > 0 {
+			nodePart = fmt.Sprintf("节点 %d", nodeID)
+		}
+		recordAudit(c, "服务控制", "节点服务", services.FormatAuditDetail(nodePart, detail, "结果：失败"))
+	}
 	nodeID, err := strconv.Atoi(c.Param("id"))
 	if err != nil || nodeID <= 0 {
+		auditFailure(nodeID, "节点编号无效")
 		clusterError(c, http.StatusBadRequest, "节点编号无效", err)
 		return
 	}
 	var req models.ClusterNodeServiceRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		auditFailure(nodeID, "请求格式错误")
 		clusterError(c, http.StatusBadRequest, "请求格式错误", err)
 		return
 	}
 	if !models.IsValidClusterServiceAction(req.Action) {
+		auditFailure(nodeID, "动作："+registerAuditField(req.Action)+"（不支持）")
 		clusterError(c, http.StatusBadRequest, "不支持的服务控制动作", nil)
 		return
 	}
@@ -73,6 +86,7 @@ func (h *Handlers) ControlClusterNodeService(c *gin.Context) {
 		case errors.Is(err, services.ErrInvalidServiceAction):
 			status = http.StatusBadRequest
 		}
+		auditFailure(nodeID, "签发票据失败（动作："+registerAuditField(req.Action)+"）")
 		clusterError(c, status, "签发服务控制票据失败", err)
 		return
 	}

@@ -241,6 +241,78 @@ func TestListSecurityEvents_returnsSnapshotNamesAfterRuleAndPolicyChanged(t *tes
 	}
 }
 
+func TestListSecurityEvents_serverSideRequestContextMasking(t *testing.T) {
+	cases := []struct {
+		name       string
+		role       string
+		authType   string
+		readOnly   bool
+		headers    string
+		wantPlain  bool
+		wantObject bool
+	}{
+		{name: "admin JWT keeps plaintext", role: "admin", authType: "jwt", headers: `{"Authorization":"Bearer secret","Cookie":"session=secret","X-Request-ID":"ok"}`, wantPlain: true, wantObject: true},
+		{name: "admin readwrite API key keeps plaintext", role: "admin", authType: "api_key", headers: `{"Authorization":"Bearer secret","Cookie":"session=secret","X-Request-ID":"ok"}`, wantPlain: true, wantObject: true},
+		{name: "non admin is masked", role: "user", authType: "jwt", headers: `{"Authorization":"Bearer secret","Cookie":"session=secret","X-Request-ID":"ok"}`, wantObject: true},
+		{name: "admin read-only API key is masked", role: "admin", authType: "api_key", readOnly: true, headers: `{"Authorization":"Bearer secret","Cookie":"session=secret","X-Request-ID":"ok"}`, wantObject: true},
+		{name: "malformed headers fail closed", role: "user", authType: "jwt", headers: `not-json`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setupSecurityPolicyTestDB(t)
+			if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time,client_ip,method,uri,event_type,rule_triggered,rule_msg,action,request_headers,request_body) VALUES ('2026-10-18 10:00:00','203.0.113.7','POST','/login','crs','942100','SQL Injection','blocked',?,'username=alice&password=secret')`, tc.headers); err != nil {
+				t.Fatal(err)
+			}
+			gin.SetMode(gin.TestMode)
+			h := &Handlers{}
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				c.Set("role", tc.role)
+				c.Set("auth_type", tc.authType)
+				c.Set("api_key_read_only", tc.readOnly)
+			})
+			router.GET("/security/events", h.ListSecurityEvents)
+			response := getRequest(t, router, "/security/events")
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var payload struct {
+				Data struct {
+					Events []struct {
+						RequestHeaders string `json:"request_headers"`
+						RequestBody    string `json:"request_body"`
+					} `json:"events"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if len(payload.Data.Events) != 1 {
+				t.Fatalf("events=%d, want 1", len(payload.Data.Events))
+			}
+			event := payload.Data.Events[0]
+			if tc.wantPlain {
+				if event.RequestHeaders != tc.headers || event.RequestBody != "username=alice&password=secret" {
+					t.Fatalf("privileged context changed: headers=%q body=%q", event.RequestHeaders, event.RequestBody)
+				}
+				return
+			}
+			if event.RequestBody != "" || strings.Contains(event.RequestHeaders, "secret") || strings.Contains(event.RequestHeaders, "alice") {
+				t.Fatalf("sensitive context leaked: headers=%q body=%q", event.RequestHeaders, event.RequestBody)
+			}
+			if !tc.wantObject {
+				if event.RequestHeaders != "{}" {
+					t.Fatalf("malformed headers=%q, want {}", event.RequestHeaders)
+				}
+				return
+			}
+			if !strings.Contains(event.RequestHeaders, "••••••") || !strings.Contains(event.RequestHeaders, "X-Request-ID") {
+				t.Fatalf("masked headers must retain names and mask marker: %q", event.RequestHeaders)
+			}
+		})
+	}
+}
+
 func TestCategorizeAttack_familyMapping(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -301,6 +373,37 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 	}
 }
 
+func TestGetSecurityOverview_disclosesRawEventRetentionScope(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityEventsRouter(t)
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time,client_ip,method,uri,event_type,rule_triggered,rule_msg,action) VALUES
+		('2020-01-01 00:00:00','203.0.113.7','GET','/old','crs','942100','SQL Injection','blocked'),
+		('2026-10-18 10:00:00','203.0.113.8','GET','/new','crs','942100','SQL Injection','blocked')`); err != nil {
+		t.Fatal(err)
+	}
+	response := getRequest(t, router, "/security/overview")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			RawCoverageFrom  string `json:"raw_coverage_from"`
+			RawRetentionNote string `json:"raw_retention_note"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Data.RawCoverageFrom != "2020-01-01 00:00:00" {
+		t.Fatalf("raw_coverage_from=%q, want oldest retained event", payload.Data.RawCoverageFrom)
+	}
+	for _, want := range []string{"Top IP", "原始", "威胁大屏"} {
+		if !strings.Contains(payload.Data.RawRetentionNote, want) {
+			t.Fatalf("raw_retention_note=%q, want disclosure containing %q", payload.Data.RawRetentionNote, want)
+		}
+	}
+}
+
 func TestGetSecurityOverview_returnsStoredCRSVersionAndUpdateStatus(t *testing.T) {
 	// Given a stored CRS version row
 	setupSecurityPolicyTestDB(t)
@@ -331,6 +434,20 @@ func TestGetSecurityOverview_returnsStoredCRSVersionAndUpdateStatus(t *testing.T
 	}
 	if resp.Data.UpdateStatus != "updating" {
 		t.Fatalf("update_status = %q, want updating", resp.Data.UpdateStatus)
+	}
+}
+
+func TestOverlayCRSOverviewUpdateStatus(t *testing.T) {
+	for _, status := range []string{"checking", "downloading", "installing", "reloading"} {
+		if got := overlayCRSOverviewUpdateStatus("idle", &services.CRSUpdateStatusSnapshot{Status: status}); got != status {
+			t.Fatalf("active status %q overlaid as %q", status, got)
+		}
+	}
+	if got := overlayCRSOverviewUpdateStatus("stored", nil); got != "stored" {
+		t.Fatalf("nil manager snapshot must keep stored status, got %q", got)
+	}
+	if got := overlayCRSOverviewUpdateStatus("stored", &services.CRSUpdateStatusSnapshot{Status: "success"}); got != "stored" {
+		t.Fatalf("terminal snapshot must not overwrite stored status, got %q", got)
 	}
 }
 

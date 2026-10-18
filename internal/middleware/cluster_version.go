@@ -27,6 +27,47 @@ func clusterVersionMiddleware(database *sql.DB) gin.HandlerFunc {
 	}
 }
 
+// globalConfigSyncedColumns 是 global_config UPDATE 触发器的 OF 列清单单源
+// （历史问题-3）。凡随集群快照同步的 global_config 列都必须在此——漏列时
+// 「仅写该列」的 UPDATE 不 bump cluster_version，从节点经 304 门永久滞留
+// 旧值（D1 autoban 六列、历史问题 自动备份组均曾因同类遗漏修过）。
+// 漂移防护：ClusterBasicSettings（internal/models/cluster.go）的全部字段
+// （JSON tag = 列名）必须命中本清单，钉测见 cluster_version_of_drift_test.go。
+// auto_backup_last_run 刻意排除：调度器每轮备份推进，入列会让每轮备份引发
+// 全集群快照重放。
+var globalConfigSyncedColumns = []string{
+	"sync_users", "sync_rules", "sync_security",
+	"branding_json", "caddy_config", "log_level",
+	"access_log_json", "access_log_format",
+	"task_log_size_mb", "audit_log_size_mb", "runtime_log_size_mb", "audit_retention_months",
+	"jwt_expire_minutes", "timezone", "acme_email",
+	"cert_expiry_days", "cert_renewal_days", "cert_renewal_attempts", "default_ca_provider_id",
+	"dns_provider", "dns_credentials", "sync_interval",
+	"admin_tls_enabled", "admin_tls_mode", "admin_tls_cert", "admin_tls_key",
+	"caddy_log_level", "caddy_log_size_mb",
+	"request_body_max_size_mb",
+	"http_read_timeout", "http_write_timeout", "http_idle_timeout",
+	"upstream_keepalive_timeout",
+	"proxy_dial_timeout", "proxy_response_header_timeout",
+	"proxy_read_timeout", "proxy_write_timeout", "proxy_stream_timeout",
+	"proxy_flush_interval", "proxy_stream_close_delay",
+	"server_tokens_hidden", "oidc_config",
+	"mfa_write_guard", "mfa_lockout_enabled", "github_proxy_url",
+	"auto_backup_enabled", "auto_backup_frequency", "auto_backup_time",
+	"auto_backup_day", "auto_backup_keep", "auto_backup_sections",
+	"trusted_proxy_enabled", "trusted_proxy_ranges", "trusted_proxy_range_refs",
+	"trusted_proxy_headers", "trusted_proxy_strict",
+	"threat_auto_update", "threat_schedule_days", "threat_schedule_time",
+	"crawler_auto_update", "crawler_schedule_days", "crawler_schedule_time",
+	"autoban_enabled", "autoban_threshold", "autoban_window_minutes",
+	"autoban_duration", "autoban_scope", "autoban_dry_run",
+	// v2.3.8：安全事件保留两列与大屏采样口径随 users 节同步并物化到从端
+	// （models.ClusterBasicSettings / services/cluster_apply.go）——历史问题-3
+	// 补列：此前仅靠「同语句 UPDATE 含其他 OF 列」偶然触发 bump，仅写这三列
+	// 的端点会滞留主节点。
+	"security_events_retention_days", "security_events_row_cap", "threat_traffic_sample_n",
+}
+
 func installClusterVersionTriggers(database *sql.DB) error {
 	tables := []struct {
 		name            string
@@ -191,13 +232,13 @@ func installClusterVersionTriggers(database *sql.DB) error {
 	// dry_run 六列入 OF(同 历史问题 先例)——主端 PUT /security/autoban 保存即下发;
 	// 不在 OF 内则稳态变更经 304 门滞留主节点,从端恒默认值、升主后按陈旧配置
 	// 静默运行(名单传播而配置不传播)。
-	if _, err := database.Exec(`CREATE TRIGGER cluster_version_global_config_update
-		AFTER UPDATE OF sync_users,sync_rules,sync_security,branding_json,caddy_config,log_level,access_log_json,access_log_format,task_log_size_mb,audit_log_size_mb,runtime_log_size_mb,audit_retention_months,jwt_expire_minutes,timezone,acme_email,cert_expiry_days,cert_renewal_days,cert_renewal_attempts,default_ca_provider_id,dns_provider,dns_credentials,sync_interval,admin_tls_enabled,admin_tls_mode,admin_tls_cert,admin_tls_key,caddy_log_level,caddy_log_size_mb,request_body_max_size_mb,http_read_timeout,http_write_timeout,http_idle_timeout,upstream_keepalive_timeout,proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,server_tokens_hidden,oidc_config,mfa_write_guard,mfa_lockout_enabled,github_proxy_url,auto_backup_enabled,auto_backup_frequency,auto_backup_time,auto_backup_day,auto_backup_keep,auto_backup_sections,trusted_proxy_enabled,trusted_proxy_ranges,trusted_proxy_range_refs,trusted_proxy_headers,trusted_proxy_strict,threat_auto_update,threat_schedule_days,threat_schedule_time,crawler_auto_update,crawler_schedule_days,crawler_schedule_time,autoban_enabled,autoban_threshold,autoban_window_minutes,autoban_duration,autoban_scope,autoban_dry_run
+	if _, err := database.Exec(fmt.Sprintf(`CREATE TRIGGER cluster_version_global_config_update
+		AFTER UPDATE OF %s
 		ON global_config
 		WHEN OLD.cluster_version IS NEW.cluster_version AND COALESCE(NEW.is_master,1)=1
 		BEGIN
 			UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1;
-		END`); err != nil {
+		END`, strings.Join(globalConfigSyncedColumns, ","))); err != nil {
 		return fmt.Errorf("install cluster version trigger for global_config UPDATE: %w", err)
 	}
 	return nil
@@ -227,6 +268,12 @@ func isSynchronizedWrite(method, path string) bool {
 	}
 	// Config backup import rewrites rules/upstreams; the validate endpoint only previews.
 	if method == http.MethodPost && (path == "/api/v1/config/import" || path == "/api/v1/config/import/v1") {
+		return true
+	}
+	// 手动任务触发可启动 CRS/IP2Region/威胁/爬虫/证书/自动封禁等
+	// 同步表写者。整路由 fail-closed：任务 ID 清单唯一归 taskengine，
+	// 中间件不维护第二份「哪些任务写同步表」分类。
+	if method == http.MethodPost && path == "/api/v1/system/tasks/:id/trigger" {
 		return true
 	}
 	// 历史问题(历史评审):自动备份还原经 importConfigBackupCore 重写

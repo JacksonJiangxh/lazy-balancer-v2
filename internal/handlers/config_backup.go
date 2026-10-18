@@ -21,6 +21,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
+	"lazy-balancer-v2/internal/services/dnsproviders"
 )
 
 var configBackupTables = []string{"lb_rules", "upstreams", "path_rules", "users", "api_keys", "ca_providers", "certificate_configs", "cert_jobs", "security_policies", "security_policy_bindings", "security_custom_rules", "security_block_pages", "security_ip_lists", "security_crs_version", "security_ip2region_version", "security_threat_sources", "security_crawler_sources"}
@@ -184,6 +185,8 @@ const (
 	warningWafMetadataSkipped    = "备份不含规则库数据文件——规则库版本记录已跳过（仅 lbbak 完整备份可导入该类）"
 	warningWafCRSMetadataSkipped = "备份不含 CRS 数据文件——CRS 版本记录已跳过（仅含该文件的 lbbak 备份可导入）"
 	warningWafXdbMetadataSkipped = "备份不含 IP2Region 数据文件——IP2Region 版本记录已跳过（仅含该文件的 lbbak 备份可导入）"
+	// 历史问题-02（历史）：导入同时替换 CRS 规则树时的校验基准降级说明。
+	warningCRSTreeReplaced = "备份同时替换 CRS 规则树：安全策略中的 CRS 组号/规则 ID 未按当前规则库做存在性校验（落地基准以备份内规则树为准）——导入后请在安全策略页复核选组，避免空 Include 静默失效"
 )
 
 var requeueNonTerminalCertJobs = services.RequeueNonTerminalCertJobs
@@ -495,6 +498,81 @@ func validateV2BackupBooleanTypes(backup configBackup) error {
 	return nil
 }
 
+// backupTimeColumns 备份中按 time.Time / sql.NullTime 消费的时间列（B3-2-1，
+// 历史）：这些列的值必须是驱动可解析的时间串——空串或不可解析文本
+// 落库后不是「空值」而是每次扫描都报错（登录读取 users.created_at、规则列表
+// 读取 lb_rules.created_at、证书任务读取 cert_jobs.created_at、主节点集群
+// 快照读取 path_rules.created_at 全线 500，且无 UI 自愈路径）。NULL 不在此门
+// 范围：写入侧 restoreTable 按 backupTableNullDefaults 归一为可解析 epoch。
+var backupTimeColumns = map[string][]string{
+	"lb_rules":            {"created_at", "updated_at"},
+	"path_rules":          {"created_at", "updated_at"},
+	"users":               {"created_at"},
+	"api_keys":            {"created_at"},
+	"ca_providers":        {"created_at", "updated_at"},
+	"certificate_configs": {"created_at", "updated_at"},
+	"cert_jobs":           {"created_at", "updated_at"},
+}
+
+// backupTimeFormats 与 modernc.org/sqlite 驱动 parseTime 的布局同集
+// （sqlite.go parseTimeFormats；另含 "Z" 后缀与 time.String 形态的容忍）。
+// 导入后的 raw time 扫描必须能被同一组布局解析，故校验侧逐字对齐。
+var backupTimeFormats = []string{
+	"2006-01-02 15:04:05.999999999-07:00",
+	"2006-01-02T15:04:05.999999999-07:00",
+	"2006-01-02 15:04:05.999999999",
+	"2006-01-02T15:04:05.999999999",
+	"2006-01-02 15:04",
+	"2006-01-02T15:04",
+	"2006-01-02",
+	// 驱动 parseTimeString 的 time.String() 形态（"…-0700 MST"）。
+	"2006-01-02 15:04:05.999999999 -0700 MST",
+}
+
+func backupTimeValueParseable(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return true // NULL 由写入侧默认值归一
+	case time.Time:
+		return true // 程序化构造的行（v1 转换）可能已是 time.Time
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return false
+		}
+		trimmed = strings.TrimSuffix(trimmed, "Z")
+		for _, layout := range backupTimeFormats {
+			if _, err := time.Parse(layout, trimmed); err == nil {
+				return true
+			}
+		}
+		return false
+	default:
+		return false // 数值/布尔等形态同样无法被 *time.Time 扫描
+	}
+}
+
+func validateV2BackupTimestamps(tables map[string][]map[string]any) error {
+	for table, columns := range backupTimeColumns {
+		rows, ok := tables[table]
+		if !ok {
+			continue
+		}
+		for index, row := range rows {
+			for _, column := range columns {
+				value, exists := row[column]
+				if !exists {
+					continue
+				}
+				if !backupTimeValueParseable(value) {
+					return fmt.Errorf("备份校验失败：%s 第 %d 行 %s 时间戳为空或不可解析（须为 YYYY-MM-DD HH:MM:SS 或 RFC3339）——该形态落库会使登录、规则/证书任务列表与集群快照扫描持续失败", table, index+1, column)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // normalizeBackupBooleanValue 把布尔列值归一为规范 INTEGER 0/1（恢复写入侧兜底）。
 // 布尔与 0/1 数值原样规范化；幸存字符串（legacy 校验和路径跳过类型门）按
 // "1"/"true"→1、"0"/"false"→0 归一；其余形态（数值 2、无法识别文本）原样透传
@@ -623,7 +701,8 @@ func restoreTable(ctx context.Context, tx *sql.Tx, database *sql.DB, table strin
 			// 对 nil 透传，故在布尔归一之后把仍为 nil 的列替换为 dump 侧对齐默认值
 			// （backupTableNullDefaults）：NULL 布尔列落到 schema/dump 默认（如
 			// enabled→0）而非布尔强转；created_at 等被 raw time.Time 扫描消费的
-			// 时间列归一为可解析 epoch，NULL/'' 均会使登录/列表扫描 500。
+			// 时间列归一为可解析 epoch。B3-2-1（历史）：空串/不可解析文本
+			// 由校验侧 validateV2BackupTimestamps 整包 400 先行拦截，不会到达此处。
 			if value == nil {
 				if columnDefault, ok := backupTableNullDefaults[table][column]; ok {
 					value = columnDefault
@@ -1023,6 +1102,9 @@ func validateV2Backup(backup configBackup) (bool, error) {
 	if err := validateV2BackupRows(backup); err != nil {
 		return false, err
 	}
+	if err := validateV2BackupCertJobStatuses(backup.Tables); err != nil {
+		return false, err
+	}
 	return usedLegacy, nil
 }
 
@@ -1145,7 +1227,22 @@ afterChecksum:
 	return false, errors.New("备份必须至少包含一个已启用的管理员账号")
 }
 
-// validateV2BackupRows 行级门（布尔类型/白名单/cert 状态/凭证），必须在
+// validateV2BackupCertJobStatuses 在空域名规则及其任务软跳过之后执行，
+// 避免将被丢弃任务的非法状态升级为整包 400。
+func validateV2BackupCertJobStatuses(tables map[string][]map[string]any) error {
+	for _, job := range tables["cert_jobs"] {
+		status, ok := job["status"].(string)
+		if !ok {
+			return errors.New("证书任务状态不能为空")
+		}
+		if _, allowed := configBackupCertJobStatuses[status]; !allowed {
+			return fmt.Errorf("无效的证书任务状态: %s", status)
+		}
+	}
+	return nil
+}
+
+// validateV2BackupRows 行级门（布尔类型/白名单/凭证），必须在
 // sections 过滤之后执行（历史问题）：未选分类的坏行不误拒整包，选中分类照常
 // 严格校验。checksum 已在 verifyBackupIntegrity 对全量计算。
 func validateV2BackupRows(backup configBackup) error {
@@ -1174,37 +1271,100 @@ func validateV2BackupRows(backup configBackup) error {
 	if err := validateV2BackupBooleanTypes(backup); err != nil {
 		return err
 	}
-	for _, job := range backup.Tables["cert_jobs"] {
-		status, ok := job["status"].(string)
-		if !ok {
-			return errors.New("证书任务状态不能为空")
-		}
-		if _, allowed := configBackupCertJobStatuses[status]; !allowed {
-			return fmt.Errorf("无效的证书任务状态: %s", status)
-		}
+	// B3-2-1（历史）：时间列空串/不可解析文本门——必须在写入前拦下，
+	// 否则导入后 users/lb_rules/cert_jobs/path_rules 的 raw time 扫描每次 500。
+	if err := validateV2BackupTimestamps(backup.Tables); err != nil {
+		return err
 	}
 	const invalidCredentialsMsg = "备份包含无效的凭证格式（ca_providers.credentials / certificate_configs.dns_credentials 需为 JSON 对象）"
 	for _, provider := range backup.Tables["ca_providers"] {
-		if err := validateCredentialsJSONObject(backupString(provider["credentials"])); err != nil {
-			return errors.New(invalidCredentialsMsg)
+		providerName := backupString(provider["provider"])
+		rawCredentials := backupString(provider["credentials"])
+		if rawCredentials != "" {
+			if err := validateCredentialsJSONObject(rawCredentials); err != nil {
+				return errors.New(invalidCredentialsMsg)
+			}
 		}
-		// CERT44-1(历史 历史问题):provider 白名单与 directory_url 官方常量
-		// 覆写,与保存/更新侧(services/caproviders.go UpdateCAProvider
-		// :194-201)同口径——provider 必须 ∈{letsencrypt,zerossl},否则恶意
-		// CA 类型经备份落库绕过保存侧门;directory_url 无条件覆写为官方常量,
-		// 消除备份携带恶意 ACME 目录 URL 落库(签发/续签被导向攻击者服务器)。
-		switch backupString(provider["provider"]) {
-		case services.ProviderLetsEncrypt:
-			provider["directory_url"] = services.LetsEncryptDirectoryURL
-		case services.ProviderZeroSSL:
-			provider["directory_url"] = services.ZeroSSLDirectoryURL
-		default:
-			return fmt.Errorf("备份包含无效的 CA 提供商类型: %s（必须为 %s 或 %s）", backupString(provider["provider"]), services.ProviderLetsEncrypt, services.ProviderZeroSSL)
+		if providerName == "" {
+			// legacy/占位行：无 provider 即无专属语义，保持放行。
+		} else {
+			// CERT44-1(历史 历史问题):provider 白名单与 directory_url 官方常量
+			// 覆写,与保存/更新侧同口径。
+			switch providerName {
+			case services.ProviderLetsEncrypt:
+				provider["directory_url"] = services.LetsEncryptDirectoryURL
+			case services.ProviderZeroSSL:
+				provider["directory_url"] = services.ZeroSSLDirectoryURL
+			default:
+				return fmt.Errorf("备份包含无效的 CA 提供商类型: %s（必须为 %s 或 %s）", providerName, services.ProviderLetsEncrypt, services.ProviderZeroSSL)
+			}
+
+			if providerName == services.ProviderLetsEncrypt {
+				trimmed := strings.TrimSpace(rawCredentials)
+				if trimmed != "" && trimmed != "{}" {
+					return fmt.Errorf("备份包含无效的 Let's Encrypt 配置：凭证必须为空")
+				}
+				if trimmed == "" {
+					provider["credentials"] = ""
+				}
+			} else if rawCredentials != "" {
+				var credentials models.CAProviderCredentials
+				if err := json.Unmarshal([]byte(rawCredentials), &credentials); err != nil {
+					return errors.New(invalidCredentialsMsg)
+				}
+			}
+		}
+		for _, limit := range []struct {
+			key     string
+			max     int
+			tooHigh error
+		}{
+			{key: "max_concurrent", max: 100, tooHigh: services.ErrCAProviderMaxConcurrentTooHigh},
+			{key: "min_interval_ms", max: 60000, tooHigh: services.ErrCAProviderMinIntervalTooHigh},
+		} {
+			raw, exists := provider[limit.key]
+			if !exists || raw == nil {
+				continue
+			}
+			value, ok := backupInteger(raw)
+			if !ok {
+				return fmt.Errorf("备份的 ca_providers.%s 必须为整数", limit.key)
+			}
+			if value > limit.max {
+				return fmt.Errorf("备份的 ca_providers.%s 超出上限: %w", limit.key, limit.tooHigh)
+			}
 		}
 	}
 	for _, certCfg := range backup.Tables["certificate_configs"] {
-		if err := validateCredentialsJSONObject(backupString(certCfg["dns_credentials"])); err != nil {
+		rawCredentials := backupString(certCfg["dns_credentials"])
+		if err := validateCredentialsJSONObject(rawCredentials); err != nil {
 			return errors.New(invalidCredentialsMsg)
+		}
+		providerName := backupString(certCfg["dns_provider"])
+		if providerName == "" {
+			continue // legacy 空 provider：无专属字段契约可校验
+		}
+		provider, ok := dnsproviders.Get(providerName)
+		if !ok {
+			return fmt.Errorf("备份包含未知的 DNS 提供商: %s", providerName)
+		}
+		if rawCredentials == "" {
+			continue // legacy 空凭证：保持原样，仅在保存时补全
+		}
+		credentials := map[string]string{}
+		if err := json.Unmarshal([]byte(rawCredentials), &credentials); err != nil {
+			return errors.New(invalidCredentialsMsg)
+		}
+		if len(credentials) == 0 {
+			return fmt.Errorf("备份的 DNS 提供商 %s 凭证不能为空对象", providerName)
+		}
+		if _, hasMode := credentials["mode"]; !hasMode {
+			// 旧版本凭证形状（无 mode 判别字段）保持兼容；非空对象不改变
+			// 既有保存语义，下一编辑保存时由前端/provider 归一。
+			continue
+		}
+		if _, err := provider.BuildCredentialsJSON(credentials); err != nil {
+			return fmt.Errorf("备份的 DNS 提供商凭证无效: %w", err)
 		}
 	}
 	return nil
@@ -1511,7 +1671,11 @@ func validateV2BackupCertJobs(tables map[string][]map[string]any) error {
 // 全量替换，备份行才是导入后的真实数据，与 validateBackupRuleReferences
 // 的备份内解析哲学一致；悬挂引用会让引用展开静默跳过，UI 宣称的引用
 // 控制静默失效）。
-func validateV2BackupSecurityPolicies(tables map[string][]map[string]any) error {
+// crsTreeReplaced=true 表示本次导入同时替换 CRS 规则树（历史问题-02，历史
+// 审计）：此时组号/规则 ID 的存在性基准应是导入后的规则树，而 live 索引代表
+// 导入前那一代——按 live 校验会误拒可自愈的旧备份、或反向放行落地后空 Include。
+// 该场景降级为形状校验 + 调用方警告。
+func validateV2BackupSecurityPolicies(tables map[string][]map[string]any, crsTreeReplaced bool) error {
 	ipListIDs := make(map[int]struct{}, len(tables["security_ip_lists"]))
 	ipListValues := make(map[int][]string, len(tables["security_ip_lists"]))
 	for index, row := range tables["security_ip_lists"] {
@@ -1569,7 +1733,7 @@ func validateV2BackupSecurityPolicies(tables map[string][]map[string]any) error 
 				}
 			}
 			value := backupString(raw)
-			if err := validateAndNormalizeCRSField(field, &value); err != nil {
+			if err := validateAndNormalizeCRSField(field, &value, !crsTreeReplaced); err != nil {
 				return fmt.Errorf("安全策略 #%d（%s）：%w", index+1, name, err)
 			}
 			policy[field] = value
@@ -2128,22 +2292,40 @@ func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]
 	}
 	if raw, exists := config["threat_traffic_sample_n"]; exists && raw != nil {
 		value, ok := backupInteger(raw)
-		if !ok || value < -1 || value > 64 {
-			return fmt.Errorf("备份的大屏流量采样必须是 -1 到 64 之间的整数")
+		if !ok {
+			return fmt.Errorf("备份的大屏流量采样必须是整数（-1 自适应 / 0 关闭 / 1 全量）")
+		}
+		// 历史统一契约：仅 -1/0/1。旧备份的固定 2..64（含历史默认 4/8）
+		// 按启动迁移同口径归一到 -1（自适应），导入不因旧契约整包被拒。
+		switch value {
+		case -1, 0, 1:
+		default:
+			config["threat_traffic_sample_n"] = -1
 		}
 	}
+	// 历史问题-5（历史裁定）：0=自动的旧语义废除——导入侧 0 归一为显式默认
+	// （天数 90 / 行数上限 1,000,000，对齐既有「越界钳制」导入风格），其余
+	// 越界/非整数响亮 400；写侧只接受 1..max。
 	for _, item := range []struct {
 		key   string
 		max   int
+		def   int64
 		label string
 	}{
-		{key: "security_events_retention_days", max: 3650, label: "安全事件保留天数"},
-		{key: "security_events_row_cap", max: 100000000, label: "安全事件行数上限"},
+		{key: "security_events_retention_days", max: 3650, def: 90, label: "安全事件保留天数"},
+		{key: "security_events_row_cap", max: 100000000, def: 1000000, label: "安全事件行数上限"},
 	} {
 		if raw, exists := config[item.key]; exists && raw != nil {
 			value, ok := backupInteger(raw)
-			if !ok || value < 0 || value > item.max {
-				return fmt.Errorf("备份的%s必须是 0 到 %d 之间的整数", item.label, item.max)
+			if !ok {
+				return fmt.Errorf("备份的%s必须是整数", item.label)
+			}
+			if value == 0 {
+				config[item.key] = item.def
+				continue
+			}
+			if value < 1 || value > item.max {
+				return fmt.Errorf("备份的%s必须是 1 到 %d 之间的整数", item.label, item.max)
 			}
 		}
 	}
@@ -2294,6 +2476,12 @@ func validateV2BackupAutoBackupConfig(config map[string]any) error {
 			return err
 		}
 		sections = normalizeBackupSectionKeys(sections)
+		// 历史问题-01（历史）：空集必须拒绝，与保存侧同口径——否则落库
+		// "[]" 后消费侧 loadAutoBackupSectionsSetting 每轮 fail-closed，自动
+		// 备份持续失败（导入不得宽于保存侧）。
+		if len(sections) == 0 {
+			return fmt.Errorf("备份范围不能为空")
+		}
 		if _, _, ok := configBackupSectionTables(sections); !ok {
 			return fmt.Errorf("备份的 auto_backup_sections 含未知的配置分类")
 		}
@@ -2856,7 +3044,13 @@ func (h *Handlers) buildLbbakExport(ctx context.Context, sel []string) (payload 
 	}
 	var bundle *services.WafFileBundle
 	if wafFilePhase {
-		bundle = services.BuildWafFileBundleInLock()
+		var complete bool
+		bundle, complete = services.BuildWafFileBundleInLockChecked()
+		if !complete {
+			// 历史问题（历史）：缺件包（瞬时读失败）不得静默导出——恢复时
+			// 会静默缺少 CRS/xdb/威胁名单，且 manifest 只覆盖已写入条目。
+			return nil, nil, "", false, fmt.Errorf("规则库文件读取不完整（CRS/IP2Region/威胁名单存在瞬时读失败），已中止导出，请重试")
+		}
 	}
 	payload, err = buildLbbakPayload(backupJSON, bundle)
 	if err != nil {
@@ -3065,6 +3259,10 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// N+13 H2-F3：空内容拦截页同款软跳过（校验和已在 validateV2Backup 内
 	// 验证完毕，跳过不影响完整性；预览端 ValidateConfigImport 同序）。
 	skipWarnings = append(skipWarnings, skipEmptyBlockPages(backup.Tables)...)
+	if err := validateV2BackupCertJobStatuses(backup.Tables); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		return
+	}
 	// 历史 历史问题：content_type 白名单值域收敛（带外通道门，渲染侧另有双保险）。
 	normalizeBlockPageContentTypes(backup.Tables)
 	if err := validateBackupRuleReferences(backup.Tables); err != nil {
@@ -3075,7 +3273,11 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
-	if err := validateV2BackupSecurityPolicies(backup.Tables); err != nil {
+	// 历史问题-02（历史）：本次导入同时替换 CRS 规则树时，组号/规则 ID 的
+	// 存在性以导入后规则树为准，live 索引不是同一代——降级为形状校验并在
+	// 响应/审计侧告警（crstreeReplacedWarning）。
+	crsTreeReplaced := sectionTables["security_crs_version"] && lbbakFiles != nil && lbbakFiles.CRSTarGz != nil
+	if err := validateV2BackupSecurityPolicies(backup.Tables, crsTreeReplaced); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
@@ -3227,26 +3429,37 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	acmeDanglingRules := 0
 	// 历史问题：导入前快照自动备份开关——提交后仅在 off→on 转换时重置水位线。
 	oldAutoBackupEnabled := 0
-	// 历史问题 配套：两版本表单行是否存在同样在加锁后的同一事务快照内读取。
-	versionRowExistedBefore := map[string]bool{}
-	// 历史问题-1：文件相位先行取 wafFileMu，再开 DB 事务——与 CRS/威胁库更新器
-	// 的 WAF→DB 锁序一致，消除事务→wafFileMu 的 AB-BA。无 WAF 文件时不取锁。
 	wafFilePhase := sectionTables["security_crs_version"] && lbbakFiles != nil &&
 		(lbbakFiles.CRSTarGz != nil || lbbakFiles.Xdb != nil || len(lbbakFiles.ThreatIplists) > 0)
-	if wafFilePhase {
-		services.WafFileLock().Lock()
-		defer services.WafFileLock().Unlock()
-	}
 	if configImportBeforeLock != nil {
 		configImportBeforeLock()
 	}
-	session, err := h.beginConfigImport(ctx)
+	var prelock func() func()
+	if wafFilePhase {
+		prelock = func() func() {
+			services.WafFileLock().Lock()
+			return services.WafFileLock().Unlock
+		}
+	}
+	session, err := h.beginConfigImportWithPrelock(ctx, prelock)
 	if err != nil {
 		respondImportBeginError(c, err)
 		return
 	}
 	defer session.close()
 	tx := session.tx
+	// B3-82-历史问题：初检可能读取 live certificate_configs/ca_providers；从读到
+	// 取得 caddyOpMu 的窗口内 DeleteCertificateConfig 可删除被引用行。此处已在
+	// 锁内，重跑引用/TLS 形态校验；若初检已有悬挂（soft 警告语义）则不改变其
+	// 既有降级口径。
+	if sectionTables["lb_rules"] && !sectionTables["certificate_configs"] && !sectionTables["ca_providers"] && acmeDanglingImported == 0 {
+		if _, err := validateV2BackupTLSShapeSoft(backup.Tables, false); err != nil {
+			err = session.abort(err)
+			recordAudit(c, action+"失败", "配置备份", "导入锁内 ACME/TLS 复核失败: "+err.Error())
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "导入期间规则引用的 DNS/CA 配置已失效，已拒绝导入: " + err.Error()})
+			return
+		}
+	}
 	if (sectionTables["certificate_configs"] || sectionTables["ca_providers"]) && !sectionTables["lb_rules"] {
 		if rows, qerr := tx.QueryContext(ctx, `SELECT COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0) FROM lb_rules WHERE enabled=1 AND tls_source='acme_dns'`); qerr == nil {
 			for rows.Next() {
@@ -3269,14 +3482,21 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	if db.DB != nil {
 		_ = tx.QueryRowContext(ctx, `SELECT COALESCE(auto_backup_enabled,0) FROM global_config WHERE id=1`).Scan(&oldAutoBackupEnabled)
 	}
+	// 历史问题 配套：两版本表单行是否存在同样在加锁后的同一事务快照内读取。
+	versionRowExistedBefore := map[string]bool{}
+	// 历史问题-01：仅记 bool 无法在文件落盘失败时回填导入前本地行——同事务快照
+	// 完整行（含 auto_update/排程/状态），失败分支整行恢复并阻止 rearm 覆盖。
+	versionRowsBefore := map[string][]map[string]any{}
 	for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
-		var count int
-		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE id=1").Scan(&count); err == nil {
-			versionRowExistedBefore[table] = count > 0
-		} else {
-			// 读失败按「既有行」保守处理：不得让清理误删无法确认归属的行。
-			versionRowExistedBefore[table] = true
+		rows, err := dumpTable(ctx, tx, table)
+		if err != nil {
+			err = session.abort(err)
+			recordAudit(c, action+"失败", "配置备份", "快照版本行失败: "+err.Error())
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
+			return
 		}
+		versionRowsBefore[table] = rows
+		versionRowExistedBefore[table] = len(rows) > 0
 	}
 	// W2：security_ip_lists 先删/先插 security_policies——refs 是策略行上的
 	// JSON 引用（无外键，顺序本自由），固定 lists→policies 与集群 apply 侧
@@ -3585,6 +3805,32 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
 				return
 			}
+			// 历史问题-01：导入前的本地版本/排程行必须整行回填，不能留下零行让
+			// rearm 用默认种子覆盖（磁盘仍是旧文件，记录必须对应当前文件）。
+			if localRows := versionRowsBefore[item.table]; len(localRows) > 0 {
+				if err := restoreTable(ctx, tx, db.DB, item.table, localRows); err != nil {
+					err = session.abort(err)
+					recordAudit(c, action+"失败", "配置备份", "恢复本地版本记录失败: "+err.Error())
+					c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
+					return
+				}
+			}
+		}
+		// B3-82-历史问题：CRS 规则树实际未落盘时，早前的「按新树降级只做形状
+		// 校验」不再成立——必须按仍生效的 live 索引重验策略，避免落库空 Include。
+		if crsTreeReplaced && wafApply.FailedCRS {
+			crsTreeReplaced = false
+			if verifyErr := validateV2BackupSecurityPolicies(backup.Tables, false); verifyErr != nil {
+				err = session.abort(verifyErr)
+				recordAudit(c, action+"失败", "配置备份", "CRS 文件未落盘，安全策略按现有规则库校验失败: "+verifyErr.Error())
+				failureWarnings := append([]string{}, skipWarnings...)
+				failureWarnings = append(failureWarnings, wafApply.Warnings...)
+				if wafApply.FilesLanded {
+					failureWarnings = append(failureWarnings, "部分规则库文件已按备份落盘，但数据库已回滚——文件与版本记录可能分裂，请重新导入或触发规则库更新以收敛")
+				}
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "CRS 规则库文件未落盘，备份安全策略与现有规则库不兼容，已回滚: " + verifyErr.Error(), Data: gin.H{"summary": counts, "warnings": failureWarnings}})
+				return
+			}
 		}
 		// 历史问题：逐源失败——整行回滚为本地快照（表已全量替换；成功源仍按
 		// 备份行导入，失败源保留本地文件与记录）。
@@ -3624,38 +3870,37 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
 		return
 	}
+	var queueRecoveryErr error
 	if err := session.commit(affectedRuleIDs, pendingCertificates); err != nil {
-		status := http.StatusInternalServerError
-		message := "配置" + action + "失败: " + err.Error()
-		if importFailureCaddyRejected(err) {
-			status = http.StatusBadRequest
-			message = "备份生成的配置未通过 Caddy 验证，未执行" + action + ": " + err.Error()
-		}
 		if importFailurePhase(err) == importPhaseQueue {
-			message = "配置已" + action + "但证书任务恢复失败: " + err.Error()
+			// 历史问题-02：数据库已提交。queue 恢复失败属于部分失败，必须继续
+			// 全部提交后收敛（缓存失效/哨兵清理/驱动同步），最后再返回 500。
+			queueRecoveryErr = err
+			recordAudit(c, "部分失败", "配置备份", err.Error())
+		} else {
+			status := http.StatusInternalServerError
+			message := "配置" + action + "失败: " + err.Error()
+			if importFailureCaddyRejected(err) {
+				status = http.StatusBadRequest
+				message = "备份生成的配置未通过 Caddy 验证，未执行" + action + ": " + err.Error()
+			}
+			auditAction := action + "失败"
+			auditDetail := err.Error()
+			recordAudit(c, auditAction, "配置备份", auditDetail)
+			failureWarnings := skipWarnings
+			if len(wafApply.Warnings) > 0 {
+				// 历史问题-F4/历史问题/03/08:未落盘文件/源的告警必须随失败响应可见
+				// （记录已按同批语义丢弃），不得只在审计侧留痕。
+				failureWarnings = append(append([]string{}, failureWarnings...), wafApply.Warnings...)
+			} else if wafApply.FilesLanded {
+				// 历史问题（历史）：文件成功落盘+commit 失败=文件与版本记录分裂
+				//（旧备份 CRS 覆盖新系统等）——曾仅审计可重构、响应对用户静默。
+				failureWarnings = append(append([]string{}, failureWarnings...),
+					"规则库文件已按备份落盘，但数据库已回滚——文件与版本记录已分裂，请重新导入或触发规则库更新以收敛")
+			}
+			c.JSON(status, models.APIResponse{Code: status, Message: message, Data: gin.H{"summary": counts, "disabled_conflicts": disabledConflicts, "warnings": failureWarnings}})
+			return
 		}
-		auditAction := action + "失败"
-		if importFailurePhase(err) == importPhaseQueue {
-			auditAction = "部分失败"
-		}
-		auditDetail := err.Error()
-		if importFailurePhase(err) == importPhaseQueue && len(disabledConflicts) > 0 {
-			auditDetail = services.FormatAuditDetail(auditDetail, "冲突置为禁用："+formatDisabledRuleConflicts(disabledConflicts))
-		}
-		recordAudit(c, auditAction, "配置备份", auditDetail)
-		failureWarnings := skipWarnings
-		if len(wafApply.Warnings) > 0 {
-			// 历史问题-F4/历史问题/03/08:未落盘文件/源的告警必须随失败响应可见
-			// （记录已按同批语义丢弃），不得只在审计侧留痕。
-			failureWarnings = append(append([]string{}, failureWarnings...), wafApply.Warnings...)
-		} else if wafApply.FilesLanded {
-			// 历史问题（历史）：文件成功落盘+commit 失败=文件与版本记录分裂
-			//（旧备份 CRS 覆盖新系统等）——曾仅审计可重构、响应对用户静默。
-			failureWarnings = append(append([]string{}, failureWarnings...),
-				"规则库文件已按备份落盘，但数据库已回滚——文件与版本记录已分裂，请重新导入或触发规则库更新以收敛")
-		}
-		c.JSON(status, models.APIResponse{Code: status, Message: message, Data: gin.H{"summary": counts, "disabled_conflicts": disabledConflicts, "warnings": failureWarnings}})
-		return
 	}
 	// U04B-07：branding_json 只是文件镜像。提交成功后把备份值物化到
 	// branding.json，再刷新镜像与默认页面；否则下一次镜像会把 DB 回写成旧文件。
@@ -3692,6 +3937,14 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	// 更正确；Reset 代价=未受导入影响的 IP 计数清零重新累计（观察态一个窗口内
 	// 自愈）。预览端（ValidateConfigImport）零写入语义、不发生替换，不接清桶。
 	if _, listsReplaced := backup.Tables["security_ip_lists"]; listsReplaced {
+		// 历史问题-1（历史）：导入是全表替换——旧备份可能不含 system=1
+		// 预置行（或含同名 system=0 用户列表使启动播种按名跳过）。提交成功后
+		// 按 db 种子表补播全部内置 system 名单（威胁三源 + 自动封禁），与默认
+		// 拦截页 reseed 同位、同「提交成功后收敛」语义；幂等（已存在零写入），
+		// 失败仅告警不影响已提交导入。
+		if err := db.SeedSystemIPLists(db.DB); err != nil {
+			recordAudit(c, action+"警告", "配置备份", "内置系统名单补播失败: "+err.Error())
+		}
 		services.ResetAutobanCounters()
 	}
 	if reseedBlockPageNeeded {
@@ -3762,8 +4015,10 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	if operatorReplaced {
 		auditParts = append(auditParts, "操作者账户已被备份替换,请使用备份内管理员登录")
 	}
-	auditParts = append(auditParts, services.AuditResultPart("success"))
-	recordAudit(c, action, "配置备份", services.FormatAuditDetail(auditParts...))
+	if queueRecoveryErr == nil {
+		auditParts = append(auditParts, services.AuditResultPart("success"))
+		recordAudit(c, action, "配置备份", services.FormatAuditDetail(auditParts...))
+	}
 	recordAudit(c, "重载", "Caddy服务", action+"配置后自动重载")
 	// 2026-09-07 审计 L4（round5 F2 修正）：导入成功后清除陈旧 caddy_apply_error
 	// ——但 reseed 失败时不清（reseed 的 caddyApplyNoteLocked 可能刚写入
@@ -3783,6 +4038,9 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	if wafMetadataSkipped {
 		responseWarnings = append(append([]string{}, responseWarnings...), warningWafMetadataSkipped)
 	}
+	if crsTreeReplaced {
+		responseWarnings = append(append([]string{}, responseWarnings...), warningCRSTreeReplaced)
+	}
 	if wafCRSMetadataSkipped {
 		responseWarnings = append(append([]string{}, responseWarnings...), warningWafCRSMetadataSkipped)
 	}
@@ -3793,6 +4051,9 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	// 兼容），但响应与审计必须可见「内容未经完整性校验」。
 	if len(lbbakUnregisteredThreat) > 0 {
 		unregisteredDetail := fmt.Sprintf("lbbak 含 manifest 未登记的威胁库条目（%s）——内容未经完整性校验，已按原样落盘；建议核实来源后重新导出备份", strings.Join(lbbakUnregisteredThreat, "、"))
+		if lbbakFiles == nil || !sectionTables["security_crs_version"] {
+			unregisteredDetail = fmt.Sprintf("lbbak 含 manifest 未登记的威胁库条目（%s）——内容未经完整性校验；本次分类未选择安全防护数据，条目未导入、未落盘", strings.Join(lbbakUnregisteredThreat, "、"))
+		}
 		recordAudit(c, action+"警告", "配置备份", unregisteredDetail)
 		responseWarnings = append(append([]string{}, responseWarnings...), unregisteredDetail)
 	}
@@ -3864,6 +4125,11 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	// 历史问题（历史）：api_keys 已随导入整体替换——清空白名单 CIDR
 	// 解析缓存（逐 Key 清扫无法枚举存活 Key；重建廉价）。
 	purgeAllAPIKeyWhitelistCache()
+	if queueRecoveryErr != nil {
+		responseWarnings = append(responseWarnings, "数据库已提交，但证书任务恢复失败: "+queueRecoveryErr.Error())
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "配置已" + action + "但证书任务恢复失败: " + queueRecoveryErr.Error(), Data: gin.H{"summary": counts, "disabled_conflicts": disabledConflicts, "warnings": responseWarnings}})
+		return
+	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: fmt.Sprintf("配置"+action+"成功：%s", strings.ReplaceAll(counts, "；", "、")), Data: gin.H{"summary": counts, "disabled_conflicts": disabledConflicts, "warnings": responseWarnings}})
 }
 

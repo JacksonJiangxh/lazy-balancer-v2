@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -17,6 +19,48 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
+func TestSetClusterMode_rejectsRegisteringNodeAsItsOwnSlave(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	var registrationCalls atomic.Int32
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		registrationCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"registration_id":1,"registration_secret":"secret"}}`))
+	}))
+	defer master.Close()
+	parsed, err := url.Parse(master.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.cfg.NodeName = "self-node"
+	h.cfg.Port = port
+	h.syncService = services.NewSyncService(db.DB, h.cfg, services.NewCaddyService("http://127.0.0.1:1"))
+	router := gin.New()
+	router.POST("/cluster/mode", h.SetClusterMode)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/cluster/mode", strings.NewReader(`{"mode":"slave","master_url":"`+master.URL+`","register_token":"one-time"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "不能将本节点注册为自己的从节点") {
+		t.Fatalf("status=%d body=%s, want self-registration 400", response.Code, response.Body.String())
+	}
+	if got := registrationCalls.Load(); got != 0 {
+		t.Fatalf("registration calls=%d, self-registration must be rejected before network", got)
+	}
+	var isMaster bool
+	if err := db.DB.QueryRow("SELECT is_master FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
+		t.Fatal(err)
+	}
+	if !isMaster {
+		t.Fatal("rejected self-registration changed node role")
+	}
+}
+
 func TestSetClusterMode_returns_registration_id_when_local_transition_fails(t *testing.T) {
 	// Given
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
@@ -26,6 +70,7 @@ func TestSetClusterMode_returns_registration_id_when_local_transition_fails(t *t
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
 	})
 	// CLUSTER-1（历史）：本地转换失败的注入不再关闭包级 db.DB——
 	// 假 handler 关包级句柄会污染全局状态（Cleanup 前的审计与断言全踩
@@ -92,6 +137,7 @@ func TestPromoteClusterNode_reportsUnavailableBeforePromoting(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
 	})
 	if _, err := db.DB.Exec("UPDATE global_config SET is_master=0, master_url='', cluster_token='' WHERE id=1"); err != nil {
 		t.Fatal(err)
@@ -127,6 +173,7 @@ func TestSetClusterMode_rejectsCredentialedMasterURLWithoutAuditingCredentials(t
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
 	})
 	master := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("credentialed master URL reached the remote server")

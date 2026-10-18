@@ -451,3 +451,43 @@ func TestImportConfigBackup_normalizesNullHealthCheckTimeout(t *testing.T) {
 		t.Fatalf("NULL health_check_timeout must normalize to 2, got %d", got)
 	}
 }
+
+// 历史问题-02（历史）：导入同时替换 CRS 规则树时，策略的组号/规则 ID
+// 存在性不得按导入前 live 索引判定（基准不同代）——降级为形状校验并进警告。
+// 对照：纯 JSON 备份（不替换规则树）仍按 live 索引 400。
+func TestValidateImport_crsTreeReplacementSkipsLiveIndexExistence(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	policyRow := map[string]any{
+		"id": 1, "name": "crs-policy", "mode": "blocking", "enabled": 1,
+		"crs_rule_groups": `["42"]`,
+	}
+	backupJSON := r78BackupJSON(t, map[string][]map[string]any{"security_policies": {policyRow}}, nil, []string{"security"})
+
+	// 对照：纯 JSON 备份不携带 CRS 文件 → 按 live 索引（测试环境无规则目录）
+	// 判「规则组不存在」。
+	plain := r78PostValidate(t, h, []byte(backupJSON))
+	if plain.Valid || !strings.Contains(plain.Error, "规则组不存在于当前 CRS") {
+		t.Fatalf("plain json valid=%v error=%q, want invalid 且点名组号不存在", plain.Valid, plain.Error)
+	}
+
+	// 携带 CRS tar 的 lbbak：同一策略行必须放行，并给出「未按当前规则库校验」警告。
+	payload, err := buildLbbakPayload([]byte(backupJSON), &services.WafFileBundle{
+		CRSVersion: "test-crs", CRSSha256: "deadbeef", CRSTarGz: []byte("dummy-crs-tar"),
+	})
+	if err != nil {
+		t.Fatalf("buildLbbakPayload: %v", err)
+	}
+	response := r78PostValidate(t, h, payload)
+	if !response.Valid {
+		t.Fatalf("lbbak preview valid=false error=%q, want valid (live 索引不参与判定)", response.Error)
+	}
+	found := false
+	for _, warning := range response.Warnings {
+		if strings.Contains(warning, "未按当前规则库做存在性校验") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("warnings=%v, want CRS 基准降级提示", response.Warnings)
+	}
+}

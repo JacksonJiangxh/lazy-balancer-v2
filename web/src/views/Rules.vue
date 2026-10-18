@@ -24,6 +24,15 @@
       <div class="polling-error-meta">{{ certPollingErrorDescription }}</div>
     </el-alert>
 
+    <el-alert v-if="securityBindingsError" type="warning" :closable="false" show-icon class="polling-error-alert">
+      <template #title>
+        <div class="polling-error-title">
+          <span>安全策略绑定数据加载失败：锁图标与流程投影可能显示为未绑定（非真实状态）</span>
+          <el-button link type="warning" :loading="loading" @click="retrySecurityBindings">重新加载</el-button>
+        </div>
+      </template>
+    </el-alert>
+
     <el-card>
       <div class="table-toolbar">
         <el-input v-model="searchQuery" placeholder="搜索规则名 / 域名 / 端口 / ID" clearable :prefix-icon="Search" class="search-input" />
@@ -1204,6 +1213,8 @@ import { getStrategyLabel } from '@/utils/strategyLabels'
 import { popperViewportSafe } from '@/utils/popper'
 import { hostPortKey } from '@/utils/upstreamKeys'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, redistributeWeight, weightPercent } from '@/utils/upstreamWeights'
+import { projectRuleFlowPath } from '@/utils/ruleFlow'
+import { dnsServerAfterToggle } from '@/utils/ruleWizard'
 import { certJobStatusLabel } from '@/utils/certJobStatus'
 import type { CertJobStatus } from '@/utils/certJobStatus'
 import { usePollingTask } from '@/composables/usePollingTask'
@@ -1403,6 +1414,7 @@ const securityPolicies = ref<SecurityStagePolicy[]>([])
 const ipLists = ref<SecurityStageIPList[]>([])
 const blockPages = ref<SecurityStageBlockPage[]>([])
 
+const securityBindingsError = ref(false)
 const fetchSecurityBindings = async () => {
   try {
     const [bindingsRes, policiesRes, ipListRes, blockPagesRes] = await Promise.all([
@@ -1415,10 +1427,17 @@ const fetchSecurityBindings = async () => {
     if (policiesRes.data) securityPolicies.value = policiesRes.data
     if (ipListRes.data) ipLists.value = ipListRes.data
     if (blockPagesRes.data) blockPages.value = blockPagesRes.data
-  } catch { /* silent */ }
+    securityBindingsError.value = false
+  } catch {
+    // 历史问题-F11：四端点任一失败时保持的数据为空，锁图标会渲染成「未绑定」、
+    // 流程投影全灰——整体静默等于把加载失败伪装成真实安全状态。改为显性横幅
+    // （模板带「重新加载」），全局拦截器仍会 toast 一次具体错误。
+    securityBindingsError.value = true
+  }
 }
+const retrySecurityBindings = (): void => { void fetchSecurityBindings() }
 
-// 每条规则的三阶段分组投影缓存（规则/绑定/策略/名单/拦截页任一变化即整体重算——
+// 每条规则的四阶段分组投影缓存（规则/绑定/策略/名单/拦截页任一变化即整体重算——
 // 分页后可见行规模小，重算成本可忽略）
 const ruleStageModelMap = computed<Map<string, RuleStageModel>>(() => {
   const map = new Map<string, RuleStageModel>()
@@ -2140,12 +2159,10 @@ watch(() => wizardForm.protocol, (newVal, oldVal) => {
   }
 }, { flush: 'sync' })
 
-// Watch for enable_dns_server toggle to clear DNS fields when disabled
+// 水合 false 配置时保留已存 dns_server；仅用户主动关闭才清空。
 watch(() => wizardForm.enable_dns_server, (newVal) => {
-  if (!newVal) {
-    wizardForm.dns_server = ''
-  }
-})
+  wizardForm.dns_server = dnsServerAfterToggle(wizardForm.dns_server, newVal, hydratingWizard)
+}, { flush: 'sync' })
 
 // Watch for enable_active_health_check toggle to set default path / TCP port
 watch(() => wizardForm.enable_active_health_check, (newVal) => {
@@ -2590,6 +2607,8 @@ const resetWizard = () => {
   editingRule.value = null
   isCopyMode.value = false
   copySourceRuleId.value = null
+  wizardForm.enable_dns_server = false
+  wizardForm.dns_server = ''
   currentStep.value = WIZARD_STEP.BASIC
 }
 
@@ -2871,6 +2890,14 @@ const submitWizard = async () => {
   }
   // 历史 历史问题：TLS 步校验镜像（跳步绕过 nextStep 时提交前兜底）
   if (wizardForm.enable_tls && wizardForm.protocol === 'http') {
+    // 历史问题-F6：ACME 引用门同镜像——后端 validateRuleACMEReferences 在
+    // enable_tls+acme_dns 且 acme_config_id=0 时返回 400；不在此前置拦截时
+    // 从 TLS 步直接跳预览保存才报错，晚且无定位。
+    if (wizardForm.tls_source === 'acme_dns' && !wizardForm.acme_config_id) {
+      ElMessage.warning('请选择 DNS 提供商配置')
+      saving.value = false
+      return
+    }
     // 历史问题-1:补 tlsKeySet 豁免(与 nextStep TLS 步同款条件——掩码私钥未粘贴
     // 新私钥时允许通过,历史问题 契约:空 key+tlsKeySet=保留原私钥)
     if (!wizardForm.tls_cert?.trim() || (!wizardForm.tls_key?.trim() && !wizardForm.tlsKeySet)) {
@@ -3191,15 +3218,12 @@ const openFlowDialog = (rule: Rule): void => {
       max_connections: u.max_connections ?? 0,
       enabled: u.enabled !== false,
     })),
-    // 路由分发节点数据源：与健康浮层 healthPathRules 同门（仅 custom_routes_enabled），
-    // 零上游路径行不投影（同浮层口径）；PathRuleUpstream 无 enabled 概念，列出即生效
-    pathRules: healthPathRules(rule)
-      .filter((pr) => (pr.upstreams?.length ?? 0) > 0)
-      .map((pr) => ({
-        path: pr.path,
-        match_type: pr.match_type,
-        upstreams: (pr.upstreams || []).map((u) => ({ host: u.address, port: u.port, enabled: true })),
-      })),
+    // 路由分发节点数据源：与健康浮层 healthPathRules 同门（仅 custom_routes_enabled）。
+    // 历史问题-F7：静态返回 / 301 跳转的路径规则也投影（此前按「有上游」过滤，
+    // 与预览「全部 path_rules 计数」口径分叉，且这两类路由在唯一呈现处完全不可见）；
+    // PathRuleUpstream 无 enabled 概念，列出即生效
+    // 历史问题-02：upstreams=null 原样保留，流程弹框据此显示「跟随主路由上游」。
+    pathRules: healthPathRules(rule).map(projectRuleFlowPath),
     health: health ? { healthy: health.healthy, unhealthy: health.unhealthy, degraded: health.degraded, unknown: health.unknown, na: health.na, total: health.total } : undefined,
     upstreamHealth,
   }

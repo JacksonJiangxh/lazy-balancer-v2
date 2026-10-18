@@ -2,8 +2,11 @@ package services
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"testing"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -85,5 +88,133 @@ func TestReplaceSnapshotTx_DisabledSwitchKeepsLocalAndIgnoresSnapshot(t *testing
 	tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&count)
 	if count != 1 {
 		t.Fatalf("snapshot user must not be inserted when switch off, got %d users", count)
+	}
+}
+
+func applySnapshotBasicSettingsForTest(t *testing.T, database *sql.DB, settings models.ClusterBasicSettings) {
+	t.Helper()
+	tx, err := database.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err := updateSnapshotSettings(context.Background(), tx, models.ClusterSnapshot{BasicSettings: settings}); err != nil {
+		t.Fatalf("update snapshot settings: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateSnapshotSettings_normalizesCertExpiryDays(t *testing.T) {
+	for _, tc := range []struct {
+		stored int
+		want   int
+	}{
+		{stored: 0, want: db.DefaultCertExpiryDays},
+		{stored: 366, want: db.DefaultCertExpiryDays},
+		{stored: 100000, want: db.DefaultCertExpiryDays},
+		{stored: 1, want: 1},
+		{stored: 365, want: 365},
+	} {
+		t.Run(fmt.Sprint(tc.stored), func(t *testing.T) {
+			_, database := newClusterTestService(t)
+			applySnapshotBasicSettingsForTest(t, database, models.ClusterBasicSettings{CertExpiryDays: new(tc.stored)})
+			var got int
+			if err := database.QueryRow("SELECT cert_expiry_days FROM global_config WHERE id=1").Scan(&got); err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("cert_expiry_days=%d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUpdateSnapshotSettings_normalizesSyncInterval(t *testing.T) {
+	for _, tc := range []struct {
+		stored int
+		want   int
+	}{
+		{stored: 5, want: 60},
+		{stored: 86401, want: 86400},
+		{stored: 1000000, want: 86400},
+		{stored: 10, want: 10},
+		{stored: 86400, want: 86400},
+	} {
+		t.Run(fmt.Sprint(tc.stored), func(t *testing.T) {
+			_, database := newClusterTestService(t)
+			applySnapshotBasicSettingsForTest(t, database, models.ClusterBasicSettings{SyncInterval: new(tc.stored)})
+			var got int
+			if err := database.QueryRow("SELECT sync_interval FROM global_config WHERE id=1").Scan(&got); err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("sync_interval=%d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReplaceSnapshotTx_usersSkipNormalizesSyncInterval(t *testing.T) {
+	_, database := newClusterTestService(t)
+	if _, err := database.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := database.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	snapshot := models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{SyncInterval: new(1000000)}}
+	if err := replaceSnapshotTx(context.Background(), tx, snapshot, &sectionSkips{disabled: map[string]bool{"users": true}, unchanged: map[string]bool{}}); err != nil {
+		t.Fatal(err)
+	}
+	var got int
+	if err := tx.QueryRow("SELECT sync_interval FROM global_config WHERE id=1").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != 86400 {
+		t.Fatalf("sync_interval=%d, want upper clamp 86400 on users-skip path", got)
+	}
+}
+
+func TestUpdateSnapshotSettings_normalizesSecurityEventValueDomains(t *testing.T) {
+	_, database := newClusterTestService(t)
+	applySnapshotBasicSettingsForTest(t, database, models.ClusterBasicSettings{
+		ThreatTrafficSampleN:        new(8),
+		SecurityEventsRetentionDays: new(3651),
+		SecurityEventsRowCap:        new(100000001),
+	})
+	var sample, days, cap int
+	if err := database.QueryRow(`SELECT threat_traffic_sample_n,security_events_retention_days,security_events_row_cap FROM global_config WHERE id=1`).Scan(&sample, &days, &cap); err != nil {
+		t.Fatal(err)
+	}
+	if sample != -1 || days != securityEventsRetentionDefaultDays || cap != securityEventsRetentionDefaultMax {
+		t.Fatalf("normalized=(sample %d,days %d,cap %d), want -1/%d/%d", sample, days, cap, securityEventsRetentionDefaultDays, securityEventsRetentionDefaultMax)
+	}
+
+	applySnapshotBasicSettingsForTest(t, database, models.ClusterBasicSettings{
+		ThreatTrafficSampleN:        new(100),
+		SecurityEventsRetentionDays: new(-1),
+		SecurityEventsRowCap:        new(0),
+	})
+	if err := database.QueryRow(`SELECT threat_traffic_sample_n,security_events_retention_days,security_events_row_cap FROM global_config WHERE id=1`).Scan(&sample, &days, &cap); err != nil {
+		t.Fatal(err)
+	}
+	if sample != -1 || days != securityEventsRetentionDefaultDays || cap != securityEventsRetentionDefaultMax {
+		t.Fatalf("normalized lower/bogus=(sample %d,days %d,cap %d)", sample, days, cap)
+	}
+
+	applySnapshotBasicSettingsForTest(t, database, models.ClusterBasicSettings{
+		ThreatTrafficSampleN:        new(1),
+		SecurityEventsRetentionDays: new(3650),
+		SecurityEventsRowCap:        new(100000000),
+	})
+	if err := database.QueryRow(`SELECT threat_traffic_sample_n,security_events_retention_days,security_events_row_cap FROM global_config WHERE id=1`).Scan(&sample, &days, &cap); err != nil {
+		t.Fatal(err)
+	}
+	if sample != 1 || days != 3650 || cap != 100000000 {
+		t.Fatalf("valid values changed=(sample %d,days %d,cap %d)", sample, days, cap)
 	}
 }

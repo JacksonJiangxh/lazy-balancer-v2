@@ -260,7 +260,8 @@ func TestSecurityPolicyHasIPControl_refsOnlyTruthTable(t *testing.T) {
 	}{
 		{"ACL refs only, enabled", &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "deny", IPACLList: "[]", IPACLListRefs: "[3]"}, true},
 		{"ACL refs only, toggle off", &models.SecurityPolicy{IPACLMode: "deny", IPACLList: "[]", IPACLListRefs: "[3]"}, false},
-		{"whitelist refs only, enabled", &models.SecurityPolicy{IPWhitelistEnabled: true, IPWhitelistRefs: "[3]"}, true},
+		{"whitelist refs only, enabled", &models.SecurityPolicy{IPWhitelistEnabled: true, IPWhitelistRefs: "[3]", MergedWhitelist: []string{"198.51.100.7"}}, true},
+		{"whitelist refs only, enabled but unresolved", &models.SecurityPolicy{IPWhitelistEnabled: true, IPWhitelistRefs: "[3]"}, false},
 		{"whitelist refs only, toggle off", &models.SecurityPolicy{IPWhitelistRefs: "[3]"}, false},
 		// 始终发射收敛（2026-10-15）：ACL 开启即恒发射（allow+空名单
 		// 表示拒绝全部）；信任名单（默认 flag 非 opt-in）维持内容门控。

@@ -1251,7 +1251,7 @@ func mfaStepUpGuard() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "节点角色查询失败"})
 			return
 		}
-		if err := database.QueryRowContext(c.Request.Context(), "SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
+		if isMaster, err = services.RoleOf(c.Request.Context(), database); err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "节点角色查询失败"})
 			return
 		}

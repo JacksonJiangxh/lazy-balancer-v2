@@ -44,6 +44,11 @@ func SecurityEventsRetentionSummary() string {
 // securityEventsRetentionPolicyFromDB 读取安全事件保留策略（独立配置项）：
 // security_events_retention_days / security_events_row_cap；0/缺省使用内置
 // 默认 90 天 / 100 万行。审计日志保留月数只作用于 audit_logs，不参与本表。
+//
+// 历史问题-5（历史裁定）：写侧拒绝 0（retention 1..3650、row_cap 1..1e8），
+// 导入把 0 归一为默认值，SVC 以一次性 marker 迁移存量 0/NULL。读侧保留本
+// 0/NULL → 内置默认的 legacy 防御（带外写库/旧库），行为不变——不回写、不
+// 改写库值。
 func securityEventsRetentionPolicyFromDB() securityEventsRetentionPolicy {
 	policy := securityEventsRetentionPolicy{Days: securityEventsRetentionDefaultDays, Max: securityEventsRetentionDefaultMax}
 	database := db.DB
@@ -80,7 +85,14 @@ func securityEventsRetentionSettings() (days, max int) {
 // SecurityEventsRetentionCleanupOnce 单轮过期事件清理（引擎每日节拍），按保留期
 // 清理安全事件并返回删除条数（§6.5 摘要行数据源）。
 func SecurityEventsRetentionCleanupOnce() int {
-	return securityEventsRetentionCleanup(context.Background())
+	return SecurityEventsRetentionCleanupCtx(context.Background())
+}
+
+// SecurityEventsRetentionCleanupCtx 生产入口（历史问题-06）：任务体传 rc.Ctx——
+// 批间 ctx.Done() 分支才在生产可达（停机时百万行清理可及时中止，不拖过宽限期
+// 被 SIGKILL 跳过 db.Close/WAL 落盘）。Once 的无 ctx 包装保留给测试/兼容调用。
+func SecurityEventsRetentionCleanupCtx(ctx context.Context) int {
+	return securityEventsRetentionCleanup(ctx)
 }
 
 func securityEventsRetentionCleanup(ctx context.Context) int {

@@ -186,6 +186,10 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 		return
 	}
 
+	// 与规则写/删除配置共用临界区：引用检查与 enabled 写入必须相对规则绑定原子。
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
+
 	// LBS/LBH-4（历史 历史问题）：旧行读取与动态 UPDATE 收敛到同一事务
 	//（_txlock=immediate → BEGIN IMMEDIATE 先取写锁）——审计 changed 清单的
 	//比对基线即写入前那一刻的真实行，消除「事务外预读 → 写入」窗口内并发
@@ -252,6 +256,57 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 	if _, err := provider.BuildCredentialsJSON(effectiveCredentials); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
+	}
+
+	// 禁用会使启用中的 ACME 规则在下一次签发/续期才失败；与删除路径一样
+	// 提前 409 点名引用方。禁用规则的历史绑定不阻止停用，重新启用规则时
+	// 仍由 validateRuleACMEReferences 拒绝绑定已禁用配置。
+	if req.Enabled != nil && !*req.Enabled && oldEnabled {
+		refs, err := tx.QueryContext(c.Request.Context(), `SELECT caddy_id, COALESCE(domain,'') FROM lb_rules WHERE acme_config_id=? AND enabled=1 AND tls_source='acme_dns' ORDER BY caddy_id`, id)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to check rule references"})
+			return
+		}
+		type ruleRef struct{ caddyID, domain string }
+		var references []ruleRef
+		for refs.Next() {
+			var ref ruleRef
+			if err := refs.Scan(&ref.caddyID, &ref.domain); err != nil {
+				refs.Close()
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to check rule references"})
+				return
+			}
+			references = append(references, ref)
+		}
+		if err := refs.Err(); err != nil {
+			refs.Close()
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to check rule references"})
+			return
+		}
+		if err := refs.Close(); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to check rule references"})
+			return
+		}
+		if len(references) > 0 {
+			const maxListedReferences = 5
+			listed := make([]string, 0, len(references))
+			for _, ref := range references {
+				if len(listed) == maxListedReferences {
+					break
+				}
+				if ref.domain != "" {
+					listed = append(listed, fmt.Sprintf("%s (%s)", ref.domain, ref.caddyID))
+				} else {
+					listed = append(listed, ref.caddyID)
+				}
+			}
+			message := fmt.Sprintf("该 DNS 配置正被 %d 条启用中的 ACME 规则引用，禁用后这些规则将无法自动签发/续签证书，请先修改规则的 DNS 配置后再禁用：%s", len(references), strings.Join(listed, "、"))
+			if len(references) > maxListedReferences {
+				message += fmt.Sprintf(" 等 %d 条规则", len(references))
+			}
+			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: message})
+			return
+		}
 	}
 
 	changed := []string{}
@@ -497,13 +552,14 @@ func (h *Handlers) TestCertificateConfig(c *gin.Context) {
 // ListCertificates 返回证书任务聚合清单(C-F3,2026-09-10 审计:原实现请求
 // Caddy /pki/ca/local 返回内部 local CA 信息——与业务证书无关(autoHTTPS 已
 // disable_certificates,证书由 cert_jobs 落盘经 load_files 加载),前端零消费、
-// MCP 描述误导。改为从 cert_jobs 聚合每域名最新任务)。
+// MCP 描述误导。改为从 cert_jobs 聚合每规则、每域名最新任务；同域不同规则
+// 不得互相折叠，disabled/历史行也不能遮蔽其他规则的已签发证书。
 func (h *Handlers) ListCertificates(c *gin.Context) {
 	rows, err := db.DB.Query(`
 		SELECT j.id, j.rule_id, j.domain, j.status, COALESCE(j.message,''), COALESCE(j.expires_at,''), COALESCE(j.updated_at,'')
 		FROM cert_jobs j
-		WHERE j.id = (SELECT MAX(j2.id) FROM cert_jobs j2 WHERE j2.domain = j.domain)
-		ORDER BY j.domain`)
+		WHERE j.id = (SELECT MAX(j2.id) FROM cert_jobs j2 WHERE j2.rule_id = j.rule_id AND j2.domain = j.domain)
+		ORDER BY j.domain, j.rule_id`)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询证书任务失败"})
 		return

@@ -44,6 +44,33 @@ func TestSanitizeBundleVersion(t *testing.T) {
 	}
 }
 
+func TestBuildWafFileBundleInLockChecked_reportsRefReadFailure(t *testing.T) {
+	src := t.TempDir()
+	crsDir := filepath.Join(src, "crs")
+	if err := os.MkdirAll(filepath.Join(crsDir, "rules"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", "a.conf"), []byte("SecRule X 1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// VERSION 是目录 → Ref 构造读取失败；旧实现静默省略后仍宣称完整。
+	if err := os.Mkdir(filepath.Join(crsDir, "VERSION"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	oldLive := crsLiveDir
+	oldXdb := ip2regionLivePath
+	crsLiveDir = crsDir
+	ip2regionLivePath = filepath.Join(src, "ip2region.xdb")
+	t.Cleanup(func() { crsLiveDir, ip2regionLivePath = oldLive, oldXdb })
+
+	WafFileLock().Lock()
+	_, complete := BuildWafFileBundleInLockChecked()
+	WafFileLock().Unlock()
+	if complete {
+		t.Fatal("ref read failure was silently reported as a complete bundle")
+	}
+}
+
 func TestWafFileBundleRoundTrip(t *testing.T) {
 	src := t.TempDir()
 	rules := filepath.Join(src, "crs", "rules")
@@ -436,6 +463,48 @@ func TestUntarGzTo_midCopyFailure_restoresPureOldTree(t *testing.T) {
 			names = append(names, entry.Name())
 		}
 		t.Fatalf("destDir entries=%v, want exactly [old.conf]（纯旧树）", names)
+	}
+}
+
+func TestUntarGzTo_firstInstall_midCopyFailure_leavesNoPartialTree(t *testing.T) {
+	// Given：destDir 不存在（首装）且 copy 回退在复制新文件后失败。
+	destDir := filepath.Join(t.TempDir(), "crs")
+	newTree := t.TempDir()
+	if err := os.WriteFile(filepath.Join(newTree, "a-new.conf"), []byte("SecRule NEW"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	data, _, err := tarGzDir(newTree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging := destDir + ".sync-in"
+	planted := filepath.Join(staging, "z-planted")
+	if err := os.MkdirAll(planted, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(planted, "inner"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(planted, 0000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(planted, 0755)
+		_ = os.Chmod(filepath.Join(destDir, "z-planted"), 0755)
+		_ = os.RemoveAll(staging)
+		_ = os.RemoveAll(destDir)
+	})
+	forceRenameFailure(t)
+
+	// When
+	err = untarGzTo(data, destDir, "")
+
+	// Then：失败后首装目标必须回到「不存在」，不得留下部分新树。
+	if err == nil {
+		t.Fatal("err=nil, want copy fallback failure")
+	}
+	if _, statErr := os.Stat(destDir); !os.IsNotExist(statErr) {
+		t.Fatalf("first install failure left partial tree at %s (stat=%v)", destDir, statErr)
 	}
 }
 

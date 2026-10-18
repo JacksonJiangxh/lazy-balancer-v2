@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -24,6 +25,9 @@ func TestClusterStatus_syncIntervalDisplayClamp(t *testing.T) {
 		{10, 10},   // 边界 10 不 clamp
 		{60, 60},   // 正常值不变
 		{120, 120}, // 大于 60 不变
+		{86400, 86400},
+		{86401, 86400},
+		{1000000, 86400},
 	}
 	for _, tc := range cases {
 		t.Run(fmt.Sprintf("stored_%d", tc.stored), func(t *testing.T) {
@@ -42,5 +46,11 @@ func TestClusterStatus_syncIntervalDisplayClamp(t *testing.T) {
 				t.Fatalf("Status().SyncInterval=%d (stored %d), want %d", status.SyncInterval, tc.stored, tc.want)
 			}
 		})
+	}
+}
+
+func TestNodeOfflineThreshold_clampsExcessiveSyncInterval(t *testing.T) {
+	if got := nodeOfflineThreshold(1000000); got != 2*86400*time.Second {
+		t.Fatalf("nodeOfflineThreshold=%v, want %v", got, 2*86400*time.Second)
 	}
 }

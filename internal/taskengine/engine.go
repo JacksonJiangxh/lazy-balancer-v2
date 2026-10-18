@@ -111,6 +111,7 @@ type RunRecord struct {
 }
 
 var ErrAlreadyRunning = errors.New("taskengine: 任务运行中")
+var ErrSchedulingPaused = errors.New("taskengine: 调度已暂停")
 
 // ErrTaskSkipped 任务跳过哨兵（TASK-L5，历史 历史问题）：demote 中止等「非故障
 // 放弃」语义由 Run 体返回该哨兵，terminalStatus 映射为 task_runs skipped 终态
@@ -155,14 +156,16 @@ type Engine struct {
 	startedAt time.Time
 	daemonWG  sync.WaitGroup // daemon goroutine 退出等待（2026-10-04 测试污染修复）
 	runWG     sync.WaitGroup // Scheduled/Periodic/Oneshot 在途 Run 退出等待
+	// inFlight 是 Scheduled/Periodic/Oneshot 在途 Run 计数（历史问题-1/历史问题-1）：
+	// runWG 无可取消 Wait，配置导入的「暂停 + 有界排空」需要可轮询计数。
+	// 与 runWG.Add/Done 严格配对（唯一登记点 runNow）。
+	inFlight atomic.Int64
 
 	// daemonRestartDelays 常驻异常退出后的有界重拉退避表（历史问题-04）
 	daemonRestartDelays []time.Duration
 
-	// schedPaused 装配期暂停 tick 调度（历史问题，历史）：BootSync
-	// （startup:config-load 等）完成前周期/定时任务不得抢跑（配置未加载即
-	// 执行首轮）。仅装配路径经 Options.StartPaused 置位；仅暂停 tick 投递，
-	// Trigger/RunSync/StartLoop/RunBootSyncTasks 不受影响。
+	// schedPaused 暂停 tick 与新执行登记：装配期 BootSync（startup 触发）
+	// 除外；配置导入期间 Trigger/RunSync/runNow 同样拒绝，保证在途只减不增。
 	schedPaused atomic.Bool
 }
 
@@ -172,9 +175,9 @@ type Options struct {
 	// 重拉退避（历史 历史问题-04）：长度=最大重拉次数，逐次消耗。空=引擎
 	// 默认 1s/5s/30s（三次用尽后停止调度并留痕，防紧循环）。
 	DaemonRestartDelays []time.Duration
-	// StartPaused（历史问题，历史）：以暂停 tick 形态启动——装配方在
+	// StartPaused（历史问题，历史）：以暂停调度形态启动——装配方在
 	// RunBootSyncTasks 完成后必须调 ResumeScheduling，否则周期/定时任务
-	// 永不调度。
+	// 与手动/自动执行（startup 豁免）永不投递。
 	StartPaused bool
 }
 
@@ -203,10 +206,13 @@ func NewEngine(opts Options) *Engine {
 	return e
 }
 
-// ResumeScheduling 结束装配暂停（历史问题，历史）：仅在 Options.StartPaused
-// 启动的引擎上有语义——InitTaskEngine 在 RunBootSyncTasks 之后调用，
-// BootSync 完成前 tick 不投递周期/定时任务。幂等。
-func (e *Engine) ResumeScheduling() { e.schedPaused.Store(false) }
+// ResumeScheduling 恢复 tick 与手动/自动执行。幂等；与 runNow 登记共用
+// e.mu，保证暂停/恢复边界与 inFlight 登记严格定序。
+func (e *Engine) ResumeScheduling() {
+	e.mu.Lock()
+	e.schedPaused.Store(false)
+	e.mu.Unlock()
+}
 
 func (e *Engine) StartedAt() time.Time { return e.startedAt }
 
@@ -454,6 +460,9 @@ func (e *Engine) Register(d Descriptor) error {
 }
 
 func (e *Engine) Trigger(id, trigger, operator string) error {
+	if e.schedPaused.Load() && trigger != "startup" {
+		return ErrSchedulingPaused
+	}
 	e.mu.RLock()
 	r := e.regs[id]
 	e.mu.RUnlock()
@@ -477,6 +486,9 @@ func (e *Engine) Trigger(id, trigger, operator string) error {
 
 // RunSync 同步执行一次并返回 runID（handler 直调入口——响应需要行视图）。
 func (e *Engine) RunSync(id, trigger, operator string) (int64, error) {
+	if e.schedPaused.Load() && trigger != "startup" {
+		return 0, ErrSchedulingPaused
+	}
 	e.mu.RLock()
 	r := e.regs[id]
 	e.mu.RUnlock()
@@ -582,6 +594,54 @@ func (e *Engine) CancelInFlightRuns() int {
 		}
 	}
 	return cancelled
+}
+
+// PauseScheduling 暂停 tick 投递与 Trigger/RunSync/runNow 新执行
+// （历史问题-3/历史问题-历史问题/03）：配置导入/还原的前置排空。BootSync 的
+// startup 触发是装配期唯一豁免；StartLoop 只改调度偏好，不受此门影响。
+// 与 runNow 的 inFlight 登记共用 e.mu：函数返回后，在途集合只减不增。
+// 必须与 ResumeScheduling 成对使用（导入失败路径也要恢复）。
+func (e *Engine) PauseScheduling() {
+	e.mu.Lock()
+	e.schedPaused.Store(true)
+	e.mu.Unlock()
+}
+
+// WaitInFlightRuns 等待全部在途 Scheduled/Periodic/Oneshot Run 落定终态，
+// 直到 ctx 完成（超时/取消）。返回 true=已排空，false=ctx 先到期（由调用方
+// 决定 409/继续并留痕）。Daemon 不计入（常驻族不归导入排空管理）。
+//
+// 与 CancelInFlightRuns 配合的标准排空序列（handlers/config_import_coordinator）：
+//
+//	engine.PauseScheduling()          // 关派发（在途集合只减不增）
+//	engine.CancelInFlightRuns()       // 发取消信号
+//	engine.WaitInFlightRuns(ctx)      // 有界等待落定（ctx 自带 deadline）
+//	...导入事务...
+//	engine.ResumeScheduling()         // 成功/失败都必须恢复
+//
+// 注意：Run 体不消费 rc.Ctx 的族（cert 四 tick / log-cleanup / audit-retention
+// 等）取消等价 no-op，等待会跑满其单轮时长——因此 ctx deadline 是必需的
+// 兜底（建议与证书队列 PauseAndDrain 同量级 30s）。实现为计数轮询
+// （runWG 无取消语义；暂停后计数单调递减，无伪排空窗口）。
+func (e *Engine) WaitInFlightRuns(ctx context.Context) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if e.inFlight.Load() <= 0 {
+		return true
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return e.inFlight.Load() <= 0
+		case <-ticker.C:
+			if e.inFlight.Load() <= 0 {
+				return true
+			}
+		}
+	}
 }
 
 // ---- StartLoop/StopLoop：循环启停 ----
@@ -761,6 +821,9 @@ func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, ca
 					relaunchAttempt = r.abnormalRestarts
 				} else {
 					abnormalExhausted = true
+					// 与日志和监控语义一致：预算用尽即真实停止调度。
+					// 后续 StartLoop 观察到关→开过渡，才会重置预算并手动恢复。
+					r.loopEnabled = false
 				}
 			}
 		}
@@ -922,6 +985,7 @@ func (e *Engine) History(id string, limit int) []RunRecord {
 		COALESCE(finished_at,''), COALESCE(duration_ms,0), COALESCE(message,'')
 		FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT ?`, id, limit)
 	if err != nil {
+		log.Printf("WARNING: taskengine: 任务历史 %s 查询失败: %v", id, err)
 		return nil
 	}
 	defer rows.Close()
@@ -967,10 +1031,21 @@ func (e *Engine) runNow(id, trigger, operator string) (int64, error) {
 		e.mu.Unlock()
 		return 0, ErrEngineStopped
 	}
+	// Pause 与登记共用 e.mu：一旦 PauseScheduling 返回，越过 tick 入口
+	// 检查的迟到 goroutine 与各手动入口都无法再增加 inFlight。
+	// RunBootSyncTasks 的 startup 是装配暂停期的唯一合法豁免。
+	if e.schedPaused.Load() && trigger != "startup" {
+		e.mu.Unlock()
+		return 0, ErrSchedulingPaused
+	}
 	r := e.regs[id]
 	e.runWG.Add(1)
+	e.inFlight.Add(1)
 	e.mu.Unlock()
-	defer e.runWG.Done()
+	defer func() {
+		e.inFlight.Add(-1)
+		e.runWG.Done()
+	}()
 	if r == nil {
 		return 0, ErrNotFound
 	}
@@ -1417,18 +1492,14 @@ func RecordRunFinish(runID int64, status string, durMs int64, message string) {
 // ---- 元数据 ----
 
 type TaskMeta struct {
-	ID          string `json:"id"`
-	Family      string `json:"family"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Category    string `json:"category"`
-	Kind        Kind   `json:"kind"`
-	IntervalSec int    `json:"interval_sec"`
-	NextSlot    string `json:"next_slot"`
-	// Enabled 诊断字段（历史问题/历史问题）：仅承载 EnabledFn 的当前求值结果，
-	// 生产代码零读取，序列化面不暴露（json:"-"）。任务视图的调度语义只由
-	// LoopOn 表达；business_driven 标记任务由业务页开关驱动（只读态）。
-	Enabled      bool   `json:"-"`
+	ID           string `json:"id"`
+	Family       string `json:"family"`
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	Category     string `json:"category"`
+	Kind         Kind   `json:"kind"`
+	IntervalSec  int    `json:"interval_sec"`
+	NextSlot     string `json:"next_slot"`
 	StatusMirror string `json:"status_mirror"`
 	Controllable bool   `json:"controllable"`
 	Cancelable   bool   `json:"cancelable"`
@@ -1458,7 +1529,6 @@ func (e *Engine) Lookup(id string) (TaskMeta, bool) {
 		Cancelable:   r.desc.Cancelable,
 		LoopOn:       loopOn,
 		Running:      running,
-		Enabled:      true,
 		Controllable: r.desc.Kind == KindDaemon,
 	}
 	// 历史问题-04：与 tick 同口径的闭包 panic 隔离（safe*）——装配闭包单任务
@@ -1470,9 +1540,6 @@ func (e *Engine) Lookup(id string) (TaskMeta, bool) {
 		if t := safeSlot(id+".NextSlotFn", r.desc.NextSlotFn); !t.IsZero() {
 			m.NextSlot = t.In(engineLocPtr()).Format("2006-01-02 15:04:05")
 		}
-	}
-	if r.desc.EnabledFn != nil {
-		m.Enabled = safeBool(id+".EnabledFn", r.desc.EnabledFn)
 	}
 	// 状态镜像角色门：与 DescribeAll 同门（2026-10-03 裁定）——角色不符
 	// 不采纳，单任务查询不旁路。历史问题（历史）：StatusFn 闭包 panic
@@ -1509,7 +1576,6 @@ func (e *Engine) DescribeAll() []TaskMeta {
 			Cancelable:   s.desc.Cancelable,
 			LoopOn:       s.loopOn,
 			Running:      s.running,
-			Enabled:      true,
 			Controllable: s.desc.Kind == KindDaemon, // 常驻族可启停（真实生命周期挂钩——B 完全标准化）
 		}
 		// 历史问题-04：闭包 panic 隔离（与 Lookup/tick 同口径）
@@ -1520,9 +1586,6 @@ func (e *Engine) DescribeAll() []TaskMeta {
 			if t := safeSlot(s.id+".NextSlotFn", s.desc.NextSlotFn); !t.IsZero() {
 				m.NextSlot = t.In(engineLocPtr()).Format("2006-01-02 15:04:05")
 			}
-		}
-		if s.desc.EnabledFn != nil {
-			m.Enabled = safeBool(s.id+".EnabledFn", s.desc.EnabledFn)
 		}
 		// 状态镜像角色门（2026-10-03 裁定）：任务不在本角色运行时，其
 		// StatusFn 读到的常是同步来的业务数据（从节点 cert_jobs/
@@ -1681,6 +1744,7 @@ func (e *Engine) Stats24hHourlySeries() []TaskHourlyStat {
 		FROM task_runs WHERE started_at >= ? GROUP BY h`,
 		curHour.Add(-23*time.Hour).Format("2006-01-02 15:04:05"))
 	if err != nil {
+		log.Printf("WARNING: taskengine: 24h 分小时统计查询失败（小时桶零填）: %v", err)
 		return out
 	}
 	defer rows.Close()

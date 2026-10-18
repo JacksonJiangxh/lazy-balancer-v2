@@ -471,3 +471,27 @@ func TestUpdateRule_rejects_negative_health_check_thresholds(t *testing.T) {
 		t.Fatalf("negative healthy threshold must 400, got %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+// D1-历史问题：定向预览与全量渲染同为 fail-visible；存量非法 protocol 不得
+// 被吞成 200 + 空 server_context。
+func TestGetRuleCaddyConfig_unsupportedProtocolReturnsError(t *testing.T) {
+	initializeRuleFeatureTestDB(t)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enabled)
+		VALUES ('lb_bad_protocol','bad','sctp','bad.example.test',8080,'weighted_round_robin',1)`); err != nil {
+		t.Fatal(err)
+	}
+	runningConfig := `{"apps":{"http":{"servers":{"http_8080":{"listen":[":8080"],"routes":[{"@id":"lb_bad_protocol","handle":[]}]}}}}}`
+	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(runningConfig))
+	}))
+	t.Cleanup(fakeCaddy.Close)
+	handler := &Handlers{cfg: &config.Config{CaddyAdminURL: fakeCaddy.URL}, caddyService: services.NewCaddyService(fakeCaddy.URL)}
+	router := gin.New()
+	router.GET("/rules/:caddy_id/caddy-config", handler.GetRuleCaddyConfig)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/rules/lb_bad_protocol/caddy-config", nil))
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "unsupported protocol") {
+		t.Fatalf("status=%d body=%s, want 500 unsupported protocol", response.Code, response.Body.String())
+	}
+}

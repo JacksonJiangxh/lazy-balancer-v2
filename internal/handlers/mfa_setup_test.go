@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
+
+	"github.com/gin-gonic/gin"
 )
 
 // D5-S1 / D5-S4（N+11 轮）：MFASetup 的 otpauth 账号位与 pending 密钥落库。
@@ -166,5 +168,66 @@ func TestMFASetup_pendingWriteFailure_returns500(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "保存 MFA 密钥失败") {
 		t.Fatalf("body=%s, want 包含「保存 MFA 密钥失败」", rec.Body.String())
+	}
+}
+
+// B3-82-历史问题：activate 的 pending 读取故障必须 500 且不得计入验证码失败；
+// 普通错误验证码仍保持 400 + 计数的回归契约。
+func TestMFAActivate_pendingFailureClassification(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedMfaSetupUser(t)
+	if _, err := db.DB.Exec(`UPDATE users SET mfa_pending_secret='junk',mfa_pending_fails=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	router := mfaSetupTestRouter(h)
+	router.POST("/auth/mfa/activate", func(c *gin.Context) {
+		c.Set("user_id", 1)
+		c.Set("username", "operator")
+		c.Set("auth_type", "jwt")
+		h.MFAActivate(c)
+	})
+
+	wrong := postRaw(router, "/auth/mfa/activate", `{"code":"000000"}`)
+	if wrong.Code != http.StatusBadRequest {
+		t.Fatalf("wrong code status=%d body=%s, want 400", wrong.Code, wrong.Body.String())
+	}
+	var fails int
+	if err := db.DB.QueryRow(`SELECT mfa_pending_fails FROM users WHERE id=1`).Scan(&fails); err != nil {
+		t.Fatal(err)
+	}
+	if fails != 1 {
+		t.Fatalf("wrong code fails=%d, want 1", fails)
+	}
+
+	if _, err := db.DB.Exec(`ALTER TABLE users DROP COLUMN mfa_pending_secret`); err != nil {
+		t.Fatalf("break pending read: %v", err)
+	}
+	failure := postRaw(router, "/auth/mfa/activate", `{"code":"000000"}`)
+	if failure.Code != http.StatusInternalServerError {
+		t.Fatalf("pending DB failure status=%d body=%s, want 500", failure.Code, failure.Body.String())
+	}
+	if err := db.DB.QueryRow(`SELECT mfa_pending_fails FROM users WHERE id=1`).Scan(&fails); err != nil {
+		t.Fatal(err)
+	}
+	if fails != 1 {
+		t.Fatalf("DB failure changed pending fails to %d, want unchanged 1", fails)
+	}
+}
+
+// B3-82-历史问题：已启用 MFA 的用户重绑时验码失败属于高敏失败尝试，必须留审计。
+func TestMFASetup_rebindVerificationFailureWritesAudit(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedMfaResetUsers(t, true)
+	router := mfaSetupTestRouter(h)
+	response := postRaw(router, "/auth/mfa/setup", `{"code":"000000"}`)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s, want 401", response.Code, response.Body.String())
+	}
+	var events int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='认证拒绝' AND detail LIKE '%重绑 MFA 前验证失败%'`).Scan(&events); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if events != 1 {
+		t.Fatalf("rebind failure audit events=%d, want 1", events)
 	}
 }

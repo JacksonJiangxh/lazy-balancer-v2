@@ -211,6 +211,8 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 	if err := tx.Commit(); err != nil {
 		return models.ClusterRegistration{}, fmt.Errorf("提交节点注册: %w", err)
 	}
+	// 历史问题-05：同 IP:port 行被覆盖后旧分区哈希不再属于本次注册。
+	s.clearSectionReport(nodeID)
 	return models.ClusterRegistration{RegistrationID: nodeID, RegistrationSecret: secret, OverwrittenNodeID: overwrittenNodeID, OverwrittenNodeName: overwrittenNodeName, AccessURLIgnored: accessURLIgnored}, nil
 }
 
@@ -320,6 +322,11 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	if isMaster {
 		return ErrAlreadyMaster
 	}
+	// 历史问题-06：角色翻转显式失效快照缓存（幂等零成本）。缓存键只有
+	// version/ownership/开关，降级期间在途的 master-only Run 可写过库且
+	// is_master=0 不 bump 版本——若从降级到再升主之间没有发生 apply，旧缓存
+	// 内容会被当作权威重新对外提供。放在角色检查之后，成功/失败路径都覆盖。
+	clusterSnapshotCaches.Delete(s.db)
 	var masterURL string
 	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(master_url,'') FROM global_config WHERE id=1").Scan(&masterURL); err != nil {
 		return fmt.Errorf("读取旧主节点地址: %w", err)
@@ -348,6 +355,13 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 		if err := drainer.DrainPulls(ctx); err != nil {
 			return fmt.Errorf("等待在途同步拉取结束: %w", err)
 		}
+		// 历史问题-02：排干成功后的任意返回路径都必须重开准入。原实现依赖
+		// 「失败 → 重启 cluster-sync → startLocked 重开」的隐式链：当用户此前
+		// 关闭了 cluster-sync（clusterSyncWasOn=false）或 TaskEngine()==nil 时，
+		// 失败路径不重启循环，准入永久关闭 → 从节点「立即同步」被 beginPull
+		// 拒绝（errSyncPullStopped 不落库，静默）。成功升主后再降级也有
+		// BecomeSlave 的显式重开，此处兜底保持不变量。
+		defer drainer.reopenPullAdmission()
 	}
 	var registrationID int
 	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(registration_id,0) FROM global_config WHERE id=1").Scan(&registrationID); err != nil {
@@ -375,13 +389,18 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	// 本节点降级后再提升时，旧 nodes 行即刻恢复权威，旧从节点持有的令牌
 	// 仍然有效，经手工 Resume/重新注册即可复活上报与同步——这是有意设计
 	// （主库清零后可凭从库副本恢复集群拓扑），不是令牌泄漏缺口。
-	if _, err := tx.ExecContext(ctx, `UPDATE global_config SET is_master=1, master_url='', cluster_token='', registration_id=0, registration_secret='', applied_version=0, sync_fingerprint='', last_sync_error='', registration_confirm_failures=0 WHERE id=1`); err != nil {
+	// 历史问题-05(a)：last_sync 与 applied_version 同语义——旧集群的同步时间对
+	// 新主节点无意义；此前漏置 NULL 让 Status() 继续格式化旧集群时间（与
+	// BecomeSlave 的 历史问题 对称缺失）。
+	if _, err := tx.ExecContext(ctx, `UPDATE global_config SET is_master=1, master_url='', cluster_token='', registration_id=0, registration_secret='', applied_version=0, sync_fingerprint='', last_sync_error='', registration_confirm_failures=0, last_sync=NULL WHERE id=1`); err != nil {
 		return fmt.Errorf("重置主节点状态: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交提升事务: %w", err)
 	}
 	promoted = true
+	// 历史问题-05：降级期间残留的主节点时代分区缓存不得沿用到再次升主。
+	s.clearAllSectionReports()
 	ResetConfigDrift()
 	// 历史问题：升主后以本地 DB 重建爬虫运行快照——从节点期间的快照可能
 	// 陈旧/缺失（此前仅主节点 Prime/更新任务写该文件），升主后本节点将成为
@@ -480,6 +499,25 @@ func (s *ClusterService) retryPendingPinCleanup() {
 	}
 }
 
+const (
+	minSyncIntervalSeconds     = 10
+	defaultSyncIntervalSeconds = 60
+	maxSyncIntervalSeconds     = 86400
+)
+
+// normalizeSyncInterval 将存量/快照脏值归一到运行时和展示共同接受的区间。
+// 低于下限沿用历史 60s 口径（1-9s 会形成高频 Pull 风暴），高于上限钳到 24h
+// （避免同步长停与在线阈值被无限放大）。
+func normalizeSyncInterval(interval int) int {
+	if interval < minSyncIntervalSeconds {
+		return defaultSyncIntervalSeconds
+	}
+	if interval > maxSyncIntervalSeconds {
+		return maxSyncIntervalSeconds
+	}
+	return interval
+}
+
 // nodeOfflineMultiplier 判定节点离线时 last_seen 的允许超时倍率（× sync_interval 秒）。
 // MetricsService.updateOverview 的在线节点统计口径必须与此一致，共用本常量，
 // 避免阈值在两处各自硬编码导致口径漂移。
@@ -495,9 +533,7 @@ const nodeOfflineMultiplier = 2
 // UI 侧仅 2×clamp(sync_interval)，sync_interval∈[10,59] 时两口径分叉
 // （interval=30：巡检 120s 判在线、UI 60s 判离线）。
 func nodeOfflineThreshold(syncInterval int) time.Duration {
-	if syncInterval < 10 {
-		syncInterval = 60
-	}
+	syncInterval = normalizeSyncInterval(syncInterval)
 	threshold := time.Duration(nodeOfflineMultiplier*syncInterval) * time.Second
 	if threshold < masterSyncOfflineThreshold {
 		threshold = masterSyncOfflineThreshold

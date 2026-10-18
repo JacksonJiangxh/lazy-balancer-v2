@@ -253,6 +253,79 @@ func TestAutobanStatus_shape(t *testing.T) {
 	}
 }
 
+func TestAutobanStatus_banEffectiveTruthTable(t *testing.T) {
+	cases := []struct {
+		name        string
+		entries     string
+		aclEnabled  bool
+		aclMode     string
+		refsField   string
+		bind        bool
+		ruleEnabled bool
+		want        bool
+	}{
+		{name: "bound deny policy with active entries", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, want: true},
+		{name: "unbound deny policy", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", ruleEnabled: true, want: false},
+		{name: "disabled rule", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: false, want: false},
+		{name: "empty list", entries: `[]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, want: false},
+		{name: "IP ACL disabled", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: false, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, want: false},
+		{name: "whitelist reference only", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: false, aclMode: "deny", refsField: "ip_whitelist_refs", bind: true, ruleEnabled: true, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router := newAutobanTestEnv(t)
+			seedAutobanListEntries(t, tc.entries)
+			listID := autobanPresetID(t)
+			aclRefs, whitelistRefs := "[]", "[]"
+			if tc.refsField == "ip_whitelist_refs" {
+				whitelistRefs = fmt.Sprintf("[%d]", listID)
+			} else {
+				aclRefs = fmt.Sprintf("[%d]", listID)
+			}
+			res, err := db.DB.Exec(`INSERT INTO security_policies (name,enabled,ip_acl_enabled,ip_acl_mode,ip_acl_list_refs,ip_whitelist_refs) VALUES ('ban-effective',1,?,?,?,?)`, tc.aclEnabled, tc.aclMode, aclRefs, whitelistRefs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			policyID, _ := res.LastInsertId()
+			if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_ban_effective','ban-effective','http','ban-effective.test',8080,?)`, tc.ruleEnabled); err != nil {
+				t.Fatal(err)
+			}
+			if tc.bind {
+				if _, err := db.DB.Exec(`INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES ('lb_ban_effective',?)`, policyID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			response := getRequest(t, router, "/security/autoban/status")
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var payload struct {
+				Data struct {
+					BanEffective bool `json:"ban_effective"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Data.BanEffective != tc.want {
+				t.Fatalf("ban_effective=%v, want %v", payload.Data.BanEffective, tc.want)
+			}
+		})
+	}
+
+	t.Run("binding query failure is fail closed", func(t *testing.T) {
+		router := newAutobanTestEnv(t)
+		seedAutobanListEntries(t, `[{"value":"198.51.100.8"}]`)
+		if _, err := db.DB.Exec(`DROP TABLE security_policy_bindings`); err != nil {
+			t.Fatal(err)
+		}
+		response := getRequest(t, router, "/security/autoban/status")
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"ban_effective":true`) {
+			t.Fatalf("query failure must suppress the misleading warning, status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+}
+
 // TestAutobanStatus_suggestionsCarryIPLocation：观察建议逐条携带归属地——与
 // 安全事件列表同源富化（handlers 侧 enrichIPLocation 单源装填）。保留地址无需
 // xdb 即可钉装填链路（私网前置拦截），普通 IP 无 xdb 时降级空串、永不报错。

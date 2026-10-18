@@ -30,17 +30,20 @@ var (
 	trafficEventSampleN atomic.Uint32
 )
 
+// resetTrafficEvents 清空环形缓冲与采样计数，但保留单调递增的 seq。
+// 前端可能未观察到短暂的采集空窗；若 seq 归零，其单调 since 游标会永久
+// 过滤重新从 1 开始的事件。
 func resetTrafficEvents() {
 	trafficEventsMu.Lock()
 	trafficEvents = nil
 	trafficEventsMu.Unlock()
-	trafficEventSeq.Store(0)
 	trafficEventAttempt.Store(0)
 }
 
-// trafficEventRecord 记录一条正常请求（抽样在写入前完成）。
+// trafficEventRecord 记录一条正常请求（抽样在写入前完成）。国名键非国家值
+// （空/0/Reserved）不记录——与计数桶及聚合端点同口径（E81-历史问题）。
 func trafficEventRecord(country, province string) {
-	if country == "" || !trafficCollectorActive() {
+	if !trafficCountryKeyValid(country) || !trafficCollectorActive() {
 		return
 	}
 	n := trafficEventSampleN.Load()

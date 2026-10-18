@@ -170,6 +170,11 @@ func (h *Handlers) GetRuleCaddyConfig(c *gin.Context) {
 	// and policies. 历史 历史问题: 定向构建仅含本规则端口 server 的上下文，
 	// 不再为单条规则触发整库查询+证书快照读取的全量重渲染。
 	fullConfig := services.GenerateRuleServerContext(r.CaddyID, r.ListenPort, r.Protocol, r.Domain)
+	if previewErr, exists := fullConfig["error"]; exists && previewErr != nil {
+		services.Logf("error", "GetRuleCaddyConfig: build server context for %s failed: %v", r.CaddyID, previewErr)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: fmt.Sprintf("生成规则 Caddy 配置失败: %v", previewErr)})
+		return
+	}
 	ruleContext := buildRuleCaddyContext(fullConfig, r.CaddyID, r.Domain)
 
 	responseData["config"] = map[string]interface{}{

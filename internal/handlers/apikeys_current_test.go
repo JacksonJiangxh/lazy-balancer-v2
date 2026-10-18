@@ -456,13 +456,16 @@ func TestUpdateAPIKeyRejectsInvalidMCPWhitelist(t *testing.T) {
 // 注：setupAPIKeyTestDB 的裸 sql.Open 无 busy_timeout，并发下会以 SQLITE_BUSY
 // 500 污染断言，故此处独立搭生产形态环境。
 func TestCreateAPIKey_quotaAtomicUnderConcurrency(t *testing.T) {
-	oldDB, oldAuditDB := db.DB, db.AuditDB
+	// B1-历史问题（历史）：db.Initialize 会替换三个全局句柄，恢复必须
+	// 三者齐全——此前漏 MetricsDB，后续用例会踩已关闭的临时指标库。
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("initialize: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.AuditDB = oldDB, oldAuditDB
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
 	})
 	gin.SetMode(gin.TestMode)
 

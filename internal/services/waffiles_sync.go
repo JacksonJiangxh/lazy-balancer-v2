@@ -278,6 +278,77 @@ func buildWafFileRefLocked() *models.ClusterWafFilesRef {
 	return ref
 }
 
+// buildWafFileRefLockedChecked 与 buildWafFileRefLocked 同源，但把「组件
+// 存在却读取/哈希失败」显式上报，而不是静默省略分量后宣称引用完整。
+// lbbak 导出必须走本变体（历史问题-04）。
+func buildWafFileRefLockedChecked() (*models.ClusterWafFilesRef, error) {
+	ref := &models.ClusterWafFilesRef{}
+	seen := false
+	rulesDir := filepath.Join(crsLiveDir, "rules")
+	if _, err := os.Stat(rulesDir); err == nil {
+		sum, err := tarGzDirSum(crsLiveDir)
+		if err != nil {
+			return nil, fmt.Errorf("hash CRS tree: %w", err)
+		}
+		if sum != "" {
+			ref.CRSSha256 = sum
+			seen = true
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("stat CRS tree: %w", err)
+	}
+	if v, err := os.ReadFile(filepath.Join(crsLiveDir, "VERSION")); err == nil {
+		ref.CRSVersion = strings.TrimSpace(string(v))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read CRS version: %w", err)
+	}
+	if sum, err := sha256File(ip2regionLivePath); err == nil && sum != "" {
+		ref.IP2RegionSha = sum
+		seen = true
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("hash IP2Region database: %w", err)
+	}
+	if v, err := os.ReadFile(ip2regionLivePath + ".version"); err == nil {
+		ref.IP2RegionTag = sanitizeBundleVersion(strings.TrimSpace(string(v)))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read IP2Region version: %w", err)
+	}
+	threatFast, err := scanThreatFastFilesChecked()
+	if err != nil {
+		return nil, err
+	}
+	if len(threatFast) > 0 {
+		ref.ThreatSha256s = threatFast
+		seen = true
+	}
+	if !seen {
+		return nil, nil
+	}
+	return ref, nil
+}
+
+func scanThreatFastFilesChecked() (map[string]string, error) {
+	result := make(map[string]string)
+	matches, err := filepath.Glob(filepath.Join(wafDir, "threat-*.iplist.fast"))
+	if err != nil {
+		return nil, fmt.Errorf("scan threat files: %w", err)
+	}
+	for _, path := range matches {
+		source := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(path), "threat-"), ".iplist.fast")
+		if source == "" || !validThreatFileName(source) {
+			continue
+		}
+		sum, err := sha256File(path)
+		if err != nil {
+			return nil, fmt.Errorf("hash threat file %s: %w", source, err)
+		}
+		if sum != "" {
+			result[source] = sum
+		}
+	}
+	return result, nil
+}
+
 // validThreatFileName 威胁库源名白名单（历史问题：与内置三源单一对应，
 // 协议合法输入不变；其余一律拒绝）。
 func validThreatFileName(name string) bool {
@@ -323,12 +394,23 @@ func BuildWafFileBundle() *WafFileBundle {
 	return bundle
 }
 
-// BuildWafFileBundleInLock 是 BuildWafFileBundle 的「调用方已持 WafFileLock」
-// 变体：供需要在同一临界区内同时冻结 DB 快照与文件 bundle 的调用方使用
-// （lbbak 导出）。契约：调用方必须先 WafFileLock().Lock()，本函数不自锁。
-func BuildWafFileBundleInLock() *WafFileBundle {
+// BuildWafFileBundleInLockChecked 是锁内 bundle 物化的完整性显式变体
+// （历史问题 历史）：返回物化是否覆盖引用声明的全部组件。lbbak 导出必须消费
+// 本变体——瞬时读失败（tar 打包/xdb 读取/威胁 .fast 读取）会产出「manifest
+// 自洽但缺 CRS/xdb/威胁文件」的包，恢复时静默缺安全数据；集群按需端点因从端
+// 有 wafFilesRefMatchesBundle 校验而安全，lbbak 侧没有同等校验。
+// 契约：调用方必须先 WafFileLock().Lock()。
+func BuildWafFileBundleInLockChecked() (*WafFileBundle, bool) {
+	ref, err := buildWafFileRefLockedChecked()
+	if err != nil {
+		Logf("error", "WAF bundle: 引用构造读取失败: %v", err)
+		return nil, false
+	}
+	if ref == nil {
+		return nil, true // 无任何 WAF 组件可导出：不构成不完整
+	}
 	bundle, _ := buildWafFileBundleLocked()
-	return bundle
+	return bundle, bundle != nil && wafFileBundleComplete(ref, bundle)
 }
 
 // wafFilesRefDiffers reports whether the slave's live files fail to match
@@ -744,12 +826,14 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 	// the CRS updater itself).
 	backup := destDir + ".sync-bak"
 	os.RemoveAll(backup)
-	if _, err := os.Stat(destDir); err == nil {
+	_, destStatErr := os.Stat(destDir)
+	destExisted := destStatErr == nil
+	if destExisted {
 		if err := copyDir(destDir, backup); err != nil {
 			return err
 		}
 	}
-	if err := os.Rename(staging, destDir); err != nil {
+	if err := osRename(staging, destDir); err != nil {
 		// rename 到非空目录恒失败（EEXIST/ENOTEMPTY）——destDir 非空（生产常态：
 		// 镜像自带规则树或已同步过的树）时本兜底分支即主路径，而非罕见的跨挂载点
 		// 情形。copyDir 只覆盖同名文件、不删除旧树中新包缺失的文件，必须先清空
@@ -763,8 +847,13 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 		}
 		if err := copyDir(staging, destDir); err != nil {
 			// 复制中途失败时 destDir 已被清空但可能残留部分新树文件——恢复自身的
-			// 错误并入返回错误，不吞掉（历史问题 A-F3）。
-			return fmt.Errorf("安装同步规则集: %w", errors.Join(err, restoreWafTreeFromBackup(backup, destDir)))
+			// 错误并入返回错误，不吞掉（历史问题 A-F3）。首装（destDir 原本不存在）
+			// 无备份可恢复，必须把部分新树整树删除回到「不存在」终态。
+			restoreErr := restoreWafTreeFromBackup(backup, destDir)
+			if !destExisted {
+				restoreErr = errors.Join(restoreErr, os.RemoveAll(destDir))
+			}
+			return fmt.Errorf("安装同步规则集: %w", errors.Join(err, restoreErr))
 		}
 	}
 	os.RemoveAll(backup)

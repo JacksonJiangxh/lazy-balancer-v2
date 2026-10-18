@@ -543,7 +543,7 @@ const customDbId = computed(() => {
   const n = Number(props.row?.rule_triggered)
   return Number.isFinite(n) && n >= 10000 ? n - 10000 : NaN
 })
-const ACTION_LABELS: Record<string, string> = { block: '拦截', log: '仅记录', score: '计分', pass: '放行' } // 历史 历史问题：补 pass（后端合法三态含 pass）
+const ACTION_LABELS: Record<string, string> = { block: '拦截', log: '仅记录', pass: '放行' } // 后端合法动作仅 block/log/pass（历史问题-F12：score 为不可达映射，已删）
 const customActionLabel = computed(() => {
   const a = customRule.value?.action ?? ''
   return ACTION_LABELS[a] ?? a

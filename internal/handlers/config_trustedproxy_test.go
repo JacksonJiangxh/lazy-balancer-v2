@@ -11,7 +11,7 @@ import (
 )
 
 // 受信代理四字段（v2.3.x CDN 真实 IP 支持）：合法值写入成功并经 GET 回读；
-// 网段过宽（</8 v4、</96 v6）与非法头名 400；预览端点同校验。
+// 网段过宽（</8 v4、</29 v6）与非法头名 400；预览端点同校验。
 func TestUpdateConfig_trustedProxy_roundtrip(t *testing.T) {
 	// Given
 	handler := newBackupTestHandlers(t)
@@ -21,7 +21,7 @@ func TestUpdateConfig_trustedProxy_roundtrip(t *testing.T) {
 	router.GET("/config", handler.GetConfig)
 
 	body := `{"source":"caddy","trusted_proxy_enabled":true,"trusted_proxy_strict":false,` +
-		`"trusted_proxy_ranges":"[\"203.0.113.0/24\",\"198.51.100.7\"]","trusted_proxy_headers":"[\"CF-Connecting-IP\",\"X-Forwarded-For\"]"}`
+		`"trusted_proxy_ranges":"[\"203.0.113.0/24\",\"198.51.100.7\",\"2a06:98c0::/29\"]","trusted_proxy_headers":"[\"CF-Connecting-IP\",\"X-Forwarded-For\"]"}`
 	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -58,8 +58,8 @@ func TestUpdateConfig_trustedProxy_roundtrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(payload.Data.TrustedProxyHeaders), &headers); err != nil {
 		t.Fatalf("headers not JSON: %v", err)
 	}
-	if len(ranges) != 2 || ranges[0] != "203.0.113.0/24" || ranges[1] != "198.51.100.7/32" {
-		t.Fatalf("ranges=%v, want [203.0.113.0/24 198.51.100.7/32]", ranges)
+	if len(ranges) != 3 || ranges[0] != "203.0.113.0/24" || ranges[1] != "198.51.100.7/32" || ranges[2] != "2a06:98c0::/29" {
+		t.Fatalf("ranges=%v, want [203.0.113.0/24 198.51.100.7/32 2a06:98c0::/29]", ranges)
 	}
 	if len(headers) != 2 || headers[0] != "CF-Connecting-IP" || headers[1] != "X-Forwarded-For" {
 		t.Fatalf("headers=%v, want [CF-Connecting-IP X-Forwarded-For]", headers)
@@ -78,7 +78,7 @@ func TestUpdateConfig_trustedProxy_rejectsOverwideRanges(t *testing.T) {
 	}{
 		{"v4 /7", `["10.0.0.0/7"]`},
 		{"v4 /0", `["0.0.0.0/0"]`},
-		{"v6 /95", `["2001:db8::/95"]`},
+		{"v6 /28", `["2001:db8::/28"]`},
 		{"v6 /0", `["::/0"]`},
 		// 历史 历史问题（历史问题）：/8 恰好等于下限但覆盖整个 IPv4 空间——
 		// 「信任全体 IPv4」形态必须拒绝；v4-mapped /96 同义（Is6 含 mapped，

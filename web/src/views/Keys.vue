@@ -17,7 +17,7 @@
           <el-icon><Connection /></el-icon>
           MCP 文档
         </el-button>
-        <el-button type="primary" :disabled="nodeModeSlave || creating" @click="openCreateDialog">
+        <el-button type="primary" :disabled="nodeWriteBlocked || creating" @click="openCreateDialog">
           <el-icon><Plus /></el-icon>
           创建密钥
         </el-button>
@@ -68,7 +68,7 @@
               size="small"
               type="primary"
               plain
-              :disabled="nodeModeSlave || togglePendingId === key.id || deletingIds.has(key.id)"
+              :disabled="nodeWriteBlocked || togglePendingId === key.id || deletingIds.has(key.id)"
               @click="openFeatureDialog(key)"
             >
               <el-icon><Setting /></el-icon>
@@ -78,13 +78,13 @@
               size="small"
               :type="key.is_enabled ? 'warning' : 'success'"
               :loading="togglePendingId === key.id"
-              :disabled="nodeModeSlave || deletingIds.has(key.id)"
+              :disabled="nodeWriteBlocked || deletingIds.has(key.id)"
               @click="toggleKey(key)"
             >
               <el-icon><SwitchButton v-if="key.is_enabled" /><VideoPlay v-else /></el-icon>
               {{ key.is_enabled ? '禁用' : '启用' }}
             </el-button>
-            <el-button size="small" type="danger" :loading="deletingIds.has(key.id)" :disabled="nodeModeSlave || togglePendingId === key.id || deletingIds.has(key.id)" @click="deleteKey(key.id)">
+            <el-button size="small" type="danger" :loading="deletingIds.has(key.id)" :disabled="nodeWriteBlocked || togglePendingId === key.id || deletingIds.has(key.id)" @click="deleteKey(key.id)">
               <el-icon><Delete /></el-icon>
               删除
             </el-button>
@@ -368,9 +368,10 @@ interface CreateAPIKeyResponse {
 }
 
 const authStore = useAuthStore()
-// M30：slave 节点只读；主节点非 admin 可管理本人密钥（后端强制只读 Key，
-// 白名单 60b43841 放行非 admin 自助密钥端点），故写入口仅按从节点收紧。
-const nodeModeSlave = computed(() => authStore.isSlaveNode)
+// 历史问题-F9：只读门按「非 master 即禁用」判定——nodeMode 未知（/config 未返回/
+// 失败）时 fail-closed（与 历史问题/全站 readOnlyReason 口径一致）。主节点非 admin
+// 仍可管理本人密钥（后端强制只读 Key，白名单放行自助密钥端点）。
+const nodeWriteBlocked = computed(() => authStore.nodeMode !== 'master')
 const isAdmin = computed(() => authStore.user?.role === 'admin')
 
 const keys = ref<readonly APIKey[]>([])
@@ -477,7 +478,7 @@ const serializeWhitelist = (value: string): { readonly value: string[]; readonly
 }
 
 const openCreateDialog = (): void => {
-  if (nodeModeSlave.value || creating.value) return
+  if (nodeWriteBlocked.value || creating.value) return
   resetCreateForm()
   createDialogVisible.value = true
 }
@@ -502,7 +503,7 @@ const disablePastDate = (date: Date): boolean => {
 }
 
 async function createKey() {
-  if (nodeModeSlave.value || creating.value) return
+  if (nodeWriteBlocked.value || creating.value) return
   const name = createForm.value.name.trim()
   if (!name) {
     createNameError.value = '请输入密钥名称'
@@ -546,7 +547,7 @@ async function createKey() {
 }
 
 const openFeatureDialog = (key: APIKey): void => {
-  if (nodeModeSlave.value || featureSaving.value) return
+  if (nodeWriteBlocked.value || featureSaving.value) return
   featureTarget.value = key
   featureForm.value = {
     mcp_enabled: key.mcp_enabled,
@@ -564,7 +565,7 @@ const resetFeatureForm = (): void => {
 }
 
 const saveFeatures = async (): Promise<void> => {
-  if (nodeModeSlave.value || featureSaving.value || !featureTarget.value) return
+  if (nodeWriteBlocked.value || featureSaving.value || !featureTarget.value) return
   const whitelist = serializeWhitelist(featureForm.value.whitelistText)
   if (whitelist.error) {
     featureWhitelistError.value = whitelist.error
@@ -590,7 +591,7 @@ const saveFeatures = async (): Promise<void> => {
 }
 
 const deleteKey = async (id: number) => {
-  if (nodeModeSlave.value || togglePendingId.value === id || deletingIds.value.has(id)) return
+  if (nodeWriteBlocked.value || togglePendingId.value === id || deletingIds.value.has(id)) return
   deletingIds.value.add(id)
   try {
     await ElMessageBox.confirm('确定要删除这个 API 密钥吗？删除后无法恢复。', '警告', { type: 'warning' })
@@ -606,7 +607,7 @@ const deleteKey = async (id: number) => {
 }
 
 const toggleKey = async (key: APIKey) => {
-  if (nodeModeSlave.value || togglePendingId.value !== null || deletingIds.value.has(key.id)) return
+  if (nodeWriteBlocked.value || togglePendingId.value !== null || deletingIds.value.has(key.id)) return
   const isEnabled = !key.is_enabled
 
   if (!isEnabled) {

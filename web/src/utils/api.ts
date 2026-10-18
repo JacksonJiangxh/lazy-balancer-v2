@@ -14,6 +14,7 @@ import type {
   SystemMetrics,
   UpdateCurrentUserInput,
 } from '@/types'
+import { isCurrentPasswordRejection } from '@/utils/profileUpdate'
 
 declare module 'axios' {
   interface AxiosRequestConfig {
@@ -260,7 +261,15 @@ service.interceptors.response.use(
       // 历史问题 补正：管理员重置端点 /users/:id/mfa/reset 同样以 401 返回「验证码错误」，
       // 需同口径放行（Users.vue 的 catch 展示后端文案供重试），否则误杀会话并在
       // 仅匹配 /mfa/reset 路径段，不泛化放行（2026-09 裁定后登录失败计数仅登录阶段）。
-      if (error.config?.url?.includes('/auth/mfa/') || error.config?.url?.includes('/mfa/reset')) {
+      // 历史问题-历史问题：只有后端明确的「当前密码错误」才豁免会话失效；同端点的
+      // token 过期/未登录 401 仍必须进入下方重新登录流程。
+      const isSelfProfileCurrentPasswordError = isCurrentPasswordRejection(
+        error.config?.method,
+        error.config?.url,
+        status,
+        message,
+      )
+      if (error.config?.url?.includes('/auth/mfa/') || error.config?.url?.includes('/mfa/reset') || isSelfProfileCurrentPasswordError) {
         return Promise.reject(new ApiRequestError(message, status))
       }
       if (!isLoginRequest) {

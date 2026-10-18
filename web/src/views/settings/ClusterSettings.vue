@@ -426,7 +426,10 @@ const syncNow = async (): Promise<void> => {
   if (!ok) return
   syncing.value = true
   try {
-    const response = await request.post<APIResponse<ClusterSyncResult>>('/cluster/sync/pull')
+    // 历史问题-07：/cluster/sync/pull 同样含「拉快照 → 应用 → Caddy 重载」，与
+    // Promote 同口径放大到 120s——沿用全局 30s 会在后端成功时先超时误报失败，
+    // 诱导用户重复点击（后端可能仍在应用）。
+    const response = await request.post<APIResponse<ClusterSyncResult>>('/cluster/sync/pull', undefined, { timeout: 120000 })
     const result = response.data
     if (result) mfaAwareSuccess(result.changed ? `同步完成，已应用版本 ${result.applied_version}` : '当前已是最新配置')
     // fetchStatus 为 silent 请求，失败仅记录日志，避免逃逸为未处理的 rejection

@@ -170,7 +170,18 @@ func crsPoolFingerprint() string {
 // （两个渲染入口都由规则身份驱动），空值=数据损坏/调用错位的显性信号；收窄
 // 为「跳过该规则+告警」会让受影响规则的 IP 控制面静默缺失（安全面静默缺口），
 // 比整份配置拒绝（fail-closed、横幅可见）更危险。本注释即裁定载体。
+type scopedCRSListResult struct {
+	lists map[int64][]string
+	err   error
+}
+
+type scopedCRSListCache map[string]scopedCRSListResult
+
 func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crsFingerprint string, multiPolicy bool, blockStatus int, ruleCaddyID string, stage0DetectionTrust ...[]string) (string, error) {
+	return buildCorazaDirectivesWithScopedCache(p, store, crsFingerprint, multiPolicy, blockStatus, ruleCaddyID, nil, stage0DetectionTrust...)
+}
+
+func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyConfigStore, crsFingerprint string, multiPolicy bool, blockStatus int, ruleCaddyID string, scopedCache scopedCRSListCache, stage0DetectionTrust ...[]string) (string, error) {
 	if ruleCaddyID == "" {
 		return "", fmt.Errorf("u-trust12 引擎投影缺少规则身份（ruleCaddyID 为空）——id:12 逐规则渲染，scope 必须编入规则身份（历史 HP-1）")
 	}
@@ -493,7 +504,7 @@ func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crs
 		}
 		// 运行时 ctl 规则：Include 之前（先于被禁规则插入 phase:1 序列）
 		if len(scoped) > 0 {
-			if err := emitScopedCRSExclusions(&sb, p, scoped, store, chainIndex); err != nil {
+			if err := emitScopedCRSExclusions(&sb, p, scoped, store, chainIndex, scopedCache); err != nil {
 				return "", err
 			}
 		}
@@ -765,6 +776,14 @@ func conditionsEmissionIssue(conditions []models.CustomRuleCondition) string {
 // （无 conditions、靠 target/operator/pattern 发射），并对该形状同样校验 target/
 // operator 合法性。
 func customRuleEmissionIssue(cr models.CustomRule) string {
+	// 带外旧库/集群快照可能绕过写侧校验；非法分值会产出 "+-5" 等整份
+	// 配置级编译错误，非法动作会静默改变语义。0 分与空动作保留旧版缺省形状。
+	if cr.Score != 0 && !customRuleValidScores[cr.Score] {
+		return "异常分值无效"
+	}
+	if cr.Action != "" && !customRuleValidActions[cr.Action] {
+		return "动作无效"
+	}
 	// 规则名进入 msg 引号串：控制字符/双引号会截断规则行或提前闭合动作。
 	for _, r := range cr.Name {
 		if r < 0x20 || r == 0x7f || r == '"' {
@@ -919,20 +938,25 @@ func SecurityPolicyHasIPControl(p *models.SecurityPolicy) bool {
 	if p == nil {
 		return false
 	}
-	var ipWL []string
-	json.Unmarshal(p.IPWhitelist, &ipWL)
-	if p.IPWhitelistEnabled && len(ipWL) > 0 {
+	// 历史问题（历史）：摘要必须与发射面同判定，不再按「refs 非空」虚报。
+	// 严格模式装载失败（IPRefMissing）时发射端整条跳过渲染 → false。
+	if p.IPRefMissing {
+		return false
+	}
+	// 信任名单：stage0 策略的信任不属于本引擎（路由层直通/预检承载）；
+	// 内容门取合并集（inline ∪ 已解析引用条目）——引用的列表为空/已被删除
+	// 时发射面零信任规则，摘要同步 false。
+	if p.IPWhitelistEnabled && p.PolicyType != models.PolicyTypeStage0 && len(mergedWhitelist(p)) > 0 {
 		return true
 	}
-	if p.IPWhitelistEnabled && ipListRefsNonEmpty(p.IPWhitelistRefs) {
-		return true
-	}
+	// ACL：开启即发射（allow 空集=否定空集恒拒；deny/绕过 空集不命中但
+	// 引擎仍开）——与 emitIPControl 的 p.IPACLEnabled 项一致。
 	if p.IPACLEnabled {
 		return true
 	}
 	var ipBL []string
 	json.Unmarshal(p.IPBlacklist, &ipBL)
-	return len(ipBL) > 0
+	return len(aggregateIPEntries(ipBL)) > 0
 }
 
 // CountEnabledCustomRules returns how many of the policy's referenced custom
@@ -1029,16 +1053,20 @@ func CountEnabledCustomRulesBatch(policies []*models.SecurityPolicy) []int {
 // stage0DetectionTrust 契约（始终发射收敛，2026-10-15）：nil=无 stage0 保留
 // 检测策略（不发射 id:12）；非 nil（可空切片）=存在——恒发射 id:12（空集
 // 文件算子永不命中=与无规则等价，空↔非空纯内容变化走热路径）。
-func buildWafHandlerWithPolicy(ruleCaddyID string, policy *models.SecurityPolicy, store caddyConfigStore, crsFp string, multiPolicy bool, blockStatus int, bodyLimitMB int, stage0DetectionTrust []string) (map[string]interface{}, error) {
+func buildWafHandlerWithPolicy(ruleCaddyID string, policy *models.SecurityPolicy, store caddyConfigStore, crsFp string, multiPolicy bool, blockStatus int, bodyLimitMB int, stage0DetectionTrust []string, scopedCaches ...scopedCRSListCache) (map[string]interface{}, error) {
 	if policy == nil {
 		return nil, nil
+	}
+	var scopedCache scopedCRSListCache
+	if len(scopedCaches) > 0 {
+		scopedCache = scopedCaches[0]
 	}
 	var directives string
 	var err error
 	if stage0DetectionTrust == nil {
-		directives, err = BuildCorazaDirectives(policy, store, crsFp, multiPolicy, blockStatus, ruleCaddyID)
+		directives, err = buildCorazaDirectivesWithScopedCache(policy, store, crsFp, multiPolicy, blockStatus, ruleCaddyID, scopedCache)
 	} else {
-		directives, err = BuildCorazaDirectives(policy, store, crsFp, multiPolicy, blockStatus, ruleCaddyID, stage0DetectionTrust)
+		directives, err = buildCorazaDirectivesWithScopedCache(policy, store, crsFp, multiPolicy, blockStatus, ruleCaddyID, scopedCache, stage0DetectionTrust)
 	}
 	if err != nil {
 		return nil, err
@@ -1699,6 +1727,10 @@ func resolvePolicyCustomRules(raw json.RawMessage, store caddyConfigStore) []mod
 				var cr models.CustomRule
 				var conditionsJSON string
 				if err := rows.Scan(&cr.ID, &cr.Name, &conditionsJSON, &cr.Action, &cr.Score, &cr.Enabled); err != nil {
+					msg := fmt.Sprintf("解析策略自定义规则行扫描失败（规则 id=%d）: %v", cr.ID, err)
+					if auditFailureShouldLog(msg) {
+						Logf("warn", "%s", msg)
+					}
 					continue
 				}
 				// S历史问题-5:跨 500 分块重复引用查重——同 ID 双 SecRule 会被
@@ -1932,7 +1964,7 @@ const crsScopedExclusionIDBase = 2000000
 // 排序后 listRefs，同名必同键、异键必异名，键不变则文件名稳定（名单条目
 // 内容变化热路径原位重写，@ipListFast ≤1s stat 热感知），键变化才换名（旧
 // 文件由 24h GC 回收）。同组合多条目共享一份投影（配置字节恒定）。
-func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entries []CRSExcludedEntry, store caddyConfigStore, chainIndex func() *CRSRuleIndex) error {
+func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entries []CRSExcludedEntry, store caddyConfigStore, chainIndex func() *CRSRuleIndex, cache scopedCRSListCache) error {
 	var refIDs []int64
 	seenRef := make(map[int64]struct{})
 	for _, entry := range entries {
@@ -1944,7 +1976,25 @@ func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entr
 			refIDs = append(refIDs, id)
 		}
 	}
-	listsByID, _, err := loadIPListEntriesVia(store, refIDs)
+	var listsByID map[int64][]string
+	var err error
+	if cache != nil {
+		sorted := append([]int64(nil), refIDs...)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+		var key strings.Builder
+		for _, id := range sorted {
+			key.WriteString(strconv.FormatInt(id, 10))
+			key.WriteByte(',')
+		}
+		if cached, ok := cache[key.String()]; ok {
+			listsByID, err = cached.lists, cached.err
+		} else {
+			listsByID, _, err = loadIPListEntriesVia(store, refIDs)
+			cache[key.String()] = scopedCRSListResult{lists: listsByID, err: err}
+		}
+	} else {
+		listsByID, _, err = loadIPListEntriesVia(store, refIDs)
+	}
 	if err != nil {
 		Logf("warn", "解析作用域排除引用的 IP 列表失败（策略 %q）: %v", p.Name, err)
 		listsByID = map[int64][]string{}

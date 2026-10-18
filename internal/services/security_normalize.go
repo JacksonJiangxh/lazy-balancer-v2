@@ -62,6 +62,8 @@ func ValidBlockStatusCode(v int) bool {
 //     唯一修复路径（Update 400 拒修、发射端零规则），执行归一但不 bump
 //     集群版本（从节点无版本权威，bump 会与主节点版本流冲突）。
 func NormalizeLegacySecurityPolicyEnums(ctx context.Context) {
+	// 历史问题-07 保留内联：复合原子读（角色 + sync_security 单查询），拆成
+	// RoleOf + 第二次查询会引入两读之间的开关翻转窗口。
 	var isMaster, syncSecurity bool
 	if err := db.DB.QueryRowContext(ctx, "SELECT COALESCE(is_master,1), COALESCE(sync_security,1) FROM global_config WHERE id=1").Scan(&isMaster, &syncSecurity); err != nil {
 		Logf("warn", "security enum normalize: failed to read cluster role, skipping: %v", err)

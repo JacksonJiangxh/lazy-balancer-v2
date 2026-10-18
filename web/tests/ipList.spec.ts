@@ -14,6 +14,7 @@ import { formatIpListEntryLine, parseIpListEntryLine } from '../src/utils/ipList
 import {
   ensureSharedEntries,
   invalidateSharedEntriesCache,
+  parseIPList,
   sharedEntriesCache,
   writeSharedEntries,
 } from '../src/utils/securityStages.ts'
@@ -84,6 +85,27 @@ test('C5 引号包裹的 IP 字段（外部 CSV 工具产物）可解析', () =>
   assert.deepEqual(parseIpListEntryLine('"10.0.0.2","备注"', isIp), { value: '10.0.0.2', remark: '备注' })
 })
 
+test('C6 多行备注导出归一为空格——导入端按行切分，往返不丢备注（历史问题-11）', () => {
+  const line = formatIpListEntryLine('10.0.0.1', '第一行\r\n第二行')
+  assert.equal(line, '10.0.0.1,第一行 第二行')
+  const parsed = parseIpListEntryLine(line, isIp)
+  assert.deepEqual(parsed, { value: '10.0.0.1', remark: '第一行 第二行' })
+})
+
+test('C7 备注按 Unicode code point 截断 100，不产生半个代理对（历史问题-15）', () => {
+  const parsed = parseIpListEntryLine(`10.0.0.1,${'😀'.repeat(100)}尾`, isIp)
+  assert.ok(parsed)
+  assert.equal(Array.from(parsed.remark).length, 100)
+  assert.equal(parsed.remark, '😀'.repeat(100))
+  assert.equal(parsed.remark.isWellFormed(), true)
+})
+
+test('C8 JSON 字符串数组统一 trim 并丢弃空项（历史问题-17）', () => {
+  assert.deepEqual(parseIPList('[" 1.1.1.1 ","","  ",2,"10.0.0.0/8"]'), ['1.1.1.1', '10.0.0.0/8'])
+  const crsSource = readFileSync(new URL('../src/composables/useCrsRuleIndex.ts', import.meta.url), 'utf8')
+  assert.match(crsSource, /normalizeStringEntries\(rec\.ips\)/, 'CRS 排除规则数组必须复用同一 trim 归一')
+})
+
 test('D 共享条目缓存：缺失才拉、并发去重、失败可重试、invalidate 后重拉', async () => {
   invalidateSharedEntriesCache()
   const calls: number[] = []
@@ -108,5 +130,24 @@ test('D 共享条目缓存：缺失才拉、并发去重、失败可重试、inv
   calls.length = 0
   await ensureSharedEntries([1], loader)
   assert.deepEqual(calls, [1])
+  invalidateSharedEntriesCache()
+})
+
+test('D2 代际守卫：失效前发起的在途 loader 落地不得回填缓存（历史问题-03）', async () => {
+  invalidateSharedEntriesCache()
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const pending = ensureSharedEntries([7], async () => {
+    await gate
+    return ['10.0.0.7-old']
+  })
+  // 在途期间发生写动作：失效缓存并递增代际
+  invalidateSharedEntriesCache()
+  release()
+  await pending
+  assert.equal(7 in sharedEntriesCache, false, '迟到结果必须丢弃，保持未缓存待重取')
+  // 重取得到新值
+  await ensureSharedEntries([7], async () => ['10.0.0.7-new'])
+  assert.deepEqual(sharedEntriesCache[7], ['10.0.0.7-new'])
   invalidateSharedEntriesCache()
 })

@@ -197,8 +197,7 @@ func (m *CRSUpdateManager) RefreshLatestAsync() {
 			m.latestKnown = true
 		}
 		m.latestMu.Unlock()
-		var isMaster bool
-		if qerr := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); qerr == nil && isMaster {
+		if isMaster, qerr := RoleOf(context.Background(), db.DB); qerr == nil && isMaster {
 			if _, dbErr := db.DB.Exec("UPDATE security_crs_version SET last_checked=datetime('now') WHERE id=1"); dbErr != nil {
 				Logf("error", "crs update: failed to record last_checked: %v", dbErr)
 			}
@@ -333,8 +332,7 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	// 会写本地版本行、替换规则树并 reload，瞬时打破只读不变量。
 	// 历史问题（历史）：NULL 兜底归一为 1，与 IsMaster/readonly 写闸/
 	// 调度器 tick 的 COALESCE(is_master,1) 同口径（历史 NULL 视为主节点）。
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
+	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
 		// 历史问题-05（历史）：从节点中止是正常跳过语义，对齐威胁族——
 		// 落 skipped 终态、审计「更新跳过」，不再记「更新失败」。
 		m.setStage(CRSStatusSkipped, "当前节点为从节点，终止 CRS 更新")

@@ -110,7 +110,10 @@ var auditLogCopyFile = copyAuditLogTo
 // audit.log 永远不会被重新创建；采集器（tailer）也会因文件缺失/inode 变化而
 // 重置偏移，导致首次轮转后所有安全事件永久丢失。copytruncate 保留原 inode，
 // Coraza 无感知，tailer 只看到截断（size < offset 即重置偏移），从而持续摄取。
-func rotateAuditLogIfNeeded() {
+func rotateAuditLogIfNeeded() int {
+	// 历史问题-08：返回轮转路径补采实际插入条数（pending/活文件尾部/.1 归档），
+	// 由 PollOnce 并入「摄取 N 条」——补采窗口入库的事件此前从不出现在任务日志。
+	total := 0
 	// 先重试上次失败的归档补采：成功才删除标记继续轮转；失败则保留 .1 不被 shift
 	// 覆盖（事件尚存），待下次轮转重试，避免补采失败导致窗口事件永久丢失。
 	if pending := securityEventsReadPendingDelta(); pending != nil {
@@ -121,21 +124,22 @@ func rotateAuditLogIfNeeded() {
 			// digit key 归一为 #。消息内容保持原样。
 			throttledAuditFailureLogf("audit log rotation: pending delta archive %s missing, dropping marker", pending.Path)
 			_ = os.Remove(securityEventsPendingDeltaPath())
-		} else if err := securityEventsIngestDeltaFrom(pending.Path, pending.Offset, true); err != nil {
+		} else if n, err := securityEventsIngestDeltaFrom(pending.Path, pending.Offset, true); err != nil {
 			throttledAuditFailureLogf("audit log rotation: pending delta ingest retry failed (rotation deferred): %v", err)
-			return
+			return total
 		} else {
+			total += n
 			Logf("info", "audit log rotation: pending delta ingest recovered from %s", pending.Path)
 			_ = os.Remove(securityEventsPendingDeltaPath())
 		}
 	}
 	info, err := os.Stat(auditLogPath)
 	if err != nil || info.Size() == 0 {
-		return
+		return total
 	}
 	maxBytes := auditLogSizeBytes()
 	if info.Size() < maxBytes {
-		return
+		return total
 	}
 	// 轮转前记录已持久化的摄取偏移：tick 读到 EOF 后、复制完成前 Coraza 新写入
 	// 的事件只存在于 .1，活文件截断后 tailer 重置偏移也不会再读 .1，需在归档后
@@ -163,12 +167,12 @@ func rotateAuditLogIfNeeded() {
 	current := filepath.Join(dir, base+".1")
 	if err := auditLogCopyFile(auditLogPath, current); err != nil {
 		throttledAuditFailureLogf("audit log rotation: copy to .1 failed (not truncating): %v", err)
-		return
+		return total
 	}
 	archInfo, err := os.Stat(current)
 	if err != nil {
 		throttledAuditFailureLogf("audit log rotation: stat %s failed (not truncating): %v", current, err)
-		return
+		return total
 	}
 	archSize := archInfo.Size()
 	// 补采活文件 [archSize, truncate 前) 的新写尾部：copy 最后一次读取后、truncate
@@ -191,14 +195,16 @@ func rotateAuditLogIfNeeded() {
 		ingestFrom, berr := securityEventsBackscanDocumentStart(auditLogPath, archSize)
 		if berr != nil {
 			throttledAuditFailureLogf("audit log rotation: backscan live tail failed (not truncating): %v", berr)
-			return
+			return total
 		}
 		// 活文件补采以归档语义进行（archive=true）：补采区间有界且完整内容已在
 		// 刚拷贝的 .1 中以归档语义摄取，活文件畸形区（≥4MB 无文档头）可安全跳过；
 		// 若按活文件语义 F1 报错，轮转每 2s 周期反复中止，文件永不截断（历史问题 F1）。
-		if ierr := securityEventsIngestDeltaFrom(auditLogPath, ingestFrom, true); ierr != nil {
+		if n, ierr := securityEventsIngestDeltaFrom(auditLogPath, ingestFrom, true); ierr != nil {
 			throttledAuditFailureLogf("audit log rotation: ingest live tail [%d, %d) failed (not truncating): %v", ingestFrom, tailInfo.Size(), ierr)
-			return
+			return total
+		} else {
+			total += n
 		}
 		archSize = tailInfo.Size()
 	}
@@ -207,7 +213,7 @@ func rotateAuditLogIfNeeded() {
 	// 事务被截断抹除且后续归档 pass 同样静默跳过，事件永久丢失（实际丢失窗口
 	// 大于原「stat→truncate 系统调用间隙毫秒级」注释所述）。
 	if finalInfo, ferr := os.Stat(auditLogPath); ferr == nil && finalInfo.Size() > archSize {
-		return
+		return total
 	}
 	// F5: truncate 前先落 pending 标记。标记写失败绝不在无标记状态下截断——
 	// 活文件仍完好、内容无损失，本轮中止下周期重试。truncate 成功与补采完成之间
@@ -216,13 +222,13 @@ func rotateAuditLogIfNeeded() {
 	// 无需补采。
 	if err := securityEventsWritePendingDelta(securityEventsPendingDelta{Path: current, Offset: persistedOffset, Size: archSize}); err != nil {
 		throttledAuditFailureLogf("audit log rotation: write pending delta marker failed, aborting rotation without truncate: %v", err)
-		return
+		return total
 	}
 	// 截断失败不影响数据安全（下次轮转会重试），仅记录日志。
 	if err := os.Truncate(auditLogPath, 0); err != nil {
 		_ = os.Remove(securityEventsPendingDeltaPath())
 		throttledAuditFailureLogf("audit log rotation: truncate failed (will retry next cycle): %v", err)
-		return
+		return total
 	}
 	// M20（2026-09-05 审计）：truncate 成功后立即把持久化 offset 归零——此前
 	// 依赖下次读取时的 size 比较（新 size < 旧 offset）才回退，窗口期内 offset
@@ -233,13 +239,15 @@ func rotateAuditLogIfNeeded() {
 	Logf("info", "audit log rotation: rotated %s (%d bytes → %s.1)", auditLogPath, info.Size(), base)
 	// 补采轮转窗口：归档大小可能因复制期间的新写入大于 stat 时的 size，
 	// 因此以 .1 实际大小作为窗口终点，覆盖复制竞态。
-	if err := securityEventsIngestRotatedDelta(persistedOffset); err != nil {
+	if n, err := securityEventsIngestRotatedDelta(persistedOffset); err != nil {
 		throttledAuditFailureLogf("audit log rotation: ingest rotated delta failed (events in %s.1 may be lost): %v", base, err)
 		// 标记保留（truncate 前已落盘）：事件只在 .1，下次轮转 shift 前先重试，
 		// 防止 .1→.2 后事件永久丢失。
 	} else {
+		total += n
 		_ = os.Remove(securityEventsPendingDeltaPath())
 	}
+	return total
 }
 
 // securityEventsBackscanDocumentStart 后向扫描 [0, from) 内最近一个文档头 "\n{"

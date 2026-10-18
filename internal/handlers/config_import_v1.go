@@ -662,6 +662,10 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		// N+13 H2-F3：与 ImportConfigBackup 同序——空内容拦截页软跳过也须
 		// 进预览，否则预览静默、导入才跳（summary/warnings 口径一致）。
 		skipWarnings = append(skipWarnings, skipEmptyBlockPages(backup.Tables)...)
+		if err := validateV2BackupCertJobStatuses(backup.Tables); err != nil {
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
+			return
+		}
 		// 历史 历史问题：与 ImportConfigBackup 同序——content_type 白名单值域收敛
 		// 也进预览，「导入/预览双路径同序」不变量补齐（预览不回显该值，无可观察
 		// 面分叉，纯不变量对齐）。
@@ -679,7 +683,11 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		}
 		// 与 ImportConfigBackup 同序：安全策略 CRS 字段校验也须进预览，否则坏
 		// 组号备份在预览显示可导入、实际导入才 400（历史问题 历史问题）。
-		if err := validateV2BackupSecurityPolicies(backup.Tables); err != nil {
+		// 历史问题-02（历史）：本次导入同时替换 CRS 规则树时，存在性基准
+		// 不是 live 索引——降级为形状校验并进预览警告（与导入侧同判据）。
+		previewLbbak := lbbakPayloadFromCtx(c)
+		crsTreeReplaced := sectionTables["security_crs_version"] && previewLbbak != nil && previewLbbak.CRSTarGz != nil
+		if err := validateV2BackupSecurityPolicies(backup.Tables, crsTreeReplaced); err != nil {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
@@ -735,6 +743,9 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		// (与导入侧 历史问题-F3 口径一致)。
 		validateWarnings := skipWarnings[:0:0]
 		validateWarnings = append(validateWarnings, skipWarnings...)
+		if crsTreeReplaced {
+			validateWarnings = append(validateWarnings, warningCRSTreeReplaced)
+		}
 		if importUsername := c.GetString("username"); importUsername != "" && sectionTables["users"] && len(backup.Tables["users"]) > 0 && !backupContainsUsername(backup.Tables["users"], importUsername) {
 			validateWarnings = append(validateWarnings, "备份不包含当前操作账户——若导入时勾选“系统数据”，导入后请使用备份内的管理员账户登录")
 		}
@@ -751,7 +762,11 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			// F-B1（历史）：manifest 未登记的威胁库条目——预览/导入
 			// 同文案告警（不拒绝，老备份兼容）。
 			if len(payload.UnregisteredThreatEntries) > 0 {
-				validateWarnings = append(validateWarnings, fmt.Sprintf("lbbak 含 manifest 未登记的威胁库条目（%s）——内容未经完整性校验，已按原样落盘；建议核实来源后重新导出备份", strings.Join(payload.UnregisteredThreatEntries, "、")))
+				warning := fmt.Sprintf("lbbak 含 manifest 未登记的威胁库条目（%s）——内容未经完整性校验，已按原样落盘；建议核实来源后重新导出备份", strings.Join(payload.UnregisteredThreatEntries, "、"))
+				if !sectionTables["security_crs_version"] {
+					warning = fmt.Sprintf("lbbak 含 manifest 未登记的威胁库条目（%s）——内容未经完整性校验；本次分类未选择安全防护数据，条目未导入、未落盘", strings.Join(payload.UnregisteredThreatEntries, "、"))
+				}
+				validateWarnings = append(validateWarnings, warning)
 			}
 		}
 		// SYS-U4（历史，已声明例外）：本剔除步位于全部校验器之后，与导入侧

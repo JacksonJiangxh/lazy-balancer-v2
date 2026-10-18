@@ -4,6 +4,12 @@ import { resolve } from 'path'
 import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 
+// 面板默认 admin_tls_enabled=0；仅开发机明确启用 HTTPS 时设置
+// VITE_DEV_BACKEND_HTTPS=1（secure:false 用于自签证书）。
+const devBackendTarget = process.env.VITE_DEV_BACKEND_HTTPS === '1'
+  ? 'https://localhost:8000'
+  : 'http://localhost:8000'
+
 export default defineConfig({
   plugins: [
     vue(),
@@ -21,9 +27,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        // 默认连本地 Docker 部署（面板强制 HTTPS，明文 301）——secure:false 跳过自签证书校验。
-        // 裸 go run 起的 dev 后端无 TLS：target 改回 http://localhost:8000 并移除 secure。
-        target: 'https://localhost:8000',
+        target: devBackendTarget,
         changeOrigin: true,
         secure: false,
       },

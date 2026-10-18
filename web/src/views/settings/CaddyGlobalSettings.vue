@@ -89,7 +89,7 @@
               @click="openSaveListDialog"
             >存为列表</el-button>
           </div>
-          <div class="form-tip-line">仅这些网段发来的请求头会被采信；未配对网段时所有头一律被忽略（最小 /8 与 /96）。{{ trustedPresetRangesDoc }}</div>
+          <div class="form-tip-line">仅这些网段发来的请求头会被采信；未配对网段时所有头一律被忽略（最小 /8 与 /29）。{{ trustedPresetRangesDoc }}</div>
         </el-form-item>
         <el-form-item label="引用地址列表">
           <el-select
@@ -239,7 +239,7 @@ import { useAuthStore } from '@/stores/auth'
 import { ansiToHtml } from '@/utils/ansi'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { CDN_PRESETS, DEFAULT_ACCESS_LOG_FORMAT } from '@/utils/caddyDefaults'
-import { IP_LIST_CATEGORIES } from '@/utils/securityStages'
+import { IP_LIST_CATEGORIES, parseIPList, parseRefIds } from '@/utils/securityStages'
 import type { APIResponse, ProxyTimeoutConfig } from '@/types'
 import ProxyTimeoutFields from '@/components/rules/ProxyTimeoutFields.vue'
 
@@ -319,29 +319,14 @@ const trustedPresetRangesDoc = computed(() => {
   return doc ? `官方网段：${doc}` : ''
 })
 
-const parseTrustedList = (raw: string): string[] => {
-  try {
-    const parsed: unknown = JSON.parse(raw || '[]')
-    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : []
-  } catch {
-    return []
-  }
-}
-
-const parseTrustedRefIds = (raw: string): number[] => {
-  try {
-    const parsed: unknown = JSON.parse(raw || '[]')
-    return Array.isArray(parsed) ? parsed.filter((v): v is number => typeof v === 'number' && Number.isInteger(v)) : []
-  } catch {
-    return []
-  }
-}
+// JSON 数组文本解析统一走 utils/securityStages（parseIPList/parseRefIds 单源，
+// 历史问题-10：原文件内 parseTrustedList/parseTrustedRefIds 与其逐字重复）。
 
 // settings（外部回填/加载）→ 表单数组
 watch(() => [settings.value.trusted_proxy_ranges, settings.value.trusted_proxy_headers, settings.value.trusted_proxy_range_refs], ([ranges, headers, refs]) => {
-  trustedRanges.value = parseTrustedList(ranges)
-  trustedHeaders.value = parseTrustedList(headers)
-  trustedRangeRefs.value = parseTrustedRefIds(refs)
+  trustedRanges.value = parseIPList(ranges)
+  trustedHeaders.value = parseIPList(headers)
+  trustedRangeRefs.value = parseRefIds(refs)
 }, { immediate: true })
 // 表单数组 → settings（保存载荷经 CADDY_CONFIG_KEYS 拾取 JSON 文本）
 watch(trustedRanges, (list) => { settings.value.trusted_proxy_ranges = JSON.stringify(list) })

@@ -8,6 +8,7 @@ package services
 // cert-waiting-ca：默认调度关闭——cert-renewal-scan 入队时唤醒，全部终态自动停。
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -104,10 +105,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// 历史问题：读失败 warn+重试一次；仍失败按 fail-closed 从节点启动——
 	// 不得因读错误保持 NewEngine 默认主节点（会拉起 master-only daemon 并
 	// 放开写面）。并发角色翻转由后续 SetRole 正常收敛。
-	var roleMaster int
+	var roleMaster bool
 	roleErr := errors.New("数据库未初始化")
 	for attempt := 0; attempt < 2 && db.DB != nil; attempt++ {
-		if roleErr = db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&roleMaster); roleErr == nil {
+		if roleMaster, roleErr = RoleOf(context.Background(), db.DB); roleErr == nil {
 			break
 		}
 	}
@@ -115,7 +116,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Logf("warn", "任务引擎角色种子读取失败（已重试一次），按从节点启动（fail-closed）: %v", roleErr)
 		taskEngine.SetRole(false)
 	} else {
-		taskEngine.SetRole(roleMaster == 1)
+		taskEngine.SetRole(roleMaster)
 	}
 	_ = taskEngine.RecoverOrphans()
 
@@ -195,7 +196,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Kind:        taskengine.KindPeriodic,
 		IntervalFn:  func() time.Duration { return 24 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
-			deleted := SecurityEventsRetentionCleanupOnce()
+			// 历史问题-06：传任务 ctx——Stop(cancel) 可在大批量首遍中途生效。
+			deleted := SecurityEventsRetentionCleanupCtx(rc.Ctx)
 			TaskLogf("security-events-retention", "cleanup", "安全事件保留清理完成：删除 %d 条（保留期与条数上限，无过期为 0）", deleted)
 			return nil
 		},
@@ -488,8 +490,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		IntervalFn: func() time.Duration { return time.Minute },
 		// 无 EnabledFn（2026-10-14 用户裁定）：调度唯一前提=业务启用（PUT
 		// 保存联动启停+启动按库实态对齐）；挂 EnabledFn 会让域 E 调度门在
-		// 调度面静默拦截，到不了 Run 体业务门（未启用空转无落痕）。任务监控
-		// enabled 列恒开，启停语义全在调度开关+事件页业务开关。
+		// 调度面静默拦截，到不了 Run 体业务门（未启用空转无落痕）。启停语义
+		// 全在调度开关+事件页业务开关。
 		Run: func(rc taskengine.RunContext) error {
 			return RunAutobanCycle(rc)
 		},
@@ -635,18 +637,6 @@ func syncTaskLoop(id string, enabled bool) {
 	} else {
 		te.StopLoop(id)
 	}
-}
-
-// WakeCertWaitingCA 证书任务入队成功后的统一唤醒入口（历史问题）。
-// 仅当确有在途/待补扫任务（certJobsActive）时越过 cert-waiting-ca 的
-// 「已停止」态并重置补扫节拍；无活零动作。禁止直接 StartLoop——那会把
-// 用户手动停止的调度隐式打开（旧三处唤醒点即此缺陷）。
-func WakeCertWaitingCA() {
-	te := TaskEngine()
-	if te == nil {
-		return
-	}
-	te.RearmLoop("cert-waiting-ca", certJobsActive())
 }
 
 // WakeCertWaitingCAForEnqueuedJob 已知任务入队成功时的唤醒（历史问题）。

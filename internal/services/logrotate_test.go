@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 func TestRotatingFileWriter_Write_returns_rotation_reopen_error(t *testing.T) {
@@ -211,5 +212,74 @@ func TestTaskLogsHousekeeping_waitsForCertJobWriteLock(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("过期文件应已删除, stat err=%v", err)
+	}
+}
+
+// 历史问题-历史问题：tasks 根目录的保留期删除也必须与 appendTaskLogLine
+// 共用路径锁，并在锁内重读 ModTime；写入刚刷新的文件不得按扫描前旧状态删除。
+func TestTaskLogsHousekeeping_waitsForTaskLogWriteLock(t *testing.T) {
+	base := t.TempDir()
+	logFile := filepath.Join(base, "app.log")
+	tasksDir := filepath.Join(base, "tasks")
+	if err := os.MkdirAll(tasksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldDir := taskengine.LogDir()
+	taskengine.SetLogDir(tasksDir)
+	t.Cleanup(func() {
+		taskengine.SetLogDir(oldDir)
+		taskengine.SetTaskLogSizeBytesFn(nil)
+	})
+	path := taskengine.TaskLogPath("lock-root")
+	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().AddDate(0, -6, 0)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	taskengine.SetTaskLogSizeBytesFn(func() int64 {
+		close(entered)
+		<-release
+		return int64(^uint64(0) >> 1)
+	})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		taskengine.TeeTaskLog("lock-root", "2026/01/02 03:04:05", "INFO", "test", "fresh")
+	}()
+	<-entered // writer 已持路径锁并阻塞在尺寸求值，清理不得越过该锁。
+
+	cleaned := make(chan TaskLogHousekeepingResult, 1)
+	go func() { cleaned <- taskLogsHousekeeping(logFile) }()
+	select {
+	case res := <-cleaned:
+		close(release)
+		<-writerDone
+		t.Fatalf("清理未等待 tasks 根日志写锁: %+v", res)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if _, err := os.Stat(path); err != nil {
+		close(release)
+		<-writerDone
+		t.Fatalf("持锁期间文件被删除: %v", err)
+	}
+
+	close(release)
+	<-writerDone
+	select {
+	case res := <-cleaned:
+		if len(res.Deleted) != 0 {
+			t.Fatalf("写入刷新后的文件不得按旧 ModTime 删除: %+v", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("解锁后清理未完成")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(data), "fresh") {
+		t.Fatalf("写入后的活动日志必须保留, err=%v body=%q", err, data)
 	}
 }

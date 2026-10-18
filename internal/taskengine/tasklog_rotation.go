@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 )
 
 // 任务日志统一滚动：所有写入都在追加前按真实文件大小判断。
@@ -39,6 +40,29 @@ func lockTaskLogPath(path string) *sync.Mutex {
 		taskLogPathLocks[path] = l
 	}
 	return l
+}
+
+// RemoveTaskLogIfModifiedBefore 在任务日志写入锁内重新 stat 后按保留期删除。
+// 扫描者锁外看到的旧 FileInfo 可能已被「rotate→rename→append」替换；
+// 锁内复核避免误删刚移位或刚写入的新一代文件。
+func RemoveTaskLogIfModifiedBefore(path string, cutoff time.Time) (bool, error) {
+	lock := lockTaskLogPath(path)
+	lock.Lock()
+	defer lock.Unlock()
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.ModTime().Before(cutoff) {
+		return false, nil
+	}
+	if err := os.Remove(path); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // RotateTaskLogBeforeWrite 在 size+incoming 超阈时先滚动再写入。

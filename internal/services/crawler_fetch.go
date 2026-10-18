@@ -52,7 +52,10 @@ func findBoundedCrawlerTokens(re *regexp.Regexp, body string, v6 bool) []string 
 }
 
 // parseCrawlerCIDRsForFormat 按源声明格式提取（历史问题：消费 crawlerSource.Format）：
-//   - json：响应必须是合法 JSON（错误页/限流页 → error，调用方保留上次快照）；
+//   - json：响应必须是合法 JSON，且必须命中结构化 ipv4Prefix/ipv6Prefix 字段
+//     （历史问题：错误页/限流页的合法 JSON——如 {"error":"rate limited from
+//     1.2.3.4"}——此前会走词法兜底把页面内 IP 同形文本写进豁免名单；JSON 源
+//     不再做词法提取，结构不符即失败并保留上次快照）；
 //   - html/plain/空：仅词法提取；
 //   - 统一 netip 校验，裸 IP 归一 /32（IPv4）/ /128（IPv6），非法 token 跳过。
 func parseCrawlerCIDRsForFormat(body, format string) ([]string, error) {
@@ -69,12 +72,22 @@ func parseCrawlerCIDRsForFormat(body, format string) ([]string, error) {
 		seen[prefix] = struct{}{}
 		out = append(out, prefix)
 	}
+	isJSON := strings.EqualFold(strings.TrimSpace(format), "json")
 	// 1) 结构化字段（JSON 对象/数组递归；ipv4Prefix/ipv6Prefix 大小写不敏感）。
 	var parsed any
 	jsonErr := json.Unmarshal([]byte(body), &parsed)
 	if jsonErr == nil {
+		structuredBefore := len(out)
 		collectCrawlerPrefixFields(parsed, add)
-	} else if strings.EqualFold(strings.TrimSpace(format), "json") {
+		if isJSON {
+			if len(out) == structuredBefore {
+				return nil, fmt.Errorf("JSON 响应未包含结构化 ipv4Prefix/ipv6Prefix 字段（疑似错误页/结构变更），保留上次快照")
+			}
+			// 历史问题：JSON 源只认结构化字段——其余字段（error/message/note）
+			// 中的 IP 同形文本一律不作官方网段。
+			return out, nil
+		}
+	} else if isJSON {
 		// 历史问题：JSON 源返回非 JSON（错误页/HTML 劫持）→ 显式失败，绝不把
 		// 页面里的 IP 同形文本当官方网段。
 		return nil, fmt.Errorf("响应不是合法 JSON（疑似错误页），保留上次快照")

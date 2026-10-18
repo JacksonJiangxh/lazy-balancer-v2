@@ -22,6 +22,7 @@ func resetTrafficState(t *testing.T) {
 	trafficMu.Unlock()
 	trafficSecondState.Store(0)
 	trafficSampleN.Store(1)
+	trafficEventSeq.Store(0)
 	trafficLeasesMu.Lock()
 	trafficLeases = map[string]trafficLease{}
 	if trafficLeaseTimer != nil {
@@ -55,6 +56,38 @@ func TestTrafficRecord_attackNormalBuckets(t *testing.T) {
 	trafficRecord("", true)
 	if _, exists := trafficCountries[""]; exists {
 		t.Fatalf("空国名不应产生条目")
+	}
+}
+
+// E81-历史问题：xdb 私网/保留段行的国家列为 "0"/"Reserved"，不是国家值——计数桶
+// 与事件流都不得为其建键（聚合端点已过滤 ""/"0"/"Reserved"，两端口径统一）。
+func TestTrafficRecord_rejectsNonCountryKeys(t *testing.T) {
+	resetTrafficState(t)
+	resetTrafficEvents()
+	trafficEventSampleN.Store(1)
+	for _, key := range []string{"", "0", "Reserved", " 0 ", "Reserved "} {
+		trafficRecord(key, true)
+		trafficRecord(key, false)
+		trafficEventRecord(key, "")
+	}
+	trafficMu.RLock()
+	count := len(trafficCountries)
+	trafficMu.RUnlock()
+	if count != 0 {
+		t.Fatalf("non-country keys must not create buckets, got %d", count)
+	}
+	if events := len(trafficEvents); events != 0 {
+		t.Fatalf("non-country keys must not create events, got %d", events)
+	}
+
+	// 回归形状：真实国家键照常计数与记录事件。
+	trafficRecord("中国", false)
+	trafficEventRecord("中国", "广东省")
+	if e := trafficCountries["中国"]; e == nil || e.normal.Load() != 1 {
+		t.Fatalf("real country bucket missing: %+v", e)
+	}
+	if len(trafficEvents) != 1 {
+		t.Fatalf("real country event missing: %d", len(trafficEvents))
 	}
 }
 

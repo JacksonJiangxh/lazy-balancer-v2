@@ -5,7 +5,7 @@ type WeightedItem = {
 
 export const MAX_UPSTREAM_ROWS = 100
 
-const minimumWeight = (item: WeightedItem): number => item.enabled === undefined ? 1 : 0
+const minimumWeight = (item: WeightedItem): number => item.enabled === false ? 0 : 1
 const normalizedWeight = (item: WeightedItem): number => Math.max(minimumWeight(item), Math.round(item.weight || 0))
 
 const participatingItems = <Item extends WeightedItem>(items: Item[]): Item[] => {

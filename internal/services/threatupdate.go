@@ -305,8 +305,7 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	// 守卫与更新启动之间存在 demote 竞态窗口——从节点继续执行会写
 	// security_ip_lists 并触发重载，打破只读不变量。NULL 兜底归一为 1（同
 	// crsupdate/ip2regionupdate 口径）。
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
+	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
 		AppendThreatUpdateLog("WARN", "skipped", "当前节点为从节点，终止威胁情报库更新")
 		m.mu.Lock()
 		m.lastFinishedAt = time.Now().UTC().Format(crsTimeLayout) // 历史：早退同样落终态
@@ -529,8 +528,10 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 	var rawHash string
 	healed := false
 	if threatIplistMissing(source.name) == false && threatFastMissing(source.name) {
-		if e, h, ok := healThreatFastFromText(source.name); ok {
-			entries, rawHash, healed = e, h, true
+		if e, _, ok := healThreatFastFromText(source.name); ok {
+			// heal 的文本 sha256 不是上游原始字节哈希：留空使慢路径不写
+			// raw_hash，保留上次真实下载哈希（历史问题-02）。
+			entries, rawHash, healed = e, "", true
 		}
 	}
 	// 任务内重试（2026-09-25 用户裁定）：瞬断在当前任务内重试，耗尽才落定——
@@ -574,7 +575,9 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 			Logf("info", "威胁情报库: 源 %s 原始哈希一致但 .iplist 文件缺失，执行落盘（升级引导）", source.name)
 		case listExists > 0:
 			AppendThreatUpdateLog("INFO", "unchanged", fmt.Sprintf("源 %s 名单内容未变化（原始内容哈希一致），跳过解析写入", source.name))
-			markSourceSuccess(source.id, len(entries), finished, trigger)
+			// 历史问题：内容未变化不得用本次原始解析条数覆盖源行（源行口径=
+			// 上次聚合后条数，与内置名单行数一致）。
+			markSourceSuccess(source.id, -1, finished, trigger)
 			return false, false
 		}
 	}
@@ -592,7 +595,13 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 	if !changed {
 		AppendThreatUpdateLog("INFO", "unchanged", fmt.Sprintf("源 %s 名单内容未变化（哈希一致），跳过写入", source.name))
 	}
-	markSourceSuccess(source.id, len(entries), finished, trigger, rawHash)
+	// 历史问题：条数口径单源——聚合后条数（与 writeThreatSystemList 写入 .iplist
+	// 的行数一致）；此前传原始 len(entries)，后写者胜使「N 条」恒为聚合前值。
+	if rawHash != "" {
+		markSourceSuccess(source.id, len(merged), finished, trigger, rawHash)
+	} else {
+		markSourceSuccess(source.id, len(merged), finished, trigger)
+	}
 	return changed, false
 }
 
@@ -603,15 +612,25 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 func markSourceSuccess(id int, entryCount int, finished string, trigger string, rawHash ...string) {
 	version := time.Now().UTC().Format("2006.01.02")
 	next := threatNextSlot(time.Now().UTC())
+	// 历史问题：entry_count 的唯一口径是**聚合后**条数（writeThreatSystemList 的
+	// len(merged)，与内置名单 .iplist 行数一致）。entryCount<0 = 内容未变化
+	// 快路径：不覆写该列（源行已是上次聚合后值；用本次原始解析条数覆盖会让
+	// 「N 条」卡片与名单详情长期不一致）。
+	entrySet, entryArgs := "entry_count=?, ", []any{entryCount}
+	if entryCount < 0 {
+		entrySet, entryArgs = "", nil
+	}
 	if len(rawHash) > 0 {
-		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', entry_count=?, version=?, finished_at=?, `+threatSlotAdvanceSQL+`, consecutive_failures=0, raw_hash=?, updated_at=datetime('now') WHERE id=?`,
-			entryCount, version, finished, trigger, next, rawHash[0], id); err != nil {
+		args := append(append([]any{}, entryArgs...), version, finished, trigger, next, rawHash[0], id)
+		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', `+entrySet+`version=?, finished_at=?, `+threatSlotAdvanceSQL+`, consecutive_failures=0, raw_hash=?, updated_at=datetime('now') WHERE id=?`,
+			args...); err != nil {
 			Logf("error", "威胁情报库: 更新源成功状态失败: %v", err)
 		}
 	} else {
 		// raw_hash 缺省（快路径内容未变）不覆写该列（历史 历史问题 修法）。
-		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', entry_count=?, version=?, finished_at=?, `+threatSlotAdvanceSQL+`, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`,
-			entryCount, version, finished, trigger, next, id); err != nil {
+		args := append(append([]any{}, entryArgs...), version, finished, trigger, next, id)
+		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', `+entrySet+`version=?, finished_at=?, `+threatSlotAdvanceSQL+`, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`,
+			args...); err != nil {
 			Logf("error", "威胁情报库: 更新源成功状态失败: %v", err)
 		}
 	}
@@ -621,8 +640,13 @@ func markSourceSuccess(id int, entryCount int, finished string, trigger string, 
 	// 源名仅用于日志，按 id 反查一次
 	var name string
 	_ = db.DB.QueryRow(`SELECT name FROM security_threat_sources WHERE id=?`, id).Scan(&name)
-	Logf("info", "威胁情报库: 源 %s 更新成功（%d 条，版本 %s）", name, entryCount, version)
-	AppendThreatUpdateLog("INFO", "success", fmt.Sprintf("源 %s 更新成功（%d 条，版本 %s）", name, entryCount, version))
+	if entryCount >= 0 {
+		Logf("info", "威胁情报库: 源 %s 更新成功（%d 条，版本 %s）", name, entryCount, version)
+		AppendThreatUpdateLog("INFO", "success", fmt.Sprintf("源 %s 更新成功（%d 条，版本 %s）", name, entryCount, version))
+	} else {
+		Logf("info", "威胁情报库: 源 %s 更新成功（内容未变化，版本 %s）", name, version)
+		AppendThreatUpdateLog("INFO", "success", fmt.Sprintf("源 %s 更新成功（内容未变化，版本 %s）", name, version))
+	}
 }
 
 // writeThreatSystemList 把聚合条目写入源对应的内置只读名单行
@@ -810,13 +834,6 @@ func healThreatFastFromText(source string) ([]string, string, bool) {
 	if err != nil {
 		return nil, "", false
 	}
-	wafFileMu.Lock()
-	err = CompileFromIplistFile(iplistPath)
-	wafFileMu.Unlock()
-	if err != nil {
-		Logf("warn", "威胁情报库: 源 %s .fast 从文本重建失败: %v", source, err)
-		return nil, "", false
-	}
 	entries := make([]string, 0, 1024)
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -824,6 +841,17 @@ func healThreatFastFromText(source string) ([]string, string, bool) {
 			continue
 		}
 		entries = append(entries, line)
+	}
+	if len(entries) == 0 {
+		Logf("warn", "威胁情报库: 源 %s .iplist 为空/仅注释，拒绝以空集重建 .fast（保留上次快照）", source)
+		return nil, "", false
+	}
+	wafFileMu.Lock()
+	err = CompileFromIplistFile(iplistPath)
+	wafFileMu.Unlock()
+	if err != nil {
+		Logf("warn", "威胁情报库: 源 %s .fast 从文本重建失败: %v", source, err)
+		return nil, "", false
 	}
 	sum := fmt.Sprintf("%x", sha256.Sum256(data))
 	AppendThreatUpdateLog("INFO", "healed", fmt.Sprintf("源 %s .fast 缺失，已从现有文本重建（未重新下载）", source))

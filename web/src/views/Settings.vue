@@ -44,6 +44,7 @@ import { ref, onMounted, computed, watch } from 'vue'
 import { request } from '@/utils/api'
 import { DEFAULT_ACCESS_LOG_FORMAT } from '@/utils/caddyDefaults'
 import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
+import { displaySecurityEventsRowCap } from '@/utils/configValues'
 import { useAuthStore } from '@/stores/auth'
 import { Setting } from '@element-plus/icons-vue'
 import BasicSettings from './settings/BasicSettings.vue'
@@ -155,6 +156,15 @@ const applyBasicKeys = (data: ConfigPayload) => {
   settings.value.timezone = data.timezone || 'Asia/Shanghai'
   settings.value.mfa_write_guard = data.mfa_write_guard ?? false
   settings.value.mfa_lockout_enabled = data.mfa_lockout_enabled ?? false
+  // 基础卡自有字段（历史问题-F1）：此前只在 Caddy 卡的合并函数里回写，基础卡保存后
+  // 父模型停留旧值——切页重挂后用旧值覆盖本地 ref，再次保存即把旧值写回库。
+  // 大屏本站坐标/视觉模式/安全事件保留/行数上限/流量采样均归基础卡所有。
+  settings.value.server_map_lat = data.server_map_lat ?? 0
+  settings.value.server_map_lon = data.server_map_lon ?? 0
+  settings.value.threat_screen_mode = data.threat_screen_mode === 'globe' ? 'globe' : 'map'
+  settings.value.security_events_retention_days = data.security_events_retention_days && data.security_events_retention_days > 0 ? data.security_events_retention_days : 90
+  settings.value.threat_traffic_sample_n = normalizeTrafficSampleN(data.threat_traffic_sample_n)
+  settings.value.security_events_row_cap = displaySecurityEventsRowCap(data.security_events_row_cap)
 }
 
 const applyCaddyKeys = (data: ConfigPayload) => {
@@ -182,13 +192,8 @@ const applyCaddyKeys = (data: ConfigPayload) => {
   settings.value.trusted_proxy_range_refs = data.trusted_proxy_range_refs ?? '[]'
   settings.value.trusted_proxy_headers = data.trusted_proxy_headers ?? '[]'
   settings.value.trusted_proxy_strict = data.trusted_proxy_strict ?? true
-  // 大屏本站坐标（v2.3.x 大屏）：GET 回显装载——缺此装载时表单恒显初值 0
-  settings.value.server_map_lat = data.server_map_lat ?? 0
-  settings.value.server_map_lon = data.server_map_lon ?? 0
-  settings.value.threat_screen_mode = data.threat_screen_mode === 'globe' ? 'globe' : 'map'
-  settings.value.security_events_retention_days = data.security_events_retention_days && data.security_events_retention_days > 0 ? data.security_events_retention_days : 90
-  settings.value.threat_traffic_sample_n = normalizeTrafficSampleN(data.threat_traffic_sample_n)
-  settings.value.security_events_row_cap = data.security_events_row_cap && data.security_events_row_cap > 0 ? data.security_events_row_cap : 1_000_000
+  // 大屏本站坐标/视觉模式/安全事件保留/流量采样归基础卡（见 applyBasicKeys）——
+  // Caddy 卡保存不得回写这些字段，否则覆盖基础卡未保存的编辑。
 }
 
 const applyCertKeys = (data: ConfigPayload) => {

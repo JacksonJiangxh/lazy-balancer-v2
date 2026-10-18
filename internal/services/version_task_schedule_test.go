@@ -10,7 +10,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-func TestVersionTasks_autoUpdateDisabledHasNoSlotOrEnabled(t *testing.T) {
+func TestVersionTasks_autoUpdateDisabledHasNoSlotAndLoopOff(t *testing.T) {
 	te := newWireTestEngine(t)
 	for _, tc := range []struct{ id, table string }{
 		{id: "crs", table: "security_crs_version"},
@@ -19,12 +19,13 @@ func TestVersionTasks_autoUpdateDisabledHasNoSlotOrEnabled(t *testing.T) {
 		if _, err := db.DB.Exec(`UPDATE ` + tc.table + ` SET auto_update=0 WHERE id=1`); err != nil {
 			t.Fatal(err)
 		}
+		SyncBusinessTaskDrivers()
 		meta, ok := te.Lookup(tc.id)
 		if !ok {
 			t.Fatalf("%s 未注册", tc.id)
 		}
-		if meta.NextSlot != "" || meta.Enabled {
-			t.Errorf("%s auto_update=0 时 NextSlot=%q Enabled=%v，want 空/false", tc.id, meta.NextSlot, meta.Enabled)
+		if meta.NextSlot != "" || meta.LoopOn {
+			t.Errorf("%s auto_update=0 时 NextSlot=%q LoopOn=%v，want 空/false", tc.id, meta.NextSlot, meta.LoopOn)
 		}
 	}
 }

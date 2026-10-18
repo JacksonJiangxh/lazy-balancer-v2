@@ -123,6 +123,17 @@ func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 	}
 	searcher, err := service.NewIp2RegionWithPath(path, "")
 	if err != nil {
+		// E81-历史问题：重建失败（带外损坏的 xdb 等）不回退缓存旧实例，则
+		// Provision 收到 error → handler 降级 pass-through → 全部客户端判
+		// 「海外」→ deny 海外策略全量误拦（与 wafiplist 的 fail-stale 不对称）。
+		// 正常更新走 rename（文件形态变化即命中成功重建），失败分支只可能是
+		// 带外损坏：保留旧实例继续服务（fail-stale），文件修复后的下一次
+		// Provision/reload 再重建。缓存条目保持旧形态，不驱逐。
+		if cached, ok := geoipSharedSearchers[path]; ok {
+			caddy.Log().Named("geoip2region").Warn("ip2region rebuild failed, serving the previous database instance",
+				zap.String("xdb_path", path), zap.Error(err))
+			return cached.searcher, nil
+		}
 		return nil, err
 	}
 	if replaced, ok := geoipSharedSearchers[path]; ok {

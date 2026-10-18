@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -427,6 +428,38 @@ func TestOIDC_disabled_state(t *testing.T) {
 	}
 }
 
+// B1-历史问题：公开 OIDC 状态端点在配置持续损坏时不得每请求写一条 warn；
+// 响应仍按未启用 fail-closed。
+func TestOIDCStatus_failureWarningIsThrottled(t *testing.T) {
+	idp := newMockIdP(t)
+	router, _ := setupOIDCTest(t, idp)
+	resetWarningWindow := func() {
+		oidcStatusFailureLog.Lock()
+		oidcStatusFailureLog.at = time.Time{}
+		oidcStatusFailureLog.Unlock()
+	}
+	resetWarningWindow()
+	t.Cleanup(resetWarningWindow)
+	if _, err := db.DB.Exec(`UPDATE global_config SET oidc_config='{' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	var logs strings.Builder
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	for range 2 {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/status", nil))
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"enabled":false`) {
+			t.Fatalf("status=%d body=%s, want disabled 200", response.Code, response.Body.String())
+		}
+	}
+	if got := strings.Count(logs.String(), "读取 OIDC 状态失败"); got != 1 {
+		t.Fatalf("warning count=%d, want 1 within throttle window; logs=%s", got, logs.String())
+	}
+}
+
 // 场景 6:回调伪造 state 拒绝(不计锁定——锁定列不动)。
 func TestOIDCCallback_bad_state_rejected(t *testing.T) {
 	idp := newMockIdP(t)
@@ -542,6 +575,9 @@ func TestOIDC_normalize_issuer(t *testing.T) {
 // 场景 9(v2.3.0 裁定):OIDC 用户与本地 MFA 完全解耦——
 // 启用/禁用/激活/管理员重置全 403;登录从节点两道 MFA 门豁免。
 func TestOIDCUser_mfa_decoupled(t *testing.T) {
+	// B1-历史问题（历史）：初始化临时库必须完整快照并在 cleanup 恢复
+	// 三个全局句柄（同 setupOIDCTest）——否则后续用例踩已关闭的临时库。
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	dir := t.TempDir()
 	if err := db.Initialize(dir); err != nil {
 		t.Fatal(err)
@@ -552,7 +588,12 @@ func TestOIDCUser_mfa_decoupled(t *testing.T) {
 	// TestOIDCCallback_stateBoundToBrowser 专题覆盖。
 	oldBinding := oidcStateBindingEnabled
 	oidcStateBindingEnabled = false
-	t.Cleanup(func() { oidcStateBindingEnabled = oldBinding })
+	t.Cleanup(func() {
+		oidcStateBindingEnabled = oldBinding
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
+	})
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	// OIDC 目标用户 + 本地操作者(admin)
@@ -589,10 +630,17 @@ func TestOIDCUser_mfa_decoupled(t *testing.T) {
 
 // 场景 10:登录从节点 MFA 门对 OIDC 会话豁免(本地用户仍要求)。
 func TestOIDCUser_slave_login_gate_exempt(t *testing.T) {
+	// B1-历史问题：完整快照/恢复全局 DB 句柄（同 setupOIDCTest）。
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	dir := t.TempDir()
 	if err := db.Initialize(dir); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
+	})
 	cfg := &config.Config{JWTSecret: "test-secret", DataDir: dir}
 	h := &Handlers{cfg: cfg, clusterService: services.NewClusterService(db.DB, dir)}
 	gin.SetMode(gin.TestMode)
@@ -849,5 +897,92 @@ func TestOIDCCookieSecure_forwardedProtoOnlyFromTrustedProxy(t *testing.T) {
 	}
 	if !oidcCookieSecure(makeCtx("127.0.0.1:443")) {
 		t.Fatal("trusted proxy https declaration must set Secure cookie")
+	}
+}
+
+// B1-历史问题（历史）：OIDC 配置读失败/损坏时更新端点必须整体拒绝——
+// 旧实现以零值 cfg 继续合并并整体写回，会清空 issuer/client_id/secret。
+func TestOIDCSettingsUpdate_readFailureDoesNotOverwriteConfig(t *testing.T) {
+	router, _ := setupOIDCTest(t, newMockIdP(t))
+	if _, err := db.DB.Exec(`UPDATE global_config SET oidc_config='{broken' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings/oidc", strings.NewReader(`{"display_name":"x"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "读取 OIDC 配置失败") {
+		t.Fatalf("status=%d body=%s, want 500 读取失败", rec.Code, rec.Body.String())
+	}
+	var raw string
+	if err := db.DB.QueryRow(`SELECT COALESCE(oidc_config,'') FROM global_config WHERE id=1`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw != "{broken" {
+		t.Fatalf("oidc_config=%q, want untouched corrupt value", raw)
+	}
+}
+
+// B1-历史问题（历史）：OIDC 配置更新/删除审计必须带字段级 delta，
+// secret 只记「已更换/已清除」不落值。
+func TestOIDCSettings_auditFieldDelta(t *testing.T) {
+	idp := newMockIdP(t)
+	router, _ := setupOIDCTest(t, idp)
+	putOIDCConfig(t, router, `{"issuer":"`+idp.issuer+`","client_id":"client-a","client_secret":"secret-before","enabled":true}`)
+	helperSuccess := func(body string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings/oidc", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("update body=%s status=%d resp=%s", body, rec.Code, rec.Body.String())
+		}
+	}
+	helperSuccess(`{"display_name":"SSO 登录","client_secret":"secret-after"}`)
+	helperSuccess(`{"enabled":false}`)
+
+	rows, err := db.AuditDB.Query(`SELECT detail FROM audit_log WHERE action='更新' AND resource='OIDC 配置' ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var details []string
+	for rows.Next() {
+		var detail string
+		if err := rows.Scan(&detail); err != nil {
+			t.Fatal(err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(details, "\n")
+	for _, fragment := range []string{"展示名称：（空）→SSO 登录", "Client Secret：已更换", "启用状态：启用→禁用"} {
+		if !strings.Contains(joined, fragment) {
+			t.Errorf("audit details=%v, want contains %q", details, fragment)
+		}
+	}
+	if strings.Contains(joined, "secret-after") || strings.Contains(joined, "secret-before") {
+		t.Fatalf("audit details leak secret value: %v", details)
+	}
+
+	// 删除留痕删除前字段值（secret 仅记已配置）。
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/settings/oidc", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var deleteDetail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='删除' AND resource='OIDC 配置' ORDER BY id DESC LIMIT 1`).Scan(&deleteDetail); err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{"删除前", idp.issuer, "Client ID client-a", "Client Secret 已配置", "启用状态 禁用"} {
+		if !strings.Contains(deleteDetail, fragment) {
+			t.Errorf("delete audit=%q, want contains %q", deleteDetail, fragment)
+		}
+	}
+	if strings.Contains(deleteDetail, "secret-after") {
+		t.Fatalf("delete audit leaks secret: %q", deleteDetail)
 	}
 }

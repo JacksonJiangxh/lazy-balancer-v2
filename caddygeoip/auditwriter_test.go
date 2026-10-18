@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -111,19 +112,35 @@ func useTestAuditPipeline(t *testing.T) {
 	auditTimingPollStep = time.Millisecond
 	auditTimingEntryTTL = 50 * time.Millisecond
 	auditTimingMu.Lock()
-	auditTimingEntries = make(map[string]*auditTimingEntry)
-	auditTimingCreateCount = 0
-	auditTimingLastSweep = time.Time{}
+	resetAuditTimingRegistryLockedForTest()
 	auditTimingMu.Unlock()
 	t.Cleanup(func() {
 		auditQueueSize, auditFlushThreshold, auditFlushInterval = origQueue, origThreshold, origInterval
 		auditTimingWaitLimit, auditTimingPollStep, auditTimingEntryTTL = origWait, origPoll, origTTL
 		auditTimingMu.Lock()
-		auditTimingEntries = make(map[string]*auditTimingEntry)
-		auditTimingCreateCount = 0
-		auditTimingLastSweep = time.Time{}
+		resetAuditTimingRegistryLockedForTest()
 		auditTimingMu.Unlock()
 	})
+}
+
+// resetAuditTimingRegistryLockedForTest 清空计时注册表全部状态（调用方持
+// auditTimingMu）——条目/建条 FIFO/游标/清扫计数一并复位，避免测试间串扰。
+func resetAuditTimingRegistryLockedForTest() {
+	auditTimingEntries = make(map[string]*auditTimingEntry)
+	auditTimingOrder = nil
+	auditTimingHead = 0
+	auditTimingCreateCount = 0
+	auditTimingPollCountForTest.Store(0)
+	auditTimingSweepVisitsForTest.Store(0)
+}
+
+// seedAuditTimingEntryForTest 以指定建条时刻直接种入条目（含 FIFO 项——
+// 与生产建条路径同形，保证清扫不变量成立）。
+func seedAuditTimingEntryForTest(id string, created time.Time) {
+	auditTimingMu.Lock()
+	auditTimingEntries[id] = &auditTimingEntry{created: created}
+	auditTimingOrder = append(auditTimingOrder, auditTimingQueueEntry{id: id, created: created})
+	auditTimingMu.Unlock()
 }
 
 // waitAuditLine 轮询等待临时审计文件出现一行可解析 JSON（上限 2s）。
@@ -526,6 +543,198 @@ func TestAuditWriter_snapshotSurvivesTxCycle(t *testing.T) {
 	}
 }
 
+// captureFormatter 捕获 coraza 交给写路径的审计对象（快照）并按 JSON 直出。
+type captureFormatter struct{ ch chan plugintypes.AuditLog }
+
+func (f *captureFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
+	select {
+	case f.ch <- al:
+	default:
+	}
+	return json.Marshal(al)
+}
+
+func (*captureFormatter) MIME() string { return "application/json" }
+
+func TestSnapshotAuditRequestBody_capAndBoundaries(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		wantLen   int
+		truncated bool
+	}{
+		{name: "small body unchanged", body: "payload=hit", wantLen: len("payload=hit")},
+		{name: "exact limit unchanged", body: strings.Repeat("x", auditRequestBodyMaxBytes), wantLen: auditRequestBodyMaxBytes},
+		{name: "over limit truncated", body: strings.Repeat("x", auditRequestBodyMaxBytes+1), wantLen: auditRequestBodyMaxBytes, truncated: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, truncated := snapshotAuditRequestBody(tc.body)
+			if len(got) != tc.wantLen || truncated != tc.truncated {
+				t.Fatalf("len=%d truncated=%v, want len=%d truncated=%v", len(got), truncated, tc.wantLen, tc.truncated)
+			}
+			if got != tc.body[:tc.wantLen] {
+				t.Fatal("captured body must preserve the original prefix")
+			}
+		})
+	}
+}
+
+// 大请求体经真实 coraza phase:2 命中后，快照与 JSON 行只能保留有界前缀，
+// 并显式携带截断标记；不能把工作区/队列/格式化链放大到原始 body 大小。
+func TestAuditWriter_requestBodyCapAndTruncationMarker(t *testing.T) {
+	useTestAuditPipeline(t)
+	capture := &captureFormatter{ch: make(chan plugintypes.AuditLog, 1)}
+	plugins.RegisterAuditLogFormatter("lbcap", capture)
+	logPath := filepath.Join(t.TempDir(), "audit.log")
+	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives(strings.Join([]string{
+		"SecRuleEngine On",
+		"SecRequestBodyAccess On",
+		"SecAuditEngine RelevantOnly",
+		"SecAuditLog " + logPath,
+		"SecAuditLogFormat lbcap",
+		"SecAuditLogType lbfile",
+		"SecAuditLogParts ABCIJDEFHKZ",
+		"SecRule ARGS:payload \"@streq hit\" \"id:990005,phase:2,deny,status:403,log,msg:'probe-large-body'\"",
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("NewWAF: %v", err)
+	}
+
+	body := "payload=hit&pad=" + strings.Repeat("x", auditRequestBodyMaxBytes+32)
+	tx := waf.NewTransaction()
+	defer tx.Close()
+	req := httptest.NewRequest(http.MethodPost, "/probe-large", nil)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tx.ProcessConnection(req.RemoteAddr, 0, "127.0.0.1", 8080)
+	tx.ProcessURI(req.URL.String(), req.Method, "HTTP/1.1")
+	for k, v := range req.Header {
+		for _, val := range v {
+			tx.AddRequestHeader(k, val)
+		}
+	}
+	tx.ProcessRequestHeaders()
+	if _, n, err := tx.WriteRequestBody([]byte(body)); err != nil || n != len(body) {
+		t.Fatalf("WriteRequestBody: n=%d err=%v", n, err)
+	}
+	if intr, err := tx.ProcessRequestBody(); err != nil || intr == nil {
+		t.Fatalf("rule must interrupt large body phase: intr=%v err=%v", intr, err)
+	}
+	tx.ProcessLogging()
+
+	var al plugintypes.AuditLog
+	select {
+	case al = <-capture.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("large-body audit snapshot was not captured")
+	}
+	sr, ok := al.Transaction().Request().(*auditSnapshotRequest)
+	if !ok {
+		t.Fatalf("snapshot request type = %T", al.Transaction().Request())
+	}
+	if got := len(sr.Body()); got != auditRequestBodyMaxBytes {
+		t.Fatalf("snapshot body len=%d, want cap=%d", got, auditRequestBodyMaxBytes)
+	}
+	if !sr.BodyTruncated_ {
+		t.Fatal("oversized snapshot body must carry the truncation marker")
+	}
+	line, err := json.Marshal(al)
+	if err != nil {
+		t.Fatalf("marshal capped audit snapshot: %v", err)
+	}
+	var wire struct {
+		Transaction struct {
+			Request struct {
+				Body          string `json:"body"`
+				BodyTruncated bool   `json:"body_truncated"`
+			} `json:"request"`
+		} `json:"transaction"`
+	}
+	if err := json.Unmarshal(line, &wire); err != nil {
+		t.Fatalf("audit line not JSON: %v", err)
+	}
+	if len(wire.Transaction.Request.Body) != auditRequestBodyMaxBytes || !wire.Transaction.Request.BodyTruncated {
+		t.Fatalf("serialized body len=%d truncated=%v", len(wire.Transaction.Request.Body), wire.Transaction.Request.BodyTruncated)
+	}
+}
+
+// E81-历史问题：审计快照的 Args() 提升源必须是「冻结」接口值（同动态类型
+// typed-nil），不得引用 coraza 事务活对象——drain 侧格式化恒晚于 tx.Close，
+// 活引用在事务回池复用后会读到下一请求的参数。冻结后 Args() 返回空集合。
+func TestAuditSnapshotRequest_argsFrozen(t *testing.T) {
+	useTestAuditPipeline(t)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+
+	capture := &captureFormatter{ch: make(chan plugintypes.AuditLog, 4)}
+	plugins.RegisterAuditLogFormatter("lbcapture", capture)
+
+	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives(strings.Join([]string{
+		"SecRuleEngine On",
+		"SecRequestBodyAccess On",
+		"SecAuditEngine RelevantOnly",
+		"SecAuditLog " + logPath,
+		"SecAuditLogFormat lbcapture",
+		"SecAuditLogType lbfile",
+		"SecAuditLogParts ABCIJDEFHKZ",
+		"SecRule ARGS:payload \"@streq hit\" \"id:990004,phase:2,deny,status:403,log,msg:'probe-body'\"",
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("NewWAF: %v", err)
+	}
+
+	tx := waf.NewTransaction()
+	defer tx.Close()
+	req := httptest.NewRequest(http.MethodPost, "/probe", nil)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tx.ProcessConnection(req.RemoteAddr, 0, "127.0.0.1", 8080)
+	tx.ProcessURI(req.URL.String(), req.Method, "HTTP/1.1")
+	for k, v := range req.Header {
+		for _, val := range v {
+			tx.AddRequestHeader(k, val)
+		}
+	}
+	tx.ProcessRequestHeaders()
+	if _, n, err := tx.WriteRequestBody([]byte("payload=hit")); err != nil || n != len("payload=hit") {
+		t.Fatalf("WriteRequestBody: n=%d err=%v", n, err)
+	}
+	if intr, err := tx.ProcessRequestBody(); err != nil || intr == nil {
+		t.Fatalf("rule must interrupt body phase: intr=%v err=%v", intr, err)
+	}
+	tx.ProcessLogging()
+
+	var al plugintypes.AuditLog
+	select {
+	case al = <-capture.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("audit snapshot was not captured")
+	}
+	// 快照已在 tx 存活时构建：此刻冻结形态已生效（不是等 tx.Close 后才成立）。
+	snapshotReq := al.Transaction().Request()
+	sr, ok := snapshotReq.(*auditSnapshotRequest)
+	if !ok {
+		t.Fatalf("snapshot request type = %T", snapshotReq)
+	}
+	embedded := sr.AuditLogTransactionRequest
+	if embedded == nil {
+		t.Fatal("embedded args source must be present for interface promotion")
+	}
+	if rv := reflect.ValueOf(embedded); !rv.IsNil() {
+		t.Fatalf("embedded request must be a typed-nil freeze, got live %T", embedded)
+	}
+	args := snapshotReq.Args()
+	if args == nil {
+		t.Fatal("frozen Args() must return an empty collection (coraza nil-receiver branch)")
+	}
+	if got := args.Get("payload"); len(got) != 0 {
+		t.Fatalf("frozen Args() leaked request arguments: %v", got)
+	}
+	// 回归形状：其余字段仍来自自持快照。
+	if snapshotReq.Body() != "payload=hit" || snapshotReq.Method() != http.MethodPost {
+		t.Fatalf("snapshot body/method drifted: %q %q", snapshotReq.Body(), snapshotReq.Method())
+	}
+}
+
 // Given: 管线已 release（重载窗口：旧 WAF release、在途事务仍 Write）
 // When: 关闭态入队
 // Then: 同步回退直写该行（短生命周期 fd O_APPEND），零丢弃；计时同步短等注入
@@ -861,11 +1070,7 @@ func TestAuditTimingRegistry_recordWaitClose(t *testing.T) {
 func TestAuditTimingRegistry_sweep(t *testing.T) {
 	useTestAuditPipeline(t)
 	const stale = "aaaaaaaaaaaaaaaa"
-	auditTimingRecord(stale, "pre", 1)
-	// 强制 stale 条目超龄
-	auditTimingMu.Lock()
-	auditTimingEntries[stale].created = time.Now().Add(-time.Hour)
-	auditTimingMu.Unlock()
+	seedAuditTimingEntryForTest(stale, time.Now().Add(-time.Hour))
 
 	for i := range 128 { // 跨过 sweep 周期（64）多批
 		auditTimingRecord(fmt.Sprintf("bbbbbbbbbbbbbb%03d", i), "pre", int64(i))
@@ -883,52 +1088,89 @@ func TestAuditTimingRegistry_sweep(t *testing.T) {
 	}
 }
 
-func TestAuditTimingRegistry_burstSweepRateLimited(t *testing.T) {
+func TestAuditTimingRegistry_sweepClosesWaitedEntry(t *testing.T) {
 	useTestAuditPipeline(t)
-	auditTimingEntryTTL = 30 * time.Minute // 保留批量新鲜条目，聚焦清扫触发频率而非 TTL。
-	now := time.Now()
+	const id = "cccccccccccccccc"
+	seedAuditTimingEntryForTest(id, time.Now().Add(-time.Hour))
 
-	// Given: 条目数已经超过突发阈值，第一次兜底清扫必须立即执行。
+	result := make(chan auditTimingSnapshot, 1)
+	go func() {
+		result <- auditTimingWait(id, 30*time.Millisecond)
+	}()
+	// 等到 wait 已取出条目指针并完成首轮未终态读取，再从注册表清扫；
+	// 旧实现只 delete 不置 closed，wait 只能轮询到超时并返回未终态快照。
+	deadline := time.Now().Add(time.Second)
+	for auditTimingPollCountForTest.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if auditTimingPollCountForTest.Load() == 0 {
+		t.Fatal("wait did not observe the seeded unclosed entry")
+	}
 	auditTimingMu.Lock()
-	auditTimingCreateCount = 0
-	for i := range auditTimingSweepMin + 1 {
-		auditTimingEntries[fmt.Sprintf("bulk-%04d", i)] = &auditTimingEntry{created: now}
-	}
-	auditTimingEntries["stale-first"] = &auditTimingEntry{created: now.Add(-time.Hour)}
-	auditTimingSweepIfDueLocked(now)
-	_, firstStillExists := auditTimingEntries["stale-first"]
-	// When: 100ms 后再次建条，且创建计数未触及 64 周期。
-	auditTimingEntries["stale-throttled"] = &auditTimingEntry{created: now.Add(-time.Hour)}
-	auditTimingSweepIfDueLocked(now.Add(100 * time.Millisecond))
-	_, throttledStillExists := auditTimingEntries["stale-throttled"]
+	auditTimingSweepLocked(time.Now())
+	_, exists := auditTimingEntries[id]
 	auditTimingMu.Unlock()
-	if firstStillExists {
-		t.Fatal("first oversized registry must sweep immediately")
-	}
-	if !throttledStillExists {
-		t.Fatal("oversized registry must not rescan the whole map on every creation")
-	}
-
-	// Regression: 64 创建周期不受突发清扫时间下限影响。
-	auditTimingMu.Lock()
-	auditTimingEntries["stale-periodic"] = &auditTimingEntry{created: now.Add(-time.Hour)}
-	auditTimingCreateCount = 63
-	auditTimingSweepIfDueLocked(now.Add(200 * time.Millisecond))
-	_, periodicStillExists := auditTimingEntries["stale-periodic"]
-	auditTimingMu.Unlock()
-	if periodicStillExists {
-		t.Fatal("periodic 64-creation sweep must still run")
+	if exists {
+		t.Fatal("expired entry must still be removed from the registry")
 	}
 
-	// Boundary: 距上次真实清扫超过 1s 后，突发兜底可以再次执行。
+	select {
+	case snap := <-result:
+		if !snap.closed {
+			t.Fatalf("swept entry returned unclosed after wait timeout: %+v", snap)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait did not finish after its entry was swept")
+	}
+}
+
+// E81-历史问题：清扫成本必须随「过期条目数」增长，而不是注册表规模——旧实现
+// 每 64 次建条全表 map 扫描（O(n)，n≈TTL×RPS ⇒ CPU 随 RPS² 增长）。
+func TestAuditTimingRegistry_sweepCostIsIncremental(t *testing.T) {
+	useTestAuditPipeline(t)
+	auditTimingEntryTTL = time.Hour // 焦点在清扫检查量，不让新条目过期
+
+	const expired = 100
+	base := time.Now().Add(-2 * time.Hour)
+	for i := range expired {
+		seedAuditTimingEntryForTest(fmt.Sprintf("expired-%04d", i), base)
+	}
+	const fresh = 5000
+	for i := range fresh {
+		auditTimingRecord(fmt.Sprintf("fresh-%04d", i), "pre", 0)
+	}
+
 	auditTimingMu.Lock()
-	auditTimingEntries["stale-after-interval"] = &auditTimingEntry{created: now.Add(-time.Hour)}
-	auditTimingCreateCount = 1
-	auditTimingSweepIfDueLocked(now.Add(200*time.Millisecond + time.Second + time.Millisecond))
-	_, intervalStillExists := auditTimingEntries["stale-after-interval"]
+	entries := len(auditTimingEntries)
 	auditTimingMu.Unlock()
-	if intervalStillExists {
-		t.Fatal("oversized registry must sweep again after the rate-limit interval")
+	if entries < fresh {
+		t.Fatalf("fresh entries must survive, got %d", entries)
+	}
+	// 期间触发约 fresh/64≈78 次清扫：检查量 ≈ 过期条目数 + 每次一条未过期队首。
+	// 旧实现每次全表扫描 ⇒ 约 Σn/64 ≈ 19 万次检查。
+	if visits := auditTimingSweepVisitsForTest.Load(); visits > expired+2*(fresh/64) {
+		t.Fatalf("sweep visited %d queue entries; want O(expired) not O(registry)", visits)
+	}
+}
+
+// E81-历史问题：close 不再建条（未知 tid 的 drain 首轮即返，close 建条只占 TTL
+// 条目）；已有条目照常置终态。
+func TestAuditTimingClose_requiresExistingEntry(t *testing.T) {
+	useTestAuditPipeline(t)
+	auditTimingClose("dddddddddddddddd")
+
+	auditTimingMu.Lock()
+	_, created := auditTimingEntries["dddddddddddddddd"]
+	count := len(auditTimingEntries)
+	auditTimingMu.Unlock()
+	if created || count != 0 {
+		t.Fatalf("close must not create entries, got %d entries", count)
+	}
+
+	auditTimingRecord("eeeeeeeeeeeeeeee", "pre", 5)
+	auditTimingClose("eeeeeeeeeeeeeeee")
+	if snap := auditTimingLookupForTest(t, "eeeeeeeeeeeeeeee"); !snap.closed {
+		t.Fatal("close must mark an existing entry as terminal")
 	}
 }
 
@@ -946,33 +1188,6 @@ func TestSecurityTimingIDFromHeaders(t *testing.T) {
 	}
 	if got := securityTimingIDFromHeaders(map[string][]string{"Other": {"x"}}); got != "" {
 		t.Fatalf("missing header must be empty, got %q", got)
-	}
-}
-
-// ---- 历史 历史问题 / 历史问题 / 历史问题 ----
-
-func TestAuditTiming_closeOnlyPathSweepsExpired(t *testing.T) {
-	useTestAuditPipeline(t)
-	const stale = "cccccccccccccccc"
-	auditTimingRecord(stale, "pre", 1)
-	auditTimingMu.Lock()
-	auditTimingEntries[stale].created = time.Now().Add(-time.Hour)
-	// 把创建计数推到清扫触发点前一条：下一次 close 建条（纯 close 路径）即
-	// 触发摊销清扫——旧实现 close 不递增计数，从不触发。
-	auditTimingCreateCount = 63
-	auditTimingMu.Unlock()
-
-	auditTimingClose("dddddddddddddddd")
-
-	auditTimingMu.Lock()
-	_, staleExists := auditTimingEntries[stale]
-	_, freshExists := auditTimingEntries["dddddddddddddddd"]
-	auditTimingMu.Unlock()
-	if staleExists {
-		t.Fatal("close-only path must sweep expired entries")
-	}
-	if !freshExists {
-		t.Fatal("closed entry must be registered")
 	}
 }
 

@@ -216,7 +216,8 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useMediaQuery } from '@vueuse/core'
 import { useAuthStore } from '@/stores/auth'
 import type { PageId } from '@/stores/auth'
-import { request, mfaAwareSuccess } from '@/utils/api'
+import { request, mfaAwareSuccess, ApiRequestError } from '@/utils/api'
+import { isCurrentPasswordRejection } from '@/utils/profileUpdate'
 import { ElMessageBox } from 'element-plus'
 import {Timer,  DataAnalysis, List, Setting, Cpu, User, Connection, Lock, Key, Document, Warning, Notebook } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
@@ -345,8 +346,14 @@ const saveProfile = async () => {
       await authStore.fetchUser()
     }
   } catch (error: unknown) {
-    // Error toast is already shown by the global axios interceptor.
-    console.error('Failed to save profile:', error)
+    // 当前密码错误被拦截器有意豁免全局 toast/会话弹窗，必须在页面本地可见；
+    // 其它错误仍由全局拦截器反馈，避免重复 toast。
+    if (error instanceof ApiRequestError
+      && isCurrentPasswordRejection('patch', '/users/me', error.status, error.message)) {
+      authStore.showToast('error', error.message)
+    } else {
+      console.error('Failed to save profile:', error)
+    }
   } finally {
     saving.value = false
   }

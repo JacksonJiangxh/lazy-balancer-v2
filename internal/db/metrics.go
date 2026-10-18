@@ -351,7 +351,11 @@ func initMetricsSchema(db *sql.DB) error {
 		count INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY (minute, rule_caddy_id)
 	) WITHOUT ROWID;
-	CREATE INDEX IF NOT EXISTS idx_security_event_target_rollup_minute ON security_event_target_rollup(minute);
+	-- 历史问题-09（历史）：idx_security_event_target_rollup_minute 与 WITHOUT
+	-- ROWID 主键 (minute, rule_caddy_id) 的排序前缀完全等价（WHERE minute>=?
+	-- 与 GROUP BY minute 本就走主键扫描），删除以省写入/存储成本；存量库
+	-- 由本语句在每次初始化时幂等回收。
+	DROP INDEX IF EXISTS idx_security_event_target_rollup_minute;
 
 	-- 指标库通用状态表（历史 历史问题）：rollup 固化水位等持久元数据。
 	-- 键值单行形态，水位与分钟数据同事务提交——不再以数据行 MAX(minute)

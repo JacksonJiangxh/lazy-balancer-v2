@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -79,8 +80,7 @@ func WatchdogCheckOnce() {
 	if db.DB == nil {
 		return
 	}
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
+	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
 		if err != nil {
 			// 查询失败与「非主节点」同为跳过，失败留痕（历史 历史问题 标准——
 			// 静默吞错会掩盖 DB 异常）。

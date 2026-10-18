@@ -100,6 +100,29 @@ func TestResolvePolicyCustomRules_chunkFailureDoesNotInflateDanglingLog(t *testi
 	}
 }
 
+func TestResolvePolicyCustomRules_logsRowScanFailure(t *testing.T) {
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// SQLite 接受 INTEGER 列中的文本；扫描到 int 时注入真实转换失败。
+	if _, err := db.DB.Exec(`INSERT INTO security_custom_rules (id,name,conditions,action,score,enabled) VALUES (91,'坏行','[]','block','not-an-integer',1)`); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	originalWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(originalWriter) })
+
+	rules := resolvePolicyCustomRules(json.RawMessage(`[91]`), nil)
+	if len(rules) != 0 {
+		t.Fatalf("bad row must be skipped, got %+v", rules)
+	}
+	if !strings.Contains(logs.String(), "扫描") || !strings.Contains(logs.String(), "91") {
+		t.Fatalf("row Scan failure must be visible with rule id:\n%s", logs.String())
+	}
+}
+
 func TestBuildCorazaDirectives_customRuleDenyOmitsStatusCode(t *testing.T) {
 	// Given a blocking policy with a custom block rule carrying a custom status code
 	policy := &models.SecurityPolicy{

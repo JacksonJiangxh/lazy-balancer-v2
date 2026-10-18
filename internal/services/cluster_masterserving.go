@@ -200,7 +200,14 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 		}
 	}
 
-	// 小时级心跳：全绿才记（异常在挂→静默，异常已 WARN 留痕）
+	// 小时级心跳：全绿才记（异常在挂→静默，异常已 WARN 留痕）。
+	// D1-历史问题：异常轮必须清零窗口——原实现只按轮数自增/满 60 清零，窗口内
+	// 出现离线/滞后后，恢复仅数轮就可能在「仅数轮全绿」时输出「服务面正常」
+	// 心跳（与 configwatchdog 的漂移清零窗口口径分叉）。
+	if offlineCount > 0 || lagging > 0 {
+		w.quietRounds = 0
+		return
+	}
 	w.quietRounds++
 	if w.quietRounds < masterSyncHeartbeatRounds {
 		return

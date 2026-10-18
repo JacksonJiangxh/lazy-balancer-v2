@@ -281,6 +281,13 @@ func (h *Handlers) GetRuleMetricsHistory(c *gin.Context) {
 		return
 	}
 	modifier, bucketSeconds, bucketCount := metricsHistoryRange(c.DefaultQuery("range", "24h"))
+	if db.MetricsDB == nil {
+		// B2-历史问题（历史）：MetricsDB 未装配（单测/嵌入形态）不得
+		// nil-deref panic——对齐 历史问题 家族（GetIPEventCount/GetRuleStageStats）
+		// 返回空数据 200。
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"protocol": protocol, "supported": true, "bucket_interval_seconds": bucketSeconds, "rows": []any{}}})
+		return
+	}
 	rows, err := db.MetricsDB.Query(`
 		WITH ranked AS (
 			SELECT CAST(strftime('%s', timestamp) AS INTEGER) / ? AS bucket,
@@ -357,6 +364,13 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 
 	var rows *sql.Rows
 	var err error
+
+	if db.MetricsDB == nil {
+		// B2-历史问题（历史）：未装配形态返回空列表 `[]`（同 U04d-09
+		// 空结果形态），不得 nil-deref panic。
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: []any{}})
+		return
+	}
 
 	if ruleID != "" {
 		rows, err = db.MetricsDB.Query(`

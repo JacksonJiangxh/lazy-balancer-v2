@@ -15,6 +15,7 @@ var auditResultTextMap = map[string]string{
 	"missing_material":     "证书数据缺失",
 	"queued":               "已重新排队",
 	"deployment_retry":     "等待恢复部署",
+	"slow_retry":           "慢速重试中",
 	"requested":            "已触发",
 	"skipped":              "已跳过",
 	"invalid_request":      "请求格式错误",
@@ -45,6 +46,10 @@ var auditResultTextMap = map[string]string{
 	"sync_failed":          "同步失败",
 	"io_error":             "文件写入失败",
 	"query_failed":         "查询失败",
+	// 历史问题（历史）：证书任务「重试被阻止」终态（certificates.go 经局部
+	// auditFailure 闭包以动态实参传入，字面量扫描钉测覆盖不到——本码曾因此
+	// 渲染成英文 blocked）。
+	"blocked": "重试被阻止",
 }
 
 func AuditResultText(result string) string {

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"lazy-balancer-v2/internal/db"
 )
 
 func TestCertDaysRemaining_truncationTowardZero(t *testing.T) {
@@ -32,6 +34,25 @@ func TestCertDaysRemaining_truncationTowardZero(t *testing.T) {
 				t.Fatalf("CertDaysRemaining(offset=%v)=%d, want %d", tc.offset, got, tc.want)
 			}
 		})
+	}
+}
+func TestGetCertExpiryThreshold_rejectsStoredValuesAbove365(t *testing.T) {
+	_, database := newClusterTestService(t)
+	for _, days := range []int{366, 100000} {
+		if _, err := database.Exec("UPDATE global_config SET cert_expiry_days=? WHERE id=1", days); err != nil {
+			t.Fatal(err)
+		}
+		if got := GetCertExpiryThreshold(); got != db.DefaultCertExpiryDays {
+			t.Fatalf("cert_expiry_days=%d: threshold=%d, want default %d", days, got, db.DefaultCertExpiryDays)
+		}
+	}
+	for _, days := range []int{1, 365} {
+		if _, err := database.Exec("UPDATE global_config SET cert_expiry_days=? WHERE id=1", days); err != nil {
+			t.Fatal(err)
+		}
+		if got := GetCertExpiryThreshold(); got != days {
+			t.Fatalf("valid cert_expiry_days=%d: threshold=%d", days, got)
+		}
 	}
 }
 

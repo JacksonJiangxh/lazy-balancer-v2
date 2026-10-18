@@ -10,6 +10,11 @@ func storedStatusSnapshot() CRSUpdateStatusSnapshot {
 	var stored struct {
 		status, trigger, startedAt, finishedAt, message, version string
 	}
+	// 历史问题：半初始化（db.DB=nil）时降级 idle 而非 panic——与同包
+	// crs_rule_index/securityevents_retention 的 nil 守卫同口径。
+	if db.DB == nil {
+		return CRSUpdateStatusSnapshot{Status: string(CRSStatusIdle)}
+	}
 	err := db.DB.QueryRow(`SELECT COALESCE(update_status,'idle'), COALESCE(trigger,''),
 		COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(message,''), version
 		FROM security_crs_version WHERE id=1`).

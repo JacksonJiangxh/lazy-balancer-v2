@@ -62,9 +62,10 @@ func TestSecurityEventsRetentionCleanup_deletesEventsOlderThanConfiguredDays(t *
 func TestSecurityEventsRetentionCleanup_keepsAllBelowSafetyMax(t *testing.T) {
 	// SEC-B-GAP-U2（历史）：原名 trimsOldestRowsWhenCountExceedsMax 与断言
 	// 语义相反（行为变更后复用旧名）——本用例实际钉「宽年龄窗+远低于安全上限
-	// 时全存活」。count-trim 分支（max 恒 1000000）不可经济构造，不修+理由：
-	// 其与年龄裁剪共用批循环，分批/取消同构风险已由 batchesAgeDelete/
-	// stopsPromptly 两钉覆盖。
+	// 时全存活」。count-trim 分支的独立钉测见
+	// TestSecurityEventsRetentionCleanup_trimsOldestWhenRowCapExceeded（历史
+	// 历史问题：v2.3.8 起 security_events_row_cap 可配置，cap=小值即可经济构造
+	// 该分支——原「不可构造」豁免理由已失效）。
 	setupSecurityEventsRetentionTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=3650 WHERE id=1`); err != nil {
 		t.Fatal(err)
@@ -303,4 +304,62 @@ func TestSecurityEventRollupRetention_batches(t *testing.T) {
 
 	// 空表形状：再跑一次无错误（幂等）
 	securityEventsRetentionCleanup(context.Background())
+}
+
+// 历史问题（历史）：security_events_row_cap 可配置后，count 超限批删分支可
+// 经济构造——钉住「按最旧优先裁剪到上限 + 返回已删计数」（SEC-L1 口径）。
+func TestSecurityEventsRetentionCleanup_trimsOldestWhenRowCapExceeded(t *testing.T) {
+	// Given cap=3、宽年龄窗、5 条近期事件（id 升序=时间序）
+	setupSecurityEventsRetentionTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=3650, security_events_row_cap=3 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, event_type) VALUES (datetime('now'), ?, ?)`,
+			fmt.Sprintf("198.51.100.%d", i), fmt.Sprintf("evt-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var oldestIDs []int64
+	rows, err := db.MetricsDB.Query(`SELECT id FROM security_events ORDER BY id ASC LIMIT 2`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		oldestIDs = append(oldestIDs, id)
+	}
+	rows.Close()
+	if len(oldestIDs) != 2 {
+		t.Fatalf("seed 失败：oldestIDs=%v", oldestIDs)
+	}
+
+	// When
+	deleted := securityEventsRetentionCleanup(context.Background())
+
+	// Then 行数收敛到 cap，且删的是最旧两行（不是随机/最新）
+	var count int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("cleanup 后行数=%d，want 3（cap=3）", count)
+	}
+	for _, id := range oldestIDs {
+		var exists int
+		if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_events WHERE id=?`, id).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if exists != 0 {
+			t.Fatalf("最旧事件 id=%d 未被裁剪（count-trim 应按 id ASC）", id)
+		}
+	}
+	// 返回计数 = 实际删除数（§6.5 摘要行真实性）
+	if deleted != 2 {
+		t.Fatalf("cleanup 返回已删=%d，want 2", deleted)
+	}
 }

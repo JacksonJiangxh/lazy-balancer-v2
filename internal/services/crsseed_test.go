@@ -287,6 +287,7 @@ func TestPersistCRSSnapshotFrom_blocksWhileWafFileLockHeld(t *testing.T) {
 	liveDir := filepath.Join(root, "waf", "crs")
 	snapshotDir := filepath.Join(root, "data", "crs")
 	writeTestFile(t, filepath.Join(liveDir, "rules", crsProbeFile), "SecRule installed")
+	writeTestFile(t, filepath.Join(liveDir, crsVersionFile), "v4.15.0")
 
 	probeBlocksUnderWafFileLock(t, "CRS 快照持久化", func() {
 		if err := persistCRSSnapshotFrom(liveDir, snapshotDir, "v4.15.0"); err != nil {
@@ -314,4 +315,28 @@ func TestSeedCRSRules_healsDegenerateSnapshotWithLiveVersion(t *testing.T) {
 	if strings.TrimSpace(string(raw)) != "v4.15.0" {
 		t.Fatalf("snapshot VERSION=%q, want live v4.15.0 (not bundled)", strings.TrimSpace(string(raw)))
 	}
+}
+
+func TestSeedCRSRules_blocksWhileWafFileLockHeld(t *testing.T) {
+	root := t.TempDir()
+	liveDir := filepath.Join(root, "waf", "crs")
+	snapshotDir := filepath.Join(root, "data", "crs")
+	distDir := filepath.Join(root, "waf.dist", "crs")
+	writeTestFile(t, filepath.Join(liveDir, "rules", crsRulesProbeFile), "SecRule live")
+
+	probeBlocksUnderWafFileLock(t, "CRS 播种判定与写相位", func() {
+		seedCRSRulesFrom(liveDir, snapshotDir, distDir)
+	})
+}
+
+func TestReconcileCRSState_blocksWhileWafFileLockHeld(t *testing.T) {
+	root := t.TempDir()
+	liveDir := filepath.Join(root, "waf", "crs")
+	snapshotDir := filepath.Join(root, "data", "crs")
+	writeTestFile(t, filepath.Join(liveDir, "rules", crsRulesProbeFile), "SecRule live")
+	writeTestFile(t, filepath.Join(liveDir, crsVersionFile), "v4.15.0\n")
+
+	probeBlocksUnderWafFileLock(t, "CRS 对账判定与写相位", func() {
+		reconcileCRSStateFrom(liveDir, snapshotDir, "v4.15.0")
+	})
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 )
 
@@ -84,6 +85,7 @@ func TestCreateSecurityPolicy_typeInferredAndMixedRejected(t *testing.T) {
 	for _, body := range []string{
 		`{"name":"bad-mixed","policy_type":"mixed","mode":"blocking"}`,
 		`{"name":"bad-type","policy_type":"stage9","mode":"blocking"}`,
+		`{"name":"inferred-mixed","mode":"blocking","ip_acl_enabled":true,"ip_acl_mode":"deny","ip_acl_list":"[\"10.0.0.0/8\"]"}`,
 	} {
 		request := httptest.NewRequest(http.MethodPost, "/security/policies", strings.NewReader(body))
 		request.Header.Set("Content-Type", "application/json")
@@ -93,6 +95,104 @@ func TestCreateSecurityPolicy_typeInferredAndMixedRejected(t *testing.T) {
 			t.Fatalf("body %s status=%d, want 400", body, response.Code)
 		}
 	}
+	var inferredMixedCount int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_policies WHERE name='inferred-mixed'`).Scan(&inferredMixedCount); err != nil {
+		t.Fatal(err)
+	}
+	if inferredMixedCount != 0 {
+		t.Fatal("缺省 policy_type 推断为 mixed 的策略不得落库")
+	}
+}
+
+func TestCreateSecurityPolicy_explicitTypeNormalizesCrawlerExemption(t *testing.T) {
+	for _, policyType := range []string{models.PolicyTypeStage0, models.PolicyTypeStage2, models.PolicyTypeStage3} {
+		t.Run(policyType, func(t *testing.T) {
+			setupSecurityPolicyTestDB(t)
+			router := newSecurityRouter(t)
+			body := fmt.Sprintf(`{"name":"typed-crawler-%s","policy_type":%q,"geoip_crawler_exempt":true,"geoip_crawler_engines":"[\"googlebot\"]"}`, policyType, policyType)
+			request := httptest.NewRequest(http.MethodPost, "/security/policies", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusCreated && response.Code != http.StatusOK {
+				t.Fatalf("create status=%d body=%s, want 2xx", response.Code, response.Body.String())
+			}
+			var exempt bool
+			var engines string
+			if err := db.DB.QueryRow(`SELECT geoip_crawler_exempt, geoip_crawler_engines FROM security_policies WHERE name=?`, "typed-crawler-"+policyType).Scan(&exempt, &engines); err != nil {
+				t.Fatal(err)
+			}
+			if exempt || engines != "[]" {
+				t.Fatalf("stored crawler fields=(%v,%s), want false/[]", exempt, engines)
+			}
+		})
+	}
+}
+
+func TestUpdateSecurityPolicy_crawlerFieldsNormalizedAndValidated(t *testing.T) {
+	t.Run("geoip off clears stored exemption", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		router := newSecurityRouter(t)
+		res, err := db.DB.Exec(`INSERT INTO security_policies (name,policy_type,geoip_mode,geoip_crawler_exempt,geoip_crawler_engines) VALUES ('crawler-off','stage1','deny',1,'["googlebot"]')`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, _ := res.LastInsertId()
+		response := putJSON(t, router, "/security/policies/"+strconv.FormatInt(id, 10), map[string]any{"geoip_mode": "off"})
+		if response.Code != http.StatusOK {
+			t.Fatalf("update status=%d body=%s", response.Code, response.Body.String())
+		}
+		var exempt bool
+		if err := db.DB.QueryRow(`SELECT geoip_crawler_exempt FROM security_policies WHERE id=?`, id).Scan(&exempt); err != nil {
+			t.Fatal(err)
+		}
+		if exempt {
+			t.Fatal("geoip_mode=off 后不得残留生效豁免位")
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		engines string
+	}{
+		{name: "unknown engine", engines: `["not-a-crawler"]`},
+		{name: "malformed engines", engines: `not-json`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupSecurityPolicyTestDB(t)
+			router := newSecurityRouter(t)
+			res, err := db.DB.Exec(`INSERT INTO security_policies (name,policy_type,geoip_mode,geoip_crawler_exempt,geoip_crawler_engines) VALUES ('crawler-validate','stage1','deny',1,'["googlebot"]')`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, _ := res.LastInsertId()
+			response := putJSON(t, router, "/security/policies/"+strconv.FormatInt(id, 10), map[string]any{"geoip_crawler_engines": tc.engines})
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("engines-only update status=%d body=%s, want 400", response.Code, response.Body.String())
+			}
+		})
+	}
+
+	t.Run("empty engines use create defaults", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		router := newSecurityRouter(t)
+		res, err := db.DB.Exec(`INSERT INTO security_policies (name,policy_type,geoip_mode,geoip_crawler_exempt,geoip_crawler_engines) VALUES ('crawler-default','stage1','deny',1,'["googlebot"]')`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, _ := res.LastInsertId()
+		response := putJSON(t, router, "/security/policies/"+strconv.FormatInt(id, 10), map[string]any{"geoip_crawler_engines": ""})
+		if response.Code != http.StatusOK {
+			t.Fatalf("update status=%d body=%s", response.Code, response.Body.String())
+		}
+		var raw string
+		if err := db.DB.QueryRow(`SELECT geoip_crawler_engines FROM security_policies WHERE id=?`, id).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if engines := decodeStringArray(t, raw); len(engines) == 0 {
+			t.Fatal("空 engines 必须按 Create 口径归一为默认引擎集")
+		}
+	})
 }
 
 func TestUpdateSecurityPolicy_nilTypeReinfersAfterContentChange(t *testing.T) {

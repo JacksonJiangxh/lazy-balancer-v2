@@ -180,3 +180,39 @@ func TestMFAVerifyLogin_dbFailureReturns500Not401(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 500", recorder.Code, recorder.Body.String())
 	}
 }
+
+// B3-82-历史问题：消费挑战的 DB 故障不得折叠成 401「已消费」；挑战保持未消费，
+// 并留下服务故障审计，客户端可重试。
+func TestMFAVerifyLogin_consumeDBFailureReturns500AndKeepsChallenge(t *testing.T) {
+	seedMFAChallengeLoginFixture(t, "consume-db-err", 0)
+	oldAudit := db.AuditDB
+	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.AuditDB = oldAudit })
+	if _, err := db.DB.Exec(`ALTER TABLE mfa_challenges RENAME COLUMN consumed TO consumed_unreadable`); err != nil {
+		t.Fatalf("break consume update: %v", err)
+	}
+	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
+	router := gin.New()
+	router.POST("/auth/mfa/verify", h.MFAVerifyLogin)
+
+	response := postMFAVerify(t, router, "consume-db-err", "123456")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", response.Code, response.Body.String())
+	}
+	var consumed int
+	if err := db.DB.QueryRow(`SELECT consumed_unreadable FROM mfa_challenges WHERE token='consume-db-err'`).Scan(&consumed); err != nil {
+		t.Fatal(err)
+	}
+	if consumed != 0 {
+		t.Fatalf("challenge consumed=%d, want unchanged 0", consumed)
+	}
+	var events int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='认证拒绝' AND detail LIKE '%挑战消费服务故障%'`).Scan(&events); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if events != 1 {
+		t.Fatalf("consume failure audit events=%d, want 1", events)
+	}
+}

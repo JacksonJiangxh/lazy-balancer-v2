@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -50,8 +53,16 @@ func (h *Handlers) GetSecurityRateLimitBlocks(c *gin.Context) {
 // 暂无限流拦截必须可区分，前端 chip 显示「暂无计数」）。
 func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 	if db.MetricsDB == nil {
-		// MetricsDB 未装配：返回空统计而非 panic（历史 历史问题）
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]any{}})
+		// MetricsDB 未装配：与成功路径同键的零统计而非 panic（历史 历史问题）。
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
+			"stage1_blocked_24h":      0,
+			"stage3_blocked_24h":      0,
+			"ratelimit_blocks_reload": 0.0,
+			"precheck_avg_us":         0.0,
+			"precheck_samples":        0,
+			"waf_avg_us":              0.0,
+			"waf_samples":             0,
+		}})
 		return
 	}
 	ruleCaddyID := c.Param("caddy_id")
@@ -72,9 +83,15 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 			return
 		}
 		n, convErr := strconv.Atoi(triggered)
-		if convErr == nil && services.IsStage1PrecheckID(n) { // 历史收敛：五元组单一事实源
+		switch {
+		case triggered == "429":
+			// A81A-历史问题：限流拦截（429）由 ratelimit_blocks_reload（/metrics
+			// 429 计数）单独供给阶段 2 chip；此前落入 else 分支被计入
+			// stage3_blocked_24h，导致同一拦截同时出现在阶段 2 与阶段 3。
+			continue
+		case convErr == nil && services.IsStage1PrecheckID(n): // 历史收敛：五元组单一事实源
 			stage1 += count
-		} else {
+		default:
 			stage3 += count
 		}
 	}
@@ -163,4 +180,212 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 		"waf_avg_us":              wafAvg,
 		"waf_samples":             wafCnt,
 	}})
+}
+
+// 历史问题-11（历史）：安全总览的近 7 天聚合（趋势/Top10 IP/攻击族）此前
+// 每请求执行 4 条无缓存的大范围扫描（趋势、Top IP、Top IP 攻击族、攻击类型），
+// 100/s 攻击态 7 天可达数千万行时每 30s 轮询多趟全窗口聚合。改为 30s 进程内
+// 缓存（键含指标库句柄/日界/时区偏移——换库/跨日/改时区即失效；失败不缓存）。
+const securityOverviewAggCacheTTL = 30 * time.Second
+
+type securityOverviewAggregates struct {
+	trend            []models.SecurityTrendPoint
+	topIPs           []models.SecurityTopIP
+	attackTypes      []models.SecurityAttackType
+	attackTypesStage []models.SecurityAttackType
+	rawCoverageFrom  string
+}
+
+const securityOverviewRawRetentionNote = "今日计数、7 天趋势、攻击类型与 Top IP 仅统计原始安全事件保留窗口；威胁大屏使用分钟汇总，原始事件裁剪后两边计数可能不同"
+
+type securityOverviewResponse struct {
+	models.SecurityOverview
+	RawCoverageFrom  string `json:"raw_coverage_from"`
+	RawRetentionNote string `json:"raw_retention_note"`
+}
+
+type securityOverviewAggCacheKey struct {
+	metrics    *sql.DB
+	todayStart string
+	tzModifier string
+}
+
+type securityOverviewAggCacheEntry struct {
+	data      securityOverviewAggregates
+	expiresAt time.Time
+}
+
+var (
+	securityOverviewAggCacheMu sync.Mutex
+	securityOverviewAggCache   = map[securityOverviewAggCacheKey]securityOverviewAggCacheEntry{}
+)
+
+// resetSecurityOverviewAggCacheForTest 测试缝：清空总览聚合缓存（生产不调用）。
+func resetSecurityOverviewAggCacheForTest() {
+	securityOverviewAggCacheMu.Lock()
+	securityOverviewAggCache = map[securityOverviewAggCacheKey]securityOverviewAggCacheEntry{}
+	securityOverviewAggCacheMu.Unlock()
+}
+
+// loadSecurityOverviewAggregates 计算（或命中缓存）近 7 天聚合。错误不缓存、
+// 由调用方聚合成 500（与既有「任一查询失败显式报错」口径一致）。
+func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todayStartUTC, tzModifier string) (securityOverviewAggregates, error) {
+	key := securityOverviewAggCacheKey{metrics: metricsDB, todayStart: todayStartUTC, tzModifier: tzModifier}
+	now := time.Now()
+	securityOverviewAggCacheMu.Lock()
+	if entry, ok := securityOverviewAggCache[key]; ok && now.Before(entry.expiresAt) {
+		data := entry.data
+		securityOverviewAggCacheMu.Unlock()
+		return data, nil
+	}
+	securityOverviewAggCacheMu.Unlock()
+
+	var firstErr error
+	track := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	trendByDate := map[string]models.SecurityTrendPoint{}
+	trendRows, err := metricsDB.Query(`SELECT date(event_time, ?) as d, SUM(CASE WHEN action='blocked' THEN 1 ELSE 0 END) as b, SUM(CASE WHEN action='logged' THEN 1 ELSE 0 END) as l FROM security_events WHERE event_time >= datetime(?, '-6 days') GROUP BY d`, tzModifier, todayStartUTC)
+	track(err)
+	for trendRows != nil && trendRows.Next() {
+		var t models.SecurityTrendPoint
+		track(trendRows.Scan(&t.Date, &t.Blocked, &t.Detected))
+		trendByDate[t.Date] = t
+	}
+	if trendRows != nil {
+		track(trendRows.Err())
+		trendRows.Close()
+	}
+	trend := make([]models.SecurityTrendPoint, 0, 7)
+	for i := 6; i >= 0; i-- {
+		day := today.AddDate(0, 0, -i).Format("2006-01-02")
+		point := trendByDate[day]
+		point.Date = day
+		trend = append(trend, point)
+	}
+
+	type topIPRow struct {
+		ip                string
+		blocked, detected int
+		lastTime          string
+	}
+	var topRows []topIPRow
+	ipRows, err := metricsDB.Query(`SELECT client_ip, SUM(CASE WHEN action='blocked' THEN 1 ELSE 0 END) as b, SUM(CASE WHEN action='logged' THEN 1 ELSE 0 END) as l, MAX(event_time) as last_time FROM security_events WHERE event_time >= datetime(?, '-6 days') GROUP BY client_ip ORDER BY b + l DESC LIMIT 10`, todayStartUTC)
+	track(err)
+	for ipRows != nil && ipRows.Next() {
+		var row topIPRow
+		track(ipRows.Scan(&row.ip, &row.blocked, &row.detected, &row.lastTime))
+		topRows = append(topRows, row)
+	}
+	if ipRows != nil {
+		track(ipRows.Err())
+		ipRows.Close()
+	}
+	familyCountsByIP := map[string]map[string]int{}
+	stageFamilyCountsByIP := map[string]map[string]int{}
+	if len(topRows) > 0 {
+		placeholders := make([]string, len(topRows))
+		famArgs := make([]interface{}, 0, len(topRows)+1)
+		famArgs = append(famArgs, todayStartUTC)
+		for i, row := range topRows {
+			placeholders[i] = "?"
+			famArgs = append(famArgs, row.ip)
+		}
+		famRows, ferr := metricsDB.Query(fmt.Sprintf(`SELECT client_ip, COALESCE(rule_triggered,''), COALESCE(rule_msg,''), COUNT(*) as cnt FROM security_events WHERE event_time >= datetime(?, '-6 days') AND client_ip IN (%s) GROUP BY client_ip, rule_triggered, rule_msg`, strings.Join(placeholders, ",")), famArgs...)
+		track(ferr)
+		for famRows != nil && famRows.Next() {
+			var ip, ruleTriggered, ruleMsg string
+			var cnt int
+			track(famRows.Scan(&ip, &ruleTriggered, &ruleMsg, &cnt))
+			counts := familyCountsByIP[ip]
+			if counts == nil {
+				counts = map[string]int{}
+				familyCountsByIP[ip] = counts
+			}
+			counts[categorizeAttack(ruleTriggered, ruleMsg)] += cnt
+			stageCounts := stageFamilyCountsByIP[ip]
+			if stageCounts == nil {
+				stageCounts = map[string]int{}
+				stageFamilyCountsByIP[ip] = stageCounts
+			}
+			stageCounts[stageCategorizeAttack(ruleTriggered, ruleMsg)] += cnt
+		}
+		if famRows != nil {
+			track(famRows.Err())
+			famRows.Close()
+		}
+	}
+	topIPs := make([]models.SecurityTopIP, 0, len(topRows))
+	for _, row := range topRows {
+		topIPs = append(topIPs, models.SecurityTopIP{
+			IP:              row.ip,
+			IPLocation:      enrichIPLocation(row.ip),
+			Blocked:         row.blocked,
+			Detected:        row.detected,
+			LastTime:        row.lastTime,
+			AttackType:      joinDistinctFamilies(familyCountsByIP[row.ip]),
+			AttackTypeStage: joinDistinctFamilies(stageFamilyCountsByIP[row.ip]),
+		})
+	}
+
+	typeRows, err := metricsDB.Query(`SELECT COALESCE(rule_triggered,''), COALESCE(rule_msg,''), COUNT(*) as cnt FROM security_events WHERE event_time >= datetime(?, '-6 days') GROUP BY rule_triggered, rule_msg`, todayStartUTC)
+	track(err)
+	familyCounts := map[string]int{}
+	stageCounts := map[string]int{}
+	for typeRows != nil && typeRows.Next() {
+		var ruleTriggered, ruleMsg string
+		var cnt int
+		track(typeRows.Scan(&ruleTriggered, &ruleMsg, &cnt))
+		familyCounts[categorizeAttack(ruleTriggered, ruleMsg)] += cnt
+		stageCounts[stageCategorizeAttack(ruleTriggered, ruleMsg)] += cnt
+	}
+	if typeRows != nil {
+		track(typeRows.Err())
+		typeRows.Close()
+	}
+	attackTypesStage := make([]models.SecurityAttackType, 0, len(stageCounts))
+	for name, value := range stageCounts {
+		attackTypesStage = append(attackTypesStage, models.SecurityAttackType{Name: name, Value: value})
+	}
+	// A81A-历史问题：值相等时按名称升序 tiebreak（map 迭代序随机，防轮询抖动）。
+	sort.Slice(attackTypesStage, func(i, j int) bool {
+		if attackTypesStage[i].Value != attackTypesStage[j].Value {
+			return attackTypesStage[i].Value > attackTypesStage[j].Value
+		}
+		return attackTypesStage[i].Name < attackTypesStage[j].Name
+	})
+
+	attackTypes := make([]models.SecurityAttackType, 0, len(familyCounts))
+	for name, value := range familyCounts {
+		attackTypes = append(attackTypes, models.SecurityAttackType{Name: name, Value: value})
+	}
+	sort.Slice(attackTypes, func(i, j int) bool {
+		if attackTypes[i].Value != attackTypes[j].Value {
+			return attackTypes[i].Value > attackTypes[j].Value
+		}
+		return attackTypes[i].Name < attackTypes[j].Name
+	})
+	if len(attackTypes) > 10 {
+		attackTypes = attackTypes[:10]
+	}
+
+	var rawCoverageFrom string
+	track(metricsDB.QueryRow(`SELECT COALESCE(MIN(event_time),'') FROM security_events`).Scan(&rawCoverageFrom))
+
+	data := securityOverviewAggregates{trend: trend, topIPs: topIPs, attackTypes: attackTypes, attackTypesStage: attackTypesStage, rawCoverageFrom: rawCoverageFrom}
+	if firstErr != nil {
+		return data, firstErr
+	}
+	securityOverviewAggCacheMu.Lock()
+	// 过期项顺带清理（键空间随时区/日界变化，且测试换库会产生旧键）。
+	for k, entry := range securityOverviewAggCache {
+		if !now.Before(entry.expiresAt) {
+			delete(securityOverviewAggCache, k)
+		}
+	}
+	securityOverviewAggCache[key] = securityOverviewAggCacheEntry{data: data, expiresAt: now.Add(securityOverviewAggCacheTTL)}
+	securityOverviewAggCacheMu.Unlock()
+	return data, nil
 }

@@ -194,6 +194,31 @@ func TestBatchBindSecurityPolicies_singleRenderAndShapes(t *testing.T) {
 	}
 }
 
+func TestBatchBindSecurityPolicies_dedupesRuleIDs(t *testing.T) {
+	handler, loadCount := newStageBatchTestHandlers(t)
+	seedStageBatchRules(t)
+	router := stageBatchRouter(handler)
+	response := postStageJSON(t, router, "/security/policies/batch-bind",
+		`{"rule_ids":[" lb_b1 ","lb_b1","lb_b1"],"policy_ids":[1],"mode":"replace"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	bound, skipped := batchResult(t, response)
+	if bound != 1 || len(skipped) != 0 {
+		t.Fatalf("duplicate rule ids bound=%d skipped=%v, want 1/0", bound, skipped)
+	}
+	if *loadCount != 1 {
+		t.Fatalf("loads=%d, want 1", *loadCount)
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='安全策略' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(detail, "成功 1 条") {
+		t.Fatalf("audit detail=%q, want deduped success count", detail)
+	}
+}
+
 // merge 上限边界（2026-09-21 上限 5→8）：lb_b1 现有 6 条 + merge 2 条 = 8 → bound；
 // 再 merge 1 条 = 9 → 该规则 skipped「合并后超过 8 条策略上限」且原绑定保留。
 func TestBatchBindSecurityPolicies_mergeCapBoundary(t *testing.T) {
@@ -352,6 +377,31 @@ caddy_http_request_duration_seconds_count{code="200",handler="rate_limit",host="
 	}
 	if payload.Data.Stage1 != 4 || payload.Data.Stage3 != 3 || payload.Data.Ratelimit != 9 {
 		t.Fatalf("stage-stats=(%d,%d,%v), want (4,3,9)", payload.Data.Stage1, payload.Data.Stage3, payload.Data.Ratelimit)
+	}
+}
+
+func TestGetRuleStageStats_nilMetricsDBReturnsFullZeroShape(t *testing.T) {
+	handler, _ := newStageBatchTestHandlers(t)
+	saved := db.MetricsDB
+	db.MetricsDB = nil
+	t.Cleanup(func() { db.MetricsDB = saved })
+	router := stageBatchRouter(handler)
+	request := httptest.NewRequest(http.MethodGet, "/security/rules/lb_nil/stage-stats", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"stage1_blocked_24h", "stage3_blocked_24h", "ratelimit_blocks_reload", "precheck_avg_us", "precheck_samples", "waf_avg_us", "waf_samples"} {
+		if _, ok := payload.Data[key]; !ok {
+			t.Fatalf("nil MetricsDB fallback missing key %q: %s", key, response.Body.String())
+		}
 	}
 }
 

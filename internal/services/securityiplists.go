@@ -331,6 +331,13 @@ func danglingIPListRefs(p *models.SecurityPolicy, listsByID map[int64][]string, 
 	return dangling
 }
 
+// ResolvePolicyIPListRefsForSummary 供摘要/列表路径批量解析引用 IP 名单
+// （历史问题：SecurityPolicyHasIPControl 需要与发射面一致的合并集内容判定）。
+// 与渲染加载路径同一实现（store=nil → db.DB）；批次内零引用时零查询。
+func ResolvePolicyIPListRefsForSummary(policies []*models.SecurityPolicy) {
+	resolvePolicyIPListRefs(policies, nil)
+}
+
 // resolvePolicyIPListRefs 在策略加载路径上完成引用解析：跨整个已加载批次收集
 // 引用的列表 id（去重），仅当存在引用时执行恰好一次批量查询，再把每条策略的
 // 合并集（inline ∪ 引用条目）附加到 MergedACLList / MergedWhitelist。

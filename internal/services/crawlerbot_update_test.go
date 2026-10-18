@@ -156,10 +156,10 @@ func TestMarkCrawlerSourceFailed_usesScheduleNotBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// When
-	markCrawlerSourceFailed("googlebot")
+	// When（auto 触发：现存槽已过期 → 推进）
+	markCrawlerSourceFailed("googlebot", "auto")
 
-	// Then：失败也写下一排程槽，不得使用 5/10/20 分钟指数退避
+	// Then：失败写下一排程槽（非 5/10/20 分钟指数退避）
 	var next string
 	if err := database.QueryRow(`SELECT COALESCE(next_update,'') FROM security_crawler_sources WHERE name='googlebot'`).Scan(&next); err != nil {
 		t.Fatal(err)
@@ -167,6 +167,58 @@ func TestMarkCrawlerSourceFailed_usesScheduleNotBackoff(t *testing.T) {
 	want := crawlerNextSlot(time.Now().UTC())
 	if next != want {
 		t.Errorf("失败 next_update=%q want 排程槽 %q", next, want)
+	}
+}
+
+// 历史问题-2（R-12 同族收敛）：crawlerbot 源族排程槽写入必须继承威胁源族门禁
+// ——仅 auto 触发且现存槽空/过期才推进；手动触发（成功/失败）不动预约、
+// 未来槽不回拨。旧实现无条件改写 next_update：手动轮可静默吞掉当天自动轮，
+// 一次瞬时手动失败可抑制自动重试。
+func TestCrawlerSlotAdvance_triggerGate(t *testing.T) {
+	const past = "2000-01-01 00:00:00"
+	future := time.Now().UTC().Add(48 * time.Hour).Format("2006-01-02 15:04:05")
+	write := map[string]func(string, string){
+		"success": func(name, trigger string) { markCrawlerSourceSuccess(name, trigger, 1) },
+		"failed":  func(name, trigger string) { markCrawlerSourceFailed(name, trigger) },
+	}
+	cases := []struct {
+		name         string
+		kind         string
+		trigger      string
+		initial      string
+		wantAdvanced bool
+	}{
+		{name: "auto success advances past slot", kind: "success", trigger: "auto", initial: past, wantAdvanced: true},
+		{name: "auto failed advances past slot", kind: "failed", trigger: "auto", initial: past, wantAdvanced: true},
+		{name: "manual success keeps slot", kind: "success", trigger: "manual", initial: past, wantAdvanced: false},
+		{name: "manual failed keeps slot", kind: "failed", trigger: "manual", initial: past, wantAdvanced: false},
+		{name: "auto success keeps future slot", kind: "success", trigger: "auto", initial: future, wantAdvanced: false},
+		{name: "auto failed keeps future slot", kind: "failed", trigger: "auto", initial: future, wantAdvanced: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, database := newClusterTestService(t)
+			if err := ensureCrawlerSources(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.Exec(`UPDATE security_crawler_sources SET next_update=? WHERE name='googlebot'`, tc.initial); err != nil {
+				t.Fatal(err)
+			}
+
+			write[tc.kind]("googlebot", tc.trigger)
+
+			var next string
+			if err := database.QueryRow(`SELECT COALESCE(next_update,'') FROM security_crawler_sources WHERE name='googlebot'`).Scan(&next); err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantAdvanced {
+				if want := crawlerNextSlot(time.Now().UTC()); next != want {
+					t.Fatalf("next_update=%q, want advanced slot %q", next, want)
+				}
+			} else if next != tc.initial {
+				t.Fatalf("next_update=%q, want unchanged %q (gate violated)", next, tc.initial)
+			}
+		})
 	}
 }
 

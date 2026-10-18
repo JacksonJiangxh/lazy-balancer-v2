@@ -44,6 +44,7 @@ func TestUpdateRule_acmeToManual_deletesAllCertJobsIncludingFailed(t *testing.T)
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	certPEM, keyPEM, err := generateTestCert("r10.example.test", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	if err != nil {
@@ -75,6 +76,7 @@ func TestUpdateRule_disableTLS_deletesAllCertJobs(t *testing.T) {
 	seedACMEManualSwitchFixture(t, "lb_r10_nodtls", "nodtls.example.test", "failed")
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 
 	response := putUpdateRule(t, harness, "lb_r10_nodtls", `{"name":"after","enable_tls":false}`)
@@ -148,6 +150,7 @@ func TestUpdateRule_manualResave_healsOrphanCertJobs(t *testing.T) {
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	certPEM, keyPEM, err := generateTestCert("heal.example.test", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	if err != nil {

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -371,8 +372,7 @@ func (h *Handlers) GetBranding(c *gin.Context) {
 		}
 		if needApply {
 			go func() {
-				var isMaster bool
-				if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err == nil && !isMaster {
+				if isMaster, err := services.RoleOf(context.Background(), db.DB); err == nil && !isMaster {
 					return
 				}
 				if err := h.applyCaddyConfigE(); err != nil {
@@ -529,8 +529,7 @@ func SeedDefaultBlockPage(dataDir string) (bool, error) {
 	if db.DB == nil {
 		return false, nil
 	}
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err == nil && !isMaster {
+	if isMaster, err := services.RoleOf(context.Background(), db.DB); err == nil && !isMaster {
 		// The default block page content is owned by the master and arrives on
 		// slaves via cluster sync; branding.json is node-local, so re-rendering
 		// here would overwrite the synced content with local defaults.

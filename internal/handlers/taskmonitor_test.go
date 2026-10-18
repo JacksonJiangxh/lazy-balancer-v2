@@ -6,6 +6,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -31,6 +32,7 @@ func initTaskEngineForTest(t *testing.T) {
 			services.StopTaskEngine()
 			_ = db.Close()
 			db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA
+			db.SetDB(oldDB)
 		})
 		services.InitTaskEngine("", t.TempDir()+"/app.log")
 	}
@@ -363,6 +365,42 @@ func TestGetSystemTaskLogs_boundedTailDropsPartialFirstLine(t *testing.T) {
 				t.Fatalf("content length=%d value=%q, want length=%d %q", len(got), got, len(tc.want), tc.want)
 			}
 		})
+	}
+}
+
+// 历史问题-历史问题：任务监控与证书/更新日志端点同为轮转感知——活动文件外加
+// .1～.5，按最旧到最新拼接，轮转后不得出现历史缺口。
+func TestGetSystemTaskLogs_includesFiveRotations(t *testing.T) {
+	dir := t.TempDir()
+	oldLogDir := taskengine.LogDir()
+	taskengine.SetLogDir(dir)
+	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
+	path := taskengine.TaskLogPath("rotated")
+	if err := os.WriteFile(path, []byte("current\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 5; i++ {
+		if err := os.WriteFile(fmt.Sprintf("%s.%d", path, i), []byte(fmt.Sprintf("archive-%d\n", i)), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/system/tasks/:id/logs", h.GetSystemTaskLogs)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/system/tasks/rotated/logs", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	want := "archive-5\narchive-4\narchive-3\narchive-2\narchive-1\ncurrent\n"
+	if got := payload.Data["content"]; got != want {
+		t.Fatalf("content=%q, want %q", got, want)
 	}
 }
 

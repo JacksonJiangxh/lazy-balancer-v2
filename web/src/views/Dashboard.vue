@@ -432,6 +432,7 @@ import { Monitor, Cpu, Document, Loading, CircleCheck, Odometer, TrendCharts, Da
 import type { APIResponse, SystemInfo, SystemMetrics, CaddyMetrics, Rule, RuleMetrics, HostMetrics, MetricsOverview } from '@/types'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { httpStatusColors } from '@/utils/chartTheme'
+import { buildRuleMetricsUnavailable } from '@/utils/dashboardMetrics'
 
 
 const authStore = useAuthStore()
@@ -803,13 +804,14 @@ const fetchAllData = (): Promise<void> => {
         caddyMetricsUnavailable.value = true
         hostMetricsUnavailable.value = true
         overviewUnavailable.value = true
+        ruleMetricsUnavailable.value = buildRuleMetricsUnavailable(rules.value, undefined, false)
         return
       }
       caddyMetrics.value = data.global
       hostMetrics.value = data.hosts
       overview.value = data.overview
       ruleMetrics.value = data.rules
-      ruleMetricsUnavailable.value = Object.fromEntries(rules.value.map((rule) => [rule.caddy_id, rule.enabled && data.rules[rule.caddy_id] === undefined]))
+      ruleMetricsUnavailable.value = buildRuleMetricsUnavailable(rules.value, data.rules, true)
       caddyMetricsUnavailable.value = false
       hostMetricsUnavailable.value = false
       overviewUnavailable.value = false
@@ -820,7 +822,7 @@ const fetchAllData = (): Promise<void> => {
       overviewUnavailable.value = true
       // 历史 历史问题: 移除 rulesUnavailable.value = true（与 /rules then 竞态）。
       // rulesUnavailable 由 /rules 自己的 then/catch 管理，避免双 setter 竞态。
-      ruleMetricsUnavailable.value = Object.fromEntries(rules.value.map((rule) => [rule.caddy_id, rule.enabled]))
+      ruleMetricsUnavailable.value = buildRuleMetricsUnavailable(rules.value, undefined, false)
     }),
     request.get('/rules', config).then(async (res) => {
       if (disposed) return
@@ -830,15 +832,13 @@ const fetchAllData = (): Promise<void> => {
       }
       rules.value = res.data || []
       rulesUnavailable.value = false
-      // FE18-5+S历史问题/2(历史修正):/rules 落地后按同一谓词重建映射——
-      // 仅当 metrics 成功态(caddyMetricsUnavailable=false 保证 ruleMetrics
-      // 是新鲜数据)时重建;失败序(metrics 先败→rules 后到)不触碰,
-      // 保留 metrics 分支已写入的全真「采集失败」映射(此前用陈旧
-      // ruleMetrics 判第三段会抹掉它)。原两析取(初始 {} 恒真/keys>0)在
-      // 主场景恒死,修复无效,已删。
-      if (!caddyMetricsUnavailable.value) {
-        ruleMetricsUnavailable.value = Object.fromEntries(rules.value.map((rule) => [rule.caddy_id, rule.enabled && ruleMetrics.value?.[rule.caddy_id] === undefined]))
-      }
+      // /rules 与 metrics 无序落地：无论指标成功、失败或空载荷，都以当前规则
+      // 列表重建映射；metrics 失败时启用行恒为「采集失败」。
+      ruleMetricsUnavailable.value = buildRuleMetricsUnavailable(
+        rules.value,
+        ruleMetrics.value,
+        !caddyMetricsUnavailable.value,
+      )
       const version = ++rulesVersion
       const currentRules = rules.value
        await fetchRuleHealth(currentRules, version)

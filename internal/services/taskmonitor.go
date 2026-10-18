@@ -6,6 +6,7 @@ package services
 // 暂停/取消）复用各任务族既有入口（handlers 映射层）。
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -23,7 +24,8 @@ const (
 	TaskStatusDisabled TaskStatus = "disabled"
 	TaskStatusQueued   TaskStatus = "queued"
 	// 方案 A（2026-10-12）：stopped 退役——状态列只承载执行语义（调度语义归
-	// 开关列 loop_on&&enabled）；disabled 仅 cert-job 退役行集产出。
+	// 开关列 loop_on；业务驱动任务另由业务开关决定是否启动）。disabled 仅
+	// cert-job 退役行集产出。
 	// B1-5（历史）：cancelled 常量删除——零产出零消费（取消只存在于
 	// task_runs.result 字段，非 TaskStatus 状态产出）。
 )
@@ -94,9 +96,8 @@ func collectCertJobRows() []TaskInfo {
 	// 节点自己的签发工作项）。读角色失败按主节点处理（行可见：多展示无害，
 	// 静默丢行不可恢复）。
 	isMaster := 1
-	var roleVal int
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&roleVal); err == nil {
-		isMaster = roleVal
+	if role, err := RoleOf(context.Background(), db.DB); err == nil && !role {
+		isMaster = 0
 	}
 	rows, err := db.DB.Query(`SELECT id, rule_id, domain, status, COALESCE(message,''), COALESCE(updated_at,created_at)
 		FROM cert_jobs

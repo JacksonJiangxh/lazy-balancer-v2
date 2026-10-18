@@ -66,6 +66,10 @@ func GetCertExpiryThreshold() int {
 		Logf("error", "GetCertExpiryThreshold: cert_expiry_days 库值无效（%d <=0）——类型①值型列应恒为正（写侧 1-365 校验+启动回填报证），疑似带外直写；本轮降级默认 %d 留痕", days, db.DefaultCertExpiryDays)
 		return db.DefaultCertExpiryDays
 	}
+	if days > 365 {
+		Logf("error", "GetCertExpiryThreshold: cert_expiry_days 库值超上界（%d >365）——写侧/导入 1-365 之外，疑似带外直写/旧快照；本轮降级默认 %d 留痕", days, db.DefaultCertExpiryDays)
+		return db.DefaultCertExpiryDays
+	}
 	return days
 }
 
@@ -90,7 +94,14 @@ func GetCertRenewalDays() int {
 		return db.DefaultCertRenewalDays
 	}
 	if days <= 0 {
-		Logf("error", "GetCertRenewalDays: cert_renewal_days 库值无效（%d <=0）——启动回填 1-365 之外的最后防线，疑似带外直写/旧导入；本轮降级默认 %d 留痕", days, db.DefaultCertRenewalDays)
+		Logf("error", "GetCertRenewalDays: cert_renewal_days 库值无效（%d <=0）——启动回填只处理 <=0，写侧 0-90/导入 1-90 之外的最后防线，疑似带外直写/旧导入；本轮降级默认 %d 留痕", days, db.DefaultCertRenewalDays)
+		return db.DefaultCertRenewalDays
+	}
+	// 历史问题-05：读侧上界与写侧（handlers.UpdateConfig 0-90）/导入钳制（1-90）
+	// 对齐——带外直写 365 会让 90 天证书整年处于续签窗口，每 6h 触发一次签发
+	// 风暴耗尽 CA 配额。与 <=0 同形态：error 级留痕后降级治理默认。
+	if days > 90 {
+		Logf("error", "GetCertRenewalDays: cert_renewal_days 库值超上界（%d >90）——写侧 0-90/导入 1-90 之外，疑似带外直写/旧备份恢复（续签风暴风险）；本轮降级默认 %d 留痕", days, db.DefaultCertRenewalDays)
 		return db.DefaultCertRenewalDays
 	}
 	return days
@@ -111,7 +122,13 @@ func GetCertRenewalAttempts() int {
 		return db.DefaultCertRenewalAttempts
 	}
 	if attempts <= 0 {
-		Logf("error", "GetCertRenewalAttempts: cert_renewal_attempts 库值无效（%d <=0）——启动回填之外的最后防线，疑似带外直写/旧导入；本轮降级默认 %d 留痕", attempts, db.DefaultCertRenewalAttempts)
+		Logf("error", "GetCertRenewalAttempts: cert_renewal_attempts 库值无效（%d <=0）——启动回填只处理 <=0，写侧/导入 1-10 之外的最后防线，疑似带外直写/旧导入；本轮降级默认 %d 留痕", attempts, db.DefaultCertRenewalAttempts)
+		return db.DefaultCertRenewalAttempts
+	}
+	// 历史问题-05：读侧上界与写侧（1-10）/导入钳制（1-10）对齐——带外直写
+	// 100 会让失败任务自动重试 100 次（CA 配额与 Caddy 重载压力）。
+	if attempts > 10 {
+		Logf("error", "GetCertRenewalAttempts: cert_renewal_attempts 库值超上界（%d >10）——写侧/导入 1-10 之外，疑似带外直写/旧备份恢复；本轮降级默认 %d 留痕", attempts, db.DefaultCertRenewalAttempts)
 		return db.DefaultCertRenewalAttempts
 	}
 	return attempts

@@ -39,8 +39,8 @@ func requireMasterNode(c *gin.Context) bool {
 		clusterError(c, http.StatusInternalServerError, "节点角色查询失败", nil)
 		return false
 	}
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
+	isMaster, err := services.RoleOf(c.Request.Context(), db.DB)
+	if err != nil {
 		clusterError(c, http.StatusInternalServerError, "节点角色查询失败", err)
 		return false
 	}
@@ -323,5 +323,6 @@ func (h *Handlers) GetSystemTaskLogs(c *gin.Context) {
 		return
 	}
 	data = tailLogWindow(data, startOffset)
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"content": string(data)}})
+	content := prependTaskLogRotations(path, string(data))
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"content": content}})
 }

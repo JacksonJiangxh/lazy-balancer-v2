@@ -6,7 +6,9 @@ package services
 // 含 942100+942550 两条）。
 
 import (
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +18,52 @@ import (
 
 	"lazy-balancer-v2/internal/models"
 )
+
+type countingIPListStore struct {
+	caddyConfigStore
+	queries int
+}
+
+func (c *countingIPListStore) Query(query string, args ...any) (*sql.Rows, error) {
+	if strings.Contains(query, "FROM security_ip_lists") {
+		c.queries++
+	}
+	return c.caddyConfigStore.Query(query, args...)
+}
+
+func TestScopedExclusionRefLoadsOncePerRenderContext(t *testing.T) {
+	scopedExclusionFixture(t)
+	_, database := newClusterTestService(t)
+	firstID, err := database.Exec(`INSERT INTO security_ip_lists (name, entries) VALUES ('cache-a', '[{"value":"1.1.1.1"}]')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := firstID.LastInsertId()
+	secondID, err := database.Exec(`INSERT INTO security_ip_lists (name, entries) VALUES ('cache-b', '[{"value":"2.2.2.2"}]')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _ := secondID.LastInsertId()
+	policy := &models.SecurityPolicy{ID: 1, Name: "cache", AnomalyThreshold: 5, Mode: "blocking",
+		CRSExcludedRules: json.RawMessage(fmt.Sprintf(`[{"target":"42","scope":"list","listRefs":[%d]}]`, first))}
+	store := &countingIPListStore{caddyConfigStore: database}
+	cache := make(scopedCRSListCache)
+	for range 2 {
+		if _, err := buildCorazaDirectivesWithScopedCache(policy, store, "", false, 0, "lb_cache", cache); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if store.queries != 1 {
+		t.Fatalf("IP list loads=%d, want 1 shared across policy renders", store.queries)
+	}
+	policy.CRSExcludedRules = json.RawMessage(fmt.Sprintf(`[{"target":"42","scope":"list","listRefs":[%d]}]`, second))
+	if _, err := buildCorazaDirectivesWithScopedCache(policy, store, "", false, 0, "lb_cache", cache); err != nil {
+		t.Fatal(err)
+	}
+	if store.queries != 2 {
+		t.Fatalf("different refs must load once more, queries=%d", store.queries)
+	}
+}
 
 func scopedExclusionFixture(t *testing.T) {
 	t.Helper()

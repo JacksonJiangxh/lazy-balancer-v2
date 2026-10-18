@@ -106,6 +106,11 @@ type CaddyService struct {
 	// 不绑端口——比「不 provision」更强,引擎级错误在此被捕获)校验
 	// 最终渲染（裁定 2026-09-06 ④'）。默认关闭，main 显式启用，测试注入桩。
 	cliValidate func(rendered []byte) error
+
+	healthMu             sync.Mutex
+	healthCache          map[string]map[string]*UpstreamHealthDetail
+	healthCacheExpiresAt time.Time
+	healthInflight       *upstreamHealthCall
 }
 
 func NewCaddyService(adminURL string) *CaddyService {
@@ -269,11 +274,11 @@ func (s *CaddyService) getRunningConfigBytes() ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET /config/ returned %d", resp.StatusCode)
-	}
 	// 历史问题 同族防线（历史 历史问题：全文件最后一处无界 admin 读取收口）。
-	return io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	// D1-历史问题：与 GetConfig 共用 readAdminConfigBody（状态分类 + 32MB+1 探测），
+	// 超限返回显式错误而非静默截断——比对方按 fail-open 照常 /load，但日志
+	// 可见「超限」而非「配置变化」的假象。
+	return readAdminConfigBody(resp)
 }
 
 func (s *CaddyService) applyConfigLocked(config map[string]interface{}, persistDegradation bool) (err error) {
@@ -318,8 +323,15 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 	// errSameConfig 让审计层知道「没有发生真实重载」。比对失败按未知照常
 	// /load（fail-open，与 Caddy 自身短路同向）。
 	if !force {
-		if running, err := s.getRunningConfigBytes(); err == nil && caddyConfigJSONEqual(running, data) {
+		running, runningErr := s.getRunningConfigBytes()
+		if runningErr == nil && caddyConfigJSONEqual(running, data) {
+			// D1-历史问题：同字节短路同样收敛降级状态（见函数说明）。
+			applyRenderDegradationState(config, persistDegradation)
 			return errSameConfig
+		}
+		if errors.Is(runningErr, errCaddyAdminConfigTooLarge) {
+			// D1-历史问题：超限是形态异常（非常规瞬时读失败），跳过短路但显式留痕。
+			Logf("warn", "Caddy 运行配置超过同字节比对上限，跳过短路照常 /load: %v", runningErr)
 		}
 	}
 
@@ -357,21 +369,35 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 	// D3（历史）：渲染降级随配置图到达此处——成功应用后落审计行+
 	// caddy_apply_error 横幅（不阻断应用）；干净渲染置空状态，handlers 侧
 	// recordCaddyApplyResult(nil) 据此恢复常规清除。
-	if degraded, _ := config[caddyConfigDegradationKey].(string); degraded != "" {
-		setLastRenderDegradation(degraded)
-		RecordAuditLog("system", "应用降级", "Caddy配置", degraded, "")
-		// 历史问题/历史问题：事务内 apply 时主库写锁仍在未提交事务手里，此处
-		// 用 db.DB 第二连接写横幅会等待 busy_timeout 后必败。持久化交给
-		// commit 后的 recordCaddyApplyResult(nil)；非事务路径保持即时落库。
-		if persistDegradation && db.DB != nil {
-			if _, err := db.DB.Exec(`UPDATE global_config SET caddy_apply_error=? WHERE id=1`, degraded); err != nil {
-				Logf("warn", "D3: 持久化渲染降级横幅失败: %v", err)
-			}
-		}
-	} else {
-		setLastRenderDegradation("")
-	}
+	applyRenderDegradationState(config, persistDegradation)
 	return nil
+}
+
+// applyRenderDegradationState 收敛本轮渲染的降级状态（D3 历史；D1-历史问题）。
+// 必须在「同字节短路」与「成功 /load」两条出口都调用：降级键经 caddyPayload
+// 从载荷剔除、不参与字节比较，若只在真实 /load 后处理，则
+//   - 启用某特性但本轮渲染降级、产物又与运行配置同字节（如受信代理开启瞬间
+//     读设置失败按未启用渲染）→ 保存「成功」、横幅/审计全无，面板显示已启用
+//     而实际未生效；
+//   - 降级已解除但新渲染与运行配置同字节 → setLastRenderDegradation("") 不可达，
+//     LastRenderDegradation 残留旧值，recordCaddyApplyResult(nil) 会把旧降级
+//     重新持久化。
+//
+// persist=false（事务内 apply）不写主库：未提交事务仍持写锁，持久化交给
+// commit 后的 recordCaddyApplyResult(nil)（历史问题/历史问题）。
+func applyRenderDegradationState(config map[string]interface{}, persist bool) {
+	degraded, _ := config[caddyConfigDegradationKey].(string)
+	if degraded == "" {
+		setLastRenderDegradation("")
+		return
+	}
+	setLastRenderDegradation(degraded)
+	RecordAuditLog("system", "应用降级", "Caddy配置", degraded, "")
+	if persist && db.DB != nil {
+		if _, err := db.DB.Exec(`UPDATE global_config SET caddy_apply_error=? WHERE id=1`, degraded); err != nil {
+			Logf("warn", "D3: 持久化渲染降级横幅失败: %v", err)
+		}
+	}
 }
 
 // SetLastGoodPath 启用「最后已知正确配置」落盘（裁定 2026-09-06 ③）。每次
@@ -555,6 +581,10 @@ const caddyErrorBodyMaxBytes = 1024
 // 与 getRunningConfigBytes/看门狗同源，防止异常对端无界分配）。
 const caddyAdminConfigMaxBytes = 32 << 20
 
+// errCaddyAdminConfigTooLarge 标记 admin GET /config/ 超过比对上限（D1-历史问题）：
+// 调用方据此把「超限」与瞬时读失败区分开留痕（二者都按 fail-open 照常 /load）。
+var errCaddyAdminConfigTooLarge = errors.New("Caddy admin 配置响应超过 32MB 上限")
+
 // readAdminConfigBody 读取 admin GET /config/ 的响应体：非 2xx 一律返回带状态码
 // 的错误（错误体经 readCaddyErrorBody 截断到 1KB 供诊断），2xx 时按 32MB 上限
 // 返回原始字节。U04a2-历史问题（历史）：此前 GetConfig/GetUpstreamHealthDetailed
@@ -564,7 +594,17 @@ func readAdminConfigBody(resp *http.Response) ([]byte, error) {
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, fmt.Errorf("GET /config/ returned %d: %s", resp.StatusCode, strings.TrimSpace(string(readCaddyErrorBody(resp.Body))))
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, caddyAdminConfigMaxBytes))
+	// D1-历史问题：+1 探测（metrics 16MB 家族同口径）——裸 LimitReader 静默截断
+	// 会让超限与「合法短响应」不可区分（配置结构比对恒不等 → 多余一次 /load；
+	// upstreams 解码静默失败为空表）。
+	data, err := io.ReadAll(io.LimitReader(resp.Body, caddyAdminConfigMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > caddyAdminConfigMaxBytes {
+		return nil, fmt.Errorf("%w（上限 %d 字节）", errCaddyAdminConfigTooLarge, caddyAdminConfigMaxBytes)
+	}
+	return data, nil
 }
 
 // ValidateConfig validates Caddy configuration using the /load API with validate=true
@@ -666,8 +706,71 @@ type UpstreamHealthDetail struct {
 	Fails       int  `json:"fails"`
 }
 
-// GetUpstreamHealthDetailed returns detailed health status of all upstreams from Caddy
+// upstreamHealthCacheTTL 限制面板多轮询实例对 admin/metrics 的放大；失败不缓存。
+var upstreamHealthCacheTTL = 5 * time.Second
+
+type upstreamHealthCall struct {
+	done   chan struct{}
+	health map[string]map[string]*UpstreamHealthDetail
+	err    error
+}
+
+// GetUpstreamHealthDetailed returns detailed health status of all upstreams from Caddy.
+// 成功结果按 5s TTL 缓存且并发单飞；每次返回深拷贝，调用方不能污染共享缓存。
 func (s *CaddyService) GetUpstreamHealthDetailed() (map[string]map[string]*UpstreamHealthDetail, error) {
+	s.healthMu.Lock()
+	if s.healthCache != nil && time.Now().Before(s.healthCacheExpiresAt) {
+		health := cloneUpstreamHealthDetails(s.healthCache)
+		s.healthMu.Unlock()
+		return health, nil
+	}
+	if call := s.healthInflight; call != nil {
+		s.healthMu.Unlock()
+		<-call.done
+		if call.err != nil {
+			return nil, call.err
+		}
+		return cloneUpstreamHealthDetails(call.health), nil
+	}
+	call := &upstreamHealthCall{done: make(chan struct{})}
+	s.healthInflight = call
+	s.healthMu.Unlock()
+
+	health, err := s.getUpstreamHealthDetailedUncached()
+
+	s.healthMu.Lock()
+	call.health, call.err = health, err
+	s.healthInflight = nil
+	if err == nil {
+		s.healthCache = health
+		s.healthCacheExpiresAt = time.Now().Add(upstreamHealthCacheTTL)
+	}
+	s.healthMu.Unlock()
+	close(call.done)
+	if err != nil {
+		return nil, err
+	}
+	return cloneUpstreamHealthDetails(health), nil
+}
+
+func cloneUpstreamHealthDetails(src map[string]map[string]*UpstreamHealthDetail) map[string]map[string]*UpstreamHealthDetail {
+	clone := make(map[string]map[string]*UpstreamHealthDetail, len(src))
+	for server, upstreams := range src {
+		serverClone := make(map[string]*UpstreamHealthDetail, len(upstreams))
+		for dial, detail := range upstreams {
+			if detail == nil {
+				serverClone[dial] = nil
+				continue
+			}
+			detailClone := *detail
+			serverClone[dial] = &detailClone
+		}
+		clone[server] = serverClone
+	}
+	return clone
+}
+
+func (s *CaddyService) getUpstreamHealthDetailedUncached() (map[string]map[string]*UpstreamHealthDetail, error) {
 	healthStatus := make(map[string]map[string]*UpstreamHealthDetail)
 
 	upstreamHealth := s.getUpstreamHealthFromMetrics()
@@ -903,9 +1006,20 @@ func (s *CaddyService) getUpstreamMetrics() map[string]*upstreamMetric {
 		return result
 	}
 
-	var upstreams []map[string]interface{}
 	// 32MB 上限同族防线（历史 历史问题，口径见 GetUpstreamHealthDetailed）。
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&upstreams); err != nil {
+	// D1-历史问题：+1 探测——裸 LimitReader 静默截断会让解码失败被当作「空表」，
+	// 运维无法区分「Caddy 无上游」与「响应超限」。
+	body, err := io.ReadAll(io.LimitReader(resp.Body, caddyAdminConfigMaxBytes+1))
+	if err != nil {
+		Logf("error", "Failed to read reverse_proxy/upstreams: %v", err)
+		return result
+	}
+	if len(body) > caddyAdminConfigMaxBytes {
+		Logf("error", "reverse_proxy/upstreams 响应超过 %d 字节上限，指标本轮缺失", caddyAdminConfigMaxBytes)
+		return result
+	}
+	var upstreams []map[string]interface{}
+	if err := json.Unmarshal(body, &upstreams); err != nil {
 		Logf("error", "Failed to decode reverse_proxy/upstreams: %v", err)
 		return result
 	}
@@ -936,6 +1050,11 @@ func (s *CaddyService) getUpstreamMetrics() map[string]*upstreamMetric {
 	return result
 }
 
+var (
+	caddyReverseProxyHealthyMetricPrefix = []byte("caddy_reverse_proxy_upstreams_healthy{")
+	caddyLayer4ProxyHealthyMetricPrefix  = []byte("caddy_layer4_proxy_upstream_healthy{")
+)
+
 func (s *CaddyService) getUpstreamHealthFromMetrics() map[string]bool {
 	result := make(map[string]bool)
 
@@ -957,9 +1076,9 @@ func (s *CaddyService) getUpstreamHealthFromMetrics() map[string]bool {
 		return result
 	}
 
-	lines := strings.Split(string(body), "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "caddy_reverse_proxy_upstreams_healthy{") || strings.HasPrefix(line, "caddy_layer4_proxy_upstream_healthy{") {
+	for rawLine := range bytes.Lines(body) {
+		if bytes.HasPrefix(rawLine, caddyReverseProxyHealthyMetricPrefix) || bytes.HasPrefix(rawLine, caddyLayer4ProxyHealthyMetricPrefix) {
+			line := string(rawLine)
 			upstream := ExtractMetricLabel(line, "upstream")
 			spaceIdx := strings.LastIndex(line, " ")
 			var isHealthy float64
@@ -1031,6 +1150,9 @@ type securityPolicyContext struct {
 	// BuildCorazaDirectives → resolvePolicyCustomRules 必须沿同一 store 读取
 	// security_custom_rules，否则 v2 导入事务内重插的规则在渲染期静默丢失。
 	store caddyConfigStore
+	// scopedListCache 单次全量生成的 CRS 作用域排除列表引用缓存
+	// （历史问题-09）：键=排序后的 listRefs，避免规则×策略重复读库/整文件。
+	scopedListCache scopedCRSListCache
 }
 
 // loadSecurityPolicyContext 一次性查询 security_policy_bindings +
@@ -1047,6 +1169,7 @@ func loadSecurityPolicyContext(store caddyConfigStore) (*securityPolicyContext, 
 		blockPageTypeByID: make(map[int]string),
 		policySynthetic:   make(map[int]int),
 		store:             store,
+		scopedListCache:   make(scopedCRSListCache),
 	}
 	bindingRows, err := store.Query(`SELECT rule_caddy_id, policy_id FROM security_policy_bindings ORDER BY rule_caddy_id, policy_id ASC`)
 	if err != nil {
@@ -1310,11 +1433,12 @@ func trustedProxyServerFields(store caddyConfigStore) (map[string]interface{}, s
 }
 
 // TrustedProxyMinPrefixBits 返回受信代理允许的最小前缀长度（IPv4=/8，
-// IPv6=/96）——过宽网段会让伪造的头在任意来源被采信。写侧（内联 ranges 与
+// IPv6=/29）。/29 覆盖 Cloudflare 官方最宽回源段 2a06:98c0::/29；
+// 过宽网段会让伪造的头在任意来源被采信。写侧（内联 ranges 与
 // 引用名单条目）与渲染侧共用本判据（U04d-01：两个输入通道不得有宽窄差）。
 func TrustedProxyMinPrefixBits(addr netip.Addr) int {
 	if addr.Is6() {
-		return 96
+		return 29
 	}
 	return 8
 }
@@ -1374,7 +1498,7 @@ func expandTrustedProxyRanges(store caddyConfigStore, inline []string, refsJSON 
 		// 覆盖带外改库与旧版本残留配置——过宽网段会让伪造头在任意来源被采信，
 		// 宁可跳过并留痕（运行配置缺该来源 = 退回 socket IP，偏安全侧）。
 		if TrustedProxyPrefixTooWide(prefix) {
-			Logf("warn", "受信代理条目 %q 过宽（最小 /8（IPv4）与 /96（IPv6），且不得覆盖全部地址空间，跳过）", value)
+			Logf("warn", "受信代理条目 %q 过宽（最小 /8（IPv4）与 /29（IPv6），且不得覆盖全部地址空间，跳过）", value)
 			return
 		}
 		seen[prefix.String()] = struct{}{}
@@ -1884,6 +2008,12 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	for _, ru := range allRules {
 		r := ru.rule
 		ups := ru.upstreams
+
+		// 历史问题 历史问题 同族收敛：全量路径与单规则路径共用 http/tcp 白名单，
+		// 带外 https/udp 等脏值不得被静默暴露成原始 TCP 代理。
+		if r.Protocol != "http" && r.Protocol != "tcp" {
+			return generationFailure("rule %s: unsupported protocol: %s", r.CaddyID, r.Protocol)
+		}
 
 		// 历史问题-1(历史):dial 值零消费(仅判空)——改计数器,免每启用
 		// 上游一次 JoinHostPort+append 的渲染热路径分配。
@@ -2899,6 +3029,9 @@ func formatFlushInterval(v int) string {
 // GenerateCaddyConfig, which re-queried the whole database and re-read
 // certificate files on every request.
 func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain string) map[string]interface{} {
+	if protocol != "http" && protocol != "tcp" {
+		return map[string]interface{}{"error": fmt.Errorf("unsupported protocol: %s", protocol)}
+	}
 	serverName := fmt.Sprintf("http_%d", listenPort)
 	if protocol != "http" {
 		serverName = fmt.Sprintf("tcp_%d", listenPort)
@@ -3762,8 +3895,10 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// A-I1：WAF 发射读取 security_custom_rules 必须与策略预载同 store——
 	// 无 ctx（非批量路径）时传 nil，由 resolvePolicyCustomRules 回退 db.DB。
 	var policyStore caddyConfigStore
+	var scopedCache scopedCRSListCache
 	if ctx != nil {
 		policyStore = ctx.store
+		scopedCache = ctx.scopedListCache
 	}
 	var handleChain []interface{}
 	// F3（v2.2.3）：链首注入 X-LB-Rule-ID——安全事件归因的一等信号（摄入侧优先
@@ -3923,7 +4058,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			// 本策略信任 IP 由预检统一记录(事件去重),他策略信任 IP 照常拦截
 			// (「信任仅豁免所属策略」边界);单策略保持平原形态(预检虽同构存在,
 			// 但策略层自身信任 DetectionOnly 已正确处理,无跨策略信任边界)。
-			wafHandler, err := buildWafHandlerWithPolicy(rule.CaddyID, policy, policyStore, needFingerprint(), len(policies) > 1, blockStatusForPolicy(ctx, rule, policy), effectiveRequestBodyMaxSizeMB, detectionTrust)
+			wafHandler, err := buildWafHandlerWithPolicy(rule.CaddyID, policy, policyStore, needFingerprint(), len(policies) > 1, blockStatusForPolicy(ctx, rule, policy), effectiveRequestBodyMaxSizeMB, detectionTrust, scopedCache)
 			if err != nil {
 				return nil, err
 			}
@@ -4364,6 +4499,14 @@ func (s *CaddyService) refreshIPListProjectionsInLock(store caddyConfigStore) (I
 	if certMaterialized {
 		return ProjectionNeedForce, nil // 字节一致但证书已物化 → 强制重载收敛
 	}
+	// 历史问题-1：Converged 零 /load 收尾同样必须收敛渲染降级状态——降级键经
+	// caddyPayload 剔除、不参与字节比较；调用方 recordCaddyApplyResult(nil)
+	// 仅在 setLastRenderDegradation 已执行时才持久化横幅，漏此步会让「受信代理
+	// 引用名单缺失/损坏」这类渲染降级的审计与横幅在热路径上完全丢失。
+	// 事务视图（未提交）不写主库（避免与写锁争用），交给 commit 后的
+	// recordCaddyApplyResult(nil)；DB 视图直接持久化。
+	_, inTx := store.(*sql.Tx)
+	applyRenderDegradationState(config, !inTx)
 	return ProjectionConverged, nil
 }
 

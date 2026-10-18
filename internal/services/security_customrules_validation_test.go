@@ -47,6 +47,31 @@ func TestBuildCorazaDirectives_passActionKeepsScoreSetvar(t *testing.T) {
 	}
 }
 
+func TestBuildCorazaDirectives_skipsOnlyInvalidScoreOrAction(t *testing.T) {
+	policy := &models.SecurityPolicy{
+		AnomalyThreshold: 5,
+		Mode:             "blocking",
+		CustomRules: json.RawMessage(`[
+			{"id":81,"name":"负分坏规则","enabled":true,"action":"block","score":-5,"conditions":[{"target":"uri","operator":"contains","pattern":"/bad-score"}]},
+			{"id":82,"name":"非法动作坏规则","enabled":true,"action":"evil","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/bad-action"}]},
+			{"id":83,"name":"合法规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/good"}]},
+			{"id":84,"name":"旧版缺省规则","enabled":true,"target":"uri","operator":"contains","pattern":"/legacy"}
+		]`),
+	}
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
+	for _, invalid := range []string{"负分坏规则", "非法动作坏规则", "+-5"} {
+		if strings.Contains(directives, invalid) {
+			t.Fatalf("invalid score/action rule must be skipped (%q):\n%s", invalid, directives)
+		}
+	}
+	for _, valid := range []string{"合法规则", "旧版缺省规则"} {
+		if !strings.Contains(directives, valid) {
+			t.Fatalf("valid sibling %q must still emit:\n%s", valid, directives)
+		}
+	}
+	compileForEngineGate(t, directives)
+}
+
 func TestValidateCustomRuleConditions_rejectsInvalidTarget(t *testing.T) {
 	err := ValidateCustomRuleConditions([]models.CustomRuleCondition{{Target: "cookie", Operator: "contains", Pattern: "x"}})
 	if err == nil || !strings.Contains(err.Error(), "target 无效") {

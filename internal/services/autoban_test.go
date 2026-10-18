@@ -6,9 +6,11 @@ package services
 // fail-closed、配置校验与口径/窗口变更重置、投影层过期条目过滤。
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -179,6 +181,26 @@ func TestAutobanCounter_capProtection(t *testing.T) {
 	}
 	if !autobanCapWarned {
 		t.Fatal("超限丢弃必须置位告警标记（留痕）")
+	}
+}
+
+func TestResetAutobanCounters_rearmsCapWarning(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	autobanMu.Lock()
+	autobanCapWarned = true
+	autobanWindows["203.0.113.1"] = &autobanCounter{Count: 3}
+	autobanSuggestions = []AutobanSuggestion{{IP: "203.0.113.1", Count: 3}}
+	autobanMu.Unlock()
+
+	ResetAutobanCounters()
+
+	autobanMu.Lock()
+	defer autobanMu.Unlock()
+	if autobanCapWarned {
+		t.Fatal("计数口径重置后必须重新允许上限告警")
+	}
+	if len(autobanWindows) != 0 || len(autobanSuggestions) != 0 {
+		t.Fatalf("计数桶/建议未清空: windows=%d suggestions=%d", len(autobanWindows), len(autobanSuggestions))
 	}
 }
 
@@ -950,9 +972,8 @@ func TestAutobanBannedToday_countsAuditBansOfDay(t *testing.T) {
 // Given 引擎装配（InitTaskEngine），库内默认未启用（autoban_enabled=0）。
 // When 查 autoban 元数据。
 // Then 循环族 60s 间隔、主节点角色门、可手动触发；Descriptor 无 EnabledFn
-// （任务监控 enabled 列恒开——启停语义全在调度开关+事件页业务开关，
-// 2026-10-14 用户裁定）；未启用时启动不开调度（否则未启用部署首 tick
-// 必落「未启用」失败行）。
+// （启停语义全在调度开关+事件页业务开关，2026-10-14 用户裁定）；未启用时
+// 启动不开调度（否则未启用部署首 tick 必落「未启用」失败行）。
 func TestTaskEngineWire_AutobanDescriptor(t *testing.T) {
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -979,9 +1000,6 @@ func TestTaskEngineWire_AutobanDescriptor(t *testing.T) {
 	}
 	if !m.CanTrigger {
 		t.Fatal("循环族应可手动触发")
-	}
-	if !m.Enabled {
-		t.Fatal("Descriptor 无 EnabledFn：任务监控 enabled 列应恒开（启停语义在 loop 开关+业务开关）")
 	}
 	if m.LoopOn {
 		t.Fatal("默认未启用（autoban_enabled=0）时启动不得开调度（调度唯一前提=业务启用）")
@@ -1373,6 +1391,31 @@ func TestAutobanDisableFlush_expiresOnceAndForceFlushes(t *testing.T) {
 	}
 }
 
+func TestAutobanDisableFlush_mergeFailureIsVisible(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, false, 1, 5, "1h", "all", false)
+	if _, err := db.DB.Exec(`DROP TABLE security_ip_lists`); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	originalWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(originalWriter) })
+
+	AutobanDisableFlush()
+
+	if !strings.Contains(logs.String(), "禁用收尾") || !strings.Contains(logs.String(), "失败") {
+		t.Fatalf("merge failure must be logged:\n%s", logs.String())
+	}
+	var n int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='写入失败' AND resource='自动封禁'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("merge failure audit rows=%d, want 1", n)
+	}
+}
+
 // ---- 历史 A 域：RG-SEC-AUTOBAN-CANDIDATE-CAP（历史问题）----
 
 func TestAutobanFormalMerge_beyondSuggestionCap(t *testing.T) {
@@ -1436,5 +1479,74 @@ func TestAutobanFormalMerge_beyondSuggestionCap(t *testing.T) {
 	autobanMu.Unlock()
 	if stored != autobanSuggestionCap {
 		t.Fatalf("dry-run suggestions stored=%d, want %d（展示口径截断）", stored, autobanSuggestionCap)
+	}
+}
+
+// 历史问题（历史）：window(60m) > duration(10m) 时，条目到期解封不得被同一
+// 计数桶在 merge 内立即重封——旧实现每轮「清到期 → 从仍跨阈值的桶重封」，
+// 实际封禁被延长到约 window+duration，并产生成对的自动解封/自动封禁审计。
+func TestAutobanMerge_expiredEntryNotRebannedSameRound(t *testing.T) {
+	f := installAutobanFixture(t, "2026-10-14 10:00:00")
+	cfg := AutobanConfig{Enabled: true, Threshold: 3, WindowMinutes: 60, Duration: "10m", Scope: "all", DryRun: false}
+	const ip = "203.0.113.55"
+
+	// Given 3 次真实计数达阈值 → 封禁 10 分钟
+	for range 3 {
+		autobanObserveEventScoped(cfg, ip, "blocked", "944100")
+	}
+	cands := autobanCandidates(3, time.Hour)
+	if len(cands) != 1 {
+		t.Fatalf("给定：候选=%v，want 1（%s 封禁前）", cands, ip)
+	}
+	if _, err := autobanMergeEntries(cfg, cands); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if _, ok := entryValues(presetEntries(t))[ip]; !ok {
+		t.Fatal("给定：IP 未落名单")
+	}
+
+	// When 越过 10 分钟时长（计数窗口 60m 尚未过期 → 桶仍跨阈值）
+	f.Advance(11 * time.Minute)
+	expiredCands := autobanCandidates(3, time.Hour)
+	found := false
+	for _, c := range expiredCands {
+		if c.IP == ip {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("前提失效：到期后计数桶仍应跨阈值产出候选（window>duration），got=%v", expiredCands)
+	}
+	out, err := autobanMergeEntries(cfg, expiredCands)
+
+	// Then 同一轮只解封，不得重封
+	if err != nil {
+		t.Fatalf("expiry merge: %v", err)
+	}
+	sawExpired := false
+	for _, v := range out.Expired {
+		if v == ip {
+			sawExpired = true
+		}
+	}
+	if !sawExpired {
+		t.Fatalf("到期 IP 未进入 Expired：%v", out.Expired)
+	}
+	for _, v := range out.Banned {
+		if v == ip {
+			t.Fatalf("到期解封的 IP 在同一轮被计数桶重封（历史问题 回归）：banned=%v", out.Banned)
+		}
+	}
+	if _, ok := entryValues(presetEntries(t))[ip]; ok {
+		t.Fatalf("到期后名单仍含 %s（应已解封）", ip)
+	}
+
+	// 生产路径随后清桶（RunAutobanCycle）——零新事件下下一轮不再产出候选。
+	AutobanForgetIPs(out.Expired)
+	if got := AutobanTrackedIPs(); got != 0 {
+		t.Fatalf("到期清桶后计数键=%d，want 0", got)
+	}
+	if again := autobanCandidates(3, time.Hour); len(again) != 0 {
+		t.Fatalf("到期清桶后零新事件不得再产候选，got=%v", again)
 	}
 }

@@ -23,7 +23,7 @@ export function normalizeRateLimitBlocks(data: unknown): RateLimitBlocks {
         }))
         .filter((item) => item.host !== '')
     : []
-  const total = Number(raw.total)
+  const total = raw.total === null || raw.total === undefined ? Number.NaN : Number(raw.total)
   return {
     total: Number.isFinite(total) ? total : hosts.reduce((sum, item) => sum + item.count, 0),
     hosts,

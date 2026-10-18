@@ -27,7 +27,7 @@ const tzFormat = (timeZone: string, withTime: boolean): Intl.DateTimeFormat =>
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
-    ...(withTime ? { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false } : {}),
+    ...(withTime ? { hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' as const } : {}),
   })
 
 // 模块级 formatter 缓存（S-01）：Dashboard 每轮询对 60 点 × 2 图表调用 tzFormatter，

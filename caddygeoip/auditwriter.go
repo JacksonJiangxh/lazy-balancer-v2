@@ -55,9 +55,9 @@ import (
 // （coraza GetWriter 大小写不敏感）。
 const auditWriterName = "lbfile"
 
-// auditTimingBurstSweepInterval 限制「条目数超阈值」兜底清扫频率；常规
-// 64 创建周期清扫不受此间隔影响。
-const auditTimingBurstSweepInterval = time.Second
+// auditRequestBodyMaxBytes 限制审计 part C 在快照/队列/格式化链中保留的
+// 原始请求体字节数。截断只影响审计展示，不影响 WAF 已完成的规则评估。
+const auditRequestBodyMaxBytes = 64 * 1024
 
 func init() {
 	plugins.RegisterAuditLogWriter(auditWriterName, func() plugintypes.AuditLogWriter {
@@ -67,8 +67,8 @@ func init() {
 
 // 管线参数（var 供测试收窄）。
 var (
-	// auditQueueSize 有界队列容量：2048 条 × 典型 2-8KB ≈ 上限 16MB 内存，
-	// 打满即请求路径阻塞（零丢弃的退化价，与退役前 serial 同步写同价）。
+	// auditQueueSize 有界队列容量：2048 条 × 典型 2-8KB；part C 另由快照侧
+	// 64KiB 硬限。打满即请求路径阻塞（零丢弃的退化价，与退役前 serial 同步写同价）。
 	auditQueueSize = 2048
 	// auditFlushThreshold bufio 批量刷盘字节数阈值；auditFlushInterval 周期
 	// 兜底（低流量下 bufio 滞留行不超周期）。
@@ -120,18 +120,34 @@ type auditTimingSnapshot struct {
 
 func (s auditTimingSnapshot) hasAny() bool { return s.preSet || s.endSet }
 
+// auditTimingQueueEntry 是建条顺序 FIFO 的元素：id + 建条时刻（携带单调
+// 时钟读数，入队顺序即时间顺序）。
+type auditTimingQueueEntry struct {
+	id      string
+	created time.Time
+}
+
 var (
 	auditTimingMu      sync.Mutex
 	auditTimingEntries = map[string]*auditTimingEntry{}
-	// auditTimingCreateCount 记录创建次数——每 64 次创建触发一次过期清扫
-	// （摊销 O(1)）；size 超限时的额外兜底清扫受时间下限约束。
+	// auditTimingOrder 是建条顺序的 FIFO：清扫只从队首弹出 TTL 已过期条目，
+	// 摊销 O(过期数)。E81-历史问题：旧实现每 64 次建条全表扫描（O(n)，n≈TTL×RPS），
+	// 每次请求摊销 O(n/64) 次 map 迭代且持全局锁 ⇒ CPU 随 RPS² 增长。
+	// 不变量：队列内 created 单调不减（time.Now 的单调读数），且每条目只
+	// 入队一次（id 为进程内唯一随机值，不会重建）。
+	auditTimingOrder []auditTimingQueueEntry
+	// auditTimingHead 是队首游标：已弹出的前缀留在切片里，达到一定规模后
+	// 整体压缩（摊销 O(1)）。
+	auditTimingHead int
+	// auditTimingCreateCount 记录创建次数——每 64 次创建触发一次过期清扫。
 	auditTimingCreateCount int
-	auditTimingSweepMin    = 4096
-	auditTimingLastSweep   time.Time
 	// auditTimingPollCountForTest 轮询总次数（测试观测钉：未知 tid/已终态
 	// 条目/无计时头行必须零轮询立即返回——替代挂钟阈值断言，消除 CI 负载
 	// 抖动假红）。仅 auditTimingWait 轮询步 incr，成本可忽略。
 	auditTimingPollCountForTest atomic.Int64
+	// auditTimingSweepVisitsForTest 清扫检查的队列元素数（E81-历史问题 钉：清扫
+	// 成本必须随「过期条目数」而非注册表规模增长）。
+	auditTimingSweepVisitsForTest atomic.Int64
 )
 
 // auditTimingRecord 写入一个分段计时（µs）。id 为空（计时 ID 生成失败的降级
@@ -146,6 +162,7 @@ func auditTimingRecord(id, segment string, us int64) {
 	if e == nil {
 		e = &auditTimingEntry{created: now}
 		auditTimingEntries[id] = e
+		auditTimingOrder = append(auditTimingOrder, auditTimingQueueEntry{id: id, created: now})
 		auditTimingSweepIfDueLocked(now)
 	}
 	auditTimingMu.Unlock()
@@ -161,37 +178,55 @@ func auditTimingRecord(id, segment string, us int64) {
 
 // auditTimingClose 标记该请求的全部分段已写完（终态）。由链最外层收点
 // （blocked_counter post-next）调用——此刻整个安全链已返回，不会再有分段写点。
-// 条目不存在（极形态：链上无任何分段写点执行）时创建空终态条目——审计 drain
-// 见终态立即注入空快照（无 lb_timing 字段），不等满超时。
+// 条目不存在时直接返回（E81-历史问题）：drain 对未知 tid 首轮即返（AUD-1），
+// close 建条没有收益——它只会给「零分段写点」的请求额外占一个 TTL 条目。
 func auditTimingClose(id string) {
 	if id == "" {
 		return
 	}
-	now := time.Now()
 	auditTimingMu.Lock()
 	e := auditTimingEntries[id]
-	if e == nil {
-		e = &auditTimingEntry{created: now}
-		auditTimingEntries[id] = e
-		// 历史问题（历史）：close 建条路径与 record 共用同一「自增 + 摊销
-		// 清扫」helper——纯 close 流量（无任何分段写点）此前完全不触发清扫，
-		// 过期条目积压到下一次 record 才清。
-		auditTimingSweepIfDueLocked(now)
-	}
 	auditTimingMu.Unlock()
+	if e == nil {
+		return
+	}
 	e.mu.Lock()
 	e.closed = true
 	e.mu.Unlock()
 }
 
 // auditTimingSweepIfDueLocked 建条计数 + 摊销清扫（调用方持 auditTimingMu）。
-// 超阈值兜底最多每秒一次，避免大注册表把每次建条放大成全表 O(n) 扫描。
+// 清扫成本与过期条目数成正比（队首弹出），不再随注册表规模增长。
 func auditTimingSweepIfDueLocked(now time.Time) {
 	auditTimingCreateCount++
-	burstDue := len(auditTimingEntries) > auditTimingSweepMin &&
-		(auditTimingLastSweep.IsZero() || now.Sub(auditTimingLastSweep) >= auditTimingBurstSweepInterval)
-	if auditTimingCreateCount%64 == 0 || burstDue {
+	if auditTimingCreateCount%64 == 0 {
 		auditTimingSweepLocked(now)
+	}
+}
+
+// auditTimingSweepLocked 从队首弹出 TTL 过期条目（调用方持 auditTimingMu）。
+// 队列 created 单调不减 ⇒ 队首未过期即整队未过期。
+func auditTimingSweepLocked(now time.Time) {
+	for auditTimingHead < len(auditTimingOrder) {
+		item := auditTimingOrder[auditTimingHead]
+		auditTimingSweepVisitsForTest.Add(1)
+		if now.Sub(item.created) <= auditTimingEntryTTL {
+			break
+		}
+		if e, ok := auditTimingEntries[item.id]; ok && e.created.Equal(item.created) {
+			// drain 可能已经取出条目指针并正在等待 closed。删除前先置终态，
+			// 否则后续 close 查表必 miss，等待方只能逐行轮询到超时。
+			e.mu.Lock()
+			e.closed = true
+			e.mu.Unlock()
+			delete(auditTimingEntries, item.id)
+		}
+		auditTimingHead++
+	}
+	// 已弹出前缀达到半量时压缩，避免 backing array 无界增长（摊销 O(1)）。
+	if auditTimingHead >= 1024 && auditTimingHead*2 >= len(auditTimingOrder) {
+		auditTimingOrder = append(auditTimingOrder[:0], auditTimingOrder[auditTimingHead:]...)
+		auditTimingHead = 0
 	}
 }
 
@@ -237,16 +272,6 @@ func auditTimingWait(id string, timeout time.Duration) auditTimingSnapshot {
 		}
 		auditTimingPollCountForTest.Add(1)
 		time.Sleep(auditTimingPollStep)
-	}
-}
-
-// auditTimingSweepLocked 清扫超龄条目（调用方持 auditTimingMu）。
-func auditTimingSweepLocked(now time.Time) {
-	auditTimingLastSweep = now
-	for id, e := range auditTimingEntries {
-		if now.Sub(e.created) > auditTimingEntryTTL {
-			delete(auditTimingEntries, id)
-		}
 	}
 }
 
@@ -436,10 +461,16 @@ func (t *auditSnapshotTransaction) IsInterrupted() bool {
 }
 
 // auditSnapshotRequest 实现 plugintypes.AuditLogTransactionRequest。嵌入原始请求
-// 接口仅为提升 Args()——其返回类型是 coraza 内部 collections.ConcatKeyed，外部
-// 包无法命名实现；其余访问器全部走本快照（影子方法遮蔽提升方法）。Args() 仅
-// OCSF 格式化器消费（本项目固定 JSON 渲染，JSON 输出经下方标签字段与内置
-// 格式化器一致：args 恒 {} 空对象）；其视图随 tx.Close 失效为空读，不产错误数据。
+// 接口仅为提升 Args()——其返回类型是 coraza internal 包（collections.ConcatKeyed），
+// 外部包无法命名实现；其余访问器全部走本快照（影子方法遮蔽提升方法）。Args() 仅
+// OCSF/自定义格式化器消费（本项目固定 JSON 渲染，JSON 输出经下方标签字段与内置
+// 格式化器一致：args 恒 {} 空对象）。
+//
+// E81-历史问题：嵌入值不是事务活对象，而是 frozenArgsRequest(req) 返回的同动态类型
+// typed-nil 指针——只保留 Args() 的接口契约，不引用事务变量集合。旧实现嵌入 live
+// 请求，注释声称「tx.Close 后为空读」与 coraza 实现不符（ConcatKeyed 持有事务
+// argsGet/argsPost 的长期引用，tx 回池复用后 Args() 会读到下一请求的参数，而
+// drain 侧格式化恒晚于 tx.Close）。
 type auditSnapshotRequest struct {
 	plugintypes.AuditLogTransactionRequest `json:"-"`
 	Method_                                string                                        `json:"method"`
@@ -448,6 +479,7 @@ type auditSnapshotRequest struct {
 	HTTPVersion_                           string                                        `json:"http_version"`
 	Headers_                               map[string][]string                           `json:"headers"`
 	Body_                                  string                                        `json:"body"`
+	BodyTruncated_                         bool                                          `json:"body_truncated,omitempty"`
 	Files_                                 []plugintypes.AuditLogTransactionRequestFiles `json:"files"`
 	ArgsStub                               struct{}                                      `json:"args"`
 	Length_                                int32                                         `json:"length"`
@@ -621,6 +653,15 @@ var (
 	_ plugintypes.AuditLogTransactionProducer     = (*auditSnapshotProducer)(nil)
 )
 
+// snapshotAuditRequestBody 对 part C 做字节级硬截断。超长前缀必须 Clone：
+// 直接切片会让快照继续持有原始大 string 的整个 backing array，失去内存上限意义。
+func snapshotAuditRequestBody(body string) (string, bool) {
+	if len(body) <= auditRequestBodyMaxBytes {
+		return body, false
+	}
+	return strings.Clone(body[:auditRequestBodyMaxBytes]), true
+}
+
 // snapshotAuditLog 把 live AuditLog 拷贝为自持快照。接口 nil 检查穿透 typed-nil
 // （coraza 的 Response()/Producer() 返回 typed-nil 指针——接口非 nil 但底层为
 // nil，按缺失处理保持 JSON 信封一致：response/producer omitempty）。
@@ -647,14 +688,16 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 		IsInterrupted_:   tx.IsInterrupted(),
 	}
 	if req := tx.Request(); !isNilInterface(req) {
+		body, bodyTruncated := snapshotAuditRequestBody(req.Body())
 		r := &auditSnapshotRequest{
-			Method_:      req.Method(),
-			Protocol_:    req.Protocol(),
-			URI_:         req.URI(),
-			HTTPVersion_: req.HTTPVersion(),
-			Body_:        req.Body(),
-			Length_:      req.Length(),
-			ArgsStub:     struct{}{},
+			Method_:        req.Method(),
+			Protocol_:      req.Protocol(),
+			URI_:           req.URI(),
+			HTTPVersion_:   req.HTTPVersion(),
+			Body_:          body,
+			BodyTruncated_: bodyTruncated,
+			Length_:        req.Length(),
+			ArgsStub:       struct{}{},
 		}
 		if hs := req.Headers(); hs != nil {
 			r.Headers_ = make(map[string][]string, len(hs))
@@ -665,7 +708,7 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 		for _, f := range req.Files() {
 			r.Files_ = append(r.Files_, auditSnapshotFile{Name_: f.Name(), Size_: f.Size(), Mime_: f.Mime()})
 		}
-		r.AuditLogTransactionRequest = req
+		r.AuditLogTransactionRequest = frozenArgsRequest(req)
 		t.Request_ = r
 	}
 	if resp := tx.Response(); !isNilInterface(resp) {
@@ -696,6 +739,53 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 		t.Producer_ = p
 	}
 	return t
+}
+
+// frozenArgsRequest 返回不再引用 coraza 事务活对象的请求接口值，仅用于满足
+// AuditLogTransactionRequest 的 Args() 方法（返回类型不可命名，外部包只能经
+// 接口提升实现）。做法：取该请求动态类型的零值（typed-nil 指针）——coraza 的
+// *auditlog.TransactionRequest.Args() 在 nil 接收者上返回全新的空 ConcatKeyed
+// （internal/auditlog/auditlog.go，nil 分支），因此任何迟到的 Args() 读取得到
+// 「空」而不是复用事务里下一请求的参数。
+//
+// 保守回退：动态类型非指针、类型断言失败，或零值上 Args() panic/返回 nil 时，
+// 返回原接口（行为与修复前一致）。coraza 当前形态恒走冻结分支。
+func frozenArgsRequest(req plugintypes.AuditLogTransactionRequest) plugintypes.AuditLogTransactionRequest {
+	t := reflect.TypeOf(req)
+	if t == nil || t.Kind() != reflect.Pointer {
+		return req
+	}
+	frozen, ok := reflect.Zero(t).Interface().(plugintypes.AuditLogTransactionRequest)
+	if !ok {
+		return req
+	}
+	if !argsNilSafe(t, frozen) {
+		return req
+	}
+	return frozen
+}
+
+// frozenArgsSafety 缓存「该动态类型零值上 Args() 是否安全」的探测结果——
+// 探测会分配一个空集合，按类型缓存一次即可（审计行构建在请求路径上）。
+var frozenArgsSafety sync.Map // reflect.Type → bool
+
+// argsNilSafe 探测零值请求上的 Args() 是否安全返回非 nil（nil 接收者实现）。
+// 返回值类型是 coraza internal 类型，只能以 any 承接；仅做 nil 判定。
+func argsNilSafe(t reflect.Type, req plugintypes.AuditLogTransactionRequest) bool {
+	if cached, ok := frozenArgsSafety.Load(t); ok {
+		return cached.(bool)
+	}
+	safe := func() (safe bool) {
+		defer func() {
+			if recover() != nil {
+				safe = false
+			}
+		}()
+		args := req.Args()
+		return args != nil
+	}()
+	frozenArgsSafety.Store(t, safe)
+	return safe
 }
 
 // isNilInterface 判定接口值为 nil 或持 typed-nil 指针。

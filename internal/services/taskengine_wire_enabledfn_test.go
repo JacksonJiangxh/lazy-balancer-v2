@@ -3,7 +3,7 @@ package services
 // TASK-2（历史）：wire EnabledFn 读库失败方向统一 fail-closed——
 // crs/ip2region 曾 err→true（读库失败显示「启用」，实际调度面读不到开关
 // 状态）；auto-backup 曾 err!=nil||enabled（同向 fail-open）。读错时应
-// 显示「已停止」（Enabled=false），与 threat 既有 fail-closed 口径一致。
+// 显示「已停止」（LoopOn=false），与 threat 既有 fail-closed 口径一致。
 
 import (
 	"context"
@@ -52,18 +52,22 @@ func swapBrokenDB(t *testing.T) {
 
 func enabledOf(t *testing.T, te *taskengine.Engine, id string) bool {
 	t.Helper()
+	// 元数据不再为展示冗余求值 EnabledFn；按生产写侧同一入口把业务
+	// 开关对齐到真实调度，再断言 LoopOn。
+	SyncBusinessTaskDrivers()
 	m, ok := te.Lookup(id)
 	if !ok {
 		t.Fatalf("task %s 未注册", id)
 	}
-	return m.Enabled
+	return m.LoopOn
 }
 
 // B1-8（历史）：wire Fn 闭包族 db.DB 直读无 nil 守卫（生产不可达——引擎
 // wire 晚于 db.Initialize；测试/降级形态可触达）。EnabledFn/NextSlotFn/StatusFn
-// 读 nil 库必须 fail-closed（Enabled=false/零值槽/空状态），不得 panic——
-// Lookup 驱动四族全部 Fn（含 threat 委托的 ThreatAutoUpdateEnabled 与
-// auto-backup 委托的 loadAutoBackupSettings）。
+// 读 nil 库必须 fail-closed（LoopOn=false/零值槽/空状态），不得 panic——
+// SyncBusinessTaskDrivers 对齐四族业务门，Lookup 同时驱动槽/状态闭包（含
+// threat 委托的 ThreatAutoUpdateEnabled 与 auto-backup 委托的
+// loadAutoBackupSettings）。
 func TestTaskEngineWire_nilDBFnsFailClosedEverywhere(t *testing.T) {
 	te := newWireTestEngine(t)
 	orig := db.DB
@@ -71,40 +75,40 @@ func TestTaskEngineWire_nilDBFnsFailClosedEverywhere(t *testing.T) {
 	t.Cleanup(func() { db.DB = orig })
 	for _, id := range []string{"threat", "crs", "ip2region", "auto-backup"} {
 		if enabledOf(t, te, id) {
-			t.Fatalf("%s Fn 族读 nil 库应 fail-closed（Enabled=false），得到 true", id)
+			t.Fatalf("%s Fn 族读 nil 库应 fail-closed（LoopOn=false），得到 true", id)
 		}
 	}
 }
 
 // Given crs EnabledFn 的 DB 读失败。
 // When 查询任务元数据。
-// Then Enabled=false（状态列「已停止」）——读库失败不得误报启用（fail-closed）。
+// Then LoopOn=false（状态列「已停止」）——读库失败不得误报启用（fail-closed）。
 func TestTaskEngineWire_CRSEnabledFnFailsClosedOnDBError(t *testing.T) {
 	te := newWireTestEngine(t)
 	swapBrokenDB(t)
 	if enabledOf(t, te, "crs") {
-		t.Fatal("crs EnabledFn 读库失败应 fail-closed（Enabled=false/已停止），得到 true")
+		t.Fatal("crs EnabledFn 读库失败应 fail-closed（LoopOn=false/已停止），得到 true")
 	}
 }
 
 // Given ip2region EnabledFn 的 DB 读失败。
 // When 查询任务元数据。
-// Then Enabled=false（fail-closed，与 crs/threat 同口径）。
+// Then LoopOn=false（fail-closed，与 crs/threat 同口径）。
 func TestTaskEngineWire_IP2RegionEnabledFnFailsClosedOnDBError(t *testing.T) {
 	te := newWireTestEngine(t)
 	swapBrokenDB(t)
 	if enabledOf(t, te, "ip2region") {
-		t.Fatal("ip2region EnabledFn 读库失败应 fail-closed（Enabled=false/已停止），得到 true")
+		t.Fatal("ip2region EnabledFn 读库失败应 fail-closed（LoopOn=false/已停止），得到 true")
 	}
 }
 
 // Given auto-backup loadAutoBackupSettings 读失败。
 // When 查询任务元数据。
-// Then Enabled=false（fail-closed）——曾 err!=nil||enabled 把读错当启用。
+// Then LoopOn=false（fail-closed）——曾 err!=nil||enabled 把读错当启用。
 func TestTaskEngineWire_AutoBackupEnabledFnFailsClosedOnDBError(t *testing.T) {
 	te := newWireTestEngine(t)
 	swapBrokenDB(t)
 	if enabledOf(t, te, "auto-backup") {
-		t.Fatal("auto-backup EnabledFn 读库失败应 fail-closed（Enabled=false/已停止），得到 true")
+		t.Fatal("auto-backup EnabledFn 读库失败应 fail-closed（LoopOn=false/已停止），得到 true")
 	}
 }

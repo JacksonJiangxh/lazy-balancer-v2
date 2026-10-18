@@ -138,7 +138,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 
 		if i.RequireRecursiveDNS {
 			if !i.checkRecursiveDNS(ctx, ci.tokenFQDN, keyAuth) {
-				return "", "", fmt.Errorf("recursive DNS propagation failed for %s: record not visible on public resolvers", ci.tokenFQDN)
+				return "", "", recursiveDNSCheckError(ctx, ci.tokenFQDN)
 			}
 			log("dns_propagated", fmt.Sprintf("递归 DNS 已传播 %s", ci.tokenFQDN))
 		}
@@ -351,7 +351,10 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 		tickerIterations++
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("等待 CA 验证超时 (challenge: %s, 授权: %s)", lastChalStatus, lastAuthStatus)
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return fmt.Errorf("等待 CA 验证取消 (challenge: %s, 授权: %s): %w", lastChalStatus, lastAuthStatus, ctx.Err())
+			}
+			return fmt.Errorf("等待 CA 验证超时 (challenge: %s, 授权: %s): %w", lastChalStatus, lastAuthStatus, ctx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -509,13 +512,17 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 
 		select {
 		case <-ctx.Done():
-			if len(lastFound) > 0 {
-				return fmt.Errorf("dns propagation timeout for %s: expected %s, last found %s (via %s); authoritative=%s recursive=%s(命中:%s)",
-					fqdn, expected, strings.Join(lastFound, "; "), lastResolver,
-					orNone(initialAuthServers), strings.Join(resolvers, ","), orNone(lastRecursiveHits))
+			outcome := "timeout"
+			if errors.Is(ctx.Err(), context.Canceled) {
+				outcome = "canceled"
 			}
-			return fmt.Errorf("dns propagation timeout for %s: expected %s, no TXT record found from any resolver; authoritative=%s recursive=%s(命中:%s)",
-				fqdn, expected, orNone(initialAuthServers), strings.Join(resolvers, ","), orNone(lastRecursiveHits))
+			if len(lastFound) > 0 {
+				return fmt.Errorf("dns propagation %s for %s: expected %s, last found %s (via %s); authoritative=%s recursive=%s(命中:%s): %w",
+					outcome, fqdn, expected, strings.Join(lastFound, "; "), lastResolver,
+					orNone(initialAuthServers), strings.Join(resolvers, ","), orNone(lastRecursiveHits), ctx.Err())
+			}
+			return fmt.Errorf("dns propagation %s for %s: expected %s, no TXT record found from any resolver; authoritative=%s recursive=%s(命中:%s): %w",
+				outcome, fqdn, expected, orNone(initialAuthServers), strings.Join(resolvers, ","), orNone(lastRecursiveHits), ctx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -576,6 +583,20 @@ var (
 	// 「5+2+15min < 30min」算式漏计就绪/finalize/有效三段且外层值错误。
 	recursiveDNSDeadline = 120 * time.Second
 )
+
+// recursiveDNSCheckError 区分父上下文取消/截止与独立递归预算用尽。
+// checkRecursiveDNS 的 bool 只表达是否命中；调用侧必须保留 ctx.Err() 链，
+// 避免服务停止/用户取消被误报为公共递归传播失败。
+func recursiveDNSCheckError(ctx context.Context, fqdn string) error {
+	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		return fmt.Errorf("recursive DNS propagation canceled for %s: %w", fqdn, ctx.Err())
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return fmt.Errorf("recursive DNS propagation timeout for %s: %w", fqdn, ctx.Err())
+	default:
+		return fmt.Errorf("recursive DNS propagation failed for %s: record not visible on public resolvers", fqdn)
+	}
+}
 
 // checkRecursiveDNS 是 RequireRecursiveDNS（ZeroSSL）路径的递归可见性二次确认，
 // 语义**刻意弱于** waitForDNS 的递归共识放行，两者分层不得合并（历史问题，历史）：

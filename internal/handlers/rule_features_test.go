@@ -613,6 +613,7 @@ func TestCreateRule_resolves_default_CA_provider_for_ACME(t *testing.T) {
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)

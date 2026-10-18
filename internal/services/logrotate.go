@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 var runtimeLogSizeMB atomic.Int64
@@ -344,7 +345,8 @@ func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 				continue
 			}
 		}
-		if os.Remove(f.path) == nil {
+		removed, err := taskengine.RemoveTaskLogIfModifiedBefore(f.path, cutoff)
+		if err == nil && removed {
 			result.Deleted = append(result.Deleted, f.name)
 		}
 	}

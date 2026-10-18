@@ -592,7 +592,7 @@
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { Aim, Filter, List, Location, Lock, Search, Notebook, Plus, WarningFilled, Link } from '@element-plus/icons-vue'
 import { formatDate, parseDbTimeMs } from '@/utils/date'
-import { compareVersion, IP_LIST_CATEGORIES} from '@/utils/securityStages'
+import { compareVersion, IP_LIST_CATEGORIES, invalidateSharedEntriesCache } from '@/utils/securityStages'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import RuleLibScheduleEditor from '@/components/RuleLibScheduleEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
@@ -617,7 +617,6 @@ interface ThreatSource {
 }
 const threatSources = ref<ThreatSource[]>([])
 const threatAutoUpdate = ref(true)
-const threatMergedCount = ref(0)
 const threatSchedule = ref({ days: [1, 2, 3, 4, 5, 6, 7] as number[], time: '04:00' })
 
 const fetchThreatLib = async () => {
@@ -625,7 +624,6 @@ const fetchThreatLib = async () => {
     const res = await request.get<APIResponse<{ sources: ThreatSource[]; total_entries: number; auto_update?: boolean; schedule_days?: number[]; schedule_time?: string }>>('/security/threat-lib')
     if (res.data) {
       threatSources.value = res.data.sources
-      threatMergedCount.value = res.data.total_entries
       threatAutoUpdate.value = res.data.auto_update !== false
       if (res.data.schedule_days?.length) threatSchedule.value = { days: res.data.schedule_days, time: res.data.schedule_time || '04:00' }
     }
@@ -1169,6 +1167,9 @@ const saveIpList = async () => {
     const res = editingIpListId.value
       ? await request.put(`/security/ip-lists/${editingIpListId.value}`, body)
       : await request.post('/security/ip-lists', body)
+    // 历史问题-03：名单直编是共享条目缓存的另一写入口（此前仅 IPLocationAction
+    // 失效缓存）——不失效时策略向导/处置弹层会继续读旧条目。
+    invalidateSharedEntriesCache()
     showSaveResult(res, '保存成功'); ipListDialogVisible.value = false; fetchIpLists()
   } catch (error: unknown) {
     // 409 重名 / 400 条目非法等已由全局拦截器 toast，这里仅记录避免 unhandled rejection
@@ -1186,6 +1187,8 @@ const deleteIpList = (row: IPListRow) => {
     .then(async () => {
       // 被策略引用时后端返回 409（含引用策略名的 message 由全局拦截器 toast）
       const del = await request.delete(`/security/ip-lists/${row.id}`)
+      // 删除同样使条目缓存失效（历史问题-03）。
+      invalidateSharedEntriesCache()
       showSaveResult(del, '已删除'); fetchIpLists()
     }).catch(() => { /* 用户取消:不动列表;HTTP 失败已由全局拦截器 toast */ })
     .finally(() => { deletingIpListId.value = null })

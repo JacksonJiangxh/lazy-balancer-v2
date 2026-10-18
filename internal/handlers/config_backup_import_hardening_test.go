@@ -487,9 +487,10 @@ func TestValidateV2BackupRuntimeSettings_securityEventRetentionBounds(t *testing
 		{name: "negative row cap", key: "security_events_row_cap", value: -1, wantErr: true},
 		{name: "excess row cap", key: "security_events_row_cap", value: 100000001, wantErr: true},
 		{name: "non numeric row cap", key: "security_events_row_cap", value: "abc", wantErr: true},
-		{name: "automatic retention", key: "security_events_retention_days", value: 0},
+		// 历史问题-5（历史裁定）：0=自动旧语义废除，导入按显式默认归一（见下个测试）。
+		{name: "legacy zero retention normalized", key: "security_events_retention_days", value: 0},
 		{name: "maximum retention", key: "security_events_retention_days", value: 3650},
-		{name: "automatic row cap", key: "security_events_row_cap", value: 0},
+		{name: "legacy zero row cap normalized", key: "security_events_row_cap", value: 0},
 		{name: "maximum row cap", key: "security_events_row_cap", value: 100000000},
 	}
 	for _, tt := range tests {
@@ -500,6 +501,24 @@ func TestValidateV2BackupRuntimeSettings_securityEventRetentionBounds(t *testing
 				t.Fatalf("validation error=%v, wantErr=%v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// 历史问题-5（历史裁定）：导入的 0（旧「自动」语义）归一为显式默认
+// 90 天 / 1,000,000 行；写侧随后只接受 1..max。
+func TestValidateV2BackupRuntimeSettings_zeroRetentionNormalizedToDefaults(t *testing.T) {
+	config := map[string]any{
+		"security_events_retention_days": 0,
+		"security_events_row_cap":        0,
+	}
+	if err := validateV2BackupRuntimeSettings(config, nil); err != nil {
+		t.Fatalf("zero retention must be normalized, got err=%v", err)
+	}
+	if got := config["security_events_retention_days"]; got != int64(90) {
+		t.Fatalf("retention=%v (%T), want 90", got, got)
+	}
+	if got := config["security_events_row_cap"]; got != int64(1000000) {
+		t.Fatalf("row_cap=%v (%T), want 1000000", got, got)
 	}
 }
 

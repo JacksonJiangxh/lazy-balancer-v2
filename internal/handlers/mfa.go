@@ -96,7 +96,13 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 	// 落败/过期窗口在此 401，不触碰凭证）；旧顺序先验码，恢复码「提交即消费」
 	// 会在「挑战已被使用」路径白烧。验码失败归还挑战（错误码不烧挑战，同 token
 	// 可重试；失败计数由 MFARecordChallengeFailure 负责，达阈值仍作废）。
-	if !services.MFAConsumeChallenge(req.MFAToken, userID) {
+	consumed, consumeErr := services.MFAConsumeChallenge(req.MFAToken, userID)
+	if consumeErr != nil {
+		services.RecordAuditLog(user.Username, "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "挑战消费服务故障"), c.ClientIP())
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 验证服务暂时不可用，请稍后重试"})
+		return
+	}
+	if !consumed {
 		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "MFA 挑战已被使用，请重新登录"})
 		return
 	}
@@ -193,6 +199,7 @@ func (h *Handlers) MFASetup(c *gin.Context) {
 		// 历史问题(历史问题 同形对齐):守卫验码放行路径跳过本层验码(同 MFADisable)。
 		if !mfaStepUpVerifiedInContext(c) {
 			if ok, verr := services.MFAVerifyTOTPCode(userID, req.Code, time.Now()); !ok {
+				recordAudit(c, "认证拒绝", "用户认证", services.FormatAuditDetail("重绑 MFA 前验证失败", services.AuditResultPart("failure")))
 				msg := "验证码错误"
 				if verr != nil {
 					msg = verr.Error()
@@ -240,7 +247,11 @@ func (h *Handlers) MFAActivate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求格式错误"})
 		return
 	}
-	if ok, _ := services.MFAVerifyPending(userID, req.Code, time.Now()); !ok {
+	if ok, verr := services.MFAVerifyPending(userID, req.Code, time.Now()); !ok {
+		if verr != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 验证服务暂时不可用，请稍后重试"})
+			return
+		}
 		// 历史问题 A-历史问题：pending 码失败计数——VerifyPending 无锁定无限流（loginRateLimit
 		// 只挂公开路由），持会话者可对 10^6 码空间暴力；5 次失败作废 pending（重新
 		// setup 才能再试），与挑战级计数同为与全局开关无关的硬闸。

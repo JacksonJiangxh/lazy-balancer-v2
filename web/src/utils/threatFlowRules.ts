@@ -48,9 +48,88 @@ export function shouldAggregate(count: number): boolean {
   return count > FLOW_AGGREGATE_THRESHOLD
 }
 
-/** 后端采样契约：-1=自适应、0=关闭、1=全量、2-64=固定 1/N。 */
+/**
+ * 后端采样契约（2026-10-18 用户裁定）：-1=自适应、0=关闭逐请求光流、1=全量。
+ * 固定 1/N（2-64）档已退役——存量/外来值一律按自适应归一。
+ */
 export function normalizeTrafficSampleN(value: number | null | undefined): number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= -1 && value <= 64 ? value : -1
+  return value === -1 || value === 0 || value === 1 ? value : -1
+}
+
+/** 序号回退或采集关闭表示租约/事件缓冲区已重置；下轮必须从 0 重新追赶。 */
+export function nextFlowCursor(previous: number, data: { enabled?: boolean; next_seq?: number }): number {
+  if (!data.enabled) return 0
+  if (typeof data.next_seq === 'number' && data.next_seq < previous) return 0
+  return typeof data.next_seq === 'number' ? data.next_seq : previous
+}
+
+/** 自适应档位：全量 / 1/4 / 1/8（1/N 的 N）。 */
+export const ADAPTIVE_SAMPLE_TIERS = [1, 4, 8] as const
+
+/**
+ * 自适应切换阈值（事件/秒，用服务端 sample_n 还原后的真实速率）：
+ * 1→4 高于 180、4→1 低于 120；4→8 高于 720、8→4 低于 480。
+ * 上下阈值留滞回带，避免在边界附近来回抖动。
+ */
+export const ADAPTIVE_SAMPLE_THRESHOLDS = {
+  upTo4: 180,
+  downTo1: 120,
+  upTo8: 720,
+  downTo4: 480,
+} as const
+
+/** 连续多少次采样同向才允许换档（配合 1s 轮询）。 */
+export const ADAPTIVE_SAMPLE_CONFIRM_SAMPLES = 2
+/** 两次换档之间的最小间隔（毫秒）。 */
+export const ADAPTIVE_SAMPLE_MIN_SWITCH_INTERVAL_MS = 4000
+
+/** 用服务端回报的采样因子还原真实事件速率（events 已被按 sample_n 缩小）。 */
+export function reconstructObservedRate(eventCount: number, sampleN: number, fallbackSampleN = 1): number {
+  const factor = sampleN > 0 ? sampleN : fallbackSampleN > 0 ? fallbackSampleN : 1
+  return eventCount * factor
+}
+
+/** 自适应目标档位（含滞回带）：仅返回 1/4/8。 */
+export function nextAdaptiveSampleN(current: number, observedRate: number): number {
+  if (current === 8) return observedRate < ADAPTIVE_SAMPLE_THRESHOLDS.downTo4 ? 4 : 8
+  if (current === 4) {
+    if (observedRate > ADAPTIVE_SAMPLE_THRESHOLDS.upTo8) return 8
+    if (observedRate < ADAPTIVE_SAMPLE_THRESHOLDS.downTo1) return 1
+    return 4
+  }
+  return observedRate > ADAPTIVE_SAMPLE_THRESHOLDS.upTo4 ? 4 : 1
+}
+
+export interface AdaptiveSampleState {
+  /** 当前生效档位（1/4/8） */
+  active: number
+  /** 已连续确认的同向采样次数 */
+  stable: number
+  /** 上次换档时刻（ms；0=尚未换过档） */
+  lastSwitch: number
+}
+
+export interface AdaptiveSampleOutcome extends AdaptiveSampleState {
+  changed: boolean
+}
+
+/**
+ * 自适应采样单步状态机：连续 2 次采样同向且距上次换档 ≥4s 才换档。
+ * 目标与当前一致时清空确认计数（但保留上次换档时刻——回摆同样受 4s 门约束）。
+ */
+export function stepAdaptiveSample(state: AdaptiveSampleState, observedRate: number, now: number): AdaptiveSampleOutcome {
+  if (state.active !== 1 && state.active !== 4 && state.active !== 8) {
+    return { ...state, changed: false }
+  }
+  const target = nextAdaptiveSampleN(state.active, observedRate)
+  if (target === state.active) {
+    return { active: state.active, stable: 0, lastSwitch: state.lastSwitch, changed: false }
+  }
+  const stable = state.stable + 1
+  if (stable >= ADAPTIVE_SAMPLE_CONFIRM_SAMPLES && now - state.lastSwitch >= ADAPTIVE_SAMPLE_MIN_SWITCH_INTERVAL_MS) {
+    return { active: target, stable: 0, lastSwitch: now, changed: true }
+  }
+  return { active: state.active, stable, lastSwitch: state.lastSwitch, changed: false }
 }
 
 /** 按 region + 秒桶分组；保持输入顺序，供光流和弹框共同消费。 */

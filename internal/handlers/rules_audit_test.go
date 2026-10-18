@@ -329,6 +329,7 @@ func TestEnableRule_restores_cert_job_fields_when_requeue_fails(t *testing.T) {
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
 	services.GetCAQueueManager().Stop()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	router := gin.New()
@@ -419,6 +420,7 @@ func TestUpdateRule_reissues_when_default_CA_differs_from_latest_job_provider(t 
 	t.Cleanup(func() { testServicesCertDir = oldCertDir })
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	oldCreate := createOrRequeueCertJob
 	enqueuedProvider := make(chan int, 1)
@@ -460,6 +462,7 @@ func TestDeleteRule_returns_timeout_and_preserves_rule_when_worker_does_not_exit
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	services.GetCAQueueManager().PauseAndDrain()
 	oldTimeout := cancelRuleJobsTimeout
@@ -515,6 +518,9 @@ func TestDeleteRule_returns_timeout_and_preserves_rule_when_worker_does_not_exit
 	deadline = time.Now().Add(2 * time.Second)
 	for services.GetCAQueueManager().IsRuleBlocked("lb_delete_timeout") && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
+	}
+	if services.GetCAQueueManager().IsRuleBlocked("lb_delete_timeout") {
+		t.Fatal("rule block lease was not released after cancellation compensation")
 	}
 }
 
@@ -1073,6 +1079,7 @@ func TestUpdateRule_cancels_job_before_restore_when_create_returns_jobID_and_err
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	oldCreate := createOrRequeueCertJob
 	oldCancel := cancelCertJob
@@ -1130,6 +1137,7 @@ func TestUpdateRule_migrates_cert_job_domain_inplace(t *testing.T) {
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
@@ -1506,6 +1514,7 @@ func TestDeleteRule_returnsConflictWhenWorkerRunning(t *testing.T) {
 	seedAuditRule(t, "lb_del_running", "running", "running.example.test", 8081, true, "acme_dns", true)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	services.GetCAQueueManager().MarkJobRunningForTest("lb_del_running", 901)
 	router := gin.New()
@@ -1532,6 +1541,7 @@ func TestDisableRule_returnsConflictWhenWorkerRunning(t *testing.T) {
 	seedAuditRule(t, "lb_dis_running", "disrunning", "disrunning.example.test", 8082, true, "acme_dns", true)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	services.GetCAQueueManager().MarkJobRunningForTest("lb_dis_running", 902)
 	router := gin.New()
@@ -1558,6 +1568,7 @@ func TestDeleteRule_queuedOnlyJobIsNotBlocked(t *testing.T) {
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	router := gin.New()
 	router.DELETE("/rules/:caddy_id", handler.DeleteRule)
@@ -2025,6 +2036,7 @@ func TestRuleCertCancellation_releasesCaddyOpLock(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			services.ResetCAQueueManagerForTest()
 			services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+			services.GetCAQueueManager().Start()
 			t.Cleanup(services.ResetCAQueueManagerForTest)
 			handler, router, request, label := tt.setup(t)
 			entered := make(chan struct{}, 1)

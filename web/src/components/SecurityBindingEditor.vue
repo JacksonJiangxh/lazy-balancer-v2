@@ -161,6 +161,8 @@ import {
   POLICY_TYPE_SHORT_LABELS,
   inferPolicyType,
   resolveStageOverride,
+  chunkForBulk,
+  SECURITY_BULK_LIMITS,
 } from '@/utils/securityStages'
 import type {
   SecurityPolicyType,
@@ -413,7 +415,15 @@ const submit = async (): Promise<void> => {
   }
   saving.value = true
   try {
-    const res = await request.post<APIResponse>(`/security/policies/${pid}/bindings/bulk`, { bind: toBind, unbind: toUnbind })
+    // 历史问题-06：bulk 端点单次 bind+unbind 合计 ≤100——按方向分片提交（每片 ≤100
+    // 天然满足合计上限）；端点幂等，部分失败后重试安全。
+    let res: APIResponse<unknown> | undefined
+    for (const ids of chunkForBulk(toBind, SECURITY_BULK_LIMITS.policyBindings)) {
+      res = await request.post<APIResponse>(`/security/policies/${pid}/bindings/bulk`, { bind: ids, unbind: [] })
+    }
+    for (const ids of chunkForBulk(toUnbind, SECURITY_BULK_LIMITS.policyBindings)) {
+      res = await request.post<APIResponse>(`/security/policies/${pid}/bindings/bulk`, { bind: [], unbind: ids })
+    }
     showSaveResult(res, `已更新 ${toBind.length + toUnbind.length} 条规则的绑定`)
     emit('update:modelValue', false)
     emit('saved')

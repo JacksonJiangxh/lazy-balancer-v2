@@ -198,6 +198,12 @@ var readOnlyWriteRoutes = map[string]struct{}{
 	// 仅记审计不落库配置),只读 API Key 放行。
 	"POST /api/v1/settings/oidc/test": {},
 	"POST /api/v1/rules/cert-info":    {},
+	// 历史问题-04（历史）：大屏流量/逐请求光流采集租约是**纯本机内存**
+	// 开关（无 DB 写、无集群同步副作用），却被只读守卫按写方法拦截——只读
+	// 用户/从节点的大屏流量卡片永远为空且前端静默吞 403。与 GET 同属读展示
+	// 能力，三守卫（apiKeyReadOnlyGuard/mfaStepUpGuard/readOnlyGuard）放行。
+	"POST /api/v1/security/overview/threat-screen/collector":   {},
+	"DELETE /api/v1/security/overview/threat-screen/collector": {},
 }
 
 func ClassifyAuditRoute(method, path string) AuditPolicy {

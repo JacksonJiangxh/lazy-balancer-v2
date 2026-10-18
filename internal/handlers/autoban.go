@@ -99,13 +99,18 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 		"banned_today":    services.AutobanBannedToday(),
 		"list_entries":    len(services.AutobanActiveEntries(entries)),
 		"list_referenced": h.autobanListReferenced(),
-		"tracked_ips":     services.AutobanTrackedIPs(),
-		"suggestions":     suggestions,
-		"is_master":       isMaster,
-		"role":            map[bool]string{true: "master", false: "slave"}[isMaster],
-		"running":         false,
-		"last_run":        "",
-		"last_status":     "",
+		// 历史问题-02：黄条真正需要的是「封禁是否生效」——名单被 deny + IP 访问
+		// 控制启用的策略引用且名单非空才生效；list_referenced 复用热路径资格门
+		// 的四面引用集（含白名单/受信代理/CRS 排除），不能区分「引用」与「拦截
+		// 生效」，曾抑制唯一的不生效告警。
+		"ban_effective": h.autobanBanEffective(),
+		"tracked_ips":   services.AutobanTrackedIPs(),
+		"suggestions":   suggestions,
+		"is_master":     isMaster,
+		"role":          map[bool]string{true: "master", false: "slave"}[isMaster],
+		"running":       false,
+		"last_run":      "",
+		"last_status":   "",
 	}
 	if te := services.TaskEngine(); te != nil {
 		if m, ok := te.Lookup(services.AutobanTaskID); ok {
@@ -133,4 +138,34 @@ func (h *Handlers) autobanListReferenced() bool {
 		return true
 	}
 	return services.IPListsReferencedByEnabledPolicy([]int{int(listID)})
+}
+
+// autobanBanEffective 封禁是否真正生效（历史问题-02 黄条判据）：预置名单存在且
+// 含未到期条目，并被至少一个「启用 + IP 访问控制启用 + deny 模式」的策略在
+// ip_acl_list_refs 中引用，且该策略已绑定到启用的 HTTP 规则。白名单/受信代理/CRS 排除引用不构成拦截生效。
+// 查询失败 fail-closed（返回 true，不弹误导性黄条——与 list_referenced 同口径）。
+func (h *Handlers) autobanBanEffective() bool {
+	var listID int64
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=1`, services.AutobanPresetListName).Scan(&listID); err != nil {
+		return true
+	}
+	entries, _, err := services.AutobanListEntries()
+	if err != nil {
+		return true
+	}
+	if len(services.AutobanActiveEntries(entries)) == 0 {
+		return false // 空名单：即便被 deny 策略引用也不拦截任何 IP
+	}
+	var count int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_policies p
+		WHERE COALESCE(p.enabled,0)=1 AND COALESCE(p.ip_acl_enabled,0)=1 AND COALESCE(p.ip_acl_mode,'')='deny'
+		  AND json_valid(COALESCE(p.ip_acl_list_refs,'[]'))
+		  AND EXISTS (SELECT 1 FROM json_each(COALESCE(p.ip_acl_list_refs,'[]')) je WHERE je.value=?)
+		  AND EXISTS (SELECT 1 FROM security_policy_bindings b
+		              JOIN lb_rules r ON r.caddy_id=b.rule_caddy_id
+		              WHERE b.policy_id=p.id AND r.protocol='http' AND COALESCE(r.enabled,0)=1)`,
+		listID).Scan(&count); err != nil {
+		return true
+	}
+	return count > 0
 }

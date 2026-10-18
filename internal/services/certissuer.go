@@ -233,17 +233,24 @@ func (s *CertIssuer) deploymentFailed(jobID int, material issuedCertificate, mes
 		previousAttempt = material.deploymentAttempt
 	}
 	attempt := previousAttempt + 1
-	status := "downloaded"
-	if attempt >= maxCertificateDeploymentAttempts {
-		status = "failed"
+	// 历史问题-02：封顶后不落 failed 终态。写文件/reload 连续失败时材料已在库、
+	// expires_at 已前进；failed 会把任务从全部自动通道摘除（部署重试只收
+	// downloaded/cleanup_*、启动恢复对 JobIsTerminal 直接 continue、文件对账
+	// 只重建 issued/downloaded），而续期扫描按已前进的 expires_at 跳过 →
+	// 旧证书到期后 TLS 长时间中断（DB 报新证有效）。保留可部署态并放慢为
+	// 30 分钟慢速重试：磁盘/权限/重载恢复后自动收敛，材料不丢、不重签。
+	const blockedDeploymentRetryDelay = 30 * time.Minute
+	delay := certificateDeploymentBackoff(attempt)
+	capped := attempt >= maxCertificateDeploymentAttempts
+	if capped {
+		delay = blockedDeploymentRetryDelay
 	}
 	storedMessage := fmt.Sprintf("部署失败 [attempt=%d/%d]: %s", attempt, maxCertificateDeploymentAttempts, message)
-	storedMessage = truncateJobMessage(storedMessage)
-	delay := certificateDeploymentBackoff(attempt)
-	var availableAfter any
-	if status == "downloaded" {
-		availableAfter = time.Now().UTC().Add(delay).Format("2006-01-02 15:04:05")
+	if capped {
+		storedMessage += fmt.Sprintf("；证书材料已保留，转入 %d 分钟慢速重试（磁盘/重载恢复后自动收敛）", int(blockedDeploymentRetryDelay.Minutes()))
 	}
+	storedMessage = truncateJobMessage(storedMessage)
+	availableAfter := time.Now().UTC().Add(delay).Format("2006-01-02 15:04:05")
 	// 历史问题(历史):材料随失败落库——首签发 confirm/persist 瞬时
 	// 失败改走本重试链时,材料仅在内存;不落库则任务回 downloaded 但
 	// 补扫 hasCertMaterial=0 跳过,永久不可达只能重签烧 CA 配额。
@@ -259,16 +266,16 @@ func (s *CertIssuer) deploymentFailed(jobID int, material issuedCertificate, mes
 		fields["expires_at"] = material.notAfter
 		fields["ca_provider_id"] = material.providerID
 	}
-	updateErr := transitionJob(db.DB, jobID, deploymentLifecycleJobStatuses, status, fields)
+	updateErr := transitionJob(db.DB, jobID, deploymentLifecycleJobStatuses, "downloaded", fields)
 	// 历史问题（历史）：部署失败必须落 certjob-*.log（此前部署链零 WriteCertJobLog，
 	// 磁盘日志只剩签发阶段，排障需反查 DB）。ERROR 行业务行恒写；状态回写失败
 	// （CAS 冲突/DB 故障）补 WARN 行，且不改变部署失败语义与签发结果。
 	WriteCertJobLog(jobID, "ERROR", "deployment_failed", storedMessage)
 	if updateErr != nil {
-		Logf("warn", "cert job %d deployment status writeback failed (status=%s, attempt=%d): %v", jobID, status, attempt, updateErr)
+		Logf("warn", "cert job %d deployment status writeback failed (status=downloaded, attempt=%d): %v", jobID, attempt, updateErr)
 		WriteCertJobLog(jobID, "WARN", "deployment_status_update_failed", fmt.Sprintf("部署失败状态回写失败 [attempt=%d/%d]: %v", attempt, maxCertificateDeploymentAttempts, updateErr))
 	}
-	if updateErr == nil && status == "downloaded" && s.deploymentRetry != nil {
+	if updateErr == nil && s.deploymentRetry != nil {
 		material.deploymentAttempt = attempt
 		// 历史问题 A-#1：异步再调度。此处常在部署回调 goroutine 内被同步调用——
 		// 若同步进入 scheduleDeploymentRetry，会命中 历史问题 历史问题(a) 的在途回调
@@ -278,8 +285,10 @@ func (s *CertIssuer) deploymentFailed(jobID int, material issuedCertificate, mes
 		// jobID 永不并发部署」不变量由该等待继续保证。
 		go s.deploymentRetry(jobID, material, delay)
 	}
-	if updateErr == nil && status == "failed" {
-		RecordAuditLog("system", "部署失败", "证书任务", FormatAuditDetail(AuditJobPart(jobID), AuditResultPart("max_attempts")), "")
+	if updateErr == nil && attempt == maxCertificateDeploymentAttempts {
+		// 封顶只留一条审计（后续每 30 分钟慢速重试不再刷屏）；结果码说明
+		// 任务未终态、材料保留。
+		RecordAuditLog("system", "部署失败", "证书任务", FormatAuditDetail(AuditJobPart(jobID), AuditResultPart("slow_retry")), "")
 	}
 	return &certificateDeploymentError{err: errors.Join(err, updateErr)}
 }
@@ -444,7 +453,12 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 		if raErr := detectRateLimit(err); raErr != nil {
 			return raErr
 		}
-		failJobFromStatus(jobID, "creating_account", fmt.Sprintf("CA 提供商测试失败: %v", err))
+		// 历史问题-03（复核修正）：审计报告称 from=creating_account 恒不命中，
+		// 但上方 logger.Log("creating_account", …) 已先行迁移状态（from=全部
+		// 非 disabled），原 CAS 实际可命中——报告前提证伪。改用 failJob（from=
+		// 全部非终态）作为防御：若 logger.Log 的状态迁移因瞬时 DB 错误未落库，
+		// 精确归因仍能写入，不被 execute 兜底的泛化文案覆盖。
+		failJob(jobID, fmt.Sprintf("CA 提供商测试失败: %v", err))
 		return fmt.Errorf("CA provider test failed: %w", err)
 	}
 	logger.Log("creating_account", "CA 提供商测试通过")
@@ -530,9 +544,9 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 		failJob(jobID, err.Error())
 		return err
 	}
-	var isMaster bool
 	// 历史 历史问题: 区分 DB 错误与角色变化，避免误报"节点切换为从节点"。
-	if err := db.DB.QueryRowContext(ctx, "SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
+	isMaster, err := RoleOf(ctx, db.DB)
+	if err != nil {
 		return fmt.Errorf("读取主从角色失败: %w", err)
 	}
 	if !isMaster {

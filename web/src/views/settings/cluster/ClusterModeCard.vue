@@ -78,6 +78,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
 import { Connection } from '@element-plus/icons-vue'
 import type { ClusterNodeMode, ClusterRegistrationInput, ClusterStatus } from '@/types'
+import { shouldCloseRegistrationDialog } from '@/utils/clusterRegistration'
 
 interface RegistrationForm {
   master_url: string
@@ -102,6 +103,7 @@ const emit = defineEmits<{
 const dialogFormRef = ref<FormInstance>()
 const selectedMode = ref<ClusterNodeMode>('master')
 const registrationOpen = ref(false)
+let registrationOriginMode: ClusterNodeMode | null = null
 const syncInterval = ref(60)
 const form = reactive<RegistrationForm>({ master_url: '', register_token: '', node_name: '' })
 
@@ -136,8 +138,9 @@ watch(
   () => props.status,
   (status, oldStatus) => {
     if (!status) return
-    // 注册成功后 node_mode 变为 slave：立即关闭弹框（否则残留阻塞主界面）。
-    if (registrationOpen.value && status.node_mode === 'slave') {
+    // 仅首次注册的 master→slave 跃迁自动关闭；slave→slave 轮询属于重新注册，
+    // 不得关闭弹框或清空一次性令牌。
+    if (shouldCloseRegistrationDialog(registrationOpen.value, registrationOriginMode, status.node_mode)) {
       registrationOpen.value = false
       return
     }
@@ -157,6 +160,7 @@ watch(
   () => {
     if (props.status?.node_mode !== 'slave') return
     selectedMode.value = 'slave'
+    registrationOriginMode = props.status?.node_mode ?? null
     registrationOpen.value = true
   },
 )
@@ -164,6 +168,7 @@ watch(
 // 注册令牌为一次性凭据：注册流程结束（提交/取消/成功关闭）后不回填，避免下次打开残留旧令牌
 watch(registrationOpen, (open) => {
   if (!open) {
+    registrationOriginMode = null
     form.register_token = ''
     // FE-70-7：X/ESC 直闭不走 closeRegistration——复位对齐实际节点模式，否则
     // 主节点表单错显「从节点」（曾等 status 轮询 ≤15s 才自愈）
@@ -174,6 +179,7 @@ watch(registrationOpen, (open) => {
 const handleModeChange = (value: string | number | boolean): void => {
   if (props.readOnly || props.loading) return
   if (value === 'slave') {
+    registrationOriginMode = props.status?.node_mode ?? null
     registrationOpen.value = true
     return
   }

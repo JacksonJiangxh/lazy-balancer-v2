@@ -98,10 +98,15 @@ type CertJobFileLogger struct {
 // 锁防不了跨实例并发轮转的 check-then-rename 交错——两个实例同时越过大小阈值
 // 时，后者的 os.Rename(path, path+".1") 会覆盖前者刚轮转出的 .1，丢一整代
 // 历史。键空间以 ruleID 为界（规则量级），无需回收。
-var certJobLogWriteLocks sync.Map // ruleID -> *sync.Mutex
+//
+// 键口径 = sanitizePathComponent(ruleID)（D1-历史问题）：housekeeping 从文件名反解
+// ruleID，只能拿到已净化值；含 `.` 的导入 ruleID（v2 导入允许）若写侧用原始
+// 值取锁，写与清理会持不同互斥量，轮转/删除交错可覆盖 .1 代或删除未过期代。
+var certJobLogWriteLocks sync.Map // sanitized ruleID -> *sync.Mutex
 
 func lockCertJobLog(ruleID string) *sync.Mutex {
-	lock, _ := certJobLogWriteLocks.LoadOrStore(ruleID, &sync.Mutex{})
+	key := sanitizePathComponent(ruleID)
+	lock, _ := certJobLogWriteLocks.LoadOrStore(key, &sync.Mutex{})
 	return lock.(*sync.Mutex)
 }
 

@@ -26,16 +26,19 @@ type threatTopTarget struct {
 	Value  int    `json:"value"`
 }
 
-// topTargetsCacheTTL top_targets 进程内缓存有效期——大屏 30s 轮询不再每轮
-// 扫 security_events 原始表。
-const topTargetsCacheTTL = 5 * time.Minute
+// topTargetsCacheTTL top_targets 进程内缓存有效期——同一窗口锚点内（1 分钟）
+// 合并重复查询；锚点（sinceMinute）变化即换键，卡片窗口与同屏其余维度一致
+// （历史问题-01：旧键只有 hours，命中时会把 5 分钟前的旧窗口结果当当前窗口）。
+const topTargetsCacheTTL = time.Minute
 
-// topTargetsCacheKey 缓存键含 *sql.DB 指针与 hours——测试换库/换窗口即失效，
-// 不串库不串窗口。
+// topTargetsCacheKey 缓存键含 *sql.DB 指针、hours 与窗口锚点 sinceMinute——
+// 测试换库/换窗口即失效，不串库不串窗口；窗口每分钟前移即新键，不会返回
+// 含窗口外事件的过期聚合。
 type topTargetsCacheKey struct {
-	metrics *sql.DB // security_events 所在库
-	main    *sql.DB // lb_rules 所在库
-	hours   int
+	metrics     *sql.DB // security_event_target_rollup 所在库
+	main        *sql.DB // lb_rules 所在库
+	hours       int
+	sinceMinute string
 }
 
 type topTargetsCacheEntry struct {
@@ -60,7 +63,7 @@ func threatTopTargets(sinceMinute string, hours int) ([]threatTopTarget, error) 
 	if db.MetricsDB == nil || db.DB == nil {
 		return nil, errors.New("database unavailable")
 	}
-	key := topTargetsCacheKey{metrics: db.MetricsDB, main: db.DB, hours: hours}
+	key := topTargetsCacheKey{metrics: db.MetricsDB, main: db.DB, hours: hours, sinceMinute: sinceMinute}
 	now := time.Now()
 	topTargetsCacheMu.Lock()
 	if entry, ok := topTargetsCache[key]; ok && now.Before(entry.expiresAt) {
@@ -157,6 +160,13 @@ func threatTopTargets(sinceMinute string, hours int) ([]threatTopTarget, error) 
 	}
 
 	topTargetsCacheMu.Lock()
+	// 键含窗口锚点后每分钟产生新键——插入时顺带清过期项，防止 map 无限增长
+	//（旧键 TTL 到期后不再被命中）。
+	for k, entry := range topTargetsCache {
+		if !now.Before(entry.expiresAt) {
+			delete(topTargetsCache, k)
+		}
+	}
 	topTargetsCache[key] = topTargetsCacheEntry{targets: targets, expiresAt: now.Add(topTargetsCacheTTL)}
 	topTargetsCacheMu.Unlock()
 	return targets, nil

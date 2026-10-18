@@ -1098,6 +1098,60 @@ func TestSecurityEventsPollOnce_returnsCountWithoutWritingTaskLog(t *testing.T) 
 	}
 }
 
+func TestSecurityEventsPollOnce_callsRollupRewindHookForInsertedBatch(t *testing.T) {
+	dataDir := t.TempDir()
+	if err := db.Initialize(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitializeMetricsDB(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	offsetPath := filepath.Join(dir, "security_events.offset")
+	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldAuditLog, oldAuditOffset := auditLogPath, securityEventsOffsetPath
+	auditLogPath, securityEventsOffsetPath = logPath, offsetPath
+	resetSecurityEventsPollState(t)
+	t.Cleanup(func() {
+		SetSecurityEventsRollupRewrite(nil)
+		auditLogPath, securityEventsOffsetPath = oldAuditLog, oldAuditOffset
+	})
+	var rewinds []time.Time
+	SetSecurityEventsRollupRewrite(func(minute time.Time) { rewinds = append(rewinds, minute) })
+
+	if got := SecurityEventsPollOnce(); got != 1 {
+		t.Fatalf("ingested=%d, want 1", got)
+	}
+	if len(rewinds) != 1 {
+		t.Fatalf("rewind hook calls=%d, want 1", len(rewinds))
+	}
+	var eventTime string
+	if err := db.MetricsDB.QueryRow(`SELECT event_time FROM security_events LIMIT 1`).Scan(&eventTime); err != nil {
+		t.Fatal(err)
+	}
+	want, err := time.ParseInLocation("2006-01-02 15:04:05", eventTime, time.UTC)
+	if err != nil {
+		want, err = time.Parse(time.RFC3339, eventTime)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rewinds[0].Equal(want.Truncate(time.Minute)) {
+		t.Fatalf("rewind minute=%s, want %s", rewinds[0], want.Truncate(time.Minute))
+	}
+
+	// 幂等重放（INSERT OR IGNORE 未插入）不得再次回退水位。
+	if got := SecurityEventsPollOnce(); got != 0 {
+		t.Fatalf("replayed poll ingested=%d, want 0", got)
+	}
+	if len(rewinds) != 1 {
+		t.Fatalf("idempotent replay called hook again: %v", rewinds)
+	}
+}
+
 func TestSecurityEventsTick_reportsErrorBeyondScanWindow(t *testing.T) {
 	// Given：日志含正常事务 + ≥4MB 无文档头畸形区（崩溃残片）+ 后续正常事务，
 	// 且指标库就绪
@@ -3535,5 +3589,60 @@ func TestSecurityEventsIngest_insertedCountExcludesIgnoredRows(t *testing.T) {
 				t.Fatalf("stored rows=%d, want %d", rows, tc.want)
 			}
 		})
+	}
+}
+
+// 历史问题-12（历史）：纯域名键的覆盖序必须由显式 ORDER BY id 定义，不得
+// 依赖 SQLite 未定义的返回序。构造「插入序与 id 序相反」的双规则：id=5 先插入、
+// id=3 后插入。无 ORDER BY 时后者（id=3）覆盖纯域名键；显式 id ASC 后由
+// 较高 id（较新创建）id=5 覆盖——与注释契约「后创建规则覆盖(创建序)」一致。
+func TestSecurityEventsLoadMappings_plainDomainOverrideDeterministic(t *testing.T) {
+	_, database := newClusterTestService(t)
+	if _, err := database.Exec(`INSERT INTO lb_rules (id,caddy_id,name,domain,protocol,listen_port,enabled) VALUES
+		(5,'lb_newer','newer-rule','dup.example.com','http',443,1),
+		(3,'lb_older','older-rule','dup.example.com','http',8443,1)`); err != nil {
+		t.Fatal(err)
+	}
+	rules, _, _, err := securityEventsLoadMappings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 纯域名键：id 较大（较新创建）者胜
+	if got := securityEventsMapHost("dup.example.com", rules); got.caddyID != "lb_newer" {
+		t.Fatalf("plain-domain override=%q, want lb_newer（ORDER BY id ASC 较高 id 覆盖；无 ORDER BY 时为插入序故此处必红）", got.caddyID)
+	}
+	// host:port 精确键两侧仍各自可达
+	if got := securityEventsMapHost("dup.example.com:443", rules); got.caddyID != "lb_newer" {
+		t.Fatalf("MapHost(:443)=%q, want lb_newer", got.caddyID)
+	}
+	if got := securityEventsMapHost("dup.example.com:8443", rules); got.caddyID != "lb_older" {
+		t.Fatalf("MapHost(:8443)=%q, want lb_older", got.caddyID)
+	}
+}
+
+func TestSecurityEventsAttributePolicy_emptyAllowOwnsFailClosedSurface(t *testing.T) {
+	emptyAllow := &models.SecurityPolicy{
+		ID: 1, Name: "empty-allow", IPACLEnabled: true, IPACLMode: "allow", IPACLList: "[]",
+	}
+	denyOwner := &models.SecurityPolicy{
+		ID: 2, Name: "deny-owner", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["203.0.113.0/24"]`,
+	}
+	threatRef := &models.SecurityPolicy{
+		ID: 3, Name: "threat-ref", IPACLEnabled: true, IPACLMode: "deny", IPACLList: "[]", IPACLListRefs: "[7]",
+	}
+	policyByID := map[int]*models.SecurityPolicy{1: emptyAllow, 2: denyOwner, 3: threatRef}
+	bindings := map[string][]int{"lb_x": {1, 2}}
+
+	if pid, _ := securityEventsAttributePolicy("lb_x", "2", "blocked", "198.51.100.9", policyByID, bindings); pid != 1 {
+		t.Fatalf("empty allow id:2 attribution=%d, want 1 (fail-closed surface belongs to the empty allow policy)", pid)
+	}
+	if !securityEventsPolicyContainsRule(emptyAllow, "7", "") {
+		t.Fatal("empty allow policy must own id:7 precheck deny surface")
+	}
+	if !securityEventsPolicyContainsRule(threatRef, "14", "") {
+		t.Fatal("policy with ACL refs must own historical threat-list id:14")
+	}
+	if securityEventsPolicyContainsRule(&models.SecurityPolicy{ID: 4, IPACLEnabled: true, IPACLMode: "allow", IPACLList: `["10.0.0.0/8"]`}, "2", "198.51.100.9") {
+		t.Fatal("non-empty allow mode must keep the documented id:2 fallback semantics")
 	}
 }

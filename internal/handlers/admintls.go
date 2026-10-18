@@ -303,6 +303,14 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		respondAdminTLSBodyError(c, err)
 		return
 	}
+	if v := input.enabledValue; v != "" {
+		switch v {
+		case "true", "1", "false", "0":
+		default:
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "enabled 仅支持 true、1、false 或 0"})
+			return
+		}
+	}
 
 	// U04d-04：写路径用严格 loader——读失败必须中止（降级默认值当基线会把
 	// 已上传证书/私钥合并成空值）。
@@ -318,6 +326,17 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 	mode := current.Mode
 	if v := input.modeValue; v != "" {
 		mode = v
+	}
+	// B2-历史问题（历史）：携带证书材料但生效来源不是 upload 时此前静默
+	// 丢弃材料（甚至回「配置未变更，无需重启」200），与 fail-visible 原则不符。
+	// 现显式 400 点名两种正确做法（补 mode=upload 或移除材料字段）。
+	if input.hasUploadPayload() && mode != "upload" {
+		modeText := mode
+		if modeText == "" {
+			modeText = "未设置"
+		}
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "提交了证书材料但证书来源不是 upload（当前：" + modeText + "）；如需上传证书请同时提交 mode=upload，否则请移除 cert_file/key_file 后重试"})
+		return
 	}
 	cert, key := current.Cert, current.Key
 	uploadedCertificate := false

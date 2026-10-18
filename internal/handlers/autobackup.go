@@ -82,7 +82,9 @@ func loadAutoBackupKeepSetting() int {
 
 // nextAutoBackupFilename 生成不冲突的备份文件名：lbbak-{auto|manual}-YYYYMMDD-
 // HHMMSS.lbbak，同秒冲突追加 -2..-201（调度与手动同秒串行执行的场景）。
-func nextAutoBackupFilename(dir, trigger string, now time.Time) string {
+// B2-历史问题（历史）：200 个变体全冲突时必须报错，不得回退到基础名
+// （可能是已存在文件）——否则后续 os.Rename 会覆盖既有备份。
+func nextAutoBackupFilename(dir, trigger string, now time.Time) (string, error) {
 	kind := "auto"
 	if trigger == "manual" {
 		kind = "manual"
@@ -100,9 +102,9 @@ func nextAutoBackupFilename(dir, trigger string, now time.Time) string {
 		if db.DB != nil && db.DB.QueryRow(`SELECT COUNT(*) FROM auto_backups WHERE filename=?`, name).Scan(&exists) == nil && exists > 0 {
 			continue
 		}
-		return name
+		return name, nil
 	}
-	return base + ".lbbak"
+	return "", fmt.Errorf("同名备份文件冲突超过 200 次（基准名 %s）", base)
 }
 
 // appVersion 为系统真实版本（cfg.Version，不受 branding.json 版本覆盖影响，
@@ -231,10 +233,17 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 	}
 	now := time.Now()
 	dir := h.cfg.BackupDir
-	filename := nextAutoBackupFilename(dir, trigger, now)
 	triggerLabel := "调度"
 	if trigger == "manual" {
 		triggerLabel = "手动"
+	}
+	filename, ferr := nextAutoBackupFilename(dir, trigger, now)
+	if ferr != nil {
+		// 不落 failed 行（无文件名可归因），但审计与任务日志留痕。
+		services.Logf("warn", "%s失败：生成备份文件名：%v", action, ferr)
+		services.RecordAuditLog(operator, "备份失败", "配置备份", services.FormatAuditDetail(
+			"触发："+triggerLabel, "生成备份文件名："+ferr.Error(), services.AuditResultPart("failed")), "")
+		return autoBackupRowView{}, fmt.Errorf("生成备份文件名: %w", ferr)
 	}
 	fail := func(stage string, err error) error {
 		wrapped := fmt.Errorf("%s: %w", stage, err)

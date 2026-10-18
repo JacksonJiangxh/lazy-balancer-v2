@@ -654,6 +654,66 @@ func TestSharedGeoIPSearcher_statFailureEvictsCachedEntry(t *testing.T) {
 	}
 }
 
+// E81-历史问题：xdb 带外损坏（文件形态变化但重建失败）时不得让 Provision 收到
+// error 而降级 pass-through（全部客户端判「海外」→ deny 海外全量误拦）；
+// 必须 fail-stale 继续服务缓存旧实例（与 wafiplist 的 fail-stale 对称）。
+func TestSharedGeoIPSearcher_rebuildFailureServesStale(t *testing.T) {
+	src := findTestXdb()
+	if src == "" {
+		t.Skip("no ip2region xdb available; place one under caddygeoip/testdata/ to run this test")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ip2region.xdb")
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read source xdb: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("seed xdb copy: %v", err)
+	}
+	oldDelay := geoipOldInstanceCloseDelay
+	geoipOldInstanceCloseDelay = 200 * time.Millisecond
+	t.Cleanup(func() {
+		geoipOldInstanceCloseDelay = oldDelay
+		geoipSharedMu.Lock()
+		delete(geoipSharedSearchers, path)
+		geoipSharedMu.Unlock()
+	})
+
+	first, err := sharedGeoIPSearcher(path)
+	if err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	// 带外损坏：原子 rename 换入坏文件（文件形态变化 → 触发重建且必失败）。
+	// 用 rename 而非原地截断：旧实例持有旧 inode 的 fd，原地改写会连旧实例
+	// 一起破坏（生产更新路径本身就是 rename）。
+	badPath := filepath.Join(dir, "corrupt.xdb")
+	if err := os.WriteFile(badPath, []byte("corrupted-xdb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(badPath, path); err != nil {
+		t.Fatal(err)
+	}
+	second, err := sharedGeoIPSearcher(path)
+	if err != nil {
+		t.Fatalf("rebuild failure must fail stale (nil error), got %v", err)
+	}
+	if second != first {
+		t.Fatal("rebuild failure must serve the cached instance, not a replacement")
+	}
+	if region, err := second.Search("114.114.114.114"); err != nil || region == "" {
+		t.Fatalf("stale instance must still serve lookups: region=%q err=%v", region, err)
+	}
+	// 缓存条目保留（文件修复后下一次 stat 变化仍会触发重建）。
+	geoipSharedMu.Lock()
+	cached := geoipSharedSearchers[path]
+	geoipSharedMu.Unlock()
+	if cached == nil || cached.searcher != first {
+		t.Fatal("rebuild failure must not evict the cached entry")
+	}
+}
+
 // ---- 历史 历史问题 / 历史问题 ----
 
 const googlebotUA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"

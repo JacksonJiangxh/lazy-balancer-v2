@@ -8,13 +8,40 @@ import (
 	"time"
 )
 
+func TestClusterAccessURLTargetsNode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		url  string
+		ip   string
+		port int
+		want bool
+	}{
+		{name: "loopback literal", url: "http://127.0.0.1:8000", ip: "192.168.50.2", port: 8000, want: true},
+		{name: "localhost", url: "http://localhost:8000", ip: "192.168.50.2", port: 8000, want: true},
+		{name: "IPv6 loopback", url: "https://[::1]:8000", ip: "192.168.50.2", port: 8000, want: true},
+		{name: "outbound IP", url: "http://192.168.50.2:8000", ip: "192.168.50.2", port: 8000, want: true},
+		{name: "different port", url: "http://192.168.50.2:8001", ip: "192.168.50.2", port: 8000, want: false},
+		{name: "different host", url: "http://192.168.50.3:8000", ip: "192.168.50.2", port: 8000, want: false},
+		{name: "default HTTP port match", url: "http://192.168.50.2", ip: "192.168.50.2", port: 80, want: true},
+		{name: "default HTTPS port match", url: "https://192.168.50.2", ip: "192.168.50.2", port: 443, want: true},
+		{name: "default port mismatch", url: "https://192.168.50.2", ip: "192.168.50.2", port: 8000, want: false},
+		{name: "hostname alias remains best effort", url: "http://example.com:8000", ip: "192.168.50.2", port: 8000, want: false},
+		{name: "invalid URL", url: "://bad", ip: "192.168.50.2", port: 8000, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClusterAccessURLTargetsNode(tc.url, tc.ip, tc.port); got != tc.want {
+				t.Fatalf("ClusterAccessURLTargetsNode(%q,%q,%d)=%v, want %v", tc.url, tc.ip, tc.port, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestGlobalConfig_serializes_DNS_credentials(t *testing.T) {
 	// Given
 	config := GlobalConfig{DNSCredentials: "id,token"}
 
 	// When
 	data, err := json.Marshal(config)
-
 	// Then
 	if err != nil {
 		t.Fatalf("marshal GlobalConfig: %v", err)

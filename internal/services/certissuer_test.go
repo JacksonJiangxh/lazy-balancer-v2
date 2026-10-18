@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"database/sql"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -715,7 +716,7 @@ func TestRetryCertificateDeployment_missingExpiryRejectsMalformedPEM(t *testing.
 	}
 }
 
-func TestCertIssuer_deploymentFailed_backs_off_and_stops_after_max_attempts(t *testing.T) {
+func TestCertIssuer_deploymentFailed_backs_off_then_slowRetriesAtMaxAttempts(t *testing.T) {
 	// Given
 	jobID, ruleID := seedCertificateJob(t, "downloaded")
 	issuer := NewCertIssuer(nil)
@@ -735,10 +736,12 @@ func TestCertIssuer_deploymentFailed_backs_off_and_stops_after_max_attempts(t *t
 		_ = issuer.deploymentFailed(jobID, issuedCertificate{ruleID: ruleID, providerID: 1}, "reload failed", errors.New("reload failed"))
 	}
 
-	// Then：收满 9 次再调度（5s 上限，顺序即投递顺序=退避顺序）。
+	// Then：每次失败都再调度——前 9 次按 1s→256s 退避，第 10 次封顶后转
+	// 30 分钟慢速重试（历史问题-02：不落 failed，材料保留、磁盘恢复后自动收敛）。
 	wantDelays := []time.Duration{
 		time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second,
 		32 * time.Second, 64 * time.Second, 128 * time.Second, 256 * time.Second,
+		30 * time.Minute,
 	}
 	var delays []time.Duration
 	var lastMaterial issuedCertificate
@@ -765,13 +768,16 @@ func TestCertIssuer_deploymentFailed_backs_off_and_stops_after_max_attempts(t *t
 		t.Fatalf("unexpected extra retry: %+v", extra)
 	default:
 	}
-	var status string
+	var status, message string
 	var attempts int
-	if err := db.DB.QueryRow("SELECT status, deployment_attempts FROM cert_jobs WHERE id=?", jobID).Scan(&status, &attempts); err != nil {
+	if err := db.DB.QueryRow("SELECT status, COALESCE(message,''), deployment_attempts FROM cert_jobs WHERE id=?", jobID).Scan(&status, &message, &attempts); err != nil {
 		t.Fatalf("read deployment retry status: %v", err)
 	}
-	if status != "failed" || attempts != maxCertificateDeploymentAttempts {
-		t.Fatalf("deployment retry status=%q attempts=%d, want failed and %d", status, attempts, maxCertificateDeploymentAttempts)
+	if status != "downloaded" || attempts != maxCertificateDeploymentAttempts {
+		t.Fatalf("deployment retry status=%q attempts=%d, want downloaded (slow retry) and %d", status, attempts, maxCertificateDeploymentAttempts)
+	}
+	if !strings.Contains(message, "慢速重试") {
+		t.Fatalf("message=%q at cap, want slow-retry disclosure", message)
 	}
 }
 
@@ -870,8 +876,9 @@ func TestRetryCertificateDeployment_accepts_cleanup_dns_status(t *testing.T) {
 	}
 }
 
-func TestRetryCertificateDeployment_cleanup_dns_job_fails_after_max_attempts(t *testing.T) {
-	// Given：长时间停留在 cleanup_dns 的任务，部署反复失败，重试到上限后必须落为 failed
+func TestRetryCertificateDeployment_cleanup_dns_job_slowRetriesAtMaxAttempts(t *testing.T) {
+	// Given：长时间停留在 cleanup_dns 的任务，部署反复失败——封顶后保留可部署态
+	// （历史问题-02：落 failed 会把材料/磁盘分叉变成无自动通道的搁浅）
 	jobID, _ := seedCertificateJob(t, "cleanup_dns")
 	useTemporaryCertDir(t)
 	const providerID = 999
@@ -890,11 +897,15 @@ func TestRetryCertificateDeployment_cleanup_dns_job_fails_after_max_attempts(t *
 	}
 	var status string
 	var attempts int
-	if err := db.DB.QueryRow("SELECT status, deployment_attempts FROM cert_jobs WHERE id=?", jobID).Scan(&status, &attempts); err != nil {
-		t.Fatalf("read failed cleanup_dns job: %v", err)
+	var available sql.NullTime
+	if err := db.DB.QueryRow("SELECT status, deployment_attempts, deployment_available_after FROM cert_jobs WHERE id=?", jobID).Scan(&status, &attempts, &available); err != nil {
+		t.Fatalf("read capped cleanup_dns job: %v", err)
 	}
-	if status != "failed" || attempts != maxCertificateDeploymentAttempts {
-		t.Fatalf("job status=%q attempts=%d, want failed with %d attempts", status, attempts, maxCertificateDeploymentAttempts)
+	if status != "downloaded" || attempts != maxCertificateDeploymentAttempts {
+		t.Fatalf("job status=%q attempts=%d, want downloaded (slow retry) with %d attempts", status, attempts, maxCertificateDeploymentAttempts)
+	}
+	if !available.Valid || time.Until(available.Time) < 20*time.Minute {
+		t.Fatalf("deployment_available_after=%v, want ~30m slow-retry window", available)
 	}
 }
 
@@ -1085,8 +1096,9 @@ func TestDeploymentFailed_writesCertJobLogWithAttemptAndReason(t *testing.T) {
 	}
 }
 
-// 历史问题 封顶形态：第 10 次部署失败落 failed 终态，日志行同样带 attempt=10/10。
-func TestDeploymentFailed_writesTerminalLogAtMaxAttempts(t *testing.T) {
+// 历史问题/历史问题-02 封顶形态：第 10 次部署失败保留可部署态（慢速重试），日志行
+// 同样带 attempt=10/10 与慢速重试说明。
+func TestDeploymentFailed_entersSlowRetryAtMaxAttempts(t *testing.T) {
 	useCertJobLogTestEnv(t, 1<<20)
 	jobID, ruleID := seedCertificateJob(t, "downloaded")
 	if _, err := db.DB.Exec("UPDATE cert_jobs SET deployment_attempts=9 WHERE id=?", jobID); err != nil {
@@ -1105,14 +1117,17 @@ func TestDeploymentFailed_writesTerminalLogAtMaxAttempts(t *testing.T) {
 		t.Fatalf("read cert job log: %v", err)
 	}
 	if !strings.Contains(string(data), "attempt=10/10") {
-		t.Fatalf("cert job log missing terminal attempt=10/10:\n%s", data)
+		t.Fatalf("cert job log missing capped attempt=10/10:\n%s", data)
+	}
+	if !strings.Contains(string(data), "慢速重试") {
+		t.Fatalf("cert job log missing slow-retry disclosure:\n%s", data)
 	}
 	var status string
 	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", jobID).Scan(&status); err != nil {
 		t.Fatalf("read job status: %v", err)
 	}
-	if status != "failed" {
-		t.Fatalf("job status=%q, want failed at max attempts", status)
+	if status != "downloaded" {
+		t.Fatalf("job status=%q, want downloaded (material retained for slow retry)", status)
 	}
 }
 

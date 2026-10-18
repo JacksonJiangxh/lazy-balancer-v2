@@ -360,13 +360,13 @@ const refreshing = ref(false)
 const readOnly = computed(() => authStore.readOnlyReason !== null)
 const canOperate = computed(() => isAdmin.value && !readOnly.value)
 
-const fetchTasks = async () => {
-  const res = await request.get<APIResponse<{ tasks: TaskInfo[] }>>('/system/tasks', { silent: true })
+const fetchTasks = async (signal?: AbortSignal) => {
+  const res = await request.get<APIResponse<{ tasks: TaskInfo[] }>>('/system/tasks', { silent: true, signal })
   tasks.value = res.data?.tasks || []
   loaded.value = true
 }
-const fetchSeries = async () => {
-  const res = await request.get<APIResponse<{ series: TaskHourlyStat[] }>>('/system/tasks/stats-24h-series', { silent: true })
+const fetchSeries = async (signal?: AbortSignal) => {
+  const res = await request.get<APIResponse<{ series: TaskHourlyStat[] }>>('/system/tasks/stats-24h-series', { silent: true, signal })
   series24h.value = res.data?.series || []
 }
 const refreshNow = async () => {
@@ -374,6 +374,10 @@ const refreshNow = async () => {
   try {
     await Promise.all([fetchTasks(), fetchSeries(), fetchCertQueue()])
     pollingError.clear()
+  } catch (error: unknown) {
+    // 历史问题-F5：原实现无 catch——网络/5xx 时按钮无反馈且产生 unhandled
+    // rejection；与轮询失败同口径记录到可见横幅。
+    pollingError.recordError(error)
   } finally { refreshing.value = false }
 }
 onMounted(() => {
@@ -392,10 +396,11 @@ const pollingErrorDescription = computed(() => {
     ? `最后错误：${lastError}；契约响应异常，自动重试已退避至 ${retryAt}`
     : `最后错误：${lastError}`
 })
-const polling = usePollingTask(async () => {
+const polling = usePollingTask(async ({ signal }) => {
   // 历史问题-4：证书队列横幅与任务列表同频 10s（曾只在 mounted/手动刷新拉取，横幅最长陈旧一个会话）
   if (!pollingError.canRun()) return
-  await Promise.all([fetchTasks(), fetchSeries(), fetchCertQueue()])
+  // 历史问题-F5：消费每轮 abort signal——pause/stop（含组件卸载）可取消在途请求。
+  await Promise.all([fetchTasks(signal), fetchSeries(signal), fetchCertQueue()])
   pollingError.clear()
 }, {
   interval: 10000,
@@ -661,26 +666,43 @@ const logsTask = ref<TaskInfo | null>(null)
 const logsTaskStorageKey = computed(() => logsTask.value ? `task:${logsTask.value.id}` : 'tasks')
 const logContainerRef = ref<HTMLElement | null>(null)
 let logsTimer: ReturnType<typeof setInterval> | null = null
+// 会话序号：刷新回调捕获打开时的会话，关闭/切换任务后迟到的响应不得写回。
+let logsSession = 0
 const taskLogEndpoint = (id: string): string =>
   id.startsWith('cert-job:') ? `/certificates/jobs/${id.slice(9)}/logs` : `/system/tasks/${id}/logs`
-const openLogs = async (row: TaskInfo) => {
+const startLogPolling = (): void => {
+  if (logsTimer) { clearInterval(logsTimer); logsTimer = null }
+  logsTimer = setInterval(() => { void refreshLogs() }, 5000)
+}
+const openLogs = (row: TaskInfo): void => {
+  // 历史问题-F2：先清空上一任务内容并同步装定时器——不再清空残留，也不会出现
+  // 「首拉未完成就关闭 → await 后续体又装 interval」的关闭后永久轮询。
+  logsSession++
   logsTask.value = row
   logsVisible.value = true
-  await refreshLogs()
-  logsTimer = setInterval(refreshLogs, 5000)
+  logsText.value = ''
+  startLogPolling()
+  void refreshLogs()
 }
-const refreshLogs = async () => {
-  if (!logsTask.value) return
+const refreshLogs = async (): Promise<void> => {
+  const task = logsTask.value
+  if (!task) return
+  const session = logsSession
   try {
-    const res = await request.get<APIResponse<{ content: string }>>(taskLogEndpoint(logsTask.value.id), { silent: true })
+    const res = await request.get<APIResponse<{ content: string }>>(taskLogEndpoint(task.id), { silent: true })
+    if (session !== logsSession) return
     logsText.value = (res.data?.content || '').trim()
     await nextTick(() => {
+      if (session !== logsSession) return
       if (logContainerRef.value) logContainerRef.value.scrollTop = logContainerRef.value.scrollHeight
     })
   } catch { /* 静默 */ }
 }
-const closeLogs = () => {
+const closeLogs = (): void => {
+  logsSession++
   if (logsTimer) { clearInterval(logsTimer); logsTimer = null }
+  logsTask.value = null
+  logsText.value = ''
 }
 onUnmounted(closeLogs)
 

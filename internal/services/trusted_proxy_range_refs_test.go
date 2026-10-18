@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,28 @@ import (
 
 	"lazy-balancer-v2/internal/models"
 )
+
+func TestTrustedProxyPrefixTooWide_acceptsOfficialCDNv6Ranges(t *testing.T) {
+	// Cloudflare 官方列表含 2a06:98c0::/29；/96 会拒绝全部真实 CDN 回源段。
+	for _, tc := range []struct {
+		cidr string
+		want bool
+	}{
+		{cidr: "2a06:98c0::/29", want: false},
+		{cidr: "2400:cb00::/32", want: false},
+		{cidr: "2001:db8::/28", want: true},
+		{cidr: "::/0", want: true},
+		{cidr: "104.16.0.0/13", want: false},
+		{cidr: "0.0.0.0/8", want: true},
+	} {
+		t.Run(tc.cidr, func(t *testing.T) {
+			prefix := netip.MustParsePrefix(tc.cidr)
+			if got := TrustedProxyPrefixTooWide(prefix); got != tc.want {
+				t.Fatalf("TrustedProxyPrefixTooWide(%s)=%v, want %v", tc.cidr, got, tc.want)
+			}
+		})
+	}
+}
 
 // 受信代理网段引用 IP 地址列表（trusted_proxy_range_refs，2026-10-12）：
 // 内联 CIDR ∪ 引用名单条目合并投影（2026-10-15 热路径化，tp.txt/lb_file）。

@@ -74,6 +74,7 @@ func TestUpdateRule_acmeToManual_convergesNonTerminalCertJobs(t *testing.T) {
 	jobID := seedACMEManualSwitchFixture(t, "lb_sw_manual", "sw.example.test", "queued")
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	certPEM, keyPEM, err := generateTestCert("sw.example.test", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	if err != nil {

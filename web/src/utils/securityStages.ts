@@ -219,12 +219,20 @@ export const STAGE_BLOCK_STATUS_OPTIONS: ReadonlyArray<{ value: number; label: s
   { value: 503, label: '503 Service Unavailable' },
 ]
 
+// 带外/导入 JSON 的字符串数组统一 trim；空项与非字符串一律丢弃。
+export const normalizeStringEntries = (raw: unknown): string[] => {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter((item) => item !== '')
+}
+
 // ip 名单 JSON 文本 → 字符串数组（坏数据回退空数组，不得炸渲染路径）
 export const parseIPList = (raw: string | undefined): string[] => {
   if (!raw) return []
   try {
-    const parsed: unknown = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : []
+    return normalizeStringEntries(JSON.parse(raw) as unknown)
   } catch {
     return []
   }
@@ -634,7 +642,7 @@ const parseUnknownIds = (raw: unknown): number[] => {
 }
 
 const parseUnknownStrings = (raw: unknown): string[] => {
-  if (Array.isArray(raw)) return raw.filter((v): v is string => typeof v === 'string')
+  if (Array.isArray(raw)) return normalizeStringEntries(raw)
   if (typeof raw === 'string') return parseIPList(raw)
   return []
 }
@@ -851,6 +859,9 @@ export const entryMatchesIp = (entry: string, ip: string): boolean => {
 // FE65-1（历史）：invalidate 同时通知订阅者（已打开弹框的本地副本即时
 // 失效重拷——曾失效触不到本地 ref，开放窗口叠开 IP 处置后徽标滞留旧值）。
 export const sharedEntriesCache: Record<number, string[]> = {}
+// 历史问题-03：缓存代际。invalidate 递增代际，在途 loader 落地时校验代际——
+// 写动作后旧请求的返回值不得回填缓存（否则后续 ensure 命中失效前的旧条目）。
+let entriesCacheGeneration = 0
 type EntriesCacheListener = () => void
 const entriesCacheListeners = new Set<EntriesCacheListener>()
 function notifyEntriesCache(): void {
@@ -876,6 +887,7 @@ export function writeSharedEntries(id: number, values: string[]): void {
 export async function ensureSharedEntries(ids: Iterable<number>, loader: (id: number) => Promise<string[]>): Promise<void> {
   const todo = [...new Set(ids)].filter((id) => id > 0 && !(id in sharedEntriesCache))
   if (todo.length === 0) return
+  const generation = entriesCacheGeneration
   await Promise.all(todo.map(async (id) => {
     const existing = inflightEntries.get(id)
     if (existing) {
@@ -884,7 +896,10 @@ export async function ensureSharedEntries(ids: Iterable<number>, loader: (id: nu
     }
     const pending = (async () => {
       try {
-        writeSharedEntries(id, await loader(id))
+        const values = await loader(id)
+        // 代际已变（期间发生写动作 invalidate）→ 丢弃迟到结果，保持未缓存待重取。
+        if (generation !== entriesCacheGeneration) return
+        writeSharedEntries(id, values)
       } catch {
         /* 单名单失败：保持未缓存，下一次调用重试 */
       }
@@ -899,8 +914,34 @@ export async function ensureSharedEntries(ids: Iterable<number>, loader: (id: nu
 }
 
 export const invalidateSharedEntriesCache = (): void => {
+  entriesCacheGeneration++
   for (const k of Object.keys(sharedEntriesCache)) delete sharedEntriesCache[Number(k)]
   notifyEntriesCache()
+}
+
+// —— 后端批量端点上限（与 internal/handlers 同口径）：前端按上限分片提交 ——
+// /security/policies/:id/bindings/bulk 的 bind+unbind 合计 ≤100；
+// /rules/batch-block-pages 的 rule_ids ≤500。超限整批 400，原样重试仍失败。
+export const SECURITY_BULK_LIMITS = { policyBindings: 100, ruleBlockPages: 500 } as const
+
+/** 按单次上限切分待提交项（顺序保持；空数组→空切分）。 */
+export function chunkForBulk<T>(items: readonly T[], limit: number): T[][] {
+  if (limit <= 0) return []
+  const chunks: T[][] = []
+  for (let i = 0; i < items.length; i += limit) chunks.push(items.slice(i, i + limit))
+  return chunks
+}
+
+/** 数组求交（按 a 顺序、去重）：Set 查表替代 includes——万级名单下避免 O(A×D)。 */
+export function entriesIntersect(a: readonly string[], b: ReadonlySet<string>): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const entry of a) {
+    if (!b.has(entry) || seen.has(entry)) continue
+    seen.add(entry)
+    out.push(entry)
+  }
+  return out
 }
 
 // formatDurationUs 安全处理耗时格式化(微秒→人类可读,分级精度):

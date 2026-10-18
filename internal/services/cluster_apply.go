@@ -195,8 +195,10 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 			return errors.Join(fmt.Errorf("写入同步证书: %w", err), s.restoreSnapshotArtifacts(previous, snapshot))
 		}
 	}
-	if err := s.materializeSnapshotDNSOwnership(snapshot.ACME); err != nil {
-		return errors.Join(fmt.Errorf("写入同步 DNS 所有权状态: %w", err), s.restoreSnapshotArtifacts(previous, snapshot))
+	if !skip.disabled["rules"] {
+		if err := s.materializeSnapshotDNSOwnership(snapshot.ACME); err != nil {
+			return errors.Join(fmt.Errorf("写入同步 DNS 所有权状态: %w", err), s.restoreSnapshotArtifacts(previous, snapshot))
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE global_config SET applied_version=?, cluster_version=?, sync_fingerprint=?, last_sync=datetime('now'), last_sync_error='' WHERE id=1`, snapshot.Version, snapshot.Version, snapshot.Fingerprint); err != nil {
 		return errors.Join(
@@ -401,6 +403,9 @@ func wafBundleSyncDetail(bundle *WafFileBundle, crsChanged, xdbChanged bool) str
 }
 
 func (s *SyncService) restoreSnapshotArtifacts(previous, current models.ClusterSnapshot) error {
+	// previous 是 apply 前的本地快照，不是主端 incoming；失败回滚恢复本地基线。
+	// rules 开关禁用时主端 ownership 从未写入（初始物化已跳过），因此此处仍须
+	// 恢复 previous 本地 ownership，不能与写入侧同门跳过。
 	return errors.Join(restoreSnapshotCerts(previous.Certs, current.Certs), s.materializeSnapshotDNSOwnership(previous.ACME))
 }
 
@@ -535,8 +540,13 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 			return err
 		}
 	}
+	// D2-历史问题：ACME 配置/CA 提供商与 cert_jobs 同门——rules 开关关闭时从节点
+	// 保留本地规则（含本地 acme_dns 规则），若 ACME 表仍按主节点快照全量替换：
+	// ①本地规则的 acme_config_id 悬空；②主端同 id 配置覆盖后可能绑定到错误
+	// DNS 账号（promote 后按错误账号签发/续期）。历史问题 A-N5 只给 cert_jobs 加了
+	// 精确 disabled 门，引用目标必须同门。
 	var statements []string
-	if snapshot.ACME != nil {
+	if snapshot.ACME != nil && !skip.disabled["rules"] {
 		statements = append(statements, "DELETE FROM certificate_configs", "DELETE FROM ca_providers")
 	}
 	for _, statement := range statements {
@@ -544,7 +554,7 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 			return fmt.Errorf("清理快照数据: %w", err)
 		}
 	}
-	if snapshot.ACME != nil {
+	if snapshot.ACME != nil && !skip.disabled["rules"] {
 		for _, provider := range snapshot.ACME.CAProviders {
 			// CL-1（历史）：从端全部时间列统一平面格式（nullableTimeFlat/
 			// UTC 直写），消除驱动序列化 '+00:00'/RFC3339 后缀形态与主端三态并存。
@@ -592,7 +602,7 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 			return err
 		}
 	} else if snapshot.BasicSettings.SyncInterval != nil {
-		if _, err := tx.ExecContext(ctx, `UPDATE global_config SET sync_interval=? WHERE id=1 AND COALESCE(is_master,1)=0`, *snapshot.BasicSettings.SyncInterval); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE global_config SET sync_interval=? WHERE id=1 AND COALESCE(is_master,1)=0`, normalizeSyncInterval(*snapshot.BasicSettings.SyncInterval)); err != nil {
 			return fmt.Errorf("写入同步间隔: %w", err)
 		}
 	}
@@ -1211,6 +1221,11 @@ func insertSnapshotPathRules(ctx context.Context, tx *sql.Tx, ruleID string, pat
 	return nil
 }
 
+const (
+	snapshotSecurityEventsRetentionDaysMax = 3650
+	snapshotSecurityEventsRowCapMax        = 100000000
+)
+
 func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.ClusterSnapshot) error {
 	settings := snapshot.BasicSettings
 	if settings.JWTExpireMinutes != nil && (*settings.JWTExpireMinutes <= 0 || *settings.JWTExpireMinutes > 1440) {
@@ -1247,7 +1262,11 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 		addBase("acme_email", *settings.ACMEEmail)
 	}
 	if settings.CertExpiryDays != nil {
-		addBase("cert_expiry_days", *settings.CertExpiryDays)
+		days := *settings.CertExpiryDays
+		if days <= 0 || days > 365 {
+			days = db.DefaultCertExpiryDays
+		}
+		addBase("cert_expiry_days", days)
 	}
 	if settings.CertRenewalDays != nil {
 		addBase("cert_renewal_days", *settings.CertRenewalDays)
@@ -1265,7 +1284,7 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 		addBase("dns_credentials", *settings.DNSCredentials)
 	}
 	if settings.SyncInterval != nil {
-		addBase("sync_interval", *settings.SyncInterval)
+		addBase("sync_interval", normalizeSyncInterval(*settings.SyncInterval))
 	}
 	if settings.AdminTLSEnabled != nil {
 		addBase("admin_tls_enabled", *settings.AdminTLSEnabled)
@@ -1447,16 +1466,28 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	// D1（历史）：自动封禁六项配置同口径入块（指针缺席=旧主端快照未
 	// 携带——跳过写入保留从端本地值，不清零；新主端恒携带全组，升主即生效）。
 	if settings.SecurityEventsRetentionDays != nil {
+		days := *settings.SecurityEventsRetentionDays
+		if days <= 0 || days > snapshotSecurityEventsRetentionDaysMax {
+			days = securityEventsRetentionDefaultDays
+		}
 		settingClauses = append(settingClauses, "security_events_retention_days=?")
-		settingArgs = append(settingArgs, *settings.SecurityEventsRetentionDays)
+		settingArgs = append(settingArgs, days)
 	}
 	if settings.SecurityEventsRowCap != nil {
+		rowCap := *settings.SecurityEventsRowCap
+		if rowCap <= 0 || rowCap > snapshotSecurityEventsRowCapMax {
+			rowCap = securityEventsRetentionDefaultMax
+		}
 		settingClauses = append(settingClauses, "security_events_row_cap=?")
-		settingArgs = append(settingArgs, *settings.SecurityEventsRowCap)
+		settingArgs = append(settingArgs, rowCap)
 	}
 	if settings.ThreatTrafficSampleN != nil {
+		sample := *settings.ThreatTrafficSampleN
+		if sample != -1 && sample != 0 && sample != 1 {
+			sample = -1
+		}
 		settingClauses = append(settingClauses, "threat_traffic_sample_n=?")
-		settingArgs = append(settingArgs, *settings.ThreatTrafficSampleN)
+		settingArgs = append(settingArgs, sample)
 	}
 	if settings.AutobanEnabled != nil {
 		settingClauses = append(settingClauses, "autoban_enabled=?")

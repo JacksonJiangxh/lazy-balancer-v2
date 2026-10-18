@@ -2,6 +2,9 @@
 
 > 2026-10-01 用户裁定重构。任务类型决定一切——调度方式、记录策略、日志行为、控制面。
 > 零 flag、零补丁、零特判；任务体只写业务逻辑，引擎处理全部基础设施。
+>
+> 口径说明：本文是工程标准文档（不在 README 用户文档索引内），文中「第 N 轮/历史问题」
+> 等内部流程口径用于裁定溯源；面向用户/官网的文案不得引用此类内部口径。
 
 ## 1. 四类型定义
 
@@ -55,7 +58,7 @@ type Descriptor struct {
 2. 必须显式声明 `RunsOn=RoleAny`（含空值拒绝）——启动执行面无角色语义，
    漏声明不得回落到旧任务兼容默认值。
 
-已删除：`SilentProbes`/`RecordFailuresOnly`/`SignalledWork`/`AsKind`/`Cadence`/`Singleton`——Kind 单独决定全部行为；`ToggleFn`/`ToggleName`（LNK71-3，2026-10-11）——v2.0 调度开关统一（StartLoop/StopLoop）后声明族零消费退役，TaskMeta/TaskInfo 的 `toggleable`/`toggle_name` 序列化字段一并删除；`ManualRun`（历史勘误）——手动触发能力由 Kind 派生（DescribeAll `CanTrigger`），声明字段无消费。
+已删除：`SilentProbes`/`RecordFailuresOnly`/`SignalledWork`/`AsKind`/`Cadence`/`Singleton`——Kind 单独决定全部行为；`ToggleFn`/`ToggleName`（LNK71-3，2026-10-11）——v2.0 调度开关统一（StartLoop/StopLoop）后声明族零消费退役，TaskMeta/TaskInfo 的 `toggleable`/`toggle_name` 序列化字段一并删除；`ManualRun`（历史勘误）——手动触发能力由 Kind 派生（DescribeAll `CanTrigger`），声明字段无消费；`TaskMeta.Enabled`（任务监控只认 `loop_on`，`Lookup/DescribeAll` 不再求值 `EnabledFn`）——`Descriptor.EnabledFn` 仍保留为 Scheduled/Periodic 调度门。
 
 ## 2. 任务清单（18 注册任务）
 
@@ -93,8 +96,8 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
 **Daemon 异常退出自愈（2026-10-18）**：异常退出且调度仍开
 （`loopEnabled && 角色允许 && 引擎未停止`）时按有界退避自动重拉——默认
 1s/5s/30s 三次（`taskengine.Options.DaemonRestartDelays` 可覆盖），每次重拉在
-`tasks/{id}.log` 留 `[restart]` 行；次数用尽后停止调度并留 `[done] … 已用尽`
-行，需人工重启。Run 存活 ≥1 分钟后再崩视为新故障（预算归零）；用户显式
+`tasks/{id}.log` 留 `[restart]` 行；次数用尽后置 `loop_on=false` 并留 `[done] … 已用尽`
+行；可直接 `StartLoop` 恢复调度并重置预算，无需重启进程。Run 存活 ≥1 分钟后再崩视为新故障（预算归零）；用户显式
 关→开（StartLoop/control restart）同样重置预算。退避窗口内 `TaskMeta.Running=false`
 且状态列呈现 `failed`（修复前恒 `idle`「空闲」，采集/签发静默停摆无信号）；
 显式停止调度后回 `idle`。
@@ -134,14 +137,18 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
       CreateOrRequeueCertJobWithChange 成功路径（规则写路径 Create/Retry/Renew 收敛点）
       RetryCertJob 成功路径（handlers/certjobs.go）
       DeleteCertJob 删除失败恢复重入队成功路径（handlers/certjobs.go）
-      统一入口=`services.WakeCertWaitingCA()`（仅 certJobsActive 时越过后台停止态）
+      后三处入队成功入口=`services.WakeCertWaitingCAForEnqueuedJob()`
+      （RearmLoop(..., true)，以入队成功为工作事实，不重查 certJobsActive）
 自停：Run 体发现 certJobsActive()==false → StopLoop（回到默认关闭态）
 ```
 
-唤醒语义（历史问题）：`RearmLoop` 有活唤醒形态仅在确有在途任务时越过「已停止」
-态并立即补跑；无活零动作。禁止唤醒路径直调 `StartLoop`——那会把用户手动
-停止的调度隐式打开，且停止只在重启前有效。服务就绪补跑形态（无 hasWork
-实参）仍只在调度已开启时重置节拍。
+唤醒语义（历史问题）：`RearmLoop(..., true)` 越过「已停止」态恢复调度并立即补跑，
+`false` 零动作；唤醒不改写 `task_loop_prefs` 用户偏好。续期扫描以
+`certJobsActive()` 作为 hasWork，无活零动作；已确认入队成功的路径经
+`WakeCertWaitingCAForEnqueuedJob()` 直接传 `true`，避免任务快速转为 failed 后
+重查活跃态造成漏唤醒。禁止唤醒路径直调 `StartLoop`——那会把用户手动停止的
+调度隐式打开，且停止只在重启前有效。服务就绪补跑形态（无 hasWork 实参）仍只在
+调度已开启时重置节拍。
 
 30s 循环为循环任务正常定义；调度关闭期间零执行零记录。`NextRunAt` 仅由视图层查询 `cert_jobs.ca_available_after` 作为「下次 CA 可用时间」展示；Periodic 描述符不携带 Scheduled 专用 `NextSlotFn`。
 
@@ -186,7 +193,7 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
 - 业务页开启 → 写业务字段后立即 `StartLoop`；关闭 → 立即 `StopLoop`。
 - 任务监控的六个业务驱动任务调度开关**只读**：只允许查看 `loop_on`，不得从引擎或任务监控反写业务配置；非业务驱动任务仍可由任务监控启停。任务清单唯一事实源=`businessTaskDrivers`。
 - 启动装配按业务实态对齐 `loop_on`；首槽武装必须覆盖全部四个规则库源表，缺槽时开启业务即补槽。
-- `EnabledFn` 仅作执行面纵深校验，不向任务视图暴露额外「业务开关」字段；任务监控与详情只展示 `loop_on` 调度开关，另以只读 `business_driven` 标记驱动 toggle 禁用（不是第二个开关）。
+- `EnabledFn` 仅作执行面纵深校验，不向任务视图暴露额外「业务开关」字段；`TaskMeta.Enabled` 已删除，任务监控与详情只展示 `loop_on` 调度开关（`Lookup/DescribeAll` 不求值 `EnabledFn`），另以只读 `business_driven` 标记驱动 toggle 禁用（不是第二个开关）。
 
 ### 4.3 API 写门与执行角色分层
 
@@ -209,6 +216,8 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
 
 task_runs 保留 90 天（audit-retention 每日清理）。`Engine.Stop` 先取消全部运行，再等待 Scheduled/Periodic/Oneshot 在途 Run 与全部 daemon 落定终态；停止后新的 Trigger/RunSync 返回 `ErrEngineStopped`。
 
+**配置导入暂停/排空**：`PauseScheduling` 与 `ResumeScheduling` 成对使用，均在 `e.mu` 内提交暂停状态，与 `runNow` 的 `inFlight` 登记严格定序。暂停后 tick 不再派发，`Trigger`、`RunSync` 及已越过入口检查的迟到 `runNow` 均返回 `ErrSchedulingPaused`；仅装配期 BootSync（`trigger=startup`）豁免。因此除该启动路径外，暂停返回后 `inFlight` 只减不增，导入可安全排空在途执行；恢复同样在 `e.mu` 内提交，暂停/恢复边界不留下登记窗口。
+
 ## 6. 业务侧 helper
 
 - `TaskLogf(taskID, stage, format, ...)` — 业务摘要行（tee 到任务日志）
@@ -222,7 +231,7 @@ task_runs 保留 90 天（audit-retention 每日清理）。`Engine.Stop` 先取
 
 - 统一入口为 `taskengine.RotateTaskLogBeforeWrite`：`size(path)+len(待写入行) > task_log_size_mb` 时先 `RotateTaskLogFile` 再追加。`taskLogAppend`、`TeeTaskLog` 与证书任务日志全部经过该入口，禁止另设每日巡检滚动或第二套滚动实现。
 - 主流水 `tasks/{id}.log` 保 1 份，证书任务 `tasks/certjobs/*.log` 保 5 份；归档份数是保留策略差异，不是第二种滚动机制。
-- `log-cleanup` 只负责保留期清理，不再负责尺寸滚动。
+- `log-cleanup` 只负责保留期清理，不再负责尺寸滚动。`tasks/` 根日志删除统一经 `taskengine.RemoveTaskLogIfModifiedBefore`，在路径写锁内重新 stat 后删除（避免锁外旧 FileInfo 与 `rotate→rename→append` 交错误删新一代）；`tasks/certjobs/` 子目录仍由 ruleID 写锁同源复核。
 - 每个 `tasks/{id}.log` 只能由该任务执行链写入：cluster-sync/普通配置导入不得写三库日志；`SecurityEventsPollOnce` 只返回条数，ingestion 自行记录；autoban 仅 Run/候选修剪同链写日志，摄取热路径不直接写。
 - 普通任务路径=`TaskLogPath`；`cert-job:<job_id>` 先解析 `rule_id` 再进 `tasks/certjobs/certjob-<rule>.log`，API/MCP/`/logs/stats` 共用 `systemTaskLogPath`。
 - 日志统计与弹框使用 `task:<id>`：每个任务对应自己的真实文件、活动大小、轮转副本和阈值；禁止用 `tasks/*.log` 目录聚合值代替当前任务。
@@ -240,7 +249,7 @@ task_runs 保留 90 天（audit-retention 每日清理）。`Engine.Stop` 先取
 
 ## 7. 修订记录
 
-- v2.0.3（2026-10-14，用户裁定「启用后按配置调度」）：autoban 调度模型收编——Descriptor 去除 EnabledFn（任务监控 enabled 列恒开，启停语义全在调度开关+事件页业务开关）；PUT /security/autoban 保存联动启停（enabled=true→StartLoop、false→StopLoop；历史补：禁用保存先收敛已到期条目与暂存重载再停调度——禁用后无循环 flush/到期清理点）；启动按库内业务开关实态对齐调度；手动开调度/手动触发但未启用由 Run 体首行业务门拦停（TaskLogf「手动调度，执行失败：未启用」+task_runs failed 行+StopLoop 重禁调度）；POST /security/autoban/run「立即执行」端点与前端按钮删除。
+- v2.0.3（2026-10-14，用户裁定「启用后按配置调度」）：autoban 调度模型收编——Descriptor 去除 EnabledFn（任务监控只认 `loop_on`，启停语义全在调度开关+事件页业务开关）；PUT /security/autoban 保存联动启停（enabled=true→StartLoop、false→StopLoop；历史补：禁用保存先收敛已到期条目与暂存重载再停调度——禁用后无循环 flush/到期清理点）；启动按库内业务开关实态对齐调度；手动开调度/手动触发但未启用由 Run 体首行业务门拦停（TaskLogf「手动调度，执行失败：未启用」+task_runs failed 行+StopLoop 重禁调度）；POST /security/autoban/run「立即执行」端点与前端按钮删除。
 
 - v2.0.2（2026-10-14，历史问题）：新增 autoban 循环任务（60s/主节点/EnabledFn=autoban_enabled 业务开关联动）——WAF 事件固定窗口计数（摄取提交点喂入）→ 阈值判定 →「自动封禁名单」merge（清到期/保留手动/已在名单过滤/超限挤最早到期）→ 重载 60s 节流暂存合并；观察模式（dry_run 默认开）仅记建议；每轮 TaskLogf 摘要行入 tasks/autoban.log。
 

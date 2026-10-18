@@ -23,7 +23,14 @@
         <span class="info-note-desc">{{ autobanBlockedReason }}</span>
       </div>
       <div class="autoban-bar">
-          <div class="autoban-main">
+          <div
+            class="autoban-main"
+            role="button"
+            tabindex="0"
+            @click="openAutobanConfig"
+            @keydown.enter.prevent="openAutobanConfig"
+            @keydown.space.prevent="openAutobanConfig"
+          >
             <div class="autoban-title">
               <el-icon class="title-icon"><Lock /></el-icon>
               <span>自动封禁</span>
@@ -55,9 +62,10 @@
           <el-button v-else size="small" type="success" plain :disabled="!autobanWritable" @click="openAutobanConfigForEnable">启用</el-button>
         </div>
       </div>
-      <!-- 未关联策略黄条：名单未被启用中的安全策略引用，封禁不生效 -->
-      <div v-if="autobanStatus.enabled && autobanStatus.list_referenced === false" class="info-note-bar autoban-warn-bar">
-        <span class="info-note-desc">「自动封禁名单」尚未被任何启用的安全策略引用，封禁暂不生效——请到「安全规则 → IP 地址列表」将该名单引用到 IP 访问控制（deny）策略</span>
+      <!-- 未生效黄条（历史问题-02）：判据=ban_effective（名单非空且被启用+deny 的策略引用），
+           不再用 list_referenced（四面引用集会把「仅被白名单/受信代理引用」误当生效） -->
+      <div v-if="autobanStatus.enabled && autobanStatus.ban_effective === false" class="info-note-bar autoban-warn-bar">
+        <span class="info-note-desc">「自动封禁名单」尚未生效——名单为空，或尚未被启用中的 IP 访问控制（deny）策略引用；请到「安全规则 → IP 地址列表」将该名单引用到 IP 访问控制（deny）策略</span>
       </div>
       <!-- 观察模式建议列表：dry-run 下达阈值 IP（不封禁，供评估阈值/口径） -->
       <template v-if="autobanStatus.enabled && autobanStatus.dry_run && (autobanStatus.suggestions?.length ?? 0) > 0">
@@ -290,7 +298,7 @@
       </template>
       <template v-if="ctxEvent">
         <el-descriptions :column="2" border size="small">
-          <el-descriptions-item label="时间">{{ ctxEvent.event_time || '—' }}</el-descriptions-item>
+          <el-descriptions-item label="时间">{{ ctxEvent.event_time ? formatDate(ctxEvent.event_time) : '—' }}</el-descriptions-item>
           <el-descriptions-item label="方法">{{ ctxEvent.method || '—' }}</el-descriptions-item>
           <el-descriptions-item label="客户端 IP">{{ ctxEvent.client_ip || '—' }}</el-descriptions-item>
           <el-descriptions-item label="归属地">{{ ctxEvent.ip_location || '—' }}</el-descriptions-item>
@@ -379,6 +387,11 @@ interface AutobanSuggestion { ip: string; count: number; ip_location?: string; w
 interface AutobanStatus {
   enabled: boolean; dry_run: boolean; threshold: number; window_minutes: number
   duration: string; scope: string; banned_today: number; list_entries: number
+  // 历史问题-02：黄条判据 = 封禁是否真正生效（名单非空 ∧ 被启用+IP ACL 启用+deny 的
+  // 策略在 ip_acl_list_refs 引用）。list_referenced 为后端热路径资格门的四面
+  // 引用集（含白名单/受信代理/CRS 排除），不能区分「引用」与「拦截生效」——
+  // 仅保留为内部字段，不再驱动 UI。
+  ban_effective: boolean
   list_referenced: boolean; suggestions: AutobanSuggestion[]
   // 后端另有 running/last_run/last_status/role/tracked_ips（API 契约保留）——
   // 本卡零消费，不再声明（历史问题：声明即暗示已渲染）。
@@ -396,7 +409,7 @@ const AUTOBAN_SCOPES = [
 
 const autobanStatus = ref<AutobanStatus>({
   enabled: false, dry_run: true, threshold: 100, window_minutes: 5, duration: '1h', scope: 'all',
-  banned_today: 0, list_entries: 0, list_referenced: true, suggestions: [],
+  banned_today: 0, list_entries: 0, list_referenced: true, ban_effective: true, suggestions: [],
   // 默认 false：成功响应前不得假定主节点可写（历史问题 失败关闭）
   is_master: false,
 })
@@ -823,7 +836,9 @@ onMounted(() => {
 .autoban-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 /* 卡片主体=配置入口（2026-10-14 裁定）：标题/参数区可点，hover 灰底+pointer 反馈；
    padding+负 margin 扩大热区而不改变行内布局 */
-.autoban-main { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex: 1; min-width: 0; }
+.autoban-main { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex: 1; min-width: 0; cursor: pointer; padding: 4px; margin: -4px; border-radius: 6px; }
+.autoban-main:hover { background: #f9fafb; }
+.autoban-main:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 2px; }
 .autoban-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: #111827; flex-shrink: 0; }
 .autoban-title .title-icon { font-size: 16px; color: #3b82f6; }
 .autoban-stats { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: 1; min-width: 0; font-size: 12px; color: var(--text-secondary, #6b7280); }

@@ -265,8 +265,7 @@ func (h *Handlers) respondLoginWithMFA(c *gin.Context, user models.User, passwor
 	// node_mode 仅用于登录响应体的展示字段（历史问题：JWT claim 已删除——
 	// jwtAuth 不消费，客户端声明无意义；响应体 NodeMode 保留）。
 	nodeMode := "master"
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err == nil && !isMaster {
+	if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err == nil && !isMaster {
 		nodeMode = "slave"
 	}
 
@@ -597,8 +596,7 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 func (h *Handlers) GetSetupStatus(c *gin.Context) {
 	// 历史问题:从节点无初始化语义——users 由主端同步,同步未收敛的瞬态空表
 	// 不得引导建号(建号会被同步覆盖)。查询失败按主节点语义放行(老库形态)。
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err == nil && !isMaster {
+	if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err == nil && !isMaster {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"needs_setup": false}})
 		return
 	}
@@ -612,8 +610,7 @@ func (h *Handlers) GetSetupStatus(c *gin.Context) {
 
 func (h *Handlers) SetupAdmin(c *gin.Context) {
 	// 历史问题:从节点禁止初始化建号(公开路由无 JWT,is_master 读 global_config)。
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err == nil && !isMaster {
+	if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err == nil && !isMaster {
 		c.JSON(http.StatusForbidden, models.APIResponse{Code: 403, Message: "从节点不支持初始化，请在主节点完成初始化"})
 		return
 	}

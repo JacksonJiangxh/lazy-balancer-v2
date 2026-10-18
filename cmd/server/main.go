@@ -209,6 +209,9 @@ func run() error {
 	// tp.txt/lb_file ≤1s stat 热感知）；threatReloader 仅残留热路径未证实
 	// 收敛时的 fail-safe 回退。
 	services.SetThreatProjectionRefresher(func() (services.IPListProjectionOutcome, error) { return caddyService.RefreshIPListProjections() })
+	// 历史问题-1：摄取提交后回退 rollup 覆盖水位——停机/升级积压事件落在 warmer
+	// 已覆盖分钟时重固（否则大屏永久少计；warmer 首轮先于摄取首 pass 运行）。
+	services.SetSecurityEventsRollupRewrite(handlers.ThreatRollupRewindTo)
 	services.InitThreatUpdateManager()
 	services.InitTaskEngine(cfg.CaddyAdminURL, runtimeLogFile) // 前置设施——非任务
 	// 引擎收尾统一交由下方 tail defer（StopTaskEngine 幂等）；此处不再重复
@@ -273,14 +276,7 @@ func run() error {
 	// ldflags 变量 version(无注入链恒 "dev"),与 branding API 版本分叉
 	// (v2.3.0 首发漏注入,记忆在案)。不存在 ldflags 注入通道。
 	log.Printf("Starting lazy-balancer-v2 %s on %s", cfg.Version, addr)
-	server := &http.Server{
-		Addr:              addr,
-		Handler:           router,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-	}
+	server := newAdminHTTPServer(addr, router)
 
 	tlsCfg := services.LoadAdminTLSConfig()
 	services.RecordRuntimeAdminTLS(tlsCfg)
@@ -312,6 +308,20 @@ func run() error {
 		return fmt.Errorf("serve HTTP: %w", serverErr)
 	}
 	return nil
+}
+
+// newAdminHTTPServer 统一面板 HTTP 超时。请求头仍保持 10s 慢头护栏；
+// 48MB 导入与含 CRS/IP2Region 的大备份下载需要分钟级正文读写预算，
+// 不再沿用 30s/60s 的绝对截止。
+func newAdminHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		WriteTimeout:      10 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
 }
 
 func newRestartSignal() (<-chan struct{}, func()) {

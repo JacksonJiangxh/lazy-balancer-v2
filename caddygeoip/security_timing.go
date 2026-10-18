@@ -45,7 +45,13 @@ func recordSecurityTiming(r *http.Request, segment string) {
 	startNsStr := r.Header.Get(securityTimingStartHeader)
 	if timingID != "" && startNsStr != "" {
 		if startNs, perr := strconv.ParseInt(startNsStr, 10, 64); perr == nil {
-			auditTimingRecord(timingID, segment, (time.Now().UnixNano()-startNs)/1000) // ns→µs
+			us := (time.Now().UnixNano() - startNs) / 1000 // ns→µs
+			// E81-历史问题：挂钟回拨（或异常起始头解析出的未来时刻）会产生负时长，
+			// 直接注入审计行/UI 是脏数据；耗时下限钳 0（0µs 是合法计时值）。
+			if us < 0 {
+				us = 0
+			}
+			auditTimingRecord(timingID, segment, us)
 		}
 	}
 }

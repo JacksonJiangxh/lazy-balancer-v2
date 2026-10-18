@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -269,6 +270,64 @@ func TestLbbakImport_waitsForWafLockBeforeDBTransaction(t *testing.T) {
 	}
 }
 
+// B3-82-历史问题：导入必须先暂停/排空任务再取 WAF 文件锁；若先取锁，
+// 等待该锁的更新任务无法被取消，排空必然超时并可能在提交后旧写覆盖。
+func TestLbbakImport_pausesSchedulingBeforeWafLock(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initTaskEngineForTest(t)
+	te := services.TaskEngine()
+	if err := te.Register(taskengine.Descriptor{
+		ID: "waf-lock-order-probe", Family: "test", Name: "WAF lock order probe",
+		Kind: taskengine.KindOneshot,
+		Run:  func(taskengine.RunContext) error { return nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	g := newBackupSectionRouter(h)
+	overrideTestWafPaths(t)
+	body := buildTestLbbak(t, completeBackupJSON(t, nil), []byte("x"))
+	services.WafFileLock().Lock()
+	unlocked := false
+	unlockWaf := func() {
+		if !unlocked {
+			services.WafFileLock().Unlock()
+			unlocked = true
+		}
+	}
+	defer unlockWaf()
+
+	done := make(chan int, 1)
+	go func() { done <- postLbbakImport(g, t, body, "").Code }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	paused := false
+	for time.Now().Before(deadline) {
+		err := te.Trigger("waf-lock-order-probe", "manual", "test")
+		if errors.Is(err, taskengine.ErrSchedulingPaused) {
+			paused = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !paused {
+		unlockWaf()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+		t.Fatal("导入在等待 WAF 锁前未暂停调度（锁序仍为 WAF→排空）")
+	}
+	unlockWaf()
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("import status=%d, want 200", code)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("releasing WAF lock did not let import finish")
+	}
+}
+
 // ── 历史问题-04：CRS 分阶段流水「reloading/success」必须落在 commit 成功之后 ──
 
 // Given lbbak 备份（含 CRS 文件）导入，Caddy stub 拒绝一切请求使 session.commit
@@ -399,6 +458,36 @@ func TestLbbakImport_unregistered_threat_entry_warns(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "未登记") || !strings.Contains(rec.Body.String(), "threat/ustc.iplist") {
 		t.Fatalf("响应应携带 manifest 未登记条目告警: %s", rec.Body.String())
+	}
+}
+
+// B3-82-历史问题：未选择安全防护分类时条目并未落盘，警告不得宣称「已按原样落盘」。
+func TestLbbakImport_unregisteredThreatSkippedBySectionsWarnsNotImported(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	g := newBackupSectionRouter(h)
+	overrideTestWafPaths(t)
+	dir := t.TempDir()
+	restore := services.OverrideThreatWafDirForTest(dir)
+	defer restore()
+	taskengine.SetLogDir(t.TempDir())
+	t.Cleanup(func() { taskengine.SetLogDir("") })
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (6,'local-admin-unregistered','hash','admin',1)`); err != nil {
+		t.Fatalf("seed local admin: %v", err)
+	}
+
+	body := buildLbbakWithExtraThreatEntry(t, completeBackupJSON(t, nil), []byte("1.2.3.4\n"))
+	rec := postLbbakImport(g, t, body, "?sections=rules")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "未登记") || !strings.Contains(rec.Body.String(), "未导入") {
+		t.Fatalf("响应应明确条目未导入: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "已按原样落盘") {
+		t.Fatalf("未选安全防护分类仍宣称已落盘: %s", rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "threat-ustc.iplist")); !os.IsNotExist(err) {
+		t.Fatalf("skipped threat file exists or stat failed unexpectedly: %v", err)
 	}
 }
 

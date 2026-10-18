@@ -567,6 +567,7 @@ func TestCAQueueManager_CancelJobsForRule_blocks_retry_created_during_worker_exi
 	<-workerStarted
 	ResetCAQueueManagerForTest()
 	InitCAQueueManager(nil)
+	GetCAQueueManager().Start()
 	t.Cleanup(ResetCAQueueManagerForTest)
 	manager := GetCAQueueManager()
 	manager.mu.Lock()

@@ -56,14 +56,21 @@ const (
 	crawlerDNSQueryTimeout  = 500 * time.Millisecond
 	// crawlerVerifySlots 在途 DNS 并发上限（非阻塞获取：满员 fail-closed）
 	crawlerVerifySlots = 32
+	// crawlerCachePruneProbeLimit 限制单次新键插入时的过期回收工作量，
+	// 避免满员后对 200k map 做全表扫描。map 遍历顺序不作保证；未探到的
+	// 过期条目由后续插入继续回收，满员时维持既有的「不缓存新键」降级。
+	crawlerCachePruneProbeLimit = 64
 )
 
 var (
 	crawlerCacheMu sync.Mutex
 	crawlerCache   = map[string]crawlerVerifyCache{}
+	// crawlerCachePruneVisitsForTest 记录满员回收实际检查的条目数；由
+	// crawlerCacheMu 保护，供容量路径的有界工作量钉测读取。
+	crawlerCachePruneVisitsForTest int
 	// crawlerVerifySem 非阻塞信号量（cap 32；关账本式释放）
 	crawlerVerifySem = make(chan struct{}, crawlerVerifySlots)
-	// crawlerCacheMax 容量护栏：到上限先删过期条目；仍满员则跳过新键缓存，
+	// crawlerCacheMax 容量护栏：到上限按固定探针数回收过期条目；仍满员则跳过新键缓存，
 	// 保留未过期的正/负结论（已存在键可原位更新，不增加条目数）。
 	crawlerCacheMax = 200_000
 )
@@ -102,10 +109,17 @@ func VerifyCrawler(ip, engineID string) bool {
 	}
 	crawlerCacheMu.Lock()
 	if len(crawlerCache) >= crawlerCacheMax {
-		// 先回收过期条目；仍满员时宁可不缓存新键，也不清空已验证爬虫。
+		// 固定探针数内回收过期条目；仍满员时宁可不缓存新键，也不清空
+		// 已验证爬虫，且绝不因一个新键扫描整张 200k 缓存。
+		probed := 0
 		for cachedKey, entry := range crawlerCache {
+			probed++
+			crawlerCachePruneVisitsForTest++
 			if !now.Before(entry.expires) {
 				delete(crawlerCache, cachedKey)
+			}
+			if probed >= crawlerCachePruneProbeLimit || len(crawlerCache) < crawlerCacheMax {
+				break
 			}
 		}
 	}
@@ -187,6 +201,7 @@ func releaseCrawlerSlot() {
 func ResetCrawlerVerifyCacheForTest(r crawlerDNSResolver) {
 	crawlerCacheMu.Lock()
 	crawlerCache = make(map[string]crawlerVerifyCache)
+	crawlerCachePruneVisitsForTest = 0
 	crawlerCacheMu.Unlock()
 	if r != nil {
 		crawlerVerifyResolver = r
@@ -200,10 +215,12 @@ func ResetCrawlerVerifyCacheForTest(r crawlerDNSResolver) {
 var crawlerIPListFile = "/app/data/crawler-ip-lists.json"
 
 // crawlerIPRangeSnapshot 预编译快照：引擎 ID → 已解析前缀列表。加载时一次性
-// ParsePrefix（历史问题），判定热路径零解析/零分配。
+// ParsePrefix（历史问题），判定热路径零解析/零分配。ok=false 表示读取/解析失败
+// 的空快照——只按短重试间隔节流（E81-历史问题），成功快照按完整重载间隔缓存。
 type crawlerIPRangeSnapshot struct {
 	prefixes map[string][]netip.Prefix
 	loadedAt time.Time
+	ok       bool
 }
 
 var (
@@ -213,17 +230,30 @@ var (
 
 const crawlerIPListReloadInterval = 10 * time.Minute
 
-// loadCrawlerIPRangeSnapshot 返回当前快照（超过 10min 重读）。读盘与解析在
-// 锁外完成（双检 + 原子快照替换）：文件大/磁盘慢时不再阻塞并发判定。读取/
-// JSON/解析失败同样写入节流时间戳并返回空快照（fail-closed + 失败也节流，
-// 旧实现失败路径不写时间戳，缺失文件时每次判定都尝试读盘）。
+// crawlerIPListRetryInterval 是失败/坏快照的重试间隔：Caddy 可能先于根服务
+// 生成快照文件做首次爬虫校验（首启/冷装窗口）。旧实现把失败也缓存满 10min，
+// 360 引擎豁免会 fail-closed 最长 10 分钟（伪装判定）；10s 既避免每次判定
+// 读盘，又让文件出现后迅速收敛。var 供测试收窄。
+var crawlerIPListRetryInterval = 10 * time.Second
+
+// loadCrawlerIPRangeSnapshot 返回当前快照（成功快照超过 10min、失败快照超过
+// 重试间隔时重读）。读盘与解析在锁外完成（双检 + 原子快照替换）：文件大/
+// 磁盘慢时不再阻塞并发判定。读取/JSON/解析失败同样写入节流时间戳并返回空
+// 快照（fail-closed + 失败也节流，旧实现失败路径不写时间戳，缺失文件时每次
+// 判定都尝试读盘）。
 func loadCrawlerIPRangeSnapshot() *crawlerIPRangeSnapshot {
 	now := time.Now()
 	crawlerFileCacheMu.Lock()
 	snap := crawlerFileCacheSnap
-	if snap != nil && now.Sub(snap.loadedAt) <= crawlerIPListReloadInterval {
-		crawlerFileCacheMu.Unlock()
-		return snap
+	if snap != nil {
+		ttl := crawlerIPListRetryInterval
+		if snap.ok {
+			ttl = crawlerIPListReloadInterval
+		}
+		if now.Sub(snap.loadedAt) <= ttl {
+			crawlerFileCacheMu.Unlock()
+			return snap
+		}
 	}
 	crawlerFileCacheMu.Unlock()
 
@@ -231,6 +261,7 @@ func loadCrawlerIPRangeSnapshot() *crawlerIPRangeSnapshot {
 	if data, err := os.ReadFile(crawlerIPListFile); err == nil {
 		var all map[string][]string
 		if err := json.Unmarshal(data, &all); err == nil {
+			next.ok = true
 			for engine, cidrs := range all {
 				prefixes := make([]netip.Prefix, 0, len(cidrs))
 				for _, cidr := range cidrs {

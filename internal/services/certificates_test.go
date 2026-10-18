@@ -221,6 +221,7 @@ func TestRequeueNonTerminalCertJobs_skips_downloaded_job_missing_cert_material_w
 	jobID, _ := seedCertificateJob(t, "cleanup_dns")
 	ResetCAQueueManagerForTest()
 	InitCAQueueManager(func() error { return nil })
+	GetCAQueueManager().Start()
 	GetCAQueueManager().PauseAndDrain()
 	t.Cleanup(ResetCAQueueManagerForTest)
 	retried := make(chan int, 1)
@@ -279,6 +280,7 @@ func TestRequeueNonTerminalCertJobs_skips_job_still_active_in_retired_queue(t *t
 	}
 	ResetCAQueueManagerForTest()
 	InitCAQueueManager(func() error { return nil })
+	GetCAQueueManager().Start()
 	t.Cleanup(ResetCAQueueManagerForTest)
 	manager := GetCAQueueManager()
 	retired := newCAQueue(models.CAProvider{ID: 7, MaxConcurrent: 1}, nil)
@@ -593,6 +595,7 @@ func TestCertificateService_periodic_scans_do_not_mutate_jobs_while_queue_paused
 	_, database := newClusterTestService(t)
 	ResetCAQueueManagerForTest()
 	InitCAQueueManager(func() error { return nil })
+	GetCAQueueManager().Start()
 	manager := GetCAQueueManager()
 	manager.PauseAndDrain()
 	t.Cleanup(ResetCAQueueManagerForTest)
@@ -631,6 +634,7 @@ func TestCertificateService_renewExpiringCertificates_retries_failed_first_issua
 	_, database := newClusterTestService(t)
 	ResetCAQueueManagerForTest()
 	InitCAQueueManager(func() error { return nil })
+	GetCAQueueManager().Start()
 	manager := GetCAQueueManager()
 	t.Cleanup(ResetCAQueueManagerForTest)
 	for _, ruleID := range []string{"lb_first_retry", "lb_first_cooling", "lb_first_capped"} {
@@ -679,6 +683,65 @@ func TestCertificateService_renewExpiringCertificates_retries_failed_first_issua
 	<-done
 }
 
+func TestCertificateService_renewExpiringCertificates_usesRenewalFlowForIssuedMissingExpiry(t *testing.T) {
+	// Given：expires_at 缺失并不表示首次签发失败；issued 行必须走续期状态与文案。
+	_, database := newClusterTestService(t)
+	ResetCAQueueManagerForTest()
+	InitCAQueueManager(func() error { return nil })
+	GetCAQueueManager().Start()
+	manager := GetCAQueueManager()
+	t.Cleanup(ResetCAQueueManagerForTest)
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
+		VALUES ('lb_issued_null_flow','issued-null-flow','issued-null-flow.example.com','http',8080,1,1,'acme_dns')`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	certPEM, keyPEM := certificatePairForDomains(t, now.Add(-time.Hour), now.Add(time.Hour), "issued-null-flow.example.com")
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,expires_at,cert_pem,key_pem,ca_provider_id)
+		VALUES ('lb_issued_null_flow','issued-null-flow.example.com','issued',NULL,?,?,1)`, certPEM, keyPEM); err != nil {
+		t.Fatal(err)
+	}
+	transitioned := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseEnqueue := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseEnqueue)
+	manager.beforeEnqueue = func() {
+		close(transitioned)
+		<-release
+	}
+	done := make(chan struct{})
+	resetCertificateServiceForTest(t)
+	service := NewCertificateService()
+	if jobs := service.CheckExpiration(); len(jobs) != 1 || jobs[0].RuleID != "lb_issued_null_flow" {
+		t.Fatalf("renewal candidates=%v, want issued NULL job", jobs)
+	}
+	go func() {
+		service.renewExpiringCertificates()
+		close(done)
+	}()
+
+	// When：续期巡检应完成状态迁移并在入队钩子前停下，便于检查真实 DB 终态。
+	select {
+	case <-transitioned:
+	case <-time.After(2 * time.Second):
+		releaseEnqueue()
+		<-done
+		t.Fatal("issued + NULL expires_at 未进入续期入队")
+	}
+
+	// Then
+	var status, message string
+	if err := database.QueryRow("SELECT status,message FROM cert_jobs WHERE rule_id='lb_issued_null_flow'").Scan(&status, &message); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" || message != "等待排队续期" {
+		t.Fatalf("job=(%q,%q), want queued/等待排队续期", status, message)
+	}
+	releaseEnqueue()
+	<-done
+}
+
 // CERT-A（历史）：已达最大重试的 issued/failed 任务每轮续签扫描都会被
 // 重复选出并入摘要后静默 continue——至少要留 warn 痕，操作者可见「仅手动
 // 重试可达」（waiting_ca 有终局转换+审计，同条件 issued/failed 零痕迹）。
@@ -687,6 +750,7 @@ func TestCertificateService_renewExpiringCertificates_logs_capped_skip(t *testin
 	_, database := newClusterTestService(t)
 	ResetCAQueueManagerForTest()
 	InitCAQueueManager(func() error { return nil })
+	GetCAQueueManager().Start()
 	t.Cleanup(ResetCAQueueManagerForTest)
 	ruleID := "lb_capped_warn"
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES (?,?,?,'http',8080,1,1,'acme_dns')`, ruleID, ruleID, ruleID+".example.com"); err != nil {
@@ -731,6 +795,7 @@ func TestCertificateService_renewExpiringCertificates_summaryTiersCappedJobs(t *
 	_, database := newClusterTestService(t)
 	ResetCAQueueManagerForTest()
 	InitCAQueueManager(func() error { return nil })
+	GetCAQueueManager().Start()
 	t.Cleanup(ResetCAQueueManagerForTest)
 	for _, ruleID := range []string{"lb_sum_normal", "lb_sum_capped"} {
 		if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES (?,?,?,'http',8080,1,1,'acme_dns')`, ruleID, ruleID, ruleID+".example.com"); err != nil {
@@ -768,6 +833,7 @@ func TestCertificateService_renewExpiringCertificates_summaryKeepsPlainFormWitho
 	_, database := newClusterTestService(t)
 	ResetCAQueueManagerForTest()
 	InitCAQueueManager(func() error { return nil })
+	GetCAQueueManager().Start()
 	t.Cleanup(ResetCAQueueManagerForTest)
 	ruleID := "lb_sum_plain"
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES (?,?,?,'http',8080,1,1,'acme_dns')`, ruleID, ruleID, ruleID+".example.com"); err != nil {
@@ -802,6 +868,7 @@ func TestCertificateService_requeueWaitingCAJobs_disables_orphaned_waiting_job(t
 	_, database := newClusterTestService(t)
 	ResetCAQueueManagerForTest()
 	InitCAQueueManager(func() error { return nil })
+	GetCAQueueManager().Start()
 	t.Cleanup(ResetCAQueueManagerForTest)
 	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_available_after,ca_provider_id) VALUES ('lb_gone','gone.example.com','waiting_ca',datetime('now','-1 minute'),1)`); err != nil {
 		t.Fatalf("seed orphan waiting job: %v", err)
@@ -825,6 +892,7 @@ func TestCertificateService_requeueWaitingCAJobs_pause_after_scan_start_leaves_j
 	_, database := newClusterTestService(t)
 	ResetCAQueueManagerForTest()
 	InitCAQueueManager(func() error { return nil })
+	GetCAQueueManager().Start()
 	manager := GetCAQueueManager()
 	t.Cleanup(ResetCAQueueManagerForTest)
 	// R28 A-M1 起 requeue 守卫要求任务仍被启用中的 acme_dns TLS 规则引用，
@@ -1047,6 +1115,54 @@ func TestCertificateService_CheckExpiration_returns_only_current_enabled_acme_do
 	// Then
 	if len(jobs) != 1 || jobs[0].RuleID != "lb_current" {
 		t.Fatalf("renewal jobs=%v, want only lb_current", jobs)
+	}
+}
+
+func TestCertificateService_CheckExpiration_includes_issued_missing_expiry(t *testing.T) {
+	// Given：历史 issued 行缺失 expires_at；证书临期/材料缺失都必须重新进入续期，
+	// 已有证书仍远超续期窗口时则保持跳过，避免每轮无谓重签。
+	_, database := newClusterTestService(t)
+	now := time.Now().UTC()
+	for _, ruleID := range []string{"lb_issued_null_due", "lb_issued_null_future", "lb_issued_null_missing", "lb_issued_timestamp_future"} {
+		if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
+			VALUES (?,?,?,'http',8080,1,1,'acme_dns')`, ruleID, ruleID, ruleID+".example.com"); err != nil {
+			t.Fatalf("seed rule %s: %v", ruleID, err)
+		}
+	}
+	seed := func(ruleID string, notAfter time.Time, withMaterial bool, expiresAt any) {
+		t.Helper()
+		certPEM, keyPEM := "", ""
+		if withMaterial {
+			certPEM, keyPEM = certificatePairForDomains(t, now.Add(-time.Hour), notAfter, ruleID+".example.com")
+		}
+		if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,expires_at,cert_pem,key_pem)
+			VALUES (?,?,'issued',?,?,?)`, ruleID, ruleID+".example.com", expiresAt, certPEM, keyPEM); err != nil {
+			t.Fatalf("seed job %s: %v", ruleID, err)
+		}
+	}
+	seed("lb_issued_null_due", now.Add(time.Hour), true, nil)
+	seed("lb_issued_null_future", now.Add(90*24*time.Hour), true, nil)
+	seed("lb_issued_null_missing", time.Time{}, false, nil)
+	seed("lb_issued_timestamp_future", now.Add(90*24*time.Hour), true, now.Add(90*24*time.Hour))
+
+	// When
+	resetCertificateServiceForTest(t)
+	jobs := NewCertificateService().CheckExpiration()
+
+	// Then
+	found := make(map[string]bool, len(jobs))
+	for _, job := range jobs {
+		found[job.RuleID] = true
+	}
+	for _, ruleID := range []string{"lb_issued_null_due", "lb_issued_null_missing"} {
+		if !found[ruleID] {
+			t.Errorf("%s missing from renewal candidates: %v", ruleID, jobs)
+		}
+	}
+	for _, ruleID := range []string{"lb_issued_null_future", "lb_issued_timestamp_future"} {
+		if found[ruleID] {
+			t.Errorf("%s unexpectedly selected for renewal: %v", ruleID, jobs)
+		}
 	}
 }
 
@@ -1554,6 +1670,7 @@ func TestRequeueNonTerminalCertJobs_does_not_resurrect_failed_job(t *testing.T) 
 	}
 	ResetCAQueueManagerForTest()
 	InitCAQueueManager(func() error { return nil })
+	GetCAQueueManager().Start()
 	t.Cleanup(ResetCAQueueManagerForTest)
 	manager := GetCAQueueManager()
 	var enqueues atomic.Int32
@@ -1625,6 +1742,7 @@ func TestRequeueNonTerminalCertJobs_requeues_queued_job_despite_valid_stored_cer
 	}
 	ResetCAQueueManagerForTest()
 	InitCAQueueManager(func() error { return nil })
+	GetCAQueueManager().Start()
 	t.Cleanup(ResetCAQueueManagerForTest)
 	manager := GetCAQueueManager()
 	var enqueues atomic.Int32
@@ -2047,6 +2165,37 @@ func TestCertificateService_rescanPicksUpDroppedRetry(t *testing.T) {
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("dropped retry was not rescheduled")
+	}
+	service.pauseDeploymentRetries()
+}
+
+func TestCertificateService_rescanPicksUpCleanupAfterWritebackFailure(t *testing.T) {
+	_, database := newClusterTestService(t)
+	seedGenerationRule(t, database, "lb_rescan_cleanup", false)
+	if _, err := database.Exec("UPDATE lb_rules SET enable_tls=1,tls_source='acme_dns' WHERE caddy_id='lb_rescan_cleanup'"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem,deployment_available_after)
+		VALUES ('lb_rescan_cleanup','example.test','cleanup_dns','x','y',NULL)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID64, _ := res.LastInsertId()
+	jobID := int(jobID64)
+	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
+	rescheduled := make(chan int, 4)
+	service.deploymentRetry = func(id int, _ issuedCertificate, _ time.Duration) {
+		rescheduled <- id
+	}
+	service.rescanDroppedDeploymentRetries()
+	select {
+	case id := <-rescheduled:
+		if id != jobID {
+			t.Fatalf("rescheduled job=%d, want %d", id, jobID)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("cleanup job with failed status writeback was not rescheduled")
 	}
 	service.pauseDeploymentRetries()
 }

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/prometheus/client_golang/prometheus"
@@ -118,13 +119,18 @@ func TestSecurityBlockedCounter_panicFinalizesTimingAndTraffic(t *testing.T) {
 		_ = h.ServeHTTP(httptest.NewRecorder(), req, next)
 	}()
 
-	// panic 向外传播的同时，审计计时必须有终态，流量也不能静默丢失。
+	// panic 向外传播的同时，审计计时不得留下「等待中」的条目（E81-历史问题：无
+	// 分段写点时 close 不建条；drain 首轮查表即返，不为该行等满超时），流量
+	// 也不能静默丢失。
 	id := req.Header.Get(securityTimingHeader)
 	if id == "" {
 		t.Fatal("missing injected timing id")
 	}
-	if snap := auditTimingLookupForTest(t, id); !snap.closed {
-		t.Fatalf("timing snapshot after panic=%+v, want closed terminal marker", snap)
+	if snap := auditTimingLookupForTest(t, id); snap.hasAny() || snap.closed {
+		t.Fatalf("timing snapshot after panic=%+v, want no registered entry", snap)
+	}
+	if polls := auditTimingPollCountForTest.Load(); polls != 0 {
+		t.Fatalf("drain must not poll for a never-registered timing id, got %d polls", polls)
 	}
 	trafficMu.RLock()
 	e := trafficCountries["中国"]
@@ -201,8 +207,10 @@ func TestSecurityBlockedCounter_timingSegmentSelection(t *testing.T) {
 		})
 	}
 
-	// 非拦截形态（logged 放行）：无分段写点，但终态标记照常置位（drain 不等待）。
-	t.Run("logged passthrough closes entry without segments", func(t *testing.T) {
+	// 非拦截形态（logged 放行）：本 handler 之外无任何分段写点（无 timing_pre/
+	// timing_end）——E81-历史问题 起 close 不再建条，因此不产生注册表条目；
+	// 审计 drain 对未知 tid 首轮即返（AUD-1），同样不等待。
+	t.Run("logged passthrough without segment writes leaves no entry", func(t *testing.T) {
 		useTestTimingRegistry(t)
 		h := &SecurityBlockedCounter{Rule: "lb_seg_rule"}
 		next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
@@ -211,9 +219,23 @@ func TestSecurityBlockedCounter_timingSegmentSelection(t *testing.T) {
 			t.Fatalf("ServeHTTP: %v", err)
 		}
 		id := req.Header.Get(securityTimingHeader)
-		snap := auditTimingLookupForTest(t, id)
-		if !snap.closed || snap.preSet || snap.endSet {
-			t.Fatalf("snapshot = %+v; want closed empty entry", snap)
+		if id == "" {
+			t.Fatal("timing id header must be injected")
+		}
+		auditTimingMu.Lock()
+		_, exists := auditTimingEntries[id]
+		count := len(auditTimingEntries)
+		auditTimingMu.Unlock()
+		if exists || count != 0 {
+			t.Fatalf("close must not create entries (E81-历史问题), got %d entries", count)
+		}
+		// AND：drain 侧零轮询立即返回（不注入 lb_timing）。
+		snap := auditTimingWait(id, 50*time.Millisecond)
+		if snap.hasAny() || snap.closed {
+			t.Fatalf("snapshot = %+v; want empty", snap)
+		}
+		if polls := auditTimingPollCountForTest.Load(); polls != 0 {
+			t.Fatalf("unknown tid must return without polling, got %d polls", polls)
 		}
 	})
 }

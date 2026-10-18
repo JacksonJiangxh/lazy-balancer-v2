@@ -217,6 +217,24 @@ func TestControlSystemTaskSchemaMatchesHandlerActionSet(t *testing.T) {
 	}
 }
 
+func TestMCPToolDescriptionsCurrentContracts(t *testing.T) {
+	byName := make(map[string]toolSpec, len(tools))
+	for _, spec := range tools {
+		byName[spec.name] = spec
+	}
+	trigger := byName["trigger_system_task"]
+	if strings.Contains(trigger.schema, "can_trigger") || !strings.Contains(trigger.schema, "triggerable") {
+		t.Errorf("trigger_system_task schema=%s, want DTO field triggerable and no can_trigger", trigger.schema)
+	}
+	cert := byName["list_certificates"]
+	if !strings.Contains(cert.description, "每规则每域名最新") {
+		t.Errorf("list_certificates description=%q, want per-rule per-domain latest semantics", cert.description)
+	}
+	if usage := toolUsage["list_certificates"]; !strings.Contains(usage, "每规则每域名最新") {
+		t.Errorf("list_certificates usage=%q, want per-rule per-domain latest semantics", usage)
+	}
+}
+
 func containsString(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {

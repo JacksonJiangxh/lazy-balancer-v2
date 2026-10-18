@@ -174,7 +174,11 @@ func redirectHTTP(reader *bufio.Reader, connection net.Conn) {
 		}
 	}
 	if host == "" {
-		host = connection.LocalAddr().String()
+		// 历史问题-6：无 Host（HTTP/1.0 或畸形头）时不得把监听地址反射进 Location
+		//（net.Listen("tcp", ":port") 下是 https://0.0.0.0:port/，客户端无法
+		// 使用）。按 HTTP 语义返回 400 并关闭——也不反射原始畸形 Host。
+		_, _ = connection.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n"))
+		return
 	}
 	response := fmt.Sprintf("HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\nLocation: https://%s%s\r\nCache-Control: no-store\r\n\r\n", host, location)
 	_, _ = connection.Write([]byte(response))

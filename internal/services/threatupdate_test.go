@@ -1031,3 +1031,42 @@ func TestHealThreatFastFromText_skipsComments(t *testing.T) {
 		t.Fatalf("healed .fast missing: %v", err)
 	}
 }
+
+func TestHealThreatFastFromText_rejectsEmptyList(t *testing.T) {
+	overrideWafDirForTest(t)
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("# only comments\n\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := healThreatFastFromText("ustc"); ok {
+		t.Fatal("empty .iplist must not heal into an empty active list")
+	}
+	if _, err := os.Stat(filepath.Join(wafDir, "threat-ustc.iplist.fast")); !os.IsNotExist(err) {
+		t.Fatal("rejected heal must not create .fast")
+	}
+}
+
+func TestUpdateOneSource_healPreservesRawHash(t *testing.T) {
+	newClusterTestService(t)
+	overrideWafDirForTest(t)
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("1.2.3.4\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET raw_hash='legacy-raw-hash' WHERE name='ustc'`); err != nil {
+		t.Fatal(err)
+	}
+	var id int
+	if err := db.DB.QueryRow(`SELECT id FROM security_threat_sources WHERE name='ustc'`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	m := &ThreatUpdateManager{}
+	if _, failed := m.updateOneSource(context.Background(), threatSourceRow{id: id, name: "ustc"}, "manual", time.Now().UTC().Format(crsTimeLayout)); failed {
+		t.Fatal("heal update failed")
+	}
+	var raw string
+	if err := db.DB.QueryRow(`SELECT COALESCE(raw_hash,'') FROM security_threat_sources WHERE name='ustc'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw != "legacy-raw-hash" {
+		t.Fatalf("raw_hash=%q, want preserved upstream raw hash (heal text hash is not upstream bytes)", raw)
+	}
+}

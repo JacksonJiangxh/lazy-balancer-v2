@@ -231,6 +231,76 @@ func TestLoadOrCreateJWTSecret_validReusedAndEmptyQuiet(t *testing.T) {
 	})
 }
 
+// 历史问题-2：JWT_SECRET 环境变量过短必须告警可见（文件通道强制 ≥32 并再生，
+// 环境变量通道此前完全不校验——3 字节 HS256 密钥可离线爆破）。
+func TestLoad_warnsOnShortEnvJWTSecret(t *testing.T) {
+	t.Setenv("JWT_SECRET", "abc")
+	var logBuf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+
+	loaded := Load("")
+
+	if loaded.JWTSecret != "abc" {
+		t.Fatalf("env secret=%q; want operator-provided value preserved", loaded.JWTSecret)
+	}
+	if !strings.Contains(logBuf.String(), "JWT_SECRET 环境变量过短") {
+		t.Fatalf("short env secret must warn, got %q", logBuf.String())
+	}
+
+	// 回归形状：≥32 字节的环境变量零告警。
+	t.Setenv("JWT_SECRET", strings.Repeat("s", 32))
+	logBuf.Reset()
+	if loaded := Load(""); loaded.JWTSecret != strings.Repeat("s", 32) {
+		t.Fatalf("valid env secret=%q", loaded.JWTSecret)
+	}
+	if strings.Contains(logBuf.String(), "JWT_SECRET 环境变量过短") {
+		t.Fatalf("valid env secret must not warn, got %q", logBuf.String())
+	}
+}
+
+// 历史问题-4：metrics_interval 的 ≤0 与超范围必须告警且结果确定（旧实现 0/负值
+// 静默回落默认；巨值 float→int 回绕后可能被静默抬成 5s 高频采集）。
+func TestLoad_metricsIntervalBoundsWarn(t *testing.T) {
+	t.Setenv("JWT_SECRET", "test-secret")
+	cases := []struct {
+		name    string
+		raw     string
+		want    int
+		wantLog string
+	}{
+		{name: "zero warns", raw: "0", want: 30, wantLog: "must be positive"},
+		{name: "negative warns", raw: "-10", want: 30, wantLog: "must be positive"},
+		{name: "huge clamps to max", raw: "1e300", want: metricsIntervalMax, wantLog: "above maximum"},
+		{name: "above max clamps", raw: "90000", want: metricsIntervalMax, wantLog: "above maximum"},
+		{name: "in range unchanged", raw: "12", want: 12, wantLog: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logBuf bytes.Buffer
+			origOut := log.Writer()
+			log.SetOutput(&logBuf)
+			t.Cleanup(func() { log.SetOutput(origOut) })
+
+			configPath := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(configPath, []byte(`{"metrics_interval":`+tc.raw+`}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			loaded := Load(configPath)
+			if loaded.MetricsInterval != tc.want {
+				t.Fatalf("metrics interval=%d, want %d", loaded.MetricsInterval, tc.want)
+			}
+			if tc.wantLog != "" && !strings.Contains(logBuf.String(), tc.wantLog) {
+				t.Fatalf("expected log %q, got %q", tc.wantLog, logBuf.String())
+			}
+			if tc.wantLog == "" && strings.Contains(logBuf.String(), "metrics_interval") {
+				t.Fatalf("in-range interval must not log, got %q", logBuf.String())
+			}
+		})
+	}
+}
+
 func TestLoad_normalizesRelativeDataDir(t *testing.T) {
 	t.Setenv("JWT_SECRET", "test-secret")
 	dir := t.TempDir()

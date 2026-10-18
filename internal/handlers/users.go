@@ -149,32 +149,16 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	// B1-04（历史）：空 password 键在策略层语义为「不修改」
 	// （validatePasswordPolicy 空值放行、passwordHash 仅非空生成）——携带
 	// 空串不算改密尝试，不得触发 OIDC 门；非空仍拦截。
+	// B1-历史问题（历史）：门控按「值实际变化」而非「字段出现」判定——
+	// 携带与库中同值的 display_name、空 username 属无变更的局部更新（写侧
+	// 同样跳过，见下方 UPDATE 分支），不得整单 400。故门控前移到事务内读到
+	// 旧值之后再判。
 	passwordChangeRequested := req.Password != nil && *req.Password != ""
-	if req.DisplayName != nil || passwordChangeRequested || req.Username != nil {
-		oidcUser, err := isOIDCUser(c.Request.Context(), id)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户身份失败"})
-			return
-		}
-		if oidcUser {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "OIDC 用户的用户名、显示名与密码由认证服务管理，请前往 OIDC 服务修改"})
-			return
-		}
-	}
 	if req.Password != nil {
 		if err := validatePasswordPolicy(*req.Password); err != nil {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 			return
 		}
-	}
-	var passwordHash string
-	if req.Password != nil && *req.Password != "" {
-		hash, err := bcrypt.GenerateFromPassword([]byte(*req.Password), bcrypt.DefaultCost)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "密码加密失败"})
-			return
-		}
-		passwordHash = string(hash)
 	}
 
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
@@ -202,10 +186,35 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 		return
 	}
 
+	// OIDC 门（值变化判定，见上方 B1-历史问题）：username 空串/同值、display_name
+	// 同值均为「不修改」（与下方 UPDATE 分支同一谓词），非空密码恒视为改密尝试。
+	usernameChanged := req.Username != nil && *req.Username != "" && *req.Username != oldUsername
+	displayNameChanged := req.DisplayName != nil && *req.DisplayName != oldDisplayName
+	if usernameChanged || displayNameChanged || passwordChangeRequested {
+		oidcUser, err := isOIDCUser(c.Request.Context(), id)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户身份失败"})
+			return
+		}
+		if oidcUser {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "OIDC 用户的用户名、显示名与密码由认证服务管理，请前往 OIDC 服务修改"})
+			return
+		}
+	}
+	var passwordHash string
+	if passwordChangeRequested {
+		hash, err := bcrypt.GenerateFromPassword([]byte(*req.Password), bcrypt.DefaultCost)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "密码加密失败"})
+			return
+		}
+		passwordHash = string(hash)
+	}
+
 	changed := []string{}
 	sets := make([]string, 0, 5)
 	args := make([]any, 0, 5)
-	if req.Username != nil && *req.Username != "" && *req.Username != oldUsername {
+	if usernameChanged {
 		if err := validateUsernamePolicy(*req.Username); err != nil { // 历史问题-历史问题：改名须过策略（创建/注册已查、更新曾漏）
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 			return
@@ -220,7 +229,7 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 		args = append(args, *req.Role)
 		changed = append(changed, "角色："+oldRole+"→"+*req.Role)
 	}
-	if req.DisplayName != nil && *req.DisplayName != oldDisplayName {
+	if displayNameChanged {
 		sets = append(sets, "display_name = ?")
 		args = append(args, *req.DisplayName)
 		changed = append(changed, "昵称："+oldDisplayName+"→"+*req.DisplayName)

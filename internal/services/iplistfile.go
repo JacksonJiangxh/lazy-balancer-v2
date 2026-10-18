@@ -141,17 +141,21 @@ const ipListGCInterval = time.Hour
 //     含点 rule id，旧字符类使这类孤儿永不回收；白名单仍不含路径分隔符，
 //     纯单段文件名，无路径逃逸面）；升级前旧全局名 u-deny.txt 等同字符类
 //     天然覆盖，由 24h GC 过渡回收）；精确白名单，用户手放文件不碰；
-//   - 旧内容寻址 scope-sha256[:12].txt——迁移过渡分支：改造前落盘的旧哈希
-//     文件由既有 24h GC 自然回收（不写迁移），旧文件清尽后该分支恒不命中，
-//     自行失效。
-var ipListProjectedFileName = regexp.MustCompile(`^(u-[A-Za-z0-9][A-Za-z0-9._-]*|p[0-9]+-(acl|trust|bl|crsxc-([0-9]+|[0-9a-f]{12}))|tp|.+-[0-9a-f]{12})\.txt$`)
+//   - 旧内容寻址 <已知 scope>-sha256[:12].txt——迁移过渡分支：改造前落盘的
+//     旧哈希文件由既有 24h GC 自然回收（不写迁移）。D1-历史问题：后缀只允许
+//     挂在上述已知 scope 形态之后——原 `|.+-[0-9a-f]{12}` 会把运维投放的
+//     backup-deadbeef1234.txt 一律当作自身投影删除，且「旧文件清尽后自行
+//     失效」的注释不成立（分支恒命中任意前缀）。旧文件清尽后该分支对已知
+//     scope 仍可能命中（用户手放同形名），但不再吞未知前缀文件。
+var ipListProjectedFileName = regexp.MustCompile(`^(u-[A-Za-z0-9][A-Za-z0-9._-]*|p[0-9]+-(acl|trust|bl|crsxc-([0-9]+|[0-9a-f]{12}))|tp)(-[0-9a-f]{12})?\.txt$`)
 
 // ipListTempFileName 匹配 writeIPListFile 的临时文件名形态
 // （CreateTemp(IPListDataDir, scope+"-*.tmp")：<投影 scope>-<随机数字>.tmp）。
 // 历史问题（历史）：GC 只委托删除本模块拥有的临时文件——目录内的无关
 // .tmp（运维投放的 ops-notes.tmp 等）一律不动；24h 超龄门槛仍保护在役写入
-// （在役 tmp 恒新鲜）。scope 白名单与 ipListProjectedFileName 同源。
-var ipListTempFileName = regexp.MustCompile(`^(u-[A-Za-z0-9][A-Za-z0-9._-]*-[0-9]+|p[0-9]+-(acl|trust|bl|crsxc-([0-9]+|[0-9a-f]{12}))-[0-9]+|tp-[0-9]+|.+-[0-9a-f]{12}-[0-9]+)\.tmp$`)
+// （在役 tmp 恒新鲜）。scope 白名单与 ipListProjectedFileName 同源（D1-历史问题
+// 同款收口：旧哈希后缀只挂已知 scope，不吞任意前缀）。
+var ipListTempFileName = regexp.MustCompile(`^(u-[A-Za-z0-9][A-Za-z0-9._-]*|p[0-9]+-(acl|trust|bl|crsxc-([0-9]+|[0-9a-f]{12}))|tp)(-[0-9a-f]{12})?-[0-9]+\.tmp$`)
 
 // ipListRenderRefs 记录本进程渲染引用过的投影文件及最近引用时间：一次全量
 // 配置渲染会重新投影全部在役名单（同字节跳写也计引用），故「长期
@@ -181,6 +185,12 @@ func forgetIPListRenderRefForTest(path string) {
 
 // maybeGCStaleIPListFiles 整轮渲染 apply 成功后的节流 GC 入口（间隔
 // ipListGCInterval）——此刻本轮渲染的全部在役名单引用已落齐，差集决策安全。
+//
+// D1-历史问题（触发面披露）：唯一调用点在成功 /load 之后；2026-10-15 起的名单
+// 热路径刻意零 /load，因此长期仅热路径收敛的系统里，孤儿投影（通常由策略/
+// 规则删除产生，删除走全量链会触发本 GC）的回收会被推迟到下一次真实重载。
+// 有界非泄漏（文件不增长、不参与渲染），接受该披露而不为零/load 路径新增
+// GC 触发点（差集前提=本轮全量引用集已落齐，热路径不具备该前提）。
 func maybeGCStaleIPListFiles() {
 	if time.Since(ipListLastGC) < ipListGCInterval {
 		return

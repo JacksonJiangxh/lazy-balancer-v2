@@ -563,6 +563,48 @@ func TestVerifySnapshotIntegrity_acceptsMasterVersionRegressionWithWarning(t *te
 	}
 }
 
+func TestSyncService_Pull_demotedMaster403RecoversWithoutTokenRevocation(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var promoted atomic.Bool
+	const token = "cluster-token"
+	snapshot := signedTestSnapshot(1, token)
+	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/v1/cluster/sync/snapshot":
+			if !promoted.Load() {
+				response.WriteHeader(http.StatusForbidden)
+				_, _ = response.Write([]byte(`{"code":403,"message":"该操作仅允许在主节点执行"}`))
+				return
+			}
+			response.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(response).Encode(models.APIResponse{Code: 0, Data: snapshot})
+		default:
+			response.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer master.Close()
+	caddy := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) { response.WriteHeader(http.StatusOK) }))
+	defer caddy.Close()
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token=? WHERE id=1", master.URL, token); err != nil {
+		t.Fatal(err)
+	}
+	service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, NewCaddyService(caddy.URL))
+	if _, err := service.Pull(context.Background()); err == nil || errors.Is(err, errSyncTokenRevoked) {
+		t.Fatalf("demoted master error=%v, want non-terminal retryable failure", err)
+	}
+	promoted.Store(true)
+	if _, err := service.Pull(context.Background()); err != nil {
+		t.Fatalf("pull after re-promotion: %v", err)
+	}
+	var applied int
+	if err := database.QueryRow("SELECT applied_version FROM global_config WHERE id=1").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("applied_version=%d, want recovery to version 1", applied)
+	}
+}
+
 func TestVerifySnapshotIntegrity_classifiesAuthenticHigherMinReaderVersion(t *testing.T) {
 	// Given
 	const token = "cluster-token"
@@ -580,6 +622,30 @@ func TestVerifySnapshotIntegrity_classifiesAuthenticHigherMinReaderVersion(t *te
 	}
 	if got := syncErrorCode(err); got != models.SyncErrorCodeSchemaTooNew {
 		t.Fatalf("sync error code=%q, want %q", got, models.SyncErrorCodeSchemaTooNew)
+	}
+}
+
+func TestVerifySnapshotIntegrity_rejectsTamperedOuterMinReaderWithoutTerminalSchemaError(t *testing.T) {
+	// Given：canonical 与签名均合法，仅外层 min_reader_version 被在途篡改。
+	const token = "cluster-token"
+	snapshot := signTestSnapshot(models.ClusterSnapshot{
+		Version: 1, SchemaVersion: CurrentSnapshotSchema, MinReaderVersion: CurrentSnapshotSchema,
+	}, token)
+	snapshot.MinReaderVersion = CurrentSnapshotSchema + 1
+
+	// When
+	err := verifySnapshotIntegrity(snapshot, token, 0)
+
+	// Then：终止性版本判定只能使用完成 canonical 一致性绑定的值。
+	var schemaTooNew *SnapshotSchemaTooNewError
+	if err == nil || errors.As(err, &schemaTooNew) {
+		t.Fatalf("tampered outer min-reader error=%v, want non-terminal validation failure", err)
+	}
+	if got := syncErrorCode(err); got != models.SyncErrorCodeValidationFailed {
+		t.Fatalf("sync error code=%q, want %q", got, models.SyncErrorCodeValidationFailed)
+	}
+	if !strings.Contains(err.Error(), "元数据不一致") {
+		t.Fatalf("error=%v, want canonical metadata mismatch", err)
 	}
 }
 

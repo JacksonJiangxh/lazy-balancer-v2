@@ -449,15 +449,18 @@ func reversedCertJobDomain(domain string) string {
 }
 
 // certJobDeleteGuard 返回该状态任务在关联规则仍处自动签发状态时是否受 409
-// 守卫及对应文案（守卫的状态类枚举与取舍理由见 DeleteCertJob 守卫注释）。
+// 守卫及对应文案。disabled 是已退出自动签发链的唯一可删除状态；其余状态
+// 一律默认受守卫，避免新增在途状态时再次形成断链旁路。
 func certJobDeleteGuard(status string) (bool, string) {
 	switch status {
+	case "disabled":
+		return false, ""
 	case "issued", "downloaded":
 		return true, "该任务持有有效证书且关联规则仍在自动签发状态，删除后自动续签将中断且无法自动恢复；请先禁用规则或切换证书来源后再删除"
 	case "failed", "waiting_ca", "queued":
 		return true, "该任务仍在自动签发链中（等待签发或等待重试），且关联规则仍在自动签发状态，删除后自动签发将中断且无法自动恢复；请先禁用规则或切换证书来源后再删除"
 	default:
-		return false, ""
+		return true, "该任务仍在自动签发链中（正在执行或清理 DNS），且关联规则仍在自动签发状态，删除后自动签发将中断且无法自动恢复；请先禁用规则或切换证书来源后再删除"
 	}
 }
 
@@ -498,17 +501,12 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 		dbQueryNotFound(c, err, "Job not found", "DeleteCertJob query job")
 		return
 	}
-	// 历史问题 N4 + 历史问题 S-2：删除持有证书的 issued/downloaded 任务、或删除仍在
-	// 自动签发链中等待的 failed/waiting_ca/queued 任务，且规则仍在自动签发
-	// 状态时，纯周期路径永不重建任务行（CreateOrRequeueCertJob 仅由规则写
-	// 路径调用），自动签发/续签永久断链且 UI 无信号——409 显式拒绝；运维可
-	// 先禁用规则或切换证书来源后再删除，与既有 disabled-flow 语义一致。
-	// 在途执行态（pending/processing/creating_*/order_*/presenting_dns/
-	// waiting_propagation/dns_propagated/accepting_challenge/validating/
-	// validated/finalizing/finalized/downloading/waiting_order_* 及
-	// cleanup_dns/cleanup_warning）不在守卫内：删除是中断在途尝试的显式
-	// 运维手段（cancelCertJob 即时取消执行，删除失败恢复路径会重新排队），
-	// 封锁它会移除卡死签发的唯一中止通道。disabled 为退役终态，删除即清理。
+	// 历史问题 N4 + 历史问题 S-2 + 历史问题-02：规则仍在自动签发状态时，删除任何未退役
+	// 任务都会让纯周期路径失去续签/签发入口（CreateOrRequeueCertJob 仅由规则
+	// 写路径调用），因此 issued/downloaded、等待态、在途执行态与 cleanup_* 全部
+	// 409 显式拒绝；运维可先禁用规则或切换证书来源后再删除。disabled 为退役
+	// 终态，删除即清理。中断卡死尝试应使用重试/禁用规则流程，而不是删除唯一
+	// 任务行。
 	// 已知竞态（历史问题 S-5）：DeleteRule drain 超时后的后台补偿（不持
 	// caddyOpMu）在退避窗口内按规则快照 DELETE+INSERT 恢复 cert_jobs，
 	// 可能复活窗口内被本函数删除的行——恢复是保守选择（复活行来自规则自身
@@ -691,15 +689,21 @@ func (h *Handlers) GetCertJobLogs(c *gin.Context) {
 	logPath := certJobLogPathForRule(ruleID)
 	// 历史问题（2026-09-05 证书域审计裁定）：按旧→新拼接全部轮转备份再加当前文件
 	//（.5 最旧 → .1 最新，对齐写侧 maxRotatedFiles=5），每文件保留 128KB/500 行
-	// 截断；缺失的备份序号按空跳过。升序遍历逐个前置，末序恰为 .5→.1→当前。
-	content := readCertJobLogFile(logPath)
+	// 截断；缺失的备份序号按空跳过。
+	content := prependTaskLogRotations(logPath, readCertJobLogFile(logPath))
+
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": content}})
+}
+
+// prependTaskLogRotations 把 .1～.5 逐代前置到活动日志内容之前，最终顺序
+// 恒为 .5→.1→活动文件；任务监控与证书任务日志共用同一轮转口径。
+func prependTaskLogRotations(path, content string) string {
 	for i := 1; i <= certJobLogMaxRotatedBackups; i++ {
-		if backup := readCertJobLogFile(fmt.Sprintf("%s.%d", logPath, i)); backup != "" {
+		if backup := readCertJobLogFile(fmt.Sprintf("%s.%d", path, i)); backup != "" {
 			content = backup + content
 		}
 	}
-
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": content}})
+	return content
 }
 
 func readCertJobLogFile(path string) string {

@@ -9,11 +9,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/services"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 func TestImportFailureAuditDescriptionReflectsFailurePhase(t *testing.T) {
@@ -43,11 +45,57 @@ func TestImportFailureAuditDescriptionReflectsFailurePhase(t *testing.T) {
 	}
 }
 
+// B3-82-历史问题 / 历史问题-历史问题：并发导入必须串行；第二个会话在第一个
+// close 前不得已执行 Pause，否则第一个 Resume 会让它失去排空保护。
+func TestBeginConfigImport_serializesConcurrentSessions(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initTaskEngineForTest(t)
+	te := services.TaskEngine()
+	if err := te.Register(taskengine.Descriptor{
+		ID: "import-serial-probe", Family: "test", Name: "Import serialization probe",
+		Kind: taskengine.KindOneshot,
+		Run:  func(taskengine.RunContext) error { return nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := h.beginConfigImport(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		session *configImportSession
+		err     error
+	}
+	secondDone := make(chan result, 1)
+	go func() {
+		session, err := h.beginConfigImport(context.Background())
+		secondDone <- result{session: session, err: err}
+	}()
+	time.Sleep(100 * time.Millisecond) // 给旧实现机会执行 Pause 后阻塞在 caddyOpMu
+	first.close()
+	var second result
+	select {
+	case second = <-secondDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second import did not begin after first closed")
+	}
+	if second.err != nil {
+		t.Fatalf("second begin: %v", second.err)
+	}
+	err = te.Trigger("import-serial-probe", "manual", "test")
+	if !errors.Is(err, taskengine.ErrSchedulingPaused) {
+		second.session.close()
+		t.Fatalf("second import session is not paused (trigger err=%v)", err)
+	}
+	second.session.close()
+}
+
 func TestBeginConfigImport_preservesStoppedCAQueue(t *testing.T) {
 	// Given：cert-issuance 已被停止，CA 队列为 inactive。
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil })
+	services.GetCAQueueManager().Start()
 	manager := services.GetCAQueueManager()
 	manager.PauseAndDrain()
 	if manager.IsActive() {

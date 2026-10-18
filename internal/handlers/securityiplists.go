@@ -249,6 +249,11 @@ func parseIPListRefsPayload(field string, val *string) ([]int64, error) {
 		// 撑爆配置体积——封顶 64(去重后计数)。
 		return nil, fmt.Errorf("%s 引用的 IP 列表数量不能超过 64", field)
 	}
+	normalized, err := json.Marshal(unique)
+	if err != nil {
+		return nil, fmt.Errorf("%s 归一化失败: %w", field, err)
+	}
+	*val = string(normalized)
 	return unique, nil
 }
 
@@ -708,6 +713,11 @@ func (h *Handlers) CreateIPList(c *gin.Context) {
 
 func (h *Handlers) UpdateIPList(c *gin.Context) {
 	id := c.Param("id")
+	listID, idOK := parsePositiveNumericID(id)
+	if !idOK {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的列表 ID"})
+		return
+	}
 	var req models.UpdateIPListRequest
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -778,31 +788,21 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 	}
 	// N1(历史):条目清空 + 本列表被 allow 模式策略引用 → 该策略
 	// 生效名单变空 → 发射端 fail-open(「其余一律拒绝」实际全放行)且 UI
-	// 仍宣称 IP 控制已启用。镜像 DeleteIPList 引用门:条目将被清空且存在
-	// allow 引用时 409 拒绝(同事务内检查,持 caddyOpMu)。
+	// 仍宣称 IP 控制已启用。A81A-历史问题：判据必须与 RemoveIPListEntry 同源——
+	// 走 allowEmptyingBlockedByPolicies 的「并集是否为空」语义（策略内联或
+	// 其他引用名单仍有条目时清空本列表不会放行全部请求），此前按「是否被
+	// 引用」一律 409 的偏严口径给出的文案在并集非空时是假的。
 	if req.Entries != nil && len(entries) == 0 {
-		// S历史问题-2(历史):非规范数字 id('5.0'/' 5')经 SQLite 数值
-		// 亲和仍命中行,但 ParseInt 失败使守卫静默跳过 → 清空被 allow 引用的
-		// 列表 fail-open。与 DeleteIPList 同口径:解析失败直接 400。
-		listID, perr := strconv.ParseInt(id, 10, 64)
-		if perr != nil || listID <= 0 {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的列表 ID"})
+		blocked, berr := allowEmptyingBlockedByPolicies(tx, listID, nil)
+		if berr != nil {
+			// S历史问题(历史):守卫查询失败 fail-closed——静默放行
+			// 「清空被 allow 引用的列表」正是 N1 要防的发射端 fail-open 形态。
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "校验 IP 列表引用失败: " + berr.Error()})
 			return
 		}
-		var allowRefCount int
-		if err := tx.QueryRowContext(c.Request.Context(),
-			`SELECT COUNT(*) FROM security_policies
-WHERE COALESCE(ip_acl_enabled,0)=1 AND COALESCE(ip_acl_mode,'')='allow'
-  AND json_valid(COALESCE(ip_acl_list_refs,'[]')) AND EXISTS (SELECT 1 FROM json_each(COALESCE(ip_acl_list_refs,'[]')) je WHERE je.value=?)`,
-			listID).Scan(&allowRefCount); err != nil {
-			// S历史问题(历史):守卫查询失败 fail-closed——此前
-			// err==nil&& 使查询错误静默放行「清空被 allow 引用的列表」,
-			// 正是 N1 要防的发射端 fail-open 形态;与 12 行后重名门同口径。
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "校验 IP 列表引用失败"})
-			return
-		} else if allowRefCount > 0 {
+		if blocked {
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409,
-				Message: fmt.Sprintf("该列表正被 %d 个白名单模式策略引用，清空条目会使这些策略放行全部请求，请先解除引用", allowRefCount)})
+				Message: "清空后会使引用它的白名单策略生效集合为空（空名单会放行所有请求）；请先为相关策略补充内联条目或其他引用名单，或解除引用"})
 			return
 		}
 	}
@@ -992,6 +992,10 @@ func (h *Handlers) DeleteIPList(c *gin.Context) {
 
 func (h *Handlers) AddIPToList(c *gin.Context) {
 	id := c.Param("id")
+	if _, ok := parsePositiveNumericID(id); !ok {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的列表 ID"})
+		return
+	}
 	var req models.AddIPToListRequest
 	if !guardConfiguredJSONBody(c) {
 		return

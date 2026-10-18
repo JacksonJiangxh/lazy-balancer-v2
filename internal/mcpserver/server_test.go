@@ -109,6 +109,53 @@ func TestUpdateConfigSchemaExcludesCaddyLogPath(t *testing.T) {
 	}
 }
 
+func TestUpdateConfigSchemaCurrentWritableFields(t *testing.T) {
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(updateConfigSchema), &schema); err != nil {
+		t.Fatalf("parse update config schema: %v", err)
+	}
+	for _, field := range []string{"threat_screen_mode", "threat_traffic_sample_n", "security_events_retention_days", "security_events_row_cap"} {
+		if _, ok := schema.Properties[field]; !ok {
+			t.Errorf("update_config schema lacks writable field %q", field)
+		}
+	}
+
+	var mode struct {
+		Enum []string `json:"enum"`
+	}
+	if raw := schema.Properties["threat_screen_mode"]; json.Unmarshal(raw, &mode) != nil || strings.Join(mode.Enum, ",") != "map,globe" {
+		t.Errorf("threat_screen_mode enum=%v, want map/globe", mode.Enum)
+	}
+	var sample struct {
+		Enum []int `json:"enum"`
+	}
+	if raw := schema.Properties["threat_traffic_sample_n"]; json.Unmarshal(raw, &sample) != nil || len(sample.Enum) != 3 || sample.Enum[0] != -1 || sample.Enum[1] != 0 || sample.Enum[2] != 1 {
+		t.Errorf("threat_traffic_sample_n enum=%v, want [-1,0,1]", sample.Enum)
+	}
+	for field, wantMax := range map[string]int{"security_events_retention_days": 3650, "security_events_row_cap": 100000000} {
+		var property struct {
+			Maximum int `json:"maximum"`
+		}
+		if err := json.Unmarshal(schema.Properties[field], &property); err != nil || property.Maximum != wantMax {
+			t.Errorf("%s maximum=%d err=%v, want %d", field, property.Maximum, err, wantMax)
+		}
+	}
+
+	for _, field := range []string{"trusted_proxy_ranges", "trusted_proxy_headers"} {
+		var property struct {
+			Description string `json:"description"`
+		}
+		if err := json.Unmarshal(schema.Properties[field], &property); err != nil {
+			t.Fatalf("decode %s: %v", field, err)
+		}
+		if strings.Contains(property.Description, "逗号分隔") || !strings.Contains(property.Description, "JSON 字符串数组文本") || !strings.Contains(property.Description, "[\"") {
+			t.Errorf("%s description=%q, want JSON string-array text with example", field, property.Description)
+		}
+	}
+}
+
 func TestToolsListHidesWriteTools_forReadOnlyAPIKey(t *testing.T) {
 	// Given
 	resolver := func(apiKey string) (bool, error) {

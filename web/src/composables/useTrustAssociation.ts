@@ -148,7 +148,12 @@ export const useTrustAssociation = (options: {
     }
     creating.value = true
     try {
-      await request.post(`/security/ip-lists/${list.id}/remove-ip`, { value: ip })
+      const res = await request.post<APIResponse<{ removed?: boolean }>>(`/security/ip-lists/${list.id}/remove-ip`, { value: ip })
+      if (res.data?.removed !== true) {
+        ElMessage.info(`列表「${list.name}」中没有 ${ip} 的精确条目；若由 CIDR 覆盖，请编辑列表处理`)
+        await options.onChanged?.()
+        return
+      }
       ElMessage.success(`已从「${list.name}」移除`)
       await options.onChanged?.()
     } catch {

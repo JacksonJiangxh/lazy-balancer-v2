@@ -74,7 +74,7 @@ func TestValidateAndNormalizeCRSField_hybridRuleGroups(t *testing.T) {
 	}
 	for _, tc := range cases {
 		val := tc.payload
-		err := validateAndNormalizeCRSField("crs_rule_groups", &val)
+		err := validateAndNormalizeCRSField("crs_rule_groups", &val, true)
 		if tc.wantErr == "" {
 			if err != nil {
 				t.Fatalf("groups %s: unexpected error %v", tc.payload, err)
@@ -124,7 +124,7 @@ func TestValidateCRSExcludedRulesPayload_matrix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		val := tc.payload
-		err := validateCRSExcludedRulesPayload(&val)
+		err := validateCRSExcludedRulesPayload(&val, true)
 		if tc.wantErr == "" {
 			if err != nil {
 				t.Fatalf("%s: unexpected error %v", tc.name, err)

@@ -22,6 +22,7 @@ package caddygeoip
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -86,6 +87,18 @@ const (
 	fuseFallbackPerSecond = 1000
 )
 
+// trafficCountryKeyValid 判定国名键是否为可展示的国家值：xdb 对私网/保留
+// 网段行的国家列常为 "0"/"Reserved"，不可解析行为空串。与事件聚合端点
+// （internal/handlers/security_threat_screen.go 的 ""/"0"/"Reserved" 过滤）
+// 同口径——E81-历史问题：大屏只为真实国家画弧/建桶。
+func trafficCountryKeyValid(country string) bool {
+	switch strings.TrimSpace(country) {
+	case "", "0", "Reserved":
+		return false
+	}
+	return true
+}
+
 func trafficEntryFor(country string) *trafficEntry {
 	trafficMu.RLock()
 	e := trafficCountries[country]
@@ -107,10 +120,10 @@ func trafficEntryFor(country string) *trafficEntry {
 	return e
 }
 
-// trafficRecord 记一次请求（country 空=geoip 未解析——跳过；抽样期按 1/N
-// 计数并 ×N 还原）。
+// trafficRecord 记一次请求（country 非国家值=未解析/私网保留段——跳过；
+// 抽样期按 1/N 计数并 ×N 还原）。
 func trafficRecord(country string, attack bool) {
-	if country == "" {
+	if !trafficCountryKeyValid(country) {
 		return
 	}
 	// 惰性翻秒 + 保险丝状态机（全量→1/8 抽样→全量，滞回防抖动）。

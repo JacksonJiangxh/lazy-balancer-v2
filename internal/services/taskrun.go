@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -41,8 +42,7 @@ func updateRunStillMaster() bool {
 	if db.DB == nil {
 		return false
 	}
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
+	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
 		return false
 	}
 	return true

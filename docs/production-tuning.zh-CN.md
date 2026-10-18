@@ -44,7 +44,7 @@ fs.file-max = 2097152
 
 每个连接消耗一个 fd（含 TLS/日志/证书文件）。容器内进程上限由 compose
 `ulimits` 控制（仓库已配置），宿主机 systemd 单元如需放宽：
-`/etc/systemd/docker.service.d/override.conf` 设 `LimitNOFILE=1048576`。
+`/etc/systemd/system/docker.service.d/override.conf` 设 `LimitNOFILE=1048576`。
 
 ### HTTP/3 端口
 
@@ -110,7 +110,7 @@ TCP 握手 + 慢启动。高 QPS 场景延迟与上游负载双降。
   reverse_proxy `max_requests`）防止单一上游被打穿。
 - **版本隐藏**：全局开关（基础设置，`server_tokens_hidden`，渲染为 deferred
   headers 处理器隐藏 Server 头）。注：规则级 `server_tokens_hidden` 为
-  API/MCP 预留字段（2026-09-06 起，无 UI 入口），取值 0=随全局 / **1=隐藏** /
+  API/MCP 预留字段（无 UI 入口），取值 0=随全局 / **1=隐藏** /
   **2=显示**——与 v2.2.5 前文档所述「2=完全隐藏」相反，以实现为准。
 
 ---
@@ -128,7 +128,7 @@ detection 模式仅记录不拦截；切换 blocking 前用安全事件页确认
 
 ### 3.2 CRS 规则组裁剪
 
-> 阶段化模型（2026-09-20 起）：CRS 规则组属于**阶段 3 · WAF 类型策略**（与限流
+> 阶段化模型：CRS 规则组属于**阶段 3 · WAF 类型策略**（与限流
 > 等其它阶段分属不同策略实体）；下文的规则组裁剪在 WAF 类型策略的编辑页操作。
 
 只启用业务相关的规则组（策略编辑 → CRS 规则组），降低每请求的规则评估开销

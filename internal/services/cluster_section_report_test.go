@@ -221,6 +221,65 @@ func TestClusterService_DeleteNode_clearsSectionReport(t *testing.T) {
 	}
 }
 
+func TestClusterService_roleFlipClearsSectionReports(t *testing.T) {
+	t.Run("become slave", func(t *testing.T) {
+		service, database := newClusterTestService(t)
+		nodeID := insertApprovedClusterNode(t, database, "slave-before-demote")
+		if err := service.ReportNode(context.Background(), nodeID, models.ClusterReport{SectionHashes: map[string]string{"rules": "stale"}}, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := service.BecomeSlave(context.Background(), "https://new-master.example", models.ClusterRegistration{RegistrationID: 9}); err != nil {
+			t.Fatalf("become slave: %v", err)
+		}
+		service.sectionMu.Lock()
+		defer service.sectionMu.Unlock()
+		if len(service.sectionReports) != 0 {
+			t.Fatalf("stale master-era section reports=%v, want cleared", service.sectionReports)
+		}
+	})
+	t.Run("promote", func(t *testing.T) {
+		service, database := newClusterTestService(t)
+		nodeID := insertApprovedClusterNode(t, database, "slave-before-promote")
+		if err := service.ReportNode(context.Background(), nodeID, models.ClusterReport{SectionHashes: map[string]string{"rules": "stale"}}, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url='https://old-master.example' WHERE id=1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := service.Promote(context.Background()); err != nil {
+			t.Fatalf("promote: %v", err)
+		}
+		service.sectionMu.Lock()
+		defer service.sectionMu.Unlock()
+		if len(service.sectionReports) != 0 {
+			t.Fatalf("stale slave-era section reports=%v, want cleared", service.sectionReports)
+		}
+	})
+}
+
+func TestClusterService_RegisterNode_upsertClearsSectionReport(t *testing.T) {
+	service, database := newClusterTestService(t)
+	nodeID := insertApprovedClusterNode(t, database, "slave-reregister")
+	if err := service.ReportNode(context.Background(), nodeID, models.ClusterReport{SectionHashes: map[string]string{"rules": "stale"}}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	token, _, err := service.GenerateRegisterToken(context.Background(), 1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
+		Token: token, Name: "slave-reregister", IPAddress: "127.0.0.1", Port: 8000,
+	}, now); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	service.sectionMu.Lock()
+	defer service.sectionMu.Unlock()
+	if _, remains := service.sectionReports[nodeID]; remains {
+		t.Fatal("section report survived node re-registration")
+	}
+}
+
 func TestSyncService_Report_includesAppliedSectionHashes(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)

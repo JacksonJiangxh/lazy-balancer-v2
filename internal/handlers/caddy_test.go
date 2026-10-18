@@ -686,3 +686,147 @@ func TestStartCaddy_zombieSupervisorFallsBackToDirectSpawn(t *testing.T) {
 		t.Fatal("未落直启路径（僵尸被误判为活，劫持到委托路径）")
 	}
 }
+
+// 历史采样契约（用户裁定）：threat_traffic_sample_n 仅 -1（自适应）/
+// 0（关闭）/1（全量）；固定 2..64 已废除，写侧 400。
+func TestUpdateConfig_samplingContractOnlyAdaptiveOffFull(t *testing.T) {
+	handler := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/config", handler.UpdateConfig)
+
+	put := func(body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+
+	for _, value := range []string{"2", "4", "8", "64", "-2"} {
+		response := put(`{"source":"basic","threat_traffic_sample_n":` + value + `}`)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "仅支持 -1（自适应）、0（关闭）或 1（全量）") {
+			t.Fatalf("sample_n=%s status=%d body=%s, want 400 contract", value, response.Code, response.Body.String())
+		}
+	}
+	for _, value := range []string{"-1", "0", "1"} {
+		response := put(`{"source":"basic","threat_traffic_sample_n":` + value + `}`)
+		if response.Code != http.StatusOK {
+			t.Fatalf("sample_n=%s status=%d body=%s, want 200", value, response.Code, response.Body.String())
+		}
+	}
+}
+
+// 历史问题-6（历史）：预览与保存共用同一组校验——保存必 400 的载荷
+// 不得在预览给出「可变更」清单。
+func TestPreviewConfigUpdate_matchesSaveSideValidation(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/config/preview", h.PreviewConfigUpdate)
+	router.PUT("/config", h.UpdateConfig)
+
+	post := func(handler gin.HandlerFunc, method, path, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+	// 每组非法值：预览与保存必须同为 400（此前预览仅校验受信代理，其余直接 200）。
+	for _, body := range []string{
+		`{"source":"basic","log_level":"verbose"}`,
+		`{"source":"basic","timezone":"Not/AZone"}`,
+		`{"source":"basic","threat_traffic_sample_n":4}`,
+		`{"source":"basic","security_events_retention_days":0}`,
+		`{"source":"basic","security_events_row_cap":0}`,
+		`{"source":"basic","caddy_log_size_mb":1}`,
+		`{"source":"caddy","access_log_format":"request>remote_ip->delete"}`,
+	} {
+		preview := post(h.PreviewConfigUpdate, http.MethodPost, "/config/preview", body)
+		if preview.Code != http.StatusBadRequest {
+			t.Fatalf("preview body=%s status=%d resp=%s, want 400（与保存同组校验）", body, preview.Code, preview.Body.String())
+		}
+		save := post(h.UpdateConfig, http.MethodPut, "/config", body)
+		if save.Code != http.StatusBadRequest {
+			t.Fatalf("save body=%s status=%d resp=%s, want 400", body, save.Code, save.Body.String())
+		}
+	}
+	// 合法形态：预览 200 且归一后的变更清单可见（"DEBUG" 归一为 debug，与保存
+	// 同口径——归一在校验函数内回写 req）。
+	preview := post(h.PreviewConfigUpdate, http.MethodPost, "/config/preview", `{"source":"basic","log_level":"DEBUG"}`)
+	if preview.Code != http.StatusOK {
+		t.Fatalf("valid preview status=%d body=%s, want 200", preview.Code, preview.Body.String())
+	}
+}
+
+// 历史问题-2（历史）：apply 失败且回弹也失败时，除响应/审计外必须持久化
+// caddy_apply_error 横幅（重启后真实失败仍可见）。
+func TestUpdateConfig_rollbackFailurePersistsApplyBanner(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/config/":
+			_, _ = w.Write([]byte(`{"old":true}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/load":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"boom"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{caddyService: services.NewCaddyService(srv.URL)}
+	router := gin.New()
+	router.PUT("/config", h.UpdateConfig)
+	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"source":"basic","proxy_dial_timeout":5}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code == http.StatusOK {
+		t.Fatalf("status=%d body=%s, want apply/rollback failure", response.Code, response.Body.String())
+	}
+	var banner string
+	if err := db.DB.QueryRow(`SELECT COALESCE(caddy_apply_error,'') FROM global_config WHERE id=1`).Scan(&banner); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(banner, "Caddy 配置应用失败") {
+		t.Fatalf("caddy_apply_error=%q, want persisted failure banner", banner)
+	}
+}
+
+// 历史问题-5（历史裁定）：安全事件保留两列 0=自动语义废除，写侧 1..max。
+func TestUpdateConfig_rejectsZeroRetentionValues(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/config", h.UpdateConfig)
+	put := func(body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+	for _, body := range []string{
+		`{"source":"basic","security_events_retention_days":0}`,
+		`{"source":"basic","security_events_row_cap":0}`,
+		`{"source":"basic","security_events_retention_days":-1}`,
+	} {
+		if res := put(body); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "必须在 1 到") {
+			t.Fatalf("body=%s status=%d resp=%s, want 400 1..N", body, res.Code, res.Body.String())
+		}
+	}
+	for _, body := range []string{
+		`{"source":"basic","security_events_retention_days":1}`,
+		`{"source":"basic","security_events_row_cap":1}`,
+	} {
+		if res := put(body); res.Code != http.StatusOK {
+			t.Fatalf("body=%s status=%d resp=%s, want 200", body, res.Code, res.Body.String())
+		}
+	}
+}

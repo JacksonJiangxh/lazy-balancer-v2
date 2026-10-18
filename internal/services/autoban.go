@@ -26,6 +26,7 @@
 package services
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +45,9 @@ const (
 	AutobanTaskID = "autoban"
 	// AutobanPresetListName 预置名单行名（迁移种子同字面值，db_autoban_migration_test 锚定）。
 	AutobanPresetListName = "自动封禁名单"
+	// autobanPresetListDescription 预置行描述（db 播种文案同字面值；描述禁改，
+	// 运行期自愈补建时须与播种一致）。
+	autobanPresetListDescription = "自动封禁命中 IP（自动封禁任务维护；可手动追加或删除条目）"
 	// AutobanEntryRemark 自动条目标记：merge 挤出与「今日封禁数」统计的唯一判据。
 	AutobanEntryRemark = "自动封禁"
 	// AutobanManualUnbanRemark 手动追加条目的默认备注（地址列表页手动封禁）。
@@ -298,6 +302,7 @@ func ResetAutobanCounters() {
 	defer autobanMu.Unlock()
 	autobanWindows = make(map[string]*autobanCounter)
 	autobanSuggestions = nil
+	autobanCapWarned = false
 }
 
 // autobanActionMatches 口径过滤：scope=blocked 只统计拦截，logged 只统计检测，
@@ -550,6 +555,35 @@ func parseAutobanEntryTime(s string) time.Time {
 	return ts
 }
 
+// ensureAutobanPresetListID 返回预置名单 id；system=1 行缺失时补建（历史问题-1：
+// 与 db 播种同为 name+system=1 口径）。可达形态：旧备份导入全表替换后 system
+// 名单种子不重播、旧版本可携带同名用户列表——仅 name 判定的播种会永久跳过
+// 内置行，而 autoban 全部消费方要求 system=1。同名用户列表不合并、不删除。
+func ensureAutobanPresetListID() (int64, error) {
+	if db.DB == nil {
+		return 0, errors.New("数据库未初始化")
+	}
+	var id int64
+	err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=1`, AutobanPresetListName).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at)
+		SELECT ?, ?, '自动封禁', '[]', 1, datetime('now'), datetime('now')
+		WHERE NOT EXISTS (SELECT 1 FROM security_ip_lists WHERE name=? AND system=1)`,
+		AutobanPresetListName, autobanPresetListDescription, AutobanPresetListName); err != nil {
+		return 0, fmt.Errorf("补建预置名单「%s」: %w", AutobanPresetListName, err)
+	}
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=1`, AutobanPresetListName).Scan(&id); err != nil {
+		return 0, fmt.Errorf("预置名单「%s」补建后仍不可见: %w", AutobanPresetListName, err)
+	}
+	Logf("warn", "自动封禁预置名单缺失，已自动补建 system=1 行（若存在同名用户列表请重命名以消除歧义）")
+	return id, nil
+}
+
 // autobanMergeEntries 单次 merge（纯 DB 侧，无重载/审计副作用——便于钉测）：
 // 清到期 → 已在名单过滤 → 追加新封 → 超限挤最早到期自动条目 → 回写。
 func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (autobanMergeOutcome, error) {
@@ -559,9 +593,9 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 	}
 	now := autobanNow()
 	nowStr := now.Format(autobanTimeLayout)
-	var id int64
-	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=1`, AutobanPresetListName).Scan(&id); err != nil {
-		return out, fmt.Errorf("预置名单「%s」不存在: %w", AutobanPresetListName, err)
+	id, err := ensureAutobanPresetListID()
+	if err != nil {
+		return out, err
 	}
 	out.ListID = id
 	var raw string
@@ -576,9 +610,11 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 	// 1) 清到期（到期即解封）；不可解析的 expires_at 保留（fail-open 不误删）。
 	kept := make([]models.IPListEntry, 0, len(entries))
 	inList := make(map[string]struct{}, len(entries))
+	expiredThisRound := make(map[string]struct{})
 	for _, e := range entries {
 		if exp := parseAutobanEntryTime(e.ExpiresAt); !exp.IsZero() && !exp.After(now) {
 			out.Expired = append(out.Expired, e.Value)
+			expiredThisRound[e.Value] = struct{}{}
 			out.Changed = true
 			continue
 		}
@@ -587,10 +623,17 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 	}
 
 	// 2) 新封过滤：已在名单跳过；其余追加（permanent 不带 expires_at）。
+	// 历史问题（历史）：本轮刚到期解封的 IP 不得在同一轮被计数桶立即重封
+	// （window>duration 时计数仍跨阈值 → 封禁被延长到约 window+duration 并
+	// 产生成对的「自动解封/自动封禁」审计）；计数桶由 RunAutobanCycle 随后
+	// 清空，新流量重新计数/达标仍会再封（与手动解封同语义）。
 	duration := autobanDurations[cfg.Duration]
 	var toAdd []models.IPListEntry
 	for _, c := range candidates {
 		if c.IP == "" {
+			continue
+		}
+		if _, justExpired := expiredThisRound[c.IP]; justExpired {
 			continue
 		}
 		if _, exists := inList[c.IP]; exists {
@@ -846,7 +889,11 @@ func AutobanDisableFlush() {
 	cfg := GetAutobanConfig()
 	CaddyOpLock.Lock()
 	out, err := autobanMergeEntries(cfg, nil)
-	if err == nil && out.Changed {
+	if err != nil {
+		msg := fmt.Sprintf("禁用收尾到期条目清理失败: %v", err)
+		Logf("error", "自动封禁%s", msg)
+		RecordAuditLog("system", "写入失败", "自动封禁", FormatAuditDetail(msg, AuditResultPart("failed")), "")
+	} else if out.Changed {
 		autobanAuditExpiredUnban(out.Expired)
 		autobanConvergeLocked("自动封禁禁用收尾", out.ListID)
 	}
@@ -862,9 +909,10 @@ func AutobanDisableFlush() {
 // 名单 merge → 审计/重载/每轮摘要行。
 //
 // 业务门（2026-10-14 用户裁定）：本任务只能由「启用后按配置调度执行」——
-// Descriptor 不设 EnabledFn（调度面无业务门，任务监控 enabled 列恒开，启停
-// 语义全在调度开关+事件页业务开关），未启用期间的手动开调度/手动触发到
-// Run 体首行拦下：落痕+落 failed 行+StopLoop 重禁调度，防未启用空转续跑。
+// Descriptor 不设 EnabledFn（调度面无业务门；TaskMeta.Enabled 已删除，任务
+// 监控只认 loop_on，启停语义全在调度开关+事件页业务开关），未启用期间的手动
+// 开调度/手动触发到 Run 体首行拦下：落痕+落 failed 行+StopLoop 重禁调度，防
+// 未启用空转续跑。
 // AB-2（历史）：StopLoop 前复查一次——首读 false 与停环之间存在
 // 「PUT enabled=1 + StartLoop」交错窗，无条件停环会把并发重新启用的新调度
 // 误杀（enabled=1 而调度停，无自动恢复）；复查仍 false 才停，复查转 true
@@ -936,6 +984,10 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 			return err
 		}
 		out = o
+		// 历史问题：到期自动解封与手动解封同语义——同步丢弃计数桶，否则下一轮
+		// 评估用窗口内旧计数在零新流量下立即重封（window>duration 的配置下
+		// 封禁实际被延长到约 window+duration）。
+		AutobanForgetIPs(out.Expired)
 		if out.Changed {
 			reloadState = autobanConvergeLocked("名单更新", out.ListID)
 		}
@@ -1039,10 +1091,13 @@ func AutobanListEntries() ([]models.IPListEntry, int64, error) {
 	if db.DB == nil {
 		return nil, 0, errors.New("数据库未初始化")
 	}
-	var id int64
-	var raw string
-	if err := db.DB.QueryRow(`SELECT id, COALESCE(entries,'[]') FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=1`, AutobanPresetListName).Scan(&id, &raw); err != nil {
+	id, err := ensureAutobanPresetListID()
+	if err != nil {
 		return nil, 0, err
+	}
+	var raw string
+	if err := db.DB.QueryRow(`SELECT COALESCE(entries,'[]') FROM security_ip_lists WHERE id=?`, id).Scan(&raw); err != nil {
+		return nil, id, err
 	}
 	var entries []models.IPListEntry
 	if err := json.Unmarshal([]byte(raw), &entries); err != nil {

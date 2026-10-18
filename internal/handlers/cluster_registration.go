@@ -99,9 +99,17 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 }
 
 func (h *Handlers) GetClusterRegistrationStatus(c *gin.Context) {
+	// 参数校验先于角色门：非法 ID 恒 400（R21 ID 校验口径），不因节点角色变化。
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		clusterError(c, http.StatusBadRequest, "注册编号无效", err)
+		return
+	}
+	// 历史问题-04：同族机器端点（register/confirm/snapshot/waf-files/report）均有
+	// 主节点门，仅本端点缺失——降级后的主节点按 历史问题 保留 nodes 行，残留
+	// 注册行仍可被应答 approved 并重发集群令牌。权限面不扩大（令牌由 secret
+	// 确定性派生），但角色门必须一致收敛。
+	if !h.requireMaster(c) {
 		return
 	}
 	status, err := h.clusterService.RegistrationStatus(c.Request.Context(), id, c.GetString("registration_secret"), time.Now())

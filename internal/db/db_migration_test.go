@@ -322,7 +322,6 @@ func TestRunMigrations_migratesLegacyHTTPSRulesWithACMECertJobToHTTPWithTLS(t *t
 		t.Fatalf("create tables: %v", err)
 	}
 	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config) VALUES (1,'{}');
-		ALTER TABLE lb_rules ADD COLUMN tls_source VARCHAR(20) DEFAULT 'manual';
 		INSERT INTO lb_rules (name,protocol,domain,listen_port,enable_tls,tls_source,tls_cert,tls_key,tls_http_redirect,caddy_id) VALUES
 			('legacy-https-acme','https','acme.example.test',8443,1,'acme_dns','','',1,'lb_https_acme'),
 			('legacy-https-acme-disabled','https','disabled.example.test',8444,1,'acme_dns','','',1,'lb_https_acme_disabled'),
@@ -2372,6 +2371,27 @@ func TestCreateTables_freshSchemaCarriesStagedPolicyRuleAndBackupColumns(t *test
 			if dflt != col.dflt {
 				t.Fatalf("%s.%s default=%q, want %q", table, col.name, dflt, col.dflt)
 			}
+		}
+	}
+}
+
+func TestCreateTables_freshSchemaCarriesACMEAndTCPProxyColumns(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	for column, wantDefault := range map[string]string{
+		"tcp_proxy_protocol": "0",
+		"tls_source":         "'manual'",
+		"acme_config_id":     "0",
+		"ca_provider_id":     "0",
+	} {
+		var gotDefault string
+		if err := database.QueryRow(`SELECT COALESCE(dflt_value,'') FROM pragma_table_info('lb_rules') WHERE name=?`, column).Scan(&gotDefault); err != nil {
+			t.Fatalf("lb_rules.%s missing from fresh schema: %v", column, err)
+		}
+		if gotDefault != wantDefault {
+			t.Fatalf("lb_rules.%s default=%q, want %q", column, gotDefault, wantDefault)
 		}
 	}
 }

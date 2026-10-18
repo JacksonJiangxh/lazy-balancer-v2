@@ -61,8 +61,7 @@ func (h *Handlers) GetSystemInfo(c *gin.Context) {
 		Uptime:        getUptime(),
 		Version:       version,
 	}
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err == nil && !isMaster {
+	if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err == nil && !isMaster {
 		info.NodeMode = "slave"
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: info})

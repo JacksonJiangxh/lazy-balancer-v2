@@ -436,3 +436,127 @@ func TestUpdateAdminTLS_unchangedConfigSkipsWriteAndRestart(t *testing.T) {
 	case <-time.After(800 * time.Millisecond):
 	}
 }
+
+// B2-历史问题（历史）：携带证书材料但生效来源不是 upload 时不得静默丢弃
+// （旧行为可能回「配置未变更」200）——必须 400 点名正确做法且不落库。
+func TestUpdateAdminTLSJSONBody_rejectsUploadPayloadWithoutUploadMode(t *testing.T) {
+	initializeRuleFeatureTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET admin_tls_enabled=0,admin_tls_mode='selfsigned',
+		admin_tls_cert='',admin_tls_key='' WHERE id=1`); err != nil {
+		t.Fatalf("seed admin TLS config: %v", err)
+	}
+	certPEM, keyPEM, err := generateTestCert("silent-drop.example.com", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("generate cert pair: %v", err)
+	}
+	oldExit := exitProcess
+	exitProcess = func(int) { t.Error("rejected update must not schedule restart") }
+	t.Cleanup(func() { exitProcess = oldExit })
+	handler := &Handlers{cfg: &config.Config{Port: 8000}}
+	router := gin.New()
+	router.PUT("/admin-tls", handler.UpdateAdminTLS)
+
+	for _, test := range []struct {
+		name string
+		body map[string]any
+	}{
+		{name: "mode omitted (keeps current selfsigned)", body: map[string]any{"enabled": false, "cert_file": certPEM, "key_file": keyPEM}},
+		{name: "explicit non-upload mode", body: map[string]any{"enabled": false, "mode": "selfsigned", "cert_file": certPEM, "key_file": keyPEM}},
+	} {
+		payload, err := json.Marshal(test.body)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", test.name, err)
+		}
+		request := httptest.NewRequest(http.MethodPut, "/admin-tls", bytes.NewReader(payload))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "证书来源不是 upload") {
+			t.Fatalf("%s status=%d body=%s, want 400 upload-mode guidance", test.name, response.Code, response.Body.String())
+		}
+	}
+	var mode, cert, key string
+	if err := db.DB.QueryRow("SELECT admin_tls_mode,admin_tls_cert,admin_tls_key FROM global_config WHERE id=1").Scan(&mode, &cert, &key); err != nil {
+		t.Fatalf("read admin TLS config: %v", err)
+	}
+	if mode != "selfsigned" || cert != "" || key != "" {
+		t.Fatalf("saved config=(%q,%v,%v), want untouched selfsigned", mode, cert != "", key != "")
+	}
+}
+
+// B2-历史问题：enabled 是安全开关，字符串值必须遵循 true/1/false/0 白名单；
+// 非法拼写不得静默按 false 关闭 HTTPS 并触发重启，合法 "0" 保持回归。
+func TestUpdateAdminTLS_enabledValueWhitelist(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		multipart   bool
+		value       string
+		wantStatus  int
+		wantEnabled bool
+		wantRestart bool
+	}{
+		{name: "JSON invalid uppercase", value: "TRUE", wantStatus: http.StatusBadRequest, wantEnabled: true},
+		{name: "multipart invalid text", multipart: true, value: "on", wantStatus: http.StatusBadRequest, wantEnabled: true},
+		{name: "JSON valid zero", value: "0", wantStatus: http.StatusOK, wantEnabled: false, wantRestart: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			initializeRuleFeatureTestDB(t)
+			if _, err := db.DB.Exec(`UPDATE global_config SET admin_tls_enabled=1,admin_tls_mode='selfsigned',admin_tls_cert='',admin_tls_key='' WHERE id=1`); err != nil {
+				t.Fatalf("seed admin TLS config: %v", err)
+			}
+			oldExit := exitProcess
+			exited := make(chan struct{}, 1)
+			exitProcess = func(int) { exited <- struct{}{} }
+			t.Cleanup(func() { exitProcess = oldExit })
+			handler := &Handlers{cfg: &config.Config{Port: 8000}}
+			router := gin.New()
+			router.PUT("/admin-tls", handler.UpdateAdminTLS)
+
+			var request *http.Request
+			if tc.multipart {
+				var body strings.Builder
+				writer := multipart.NewWriter(&body)
+				if err := writer.WriteField("enabled", tc.value); err != nil {
+					t.Fatal(err)
+				}
+				if err := writer.Close(); err != nil {
+					t.Fatal(err)
+				}
+				request = httptest.NewRequest(http.MethodPut, "/admin-tls", strings.NewReader(body.String()))
+				request.Header.Set("Content-Type", writer.FormDataContentType())
+			} else {
+				payload, err := json.Marshal(map[string]any{"enabled": tc.value})
+				if err != nil {
+					t.Fatal(err)
+				}
+				request = httptest.NewRequest(http.MethodPut, "/admin-tls", bytes.NewReader(payload))
+				request.Header.Set("Content-Type", "application/json")
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != tc.wantStatus {
+				t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), tc.wantStatus)
+			}
+			var enabled bool
+			if err := db.DB.QueryRow(`SELECT admin_tls_enabled FROM global_config WHERE id=1`).Scan(&enabled); err != nil {
+				t.Fatal(err)
+			}
+			if enabled != tc.wantEnabled {
+				t.Fatalf("enabled=%v, want %v", enabled, tc.wantEnabled)
+			}
+			if tc.wantRestart {
+				select {
+				case <-exited:
+				case <-time.After(2 * time.Second):
+					t.Fatal("合法状态变更未触发重启")
+				}
+			} else {
+				select {
+				case <-exited:
+					t.Fatal("非法 enabled 触发了重启")
+				case <-time.After(600 * time.Millisecond):
+				}
+			}
+		})
+	}
+}

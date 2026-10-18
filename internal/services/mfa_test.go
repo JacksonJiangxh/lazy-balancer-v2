@@ -165,22 +165,39 @@ func TestMFAChallengeLifecycle(t *testing.T) {
 	if err != nil || tok == "" {
 		t.Fatal(err)
 	}
-	if !MFAConsumeChallenge(tok, 5) {
-		t.Fatal("first consume must succeed")
+	if ok, err := MFAConsumeChallenge(tok, 5); !ok || err != nil {
+		t.Fatalf("first consume must succeed: ok=%v err=%v", ok, err)
 	}
-	if MFAConsumeChallenge(tok, 5) {
-		t.Fatal("replay consume must fail")
+	if ok, err := MFAConsumeChallenge(tok, 5); ok || err != nil {
+		t.Fatalf("replay consume must fail without service error: ok=%v err=%v", ok, err)
 	}
-	if MFAConsumeChallenge(tok, 999) {
-		t.Fatal("wrong owner must fail")
+	if ok, err := MFAConsumeChallenge(tok, 999); ok || err != nil {
+		t.Fatalf("wrong owner must fail without service error: ok=%v err=%v", ok, err)
 	}
 	// 过期：手工回拨
 	tok2, _ := MFAIssueChallenge(5)
 	if _, err := db.DB.Exec("UPDATE mfa_challenges SET expires_at=datetime('now','-1 minute') WHERE token=?", tok2); err != nil {
 		t.Fatal(err)
 	}
-	if MFAConsumeChallenge(tok2, 5) {
-		t.Fatal("expired challenge must fail")
+	if ok, err := MFAConsumeChallenge(tok2, 5); ok || err != nil {
+		t.Fatalf("expired challenge must fail without service error: ok=%v err=%v", ok, err)
+	}
+}
+
+// B3-82-历史问题：执行错误必须与「行未更新」分判，调用方才能区分 DB 故障 500
+// 与正常挑战失效 401。
+func TestMFAConsumeChallenge_returnsExecutionError(t *testing.T) {
+	mfaTestEnv(t)
+	mfaSeedUser(t, 55)
+	tok, err := MFAIssueChallenge(55)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`DROP TABLE mfa_challenges`); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := MFAConsumeChallenge(tok, 55); ok || err == nil {
+		t.Fatalf("consume after table loss: ok=%v err=%v, want false+error", ok, err)
 	}
 }
 
@@ -282,8 +299,8 @@ func TestMFARecordChallengeFailure_invalidatesAtThreshold(t *testing.T) {
 	if attempts != mfaChallengeFailThreshold {
 		t.Fatalf("attempts=%d, want %d", attempts, mfaChallengeFailThreshold)
 	}
-	if MFAConsumeChallenge(token, 3) {
-		t.Fatal("作废后的挑战不得再被消费")
+	if ok, err := MFAConsumeChallenge(token, 3); ok || err != nil {
+		t.Fatalf("作废后的挑战不得再被消费: ok=%v err=%v", ok, err)
 	}
 }
 
@@ -336,14 +353,14 @@ func TestMFARestoreChallenge_invalidatedChallengeStaysDead(t *testing.T) {
 	}
 
 	for round := 1; round <= mfaChallengeFailThreshold; round++ {
-		if !MFAConsumeChallenge(token, 5) {
-			t.Fatalf("第 %d 轮 consume 应成功（未达阈值）", round)
+		if ok, err := MFAConsumeChallenge(token, 5); !ok || err != nil {
+			t.Fatalf("第 %d 轮 consume 应成功（未达阈值）：ok=%v err=%v", round, ok, err)
 		}
 		MFARestoreChallenge(token, 5) // 错误码不烧挑战
 		MFARecordChallengeFailure(token)
 	}
-	if MFAConsumeChallenge(token, 5) {
-		t.Fatal("达阈值后的挑战不得复活（consume 门必须拒绝，restore 不可达）")
+	if ok, err := MFAConsumeChallenge(token, 5); ok || err != nil {
+		t.Fatalf("达阈值后的挑战不得复活（consume 门必须拒绝，restore 不可达）：ok=%v err=%v", ok, err)
 	}
 	var consumed bool
 	var attempts int
@@ -352,5 +369,27 @@ func TestMFARestoreChallenge_invalidatedChallengeStaysDead(t *testing.T) {
 	}
 	if !consumed || attempts != mfaChallengeFailThreshold {
 		t.Fatalf("终态 consumed=%v attempts=%d, want consumed=true attempts=%d", consumed, attempts, mfaChallengeFailThreshold)
+	}
+}
+
+// D2-历史问题（历史）：MFAGetStatus 对恢复码存储损坏必须显性报错，
+// 不得以「剩余 0 个」掩盖（与 mfaConsumeRecoveryCode 的三态口径一致）。
+func TestMFAGetStatus_reportsCorruptedRecoveryCodes(t *testing.T) {
+	mfaTestEnv(t)
+	mfaSeedUser(t, 9)
+
+	st, err := MFAGetStatus(9)
+	if err != nil {
+		t.Fatalf("默认空恢复码必须可读: %v", err)
+	}
+	if st.RecoveryCodesRemaining != 0 {
+		t.Fatalf("默认恢复码数=%d, want 0", st.RecoveryCodesRemaining)
+	}
+
+	if _, err := db.DB.Exec("UPDATE users SET mfa_recovery_codes=? WHERE id=9", "not-json"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MFAGetStatus(9); err == nil {
+		t.Fatal("恢复码存储损坏必须返回错误（此前被吞为 0 个）")
 	}
 }

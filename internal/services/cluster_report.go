@@ -43,7 +43,7 @@ func (s *SyncService) Report(ctx context.Context) error {
 	// R2（历史）：字面量 30 → db.DefaultCertExpiryDays 绑定参数（caddy.go
 	// G4 形态，库值唯一真相单源）；读失败/非法值回退口径原样（warn 留痕）。
 	expiryDays := db.DefaultCertExpiryDays
-	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(cert_expiry_days,?) FROM global_config WHERE id=1", db.DefaultCertExpiryDays).Scan(&expiryDays); err != nil || expiryDays <= 0 {
+	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(cert_expiry_days,?) FROM global_config WHERE id=1", db.DefaultCertExpiryDays).Scan(&expiryDays); err != nil || expiryDays <= 0 || expiryDays > 365 {
 		// 读失败/非法值回退治理默认时留痕（历史 R-12 家族扫描唯一漏点，
 		// 同族 certissuer/certificates/certinfo/certjobs 均已带留痕）。
 		Logf("warn", "集群报告: 读取证书到期口径失败，回退 %d 天", db.DefaultCertExpiryDays)
@@ -52,7 +52,10 @@ func (s *SyncService) Report(ctx context.Context) error {
 	// expiryDays 经 Scan 已是纯整数（非法/非数字值回退 30），strconv.Itoa 只产生
 	// 数字修饰符；SQLite datetime 修饰符无法参数化，格式化必须保证纯数字。
 	expiryModifier := strconv.Itoa(expiryDays)
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cert_jobs WHERE status IN ('issued','downloaded','failed') AND expires_at IS NOT NULL AND datetime(expires_at)<=datetime('now','+`+expiryModifier+` days')`).Scan(&expiringCount); err != nil {
+	// D2-历史问题：状态集必须覆盖部署生命周期——cleanup_dns/cleanup_warning
+	//（JobLifecycle=Downloaded）材料已落库、待部署，此前漏计会与规则页/任务
+	// 页的到期口径分叉（deploymentLifecycleJobStatuses 见 certissuer.go）。
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cert_jobs WHERE status IN ('issued','downloaded','failed','cleanup_dns','cleanup_warning') AND expires_at IS NOT NULL AND datetime(expires_at)<=datetime('now','+`+expiryModifier+` days')`).Scan(&expiringCount); err != nil {
 		return fmt.Errorf("统计即将到期证书: %w", err)
 	}
 	_, caddyErr := s.caddy.GetConfig()

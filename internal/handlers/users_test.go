@@ -471,3 +471,36 @@ func TestUserMutations_failWhenUsernameUnreadable(t *testing.T) {
 		}
 	})
 }
+
+// B1-历史问题（历史）：OIDC 写保护门按「值实际变化」判定——携带与库中
+// 同值的 display_name、空 username 或同值 username 属无实际变更的局部更新，
+// 不得整单 400（角色/启停是本地管理语义）；真实字段变更仍 400。
+func TestUpdateUser_oidcGateComparesValuesNotFieldPresence(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedUserAuditTest(t, 1, "admin", "admin", true)
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,auth_provider,display_name) VALUES (7,'sso@example.com','','user',1,'oidc','IdP Name')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// 同值 display_name + 角色变更 → 200，角色本地生效
+	rec := serveUserMutation(h, http.MethodPut, "/users/7", `{"role":"admin","display_name":"IdP Name"}`, 1, h.UpdateUser)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("same display_name + role change: status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var role string
+	if err := db.DB.QueryRow("SELECT role FROM users WHERE id=7").Scan(&role); err != nil || role != "admin" {
+		t.Fatalf("role=%q err=%v, want admin", role, err)
+	}
+	// 注：空 username 在绑定层（binding:"omitempty,min=3" 对 *string 仍校验
+	// 空串）即 400，到不了 OIDC 门——该形状的既有拒绝与本次修复无关。
+	// 同值 username → 200
+	rec = serveUserMutation(h, http.MethodPut, "/users/7", `{"username":"sso@example.com"}`, 1, h.UpdateUser)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("same username: status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	// 真实变更仍拦截（回归）
+	rec = serveUserMutation(h, http.MethodPut, "/users/7", `{"display_name":"Other Name"}`, 1, h.UpdateUser)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "OIDC") {
+		t.Fatalf("real display_name change: status=%d body=%s, want 400 OIDC", rec.Code, rec.Body.String())
+	}
+}

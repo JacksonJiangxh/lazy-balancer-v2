@@ -121,10 +121,16 @@ func InitCAQueueManager(reloader func() error, dataDir ...string) {
 		}
 		compensationCtx, compensationCancel := context.WithCancel(context.Background())
 		caQueueManager = &CAQueueManager{
-			queues:             make(map[int]*caQueue),
+			queues: make(map[int]*caQueue),
+			// 历史问题-01：活动态由 cert-issuance 守护生命周期派生，初始化即为
+			// 停止。唯一激活点=StartACME 的 Start()（daemon Run 经
+			// StartACME/StopACME 挂钩）；从节点启动、用户停止证书签发后重启
+			// 等「守护从未启动」形态不得留下可签发却无证书服务（部署重试/
+			// 启动恢复/补扫全为 nil）的半启动子系统，也避免运行期停止（409）
+			// 与重启后停止（仍可签发）的语义反转。
+			active:             false,
 			blockedRules:       make(map[string]map[RuleBlockToken]struct{}),
 			reloader:           reloader,
-			active:             true,
 			dataDir:            accountDataDir,
 			compensationCtx:    compensationCtx,
 			compensationCancel: compensationCancel,
@@ -738,6 +744,10 @@ func (m *CAQueueManager) EnqueueIfActive(providerID int, jobID int, ruleID, doma
 // failed 行再重新失败——且规则租约 blockedRules 永不释放，该规则证书操作持续 409）。
 var errCAProviderUnavailable = errors.New("CA Provider 不可用")
 
+// errCAQueueInactive 标记补偿重排队时队列未激活/已暂停。任务已按补偿语义
+// 转回 queued，Resume/启动扫描会接管；此处不得上抛重试，否则租约永久不释放。
+var errCAQueueInactive = errors.New("certificate queue manager is inactive")
+
 func (m *CAQueueManager) enqueueLocked(providerID int, jobID int, ruleID, domains string) error {
 	provider, err := loadCAProvider(providerID)
 	if err != nil {
@@ -790,7 +800,7 @@ func (m *CAQueueManager) enqueueCompensation(providerID int, jobID int, ruleID, 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.active {
-		return errors.New("certificate queue manager is stopped")
+		return errCAQueueInactive
 	}
 	if len(m.blockedRules[ruleID]) == 0 {
 		return fmt.Errorf("certificate compensation lease missing for rule %s", ruleID)

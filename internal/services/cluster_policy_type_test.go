@@ -7,8 +7,8 @@ import (
 )
 
 // policy_type 集群同步面：快照 dump 携带该列（新主节点显式值透传）；旧主节点
-// 快照（缺列）在从端 apply 时按内容推断（snapshotPolicyType → models.
-// InferPolicyType），从端落库后类型不滞留 ”。
+// 快照（缺列）在从端 apply 时按内容推断（InferSnapshotPolicyType →
+// models.InferPolicyType），从端落库后类型不滞留 ”。
 func TestClusterSnapshot_policyTypeRoundTrip(t *testing.T) {
 	// Given：主端两条类型策略
 	cluster, database := newClusterTestService(t)

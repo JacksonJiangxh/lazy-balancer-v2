@@ -3,9 +3,13 @@
 // 反转义——自产文件导回后备注被截断/保留外层引号，二次往返累积漂移。
 // 此模块是导出/导入共用的字段级单源。
 
-/** 备注字段导出：含逗号或双引号时按 RFC4180 包裹并双写内部引号。 */
-export function formatCsvRemark(remark: string): string {
-  return /[",\r\n]/.test(remark) ? `"${remark.replace(/"/g, '""')}"` : remark
+/**
+ * 备注字段导出：换行归一为空格（导入端按行切分，多行备注无法回读——历史问题-11），
+ * 含逗号或双引号时按 RFC4180 包裹并双写内部引号。
+ */
+function formatCsvRemark(remark: string): string {
+  const singleLine = remark.replace(/[\r\n]+/g, ' ')
+  return /[",]/.test(singleLine) ? `"${singleLine.replace(/"/g, '""')}"` : singleLine
 }
 
 /** 导出一行（第一列 IP/CIDR，第二列备注；备注为空保留尾随逗号）。 */
@@ -65,5 +69,5 @@ export function parseIpListEntryLine(
     if (!field) return null
     remark = field.text
   }
-  return { value: normalized, remark: remark.slice(0, 100) }
+  return { value: normalized, remark: Array.from(remark).slice(0, 100).join('') }
 }

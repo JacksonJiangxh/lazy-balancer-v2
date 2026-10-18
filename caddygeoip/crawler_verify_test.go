@@ -3,6 +3,7 @@ package caddygeoip
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -221,6 +222,37 @@ func TestVerifyCrawler_cacheCapacityPreservesLiveEntries(t *testing.T) {
 	})
 }
 
+func TestVerifyCrawler_cacheCapacityPruneWorkBounded(t *testing.T) {
+	const newIP = "34.100.1.1"
+	ResetCrawlerVerifyCacheForTest(&fakeResolver{ptr: map[string][]string{
+		newIP: {"vm-34-100-1-1.bc.googleusercontent.com."},
+	}})
+	oldMax := crawlerCacheMax
+	crawlerCacheMax = 1000
+	t.Cleanup(func() { crawlerCacheMax = oldMax })
+	now := time.Now()
+	crawlerCacheMu.Lock()
+	for i := range crawlerCacheMax {
+		crawlerCache[fmt.Sprintf("live-%d|googlebot", i)] = crawlerVerifyCache{ok: true, expires: now.Add(time.Hour)}
+	}
+	crawlerCachePruneVisitsForTest = 0
+	crawlerCacheMu.Unlock()
+
+	if VerifyCrawler(newIP, "googlebot") {
+		t.Fatal("test input must produce a deterministic negative")
+	}
+	crawlerCacheMu.Lock()
+	visits := crawlerCachePruneVisitsForTest
+	size := len(crawlerCache)
+	crawlerCacheMu.Unlock()
+	if visits > crawlerCachePruneProbeLimit {
+		t.Fatalf("capacity pruning visited %d entries, want bounded by %d (cache size=%d)", visits, crawlerCachePruneProbeLimit, size)
+	}
+	if size != crawlerCacheMax {
+		t.Fatalf("live full cache size=%d, want %d", size, crawlerCacheMax)
+	}
+}
+
 func TestVerifyCrawlerIPRangeFromList_jsonPerEngine(t *testing.T) {
 	// Given：按引擎隔离的快照 JSON（与 root 服务 writeCrawlerIPListSnapshotAll 同形）
 	oldFile := crawlerIPListFile
@@ -259,8 +291,13 @@ func resetCrawlerIPRangeCacheForTest() {
 
 func TestCrawlerIPRangeList_precompiledAndFailureThrottled(t *testing.T) {
 	oldFile := crawlerIPListFile
+	oldRetry := crawlerIPListRetryInterval
 	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
-	t.Cleanup(func() { crawlerIPListFile = oldFile })
+	crawlerIPListRetryInterval = time.Minute
+	t.Cleanup(func() {
+		crawlerIPListFile = oldFile
+		crawlerIPListRetryInterval = oldRetry
+	})
 	resetCrawlerIPRangeCacheForTest()
 
 	// 缺失快照：fail-closed，且失败也写节流时间戳。
@@ -270,13 +307,14 @@ func TestCrawlerIPRangeList_precompiledAndFailureThrottled(t *testing.T) {
 	if err := os.WriteFile(crawlerIPListFile, []byte(`{"googlebot":["66.249.66.0/24"]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// 10 分钟内不重读：失败节流生效（旧实现在失败路径不写时间戳，会立即重读）。
+	// 失败节流期内不重读（旧实现在失败路径不写时间戳，会立即重读）。
 	if verifyCrawlerIPRangeFromList("66.249.66.1", "googlebot") {
-		t.Fatal("failure must be throttled for the reload interval")
+		t.Fatal("failure must be throttled for the retry interval")
 	}
-	// 过期后重读 → 命中；命中用预编译前缀（判定不再逐条 ParsePrefix）。
+	// E81-历史问题：失败只按短重试间隔节流（旧实现缓存满 10min，冷装窗口 360
+	// 豁免 fail-closed 最长 10 分钟）；重试间隔过后重读 → 命中。
 	crawlerFileCacheMu.Lock()
-	crawlerFileCacheSnap.loadedAt = time.Now().Add(-11 * time.Minute)
+	crawlerFileCacheSnap.loadedAt = time.Now().Add(-2 * time.Minute)
 	crawlerFileCacheMu.Unlock()
 	if !verifyCrawlerIPRangeFromList("66.249.66.1", "googlebot") {
 		t.Fatal("snapshot reload must match the configured prefix")
@@ -284,8 +322,15 @@ func TestCrawlerIPRangeList_precompiledAndFailureThrottled(t *testing.T) {
 	crawlerFileCacheMu.Lock()
 	snap := crawlerFileCacheSnap
 	crawlerFileCacheMu.Unlock()
-	if snap == nil || len(snap.prefixes["googlebot"]) != 1 {
+	if snap == nil || len(snap.prefixes["googlebot"]) != 1 || !snap.ok {
 		t.Fatalf("prefixes must be precompiled at load, got %#v", snap)
+	}
+	// 成功快照按完整重载间隔缓存：超过重试间隔（1min）但未到 10min 不重读。
+	crawlerFileCacheMu.Lock()
+	crawlerFileCacheSnap.loadedAt = time.Now().Add(-2 * time.Minute)
+	crawlerFileCacheMu.Unlock()
+	if !verifyCrawlerIPRangeFromList("66.249.66.1", "googlebot") {
+		t.Fatal("successful snapshot must stay cached until the reload interval")
 	}
 	// 回归形状：段外地址不命中。
 	if verifyCrawlerIPRangeFromList("66.249.67.1", "googlebot") {

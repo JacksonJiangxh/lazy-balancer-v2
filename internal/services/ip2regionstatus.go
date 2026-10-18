@@ -41,6 +41,10 @@ func ip2RegionStoredStatusSnapshot() IP2RegionUpdateStatusSnapshot {
 	var stored struct {
 		status, trigger, startedAt, finishedAt, message, version string
 	}
+	// 历史问题：半初始化（db.DB=nil）降级 idle（同 crsstatus 口径）。
+	if db.DB == nil {
+		return IP2RegionUpdateStatusSnapshot{Status: string(IP2RegionStatusIdle)}
+	}
 	err := db.DB.QueryRow(`SELECT COALESCE(update_status,'idle'), COALESCE(trigger,''),
 		COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(message,''), version
 		FROM security_ip2region_version WHERE id=1`).

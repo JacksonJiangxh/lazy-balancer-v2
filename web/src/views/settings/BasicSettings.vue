@@ -38,7 +38,7 @@
           <el-form-item label="安全事件保留">
             <el-input-number v-model="seRetentionDays" :disabled="isReadOnly" :min="1" :max="3650" :step="30" controls-position="right" style="width: 120px;" />
             <span class="form-tip-inline">天</span>
-            <el-input-number v-model="seRowCap" :disabled="isReadOnly" :min="1000" :max="100000000" :step="100000" controls-position="right" style="width: 170px; margin-left: 10px;" />
+            <el-input-number v-model="seRowCap" :disabled="isReadOnly" :min="1" :max="100000000" :step="100000" controls-position="right" style="width: 170px; margin-left: 10px;" />
             <span class="form-tip-inline">行数上限</span>
             <div class="form-tip-line">安全事件日志滚动保留：超出保留天数或行数上限时按最旧优先滚动删除。默认 90 天 / 1,000,000 行；高攻击流量部署可按需上调。</div>
           </el-form-item>
@@ -90,10 +90,8 @@
               <el-option label="自适应（推荐）" :value="-1" />
               <el-option label="全量（不采样）" :value="1" />
               <el-option label="关闭逐请求光流" :value="0" />
-              <el-option :label="trafficSampleN >= 2 ? `固定 1/${trafficSampleN}` : '固定 1/2'" :value="trafficSampleN >= 2 ? trafficSampleN : 2" />
             </el-select>
-            <el-input-number v-if="trafficSampleN >= 2" v-model="trafficSampleN" :disabled="isReadOnly" :min="2" :max="64" controls-position="right" style="width: 110px; margin-left: 8px" />
-            <div class="form-tip-line">大屏正常请求光流的逐请求采样；自适应会根据每秒事件量在 1/4、1/8 间自动切换，固定比例可设 1/2 至 1/64。关闭后仅保留聚合流量统计，不影响安全事件日志。</div>
+            <div class="form-tip-line">大屏正常请求光流的逐请求采样；自适应会根据每秒事件量在全量、1/4、1/8 之间自动切换。关闭后仅保留聚合流量统计，不影响安全事件日志。</div>
           </el-form-item>
           <el-form-item label="下载代理">
             <el-select v-model="githubProxyUrl" :disabled="isReadOnly || !githubProxyLoaded" style="width: 160px" :placeholder="githubProxyLoaded ? '选择代理' : '未加载'">
@@ -480,6 +478,7 @@ import { request, mfaAwareSuccess, formatBytes, ApiRequestError } from '@/utils/
 import { reloadAfterRestart } from '@/utils/restart'
 import { formatDate } from '@/utils/date'
 import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
+import { displaySecurityEventsRowCap } from '@/utils/configValues'
 import { Setting, InfoFilled, Check, View, Upload, Download, Timer, Lock, Document } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import type { SystemInfo } from '@/types'
@@ -737,14 +736,18 @@ const fetchAutoBackup = async (quiet = false): Promise<void> => {
   try {
     const res = await request.get<{ data: AutoBackupSettingsResponse }>('/settings/auto-backup', { silent: true })
     const d = res.data
-    autoBackupForm.value = {
-      enabled: d.enabled,
-      frequency: d.frequency || 'daily',
-      time: d.time || '03:00',
-      day: d.day || 1,
-      keep: d.keep || 7,
+    // quiet=true 来自「立即备份」轮询：只刷新列表与上次成功时间，不得用服务端
+    // 值覆盖用户未保存的频率/时间/保留份数/范围（历史问题-F4）。
+    if (!quiet) {
+      autoBackupForm.value = {
+        enabled: d.enabled,
+        frequency: d.frequency || 'daily',
+        time: d.time || '03:00',
+        day: d.day || 1,
+        keep: d.keep || 7,
+      }
+      autoBackupSections.value = d.sections?.length ? normalizeBackupSectionKeys(d.sections) : BACKUP_SECTIONS.map((s) => s.key)
     }
-    autoBackupSections.value = d.sections?.length ? normalizeBackupSectionKeys(d.sections) : BACKUP_SECTIONS.map((s) => s.key)
     autoBackupRows.value = d.backups || []
     // last_run 是调度水位线（off→on=now），不是执行事实；「上次成功备份」
     // 只认最近一次 success 行（last_success_at）——否则启用后即谎报「刚刚」。
@@ -1291,7 +1294,8 @@ const trafficSampleN = ref(-1)
 watch(() => settings.value.threat_screen_mode, (v) => { threatScreenMode.value = v === 'globe' ? 'globe' : 'map' }, { immediate: true })
 watch(() => [settings.value.security_events_retention_days, settings.value.security_events_row_cap] as const, ([d, c]) => {
   seRetentionDays.value = d && d > 0 ? d : 90
-  seRowCap.value = c && c > 0 ? c : 1_000_000
+  // 历史问题-07：1..999 等小值是后端合法配置（行帽），原样展示；仅 0=自动按默认显示。
+  seRowCap.value = displaySecurityEventsRowCap(c)
 }, { immediate: true })
 watch(() => settings.value.threat_traffic_sample_n, (v) => {
   trafficSampleN.value = normalizeTrafficSampleN(v)

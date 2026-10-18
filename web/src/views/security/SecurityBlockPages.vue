@@ -189,15 +189,17 @@ const contentTypeTagType = (ct?: string): 'primary' | 'success' | 'warning' | 'i
 const fetchData = async () => {
   loading.value = true
   try {
-    const [pagesRes, usersRes] = await Promise.all([
+    // 历史问题-F11：用户列表失败不得连带丢弃已成功的拦截页——Promise.all 下
+    // 任一 reject 即整页空态「暂无拦截页面」，与真实数据状态不符。
+    const [pagesRes, usersRes] = await Promise.allSettled([
       request.get<APIResponse<BlockPage[]>>('/security/block-pages'),
       request.get<APIResponse<UserListItem[]>>('/users'),
     ])
-    pages.value = pagesRes.data || []
-    users.value = usersRes.data || []
-  } catch (error: unknown) {
-    // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
-    console.error('Failed to load block pages data:', error)
+    if (pagesRes.status === 'fulfilled') pages.value = pagesRes.value.data || []
+    if (usersRes.status === 'fulfilled') users.value = usersRes.value.data || []
+    // 全局拦截器已弹 toast，这里仅记录（用户列失败时更新者显示 '-'）
+    if (pagesRes.status === 'rejected') console.error('Failed to load block pages:', pagesRes.reason)
+    if (usersRes.status === 'rejected') console.error('Failed to load block page users:', usersRes.reason)
   } finally { loading.value = false }
 }
 

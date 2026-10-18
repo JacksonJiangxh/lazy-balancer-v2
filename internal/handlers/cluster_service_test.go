@@ -31,6 +31,7 @@ func setupClusterServiceControlDB(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
 	})
 	gin.SetMode(gin.TestMode)
 }
@@ -452,6 +453,23 @@ func TestControlClusterNodeService_rejects_bad_requests(t *testing.T) {
 	router.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("bad node id status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
+	}
+
+	// B2-历史问题（历史）：三条失败早退各留一条「失败」审计（此前零审计）。
+	details := auditDetailsServiceControlRows(t)
+	if len(details) != 3 {
+		t.Fatalf("audit details=%v, want one failure row per rejected request", details)
+	}
+	joined := strings.Join(details, "\n")
+	for _, fragment := range []string{"动作：explode（不支持）", "节点 999", "签发票据失败", "节点 abc", "节点编号无效"} {
+		if !strings.Contains(joined, fragment) {
+			t.Errorf("rejection audit missing %q: %v", fragment, details)
+		}
+	}
+	for _, detail := range details {
+		if !strings.Contains(detail, "结果：失败") {
+			t.Errorf("rejection audit lacks failure result: %q", detail)
+		}
 	}
 }
 

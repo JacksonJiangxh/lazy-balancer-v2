@@ -167,7 +167,9 @@ func (h *Handlers) recordCaddyApplyResult(err error) {
 // 重载审计的家族（契约：触发重载必须留痕。69d809b4 曾误以为单一入口
 // 全覆盖而删光其余家族的手动审计，导致删除/启用规则等操作重载不留痕）：
 //  1. caddyApplyNoteLocked — 已持 caddyOpMu 的后台/会话内路径（Start/
-//     Restart Caddy、集群应用、导入会话内重播种）；
+//     Restart Caddy、集群应用、导入会话内重播种）仅保证失败留痕+横幅；
+//     Start/Stop/Restart 的成功动作审计由 Generic 中间件动作映射承担，
+//     不产生「重载」审计；
 //  2. applyFromTxNote      — 事务内应用（规则生命周期 ×5、UpdateConfig、
 //     finishTxApply 家族）：重载发生在 Commit 前、审计只能落在 Commit 后，
 //     两点必然分离，由返回的 note 闭包绑定，漏调即编译错误。
@@ -929,8 +931,7 @@ func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 			// 2026-09-07 裁定 K1：从节点追加补偿标记——Pull 的 304 分支识别后
 			// 全量重拉，消除「同步正常+运行旧配置」静默窗口；主节点不经 Pull
 			// 消费该标记，故不写。
-			var isMaster bool
-			if mErr := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); mErr == nil && !isMaster {
+			if isMaster, mErr := services.RoleOf(context.Background(), db.DB); mErr == nil && !isMaster {
 				if mErr := services.MarkStartupFallbackPending(context.Background(), db.DB); mErr != nil {
 					services.Logf("error", "startup fallback: write compensation marker failed: %v", mErr)
 				}
@@ -941,8 +942,7 @@ func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 			// F-历史问题-02（历史）：双失败（渲染被拒+回退失败）从节点同样
 			// 写补偿标记——无标记时 Pull 的 304 分支永远判「同步正常」，运行配置
 			// 与数据库的未知分叉静默存活（自愈失明）；标记触发下轮全量重拉。
-			var isMaster bool
-			if mErr := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); mErr == nil && !isMaster {
+			if isMaster, mErr := services.RoleOf(context.Background(), db.DB); mErr == nil && !isMaster {
 				if mErr := services.MarkStartupFallbackFailed(context.Background(), db.DB, fbErr); mErr != nil {
 					services.Logf("error", "startup fallback: write double-failure compensation marker failed: %v", mErr)
 				}

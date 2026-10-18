@@ -17,12 +17,6 @@ import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpo
 import type { ThreatScene, ThreatSceneOptions, CountryHeat } from '@/utils/threatScene'
 import { FLOW_ATTACK_ARC_COLORS, FLOW_NORMAL_ARC_COLORS, FLOW_FLIGHT_MS, flowArcLabel, flowAttackWidth, flowNormalWidth } from '@/utils/threatTheme'
 
-interface GeoFeature {
-  type: 'Feature'
-  properties: { name: string; count: number }
-  geometry: { type: 'MultiPolygon'; coordinates: [number, number][][][] }
-}
-
 interface ArcDatum {
   startLat: number
   startLng: number
@@ -40,30 +34,6 @@ const LAND_DARK = 'rgb(27,42,65)'
 const WORLD_ALTITUDE = 1.63
 const MAX_ARCS = 30
 const ARC_TTL = 4200
-
-/** 扁平多边形组（[lon,lat,…] 环）→ GeoJSON MultiPolygon（环首点闭合）。 */
-function toMultiPolygon(polys: number[][][]): [number, number][][][] {
-  return polys.map((poly) =>
-    poly.map((flat) => {
-      const coords: [number, number][] = []
-      for (let i = 0; i + 1 < flat.length; i += 2) coords.push([flat[i], flat[i + 1]])
-      const first = coords[0]
-      const last = coords[coords.length - 1]
-      if (first && last && (first[0] !== last[0] || first[1] !== last[1])) coords.push([first[0], first[1]])
-      return coords
-    }),
-  )
-}
-
-/** 国家层 FeatureCollection（count 预置 0，热力随 setCountries 更新重建）。
- *  国家全集消费 THREAT_COUNTRIES（南极洲已剔除——历史 历史问题 单源）。 */
-function buildCountryFeatures(counts: Map<string, number>): GeoFeature[] {
-  return THREAT_COUNTRIES.map((c) => ({
-    type: 'Feature',
-    properties: { name: c.name, count: counts.get(c.name) ?? 0 },
-    geometry: { type: 'MultiPolygon', coordinates: toMultiPolygon(c.polys) },
-  }))
-}
 
 /** 垂直扫描 shader（参考实现移植）：纬度带自北极向南极往返扫掠。 */
 const FRESNEL_VS = `
@@ -112,14 +82,6 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   let server: Centroid = opts?.serverCentroid ?? COUNTRY_CENTROIDS['中国'] ?? [104, 35]
   let siteConfigured = opts?.siteConfigured ?? !!opts?.serverCentroid
 
-  // 世界 Feature 仅构建一次（坐标数组是静态的）；数据刷新只改 properties。
-  // 下钻时复用同一批对象，three-globe 的 DataBindMapper 可按对象身份复用
-  // 已生成的 hex 几何，避免每次点击国家都重跑 176 国 H3 hexbin。
-  let worldFeatureCache: (GeoFeature & { properties: { hover?: boolean; dim?: boolean } })[] | null = null
-  function ensureWorldFeatures(): (GeoFeature & { properties: { hover?: boolean; dim?: boolean } })[] {
-    if (!worldFeatureCache) worldFeatureCache = buildCountryFeatures(new Map()) as (GeoFeature & { properties: { hover?: boolean; dim?: boolean } })[]
-    return worldFeatureCache
-  }
   let countryCounts = new Map<string, number>()
   let provinceCounts = new Map<string, number>()
   let drilledName: string | null = null
@@ -208,10 +170,10 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
 
-  // ---- 30fps 渲染节流（v2.3.8 用户反馈） ----
+  // ---- 60fps 渲染节流（v2.3.8 用户反馈） ----
   // globe.gl 内部固定用 requestAnimationFrame 自循环，无 FPS 配置项。这里只
-  // 拦截其 _animationCycle 回调，把渲染节流到 30fps；其它 RAF（Vue/自研帧循环/
-  // hover）原样放行。拖拽/旋转仍然响应，只是画面刷新 30fps。
+  // 拦截其 _animationCycle 回调，保留累计时间预算以便后续降档；其它 RAF
+  // （Vue/自研帧循环/hover）原样放行。
   const originalRAF = window.requestAnimationFrame
   const nativeRAF = originalRAF.bind(window)
   const globeCycle = (globe as unknown as { _animationCycle?: FrameRequestCallback })._animationCycle
@@ -266,14 +228,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     .hexPolygonResolution(2)
     .hexPolygonMargin(0.25)
     .hexPolygonUseDots(false)
-    .hexPolygonColor((f: object) => {
-      const props = f && 'properties' in f ? (f as GeoFeature & { properties: { hover?: boolean; dim?: boolean } }).properties : null
-      if (!props) return LAND_DARK
-      if (props.hover) return '#8fe6ff'
-      // 下钻态他国暗度衬底（与地图版 22% 同语义；命中国仍全亮热力）
-      if (props.dim) return 'rgba(27, 42, 65, 0.4)'
-      return heatCss(props.count)
-    })
+    .hexPolygonColor(LAND_DARK)
     .hexPolygonsTransitionDuration(0)
     // 下钻态他国暗度衬底用普通多边形层，避免把 176 国再次送进 H3 hexbin
     //（首次下钻 3s 长任务根因）；世界态恒为空。
@@ -434,7 +389,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   hoverTipEl.style.cssText = 'position:absolute;z-index:6;pointer-events:none;display:none;padding:5px 10px;background:rgba(4,12,32,.92);border:1px solid rgba(80,170,255,.45);color:#e2ecff;font:12px "Noto Sans SC","PingFang SC",sans-serif;white-space:nowrap;border-radius:2px'
   container.appendChild(hoverTipEl)
   let hoverKeyCache: string | null = null
-  // 交互后 350ms 内保持 60fps，静止自动旋转降到 30fps。
+  // 交互状态窗口保留帧率档位切换点；当前交互与静止两档均为 60fps。
   let lastInteraction = 0
   let pendingMove: { x: number; y: number } | null = null
   // 自转时指针可能不动而国家从光标下滑过：保留最后指针位置并低频复测，
@@ -828,8 +783,6 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       const nextCounts = aggregateCountryCounts(entries)
       if (heatEntriesEqual(countryCounts, [...nextCounts].map(([name, count]) => ({ name, count })))) return
       countryCounts = nextCounts
-      const cached = ensureWorldFeatures()
-      for (const f of cached) f.properties.count = countryCounts.get(f.properties.name) ?? 0
       applyHotspots()
       if (!drilledName) {
         updateDotColors()

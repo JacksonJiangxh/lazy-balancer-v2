@@ -53,6 +53,12 @@ func (h *Handlers) SetClusterMode(c *gin.Context) {
 		recordAudit(c, "警告", "集群模式", services.FormatAuditDetail("目标：从节点", "使用明文 HTTP 注册，证书私钥将明文传输，建议改用 HTTPS"))
 	}
 	outboundIP, outboundIPOK := localOutboundIP()
+	if models.ClusterAccessURLTargetsNode(req.MasterURL, outboundIP, h.cfg.Port) {
+		const message = "不能将本节点注册为自己的从节点，请填写另一主节点的地址，或使用提升接口保持主节点角色"
+		recordAudit(c, "切换失败", "集群模式", services.FormatAuditDetail("目标："+masterAuditURL, message))
+		clusterError(c, http.StatusBadRequest, message, nil)
+		return
+	}
 	registration, err := h.syncService.RegisterWithMaster(c.Request.Context(), req.MasterURL, models.ClusterRegisterRequest{
 		Token: req.RegisterToken, Name: name, IPAddress: outboundIP, Port: h.cfg.Port, Protocol: requestProtocol(c),
 	})

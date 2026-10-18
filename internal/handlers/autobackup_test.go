@@ -1087,3 +1087,32 @@ func TestRunAutoBackupNow_asyncReturnsBeforeSlowBackupCompletes(t *testing.T) {
 		return db.DB.QueryRow(`SELECT status FROM task_runs WHERE task_id='auto-backup' AND trigger='manual' ORDER BY id DESC LIMIT 1`).Scan(&status) == nil && status == "success"
 	})
 }
+
+// B2-历史问题（历史）：文件名分配器在 200 个变体全冲突时必须报错，
+// 不得回退到基础名（可能已存在）——否则写盘会覆盖既有备份。
+func TestNextAutoBackupFilename_errorsWhenAllVariantsTaken(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.Local)
+	base := "lbbak-auto-" + now.Format("20060102-150405")
+
+	name, err := nextAutoBackupFilename(h.cfg.BackupDir, "auto", now)
+	if err != nil {
+		t.Fatalf("empty dir must allocate: %v", err)
+	}
+	if name != base+".lbbak" {
+		t.Fatalf("name=%q, want %q", name, base+".lbbak")
+	}
+
+	for i := 0; i < 200; i++ {
+		candidate := base + ".lbbak"
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%d.lbbak", base, i+1)
+		}
+		if err := os.WriteFile(filepath.Join(h.cfg.BackupDir, candidate), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := nextAutoBackupFilename(h.cfg.BackupDir, "auto", now); err == nil {
+		t.Fatal("exhausted variants must return error instead of reusing an existing name")
+	}
+}

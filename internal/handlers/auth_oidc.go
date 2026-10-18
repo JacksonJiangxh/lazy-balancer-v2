@@ -108,16 +108,26 @@ func reserveOIDCStateSlot() bool {
 
 // ── 配置读写 ──
 
-func loadOIDCConfig() (OIDCConfig, bool) {
+// loadOIDCConfig 读取 OIDC 配置。
+// B1-历史问题（历史）：读失败/JSON 损坏必须与「未配置」区分——旧实现把
+// 两者折叠为 false，更新端点据此以零值整体回写，会把 issuer/client_id/secret
+// 清空（fail-open 破坏性写）。现在：未配置=(零值, nil)，读取失败=(零值, err)。
+func loadOIDCConfig() (OIDCConfig, error) {
 	var raw string
-	if err := db.DB.QueryRow("SELECT COALESCE(oidc_config,'') FROM global_config WHERE id=1").Scan(&raw); err != nil || raw == "" {
-		return OIDCConfig{}, false
+	if err := db.DB.QueryRow("SELECT COALESCE(oidc_config,'') FROM global_config WHERE id=1").Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return OIDCConfig{}, nil // 行缺失=未配置（初始化/迁移建行）
+		}
+		return OIDCConfig{}, fmt.Errorf("读取 OIDC 配置失败: %w", err)
+	}
+	if raw == "" {
+		return OIDCConfig{}, nil
 	}
 	var cfg OIDCConfig
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
-		return OIDCConfig{}, false
+		return OIDCConfig{}, fmt.Errorf("OIDC 配置损坏: %w", err)
 	}
-	return cfg, true
+	return cfg, nil
 }
 
 func saveOIDCConfig(cfg OIDCConfig) error {
@@ -125,8 +135,19 @@ func saveOIDCConfig(cfg OIDCConfig) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.DB.Exec("UPDATE global_config SET oidc_config=? WHERE id=1", string(raw))
-	return err
+	res, err := db.DB.Exec("UPDATE global_config SET oidc_config=? WHERE id=1", string(raw))
+	if err != nil {
+		return err
+	}
+	// B1-历史问题：与 UpdateConfig 同口径——影响行数非 1 即失败，不得报成功。
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("保存 OIDC 配置失败：影响行数 %d（global_config 行缺失）", affected)
+	}
+	return nil
 }
 
 // oidcProvider 按 issuer 获取(带缓存的 discovery)。
@@ -188,10 +209,34 @@ func oidcOAuthConfig(cfg OIDCConfig, p *oidc.Provider, callbackURL string) oauth
 
 // ── 公开端点 ──
 
+var oidcStatusFailureLog = struct {
+	sync.Mutex
+	at time.Time
+}{}
+
+const oidcStatusFailureLogWindow = time.Minute
+
+func logOIDCStatusFailure(err error) {
+	now := time.Now()
+	oidcStatusFailureLog.Lock()
+	if !oidcStatusFailureLog.at.IsZero() && now.Sub(oidcStatusFailureLog.at) < oidcStatusFailureLogWindow {
+		oidcStatusFailureLog.Unlock()
+		return
+	}
+	oidcStatusFailureLog.at = now
+	oidcStatusFailureLog.Unlock()
+	services.Logf("warn", "读取 OIDC 状态失败: %v", err)
+}
+
 // OIDCStatus GET /auth/oidc/status(公开):登录页按钮显隐与展示名。
 func (h *Handlers) OIDCStatus(c *gin.Context) {
-	cfg, ok := loadOIDCConfig()
-	if !ok || !cfg.Enabled || cfg.Issuer == "" {
+	cfg, cfgErr := loadOIDCConfig()
+	if cfgErr != nil {
+		// 公开端点：读失败按未启用展示（fail-closed）；持续故障按 60s 窗口留痕，
+		// 避免无鉴权请求形成日志放大。
+		logOIDCStatusFailure(cfgErr)
+	}
+	if cfgErr != nil || !cfg.Enabled || cfg.Issuer == "" {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"enabled": false}})
 		return
 	}
@@ -348,8 +393,13 @@ func (h *Handlers) OIDCLogin(c *gin.Context) {
 	fail := func(msg string) {
 		c.Redirect(http.StatusFound, requestOrigin(c)+"/#/login?oidc_error="+url.QueryEscape(msg))
 	}
-	cfg, ok := loadOIDCConfig()
-	if !ok || !cfg.Enabled || cfg.Issuer == "" {
+	cfg, cfgErr := loadOIDCConfig()
+	if cfgErr != nil {
+		services.Logf("warn", "OIDC 登录读取配置失败: %v", cfgErr)
+		fail("OIDC 配置读取失败")
+		return
+	}
+	if !cfg.Enabled || cfg.Issuer == "" {
 		fail("OIDC 未启用")
 		return
 	}
@@ -536,8 +586,13 @@ func createOIDCUserWithRetry(issuer, subject, base, displayName string) (oidcIde
 // OIDCCallback GET /auth/oidc/callback——授权码换令牌→ID Token 验签→
 // 用户命中/禁用检查/JIT 开户→签发本站 JWT(与密码登录同构,auth_method=oidc)。
 func (h *Handlers) OIDCCallback(c *gin.Context) {
-	cfg, ok := loadOIDCConfig()
-	if !ok || !cfg.Enabled || cfg.Issuer == "" {
+	cfg, cfgErr := loadOIDCConfig()
+	if cfgErr != nil {
+		services.Logf("warn", "OIDC 回调读取配置失败: %v", cfgErr)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "OIDC 配置读取失败"})
+		return
+	}
+	if !cfg.Enabled || cfg.Issuer == "" {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "OIDC 未启用"})
 		return
 	}
@@ -763,7 +818,11 @@ func (h *Handlers) issueOIDCJWT(userID int, username, role string, passwordVersi
 // client_secret_masked 为文档性字段（apidocs 登记；历史问题 历史核实
 // 前端不消费——前端仅用 has_secret 显隐），保留供 API 消费者辨别 secret 已配置。
 func (h *Handlers) OIDCSettings(c *gin.Context) {
-	cfg, _ := loadOIDCConfig()
+	cfg, err := loadOIDCConfig()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 OIDC 配置失败"})
+		return
+	}
 	masked := cfg.ClientSecret
 	if masked != "" {
 		if len(masked) > 4 {
@@ -797,7 +856,15 @@ func (h *Handlers) OIDCSettingsUpdate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
-	cfg, _ := loadOIDCConfig()
+	cfg, cfgErr := loadOIDCConfig()
+	if cfgErr != nil {
+		// B1-历史问题：读失败/损坏时不得以零值继续合并——否则会清空 issuer/
+		// client_id/secret（破坏性写）。整体拒绝，保留库中现值。
+		services.Logf("error", "OIDC 配置更新前读取失败（已拒绝写入）: %v", cfgErr)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 OIDC 配置失败"})
+		return
+	}
+	before := cfg // B1-历史问题：字段级变更留痕基线
 	if req.Enabled != nil {
 		cfg.Enabled = *req.Enabled
 	}
@@ -848,8 +915,51 @@ func (h *Handlers) OIDCSettingsUpdate(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "保存 OIDC 配置失败"})
 		return
 	}
-	recordAudit(c, "更新", "OIDC 配置", services.FormatAuditDetail("认证集成", services.AuditResultPart("success")))
+	recordAudit(c, "更新", "OIDC 配置", services.FormatAuditDetail(oidcConfigUpdateAuditDetail(before, cfg), services.AuditResultPart("success")))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "OIDC 配置已保存"})
+}
+
+// oidcConfigUpdateAuditDetail 生成字段级 delta（B1-历史问题，历史）。
+// 该端点为 AuditPolicyExplicit，中间件不补字段——此前详情仅有「认证集成 成功」，
+// 启用/禁用、issuer、client_id 的任何变更在审计中不可区分。secret 只记
+// 「已更换/已清除」，绝不落值（对齐 config_changes.go GitHub token 口径）。
+func oidcConfigUpdateAuditDetail(before, after OIDCConfig) string {
+	changed := make([]string, 0, 5)
+	enabledText := func(v bool) string {
+		if v {
+			return "启用"
+		}
+		return "禁用"
+	}
+	shown := func(v string) string {
+		if v == "" {
+			return "（空）"
+		}
+		return v
+	}
+	if before.Enabled != after.Enabled {
+		changed = append(changed, "启用状态："+enabledText(before.Enabled)+"→"+enabledText(after.Enabled))
+	}
+	if before.Issuer != after.Issuer {
+		changed = append(changed, "服务地址："+shown(before.Issuer)+"→"+shown(after.Issuer))
+	}
+	if before.ClientID != after.ClientID {
+		changed = append(changed, "Client ID："+shown(before.ClientID)+"→"+shown(after.ClientID))
+	}
+	if before.ClientSecret != after.ClientSecret {
+		if after.ClientSecret == "" {
+			changed = append(changed, "Client Secret：已清除")
+		} else {
+			changed = append(changed, "Client Secret：已更换")
+		}
+	}
+	if before.DisplayName != after.DisplayName {
+		changed = append(changed, "展示名称："+shown(before.DisplayName)+"→"+shown(after.DisplayName))
+	}
+	if len(changed) == 0 {
+		return "认证集成（无字段变化）"
+	}
+	return "认证集成（" + strings.Join(changed, "；") + "）"
 }
 
 // OIDCSettingsTest POST /settings/oidc/test(admin)——完整发现+JWKS 探测。
@@ -870,7 +980,11 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 	}
 	issuer := normalizeOIDCIssuer(req.Issuer)
 	if issuer == "" {
-		cfg, _ := loadOIDCConfig()
+		cfg, cfgErr := loadOIDCConfig()
+		if cfgErr != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 OIDC 配置失败"})
+			return
+		}
 		issuer = cfg.Issuer
 	}
 	if issuer == "" {
@@ -880,7 +994,12 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 	// SEC-2:机器身份(API Key/MCP)不开放「任指 URL」探测——issuer 须与已
 	// 保存配置一致(先例端点探测的都是已存实体);管理员 JWT 面板编辑流不受限。
 	if c.GetString("auth_type") == "api_key" {
-		if stored, _ := loadOIDCConfig(); normalizeOIDCIssuer(req.Issuer) != "" && issuer != stored.Issuer {
+		stored, cfgErr := loadOIDCConfig()
+		if cfgErr != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 OIDC 配置失败"})
+			return
+		}
+		if normalizeOIDCIssuer(req.Issuer) != "" && issuer != stored.Issuer {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "API Key 仅支持测试已保存的 OIDC 配置"})
 			return
 		}
@@ -910,7 +1029,9 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 	// /invalid_scope 等)=客户端认证已过或该服务不支持离线探测,降级为可达性通过。
 	clientID, clientSecret := strings.TrimSpace(req.ClientID), strings.TrimSpace(req.ClientSecret)
 	if clientID == "" || clientSecret == "" {
-		if cfg, _ := loadOIDCConfig(); cfg.Issuer == issuer {
+		if cfg, cfgErr := loadOIDCConfig(); cfgErr != nil {
+			services.Logf("warn", "OIDC 测试回填已保存凭证失败: %v", cfgErr)
+		} else if cfg.Issuer == issuer {
 			if clientID == "" {
 				clientID = cfg.ClientID
 			}
@@ -991,13 +1112,40 @@ func probeClientCredentials(tokenURL, clientID, clientSecret string) (bool, erro
 
 // OIDCSettingsDelete DELETE /settings/oidc(admin)——清空配置(等效禁用+抹除)。
 func (h *Handlers) OIDCSettingsDelete(c *gin.Context) {
-	cfg, _ := loadOIDCConfig()
-	oidcProviderInvalidate(cfg.Issuer)
+	cfg, cfgErr := loadOIDCConfig()
+	if cfgErr != nil {
+		// 配置损坏正是 DELETE 的用途之一：读不出旧值只影响「删除前快照」与
+		// provider 缓存失效，清空仍必须可执行（不留死锁局面）。
+		services.Logf("warn", "OIDC 配置删除前读取失败（继续清空）: %v", cfgErr)
+	} else {
+		oidcProviderInvalidate(cfg.Issuer)
+	}
 	if err := saveOIDCConfig(OIDCConfig{}); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "删除 OIDC 配置失败"})
 		return
 	}
-	recordAudit(c, "删除", "OIDC 配置", services.FormatAuditDetail("认证集成", services.AuditResultPart("success")))
+	// B1-历史问题：删除留痕「删除前的字段值」（secret 只记是否配置），供取证
+	// 重建被抹除的接入参数。
+	detail := "认证集成"
+	if cfgErr == nil {
+		yn := func(v string) string {
+			if v == "" {
+				return "（空）"
+			}
+			return v
+		}
+		secretState := "未配置"
+		if cfg.ClientSecret != "" {
+			secretState = "已配置"
+		}
+		enabledState := "禁用"
+		if cfg.Enabled {
+			enabledState = "启用"
+		}
+		detail += fmt.Sprintf("（删除前：服务地址 %s；Client ID %s；Client Secret %s；启用状态 %s）",
+			yn(cfg.Issuer), yn(cfg.ClientID), secretState, enabledState)
+	}
+	recordAudit(c, "删除", "OIDC 配置", services.FormatAuditDetail(detail, services.AuditResultPart("success")))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "OIDC 配置已删除"})
 }
 

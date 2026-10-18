@@ -155,6 +155,12 @@ type SyncService struct {
 	// 每 10 轮），防止 Caddy /load 持续故障时每同步周期全量重拉+全表重写+
 	// 强制重载+2 条审计记录的次生负载（间隔下限实为 10s，非 60s）。
 	reloadRepullFailures atomic.Int32
+	// wakePending 记录「已请求唤醒但尚未进入等待」的事件（历史问题-03）。
+	// 仅靠 close+replacement 的 wakeCh 只能唤醒此刻已 select 在该通道上的
+	// 等待者：Wake 若落在 run 的 Pull/Report 收尾期间（下次 waitDelay 尚未
+	// 抓取通道），close 的旧通道随后被替换，唤醒被丢弃 → 最长延迟一个
+	// sync_interval（上限 24h）。pending 标志把「唤醒先于等待」也覆盖。
+	wakePending bool
 }
 
 func NewSyncService(database *sql.DB, cfg *config.Config, caddy *CaddyService) *SyncService {
@@ -501,14 +507,28 @@ func (s *SyncService) Wake() {
 	if s.wakeCh == nil {
 		s.wakeCh = make(chan struct{})
 	}
+	// 历史问题-03：同时置 pending——唤醒可能发生在 run 已离开等待、仍在
+	// Pull/Report 的窗口，此时 close 旧通道后下一次等待拿到的是新通道，
+	// 单靠通道会丢失本次唤醒。
+	s.wakePending = true
 	close(s.wakeCh)
 	s.wakeCh = make(chan struct{})
 }
 
 func (s *SyncService) defaultWaitDelay(ctx context.Context, delay time.Duration) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	s.wakeMu.Lock()
 	if s.wakeCh == nil {
 		s.wakeCh = make(chan struct{})
+	}
+	// 历史问题-03：先消费「等待前已到达」的唤醒（与 Wake 同锁，二者之间不存在
+	// 丢失窗口），再走通道等待。
+	if s.wakePending {
+		s.wakePending = false
+		s.wakeMu.Unlock()
+		return true
 	}
 	wake := s.wakeCh
 	s.wakeMu.Unlock()
@@ -537,6 +557,10 @@ func (s *SyncService) startLocked(resume bool) {
 	s.pullAdmissionMu.Lock()
 	s.pullsStopped = false
 	s.pullAdmissionMu.Unlock()
+	// 新一轮循环从读态开始，启动前遗留的 pending 唤醒已无意义（历史问题-03）。
+	s.wakeMu.Lock()
+	s.wakePending = false
+	s.wakeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -902,6 +926,12 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 		body = truncateValidUTF8Tail(body)
 		// 401/403 表示主节点已拒绝本节点凭据（节点被删除或注册被拒），
 		// 重试不可能自愈：返回终止类错误，由 run 循环 halt 等待人工介入。
+		// 例外：目标节点已降级为从节点时 requireMaster 同返 403，但令牌仍有效；
+		// 这不是撤销，必须保持可重试，待对方重新升主后自动恢复。
+		if resp.StatusCode == http.StatusForbidden && strings.Contains(string(body), "该操作仅允许在主节点执行") {
+			return SyncResult{}, newSyncFailure(models.SyncErrorCodeValidationFailed,
+				fmt.Errorf("目标主节点已降级为从节点(%d): %s", resp.StatusCode, strings.TrimSpace(string(body))))
+		}
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			return SyncResult{}, newSyncFailure(models.SyncErrorCodeValidationFailed,
 				fmt.Errorf("主节点拒绝本节点访问(%d): %w", resp.StatusCode, errSyncTokenRevoked))
@@ -1473,12 +1503,6 @@ func verifiedSnapshotIntegrity(snapshot models.ClusterSnapshot, clusterToken str
 	if err := verifySnapshotSignature(snapshot, clusterToken); err != nil {
 		return models.ClusterSnapshot{}, err
 	}
-	// 只有验签通过后才允许进入 schema_too_new 终止路径：伪造数据永不触发
-	// halted，只能降级。验签通过后若读取端版本不足，无法安全解析
-	// canonical_payload，必须终止同步并等待本节点升级。
-	if snapshot.MinReaderVersion > CurrentSnapshotSchema {
-		return models.ClusterSnapshot{}, &SnapshotSchemaTooNewError{Actual: snapshot.MinReaderVersion, Supported: CurrentSnapshotSchema}
-	}
 	if len(snapshot.CanonicalPayload) > 0 && snapshot.Fingerprint == "" {
 		return models.ClusterSnapshot{}, newSyncFailure(models.SyncErrorCodeValidationFailed, errors.New("快照规范内容缺少指纹"))
 	}
@@ -1502,6 +1526,12 @@ func verifiedSnapshotIntegrity(snapshot models.ClusterSnapshot, clusterToken str
 		canonical.Signature = snapshot.Signature
 		canonical.CanonicalPayload = append(json.RawMessage(nil), snapshot.CanonicalPayload...)
 		snapshot = canonical
+	}
+	// 只有验签且外层/canonical 元数据一致性通过后，才允许进入
+	// schema_too_new 终止路径。此处 snapshot.MinReaderVersion 已绑定签名内容；
+	// 被篡改的外层值只能得到可重试的 validation_failed，永不触发 halted。
+	if snapshot.MinReaderVersion > CurrentSnapshotSchema {
+		return models.ClusterSnapshot{}, &SnapshotSchemaTooNewError{Actual: snapshot.MinReaderVersion, Supported: CurrentSnapshotSchema}
 	}
 	if snapshot.SchemaVersion > CurrentSnapshotSchema {
 		return models.ClusterSnapshot{}, &SnapshotSchemaTooNewError{Actual: snapshot.SchemaVersion, Supported: CurrentSnapshotSchema}
@@ -1671,13 +1701,9 @@ func (s *SyncService) run(ctx context.Context) {
 				prevRoundFailed = false
 			}
 		}
-		// 存量脏数据兜底：历史问题 前 sync_interval 无下限校验，库里可能残留 0/负数
-		// 或校验下限（10s）以下的值（含被主节点经快照原样下发的存量 1-9s），
-		// time.NewTimer(<=0) 会立即触发导致零间隔 Pull 风暴，1-9s 同样是 历史问题
-		// 要消除的高频 Pull；clamp 到 60s，下限与 UpdateSettings 校验一致（历史问题 A-1）。
-		if interval < 10 {
-			interval = 60
-		}
+		// 存量脏数据兜底（历史问题/历史问题 + D2-历史问题）：<10s 归 60s，>86400s 归 24h，
+		// 与 Status/节点离线阈值/快照入站同一实现，避免展示、运行与在线判定分叉。
+		interval = normalizeSyncInterval(interval)
 		delay := time.Duration(interval) * time.Second
 		if token == "" {
 			delay = 10 * time.Second

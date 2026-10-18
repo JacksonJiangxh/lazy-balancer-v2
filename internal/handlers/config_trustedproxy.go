@@ -17,7 +17,7 @@ import (
 //
 // 归一（原地回写 req 字段）：
 //   - ranges：裸 IP 补 /32（v4）//128（v6）；条数 ≤64；前缀长度 <8（v4）
-//     或 <96（v6）一律拒绝——过宽网段会让伪造头在任意来源被采信。
+//     或 <29（v6）一律拒绝——过宽网段会让伪造的头在任意来源被采信。
 //   - range_refs（2026-10-12）：引用的 IP 地址列表 id（JSON 整数数组）；
 //     每个 id 必须存在且为自定义名单（system=1 内置名单拒绝——U04d-02）；
 //     引用名单条目须为合法 IP/CIDR 且与内联通道同宽度判据（U04d-01）；总
@@ -312,7 +312,7 @@ func normalizeTrustedProxyRangeRefsWithSource(raw string, source trustedProxyBac
 				return "", 0, fmt.Errorf("引用的地址列表「%s」含过宽网段 %s：该网段覆盖全部地址空间，等同信任任意来源", row.name, prefix.String())
 			}
 			if prefix.Bits() < services.TrustedProxyMinPrefixBits(prefix.Addr()) {
-				return "", 0, fmt.Errorf("引用的地址列表「%s」含过宽网段 %s：最小允许 /8（IPv4）与 /96（IPv6），请收窄到该 CDN 的回源网段", row.name, prefix.String())
+				return "", 0, fmt.Errorf("引用的地址列表「%s」含过宽网段 %s：最小允许 /8（IPv4）与 /29（IPv6），请收窄到该 CDN 的回源网段", row.name, prefix.String())
 			}
 		}
 		total += len(entries)
@@ -361,7 +361,7 @@ func normalizeTrustedProxyRanges(raw string) (string, error) {
 			return "", fmt.Errorf("受信代理网段过宽（%s）：该网段覆盖全部地址空间，等同信任任意来源，请收窄到该 CDN 的回源网段", prefix.String())
 		}
 		if prefix.Bits() < services.TrustedProxyMinPrefixBits(prefix.Addr()) {
-			return "", fmt.Errorf("受信代理网段过宽（%s）：最小允许 /8（IPv4）与 /96（IPv6），请收窄到该 CDN 的回源网段", prefix.String())
+			return "", fmt.Errorf("受信代理网段过宽（%s）：最小允许 /8（IPv4）与 /29（IPv6），请收窄到该 CDN 的回源网段", prefix.String())
 		}
 		// 去重保序（与 headers 侧同口径，历史补充轮 U6B-7）
 		if _, dup := seen[prefix.String()]; dup {

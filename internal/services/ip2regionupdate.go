@@ -246,8 +246,7 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 	// is_master 守卫后节点被降级时，从节点上的 in-flight 更新必须立即终止。
 	// 历史问题（历史）：NULL 兜底归一为 1，与 IsMaster/readonly 写闸/
 	// 调度器 tick 的 COALESCE(is_master,1) 同口径（历史 NULL 视为主节点）。
-	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
+	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
 		// 历史问题-01（历史）：从节点中止是正常跳过语义，镜像 CRS——
 		// 落 skipped 终态、审计「更新跳过」，不再记「更新失败」。
 		m.setStage(IP2RegionStatusSkipped, "当前节点为从节点，终止 IP2Region 更新")

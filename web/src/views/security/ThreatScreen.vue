@@ -46,6 +46,8 @@
       </transition>
       <div class="error-stack">
         <div v-if="statsError" class="error-banner">大屏数据加载失败，正在重试…</div>
+        <div v-if="stats?.backfill_incomplete" class="error-banner site-unset">历史统计回填尚未完成，当前窗口总量可能少计，稍后将继续补齐</div>
+        <div v-if="stats?.rollup_stale" class="error-banner site-unset">统计汇总更新延迟，当前窗口数据可能不是最新</div>
         <div v-if="engineError" class="error-banner">
           大屏引擎加载失败
           <button type="button" class="btn error-retry" @click="mountEngine">重试</button>
@@ -282,7 +284,7 @@ import { usePollingTask } from '@/composables/usePollingTask'
 import { useCountUp } from '@/composables/useCountUp'
 import { formatDate } from '@/utils/date'
 import { trafficDelta, threatIndex, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '@/utils/threatScreenMetrics'
-import { flowBucket, flowBucketKey, flowGroupEvents, flowRegionKey, flowTimestamp, shouldAggregate } from '@/utils/threatFlowRules'
+import { flowBucket, flowBucketKey, flowGroupEvents, flowRegionKey, flowTimestamp, shouldAggregate, normalizeTrafficSampleN, reconstructObservedRate, stepAdaptiveSample, nextFlowCursor } from '@/utils/threatFlowRules'
 import type { ThreatScene, ThreatSceneOptions } from '@/utils/threatScene'
 
 // 威胁大屏（v2.3.8 Threat Wall 版式）：三栏 HUD 网格（左事件流/中引擎舞台/
@@ -308,6 +310,8 @@ interface ThreatScreenStats {
   hourly_hist: { name: string; value: number }[]
   attack_type_share: { name: string; value: number }[]
   recent_rate: number
+  backfill_incomplete?: boolean
+  rollup_stale?: boolean
 }
 
 interface FeedEvent {
@@ -736,8 +740,9 @@ function setWindow(hours: number): void {
 // 本站坐标 + 大屏模式（threat_screen_mode：map/globe）——/config 读一次。
 // 历史 历史问题：不阻塞引擎/轮询启动（见 onMounted）。
 const screenMode = ref('map')
+// 采样配置单源：-1=自适应、0=关闭、1=全量（固定 2-64 已退役，存量值归一为 -1）。
 const flowSampleN = ref(-1)
-// 自适应模式初始全量；按「事件数 × 当前采样因子」估算真实速率后调整。
+// 自适应档位（1 全量 / 4 / 8）；非自适应配置直接取配置值，0=关闭不申请逐请求采集。
 const activeSampleN = ref(1)
 const flowSampleLabel = computed(() => {
   if (flowSampleN.value === 0) return 'OFF'
@@ -752,8 +757,9 @@ async function loadServerCentroid(): Promise<void> {
     const res = await request.get<APIResponse<{ server_map_lat?: number; server_map_lon?: number; threat_screen_mode?: string; threat_traffic_sample_n?: number }>>('/config?_ts=' + Date.now(), { silent: true })
     screenMode.value = res.data?.threat_screen_mode === 'globe' ? 'globe' : 'map'
     const rawSample = res.data?.threat_traffic_sample_n ?? -1
-    flowSampleN.value = rawSample === -1 || rawSample === 0 || rawSample === 1 ? rawSample : -1
-    activeSampleN.value = flowSampleN.value === 0 ? 0 : flowSampleN.value === -1 ? 1 : flowSampleN.value
+    flowSampleN.value = normalizeTrafficSampleN(rawSample)
+    // 自适应从全量起步，由事件流速率升/降档；关闭=0；全量=1。
+    activeSampleN.value = flowSampleN.value === 0 ? 0 : 1
     acquireCollector()
     serverLatLon[0] = res.data?.server_map_lat ?? 0
     serverLatLon[1] = res.data?.server_map_lon ?? 0
@@ -771,8 +777,11 @@ async function loadServerCentroid(): Promise<void> {
 
 // ============ 事件流 ============
 const feedError = ref(false)
+// 入场回溯只在「首次轮询」回放；不能用 sinceId===0 判定——会话库为空时首轮
+// sinceId 保持 0，此后第一批真实攻击会被误当回溯而丢掉光流/弹框。
+let feedFirstBatchDone = false
 const feedTask = usePollingTask(async ({ signal, isCurrent }) => {
-  const isInitialBatch = sinceId.value === 0
+  const isInitialBatch = !feedFirstBatchDone
   let cursor = sinceId.value
   let hasMore = true
   const events: FeedEvent[] = []
@@ -794,6 +803,7 @@ const feedTask = usePollingTask(async ({ signal, isCurrent }) => {
   }
   if (!isCurrent()) return
   feedError.value = false
+  feedFirstBatchDone = true
   sinceId.value = cursor
   if (events.length === 0) return
   feedItems.value = [...events, ...feedItems.value].sort((a, b) => b.id - a.id).slice(0, FEED_LIMIT)
@@ -819,16 +829,21 @@ const statsTask = usePollingTask(async ({ signal, isCurrent }) => {
 
 // ============ 逐请求正常流量事件流（大屏打开时轮询；关闭后停止） ============
 let flowSince = 0
+let flowCursorEpoch = 0
 let adaptiveStable = 0
 let adaptiveLastSwitch = 0
 const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
+  const cursorEpoch = flowCursorEpoch
   const res = await request.get<APIResponse<{ enabled?: boolean; events?: NormalFlowEvent[]; next_seq?: number; sample_n?: number }>>(
     `/security/overview/threat-screen/events?since=${flowSince}&limit=1000`,
     { silent: true, signal },
   )
-  if (!isCurrent()) return
+  if (!isCurrent() || cursorEpoch !== flowCursorEpoch) return
   const data = res.data
-  if (!data?.enabled) return
+  if (!data?.enabled) {
+    flowSince = 0
+    return
+  }
   const events = data.events ?? []
   // 有界光流池：同一轮按地区聚合；总弧数上限 30（与引擎池一致）。
   // ≤10 且预算足够时逐条表达，超出预算或 >10 的地区合并为一条加权光流。
@@ -851,25 +866,22 @@ const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
       budget--
     }
   }
-  if (typeof data.next_seq === 'number') flowSince = data.next_seq
+  flowSince = nextFlowCursor(flowSince, data)
   if (flowSampleN.value === -1 && activeSampleN.value > 0) {
-    // events.length 已经被当前采样因子缩小；先还原真实速率再判定，否则
-    // 1/8 下 125 条会被误判成「低速」反复切回全量。
-    const sampleForRate = data.sample_n && data.sample_n > 0 ? data.sample_n : activeSampleN.value
-    const observedRate = events.length * sampleForRate
-    const target = observedRate > 600 ? 8 : observedRate > 150 ? 4 : 1
-    if (target === activeSampleN.value) {
-      adaptiveStable = 0
-      adaptiveLastSwitch = 0
-    } else {
-      adaptiveStable++
-      const now = Date.now()
-      if (adaptiveStable >= 2 && now - adaptiveLastSwitch > 4000) {
-        activeSampleN.value = target
-        adaptiveStable = 0
-        adaptiveLastSwitch = now
-        acquireCollector()
-      }
+    // events.length 已被当前采样因子缩小，先用服务端回报的 sample_n 还原真实
+    // 速率（1/8 下 125 条不得被误判为低速）；换档需连续 2 次采样同向且距
+    // 上次换档 ≥4s（滞回阈值见 ADAPTIVE_SAMPLE_THRESHOLDS）。
+    const observedRate = reconstructObservedRate(events.length, data.sample_n ?? 0, activeSampleN.value)
+    const outcome = stepAdaptiveSample(
+      { active: activeSampleN.value, stable: adaptiveStable, lastSwitch: adaptiveLastSwitch },
+      observedRate,
+      Date.now(),
+    )
+    adaptiveStable = outcome.stable
+    adaptiveLastSwitch = outcome.lastSwitch
+    if (outcome.changed) {
+      activeSampleN.value = outcome.active
+      acquireCollector()
     }
   }
 }, { interval: 1000, onError: () => { /* 事件流不可用不阻断大屏 */ } })
@@ -983,6 +995,10 @@ function onKeydown(event: KeyboardEvent): void {
 function onVisibilityChange(): void {
   if (document.hidden) threatMap?.setPaused(true)
   else {
+    // 后台节流可能让租约过期并清空后端序号；恢复后从 0 追赶，避免旧高水位
+    // 永久过滤新事件。
+    flowCursorEpoch++
+    flowSince = 0
     acquireCollector()
     applyMapPause()
   }

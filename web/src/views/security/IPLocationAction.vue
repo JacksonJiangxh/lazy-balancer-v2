@@ -410,8 +410,8 @@ const trustHitSummary = computed(() => {
   let passthroughOwner: PolicyRow | undefined
   for (const policy of policies.value) {
     if (!mergedTrustEntries(policy).some((entry) => entryMatchesIp(entry, ip))) continue
-    trusted = true
     if (!policy.ip_whitelist_enabled) continue
+    trusted = true
     if (policy.trust_detection === true) detectionOwner ??= policy
     else if (policy.trust_detection === false) passthroughOwner ??= policy
   }
@@ -423,6 +423,16 @@ const ipHitListIds = computed(() => {
   for (const l of ipLists.value) {
     if (l.system) continue
     if ((ipListEntries.value[l.id] ?? []).some((e) => entryMatchesIp(e, props.ip.trim()))) hit.add(l.id)
+  }
+  return hit
+})
+// remove-ip 只删除精确 value；CIDR 覆盖命中仅用于状态展示，不产生移除按钮。
+const ipExactListIds = computed(() => {
+  const hit = new Set<number>()
+  const ip = props.ip.trim()
+  for (const l of ipLists.value) {
+    if (l.system) continue
+    if ((ipListEntries.value[l.id] ?? []).includes(ip)) hit.add(l.id)
   }
   return hit
 })
@@ -479,17 +489,20 @@ const rowView = (policy: PolicyRow): RowView => {
   // 命中判定走共享 ipHitListIds（历史 F4 收敛）。
   const trustRefIds = parseRefIds(policy.ip_whitelist_refs)
   view.removableTrustRefLists = ipLists.value
-    .filter((l) => trustRefIds.includes(l.id) && ipHitListIds.value.has(l.id))
+    .filter((l) => trustRefIds.includes(l.id) && ipExactListIds.value.has(l.id))
     .map((l) => ({ id: l.id, name: l.name }))
   // ACL 引用命中（历史补）：黑/白名单状态行标注具体来源名单名
   const aclRefIds = parseRefIds(policy.ip_acl_list_refs)
   const aclHitNames = ipLists.value
     .filter((l) => aclRefIds.includes(l.id) && ipHitListIds.value.has(l.id))
     .map((l) => l.name)
+  const trustHitNames = ipLists.value
+    .filter((l) => trustRefIds.includes(l.id) && ipHitListIds.value.has(l.id))
+    .map((l) => l.name)
   const srcTag = (names: string[]): string =>
     names.length > 0 ? `（来自引用列表「${names.join('」「')}」）` : '（来自引用列表）'
   view.aclHitSourceLabel = srcTag(aclHitNames)
-  view.trustHitSourceLabel = srcTag(view.removableTrustRefLists.map((l) => l.name))
+  view.trustHitSourceLabel = srcTag(trustHitNames)
 
   // 阶段 0 行（历史问题 分组②）：信任名单状态即整行语义，无 ACL 面；
   // 模式行（直通/保留检测）由模板按组渲染
@@ -547,7 +560,7 @@ const rowView = (policy: PolicyRow): RowView => {
 
   view.removableRefLists = ipLists.value
     .filter((l) => !l.system && parseRefIds(policy.ip_acl_list_refs).includes(l.id))
-    .filter((l) => (ipListEntries.value[l.id] ?? []).some((e) => entryMatchesIp(e, props.ip.trim())))
+    .filter((l) => ipExactListIds.value.has(l.id))
     .map((l) => ({ id: l.id, name: l.name }))
   // 信任豁免组合态（历史组合语义复查）：预检信任 DetectionOnly 是事务级
   // 全局——但后缀只对「实际命中」形态有意义（deny 命中 / allow 交集外被 id:7
@@ -608,7 +621,7 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
   if (!inlineExact && exactRefLists.length === 0) {
     if (parseIPList(row.policy.ip_whitelist).some((e) => entryMatchesIp(e, ip))) {
       ElMessage.info('该 IP 由内联 CIDR 提供信任，请在策略编辑中移除对应条目')
-    } else if (row.removableTrustRefLists.some((m) => (ipListEntries.value[m.id] ?? []).some((e) => entryMatchesIp(e, ip)))) {
+    } else if (parseRefIds(row.policy.ip_whitelist_refs).some((id) => ipHitListIds.value.has(id))) {
       ElMessage.info('该 IP 由引用列表中的 CIDR 条目提供信任，请编辑对应列表移除条目')
     } else {
       ElMessage.warning('该 IP 的信任条目不可在本弹窗移除，请到「安全防护 → 安全策略」编辑该策略处理')

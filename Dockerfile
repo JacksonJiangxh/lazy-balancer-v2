@@ -95,10 +95,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # Final image
 FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
-# FE-8/INFRA-4（历史登记）：版本号三处硬编码之一（另两处
-# web/src/utils/branding.ts appVersion 回退值、docker-compose.yml args.VERSION）。
-# 发版检查单已固化进 lazy-balancer-release 技能步骤 2（三处同步 bump）——保留
-# 硬编码不回退，仅登记防漏。
+# FE-8/INFRA-4（历史登记）：版本号硬编码点之一。全仓七处=README 两版 docker
+# build 示例段、docker-compose.yml 两处 image tag、web/src/utils/branding.ts
+# appVersion 回退值、本文件 ARG VERSION、internal/config/config.go APP_VERSION
+# 回退、buildx --build-arg（发布时必须显式传）。发版检查单以 lazy-balancer-release
+# 技能步骤 2 为唯一清单（七处同步 bump）——保留硬编码不回退，仅登记防漏。
 ARG VERSION=v2.3.8
 # 构建机网络受限时经 --build-arg HTTP(S)_PROXY 透传给 RUN 下载步骤
 # （CRS/ip2region 钉版下载）；未传参时为空值，行为不变（官方惯例形态）。
@@ -118,6 +119,8 @@ WORKDIR /app
 COPY --from=xcaddy-builder /app/caddy /usr/local/bin/caddy
 COPY --from=backend /app/cmd/server/lazy-balancer /usr/local/bin/lazy-balancer
 COPY web/dist /app/ui
+# Apache-2.0 §4(a)：随分发（镜像）提供许可证副本。
+COPY LICENSE /app/LICENSE
 
 RUN mkdir -p /app/data /app/config /app/logs /app/certs /app/waf/crs /app/waf/audit
 

@@ -320,6 +320,7 @@ func createTables() error {
 		health_check_healthy_threshold INTEGER NOT NULL DEFAULT 2,
 		enable_active_health_check BOOLEAN DEFAULT FALSE,
 		tcp_health_check_port INTEGER DEFAULT 0,
+		tcp_proxy_protocol BOOLEAN DEFAULT 0,
 		tcp_try_duration INTEGER DEFAULT 0,
 		tcp_try_interval INTEGER NOT NULL DEFAULT 250,
 		request_body_max_size_mb INTEGER DEFAULT 0,
@@ -345,6 +346,9 @@ func createTables() error {
 		tls_cert TEXT,
 		tls_key TEXT,
 		tls_http_redirect BOOLEAN DEFAULT FALSE,
+		tls_source VARCHAR(20) DEFAULT 'manual',
+		acme_config_id INTEGER DEFAULT 0,
+		ca_provider_id INTEGER DEFAULT 0,
 		enable_compress BOOLEAN DEFAULT FALSE,
 		compress_types VARCHAR(100) DEFAULT 'gzip',
 		enabled BOOLEAN NOT NULL DEFAULT 1,
@@ -1001,67 +1005,67 @@ func runMigrations() error {
 		// 受信网段引用名单（2026-10-12）：JSON 数组文本，存 security_ip_lists 的
 		// id 列表（镜像策略 ip_acl_list_refs 形态）；渲染与内联 CIDR 合并投影
 		// （2026-10-15 热路径化：tp.txt/lb_file 文件源，内容变化零 /load）。
-		"global_config.trusted_proxy_range_refs":                "TEXT NOT NULL DEFAULT '[]'",
-		"global_config.trusted_proxy_headers":                   "TEXT NOT NULL DEFAULT '[]'",
-		"global_config.trusted_proxy_strict":                    "INTEGER NOT NULL DEFAULT 1",
-		"global_config.default_ca_provider_id":                  "INTEGER DEFAULT 0",
-		"global_config.cert_renewal_days":                       "INTEGER DEFAULT 30",
-		"global_config.cert_renewal_attempts":                   "INTEGER DEFAULT 5",
-		"global_config.task_log_size_mb":                        "INTEGER DEFAULT 10",
-		"global_config.audit_log_size_mb":                       "INTEGER DEFAULT 10",
-		"global_config.caddy_apply_error":                       "TEXT DEFAULT ''",
-		"global_config.runtime_log_size_mb":                     "INTEGER DEFAULT 100",
-		"global_config.acme_email":                              "VARCHAR(255)",
-		"global_config.cert_expiry_days":                        "INTEGER DEFAULT 30",
-		"global_config.caddy_log_level":                         "VARCHAR(10) DEFAULT 'info'",
-		"global_config.caddy_log_size_mb":                       "INTEGER NOT NULL DEFAULT 100",
-		"global_config.request_body_max_size_mb":                "INTEGER NOT NULL DEFAULT 128",
-		"global_config.http_read_timeout":                       "INTEGER NOT NULL DEFAULT 60",
-		"global_config.http_write_timeout":                      "INTEGER NOT NULL DEFAULT 60",
-		"global_config.http_idle_timeout":                       "INTEGER NOT NULL DEFAULT 120",
-		"global_config.upstream_keepalive_timeout":              "INTEGER DEFAULT 0",
-		"global_config.server_tokens_hidden":                    "BOOLEAN DEFAULT FALSE",
-		"global_config.admin_tls_enabled":                       "BOOLEAN DEFAULT 0",
-		"global_config.admin_tls_mode":                          "VARCHAR(20) DEFAULT 'selfsigned'",
-		"global_config.admin_tls_cert":                          "TEXT DEFAULT ''",
-		"global_config.admin_tls_key":                           "TEXT DEFAULT ''",
-		"global_config.access_log_json":                         "BOOLEAN DEFAULT TRUE",
-		"global_config.access_log_format":                       "TEXT DEFAULT ''",
-		"global_config.audit_retention_months":                  "INTEGER DEFAULT 3",
-		"global_config.jwt_expire_minutes":                      "INTEGER DEFAULT 20",
-		"global_config.timezone":                                "VARCHAR(50) DEFAULT 'Asia/Shanghai'",
-		"global_config.github_proxy_url":                        "TEXT NOT NULL DEFAULT 'https://v4.gh-proxy.org/'",
-		"global_config.github_token":                            "TEXT NOT NULL DEFAULT ''",
-		"global_config.server_map_lat":                          "REAL NOT NULL DEFAULT 0",
-		"global_config.threat_screen_mode":                      "TEXT NOT NULL DEFAULT 'map'",
-		"global_config.threat_traffic_sample_n":                 "INTEGER NOT NULL DEFAULT 4",
-		"global_config.threat_traffic_sample_migrated4":         "INTEGER NOT NULL DEFAULT 0",
-		"global_config.threat_traffic_sample_adaptive_migrated": "INTEGER NOT NULL DEFAULT 0",
+		"global_config.trusted_proxy_range_refs":               "TEXT NOT NULL DEFAULT '[]'",
+		"global_config.trusted_proxy_headers":                  "TEXT NOT NULL DEFAULT '[]'",
+		"global_config.trusted_proxy_strict":                   "INTEGER NOT NULL DEFAULT 1",
+		"global_config.default_ca_provider_id":                 "INTEGER DEFAULT 0",
+		"global_config.cert_renewal_days":                      "INTEGER DEFAULT 30",
+		"global_config.cert_renewal_attempts":                  "INTEGER DEFAULT 5",
+		"global_config.task_log_size_mb":                       "INTEGER DEFAULT 10",
+		"global_config.audit_log_size_mb":                      "INTEGER DEFAULT 10",
+		"global_config.caddy_apply_error":                      "TEXT DEFAULT ''",
+		"global_config.runtime_log_size_mb":                    "INTEGER DEFAULT 100",
+		"global_config.acme_email":                             "VARCHAR(255)",
+		"global_config.cert_expiry_days":                       "INTEGER DEFAULT 30",
+		"global_config.caddy_log_level":                        "VARCHAR(10) DEFAULT 'info'",
+		"global_config.caddy_log_size_mb":                      "INTEGER NOT NULL DEFAULT 100",
+		"global_config.request_body_max_size_mb":               "INTEGER NOT NULL DEFAULT 128",
+		"global_config.http_read_timeout":                      "INTEGER NOT NULL DEFAULT 60",
+		"global_config.http_write_timeout":                     "INTEGER NOT NULL DEFAULT 60",
+		"global_config.http_idle_timeout":                      "INTEGER NOT NULL DEFAULT 120",
+		"global_config.upstream_keepalive_timeout":             "INTEGER DEFAULT 0",
+		"global_config.server_tokens_hidden":                   "BOOLEAN DEFAULT FALSE",
+		"global_config.admin_tls_enabled":                      "BOOLEAN DEFAULT 0",
+		"global_config.admin_tls_mode":                         "VARCHAR(20) DEFAULT 'selfsigned'",
+		"global_config.admin_tls_cert":                         "TEXT DEFAULT ''",
+		"global_config.admin_tls_key":                          "TEXT DEFAULT ''",
+		"global_config.access_log_json":                        "BOOLEAN DEFAULT TRUE",
+		"global_config.access_log_format":                      "TEXT DEFAULT ''",
+		"global_config.audit_retention_months":                 "INTEGER DEFAULT 3",
+		"global_config.jwt_expire_minutes":                     "INTEGER DEFAULT 20",
+		"global_config.timezone":                               "VARCHAR(50) DEFAULT 'Asia/Shanghai'",
+		"global_config.github_proxy_url":                       "TEXT NOT NULL DEFAULT 'https://v4.gh-proxy.org/'",
+		"global_config.github_token":                           "TEXT NOT NULL DEFAULT ''",
+		"global_config.server_map_lat":                         "REAL NOT NULL DEFAULT 0",
+		"global_config.threat_screen_mode":                     "TEXT NOT NULL DEFAULT 'map'",
+		"global_config.threat_traffic_sample_n":                "INTEGER NOT NULL DEFAULT -1", // -1=自适应/0=关闭/1=全量（历史；2..64 废除）
+		"global_config.threat_traffic_sample_unified_migrated": "INTEGER NOT NULL DEFAULT 0",
 		// 安全事件保留显式化：默认 90 天 / 100 万行由配置本身承载，
 		// 不再用 0 隐式映射服务层写死默认值。
-		"global_config.security_events_retention_days": "INTEGER NOT NULL DEFAULT 90",
-		"global_config.security_events_row_cap":        "INTEGER NOT NULL DEFAULT 1000000",
-		"global_config.server_map_lon":                 "REAL NOT NULL DEFAULT 0",
-		"lb_rules.log_enabled":                         "BOOLEAN DEFAULT 0",
-		"lb_rules.custom_routes_enabled":               "BOOLEAN NOT NULL DEFAULT 0",
-		"lb_rules.proxy_dial_timeout":                  "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_response_header_timeout":       "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_read_timeout":                  "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_write_timeout":                 "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_stream_timeout":                "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_flush_interval":                "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_stream_close_delay":            "INTEGER NOT NULL DEFAULT 0",
-		"global_config.proxy_dial_timeout":             "INTEGER DEFAULT 0",
-		"global_config.proxy_response_header_timeout":  "INTEGER DEFAULT 0",
-		"global_config.proxy_read_timeout":             "INTEGER DEFAULT 0",
-		"global_config.proxy_write_timeout":            "INTEGER DEFAULT 0",
-		"global_config.proxy_stream_timeout":           "INTEGER DEFAULT 0",
-		"global_config.proxy_flush_interval":           "INTEGER DEFAULT 0",
-		"global_config.proxy_stream_close_delay":       "INTEGER DEFAULT 0",
-		"users.password_changed_at":                    "DATETIME",
-		"users.password_version":                       "INTEGER NOT NULL DEFAULT 0",
-		"global_config.cluster_version":                "INTEGER DEFAULT 0",
-		"global_config.sync_users":                     "BOOLEAN DEFAULT 1",
+		"global_config.security_events_retention_days":     "INTEGER NOT NULL DEFAULT 90",
+		"global_config.security_events_row_cap":            "INTEGER NOT NULL DEFAULT 1000000",
+		"global_config.security_events_retention_migrated": "INTEGER NOT NULL DEFAULT 0",
+		"global_config.server_map_lon":                     "REAL NOT NULL DEFAULT 0",
+		"lb_rules.log_enabled":                             "BOOLEAN DEFAULT 0",
+		"lb_rules.custom_routes_enabled":                   "BOOLEAN NOT NULL DEFAULT 0",
+		"lb_rules.proxy_dial_timeout":                      "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.proxy_response_header_timeout":           "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.proxy_read_timeout":                      "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.proxy_write_timeout":                     "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.proxy_stream_timeout":                    "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.proxy_flush_interval":                    "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.proxy_stream_close_delay":                "INTEGER NOT NULL DEFAULT 0",
+		"global_config.proxy_dial_timeout":                 "INTEGER DEFAULT 0",
+		"global_config.proxy_response_header_timeout":      "INTEGER DEFAULT 0",
+		"global_config.proxy_read_timeout":                 "INTEGER DEFAULT 0",
+		"global_config.proxy_write_timeout":                "INTEGER DEFAULT 0",
+		"global_config.proxy_stream_timeout":               "INTEGER DEFAULT 0",
+		"global_config.proxy_flush_interval":               "INTEGER DEFAULT 0",
+		"global_config.proxy_stream_close_delay":           "INTEGER DEFAULT 0",
+		"users.password_changed_at":                        "DATETIME",
+		"users.password_version":                           "INTEGER NOT NULL DEFAULT 0",
+		"global_config.cluster_version":                    "INTEGER DEFAULT 0",
+		"global_config.sync_users":                         "BOOLEAN DEFAULT 1",
 		// branding.json 原文镜像(2026-09-11):主节点经快照分发到从节点,
 		// 入触发器 OF 列表——文件变化即 bump cluster_version。
 		"global_config.branding_json":                 "TEXT DEFAULT ''",
@@ -1186,10 +1190,7 @@ func runMigrations() error {
 	if err := migrateSecurityEventRetentionDefaults(); err != nil {
 		return err
 	}
-	if err := migrateThreatTrafficSampleDefault4(); err != nil {
-		return err
-	}
-	if err := migrateThreatTrafficSampleAdaptive(); err != nil {
+	if err := migrateThreatTrafficSampleUnified(); err != nil {
 		return err
 	}
 	// 内置备选拦截页（2026-09-25 裁定）：必须在 ensureNewColumns 之后执行——存量库
@@ -1572,10 +1573,9 @@ func runMigrations() error {
 		return fmt.Errorf("failed to backfill NULL security_ip2region_version.consecutive_failures: %w", err)
 	}
 
-	// 历史问题: global_config.is_master NULL 回填——NULL 时 readonly 判定走
-	// COALESCE(is_master,1)（视为主库）而 cluster_version 触发器走
-	// COALESCE(is_master,0)（视为从库），语义分裂；归一为 1（fresh 行的
-	// schema 默认即 TRUE；幂等）。is_master 无 ADD COLUMN 迁移，遗留库可能
+	// 历史问题: global_config.is_master NULL 回填——NULL 时 readonly 判定与
+	// cluster_version 触发器均走 COALESCE(is_master,1)（视为主库）；归一为 1
+	// 与两者一致（fresh 行的 schema 默认即 TRUE；幂等）。is_master 无 ADD COLUMN 迁移，遗留库可能
 	// 整列缺失，此时跳过（列缺失是既有形态，不属于本次回填范围）。
 	var isMasterColumn int
 	if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('global_config') WHERE name='is_master'").Scan(&isMasterColumn); err != nil {
@@ -1689,37 +1689,13 @@ func runMigrations() error {
 	if err := migrateThreatSystemListNames(); err != nil {
 		return err
 	}
-	// 威胁情报库内置只读名单种子（v2.3.2 名单化重构）：name 稳定（更新任务
-	// 定位键），条目空，由更新任务独占写；system=1 行面板/API 拒改拒删。
-	// 历史问题：存在性判定按 system=1 限定——旧实现按名（不限 system）判定，
-	// 用户已有同名 system=0 列表时永不补建内置行，威胁文件更新却无名单 ID
-	// 可供策略引用（重启也不自愈）。同名用户列表不静默合并（数据归属不同），
-	// 但至少留痕提示重命名以消除列表选择器歧义。
-	for _, sl := range ThreatSystemLists {
-		result, err := DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at)
-			SELECT ?, ?, '恶意 IP', '[]', 1, datetime('now'), datetime('now')
-			WHERE NOT EXISTS (SELECT 1 FROM security_ip_lists WHERE name=? AND system=1)`,
-			sl.Name, sl.Description, sl.Name)
-		if err != nil {
-			return fmt.Errorf("failed to seed threat system list %s: %w", sl.Name, err)
-		}
-		if n, _ := result.RowsAffected(); n > 0 {
-			var userOwned int
-			if err := DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=0`, sl.Name).Scan(&userOwned); err == nil && userOwned > 0 {
-				log.Printf("威胁情报库内置名单 %q 与用户自建列表同名：已创建独立 system=1 行（按 id 引用，互不影响）；建议重命名用户列表以消除选择器歧义", sl.Name)
-			}
-		}
-	}
-
-	// 自动封禁预置名单种子（历史问题）：system=1 禁删（DeleteIPList 拒绝）、条目
-	// 可改（手动追加/删除条目——删除即解封）、自动封禁任务独占追加自动条目
-	//（entries 在 DB——与威胁名单的 RDB 文件形态不同，投影层按名映射路由）。
-	// 幂等：按 name 恰好一行（name 非唯一键，INSERT..SELECT..WHERE NOT EXISTS
-	// 形态）。与威胁种子同位：newColumns 补齐 system 列之后执行。
-	if _, err := DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at)
-		SELECT '自动封禁名单', '自动封禁命中 IP（自动封禁任务维护；可手动追加或删除条目）', '自动封禁', '[]', 1, datetime('now'), datetime('now')
-		WHERE NOT EXISTS (SELECT 1 FROM security_ip_lists WHERE name='自动封禁名单')`); err != nil {
-		return fmt.Errorf("failed to seed autoban preset list: %w", err)
+	// 威胁情报库/自动封禁内置只读名单种子（单源：SeedSystemIPLists，
+	// 导入提交后由 handlers 以同一函数重播）。name 稳定（更新任务定位键），
+	// 条目空，由更新任务独占写；system=1 行面板/API 拒改拒删。
+	// 历史问题/历史问题-1：存在性判定按 name+system=1——同名用户列表（旧备份
+	// 可携带 system=0 行）不阻止内置行创建，也不被合并/删除，仅留痕。
+	if err := SeedSystemIPLists(DB); err != nil {
+		return err
 	}
 	// 预置行描述文案归一（2026-10-15「删除条目即解封」裁定）：存量行的旧种子
 	// 描述（「可手动追加或解封」）同步为删除条目口径。仅命中旧文案行——预置行
@@ -2259,51 +2235,87 @@ func migrateCanonicalDomains() error {
 	return nil
 }
 
-// migrateThreatTrafficSampleAdaptive 一次性把旧的固定 4/8 默认切到自适应；
-// marker 置 1 后用户后续选择 4/8 不再被覆盖。
-func migrateThreatTrafficSampleAdaptive() error {
+// migrateThreatTrafficSampleUnified 把大屏采样列收敛到 -1/0/1 三值契约
+// （历史用户裁定：固定 2..64 废除，-1=自适应 / 0=关闭 / 1=全量）。
+// 一次性迁移取代历史两条默认值迁移（8→4、4/8→-1）——本契约发布后任何
+// 2..64 值（旧默认 4/8、用户历史固定选择、旧备份恢复）都无意义，统一归
+// 自适应；{-1,0,1} 原样保留。marker 置 1 后不再触碰运行期写值（写侧门
+// -1/0/1 已单点约束）。
+func migrateThreatTrafficSampleUnified() error {
 	var done int
-	if err := DB.QueryRow(`SELECT COALESCE(threat_traffic_sample_adaptive_migrated,0) FROM global_config WHERE id=1`).Scan(&done); err != nil && err != sql.ErrNoRows {
+	if err := DB.QueryRow(`SELECT COALESCE(threat_traffic_sample_unified_migrated,0) FROM global_config WHERE id=1`).Scan(&done); err != nil && err != sql.ErrNoRows {
 		return err
 	}
 	if done != 0 {
 		return nil
 	}
+	// 列 NOT NULL，但历史库存在带外直写 NULL 的可能：NULL 一并归一 -1，
+	// 其余非 -1/0/1 值（含 2..64 与畸形越界值）全部归自适应。
 	if _, err := DB.Exec(`UPDATE global_config
-		SET threat_traffic_sample_n = CASE WHEN COALESCE(threat_traffic_sample_n,0) IN (4,8) THEN -1 ELSE threat_traffic_sample_n END,
-		    threat_traffic_sample_adaptive_migrated = 1
+		SET threat_traffic_sample_n = CASE
+		        WHEN threat_traffic_sample_n IS NULL OR threat_traffic_sample_n NOT IN (-1,0,1) THEN -1
+		        ELSE threat_traffic_sample_n
+		    END,
+		    threat_traffic_sample_unified_migrated = 1
 		WHERE id = 1`); err != nil {
 		return err
 	}
 	return nil
 }
 
-// migrateThreatTrafficSampleDefault4 一次性把旧默认 8 调为 1/4；用户后续选择
-// 8 时 marker 已置 1，不再被启动迁移覆盖。
-func migrateThreatTrafficSampleDefault4() error {
-	var done int
-	if err := DB.QueryRow(`SELECT COALESCE(threat_traffic_sample_migrated4,0) FROM global_config WHERE id=1`).Scan(&done); err != nil && err != sql.ErrNoRows {
-		return err
-	}
-	if done != 0 {
-		return nil
-	}
-	if _, err := DB.Exec(`UPDATE global_config
-		SET threat_traffic_sample_n = CASE WHEN COALESCE(threat_traffic_sample_n,8) = 8 THEN 4 ELSE threat_traffic_sample_n END,
-		    threat_traffic_sample_migrated4 = 1
-		WHERE id = 1`); err != nil {
-		return err
-	}
-	return nil
-}
-
-// migrateSecurityEventRetentionDefaults 把旧库的 0=自动 语义回填为显式默认值：
-// 保留天数 90 天、行数上限 100 万。配置项不再迁就服务层写死默认值。
+// migrateSecurityEventRetentionDefaults 一次性把旧库的 0=自动 语义回填为显式
+// 默认值（保留天数 90 天、行数上限 100 万），marker 置 1 后不再触碰运行期写值
+// （历史问题-5/历史问题-5：原实现每启动无条件把 0 改写为 90——写侧拒绝 0 后的存量
+// 0 只来自旧版本/旧导入，迁移一次即可；运行期显式值不得被重启静默改写）。
 func migrateSecurityEventRetentionDefaults() error {
+	var done int
+	if err := DB.QueryRow(`SELECT COALESCE(security_events_retention_migrated,0) FROM global_config WHERE id=1`).Scan(&done); err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if done != 0 {
+		return nil
+	}
 	_, err := DB.Exec(`UPDATE global_config
-		SET security_events_retention_days = CASE WHEN COALESCE(security_events_retention_days,0) = 0 THEN 90 ELSE security_events_retention_days END,
-		    security_events_row_cap = CASE WHEN COALESCE(security_events_row_cap,0) = 0 THEN 1000000 ELSE security_events_row_cap END
+		SET security_events_retention_days = CASE WHEN COALESCE(security_events_retention_days,0) <= 0 THEN 90 ELSE security_events_retention_days END,
+		    security_events_row_cap = CASE WHEN COALESCE(security_events_row_cap,0) <= 0 THEN 1000000 ELSE security_events_row_cap END,
+		    security_events_retention_migrated = 1
 		WHERE id = 1`)
+	return err
+}
+
+// EnsureSystemIPList 幂等确保一条内置 system=1 名单行存在（name+system=1
+// 判定，同名 system=0 用户列表保留并留痕）。返回是否新建。
+// 历史问题-1：db 启动播种、autoban 运行期自愈与导入提交后重播共用本函数，
+// 禁止再按裸 name 判定（旧实现会因同名用户列表永久跳过内置行）。
+func EnsureSystemIPList(database *sql.DB, name, description, category string) (bool, error) {
+	if database == nil {
+		return false, errors.New("确保系统名单: 数据库未初始化")
+	}
+	result, err := database.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at)
+		SELECT ?, ?, ?, '[]', 1, datetime('now'), datetime('now')
+		WHERE NOT EXISTS (SELECT 1 FROM security_ip_lists WHERE name=? AND system=1)`,
+		name, description, category, name)
+	if err != nil {
+		return false, fmt.Errorf("failed to seed system list %s: %w", name, err)
+	}
+	n, _ := result.RowsAffected()
+	if n > 0 {
+		var userOwned int
+		if err := database.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=0`, name).Scan(&userOwned); err == nil && userOwned > 0 {
+			log.Printf("内置名单 %q 与用户自建列表同名：已创建独立 system=1 行（按 id 引用，互不影响）；建议重命名用户列表以消除选择器歧义", name)
+		}
+	}
+	return n > 0, nil
+}
+
+// SeedSystemIPLists 重播全部内置 system 名单（启动播种与导入提交后共用单源）。
+func SeedSystemIPLists(database *sql.DB) error {
+	for _, sl := range ThreatSystemLists {
+		if _, err := EnsureSystemIPList(database, sl.Name, sl.Description, "恶意 IP"); err != nil {
+			return err
+		}
+	}
+	_, err := EnsureSystemIPList(database, "自动封禁名单", "自动封禁命中 IP（自动封禁任务维护；可手动追加或删除条目）", "自动封禁")
 	return err
 }
 

@@ -1029,6 +1029,7 @@ func TestImportConfigBackup_requeues_imported_non_terminal_certificate_jobs(t *t
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source) VALUES ('lb_requeue_v2','requeue','http','requeue.example.test',8080,1,1,'acme_dns');
 		INSERT INTO users (username,password_hash,role,is_enabled) VALUES ('admin','hash','admin',1);
@@ -1092,6 +1093,7 @@ func TestImportConfigBackup_reports_partial_failure_when_certificate_job_recover
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	oldRequeue := requeueNonTerminalCertJobs
 	requeueNonTerminalCertJobs = func() error { return errors.New("requeue failed") }
@@ -1117,11 +1119,37 @@ func TestImportConfigBackup_reports_partial_failure_when_certificate_job_recover
 	}
 }
 
+// 历史问题-02：提交成功后 queue 阶段失败不得跳过提交后收敛；响应仍报部分失败，
+// 但任务日志缓存失效、哨兵清理等必须执行。
+func TestImportConfigBackup_queueFailureStillRunsPostCommitConvergence(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	services.ResetCAQueueManagerForTest()
+	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+	oldRequeue := requeueNonTerminalCertJobs
+	requeueNonTerminalCertJobs = func() error { return errors.New("requeue failed") }
+	t.Cleanup(func() { requeueNonTerminalCertJobs = oldRequeue })
+	oldInvalidate := invalidateImportTaskLogCache
+	invalidations := 0
+	invalidateImportTaskLogCache = func() { invalidations++ }
+	t.Cleanup(func() { invalidateImportTaskLogCache = oldInvalidate })
+
+	rec := r78Import(h, t, r78BackupJSON(t, nil, nil, nil))
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "证书任务恢复失败") {
+		t.Fatalf("status=%d body=%s, want partial failure", rec.Code, rec.Body.String())
+	}
+	if invalidations != 1 {
+		t.Fatalf("post-commit convergence invalidations=%d, want 1 after queue failure", invalidations)
+	}
+}
+
 func TestImportConfigBackup_joins_import_and_certificate_job_recovery_failures(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	oldRequeue := requeueNonTerminalCertJobs
 	requeueNonTerminalCertJobs = func() error { return errors.New("requeue failed") }
@@ -1309,25 +1337,36 @@ func TestValidateConfigImport_rejects_v2_backup_missing_required_contract(t *tes
 func TestValidateV2Backup_credentials_must_be_json_object(t *testing.T) {
 	tests := []struct {
 		name        string
+		caProvider  string
 		caCred      string
 		dnsCred     string
+		dnsCase     bool
 		wantErrText string
 	}{
-		{name: "ca_providers invalid", caCred: "not-json", wantErrText: "凭证格式"},
-		{name: "ca_providers valid object", caCred: `{"eab_kid":"x"}`},
+		{name: "ca_providers invalid", caProvider: "zerossl", caCred: "not-json", wantErrText: "凭证格式"},
+		{name: "ca_providers valid object", caProvider: "zerossl", caCred: `{"eab_kid":"x"}`},
+		{name: "letsencrypt credentials must be empty", caCred: `{"eab_kid":"x"}`, wantErrText: "凭证必须为空"},
 		{name: "ca_providers empty object", caCred: `{}`},
 		{name: "ca_providers empty string", caCred: ""},
-		{name: "ca_providers array rejected", caCred: `["a"]`, wantErrText: "凭证格式"},
-		{name: "certificate_configs invalid", dnsCred: "not-json", wantErrText: "凭证格式"},
-		{name: "certificate_configs valid object", dnsCred: `{"dns_id":"x"}`},
-		{name: "certificate_configs empty object", dnsCred: `{}`},
-		{name: "certificate_configs empty string", dnsCred: ""},
+		{name: "ca_providers array rejected", caProvider: "zerossl", caCred: `["a"]`, wantErrText: "凭证格式"},
+		{name: "certificate_configs invalid", dnsCred: "not-json", dnsCase: true, wantErrText: "凭证格式"},
+		{name: "certificate_configs valid object", dnsCred: `{"mode":"tencent","secret_id":"id","secret_key":"key"}`, dnsCase: true},
+		{name: "certificate_configs empty object rejected by provider", dnsCred: `{}`, dnsCase: true, wantErrText: "凭证"},
+		{name: "certificate_configs empty string legacy allowed", dnsCred: "", dnsCase: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			caProvider := tt.caProvider
+			if caProvider == "" {
+				caProvider = "letsencrypt"
+			}
+			dnsCredentials := `{"mode":"tencent","secret_id":"id","secret_key":"key"}`
+			if tt.dnsCase {
+				dnsCredentials = tt.dnsCred
+			}
 			backup := completeBackupJSON(t, map[string][]map[string]any{
-				"ca_providers":        {{"credentials": tt.caCred, "provider": "letsencrypt"}}, // CERT44-1:provider 为 NOT NULL 列,真实导出恒携带,夹具补齐
-				"certificate_configs": {{"dns_credentials": tt.dnsCred}},
+				"ca_providers":        {{"credentials": tt.caCred, "provider": caProvider}}, // CERT44-1:provider 为 NOT NULL 列,真实导出恒携带,夹具补齐
+				"certificate_configs": {{"dns_provider": "dnspod", "dns_credentials": dnsCredentials}},
 			})
 			var b configBackup
 			if err := json.Unmarshal([]byte(backup), &b); err != nil {
@@ -1345,6 +1384,72 @@ func TestValidateV2Backup_credentials_must_be_json_object(t *testing.T) {
 				t.Fatalf("validateV2Backup unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+// B3-82-历史问题/04：备份行必须与保存侧同门——CA 并发/间隔上界及 DNS
+// provider/专属凭证均不得绕过；合法上界与有效凭证保持回归。
+func TestValidateV2Backup_caProviderLimitsAndDNSProviderContracts(t *testing.T) {
+	validCA := func() map[string]any {
+		return map[string]any{"provider": "letsencrypt", "credentials": "", "max_concurrent": 100, "min_interval_ms": 60000}
+	}
+	validDNS := func() map[string]any {
+		return map[string]any{"dns_provider": "dnspod", "dns_credentials": `{"mode":"tencent","secret_id":"id","secret_key":"key"}`}
+	}
+	tests := []struct {
+		name        string
+		mutateCA    func(map[string]any)
+		mutateDNS   func(map[string]any)
+		wantErrText string
+	}{
+		{name: "valid upper boundaries"},
+		{name: "max concurrent too high", mutateCA: func(row map[string]any) { row["max_concurrent"] = 101 }, wantErrText: "max_concurrent"},
+		{name: "max concurrent malformed", mutateCA: func(row map[string]any) { row["max_concurrent"] = "100.5" }, wantErrText: "max_concurrent"},
+		{name: "min interval too high", mutateCA: func(row map[string]any) { row["min_interval_ms"] = 60001 }, wantErrText: "min_interval_ms"},
+		{name: "unknown DNS provider", mutateDNS: func(row map[string]any) { row["dns_provider"] = "evil" }, wantErrText: "DNS 提供商"},
+		{name: "DNS provider credentials missing", mutateDNS: func(row map[string]any) { row["dns_credentials"] = `{}` }, wantErrText: "凭证"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			caRow, dnsRow := validCA(), validDNS()
+			if tt.mutateCA != nil {
+				tt.mutateCA(caRow)
+			}
+			if tt.mutateDNS != nil {
+				tt.mutateDNS(dnsRow)
+			}
+			backup := completeBackupJSON(t, map[string][]map[string]any{
+				"ca_providers":        {caRow},
+				"certificate_configs": {dnsRow},
+			})
+			var b configBackup
+			if err := json.Unmarshal([]byte(backup), &b); err != nil {
+				t.Fatal(err)
+			}
+			_, err := validateV2Backup(b)
+			if tt.wantErrText == "" && err != nil {
+				t.Fatalf("valid backup rejected: %v", err)
+			}
+			if tt.wantErrText != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErrText)) {
+				t.Fatalf("err=%v, want contains %q", err, tt.wantErrText)
+			}
+		})
+	}
+}
+
+// B3-82-历史问题/04 收窄：legacy 空 provider/空凭证行保持放行；只有非空且
+// 未知或必填缺失的形态才拒绝。
+func TestValidateV2Backup_legacyEmptyProviderRowsAllowed(t *testing.T) {
+	backup := completeBackupJSON(t, map[string][]map[string]any{
+		"ca_providers":        {{"id": 1, "provider": "", "credentials": ""}},
+		"certificate_configs": {{"id": 1, "dns_provider": "", "dns_credentials": ""}},
+	})
+	var b configBackup
+	if err := json.Unmarshal([]byte(backup), &b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateV2Backup(b); err != nil {
+		t.Fatalf("legacy empty provider rows rejected: %v", err)
 	}
 }
 
@@ -2035,6 +2140,50 @@ func TestImportConfigBackup_skips_empty_domain_rule_before_row_validation(t *tes
 	})
 }
 
+// B3-82-历史问题：空域名 HTTP 规则的关联 cert_jobs 必须先随规则软跳过，
+// 再执行状态门；非跳过规则的非法状态仍必须拒绝。
+func TestConfigBackup_emptyDomainRuleSkipsCertJobBeforeStatusGate(t *testing.T) {
+	backupWithJob := func(ruleDomain, status string) string {
+		return completeBackupJSON(t, map[string][]map[string]any{
+			"lb_rules":  {{"caddy_id": "lb_job_skip", "name": "job-skip", "protocol": "http", "domain": ruleDomain, "listen_port": 8442, "enabled": 1}},
+			"cert_jobs": {{"rule_id": "lb_job_skip", "domain": ruleDomain, "status": status}},
+		})
+	}
+	t.Run("preview skips associated invalid job", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		result := r78PostValidate(t, h, []byte(backupWithJob("", "not-a-status")))
+		if !result.Valid {
+			t.Fatalf("preview valid=false error=%q, want soft skip", result.Error)
+		}
+	})
+	t.Run("import skips associated invalid job", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		router := gin.New()
+		router.POST("/config/import", h.ImportConfigBackup)
+		request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backupWithJob("", "not-a-status")))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want 200 soft skip", response.Code, response.Body.String())
+		}
+		var jobs int
+		if err := db.DB.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE rule_id='lb_job_skip'`).Scan(&jobs); err != nil {
+			t.Fatal(err)
+		}
+		if jobs != 0 {
+			t.Fatalf("skipped rule left %d cert jobs", jobs)
+		}
+	})
+	t.Run("invalid status on retained rule still rejected", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		result := r78PostValidate(t, h, []byte(backupWithJob("valid.example.test", "not-a-status")))
+		if result.Valid || !strings.Contains(result.Error, "无效的证书任务状态") {
+			t.Fatalf("preview=%+v, want invalid status rejection", result)
+		}
+	})
+}
+
 // SC-BAK-01: Config backup export → import round-trip preserves multi-row
 // security_policy_bindings (one rule → multiple policies). Post-import
 // validation passes and policy_id ordering is queryable via the same SELECT
@@ -2513,7 +2662,7 @@ func TestConfigBackup_restore_dump_isomorphism_roundtrip(t *testing.T) {
 		t.Fatalf("seed api key: %v", err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO ca_providers (id,name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled,created_at,updated_at)
-		VALUES (95,'iso-ca','letsencrypt','https://ca.iso/dir','{"eab_kid":"k"}',4,1500,1,'2026-01-02 03:04:05','2026-01-02 03:04:05')`); err != nil {
+		VALUES (95,'iso-ca','zerossl','` + services.ZeroSSLDirectoryURL + `','{"eab_kid":"k"}',4,1500,1,'2026-01-02 03:04:05','2026-01-02 03:04:05')`); err != nil {
 		t.Fatalf("seed ca provider: %v", err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled,created_at,updated_at)
@@ -2716,7 +2865,7 @@ func TestValidateV2Backup_rejectsZoneFormIPEntries(t *testing.T) {
 			{"name": "zone-list", "entries": `[{"value":"fe80::1%eth0","remark":"zone"}]`},
 		},
 	}
-	err := validateV2BackupSecurityPolicies(tables)
+	err := validateV2BackupSecurityPolicies(tables, false)
 	if err == nil {
 		t.Fatal("zone-form IP entry in backup must be rejected (coraza @ipMatch silently drops)")
 	}
@@ -2732,7 +2881,7 @@ func TestValidateV2Backup_acceptsNormalIPEntries(t *testing.T) {
 			{"name": "normal", "entries": `[{"value":"192.168.1.1"},{"value":"10.0.0.0/8"},{"value":"fe80::1"}]`},
 		},
 	}
-	if err := validateV2BackupSecurityPolicies(tables); err != nil {
+	if err := validateV2BackupSecurityPolicies(tables, false); err != nil {
 		t.Fatalf("normal entries must be accepted: %v", err)
 	}
 }
@@ -2748,7 +2897,7 @@ func TestValidateV2Backup_rejectsZoneFormInPolicyInlineFields(t *testing.T) {
 				{"name": "zone-policy", field: `["fe80::1%eth0"]`},
 			},
 		}
-		err := validateV2BackupSecurityPolicies(tables)
+		err := validateV2BackupSecurityPolicies(tables, false)
 		if err == nil {
 			t.Fatalf("zone-form entry in policy.%s must be rejected", field)
 		}
@@ -2761,7 +2910,7 @@ func TestValidateV2Backup_rejectsNonObjectIPListEntries(t *testing.T) {
 			{"name": "bare-string-list", "entries": `["192.168.1.1","fe80::1%eth0"]`},
 		},
 	}
-	err := validateV2BackupSecurityPolicies(tables)
+	err := validateV2BackupSecurityPolicies(tables, false)
 	if err == nil {
 		t.Fatal("non-object entry (bare string) in IP list must be rejected (zone form hidden inside)")
 	}
@@ -2855,7 +3004,7 @@ func TestValidateV2BackupSecurityPolicies_rejectsUnknownPolicyType(t *testing.T)
 			tables := map[string][]map[string]any{
 				"security_policies": {{"id": 1, "name": "p", "policy_type": tt.raw}},
 			}
-			err := validateV2BackupSecurityPolicies(tables)
+			err := validateV2BackupSecurityPolicies(tables, false)
 			if err == nil {
 				t.Fatalf("policy_type=%v(%T) must be rejected", tt.raw, tt.raw)
 			}
@@ -2870,7 +3019,7 @@ func TestValidateV2BackupSecurityPolicies_rejectsUnknownPolicyType(t *testing.T)
 			tables := map[string][]map[string]any{
 				"security_policies": {{"id": 1, "name": "p", "policy_type": value}},
 			}
-			if err := validateV2BackupSecurityPolicies(tables); err != nil {
+			if err := validateV2BackupSecurityPolicies(tables, false); err != nil {
 				t.Fatalf("policy_type=%q must pass (empty is re-inferred at restore; explicit five enums pass through): %v", value, err)
 			}
 		})
@@ -2892,7 +3041,7 @@ func TestValidateV2BackupSecurityPolicies_normalizesLegacyValueColumns(t *testin
 				"block_status_code": int64(451),
 			}},
 		}
-		if err := validateV2BackupSecurityPolicies(tables); err != nil {
+		if err := validateV2BackupSecurityPolicies(tables, false); err != nil {
 			t.Fatalf("normalize-on-import must not reject: %v", err)
 		}
 		row := tables["security_policies"][0]
@@ -2910,7 +3059,7 @@ func TestValidateV2BackupSecurityPolicies_normalizesLegacyValueColumns(t *testin
 		tables := map[string][]map[string]any{
 			"security_policies": {{"name": "nullish", "anomaly_threshold": nil}},
 		}
-		if err := validateV2BackupSecurityPolicies(tables); err != nil {
+		if err := validateV2BackupSecurityPolicies(tables, false); err != nil {
 			t.Fatalf("validate: %v", err)
 		}
 		if got := tables["security_policies"][0]["anomaly_threshold"]; got != int64(5) {
@@ -2926,7 +3075,7 @@ func TestValidateV2BackupSecurityPolicies_normalizesLegacyValueColumns(t *testin
 				"block_status_code": int64(503),
 			}},
 		}
-		if err := validateV2BackupSecurityPolicies(tables); err != nil {
+		if err := validateV2BackupSecurityPolicies(tables, false); err != nil {
 			t.Fatalf("validate: %v", err)
 		}
 		row := tables["security_policies"][0]
@@ -2938,7 +3087,7 @@ func TestValidateV2BackupSecurityPolicies_normalizesLegacyValueColumns(t *testin
 		tables := map[string][]map[string]any{
 			"security_policies": {{"name": "garbage", "anomaly_threshold": "abc"}},
 		}
-		if err := validateV2BackupSecurityPolicies(tables); err != nil {
+		if err := validateV2BackupSecurityPolicies(tables, false); err != nil {
 			t.Fatalf("non-integer anomaly must normalize, not reject (渲染层 fail-visible 语义归属 services): %v", err)
 		}
 		if got := tables["security_policies"][0]["anomaly_threshold"]; got != int64(5) {
@@ -2953,7 +3102,7 @@ func TestValidateV2BackupSecurityPolicies_normalizesLegacyValueColumns(t *testin
 				"rate_limit_rps":     int64(0),
 			}},
 		}
-		if err := validateV2BackupSecurityPolicies(tables); err == nil {
+		if err := validateV2BackupSecurityPolicies(tables, false); err == nil {
 			t.Fatal("enabled=1 + rps=0 must stay rejected (写侧同口径), not normalized")
 		}
 	})

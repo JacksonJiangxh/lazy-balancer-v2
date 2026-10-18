@@ -310,3 +310,38 @@ func TestGetMetricsDashboard_cachesCaddyFetchWithinTTL(t *testing.T) {
 		t.Fatalf("caddy /metrics hits=%d, want 1(5s TTL 缓存命中)", hits)
 	}
 }
+
+// B2-历史问题（历史）：MetricsDB 未装配时两个历史端点必须返回空数据
+// 200（历史问题 家族口径），不得 nil-deref panic。
+func TestMetricsHistory_nilMetricsDBReturnsEmpty(t *testing.T) {
+	newMetricsTestDatabase(t)
+	if _, err := db.DB.Exec("INSERT INTO lb_rules (caddy_id, name, protocol, listen_port, enabled) VALUES ('lb_nil_metrics', 'nil', 'http', 8081, 1)"); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	oldMetricsDB := db.MetricsDB
+	db.MetricsDB = nil
+	t.Cleanup(func() { db.MetricsDB = oldMetricsDB })
+
+	h := &Handlers{}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/rules/:caddy_id/metrics-history", h.GetRuleMetricsHistory)
+	router.GET("/metrics/history", h.GetMetricsHistory)
+
+	for _, test := range []struct {
+		path string
+		want string
+	}{
+		{path: "/rules/lb_nil_metrics/metrics-history", want: `"rows":[]`},
+		{path: "/metrics/history?interval=1h", want: `"data":[]`},
+	} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, test.path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s, want 200", test.path, response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), test.want) {
+			t.Fatalf("%s body=%s, want %s", test.path, response.Body.String(), test.want)
+		}
+	}
+}

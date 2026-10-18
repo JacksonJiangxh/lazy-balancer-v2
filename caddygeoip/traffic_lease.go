@@ -51,10 +51,11 @@ func acquireTrafficLease(id string, ttl time.Duration, sampleN uint32) error {
 	}
 	// sampleN=0 表示关闭逐请求事件（仍可保留聚合计数）。
 	trafficLeasesMu.Lock()
+	wasEmpty := len(trafficLeases) == 0
 	trafficLeases[id] = trafficLease{expires: time.Now().Add(ttl), sampleN: sampleN}
 	trafficCollectorEnabled.Store(true)
 	refreshTrafficEventSampleLocked()
-	if len(trafficLeases) == 1 {
+	if wasEmpty {
 		resetTrafficEvents()
 	}
 	scheduleTrafficLeaseCleanupLocked()

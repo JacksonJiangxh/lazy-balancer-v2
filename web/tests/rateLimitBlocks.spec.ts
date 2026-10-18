@@ -18,6 +18,13 @@ test('valid hosts are preserved and sorted data untouched', () => {
   )
 })
 
+test('legacy null total falls back to the visible host sum (历史问题-16)', () => {
+  assert.deepEqual(
+    normalizeRateLimitBlocks({ total: null, hosts: [{ host: 'x', count: 9 }] }),
+    { total: 9, hosts: [{ host: 'x', count: 9 }] },
+  )
+})
+
 test('malformed host entries are dropped without throwing', () => {
   assert.deepEqual(
     normalizeRateLimitBlocks({ total: 3, hosts: [null, { host: 'ok.example', count: 3 }, { count: 9 }] } as unknown),

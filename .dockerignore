@@ -1,6 +1,6 @@
 # 构建上下文瘦身 + 防止本地敏感数据(数据库/私钥/日志)进入镜像中间层。
 # Dockerfile COPY 源(go.mod/cmd/internal/caddygeoip/caddydeps/web/dist/
-# docker-entrypoint.sh/config)均不在排除清单内。
+# docker-entrypoint.sh/config/LICENSE)均不在排除清单内。
 data/
 data-slave/
 logs/
@@ -27,6 +27,8 @@ docs/
 .DS_Store
 .env
 *.env
+# 本地环境变体（.env.local/.env.production 等）同样绝不入构建上下文。
+.env.*
 # INFRA-A2（历史）：** 前缀匹配嵌套实例（cmd/server、web、internal、
 # internal/handlers、internal/services 均有 AGENTS.md）——裸文件名只匹配根路径。
 # story.md 仅根路径存在，无嵌套实例，保持原样。

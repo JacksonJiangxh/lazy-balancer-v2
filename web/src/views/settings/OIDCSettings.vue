@@ -98,6 +98,8 @@ import DialogHeader from '@/components/DialogHeader.vue'
 import { request, ApiRequestError } from '@/utils/api'
 import { copyText } from '@/utils/copy'
 import { useAuthStore } from '@/stores/auth'
+import { createOidcProbeGuard, oidcProbeKey } from '@/utils/oidcProbe'
+import type { OidcProbeToken, OidcProbeValues } from '@/utils/oidcProbe'
 
 const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
@@ -111,7 +113,7 @@ const displayName = ref('')
 const hasFetchedConfig = ref(false)
 const configured = computed(() => form.issuer !== '' || hasFetchedConfig.value)
 const hasSecret = ref(false)
-const probe = reactive<{ ok: boolean; checked: boolean; error?: string; providerName?: string; credentialsChecked?: boolean }>({ ok: false, checked: false })
+const probe = reactive<{ ok: boolean; checked: boolean; key?: string; error?: string; providerName?: string; credentialsChecked?: boolean }>({ ok: false, checked: false })
 const lastTest = ref<{ ok: boolean; providerName?: string; error?: string; credentialsChecked?: boolean } | null>(null)
 const testing = ref(false)
 const saving = ref(false)
@@ -124,6 +126,23 @@ const callbackNodes = computed(() => [
   { label: '回调地址（本节点）', url: callbackUrl.value },
   ...slaveOrigins.value,
 ])
+
+const probeGuard = createOidcProbeGuard()
+const currentProbeValues = (): OidcProbeValues => ({
+  issuer: form.issuer,
+  clientId: form.clientId,
+  clientSecret: form.clientSecret,
+})
+const invalidateProbe = (): void => {
+  probeGuard.invalidate()
+  probe.ok = false
+  probe.checked = false
+  probe.key = undefined
+  probe.error = undefined
+  probe.providerName = undefined
+  probe.credentialsChecked = undefined
+  lastTest.value = null
+}
 
 const loadSlaves = async () => {
   try {
@@ -143,12 +162,14 @@ const loadSlaves = async () => {
 // Users 页每次访问多发 2 请求(从节点 /cluster/nodes 必 403 白跑),重开
 // 不刷新会让陈旧 probe.ok 绕过重测直接保存(多人管理脏写)。
 watch(() => props.modelValue, (open) => {
+  invalidateProbe()
   if (open) { void loadSlaves(); void load() }
 })
 
 const notify = () => emit('status', { enabled: enabled.value, configured: configured.value })
 
 const load = async () => {
+  invalidateProbe()
   try {
     // 历史问题:silent——非管理员打开入口时 403 不弹全局 toast(入口按角色收口)
     const res = await request.get<{ data?: { enabled?: boolean; issuer?: string; client_id?: string; display_name?: string; has_secret?: boolean } }>('/settings/oidc', { silent: true })
@@ -161,45 +182,54 @@ const load = async () => {
       form.displayName = res.data.display_name || ''
       hasFetchedConfig.value = !!res.data.issuer
       form.clientSecret = ''
-      // 保存门基线:已保存的配置视为「曾经可用」但不免检——改动任一字段后
-      // probe 复位为未测试,保存前强制重测(watch 联动)
-      probe.checked = false; probe.ok = false; lastTest.value = null
+      // load 开始已推进探测世代；响应回填的字段 watcher 会再次失效旧快照。
     }
   } catch { /* 未配置/无权限 */ }
   notify()
 }
 
-let probeInFlight: Promise<boolean> | null = null
+let probeInFlight: { token: OidcProbeToken; promise: Promise<boolean> } | null = null
 
 const runProbe = async (): Promise<boolean> => {
-  // 历史问题:在途去重——blur+click 双触发不重复探测(对 IdP 双倍 discovery 流量)
-  if (probeInFlight) return probeInFlight
-  probeInFlight = doRunProbe()
-  try { return await probeInFlight } finally { probeInFlight = null }
+  const values = currentProbeValues()
+  const token = probeGuard.token(values)
+  // 仅复用仍是当前世代且快照相同的在途探测；输入变化/关闭/load 后必须新测。
+  if (probeInFlight && probeGuard.isCurrent(probeInFlight.token, values)) return probeInFlight.promise
+  const promise = doRunProbe(values, token)
+  probeInFlight = { token, promise }
+  testing.value = true
+  try { return await promise } finally {
+    if (probeInFlight?.promise === promise) {
+      probeInFlight = null
+      testing.value = false
+    }
+  }
 }
 
-const doRunProbe = async (): Promise<boolean> => {
-  const issuer = form.issuer.trim()
+const doRunProbe = async (values: OidcProbeValues, token: OidcProbeToken): Promise<boolean> => {
+  const issuer = values.issuer.trim()
   if (!issuer) { probe.checked = true; probe.ok = false; probe.error = '请先填写服务地址'; return false }
   if (!/^https?:\/\//.test(issuer)) { probe.checked = true; probe.ok = false; probe.error = '服务地址须为 http(s) URL'; return false }
-  testing.value = true
   try {
     const body: Record<string, string> = { issuer }
-    if (form.clientId.trim()) body.client_id = form.clientId.trim()
-    if (form.clientSecret) body.client_secret = form.clientSecret
+    if (values.clientId.trim()) body.client_id = values.clientId.trim()
+    if (values.clientSecret) body.client_secret = values.clientSecret
     const res = await request.post<{ data?: { ok: boolean; error?: string; provider_name?: string; credentials_checked?: boolean } }>('/settings/oidc/test', body, { silent: true })
+    if (!probeGuard.isCurrent(token, currentProbeValues())) return false
     probe.checked = true
+    probe.key = token.key
     probe.ok = !!res.data?.ok
     probe.error = res.data?.error
     probe.providerName = res.data?.provider_name
     probe.credentialsChecked = res.data?.credentials_checked
     return probe.ok
   } catch (err) {
-    probe.checked = true; probe.ok = false
+    if (!probeGuard.isCurrent(token, currentProbeValues())) return false
+    probe.checked = true
+    probe.key = token.key
+    probe.ok = false
     probe.error = err instanceof ApiRequestError && err.message ? err.message : '探测请求失败'
     return false
-  } finally {
-    testing.value = false
   }
 }
 
@@ -207,14 +237,13 @@ const probeOnBlur = () => { if (form.issuer.trim() || probe.checked) void runPro
 
 // 任一凭证/地址字段变动→探测结果与上次测试立即失效(表单值≠已测值)
 watch(() => [form.issuer, form.clientId, form.clientSecret], () => {
-  probe.ok = false
-  probe.checked = false
-  probe.credentialsChecked = undefined
-  lastTest.value = null
+  invalidateProbe()
 })
 
 const test = async () => {
+  const token = probeGuard.token(currentProbeValues())
   const ok = await runProbe()
+  if (!probeGuard.isCurrent(token, currentProbeValues())) return
   lastTest.value = ok
     ? { ok: true, providerName: probe.providerName, credentialsChecked: probe.credentialsChecked }
     : { ok: false, error: probe.error || '未知错误' }
@@ -225,7 +254,7 @@ const save = async () => {
   if (!form.clientId.trim()) { ElMessage.warning('请填写 Client ID'); return }
   if (!hasSecret.value && !form.clientSecret) { ElMessage.warning('请填写 Client Secret'); return }
   // 保存门:以「当前表单值」测试通过才允许保存——防止改了凭证未测就落库
-  if (!probe.ok) {
+  if (!probe.ok || probe.key !== oidcProbeKey(currentProbeValues())) {
     const ok = await runProbe()
     if (!ok) { ElMessage.warning('测试连接未通过，请先修正配置再保存'); return }
   }
@@ -237,6 +266,10 @@ const save = async () => {
         { type: 'warning' },
       )
     } catch { return }
+  }
+  if (!probe.ok || probe.key !== oidcProbeKey(currentProbeValues())) {
+    ElMessage.warning('配置已变更，请重新测试连接后再保存')
+    return
   }
   saving.value = true
   try {

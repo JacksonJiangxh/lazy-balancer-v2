@@ -1,7 +1,7 @@
 // 国家质心表（威胁大屏）：中文国名 → [经度, 纬度]。键与后端 ip_location
 // 首段（formatIP2RegionLocation → geoipnames.CountryNamesCN 中文简称，v2.3.7
 // 中文化口径）严格对齐——数据由 geoipnames/tables.go CountryNamesCN 全集
-// （238 键，对应 v3.18.0 xdb 国家列）对照 mledoze/countries latlng 生成，
+// （239 键，对应 v3.18.0 xdb 国家列）对照 mledoze/countries latlng 生成，
 // 坐标取各国地理质心（美国为本土几何中心）。表内未收录的名称（含「保留
 // 地址」）由消费方回退「海外」中心点（FALLBACK_CENTROID），不新增运行时
 // 查询。

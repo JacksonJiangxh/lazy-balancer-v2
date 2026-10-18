@@ -89,12 +89,19 @@ func TestImportConfigBackup_acceptsValidIPListReferences(t *testing.T) {
 	if aclRefs != "[1,2]" || wlRefs != "[2]" {
 		t.Fatalf("imported refs mismatch: acl=%q whitelist=%q", aclRefs, wlRefs)
 	}
-	var listCount int
-	if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_ip_lists").Scan(&listCount); err != nil {
+	var listCount, systemCount int
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_ip_lists WHERE system=0").Scan(&listCount); err != nil {
 		t.Fatalf("count imported ip lists: %v", err)
 	}
 	if listCount != 2 {
-		t.Fatalf("imported ip lists=%d, want 2", listCount)
+		t.Fatalf("imported user ip lists=%d, want 2", listCount)
+	}
+	// 历史问题-1：导入后必须重播 system 名单（威胁三源 + 自动封禁）。
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_ip_lists WHERE system=1").Scan(&systemCount); err != nil {
+		t.Fatal(err)
+	}
+	if systemCount != 4 {
+		t.Fatalf("system ip lists=%d, want 4", systemCount)
 	}
 }
 
@@ -242,10 +249,18 @@ func TestImportConfigBackup_emptyIPListsTableWipesLocalLists(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
 	var count int
-	if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_ip_lists").Scan(&count); err != nil {
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_ip_lists WHERE system=0").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
 		t.Fatalf("security_ip_lists rows=%d after empty-table import, want 0", count)
+	}
+	// 历史问题-1：空表导入后 system 名单仍由提交后重播补回。
+	var systemCount int
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_ip_lists WHERE system=1").Scan(&systemCount); err != nil {
+		t.Fatal(err)
+	}
+	if systemCount != 4 {
+		t.Fatalf("system ip lists=%d after empty-table import, want 4", systemCount)
 	}
 }

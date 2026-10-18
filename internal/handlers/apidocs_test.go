@@ -861,3 +861,27 @@ func TestAPIDocs_threatScreenExampleKeysMatchImplementation(t *testing.T) {
 		}
 	}
 }
+
+// B2-历史问题（历史）：OpenAPI 总述的敏感材料可见性必须与实现同口径——
+// TLS 私钥（rules.go 历史问题）与 DNS 凭证（certificates.go 历史问题 D4）对非管理员
+// 与只读 API Key 一律掩码，总述不得再声称「对所有已登录用户可读」。
+func TestBuildOpenAPIYAML_descriptionMatchesCredentialMasking(t *testing.T) {
+	openAPI := buildOpenAPIYAML()
+	var document struct {
+		Info struct {
+			Description string `yaml:"description"`
+		} `yaml:"info"`
+	}
+	if err := yaml.Unmarshal([]byte(openAPI), &document); err != nil {
+		t.Fatalf("parse generated OpenAPI YAML: %v", err)
+	}
+	description := document.Info.Description
+	if strings.Contains(description, "TLS 私钥、DNS 凭证及其他配置数据对所有已登录用户可读") {
+		t.Fatalf("general description retains stale readable-by-all claim: %q", description)
+	}
+	for _, fragment := range []string{"TLS 私钥与 DNS 凭证仅对管理员", "掩码", "TLSKeySet"} {
+		if !strings.Contains(description, fragment) {
+			t.Errorf("general description missing masking contract %q: %q", fragment, description)
+		}
+	}
+}

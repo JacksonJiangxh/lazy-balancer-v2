@@ -98,3 +98,20 @@ func TestAuditResultText_ticketFailureCodes(t *testing.T) {
 		t.Fatalf("unknown codes must pass through unchanged, got %q", got)
 	}
 }
+
+// 历史问题（历史）：handlers/certificates.go 的 auditFailure 是局部闭包，结果码
+// 以动态实参进入 AuditResultPart——字面量扫描钉测（literalArgsCovered）天然
+// 覆盖不到，"blocked" 由此长期缺映射（审计详情渲染英文码）。本用例钉住该
+// 动态入口的取值集在映射内。
+func TestAuditResultText_dynamicClosureCodes(t *testing.T) {
+	// 动态传入 AuditResultPart 的结果码集合（证书 blocked 路径 + CA 测试 +
+	// 用户状态 + 登录票据 reason 的取值域）。
+	for _, code := range []string{"blocked", "provider_error", "not_found", "missing_acme_email", "invalid_config", "register_failed", "enabled", "disabled"} {
+		if got := AuditResultText(code); got == code {
+			t.Fatalf("动态结果码 %q 缺中文映射（渲染会落英文）", code)
+		}
+	}
+	if got := AuditResultText("blocked"); got != "重试被阻止" {
+		t.Fatalf("blocked 渲染=%q，want 重试被阻止", got)
+	}
+}

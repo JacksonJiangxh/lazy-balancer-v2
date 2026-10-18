@@ -308,9 +308,11 @@ const viewLogs = async (row: CertJob) => {
   logDialogVisible.value = true
 }
 
-const onLogDialogOpened = async () => {
-  await refreshLogs()
+// 历史问题-F3：先同步装定时器再触发首拉——原 await 后才 startLogPolling，首拉慢于
+// 关闭时 @closed 已清 timer，随后续体又装上 3s 轮询（关闭后持续请求日志端点）。
+const onLogDialogOpened = (): void => {
   startLogPolling()
+  void refreshLogs()
 }
 
 const onLogDialogClosed = () => {

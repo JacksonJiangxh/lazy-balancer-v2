@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -81,6 +83,14 @@ type configImportSession struct {
 	runtime               *importRuntimeSnapshot
 	runtimeApplyAttempted bool
 	finished              bool
+	// resumeEngine 恢复任务引擎 tick 派发（历史问题-1，历史）：
+	// beginConfigImport 期间 PauseScheduling，会话 close 时恢复——不能用作
+	// begin 函数的 defer（该函数在导入体执行前就返回）。
+	resumeEngine func()
+	// releaseBeforeLock 释放排空之后、caddyOpMu/事务之前取得的资源锁
+	// （配置导入的 WAF 文件锁，B3-82-历史问题）。close 在 caddyOpMu 之后释放，
+	// 保持与获取顺序相反的锁序。
+	releaseBeforeLock func()
 }
 
 // errCertQueueDrainIncomplete 证书队列排空未完成（历史问题）：PauseAndDrain
@@ -88,15 +98,72 @@ type configImportSession struct {
 // 明确拒绝（409）而非沿用「已排干」假设。
 var errCertQueueDrainIncomplete = errors.New("证书任务执行中，请稍后重试")
 
+// importInFlightDrainTimeout 导入前排空在途任务的有界等待（历史问题-1，历史
+// 审计）：与证书队列 PauseAndDrain 的 30s 屏障同量级。超时不阻塞导入（部分
+// Run 体不消费取消信号），但留痕 warn + 审计。
+const importInFlightDrainTimeout = 30 * time.Second
+
+// configImportBeginMu 串行化整个导入会话（B3-82-历史问题/历史问题-历史问题）：
+// Pause/Resume 是单布尔位，若两个导入都先 Pause 再抢 caddyOpMu，先结束者
+// Resume 会让后者在调度已恢复的状态下执行。此锁覆盖 Pause→事务→close，
+// 后到导入在暂停开始前排队。
+var configImportBeginMu sync.Mutex
+
 func (h *Handlers) beginConfigImport(ctx context.Context) (*configImportSession, error) {
-	h.caddyOpMu.Lock()
-	// 历史问题：导入将全量替换业务数据——先取消在途 Scheduled/Periodic/Oneshot
-	// Run（Daemon 不在范围），避免其提交在导入事务之后形成 last-writer-wins。
+	return h.beginConfigImportWithPrelock(ctx, nil)
+}
+
+// beginConfigImportWithPrelock 在 Pause/Cancel/Wait 排空完成之后、取
+// caddyOpMu 与开启事务之前调用 prelock（返回释放函数）。配置导入用它把
+// WAF 文件锁放在排空之后：先取锁会让阻塞在 wafFileMu 的更新任务无法被取消。
+func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock func() func()) (*configImportSession, error) {
+	configImportBeginMu.Lock()
+	releaseSession := func() { configImportBeginMu.Unlock() }
+	// 历史问题 / 历史问题-1（历史）：导入将全量替换业务数据——先暂停 tick
+	// 派发并取消在途 Scheduled/Periodic/Oneshot Run（Daemon 不在范围），再有界
+	// 等待其在途落定，避免其提交落在导入事务之后形成 last-writer-wins。
+	// 此前只发取消信号不等待：不消费 rc.Ctx 的 Run 体会在导入期间继续跑完。
+	//
+	// 顺序铁律（历史 Fix81Inf 复核）：Pause/Cancel/Wait 必须在取 caddyOpMu
+	// **之前**。autoban 的 RunAutobanCycle 在 services.CaddyOpLock（=caddyOpMu）
+	// 临界区内合并名单；若先持锁再等待，会形成「导入持锁等 Run 退出 ↔ Run 等
+	// 锁」的互等到 30s 超时，且该 Run 仍会在导入提交后写库。Pause/Cancel/Wait
+	// 不改库，无原子性损失；并发第二个导入同样先排空再阻塞在锁上（无害）。
+	engine := services.TaskEngine()
+	resumeEngine := func() {}
+	if engine != nil {
+		engine.PauseScheduling()
+		resumeEngine = func() { engine.ResumeScheduling() }
+	}
 	cancelImportInFlightRuns()
-	session := &configImportSession{h: h, ctx: ctx, recovery: importQueueRecovery{manager: services.GetCAQueueManager()}}
+	if engine != nil {
+		drainCtx, cancel := context.WithTimeout(context.Background(), importInFlightDrainTimeout)
+		drained := engine.WaitInFlightRuns(drainCtx)
+		cancel()
+		if !drained {
+			services.Logf("warn", "配置导入：等待在途任务落定超时（%s），继续导入", importInFlightDrainTimeout)
+			services.RecordAuditLog("system", "导入警告", "配置备份", "导入前排空在途任务超时，已继续导入（可能在导入后仍有任务提交）", "")
+		}
+	}
+	releaseBeforeLock := releaseSession
+	if prelock != nil {
+		if release := prelock(); release != nil {
+			releaseBeforeLock = func() {
+				release()
+				releaseSession()
+			}
+		}
+	}
+	releaseBegin := func() {
+		h.caddyOpMu.Unlock()
+		releaseBeforeLock()
+		resumeEngine()
+	}
+	h.caddyOpMu.Lock()
+	session := &configImportSession{h: h, ctx: ctx, recovery: importQueueRecovery{manager: services.GetCAQueueManager()}, resumeEngine: resumeEngine, releaseBeforeLock: releaseBeforeLock}
 	ruleIDs, err := currentRuleIDs(ctx)
 	if err != nil {
-		h.caddyOpMu.Unlock()
+		releaseBegin()
 		return nil, fmt.Errorf("读取现有规则: %w", err)
 	}
 	session.existingRuleIDs = ruleIDs
@@ -105,7 +172,7 @@ func (h *Handlers) beginConfigImport(ctx context.Context) (*configImportSession,
 		// 历史问题：排空结果必须被消费——未完全排空（30s 超时仍有执行中任务）
 		// 不得继续导入。
 		if !session.recovery.manager.PauseAndDrain() {
-			h.caddyOpMu.Unlock()
+			releaseBegin()
 			// 本次 Pause 已停掉新任务登记；恢复既有活动态交给 finishImportFailure
 			// 语义——此处无事务可回滚，直接恢复队列避免永久暂停。
 			if session.recovery.wasActive {
@@ -117,7 +184,7 @@ func (h *Handlers) beginConfigImport(ctx context.Context) (*configImportSession,
 	session.tx, err = db.DB.BeginTx(ctx, nil)
 	if err != nil {
 		err = finishImportFailure(nil, &session.recovery, err)
-		h.caddyOpMu.Unlock()
+		releaseBegin()
 		return nil, fmt.Errorf("开始导入事务: %w", err)
 	}
 	return session, nil
@@ -138,6 +205,13 @@ func (session *configImportSession) close() {
 		_ = session.abort(errors.New("导入流程未完成"))
 	}
 	session.h.caddyOpMu.Unlock()
+	if session.releaseBeforeLock != nil {
+		session.releaseBeforeLock()
+	}
+	// 历史问题-1：导入全程（含失败 abort 的恢复动作）结束后才恢复 tick 派发。
+	if session.resumeEngine != nil {
+		session.resumeEngine()
+	}
 }
 
 func (session *configImportSession) abort(importErr error) error {

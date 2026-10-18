@@ -120,3 +120,20 @@ func TestRegisterClusterNodeRejectsInvalidAddressAndPort(t *testing.T) {
 		})
 	}
 }
+
+// 历史问题-04：GET /cluster/register/:id/status 必须与同族机器端点（register/
+// confirm/snapshot/waf-files/report）一致带主节点门——降级节点残留注册行
+// 不得继续应答 approved/重发集群令牌。
+func TestGetClusterRegistrationStatus_rejectsSlaveNode(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.GET("/cluster/register/:id/status", h.GetClusterRegistrationStatus)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/cluster/register/1/status", nil))
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s, want 403 (master-only)", recorder.Code, recorder.Body.String())
+	}
+}

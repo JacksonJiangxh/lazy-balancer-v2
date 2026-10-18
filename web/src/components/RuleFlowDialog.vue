@@ -306,7 +306,31 @@
                 <span class="flow-route-match">{{ pr.path }}<em class="flow-route-type">{{ pathMatchLabel(pr.match_type) }}</em></span>
                 <span class="flow-route-arrow">→</span>
                 <span class="flow-route-targets">
-                  <template v-if="enabledPathUpstreams(pr).length > 0">
+                  <template v-if="pr.response_mode === 'static'">
+                    <span class="flow-route-target">
+                      <el-tag size="small" effect="plain" type="success">静态返回</el-tag>
+                      <span class="flow-upstream-addr">状态码 {{ pr.response_status || 200 }}</span>
+                    </span>
+                  </template>
+                  <template v-else-if="pr.response_mode === 'redirect'">
+                    <span class="flow-route-target">
+                      <el-tag size="small" effect="plain" type="warning">301</el-tag>
+                      <span class="flow-upstream-addr">{{ pr.redirect_to || '-' }}</span>
+                    </span>
+                  </template>
+                  <template v-else-if="pr.upstreams === null">
+                    <span class="flow-route-target">
+                      <el-tag size="small" effect="plain" type="info">跟随主路由上游</el-tag>
+                    </span>
+                    <template v-if="target.upstreams && target.upstreams.length > 0">
+                      <span v-for="u in target.upstreams" :key="`${pr.path}-default-${u.host}:${u.port}`" class="flow-route-target">
+                        <span class="flow-upstream-addr">{{ u.host }}:{{ u.port }}</span>
+                        <el-tag size="small" effect="plain" :type="upstreamStateType(u)">{{ upstreamStateText(u) }}</el-tag>
+                      </span>
+                    </template>
+                    <span v-else class="flow-route-none">无主上游</span>
+                  </template>
+                  <template v-else-if="enabledPathUpstreams(pr).length > 0">
                     <span v-for="u in enabledPathUpstreams(pr)" :key="`${u.host}:${u.port}`" class="flow-route-target">
                       <span class="flow-upstream-addr">{{ u.host }}:{{ u.port }}</span>
                       <el-tag size="small" effect="plain" :type="upstreamStateType(u)">{{ upstreamStateText(u) }}</el-tag>
@@ -316,7 +340,7 @@
                 </span>
               </div>
             </div>
-            <div class="flow-panel-footnote">健康口径：规则级计数（健康 {{ target.health?.healthy ?? 0 }}/共 {{ target.health?.total ?? 0 }}）；无逐上游实时探针数据时按「上游启用/禁用 + 规则健康计数」呈现——逐上游状态为最近一次轮询快照；自定义路由上游与主路由同享规则级健康检查</div>
+            <div class="flow-panel-footnote">健康口径：规则级计数（健康 {{ target.health?.healthy ?? 0 }}/共 {{ target.health?.total ?? 0 }}）；无逐上游实时探针数据时按「上游启用/禁用 + 规则健康计数」呈现——逐上游状态为最近一次轮询快照；转发型自定义路由上游与主路由同享规则级健康检查（静态返回 / 301 跳转不转发上游）</div>
           </div>
         </el-collapse-transition>
           </div>
@@ -570,7 +594,7 @@ const upstreamStateType = (row: Pick<RuleFlowUpstream, 'host' | 'port' | 'enable
 
 // 自定义路由路径行辅助（上游面板路由分发明细分组共用）
 const enabledPathUpstreams = (pr: RuleFlowPathRule): Array<{ host: string; port: number; enabled: boolean }> =>
-  pr.upstreams.filter((u) => u.enabled)
+  pr.upstreams?.filter((u) => u.enabled) ?? []
 
 
 const pathMatchLabel = (matchType: string): string => (matchType === 'exact' ? '精确' : '前缀')

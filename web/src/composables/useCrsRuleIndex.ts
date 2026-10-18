@@ -1,5 +1,6 @@
 import { computed, ref } from 'vue'
 import { request } from '@/utils/api'
+import { normalizeStringEntries } from '@/utils/securityStages'
 import type { APIResponse } from '@/types'
 
 /** CRS 规则索引条目（GET /security/crs/rule-index）——rules 由后端按 id 升序返回 */
@@ -86,7 +87,7 @@ export const parseCrsExcludedRules = (raw: string | undefined | null): CrsExclud
     const scope: CrsExclusionScope = rec.scope === 'ip' || rec.scope === 'list' ? rec.scope : 'all'
     // 后端契约 ips 为逗号分隔字符串（"1.1.1.1,10.0.0.0/8"）；数组形态一并兼容
     const ips = Array.isArray(rec.ips)
-      ? rec.ips.filter((v): v is string => typeof v === 'string' && v.trim() !== '')
+      ? normalizeStringEntries(rec.ips)
       : typeof rec.ips === 'string'
         ? rec.ips.split(',').map((v) => v.trim()).filter((v) => v !== '')
         : []

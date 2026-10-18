@@ -364,7 +364,11 @@ func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string]
 		return nil, nil, nil, errors.New("security events: database not initialized")
 	}
 	rules := make(map[string]securityEventsRuleRef)
-	rows, err := db.DB.Query(`SELECT caddy_id, COALESCE(domain,''), COALESCE(name,''), listen_port FROM lb_rules WHERE protocol='http' AND COALESCE(domain,'') != ''`)
+	// 历史问题-12（历史）：显式 ORDER BY id ASC——同域名多规则（如 http/https
+	// 双规则）的纯域名键覆盖序此前依赖 SQLite 未定义返回序，注释却宣称「后
+	// 创建规则覆盖(创建序)」。id 升序 + 顺序赋值 = 较高 id（较新创建）最终覆盖；
+	// MapHost 对 host:port 精确键仍优先。
+	rows, err := db.DB.Query(`SELECT caddy_id, COALESCE(domain,''), COALESCE(name,''), listen_port FROM lb_rules WHERE protocol='http' AND COALESCE(domain,'') != '' ORDER BY id ASC`)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("security events: load rules: %w", err)
 	}
@@ -519,7 +523,7 @@ func securityEventsPolicyContainsRule(policy *models.SecurityPolicy, ruleTrigger
 		}
 		return clientIP == "" || securityEventsIPInList(clientIP, blacklist)
 	case n == 2:
-		if !policy.IPACLEnabled || policy.IPACLMode != "deny" {
+		if !policy.IPACLEnabled {
 			return false
 		}
 		// 审计 V1-S2（第五轮）：deny 归因应含 refs 合并集（inline ∪ ip_acl_list_refs），
@@ -532,10 +536,22 @@ func securityEventsPolicyContainsRule(policy *models.SecurityPolicy, ruleTrigger
 			}
 			aclList = inline
 		}
-		if len(aclList) == 0 {
+		nonEmpty := len(aclList) > 0 || ipListRefsNonEmpty(policy.IPACLListRefs)
+		if policy.IPACLMode == "allow" {
+			// 空 allow 名单发射的是 fail-closed 恒拒面，事件应由该策略认领；
+			// 非空 allow 的 id:2 仍保持既有「不拥有」口径。
+			return !nonEmpty
+		}
+		if policy.IPACLMode != "deny" || !nonEmpty {
 			return false
 		}
 		return clientIP == "" || securityEventsIPInList(clientIP, aclList)
+	case n == 7:
+		// 预检 allow 交集外拒绝（含空名单 fail-closed 恒拒）属于 allow 策略。
+		return policy.IPACLEnabled && policy.IPACLMode == "allow"
+	case n == 14:
+		// 历史威胁情报库共享 id:14：由带 ACL 引用/内联名单的 IP 控制策略认领。
+		return policy.IPACLEnabled && (len(policy.MergedACLList) > 0 || ipListRefsNonEmpty(policy.IPACLListRefs))
 	case n >= 900000 && n < 1000000:
 		// 审计 V1-S1（第五轮）+ W-I1（第六轮回归修复）：v2.2.2 混合选择——
 		// crs_rule_groups 可含六位 CRS ID 正选；六位 ID 触发的 CRS 事件应先按
@@ -771,7 +787,7 @@ func securityEventsIPFamilyEventSurface(p *models.SecurityPolicy, action, ruleTr
 		return PolicyHasGeoIP(p)
 	}
 	aclEntries := mergedACLList(p)
-	aclCapable := p.IPACLEnabled && (len(aclEntries) > 0 || ipListRefsNonEmpty(p.IPACLListRefs))
+	aclCapable := p.IPACLEnabled && (p.IPACLMode == "allow" || len(aclEntries) > 0 || ipListRefsNonEmpty(p.IPACLListRefs))
 	switch n {
 	case 2:
 		if p.IPACLMode == "deny" && aclCapable {
@@ -1083,6 +1099,28 @@ func securityEventsScanNextDocumentBounded(f *os.File, from, limit int64) (int64
 	return 0, false, nil
 }
 
+// securityEventsRollupRewriteHook 摄取提交后的 rollup 覆盖水位回退钩子
+// （历史问题-1，历史；由 main.go 装配 handlers.ThreatRollupRewindTo）。
+// 停机/升级积压或轮转补采的插入事件时间可能落在 rollup 已覆盖的分钟区间
+// ——warmer 在摄取首 pass 之前已推进水位时，超过 threatRollupRepairMinutes
+// 的积压分钟再无重固入口，大屏永久少计。钩子接收本批实际插入的最旧事件
+// 分钟（UTC，分钟截断），实现方负责把覆盖水位回退到该分钟之前。
+var securityEventsRollupRewriteHook func(oldestInsertedMinute time.Time)
+
+// SetSecurityEventsRollupRewrite 装配覆盖水位回退钩子（nil=停用，供测试）。
+func SetSecurityEventsRollupRewrite(fn func(time.Time)) {
+	securityEventsRollupRewriteHook = fn
+}
+
+// notifySecurityEventsRollupRewrite 在事务提交后通知回退钩子（零值=本批无
+// 实际插入，零动作）。
+func notifySecurityEventsRollupRewrite(minute time.Time) {
+	if minute.IsZero() || securityEventsRollupRewriteHook == nil {
+		return
+	}
+	securityEventsRollupRewriteHook(minute)
+}
+
 // securityEventsTailer streams new audit transactions from the log file,
 // persisting its byte offset between passes so restarts resume in place.
 type securityEventsTailer struct {
@@ -1199,8 +1237,15 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return offset, fmt.Errorf("security events: seek audit log: %w", err)
 	}
+	// 历史问题：半初始化（MetricsDB=nil）时返回显式错误而非 panic；本地句柄
+	// 捕获同时避免测试 teardown 并发置 nil 后的 mid-pass 解引用（同
+	// securityevents_retention 的本地捕获口径）。
+	metricsDB := db.MetricsDB
+	if metricsDB == nil {
+		return offset, fmt.Errorf("security events: metrics database unavailable")
+	}
 	committedOffset := offset
-	tx, err := db.MetricsDB.Begin()
+	tx, err := metricsDB.Begin()
 	if err != nil {
 		return offset, fmt.Errorf("security events: begin insert transaction: %w", err)
 	}
@@ -1223,16 +1268,24 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	// 同一事务重复行/轮转补采重叠/offset 重放的 INSERT OR IGNORE 忽略行
 	// 不计入（历史问题），与自动封禁喂入口径同源（历史问题）。
 	passInsertedTotal := 0
+	// 历史问题-08：任何返回路径都回填本 pass 实际插入数——补采（归档/活文件尾部）
+	// 的 delta 摄取同样产生 lastIngested，供任务日志「摄取 N 条」消费。
+	defer func() { t.lastIngested = passInsertedTotal }()
 	// 历史问题 自动封禁喂入：本事务批次内成功解析的 WAF 事件随「提交点」喂计数器
 	// ——commit 成功后才喂（回滚路径不喂，重试不重复计数）；feedBatch 为 nil
 	// 时 autobanObserveBatch 零动作（未启用/从节点等门在函数内收敛）。
 	var autobanBatch []autobanFeedItem
+	// 历史问题-1：本批实际插入事件的最旧分钟（UTC）——提交成功后通知 rollup
+	// 回退钩子（积压事件落在已覆盖分钟区间时重固，防止大屏永久少计）。
+	var batchOldestMinute time.Time
 	commit := func() error {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
 		autobanObserveBatch(autobanBatch)
 		autobanBatch = nil
+		notifySecurityEventsRollupRewrite(batchOldestMinute)
+		batchOldestMinute = time.Time{}
 		return nil
 	}
 	for {
@@ -1243,7 +1296,6 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 			if cerr := commit(); cerr != nil {
 				return committedOffset, fmt.Errorf("security events: commit inserts: %w", cerr)
 			}
-			t.lastIngested = passInsertedTotal
 			return offset, nil
 		}
 		if err != nil {
@@ -1398,6 +1450,14 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 			if affected == 1 {
 				autobanBatch = append(autobanBatch, autobanFeedItem{IP: rec.ClientIP, Action: rec.Action, RuleTriggered: rec.RuleTriggered})
 				passInsertedTotal++
+				// 历史问题-1：记录本批最旧插入分钟（event_time 恒 UTC 墙钟串；
+				// 解析失败跳过——仅影响回退精度，不影响摄取）。
+				if et, terr := time.ParseInLocation("2006-01-02 15:04:05", rec.EventTime, time.UTC); terr == nil {
+					m := et.Truncate(time.Minute)
+					if batchOldestMinute.IsZero() || m.Before(batchOldestMinute) {
+						batchOldestMinute = m
+					}
+				}
 			}
 			batchCount++
 			if batchCount >= batchSize {
@@ -1406,7 +1466,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 					return committedOffset, fmt.Errorf("security events: commit batch: %w", cerr)
 				}
 				committedOffset = docEnd
-				tx, err = db.MetricsDB.Begin()
+				tx, err = metricsDB.Begin()
 				if err != nil {
 					return committedOffset, fmt.Errorf("security events: begin batch transaction: %w", err)
 				}
@@ -1442,18 +1502,19 @@ func securityEventsTransactionID(raw json.RawMessage) string {
 // 后、copytruncate 完成前 Coraza 写入的尾部事件只存在于 audit.log.1，活文件截断
 // 后 tailer 重置偏移不会再读 .1，若不补采这些事件会永久丢失。复用
 // securityEventsProcessPass 的解析与 INSERT OR IGNORE 插入，transaction_id 唯一
-// 索引保证与 tick 已摄取内容幂等。
-func securityEventsIngestRotatedDelta(persistedOffset int64) error {
+// 索引保证与 tick 已摄取内容幂等。返回实际插入条数（历史问题-08：补采结果须计入
+// ingestion 任务日志「摄取 N 条」，此前被丢弃）。
+func securityEventsIngestRotatedDelta(persistedOffset int64) (int, error) {
 	if db.DB == nil || db.MetricsDB == nil {
-		return nil
+		return 0, nil
 	}
 	archive := auditLogPath + ".1"
 	info, err := os.Stat(archive)
 	if err != nil {
-		return fmt.Errorf("security events: stat rotated archive: %w", err)
+		return 0, fmt.Errorf("security events: stat rotated archive: %w", err)
 	}
 	if info.Size() <= persistedOffset {
-		return nil // 归档未包含超出已摄取偏移的内容
+		return 0, nil // 归档未包含超出已摄取偏移的内容
 	}
 	return securityEventsIngestDeltaFrom(archive, persistedOffset, true)
 }
@@ -1464,25 +1525,26 @@ func securityEventsIngestRotatedDelta(persistedOffset int64) error {
 // copy 完成后 truncate 前的活文件尾部（rotateAuditLogIfNeeded）共用此路径。
 // archive=true 表示归档补采（.1 / pending 重试）：文件大小有界且不再增长，
 // 畸形区走 scan-to-EOF 恢复而非 F1 报错（见 securityEventsProcessPass）。
-func securityEventsIngestDeltaFrom(path string, from int64, archive bool) error {
+// 返回实际插入条数（历史问题-08）。
+func securityEventsIngestDeltaFrom(path string, from int64, archive bool) (int, error) {
 	if db.DB == nil || db.MetricsDB == nil {
-		return nil
+		return 0, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("security events: open delta source: %w", err)
+		return 0, fmt.Errorf("security events: open delta source: %w", err)
 	}
 	defer f.Close()
 	// 补采路径的耗时随审计行内嵌 lb_timing 字段自带（历史侧车退役，
 	// 历史问题-2 的「补采也需加载侧车」前置不再需要）。
 	rules, bindings, policyByID, err := securityEventsLoadMappings()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	t := securityEventsNewTailer(auditLogPath, securityEventsOffsetPath)
 	t.archivePass = archive
 	_, passErr := t.securityEventsProcessPass(f, from, rules, bindings, policyByID)
-	return passErr
+	return t.lastIngested, passErr
 }
 
 // securityEventsRateLimitedWarn 输出 tick 失败告警并对 F1 停摆错误（畸形区）
@@ -1545,7 +1607,9 @@ func SecurityEventsPollOnce() int {
 	}
 	ingested := securityEventsPollState.tailer.lastIngested
 	securityEventsPollState.tailer.lastIngested = 0
-	rotateAuditLogIfNeeded()
+	// 历史问题-08：轮转/补采窗口入库的事件计入同一轮摄取数（此前只报 tailer 计数，
+	// 补采事件永不进任务日志）；失败不阻塞返回（轮转自身已限流告警）。
+	ingested += rotateAuditLogIfNeeded()
 	return ingested
 }
 

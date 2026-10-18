@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -202,12 +204,23 @@ func (h *Handlers) UpdateCrawlerLibFlags(c *gin.Context) {
 	}
 	var name string
 	if err := db.DB.QueryRow(`SELECT name FROM security_crawler_sources WHERE id=?`, id).Scan(&name); err != nil {
-		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "爬虫源不存在"})
+		// A81A-历史问题：与威胁库同款三分支——缺行=404，其余 DB 故障=500
+		// （此前一律 404，可重试故障被误报「爬虫源不存在」）。
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "爬虫源不存在"})
+		} else {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
+		}
 		return
 	}
 	if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_enabled=?, updated_at=datetime('now') WHERE id=?`, *body.UpdateEnabled, id); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
 		return
+	}
+	// A81A-历史问题：单源启用即武装首槽（威胁库 UpdateThreatSourceFlags 同构）——
+	// 总闸已开且无任何启用源持 next_update 时，仅改开关会让排程槽恒空。
+	if *body.UpdateEnabled {
+		services.ArmCrawlerFirstSlots()
 	}
 	recordAudit(c, "更新", "爬虫地址库", fmt.Sprintf("%s 更新开关", name))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已更新"})

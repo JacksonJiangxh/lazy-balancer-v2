@@ -220,7 +220,9 @@ func TestGCStaleIPListFiles_removesOldUnreferencedOnly(t *testing.T) {
 	}
 	// B 从引用集中剔除（模拟本轮渲染不再引用）
 	forgetIPListRenderRefForTest(pathB)
-	pathC := filepath.Join(IPListDataDir, "orphan-deadbeef0012.txt")
+	// D1-历史问题：旧内容寻址分支只认已知 scope 前缀——用 p12-acl-<12hex> 形态做
+	// 迁移期回收钉；用户手放的「任意前缀-12hex」文件（F）不得被当成投影删除。
+	pathC := filepath.Join(IPListDataDir, "p12-acl-deadbeef0012.txt")
 	if err := os.WriteFile(pathC, []byte("192.0.2.1/32\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -236,21 +238,27 @@ func TestGCStaleIPListFiles_removesOldUnreferencedOnly(t *testing.T) {
 	if err := os.WriteFile(pathE, []byte("not a projection\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chtimes(pathE, old, old); err != nil {
+	pathF := filepath.Join(IPListDataDir, "backup-deadbeef1234.txt")
+	if err := os.WriteFile(pathF, []byte("operator file\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Remove(pathC); _ = os.Remove(pathE) })
+	for _, p := range []string{pathE, pathF} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { _ = os.Remove(pathC); _ = os.Remove(pathE); _ = os.Remove(pathF) })
 
 	// When
 	removed := gcStaleIPListFiles(time.Now(), 24*time.Hour)
 
-	// Then：B/C 删除，A/D/E 保留
+	// Then：B/C 删除，A/D/E/F 保留（F=用户文件，D1-历史问题 前会被误删）
 	for _, p := range []string{pathB, pathC} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Fatalf("超龄未引用文件 %s 应被删除, stat err=%v", filepath.Base(p), err)
 		}
 	}
-	for _, p := range []string{pathA, pathD, pathE} {
+	for _, p := range []string{pathA, pathD, pathE, pathF} {
 		if _, err := os.Stat(p); err != nil {
 			t.Fatalf("文件 %s 应保留: %v", filepath.Base(p), err)
 		}
@@ -300,7 +308,7 @@ func TestIPListProjectedFileName_forms(t *testing.T) {
 		"u-gcdrop.txt",             // 测试注入的 u- 描述符形态
 		"u-deny-abc123def456.txt",  // 旧内容寻址形态（迁移期回收）
 		"p12-acl-0123456789ab.txt", // 旧形态（策略 scope）
-		"orphan-deadbeef0012.txt",  // 旧形态（任意 scope 前缀，精确 12 位 hex）
+		"tp-deadbeef1234.txt",      // 旧形态（受信代理全局单份 scope）
 		// 历史 HP-1 新形态：u-<kind>-<ruleCaddyID>（CaddyID 含下划线）
 		"u-deny-lb_2r8dosptk1.txt", "u-trust12-lb_2r8dosptk1.txt", "u-allow-exempt-lb_ab12cd34ef56.txt",
 		"p5-crsxc-0.txt",            // 历史 SEC-1 序号形态（HP77-4 后存量，GC 过渡回收）
@@ -317,6 +325,9 @@ func TestIPListProjectedFileName_forms(t *testing.T) {
 		"notes.txt",                 // 用户手放
 		"backup.txt",                // 用户手放
 		"deny-list.txt",             // 非投影形态
+		"orphan-deadbeef0012.txt",   // D1-历史问题：任意前缀+12hex 不再落入旧寻址分支
+		"backup-deadbeef1234.txt",   // D1-历史问题：用户手放的 hex 后缀文件不碰
+		"ops-deadbeef1234.txt.tmp",  // 任意前缀的 .tmp 同样不碰（临时文件分支）
 		"u-deny.TXT",                // 扩展名大小写不匹配（.txt 规范形态）
 		"p12-acl.txt.tmp",           // 投影临时文件（由 .tmp 清理支线处理）
 		"orphan-deadbeef001200.txt", // 13 位 hex ≠ 旧 12 位形态（hash 过渡分支精确 12 位）

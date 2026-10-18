@@ -4,6 +4,9 @@
 > (真 validate-only)+ 事务内 `ApplyConfigFromTx` 终门;字段级校验
 > (`validateRulePayloadBeforeSave`/`validateRuleFeatures`)仍活跃。v2.2.5 时代的
 > 探针/合并校验函数已撤除(见「关键函数说明」)。
+>
+> 口径说明：本文是工程标准文档（不在 README 用户文档索引内），文中「第 N 轮」等
+> 内部流程口径用于裁定溯源；面向用户/官网的文案不得引用此类内部口径。
 
 # Caddy 配置管理规范
 
@@ -158,7 +161,7 @@ for i, d := range domainHosts {
 
 ```json
 {
-  "@id": "lb_xxxxxxxxxxxx",
+  "@id": "lb_xxxxxxxxxx",
   "match": [{
     "host": ["abc.com", "def.com"]
   }],
@@ -166,16 +169,25 @@ for i, d := range domainHosts {
 }
 ```
 
-### Handle Chain 顺序
+### Handle Chain 关键顺序
+
+GeoIP 打标不在主路由的 `handle` 链内。任一绑定策略启用地域拦截时，渲染器在主路由前追加同 Host 的独立兄弟 pass 路由，以 `geoip2region` 设置 `{http.vars.geoip.*}` 占位符和 `X-LB-GeoIP-*` 请求头（伪造头先剥后设），供后续 IP 预检与 WAF 消费。
+
+主路由按配置条件发射以下关键处理器：
+
 1. **headers**（X-LB-Rule-ID 注入）：HTTP 规则绑定安全策略时链首注入归因头（供预检与 coraza 事务消费，reverse_proxy 前无条件剥离，不直达上游）
-2. **geoip2region 标签层**：规则任意绑定策略启用地域拦截时，先于 IP 预检为每请求标注 `X-LB-GeoIP-Loc` 归属地头（供 GeoIP 预检链第二段匹配；伪造头先剥后设）
-3. **IP 预检**：多策略绑定时合并全部绑定策略 deny 侧 IP 控制的极简 coraza 预检查器（先于全部 rate_limit/waf）——链序：信任（id:3/12 DetectionOnly）→ deny 并集（id:2）→ 遗留黑名单（id:4）→ allow 交集外拒绝（id:7）→ allow 命中豁免 GeoIP（id:13，历史裁定）→ 逐策略 GeoIP 链（800000+policyID）
-4. **阶段 0 信任直通包裹**：绑定含 stage0 直通策略（trust_detection=0）且命中信任 IP 时，以 subroute 短路后续全部安全阶段（不产生事件）；保留检测（td=1）不包裹——走 DetectionOnly 全评估不拦但全记录
-5. **encode**（压缩）：如果启用压缩且有 gzip/zstd——位于全部 waf 处理器之外侧（S历史问题 同步：R1 裁定，coraza 响应拦截器需包在 encode 内侧）
-6. **request_body**：配置了请求体上限时——先于全部 waf 处理器（新-1 裁定，body 解析需在 WAF 前）
-7. **rate_limit / waf**：按绑定策略 policy_id ASC 依次编入各策略的处理器组（限流先于 WAF）
-8. **headers**（Server 头隐藏）：server_tokens_hidden 时 deferred 删除 Server 响应头（须推迟到上游响应写入之后）。2026-09-06 裁定（T-3）：规则级 `server_tokens_hidden`（0=随全局 / 1=隐藏 / 2=显示）为 **API/MCP 预留字段，无 UI 入口、不作为产品功能维护**；管理面板仅提供全局开关（基础设置），UI 规则编辑仅透传保留 API 已设值
-9. **reverse_proxy**（反向代理）：主要处理逻辑；HostHeader 折入 reverse_proxy 的 request.headers（set Host），不再单独发射 headers 处理器
+2. **lb_rule_metrics**：全 HTTP 规则的流量指标收点，位于安全处理器之前
+3. **lb_security_blocked_counter**：安全库可用且绑定策略时发射，包装后续安全段并统计拦截
+4. **安全段**：存在阶段 0 直通策略（`trust_detection=0`）时，整段包入 `not client_ip` 的 subroute；命中信任并集的请求跳过本段，不产生安全事件。保留检测（`trust_detection=1`）不包裹，信任 IP 走 DetectionOnly 全评估不拦但全记录。段内依次为：
+   - **IP 预检**：多策略绑定时合并全部绑定策略 deny 侧 IP 控制的极简 coraza 预检查器——信任（id:3/12 DetectionOnly）→ deny 并集（id:2）→ 遗留黑名单（id:4）→ allow 交集外拒绝（id:7）→ allow 命中豁免 GeoIP（id:13）→ 逐策略 GeoIP 链（800000+policyID）
+   - **lb_security_timing_pre**：预检之后、请求体处理与策略评估之前的分段计时收点
+   - **encode**（压缩）：启用压缩且包含 gzip/zstd 时发射，位于全部 waf 处理器外侧
+   - **request_body**：先于全部 waf 处理器限制请求体
+   - **rate_limit / waf**：全部启用策略的限流先集中发射，再按 policy_id ASC 发射各策略 WAF
+   - **lb_security_timing_end**：安全段末尾的计时收点
+5. **headers**（Server 头隐藏）：server_tokens_hidden 时 deferred 删除 Server 响应头（须推迟到上游响应写入之后）。规则级 `server_tokens_hidden`（0=随全局 / 1=隐藏 / 2=显示）为 **API/MCP 预留字段，无 UI 入口、不作为产品功能维护**；管理面板仅提供全局开关（基础设置），UI 规则编辑仅透传保留 API 已设值
+6. **map**（逐上游回源域名）：静态上游配置 origin_domain 时，在 reverse_proxy 前发射 dial→origin_domain 映射，晚绑定生成 Host/SNI 占位符
+7. **reverse_proxy**（反向代理）：主要处理逻辑；HostHeader 折入 reverse_proxy 的 request.headers（set Host），不再单独发射 headers 处理器
 
 ### 上游服务器配置
 
@@ -232,7 +244,7 @@ for i, d := range domainHosts {
 
 使用 `@id` 实现精确路由管理：
 
-- 每个规则有唯一的 `caddy_id`（13位随机字符串）
+- 每个规则有唯一的 `caddy_id`（`lb_` + 10 位随机字符，总长 13）
 - 路由对象通过 `@id` 标识
 - `@id` 用于在完整配置中稳定标识规则及关联运行数据
 - 创建、更新、启用、禁用和删除均由数据库状态驱动全量配置重建
@@ -247,8 +259,8 @@ for i, d := range domainHosts {
   "handler": "static_response",
   "body": "Lazy Balancer V2 is running!"
   # ↑ 默认文案;可经 data/branding.json 的 landing_text 覆盖(见
-  # docs/deployment.zh-CN.md 品牌定制段——主节点修改经集群「全局配置」通道
-  # 自动分发到从节点)。
+  # docs/deployment.zh-CN.md 品牌定制段——主节点修改随集群恒同步的
+  # 「系统数据」节自动分发到从节点)。
 }
 ```
 

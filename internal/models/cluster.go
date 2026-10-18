@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -85,6 +86,39 @@ func ClusterAccessURLHostMatchesIP(accessURL, ipAddress string) bool {
 	}
 	parsedIP := net.ParseIP(host)
 	return parsedIP != nil && parsedIP.Equal(net.ParseIP(ipAddress))
+}
+
+// ClusterAccessURLTargetsNode 尽力识别主节点地址是否指向本机监听端口。
+// 仅接受明确的 loopback/localhost 或本机出口 IP，不做 DNS 解析；主机别名与
+// 反向代理后的自环无法可靠识别，调用方不得把 false 当作安全保证。
+func ClusterAccessURLTargetsNode(accessURL, ipAddress string, port int) bool {
+	if port <= 0 || port > 65535 {
+		return false
+	}
+	parsed, err := url.Parse(accessURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" {
+		return false
+	}
+	targetPort := parsed.Port()
+	if targetPort == "" {
+		switch parsed.Scheme {
+		case "http":
+			targetPort = "80"
+		case "https":
+			targetPort = "443"
+		}
+	}
+	if targetPort != strconv.Itoa(port) {
+		return false
+	}
+	host := parsed.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return ClusterAccessURLHostMatchesIP(accessURL, ipAddress)
 }
 
 type ClusterLoginTicketRequest struct {
@@ -261,7 +295,9 @@ type ClusterBasicSettings struct {
 	AuditRetentionMonths *int    `json:"audit_retention_months,omitempty"`
 	// v2.3.8 安全事件保留与流量采样：随 users 节同步（从节点/升主后
 	// 保留策略与大屏采样口径与主节点一致）；指针+omitempty 用于旧主端
-	// 快照缺席时保留从端本地值。
+	// 快照缺席时保留从端本地值。ThreatTrafficSampleN：-1=自适应 / 0=关闭 /
+	// 1=全量（历史契约）——固定 2..64 已废除，旧主端快照携带的 2..64
+	// 由从端读侧/迁移归 -1。
 	SecurityEventsRetentionDays *int    `json:"security_events_retention_days,omitempty"`
 	SecurityEventsRowCap        *int    `json:"security_events_row_cap,omitempty"`
 	ThreatTrafficSampleN        *int    `json:"threat_traffic_sample_n,omitempty"`

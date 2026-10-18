@@ -312,7 +312,7 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	       COALESCE(server_map_lat,0) as server_map_lat,
 	       COALESCE(server_map_lon,0) as server_map_lon,
 	       COALESCE(threat_screen_mode,'map') as threat_screen_mode,
-	       COALESCE(threat_traffic_sample_n,4) as threat_traffic_sample_n,
+	       COALESCE(threat_traffic_sample_n,-1) as threat_traffic_sample_n,
 	       COALESCE(security_events_retention_days,90) as security_events_retention_days,
 	       COALESCE(security_events_row_cap,1000000) as security_events_row_cap,
 	       is_master, COALESCE(master_url, '') as master_url, sync_interval,
@@ -345,6 +345,9 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	// 废弃对象，先行钳位是对废弃对象的无意义写（顺序误导读者）。
 	if cfg.SyncInterval < 10 {
 		cfg.SyncInterval = 60
+	} else if cfg.SyncInterval > 86400 {
+		// D2-历史问题：与运行时/节点状态阈值同界，存量脏数据不得原样展示。
+		cfg.SyncInterval = 86400
 	}
 	// 历史问题（2026-09-05 证书域审计裁定）：global_config.dns_credentials 为遗留字段
 	// （签发链唯一凭证来源是 certificate_configs.dns_credentials，前端零消费，
@@ -352,6 +355,11 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	// UpdateConfig 写路径与集群快照同步保留不动（v1 导入兼容）。
 
 	cfg.HasGitHubToken = cfg.GitHubToken != ""
+	// 自定义 Caddy 配置可能内联私钥或敏感 header；与规则 tls_key 同口径，
+	// 非管理员及只读 API Key 不返回原文，管理员 JWT/读写 Key 保持可读。
+	if c.GetString("role") != "admin" || (c.GetString("auth_type") == "api_key" && c.GetBool("api_key_read_only")) {
+		cfg.CaddyConfig = ""
+	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: cfg})
 }
 
@@ -366,6 +374,188 @@ func (h *Handlers) GetUpstreamHealth(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: healthStatus})
 }
 
+// validateUpdateConfigRequest 全局配置保存/预览共用的入参校验与归一
+// （历史问题-6，历史）：此前 preview 仅共用受信代理校验，可对保存必 400
+// 的载荷给出「可变更」的清单。现保存与预览调用同一实现——数值范围、日志级别
+// 枚举归一、时区、采样契约、安全事件保留值域、代理 URL 白名单全部同一组校验。
+func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
+	if err := validateTrustedProxyFields(req); err != nil {
+		return err
+	}
+
+	if req.LogLevel != nil {
+		level := strings.ToLower(strings.TrimSpace(*req.LogLevel))
+		switch level {
+		case "debug", "info", "warn", "error":
+			*req.LogLevel = level
+		default:
+			return errors.New("无效的应用日志级别")
+		}
+	}
+
+	// A-5(2026-09-10 审计):与 LogLevel 同口径归一(ToLower+TrimSpace 后回写)
+	// ——此前仅校验不归一,"DEBUG"/" info " 形态 400 或原样落库,两字段口径漂移。
+	if req.CaddyLogLevel != nil {
+		level := strings.ToLower(strings.TrimSpace(*req.CaddyLogLevel))
+		switch level {
+		case "debug", "info", "warn", "error":
+			*req.CaddyLogLevel = level
+		default:
+			return errors.New("无效的 Caddy 日志级别")
+		}
+	}
+
+	if req.AccessLogFormat != nil {
+		if err := validateAccessLogFormat(*req.AccessLogFormat); err != nil {
+			return err
+		}
+	}
+
+	// 历史问题(历史):补上限与 UI :max=10240(CaddyGlobalSettings.vue)对齐——
+	// 此前仅 ≥100 下限,天文值可落库使轮转实效、日志无限增长。
+	if req.CaddyLogSizeMB != nil && (*req.CaddyLogSizeMB < 100 || *req.CaddyLogSizeMB > 10240) {
+		return errors.New("Caddy 日志大小需在 100-10240MB 之间")
+	}
+
+	if req.DNSProvider != nil {
+		switch *req.DNSProvider {
+		case "dnspod":
+		default:
+			return errors.New("无效的 DNS 提供商")
+		}
+	}
+
+	if req.CertRenewalDays != nil && (*req.CertRenewalDays < 0 || *req.CertRenewalDays > 90) {
+		return errors.New("cert_renewal_days 必须在 0-90 之间")
+	}
+
+	if req.CertRenewalAttempts != nil && (*req.CertRenewalAttempts < 1 || *req.CertRenewalAttempts > 10) {
+		return errors.New("cert_renewal_attempts 必须在 1-10 之间")
+	}
+
+	// 历史问题 C-N5：cert_expiry_days 与另两个续签数值同边界（导入侧已按
+	// [1,365] 钳制）——写侧缺校验会让 0/负值落库，续期窗口计算漂移。
+	if req.CertExpiryDays != nil && (*req.CertExpiryDays < 1 || *req.CertExpiryDays > 365) {
+		return errors.New("cert_expiry_days 必须在 1-365 之间")
+	}
+
+	if req.DefaultCAProviderID != nil {
+		if err := services.ValidateDefaultCAProvider(*req.DefaultCAProviderID); err != nil {
+			return err
+		}
+	}
+
+	// 历史问题 历史问题：上限 4096MB——无上限时天文数字在渲染侧 int64 乘法（MB→字节）
+	// 回绕可正可负。库值唯一真相（批 1+2）：request_body_max_size_mb 为类型①
+	// 值型列（0 无效，1-4096），0 不再是「跟随全局/不限」——落库值恒有效，
+	// 渲染直读零兜底。
+	if req.RequestBodyMaxSizeMB != nil && (*req.RequestBodyMaxSizeMB < 1 || *req.RequestBodyMaxSizeMB > 4096) {
+		return errors.New("request_body_max_size_mb 必须在 1-4096 MB 之间")
+	}
+	// 库值唯一真相（批 1+2）：http_read/write/idle_timeout 为类型①值型列
+	// （NOT NULL DEFAULT 60/60/120+启动回填），>=1 合法——0 的「省略=引擎默认」
+	// 语义废除（渲染无条件发射库值）。upstream_keepalive_timeout 保持类型②
+	// 省略型（0=继承 Caddy/Go Transport 默认 2 分钟，历史问题 用户裁定），仅拒负数。
+	if req.HTTPReadTimeout != nil && *req.HTTPReadTimeout < 1 {
+		return errors.New("http_read_timeout 必须大于 0")
+	}
+	if req.HTTPWriteTimeout != nil && *req.HTTPWriteTimeout < 1 {
+		return errors.New("http_write_timeout 必须大于 0")
+	}
+	if req.HTTPIdleTimeout != nil && *req.HTTPIdleTimeout < 1 {
+		return errors.New("http_idle_timeout 必须大于 0")
+	}
+	if req.UpstreamKeepaliveTimeout != nil && *req.UpstreamKeepaliveTimeout < 0 {
+		return errors.New("Keepalive超时不能为负数")
+	}
+	if (req.ProxyDialTimeout != nil && *req.ProxyDialTimeout < 0) ||
+		(req.ProxyResponseHeaderTimeout != nil && *req.ProxyResponseHeaderTimeout < 0) ||
+		(req.ProxyReadTimeout != nil && *req.ProxyReadTimeout < 0) ||
+		(req.ProxyWriteTimeout != nil && *req.ProxyWriteTimeout < 0) ||
+		(req.ProxyStreamTimeout != nil && *req.ProxyStreamTimeout < 0) {
+		return errors.New("代理超时时间不能为负数")
+	}
+	if req.ProxyFlushInterval != nil && *req.ProxyFlushInterval < -1 {
+		return errors.New("代理刷新间隔不能小于 -1")
+	}
+	if req.ProxyStreamCloseDelay != nil && *req.ProxyStreamCloseDelay < 0 {
+		return errors.New("代理流关闭延迟不能为负数")
+	}
+
+	// 历史问题:与 caddy_log_size_mb(历史问题,100-10240)同族补上限——此前仅 >0
+	// 下限,天文值落库使轮转实效、日志无限增长。2026-09-25 用户裁定：上限收
+	// 窄为 1024（原 10240 过宽），与 UI :max=1024 同口径。
+	if req.TaskLogSizeMB != nil && (*req.TaskLogSizeMB <= 0 || *req.TaskLogSizeMB > 1024) {
+		return errors.New("任务日志大小需在 1-1024MB 之间")
+	}
+	if req.RuntimeLogSizeMB != nil && (*req.RuntimeLogSizeMB <= 0 || *req.RuntimeLogSizeMB > 1024) {
+		return errors.New("运行日志大小需在 1-1024MB 之间")
+	}
+	// 历史 历史问题: 审计日志轮转大小上限 512MB（主节点侧校验；从节点经集群
+	// 同步照单全收，配置源始终为主节点）。
+	if req.AuditLogSizeMB != nil && *req.AuditLogSizeMB <= 0 {
+		return errors.New("审计日志轮转大小必须大于 0")
+	}
+	if req.AuditLogSizeMB != nil && *req.AuditLogSizeMB > 512 {
+		return errors.New("审计日志轮转大小上限 512MB")
+	}
+	if req.JWTExpireMinutes != nil && (*req.JWTExpireMinutes <= 0 || *req.JWTExpireMinutes > 1440) {
+		return errors.New("jwt_expire_minutes 必须在 1-1440 之间")
+	}
+	// 历史问题 F3：audit_retention_months 服务端范围校验（UI 口径 1-12）——超大值使
+	// 年龄裁剪的 datetime('now', '-N days') 越出 SQLite 年份范围返回 NULL，
+	// 年龄 DELETE 恒假静默失效（仅剩条数兜底）。
+	if req.AuditRetentionMonths != nil && (*req.AuditRetentionMonths < 1 || *req.AuditRetentionMonths > 12) {
+		return errors.New("日志保留月数必须在 1-12 之间")
+	}
+	// 威胁大屏本站坐标（v3）：纬度 ±90、经度 ±180，越界 400 不改库值
+	// （fail-visible——静默钳位会让用户以为坐标已生效）。
+	if req.ServerMapLat != nil && (*req.ServerMapLat < -90 || *req.ServerMapLat > 90) {
+		return errors.New("本站纬度必须在 -90 到 90 之间")
+	}
+	if req.ServerMapLon != nil && (*req.ServerMapLon < -180 || *req.ServerMapLon > 180) {
+		return errors.New("本站经度必须在 -180 到 180 之间")
+	}
+	// 威胁大屏模式（v2.3.8）：枚举白名单，非法值 400（fail-visible）
+	if req.ThreatScreenMode != nil && *req.ThreatScreenMode != "map" && *req.ThreatScreenMode != "globe" {
+		return errors.New("威胁大屏模式仅支持 map 或 globe")
+	}
+	// 大屏逐请求流量采样（历史统一契约）：仅 -1=自适应（内部按事件速率在
+	// 1/4/8 档间滞回）、0=关闭、1=全量。固定 2..64 档已废除；存量旧值由启动
+	// 迁移归一到 -1，写侧不再接受。
+	if req.ThreatTrafficSampleN != nil {
+		switch *req.ThreatTrafficSampleN {
+		case -1, 0, 1:
+		default:
+			return errors.New("大屏流量采样仅支持 -1（自适应）、0（关闭）或 1（全量）")
+		}
+	}
+	// 安全事件保留（历史问题-5，历史裁定）：0=自动的旧语义废除——写侧只接受
+	// 显式值（天数 1-3650、行数上限 1-1 亿）。此前接受 0 但启动迁移每次把 0
+	// 改写成 90/1000000，用户显式保存的 0 重启即被静默改写（库值不再反映输入）。
+	// 存量 0/NULL 由 SVC 的一次性 marker 迁移收敛，服务层保留 legacy 防御。
+	if req.SecurityEventsRetentionDays != nil && (*req.SecurityEventsRetentionDays < 1 || *req.SecurityEventsRetentionDays > 3650) {
+		return errors.New("安全事件保留天数必须在 1 到 3650 之间")
+	}
+	if req.SecurityEventsRowCap != nil && (*req.SecurityEventsRowCap < 1 || *req.SecurityEventsRowCap > 100000000) {
+		return errors.New("安全事件行数上限必须在 1 到 100000000 之间")
+	}
+	if req.Timezone != nil {
+		if _, err := time.LoadLocation(*req.Timezone); err != nil {
+			return errors.New("无效的时区: " + err.Error())
+		}
+	}
+
+	// GitHub 加速代理仅允许内置选项（防 SSRF），CRS/IP2Region 下载共用。
+	if req.GitHubProxyURL != nil {
+		if err := services.ValidateGitHubProxyURL(*req.GitHubProxyURL); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (h *Handlers) PreviewConfigUpdate(c *gin.Context) {
 	var req models.UpdateConfigRequest
 	if !guardConfiguredJSONBody(c) {
@@ -375,7 +565,7 @@ func (h *Handlers) PreviewConfigUpdate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求无效"})
 		return
 	}
-	if err := validateTrustedProxyFields(&req); err != nil {
+	if err := validateUpdateConfigRequest(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
@@ -438,194 +628,9 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 	// 与规则写路径同一锁序：先 caddyOpMu，DB 写入与 Caddy 应用全程持锁
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
-	if err := validateTrustedProxyFields(&req); err != nil {
+	if err := validateUpdateConfigRequest(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
-	}
-
-	if req.LogLevel != nil {
-		level := strings.ToLower(strings.TrimSpace(*req.LogLevel))
-		switch level {
-		case "debug", "info", "warn", "error":
-			*req.LogLevel = level
-		default:
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的应用日志级别"})
-			return
-		}
-	}
-
-	// A-5(2026-09-10 审计):与 LogLevel 同口径归一(ToLower+TrimSpace 后回写)
-	// ——此前仅校验不归一,"DEBUG"/" info " 形态 400 或原样落库,两字段口径漂移。
-	if req.CaddyLogLevel != nil {
-		level := strings.ToLower(strings.TrimSpace(*req.CaddyLogLevel))
-		switch level {
-		case "debug", "info", "warn", "error":
-			*req.CaddyLogLevel = level
-		default:
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的 Caddy 日志级别"})
-			return
-		}
-	}
-
-	// 历史问题(历史):补上限与 UI :max=10240(CaddyGlobalSettings.vue)对齐——
-	// 此前仅 ≥100 下限,天文值可落库使轮转实效、日志无限增长。
-	if req.CaddyLogSizeMB != nil && (*req.CaddyLogSizeMB < 100 || *req.CaddyLogSizeMB > 10240) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 日志大小需在 100-10240MB 之间"})
-		return
-	}
-
-	if req.DNSProvider != nil {
-		switch *req.DNSProvider {
-		case "dnspod":
-		default:
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的 DNS 提供商"})
-			return
-		}
-	}
-
-	if req.CertRenewalDays != nil && (*req.CertRenewalDays < 0 || *req.CertRenewalDays > 90) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "cert_renewal_days 必须在 0-90 之间"})
-		return
-	}
-
-	if req.CertRenewalAttempts != nil && (*req.CertRenewalAttempts < 1 || *req.CertRenewalAttempts > 10) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "cert_renewal_attempts 必须在 1-10 之间"})
-		return
-	}
-
-	// 历史问题 C-N5：cert_expiry_days 与另两个续签数值同边界（导入侧已按
-	// [1,365] 钳制）——写侧缺校验会让 0/负值落库，续期窗口计算漂移。
-	if req.CertExpiryDays != nil && (*req.CertExpiryDays < 1 || *req.CertExpiryDays > 365) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "cert_expiry_days 必须在 1-365 之间"})
-		return
-	}
-
-	if req.DefaultCAProviderID != nil {
-		if err := services.ValidateDefaultCAProvider(*req.DefaultCAProviderID); err != nil {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-			return
-		}
-	}
-
-	// 历史问题 历史问题：上限 4096MB——无上限时天文数字在渲染侧 int64 乘法（MB→字节）
-	// 回绕可正可负。库值唯一真相（批 1+2）：request_body_max_size_mb 为类型①
-	// 值型列（0 无效，1-4096），0 不再是「跟随全局/不限」——落库值恒有效，
-	// 渲染直读零兜底。
-	if req.RequestBodyMaxSizeMB != nil && (*req.RequestBodyMaxSizeMB < 1 || *req.RequestBodyMaxSizeMB > 4096) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "request_body_max_size_mb 必须在 1-4096 MB 之间"})
-		return
-	}
-	// 库值唯一真相（批 1+2）：http_read/write/idle_timeout 为类型①值型列
-	// （NOT NULL DEFAULT 60/60/120+启动回填），>=1 合法——0 的「省略=引擎默认」
-	// 语义废除（渲染无条件发射库值）。upstream_keepalive_timeout 保持类型②
-	// 省略型（0=继承 Caddy/Go Transport 默认 2 分钟，历史问题 用户裁定），仅拒负数。
-	if req.HTTPReadTimeout != nil && *req.HTTPReadTimeout < 1 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "http_read_timeout 必须大于 0"})
-		return
-	}
-	if req.HTTPWriteTimeout != nil && *req.HTTPWriteTimeout < 1 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "http_write_timeout 必须大于 0"})
-		return
-	}
-	if req.HTTPIdleTimeout != nil && *req.HTTPIdleTimeout < 1 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "http_idle_timeout 必须大于 0"})
-		return
-	}
-	if req.UpstreamKeepaliveTimeout != nil && *req.UpstreamKeepaliveTimeout < 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Keepalive超时不能为负数"})
-		return
-	}
-	if (req.ProxyDialTimeout != nil && *req.ProxyDialTimeout < 0) ||
-		(req.ProxyResponseHeaderTimeout != nil && *req.ProxyResponseHeaderTimeout < 0) ||
-		(req.ProxyReadTimeout != nil && *req.ProxyReadTimeout < 0) ||
-		(req.ProxyWriteTimeout != nil && *req.ProxyWriteTimeout < 0) ||
-		(req.ProxyStreamTimeout != nil && *req.ProxyStreamTimeout < 0) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "代理超时时间不能为负数"})
-		return
-	}
-	if req.ProxyFlushInterval != nil && *req.ProxyFlushInterval < -1 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "代理刷新间隔不能小于 -1"})
-		return
-	}
-	if req.ProxyStreamCloseDelay != nil && *req.ProxyStreamCloseDelay < 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "代理流关闭延迟不能为负数"})
-		return
-	}
-
-	// 历史问题:与 caddy_log_size_mb(历史问题,100-10240)同族补上限——此前仅 >0
-	// 下限,天文值落库使轮转实效、日志无限增长。2026-09-25 用户裁定：上限收
-	// 窄为 1024（原 10240 过宽），与 UI :max=1024 同口径。
-	if req.TaskLogSizeMB != nil && (*req.TaskLogSizeMB <= 0 || *req.TaskLogSizeMB > 1024) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "任务日志大小需在 1-1024MB 之间"})
-		return
-	}
-	if req.RuntimeLogSizeMB != nil && (*req.RuntimeLogSizeMB <= 0 || *req.RuntimeLogSizeMB > 1024) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "运行日志大小需在 1-1024MB 之间"})
-		return
-	}
-	// 历史 历史问题: 审计日志轮转大小上限 512MB（主节点侧校验；从节点经集群
-	// 同步照单全收，配置源始终为主节点）。
-	if req.AuditLogSizeMB != nil && *req.AuditLogSizeMB <= 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "审计日志轮转大小必须大于 0"})
-		return
-	}
-	if req.AuditLogSizeMB != nil && *req.AuditLogSizeMB > 512 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "审计日志轮转大小上限 512MB"})
-		return
-	}
-	if req.JWTExpireMinutes != nil && (*req.JWTExpireMinutes <= 0 || *req.JWTExpireMinutes > 1440) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "jwt_expire_minutes 必须在 1-1440 之间"})
-		return
-	}
-	// 历史问题 F3：audit_retention_months 服务端范围校验（UI 口径 1-12）——超大值使
-	// 年龄裁剪的 datetime('now', '-N days') 越出 SQLite 年份范围返回 NULL，
-	// 年龄 DELETE 恒假静默失效（仅剩条数兜底）。
-	if req.AuditRetentionMonths != nil && (*req.AuditRetentionMonths < 1 || *req.AuditRetentionMonths > 12) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "日志保留月数必须在 1-12 之间"})
-		return
-	}
-	// 威胁大屏本站坐标（v3）：纬度 ±90、经度 ±180，越界 400 不改库值
-	// （fail-visible——静默钳位会让用户以为坐标已生效）。
-	if req.ServerMapLat != nil && (*req.ServerMapLat < -90 || *req.ServerMapLat > 90) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "本站纬度必须在 -90 到 90 之间"})
-		return
-	}
-	if req.ServerMapLon != nil && (*req.ServerMapLon < -180 || *req.ServerMapLon > 180) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "本站经度必须在 -180 到 180 之间"})
-		return
-	}
-	// 威胁大屏模式（v2.3.8）：枚举白名单，非法值 400（fail-visible）
-	if req.ThreatScreenMode != nil && *req.ThreatScreenMode != "map" && *req.ThreatScreenMode != "globe" {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "威胁大屏模式仅支持 map 或 globe"})
-		return
-	}
-	// 大屏逐请求流量采样：-1=自适应，0=关闭，1=全量，4/8=1/N。
-	if req.ThreatTrafficSampleN != nil && (*req.ThreatTrafficSampleN < -1 || *req.ThreatTrafficSampleN > 64) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "大屏流量采样必须在 -1 到 64 之间"})
-		return
-	}
-	// 安全事件保留（v2.3.8）：天数 0-3650、行数上限 0-1 亿（0=自动通道）
-	if req.SecurityEventsRetentionDays != nil && (*req.SecurityEventsRetentionDays < 0 || *req.SecurityEventsRetentionDays > 3650) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "安全事件保留天数必须在 0 到 3650 之间"})
-		return
-	}
-	if req.SecurityEventsRowCap != nil && (*req.SecurityEventsRowCap < 0 || *req.SecurityEventsRowCap > 100000000) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "安全事件行数上限必须在 0 到 100000000 之间"})
-		return
-	}
-	if req.Timezone != nil {
-		if _, err := time.LoadLocation(*req.Timezone); err != nil {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的时区: " + err.Error()})
-			return
-		}
-	}
-
-	// GitHub 加速代理仅允许内置选项（防 SSRF），CRS/IP2Region 下载共用。
-	if req.GitHubProxyURL != nil {
-		if err := services.ValidateGitHubProxyURL(*req.GitHubProxyURL); err != nil {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-			return
-		}
 	}
 
 	old, err := loadConfigSnapshot()
@@ -643,12 +648,6 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		return
 	}
 
-	if req.AccessLogFormat != nil {
-		if err := validateAccessLogFormat(*req.AccessLogFormat); err != nil {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-			return
-		}
-	}
 	if err := validateEnabledStoredRuleConfigs(c.Request.Context()); err != nil {
 		writeConfigValidationFailure(c, err)
 		return
@@ -766,6 +765,13 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		restoreErr := h.caddyService.ApplyConfig(oldRuntimeConfig)
 		applyErr = errors.Join(applyErr, restoreErr)
+		// 历史问题-2（历史）：回弹也可能失败（Caddy 不可达/超时）——运行
+		// 配置可能停留候选态而 DB 已回滚，仅响应+审计会在重启后消失。先显式
+		// 回滚事务释放写锁，再持久化横幅（recordCaddyApplyResult 写主库）。
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			applyErr = errors.Join(applyErr, rbErr)
+		}
+		h.recordCaddyApplyResult(applyErr)
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("Caddy 配置应用失败", applyErr.Error(), services.AuditResultPart("failure")))
 		// 2026-09-07 审计 N4：与规则域 D2 统一——配置拒绝→400，传输/系统→500。
 		if services.IsConfigRejected(applyErr) {
@@ -785,6 +791,8 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		restoreErr := h.caddyService.ApplyConfig(oldRuntimeConfig)
 		err = errors.Join(err, rollbackErr, restoreErr)
+		// 历史问题-2：提交失败后的回弹同样可能失败——持久化横幅（事务已回滚）。
+		h.recordCaddyApplyResult(err)
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("提交配置失败", err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交配置失败: " + err.Error()})
 		return
@@ -1165,6 +1173,8 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		}
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
 		err = errors.Join(err, rollbackErr, restoreErr)
+		// 历史问题-2：回弹失败持久化横幅（事务已显式回滚）。
+		h.recordCaddyApplyResult(err)
 		recordAudit(c, "更新失败", "Caddy配置", services.FormatAuditDetail("Caddy 配置应用失败", err.Error(), services.AuditResultPart("failure")))
 		// 2026-09-07 审计 L6：与 D2/N4 统一——配置拒绝→400，传输/系统→500。
 		if services.IsConfigRejected(err) {
@@ -1181,6 +1191,7 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		}
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
 		err = errors.Join(err, rollbackErr, restoreErr)
+		h.recordCaddyApplyResult(err)
 		recordAudit(c, "更新失败", "Caddy配置", services.FormatAuditDetail("提交 Caddy 配置失败", err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交 Caddy 配置失败: " + err.Error()})
 		return

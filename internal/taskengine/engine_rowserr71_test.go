@@ -71,6 +71,21 @@ func (taskIterZeroRows) Columns() []string         { return []string{"c"} }
 func (taskIterZeroRows) Close() error              { return nil }
 func (taskIterZeroRows) Next([]driver.Value) error { return io.EOF }
 
+// taskRowsQueryFailConnector 在 Query 阶段直接失败，与上面的迭代失败
+// 连接器互补：用于钉住 History/HourlySeries 的 rows, err := Query 分支。
+type taskRowsQueryFailConnector struct{}
+
+func (taskRowsQueryFailConnector) Connect(context.Context) (driver.Conn, error) {
+	return taskRowsQueryFailConn{}, nil
+}
+func (taskRowsQueryFailConnector) Driver() driver.Driver { return taskRowsIterFailDriver{} }
+
+type taskRowsQueryFailConn struct{ taskRowsIterFailConn }
+
+func (taskRowsQueryFailConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
+	return nil, errors.New("注入的 task_runs 查询失败")
+}
+
 // captureEngineLog 捕获标准库日志（taskengine warn 落点——包内无 services
 // 依赖，经 "WARNING:" 前缀走 main.go applicationLogWriter 级别过滤）。
 func captureEngineLog(t *testing.T) *strings.Builder {
@@ -123,5 +138,34 @@ func TestEngine_Stats24hHourlySeries_iterationErrorWarns(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "24h") {
 		t.Fatalf("Stats24hHourlySeries 迭代错误须 warn 留痕, log=%q", buf.String())
+	}
+}
+
+func TestEngine_QueryErrorWarns(t *testing.T) {
+	e := newTestEngine(t)
+	tests := []struct {
+		name   string
+		invoke func() int
+		want   int
+	}{
+		{name: "History", invoke: func() int { return len(e.History("t-x", 20)) }, want: 0},
+		{name: "Stats24hHourlySeries", invoke: func() int { return len(e.Stats24hHourlySeries()) }, want: 24},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureEngineLog(t)
+			orig := db.DB
+			broken := sql.OpenDB(taskRowsQueryFailConnector{})
+			t.Cleanup(func() { _ = broken.Close() })
+			db.DB = broken
+			t.Cleanup(func() { db.DB = orig })
+
+			if got := tc.invoke(); got != tc.want {
+				t.Fatalf("查询失败后的返回形状大小=%d, want %d", got, tc.want)
+			}
+			if !strings.Contains(buf.String(), "查询失败") {
+				t.Fatalf("Query 错误必须 warn 留痕, log=%q", buf.String())
+			}
+		})
 	}
 }

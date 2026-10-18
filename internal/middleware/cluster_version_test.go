@@ -84,6 +84,10 @@ func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testi
 		{"DELETE", "/api/v1/security/block-pages/:id", true},
 		{"PUT", "/api/v1/security/crs/auto-update", true},
 		{"POST", "/api/v1/security/crs/update", true},
+		// 手动任务触发可写版本表；整路由 fail-closed，避免在中间件维护
+		// 第二份任务 ID/同步写清单。其他任务操作不据此捕获。
+		{"POST", "/api/v1/system/tasks/:id/trigger", true},
+		{"POST", "/api/v1/system/tasks/:id/toggle", false},
 		// 历史问题-1（历史）：大屏流量采集租约是 Caddy admin 的纯代理
 		//（内存租约，不写任何同步表）——不得按 security 前缀误分类为
 		// 同步写（触发器降级态会把它误伤成 500）。
@@ -206,6 +210,9 @@ func TestClusterVersionMiddleware_rejects_with_api_response_when_trigger_install
 	router.POST("/api/v1/rules", func(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 	})
+	router.POST("/api/v1/system/tasks/:id/trigger", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
 
 	// When
 	recorder := httptest.NewRecorder()
@@ -221,6 +228,12 @@ func TestClusterVersionMiddleware_rejects_with_api_response_when_trigger_install
 	}
 	if resp.Code != 500 || resp.Message != "集群版本触发器不可用" {
 		t.Fatalf("body={code:%d message:%q}, want {code:500 message:集群版本触发器不可用}", resp.Code, resp.Message)
+	}
+
+	triggerRecorder := httptest.NewRecorder()
+	router.ServeHTTP(triggerRecorder, httptest.NewRequest(http.MethodPost, "/api/v1/system/tasks/crs/trigger", nil))
+	if triggerRecorder.Code != http.StatusInternalServerError {
+		t.Fatalf("task trigger response status=%d body=%q, want fail-closed 500", triggerRecorder.Code, triggerRecorder.Body.String())
 	}
 }
 

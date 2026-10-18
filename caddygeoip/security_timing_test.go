@@ -20,16 +20,12 @@ func useTestTimingRegistry(t *testing.T) {
 	auditTimingWaitLimit = 200 * time.Millisecond
 	auditTimingPollStep = time.Millisecond
 	auditTimingMu.Lock()
-	auditTimingEntries = make(map[string]*auditTimingEntry)
-	auditTimingCreateCount = 0
-	auditTimingLastSweep = time.Time{}
+	resetAuditTimingRegistryLockedForTest()
 	auditTimingMu.Unlock()
 	t.Cleanup(func() {
 		auditTimingWaitLimit, auditTimingPollStep = origWait, origPoll
 		auditTimingMu.Lock()
-		auditTimingEntries = make(map[string]*auditTimingEntry)
-		auditTimingCreateCount = 0
-		auditTimingLastSweep = time.Time{}
+		resetAuditTimingRegistryLockedForTest()
 		auditTimingMu.Unlock()
 	})
 }
@@ -179,6 +175,26 @@ func TestSecurityTimingEnd_recordsEndSegmentFromAnchor(t *testing.T) {
 	}
 	if snap.closed {
 		t.Fatal("timing_end must not close the entry (terminal marker owned by blocked_counter)")
+	}
+}
+
+// E81-历史问题：挂钟回拨/异常起始头（未来时刻）产生的负时长不得注入审计行——
+// 耗时下限钳 0（0µs 是合法计时值）。
+func TestRecordSecurityTiming_negativeClampedToZero(t *testing.T) {
+	useTestTimingRegistry(t)
+	const id = "ffffffffffffffff"
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set(securityTimingHeader, id)
+	req.Header.Set(securityTimingStartHeader, strconv.FormatInt(time.Now().Add(time.Minute).UnixNano(), 10))
+
+	recordSecurityTiming(req, timingSegmentPre)
+
+	snap := auditTimingLookupForTest(t, id)
+	if !snap.preSet {
+		t.Fatalf("snapshot = %+v; want recorded pre segment", snap)
+	}
+	if snap.preUs != 0 {
+		t.Fatalf("negative duration must clamp to 0, got %d", snap.preUs)
 	}
 }
 

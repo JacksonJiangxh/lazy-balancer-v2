@@ -15,18 +15,30 @@ import (
 	"time"
 )
 
-// IsMaster 读取节点角色。COALESCE(is_master,1) 与 readonly 写闸
-// （readonly.go）及 cluster_version 触发器口径一致：历史库 NULL 视为主节点
-// （fail-open）。历史问题 迁移（db.go）已回填存量 NULL，稳态不可达，此处为
-// 纵深防御一致性（2026-09-06 集群审计 历史问题 / W10 复核结论）——此前裸 SELECT
-// 对 NULL Scan 失败会使 requireMaster/Promote 走 500（fail-closed），
+// RoleOf 读取节点角色（主节点=true）的单源实现（历史问题-07）。COALESCE(is_master,1)
+// 与 readonly 写闸（readonly.go）及 cluster_version 触发器口径一致：历史库 NULL
+// 视为主节点（fail-open）。历史问题 迁移（db.go）已回填存量 NULL，稳态不可达，
+// 此处为纵深防御一致性（2026-09-06 集群审计 历史问题 / W10 复核结论）——此前裸
+// SELECT 对 NULL Scan 失败会使 requireMaster/Promote 走 500（fail-closed），
 // 同一脏数据在两守卫处语义相反。
-func (s *ClusterService) IsMaster(ctx context.Context) (bool, error) {
+//
+// 读失败语义由调用方决定（fail-open 主节点 / 500 / 跳过本轮）：本函数只做
+// 单源读取，不做策略；新调用点禁止再内联 SQL（历史：25 处重复实现已
+// 出现失败语义分叉，本批先收敛 cluster 相关点，residual 见修复报告）。
+func RoleOf(ctx context.Context, database *sql.DB) (bool, error) {
+	if database == nil {
+		return false, errors.New("读取节点模式: 数据库未初始化")
+	}
 	var isMaster bool
-	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
+	if err := database.QueryRowContext(ctx, "SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
 		return false, fmt.Errorf("读取节点模式: %w", err)
 	}
 	return isMaster, nil
+}
+
+// IsMaster 读取节点角色（ClusterService 便捷包装，语义见 RoleOf）。
+func (s *ClusterService) IsMaster(ctx context.Context) (bool, error) {
+	return RoleOf(ctx, s.db)
 }
 
 func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, registration models.ClusterRegistration) error {
@@ -44,6 +56,13 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 			drainer.reopenPullAdmission()
 			return fmt.Errorf("等待在途同步拉取结束: %w", err)
 		}
+		// 历史问题-01：排干成功后所有返回路径都必须恢复拉取准入。原实现只在
+		// 成功尾部重开——下方 UPDATE 失败（SQLITE_BUSY/磁盘满）时准入永久
+		// 关闭；而「已是从节点换主」不触发引擎换代（SetRole(false) flipped=
+		// false），旧 daemon 不会重新 Start，后续每轮 Pull 在 beginPull 即
+		// 返回 errSyncPullStopped 且该哨兵刻意不落库 → 静默脱同步、状态面
+		// 全绿、无自愈。defer 覆盖失败路径，成功路径另行提前重开。
+		defer drainer.reopenPullAdmission()
 	}
 	// 历史问题（RG-CLUSTER-STATUS-RESET）：last_sync 与 applied_version 同语义
 	// ——旧集群的同步时间对新集群无意义，同一 UPDATE 里置 NULL，状态卡不残留
@@ -51,6 +70,18 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	if _, err := s.db.ExecContext(ctx, `UPDATE global_config SET is_master=0, master_url=?, cluster_token='', registration_id=?, registration_secret=?, applied_version=0, sync_fingerprint='', last_sync_error='', registration_confirm_failures=0, last_sync=NULL WHERE id=1`, masterURL, registration.RegistrationID, registration.RegistrationSecret); err != nil {
 		return fmt.Errorf("保存从节点注册状态: %w", err)
 	}
+	// 拓扑已提交：先恢复拉取准入，再让新 daemon 起步——若等到函数尾部才重开，
+	// 新循环的首次 Pull 可能撞上仍关闭的准入并以 errSyncPullStopped 静默失败
+	//（该哨兵不落库），延迟 = 一个 sync_interval。
+	if drainer != nil {
+		drainer.reopenPullAdmission()
+	}
+	// 历史问题-06：角色翻转显式失效快照缓存。缓存键只有 version/ownership/开关，
+	// 降级瞬间在途的 master-only Run 可越过角色检查写库且 is_master=0 不 bump
+	// 版本——若此后未发生任何 apply 就再次升主，旧缓存会被当作权威下发。
+	clusterSnapshotCaches.Delete(s.db)
+	// 历史问题-05：角色翻转后主节点期间的分区上报缓存不再有权威来源。
+	s.clearAllSectionReports()
 	// 角色翻转由引擎 SetRole 唯一驱动：master-only 任务统一停调，cluster-sync
 	// 经 RestartOnRoleFlip 换代为从节点分支；无管理器/旧调度器旁路。
 	if te := TaskEngine(); te != nil {
@@ -66,10 +97,13 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 			Logf("warn", "切成从节点后持久化 cluster-sync 调度偏好失败（当前进程已恢复）: %v", err)
 		}
 	}
+	// 拉取准入已在上方拓扑提交后重开（defer 兜底失败路径）；此处不再重复。
 	if drainer != nil {
-		// DrainPulls 只是换主屏障，不是永久 Stop；新拓扑必须恢复拉取准入。
-		// Halted 的 daemon 仍由 handler 的 Resume 负责重启。
-		drainer.reopenPullAdmission()
+		// 历史问题-05(b)：换主后内存 TOFU pin 缓存与磁盘生命周期对齐——磁盘侧由
+		// detachFromMaster 删除旧主 pin，内存 verifiedPins 若不清空会残留旧主
+		// 指纹（与 Promote handler 的 ForgetClusterPins 收尾对称）。同主重注册
+		// 也一并清空：下次请求按 pin 文件重钉，行为等价且无落盘副作用。
+		drainer.ForgetClusterPins()
 	}
 	// 仅在主节点地址实际变化时通知旧主。相同主节点重新注册可能刚复用
 	// 节点行， detached 会误删本次新注册。
@@ -90,7 +124,7 @@ func (s *ClusterService) UpdateSettings(ctx context.Context, req models.ClusterS
 	}
 	// sync_interval 无下限校验会让从节点 run 循环 waitDelay(0) 进入零间隔
 	// Pull 风暴（主节点被持续高压请求打满）；上限 86400 防误填（历史问题 发现1）。
-	if req.SyncInterval != nil && (*req.SyncInterval < 10 || *req.SyncInterval > 86400) {
+	if req.SyncInterval != nil && (*req.SyncInterval < minSyncIntervalSeconds || *req.SyncInterval > maxSyncIntervalSeconds) {
 		return ErrInvalidSyncInterval
 	}
 	if s.beforeUpdateSettings != nil {
@@ -163,11 +197,10 @@ func (s *ClusterService) Status(ctx context.Context) (models.ClusterStatus, erro
 	}
 	// 历史问题-1(历史)/历史问题-1(历史幻影修复修正——clamp 曾被误插
 	// 在上方 return 之后不可达,go vet unreachable 实证):展示口径与运行时 clamp
-	// 对齐(cluster_sync.go:1387-1389,<10 → 60)——存量脏值(0/负/1-9s)不再
-	// 原样展示与运行时分叉。
-	if status.SyncInterval < 10 {
-		status.SyncInterval = 60
-	}
+	// 对齐(cluster_sync.go 的 run 循环 interval clamp,<10 → 60)——存量脏值
+	// (0/负/1-9s)不再原样展示与运行时分叉。(D2-历史问题:原注释的固定行号已漂移,
+	// 改为符号化定位。)
+	status.SyncInterval = normalizeSyncInterval(status.SyncInterval)
 	status.LastSyncError, status.SyncErrorCode = decodeSyncError(storedSyncError)
 	status.NodeMode = "slave"
 	status.ClusterActive = clusterToken != ""
@@ -332,6 +365,12 @@ func (s *ClusterService) clearSectionReport(nodeID int) {
 	s.sectionMu.Lock()
 	defer s.sectionMu.Unlock()
 	delete(s.sectionReports, nodeID)
+}
+
+func (s *ClusterService) clearAllSectionReports() {
+	s.sectionMu.Lock()
+	defer s.sectionMu.Unlock()
+	clear(s.sectionReports)
 }
 
 func (s *ClusterService) ReportNode(ctx context.Context, nodeID int, report models.ClusterReport, now time.Time) error {

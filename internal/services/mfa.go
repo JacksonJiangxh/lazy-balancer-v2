@@ -186,15 +186,19 @@ func MFARecordChallengeFailure(token string) bool {
 }
 
 // MFAConsumeChallenge 单次消费挑战：存在、未消费、未过期且属主匹配。
-func MFAConsumeChallenge(token string, userID int) bool {
+// 返回 (false,nil) 仅表示挑战不可消费；SQL/驱动错误必须显式传给调用方。
+func MFAConsumeChallenge(token string, userID int) (bool, error) {
 	res, err := db.DB.Exec(
 		"UPDATE mfa_challenges SET consumed=1 WHERE token=? AND user_id=? AND consumed=0 AND expires_at > datetime('now')",
 		token, userID)
 	if err != nil {
-		return false
+		return false, err
 	}
-	n, _ := res.RowsAffected()
-	return n == 1
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // MFARestoreChallenge 归还已消费挑战（历史问题 消费前置的配套）：MFAVerifyLogin
@@ -403,6 +407,9 @@ type MFAStatus struct {
 }
 
 // MFAGetStatus 读用户状态。
+// D2-历史问题（历史）：恢复码列解析失败是存储损坏，必须显性报错——
+// 此前吞掉 JSON 错误会展示「剩余 0 个」，掩盖损坏且与
+// mfaConsumeRecoveryCode 的三态口径分裂（U04c-05）。
 func MFAGetStatus(userID int) (MFAStatus, error) {
 	var enabled bool
 	var raw string
@@ -410,7 +417,9 @@ func MFAGetStatus(userID int) (MFAStatus, error) {
 		return MFAStatus{}, err
 	}
 	var hashes []string
-	_ = json.Unmarshal([]byte(raw), &hashes)
+	if err := json.Unmarshal([]byte(raw), &hashes); err != nil {
+		return MFAStatus{}, fmt.Errorf("恢复码存储损坏: %w", err)
+	}
 	return MFAStatus{Enabled: enabled, RecoveryCodesRemaining: len(hashes)}, nil
 }
 

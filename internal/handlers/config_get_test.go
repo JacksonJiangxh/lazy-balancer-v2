@@ -169,3 +169,94 @@ func TestCertExpiryDays_noDefaultLiteralsAcrossConsumers(t *testing.T) {
 		}
 	}
 }
+
+// D2-历史问题 handler 侧：GET /config 的展示钳位必须与运行时/状态阈值同界，
+// 低值 <10→60、高值 >86400→86400。
+func TestGetConfig_syncIntervalClampMatchesRuntime(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/config", h.GetConfig)
+	for _, tc := range []struct {
+		stored int
+		want   int
+	}{
+		{stored: 5, want: 60},
+		{stored: 86401, want: 86400},
+		{stored: 1000000, want: 86400},
+		{stored: 60, want: 60},
+		{stored: 86400, want: 86400},
+	} {
+		if _, err := db.DB.Exec(`UPDATE global_config SET sync_interval=? WHERE id=1`, tc.stored); err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/config", nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("stored=%d status=%d body=%s", tc.stored, response.Code, response.Body.String())
+		}
+		var body struct {
+			Data struct {
+				SyncInterval int `json:"sync_interval"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Data.SyncInterval != tc.want {
+			t.Fatalf("stored=%d displayed=%d, want %d", tc.stored, body.Data.SyncInterval, tc.want)
+		}
+	}
+}
+
+// B1-历史问题：自定义 Caddy 配置可包含私钥或敏感 header，非管理员及只读
+// API Key 不得通过 GET /config 读取原文；管理员 JWT/读写 Key 保持回归。
+func TestGetConfig_caddyConfigVisibilityByIdentity(t *testing.T) {
+	const secret = `private-key-and-sensitive-header`
+	for _, tc := range []struct {
+		name      string
+		role      string
+		authType  string
+		readOnly  bool
+		wantPlain bool
+	}{
+		{name: "admin JWT", role: "admin", authType: "jwt", wantPlain: true},
+		{name: "admin read-write key", role: "admin", authType: "api_key", wantPlain: true},
+		{name: "non-admin JWT", role: "user", authType: "jwt"},
+		{name: "admin read-only key", role: "admin", authType: "api_key", readOnly: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newBackupTestHandlers(t)
+			if _, err := db.DB.Exec(`UPDATE global_config SET caddy_config=? WHERE id=1`, secret); err != nil {
+				t.Fatal(err)
+			}
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				c.Set("role", tc.role)
+				c.Set("auth_type", tc.authType)
+				c.Set("api_key_read_only", tc.readOnly)
+			})
+			router.GET("/config", h.GetConfig)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/config", nil))
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var body struct {
+				Data struct {
+					CaddyConfig string `json:"caddy_config"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantPlain && body.Data.CaddyConfig != secret {
+				t.Fatalf("caddy_config=%q, want plaintext", body.Data.CaddyConfig)
+			}
+			if !tc.wantPlain && (body.Data.CaddyConfig != "" || strings.Contains(response.Body.String(), secret)) {
+				t.Fatalf("restricted identity received caddy_config=%q", body.Data.CaddyConfig)
+			}
+		})
+	}
+}

@@ -262,20 +262,35 @@ func startFakeDNSServerW(t *testing.T, respond func(w dns.ResponseWriter, query 
 	handler := dns.HandlerFunc(func(w dns.ResponseWriter, query *dns.Msg) {
 		_ = w.WriteMsg(respond(w, query))
 	})
-	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen udp: %v", err)
+	// 先占 TCP 再占同端口 UDP：外部进程常占用固定 TCP 端口，若先随机 UDP
+	// 再 TCP 回绑会偶发 address already in use。任一步失败重选端口。
+	var (
+		listener   net.Listener
+		packetConn net.PacketConn
+		addr       string
+		err        error
+	)
+	for attempt := 0; attempt < 8; attempt++ {
+		listener, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			continue
+		}
+		addr = listener.Addr().String()
+		packetConn, err = net.ListenPacket("udp", addr)
+		if err == nil {
+			break
+		}
+		_ = listener.Close()
+		listener = nil
+	}
+	if listener == nil || packetConn == nil {
+		t.Fatalf("listen tcp+udp: %v", err)
 	}
 	t.Cleanup(func() { _ = packetConn.Close() })
-	addr := packetConn.LocalAddr().String()
 	udpServer := &dns.Server{PacketConn: packetConn, Handler: handler}
 	t.Cleanup(func() { _ = udpServer.Shutdown() })
 	go func() { _ = udpServer.ActivateAndServe() }()
 
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		t.Fatalf("listen tcp on %s: %v", addr, err)
-	}
 	t.Cleanup(func() { _ = listener.Close() })
 	tcpServer := &dns.Server{Listener: listener, Handler: handler}
 	t.Cleanup(func() { _ = tcpServer.Shutdown() })

@@ -55,6 +55,19 @@ var configFileKeys = map[string]struct{}{
 	"metrics_interval":  {},
 }
 
+// minJWTSecretBytes 是 JWT/OIDC state 签名密钥的最短长度（HS256 强度下限）。
+// 文件通道（loadOrCreateJWTSecret）与环境变量通道共用本阈值——历史问题-2：旧实现
+// 只校验文件通道，JWT_SECRET=abc 这类 3 字节密钥可直接绕过。
+const minJWTSecretBytes = 32
+
+// metricsIntervalMax 是 metrics_interval 的合理上限（24h）。超出范围的浮点
+// 直接转 int 是未定义语义（巨值可能回绕成负数再被静默抬到下限），必须先判界。
+const metricsIntervalMax = 86400
+
+// jwtSecretStrongEnough 判定密钥是否满足最短长度。空串（未配置）不走本判定
+// ——文件通道会生成随机密钥。
+func jwtSecretStrongEnough(secret string) bool { return len(secret) >= minJWTSecretBytes }
+
 // Load 加载运行配置：默认值 → 配置文件（仅 configFileKeys 支持的键）→ 环境变量。
 // 配置文件中的未知键逐条 log 告警后忽略；读取/解析失败同样可见（回退默认值）。
 func Load(path string) *Config {
@@ -141,15 +154,26 @@ func Load(path string) *Config {
 				if v, ok := fileCfg["caddy_metrics_url"].(string); ok && v != "" {
 					cfg.CaddyMetricsURL = v
 				}
-				if v, ok := fileCfg["metrics_interval"].(float64); ok && v > 0 {
-					// 历史问题-7（历史）：下限钳位与截断均留痕（此前 1 被静默
-					// 抬到 5、1.9 被静默截断——看似「配置未生效」）。
-					if v < 5 {
-						log.Printf("config: metrics_interval %v below minimum 5; clamped to 5", v)
-					} else if v != math.Trunc(v) {
-						log.Printf("config: metrics_interval %v is not an integer; truncated to %d", v, int(v))
+				if v, ok := fileCfg["metrics_interval"].(float64); ok {
+					// E81/历史问题-4：≤0 与超范围都必须可见（旧实现 0/负值静默回落
+					// 默认 30s；巨值 float→int 转换是未定义语义，可能回绕成负数
+					// 再被静默抬到 5s 高频采集）。先判界再转换。
+					switch {
+					case v <= 0:
+						log.Printf("config: metrics_interval %v must be positive; using default %d", v, cfg.MetricsInterval)
+					case v > metricsIntervalMax:
+						log.Printf("config: metrics_interval %v above maximum %d; clamped to %d", v, metricsIntervalMax, metricsIntervalMax)
+						cfg.MetricsInterval = metricsIntervalMax
+					default:
+						// 历史问题-7（历史）：下限钳位与截断均留痕（此前 1 被静默
+						// 抬到 5、1.9 被静默截断——看似「配置未生效」）。
+						if v < 5 {
+							log.Printf("config: metrics_interval %v below minimum 5; clamped to 5", v)
+						} else if v != math.Trunc(v) {
+							log.Printf("config: metrics_interval %v is not an integer; truncated to %d", v, int(v))
+						}
+						cfg.MetricsInterval = max(5, int(v))
 					}
-					cfg.MetricsInterval = max(5, int(v))
 				}
 			}
 		}
@@ -172,6 +196,12 @@ func Load(path string) *Config {
 	// restarts and the secret is never predictable.
 	if cfg.JWTSecret == "" {
 		cfg.JWTSecret = loadOrCreateJWTSecret(cfg.DataDir)
+	} else if !jwtSecretStrongEnough(cfg.JWTSecret) {
+		// 历史问题-2：环境变量通道此前完全不校验长度（文件通道强制 ≥32 并再生）。
+		// env 是运维显式输入，不自动替换（替换会让所有令牌静默失效），只告警
+		// 可见；强度要求与文件通道同阈值。
+		log.Printf("config: JWT_SECRET 环境变量过短（%d 字节 < %d）——JWT HS256 与 OIDC state 签名强度不足，请改用 ≥%d 字节的随机密钥",
+			len(cfg.JWTSecret), minJWTSecretBytes, minJWTSecretBytes)
 	}
 
 	// 历史问题 二十六次 W3-3：端口范围校验——port=0 会绑随机端口、>65535 只在
@@ -195,7 +225,7 @@ func getEnv(key, defaultValue string) string {
 func loadOrCreateJWTSecret(dataDir string) string {
 	secretPath := filepath.Join(dataDir, "jwt_secret")
 	if data, err := os.ReadFile(secretPath); err == nil {
-		if len(data) >= 32 {
+		if jwtSecretStrongEnough(string(data)) {
 			return string(data)
 		}
 		if len(data) > 0 {

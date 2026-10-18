@@ -448,7 +448,8 @@ const overviewLibraryStatus = (running: boolean, failed: boolean, latestVersion:
   return ''
 }
 
-// 威胁情报库 stat（v2.3.x）：合并生效条数 + 最近版本（各源 version 最大者）。
+// 威胁情报库 stat（v2.3.x）：最近版本（各源 version 最大者）+ 运行状态。
+// total_entries 未展示（「合并生效条数」口径需后端去重统计，当前仅版本可呈现）。
 const threatLatestVersion = ref('')
 const threatRunning = ref(false)
 const threatFailed = ref(false)

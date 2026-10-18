@@ -58,21 +58,23 @@ func utcStringAgo(d time.Duration) string {
 type threatScreenPayload struct {
 	Code int `json:"code"`
 	Data struct {
-		Hours           int                         `json:"hours"`
-		WindowStart     string                      `json:"window_start"`
-		TotalEvents     int                         `json:"total_events"`
-		BlockedEvents   int                         `json:"blocked_events"`
-		BlockRate       float64                     `json:"block_rate"`
-		RatelimitBlocks float64                     `json:"ratelimit_blocks"`
-		ActiveSources   int                         `json:"active_sources"`
-		Countries       map[string]int              `json:"countries"`
-		ChinaProvinces  map[string]int              `json:"china_provinces"`
-		TopCountries    []models.SecurityAttackType `json:"top_countries"`
-		TopAttackTypes  []models.SecurityAttackType `json:"top_attack_types"`
-		TopRules        []models.SecurityAttackType `json:"top_rules"`
-		HourlyHist      []models.SecurityAttackType `json:"hourly_hist"`
-		AttackTypeShare []models.SecurityAttackType `json:"attack_type_share"`
-		RecentRate      float64                     `json:"recent_rate"`
+		Hours              int                         `json:"hours"`
+		WindowStart        string                      `json:"window_start"`
+		RollupCoverageFrom string                      `json:"rollup_coverage_from"`
+		BackfillIncomplete bool                        `json:"backfill_incomplete"`
+		TotalEvents        int                         `json:"total_events"`
+		BlockedEvents      int                         `json:"blocked_events"`
+		BlockRate          float64                     `json:"block_rate"`
+		RatelimitBlocks    float64                     `json:"ratelimit_blocks"`
+		ActiveSources      int                         `json:"active_sources"`
+		Countries          map[string]int              `json:"countries"`
+		ChinaProvinces     map[string]int              `json:"china_provinces"`
+		TopCountries       []models.SecurityAttackType `json:"top_countries"`
+		TopAttackTypes     []models.SecurityAttackType `json:"top_attack_types"`
+		TopRules           []models.SecurityAttackType `json:"top_rules"`
+		HourlyHist         []models.SecurityAttackType `json:"hourly_hist"`
+		AttackTypeShare    []models.SecurityAttackType `json:"attack_type_share"`
+		RecentRate         float64                     `json:"recent_rate"`
 		// v2.4.x 大屏加固：logged=total-blocked（夹 >=0）、限流可用性位、
 		// 被攻击目标 Top5（name/domain/value）
 		LoggedEvents       int  `json:"logged_events"`
@@ -331,9 +333,36 @@ func TestGetSecurityThreatScreen_metricsDBNilReturnsZeroShape(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &raw); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"rollup_ready", "rollup_stale", "rollup_last_success", "logged_events", "ratelimit_available", "top_rules", "top_targets", "hourly_hist", "attack_type_share", "recent_rate"} {
+	for _, key := range []string{"rollup_ready", "rollup_stale", "rollup_last_success", "rollup_coverage_from", "backfill_incomplete", "logged_events", "ratelimit_available", "top_rules", "top_targets", "hourly_hist", "attack_type_share", "recent_rate"} {
 		if _, ok := raw.Data[key]; !ok {
 			t.Fatalf("zero response missing key %q: %s", key, recorder.Body.String())
+		}
+	}
+}
+
+func TestGetSecurityThreatScreen_recentRateUsesInjectedClock(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	base := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Minute)
+	installThreatClock(t, base)
+	seedThreatScreenEvent(t, base.Add(-time.Minute).Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	response := getRequest(t, router, "/security/overview/threat-screen")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload threatScreenPayload
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Data.RecentRate != 0.2 {
+		t.Fatalf("recent_rate=%v, want 0.2 using threatScreenNow", payload.Data.RecentRate)
+	}
+}
+
+func TestTriggerTypeForRule_legacyTrustAndACL(t *testing.T) {
+	for rule, want := range map[string]string{"3": "信任名单", "5": "IP 访问控制", "12": "信任名单", "2": "IP 访问控制"} {
+		if got := triggerTypeForRule(rule); got != want {
+			t.Fatalf("triggerTypeForRule(%q)=%q, want %q", rule, got, want)
 		}
 	}
 }
@@ -1412,9 +1441,13 @@ func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
 		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 			t.Fatal(err)
 		}
+		if i == 0 && (!payload.Data.BackfillIncomplete || payload.Data.RollupCoverageFrom == "") {
+			t.Fatalf("首轮 72h 回填必须披露部分覆盖: coverage=%q incomplete=%v", payload.Data.RollupCoverageFrom, payload.Data.BackfillIncomplete)
+		}
 	}
-
-	// Then: 24h 日桶——ceil(72/24)=3 槽、名称 MM-DD、末槽=今天
+	if payload.Data.BackfillIncomplete || payload.Data.RollupCoverageFrom == "" {
+		t.Fatalf("续做回填后披露状态失真: coverage=%q incomplete=%v", payload.Data.RollupCoverageFrom, payload.Data.BackfillIncomplete)
+	}
 	hist := payload.Data.HourlyHist
 	if len(hist) != 3 {
 		t.Fatalf("hourly_hist=%d 槽, want 3（ceil(72/24) 日桶）", len(hist))
@@ -1452,5 +1485,171 @@ func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
 	}
 	if len(payload.Data.HourlyHist) != 30 {
 		t.Fatalf("hours=720 hourly_hist=%d 槽, want 30（日桶上限）", len(payload.Data.HourlyHist))
+	}
+}
+
+// 历史问题-1（历史）：停机/升级积压事件若落在 rollup 已覆盖分钟（warmer 首轮
+// 先于摄取首 pass 推进水位），超过 repair 窗口后原实现再无重固入口 → 大屏
+// 永久少计。ThreatRollupRewindTo（摄取提交钩子）把覆盖水位回退到插入分钟前，
+// 下一次固化重算该段。
+func TestThreatRollup_ingestBackfillRewindsCoverage(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	base := time.Date(2026, 10, 18, 12, 0, 30, 0, time.UTC)
+	installThreatClock(t, base)
+
+	// Given 一条 30 分钟前的积压事件（远在 threatRollupRepairMinutes=10 之外）
+	eventTime := base.Add(-30 * time.Minute)
+	eventMinute := eventTime.Format("2006-01-02 15:04")
+	seedThreatScreenEvent(t, eventTime.Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
+
+	// 且 warmer 已宣称整窗已覆盖（coveredFrom=24h 前、lastFixed=上一完整分钟），
+	// 目标维度就绪与归属地代际已就绪（否则 emptyCoverage 会全窗重固，掩盖前提）。
+	lastComplete := base.Add(-time.Minute).Truncate(time.Minute)
+	for key, value := range map[string]string{
+		threatRollupCoveredFromKey:     base.Add(-24 * time.Hour).Format("2006-01-02 15:04"),
+		threatRollupWatermarkKey:       lastComplete.Add(-time.Minute).Format("2006-01-02 15:04"),
+		threatRollupTargetReadyKey:     lastComplete.Format("2006-01-02 15:04"),
+		threatRollupGeoIPGenerationKey: fmt.Sprintf("%d", services.GeoIPDataGeneration()),
+	} {
+		if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 前提确认：未回退前，该分钟被宣称已覆盖且 repair 窗口触不到 → 0。
+	if err := ensureThreatRollup(24); err != nil {
+		t.Fatalf("ensure rollup: %v", err)
+	}
+	if got := threatRollupCountForMinute(t, eventMinute); got != 0 {
+		t.Fatalf("前提失效：未回退时积压分钟 count=%d, want 0（事件在 repair 窗口外）", got)
+	}
+
+	// When 摄取提交钩子回退水位到插入分钟前
+	ThreatRollupRewindTo(eventTime)
+	if got := threatRollupWatermarkForTest(t); got != base.Add(-31*time.Minute).Format("2006-01-02 15:04") {
+		t.Fatalf("watermark=%q, want %q（回退到插入分钟前一分钟）", got,
+			base.Add(-31*time.Minute).Format("2006-01-02 15:04"))
+	}
+
+	// Then 下一次固化重算该段，积压事件进入 rollup
+	if err := ensureThreatRollup(24); err != nil {
+		t.Fatalf("ensure rollup after rewind: %v", err)
+	}
+	if got := threatRollupCountForMinute(t, eventMinute); got != 1 {
+		t.Fatalf("回退后积压分钟 count=%d, want 1（大屏永久少计回归）", got)
+	}
+	// 已覆盖区间仍连续：水位回到最新完整分钟
+	if got := threatRollupWatermarkForTest(t); got != lastComplete.Add(-time.Minute).Format("2006-01-02 15:04") {
+		t.Fatalf("回退重算后 watermark=%q, want %q", got, lastComplete.Add(-time.Minute).Format("2006-01-02 15:04"))
+	}
+}
+
+func TestThreatRollupRewindTo_lockContentionReturnsAndClampsWindow(t *testing.T) {
+	t.Run("lock contention returns promptly and pending rewind drains", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		base := time.Date(2026, 10, 18, 12, 0, 30, 0, time.UTC)
+		installThreatClock(t, base)
+		lastComplete := base.Add(-time.Minute).Truncate(time.Minute)
+		for key, value := range map[string]string{
+			threatRollupCoveredFromKey: base.Add(-24 * time.Hour).Format("2006-01-02 15:04"),
+			threatRollupWatermarkKey:   lastComplete.Add(-time.Minute).Format("2006-01-02 15:04"),
+		} {
+			if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key,value) VALUES (?,?)`, key, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		threatRollupMu.Lock()
+		done := make(chan struct{})
+		go func() {
+			ThreatRollupRewindTo(base.Add(-30 * time.Minute))
+			close(done)
+		}()
+		returned := false
+		select {
+		case <-done:
+			returned = true
+		case <-time.After(150 * time.Millisecond):
+		}
+		threatRollupMu.Unlock()
+		if !returned {
+			<-done
+			t.Fatal("rollup rewind must not block ingest behind a long warmer batch")
+		}
+		if err := ensureThreatRollup(24); err != nil {
+			t.Fatal(err)
+		}
+		if got := threatRollupWatermarkForTest(t); got != lastComplete.Add(-time.Minute).Format("2006-01-02 15:04") {
+			t.Fatalf("drained watermark=%q, want repaired latest minute", got)
+		}
+	})
+
+	t.Run("out of window rewind is clamped", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		base := time.Date(2026, 10, 18, 12, 0, 30, 0, time.UTC)
+		installThreatClock(t, base)
+		threatRollupRequestedHours.Store(0)
+		t.Cleanup(func() { threatRollupRequestedHours.Store(0) })
+		lastComplete := base.Add(-time.Minute).Truncate(time.Minute)
+		dFrom := lastComplete.Add(-24 * time.Hour)
+		if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key,value) VALUES (?,?)`, threatRollupWatermarkKey, lastComplete.Add(-time.Minute).Format("2006-01-02 15:04")); err != nil {
+			t.Fatal(err)
+		}
+		ThreatRollupRewindTo(base.Add(-48 * time.Hour))
+		if got, want := threatRollupWatermarkForTest(t), dFrom.Add(-time.Minute).Format("2006-01-02 15:04"); got != want {
+			t.Fatalf("clamped watermark=%q, want %q", got, want)
+		}
+	})
+}
+
+func TestThreatFixMinute_prunedRowsAndLateEventsAreAdditive(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	base := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	minute := base.Truncate(time.Minute)
+	eventTime := minute.Format("2006-01-02 15:04:05")
+	seedThreatScreenEvent(t, eventTime, "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, eventTime, "203.0.113.8", "941100", "XSS", "blocked")
+	tx, err := db.MetricsDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := threatFixMinute(tx, minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.MetricsDB.Exec(`DELETE FROM security_events WHERE rule_triggered='942100'`); err != nil {
+		t.Fatal(err)
+	}
+	seedThreatScreenEvent(t, eventTime, "203.0.113.9", "930100", "LFI", "blocked")
+
+	tx, err = db.MetricsDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := threatFixMinute(tx, minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	families := map[string]int{}
+	rows, err := db.MetricsDB.Query(`SELECT family, SUM(count) FROM security_event_rollup WHERE minute=? GROUP BY family`, minute.Format("2006-01-02 15:04"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	total := 0
+	for rows.Next() {
+		var family string
+		var count int
+		if err := rows.Scan(&family, &count); err != nil {
+			t.Fatal(err)
+		}
+		families[family] = count
+		total += count
+	}
+	if total != 3 || len(families) != 3 {
+		t.Fatalf("rollup after prune+late=(total %d, families %v), want 3 distinct families", total, families)
 	}
 }

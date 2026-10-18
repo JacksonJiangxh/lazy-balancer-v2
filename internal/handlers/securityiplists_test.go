@@ -32,6 +32,9 @@ func newIPListRouter(t *testing.T) *gin.Engine {
 	router.POST("/security/ip-lists/:id/remove-ip", h.RemoveIPFromList)
 	router.POST("/security/policies", h.CreateSecurityPolicy)
 	router.PUT("/security/policies/:id", h.UpdateSecurityPolicy)
+	router.DELETE("/security/policies/:id", h.DeleteSecurityPolicy)
+	router.PUT("/security/block-pages/:id", h.UpdateSecurityBlockPage)
+	router.DELETE("/security/block-pages/:id", h.DeleteSecurityBlockPage)
 	router.GET("/security/policies/:id", h.GetSecurityPolicy)
 	router.GET("/security/policies", h.ListSecurityPolicies)
 	return router
@@ -48,6 +51,89 @@ func seedIPListRow(t *testing.T, name, entriesJSON string) int64 {
 		t.Fatal(err)
 	}
 	return id
+}
+
+func TestSecurityPolicyRefs_createAndUpdatePersistDedupedJSON(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newIPListRouter(t)
+	listID := seedIPListRow(t, "refs-dedupe", `[{"value":"203.0.113.1"}]`)
+	refs := fmt.Sprintf("[%d,%d,%d]", listID, listID, listID)
+	response := postJSON(t, router, "/security/policies", map[string]any{
+		"name": "refs-dedupe-policy", "mode": "off", "ip_acl_enabled": true, "ip_acl_mode": "deny", "ip_acl_list_refs": refs,
+	})
+	if response.Code != http.StatusOK && response.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", response.Code, response.Body.String())
+	}
+	var policyID int
+	var stored string
+	if err := db.DB.QueryRow(`SELECT id, ip_acl_list_refs FROM security_policies WHERE name='refs-dedupe-policy'`).Scan(&policyID, &stored); err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("[%d]", listID)
+	if stored != want {
+		t.Fatalf("create stored refs=%s, want %s", stored, want)
+	}
+	response = putJSON(t, router, fmt.Sprintf("/security/policies/%d", policyID), map[string]any{"ip_acl_list_refs": refs})
+	if response.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", response.Code, response.Body.String())
+	}
+	if err := db.DB.QueryRow(`SELECT ip_acl_list_refs FROM security_policies WHERE id=?`, policyID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != want {
+		t.Fatalf("update stored refs=%s, want %s", stored, want)
+	}
+}
+
+func TestSecurityWriteEndpoints_rejectNoncanonicalNumericIDs(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   map[string]any
+		seed   string
+		count  string
+	}{
+		{name: "update block page", method: http.MethodPut, path: "/security/block-pages/", body: map[string]any{"name": "page", "content": "changed"}, seed: `INSERT INTO security_block_pages (id,name,content,is_default,is_builtin) VALUES (5,'page','original',0,0)`, count: `SELECT COUNT(*) FROM security_block_pages WHERE id=5 AND content='original'`},
+		{name: "delete block page", method: http.MethodDelete, path: "/security/block-pages/", seed: `INSERT INTO security_block_pages (id,name,content,is_default,is_builtin) VALUES (5,'page','original',0,0)`, count: `SELECT COUNT(*) FROM security_block_pages WHERE id=5`},
+		{name: "delete policy", method: http.MethodDelete, path: "/security/policies/", seed: `INSERT INTO security_policies (id,name,mode,enabled) VALUES (5,'policy','off',1)`, count: `SELECT COUNT(*) FROM security_policies WHERE id=5`},
+		{name: "add IP", method: http.MethodPost, path: "/security/ip-lists/", body: map[string]any{"value": "203.0.113.8"}, seed: `INSERT INTO security_ip_lists (id,name,entries) VALUES (5,'list','[]')`, count: `SELECT COUNT(*) FROM security_ip_lists WHERE id=5 AND entries='[]'`},
+		{name: "update IP list", method: http.MethodPut, path: "/security/ip-lists/", body: map[string]any{"description": "changed"}, seed: `INSERT INTO security_ip_lists (id,name,entries,description) VALUES (5,'list','[]','original')`, count: `SELECT COUNT(*) FROM security_ip_lists WHERE id=5 AND description='original'`},
+	}
+	for _, tc := range cases {
+		for _, id := range []string{"5.0", "not-a-number"} {
+			t.Run(tc.name+"/"+id, func(t *testing.T) {
+				setupSecurityPolicyTestDB(t)
+				router := newIPListRouter(t)
+				if _, err := db.DB.Exec(tc.seed); err != nil {
+					t.Fatal(err)
+				}
+				path := tc.path + id
+				if tc.name == "add IP" {
+					path += "/ips"
+				}
+				var response *httptest.ResponseRecorder
+				switch tc.method {
+				case http.MethodPut:
+					response = putJSON(t, router, path, tc.body)
+				case http.MethodPost:
+					response = postJSON(t, router, path, tc.body)
+				default:
+					response = deleteRequest(t, router, path)
+				}
+				if response.Code != http.StatusBadRequest {
+					t.Fatalf("%s %s status=%d body=%s, want 400", tc.method, path, response.Code, response.Body.String())
+				}
+				var unchanged int
+				if err := db.DB.QueryRow(tc.count).Scan(&unchanged); err != nil {
+					t.Fatal(err)
+				}
+				if unchanged != 1 {
+					t.Fatal("invalid id must not mutate the addressed row")
+				}
+			})
+		}
+	}
 }
 
 func TestCreateIPList_validationMatrix(t *testing.T) {
@@ -523,7 +609,7 @@ func policyPayloadAllow(name string, inline string, refIDs ...int64) map[string]
 		refs = "[" + strings.Join(parts, ",") + "]"
 	}
 	return map[string]any{
-		"name": name, "mode": "blocking", "ip_acl_enabled": true, "ip_acl_mode": "allow",
+		"name": name, "policy_type": "stage1", "mode": "blocking", "ip_acl_enabled": true, "ip_acl_mode": "allow",
 		"ip_acl_list": inline, "ip_acl_list_refs": refs,
 	}
 }
