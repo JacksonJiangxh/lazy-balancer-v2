@@ -398,7 +398,9 @@ func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string]
 	// 双规则）的纯域名键覆盖序此前依赖 SQLite 未定义返回序，注释却宣称「后
 	// 创建规则覆盖(创建序)」。id 升序 + 顺序赋值 = 较高 id（较新创建）最终覆盖；
 	// MapHost 对 host:port 精确键仍优先。
-	rows, err := db.DB.Query(`SELECT caddy_id, COALESCE(domain,''), COALESCE(name,''), listen_port FROM lb_rules WHERE protocol='http' AND COALESCE(domain,'') != '' ORDER BY id ASC`)
+	// enabled 升序让启用规则最后赋值（覆盖禁用重名规则），再按 id 升序保留
+	// 「较新创建覆盖」的既有口径（历史 历史问题-08）。
+	rows, err := db.DB.Query(`SELECT caddy_id, COALESCE(domain,''), COALESCE(name,''), listen_port FROM lb_rules WHERE protocol='http' AND COALESCE(domain,'') != '' ORDER BY COALESCE(enabled,0) ASC, id ASC`)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("security events: load rules: %w", err)
 	}
@@ -1291,6 +1293,9 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	// 同一事务重复行/轮转补采重叠/offset 重放的 INSERT OR IGNORE 忽略行
 	// 不计入（历史问题），与自动封禁喂入口径同源（历史问题）。
 	passInsertedTotal := 0
+	// batchInserted 当前未提交事务内实际插入数；仅在 commit 成功后并入
+	// passInsertedTotal。回滚/提交失败的行不得计入任务日志（历史 历史问题-4）。
+	batchInserted := 0
 	// 历史问题-08：任何返回路径都回填本 pass 实际插入数——补采（归档/活文件尾部）
 	// 的 delta 摄取同样产生 lastIngested，供任务日志「摄取 N 条」消费。
 	defer func() { t.lastIngested = passInsertedTotal }()
@@ -1305,6 +1310,8 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		passInsertedTotal += batchInserted
+		batchInserted = 0
 		autobanObserveBatch(autobanBatch)
 		autobanBatch = nil
 		notifySecurityEventsRollupRewrite(batchOldestMinute)
@@ -1471,8 +1478,9 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 				return committedOffset, fmt.Errorf("security events: insert result: %w", aerr)
 			}
 			if affected == 1 {
-				autobanBatch = append(autobanBatch, autobanFeedItem{IP: rec.ClientIP, Action: rec.Action, RuleTriggered: rec.RuleTriggered})
-				passInsertedTotal++
+				eventAt, _ := time.ParseInLocation("2006-01-02 15:04:05", rec.EventTime, time.UTC)
+				autobanBatch = append(autobanBatch, autobanFeedItem{IP: rec.ClientIP, Action: rec.Action, RuleTriggered: rec.RuleTriggered, At: eventAt})
+				batchInserted++
 				// 历史问题-1：记录本批最旧插入分钟（event_time 恒 UTC 墙钟串；
 				// 解析失败跳过——仅影响回退精度，不影响摄取）。
 				if et, terr := time.ParseInLocation("2006-01-02 15:04:05", rec.EventTime, time.UTC); terr == nil {

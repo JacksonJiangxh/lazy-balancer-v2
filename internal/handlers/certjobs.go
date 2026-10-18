@@ -606,6 +606,10 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 			} else if n, _ := res.RowsAffected(); n == 0 {
 				deleteErr = errors.Join(deleteErr, fmt.Errorf("任务 %d 已被并发移离 disabled，恢复已跳过", id))
 			}
+		} else if status == "disabled" {
+			// disabled 是唯一「删除不受规则启用门守卫」的终态；删除失败时
+			// 行必须保持 disabled（原本已退役），不得改写成 failed 制造幽灵
+			// 失败行并触发额外签发（历史 B1-历史问题）。
 		} else {
 			qm := services.GetCAQueueManager()
 			var restoreErr error

@@ -723,8 +723,9 @@ const handleSave = async () => {
         type: 'warning',
       })
     }
-    await request.put('/config', payload)
-    mfaAwareSuccess('保存成功')
+    const saveResp = await request.put('/config', payload)
+    const saveMessage = (saveResp as unknown as { message?: string }).message ?? ''
+    mfaAwareSuccess(saveMessage.includes('配置无变化') ? saveMessage : '保存成功')
     emit('save')
   } catch (error) {
     if (error !== 'cancel' && error !== 'close') {

@@ -66,7 +66,7 @@ test('历史问题-8：只读态隐藏迁移入口并保留函数级守卫', () 
   const open = text.indexOf('const openMigrateDialog')
   const submit = text.indexOf('const submitMigrate')
   assert.match(text.slice(open, submit), /if \(isReadOnly\.value\) return/)
-  assert.match(text.slice(submit, text.indexOf('// ── 混合策略只读查看', submit)), /if \(isReadOnly\.value\) return/)
+  assert.match(text.slice(submit, text.indexOf('// ── 混合策略只读查看', submit)), /if \(isReadOnly\.value \|\| migrateSaving\.value\) return/)
 })
 
 test('历史问题-9：关联规则与预览步骤同样补齐引用名单条目', () => {

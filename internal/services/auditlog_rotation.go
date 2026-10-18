@@ -323,6 +323,13 @@ func copyAuditLogTo(src, dst string) error {
 		_ = os.Remove(tmp)
 		return err
 	}
+	// 归档必须在 truncate 活文件前真正落盘：否则掉电后 .1 可能为空/半截，
+	// pending 标记无从补采（历史 历史问题-1）。
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
 	if err := out.Close(); err != nil {
 		_ = os.Remove(tmp)
 		return err
@@ -331,7 +338,7 @@ func copyAuditLogTo(src, dst string) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return nil
+	return syncParentDir(dst)
 }
 
 func auditLogBaseName() string {

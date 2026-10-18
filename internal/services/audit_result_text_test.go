@@ -88,6 +88,55 @@ func TestAuditResultText_literalArgsCovered(t *testing.T) {
 	t.Fatalf("AuditResultPart 字面量结果码缺中文映射（请在 auditResultTextMap 补齐）:\n%s", b.String())
 }
 
+// 动态实参（变量/表达式）不在字面量扫描范围；新增动态入口必须同步审查
+// 其取值域。这里钉住当前动态调用点数量：新增即红，强制补映射/白名单。
+func TestAuditResultText_dynamicCallSitesTripwire(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", "..", "internal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dynamic := 0
+	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		fset := token.NewFileSet()
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			t.Errorf("parse %s: %v", path, perr)
+			return nil
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			var name string
+			switch fn := call.Fun.(type) {
+			case *ast.SelectorExpr:
+				name = fn.Sel.Name
+			case *ast.Ident:
+				name = fn.Name
+			}
+			if name != "AuditResultPart" || len(call.Args) == 0 {
+				return true
+			}
+			if _, ok := call.Args[0].(*ast.BasicLit); !ok {
+				dynamic++
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = 9
+	if dynamic != want {
+		t.Fatalf("AuditResultPart 动态调用点=%d，want %d：新增动态入口必须审查取值域并更新本绊线", dynamic, want)
+	}
+}
+
 func TestAuditResultText_ticketFailureCodes(t *testing.T) {
 	for _, code := range []string{"invalid_ticket", "invalid_signature", "expired", "replay", "user_unavailable", "database_error"} {
 		if got := AuditResultText(code); got == code || got == "" {

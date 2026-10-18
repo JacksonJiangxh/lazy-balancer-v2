@@ -13,7 +13,7 @@ import { COUNTRY_CENTROIDS, FALLBACK_CENTROID } from '@/utils/countryCentroids'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { loadAdmin1Tables, loadedAdmin1Tables } from '@/utils/admin1Loader'
-import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, adminShortName, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed } from '@/utils/threatShared'
+import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, adminShortName, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed, DOT_LAND, arcOriginForLocation } from '@/utils/threatShared'
 import type { ThreatScene, ThreatSceneOptions, CountryHeat } from '@/utils/threatScene'
 import { FLOW_ATTACK_ARC_COLORS, FLOW_NORMAL_ARC_COLORS, FLOW_FLIGHT_MS, flowArcLabel, flowAttackWidth, flowNormalWidth } from '@/utils/threatTheme'
 
@@ -95,8 +95,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   // 点阵间距 0.9°：世界/下钻同源错列网格，在观感接近更密网格的同时
   // 保留 60fps 余量，点径与地图版按各自投影分别校准。
   const DOT_STEP = 0.9
-  // 与地图共用同一基色/不透明度（用户裁定：沿用地图口径）。
-  const DOT_BASE = 'rgb(44,66,96)'
+  // 与地图共用同一基色（threatShared 单源）。
+  const DOT_BASE = DOT_LAND
   // 地图点阵半径随 cam.zoom 放大；球面点径固定屏幕像素会让下钻显得稀。
   // 点阵与 hover 拾取共用 DOT_ALTITUDE 壳层；0.005 的微小抬高避免
   // z-fighting，同时控制球缘视差，不让高亮偏离目标国家。
@@ -176,6 +176,10 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   // （Vue/自研帧循环/hover）原样放行。
   const originalRAF = window.requestAnimationFrame
   const nativeRAF = originalRAF.bind(window)
+  // 本实例补丁状态：重叠实例后装者覆盖前装者时，dispose 只在自己仍是栈顶
+  // 时恢复；否则标记 inactive，由后续栈顶恢复后经本补丁转发到 prev
+  //（历史 历史问题-6，原实现会让补丁永久残留）。
+  const rafPatch = { active: true, prev: originalRAF }
   const globeCycle = (globe as unknown as { _animationCycle?: FrameRequestCallback })._animationCycle
   // 自适应帧率：静止自动旋转 60fps（用户实测 30fps 自动旋转观感卡顿）；
   // 拖拽/悬停/缩放同样 60fps。保留累计时间预算结构，后续可只改常量
@@ -186,6 +190,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   let lastGlobeFrame = 0
   let frameCredit = 0
   const throttledRAF = (cb: FrameRequestCallback): number => {
+    if (!rafPatch.active) return rafPatch.prev(cb)
     if (cb !== globeCycle) return nativeRAF(cb)
     const run = (t: number): void => {
       if (disposed || paused) return
@@ -761,25 +766,11 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   return {
     addArcForLocation(ipLocation: string, weight = 1): void {
       if (!ipLocation) return
-      const [country, province] = ipLocation.split('·')
-      if (!country) return
-      let from: Centroid = COUNTRY_CENTROIDS[country] ?? FALLBACK_CENTROID
-      if (country === '中国' && province) {
-        const pv = CHINA_PROVINCES.find((x) => x.short === province || x.name === province)
-        if (pv) from = [pv.centroid[0], pv.centroid[1]]
-      }
-      spawnArc(from, false, weight)
+      spawnArc(arcOriginForLocation(ipLocation), false, weight)
     },
     addNormalArcForLocation(ipLocation: string, weight = 1): void {
       if (!ipLocation) return
-      const [country, province] = ipLocation.split('·')
-      if (!country) return
-      let from: Centroid = COUNTRY_CENTROIDS[country] ?? FALLBACK_CENTROID
-      if (country === '中国' && province) {
-        const pv = CHINA_PROVINCES.find((x) => x.short === province || x.name === province)
-        if (pv) from = [pv.centroid[0], pv.centroid[1]]
-      }
-      spawnArc(from, true, weight)
+      spawnArc(arcOriginForLocation(ipLocation), true, weight)
     },
     setCountries(entries: CountryHeat[]): void {
       const nextCounts = aggregateCountryCounts(entries)
@@ -787,8 +778,14 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       countryCounts = nextCounts
       applyHotspots()
       if (!drilledName) {
-        updateDotColors()
-        applyLayer()
+        // 计数变化不改点集/位置：已建层只重算颜色，避免 30s 轮询重建
+        // 1.3 万点 geometry（历史 历史问题-2）。首帧仍需建层。
+        if (!activeDots) {
+          applyLayer()
+        } else {
+          activeCounts = countryCounts
+          updateDotColors()
+        }
       }
     },
     setProvinces(entries: CountryHeat[]): void {
@@ -852,7 +849,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       disposed = true
       // 历史问题-F5：作废在途省界加载（下钻续体在 await 后检查 disposed，双保险）
       drillSeq += 1
-      if (window.requestAnimationFrame === throttledRAF) window.requestAnimationFrame = originalRAF
+      rafPatch.active = false
+      if (window.requestAnimationFrame === throttledRAF) window.requestAnimationFrame = rafPatch.prev
       window.removeEventListener('resize', syncSize)
       ro.disconnect()
       clearInterval(syncTimer)

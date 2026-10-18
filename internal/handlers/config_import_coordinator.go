@@ -109,6 +109,16 @@ const importInFlightDrainTimeout = 30 * time.Second
 // 后到导入在暂停开始前排队。
 var configImportBeginMu sync.Mutex
 
+// configImportBusy 探测导入会话是否持有全局导入锁（不阻塞）：启停/控制
+// 常驻任务在导入期间必须 409，避免绕过 PauseAndDrain（历史 历史问题-03）。
+func configImportBusy() bool {
+	if configImportBeginMu.TryLock() {
+		configImportBeginMu.Unlock()
+		return false
+	}
+	return true
+}
+
 func (h *Handlers) beginConfigImport(ctx context.Context) (*configImportSession, error) {
 	return h.beginConfigImportWithPrelock(ctx, nil)
 }

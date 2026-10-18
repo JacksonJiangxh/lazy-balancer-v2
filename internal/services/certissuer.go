@@ -45,6 +45,10 @@ type issuedCertificate struct {
 
 var deploymentLifecycleJobStatuses = []string{"downloaded", "cleanup_dns", "cleanup_warning"}
 
+// deploymentLifecycleJobStatusSQL 供 SQL IN (...) 复用，避免状态集新增时
+// 多处字面量分叉（历史 D2-历史问题）。
+const deploymentLifecycleJobStatusSQL = "'downloaded','cleanup_dns','cleanup_warning'"
+
 type certificateDeploymentError struct {
 	err error
 }
@@ -226,7 +230,7 @@ func retryCertificateDeployment(ctx context.Context, jobID int, reloader func() 
 func (s *CertIssuer) deploymentFailed(jobID int, material issuedCertificate, message string, err error) error {
 	var previousAttempt int
 	// 历史 历史问题: 使用 QueryRowContext 以响应 worker 取消信号（此处函数无 ctx，用 Background 兜底）。
-	if queryErr := db.DB.QueryRowContext(context.Background(), "SELECT COALESCE(deployment_attempts,0) FROM cert_jobs WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')", jobID).Scan(&previousAttempt); queryErr != nil {
+	if queryErr := db.DB.QueryRowContext(context.Background(), "SELECT COALESCE(deployment_attempts,0) FROM cert_jobs WHERE id=? AND status IN ('issued','downloaded','cleanup_dns','cleanup_warning')", jobID).Scan(&previousAttempt); queryErr != nil {
 		return &certificateDeploymentError{err: errors.Join(err, queryErr)}
 	}
 	if material.deploymentAttempt > previousAttempt {

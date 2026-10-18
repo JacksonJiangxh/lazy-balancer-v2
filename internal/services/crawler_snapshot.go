@@ -234,10 +234,17 @@ func writeCrawlerIPListSnapshotAll(all map[string][]string) error {
 		_ = tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, crawlerIPListFile)
+	if err := os.Rename(tmpPath, crawlerIPListFile); err != nil {
+		return err
+	}
+	return syncParentDir(crawlerIPListFile)
 }
 
 // writeCrawlerIPListSnapshot 单引擎更新后从 DB 重建全量运行快照。

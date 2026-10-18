@@ -954,7 +954,7 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 		// 重试不可能自愈：返回终止类错误，由 run 循环 halt 等待人工介入。
 		// 例外：目标节点已降级为从节点时 requireMaster 同返 403，但令牌仍有效；
 		// 这不是撤销，必须保持可重试，待对方重新升主后自动恢复。
-		if resp.StatusCode == http.StatusForbidden && strings.Contains(string(body), "该操作仅允许在主节点执行") {
+		if resp.StatusCode == http.StatusForbidden && (resp.Header.Get("X-LB-Error-Code") == "master_required" || strings.Contains(string(body), "该操作仅允许在主节点执行")) {
 			return SyncResult{}, newSyncFailure(models.SyncErrorCodeValidationFailed,
 				fmt.Errorf("目标主节点已降级为从节点(%d): %s", resp.StatusCode, strings.TrimSpace(string(body))))
 		}

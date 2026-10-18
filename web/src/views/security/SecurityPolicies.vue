@@ -1208,7 +1208,7 @@ const openMigrateDialog = (row: PolicySummary): void => {
 }
 
 const submitMigrate = async (): Promise<void> => {
-  if (isReadOnly.value) return
+  if (isReadOnly.value || migrateSaving.value) return
   const policy = migratePolicy.value
   if (!policy) return
   migrateSaving.value = true
@@ -2735,6 +2735,7 @@ const openExtractDialog = (side: 'acl' | 'trust'): void => {
 }
 
 const confirmExtract = async (): Promise<void> => {
+  if (extracting.value) return
   const name = extractForm.value.name.trim()
   if (!name) { ElMessage.warning('请输入列表名称'); return }
   if (name.length > 50) { ElMessage.warning('列表名称不能超过 50 字符'); return }
@@ -2905,6 +2906,7 @@ const beforeWizardClose = (done: () => void): void => {
 }
 
 const handleSave = async () => {
+  if (saving.value) return
   if (!form.value.name.trim()) {
     ElMessage.warning('请输入策略名称')
     currentStep.value = WIZARD_STEP.BASIC

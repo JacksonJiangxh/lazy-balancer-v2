@@ -40,7 +40,7 @@
             <span class="form-tip-inline">天</span>
             <el-input-number v-model="seRowCap" :disabled="isReadOnly" :min="1" :max="100000000" :step="100000" controls-position="right" style="width: 170px; margin-left: 10px;" />
             <span class="form-tip-inline">行数上限</span>
-            <div class="form-tip-line">安全事件日志滚动保留：超出保留天数或行数上限时按最旧优先滚动删除。默认 90 天 / 1,000,000 行；高攻击流量部署可按需上调。</div>
+            <div class="form-tip-line">安全事件日志每日清理：超出保留天数或行数上限时按最旧优先删除（行数上限在两次清理之间可能短暂超出）。默认 90 天 / 1,000,000 行；高攻击流量部署可按需上调。</div>
           </el-form-item>
           <el-form-item label="登录过期">
             <el-input-number v-model="settings.jwt_expire_minutes" :disabled="isReadOnly" :min="1" :max="1440" controls-position="right" style="width: 120px;" />
@@ -71,12 +71,16 @@
             <div class="form-tip-line">影响日志时间戳与证书时间；标注夏令时的时区会随夏令时自动偏移；仅 Caddy 日志需重启服务生效</div>
           </el-form-item>
           <el-form-item label="大屏本站坐标">
-            <el-input-number v-model="settings.server_map_lat" :disabled="isReadOnly" :min="-90" :max="90" :step="0.01" :precision="4" controls-position="right" style="width: 130px;" />
-            <span class="form-tip-inline">纬度</span>
-            <el-input-number v-model="settings.server_map_lon" :disabled="isReadOnly" :min="-180" :max="180" :step="0.01" :precision="4" controls-position="right" style="width: 130px; margin-left: 10px;" />
-            <span class="form-tip-inline">经度</span>
-            <el-button :loading="siteDetecting" :disabled="isReadOnly" style="margin-left: 10px" @click="detectSiteLocation">自动检测</el-button>
-            <div class="form-tip-line">威胁大屏地图本站信标坐标；全 0 表示未设置，按地图视觉中心显示。自动检测：出站获取公网 IP 后按本地 GeoIP 库换算经纬度并回填（显式触发，无后台请求）</div>
+            <el-select v-model="siteLocationKey" :disabled="isReadOnly" filterable clearable placeholder="选择省份或国家" style="width: 260px" @change="applySiteLocation">
+              <el-option-group label="中国省份">
+                <el-option v-for="item in CHINA_SITE_CHOICES" :key="item.key" :label="item.label" :value="item.key" />
+              </el-option-group>
+              <el-option-group label="海外国家">
+                <el-option v-for="item in COUNTRY_SITE_CHOICES" :key="item.key" :label="item.label" :value="item.key" />
+              </el-option-group>
+            </el-select>
+            <span class="form-tip-inline">纬度 {{ (settings.server_map_lat ?? 0).toFixed(4) }} · 经度 {{ (settings.server_map_lon ?? 0).toFixed(4) }}</span>
+            <div class="form-tip-line">威胁大屏地图本站信标坐标；选择中国省份或海外国家后自动换算经纬度。未选择表示未设置，按地图视觉中心显示。</div>
           </el-form-item>
           <el-form-item label="大屏视觉模式">
             <el-radio-group v-model="threatScreenMode" :disabled="isReadOnly">
@@ -140,7 +144,7 @@
             <span class="form-tip-inline">查看 Lazy Balancer 自身运行日志</span>
           </el-form-item>
           <el-form-item>
-            <el-button type="primary" :loading="saving" :disabled="isReadOnly" @click="handleSave">
+            <el-button type="primary" :loading="saving" :disabled="isReadOnly || !props.configLoaded" @click="handleSave">
               <el-icon><Check /></el-icon>
               <span class="btn-text">保存</span>
             </el-button>
@@ -446,7 +450,7 @@
         <el-button type="primary" plain :loading="autoBackupRunning" :disabled="!autoBackupSectionsValid" title="按已保存的自动备份设置执行一次备份；上方表单改动需先保存设置" @click="runAutoBackupNow">
           立即备份
         </el-button>
-        <el-button type="primary" :loading="autoBackupSaving" :disabled="!autoBackupSectionsValid" @click="saveAutoBackupSettings">
+        <el-button type="primary" :loading="autoBackupSaving" :disabled="!autoBackupSectionsValid || !autoBackupLoaded || autoBackupLoading" @click="saveAutoBackupSettings">
           保存设置
         </el-button>
       </template>
@@ -474,12 +478,12 @@
 import { computed, h, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { APIResponse } from '@/types'
-import { request, mfaAwareSuccess, formatBytes, ApiRequestError } from '@/utils/api'
+import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
 import { restartServiceWithFeedback } from '@/utils/restart'
 import { formatDate } from '@/utils/date'
 import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
 import { displaySecurityEventsRowCap } from '@/utils/configValues'
+import { CHINA_SITE_CHOICES, COUNTRY_SITE_CHOICES, coordsForSiteLocation, nearestSiteLocation } from '@/utils/siteLocation'
 import { Setting, InfoFilled, Check, View, Upload, Download, Timer, Lock, Document } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import type { SystemInfo } from '@/types'
@@ -657,6 +661,9 @@ interface AutoBackupSettingsResponse {
 
 const autoBackupVisible = ref(false)
 const autoBackupLoading = ref(false)
+// 读取失败/未完成时表单仍是默认值（enabled=false、daily/03:00/keep 7），
+// 此时允许保存会用默认值覆盖服务端配置（历史 历史问题-2）。
+const autoBackupLoaded = ref(false)
 const autoBackupSaving = ref(false)
 const autoBackupRunning = ref(false)
 const autoBackupForm = ref({ enabled: false, frequency: 'daily', time: '03:00', day: 1, keep: 7 })
@@ -733,7 +740,10 @@ const openAutoBackupDialog = (): void => {
 }
 
 const fetchAutoBackup = async (quiet = false): Promise<void> => {
-  if (!quiet) autoBackupLoading.value = true
+  if (!quiet) {
+    autoBackupLoading.value = true
+    autoBackupLoaded.value = false
+  }
   try {
     const res = await request.get<{ data: AutoBackupSettingsResponse }>('/settings/auto-backup', { silent: true })
     const d = res.data
@@ -753,8 +763,10 @@ const fetchAutoBackup = async (quiet = false): Promise<void> => {
     // last_run 是调度水位线（off→on=now），不是执行事实；「上次成功备份」
     // 只认最近一次 success 行（last_success_at）——否则启用后即谎报「刚刚」。
     autoBackupLastRun.value = d.last_success_at ?? null
+    autoBackupLoaded.value = true
   } catch {
-    // silent：打开弹框时拉取失败保持空态，全局拦截器已提示
+    // silent 模式全局拦截器不会提示：显式告知并保持保存禁用，避免默认值覆盖。
+    ElMessage.error('自动备份设置读取失败，请关闭弹框后重试；读取完成前无法保存')
   } finally {
     if (!quiet) autoBackupLoading.value = false
   }
@@ -772,6 +784,10 @@ const toggleAutoBackupSection = (key: string): void => {
 
 const saveAutoBackupSettings = async (): Promise<boolean> => {
   if (!autoBackupSectionsValid.value || autoBackupSaving.value) return false
+  if (!autoBackupLoaded.value || autoBackupLoading.value) {
+    ElMessage.warning('自动备份设置尚未加载完成，暂不能保存')
+    return false
+  }
   autoBackupSaving.value = true
   try {
     await request.put('/settings/auto-backup', { ...autoBackupForm.value, sections: autoBackupSections.value })
@@ -1232,6 +1248,8 @@ const mfaScopeGroups = [
 ]
 
 const settings = defineModel<BasicSettingsConfig>('settings', { required: true })
+// 父级 /config 加载完成前禁止保存：表单此刻仍是默认值（历史 历史问题-1）。
+const props = defineProps<{ configLoaded: boolean }>()
 const emit = defineEmits<{
   (e: 'save'): void
 }>()
@@ -1282,9 +1300,36 @@ const clearGithubToken = () => {
 }
 
 const saving = ref(false)
-// 大屏本站坐标「自动检测」（v4）：显式触发出站探测，成功回填表单坐标字段；
-// 失败走友好错误提示，不打断手动填写路径。
-const siteDetecting = ref(false)
+// 大屏本站坐标：地点选择（中国城市/海外国家）→ 经纬度；替代按公网 IP
+// 归属地自动检测（常落到省会/国家质心，无法精确到城市）。
+const siteLocationKey = ref('')
+const applySiteLocation = (key: string): void => {
+  if (!key) {
+    settings.value.server_map_lat = 0
+    settings.value.server_map_lon = 0
+    return
+  }
+  const coords = coordsForSiteLocation(key)
+  if (!coords) {
+    ElMessage.error('地点数据缺失，请重新选择')
+    siteLocationKey.value = nearestSiteLocation(settings.value.server_map_lat ?? 0, settings.value.server_map_lon ?? 0)
+    return
+  }
+  settings.value.server_map_lat = coords.lat
+  settings.value.server_map_lon = coords.lon
+}
+watch(
+  () => [settings.value.server_map_lat, settings.value.server_map_lon] as const,
+  ([lat, lon]) => {
+    const nearest = nearestSiteLocation(lat ?? 0, lon ?? 0)
+    // 已有坐标回显最近地点；用户刚选择的地点坐标一致时不会被覆盖。
+    if (nearest && siteLocationKey.value !== nearest && coordsForSiteLocation(siteLocationKey.value)?.lat !== lat) {
+      siteLocationKey.value = nearest
+    }
+    if (!nearest) siteLocationKey.value = ''
+  },
+  { immediate: true },
+)
 // v2.3.8 威胁大屏中央视觉模式（map/globe）：独立持有，父组件配置装载后经
 // watch 同步（settings 为父级响应式对象）
 const threatScreenMode = ref<'map' | 'globe'>('map')
@@ -1301,24 +1346,6 @@ watch(() => [settings.value.security_events_retention_days, settings.value.secur
 watch(() => settings.value.threat_traffic_sample_n, (v) => {
   trafficSampleN.value = normalizeTrafficSampleN(v)
 }, { immediate: true })
-async function detectSiteLocation(): Promise<void> {
-  if (siteDetecting.value) return
-  siteDetecting.value = true
-  try {
-    const res = await request.post<APIResponse<{ ip: string; location: string; lat: number; lon: number }>>('/security/overview/threat-screen/site-detect')
-    const data = res.data
-    if (!data) throw new Error('响应缺失')
-    settings.value.server_map_lat = Number(data.lat.toFixed(4))
-    settings.value.server_map_lon = Number(data.lon.toFixed(4))
-    mfaAwareSuccess(`已检测本站位置：${data.location}（${data.ip}），保存后生效`)
-  } catch (error: unknown) {
-    const message = error instanceof ApiRequestError ? error.message : '自动检测失败（离线或超时），请手动填写坐标'
-    ElMessage.error(message)
-  } finally {
-    siteDetecting.value = false
-  }
-}
-
 const adminTls = ref({ enabled: false, mode: 'selfsigned' })
 const adminTlsSaved = ref({ enabled: false, mode: 'selfsigned' })
 const adminTlsHasCert = ref(false)
@@ -1483,6 +1510,10 @@ const handleRestart = async () => {
 }
 
 const handleSave = async () => {
+  if (!props.configLoaded) {
+    ElMessage.warning('配置尚未加载完成，暂不能保存')
+    return
+  }
   if (isReadOnly.value) return
   if (saving.value) return
   const tlsPending = adminTlsDirty.value
@@ -1535,7 +1566,7 @@ const handleSave = async () => {
         type: 'warning',
       })
     }
-    await request.put('/config', payload)
+    const saveResp = await request.put('/config', payload)
     // 保存成功后同步令牌显隐态：清除→has_github_token=false；覆盖→置 true 并清空输入框
     if (githubTokenClearPending.value) {
       settings.value.has_github_token = false
@@ -1560,7 +1591,8 @@ const handleSave = async () => {
       stagedAdminTlsCert.value = null
       notifyTlsRestarting(adminTls.value.enabled)
     } else {
-      mfaAwareSuccess('保存成功')
+      const message = (saveResp as unknown as { message?: string }).message ?? ''
+      mfaAwareSuccess(message.includes('配置无变化') ? message : '保存成功')
     }
     emit('save')
   } catch (error) {

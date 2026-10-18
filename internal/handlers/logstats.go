@@ -61,6 +61,12 @@ func isTimberjackRotationCopy(name string) bool {
 }
 
 func dirBytes(path string) (int64, int64, int) {
+	return dirBytesWithEntries(path, nil)
+}
+
+// dirBytesWithEntries 与 dirBytes 同口径；entries 非 nil 时复用同目录的一次
+// ReadDir 结果（GetLogStats 批量任务行不再逐任务枚举整个目录）。
+func dirBytesWithEntries(path string, entries []os.DirEntry) (int64, int64, int) {
 	var active, rotated int64
 	count := 0
 	if st, err := os.Stat(path); err == nil && !st.IsDir() {
@@ -72,7 +78,7 @@ func dirBytes(path string) (int64, int64, int) {
 			count++
 		}
 	}
-	rotBytes, rotCount := timestampedRotationStats(path)
+	rotBytes, rotCount := timestampedRotationStatsWithEntries(path, entries)
 	rotated += rotBytes
 	count += rotCount
 	return active, rotated, count
@@ -83,6 +89,10 @@ func dirBytes(path string) (int64, int64, int) {
 // 「已归档 N/M 份」展示。(历史问题-1:计数弱化版 timestampedRotations/mustSecond
 // 生产零调用,已删。)
 func timestampedRotationStats(path string) (int64, int) {
+	return timestampedRotationStatsWithEntries(path, nil)
+}
+
+func timestampedRotationStatsWithEntries(path string, entries []os.DirEntry) (int64, int) {
 	dir := filepath.Dir(path)
 	// Sys-N1 根因(历史):运行日志 path=/app/logs/lazy-balancer.log,
 	// TrimSuffix 去 .log 后 base=lazy-balancer,而轮转副本实际是
@@ -92,9 +102,12 @@ func timestampedRotationStats(path string) (int64, int) {
 	// 故两种 base 各算一次:扩展 base 匹配运行日志族,去 ext base 匹配 timberjack。
 	base := filepath.Base(path)
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return 0, 0
+	if entries == nil {
+		var err error
+		entries, err = os.ReadDir(dir)
+		if err != nil {
+			return 0, 0
+		}
 	}
 	var total int64
 	var cnt int
@@ -619,6 +632,18 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		}
 		return services.CertJobLogPath(ruleID), nil
 	}
+	taskDirEntries := map[string][]os.DirEntry{}
+	readTaskDir := func(dir string) []os.DirEntry {
+		if entries, ok := taskDirEntries[dir]; ok {
+			return entries
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			entries = nil
+		}
+		taskDirEntries[dir] = entries
+		return entries
+	}
 	for _, task := range services.CollectSystemTasks() {
 		key := "task:" + task.ID
 		if !want(key) {
@@ -636,7 +661,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		if strings.HasPrefix(task.ID, "cert-job:") {
 			keep = 5
 		}
-		active, rotated, rotCount := dirBytes(path)
+		active, rotated, rotCount := dirBytesWithEntries(path, readTaskDir(filepath.Dir(path)))
 		infos = append(infos, LogStorageInfo{
 			Key: key, Name: task.Name + "日志",
 			SizeBytes: active, RotatedBytes: rotated, RotatedCount: rotCount,

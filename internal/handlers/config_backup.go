@@ -1699,7 +1699,12 @@ func validateV2BackupTLSShapeSoft(tables map[string][]map[string]any, softLiveAC
 // certJobRuleApplicable 的严格 CanonicalACMEDomains 全等语义对齐，不可规范化即
 // 响亮拒绝。两侧规范化后大小写/空白/顺序变体天然归一（排序规范形式）。
 func validateV2BackupCertJobs(tables map[string][]map[string]any) error {
-	jobsByRule := make(map[string][]string)
+	type certJobShape struct {
+		domain string
+		status string
+		pem    bool
+	}
+	jobsByRule := make(map[string][]certJobShape)
 	for _, job := range tables["cert_jobs"] {
 		domain := backupString(job["domain"])
 		if canonical, err := services.CanonicalACMEDomains(domain); err == nil {
@@ -1712,7 +1717,12 @@ func validateV2BackupCertJobs(tables map[string][]map[string]any) error {
 			continue
 		}
 		if ruleID, ok := job["rule_id"].(string); ok && ruleID != "" {
-			jobsByRule[ruleID] = append(jobsByRule[ruleID], domain)
+			status := backupString(job["status"])
+			// issued/downloaded 必须带可用证书材料；空 PEM 的 issued 会让
+			// 启用规则在 TLS 端口无证书运行，且 EnableRule/续期都按到期日
+			// 跳过补签（历史 历史问题-01）。
+			hasMaterial := backupString(job["cert_pem"]) != "" && backupString(job["key_pem"]) != ""
+			jobsByRule[ruleID] = append(jobsByRule[ruleID], certJobShape{domain: domain, status: status, pem: hasMaterial})
 		}
 	}
 	for index, rule := range tables["lb_rules"] {
@@ -1730,18 +1740,37 @@ func validateV2BackupCertJobs(tables map[string][]map[string]any) error {
 			return fmt.Errorf("规则 #%d（%s）：ACME 域名不合法（仅支持单域名或根域+www 二级域名），导入后将无法自动续签", index+1, backupString(rule["name"]))
 		}
 		matched := false
-		for _, jobDomain := range jobDomains {
-			jobCanonical, err := services.CanonicalACMEDomains(jobDomain)
+		emptyMaterial := false
+		for _, job := range jobDomains {
+			jobCanonical, err := services.CanonicalACMEDomains(job.domain)
 			if err != nil {
-				return fmt.Errorf("规则 #%d（%s）：证书任务域名 %q 不合法（仅支持单域名或根域+www 二级域名），导入后将无法自动续签", index+1, backupString(rule["name"]), jobDomain)
+				return fmt.Errorf("规则 #%d（%s）：证书任务域名 %q 不合法（仅支持单域名或根域+www 二级域名），导入后将无法自动续签", index+1, backupString(rule["name"]), job.domain)
 			}
-			if jobCanonical == canonical {
-				matched = true
-				break
+			if jobCanonical != canonical {
+				continue
 			}
+			if (job.status == "issued" || job.status == "downloaded") && !job.pem {
+				emptyMaterial = true
+				continue
+			}
+			matched = true
+			break
 		}
 		if !matched {
+			if emptyMaterial {
+				return fmt.Errorf("规则 #%d（%s）：证书任务标记为已签发但证书材料为空，导入后 TLS 端口将无证书可用", index+1, backupString(rule["name"]))
+			}
 			return fmt.Errorf("规则 #%d（%s）：证书任务域名与规则域名不一致，导入后将无法自动续签", index+1, backupString(rule["name"]))
+		}
+		allowed := map[string]struct{}{canonical: {}}
+		for _, d := range strings.Split(canonical, ",") {
+			allowed[strings.TrimSpace(d)] = struct{}{}
+		}
+		for _, job := range jobDomains {
+			jobCanonical, _ := services.CanonicalACMEDomains(job.domain)
+			if _, ok := allowed[jobCanonical]; !ok {
+				return fmt.Errorf("规则 #%d（%s）：证书任务包含规则当前域名之外的旧域行 %q，导入后任务视图与对账无法收敛", index+1, backupString(rule["name"]), job.domain)
+			}
 		}
 	}
 	return nil
@@ -3049,6 +3078,7 @@ func skipEmptyBlockPages(tables map[string][]map[string]any) []string {
 	}
 	warnings := []string{}
 	kept := make([]map[string]any, 0, len(rows))
+	skipped := map[int]struct{}{}
 	for _, row := range rows {
 		content, _ := row["content"].(string)
 		if strings.TrimSpace(content) != "" {
@@ -3059,12 +3089,33 @@ func skipEmptyBlockPages(tables map[string][]map[string]any) []string {
 		if name == "" {
 			name = fmt.Sprintf("#%v", row["id"])
 		}
+		if id := backupInt(row["id"]); id > 0 {
+			skipped[id] = struct{}{}
+		}
 		warnings = append(warnings, fmt.Sprintf("拦截页面 %s 的内容为空，已跳过导入", name))
 	}
 	if len(warnings) == 0 {
 		return nil
 	}
 	tables["security_block_pages"] = kept
+	// 被跳过页面的引用必须同步清空：后续 validateBackupRuleReferences/
+	// validateV2BackupRules 以「页不存在」整包 400，软跳过契约失效
+	// （历史 B1-历史问题）。清空 id/status 与运行时 JOIN 无页等效（默认页兜底）。
+	if len(skipped) > 0 {
+		for _, rule := range tables["lb_rules"] {
+			for _, pair := range [][2]string{{"block_page_stage1_id", "block_page_stage1_status"}, {"block_page_stage3_id", "block_page_stage3_status"}} {
+				if _, hit := skipped[backupInt(rule[pair[0]])]; hit {
+					rule[pair[0]] = 0
+					rule[pair[1]] = 0
+				}
+			}
+		}
+		for _, policy := range tables["security_policies"] {
+			if _, hit := skipped[backupInt(policy["block_page_id"])]; hit {
+				policy["block_page_id"] = 0
+			}
+		}
+	}
 	return warnings
 }
 
@@ -3611,9 +3662,9 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		// cert_renewal_attempts=5/cert_expiry_days=30）与显示侧 COALESCE——
 		// 此前 3/90 与写侧校验边界一致但与默认值漂移，修复后的续签窗口/到期
 		// 提醒参数会静默偏离系统默认直至管理员重存。
-		// 历史问题（历史）：cert_renewal_days 下界 1（0 会让续签窗口恒空、
-		// 到期即失效；写侧允许 0 属历史形态，导入侧钳到 1 并留痕）。
-		{"cert_renewal_days", 1, 90, 30},
+		// cert_renewal_days 0=默认 30（与 UI/写侧/读侧统一），导入不再钳到 1
+		//（历史 历史问题-1）。
+		{"cert_renewal_days", 0, 90, 30},
 		{"cert_renewal_attempts", 1, 10, 5},
 		{"cert_expiry_days", 1, 365, 30},
 	} {
@@ -3701,6 +3752,13 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	threatFileReconcile := sectionTables["security_crs_version"]
 	if _, carried := backup.Tables["security_threat_sources"]; !carried {
 		threatFileReconcile = false
+	}
+	if lbbakFiles == nil && threatFileReconcile {
+		// 纯 JSON 备份不携带 .iplist/.fast 文件：替换源表会与本地文件分叉
+		// （历史 历史问题-2）。保留本地威胁源配置与文件，显式告警。
+		delete(backup.Tables, "security_threat_sources")
+		threatFileReconcile = false
+		skipWarnings = append(skipWarnings, "纯 JSON 备份不携带威胁名单文件，已保留本地威胁源配置与名单")
 	}
 	if threatFileReconcile {
 		wafFilePhase = true
@@ -4126,6 +4184,9 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 			recordAudit(c, action+"警告", "配置备份", warning)
 		}
 	}
+	// 摘要必须在 WAF 版本表按落盘结果丢弃之后重算，否则响应仍宣称已导入
+	//（历史 历史问题-5）。
+	counts = importCountsDetail(backup.Tables)
 	// 历史问题 门控：仅当本次导入实际携带（且成功落盘）规则库四表之一时才
 	// 需要重装首槽——否则（如 JSON 导入跳过版本表、规则类导入）武装会为
 	// 空表补种子行，改变「未导入=本地零行」的既有语义。

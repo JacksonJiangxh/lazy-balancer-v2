@@ -46,7 +46,9 @@
       </transition>
       <div class="error-stack">
         <div v-if="statsError" class="error-banner">大屏数据加载失败，正在重试…</div>
-        <div v-if="stats?.backfill_incomplete" class="error-banner site-unset">历史统计回填尚未完成，当前窗口总量可能少计，稍后将继续补齐</div>
+        <div v-if="stats?.backfill_incomplete" class="error-banner site-unset">
+          {{ rawCoverageGap ? `原始事件仅保留自 ${stats?.raw_coverage_from}，更早区间无法重建，当前窗口总量可能少计` : '历史统计回填尚未完成，当前窗口总量可能少计，稍后将继续补齐' }}
+        </div>
         <div v-if="stats?.rollup_stale" class="error-banner site-unset">统计汇总更新延迟，当前窗口数据可能不是最新</div>
         <div v-if="engineError" class="error-banner">
           大屏引擎加载失败
@@ -150,38 +152,10 @@
               <dl>
                 <dt>拦截事件</dt><dd>{{ stats?.blocked_events ?? 0 }}</dd>
                 <dt>攻击源国家</dt><dd>{{ countryCount }}</dd>
-                <dt>TOP6 命中次数</dt><dd>{{ topRuleHits }}</dd>
+                <dt>TOP3 命中次数</dt><dd>{{ topRuleHits }}</dd>
               </dl>
             </div>
           </div>
-        </div>
-
-        <div class="stat-section">
-          <div class="stat-title"><span>来源国家 TOP5</span><span class="n">含检测</span></div>
-          <ul v-if="topCountries.length" class="rules country-bars">
-            <li v-for="item in topCountries" :key="item.name" class="rule" :title="item.name">
-              <span class="rule-name">{{ item.name }}</span>
-              <span class="cnt">{{ item.value }}</span>
-              <span class="rule-bar"><i :style="{ width: countryBarWidth(item.value), background: countryBarColor(item.value) }"></i></span>
-            </li>
-          </ul>
-          <div v-else class="empty">暂无归属地数据</div>
-        </div>
-
-        <div class="stat-section">
-          <div class="stat-title"><span>TOP 被攻击站点</span><span class="n">{{ targetHits }}</span></div>
-          <ul v-if="topTargets.length" class="rules">
-            <li v-for="item in topTargets" :key="item.name + item.domain" class="rule" :title="item.domain || item.name">
-              <span class="rule-name">{{ item.domain || item.name }}</span>
-              <span class="cnt">{{ item.value }}</span>
-              <span class="rule-bar"><i :style="{ width: targetBarWidth(item.value) }"></i></span>
-            </li>
-          </ul>
-          <div v-else class="empty">暂无规则维度数据</div>
-        </div>
-
-        <div class="stat-section">
-          <div class="stat-title"><span title="自最近一次 Caddy 配置重载/进程启动以来累计；含上游自返 429">限流累计（自重载）</span><span class="n">{{ ratelimitAvailable ? displayRatelimit : '—' }}</span></div>
         </div>
 
         <div class="stat-section">
@@ -218,7 +192,35 @@
         </div>
 
         <div class="stat-section">
-          <div class="stat-title"><span>TOP 命中规则（前 6 条命中次数）</span><span class="n">{{ topRuleHits }}</span></div>
+          <div class="stat-title"><span>来源国家 TOP3</span><span class="n">含检测</span></div>
+          <ul v-if="topCountries.length" class="rules country-bars">
+            <li v-for="item in topCountries" :key="item.name" class="rule" :title="item.name">
+              <span class="rule-name">{{ item.name }}</span>
+              <span class="cnt">{{ item.value }}</span>
+              <span class="rule-bar"><i :style="{ width: countryBarWidth(item.value), background: countryBarColor(item.value) }"></i></span>
+            </li>
+          </ul>
+          <div v-else class="empty">暂无归属地数据</div>
+        </div>
+
+        <div class="stat-section">
+          <div class="stat-title"><span>TOP 被攻击站点</span><span class="n">{{ targetHits }}</span></div>
+          <ul v-if="topTargets.length" class="rules">
+            <li v-for="item in topTargets" :key="item.name + item.domain" class="rule" :title="item.domain || item.name">
+              <span class="rule-name">{{ item.domain || item.name }}</span>
+              <span class="cnt">{{ item.value }}</span>
+              <span class="rule-bar"><i :style="{ width: targetBarWidth(item.value) }"></i></span>
+            </li>
+          </ul>
+          <div v-else class="empty">暂无规则维度数据</div>
+        </div>
+
+        <div class="stat-section">
+          <div class="stat-title"><span title="自最近一次 Caddy 配置重载/进程启动以来累计；含上游自返 429">限流累计（自重载）</span><span class="n">{{ ratelimitAvailable ? displayRatelimit : '—' }}</span></div>
+        </div>
+
+        <div class="stat-section">
+          <div class="stat-title"><span>TOP 命中规则（前 3 条命中次数）</span><span class="n">{{ topRuleHits }}</span></div>
           <ul v-if="topRules.length" class="rules">
             <li v-for="item in topRules" :key="item.name" class="rule" :title="item.name">
               <span class="rule-name">{{ ruleLabel(item.name) }}</span>
@@ -311,6 +313,9 @@ interface ThreatScreenStats {
   hourly_hist: { name: string; value: number }[]
   attack_type_share: { name: string; value: number }[]
   recent_rate: number
+  window_start?: string
+  rollup_coverage_from?: string
+  raw_coverage_from?: string
   backfill_incomplete?: boolean
   rollup_stale?: boolean
 }
@@ -379,10 +384,17 @@ const targetHits = computed(() => topTargets.value.reduce((m, item) => m + item.
 const maxTargetCount = computed(() => topTargets.value.reduce((m, item) => Math.max(m, item.value), 0))
 const targetBarWidth = (count: number): string => `${maxTargetCount.value > 0 ? Math.max(5, (count / maxTargetCount.value) * 100) : 0}%`
 const hourlyTotal = computed(() => hourlyHist.value.reduce((m, slot) => m + slot.value, 0))
-// 口径（历史问题 方案 B）：top_rules 后端只返回前 6 条——求和不等于「命中规则数」，
-// 文案与变量同口径改为「前 6 条命中次数」；真实 distinct 规则数需后端新增字段。
+// 口径（历史问题 方案 B）：top_rules 后端只返回前 3 条——求和不等于「命中规则数」，
+// 文案与变量同口径改为「前 3 条命中次数」；真实 distinct 规则数需后端新增字段。
 const topRuleHits = computed(() => topRules.value.reduce((m, item) => m + item.value, 0))
 const hourlyHist = computed(() => stats.value?.hourly_hist ?? [])
+// 原始表最早事件晚于窗口起点 = 窗口前段已被保留期/行帽裁剪，rollup 的 0
+// 不是「无事件」而是「不可重建」；与普通回填进行中区分文案。
+const rawCoverageGap = computed(() => {
+  const raw = stats.value?.raw_coverage_from
+  const start = stats.value?.window_start
+  return !!raw && !!start && raw > start
+})
 const attackTypeShare = computed(() => stats.value?.attack_type_share ?? [])
 const displayRecentRateX10 = useCountUp(computed(() => Math.round((stats.value?.recent_rate ?? 0) * 10)), 500)
 const displayRecentRate = computed(() => formatRecentRate(displayRecentRateX10.value / 10))

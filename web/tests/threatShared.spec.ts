@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { heatEntriesEqual, arcEndpoints, POINTY_TOP_HEX_VERTICES, drillCountryAllowed } from '../src/utils/threatShared.ts'
+import { heatEntriesEqual, arcEndpoints, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation } from '../src/utils/threatShared.ts'
 
 test('六边形点阵：pointy-top 六顶点且上下尖角（历史问题）', () => {
   assert.equal(POINTY_TOP_HEX_VERTICES.length, 6)
@@ -22,6 +22,15 @@ test('下钻白名单：缺省不限，显式列表只放行列内国家（历�
   assert.equal(drillCountryAllowed(['中国'], '中国'), true)
   assert.equal(drillCountryAllowed(['中国'], '美国'), false)
   assert.equal(drillCountryAllowed([], '中国'), false)
+})
+
+test('弧线起点：中国精确到省，其他国家走质心，未知走兜底', () => {
+  const gd = arcOriginForLocation('中国·广东省')
+  assert.ok(Math.abs(gd[0] - 113.42) < 0.5 && Math.abs(gd[1] - 23.31) < 0.5)
+  const us = arcOriginForLocation('美国')
+  assert.ok(Math.abs(us[0] - -97) < 1 && Math.abs(us[1] - 38) < 2)
+  const unknown = arcOriginForLocation('不存在国')
+  assert.deepEqual(unknown, arcOriginForLocation(''))
 })
 
 test('A 热力指纹：相同输入 true，计数/长度/重复键变化 false', () => {

@@ -792,7 +792,7 @@ func TestIP2RegionUpdateRun_rollbackRenameFailureFallsBackToCopy(t *testing.T) {
 	}
 }
 
-func TestIP2RegionUpdateRun_rollbackAllBaselinesFailFailOpen(t *testing.T) {
+func TestIP2RegionUpdateRun_rollbackAllBaselinesFailOpenRejected(t *testing.T) {
 	// Given 历史问题 历史问题 升级链全部失败：reloader 首次失败时将 live 替换为目录，
 	// 此后 rename（file→dir，EISDIR）与 copyFile（tmp→dir 同样 EISDIR）均失
 	// 败，dist 回退的 copyFile 亦失败——rollbackXDB 返回 error，调用方必须改走

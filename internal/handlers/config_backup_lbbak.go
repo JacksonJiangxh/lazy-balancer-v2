@@ -67,7 +67,13 @@ func buildLbbakPayload(backupJSON []byte, bundle *services.WafFileBundle) ([]byt
 	// RDB: 威胁库 .iplist 源文件
 	if bundle != nil {
 		for _, tf := range bundle.ThreatFiles {
-			if data := services.ReadThreatIplistBySource(tf.Name); len(data) > 0 {
+			data, err := services.ReadThreatIplistBySource(tf.Name)
+			if err != nil {
+				// 可 stat 但不可读/解析失败：静默缺件会让还原删除本地旧文件
+				// （历史 历史问题-3），导出必须显式失败。
+				return nil, fmt.Errorf("读取威胁名单 %s: %w", tf.Name, err)
+			}
+			if len(data) > 0 {
 				entries[lbbakEntryThreatPrefix+tf.Name+".iplist"] = data
 			}
 		}

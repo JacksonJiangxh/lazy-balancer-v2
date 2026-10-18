@@ -340,13 +340,9 @@ func (c *Client) removeStaleAccountKeys() error {
 			continue
 		}
 		keyPath := strings.TrimSuffix(metadataPath, ".json")
-		// 历史问题-18（历史）：本条件在当前路径公式下**恒真**——账户密钥文件名
-		// 由与元数据同一 4 元组（directory|email|EABKID|hmac 摘要）sha256 派生
-		// （acmeAccountKeyPath），故 `metadata == want ⟺ keyPath == c.accountKeyPath`，
-		// 于是 `metadata != want || keyPath == accountKeyPath` 永不放行删除（仅手工
-		// 复制出的同名元组文件会进入）。历史问题 F-A2 后的设计是「轮换遗留密钥保留」
-		// （字节级残留无害），因此此处保留为**路径公式未来再变更时的迁移钩子**，
-		// 而非活跃清理。每轮注册仍会做一次目录遍历（条目数为 CA 提供商数量级）。
+		// 历史问题-18/历史问题 F-A2 裁定：轮换后的旧 HMAC 密钥必须保留（字节级残留
+		// 无害；删除会让旧账户身份无法恢复）。当前路径公式下本条件恒真，
+		// 保留为路径公式未来变更时的迁移钩子（历史 历史问题-3 复核后不修）。
 		if metadata != want || keyPath == c.accountKeyPath {
 			continue
 		}

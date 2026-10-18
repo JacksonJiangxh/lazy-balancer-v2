@@ -451,6 +451,19 @@ func wafFilesRefDiffers(r *models.ClusterWafFilesRef) bool {
 			return true
 		}
 	}
+	// 威胁库 .fast 也属于引用面：同步开关关闭时仅威胁库更新也必须产生
+	// “同步警告”审计（历史 历史问题-3）。
+	if len(r.ThreatSha256s) > 0 {
+		local := scanThreatFastFiles()
+		if len(local) != len(r.ThreatSha256s) {
+			return true
+		}
+		for name, sum := range r.ThreatSha256s {
+			if local[name] != sum {
+				return true
+			}
+		}
+	}
 	return false
 }
 

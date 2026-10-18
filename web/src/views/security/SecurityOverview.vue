@@ -23,12 +23,6 @@
       class="mb-5 error-banner"
     />
 
-    <!-- 历史问题-02：原始事件保留窗口口径（后端 raw_retention_note 非空才展示，避免全新部署噪音） -->
-    <div v-if="overview.raw_retention_note" class="info-note-bar">
-      <span class="info-note-desc">{{ overview.raw_retention_note }}</span>
-      <span v-if="rawCoverageLabel" class="info-note-sub">原始事件覆盖起点：{{ rawCoverageLabel }}</span>
-    </div>
-
     <el-row :gutter="20" class="mb-5">
       <el-col :xs="24" :md="10">
         <el-card shadow="always" class="overview-card">
@@ -291,9 +285,6 @@ interface Overview {
   today_blocked: number; today_detected: number; active_policies: number; crs_version: string
   crs_available?: boolean; ip2region_available?: boolean; update_status?: string
   trend: TrendPoint[]; top_ips: TopIP[]; attack_types: AttackType[]; attack_types_stage: AttackType[]
-  // 历史问题-02：原始事件保留窗口口径（GET /security/overview 返回）
-  raw_coverage_from?: string
-  raw_retention_note?: string
 }
 interface SecurityEvent { id: number; event_time: string; client_ip: string; rule_caddy_id: string; rule_name: string; policy_name: string; ip_location?: string }
 
@@ -308,15 +299,11 @@ const topIpAttackLabel = (row: TopIP): string => {
   if (!attackByStage.value) return row.attack_type || '—'
   return row.attack_type_stage || '—'
 }
-const overview = ref<Overview>({ today_blocked: 0, today_detected: 0, active_policies: 0, crs_version: '', trend: [], top_ips: [], attack_types: [], attack_types_stage: [], raw_coverage_from: '', raw_retention_note: '' })
+const overview = ref<Overview>({ today_blocked: 0, today_detected: 0, active_policies: 0, crs_version: '', trend: [], top_ips: [], attack_types: [], attack_types_stage: [] })
 // 分布图展示模式：勾选=按阶段五桶（默认，与触发阶段口径一致）；取消=具体分类
 // 总览加载失败（如 metrics 库故障导致后端 500）时置位：避免把全零面板
 // 误当「无攻击」，用户目标与 历史问题 D2 的后端显式报错对齐（历史问题 F1）。
 const overviewError = ref(false)
-// 历史问题-02：原始保留窗口口径——raw_coverage_from 为原始表最早事件（UTC 墙钟串，
-// formatDate 归一展示）；note 非空时提示「趋势/Top IP 仅覆盖原始保留窗口」。
-const rawCoverageLabel = computed(() => formatDate(overview.value.raw_coverage_from) || '')
-
 const trendChartOption = computed(() => {
   const dates = overview.value.trend.map(t => t.date)
   const blocked = overview.value.trend.map(t => t.blocked)

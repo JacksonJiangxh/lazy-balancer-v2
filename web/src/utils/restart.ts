@@ -8,11 +8,9 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 // 超过 60s 上限提示手动刷新。isDisposed 供组件卸载时提前终止轮询（不触发 reload/提示）。
 export const reloadAfterRestart = async (isDisposed?: () => boolean): Promise<boolean> => {
   const deadline = Date.now() + 60_000
-  const sleep = (ms: number): Promise<void> => {
-    const { promise, resolve } = Promise.withResolvers<void>()
-    setTimeout(resolve, ms)
-    return promise
-  }
+  // 不用 Promise.withResolvers（Safari 17.4+/Chrome 119+）：旧浏览器会在
+  // 重启成功后抛错，导致页面永不刷新（历史 历史问题-3）。
+  const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, ms))
   while (Date.now() < deadline) {
     await sleep(2000)
     if (isDisposed?.()) return false

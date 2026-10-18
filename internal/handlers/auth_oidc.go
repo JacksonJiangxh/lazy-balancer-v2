@@ -63,6 +63,10 @@ var (
 	oidcStates   sync.Map // state -> oidcStateEntry
 	oidcProvMu   sync.Mutex
 	oidcProvCach = map[string]oidcProvEntry{} // issuer -> discovery 产物(含短 TTL 负缓存)
+	// oidcProvCacheMax 硬上限：管理员探测接口接受任意 issuer，无上限会导致
+	// 每个唯一 issuer 永久占位（历史 B2-历史问题）。满员淘汰任一条目，
+	// 下个请求按需重新 discovery。
+	oidcProvCacheMax = 64
 	// oidcStateCount 在册 state 条目计数(历史问题:未认证泛洪封顶,计数与
 	// Store/Delete/TTL 清理同点维护)
 	oidcStateCount atomic.Int32
@@ -187,13 +191,24 @@ func oidcProvider(issuer string) (*oidc.Provider, error) {
 	oidcProvMu.Lock()
 	if err != nil {
 		werr := fmt.Errorf("OIDC 发现失败(检查服务地址可达性与 .well-known 配置): %w", err)
-		oidcProvCach[issuer] = oidcProvEntry{err: werr, failedAt: time.Now()}
+		oidcProvCachePutLocked(issuer, oidcProvEntry{err: werr, failedAt: time.Now()})
 		oidcProvMu.Unlock()
 		return nil, werr
 	}
-	oidcProvCach[issuer] = oidcProvEntry{provider: p}
+	oidcProvCachePutLocked(issuer, oidcProvEntry{provider: p})
 	oidcProvMu.Unlock()
 	return p, nil
+}
+
+// oidcProvCachePutLocked 写入缓存并维持容量上限；调用方须持有 oidcProvMu。
+func oidcProvCachePutLocked(issuer string, entry oidcProvEntry) {
+	if _, exists := oidcProvCach[issuer]; !exists && len(oidcProvCach) >= oidcProvCacheMax {
+		for key := range oidcProvCach {
+			delete(oidcProvCach, key)
+			break
+		}
+	}
+	oidcProvCach[issuer] = entry
 }
 
 func oidcProviderInvalidate(issuer string) {

@@ -44,7 +44,7 @@ func (s *ClusterService) IssueServiceControlTicket(ctx context.Context, nodeID i
 	var name, ipAddress, protocol, accessURL, keyHash string
 	var port int
 	var approved bool
-	if err := s.db.QueryRowContext(ctx, `SELECT name,ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),COALESCE(cluster_token_hash,''),is_approved FROM nodes WHERE id=?`, nodeID).
+	if err := s.db.QueryRowContext(ctx, `SELECT name,ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),COALESCE(cluster_token_hash,''),is_approved FROM nodes WHERE id=? AND `+masterRoleConditionSQL, nodeID).
 		Scan(&name, &ipAddress, &port, &protocol, &accessURL, &keyHash, &approved); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return models.ClusterServiceControlIssue{}, ErrNodeNotFound

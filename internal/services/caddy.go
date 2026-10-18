@@ -187,6 +187,10 @@ func caddyConfigJSONEqual(a, b []byte) bool {
 	return reflect.DeepEqual(aj, bj)
 }
 
+// GenerateAndApplyConfig 非强制重载（同字节短路）。
+// 调用方 MUST 已持有 CaddyOpLock：当前唯一生产调用方（Start/Restart/集群动作/
+// 导入重播种）均全程持锁；在本函数内自取锁会与这些路径重入死锁（历史
+// 历史问题-4）。新增调用方必须显式持锁或改用 GenerateAndApplyConfigForce。
 func (s *CaddyService) GenerateAndApplyConfig() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -529,6 +533,15 @@ func (s *CaddyService) ValidateTxRenderViaCLI(tx *sql.Tx) error {
 	if validator == nil {
 		return nil
 	}
+	// 渲染会写 IP 名单投影；CLI 拒绝时必须自回滚，不能依赖每个调用方
+	//（历史 历史问题-5）。成功路径保留新投影供随后的 ApplyConfigFromTx 使用。
+	projectionSnapshot := SnapshotIPListProjections()
+	applied := false
+	defer func() {
+		if !applied {
+			RestoreIPListProjections(projectionSnapshot)
+		}
+	}()
 	config := generateCaddyConfigFromStore(tx)
 	// 2026-09-07 审计 N2：渲染过程中 MaterializeCertPairs 可能已将证书文件
 	// 写盘——无论校验结果如何都恢复快照（后续 ApplyConfigFromTx 会重新生成
@@ -550,6 +563,7 @@ func (s *CaddyService) ValidateTxRenderViaCLI(tx *sql.Tx) error {
 		}
 		return &ConfigRejectedError{Err: err}
 	}
+	applied = true
 	return nil
 }
 

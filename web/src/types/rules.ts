@@ -166,6 +166,10 @@ export interface CreateRuleRequest extends ProxyTimeoutConfig {
   enable_compress: boolean
   compress_types: string
   log_enabled: boolean
+  block_page_stage1_id?: number
+  block_page_stage1_status?: number
+  block_page_stage3_id?: number
+  block_page_stage3_status?: number
 }
 
 export interface UpdateRuleRequest extends Omit<CreateRuleRequest,

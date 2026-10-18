@@ -3492,9 +3492,14 @@ func TestSecurityEventsIngest_duplicateTransactionNotFedToAutoban(t *testing.T) 
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
 	offsetPath := filepath.Join(dir, "security_events.offset")
-	dup := securityEvents历史Fixture("tx-dup-1", "203.0.113.77", "/dup")
+	nowStamp := time.Now().UTC().Format("2006/01/02 15:04:05")
+	atNow := func(txID, ip, uri string) string {
+		fixture := strings.Replace(securityEvents历史Fixture(txID, ip, uri), "2026/08/11 19:16:57", nowStamp, 1)
+		return strings.Replace(fixture, "1786447017841320426", fmt.Sprintf("%d", time.Now().UnixNano()), 1)
+	}
+	dup := atNow("tx-dup-1", "203.0.113.77", "/dup")
 	// 形状 1：同一事务在日志中出现两次（轮转/并发可见的重复形态）。
-	content := dup + "\n" + dup + "\n" + securityEvents历史Fixture("tx-dup-2", "203.0.113.78", "/other") + "\n"
+	content := dup + "\n" + dup + "\n" + atNow("tx-dup-2", "203.0.113.78", "/other") + "\n"
 	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}

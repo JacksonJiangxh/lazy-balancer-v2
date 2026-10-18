@@ -44,6 +44,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/corazawaf/coraza/v3/experimental/plugins"
@@ -659,7 +660,18 @@ func snapshotAuditRequestBody(body string) (string, bool) {
 	if len(body) <= auditRequestBodyMaxBytes {
 		return body, false
 	}
-	return strings.Clone(body[:auditRequestBodyMaxBytes]), true
+	cut := auditRequestBodyMaxBytes
+	// 写侧与读侧上限相等，读侧无法凭长度判断截断；文本在写侧显式追加
+	// 标记，避免 UI 把半截 body 当完整内容（历史 E-历史问题）。二进制不
+	// 追加（会破坏 base64 判定）。
+	for cut > 0 && !utf8.RuneStart(body[cut]) {
+		cut--
+	}
+	prefix := strings.Clone(body[:cut])
+	if utf8.ValidString(prefix) {
+		return prefix + "\n...[TRUNCATED]", true
+	}
+	return prefix, true
 }
 
 // snapshotAuditLog 把 live AuditLog 拷贝为自持快照。接口 nil 检查穿透 typed-nil
@@ -1112,6 +1124,31 @@ func (p *auditPipeline) flushPending() {
 		p.flushLocked()
 	}
 	p.ioMu.Unlock()
+}
+
+// flush 立即把 bufio 中的行写入 fd（不关闭管线）；供 Caddy Cleanup 优雅收尾。
+func (p *auditPipeline) flush() {
+	p.ioMu.Lock()
+	if p.bw != nil {
+		if err := p.bw.Flush(); err != nil {
+			p.reportIOError("flush", err)
+		}
+	}
+	p.ioMu.Unlock()
+}
+
+// FlushAuditPipelines 冲刷全部存活管线；Caddy 模块 Cleanup（reload/优雅停机）
+// 调用，弥补上游从不调用 AuditLogWriter.Close 导致的尾部丢失（历史 E-历史问题）。
+func FlushAuditPipelines() {
+	auditPipelinesMu.Lock()
+	pipelines := make([]*auditPipeline, 0, len(auditPipelines))
+	for _, p := range auditPipelines {
+		pipelines = append(pipelines, p)
+	}
+	auditPipelinesMu.Unlock()
+	for _, p := range pipelines {
+		p.flush()
+	}
 }
 
 func (p *auditPipeline) closeFile() {

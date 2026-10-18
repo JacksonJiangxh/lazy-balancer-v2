@@ -166,6 +166,10 @@ func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 
 func (h *Handlers) UpdateSecurityCustomRule(c *gin.Context) {
 	id := c.Param("id")
+	if _, ok := parsePositiveNumericID(id); !ok {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "规则 ID 无效"})
+		return
+	}
 	var req models.UpdateCustomRuleRequest
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -1430,6 +1434,10 @@ func crsExcludedListRefs(payload string) []int64 {
 
 func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 	id := c.Param("id")
+	if _, ok := parsePositiveNumericID(id); !ok {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略 ID 无效"})
+		return
+	}
 	var req models.UpdateSecurityPolicyRequest
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -2272,6 +2280,12 @@ const maxBindingsPerRule = 8
 
 func (h *Handlers) BindRuleToPolicy(c *gin.Context) {
 	policyID := c.Param("id")
+	// 规范数字 ID 门（同族删除/名单写路径一致）：SQLite INTEGER 亲和会让
+	// "5.0" 命中行 5，而 Atoi("5.0") 失败得到 0 使 mixed 门禁失效。
+	if _, ok := parsePositiveNumericID(policyID); !ok {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略 ID 无效"})
+		return
+	}
 	var req struct {
 		RuleCaddyID string `json:"rule_caddy_id" binding:"required"`
 	}
@@ -3180,10 +3194,14 @@ func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
 }
 
 func (h *Handlers) UnbindRuleFromPolicy(c *gin.Context) {
+	policyID := c.Param("id")
+	if _, ok := parsePositiveNumericID(policyID); !ok {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略 ID 无效"})
+		return
+	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 
-	policyID := c.Param("id")
 	ruleCaddyID := c.Param("caddy_id")
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
 	if err != nil {
@@ -3659,7 +3677,11 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 		where += " AND " + ruleTriggeredMultiFilterSQL(ruleTriggered, &args)
 	}
 	if exclude := strings.TrimSpace(c.Query("rule_triggered_exclude")); exclude != "" {
-		where += " AND NOT (" + ruleTriggeredMultiFilterSQL(exclude, &args) + ")"
+		// rule_triggered 允许 NULL；NOT(NULL) 仍为 NULL 会把行从「排除」
+		// 结果里吞掉（历史 历史问题-003）。仅在反向条件内按空串比较，
+		// 正向筛选 SQL 保持原形状（既有钉测/索引口径不变）。
+		cond := strings.ReplaceAll(ruleTriggeredMultiFilterSQL(exclude, &args), "rule_triggered", "COALESCE(rule_triggered,'')")
+		where += " AND NOT (" + cond + ")"
 	}
 
 	// 历史问题 二十次（用户需求）：URI 筛选（子串）。
@@ -3750,6 +3772,10 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 		// 历史问题（历史）：触发类型必须在 Scan 成功后、append 前接线——
 		// 旧实现把赋值放在错误分支里，成功路径恒为空串（前端列全空）。
 		e.TriggerType = triggerTypeForRule(e.RuleTriggered)
+		// 列表响应字节上限（历史 历史问题-05）：100 行 × 64KB 头/体可 >15MB。
+		// 列表侧二次截断到 16KB/字段（详情弹框仍可看到截断标记）。
+		e.RequestHeaders = truncateEventListField(e.RequestHeaders)
+		e.RequestBody = truncateEventListField(e.RequestBody)
 		// 历史问题-05：请求头/体含凭证明文（Cookie/Authorization/请求体），
 		// 此前对任意登录用户/只读 Key 原样返回，掩码仅在前端——服务端脱敏。
 		maskSecurityEventRequestContextIfNeeded(c, &e)
@@ -3764,6 +3790,19 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 		events = []models.SecurityEvent{}
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"events": events, "total": total, "page": page, "page_size": pageSize}})
+}
+
+const securityEventListFieldCap = 16 * 1024
+
+func truncateEventListField(value string) string {
+	if len(value) <= securityEventListFieldCap {
+		return value
+	}
+	cut := securityEventListFieldCap
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut] + "\n...[TRUNCATED]"
 }
 
 // securityEventSensitiveHeaderNames 与前端 CTX_SENSITIVE_HEADERS 同源。
@@ -4119,9 +4158,7 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "安全总览查询失败"})
 			return
 		}
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: securityOverviewResponse{
-			SecurityOverview: overview, RawRetentionNote: securityOverviewRawRetentionNote,
-		}})
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: overview})
 		return
 	}
 	// printf('+%d', -240) 会产出非法修饰符 "+-240" 使 date() 返回 NULL，导致趋势全零。
@@ -4140,9 +4177,7 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "安全总览查询失败"})
 		return
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: securityOverviewResponse{
-		SecurityOverview: overview, RawCoverageFrom: agg.rawCoverageFrom, RawRetentionNote: securityOverviewRawRetentionNote,
-	}})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: overview})
 }
 
 func (h *Handlers) GetCRSInfo(c *gin.Context) {
@@ -4925,7 +4960,11 @@ func (h *Handlers) ListCRSRules(c *gin.Context) {
 		}
 		info, err := entry.Info()
 		if err != nil {
-			continue
+			// 静默跳过会把残缺列表以 200 返回（与同域「列表故障必须显式
+			// 500」口径冲突，历史 历史问题-005）。
+			services.Logf("error", "CRS 规则文件 stat 失败 %q: %v", entry.Name(), err)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "CRS 规则文件读取失败: " + entry.Name()})
+			return
 		}
 		cat := services.CategorizeCRSFile(entry.Name())
 		if search != "" && !strings.Contains(strings.ToLower(entry.Name()), search) && !strings.Contains(strings.ToLower(cat), search) {

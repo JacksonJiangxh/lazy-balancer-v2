@@ -1401,8 +1401,15 @@ func (h *Handlers) ExportIPList(c *gin.Context) {
 			entries = append(entries, models.IPListEntry{Value: v})
 		}
 	} else {
-		// 自定义/自动封禁/爬虫名单：DB entries（空串/畸形按空导出）。
-		_ = json.Unmarshal([]byte(entriesJSON), &entries)
+		// 自定义/自动封禁/爬虫名单：DB entries（空串按空导出，畸形显式 500——
+		// 200 空文件无法与「名单为空」区分，与 GetIPList/威胁导出同口径）。
+		if strings.TrimSpace(entriesJSON) != "" {
+			if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
+				services.Logf("error", "导出名单 %q entries 解析失败: %v", name, err)
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "名单条目数据损坏"})
+				return
+			}
+		}
 	}
 	var b strings.Builder
 	for _, e := range entries {

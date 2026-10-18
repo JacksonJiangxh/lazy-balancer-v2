@@ -193,15 +193,6 @@ type securityOverviewAggregates struct {
 	topIPs           []models.SecurityTopIP
 	attackTypes      []models.SecurityAttackType
 	attackTypesStage []models.SecurityAttackType
-	rawCoverageFrom  string
-}
-
-const securityOverviewRawRetentionNote = "今日计数、7 天趋势、攻击类型与 Top IP 仅统计原始安全事件保留窗口；威胁大屏使用分钟汇总，原始事件裁剪后两边计数可能不同"
-
-type securityOverviewResponse struct {
-	models.SecurityOverview
-	RawCoverageFrom  string `json:"raw_coverage_from"`
-	RawRetentionNote string `json:"raw_retention_note"`
 }
 
 type securityOverviewAggCacheKey struct {
@@ -371,10 +362,7 @@ func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todaySta
 		attackTypes = attackTypes[:10]
 	}
 
-	var rawCoverageFrom string
-	track(metricsDB.QueryRow(`SELECT COALESCE(MIN(event_time),'') FROM security_events`).Scan(&rawCoverageFrom))
-
-	data := securityOverviewAggregates{trend: trend, topIPs: topIPs, attackTypes: attackTypes, attackTypesStage: attackTypesStage, rawCoverageFrom: rawCoverageFrom}
+	data := securityOverviewAggregates{trend: trend, topIPs: topIPs, attackTypes: attackTypes, attackTypesStage: attackTypesStage}
 	if firstErr != nil {
 		return data, firstErr
 	}

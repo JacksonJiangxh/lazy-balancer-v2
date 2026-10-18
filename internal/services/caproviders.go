@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -140,6 +141,10 @@ var ErrCAProviderMinIntervalTooHigh = errors.New("min_interval_ms must be <= 600
 // 避免禁用后新签发/续签静默改用其它 CA（改写 cert_jobs.ca_provider_id、消耗
 // 另一 CA 配额）而队列内旧任务却按「CA Provider 不可用」失败的行为分裂。
 var ErrCAProviderInUse = errors.New("CA 提供商正被启用中的 ACME 规则引用")
+
+// ErrCAProviderDefault：当前默认 CA 提供商不得禁用（否则 0 值引用/未显式
+// 选择 CA 的规则会在下次签发时静默改派，历史 历史问题-2）。
+var ErrCAProviderDefault = errors.New("默认 CA 提供商不能禁用，请先切换默认提供商")
 
 // CAProviderInUseError 携带引用明细，供 handler 回显 409 文案（列表最多 5 条，
 // Total 为完整引用数）。
@@ -297,6 +302,10 @@ func (s *CAProviderService) UpdateCAProvider(id int, req models.UpdateCAProvider
 	// 历史问题-04：禁用引用守卫与 DNS 配置禁用同口径（失败即 409，点名引用方）。
 	// 放在事务内、UPDATE 之前：与写锁同事务，判定与写入原子。
 	if disabling {
+		var defaultID int
+		if derr := tx.QueryRow(`SELECT COALESCE(default_ca_provider_id,0) FROM global_config WHERE id=1`).Scan(&defaultID); derr == nil && defaultID == id {
+			return models.CAProvider{}, ErrCAProviderDefault
+		}
 		references, total, refErr := caProviderReferences(tx, id)
 		if refErr != nil {
 			return models.CAProvider{}, refErr
@@ -395,7 +404,7 @@ func AutoProvisionZeroSSLEAB(ctx context.Context, provider *models.CAProvider) e
 		EABHMACKey string `json:"eab_hmac_key"`
 		Error      string `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
 		return fmt.Errorf("parse zerossl EAB response: %w", err)
 	}
 	if !body.Success || body.EABKID == "" || body.EABHMACKey == "" {

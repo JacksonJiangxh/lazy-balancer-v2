@@ -110,6 +110,11 @@ func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 		discard()
 		return fmt.Errorf("fastfile tmp chmod: %w", err)
 	}
+	// 掉电窗口内空/半截 .fast 会被 @ipListFast 当合法空集（fail-open）。
+	if err := tmp.Sync(); err != nil {
+		discard()
+		return fmt.Errorf("fastfile tmp sync: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("fastfile tmp close: %w", err)
@@ -117,6 +122,13 @@ func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("fastfile rename: %w", err)
+	}
+	if dir, derr := os.Open(filepath.Dir(path)); derr == nil {
+		if serr := dir.Sync(); serr != nil {
+			_ = dir.Close()
+			return fmt.Errorf("fastfile dir sync: %w", serr)
+		}
+		_ = dir.Close()
 	}
 	return nil
 }

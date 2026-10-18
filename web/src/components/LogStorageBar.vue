@@ -84,7 +84,7 @@ const noteText = computed(() => {
   const i = info.value
   if (!i) return ''
   // 条数上限形态(安全事件)
-  if (i.limit_rows) return `满额自动裁最旧${i.retention_note ? '，' + i.retention_note : ''}`
+  if (i.limit_rows) return `超限后每日清理按最旧优先裁剪${i.retention_note ? '，' + i.retention_note : ''}`
   const parts: string[] = []
   if (i.limit_bytes) parts.push(`满 ${humanSize(i.limit_bytes)} 轮转`)
   if (i.keep_count > 0) {

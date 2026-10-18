@@ -52,10 +52,9 @@ var auditVocabDynamicAllowlist = map[string]map[int][]string{
 	"handlers/config_backup_lbbak.go": {1: {"applyLbbakWafFilesInLock", "warn"}},
 	// TriggerTaskAsync 的对象（Family）由调用点字面量传入（任务监控/安全防护/
 	// 配置备份等，均 ≤5 词）；动作固定为字面量「触发」/「触发失败」。
-	"services/task_trigger.go":     {2: {"TriggerTaskAsync"}},
-	"handlers/autobackup.go":       {1: {"RunAutoBackupOnce"}},
-	"handlers/config_import_v1.go": {1: {"ImportV1Config"}},
-	"handlers/handlers.go":         {1: {"finishTxApply"}, 2: {"finishTxApply"}},
+	"services/task_trigger.go": {2: {"TriggerTaskAsync", "RecordTaskTriggerResult"}},
+	"handlers/autobackup.go":   {1: {"RunAutoBackupOnce"}},
+	"handlers/handlers.go":     {1: {"finishTxApply"}, 2: {"finishTxApply"}},
 	// tryIPListHotPathApply 的动作/对象透传 txApplyFinish 字段（热路径收尾镜像
 	// finishTxApply 家族语义；字面量词条在各名单写路径调用点核清，
 	// 2026-10-15 核清入白名单）。

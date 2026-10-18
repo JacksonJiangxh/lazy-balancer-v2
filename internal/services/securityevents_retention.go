@@ -97,13 +97,20 @@ func SecurityEventsRetentionCleanupOnce() int {
 // 批间 ctx.Done() 分支才在生产可达（停机时百万行清理可及时中止，不拖过宽限期
 // 被 SIGKILL 跳过 db.Close/WAL 落盘）。Once 的无 ctx 包装保留给测试/兼容调用。
 func SecurityEventsRetentionCleanupCtx(ctx context.Context) int {
+	deleted, _ := SecurityEventsRetentionCleanupCtxErr(ctx)
+	return deleted
+}
+
+// SecurityEventsRetentionCleanupCtxErr 与 Ctx 同体，另返回本轮首个清理错误，
+// 供任务引擎把失败写进 task_runs（历史 历史问题-09）。
+func SecurityEventsRetentionCleanupCtxErr(ctx context.Context) (int, error) {
 	return securityEventsRetentionCleanup(ctx)
 }
 
-func securityEventsRetentionCleanup(ctx context.Context) int {
+func securityEventsRetentionCleanup(ctx context.Context) (int, error) {
 	database := db.MetricsDB
 	if database == nil {
-		return 0
+		return 0, nil
 	}
 	days, max := securityEventsRetentionSettings()
 	total := 0
@@ -113,7 +120,7 @@ func securityEventsRetentionCleanup(ctx context.Context) int {
 		res, err := database.Exec(`DELETE FROM security_events WHERE id IN (SELECT id FROM security_events WHERE event_time < datetime('now', printf('-%d days', ?)) ORDER BY id ASC LIMIT ?)`, days, securityEventsRetentionDeleteBatch)
 		if err != nil {
 			Logf("warn", "security events retention: age-based cleanup failed: %v", err)
-			break
+			return total, err
 		}
 		affected, _ := res.RowsAffected()
 		total += int(affected)
@@ -126,17 +133,17 @@ func securityEventsRetentionCleanup(ctx context.Context) int {
 			Logf("info", "security events retention: age-based cleanup canceled mid-pass")
 			// SEC-L1（历史）：返回契约统一为「已删多少报多少」——取消
 			// 路径此前 return 0 丢弃已提交批次，§6.5 摘要行少报。下同三处。
-			return total
+			return total, nil
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return total
+		return total, nil
 	}
 	var count int
 	if err := database.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&count); err != nil {
 		Logf("warn", "security events retention: row count failed: %v", err)
-		return total // SEC-L1：age 阶段已删计数不丢弃
+		return total, err // SEC-L1：age 阶段已删计数不丢弃
 	}
 	if overflow := count - max; overflow > 0 {
 		remaining := overflow
@@ -148,7 +155,7 @@ func securityEventsRetentionCleanup(ctx context.Context) int {
 			res, err := database.Exec(`DELETE FROM security_events WHERE id IN (SELECT id FROM security_events ORDER BY id ASC LIMIT ?)`, batch)
 			if err != nil {
 				Logf("warn", "security events retention: count-based cleanup failed: %v", err)
-				break
+				return total, err
 			}
 			affected, _ := res.RowsAffected()
 			if affected == 0 {
@@ -163,7 +170,7 @@ func securityEventsRetentionCleanup(ctx context.Context) int {
 			select {
 			case <-ctx.Done():
 				Logf("info", "security events retention: count-based cleanup canceled mid-pass")
-				return total
+				return total, nil
 			case <-time.After(10 * time.Millisecond):
 			}
 		}
@@ -183,7 +190,7 @@ func securityEventsRetentionCleanup(ctx context.Context) int {
 			SELECT minute FROM security_event_rollup WHERE minute < ? GROUP BY minute ORDER BY minute LIMIT 60)`, rollupCutoff, rollupCutoff)
 		if err != nil {
 			Logf("warn", "security events retention: rollup cleanup failed: %v", err)
-			break
+			return total, err
 		}
 		affected, _ := res.RowsAffected()
 		rollupDeleted += int(affected)
@@ -193,7 +200,7 @@ func securityEventsRetentionCleanup(ctx context.Context) int {
 		select {
 		case <-ctx.Done():
 			Logf("info", "security events retention: rollup cleanup canceled mid-pass (deleted %d)", rollupDeleted)
-			return total
+			return total, nil
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
@@ -208,7 +215,7 @@ func securityEventsRetentionCleanup(ctx context.Context) int {
 			SELECT minute FROM security_event_target_rollup WHERE minute < ? GROUP BY minute ORDER BY minute LIMIT 60)`, rollupCutoff, rollupCutoff)
 		if err != nil {
 			Logf("warn", "security events retention: target rollup cleanup failed: %v", err)
-			break
+			return total, err
 		}
 		affected, _ := res.RowsAffected()
 		targetDeleted += int(affected)
@@ -218,7 +225,7 @@ func securityEventsRetentionCleanup(ctx context.Context) int {
 		select {
 		case <-ctx.Done():
 			Logf("info", "security events retention: target rollup cleanup canceled mid-pass (deleted %d)", targetDeleted)
-			return total
+			return total, nil
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
@@ -236,7 +243,7 @@ func securityEventsRetentionCleanup(ctx context.Context) int {
 			ThreatRollupEventHighwaterPrefix+"%", len(ThreatRollupEventHighwaterPrefix)+1, rollupCutoff)
 		if err != nil {
 			Logf("warn", "security events retention: rollup highwater cleanup failed: %v", err)
-			break
+			return total, err
 		}
 		affected, _ := res.RowsAffected()
 		highwaterDeleted += int(affected)
@@ -246,7 +253,7 @@ func securityEventsRetentionCleanup(ctx context.Context) int {
 		select {
 		case <-ctx.Done():
 			Logf("info", "security events retention: rollup highwater cleanup canceled mid-pass (deleted %d)", highwaterDeleted)
-			return total
+			return total, nil
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
@@ -259,5 +266,5 @@ func securityEventsRetentionCleanup(ctx context.Context) int {
 			Logf("warn", "security events retention: wal checkpoint failed: %v", err)
 		}
 	}
-	return total
+	return total, nil
 }

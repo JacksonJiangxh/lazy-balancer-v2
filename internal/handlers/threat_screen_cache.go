@@ -147,9 +147,10 @@ func threatTopTargets(sinceMinute string, hours int) ([]threatTopTarget, error) 
 		rrows.Close()
 	}
 
-	targets := make([]threatTopTarget, 0, 5)
+	const topTargetCount = 3
+	targets := make([]threatTopTarget, 0, topTargetCount)
 	for _, id := range ids {
-		if len(targets) == 5 {
+		if len(targets) == topTargetCount {
 			break
 		}
 		info, ok := existing[id]

@@ -91,7 +91,14 @@ func (h *Handlers) CreateCurrentUserAPIKey(c *gin.Context) {
 }
 
 func (h *Handlers) DeleteCurrentUserAPIKey(c *gin.Context) {
-	deleteAPIKey(c, int(contextUserID(c)))
+	userID := int(contextUserID(c))
+	// scopedUserID==0 在 deleteAPIKey 中表示「全局删除」；自助入口缺少
+	// 认证上下文时必须拒绝，不能退化成管理员级删除（历史 B2-历史问题）。
+	if userID <= 0 {
+		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "认证上下文缺失"})
+		return
+	}
+	deleteAPIKey(c, userID)
 }
 
 func (h *Handlers) DeleteAPIKey(c *gin.Context) {

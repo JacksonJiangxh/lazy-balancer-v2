@@ -350,6 +350,12 @@ func TestBindWritePaths_rejectMixedPolicies(t *testing.T) {
 		t.Fatalf("bind typed status=%d body=%s, want 2xx", recorder.Code, recorder.Body.String())
 	}
 
+	// 非规范数字 ID（SQLite 亲和会命中行 1）不得绕过 mixed 门。
+	recorder = postJSON(t, router, "/security/policies/1.0/bind", map[string]any{"rule_caddy_id": "lb_mb"})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("bind noncanonical mixed status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
+	}
+
 	// SetRuleSecurityPolicies：集合含 mixed → 400
 	request := httptest.NewRequest(http.MethodPut, "/security/rules/lb_mb/policies", strings.NewReader(`{"policy_ids":[2,1]}`))
 	request.Header.Set("Content-Type", "application/json")

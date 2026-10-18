@@ -1,0 +1,71 @@
+// 威胁大屏本站坐标：地点选择（中国省份 / 海外国家）→ 经纬度单源。
+// 原自动检测依赖公网 IP 归属地，精度不可控；改为显式选择（城市列表过密，
+// 按用户要求收敛到省级），坐标只在选择时写入，避免再次引入“猜位置”。
+import { CHINA_PROVINCES } from './chinaProvinces.ts'
+import { COUNTRY_CENTROIDS } from './countryCentroids.ts'
+
+export const CHINA_SITE_PREFIX = 'cn:'
+export const COUNTRY_SITE_PREFIX = 'country:'
+
+export interface SiteLocationChoice {
+  key: string
+  label: string
+  lat: number
+  lon: number
+}
+
+export const CHINA_SITE_CHOICES: SiteLocationChoice[] = CHINA_PROVINCES
+  .slice()
+  .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'))
+  .map((province) => ({
+    key: CHINA_SITE_PREFIX + province.short,
+    label: province.name,
+    lat: province.centroid[1],
+    lon: province.centroid[0],
+  }))
+
+// 中国已由省份分组覆盖，海外国家列表必须排除「中国」——否则下拉出现两个中国。
+export const COUNTRY_SITE_CHOICES: SiteLocationChoice[] = Object.keys(COUNTRY_CENTROIDS)
+  .filter((name) => name !== '中国')
+  .sort((a, b) => a.localeCompare(b, 'zh-CN'))
+  .map((name) => {
+    const [lon, lat] = COUNTRY_CENTROIDS[name]
+    return { key: COUNTRY_SITE_PREFIX + name, label: name, lat, lon }
+  })
+
+const ALL_CHOICES = [...CHINA_SITE_CHOICES, ...COUNTRY_SITE_CHOICES]
+
+/** 选择 key → 坐标；未知 key 返回 null（保存前走显式校验）。 */
+export function coordsForSiteLocation(key: string): { lat: number; lon: number } | null {
+  const choice = ALL_CHOICES.find((item) => item.key === key)
+  if (!choice) return null
+  return { lat: Number(choice.lat.toFixed(4)), lon: Number(choice.lon.toFixed(4)) }
+}
+
+/** 近似球面距离（km）；仅用于回显最近地点，不参与业务判定。 */
+export function siteDistanceKm(aLat: number, aLon: number, bLat: number, bLon: number): number {
+  const rad = Math.PI / 180
+  const dLat = (bLat - aLat) * rad
+  const dLon = (bLon - aLon) * rad
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(aLat * rad) * Math.cos(bLat * rad) * Math.sin(dLon / 2) ** 2
+  return 2 * 6371 * Math.asin(Math.min(1, Math.sqrt(h)))
+}
+
+/**
+ * 已有坐标 → 最近地点 key（用于编辑现有配置时回显）。
+ * 零坐标（未设置）返回空串；其余取全表最近项——城市表更密，境内优先命中城市，
+ * 境外由海外国家兜底。
+ */
+export function nearestSiteLocation(lat: number, lon: number): string {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || (lat === 0 && lon === 0)) return ''
+  let best = ''
+  let bestDistance = Number.POSITIVE_INFINITY
+  for (const choice of ALL_CHOICES) {
+    const distance = siteDistanceKm(lat, lon, choice.lat, choice.lon)
+    if (distance < bestDistance) {
+      bestDistance = distance
+      best = choice.key
+    }
+  }
+  return best
+}

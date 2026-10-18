@@ -449,6 +449,9 @@ func (s *ClusterService) DeleteNode(ctx context.Context, nodeID int) error {
 	}
 	s.clearSectionReport(nodeID)
 	// 行已删:清 pin(读址失败/无 pin/地址无效均不影响删除结果,仅留痕)。
+	if addrErr != nil {
+		Logf("warn", "DeleteNode %d: 读取访问地址失败，pin 清理已跳过: %v", nodeID, addrErr)
+	}
 	if addrErr == nil {
 		accessURL = resolveNodeAccessURL(ipAddress, port, protocol, accessURL)
 		if pinPath, host, perr := nodePinPathFromAccessURL(s.db, accessURL); perr == nil {

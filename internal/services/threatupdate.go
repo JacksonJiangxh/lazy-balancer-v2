@@ -887,6 +887,12 @@ func WriteThreatIplistCompiled(iplistPath string, data []byte) error {
 		_ = tmp.Close()
 		return err
 	}
+	// 数据落盘后再编译/rename；掉电窗口内空 .iplist/.fast 会让拦截静默
+	// fail-open（历史 历史问题-3）。
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
@@ -926,6 +932,9 @@ func WriteThreatIplistCompiled(iplistPath string, data []byte) error {
 		} else {
 			_ = os.Remove(fastPath)
 		}
+		return err
+	}
+	if err := syncParentDir(iplistPath); err != nil {
 		return err
 	}
 	return nil

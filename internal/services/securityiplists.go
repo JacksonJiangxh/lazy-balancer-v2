@@ -2,6 +2,7 @@ package services
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"lazy-balancer-v2/wafiplist"
 	"os"
@@ -158,6 +159,12 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 				// SEC-A-F1（历史）：Scan 失败不再静默——行丢弃须留痕（该列表
 				// 若被引用，缺失表现为合并集静默缺条目）。
 				Logf("warn", "渲染: security_ip_lists 行扫描失败（该行丢弃）: %v", err)
+				// 严格模式必须把该 id 记为失败；仅 continue 会按 inline-only
+				// 继续渲染，deny 集合静默收窄（历史 历史问题-2）。
+				failed[id] = true
+				if firstErr == nil {
+					firstErr = fmt.Errorf("scan security_ip_lists id %d: %w", id, err)
+				}
 				continue
 			}
 			if system == 1 && threatSourceByListName(name) != "" {
@@ -489,13 +496,19 @@ func ReadThreatIplistForUI(listName string) ([]string, error) {
 // ReadThreatIplistBySource 按源名读威胁名单内容（导出用）。
 // 历史问题：与渲染/UI 共用代际感知读取——从节点文本可能是旧代，导出必须与
 // 执行面一致（.fast 较新时展开为文本行）。两文件都缺失返回 nil。
-func ReadThreatIplistBySource(source string) []byte {
+func ReadThreatIplistBySource(source string) ([]byte, error) {
 	if source == "" {
-		return nil
+		return nil, nil
 	}
 	vals, err := readThreatIplistPath(filepath.Join(wafDir, "threat-"+source+".iplist"))
-	if err != nil || len(vals) == 0 {
-		return nil
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	return []byte(strings.Join(vals, "\n") + "\n")
+	if len(vals) == 0 {
+		return nil, nil
+	}
+	return []byte(strings.Join(vals, "\n") + "\n"), nil
 }

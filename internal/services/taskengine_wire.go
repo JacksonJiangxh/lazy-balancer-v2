@@ -172,9 +172,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Kind:        taskengine.KindPeriodic,
 		IntervalFn:  func() time.Duration { return 60 * time.Second },
 		Run: func(rc taskengine.RunContext) error {
-			// 历史问题-1：低频率角色对账（与漂移检查同轮）。启动播种失败或
-			// 任何进程内角色漂移在此收敛，master-only 任务不会永久停摆。
-			reconcileTaskEngineRole()
+			// 角色对账已移至独立 startRoleReconciler（不受用户停止看门狗影响）。
 			WatchdogCheckOnce()
 			return nil
 		},
@@ -239,9 +237,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		IntervalFn:  func() time.Duration { return 24 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
 			// 历史问题-06：传任务 ctx——Stop(cancel) 可在大批量首遍中途生效。
-			deleted := SecurityEventsRetentionCleanupCtx(rc.Ctx)
+			// 历史问题-09：清理失败必须让 task_runs 落 failed，不得恒成功。
+			deleted, err := SecurityEventsRetentionCleanupCtxErr(rc.Ctx)
 			TaskLogf("security-events-retention", "cleanup", "安全事件保留清理完成：删除 %d 条（保留期与条数上限，无过期为 0）", deleted)
-			return nil
+			return err
 		},
 	})
 
@@ -270,11 +269,16 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
 		IntervalFn: func() time.Duration { return 6 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
+			// 长跑期间 StopTaskEngine 可能把全局置 nil；闭包内固定句柄，
+			// 收尾调用不会 nil 解引用（历史 历史问题-06）。
+			te := taskEngine
 			CertRenewalScanOnce()
 			// 入队即唤醒 CA 等待补扫（默认调度关闭）。历史问题：走 RearmLoop
 			// 有活唤醒——仅在确有在途任务时越过「已停止」态，不再无条件
 			// StartLoop（避免把用户手动停止的调度隐式打开）。
-			taskEngine.RearmLoop("cert-waiting-ca", certJobsActiveFn())
+			if te != nil {
+				te.RearmLoop("cert-waiting-ca", certJobsActiveFn())
+			}
 			return nil
 		},
 	})
@@ -301,15 +305,20 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
 		IntervalFn: func() time.Duration { return 30 * time.Second },
 		Run: func(rc taskengine.RunContext) error {
+			te := taskEngine
 			if !certJobsActiveFn() {
 				// 全部终态——自动关闭调度（回到默认关闭态）。
 				// F-历史问题-01（历史）：StopLoop 后复检——首查（T0）到停调度
 				// 之间的入队（T1）若经入队侧 StartLoop 先落地，会被本次 StopLoop
 				// 覆盖成「任务活跃但调度已停」死态；复检捕获则重新拉回（复检
 				// 之后的新入队由入队侧 StartLoop 承担，窗口闭合）。
-				taskEngine.StopLoop("cert-waiting-ca")
+				if te != nil {
+					te.StopLoop("cert-waiting-ca")
+				}
 				if certJobsActiveFn() {
-					taskEngine.RearmLoop("cert-waiting-ca", true) // 历史问题：确有新活才越过停止态
+					if te != nil {
+						te.RearmLoop("cert-waiting-ca", true) // 历史问题：确有新活才越过停止态
+					}
 					return nil
 				}
 				TaskLogf("cert-waiting-ca", "idle", "证书任务全部终态，自动停止补扫")
@@ -632,7 +641,25 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// 历史问题（历史）：BootSync 完成后解除 tick 暂停——此前 ticker 在
 	// NewEngine 即起跑，周期/定时任务可在配置载入前执行首轮。
 	taskEngine.ResumeScheduling()
+	startRoleReconciler()
 	return taskEngine
+}
+
+// startRoleReconciler 把引擎角色对账从用户可停止的 config-watchdog 中解耦
+// （历史 历史问题-2）：看门狗被停后，播种失败/角色漂移仍能每 60s 自愈。
+// 每次 InitTaskEngine 启动一个；引擎停止后循环退出。
+func startRoleReconciler() {
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			te := TaskEngine()
+			if te == nil || te.IsStopped() {
+				return
+			}
+			reconcileTaskEngineRole()
+		}
+	}()
 }
 
 // businessTaskDriver 业务开关与引擎调度同步的唯一任务清单。

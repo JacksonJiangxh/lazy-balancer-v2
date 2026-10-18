@@ -55,7 +55,7 @@ func (s *SyncService) Report(ctx context.Context) error {
 	// D2-历史问题：状态集必须覆盖部署生命周期——cleanup_dns/cleanup_warning
 	//（JobLifecycle=Downloaded）材料已落库、待部署，此前漏计会与规则页/任务
 	// 页的到期口径分叉（deploymentLifecycleJobStatuses 见 certissuer.go）。
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cert_jobs WHERE status IN ('issued','downloaded','failed','cleanup_dns','cleanup_warning') AND expires_at IS NOT NULL AND datetime(expires_at)<=datetime('now','+`+expiryModifier+` days')`).Scan(&expiringCount); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cert_jobs WHERE status IN ('issued','failed',`+deploymentLifecycleJobStatusSQL+`) AND expires_at IS NOT NULL AND datetime(expires_at)<=datetime('now','+`+expiryModifier+` days')`).Scan(&expiringCount); err != nil {
 		return fmt.Errorf("统计即将到期证书: %w", err)
 	}
 	// D2-历史问题：构造契约允许 caddy=nil（测试/独立运维路径）；nil 下按

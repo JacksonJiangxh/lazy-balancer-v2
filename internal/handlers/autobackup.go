@@ -158,9 +158,16 @@ func pruneAutoBackups(dir string, keepSuccess, keepFailed int) {
 		for rows.Next() {
 			var r pruneRow
 			if err := rows.Scan(&r.id, &r.filename); err != nil {
+				services.Logf("warn", "自动备份裁剪：扫描 %s 行失败: %v", status, err)
 				continue
 			}
 			all = append(all, r)
+		}
+		if err := rows.Err(); err != nil {
+			// 半途失败时清单不完整：放弃本轮裁剪，避免漏删/误删且无痕。
+			services.Logf("warn", "自动备份裁剪：遍历 %s 行失败: %v", status, err)
+			rows.Close()
+			return 0
 		}
 		rows.Close()
 		removed := 0

@@ -519,16 +519,15 @@ type UpdateRuleRequest struct {
 	HealthCheckPath     *string `json:"health_check_path"`
 	HealthCheckInterval int     `json:"health_check_interval"`
 	HealthCheckTimeout  int     `json:"health_check_timeout"`
-	// 历史问题（M16 口径续）：健康检查双阈值指针化——省略（nil）=保留原值，
-	// 显式 0=落库 0（渲染侧 <=0 兜底默认 3/2，caddy.go）。此前非指针 int 无
-	// 合并，部分更新（如仅改名）把存量阈值静默重置为 0。
+	// 历史问题（M16 口径续）：健康检查双阈值指针化——省略（nil）=保留原值。
+	// 显式 0 不再落库：写侧校验 400、启动迁移回填默认 3/2，渲染层直读库值
+	// 且无效值显性失败（无写死兜底）。
 	HealthCheckUnhealthyThreshold *int  `json:"health_check_unhealthy_threshold"`
 	HealthCheckHealthyThreshold   *int  `json:"health_check_healthy_threshold"`
 	EnableActiveHealthCheck       *bool `json:"enable_active_health_check"`
-	// LB-02（M16 口径续）：TCP 三字段指针化——省略（nil）=保留原值，显式 0=真实
-	// 零值落库（tcp_try_duration 0=不重试、tcp_try_interval 0=Caddy 默认间隔、
-	// tcp_health_check_port 0=跟随上游端口）。此前非指针 int 的「0=沿用存量」
-	// 合并使显式清零永不可达。
+	// LB-02（M16 口径续）：TCP 字段指针化——省略（nil）=保留原值。
+	// tcp_try_duration 0=不重试；tcp_try_interval 由启动回填默认 2（写侧
+	// <=0 拒绝），tcp_health_check_port 0=跟随上游端口。
 	TCPHealthCheckPort       *int  `json:"tcp_health_check_port"`
 	TCPProxyProtocol         *bool `json:"tcp_proxy_protocol"`
 	TCPTryDuration           *int  `json:"tcp_try_duration"`

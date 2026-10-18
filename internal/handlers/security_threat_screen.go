@@ -8,9 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -55,102 +53,6 @@ func topThreatEntries(counts map[string]int, n int) []models.SecurityAttackType 
 		entries = entries[:n]
 	}
 	return entries
-}
-
-// ipSource 公网 IP 回显源（v5 多源回退链，用户指定国内可达优先）：
-// 任一源成功（首个合法 IPv4/IPv6）即用；每源独立 3.5s 超时、整体 10s 上限；
-// 源名随响应/审计披露便于排障。GitHub 加速代理仅支持 GitHub 路径
-// （crshttp.go 契约），不适用本类回显服务，直连。
-type ipSource struct {
-	name      string
-	url       string
-	multiLine bool // 文本含附加信息（需正则提取 IP），false=整行即 IP
-}
-
-var publicIPSources = []ipSource{
-	{name: "myip.ipip.net", url: "https://myip.ipip.net", multiLine: true},
-	{name: "cip.cc", url: "https://cip.cc", multiLine: true},
-	{name: "ipv4.icanhazip.com", url: "https://ipv4.icanhazip.com"},
-	{name: "api.ipify.org", url: "https://api.ipify.org"},
-}
-
-var ipExtractPattern = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
-
-// fetchPublicIP 出站获取本机公网 IP：多源按序回退（整体 10s 上限），返回
-// (IP, 源名)。显式按钮触发、无后台轮询。测试经包级缝注入。
-var fetchPublicIP = func() (ip string, source string, err error) {
-	client := &http.Client{Timeout: 3500 * time.Millisecond}
-	deadline := time.Now().Add(10 * time.Second)
-	var lastErr error
-	for _, src := range publicIPSources {
-		if time.Now().After(deadline) {
-			if lastErr == nil {
-				lastErr = fmt.Errorf("整体超时")
-			}
-			break
-		}
-		ip, err := fetchIPFromSource(client, src)
-		if err == nil {
-			return ip, src.name, nil
-		}
-		lastErr = err
-		services.Logf("warn", "threat-screen site detect: source %s failed: %v", src.name, err)
-	}
-	return "", "", lastErr
-}
-
-func fetchIPFromSource(client *http.Client, source ipSource) (string, error) {
-	resp, err := client.Get(source.url)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("响应 %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 512))
-	if err != nil {
-		return "", err
-	}
-	text := strings.TrimSpace(string(body))
-	var ip string
-	if source.multiLine {
-		if m := ipExtractPattern.FindString(text); m != "" {
-			ip = m
-		}
-	} else {
-		ip = text
-	}
-	if net.ParseIP(ip) == nil {
-		return "", fmt.Errorf("未解析到合法 IP")
-	}
-	return ip, nil
-}
-
-// locateSiteCoords 公网 IP → 归属地文本 → 经纬度（本地 xdb + 质心表派生表）：
-// 国内取省短名质心、海外取国家质心；无法定位 ok=false（调用方走手动填写指引）。
-var locateSiteCoords = func(ip string) (lat, lon float64, location string, ok bool) {
-	location = enrichIPLocation(ip)
-	if location == "" {
-		return 0, 0, "", false
-	}
-	parts := strings.SplitN(location, "·", 3)
-	if len(parts) == 0 || parts[0] == "" {
-		return 0, 0, "", false
-	}
-	if parts[0] == "中国" {
-		if len(parts) < 2 {
-			return 0, 0, "", false
-		}
-		if c, found := threatScreenProvinceCentroids[parts[1]]; found {
-			return c[1], c[0], location, true
-		}
-		return 0, 0, "", false
-	}
-	if c, found := threatScreenCountryCentroids[parts[0]]; found {
-		return c[1], c[0], location, true
-	}
-	return 0, 0, "", false
 }
 
 // threatRollupMu 懒固化互斥（每次固化幂等 DELETE+INSERT）；ensure 在批次间
@@ -684,7 +586,10 @@ func StartThreatRollupWarmer(ctx context.Context) {
 	go func() {
 		defer threatRollupWarmerWg.Done()
 		run := func() {
-			hours := 24
+			// 启动即预固化 7 天（UI 最大窗口），赶在保留期/行帽裁剪之前；
+			// 只预热 24h 会让升级后 24h–7d 区间在裁剪后永久少计
+			// （历史 历史问题-01）。单次调用按 25 批有界推进，后续轮次续做。
+			hours := 24 * 7
 			if req := int(threatRollupRequestedHours.Load()); req > hours {
 				hours = req
 			}
@@ -844,7 +749,14 @@ func threatFixMinuteWithMode(tx *sql.Tx, m time.Time, fullRebuild bool) error {
 			continue
 		}
 		country, province := threatLocationParts(enrichIPLocation(ip))
-		k := key{country, province, categorizeAttack(ruleTriggered, ruleMsg), ruleName, action}
+		// top_rules 维度优先 rule_triggered（真正的 WAF/CRS/自定义规则 ID），
+		// 无归属时才回退负载规则名；混用两者会让「TOP 命中规则」名不副实
+		// （历史 历史问题-03）。
+		ruleKey := ruleTriggered
+		if ruleKey == "" {
+			ruleKey = ruleName
+		}
+		k := key{country, province, categorizeAttack(ruleTriggered, ruleMsg), ruleKey, action}
 		agg[k] += count
 		deltaTotal += count
 		if ruleCaddyID != "" {
@@ -1015,7 +927,33 @@ func (h *Handlers) GetThreatScreenFlowEvents(c *gin.Context) {
 		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "逐请求事件流响应超过 1MB 读取上限"})
 		return
 	}
-	c.Data(resp.StatusCode, "application/json", body)
+	// 应用统一信封：Caddy admin 返回裸 JSON，前端 request 封装按 data 字段
+	// 消费（res.data）——裸透传会让 flowTask 每轮判定 enabled=false 并把游标
+	// 重置为 0，正常请求蓝色光流永不绘制（历史 历史问题 实测）。
+	var payload struct {
+		Enabled bool `json:"enabled"`
+		Events  []struct {
+			Seq      uint64 `json:"seq"`
+			Country  string `json:"country"`
+			Province string `json:"province,omitempty"`
+			At       int64  `json:"at"`
+		} `json:"events"`
+		NextSeq uint64 `json:"next_seq"`
+		SampleN uint32 `json:"sample_n"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		services.Logf("warn", "threat-screen events: decode failed: %v", err)
+		c.JSON(http.StatusBadGateway, models.APIResponse{Code: 502, Message: "逐请求事件流响应格式无效"})
+		return
+	}
+	// 国名与聚合端点/前端质心表同口径（geoipnames 单源）：Caddy 发射 xdb
+	// 原始国名（英文），不翻译会让 COUNTRY_CENTROIDS 查找失败并落到海外兜底点。
+	for i := range payload.Events {
+		if name := geoipnames.CountryChinese(payload.Events[i].Country); name != "" {
+			payload.Events[i].Country = name
+		}
+	}
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: payload})
 }
 
 // GetThreatScreenTraffic GET /security/overview/threat-screen/traffic
@@ -1069,30 +1007,6 @@ func fetchThreatTrafficSnapshot(adminURL string) (gin.H, bool) {
 	}, true
 }
 
-// DetectThreatScreenSite POST /security/overview/threat-screen/site-detect
-// 大屏本站坐标自动检测：公网 IP → 本地归属地 → 经纬度。定位失败 422 并指引
-// 手动填写（保留既有写侧校验路径）；出站失败 502 友好文案。
-func (h *Handlers) DetectThreatScreenSite(c *gin.Context) {
-	ip, source, err := fetchPublicIP()
-	if err != nil {
-		services.Logf("warn", "threat-screen site detect: fetch public ip failed: %v", err)
-		recordAudit(c, "检测失败", "大屏坐标", services.FormatAuditDetail("公网 IP 获取失败", services.AuditResultPart("failure")))
-		c.JSON(http.StatusBadGateway, models.APIResponse{Code: 502, Message: "公网 IP 获取失败（离线或超时），请检查网络后重试"})
-		return
-	}
-	lat, lon, location, ok := locateSiteCoords(ip)
-	if !ok {
-		services.Logf("warn", "threat-screen site detect: ip %s (via %s) location unresolvable", ip, source)
-		recordAudit(c, "检测失败", "大屏坐标", services.FormatAuditDetail("归属地无法定位: "+ip+"（源 "+source+"）", services.AuditResultPart("failure")))
-		c.JSON(http.StatusUnprocessableEntity, models.APIResponse{Code: 422, Message: "归属地无法定位（GeoIP 库缺失或网段未知），请手动填写坐标"})
-		return
-	}
-	recordAudit(c, "自动检测", "大屏坐标", services.FormatAuditDetail(location+" ("+ip+"，源 "+source+")"))
-	// APIResponse 包装（全站契约）：前端 request 封装按 data 字段取值，
-	// 裸 JSON 会被消费方判「响应缺失」误走失败分支（v5 实测修复）。
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"ip": ip, "location": location, "lat": lat, "lon": lon, "source": source}})
-}
-
 // threatHourlyBuckets 生成威胁大屏滑动直方图槽（小时或日桶）；返回桶起点
 // （用于落桶）与已零填充的槽。hours<=24 为本地小时槽，否则日桶（上限 30）。
 func threatHourlyBuckets(hours int, now time.Time, offset int) ([]time.Time, []models.SecurityAttackType) {
@@ -1131,7 +1045,7 @@ func threatHourlyBuckets(hours int, now time.Time, offset int) ([]time.Time, []m
 // GetSecurityThreatScreen GET /security/overview/threat-screen?hours=24
 // 返回大屏聚合：窗口总量/拦截率/logged 数/限流拦截数（Caddy metrics 429，
 // 重载口径）/活跃攻击源（近 10min 去重）/国家计数 map（ip_location 首段，
-// 空归属跳过）/Top5 攻击国家、攻击类型与被攻击目标（top_targets，
+// 空归属跳过）/Top3 攻击国家、攻击类型与被攻击目标（top_targets，
 // rule_caddy_id 分组 + lb_rules 名域）。任一安全库查询失败显式 500
 // （历史问题 D2：全零大屏与「无攻击」不可区分）；Caddy metrics 抓取失败降级
 // 200——ratelimit_blocks=0 + ratelimit_available=false，其余维度照常
@@ -1155,6 +1069,7 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 			"rollup_stale":         threatRollupStale(),
 			"rollup_last_success":  "",
 			"rollup_coverage_from": "",
+			"raw_coverage_from":    "",
 			"backfill_incomplete":  false,
 			"total_events":         0,
 			"blocked_events":       0,
@@ -1230,6 +1145,18 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		}
 	} else {
 		backfillIncomplete = true
+	}
+	// 原始事件已被保留期/行帽裁剪时，缺失分钟的固化只能写 0；此刻
+	// coveredFrom 可能已推进到窗口起点，单看覆盖无法发现「不可重建」。
+	// 披露原始表最早事件，并把窗口前段标为不完整（历史 历史问题-01）。
+	rawCoverageFrom := ""
+	if err := db.MetricsDB.QueryRow(`SELECT COALESCE(MIN(event_time),'') FROM security_events`).Scan(&rawCoverageFrom); err != nil {
+		trackErr(err)
+	} else if rawCoverageFrom != "" && rawCoverageFrom > windowStartMinute.Format("2006-01-02 15:04:05") {
+		backfillIncomplete = true
+		if coverageFrom == "" {
+			coverageFrom = rawCoverageFrom[:16]
+		}
 	}
 	var total, blocked int
 	countries := map[string]int{}
@@ -1362,6 +1289,7 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		// 分钟；backfill_incomplete=true 表示本次响应的 total/各维度只覆盖
 		// [rollup_coverage_from, now]，宽窗口回填仍在进行（后续轮询补齐）。
 		"rollup_coverage_from": coverageFrom,
+		"raw_coverage_from":    rawCoverageFrom,
 		"backfill_incomplete":  backfillIncomplete,
 		"total_events":         total,
 		"blocked_events":       blocked,
@@ -1372,9 +1300,9 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		"active_sources":       activeSources,
 		"countries":            countries,
 		"china_provinces":      chinaProvinces,
-		"top_countries":        topThreatEntries(countries, 5),
-		"top_attack_types":     topThreatEntries(familyCounts, 5),
-		"top_rules":            topThreatEntries(ruleCounts, 6),
+		"top_countries":        topThreatEntries(countries, 3),
+		"top_attack_types":     topThreatEntries(familyCounts, 3),
+		"top_rules":            topThreatEntries(ruleCounts, 3),
 		"top_targets":          topTargets,
 		"hourly_hist":          hourly,
 		"attack_type_share":    topThreatEntries(familyCounts, len(familyCounts)),

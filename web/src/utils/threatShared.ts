@@ -1,5 +1,8 @@
 // 威胁大屏共享视觉/几何单源（v2.3.8 审计 历史问题 收口）：地图/地球两引擎共用，
 // 杜绝热力阶梯与点内判定算法双实现漂移（此前靠人工复制保持一致）。
+import { CHINA_PROVINCES } from './chinaProvinces.ts'
+import { COUNTRY_CENTROIDS, FALLBACK_CENTROID, type Centroid } from './countryCentroids.ts'
+
 type Rgb = [number, number, number]
 
 /** 热力四段阶梯（与后端口径无关，纯前端视觉）：底色→暗红→红→亮红。 */
@@ -98,6 +101,19 @@ export function arcEndpoints(
   origin: readonly [number, number],
 ): { startLat: number; startLng: number; endLat: number; endLng: number } {
   return { startLat: origin[1], startLng: origin[0], endLat: self[1], endLng: self[0] }
+}
+
+/** 归属地文本 → 光流起点（中国精确到省质心，其余国家质心，未知走兜底点）。
+ *  地图/地球两引擎共用，避免省/国家查找与回退规则双实现漂移
+ *  （历史 历史问题-5）。 */
+export function arcOriginForLocation(ipLocation: string): Centroid {
+  const [country, province] = ipLocation.split('·')
+  if (!country) return FALLBACK_CENTROID
+  if (country === '中国' && province) {
+    const pv = CHINA_PROVINCES.find((x) => x.short === province || x.name === province)
+    if (pv) return [pv.centroid[0], pv.centroid[1]]
+  }
+  return COUNTRY_CENTROIDS[country] ?? FALLBACK_CENTROID
 }
 
 /** 中国领土口径：世界边界数据中 Taiwan 为独立条目，但威胁大屏按中国的一部分

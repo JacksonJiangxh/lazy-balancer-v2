@@ -2462,6 +2462,12 @@ func validateCustomRulePattern(operator, pattern string) error {
 			return fmt.Errorf("匹配内容不能包含控制字符（含制表符）")
 		}
 	}
+	// coraza 的 @contains/@streq/@beginsWith 会把参数包成 Macro 并做
+	// %{VAR} 宏展开；@rx 不展开。非 regex 运算符里的宏会让规则语义静默
+	// 动态化，畸形宏还会让 NewWAF 拒绝整份配置（历史 历史问题-2）。
+	if operator != "regex" && strings.Contains(pattern, "%{") {
+		return fmt.Errorf("该运算符不支持 %%{...} 宏语法；如需匹配字面量请使用正则运算符并转义 %%")
+	}
 	if strings.HasSuffix(pattern, `\`) {
 		if operator == "regex" {
 			return fmt.Errorf("正则匹配内容不能以反斜杠结尾：末尾反斜杠会与结尾引号组合成转义引号导致规则失效。正则可用 `\\$` 结尾锚定或末尾追加 `(?:)` 空组表达尾部反斜杠")

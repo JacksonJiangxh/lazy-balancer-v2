@@ -993,7 +993,9 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		}
 	}
 
-	if req.DnsFamily == "" {
+	// TCP 渲染零消费 DnsFamily；协议切换路径会清空该列。仅 HTTP 新规则补
+	// 默认，避免同一 TCP 终态出现 ipv4/'' 两种形态（历史 B3-历史问题）。
+	if req.Protocol == "http" && req.DnsFamily == "" {
 		req.DnsFamily = "ipv4"
 	}
 
@@ -2119,6 +2121,19 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 	}
 
+	// PUT enabled=false 与 /disable 同语义：ACME 任务置 disabled 并取消在途，
+	// 否则任务视图仍显示 issued（历史 历史问题-01）。
+	disabledByUpdate := !orphanACME && existingRule.Enabled && !derefBool(req.Enabled)
+	var disabledJobs int64
+	if disabledByUpdate {
+		res, derr := tx.Exec(`UPDATE cert_jobs SET status='disabled', message='规则已禁用，任务已暂停', updated_at=datetime('now') WHERE rule_id=? AND status<>'disabled'`, caddyID)
+		if derr != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "暂停证书任务失败: " + derr.Error()})
+			return
+		}
+		disabledJobs, _ = res.RowsAffected()
+	}
+
 	userIDInt := contextUserID(c)
 	query += "updated_at = datetime('now'), updated_by = ? WHERE caddy_id = ? AND NOT EXISTS (SELECT 1 FROM cert_jobs WHERE rule_id = ? AND status NOT IN ('issued','failed','disabled'))"
 	args = append(args, userIDInt, caddyID, caddyID)
@@ -2209,10 +2224,14 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// 并取消队列在途签发（DisableRule 同序：先收敛任务行后取消）。有界等待；
 	// 失败仅告警继续——规则切换本身已提交，任务行已删除，队列残留由取消的
 	// best-effort 收敛。
-	if orphanACME {
+	if orphanACME || disabledByUpdate {
 		if switchedCertJobs > 0 {
 			services.WriteCertJobLogByRule(caddyID, "WARN", "cancelled", delReason)
 			recordAudit(c, "更新", "证书任务", fmt.Sprintf("规则 %s %s（%d 个）", caddyID, delReason, switchedCertJobs))
+		}
+		if disabledByUpdate && disabledJobs > 0 {
+			services.WriteCertJobLogByRule(caddyID, "WARN", "cancelled", "规则已禁用，证书任务已暂停")
+			recordAudit(c, "更新", "证书任务", fmt.Sprintf("规则 %s 已禁用，暂停证书任务（%d 个）", caddyID, disabledJobs))
 		}
 		if qm := services.GetCAQueueManager(); qm != nil {
 			// B2-01：有界取消等待不得占住全局 Caddy 操作锁；队列屏障阻止
@@ -2274,7 +2293,13 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			// 不写任务状态，requeueCanceledJob 不会复活迁移后置为 'failed' 的行。
 			var inFlightJobID int
 			if scanErr := db.DB.QueryRow(`SELECT id FROM cert_jobs WHERE rule_id=? ORDER BY id DESC LIMIT 1`, caddyID).Scan(&inFlightJobID); scanErr == nil && inFlightJobID > 0 {
+				// 取消等待在途签发退出；worker 部署尾段需要同一 CaddyOpLock。
+				// 持锁等待会形成 30–60s 等待环并阻塞全部配置写（历史
+				// 历史问题-1，与 DeleteRule/DisableRule/DeleteCertJob 同构）：
+				// 先释放全局锁，有界取消后再取回，迁移事务仍在锁内。
+				h.caddyOpMu.Unlock()
 				cancelCertJob(inFlightJobID)
+				h.caddyOpMu.Lock()
 			}
 			certTx, txErr := db.DB.Begin()
 			if txErr != nil {
@@ -3075,9 +3100,6 @@ func updateUpstreamTx(ctx context.Context, tx *sql.Tx, row, incoming storedUpstr
 // {bound:n, unchanged:n, skipped:[{rule_id,reason}]}——bound=RowsAffected>0
 // 的真实变更数，unchanged=已在目标态的同值命中数（历史问题）。
 func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
-
 	var req struct {
 		RuleIDs               []string `json:"rule_ids"`
 		BlockPageStage1ID     int      `json:"block_page_stage1_id"`
@@ -3123,6 +3145,10 @@ func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("单次批量设置最多 %d 条规则（当前 %d 条）", maxBatchRuleBlockPages, len(req.RuleIDs))})
 		return
 	}
+	// 请求体读取/绑定已完成后再取全局写锁：慢速上传不得阻塞全部配置写
+	//（历史 历史问题-03，与 handlers/caddy.go 的锁序契约一致）。
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	if err := validateStageBlockPageRef(req.BlockPageStage1ID, req.BlockPageStage1Status, "阶段 1（IP 访问控制/地域拦截）"); err != nil {
 		var validationErr *configValidationError
 		if errors.As(err, &validationErr) {

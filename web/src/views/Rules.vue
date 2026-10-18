@@ -43,6 +43,15 @@
       <div class="polling-error-meta">{{ healthPollingErrorDescription }}</div>
     </el-alert>
 
+    <el-alert v-if="rulesLoadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+      <template #title>
+        <div class="polling-error-title">
+          <span>负载均衡规则加载失败，下方「暂无规则」不代表真实状态</span>
+          <el-button link type="danger" :loading="loading" @click="fetchRules">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
+
     <el-alert v-if="securityBindingsError" type="warning" :closable="false" show-icon class="polling-error-alert">
       <template #title>
         <div class="polling-error-title">
@@ -322,9 +331,9 @@
                 </div>
               </el-tooltip>
               <!-- TCP 不再 v-if 隐藏（与只读禁用同构）：不可用项禁用 + hover 原因 -->
-              <el-tooltip :disabled="row.protocol === 'http' && !isReadOnly" :content="row.protocol === 'tcp' ? 'TCP 规则不经过安全链' : readOnlyMessage">
+              <el-tooltip :disabled="row.protocol === 'http' && !isReadOnly && !securityBindingsLoading && !securityBindingsError" :content="row.protocol === 'tcp' ? 'TCP 规则不经过安全链' : securityBindingsLoading ? '安全策略绑定加载中…' : securityBindingsError ? '安全策略绑定加载失败，请先点击上方重新加载' : readOnlyMessage">
                 <div>
-                <el-button type="primary" link size="small" :disabled="row.protocol === 'tcp' || isReadOnly || saving" @click="openBindDialog(row)">
+                <el-button type="primary" link size="small" :disabled="row.protocol === 'tcp' || isReadOnly || saving || securityBindingsLoading || securityBindingsError" @click="openBindDialog(row)">
                   安全
                 </el-button>
                 </div>
@@ -1434,8 +1443,13 @@ const securityPolicies = ref<SecurityStagePolicy[]>([])
 const ipLists = ref<SecurityStageIPList[]>([])
 const blockPages = ref<SecurityStageBlockPage[]>([])
 
+const rulesLoadError = ref(false)
 const securityBindingsError = ref(false)
+// 绑定数据未就绪时禁止打开编辑器：组件预选空集 + 全量替换语义会把
+// 「加载失败/未完成」保存成「解除全部绑定」（历史 历史问题-1）。
+const securityBindingsLoading = ref(true)
 const fetchSecurityBindings = async () => {
+  securityBindingsLoading.value = true
   try {
     const [bindingsRes, policiesRes, ipListRes, blockPagesRes] = await Promise.all([
       request.get<APIResponse<typeof securityBindings.value>>('/security/bindings'),
@@ -1453,6 +1467,8 @@ const fetchSecurityBindings = async () => {
     // 流程投影全灰——整体静默等于把加载失败伪装成真实安全状态。改为显性横幅
     // （模板带「重新加载」），全局拦截器仍会 toast 一次具体错误。
     securityBindingsError.value = true
+  } finally {
+    securityBindingsLoading.value = false
   }
 }
 const retrySecurityBindings = (): void => { void fetchSecurityBindings() }
@@ -1558,6 +1574,7 @@ const fetchRules = async () => {
     const res = await request.get<APIResponse<Rule[]>>('/rules', { signal: healthPolling.signal })
     if (disposed || requestSeq !== rulesRequestSeq) return
     rules.value = res.data || []
+    rulesLoadError.value = false
     void fetchSecurityBindings()
     // Fetch health status after rules are loaded
     void healthPolling.run()
@@ -1570,6 +1587,7 @@ const fetchRules = async () => {
     // Error toast is already shown by the global axios interceptor; swallow here
     // so fire-and-forget refresh calls don't surface as unhandled rejections.
     console.error('Failed to fetch rules:', error)
+    rulesLoadError.value = true
   } finally {
     if (!disposed && requestSeq === rulesRequestSeq) loading.value = false
   }
@@ -2435,6 +2453,11 @@ const wizardFormFromRule = (fullRule: Rule): Partial<RuleForm> => ({
   request_body_max_size_mb: fullRule.request_body_max_size_mb || 0,
   upstream_keepalive_timeout: fullRule.upstream_keepalive_timeout || 0,
   server_tokens_hidden: fullRule.server_tokens_hidden || 0,
+  // 阶段拦截页覆盖：复制/编辑均保留（后端 DuplicateRule 同口径）。
+  block_page_stage1_id: fullRule.block_page_stage1_id || 0,
+  block_page_stage1_status: fullRule.block_page_stage1_status || 0,
+  block_page_stage3_id: fullRule.block_page_stage3_id || 0,
+  block_page_stage3_status: fullRule.block_page_stage3_status || 0,
   // NTLM 接管态原样回填；编辑/复制均保留实际接管字段。
   ntlm_compatible: fullRule.ntlm_compatible === 1 ? 1 : 0,
   upstream_force_http1: fullRule.upstream_force_http1 === 1 ? 1 : 0,
@@ -3075,6 +3098,11 @@ const submitWizard = async () => {
   // 「仅负载规则」=副本不含任何安全策略绑定（需后绑定）。普通新建/编辑不受影响
   let copyWithBindings = false
   if (!editingRule.value && isCopyMode.value) {
+    if (securityBindingsLoading.value || securityBindingsError.value) {
+      ElMessage.warning(securityBindingsLoading.value ? '安全策略绑定加载中，请稍后再复制' : '安全策略绑定加载失败，请先重新加载后再复制')
+      saving.value = false
+      return
+    }
     const sourceBoundCount = copySourceRuleId.value ? (securityBindings.value[copySourceRuleId.value] || []).length : 0
     try {
       await ElMessageBox.confirm(
@@ -3148,6 +3176,10 @@ const submitWizard = async () => {
       tls_http_redirect: wizardForm.tls_http_redirect,
       enable_compress: wizardForm.enable_compress,
       compress_types: wizardForm.compress_types.join(',') || 'gzip',
+      block_page_stage1_id: wizardForm.block_page_stage1_id || 0,
+      block_page_stage1_status: wizardForm.block_page_stage1_status || 0,
+      block_page_stage3_id: wizardForm.block_page_stage3_id || 0,
+      block_page_stage3_status: wizardForm.block_page_stage3_status || 0,
       request_body_max_size_mb: wizardForm.request_body_max_size_mb || 0,
       upstream_keepalive_timeout: wizardForm.upstream_keepalive_timeout || 0,
       server_tokens_hidden: wizardForm.server_tokens_hidden || 0,
@@ -3286,6 +3318,10 @@ const bindDialogVisible = ref(false)
 const bindDialogRule = ref<Rule | null>(null)
 
 const openBindDialog = (rule: Rule): void => {
+  if (securityBindingsLoading.value || securityBindingsError.value) {
+    ElMessage.warning(securityBindingsLoading.value ? '安全策略绑定加载中，请稍后再试' : '安全策略绑定加载失败，请先重新加载')
+    return
+  }
   bindDialogRule.value = rule
   bindDialogVisible.value = true
 }

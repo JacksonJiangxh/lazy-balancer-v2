@@ -835,9 +835,29 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			queued++
 		}
 		skippedTotal := skippedCooldown + skippedBlocked + skippedInFlight + skippedUnsupported
-		if pausedMidBatch {
+		if pausedMidBatch && queued == 0 {
 			auditFailure("skipped", formulaSkippedNote(skippedCooldown, skippedInFlight, skippedBlocked, skippedUnsupported), "证书签发队列已暂停")
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "证书签发队列已暂停，无法创建签发任务"})
+			return
+		}
+		if pausedMidBatch && queued > 0 {
+			// 已入队 N>0 后队列被并发暂停：按部分成功返回，不能 409 谎报全失败
+			// （历史 B3-历史问题）。剩余目标留给下次触发。
+			skipNote := formulaSkippedNote(skippedCooldown, skippedInFlight, skippedBlocked, skippedUnsupported)
+			message := fmt.Sprintf("已创建 %d 个签发任务；证书签发队列被暂停，剩余目标未处理", queued)
+			if skipNote != "" {
+				message += "（" + skipNote + "）"
+			}
+			recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, message, services.AuditResultPart("partial")))
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message, Data: gin.H{
+				"queued":            queued,
+				"failed":            len(failed),
+				"skipped_cooldown":  skippedCooldown,
+				"skipped_in_flight": skippedInFlight,
+				"skipped_blocked":   skippedBlocked,
+				"skipped_other":     skippedUnsupported,
+				"paused_mid_batch":  true,
+			}})
 			return
 		}
 		if queued == 0 && len(failed) > 0 {

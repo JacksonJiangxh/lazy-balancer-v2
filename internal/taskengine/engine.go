@@ -1071,6 +1071,7 @@ func (e *Engine) RecoverOrphans() int64 {
 	}
 	res, err := db.DB.Exec(`UPDATE task_runs SET status='interrupted', finished_at=?, message=COALESCE(message,'')||'（进程重启回收）' WHERE status='running'`, engineNowStr())
 	if err != nil {
+		log.Printf("WARNING: taskengine: 回收中断任务失败（残留 running 行）: %v", err)
 		return 0
 	}
 	n, _ := res.RowsAffected()
@@ -1166,13 +1167,22 @@ func (e *Engine) runNow(id, trigger, operator string) (int64, error) {
 // RunAsync 原子占位后异步执行一次（F-历史问题）：入口失败在任何 HTTP 响应
 // 之前同步返回（可映射 409/503），成功即已占位——「已受理」不再说谎。
 func (e *Engine) RunAsync(id, trigger, operator string) error {
+	return e.RunAsyncResult(id, trigger, operator, nil)
+}
+
+// RunAsyncResult 与 RunAsync 同语义，另在任务体结束后回调执行结果（供调用方
+// 补记成功/失败补偿审计——同步预占位不能吞掉任务体失败）。
+func (e *Engine) RunAsyncResult(id, trigger, operator string, onDone func(error)) error {
 	res, err := e.reserveRun(id, trigger)
 	if err != nil {
 		return err
 	}
 	go func() {
 		defer res.release()
-		_, _ = e.executeRun(res, id, trigger, operator)
+		_, runErr := e.executeRun(res, id, trigger, operator)
+		if onDone != nil {
+			onDone(runErr)
+		}
 	}()
 	return nil
 }
@@ -1514,10 +1524,15 @@ func appendTaskLogLine(path, line string) {
 	_ = os.MkdirAll(taskLogDir, 0755)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
+		log.Printf("WARNING: taskengine: open task log %s failed: %v", path, err)
 		return
 	}
-	defer f.Close()
-	fmt.Fprintln(f, line)
+	if _, err := fmt.Fprintln(f, line); err != nil {
+		log.Printf("WARNING: taskengine: write task log %s failed: %v", path, err)
+	}
+	if err := f.Close(); err != nil {
+		log.Printf("WARNING: taskengine: close task log %s failed: %v", path, err)
+	}
 }
 
 func taskLogAppend(taskID, line string) {
@@ -1892,6 +1907,7 @@ func PurgeTaskRuns(days int) int64 {
 	}
 	res, err := db.DB.Exec(`DELETE FROM task_runs WHERE started_at < datetime(?, ?)`, engineNowStr(), fmt.Sprintf("-%d days", days))
 	if err != nil {
+		log.Printf("WARNING: taskengine: 清理过期任务记录失败: %v", err)
 		return 0
 	}
 	n, _ := res.RowsAffected()

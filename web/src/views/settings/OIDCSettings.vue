@@ -250,6 +250,7 @@ const test = async () => {
 }
 
 const save = async () => {
+  if (saving.value) return
   if (!form.issuer.trim()) { ElMessage.warning('请填写服务地址'); return }
   if (!form.clientId.trim()) { ElMessage.warning('请填写 Client ID'); return }
   if (!hasSecret.value && !form.clientSecret) { ElMessage.warning('请填写 Client Secret'); return }

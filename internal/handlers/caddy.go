@@ -569,6 +569,12 @@ func (h *Handlers) PreviewConfigUpdate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
+	// 与 UpdateConfig 同门：preview 200 后 PUT 不应因存量规则聚合校验变 400
+	//（历史 历史问题-1）。
+	if err := validateEnabledStoredRuleConfigs(c.Request.Context()); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		return
+	}
 	old, err := loadConfigSnapshot()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取当前配置失败"})
@@ -798,9 +804,8 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		return
 	}
 	committed = true
-	// 2026-09-07 裁定 L2：成功提交且应用后清除既往失败标记（对齐 finishTxApply 口径，
-	// 陈旧 caddy_apply_error 不再长亮横幅）。
-	h.recordCaddyApplyResult(nil)
+	// 成功清横幅由 reloadNote 单收口（历史 历史问题-2）；此处重复 UPDATE
+	// 只增加写放大且违反「note 唯一收口」约定。
 	services.ApplyLogLevel()
 	// 历史问题（历史）：task_log_size_mb 经本端点写库，服务端 5 分钟 TTL
 	// 缓存此前零失效点——改设置后最长 5 分钟仍按旧阈值滚动任务日志。无条件

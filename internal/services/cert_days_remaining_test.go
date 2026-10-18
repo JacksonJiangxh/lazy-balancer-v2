@@ -66,22 +66,27 @@ func TestGetCertRenewalDays_logsNonPositiveStoredValue(t *testing.T) {
 	log.SetOutput(&buf)
 	t.Cleanup(func() { log.SetOutput(oldWriter) })
 
-	for _, days := range []int{0, -5} {
-		buf.Reset()
-		if _, err := database.Exec("UPDATE global_config SET cert_renewal_days=? WHERE id=1", days); err != nil {
-			t.Fatalf("seed cert_renewal_days=%d: %v", days, err)
-		}
-
-		// When
-		got := GetCertRenewalDays()
-
-		// Then：返回治理默认 30，且 error 级留痕含库值与字段名
-		if got != 30 {
-			t.Fatalf("cert_renewal_days=%d: GetCertRenewalDays()=%d, want 30", days, got)
-		}
-		if !strings.Contains(buf.String(), "cert_renewal_days") || !strings.Contains(buf.String(), "ERROR") || !strings.Contains(buf.String(), "30") {
-			t.Fatalf("cert_renewal_days=%d: log=%q, want error 级留痕（字段名 + 降级值）", days, buf.String())
-		}
+	// 0=默认 30（合法语义，不告警）；负值=异常，必须 error 留痕。
+	buf.Reset()
+	if _, err := database.Exec("UPDATE global_config SET cert_renewal_days=0 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetCertRenewalDays(); got != 30 {
+		t.Fatalf("cert_renewal_days=0: GetCertRenewalDays()=%d, want 30", got)
+	}
+	if strings.Contains(buf.String(), "ERROR") {
+		t.Fatalf("0=默认 30 不应告警，log=%q", buf.String())
+	}
+	buf.Reset()
+	if _, err := database.Exec("UPDATE global_config SET cert_renewal_days=-5 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	got := GetCertRenewalDays()
+	if got != 30 {
+		t.Fatalf("cert_renewal_days=-5: GetCertRenewalDays()=%d, want 30", got)
+	}
+	if !strings.Contains(buf.String(), "cert_renewal_days") || !strings.Contains(buf.String(), "ERROR") || !strings.Contains(buf.String(), "30") {
+		t.Fatalf("cert_renewal_days=-5: log=%q, want error 级留痕（字段名 + 降级值）", buf.String())
 	}
 
 	// 回归形状：合法值原样生效且不告警

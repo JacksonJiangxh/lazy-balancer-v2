@@ -194,7 +194,7 @@ func TestSecurityEventsRetentionCleanup_stopsPromptlyWhenContextCanceled(t *test
 	deleted := -1
 	go func() {
 		defer close(done)
-		deleted = securityEventsRetentionCleanup(ctx)
+		deleted, _ = securityEventsRetentionCleanup(ctx)
 	}()
 
 	// Then: 清理迅速返回且仅完成一个批次（未删净），证明中途被取消而非跑完
@@ -241,7 +241,7 @@ func TestSecurityEventsRetentionCleanup_batchesAgeDelete(t *testing.T) {
 	}
 
 	// When
-	deleted := securityEventsRetentionCleanup(context.Background())
+	deleted, _ := securityEventsRetentionCleanup(context.Background())
 
 	// Then：全部过期事件被分批删除，近期事件保留
 	if got := countSecurityEventsByType(t, "expired"); got != 0 {
@@ -339,7 +339,7 @@ func TestSecurityEventsRetentionCleanup_trimsOldestWhenRowCapExceeded(t *testing
 	}
 
 	// When
-	deleted := securityEventsRetentionCleanup(context.Background())
+	deleted, _ := securityEventsRetentionCleanup(context.Background())
 
 	// Then 行数收敛到 cap，且删的是最旧两行（不是随机/最新）
 	var count int

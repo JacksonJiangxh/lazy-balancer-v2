@@ -21,6 +21,7 @@
     <div v-if="activeTab === 'basic'" class="basic-settings-grid">
       <BasicSettings
         v-model:settings="settings"
+        :config-loaded="configLoaded"
         @save="handleSaveBasic"
       />
       <CaddyGlobalSettings
@@ -206,14 +207,17 @@ const applyCertKeys = (data: ConfigPayload) => {
   global.value.dns_provider = data.dns_provider || 'dnspod'
 }
 
+const configLoaded = ref(false)
 const fetchSettings = async () => {
   const requestSeq = ++settingsRequestSeq
+  configLoaded.value = false
   try {
     const res = await request.get('/config')
     if (requestSeq === settingsRequestSeq && res.data) {
       applyBasicKeys(res.data)
       applyCaddyKeys(res.data)
       applyCertKeys(res.data)
+      configLoaded.value = true
     }
   } catch (error) {
     console.error('Failed to fetch settings:', error)

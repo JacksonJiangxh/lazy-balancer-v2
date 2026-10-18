@@ -179,8 +179,16 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	return err
 }
 
+// Cleanup 在 Caddy reload/优雅停机时冲刷审计管线（上游 coraza 不调用
+// AuditLogWriter.Close）。
+func (h *SecurityBlockedCounter) Cleanup() error {
+	FlushAuditPipelines()
+	return nil
+}
+
 // Interface guards(编译期契约,零运行时成本)。
 var (
 	_ caddy.Provisioner           = (*SecurityBlockedCounter)(nil)
 	_ caddyhttp.MiddlewareHandler = (*SecurityBlockedCounter)(nil)
+	_ caddy.CleanerUpper          = (*SecurityBlockedCounter)(nil)
 )

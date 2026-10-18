@@ -110,6 +110,30 @@ func TestListSecurityEvents_returnsRuleAndPolicyNames(t *testing.T) {
 	}
 }
 
+func TestListSecurityEvents_excludeKeepsNullRuleTriggered(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityEventsRouter(t)
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time,client_ip,method,uri,event_type,rule_triggered,rule_msg,action) VALUES
+		('2026-08-12 10:00:01','203.0.113.7','GET','/null','crs',NULL,'other','blocked')`); err != nil {
+		t.Fatal(err)
+	}
+	recorder := getRequest(t, router, "/security/events?rule_triggered_exclude=SQL注入")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var resp struct {
+		Data struct {
+			Total int `json:"total"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Data.Total != 1 {
+		t.Fatalf("total=%d, want 1（NULL rule_triggered 不得被 NOT(NULL) 吞掉）: %s", resp.Data.Total, recorder.Body.String())
+	}
+}
+
 func TestListSecurityEvents_legacyRowsFallBackToJoinedNames(t *testing.T) {
 	// Given a rule and policy, plus a pre-migration event with empty snapshot columns
 	setupSecurityPolicyTestDB(t)
@@ -370,37 +394,6 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 				t.Fatalf("categorizeAttack(%q, %q) = %q, want %q", tc.ruleTriggered, tc.ruleMsg, got, tc.want)
 			}
 		})
-	}
-}
-
-func TestGetSecurityOverview_disclosesRawEventRetentionScope(t *testing.T) {
-	setupSecurityPolicyTestDB(t)
-	router := newSecurityEventsRouter(t)
-	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time,client_ip,method,uri,event_type,rule_triggered,rule_msg,action) VALUES
-		('2020-01-01 00:00:00','203.0.113.7','GET','/old','crs','942100','SQL Injection','blocked'),
-		('2026-10-18 10:00:00','203.0.113.8','GET','/new','crs','942100','SQL Injection','blocked')`); err != nil {
-		t.Fatal(err)
-	}
-	response := getRequest(t, router, "/security/overview")
-	if response.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
-	}
-	var payload struct {
-		Data struct {
-			RawCoverageFrom  string `json:"raw_coverage_from"`
-			RawRetentionNote string `json:"raw_retention_note"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload.Data.RawCoverageFrom != "2020-01-01 00:00:00" {
-		t.Fatalf("raw_coverage_from=%q, want oldest retained event", payload.Data.RawCoverageFrom)
-	}
-	for _, want := range []string{"Top IP", "原始", "威胁大屏"} {
-		if !strings.Contains(payload.Data.RawRetentionNote, want) {
-			t.Fatalf("raw_retention_note=%q, want disclosure containing %q", payload.Data.RawRetentionNote, want)
-		}
 	}
 }
 

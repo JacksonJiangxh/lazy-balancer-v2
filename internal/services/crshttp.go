@@ -318,7 +318,13 @@ func fetchGitHubLatestTagViaProxy(ctx context.Context, repoSlug string) (string,
 		return "", fmt.Errorf("读取代理响应 %s: %w", proxiedURL, err)
 	}
 	if m := ghLatestTagInBodyRegexp.FindSubmatch(body); m != nil {
-		return string(m[1]), nil
+		// 与 Location/API 两条漏斗同口径校验形状；正则可捕获换行等控制字符，
+		// 不校验会污染任务日志/版本 message/审计详情（历史 历史问题-1）。
+		tag := string(m[1])
+		if err := validateReleaseTag(tag); err != nil {
+			return "", err
+		}
+		return tag, nil
 	}
 	return "", fmt.Errorf("代理响应 %s 未包含 /releases/tag/ 跳转", proxiedURL)
 }

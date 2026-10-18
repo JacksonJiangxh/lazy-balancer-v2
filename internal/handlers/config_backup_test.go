@@ -435,6 +435,25 @@ func TestImportConfigBackup_skips_empty_content_block_pages(t *testing.T) {
 	}
 }
 
+func TestSkipEmptyBlockPages_clearsDanglingReferences(t *testing.T) {
+	tables := map[string][]map[string]any{
+		"security_block_pages": {{"id": 2, "name": "empty-page", "content": ""}},
+		"lb_rules":             {{"caddy_id": "lb_x", "block_page_stage1_id": 2, "block_page_stage1_status": 403, "block_page_stage3_id": 2, "block_page_stage3_status": 418}},
+		"security_policies":    {{"id": 5, "block_page_id": 2}},
+	}
+	warnings := skipEmptyBlockPages(tables)
+	if len(warnings) != 1 {
+		t.Fatalf("warnings=%v, want one skip", warnings)
+	}
+	rule := tables["lb_rules"][0]
+	if rule["block_page_stage1_id"] != 0 || rule["block_page_stage1_status"] != 0 || rule["block_page_stage3_id"] != 0 || rule["block_page_stage3_status"] != 0 {
+		t.Fatalf("rule refs=%v, want cleared", rule)
+	}
+	if tables["security_policies"][0]["block_page_id"] != 0 {
+		t.Fatalf("policy ref=%v, want cleared", tables["security_policies"][0])
+	}
+}
+
 // N+13 H2-F3：预览端与导入端同序软跳过——空内容拦截页在预览即告警，
 // summary 计数反映跳后行集，不得预览静默、导入才跳。
 func TestValidateConfigImport_reports_empty_content_block_page_skips(t *testing.T) {
@@ -2359,7 +2378,7 @@ func TestImportConfigBackup_normalizes_null_rows_for_all_backup_tables(t *testin
 				"created_at": nil, "updated_at": nil},
 			{"id": 92, "name": "null-dns-live", "dns_provider": "dnspod", "enabled": 1},
 		},
-		"cert_jobs": {{"id": 1, "rule_id": "lb_nullacme", "domain": "nullacme.example.test", "status": "issued",
+		"cert_jobs": {{"id": 1, "rule_id": "lb_nullacme", "domain": "nullacme.example.test", "status": "queued",
 			"ca_provider_id": nil, "renewal_attempts": nil, "deployment_attempts": nil, "created_at": nil,
 			"message": nil, "expires_at": nil, "key_pem": nil, "ca_available_after": nil,
 			"last_error_code": nil, "deployment_available_after": nil, "updated_at": nil}},

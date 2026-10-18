@@ -92,8 +92,11 @@ func VerifyCrawler(ip, engineID string) bool {
 	ok, cacheable := false, true
 	if geoipnames.CrawlerEngineVerifyMethod(engineID) == geoipnames.CrawlerVerifyIPRange {
 		// 官方声明不支持 nslookup 的厂商（360）：官方 IP 段验证（名单表=
-		// 定时更新任务的快照，更新即生效，无需重载）
+		// 定时更新任务的快照，更新即生效，无需重载）。O(log n) 查找本身很便宜，
+		// 不缓存正向结论——否则 CIDR 被官方移除后仍可豁免至多 1h
+		// （历史 E-历史问题）。
 		ok = verifyCrawlerIPRangeFromList(ip, engineID)
+		cacheable = false
 	} else {
 		if !acquireCrawlerSlot() {
 			return false // 瞬态资源饱和：本次 fail-closed，但不形成持久结论。

@@ -27,6 +27,7 @@
 
 ### 协议冲突检测
 - **HTTP/HTTPS 规则**：可以与其他 HTTP/HTTPS 规则共用端口（同协议）
+- **TLS/明文混布**：同一端口不能同时存在 `enable_tls=1` 与 `enable_tls=0` 的启用 HTTP 规则（监听器形态二选一）
 - **TCP 规则**：独占端口，不能与 HTTP/HTTPS 规则共用端口
 
 ```

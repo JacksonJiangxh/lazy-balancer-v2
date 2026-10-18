@@ -358,10 +358,14 @@ func (h *Handlers) GetBranding(c *gin.Context) {
 	// 最坏经门内采样延迟 60s 可见，与上方门语义一致）。
 	if brandingSyncGateAllow() {
 		needApply := false
-		if changed, _ := SyncDefaultLandingText(h.cfg.DataDir); changed {
+		if changed, err := SyncDefaultLandingText(h.cfg.DataDir); err != nil {
+			services.Logf("warn", "branding landing 同步失败: %v", err)
+		} else if changed {
 			needApply = true
 		}
-		if changed, _ := SeedDefaultBlockPage(h.cfg.DataDir); changed {
+		if changed, err := SeedDefaultBlockPage(h.cfg.DataDir); err != nil {
+			services.Logf("warn", "branding 默认拦截页播种失败: %v", err)
+		} else if changed {
 			needApply = true
 		}
 		// 品牌镜像(2026-09-11):文件变化时刷新 global_config.branding_json,

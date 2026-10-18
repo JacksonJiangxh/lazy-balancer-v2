@@ -38,6 +38,16 @@ import (
 // AllowedPathPrefix 是算子参数的目录白名单（防目录穿越）。测试可改。
 var AllowedPathPrefix = "/app/waf/"
 
+// ipListLoadLocks 按路径串行化解析；条目数受投影文件数量约束（有界）。
+var ipListLoadLocks sync.Map // path -> *sync.Mutex
+
+func lockIPListLoad(path string) func() {
+	value, _ := ipListLoadLocks.LoadOrStore(path, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
 // MaxFileBytes / MaxEntries 是加载侧体积与条目的硬上限（防异常文件拖垮
 // 内存；威胁库下载侧 200000 条上限先行拦截，此为纵深）。测试可收窄。
 var (
@@ -245,6 +255,19 @@ func loadIPListFile(path string, fresh bool) (state *ipListFileState, err error)
 	// stat 形态命中即复用——构建期（fresh）同享：策略名单稳定命名下同路径
 	// 同字节跳写（mtime 不变），威胁库/热路径原子重写 mtime 必变；N 规则引用
 	// 同一文件只解析一次。
+	if cached != nil && cached.mtime.Equal(info.ModTime()) && cached.size == info.Size() {
+		cached.lastCheckTick.Store(monotonicNowNano())
+		clearStaleReport(path)
+		return cached, nil
+	}
+
+	// 同一路径的解析单飞：1s 节流窗口过期后并发请求不得同时 ReadFile+解析
+	// 超大名单（历史 E-历史问题）。拿到锁后重新检查缓存，后到者直接复用。
+	unlock := lockIPListLoad(path)
+	defer unlock()
+	ipListCache.RLock()
+	cached = ipListCache.states[path]
+	ipListCache.RUnlock()
 	if cached != nil && cached.mtime.Equal(info.ModTime()) && cached.size == info.Size() {
 		cached.lastCheckTick.Store(monotonicNowNano())
 		clearStaleReport(path)

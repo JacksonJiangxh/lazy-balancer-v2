@@ -133,7 +133,7 @@ func (s *ClusterService) Snapshot(ctx context.Context, sinceVersion int, clientF
 		mac := hmac.New(sha256.New, []byte(tokenKey))
 		_, _ = mac.Write(canonical)
 		snapshot.Signature = hex.EncodeToString(mac.Sum(nil))
-		if _, err := s.db.ExecContext(ctx, "UPDATE nodes SET registration_secret=NULL, registration_secret_expires_at=NULL WHERE cluster_token_hash=? AND registration_secret IS NOT NULL", tokenHash(tokenKey)); err != nil {
+		if _, err := s.db.ExecContext(ctx, "UPDATE nodes SET registration_secret=NULL, registration_secret_expires_at=NULL WHERE cluster_token_hash=? AND registration_secret IS NOT NULL AND "+masterRoleConditionSQL, tokenHash(tokenKey)); err != nil {
 			return models.ClusterSnapshot{}, false, fmt.Errorf("确认旧协议集群令牌交付: %w", err)
 		}
 	}
@@ -768,6 +768,16 @@ func (s *ClusterService) snapshotSecurityIP2RegionVersion(ctx context.Context, s
 	return versions, rows.Err()
 }
 
+// snapshotTime 把快照时间统一到秒：从端落库使用 crsTimeLayout（秒），
+// 若主端哈希输入保留亚秒，主从节哈希永久不等并触发多余全量重拉
+// （历史 D2-历史问题）。
+func snapshotTime(t time.Time) time.Time {
+	if t.IsZero() {
+		return t
+	}
+	return t.UTC().Truncate(time.Second)
+}
+
 func (s *ClusterService) dumpTableAsJSON(ctx context.Context, store snapshotStore, table, columns, orderBy string) (json.RawMessage, error) {
 	rows, err := store.QueryContext(ctx, fmt.Sprintf("SELECT %s FROM %s ORDER BY %s", columns, table, orderBy))
 	if err != nil {
@@ -790,7 +800,11 @@ func (s *ClusterService) dumpTableAsJSON(ctx context.Context, store snapshotStor
 		}
 		row := make(map[string]interface{})
 		for i, col := range colNames {
-			row[col] = values[i]
+			if t, ok := values[i].(time.Time); ok {
+				row[col] = snapshotTime(t)
+			} else {
+				row[col] = values[i]
+			}
 		}
 		result = append(result, row)
 	}
@@ -818,6 +832,8 @@ func (s *ClusterService) snapshotACME(ctx context.Context, store snapshotStore) 
 			rows.Close()
 			return nil, fmt.Errorf("扫描快照 CA 提供商: %w", err)
 		}
+		provider.CreatedAt = snapshotTime(provider.CreatedAt)
+		provider.UpdatedAt = snapshotTime(provider.UpdatedAt)
 		state.CAProviders = append(state.CAProviders, provider)
 	}
 	if err := rows.Err(); err != nil {
@@ -837,6 +853,10 @@ func (s *ClusterService) snapshotACME(ctx context.Context, store snapshotStore) 
 		var config models.CertificateConfig
 		if err := rows.Scan(&config.ID, &config.Name, &config.DNSProvider, &config.DNSCredentials, &config.Enabled, &config.CreatedAt, &config.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("扫描快照证书配置: %w", err)
+		}
+		config.CreatedAt = snapshotTime(config.CreatedAt)
+		if config.UpdatedAt.Valid {
+			config.UpdatedAt.Time = snapshotTime(config.UpdatedAt.Time)
 		}
 		state.CertificateConfigs = append(state.CertificateConfigs, config)
 	}
@@ -966,6 +986,10 @@ func (s *ClusterService) snapshotAllPathRules(ctx context.Context, store snapsho
 			&pathRule.ResponseMode, &pathRule.ResponseStatus, &pathRule.ResponseBody, &pathRule.ResponseContentType, &pathRule.RedirectTo, &pathRule.CreatedAt, &pathRule.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("扫描快照路径规则: %w", err)
 		}
+		pathRule.CreatedAt = snapshotTime(pathRule.CreatedAt)
+		if pathRule.UpdatedAt.Valid {
+			pathRule.UpdatedAt.Time = snapshotTime(pathRule.UpdatedAt.Time)
+		}
 		if upstreamsJSON.Valid {
 			if err := json.Unmarshal([]byte(upstreamsJSON.String), &pathRule.Upstreams); err != nil {
 				// 历史问题：同族收敛——上游列畸形只隔离该路由行（下发空上游会让
@@ -1000,6 +1024,7 @@ func (s *ClusterService) snapshotUsers(ctx context.Context, store snapshotStore)
 		if passwordChangedAt.Valid {
 			user.PasswordChangedAt = &passwordChangedAt.String
 		}
+		user.CreatedAt = snapshotTime(user.CreatedAt)
 		users = append(users, user)
 	}
 	return users, rows.Err()
@@ -1043,6 +1068,7 @@ func (s *ClusterService) snapshotAPIKeys(ctx context.Context, store snapshotStor
 		if err := rows.Scan(&key.ID, &key.Name, &key.KeyHash, &key.KeyPrefix, &key.CreatedBy, &key.ExpiresAt, &key.IsEnabled, &key.MCPEnabled, &key.ReadOnly, &whitelistJSON, &key.LastUsed, &key.CreatedAt); err != nil {
 			return nil, fmt.Errorf("扫描快照密钥: %w", err)
 		}
+		key.CreatedAt = snapshotTime(key.CreatedAt)
 		if whitelistJSON != "" {
 			if err := json.Unmarshal([]byte(whitelistJSON), &key.MCPIPWhitelist); err != nil {
 				// 历史问题 同族：白名单畸形不能降级为空名单（会放宽 MCP 访问面），

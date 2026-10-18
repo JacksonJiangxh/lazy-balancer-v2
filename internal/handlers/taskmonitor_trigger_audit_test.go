@@ -161,8 +161,11 @@ func TestTriggerSystemTask_doubleClickRaceNoMisleadingFailAudit(t *testing.T) {
 		go func() { r.ServeHTTP(rec2, req2); done <- struct{}{} }()
 		<-done
 		<-done
-		if rec1.Code != http.StatusOK || rec2.Code != http.StatusOK {
-			// 预检已拦（其一 409）——竞态未成形，释放后重试
+		// 同步预占位后正确形态=一胜 200、一败 409；两者都 409 说明
+		// 预检先拦，释放后重试。
+		oneWon := (rec1.Code == http.StatusOK && rec2.Code == http.StatusConflict) ||
+			(rec1.Code == http.StatusConflict && rec2.Code == http.StatusOK)
+		if !oneWon {
 			close(release)
 			waitNotInFlight(taskID)
 			continue
@@ -184,7 +187,9 @@ func TestTriggerSystemTask_doubleClickRaceNoMisleadingFailAudit(t *testing.T) {
 		waitNotInFlight(taskID)
 	}
 	if !materialized {
-		t.Skip("50 次尝试内双击竞态未成形（预检均拦截）——未验证到目标分支")
+		// 回归必须触达 ErrAlreadyRunning 补偿分支；跳过会让该断言在
+		// 慢速/单核 CI 上永久假绿（历史 B3-历史问题）。
+		t.Fatal("50 次尝试内双击竞态未成形（预检均拦截）——未验证到目标分支")
 	}
 }
 

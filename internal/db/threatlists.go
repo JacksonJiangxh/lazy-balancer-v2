@@ -80,8 +80,32 @@ func migrateThreatSystemListNames() error {
 			return fmt.Errorf("failed to check threat system list name conflict %s: %w", sl.Name, err)
 		}
 		if conflicts > 0 {
-			log.Printf("WARN: 内置威胁名单改名跳过——新名 %q 已被库中既有名单占用（旧名 %q 行保留，请人工改名后重启收敛）", sl.Name, legacy)
-			continue
+			// 新名被用户名单占用时不能跳过：旧 system 名单会永久失更。
+			// 把占用的用户行改名为带 id 的唯一名称（保 id/数据），再让
+			// system 行接管规范名（历史 历史问题-1）。
+			rows, rerr := DB.Query(`SELECT id FROM security_ip_lists WHERE name=? AND system=0`, sl.Name)
+			if rerr != nil {
+				return fmt.Errorf("query conflicting threat system list rows: %w", rerr)
+			}
+			var ids []int64
+			for rows.Next() {
+				var id int64
+				if err := rows.Scan(&id); err == nil {
+					ids = append(ids, id)
+				}
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return fmt.Errorf("iterate conflicting threat system list rows: %w", err)
+			}
+			rows.Close()
+			for _, id := range ids {
+				renamed := fmt.Sprintf("%s（用户 %d）", sl.Name, id)
+				if _, err := DB.Exec(`UPDATE security_ip_lists SET name=?, updated_at=datetime('now') WHERE id=?`, renamed, id); err != nil {
+					return fmt.Errorf("rename conflicting user list %d: %w", id, err)
+				}
+			}
+			log.Printf("WARN: 内置威胁名单新名 %q 被用户名单占用，已改名用户行（ids=%v）后接管规范名", sl.Name, ids)
 		}
 		if _, err := DB.Exec(`UPDATE security_ip_lists SET name=?, description=?, updated_at=datetime('now') WHERE system=1 AND name=?`, sl.Name, sl.Description, legacy); err != nil {
 			return fmt.Errorf("failed to rename threat system list %s: %w", legacy, err)

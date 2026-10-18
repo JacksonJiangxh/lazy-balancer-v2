@@ -131,6 +131,47 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 	return path, nil
 }
 
+// IPListProjectionSnapshot 是渲染前投影目录的字节快照（仅 .txt 投影文件）。
+type IPListProjectionSnapshot map[string][]byte
+
+// SnapshotIPListProjections 供 CLI 预检失败时自回滚（历史 历史问题-5）。
+func SnapshotIPListProjections() IPListProjectionSnapshot {
+	snapshot := IPListProjectionSnapshot{}
+	entries, err := os.ReadDir(IPListDataDir)
+	if err != nil {
+		return snapshot
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".txt") {
+			continue
+		}
+		path := filepath.Join(IPListDataDir, entry.Name())
+		if data, err := os.ReadFile(path); err == nil {
+			snapshot[path] = data
+		}
+	}
+	return snapshot
+}
+
+// RestoreIPListProjections 删除渲染新增的 .txt 并回写快照内容。
+func RestoreIPListProjections(snapshot IPListProjectionSnapshot) {
+	entries, err := os.ReadDir(IPListDataDir)
+	if err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".txt") {
+				continue
+			}
+			path := filepath.Join(IPListDataDir, entry.Name())
+			if _, keep := snapshot[path]; !keep {
+				_ = os.Remove(path)
+			}
+		}
+	}
+	for path, data := range snapshot {
+		_ = os.WriteFile(path, data, 0o644)
+	}
+}
+
 // ---------- 历史问题：@ipListFast 投影文件 + 运行期缓存 GC ----------
 
 // ipListFileMaxAge 是 GC 删除未引用文件的超龄门槛（24h）：避开 Caddy 重载

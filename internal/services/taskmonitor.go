@@ -117,7 +117,8 @@ func collectCertJobRows() []TaskInfo {
 		// 终态计数（24h 窗口内 issued=成功 1、failed=失败 1；超窗行显示
 		// 但不计数——Runs24h 语义为近 24 小时）。
 		success, fail := 0, 0
-		if t, perr := time.Parse("2006-01-02 15:04:05", updatedAt); perr == nil && time.Since(t) < 24*time.Hour {
+		// 统一双布局解析（RFC3339/平面 UTC），避免导入/历史形态静默归零。
+		if t := parseUTCSlot(updatedAt); !t.IsZero() && time.Since(t) < 24*time.Hour {
 			switch status {
 			case "issued":
 				success = 1
@@ -125,6 +126,7 @@ func collectCertJobRows() []TaskInfo {
 				fail = 1
 			}
 		}
+		runs24h := success + fail
 		ti := TaskInfo{
 			ID:       fmt.Sprintf("cert-job:%d", id),
 			Name:     "ACME 签发 · " + domain,
@@ -139,7 +141,7 @@ func collectCertJobRows() []TaskInfo {
 			LastRun: &TaskRunInfo{StartedAt: localDisplayUTC(updatedAt), FinishedAt: localDisplayUTC(updatedAt),
 				Trigger: "queue", Result: status, Message: message},
 		}
-		ti.Success24h, ti.Fail24h = success, fail
+		ti.Runs24h, ti.Success24h, ti.Fail24h = runs24h, success, fail
 		ti.Status = TaskStatusIdle
 		switch status {
 		case "failed":

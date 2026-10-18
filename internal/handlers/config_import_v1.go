@@ -993,24 +993,27 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		return
 	}
 	if err := session.commit(affectedRuleIDs, pendingCerts); err != nil {
+		// 队列阶段=DB 已提交，与 v2 同语义返回 200+partial（500 会让前端
+		// 按“已回滚”处理并诱发重复导入，历史 历史问题-1）。
+		if importFailurePhase(err) == importPhaseQueue {
+			auditDetail := err.Error()
+			if len(disabledConflicts) > 0 {
+				auditDetail = services.FormatAuditDetail(auditDetail, "冲突置为禁用："+formatDisabledRuleConflicts(disabledConflicts))
+			}
+			recordAudit(c, "部分失败", "配置备份", auditDetail)
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "配置已导入，但证书任务恢复失败: " + err.Error(), Data: gin.H{
+				"imported": imported, "disabled_conflicts": disabledConflicts,
+				"partial": true, "warnings": []string{"证书任务恢复失败: " + err.Error()},
+			}})
+			return
+		}
 		status := http.StatusInternalServerError
 		message := "配置导入失败: " + err.Error()
 		if importFailureCaddyRejected(err) {
 			status = http.StatusBadRequest
 			message = "备份生成的配置未通过 Caddy 验证，未执行导入: " + err.Error()
 		}
-		if importFailurePhase(err) == importPhaseQueue {
-			message = "配置已导入但证书任务恢复失败: " + err.Error()
-		}
-		auditAction := "导入失败"
-		if importFailurePhase(err) == importPhaseQueue {
-			auditAction = "部分失败"
-		}
-		auditDetail := err.Error()
-		if importFailurePhase(err) == importPhaseQueue && len(disabledConflicts) > 0 {
-			auditDetail = services.FormatAuditDetail(auditDetail, "冲突置为禁用："+formatDisabledRuleConflicts(disabledConflicts))
-		}
-		recordAudit(c, auditAction, "配置备份", auditDetail)
+		recordAudit(c, "导入失败", "配置备份", err.Error())
 		c.JSON(status, models.APIResponse{Code: status, Message: message, Data: gin.H{"imported": imported, "disabled_conflicts": disabledConflicts}})
 		return
 	}

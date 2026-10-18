@@ -658,11 +658,11 @@ func TestGetSecurityThreatScreen_contentCards(t *testing.T) {
 	if len(payload.Data.TopRules) != 2 {
 		t.Fatalf("top_rules=%+v, want 2 项（SQL注入检测 ×3 + 回退规则 2）", payload.Data.TopRules)
 	}
-	if payload.Data.TopRules[0].Name != "SQL注入检测" || payload.Data.TopRules[0].Value != 3 {
-		t.Errorf("top_rules[0]=%+v, want {SQL注入检测 3}", payload.Data.TopRules[0])
+	if payload.Data.TopRules[0].Name != "942100" || payload.Data.TopRules[0].Value != 3 {
+		t.Errorf("top_rules[0]=%+v, want {942100 3}（触发规则 ID 维度）", payload.Data.TopRules[0])
 	}
 	if payload.Data.TopRules[1].Name != "2" || payload.Data.TopRules[1].Value != 1 {
-		t.Errorf("top_rules[1]=%+v, want {2 1}（rule_name 空回退 rule_triggered）", payload.Data.TopRules[1])
+		t.Errorf("top_rules[1]=%+v, want {2 1}（触发规则 ID）", payload.Data.TopRules[1])
 	}
 
 	// hourly_hist：恒 24 槽（hour 0-23 升序），命中槽计数、空槽零填；
@@ -1236,6 +1236,62 @@ func TestGetSecurityThreatScreen_topTargets(t *testing.T) {
 	}
 }
 
+// 升级/裁剪后原始事件只覆盖窗口尾部时，即使 rollup 把空分钟固化为 0，
+// 也必须披露原始覆盖起点并标记回填不完整（不可把少计当完整窗口）。
+func TestGetSecurityThreatScreen_disclosesRawCoverageGap(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	t.Cleanup(resetThreatScreenCachesForTest)
+	resetThreatRollupWarmerForTest()
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	seedThreatScreenEvent(t, utcStringAgo(time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
+
+	recorder := getRequest(t, router, "/security/overview/threat-screen?hours=168")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			BackfillIncomplete bool   `json:"backfill_incomplete"`
+			RawCoverageFrom    string `json:"raw_coverage_from"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Data.RawCoverageFrom == "" {
+		t.Fatal("raw_coverage_from 必须披露原始事件最早时间")
+	}
+	if !payload.Data.BackfillIncomplete {
+		t.Fatalf("原始覆盖起点晚于窗口起点时必须标记回填不完整: %+v", payload.Data)
+	}
+}
+
+func TestGetSecurityThreatScreen_topTargetsLimitThree(t *testing.T) {
+	// Given: 5 条规则各有窗口内事件
+	setupSecurityPolicyTestDB(t)
+	t.Cleanup(resetThreatScreenCachesForTest)
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	for i := 0; i < 5; i++ {
+		id := "lb_top" + string(rune('a'+i))
+		seedThreatLBRule(t, id, "站点"+id, id+".example.com")
+		for n := 0; n <= i; n++ {
+			seedThreatRuleEvent(t, utcStringAgo(time.Minute), "203.0.113.7", id, "blocked")
+		}
+	}
+
+	recorder := getRequest(t, router, "/security/overview/threat-screen")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload threatScreenPayload
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data.TopTargets) != 3 {
+		t.Fatalf("top_targets=%+v, want 3 项", payload.Data.TopTargets)
+	}
+}
+
 func TestGetSecurityThreatScreen_topTargetsCached(t *testing.T) {
 	// Given: 一条规则 + 1 条窗口内事件
 	setupSecurityPolicyTestDB(t)
@@ -1428,6 +1484,9 @@ func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 	now := time.Now()
+	// 73h 前原始事件保证原始表覆盖到 72h 窗口起点之前（否则按 历史问题-01
+	// 口径应披露“窗口前段不可重建”，不能断言回填完成）。
+	seedThreatScreenEvent(t, now.UTC().Add(-73*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "203.0.113.6", "942100", "SQL Injection", "blocked")
 	seedThreatScreenEvent(t, now.UTC().Add(-30*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
 	seedThreatScreenEvent(t, now.UTC().Add(-2*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "203.0.113.8", "941100", "XSS", "blocked")
 

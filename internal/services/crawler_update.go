@@ -29,35 +29,44 @@ type CrawlerUpdateManager struct{}
 // validateCrawlerEntriesSanity 非结构化源（html/plain）的合理性门（历史问题-02）：
 // 解析结果至少一条须落在该引擎声明的官方段（geoipnames 单一事实源）内，
 // 否则视为错误页/版本串污染，保留上次快照。JSON 源已由结构化字段校验承担。
-func validateCrawlerEntriesSanity(engineID, format string, entries []string) error {
+func validateCrawlerEntriesSanity(engineID, format string, entries []string) ([]string, error) {
 	if strings.EqualFold(strings.TrimSpace(format), "json") {
-		return nil
+		return entries, nil
 	}
 	if len(entries) == 0 {
-		return errors.New("解析无产出（疑似错误页/限流页），保留上次快照")
+		return nil, errors.New("解析无产出（疑似错误页/限流页），保留上次快照")
 	}
 	declared := crawlerEngineDeclaredRanges(engineID)
 	if len(declared) == 0 {
-		return nil // 引擎未声明官方段：无可对照的合理性口径
+		return entries, nil // 引擎未声明官方段：无可对照的合理性口径
 	}
-	parsed := make([]netip.Prefix, 0, len(entries))
-	for _, entry := range entries {
-		if prefix, err := netip.ParsePrefix(entry); err == nil {
-			parsed = append(parsed, prefix)
+	official := make([]netip.Prefix, 0, len(declared))
+	for _, raw := range declared {
+		if prefix, err := netip.ParsePrefix(raw); err == nil {
+			official = append(official, prefix)
 		}
 	}
-	for _, raw := range declared {
-		official, err := netip.ParsePrefix(raw)
+	if len(official) == 0 {
+		return entries, nil
+	}
+	// 与官方段有交集的条目才保留；页面里的示例/无关 IP 不得整体写入豁免名单。
+	filtered := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		prefix, err := netip.ParsePrefix(entry)
 		if err != nil {
 			continue
 		}
-		for _, prefix := range parsed {
-			if official.Contains(prefix.Addr()) || prefix.Contains(official.Addr()) {
-				return nil
+		for _, off := range official {
+			if off.Contains(prefix.Addr()) || prefix.Contains(off.Addr()) {
+				filtered = append(filtered, entry)
+				break
 			}
 		}
 	}
-	return fmt.Errorf("解析结果（%d 条）未落在 %s 声明的官方 IP 段内（疑似错误页/版本串污染），保留上次快照", len(entries), engineID)
+	if len(filtered) == 0 {
+		return nil, fmt.Errorf("解析结果（%d 条）未落在 %s 声明的官方 IP 段内（疑似错误页/版本串污染），保留上次快照", len(entries), engineID)
+	}
+	return filtered, nil
 }
 
 // crawlerEngineDeclaredRanges 返回引擎声明的官方 IP 段（geoipnames 单一源）。
@@ -168,7 +177,7 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 			// 历史问题-02（历史）：非结构化源（html/plain）增加合理性门——
 			// 错误页/限流页只要含四段数字就可能覆盖豁免名单；解析结果至少一条
 			// 必须落在该引擎声明的官方段内，否则保留上次快照。
-			perr = validateCrawlerEntriesSanity(src.Name, src.Format, entries)
+			entries, perr = validateCrawlerEntriesSanity(src.Name, src.Format, entries)
 		}
 		if perr != nil {
 			if firstErr == nil {

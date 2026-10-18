@@ -107,7 +107,21 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 			// 「触发」审计只在 Trigger 成功后记录（非自记族），并发双击败者
 			// 拿 ErrAlreadyRunning 静默、skipped 终态静默、真失败记补偿审计。
 			// gin.Context 在 handler 返回后池化复用：审计上下文必须在此预取。
-			services.TriggerTaskAsync(te, id, triggerAuditContext(c, "任务监控", m.Name))
+			// 同步预占位：暂停/停止/角色拒绝必须在写响应前返回 409/503，
+			// 不能先 200 再在 goroutine 里吞错（历史 历史问题-01）。
+			actx := triggerAuditContext(c, "任务监控", m.Name)
+			if err := te.RunAsyncResult(id, "manual", actx.Operator, func(runErr error) {
+				services.RecordTaskTriggerResult(id, actx, runErr)
+			}); err != nil {
+				switch {
+				case errors.Is(err, taskengine.ErrAlreadyRunning), errors.Is(err, taskengine.ErrSchedulingPaused), errors.Is(err, taskengine.ErrEngineStopped):
+					c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务当前不可触发: " + err.Error()})
+				default:
+					recordAudit(c, "触发失败", "任务监控", "手动触发任务 "+m.Name+" 失败: "+err.Error())
+					c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务触发失败: " + err.Error()})
+				}
+				return
+			}
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 			return
 		}
@@ -123,6 +137,10 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 // 定时/循环=停止/恢复调度；常驻=启停自管理循环；
 // 触发=不可调度（前端显示禁用开关）。
 func (h *Handlers) ToggleSystemTask(c *gin.Context) {
+	if configImportBusy() {
+		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "配置导入进行中，暂不能调整任务调度"})
+		return
+	}
 	id := c.Param("id")
 	if !requireMasterNode(c) {
 		return
@@ -202,6 +220,10 @@ func (h *Handlers) CancelSystemTask(c *gin.Context) {
 // 族（cert-waiting-ca 等）启停走 toggle 端点，本端点对其恒 400。v2.0 前
 // 「Continuous 族可控」注释已随四类型标准作废。
 func (h *Handlers) ControlSystemTask(c *gin.Context) {
+	if configImportBusy() {
+		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "配置导入进行中，暂不能启停任务"})
+		return
+	}
 	id := c.Param("id")
 	if !requireMasterNode(c) {
 		return

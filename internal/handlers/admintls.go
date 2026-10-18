@@ -388,9 +388,15 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		}
 	}
 
-	if _, err := db.DB.Exec(`UPDATE global_config SET admin_tls_enabled=?, admin_tls_mode=?, admin_tls_cert=?, admin_tls_key=?, updated_at=datetime('now') WHERE id=1`,
-		enabled, mode, cert, key); err != nil {
+	res, err := db.DB.Exec(`UPDATE global_config SET admin_tls_enabled=?, admin_tls_mode=?, admin_tls_cert=?, admin_tls_key=?, updated_at=datetime('now') WHERE id=1`,
+		enabled, mode, cert, key)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "保存 HTTPS 配置失败: " + err.Error()})
+		return
+	}
+	if n, rowsErr := res.RowsAffected(); rowsErr != nil || n != 1 {
+		// global_config 行缺失/损坏时不能报成功并重启（历史 B2-历史问题）。
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "HTTPS 配置未落库（配置行不存在）"})
 		return
 	}
 

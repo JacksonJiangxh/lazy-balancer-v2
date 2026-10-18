@@ -72,8 +72,6 @@ var auditRoutePolicies = map[string]AuditPolicy{
 	"PUT /api/v1/settings/oidc":       AuditPolicyExplicit,
 	"DELETE /api/v1/settings/oidc":    AuditPolicyExplicit,
 	"POST /api/v1/settings/oidc/test": AuditPolicyExplicit,
-	// 威胁大屏本站坐标自动检测（v4）：出站探测 handler 显式留痕（成功/失败）
-	"POST /api/v1/security/overview/threat-screen/site-detect": AuditPolicyExplicit,
 	// 大屏流量采集租约：UI 生命周期内部动作（打开申请/关闭释放），
 	// 高频且无安全语义，显式跳过审计。
 	"POST /api/v1/security/overview/threat-screen/collector":   AuditPolicySkip,

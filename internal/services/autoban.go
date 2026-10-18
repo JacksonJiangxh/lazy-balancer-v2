@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -279,6 +280,7 @@ type autobanFeedItem struct {
 	IP            string
 	Action        string
 	RuleTriggered string
+	At            time.Time
 }
 
 var autobanMu sync.Mutex
@@ -336,7 +338,7 @@ func autobanObserveBatch(items []autobanFeedItem) {
 		return
 	}
 	for _, it := range items {
-		autobanObserveEventScoped(cfg, it.IP, it.Action, it.RuleTriggered)
+		autobanObserveEventScopedAt(cfg, it.IP, it.Action, it.RuleTriggered, it.At)
 	}
 }
 
@@ -354,13 +356,34 @@ func autobanObserveEvent(ip, action, ruleTriggered string) {
 }
 
 func autobanObserveEventScoped(cfg AutobanConfig, ip, action, ruleTriggered string) {
+	autobanObserveEventScopedAt(cfg, ip, action, ruleTriggered, time.Time{})
+}
+
+// autobanSourceEligible 排除验证爬虫与信任名单事件：它们是正常/已信任
+// 流量，计入会把 Googlebot 等写入封禁名单（历史 历史问题-02）。
+func autobanSourceEligible(ruleTriggered string) bool {
+	if ruleTriggered == "3" || ruleTriggered == "12" {
+		return false
+	}
+	if n, err := strconv.Atoi(ruleTriggered); err == nil && n >= 810000 && n < 900000 {
+		return false
+	}
+	return true
+}
+
+func autobanObserveEventScopedAt(cfg AutobanConfig, ip, action, ruleTriggered string, at time.Time) {
 	// 窗口无效（<=0，D2 消费侧护栏）跳过计数——不落写死兜底（旧 5 分钟
 	// 兜底已删，历史 D2-③）。
 	window := time.Duration(cfg.WindowMinutes) * time.Minute
-	if ip == "" || ruleTriggered == "" || window <= 0 || !autobanActionMatches(cfg.Scope, action) {
+	if ip == "" || ruleTriggered == "" || window <= 0 || !autobanActionMatches(cfg.Scope, action) || !autobanSourceEligible(ruleTriggered) {
 		return
 	}
 	now := autobanNow()
+	// 积压回放（摄取停摆恢复/轮转补采）不得按到达时间瞬时达标：早于当前
+	// 窗口的事件不计数（历史 历史问题-01）。
+	if !at.IsZero() && now.Sub(at) > window {
+		return
+	}
 	var capWarn bool
 	autobanMu.Lock()
 	w, exists := autobanWindows[ip]
@@ -919,6 +942,18 @@ func AutobanDisableFlush() {
 // 视为已被并发启用、本轮按启用继续。残留窗收窄至复查与 StopLoop 之间，
 // 彻底消除需引擎代际令牌（不在本修复范围）。
 func RunAutobanCycle(rc taskengine.RunContext) error {
+	// demote/停止会在 SetRole 取消 ctx；autoban 必须消费 ctx 并复核角色，
+	// 否则在途轮次仍会写主库名单（历史 历史问题-02，与 threat/CRS 同族）。
+	if rc.Ctx != nil {
+		select {
+		case <-rc.Ctx.Done():
+			return taskengine.ErrTaskSkipped
+		default:
+		}
+	}
+	if !updateRunStillMaster() {
+		return taskengine.ErrTaskSkipped
+	}
 	if !AutobanEnabled() && !autobanRecheckEnabled() {
 		if te := TaskEngine(); te != nil {
 			te.StopLoop(AutobanTaskID)

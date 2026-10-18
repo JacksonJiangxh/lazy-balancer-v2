@@ -170,17 +170,33 @@ const rateLimitBucketCapacity = 1024
 // 自己的计数桶（照常 10/min 限流），内存上限不变。
 // 调用方须持有 loginRateBuckets.Lock。
 func evictLeastRecentlyUsedRateLimitBucketLocked() {
+	// 未认证机器端点的 credential 桶可由攻击者用任意令牌无限生成；若按
+	// 全局 LRU 淘汰，1024 个唯一凭证即可冲掉 <ip>|login，重置登录/MFA
+	// 暴力破解限流（历史 历史问题-1）。淘汰优先只看 credential 桶，
+	// 非凭证作用域（login/register/ip）保留为受保护集合；仅当全是
+	// credential 桶时才回退全表淘汰。
+	victim, _ := lruVictimLocked(true)
+	if victim == "" {
+		victim, _ = lruVictimLocked(false)
+	}
+	if victim != "" {
+		delete(loginRateBuckets.entries, victim)
+	}
+}
+
+func lruVictimLocked(credentialOnly bool) (string, int64) {
 	var victim string
 	oldest := int64(1<<63 - 1)
 	for key, bucket := range loginRateBuckets.entries {
+		if credentialOnly && !strings.Contains(key, "|credential:") {
+			continue
+		}
 		if used := bucket.lastUsed.Load(); used < oldest {
 			oldest = used
 			victim = key
 		}
 	}
-	if victim != "" {
-		delete(loginRateBuckets.entries, victim)
-	}
+	return victim, oldest
 }
 
 var loginRateBuckets = struct {
@@ -481,7 +497,9 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 		// 表门控,伪造回调不应消耗真实登录额度)。
 		v1.GET("/auth/oidc/status", h.OIDCStatus)
 		v1.GET("/auth/oidc/login", loginRateLimit(), h.OIDCLogin)
-		v1.GET("/auth/oidc/callback", h.OIDCCallback)
+		// callback 匿名可达且失败分支会写审计行；独立桶限流（不消耗登录
+		// 额度），防止伪造回调线速灌审计库（历史 B2-历史问题）。
+		v1.GET("/auth/oidc/callback", clusterRateLimit("oidc-callback", 60, "OIDC 回调请求过于频繁，请稍后再试"), h.OIDCCallback)
 		v1.GET("/branding", h.GetBranding)
 		v1.POST("/cluster/register", clusterRegisterRateLimit(), h.RegisterClusterNode)
 		v1.GET("/cluster/register/:id/status", clusterMachineRateLimit("registration-status", clusterCredentialFromRegistration), registrationAuth(db.DB), h.GetClusterRegistrationStatus)
@@ -609,8 +627,6 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				admin.PUT("/security/rules/:caddy_id/policies", h.SetRuleSecurityPolicies)
 				admin.POST("/security/policies/batch-bind", h.BatchBindSecurityPolicies)
 				admin.POST("/security/policies/:id/split", h.SplitSecurityPolicy)
-				// 威胁大屏本站坐标自动检测（v4）：显式按钮触发出站探测，管理员
-				admin.POST("/security/overview/threat-screen/site-detect", h.DetectThreatScreenSite)
 				admin.PUT("/security/crs/auto-update", h.UpdateCRSAutoUpdate)
 				admin.PUT("/security/crs/schedule", h.UpdateCRSSchedule)
 				admin.POST("/security/crs/update", h.StartCRSUpdate)

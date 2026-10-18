@@ -55,6 +55,25 @@ func TriggerTaskAsync(te *taskengine.Engine, taskID string, actx TriggerAuditCon
 	}()
 }
 
+// RecordTaskTriggerResult 供同步预占位（Engine.RunAsyncResult）的完成回调：
+// 成功记「触发」，失败（除并发/跳过语义）记「触发失败」；自记族成功不重复记，
+// 但任务体失败仍补「触发失败」——执行器可能尚未写入任何失败审计。
+func RecordTaskTriggerResult(taskID string, actx TriggerAuditContext, runErr error) {
+	if TaskTriggerSelfRecordsAudit(taskID) && runErr == nil {
+		return
+	}
+	if runErr == nil {
+		RecordAuditLog(actx.Operator, "触发", actx.Family, triggerAuditDetail(actx), actx.IP)
+		return
+	}
+	if errors.Is(runErr, taskengine.ErrAlreadyRunning) || errors.Is(runErr, taskengine.ErrTaskSkipped) {
+		return
+	}
+	Logf("error", "手动触发任务 %s 失败: %v", taskID, runErr)
+	RecordAuditLog(actx.Operator, "触发失败", actx.Family,
+		fmt.Sprintf("手动触发任务 %s 失败: %v", actx.Name, runErr), actx.IP)
+}
+
 // triggerAuditDetail 成功触发审计 detail（调用方可用 Detail 覆盖文案）。
 func triggerAuditDetail(actx TriggerAuditContext) string {
 	if actx.Detail != "" {

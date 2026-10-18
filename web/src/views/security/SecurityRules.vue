@@ -71,6 +71,15 @@
       </div>
     </el-card>
 
+    <el-alert v-if="rulesLoadError" type="error" :closable="false" show-icon class="error-banner mb-5">
+      <template #title>
+        <div class="polling-error-title">
+          <span>CRS 规则文件加载失败，「暂无规则文件」不代表真实状态</span>
+          <el-button link type="danger" :loading="loadingRules" @click="fetchRules">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
+
     <el-card>
       <el-tabs v-model="activeTab">
         <el-tab-pane label="CRS 规则" name="rules">
@@ -78,7 +87,7 @@
             <el-input v-model="searchQuery" placeholder="搜索规则文件名或分类" clearable :prefix-icon="Search" class="search-input" @clear="searchRules" @keyup.enter="searchRules" />
           </div>
           <el-table :data="rules" v-loading="loadingRules" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="" @row-click="openRuleContent" style="cursor: pointer">
-            <template #empty><el-empty description="暂无规则文件" :image-size="60" /></template>
+            <template #empty><el-empty :description="rulesLoadError ? '加载失败，请重试' : '暂无规则文件'" :image-size="60" /></template>
             <el-table-column prop="filename" label="文件名" min-width="320" show-overflow-tooltip />
             <el-table-column prop="category" label="分类" width="160">
               <template #default="{ row }"><el-tag size="small" effect="plain" type="info">{{ row.category }}</el-tag></template>
@@ -1435,6 +1444,7 @@ const searchRules = () => { page.value = 1; fetchRules() }
 const onRulesSizeChange = () => { page.value = 1; fetchRules() }
 // 乱序响应守卫（历史问题）：翻页/搜索快速切换时，慢响应晚到不得覆盖当前页
 let rulesRequestSeq = 0
+const rulesLoadError = ref(false)
 const fetchRules = async () => {
   const requestSeq = ++rulesRequestSeq
   loadingRules.value = true
@@ -1445,8 +1455,11 @@ const fetchRules = async () => {
     if (requestSeq !== rulesRequestSeq) return
     rules.value = res.data?.rules || []
     total.value = res.data?.total || 0
+    rulesLoadError.value = false
   } catch {
-    // 失败保留上一页数据（全局拦截器已 toast）
+    // 失败保留上一页数据（全局拦截器已 toast）；首拉失败时显式横幅，
+    // 不得把失败渲染成「暂无规则文件」（历史 历史问题-1）。
+    if (rules.value.length === 0) rulesLoadError.value = true
   } finally {
     if (requestSeq === rulesRequestSeq) loadingRules.value = false
   }

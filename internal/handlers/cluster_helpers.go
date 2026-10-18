@@ -16,6 +16,8 @@ func (h *Handlers) requireMaster(c *gin.Context) bool {
 		return false
 	}
 	if !isMaster {
+		// 机器可读码：从端不得靠中文文案判断「目标已降级」（历史 历史问题-1）。
+		c.Header("X-LB-Error-Code", "master_required")
 		clusterError(c, http.StatusForbidden, "该操作仅允许在主节点执行", nil)
 		return false
 	}

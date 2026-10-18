@@ -16,7 +16,7 @@ import {
 } from '@/utils/threatProjection'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
-import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, POINTY_TOP_HEX_VERTICES, drillCountryAllowed } from '@/utils/threatShared'
+import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation } from '@/utils/threatShared'
 import { COUNTRY_CENTROIDS, FALLBACK_CENTROID, type Centroid } from '@/utils/countryCentroids'
 import { loadAdmin1Tables } from '@/utils/admin1Loader'
 import { FLOW_ATTACK_COLOR as ATTACK_COLOR, FLOW_NORMAL_COLOR as NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowAttackWidth, flowNormalWidth } from '@/utils/threatTheme'
@@ -37,6 +37,7 @@ import { FLOW_ATTACK_COLOR as ATTACK_COLOR, FLOW_NORMAL_COLOR as NORMAL_COLOR, F
 const MAX_PIXEL_RATIO = 2
 const MAX_ACTIVE_ARCS = 30
 const ARC_FLIGHTS = 3
+const ARC_NORMAL_FLIGHTS = 2
 const ARC_FLIGHT_SECONDS = FLOW_FLIGHT_MS / 1000
 const ARC_FLIGHT_GAP = 0.22
 const ARC_FLIGHT_PARTICLES = 12
@@ -729,16 +730,14 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       const arc = arcs[i]
       arc.elapsed += delta
       arc.flightT += delta
-      const life = arc.normal
-        ? ARC_FLIGHT_SECONDS + ARC_FLIGHT_GAP
-        : ARC_FLIGHTS * (ARC_FLIGHT_SECONDS + ARC_FLIGHT_GAP)
+      const life = (arc.normal ? ARC_NORMAL_FLIGHTS : ARC_FLIGHTS) * (ARC_FLIGHT_SECONDS + ARC_FLIGHT_GAP)
       if (arc.flightT >= ARC_FLIGHT_SECONDS) {
         if (!arc.pulsed) {
           arc.pulsed = true
           if (!arc.normal) spawnRipple()
         }
         if (arc.flightT >= ARC_FLIGHT_SECONDS + ARC_FLIGHT_GAP) {
-          if (arc.normal || arc.flight + 1 >= ARC_FLIGHTS) {
+          if ((arc.normal && arc.flight + 1 >= ARC_NORMAL_FLIGHTS) || (!arc.normal && arc.flight + 1 >= ARC_FLIGHTS)) {
             arcs.splice(i, 1)
             continue
           }
@@ -771,7 +770,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
         gradient.addColorStop(1, color)
         ctx.strokeStyle = gradient
         ctx.lineWidth = arc.normal ? flowNormalWidth(arc.weight) : flowAttackWidth(arc.weight)
-        ctx.globalAlpha = arc.normal ? 0.5 : Math.min(1, Math.max(0.05, (life - arc.elapsed) / 0.4))
+        ctx.globalAlpha = arc.normal ? 0.78 : Math.min(1, Math.max(0.05, (life - arc.elapsed) / 0.4))
         ctx.stroke()
         ctx.globalAlpha = 1
         if (arc.label) {
@@ -786,11 +785,11 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
         for (let p = 0; p < ARC_FLIGHT_PARTICLES; p++) {
           const t = Math.max(0, head - p * (0.16 / ARC_FLIGHT_PARTICLES))
           const pt = bezierPoint(from, ctrl, to, t)
-          const r = arc.normal ? 1.1 : 2 - p * 0.12
+          const r = arc.normal ? 1.5 : 2 - p * 0.12
           ctx.beginPath()
           ctx.arc(pt.x, pt.y, Math.max(0.4, r), 0, Math.PI * 2)
           ctx.fillStyle = color
-          ctx.globalAlpha = (arc.normal ? 0.5 : 0.9) * (1 - p / ARC_FLIGHT_PARTICLES)
+          ctx.globalAlpha = (arc.normal ? 0.78 : 0.9) * (1 - p / ARC_FLIGHT_PARTICLES)
           ctx.fill()
         }
         ctx.globalAlpha = 1
@@ -866,16 +865,18 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     if (!sweepGrad || Math.abs(sweepAngle - sweepGradAngle) > 0.05 ||
       Math.abs(serverPos.x - sweepGradX) > 0.5 || Math.abs(serverPos.y - sweepGradY) > 0.5) {
       sweepGrad = ctx.createConicGradient ? ctx.createConicGradient(sweepAngle, serverPos.x, serverPos.y) : null
+      if (sweepGrad) {
+        // stop 只在新渐变上设置一次；复用期间重复 addColorStop 会持续膨胀。
+        sweepGrad.addColorStop(0, 'rgba(120,190,255,0.22)')
+        sweepGrad.addColorStop(0.14, 'rgba(120,190,255,0.05)')
+        sweepGrad.addColorStop(1, 'rgba(120,190,255,0)')
+      }
       sweepGradAngle = sweepAngle
       sweepGradX = serverPos.x
       sweepGradY = serverPos.y
     }
     const grad = sweepGrad
     if (!grad) return
-    // 前缘亮、尾缘淡的单束扫掠（0~0.9rad 扇区）
-    grad.addColorStop(0, 'rgba(120,190,255,0.22)')
-    grad.addColorStop(0.14, 'rgba(120,190,255,0.05)')
-    grad.addColorStop(1, 'rgba(120,190,255,0)')
     ctx.save()
     ctx.beginPath()
     ctx.moveTo(serverPos.x, serverPos.y)
@@ -1101,28 +1102,12 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   return {
     addArcForLocation(ipLocation: string, weight = 1): void {
       if (!ipLocation) return
-      const [country, province] = ipLocation.split('·')
-      if (!country) return
-      if (country === '中国') {
-        const pv = province ? CHINA_PROVINCES.find((x) => x.short === province || x.name === province) : undefined
-        const c: Centroid = pv ? [pv.centroid[0], pv.centroid[1]] : COUNTRY_CENTROIDS['中国']
-        spawnArc(c, false, weight)
-        startLoop()
-        return
-      }
-      spawnArc(COUNTRY_CENTROIDS[country] ?? FALLBACK_CENTROID, false, weight)
+      spawnArc(arcOriginForLocation(ipLocation), false, weight)
       startLoop()
     },
     addNormalArcForLocation(ipLocation: string, weight = 1): void {
       if (!ipLocation) return
-      const [country, province] = ipLocation.split('·')
-      if (!country) return
-      if (country === '中国') {
-        const pv = province ? CHINA_PROVINCES.find((x) => x.short === province || x.name === province) : undefined
-        spawnArc(pv ? [pv.centroid[0], pv.centroid[1]] : COUNTRY_CENTROIDS['中国'], true, weight)
-      } else {
-        spawnArc(COUNTRY_CENTROIDS[country] ?? FALLBACK_CENTROID, true, weight)
-      }
+      spawnArc(arcOriginForLocation(ipLocation), true, weight)
       startLoop()
     },
     setCountries(entries: CountryHeat[]): void {

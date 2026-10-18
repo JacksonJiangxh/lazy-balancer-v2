@@ -240,6 +240,23 @@ func TestExportIPList_threatUsesFileTruth(t *testing.T) {
 	}
 }
 
+func TestExportIPList_corruptEntriesReturns500(t *testing.T) {
+	newBackupTestHandlers(t)
+	res, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, entries, system) VALUES ('corrupt', '{bad', 0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists/:id/export", h.ExportIPList)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/ip-lists/"+strconv.FormatInt(id, 10)+"/export", nil))
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500（畸形 entries 不得 200 空文件）", resp.Code, resp.Body.String())
+	}
+}
+
 // RDB 文件化回归（v2.3.4）：system=1 行 entries=”（空串非 NULL）时
 // ListIPLists 不得因 json_array_length(”) 报 500；威胁库条数改由
 // security_threat_sources.entry_count 供给。

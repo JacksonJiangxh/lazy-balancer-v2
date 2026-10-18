@@ -93,8 +93,12 @@ func GetCertRenewalDays() int {
 		Logf("error", "GetCertRenewalDays: failed to read global_config, using default %d: %v", db.DefaultCertRenewalDays, err)
 		return db.DefaultCertRenewalDays
 	}
-	if days <= 0 {
-		Logf("error", "GetCertRenewalDays: cert_renewal_days 库值无效（%d <=0）——启动回填只处理 <=0，写侧 0-90/导入 1-90 之外的最后防线，疑似带外直写/旧导入；本轮降级默认 %d 留痕", days, db.DefaultCertRenewalDays)
+	if days == 0 {
+		// 0 的 UI/写侧语义=默认 30（不是异常）；与导入钳制同口径。
+		return db.DefaultCertRenewalDays
+	}
+	if days < 0 {
+		Logf("error", "GetCertRenewalDays: cert_renewal_days 库值无效（%d <0）——疑似带外直写/旧导入；本轮降级默认 %d 留痕", days, db.DefaultCertRenewalDays)
 		return db.DefaultCertRenewalDays
 	}
 	// 历史问题-05：读侧上界与写侧（handlers.UpdateConfig 0-90）/导入钳制（1-90）

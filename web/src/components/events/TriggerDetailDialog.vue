@@ -57,7 +57,7 @@
           <div v-if="inlineAclHit" class="trg-kv"><span class="k">命中位置</span><span>策略内联{{ policy?.ip_acl_mode === 'allow' ? '白' : '黑' }}名单</span></div>
           <div v-if="trustHitNote" class="trg-kv"><span class="k">信任豁免</span><span>{{ trustHitNote }}</span></div>
           <div v-if="memberSystemTip" class="trg-tip">{{ memberSystemTip }}</div>
-          <div v-if="allHitLists.length === 0 && !inlineAclHit && kind === 'acl' && !isAllowOutside" class="trg-tip">未定位到命中的地址列表（策略名单可能已变更；事件为历史记录）</div>
+          <div v-if="allHitLists.length === 0 && !inlineAclHit && kind === 'acl' && !isAllowOutside && !loadError" class="trg-tip">未定位到命中的地址列表（策略名单可能已变更；事件为历史记录）</div>
         </template>
 
         <!-- 爬虫校验：验证结果与豁免引擎（v2.3.8 独立族，不再误标地域） -->
@@ -419,7 +419,12 @@ const loadAll = async (): Promise<void> => {
     ])
     if (seq !== loadSeq) return
     if (polRes.status === 'fulfilled') enabledPolicies.value = polRes.value.data || []
-    lists.value = listRes.status === 'fulfilled' ? listRes.value.data || [] : []
+    else loadError.value = true
+    if (listRes.status === 'fulfilled') lists.value = listRes.value.data || []
+    else {
+      loadError.value = true
+      lists.value = []
+    }
     const refIds = new Set<number>()
     const allPolicies = [policy.value, ...enabledPolicies.value].filter((p): p is PolicyRow => !!p)
     for (const p of allPolicies) {
@@ -428,10 +433,15 @@ const loadAll = async (): Promise<void> => {
     }
     // 只补拉共享缓存缺失的名单（历史 历史问题）：原实现对全部 refIds 无条件
     // 并发 GET——连续打开事件详情时同一批名单反复下载。写回/通知由缓存单源负责。
-    await ensureSharedEntries(refIds, async (id) => {
-      const res = await request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`, { silent: true })
-      return (res.data?.entries || []).map((e) => e.value.trim()).filter((v) => v !== '')
-    })
+    try {
+      await ensureSharedEntries(refIds, async (id) => {
+        const res = await request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`, { silent: true })
+        return (res.data?.entries || []).map((e) => e.value.trim()).filter((v) => v !== '')
+      })
+    } catch {
+      // 条目加载失败不能伪装成「未命中名单」的业务结论。
+      loadError.value = true
+    }
     if (seq !== loadSeq) return
     entriesCache.value = { ...sharedEntriesCache }
   } finally {

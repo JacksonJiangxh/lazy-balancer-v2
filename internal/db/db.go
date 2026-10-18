@@ -2683,12 +2683,23 @@ func migrateLegacyDNSCredentials() error {
 	if err != nil {
 		return fmt.Errorf("failed to begin legacy certificate credential migration: %w", err)
 	}
-	var columnCount int
-	if err := tx.QueryRow("SELECT COUNT(*) FROM pragma_table_info('certificate_configs') WHERE name IN ('dns_id','dns_key')").Scan(&columnCount); err != nil {
+	// 逐列探测：历史中断可能只留下 dns_id 或 dns_key 单列；旧实现要求
+	// 两列同时存在，残形会被永久跳过（历史 历史问题-4）。
+	var hasID, hasKey bool
+	if err := tx.QueryRow(`SELECT
+		EXISTS(SELECT 1 FROM pragma_table_info('certificate_configs') WHERE name='dns_id'),
+		EXISTS(SELECT 1 FROM pragma_table_info('certificate_configs') WHERE name='dns_key')`).Scan(&hasID, &hasKey); err != nil {
 		return rollbackMigration(tx, fmt.Errorf("failed to check legacy certificate credential columns: %w", err))
 	}
-	if columnCount == 2 {
-		rows, err := tx.Query("SELECT id, dns_id, dns_key FROM certificate_configs WHERE dns_credentials IS NULL OR dns_credentials = ''")
+	if hasID || hasKey {
+		idExpr, keyExpr := "''", "''"
+		if hasID {
+			idExpr = "COALESCE(dns_id,'')"
+		}
+		if hasKey {
+			keyExpr = "COALESCE(dns_key,'')"
+		}
+		rows, err := tx.Query("SELECT id, " + idExpr + ", " + keyExpr + " FROM certificate_configs WHERE dns_credentials IS NULL OR dns_credentials = ''")
 		if err != nil {
 			return rollbackMigration(tx, fmt.Errorf("failed to query legacy certificate credentials: %w", err))
 		}
@@ -2726,9 +2737,17 @@ func migrateLegacyDNSCredentials() error {
 		}
 		// 值已迁入 dns_credentials 后同事务删除两份明文旧列：失败整体回滚，
 		// 不出现「新值已提交但退役列仍随 SELECT * 备份外泄」的中间态。
-		if _, err := tx.Exec(`ALTER TABLE certificate_configs DROP COLUMN dns_id;
-			ALTER TABLE certificate_configs DROP COLUMN dns_key`); err != nil {
-			return rollbackMigration(tx, fmt.Errorf("failed to drop legacy certificate credential columns: %w", err))
+		drop := ""
+		if hasID {
+			drop += "ALTER TABLE certificate_configs DROP COLUMN dns_id;"
+		}
+		if hasKey {
+			drop += "ALTER TABLE certificate_configs DROP COLUMN dns_key;"
+		}
+		if drop != "" {
+			if _, err := tx.Exec(drop); err != nil {
+				return rollbackMigration(tx, fmt.Errorf("failed to drop legacy certificate credential columns: %w", err))
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {

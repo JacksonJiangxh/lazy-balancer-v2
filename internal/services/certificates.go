@@ -897,16 +897,17 @@ func reconcileMissingCertFiles(dbh *sql.DB) int {
 			Logf("error", "cert reconcile: scan certificate row failed: %v", err)
 			continue
 		}
-		// 同 rule_id 多行只取首行(ORDER BY updated_at DESC=最新)——历史问题。
+		// 同 rule_id 多行只取首个**适用**行（ORDER BY updated_at DESC）。
+		// 先 seen 后适用性会让最新旧域行短路较旧的适用行（历史 D2-历史问题）。
 		if seenRules[ruleID] {
 			continue
 		}
-		seenRules[ruleID] = true
 		// 历史问题:域名适用性校验——任务签发域名与规则当前域名不一致时重建
 		// 会写入不匹配证书。
 		if !certJobRuleApplicable(true, ruleDomain, domain) {
 			continue
 		}
+		seenRules[ruleID] = true
 		certPath, keyPath := CertFilePaths(ruleID)
 		if certPath == "" {
 			continue

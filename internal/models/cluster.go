@@ -53,7 +53,9 @@ func ValidateClusterAccessURL(value string) error {
 func NormalizeClusterNodeName(name string) string {
 	name = strings.TrimSpace(name)
 	name = strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
+		// C0、DEL 与 C1（0x80-0x9F）均为控制字符；旧实现漏 C1，注释口径
+		// 与行为不一致（历史 历史问题-2）。
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
 			return -1
 		}
 		return r

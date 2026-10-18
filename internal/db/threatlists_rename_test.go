@@ -66,22 +66,30 @@ func TestThreatSystemListRename_skipsWhenNewNameOccupied(t *testing.T) {
 		t.Fatalf("migrate: %v（同名冲突须跳过改名而非报错阻断启动）", err)
 	}
 
-	// Then 旧名行保持旧名（未改名），用户同名行不受影响，同名双行未产生
+	// Then 旧 system 行接管规范名；占用新名的用户行被改名（保 id/数据），
+	// 不产生同名双行。
+	var canonicalSystem int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE system=1 AND name=?`, newName).Scan(&canonicalSystem); err != nil {
+		t.Fatal(err)
+	}
+	if canonicalSystem != 1 {
+		t.Fatalf("规范名 system=1 行=%d, want 1", canonicalSystem)
+	}
 	var legacyCount int
 	if err := DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE system=1 AND name='威胁情报库-中科大黑 IP'`).Scan(&legacyCount); err != nil {
 		t.Fatal(err)
 	}
-	if legacyCount != 1 {
-		t.Fatalf("旧名 system=1 行=%d, want 1（同名占用时须跳过改名）", legacyCount)
+	if legacyCount != 0 {
+		t.Fatalf("旧名 system=1 行=%d, want 0", legacyCount)
 	}
-	var sameName int
-	if err := DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=?`, newName).Scan(&sameName); err != nil {
+	var userRows int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE system=0 AND name LIKE ?`, newName+"（用户 %").Scan(&userRows); err != nil {
 		t.Fatal(err)
 	}
-	if sameName != 1 {
-		t.Fatalf("新名行=%d, want 1（不得产出同名双行）", sameName)
+	if userRows != 1 {
+		t.Fatalf("冲突用户行改名=%d, want 1", userRows)
 	}
-	// And 幂等：二次执行仍跳过且不报错
+	// And 幂等：二次执行不报错且不再改名
 	if err := migrateThreatSystemListNames(); err != nil {
 		t.Fatalf("二次执行: %v", err)
 	}

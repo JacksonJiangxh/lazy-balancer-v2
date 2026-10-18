@@ -607,7 +607,7 @@ func (m *MetricsService) updateOverview(metrics parsedMetrics) {
 		SELECT COUNT(*) FROM nodes
 		WHERE is_approved = 1
 		  AND last_seen IS NOT NULL
-		  AND datetime(last_seen) >= datetime('now', printf('-%d seconds', MAX(? * COALESCE((SELECT CASE WHEN sync_interval < 10 THEN 60 ELSE sync_interval END FROM global_config WHERE id=1), 60), 120)))
+		  AND datetime(last_seen) >= datetime('now', printf('-%d seconds', MIN(86400, MAX(? * COALESCE((SELECT CASE WHEN sync_interval < 10 THEN 60 ELSE sync_interval END FROM global_config WHERE id=1), 60), 120))))
 	`, nodeOfflineMultiplier).Scan(&onlineNodes); err != nil {
 			Logf("error", "updateOverview: query online nodes failed: %v (keeping previous value=%d)", err, previousOverview.OnlineNodes)
 			onlineNodes = previousOverview.OnlineNodes

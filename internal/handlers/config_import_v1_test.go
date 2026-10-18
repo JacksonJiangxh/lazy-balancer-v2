@@ -462,7 +462,7 @@ func TestImportV1Config_reports_partial_failure_when_certificate_job_recovery_fa
 	router.ServeHTTP(response, request)
 
 	// Then
-	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "配置已导入但证书任务恢复失败") || !strings.Contains(response.Body.String(), "requeue failed") {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "配置已导入，但证书任务恢复失败") || !strings.Contains(response.Body.String(), "requeue failed") || !strings.Contains(response.Body.String(), `"partial":true`) {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 }
