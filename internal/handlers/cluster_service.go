@@ -116,7 +116,13 @@ func (h *Handlers) callClusterServiceControl(ctx context.Context, baseURL, actio
 	// 历史问题（历史）：从节点启用管理 HTTPS 后明文端口 301——按集群同步
 	// 同一契约对同主机 https Location 重放一次，否则票据调用在空 body 上报解析
 	// 错误、服务控制全线不可用。
-	response, err := services.DoWithSameHostTLSUpgradeRedirect(clusterServiceControlClientFactory(h.cfg.DataDir), request)
+	// 历史问题-04：客户端按请求构造（工厂是测试注入点），其 Transport 自带连接池
+	// 且 IdleConnTimeout=90s——此前无关闭动作，每次控制调用都会留下一批空闲
+	// 连接与读循环 goroutine 直到空闲超时。用完即关闭空闲连接（body 已读完后
+	// 才执行，不影响本次请求）。
+	client := clusterServiceControlClientFactory(h.cfg.DataDir)
+	defer client.CloseIdleConnections()
+	response, err := services.DoWithSameHostTLSUpgradeRedirect(client, request)
 	if err != nil {
 		return "", fmt.Errorf("调用从节点服务控制: %w", err)
 	}

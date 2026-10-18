@@ -317,12 +317,19 @@ func autobanActionMatches(scope, action string) bool {
 // 启用 + WAF 事件（rule_triggered 非空）+ 口径。任一门不过整批跳过；批内
 // 逐条按口径过滤。
 func autobanObserveBatch(items []autobanFeedItem) {
-	if len(items) == 0 || !autobanIsMaster() || !AutobanEnabled() {
+	if len(items) == 0 || !autobanIsMaster() {
 		return
 	}
 	// AU-2（历史）：热路径每批只读一次配置——整份 cfg 下传单事件路径
 	//（scope/window/threshold），不再逐事件 SELECT（O(事件) 库查询）。
+	// 历史问题（历史）：启用门并入同一行读取（GetAutobanConfig 的 SELECT
+	// 已含 autoban_enabled）——旧实现先 AutobanEnabled() 再 GetAutobanConfig()，
+	// 每批多一次主库单行查询；读失败时 GetAutobanConfig 回落 Enabled=false
+	// （fail-closed 语义不变）。
 	cfg := GetAutobanConfig()
+	if !cfg.Enabled {
+		return
+	}
 	for _, it := range items {
 		autobanObserveEventScoped(cfg, it.IP, it.Action, it.RuleTriggered)
 	}
@@ -331,10 +338,14 @@ func autobanObserveBatch(items []autobanFeedItem) {
 // autobanObserveEvent 单事件喂入（测试缝 AU-4：生产摄取只走 autobanObserveBatch；
 // 本函数仅供测试驱动单事件计数行为）。门：主节点+启用+口径+WAF 事件；配置当轮直读。
 func autobanObserveEvent(ip, action, ruleTriggered string) {
-	if !autobanIsMaster() || !AutobanEnabled() || ruleTriggered == "" {
+	if !autobanIsMaster() || ruleTriggered == "" {
 		return
 	}
-	autobanObserveEventScoped(GetAutobanConfig(), ip, action, ruleTriggered)
+	cfg := GetAutobanConfig()
+	if !cfg.Enabled {
+		return
+	}
+	autobanObserveEventScoped(cfg, ip, action, ruleTriggered)
 }
 
 func autobanObserveEventScoped(cfg AutobanConfig, ip, action, ruleTriggered string) {

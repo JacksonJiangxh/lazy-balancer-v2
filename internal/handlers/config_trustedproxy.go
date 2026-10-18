@@ -9,6 +9,7 @@ import (
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/internal/services"
 )
 
 // 受信代理（CDN 真实 IP）写侧校验与归一（v2.3.x）：UpdateConfig 与
@@ -18,8 +19,9 @@ import (
 //   - ranges：裸 IP 补 /32（v4）//128（v6）；条数 ≤64；前缀长度 <8（v4）
 //     或 <96（v6）一律拒绝——过宽网段会让伪造头在任意来源被采信。
 //   - range_refs（2026-10-12）：引用的 IP 地址列表 id（JSON 整数数组）；
-//     每个 id 必须存在；引用名单条目须为合法 IP/CIDR；总 CIDR 数（内联
-//   - 引用展开）≤ trustedProxyMaxTotalCIDRs。
+//     每个 id 必须存在且为自定义名单（system=1 内置名单拒绝——U04d-02）；
+//     引用名单条目须为合法 IP/CIDR 且与内联通道同宽度判据（U04d-01）；总
+//     CIDR 数（内联 + 引用展开）≤ trustedProxyMaxTotalCIDRs。
 //   - headers：条数 ≤8；字符集 ^[A-Za-z0-9-]{1,64}$；去重保序；
 //     空数组 = 仅 X-Forwarded-For（渲染层省略 client_ip_headers）。
 var trustedProxyHeaderPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
@@ -29,10 +31,14 @@ var trustedProxyHeaderPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
 // 防御单一名单（≤2000 条写侧门，2026-10-14 裁定 500→2000）×多引用的组合膨胀。
 const trustedProxyMaxTotalCIDRs = 2000
 
-// trustedProxyListSource 名单解析源行（id → 名单行）。
+// trustedProxyListSource 名单解析源行（id → 名单行）。builtin 标记
+// system=1 的内置名单（威胁情报/爬虫/自动封禁）——受信代理不允许引用
+// （U04d-02：威胁名单真实条目在 .iplist 文件，DB entries 恒空，按 DB 列
+// 校验会同时失去条格式门与 2000 条总量门；前端本已只列自定义名单）。
 type trustedProxyListSource struct {
 	name    string
 	entries string
+	builtin bool
 }
 
 // trustedProxyBackupSource 导入通道的名单解析源（RC-2/F75C-3，历史）。
@@ -133,7 +139,6 @@ func trustedProxyInlineCount(req *models.UpdateConfigRequest) (int, error) {
 // idChunk 是一个 id 分片及其预构造的 IN 子句占位符与参数（SYS-REST-F2 第 73
 // 轮：受信代理两处 500 分片样板单源——仅共享分片构造，不合并查询/校验语义）。
 type idChunk struct {
-	ids          []int64
 	placeholders string
 	args         []any
 }
@@ -156,22 +161,14 @@ func chunkIDs(ids []int64, chunkSize int) []idChunk {
 		for i, id := range chunk {
 			args[i] = id
 		}
-		chunks = append(chunks, idChunk{ids: chunk, placeholders: placeholders, args: args})
+		chunks = append(chunks, idChunk{placeholders: placeholders, args: args})
 	}
 	return chunks
 }
 
-// trustedProxyStoredRefEntries 返回库中存量 trusted_proxy_range_refs 的引用
-// 展开条目总数（SYS-F3 总量门对称面：仅更新内联网段时引用面按存量计）。
-// 存量 refs JSON 畸形/引用悬空/条目不可解析（仅见于带外改库）按 0 计——与
-// trustedProxyInlineCount 存量畸形口径一致：总量门不因存量问题拒绝合法的
-// 内联载荷（存量引用的悬空由名单删除守卫与渲染层各自兜底）。
-func trustedProxyStoredRefEntries() (int, error) {
-	return trustedProxyStoredRefEntriesWithSource(trustedProxyBackupSource{})
-}
-
 // resolveTrustedProxyRefLists 解析 refs 引用的名单行（RC-2 分流的单点）：
 // 备份行命中直取；未命中且备份未携带名单表（carried=false）时分片查库。
+// 两通道都带 system 列映射 builtin（U04d-02 写侧拒绝内置名单）。
 // carried=true 不回落库内——名单表随备份全量替换，库内命中不代表导入后存在。
 func resolveTrustedProxyRefLists(ids []int64, source trustedProxyBackupSource) (map[int64]trustedProxyListSource, error) {
 	resolved := make(map[int64]trustedProxyListSource, len(ids))
@@ -187,18 +184,19 @@ func resolveTrustedProxyRefLists(ids []int64, source trustedProxyBackupSource) (
 		return resolved, nil
 	}
 	for _, ch := range chunkIDs(missing, 500) {
-		rows, err := db.DB.Query(`SELECT id, COALESCE(entries,'[]'), COALESCE(name,'') FROM security_ip_lists WHERE id IN (`+ch.placeholders+`)`, ch.args...)
+		rows, err := db.DB.Query(`SELECT id, COALESCE(entries,'[]'), COALESCE(name,''), COALESCE(system,0) FROM security_ip_lists WHERE id IN (`+ch.placeholders+`)`, ch.args...)
 		if err != nil {
 			return nil, fmt.Errorf("校验受信代理引用列表失败: %v", err)
 		}
 		for rows.Next() {
 			var id int64
 			var entriesJSON, name string
-			if err := rows.Scan(&id, &entriesJSON, &name); err != nil {
+			var system int
+			if err := rows.Scan(&id, &entriesJSON, &name, &system); err != nil {
 				rows.Close()
 				return nil, fmt.Errorf("校验受信代理引用列表失败: %v", err)
 			}
-			resolved[id] = trustedProxyListSource{name: name, entries: entriesJSON}
+			resolved[id] = trustedProxyListSource{name: name, entries: entriesJSON, builtin: system == 1}
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
@@ -215,6 +213,10 @@ func resolveTrustedProxyRefLists(ids []int64, source trustedProxyBackupSource) (
 // 展开面归零）；载荷未携带 refs 键而备份携带名单表的残留悬空形态（仅手造备份
 // 可达——真实导出恒携带全列）不在本门范围内，由渲染层 fail-closed 与名单删除
 // 守卫兜底。存量 refs JSON 畸形/条目不可解析（仅见于带外改库）按 0 计。
+//
+// 内置名单（system=1）引用自 U04d-02 起在写侧拒绝；升级前存量引用仍按 DB
+// entries 计数（威胁名单恒 0 条——其真实条目不参与本门，属既有配置的遗留
+// 边界：下次保存 refs 载荷时被 400 拒绝并要求改用自定义名单）。
 func trustedProxyStoredRefEntriesWithSource(source trustedProxyBackupSource) (int, error) {
 	var raw string
 	if err := db.DB.QueryRow(`SELECT COALESCE(trusted_proxy_range_refs,'[]') FROM global_config WHERE id=1`).Scan(&raw); err != nil {
@@ -238,14 +240,10 @@ func trustedProxyStoredRefEntriesWithSource(source trustedProxyBackupSource) (in
 	return total, nil
 }
 
-// normalizeTrustedProxyRangeRefs 保存通道入口（仅库内解析）。
-func normalizeTrustedProxyRangeRefs(raw string) (string, int, error) {
-	return normalizeTrustedProxyRangeRefsWithSource(raw, trustedProxyBackupSource{})
-}
-
 // normalizeTrustedProxyRangeRefsWithSource 校验并归一引用载荷：空白归一 "[]"；
-// 非空须为整数数组 JSON（字符串/对象条目拒绝）；逐 id 校验存在性与条目格式
-// （复用 validIPOrCIDR——带 zone 形态与名单写侧同口径拒绝）；去重保序。
+// 非空须为整数数组 JSON（字符串/对象条目拒绝）；逐 id 校验存在性（内置名单
+// 拒绝，U04d-02）与条目格式/宽度（parseTrustedProxyPrefix + services 宽度
+// 判据，与内联通道同口径，U04d-01）；去重保序。
 // source 按备份是否携带名单表分流（trustedProxyBackupSource）：carried=true
 // 时存在性仅按备份行集合解析（RC-2——全量替换后库内行不复存在，悬空 400）；
 // carried=false 时未命中备份行的 id 按库内存量解析（保存通道同口径）。
@@ -287,6 +285,12 @@ func normalizeTrustedProxyRangeRefsWithSource(raw string, source trustedProxyBac
 		if !ok {
 			return "", 0, fmt.Errorf("受信代理引用的地址列表不存在：#%d", id)
 		}
+		// U04d-02：内置名单（威胁情报/爬虫/自动封禁）不得作为受信代理来源——
+		// 真实条目在 .iplist 文件、DB entries 恒空，按 DB 列校验会同时失去条
+		// 格式门与总量门；且威胁名单与「可信回源」语义相反。与 UI 一致拒绝。
+		if row.builtin {
+			return "", 0, fmt.Errorf("受信代理不能引用内置地址列表「%s」：内置名单（威胁情报/爬虫/自动封禁）由系统维护，请改用自定义名单", row.name)
+		}
 		var entries []models.IPListEntry
 		if row.entries != "" {
 			if err := json.Unmarshal([]byte(row.entries), &entries); err != nil {
@@ -298,8 +302,17 @@ func normalizeTrustedProxyRangeRefsWithSource(raw string, source trustedProxyBac
 			if value == "" {
 				continue
 			}
-			if !validIPOrCIDR(value) {
+			prefix, err := parseTrustedProxyPrefix(value)
+			if err != nil {
 				return "", 0, fmt.Errorf("引用的地址列表「%s」含无效 IP/CIDR 条目：%s（受信网段仅接受 IP/CIDR）", row.name, value)
+			}
+			// U04d-01：与内联通道同一宽度判据——名单通道不得成为过宽网段的
+			// 等价绕过入口（否则伪造头可在任意来源被采信）。
+			if services.TrustedProxyPrefixAllSpace(prefix) {
+				return "", 0, fmt.Errorf("引用的地址列表「%s」含过宽网段 %s：该网段覆盖全部地址空间，等同信任任意来源", row.name, prefix.String())
+			}
+			if prefix.Bits() < services.TrustedProxyMinPrefixBits(prefix.Addr()) {
+				return "", 0, fmt.Errorf("引用的地址列表「%s」含过宽网段 %s：最小允许 /8（IPv4）与 /96（IPv6），请收窄到该 CDN 的回源网段", row.name, prefix.String())
 			}
 		}
 		total += len(entries)
@@ -309,6 +322,21 @@ func normalizeTrustedProxyRangeRefsWithSource(raw string, source trustedProxyBac
 		return "", 0, fmt.Errorf("序列化受信代理引用列表失败: %v", err)
 	}
 	return string(out), total, nil
+}
+
+// parseTrustedProxyPrefix 解析受信网段条目：合法 CIDR 或裸 IP（补 /32 或
+// /128）。格式门与渲染层 appendCIDR 同口径；宽度判据由调用方按
+// services.TrustedProxy* 执行（两通道不得分叉）。
+func parseTrustedProxyPrefix(value string) (netip.Prefix, error) {
+	value = strings.TrimSpace(value)
+	if prefix, err := netip.ParsePrefix(value); err == nil {
+		return prefix, nil
+	}
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	return netip.PrefixFrom(addr, addr.BitLen()), nil
 }
 
 func normalizeTrustedProxyRanges(raw string) (string, error) {
@@ -322,36 +350,17 @@ func normalizeTrustedProxyRanges(raw string) (string, error) {
 	normalized := make([]string, 0, len(entries))
 	seen := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
-		prefix, err := netip.ParsePrefix(entry)
+		prefix, err := parseTrustedProxyPrefix(entry)
 		if err != nil {
-			addr, addrErr := netip.ParseAddr(entry)
-			if addrErr != nil {
-				return "", fmt.Errorf("无效的受信代理网段: %s", entry)
-			}
-			bits := 32
-			if addr.Is6() {
-				bits = 128
-			}
-			prefix = netip.PrefixFrom(addr, bits)
+			return "", fmt.Errorf("无效的受信代理网段: %s", entry)
 		}
-		// 历史 历史问题（历史问题）：全空间形态显式拒绝——/8 的 0.0.0.0/8 覆盖整个
-		// IPv4；v4-mapped ::ffff:0:0/96（Is6 含 mapped）内嵌全零 v4 同义。两者
-		// 均等同「信任任意来源的伪造头」，与最小前缀长度门的目的相悖。
-		allSpace := map[string]bool{
-			"0.0.0.0/8":         true, // 整个 IPv4
-			"0.0.0.0/0":         true,
-			"::/0":              true,
-			"::ffff:0.0.0.0/96": true, // v4-mapped 规范形态：内嵌全零 v4
-			"::ffff:0:0/96":     true, // 同义的紧凑写法
-		}
-		if allSpace[prefix.String()] {
+		// 历史 历史问题（历史问题）+ U04d-01：全空间形态与最小前缀长度判据
+		// 单源在 services（内联/引用/渲染三处同口径）——全空间（0.0.0.0/8、
+		// 0.0.0.0/0、::/0、v4-mapped 全零 /96）等同「信任任意来源的伪造头」。
+		if services.TrustedProxyPrefixAllSpace(prefix) {
 			return "", fmt.Errorf("受信代理网段过宽（%s）：该网段覆盖全部地址空间，等同信任任意来源，请收窄到该 CDN 的回源网段", prefix.String())
 		}
-		minBits := 8
-		if prefix.Addr().Is6() {
-			minBits = 96
-		}
-		if prefix.Bits() < minBits {
+		if prefix.Bits() < services.TrustedProxyMinPrefixBits(prefix.Addr()) {
 			return "", fmt.Errorf("受信代理网段过宽（%s）：最小允许 /8（IPv4）与 /96（IPv6），请收窄到该 CDN 的回源网段", prefix.String())
 		}
 		// 去重保序（与 headers 侧同口径，历史补充轮 U6B-7）

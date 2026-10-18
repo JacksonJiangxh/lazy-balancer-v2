@@ -63,3 +63,55 @@ export const certJobStatusLabel = (status: CertJobStatus): string => {
       return String(status)
   }
 }
+
+/** 证书任务状态 → Element tag 色调（与 certJobStatusLabel 同一状态机）。 */
+export const certJobStatusTone = (status: CertJobStatus): 'success' | 'danger' | 'warning' | 'info' => {
+  if (!status) return 'info'
+  switch (status) {
+    case 'issued': return 'success'
+    case 'failed': return 'danger'
+    case 'disabled': return 'info'
+    case 'queued': return 'info'
+    case 'waiting_ca': return 'warning'
+    case 'pending':
+    case 'processing':
+    case 'creating_account':
+    case 'creating_order':
+    case 'order_created':
+    case 'waiting_order_ready':
+    case 'order_ready':
+    case 'cleanup_dns':
+    case 'cleanup_warning':
+    case 'presenting_dns':
+    case 'waiting_propagation':
+    case 'dns_propagated':
+    case 'accepting_challenge':
+    case 'waiting_order_valid':
+    case 'order_valid':
+    case 'validating':
+    case 'validated':
+    case 'finalizing':
+    case 'finalized':
+    case 'downloading':
+    case 'downloaded':
+      return 'warning'
+    default:
+      console.warn('Unknown cert job status:', status)
+      return 'info'
+  }
+}
+
+/** 证书任务重试冷却（分钟）；null=不可重试。 */
+export const certJobRetryCooldown = (status: CertJobStatus): number | null => {
+  if (!status) return 2
+  switch (status) {
+    case 'disabled': return null
+    case 'issued':
+    case 'waiting_ca':
+      return 0
+    case 'queued': return 15
+    case 'failed': return 5
+    default:
+      return 2
+  }
+}

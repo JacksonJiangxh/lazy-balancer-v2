@@ -20,6 +20,7 @@
 
 ```bash
 docker run -d --name lazy-balancer --network host \
+  --restart unless-stopped \
   --ulimit nofile=1048576:1048576 \
   -v $(pwd)/data:/app/data -v $(pwd)/certs:/app/certs \
   -v $(pwd)/logs:/app/logs -v $(pwd)/waf:/app/waf \

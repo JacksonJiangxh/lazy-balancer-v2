@@ -112,6 +112,10 @@ func applySnapshotBrandingChecked(cfg *config.Config, content string) error {
 	return nil
 }
 
+// rebuildCrawlerSnapshotForSync 集群 apply / 升主后的爬虫运行快照重建缝
+// （测试可注入计数；生产=CrawlerUpdateManager 同一 DB→文件单源实现）。
+var rebuildCrawlerSnapshotForSync = RebuildCrawlerIPListSnapshot
+
 func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.ClusterSnapshot) error {
 	// 历史问题(2026-09-10 审计):ACME 状态校验由 Pull 侧 verifiedSnapshotIntegrity 统一
 	// 执行(验签后、apply 前单点);此处重复执行已删——applySnapshot 唯一生产
@@ -276,6 +280,15 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 				}
 				RebuildRegionTreeCacheForSync()
 			}
+		}
+	}
+	// 历史问题：安全节替换 security_ip_lists 后重建爬虫运行快照（插件只读
+	// /app/data/crawler-ip-lists.json，不从 DB 派生；无此钩子时从节点/升主/
+	// 导入后执行面停在旧代或缺失，爬虫豁免/伪装判定与主节点分裂）。快照写
+	// 失败不回滚已提交快照——留痕后由下次更新/重启收敛。
+	if switches.Security && !skip.skip("security") {
+		if err := rebuildCrawlerSnapshotForSync(); err != nil {
+			Logf("warn", "集群同步：爬虫运行快照重建失败（DB 已应用，插件按旧快照运行至下次收敛）: %v", err)
 		}
 	}
 	// Caddy 重载必须在事务提交之后：buildWafHandler 等安全配置读取走 db.DB，
@@ -927,14 +940,22 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 		if !ValidBlockStatusCode(int(toFloat64(p["block_status_code"]))) {
 			p["block_status_code"] = int64(403)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO security_policies (id,name,description,mode,anomaly_threshold,ip_acl_mode,ip_acl_list,ip_acl_enabled,ip_whitelist,ip_whitelist_enabled,ip_blacklist,rate_limit_enabled,rate_limit_rps,rate_limit_burst,crs_rule_groups,crs_excluded_rules,custom_rules,block_page_id,block_status_code,enabled,updated_by,created_at,updated_at,geoip_countries,geoip_mode,waf_check_response,log_request_body,ip_acl_list_refs,ip_whitelist_refs,policy_type,trust_detection) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		// 旧主节点/手工快照缺爬虫两列时按 schema 默认归一；NOT NULL 新列
+		// 不得把兼容载荷变成整条 apply 失败，显式 false/[] 与值均原样保留。
+		if p["geoip_crawler_exempt"] == nil {
+			p["geoip_crawler_exempt"] = int64(0)
+		}
+		if p["geoip_crawler_engines"] == nil {
+			p["geoip_crawler_engines"] = "[]"
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO security_policies (id,name,description,mode,anomaly_threshold,ip_acl_mode,ip_acl_list,ip_acl_enabled,ip_whitelist,ip_whitelist_enabled,ip_blacklist,rate_limit_enabled,rate_limit_rps,rate_limit_burst,crs_rule_groups,crs_excluded_rules,custom_rules,block_page_id,block_status_code,enabled,updated_by,created_at,updated_at,geoip_countries,geoip_mode,geoip_crawler_exempt,geoip_crawler_engines,waf_check_response,log_request_body,ip_acl_list_refs,ip_whitelist_refs,policy_type,trust_detection) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			p["id"], p["name"], p["description"], p["mode"], p["anomaly_threshold"],
 			p["ip_acl_mode"], snapshotJSONText(p["ip_acl_list"]), p["ip_acl_enabled"],
 			snapshotJSONText(p["ip_whitelist"]), policyWhitelistEnabled(p), snapshotJSONText(p["ip_blacklist"]),
 			p["rate_limit_enabled"], p["rate_limit_rps"], p["rate_limit_burst"],
 			snapshotJSONText(p["crs_rule_groups"]), snapshotJSONText(p["crs_excluded_rules"]), snapshotJSONText(p["custom_rules"]),
 			p["block_page_id"], p["block_status_code"], p["enabled"], p["updated_by"], p["created_at"], p["updated_at"],
-			snapshotJSONText(p["geoip_countries"]), p["geoip_mode"], p["waf_check_response"], p["log_request_body"],
+			snapshotJSONText(p["geoip_countries"]), p["geoip_mode"], p["geoip_crawler_exempt"], snapshotJSONText(p["geoip_crawler_engines"]), p["waf_check_response"], p["log_request_body"],
 			snapshotJSONText(p["ip_acl_list_refs"]), snapshotJSONText(p["ip_whitelist_refs"]), InferSnapshotPolicyType(p), snapshotTrustDetection(p)); err != nil {
 			return fmt.Errorf("写入 security_policy: %w", err)
 		}

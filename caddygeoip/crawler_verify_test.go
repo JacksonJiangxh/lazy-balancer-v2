@@ -68,6 +68,159 @@ func TestVerifyCrawler_passFailMatrix(t *testing.T) {
 	}
 }
 
+func TestVerifyCrawler_transientFailuresNotCached(t *testing.T) {
+	t.Run("semaphore saturated", func(t *testing.T) {
+		ResetCrawlerVerifyCacheForTest(&fakeResolver{})
+		for len(crawlerVerifySem) > 0 {
+			<-crawlerVerifySem
+		}
+		for range cap(crawlerVerifySem) {
+			crawlerVerifySem <- struct{}{}
+		}
+		t.Cleanup(func() {
+			for len(crawlerVerifySem) > 0 {
+				<-crawlerVerifySem
+			}
+		})
+
+		if VerifyCrawler("9.8.7.6", "googlebot") {
+			t.Fatal("saturated verifier must fail closed for the current request")
+		}
+		crawlerCacheMu.Lock()
+		_, cached := crawlerCache["9.8.7.6|googlebot"]
+		crawlerCacheMu.Unlock()
+		if cached {
+			t.Fatal("semaphore saturation is transient and must not create a 10-minute negative entry")
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		ip   string
+		err  error
+	}{
+		{name: "resolver error", ip: "5.6.7.8", err: errors.New("resolver down")},
+		{name: "context timeout", ip: "5.6.7.9", err: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ResetCrawlerVerifyCacheForTest(&fakeResolver{ptrErr: map[string]error{tc.ip: tc.err}})
+			if VerifyCrawler(tc.ip, "googlebot") {
+				t.Fatal("DNS failure must fail closed")
+			}
+			crawlerCacheMu.Lock()
+			_, cached := crawlerCache[tc.ip+"|googlebot"]
+			crawlerCacheMu.Unlock()
+			if cached {
+				t.Fatal("transient DNS failure must not be cached")
+			}
+		})
+	}
+
+	t.Run("forward resolver error", func(t *testing.T) {
+		const (
+			ip   = "66.249.66.9"
+			host = "crawl-66-249-66-9.googlebot.com"
+		)
+		ResetCrawlerVerifyCacheForTest(&fakeResolver{
+			ptr:     map[string][]string{ip: {host + "."}},
+			hostErr: map[string]error{host: errors.New("forward resolver down")},
+		})
+		if VerifyCrawler(ip, "googlebot") {
+			t.Fatal("failed forward verification must fail closed")
+		}
+		crawlerCacheMu.Lock()
+		_, cached := crawlerCache[ip+"|googlebot"]
+		crawlerCacheMu.Unlock()
+		if cached {
+			t.Fatal("forward resolver failure is transient and must not be cached")
+		}
+	})
+
+	t.Run("deterministic negative stays cached", func(t *testing.T) {
+		const ip = "34.100.1.1"
+		ResetCrawlerVerifyCacheForTest(&fakeResolver{ptr: map[string][]string{
+			ip: {"vm-34-100-1-1.bc.googleusercontent.com."},
+		}})
+		if VerifyCrawler(ip, "googlebot") {
+			t.Fatal("non-official PTR must not verify")
+		}
+		crawlerCacheMu.Lock()
+		entry, cached := crawlerCache[ip+"|googlebot"]
+		crawlerCacheMu.Unlock()
+		if !cached || entry.ok {
+			t.Fatalf("deterministic negative must retain its negative cache entry: %+v cached=%v", entry, cached)
+		}
+	})
+}
+
+func TestVerifyCrawler_cacheCapacityPreservesLiveEntries(t *testing.T) {
+	const newIP = "34.100.1.1"
+	newResolver := func() *fakeResolver {
+		return &fakeResolver{ptr: map[string][]string{
+			newIP: {"vm-34-100-1-1.bc.googleusercontent.com."},
+		}}
+	}
+
+	t.Run("prunes only expired entries", func(t *testing.T) {
+		ResetCrawlerVerifyCacheForTest(newResolver())
+		oldMax := crawlerCacheMax
+		crawlerCacheMax = 2
+		t.Cleanup(func() { crawlerCacheMax = oldMax })
+		now := time.Now()
+		crawlerCacheMu.Lock()
+		crawlerCache["keep|googlebot"] = crawlerVerifyCache{ok: true, expires: now.Add(time.Hour)}
+		crawlerCache["expired|googlebot"] = crawlerVerifyCache{ok: true, expires: now.Add(-time.Minute)}
+		crawlerCacheMu.Unlock()
+
+		if VerifyCrawler(newIP, "googlebot") {
+			t.Fatal("test input must produce a deterministic negative")
+		}
+		crawlerCacheMu.Lock()
+		keep, keepExists := crawlerCache["keep|googlebot"]
+		_, expiredExists := crawlerCache["expired|googlebot"]
+		_, newExists := crawlerCache[newIP+"|googlebot"]
+		size := len(crawlerCache)
+		crawlerCacheMu.Unlock()
+		if !keepExists || !keep.ok {
+			t.Fatal("capacity cleanup must not evict a live positive verification")
+		}
+		if expiredExists {
+			t.Fatal("expired entry must be pruned at capacity")
+		}
+		if !newExists || size != 2 {
+			t.Fatalf("after pruning size=%d newCached=%v, want size=2 and new result cached", size, newExists)
+		}
+	})
+
+	t.Run("full live cache rejects new key without eviction", func(t *testing.T) {
+		ResetCrawlerVerifyCacheForTest(newResolver())
+		oldMax := crawlerCacheMax
+		crawlerCacheMax = 2
+		t.Cleanup(func() { crawlerCacheMax = oldMax })
+		now := time.Now()
+		crawlerCacheMu.Lock()
+		crawlerCache["keep-a|googlebot"] = crawlerVerifyCache{ok: true, expires: now.Add(time.Hour)}
+		crawlerCache["keep-b|googlebot"] = crawlerVerifyCache{ok: true, expires: now.Add(time.Hour)}
+		crawlerCacheMu.Unlock()
+
+		if VerifyCrawler(newIP, "googlebot") {
+			t.Fatal("test input must produce a deterministic negative")
+		}
+		crawlerCacheMu.Lock()
+		_, keepA := crawlerCache["keep-a|googlebot"]
+		_, keepB := crawlerCache["keep-b|googlebot"]
+		_, newExists := crawlerCache[newIP+"|googlebot"]
+		size := len(crawlerCache)
+		crawlerCacheMu.Unlock()
+		if !keepA || !keepB || size != 2 {
+			t.Fatalf("live entries must survive a full cache: keepA=%v keepB=%v size=%d", keepA, keepB, size)
+		}
+		if newExists {
+			t.Fatal("a full live cache must skip the new key rather than evict verified crawlers")
+		}
+	})
+}
+
 func TestVerifyCrawlerIPRangeFromList_jsonPerEngine(t *testing.T) {
 	// Given：按引擎隔离的快照 JSON（与 root 服务 writeCrawlerIPListSnapshotAll 同形）
 	oldFile := crawlerIPListFile

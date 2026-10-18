@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"lazy-balancer-v2/geoipnames"
 	"lazy-balancer-v2/internal/db"
@@ -29,7 +30,14 @@ var (
 	// ioCount diagnostics field on every search and is not race-safe for
 	// concurrent searches, even in BufferCache mode.
 	ip2regionSearchMu sync.Mutex
+	// ip2regionGeneration 归属地库代际（0=从未加载；每次安装/热换 +1）。
+	// 威胁大屏 rollup 据此判定历史空归属地维度是否值得重固（历史问题）。
+	ip2regionGeneration atomic.Int64
 )
+
+// GeoIPDataGeneration 返回当前归属地库代际（0=库从未加载；每次启动加载/
+// 更新热换递增）。纯读，供上层判断派生聚合是否需要按新库重算。
+func GeoIPDataGeneration() int64 { return ip2regionGeneration.Load() }
 
 // InitIP2Region loads the GeoIP database into the singleton searcher using
 // BufferCache mode (whole xdb in memory, zero-contention reads). The live
@@ -119,6 +127,7 @@ var reloadIP2RegionSearcher = Reload
 func swapIP2RegionSearcher(searcher *ip2regionService.Ip2Region) {
 	old := ip2regionSearcher
 	ip2regionSearcher = searcher
+	ip2regionGeneration.Add(1)
 	if old != nil {
 		ip2regionSearchMu.Lock()
 		old.Close()
@@ -326,47 +335,21 @@ func GetIP2RegionProvinceList() []string {
 // 发现不了「该有而没有」的条目（如 r25 前整段被丢的 新疆/乌鲁木齐市）。
 const treeCacheRevision = "r27" // r27：海外分支收集国家名（Countries）——旧缓存静默缺国名集，必须重建
 
-// normalizeIP2Province 把 xdb 省列原始值规范化为规范省名：别名表归一（上海→
-// 上海市）、带「省」后缀原样通过；其余候选（精简 fixture 的「广东」、潜在非
-// 标准库形态）保守通过——只有明确误置形态（台湾城市）返回空（由调用方归入
-// 台湾省城市集），乱码由选项树按去重自然呈现但不会与规范名冲突。
+// normalizeIP2Province 选项树侧省列规范化——单源 geoipnames.ProvinceForTree
+// （历史问题 历史下沉：此前与 caddygeoip.normalizeProvince 是两份手工镜像，
+// 语义分叉靠调用点补偿）。语义：无效值（空/"0"）→ 空串；别名表归一
+// （上海→上海市、UEruemqi→新疆维吾尔自治区）；台湾城市误置省列 → 空串
+// （由调用方归入台湾省城市集）；未映射 ASCII（乱码/拼音残片）→ 空串；
+// 其余中文省名原样通过。
 func normalizeIP2Province(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || trimmed == "0" {
-		return ""
-	}
-	if canonical, ok := geoipnames.ProvinceAliases[trimmed]; ok {
-		return canonical
-	}
-	if geoipnames.TaiwanCities[trimmed] {
-		return ""
-	}
-	// ASCII 省名是乱码/拼音残片（如 UEruemqi），xdb 中文省列恒为多字节——
-	// 过滤（城市级拼音由 normalizeIP2City 映射表处理，省级无可靠映射）。
-	if trimmed[0] < 0x80 {
-		return ""
-	}
-	return trimmed
+	return geoipnames.ProvinceForTree(raw)
 }
 
-// normalizeIP2City 规范城市列：拼音映射为中文；无法映射的 ASCII 城市返回空
-// （过滤）。中文城市原样通过。
+// normalizeIP2City 选项树侧城市列规范化——单源 geoipnames.CityForTree：
+// 无效值 → 空串；拼音映射/自治州全称 → 规范中文；未映射 ASCII 城市 → 空串
+// （过滤）；中文城市原样通过。
 func normalizeIP2City(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || trimmed == "0" {
-		return ""
-	}
-	if fixed, ok := geoipnames.CityPinyinFixes[trimmed]; ok {
-		return fixed
-	}
-	// 历史问题 二十八次：少数民族自治州简称 → 全称（见 geoipnames.AutonomousPrefectures）。
-	if full, ok := geoipnames.AutonomousPrefectures[trimmed]; ok {
-		return full
-	}
-	if trimmed[0] < 0x80 {
-		return "" // 未映射的拼音/英文段
-	}
-	return trimmed
+	return geoipnames.CityForTree(raw)
 }
 
 // IP2RegionRegionTree 地域树（历史问题 二十三次，用户裁决：区域精确到市）：省级

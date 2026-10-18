@@ -650,9 +650,9 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		var jobUpdatedAt sql.NullTime
 		err = db.DB.QueryRow("SELECT status, updated_at FROM cert_jobs WHERE rule_id=? AND domain=?", req.CaddyID, canonicalRuleDomain).Scan(&jobStatus, &jobUpdatedAt)
 		if err == nil {
-			if blocked, message := certJobRetryBlocked(jobStatus, jobUpdatedAt, time.Now()); blocked {
-				auditFailure("blocked", "证书任务正在执行")
-				c.JSON(http.StatusTooManyRequests, models.APIResponse{Code: 429, Message: message})
+			if blocked, statusCode, message := certJobRetryBlocked(jobStatus, jobUpdatedAt, time.Now()); blocked {
+				auditFailure("blocked", message)
+				c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
 				return
 			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
@@ -751,7 +751,7 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			jobErr := db.DB.QueryRow("SELECT status, updated_at FROM cert_jobs WHERE rule_id=? AND domain=?", target.ruleID, canonicalDomain).Scan(&jobStatus, &jobUpdatedAt)
 			switch {
 			case jobErr == nil:
-				if blocked, _ := certJobRetryBlocked(jobStatus, jobUpdatedAt, time.Now()); blocked {
+				if blocked, _, _ := certJobRetryBlocked(jobStatus, jobUpdatedAt, time.Now()); blocked {
 					skippedCooldown++
 					continue
 				}
@@ -793,7 +793,12 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		}
 		if queued == 0 {
 			// 历史问题：批量全部跳过（冷却/在途/屏障/状态不支持）→ 409，不得 200 假成功。
+			// 历史问题（历史）：零目标（尚无启用中的 ACME 规则）时 skipNote 为空，
+			// 不能返回以冒号结尾的空原因——单列文案。
 			skipNote := formulaSkippedNote(skippedCooldown, skippedInFlight, skippedBlocked, skippedUnsupported)
+			if skipNote == "" {
+				skipNote = "当前没有处于启用状态的 ACME 签发规则"
+			}
 			auditFailure("skipped", skipNote)
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "未创建任何签发任务：" + skipNote, Data: gin.H{
 				"queued":            0,

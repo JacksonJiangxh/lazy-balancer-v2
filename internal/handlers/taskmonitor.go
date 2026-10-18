@@ -31,10 +31,21 @@ func (h *Handlers) ListSystemTasks(c *gin.Context) {
 }
 
 // requireMasterNode 主节点门（写操作镜像 StartCRSUpdate 口径）。
+// 历史问题-01：角色查询失败（DB 故障/迁移窗口）≠ 从节点——查询失败响亮 500，
+// 403「仅允许在主节点执行」会把排障方向指向集群角色（与 requireMaster 及
+// requireAutoBackupMaster 的 历史问题-19② 先例同形）。
 func requireMasterNode(c *gin.Context) bool {
+	if db.DB == nil {
+		clusterError(c, http.StatusInternalServerError, "节点角色查询失败", nil)
+		return false
+	}
 	var isMaster bool
-	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil || !isMaster {
-		clusterError(c, http.StatusForbidden, "该操作仅允许在主节点执行", err)
+	if err := db.DB.QueryRow("SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
+		clusterError(c, http.StatusInternalServerError, "节点角色查询失败", err)
+		return false
+	}
+	if !isMaster {
+		clusterError(c, http.StatusForbidden, "该操作仅允许在主节点执行", nil)
 		return false
 	}
 	return true

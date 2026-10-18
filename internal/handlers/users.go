@@ -104,6 +104,14 @@ func passwordResetColumns() []string {
 	}
 }
 
+// revokeMFAChallenges 改密时吊销在册 MFA 登录挑战（历史 U04c-02）：
+// 三条改密路径（管理员更新/重置、自助改密）都必须在同一事务内调用——
+// 版本绑定是主防线，删除保证旧挑战不以任何路径残留。
+func revokeMFAChallenges(tx *sql.Tx, userID int) error {
+	_, err := tx.Exec("DELETE FROM mfa_challenges WHERE user_id = ?", userID)
+	return err
+}
+
 func (h *Handlers) UpdateUser(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
@@ -258,6 +266,13 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	}
 	var user models.User
 	var authProvider string
+	// U04c-02：改密成功后在提交前吊销在册 MFA 挑战。
+	if passwordHash != "" {
+		if err := revokeMFAChallenges(tx, id); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新用户失败"})
+			return
+		}
+	}
 	if err := tx.QueryRowContext(c.Request.Context(), `SELECT id,username,role,display_name,is_enabled,created_at,last_login,COALESCE(auth_provider,'local') FROM users WHERE id=?`, id).
 		Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &authProvider); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户失败"})
@@ -559,6 +574,11 @@ func (h *Handlers) ResetUserPassword(c *gin.Context) {
 	}
 	if rowsAffected == 0 {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "用户不存在"})
+		return
+	}
+	// U04c-02：密码重置吊销在册 MFA 挑战（与更新/自助改密同语义）。
+	if err := revokeMFAChallenges(tx, id); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "重置密码失败"})
 		return
 	}
 	var resetUsername string

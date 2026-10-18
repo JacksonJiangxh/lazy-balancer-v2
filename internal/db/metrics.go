@@ -252,7 +252,7 @@ func gcQuarantinedMetricsFiles(dbPath string) {
 }
 
 func openAndPingMetricsDB(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=synchronous(NORMAL)")
+	db, err := sql.Open("sqlite", dbPath+"?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=synchronous(NORMAL)")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open metrics database: %w", err)
 	}
@@ -341,6 +341,17 @@ func initMetricsSchema(db *sql.DB) error {
 		count INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY (minute, country, province, family, rule, action)
 	) WITHOUT ROWID;
+
+	-- 历史 历史问题：被攻击目标（rule_caddy_id）分钟 rollup——与主 rollup
+	-- 同批写入，使「TOP 被攻击站点」与总量/国家等卡片同窗口，不再依赖原始表
+	-- （原始表受保留期/行帽裁剪；主 rollup 主键无法承载该维度）。
+	CREATE TABLE IF NOT EXISTS security_event_target_rollup (
+		minute TEXT NOT NULL,
+		rule_caddy_id TEXT NOT NULL,
+		count INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (minute, rule_caddy_id)
+	) WITHOUT ROWID;
+	CREATE INDEX IF NOT EXISTS idx_security_event_target_rollup_minute ON security_event_target_rollup(minute);
 
 	-- 指标库通用状态表（历史 历史问题）：rollup 固化水位等持久元数据。
 	-- 键值单行形态，水位与分钟数据同事务提交——不再以数据行 MAX(minute)

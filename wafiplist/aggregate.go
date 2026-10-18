@@ -8,14 +8,12 @@ import (
 	"strings"
 )
 
-// AggregatePrefixes 聚合 IP/CIDR 名单：解析（裸 IP 补 /32 //128、主机位掩码
-// 归零）→ 去重 → 兄弟前缀归并（同 bits、同父段的相邻对合并为 bits-1 父段，
-// 迭代收敛）→ 剔除被更宽段覆盖的段 → 按地址排序。产出为「升序、去重、
-// 不相交」前缀集——既是 @ipListFast 二分检索的加载形态，也是渲染层名单的
-// 规范发射形态。不可解析条目被丢弃（调用方需先自行校验/透传）。
-// 不变量：聚合前后匹配集合逐点相等。
+// AggregatePrefixes 聚合 IP/CIDR 名单（字符串入口）：逐条目解析一次
+// （ParseIPEntry——裸 IP 补 /32 //128、主机位掩码归零、4in6 归一）后交给
+// AggregateParsedPrefixes 聚合。不可解析条目被丢弃（调用方需先自行校验/
+// 透传）。
 func AggregatePrefixes(entries []string) []netip.Prefix {
-	set := make(map[netip.Prefix]struct{}, len(entries))
+	parsed := make([]netip.Prefix, 0, len(entries))
 	for _, entry := range entries {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
@@ -25,7 +23,29 @@ func AggregatePrefixes(entries []string) []netip.Prefix {
 		if err != nil {
 			continue
 		}
-		set[prefix] = struct{}{}
+		parsed = append(parsed, prefix)
+	}
+	return AggregateParsedPrefixes(parsed)
+}
+
+// AggregateParsedPrefixes 聚合**已解析**前缀（ParseIPEntry 产物或等价形态）：
+// 去重 → 兄弟前缀归并（同 bits、同父段的相邻对合并为 bits-1 父段，迭代收敛）
+// → 剔除被更宽段覆盖的段 → 按地址排序。产出为「升序、去重、不相交」前缀集
+// ——既是 @ipListFast 二分检索的加载形态，也是渲染层名单的规范发射形态。
+// 不变量：聚合前后匹配集合逐点相等。
+//
+// 单源原语（历史问题）：字符串入口（AggregatePrefixes/AggregateIPEntries）与
+// 「解析已完成」的调用方（名单加载、.fast 编译、选项树）共用同一聚合实现——
+// 同一条目只解析一次，不再「校验一次 + 聚合再解析一次」。
+func AggregateParsedPrefixes(parsed []netip.Prefix) []netip.Prefix {
+	set := make(map[netip.Prefix]struct{}, len(parsed))
+	for _, p := range parsed {
+		if !p.IsValid() {
+			continue
+		}
+		// ParseIPEntry 已掩码；此处幂等再掩码，防外部构造的未掩码前缀破坏
+		// 二分不变量（主机位非零条目能通过读侧校验却查询假阴性）。
+		set[p.Masked()] = struct{}{}
 	}
 	prefixes := make([]netip.Prefix, 0, len(set))
 	for p := range set {
@@ -73,21 +93,23 @@ func AggregatePrefixes(entries []string) []netip.Prefix {
 
 // AggregateIPEntries 同 AggregatePrefixes，字符串进出（渲染层形态）；
 // 不可解析条目原样透传在末尾（不静默削弱安全名单——引擎层对坏条目
-// fail-closed）。
+// fail-closed）。逐条目只解析一次。
 func AggregateIPEntries(entries []string) []string {
-	var parseable, passthrough []string
+	var passthrough []string
+	parsed := make([]netip.Prefix, 0, len(entries))
 	for _, entry := range entries {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
 		}
-		if _, err := ParseIPEntry(entry); err != nil {
+		prefix, err := ParseIPEntry(entry)
+		if err != nil {
 			passthrough = append(passthrough, entry)
 			continue
 		}
-		parseable = append(parseable, entry)
+		parsed = append(parsed, prefix)
 	}
-	merged := AggregatePrefixes(parseable)
+	merged := AggregateParsedPrefixes(parsed)
 	out := make([]string, 0, len(merged)+len(passthrough))
 	for _, p := range merged {
 		out = append(out, p.String())

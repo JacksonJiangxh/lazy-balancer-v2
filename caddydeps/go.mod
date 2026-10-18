@@ -4,11 +4,12 @@ go 1.26.0
 
 // 该模块不提供任何功能代码，仅通过 MVS 抬升 Caddy 二进制的传递依赖版本，
 // 满足镜像扫描的最低版本要求（见 Dockerfile xcaddy build 的 --with 引用）。
-// cel-go：Caddy v2.11.6 起自身要求 v0.29.2（celmatcher 已适配 v0.29 的
-// interpreter API 变更）——本钉版随之从 v0.28.1 升至 v0.29.2 对齐上游，
-// 防 MVS 解到 v0.28/v0.29 之外的偏移版本。调整时同步 Dockerfile 断言注释。
+// cel-go：Caddy v2.11.7 的 celmatcher 依赖 **cel.dev/cel-go v0.32.0**（模块
+// 路径自上游切换后为 cel.dev/cel-go；github.com/google/cel-go 是另一个独立
+// 模块路径——require 旧路径不参与本依赖图的 MVS，等于空转，历史 历史问题
+// 修正）。本钉版与上游同值，防传递解到更低偏移；调整时同步 Dockerfile 断言。
 require (
-	github.com/google/cel-go v0.29.2
+	cel.dev/cel-go v0.32.0
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.45.0

@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -132,6 +133,48 @@ func TestCleanupMetricsHistory_loopsAcrossBatches(t *testing.T) {
 	// 停顿 ⇒ 至少 40ms；单语句实现无停顿会被此处捕获。
 	if elapsed < 4*10*time.Millisecond {
 		t.Fatalf("cleanup finished in %v, want >=40ms (4 inter-batch yields) — batching not in effect", elapsed)
+	}
+}
+
+func TestOpenAndPingMetricsDB_beginsImmediateTransactions(t *testing.T) {
+	// Given：真实指标库与独立写连接。
+	dbPath := filepath.Join(t.TempDir(), "metrics-txlock.db")
+	metrics, err := openAndPingMetricsDB(dbPath)
+	if err != nil {
+		t.Fatalf("open metrics database: %v", err)
+	}
+	t.Cleanup(func() { _ = metrics.Close() })
+	if err := initMetricsSchema(metrics); err != nil {
+		t.Fatalf("initialize metrics schema: %v", err)
+	}
+	other, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(50)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+
+	// When：首个事务尚未写任何行时，deferred BEGIN 会放行另一连接写入；
+	// immediate BEGIN 必须在 BEGIN 当场取得写锁。
+	tx, err := metrics.Begin()
+	if err != nil {
+		t.Fatalf("begin metrics transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, writeErr := other.Exec(`INSERT INTO metrics_history (rule_id,timestamp) VALUES ('lb_lock',datetime('now'))`)
+
+	// Then：另一连接应得到锁冲突，而不是在首个事务读写升级前抢写成功。
+	if writeErr == nil {
+		t.Fatal("concurrent writer succeeded before first transaction wrote; BEGIN is deferred")
+	}
+	if !strings.Contains(writeErr.Error(), "SQLITE_BUSY") && !strings.Contains(writeErr.Error(), "database is locked") {
+		t.Fatalf("concurrent write error=%v, want SQLITE_BUSY", writeErr)
+	}
+	// 回归/夹具有效性：回滚后同一写入必须成功，排除表或连接本身不可用。
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if _, err := other.Exec(`INSERT INTO metrics_history (rule_id,timestamp) VALUES ('lb_lock',datetime('now'))`); err != nil {
+		t.Fatalf("write after rollback: %v", err)
 	}
 }
 

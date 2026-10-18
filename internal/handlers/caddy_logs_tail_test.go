@@ -66,7 +66,7 @@ func TestGetCaddyLogs_tailWindowGiantLineReturnsEmpty(t *testing.T) {
 	}
 	if envelope.Data.Content != "" {
 		t.Fatalf("巨行中段应输出为空（与 GetAppLogs 同口径）, got %d 字节（首 64 字符: %q）",
-			len(envelope.Data.Content), envelope.Data.Content[:64])
+			len(envelope.Data.Content), logContentPreview(envelope.Data.Content, 64))
 	}
 }
 
@@ -122,9 +122,34 @@ func TestGetCaddyLogs_tailWindowDropsFirstLineFragment(t *testing.T) {
 		t.Fatalf("decode response: %v", err)
 	}
 	if strings.Contains(envelope.Data.Content, string(rune(0xFFFD))) {
-		t.Fatalf("输出含 U+FFFD 替换符——窗口起点切断多字节 rune,残段污染首行（首 64 字符: %q）", envelope.Data.Content[:64])
+		t.Fatalf("输出含 U+FFFD 替换符——窗口起点切断多字节 rune,残段污染首行（首 64 字符: %q）", logContentPreview(envelope.Data.Content, 64))
 	}
 	if envelope.Data.Content != filler {
 		t.Fatalf("输出须恰好为截断后的完整行内容: 长度=%d, want %d（首行残段整体丢弃）", len(envelope.Data.Content), len(filler))
+	}
+}
+
+// logContentPreview 截取日志内容预览（LBH79-历史问题）：断言失败消息里直接
+// content[:64] 会在内容不足 64 字节（含空串）时 panic，掩盖真实诊断。
+func logContentPreview(content string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(content)
+	if len(runes) > limit {
+		return string(runes[:limit]) + "…"
+	}
+	return string(runes)
+}
+
+func TestLogContentPreview_shortContentDoesNotPanic(t *testing.T) {
+	if got := logContentPreview("short", 64); got != "short" {
+		t.Fatalf("preview=%q, want short", got)
+	}
+	if got := logContentPreview("", 64); got != "" {
+		t.Fatalf("preview=%q, want empty", got)
+	}
+	if got := logContentPreview("abcdef", 3); got != "abc…" {
+		t.Fatalf("preview=%q, want abc…", got)
 	}
 }

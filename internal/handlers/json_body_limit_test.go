@@ -16,7 +16,7 @@ import (
 // （0=默认 128，写侧 0-4096），不再逐端点裸奔或各定各的常量。
 func TestGuardConfiguredJSONBody(t *testing.T) {
 	setupAuthTestDB(t)
-	if _, err := db.DB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, request_body_max_size_mb INTEGER); INSERT INTO global_config VALUES (1,1)`); err != nil {
+	if _, err := db.DB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, request_body_max_size_mb INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,1)`); err != nil {
 		t.Fatalf("create global config: %v", err)
 	}
 	gin.SetMode(gin.TestMode)

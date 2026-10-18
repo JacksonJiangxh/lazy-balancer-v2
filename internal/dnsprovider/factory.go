@@ -43,16 +43,32 @@ func newProviderFromCredentials(rawJSON, dataDir string) (Provider, error) {
 	// 面归一化）：本处与 internal/services/dnsproviders/dnspod.go 的
 	// buildCredentials（UI 面 canonical 产出，AD-2 历史）——任一侧改
 	// 字段名/拼接格式须双侧同步。
-	if creds.Mode == "" {
-		var legacy struct {
-			AuthMode  string `json:"auth_mode"`
-			AppID     string `json:"app_id"`
-			AppToken  string `json:"app_token"`
-			SecretID  string `json:"secret_id"`
-			SecretKey string `json:"secret_key"`
+	//
+	// 历史问题（历史）：UI 形态是凭据真相——只要 auth_mode 存在，表单字段
+	// 就压过游离的消费层 mode 字段与陈旧 api_token。否则提交中同时带
+	// auth_mode=dnspod 与 mode=tencent 时，「保存前测试」（buildCredentials 走
+	// auth_mode）与真实签发（本函数原先 mode 优先）会用两套不同凭据。
+	var legacy struct {
+		AuthMode  string `json:"auth_mode"`
+		AppID     string `json:"app_id"`
+		AppToken  string `json:"app_token"`
+		SecretID  string `json:"secret_id"`
+		SecretKey string `json:"secret_key"`
+	}
+	legacyErr := json.Unmarshal([]byte(rawJSON), &legacy)
+	if legacyErr == nil && legacy.AuthMode != "" {
+		creds.Mode = legacy.AuthMode
+		if legacy.AppID != "" && legacy.AppToken != "" {
+			creds.APIToken = legacy.AppID + "," + legacy.AppToken
 		}
-		if err := json.Unmarshal([]byte(rawJSON), &legacy); err == nil {
-			creds.Mode = legacy.AuthMode
+		if legacy.SecretID != "" {
+			creds.SecretID = legacy.SecretID
+		}
+		if legacy.SecretKey != "" {
+			creds.SecretKey = legacy.SecretKey
+		}
+	} else if creds.Mode == "" {
+		if legacyErr == nil {
 			if creds.APIToken == "" && legacy.AppID != "" && legacy.AppToken != "" {
 				creds.APIToken = legacy.AppID + "," + legacy.AppToken
 			}

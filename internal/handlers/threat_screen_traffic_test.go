@@ -2,7 +2,7 @@ package handlers
 
 // 大屏实时流量端点（Plan B）：代理 Caddy admin 自定义端点 /lb/traffic-stats
 // （caddygeoip per-country 原子计数器），国名翻译中文（geoipnames 单源）+
-// Reserved/空键过滤；admin 不可达时空数据降级（200，非 500——大屏轮询容忍
+// Reserved/空/0 键过滤；admin 不可达时空数据降级（200，非 500——大屏轮询容忍
 // 瞬时不可达，可用性位 available 披露）。
 
 import (
@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,7 +35,7 @@ func TestGetThreatScreenTraffic_proxiesAndTranslates(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		_, _ = w.Write([]byte(`{"countries":{"United States":{"attack":12,"normal":345},"中国":{"attack":0,"normal":88},"Reserved":{"attack":1,"normal":0}},"sample_n":1}`))
+		_, _ = w.Write([]byte(`{"countries":{"United States":{"attack":12,"normal":345},"中国":{"attack":0,"normal":88},"Reserved":{"attack":1,"normal":0},"0":{"attack":2,"normal":3}},"sample_n":1}`))
 	}))
 	t.Cleanup(admin.Close)
 	router := newTrafficProxyRouter(t, admin.URL)
@@ -42,7 +43,7 @@ func TestGetThreatScreenTraffic_proxiesAndTranslates(t *testing.T) {
 	// When
 	rec := getRequest(t, router, "/security/overview/threat-screen/traffic")
 
-	// Then: 国名翻译中文（United States→美国 与质心表对齐）、Reserved 过滤、
+	// Then: 国名翻译中文（United States→美国 与质心表对齐）、Reserved/0 过滤、
 	// available=true、2s 超时保护
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
@@ -71,6 +72,12 @@ func TestGetThreatScreenTraffic_proxiesAndTranslates(t *testing.T) {
 	}
 	if payload.Data.Countries["美国"].Attack != 12 || payload.Data.Countries["美国"].Normal != 345 {
 		t.Fatalf("美国=%+v", payload.Data.Countries["美国"])
+	}
+	if _, exists := payload.Data.Countries["0"]; exists {
+		t.Fatalf("xdb 无效国家键 0 必须过滤: %+v", payload.Data.Countries)
+	}
+	if got := len(payload.Data.Countries); got != 2 {
+		t.Fatalf("countries=%+v, want only 美国 and 中国", payload.Data.Countries)
 	}
 }
 
@@ -113,5 +120,87 @@ func TestGetThreatScreenTraffic_timeoutGuard(t *testing.T) {
 	}
 	if elapsed >= 3*time.Second {
 		t.Fatalf("elapsed=%v, want <3s（2s 超时保护）", elapsed)
+	}
+}
+
+func TestGetThreatScreenTraffic_shortTTLCacheHit(t *testing.T) {
+	// Given: admin 端点计数器 + 1s TTL 进程内缓存
+	var hits int32
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte(`{"countries":{"中国":{"attack":1,"normal":2}},"sample_n":1}`))
+	}))
+	t.Cleanup(admin.Close)
+	router := newTrafficProxyRouter(t, admin.URL)
+
+	// When: 连续两次请求（TTL 内）
+	rec1 := getRequest(t, router, "/security/overview/threat-screen/traffic")
+	rec2 := getRequest(t, router, "/security/overview/threat-screen/traffic")
+
+	// Then: 第二次命中缓存——上游仅抓取一次，两次响应一致
+	if rec1.Code != http.StatusOK || rec2.Code != http.StatusOK {
+		t.Fatalf("status=%d/%d", rec1.Code, rec2.Code)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("upstream hits=%d, want 1（1s TTL 缓存命中）", got)
+	}
+	if rec1.Body.String() != rec2.Body.String() {
+		t.Fatalf("cached response mismatch:\n%s\n%s", rec1.Body.String(), rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), `"available":true`) {
+		t.Fatalf("cached body=%s, want available=true", rec2.Body.String())
+	}
+}
+
+func TestGetThreatScreenTraffic_cacheExpires(t *testing.T) {
+	// Given: 缓存 TTL 缩短至 50ms（测试缝）
+	old := threatTrafficCacheTTL
+	threatTrafficCacheTTL = 50 * time.Millisecond
+	t.Cleanup(func() { threatTrafficCacheTTL = old })
+	var hits int32
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte(`{"countries":{"中国":{"attack":1,"normal":2}},"sample_n":1}`))
+	}))
+	t.Cleanup(admin.Close)
+	router := newTrafficProxyRouter(t, admin.URL)
+
+	// When: 首次请求 → 过期后再请求
+	_ = getRequest(t, router, "/security/overview/threat-screen/traffic")
+	time.Sleep(80 * time.Millisecond)
+	_ = getRequest(t, router, "/security/overview/threat-screen/traffic")
+
+	// Then: TTL 过期后重新抓取
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("upstream hits=%d, want 2（TTL 过期后重新抓取）", got)
+	}
+}
+
+func TestGetThreatScreenTraffic_failureNotCached(t *testing.T) {
+	// Given: 首次请求 admin 返回 502，第二次恢复
+	var hits int32
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write([]byte(`{"countries":{"中国":{"attack":1,"normal":2}},"sample_n":1}`))
+	}))
+	t.Cleanup(admin.Close)
+	router := newTrafficProxyRouter(t, admin.URL)
+
+	// When
+	rec1 := getRequest(t, router, "/security/overview/threat-screen/traffic")
+	rec2 := getRequest(t, router, "/security/overview/threat-screen/traffic")
+
+	// Then: 失败不缓存——第一次降级 available=false，第二次真实抓取成功
+	if !strings.Contains(rec1.Body.String(), `"available":false`) {
+		t.Fatalf("first body=%s, want available=false 降级", rec1.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), `"available":true`) || !strings.Contains(rec2.Body.String(), `"中国"`) {
+		t.Fatalf("second body=%s, want 恢复后真实数据", rec2.Body.String())
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("upstream hits=%d, want 2（失败结果不缓存）", got)
 	}
 }

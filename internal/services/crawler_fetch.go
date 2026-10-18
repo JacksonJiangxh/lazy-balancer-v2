@@ -13,17 +13,56 @@ import (
 )
 
 // cidrTokenRE / cidrTokenV6RE 通用 CIDR/裸 IP 提取（JSON/HTML 通用）。
+// 历史问题（历史）：边界排除「数字/点」——旧 `\b` 会把版本号/日期串中的
+// 四段数字收进名单（`not.an.ip.version.1.2.3.4.5` 抽出 1.2.3.4，`2026.10.18`
+// 类文本同理），错误页/示例文本即可污染豁免名单。
 var (
-	cidrTokenRE   = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b`)
-	cidrTokenV6RE = regexp.MustCompile(`(?i)\b(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{0,4}(?:/\d{1,3})?\b`)
+	cidrTokenRE   = regexp.MustCompile(`(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?`)
+	cidrTokenV6RE = regexp.MustCompile(`(?i)(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{0,4}(?:/\d{1,3})?`)
 )
 
-// parseCrawlerCIDRs 从任意 JSON/HTML 文本提取 CIDR 与裸 IP 并去重。
-// 历史问题（历史）：JSON 源优先按结构解析 ipv4Prefix/ipv6Prefix（Google
-// common-crawlers.json 携带大量 ipv6Prefix，旧纯 IPv4 词法把 IPv6 全丢弃）；
-// 通用词法同时补 IPv6（冒号十六进制 + 可选 /len）；统一 netip 校验，裸 IP
-// 归一 /32（IPv4）/ /128（IPv6），非法 token（版本号等）跳过。
+// crawlerTokenBoundary 判定 token 边界外字符是否属于「同类」——数字/点（v4）
+// 或十六进制/冒号/点（v6）。Go RE2 无 lookaround，用索引手工判界（避免消费
+// 边界字符导致相邻 token 漏取）。
+func crawlerTokenBoundary(b byte, v6 bool) bool {
+	if b >= '0' && b <= '9' || b == '.' {
+		return true
+	}
+	if v6 && (b >= 'a' && b <= 'f' || b >= 'A' && b <= 'F' || b == ':') {
+		return true
+	}
+	return false
+}
+
+// findBoundedCrawlerTokens 返回词法命中的 token（两侧边界均非同类字符）。
+func findBoundedCrawlerTokens(re *regexp.Regexp, body string, v6 bool) []string {
+	idxs := re.FindAllStringIndex(body, -1)
+	out := make([]string, 0, len(idxs))
+	for _, idx := range idxs {
+		start, end := idx[0], idx[1]
+		if start > 0 && crawlerTokenBoundary(body[start-1], v6) {
+			continue
+		}
+		if end < len(body) && crawlerTokenBoundary(body[end], v6) {
+			continue
+		}
+		out = append(out, body[start:end])
+	}
+	return out
+}
+
+// parseCrawlerCIDRs 从任意 JSON/HTML 文本提取 CIDR 与裸 IP 并去重（宽松形态：
+// 未知格式/纯文本）。
 func parseCrawlerCIDRs(body string) []string {
+	out, _ := parseCrawlerCIDRsForFormat(body, "")
+	return out
+}
+
+// parseCrawlerCIDRsForFormat 按源声明格式提取（历史问题：消费 crawlerSource.Format）：
+//   - json：响应必须是合法 JSON（错误页/限流页 → error，调用方保留上次快照）；
+//   - html/plain/空：仅词法提取；
+//   - 统一 netip 校验，裸 IP 归一 /32（IPv4）/ /128（IPv6），非法 token 跳过。
+func parseCrawlerCIDRsForFormat(body, format string) ([]string, error) {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, 64)
 	add := func(tok string) {
@@ -39,17 +78,22 @@ func parseCrawlerCIDRs(body string) []string {
 	}
 	// 1) 结构化字段（JSON 对象/数组递归；ipv4Prefix/ipv6Prefix 大小写不敏感）。
 	var parsed any
-	if json.Unmarshal([]byte(body), &parsed) == nil {
+	jsonErr := json.Unmarshal([]byte(body), &parsed)
+	if jsonErr == nil {
 		collectCrawlerPrefixFields(parsed, add)
+	} else if strings.EqualFold(strings.TrimSpace(format), "json") {
+		// 历史问题：JSON 源返回非 JSON（错误页/HTML 劫持）→ 显式失败，绝不把
+		// 页面里的 IP 同形文本当官方网段。
+		return nil, fmt.Errorf("响应不是合法 JSON（疑似错误页），保留上次快照")
 	}
 	// 2) 通用词法（HTML/纯文本/未结构化 JSON）。
-	for _, tok := range cidrTokenRE.FindAllString(body, -1) {
+	for _, tok := range findBoundedCrawlerTokens(cidrTokenRE, body, false) {
 		add(tok)
 	}
-	for _, tok := range cidrTokenV6RE.FindAllString(body, -1) {
+	for _, tok := range findBoundedCrawlerTokens(cidrTokenV6RE, body, true) {
 		add(tok)
 	}
-	return out
+	return out, nil
 }
 
 // collectCrawlerPrefixFields 递归收集 JSON 中的 ipv4Prefix/ipv6Prefix 字符串值。

@@ -3,15 +3,27 @@ package models
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"net/url"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 var ErrInvalidClusterAccessURL = errors.New("访问地址必须是无凭证、查询参数或片段的 HTTP 或 HTTPS URL")
 
+// ErrInvalidClusterNodeName 归一后为空的节点名（仅含空白/控制字符）——handler
+// 映射 400（客户端可修正），区别于服务端故障。
+var ErrInvalidClusterNodeName = errors.New("节点名不能为空")
+
+// ClusterNodeNameMaxLen 节点名长度上限（与 nodes.name VARCHAR(100) 一致）。
+// HTTP 入口由 binding max=100 拦截，服务层落库前经 NormalizeClusterNodeName
+// 再归一（控制字符剥离 + 截断），两侧共用同一上限。
+const ClusterNodeNameMaxLen = 100
+
 type ClusterRegisterRequest struct {
 	Token     string `json:"token" binding:"required"`
-	Name      string `json:"name" binding:"required"`
+	Name      string `json:"name" binding:"required,max=100"`
 	IPAddress string `json:"ip_address" binding:"required,ip"`
 	Port      int    `json:"port" binding:"omitempty,min=1,max=65535"`
 	Protocol  string `json:"protocol" binding:"omitempty,oneof=http https"`
@@ -31,6 +43,48 @@ func ValidateClusterAccessURL(value string) error {
 		return ErrInvalidClusterAccessURL
 	}
 	return nil
+}
+
+// NormalizeClusterNodeName 节点名落库侧单源归一（历史问题-05）：去首尾空白、
+// 剥离控制字符、按 schema VARCHAR(100) 上限截断到合法 UTF-8 边界。HTTP 入口
+// 由 binding max=100 拦截；服务层直调与旧客户端仍需同一兜底（SQLite 不强制
+// VARCHAR 长度），否则 16KB 注册体可把超长/带换行的名字写进 nodes 并回显。
+func NormalizeClusterNodeName(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, name)
+	name = strings.TrimSpace(name)
+	if utf8.RuneCountInString(name) > ClusterNodeNameMaxLen {
+		name = string([]rune(name)[:ClusterNodeNameMaxLen])
+	}
+	return name
+}
+
+// ClusterAccessURLHostMatchesIP 判定自述访问地址的主机是否即注册来源 IP
+// （历史问题-06 信任边界）：access_url 是能力票据（服务控制/登录票据）的投递
+// 地址，注册方自述值只在与来源 IP 一致时可信；其余必须由管理员经节点访问
+// 地址端点显式配置，避免已发注册令牌把票据引向任意第三方主机。
+func ClusterAccessURLHostMatchesIP(accessURL, ipAddress string) bool {
+	if accessURL == "" {
+		return true
+	}
+	parsed, err := url.Parse(accessURL)
+	if err != nil {
+		return false
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, ipAddress) {
+		return true
+	}
+	parsedIP := net.ParseIP(host)
+	return parsedIP != nil && parsedIP.Equal(net.ParseIP(ipAddress))
 }
 
 type ClusterLoginTicketRequest struct {
@@ -103,7 +157,7 @@ type ClusterModeRequest struct {
 	Mode          string `json:"mode" binding:"required,oneof=master slave"`
 	MasterURL     string `json:"master_url"`
 	RegisterToken string `json:"register_token"`
-	NodeName      string `json:"node_name"`
+	NodeName      string `json:"node_name" binding:"omitempty,max=100"`
 }
 
 type ClusterSettingsRequest struct {
@@ -125,6 +179,10 @@ type ClusterRegistration struct {
 	// 与令牌会让运营方误以为是新节点——响应与审计必须点名被覆盖的节点。
 	OverwrittenNodeID   int    `json:"overwritten_node_id,omitempty"`
 	OverwrittenNodeName string `json:"overwritten_node_name,omitempty"`
+	// AccessURLIgnored 表示注册请求自述的 access_url 与来源 IP 不一致而被忽略
+	// （历史问题-06：access_url 是能力票据投递地址，只接受与注册来源一致的
+	// 自述值；其余必须由管理员经节点访问地址端点显式配置）。
+	AccessURLIgnored bool `json:"access_url_ignored,omitempty"`
 }
 
 type ClusterRegistrationStatus struct {
@@ -510,4 +568,8 @@ type ClusterStatus struct {
 	SyncErrorCode  SyncErrorCode `json:"sync_error_code,omitempty"`
 	PendingCount   int           `json:"pending_count"`
 	ApprovedCount  int           `json:"approved_count"`
+	// TransportInsecure 表示从节点→主节点链路为明文 HTTP（快照承载证书私钥
+	// 与 CA/DNS 凭据、服务控制票据为 Bearer，且 HTTP 下无 TOFU 指纹防护）。
+	// 注册时刻的一次性告警之外，UI 据此常驻提示（历史问题-09）。
+	TransportInsecure bool `json:"transport_insecure"`
 }

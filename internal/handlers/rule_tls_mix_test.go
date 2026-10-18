@@ -147,3 +147,35 @@ func TestRulePortTLSMix_null_enable_tls_row_normalized_as_plaintext(t *testing.T
 		t.Fatalf("plaintext coexistence with NULL-enable_tls row must pass, got %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+// LBH79-历史问题：补 Update 方向——文件头声明覆盖 create/update/enable 三入口，
+// 实际只测了 create×2 + enable；更新开启 TLS 命中同端口混布门无钉测。
+func TestRulePortTLSMix_rejectedOnUpdate(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	oldCertDir := testServicesCertDir
+	testServicesCertDir = t.TempDir()
+	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	router := newTLSMixRouter(t, handler)
+
+	// Given：同端口已启用明文规则 A + 一条禁用明文规则 B（同形态共存合法）
+	seedTLSMixRule(t, "lb_mix_upd_plain_a", "mix-upd-a.test", 18449, false, 1)
+	seedTLSMixRule(t, "lb_mix_upd_plain", "mix-upd-b.test", 18449, false, 0)
+
+	// When：更新 B 开启 TLS（同端口已有启用中的明文规则 → 混布门）
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_mix_upd_plain", strings.NewReader(`{"enable_tls":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	// Then：400 混布拒绝，DB 的 enable_tls 未被写入
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "不能混布") {
+		t.Fatalf("update enabling TLS onto plaintext/TLS mixed port must 400, got %d %s", response.Code, response.Body.String())
+	}
+	var enableTLS int
+	if err := db.DB.QueryRow(`SELECT IIF(enable_tls IN ('1',1),1,0) FROM lb_rules WHERE caddy_id='lb_mix_upd_plain'`).Scan(&enableTLS); err != nil {
+		t.Fatalf("read enable_tls: %v", err)
+	}
+	if enableTLS != 0 {
+		t.Fatalf("rejected update persisted enable_tls=%d", enableTLS)
+	}
+}

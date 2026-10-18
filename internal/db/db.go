@@ -49,6 +49,10 @@ const (
 	DefaultHealthCheckUnhealthyThreshold = 3
 	DefaultTCPTryInterval                = 250
 	DefaultCertExpiryDays                = 30
+	// 历史问题（历史）：cert_renewal_days/cert_renewal_attempts 与
+	// cert_expiry_days 同族——DDL DEFAULT + 启动回填 + 读侧直读零兜底三件套。
+	DefaultCertRenewalDays     = 30
+	DefaultCertRenewalAttempts = 5
 	// DefaultAnomalyThreshold（G6，历史）：security_policies.anomaly_threshold
 	// 类型①值列默认值——DDL DEFAULT（:604）+启动归一（security_normalize.go
 	// legacySecurityEnumBackfills）+DB 侧钉测三处单源。
@@ -471,6 +475,9 @@ func createTables() error {
 		server_tokens_hidden BOOLEAN DEFAULT FALSE,
 		cert_expiry_days INTEGER DEFAULT 30,
 		cert_renewal_days INTEGER DEFAULT 30,
+		-- 历史问题（历史）：续期次数与天数同族——fresh DDL 与 ensureNewColumns
+		-- （存量库）双锚，缺此列会让 DDL DEFAULT 钉测在 fresh 库上查无此列。
+		cert_renewal_attempts INTEGER DEFAULT 5,
 		task_log_size_mb INTEGER DEFAULT 10,
 		audit_log_size_mb INTEGER DEFAULT 10,
 		caddy_apply_error TEXT DEFAULT '',
@@ -510,6 +517,19 @@ func createTables() error {
 	);
 
 	-- Nodes table
+	-- 历史问题-03（历史）：三列是历史状态机残留，语义如下，禁止新消费：
+	--   status VARCHAR(20)         仅注册/审批/上报时写（pending/online），从不回写
+	--                              'offline'；在线判定唯一口径=nodes.is_approved +
+	--                              last_seen + nodeOfflineThreshold（ComputeNodeStatus）。
+	--                              唯一判定性读点是审批 SQL 的 status='pending'
+	--                              （若未来重建表，可改 is_approved=0 且
+	--                              registration_secret 非空）。
+	--   cluster_token_delivered    只写不读（注册/审批置 0、令牌下发置 1）；令牌重投
+	--                              语义由 registration_secret 保留 + Snapshot 确认清除
+	--                              承载，本列无消费方。
+	--   sync_interval              写侧从不写（schema 默认 60），阈值口径统一读
+	--                              global_config.sync_interval（历史问题-01）。
+	-- 三列随下一次 nodes 重建迁移删除；此前保留仅为兼容旧库/旧快照回放。
 	CREATE TABLE IF NOT EXISTS nodes (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name VARCHAR(100) NOT NULL,
@@ -534,6 +554,8 @@ func createTables() error {
 	);
 
 	-- Create indexes
+	-- idx_nodes_status 无查询消费（status 唯一读点是审批点查 + is_approved 过滤，
+	-- 走 id 主键/无索引需求）；与 status 列同批迁移删除。
 	CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
 
 	CREATE TABLE IF NOT EXISTS cluster_register_tokens (
@@ -554,12 +576,16 @@ func createTables() error {
 	-- MFA 登录二步挑战（v2.1.8）：节点本地临时态，不参与集群同步/配置备份
 	--（同 used_login_tickets 先例）；过期行（含未消费）由每次签发挑战时的
 	-- 惰性 DELETE 清除（历史问题 修正：原注释所述 loginRateLimit 桶扫描不存在）。
+	-- password_version（历史 U04c-02）：绑定签发时的密码版本——改密/重置
+	-- 后旧挑战校验必败（验证端要求与 users.password_version 相等），
+	-- 杜绝「旧密码取得挑战→重置后仍能完成 MFA」。
 	CREATE TABLE IF NOT EXISTS mfa_challenges (
 		token TEXT PRIMARY KEY,
 		user_id INTEGER NOT NULL,
 		expires_at DATETIME NOT NULL,
 		consumed BOOLEAN DEFAULT 0,
 		attempts INTEGER DEFAULT 0,
+		password_version INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE INDEX IF NOT EXISTS idx_mfa_challenges_expires_at ON mfa_challenges(expires_at);
@@ -665,7 +691,9 @@ func createTables() error {
 	-- （TEXT NOT NULL DEFAULT '' / BOOLEAN NOT NULL DEFAULT 0），fresh 建库
 	-- 不再依赖启动补列。
 	policy_type TEXT NOT NULL DEFAULT '',
-	trust_detection BOOLEAN NOT NULL DEFAULT 0
+	trust_detection BOOLEAN NOT NULL DEFAULT 0,
+	geoip_crawler_exempt INTEGER NOT NULL DEFAULT 0,
+	geoip_crawler_engines TEXT NOT NULL DEFAULT '[]'
 	);
 	CREATE TABLE IF NOT EXISTS security_policy_bindings (
 		rule_caddy_id TEXT NOT NULL,
@@ -787,17 +815,13 @@ CREATE TABLE IF NOT EXISTS security_threat_sources (
 	}
 	// 威胁库三源种子（v2.3.x）——USTC URL 含「?」必须走参数化（原始 SQL 中
 	// 会被当作占位符）。INSERT OR IGNORE 幂等，存量库重启重复执行安全。
-	for _, seed := range [][3]string{
-		{"ustc", "中科大恶意 IP（USTC）", "https://blackip.ustc.edu.cn/list.php?txt"},
-		{"firehol_l1", "FireHOL Level 1", "https://iplists.firehol.org/files/firehol_level1.netset"},
-		{"et_compromised", "Emerging Threats Compromised", "https://rules.emergingthreats.net/blockrules/compromised-ips.txt"},
-	} {
-		if _, err := DB.Exec(`INSERT OR IGNORE INTO security_threat_sources (name, display_name, url) VALUES (?, ?, ?)`, seed[0], seed[1], seed[2]); err != nil {
-			return fmt.Errorf("failed to seed threat source %s: %w", seed[0], err)
+	for _, seed := range threatSourceSeeds {
+		if _, err := DB.Exec(`INSERT OR IGNORE INTO security_threat_sources (name, display_name, url, format) VALUES (?, ?, ?, ?)`, seed.Name, seed.DisplayName, seed.URL, seed.Format); err != nil {
+			return fmt.Errorf("failed to seed threat source %s: %w", seed.Name, err)
 		}
 		// 存量行 display_name 专业化跟进（2026-09-24 用户裁定；name 为定位键不变）
-		if _, err := DB.Exec(`UPDATE security_threat_sources SET display_name=? WHERE name=? AND COALESCE(display_name,'')<>?`, seed[1], seed[0], seed[1]); err != nil {
-			return fmt.Errorf("failed to refresh threat source display_name %s: %w", seed[0], err)
+		if _, err := DB.Exec(`UPDATE security_threat_sources SET display_name=? WHERE name=? AND COALESCE(display_name,'')<>?`, seed.DisplayName, seed.Name, seed.DisplayName); err != nil {
+			return fmt.Errorf("failed to refresh threat source display_name %s: %w", seed.Name, err)
 		}
 	}
 	return nil
@@ -903,10 +927,12 @@ func runMigrations() error {
 		"upstreams.max_connections":                       "INTEGER DEFAULT 0",
 		// 逐上游回源域名 + 健康检查域名（2026-10-10）：空串=不配置，
 		// 回退规则级 host_header / 现状默认。
-		"upstreams.origin_domain":              "TEXT NOT NULL DEFAULT ''",
-		"lb_rules.health_check_host":           "TEXT NOT NULL DEFAULT ''",
-		"global_config.threat_auto_update":     "INTEGER NOT NULL DEFAULT 1",
-		"security_ip_lists.system":             "INTEGER NOT NULL DEFAULT 0",
+		"upstreams.origin_domain":          "TEXT NOT NULL DEFAULT ''",
+		"lb_rules.health_check_host":       "TEXT NOT NULL DEFAULT ''",
+		"global_config.threat_auto_update": "INTEGER NOT NULL DEFAULT 1",
+		"security_ip_lists.system":         "INTEGER NOT NULL DEFAULT 0",
+		// MFA 登录挑战绑定签发时密码版本（历史 U04c-02）。
+		"mfa_challenges.password_version":      "INTEGER NOT NULL DEFAULT 0",
 		"path_rules.upstream_path":             "TEXT NOT NULL DEFAULT ''",
 		"security_threat_sources.content_hash": "TEXT DEFAULT ''",
 		"security_threat_sources.raw_hash":     "TEXT DEFAULT ''",
@@ -1116,6 +1142,9 @@ func runMigrations() error {
 		//（保留作形状防御）；真正的默认值收敛由 fresh CREATE DEFAULT 0 承担。
 		// 用户显式设置的 60 是写侧合法值，任何启动期迁移不得改写。
 		"global_config.upstream_keepalive_timeout": "UPDATE global_config SET upstream_keepalive_timeout=0 WHERE upstream_keepalive_timeout=60",
+		// 历史 U04c-02：存量挑战按用户当前密码版本回填（列新增当刻这些
+		// 挑战本就按「当前密码未变」语义有效，行为零漂移；一次性形状）。
+		"mfa_challenges.password_version": "UPDATE mfa_challenges SET password_version=COALESCE((SELECT COALESCE(password_version,0) FROM users WHERE users.id=mfa_challenges.user_id),0)",
 	}
 	if err := ensureNewColumns(newColumns, newColumnBackfills); err != nil {
 		return err
@@ -1211,6 +1240,11 @@ func runMigrations() error {
 		// 历史问题 C-N5 + 导入钳制 历史问题 历史问题 之外的最后防线）：NULL/<=0 归 30；用户已设
 		// 有效值（>0）恒不触碰。消费侧 GetCertExpiryThreshold 直读零兜底。
 		fmt.Sprintf("UPDATE global_config SET cert_expiry_days=%d WHERE cert_expiry_days IS NULL OR cert_expiry_days<=0", DefaultCertExpiryDays),
+		// 历史问题（历史）：cert_renewal_days/cert_renewal_attempts 纳入同一
+		// 启动回填（此前只有 DDL DEFAULT，带外直写 NULL 后读侧字面量 COALESCE
+		// 静默吞掉，无任何留痕）。读侧 GetCertRenewalDays/Attempts 直读零兜底。
+		fmt.Sprintf("UPDATE global_config SET cert_renewal_days=%d WHERE cert_renewal_days IS NULL OR cert_renewal_days<=0", DefaultCertRenewalDays),
+		fmt.Sprintf("UPDATE global_config SET cert_renewal_attempts=%d WHERE cert_renewal_attempts IS NULL OR cert_renewal_attempts<=0", DefaultCertRenewalAttempts),
 		// D2（历史）：自动封禁六列每启动幂等回填（同上铁律的最后防线
 		// 形态）——带外直写/畸形备份导入的脏行（0-1 外布尔、枚举外文本、写侧
 		// 边界外数值）在下次启动收敛到治理默认；运行期窗口内的无效值由消费侧
@@ -1324,6 +1358,11 @@ func runMigrations() error {
 	if _, err := DB.Exec("CREATE INDEX IF NOT EXISTS idx_cert_jobs_status_ca_available ON cert_jobs(status, ca_available_after)"); err != nil {
 		return fmt.Errorf("failed to index cert_jobs CA availability: %w", err)
 	}
+	// 历史问题（历史）：证书任务列表分页索引从只读 handler 内懒建（首个
+	// GET 拿 schema 写锁、并发首请求可能 SQLITE_BUSY）移入迁移期——读路径只查询。
+	if _, err := DB.Exec("CREATE INDEX IF NOT EXISTS idx_cert_jobs_created_at_desc ON cert_jobs(created_at DESC)"); err != nil {
+		return fmt.Errorf("failed to index cert_jobs created_at: %w", err)
+	}
 	if _, err := DB.Exec("CREATE INDEX IF NOT EXISTS idx_cert_jobs_status_expires ON cert_jobs(status, expires_at)"); err != nil {
 		return fmt.Errorf("failed to index cert_jobs expiration: %w", err)
 	}
@@ -1386,12 +1425,8 @@ func runMigrations() error {
 		return fmt.Errorf("failed to migrate legacy https protocol: %w", err)
 	}
 
-	// 历史问题 历史问题: 须在 migrateLegacyHTTPSProtocol 之后（其归一可能产生新的 http 行，
-	// 与本迁移的 tcp 谓词无交集，顺序仅求确定性）。
-	if err := migrateTCPRuleStaleTLS(); err != nil {
-		return fmt.Errorf("failed to migrate tcp rule stale tls: %w", err)
-	}
-	// 历史问题-1（历史）：紧随 StaleTLS——同为 TCP 死配置清理族，谓词互不重叠。
+	// 历史问题-1（历史）：TCP DNS 死配置清理由 deadFields 同族收口；
+	// TLS-only 旧形态由 runMigrations 尾部的 migrateTCPRuleDeadFields 覆盖并负责版本 bump。
 	if err := migrateTCPRuleStaleDNSServer(); err != nil {
 		return fmt.Errorf("failed to migrate tcp rule stale dns server: %w", err)
 	}
@@ -1633,12 +1668,23 @@ func runMigrations() error {
 	}
 	// 威胁情报库内置只读名单种子（v2.3.2 名单化重构）：name 稳定（更新任务
 	// 定位键），条目空，由更新任务独占写；system=1 行面板/API 拒改拒删。
+	// 历史问题：存在性判定按 system=1 限定——旧实现按名（不限 system）判定，
+	// 用户已有同名 system=0 列表时永不补建内置行，威胁文件更新却无名单 ID
+	// 可供策略引用（重启也不自愈）。同名用户列表不静默合并（数据归属不同），
+	// 但至少留痕提示重命名以消除列表选择器歧义。
 	for _, sl := range ThreatSystemLists {
-		if _, err := DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at)
+		result, err := DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at)
 			SELECT ?, ?, '恶意 IP', '[]', 1, datetime('now'), datetime('now')
-			WHERE NOT EXISTS (SELECT 1 FROM security_ip_lists WHERE name=?)`,
-			sl.Name, sl.Description, sl.Name); err != nil {
+			WHERE NOT EXISTS (SELECT 1 FROM security_ip_lists WHERE name=? AND system=1)`,
+			sl.Name, sl.Description, sl.Name)
+		if err != nil {
 			return fmt.Errorf("failed to seed threat system list %s: %w", sl.Name, err)
+		}
+		if n, _ := result.RowsAffected(); n > 0 {
+			var userOwned int
+			if err := DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=0`, sl.Name).Scan(&userOwned); err == nil && userOwned > 0 {
+				log.Printf("威胁情报库内置名单 %q 与用户自建列表同名：已创建独立 system=1 行（按 id 引用，互不影响）；建议重命名用户列表以消除选择器歧义", sl.Name)
+			}
 		}
 	}
 
@@ -1860,54 +1906,6 @@ func migrateLegacyHTTPSProtocol() error {
 		} else {
 			detail = fmt.Sprintf("存量 https 协议规则已迁移为普通 HTTP（无可用证书，未启用 TLS）：caddy_id=%s name=%s", rule.caddyID, rule.name)
 		}
-		log.Print(detail)
-		recordSystemAudit("启动迁移", "系统配置", detail)
-	}
-	return nil
-}
-
-// migrateTCPRuleStaleTLS 一次性迁移（历史问题 历史问题）：旧版 v1 导入曾落库
-// protocol='tcp' + enable_tls=1 + tls_source='manual' + 空证书的行——TCP 规则在
-// 渲染侧不终结入站 TLS（该形态无流量影响），但 UpdateRule 的手动证书检查不按
-// 协议门控，导致此类规则的任何编辑恒 400 且 UI 无自救路径。归一为关闭 TLS 并
-// 清空证书材料（与 UpdateRule 切换到 TCP 的归一分支同语义）。幂等，重跑零命中。
-func migrateTCPRuleStaleTLS() error {
-	rows, err := DB.Query(`SELECT caddy_id, name FROM lb_rules
-		WHERE protocol='tcp' AND IIF(enable_tls IN ('1',1),1,0)=1
-		  AND TRIM(COALESCE(tls_cert,''))='' AND TRIM(COALESCE(tls_key,''))=''`)
-	if err != nil {
-		return fmt.Errorf("failed to query tcp rules with stale tls: %w", err)
-	}
-	type staleTLSRule struct {
-		caddyID string
-		name    string
-	}
-	var stale []staleTLSRule
-	for rows.Next() {
-		var rule staleTLSRule
-		if err := rows.Scan(&rule.caddyID, &rule.name); err != nil {
-			rows.Close()
-			return fmt.Errorf("failed to scan tcp rules with stale tls: %w", err)
-		}
-		stale = append(stale, rule)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("failed to iterate tcp rules with stale tls: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("failed to close tcp rules with stale tls: %w", err)
-	}
-	if len(stale) == 0 {
-		return nil
-	}
-	if _, err := DB.Exec(`UPDATE lb_rules SET enable_tls=0, tls_cert='', tls_key=''
-		WHERE protocol='tcp' AND IIF(enable_tls IN ('1',1),1,0)=1
-		  AND TRIM(COALESCE(tls_cert,''))='' AND TRIM(COALESCE(tls_key,''))=''`); err != nil {
-		return fmt.Errorf("failed to normalize tcp rules with stale tls: %w", err)
-	}
-	for _, rule := range stale {
-		detail := fmt.Sprintf("存量 TCP 规则携带无效 TLS 状态（空证书），已归一为关闭 TLS：caddy_id=%s name=%s", rule.caddyID, rule.name)
 		log.Print(detail)
 		recordSystemAudit("启动迁移", "系统配置", detail)
 	}
@@ -2503,16 +2501,18 @@ func migrateSecurityPoliciesNullable() error {
 			ip_acl_list_refs TEXT DEFAULT '[]',
 			ip_whitelist_refs TEXT DEFAULT '[]',
 			policy_type TEXT NOT NULL DEFAULT '',
-			trust_detection BOOLEAN NOT NULL DEFAULT 0
+			trust_detection BOOLEAN NOT NULL DEFAULT 0,
+			geoip_crawler_exempt INTEGER NOT NULL DEFAULT 0,
+			geoip_crawler_engines TEXT NOT NULL DEFAULT '[]'
 		);
 		INSERT INTO security_policies_new (id,name,description,mode,anomaly_threshold,ip_acl_mode,ip_acl_list,ip_acl_enabled,
 			ip_whitelist,ip_blacklist,rate_limit_enabled,rate_limit_rps,rate_limit_burst,crs_rule_groups,crs_excluded_rules,
 			custom_rules,block_page_id,block_status_code,enabled,updated_by,created_at,updated_at,ip_whitelist_enabled,geoip_countries,geoip_mode,waf_check_response,
-			log_request_body,ip_acl_list_refs,ip_whitelist_refs,policy_type,trust_detection)
+			log_request_body,ip_acl_list_refs,ip_whitelist_refs,policy_type,trust_detection,geoip_crawler_exempt,geoip_crawler_engines)
 		SELECT id,name,description,mode,anomaly_threshold,ip_acl_mode,ip_acl_list,ip_acl_enabled,
 			ip_whitelist,ip_blacklist,rate_limit_enabled,rate_limit_rps,rate_limit_burst,crs_rule_groups,crs_excluded_rules,
 			custom_rules,block_page_id,block_status_code,enabled,updated_by,created_at,updated_at,COALESCE(ip_whitelist_enabled,1),geoip_countries,geoip_mode,waf_check_response,
-			COALESCE(log_request_body,0),COALESCE(ip_acl_list_refs,'[]'),COALESCE(ip_whitelist_refs,'[]'),policy_type,COALESCE(trust_detection,0)
+			COALESCE(log_request_body,0),COALESCE(ip_acl_list_refs,'[]'),COALESCE(ip_whitelist_refs,'[]'),policy_type,COALESCE(trust_detection,0),COALESCE(geoip_crawler_exempt,0),COALESCE(geoip_crawler_engines,'[]')
 		FROM security_policies;
 		DROP TABLE security_policies;
 		ALTER TABLE security_policies_new RENAME TO security_policies;`); err != nil {
@@ -2640,6 +2640,12 @@ func migrateLegacyDNSCredentials() error {
 			if _, err := tx.Exec("UPDATE certificate_configs SET dns_credentials = ? WHERE id = ?", string(encoded), credential.id); err != nil {
 				return rollbackMigration(tx, fmt.Errorf("failed to migrate certificate credentials for config %d: %w", credential.id, err))
 			}
+		}
+		// 值已迁入 dns_credentials 后同事务删除两份明文旧列：失败整体回滚，
+		// 不出现「新值已提交但退役列仍随 SELECT * 备份外泄」的中间态。
+		if _, err := tx.Exec(`ALTER TABLE certificate_configs DROP COLUMN dns_id;
+			ALTER TABLE certificate_configs DROP COLUMN dns_key`); err != nil {
+			return rollbackMigration(tx, fmt.Errorf("failed to drop legacy certificate credential columns: %w", err))
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -3157,7 +3163,8 @@ func normalizeRuleTimestampsMigration() error {
 	for _, table := range []string{"lb_rules", "path_rules"} {
 		for _, col := range []string{"created_at", "updated_at"} {
 			if _, err := DB.Exec(`UPDATE ` + table + ` SET ` + col + `=strftime('%Y-%m-%d %H:%M:%S', ` + col + `)
-				WHERE ` + col + ` IS NOT NULL AND (` + col + ` LIKE '%T%' OR ` + col + ` LIKE '%+%')`); err != nil {
+				WHERE ` + col + ` IS NOT NULL AND (` + col + ` LIKE '%T%' OR ` + col + ` LIKE '%+%')
+				  AND strftime('%Y-%m-%d %H:%M:%S', ` + col + `) IS NOT NULL`); err != nil {
 				return fmt.Errorf("failed to normalize %s.%s timestamp format: %w", table, col, err)
 			}
 		}
@@ -3189,7 +3196,7 @@ func migrateTCPRuleDeadFields() error {
 	if n, _ := res.RowsAffected(); n > 0 {
 		// 快照缓存随版本失效；bump 让从端下一轮拉到归一后 canonical，
 		// rules 节哈希两侧收敛（「分区滞后」自愈）。
-		if _, err := DB.Exec(`UPDATE global_config SET cluster_version=cluster_version+1 WHERE id=1`); err != nil {
+		if _, err := DB.Exec(`UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1`); err != nil {
 			return fmt.Errorf("failed to bump cluster_version after TCP dead-field cleanup: %w", err)
 		}
 	}

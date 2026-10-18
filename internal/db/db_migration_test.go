@@ -111,13 +111,15 @@ func TestRunMigrationsDropsTaskRunsStageEntryCount(t *testing.T) {
 }
 
 func TestRunMigrationsCreatesAuthenticationAndUpstreamIndexes(t *testing.T) {
-	// Given
+	// Given：fresh DDL 先建索引，再显式删除模拟存量库缺失形态。
 	database := openMigrationTestDB(t)
 	if err := createTables(); err != nil {
 		t.Fatalf("create tables: %v", err)
 	}
-	if _, err := database.Exec("INSERT INTO global_config (id,caddy_config) VALUES (1,'{}')"); err != nil {
-		t.Fatalf("seed global config: %v", err)
+	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config) VALUES (1,'{}');
+		DROP INDEX IF EXISTS idx_api_keys_prefix_hash;
+		DROP INDEX IF EXISTS idx_upstreams_rule_enabled_id;`); err != nil {
+		t.Fatalf("seed global config and drop legacy indexes: %v", err)
 	}
 
 	// When
@@ -133,6 +135,16 @@ func TestRunMigrationsCreatesAuthenticationAndUpstreamIndexes(t *testing.T) {
 		}
 		if count != 1 {
 			t.Fatalf("index %s count=%d, want 1", index, count)
+		}
+	}
+	// MCP/apiKeyAuth 的复合索引必须保持左前缀 key_prefix，再 key_hash。
+	for seqno, want := range []string{"key_prefix", "key_hash"} {
+		var column string
+		if err := database.QueryRow(`SELECT name FROM pragma_index_info('idx_api_keys_prefix_hash') WHERE seqno=?`, seqno).Scan(&column); err != nil {
+			t.Fatalf("read API key index column %d: %v", seqno, err)
+		}
+		if column != want {
+			t.Fatalf("API key index column %d=%q, want %q", seqno, column, want)
 		}
 	}
 }
@@ -1511,6 +1523,62 @@ func TestInitialize_backfillsNullConsecutiveFailuresAndIsMaster(t *testing.T) {
 	}
 }
 
+func TestMigrateLegacyDNSCredentials_migratesAndDropsRetiredColumns(t *testing.T) {
+	// Given：待迁移凭据、已有新格式凭据（回归）与空旧凭据（边界）。
+	database := openMigrationTestDB(t)
+	if _, err := database.Exec(`CREATE TABLE certificate_configs (
+		id INTEGER PRIMARY KEY, dns_id TEXT, dns_key TEXT, dns_credentials TEXT
+	);
+	INSERT INTO certificate_configs VALUES
+		(1, 'id-1', 'key-1', NULL),
+		(2, 'stale-id', 'stale-key', '{"app_id":"keep","app_token":"keep-token"}'),
+		(3, '', '', NULL);`); err != nil {
+		t.Fatalf("seed legacy certificate configs: %v", err)
+	}
+
+	// When
+	if err := migrateLegacyDNSCredentials(); err != nil {
+		t.Fatalf("migrate legacy credentials: %v", err)
+	}
+
+	// Then：值迁入新 JSON 列后，两个明文凭据退役列必须消失。
+	var retiredColumns int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('certificate_configs') WHERE name IN ('dns_id','dns_key')`).Scan(&retiredColumns); err != nil {
+		t.Fatal(err)
+	}
+	if retiredColumns != 0 {
+		t.Errorf("retired DNS credential columns=%d, want 0", retiredColumns)
+	}
+	var migratedText, existingText string
+	if err := database.QueryRow(`SELECT dns_credentials FROM certificate_configs WHERE id=1`).Scan(&migratedText); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT dns_credentials FROM certificate_configs WHERE id=2`).Scan(&existingText); err != nil {
+		t.Fatal(err)
+	}
+	var migrated map[string]string
+	if err := json.Unmarshal([]byte(migratedText), &migrated); err != nil {
+		t.Fatalf("decode migrated credentials %q: %v", migratedText, err)
+	}
+	if migrated["app_id"] != "id-1" || migrated["app_token"] != "key-1" {
+		t.Errorf("migrated credentials=%v, want id-1/key-1", migrated)
+	}
+	if existingText != `{"app_id":"keep","app_token":"keep-token"}` {
+		t.Errorf("existing credentials=%q, want preserved", existingText)
+	}
+	var emptyCredentials sql.NullString
+	if err := database.QueryRow(`SELECT dns_credentials FROM certificate_configs WHERE id=3`).Scan(&emptyCredentials); err != nil {
+		t.Fatal(err)
+	}
+	if emptyCredentials.Valid {
+		t.Errorf("empty legacy credentials=%q, want NULL unchanged", emptyCredentials.String)
+	}
+	// 幂等：列已退役后重跑不影响新格式数据。
+	if err := migrateLegacyDNSCredentials(); err != nil {
+		t.Fatalf("repeat migration: %v", err)
+	}
+}
+
 func TestMigrateLegacyDNSCredentials_rollsBackAllRowsOnFailure(t *testing.T) {
 	database := openMigrationTestDB(t)
 	if _, err := database.Exec(`CREATE TABLE certificate_configs (
@@ -1942,6 +2010,100 @@ func TestInitialize_backfillsLegacyNullTimestampColumns(t *testing.T) {
 	assertEpoch("SELECT COUNT(*) FROM users WHERE id=100 AND created_at='" + epoch + "'")
 }
 
+func TestNormalizeRuleTimestampsMigration_preservesMalformedAndCanonicalizesValidValues(t *testing.T) {
+	// Given：可解析 RFC3339、不可解析但带 T 的垃圾值、平面格式与 NULL 四种形态。
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	const malformed = "2026-13-45T99:99:99Z"
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,created_at,updated_at) VALUES
+		('lb_ts_valid','valid','http',8080,'2026-01-02T03:04:05Z','2026-01-02 03:04:05'),
+		('lb_ts_bad','bad','http',8081,'2026-13-45T99:99:99Z','2026-02-03T04:05:06Z');
+		INSERT INTO path_rules (rule_id,sort_order,match_type,path,created_at,updated_at)
+		VALUES ('lb_ts_valid',0,'prefix','/','2026-13-45T99:99:99Z',NULL)`); err != nil {
+		t.Fatalf("seed timestamp shapes: %v", err)
+	}
+
+	// When：真实迁移执行两次，验证幂等。
+	for round := range 2 {
+		if err := normalizeRuleTimestampsMigration(); err != nil {
+			t.Fatalf("normalize round %d: %v", round, err)
+		}
+	}
+
+	// Then：有效值归一，平面值不变，垃圾值保留异常信号而非写成 NULL。
+	assertText := func(query, want string) {
+		t.Helper()
+		var got sql.NullString
+		if err := database.QueryRow(query).Scan(&got); err != nil {
+			t.Fatalf("query %s: %v", query, err)
+		}
+		if !got.Valid || got.String != want {
+			t.Errorf("query %s = %+v, want %q", query, got, want)
+		}
+	}
+	assertText(`SELECT CAST(created_at AS TEXT) FROM lb_rules WHERE caddy_id='lb_ts_valid'`, "2026-01-02 03:04:05")
+	assertText(`SELECT CAST(updated_at AS TEXT) FROM lb_rules WHERE caddy_id='lb_ts_valid'`, "2026-01-02 03:04:05")
+	assertText(`SELECT CAST(created_at AS TEXT) FROM lb_rules WHERE caddy_id='lb_ts_bad'`, malformed)
+	assertText(`SELECT CAST(updated_at AS TEXT) FROM lb_rules WHERE caddy_id='lb_ts_bad'`, "2026-02-03 04:05:06")
+	assertText(`SELECT CAST(created_at AS TEXT) FROM path_rules WHERE rule_id='lb_ts_valid'`, malformed)
+	var nullCount int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM path_rules WHERE rule_id='lb_ts_valid' AND updated_at IS NULL`).Scan(&nullCount); err != nil {
+		t.Fatal(err)
+	}
+	if nullCount != 1 {
+		t.Errorf("pre-existing NULL updated_at count=%d, want preserved 1", nullCount)
+	}
+}
+
+func TestMigrateTCPRuleDeadFields_bumpsNullClusterVersion(t *testing.T) {
+	// Given：带外/旧备份形态 cluster_version=NULL，以及一条确需清理的 TCP 行。
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config,cluster_version) VALUES (1,'{}',NULL);
+		INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,enable_tls) VALUES ('lb_tcp_null_version','tcp','tcp',9443,1);
+		INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enable_tls) VALUES ('lb_http_null_version','http','http','http.example.test',8443,1)`); err != nil {
+		t.Fatalf("seed null version and rules: %v", err)
+	}
+
+	// When
+	if err := migrateTCPRuleDeadFields(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	// Then：NULL 必须按 0 参与递增，TCP 清理生效且 HTTP 回归行不受影响。
+	var version sql.NullInt64
+	if err := database.QueryRow(`SELECT cluster_version FROM global_config WHERE id=1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if !version.Valid || version.Int64 != 1 {
+		t.Fatalf("cluster_version=%+v, want 1", version)
+	}
+	var tcpTLS, httpTLS int
+	if err := database.QueryRow(`SELECT enable_tls FROM lb_rules WHERE caddy_id='lb_tcp_null_version'`).Scan(&tcpTLS); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT enable_tls FROM lb_rules WHERE caddy_id='lb_http_null_version'`).Scan(&httpTLS); err != nil {
+		t.Fatal(err)
+	}
+	if tcpTLS != 0 || httpTLS != 1 {
+		t.Fatalf("TLS after migration tcp=%d http=%d, want 0/1", tcpTLS, httpTLS)
+	}
+	// 幂等重跑没有脏行，不再 bump。
+	if err := migrateTCPRuleDeadFields(); err != nil {
+		t.Fatalf("idempotent migrate: %v", err)
+	}
+	if err := database.QueryRow(`SELECT cluster_version FROM global_config WHERE id=1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version.Int64 != 1 {
+		t.Fatalf("cluster_version after no-op=%d, want unchanged 1", version.Int64)
+	}
+}
+
 func openMigrationTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	database, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "migration.db")+"?_pragma=foreign_keys(1)")
@@ -2193,7 +2355,7 @@ func TestCreateTables_freshSchemaCarriesStagedPolicyRuleAndBackupColumns(t *test
 		name string
 		dflt string
 	}{
-		"security_policies": {{"policy_type", "''"}, {"trust_detection", "0"}},
+		"security_policies": {{"policy_type", "''"}, {"trust_detection", "0"}, {"geoip_crawler_exempt", "0"}, {"geoip_crawler_engines", "'[]'"}},
 		"lb_rules":          {{"block_page_stage1_id", "0"}, {"block_page_stage1_status", "0"}, {"block_page_stage3_id", "0"}, {"block_page_stage3_status", "0"}},
 		"auto_backups":      {{"app_version", "''"}},
 	}
@@ -2259,10 +2421,12 @@ func TestInitialize_preservesStagedColumnsOnSecurityPoliciesRebuild(t *testing.T
 			geoip_mode TEXT NOT NULL DEFAULT 'deny',
 			waf_check_response INTEGER NOT NULL DEFAULT 0,
 			policy_type TEXT NOT NULL DEFAULT '',
-			trust_detection BOOLEAN NOT NULL DEFAULT 0
+			trust_detection BOOLEAN NOT NULL DEFAULT 0,
+			geoip_crawler_exempt INTEGER NOT NULL DEFAULT 0,
+			geoip_crawler_engines TEXT NOT NULL DEFAULT '[]'
 		);
-		INSERT INTO security_policies (id,name,geoip_countries,geoip_mode,waf_check_response,block_status_code,enabled,policy_type,trust_detection)
-		VALUES (1,'window-era','[]','deny',0,0,1,'stage0',1);`); err != nil {
+		INSERT INTO security_policies (id,name,geoip_countries,geoip_mode,waf_check_response,block_status_code,enabled,policy_type,trust_detection,geoip_crawler_exempt,geoip_crawler_engines)
+		VALUES (1,'window-era','[]','deny',0,0,1,'stage0',1,1,'["googlebot"]');`); err != nil {
 		t.Fatalf("seed window-era security_policies: %v", err)
 	}
 
@@ -2272,9 +2436,9 @@ func TestInitialize_preservesStagedColumnsOnSecurityPoliciesRebuild(t *testing.T
 	}
 
 	// Then: 显式 policy_type 与 trust_detection 存活
-	var policyType string
-	var trustDetection int
-	if err := DB.QueryRow(`SELECT policy_type, trust_detection FROM security_policies WHERE id=1`).Scan(&policyType, &trustDetection); err != nil {
+	var policyType, crawlerEngines string
+	var trustDetection, crawlerExempt int
+	if err := DB.QueryRow(`SELECT policy_type, trust_detection, geoip_crawler_exempt, geoip_crawler_engines FROM security_policies WHERE id=1`).Scan(&policyType, &trustDetection, &crawlerExempt, &crawlerEngines); err != nil {
 		t.Fatalf("read migrated policy staged columns: %v", err)
 	}
 	if policyType != "stage0" {
@@ -2282,6 +2446,9 @@ func TestInitialize_preservesStagedColumnsOnSecurityPoliciesRebuild(t *testing.T
 	}
 	if trustDetection != 1 {
 		t.Fatalf("trust_detection=%d, want 1 (explicit value has no backfill path; rebuild must preserve it)", trustDetection)
+	}
+	if crawlerExempt != 1 || crawlerEngines != `["googlebot"]` {
+		t.Fatalf("crawler columns=(%d,%q), want (1,[googlebot]) preserved across rebuild", crawlerExempt, crawlerEngines)
 	}
 }
 
@@ -2459,9 +2626,9 @@ func TestInitialize_adds_path_rules_upstream_path_column(t *testing.T) {
 	}
 }
 
-// 历史问题-1（历史，历史问题）：存量 TCP 规则的 enable_dns_server/dns_server
-// 落库恒无效（TCP 渲染路径永不消费且无告警），迁移按 migrateTCPRuleStaleTLS
-// 同口径清空两列；HTTP 规则同名字段（DNS 服务发现合法配置）不受影响。
+// 历史问题-1（历史）：存量 TCP 规则的 enable_dns_server/dns_server
+// 落库恒无效，迁移按 migrateTCPRuleDeadFields 同口径清空；HTTP 规则同名字段
+// （DNS 服务发现合法配置）不受影响。
 func TestRunMigrations_clearsTCPRuleStaleDNSServerFields(t *testing.T) {
 	// Given 存量行：TCP 规则携带 DNS 字段两形态（开关开+地址/仅地址）、
 	// 已干净的 TCP 行、携带同名合法字段的 HTTP 规则（回归形状——不得误清）

@@ -805,23 +805,21 @@ func TestReadOnlyGuard_SlaveMcpWriteRouteRejected(t *testing.T) {
 
 // 历史问题（历史，主审上调 历史问题）：证书配置「测试」两条路由已移出只读白名单
 // ——它们会经 dnsproviders.Validate 真实 Present+CleanUp DNS TXT 记录（非纯读
-// 探测），从节点与只读 API Key 不得触发。CA 提供商测试（不发 DNS 写）保留读探测。
+// 探测），从节点与只读 API Key 不得触发。U04a2-历史问题（历史）：CA 提供商
+// 测试同步移出——ZeroSSL 缺 EAB 时会真实写 ca_providers.credentials。
 func TestReadOnlyGuard_slaveCannotRunCertificateConfigTests(t *testing.T) {
 	router := newReadOnlyGuardTestRouter(t, false, "admin")
 
-	for _, path := range []string{"/api/v1/certificate-configs/test", "/api/v1/certificate-configs/1/test"} {
+	for _, path := range []string{
+		"/api/v1/certificate-configs/test",
+		"/api/v1/certificate-configs/1/test",
+		"/api/v1/ca-providers/1/test",
+	} {
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
 		if response.Code != http.StatusForbidden {
-			t.Fatalf("%s status=%d, want 403（从节点不得触发真实 DNS 写探测）", path, response.Code)
+			t.Fatalf("%s status=%d, want 403（从节点不得触发真实写入的测试端点）", path, response.Code)
 		}
-	}
-
-	// 回归：CA 提供商测试保留读探测语义，从节点仍放行
-	response := httptest.NewRecorder()
-	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/ca-providers/1/test", nil))
-	if response.Code != http.StatusNoContent {
-		t.Fatalf("ca-providers test status=%d, want 204（读探测白名单保留）", response.Code)
 	}
 }
 
@@ -836,7 +834,8 @@ func TestReadOnlyGuard_adminCanRunCertificateConfigTests(t *testing.T) {
 	}
 }
 
-// 只读 API Key（同一 readOnlyWriteRoutes 事实源）同样不得触发证书配置测试。
+// 只读 API Key（同一 readOnlyWriteRoutes 事实源）同样不得触发证书配置测试，
+// 也不得触发 ZeroSSL 缺 EAB 时会写库的 CA 提供商测试（U04a2-历史问题）。
 func TestAPIKeyReadOnlyGuard_blocksCertificateConfigTests(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -850,16 +849,15 @@ func TestAPIKeyReadOnlyGuard_blocksCertificateConfigTests(t *testing.T) {
 	router.POST("/api/v1/certificate-configs/:id/test", noContent)
 	router.POST("/api/v1/ca-providers/:id/test", noContent)
 
-	for _, path := range []string{"/api/v1/certificate-configs/test", "/api/v1/certificate-configs/1/test"} {
+	for _, path := range []string{
+		"/api/v1/certificate-configs/test",
+		"/api/v1/certificate-configs/1/test",
+		"/api/v1/ca-providers/1/test",
+	} {
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
 		if response.Code != http.StatusForbidden {
-			t.Fatalf("%s status=%d, want 403（只读 Key 不得触发 DNS 写探测）", path, response.Code)
+			t.Fatalf("%s status=%d, want 403（只读 Key 不得触发真实写探测）", path, response.Code)
 		}
-	}
-	response := httptest.NewRecorder()
-	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/ca-providers/1/test", nil))
-	if response.Code != http.StatusNoContent {
-		t.Fatalf("ca-providers test status=%d, want 204（读探测保留）", response.Code)
 	}
 }

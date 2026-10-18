@@ -7,9 +7,10 @@
 //     *.bc.googleusercontent.com 不匹配——伪装墙 1）
 //  3. 正向回验：PTR 域名解析结果包含客户端 IP（防自配 PTR——伪装墙 2/3）
 //
-// 性能（2000/s 正常 + 100/s 攻击基准）：非爬虫 UA 仅付一次预编译正则；
-// 验证按 IP 缓存（正 1h/负 10min）；在途 DNS 信号量 32 非阻塞（满员立即
-// fail-closed，无 goroutine 堆积）；单查询 500ms 超时。
+// 性能（2000/s 正常 + 100/s 攻击基准）：非爬虫 UA 不做 DNS/PTR，但需顺序
+// 扫描引擎预编译正则表（未命中=全表成本）；验证按 IP 缓存（正 1h/确定性负
+// 10min，瞬态失败不缓存）；在途 DNS 信号量 32 非阻塞（满员立即 fail-closed，
+// 无 goroutine 堆积）；单查询 500ms 超时。
 package caddygeoip
 
 import (
@@ -62,12 +63,14 @@ var (
 	crawlerCache   = map[string]crawlerVerifyCache{}
 	// crawlerVerifySem 非阻塞信号量（cap 32；关账本式释放）
 	crawlerVerifySem = make(chan struct{}, crawlerVerifySlots)
-	// crawlerCacheMax 简单容量护栏（条目数；超限全清——结论短 TTL，重建廉价）
+	// crawlerCacheMax 容量护栏：到上限先删过期条目；仍满员则跳过新键缓存，
+	// 保留未过期的正/负结论（已存在键可原位更新，不增加条目数）。
 	crawlerCacheMax = 200_000
 )
 
 // VerifyCrawler 验证客户端 IP 是否为该引擎官方爬虫出口（带缓存）。
-// 返回 false = 未通过（含超时/信号量满/解析失败——fail-closed）。
+// 返回 false = 当前请求未通过（fail-closed）。只有确定性验证结论进入缓存；
+// 信号量饱和、DNS 错误和超时仅作用于本次请求，不写 10 分钟负缓存。
 func VerifyCrawler(ip, engineID string) bool {
 	key := ip + "|" + engineID
 	now := time.Now()
@@ -78,14 +81,20 @@ func VerifyCrawler(ip, engineID string) bool {
 	}
 	crawlerCacheMu.Unlock()
 
-	ok := false
+	ok, cacheable := false, true
 	if geoipnames.CrawlerEngineVerifyMethod(engineID) == geoipnames.CrawlerVerifyIPRange {
 		// 官方声明不支持 nslookup 的厂商（360）：官方 IP 段验证（名单表=
 		// 定时更新任务的快照，更新即生效，无需重载）
 		ok = verifyCrawlerIPRangeFromList(ip, engineID)
-	} else if acquireCrawlerSlot() {
-		ok = verifyCrawlerDNS(ip, engineID)
+	} else {
+		if !acquireCrawlerSlot() {
+			return false // 瞬态资源饱和：本次 fail-closed，但不形成持久结论。
+		}
+		ok, cacheable = verifyCrawlerDNS(ip, engineID)
 		releaseCrawlerSlot()
+	}
+	if !cacheable {
+		return ok
 	}
 	ttl := crawlerCacheNegativeTTL
 	if ok {
@@ -93,21 +102,31 @@ func VerifyCrawler(ip, engineID string) bool {
 	}
 	crawlerCacheMu.Lock()
 	if len(crawlerCache) >= crawlerCacheMax {
-		crawlerCache = make(map[string]crawlerVerifyCache, 1024)
+		// 先回收过期条目；仍满员时宁可不缓存新键，也不清空已验证爬虫。
+		for cachedKey, entry := range crawlerCache {
+			if !now.Before(entry.expires) {
+				delete(crawlerCache, cachedKey)
+			}
+		}
 	}
-	crawlerCache[key] = crawlerVerifyCache{ok: ok, expires: now.Add(ttl)}
+	_, keyExists := crawlerCache[key]
+	if len(crawlerCache) < crawlerCacheMax || keyExists {
+		crawlerCache[key] = crawlerVerifyCache{ok: ok, expires: now.Add(ttl)}
+	}
 	crawlerCacheMu.Unlock()
 	return ok
 }
 
-// verifyCrawlerDNS 双跳验证本体（无缓存、需已持信号量）。
-func verifyCrawlerDNS(ip, engineID string) bool {
+// verifyCrawlerDNS 双跳验证本体（无缓存、需已持信号量）。第二个返回值表示
+// 结论是否可缓存：PTR/正向回验的确定性否定为 true，任何解析错误/超时为 false。
+func verifyCrawlerDNS(ip, engineID string) (bool, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), crawlerDNSQueryTimeout)
 	defer cancel()
 	names, err := crawlerVerifyResolver.LookupAddr(ctx, ip)
 	if err != nil {
-		return false
+		return false, false
 	}
+	transientFailure := false
 	for _, name := range names {
 		// LookupAddr 返回 FQDN 尾点；PTR 后缀锚定前剥除
 		host := name
@@ -120,15 +139,19 @@ func verifyCrawlerDNS(ip, engineID string) bool {
 		// 正向回验：PTR 域名解析须包含原 IP（防伪造 PTR 指向官方域）
 		addrs, err := crawlerVerifyResolver.LookupHost(ctx, host)
 		if err != nil {
+			transientFailure = true
 			continue
 		}
 		for _, a := range addrs {
 			if a == ip {
-				return true
+				return true, true
 			}
 		}
 	}
-	return false
+	if transientFailure || ctx.Err() != nil {
+		return false, false
+	}
+	return false, true
 }
 
 func acquireCrawlerSlot() bool {
@@ -213,7 +236,7 @@ func loadCrawlerIPRangeSnapshot() *crawlerIPRangeSnapshot {
 }
 
 // verifyCrawlerIPRangeFromList 从共享快照文件验证 IP 段命中（缺失/为空=fail-closed；
-// mtime 变化才重读，2000/s 混合流量下文件系统开销=stat 节流）。
+// 快照每 10 分钟定时重读，不依赖 mtime/stat 触发）。
 func verifyCrawlerIPRangeFromList(ipStr, engineID string) bool {
 	snap := loadCrawlerIPRangeSnapshot()
 	entries := snap.prefixes[engineID]

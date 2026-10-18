@@ -1487,13 +1487,17 @@ const toggleIP2RegionAutoUpdate = async (val: boolean) => { try { await request.
 // —— 定时更新排程（三库同构：星期多选 + 时间；保存即重排下次更新，时区遵循基础设置）——
 const scheduleTz = ref('')
 let scheduleTzLoaded = false
+let scheduleTzLoading = false
 const ensureScheduleTz = async () => {
-  if (scheduleTzLoaded) return
-  scheduleTzLoaded = true
+  if (scheduleTzLoaded || scheduleTzLoading) return
+  scheduleTzLoading = true
   try {
     const res = await request.get<APIResponse<{ timezone?: string }>>('/config', { silent: true })
     scheduleTz.value = res.data?.timezone || ''
-  } catch { /* 说明行降级为「…」，不影响设置功能 */ }
+    scheduleTzLoaded = true
+  } catch { /* 失败不闩死：下次打开弹框重试 */ } finally {
+    scheduleTzLoading = false
+  }
 }
 
 const savingCRSSchedule = ref(false)

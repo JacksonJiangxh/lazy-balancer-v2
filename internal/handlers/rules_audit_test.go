@@ -775,11 +775,10 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 	}{
 		{
 			name: "create", method: http.MethodPost, path: "/rules", body: `{"name":"candidate","protocol":"tcp","listen_port":19001,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
-			seed: func(t *testing.T) {
-				if _, err := db.DB.Exec(`CREATE TRIGGER block_create_compensation BEFORE DELETE ON lb_rules WHEN OLD.name='candidate' BEGIN SELECT RAISE(ABORT,'delete blocked'); END`); err != nil {
-					t.Fatalf("create compensation blocker: %v", err)
-				}
-			},
+			// LBH79-历史问题：此处原有补偿阻断触发器——apply 失败走 defer tx.Rollback
+			// （删除由回滚完成，不执行 removeCreatedRule），触发器永不触达。删除
+			// 死夹具；回滚终态断言不变。
+			seed:  func(*testing.T) {},
 			mount: func(router *gin.Engine, handler *Handlers) { router.POST("/rules", handler.CreateRule) },
 			assert: func(t *testing.T) {
 				var count int
@@ -798,8 +797,8 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 				if _, err := db.DB.Exec("INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_tx_update','127.0.0.1',9000,1,1,'tcp')"); err != nil {
 					t.Fatalf("seed TCP upstream: %v", err)
 				}
-				if _, err := db.DB.Exec(`UPDATE lb_rules SET protocol='tcp' WHERE caddy_id='lb_tx_update'; CREATE TRIGGER block_update_compensation BEFORE DELETE ON lb_rules WHEN OLD.name='candidate' BEGIN SELECT RAISE(ABORT,'delete blocked'); END`); err != nil {
-					t.Fatalf("prepare update compensation blocker: %v", err)
+				if _, err := db.DB.Exec(`UPDATE lb_rules SET protocol='tcp' WHERE caddy_id='lb_tx_update'`); err != nil {
+					t.Fatalf("prepare update rule: %v", err)
 				}
 			},
 			mount: func(router *gin.Engine, handler *Handlers) { router.PUT("/rules/:caddy_id", handler.UpdateRule) },
@@ -818,9 +817,8 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 			seed: func(t *testing.T) {
 				seedAuditRule(t, "lb_tx_enable", "enable", "enable-tx.example.test", 8080, false, "manual", false)
 				seedAuditUpstream(t, "lb_tx_enable")
-				if _, err := db.DB.Exec(`CREATE TRIGGER block_enable_compensation BEFORE UPDATE ON lb_rules WHEN OLD.enabled=1 AND NEW.enabled=0 BEGIN SELECT RAISE(ABORT,'restore blocked'); END`); err != nil {
-					t.Fatalf("create enable compensation blocker: %v", err)
-				}
+				// LBH79-历史问题：补偿发生在 commit 之后的失败分支，apply 失败在
+				// commit 前回滚——此触发器永不触达，删除死夹具。
 			},
 			mount: func(router *gin.Engine, handler *Handlers) {
 				router.POST("/rules/:caddy_id/enable", handler.EnableRule)
@@ -840,9 +838,7 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 			seed: func(t *testing.T) {
 				seedAuditRule(t, "lb_tx_disable", "disable", "disable-tx.example.test", 8080, true, "manual", false)
 				seedAuditUpstream(t, "lb_tx_disable")
-				if _, err := db.DB.Exec(`CREATE TRIGGER block_disable_compensation BEFORE UPDATE ON lb_rules WHEN OLD.enabled=0 AND NEW.enabled=1 BEGIN SELECT RAISE(ABORT,'restore blocked'); END`); err != nil {
-					t.Fatalf("create disable compensation blocker: %v", err)
-				}
+				// LBH79-历史问题：同上——补偿分支不可达，删除死夹具。
 			},
 			mount: func(router *gin.Engine, handler *Handlers) {
 				router.POST("/rules/:caddy_id/disable", handler.DisableRule)
@@ -1202,11 +1198,13 @@ func TestUpdateRule_serializes_snapshot_commit_apply_and_restore(t *testing.T) {
 		close(secondDone)
 	}()
 	harness.release()
-	<-firstDone
+	// LBH79-历史问题：通道读取加超时——回归时这里会退化为包级测试超时，
+	// 丢失「卡在哪个同步点」的诊断。
+	waitTestChannel(t, firstDone, "首个 UpdateRule 完成")
 	// 第二个请求在第一个释放 caddyOpMu 后进入临界区（快照 GET 信号），
 	// 随后完成自己的应用——串行化 + 首个失败恢复快照的契约由下方断言锁定。
-	<-harness.secondValidation
-	<-secondDone
+	waitTestChannel(t, harness.secondValidation, "第二个请求进入 caddyOpMu 临界区")
+	waitTestChannel(t, secondDone, "第二个 UpdateRule 完成")
 
 	// Then
 	if firstResponse.Code == http.StatusOK || secondResponse.Code != http.StatusOK {
@@ -1970,5 +1968,15 @@ func TestCreateRule_tcpTLSMaterialNormalized_omitsCertWarningAudit(t *testing.T)
 	}
 	if strings.Contains(detail, "证书警告") {
 		t.Fatalf("create audit detail=%q, TCP-normalized cert material must not warn", detail)
+	}
+}
+
+// waitTestChannel 等通道关闭，超时给出具名诊断（替代裸 <-ch 的包级超时）。
+func waitTestChannel(t *testing.T, ch <-chan struct{}, label string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("等待超时: %s", label)
 	}
 }

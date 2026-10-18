@@ -94,9 +94,10 @@ func DefaultLandingBody() string {
 
 // CaddyService handles Caddy configuration management
 type CaddyService struct {
-	adminURL string
-	client   *http.Client
-	mu       sync.Mutex
+	adminURL   string
+	metricsURL string
+	client     *http.Client
+	mu         sync.Mutex
 	// lastGoodPath 非空时，每次成功 /load 后把已应用 JSON 原子落盘到该路径，
 	// 供启动兜底（裁定 2026-09-06 ③）读取回放。
 	lastGoodPath string
@@ -108,8 +109,15 @@ type CaddyService struct {
 }
 
 func NewCaddyService(adminURL string) *CaddyService {
+	// 兼容 admin 与指标同址的调用方；独立指标端点必须使用
+	// NewCaddyServiceWithMetricsURL（生产装配显式传配置值）。
+	return NewCaddyServiceWithMetricsURL(adminURL, strings.TrimRight(adminURL, "/")+"/metrics")
+}
+
+func NewCaddyServiceWithMetricsURL(adminURL, metricsURL string) *CaddyService {
 	return &CaddyService{
-		adminURL: adminURL,
+		adminURL:   adminURL,
+		metricsURL: metricsURL,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -543,6 +551,22 @@ func readCaddyErrorBody(body io.Reader) []byte {
 // caddyErrorBodyMaxBytes 限制嵌入 error 的 Caddy 管理接口错误响应体大小。
 const caddyErrorBodyMaxBytes = 1024
 
+// caddyAdminConfigMaxBytes admin GET /config/ 响应体解码上限（32MB 家族口径：
+// 与 getRunningConfigBytes/看门狗同源，防止异常对端无界分配）。
+const caddyAdminConfigMaxBytes = 32 << 20
+
+// readAdminConfigBody 读取 admin GET /config/ 的响应体：非 2xx 一律返回带状态码
+// 的错误（错误体经 readCaddyErrorBody 截断到 1KB 供诊断），2xx 时按 32MB 上限
+// 返回原始字节。U04a2-历史问题（历史）：此前 GetConfig/GetUpstreamHealthDetailed
+// 直接解码响应体——Caddy 错误体本身是合法 JSON（{"error":"..."}），4xx/5xx 时错误
+// 对象会被当配置返回，健康查询更会静默退化为「无健康数据」的空表。
+func readAdminConfigBody(resp *http.Response) ([]byte, error) {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("GET /config/ returned %d: %s", resp.StatusCode, strings.TrimSpace(string(readCaddyErrorBody(resp.Body))))
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, caddyAdminConfigMaxBytes))
+}
+
 // ValidateConfig validates Caddy configuration using the /load API with validate=true
 func (s *CaddyService) ValidateConfig(config map[string]interface{}) (err error) {
 	// 历史问题：validate=true 实为真实加载（Caddy 以校验模式执行完整的 provision/
@@ -575,7 +599,10 @@ func (s *CaddyService) ValidateConfig(config map[string]interface{}) (err error)
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("validation failed: %s", string(readCaddyErrorBody(resp.Body)))
+		// LBH79-历史问题：admin 4xx=候选配置被拒（可安全的 400 映射），
+		// 传输/超时=系统故障（须 500 且仍需回弹权威配置）——用既有
+		// ConfigRejectedError 单源分类，调用侧 IsConfigRejected 判定。
+		return &ConfigRejectedError{Err: fmt.Errorf("validation failed: %s", string(readCaddyErrorBody(resp.Body)))}
 	}
 
 	return nil
@@ -611,10 +638,15 @@ func (s *CaddyService) GetConfig() (map[string]interface{}, error) {
 	}
 	defer resp.Body.Close()
 
+	// U04a2-历史问题：非 2xx 必须先拦（Caddy 错误体是合法 JSON，直接解码会把
+	// 错误对象当配置返回）；解码上限沿用 32MB 家族口径（历史问题-6）。
+	body, err := readAdminConfigBody(resp)
+	if err != nil {
+		return nil, err
+	}
+
 	var config map[string]interface{}
-	// 历史问题-6：对齐 32MB 家族口径（与 caddy.go:210/565/780+configwatchdog
-	// 同源——历史问题 历史问题-2 修 configwatchdog 时漏收敛此一处，>4MB 配置回读失败）。
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&config); err != nil {
+	if err := json.Unmarshal(body, &config); err != nil {
 		return nil, err
 	}
 
@@ -647,11 +679,18 @@ func (s *CaddyService) GetUpstreamHealthDetailed() (map[string]map[string]*Upstr
 	}
 	defer resp.Body.Close()
 
+	// U04a2-历史问题：与 GetConfig 同源状态门——错误页/4xx/5xx 不得静默退化为
+	// 「无上游健康数据」的空表（旧实现此处直接解码错误 JSON 后返回 nil error）。
+	body, err := readAdminConfigBody(resp)
+	if err != nil {
+		return nil, err
+	}
+
 	var config map[string]interface{}
-	// 历史问题 同族防线（历史 历史问题）：admin 响应无界解码补上限——取 32MB
-	// （较 GetConfig 的 4MB 宽：本端点返回完整 routes 视图，超大部署体积大，
-	// 上限只为异常对端兜底，不得截断正常健康视图）。
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&config); err != nil {
+	// 历史问题 同族防线（历史 历史问题）：admin 响应解码上限统一在
+	// readAdminConfigBody（32MB，较 GetConfig 历史 4MB 宽：本端点返回完整
+	// routes 视图，超大部署体积大，上限只为异常对端兜底，不得截断正常健康视图）。
+	if err := json.Unmarshal(body, &config); err != nil {
 		return nil, err
 	}
 
@@ -900,7 +939,7 @@ func (s *CaddyService) getUpstreamMetrics() map[string]*upstreamMetric {
 func (s *CaddyService) getUpstreamHealthFromMetrics() map[string]bool {
 	result := make(map[string]bool)
 
-	resp, err := s.client.Get(s.adminURL + "/metrics")
+	resp, err := s.client.Get(s.metricsURL)
 	if err != nil {
 		return result
 	}
@@ -1270,6 +1309,34 @@ func trustedProxyServerFields(store caddyConfigStore) (map[string]interface{}, s
 	return fields, ""
 }
 
+// TrustedProxyMinPrefixBits 返回受信代理允许的最小前缀长度（IPv4=/8，
+// IPv6=/96）——过宽网段会让伪造的头在任意来源被采信。写侧（内联 ranges 与
+// 引用名单条目）与渲染侧共用本判据（U04d-01：两个输入通道不得有宽窄差）。
+func TrustedProxyMinPrefixBits(addr netip.Addr) int {
+	if addr.Is6() {
+		return 96
+	}
+	return 8
+}
+
+// TrustedProxyPrefixAllSpace 报告前缀是否覆盖全部地址空间（等同信任任意
+// 来源）：0.0.0.0/8、0.0.0.0/0、::/0 与 v4-mapped 全零 /96 两种规范写法。
+// 历史 历史问题 曾在内联通道显式拒绝这组形态，引用通道此前漏掉——判据
+// 单源后两通道同口径。
+func TrustedProxyPrefixAllSpace(prefix netip.Prefix) bool {
+	switch prefix.String() {
+	case "0.0.0.0/8", "0.0.0.0/0", "::/0", "::ffff:0.0.0.0/96", "::ffff:0:0/96":
+		return true
+	}
+	return false
+}
+
+// TrustedProxyPrefixTooWide 是上述两条判据的合取（过宽=全空间或低于最小
+// 前缀长度），渲染侧防御带外改库/旧配置时使用。
+func TrustedProxyPrefixTooWide(prefix netip.Prefix) bool {
+	return TrustedProxyPrefixAllSpace(prefix) || prefix.Bits() < TrustedProxyMinPrefixBits(prefix.Addr())
+}
+
 // expandTrustedProxyRanges 合并内联网段与引用名单条目（2026-10-12；2026-10-15
 // 起消费方=受信代理投影文件 tp.txt，不再内联进配置本体）：refs 按 id 经
 // loadIPListEntriesVia 装载（system=1 读 .iplist 文件、自定义读 DB entries
@@ -1301,6 +1368,13 @@ func expandTrustedProxyRanges(store caddyConfigStore, inline []string, refsJSON 
 			prefix = netip.PrefixFrom(addr, bits)
 		}
 		if _, dup := seen[prefix.String()]; dup {
+			return
+		}
+		// U04d-01 防御复检：写侧两通道（内联/引用）都已拒绝过宽网段，此处
+		// 覆盖带外改库与旧版本残留配置——过宽网段会让伪造头在任意来源被采信，
+		// 宁可跳过并留痕（运行配置缺该来源 = 退回 socket IP，偏安全侧）。
+		if TrustedProxyPrefixTooWide(prefix) {
+			Logf("warn", "受信代理条目 %q 过宽（最小 /8（IPv4）与 /96（IPv6），且不得覆盖全部地址空间，跳过）", value)
 			return
 		}
 		seen[prefix.String()] = struct{}{}
@@ -2040,6 +2114,24 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		}
 		return false
 	}
+	// U04a2-历史问题（历史）：遮蔽复核索引一次构建——旧实现对每条跳转规则遍历
+	// 全部规则并逐条 normalizedDomainSet（每次含 db.CanonicalDomains 规范化），
+	// R 条跳转 × N 条规则约 R×N 次规范化。索引只规范化 80 端口候选项一次（O(N)），
+	// 跳转循环内退化为 O(1) 域名查表；比较口径与 M1/历史 历史问题 完全不变。
+	port80Candidates := make([]port80RuleCandidate, 0, len(allRules))
+	for _, other := range allRules {
+		otherRule := other.rule
+		if otherRule.Protocol != "http" || otherRule.ListenPort != 80 {
+			continue
+		}
+		// M1（审计）：遮蔽复核的比对方也过启用上游门——零启用上游的规则不生成
+		// 80 端口路由（死规则），不得作为遮蔽方压制兄弟域名的 HTTPS 跳转。
+		if !hasEnabledUpstream(other.upstreams) {
+			continue
+		}
+		port80Candidates = append(port80Candidates, port80RuleCandidate{caddyID: otherRule.CaddyID, domain: otherRule.Domain})
+	}
+	port80DomainOwners := buildPort80DomainOwners(port80Candidates)
 	for _, ru := range allRules {
 		r := ru.rule
 		// 历史问题 F-A: 与规则渲染跳过同口径（上方按启用上游数 continue）——全部上游
@@ -2069,24 +2161,20 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 				wantedDomains := normalizedDomainSet(r.Domain)
 				blockedDomains := make(map[string]struct{})
 				shadowedBy := ""
-				for _, other := range allRules {
-					otherRule := other.rule
-					if otherRule.CaddyID == r.CaddyID || otherRule.Protocol != "http" || otherRule.ListenPort != 80 {
-						continue
-					}
-					// M1（审计）：遮蔽复核的比对方也过启用上游门——零启用上游的
-					// 规则不生成 80 端口路由（死规则），不得作为遮蔽方压制兄弟
-					// 域名的 HTTPS 跳转。
-					if !hasEnabledUpstream(other.upstreams) {
-						continue
-					}
-					for existingDomain := range normalizedDomainSet(otherRule.Domain) {
-						if _, hit := wantedDomains[existingDomain]; hit {
-							blockedDomains[existingDomain] = struct{}{}
-							if shadowedBy == "" {
-								shadowedBy = existingDomain
-							}
+				// U04a2-历史问题：索引查表替代 R×N 次规范化；自排除语义与旧实现
+				// otherRule.CaddyID == r.CaddyID 一致（仅自身拥有该域名不算遮蔽）。
+				// shadowedBy 取字典序最小命中域名，日志内容因此确定（旧实现取
+				// map 遍历首个命中，无序）。
+				for existingDomain := range wantedDomains {
+					for _, ownerID := range port80DomainOwners[existingDomain] {
+						if ownerID == r.CaddyID {
+							continue
 						}
+						blockedDomains[existingDomain] = struct{}{}
+						if shadowedBy == "" || existingDomain < shadowedBy {
+							shadowedBy = existingDomain
+						}
+						break
 					}
 				}
 				if len(blockedDomains) > 0 {
@@ -2577,6 +2665,29 @@ func normalizeHostForMatcher(host string) string {
 		return canonical
 	}
 	return strings.ToLower(host)
+}
+
+// port80RuleCandidate 一条「直接监听 80 端口」的候选规则（调用方已按协议/
+// 端口/启用上游过滤）。
+type port80RuleCandidate struct {
+	caddyID string
+	domain  string
+}
+
+// buildPort80DomainOwners 一次性规范化候选域名，返回 域名→规则 ID 列表 索引。
+// U04a2-历史问题（历史）：渲染期 HTTP→HTTPS 跳转遮蔽复核原为每条跳转规则
+// 对全部规则逐对 normalizedDomainSet（每次含 db.CanonicalDomains），大规则量
+// 下约 R×N 次规范化；索引把规范化收敛为 O(N)，逐跳转规则只做 O(1) 域名查表。
+// 同一域名被多条 80 端口规则拥有时按 allRules 顺序追加 ID，供调用方做自排除
+// （仅自身拥有该域名不算遮蔽）。
+func buildPort80DomainOwners(candidates []port80RuleCandidate) map[string][]string {
+	owners := make(map[string][]string, len(candidates))
+	for _, candidate := range candidates {
+		for domain := range normalizedDomainSet(candidate.domain) {
+			owners[domain] = append(owners[domain], candidate.caddyID)
+		}
+	}
+	return owners
 }
 
 // httpsRedirectLocation 构造 HTTP→HTTPS 跳转的 Location 头。
@@ -3320,7 +3431,10 @@ func SplitDnsAddresses(s string) []string {
 }
 
 func joinUpstreamAddress(host string, port int) string {
-	return net.JoinHostPort(host, strconv.Itoa(port))
+	// LBH79-历史问题：渲染侧与写侧同口径归一首尾空白——历史行/直改 DB 的
+	// " up.test" 会渲染成非法 dial（该上游恒 502）。主机名/IP 字面量不含
+	// 有意义空白，TrimSpace 不改变合法配置。
+	return net.JoinHostPort(strings.TrimSpace(host), strconv.Itoa(port))
 }
 
 // stripOriginPort 剥离 host:port 形态的端口（SNI 不得含端口）；无端口形态
@@ -3416,7 +3530,7 @@ func decodePathUpstreams(raw string) ([]UpstreamConfig, error) {
 			protocol = "http"
 		}
 		upstreams = append(upstreams, UpstreamConfig{
-			Host: item.Address, Port: item.Port, Weight: item.Weight, Protocol: protocol, Enabled: true,
+			Host: strings.TrimSpace(item.Address), Port: item.Port, Weight: item.Weight, Protocol: protocol, Enabled: true,
 		})
 	}
 	return upstreams, nil
@@ -4284,6 +4398,46 @@ func (s *CaddyService) RollbackIPListProjectionsToCommittedInLock() {
 	}
 	// 投影写盘与证书物化发生在生成期；配置图就地丢弃——本方法只消费副作用，
 	// 不做运行配置比对、零 /load（拒绝语义：运行配置本就未被改动）。
+}
+
+// RestoreRuntimeToCommittedInLock 是提交失败分支的运行配置恢复（U04d-03）：
+// 事务内 apply 已按未提交视图 /load 并写入 last-known-good（持久化发生在每次
+// 成功 /load 之后），commit 失败只回退投影会让数据面继续生效未提交内容、重启
+// 兜底也回到未提交配置。本方法以已提交库值（db.DB）重渲染并 /load：运行配置、
+// LKG（成功 /load 经 persistLastGoodLocked 写回）、投影与证书物化副作用全部
+// 收敛到「已提交视图」。
+//
+// 语义披露：
+//   - 已提交视图生成失败（数据损坏等）→ 返回 ConfigRejectedError，不 /load、
+//     不改 LKG（此时无从判断什么是正确配置；调用方按双故障留痕）。
+//   - /load 恢复失败 → 仍然把已提交视图字节写入 LKG（marshal 成功时）：
+//     LKG 是启动兜底通道，绝不可停留在未提交配置；运行配置恢复失败本身作为
+//     error 上抛，由调用方并入 500 响应。
+//   - 同字节短路（errSameConfig）= 运行配置已是已提交内容（如未提交变更渲染
+//     结果与运行配置一致），无需任何动作。
+//
+// 锁契约：调用方必须已持 CaddyOpLock（=caddyOpMu 写路径临界区）；本方法只取
+// s.mu（与 ApplyConfigFromTx 同序）。调用方须先 Rollback 释放未提交事务的
+// 写锁，否则 db.DB 读可能被 SQLite 写锁阻塞。
+func (s *CaddyService) RestoreRuntimeToCommittedInLock() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	config := generateCaddyConfigFromStore(db.DB)
+	if message, ok := config[caddyConfigGenerationErrorKey].(string); ok {
+		return &ConfigRejectedError{Err: errors.New(message)}
+	}
+	data, marshalErr := json.Marshal(caddyPayload(config))
+	applyErr := s.applyConfigLocked(config, true)
+	if IsSameConfig(applyErr) {
+		return nil
+	}
+	if applyErr != nil {
+		if marshalErr == nil {
+			s.persistLastGoodLocked(data)
+		}
+		return errors.Join(applyErr, marshalErr)
+	}
+	return marshalErr
 }
 
 // ApplyConfigFromTxCertAwareForce：证书候选改读事务自身（历史问题 A-N1，restoreTable

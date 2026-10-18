@@ -12,7 +12,7 @@ x-common-ulimits: &common-ulimits
     soft: 1048576
     hard: 1048576
 x-common-healthcheck: &common-healthcheck
-  # 探针须模式无关：面板默认强制 HTTPS（明文 HTTP 得 301），而 admin_tls 关闭时
+  # 探针须模式无关：面板 HTTPS 可开关（开启时明文 HTTP 得 302），admin_tls 关闭时
   # 又只有明文可用；镜像内无 curl（仅构建期临时安装后 apk del），busybox wget
   # 的 --no-check-certificate 经实证可完成自签 TLS 探测（历史 历史问题-30）。
   test: ["CMD-SHELL", "wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8000/health || wget -q -O /dev/null http://127.0.0.1:8000/health"]

@@ -73,7 +73,7 @@ func (h *Handlers) GetMetricsDashboard(c *gin.Context) {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: metricsDashboardCache.payload})
 		return
 	}
-	body, err := fetchCaddyMetrics(c.Request.Context(), h.cfg.CaddyAdminURL+"/metrics")
+	body, err := fetchCaddyMetrics(c.Request.Context(), h.cfg.CaddyMetricsURL)
 	if err != nil {
 		caddyMetricsError(c, err)
 		return
@@ -180,7 +180,7 @@ func (h *Handlers) GetRuleMetrics(c *gin.Context) {
 		return
 	}
 
-	body, err := fetchCaddyMetrics(c.Request.Context(), h.cfg.CaddyAdminURL+"/metrics")
+	body, err := fetchCaddyMetrics(c.Request.Context(), h.cfg.CaddyMetricsURL)
 	if err != nil {
 		caddyMetricsError(c, err)
 		return
@@ -417,7 +417,9 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 		BytesOut      int64     `json:"bytes_out"`
 	}
 
-	var metrics []MetricRow
+	// U04d-09：空结果必须是 []（同族列表端点与 OpenAPI 契约）——nil slice
+	// 序列化为 null 会让客户端额外处理 null 形状。
+	metrics := make([]MetricRow, 0)
 	for rows.Next() {
 		var m MetricRow
 		var ts string
@@ -444,7 +446,7 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 }
 
 func (h *Handlers) GetCaddyMetrics(c *gin.Context) {
-	body, err := fetchCaddyMetrics(c.Request.Context(), h.cfg.CaddyAdminURL+"/metrics")
+	body, err := fetchCaddyMetrics(c.Request.Context(), h.cfg.CaddyMetricsURL)
 	if err != nil {
 		caddyMetricsError(c, err)
 		return
@@ -459,7 +461,7 @@ func (h *Handlers) GetCaddyMetrics(c *gin.Context) {
 }
 
 func (h *Handlers) GetHostMetrics(c *gin.Context) {
-	body, err := fetchCaddyMetrics(c.Request.Context(), h.cfg.CaddyAdminURL+"/metrics")
+	body, err := fetchCaddyMetrics(c.Request.Context(), h.cfg.CaddyMetricsURL)
 	if err != nil {
 		caddyMetricsError(c, err)
 		return

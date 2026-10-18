@@ -304,7 +304,13 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		return
 	}
 
-	current := services.LoadAdminTLSConfig()
+	// U04d-04：写路径用严格 loader——读失败必须中止（降级默认值当基线会把
+	// 已上传证书/私钥合并成空值）。
+	current, err := services.LoadAdminTLSConfigE()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取当前 HTTPS 配置失败，已中止保存: " + err.Error()})
+		return
+	}
 	enabled := current.Enabled
 	if v := input.enabledValue; v != "" {
 		enabled = v == "true" || v == "1"

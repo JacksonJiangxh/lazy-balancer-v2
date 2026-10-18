@@ -61,9 +61,11 @@ func TestRegisterClusterNode_rejects_oversized_body(t *testing.T) {
 }
 
 func TestRegisterClusterNode_invalid_token_audit_detail_is_generic(t *testing.T) {
-	// Given：无效令牌 + 攻击者注入的 name/ip（超长 + 换行）
+	// Given：无效令牌 + 攻击者注入的 name/ip（换行注入；长度在 binding max=100
+	// 之内——超长名现在由 binding 直接 400，见
+	// TestRegisterClusterNode_rejectsOversizedName）
 	h := newBackupTestHandlers(t)
-	attackerName := "evil-" + strings.Repeat("x", 200) + "\nINJECTED"
+	attackerName := "evil-" + strings.Repeat("x", 40) + "\nINJECTED"
 	body := fmt.Sprintf(`{"token":"definitely-invalid","name":%q,"ip_address":"10.0.0.1","port":8000}`, attackerName)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)

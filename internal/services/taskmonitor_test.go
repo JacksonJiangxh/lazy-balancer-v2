@@ -13,8 +13,12 @@ import (
 // cert_jobs 查询、cluster-sync 节奏的 sync_interval 查询）补 nil 防护——与
 // 引擎侧导出 DB 函数（History/Stats24h 等 7 处）同形契约。
 //
+// 历史 历史问题-09：cluster-sync 的 sync_interval 节奏覆写已删除（常驻族
+// 节奏统一为「常驻自管理」，不再读库），本测试当前覆盖的一处 db.DB 裸用是
+// collectCertJobRows；引擎族聚合走 RunOverview（内部 nil 守卫）。
+//
 // Given db.DB 未初始化（nil）。
-// When 调用 cert 任务行收集与引擎族聚合（含 cluster-sync 节奏查询）。
+// When 调用 cert 任务行收集与引擎族聚合。
 // Then 不 panic：cert 行返回 nil，引擎族聚合返回降级视图（节奏兜底文案）。
 func TestCollectSystemTasks_nilDBGuards(t *testing.T) {
 	old := db.DB

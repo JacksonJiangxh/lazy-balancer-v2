@@ -112,12 +112,16 @@ func useTestAuditPipeline(t *testing.T) {
 	auditTimingEntryTTL = 50 * time.Millisecond
 	auditTimingMu.Lock()
 	auditTimingEntries = make(map[string]*auditTimingEntry)
+	auditTimingCreateCount = 0
+	auditTimingLastSweep = time.Time{}
 	auditTimingMu.Unlock()
 	t.Cleanup(func() {
 		auditQueueSize, auditFlushThreshold, auditFlushInterval = origQueue, origThreshold, origInterval
 		auditTimingWaitLimit, auditTimingPollStep, auditTimingEntryTTL = origWait, origPoll, origTTL
 		auditTimingMu.Lock()
 		auditTimingEntries = make(map[string]*auditTimingEntry)
+		auditTimingCreateCount = 0
+		auditTimingLastSweep = time.Time{}
 		auditTimingMu.Unlock()
 	})
 }
@@ -594,6 +598,67 @@ func TestAuditPipeline_releasedPipelineSyncWritesRow(t *testing.T) {
 	}
 }
 
+// 历史问题-04：drain 尚未抢到首把锁时 release 关闭队列，仍必须排空
+// 已入队行、刷盘并关闭 fd；不得因启动竞态静默丢行或泄漏文件。
+func TestAuditPipeline_releaseBeforeDrainStartFlushesAndCloses(t *testing.T) {
+	useTestAuditPipeline(t)
+	target := filepath.Join(t.TempDir(), "audit-race.log")
+	p := &auditPipeline{
+		target: target,
+		mode:   0o644,
+		queue:  make(chan lbAuditItem, 1),
+		done:   make(chan struct{}),
+		refs:   1,
+	}
+	if err := p.openFile(p.mode); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.closeFile)
+	if err := p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"race":1}`)}}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	released := make(chan struct{})
+	go func() {
+		p.release()
+		close(released)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		p.mu.RLock()
+		closed := p.closed
+		p.mu.RUnlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("release did not close the pipeline")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// 强制复现「release 完成后 drain 才首次运行」的竞态形状。
+	go p.drain()
+	select {
+	case <-released:
+	case <-time.After(2 * time.Second):
+		t.Fatal("release blocked waiting for drain")
+	}
+
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read audit target: %v", err)
+	}
+	p.ioMu.Lock()
+	fdStillOpen := p.fd != nil
+	p.ioMu.Unlock()
+	if !strings.Contains(string(data), `"race":1`) {
+		t.Fatalf("queued audit row was dropped during drain startup race: %q", data)
+	}
+	if fdStillOpen {
+		t.Fatal("drain startup race left the audit fd open")
+	}
+}
+
 // Given: 有界队列（容量 2）且 drain 未消费
 // When: 先同步填满 2 条，再异步入队第 3 条
 // Then: 第 3 条阻塞等待（零丢弃），drain 启动后完成——退化价=退役前 serial 同步写
@@ -809,6 +874,55 @@ func TestAuditTimingRegistry_sweep(t *testing.T) {
 	}
 	if count < 100 {
 		t.Fatalf("recent entries must survive sweep, got %d", count)
+	}
+}
+
+func TestAuditTimingRegistry_burstSweepRateLimited(t *testing.T) {
+	useTestAuditPipeline(t)
+	auditTimingEntryTTL = 30 * time.Minute // 保留批量新鲜条目，聚焦清扫触发频率而非 TTL。
+	now := time.Now()
+
+	// Given: 条目数已经超过突发阈值，第一次兜底清扫必须立即执行。
+	auditTimingMu.Lock()
+	auditTimingCreateCount = 0
+	for i := range auditTimingSweepMin + 1 {
+		auditTimingEntries[fmt.Sprintf("bulk-%04d", i)] = &auditTimingEntry{created: now}
+	}
+	auditTimingEntries["stale-first"] = &auditTimingEntry{created: now.Add(-time.Hour)}
+	auditTimingSweepIfDueLocked(now)
+	_, firstStillExists := auditTimingEntries["stale-first"]
+	// When: 100ms 后再次建条，且创建计数未触及 64 周期。
+	auditTimingEntries["stale-throttled"] = &auditTimingEntry{created: now.Add(-time.Hour)}
+	auditTimingSweepIfDueLocked(now.Add(100 * time.Millisecond))
+	_, throttledStillExists := auditTimingEntries["stale-throttled"]
+	auditTimingMu.Unlock()
+	if firstStillExists {
+		t.Fatal("first oversized registry must sweep immediately")
+	}
+	if !throttledStillExists {
+		t.Fatal("oversized registry must not rescan the whole map on every creation")
+	}
+
+	// Regression: 64 创建周期不受突发清扫时间下限影响。
+	auditTimingMu.Lock()
+	auditTimingEntries["stale-periodic"] = &auditTimingEntry{created: now.Add(-time.Hour)}
+	auditTimingCreateCount = 63
+	auditTimingSweepIfDueLocked(now.Add(200 * time.Millisecond))
+	_, periodicStillExists := auditTimingEntries["stale-periodic"]
+	auditTimingMu.Unlock()
+	if periodicStillExists {
+		t.Fatal("periodic 64-creation sweep must still run")
+	}
+
+	// Boundary: 距上次真实清扫超过 1s 后，突发兜底可以再次执行。
+	auditTimingMu.Lock()
+	auditTimingEntries["stale-after-interval"] = &auditTimingEntry{created: now.Add(-time.Hour)}
+	auditTimingCreateCount = 1
+	auditTimingSweepIfDueLocked(now.Add(200*time.Millisecond + time.Second + time.Millisecond))
+	_, intervalStillExists := auditTimingEntries["stale-after-interval"]
+	auditTimingMu.Unlock()
+	if intervalStillExists {
+		t.Fatal("oversized registry must sweep again after the rate-limit interval")
 	}
 }
 

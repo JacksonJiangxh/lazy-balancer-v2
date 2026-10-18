@@ -7,128 +7,27 @@ import (
 	"testing"
 )
 
-func automationPolicyFixture(marker string, subjects ...string) map[string]interface{} {
-	subjectList := make([]interface{}, 0, len(subjects))
-	for _, subject := range subjects {
-		subjectList = append(subjectList, subject)
-	}
-	return map[string]interface{}{
-		"subjects": subjectList,
-		"issuer":   map[string]interface{}{"module": marker},
-	}
-}
-
-func automationGlobalPolicyFixture(marker string) map[string]interface{} {
-	return map[string]interface{}{
-		"issuer": map[string]interface{}{"module": marker},
-	}
-}
-
-func automationConfigWithPolicies(policies ...interface{}) map[string]interface{} {
-	return map[string]interface{}{
+// LBH79-历史问题：生产渲染（GenerateRuleServerContext / 全量生成）从不产出
+// tls.automation（证书由应用层任务管理），旧实现扫描该段的分支恒不可达且
+// 让配置查看响应携带恒空字段。此处钉住：即使运行配置被外部注入 automation
+// 段，context 也不再声明/返回 automation_policies。
+func TestBuildRuleCaddyContext_doesNotExposeDeadAutomationPolicies(t *testing.T) {
+	fullConfig := map[string]interface{}{
 		"apps": map[string]interface{}{
 			"tls": map[string]interface{}{
 				"automation": map[string]interface{}{
-					"policies": policies,
+					"policies": []interface{}{
+						map[string]interface{}{"subjects": []interface{}{"example.com"}},
+					},
 				},
 			},
 		},
 	}
-}
 
-func automationPolicyModules(t *testing.T, result map[string]interface{}) []string {
-	t.Helper()
-	raw, ok := result["automation_policies"].([]interface{})
-	if !ok {
-		t.Fatalf("automation_policies type = %T, want []interface{}", result["automation_policies"])
-	}
-	if raw == nil {
-		t.Fatal("automation_policies is nil, want initialized empty slice")
-	}
-	modules := make([]string, 0, len(raw))
-	for _, policyVal := range raw {
-		policy, _ := policyVal.(map[string]interface{})
-		issuer, _ := policy["issuer"].(map[string]interface{})
-		module, _ := issuer["module"].(string)
-		modules = append(modules, module)
-	}
-	return modules
-}
+	result := buildRuleCaddyContext(fullConfig, "lb_testrule", "example.com")
 
-func TestBuildRuleCaddyContext_AutomationPoliciesScopedToRuleDomains(t *testing.T) {
-	tests := []struct {
-		name        string
-		domain      string
-		policies    []interface{}
-		wantModules []string
-	}{
-		{
-			name:   "policy with subjects matching rule domains is kept",
-			domain: "example.com",
-			policies: []interface{}{
-				automationPolicyFixture("acme", "example.com"),
-			},
-			wantModules: []string{"acme"},
-		},
-		{
-			name:   "policy matching any of several canonicalized rule domains is kept",
-			domain: "Example.com, www.example.com",
-			policies: []interface{}{
-				automationPolicyFixture("acme", "www.example.com"),
-			},
-			wantModules: []string{"acme"},
-		},
-		{
-			name:   "policy with non-matching subjects is dropped",
-			domain: "example.com",
-			policies: []interface{}{
-				automationPolicyFixture("acme", "other.com"),
-			},
-			wantModules: []string{},
-		},
-		{
-			name:   "policy without subjects field is dropped",
-			domain: "example.com",
-			policies: []interface{}{
-				automationGlobalPolicyFixture("internal"),
-			},
-			wantModules: []string{},
-		},
-		{
-			name:   "empty rule domain yields empty non-nil policies",
-			domain: "",
-			policies: []interface{}{
-				automationPolicyFixture("acme", "example.com"),
-			},
-			wantModules: []string{},
-		},
-		{
-			name:   "mixed policies keep only domain matches",
-			domain: "example.com",
-			policies: []interface{}{
-				automationPolicyFixture("acme", "example.com"),
-				automationPolicyFixture("zerossl", "other.com"),
-				automationGlobalPolicyFixture("internal"),
-				automationPolicyFixture("empty"),
-			},
-			wantModules: []string{"acme"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Given: a full Caddy config whose TLS app holds the case's automation policies
-			fullConfig := automationConfigWithPolicies(tt.policies...)
-
-			// When
-			result := buildRuleCaddyContext(fullConfig, "lb_testrule", 443, tt.domain)
-
-			// Then
-			gotModules := automationPolicyModules(t, result)
-			if !reflect.DeepEqual(gotModules, tt.wantModules) {
-				t.Fatalf("automation policy modules = %v, want %v", gotModules, tt.wantModules)
-			}
-		})
+	if _, exists := result["automation_policies"]; exists {
+		t.Fatalf("automation_policies=%v, want field removed（生产渲染无该段）", result["automation_policies"])
 	}
 }
 
@@ -273,7 +172,7 @@ func TestBuildRuleCaddyContext_TLSConnectionPoliciesScopedToRule(t *testing.T) {
 			fullConfig := tlsConnPoliciesConfigFixture(tt.caddyID, tt.policies)
 
 			// When
-			result := buildRuleCaddyContext(fullConfig, tt.caddyID, 443, tt.domain)
+			result := buildRuleCaddyContext(fullConfig, tt.caddyID, tt.domain)
 
 			// Then: both the top-level array and the server context carry the rule-scoped set
 			gotTop := tlsConnPolicyFingerprints(t, result["tls_connection_policies"])

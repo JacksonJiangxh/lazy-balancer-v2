@@ -6,6 +6,7 @@ package caddygeoip
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -45,6 +46,33 @@ func TestTrafficRecord_attackNormalBuckets(t *testing.T) {
 	trafficRecord("", true)
 	if _, exists := trafficCountries[""]; exists {
 		t.Fatalf("空国名不应产生条目")
+	}
+}
+
+func TestTrafficRecord_countryCapacity(t *testing.T) {
+	// Given: 国名桶达到硬上限，且其中一个已有桶随后继续命中。
+	resetTrafficState(t)
+	const limit = 512
+	for i := range limit {
+		trafficRecord(fmt.Sprintf("country-%03d", i), false)
+	}
+	trafficRecord("country-000", true)
+
+	// When: 第 513 个新国名到达。
+	trafficRecord("overflow", true)
+
+	// Then: 新键被丢弃，已有键仍正常计数，map 永不越界。
+	trafficMu.RLock()
+	defer trafficMu.RUnlock()
+	if got := len(trafficCountries); got != limit {
+		t.Fatalf("country buckets=%d, want hard limit %d", got, limit)
+	}
+	if _, exists := trafficCountries["overflow"]; exists {
+		t.Fatal("new country beyond the capacity must be dropped")
+	}
+	e := trafficCountries["country-000"]
+	if e == nil || e.normal.Load() != 1 || e.attack.Load() != 1 {
+		t.Fatalf("existing country at capacity=%+v, want attack=1 normal=1", e)
 	}
 }
 

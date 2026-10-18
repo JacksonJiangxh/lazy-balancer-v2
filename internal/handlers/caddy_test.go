@@ -22,6 +22,20 @@ import (
 )
 
 func TestCaddyLifecycleHandlers_wait_for_rule_operation_lock(t *testing.T) {
+	// LBH79-历史问题：测试隔离——注入临时 pause/pid 路径与失败命令桩，避免
+	// 写真实 /tmp/lazy-balancer-caddy-paused 或执行真实 caddy run/stop。
+	// 命令桩恒失败，锁释放后的 handler 快速返回，不会走到 nil caddyService。
+	oldPause, oldPidFile := caddyPauseFile, caddySupervisorPidFile
+	oldRun, oldStop := caddyRunCommand, caddyStopCommand
+	dir := t.TempDir()
+	caddyPauseFile = filepath.Join(dir, "paused")
+	caddySupervisorPidFile = filepath.Join(dir, "supervisor.pid")
+	caddyRunCommand = func() *exec.Cmd { return exec.Command("sh", "-c", "exit 7") }
+	caddyStopCommand = func(string) *exec.Cmd { return exec.Command("sh", "-c", "exit 8") }
+	t.Cleanup(func() {
+		caddyPauseFile, caddySupervisorPidFile = oldPause, oldPidFile
+		caddyRunCommand, caddyStopCommand = oldRun, oldStop
+	})
 	tests := []struct {
 		name  string
 		mount func(*gin.Engine, *Handlers)

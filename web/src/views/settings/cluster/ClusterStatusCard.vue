@@ -35,6 +35,10 @@
           <span class="mono-value">{{ status.master_url || '-' }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="最近同步">{{ formatDate(status.last_sync_at) || '-' }}</el-descriptions-item>
+        <!-- 历史问题-09：明文链路常驻提示（注册时刻的一次性审计之外，稳态也要可见） -->
+        <el-descriptions-item v-if="status.transport_insecure" label="链路加密" :span="3">
+          <span class="error-text">明文 HTTP：证书私钥、ACME/DNS 凭据与集群令牌将以明文传输，且没有证书指纹校验；建议改用 HTTPS</span>
+        </el-descriptions-item>
         <el-descriptions-item v-if="status.last_sync_error" label="同步错误" :span="3">
           <span class="error-text">{{ syncErrorDisplay }}</span>
         </el-descriptions-item>

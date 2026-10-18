@@ -39,7 +39,7 @@
       </div>
 
       <transition name="fade">
-        <div v-if="showEmptyState" class="empty-state">近 24 小时无攻击事件</div>
+        <div v-if="showEmptyState" class="empty-state">近 {{ windowHours }} 小时无安全事件</div>
       </transition>
       <div class="error-stack">
         <div v-if="statsError" class="error-banner">大屏数据加载失败，正在重试…</div>
@@ -48,6 +48,7 @@
           <button type="button" class="btn error-retry" @click="mountEngine">重试</button>
         </div>
         <div v-if="trafficError" class="error-banner traffic-error">流量采集不可用（Caddy admin 不可达），曲线已保留上一帧</div>
+        <div v-if="!siteConfigured" class="error-banner site-unset">未配置站点坐标，本站信标与攻击弹道已隐藏</div>
       </div>
     </div>
 
@@ -68,6 +69,7 @@
             <div class="ev-top">
               <span>{{ formatFeedTime(event.event_time) }}</span>
               <span class="sev" :class="'sev-' + sevOf(event)">{{ sevLabel(event) }}</span>
+              <span class="act" :class="'act-' + event.action">{{ actionLabel(event.action) }}</span>
             </div>
             <div class="ev-main">
               <span class="ev-ip">{{ event.client_ip }}</span>
@@ -93,18 +95,21 @@
         </div>
         <div>
           <h1 class="glitch" data-text="安全威胁大屏">安全威胁大屏</h1>
-          <p>近 {{ stats?.hours ?? 24 }} 小时安全态势实时监控 <time class="mono">{{ clockText }}</time><span class="mono clock-date">{{ clockDate }}</span></p>
+          <p>近 {{ windowHours }} 小时安全态势实时监控 <time class="mono">{{ clockText }}</time><span class="mono clock-date">{{ clockDate }}</span><span class="scope-badge">本节点数据</span></p>
         </div>
       </div>
 
       <div class="kpis" role="group" aria-label="核心指标">
-        <div class="kpi"><span class="kpi-value">{{ displayTotal }}</span><span class="kpi-label">24h 攻击总数</span></div>
-        <div class="kpi"><span class="kpi-value cool">{{ displayRate }}<small>%</small></span><span class="kpi-label" title="拦截率=近 24 小时窗口；限流次数自最近一次 Caddy 配置重载起累计">拦截率 · 限流累计 {{ displayRatelimit }}（自重载）</span></div>
-        <div class="kpi"><span class="kpi-value">{{ displayRecentRate }}</span><span class="kpi-label">次/分钟 · 近 5 分钟</span></div>
-        <div class="kpi"><span class="kpi-value">{{ displayActive }}</span><span class="kpi-label">活跃攻击源 · 近 10 分钟</span></div>
+        <div class="kpi"><span class="kpi-value">{{ displayTotal }}</span><span class="kpi-label">{{ windowHours }}h 安全事件 · 拦截 {{ stats?.blocked_events ?? 0 }} / 检测 {{ loggedEvents }}</span></div>
+        <div class="kpi"><span class="kpi-value cool">{{ blockRateText }}</span><span class="kpi-label">拦截率 · 拦截 / 全部安全事件</span></div>
+        <div class="kpi"><span class="kpi-value">{{ displayRecentRate }}</span><span class="kpi-label">拦截/分钟 · 近 5 分钟</span></div>
+        <div class="kpi"><span class="kpi-value">{{ displayActive }}</span><span class="kpi-label">活跃来源 · 近 10 分钟</span></div>
       </div>
 
       <div class="actions">
+        <div class="window-switch" role="group" aria-label="时间窗口">
+          <button v-for="opt in windowOptions" :key="opt.value" type="button" class="window-btn" :aria-pressed="windowHours === opt.value" @click="setWindow(opt.value)">{{ opt.label }}</button>
+        </div>
         <button type="button" class="btn" title="复位视角" @click="resetView">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
           <span class="btn-text">复位视角</span>
@@ -128,9 +133,9 @@
       </div>
       <div class="stats">
         <div class="stat-section">
-          <div class="stat-title"><span title="按近 24 小时全局攻击总量定标（对数）：10 次≈20 / 1,000 次≈60 / 10 万次=100">威胁指数</span><span class="n">{{ threatGauge.pct }}</span></div>
+          <div class="stat-title"><span title="按当前窗口全局安全事件量定标（对数），不是风险评分：10 次≈20 / 1,000 次≈60 / 10 万次=100">事件量指数</span><span class="n">{{ threatGauge.pct }}</span></div>
           <div class="gauge-row">
-            <svg class="gauge" viewBox="0 0 120 70" role="img" aria-label="威胁指数">
+            <svg class="gauge" viewBox="0 0 120 70" role="img" aria-label="事件量指数">
               <path class="gauge-track" d="M10 62 A50 50 0 0 1 110 62" fill="none"></path>
               <path class="gauge-fill" :stroke="threatGauge.color" :stroke-dasharray="`${threatGauge.pct * 1.571} 157.1`" d="M10 62 A50 50 0 0 1 110 62" fill="none"></path>
               <text x="60" y="52" text-anchor="middle" class="gauge-num">{{ threatGauge.pct }}</text>
@@ -147,7 +152,7 @@
         </div>
 
         <div class="stat-section">
-          <div class="stat-title"><span>攻击国家 TOP5</span></div>
+          <div class="stat-title"><span>来源国家 TOP5</span><span class="n">含检测</span></div>
           <ul v-if="topCountries.length" class="rules country-bars">
             <li v-for="item in topCountries" :key="item.name" class="rule" :title="item.name">
               <span class="rule-name">{{ item.name }}</span>
@@ -159,7 +164,23 @@
         </div>
 
         <div class="stat-section">
-          <div class="stat-title"><span>攻击类型占比</span><span class="n">{{ shareTotal }}</span></div>
+          <div class="stat-title"><span>TOP 被攻击站点</span><span class="n">{{ targetHits }}</span></div>
+          <ul v-if="topTargets.length" class="rules">
+            <li v-for="item in topTargets" :key="item.name + item.domain" class="rule" :title="item.domain || item.name">
+              <span class="rule-name">{{ item.domain || item.name }}</span>
+              <span class="cnt">{{ item.value }}</span>
+              <span class="rule-bar"><i :style="{ width: targetBarWidth(item.value) }"></i></span>
+            </li>
+          </ul>
+          <div v-else class="empty">暂无规则维度数据</div>
+        </div>
+
+        <div class="stat-section">
+          <div class="stat-title"><span title="自最近一次 Caddy 配置重载/进程启动以来累计；含上游自返 429">限流累计（自重载）</span><span class="n">{{ ratelimitAvailable ? displayRatelimit : '—' }}</span></div>
+        </div>
+
+        <div class="stat-section">
+          <div class="stat-title"><span>事件族构成</span><span class="n">{{ shareTotal }}</span></div>
           <div class="donut-row">
             <div class="donut">
               <svg viewBox="0 0 36 36" role="img" aria-label="攻击类型占比">
@@ -174,7 +195,7 @@
                   :stroke-dashoffset="seg.offset"
                 ></circle>
               </svg>
-              <div class="donut-center"><b>{{ shareTotal }}</b><span>攻击</span></div>
+              <div class="donut-center"><b>{{ shareTotal }}</b><span>事件</span></div>
             </div>
             <ul class="type-legend">
               <li v-for="item in shareTop" :key="item.name">
@@ -195,7 +216,7 @@
           <div class="stat-title"><span>TOP 命中规则（前 6 条命中次数）</span><span class="n">{{ topRuleHits }}</span></div>
           <ul v-if="topRules.length" class="rules">
             <li v-for="item in topRules" :key="item.name" class="rule" :title="item.name">
-              <span class="rule-name">{{ item.name }}</span>
+              <span class="rule-name">{{ ruleLabel(item.name) }}</span>
               <span class="cnt">{{ item.value }}</span>
               <span class="rule-bar"><i :style="{ width: ruleBarWidth(item.value) }"></i></span>
             </li>
@@ -209,7 +230,7 @@
     <div class="charts-row">
       <div class="panel hud">
         <div class="panel-head">
-          <h2>24h 攻击时段趋势 <span class="en">HOURLY</span></h2>
+          <h2>{{ windowHours }}h 事件趋势 <span class="en">{{ windowHours > 24 ? 'DAILY' : 'HOURLY' }}</span></h2>
           <span class="meta">合计 <b>{{ hourlyTotal }}</b></span>
         </div>
         <div class="chart-box">
@@ -220,25 +241,27 @@
               v-for="(slot, i) in hourlyHist"
               :key="slot.name"
               class="timeline-slot"
-              :x="i * (100 / 24)"
+              :x="i * (100 / Math.max(1, hourlyHist.length))"
               y="0"
-              :width="100 / 24 + 0.05"
+              :width="100 / Math.max(1, hourlyHist.length) + 0.05"
               height="40"
-            ><title>{{ slot.name }}:00 — {{ slot.value }} 次</title></rect>
+            ><title>{{ hourlyTooltip(slot.name) }} — {{ slot.value }} 次</title></rect>
           </svg>
-          <div class="timeline-axis"><span>00</span><span>06</span><span>12</span><span>18</span><span>23</span></div>
+          <div class="timeline-axis"><span v-for="label in histAxis" :key="label">{{ label }}</span></div>
         </div>
       </div>
       <div class="panel hud">
         <div class="panel-head">
-          <h2>正常请求流量 <span class="en">TRAFFIC · 90s</span></h2>
-          <span class="meta">当前 <b>{{ normalQps }}</b> /s · 自页面打开累计 {{ normalTotalText }}<template v-if="trafficSampled"> · 抽样估算</template></span>
+          <h2>请求流量 <span class="en">TRAFFIC · 90s</span></h2>
+          <span class="meta" title="仅统计经过 GeoIP 处理器规则的请求；正常桶含上游透传，不等于 2xx">正常 <b>{{ normalQps }}</b>/s · 攻击 <b class="attack-qps">{{ attackQps }}</b>/s · 累计 正常 {{ normalTotalText }} / 攻击 {{ attackTotalText }}<template v-if="trafficSampled"> · 抽样估算</template></span>
         </div>
         <div class="chart-box">
           <svg class="normal-spark" viewBox="0 0 100 40" preserveAspectRatio="none">
             <polygon class="normal-fill" :points="normalFillPoints"></polygon>
             <polyline class="normal-stroke" :points="normalPoints"></polyline>
+            <polyline class="attack-stroke" :points="attackPoints"></polyline>
           </svg>
+          <div class="traffic-legend"><span class="sw normal"></span>正常<span class="sw attack"></span>攻击</div>
           <div class="timeline-axis"><span>90s 前</span><span>现在</span></div>
         </div>
       </div>
@@ -255,7 +278,7 @@ import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { useCountUp } from '@/composables/useCountUp'
 import { formatDate } from '@/utils/date'
-import { trafficDelta, threatIndex, type TrafficBaseline } from '@/utils/threatScreenMetrics'
+import { trafficDelta, threatIndex, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '@/utils/threatScreenMetrics'
 import type { ThreatScene, ThreatSceneOptions } from '@/utils/threatScene'
 
 // 威胁大屏（v2.3.8 Threat Wall 版式）：三栏 HUD 网格（左事件流/中引擎舞台/
@@ -268,13 +291,16 @@ interface ThreatScreenStats {
   hours: number
   total_events: number
   blocked_events: number
+  logged_events?: number
   block_rate: number
   ratelimit_blocks: number
+  ratelimit_available?: boolean
   active_sources: number
   countries: Record<string, number>
   china_provinces: Record<string, number>
   top_countries: { name: string; value: number }[]
   top_rules: { name: string; value: number }[]
+  top_targets?: { name: string; domain?: string; value: number }[]
   hourly_hist: { name: string; value: number }[]
   attack_type_share: { name: string; value: number }[]
   recent_rate: number
@@ -300,6 +326,10 @@ const FEED_LIMIT = 50
 const FEED_POLL_MS = 3000
 const STATS_POLL_MS = 30000
 const ARC_FLUSH_MS = 500
+const FEED_PAGE_LIMIT = 200
+const FEED_MAX_PAGES = 5
+const windowOptions = [{ value: 1, label: '1h' }, { value: 24, label: '24h' }, { value: 168, label: '7d' }] as const
+const windowHours = ref<number>(24)
 
 const authStore = useAuthStore()
 const stats = ref<ThreatScreenStats | null>(null)
@@ -316,20 +346,29 @@ let arcFlushTimer: number | undefined = undefined
 let disposed = false
 
 const displayTotal = useCountUp(computed(() => stats.value?.total_events ?? 0))
-const displayRateX10 = useCountUp(computed(() => Math.round((stats.value?.block_rate ?? 0) * 10)))
-const displayRate = computed(() => (displayRateX10.value / 10).toFixed(1))
 const displayRatelimit = useCountUp(computed(() => Math.floor(stats.value?.ratelimit_blocks ?? 0)))
 const displayActive = useCountUp(computed(() => stats.value?.active_sources ?? 0))
-
+const loggedEvents = computed(() => stats.value?.logged_events ?? Math.max(0, (stats.value?.total_events ?? 0) - (stats.value?.blocked_events ?? 0)))
+const blockRateText = computed(() => {
+  const total = stats.value?.total_events ?? 0
+  if (total <= 0) return '—'
+  return `${(stats.value?.block_rate ?? 0).toFixed(1)}%`
+})
+const ratelimitAvailable = computed(() => stats.value?.ratelimit_available !== false)
 const topCountries = computed(() => stats.value?.top_countries ?? [])
 const topRules = computed(() => stats.value?.top_rules ?? [])
+const topTargets = computed(() => stats.value?.top_targets ?? [])
+const targetHits = computed(() => topTargets.value.reduce((m, item) => m + item.value, 0))
+const maxTargetCount = computed(() => topTargets.value.reduce((m, item) => Math.max(m, item.value), 0))
+const targetBarWidth = (count: number): string => `${maxTargetCount.value > 0 ? Math.max(5, (count / maxTargetCount.value) * 100) : 0}%`
 const hourlyTotal = computed(() => hourlyHist.value.reduce((m, slot) => m + slot.value, 0))
 // 口径（历史问题 方案 B）：top_rules 后端只返回前 6 条——求和不等于「命中规则数」，
 // 文案与变量同口径改为「前 6 条命中次数」；真实 distinct 规则数需后端新增字段。
 const topRuleHits = computed(() => topRules.value.reduce((m, item) => m + item.value, 0))
 const hourlyHist = computed(() => stats.value?.hourly_hist ?? [])
 const attackTypeShare = computed(() => stats.value?.attack_type_share ?? [])
-const displayRecentRate = useCountUp(computed(() => Math.round((stats.value?.recent_rate ?? 0) * 10)), 500)
+const displayRecentRateX10 = useCountUp(computed(() => Math.round((stats.value?.recent_rate ?? 0) * 10)), 500)
+const displayRecentRate = computed(() => formatRecentRate(displayRecentRateX10.value / 10))
 const showEmptyState = computed(() => !statsError.value && !!stats.value && stats.value.total_events === 0)
 const countryCount = computed(() => Object.keys(stats.value?.countries ?? {}).length)
 
@@ -346,6 +385,7 @@ const countryHeat = (count: number): string => {
 const countryBarColor = (count: number): string => countryHeat(count)
 const maxRuleCount = computed(() => topRules.value.reduce((m, item) => Math.max(m, item.value), 0))
 const ruleBarWidth = (count: number): string => `${maxRuleCount.value > 0 ? Math.max(5, (count / maxRuleCount.value) * 100) : 0}%`
+const ruleLabel = (name: string): string => (/^\d+$/.test(name) ? `规则 #${name}` : name)
 
 const SHARE_PALETTE = ['#ff4d4d', '#ff9f1c', '#ffd166']
 /** 第 4 段（其余）单色：与三主色区分的中性灰蓝，不参与「切片色哈希」。 */
@@ -386,6 +426,14 @@ const histPoints = computed((): string => {
     .join(' ')
 })
 const histFillPoints = computed((): string => (histPoints.value ? `0,40 ${histPoints.value} 100,40` : ''))
+const hourlyTooltip = (name: string): string => hourlyBucketLabel(name, windowHours.value)
+const histAxis = computed((): string[] => {
+  const slots = hourlyHist.value
+  if (slots.length === 0) return []
+  const names = slots.map((s) => s.name)
+  if (names.length <= 5) return names
+  return [names[0], names[Math.floor(names.length / 3)], names[Math.floor((names.length * 2) / 3)], names[names.length - 1]]
+})
 
 const feedTypeColorCache = new Map<string, string>()
 const TYPE_PALETTE = ['#ff4d4d', '#ff9f1c', '#ffd166']
@@ -413,7 +461,7 @@ function tickClock(): void {
   clockDate.value = `${now.getFullYear()}-${p2(now.getMonth() + 1)}-${p2(now.getDate())} 星期${WEEKDAYS[now.getDay()]}`
   // HUD 读数：引擎相机地理中心 + 本站坐标
   const cam = threatMap?.cameraState()
-  if (cam) camReadout.value = `${cam.cy.toFixed(1)}° ${((cam.cx + 360) % 360 - 180).toFixed(1)}°`
+  if (cam) camReadout.value = `${cam.cy.toFixed(1)}° ${cam.cx.toFixed(1)}°`
 }
 let clockTimer = 0
 
@@ -434,12 +482,17 @@ const toastTimers = new Map<number, number>()
  *  rule_triggered 二次猜解阶段（只识别 429/2/8/48x，其余一律 WAF），与后端
  *  trigger_type 映射（800xxx→地域拦截/12→信任/14→威胁情报/11→请求体…）
  *  左右自相矛盾。旧后端缺字段时回退 attack_type。 */
+function actionLabel(action: string): string {
+  return action === 'blocked' ? '已拦截' : action === 'logged' ? '仅检测' : action || '—'
+}
 function triggerLabel(ev: FeedEvent): string {
   return ev.trigger_type || ev.attack_type || '—'
 }
 function pushAttackToasts(events: FeedEvent[]): void {
-  for (const ev of events) {
-    if (ev.action !== 'blocked') continue
+  // 100/s 攻击下每 3s 可达 300 条；只为最新 3 条建 toast/定时器，
+  // 避免每条事件一个 setTimeout 的定时器风暴（原实现全量循环）。
+  const blocked = events.filter((ev) => ev.action === 'blocked').slice(-TOAST_MAX)
+  for (const ev of blocked) {
     const durMs = Math.max(0.1, (ev.duration_us ?? 0) / 1000)
     const toast: AttackToast = {
       id: ev.id,
@@ -458,27 +511,37 @@ function pushAttackToasts(events: FeedEvent[]): void {
   }
 }
 
-// ============ 正常流量 sparkline（QPS 采样 60 点窗口） ============
+// ============ 流量 sparkline（normal/attack 双线，60 点窗口） ============
 const normalWindow = ref<number[]>([])
+const attackWindow = ref<number[]>([])
 const NORMAL_WINDOW_MAX = 60
-// ref：累计值参与 normalTotalText computed——原 let 非响应式，文本恒定 0
 const normalTotal = ref(0)
+const attackTotal = ref(0)
+const trafficMax = computed(() => Math.max(1, ...normalWindow.value, ...attackWindow.value))
+function qpsText(value: number): string {
+  return value >= 100 ? Math.round(value).toString() : value.toFixed(1)
+}
 const normalQps = computed(() => {
   const w = normalWindow.value
   if (w.length < 2) return '0.0'
-  // 窗口存的是 trafficDelta 折算后的 QPS 采样（已按真实间隔折算），此处
-  // 只取近 10 个采样均值——原实现再恒除 1.5（假定固定采样间隔）。
   const recent = w.slice(-10)
-  const avg = recent.reduce((m, v) => m + v, 0) / recent.length
-  return avg >= 100 ? Math.round(avg).toString() : avg.toFixed(1)
+  return qpsText(recent.reduce((m, v) => m + v, 0) / recent.length)
+})
+const attackQps = computed(() => {
+  const w = attackWindow.value
+  if (w.length < 2) return '0.0'
+  const recent = w.slice(-10)
+  return qpsText(recent.reduce((m, v) => m + v, 0) / recent.length)
 })
 const normalTotalText = computed(() => (normalTotal.value >= 10000 ? `${(normalTotal.value / 1000).toFixed(1)}k` : normalTotal.value.toLocaleString()))
-const normalPoints = computed((): string => {
-  const w = normalWindow.value
-  if (w.length < 2) return ''
-  const max = Math.max(...w, 1)
-  return w.map((v, i) => `${((i / (w.length - 1)) * 100).toFixed(2)},${(38 - (v / max) * 34).toFixed(2)}`).join(' ')
-})
+const attackTotalText = computed(() => (attackTotal.value >= 10000 ? `${(attackTotal.value / 1000).toFixed(1)}k` : attackTotal.value.toLocaleString()))
+function sparkPoints(window: number[]): string {
+  if (window.length < 2) return ''
+  const max = trafficMax.value
+  return window.map((v, i) => `${((i / (window.length - 1)) * 100).toFixed(2)},${(38 - (v / max) * 34).toFixed(2)}`).join(' ')
+}
+const normalPoints = computed((): string => sparkPoints(normalWindow.value))
+const attackPoints = computed((): string => sparkPoints(attackWindow.value))
 const normalFillPoints = computed((): string => (normalPoints.value ? `0,40 ${normalPoints.value} 100,40` : ''))
 
 // ============ 事件等级筛选（高危=拦截 高危族 / 中危=限流 / 低危=检测） ============
@@ -527,9 +590,20 @@ const filteredFeed = computed(() =>
   sevFilter.value === 'all' ? feedItems.value : feedItems.value.filter((ev) => sevOf(ev) === sevFilter.value),
 )
 
+function arcAggregationKey(location: string): string {
+  const [country, province] = location.split('·')
+  if (!country) return ''
+  // 地球按国家质心落弧；地图中国按省质心落弧。先在此归一，避免同一
+  // 省/国家下不同城市在队列里各占一条，最终叠成 30 条重合弧。
+  if (screenMode.value !== 'globe' && country === '中国' && province) return `${country}·${province}`
+  return country
+}
+
 function enqueueArcs(events: FeedEvent[]): void {
   for (const event of events) {
-    if (event.ip_location) arcQueue.push(event.ip_location)
+    if (!event.ip_location) continue
+    const key = arcAggregationKey(event.ip_location)
+    if (key) arcQueue.push(key)
   }
 }
 
@@ -575,38 +649,57 @@ const trafficTask = usePollingTask(async () => {
     return
   }
   trafficError.value = false
-  trafficSampled.value = (res.data?.sample_n ?? 0) > 1
+  const sampleN = res.data?.sample_n ?? 1
+  trafficSampled.value = sampleN > 1
   const countries = res.data?.countries ?? {}
   const now = Date.now()
-  const sample = trafficDelta(trafficBaseline, countries, now)
+  const sample = trafficDelta(trafficBaseline, countries, now, sampleN)
   trafficBaseline = {
-    counts: new Map(Object.entries(countries).map(([name, entry]) => [name, entry.normal])),
+    counts: new Map(Object.entries(countries).map(([name, entry]) => [name, { normal: entry.normal, attack: entry.attack }])),
     at: now,
+    sampleN,
   }
   if (sample.baseline) {
-    // 首轮/计数器回退：只建基线；回退同时清空曲线（断开跨重启的错误连线）
-    if (sample.reset) normalWindow.value = []
+    // 首轮/计数器回退/抽样比变化：只建基线；回退同时清空曲线
+    if (sample.reset) {
+      normalWindow.value = []
+      attackWindow.value = []
+    }
     return
   }
-  threatMap?.setTraffic(sample.deltas)
-  normalTotal.value += sample.total
-  normalWindow.value = [...normalWindow.value, sample.qps].slice(-NORMAL_WINDOW_MAX)
+  threatMap?.setTraffic(sample.normalDeltas)
+  normalTotal.value += sample.normalTotal
+  attackTotal.value += sample.attackTotal
+  normalWindow.value = [...normalWindow.value, sample.normalQps].slice(-NORMAL_WINDOW_MAX)
+  attackWindow.value = [...attackWindow.value, sample.attackQps].slice(-NORMAL_WINDOW_MAX)
 }, { interval: 1500, onError: () => { trafficError.value = true } })
+
+function setWindow(hours: number): void {
+  if (windowHours.value === hours) return
+  windowHours.value = hours
+  stats.value = null
+  statsError.value = false
+  void statsTask.run()
+}
 
 // 本站坐标 + 大屏模式（threat_screen_mode：map/globe）——/config 读一次。
 // 历史 历史问题：不阻塞引擎/轮询启动（见 onMounted）。
 const screenMode = ref('map')
 const isGlobeMode = computed(() => screenMode.value === 'globe')
 const serverLatLon: [number, number] = [0, 0]
+const siteConfigured = ref(false)
 async function loadServerCentroid(): Promise<void> {
   try {
     const res = await request.get<APIResponse<{ server_map_lat?: number; server_map_lon?: number; threat_screen_mode?: string }>>('/config?_ts=' + Date.now(), { silent: true })
     screenMode.value = res.data?.threat_screen_mode === 'globe' ? 'globe' : 'map'
     serverLatLon[0] = res.data?.server_map_lat ?? 0
     serverLatLon[1] = res.data?.server_map_lon ?? 0
-    if (serverLatLon[0] !== 0 || serverLatLon[1] !== 0) {
+    siteConfigured.value = serverLatLon[0] !== 0 || serverLatLon[1] !== 0
+    if (siteConfigured.value) {
       threatMap?.setServer([serverLatLon[1], serverLatLon[0]])
       tgtReadout.value = `${Math.abs(serverLatLon[0]).toFixed(2)}°${serverLatLon[0] >= 0 ? 'N' : 'S'} ${Math.abs(serverLatLon[1]).toFixed(2)}°${serverLatLon[1] >= 0 ? 'E' : 'W'}`
+    } else {
+      tgtReadout.value = '--'
     }
   } catch {
     /* 配置读取失败：保持缺省（地图模式、本站未配置） */
@@ -616,20 +709,30 @@ async function loadServerCentroid(): Promise<void> {
 // ============ 事件流 ============
 const feedError = ref(false)
 const feedTask = usePollingTask(async () => {
-  const res = await request.get<APIResponse<{ events: FeedEvent[]; next_since_id?: number }>>(`/security/events/feed?since_id=${sinceId.value}`, { silent: true })
-  feedError.value = false
-  const events = res.data?.events ?? []
   const isInitialBatch = sinceId.value === 0
-  // 后端返回本批实际扫描高水位（含被保留地址过滤的行）；空页也必须推进，
-  // 否则最新一页全是保留地址时游标永久卡住。
-  const nextSince = res.data?.next_since_id
-  if (typeof nextSince === 'number' && nextSince > sinceId.value) sinceId.value = nextSince
+  let cursor = sinceId.value
+  let hasMore = true
+  const events: FeedEvent[] = []
+  // 高水位不丢事件：后端升序返回，单页 200；积压超过一页时连续补拉到
+  // 追平或达到 5 页上限（1000 条/3s），不再像原 DESC+LIMIT 50 那样把中间
+  // 事件永久跳过。首屏 since=0 由后端返回最新一页。
+  for (let page = 0; page < FEED_MAX_PAGES && hasMore; page++) {
+    const res = await request.get<APIResponse<{ events: FeedEvent[]; next_since_id?: number; has_more?: boolean }>>(
+      `/security/events/feed?since_id=${cursor}&limit=${FEED_PAGE_LIMIT}`,
+      { silent: true },
+    )
+    const batch = res.data?.events ?? []
+    events.push(...batch)
+    const nextSince = res.data?.next_since_id
+    if (typeof nextSince === 'number' && nextSince > cursor) cursor = nextSince
+    hasMore = res.data?.has_more === true
+    if (batch.length === 0) break
+  }
+  feedError.value = false
+  sinceId.value = cursor
   if (events.length === 0) return
-  if (events[0].id > sinceId.value) sinceId.value = events[0].id
-  // 保留最近 50 条滚动更新（用户裁定 2026-10-17：50 条上限+实时追加即可）
   feedItems.value = [...events, ...feedItems.value].sort((a, b) => b.id - a.id).slice(0, FEED_LIMIT)
   // 弧线/弹框仅对增量批次：首批（入场回溯）不回放——消除「开局三连流光」
-  // 演示观感（用户裁定 2026-10-17）。
   if (!isInitialBatch) {
     enqueueArcs(events)
     pushAttackToasts(events)
@@ -637,7 +740,7 @@ const feedTask = usePollingTask(async () => {
 }, { interval: FEED_POLL_MS, onError: () => { feedError.value = true } })
 
 const statsTask = usePollingTask(async () => {
-  const res = await request.get<APIResponse<ThreatScreenStats>>('/security/overview/threat-screen', { silent: true })
+  const res = await request.get<APIResponse<ThreatScreenStats>>(`/security/overview/threat-screen?hours=${windowHours.value}`, { silent: true })
   if (!res.data) throw new Error('threat-screen payload missing')
   stats.value = res.data
   statsError.value = false
@@ -652,11 +755,21 @@ const statsTask = usePollingTask(async () => {
 const engineError = ref(false)
 let mountedMode: 'map' | 'globe' | null = null
 let engineMounting = false
+let remountRequested = false
 
 async function mountEngine(): Promise<void> {
-  if (disposed || !mapHost.value || engineMounting) return
+  if (disposed || !mapHost.value) return
+  if (engineMounting) {
+    remountRequested = true
+    return
+  }
   const mode: 'map' | 'globe' = screenMode.value === 'globe' ? 'globe' : 'map'
-  if (threatMap && mountedMode === mode) return
+  if (threatMap && mountedMode === mode) {
+    // 历史问题：同模式重入也补发本站坐标——/config 晚到时首次 setServer 可能
+    // 落在引擎尚未创建的空窗，remount 早退会永久丢失信标/弹道。
+    if (siteConfigured.value) threatMap.setServer([serverLatLon[1], serverLatLon[0]])
+    return
+  }
   engineMounting = true
   try {
     if (threatMap) {
@@ -670,6 +783,9 @@ async function mountEngine(): Promise<void> {
       : (await import('@/utils/threatScene')).createThreatScene
     if (disposed || !mapHost.value) return
     const engine = create(mapHost.value, {
+      serverCentroid: siteConfigured.value ? [serverLatLon[1], serverLatLon[0]] : null,
+      siteConfigured: siteConfigured.value,
+      drillCountries: ['中国'],
       onDrillChange: (name: string | null) => { zoomedName.value = name },
       onProvinceLoadError: () => { ElMessage.warning('省界数据加载失败，本次下钻未展开；可再次点击国家重试') },
     })
@@ -677,7 +793,7 @@ async function mountEngine(): Promise<void> {
     mountedMode = mode
     ;(window as unknown as Record<string, unknown>).__threatScene = engine
     applyMapPause()
-    if (serverLatLon[0] !== 0 || serverLatLon[1] !== 0) engine.setServer([serverLatLon[1], serverLatLon[0]])
+    if (siteConfigured.value) engine.setServer([serverLatLon[1], serverLatLon[0]])
   } catch (error: unknown) {
     // 动态 chunk 404（发布中途旧页面）/网络失败：显性错误态 + 重试入口，
     // 数据轮询不受影响（历史 历史问题）。
@@ -686,6 +802,10 @@ async function mountEngine(): Promise<void> {
     mountedMode = null
   } finally {
     engineMounting = false
+    if (remountRequested && !disposed) {
+      remountRequested = false
+      void mountEngine()
+    }
   }
 }
 
@@ -905,7 +1025,17 @@ onBeforeUnmount(() => {
 .kpi-value.cool { color: #8fe6ff; text-shadow: 0 0 16px rgba(58, 209, 255, 0.55); }
 .kpi-label { font-size: 11px; color: #8ea7d6; letter-spacing: 0.04em; white-space: nowrap; }
 
-.actions { display: flex; gap: 8px; flex: none; }
+.actions { display: flex; gap: 8px; flex: none; align-items: center; }
+.window-switch { display: inline-flex; border: 1px solid rgba(58, 209, 255, 0.22); border-radius: 6px; overflow: hidden; }
+.window-btn { appearance: none; border: 0; background: transparent; color: #7d93b8; font: 11px/1 mono, monospace; padding: 7px 9px; cursor: pointer; }
+.window-btn + .window-btn { border-left: 1px solid rgba(58, 209, 255, 0.18); }
+.window-btn[aria-pressed='true'] { color: #03101f; background: #3ad1ff; }
+.scope-badge { margin-left: 8px; padding: 2px 6px; border: 1px solid rgba(58, 209, 255, 0.3); border-radius: 3px; color: #7d93b8; font: 10px/1 mono, monospace; }
+@media (prefers-reduced-motion: reduce) {
+  .threat-screen::before, .threat-screen::after { animation: none !important; }
+  .hud { backdrop-filter: none; }
+  .glitch, .live-chip i, .scanline, .viewport-grid { animation: none !important; }
+}
 .btn {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 7px 12px;
@@ -1116,8 +1246,18 @@ onBeforeUnmount(() => {
 .timeline-slot { fill: transparent; }
 .timeline-slot:hover { fill: rgba(58, 209, 255, 0.08); }
 .timeline-axis { display: flex; justify-content: space-between; font-size: 10px; color: #56709f; padding-top: 2px; font-variant-numeric: tabular-nums; }
-.normal-stroke { fill: none; stroke: #3ddc84; stroke-width: 1.6; vector-effect: non-scaling-stroke; filter: drop-shadow(0 0 4px rgba(61, 220, 132, 0.5)); }
-.normal-fill { fill: rgba(61, 220, 132, 0.12); }
+.normal-stroke { fill: none; stroke: #38bdf8; stroke-width: 1.6; vector-effect: non-scaling-stroke; filter: drop-shadow(0 0 4px rgba(56, 189, 248, 0.5)); }
+.normal-fill { fill: rgba(56, 189, 248, 0.10); }
+.attack-stroke { fill: none; stroke: #e25454; stroke-width: 1.4; vector-effect: non-scaling-stroke; filter: drop-shadow(0 0 4px rgba(226, 84, 84, 0.5)); }
+.attack-qps { color: #ff7a7a; }
+.traffic-legend { position: absolute; right: 10px; top: 8px; display: flex; align-items: center; gap: 6px; font: 10px/1 mono, monospace; color: #8ea7d6; }
+.traffic-legend .sw { width: 8px; height: 2px; display: inline-block; }
+.traffic-legend .sw.normal { background: #38bdf8; }
+.traffic-legend .sw.attack { background: #e25454; margin-left: 6px; }
+.act { margin-left: auto; font: 10px/1 mono, monospace; padding: 2px 5px; border-radius: 3px; border: 1px solid; }
+.act-blocked { color: #ff8a8a; border-color: rgba(226, 84, 84, 0.5); background: rgba(226, 84, 84, 0.12); }
+.act-logged { color: #ffd166; border-color: rgba(255, 209, 102, 0.45); background: rgba(255, 209, 102, 0.08); }
+.site-unset { color: #ffd166; }
 
 /* 地图引擎根容器适配（引擎内部自管 canvas/标签层） */
 .stage-mount :deep(canvas) { position: absolute !important; inset: 0; outline: none; display: block; }

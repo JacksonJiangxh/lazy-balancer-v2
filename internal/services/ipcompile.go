@@ -29,23 +29,26 @@ func CompileFromIplistFile(iplistPath string) error {
 		return fmt.Errorf("读取 .iplist %s: %w", iplistPath, err)
 	}
 	lines := strings.Split(string(raw), "\n")
-	entries := make([]string, 0, len(lines))
+	// 逐条目只解析一次（历史问题 单源原语）：解析产物直接进聚合，不再
+	// 「校验解析一次 + AggregatePrefixes 再解析一次」。
+	prefixes := make([]netip.Prefix, 0, len(lines))
 	skipped := 0
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
-		if _, err := wafiplist.ParseIPEntry(line); err != nil {
+		prefix, err := wafiplist.ParseIPEntry(line)
+		if err != nil {
 			skipped++
 			continue
 		}
-		entries = append(entries, line)
+		prefixes = append(prefixes, prefix)
 	}
 	if skipped > 0 {
 		Logf("warn", "编译 %s: 跳过 %d 条非法行", iplistPath, skipped)
 	}
-	v4, v6 := aggregateAndSplit(entries)
+	v4, v6 := splitV4V6(wafiplist.AggregateParsedPrefixes(prefixes))
 	return wafiplist.WriteFastFile(wafiplist.FastPath(iplistPath), v4, v6)
 }
 
@@ -54,8 +57,8 @@ func CompileFromIplistFile(iplistPath string) error {
 // 渲染层 per-policy 投影」场景不存在（保存路径从不即时编译，per-policy
 // 投影是 .txt 文本形态不写 .fast）。
 
-// splitV4V6 前缀按地址族分拣（LBS-B-R2，历史：曾双份同型循环的收敛产物，
-// CompileFromPrefixes 删除后由 aggregateAndSplit 单点消费）。
+// splitV4V6 前缀按地址族分拣（LBS-B-R2，历史：曾双份同型循环的收敛产物；
+// 历史 历史问题 起由 .fast 编译单点消费，等价于旧的 aggregateAndSplit 末段）。
 func splitV4V6(prefixes []netip.Prefix) (v4, v6 []netip.Prefix) {
 	for _, p := range prefixes {
 		if p.Addr().Is4() {
@@ -65,9 +68,4 @@ func splitV4V6(prefixes []netip.Prefix) (v4, v6 []netip.Prefix) {
 		}
 	}
 	return v4, v6
-}
-
-// aggregateAndSplit: 条目字符串列表 → CIDR 聚合+排序 → v4/v6 分离
-func aggregateAndSplit(entries []string) ([]netip.Prefix, []netip.Prefix) {
-	return splitV4V6(wafiplist.AggregatePrefixes(entries))
 }

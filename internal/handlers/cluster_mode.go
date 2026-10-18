@@ -43,6 +43,13 @@ func (h *Handlers) SetClusterMode(c *gin.Context) {
 	if name == "" {
 		name = h.cfg.NodeName
 	}
+	// 历史问题-05：与主节点落库侧同一归一（去空白/控制字符/截断 100 rune），
+	// 避免主节点拒绝或把脏名字写入集群。
+	name = models.NormalizeClusterNodeName(name)
+	if name == "" {
+		clusterError(c, http.StatusBadRequest, models.ErrInvalidClusterNodeName.Error(), models.ErrInvalidClusterNodeName)
+		return
+	}
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(req.MasterURL)), "http://") {
 		recordAudit(c, "警告", "集群模式", services.FormatAuditDetail("目标：从节点", "使用明文 HTTP 注册，证书私钥将明文传输，建议改用 HTTPS"))
 	}

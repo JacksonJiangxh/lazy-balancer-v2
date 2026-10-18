@@ -92,3 +92,36 @@ func TestNewProviderFromCredentials_emptyModeErrorDistinguishesAmbiguityFromMiss
 		t.Fatalf("显式未知 mode 须保留原 unsupported 文案, got %v", err)
 	}
 }
+
+// 历史问题（历史）：UI 形态（auth_mode + app_id/app_token 等）是唯一真相——
+// 游离的消费层 mode 字段不得压过它。否则「保存前凭证测试」（UI 形态）与
+// 真实签发（mode 优先）会使用两套不同凭据，验证结论不覆盖实际链路。
+func TestNewProviderFromCredentials_authModeOverridesStrayMode(t *testing.T) {
+	provider, err := NewProviderFromCredentials(`{"auth_mode":"dnspod","app_id":"123","app_token":"abc","mode":"tencent","secret_id":"sid","secret_key":"skey"}`)
+	if err != nil {
+		t.Fatalf("credentials with stray mode: %v", err)
+	}
+	dnspodProvider, ok := provider.(*dnspod.Provider)
+	if !ok {
+		t.Fatalf("provider=%T, want *dnspod.Provider（auth_mode 优先）", provider)
+	}
+	if dnspodProvider.LoginToken != "123,abc" {
+		t.Fatalf("login token=%q, want 123,abc（UI 字段为凭据真相）", dnspodProvider.LoginToken)
+	}
+}
+
+// 历史问题：UI 形态的 app_id/app_token 必须覆盖陈旧 api_token（掩码合并后
+// 两形态并存的短暂状态），保证校验与签发使用同一组凭据。
+func TestNewProviderFromCredentials_uiFieldsOverrideStaleAPIToken(t *testing.T) {
+	provider, err := NewProviderFromCredentials(`{"auth_mode":"dnspod","api_token":"old,old","app_id":"123","app_token":"abc"}`)
+	if err != nil {
+		t.Fatalf("credentials with stale api_token: %v", err)
+	}
+	dnspodProvider, ok := provider.(*dnspod.Provider)
+	if !ok {
+		t.Fatalf("provider=%T, want *dnspod.Provider", provider)
+	}
+	if dnspodProvider.LoginToken != "123,abc" {
+		t.Fatalf("login token=%q, want 123,abc（app_id/app_token 优先）", dnspodProvider.LoginToken)
+	}
+}

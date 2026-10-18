@@ -80,7 +80,7 @@ func (s *FileIPRangeSource) GetIPRanges(r *http.Request) []netip.Prefix {
 	if s.provisioned == "" {
 		return nil // 未 Provision 的防御形态：信任无来源
 	}
-	prefixes, err := wafiplist.ResolvePrefixes(s.provisioned)
+	prefixes, err := wafiplist.ResolvePrefixesNormalized(s.provisioned)
 	if err != nil {
 		// Provision 已保证首次加载成功；此处 error = 缓存被 GC 淘汰且文件
 		// 已消失。空集=信任无来源（fail-closed）。

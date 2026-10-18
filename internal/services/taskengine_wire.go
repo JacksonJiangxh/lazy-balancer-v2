@@ -44,16 +44,18 @@ func SetCertIssuanceLifecycleHooks(start, stop func()) {
 }
 
 // daemonLifecycleRun 常驻生命周期包装：start→阻塞 ctx→stop（nil 挂钩=测试
-// 环境空载体回退）。stop 恒执行（deferred）——StopLoop/角色翻转即真实停服。
+// 环境空载体回退）。stop 恒执行（deferred）：不仅正常停止/角色翻转，start
+// 半启动后 panic 也必须清理（runGuarded 会判定 daemon 已死——已启动的 ACME
+// 队列/同步循环不得残留运行，否则翻转后仍写库/签发）。
 
 func daemonLifecycleRun(rc taskengine.RunContext, start, stop func()) error {
+	if stop != nil {
+		defer stop()
+	}
 	if start != nil {
 		start()
 	}
 	<-rc.Ctx.Done()
-	if stop != nil {
-		stop()
-	}
 	return nil
 }
 
@@ -512,9 +514,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 				if exec == nil {
 					return errors.New("备份执行器未就绪")
 				}
-				return exec("manual", rc.Operator, rc.RunID)
+				return exec(rc.Ctx, "manual", rc.Operator, rc.RunID)
 			}
-			return runAutoBackupScheduled(rc.RunID)
+			return runAutoBackupScheduled(rc.Ctx, rc.RunID)
 		},
 	})
 

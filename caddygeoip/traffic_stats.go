@@ -2,20 +2,20 @@ package caddygeoip
 
 // 全请求实时流量计数（大屏「无 accesslog 光流」数据源，Plan B）：
 //   - per-country 双计数器（attack=安全拦截 isSecurityBlock 同口径；normal=
-//     非 安全中断 的已处理请求）——进程级常驻内存（~250 国 ×2×8B ≈ 4KB），
-//     随进程生命周期，无文件/无 goroutine/无 GC 负担。
+//     非 安全中断 的已处理请求）——进程级常驻内存，国名桶硬上限 512（满员
+//     只丢新键，已有键继续计数），随进程生命周期，无文件/无 goroutine。
 //   - 暴露：SecurityBlockedCounter 实现 caddy.AdminRouter——GET /lb/traffic-stats
 //     请求到达时序列化当前快照（无常驻写者/无激活信号；页面异常关闭零残留）。
 //   - QPS 保险丝：单秒请求计数超过 fuseQPSPerSecond 时进入 1/N 抽样（N=8，
 //     每 N 个请求计 1 次×N 还原），翻秒且上一秒计数低于阈值 1/4 时回落 N=1。
 //     误差口径披露：抽样期估计量=真值±N/2（整秒口径无偏），瞬时分布有量化
 //     误差——大屏光流为密度示意，可接受。
-//   - 国名口径：X-LB-GeoIP-Country 原始国名（xdb 英文名/「中国」），由 app
-//     代理端点翻译为中文（app 单源 geoipnames），本模块不加依赖。
-//   - 统计边界（历史问题）：计数由 geoip2region handler 记入——**仅统计经过
-//     geoip handler 的规则流量**（无 GeoIP 策略的规则不挂该 handler，因此
-//    不进此统计）。大屏流量卡是「已启用地域能力规则的流量」口径，不是全站
-//     请求总量。
+//   - 国名口径：geoip2region 写入的 Caddy 变量 geoip.country_name（xdb 英文
+//     名/「中国」），由 app 代理端点翻译为中文（app 单源 geoipnames）；
+//     客户端请求头不参与计数，本模块不加依赖。
+//   - 统计边界：计数由链尾 lb_security_blocked_counter 执行；国名只来自
+//     geoip2region 的服务端变量。未启用地域能力的规则没有该变量，因此不产生
+//     国名桶；大屏流量卡不是全站请求总量。
 //   - 注册语义：admin 路由进程级注册一次（reload 期新旧实例并存，同路径
 //     二次注册会 panic；路由无实例状态——读全局计数器，实例无关）。
 
@@ -46,10 +46,11 @@ var (
 	trafficSampleN     atomic.Uint32 // 抽样因子 N（1=全量）
 )
 
+// trafficCountryLimit 限定常驻国名桶数量；实际 xdb 国家数远低于此值。
+const trafficCountryLimit = 512
+
 // trafficSecondState 的打包布局。
-const (
-	trafficHitsMask = 0xffffffff
-)
+const trafficHitsMask = 0xffffffff
 
 // trafficBumpSecond 在当前秒计数 +1 并返回 (新 hits, 上一秒 hits, 是否翻秒)。
 func trafficBumpSecond(nowSec uint64) (hits, prevHits uint32, rolled bool) {
@@ -94,6 +95,11 @@ func trafficEntryFor(country string) *trafficEntry {
 	trafficMu.Lock()
 	defer trafficMu.Unlock()
 	if e = trafficCountries[country]; e == nil {
+		// 硬上限兜底：即使未来新增其他调用源，也不能让国家键无界增长。
+		// 满员只丢新键，已有国家继续精确计数。
+		if len(trafficCountries) >= trafficCountryLimit {
+			return nil
+		}
 		e = &trafficEntry{}
 		trafficCountries[country] = e
 	}
@@ -125,6 +131,9 @@ func trafficRecord(country string, attack bool) {
 		n = 1
 	}
 	e := trafficEntryFor(country)
+	if e == nil {
+		return
+	}
 	if attack {
 		e.attack.Add(uint64(n))
 	} else {

@@ -20,7 +20,9 @@ func TestRunCrawlerBotUpdate_taskLifecycleLogsAndTimestamps(t *testing.T) {
 	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
 	defer func() { crawlerIPListFile = oldFile }()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("66.249.66.0/24\n66.249.67.0/24\n"))
+		// 源声明 format=json（官方源同形）：响应必须是合法 JSON——
+		// 历史问题 起 json 源的非 JSON 响应按错误页失败（保留上次快照）。
+		_, _ = w.Write([]byte(`{"prefixes":[{"ipv4Prefix":"66.249.66.0/24"},{"ipv4Prefix":"66.249.67.0/24"}]}`))
 	}))
 	defer ts.Close()
 	if err := ensureCrawlerSources(); err != nil {

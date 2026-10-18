@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -62,7 +61,6 @@ func TestGetMetricsHistory_miniteWindowKeepsRecentData(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.GET("/api/v1/metrics/history", h.GetMetricsHistory)
-	_ = fmt.Sprint()
 	for i := 0; i < 1500; i++ {
 		ts := time.Now().UTC().Add(-time.Duration(i*2) * time.Second).Format("2006-01-02 15:04:05")
 		if _, err := db.MetricsDB.Exec(

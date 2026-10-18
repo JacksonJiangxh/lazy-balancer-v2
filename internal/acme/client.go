@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	mathrand "math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -120,7 +121,11 @@ func newClient(directoryURL, email, dataDir string, eab *acme.ExternalAccountBin
 				// 此前固定 2s 在 CA 5xx 过载时维持约 5 倍请求压力（N+11 D1-S3）。
 				// 注：自定义 RetryBackoff 的返回值即重试延迟本身（x/crypto 不会
 				// 再叠加默认曲线或解析 Retry-After），故曲线在此显式给出。
-				return min(time.Duration(1<<min(n, 4))*time.Second, 10*time.Second)
+				// 历史问题（历史）：自定义曲线会丢失默认实现的 jitter——多规则
+				// 并发签发（max_concurrent>1）在同一 CA 5xx 窗口会以相同延迟同步
+				// 重试（thundering herd）。补 0~1s 均匀抖动（同默认曲线量级）。
+				base := min(time.Duration(1<<min(n, 4))*time.Second, 10*time.Second)
+				return base + time.Duration(mathrand.IntN(1000))*time.Millisecond
 			},
 		},
 		accountKeyPath: acmeAccountKeyPath(dataDir, directoryURL, email, eabKID, eabKey),

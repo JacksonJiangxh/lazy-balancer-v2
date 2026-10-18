@@ -562,9 +562,11 @@ var (
 	// 300~600s）刷新抖动的一个有意义比例：权威快速路径收敛后记录已在权威
 	// 侧生效，但写入前曾应答 NXDOMAIN 的递归解析器会持续返回否定缓存直到
 	// 各自过期。四个受查解析器错峰刷新（缓存到期时间不同），120s 足以等到
-	// 至少一个刷新放行，同时远小于 waitForDNS 的 5min 权威预算，且外层任务
-	// 预算（caExecutionTimeoutFor：单域 30min，每域 +10min，封顶 60min）
-	// 为每域最多 +90s 的最坏增量留足余量（单域最坏 5+2+15min < 30min）。
+	// 至少一个刷新放行，同时远小于 waitForDNS 的 5min 权威预算。
+	// 历史问题（历史）：单域分段预算之和 = 注册 30s + 传播 5m + 本段 2m +
+	// 验证 10m + 就绪 3m + finalize 10m + 有效 5m = 35.5m < 外层
+	// caExecutionTimeout（40m，services/caqueue.go）——原注释的
+	// 「5+2+15min < 30min」算式漏计就绪/finalize/有效三段且外层值错误。
 	recursiveDNSDeadline = 120 * time.Second
 )
 
@@ -593,13 +595,18 @@ func (i *Issuer) checkRecursiveDNS(ctx context.Context, fqdn, expected string) b
 		case <-deadline:
 			return false
 		case <-ticker.C:
-			for _, r := range propagationRecursiveResolvers {
-				if hit, _, _ := probeTXT(ctx, r, fqdn, expected, true); hit {
-					if i.Logger != nil {
-						i.Logger.Log("waiting_propagation", fmt.Sprintf("递归 DNS 已命中 %s @ %s", fqdn, r))
-					}
-					return true
+			// 历史问题（历史）：复用 waitForDNS 的并行探测（历史问题）——逐台串行时
+			// 一台黑洞解析器（UDP/TCP 双 8s）会把单轮拖到 ~32s，120s 预算仅剩
+			// ≈3 轮；并行后单轮上界≈单台最坏耗时。结果按输入顺序回填，命中即放行
+			// （语义不变：任意 1 台可见）。
+			for _, probe := range probeRecursiveParallel(ctx, propagationRecursiveResolvers, fqdn, expected) {
+				if !probe.hit {
+					continue
 				}
+				if i.Logger != nil {
+					i.Logger.Log("waiting_propagation", fmt.Sprintf("递归 DNS 已命中 %s @ %s", fqdn, probe.resolver))
+				}
+				return true
 			}
 		}
 	}
@@ -759,6 +766,22 @@ func probeTXT(ctx context.Context, server, fqdn, expected string, recursion bool
 	return false, nil, lastErr
 }
 
+// ipv6EgressAvailable 报告本机是否存在可用 IPv6 出口（测试缝：var 而非直接
+// 调用，测试按固定答案替换；生产代码不得改写）。
+var ipv6EgressAvailable = detectIPv6Egress
+
+// detectIPv6Egress 用 UDP Dial 查询本机路由表：UDP 不发送报文，无 v6 地址/
+// 默认路由时立即失败。探测目标为 Google Public DNS 的 v6 地址（无需可达——
+// 仅需本机有 v6 路由）。
+func detectIPv6Egress() bool {
+	conn, err := net.DialTimeout("udp6", "[2001:4860:4860::8888]:53", time.Second)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
 // resolveAuthoritativeNS finds the authoritative name servers of fqdn's zone
 // by walking up the domain labels and querying NS records through a public
 // recursive resolver, then resolves the servers' addresses. Best-effort:
@@ -803,8 +826,15 @@ func resolveAuthoritativeNS(ctx context.Context, fqdn, bootstrap string) []strin
 	// Resolve addresses of each name server.
 	seen := make(map[string]bool)
 	var servers []string
+	// 历史问题（历史）：本机无 IPv6 出口时预筛 AAAA——纯 v6 权威在无 v6 出口
+	// 网络里每台 UDP/TCP 双 8s 白耗，且 AAAA 查询本身也是无用往返。能力探测
+	// 仅查本机路由表（UDP Dial 不发报文），不是网络可用性断言。
+	qtypes := []uint16{dns.TypeA, dns.TypeAAAA}
+	if !ipv6EgressAvailable() {
+		qtypes = qtypes[:1]
+	}
 	for _, ns := range nsNames {
-		for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		for _, qtype := range qtypes {
 			r := query(ns, qtype)
 			if r == nil {
 				continue

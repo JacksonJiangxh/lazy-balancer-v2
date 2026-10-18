@@ -78,36 +78,41 @@ func GetCertExpiryThreshold() int {
 // 级留痕库值，禁止静默改写。
 func GetCertRenewalDays() int {
 	// SVC-F2（历史）：未初始化库回退默认 30 天（同 GetCertExpiryThreshold）。
+	// 历史问题（历史）：读侧直读库值零兜底——启动回填保证 NULL/<=0 已收敛，
+	// 此后的无效值只可能来自运行期带外直写，显性留痕降级。
 	if db.DB == nil {
-		return 30
+		return db.DefaultCertRenewalDays
 	}
 	var days int
-	err := db.DB.QueryRow("SELECT COALESCE(cert_renewal_days, 30) FROM global_config WHERE id = 1").Scan(&days)
+	err := db.DB.QueryRow("SELECT cert_renewal_days FROM global_config WHERE id = 1").Scan(&days)
 	if err != nil {
-		Logf("error", "GetCertRenewalDays: failed to read global_config, using default 30: %v", err)
-		return 30
+		Logf("error", "GetCertRenewalDays: failed to read global_config, using default %d: %v", db.DefaultCertRenewalDays, err)
+		return db.DefaultCertRenewalDays
 	}
 	if days <= 0 {
-		Logf("error", "GetCertRenewalDays: cert_renewal_days 库值无效（%d <=0）——写侧下界 1 已钳制，疑似带外直写/旧导入；本轮降级默认 30 留痕", days)
-		return 30
+		Logf("error", "GetCertRenewalDays: cert_renewal_days 库值无效（%d <=0）——启动回填 1-365 之外的最后防线，疑似带外直写/旧导入；本轮降级默认 %d 留痕", days, db.DefaultCertRenewalDays)
+		return db.DefaultCertRenewalDays
 	}
 	return days
 }
 
 // GetCertRenewalAttempts returns the configured max renewal attempts.
+// 历史问题（历史）：与 GetCertRenewalDays 同口径——直读库值、无效值 error 级
+// 留痕（此前 <=0 静默返回 5，排障无法区分「配置为 0」与「读失败」）。
 func GetCertRenewalAttempts() int {
 	// SVC-F2（历史）：未初始化库回退默认 5 次（同 GetCertExpiryThreshold）。
 	if db.DB == nil {
-		return 5
+		return db.DefaultCertRenewalAttempts
 	}
 	var attempts int
-	err := db.DB.QueryRow("SELECT COALESCE(cert_renewal_attempts, 5) FROM global_config WHERE id = 1").Scan(&attempts)
+	err := db.DB.QueryRow("SELECT cert_renewal_attempts FROM global_config WHERE id = 1").Scan(&attempts)
 	if err != nil {
-		Logf("error", "GetCertRenewalAttempts: failed to read global_config, using default 5: %v", err)
-		return 5
+		Logf("error", "GetCertRenewalAttempts: failed to read global_config, using default %d: %v", db.DefaultCertRenewalAttempts, err)
+		return db.DefaultCertRenewalAttempts
 	}
 	if attempts <= 0 {
-		return 5
+		Logf("error", "GetCertRenewalAttempts: cert_renewal_attempts 库值无效（%d <=0）——启动回填之外的最后防线，疑似带外直写/旧导入；本轮降级默认 %d 留痕", attempts, db.DefaultCertRenewalAttempts)
+		return db.DefaultCertRenewalAttempts
 	}
 	return attempts
 }

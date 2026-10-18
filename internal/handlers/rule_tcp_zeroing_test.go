@@ -221,7 +221,8 @@ func TestUpdateRule_tcpEditHealsHTTPOnlyFieldFamily(t *testing.T) {
 // LBH-A-N1（历史 历史问题）：NTLM 接管态（td=-1，方案 C 库级表达）随
 // http→tcp 切换命中校验死端——指针合并（rules.go nil=沿用存量）把 -1 带进
 // TCP 值域门（rule_features.go TCP 分支拒负值），400 指向用户从未提交的字段，
-// UI 无自救路径。切换路径负值自愈归零（0=默认 5s 窗口）；非负间隔不受波及。
+// UI 无自救路径。切换路径负值自愈归零（TCP 语义：0/-1 均为不重试；5s
+// 默认窗口仅属 HTTP）；非负间隔不受波及。
 func TestUpdateRule_switchToTCPHealsNegativeTryDurationFromNTLMState(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -508,5 +509,88 @@ func TestUpdateRule_httpEditDropsTCPOnlyFields(t *testing.T) {
 	}
 	if port != 0 || proxy != 0 {
 		t.Fatalf("http edit must clear TCP-only fields, got port=%d proxy=%d", port, proxy)
+	}
+}
+
+// LBH79-历史问题.4：HTTP 源行的 TCP-only 残留（tcp_health_check_port/
+// tcp_proxy_protocol）不得随复制放大——Create/Update 已反向清零，复制
+// 路径此前只处理 TCP 源行。
+func TestDuplicateRule_httpCopyClearsTCPOnlyFields(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules/:caddy_id/duplicate", handler.DuplicateRule)
+
+	// Given：HTTP 源行直改 DB 携带 TCP-only 字段
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,tcp_health_check_port,tcp_proxy_protocol)
+		VALUES ('lb_httpduptcp','http-dup-tcp','','http','httpduptcp.test',18830,'weighted_round_robin',1,99,1)`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_httpduptcp','up.test',80,1,1,'http')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+
+	// When
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_httpduptcp/duplicate", nil))
+
+	// Then：副本 TCP-only 列归零
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s, want 201", response.Code, response.Body.String())
+	}
+	var port, proxy int
+	if err := db.DB.QueryRow(`SELECT COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0) FROM lb_rules WHERE name='http-dup-tcp（副本）'`).
+		Scan(&port, &proxy); err != nil {
+		t.Fatalf("read copy: %v", err)
+	}
+	if port != 0 || proxy != 0 {
+		t.Fatalf("HTTP 副本携带 TCP-only 残留: tcp_health_check_port=%d tcp_proxy_protocol=%d, want 0/0", port, proxy)
+	}
+}
+
+// LBH79-历史问题.1/04.2/04.3：同协议 TCP 编辑必须自愈健康检查域名、上游回源
+// 域名与死证书/私钥材料（此前只在协议切换分支清理，或 SQL 写入条件不命中）。
+func TestUpdateRule_tcpEditClearsHTTPOnlyAndTLSResidue(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+
+	// Given：直改 DB 的 TCP 行携带 HTTP-only / TLS 死材料
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,
+		health_check_host,tls_cert,tls_key,tls_source)
+		VALUES ('lb_tcpresidue','tcp-residue','','tcp','',18831,'weighted_round_robin',1,
+		'probe.example','CERT-PEM','KEY-PEM','manual')`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol,origin_domain)
+		VALUES ('lb_tcpresidue','up.test',9000,1,1,'tcp','origin.example')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+
+	// When：同协议编辑（纯改名）
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_tcpresidue", strings.NewReader(`{"name":"tcp-residue-renamed"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+
+	// Then：200 且三类残留全部清零
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var healthCheckHost, tlsCert, tlsKey string
+	if err := db.DB.QueryRow(`SELECT COALESCE(health_check_host,''), COALESCE(tls_cert,''), COALESCE(tls_key,'') FROM lb_rules WHERE caddy_id='lb_tcpresidue'`).
+		Scan(&healthCheckHost, &tlsCert, &tlsKey); err != nil {
+		t.Fatalf("read rule: %v", err)
+	}
+	if healthCheckHost != "" || tlsCert != "" || tlsKey != "" {
+		t.Fatalf("TCP 编辑未清残留: health_check_host=%q tls_cert=%q tls_key=%q", healthCheckHost, tlsCert, tlsKey)
+	}
+	var originDomain string
+	if err := db.DB.QueryRow(`SELECT COALESCE(origin_domain,'') FROM upstreams WHERE rule_id='lb_tcpresidue'`).Scan(&originDomain); err != nil {
+		t.Fatalf("read upstream: %v", err)
+	}
+	if originDomain != "" {
+		t.Fatalf("TCP 编辑未清上游回源域名: %q", originDomain)
 	}
 }

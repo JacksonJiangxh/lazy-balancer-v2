@@ -43,6 +43,8 @@ type mockIdP struct {
 	// usePref/prefUsername:覆盖 id_token 的 preferred_username(测空白用户名形状)
 	usePref      bool
 	prefUsername string
+	// claimName:覆盖 id_token 的 name（U04c-06：重复登录刷新显示名）
+	claimName atomic.Value
 	// nonceByChallenge:PKCE challenge → nonce——并发双登录各自 authorize 后,
 	// 令牌交换按 code_verifier 派生 challenge 回查本登录的 nonce(单登录场景
 	// lastNonce 兜底同值)。
@@ -136,9 +138,10 @@ func newMockIdP(t *testing.T) *mockIdP {
 			pref = m.prefUsername
 		}
 		now := time.Now()
+		name, _ := m.claimName.Load().(string)
 		tok := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
 			"iss": m.issuer, "aud": "test-client", "sub": "user-sub-1",
-			"email": "oidc@example.com", "preferred_username": pref,
+			"email": "oidc@example.com", "preferred_username": pref, "name": name,
 			"nonce": nonce, "iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
 		})
 		signed, _ := tok.SignedString(key)

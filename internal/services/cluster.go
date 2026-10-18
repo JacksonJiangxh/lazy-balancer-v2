@@ -51,7 +51,39 @@ type ClusterService struct {
 }
 
 func NewClusterService(database *sql.DB, dataDir string) *ClusterService {
-	return &ClusterService{db: database, dataDir: dataDir, snapshotNow: time.Now, sectionReports: make(map[int]map[string]string)}
+	service := &ClusterService{db: database, dataDir: dataDir, snapshotNow: time.Now, sectionReports: make(map[int]map[string]string)}
+	registerClusterService(service)
+	return service
+}
+
+// clusterServices 按数据库句柄登记集群服务实例（与 syncDrainers 同模式），
+// 供主节点巡检周期（masterSyncServingRound，无 ClusterService 接收者的自由
+// 函数）触达提升后 pin 清理重试（历史问题-07）。用 *sql.DB 作键隔离测试实例；
+// 同一库可能登记多个实例（NewSyncService 内部也构造一个 ClusterService），
+// 而 pending pin 状态是实例本地的——因此按库保留全部实例、逐个重试，
+// 不依赖构造顺序决定谁是「当前」实例。
+var (
+	clusterServicesMu sync.Mutex
+	clusterServices   = map[*sql.DB][]*ClusterService{}
+)
+
+func registerClusterService(service *ClusterService) {
+	if service == nil || service.db == nil {
+		return
+	}
+	clusterServicesMu.Lock()
+	clusterServices[service.db] = append(clusterServices[service.db], service)
+	clusterServicesMu.Unlock()
+}
+
+func clusterServicesFor(database *sql.DB) []*ClusterService {
+	if database == nil {
+		return nil
+	}
+	clusterServicesMu.Lock()
+	services := append([]*ClusterService(nil), clusterServices[database]...)
+	clusterServicesMu.Unlock()
+	return services
 }
 
 func randomHex(byteCount int) (string, error) {
@@ -93,6 +125,23 @@ func (s *ClusterService) GenerateRegisterToken(ctx context.Context, createdBy in
 func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterRegisterRequest, now time.Time) (models.ClusterRegistration, error) {
 	if err := models.ValidateClusterAccessURL(req.AccessURL); err != nil {
 		return models.ClusterRegistration{}, err
+	}
+	// 历史问题-05：落库侧名字归一是最后一道闸（binding max=100 只覆盖 HTTP
+	// 入口；服务层直调/旧客户端仍可传入超长或带控制字符的名字）。
+	req.Name = models.NormalizeClusterNodeName(req.Name)
+	if req.Name == "" {
+		return models.ClusterRegistration{}, models.ErrInvalidClusterNodeName
+	}
+	// 历史问题-06：自述 access_url 只在主机即注册来源 IP 时落库。该值随后被用作
+	// 服务控制/登录票据（Bearer 能力凭证）的投递地址——未校验时持有注册令牌
+	// 的一方可把票据引向任意第三方主机。不一致时按「未携带」处理：既有行的
+	// 管理员配置值由 COALESCE(NULLIF(?,''),access_url) 保留，新行留空回退
+	// protocol://ip:port。
+	accessURL := req.AccessURL
+	accessURLIgnored := false
+	if accessURL != "" && !models.ClusterAccessURLHostMatchesIP(accessURL, req.IPAddress) {
+		accessURL = ""
+		accessURLIgnored = true
 	}
 	if req.Port == 0 {
 		req.Port = 8000
@@ -141,9 +190,9 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 		}
 		// 历史问题(历史):access_url 是管理员配置态——重新注册不携带
 		// (cluster_mode.go:49-51 恒空)时保留存量,不静默清空。
-		_, err = tx.ExecContext(ctx, `UPDATE nodes SET name=?, protocol=?, access_url=COALESCE(NULLIF(?,''),access_url), status='pending', is_approved=0, registration_secret=?, registration_secret_expires_at=NULL, cluster_token_hash=NULL, cluster_token_delivered=0, reported_version=0, health_json=NULL, last_seen=NULL WHERE id=?`, req.Name, req.Protocol, req.AccessURL, tokenHash(secret), nodeID)
+		_, err = tx.ExecContext(ctx, `UPDATE nodes SET name=?, protocol=?, access_url=COALESCE(NULLIF(?,''),access_url), status='pending', is_approved=0, registration_secret=?, registration_secret_expires_at=NULL, cluster_token_hash=NULL, cluster_token_delivered=0, reported_version=0, health_json=NULL, last_seen=NULL WHERE id=?`, req.Name, req.Protocol, accessURL, tokenHash(secret), nodeID)
 	case errors.Is(err, sql.ErrNoRows):
-		insert, insertErr := tx.ExecContext(ctx, `INSERT INTO nodes (name, mode, ip_address, port, protocol, access_url, status, is_approved, registration_secret) VALUES (?, 'slave', ?, ?, ?, ?, 'pending', 0, ?)`, req.Name, req.IPAddress, req.Port, req.Protocol, req.AccessURL, tokenHash(secret))
+		insert, insertErr := tx.ExecContext(ctx, `INSERT INTO nodes (name, mode, ip_address, port, protocol, access_url, status, is_approved, registration_secret) VALUES (?, 'slave', ?, ?, ?, ?, 'pending', 0, ?)`, req.Name, req.IPAddress, req.Port, req.Protocol, accessURL, tokenHash(secret))
 		if insertErr != nil {
 			return models.ClusterRegistration{}, fmt.Errorf("创建待审批节点: %w", insertErr)
 		}
@@ -162,7 +211,7 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 	if err := tx.Commit(); err != nil {
 		return models.ClusterRegistration{}, fmt.Errorf("提交节点注册: %w", err)
 	}
-	return models.ClusterRegistration{RegistrationID: nodeID, RegistrationSecret: secret, OverwrittenNodeID: overwrittenNodeID, OverwrittenNodeName: overwrittenNodeName}, nil
+	return models.ClusterRegistration{RegistrationID: nodeID, RegistrationSecret: secret, OverwrittenNodeID: overwrittenNodeID, OverwrittenNodeName: overwrittenNodeName, AccessURLIgnored: accessURLIgnored}, nil
 }
 
 func (s *ClusterService) UpdateNodeAccessURL(ctx context.Context, nodeID int, accessURL string) error {
@@ -334,6 +383,12 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	}
 	promoted = true
 	ResetConfigDrift()
+	// 历史问题：升主后以本地 DB 重建爬虫运行快照——从节点期间的快照可能
+	// 陈旧/缺失（此前仅主节点 Prime/更新任务写该文件），升主后本节点将成为
+	// 插件文件的生产者。失败仅留痕（下轮更新/重启收敛）。
+	if err := RebuildCrawlerIPListSnapshot(); err != nil {
+		Logf("warn", "Promote: 爬虫运行快照重建失败（插件按旧快照运行至下次更新）: %v", err)
+	}
 
 	if registrationID > 0 {
 		RecordAuditLog("system", "提升完成", "集群节点", FormatAuditDetail(fmt.Sprintf("注册编号：%d", registrationID), "本节点已脱离集群并提升为主节点", AuditResultPart("success")), "")

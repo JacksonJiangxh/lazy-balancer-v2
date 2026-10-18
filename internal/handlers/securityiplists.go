@@ -521,12 +521,14 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 	{
 		var raw string
 		if qerr := db.DB.QueryRow(`SELECT COALESCE(trusted_proxy_range_refs,'[]') FROM global_config WHERE id=1`).Scan(&raw); qerr != nil {
-			// 与删除守卫同口径 fail-closed：查询失败按「可能被引用」展示（不假绿）。
-			services.Logf("warn", "受信代理引用面查询失败（名单引用视图可能不完整）: %v", qerr)
-		} else {
-			for _, id := range parseIPListRefsIDs(raw) {
-				trustedProxyRefs[id] = true
-			}
+			// 历史问题：与删除守卫同口径 fail-closed——查询失败时不得把引用面
+			// 展示为空（页面「无引用可删」与删除 409/500 自相矛盾）；显式
+			// 500 让运维区分「真无引用」与「观测失败」。
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取受信代理引用失败"})
+			return
+		}
+		for _, id := range parseIPListRefsIDs(raw) {
+			trustedProxyRefs[id] = true
 		}
 	}
 	// RDB 文件化：威胁库条数以 threat_sources 为准（DB entries 恒空）
@@ -1155,13 +1157,21 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 	}
 	// 历史问题：删后形态若使任一启用 allow 策略的生效集合为空（fail-open），
 	// 拒绝移除（409）；只有策略 inline 或其他引用名单仍有条目时才允许清空。
+	// 历史问题（历史）：判据必须用**过滤到期后**的有效集合——导入/带外
+	// 名单可含 expires_at，移除最后一个未到期条目后仅剩过期条目，原始 len>0
+	// 会绕过守卫；渲染侧（AutobanActiveEntries）的生效集合已为空。
 	listID, idErr := strconv.ParseInt(id, 10, 64)
 	if idErr != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的列表 id"})
 		return
 	}
-	if len(kept) == 0 {
-		keptValues := make([]string, 0)
+	keptValues := make([]string, 0, len(kept))
+	for _, entry := range services.AutobanActiveEntries(kept) {
+		if entry.Value != "" {
+			keptValues = append(keptValues, entry.Value)
+		}
+	}
+	if len(keptValues) == 0 {
 		blocked, berr := allowEmptyingBlockedByPolicies(tx, listID, keptValues)
 		if berr != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "校验 IP 列表引用失败: " + berr.Error()})

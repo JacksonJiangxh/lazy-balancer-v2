@@ -132,10 +132,14 @@ func (s *ClusterService) ValidateLoginTicket(ctx context.Context, ticket string,
 	}
 	var claims models.ClusterLoginTicketClaims
 	if err := json.Unmarshal(payload, &claims); err != nil || claims.UserID <= 0 || claims.Username == "" || claims.JTI == "" || claims.NodeID != registrationID {
-		return models.ClusterLoginTicketClaims{}, models.User{}, 0, ErrInvalidLoginTicket
+		return claims, models.User{}, 0, ErrInvalidLoginTicket
 	}
+	// 历史问题-08：以下全部失败分支的 claims 均已通过 HMAC 验签（主体身份可信），
+	// 必须随错误返回——此前一律返回零值，票据登录失败审计的 actor 恒为空，
+	// 「谁的票据被重放/过期」这两类最需取证的票据事件无法归因。未验签分支
+	// （上方签名/载荷解析失败）保持零值，不得凭空归因。
 	if claims.ExpiresAt <= now.UTC().Unix() {
-		return models.ClusterLoginTicketClaims{}, models.User{}, 0, errors.Join(ErrInvalidLoginTicket, ErrLoginTicketExpired)
+		return claims, models.User{}, 0, errors.Join(ErrInvalidLoginTicket, ErrLoginTicketExpired)
 	}
 	var user models.User
 	var passwordVersion int64
@@ -144,28 +148,28 @@ func (s *ClusterService) ValidateLoginTicket(ctx context.Context, ticket string,
 		Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &passwordVersion, &authProvider)
 	user.AuthProvider = authProvider
 	if errors.Is(err, sql.ErrNoRows) || err == nil && (!user.IsEnabled || user.Username != claims.Username) {
-		return models.ClusterLoginTicketClaims{}, models.User{}, 0, errors.Join(ErrInvalidLoginTicket, ErrLoginTicketUserUnavailable)
+		return claims, models.User{}, 0, errors.Join(ErrInvalidLoginTicket, ErrLoginTicketUserUnavailable)
 	}
 	if err != nil {
-		return models.ClusterLoginTicketClaims{}, models.User{}, 0, fmt.Errorf("读取登录票据用户: %w", err)
+		return claims, models.User{}, 0, fmt.Errorf("读取登录票据用户: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM used_login_tickets WHERE expires_at<=?", now.UTC()); err != nil {
-		return models.ClusterLoginTicketClaims{}, models.User{}, 0, fmt.Errorf("清理过期登录票据: %w", err)
+		return claims, models.User{}, 0, fmt.Errorf("清理过期登录票据: %w", err)
 	}
 	jtiHash := sha256.Sum256([]byte(claims.JTI))
 	result, err := tx.ExecContext(ctx, `INSERT INTO used_login_tickets (jti_hash,expires_at) VALUES (?,?) ON CONFLICT(jti_hash) DO NOTHING`, hex.EncodeToString(jtiHash[:]), time.Unix(claims.ExpiresAt, 0).UTC())
 	if err != nil {
-		return models.ClusterLoginTicketClaims{}, models.User{}, 0, fmt.Errorf("消费登录票据: %w", err)
+		return claims, models.User{}, 0, fmt.Errorf("消费登录票据: %w", err)
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
-		return models.ClusterLoginTicketClaims{}, models.User{}, 0, fmt.Errorf("读取登录票据消费结果: %w", err)
+		return claims, models.User{}, 0, fmt.Errorf("读取登录票据消费结果: %w", err)
 	}
 	if inserted != 1 {
-		return models.ClusterLoginTicketClaims{}, models.User{}, 0, errors.Join(ErrInvalidLoginTicket, ErrLoginTicketReplay)
+		return claims, models.User{}, 0, errors.Join(ErrInvalidLoginTicket, ErrLoginTicketReplay)
 	}
 	if err := tx.Commit(); err != nil {
-		return models.ClusterLoginTicketClaims{}, models.User{}, 0, fmt.Errorf("提交登录票据消费: %w", err)
+		return claims, models.User{}, 0, fmt.Errorf("提交登录票据消费: %w", err)
 	}
 	return claims, user, passwordVersion, nil
 }

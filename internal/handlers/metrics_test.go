@@ -42,8 +42,10 @@ type metricsCursorErrorRows struct {
 	read bool
 }
 
+// U04d-10：列必须与 GetRuleMetricsHistory 的 SELECT 完全一致（9 列，含
+// requests_blocked）——原 8 列让首次 Scan 就失败，游标中断分支从未执行。
 func (*metricsCursorErrorRows) Columns() []string {
-	return []string{"timestamp", "requests_total", "requests_2xx", "requests_3xx", "requests_4xx", "requests_5xx", "bytes_in", "bytes_out"}
+	return []string{"timestamp", "requests_total", "requests_2xx", "requests_3xx", "requests_4xx", "requests_5xx", "requests_blocked", "bytes_in", "bytes_out"}
 }
 func (*metricsCursorErrorRows) Close() error { return nil }
 func (r *metricsCursorErrorRows) Next(dest []driver.Value) error {
@@ -51,7 +53,9 @@ func (r *metricsCursorErrorRows) Next(dest []driver.Value) error {
 		return errors.New("cursor interrupted")
 	}
 	r.read = true
-	dest[0] = time.Now()
+	// 时间戳必须是处理器可解析的布局（time.Time 经驱动转换后无法按
+	// "2006-01-02 15:04:05" 解析，会在时间解析分支提前 500）。
+	dest[0] = "2026-10-18 00:00:00"
 	for i := 1; i < len(dest); i++ {
 		dest[i] = int64(i)
 	}
@@ -70,6 +74,66 @@ func newMetricsTestDatabase(t *testing.T) {
 	})
 }
 
+func TestMetricsHandlers_useDedicatedCaddyMetricsURL(t *testing.T) {
+	// Given：admin 与 Prometheus 指标端点分离；admin 端点故意返回 503。
+	tests := []struct {
+		name  string
+		mount func(*gin.Engine, *Handlers)
+		path  string
+	}{
+		{name: "caddy metrics", mount: func(r *gin.Engine, h *Handlers) { r.GET("/metrics", h.GetCaddyMetrics) }, path: "/metrics"},
+		{name: "host metrics", mount: func(r *gin.Engine, h *Handlers) { r.GET("/metrics", h.GetHostMetrics) }, path: "/metrics"},
+		{name: "rule metrics", mount: func(r *gin.Engine, h *Handlers) { r.GET("/rules/:caddy_id/metrics", h.GetRuleMetrics) }, path: "/rules/lb_metrics_url/metrics"},
+		{name: "dashboard", mount: func(r *gin.Engine, h *Handlers) { r.GET("/dashboard", h.GetMetricsDashboard) }, path: "/dashboard"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			newMetricsTestDatabase(t)
+			if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_metrics_url','metrics','http','metrics.example.test',80,1)`); err != nil {
+				t.Fatal(err)
+			}
+			metricsDashboardCache.Lock()
+			metricsDashboardCache.payload = nil
+			metricsDashboardCache.expiresAt = time.Time{}
+			metricsDashboardCache.Unlock()
+			t.Cleanup(func() {
+				metricsDashboardCache.Lock()
+				metricsDashboardCache.payload = nil
+				metricsDashboardCache.expiresAt = time.Time{}
+				metricsDashboardCache.Unlock()
+			})
+			adminHits, metricsHits := 0, 0
+			admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				adminHits++
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			defer admin.Close()
+			metrics := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				metricsHits++
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("caddy_http_requests_total 100\n"))
+			}))
+			defer metrics.Close()
+			cfg := &config.Config{CaddyAdminURL: admin.URL, CaddyMetricsURL: metrics.URL + "/metrics"}
+			h := &Handlers{cfg: cfg, metricsService: services.NewMetricsService(cfg.CaddyMetricsURL, 30)}
+			router := gin.New()
+			test.mount(router, h)
+
+			// When
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, test.path, nil))
+
+			// Then：四个消费面都直读 CaddyMetricsURL，绝不回退/拼接 admin URL。
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s, want dedicated metrics endpoint 200", response.Code, response.Body.String())
+			}
+			if adminHits != 0 || metricsHits != 1 {
+				t.Fatalf("hits admin=%d metrics=%d, want 0/1", adminHits, metricsHits)
+			}
+		})
+	}
+}
+
 func TestGetCaddyMetrics_propagates_request_cancellation(t *testing.T) {
 	// Given
 	requestStarted := make(chan struct{})
@@ -82,7 +146,7 @@ func TestGetCaddyMetrics_propagates_request_cancellation(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	h := &Handlers{cfg: &config.Config{CaddyAdminURL: server.URL}}
+	h := &Handlers{cfg: &config.Config{CaddyAdminURL: server.URL, CaddyMetricsURL: server.URL + "/metrics"}}
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.GET("/metrics", h.GetCaddyMetrics)
@@ -113,7 +177,7 @@ func TestGetCaddyMetrics_returns_bad_gateway_on_caddy_error_status(t *testing.T)
 		_, _ = w.Write([]byte("unavailable"))
 	}))
 	defer server.Close()
-	h := &Handlers{cfg: &config.Config{CaddyAdminURL: server.URL}}
+	h := &Handlers{cfg: &config.Config{CaddyAdminURL: server.URL, CaddyMetricsURL: server.URL + "/metrics"}}
 	router := gin.New()
 	router.GET("/metrics", h.GetCaddyMetrics)
 
@@ -152,9 +216,13 @@ func TestGetRuleMetricsHistory_returns_error_when_cursor_fails(t *testing.T) {
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/rules/lb_history/metrics-history", nil))
 
-	// Then
+	// Then：U04d-10——必须真正到达 rows.Err() 分支（原假驱动列数 8 vs Scan 9
+	// 让首次 Scan 即以列数不匹配 500，游标中断分支从未被覆盖）。
 	if response.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "cursor interrupted") {
+		t.Fatalf("body=%s, want 携带驱动的游标中断错误（证明到达 rows.Err 分支）", response.Body.String())
 	}
 }
 
@@ -223,7 +291,7 @@ func TestGetMetricsDashboard_cachesCaddyFetchWithinTTL(t *testing.T) {
 		_, _ = w.Write([]byte("caddy_http_requests_total 100\n"))
 	}))
 	defer server.Close()
-	h := &Handlers{cfg: &config.Config{CaddyAdminURL: server.URL}, metricsService: services.NewMetricsService(server.URL, 30)}
+	h := &Handlers{cfg: &config.Config{CaddyAdminURL: server.URL, CaddyMetricsURL: server.URL + "/metrics"}, metricsService: services.NewMetricsService(server.URL, 30)}
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.GET("/metrics/dashboard", h.GetMetricsDashboard)

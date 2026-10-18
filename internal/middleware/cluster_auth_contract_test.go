@@ -93,6 +93,54 @@ func newClusterAuthContractRouter(database *sql.DB) *gin.Engine {
 	return router
 }
 
+func TestClusterAuthMiddlewares_mapDatabaseFailuresTo500(t *testing.T) {
+	t.Run("cluster token", func(t *testing.T) {
+		// Given：非空有效形态凭证 + 已关闭数据库（基础设施故障而非凭证无效）。
+		database, token := newClusterAuthContractDatabase(t)
+		if err := database.Close(); err != nil {
+			t.Fatal(err)
+		}
+		router := newClusterAuthContractRouter(database)
+		request := httptest.NewRequest(http.MethodGet, "/cluster", nil)
+		request.Header.Set("X-Cluster-Token", token)
+		response := httptest.NewRecorder()
+
+		// When
+		router.ServeHTTP(response, request)
+
+		// Then
+		if response.Code != http.StatusInternalServerError {
+			t.Fatalf("status=%d body=%s, want 500 for database failure", response.Code, response.Body.String())
+		}
+	})
+	t.Run("registration secret", func(t *testing.T) {
+		database, err := sql.Open("sqlite", t.TempDir()+"/registration-auth-failure.db")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = database.Close() })
+		if _, err := database.Exec(`CREATE TABLE nodes (id INTEGER PRIMARY KEY, registration_secret TEXT, registration_secret_expires_at DATETIME)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := database.Close(); err != nil {
+			t.Fatal(err)
+		}
+		router := gin.New()
+		router.GET("/cluster/register/:id/status", registrationAuth(database), func(c *gin.Context) { c.Status(http.StatusOK) })
+		request := httptest.NewRequest(http.MethodGet, "/cluster/register/7/status", nil)
+		request.Header.Set("X-Registration-Secret", "non-empty-secret")
+		response := httptest.NewRecorder()
+
+		// When
+		router.ServeHTTP(response, request)
+
+		// Then
+		if response.Code != http.StatusInternalServerError {
+			t.Fatalf("status=%d body=%s, want 500 for database failure", response.Code, response.Body.String())
+		}
+	})
+}
+
 // 历史问题(历史):AuthenticateRegistrationSecret 哈希比对改常量时间
 // (镜像 services/cluster.go RegistrationStatus 的 历史问题 形态)——防御一致性
 // 改写,无行为差异。本测试为基线钉(非 RED):钉住改写前后契约不变——

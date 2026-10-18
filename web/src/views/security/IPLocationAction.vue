@@ -268,8 +268,9 @@ const loadIpLists = async (): Promise<void> => {
     })
     ipListEntries.value = { ...sharedEntriesCache }
   } catch {
+    // 单弹层加载失败不清全局共享缓存：其它组件可能仍持有有效条目；
+    // 下次 ensureSharedEntries 会按名单 ID 自行重拉。
     ipLists.value = []
-    invalidateSharedEntriesCache()
   }
 }
 

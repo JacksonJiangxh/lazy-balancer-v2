@@ -69,6 +69,12 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 			clusterError(c, http.StatusUnauthorized, "注册令牌无效或已过期", err)
 			return
 		}
+		if errors.Is(err, models.ErrInvalidClusterNodeName) {
+			// 历史问题-05：归一后为空的节点名属客户端可修正输入，映射 400。
+			services.RecordAuditLog("system", "注册失败", "集群节点", services.FormatAuditDetail(registerAuditField(req.Name), registerAuditField(req.IPAddress), err.Error()), c.ClientIP())
+			clusterError(c, http.StatusBadRequest, err.Error(), err)
+			return
+		}
 		services.RecordAuditLog("system", "注册失败", "集群节点", services.FormatAuditDetail(registerAuditField(req.Name), registerAuditField(req.IPAddress), err.Error()), c.ClientIP())
 		clusterError(c, http.StatusInternalServerError, "节点注册失败", err)
 		return
@@ -81,6 +87,12 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 		overwritten := fmt.Sprintf("已覆盖节点 #%d（%s）", registration.OverwrittenNodeID, registerAuditField(registration.OverwrittenNodeName))
 		auditParts = append(auditParts, overwritten)
 		message = "注册成功，" + overwritten + "，等待主节点审批"
+	}
+	// 历史问题-06：自述访问地址与来源 IP 不一致时已忽略（不落库），此处显性
+	// 告知——该值决定能力票据投递地址，只能由管理员显式配置。
+	if registration.AccessURLIgnored {
+		auditParts = append(auditParts, "自述访问地址与来源 IP 不一致，已忽略")
+		message += "；自述访问地址与来源 IP 不一致，已忽略，请在节点设置中显式配置访问地址"
 	}
 	services.RecordAuditLog("system", "注册", "集群节点", services.FormatAuditDetail(auditParts...), c.ClientIP())
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message, Data: registration})

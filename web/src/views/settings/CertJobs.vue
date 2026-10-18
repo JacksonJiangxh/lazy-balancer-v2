@@ -129,7 +129,7 @@ import { escapeHtml } from '@/utils/escape'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import type { APIResponse, CertJobsPage } from '@/types'
-import { certJobStatusLabel } from '@/utils/certJobStatus'
+import { certJobStatusLabel, certJobStatusTone, certJobRetryCooldown } from '@/utils/certJobStatus'
 import type { CertJobStatus } from '@/utils/certJobStatus'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
@@ -195,86 +195,9 @@ const scrollToBottom = async () => {
   }
 }
 
-const statusType = (status: CertJobStatus) => {
-  // FE-70-4（RV-1 同族收敛）：空 status 静默回退（存量行瞬时形态，对齐
-  // certJobStatusLabel 口径）；非空未知值保留 warn 暴露状态机漂移
-  if (!status) return 'info'
-  switch (status) {
-    case 'issued': return 'success'
-    case 'failed': return 'danger'
-    case 'disabled': return 'info'
-    case 'queued': return 'info'
-    case 'waiting_ca': return 'warning'
-    case 'pending':
-    case 'processing':
-    case 'creating_account':
-    case 'creating_order':
-    case 'order_created':
-    case 'waiting_order_ready':
-    case 'order_ready':
-    case 'cleanup_dns':
-    case 'cleanup_warning':
-    case 'presenting_dns':
-    case 'waiting_propagation':
-    case 'dns_propagated':
-    case 'accepting_challenge':
-    case 'waiting_order_valid':
-    case 'order_valid':
-    case 'validating':
-    case 'validated':
-    case 'finalizing':
-    case 'finalized':
-    case 'downloading':
-    case 'downloaded':
-      return 'warning'
-    // 历史 历史问题: assertNever 在运行时 throw，后端未来新增状态会导致组件崩溃。
-    // 改为返回 'info' + console.warn，保证表格始终可渲染。
-    default:
-      console.warn('Unknown cert job status:', status)
-      return 'info'
-  }
-}
+const statusType = (status: CertJobStatus) => certJobStatusTone(status)
 
-const retryCooldownMinutes = (status: CertJobStatus): number | null => {
-  // FE-70-4：空 status 静默回退 2 分钟兜底（同 statusType 口径）
-  if (!status) return 2
-  switch (status) {
-    case 'disabled': return null
-    case 'issued':
-    case 'waiting_ca':
-      return 0
-    case 'queued': return 15
-    case 'failed': return 5
-    case 'pending':
-    case 'processing':
-    case 'creating_account':
-    case 'creating_order':
-    case 'order_created':
-    case 'waiting_order_ready':
-    case 'order_ready':
-    case 'cleanup_dns':
-    case 'cleanup_warning':
-    case 'presenting_dns':
-    case 'waiting_propagation':
-    case 'dns_propagated':
-    case 'accepting_challenge':
-    case 'waiting_order_valid':
-    case 'order_valid':
-    case 'validating':
-    case 'validated':
-    case 'finalizing':
-    case 'finalized':
-    case 'downloading':
-    case 'downloaded':
-      return 2
-    // 历史 历史问题: 同 statusType，避免运行时 throw。历史问题（2026-09-05 证书域
-    // 审计）：未知状态默认冷却对齐后端 certJobRetryBlocked 的 2 分钟兜底，
-    // 不再前端放行（0）造成按钮可点但必然 429。
-    default:
-      console.warn('Unknown cert job status:', status)
-      return 2
-  }
-}
+const retryCooldownMinutes = (status: CertJobStatus): number | null => certJobRetryCooldown(status)
 
 const canRetry = (row: CertJob): boolean => {
   const cooldownMinutes = retryCooldownMinutes(row.status)

@@ -23,6 +23,17 @@ var crawlerBotSources = []crawlerSource{
 	{Name: "so360spider", URL: "https://www.so.com/help/spider_ip.html", Format: "html"},
 }
 
+// CanonicalCrawlerSource 返回内置爬虫源的官方 URL 与解析格式；备份导入
+// 借此覆盖携带值，合法 name 不能成为任意下载地址的通行证。
+func CanonicalCrawlerSource(name string) (url, format string, ok bool) {
+	for _, src := range crawlerBotSources {
+		if src.Name == name {
+			return src.URL, src.Format, true
+		}
+	}
+	return "", "", false
+}
+
 // ensureCrawlerSources 幂等种子（display_name 区分于威胁源；不更新威胁源行）。
 func ensureCrawlerSources() error {
 	for _, src := range crawlerBotSources {

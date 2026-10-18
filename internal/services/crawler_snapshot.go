@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -110,12 +111,30 @@ func (m *CrawlerUpdateManager) Prime() error {
 	return writeCrawlerIPListSnapshotAll(all)
 }
 
-// upsertCrawlerIPList 名单行原子快照：内容变化才更新（entries JSON、
-// updated_at、entry_count）；失败/空集不写（保留上次快照）。
-// 同步推送插件内存态（模块边界友好：caddygeoip 独立模块不能 import 根 DB）。
+// RebuildCrawlerIPListSnapshot 以当前 DB 名单为唯一真相重建运行交换文件。
+// 与 Prime 不同，不播种、不回写名单；适用于备份替换后的无副作用收敛。
+func RebuildCrawlerIPListSnapshot() error {
+	all, err := loadCrawlerIPListsFromDB()
+	if err != nil {
+		return err
+	}
+	return writeCrawlerIPListSnapshotAll(all)
+}
+
+// upsertCrawlerIPList 名单行原子快照（内容变化才更新）；失败/空集不写（保留
+// 上次快照）。changed 语义见 upsertCrawlerIPListChanged。
 func upsertCrawlerIPList(engineID string, entries []string) error {
+	_, err := upsertCrawlerIPListChanged(engineID, entries)
+	return err
+}
+
+// upsertCrawlerIPListChanged 名单行原子快照：内容变化才更新（entries JSON、
+// updated_at、entry_count）；失败/空集不写（保留上次快照）。
+// 返回 changed=DB/快照内容真实变化（调用方据此决定投影收敛，历史问题）。
+// 同步推送插件内存态（模块边界友好：caddygeoip 独立模块不能 import 根 DB）。
+func upsertCrawlerIPListChanged(engineID string, entries []string) (bool, error) {
 	if len(entries) == 0 {
-		return errors.New("空 IP 段列表（解析无产出）")
+		return false, errors.New("空 IP 段列表（解析无产出）")
 	}
 	payload := make([]models.IPListEntry, 0, len(entries))
 	for _, value := range entries {
@@ -123,16 +142,16 @@ func upsertCrawlerIPList(engineID string, entries []string) error {
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := migrateCrawlerIPListNames(); err != nil {
-		return err
+		return false, err
 	}
 	name := CrawlerIPListName(engineID)
 	var existing string
 	scanErr := db.DB.QueryRow(`SELECT COALESCE(entries,'') FROM security_ip_lists WHERE name=? AND system=1`, name).Scan(&existing)
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
-		return scanErr
+		return false, scanErr
 	}
 	if scanErr == nil && existing == string(encoded) {
 		// 历史问题：快速路径必须校验**快照内容**（本引擎条目 == DB 条目），
@@ -140,9 +159,9 @@ func upsertCrawlerIPList(engineID string, entries []string) error {
 		// 升级遗留）都要从 DB/entries 重建；writeCrawlerIPListSnapshot 从 DB
 		// 全量重建并覆盖本引擎，其他引擎分片保留。
 		if crawlerSnapshotMatchesEngine(engineID, entries) {
-			return nil
+			return false, nil
 		}
-		return writeCrawlerIPListSnapshot(engineID, entries)
+		return true, writeCrawlerIPListSnapshot(engineID, entries)
 	}
 	exists := 0
 	if scanErr == nil {
@@ -155,10 +174,10 @@ func upsertCrawlerIPList(engineID string, entries []string) error {
 		_, err = db.DB.Exec(`UPDATE security_ip_lists SET entries=?, updated_at=datetime('now') WHERE name=? AND system=1`, string(encoded), name)
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	// DB 与运行快照是同一更新事务语义：快照写失败不得继续标记源成功。
-	return writeCrawlerIPListSnapshot(engineID, entries)
+	return true, writeCrawlerIPListSnapshot(engineID, entries)
 }
 
 // crawlerSnapshotMatchesEngine 快照文件可解析且本引擎条目集合与期望一致。
@@ -194,11 +213,20 @@ func writeCrawlerIPListSnapshotAll(all map[string][]string) error {
 	if err != nil {
 		return err
 	}
-	tmp := crawlerIPListFile + ".tmp"
-	if err := os.WriteFile(tmp, encoded, 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(crawlerIPListFile), ".crawler-ip-lists-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, crawlerIPListFile)
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(encoded); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, crawlerIPListFile)
 }
 
 // writeCrawlerIPListSnapshot 单引擎更新后从 DB 重建全量运行快照。

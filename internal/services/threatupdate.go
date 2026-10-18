@@ -54,13 +54,9 @@ const (
 )
 
 type ThreatUpdateManager struct {
-	mu      sync.Mutex
-	running bool
-	runDone chan struct{}
-	// runCancel 取消当前运行中的下载阶段（任务监控手动取消，v2.3.4）。
+	mu        sync.Mutex
+	running   bool
 	runCancel context.CancelFunc
-	// lastCancelled 标记最近一次运行被手动取消（区分 failed）。
-	lastCancelled bool
 	// lastTrigger/lastFinishedAt 为任务级状态（status 端点 + 弹框展示）。
 	lastTrigger     string
 	lastStartedAt   string
@@ -175,8 +171,7 @@ func (m *ThreatUpdateManager) StartUpdate(trigger string, rc *taskengine.RunCont
 		return nil, ErrThreatUpdateRunning
 	}
 	m.running = true
-	m.runDone = make(chan struct{})
-	done := m.runDone
+	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		m.run(trigger, rc)
@@ -303,7 +298,6 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	m.mu.Lock()
 	m.lastTrigger = trigger
 	m.lastStartedAt = time.Now().UTC().Format(crsTimeLayout)
-	m.lastCancelled = false
 	m.runCancel = runCancel
 	m.mu.Unlock()
 	defer runCancel()
@@ -379,7 +373,6 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		m.lastTaskOutcome = "skipped"
 	} else if cancelled {
 		m.lastTaskOutcome = "cancelled"
-		m.lastCancelled = true
 	} else if anyFailed {
 		m.lastTaskOutcome = "failed"
 	} else {
@@ -654,9 +647,11 @@ func writeThreatSystemList(source string, entries []string) (bool, error) {
 		return false, fmt.Errorf("编码名单条目失败: %w", err)
 	}
 	hash := fmt.Sprintf("%x", sha256.Sum256(encoded))
-	// 名单行存在 + 哈希一致 → 未变化（名单行缺失即使哈希命中也须补建）
+	// 名单行存在（system=1）+ 哈希一致 → 未变化（名单行缺失即使哈希命中也须
+	// 补建）。历史问题：存在性判定按 system=1 限定——同名用户自建列表
+	// （system=0）不得抑制内置行创建，否则威胁文件更新后无名单 ID 可引用。
 	var listExists int
-	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=?`, name).Scan(&listExists); err != nil {
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=? AND system=1`, name).Scan(&listExists); err != nil {
 		return false, fmt.Errorf("读内置名单失败: %w", err)
 	}
 	var storedHash string
@@ -685,6 +680,12 @@ func writeThreatSystemList(source string, entries []string) (bool, error) {
 		if _, ierr := db.DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at)
 			VALUES (?, ?, '恶意 IP', '', 1, datetime('now'), datetime('now'))`, name, threatListDescription(source)); ierr != nil {
 			return false, fmt.Errorf("补建内置名单失败: %w", ierr)
+		}
+		// 历史问题：同名用户自建列表与内置行并存时显式留痕（不静默双名）。
+		var userOwned int
+		if uerr := db.DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=0`, name).Scan(&userOwned); uerr == nil && userOwned > 0 {
+			Logf("warn", "威胁情报库: 内置名单 %q 已补建，但存在同名用户自建列表——请重命名用户列表以消除选择器歧义", name)
+			RecordAuditLog("system", "重建", "威胁情报库", fmt.Sprintf("内置名单 %s 已补建（存在同名用户列表，建议重命名用户列表）", name), "")
 		}
 		// 历史问题-4：补建产生新 id
 		Logf("warn", "威胁情报库: 内置名单 %q 已重建为新 id，原策略引用已失效，需重新绑定", name)
@@ -827,33 +828,86 @@ func healThreatFastFromText(source string) ([]string, string, bool) {
 	return entries, sum, true
 }
 
-// writeThreatIplist 将威胁库条目写为 .iplist 纯文本文件（原子写）。
-// 格式：每行一个 IP/CIDR，供导出/调试/从节点编译。
-func writeThreatIplist(path string, entries []string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+// WriteThreatIplistCompiled 在同目录临时文件上完成文本写入与 .fast 编译，
+// 全部成功后才替换 live 文件。fast 先替换时保留硬链接备份，第二个 rename
+// 若失败可恢复旧 fast；任何前置失败均不触碰 live .iplist。
+// 调用方必须持 WafFileLock（lbbak 导入与威胁更新器均已在外层持有）。
+func WriteThreatIplistCompiled(iplistPath string, data []byte) error {
+	fastPath := iplistPath + ".fast"
+	for _, path := range []string{iplistPath, fastPath} {
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("威胁库目标不是普通文件: %s", path)
+		}
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(iplistPath), ".lbbak-threat-*.iplist")
+	if err != nil {
 		return err
 	}
-	content := strings.Join(entries, "\n") + "\n"
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	defer os.Remove(tmpPath + ".fast")
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := CompileFromIplistFile(tmpPath); err != nil {
+		return err
+	}
+
+	fastBackup := ""
+	if _, err := os.Stat(fastPath); err == nil {
+		placeholder, err := os.CreateTemp(filepath.Dir(fastPath), ".lbbak-fast-backup-*")
+		if err != nil {
+			return err
+		}
+		fastBackup = placeholder.Name()
+		if err := placeholder.Close(); err != nil {
+			_ = os.Remove(fastBackup)
+			return err
+		}
+		if err := os.Remove(fastBackup); err != nil {
+			return err
+		}
+		if err := os.Link(fastPath, fastBackup); err != nil {
+			return err
+		}
+		defer os.Remove(fastBackup)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Rename(tmpPath+".fast", fastPath); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, iplistPath); err != nil {
+		if fastBackup != "" {
+			if restoreErr := os.Rename(fastBackup, fastPath); restoreErr != nil {
+				return errors.Join(err, fmt.Errorf("恢复旧 .fast 失败: %w", restoreErr))
+			}
+		} else {
+			_ = os.Remove(fastPath)
+		}
+		return err
+	}
+	return nil
 }
 
-// writeThreatIplistCompiled 威胁库文件相位（历史问题-02）：.iplist 原子写 + .fast
-// 编译在 wafFileMu 互斥段内完成——与 lbbak 导入直写、从节点 .fast 落盘串行，
-// 杜绝并发写者下的撕裂读与半新半旧名单。错误文案与此前两段式返回保持一致。
+// writeThreatIplistCompiled 威胁库文件相位（历史问题-02）：文本与编译产物
+// 在 wafFileMu 互斥段内 staging 后替换，与 lbbak 导入共用同一实现。
 func writeThreatIplistCompiled(path string, entries []string) error {
 	wafFileMu.Lock()
 	defer wafFileMu.Unlock()
-	if err := writeThreatIplist(path, entries); err != nil {
-		return fmt.Errorf("写 .iplist 文件失败: %w", err)
-	}
-	if err := CompileFromIplistFile(path); err != nil {
-		return fmt.Errorf("编译 .fast 失败: %w", err)
-	}
-	return nil
+	content := strings.Join(entries, "\n") + "\n"
+	return WriteThreatIplistCompiled(path, []byte(content))
 }
 
 // WafDir 返回 waf 目录路径（导入/导出用）。

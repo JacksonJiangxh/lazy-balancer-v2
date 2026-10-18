@@ -1,6 +1,7 @@
 package caddygeoip
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -51,6 +52,85 @@ func TestSecurityBlockedCounter_ServeHTTP(t *testing.T) {
 	wantTotal := before + 3 // coraza 403 + coraza 429 + ratelimit 429 三笔
 	if after != wantTotal {
 		t.Fatalf("counter=%v, want %v (before=%v)", after, wantTotal, before)
+	}
+}
+
+// 历史问题-01：无 geoip handler 的链上，客户端伪造国名头不得进入流量统计；
+// 有 geoip handler 时也只能采用其写入的服务端变量，不能被同名请求头覆盖。
+func TestSecurityBlockedCounter_trafficCountryTrustsServerVar(t *testing.T) {
+	cases := []struct {
+		name        string
+		vars        map[string]any
+		wantBuckets int
+		wantCountry string
+	}{
+		{name: "missing geoip var ignores forged header", wantBuckets: 0},
+		{name: "server var wins over forged header", vars: map[string]any{"geoip.country_name": "中国"}, wantBuckets: 1, wantCountry: "中国"},
+		{name: "non string var is ignored", vars: map[string]any{"geoip.country_name": 42}, wantBuckets: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetTrafficState(t)
+			useTestTimingRegistry(t)
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set("X-LB-GeoIP-Country", "attacker-controlled")
+			if tc.vars != nil {
+				req = req.WithContext(context.WithValue(req.Context(), caddyhttp.VarsCtxKey, tc.vars))
+			}
+			h := &SecurityBlockedCounter{Rule: "lb_traffic_source"}
+			next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
+			if err := h.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
+				t.Fatalf("ServeHTTP: %v", err)
+			}
+
+			trafficMu.RLock()
+			buckets := len(trafficCountries)
+			e := trafficCountries[tc.wantCountry]
+			trafficMu.RUnlock()
+			if buckets != tc.wantBuckets {
+				t.Fatalf("country buckets=%d, want %d (forged header must not be trusted)", buckets, tc.wantBuckets)
+			}
+			if tc.wantCountry != "" && (e == nil || e.normal.Load() != 1 || e.attack.Load() != 0) {
+				t.Fatalf("trusted country entry=%+v, want one normal request", e)
+			}
+		})
+	}
+}
+
+func TestSecurityBlockedCounter_panicFinalizesTimingAndTraffic(t *testing.T) {
+	resetTrafficState(t)
+	useTestTimingRegistry(t)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(context.WithValue(req.Context(), caddyhttp.VarsCtxKey, map[string]any{
+		"geoip.country_name": "中国",
+	}))
+	h := &SecurityBlockedCounter{Rule: "lb_panic_finalization"}
+	next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error {
+		panic("injected downstream panic")
+	})
+
+	func() {
+		defer func() {
+			if got := recover(); got != "injected downstream panic" {
+				t.Fatalf("panic propagation=%v, want injected downstream panic", got)
+			}
+		}()
+		_ = h.ServeHTTP(httptest.NewRecorder(), req, next)
+	}()
+
+	// panic 向外传播的同时，审计计时必须有终态，流量也不能静默丢失。
+	id := req.Header.Get(securityTimingHeader)
+	if id == "" {
+		t.Fatal("missing injected timing id")
+	}
+	if snap := auditTimingLookupForTest(t, id); !snap.closed {
+		t.Fatalf("timing snapshot after panic=%+v, want closed terminal marker", snap)
+	}
+	trafficMu.RLock()
+	e := trafficCountries["中国"]
+	trafficMu.RUnlock()
+	if e == nil || e.normal.Load() != 1 || e.attack.Load() != 0 {
+		t.Fatalf("traffic after panic=%+v, want one normal finalized request", e)
 	}
 }
 

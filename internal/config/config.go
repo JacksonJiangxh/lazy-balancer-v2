@@ -20,9 +20,9 @@ type Config struct {
 	Version   string `json:"version"`
 
 	// Caddy
-	// CaddyAdminURL(2026-09-19 历史 历史问题 裁定):生产 admin 恒
-	// 127.0.0.1:2019(渲染侧 caddy.go 硬编码),本字段(与 caddy_metrics_url)
-	// 仅服务测试注入与指标地址;受支持部署不传 -config,恒取默认。
+	// CaddyAdminURL 是生产 Caddy Admin API（配置加载、状态、生命周期与任务
+	// 守卫）的唯一地址；CaddyMetricsURL 是所有 Prometheus 指标采集的唯一地址，
+	// 两者可指向同机不同端口/路径，指标消费不得再由 admin URL 拼接。
 	CaddyAdminURL   string `json:"caddy_admin_url"`
 	CaddyMetricsURL string `json:"caddy_metrics_url"`
 
@@ -96,6 +96,29 @@ func Load(path string) *Config {
 				sort.Strings(unsupported)
 				for _, key := range unsupported {
 					log.Printf("config: ignoring unsupported config key %q in %s", key, path)
+				}
+				// 支持键但 JSON 类型错误同样不得静默：沿用默认值的同时逐键告警，
+				// 避免 port/data_dir 误配后看似「配置未生效」甚至切到空库。
+				invalidTypes := make([]string, 0, len(configFileKeys))
+				for key := range configFileKeys {
+					value, exists := fileCfg[key]
+					if !exists {
+						continue
+					}
+					validType := false
+					switch key {
+					case "port", "metrics_interval":
+						_, validType = value.(float64)
+					default:
+						_, validType = value.(string)
+					}
+					if !validType {
+						invalidTypes = append(invalidTypes, key)
+					}
+				}
+				sort.Strings(invalidTypes)
+				for _, key := range invalidTypes {
+					log.Printf("config: invalid type for key %q in %s; using default", key, path)
 				}
 				if v, ok := fileCfg["data_dir"].(string); ok && v != "" {
 					cfg.DataDir = v

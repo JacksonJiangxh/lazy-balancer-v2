@@ -12,6 +12,16 @@ import (
 	"lazy-balancer-v2/wafiplist"
 )
 
+// init 装配 wafiplist 的 fail-stale 观测钩子（历史问题，历史）：运行期
+// 名单文件被删/写坏、重建失败而回退旧集合时，按路径节流（wafiplist.
+// StaleServeLogInterval，默认 1 分钟）写 WARN。wafiplist 的默认钩子只写
+// stderr（Caddy 进程内的形态）；本进程覆盖为面板日志，级别过滤与落盘一致。
+func init() {
+	wafiplist.OnStaleServe = func(path string, err error) {
+		Logf("warn", "IP 名单 %q 无法重建，继续按最近一次成功加载的集合判定（fail-stale）: %v", path, err)
+	}
+}
+
 // IPListDataDir 是策略名单投影目录（@ipListFast 算子读取侧）。生产容器默认
 // /app/waf/ip-lists（DataDir=/app/data 同级）；本地开发经 ConfigureWafDirs
 // 按 data_dir 同级 waf/ 派生。测试可改。

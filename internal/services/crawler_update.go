@@ -77,7 +77,7 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 	TaskLogf("crawlerbot-update", "checking", "开始更新爬虫地址库（%d 个启用源）", len(sources))
 	runStarted := taskRunStartedAt(&rc)
 	var firstErr error
-	successCount, failedCount, totalEntries := 0, 0, 0
+	successCount, failedCount, totalEntries, changedCount := 0, 0, 0, 0
 	for _, src := range sources {
 		if !updateRunStillMaster() {
 			outcome = "skipped"
@@ -114,8 +114,20 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 			taskengine.TeeTaskLogTime("crawlerbot-update", "ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, err))
 			continue
 		}
-		entries := parseCrawlerCIDRs(body)
-		if err := upsertCrawlerIPList(src.Name, entries); err != nil {
+		// 历史问题：按源声明格式解析（json 源的非 JSON 响应=错误页 → 失败并
+		// 保留上次快照；词法边界已排除版本号/日期等 IP 同形 token）。
+		entries, perr := parseCrawlerCIDRsForFormat(body, src.Format)
+		if perr != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("源 %s 解析失败: %w", src.Name, perr)
+			}
+			failedCount++
+			markCrawlerSourceFailed(src.Name)
+			taskengine.TeeTaskLogTime("crawlerbot-update", "ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, perr))
+			continue
+		}
+		changed, err := upsertCrawlerIPListChanged(src.Name, entries)
+		if err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("源 %s 写名单失败: %w", src.Name, err)
 			}
@@ -123,6 +135,9 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 			markCrawlerSourceFailed(src.Name)
 			taskengine.TeeTaskLogTime("crawlerbot-update", "ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, err))
 			continue
+		}
+		if changed {
+			changedCount++
 		}
 		markCrawlerSourceSuccess(src.Name, len(entries))
 		successCount++
@@ -135,7 +150,39 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 	} else {
 		TaskLogf("crawlerbot-update", "success", "爬虫地址更新完成：%d 个源成功，共 %d 条", successCount, totalEntries)
 	}
+	// 历史问题：名单内容变化后的收敛——复用威胁库的单源热路径（投影重写
+	// 零 /load；未证实收敛回退强制重载）。无变化/全失败不触碰 Caddy。
+	if changedCount > 0 {
+		convergeIPListProjectionAfterMutation("crawlerbot-update")
+	}
 	return firstErr
+}
+
+// convergeIPListProjectionAfterMutation 内置名单（system=1，可被 ACL/信任面
+// 引用）内容变化后的生效路径（历史问题，复用威胁库单源回调）：
+//   - 投影刷新器已注册 → RefreshIPListProjections（毫秒级、零 /load，
+//     @ipListFast 匹配器 ≤1s stat 热感知）；
+//   - 未证实收敛（发射面变化/运行配置不可读/刷新被拒）或回调未注册 →
+//     回退全量 /load（宁可一次重载，不欠引用方渲染收敛）。
+func convergeIPListProjectionAfterMutation(task string) {
+	if threatProjectionRefresher == nil {
+		TaskLogfWarn(task, "unchanged", "投影刷新器未注册，跳过名单投影热路径（引用方由下次配置变更收敛）")
+		return
+	}
+	hot, err := threatProjectionRefresher()
+	if err == nil && hot == ProjectionConverged {
+		TaskLogf(task, "hot", "名单内容变化经投影热路径收敛（零 Caddy 重载）")
+		return
+	}
+	TaskLogf(task, "reloading", "投影热路径未证实收敛，回退重载 Caddy 配置")
+	if threatReloader == nil {
+		TaskLogfWarn(task, "reloading", "重载回调未注册，引用方渲染由下次配置变更收敛")
+		return
+	}
+	if rerr := threatReloader(); rerr != nil {
+		Logf("error", "爬虫地址库: 名单变化后重载失败: %v", rerr)
+		TaskLogfWarn(task, "reloading", "重载 Caddy 配置失败: %v", rerr)
+	}
 }
 
 // markCrawlerSourceRunning 源开始态：任务开始时刻统一以 UTC 写 started_at/

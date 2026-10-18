@@ -73,7 +73,8 @@ const (
 
 // loginLockoutEnabled 读「登录失败锁定」开关（与 services.MFALockoutEnabled
 // 同一配置项；handler 侧就近封装避免跨包零散查询）。
-func loginLockoutEnabled() bool {
+// U04c-04：错误向上传播——锁定门不得因配置读取失败静默降级为关闭。
+func loginLockoutEnabled() (bool, error) {
 	return services.MFALockoutEnabled()
 }
 
@@ -84,7 +85,14 @@ func loginLockoutEnabled() bool {
 // 计数是事实，关闭期清零反而给免费重置窗口。
 func recordLoginFailure(userID int) {
 	now := time.Now()
-	if !loginLockoutEnabled() {
+	enabled, err := loginLockoutEnabled()
+	if err != nil {
+		// U04c-04：开关读不到时按「开启」处理（fail-closed）——失败计数与
+		// 锁定门不得因基础设施故障静默消失；故障本身留运行日志。
+		services.Logf("error", "读取登录失败锁定开关失败（按开启处理）: %v", err)
+		enabled = true
+	}
+	if !enabled {
 		_, _ = db.DB.Exec(`UPDATE users SET login_failed_attempts=COALESCE(login_failed_attempts,0)+1 WHERE id=?`, userID)
 		return
 	}
@@ -97,8 +105,14 @@ func recordLoginFailure(userID int) {
 }
 
 // loginLockedNow 账户当前是否处于登录锁定（开关关闭视为未锁）。
-func loginLockedNow(lockedUntil sql.NullString) bool {
-	return loginLockoutEnabled() && lockedUntil.Valid && lockedUntil.String > time.Now().UTC().Format("2006-01-02 15:04:05")
+// U04c-04：开关读取失败返回错误，由调用方 fail-closed（500），不得把
+// 「读不到」当作「未锁定」放行。
+func loginLockedNow(lockedUntil sql.NullString) (bool, error) {
+	enabled, err := loginLockoutEnabled()
+	if err != nil {
+		return false, err
+	}
+	return enabled && lockedUntil.Valid && lockedUntil.String > time.Now().UTC().Format("2006-01-02 15:04:05"), nil
 }
 
 // loginLockRemainingMinutes 剩余锁定时长（分钟，向上取整，下限 1）——锁定
@@ -154,7 +168,14 @@ func (h *Handlers) Login(c *gin.Context) {
 	// 登录失败锁定（用户裁定：受「登录失败锁定」开关控制）。锁定期间仍跑一次
 	// 真实 bcrypt 再 429——等时占位，与「用户名或密码错误」路径同耗时，不泄露
 	// 锁定账户的密码正误（防枚举）。
-	if loginLockedNow(loginLockedUntil) {
+	locked, lockErr := loginLockedNow(loginLockedUntil)
+	if lockErr != nil {
+		// U04c-04：开关读取失败 fail-closed——不进入认证流程。
+		services.RecordAuditLog(req.Username, "登录失败", "用户认证", services.AuditResultPart("internal_error"), c.ClientIP())
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
+		return
+	}
+	if locked {
 		_ = bcrypt.CompareHashAndPassword(loginCompareHash(passwordHash), []byte(req.Password))
 		services.RecordAuditLog(req.Username, "登录失败", "用户认证", services.FormatAuditDetail(services.AuditUserPart(user.ID, user.Username), "账户已锁定"), c.ClientIP())
 		c.JSON(http.StatusTooManyRequests, models.APIResponse{Code: 429, Message: fmt.Sprintf("账户已锁定，请 %d 分钟后重试", loginLockRemainingMinutes(loginLockedUntil, time.Now().UTC()))})
@@ -375,13 +396,15 @@ type UpdateCurrentUserRequest struct {
 	// bcrypt 的字节上限 72——x/crypto v0.55+ 超出即返回 ErrPasswordTooLong
 	// (密码策略:8-24 可打印 ASCII,四类字符)
 	// F-SYSR-3 同族（R-12，历史）：binding 只拦空，长度/复杂度交
-	// validatePasswordPolicy 友好文案（CurrentPassword 例外保留 max=24——
-	// 非新密码，超限必为无效确认输入，防御性拦截无文案损失）。
+	// validatePasswordPolicy 友好文案（CurrentPassword 例外见下）。
 	Password string `json:"password" binding:"omitempty"`
 	// M5（用户已批准契约，2026-09 裁定保留——登录后唯一密码确认例外）：提交新
 	// 密码时必须携带当前密码过共享确认门——此前仅凭会话即可改密，劫持会话可直接
 	// 置换密码把原主锁在门外。仅改昵称不要求。
-	CurrentPassword string `json:"current_password" binding:"omitempty,max=24"`
+	// U04c-01：当前密码不套用新密码策略 8-24——登录不做策略校验（存量密码可能
+	// 来自旧策略），25-72 字符的存量密码必须仍能自助更换；这里只保留 bcrypt
+	// 物理上限 72（>72 字节比较必败，400 文案与 401 无行为差异）。
+	CurrentPassword string `json:"current_password" binding:"omitempty,max=72"`
 }
 
 // 密码策略（2026-09-28 用户裁定，历史问题-1）：8-24 个可打印 ASCII 字符，
@@ -523,13 +546,23 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 		changed = append(changed, "昵称")
 	}
 	if passwordHash != "" {
-		sets = append(sets, "password_hash = ?", "password_changed_at = datetime('now')", "password_version = password_version + 1")
+		// U04c-03：复用 passwordResetColumns——自助改密与管理员重置同语义，
+		// 清空登录失败计数与锁定（否则锁定中的会话改密后仍被旧锁 429）。
+		sets = append(sets, passwordResetColumns()...)
 		args = append(args, passwordHash)
 		changed = append(changed, "密码")
 	}
 	if len(sets) > 0 {
 		args = append(args, userIDInt)
 		if _, err := tx.ExecContext(c.Request.Context(), "UPDATE users SET "+strings.Join(sets, ", ")+" WHERE id = ?", args...); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新用户失败"})
+			return
+		}
+	}
+	if passwordHash != "" {
+		// U04c-02：改密在同一事务内吊销在册 MFA 挑战（版本绑定是主防线，
+		// 这里保证旧挑战不会以任何路径残留）。
+		if err := revokeMFAChallenges(tx, userIDInt); err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新用户失败"})
 			return
 		}

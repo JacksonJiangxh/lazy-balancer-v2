@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"fmt"
+
 	"github.com/gin-gonic/gin"
 	"net/http"
 	"strconv"
@@ -59,12 +61,19 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 		}
 		defer rows.Close()
 		out := []optionRow{}
+		var scanErr error
 		for rows.Next() {
 			var o optionRow
 			if err := rows.Scan(&o.Value, &o.Count); err != nil {
 				// F-CORE-2（历史）：单行 Scan 失败须留痕——静默丢行让下拉
 				// 缺项零信号（主查询 500 口径在此分裂为静默）。
 				services.Logf("warn", "审计日志下拉选项（%s）行扫描失败: %v", column, err)
+				// U04d-05：Scan 失败也是故障轮——此前只 continue，fetchErr 不置位，
+				// 缺项下拉被当作完整结果写进 60s 缓存（同文件 历史问题 门禁的
+				// 遗漏分支）。保留首错用于缓存门判定。
+				if scanErr == nil {
+					scanErr = fmt.Errorf("审计日志下拉选项（%s）行扫描失败: %w", column, err)
+				}
 				continue
 			}
 			out = append(out, o)
@@ -74,6 +83,9 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 		if err := rows.Err(); err != nil {
 			services.Logf("warn", "审计日志下拉选项（%s）迭代失败: %v", column, err)
 			return out, err
+		}
+		if scanErr != nil {
+			return out, scanErr
 		}
 		return out, nil
 	}

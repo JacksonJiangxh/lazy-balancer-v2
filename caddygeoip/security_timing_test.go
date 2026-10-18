@@ -21,11 +21,15 @@ func useTestTimingRegistry(t *testing.T) {
 	auditTimingPollStep = time.Millisecond
 	auditTimingMu.Lock()
 	auditTimingEntries = make(map[string]*auditTimingEntry)
+	auditTimingCreateCount = 0
+	auditTimingLastSweep = time.Time{}
 	auditTimingMu.Unlock()
 	t.Cleanup(func() {
 		auditTimingWaitLimit, auditTimingPollStep = origWait, origPoll
 		auditTimingMu.Lock()
 		auditTimingEntries = make(map[string]*auditTimingEntry)
+		auditTimingCreateCount = 0
+		auditTimingLastSweep = time.Time{}
 		auditTimingMu.Unlock()
 	})
 }

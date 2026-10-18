@@ -1578,6 +1578,7 @@ func (s *SyncService) run(ctx context.Context) {
 		if isMaster {
 			return
 		}
+		pullFailed := false
 		if token == "" {
 			s.pollRegistration(ctx)
 		} else {
@@ -1617,6 +1618,13 @@ func (s *SyncService) run(ctx context.Context) {
 			if pullErr != nil || reportErr != nil {
 				s.state.Store(uint32(syncStateDegraded))
 				prevRoundFailed = true
+				pullFailed = pullErr != nil
+				if pullErr == nil {
+					// 历史问题-01：上报侧故障与主链路退避解耦——拉取已恢复即复位
+					// 快速重试起点，否则历史拉取失败累积的 retryDelay 会被后续
+					// 上报故障"继承"，下次真实拉取故障从 30s 才起跳。
+					retryDelay = time.Second
+				}
 				TaskLogf("cluster-sync", "sync", "同步轮失败：%v / %v（退避重试）", pullErr, reportErr)
 			} else {
 				s.state.Store(uint32(syncStateRunning))
@@ -1639,13 +1647,21 @@ func (s *SyncService) run(ctx context.Context) {
 		delay := time.Duration(interval) * time.Second
 		if token == "" {
 			delay = 10 * time.Second
-		} else if syncLifecycleState(s.state.Load()) == syncStateDegraded {
+		} else if pullFailed {
+			// 历史问题-01：仅主链路（拉取）失败才启用 1s→30s 快速退避；上报失败
+			// 时拉取仍健康（304），加速轮询不能修复上报，反而把用户可见的
+			// 「同步间隔」压到 30s 以内（interval=86400 时达 2880×）并放大已
+			// 故障主节点负载。退避同时以配置间隔为上限（min(retryDelay,
+			// interval)），任何恢复路径都不反超用户配置的节奏。
 			delay = retryDelay
+			if configured := time.Duration(interval) * time.Second; delay > configured {
+				delay = configured
+			}
 		}
 		if !waitDelay(ctx, delay) {
 			return
 		}
-		if syncLifecycleState(s.state.Load()) == syncStateDegraded && retryDelay < 30*time.Second {
+		if pullFailed && retryDelay < 30*time.Second {
 			retryDelay *= 2
 			if retryDelay > 30*time.Second {
 				retryDelay = 30 * time.Second

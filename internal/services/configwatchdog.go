@@ -436,13 +436,43 @@ func updateConfigDrift(missing, extra []string) {
 	}
 }
 
-func formatDriftDetail(missing, extra []string) string {
+// LBH79-历史问题：漂移文案单源（横幅 GetCaddyStatus 与看门狗审计共用）——
+// 此前两处各自拼接「缺失规则路由/多余规则路由」，跨包维护两份。展示上限
+// 防止规则数很大时 60s 轮询响应与 audit_log.detail 无界增长。
+const (
+	driftDisplayMaxEntries = 20
+	driftDisplayMaxRunes   = 512
+)
+
+// FormatDriftRoutes 生成「缺失规则路由: …；多余规则路由: …」正文（一致时
+// 空串）。每条列表最多展示 driftDisplayMaxEntries 项，整体截断到
+// driftDisplayMaxRunes 个字符。
+func FormatDriftRoutes(missing, extra []string) string {
 	parts := make([]string, 0, 2)
 	if len(missing) > 0 {
-		parts = append(parts, "缺失规则路由: "+strings.Join(missing, "、"))
+		parts = append(parts, "缺失规则路由: "+formatDriftRouteList(missing))
 	}
 	if len(extra) > 0 {
-		parts = append(parts, "多余规则路由: "+strings.Join(extra, "、"))
+		parts = append(parts, "多余规则路由: "+formatDriftRouteList(extra))
 	}
-	return "运行配置与规则数据不一致（" + strings.Join(parts, "；") + "），请重启服务恢复"
+	joined := strings.Join(parts, "；")
+	runes := []rune(joined)
+	if len(runes) > driftDisplayMaxRunes {
+		return string(runes[:driftDisplayMaxRunes]) + "…"
+	}
+	return joined
+}
+
+func formatDriftRouteList(items []string) string {
+	display := items
+	suffix := ""
+	if len(items) > driftDisplayMaxEntries {
+		display = items[:driftDisplayMaxEntries]
+		suffix = fmt.Sprintf("…（共 %d 条）", len(items))
+	}
+	return strings.Join(display, "、") + suffix
+}
+
+func formatDriftDetail(missing, extra []string) string {
+	return "运行配置与规则数据不一致（" + FormatDriftRoutes(missing, extra) + "），请重启服务恢复"
 }

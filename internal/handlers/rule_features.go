@@ -49,10 +49,6 @@ type ruleFeatureInput struct {
 	UpstreamForceHTTP1         int
 }
 
-type pathRuleQueryer interface {
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-}
-
 func createRuleFeatures(req models.CreateRuleRequest) ruleFeatureInput {
 	enabledUpstreams := 0
 	enabledHosts := make([]string, 0, len(req.Upstreams))
@@ -221,6 +217,21 @@ func normalizePathRules(pathRules []models.PathRule) []models.PathRule {
 		// 历史 历史问题: 存储前 TrimSpace，与校验侧（validateRuleFeatures 277 行先 TrimSpace
 		// 再归一）及渲染侧 pathMatcherSpecs 对齐，避免空格路径校验误报冲突。
 		normalized[index].Path = strings.TrimSpace(normalized[index].Path)
+		// LBH79-历史问题：路径上游地址与主上游同口径归一——校验/查重侧一直用
+		// TrimSpace 后的值判定，但落库/渲染原样消费 Address；" up.test" 能过
+		// host 门并渲染成 dial:" up.test:9001"（该路径恒 502）。深拷贝上游
+		// 切片后回写 TrimSpace，避免改动调用方共享的底层数组。
+		if normalized[index].Upstreams != nil {
+			// 保留「非 nil 空切片」形态（nil 与 [] 在保存门语义不同：
+			// nil=回退主上游，[]=显式空上游 400）——append(nil, empty...)
+			// 会把它压成 nil。
+			upstreams := make([]models.PathRuleUpstream, len(normalized[index].Upstreams))
+			copy(upstreams, normalized[index].Upstreams)
+			for upstreamIndex := range upstreams {
+				upstreams[upstreamIndex].Address = strings.TrimSpace(upstreams[upstreamIndex].Address)
+			}
+			normalized[index].Upstreams = upstreams
+		}
 	}
 	return normalized
 }
@@ -308,6 +319,12 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 	if input.NTLMCompatible != 0 && input.NTLMCompatible != 1 {
 		return fmt.Errorf("ntlm_compatible 必须为 0 或 1")
 	}
+	// LBH79-历史问题：upstream_force_http1 与 ntlm_compatible 同为 0/1 开关列，
+	// MCP schema 已枚举 0/1 但 REST 无对应门——2/-1 可落库，UI/渲染按
+	// `==1` 静默当关闭，用户意图与运行行为不一致。保存门单源拒绝越界值。
+	if input.UpstreamForceHTTP1 != 0 && input.UpstreamForceHTTP1 != 1 {
+		return fmt.Errorf("upstream_force_http1 必须为 0 或 1")
+	}
 	// 重试窗口值域（方案 C，2026-10-12）：http 规则 tcp_try_duration ∈ [-1,60000]
 	// （-1=显式禁用重试，NTLM 接管态）；tcp 规则 ∈ [0,60000]（下方 TCP 分支拒负值）。
 	// LBH-1（历史 历史问题）：上界两协议两字段同值 60000——此前 http 侧
@@ -317,7 +334,10 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 	if input.Protocol == "http" && (input.TCPTryDuration < -1 || input.TCPTryDuration > 60000) {
 		return fmt.Errorf("重试窗口必须在 -1 到 60000 毫秒之间（-1=禁用重试，0=默认 5 秒窗口）")
 	}
-	if input.Protocol == "http" && input.TCPTryInterval > 60000 {
+	// LBH79-历史问题：http 侧重试间隔补下界——此前只判 >60000，负值可保存后
+	// 成为死值（渲染走默认分支）或触发泛化的配置生成失败，用户拿不到字段级
+	// 400。TCP 侧下界在下方 TCP 分支（同值域文案）。
+	if input.Protocol == "http" && (input.TCPTryInterval < 0 || input.TCPTryInterval > 60000) {
 		return fmt.Errorf("重试间隔必须在 0 到 60000 毫秒之间")
 	}
 	if input.NTLMCompatible == 1 {
@@ -870,7 +890,7 @@ const lbRuleListColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE
 	COALESCE(custom_routes_enabled,0),
 	COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 	COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), '', '',
-	COALESCE(tls_http_redirect,0), COALESCE(enable_compress,1), COALESCE(compress_types,'gzip'), IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0),
+	COALESCE(tls_http_redirect,0), COALESCE(enable_compress,0), COALESCE(compress_types,'gzip'), IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0),
 	created_by, created_at, updated_at, updated_by, COALESCE(host_header,''), COALESCE(health_check_host,''),
 	COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)`
 
@@ -882,7 +902,7 @@ const lbRuleColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE(des
 	COALESCE(custom_routes_enabled,0),
 	COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 	COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), COALESCE(tls_cert,''), COALESCE(tls_key,''),
-	COALESCE(tls_http_redirect,0), COALESCE(enable_compress,1), COALESCE(compress_types,'gzip'), IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0),
+	COALESCE(tls_http_redirect,0), COALESCE(enable_compress,0), COALESCE(compress_types,'gzip'), IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0),
 	created_by, created_at, updated_at, updated_by, COALESCE(host_header,''), COALESCE(health_check_host,''),
 	COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)`
 
@@ -1094,6 +1114,12 @@ func validateStageBlockPageRef(pageID, status int, label string) error {
 	}
 	if pageID < 0 {
 		return &configValidationError{message: fmt.Sprintf("%s拦截页 id 不能为负数", label)}
+	}
+	// LBH79-历史问题：跨字段门——渲染只在 pageID>0 时发射阶段路由，单独携带
+	// status（page=0）会保存成永不消费的死配置（UI 显示未配置、导出/复制
+	// 放大）。与策略侧零化门同口径：无页即无码。
+	if pageID == 0 && status != 0 {
+		return &configValidationError{message: fmt.Sprintf("%s拦截页状态码 %d 需要先选择拦截页（未选择拦截页时状态码必须为 0）", label, status)}
 	}
 	if pageID > 0 {
 		var pageOK bool

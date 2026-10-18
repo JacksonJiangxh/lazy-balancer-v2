@@ -47,7 +47,8 @@ func TestTriggerSystemTask_certJobRowRetriesFailedJob(t *testing.T) {
 	}
 }
 
-// Given：disabled 证书任务。When：触发。Then：429（退役任务不可重试——复用重试门）。
+// Given：disabled 证书任务。When：触发。Then：409（退役任务永久不可重试——复用重试门；
+// 历史问题：永久条件不得用 429，SDK/前端会按限流语义退避轮询）。
 func TestTriggerSystemTask_certJobRowDisabledRejected(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
@@ -64,7 +65,7 @@ func TestTriggerSystemTask_certJobRowDisabledRejected(t *testing.T) {
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/system/tasks/cert-job:1/trigger", nil))
 
-	if response.Code != http.StatusTooManyRequests {
-		t.Fatalf("status=%d body=%s, want 429（已退役证书任务不能重试）", response.Code, response.Body.String())
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409（已退役证书任务不能重试）", response.Code, response.Body.String())
 	}
 }

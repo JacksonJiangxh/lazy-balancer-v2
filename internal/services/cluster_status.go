@@ -149,6 +149,14 @@ func (s *ClusterService) Status(ctx context.Context) (models.ClusterStatus, erro
 	status.LastSyncError, status.SyncErrorCode = decodeSyncError(storedSyncError)
 	status.NodeMode = "slave"
 	status.ClusterActive = clusterToken != ""
+	// 历史问题-09：链路明文常驻标志——注册时刻只告警一次，之后面板无从得知当前
+	// 上行为明文（快照承载证书私钥/CA 与 DNS 凭据、服务控制票据为 Bearer，且
+	// HTTP 下 TOFU 指纹防护完全不生效）。前端据 transport_insecure 常驻提示。
+	if !isMaster && status.MasterURL != "" {
+		if parsed, parseErr := url.Parse(status.MasterURL); parseErr == nil && parsed.Scheme == "http" {
+			status.TransportInsecure = true
+		}
+	}
 	if isMaster {
 		status.NodeMode = "master"
 		status.ClusterActive = true

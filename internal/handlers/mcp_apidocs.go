@@ -8,7 +8,7 @@ func init() {
 		Summary:     "MCP 工具注册表",
 		Response:    `{"code":0,"message":"查询成功","data":[{"name":"list_rules","description":"列出全部负载均衡规则","method":"GET","path":"/api/v1/rules","read_only":true}]}`,
 		Errors:      []string{"401 unauthenticated"},
-		Description: "所有已登录用户可读；返回 MCP 工具名称、描述、映射的 REST 请求与读写分类，不含内部路由参数注记（path_args/query_args），包含各工具 input_schema。read_only 表示该工具对只读 API Key 可用：GET 且非 export_config，或 4 个读探测 POST 工具（test_ca_provider/parse_certificate/validate_import/preview_config）。它与 HTTP 方法是否为 GET 不等价——export_config 虽为 GET 但对只读 Key 不可见（read_only=false）；其余写工具（含 test_certificate_config 证书配置测试）对只读 Key 不可用。",
+		Description: "所有已登录用户可读；返回 MCP 工具名称、描述、映射的 REST 请求与读写分类，不含内部路由参数注记（path_args/query_args），包含各工具 input_schema。read_only 表示该工具对只读 API Key 可用：GET 且非 export_config，或 3 个读探测 POST 工具（parse_certificate/validate_import/preview_config）。它与 HTTP 方法是否为 GET 不等价——export_config 虽为 GET 但对只读 Key 不可见（read_only=false）；其余写工具（含 test_certificate_config 证书配置测试、test_ca_provider 提供商测试）对只读 Key 不可用。",
 	})
 	apiDocRoutes = append(apiDocRoutes, apiDocRoute{
 		Method:      "GET",

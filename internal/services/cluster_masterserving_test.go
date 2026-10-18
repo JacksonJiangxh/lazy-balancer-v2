@@ -110,6 +110,9 @@ func TestTaskEngineWire_ClusterSyncMasterRunsForReal(t *testing.T) {
 	waitForCond(t, 2*time.Second, func() bool {
 		return strings.Contains(readClusterSyncLog(t), "[start] 常驻启动")
 	})
+	waitForCond(t, 2*time.Second, func() bool {
+		return strings.Contains(readClusterSyncLog(t), "主节点巡检启动")
+	})
 	var status string
 	if err := db.DB.QueryRow(`SELECT status FROM task_runs WHERE task_id='cluster-sync' ORDER BY id DESC LIMIT 1`).Scan(&status); err != nil {
 		t.Fatalf("boot 行应落 task_runs: %v", err)

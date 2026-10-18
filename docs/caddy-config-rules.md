@@ -101,6 +101,8 @@ TCP规则A(port=8080) + TCP规则B(port=8080) → 冲突（TCP 端口独占；�
 
 ## 系统启动流程
 
+> 现行入口协议：监督器先等待 Caddy API 就绪并回放 last-known-good，再写入回放标记；应用侧 `waitStartupReplayDone()` 等待该标记（上限 30s）后才应用数据库渲染配置。排障时不要只看 `/config/` 就绪。
+
 ```
 1. 等待 Caddy API 就绪
    └── 轮询 http://localhost:2019/config/ 直到返回非500状态

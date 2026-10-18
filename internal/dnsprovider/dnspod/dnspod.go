@@ -184,7 +184,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 
 	var cleanupErr error
 	var failed []ownedRecord
-	deleteOne := func(recordID string) error {
+	deleteOne := func(recordID, value string) error {
 		err := p.deleteRecord(ctx, domainID, recordID)
 		if errors.Is(err, errStaleDomainID) {
 			// 历史问题（历史）：cleanUp 侧的 CERT42-7 同族自愈——缓存的
@@ -225,7 +225,9 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 				// 历史问题：failed 的唯一消费点是下方 ownership==nil 的 owned
 				// 回填；ownership 模式下失败条目由 ownership 留存（删除失败
 				// 不 Remove），不再写入死存储。
-				failed = append(failed, ownedRecord{recordID: recordID})
+				// 历史问题（历史）：回填必须保留 challenge value——后续按值
+				// 清理（CleanUpValue）以 entry.value 过滤，空值条目永不被选中重试。
+				failed = append(failed, ownedRecord{recordID: recordID, value: value})
 			}
 			cleanupErr = errors.Join(cleanupErr, err)
 			return err
@@ -238,7 +240,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 			// its ownership entry (the DNS record may still exist), but an
 			// earlier miss must not skip Remove for records that WERE
 			// deleted — that orphans them until self-heal.
-			if deleteOne(record.RecordID) != nil {
+			if deleteOne(record.RecordID, record.Value) != nil {
 				continue
 			}
 			cleanupErr = errors.Join(cleanupErr, p.ownership.Remove(record))
@@ -252,7 +254,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 		delete(p.owned, key)
 		p.mu.Unlock()
 		for _, entry := range fallback {
-			if deleteOne(entry.recordID) != nil {
+			if deleteOne(entry.recordID, entry.value) != nil {
 				p.mu.Lock()
 				p.owned[key] = append(p.owned[key], entry)
 				p.mu.Unlock()
@@ -260,7 +262,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 		}
 	} else {
 		for _, entry := range memorySelected {
-			deleteOne(entry.recordID)
+			deleteOne(entry.recordID, entry.value)
 		}
 	}
 	if p.ownership == nil && len(failed) > 0 {

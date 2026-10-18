@@ -506,7 +506,7 @@ const openConfigDialog = (config?: CertConfig) => {
         parsedCreds = {}
       }
     } else {
-      parsedCreds = rawCreds
+      parsedCreds = { ...rawCreds }
     }
     if (!parsedCreds.auth_mode) {
       if (parsedCreds.secret_id && parsedCreds.secret_key) {

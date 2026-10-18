@@ -23,7 +23,10 @@ import (
 // normalizeRuleForTransport 规则传输归一（单一事实源）：
 // ① body 上限钳 [0,4096]（历史问题 C-F1）；
 // ② TCP+TLS 死形态清除（历史问题 A-N1）；
-// ③ TCP 行 HTTP 专属七字段归零（LBH-A-U1 同族，2026-10-11 裁定并入导出侧）。
+// ③ TCP 行 HTTP 专属字段归零（LBH-A-U1 同族，2026-10-11 裁定并入导出侧；
+//
+//	LBH79-历史问题.1 补 health_check_host）。
+//
 // ④ 健康检查族/tcp_try_interval 值型列回填（库值唯一真相批 1+2，2026-10-14
 //
 //	用户裁定）：<=0 归治理默认（db.Default* 常量）——主端带外脏行/旧版本
@@ -73,6 +76,9 @@ func normalizeRuleForTransport(rule *models.LbRule) {
 		// 「没有就都应该没有」：主端存储、导出、从端落库三面全零。
 		rule.HostHeader = ""
 		rule.HealthCheckPath = ""
+		// LBH79-历史问题.1：健康检查域名同为 HTTP-only（TCP 探针走端口）——
+		// 保存族（tcpDeadFieldReset）已清，传输族补齐，避免主从/导入面分叉。
+		rule.HealthCheckHost = ""
 		rule.EnableCompress = false
 		rule.CompressTypes = ""
 		rule.RequestBodyMaxSizeMB = 0

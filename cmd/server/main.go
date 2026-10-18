@@ -109,7 +109,7 @@ func run() error {
 	}
 
 	// Initialize services
-	caddyService := services.NewCaddyService(cfg.CaddyAdminURL)
+	caddyService := services.NewCaddyServiceWithMetricsURL(cfg.CaddyAdminURL, cfg.CaddyMetricsURL)
 	// 2026-09-06 裁定 ③：每次成功下发后落盘最后已知正确配置，启动 DB 渲染
 	// 被拒时回退应用（负载均衡可用性兜底）。
 	// 2026-09-06 裁定 ④'：任意 Caddy 修改三层校验的 Caddy 层——写路径在事务内
@@ -190,8 +190,8 @@ func run() error {
 	services.SetSyncLifecycleHooks(syncService.Start, syncService.Stop)
 	// 自动备份执行器必须先于 InitTaskEngine：启用且存在补跑槽时，
 	// 引擎首轮可能在毫秒内到期，不得在 nil executor 下记录成功。
-	services.SetAutoBackupExecutor(func(trigger, operator string, engineRunID int64) error {
-		_, err := h.RunAutoBackupOnce(trigger, operator, engineRunID)
+	services.SetAutoBackupExecutor(func(ctx context.Context, trigger, operator string, engineRunID int64) error {
+		_, err := h.RunAutoBackupOnce(ctx, trigger, operator, engineRunID)
 		return err
 	})
 	// 历史问题：威胁库依赖（reloader/投影回调/manager 单例）必须先于
@@ -209,6 +209,12 @@ func run() error {
 	// 引擎收尾统一交由下方 tail defer（StopTaskEngine 幂等）；此处不再重复
 	// defer（INFRA-1 历史：双 defer 依赖幂等，收敛单点收尾）。
 
+	// 威胁大屏 rollup 后台固化（幂等：启动即一次 + 每 60s 一轮；启动后大屏
+	// 请求路径不再懒固化，避免与用户请求抢写锁/重复回填）。
+	warmerCtx, warmerCancel := context.WithCancel(context.Background())
+	cancelThreatRollupWarmer := warmerCancel
+	handlers.StartThreatRollupWarmer(warmerCtx)
+
 	// Setup router
 	router := middleware.SetupRouter(h, cfg)
 	restart, requestRestart := newRestartSignal()
@@ -224,7 +230,9 @@ func run() error {
 	var isMaster bool
 	if err := db.DB.QueryRow("SELECT is_master FROM global_config WHERE id=1").Scan(&isMaster); err != nil {
 		services.Logf("error", "failed to read cluster role: %v", err)
-		isMaster = true
+		// 仅用于爬虫名单播种；读取失败按从节点处理（fail-closed），
+		// 与任务引擎同一列的角色失败语义对齐。
+		isMaster = false
 	}
 	// 历史问题：自动封禁名单变化后的收敛。投影热路径优先（2026-10-15 用户裁定）：
 	// 资格门（被启用策略引用；受信代理引用面已随 tp.txt/lb_file 热路径化
@@ -243,6 +251,7 @@ func run() error {
 	// 审计日志轮转由事件摄入循环驱动（先采集后轮转），此处无需独立启动器
 	// 安全事件采集已由任务引擎接管（InitTaskEngine 注册 2s 循环）
 	defer func() {
+		cancelThreatRollupWarmer()
 		// 审计 历史问题：事件摄入与其余 worker 同生命周期——db.Close 前 cancel，
 		// 否则退出窗口内每 2s 对已关闭 MetricsDB 刷 "database is closed" 告警。
 		services.StopTaskEngine() // M2:引擎统一收尾(摄取/看门狗/清理)
@@ -257,7 +266,7 @@ func run() error {
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	// 版本单一事实源=config(APP_VERSION env/Dockerfile ARG 兜底)——此前打印
 	// ldflags 变量 version(无注入链恒 "dev"),与 branding API 版本分叉
-	// (v2.3.0 首发漏注入,记忆在案)。ldflags 变量保留给 go 直编场景。
+	// (v2.3.0 首发漏注入,记忆在案)。不存在 ldflags 注入通道。
 	log.Printf("Starting lazy-balancer-v2 %s on %s", cfg.Version, addr)
 	server := &http.Server{
 		Addr:              addr,

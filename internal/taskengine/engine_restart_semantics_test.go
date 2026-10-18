@@ -207,8 +207,10 @@ func TestEngine_TaskRunPanicRecordsFailed(t *testing.T) {
 
 // Given daemon 任务体启动即 panic（历史问题-01）。
 // When StartLoop。
-// Then 补记 failed 行且不自动重启（防紧循环）。
-func TestEngine_DaemonRunPanicRecordsFailedNoRestart(t *testing.T) {
+// Then 补记 failed 行且退避窗口内不得紧循环（历史问题-04 起异常退出按有界退避
+// 重拉——默认首档 1s，本断言窗口 200ms 内必须保持未运行；重拉本身由
+// u05_r79_test.go 的缩短退避用例覆盖）。
+func TestEngine_DaemonRunPanicRecordsFailedWithBackoff(t *testing.T) {
 	e := newTestEngine(t)
 	e.Register(Descriptor{ID: "t-dpanic", Family: "t", Name: "恐慌常驻", Kind: KindDaemon, RunsOn: RoleAny,
 		Run: func(rc RunContext) error { panic("daemon boom") }})
@@ -227,13 +229,13 @@ func TestEngine_DaemonRunPanicRecordsFailedNoRestart(t *testing.T) {
 	if !sawFailed {
 		t.Fatal("daemon panic 应补记 failed 行")
 	}
-	// 不自动重启：真实运行位归 false 后保持
+	// 退避窗口内不得紧循环（真实运行位归 false 后保持）
 	if !waitDaemonNotRunning(t, e, "t-dpanic", time.Second) {
-		t.Fatal("daemon panic 后不得自动重启（防紧循环）")
+		t.Fatal("daemon panic 后必须退出运行（不得紧循环）")
 	}
 	time.Sleep(200 * time.Millisecond)
 	if daemonRunning(e, "t-dpanic") {
-		t.Fatal("daemon panic 后被自动重启——紧循环风险")
+		t.Fatal("daemon panic 后在退避窗口内被立即重启——紧循环风险")
 	}
 }
 

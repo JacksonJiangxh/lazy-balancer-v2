@@ -177,7 +177,8 @@ const (
 
 // applyCrawlerVerification UA 命中引擎 → PTR 双跳验证：通过置 Verified=引擎 ID
 // （下游豁免规则 @streq 消费）；未通过置 Spoof=1（伪装事件规则消费）。
-// 非爬虫 UA 零成本直接返回（2000/s 正常流量仅付一次正则）。
+// 非爬虫 UA 不做 DNS/PTR，但 MatchCrawlerEngine 仍需顺序扫描引擎正则表；
+// 未命中时承担全表预编译正则成本，命中时每个 UA 只匹配一次。
 func (h *GeoIPHandler) applyCrawlerVerification(r *http.Request) {
 	// 历史问题：渲染门控字段 false（无爬虫豁免策略）时零 DNS/PTR 开销；
 	// 客户端伪造头已在 ServeHTTP 入口剥离，因此「只剥不验」是安全形态。
@@ -209,11 +210,10 @@ func clientIPForVerify(r *http.Request) string {
 	return realClientIP(r)
 }
 
-// Cleanup releases the handler's reference to the shared singleton (审计 M2)：
-// 单例按 XdbPath 进程级共享、生命周期与进程相同——关闭会打断仍在使用同路径的
-// 其他 handler（重载窗口内新旧配置并存），故此处不 Close。
+// Cleanup 不关闭也不置空共享 searcher：单例按 XdbPath 进程级共享，换库由
+// geoipOldInstanceCloseDelay 延迟回收。保留旧 handler 的指针可让 Caddy 重载
+// 窗口内的在途请求继续查库，并消除 Cleanup 与 ServeHTTP 之间的数据竞争。
 func (h *GeoIPHandler) Cleanup() error {
-	h.searcher = nil
 	return nil
 }
 
@@ -331,34 +331,20 @@ func realClientIP(r *http.Request) string {
 // internal/services 手工镜像双份，靠解析对侧源文本的镜像测试防漂移；
 // 中立叶模块经根/caddygeoip 双 replace 接线，与 wafiplist 同模式）。
 
-// normalizeProvince 规范 xdb 省列原始值；不可识别（乱码）原样返回（不出现在
-// 选项树中，策略不会配置）；台湾城市误入省列时省变量按台湾省发射、城市变量
-// 改发省列值（见 setGeoIPPlaceholders——该类段的城市列是乱码值）。
+// normalizeProvince 发射侧省列规范化——单源 geoipnames.ProvinceForEmit
+// （历史问题 历史下沉：此前与 internal/services.normalizeIP2Province 是
+// 两份手工镜像，语义分叉靠调用点补偿）。台湾城市误入省列时省变量按台湾省
+// 发射、城市变量改发省列值（见 setGeoIPPlaceholders——该类段的城市列是
+// 乱码值）；无效值（空/"0"）→ 空串；别名归一；不可识别（乱码）原样返回
+// （不出现在选项树中，策略不会配置）。
 func normalizeProvince(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	if canonical, ok := geoipnames.ProvinceAliases[trimmed]; ok {
-		return canonical
-	}
-	if geoipnames.TaiwanCities[trimmed] {
-		return "台湾省"
-	}
-	return trimmed
+	return geoipnames.ProvinceForEmit(raw)
 }
 
-// normalizeCity 规范 xdb 城市列原始值：拼音映射表命中返回规范中文；未映射的
-// ASCII 城市原样返回（选项树侧会过滤、策略不会配置，发射原值恒不命中——与
-// normalizeProvince 的不可识别语义一致）；中文城市原样通过。
+// normalizeCity 发射侧城市列规范化——单源 geoipnames.CityForEmit：表映射
+// 命中返回规范中文；无效值（空/"0"）→ 空串；未映射的 ASCII 城市原样返回
+// （选项树侧会过滤、策略不会配置，发射原值恒不命中——与 normalizeProvince
+// 的不可识别语义一致）；中文城市原样通过。
 func normalizeCity(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || trimmed == "0" {
-		return ""
-	}
-	if fixed, ok := geoipnames.CityPinyinFixes[trimmed]; ok {
-		return fixed
-	}
-	// 历史问题 二十八次：少数民族自治州简称 → 全称（geoipnames.AutonomousPrefectures）。
-	if full, ok := geoipnames.AutonomousPrefectures[trimmed]; ok {
-		return full
-	}
-	return trimmed
+	return geoipnames.CityForEmit(raw)
 }

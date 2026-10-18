@@ -36,6 +36,30 @@ func snapshotScalarString(value interface{}) string {
 	}
 }
 
+func securityPolicySchemaColumns(t *testing.T, database *sql.DB) []string {
+	t.Helper()
+	rows, err := database.Query(`SELECT name FROM pragma_table_info('security_policies') ORDER BY cid`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var columns []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		columns = append(columns, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(columns) == 0 {
+		t.Fatal("security_policies schema is empty")
+	}
+	return columns
+}
+
 func TestClusterSnapshot_securityPoliciesIncludeFullColumnSet(t *testing.T) {
 	// Given
 	cluster, database := newClusterTestService(t)
@@ -74,6 +98,215 @@ func TestClusterSnapshot_securityPoliciesIncludeFullColumnSet(t *testing.T) {
 	for column, expected := range want {
 		if got := snapshotScalarString(policy[column]); got != expected {
 			t.Errorf("policy column %s=%q, want %q", column, got, expected)
+		}
+	}
+}
+
+func TestClusterSnapshot_securityPoliciesSchemaColumnParity(t *testing.T) {
+	// Given：初始化后的真实表形状（fresh DDL ∪ newColumns 的终态）与一行策略。
+	cluster, database := newClusterTestService(t)
+	if _, err := database.Exec(`INSERT INTO security_policies (id,name) VALUES (5,'schema parity')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When：走生产快照导出。
+	snapshot, _, err := cluster.Snapshot(context.Background(), 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Then：dump 键集合必须与表列集合完全相等，新增列不得只落 schema。
+	schemaColumns := make(map[string]bool)
+	for _, column := range securityPolicySchemaColumns(t, database) {
+		schemaColumns[column] = true
+	}
+	var policies []map[string]interface{}
+	if err := json.Unmarshal(snapshot.SecurityPolicies, &policies); err != nil {
+		t.Fatalf("parse security policies: %v", err)
+	}
+	if len(policies) != 1 || len(schemaColumns) == 0 {
+		t.Fatalf("policies=%d schema columns=%d, want 1 and non-empty", len(policies), len(schemaColumns))
+	}
+	for column := range schemaColumns {
+		if _, ok := policies[0][column]; !ok {
+			t.Errorf("snapshot lacks security_policies column %q", column)
+		}
+	}
+	for column := range policies[0] {
+		if !schemaColumns[column] {
+			t.Errorf("snapshot contains non-schema security_policies key %q", column)
+		}
+	}
+}
+
+func TestApplySnapshot_securityPoliciesEverySchemaColumnRoundTrip(t *testing.T) {
+	// Given：不依赖 snapshot dump 的全列哨兵载荷——专门隔离 apply INSERT 漏列。
+	_, database := newClusterTestService(t)
+	columns := securityPolicySchemaColumns(t, database)
+	jsonColumns := map[string]bool{
+		"ip_acl_list": true, "ip_whitelist": true, "ip_blacklist": true,
+		"crs_rule_groups": true, "crs_excluded_rules": true, "custom_rules": true,
+		"geoip_countries": true, "geoip_crawler_engines": true,
+		"ip_acl_list_refs": true, "ip_whitelist_refs": true,
+	}
+	booleanColumns := map[string]bool{
+		"ip_acl_enabled": true, "ip_whitelist_enabled": true, "rate_limit_enabled": true,
+		"enabled": true, "geoip_crawler_exempt": true, "waf_check_response": true,
+		"log_request_body": true, "trust_detection": true,
+	}
+	expected := make(map[string]interface{}, len(columns))
+	for _, column := range columns {
+		switch {
+		case column == "name":
+			expected[column] = "apply parity"
+		case column == "description":
+			expected[column] = "every column"
+		case column == "mode":
+			expected[column] = "blocking"
+		case column == "ip_acl_mode":
+			expected[column] = "deny"
+		case column == "geoip_mode":
+			expected[column] = "off"
+		case column == "policy_type":
+			expected[column] = "stage0"
+		case column == "created_at" || column == "updated_at":
+			expected[column] = "2026-01-02 03:04:05"
+		case column == "block_status_code":
+			expected[column] = 403
+		case column == "enabled" || column == "ip_whitelist_enabled":
+			expected[column] = 0
+		case jsonColumns[column]:
+			expected[column] = `["7"]`
+		case booleanColumns[column]:
+			expected[column] = 1
+		default:
+			// 当前其余列均为整数（id/阈值/限流/审计外键等）；未来新增文本列
+			// 若引入约束，本测试会以真实 SQLite 错误要求显式登记其有效哨兵。
+			expected[column] = 7
+		}
+	}
+	rawPolicies, err := json.Marshal([]map[string]interface{}{expected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := models.ClusterSnapshot{
+		Version:             9,
+		SecurityPolicies:    rawPolicies,
+		SecurityBindings:    json.RawMessage("[]"),
+		SecurityCustomRules: []models.SecurityCustomRule{},
+		SecurityBlockPages:  []models.SecurityBlockPage{},
+		SecurityIPLists:     json.RawMessage("[]"),
+		SecurityCRSVersion:  []models.ClusterSecurityCRSVersion{},
+	}
+
+	// When：走生产 replaceSnapshotTx/applySecurityTables。
+	if err := replaceSnapshotDB(context.Background(), database, snapshot); err != nil {
+		t.Fatalf("apply full-column snapshot: %v", err)
+	}
+
+	// Then：逐列读取真实 SQLite 文本值；任何 INSERT 漏列都会落 schema 默认值而判红。
+	for _, column := range columns {
+		var got string
+		query := fmt.Sprintf(`SELECT CAST("%s" AS TEXT) FROM security_policies WHERE id=7`, column)
+		if err := database.QueryRow(query).Scan(&got); err != nil {
+			t.Fatalf("read applied column %s: %v", column, err)
+		}
+		if want := snapshotScalarString(expected[column]); got != want {
+			t.Errorf("applied column %s=%q, want %q", column, got, want)
+		}
+	}
+}
+
+func TestSyncService_applySnapshot_geoIPCrawlerExemptionRoundTrip(t *testing.T) {
+	stubSecurityLibsAvailable(t)
+	// Given：主端非默认爬虫豁免值，经真实绑定参与渲染。
+	cluster, database := newClusterTestService(t)
+	const engines = `["googlebot","baiduspider"]`
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_crawler_sync','crawler','http','crawler.example.test',80,1);
+		INSERT INTO upstreams (rule_id,host,port,enabled) VALUES ('lb_crawler_sync','127.0.0.1',8080,1);
+		INSERT INTO security_policies (id,name,mode,enabled,geoip_countries,geoip_mode,geoip_crawler_exempt,geoip_crawler_engines)
+		VALUES (7,'crawler exemption','blocking',1,'["海外"]','deny',1,'["googlebot","baiduspider"]');
+		INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES ('lb_crawler_sync',7)`); err != nil {
+		t.Fatal(err)
+	}
+	masterPolicy := scanSecurityPolicyByID(7)
+	if masterPolicy == nil {
+		t.Fatal("master policy missing")
+	}
+	masterDirectives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{masterPolicy}, 403, "lb_crawler_sync"))
+
+	// When：主端真实快照导出。
+	snapshot, _, err := cluster.Snapshot(context.Background(), 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Then：快照先携带哨兵值；用 Errorf 继续跑 apply，分别暴露 dump/apply 缺列。
+	var exported []map[string]interface{}
+	if err := json.Unmarshal(snapshot.SecurityPolicies, &exported); err != nil {
+		t.Fatalf("parse exported policies: %v", err)
+	}
+	if len(exported) != 1 {
+		t.Fatalf("exported policies=%d, want 1", len(exported))
+	}
+	if got := snapshotScalarString(exported[0]["geoip_crawler_exempt"]); got != "1" {
+		t.Errorf("snapshot geoip_crawler_exempt=%q, want 1", got)
+	}
+	if got := snapshotScalarString(exported[0]["geoip_crawler_engines"]); got != engines {
+		t.Errorf("snapshot geoip_crawler_engines=%q, want %s", got, engines)
+	}
+
+	// When：从端清空本地策略，经生产 applySnapshot 落库并生成/提交 Caddy 配置。
+	if _, err := database.Exec(`DELETE FROM security_policy_bindings; DELETE FROM security_policies; UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	clusterSnapshotCaches.Delete(database)
+	var mu sync.Mutex
+	var applied []byte
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		body, _ := io.ReadAll(request.Body)
+		mu.Lock()
+		applied = body
+		mu.Unlock()
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer caddyServer.Close()
+	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
+	if err := syncService.applySnapshot(context.Background(), snapshot); err != nil {
+		t.Fatalf("apply snapshot: %v", err)
+	}
+
+	// Then：从库值、真实渲染预载与安全指令均与主端一致。
+	var exempt int
+	var storedEngines string
+	if err := database.QueryRow(`SELECT geoip_crawler_exempt,geoip_crawler_engines FROM security_policies WHERE id=7`).Scan(&exempt, &storedEngines); err != nil {
+		t.Fatal(err)
+	}
+	if exempt != 1 || storedEngines != engines {
+		t.Errorf("applied crawler values=(%d,%s), want (1,%s)", exempt, storedEngines, engines)
+	}
+	policyContext, err := loadSecurityPolicyContext(database)
+	if err != nil {
+		t.Fatalf("load slave policy context: %v", err)
+	}
+	policies := policyContext.policyByRule["lb_crawler_sync"]
+	if len(policies) != 1 {
+		t.Fatalf("slave policies=%d, want 1", len(policies))
+	}
+	slavePolicy := policies[0]
+	if !slavePolicy.GeoIPCrawlerExempt || string(slavePolicy.GeoIPCrawlerEngines) != engines {
+		t.Errorf("slave render input crawler=(%v,%s), want (true,%s)", slavePolicy.GeoIPCrawlerExempt, slavePolicy.GeoIPCrawlerEngines, engines)
+	}
+	slaveDirectives := mustDirectives(buildIPPrecheckDirectives(policies, 403, "lb_crawler_sync"))
+	if slaveDirectives != masterDirectives {
+		t.Errorf("slave directives diverge from master:\n%s\nwant:\n%s", slaveDirectives, masterDirectives)
+	}
+	mu.Lock()
+	appliedConfig := string(applied)
+	mu.Unlock()
+	for _, engine := range []string{"googlebot", "baiduspider"} {
+		if !strings.Contains(appliedConfig, engine) {
+			t.Errorf("applied Caddy config lacks crawler engine %q", engine)
 		}
 	}
 }

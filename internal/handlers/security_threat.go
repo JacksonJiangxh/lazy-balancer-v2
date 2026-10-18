@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -67,7 +69,14 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 	for _, s := range rawRows {
 		listName := db.ThreatListNameBySource(s.Name)
 		if listName != "" {
-			_ = db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=?`, listName).Scan(&s.ListID)
+			// 历史问题：缺行=未生成内置名单（list_id=0 由前端引导），其余
+			// 数据库错误必须显式 500——静默吞错会让「查看名单」无提示失效。
+			// 历史问题：按 system=1 定位（同名用户列表不是内置行）。
+			lerr := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND system=1`, listName).Scan(&s.ListID)
+			if lerr != nil && !errors.Is(lerr, sql.ErrNoRows) {
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取内置名单失败: " + lerr.Error()})
+				return
+			}
 		}
 		totalEntries += s.EntryCount
 		sources = append(sources, s)
@@ -150,7 +159,13 @@ func (h *Handlers) UpdateThreatSourceFlags(c *gin.Context) {
 	}
 	var name string
 	if err := db.DB.QueryRow(`SELECT name FROM security_threat_sources WHERE id=?`, id).Scan(&name); err != nil {
-		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "威胁库源不存在"})
+		// 历史问题：DB 故障不得误报 404——缺行=404，其余=500（与
+		// security_overview 的 ErrNoRows→404 同族契约）。
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "威胁库源不存在"})
+		} else {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取威胁库源失败: " + err.Error()})
+		}
 		return
 	}
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=?, updated_at=datetime('now') WHERE id=?`, *body.UpdateEnabled, id); err != nil {

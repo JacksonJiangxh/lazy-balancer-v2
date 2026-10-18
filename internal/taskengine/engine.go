@@ -130,8 +130,10 @@ type registration struct {
 	lastCheck         time.Time // Periodic：最近到期判定基准
 	nextScheduledTime time.Time // Scheduled：下一槽（每 tick 重读——µs 级 SELECT）
 	loopEnabled       bool      // 循环/调度开关
-	loopUserStopped   bool      // 历史问题：调度被显式停止（用户/业务/引擎自停）——有活唤醒可越过
 	pendingRestart    bool      // daemon restart 意图：旧 Run 退出后自动拉起新代（历史问题-3）
+	// 历史 历史问题-04：常驻异常退出有界重拉状态。
+	abnormalRestarts int  // 连续异常退出次数（健康运行一段后或显式重启归零）
+	relaunchPending  bool // 退避等待中的重拉已排定（防重复排定）
 }
 
 // ---- Engine ----
@@ -153,20 +155,38 @@ type Engine struct {
 	startedAt time.Time
 	daemonWG  sync.WaitGroup // daemon goroutine 退出等待（2026-10-04 测试污染修复）
 	runWG     sync.WaitGroup // Scheduled/Periodic/Oneshot 在途 Run 退出等待
+
+	// daemonRestartDelays 常驻异常退出后的有界重拉退避表（历史问题-04）
+	daemonRestartDelays []time.Duration
 }
 
 type Options struct {
 	TickInterval time.Duration
+	// DaemonRestartDelays 常驻任务异常退出（Run 返回错误/panic）后的有界自动
+	// 重拉退避（历史 历史问题-04）：长度=最大重拉次数，逐次消耗。空=引擎
+	// 默认 1s/5s/30s（三次用尽后停止调度并留痕，防紧循环）。
+	DaemonRestartDelays []time.Duration
 }
+
+// 默认常驻重拉退避（1s/5s/30s）与「健康运行」判定阈值：Run 存活超过该
+// 阈值再异常退出视为新故障（重置重拉预算），避免历史抖动永久耗尽预算。
+var defaultDaemonRestartDelays = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second}
+
+const daemonAbnormalResetAfter = time.Minute
 
 func NewEngine(opts Options) *Engine {
 	if opts.TickInterval <= 0 {
 		opts.TickInterval = time.Second
 	}
+	delays := opts.DaemonRestartDelays
+	if len(delays) == 0 {
+		delays = defaultDaemonRestartDelays
+	}
 	e := &Engine{
 		opts: opts, regs: map[string]*registration{}, role: true,
 		schedStop: make(chan struct{}), schedDone: make(chan struct{}),
-		startedAt: time.Now(),
+		startedAt:           time.Now(),
+		daemonRestartDelays: append([]time.Duration(nil), delays...),
 	}
 	go e.scheduleLoop()
 	return e
@@ -520,7 +540,11 @@ func (e *Engine) StartLoop(id string) {
 	r.mu.Lock()
 	wasOn := r.loopEnabled
 	r.loopEnabled = true
-	r.loopUserStopped = false
+	if !wasOn {
+		// 用户显式重启（关→开）=新一轮预算：清空历史异常重拉计数。
+		r.abnormalRestarts = 0
+		r.relaunchPending = false
+	}
 	r.lastCheck = time.Time{}
 	r.mu.Unlock()
 	// Daemon：CAS 启动（历史问题-4）。关→开过渡=真实重启意图（背靠背
@@ -537,8 +561,9 @@ func (e *Engine) StartLoop(id string) {
 //     不改变 loopEnabled——不得覆盖用户明确停止的调度。
 //   - 携带 hasWork（业务唤醒形态，cert-waiting-ca 等入队唤醒）：hasWork=false
 //     零动作；hasWork=true 表示确有新工作待消费——越过「已停止」态恢复调度
-//     并立即补跑（新工作必须有消费通道）。loopUserStopped 标记停止来源；越过
-//     即清除标记，后续仍以 loopEnabled 为唯一调度事实。
+//     并立即补跑（新工作必须有消费通道）。越过即打开 loopEnabled，后续仍以
+//     loopEnabled 为唯一调度事实（跨重启的停止来源语义由 task_loop_prefs 承担，
+//     引擎内不再保留第二状态位）。
 func (e *Engine) RearmLoop(id string, hasWork ...bool) {
 	if e.stopped.Load() {
 		return
@@ -556,7 +581,6 @@ func (e *Engine) RearmLoop(id string, hasWork ...bool) {
 	r.mu.Lock()
 	if 绕过 {
 		r.loopEnabled = true
-		r.loopUserStopped = false
 	} else if !r.loopEnabled {
 		r.mu.Unlock()
 		return
@@ -578,7 +602,6 @@ func (e *Engine) StopLoop(id string) {
 	}
 	r.mu.Lock()
 	r.loopEnabled = false
-	r.loopUserStopped = true
 	r.lastCheck = time.Time{}
 	c := r.cancel
 	r.mu.Unlock()
@@ -640,6 +663,10 @@ func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, ca
 
 		var relaunchCtx context.Context
 		var relaunchCancel context.CancelFunc
+		// 历史 历史问题-04：异常退出有界重拉（退避在锁外等待）。
+		var relaunchDelay time.Duration
+		var relaunchAttempt int
+		var abnormalExhausted bool
 		// 历史问题 锁序：r.mu 内不得取 roleMu（runNow 的反向序为 roleMu→r.mu）。
 		// 角色/停止态在进入 r.mu 前快照——退出清理只消费快照，不反向嵌套。
 		allows := e.roleAllows(r.desc.RunsOn)
@@ -663,6 +690,25 @@ func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, ca
 				}
 			}
 		}
+		// 异常退出（非取消）且仍在调度=故障自愈：按有界退避重拉。修复前仅
+		// 显式 restart 意图会换代——安全事件采集/证书签发/集群同步任一轮
+		// panic 即永久停摆（loop_on 仍 true、状态列恒「空闲」）。
+		if abnormal {
+			if dur >= daemonAbnormalResetAfter.Milliseconds() {
+				// 健康运行一段后再崩=新故障，预算重置（历史抖动不得永久耗尽）。
+				r.abnormalRestarts = 0
+			}
+			if r.loopEnabled && !stopped && allows && !r.relaunchPending {
+				if r.abnormalRestarts < len(e.daemonRestartDelays) {
+					relaunchDelay = e.daemonRestartDelays[r.abnormalRestarts]
+					r.abnormalRestarts++
+					r.relaunchPending = true
+					relaunchAttempt = r.abnormalRestarts
+				} else {
+					abnormalExhausted = true
+				}
+			}
+		}
 		r.mu.Unlock()
 
 		if abnormal {
@@ -670,14 +716,61 @@ func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, ca
 			failID := globalInsertRunAt(id, r.desc.Family, "auto", start.In(engineLocPtr()).Format("2006-01-02 15:04:05"), "")
 			e.finishRunWithMessage(failID, "failed", dur, truncMsg(err))
 			taskLogAppend(id, fmt.Sprintf("[done] failed 耗时=%dms 触发=auto 错误=%s", dur, err.Error()))
+			switch {
+			case relaunchDelay > 0:
+				taskLogAppend(id, fmt.Sprintf("[restart] 常驻异常退出，%s 后第 %d/%d 次自动重启",
+					relaunchDelay, relaunchAttempt, len(e.daemonRestartDelays)))
+			case abnormalExhausted:
+				taskLogAppend(id, fmt.Sprintf("[done] 常驻任务异常退出，自动重启 %d 次已用尽且已停止调度（需手动重启）",
+					len(e.daemonRestartDelays)))
+			}
 		} else {
 			taskLogAppend(id, fmt.Sprintf("[done] stopped 耗时=%dms 触发=auto（取消/正常退出）", dur))
 		}
 		if relaunchCtx != nil {
 			e.startDaemon(id, r, relaunchCtx, relaunchCancel) // 历史问题-3：restart 意图落地——新代接续
 		}
+		if relaunchDelay > 0 {
+			e.scheduleDaemonRelaunch(r, relaunchDelay)
+		}
 	}()
 	return true
+}
+
+// scheduleDaemonRelaunch 常驻异常退出后的有界延迟重拉（历史问题-04）。退避窗口
+// 内 running 保持 false（状态列如实呈现 failed）；到点经 tryStartDaemon 统一
+// CAS 入口（重读 loopEnabled/stopped/running），用户启停/角色翻转可随时越过。
+func (e *Engine) scheduleDaemonRelaunch(r *registration, delay time.Duration) {
+	e.mu.RLock()
+	if e.stopped.Load() {
+		e.mu.RUnlock()
+		r.mu.Lock()
+		r.relaunchPending = false
+		r.mu.Unlock()
+		return
+	}
+	e.daemonWG.Add(1) // Add 在 stopped 复核后、仍持 e.mu.RLock——Stop 的 Wait 不会漏等
+	e.mu.RUnlock()
+	go func() {
+		defer e.daemonWG.Done()
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-e.schedStop:
+			r.mu.Lock()
+			r.relaunchPending = false
+			r.mu.Unlock()
+			return
+		}
+		r.mu.Lock()
+		r.relaunchPending = false
+		r.mu.Unlock()
+		if !e.roleAllows(r.desc.RunsOn) {
+			return // 角色不符：promote 时 SetRole 的常驻分支会拉起
+		}
+		e.tryStartDaemon(r, false)
+	}()
 }
 
 // runGuarded 隔离任务体 panic（历史问题-01）：任一任务体 panic 不得杀死
@@ -1267,16 +1360,18 @@ func (e *Engine) Lookup(id string) (TaskMeta, bool) {
 		Enabled:      true,
 		Controllable: r.desc.Kind == KindDaemon,
 	}
+	// 历史问题-04：与 tick 同口径的闭包 panic 隔离（safe*）——装配闭包单任务
+	// 缺陷不得让 GET /system/tasks / toggle / detail 整页 500。
 	if r.desc.IntervalFn != nil {
-		m.IntervalSec = int(r.desc.IntervalFn().Seconds())
+		m.IntervalSec = int(safeInterval(id+".IntervalFn", r.desc.IntervalFn).Seconds())
 	}
 	if r.desc.NextSlotFn != nil {
-		if t := r.desc.NextSlotFn(); !t.IsZero() {
+		if t := safeSlot(id+".NextSlotFn", r.desc.NextSlotFn); !t.IsZero() {
 			m.NextSlot = t.In(engineLocPtr()).Format("2006-01-02 15:04:05")
 		}
 	}
 	if r.desc.EnabledFn != nil {
-		m.Enabled = r.desc.EnabledFn()
+		m.Enabled = safeBool(id+".EnabledFn", r.desc.EnabledFn)
 	}
 	// 状态镜像角色门：与 DescribeAll 同门（2026-10-03 裁定）——角色不符
 	// 不采纳，单任务查询不旁路。
@@ -1315,16 +1410,17 @@ func (e *Engine) DescribeAll() []TaskMeta {
 			Enabled:      true,
 			Controllable: s.desc.Kind == KindDaemon, // 常驻族可启停（真实生命周期挂钩——B 完全标准化）
 		}
+		// 历史问题-04：闭包 panic 隔离（与 Lookup/tick 同口径）
 		if s.desc.IntervalFn != nil {
-			m.IntervalSec = int(s.desc.IntervalFn().Seconds())
+			m.IntervalSec = int(safeInterval(s.id+".IntervalFn", s.desc.IntervalFn).Seconds())
 		}
 		if s.desc.NextSlotFn != nil {
-			if t := s.desc.NextSlotFn(); !t.IsZero() {
+			if t := safeSlot(s.id+".NextSlotFn", s.desc.NextSlotFn); !t.IsZero() {
 				m.NextSlot = t.In(engineLocPtr()).Format("2006-01-02 15:04:05")
 			}
 		}
 		if s.desc.EnabledFn != nil {
-			m.Enabled = s.desc.EnabledFn()
+			m.Enabled = safeBool(s.id+".EnabledFn", s.desc.EnabledFn)
 		}
 		// 状态镜像角色门（2026-10-03 裁定）：任务不在本角色运行时，其
 		// StatusFn 读到的常是同步来的业务数据（从节点 cert_jobs/
@@ -1385,6 +1481,61 @@ func (e *Engine) Stats24h(taskID string) TaskRunsStats {
 		COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0)
 		FROM task_runs WHERE task_id=? AND started_at > datetime(?, '-1 day')`, taskID, engineNowStr()).Scan(&st.Runs, &st.Success, &st.Fail)
 	return st
+}
+
+func (e *Engine) RunOverview() (map[string]*RunRecord, map[string]TaskRunsStats) {
+	latest := map[string]*RunRecord{}
+	stats := map[string]TaskRunsStats{}
+	if db.DB == nil {
+		return latest, stats
+	}
+	// 最近运行：每任务最大 id（与 History(...,1) 的 ORDER BY id DESC LIMIT 1 同义）。
+	rows, err := db.DB.Query(
+		`SELECT id, task_id, family, trigger, COALESCE(operator,''), status, started_at,
+			COALESCE(finished_at,''), COALESCE(duration_ms,0), COALESCE(message,'')
+			FROM task_runs WHERE id IN (SELECT MAX(id) FROM task_runs GROUP BY task_id)`)
+	if err != nil {
+		// 降级为空记录（视图仍可用），但不得静默——与同文件其余查询同口径。
+		log.Printf("WARNING: taskengine: 最近运行批量查询失败（任务视图无运行记录）: %v", err)
+	} else {
+		for rows.Next() {
+			var r RunRecord
+			if err := rows.Scan(&r.ID, &r.TaskID, &r.Family, &r.Trigger, &r.Operator, &r.Status, &r.StartedAt,
+				&r.FinishedAt, &r.DurationMs, &r.Message); err != nil {
+				log.Printf("WARNING: taskengine: 最近运行批量行扫描失败（跳过该行）: %v", err)
+				continue
+			}
+			rec := r
+			latest[rec.TaskID] = &rec
+		}
+		if err := rows.Err(); err != nil {
+			log.Printf("WARNING: taskengine: 最近运行批量迭代失败（部分任务缺记录）: %v", err)
+		}
+		rows.Close()
+	}
+	// 24h 统计：与 Stats24h 同窗口/同口径（started_at > now-1day，配置时区墙钟）。
+	statRows, err := db.DB.Query(`SELECT task_id, COUNT(*),
+		COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0)
+		FROM task_runs WHERE started_at > datetime(?, '-1 day') GROUP BY task_id`, engineNowStr())
+	if err != nil {
+		log.Printf("WARNING: taskengine: 24h 统计批量查询失败（计数降级为零）: %v", err)
+		return latest, stats
+	}
+	defer statRows.Close()
+	for statRows.Next() {
+		var id string
+		var st TaskRunsStats
+		if err := statRows.Scan(&id, &st.Runs, &st.Success, &st.Fail); err != nil {
+			log.Printf("WARNING: taskengine: 24h 统计批量行扫描失败（跳过该行）: %v", err)
+			continue
+		}
+		stats[id] = st
+	}
+	if err := statRows.Err(); err != nil {
+		log.Printf("WARNING: taskengine: 24h 统计批量迭代失败（部分任务计数缺失）: %v", err)
+	}
+	return latest, stats
 }
 
 // TaskHourlyStat 24h 分小时桶（配置时区墙面小时——engineNowStr/CurrentLocation

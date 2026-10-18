@@ -150,7 +150,10 @@ func collectCertJobRows() []TaskInfo {
 			ti.Status = TaskStatusFailed
 		case "issued":
 			ti.Status = TaskStatusIdle
-		case "queued", "pending":
+		case "queued", "pending", "waiting_ca":
+			// 历史问题-05：waiting_ca=CA 429 限流停车态（等 ca_available_after），
+			// 不是处理中——修复前落 default 映射为 running，与 creating_*/
+			// validating 不可区分，运维误以为签发队列在跑。
 			ti.Status = TaskStatusQueued
 		case "disabled":
 			ti.Status = TaskStatusDisabled
@@ -171,6 +174,9 @@ func collectCertJobRows() []TaskInfo {
 // 来自 task_runs，下次时间兜底 last+interval）。
 func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 	var out []TaskInfo
+	// 历史问题-06：最近运行与 24h 统计一次批量取（修复前逐任务 LatestRun+Stats24h
+	// = 2N 条 SQL，前端 5s 轮询下为稳定常驻负载）。
+	latestRuns, runStats := te.RunOverview()
 	for _, m := range te.DescribeAll() {
 		ti := TaskInfo{
 			ID: m.ID, Name: m.Name, Description: m.Description,
@@ -194,14 +200,9 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			ti.Cadence = "手动触发"
 		}
 		// TASK-L3（历史 历史问题）：db.DB nil 防护（与同层 collectCertJobRows 同形）。
-		if m.ID == "cluster-sync" && db.DB != nil {
-			var iv int
-			if err := db.DB.QueryRow("SELECT COALESCE(sync_interval,60) FROM global_config WHERE id=1").Scan(&iv); err == nil {
-				ti.Cadence = fmt.Sprintf("每 %d 秒（用户配置同步间隔）", iv)
-			}
-		}
-		// 历史问题：LatestRun 单次查询复用（曾每任务两查）
-		latestRun := te.LatestRun(m.ID)
+		// 历史问题：LatestRun 单次查询复用（曾每任务两查）；历史问题-06：全部任务
+		// 合并为两条批量查询（RunOverview）。
+		latestRun := latestRuns[m.ID]
 		// 状态分流（方案 A，2026-10-12 用户裁定）：状态列只承载执行语义
 		// （运行中/空闲/失败；cert-job 退役行「已禁用」走 cert-job 行集）。
 		// 调度语义全部归开关列——调度语义只由 loop_on 表达；business_driven
@@ -212,6 +213,10 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		} else if m.Kind == taskengine.KindDaemon {
 			if m.Running {
 				ti.Status = TaskStatusRunning
+			} else if m.LoopOn && latestRun != nil && latestRun.Status == "failed" {
+				// 历史问题-04：调度开但 Run 已死（有界重拉窗口/次数用尽）——必须
+				// 呈现 failed。修复前恒 idle「空闲」，采集/签发永久停摆无信号。
+				ti.Status = TaskStatusFailed
 			} else {
 				ti.Status = TaskStatusIdle // 未跑=空闲（调度关由开关列表达）
 			}
@@ -252,7 +257,7 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		if info, err := os.Stat(taskengine.TaskLogPath(m.ID)); err == nil {
 			ti.LogSizeBytes = info.Size()
 		}
-		st := te.Stats24h(m.ID)
+		st := runStats[m.ID]
 		ti.Runs24h, ti.Success24h, ti.Fail24h = st.Runs, st.Success, st.Fail
 		// 常驻族启动时刻——「常驻 · 启动于」。用该 daemon 最近 boot 行时刻
 		// （重启后正确更新）；从未运行的常驻任务（角色门未获/调度关闭未拉起）

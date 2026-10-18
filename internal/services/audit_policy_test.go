@@ -87,9 +87,7 @@ func TestClassifyAuditRouteMatrix(t *testing.T) {
 }
 
 // 历史问题(C3):POST /settings/oidc/test 是读探测语义(发现+JWKS 可达性,不落库
-// 配置)——只读 API Key 应可调用,须经 readOnlyWriteRoutes 放行。历史问题（第 78
-// 轮）：certificate-configs 两条 test 因真实 DNS TXT 写副作用已移出白名单，
-// 本端点与 ca-providers/:id/test 仍为纯读探测。
+// 配置)——只读 API Key 应可调用,须经 readOnlyWriteRoutes 放行。
 func TestIsReadOnlyWriteRoute_allowsOIDCDiscoveryProbe(t *testing.T) {
 	if !IsReadOnlyWriteRoute("POST", "/api/v1/settings/oidc/test") {
 		t.Fatal("IsReadOnlyWriteRoute(POST /api/v1/settings/oidc/test)=false, want true (读探测语义)")
@@ -97,16 +95,19 @@ func TestIsReadOnlyWriteRoute_allowsOIDCDiscoveryProbe(t *testing.T) {
 }
 
 // 历史问题（历史，主审上调 历史问题）：证书配置两条 test 路由移出只读白名单
-// ——dnsproviders.Validate 会真实 Present+CleanUp DNS TXT（非只读探测）；CA
-// 提供商 test 不发 DNS 写，保留读探测语义。
-func TestIsReadOnlyWriteRoute_certificateConfigTestsAreNotProbes(t *testing.T) {
+// ——dnsproviders.Validate 会真实 Present+CleanUp DNS TXT（非只读探测）。
+// U04a2-历史问题（历史）：CA 提供商 test 同步移出——provider == ZeroSSL 且
+// 缺 EAB 时 TestCAProviderWithContext → AutoProvisionZeroSSLEAB 会申请 EAB 并
+// UPDATE ca_providers.credentials（caproviders.go:342-344），不是纯探测；
+// 只读 API Key/从节点/MFA step-up 三守卫必须恢复完整写权限校验。
+func TestIsReadOnlyWriteRoute_writeSideEffectTestsAreNotProbes(t *testing.T) {
 	for _, path := range []string{"/api/v1/certificate-configs/:id/test", "/api/v1/certificate-configs/test"} {
 		if IsReadOnlyWriteRoute("POST", path) {
 			t.Fatalf("IsReadOnlyWriteRoute(POST %s)=true, want false（真实 DNS 写副作用，三守卫须恢复）", path)
 		}
 	}
-	if !IsReadOnlyWriteRoute("POST", "/api/v1/ca-providers/:id/test") {
-		t.Fatal("IsReadOnlyWriteRoute(POST /api/v1/ca-providers/:id/test)=false, want true（读探测保留）")
+	if IsReadOnlyWriteRoute("POST", "/api/v1/ca-providers/:id/test") {
+		t.Fatal("IsReadOnlyWriteRoute(POST /api/v1/ca-providers/:id/test)=true, want false（ZeroSSL 缺 EAB 时真实写 ca_providers.credentials，三守卫须恢复）")
 	}
 }
 

@@ -147,7 +147,7 @@ func TestClusterService_RegisterNodeStoresAndUpdatesAccessURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
-		Token: token, Name: "slave-a", IPAddress: "172.18.0.2", Port: 8000, AccessURL: "http://127.0.0.1:8001",
+		Token: token, Name: "slave-a", IPAddress: "172.18.0.2", Port: 8000, AccessURL: "http://172.18.0.2:8001",
 	}, now)
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +156,7 @@ func TestClusterService_RegisterNodeStoresAndUpdatesAccessURL(t *testing.T) {
 	if err := database.QueryRow("SELECT access_url FROM nodes WHERE id=?", registration.RegistrationID).Scan(&accessURL); err != nil {
 		t.Fatal(err)
 	}
-	if accessURL != "http://127.0.0.1:8001" {
+	if accessURL != "http://172.18.0.2:8001" {
 		t.Fatalf("access_url=%q", accessURL)
 	}
 	if err := service.UpdateNodeAccessURL(context.Background(), registration.RegistrationID, "https://node.example:8443"); err != nil {

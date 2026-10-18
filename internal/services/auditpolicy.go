@@ -168,7 +168,6 @@ var auditRoutePolicies = map[string]AuditPolicy{
 }
 
 var readOnlyWriteRoutes = map[string]struct{}{
-	"POST /api/v1/ca-providers/:id/test":     {},
 	"POST /api/v1/certificates/jobs/current": {},
 	"POST /api/v1/certificates/parse":        {},
 	"POST /api/v1/config/import/validate":    {},
@@ -178,8 +177,11 @@ var readOnlyWriteRoutes = map[string]struct{}{
 	// 历史问题（历史，主审上调 历史问题）：certificate-configs 两条 test 路由已移出
 	// 只读白名单——providers.Validate 会真实 Present+CleanUp DNS TXT 记录（非读
 	// 探测语义），从节点/只读 API Key 不得触发；三守卫（apiKeyReadOnlyGuard/
-	// mfaStepUpGuard/readOnlyGuard）对两条恢复完整写权限校验。ca-providers/:id/test
-	// 仅探测 ACME 目录/账户可达性（无 DNS 写副作用），保留读探测豁免。
+	// mfaStepUpGuard/readOnlyGuard）对两条恢复完整写权限校验。
+	// U04a2-历史问题（历史）：ca-providers/:id/test 同步移出——ZeroSSL 提供商
+	// 缺 EAB 时 TestCAProviderWithContext 会调 AutoProvisionZeroSSLEAB 申请 EAB
+	// 并 UPDATE ca_providers.credentials（caproviders.go:342-344），原「仅探测
+	// ACME 目录/账户可达性」的豁免前提不成立；三守卫同样恢复完整写权限校验。
 	// 审计 历史问题：POST /config/validate 已移出只读豁免——该端点实际执行真实
 	// Caddy /load（?validate=true 参数被 Caddy v2.11.4 静默忽略，校验成功即
 	// 调用方配置成为运行配置），只读 API key/从节点/MFA 豁免均可触发真实

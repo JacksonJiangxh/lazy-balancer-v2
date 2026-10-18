@@ -846,3 +846,48 @@ func TestDNSPodCleanUp_staleRetryFailureKeepsOwnershipEntry(t *testing.T) {
 		t.Fatalf("ownership left=%+v, want failed record 300 kept", left)
 	}
 }
+
+// 历史问题（历史）：内存模式失败回填必须保留 challenge value——否则后续
+// 按值清理（CleanUpValue）的 entry.value != value 过滤会永久跳过该条目，
+// 「失败回填供后续清理重试」的意图落空。
+func TestProvider_CleanUp_memoryModeFailedValueRetriedByCleanUpValue(t *testing.T) {
+	// Given: memory-mode ownership whose only record fails to delete
+	provider := New("id,token")
+	transport := &removeFailTransport{dnsPodRecordTransport: dnsPodRecordTransport{records: map[string]string{}}, failRecordID: "200"}
+	provider.client.Transport = transport
+	if err := provider.Present(t.Context(), "example.com", "_acme-challenge.example.com.", "value", 600); err != nil {
+		t.Fatalf("present record: %v", err)
+	}
+
+	// When: first by-value cleanup fails at the API
+	if err := provider.CleanUpValue(t.Context(), "example.com", "_acme-challenge.example.com.", "value"); err == nil {
+		t.Fatal("first cleanup swallowed the deletion failure")
+	}
+	// Then: the re-appended entry still carries the challenge value
+	provider.mu.Lock()
+	entries := append([]ownedRecord(nil), provider.owned["1|_acme-challenge"]...)
+	provider.mu.Unlock()
+	if len(entries) != 1 || entries[0].recordID != "200" || entries[0].value != "value" {
+		t.Fatalf("owned entries=%+v, want failed record 200 with value preserved", entries)
+	}
+
+	// When: the API recovers and the same value is cleaned again
+	transport.failRecordID = ""
+	if err := provider.CleanUpValue(t.Context(), "example.com", "_acme-challenge.example.com.", "value"); err != nil {
+		t.Fatalf("second cleanup must retry the failed entry, got error: %v", err)
+	}
+
+	// Then: the record is deleted at the API and the owned table is drained
+	transport.mu.Lock()
+	_, alive := transport.records["200"]
+	transport.mu.Unlock()
+	if alive {
+		t.Fatal("record 200 was never retried (value lost in failed backfill)")
+	}
+	provider.mu.Lock()
+	left := append([]ownedRecord(nil), provider.owned["1|_acme-challenge"]...)
+	provider.mu.Unlock()
+	if len(left) != 0 {
+		t.Fatalf("owned entries=%+v, want drained after successful retry", left)
+	}
+}

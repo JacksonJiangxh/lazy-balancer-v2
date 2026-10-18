@@ -1430,25 +1430,6 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 			*val = &empty
 		}
 	}
-	var aclRefsIDs, wlRefsIDs []int64
-	for _, f := range []struct {
-		name string
-		val  *string
-		ids  *[]int64
-	}{
-		{"ip_acl_list_refs", req.IPACLListRefs, &aclRefsIDs},
-		{"ip_whitelist_refs", req.IPWhitelistRefs, &wlRefsIDs},
-	} {
-		if f.val == nil {
-			continue
-		}
-		ids, err := parseIPListRefsPayload(f.name, f.val)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-			return
-		}
-		*f.ids = ids
-	}
 	// 显式空串会把枚举列清空：mode 为 "" 时汇总口径（mode!="off" 即计入 WAF）
 	// 与发射口径（仅 blocking/detection 生效）随即漂移；geoip_mode 在创建时已
 	// 归一为 allow/deny，空串属于域外值。不修改请直接省略字段，而不是传空串。
@@ -1473,6 +1454,7 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 			req.IPACLList, req.IPACLListRefs = &emptyArr, &emptyArr
 			req.IPBlacklist = &emptyArr
 			req.GeoIPMode, req.GeoIPCountries = &offMode, &emptyArr
+			req.GeoIPCrawlerExempt, req.GeoIPCrawlerEngines = &falseVal, &emptyArr
 			req.BlockPageID, req.BlockStatusCode = &zeroInt, &zeroInt
 		case models.PolicyTypeStage1:
 			req.Mode = &offMode
@@ -1494,6 +1476,8 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 			req.IPWhitelist, req.IPWhitelistRefs = &emptyArr, &emptyArr
 			req.IPBlacklist = &emptyArr
 			req.GeoIPMode, req.GeoIPCountries = &offMode, &emptyArr
+			// 历史问题：爬虫豁免同属阶段外字段——类型往返后不得静默复活。
+			req.GeoIPCrawlerExempt, req.GeoIPCrawlerEngines = &falseVal, &emptyArr
 			// 2026-09-25 用户裁定：stage2 允许配置拦截页（429 路由按其取页渲染）；
 			// 状态码仍归一 0——限流拦截恒 429（指标单独计量），页面由用户选。
 			req.BlockStatusCode = &zeroInt
@@ -1506,6 +1490,8 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 			req.IPWhitelist, req.IPWhitelistRefs = &emptyArr, &emptyArr
 			req.IPBlacklist = &emptyArr
 			req.GeoIPMode, req.GeoIPCountries = &offMode, &emptyArr
+			// 历史问题：爬虫豁免同属阶段外字段——类型往返后不得静默复活。
+			req.GeoIPCrawlerExempt, req.GeoIPCrawlerEngines = &falseVal, &emptyArr
 			req.RateLimitEnabled, req.RateLimitRPS, req.RateLimitBurst = &falseVal, &zeroInt, &zeroInt
 			// 历史问题（历史）：trust_detection 是 stage0 专属，同上归 0。
 			req.TrustDetection = &falseVal
@@ -1520,6 +1506,30 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 			zero := 0
 			req.BlockStatusCode = &zero
 		}
+	}
+	// 历史问题：refs 派生 ID 必须在类型归一**之后**解析——显式类型切换会把
+	// 阶段外 refs 指针改写为 "[]"，旧顺序仍用切换前的 ID 做存在性/内置名单
+	// 校验，合法的类型转换会因已被合法删除的列表而 400。此处按归一后的
+	// 请求值重算（nil 字段保持 nil→不参与校验）。
+	var aclRefsIDs, wlRefsIDs []int64
+	for _, f := range []struct {
+		name string
+		val  *string
+		ids  *[]int64
+	}{
+		{"ip_acl_list_refs", req.IPACLListRefs, &aclRefsIDs},
+		{"ip_whitelist_refs", req.IPWhitelistRefs, &wlRefsIDs},
+	} {
+		*f.ids = nil
+		if f.val == nil {
+			continue
+		}
+		ids, err := parseIPListRefsPayload(f.name, f.val)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+			return
+		}
+		*f.ids = ids
 	}
 
 	for _, f := range []struct {
@@ -2875,11 +2885,20 @@ func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
 	insertChild := func(policyType, name, mode, aclMode, aclList string, aclEnabled bool, whitelist json.RawMessage, wlEnabled bool, blacklist json.RawMessage,
 		rlEnabled bool, rlRPS, rlBurst int, crsGroups, crsExcluded, customRules string, blockPageID, blockStatus int,
 		geoCountries json.RawMessage, geoMode string, wafResp, logBody bool, aclRefs, wlRefs string, trustDetection bool) error {
+		// 历史问题：爬虫豁免同随子策略的阶段归一——仅地域拦截启用形态的子
+		// 策略保留豁免位；阶段外子策略（geo_mode=off）恒 0/[]，避免拆分把
+		// 开关复制给所有子策略、类型往返后静默复活。
+		geoipActive := geoMode != "" && geoMode != "off"
+		childCrawlerExempt := crawlerExemptBool(p.GeoIPCrawlerExempt, geoipActive)
+		childCrawlerEngines := "[]"
+		if geoipActive {
+			childCrawlerEngines = string(p.GeoIPCrawlerEngines)
+		}
 		result, err := tx.ExecContext(c.Request.Context(), `INSERT INTO security_policies (name, description, mode, anomaly_threshold, ip_acl_mode, ip_acl_list, ip_acl_enabled, ip_whitelist, ip_whitelist_enabled, ip_blacklist,
 			rate_limit_enabled, rate_limit_rps, rate_limit_burst, crs_rule_groups, crs_excluded_rules, custom_rules, block_page_id, block_status_code, enabled, geoip_countries, geoip_mode, geoip_crawler_exempt, geoip_crawler_engines, waf_check_response, log_request_body, ip_acl_list_refs, ip_whitelist_refs, updated_by, policy_type, trust_detection)
 			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			name, p.Description, mode, p.AnomalyThreshold, aclMode, aclList, aclEnabled, whitelist, wlEnabled, blacklist,
-			rlEnabled, rlRPS, rlBurst, crsGroups, crsExcluded, customRules, blockPageID, blockStatus, p.Enabled, geoCountries, geoMode, p.GeoIPCrawlerExempt, string(p.GeoIPCrawlerEngines), wafResp, logBody, aclRefs, wlRefs, operator, policyType, trustDetection)
+			rlEnabled, rlRPS, rlBurst, crsGroups, crsExcluded, customRules, blockPageID, blockStatus, p.Enabled, geoCountries, geoMode, childCrawlerExempt, childCrawlerEngines, wafResp, logBody, aclRefs, wlRefs, operator, policyType, trustDetection)
 		if err != nil {
 			return err
 		}
@@ -3216,7 +3235,11 @@ var ruleTriggeredFamilyPrefixes = map[string][]string{
 func appendFamilyPrefixCondition(ors *[]string, args *[]any, prefix string) {
 	// 单数字族（2/3/4/5/7/8）与两位完整 id 族（14=威胁情报库）为精确匹配——
 	// LIKE 前缀会让自定义规则 5 位 ID（24567/14xxxx 等）交叉命中 IP/威胁族。
-	if len(prefix) == 1 || len(prefix) == 2 {
+	// 历史 历史问题：3 字符前缀不全是 CRS 族——「限流」是 429 精确 ID，
+	// 旧实现无条件 prefix+"___" 生成 LIKE '429___'，永不命中。CRS 六位 ID
+	// 恒以 9 开头（920/921/949/959 族），据此区分：9 开头仍长度锚定，其余
+	// 3 字符按精确匹配。
+	if len(prefix) == 1 || len(prefix) == 2 || (len(prefix) == 3 && !strings.HasPrefix(prefix, "9")) {
 		*ors = append(*ors, "rule_triggered = ?")
 		*args = append(*args, prefix)
 		return
@@ -4060,12 +4083,15 @@ func (h *Handlers) GetCRSInfo(c *gin.Context) {
 
 func (h *Handlers) UpdateCRSAutoUpdate(c *gin.Context) {
 	var req struct {
-		AutoUpdate bool `json:"auto_update"`
+		// 历史问题：指针语义——缺字段/null 绑定成功时得到 nil（显式 400），
+		// 非指针 bool 会静默取 false 并写库（脚本/MCP 部分更新或键名漂移
+		// 可无提示停止安全规则自动更新，审计却记录为用户主动关闭）。
+		AutoUpdate *bool `json:"auto_update"`
 	}
 	if !guardConfiguredJSONBody(c) {
 		return
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBindJSON(&req); err != nil || req.AutoUpdate == nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
@@ -4074,12 +4100,12 @@ func (h *Handlers) UpdateCRSAutoUpdate(c *gin.Context) {
 	if !requireMasterNode(c) {
 		return
 	}
-	if err := services.SetCRSAutoUpdate(req.AutoUpdate); err != nil {
+	if err := services.SetCRSAutoUpdate(*req.AutoUpdate); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
 	autoUpdateText := "关闭"
-	if req.AutoUpdate {
+	if *req.AutoUpdate {
 		autoUpdateText = "开启"
 	}
 	recordAudit(c, "更新", "CRS规则库", fmt.Sprintf("自动更新已%s", autoUpdateText))
@@ -4271,12 +4297,13 @@ func (h *Handlers) GetIP2RegionRegions(c *gin.Context) {
 
 func (h *Handlers) UpdateIP2RegionAutoUpdate(c *gin.Context) {
 	var req struct {
-		AutoUpdate bool `json:"auto_update"`
+		// 历史问题：指针语义（同 UpdateCRSAutoUpdate）——缺字段/null 显式 400。
+		AutoUpdate *bool `json:"auto_update"`
 	}
 	if !guardConfiguredJSONBody(c) {
 		return
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBindJSON(&req); err != nil || req.AutoUpdate == nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
@@ -4284,12 +4311,12 @@ func (h *Handlers) UpdateIP2RegionAutoUpdate(c *gin.Context) {
 	if !requireMasterNode(c) {
 		return
 	}
-	if err := services.SetIP2RegionAutoUpdate(req.AutoUpdate); err != nil {
+	if err := services.SetIP2RegionAutoUpdate(*req.AutoUpdate); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
 	autoUpdateText := "关闭"
-	if req.AutoUpdate {
+	if *req.AutoUpdate {
 		autoUpdateText = "开启"
 	}
 	recordAudit(c, "更新", "IP数据库", fmt.Sprintf("自动更新已%s", autoUpdateText))

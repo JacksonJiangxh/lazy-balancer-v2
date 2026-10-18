@@ -103,7 +103,10 @@ const tooltipContent = computed(() => `${info.value?.config_source || ''}${info.
 
 onMounted(async () => {
   try {
-    const params = props.caddyId ? { caddy_id: props.caddyId } : {}
+    // U04d-06：服务端按 key 收窄（只统计所看那一行）；缺省全量会为每个弹框
+    // 做全部 DB 计数与目录统计。
+    const params: Record<string, string> = { key: props.logKey }
+    if (props.caddyId) params.caddy_id = props.caddyId
     const res = await request.get<{ data?: { logs?: LogStorageInfo[] } }>('/logs/stats', { params })
     info.value = res.data?.logs?.find((l) => l.key === props.logKey) || null
   } catch (e) {

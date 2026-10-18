@@ -475,9 +475,14 @@ func TestCertIssuer_Issue_fast_path_skips_redeploy_when_deployed_cert_matches(t 
 	if _, err := db.DB.Exec("UPDATE cert_jobs SET cert_pem=?, key_pem='persisted-key', ca_provider_id=? WHERE id=?", certPEM, providerID, jobID); err != nil {
 		t.Fatalf("seed downloaded certificate material: %v", err)
 	}
-	certPath, _ := CertFilePaths(ruleID)
+	// 历史问题（历史）：快速路径同时比对私钥文件——部署态必须 cert+key 双文件
+	// 都与任务材料一致才算「无需重新部署」。
+	certPath, keyPath := CertFilePaths(ruleID)
 	if err := os.WriteFile(certPath, []byte(certPEM), 0644); err != nil {
 		t.Fatalf("write deployed certificate file: %v", err)
+	}
+	if err := os.WriteFile(keyPath, []byte("persisted-key"), 0600); err != nil {
+		t.Fatalf("write deployed key file: %v", err)
 	}
 	reloads := 0
 	issuer := NewCertIssuer(func() error {

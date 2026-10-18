@@ -31,12 +31,12 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 		return
 	}
 	var userID int
-	var passwordVersion int64
+	var passwordVersion, challengeVersion int64
 	var user models.User
-	err := db.DB.QueryRow(`SELECT u.id, u.password_version, u.username, u.role, u.display_name, u.is_enabled, u.created_at, u.last_login, COALESCE(u.auth_provider,'local')
+	err := db.DB.QueryRow(`SELECT u.id, u.password_version, ch.password_version, u.username, u.role, u.display_name, u.is_enabled, u.created_at, u.last_login, COALESCE(u.auth_provider,'local')
 		FROM mfa_challenges ch JOIN users u ON u.id = ch.user_id
 		WHERE ch.token=? AND ch.expires_at > datetime('now')`, req.MFAToken).
-		Scan(&userID, &passwordVersion, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &user.AuthProvider)
+		Scan(&userID, &passwordVersion, &challengeVersion, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &user.AuthProvider)
 	if err != nil {
 		// F-SYS-1（历史）：DB 故障与无效挑战分判——基础设施错误 500，
 		// 不再伪装成 401（挑战无效不泄露具体原因的口径仅适用于 ErrNoRows）。
@@ -57,11 +57,36 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 	}
 	user.ID = userID
 
+	// U04c-02：挑战绑定签发时的密码版本——签发后密码被改（自助/管理员重置），
+	// 旧挑战即使持有有效第二因子也不得换取携带新 pwd_ver 的 JWT；顺带删除。
+	if challengeVersion != passwordVersion {
+		_, _ = db.DB.Exec("DELETE FROM mfa_challenges WHERE token=?", req.MFAToken)
+		services.RecordAuditLog("", "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "挑战令牌无效或已过期"), c.ClientIP())
+		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "MFA 挑战无效或已过期，请重新登录"})
+		return
+	}
+
 	// 登录失败锁定（2026-09 用户裁定）：MFA 验证码失败与密码失败同计一个
 	// 账户级计数（login_*），受「登录失败锁定」开关控制；锁定期间验证步直接
 	// 429，不再消耗挑战次数。
+	// U04c-04：锁定状态/开关读取失败必须 fail-closed（500，不消费挑战）——
+	// 旧实现把 DB 错误静默当作「未锁定」。
 	var loginLockedUntil sql.NullString
-	if err := db.DB.QueryRow("SELECT login_locked_until FROM users WHERE id=?", userID).Scan(&loginLockedUntil); err == nil && loginLockedNow(loginLockedUntil) {
+	if err := db.DB.QueryRow("SELECT login_locked_until FROM users WHERE id=?", userID).Scan(&loginLockedUntil); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			services.RecordAuditLog("", "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "挑战令牌无效或已过期"), c.ClientIP())
+			c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "MFA 挑战无效或已过期，请重新登录"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
+		return
+	}
+	locked, lockErr := loginLockedNow(loginLockedUntil)
+	if lockErr != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
+		return
+	}
+	if locked {
 		services.RecordAuditLog(user.Username, "登录失败", "用户认证", services.FormatAuditDetail(services.AuditUserPart(userID, user.Username), "账户已锁定"), c.ClientIP())
 		c.JSON(http.StatusTooManyRequests, models.APIResponse{Code: 429, Message: fmt.Sprintf("账户已锁定，请 %d 分钟后重试", loginLockRemainingMinutes(loginLockedUntil, time.Now().UTC()))})
 		return
@@ -77,17 +102,21 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 	}
 	if ok, verr := services.MFAVerifyCode(userID, req.Code, time.Now()); !ok {
 		services.MFARestoreChallenge(req.MFAToken, userID)
+		if verr != nil {
+			// U04c-05：查询/写库故障不是「验证码错误」——不审计验证码错误、
+			// 不累加挑战级/账户级失败计数（否则基础设施抖动会烧掉挑战额度
+			// 并把用户锁 10 分钟）。
+			services.RecordAuditLog(user.Username, "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "验证服务故障"), c.ClientIP())
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 验证服务暂时不可用，请稍后重试"})
+			return
+		}
 		services.RecordAuditLog(user.Username, "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "验证码错误"), c.ClientIP())
 		// 历史问题 B-历史问题：挑战级失败计数——分布式 IP 限流绕过下对单挑战的爆破收敛
 		//（10 次作废，需重新走密码步取新挑战）。
 		_ = services.MFARecordChallengeFailure(req.MFAToken)
 		// 统一登录失败计数（开关语义见 recordLoginFailure）。
 		recordLoginFailure(userID)
-		msg := "验证码错误"
-		if verr != nil {
-			msg = verr.Error()
-		}
-		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: msg})
+		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "验证码错误"})
 		return
 	}
 	// 完整登录成功：清零登录失败计数与锁定（密码步未清零，见 Login 注释）。
@@ -109,11 +138,13 @@ func (h *Handlers) MFAStatus(c *gin.Context) {
 }
 
 // MFASetup POST /auth/mfa/setup — 生成 pending secret + otpauth URI（未启用）。
-// 历史问题 历史问题：已启用 MFA 的用户重新 setup 需密码+当前有效验证码双重确认——
-// 此前无任何门：持被劫持会话即可静默轮换第二因子（setup 响应明文返回新 secret
-// + URI，攻击者配好自己的 authenticator 后 activate 即夺取 MFA；受害者未启用
-// 场景则被强开攻击者控制的 MFA = 永久登录 DoS）。未启用用户保持无门（首次
-// 绑定的可用性优先，会话本身已过密码认证）。
+// 历史问题 历史问题：已启用 MFA 的用户重新 setup 需当前有效验证码确认（守卫验码放行
+// 或本层验码，见下）——此前无任何门：持被劫持会话即可静默轮换第二因子
+// （setup 响应明文返回新 secret + URI，攻击者配好自己的 authenticator 后
+// activate 即夺取 MFA；受害者未启用场景则被强开攻击者控制的 MFA = 永久
+// 登录 DoS）。未启用用户保持无门（首次绑定的可用性优先，会话本身已过密码
+// 认证）。U04c-10：登录后不再有密码输入要求（2026-09 用户裁定），原注释
+// 的「密码+验证码双重确认」已过时。
 // rejectOIDCUserMFAOperation v2.3.0 用户裁定:OIDC 用户与本地 MFA 体系完全
 // 解耦——对其禁止本地 MFA 的启用/激活/禁用/重置(身份保证在 IdP 侧)。
 // targetUserID=0 表示操作自己(从 JWT 取)。

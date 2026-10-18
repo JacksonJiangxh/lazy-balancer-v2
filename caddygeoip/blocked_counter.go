@@ -114,6 +114,19 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 	start := time.Now()
 
+	isSecurityBlock := false
+	// 终态与流量计数必须覆盖 panic 展开路径：coraza 的 ProcessLogging 也会
+	// 在 panic 时执行，若此处不 close，drain 会为该审计行等满超时。
+	defer func() {
+		if timingID != "" {
+			auditTimingClose(timingID)
+		}
+		// 国名只取 geoip handler 写入的 Caddy 服务端变量。无 GeoIP handler
+		// 时变量缺席即跳过，客户端自带的同名请求头永不可信。
+		country, _ := caddyhttp.GetVar(r.Context(), "geoip.country_name").(string)
+		trafficRecord(country, isSecurityBlock)
+	}()
+
 	err := next.ServeHTTP(w, r)
 
 	var herr caddyhttp.HandlerError
@@ -124,7 +137,7 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	// proxy 499/request_body 413/其他 caddyhttp.Error 4xx(全 9 字符)。
 	// 脆弱点:coraza 若改 tx.ID 长度→断;但 v2.x 一直 16 且 coraza 由
 	// Dockerfile pin+构建断言控制——可控。
-	isSecurityBlock := err != nil && errors.As(err, &herr) &&
+	isSecurityBlock = err != nil && errors.As(err, &herr) &&
 		herr.StatusCode >= 400 && herr.StatusCode < 500 &&
 		(len(herr.ID) == 16 || herr.StatusCode == http.StatusTooManyRequests)
 
@@ -144,13 +157,6 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			auditTimingRecord(timingID, timingSegmentEnd, time.Since(start).Microseconds())
 		}
 	}
-	// 终态标记:本 handler 是链最外层收点,post-next 时全部分段写点(timing_pre/
-	// timing_end/本方法)均已完成——审计写插件的 drain goroutine 见终态即注入
-	// 落盘,不再等待。计时数字在上方决策点测得,终态标记与注入均不改变数值。
-	if timingID != "" {
-		auditTimingClose(timingID)
-	}
-
 	if isSecurityBlock {
 		// F1(第 28.6 轮审计):历史问题 判定丢失 4xx 约束——coraza 引擎 500
 		// (16 字符 tx.ID)被误计为安全拦截且吃掉一个合法 4xx。恢复 4xx 约束。
@@ -158,11 +164,6 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			h.metrics.WithLabelValues(h.Rule).Inc()
 		}
 	}
-	// 大屏全请求实时流量计数（Plan B）：链尾分类点——attack=安全中断
-	// （isSecurityBlock 同口径）、normal=非安全中断的已处理请求（含上游
-	// 透传）；国名取 X-LB-GeoIP-Country（geoip handler 已剥伪造头并按
-	// 客户端 IP 回填，未解析=空串由计数器跳过）。
-	trafficRecord(r.Header.Get("X-LB-GeoIP-Country"), isSecurityBlock)
 	return err
 }
 

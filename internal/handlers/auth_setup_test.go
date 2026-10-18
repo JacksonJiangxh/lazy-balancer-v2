@@ -53,6 +53,17 @@ func setupAuthTestDB(t *testing.T) *sql.DB {
 	CREATE TABLE api_keys (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		created_by INTEGER NOT NULL
+	);
+	-- 挑战表随生产 schema 常备（U04c-02：三条改密路径在同一事务内吊销挑战，
+	-- 缺表会让改密 500）。
+	CREATE TABLE mfa_challenges (
+		token TEXT PRIMARY KEY,
+		user_id INTEGER NOT NULL,
+		expires_at DATETIME NOT NULL,
+		consumed BOOLEAN DEFAULT 0,
+		attempts INTEGER DEFAULT 0,
+		password_version INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`)
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +74,7 @@ func setupAuthTestDB(t *testing.T) *sql.DB {
 func TestLogin_returns_created_at_and_new_last_login_as_nullable_values(t *testing.T) {
 	// Given
 	database := setupAuthTestDB(t)
-	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER); INSERT INTO global_config VALUES (1,1,20)`); err != nil {
+	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,20,1)`); err != nil {
 		t.Fatalf("create global config: %v", err)
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
@@ -106,7 +117,7 @@ func TestLogin_returns_created_at_and_new_last_login_as_nullable_values(t *testi
 
 func TestLogin_signs_password_version_claim(t *testing.T) {
 	database := setupAuthTestDB(t)
-	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER); INSERT INTO global_config VALUES (1,1,20)`); err != nil {
+	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,20,1)`); err != nil {
 		t.Fatalf("create global config: %v", err)
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
@@ -146,7 +157,7 @@ func TestLogin_signs_password_version_claim(t *testing.T) {
 
 func TestLogin_clamps_excessive_jwt_expiration(t *testing.T) {
 	database := setupAuthTestDB(t)
-	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER); INSERT INTO global_config VALUES (1,1,999999)`); err != nil {
+	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,999999,1)`); err != nil {
 		t.Fatalf("create global config: %v", err)
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
@@ -185,6 +196,9 @@ func TestLogin_clamps_excessive_jwt_expiration(t *testing.T) {
 func TestLogin_returns_error_when_last_login_update_fails(t *testing.T) {
 	// Given
 	database := setupAuthTestDB(t)
+	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,20,1)`); err != nil {
+		t.Fatalf("create global config: %v", err)
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("hash password: %v", err)
@@ -210,7 +224,10 @@ func TestLogin_returns_error_when_last_login_update_fails(t *testing.T) {
 
 func TestSetupAdmin_first_run_flow(t *testing.T) {
 	// Given
-	setupAuthTestDB(t)
+	database := setupAuthTestDB(t)
+	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,20,1)`); err != nil {
+		t.Fatalf("create global config: %v", err)
+	}
 	gin.SetMode(gin.TestMode)
 	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
 	router := gin.New()

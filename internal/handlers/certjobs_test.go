@@ -50,9 +50,13 @@ func TestGetCurrentCertJobs_rejects_more_than_200_rule_ids(t *testing.T) {
 }
 
 func TestCertJobRetryBlocked_rejects_disabled_job_without_timestamp(t *testing.T) {
-	blocked, _ := certJobRetryBlocked("disabled", sql.NullTime{}, time.Now())
+	blocked, statusCode, _ := certJobRetryBlocked("disabled", sql.NullTime{}, time.Now())
 	if !blocked {
 		t.Fatal("disabled job retry was allowed")
+	}
+	// 历史问题（历史）：永久条件用 409，不得用「稍后可重试」的 429。
+	if statusCode != http.StatusConflict {
+		t.Fatalf("status=%d, want 409（已退役任务永不可重试）", statusCode)
 	}
 }
 
@@ -64,7 +68,7 @@ func TestCertJobRetryBlocked_downloaded_job_uses_deployment_message(t *testing.T
 	now := time.Now()
 
 	// When
-	blocked, message := certJobRetryBlocked("downloaded", sql.NullTime{Time: now.Add(-time.Minute), Valid: true}, now)
+	blocked, _, message := certJobRetryBlocked("downloaded", sql.NullTime{Time: now.Add(-time.Minute), Valid: true}, now)
 
 	// Then：仍被拦截（部署窗口守卫不变），但文案单列
 	if !blocked {

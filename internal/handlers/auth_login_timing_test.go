@@ -24,6 +24,9 @@ import (
 func TestLogin_unknownUserAndWrongPassword_returnIdentical401(t *testing.T) {
 	// Given 存在用户 root（真实 bcrypt 哈希，DefaultCost 与生产一致）
 	database := setupAuthTestDB(t)
+	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,20,1)`); err != nil {
+		t.Fatalf("create global config: %v", err)
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.DefaultCost)
 	if err != nil {
 		t.Fatalf("hash password: %v", err)

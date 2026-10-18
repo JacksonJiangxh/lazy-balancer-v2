@@ -38,11 +38,6 @@ var deleteCertJobPreDisableHook func(jobID int)
 // 之前触发，用于模拟「行在删除窗口内被并发移离 disabled」（历史问题 回归测试）。
 var deleteCertJobPreRestoreHook func(jobID int)
 
-var certJobIndexState struct {
-	sync.Mutex
-	databases map[*sql.DB]struct{}
-}
-
 // certJobLogPathForRule 解析规则的任务日志路径（测试缝：镜像 cancelCertJob 的
 // var 先例，测试可重定向到临时目录；生产恒为 services.CertJobLogPath）。
 var certJobLogPathForRule = services.CertJobLogPath
@@ -67,22 +62,6 @@ func certJobOperationLock(id int) *sync.Mutex {
 	return &certJobOperationLocks[index]
 }
 
-func ensureCertJobListIndex() error {
-	certJobIndexState.Lock()
-	defer certJobIndexState.Unlock()
-	if certJobIndexState.databases == nil {
-		certJobIndexState.databases = make(map[*sql.DB]struct{})
-	}
-	if _, exists := certJobIndexState.databases[db.DB]; exists {
-		return nil
-	}
-	if _, err := db.DB.Exec("CREATE INDEX IF NOT EXISTS idx_cert_jobs_created_at_desc ON cert_jobs(created_at DESC)"); err != nil {
-		return err
-	}
-	certJobIndexState.databases[db.DB] = struct{}{}
-	return nil
-}
-
 func (h *Handlers) ListCertJobs(c *gin.Context) {
 	ruleID := c.Query("rule_id")
 	page, err := strconv.ParseInt(c.DefaultQuery("page", "1"), 10, 64)
@@ -93,10 +72,6 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 	pageSize, err := strconv.Atoi(c.DefaultQuery("page_size", "50"))
 	if err != nil || pageSize < 1 || pageSize > 200 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "page_size 必须在 1-200 之间"})
-		return
-	}
-	if err := ensureCertJobListIndex(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "初始化证书任务分页索引失败"})
 		return
 	}
 	if page-1 > math.MaxInt64/int64(pageSize) {
@@ -313,8 +288,22 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 		return
 	}
 
-	if blocked, message := certJobRetryBlocked(status, updatedAt, time.Now()); blocked {
-		c.JSON(http.StatusTooManyRequests, models.APIResponse{Code: 429, Message: message})
+	if blocked, statusCode, message := certJobRetryBlocked(status, updatedAt, time.Now()); blocked {
+		c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
+		return
+	}
+
+	// 历史问题（历史）：downloaded + 材料在库的任务停在部署窗口——转 queued
+	// 会丢弃已签发证书并触发整轮重签（同 requeueCanceledJob / DeleteCertJob
+	// 恢复 / requeueCertJobsSnapshot 的取向）。改为把部署窗口推到 now 并立即
+	// 重排部署重试；仅「无材料」的 downloaded（历史脏行）才回落重新签发。
+	if rescheduled, err := rescheduleDownloadedCertJobDeployment(id, ruleID, domain); err != nil {
+		services.Logf("error", "Manual deployment retry failed for job %d: %v", id, err)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to enqueue retry"})
+		return
+	} else if rescheduled {
+		recordAudit(c, "重试", "证书任务", services.FormatAuditDetail(services.AuditJobPart(id), services.AuditRulePart(ruleID), domain, fmt.Sprintf("原状态：%s", status), services.AuditResultPart("deployment_retry")))
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "Deployment retry triggered"})
 		return
 	}
 
@@ -389,18 +378,51 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "Retry triggered"})
 }
 
-func certJobRetryBlocked(status string, updatedAt sql.NullTime, now time.Time) (bool, string) {
+// rescheduleDownloadedCertJobDeployment 处理 downloaded 任务的「部署重排」快速
+// 路径：仅当任务仍为 downloaded、证书材料在库且关联规则仍处自动签发状态时，
+// 把部署窗口推到 now 并触发证书服务补扫（取消挂起的退避 timer → 立即部署）。
+// 返回 false 表示不适用（无材料/状态已变/规则失效），调用方回落重新入队语义。
+func rescheduleDownloadedCertJobDeployment(id int, ruleID, domain string) (bool, error) {
+	reversedDomain := reversedCertJobDomain(domain)
+	result, err := db.DB.Exec(`UPDATE cert_jobs
+		SET deployment_available_after=datetime('now'), message='手动重试：等待恢复部署', updated_at=datetime('now')
+		WHERE id=? AND status='downloaded'
+		  AND COALESCE(cert_pem,'') <> '' AND COALESCE(key_pem,'') <> ''
+		  AND EXISTS (
+			SELECT 1 FROM lb_rules
+			WHERE caddy_id=? AND enabled=1 AND enable_tls=1 AND tls_source='acme_dns' AND lower(replace(domain,' ','')) IN (?,?)
+		  )`, id, ruleID, domain, reversedDomain)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rowsAffected == 0 {
+		return false, nil
+	}
+	// 证书服务在运行则立即重排（取消挂起退避 timer）；服务缺失时
+	// deployment_available_after=now 已被启动恢复/补扫覆盖，不会静默丢失。
+	services.RetryCertificateDeploymentNow(id, ruleID)
+	return true, nil
+}
+
+// certJobRetryBlocked 返回任务是否被重试门拦截，以及应返回的 HTTP 状态码。
+// 429 =「稍后重试可成功」（执行中/冷却），409 =「永久条件不可重试」（已退役）。
+func certJobRetryBlocked(status string, updatedAt sql.NullTime, now time.Time) (bool, int, string) {
 	if status == "disabled" {
-		return true, "已退役的证书任务不能重试"
+		// 历史问题（历史）：永久条件不得用 429（SDK/前端会按限流退避轮询）。
+		return true, http.StatusConflict, "已退役的证书任务不能重试"
 	}
 	if !updatedAt.Valid {
-		return false, ""
+		return false, 0, ""
 	}
 	if status == "failed" && now.Sub(updatedAt.Time) < 5*time.Minute {
-		return true, "失败后请等待 5 分钟再重试"
+		return true, http.StatusTooManyRequests, "失败后请等待 5 分钟再重试"
 	}
 	if status == "issued" || status == "failed" || status == "waiting_ca" {
-		return false, ""
+		return false, 0, ""
 	}
 	guard := 2 * time.Minute
 	message := "任务正在执行中，请稍后重试"
@@ -409,10 +431,14 @@ func certJobRetryBlocked(status string, updatedAt sql.NullTime, now time.Time) (
 	}
 	// CERT-N3（历史）：downloaded 态签发已完成（证书在库），停在部署
 	// 退避窗口——复用在途文案会误导用户以为签发流程卡住，单列部署口径。
+	// 历史问题（历史）：冷却到期后再点重试 = 立即重排部署（不重签）。
 	if status == "downloaded" {
-		message = "证书已下载完成，正在等待部署生效，请稍后重试"
+		message = "证书已下载完成，正在等待部署生效；稍后可重试以立即重新部署（不会重新签发）"
 	}
-	return now.Sub(updatedAt.Time) < guard, message
+	if now.Sub(updatedAt.Time) < guard {
+		return true, http.StatusTooManyRequests, message
+	}
+	return false, 0, ""
 }
 
 // reversedCertJobDomain 交换双域名任务的域名顺序：cert_jobs.domain 存排序

@@ -59,8 +59,8 @@ func TestValidateBackupRuleReferences_rejectsMixedHttpHttpsPool(t *testing.T) {
 	tables := map[string][]map[string]any{
 		"lb_rules": {{"caddy_id": "lb_mixbak", "protocol": "http"}},
 		"upstreams": {
-			{"rule_id": "lb_mixbak", "protocol": "http", "enabled": true},
-			{"rule_id": "lb_mixbak", "protocol": "https", "enabled": true},
+			{"rule_id": "lb_mixbak", "host": "10.0.0.1", "port": 8080, "weight": 1, "protocol": "http", "enabled": true},
+			{"rule_id": "lb_mixbak", "host": "10.0.0.2", "port": 8443, "weight": 1, "protocol": "https", "enabled": true},
 		},
 	}
 	err := validateBackupRuleReferences(tables)

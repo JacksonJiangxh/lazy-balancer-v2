@@ -34,6 +34,10 @@ func TestFreshSchemaDefaults_MatchGovernedConstants(t *testing.T) {
 		// G6（历史）：双向钉补齐——批 3 治理列此前只有消费侧 fail-visible 钉
 		//（render_db_truth_test.go），DDL DEFAULT 与治理常量未双向钉。
 		{"global_config", "cert_expiry_days", fmt.Sprint(DefaultCertExpiryDays)},
+		// 历史问题（历史）：续期天数/次数与 cert_expiry_days 同族，DDL DEFAULT
+		// 与常量双向钉死。
+		{"global_config", "cert_renewal_days", fmt.Sprint(DefaultCertRenewalDays)},
+		{"global_config", "cert_renewal_attempts", fmt.Sprint(DefaultCertRenewalAttempts)},
 		{"security_policies", "anomaly_threshold", fmt.Sprint(DefaultAnomalyThreshold)},
 	}
 	for _, tc := range cases {
@@ -146,8 +150,8 @@ func TestRunMigrationsBackfillsInvalidValueColumns(t *testing.T) {
 	}
 	// G6（历史）：cert_expiry_days 回填钉（defaultUpdates 已含该列——
 	// NULL/<=0 归 DefaultCertExpiryDays；用户已设有效值保留）。
-	if _, err := database.Exec("UPDATE global_config SET cert_expiry_days=0"); err != nil {
-		t.Fatalf("zero cert_expiry_days: %v", err)
+	if _, err := database.Exec("UPDATE global_config SET cert_expiry_days=0, cert_renewal_days=0, cert_renewal_attempts=0"); err != nil {
+		t.Fatalf("zero cert expiry/renewal columns: %v", err)
 	}
 	// 存量脏形态：0 值行 + 用户已设有效值行（fresh DDL 对本批列 NOT NULL，
 	// NULL 形态仅存在于存量库的可空列——由迁移 WHERE IS NULL 分支覆盖，
@@ -198,6 +202,9 @@ func TestRunMigrationsBackfillsInvalidValueColumns(t *testing.T) {
 	assertScalar("SELECT caddy_log_size_mb FROM global_config WHERE id=1", DefaultCaddyLogSizeMB)
 	// G6（历史）：cert_expiry_days 回填归 DefaultCertExpiryDays。
 	assertScalar("SELECT cert_expiry_days FROM global_config WHERE id=1", DefaultCertExpiryDays)
+	// 历史问题（历史）：续期天数/次数同批回填（此前只有 DDL DEFAULT）。
+	assertScalar("SELECT cert_renewal_days FROM global_config WHERE id=1", DefaultCertRenewalDays)
+	assertScalar("SELECT cert_renewal_attempts FROM global_config WHERE id=1", DefaultCertRenewalAttempts)
 	assertScalar("SELECT health_check_interval FROM lb_rules WHERE caddy_id='lb-backfill-a'", DefaultHealthCheckInterval)
 	assertScalar("SELECT health_check_timeout FROM lb_rules WHERE caddy_id='lb-backfill-a'", DefaultHealthCheckTimeout)
 	assertScalar("SELECT health_check_unhealthy_threshold FROM lb_rules WHERE caddy_id='lb-backfill-a'", DefaultHealthCheckUnhealthyThreshold)

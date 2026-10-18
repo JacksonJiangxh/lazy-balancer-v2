@@ -105,6 +105,47 @@ func TestLoad_warnsOnUnsupportedConfigFileKeys(t *testing.T) {
 	}
 }
 
+func TestLoad_warnsOnSupportedConfigFileKeyTypeMismatch(t *testing.T) {
+	// Given：六个支持键全部使用错误 JSON 类型。
+	t.Setenv("JWT_SECRET", "test-secret")
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	content := `{"data_dir":123,"static_dir":false,"port":"8000","caddy_admin_url":42,"caddy_metrics_url":[],"metrics_interval":"10"}`
+	if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var logBuf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+
+	// When
+	loaded := Load(configPath)
+
+	// Then：沿用默认值但每个误配键都必须有类型告警，不再静默。
+	if loaded.Port != 8000 || loaded.DataDir != "/app/data" || loaded.StaticDir != "/app/ui" || loaded.CaddyAdminURL != "http://localhost:2019" || loaded.CaddyMetricsURL != "http://localhost:2019/metrics" || loaded.MetricsInterval != 30 {
+		t.Fatalf("invalid-type config did not retain defaults: %+v", loaded)
+	}
+	logs := logBuf.String()
+	for _, key := range []string{"data_dir", "static_dir", "port", "caddy_admin_url", "caddy_metrics_url", "metrics_interval"} {
+		if !strings.Contains(logs, `invalid type for key "`+key+`"`) {
+			t.Errorf("missing invalid-type warning for %q, log=%q", key, logs)
+		}
+	}
+
+	// 回归形状：正确类型全部生效且零类型告警。
+	logBuf.Reset()
+	if err := os.WriteFile(configPath, []byte(`{"data_dir":"/tmp/config-type-data","static_dir":"/tmp/config-type-ui","port":8081,"caddy_admin_url":"http://127.0.0.1:2019","caddy_metrics_url":"http://127.0.0.1:2019/metrics","metrics_interval":10}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded = Load(configPath)
+	if loaded.Port != 8081 || loaded.DataDir != "/tmp/config-type-data" || loaded.StaticDir != "/tmp/config-type-ui" || loaded.MetricsInterval != 10 {
+		t.Fatalf("valid config not applied: %+v", loaded)
+	}
+	if strings.Contains(logBuf.String(), "invalid type for key") {
+		t.Fatalf("valid config produced type warning: %q", logBuf.String())
+	}
+}
+
 // ADNS-N1（历史）：jwt_secret 文件存在但内容过短（非空且 <32 字节）时，
 // 覆写重生成必须 log warn——对齐同文件端口回退/密钥目录创建失败分支的可见性
 // 准则；此前静默覆写，旧令牌全部失效且零信号。

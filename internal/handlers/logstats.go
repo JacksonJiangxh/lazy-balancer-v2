@@ -412,6 +412,14 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	// 未请求行的 DB/文件统计并只回这些行（任务监控弹框轮询不再放大全族统计）。
 	requested := requestedLogKeys(c)
 	want := func(key string) bool { return requested == nil || requested[key] }
+	wantAny := func(keys ...string) bool {
+		for _, key := range keys {
+			if want(key) {
+				return true
+			}
+		}
+		return false
+	}
 
 	// S-7（2026-09-06 裁定）已被 2026-09-15 裁定部分覆盖:指标历史固定保留
 	// 最近 7 天(services/services.go cleanupHistory),不再复用「日志保留」
@@ -423,17 +431,45 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	// security_events_retention_days/row_cap 生效，不再复用审计月数文案）；
 	// 其写入侧与审计日志同文件，大小限值随 audit_log_size_mb。
 	securityRetentionNote := services.SecurityEventsRetentionSummary()
-	caddyLimit := sizeLimitMB("caddy_log_size_mb", 100)
+	// U04d-06：阈值按 want 门控——日志弹框只请求单行时不得读其它配置列。
+	// 每列只读一次（此前任务循环逐任务重复读 task_log_size_mb）。
+	var (
+		auditLogLimit   *int64
+		runtimeLogLimit *int64
+		caddyLimit      *int64
+		taskLogLimit    *int64
+	)
+	if want("security_events") {
+		auditLogLimit = sizeLimitMB("audit_log_size_mb", 10)
+	}
+	if want("runtime") {
+		runtimeLogLimit = sizeLimitMB("runtime_log_size_mb", 100)
+	}
+	if wantAny("caddy", "caddy_runtime", "caddy_tls", "caddy_server", "caddy_proxy", "rule_access") {
+		caddyLimit = sizeLimitMB("caddy_log_size_mb", 100)
+	}
+	wantsTaskRows := wantAny("certjob", "crs_update", "ip2region_update", "threat_update", "crawlerbot_update")
+	if !wantsTaskRows && requested != nil {
+		for key := range requested {
+			if strings.HasPrefix(key, "task:") {
+				wantsTaskRows = true
+				break
+			}
+		}
+	}
+	if wantsTaskRows {
+		taskLogLimit = sizeLimitMB("task_log_size_mb", 10)
+	}
 
 	infos := []LogStorageInfo{
 		{Key: "audit", Name: "操作日志", KeepCount: 0, RetentionNote: retentionNote, ConfigSource: "基础设置 · 日志保留（操作/运行/安全事件）"},
-		{Key: "security_events", Name: "安全事件", KeepCount: 0, LimitRows: securityEventsMaxRows(), LimitBytes: sizeLimitMB("audit_log_size_mb", 10), RetentionNote: securityRetentionNote, ConfigSource: "基础设置 · 日志保留（操作/运行/安全事件）"},
-		{Key: "certjob", Name: "证书任务日志", LimitBytes: sizeLimitMB("task_log_size_mb", 10), KeepCount: 5, ConfigSource: "基础设置 · 任务日志大小"},
-		{Key: "crs_update", Name: "CRS 更新日志", LimitBytes: sizeLimitMB("task_log_size_mb", 10), KeepCount: 1, ConfigSource: "统一任务日志（tasks/crs.log）"},
-		{Key: "ip2region_update", Name: "IP 库更新日志", LimitBytes: sizeLimitMB("task_log_size_mb", 10), KeepCount: 1, ConfigSource: "统一任务日志（tasks/ip2region.log）"},
-		{Key: "threat_update", Name: "威胁库更新日志", LimitBytes: sizeLimitMB("task_log_size_mb", 10), KeepCount: 1, ConfigSource: "统一任务日志（tasks/threat.log）"},
-		{Key: "crawlerbot_update", Name: "爬虫地址库更新日志", LimitBytes: sizeLimitMB("task_log_size_mb", 10), KeepCount: 1, ConfigSource: "统一任务日志（tasks/crawlerbot-update.log）"},
-		{Key: "runtime", Name: "运行日志", LimitBytes: sizeLimitMB("runtime_log_size_mb", 100), KeepCount: 0, RetentionNote: "时间戳轮转，按保留期清理（份数随保留期）", ConfigSource: "基础设置 · 运行日志大小"},
+		{Key: "security_events", Name: "安全事件", KeepCount: 0, LimitRows: securityEventsMaxRows(), LimitBytes: auditLogLimit, RetentionNote: securityRetentionNote, ConfigSource: "基础设置 · 日志保留（操作/运行/安全事件）"},
+		{Key: "certjob", Name: "证书任务日志", LimitBytes: taskLogLimit, KeepCount: 5, ConfigSource: "基础设置 · 任务日志大小"},
+		{Key: "crs_update", Name: "CRS 更新日志", LimitBytes: taskLogLimit, KeepCount: 1, ConfigSource: "统一任务日志（tasks/crs.log）"},
+		{Key: "ip2region_update", Name: "IP 库更新日志", LimitBytes: taskLogLimit, KeepCount: 1, ConfigSource: "统一任务日志（tasks/ip2region.log）"},
+		{Key: "threat_update", Name: "威胁库更新日志", LimitBytes: taskLogLimit, KeepCount: 1, ConfigSource: "统一任务日志（tasks/threat.log）"},
+		{Key: "crawlerbot_update", Name: "爬虫地址库更新日志", LimitBytes: taskLogLimit, KeepCount: 1, ConfigSource: "统一任务日志（tasks/crawlerbot-update.log）"},
+		{Key: "runtime", Name: "运行日志", LimitBytes: runtimeLogLimit, KeepCount: 0, RetentionNote: "时间戳轮转，按保留期清理（份数随保留期）", ConfigSource: "基础设置 · 运行日志大小"},
 		{Key: "caddy", Name: "Caddy 运行日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
 		{Key: "caddy_runtime", Name: "Caddy 运行时日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
 		{Key: "caddy_tls", Name: "Caddy TLS 日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
@@ -600,7 +636,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		infos = append(infos, LogStorageInfo{
 			Key: key, Name: task.Name + "日志",
 			SizeBytes: active, RotatedBytes: rotated, RotatedCount: rotCount,
-			LimitBytes: sizeLimitMB("task_log_size_mb", 10), KeepCount: keep,
+			LimitBytes: taskLogLimit, KeepCount: keep,
 			ConfigSource: "统一任务日志（" + filepath.Base(path) + "）",
 		})
 	}

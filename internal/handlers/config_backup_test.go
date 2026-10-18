@@ -1549,6 +1549,17 @@ func TestValidateBackupRuleReferences_rejects_bad_upstream_protocol(t *testing.T
 		t.Run(tt.name, func(t *testing.T) {
 			tables := base(tt.ruleProto)
 			tables["upstreams"] = []map[string]any{tt.upstreamAny}
+			for _, row := range tables["upstreams"] {
+				if _, ok := row["host"]; !ok {
+					row["host"] = "127.0.0.1"
+				}
+				if _, ok := row["port"]; !ok {
+					row["port"] = 9000
+				}
+				if _, ok := row["weight"]; !ok {
+					row["weight"] = 1
+				}
+			}
 			err := validateBackupRuleReferences(tables)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
@@ -1599,6 +1610,17 @@ func TestValidateBackupRuleReferences_rejects_bad_origin_domain_and_health_check
 			tables := base(tt.rule)
 			if tt.upstreamAny != nil {
 				tables["upstreams"] = []map[string]any{tt.upstreamAny}
+			}
+			for _, row := range tables["upstreams"] {
+				if _, ok := row["host"]; !ok {
+					row["host"] = "127.0.0.1"
+				}
+				if _, ok := row["port"]; !ok {
+					row["port"] = 9000
+				}
+				if _, ok := row["weight"]; !ok {
+					row["weight"] = 1
+				}
 			}
 			err := validateBackupRuleReferences(tables)
 			if tt.wantErr != "" {

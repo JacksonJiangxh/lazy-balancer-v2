@@ -364,8 +364,9 @@ func TestGeoipLocFor_trimsChinaCountryColumn(t *testing.T) {
 // 多个 handler 必须共享同一 Ip2Region 实例——每 handler 各建一份会各开 20 个
 // searcher fd（50 条 GeoIP 规则≈1000 fd 逼近 soft limit，重载期翻倍），fd 耗尽
 // → Provision 降级 pass-through → 全客户端判「海外」误拦。指针同一即证明
-// 只开了一份 20-searcher 池。Cleanup 只解除引用不关闭单例（关闭会打断共享方）；
-// xdb 文件形态变化（更新流程 rename 换库后重载）→ 重建新实例而非复用旧 inode。
+// 只开了一份 20-searcher 池。Cleanup 不置空也不关闭单例（旧配置在途请求与
+// 其他共享方都可继续查询）；xdb 文件形态变化（更新流程 rename 换库后重载）
+// → 重建新实例而非复用旧 inode。
 func TestProvision_sharedSearcherSingletonPerXdbPath(t *testing.T) {
 	src := findTestXdb()
 	if src == "" {
@@ -395,15 +396,15 @@ func TestProvision_sharedSearcherSingletonPerXdbPath(t *testing.T) {
 	}
 	shared := h1.searcher
 
-	// h1 清理不关单例：h2 引用仍可用（Search 正常返回）
+	// h1 清理不清空也不关闭共享单例：旧配置的在途请求仍可使用 h1，h2 亦然。
 	if err := h1.Cleanup(); err != nil {
 		t.Fatalf("cleanup h1: %v", err)
 	}
-	if h1.searcher != nil {
-		t.Fatal("cleanup must drop the handler's own reference")
+	if h1.searcher != shared {
+		t.Fatal("cleanup must retain the handler's shared searcher for in-flight requests")
 	}
-	if region, err := h2.searcher.Search("114.114.114.114"); err != nil || region == "" {
-		t.Fatalf("shared searcher must stay usable after a sibling's cleanup: region=%q err=%v", region, err)
+	if region, err := h1.searcher.Search("114.114.114.114"); err != nil || region == "" {
+		t.Fatalf("cleaned-up handler's in-flight searcher must stay usable: region=%q err=%v", region, err)
 	}
 
 	// xdb 更新（rename 换库后 mtime/size 变化）→ 新 Provision 重建实例

@@ -9,6 +9,7 @@ package geoipnames
 
 import (
 	"regexp"
+	"strings"
 )
 
 // CrawlerEngine 搜索引擎爬虫定义。UA/PTR/IP 段来源=各厂商官方文档
@@ -62,9 +63,11 @@ var crawlerEngines = []CrawlerEngine{
 		PTRSuffixes: []string{".crawl.baidu.com", ".baidu.com"},
 	},
 	{
-		ID:          "sogouspider",
-		Name:        "搜狗",
-		UARegex:     regexp.MustCompile(`(?i)Sogou\+?(web|inst)?\+?spider`),
+		ID:   "sogouspider",
+		Name: "搜狗",
+		// 官方 UA 以空格分隔（"Sogou web spider/4.0"、"Sogou inst spider/4.0"），
+		// 仅历史上少数变体用 "+" 分隔；两种分隔符都允许，无分隔的垃圾串不认。
+		UARegex:     regexp.MustCompile(`(?i)Sogou[\s+]+(?:web[\s+]+|inst[\s+]+)?spider`),
 		PTRSuffixes: []string{".sogou.com"},
 	},
 	{
@@ -139,10 +142,20 @@ var crawlerEngines = []CrawlerEngine{
 	},
 }
 
-// CrawlerEngines 返回引擎注册表（只读切片副本，防调用方篡改全局）。
+// CrawlerEngines 返回引擎注册表的**深拷贝**（防调用方篡改全局）：结构体与
+// 其中的 PTRSuffixes/IPRanges 切片都重新分配——只复制结构体的浅拷贝会让
+// out[i].PTRSuffixes[j] = … 写穿到全局注册表。
 func CrawlerEngines() []CrawlerEngine {
 	out := make([]CrawlerEngine, len(crawlerEngines))
-	copy(out, crawlerEngines)
+	for i := range crawlerEngines {
+		out[i] = crawlerEngines[i]
+		if s := crawlerEngines[i].PTRSuffixes; s != nil {
+			out[i].PTRSuffixes = append([]string(nil), s...)
+		}
+		if r := crawlerEngines[i].IPRanges; r != nil {
+			out[i].IPRanges = append([]string(nil), r...)
+		}
+	}
 	return out
 }
 
@@ -158,6 +171,8 @@ func MatchCrawlerEngine(userAgent string) string {
 
 // CrawlerEnginePTRMatch 引擎 ID + PTR 域名 → 后缀是否属该引擎官方域。
 func CrawlerEnginePTRMatch(engineID, ptrName string) bool {
+	// FQDN 尾点容忍（库层单源：消费方虽已剥尾点，直接调用不得因尾点失效）。
+	ptrName = strings.TrimRight(ptrName, ".")
 	if ptrName == "" {
 		return false
 	}
@@ -212,4 +227,5 @@ func ValidCrawlerEngineID(id string) bool {
 }
 
 // DefaultCrawlerEngines 向导默认勾选（主流 SEO 场景：Google/Bing/百度）。
+// 只读：消费方只做 json.Marshal/遍历，禁止修改本切片（全局单份）。
 var DefaultCrawlerEngines = []string{"googlebot", "bingbot", "baiduspider"}

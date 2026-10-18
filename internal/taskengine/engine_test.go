@@ -18,6 +18,12 @@ import (
 )
 
 func newTestEngine(t *testing.T) *Engine {
+	return newTestEngineWithOptions(t, Options{TickInterval: 10 * time.Millisecond})
+}
+
+// newTestEngineWithOptions 与 newTestEngine 同形，允许指定 Options（历史
+// 历史问题-04：常驻重拉退避需在测试内缩短）。
+func newTestEngineWithOptions(t *testing.T, opts Options) *Engine {
 	t.Helper()
 	// 与 services 测试同模式：临时目录初始化全套库（含 task_runs 表迁移）
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
@@ -28,7 +34,7 @@ func newTestEngine(t *testing.T) *Engine {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
 	})
-	e := NewEngine(Options{TickInterval: 10 * time.Millisecond})
+	e := NewEngine(opts)
 	t.Cleanup(e.Stop)
 	return e
 }

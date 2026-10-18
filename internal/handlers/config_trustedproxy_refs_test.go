@@ -185,13 +185,16 @@ func TestConfigBackup_trustedProxyRangeRefsRoundTrip(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO users (id, username, password_hash, role, display_name, is_enabled) VALUES (2, 'backup-admin', 'hash', 'admin', 'Backup Admin', 1) ON CONFLICT(id) DO NOTHING`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_range_refs='[3,7]' WHERE id=1`); err != nil {
+	// U04d-02：id 3 是内置威胁名单（db 种子）——内置名单引用自本轮起 400
+	// 拒绝（威胁名单条目在 .iplist 文件，DB entries 恒空会让格式/总量门失效），
+	// 本往返用例改用不冲突的自定义 id。
+	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_range_refs='[903,907]' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	// D3（历史）导入门后语义：refs 存在性按「备份内优先 ∪ 库内」解析
 	//——真实备份的被引用名单随 security_ip_lists 表导出，此处种两行使备份
 	// 自洽（带外直写悬空 refs 的旧形态现在导入 400，见 r74c 门钉测）。
-	for _, id := range []int64{3, 7} {
+	for _, id := range []int64{903, 907} {
 		if _, err := db.DB.Exec(`INSERT OR IGNORE INTO security_ip_lists (id, name, entries) VALUES (?, ?, '[]')`, id, fmt.Sprintf("roundtrip-%d", id)); err != nil {
 			t.Fatal(err)
 		}
@@ -208,8 +211,8 @@ func TestConfigBackup_trustedProxyRangeRefsRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(unpackExportBody(t, response.Body.Bytes()), &backup); err != nil {
 		t.Fatalf("decode export: %v", err)
 	}
-	if got, _ := backup.Config["trusted_proxy_range_refs"].(string); got != "[3,7]" {
-		t.Fatalf("export config region trusted_proxy_range_refs=%v, want [3,7]", backup.Config["trusted_proxy_range_refs"])
+	if got, _ := backup.Config["trusted_proxy_range_refs"].(string); got != "[903,907]" {
+		t.Fatalf("export config region trusted_proxy_range_refs=%v, want [903,907]", backup.Config["trusted_proxy_range_refs"])
 	}
 
 	// 清空后导入同一备份（校验和原样携带）→ 值还原
@@ -233,7 +236,7 @@ func TestConfigBackup_trustedProxyRangeRefsRoundTrip(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT COALESCE(trusted_proxy_range_refs,'[]') FROM global_config WHERE id=1`).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
-	if got != "[3,7]" {
-		t.Fatalf("imported trusted_proxy_range_refs=%q, want [3,7]", got)
+	if got != "[903,907]" {
+		t.Fatalf("imported trusted_proxy_range_refs=%q, want [903,907]", got)
 	}
 }

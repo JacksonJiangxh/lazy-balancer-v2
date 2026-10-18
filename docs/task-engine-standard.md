@@ -90,6 +90,15 @@ SetRole（promote/demote）自动拉起/停止角色不符的 daemon（loopEnabl
 事实——成功列体现启动计数）；异常退出（Run 返回错误且非 ctx 取消）补记
 failed 行（真实时长与错误）；取消/正常停止不增行。
 
+**Daemon 异常退出自愈（2026-10-18）**：异常退出且调度仍开
+（`loopEnabled && 角色允许 && 引擎未停止`）时按有界退避自动重拉——默认
+1s/5s/30s 三次（`taskengine.Options.DaemonRestartDelays` 可覆盖），每次重拉在
+`tasks/{id}.log` 留 `[restart]` 行；次数用尽后停止调度并留 `[done] … 已用尽`
+行，需人工重启。Run 存活 ≥1 分钟后再崩视为新故障（预算归零）；用户显式
+关→开（StartLoop/control restart）同样重置预算。退避窗口内 `TaskMeta.Running=false`
+且状态列呈现 `failed`（修复前恒 `idle`「空闲」，采集/签发静默停摆无信号）；
+显式停止调度后回 `idle`。
+
 ### 循环（9）——固定间隔，每轮独立执行+记录
 
 | 任务 | 间隔 |
@@ -181,7 +190,7 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
 
 ### 4.3 API 写门与执行角色分层
 
-- `Trigger/Toggle/Cancel/Control` 四个任务写端点统一 `requireMasterNode`，与路由组 `readOnlyGuard` 共同保证从节点只读和同步 403。
+- `Trigger/Toggle/Cancel/Control` 四个任务写端点统一 `requireMasterNode`，与路由组 `readOnlyGuard` 共同保证从节点只读和同步 403。角色查询失败（DB 故障/迁移窗口）返回 `500`「节点角色查询失败」，不得报 403（403 会把排障方向误导为集群角色问题）。
 - `Descriptor.RunsOn` 是**执行调度**唯一角色事实源（引擎 tick/Trigger/RunSync/BootSync）；它不承担面板 API 权限语义，不与集群只读写门混用。
 - 写端点状态码统一（历史问题）：引擎未初始化 `503`、任务不存在 `404`、语义拒绝（常驻族触发、触发类 toggle、业务驱动族 toggle 等）`400`。
 - 引擎角色种子（启动装配读 `global_config.is_master`）读失败时 warn + 重试一次，仍失败按**从节点 fail-closed** 启动（不得沿用引擎默认主节点——否则会拉起 master-only daemon 并放开写面）；后续并发角色翻转由 `SetRole` 正常收敛。
@@ -192,7 +201,7 @@ failed 行（真实时长与错误）；取消/正常停止不增行。
 |---|---|---|
 | 定时槽间隙 | 0 行 | 0 行 |
 | 定时执行 | 1 行（引擎预插 running→终态） | [done]+业务 |
-| 常驻生命周期 | 启动即记 success；异常退出补 failed 行（真实时长与错误 message） | [start]；停止 [done stopped]；失败 [done failed] |
+| 常驻生命周期 | 启动即记 success；异常退出补 failed 行（真实时长与错误 message） | [start]；停止 [done stopped]；失败 [done failed]；异常退出重拉 [restart]（有界 1s/5s/30s，用尽后 [done] 已用尽） |
 | 循环每轮 | 1 行 | [done]+业务 |
 | 触发执行 | 1 行 | [start]/[done]+业务 |
 | 手动触发 | 1 行（trigger=manual） | 同上 |

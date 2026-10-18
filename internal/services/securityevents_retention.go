@@ -198,8 +198,33 @@ func securityEventsRetentionCleanup(ctx context.Context) int {
 	if rollupDeleted > 0 {
 		Logf("info", "security events retention: rollup cleanup removed %d rows older than %s", rollupDeleted, rollupCutoff)
 	}
+	// 历史问题（历史）：目标维度 rollup 与主 rollup 同生命周期——同批次/
+	// 同保留下界清理，否则 top_targets 投影无限增长。
+	targetDeleted := 0
+	for {
+		res, err := database.Exec(`DELETE FROM security_event_target_rollup WHERE minute < ? AND minute IN (
+			SELECT minute FROM security_event_target_rollup WHERE minute < ? GROUP BY minute ORDER BY minute LIMIT 60)`, rollupCutoff, rollupCutoff)
+		if err != nil {
+			Logf("warn", "security events retention: target rollup cleanup failed: %v", err)
+			break
+		}
+		affected, _ := res.RowsAffected()
+		targetDeleted += int(affected)
+		if affected == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			Logf("info", "security events retention: target rollup cleanup canceled mid-pass (deleted %d)", targetDeleted)
+			return total
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if targetDeleted > 0 {
+		Logf("info", "security events retention: target rollup cleanup removed %d rows older than %s", targetDeleted, rollupCutoff)
+	}
 	// v2.3.8：本轮有删除时截断 WAL（含仅 rollup 清理；100/s 持续写入+滚动删除下防 WAL 无界）
-	if total > 0 || rollupDeleted > 0 {
+	if total > 0 || rollupDeleted > 0 || targetDeleted > 0 {
 		if _, err := database.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 			Logf("warn", "security events retention: wal checkpoint failed: %v", err)
 		}

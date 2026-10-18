@@ -33,6 +33,11 @@ func Retryable(status int) bool {
 
 // After parses a Retry-After header value (delay-seconds or HTTP-date) into a
 // duration. Unparseable, empty, or past values yield zero.
+//
+// 历史问题（历史）：本函数与 services/certissuer.go 的 parseRetryAfter 是
+// 同语义双实现（包边界所致：本包属 dnsprovider/internal，services 不可导入）。
+// 解析口径（delay-seconds/HTTP-date、不可解析或非正归零）任一侧变更 MUST
+// 同步另一侧并保持语义一致。
 func After(header string) time.Duration {
 	if header == "" {
 		return 0

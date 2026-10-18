@@ -43,18 +43,23 @@ func TestValidateRuleFeatures_rejectsOutOfRangeTryWindow(t *testing.T) {
 	}
 
 	rejectCases := []struct {
-		name   string
-		mutate func(*ruleFeatureInput)
+		protocol string
+		name     string
+		mutate   func(*ruleFeatureInput)
 	}{
-		{"tcp duration above max", func(i *ruleFeatureInput) { i.TCPTryDuration = 60001 }},
-		{"tcp interval above max", func(i *ruleFeatureInput) { i.TCPTryInterval = 60001 }},
-		{"tcp duration far above max", func(i *ruleFeatureInput) { i.TCPTryDuration = 1_000_000 }},
-		{"http interval above max", func(i *ruleFeatureInput) { i.Protocol = "http"; i.TCPHealthCheckPort = 0; i.TCPTryInterval = 60001 }},
-		{"http duration above max", func(i *ruleFeatureInput) { i.Protocol = "http"; i.TCPHealthCheckPort = 0; i.TCPTryDuration = 60001 }},
+		{"tcp", "tcp duration above max", func(i *ruleFeatureInput) { i.TCPTryDuration = 60001 }},
+		{"tcp", "tcp interval above max", func(i *ruleFeatureInput) { i.TCPTryInterval = 60001 }},
+		{"tcp", "tcp duration far above max", func(i *ruleFeatureInput) { i.TCPTryDuration = 1_000_000 }},
+		{"http", "http interval above max", func(i *ruleFeatureInput) { i.TCPTryInterval = 60001 }},
+		{"http", "http duration above max", func(i *ruleFeatureInput) { i.TCPTryDuration = 60001 }},
+		// LBH79-历史问题：http 侧下界——修复前只判 >60000，负 interval 静默落库。
+		{"http", "http interval below min", func(i *ruleFeatureInput) { i.TCPTryInterval = -1 }},
+		{"http", "http interval far below min", func(i *ruleFeatureInput) { i.TCPTryInterval = -250 }},
+		{"http", "http duration below min", func(i *ruleFeatureInput) { i.TCPTryDuration = -2 }},
 	}
 	for _, tc := range rejectCases {
 		t.Run(tc.name, func(t *testing.T) {
-			input := base("tcp")
+			input := base(tc.protocol)
 			tc.mutate(&input)
 			if err := validateRuleFeatures(input); err == nil {
 				t.Fatalf("%s must be rejected, got nil error", tc.name)
@@ -62,28 +67,28 @@ func TestValidateRuleFeatures_rejectsOutOfRangeTryWindow(t *testing.T) {
 		})
 	}
 
-	// 边界放行形状：60000 两协议、两字段均为合法上界
+	// 边界放行形状：60000 两协议、两字段均为合法上界；http interval 0 合法。
 	validCases := []struct {
-		name   string
-		mutate func(*ruleFeatureInput)
+		protocol string
+		name     string
+		mutate   func(*ruleFeatureInput)
 	}{
-		{"tcp at upper bound", func(i *ruleFeatureInput) { i.TCPTryDuration = 60000; i.TCPTryInterval = 60000 }},
-		{"http at upper bound", func(i *ruleFeatureInput) {
-			i.Protocol = "http"
-			i.TCPHealthCheckPort = 0
+		{"tcp", "tcp at upper bound", func(i *ruleFeatureInput) { i.TCPTryDuration = 60000; i.TCPTryInterval = 60000 }},
+		{"http", "http at upper bound", func(i *ruleFeatureInput) {
 			i.TCPTryDuration = 60000
 			i.TCPTryInterval = 60000
 		}},
-		{"http ntlm sentinel -1", func(i *ruleFeatureInput) {
-			i.Protocol = "http"
-			i.TCPHealthCheckPort = 0
+		{"http", "http ntlm sentinel -1", func(i *ruleFeatureInput) {
 			i.TCPTryDuration = -1
 			i.TCPTryInterval = 250
+		}},
+		{"http", "http zero interval", func(i *ruleFeatureInput) {
+			i.TCPTryInterval = 0
 		}},
 	}
 	for _, tc := range validCases {
 		t.Run(tc.name, func(t *testing.T) {
-			input := base("tcp")
+			input := base(tc.protocol)
 			tc.mutate(&input)
 			if err := validateRuleFeatures(input); err != nil {
 				t.Fatalf("%s must pass, got %v", tc.name, err)

@@ -281,12 +281,6 @@ type GlobalConfig struct {
 	TrustedProxyRangeRefs string       `json:"trusted_proxy_range_refs"`
 	TrustedProxyHeaders   string       `json:"trusted_proxy_headers"`
 	TrustedProxyStrict    bool         `json:"trusted_proxy_strict"`
-	ClusterVersion        int          `json:"cluster_version"`
-	ClusterToken          string       `json:"-"`
-	RegistrationID        int          `json:"-"`
-	RegistrationSecret    string       `json:"-"`
-	AppliedVersion        int          `json:"applied_version"`
-	LastSyncError         string       `json:"last_sync_error"`
 	LastSync              JSONNullTime `json:"last_sync"`
 	UpdatedAt             JSONNullTime `json:"updated_at"`
 }

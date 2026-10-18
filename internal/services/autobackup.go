@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"strconv"
@@ -17,11 +18,13 @@ import (
 // （services→handlers 直接依赖会成环，装配点在 main.go）。
 var (
 	autoBackupExecMu   sync.Mutex
-	autoBackupExecutor func(trigger, operator string, engineRunID int64) error
+	autoBackupExecutor func(ctx context.Context, trigger, operator string, engineRunID int64) error
 )
 
 // SetAutoBackupExecutor 注入备份执行器（main.go 装配 handlers 实现；nil 解除）。
-func SetAutoBackupExecutor(fn func(trigger, operator string, engineRunID int64) error) {
+// ctx 由引擎 Run 上下文透传（历史 历史问题-10）：demote/停止时在途备份
+// 必须可被取消，而非跑完并记 success。
+func SetAutoBackupExecutor(fn func(ctx context.Context, trigger, operator string, engineRunID int64) error) {
 	autoBackupExecMu.Lock()
 	autoBackupExecutor = fn
 	autoBackupExecMu.Unlock()
@@ -39,26 +42,52 @@ func AutoBackupEnabled() bool {
 	return enabled == 1
 }
 
-// SetAutoBackupEnabled 写自动备份业务开关并同步任务调度；off→on 保留
-// 既有水位线语义（停用期不追补），与设置页保存同口径。
-func SetAutoBackupEnabled(enabled bool) error {
+// autoBackupConfigWriter 是 *sql.DB / *sql.Tx 的最小写面（开关写入单源）。
+type autoBackupConfigWriter interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// writeAutoBackupEnabled 开关+启用水位线写入的唯一实现（DB 直写与设置页事务
+// 共用；off→on 保留既有水位线语义——停用期不追补）。
+func writeAutoBackupEnabled(w autoBackupConfigWriter, enabled bool) error {
 	var previous int
-	if err := db.DB.QueryRow(`SELECT COALESCE(auto_backup_enabled,0) FROM global_config WHERE id=1`).Scan(&previous); err != nil {
+	if err := w.QueryRow(`SELECT COALESCE(auto_backup_enabled,0) FROM global_config WHERE id=1`).Scan(&previous); err != nil {
 		return err
 	}
-	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=?, updated_at=datetime('now') WHERE id=1`, enabled); err != nil {
+	if _, err := w.Exec(`UPDATE global_config SET auto_backup_enabled=?, updated_at=datetime('now') WHERE id=1`, enabled); err != nil {
 		return err
 	}
 	if previous == 0 && enabled {
-		if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_last_run=? WHERE id=1`, time.Now().Format(time.RFC3339)); err != nil {
+		if _, err := w.Exec(`UPDATE global_config SET auto_backup_last_run=? WHERE id=1`, time.Now().Format(time.RFC3339)); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// SetAutoBackupEnabled 写自动备份业务开关并同步任务调度；off→on 保留
+// 既有水位线语义（停用期不追补），与设置页保存同口径。
+func SetAutoBackupEnabled(enabled bool) error {
+	if err := writeAutoBackupEnabled(db.DB, enabled); err != nil {
+		return err
 	}
 	syncTaskLoop("auto-backup", enabled)
 	return nil
 }
 
-func currentAutoBackupExecutor() func(trigger, operator string, engineRunID int64) error {
+// SetAutoBackupEnabledTx 在调用方事务内写业务开关与启用水位线（历史问题-08：
+// 设置页「四列设置 + 开关」必须同事务——修复前设置先落库、开关后写，开关
+// 失败返回 500 但设置已生效）。事务提交后由调用方经 SyncAutoBackupTaskLoop
+// 同步引擎调度。
+func SetAutoBackupEnabledTx(tx *sql.Tx, enabled bool) error {
+	return writeAutoBackupEnabled(tx, enabled)
+}
+
+// SyncAutoBackupTaskLoop 事务提交后同步自动备份调度（启用态即开/关循环）。
+func SyncAutoBackupTaskLoop(enabled bool) { syncTaskLoop("auto-backup", enabled) }
+
+func currentAutoBackupExecutor() func(ctx context.Context, trigger, operator string, engineRunID int64) error {
 	autoBackupExecMu.Lock()
 	defer autoBackupExecMu.Unlock()
 	return autoBackupExecutor
@@ -208,12 +237,17 @@ func nextAutoBackupSlot(now time.Time) (time.Time, bool) {
 // runAutoBackupScheduled 定时任务执行体（v2.0 Scheduled 标准——引擎在排程
 // 槽调用；追补/去重判定在 NextSlotFn=nextAutoBackupSlot）。成败均推进
 // last_run（失败已由执行器落 failed 行+审计，防重试风暴）。
-func runAutoBackupScheduled(engineRunID int64) error {
+func runAutoBackupScheduled(ctx context.Context, engineRunID int64) error {
 	exec := currentAutoBackupExecutor()
 	if exec == nil {
 		return errors.New("自动备份执行器未就绪")
 	}
-	execErr := exec("schedule", "system", engineRunID) // engineRunID=引擎已记行——执行器跳过自记（单写方）
+	execErr := exec(ctx, "schedule", "system", engineRunID) // engineRunID=引擎已记行——执行器跳过自记（单写方）
+	if ctx.Err() != nil {
+		// 取消（角色降级/引擎停止）不等于本槽已完成：推进水位线会把漏掉的
+		// 备份槽记作已执行，恢复后不再补跑（历史问题-10）。
+		return execErr
+	}
 	row, err := loadAutoBackupSettings()
 	if err == nil {
 		if dueSlot, ok := autoBackupDueSlot(time.Now(), row.freq, row.hhmm, row.day, CurrentLocation()); ok {

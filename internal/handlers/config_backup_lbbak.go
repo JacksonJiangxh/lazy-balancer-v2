@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/services"
 
 	"github.com/gin-gonic/gin"
@@ -231,7 +232,7 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 			continue
 		}
 		source := strings.TrimSuffix(strings.TrimPrefix(name, lbbakEntryThreatPrefix), ".iplist")
-		if source == "" || strings.Contains(source, "/") {
+		if _, ok := db.CanonicalThreatSource(source); !ok {
 			return nil, fmt.Errorf("lbbak 威胁库条目名非法: %s", name)
 		}
 		// F-B1：manifest 未登记的条目未经 sha256 校验（合法导出恒登记全部
@@ -256,7 +257,6 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 type lbbakWafApplyResult struct {
 	Warnings            []string
 	FilesLanded         bool
-	CRSApplied          bool
 	FailedCRS           bool
 	FailedXdb           bool
 	FailedThreatSources []string
@@ -303,6 +303,7 @@ func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip
 	services.WafFileLock().Lock()
 	defer services.WafFileLock().Unlock()
 	threatFailed := map[string]struct{}{}
+	threatLanded := false
 	bundle := &services.WafFileBundle{IP2RegionTag: ip2regionTag}
 	if payload.CRSTarGz != nil {
 		bundle.CRSSha256 = payload.CRSSha256
@@ -336,42 +337,47 @@ func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip
 			fail("mkdir 失败", err)
 			continue
 		}
-		if err := os.WriteFile(iplistPath, data, 0644); err != nil {
-			fail("落盘失败", err)
+		if err := services.WriteThreatIplistCompiled(iplistPath, data); err != nil {
+			fail("落盘/编译失败", err)
 			continue
 		}
-		if err := services.CompileFromIplistFile(iplistPath); err != nil {
-			fail("编译失败", err)
-			continue
-		}
+		threatLanded = true
 	}
-	crsChanged, xdbChanged := false, false
-	if _, _, _, err := services.ApplyWafFileBundle(bundle); err != nil {
+	crsChanged, xdbChanged, _, err := services.ApplyWafFileBundle(bundle)
+	result.FilesLanded = crsChanged || xdbChanged || threatLanded
+	if err != nil {
 		services.Logf("error", "lbbak 导入落盘规则库文件失败: %v", err)
-		// 落盘失败：对应版本表必须由调用方丢弃（记录与文件同批语义）。
-		if payload.CRSTarGz != nil {
-			result.FailedCRS = true
-		}
-		if payload.Xdb != nil && !result.FailedXdb {
+		component := services.WafFileApplyComponent(err)
+		switch component {
+		case "crs":
+			// CRS 阶段失败时 XDB 尚未执行；两者记录都不能指向备份版本。
+			result.FailedCRS = payload.CRSTarGz != nil
+			result.FailedXdb = payload.Xdb != nil
+		case "xdb":
+			// CRS 阶段已经完整返回：changed=false 仅表示 live 已一致，绝非失败。
 			result.FailedXdb = true
+		default:
+			// 未知错误形态保守维持旧文件/记录同批语义。
+			result.FailedCRS = payload.CRSTarGz != nil
+			result.FailedXdb = payload.Xdb != nil
 		}
 		if result.FailedCRS {
 			result.warn(c, action, "CRS 规则库文件落盘失败: "+err.Error()+"——CRS 版本记录已丢弃（记录与文件须同批）")
 		}
-		if !result.FailedCRS && result.FailedXdb {
-			result.warn(c, action, "规则库文件落盘失败: "+err.Error()+"——IP2Region 版本记录已丢弃（记录与文件须同批）")
+		if result.FailedXdb {
+			result.warn(c, action, "IP2Region 数据文件未成功应用: "+err.Error()+"——IP2Region 版本记录已丢弃（记录与文件须同批）")
+		}
+		if component == "xdb" && crsChanged {
+			result.warn(c, action, "CRS 规则库文件已落盘并保留版本记录；仅 IP2Region 应用失败")
 		}
 		return result
 	}
-	// ApplyWafFileBundle 内部已判定变更；此处以「有携带即视为可能落盘」
-	// 保守口径（变更判定不外泄——filesLanded 用于失败分裂警告，宁可多报）
-	crsChanged = payload.CRSTarGz != nil
-	xdbChanged = payload.Xdb != nil && !result.FailedXdb
-	result.FilesLanded = true
-	if crsChanged || xdbChanged {
+	crsApplied := payload.CRSTarGz != nil
+	xdbApplied := payload.Xdb != nil && !result.FailedXdb
+	if crsApplied || xdbApplied {
 		recordAudit(c, action, "安全数据", services.FormatAuditDetail("规则库数据库(随备份还原/导入)", services.AuditResultPart("success")))
 		// 完整更新流程(与自动更新器同款分阶段流水,来源=lbbak 备份)
-		if xdbChanged {
+		if xdbApplied {
 			if err := services.Reload(); err != nil {
 				services.Logf("error", "lbbak 导入后 ip2region 内存缓存热换失败(下次重启生效): %v", err)
 				// 历史问题：热换失败必须对用户可见（磁盘与内存分裂，重启才收敛）。
@@ -380,7 +386,6 @@ func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip
 			services.RebuildRegionTreeCacheForSync()
 		}
 	}
-	result.CRSApplied = crsChanged
 	return result
 }
 

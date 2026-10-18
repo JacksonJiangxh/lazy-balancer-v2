@@ -10,6 +10,9 @@
 // wafiplist 叶模块同接线：Dockerfile xcaddy --with + COPY，backend 阶段
 // go.mod 先拷）。漂移失效形态（选项树提供某省/市而发射变量发另一形态 →
 // 城市级地域规则静默恒不命中）由单源根治，修改只改本包一处。
+//
+// 所有导出表均为进程级**只读**全局数据：消费方只读取，禁止修改（写入会同时
+// 污染选项树与发射两端；新增映射请改表本身并同步 tables_test 钉值）。
 package geoipnames
 
 import "strings"
@@ -17,6 +20,7 @@ import "strings"
 // ProvinceAliases 省列别名规范化（历史问题 二十三次）：xdb 原始省列存在双形态
 // （上海/上海市、广西/广西壮族自治区）、台湾城市误入省列（台中市等）与个别
 // 乱码（UEruemqi）。选项树与 CEL 发射变量统一用规范名，两边一致才能命中。
+// 只读：禁止修改（全局单份）。
 var ProvinceAliases = map[string]string{
 	// v3.17.0 段 (UEruemqi, Wulumuqi)：省列是城市名 Ürümqi 的乱码转写、城市列
 	// 拼音已可映射——别名把该段回收为 新疆维吾尔自治区/乌鲁木齐市（此前整段
@@ -34,6 +38,7 @@ var ProvinceAliases = map[string]string{
 }
 
 // TaiwanCities 台湾地区在 xdb 中误置于省列的城市——归入台湾省城市集。
+// 只读：禁止修改（全局单份）。
 var TaiwanCities = map[string]bool{
 	"台北市": true, "新北市": true, "台中市": true, "台南市": true, "高雄市": true,
 	"基隆市": true, "新竹市": true, "嘉义市": true, "新竹县": true, "彰化县": true,
@@ -45,6 +50,7 @@ var TaiwanCities = map[string]bool{
 // ASCII 城市由选项树侧过滤（宁缺勿乱，无法可靠音译）、发射侧原样通过
 // （恒不命中，与不可识别省同语义）。历史问题 二十五次起发射侧同步映射——
 // 城市级 CEL 规则对拼音段可命中。
+// 只读：禁止修改（全局单份）。
 var CityPinyinFixes = map[string]string{
 	"Wulumuqi": "乌鲁木齐市", "Shanghai": "上海市", "Beijing": "北京市",
 	"Fengyuan": "丰原市", "Taipei City": "台北市", "Zhongli District": "中坜区",
@@ -69,6 +75,7 @@ var CityPinyinFixes = map[string]string{
 // 简称 → 全称 映射。
 // 注意不可盲加「市」：「大理市」是另一个县级市，全称是「大理白族自治州」。
 // 港澳的「九龙/将军澳/新界/香港岛/澳门」是地区名非城市，不在此表（保持原值）。
+// 只读：禁止修改（全局单份）。
 var AutonomousPrefectures = map[string]string{
 	// 云南（8 个自治州）
 	"大理": "大理白族自治州", "怒江": "怒江傈僳族自治州", "楚雄": "楚雄彝族自治州",
@@ -105,6 +112,7 @@ var AutonomousPrefectures = map[string]string{
 // 未列入表的值原样通过（纯白名单过滤）：选项树收集与 CEL/头发射两侧共用
 // NormalizeCountry，同进同出，不存在「树提供某国而发射变量发另一形态」的
 // 漂移面（PLUG-N3 单源立场）。
+// 只读：禁止修改（全局单份）。
 var OverseasCountries = map[string]string{
 	"美国":       "United States",
 	"Reserved": "",
@@ -137,6 +145,7 @@ func NormalizeCountry(raw string) string {
 //
 // 「中国」行走国内分支、「Reserved」行在展示层走保留地址分支，均不进本表；
 // 未收录名经 CountryChinese 回退原名（未来 xdb 新增国名优雅降级英文）。
+// 只读：禁止修改（全局单份；本表直接进 API 响应，就地修改即污染响应）。
 var CountryNamesCN = map[string]string{
 	// A
 	"Afghanistan": "阿富汗", "Albania": "阿尔巴尼亚", "Algeria": "阿尔及利亚",

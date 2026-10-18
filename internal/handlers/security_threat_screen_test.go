@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"lazy-balancer-v2/internal/config"
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/internal/services"
 )
 
 // 威胁大屏（threat-screen）端点钉测：聚合形状（国家计数 map/总量/拦截率/
@@ -70,6 +72,15 @@ type threatScreenPayload struct {
 		HourlyHist      []models.SecurityAttackType `json:"hourly_hist"`
 		AttackTypeShare []models.SecurityAttackType `json:"attack_type_share"`
 		RecentRate      float64                     `json:"recent_rate"`
+		// v2.4.x 大屏加固：logged=total-blocked（夹 >=0）、限流可用性位、
+		// 被攻击目标 Top5（name/domain/value）
+		LoggedEvents       int  `json:"logged_events"`
+		RatelimitAvailable bool `json:"ratelimit_available"`
+		TopTargets         []struct {
+			Name   string `json:"name"`
+			Domain string `json:"domain"`
+			Value  int    `json:"value"`
+		} `json:"top_targets"`
 	} `json:"data"`
 }
 
@@ -189,6 +200,14 @@ func TestGetSecurityThreatScreen_aggregateShape(t *testing.T) {
 	if payload.Data.RatelimitBlocks != 12 {
 		t.Errorf("ratelimit_blocks=%v, want 12 (Caddy metrics 429 total)", payload.Data.RatelimitBlocks)
 	}
+	// 限流可用性位：metrics 正常抓取 → true
+	if !payload.Data.RatelimitAvailable {
+		t.Errorf("ratelimit_available=false, want true（metrics 可达）")
+	}
+	// logged_events = total - blocked = 6-5 = 1
+	if payload.Data.LoggedEvents != 1 {
+		t.Errorf("logged_events=%d, want 1（total 6 - blocked 5）", payload.Data.LoggedEvents)
+	}
 	// 活跃源 = 近 10min 去重 client_ip：192.0.2.9 与 198.51.100.6
 	if payload.Data.ActiveSources != 2 {
 		t.Errorf("active_sources=%d, want 2", payload.Data.ActiveSources)
@@ -261,19 +280,27 @@ func TestGetSecurityThreatScreen_hoursParam(t *testing.T) {
 	}
 }
 
-func TestGetSecurityThreatScreen_metricsScrapeFailureReturns500(t *testing.T) {
-	// Given: Caddy metrics 不可达
+func TestGetSecurityThreatScreen_metricsScrapeFailureDegrades(t *testing.T) {
+	// Given: Caddy metrics 不可达 + 窗口内 1 条事件
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, "http://127.0.0.1:1/metrics")
+	seedThreatScreenEvent(t, utcStringAgo(time.Hour), "203.0.113.7", "942100", "SQL Injection", "blocked")
 
-	// When/Then: 500「限流拦截数据不可用」——指标不可达与暂无限流拦截必须
-	// 可区分（与 GetSecurityRateLimitBlocks 同口径，历史问题 三-4）
+	// When/Then: 不再整卡 500——ratelimit_blocks=0、ratelimit_available=false，
+	// 其余维度照常 200（大屏 30s 轮询容忍限流指标瞬时不可达，可用性位披露）
 	recorder := getRequest(t, router, "/security/overview/threat-screen")
-	if recorder.Code != http.StatusInternalServerError {
-		t.Fatalf("status=%d body=%s, want 500", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 降级", recorder.Code, recorder.Body.String())
 	}
-	if !strings.Contains(recorder.Body.String(), "限流拦截数据不可用") {
-		t.Fatalf("body=%s, want explicit message", recorder.Body.String())
+	var payload threatScreenPayload
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Data.RatelimitAvailable || payload.Data.RatelimitBlocks != 0 {
+		t.Fatalf("ratelimit_available=%v ratelimit_blocks=%v, want false/0", payload.Data.RatelimitAvailable, payload.Data.RatelimitBlocks)
+	}
+	if payload.Data.TotalEvents != 1 || payload.Data.BlockedEvents != 1 {
+		t.Fatalf("total=%d blocked=%d, want 1/1（其余维度照常）", payload.Data.TotalEvents, payload.Data.BlockedEvents)
 	}
 }
 
@@ -336,14 +363,18 @@ type feedPayload struct {
 			RuleName   string `json:"rule_name"`
 			AttackType string `json:"attack_type"`
 		} `json:"events"`
-		SinceID int `json:"since_id"`
-		Limit   int `json:"limit"`
+		SinceID     int   `json:"since_id"`
+		NextSinceID int64 `json:"next_since_id"`
+		Limit       int   `json:"limit"`
+		HasMore     bool  `json:"has_more"`
 	} `json:"data"`
 }
 
-// 历史 历史问题 改名：突发超过单页上限的事件按裁定舍弃（有界单页语义），
-// 不再宣称「NoLoss」。
-func TestGetSecurityEventFeed_cursorIncrementalDedupAndBacklogDropAtPageCap(t *testing.T) {
+// 大屏事件流升序无漏语义：since_id=0 首屏返回最新 limit 条（响应仍按 id
+// 升序，next_since_id=返回集最大 id，has_more=false——首屏不回溯更老）；
+// since_id>0 增量升序、>limit 积压分多次拉取无重无漏，has_more 披露
+// 「本页填满且可能还有更新未返回」。
+func TestGetSecurityEventFeed_ascendingNoLossAndFirstScreenLatest(t *testing.T) {
 	// Given: 210 条事件（超过单页 clamp 上限 200）
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
@@ -357,11 +388,6 @@ func TestGetSecurityEventFeed_cursorIncrementalDedupAndBacklogDropAtPageCap(t *t
 		seedThreatScreenEvent(t, ts, fmt.Sprintf("203.0.113.%d", i%200+1), triggered, msg, "blocked")
 	}
 
-	// When: 消费者游标 = 已消费最大 id，恒递增；每次拉取 id > 游标的增量
-	// （id 降序、limit 截断——超出单页的积压按大屏突发合并口径舍弃，不重复
-	// 消费已见 id）。
-	seen := map[int]bool{}
-	since := 0
 	fetch := func(query string) feedPayload {
 		recorder := getRequest(t, router, "/security/events/feed"+query)
 		if recorder.Code != http.StatusOK {
@@ -373,14 +399,10 @@ func TestGetSecurityEventFeed_cursorIncrementalDedupAndBacklogDropAtPageCap(t *t
 		}
 		prev := -1
 		for _, ev := range payload.Data.Events {
-			if ev.ID >= prev && prev != -1 {
-				t.Fatalf("feed not id-desc: %v after %v", ev.ID, prev)
+			if ev.ID <= prev {
+				t.Fatalf("feed not id-ascending: %v after %v", ev.ID, prev)
 			}
 			prev = ev.ID
-			if seen[ev.ID] {
-				t.Fatalf("duplicate id %v across polls", ev.ID)
-			}
-			seen[ev.ID] = true
 			if ev.ClientIP == "" || ev.Action != "blocked" || ev.EventTime == "" || ev.RuleName != "测试规则" {
 				t.Fatalf("feed event missing enrichment fields: %+v", ev)
 			}
@@ -388,30 +410,64 @@ func TestGetSecurityEventFeed_cursorIncrementalDedupAndBacklogDropAtPageCap(t *t
 		return payload
 	}
 
-	// Then: 首轮（since=0, limit=200）→ 恰 200 条、不越上限
-	payload := fetch("?since_id=0&limit=200")
-	if len(payload.Data.Events) != 200 || payload.Data.Limit != 200 {
-		t.Fatalf("first poll: %d events (limit=%d), want 200/200", len(payload.Data.Events), payload.Data.Limit)
+	// 首屏（since_id=0, limit=200）：最新 200 条（ids 11..210）升序，
+	// next_since_id=210、has_more=false（不回溯更老的 ids 1..10）
+	first := fetch("?since_id=0&limit=200")
+	if len(first.Data.Events) != 200 || first.Data.Limit != 200 {
+		t.Fatalf("first screen: %d events (limit=%d), want 200/200", len(first.Data.Events), first.Data.Limit)
 	}
-	// 游标推进到本页最大 id 后重复轮询 → 空页（无重）
-	since = payload.Data.Events[0].ID
-	payload = fetch(fmt.Sprintf("?since_id=%d&limit=200", since))
-	if len(payload.Data.Events) != 0 {
-		t.Fatalf("re-poll after cursor advance returned %d events, want 0", len(payload.Data.Events))
+	if first.Data.Events[0].ID != 11 || first.Data.Events[199].ID != 210 {
+		t.Fatalf("first screen ids [%d..%d], want [11..210]（最新 200 条）", first.Data.Events[0].ID, first.Data.Events[199].ID)
 	}
-	// 游标之后新落库的事件全部被增量拉到（无漏）
-	for i := range 3 {
-		seedThreatScreenEvent(t, utcStringAgo(time.Duration(-i)*time.Second), fmt.Sprintf("198.51.100.%d", i+1), "930100", "LFI", "blocked")
-	}
-	payload = fetch(fmt.Sprintf("?since_id=%d", since))
-	if len(payload.Data.Events) != 3 {
-		t.Fatalf("incremental poll=%d events, want exactly the 3 new events", len(payload.Data.Events))
-	}
-	if len(seen) != 203 {
-		t.Fatalf("unique ids=%d, want 203 (200+3, zero dup)", len(seen))
+	if first.Data.NextSinceID != 210 || first.Data.HasMore {
+		t.Fatalf("first screen next_since_id=%d has_more=%v, want 210/false", first.Data.NextSinceID, first.Data.HasMore)
 	}
 
-	// 家族归因单源：942100→SQL注入、941100→XSS（feed 富化字段）
+	// 积压消费（since_id=1, limit=100）：209 条分三拉无重无漏
+	seen := map[int]bool{}
+	pull := func(since int64, wantN int, wantHasMore bool) feedPayload {
+		p := fetch(fmt.Sprintf("?since_id=%d&limit=100", since))
+		if len(p.Data.Events) != wantN {
+			t.Fatalf("pull since=%d: %d events, want %d", since, len(p.Data.Events), wantN)
+		}
+		if p.Data.HasMore != wantHasMore {
+			t.Fatalf("pull since=%d: has_more=%v, want %v", since, p.Data.HasMore, wantHasMore)
+		}
+		for _, ev := range p.Data.Events {
+			if seen[ev.ID] {
+				t.Fatalf("duplicate id %d across pulls", ev.ID)
+			}
+			seen[ev.ID] = true
+			if int64(ev.ID) <= since {
+				t.Fatalf("event id %d <= cursor %d（重复消费已见 id）", ev.ID, since)
+			}
+		}
+		return p
+	}
+	p1 := pull(1, 100, true)
+	if p1.Data.NextSinceID != 101 {
+		t.Fatalf("pull1 next_since_id=%d, want 101（本批实际扫描最大 id）", p1.Data.NextSinceID)
+	}
+	p2 := pull(p1.Data.NextSinceID, 100, true)
+	p3 := pull(p2.Data.NextSinceID, 9, false)
+	if p3.Data.NextSinceID != 210 {
+		t.Fatalf("pull3 next_since_id=%d, want 210", p3.Data.NextSinceID)
+	}
+	if len(seen) != 209 {
+		t.Fatalf("unique ids=%d, want 209（ids 2..210 无重无漏）", len(seen))
+	}
+
+	// 游标之后新落库的事件全部被增量拉到（无漏）
+	for i := range 3 {
+		seedThreatScreenEvent(t, utcStringAgo(0), fmt.Sprintf("198.51.100.%d", i+1), "930100", "LFI", "blocked")
+	}
+	inc := fetch("?since_id=210&limit=100")
+	if len(inc.Data.Events) != 3 || inc.Data.HasMore {
+		t.Fatalf("incremental=%d events has_more=%v, want 3/false", len(inc.Data.Events), inc.Data.HasMore)
+	}
+
+	// 家族归因单源：首屏最新 200 条（3 条 LFI 落库后 = ids 14..213：
+	// XSS 事件 id=1 在窗外）——942100→SQL注入 ×197、无 XSS
 	recorder := getRequest(t, router, "/security/events/feed?limit=200")
 	var full feedPayload
 	_ = json.Unmarshal(recorder.Body.Bytes(), &full)
@@ -425,7 +481,7 @@ func TestGetSecurityEventFeed_cursorIncrementalDedupAndBacklogDropAtPageCap(t *t
 		}
 	}
 	if sqlCount != 197 || xssCount != 0 {
-		t.Fatalf("attack_type attribution=%d/%d, want 197/0（最新 200 条=ids 213..14：XSS 事件 id=1 在窗外，3 条 LFI 为游标后新增）", sqlCount, xssCount)
+		t.Fatalf("attack_type attribution=%d/%d, want 197/0", sqlCount, xssCount)
 	}
 }
 
@@ -449,7 +505,14 @@ func TestGetSecurityEventFeed_defaultsAndNewEventsAfterCursor(t *testing.T) {
 	if len(payload.Data.Events) != 3 || payload.Data.SinceID != 0 || payload.Data.Limit != 50 {
 		t.Fatalf("defaults: %+v", payload.Data)
 	}
-	maxID := payload.Data.Events[0].ID
+	// 升序：末条即最大 id；首屏 has_more=false
+	if payload.Data.HasMore {
+		t.Fatalf("first screen has_more=true, want false")
+	}
+	maxID := payload.Data.Events[len(payload.Data.Events)-1].ID
+	if int64(maxID) != payload.Data.NextSinceID {
+		t.Fatalf("next_since_id=%d, want %d（返回集最大 id）", payload.Data.NextSinceID, maxID)
+	}
 
 	// 游标之后新落库的事件可被增量拉到（不重不漏的增量语义）
 	seedThreatScreenEvent(t, utcStringAgo(0), "203.0.113.10", "930100", "LFI", "blocked")
@@ -888,6 +951,7 @@ type feedCursorPayload struct {
 		SinceID     int64                          `json:"since_id"`
 		NextSinceID int64                          `json:"next_since_id"`
 		Limit       int                            `json:"limit"`
+		HasMore     bool                           `json:"has_more"`
 	} `json:"data"`
 }
 
@@ -914,6 +978,13 @@ func TestSecurityEventFeed_reservedOnlyPageAdvancesCursor(t *testing.T) {
 	}
 	if payload.Data.NextSinceID != 110 {
 		t.Fatalf("next_since_id=%d, want 110 (max id actually scanned)", payload.Data.NextSinceID)
+	}
+	// 首屏契约：升序输出（ids 11..60）、has_more=false（不回溯更老）
+	if payload.Data.HasMore {
+		t.Fatalf("first screen has_more=true, want false")
+	}
+	if payload.Data.Events[0].ID != 11 || payload.Data.Events[49].ID != 60 {
+		t.Fatalf("first screen ids [%d..%d], want ascending [11..60]", payload.Data.Events[0].ID, payload.Data.Events[49].ID)
 	}
 	// 用返回的高水位再请求：不得重复返回已扫描行。
 	recorder = getRequest(t, router, fmt.Sprintf("/security/events/feed?limit=50&since_id=%d", payload.Data.NextSinceID))
@@ -949,6 +1020,10 @@ func TestSecurityEventFeed_mixedPageHighWater(t *testing.T) {
 	if payload.Data.NextSinceID != 60 {
 		t.Fatalf("next_since_id=%d, want 60", payload.Data.NextSinceID)
 	}
+	// 升序输出（ids 1..50）
+	if payload.Data.Events[0].ID != 1 || payload.Data.Events[49].ID != 50 {
+		t.Fatalf("mixed page ids [%d..%d], want ascending [1..50]", payload.Data.Events[0].ID, payload.Data.Events[49].ID)
+	}
 }
 
 func TestThreatRollup_longGapDoesNotFakeContinuousCoverage(t *testing.T) {
@@ -980,5 +1055,313 @@ func TestThreatRollup_longGapDoesNotFakeContinuousCoverage(t *testing.T) {
 	}
 	if got := threatRollupCountForMinute(t, eventMinute); got != 1 {
 		t.Fatalf("gap minute count=%d, want 1 (长缺口事件必须被更宽窗口回填)", got)
+	}
+}
+
+// ---- v2.4.x 大屏加固：top_targets / rollup warmer / hourly_hist 滑动窗口 ----
+
+// seedThreatRuleEvent 带 rule_caddy_id 的事件种子（top_targets 数据源）。
+func seedThreatRuleEvent(t *testing.T, eventTime, clientIP, ruleCaddyID, action string) {
+	t.Helper()
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, rule_name, rule_caddy_id)
+		VALUES (?, ?, 'GET', '/a', 'stage1', '2', 'IP 黑名单命中', ?, '', ?)`,
+		eventTime, clientIP, action, ruleCaddyID); err != nil {
+		t.Fatalf("seed rule event: %v", err)
+	}
+}
+
+func seedThreatLBRule(t *testing.T, caddyID, name, domain string) {
+	t.Helper()
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, listen_port, domain) VALUES (?, ?, 'http', 80, ?)`,
+		caddyID, name, domain); err != nil {
+		t.Fatalf("seed lb_rule: %v", err)
+	}
+}
+
+func TestGetSecurityThreatScreen_topTargets(t *testing.T) {
+	// Given: 主库两条规则 + 窗口内事件（lb_aaa ×3 blocked、lb_bbb ×1 logged、
+	// 已删除规则 lb_gone ×2、空 rule_caddy_id 事件 ×1）
+	setupSecurityPolicyTestDB(t)
+	t.Cleanup(resetThreatScreenCachesForTest)
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	seedThreatLBRule(t, "lb_aaa", "API 服务", "api.example.com")
+	seedThreatLBRule(t, "lb_bbb", "官网", "www.example.com")
+	for i := 0; i < 3; i++ {
+		seedThreatRuleEvent(t, utcStringAgo(time.Duration(i+1)*time.Minute), "203.0.113.7", "lb_aaa", "blocked")
+	}
+	seedThreatRuleEvent(t, utcStringAgo(time.Minute), "203.0.113.8", "lb_bbb", "logged")
+	for i := 0; i < 2; i++ {
+		seedThreatRuleEvent(t, utcStringAgo(time.Duration(i+1)*time.Minute), "203.0.113.9", "lb_gone", "blocked")
+	}
+	seedThreatScreenEvent(t, utcStringAgo(time.Minute), "203.0.113.10", "942100", "SQL Injection", "blocked")
+
+	// When
+	recorder := getRequest(t, router, "/security/overview/threat-screen")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload threatScreenPayload
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+
+	// Then: top_targets 按计数降序取前 5；已删除规则跳过；空 rule_caddy_id 排除
+	targets := payload.Data.TopTargets
+	if len(targets) != 2 {
+		t.Fatalf("top_targets=%+v, want 2 项（lb_gone 无 lb_rules 行跳过、空 id 排除）", targets)
+	}
+	if targets[0].Name != "API 服务" || targets[0].Domain != "api.example.com" || targets[0].Value != 3 {
+		t.Errorf("top_targets[0]=%+v, want {API 服务 api.example.com 3}", targets[0])
+	}
+	if targets[1].Name != "官网" || targets[1].Domain != "www.example.com" || targets[1].Value != 1 {
+		t.Errorf("top_targets[1]=%+v, want {官网 www.example.com 1}（logged 也计入分组计数）", targets[1])
+	}
+}
+
+func TestGetSecurityThreatScreen_topTargetsCached(t *testing.T) {
+	// Given: 一条规则 + 1 条窗口内事件
+	setupSecurityPolicyTestDB(t)
+	t.Cleanup(resetThreatScreenCachesForTest)
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	seedThreatLBRule(t, "lb_aaa", "API 服务", "api.example.com")
+	seedThreatRuleEvent(t, utcStringAgo(time.Minute), "203.0.113.7", "lb_aaa", "blocked")
+
+	get := func() int {
+		recorder := getRequest(t, router, "/security/overview/threat-screen")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var payload threatScreenPayload
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if len(payload.Data.TopTargets) != 1 {
+			t.Fatalf("top_targets=%+v, want 1 项", payload.Data.TopTargets)
+		}
+		return payload.Data.TopTargets[0].Value
+	}
+
+	// When/Then: 首查 value=1；缓存窗口（5min TTL）内再落 2 条事件后第二查
+	// 仍返回 1（进程内缓存命中——大屏 30s 轮询不再每轮扫原始表）
+	if got := get(); got != 1 {
+		t.Fatalf("first value=%d, want 1", got)
+	}
+	seedThreatRuleEvent(t, utcStringAgo(30*time.Second), "203.0.113.7", "lb_aaa", "blocked")
+	seedThreatRuleEvent(t, utcStringAgo(20*time.Second), "203.0.113.7", "lb_aaa", "blocked")
+	if got := get(); got != 1 {
+		t.Fatalf("cached value=%d, want 1（TTL 内缓存命中）", got)
+	}
+	// reset 后重新查询生效
+	resetThreatScreenCachesForTest()
+	if got := get(); got != 3 {
+		t.Fatalf("after reset value=%d, want 3", got)
+	}
+}
+
+func TestGetSecurityThreatScreen_topTargetsQueryFailureReturns500(t *testing.T) {
+	// Given: lb_rules 表缺失（主库查询失败）+ 一条带 rule_caddy_id 的事件
+	setupSecurityPolicyTestDB(t)
+	t.Cleanup(resetThreatScreenCachesForTest)
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	seedThreatRuleEvent(t, utcStringAgo(time.Minute), "203.0.113.7", "lb_aaa", "blocked")
+	if _, err := db.DB.Exec(`DROP TABLE lb_rules`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When/Then: top_targets 查询失败保持整卡 500（与现有错误口径一致）
+	recorder := getRequest(t, router, "/security/overview/threat-screen")
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestStartThreatRollupWarmer_takesOverFixation(t *testing.T) {
+	// Given: 窗口内 1 条事件；warmer 以已取消 ctx 启动（立即退出不执行固化，
+	// 但启动标志置位）；幂等二次启动不 panic。
+	// 历史 历史问题：启动标志 ≠ 已有可用覆盖——首轮从未成功时请求路径必须
+	// 沿用懒固化（不得返回全零「无攻击」大屏）。
+	setupSecurityPolicyTestDB(t)
+	t.Cleanup(resetThreatRollupWarmerForTest)
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	seedThreatScreenEvent(t, utcStringAgo(5*time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 已取消：warmer 立即退出（不执行固化），仅置启动标志
+	StartThreatRollupWarmer(ctx)
+	StartThreatRollupWarmer(ctx) // 幂等：CAS 标志，重复启动为空操作
+	threatRollupWarmerWg.Wait()  // 确认协程已退出（后续请求路径断言无并发固化）
+
+	// When/Then: warmer 未完成首轮 → 请求路径懒固化兜底（total=1）
+	recorder := getRequest(t, router, "/security/overview/threat-screen")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload threatScreenPayload
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Data.TotalEvents != 1 {
+		t.Fatalf("total_events=%d, want 1（首轮未完成时请求路径须懒固化兜底）", payload.Data.TotalEvents)
+	}
+
+	// 模拟「warmer 已成功固化且新鲜」：再落一条最新分钟事件——常规请求不再
+	// 懒固化（total 保持 1）；复位后请求懒固化重固末两分钟 → 2。
+	markThreatRollupSuccess()
+	seedThreatScreenEvent(t, utcStringAgo(10*time.Second), "203.0.113.8", "942100", "SQL Injection", "blocked")
+	recorder = getRequest(t, router, "/security/overview/threat-screen")
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Data.TotalEvents != 1 {
+		t.Fatalf("total_events=%d, want 1（warmer 已就绪且新鲜时请求路径不再懒固化）", payload.Data.TotalEvents)
+	}
+
+	// 复位启动标志（测试/旧路径）→ 请求懒固化恢复
+	resetThreatRollupWarmerForTest()
+	recorder = getRequest(t, router, "/security/overview/threat-screen")
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Data.TotalEvents != 2 {
+		t.Fatalf("total_events=%d, want 2（未启动 warmer 时保持懒固化）", payload.Data.TotalEvents)
+	}
+}
+
+func TestStartThreatRollupWarmer_runsImmediately(t *testing.T) {
+	// Given: 窗口内 1 条事件
+	setupSecurityPolicyTestDB(t)
+	t.Cleanup(resetThreatRollupWarmerForTest)
+	seedThreatScreenEvent(t, utcStringAgo(2*time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	ctx, cancel := context.WithCancel(context.Background())
+	// 先取消并等待协程退出，再让 DB 清理运行（cleanup LIFO：本注册晚于
+	// setupSecurityPolicyTestDB 的换库清理，故先于其执行）。
+	t.Cleanup(func() {
+		cancel()
+		threatRollupWarmerWg.Wait()
+	})
+
+	// When
+	StartThreatRollupWarmer(ctx)
+
+	// Then: 启动即固化一次（不等首个 60s tick）——轮询等待 rollup 行出现
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var n int
+		if err := db.MetricsDB.QueryRow(`SELECT COALESCE(SUM(count),0) FROM security_event_rollup`).Scan(&n); err == nil && n >= 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("warmer 未在启动后立即固化（rollup 仍为空）")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestGetSecurityThreatScreen_hourlyHistSlidingHours(t *testing.T) {
+	// Given: 30 分钟前与 90 分钟前各 1 条事件
+	setupSecurityPolicyTestDB(t)
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	now := time.Now()
+	seedThreatScreenEvent(t, now.UTC().Add(-30*time.Minute).Truncate(time.Second).Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, now.UTC().Add(-90*time.Minute).Truncate(time.Second).Format("2006-01-02 15:04:05"), "203.0.113.8", "941100", "XSS", "blocked")
+
+	// When: hours=3
+	recorder := getRequest(t, router, "/security/overview/threat-screen?hours=3")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload threatScreenPayload
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+
+	// Then: 滑动窗口分桶——3 槽（min(hours,24)）、名称 HH:00、末槽=当前
+	// 小时（配置时区），不再按本地固定 0..23 小时折叠
+	hist := payload.Data.HourlyHist
+	if len(hist) != 3 {
+		t.Fatalf("hourly_hist=%d 槽, want 3（hours=3 滑动窗口）", len(hist))
+	}
+	loc := services.CurrentLocation()
+	lastHour := time.Now().In(loc).Truncate(time.Hour)
+	for i, slot := range hist {
+		want := lastHour.Add(-time.Duration(len(hist)-1-i) * time.Hour)
+		if slot.Name != fmt.Sprintf("%02d:00", want.Hour()) {
+			t.Fatalf("hist[%d].Name=%q, want %02d:00（末槽为当前小时，逐槽回溯）", i, slot.Name, want.Hour())
+		}
+	}
+	// 事件按本地小时落槽（总量守恒）
+	byName := map[string]int{}
+	total := 0
+	for _, slot := range hist {
+		byName[slot.Name] += slot.Value
+		total += slot.Value
+	}
+	if total != 2 {
+		t.Fatalf("hourly 总计=%d, want 2", total)
+	}
+	slot30 := fmt.Sprintf("%02d:00", now.Add(-30*time.Minute).In(loc).Hour())
+	slot90 := fmt.Sprintf("%02d:00", now.Add(-90*time.Minute).In(loc).Hour())
+	if byName[slot30] != 1 || byName[slot90] != 1 {
+		t.Fatalf("落槽=%v, want %s=1 且 %s=1", byName, slot30, slot90)
+	}
+}
+
+func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
+	// Given: 30 小时前与 2 小时前各 1 条事件
+	setupSecurityPolicyTestDB(t)
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	now := time.Now()
+	seedThreatScreenEvent(t, now.UTC().Add(-30*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, now.UTC().Add(-2*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "203.0.113.8", "941100", "XSS", "blocked")
+
+	// When: hours=72（rollup 回填跨多次请求续做——单请求批预算 24h）
+	var payload threatScreenPayload
+	for i := 0; i < 6; i++ {
+		recorder := getRequest(t, router, "/security/overview/threat-screen?hours=72")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Then: 24h 日桶——ceil(72/24)=3 槽、名称 MM-DD、末槽=今天
+	hist := payload.Data.HourlyHist
+	if len(hist) != 3 {
+		t.Fatalf("hourly_hist=%d 槽, want 3（ceil(72/24) 日桶）", len(hist))
+	}
+	loc := services.CurrentLocation()
+	today := time.Now().In(loc)
+	for i, slot := range hist {
+		want := today.AddDate(0, 0, -(len(hist) - 1 - i))
+		if slot.Name != want.Format("01-02") {
+			t.Fatalf("hist[%d].Name=%q, want %s（末槽为今天，逐日回溯）", i, slot.Name, want.Format("01-02"))
+		}
+	}
+	byName := map[string]int{}
+	total := 0
+	for _, slot := range hist {
+		byName[slot.Name] += slot.Value
+		total += slot.Value
+	}
+	if total != 2 {
+		t.Fatalf("hourly 总计=%d, want 2", total)
+	}
+	day30 := now.Add(-30 * time.Hour).In(loc).Format("01-02")
+	day2 := now.Add(-2 * time.Hour).In(loc).Format("01-02")
+	if byName[day30] != 1 || byName[day2] != 1 {
+		t.Fatalf("落桶=%v, want %s=1 且 %s=1", byName, day30, day2)
+	}
+
+	// hours=720（30 天上限）→ 日桶上限 30 槽
+	recorder := getRequest(t, router, "/security/overview/threat-screen?hours=720")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("hours=720 status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data.HourlyHist) != 30 {
+		t.Fatalf("hours=720 hourly_hist=%d 槽, want 30（日桶上限）", len(payload.Data.HourlyHist))
 	}
 }

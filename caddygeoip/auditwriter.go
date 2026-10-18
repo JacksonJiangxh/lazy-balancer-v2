@@ -54,6 +54,10 @@ import (
 // （coraza GetWriter 大小写不敏感）。
 const auditWriterName = "lbfile"
 
+// auditTimingBurstSweepInterval 限制「条目数超阈值」兜底清扫频率；常规
+// 64 创建周期清扫不受此间隔影响。
+const auditTimingBurstSweepInterval = time.Second
+
 func init() {
 	plugins.RegisterAuditLogWriter(auditWriterName, func() plugintypes.AuditLogWriter {
 		return &lbAuditWriter{}
@@ -119,9 +123,10 @@ var (
 	auditTimingMu      sync.Mutex
 	auditTimingEntries = map[string]*auditTimingEntry{}
 	// auditTimingCreateCount 记录创建次数——每 64 次创建触发一次过期清扫
-	// （摊销 O(1)；size 超限时立即清扫兜底突发）。
+	// （摊销 O(1)）；size 超限时的额外兜底清扫受时间下限约束。
 	auditTimingCreateCount int
 	auditTimingSweepMin    = 4096
+	auditTimingLastSweep   time.Time
 )
 
 // auditTimingRecord 写入一个分段计时（µs）。id 为空（计时 ID 生成失败的降级
@@ -175,9 +180,12 @@ func auditTimingClose(id string) {
 }
 
 // auditTimingSweepIfDueLocked 建条计数 + 摊销清扫（调用方持 auditTimingMu）。
+// 超阈值兜底最多每秒一次，避免大注册表把每次建条放大成全表 O(n) 扫描。
 func auditTimingSweepIfDueLocked(now time.Time) {
 	auditTimingCreateCount++
-	if auditTimingCreateCount%64 == 0 || len(auditTimingEntries) > auditTimingSweepMin {
+	burstDue := len(auditTimingEntries) > auditTimingSweepMin &&
+		(auditTimingLastSweep.IsZero() || now.Sub(auditTimingLastSweep) >= auditTimingBurstSweepInterval)
+	if auditTimingCreateCount%64 == 0 || burstDue {
 		auditTimingSweepLocked(now)
 	}
 }
@@ -228,6 +236,7 @@ func auditTimingWait(id string, timeout time.Duration) auditTimingSnapshot {
 
 // auditTimingSweepLocked 清扫超龄条目（调用方持 auditTimingMu）。
 func auditTimingSweepLocked(now time.Time) {
+	auditTimingLastSweep = now
 	for id, e := range auditTimingEntries {
 		if now.Sub(e.created) > auditTimingEntryTTL {
 			delete(auditTimingEntries, id)
@@ -867,11 +876,11 @@ func (p *auditPipeline) openFile(mode os.FileMode) error {
 // enqueue 阻塞式入队（零丢弃）：队列满时等待 drain 消化——退化价=退役前
 // serial 同步写。发送持 RLock 全程（release 的 Lock 排队等到发送完成），与
 // release 的 close(q) 定序互斥，不会 send-on-closed。管线已关（refs 归零后的
-// 重载窗口在途写入，q==nil）或 done 已闭时回退同步直写——同样零丢弃。
+// 重载窗口在途写入，closed=true）或 done 已闭时回退同步直写——同样零丢弃。
 func (p *auditPipeline) enqueue(item lbAuditItem) error {
 	p.mu.RLock()
-	q, done := p.queue, p.done
-	if q == nil {
+	q, done, closed := p.queue, p.done, p.closed
+	if closed || q == nil {
 		p.mu.RUnlock()
 		return p.syncWrite(item)
 	}
@@ -929,7 +938,6 @@ func (p *auditPipeline) release() {
 	if p.refs == 0 && !p.closed {
 		p.closed = true
 		q := p.queue
-		p.queue = nil
 		waitDrain = true
 		delete(auditPipelines, p.target)
 		close(q)
@@ -946,16 +954,17 @@ func (p *auditPipeline) release() {
 }
 
 // drain 专职落盘 goroutine：注入 timing → bufio 批量写 → 阈值/周期双触发刷盘。
-// 队列关闭后排空余量再退出（零丢弃语义覆盖 teardown 路径）。队列句柄在启动时
-// 捕获一次——release 会把 p.queue 置 nil（防后续 enqueue），select 若每轮重读
-// 字段会读到 nil channel（永不完全就绪的 case），ticker 分支将使本 goroutine
-// 永不退出（实测 livelock）。
+// 队列关闭后排空余量再退出（零丢弃语义覆盖 teardown 路径）。队列句柄创建后
+// 保持不变，release 只关闭 channel 不清字段；因此 drain 即使在 release 后
+// 才首次运行，也仍能取得同一 channel 并排空。后续 enqueue 由 closed 门控转
+// 同步直写，不会向已关闭 channel 发送。
 func (p *auditPipeline) drain() {
 	defer close(p.done)
 	p.mu.RLock()
 	q := p.queue
 	p.mu.RUnlock()
 	if q == nil {
+		p.closeFile()
 		return
 	}
 	ticker := time.NewTicker(auditFlushInterval)

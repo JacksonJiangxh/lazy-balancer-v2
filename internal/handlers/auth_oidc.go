@@ -85,6 +85,27 @@ const (
 // var 供测试收窄)。
 var oidcStateMaxEntries = 4096
 
+// reserveOIDCStateSlot 原子预留一个在册 state 槽位（历史 U04c-07）。
+// 旧实现「先 Load 判定上限、discovery/随机数之后再 Store + Add(1)」是
+// TOCTOU：并发未认证登录可在检查与入册之间同时通过上限判定，越过 4096
+// 硬上限。CAS 循环不持锁、不阻塞昂贵的 discovery；上限 <=0 表示一律拒绝
+// （测试用 0 表达禁用登录）。调用方必须在成功 Store 前可回滚预留。
+func reserveOIDCStateSlot() bool {
+	max := int32(oidcStateMaxEntries)
+	if max <= 0 {
+		return false
+	}
+	for {
+		cur := oidcStateCount.Load()
+		if cur >= max {
+			return false
+		}
+		if oidcStateCount.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
 // ── 配置读写 ──
 
 func loadOIDCConfig() (OIDCConfig, bool) {
@@ -347,10 +368,18 @@ func (h *Handlers) OIDCLogin(c *gin.Context) {
 	})
 	// 历史问题:在册 state 条目封顶——未认证泛洪不得无限放大内存(上限远高于
 	// 正常未完成登录量级;到达即拒绝,不影响「回调失败不计锁定」裁定)。
-	if oidcStateCount.Load() >= int32(oidcStateMaxEntries) {
+	// U04c-07：改为原子预留（CAS 递增），后续失败路径经 defer 释放——
+	// 检查与入册不再有 TOCTOU 窗口。
+	if !reserveOIDCStateSlot() {
 		fail("登录请求过于频繁，请稍后再试")
 		return
 	}
+	reserved := true
+	defer func() {
+		if reserved {
+			oidcStateCount.Add(-1)
+		}
+	}()
 	p, err := oidcProvider(cfg.Issuer)
 	if err != nil {
 		fail(err.Error())
@@ -373,7 +402,7 @@ func (h *Handlers) OIDCLogin(c *gin.Context) {
 	verifier := oauth2.GenerateVerifier()
 	returnTo := sanitizeOIDCReturnTo(c.Query("return_to"))
 	oidcStates.Store(state, oidcStateEntry{nonce: nonce, verifier: verifier, returnTo: returnTo, created: time.Now()})
-	oidcStateCount.Add(1)
+	reserved = false // 槽位已由预留提交，计数保持 +1
 	// 历史问题：state 与发起登录的浏览器绑定——回调侧校验同名 cookie 的 HMAC
 	// 绑定值，跨浏览器/跨会话的 code+state 组合无法完成登录。
 	setOIDCStateCookie(c, h.cfg.JWTSecret, state)
@@ -404,6 +433,104 @@ func truncateRunes(s string, max int) string {
 		return s
 	}
 	return string(runes[:max])
+}
+
+// oidcIdentity 是 (issuer,subject) 命中的 OIDC 身份行。
+type oidcIdentity struct {
+	id              int
+	username        string
+	role            string
+	isEnabled       int
+	passwordVersion int64
+}
+
+// lookupOIDCIdentity 按 (issuer,subject) 查身份行（命中分支、JIT 并发回退
+// 共用同一查询口径——U04c-08 收敛）。
+func lookupOIDCIdentity(issuer, subject string) (oidcIdentity, error) {
+	var ident oidcIdentity
+	err := db.DB.QueryRow(`SELECT id, username, role, COALESCE(is_enabled,1), COALESCE(password_version,0)
+		FROM users WHERE auth_provider='oidc' AND oidc_issuer=? AND oidc_subject=?`, issuer, subject).
+		Scan(&ident.id, &ident.username, &ident.role, &ident.isEnabled, &ident.passwordVersion)
+	return ident, err
+}
+
+// oidcCandidateUsername 选择未被占用的 JIT 用户名（先 COUNT 后 INSERT；
+// 与并发写入者的唯一冲突由 createOIDCUserWithRetry 兜底重试）。
+func oidcCandidateUsername(base string) (string, error) {
+	candidate := base
+	for i := 2; ; i++ {
+		var exists int
+		if err := db.DB.QueryRow("SELECT COUNT(*) FROM users WHERE username=?", candidate).Scan(&exists); err != nil {
+			return "", err
+		}
+		if exists == 0 {
+			return candidate, nil
+		}
+		suffix := fmt.Sprintf("-%d", i)
+		// 后缀去重同受 历史问题-3 的 50 字符预算约束(后缀为 ASCII,字节数=rune 数)。
+		baseRunes := []rune(base)
+		if len(baseRunes)+len(suffix) > 50 {
+			budget := 50 - len(suffix)
+			if budget < 0 {
+				budget = 0
+			}
+			candidate = string(baseRunes[:budget]) + suffix
+		} else {
+			candidate = base + suffix
+		}
+	}
+}
+
+// oidcJITInsertAttempts JIT 开户唯一冲突的重试上限（每次重试重新 COUNT）。
+const oidcJITInsertAttempts = 3
+
+// oidcJITInsertAttemptHook 测试缝（生产恒 nil）：在每次 INSERT 前调用，
+// attempt 从 1 起；返回非 nil 即按该错误处理（模拟「COUNT 已通过、INSERT
+// 前并发者抢占候选名」的竞态），不执行真实 INSERT。
+var oidcJITInsertAttemptHook func(attempt int) error
+
+// createOIDCUserWithRetry JIT 开户（U04c-08）：候选名「先 COUNT 后 INSERT」
+// 在「不同 subject、相同 preferred_username 并发首登」下仍会撞 username
+// 唯一约束——旧实现只按 (issuer,subject) 回查，身份行不存在即令本次登录
+// 失败。新语义：唯一冲突且身份行不存在时重算候选名并有限重试；同一 subject
+// 的并发回调（U6a-1）仍按命中分支收口，不补「创建」审计。
+// 返回 (身份行, 是否本次创建, 错误)。
+func createOIDCUserWithRetry(issuer, subject, base, displayName string) (oidcIdentity, bool, error) {
+	for attempt := 1; attempt <= oidcJITInsertAttempts; attempt++ {
+		candidate, err := oidcCandidateUsername(base)
+		if err != nil {
+			return oidcIdentity{}, false, err
+		}
+		var res sql.Result
+		if oidcJITInsertAttemptHook != nil {
+			err = oidcJITInsertAttemptHook(attempt)
+		}
+		if err == nil {
+			// password_hash 置空:bcrypt 对空哈希恒败,OIDC 用户密码登录天然不可用。
+			res, err = db.DB.Exec("INSERT INTO users (username, password_hash, role, display_name, is_enabled, auth_provider, oidc_subject, oidc_issuer) VALUES (?, '', 'user', ?, 1, 'oidc', ?, ?)",
+				candidate, displayName, subject, issuer)
+		}
+		if err == nil {
+			newID, idErr := res.LastInsertId()
+			if idErr != nil {
+				return oidcIdentity{}, false, idErr
+			}
+			return oidcIdentity{id: int(newID), username: candidate, role: "user", isEnabled: 1}, true, nil
+		}
+		if !isUniqueConstraintError(err) {
+			return oidcIdentity{}, false, err
+		}
+		// 同 subject 并发回调：对端已建身份行 → 沿用其账号状态。
+		ident, lookupErr := lookupOIDCIdentity(issuer, subject)
+		if lookupErr == nil {
+			return ident, false, nil
+		}
+		if !errors.Is(lookupErr, sql.ErrNoRows) {
+			return oidcIdentity{}, false, lookupErr
+		}
+		// 冲突发生在 username（不同 subject 同名竞态）→ 重算候选名重试。
+	}
+	return oidcIdentity{}, false, fmt.Errorf("OIDC JIT 用户创建冲突重试耗尽")
 }
 
 // OIDCCallback GET /auth/oidc/callback——授权码换令牌→ID Token 验签→
@@ -512,18 +639,23 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 	// 用户命中:OIDC 用户独立行(不绑定本地账号),按 (issuer, subject) 定位。
 	// 历史问题:同查 password_version——OIDC JWT 携带 pwd_ver,与本地会话同构,
 	// 配置导入的版本递增不再把 OIDC 会话打入永久 401 死循环。
-	var userID int
-	var username, role string
-	var isEnabled int
-	var passwordVersion int64
-	err = db.DB.QueryRow("SELECT id, username, role, COALESCE(is_enabled,1), COALESCE(password_version,0) FROM users WHERE auth_provider='oidc' AND oidc_issuer=? AND oidc_subject=?", cfg.Issuer, claims.Sub).
-		Scan(&userID, &username, &role, &isEnabled, &passwordVersion)
+	ident, err := lookupOIDCIdentity(cfg.Issuer, claims.Sub)
 	switch {
-	case errors.Is(err, nil):
-		if isEnabled != 1 {
-			services.RecordAuditLog(username, "登录失败", "用户认证", services.FormatAuditDetail(fmt.Sprintf("OIDC 登录 %s(账号已禁用)", services.AuditUserPart(userID, username)), services.AuditResultPart("failure")), c.ClientIP())
+	case err == nil:
+		if ident.isEnabled != 1 {
+			services.RecordAuditLog(ident.username, "登录失败", "用户认证", services.FormatAuditDetail(fmt.Sprintf("OIDC 登录 %s(账号已禁用)", services.AuditUserPart(ident.id, ident.username)), services.AuditResultPart("failure")), c.ClientIP())
 			fail("账号已被禁用", "")
 			return
+		}
+		// U04c-06：显示名是 IdP 源属性——重复登录按最新 claims 刷新（否则
+		// 永久停留在首次开户快照，而 UI 明示「由认证服务管理」）。role/
+		// is_enabled/username 仍由本地管理；username 刷新涉及唯一冲突与历史
+		// 链接，本轮保留本地值（报告裁定：单独策略）。
+		if name := truncateRunes(strings.TrimSpace(claims.Name), 50); name != "" {
+			if _, uerr := db.DB.Exec("UPDATE users SET display_name=? WHERE id=? AND COALESCE(display_name,'')<>?", name, ident.id, name); uerr != nil {
+				fail("更新用户资料失败", "OIDC 用户资料刷新失败")
+				return
+			}
 		}
 	case errors.Is(err, sql.ErrNoRows):
 		// JIT 开户:默认普通角色;用户名取 preferred_username→email 本地部分→sub,
@@ -547,63 +679,28 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 		if displayName == "" {
 			displayName = base
 		}
-		candidate := base
-		for i := 2; ; i++ {
-			var exists int
-			if err := db.DB.QueryRow("SELECT COUNT(*) FROM users WHERE username=?", candidate).Scan(&exists); err != nil {
-				fail("查询用户失败", "")
-				return
-			}
-			if exists == 0 {
-				break
-			}
-			suffix := fmt.Sprintf("-%d", i)
-			// 后缀去重同受 历史问题-3 的 50 字符预算约束(后缀为 ASCII,字节数=rune 数)。
-			baseRunes := []rune(base)
-			if len(baseRunes)+len(suffix) > 50 {
-				budget := 50 - len(suffix)
-				if budget < 0 {
-					budget = 0
-				}
-				candidate = string(baseRunes[:budget]) + suffix
-			} else {
-				candidate = base + suffix
-			}
-		}
-		// password_hash 置空:bcrypt 对空哈希恒败,OIDC 用户密码登录天然不可用。
-		res, err := db.DB.Exec("INSERT INTO users (username, password_hash, role, display_name, is_enabled, auth_provider, oidc_subject, oidc_issuer) VALUES (?, '', 'user', ?, 1, 'oidc', ?, ?)",
-			candidate, displayName, claims.Sub, cfg.Issuer)
-		fellBack := false
-		if err != nil && isUniqueConstraintError(err) {
-			// U6a-1（历史）：JIT 开户与并发回调竞态——两请求同窗口双双
-			// 走 no-rows 分支，后到的 INSERT 撞 u_oidc_identity 唯一索引。按既有
-			// 命中分支收口：重 SELECT 对端已建行，命中即沿用其账号状态（禁用态
-			// 同口径拒绝）；不补「创建」审计——行非本请求所建。身份行不存在
-			// （冲突发生在 username 等其他唯一键）则维持原失败路径。
-			err = db.DB.QueryRow("SELECT id, username, role, COALESCE(is_enabled,1), COALESCE(password_version,0) FROM users WHERE auth_provider='oidc' AND oidc_issuer=? AND oidc_subject=?", cfg.Issuer, claims.Sub).
-				Scan(&userID, &username, &role, &isEnabled, &passwordVersion)
-			fellBack = err == nil
-			if fellBack && isEnabled != 1 {
-				services.RecordAuditLog(username, "登录失败", "用户认证", services.FormatAuditDetail(fmt.Sprintf("OIDC 登录 %s(账号已禁用)", services.AuditUserPart(userID, username)), services.AuditResultPart("failure")), c.ClientIP())
-				fail("账号已被禁用", "")
-				return
-			}
-		}
-		if err != nil {
+		// U04c-08：不同 subject 同名并发首登仍会撞 username 唯一约束——
+		// 唯一冲突后重算候选名有限重试（含 U6a-1 的同 subject 并发回退）。
+		var created bool
+		var cerr error
+		ident, created, cerr = createOIDCUserWithRetry(cfg.Issuer, claims.Sub, base, displayName)
+		if cerr != nil {
 			fail("创建 OIDC 用户失败", "OIDC JIT 开户失败")
 			return
 		}
-		if !fellBack {
-			newID, _ := res.LastInsertId()
-			userID = int(newID)
-			username = candidate
-			role = "user"
-			services.RecordAuditLog(username, "创建", "用户认证", services.FormatAuditDetail(fmt.Sprintf("OIDC 首次登录自动开户(%s)", cfg.Issuer), services.AuditResultPart("success")), c.ClientIP())
+		if ident.isEnabled != 1 {
+			services.RecordAuditLog(ident.username, "登录失败", "用户认证", services.FormatAuditDetail(fmt.Sprintf("OIDC 登录 %s(账号已禁用)", services.AuditUserPart(ident.id, ident.username)), services.AuditResultPart("failure")), c.ClientIP())
+			fail("账号已被禁用", "")
+			return
+		}
+		if created {
+			services.RecordAuditLog(ident.username, "创建", "用户认证", services.FormatAuditDetail(fmt.Sprintf("OIDC 首次登录自动开户(%s)", cfg.Issuer), services.AuditResultPart("success")), c.ClientIP())
 		}
 	default:
 		fail("查询用户失败", "")
 		return
 	}
+	userID, username, role, passwordVersion := ident.id, ident.username, ident.role, ident.passwordVersion
 
 	// 签发本站 JWT(与密码登录同构;auth_method=oidc 标记会话来源——本地
 	// MFA 族功能对 OIDC 用户整体豁免,v2.3.0 用户裁定)。
@@ -765,7 +862,12 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 	if !guardConfiguredJSONBody(c) {
 		return
 	}
-	_ = c.ShouldBindJSON(&req)
+	// U04c-09：只有真正的空 body 才回退「测试已保存配置」；语法畸形/字段
+	// 类型错误必须 400（旧实现吞掉绑定错误，客户端格式错误会收到 200）。
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
+		return
+	}
 	issuer := normalizeOIDCIssuer(req.Issuer)
 	if issuer == "" {
 		cfg, _ := loadOIDCConfig()

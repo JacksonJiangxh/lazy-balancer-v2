@@ -80,59 +80,79 @@ func mfaGenerateRecoveryCodes(n int) ([]string, string, error) {
 	return codes, string(j), nil
 }
 
-// mfaConsumeRecoveryCode 单次消费：命中即从 JSON 数组删除并写回，返回是否命中。
+// mfaConsumeRecoveryCode 单次消费：命中即从 JSON 数组删除并写回。
+// 返回 (命中, 错误)——三态（U04c-05）：查询/解析/写库失败是存储错误
+// （err != nil），与「码未命中/已被并发消费」（false, nil）严格区分；
+// 旧实现把存储错误吞成未命中，handler 侧会当作验证码错误累加失败计数并
+// 可能触发账户锁定。
 // 历史问题 S-3：消费语句改条件 UPDATE（... AND mfa_recovery_codes=? 旧值 CAS）——
 // read-then-write 在毫秒级并发下可双消费同码；CAS 保证只有一个写入者生效。
-func mfaConsumeRecoveryCode(userID int, code string) bool {
+func mfaConsumeRecoveryCode(userID int, code string) (bool, error) {
 	var raw string
 	if err := db.DB.QueryRow("SELECT COALESCE(mfa_recovery_codes,'[]') FROM users WHERE id=?", userID).Scan(&raw); err != nil {
-		return false
+		return false, err
 	}
 	var hashes []string
 	if err := json.Unmarshal([]byte(raw), &hashes); err != nil {
-		return false
+		return false, fmt.Errorf("恢复码存储损坏: %w", err)
 	}
 	sum := sha256.Sum256([]byte(code))
 	want := hex.EncodeToString(sum[:])
 	for i, h := range hashes {
 		if h == want {
 			hashes = append(hashes[:i], hashes[i+1:]...)
-			j, _ := json.Marshal(hashes)
+			j, err := json.Marshal(hashes)
+			if err != nil {
+				return false, err
+			}
 			res, err := db.DB.Exec("UPDATE users SET mfa_recovery_codes=? WHERE id=? AND mfa_recovery_codes=?", string(j), userID, raw)
 			if err != nil {
-				return false
+				return false, err
 			}
-			n, _ := res.RowsAffected()
-			return n == 1
+			n, err := res.RowsAffected()
+			if err != nil {
+				return false, err
+			}
+			// 0 行 = 并发消费方已改写旧值（CAS 落败）→ 本码视为未命中。
+			return n == 1, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // —— 锁定开关读取（2026-09 裁定：仅登录阶段锁定使用，登录后验证失败不计数）——
 
 // MFALockoutEnabled 读全局锁定开关。
-func MFALockoutEnabled() bool {
+// U04c-04：读取失败必须显式报错——旧实现返回 false 把「读不到」降级为
+// 「开关关闭」，锁定门随之被静默绕过（fail-open）。调用方决定 fail-closed 口径。
+func MFALockoutEnabled() (bool, error) {
 	var v int
 	if err := db.DB.QueryRow("SELECT COALESCE(mfa_lockout_enabled,0) FROM global_config WHERE id=1").Scan(&v); err != nil {
-		return false
+		return false, err
 	}
-	return v == 1
+	return v == 1, nil
 }
 
 // —— 登录二步挑战 ——
 
 // MFAIssueChallenge 密码验证通过后签发 5 分钟单次挑战令牌。
+// U04c-02：挑战落签发时的 users.password_version——验证端要求与当前版本
+// 相等，改密/重置后旧挑战立即失效（INSERT..SELECT 单语句取版本，避免
+// 「先读版本后写挑战」的竞态窗口）。
 func MFAIssueChallenge(userID int) (string, error) {
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}
 	token := hex.EncodeToString(raw)
-	_, err := db.DB.Exec("INSERT INTO mfa_challenges (token,user_id,expires_at) VALUES (?,?,datetime('now','+5 minutes'))",
+	res, err := db.DB.Exec(`INSERT INTO mfa_challenges (token,user_id,expires_at,password_version)
+		SELECT ?, id, datetime('now','+5 minutes'), COALESCE(password_version,0) FROM users WHERE id=?`,
 		token, userID)
 	if err != nil {
 		return "", err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return "", fmt.Errorf("用户不存在")
 	}
 	// 惰性清理过期行（历史问题：去掉 consumed=1——未消费的过期挑战同样永久不可用，
 	// 保留只会无界累积；同 used_login_tickets 先例的「清全部过期」口径）
@@ -244,10 +264,11 @@ func MFAVerifyCode(userID int, code string, now time.Time) (bool, error) {
 		if secret == "" {
 			return false, fmt.Errorf("用户未启用 MFA")
 		}
-		if mfaConsumeRecoveryCode(userID, code) {
-			return true, nil
+		consumed, err := mfaConsumeRecoveryCode(userID, code)
+		if err != nil {
+			return false, err
 		}
-		return false, nil
+		return consumed, nil
 	}
 	return mfaVerifyTOTPLocked(userID, code, now)
 }

@@ -5,6 +5,31 @@ import (
 	"log"
 )
 
+// ThreatSourceSeed 是内置威胁源下载端的唯一事实源；数据库种子、备份导入
+// 与 lbbak 文件名白名单共用，防止合法 name 携带伪造 URL/format。
+type ThreatSourceSeed struct {
+	Name        string
+	DisplayName string
+	URL         string
+	Format      string
+}
+
+var threatSourceSeeds = []ThreatSourceSeed{
+	{Name: "ustc", DisplayName: "中科大恶意 IP（USTC）", URL: "https://blackip.ustc.edu.cn/list.php?txt", Format: "plain"},
+	{Name: "firehol_l1", DisplayName: "FireHOL Level 1", URL: "https://iplists.firehol.org/files/firehol_level1.netset", Format: "plain"},
+	{Name: "et_compromised", DisplayName: "Emerging Threats Compromised", URL: "https://rules.emergingthreats.net/blockrules/compromised-ips.txt", Format: "plain"},
+}
+
+// CanonicalThreatSource 按内置 name 返回官方下载端定义。
+func CanonicalThreatSource(name string) (ThreatSourceSeed, bool) {
+	for _, seed := range threatSourceSeeds {
+		if seed.Name == name {
+			return seed, true
+		}
+	}
+	return ThreatSourceSeed{}, false
+}
+
 // ThreatSystemList 威胁情报库内置只读名单条目（v2.3.2 名单化重构）。
 // Source=威胁源名（security_threat_sources.name，更新任务定位键），
 // Name=security_ip_lists.name（用户可见，稳定不变——策略 refs 按 id 引用，

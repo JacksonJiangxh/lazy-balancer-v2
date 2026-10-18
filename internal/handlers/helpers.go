@@ -228,10 +228,16 @@ func tlsCertificateWarnings(certPEM, keyPEM, domain string) []string {
 }
 
 // tlsCertCoversDomain 判定证书是否覆盖域名:优先标准 SAN 校验(Go 内建通配
-// 语义),无 SAN 的老证书回退 CN 精确/单段通配匹配。比较小写化。
+// 语义);仅当证书完全没有 SAN（DNS/IP/Email/URI 均为空）时才回退 CN 精确/
+// 单段通配匹配。U04d-07：有 SAN 的现代证书以 SAN 为准（RFC 6125），CN 回退
+// 会抑制「SAN 不覆盖但 CN 恰好覆盖」的域名不匹配警告，而客户端仍握手失败。
+// 比较小写化。
 func tlsCertCoversDomain(cert *x509.Certificate, domain string) bool {
 	if err := cert.VerifyHostname(domain); err == nil {
 		return true
+	}
+	if len(cert.DNSNames) > 0 || len(cert.IPAddresses) > 0 || len(cert.EmailAddresses) > 0 || len(cert.URIs) > 0 {
+		return false
 	}
 	return tlsWildcardMatch(strings.ToLower(cert.Subject.CommonName), strings.ToLower(domain))
 }
@@ -1004,11 +1010,9 @@ func (index *prometheusMetricsIndex) addSample(sample prometheusSample) {
 	if upstream := services.ExtractMetricLabel(name, "upstream"); upstream != "" {
 		aggregate := index.aggregateFor(index.tcpUpstreams, upstream)
 		switch {
-		case strings.HasPrefix(name, "caddy_layer4_proxy_connections_total{"),
-			strings.HasPrefix(name, "caddy_layer4_proxy_connections_total "):
+		case strings.HasPrefix(name, "caddy_layer4_proxy_connections_total{"):
 			aggregate.requestsTotal += int64(value)
-		case strings.HasPrefix(name, "caddy_layer4_proxy_active_connections{"),
-			strings.HasPrefix(name, "caddy_layer4_proxy_active_connections "):
+		case strings.HasPrefix(name, "caddy_layer4_proxy_active_connections{"):
 			aggregate.requestsInFlight += int64(value)
 		}
 	}

@@ -57,6 +57,33 @@ var emptyBrandingTemplate = func() string {
 	return string(out)
 }()
 
+// MaterializeBranding 把 branding_json 镜像值写回其事实源文件，并立即
+// 注入 landing 文案。空内容按集群同步既有语义收敛为全空模板。
+func MaterializeBranding(dataDir, content string) error {
+	if dataDir == "" {
+		return fmt.Errorf("品牌配置目录为空")
+	}
+	if content != "" {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(content), &object); err != nil || object == nil {
+			return fmt.Errorf("品牌配置不是有效 JSON 对象")
+		}
+	}
+	if content == "" {
+		content = emptyBrandingTemplate
+	}
+	path := filepath.Join(dataDir, "branding.json")
+	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
+		injectLandingFromBranding(content)
+		return nil
+	}
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		return fmt.Errorf("写入品牌配置文件: %w", err)
+	}
+	injectLandingFromBranding(content)
+	return nil
+}
+
 // applySnapshotBranding 在 global_config 节应用后(事务已提交、Caddy 重载前)
 // 把快照携带的 branding.json 写入本地文件并注入 landing 渲染。有差异才写
 // (幂等,零 mtime 扰动);内存快照(若有)由 handlers 侧 loadBrandingConfig
@@ -70,21 +97,11 @@ func applySnapshotBranding(dataDir, content string) {
 		return
 	}
 	reset := content == ""
-	if reset {
-		content = emptyBrandingTemplate
-	}
-	path := filepath.Join(dataDir, "branding.json")
-	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
-		// 内容一致:仍同步注入 landing(防进程内注入态丢失,如主重启后)。
-		injectLandingFromBranding(content)
-		return
-	}
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	if err := MaterializeBranding(dataDir, content); err != nil {
 		Logf("error", "同步品牌配置落盘失败: %v", err)
 		RecordAuditLog("system", "同步失败", "集群同步", fmt.Sprintf("品牌配置落盘失败: %v", err), "")
 		return
 	}
-	injectLandingFromBranding(content)
 	if reset {
 		RecordAuditLog("system", "同步", "集群同步", "品牌配置已重置为默认（主节点无品牌文件）", "")
 	} else {

@@ -61,6 +61,11 @@ func (e *CAProviderRateLimitError) Error() string {
 }
 
 // parseRetryAfter parses an HTTP Retry-After header value into a duration.
+//
+// 历史问题（历史）：本函数与 internal/dnsprovider/internal/retry.After 是
+// 同语义双实现（包边界所致：dnsprovider/internal 不可被 services 导入）。
+// 两者都接受 delay-seconds 与 HTTP-date、不可解析/非正值归零；任一侧修改
+// 解析口径（例如支持毫秒、处理负值）MUST 同步另一侧并保持语义一致。
 func parseRetryAfter(header string) time.Duration {
 	if header == "" {
 		return 0
@@ -167,6 +172,22 @@ func rescanDroppedCertificateDeploymentRetries() {
 	if service != nil {
 		service.rescanDroppedDeploymentRetries()
 	}
+}
+
+// RetryCertificateDeploymentNow 手动重试入口（历史问题 历史）：把 downloaded
+// 任务的部署重试立即重排（取消挂起的退避 timer 并在当前时刻执行一次部署）。
+// 证书服务未运行（测试/启动窗口）时返回 false——调用方已把
+// deployment_available_after 推到 now，启动恢复/周期补扫会接手，不会丢失。
+func RetryCertificateDeploymentNow(jobID int, ruleID string) bool {
+	certificateServiceMu.Lock()
+	service := certificateService
+	certificateServiceMu.Unlock()
+	if service == nil {
+		Logf("warn", "证书服务未运行：任务 %d 的部署重试将在服务启动/补扫时执行", jobID)
+		return false
+	}
+	service.scheduleDeploymentRetry(jobID, ruleID, 0)
+	return true
 }
 
 func retryCertificateDeployment(ctx context.Context, jobID int, reloader func() error) error {
@@ -322,11 +343,15 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 					if err := confirmCertificateDeployment(ctx, jobID, material, true); err != nil {
 						return err
 					}
-					// 快速路径改为证书内容比对：规则上已部署的证书与任务中的证书一致时
-					// 无需重新部署/重载，直接确认签发任务状态即可。
-					certPath, _ := CertFilePaths(ruleID)
-					deployedCert, readErr := os.ReadFile(certPath)
-					if readErr == nil && string(deployedCert) == existingCert {
+					// 快速路径改为文件内容比对：证书与私钥文件都与任务中的材料一致时
+					// 无需重新部署/重载，直接确认签发任务状态即可。历史问题（历史）：
+					// 必须同时校验私钥文件——只比证书会在「cert 已 rename、key 未 rename」
+					// 的崩溃窗口里持续跳过重部署，Caddy reload 因 key 不匹配失败且运行期
+					// 不自愈（启动物化会修，窗口有界但无谓）。
+					certPath, keyPath := CertFilePaths(ruleID)
+					deployedCert, certReadErr := os.ReadFile(certPath)
+					deployedKey, keyReadErr := os.ReadFile(keyPath)
+					if certReadErr == nil && keyReadErr == nil && string(deployedCert) == existingCert && string(deployedKey) == existingKey {
 						if err := ctx.Err(); err != nil {
 							return err
 						}

@@ -150,9 +150,10 @@ func recordAuthenticationRejection(c *gin.Context, reason string) {
 }
 
 type loginRateBucket struct {
-	mu    sync.Mutex
-	count int
-	until time.Time
+	mu         sync.Mutex
+	count      int
+	until      time.Time
+	generation uint64
 }
 
 var loginRateBuckets = struct {
@@ -167,6 +168,22 @@ var loginRateBuckets = struct {
 // 不变（内存态无迁移面），oidc/setup 共桶钉测试为回归钉。
 func loginRateLimit() gin.HandlerFunc {
 	return clusterRateLimit("login", 10, "登录尝试过于频繁，请稍后再试")
+}
+
+// acquireRateLimitBucket 在首次记账时创建，容量满返回 false 由调用方 fail-open。
+func acquireRateLimitBucket(ip, scope string, now time.Time) (*loginRateBucket, bool) {
+	loginRateBuckets.Lock()
+	defer loginRateBuckets.Unlock()
+	key := ip + "|" + scope
+	if bucket, ok := loginRateBuckets.entries[key]; ok {
+		return bucket, true
+	}
+	if len(loginRateBuckets.entries) >= 1024 {
+		return nil, false
+	}
+	bucket := &loginRateBucket{until: now.Add(time.Minute)}
+	loginRateBuckets.entries[key] = bucket
+	return bucket, true
 }
 
 // clusterRegisterRateLimit 注册端点限流(历史问题,历史):唯一公开、
@@ -184,21 +201,11 @@ func clusterRateLimit(scope string, limit int, message string) gin.HandlerFunc {
 		now := time.Now()
 		ip := c.ClientIP()
 
-		loginRateBuckets.Lock()
-		bucket, ok := loginRateBuckets.entries[ip+"|"+scope]
+		bucket, ok := acquireRateLimitBucket(ip, scope, now)
 		if !ok {
-			// U6c-历史问题：容量上限（与 loginRateLimit 同族 历史问题-历史问题——曾缺此
-			// 检查：分布式攻击可无界建桶推满共享 map 使登录限流 fail-open）
-			if len(loginRateBuckets.entries) >= 1024 {
-				loginRateBuckets.Unlock()
-				c.Next() // 超限本轮放行（不添桶）——1min 清理周期内自愈
-				return
-			}
-			bucket = &loginRateBucket{until: now.Add(time.Minute)}
-			loginRateBuckets.entries[ip+"|"+scope] = bucket
+			c.Next() // 超限本轮放行（不添桶）——1min 清理周期内自愈
+			return
 		}
-		loginRateBuckets.Unlock()
-
 		bucket.mu.Lock()
 		if now.After(bucket.until) {
 			bucket.count = 0
@@ -218,6 +225,114 @@ func clusterRateLimit(scope string, limit int, message string) gin.HandlerFunc {
 
 func clusterRegisterRateLimit() gin.HandlerFunc {
 	return clusterRateLimit("register", 30, "注册请求过于频繁，请稍后再试")
+}
+
+type clusterCredentialSource int
+
+const (
+	clusterCredentialFromToken clusterCredentialSource = iota
+	clusterCredentialFromRegistration
+)
+
+// clusterMachineRateLimit 在 token/registration 认证与 DB 查询之前预占额度：
+// 同一凭证最多 30 次/分钟，同一 IP 全凭证合计最多 300 次/分钟。凭证来源
+// 必须与对应路由认证中间件一致，防止攻击者用无关头打散凭证桶。预占在锁内
+// 原子完成，401 保留额度、非 401 回滚——并发无效请求不能击穿 check-then-act
+// 窗口；合法节点（含同一 NAT 出口）成功请求不消耗失败预算。窗口换代编号
+// 防止旧窗口在途请求污染新窗口。
+func clusterMachineRateLimit(scope string, source clusterCredentialSource) gin.HandlerFunc {
+	const (
+		credentialLimit = 30
+		ipLimit         = 300
+	)
+	return func(c *gin.Context) {
+		now := time.Now()
+		ip := c.ClientIP()
+		fingerprint := clusterCredentialFingerprint(c, source)
+		var credentialBucket *loginRateBucket
+		var credentialGeneration uint64
+		if fingerprint != "" {
+			var allowed, capacityFull bool
+			credentialBucket, credentialGeneration, allowed, capacityFull = reserveRateLimitBucket(ip, scope+"|credential:"+fingerprint, now, credentialLimit)
+			if !allowed && !capacityFull {
+				abortClusterMachineRateLimit(c)
+				return
+			}
+		}
+		ipBucket, ipGeneration, ipAllowed, ipCapacityFull := reserveRateLimitBucket(ip, scope+"|ip", now, ipLimit)
+		if !ipAllowed && !ipCapacityFull {
+			releaseRateLimitReservation(credentialBucket, credentialGeneration, false)
+			abortClusterMachineRateLimit(c)
+			return
+		}
+		c.Next()
+		failed := c.Writer.Status() == http.StatusUnauthorized
+		releaseRateLimitReservation(credentialBucket, credentialGeneration, failed)
+		releaseRateLimitReservation(ipBucket, ipGeneration, failed)
+	}
+}
+
+func clusterCredentialFingerprint(c *gin.Context, source clusterCredentialSource) string {
+	var credential string
+	switch source {
+	case clusterCredentialFromRegistration:
+		credential = c.GetHeader("X-Registration-Secret")
+	default:
+		credential = c.GetHeader("X-Cluster-Token")
+	}
+	if credential == "" {
+		credential = bearerToken(c.GetHeader("Authorization"))
+	}
+	if credential == "" {
+		return ""
+	}
+	hash := sha256.Sum256([]byte(credential))
+	return hex.EncodeToString(hash[:])
+}
+
+func reserveRateLimitBucket(ip, scope string, now time.Time, limit int) (*loginRateBucket, uint64, bool, bool) {
+	key := ip + "|" + scope
+	loginRateBuckets.Lock()
+	bucket, exists := loginRateBuckets.entries[key]
+	if !exists {
+		if len(loginRateBuckets.entries) >= 1024 {
+			loginRateBuckets.Unlock()
+			return nil, 0, false, true
+		}
+		bucket = &loginRateBucket{until: now.Add(time.Minute)}
+		loginRateBuckets.entries[key] = bucket
+	}
+	bucket.mu.Lock()
+	loginRateBuckets.Unlock()
+	defer bucket.mu.Unlock()
+	if now.After(bucket.until) {
+		bucket.count = 0
+		bucket.until = now.Add(time.Minute)
+		bucket.generation++
+	}
+	if bucket.count >= limit {
+		return bucket, bucket.generation, false, false
+	}
+	bucket.count++
+	return bucket, bucket.generation, true, false
+}
+
+func releaseRateLimitReservation(bucket *loginRateBucket, generation uint64, failed bool) {
+	if bucket == nil {
+		return
+	}
+	bucket.mu.Lock()
+	defer bucket.mu.Unlock()
+	if bucket.generation != generation {
+		return
+	}
+	if !failed {
+		bucket.count--
+	}
+}
+
+func abortClusterMachineRateLimit(c *gin.Context) {
+	c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"code": http.StatusTooManyRequests, "message": "集群机器接口请求过于频繁，请稍后再试"})
 }
 
 var loginRateLimitCleanupOnce sync.Once
@@ -342,11 +457,11 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 		v1.GET("/auth/oidc/callback", h.OIDCCallback)
 		v1.GET("/branding", h.GetBranding)
 		v1.POST("/cluster/register", clusterRegisterRateLimit(), h.RegisterClusterNode)
-		v1.GET("/cluster/register/:id/status", registrationAuth(db.DB), h.GetClusterRegistrationStatus)
-		v1.GET("/cluster/sync/snapshot", clusterTokenAuth(db.DB), h.GetClusterSnapshot)
-		v1.GET("/cluster/sync/waf-files", clusterTokenAuth(db.DB), h.GetClusterWafFiles)
-		v1.POST("/cluster/registration/confirm", clusterTokenAuth(db.DB), h.ConfirmClusterRegistration)
-		v1.POST("/cluster/nodes/report", clusterTokenAuth(db.DB), h.ReportClusterNode)
+		v1.GET("/cluster/register/:id/status", clusterMachineRateLimit("registration-status", clusterCredentialFromRegistration), registrationAuth(db.DB), h.GetClusterRegistrationStatus)
+		v1.GET("/cluster/sync/snapshot", clusterMachineRateLimit("sync-snapshot", clusterCredentialFromToken), clusterTokenAuth(db.DB), h.GetClusterSnapshot)
+		v1.GET("/cluster/sync/waf-files", clusterMachineRateLimit("sync-waf-files", clusterCredentialFromToken), clusterTokenAuth(db.DB), h.GetClusterWafFiles)
+		v1.POST("/cluster/registration/confirm", clusterMachineRateLimit("registration-confirm", clusterCredentialFromToken), clusterTokenAuth(db.DB), h.ConfirmClusterRegistration)
+		v1.POST("/cluster/nodes/report", clusterMachineRateLimit("node-report", clusterCredentialFromToken), clusterTokenAuth(db.DB), h.ReportClusterNode)
 		// 从节点服务控制：票据即凭证（主节点签发的一次性 HMAC，与登录票据同
 		// 机制），不走 clusterTokenAuth——主节点无法取回令牌明文（仅存哈希）。
 		v1.POST("/cluster/service-control", clusterRateLimit("service-control", 20, "服务控制请求过于频繁，请稍后再试"), h.ClusterServiceControl)

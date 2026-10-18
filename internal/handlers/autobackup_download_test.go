@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -36,7 +37,7 @@ func TestDownloadAutoBackup_streamsFileAndAuditsAfterOpen(t *testing.T) {
 	router := gin.New()
 	router.GET("/api/v1/auto-backup/:id/download", h.DownloadAutoBackup)
 
-	if _, err := h.RunAutoBackupOnce("manual", "system", 0); err != nil {
+	if _, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 0); err != nil {
 		t.Fatalf("RunAutoBackupOnce: %v", err)
 	}
 	rows := autoBackupRows(t, "WHERE trigger_type='manual'")
@@ -71,7 +72,7 @@ func TestDownloadAutoBackup_missingFileNoAudit(t *testing.T) {
 	router := gin.New()
 	router.GET("/api/v1/auto-backup/:id/download", h.DownloadAutoBackup)
 
-	if _, err := h.RunAutoBackupOnce("manual", "system", 0); err != nil {
+	if _, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 0); err != nil {
 		t.Fatalf("RunAutoBackupOnce: %v", err)
 	}
 	rows := autoBackupRows(t, "WHERE trigger_type='manual'")

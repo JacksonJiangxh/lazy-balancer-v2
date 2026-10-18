@@ -14,6 +14,7 @@ var auditResultTextMap = map[string]string{
 	"max_attempts":         "达到最大重试次数",
 	"missing_material":     "证书数据缺失",
 	"queued":               "已重新排队",
+	"deployment_retry":     "等待恢复部署",
 	"requested":            "已触发",
 	"skipped":              "已跳过",
 	"invalid_request":      "请求格式错误",

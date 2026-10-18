@@ -803,11 +803,13 @@ export const compareVersion = (a: string, b: string): number => {
   const pa = a.replace(/^v/, '').split(/[.-]/)
   const pb = b.replace(/^v/, '').split(/[.-]/)
   for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const na = Number(pa[i]); const nb = Number(pb[i])
+    const rawA = pa[i]; const rawB = pb[i]
+    const na = rawA === undefined ? 0 : Number(rawA)
+    const nb = rawB === undefined ? 0 : Number(rawB)
     if (!Number.isNaN(na) && !Number.isNaN(nb)) {
       if (na !== nb) return na - nb
     } else {
-      const sa = pa[i] ?? ''; const sb = pb[i] ?? ''
+      const sa = rawA ?? ''; const sb = rawB ?? ''
       if (sa !== sb) return sa < sb ? -1 : 1
     }
   }

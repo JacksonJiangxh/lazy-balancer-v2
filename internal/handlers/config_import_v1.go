@@ -256,21 +256,6 @@ func disableConvertedRuleConflicts(rules []convertedRule) []disabledRuleConflict
 	return conflicts
 }
 
-// httpRedirectShadowReason 判定 80 端口规则域名是否被 TLS+跳转规则域名遮蔽，
-// 命中返回遮蔽原因，未命中返回空串。
-func httpRedirectShadowReason(port80Domain, redirectDomain string) string {
-	leftDomains := make(map[string]struct{})
-	for _, domain := range normalizedRuleDomains(port80Domain) {
-		leftDomains[domain] = struct{}{}
-	}
-	for _, domain := range normalizedRuleDomains(redirectDomain) {
-		if _, exists := leftDomains[domain]; exists {
-			return fmt.Sprintf("HTTP 域名 %s 被 HTTPS 跳转遮蔽", domain)
-		}
-	}
-	return ""
-}
-
 func formatDisabledRuleConflicts(conflicts []disabledRuleConflict) string {
 	parts := make([]string, 0, len(conflicts))
 	for _, conflict := range conflicts {
@@ -435,25 +420,10 @@ func validateConvertedV1Rules(rules []convertedRule) ([]convertedRule, []string,
 				continue
 			}
 		}
-		enabledUpstreams := 0
+		// 先把 v1 协议名归一到 v2 值域，再复用保存侧上游单源校验。
 		upstreamBad := false
-		for upstreamIndex, upstream := range rule.Upstreams {
-			if !isValidHost(upstream.Host) {
-				skips = append(skips, fmt.Sprintf("规则 #%d（%s）上游 #%d：主机无效", index+1, rule.Name, upstreamIndex+1))
-				upstreamBad = true
-				break
-			}
-			if upstream.Port < 1 || upstream.Port > 65535 {
-				skips = append(skips, fmt.Sprintf("规则 #%d（%s）上游 #%d：端口必须在 1-65535 之间", index+1, rule.Name, upstreamIndex+1))
-				upstreamBad = true
-				break
-			}
-			// 历史问题 历史问题/历史问题 S-1：上游协议白名单 + http 规则归一化——值域与保存侧/渲染侧
-			// 一致；口径经 历史问题 S-1 统一：HTTP 规则下 tcp/tls 上游归一（tcp 渲染等同
-			// http 明文转发；tls 归一 https 即 TLS transport，封堵「明文 HTTP 打 TLS
-			// 端口静默 502」形态——v2 导入/保存侧均拒绝、v1 此前是唯一入口）。TCP
-			// 规则下 http 为 v1 原生（nginx stream 明文）语义、https 渲染按 TLS 处理
-			//（=tls），均保留。归一记入 normalizations 供导入报告呈现。
+		for upstreamIndex := range rule.Upstreams {
+			upstream := &rule.Upstreams[upstreamIndex]
 			switch upstream.Protocol {
 			case "http", "https", "tcp", "tls":
 				if rule.Protocol == "http" && (upstream.Protocol == "tcp" || upstream.Protocol == "tls") {
@@ -463,7 +433,13 @@ func validateConvertedV1Rules(rules []convertedRule) ([]convertedRule, []string,
 					}
 					normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）上游 #%d：HTTP 规则上游协议 %s 已按 %s 导入", index+1, rule.Name, upstreamIndex+1, upstream.Protocol, normalized))
 					upstream.Protocol = normalized
-					rule.Upstreams[upstreamIndex].Protocol = normalized
+				} else if rule.Protocol == "tcp" && (upstream.Protocol == "http" || upstream.Protocol == "https") {
+					normalized := "tcp"
+					if upstream.Protocol == "https" {
+						normalized = "tls"
+					}
+					normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）上游 #%d：TCP 规则上游协议 %s 已按 %s 导入", index+1, rule.Name, upstreamIndex+1, upstream.Protocol, normalized))
+					upstream.Protocol = normalized
 				}
 			default:
 				skips = append(skips, fmt.Sprintf("规则 #%d（%s）上游 #%d：上游协议 %q 无效（支持 http/https/tcp/tls）", index+1, rule.Name, upstreamIndex+1, upstream.Protocol))
@@ -472,15 +448,21 @@ func validateConvertedV1Rules(rules []convertedRule) ([]convertedRule, []string,
 			if upstreamBad {
 				break
 			}
-			if upstream.Enabled {
-				enabledUpstreams++
-			}
 		}
 		if upstreamBad {
 			continue
 		}
-		if enabledUpstreams == 0 {
-			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：至少需要一个已启用的上游服务器", index+1, rule.Name))
+		upstreams := make([]models.Upstream, 0, len(rule.Upstreams))
+		for _, upstream := range rule.Upstreams {
+			upstreams = append(upstreams, models.Upstream{Host: upstream.Host, Port: upstream.Port, Weight: upstream.Weight, Enabled: upstream.Enabled, Protocol: upstream.Protocol})
+		}
+		enabledUpstreams, err := validateRuleUpstreams(rule.Protocol, false, upstreams, true)
+		if err != nil {
+			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：%v", index+1, rule.Name, err))
+			continue
+		}
+		if err := validateRuleHostHeader(rule.HostHeader); err != nil {
+			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：%v", index+1, rule.Name, err))
 			continue
 		}
 		// 历史问题 历史问题: 导入 INSERT 的探测超时硬编码 5s，历史 历史问题 的
@@ -527,7 +509,8 @@ func validateConvertedV1Rules(rules []convertedRule) ([]convertedRule, []string,
 		if validateErr := validateRuleFeatures(ruleFeatureInput{
 			Protocol: rule.Protocol, Strategy: mappedStrategy,
 			ListenPort: rule.ListenPort, EnableTLS: rule.EnableTLS, TLSHTTPRedirect: rule.Redirect,
-			CompressTypes: "gzip",
+			HealthCheckInterval: rule.HealthInt, HealthCheckTimeout: db.DefaultHealthCheckTimeout,
+			EnabledUpstreamCount: enabledUpstreams, EnableCompress: rule.Compress, CompressTypes: "gzip",
 		}); validateErr != nil {
 			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：%v", index+1, rule.Name, validateErr))
 			continue

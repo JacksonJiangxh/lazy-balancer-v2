@@ -255,7 +255,7 @@ func setupAutoBackupTestDB(t *testing.T) {
 
 func setAutoBackupTestExecutor(t *testing.T, calls *[]string, err error) {
 	t.Helper()
-	SetAutoBackupExecutor(func(trigger, operator string, engineRunID int64) error {
+	SetAutoBackupExecutor(func(ctx context.Context, trigger, operator string, engineRunID int64) error {
 		*calls = append(*calls, trigger+":"+operator)
 		return err
 	})
@@ -272,7 +272,7 @@ func TestAutoBackupScheduled_execsAndAdvancesLastRun(t *testing.T) {
 	setAutoBackupTestExecutor(t, &calls, nil)
 
 	// When
-	if err := runAutoBackupScheduled(0); err != nil {
+	if err := runAutoBackupScheduled(context.Background(), 0); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 
@@ -355,7 +355,7 @@ func TestAutoBackupScheduled_advancesLastRunEvenWhenExecutorFails(t *testing.T) 
 	setAutoBackupTestExecutor(t, &calls, context.DeadlineExceeded)
 
 	// When
-	_ = runAutoBackupScheduled(0)
+	_ = runAutoBackupScheduled(context.Background(), 0)
 
 	// Then
 	if len(calls) != 1 {
@@ -380,7 +380,7 @@ func TestAutoBackupScheduled_nilExecutorReturnsError(t *testing.T) {
 	t.Cleanup(func() { SetAutoBackupExecutor(nil) })
 
 	// When/Then：必须返回可见错误而非记录成功；last_run 仍不推进。
-	if err := runAutoBackupScheduled(0); err == nil {
+	if err := runAutoBackupScheduled(context.Background(), 0); err == nil {
 		t.Fatal("未装配执行器不得静默记录成功")
 	}
 	var lastRun *string

@@ -9,7 +9,7 @@
 | `/app/logs` | 应用日志、Caddy 日志、按规则访问日志 | 推荐 |
 | `/app/waf` | CRS 规则、IP2Region xdb（Coraza 审计日志在 `/app/logs/waf-audit`） | 推荐 |
 | `/app/backup` | 自动备份落盘目录（不挂载则容器重建后备份文件丢失） | **是** |
-| `/app/config` | Caddyfile（仅高级定制） | 可选 |
+| `/app/config` | 启动期最小 Caddyfile（admin 监听等）；运行配置恒由数据库渲染覆盖，手改不持久 | 可选 |
 
 > 不挂载 `/app/waf` 时，容器重建会将 CRS 回退到镜像捆绑版本；系统自动将更新后的规则树快照持久化到数据卷并在启动时对账恢复。数据库是配置的唯一真实来源。
 
@@ -22,6 +22,7 @@
 | `JWT_SECRET` | 自动生成 | JWT 签名密钥；生产建议显式设置 |
 | `LOG_FILE` | `/app/logs/lazy-balancer.log` | 运行日志文件路径（恒启用，LOG_FILE 仅覆盖路径） |
 | `NODE_NAME` | `node-1` | 集群注册的默认节点名 |
+| `BACKUP_DIR` | 自动备份落盘目录（默认 `data_dir` 同级 `backup`，容器默认 `/app/backup`） |
 | `APP_VERSION` | 构建时注入 | 显示版本号 |
 | `TZ` | 数据库 `timezone` | 进程时区 |
 
@@ -77,7 +78,11 @@
 
 **面板应直连访问，不要在前置反向代理/CDN 之后暴露**：面板启动时执行 `SetTrustedProxies(nil)`（不信任任何代理头），`ClientIP` 恒取 TCP 直连源地址。若置于反代之后，所有请求的源 IP 都会是代理地址——限流桶被全体访问者共享（一人触发限流全体遭殃）、IP 白名单只会匹配到代理地址（形同虚设）、审计与安全事件的来源 IP 全部失真。需要 HTTPS 终结时，请在面板所在主机本机回环侧做代理并确信直连源语义可接受。
 
-## Caddy v2.11.6 行为变化（升级前须知）
+## 重启语义与容器策略
+
+面板的“重启服务”、启用面板 HTTPS、集群 `restart_app` 都会让 PID1 退出。裸 `docker run` 必须带 `--restart unless-stopped`（compose 已内置 `restart: unless-stopped`），否则容器不会自动拉起，面板与代理流量会同时停摆。裸机 systemd 部署需配置等效的自动重启策略。
+
+## Caddy 2.11.6+ 行为变化（当前镜像 2.11.7，升级前须知）
 
 以下为底层 Caddy 升级到 v2.11.6 后的默认行为变化。仓库自身渲染面不受影响（已核验零引用），但**用户自建数据面**需要注意：
 

@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -36,7 +35,6 @@ func TestGetMetricsHistory_bucketsDenseRowsToCap(t *testing.T) {
 			t.Fatalf("seed row %d: %v", i, err)
 		}
 	}
-	_ = fmt.Sprint()
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/history?interval=1h", nil)

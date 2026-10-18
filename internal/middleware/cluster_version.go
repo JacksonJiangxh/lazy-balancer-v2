@@ -57,11 +57,11 @@ func installClusterVersionTriggers(database *sql.DB) error {
 		{name: "ca_providers", snapshotColumns: "id,name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled,created_at,updated_at"},
 		{name: "certificate_configs", snapshotColumns: "id,name,dns_provider,dns_credentials,enabled,created_at,updated_at"},
 		{name: "cert_jobs", snapshotColumns: "rule_id,domain,status,cert_pem,key_pem,expires_at,ca_provider_id,renewal_attempts,ca_available_after,last_error_code,created_at,updated_at"},
-		{name: "security_policies", snapshotColumns: "id,name,description,mode,anomaly_threshold,ip_acl_mode,ip_acl_list,ip_acl_enabled,ip_whitelist,ip_whitelist_enabled,ip_blacklist,rate_limit_enabled,rate_limit_rps,rate_limit_burst,crs_rule_groups,crs_excluded_rules,custom_rules,block_page_id,block_status_code,enabled,updated_by,created_at,updated_at,geoip_countries,geoip_mode,waf_check_response,log_request_body,ip_acl_list_refs,ip_whitelist_refs,policy_type,trust_detection"},
+		{name: "security_policies", snapshotColumns: "id,name,description,mode,anomaly_threshold,ip_acl_mode,ip_acl_list,ip_acl_enabled,ip_whitelist,ip_whitelist_enabled,ip_blacklist,rate_limit_enabled,rate_limit_rps,rate_limit_burst,crs_rule_groups,crs_excluded_rules,custom_rules,block_page_id,block_status_code,enabled,updated_by,created_at,updated_at,geoip_countries,geoip_mode,geoip_crawler_exempt,geoip_crawler_engines,waf_check_response,log_request_body,ip_acl_list_refs,ip_whitelist_refs,policy_type,trust_detection"},
 		{name: "security_policy_bindings", snapshotColumns: "rule_caddy_id,policy_id"},
 		{name: "security_custom_rules", snapshotColumns: "id,name,description,conditions,action,score,enabled,updated_by,created_at,updated_at"},
 		{name: "security_block_pages", snapshotColumns: "id,name,description,content,content_type,is_default,is_builtin,created_by,created_at,updated_by,updated_at"},
-		{name: "security_ip_lists", snapshotColumns: "id,name,description,category,entries,created_by,created_at,updated_by,updated_at"},
+		{name: "security_ip_lists", snapshotColumns: "id,name,description,category,entries,created_by,created_at,updated_by,updated_at,system"},
 		// 历史问题-01（历史）：schedule_days/schedule_time 入列——主端排程
 		// 保存（setVersionTableSchedule 同语句写两列+next_update）即 bump 版本，
 		// 排程随快照到达从端（升主即生效，历史问题 自动备份先例）。
@@ -240,8 +240,15 @@ func isSynchronizedWrite(method, path string) bool {
 		(strings.HasPrefix(path, "/api/v1/certificates/jobs/") && (method == http.MethodDelete || (method == http.MethodPost && strings.HasSuffix(path, "/retry")))) {
 		return true
 	}
-	// CA provider updates write ca_providers; the POST test endpoint only probes credentials.
+	// CA provider updates write ca_providers. U04a2-历史问题（历史）：POST
+	// /ca-providers/:id/test 亦然——ZeroSSL 缺 EAB 时 AutoProvisionZeroSSLEAB
+	// 会 UPDATE ca_providers.credentials（触发器 OF 列内含 credentials）。
+	// 原注释「test 仅探测凭据」的前提不成立：触发器安装失败的降级态须同样
+	// fail-closed，不得静默写同步表却不 bump cluster_version。
 	if method == http.MethodPut && strings.HasPrefix(path, "/api/v1/ca-providers") {
+		return true
+	}
+	if method == http.MethodPost && strings.HasPrefix(path, "/api/v1/ca-providers/") && strings.HasSuffix(path, "/test") {
 		return true
 	}
 	if path == "/api/v1/rules/cert-info" {

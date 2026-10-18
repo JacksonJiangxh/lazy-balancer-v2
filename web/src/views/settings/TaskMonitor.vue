@@ -226,7 +226,7 @@
           :page-sizes="[10, 20, 50]"
           :total="filteredTasks.length"
           layout="total, sizes, prev, pager, next"
-          @size-change="(s: number) => pageSize = s"
+          @size-change="(s: number) => { pageSize = s; page = 1 }"
         />
       </div>
     </el-card>
@@ -550,11 +550,11 @@ async function runTaskAction(row: TaskInfo, options: TaskActionOptions): Promise
     }
     const res = await options.request()
     ElMessage.success(res.message || options.successFallback)
-    fetchTasks()
+    void fetchTasks().catch(() => {})
   } catch (error: unknown) {
     // 全局拦截器已 toast；仅记录，避免 unhandled rejection
     console.error(`${options.failureLabel} failed`, error)
-    if (options.refreshOnError) fetchTasks()
+    if (options.refreshOnError) void fetchTasks().catch(() => {})
   } finally {
     if (taskActionPendingId.value === row.id) taskActionPendingId.value = null
   }
@@ -636,17 +636,21 @@ const fetchCertJobHistory = async (jobId: number): Promise<RunRecord[]> => {
     message: j.message || undefined,
   }]
 }
+let detailSeq = 0
 const openDetail = async (row: TaskInfo) => {
+  const seq = ++detailSeq
   detailTask.value = row
   detailVisible.value = true
   history.value = []
   try {
+    let runs: RunRecord[] = []
     if (isCertJobRow(row.id)) {
-      history.value = await fetchCertJobHistory(Number(row.id.slice(9)))
-      return
+      runs = await fetchCertJobHistory(Number(row.id.slice(9)))
+    } else {
+      const res = await request.get<APIResponse<{ runs: RunRecord[] }>>(`/system/tasks/${row.id}/history`, { silent: true })
+      runs = res.data?.runs || []
     }
-    const res = await request.get<APIResponse<{ runs: RunRecord[] }>>(`/system/tasks/${row.id}/history`, { silent: true })
-    history.value = res.data?.runs || []
+    if (seq === detailSeq) history.value = runs
   } catch { /* 无历史族静默 */ }
 }
 

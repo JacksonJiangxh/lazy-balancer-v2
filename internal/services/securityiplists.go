@@ -215,17 +215,24 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 	return entries, failed, nil
 }
 
-// readThreatIplistEntries 按列表名读 .iplist 文件条目（渲染层消费）。
-// 文件路径: /app/waf/threat-{source_name}.iplist
-func readThreatIplistEntries(listName string) ([]string, error) {
-	source := threatSourceByListName(listName)
-	if source == "" {
-		return nil, fmt.Errorf("列表 %q 不映射到任何威胁源", listName)
-	}
-	iplistPath := filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist", source))
-	if raw, err := os.ReadFile(iplistPath); err == nil {
-		// 主节点/备份导入路径：文本源文件在场，逐行解析
-		var vals []string
+// readThreatIplistPath 按代际读取威胁名单文件（历史 历史问题）：文本与
+// .fast 同时存在时以 mtime 较新者为准——从节点只同步 .fast（零编译裁定），
+// 降级前遗留的文本可能是旧代；旧「文本优先」会让集群新同步的 .fast 被陈旧
+// 文本静默遮蔽（新威胁漏拦/已移除误拦）。同代（mtime 相等）保持文本优先
+// （主节点写入相位先落文本后落 fast，内容等价）。
+// 两个文件都缺失返回文本侧错误（os.ErrNotExist 语义由调用方判定）。
+func readThreatIplistPath(iplistPath string) ([]string, error) {
+	textInfo, textErr := os.Stat(iplistPath)
+	fastPath := wafiplist.FastPath(iplistPath)
+	fastInfo, fastErr := os.Stat(fastPath)
+	useText := textErr == nil && (fastErr != nil || !fastInfo.ModTime().After(textInfo.ModTime()))
+	if useText {
+		raw, err := os.ReadFile(iplistPath)
+		if err != nil {
+			return nil, err
+		}
+		// 三处行过滤契约（渲染/UI/编译）同口径：空行与 #/; 注释跳过。
+		vals := make([]string, 0, 1024)
 		for _, line := range strings.Split(string(raw), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
@@ -235,13 +242,20 @@ func readThreatIplistEntries(listName string) ([]string, error) {
 		}
 		return vals, nil
 	}
-	// 从节点路径：waf_files 通道只同步 .fast 二进制（零编译裁定）——文本
-	// 缺失时展开 .fast 前缀集（已聚合排序，match-set 等价）。两个文件都
-	// 缺失才报错（严格模式由调用方跳过策略）。
-	fastPath := wafiplist.FastPath(iplistPath)
+	if fastErr == nil {
+		return expandThreatFastEntries(fastPath)
+	}
+	if textErr != nil {
+		return nil, textErr
+	}
+	return nil, fastErr
+}
+
+// expandThreatFastEntries 展开 .fast 前缀集（已聚合排序，match-set 等价）。
+func expandThreatFastEntries(fastPath string) ([]string, error) {
 	set, err := wafiplist.ReadFastFile(fastPath)
 	if err != nil {
-		return nil, fmt.Errorf("读取 %s 与 %s 均失败: %w", iplistPath, fastPath, err)
+		return nil, err
 	}
 	vals := make([]string, 0, len(set.V4)+len(set.V6))
 	for _, p := range set.V4 {
@@ -249,6 +263,22 @@ func readThreatIplistEntries(listName string) ([]string, error) {
 	}
 	for _, p := range set.V6 {
 		vals = append(vals, p.String())
+	}
+	return vals, nil
+}
+
+// readThreatIplistEntries 按列表名读威胁名单条目（渲染层消费）。
+// 文件路径: /app/waf/threat-{source_name}.iplist
+func readThreatIplistEntries(listName string) ([]string, error) {
+	source := threatSourceByListName(listName)
+	if source == "" {
+		return nil, fmt.Errorf("列表 %q 不映射到任何威胁源", listName)
+	}
+	iplistPath := filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist", source))
+	vals, err := readThreatIplistPath(iplistPath)
+	if err != nil {
+		// 严格模式由调用方跳过策略：两个文件都不可用时才报错。
+		return nil, fmt.Errorf("读取 %s 与其 .fast 均失败: %w", iplistPath, err)
 	}
 	return vals, nil
 }
@@ -322,11 +352,17 @@ func resolvePolicyIPListRefs(policies []*models.SecurityPolicy, store caddyConfi
 		}
 		// RDB 严格模式：策略引用的任一列表装载失败（威胁库 .iplist 缺失）→
 		// 标记跳过渲染，绝不以空集静默收窄 ACL 保护面。
+		// 历史问题：本函数在事件摄取 tick 内随归因映射重载执行，缺失文件持续
+		// 存在时会每 tick 重复留痕——同一 policy+list+错误文本按
+		// auditFailureShouldLog 单源限流（60s 窗口），避免审计库/日志噪声。
 		for _, id := range parseIPListRefs(p.IPACLListRefs) {
 			if failedIDs[id] {
 				p.IPRefMissing = true
-				Logf("error", "策略 %q 引用的威胁库列表(id=%d)装载失败——该策略将被跳过渲染", p.Name, id)
-				RecordAuditLog("system", "渲染跳过", "安全策略", fmt.Sprintf("策略 %q 引用的威胁库列表(id=%d)装载失败，已跳过该策略渲染: %v", p.Name, id, err), "")
+				refErr := fmt.Sprintf("策略 %q 引用的威胁库列表(id=%d)装载失败: %v", p.Name, id, err)
+				if auditFailureShouldLog(refErr) {
+					Logf("error", "%s——该策略将被跳过渲染", refErr)
+					RecordAuditLog("system", "渲染跳过", "安全策略", fmt.Sprintf("策略 %q 引用的威胁库列表(id=%d)装载失败，已跳过该策略渲染: %v", p.Name, id, err), "")
+				}
 				break
 			}
 		}
@@ -334,8 +370,11 @@ func resolvePolicyIPListRefs(policies []*models.SecurityPolicy, store caddyConfi
 			for _, id := range parseIPListRefs(p.IPWhitelistRefs) {
 				if failedIDs[id] {
 					p.IPRefMissing = true
-					Logf("error", "策略 %q 引用的威胁库列表(id=%d)装载失败——该策略将被跳过渲染", p.Name, id)
-					RecordAuditLog("system", "渲染跳过", "安全策略", fmt.Sprintf("策略 %q 引用的威胁库列表(id=%d)装载失败，已跳过该策略渲染: %v", p.Name, id, err), "")
+					refErr := fmt.Sprintf("策略 %q 引用的威胁库列表(id=%d)装载失败: %v", p.Name, id, err)
+					if auditFailureShouldLog(refErr) {
+						Logf("error", "%s——该策略将被跳过渲染", refErr)
+						RecordAuditLog("system", "渲染跳过", "安全策略", fmt.Sprintf("策略 %q 引用的威胁库列表(id=%d)装载失败，已跳过该策略渲染: %v", p.Name, id, err), "")
+					}
 					break
 				}
 			}
@@ -372,55 +411,37 @@ func mergedWhitelist(p *models.SecurityPolicy) []string {
 	return aggregateIPEntries(list)
 }
 
-// ReadThreatIplistForUI 供 UI 预览调用：按列表名读 .iplist 文件条目。
-// 文件不存在返回空集（禁用/未更新源）。
+// ReadThreatIplistForUI 供 UI 预览调用：按列表名读威胁名单条目。
+// 文件不存在返回空集（禁用/未更新源）。与渲染侧 readThreatIplistEntries 共用
+// readThreatIplistPath（代际感知：新同步的 .fast 不被陈旧文本遮蔽，历史问题）。
 func ReadThreatIplistForUI(listName string) ([]string, error) {
 	source := threatSourceByListName(listName)
 	if source == "" {
 		return nil, nil // 非威胁库列表——调用方处理
 	}
 	path := filepath.Join(wafDir, "threat-"+source+".iplist")
-	raw, err := os.ReadFile(path)
+	vals, err := readThreatIplistPath(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// SEC-U2（历史）：从节点 waf_files 只同步 .fast（零编译裁定）——
-			// .iplist 缺失时展开 .fast 前缀集，与渲染侧 readThreatIplistEntries
-			// 同口径；两个文件都缺失才返回空集（未更新源）。
-			fastPath := wafiplist.FastPath(path)
-			set, ferr := wafiplist.ReadFastFile(fastPath)
-			if ferr != nil {
-				return nil, nil
-			}
-			vals := make([]string, 0, len(set.V4)+len(set.V6))
-			for _, p := range set.V4 {
-				vals = append(vals, p.String())
-			}
-			for _, p := range set.V6 {
-				vals = append(vals, p.String())
-			}
-			return vals, nil
+			// SEC-U2（历史）：从节点 waf_files 只同步 .fast——两个文件都
+			// 缺失才视为「未更新源」空集。
+			return nil, nil
 		}
 		return nil, err
-	}
-	var vals []string
-	// SEC-A-F2（历史）：#/; 注释行与渲染侧 readThreatIplistEntries、
-	// 编译侧 ipcompile 同口径过滤（三处单一行过滤契约，勿单方漂移）。
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, ";") {
-			vals = append(vals, line)
-		}
 	}
 	return vals, nil
 }
 
-// ReadThreatIplistBySource 按源名读 .iplist 原始内容（导出用）。
+// ReadThreatIplistBySource 按源名读威胁名单内容（导出用）。
+// 历史问题：与渲染/UI 共用代际感知读取——从节点文本可能是旧代，导出必须与
+// 执行面一致（.fast 较新时展开为文本行）。两文件都缺失返回 nil。
 func ReadThreatIplistBySource(source string) []byte {
 	if source == "" {
 		return nil
 	}
-	data, err := os.ReadFile(filepath.Join(wafDir, "threat-"+source+".iplist"))
-	if err != nil {
+	vals, err := readThreatIplistPath(filepath.Join(wafDir, "threat-"+source+".iplist"))
+	if err != nil || len(vals) == 0 {
 		return nil
 	}
-	return data
+	return []byte(strings.Join(vals, "\n") + "\n")
 }

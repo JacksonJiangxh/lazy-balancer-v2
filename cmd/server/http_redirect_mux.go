@@ -176,7 +176,7 @@ func redirectHTTP(reader *bufio.Reader, connection net.Conn) {
 	if host == "" {
 		host = connection.LocalAddr().String()
 	}
-	response := fmt.Sprintf("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nConnection: close\r\nLocation: https://%s%s\r\n\r\n", host, location)
+	response := fmt.Sprintf("HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\nLocation: https://%s%s\r\nCache-Control: no-store\r\n\r\n", host, location)
 	_, _ = connection.Write([]byte(response))
 }
 

@@ -158,6 +158,9 @@ func TestTaskEngineWire_MasterSyncShowsServing(t *testing.T) {
 			if ti.Status != TaskStatusRunning {
 				t.Fatalf("主节点 cluster-sync 应运行中（真实 daemon 实态）, got %s", ti.Status)
 			}
+			if ti.Cadence != "常驻自管理" {
+				t.Fatalf("常驻任务运行节奏=%q, want 常驻自管理（内部巡检周期不得进入任务详情）", ti.Cadence)
+			}
 			return
 		}
 	}

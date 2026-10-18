@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"database/sql"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -20,7 +21,12 @@ func clusterTokenAuth(database *sql.DB) gin.HandlerFunc {
 		}
 		nodeID, err := services.AuthenticateClusterToken(c.Request.Context(), database, token)
 		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "集群凭证无效"})
+			if errors.Is(err, services.ErrInvalidClusterAuth) {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "集群凭证无效"})
+			} else {
+				services.Logf("error", "cluster token authentication failed: %v", err)
+				c.AbortWithStatusJSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "集群凭证校验失败"})
+			}
 			return
 		}
 		c.Set("cluster_node_id", nodeID)
@@ -41,7 +47,12 @@ func registrationAuth(database *sql.DB) gin.HandlerFunc {
 			secret = bearerToken(c.GetHeader("Authorization"))
 		}
 		if err := services.AuthenticateRegistrationSecret(c.Request.Context(), database, nodeID, secret); err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "注册凭证无效"})
+			if errors.Is(err, services.ErrInvalidClusterAuth) {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "注册凭证无效"})
+			} else {
+				services.Logf("error", "cluster registration authentication failed: %v", err)
+				c.AbortWithStatusJSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "注册凭证校验失败"})
+			}
 			return
 		}
 		c.Set("registration_secret", secret)

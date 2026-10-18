@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"bytes"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,10 +19,12 @@ type readOnlyResolver func(apiKey string) (bool, error)
 // 可见性钉测试（server_test.go）共用的单一事实源（历史 历史问题：
 // 原工具侧/测试侧两份手工平行清单收敛为一份）。历史问题（历史）：
 // test_certificate_config 会写 DNS TXT 验证记录，移出探测集（工具本身保留，
-// 管理员仍可用；只读 Key 不可见）。
+// 管理员仍可用；只读 Key 不可见）。U04a2-历史问题（历史）：test_ca_provider
+// 同理移出——ZeroSSL 缺 EAB 时会真实写 ca_providers.credentials。
 var ReadOnlyProbeTools = map[string]struct{}{
-	"test_ca_provider": {}, "parse_certificate": {},
-	"validate_import": {}, "preview_config": {},
+	"parse_certificate": {},
+	"validate_import":   {},
+	"preview_config":    {},
 }
 
 // readOnlyHiddenTools 是「GET 但对只读 Key 不可见」的工具（M8：export_config
@@ -80,17 +83,20 @@ func resolveAPIKeyReadOnly(apiKey string) (bool, error) {
 	if apiKey == "" || db.DB == nil {
 		return false, nil
 	}
+	if len(apiKey) < 13 {
+		return false, sql.ErrNoRows
+	}
 	hash := sha256.Sum256([]byte(apiKey))
 	var readOnly bool
 	err := db.DB.QueryRow(`
 		SELECT COALESCE(k.read_only,0)
 		FROM api_keys k
 		JOIN users u ON u.id = k.created_by
-		WHERE k.key_hash = ?
+		WHERE k.key_prefix = ? AND k.key_hash = ?
 		  AND k.is_enabled = 1
 		  AND u.is_enabled = 1
 		  AND (k.expires_at IS NULL OR datetime(k.expires_at) > datetime('now'))
-	`, fmt.Sprintf("%x", hash[:])).Scan(&readOnly)
+	`, apiKey[:12], fmt.Sprintf("%x", hash[:])).Scan(&readOnly)
 	return readOnly, err
 }
 

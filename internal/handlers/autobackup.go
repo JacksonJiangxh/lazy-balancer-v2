@@ -172,14 +172,23 @@ func pruneAutoBackups(dir string, keepSuccess, keepFailed int) {
 // (2026-09-20 用户反馈:手动备份审计恒 system,看不出是谁点的)。
 // engineRunID>0=调用方（引擎 runNow/调度 tick）已落 task_runs 行——本函数
 // 跳过自记自收尾（历史问题-④ 单写方，行终态由引擎按返回错误落）。
-func (h *Handlers) RunAutoBackupOnce(trigger, operator string, engineRunID int64) (row autoBackupRowView, err error) {
+// ctx 来自引擎 Run 上下文（历史 历史问题-10）：demote/停止时取消在途备份
+// （buildLbbakExport 与写盘检查点消费），取消不落 failed 行。
+func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator string, engineRunID int64) (row autoBackupRowView, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	histRun := int64(0)
 	histT0 := time.Now()
 	if engineRunID <= 0 {
 		histRun = taskengine.RecordRunStart("auto-backup", "backup", trigger)
 		defer func() {
 			status, msg := "success", ""
-			if err != nil {
+			switch {
+			case errors.Is(err, context.Canceled):
+				// 历史问题-10：取消（角色降级/引擎停止）落 cancelled，不得记 success。
+				status, msg = "cancelled", err.Error()
+			case err != nil:
 				status, msg = "failed", err.Error()
 			}
 			taskengine.RecordRunFinish(histRun, status, time.Since(histT0).Milliseconds(), msg)
@@ -191,10 +200,13 @@ func (h *Handlers) RunAutoBackupOnce(trigger, operator string, engineRunID int64
 	}
 	backupTee("backup", "备份开始（触发："+trigger+"）")
 	defer func() {
-		if err != nil {
-			backupTee("backup", "备份失败："+err.Error())
-		} else {
+		switch {
+		case err == nil:
 			backupTee("backup", "备份完成")
+		case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+			backupTee("backup", "备份已取消（角色降级/引擎停止）")
+		default:
+			backupTee("backup", "备份失败："+err.Error())
 		}
 	}()
 
@@ -202,6 +214,11 @@ func (h *Handlers) RunAutoBackupOnce(trigger, operator string, engineRunID int64
 		return autoBackupRowView{}, errors.New("已有备份任务正在执行，请稍后重试")
 	}
 	defer autoBackupRunMu.Unlock()
+
+	// 历史问题-10：取消检查点——取消不是「备份失败」，不落 failed 行/审计。
+	if cerr := ctx.Err(); cerr != nil {
+		return autoBackupRowView{}, cerr
+	}
 
 	action := "自动备份"
 	if trigger == "manual" {
@@ -230,15 +247,25 @@ func (h *Handlers) RunAutoBackupOnce(trigger, operator string, engineRunID int64
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return autoBackupRowView{}, fail("创建备份目录失败", err)
 	}
-	payload, exportedSections, countsSummary, _, err := h.buildLbbakExport(context.Background(), loadAutoBackupSectionsSetting())
+	payload, exportedSections, countsSummary, _, err := h.buildLbbakExport(ctx, loadAutoBackupSectionsSetting())
 	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return autoBackupRowView{}, cerr
+		}
 		return autoBackupRowView{}, fail("备份构建失败", err)
 	}
 	backupTee("build", fmt.Sprintf("备份构建完成：%s（%d 段）", countsSummary, len(exportedSections)))
 	finalPath := filepath.Join(dir, filename)
 	tmpPath := finalPath + ".tmp"
 	if err := os.WriteFile(tmpPath, payload, 0o600); err != nil {
+		// 历史问题-07：写失败（磁盘满/配额/半写）同样清理半成品——该文件不进
+		// auto_backups 行，prune 永不回收（残留含私钥/凭证明文片段）。
+		_ = os.Remove(tmpPath)
 		return autoBackupRowView{}, fail("备份文件写入失败", err)
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		_ = os.Remove(tmpPath)
+		return autoBackupRowView{}, cerr
 	}
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		_ = os.Remove(tmpPath)
@@ -387,9 +414,20 @@ func (h *Handlers) AutoBackupSettings(c *gin.Context) {
 		// SYS-F1（历史 历史问题）：水位线回传响应面（此前扫描后零消费恒 null）。
 		lastRunValue = &lastRun.String
 	}
+	// 历史问题-03：last_run 是调度水位线（off→on=now，2026-09-19 裁定），不是
+	// 执行事实；「上次执行」必须取最近一次 success 备份行。列表已 DESC 加载，
+	// 直接取首条 success（零额外查询），失败行不得入选。
+	var lastSuccessValue *string
+	for i := range backups {
+		if backups[i].Status == "success" {
+			createdAt := backups[i].CreatedAt
+			lastSuccessValue = &createdAt
+			break
+		}
+	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "ok", Data: gin.H{
 		"enabled": enabled, "frequency": freq, "time": hhmm, "day": day, "keep": keep,
-		"sections": sections, "last_run": lastRunValue, "backups": backups,
+		"sections": sections, "last_run": lastRunValue, "last_success_at": lastSuccessValue, "backups": backups,
 	}})
 }
 
@@ -456,15 +494,34 @@ func (h *Handlers) UpdateAutoBackupSettings(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "序列化备份范围失败: " + err.Error()})
 		return
 	}
-	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_frequency=?, auto_backup_time=?, auto_backup_day=?, auto_backup_keep=?, auto_backup_sections=? WHERE id=1`,
+	// 历史问题-08：四列设置与业务开关同事务——修复前设置先落库、开关后写，
+	// 开关失败返回 500 但频率/范围/保留份数已生效（半保存）。
+	tx, err := db.DB.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "保存自动备份设置失败: " + err.Error()})
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err := tx.Exec(`UPDATE global_config SET auto_backup_frequency=?, auto_backup_time=?, auto_backup_day=?, auto_backup_keep=?, auto_backup_sections=? WHERE id=1`,
 		*req.Frequency, *req.Time, *req.Day, *req.Keep, string(sectionsJSON)); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "保存自动备份设置失败: " + err.Error()})
 		return
 	}
-	if err := services.SetAutoBackupEnabled(*req.Enabled); err != nil {
+	if err := services.SetAutoBackupEnabledTx(tx, *req.Enabled); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "保存自动备份开关失败: " + err.Error()})
 		return
 	}
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "保存自动备份设置失败: " + err.Error()})
+		return
+	}
+	committed = true
+	services.SyncAutoBackupTaskLoop(*req.Enabled)
 	freqLabel := map[string]string{"daily": "每日", "weekly": "每周", "monthly": "每月"}[*req.Frequency]
 	recordAudit(c, "备份设置", "配置备份", services.FormatAuditDetail(
 		fmt.Sprintf("启用：%s", boolText(*req.Enabled)),
@@ -525,6 +582,14 @@ func (h *Handlers) RunAutoBackupNow(c *gin.Context) {
 	}
 	if !autoBackupTriggerMu.TryLock() {
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "已有备份任务正在执行，请稍后重试"})
+		return
+	}
+	// 历史问题-02：本层门只串行手动触发——定时备份（03:00 起可能跑数分钟）在途
+	// 时 TryLock 必成功，随后 goroutine 撞引擎单飞会静默丢弃（仅写 warn），
+	// 用户却已收到「已开始」。202 之前同步检出引擎在途（与任务监控触发同门）。
+	if te.IsTaskInFlight("auto-backup") {
+		autoBackupTriggerMu.Unlock()
+		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "已有备份任务正在执行（含定时备份），请稍后重试"})
 		return
 	}
 	go func() {

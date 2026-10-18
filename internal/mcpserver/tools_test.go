@@ -93,6 +93,84 @@ func TestSmallWriteToolSchemasDeclareFields(t *testing.T) {
 	}
 }
 
+func TestRuleToolSchemasDeclareNestedItemContracts(t *testing.T) {
+	// Given：create/update 两工具的真实 input_schema。
+	type schemaNode struct {
+		Required   []string                   `json:"required"`
+		Properties map[string]json.RawMessage `json:"properties"`
+		Items      *schemaNode                `json:"items"`
+	}
+	for _, testCase := range []struct {
+		name   string
+		schema string
+	}{{"create_rule", createRuleSchema}, {"update_rule", updateRuleSchema}} {
+		t.Run(testCase.name, func(t *testing.T) {
+			decode := func(raw json.RawMessage) schemaNode {
+				t.Helper()
+				var node schemaNode
+				if len(raw) == 0 {
+					return node
+				}
+				if err := json.Unmarshal(raw, &node); err != nil {
+					t.Fatalf("decode schema: %v", err)
+				}
+				return node
+			}
+			root := decode(json.RawMessage(testCase.schema))
+			property := func(node schemaNode, name string) schemaNode {
+				t.Helper()
+				raw, ok := node.Properties[name]
+				if !ok {
+					t.Errorf("schema lacks property %q", name)
+					return schemaNode{}
+				}
+				return decode(raw)
+			}
+			items := func(node schemaNode) schemaNode {
+				t.Helper()
+				if node.Items == nil {
+					t.Errorf("array schema lacks items")
+					return schemaNode{}
+				}
+				return *node.Items
+			}
+			require := func(node schemaNode, fields ...string) {
+				t.Helper()
+				for _, field := range fields {
+					if !containsString(node.Required, field) {
+						t.Errorf("schema required=%v, want %q", node.Required, field)
+					}
+				}
+			}
+
+			// Then：path_rules 全字段、匹配必填与嵌套上游契约可见。
+			pathItems := items(property(root, "path_rules"))
+			require(pathItems, "match_type", "path")
+			for _, field := range []string{"id", "sort_order", "match_type", "path", "upstream_path", "response_mode", "response_status", "response_body", "response_content_type", "redirect_to", "upstreams"} {
+				if _, ok := pathItems.Properties[field]; !ok {
+					t.Errorf("path_rules.items lacks property %q", field)
+				}
+			}
+			pathUpstreamItems := items(property(pathItems, "upstreams"))
+			require(pathUpstreamItems, "address", "port")
+			for _, field := range []string{"address", "port", "weight", "protocol"} {
+				if _, ok := pathUpstreamItems.Properties[field]; !ok {
+					t.Errorf("path upstream items lacks property %q", field)
+				}
+			}
+
+			// And：主 upstreams 在 create（回归）与 update（目标）均完整声明。
+			upstreamItems := items(property(root, "upstreams"))
+			require(upstreamItems, "host", "port")
+			for _, field := range []string{"host", "port", "weight", "enabled", "protocol", "max_connections", "origin_domain"} {
+				if _, ok := upstreamItems.Properties[field]; !ok {
+					t.Errorf("upstreams.items lacks property %q", field)
+				}
+			}
+		})
+	}
+}
+
 // 历史问题（历史）：control_system_task 的 schema enum、handler 接受集
 // （taskmonitor.go ControlSystemTask：start/stop/restart）与描述必须一致，
 // 并说明与 toggle_system_task 的分工。

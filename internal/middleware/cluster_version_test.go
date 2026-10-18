@@ -59,7 +59,10 @@ func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testi
 		{"POST", "/api/v1/certificates/parse", false},
 		{"GET", "/api/v1/certificates/jobs/:id", false},
 		{"PUT", "/api/v1/ca-providers/:id", true},
-		{"POST", "/api/v1/ca-providers/:id/test", false},
+		// U04a2-历史问题（历史）：test 端点在 ZeroSSL 缺 EAB 时写
+		// ca_providers.credentials（同步表），与 PUT 同口径 fail-closed。
+		{"POST", "/api/v1/ca-providers/:id/test", true},
+		{"POST", "/api/v1/ca-providers/7/test", true},
 		{"POST", "/api/v1/certificate-configs", true},
 		{"PUT", "/api/v1/certificate-configs/:id", true},
 		{"DELETE", "/api/v1/certificate-configs/:id", true},
@@ -353,6 +356,131 @@ func TestClusterVersionTriggers_bump_for_security_tables(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestClusterVersionTriggers_coverEverySecurityPolicySchemaColumn(t *testing.T) {
+	// Given：真实 schema 与触发器；逐列 UPDATE OF 行为是比手写清单更可靠的契约。
+	database := newClusterVersionTestDB(t)
+	if err := installClusterVersionTriggers(database); err != nil {
+		t.Fatalf("install triggers: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO security_policies (id,name) VALUES (7,'trigger parity');
+		UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := database.Query(`SELECT name FROM pragma_table_info('security_policies') ORDER BY cid`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var columns []string
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			_ = rows.Close()
+			t.Fatal(err)
+		}
+		columns = append(columns, column)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(columns) == 0 {
+		t.Fatal("no security_policies columns discovered")
+	}
+
+	// When / Then：每列单独出现在 UPDATE 列清单，版本必须恰好递增一次。
+	for index, column := range columns {
+		quoted := strings.ReplaceAll(column, `"`, `""`)
+		statement := fmt.Sprintf(`UPDATE security_policies SET "%s"="%s" WHERE id=7`, quoted, quoted)
+		if _, err := database.Exec(statement); err != nil {
+			t.Fatalf("update column %s: %v", column, err)
+		}
+		if got := clusterVersion(t, database); got != index+1 {
+			t.Errorf("version after updating %s=%d, want %d（触发器 OF 漏列）", column, got, index+1)
+		}
+	}
+}
+
+func TestClusterVersionTriggers_bumpForCrawlerExemptionColumns(t *testing.T) {
+	// Given：真实触发器与预热快照缓存。
+	database := newClusterVersionTestDB(t)
+	if err := installClusterVersionTriggers(database); err != nil {
+		t.Fatalf("install triggers: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO security_policies (id,name,mode) VALUES (7,'crawler trigger','blocking');
+		UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	cluster := services.NewClusterService(database, "")
+	if _, _, err := cluster.Snapshot(context.Background(), 0, "", ""); err != nil {
+		t.Fatalf("warm snapshot: %v", err)
+	}
+
+	// When：每次只改一个爬虫豁免列（不夹带 updated_at 等其他 OF 列）。
+	if _, err := database.Exec(`UPDATE security_policies SET geoip_crawler_exempt=1 WHERE id=7`); err != nil {
+		t.Fatal(err)
+	}
+	// Then：开关本身必须使版本失效。
+	if got := clusterVersion(t, database); got != 1 {
+		t.Errorf("version after crawler exempt update=%d, want 1", got)
+	}
+	if _, err := database.Exec(`UPDATE security_policies SET geoip_crawler_engines='["googlebot"]' WHERE id=7`); err != nil {
+		t.Fatal(err)
+	}
+	if got := clusterVersion(t, database); got != 2 {
+		t.Errorf("version after crawler engines update=%d, want 2", got)
+	}
+
+	// And：版本失效后的快照必须带出新值，而非命中预热缓存。
+	snapshot, _, err := cluster.Snapshot(context.Background(), 0, "", "")
+	if err != nil {
+		t.Fatalf("snapshot after crawler updates: %v", err)
+	}
+	var policies []map[string]interface{}
+	if err := json.Unmarshal(snapshot.SecurityPolicies, &policies); err != nil {
+		t.Fatal(err)
+	}
+	if len(policies) != 1 || policies[0]["geoip_crawler_exempt"] != float64(1) || policies[0]["geoip_crawler_engines"] != `["googlebot"]` {
+		t.Errorf("snapshot crawler values=%+v, want exempt=1 engines=[googlebot]", policies)
+	}
+
+	// 回归形状：从节点本地写不得 bump 主端版本链。
+	if _, err := database.Exec(`UPDATE global_config SET is_master=0 WHERE id=1;
+		UPDATE security_policies SET geoip_crawler_exempt=0 WHERE id=7`); err != nil {
+		t.Fatal(err)
+	}
+	if got := clusterVersion(t, database); got != 2 {
+		t.Errorf("version after slave-local update=%d, want unchanged 2", got)
+	}
+}
+
+func TestClusterVersionTriggers_bumpForIPListSystemColumn(t *testing.T) {
+	// Given
+	database := newClusterVersionTestDB(t)
+	if err := installClusterVersionTriggers(database); err != nil {
+		t.Fatalf("install triggers: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO security_ip_lists (id,name,entries,system) VALUES (77,'system toggle','[]',0);
+		UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When：只改快照已携带的 system 列。
+	if _, err := database.Exec(`UPDATE security_ip_lists SET system=1 WHERE id=77`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Then
+	if got := clusterVersion(t, database); got != 1 {
+		t.Fatalf("version after system update=%d, want 1", got)
+	}
+	// 回归形状：普通快照列仍正常 bump。
+	if _, err := database.Exec(`UPDATE security_ip_lists SET entries='["203.0.113.1"]' WHERE id=77`); err != nil {
+		t.Fatal(err)
+	}
+	if got := clusterVersion(t, database); got != 2 {
+		t.Fatalf("version after entries update=%d, want 2", got)
 	}
 }
 

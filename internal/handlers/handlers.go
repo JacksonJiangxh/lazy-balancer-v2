@@ -160,25 +160,24 @@ func (h *Handlers) recordCaddyApplyResult(err error) {
 	}
 }
 
-// caddyApplyNote returns a response-message suffix describing an apply
-// failure; empty string means the config applied cleanly. Callers inside an
-// import session (which already holds caddyOpMu) must use
-// caddyApplyNoteLocked instead — applyCaddyConfigE is not reentrant.
+// caddyApplyNoteLocked 返回应用失败时的响应文案后缀（空=配置干净应用）。
+// 已持 caddyOpMu 的后台/会话内路径使用（Start/Restart Caddy、集群应用、
+// 导入会话内重播种）；applyCaddyConfigE 不可重入，未持锁路径必须用它。
 //
-// 重载审计的三个家族（契约：触发重载必须留痕。69d809b4 曾误以为本方法
+// 重载审计的家族（契约：触发重载必须留痕。69d809b4 曾误以为单一入口
 // 全覆盖而删光其余家族的手动审计，导致删除/启用规则等操作重载不留痕）：
-//  1. caddyApplyNote       — 提交后从 DB 重放（security 等）：重载与审计
-//     同处一行，不可能遗漏；
-//  2. caddyApplyNoteLocked — 已持 caddyOpMu 的后台/会话内路径（Start/
-//     Restart Caddy、导入会话内重播种）；
-//  3. applyFromTxNote      — 事务内应用（rule 生命周期 ×5、UpdateConfig）：
-//     重载发生在 Commit 前、审计只能落在 Commit 后，两点必然分离，由返回
-//     的 note 闭包绑定，漏调即编译错误。
-//     注意：UpdateConfig 是家族 3 的严格变体——任何 applyErr（含传输失败）
-//     都回滚事务并返回 400/500，不采用「传输失败退化提交」；该差异由
+//  1. caddyApplyNoteLocked — 已持 caddyOpMu 的后台/会话内路径（Start/
+//     Restart Caddy、集群应用、导入会话内重播种）；
+//  2. applyFromTxNote      — 事务内应用（规则生命周期 ×5、UpdateConfig、
+//     finishTxApply 家族）：重载发生在 Commit 前、审计只能落在 Commit 后，
+//     两点必然分离，由返回的 note 闭包绑定，漏调即编译错误。
+//     注意：UpdateConfig 是严格变体——任何 applyErr（含传输失败）都回滚
+//     事务并返回 400/500，不采用「传输失败退化提交」；该差异由
 //     handlers/caddy.go 的 UpdateConfig 与钉测固化。
+//  3. applyCaddyConfigE    — 未持锁的手动重载（POST /caddy/reload 等），
+//     自取 caddyOpMu 并持久化应用结果。
 //
-// 家族 3 的变体（不经 tx 渲染）：PutCaddyConfig（ApplyConfig 原始载荷）与
+// 家族 2 的变体（不经 tx 渲染）：PutCaddyConfig（ApplyConfig 原始载荷）与
 // 备份导入 ×2（协调器内应用）各自在成功尾部补记，同受契约约束。
 func (h *Handlers) caddyApplyNoteLocked() string {
 	err := h.caddyService.GenerateAndApplyConfig()
@@ -277,16 +276,18 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 	if applyErr == nil {
 		if err := tx.Commit(); err != nil {
 			// 2026-09-07 审计 L5：SQLite commit 失败极罕见（磁盘满/IO 错误）。
-			// 历史问题：apply 已按未提交事务视图重写投影/证书文件，commit 失败
-			// 必须先把磁盘副作用回退到已提交视图；运行配置回弹仍受无快照边界
-			// 限制（后续由看门狗/下次成功 apply 收敛）。
-			h.caddyService.RollbackIPListProjectionsToCommittedInLock()
-			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", err.Error(), services.AuditResultPart("failure")))
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + err.Error()})
+			// U04d-03：apply 已按未提交事务视图 /load 并把同一内容写入 LKG，
+			// commit 失败必须把运行配置/LKG/投影/证书统一回退到已提交视图。
+			restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+			joined := errors.Join(err, restoreErr)
+			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", joined.Error(), services.AuditResultPart("failure")))
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + joined.Error()})
 			return
 		}
-		h.recordCaddyApplyResult(nil) // 运行配置=已提交 DB，清除既往失败标记（与旧 caddyApplyNote 成功路径等价）
 		recordAudit(c, f.AuditAction, f.Resource, f.AuditDetail)
+		// 重载审计与失败横幅清除的唯一收口（U04d-13：此前上方已先清一次、
+		// 此处 reloadNote 内又清一次 = 同请求重复 UPDATE global_config；
+		// 同字节短路形态也由 note 覆盖）。
 		reloadNote()
 		c.JSON(status, models.APIResponse{Code: 0, Message: f.SuccessMsg, Data: f.Data})
 		return
@@ -310,14 +311,35 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", err.Error(), services.AuditResultPart("failure")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + err.Error()})
+		// U04d-03：退化提交分支同样可能已按未提交视图重写投影/证书并（若
+		// 传输失败前 /load 已生效）留下运行配置分叉——与成功分支同一收口。
+		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		joined := errors.Join(err, restoreErr)
+		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", joined.Error(), services.AuditResultPart("failure")))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + joined.Error()})
 		return
 	}
 	h.recordCaddyApplyResult(applyErr)
 	recordAudit(c, f.AuditAction, f.Resource, f.AuditDetail)
 	recordAudit(c, "重载失败", "Caddy服务", applyErr.Error())
 	c.JSON(status, models.APIResponse{Code: 0, Message: f.SuccessMsg + "；但 Caddy 配置应用失败：" + applyErr.Error(), Data: f.Data})
+}
+
+// recoverCommittedViewAfterCommitFailure 是事务提交失败的统一恢复（U04d-03）：
+// 先回滚未提交事务（释放 SQLite 写锁，否则 db.DB 读会被阻塞），再以已提交
+// 视图重渲染并 /load——运行配置、last-known-good、名单投影与证书物化副作用
+// 全部回退到已提交状态，审计与 500 响应合并两类失败。
+//
+// 调用契约：调用方处于写路径临界区（已持 caddyOpMu），且此后不得再使用 tx。
+func (h *Handlers) recoverCommittedViewAfterCommitFailure(tx *sql.Tx) error {
+	var errs []error
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		errs = append(errs, fmt.Errorf("回滚未提交事务失败: %w", err))
+	}
+	if err := h.caddyService.RestoreRuntimeToCommittedInLock(); err != nil {
+		errs = append(errs, fmt.Errorf("恢复已提交视图运行配置失败: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
 // reloadDetailFor 返回收尾选项的重载审计明细（默认「配置变更后自动重载」）。
@@ -380,6 +402,91 @@ type rulePayloadInput struct {
 	BlockPageStage3ID             int
 	BlockPageStage3Status         int
 	Upstreams                     []models.Upstream
+}
+
+// validateRuleHostHeader 是 Host 头写侧唯一形状门；保存与两种备份导入共用。
+func validateRuleHostHeader(hostHeader string) error {
+	for _, r := range hostHeader {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("后端域名含非法字符")
+		}
+	}
+	return nil
+}
+
+func validateRuleHealthCheckPath(path string) error {
+	if path != "" && !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("健康检查路径必须以 / 开头")
+	}
+	return nil
+}
+
+// validateRuleUpstreams 校验一组实际上游。requireEnabled 用于 Create/Update
+// 与 v1 的表单语义；v2 备份是存量行还原，保留渲染层支持的零上游/零启用
+// 形态，但所有携带行仍逐项经过完全相同的值域、查重与协议校验。
+func validateRuleUpstreams(protocol string, dynamicDNS bool, upstreams []models.Upstream, requireEnabled bool) (int, error) {
+	if requireEnabled && len(upstreams) == 0 {
+		return 0, fmt.Errorf("至少需要一个上游服务器")
+	}
+	enabledUpstreamCount := 0
+	enabledProtocols := make(map[string]bool, 2)
+	hostPortSeen := make(map[string]bool)
+	for i, u := range upstreams {
+		if u.Host == "" {
+			return 0, fmt.Errorf("上游 #%d：主机地址不能为空", i+1)
+		}
+		if u.Port < 1 || u.Port > 65535 {
+			return 0, fmt.Errorf("上游 #%d：端口 %d 无效（必须在 1-65535 之间）", i+1, u.Port)
+		}
+		if u.Weight < 0 {
+			return 0, fmt.Errorf("上游 #%d：权重不能为负数", i+1)
+		}
+		if protocol == "http" {
+			if u.Protocol != "" && u.Protocol != "http" && u.Protocol != "https" {
+				return 0, fmt.Errorf("上游 #%d：协议 '%s' 无效（HTTP 规则仅支持 http/https）", i+1, u.Protocol)
+			}
+		} else if u.Protocol != "" && u.Protocol != "tcp" && u.Protocol != "tls" {
+			return 0, fmt.Errorf("上游 #%d：协议 '%s' 无效（TCP 规则仅支持 tcp/tls）", i+1, u.Protocol)
+		}
+		if u.MaxConnections < 0 {
+			return 0, fmt.Errorf("上游 #%d：最大连接数不能为负数", i+1)
+		}
+
+		key := net.JoinHostPort(strings.ToLower(strings.TrimSpace(u.Host)), strconv.Itoa(u.Port))
+		if hostPortSeen[key] {
+			return 0, fmt.Errorf("上游 %s 重复", key)
+		}
+		hostPortSeen[key] = true
+		if !isValidHost(u.Host) {
+			return 0, fmt.Errorf("上游 #%d：主机 '%s' 无效", i+1, u.Host)
+		}
+		if u.OriginDomain != "" {
+			if protocol != "http" {
+				return 0, fmt.Errorf("上游 #%d：回源域名仅 HTTP 规则支持", i+1)
+			}
+			if dynamicDNS {
+				return 0, fmt.Errorf("上游 #%d：动态上游模式不支持回源域名（请使用规则级后端域名）", i+1)
+			}
+			if !isValidHost(u.OriginDomain) {
+				return 0, fmt.Errorf("上游 #%d：回源域名 %q 无效（仅支持主机名，不带端口）", i+1, u.OriginDomain)
+			}
+		}
+		if u.Enabled {
+			enabledUpstreamCount++
+			proto := u.Protocol
+			if proto == "" {
+				proto = "http"
+			}
+			enabledProtocols[proto] = true
+		}
+	}
+	if protocol == "http" && enabledProtocols["http"] && enabledProtocols["https"] {
+		return 0, fmt.Errorf("同一 HTTP 规则的启用上游协议须一致（http/https 混布时 http 上游会被 TLS 化静默全灭；如需共存请拆分为两条规则）")
+	}
+	if requireEnabled && enabledUpstreamCount == 0 {
+		return 0, fmt.Errorf("至少需要一个启用的上游服务器")
+	}
+	return enabledUpstreamCount, nil
 }
 
 // validateRulePayloadBeforeSave 是规则保存的后端字段层校验（三层校验第 2 层，
@@ -511,10 +618,8 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 
 	// 历史问题:host_header 直写 reverse_proxy 头部——CRLF/控制字符可注入额外
 	// 头(请求拆分面);拒绝不可见字符,可见 ASCII 与常规 Unicode 放行。
-	for _, r := range data.HostHeader {
-		if r < 0x20 || r == 0x7f {
-			return fmt.Errorf("后端域名含非法字符")
-		}
+	if err := validateRuleHostHeader(data.HostHeader); err != nil {
+		return err
 	}
 	// 历史问题:dns_server 形状校验(host[:port])——垃圾串直写 caddy dns 模块
 	// 配置,渲染层报错位置深且难归因。
@@ -548,81 +653,9 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		}
 	}
 
-	if len(data.Upstreams) == 0 {
-		return fmt.Errorf("至少需要一个上游服务器")
-	}
-
-	enabledUpstreamCount := 0
-	// LBS-A-L1（历史 历史问题）：HTTP 规则 http/https 混布池拒绝——Caddy TLS 决策
-	// 是传输级（shouldUseTLS 无逐上游概念），任一 https 上游使 http 上游明文
-	// 打 TLS 端口静默全灭 502；禁用上游不参与渲染，不计入混布判定。
-	enabledProtocols := make(map[string]bool, 2)
-	hostPortSeen := make(map[string]bool)
-	for i, u := range data.Upstreams {
-		if u.Host == "" {
-			return fmt.Errorf("上游 #%d：主机地址不能为空", i+1)
-		}
-		if u.Port < 1 || u.Port > 65535 {
-			return fmt.Errorf("上游 #%d：端口 %d 无效（必须在 1-65535 之间）", i+1, u.Port)
-		}
-		if u.Weight < 0 {
-			return fmt.Errorf("上游 #%d：权重不能为负数", i+1)
-		}
-		if data.Protocol == "http" {
-			if u.Protocol != "" && u.Protocol != "http" && u.Protocol != "https" {
-				return fmt.Errorf("上游 #%d：协议 '%s' 无效（HTTP 规则仅支持 http/https）", i+1, u.Protocol)
-			}
-		} else {
-			if u.Protocol != "" && u.Protocol != "tcp" && u.Protocol != "tls" {
-				return fmt.Errorf("上游 #%d：协议 '%s' 无效（TCP 规则仅支持 tcp/tls）", i+1, u.Protocol)
-			}
-		}
-		if u.MaxConnections < 0 {
-			return fmt.Errorf("上游 #%d：最大连接数不能为负数", i+1)
-		}
-
-		key := fmt.Sprintf("%s:%d", strings.ToLower(strings.TrimSpace(u.Host)), u.Port)
-		if hostPortSeen[key] {
-			return fmt.Errorf("上游 %s:%d 重复", u.Host, u.Port)
-		}
-		hostPortSeen[key] = true
-
-		if !isValidHost(u.Host) {
-			return fmt.Errorf("上游 #%d：主机 '%s' 无效", i+1, u.Host)
-		}
-
-		// 逐上游回源域名（2026-10-10）：仅 HTTP 规则静态上游可用——dynamic_dns
-		// 池 dial=解析后 IP（渲染期映射永不命中）；TCP 规则无 Host/SNI 语义。
-		if u.OriginDomain != "" {
-			if data.Protocol != "http" {
-				return fmt.Errorf("上游 #%d：回源域名仅 HTTP 规则支持", i+1)
-			}
-			if data.DynamicDNS {
-				return fmt.Errorf("上游 #%d：动态上游模式不支持回源域名（请使用规则级后端域名）", i+1)
-			}
-			// 纯主机名不带端口（2026-10-10 用户裁定：端口已有独立配置列）；
-			// isValidHost 字符集天然拒绝 CRLF/控制字符与端口冒号形态。
-			if !isValidHost(u.OriginDomain) {
-				return fmt.Errorf("上游 #%d：回源域名 %q 无效（仅支持主机名，不带端口）", i+1, u.OriginDomain)
-			}
-		}
-
-		if u.Enabled {
-			enabledUpstreamCount++
-			proto := u.Protocol
-			if proto == "" {
-				proto = "http"
-			}
-			enabledProtocols[proto] = true
-		}
-	}
-
-	if data.Protocol == "http" && enabledProtocols["http"] && enabledProtocols["https"] {
-		return fmt.Errorf("同一 HTTP 规则的启用上游协议须一致（http/https 混布时 http 上游会被 TLS 化静默全灭；如需共存请拆分为两条规则）")
-	}
-
-	if enabledUpstreamCount == 0 {
-		return fmt.Errorf("至少需要一个启用的上游服务器")
+	enabledUpstreamCount, err := validateRuleUpstreams(data.Protocol, data.DynamicDNS, data.Upstreams, true)
+	if err != nil {
+		return err
 	}
 
 	if data.DynamicDNS && enabledUpstreamCount > 1 {
@@ -632,8 +665,8 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		return fmt.Errorf("无效的 DNS 协议栈 '%s'（仅支持 ipv4、ipv6 或 both）", data.DnsFamily)
 	}
 
-	if data.HealthCheckPath != "" && !strings.HasPrefix(data.HealthCheckPath, "/") {
-		return fmt.Errorf("健康检查路径必须以 / 开头")
+	if err := validateRuleHealthCheckPath(data.HealthCheckPath); err != nil {
+		return err
 	}
 
 	// 健康检查域名（2026-10-10）：probe 的 Host 头（health_checks.active.headers.
@@ -1003,22 +1036,39 @@ func validateDnsServerShape(raw string) error {
 
 // validateSingleDnsAddress 单地址校验:host[:port] 形态;host 须为 IP(netip)
 // 或含点的 FQDN 或 localhost;端口 1-65535;拒绝空 host 与控制字符。
+// U04d-08：含冒号的输入只接受合法 host:port（含 [v6]:port）——SplitHostPort
+// 失败的多冒号/空端口/括号畸形一律拒绝，不得回落「含点即 FQDN」（原实现让
+// bad.example.com:80:90 这类串整串当 host 通过字段门）。
 func validateSingleDnsAddress(server string) error {
 	server = strings.TrimSpace(server)
 	if server == "" {
 		return fmt.Errorf("DNS 服务器地址无效")
 	}
-	host := server
-	if h, p, err := net.SplitHostPort(server); err == nil {
-		host = h
-		if p != "" {
-			port, perr := strconv.Atoi(p)
-			if perr != nil || port < 1 || port > 65535 {
-				return fmt.Errorf("DNS 服务器端口必须在 1-65535 之间")
-			}
+	// 裸 IP（含裸 IPv6 字面量、带 zone 形态）：无端口，直接接受。
+	if _, err := netip.ParseAddr(server); err == nil {
+		return nil
+	}
+	// 方括号裸 IPv6（[::1]，无端口）：容错接受并校验内部字面量。
+	if strings.HasPrefix(server, "[") && strings.HasSuffix(server, "]") {
+		if _, err := netip.ParseAddr(server[1 : len(server)-1]); err != nil {
+			return fmt.Errorf("DNS 服务器地址无效: %s", server)
 		}
-	} else {
-		host = strings.Trim(server, "[]")
+		return nil
+	}
+	host := server
+	if strings.Contains(server, ":") {
+		h, p, err := net.SplitHostPort(server)
+		if err != nil {
+			return fmt.Errorf("DNS 服务器地址格式无效（须为 IP、域名或 host:port）: %s", server)
+		}
+		if p == "" {
+			return fmt.Errorf("DNS 服务器端口不能为空")
+		}
+		port, perr := strconv.Atoi(p)
+		if perr != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("DNS 服务器端口必须在 1-65535 之间")
+		}
+		host = h
 	}
 	if strings.TrimSpace(host) == "" {
 		return fmt.Errorf("DNS 服务器地址无效")

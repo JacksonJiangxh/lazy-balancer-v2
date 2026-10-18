@@ -161,14 +161,16 @@ func (h *Handlers) ForgetClusterNodePin(c *gin.Context) {
 
 // GetClusterWafFiles serves the full CRS/IP2Region file bundle on demand to
 // slaves whose snapshot-carried hash reference differs from their local files.
+// 历史问题-01：响应体按引用指纹缓存（一次 base64/JSON 编码），不再每请求
+// 全树打包 + 重新序列化；限流由 clusterMachineRateLimit 在路由层预占。
 func (h *Handlers) GetClusterWafFiles(c *gin.Context) {
 	if !h.requireMaster(c) {
 		return
 	}
-	bundle := services.BuildWafFileBundle()
-	if bundle == nil {
+	body := services.BuildWafFileBundleResponse()
+	if body == nil {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "主节点无安全数据"})
 		return
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: bundle})
+	c.Data(http.StatusOK, "application/json; charset=utf-8", body)
 }

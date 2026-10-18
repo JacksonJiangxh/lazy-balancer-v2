@@ -24,6 +24,24 @@ func TestGlobalConfig_serializes_DNS_credentials(t *testing.T) {
 	}
 }
 
+func TestGlobalConfig_omitsClusterInternalState(t *testing.T) {
+	// Given：未赋值的响应模型不得凭空发布集群内部状态的零值契约。
+	data, err := json.Marshal(GlobalConfig{})
+	if err != nil {
+		t.Fatalf("marshal GlobalConfig: %v", err)
+	}
+	body := string(data)
+	for _, key := range []string{"cluster_version", "applied_version", "last_sync_error"} {
+		if strings.Contains(body, `"`+key+`"`) {
+			t.Errorf("GlobalConfig exposes unpopulated %s: %s", key, body)
+		}
+	}
+	// 回归形状：实际由 GetConfig 填载的同步时间字段继续存在。
+	if !strings.Contains(body, `"last_sync":null`) || !strings.Contains(body, `"updated_at":null`) {
+		t.Fatalf("populated sync timestamps must remain in API: %s", body)
+	}
+}
+
 func TestUserResponse_serializes_nullable_fields_as_values_or_null(t *testing.T) {
 	// Given
 	createdAt := time.Date(2026, time.July, 30, 1, 2, 3, 0, time.UTC)

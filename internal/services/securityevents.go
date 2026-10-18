@@ -861,35 +861,49 @@ func securityEventsAttributePolicy(ruleCaddyID, ruleTriggered, action, clientIP 
 		if p == nil {
 			continue
 		}
+		// 历史问题：渲染被跳过（引用名单缺失）的策略不参与成员归因。
+		if p.IPRefMissing {
+			continue
+		}
 		if securityEventsPolicyContainsRule(p, ruleTriggered, clientIP) {
 			return pid, p.Name
 		}
 	}
 	ipFamily := securityEventsRuleIsIPFamily(ruleTriggered)
 	customFam := securityEventsRuleIsCustomFamily(ruleTriggered)
-	for _, pid := range policyIDs {
-		p := policyByID[pid]
-		if p == nil {
-			continue
-		}
+	// 历史问题：IPRefMissing=该策略因引用名单缺失被渲染跳过——物理上不可能
+	// 产出本事件，不得凭规则 ID/能力门抢走真实属主。但「发射后配置漂移」的
+	// 既有 fallback 语义保留：已渲染候选全部不匹配时，仍归到未渲染候选
+	// （绝不归零），仅让其退居末位。
+	fallbackMatch := func(p *models.SecurityPolicy, requireCapability bool) bool {
 		if !securityEventsFallbackCanProduce(p, action, ruleTriggered) {
-			continue
+			return false
+		}
+		if !requireCapability {
+			return true
 		}
 		if ipFamily && !securityEventsIPFamilyEventSurface(p, action, ruleTriggered) {
-			continue
+			return false
 		}
 		if customFam && !securityEventsCustomRulesEventSurface(p) {
-			continue
+			return false
 		}
-		return pid, p.Name
+		return true
 	}
-	for _, pid := range policyIDs {
-		p := policyByID[pid]
-		if p == nil {
-			continue
-		}
-		if securityEventsFallbackCanProduce(p, action, ruleTriggered) {
-			return pid, p.Name
+	for _, skipMissing := range []bool{true, false} {
+		for _, requireCapability := range []bool{true, false} {
+			for _, pid := range policyIDs {
+				p := policyByID[pid]
+				if p == nil {
+					continue
+				}
+				if skipMissing != p.IPRefMissing {
+					continue
+				}
+				if fallbackMatch(p, requireCapability) {
+					return pid, p.Name
+				}
+			}
 		}
 	}
 	return 0, ""
@@ -1534,7 +1548,7 @@ func SecurityEventsPollOnce() int {
 // 轮转跟随，阻塞直到 ctx 取消。引擎 StartLoop 时启动一次（Run=本函数），
 // StopLoop 时 ctx 取消返回。
 func runIngestionLoop(ctx context.Context) error {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(securityEventsPollInterval)
 	defer ticker.Stop()
 	for {
 		select {

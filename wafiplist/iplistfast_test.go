@@ -237,9 +237,34 @@ func TestIPListFast_emptyFileLoadsNoErrorAndNeverMatches(t *testing.T) {
 	}
 }
 
-// LoadPrefixesFresh/ResolvePrefixes 是 http.ip_sources.lb_file（受信代理网段
-// 热路径化）消费的导出入口：白名单与算子同规；fresh=fail-closed（构建期），
-// resolve=节流+fail-stale（运行期）。返回切片为缓存共享只读快照。
+// ResolvePrefixesNormalized 是 Provision 已归一路径的热路径入口：复用同一
+// 缓存快照与网段语义，不再重复 Clean/白名单校验。
+func TestResolvePrefixesNormalized_contract(t *testing.T) {
+	// Given: Provision 已完成白名单归一和首次新鲜加载。
+	dir := useAllowedDir(t)
+	path := writeListFile(t, dir, "tp-normalized.txt", []string{"203.0.113.7", "10.8.0.0/16"})
+	cleaned, err := NormalizeAllowedPath(path)
+	if err != nil {
+		t.Fatalf("NormalizeAllowedPath: %v", err)
+	}
+	if _, err := LoadPrefixesFresh(cleaned); err != nil {
+		t.Fatalf("LoadPrefixesFresh: %v", err)
+	}
+
+	// When: 热路径使用已归一入口。
+	prefixes, err := ResolvePrefixesNormalized(cleaned)
+
+	// Then: 复用同一缓存快照与网段语义，不重复路径归一。
+	if err != nil {
+		t.Fatalf("ResolvePrefixesNormalized: %v", err)
+	}
+	if len(prefixes) != 2 {
+		t.Fatalf("prefixes=%v, want 2 entries", prefixes)
+	}
+}
+
+// LoadPrefixesFresh/ResolvePrefixes 是白名单校验导出入口：fresh=构建期
+// fail-closed，resolve=运行期节流+fail-stale；返回缓存共享只读快照。
 func TestLoadAndResolvePrefixes_contract(t *testing.T) {
 	dir := useAllowedDir(t)
 	path := writeListFile(t, dir, "tp-accessor.txt", []string{"203.0.113.7", "10.8.0.0/16"})

@@ -126,13 +126,10 @@ func (h *Handlers) GetRuleCaddyConfig(c *gin.Context) {
 		return
 	}
 
-	// N4/S历史问题-17(历史处置):该 COUNT 仅供 debug 日志——失败降级为
-	// 零值继续,不再 500 阻断规则配置查看(文案亦误导:无上游获取发生)。
-	var upstreamCount int
-	_ = db.DB.QueryRow(`SELECT COUNT(*) FROM upstreams WHERE rule_id = ? AND IIF(enabled IN ('1',1),1,0) = 1`, caddyID).Scan(&upstreamCount)
-
-	services.Logf("debug", "GetRuleCaddyConfig: caddyID=%s, port=%d, upstreams=%d, enabled=%v",
-		r.CaddyID, r.ListenPort, upstreamCount, r.Enabled)
+	// 审计 M17 同族（历史）：该 enabled 上游 COUNT 仅用于 debug 日志，
+	// 每次请求额外执行一次查询——删除（排障价值不抵每请求成本）。
+	services.Logf("debug", "GetRuleCaddyConfig: caddyID=%s, port=%d, enabled=%v",
+		r.CaddyID, r.ListenPort, r.Enabled)
 
 	responseData := map[string]interface{}{
 		"caddy_id": r.CaddyID,
@@ -153,10 +150,11 @@ func (h *Handlers) GetRuleCaddyConfig(c *gin.Context) {
 	// 主路由对象，配置查看对话框拿到的 JSON 缺路径路由。
 	runtimeConfig, err := h.caddyService.GetConfig()
 	if err != nil {
+		// LBH79-历史问题：admin 不可达/超时 ≠「规则未应用」——此前两者都归一为
+		// config_not_exists，排障被误导。返回 502，让 UI 的失败分支如实展示
+		// 「获取配置失败」（后者只表示该规则无运行路由）。
 		services.Logf("error", "GetRuleCaddyConfig: failed to get config from Caddy for caddy_id=%s: %v", r.CaddyID, err)
-		responseData["config"] = nil
-		responseData["config_not_exists"] = true
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: responseData})
+		c.JSON(http.StatusBadGateway, models.APIResponse{Code: http.StatusBadGateway, Message: "读取 Caddy 运行配置失败: " + err.Error()})
 		return
 	}
 	mainRoute, allRuleRoutes := ruleCaddyRoutes(runtimeConfig, r.CaddyID)
@@ -172,7 +170,7 @@ func (h *Handlers) GetRuleCaddyConfig(c *gin.Context) {
 	// and policies. 历史 历史问题: 定向构建仅含本规则端口 server 的上下文，
 	// 不再为单条规则触发整库查询+证书快照读取的全量重渲染。
 	fullConfig := services.GenerateRuleServerContext(r.CaddyID, r.ListenPort, r.Protocol, r.Domain)
-	ruleContext := buildRuleCaddyContext(fullConfig, r.CaddyID, r.ListenPort, r.Domain)
+	ruleContext := buildRuleCaddyContext(fullConfig, r.CaddyID, r.Domain)
 
 	responseData["config"] = map[string]interface{}{
 		"route":                   mainRoute,
@@ -180,19 +178,17 @@ func (h *Handlers) GetRuleCaddyConfig(c *gin.Context) {
 		"server_context":          ruleContext["server"],
 		"tls_certificates":        ruleContext["tls_certificates"],
 		"tls_connection_policies": ruleContext["tls_connection_policies"],
-		"automation_policies":     ruleContext["automation_policies"],
 	}
 	responseData["config_not_exists"] = false
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: responseData})
 }
 
 // buildRuleCaddyContext extracts the server and TLS context relevant to a rule from the full Caddy config.
-func buildRuleCaddyContext(fullConfig map[string]interface{}, caddyID string, listenPort int, domain string) map[string]interface{} {
+func buildRuleCaddyContext(fullConfig map[string]interface{}, caddyID string, domain string) map[string]interface{} {
 	result := map[string]interface{}{
 		"server":                  nil,
 		"tls_certificates":        []interface{}{},
 		"tls_connection_policies": []interface{}{},
-		"automation_policies":     []interface{}{},
 	}
 
 	apps, _ := fullConfig["apps"].(map[string]interface{})
@@ -310,49 +306,11 @@ func buildRuleCaddyContext(fullConfig map[string]interface{}, caddyID string, li
 		}
 	}
 
-	if automation, ok := tlsApp["automation"].(map[string]interface{}); ok {
-		if policies, ok := automation["policies"].([]interface{}); ok {
-			wanted := make(map[string]struct{})
-			for _, ruleDomain := range normalizedRuleDomains(domain) {
-				wanted[ruleDomain] = struct{}{}
-			}
-			if len(wanted) > 0 {
-				scoped := make([]interface{}, 0, len(policies))
-				for _, policyVal := range policies {
-					policy, _ := policyVal.(map[string]interface{})
-					if policy == nil {
-						continue
-					}
-					matched := false
-					switch subjects := policy["subjects"].(type) {
-					case []interface{}:
-						for _, subject := range subjects {
-							name, ok := subject.(string)
-							if !ok {
-								continue
-							}
-							if _, hit := wanted[name]; hit {
-								matched = true
-								break
-							}
-						}
-					case []string:
-						for _, subject := range subjects {
-							if _, hit := wanted[subject]; hit {
-								matched = true
-								break
-							}
-						}
-					}
-					if matched {
-						scoped = append(scoped, policyVal)
-					}
-				}
-				result["automation_policies"] = scoped
-			}
-		}
-	}
-
+	// LBH79-历史问题：此处曾有 tls.automation.policies 的域名作用域扫描——生产
+	// 渲染（GenerateRuleServerContext / 全量生成）从不产出 tls.automation
+	// （注释明确「no Caddy ACME automation」，证书由应用层任务管理），该字段
+	// 恒为 []，测试为自造输入假绿。删除死代码，配置查看框不再展示不存在的
+	// automation policies。
 	return result
 }
 
@@ -678,7 +636,8 @@ func (h *Handlers) respondRuleApplyError(c *gin.Context, applyErr, restoreErr er
 
 // tcpDeadFields 是 TCP 写入侧「HTTP 专属字段」的指针视图：CreateRule（值
 // 字段）/ UpdateRule（指针字段）/ DuplicateRule（存量行）共用同一张归一
-// 清单。nil 目标 = 该入口有意不处置该字段（当前仅 Create 的 NTLMCompatible）。
+// 清单。nil 目标 = 该入口有意不处置该字段（Create 的 NTLMCompatible/
+// HealthCheckHost——显式携带由保存门 400 拒绝，不做静默弃置）。
 type tcpDeadFields struct {
 	EnableTLS                *bool
 	TLSSource                *string
@@ -690,6 +649,7 @@ type tcpDeadFields struct {
 	TLSHTTPRedirect          *bool
 	HostHeader               *string
 	HealthCheckPath          *string
+	HealthCheckHost          *string
 	EnableCompress           *bool
 	CompressTypes            *string
 	RequestBodyMaxSizeMB     *int
@@ -720,7 +680,7 @@ func tcpDeadFieldReset(protocol string, fields tcpDeadFields) {
 	if fields.TLSSource != nil {
 		*fields.TLSSource = "manual"
 	}
-	for _, target := range []*string{fields.TLSCert, fields.TLSKey, fields.Domain, fields.HostHeader, fields.HealthCheckPath, fields.CompressTypes} {
+	for _, target := range []*string{fields.TLSCert, fields.TLSKey, fields.Domain, fields.HostHeader, fields.HealthCheckPath, fields.HealthCheckHost, fields.CompressTypes} {
 		if target != nil {
 			*target = deadEmpty
 		}
@@ -740,6 +700,9 @@ func tcpDeadFieldReset(protocol string, fields tcpDeadFields) {
 
 // createRuleTCPDeadFields 接 CreateRule 的值字段；NTLMCompatible 留空——
 // TCP 创建携带 NTLM 必须经 validateRuleFeatures 显式 400（2026-10-12 定稿）。
+// HealthCheckHost 亦留空（LBH79-历史问题.1）：HTTP-only 字段由保存门
+// validateRulePayloadBeforeSave 显式 400（既有行为，与 NTLM 同格的「显式
+// 携带即拒」），仅存量/复制/传输路径沉默归一。
 func createRuleTCPDeadFields(req *models.CreateRuleRequest) tcpDeadFields {
 	return tcpDeadFields{
 		EnableTLS:                &req.EnableTLS,
@@ -778,6 +741,7 @@ func updateRuleTCPDeadFields(req *models.UpdateRuleRequest) tcpDeadFields {
 		TLSHTTPRedirect:          req.TLSHTTPRedirect,
 		HostHeader:               req.HostHeader,
 		HealthCheckPath:          req.HealthCheckPath,
+		HealthCheckHost:          req.HealthCheckHost,
 		EnableCompress:           req.EnableCompress,
 		CompressTypes:            &req.CompressTypes,
 		RequestBodyMaxSizeMB:     req.RequestBodyMaxSizeMB,
@@ -805,6 +769,7 @@ func storedRuleTCPDeadFields(rule *models.LbRule) tcpDeadFields {
 		TLSHTTPRedirect:          &rule.TLSHTTPRedirect,
 		HostHeader:               &rule.HostHeader,
 		HealthCheckPath:          &rule.HealthCheckPath,
+		HealthCheckHost:          &rule.HealthCheckHost,
 		EnableCompress:           &rule.EnableCompress,
 		CompressTypes:            &rule.CompressTypes,
 		RequestBodyMaxSizeMB:     &rule.RequestBodyMaxSizeMB,
@@ -946,12 +911,12 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
 			return
 		}
-		// 历史 问题: 截断 body 日志避免敏感信息（TLS 私钥/密码）泄漏。
-		bodyPreview := string(rawBody)
-		if len(bodyPreview) > 512 {
-			bodyPreview = bodyPreview[:512] + "...(truncated)"
-		}
-		services.Logf("error", "CreateRule bind error: %v, body_length: %d, body_preview: %s", err, len(rawBody), bodyPreview)
+		// 历史 问题 / LBH79-历史问题：畸形 JSON 的请求体可能含
+		// tls_key/tls_cert/password，运行日志对所有登录用户可读——原实现
+		// 只截 512B 仍把密钥前缀写入日志。改为只记录结构性元信息，正文
+		// 一律不落日志。
+		services.Logf("error", "CreateRule bind error: %v, body_length: %d, content_type: %s（请求体正文不记录，避免证书/密钥泄漏）",
+			err, len(rawBody), c.GetHeader("Content-Type"))
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("Invalid request: %v", err)})
 		return
 	}
@@ -1246,6 +1211,10 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
+		// LBH79-历史问题：commit 失败与 finishTxApply/UpdateConfig 同收口——
+		// 事务内两轮渲染已按未提交视图重写名单投影，先回滚到已提交视图
+		// 再恢复运行配置。
+		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
 		services.Logf("error", "CreateRule transaction commit error: %v", err)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则失败: " + errors.Join(err, restoreErr).Error()})
@@ -1396,7 +1365,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0),
 		COALESCE(custom_routes_enabled,0),
 		COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
-		COALESCE(host_header,''), COALESCE(health_check_host,''), COALESCE(enable_compress,1), COALESCE(compress_types,'gzip'),
+		COALESCE(host_header,''), COALESCE(health_check_host,''), COALESCE(enable_compress,0), COALESCE(compress_types,'gzip'),
 		IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0), name, description
 	FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(
 		&existingRule.Protocol, &existingRule.Domain, &existingRule.ListenPort, &existingRule.Strategy,
@@ -1681,7 +1650,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		// -1=NTLM 接管态合法；指针合并（nil=沿用存量）会把存量 -1 带进 TCP
 		// 值域门（rule_features.go TCP 分支拒负值）——切换与同协议编辑双路径
 		// 均命中 400 死端，错误指向用户从未提交的字段。负值一律自愈归零
-		// （0=默认 5s 窗口）；非负值尊重 LB-02 指针合并契约（nil=沿用存量/
+		// （TCP 语义：0 与 -1 均为零窗口=不重试；5s 默认窗口仅属 HTTP）；
+		// 非负值尊重 LB-02 指针合并契约（nil=沿用存量/
 		// 显式值=尊重输入，rules_lb_fixes_test 钉测）——不可无条件归零。
 		if req.TCPTryDuration != nil && *req.TCPTryDuration < 0 {
 			req.TCPTryDuration = &tcpZero
@@ -1787,6 +1757,15 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// （LBH-A-D2，历史删死分支后不再按 nil 判空）。
 	if req.Upstreams == nil {
 		req.Upstreams = oldUpstreams
+	}
+	// LBH79-历史问题.2：同协议 TCP 编辑也必须弃置上游回源域名（HTTP-only
+	// 语义）——此前只在 protocolChanged 分支清理，存量残留会在下方
+	// validateRulePayloadBeforeSave 命中「回源域名仅 HTTP」400，UI 对 TCP
+	// 隐藏该字段，用户无自救路径。协议切换分支的同类清理保留（幂等）。
+	if req.Protocol == "tcp" {
+		for index := range req.Upstreams {
+			req.Upstreams[index].OriginDomain = ""
+		}
 	}
 	if protocolChanged {
 		for index := range req.Upstreams {
@@ -1925,6 +1904,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	switchingFromACME := existingRule.TLSSource == "acme_dns" && req.TLSSource == "manual"
 	if switchingFromACME {
 		req.ACMEConfigID = 0
+		// LBH79-历史问题：与 CreateRule 非 ACME 强制 CAProviderID=0 同口径——
+		// 手动证书不再引用 CA 提供商，残留引用随导出/备份/快照放大。
+		zeroCA := 0
+		req.CAProviderID = &zeroCA
 	}
 
 	// Build dynamic update for lb_rules table
@@ -2027,11 +2010,15 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		query += "block_page_stage3_status = ?, "
 		args = append(args, *req.BlockPageStage3Status)
 	}
-	if req.TLSCert != "" || protocolChanged {
+	// LBH79-历史问题.3：空值=保留存量的语义只适用于 HTTP（手动证书留空=沿用）；
+	// TCP 行经上方 tcpDeadFieldReset 已把 TLSCert/TLSKey 置空，但同协议编辑
+	// 时两条件此前皆假 → DELETE 列不写，死证书/私钥材料永久滞留并随导出/
+	// 快照放大。TCP 恒写（值为归一后的空串）。
+	if req.TLSCert != "" || protocolChanged || req.Protocol == "tcp" {
 		query += "tls_cert = ?, "
 		args = append(args, req.TLSCert)
 	}
-	if req.TLSKey != "" || protocolChanged {
+	if req.TLSKey != "" || protocolChanged || req.Protocol == "tcp" {
 		query += "tls_key = ?, "
 		args = append(args, req.TLSKey)
 	}
@@ -2188,6 +2175,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
+		// LBH79-历史问题：commit 失败必须同时回滚 IP 名单投影（历史问题 同族）。
+		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
 		services.Logf("error", "UpdateRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则更新失败: " + errors.Join(err, restoreErr).Error()})
@@ -2345,15 +2334,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 		resumedValidJob := false
 		if wasReEnabled && jobErr == nil {
-			var renewalDays int
-			if err := db.DB.QueryRow("SELECT COALESCE(cert_renewal_days,30) FROM global_config WHERE id=1").Scan(&renewalDays); err != nil {
-				restoreErr := restoreACMEState()
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取证书续签配置失败: " + errors.Join(err, restoreErr).Error()})
-				return
-			}
-			if renewalDays <= 0 {
-				renewalDays = 30
-			}
+			// 历史问题（历史）：续期天数读取单源（services.GetCertRenewalDays）——
+			// 原内联 COALESCE(cert_renewal_days,30) 与读侧零兜底口径分裂。
+			renewalDays := services.GetCertRenewalDays()
 			var expiryPtr *time.Time
 			if jobExpiresAt.Valid {
 				expiry := jobExpiresAt.Time
@@ -2602,6 +2585,8 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
+		// LBH79-历史问题：commit 失败必须同时回滚 IP 名单投影（历史问题 同族）。
+		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
 		services.Logf("error", "DeleteRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
 		if restoreErr != nil {
@@ -2700,6 +2685,13 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		if rule.TCPTryInterval < 0 {
 			rule.TCPTryInterval = 0
 		}
+	} else if rule.Protocol == "http" {
+		// LBH79-历史问题.4：HTTP 方向反向归一——Create/Update 已清零 TCP-only
+		// 字段（tcp_health_check_port/tcp_proxy_protocol），复制路径此前只处理
+		// TCP 源行，HTTP 源行的残留值被原样放大到副本。tcp_try_* 是 http/tcp
+		// 共用字段，不在此列。
+		rule.TCPProxyProtocol = false
+		rule.TCPHealthCheckPort = 0
 	}
 
 	// 历史问题（历史）：复制前把源行投影为共享保存输入并执行字段层校验
@@ -2770,21 +2762,10 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		return
 	}
 
-	// 历史问题 发现5：副本原样继承 acme_config_id/ca_provider_id——源规则携带悬挂/
-	// 已禁用引用时必须先 400 点名源规则，否则副本可经 EnableRule 投入运行
-	// （历史问题 发现1 修复前）或持续携带坏引用（修复后 EnableRule 才会拦）。
-	if err := validateRuleACMEReferences(acmeReferenceInput{
-		EnableTLS: rule.EnableTLS, TLSSource: rule.TLSSource,
-		ACMEConfigID: rule.ACMEConfigID, CAProviderID: rule.CAProviderID,
-	}); err != nil {
-		var validationErr *configValidationError
-		if errors.As(err, &validationErr) {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("源规则 %s（%s）：%s", rule.Name, caddyID, validationErr.Error())})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "校验源规则 ACME 引用失败: " + err.Error()})
-		return
-	}
+	// 历史问题 发现5 的 ACME 引用校验已由上方 validateDuplicateRulePayload →
+	// validateRulePayloadBeforeSave（共享 validateRuleACMEReferences）覆盖并
+	// 点名源规则；LBH79-历史问题：此处原有一次同条件/同文案的重复调用（永不
+	// 产生新结果，且重复查库），删除。
 
 	// LBH-A-1（历史 历史问题）：源行启用上游池混布同检——保存门只拦新建/更新
 	// 载荷，复制是对存量混布行（69 轮修复前落库/直改 DB）的旁路放大通道。
@@ -3101,6 +3082,13 @@ func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 		return
 	}
 	req.RuleIDs = dedupedRuleIDs
+	// LBH79-历史问题：规则条数上限——逐规则 UPDATE 在单事务/单锁内执行，
+	// 请求体只受全局 128MB 上限约束，认证管理员可长时间占用 caddyOpMu。
+	const maxBatchRuleBlockPages = 500
+	if len(req.RuleIDs) > maxBatchRuleBlockPages {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("单次批量设置最多 %d 条规则（当前 %d 条）", maxBatchRuleBlockPages, len(req.RuleIDs))})
+		return
+	}
 	if err := validateStageBlockPageRef(req.BlockPageStage1ID, req.BlockPageStage1Status, "阶段 1（IP 访问控制/地域拦截）"); err != nil {
 		var validationErr *configValidationError
 		if errors.As(err, &validationErr) {
@@ -3132,16 +3120,42 @@ func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 	bound := 0
 	unchanged := 0
 	skipped := make([]skippedRule, 0)
-	for _, ruleCaddyID := range req.RuleIDs {
-		// 历史问题:阶段页 4 列仅 http 渲染消费——非 http(tcp)先查后跳过不 UPDATE
-		// (与 batch-bind 的 TCP 跳过同文案同口径),仅不存在记「规则不存在」。
-		var ruleExists int
-		var ruleProtocol string
-		if err := tx.QueryRowContext(c.Request.Context(), "SELECT COUNT(*), COALESCE(MAX(protocol),'') FROM lb_rules WHERE caddy_id=?", ruleCaddyID).Scan(&ruleExists, &ruleProtocol); err != nil {
+	// LBH79-历史问题：一次 IN 预取协议，替代逐规则 SELECT（2N → N+1 次 SQL）。
+	placeholders := make([]string, len(req.RuleIDs))
+	prefetchArgs := make([]any, len(req.RuleIDs))
+	for i, ruleID := range req.RuleIDs {
+		placeholders[i] = "?"
+		prefetchArgs[i] = ruleID
+	}
+	protocolByRule := make(map[string]string, len(req.RuleIDs))
+	prefetchRows, err := tx.QueryContext(c.Request.Context(),
+		"SELECT caddy_id, COALESCE(protocol,'') FROM lb_rules WHERE caddy_id IN ("+strings.Join(placeholders, ",")+")", prefetchArgs...)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+		return
+	}
+	for prefetchRows.Next() {
+		var caddyID, protocol string
+		if err := prefetchRows.Scan(&caddyID, &protocol); err != nil {
+			prefetchRows.Close()
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 			return
 		}
-		if ruleExists == 0 {
+		protocolByRule[caddyID] = protocol
+	}
+	if err := prefetchRows.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+		return
+	}
+	if err := prefetchRows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+		return
+	}
+	for _, ruleCaddyID := range req.RuleIDs {
+		// 历史问题:阶段页 4 列仅 http 渲染消费——非 http(tcp)先查后跳过不 UPDATE
+		// (与 batch-bind 的 TCP 跳过同文案同口径),仅不存在记「规则不存在」。
+		ruleProtocol, exists := protocolByRule[ruleCaddyID]
+		if !exists {
 			skipped = append(skipped, skippedRule{ruleCaddyID, "规则不存在"})
 			continue
 		}
@@ -3190,9 +3204,11 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 	var originalEnabled, enableTLS, tlsHTTPRedirect bool
 	var ruleProtocol, ruleDomain, tlsSource string
 	var rulePort, caProviderID int
+	var originalUpdatedBy sql.NullInt64
+	var originalUpdatedAt sql.NullString
 	err := db.DB.QueryRow(`SELECT IIF(enabled IN ('1',1),1,0), COALESCE(protocol,''), COALESCE(domain,''), listen_port,
-		COALESCE(tls_source,''), COALESCE(enable_tls,0), COALESCE(tls_http_redirect,0), COALESCE(ca_provider_id,0)
-		FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(&originalEnabled, &ruleProtocol, &ruleDomain, &rulePort, &tlsSource, &enableTLS, &tlsHTTPRedirect, &caProviderID)
+		COALESCE(tls_source,''), COALESCE(enable_tls,0), COALESCE(tls_http_redirect,0), COALESCE(ca_provider_id,0), updated_by, updated_at
+		FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(&originalEnabled, &ruleProtocol, &ruleDomain, &rulePort, &tlsSource, &enableTLS, &tlsHTTPRedirect, &caProviderID, &originalUpdatedBy, &originalUpdatedAt)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "规则不存在"})
 		return
@@ -3201,6 +3217,9 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则失败"})
 		return
 	}
+	// LBH79-历史问题：补偿需要恢复启用 UPDATE 改写前的原始域名/操作者——
+	// ruleDomain 随后被规范化，原值必须单独留存。
+	originalDomain := ruleDomain
 	if ruleProtocol == "http" && ruleDomain != "" {
 		ruleDomain, err = db.CanonicalDomains(ruleDomain)
 		if err != nil {
@@ -3305,6 +3324,8 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
+		// LBH79-历史问题：commit 失败必须同时回滚 IP 名单投影（历史问题 同族）。
+		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则启用失败: " + errors.Join(err, restoreErr).Error()})
 		return
@@ -3321,7 +3342,11 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		if isACME {
 			caddyErr = h.restoreImportRuntime(runtimeSnapshot)
 		}
-		if _, dbErr = db.DB.Exec("UPDATE lb_rules SET enabled = ?, updated_at = datetime('now') WHERE caddy_id = ?", originalEnabled, caddyID); dbErr != nil {
+		// LBH79-历史问题：补偿必须恢复启用 UPDATE 改写过的全部列——此前只恢复
+		// enabled，updated_at/updated_by 指向未生效的启用尝试，规范化域名也
+		// 被留在行上。
+		if _, dbErr = db.DB.Exec("UPDATE lb_rules SET enabled = ?, domain = ?, updated_by = ?, updated_at = COALESCE(NULLIF(?, ''), datetime('now')) WHERE caddy_id = ?",
+			originalEnabled, originalDomain, originalUpdatedBy, originalUpdatedAt.String, caddyID); dbErr != nil {
 			dbErr = fmt.Errorf("恢复规则启用状态: %w", dbErr)
 		}
 		if isACME {
@@ -3330,11 +3355,18 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		return errors.Join(caddyErr, dbErr, jobsErr)
 	}
 	failEnable := func(message string) {
+		// LBH79-历史问题：启用端点为 Explicit 审计策略，中间件不兜底；此前
+		// 提交后的失败（CA 解析/任务读取/Resume 0 行等）只回滚无操作审计，
+		// 运维无法追溯谁在何时启用了哪条规则以及失败原因。
 		if restoreErr := restoreEnabledState(); restoreErr != nil {
 			services.Logf("error", "问题: EnableRule compensation failed for caddy_id=%s: %v", caddyID, restoreErr)
+			recordAudit(c, "启用失败", "负载规则", services.FormatAuditDetail(
+				services.AuditRulePart(caddyID), message, "补偿恢复失败: "+restoreErr.Error(), services.AuditResultPart("failure")))
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: message + "；规则与 Caddy 恢复失败: " + restoreErr.Error()})
 			return
 		}
+		recordAudit(c, "启用失败", "负载规则", services.FormatAuditDetail(
+			services.AuditRulePart(caddyID), message, services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: message})
 	}
 
@@ -3360,17 +3392,10 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 			failEnable("读取证书任务失败")
 			return
 		}
-		var renewalDays int
-		if err := db.DB.QueryRow("SELECT COALESCE(cert_renewal_days,30) FROM global_config WHERE id=1").Scan(&renewalDays); err != nil {
-			failEnable("读取证书续签配置失败")
-			return
-		}
-		// 历史问题 C-N6：与周期续签路径同口径兜底——导入物可落 0/负值（导入侧只
-		// 钳上限），ResolveEnableCertJobAction 对 renewalDays<=0 的 Keep 窗口
-		// 判定会把刚签发的证书立即判为待续签。
-		if renewalDays <= 0 {
-			renewalDays = 30
-		}
+		// 历史问题（历史）：续期天数读取单源（services.GetCertRenewalDays）——
+		// 无效值降级与 error 级留痕统一由 helper 承担（历史问题 C-N6 的 <=0 兜底语义
+		// 保持：helper 对 <=0 返回默认 30 并留痕）。
+		renewalDays := services.GetCertRenewalDays()
 		var expiryPtr *time.Time
 		if jobExpiresAt.Valid {
 			expiry := jobExpiresAt.Time
@@ -3539,6 +3564,8 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
+		// LBH79-历史问题：commit 失败必须同时回滚 IP 名单投影（历史问题 同族）。
+		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则禁用失败: " + errors.Join(err, restoreErr).Error()})
 		return

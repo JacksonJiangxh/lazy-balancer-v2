@@ -160,7 +160,7 @@ func TestToolsListHidesWriteTools_forReadOnlyAPIKey(t *testing.T) {
 			dashboardVisible = true
 		}
 		// ApiMcp-新1:读探测 POST 工具对只读 Key 合法可见(单一事实源
-		// ReadOnlyProbeTools，历史 历史问题 收敛；历史问题 后 4 项)
+		// ReadOnlyProbeTools，历史 历史问题 收敛；历史问题 与 U04a2-历史问题 后 3 项)
 		for _, spec := range tools {
 			if spec.name == tool.Name && spec.method != http.MethodGet {
 				if _, probe := ReadOnlyProbeTools[tool.Name]; !probe {
@@ -199,6 +199,44 @@ func TestResolveAPIKeyReadOnly_returnsPersistedPermission(t *testing.T) {
 	// Then
 	if err != nil || !readOnly {
 		t.Fatalf("readOnly=%v err=%v", readOnly, err)
+	}
+}
+
+func TestResolveAPIKeyReadOnly_requiresMatchingIndexedPrefix(t *testing.T) {
+	// Given：正确 hash 但错误 prefix 的带外脏行；修复前单列 hash 查询会误命中。
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+	apiKey := "lb_sk_indexed-read-only"
+	hash := sha256.Sum256([]byte(apiKey))
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (94,'mcp-indexed','x','admin',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO api_keys (name,key_hash,key_prefix,created_by,is_enabled,mcp_enabled,read_only) VALUES ('mcp-indexed',?,?,94,1,1,1)`, fmt.Sprintf("%x", hash[:]), "lb_sk_wrong!"); err != nil {
+		t.Fatal(err)
+	}
+
+	// When / Then：prefix 必须与 hash 同时匹配（命中复合索引左前缀）。
+	readOnly, err := resolveAPIKeyReadOnly(apiKey)
+	if err == nil || readOnly {
+		t.Fatalf("wrong-prefix row resolved readOnly=%v err=%v, want key not found", readOnly, err)
+	}
+	// 回归形状：纠正 prefix 后同一行正常可见。
+	if _, err := db.DB.Exec(`UPDATE api_keys SET key_prefix=?`, apiKey[:12]); err != nil {
+		t.Fatal(err)
+	}
+	readOnly, err = resolveAPIKeyReadOnly(apiKey)
+	if err != nil || !readOnly {
+		t.Fatalf("valid indexed key readOnly=%v err=%v, want true/nil", readOnly, err)
+	}
+	// 边界形状：短 key 不得因取 12 字节前缀而 panic。
+	if readOnly, err = resolveAPIKeyReadOnly("short"); err == nil || readOnly {
+		t.Fatalf("short key readOnly=%v err=%v, want not found", readOnly, err)
 	}
 }
 

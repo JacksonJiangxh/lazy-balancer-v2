@@ -393,7 +393,7 @@
       </el-form>
       <div class="auto-backup-list-head">
         <el-text type="info" size="small">
-          上次执行：{{ autoBackupLastRunLabel }}<template v-if="autoBackupNextRunLabel"> · 下次备份：{{ autoBackupNextRunLabel }}</template>
+          上次成功备份：{{ autoBackupLastRunLabel }}<template v-if="autoBackupNextRunLabel"> · 下次备份：{{ autoBackupNextRunLabel }}</template>
         </el-text>
       </div>
       <div class="auto-backup-list">
@@ -640,6 +640,7 @@ interface AutoBackupSettingsResponse {
   keep: number
   sections: string[]
   last_run: string | null
+  last_success_at: string | null
   backups: AutoBackupRow[]
 }
 
@@ -720,8 +721,8 @@ const openAutoBackupDialog = (): void => {
   autoBackupVisible.value = true
 }
 
-const fetchAutoBackup = async (): Promise<void> => {
-  autoBackupLoading.value = true
+const fetchAutoBackup = async (quiet = false): Promise<void> => {
+  if (!quiet) autoBackupLoading.value = true
   try {
     const res = await request.get<{ data: AutoBackupSettingsResponse }>('/settings/auto-backup', { silent: true })
     const d = res.data
@@ -734,11 +735,13 @@ const fetchAutoBackup = async (): Promise<void> => {
     }
     autoBackupSections.value = d.sections?.length ? normalizeBackupSectionKeys(d.sections) : BACKUP_SECTIONS.map((s) => s.key)
     autoBackupRows.value = d.backups || []
-    autoBackupLastRun.value = d.last_run ?? null
+    // last_run 是调度水位线（off→on=now），不是执行事实；「上次成功备份」
+    // 只认最近一次 success 行（last_success_at）——否则启用后即谎报「刚刚」。
+    autoBackupLastRun.value = d.last_success_at ?? null
   } catch {
     // silent：打开弹框时拉取失败保持空态，全局拦截器已提示
   } finally {
-    autoBackupLoading.value = false
+    if (!quiet) autoBackupLoading.value = false
   }
 }
 
@@ -776,13 +779,28 @@ const runAutoBackupNow = async (): Promise<void> => {
     ElMessage.warning('备份范围至少需选择一个分类')
     return
   }
+  // 异步契约（历史问题）：202 只代表已受理，不代表完成——记录基线 id，轮询
+  // 备份列表直到出现本次新增的 manual 行（成功/失败都算落定）或 60s 超时。
+  const baselineId = autoBackupRows.value.reduce((max, row) => Math.max(max, Number(row.id) || 0), 0)
   autoBackupRunning.value = true
   try {
     await request.post('/auto-backup/run')
-    mfaAwareSuccess('手动备份完成')
-    await fetchAutoBackup()
+    mfaAwareSuccess('备份已开始，完成后将自动刷新列表')
+    const deadline = Date.now() + 60000
+    let completed: AutoBackupRow | undefined
+    while (autoBackupVisible.value && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+      await fetchAutoBackup(true)
+      completed = autoBackupRows.value.find((row) => Number(row.id) > baselineId && row.trigger_type === 'manual')
+      if (completed) break
+    }
+    if (completed?.status === 'success') {
+      mfaAwareSuccess('手动备份完成')
+    } else if (completed) {
+      ElMessage.error(completed.message || '手动备份失败')
+    }
   } catch {
-    // 全局拦截器已提示
+    // 全局拦截器已提示（409=已有备份在执行）
   } finally {
     autoBackupRunning.value = false
   }

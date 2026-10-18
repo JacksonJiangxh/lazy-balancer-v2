@@ -154,7 +154,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 
 	var cleanupErr error
 	var failed []ownedRecord
-	deleteOne := func(recordID uint64) error {
+	deleteOne := func(recordID uint64, value string) error {
 		if err := p.deleteRecord(ctx, zone, recordID); err != nil {
 			if ctx.Err() != nil {
 				// 保留原始 provider 错误（历史 历史问题：整体覆写会丢失具体
@@ -165,7 +165,9 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 				// 历史问题：failed 的唯一消费点是下方 ownership==nil 的 owned
 				// 回填；ownership 模式下失败条目由 ownership 留存（删除失败
 				// 不 Remove），不再写入死存储。
-				failed = append(failed, ownedRecord{recordID: recordID})
+				// 历史问题（历史）：回填必须保留 challenge value——后续按值
+				// 清理（CleanUpValue）以 entry.value 过滤，空值条目永不被选中重试。
+				failed = append(failed, ownedRecord{recordID: recordID, value: value})
 			}
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("DeleteRecord failed: %w", err))
 			return err
@@ -183,7 +185,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 			// its ownership entry (the DNS record may still exist), but an
 			// earlier miss must not skip Remove for records that WERE
 			// deleted — that orphans them until self-heal.
-			if deleteOne(recordID) != nil {
+			if deleteOne(recordID, record.Value) != nil {
 				continue
 			}
 			cleanupErr = errors.Join(cleanupErr, p.ownership.Remove(record))
@@ -197,7 +199,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 		delete(p.owned, key)
 		p.mu.Unlock()
 		for _, entry := range fallback {
-			if deleteOne(entry.recordID) != nil {
+			if deleteOne(entry.recordID, entry.value) != nil {
 				p.mu.Lock()
 				p.owned[key] = append(p.owned[key], entry)
 				p.mu.Unlock()
@@ -205,7 +207,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 		}
 	} else {
 		for _, entry := range memorySelected {
-			deleteOne(entry.recordID)
+			deleteOne(entry.recordID, entry.value)
 		}
 	}
 	if p.ownership == nil && len(failed) > 0 {

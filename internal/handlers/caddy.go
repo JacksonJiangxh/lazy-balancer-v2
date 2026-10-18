@@ -804,10 +804,9 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 }
 
 func (h *Handlers) ValidateConfig(c *gin.Context) {
-	// 历史问题 二十六次 W1-8：CLI 不可用回退路径仍执行真实 /load，保持与其他写
-	// 端点共享 caddyOpMu。
-	h.caddyOpMu.Lock()
-	defer h.caddyOpMu.Unlock()
+	// LBH79-历史问题：先读请求体再取写锁（UpdateConfig/PutCaddyConfig 同序）——
+	// 已认证客户端的慢速/chunked 上传此前在持有 caddyOpMu 时读 body，会阻塞
+	// 全部规则/配置写与后台强制重载。全局 body 上限可配到 4096MB，窗口可观。
 	var configData map[string]interface{}
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -821,6 +820,10 @@ func (h *Handlers) ValidateConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的配置 JSON"})
 		return
 	}
+	// 历史问题 二十六次 W1-8：CLI 不可用回退路径仍执行真实 /load，保持与其他写
+	// 端点共享 caddyOpMu。
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	// 2026-09-06 裁定 ④' 收口：真 validate-only（caddy CLI，零运行时扰动），
 	// 与 apidocs「不触发 Caddy」的既有承诺对齐；CLI 不可用回退 历史问题 C-N3-c
 	// 的 load+回弹口径。
@@ -833,16 +836,30 @@ func (h *Handlers) ValidateConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "配置验证失败", Data: err.Error()})
 		return
 	}
-	// CLI 校验器不可用回退：历史问题 C-N3-c——/load 无 validate-only 语义，校验
-	// 成功即用户配置已加载为运行配置，立即回弹 DB 权威全量配置收敛窗口。
-	if err := h.caddyService.ValidateConfig(configData); err != nil {
-		recordAudit(c, "校验失败", "Caddy配置", services.FormatAuditDetail("配置校验", services.AuditResultPart("failure")))
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "配置验证失败", Data: err.Error()})
+	// CLI 校验器不可用回退：历史问题 C-N3-c——/load 无 validate-only 语义，候选
+	// 载荷会成为运行配置。LBH79-历史问题：候选可能已被 Caddy 加载后请求才
+	// 断连/超时（客户端看到传输错误），因此**无论 ValidateConfig 成功或
+	// 失败**都必须回弹 DB 权威全量配置；只有回弹成功才允许把错误归类为
+	// 「配置无效」（400），传输/系统错误映射 500，回弹失败一律 500 并
+	// join 双错误（与 UpdateConfig/PutCaddyConfig 的失败快照恢复同口径）。
+	validateErr := h.caddyService.ValidateConfig(configData)
+	restoreErr := h.caddyService.ApplyConfig(services.GenerateCaddyConfig())
+	if restoreErr != nil {
+		joined := errors.Join(validateErr, restoreErr)
+		recordAudit(c, "校验失败", "Caddy配置", services.FormatAuditDetail(
+			"校验回退加载后恢复权威配置失败，运行配置可能停留为校验载荷", joined.Error(), services.AuditResultPart("failure")))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "配置校验后恢复运行配置失败: " + joined.Error()})
 		return
 	}
-	if restoreErr := h.caddyService.ApplyConfig(services.GenerateCaddyConfig()); restoreErr != nil {
-		recordAudit(c, "校验成功", "Caddy配置", services.FormatAuditDetail("配置校验通过，但回弹权威配置失败，运行配置可能停留为校验载荷", services.AuditResultPart("partial")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "配置校验通过，但恢复运行配置失败: " + restoreErr.Error()})
+	if validateErr != nil {
+		recordAudit(c, "校验失败", "Caddy配置", services.FormatAuditDetail("配置校验", validateErr.Error(), services.AuditResultPart("failure")))
+		if services.IsConfigRejected(validateErr) {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "配置验证失败", Data: validateErr.Error()})
+			return
+		}
+		// 传输/超时等系统故障不得伪装成「配置无效」——候选是否被拒未知，
+		// 但运行配置已回弹权威值。
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "配置校验请求失败（运行配置已恢复）: " + validateErr.Error()})
 		return
 	}
 
@@ -921,14 +938,9 @@ func driftSinceText(drift services.ConfigDriftStatus) string {
 }
 
 func formatDriftBanner(missing, extra []string) string {
-	parts := make([]string, 0, 2)
-	if len(missing) > 0 {
-		parts = append(parts, "缺失规则路由: "+strings.Join(missing, "、"))
-	}
-	if len(extra) > 0 {
-		parts = append(parts, "多余规则路由: "+strings.Join(extra, "、"))
-	}
-	return strings.Join(parts, "；")
+	// LBH79-历史问题：文案与长度上限单源在 services（看门狗审计同源）——此处
+	// 仅保留 handler 层命名供既有调用/测试使用。
+	return services.FormatDriftRoutes(missing, extra)
 }
 
 func (h *Handlers) GetCaddyConfig(c *gin.Context) {

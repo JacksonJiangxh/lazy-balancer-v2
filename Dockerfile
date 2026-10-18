@@ -47,14 +47,15 @@ RUN --mount=type=cache,target=/go/pkg/mod \
   [ "$built" -eq 1 ] || { echo ">>> xcaddy build 3 次全部失败" >&2; exit 1; }; \
   [ -f /app/caddy ] || { echo ">>> 构建成功但 /app/caddy 未生成" >&2; exit 1; }
 # 构建期断言：镜像扫描要求的最低依赖版本未被 MVS 抬升到位则直接失败
-# （版本下限：grpc>=v1.83.2、otel>=v1.45、x/net>=v0.58、x/crypto>=v0.56；
-#  cel-go v2.11.7 起随上游 v0.29.2（celmatcher 已适配）；caddydeps 钉同版防传递抬偏，见
-#  caddydeps/go.mod 注释；go version -m 各列以 TAB 分隔，用 awk 的 ge()
+# （版本下限：grpc>=v1.83.2、otel>=v1.45、x/net>=v0.58、x/crypto>=v0.56、
+#  cel.dev/cel-go>=v0.32.0——Caddy v2.11.7 上游同值，caddydeps 钉同版防传递
+#  抬偏；注意模块路径是 cel.dev/cel-go，github.com/google/cel-go 是另一个
+#  模块路径，钉旧路径不参与 MVS）；go version -m 各列以 TAB 分隔，用 awk 的 ge()
 #  做逐段数值化语义比较，不设上限，依赖升到大版本也不会误报。
 #  ge() 的局部变量必须以多余形参声明，否则会覆盖主循环的 i 导致漏检；
 #  且 awk 程序必须保持单行——多行函数体会破坏 RUN 指令解析）
 RUN go version -m /app/caddy | tee /tmp/caddy-mods.txt && \
-    awk -F'\t' 'function ge(v, f,  a, b, av, bv, i) { split(substr(v, 2), a, "."); split(substr(f, 2), b, "."); for (i = 1; i <= 3; i++) { av = a[i] + 0; bv = b[i] + 0; if (av > bv) return 1; if (av < bv) return 0 } return 1 } { for (i = 1; i < NF; i++) { if ($i == "google.golang.org/grpc") ok1 = ge($(i+1), "v1.83.2"); else if ($i == "go.opentelemetry.io/otel") ok2 = ge($(i+1), "v1.45.0"); else if ($i == "golang.org/x/net") ok3 = ge($(i+1), "v0.58.0"); else if ($i == "golang.org/x/crypto") ok4 = ge($(i+1), "v0.56.0") } } END { exit (ok1 && ok2 && ok3 && ok4) ? 0 : 1 }' /tmp/caddy-mods.txt
+    awk -F'\t' 'function ge(v, f,  a, b, av, bv, i) { split(substr(v, 2), a, "."); split(substr(f, 2), b, "."); for (i = 1; i <= 3; i++) { av = a[i] + 0; bv = b[i] + 0; if (av > bv) return 1; if (av < bv) return 0 } return 1 } { for (i = 1; i < NF; i++) { if ($i == "google.golang.org/grpc") ok1 = ge($(i+1), "v1.83.2"); else if ($i == "go.opentelemetry.io/otel") ok2 = ge($(i+1), "v1.45.0"); else if ($i == "golang.org/x/net") ok3 = ge($(i+1), "v0.58.0"); else if ($i == "golang.org/x/crypto") ok4 = ge($(i+1), "v0.56.0"); else if ($i == "cel.dev/cel-go") ok5 = ge($(i+1), "v0.32.0") } } END { exit (ok1 && ok2 && ok3 && ok4 && ok5) ? 0 : 1 }' /tmp/caddy-mods.txt
 
 # Build Go backend
 FROM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS backend
@@ -162,6 +163,9 @@ COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # 443/udp = HTTP/3（QUIC）——Caddy 默认启用，EXPOSE 补全声明（INFRA-历史问题）。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+  CMD wget -q -O /dev/null http://127.0.0.1:8000/health || wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8000/health || exit 1
+
 EXPOSE 80 443 443/udp 8000
 
 ENTRYPOINT ["docker-entrypoint.sh"]

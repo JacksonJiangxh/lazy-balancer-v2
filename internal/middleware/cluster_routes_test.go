@@ -5,9 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -106,6 +110,218 @@ func TestSetupRouter_registers_cluster_contract_and_removes_legacy_routes(t *tes
 		if route == "POST /api/v1/nodes/register" || route == "GET /api/v1/sync/status" || route == "GET /api/v1/sync/config" || route == "POST /api/v1/sync/pull" || route == "POST /api/v1/nodes/:id/heartbeat" {
 			t.Errorf("legacy route remains registered: %s", route)
 		}
+	}
+}
+
+func TestClusterMachineEndpoints_rateLimitBeforeAuthentication(t *testing.T) {
+	// Given：五个 token/registration 机器端点，均携带无效但非空凭证以覆盖 DB 查询路径。
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		header string
+		ip     string
+	}{
+		{name: "registration status", method: http.MethodGet, path: "/api/v1/cluster/register/1/status", header: "X-Registration-Secret", ip: "198.51.100.11:1234"},
+		{name: "snapshot", method: http.MethodGet, path: "/api/v1/cluster/sync/snapshot", header: "X-Cluster-Token", ip: "198.51.100.12:1234"},
+		{name: "waf files", method: http.MethodGet, path: "/api/v1/cluster/sync/waf-files", header: "X-Cluster-Token", ip: "198.51.100.13:1234"},
+		{name: "registration confirm", method: http.MethodPost, path: "/api/v1/cluster/registration/confirm", header: "X-Cluster-Token", ip: "198.51.100.14:1234"},
+		{name: "node report", method: http.MethodPost, path: "/api/v1/cluster/nodes/report", header: "X-Cluster-Token", ip: "198.51.100.15:1234"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			router := newMiddlewareTestRouter(t)
+			// When：同一 IP 连续 30 次无效认证仍按原契约返回 401。
+			for attempt := 1; attempt <= 30; attempt++ {
+				request := httptest.NewRequest(test.method, test.path, nil)
+				request.RemoteAddr = test.ip
+				request.Header.Set(test.header, "invalid-cluster-credential")
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+				if response.Code != http.StatusUnauthorized {
+					t.Fatalf("attempt %d status=%d body=%s, want 401 before limit", attempt, response.Code, response.Body.String())
+				}
+			}
+			// Then：第 31 次必须在认证/DB 查询之前被 429 截断。
+			request := httptest.NewRequest(test.method, test.path, nil)
+			request.RemoteAddr = test.ip
+			request.Header.Set(test.header, "invalid-cluster-credential")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusTooManyRequests || !bytes.Contains(response.Body.Bytes(), []byte("集群机器接口请求过于频繁")) {
+				t.Fatalf("31st status=%d body=%s, want machine-endpoint 429", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestClusterMachineRateLimit_validResponsesDoNotConsumeFailureBudget(t *testing.T) {
+	// Given：六个经同一 NAT 出口的合法节点，各自每 10 秒一次同步（36 请求/分钟）。
+	database, firstToken := newClusterAuthContractDatabase(t)
+	tokens := []string{firstToken}
+	for index := 1; index < 6; index++ {
+		token := fmt.Sprintf("cluster-contract-token-%d", index)
+		hash := sha256.Sum256([]byte(token))
+		if _, err := database.Exec(`INSERT INTO nodes (id,cluster_token_hash,is_approved) VALUES (?,?,1)`, 7+index, hex.EncodeToString(hash[:])); err != nil {
+			t.Fatal(err)
+		}
+		tokens = append(tokens, token)
+	}
+	router := gin.New()
+	router.Use(clusterMachineRateLimit("valid-nat-traffic", clusterCredentialFromToken))
+	router.Use(clusterTokenAuth(database))
+	router.GET("/cluster", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+	// When / Then：成功请求不得消耗认证失败配额，第 31-36 次也不能 429。
+	for attempt := range 36 {
+		request := httptest.NewRequest(http.MethodGet, "/cluster", nil)
+		request.RemoteAddr = "198.51.100.60:1234"
+		request.Header.Set("X-Cluster-Token", tokens[attempt%len(tokens)])
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("attempt %d status=%d body=%s, want valid NAT traffic 204", attempt+1, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestClusterMachineRateLimit_concurrentFailuresReserveAtomically(t *testing.T) {
+	// Given：同一凭证/IP 同时发起 100 个必然 401 的请求，计数进入认证桩的次数。
+	const scope = "concurrent-failure-reservation"
+	var entered, rejected, throttled atomic.Int32
+	router := gin.New()
+	router.Use(clusterMachineRateLimit(scope, clusterCredentialFromToken))
+	router.GET("/cluster", func(c *gin.Context) {
+		entered.Add(1)
+		rejected.Add(1)
+		c.Status(http.StatusUnauthorized)
+	})
+	var waitGroup sync.WaitGroup
+	for range 100 {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			request := httptest.NewRequest(http.MethodGet, "/cluster", nil)
+			request.RemoteAddr = "198.51.100.61:1234"
+			request.Header.Set("X-Cluster-Token", "same-invalid-credential")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code == http.StatusTooManyRequests {
+				throttled.Add(1)
+			}
+		}()
+	}
+	waitGroup.Wait()
+
+	// Then：预算必须在认证前原子预占——恰好30次进入认证并401，其余70次429。
+	if got := entered.Load(); got != 30 || rejected.Load() != 30 || throttled.Load() != 70 {
+		t.Fatalf("authentication attempts=%d rejected=%d throttled=%d, want 30/30/70", entered.Load(), rejected.Load(), throttled.Load())
+	}
+}
+
+func TestClusterMachineRateLimit_failureDoesNotBlockValidCredentialFromSameIP(t *testing.T) {
+	// Given：同一出口先出现 30 次同凭证失败，随后合法节点使用自己的凭证同步。
+	database, validToken := newClusterAuthContractDatabase(t)
+	router := gin.New()
+	router.Use(clusterMachineRateLimit("mixed-credential-traffic", clusterCredentialFromToken))
+	router.Use(clusterTokenAuth(database))
+	router.GET("/cluster", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	const ip = "198.51.100.62:1234"
+	for attempt := range 30 {
+		request := httptest.NewRequest(http.MethodGet, "/cluster", nil)
+		request.RemoteAddr = ip
+		request.Header.Set("X-Cluster-Token", "repeated-invalid-credential")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("invalid attempt %d status=%d body=%s, want 401", attempt+1, response.Code, response.Body.String())
+		}
+	}
+
+	// When
+	request := httptest.NewRequest(http.MethodGet, "/cluster", nil)
+	request.RemoteAddr = ip
+	request.Header.Set("X-Cluster-Token", validToken)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	// Then：失败预算按凭证隔离，IP 宽桶未被 30 次失败打满。
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("valid credential status=%d body=%s after other failures, want 204", response.Code, response.Body.String())
+	}
+}
+
+func TestClusterMachineRateLimit_ignoresHeadersNotUsedByRouteAuth(t *testing.T) {
+	// Given：认证中间件只认其路由凭证来源；攻击者用另一个路由的头做变体。
+	tests := []struct {
+		name      string
+		method    string
+		path      string
+		decoyHead string
+		ip        string
+	}{
+		{name: "cluster token ignores registration header", method: http.MethodGet, path: "/api/v1/cluster/sync/snapshot", decoyHead: "X-Registration-Secret", ip: "198.51.100.71:1234"},
+		{name: "registration ignores cluster token header", method: http.MethodGet, path: "/api/v1/cluster/register/1/status", decoyHead: "X-Cluster-Token", ip: "198.51.100.72:1234"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			router := newMiddlewareTestRouter(t)
+			stableAuthorization := "Bearer " + "invalid-stable-credential"
+			for attempt := 1; attempt <= 30; attempt++ {
+				request := httptest.NewRequest(test.method, test.path, nil)
+				request.RemoteAddr = test.ip
+				// 实际认证固定读取 Bearer；另一头每轮变化，仅是无关噪声。
+				request.Header.Set("Authorization", stableAuthorization)
+				request.Header.Set(test.decoyHead, fmt.Sprintf("noise-%d", attempt))
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+				if response.Code != http.StatusUnauthorized {
+					t.Fatalf("attempt %d status=%d body=%s, want 401", attempt, response.Code, response.Body.String())
+				}
+			}
+			request := httptest.NewRequest(test.method, test.path, nil)
+			request.RemoteAddr = test.ip
+			request.Header.Set("Authorization", stableAuthorization)
+			request.Header.Set(test.decoyHead, "noise-31")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusTooManyRequests {
+				t.Fatalf("31st status=%d body=%s, want 429 based on the credential auth actually reads", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestClusterMachineRateLimit_capacityFullFailsOpen(t *testing.T) {
+	// Given：共享桶容量已满；合法节点的机器认证不得被误报为限流。
+	database, token := newClusterAuthContractDatabase(t)
+	loginRateBuckets.Lock()
+	savedEntries := loginRateBuckets.entries
+	loginRateBuckets.entries = make(map[string]*loginRateBucket)
+	for index := range 1024 {
+		loginRateBuckets.entries[fmt.Sprintf("machine-cap-%d", index)] = &loginRateBucket{until: time.Now().Add(time.Minute), count: 1}
+	}
+	loginRateBuckets.Unlock()
+	t.Cleanup(func() {
+		loginRateBuckets.Lock()
+		loginRateBuckets.entries = savedEntries
+		loginRateBuckets.Unlock()
+	})
+	router := gin.New()
+	router.Use(clusterMachineRateLimit("capacity-full", clusterCredentialFromToken))
+	router.Use(clusterTokenAuth(database))
+	router.GET("/cluster", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	request := httptest.NewRequest(http.MethodGet, "/cluster", nil)
+	request.RemoteAddr = "198.51.100.73:1234"
+	request.Header.Set("X-Cluster-Token", token)
+	response := httptest.NewRecorder()
+
+	// When
+	router.ServeHTTP(response, request)
+
+	// Then：容量满按既有 fail-open 语义放行，而不是配额满的 429。
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("capacity-full valid request status=%d body=%s, want 204", response.Code, response.Body.String())
 	}
 }
 

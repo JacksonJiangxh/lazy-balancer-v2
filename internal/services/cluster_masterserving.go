@@ -18,7 +18,7 @@ package services
 
 import (
 	"context"
-	"strings"
+	"database/sql"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -46,6 +46,11 @@ type masterServingWatch struct {
 func masterSyncServingLifecycleRun(rc taskengine.RunContext) error {
 	ctx, cancel := context.WithCancel(rc.Ctx)
 	defer cancel()
+	// 启动可见性：零噪音口径下全绿只在小时级心跳落一条，刚启动/刚切角色
+	// 时日志面板会长时间只有 [start]。这里每次换代只写一次巡检参数，
+	// 不逐轮写（内部周期不属于任务调度节奏）。
+	TaskLogf("cluster-sync", "serving", "主节点巡检启动：每 %d 秒一轮，全绿时每 %d 轮心跳一次",
+		int(masterSyncInspectInterval.Seconds()), masterSyncHeartbeatRounds)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -81,10 +86,10 @@ func masterSyncServingLoop(ctx context.Context) {
 }
 
 type masterServingNode struct {
-	id      int64
-	name    string
-	seenRaw string
-	version int
+	id       int64
+	name     string
+	lastSeen sql.NullTime
+	version  int
 }
 
 // masterSyncServingRound 执行一轮巡检（facts 读取→异常判定→零噪音落日志）。
@@ -98,6 +103,12 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	if db.DB == nil {
 		return
 	}
+	// 历史问题-07：提升后 pin 清理失败的重试挂巡检周期。此前唯一重试点是
+	// Snapshot()（从节点 Pull）入口——刚提升、无从节点的主节点永不重试，
+	// 旧主节点 pin 文件与「清理失败」审计长期残留（进程重启连内存态也丢）。
+	for _, service := range clusterServicesFor(db.DB) {
+		service.retryPendingPinCleanup()
+	}
 	var clusterVersion, syncInterval int
 	// 历史问题-01（历史）：离线阈值跟随全局同步间隔——sync_interval 与
 	// cluster_sync 同口径读 global_config（COALESCE 60 兜底）；nodes.sync_interval
@@ -109,7 +120,7 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 		return
 	}
 	rows, err := db.DB.QueryContext(ctx,
-		`SELECT id, COALESCE(name,''), COALESCE(last_seen,''), COALESCE(reported_version,0)
+		`SELECT id, COALESCE(name,''), last_seen, COALESCE(reported_version,0)
 		 FROM nodes WHERE is_approved=1 AND mode='slave'`)
 	if err != nil {
 		TaskLogfWarn("cluster-sync", "serving", "巡检失败：读取节点表失败（下一轮重试）：%v", err)
@@ -118,9 +129,16 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	var nodes []masterServingNode
 	for rows.Next() {
 		var n masterServingNode
-		if err := rows.Scan(&n.id, &n.name, &n.seenRaw, &n.version); err == nil {
-			nodes = append(nodes, n)
+		// 历史问题-02：last_seen 直接扫描为 sql.NullTime——与 Nodes()/票据路径
+		// 同源（驱动按 DATETIME 声明解析），不再维护第二套手写布局表。不可解析
+		// 的脏值不得静默降级为「从未上报」假离线：整轮显性告警并跳过（下一轮
+		// 重试），与 rows.Err 同口径。
+		if err := rows.Scan(&n.id, &n.name, &n.lastSeen, &n.version); err != nil {
+			rows.Close()
+			TaskLogfWarn("cluster-sync", "serving", "巡检失败：读取节点行失败（last_seen 无法解析或列型不符，下一轮重试）：%v", err)
+			return
 		}
+		nodes = append(nodes, n)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -137,12 +155,12 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	threshold := nodeOfflineThreshold(syncInterval)
 	for _, n := range nodes {
 		seen[n.id] = true
-		lastSeen := parseNodeLastSeen(n.seenRaw)
-		if lastSeen.IsZero() || now.Sub(lastSeen) > threshold {
+		lastSeen := n.lastSeen.Time
+		if !n.lastSeen.Valid || now.Sub(lastSeen) > threshold {
 			offlineCount++
 			if !w.offlineAlerted[n.id] {
 				w.offlineAlerted[n.id] = true
-				if lastSeen.IsZero() {
+				if !n.lastSeen.Valid {
 					TaskLogfWarn("cluster-sync", "serving", "从节点 %s 离线：从未上报（超时阈值 %d 秒）", n.name, int(threshold.Seconds()))
 				} else {
 					TaskLogfWarn("cluster-sync", "serving", "从节点 %s 离线：最后上报 %s（超时阈值 %d 秒）",
@@ -196,17 +214,5 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	}
 }
 
-// parseNodeLastSeen 兼容 modernc 驱动 time.Time 落库格式与 datetime('now')
-// 字符串格式（写侧 cluster_status.go 传 now.UTC()；测试/手工种子常用整秒串）。
-func parseNodeLastSeen(s string) time.Time {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return time.Time{}
-	}
-	for _, layout := range []string{"2006-01-02 15:04:05.999999999-07:00", "2006-01-02 15:04:05", time.RFC3339} {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t
-		}
-	}
-	return time.Time{}
-}
+// （历史问题-02：原手工 parseNodeLastSeen 三布局解析已删除——last_seen 统一由
+// 驱动按 DATETIME 声明解析（sql.NullTime），与 Nodes()/票据路径同源。）

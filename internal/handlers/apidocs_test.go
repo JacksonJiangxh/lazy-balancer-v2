@@ -382,8 +382,8 @@ func TestAPIDocRoutes_round41_documentation_contracts(t *testing.T) {
 	}
 	tools := routes["GET /mcp/tools"].Description
 	// 历史问题（历史）：read_only 是「对只读 Key 可用」的能力语义，与
-	// method==GET 不等价——描述必须点名 export_config 例外与 4 个读探测
-	// POST，并逐工具钉死分类（弱子串断言曾把相反语义钉住）。
+	// method==GET 不等价——描述必须点名 export_config 例外与读探测 POST，
+	// 并逐工具钉死分类（弱子串断言曾把相反语义钉住）。
 	for _, fragment := range []string{"read_only", "只读 API Key", "export_config"} {
 		if !strings.Contains(tools, fragment) {
 			t.Errorf("GET /mcp/tools description lacks %q: %q", fragment, tools)
@@ -393,11 +393,12 @@ func TestAPIDocRoutes_round41_documentation_contracts(t *testing.T) {
 		t.Errorf("GET /mcp/tools description retains stale HTTP-semantics read_only: %q", tools)
 	}
 	readOnlyProbes := map[string]bool{
-		"test_ca_provider":  true,
 		"parse_certificate": true, "validate_import": true, "preview_config": true,
 	}
 	// 历史问题（历史）：test_certificate_config 会写 DNS TXT 验证记录，
 	// 已移出只读探测集——对只读 Key 不可见（工具保留给管理员）。
+	// U04a2-历史问题（历史）：test_ca_provider 同理移出（ZeroSSL 缺 EAB 时
+	// 会真实写 ca_providers.credentials）。
 	specs := mcpserver.ListToolSpecs()
 	if len(specs) == 0 {
 		t.Fatal("ListToolSpecs returned no tools")

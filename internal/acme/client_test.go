@@ -427,17 +427,33 @@ func TestNewClientRetryBackoff_curve(t *testing.T) {
 		t.Fatal("RetryBackoff not configured")
 	}
 
-	// When/Then：n=0..6 → 1,2,4,8,10,10,10 秒
-	for n, want := range []time.Duration{
+	// When/Then：n=0..6 基线 1,2,4,8,10,10,10 秒 + 0~1s 抖动（历史问题：多规则
+	// 并发签发不得在同一 CA 5xx 窗口以相同延迟同步重试）。
+	assertCurve := func(n int, base time.Duration) {
+		t.Helper()
+		for range 20 {
+			got := backoff(n, nil, nil)
+			if got < base || got > base+time.Second {
+				t.Fatalf("backoff(n=%d)=%v, want [%v, %v]（基线 + 0~1s 抖动）", n, got, base, base+time.Second)
+			}
+		}
+	}
+	for n, base := range []time.Duration{
 		1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second,
 		10 * time.Second, 10 * time.Second, 10 * time.Second,
 	} {
-		if got := backoff(n, nil, nil); got != want {
-			t.Fatalf("backoff(n=%d)=%v, want %v", n, got, want)
-		}
+		assertCurve(n, base)
 	}
-	if got := backoff(2, nil, &http.Response{StatusCode: http.StatusInternalServerError}); got != 4*time.Second {
-		t.Fatalf("backoff(n=2, 500)=%v, want 4s（非 429 响应同样走指数曲线）", got)
+	// 抖动必须真实存在（否则多任务仍在同一 ms 同步重试）。
+	distinct := map[time.Duration]struct{}{}
+	for range 10 {
+		distinct[backoff(1, nil, nil)] = struct{}{}
+	}
+	if len(distinct) < 2 {
+		t.Fatal("backoff 无抖动：10 次采样恒等（thundering herd 未消除）")
+	}
+	if got := backoff(2, nil, &http.Response{StatusCode: http.StatusInternalServerError}); got < 4*time.Second || got > 5*time.Second {
+		t.Fatalf("backoff(n=2, 500)=%v, want [4s,5s]（非 429 响应同样走指数曲线）", got)
 	}
 
 	// 429：返回 0 立即放弃库内重试（waiting_ca 记账语义，保持不变）

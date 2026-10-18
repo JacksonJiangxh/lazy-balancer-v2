@@ -63,10 +63,32 @@ func RuntimeAdminTLSChanged(cfg AdminTLSConfig) bool {
 	return *v != fingerprintAdminTLS(cfg)
 }
 
+// LoadAdminTLSConfig 是只读消费面的降级变体：查询失败 warn 后按 selfsigned
+// 默认形态返回（Get/启动/集群比较对可用性敏感，一次读失败不中断）。写路径
+// 与备份合并路径必须使用 LoadAdminTLSConfigE——降级默认值不可作为读-改-写
+// 基线（U04d-04）。
 func LoadAdminTLSConfig() AdminTLSConfig {
+	if db.DB == nil {
+		return AdminTLSConfig{Mode: "selfsigned"}
+	}
+	cfg, err := LoadAdminTLSConfigE()
+	if err != nil {
+		// 历史问题-4：查询失败不得无声吞掉——warn 留痕后按默认形态返回（API
+		// 形态不变；db nil 分支属启动窗口正常路径不告警）。
+		Logf("warn", "LoadAdminTLSConfig: query failed, falling back to selfsigned default: %v", err)
+		return AdminTLSConfig{Mode: "selfsigned"}
+	}
+	return cfg
+}
+
+// LoadAdminTLSConfigE 是写/合并路径的严格变体（U04d-04）：读取失败（db 未
+// 初始化、查询错误、行缺失）返回 error。调用方必须中止写操作——把降级默认
+// 值当现有配置合并，会在「本次 SELECT 失败 + 随后 UPDATE 成功」的时序里把已
+// 上传证书/私钥改写为空，且接口仍可能返回成功。
+func LoadAdminTLSConfigE() (AdminTLSConfig, error) {
 	cfg := AdminTLSConfig{Mode: "selfsigned"}
 	if db.DB == nil {
-		return cfg
+		return cfg, fmt.Errorf("数据库未初始化")
 	}
 	var enabled int
 	var mode, cert, key string
@@ -74,16 +96,13 @@ func LoadAdminTLSConfig() AdminTLSConfig {
 		COALESCE(admin_tls_cert,''), COALESCE(admin_tls_key,'')
 		FROM global_config WHERE id=1`).Scan(&enabled, &mode, &cert, &key)
 	if err != nil {
-		// 历史问题-4：查询失败不得无声吞掉——一次性 warn 留痕后按默认形态返回
-		//（API 形态不变，4 消费点无感；db nil 分支属启动窗口正常路径不告警）。
-		Logf("warn", "LoadAdminTLSConfig: query failed, falling back to selfsigned default: %v", err)
-		return cfg
+		return cfg, fmt.Errorf("读取管理面板 HTTPS 配置失败: %w", err)
 	}
 	cfg.Enabled = enabled == 1
 	cfg.Mode = mode
 	cfg.Cert = cert
 	cfg.Key = key
-	return cfg
+	return cfg, nil
 }
 
 // ResolveCertificate returns the TLS certificate for the admin panel,

@@ -23,30 +23,57 @@ type FastFileState struct {
 }
 
 // WriteFastFile 将前缀集序列化为 .fast 二进制格式并原子写入。
-// 输入应已聚合为不相交集合；为守住二分查询契约，本函数会对 prefix **防御性
-// 原地排序**——传入切片的元素顺序会被改写（历史问题：旧注释「不做排序」与实现
-// 相反，且调用方若复用同一底层数组会被静默改序）。本函数不聚合/不去重；
-// 嵌套/同址形态由 ReadFastFile 拒绝。
+// 输入应已聚合为不相交集合；为守住二分查询契约，本函数在**内部副本**上
+// 防御性掩码主机位并排序——调用方切片的内容与顺序都不被改写。本函数不
+// 聚合/不去重；嵌套/同址形态由 ReadFastFile 拒绝。
+//
+// 族校验（历史问题）：v4 切片只接受纯 IPv4 前缀，v6 切片只接受纯 IPv6 前缀
+// （4in6 映射形态须先 Unmap 归 v4）。族错配返回 error 而不是 panic/静默腐化
+// ——As4 对 v6 入参 panic；As16 对 v4 会写出「4-in-6 地址 + v4 bits」的
+// 可加载但永不命中形态。主机位未掩码的条目（如 1.2.3.200/24）能通过读侧
+// 全部校验（单条无前驱可比较嵌套），却让二分查询用未掩码地址比较而假阴性
+// ——写侧必须先掩码。
+//
+// 原子写用独占临时名（CreateTemp，历史问题）：固定 path+".tmp" 在并发/多调用
+// 方下互相覆盖（rename ENOENT 或旧代际覆盖新代际）。本函数自身不持锁，
+// 生产调用方仍须持 wafFileMu 串行化代际。
 func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
-	// 防御性排序：.fast 的二分查询契约要求升序不相交。调用方（生产路径
-	// AggregatePrefixes）已排序，此处兜底防静默损坏——乱序输入会产出
-	// 「可加载但查询错误」的文件，是最坏形态的静默腐化。已序输入的排序
-	// 开销近似线性。
-	sort.Slice(v4, func(i, j int) bool { return v4[i].Addr().Compare(v4[j].Addr()) < 0 })
-	sort.Slice(v6, func(i, j int) bool { return v6[i].Addr().Compare(v6[j].Addr()) < 0 })
+	for _, p := range v4 {
+		if !p.IsValid() || !p.Addr().Is4() {
+			return fmt.Errorf("fastfile: v4 条目 %v 不是纯 IPv4 前缀（族错配）", p)
+		}
+	}
+	for _, p := range v6 {
+		if !p.IsValid() || !p.Addr().Is6() || p.Addr().Is4In6() {
+			return fmt.Errorf("fastfile: v6 条目 %v 不是纯 IPv6 前缀（族错配/无效）", p)
+		}
+	}
+	// 掩码 + 排序都在副本上做：掩码会改变地址（进而改变正确排序次序），
+	// 直接原地改调用方切片会静默改写其数据。
+	mv4 := make([]netip.Prefix, len(v4))
+	for i, p := range v4 {
+		mv4[i] = p.Masked()
+	}
+	mv6 := make([]netip.Prefix, len(v6))
+	for i, p := range v6 {
+		mv6[i] = p.Masked()
+	}
+	sort.Slice(mv4, func(i, j int) bool { return mv4[i].Addr().Compare(mv4[j].Addr()) < 0 })
+	sort.Slice(mv6, func(i, j int) bool { return mv6[i].Addr().Compare(mv6[j].Addr()) < 0 })
+
 	// 计算总大小
-	size := fastFileHeaderSize + len(v4)*5 + len(v6)*17
+	size := fastFileHeaderSize + len(mv4)*5 + len(mv6)*17
 	buf := make([]byte, size)
 
 	// Header
 	copy(buf[0:4], fastFileMagic)
-	binary.BigEndian.PutUint32(buf[4:8], uint32(len(v4)))
-	binary.BigEndian.PutUint32(buf[8:12], uint32(len(v6)))
+	binary.BigEndian.PutUint32(buf[4:8], uint32(len(mv4)))
+	binary.BigEndian.PutUint32(buf[8:12], uint32(len(mv6)))
 	binary.BigEndian.PutUint32(buf[12:16], 0) // flags reserved
 
 	// v4 entries: [4B addr][1B bits]
 	offset := fastFileHeaderSize
-	for _, p := range v4 {
+	for _, p := range mv4 {
 		addr := p.Addr().As4()
 		copy(buf[offset:offset+4], addr[:])
 		buf[offset+4] = byte(p.Bits())
@@ -54,23 +81,41 @@ func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 	}
 
 	// v6 entries: [16B addr][1B bits]
-	for _, p := range v6 {
+	for _, p := range mv6 {
 		addr := p.Addr().As16()
 		copy(buf[offset:offset+16], addr[:])
 		buf[offset+16] = byte(p.Bits())
 		offset += 17
 	}
 
-	// 原子写（与 @ipListFast 投影同模式）
+	// 原子写（与 @ipListFast 投影同模式）：独占临时名 + rename。
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("fastfile mkdir: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0644); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("fastfile tmp create: %w", err)
+	}
+	tmpName := tmp.Name()
+	discard := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}
+	if _, err := tmp.Write(buf); err != nil {
+		discard()
 		return fmt.Errorf("fastfile tmp write: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+	// CreateTemp 建 0600，正式文件沿用既有 0644（跨进程可读）。
+	if err := tmp.Chmod(0o644); err != nil {
+		discard()
+		return fmt.Errorf("fastfile tmp chmod: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("fastfile tmp close: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("fastfile rename: %w", err)
 	}
 	return nil
@@ -91,10 +136,15 @@ func ReadFastFile(path string) (*FastFileState, error) {
 	}
 	v4Count := binary.BigEndian.Uint32(data[4:8])
 	v6Count := binary.BigEndian.Uint32(data[8:12])
+	// 历史问题：未知 flags 位不得静默忽略（格式演进必须显式：未来的特性位
+	// 若被当 0 解析，会按错误的条目布局读数据）。
+	if flags := binary.BigEndian.Uint32(data[12:16]); flags != 0 {
+		return nil, fmt.Errorf("fastfile: unknown flags %#x", flags)
+	}
 
 	expectedSize := fastFileHeaderSize + int(v4Count)*5 + int(v6Count)*17
-	if len(data) < expectedSize {
-		return nil, fmt.Errorf("fastfile: truncated (have %d, want %d)", len(data), expectedSize)
+	if len(data) != expectedSize {
+		return nil, fmt.Errorf("fastfile: size mismatch (have %d, want %d)", len(data), expectedSize)
 	}
 
 	state := &FastFileState{

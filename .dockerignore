@@ -46,3 +46,8 @@ test-ui/
 openspec/
 .omo/
 .sisyphus/
+data-qa-master/
+data-qa-slave/
+dist/
+round*-*.png
+*.tgz
