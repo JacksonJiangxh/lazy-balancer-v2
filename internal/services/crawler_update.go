@@ -25,11 +25,11 @@ import (
 // 当前无运行态字段，单例仅统一生命周期与调用契约）。
 type CrawlerUpdateManager struct{}
 
-// validateCrawlerEntriesSanity 爬虫名单合理性门（历史问题-02 + A86 历史问题 收紧）。
+// validateCrawlerEntriesSanity 爬虫名单合理性门（历史问题-02 + 历史修复 历史问题 收紧）。
 // 引擎声明了官方段（geoipnames 单一事实源）时，一切格式（含 JSON——结构化
 // 字段白名单由 parseCrawlerCIDRsForFormat 承担，本门承担段集一致性）：
 //  1. 子集门：每条解析结果必须 ⊆ 某官方段（off.Bits()<=prefix.Bits() 且
-//     包含首地址）——A86 历史问题 前为「交集」判定，0.0.0.0/0、10.0.0.0/8 等
+//     包含首地址）——历史修复 历史问题 前为「交集」判定，0.0.0.0/0、10.0.0.0/8 等
 //     覆盖官方段的超网会被放行，写入即对启用爬虫豁免的策略整体 fail-open；
 //  2. 覆盖门：每个官方段至少被一条保留条目命中——截断页/仅一条官方段内 IP
 //     的错误页不得整体替换豁免名单（与 crawler_seed_parity_test.go 的
@@ -90,7 +90,7 @@ func validateCrawlerEntriesSanity(engineID string, entries []string) ([]string, 
 	return filtered, nil
 }
 
-// crawlerSnapshotShrinkGuard 条数收缩门（A86 历史问题）：新名单条数较当前快照
+// crawlerSnapshotShrinkGuard 条数收缩门（历史修复 历史问题）：新名单条数较当前快照
 // 收缩超过一半时拒绝写入、保留上次快照——子集/覆盖门之外的兜底（引擎未
 // 声明官方段时它是唯一闸门）。基线=DB 名单行当前条数，无行回退内置首版
 // （首轮更新也受门），两者皆无则放行（无可对照口径）。基线读取失败按
@@ -231,13 +231,13 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		// 保留上次快照；词法边界已排除版本号/日期等 IP 同形 token）。
 		entries, perr := parseCrawlerCIDRsForFormat(body, src.Format)
 		if perr == nil {
-			// 历史问题-02（历史）+ A86 历史问题（历史收紧）：合理性门——
+			// 历史问题-02（历史）+ 历史修复 历史问题（历史收紧）：合理性门——
 			// 子集（每条 ⊆ 官方段，取代旧交集判定）+ 覆盖（官方段全覆盖），
 			// 一切格式同口径；错误页/超网/截断名单保留上次快照。
 			entries, perr = validateCrawlerEntriesSanity(src.Name, entries)
 		}
 		if perr == nil {
-			// A86 历史问题：条数收缩门——较当前快照（DB/内置首版）收缩过半拒绝写入。
+			// 历史修复 历史问题：条数收缩门——较当前快照（DB/内置首版）收缩过半拒绝写入。
 			perr = crawlerSnapshotShrinkGuard(src.Name, len(entries))
 		}
 		if perr != nil {

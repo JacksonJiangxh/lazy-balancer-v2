@@ -1,0 +1,228 @@
+package middleware
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"lazy-balancer-v2/internal/db"
+
+	jwt "github.com/golang-jwt/jwt/v5"
+)
+
+// 历史修复 B-1 回归绊线：mfaStepUpGuard 的 428 行为——此前 auth_type 从未被 jwtAuth
+// 设置 + GetString 读 float64 user_id 双缺陷使守卫整体死代码（单测全绿掩盖）。
+// 本测试让真实 JWT 穿过完整认证链。
+func TestMFAStepUpGuard_endToEnd(t *testing.T) {
+	router := newMiddlewareTestRouter(t)
+	// 与 newMiddlewareTestRouterAtPort 相同的 JWT secret。
+	const jwtSecret = "test-secret"
+
+	seedUser := func(mfaEnabled bool, mfaTs int64) string {
+		t.Helper()
+		username := fmt.Sprintf("g%d%v", time.Now().UnixNano(), mfaEnabled)
+		res, err := db.DB.Exec("INSERT INTO users (username,password_hash,role,is_enabled,password_version) VALUES (?,?,'admin',1,0)", username, "x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, _ := res.LastInsertId()
+		if mfaEnabled {
+			if _, err := db.DB.Exec("UPDATE users SET mfa_enabled=1 WHERE id=?", id); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := db.DB.Exec("UPDATE global_config SET mfa_write_guard=1 WHERE id=1"); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = db.DB.Exec("UPDATE global_config SET mfa_write_guard=0 WHERE id=1") })
+		claims := jwt.MapClaims{
+			"user_id": float64(id), "username": username, "pwd_ver": float64(0),
+			"jti": fmt.Sprintf("j%d", time.Now().UnixNano()), "exp": time.Now().Add(time.Hour).Unix(),
+		}
+		if mfaTs > 0 {
+			claims["mfa_ts"] = float64(mfaTs)
+		}
+		token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(jwtSecret))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return token
+	}
+
+	post := func(path, token string) int {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	// 历史修复 十六次：/config/preview 已是只读语义 POST（被豁免），写探针改用 PUT /config。
+	put := func(path, token string) int {
+		req := httptest.NewRequest(http.MethodPut, path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// Case 1：MFA 用户 + 无 mfa_ts + 真实写路由（PUT /config）→ 428
+	tokenOld := seedUser(true, 0)
+	if code := put("/api/v1/config", tokenOld); code != http.StatusPreconditionRequired {
+		t.Fatalf("MFA user without mfa_ts: got %d, want 428（守卫生效证明）", code)
+	}
+
+	// Case 2：verify-step 豁免 → 不得被守卫 428，且不得落 5xx
+	if code := post("/api/v1/auth/mfa/verify-step", tokenOld); code == http.StatusPreconditionRequired || code >= 500 {
+		t.Fatalf("verify-step must be exempt from step-up guard and reach handler, got %d", code)
+	}
+
+	// Case 3：非 MFA 用户 → 直通到后续中间件（不得 428/5xx）
+	tokenPlain := seedUser(false, 0)
+	if code := put("/api/v1/config", tokenPlain); code == http.StatusPreconditionRequired || code >= 500 {
+		t.Fatalf("non-MFA user must not be challenged or crash, got %d", code)
+	}
+
+	// Case 4：MFA 用户 + 新鲜 mfa_ts → 不得 428/5xx
+	tokenFresh := seedUser(true, time.Now().Unix())
+	if code := put("/api/v1/config", tokenFresh); code == http.StatusPreconditionRequired || code >= 500 {
+		t.Fatalf("fresh mfa_ts must pass, got %d", code)
+	}
+
+	// Case 5（历史修复 十六次）：只读语义 POST（readOnlyWriteRoutes：批量证书状态
+	// 查询/测试/预览）即使 mfa_ts 过期也不弹码——用户打开规则列表页不该被要求验证。
+	if code := post("/api/v1/rules/cert-info", tokenOld); code == http.StatusPreconditionRequired {
+		t.Fatal("read-semantics POST (cert-info) must be exempt from step-up（打开列表页不弹码）")
+	}
+
+	// 时会真实写 ca_providers.credentials，MFA step-up 必须重新拦截。
+	if code := post("/api/v1/ca-providers/1/test", tokenOld); code != http.StatusPreconditionRequired {
+		t.Fatalf("CA provider test with stale mfa_ts: got %d, want 428（写侧非探测语义）", code)
+	}
+}
+
+// 「MFA 未启用」合并放行——旧代码 err != nil || !mfaEnabled 同一 c.Next()，瞬时
+// DB 失败会让已启用 MFA 的用户整体绕过 step-up（fail-open）。DB 错误必须 500
+// 中止（与 readOnlyGuard 的基建错误 500 中止同口径）。
+func TestMFAStepUpGuard_failClosedOnDBError(t *testing.T) {
+	router := newMiddlewareTestRouter(t)
+	const jwtSecret = "test-secret"
+
+	username := fmt.Sprintf("g%d", time.Now().UnixNano())
+	res, err := db.DB.Exec("INSERT INTO users (username,password_hash,role,is_enabled,password_version) VALUES (?,?,'admin',1,0)", username, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	if _, err := db.DB.Exec("UPDATE users SET mfa_enabled=1 WHERE id=?", id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec("UPDATE global_config SET mfa_write_guard=1 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = db.DB.Exec("UPDATE global_config SET mfa_write_guard=0 WHERE id=1") })
+	claims := jwt.MapClaims{
+		"user_id": float64(id), "username": username, "pwd_ver": float64(0),
+		"jti": fmt.Sprintf("j%d", time.Now().UnixNano()), "exp": time.Now().Add(time.Hour).Unix(),
+	}
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(jwtSecret))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟瞬时 DB 失败（仅 MFA 启用态查询报错，认证链其余查询正常）
+	oldCheck := mfaUserEnabledCheck
+	mfaUserEnabledCheck = func(int) (bool, error) { return false, errors.New("simulated transient db failure") }
+	t.Cleanup(func() { mfaUserEnabledCheck = oldCheck })
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/config", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("MFAUserEnabled DB error must fail-closed 500, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "MFA") {
+		t.Fatalf("fail-closed response must identify the MFA lookup failure, body=%s", rec.Body.String())
+	}
+}
+
+// step-up 428（此前 428 在前，用户输码重试后才见「从节点只读」真因）。守卫在
+// 428 判定点须对从节点短路 403；is_master 查询失败与只读门同语义 fail-closed。
+func TestMFAStepUpGuard_slaveWriteRejected403Before428(t *testing.T) {
+	router := newMiddlewareTestRouter(t)
+
+	if _, err := db.DB.Exec("UPDATE global_config SET is_master=0, mfa_write_guard=1 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = db.DB.Exec("UPDATE global_config SET is_master=1, mfa_write_guard=0 WHERE id=1") })
+
+	username := fmt.Sprintf("slave-g%d", time.Now().UnixNano())
+	res, err := db.DB.Exec("INSERT INTO users (username,password_hash,role,is_enabled,password_version) VALUES (?,?,'admin',1,0)", username, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	if _, err := db.DB.Exec("UPDATE users SET mfa_enabled=1 WHERE id=?", id); err != nil {
+		t.Fatal(err)
+	}
+	claims := jwt.MapClaims{
+		"user_id": float64(id), "username": username, "pwd_ver": float64(0),
+		"jti": fmt.Sprintf("j%d", time.Now().UnixNano()), "exp": time.Now().Add(time.Hour).Unix(),
+	}
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte("test-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/config", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("slave MFA write: got %d, want 403（只读真因不得被 428 遮蔽）", rec.Code)
+	}
+}
+
+// 补救端点（ForgetClusterPins 语义上只能在从节点执行，主节点 handler 拒绝）
+// 收误导性 403「请在主节点操作」，前端弹码链（仅 428 触发）断裂。
+// 钉：从节点+守卫开+陈旧 mfa_ts 下白名单路径得 428（弹码→验码→落白名单放行）。
+func TestMFAStepUpGuard_slaveWhitelistedClusterRemedyGets428(t *testing.T) {
+	router := newMiddlewareTestRouter(t)
+
+	if _, err := db.DB.Exec("UPDATE global_config SET is_master=0, mfa_write_guard=1 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = db.DB.Exec("UPDATE global_config SET is_master=1, mfa_write_guard=0 WHERE id=1") })
+
+	username := fmt.Sprintf("slave-w%d", time.Now().UnixNano())
+	res, err := db.DB.Exec("INSERT INTO users (username,password_hash,role,is_enabled,password_version) VALUES (?,?,'admin',1,0)", username, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	if _, err := db.DB.Exec("UPDATE users SET mfa_enabled=1 WHERE id=?", id); err != nil {
+		t.Fatal(err)
+	}
+	claims := jwt.MapClaims{
+		"user_id": float64(id), "username": username, "pwd_ver": float64(0),
+		"jti": fmt.Sprintf("j%d", time.Now().UnixNano()), "exp": time.Now().Add(time.Hour).Unix(),
+	}
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte("test-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 白名单路径（从节点补救通道）→ 428 弹码，而非误导性 403
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/cluster/forget-pins", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusPreconditionRequired {
+		t.Fatalf("slave whitelisted remedy write: got %d, want 428（从节点集群补救通道须保持弹码链可达）", rec.Code)
+	}
+}

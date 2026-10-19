@@ -651,7 +651,7 @@ func queryRuleDomainConflict(domain string, listenPort int, excludeCaddyID, extr
 // respondRuleApplyError 规则×5 apply 错误统一映射（裁定 2026-09-07 D2）：
 // 配置拒绝（CLI/admin 4xx/生成失败）→ 400「Caddy 配置应用失败，规则未<动词>: …」；
 // ErrUnvalidatedApply/传输失败 → 500 同文案。恢复失败并入消息（不改状态码分类）。
-// HP77-1（历史）：五个调用方的 applyErr 分支均伴随 tx 回滚——applyFromTxNote
+// 历史修复-1（历史）：五个调用方的 applyErr 分支均伴随 tx 回滚——applyFromTxNote
 // 的 CLI 预检/事务内应用两轮渲染已按未提交内容重写投影文件（规则×绑定策略的
 // u-*/p<id> 投影），磁盘同步回退到已提交态（零 /load；单一收敛点=R-12 同族
 // 收敛，禁止单点补丁）。
@@ -962,7 +962,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 	var req models.CreateRuleRequest
-	// ShouldBindBodyWith（缓存请求体）供 A86 D-3 的 weight 省略探针二次解码。
+	// ShouldBindBodyWith（缓存请求体）供 历史修复 D-3 的 weight 省略探针二次解码。
 	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
 		if isRequestBodyTooLarge(err) {
 			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
@@ -978,7 +978,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 
-	// A86 D-3：省略 weight 的上游行落默认 1（显式 0 由写侧校验 400）。
+	// 历史修复 D-3：省略 weight 的上游行落默认 1（显式 0 由写侧校验 400）。
 	applyOmittedUpstreamWeightDefaults(c, req.Upstreams)
 
 	// 与 UpdateRule/DeleteRule 同一锁序：先 caddyOpMu 后 DB，冲突检查与写入串行化
@@ -1210,7 +1210,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		enabledVal = 0
 	}
 
-	// A86 历史问题：INSERT 列清单与值投影走唯一事实源（services.LbRuleInsertSQL/
+	// 历史修复 历史问题：INSERT 列清单与值投影走唯一事实源（services.LbRuleInsertSQL/
 	// LbRuleInsertArgs）——新建排除 id/created_at/updated_by（主键自增分配、
 	// created_at 走 schema 默认、updated_by 留 NULL 待首次更新），列形态与
 	// 复制/集群镜像/快照导出同源自此结构性保证。
@@ -1249,7 +1249,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	}
 
 	for _, u := range req.Upstreams {
-		// A86 D-3：weight<1 已由 validateRulePayloadBeforeSave 响亮拒绝
+		// 历史修复 D-3：weight<1 已由 validateRulePayloadBeforeSave 响亮拒绝
 		//（0→1 静默归一废除），此处不再兜底归一。
 		if u.Protocol == "" {
 			if req.Protocol == "tcp" {
@@ -1416,7 +1416,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxUpdateRuleBodyBytes)
 	var req models.UpdateRuleRequest
-	// ShouldBindBodyWith（缓存请求体）供 A86 D-3 的 weight 省略探针二次解码。
+	// ShouldBindBodyWith（缓存请求体）供 历史修复 D-3 的 weight 省略探针二次解码。
 	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
 		// 历史问题(历史):MaxBytesReader 超限(chunked/未知长度)映射 413,
 		// 与 CreateRule/PutCaddyConfig/导入路径口径一致。
@@ -1428,7 +1428,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的请求: " + err.Error()})
 		return
 	}
-	// A86 D-3：省略 weight 的上游行落默认 1（显式 0 由写侧校验 400）；
+	// 历史修复 D-3：省略 weight 的上游行落默认 1（显式 0 由写侧校验 400）；
 	// upstreams 整体省略时 len=0 探针 no-op，合并区保留存量。
 	applyOmittedUpstreamWeightDefaults(c, req.Upstreams)
 	requestedProtocol := req.Protocol
@@ -2216,11 +2216,11 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	var switchedCertJobs int64
 	delReason := ""
 	if orphanACME {
-		// A86 历史问题（收窄裁定 2026-10-19，不反转历史 R10）：409 在途守卫
+		// 历史修复 历史问题（收窄裁定 2026-10-19，不反转历史 历史修复）：409 在途守卫
 		// 前置到删除之前——此前先 DELETE 致下方 UPDATE 的 NOT EXISTS 守卫在
 		// 本路径恒失效，CA 往返在途的规则可被改成 manual/关 TLS（队列取消是
 		// 提交后 best-effort）。仅拦「执行中」状态集（executingACMEJobStatuses
-		// =非终态减 queued/pending 未起动行）；queued/pending 维持 R10
+		// =非终态减 queued/pending 未起动行）；queued/pending 维持 历史修复
 		// 「删除+提交后取消+200」语义，保留持续失败域名的切换逃生口。
 		executingStatuses := executingACMEJobStatuses()
 		if len(executingStatuses) > 0 {
@@ -2263,7 +2263,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 
 	// PUT enabled=false 与 /disable 同语义：ACME 任务置 disabled 并取消在途，
 	// 否则任务视图仍显示 issued（历史 历史问题-01）。谓词经
-	// disableCertJobsForRuleTx 单源（A86 历史问题，failed 终态行保留失败史实）。
+	// disableCertJobsForRuleTx 单源（历史修复 历史问题，failed 终态行保留失败史实）。
 	// 单源判据：上方 updatingToDisabled 已含 !orphanACME 的全部条件（启用中 +
 	// 请求禁用 + 终态仍为 acme_dns + TLS 开启），此处复用避免两处谓词漂移。
 	disabledByUpdate := updatingToDisabled
@@ -2329,7 +2329,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// 不再 DELETE+INSERT 重建全部上游行（id 保留、不触发上游表行级同步触发器）。
 	for i := range req.Upstreams {
 		u := &req.Upstreams[i]
-		// A86 D-3：weight<1 已由 validateRulePayloadBeforeSave 响亮拒绝
+		// 历史修复 D-3：weight<1 已由 validateRulePayloadBeforeSave 响亮拒绝
 		//（0→1 静默归一废除），此处不再兜底归一。
 		if u.Protocol == "" {
 			if req.Protocol == "tcp" {
@@ -2382,7 +2382,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		recordAudit(c, "更新", "安全策略", fmt.Sprintf("规则 %s 切换为 TCP，已解除 %d 条安全策略绑定（TCP 不参与策略渲染）", caddyID, droppedBindings))
 	}
 
-	// 历史问题-01/R10：规则脱离 ACME（改手动/禁用 TLS）第二步——提交成功后留痕
+	// 历史问题-01/历史修复：规则脱离 ACME（改手动/禁用 TLS）第二步——提交成功后留痕
 	// 并取消队列在途签发（DisableRule 同序：先收敛任务行后取消）。有界等待；
 	// 失败仅告警继续——规则切换本身已提交，任务行已删除，队列残留由取消的
 	// best-effort 收敛。
@@ -2838,7 +2838,7 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 
 	if db.MetricsDB != nil {
 		if _, err := db.MetricsDB.Exec("DELETE FROM metrics_history WHERE rule_id = ?", caddyID); err != nil {
-			// A86 D-4（历史裁定）：清理失败不阻断删除（规则已提交），
+			// 历史修复 D-4（历史裁定）：清理失败不阻断删除（规则已提交），
 			// 但必须显性化——操作审计留痕 + 周期任务 metrics-orphan-cleanup
 			// 按「已删除规则」谓词有界收敛重试（残留行 7 天保留期另兜底）。
 			services.Logf("error", "DeleteRule metrics_history delete error for caddy_id=%s: %v", caddyID, err)
@@ -3029,7 +3029,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		return
 	}
 
-	// A86 历史问题：INSERT 列清单与值投影走唯一事实源（services.LbRuleInsertSQL/
+	// 历史修复 历史问题：INSERT 列清单与值投影走唯一事实源（services.LbRuleInsertSQL/
 	// LbRuleInsertArgs）——复制排除 id（AUTOINCREMENT 分配新主键），审计四列
 	// 按复制语义覆写（created_by/updated_by=操作者，created_at/updated_at=现在）。
 	duplicate := rule
@@ -3754,7 +3754,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "规则已启用"})
 }
 
-// upstreamWeightPresenceProbe 区分「省略 weight」与「显式 0」（A86 D-3）：
+// upstreamWeightPresenceProbe 区分「省略 weight」与「显式 0」（历史修复 D-3）：
 // typed 绑定把省略解码为 0，与显式 0 不可分——省略须落默认 1（与导入侧
 // 缺键→schema DEFAULT 1 同口径，config_backup.go D-3 门），显式 0/负值
 // 留给 validateRuleUpstreams 响亮 400。
@@ -3786,9 +3786,9 @@ func applyOmittedUpstreamWeightDefaults(c *gin.Context, upstreams []models.Upstr
 }
 
 // executingACMEJobStatuses 派生「执行中/CA 往返在途」cert_jobs 状态集
-// （A86 历史问题 收窄裁定 2026-10-19）：规范枚举（db.CertJobStatuses 单源）减去
+// （历史修复 历史问题 收窄裁定 2026-10-19）：规范枚举（db.CertJobStatuses 单源）减去
 // 终态（issued/failed/disabled）与未起动行（queued/pending）——未起动行
-// 维持历史 R10「删除+取消+200」语义，在途行才在 orphanACME 删除前 409。
+// 维持历史 历史修复「删除+取消+200」语义，在途行才在 orphanACME 删除前 409。
 // 逐调用计算：枚举极小（26 项），UpdateRule 非热路径，避免包级缓存漂移。
 func executingACMEJobStatuses() []string {
 	excluded := map[string]bool{"queued": true, "pending": true, "issued": true, "failed": true, "disabled": true}
@@ -3802,10 +3802,10 @@ func executingACMEJobStatuses() []string {
 }
 
 // disableCertJobsForRuleTx 是「规则禁用/停用」暂停证书任务的单源写点
-// （A86 历史问题）：UpdateRule（PUT enabled=false 同语义入口）与 DisableRule
+// （历史修复 历史问题）：UpdateRule（PUT enabled=false 同语义入口）与 DisableRule
 // 原两份手写 UPDATE 谓词漂移——前者 status<>'disabled' 会把 failed 终态行
 // 改写为 disabled 抹掉失败史实；统一为 NOT IN ('failed','disabled')，与
-// config_backup.go pauseCertJobsForImportDisabledRule（A86 历史问题 导入冲突
+// config_backup.go pauseCertJobsForImportDisabledRule（历史修复 历史问题 导入冲突
 // 暂停）谓词逐字一致。返回受影响行数；审计/日志由调用方负责。
 func disableCertJobsForRuleTx(tx *sql.Tx, caddyID string) (int64, error) {
 	result, err := tx.Exec(`UPDATE cert_jobs SET status='disabled', message='规则已禁用，任务已暂停', updated_at=datetime('now') WHERE rule_id=? AND status NOT IN ('failed','disabled')`, caddyID)
@@ -3874,7 +3874,7 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 	}
 	var disabledJobs int64
 	if enableTLS && tlsSource == "acme_dns" && domain != "" {
-		// 谓词经 disableCertJobsForRuleTx 单源（A86 历史问题）——与 UpdateRule
+		// 谓词经 disableCertJobsForRuleTx 单源（历史修复 历史问题）——与 UpdateRule
 		// 禁用入口/config_backup 导入冲突暂停同口径，failed 终态行保留。
 		var derr error
 		disabledJobs, derr = disableCertJobsForRuleTx(tx, caddyID)

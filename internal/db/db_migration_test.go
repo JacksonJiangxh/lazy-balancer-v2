@@ -66,7 +66,7 @@ func TestRunMigrationsAddsTaskRunsOperatorColumn(t *testing.T) {
 	}
 }
 
-// TASK-L7（历史）：task_runs.stage/entry_count 零写入方死列清理——
+// TASK-历史修复（历史）：task_runs.stage/entry_count 零写入方死列清理——
 // fresh DDL 不含两列；存量库经 runMigrations 的 deadColumnDrops 幂等删除。
 func TestRunMigrationsDropsTaskRunsStageEntryCount(t *testing.T) {
 	// Given 存量库形态：task_runs 带 stage/entry_count 两列（fresh DDL 已删
@@ -194,7 +194,7 @@ func TestRunMigrationsDropsLegacyTLSCertificatesAndNodeSyncColumnsIdempotently(t
 func TestRunMigrationsNodesDeadColumnsPreservesServerMapCoordinates(t *testing.T) {
 	// Given 存量库：nodes 仍带 sync_enabled/sync_scope 死列（触发
 	// migrateNodesDeadColumns 整表重建），且节点已写入大屏坐标——
-	// 重建 DDL 必须携 server_map_lat/lon 并保值（Audit86 历史问题）。
+	// 重建 DDL 必须携 server_map_lat/lon 并保值（历史修复 历史问题）。
 	database := openMigrationTestDB(t)
 	if err := createTables(); err != nil {
 		t.Fatalf("create tables: %v", err)

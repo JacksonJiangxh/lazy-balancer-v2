@@ -81,7 +81,7 @@ type CRSUpdateManager struct {
 	overridesBakCreated bool
 
 	// rulesBakCreated/setupBakCreated/stockBakCreated 同口径「本运行创建」标记
-	// （A86 历史问题，历史，镜像 overridesBakCreated 的 历史问题 1.1）：上一运行
+	// （历史修复 历史问题，历史，镜像 overridesBakCreated 的 历史问题 1.1）：上一运行
 	// 在「备份已建→清理前」崩溃会残留完整的 rules/setup/stock .bak；本运行在
 	// 到达备份点前失败（如下载失败走 fail/cancel(..., true)）时 restoreBackup
 	// 不得消费这些陈旧备份覆盖 live——它们是崩溃现场的唯一排障/恢复素材
@@ -579,7 +579,7 @@ func (m *CRSUpdateManager) restoreAfterInstallError(restore bool) {
 
 // cancel 记录用户主动取消：安装段已发生树变更时沿用失败路径的回滚/重载
 // 安全编舞，但终态不是 failed，连续失败计数不增加。
-// A86 历史问题：若取消发生在树交换之后，downloadAndInstall 已在返回前走
+// 历史修复 历史问题：若取消发生在树交换之后，downloadAndInstall 已在返回前走
 // rollbackAfterReloadFailure 同代回滚（树+VERSION 标记+DB 版本行）——此处
 // restoreAfterInstallError 的 restoreBackup 是幂等兜底（本运行备份已被回滚
 // 消费），reloader 负责让 Caddy 追上还原后的旧树。

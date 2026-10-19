@@ -13,7 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// R28 后续优化：同协议端口迁移放行（原「仅协议切换时允许迁移监听端口」守卫删除），
+// 历史修复 后续优化：同协议端口迁移放行（原「仅协议切换时允许迁移监听端口」守卫删除），
 // 冲突拦截由 validateRuleListenPort / validatePortFromDB / validateRuleFeatures 兜底。
 func TestUpdateRule_allows_same_protocol_port_migration(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)

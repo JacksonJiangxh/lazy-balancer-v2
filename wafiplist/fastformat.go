@@ -15,7 +15,7 @@ const fastFileMagic = "LBF1"
 // fastFileHeaderSize 是 .fast 文件头固定长度。
 const fastFileHeaderSize = 16
 
-// MaxFastFileBytes 是 ReadFastFile 读取前的体积硬上限（A86 历史问题，历史
+// MaxFastFileBytes 是 ReadFastFile 读取前的体积硬上限（历史修复 历史问题，历史
 // 审计）：.fast 是跨进程输入（节点回传/从节点回退），不能只依赖写侧自律——
 // 异常/恶意超大文件必须先过 Stat 体积门，再进入读取与内容校验。与文本名单
 // 路径的 MaxFileBytes（iplistfast.go）同型；二进制条目 5B/v4、17B/v6，
@@ -144,7 +144,7 @@ func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 // ReadFastFile 读取 .fast 二进制文件并展开为内存前缀集。
 // 加载成本 O(n) 纯内存拷贝——无文本解析、无排序（20 万条 ~0.2ms）。
 func ReadFastFile(path string) (*FastFileState, error) {
-	// A86 历史问题：读取前 Stat 体积门——超限文件不进入内存（防 OOM），
+	// 历史修复 历史问题：读取前 Stat 体积门——超限文件不进入内存（防 OOM），
 	// 读取后的 header/expectedSize 一致性校验保留作第二道。
 	if info, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("fastfile stat: %w", err)

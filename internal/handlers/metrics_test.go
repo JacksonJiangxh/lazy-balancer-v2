@@ -71,7 +71,7 @@ func newMetricsTestDatabase(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		// A86 历史问题：直换包级句柄必须同步复位 currentDB（B1-07 契约，
+		// 历史修复 历史问题：直换包级句柄必须同步复位 currentDB（B1-07 契约，
 		// 与 newBackupTestHandlers 同型），防跨用例留下 nil/已关闭句柄。
 		db.SetDB(oldDB)
 	})

@@ -119,7 +119,7 @@ func TestImportConfigBackup_legacyBackupWithoutUpstreamPath_restoresEmptyDefault
 // 截断备份会让 live upstream/path 行指向已被整体替换的规则（渲染不可见、集群
 // 快照原样 dump、极小概率 id 复用误挂）——导入事务内按导入后视图幂等剪枝。 ──
 
-func TestA3_87_P3_05_rulesOnlyImportPrunesOrphanUpstreamAndPathRows(t *testing.T) {
+func Test87_P3_05_rulesOnlyImportPrunesOrphanUpstreamAndPathRows(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	a3SeedLiveAdmin(t)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled)

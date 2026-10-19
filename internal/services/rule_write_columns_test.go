@@ -1,6 +1,6 @@
 package services
 
-// A86 历史问题 钉测试：唯一事实源（LbRuleWriteColumns）与 lb_rules schema、
+// 历史修复 历史问题 钉测试：唯一事实源（LbRuleWriteColumns）与 lb_rules schema、
 // 值投影、快照导出 SELECT 的三向对账。
 
 import (

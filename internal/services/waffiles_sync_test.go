@@ -950,7 +950,7 @@ func TestWafFilesRefMatchesBundle_verifiesThreatSha256s(t *testing.T) {
 	})
 }
 
-// A86 历史问题（历史）：集群同步路径的 WAF ref 构建不得静默省略分量——
+// 历史修复 历史问题（历史）：集群同步路径的 WAF ref 构建不得静默省略分量——
 // 组件存在但读取/哈希失败时，旧实现少一项分量，从端不拉取、主端无告警，
 // 主从静默分叉（从端继续用旧 WAF 规则/旧库）。修复后读失败显式化：
 // 整个 ref 视为不可用（nil）+ 错误日志，从端漂移检测把 nil 当分叉处理

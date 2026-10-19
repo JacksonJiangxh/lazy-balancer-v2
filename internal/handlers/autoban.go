@@ -132,7 +132,7 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 }
 
 // autobanListReferenced 启用中的策略是否引用预置名单（黄条判据）。引用面判定
-// 单源 services.IPListsReferencedByEnabledPolicy（HP77-8，历史：原第二份
+// 单源 services.IPListsReferencedByEnabledPolicy（历史修复-8，历史：原第二份
 // 窄引用实现只查 ip_acl_list_refs/ip_whitelist_refs，与热路径资格门 SEC-2
 // 补全后的四面口径分叉——仅被受信代理网段/CRS 排除 scope=ip/list ListRefs
 // 引用的名单会被黄条误报「名单未生效」；错误日志沿用单源通用前缀「IP 名单

@@ -381,7 +381,7 @@ func TestCRSRollbackAfterReloadFailure_blocksWhileWafFileLockHeld(t *testing.T) 
 	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-901-INITIALIZATION.conf"), "SecRule live")
 	writeTestFile(t, filepath.Join(crsTransientPath(m.crsDir, "rules.bak"), "REQUEST-901-INITIALIZATION.conf"), "SecRule old")
 	writeTestFile(t, filepath.Join(m.crsDir, crsVersionFile), "v4.15.0\n")
-	m.rulesBakCreated = true // 本运行已创建 rules.bak（A86 历史问题 守卫）
+	m.rulesBakCreated = true // 本运行已创建 rules.bak（历史修复 历史问题 守卫）
 
 	probeBlocksUnderWafFileLock(t, "CRS 重载失败回滚（树+VERSION+版本行）", func() {
 		m.rollbackAfterReloadFailure("v4.14.0")
@@ -403,7 +403,7 @@ func TestCRSRollbackAfterReloadFailure_blocksWhileWafFileLockHeld(t *testing.T) 
 	}
 }
 
-// A86 历史问题（历史）：rules/setup/stock .bak 无「本运行创建」守卫——上一
+// 历史修复 历史问题（历史）：rules/setup/stock .bak 无「本运行创建」守卫——上一
 // 运行在「备份已建→清理前」崩溃残留的完整备份，会在本运行到达备份点前失败
 // （如下载失败走 fail(..., true)）时被 restoreBackup 无条件消费：live 树/setup
 // 被回滚到崩溃前状态（若崩溃发生在 swap 后则与 DB 版本行分叉，同 历史问题 形态；
@@ -454,7 +454,7 @@ func TestCRSUpdateRun_staleBaksNotConsumedOnEarlyFailure(t *testing.T) {
 	}
 }
 
-// A86 历史问题 回归形状（正向）：陈旧备份在场时，本运行到达备份点会用新备份覆盖
+// 历史修复 历史问题 回归形状（正向）：陈旧备份在场时，本运行到达备份点会用新备份覆盖
 // 之（复制覆写语义不变），失败路径消费的是本运行备份——live 回到「本次更新前」
 // 状态而非崩溃前的陈旧状态。
 func TestCRSUpdateRun_thisRunBaksConsumedOnSwapFailure(t *testing.T) {

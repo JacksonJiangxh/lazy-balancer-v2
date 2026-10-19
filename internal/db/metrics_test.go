@@ -247,7 +247,7 @@ func TestInitMetricsSchema_duplicateTransactionIDsDedupedAndIndexCreated(t *test
 	err = initMetricsSchema(metrics)
 
 	// Then 重复历史行不得拖垮启动；启动期去重（保留每事务最早行）后唯一索引
-	// 照常建立——不再靠跳过索引放行（Audit86 历史问题：跳过会让 offset 重建/
+	// 照常建立——不再靠跳过索引放行（历史修复 历史问题：跳过会让 offset 重建/
 	// 轮转补采把重复事件重新入库并重复喂 autoban/rollup）。
 	if err != nil {
 		t.Fatalf("duplicate transaction IDs must not abort initialization: %v", err)

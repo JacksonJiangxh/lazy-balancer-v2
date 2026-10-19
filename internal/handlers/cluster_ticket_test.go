@@ -20,7 +20,7 @@ import (
 // 票据无效或已过期」凭证文案——审计侧已区分 database_error，响应面缺失让
 // 运维误判为票据问题并反复重取票据。钉：DB 故障 → 500 + 独立文案；401
 // 凭证分支文案不变。
-func TestA87TicketLogin_databaseErrorUsesRetryMessage(t *testing.T) {
+func TestTicketLogin_databaseErrorUsesRetryMessage(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	const clusterToken = "lb_cluster_a87"
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0, cluster_token=?, registration_id=7 WHERE id=1`, clusterToken); err != nil {

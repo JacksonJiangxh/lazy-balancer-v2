@@ -148,7 +148,7 @@ func TestCreateOrRequeueCertJob_requeues_disabled_job_for_reenabled_rule(t *test
 
 func TestCreateOrRequeueCertJob_requeues_downloaded_job(t *testing.T) {
 	// Given：已部署（downloaded）任务——用户再次触发签发必须重新排队，
-	// 不能静默空转（R29 A-M1）
+	// 不能静默空转（历史修复 A-M1）
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
 		VALUES ('lb_downloaded','downloaded','downloaded.example','http',8443,1,1,'acme_dns');
@@ -1004,7 +1004,7 @@ func TestCertificateService_requeueWaitingCAJobs_pause_after_scan_start_leaves_j
 	GetCAQueueManager().Start()
 	manager := GetCAQueueManager()
 	t.Cleanup(ResetCAQueueManagerForTest)
-	// R28 A-M1 起 requeue 守卫要求任务仍被启用中的 acme_dns TLS 规则引用，
+	// 历史修复 A-M1 起 requeue 守卫要求任务仍被启用中的 acme_dns TLS 规则引用，
 	// 否则按孤儿转 disabled，不会进入 EnqueueIfActive 钩子路径。
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES ('lb_pause_scan','lb_pause_scan','example.com','http',8080,1,1,'acme_dns')`); err != nil {
 		t.Fatalf("seed rule: %v", err)

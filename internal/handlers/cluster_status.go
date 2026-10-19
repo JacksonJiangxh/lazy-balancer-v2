@@ -38,7 +38,7 @@ func (h *Handlers) ListClusterNodes(c *gin.Context) {
 }
 
 func (h *Handlers) ReportClusterNode(c *gin.Context) {
-	// A86 历史问题：导入窗口 fast-fail——上报写 nodes 瞬态列与分区上报缓存，
+	// 历史修复 历史问题：导入窗口 fast-fail——上报写 nodes 瞬态列与分区上报缓存，
 	// 导入全量替换 nodes 时窗口写入会被覆盖或阻塞至 busy_timeout。
 	if rejectNodeWriteDuringImport(c) {
 		return

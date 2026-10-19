@@ -442,7 +442,7 @@ func (s *ClusterService) clearAllSectionReports() {
 	clear(s.sectionReports)
 }
 
-// ClearNodeSectionReports（A86 历史问题/D-2，历史修复主审授权扩展）：
+// ClearNodeSectionReports（历史修复 历史问题/D-2，历史修复主审授权扩展）：
 // 拓扑整体恢复（备份导入）删除节点时，按库遍历登记的全部 ClusterService
 // 实例清除该节点的分区上报缓存（与 clusterServicesFor 同模式——缓存是实例
 // 本地状态，需逐实例清理）。仅用于「节点已被删除」的清理；仍存在的节点

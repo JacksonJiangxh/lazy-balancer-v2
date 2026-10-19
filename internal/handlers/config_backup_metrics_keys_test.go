@@ -89,7 +89,7 @@ func TestImportConfigBackup_toleratesDeadMetricsConfigKeys(t *testing.T) {
 	}
 }
 
-// CL14-新2(历史):CL13-新3 钉住——备份携带字面量 "null" 白名单导入后
+// 历史修复-新2(历史):历史修复-新3 钉住——备份携带字面量 "null" 白名单导入后
 // 归一为 ”(中间件把非空串当白名单配置,null 解析成功但 0 CIDR→全来源 403)。
 func TestImportConfigBackup_normalizesNullWhitelist(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -129,7 +129,7 @@ func TestImportConfigBackup_normalizesNullWhitelist(t *testing.T) {
 	}
 }
 
-// CL15-新1(历史):CL14-新1 钉住——sync_users 入保护键,导出不含、
+// 历史修复-新1(历史):历史修复-新1 钉住——sync_users 入保护键,导出不含、
 // 导入携带 0 值不落库(恒同步不变量的第五强制点)。
 func TestExportImportConfigBackup_syncUsersProtected(t *testing.T) {
 	h := newBackupTestHandlers(t)

@@ -39,7 +39,7 @@ func newImportRollbackHarness(t *testing.T) importRollbackHarness {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		// A86 历史问题：直换包级句柄必须同步复位 currentDB（B1-07 契约，
+		// 历史修复 历史问题：直换包级句柄必须同步复位 currentDB（B1-07 契约，
 		// 与 newBackupTestHandlers 同型）——否则 GetDB() 返回 nil/后台循环
 		// 持有已关闭测试库，跨用例污染。
 		db.SetDB(oldDB)
@@ -621,7 +621,7 @@ func a3CanonicalThreatURL(t *testing.T, source string) string {
 	return seed.URL
 }
 
-func TestA3_87_P3_12_previewHasWafFilesIncludesThreatOnlyLbbak(t *testing.T) {
+func Test87_P3_12_previewHasWafFilesIncludesThreatOnlyLbbak(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	overrideTestWafPaths(t)
 	restore := services.OverrideThreatWafDirForTest(t.TempDir())

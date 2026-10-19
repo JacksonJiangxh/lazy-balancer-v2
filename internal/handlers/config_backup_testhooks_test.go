@@ -4,7 +4,7 @@ package handlers
 // config_backup.go 的 validateV2BackupTLSShape（软入口的零参数硬包装，生产
 // 零调用）与 config_backup_lbbak.go 的 buildLbbakPayload（threatSnapshot
 // 缺省捷径，生产零调用）迁移到本文件。两者语义完全不变，仅为消除「生产文件
-// 里看似第二条调用链」的维护误导；r43-r56 既有用例与本包各夹具同包消费。
+// 里看似第二条调用链」的维护误导；历史修复 既有用例与本包各夹具同包消费。
 //
 // 新增测试请优先使用正式入口（validateV2BackupTLSShapeSoft /
 // buildLbbakPayloadWithThreatIplists）——本文件仅是历史用例的兼容壳。

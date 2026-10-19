@@ -427,7 +427,7 @@ func TestValidateBuiltinThreatListRefs_chunksLargeReferenceSets(t *testing.T) {
 // ── 历史问题-历史问题（历史）：system=1 名单名称白名单（威胁/爬虫/自动封禁
 // 种子集合）——任意伪造内置名入库后管理员无法编辑/删除，UI 却宣称任务维护。 ──
 
-func TestA3_87_P3_02_rejectsForgedSystemIPListNames(t *testing.T) {
+func Test87_P3_02_rejectsForgedSystemIPListNames(t *testing.T) {
 	threatName := db.ThreatSystemLists()[0].Name
 	crawlerName := services.CrawlerIPListName("googlebot")
 	for _, tc := range []struct {

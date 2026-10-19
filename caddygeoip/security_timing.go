@@ -43,7 +43,7 @@ const (
 func recordSecurityTiming(r *http.Request, segment string) {
 	timingID := r.Header.Get(securityTimingHeader)
 	startNsStr := r.Header.Get(securityTimingStartHeader)
-	// A86 历史问题（历史）：计时 ID 是进程内注册表 key，头值客户端可控
+	// 历史修复 历史问题（历史）：计时 ID 是进程内注册表 key，头值客户端可控
 	// （无 counter 的路由无服务端注入/覆盖）——只接受与服务端 securityTimingID
 	// 同形态的 16 字符小写 hex，其余（含超长/非 hex 伪造头）一律静默忽略，
 	// 不得进入注册表（内存 DoS 面）。
@@ -72,7 +72,7 @@ func securityTimingID() string {
 }
 
 // isValidSecurityTimingID 校验计时 ID 与服务端生成形态（securityTimingID，
-// 8 字节小写 hex）逐形一致——A86 历史问题：该 ID 是计时注册表 key 且头值客户端
+// 8 字节小写 hex）逐形一致——历史修复 历史问题：该 ID 是计时注册表 key 且头值客户端
 // 可控，消费侧（recordSecurityTiming/auditTimingRecord）只认 16 字符小写
 // hex，把 key 长度与字符集钉死在生成侧形态上，伪造头灌注册表的内存 DoS
 // 面闭合。

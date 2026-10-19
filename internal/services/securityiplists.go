@@ -290,7 +290,7 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 // 文本静默遮蔽（新威胁漏拦/已移除误拦）。同代（mtime 相等）保持文本优先
 // （主节点写入相位先落文本后落 fast，内容等价）。
 // 两个文件都缺失返回文本侧错误（os.ErrNotExist 语义由调用方判定）。
-// A86 历史问题（历史）：.fast 较新但损坏/不可读时回退文本（在场时）
+// 历史修复 历史问题（历史）：.fast 较新但损坏/不可读时回退文本（在场时）
 // 并告警——旧实现直接失败，引用名单的 ACL/信任策略被渲染层整体跳过
 // （安全面静默缺失），且更新器哈希快路径按 stat 判定永不修复。
 func readThreatIplistPath(iplistPath string) ([]string, error) {

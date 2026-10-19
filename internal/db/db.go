@@ -1677,8 +1677,8 @@ func runMigrations() error {
 	// - lb_rules.ip_acl_mode / ip_acl_list 为规则级 IP 访问控制的遗留列，规则级 IP ACL 早已
 	//   迁入 security_policies（策略级 ip_acl_* 仍在使用），这两列不再被读取或写入。
 	deadColumnDrops := []struct{ table, column string }{
-		{"task_runs", "stage"},              // TASK-L7（历史）：零写入方死列
-		{"task_runs", "entry_count"},        // TASK-L7（历史）：零写入方死列
+		{"task_runs", "stage"},              // TASK-历史修复（历史）：零写入方死列
+		{"task_runs", "entry_count"},        // TASK-历史修复（历史）：零写入方死列
 		{"global_config", "caddy_log_path"}, // 读取但从未使用，日志文件名由渲染层硬编码
 		{"security_block_pages", "status_code"},
 		{"security_custom_rules", "status_code"},
@@ -1697,7 +1697,7 @@ func runMigrations() error {
 		}
 	}
 
-	// 一次性迁移：清理 R15 校验落地之前写入的存量自定义规则（尾部反斜杠/空条件），
+	// 一次性迁移：清理 历史修复 校验落地之前写入的存量自定义规则（尾部反斜杠/空条件），
 	// 避免它们在每次配置重生成时产出畸形 SecRule 行而被 coraza 整体拒绝。
 	if err := sanitizeLegacyCustomRulePatterns(); err != nil {
 		return fmt.Errorf("failed to sanitize legacy custom rule patterns: %w", err)
@@ -2084,7 +2084,7 @@ type canonicalDomainMigrationRow struct {
 	column string
 }
 
-// sanitizeLegacyCustomRulePatterns 一次性迁移：清理 R15 校验落地之前写入的存量自定义
+// sanitizeLegacyCustomRulePatterns 一次性迁移：清理 历史修复 校验落地之前写入的存量自定义
 // 规则。尾部反斜杠或空条件的规则在发射时会被跳过（见 services.emitCustomRules 的发射
 // 侧防御），这里改为「保留数据、禁用即可」，避免它们在配置重生成时产出畸形 SecRule。
 //
@@ -2872,7 +2872,7 @@ func migrateNodesDeadColumns() error {
 		// 历史问题:重建目标对齐新 schema(无 master_id/自引用 FK,idx_nodes_master；
 		// 补 UNIQUE(ip,port))——master_id 死列经本路径与 migrateNodesDropMasterID
 		// 双路径收敛为同一形态。
-		// Audit86 历史问题:重建 DDL 必须携 server_map_lat/lon 并 COALESCE 保值——
+		// 历史修复 历史问题:重建 DDL 必须携 server_map_lat/lon 并 COALESCE 保值——
 		// 此前漏列，升级重建丢坐标（第二次 ensureNewColumns 仅以默认 0 补回 schema，
 		// 值已丢失）。
 		// 历史问题（历史）：DDL 与拷贝 SELECT 抽到 nodesRebuildDDL/
@@ -2893,7 +2893,7 @@ func migrateNodesDeadColumns() error {
 // nodesRebuildDDL 与 nodesRebuildCopySQL 是 nodes 整表重建的唯一 DDL 单源
 // （历史问题，历史）：两条历史升级路径——migrateNodesDeadColumns
 // （legacy sync 列）与 migrateNodesDropMasterID（master_id 死列）——共用本形态，
-// 杜绝「加列只改一处、另一条升级路径静默丢值」（Audit86 历史问题 丢过
+// 杜绝「加列只改一处、另一条升级路径静默丢值」（历史修复 历史问题 丢过
 // server_map_lat/lon）。target 为迁移期临时表名。
 //
 // fresh CREATE（createTables）的列集合是本函数的超集前提：新增列须同时登记

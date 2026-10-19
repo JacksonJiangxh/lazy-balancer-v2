@@ -3787,7 +3787,7 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 		return
 	}
 	// event_time 恒为 'YYYY-MM-DD HH:MM:SS' UTC 字符串，参数同形 —— 直接字符串比较
-	// 即可走 idx_security_events_time 索引；两侧包 datetime() 会使索引失效（R28 修复）。
+	// 即可走 idx_security_events_time 索引；两侧包 datetime() 会使索引失效（历史修复 修复）。
 	if hasStart {
 		where += " AND event_time >= ?"
 		args = append(args, startBoundary)

@@ -341,7 +341,7 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	}
 	// cert_jobs.domain 按排序后的规范形式存储，而 lb_rules.domain 保留用户输入顺序，
 	// 规则侧用 joined+reversed 双形式匹配（ACME 域名至多根域+www 两个）。
-	reversedDomain := reversedCertJobDomain(domain) // CL18-新4:复用同文件 helper
+	reversedDomain := reversedCertJobDomain(domain) // 历史修复-新4:复用同文件 helper
 	if retryCertJobPreEnqueueHook != nil {
 		retryCertJobPreEnqueueHook(id)
 	}
@@ -533,7 +533,7 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 	// transitionJob 的 from 列表均排除 'disabled'，翻转后不会被周期路径复活。
 	// caqueue.EnqueueIfActive 的调用方并非全部持锁：RetryCertJob 持
 	// certJobOperationLock；本函数失败恢复、规则写路径与手工签发
-	// （IssueCertificate，A86 历史问题 起定向/批量两分支全程持 caddyOpMu）持
+	// （IssueCertificate，历史修复 历史问题 起定向/批量两分支全程持 caddyOpMu）持
 	// caddyOpMu；四个周期路径（requeueStrandedJobs/requeueWaitingCAJobs/
 	// requeueNonTerminalCertJobs/renewExpiringCertificates）无锁调用——其
 	// UPDATE 均按旧状态 CAS 或 from 列表排除 'disabled'，与翻转交错时命中

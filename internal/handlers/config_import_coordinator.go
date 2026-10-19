@@ -126,7 +126,7 @@ func configImportBusy() bool {
 	return true
 }
 
-// rejectNodeWriteDuringImport（A86 历史问题，历史）：配置导入窗口内
+// rejectNodeWriteDuringImport（历史修复 历史问题，历史）：配置导入窗口内
 // 节点写端点（注册/审批/拒绝/删除/改访问地址/改站点坐标/清 pin/节点上报等）
 // 一律 409 fast-fail。导入事务全量替换 nodes 表：窗口内的节点写入要么被
 // 导入覆盖（静默丢失），要么阻塞在 SQLite 写锁上至 busy_timeout（30s）后
@@ -271,7 +271,7 @@ func (session *configImportSession) abort(importErr error) error {
 	if session.finished {
 		return importErr
 	}
-	// HP77-1（历史）：会话内 CLI 预检/强制应用等渲染已按未提交导入内容
+	// 历史修复-1（历史）：会话内 CLI 预检/强制应用等渲染已按未提交导入内容
 	// 重写投影文件——abort 必回滚 tx，磁盘同步回退到已提交态（零 /load；
 	// 快照阶段失败等未渲染形态为同字节 no-op）。已持 caddyOpMu（begin 起）。
 	session.h.caddyService.RollbackIPListProjectionsToCommittedInLock()

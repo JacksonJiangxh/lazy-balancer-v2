@@ -266,7 +266,7 @@ func TestUpdateClusterSettings_rejectsDisablingSyncUsersAs400(t *testing.T) {
 	}
 }
 
-// CL41 观察项转正(历史):集群设置审计的 sync_rules 标签必须与设置卡/
+// 历史修复 观察项转正(历史):集群设置审计的 sync_rules 标签必须与设置卡/
 // 新版 hover 标签统一为「负载均衡规则」(不再用旧称「负载规则」)。
 func TestUpdateClusterSettings_auditUsesUnifiedRulesLabel(t *testing.T) {
 	// Given
@@ -296,7 +296,7 @@ func TestUpdateClusterSettings_auditUsesUnifiedRulesLabel(t *testing.T) {
 // 历史问题（历史 历史问题）：空 body 的幂等空保存曾落「更新/集群设置」零详情审计
 // （parts 为空 → Join 空串），无法区分「无修改」与记录缺陷——复用同域既有
 // 「无修改」文案（caproviders/certificates 同口径）。
-func TestA87UpdateClusterSettings_emptyChangeAuditsNoModification(t *testing.T) {
+func TestUpdateClusterSettings_emptyChangeAuditsNoModification(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	router := gin.New()
 	router.PUT("/cluster/settings", h.UpdateClusterSettings)
@@ -316,12 +316,12 @@ func TestA87UpdateClusterSettings_emptyChangeAuditsNoModification(t *testing.T) 
 	}
 }
 
-// 历史问题（历史 历史问题，R-12 家族收敛）：A86 历史问题 的导入窗口节点写门覆盖了
+// 历史问题（历史 历史问题，R-12 家族收敛）：历史修复 历史问题 的导入窗口节点写门覆盖了
 // 注册/审批/改址/清 pin/上报，但漏掉角色切换端点——SetClusterMode 在远端
 // 注册后写 global_config、Promote 写 global_config，导入事务全量替换
 // global_config 时会被覆盖（含远端孤儿注册）。本测试钉住三端点在导入窗口内
 // 一律 409 fast-fail（先于任何网络副作用与 DB 写）。
-func TestA87_clusterRoleEndpoints409DuringImport(t *testing.T) {
+func TestClusterRoleEndpoints409DuringImport(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	h.syncService = services.NewSyncService(db.DB, &config.Config{DataDir: t.TempDir()}, nil)
 	gin.SetMode(gin.TestMode)

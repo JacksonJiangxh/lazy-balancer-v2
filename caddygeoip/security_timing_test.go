@@ -210,7 +210,7 @@ func auditTimingEntriesSnapshotForTest(t *testing.T) map[string]*auditTimingEntr
 	return out
 }
 
-// A86 历史问题（历史）：计时 ID 是注册表 key，客户端可对无 counter 的
+// 历史修复 历史问题（历史）：计时 ID 是注册表 key，客户端可对无 counter 的
 // 路由伪造任意头值灌入注册表（内存 DoS）。recordSecurityTiming 只接受与
 // 服务端 securityTimingID 同形态的 16 字符 hex ID，其余一律静默忽略。
 func TestRecordSecurityTiming_rejectsForgedID(t *testing.T) {

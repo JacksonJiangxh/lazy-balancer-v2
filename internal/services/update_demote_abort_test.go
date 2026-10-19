@@ -490,7 +490,7 @@ func TestUpdateInstallEntryCancellationDoesNotWriteSuccess(t *testing.T) {
 	})
 }
 
-// A86 历史问题（历史）：取消发生在树交换之后（重载阶段）时，交换段已把
+// 历史修复 历史问题（历史）：取消发生在树交换之后（重载阶段）时，交换段已把
 // security_crs_version.version 与 live VERSION 落为新 tag——旧 cancel 路径只
 // 还原文件树（restoreBackup）不回滚版本行/标记，留下「旧树+新版本号」并被
 // 下轮 tag==current「已是最新」短路永久固化（ReconcileCRSState 因 liveV==dbV

@@ -785,7 +785,7 @@ func TestClusterVersionTriggers_refreshCachedSnapshotWhenCertificateEntersAndLea
 }
 
 func TestClusterVersionTriggers_bumpForTimestampOnlyUpdates(t *testing.T) {
-	// R24：created_at/updated_at 属于快照 payload（cluster_snapshot.go 的 rules 与
+	// 历史修复：created_at/updated_at 属于快照 payload（cluster_snapshot.go 的 rules 与
 	// ACME 证书候选节），时间戳单列更新也必须递增 cluster_version，否则指纹漂移。
 	t.Run("lb_rules", func(t *testing.T) {
 		database := newClusterVersionTestDB(t)
@@ -824,7 +824,7 @@ func TestClusterVersionTriggers_bumpForTimestampOnlyUpdates(t *testing.T) {
 			t.Fatalf("update job timestamp: %v", err)
 		}
 		// 历史问题(历史):updated_at 是簿记列——单列更新不再 bump
-		// (R24 旧语义已改:簿记抖动不再触发全集群重放)
+		// (历史修复 旧语义已改:簿记抖动不再触发全集群重放)
 		if got := clusterVersion(t, database); got != 0 {
 			t.Fatalf("version after member cert updated_at=%d, want 0 (bookkeeping column, 历史问题)", got)
 		}

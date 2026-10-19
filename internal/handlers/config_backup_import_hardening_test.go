@@ -655,7 +655,7 @@ func TestValidateCredentialsJSONObject_rejectsNull(t *testing.T) {
 // security_policy_bindings 指向 live TCP 规则——TCP 渲染链不消费策略，绑定为
 // 死绑定，必须在插入后清理（策略页不得宣称生效而运行态零防护）。 ──
 
-func TestA3_87_P3_04_securityOnlyImportDropsTCPRuleBindings(t *testing.T) {
+func Test87_P3_04_securityOnlyImportDropsTCPRuleBindings(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	a3SeedLiveAdmin(t)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled)

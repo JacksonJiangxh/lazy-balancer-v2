@@ -147,7 +147,7 @@ func (h *Handlers) ForgetClusterNodePin(c *gin.Context) {
 		status := http.StatusInternalServerError
 		switch {
 		case errors.Is(err, services.ErrNotMasterNode):
-			// A86 历史问题：降级竞态 403 与 requireMaster 门同源带头（保留失败审计）。
+			// 历史修复 历史问题：降级竞态 403 与 requireMaster 门同源带头（保留失败审计）。
 			c.Header("X-LB-Error-Code", masterRequiredErrorCode)
 			status = http.StatusForbidden
 		case errors.Is(err, services.ErrNodeNotFound):

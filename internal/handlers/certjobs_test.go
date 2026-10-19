@@ -1008,7 +1008,7 @@ func TestListCertJobs_returnsStatusCountsForQueueBanner(t *testing.T) {
 //
 // 修复前 T1 继续反向取 caddyOpMu → 死锁（5s 超时失败）；修复后 T1 先释放
 // per-job 锁再按规范顺序重取，两者依次完成且行按恢复语义落库。
-func TestA87DeleteCertJob_recoveryKeepsCanonicalLockOrder(t *testing.T) {
+func TestDeleteCertJob_recoveryKeepsCanonicalLockOrder(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status) VALUES ('lb_lockorder','lockorder.example.test','issued');
 		CREATE TRIGGER fail_lockorder_delete BEFORE DELETE ON cert_jobs BEGIN SELECT RAISE(ABORT,'delete failed'); END`); err != nil {

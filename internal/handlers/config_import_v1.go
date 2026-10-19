@@ -1066,7 +1066,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		// 队列阶段=DB 已提交，与 v2 同语义返回 200+partial（500 会让前端
 		// 按“已回滚”处理并诱发重复导入，历史 历史问题-1）。
 		if importFailurePhase(err) == importPhaseQueue {
-			// A86 历史问题（历史）：与 v2 尾部（config_backup.go queue
+			// 历史修复 历史问题（历史）：与 v2 尾部（config_backup.go queue
 			// 分支后继续提交后收敛）对齐——此前提前返回丢失全部转换/跳过/
 			// 归一化警告、不写「重载」审计、不清陈旧 caddy_apply_error 横幅。
 			auditDetail := err.Error()

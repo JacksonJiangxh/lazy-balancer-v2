@@ -104,7 +104,7 @@ func TestThreatRDBSteadyState_emptyDBEntriesWithFileIsNotDue(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 历史问题：.fast 缺失同样视为未装载（运行消费面），稳态需两者齐备。
-	// A86 历史问题：判据含可读性校验——夹具必须是真实编译产物，4 字节伪
+	// 历史修复 历史问题：判据含可读性校验——夹具必须是真实编译产物，4 字节伪
 	// 「LBF1」头在可读性口径下即为损坏文件。
 	if err := CompileFromIplistFile(iplistPath); err != nil {
 		t.Fatalf("编译 .fast 夹具: %v", err)

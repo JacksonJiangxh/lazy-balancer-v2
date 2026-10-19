@@ -320,7 +320,7 @@ func TestRunMigrationsBackfillsInvalidValueColumns(t *testing.T) {
 // 「重建 DDL ≡ fresh DDL 全列 name/type/notnull/default/pk」钉测；users /
 // security_policies / nodes（nodes 见 db_nodes_rebuild_parity_test.go）缺回归
 // 形状——新增列只改 fresh 不改正重建时，二次 ensureNewColumns 会以默认值补回
-// 列，用户值静默丢失（OIDC / U6B-3 / Audit86 历史问题 三次先例）。
+// 列，用户值静默丢失（OIDC / U6B-3 / 历史修复 历史问题 三次先例）。
 func assertShapeMatchesFresh(t *testing.T, table string, fresh []pragmaColumn, rebuilt []pragmaColumn) {
 	t.Helper()
 	freshColumns := make(map[string]pragmaColumn, len(fresh))

@@ -422,7 +422,7 @@ func TestSyncService_applySnapshot_nilLockedUsersPayloadIsNoOp(t *testing.T) {
 	}
 }
 
-// CL14-新2(历史):CL13-新1 核心语义钉住——快照旧 mfa_last_timestep
+// 历史修复-新2(历史):历史修复-新1 核心语义钉住——快照旧 mfa_last_timestep
 // 不得重开从节点重放防护窗(本地>快照取本地);主节点更新(快照>本地)覆盖。
 func TestSyncService_applySnapshot_preservesLocalTOTPTimestep(t *testing.T) {
 	_, database := newClusterTestService(t)

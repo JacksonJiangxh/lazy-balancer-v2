@@ -56,7 +56,7 @@ func (h *Handlers) GenerateClusterRegisterToken(c *gin.Context) {
 }
 
 func (h *Handlers) RegisterClusterNode(c *gin.Context) {
-	// A86 历史问题：导入窗口 fast-fail（全量替换 nodes，窗口写入会被覆盖或阻塞）。
+	// 历史修复 历史问题：导入窗口 fast-fail（全量替换 nodes，窗口写入会被覆盖或阻塞）。
 	if rejectNodeWriteDuringImport(c) {
 		return
 	}
@@ -113,7 +113,7 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 }
 
 func (h *Handlers) GetClusterRegistrationStatus(c *gin.Context) {
-	// 参数校验先于角色门：非法 ID 恒 400（R21 ID 校验口径），不因节点角色变化。
+	// 参数校验先于角色门：非法 ID 恒 400（历史修复 ID 校验口径），不因节点角色变化。
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		clusterError(c, http.StatusBadRequest, "注册编号无效", err)
@@ -206,7 +206,7 @@ func (h *Handlers) UpdateClusterNodeSiteCoordinates(c *gin.Context) {
 		return
 	}
 	if err := h.clusterService.UpdateNodeSiteCoordinates(c.Request.Context(), id, *req.ServerMapLat, *req.ServerMapLon); err != nil {
-		// A86 历史问题：服务层降级竞态 403 与 requireMaster 门同源带头。
+		// 历史修复 历史问题：服务层降级竞态 403 与 requireMaster 门同源带头。
 		if errors.Is(err, services.ErrNotMasterNode) {
 			clusterMasterForbidden(c, err)
 			return
@@ -241,7 +241,7 @@ func (h *Handlers) UpdateClusterNodeAccessURL(c *gin.Context) {
 }
 
 func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation func(int) error) {
-	// A86 历史问题：审批/拒绝/删除共用的写端点收口——导入窗口 409 fast-fail。
+	// 历史修复 历史问题：审批/拒绝/删除共用的写端点收口——导入窗口 409 fast-fail。
 	if rejectNodeWriteDuringImport(c) {
 		return
 	}
@@ -254,7 +254,7 @@ func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation fu
 		return
 	}
 	if err := operation(id); err != nil {
-		// A86 历史问题：服务层降级竞态 403 与 requireMaster 门同源带头。
+		// 历史修复 历史问题：服务层降级竞态 403 与 requireMaster 门同源带头。
 		if errors.Is(err, services.ErrNotMasterNode) {
 			clusterMasterForbidden(c, err)
 			return

@@ -490,7 +490,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		}
 	}
 	// SS87-历史问题：只清理本运行创建的备份（与 rollbackXDB 的 bakCreated 口径、
-	// 历史问题/历史问题/A86 历史问题「本运行创建才可消费/清理」统一）——fresh-install（live
+	// 历史问题/历史问题/历史修复 历史问题「本运行创建才可消费/清理」统一）——fresh-install（live
 	// 不存在→本轮未建备份）时磁盘上的陈旧 .bak 是崩溃现场唯一恢复副本，
 	// 成功路径删除会无谓销毁它。
 	if m.bakCreated {

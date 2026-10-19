@@ -152,7 +152,7 @@ func TestMarkStartupFallbackPending_writesCompensationMarker(t *testing.T) {
 // 304 分支只认 apply_ok_reload_failed 标记，自愈失明（「同步正常+运行未知旧
 // 配置」静默到下次真实变更或重启）。修复=双失败同样落标记，下轮 Pull 打破 304
 // 强制全量重放。本测试钉：标记写入 + 304 触发器（syncReloadFailureMarkerPresent）
-// 识别（全量重拉机制本身由 cluster_r31/r32 既有测试覆盖）。
+// 识别（全量重拉机制本身由 cluster_r31/历史修复 既有测试覆盖）。
 func TestMarkStartupFallbackFailed_writesCompensationMarker(t *testing.T) {
 	_, database := newClusterTestService(t)
 	cause := errors.New("apply last-known-good config failed: connection refused")

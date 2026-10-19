@@ -310,10 +310,10 @@ func TestGCStaleIPListFiles_prunesStaleRefEntries(t *testing.T) {
 	}
 }
 
-// GC regex 形态（2026-10-15 热路径改造；历史 HP77-2/HP77-4 收口）：新稳定
+// GC regex 形态（2026-10-15 热路径改造；历史 历史修复-2/历史修复-4 收口）：新稳定
 // 命名（<scope>.txt——u- 并集描述符 / p<id>-角色 白名单形态）、crsxc 组合键
-// 哈希形态（HP77-4）与旧内容寻址形态（scope-sha256[:12].txt——迁移期 GC 自然
-// 回收）都命中；大写/含点 rule id 形态命中（HP77-2：v2 导入可携带，旧字符类
+// 哈希形态（历史修复-4）与旧内容寻址形态（scope-sha256[:12].txt——迁移期 GC 自然
+// 回收）都命中；大写/含点 rule id 形态命中（历史修复-2：v2 导入可携带，旧字符类
 // 使孤儿永不回收）；用户手放文件（非投影命名形态）不碰。
 func TestIPListProjectedFileName_forms(t *testing.T) {
 	matched := []string{
@@ -325,9 +325,9 @@ func TestIPListProjectedFileName_forms(t *testing.T) {
 		"tp-deadbeef1234.txt",      // 旧形态（受信代理全局单份 scope）
 		// 历史 HP-1 新形态：u-<kind>-<ruleCaddyID>（CaddyID 含下划线）
 		"u-deny-lb_2r8dosptk1.txt", "u-trust12-lb_2r8dosptk1.txt", "u-allow-exempt-lb_ab12cd34ef56.txt",
-		"p5-crsxc-0.txt",            // 历史 SEC-1 序号形态（HP77-4 后存量，GC 过渡回收）
-		"p5-crsxc-0123456789ab.txt", // 历史 HP77-4 组合键哈希形态
-		// 历史 HP77-2：导入可携带大写/含点 rule id——孤儿必须可回收
+		"p5-crsxc-0.txt",            // 历史 SEC-1 序号形态（历史修复-4 后存量，GC 过渡回收）
+		"p5-crsxc-0123456789ab.txt", // 历史 历史修复-4 组合键哈希形态
+		// 历史 历史修复-2：导入可携带大写/含点 rule id——孤儿必须可回收
 		"u-deny-lb_2R8d.ptk1.txt", "u-bl-My_Rule.1.txt", "u-trust-lbUPPER123.txt",
 	}
 	for _, name := range matched {

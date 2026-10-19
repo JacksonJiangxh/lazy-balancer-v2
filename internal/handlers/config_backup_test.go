@@ -265,7 +265,7 @@ func TestImportConfigBackup_accepts_enabled_admin_and_increments_password_versio
 }
 
 func TestImportConfigBackup_normalizes_null_boolean_rows(t *testing.T) {
-	// 历史问题 历史问题: pre-R24/历史问题 库导出的全 null 管理员备份此前被
+	// 历史问题 历史问题: pre-历史修复/历史问题 库导出的全 null 管理员备份此前被
 	// backupBooleanEnabled(nil)=false 先行 400 拦截，归一不可达；归一须在
 	// checksum 之后、管理员校验之前执行：用户 is_enabled null→1、规则/上游
 	// enabled null→0，导入成功且落库值正确。
@@ -2083,11 +2083,11 @@ func TestImportConfigBackup_normalizesNullEnabled(t *testing.T) {
 	}
 }
 
-// 历史问题 历史问题: pre-R24 库的 users.is_enabled 为可空列（R24 起 NOT NULL），旧实例导出的
-// "is_enabled":null 行导入 R24+ 库会触发约束失败整包回滚；归一为 1（与
+// 历史问题 历史问题: pre-历史修复 库的 users.is_enabled 为可空列（历史修复 起 NOT NULL），旧实例导出的
+// "is_enabled":null 行导入 历史修复+ 库会触发约束失败整包回滚；归一为 1（与
 // lb_rules/upstreams 的 NULL→0 不同，对齐 migrateUsersIsEnabledNotNull 口径）。
 func TestImportConfigBackup_normalizesNullUserIsEnabled(t *testing.T) {
-	// Given：备份含一个 is_enabled:null 用户行（pre-R24 遗留）+ 一个启用 admin
+	// Given：备份含一个 is_enabled:null 用户行（pre-历史修复 遗留）+ 一个启用 admin
 	h := newBackupTestHandlers(t)
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)

@@ -300,7 +300,7 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 	if err != nil {
 		return models.ClusterRegistration{}, fmt.Errorf("更新待审批节点: %w", err)
 	}
-	// A86 历史问题：nodes 不在 cluster_version 触发器清单（middleware/cluster_version.go
+	// 历史修复 历史问题：nodes 不在 cluster_version 触发器清单（middleware/cluster_version.go
 	// 依赖显式 bump）——注册/覆盖改变节点拓扑后必须同事务 bump，否则快照缓存键
 	// 不变，新节点的 node_sites 缺项，继承坐标静默不生效直至下一次无关 bump。
 	if err := BumpClusterVersion(ctx, tx); err != nil {
@@ -320,7 +320,7 @@ func (s *ClusterService) UpdateNodeSiteCoordinates(ctx context.Context, nodeID i
 		return fmt.Errorf("开启节点站点坐标事务: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	// A86 历史问题：无变更保存=no-op——现值相同则不写库不 bump（「打开弹框原样
+	// 历史修复 历史问题：无变更保存=no-op——现值相同则不写库不 bump（「打开弹框原样
 	// 保存」不得放大为全集群快照重放；继承节点 0,0 原样保存保持继承不固化）。
 	var currentLat, currentLon float64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(server_map_lat,0), COALESCE(server_map_lon,0) FROM nodes WHERE id=? AND `+masterRoleConditionSQL, nodeID).Scan(&currentLat, &currentLon); err != nil {

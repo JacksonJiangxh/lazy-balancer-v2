@@ -203,7 +203,7 @@ func switchToSlaveAuditDetail(masterURL string, outboundIPOK bool) string {
 
 func clusterSettingsChangeDetail(req models.ClusterSettingsRequest) string {
 	labels := map[string]string{
-		// CL41(历史观察项转正):sync_rules 标签与集群设置卡/新版 hover
+		// 历史修复(历史观察项转正):sync_rules 标签与集群设置卡/新版 hover
 		// 统一为「负载均衡规则」(备份分类标签「负载规则」不在此口径)。
 		"sync_users": "系统数据", "sync_rules": "负载均衡规则",
 		"sync_security": "安全防护",

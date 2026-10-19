@@ -2913,7 +2913,7 @@ func TestSecurityEventsAttribution_singleRuleForms(t *testing.T) {
 //	custom_only: CRS(9xxxxx)全拒(零 Include);blocked 另拒 id:11(无 949 评分链)
 //	blocking:    全域
 //
-// 误拒三族(A35):off+{2,4} blocked / detection+{2,4} blocked / custom_only+7 blocked。
+// 误拒三族(历史修复):off+{2,4} blocked / detection+{2,4} blocked / custom_only+7 blocked。
 // 全用例排空 contains() 命中(组号错配/空名单),确保走的是 fallback 门。
 func TestSecurityEventsAttribution_FallbackModeFeasibilityGate(t *testing.T) {
 	dataDir := t.TempDir()
@@ -2958,7 +2958,7 @@ func TestSecurityEventsAttribution_FallbackModeFeasibilityGate(t *testing.T) {
 		{"F2 custom_only CRS blocked rejected", "lb_r2", "913100", "blocked", 0},
 		// detection 不得认领 CRS blocked(id:6 切换先于 CRS 评估,DetectionOnly 零中断)
 		{"detection CRS blocked rejected", "lb_r3", "913100", "blocked", 0},
-		// ── A35 误拒三族(修正目标,当前被门错误拒绝) ──
+		// ── 历史修复 误拒三族(修正目标,当前被门错误拒绝) ──
 		// off+IP 控制 blocked 可产(IP 控制与模式无关独立发射,security.go:179-181)
 		{"off id:2 blocked allowed", "lb_r4", "2", "blocked", 4},
 		{"off id:4 blocked allowed", "lb_r4", "4", "blocked", 4},

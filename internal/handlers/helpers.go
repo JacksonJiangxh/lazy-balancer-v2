@@ -849,7 +849,7 @@ func (index prometheusMetricsIndex) ruleMetrics(target ruleMetricTarget) gin.H {
 	return result.ruleMetrics(true)
 }
 
-// tcpRuleMetrics 按上游地址归集 TCP 单规则指标（A86 历史问题 口径声明）：
+// tcpRuleMetrics 按上游地址归集 TCP 单规则指标（历史修复 历史问题 口径声明）：
 // caddy-l4 v0.1.2 的 L4 指标（caddy_layer4_proxy_connections_total /
 // active_connections / upstream_healthy）标签仅 []string{"upstream"}
 // （模块源码 modules/l4proxy/metrics.go:57-75 实证）——无 server/listener/

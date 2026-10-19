@@ -94,7 +94,7 @@ type Descriptor struct {
 	RestartOnRoleFlip bool
 }
 
-// RunRecord task_runs 行视图。TASK-L7（历史）：stage/entry_count 两列
+// RunRecord task_runs 行视图。TASK-历史修复（历史）：stage/entry_count 两列
 // 零写入方（恒零值死列）已随列删除一并移除——DB DDL 与存量库迁移见 db.go
 // deadColumnDrops。
 type RunRecord struct {

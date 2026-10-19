@@ -14,7 +14,7 @@ import (
 // W8（WAF 域划入 handlers/security.go · 批准修复）：GetCRSRuleContent 必须经
 // crsRulesDir 测试缝（文件头声明，ListCRSRules 同源）解析规则文件路径——此前
 // 局部变量硬编码 "/app/waf/crs/rules" 且遮蔽 filepath 包名，与缝声明构成双真源，
-// 规则目录不可注入（r69 测试因此只能钉 400/404 两分支）。
+// 规则目录不可注入（历史修复 测试因此只能钉 400/404 两分支）。
 func TestGetCRSRuleContent_resolvesViaCRSRulesDirSeam(t *testing.T) {
 	// Given：crsRulesDir 指向临时目录，内含一个规则文件
 	dir := t.TempDir()

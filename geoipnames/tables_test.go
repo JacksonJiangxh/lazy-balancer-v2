@@ -7,7 +7,7 @@ import "testing"
 // 映射（防键值漂移）。条目数基线取自收敛前镜像测试的核验值
 // （22/13/45/31，两侧逐条人工比对一致）；U80 E-CM-04 起 ProvinceAliases
 // 剔除 11 条恒等别名（key==value 死条目，未命中即原样返回不影响输出），
-// 基线 22→11，并加零恒等钉防回潮。Audit85 补 Taichung County→台中县，
+// 基线 22→11，并加零恒等钉防回潮。历史修复 补 Taichung County→台中县，
 // CityPinyinFixes 基线 45→46，服务层以仓库 xdb 全段扫描同步验收。
 func TestGeoipNamesTables_pinnedCountsAndSpotMappings(t *testing.T) {
 	// Given/When/Then：条目数钉

@@ -336,7 +336,7 @@ func TestNextQuarantinePath_returnsCandidateOnPersistentStatError(t *testing.T) 
 	}
 }
 
-// A85 历史问题：伴生文件（-wal/-shm）必须先于主文件隔离。伴生改名失败时
+// 历史修复 历史问题：伴生文件（-wal/-shm）必须先于主文件隔离。伴生改名失败时
 // 主文件必须仍在原位并中止重建，避免下次启动在旧 WAL 残留时新建同名空库。
 func TestQuarantineCorruptSQLiteFile_companionRenameErrorPropagates(t *testing.T) {
 	for _, tc := range []struct {

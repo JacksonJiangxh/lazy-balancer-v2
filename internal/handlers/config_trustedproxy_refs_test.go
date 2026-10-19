@@ -245,7 +245,7 @@ func TestConfigBackup_trustedProxyRangeRefsRoundTrip(t *testing.T) {
 // 与渲染层都跳过空 value 条目——名单含空条目（带外改库/旧数据）时，实际
 // 展开 ≤2000 的合法载荷会被总量门 400 拒绝。钉：两侧（refs 载荷分支与
 // inline-only 存量分支）都只计通过校验的非空条目。
-func TestA87UpdateConfig_trustedProxyRefs_countsOnlyNonEmptyEntries(t *testing.T) {
+func TestUpdateConfig_trustedProxyRefs_countsOnlyNonEmptyEntries(t *testing.T) {
 	router := newTrustedProxyRefsRouter(t)
 	entries := make([]string, 0, 2001)
 	for i := range 2000 {

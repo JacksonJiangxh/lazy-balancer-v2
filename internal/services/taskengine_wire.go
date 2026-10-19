@@ -249,7 +249,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Kind:        taskengine.KindPeriodic,
 		IntervalFn:  func() time.Duration { return 24 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
-			// A86 D-4：清理失败必须让 task_runs 落 failed，不得恒成功；
+			// 历史修复 D-4：清理失败必须让 task_runs 落 failed，不得恒成功；
 			// 有界=单轮最多清理 metricsOrphanPurgeRulesPerRun 个规则，余量下轮收敛。
 			deletedRules, err := PurgeOrphanMetricsHistory(rc.Ctx)
 			// V87-TO-10：失败轮不得写「清理完成」（task_runs 已落 failed）。

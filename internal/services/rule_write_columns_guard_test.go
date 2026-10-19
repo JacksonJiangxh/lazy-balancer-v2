@@ -1,6 +1,6 @@
 package services
 
-// A86 历史问题（历史）结构守卫：生产代码中「INSERT INTO lb_rules (」
+// 历史修复 历史问题（历史）结构守卫：生产代码中「INSERT INTO lb_rules (」
 // 手写字面量唯一豁免=config_import_v1.go（v1 遗留转换器，窄清单语义已裁定
 // 维持）；其余站点必须经 LbRuleInsertSQL 单源生成——新增列漏改某一处即
 // 「保存成功但与快照/副本不同形」（历史问题 缺陷形态）。

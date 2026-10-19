@@ -460,7 +460,7 @@ func TestProvider_CleanUp_removes_ownership_of_independently_deleted_records(t *
 	}
 }
 
-// A85 历史问题：不可解析的持久化 RecordID 只告警一次并移除，正常兄弟条目不受影响。
+// 历史修复 历史问题：不可解析的持久化 RecordID 只告警一次并移除，正常兄弟条目不受影响。
 func TestProvider_CleanUp_malformedPersistedRecordIDRemovedAfterWarning(t *testing.T) {
 	// Given 同一 challenge 下一条不可解析的持久化 ID 与一条正常 ID（真实 ownership 文件）。
 	dataDir := t.TempDir()

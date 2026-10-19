@@ -247,7 +247,7 @@ func BuildWafFileRef() *models.ClusterWafFilesRef {
 
 // buildWafFileRefLocked 是 BuildWafFileRef 的无锁核心（调用方必须已持
 // wafFileMu；BuildWafFileBundle 与导出一侧共用，杜绝锁内自取）。
-// A86 历史问题（历史）：与 checked 变体单源——组件存在但读取/哈希
+// 历史修复 历史问题（历史）：与 checked 变体单源——组件存在但读取/哈希
 // 失败不再静默省略分量（旧行为让快照 ref 少一项：从端不拉取、主端无告警，
 // 主从静默分叉），而是错误日志显式化 + 整体返回 nil。消费侧语义：
 // 主端快照缺 waf_files 引用（从端跳过比对、保留现状）与从端本地漂移检测

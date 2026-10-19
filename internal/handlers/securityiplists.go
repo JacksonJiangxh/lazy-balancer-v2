@@ -1343,7 +1343,7 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 		applyErr := h.caddyService.ApplyConfigFromTxCertAwareForce(tx)
 		if applyErr != nil {
 			if services.IsConfigRejected(applyErr) {
-				// HP77-1/HP77-5（历史）：强制被拒=tx 回滚——refresh 渲染已按
+				// 历史修复-1/历史修复-5（历史）：强制被拒=tx 回滚——refresh 渲染已按
 				// 未提交条目重写投影，磁盘回退到已提交态（证书物化内容本即已提交
 				// PEM，物化无需撤销；见 RollbackIPListProjectionsToCommittedInLock 披露）。
 				h.caddyService.RollbackIPListProjectionsToCommittedInLock()

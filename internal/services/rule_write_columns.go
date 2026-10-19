@@ -1,6 +1,6 @@
 package services
 
-// A86 历史问题（历史）：规则写路径列清单与值投影唯一事实源。
+// 历史修复 历史问题（历史）：规则写路径列清单与值投影唯一事实源。
 // 此前 CreateRule/DuplicateRule/集群 apply（insertSnapshotRules）/快照导出
 // （snapshotRules SELECT）四处各自手写列清单，已出现形态差异（Duplicate 显式
 // 写审计四列、Create 依赖默认）；新增列必须同时改多处，漏一处即「保存成功

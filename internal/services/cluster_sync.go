@@ -1537,7 +1537,7 @@ func (s *SyncService) combineOrReplaceSyncError(ctx context.Context, message str
 	}
 	if syncErrorPreservesReloadMarker(code) {
 		var stored string
-		// CL13-新2:读侧 WithoutCancel(与 :1043 syncReloadFailureMarkerPresent
+		// 历史修复-新2:读侧 WithoutCancel(与 :1043 syncReloadFailureMarkerPresent
 		// 同口径)——可取消读在 Stop cancel 落窗时失败,误跳过组合使标记被覆盖。
 		if err := s.db.QueryRowContext(context.WithoutCancel(ctx), "SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err == nil {
 			// 自愈类错误不得覆盖重载失败标记：标记是全量重拉补偿的唯一触发器，
@@ -1768,7 +1768,7 @@ func (s *SyncService) run(ctx context.Context) {
 		if token == "" {
 			s.pollRegistration(ctx)
 		} else {
-			// 304「配置无变化」是稳态事件，不留审计（曾按周期刷屏，R24 移除）；
+			// 304「配置无变化」是稳态事件，不留审计（曾按周期刷屏，历史修复 移除）；
 			// 有意义的状态跃迁（漂移自愈、失败）仍在各自路径留痕。
 			pullRes, pullErr := s.Pull(ctx)
 			var schemaTooNew *SnapshotSchemaTooNewError

@@ -394,7 +394,7 @@ var apiDocContracts = map[string]apiDocContract{
 	"POST /certificate-configs":          {successStatus: http.StatusCreated},
 	// 历史问题(C2):v2.3.0 起导出恒为 lbbak tar.gz(writeLbbakResponse 以
 	// application/gzip 下发);sections query 与导入侧对称（分类键清单由
-	// configBackupSections 单一事实源派生——A86 历史问题，防文档与实现再分叉）。
+	// configBackupSections 单一事实源派生——历史修复 历史问题，防文档与实现再分叉）。
 	"GET /config/export": {rawResponse: true, responseContentType: "application/gzip", queryParameters: []apiDocParameter{{"sections", "string", "可选配置分类（逗号分隔）：" + configBackupSectionKeysText() + "，默认全选；旧版 global_config/waf_files 键自动归一（分别视为 users/security）；未知分类返回 400"}}},
 	// 历史问题（历史）：两个非 JSON 下载端点显式登记 media type——漏登记
 	// 会回落到 application/json 并被包成 {"code":0,...,"data":非 JSON}。

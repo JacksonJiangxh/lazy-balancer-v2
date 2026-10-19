@@ -406,7 +406,7 @@ func TestIssueCertificate_batch_preserves_running_jobs(t *testing.T) {
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
 
 	// 执行中的任务（creating_order）保持不变；已部署任务（downloaded）按
-	// R29 A-M1 重新排队——再次触发签发对已部署证书必须生效，不得静默空转。
+	// 历史修复 A-M1 重新排队——再次触发签发对已部署证书必须生效，不得静默空转。
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
 	}

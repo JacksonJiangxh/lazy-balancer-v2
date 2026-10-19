@@ -125,7 +125,7 @@ func TestCidrIntersectParsed_directionIndependent(t *testing.T) {
 // TestBuildCorazaDirectives_BodyAccessTruthTable(R-6 首例,S历史问题):
 // 机械枚举 body 门控读取的全部变量交叉积——mode(4)×自定义规则态(3:
 // 无规则/停放启用/发射启用)×IP 控制(2)。期望:On ⟺ crsActive ‖
-// (customActive && hasCustomRules)。历史:R12 引擎不可消费条件→R13 停放
+// (customActive && hasCustomRules)。历史:历史修复 引擎不可消费条件→历史修复 停放
 // 规则反向回归——每轮只测目标格,bug 在未测格;本表为构造性全形状。
 func TestBuildCorazaDirectives_BodyAccessTruthTable(t *testing.T) {
 	rulesJSON := func(enabled bool) json.RawMessage {
@@ -156,7 +156,7 @@ func TestBuildCorazaDirectives_BodyAccessTruthTable(t *testing.T) {
 		{"custom_only", "none", true, false},  // 仅 IP 控制:phase:1,无 body 消费者
 		// off:IP/GeoIP 仅 phase:1,停放规则不发射→Off(S历史问题 回归格)
 		{"off", "none", true, false},
-		{"off", "parked-enabled", true, false}, // ← R13 反向回归格:此前误 On
+		{"off", "parked-enabled", true, false}, // ← 历史修复 反向回归格:此前误 On
 		{"off", "parked-enabled", false, false},
 	}
 	for _, tc := range cases {

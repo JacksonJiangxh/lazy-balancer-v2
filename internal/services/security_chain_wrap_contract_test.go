@@ -147,7 +147,7 @@ func TestBlockedCounterWrapContract_acrossAllRenderShapes(t *testing.T) {
 	}
 	assertBlockedCounterWrap(t, "lb_wrap4", "main", flattenRouteHandlers(t, mainRoute4))
 
-	// 形状 5：无策略规则——AUD-1 语义面处理器全不发射。A86 历史问题（历史
+	// 形状 5：无策略规则——AUD-1 语义面处理器全不发射。历史修复 历史问题（历史
 	// 审计）起 lb_security_timing_end 也不再例外：无 counter 即无服务端
 	// timing ID 注入/覆盖，发射 timing_end 会让客户端伪造的计时头直进
 	// 进程内注册表（内存 DoS 面）——渲染层单点收口，无 counter 的路由

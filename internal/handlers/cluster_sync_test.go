@@ -196,7 +196,7 @@ func TestGetClusterWafFiles_demotedMasterForbidden(t *testing.T) {
 // ForgetClusterPins）均以 503「同步服务未初始化」前置。装配缺失或测试注入
 // nil 时，从节点手动同步会 nil 指针 panic（Gin recovery → 500 空体），
 // 与同族错误形状分叉。
-func TestA87PullClusterSnapshot_missingSyncServiceReturnsUnavailable(t *testing.T) {
+func TestPullClusterSnapshot_missingSyncServiceReturnsUnavailable(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	h.syncService = nil
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {

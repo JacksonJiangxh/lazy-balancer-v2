@@ -784,7 +784,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 
 	reloadNote, applyErr := h.applyFromTxNote(c, tx, "保存配置后自动重载")
 	if applyErr != nil {
-		// HP77-1（历史）：CLI 预检/事务内应用两轮渲染已按未提交内容重写
+		// 历史修复-1（历史）：CLI 预检/事务内应用两轮渲染已按未提交内容重写
 		// 投影（tp.txt 等）——tx 回滚的同时把磁盘回退到已提交态（零 /load）。
 		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		restoreErr := h.caddyService.ApplyConfig(oldRuntimeConfig)

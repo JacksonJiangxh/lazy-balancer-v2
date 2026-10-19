@@ -1437,7 +1437,7 @@ func TestAuditPipelineRelease_doesNotHoldRegistryLockWhileDraining(t *testing.T)
 	<-released
 }
 
-// A86 历史问题（历史）：注册表条目硬上限——无 counter 路由时代理层校验
+// 历史修复 历史问题（历史）：注册表条目硬上限——无 counter 路由时代理层校验
 // 之外的纵深（任何新 key 生产路径都不得让注册表无界增长）。满时拒绝新键，
 // 既有键的分段写入不受影响。
 func TestAuditTimingRegistry_entryCap(t *testing.T) {
@@ -1471,7 +1471,7 @@ func TestAuditTimingRegistry_entryCap(t *testing.T) {
 	}
 }
 
-// A86 历史问题：周期清扫——旧实现清扫仅由建条驱动（停流后过期条目永久驻留）。
+// 历史修复 历史问题：周期清扫——旧实现清扫仅由建条驱动（停流后过期条目永久驻留）。
 // 后台 sweeper 按周期弹出 TTL 过期条目，零建条流量下注册表也必须收敛。
 func TestAuditTimingRegistry_periodicSweep(t *testing.T) {
 	useTestTimingRegistry(t)

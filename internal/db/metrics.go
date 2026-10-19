@@ -404,7 +404,7 @@ func initMetricsSchema(db *sql.DB) error {
 	}
 	// transaction_id 的幂等唯一部分索引（WHERE != ''）让重复事务写入被
 	// OR IGNORE 静默去重，同时保留历史遗留空 transaction_id 行不受唯一约束影响。
-	// 存量重复行：启动期去重（保留每事务最早行）后照常建索引（Audit86 历史问题，
+	// 存量重复行：启动期去重（保留每事务最早行）后照常建索引（历史修复 历史问题，
 	// 台账裁定：去重后再建索引，不靠跳过——跳过会让 offset 重建/轮转补采把
 	// 重复事件重新入库并重复喂 autoban/rollup）。
 	if err := ensureSecurityEventsTransactionIndex(db); err != nil {
@@ -417,7 +417,7 @@ func initMetricsSchema(db *sql.DB) error {
 }
 
 // ensureSecurityEventsTransactionIndex 在建立唯一部分索引前检查存量重复事务。
-// Audit86 历史问题：发现重复时不再 WARN+跳过（跳过期间 INSERT OR IGNORE 失去
+// 历史修复 历史问题：发现重复时不再 WARN+跳过（跳过期间 INSERT OR IGNORE 失去
 // 唯一约束兜底，offset 重建/轮转补采会把重复事件重新入库并重复喂
 // autoban/rollup）——改为启动期一次性去重：每个非空 transaction_id 保留
 // 最早行（MIN(id)，即首次摄取的事件），删除其余重复行后照常建索引，摄取

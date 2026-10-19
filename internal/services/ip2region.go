@@ -328,8 +328,8 @@ func GetIP2RegionProvinceList() []string {
 // 变量统一用规范名，两边一致才能命中。
 // treeCacheRevision 地域树缓存修订号——规范化规则（映射/别名/结构）变更时
 // 递增，旧缓存据此判定过期重建。ASCII 残留探测只能发现「缓存里有脏数据」，
-// 发现不了「该有而没有」的条目（如 r25 前整段被丢的 新疆/乌鲁木齐市）。
-const treeCacheRevision = "r27" // r27：海外分支收集国家名（Countries）——旧缓存静默缺国名集，必须重建
+// 发现不了「该有而没有」的条目（如 历史修复 前整段被丢的 新疆/乌鲁木齐市）。
+const treeCacheRevision = "r27" // 历史修复：海外分支收集国家名（Countries）——旧缓存静默缺国名集，必须重建
 
 // normalizeIP2Province 选项树侧省列规范化——单源 geoipnames.ProvinceForTree
 // （历史问题 历史下沉：此前与 caddygeoip.normalizeProvince 是两份手工镜像，

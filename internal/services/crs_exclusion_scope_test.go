@@ -72,7 +72,7 @@ func scopedExclusionFixture(t *testing.T) {
 }
 
 // crsxcProjectionFiles 提取渲染产物中全部 CRS 作用域排除投影（@ipListFast
-// 算子路径→文件内容）。HP77-4 后 scope 名=组合键哈希（p<id>-crsxc-<12hex>），
+// 算子路径→文件内容）。历史修复-4 后 scope 名=组合键哈希（p<id>-crsxc-<12hex>），
 // 测试不再钉实现文件名（T3 改行为断言：以名→内容的映射断言身份不变量）。
 func crsxcProjectionFiles(t *testing.T, directives string) map[string]string {
 	t.Helper()
@@ -237,7 +237,7 @@ func TestBuildCorazaDirectives_scopedExclusionMergesIPsAndListDedup(t *testing.T
 	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	// 条目 1：ips ∪ 列表条目合并去重保序 → 2.2.2.2,1.1.1.1,3.3.3.0/24；
 	// 条目 2：同一列表重复引用去重一次。两组合键不同（ips 字面不同）→ 两份
-	// 投影（HP77-4：scope=组合键哈希，内容断言以名→内容映射承载，不再钉
+	// 投影（历史修复-4：scope=组合键哈希，内容断言以名→内容映射承载，不再钉
 	// 实现文件名）。
 	files := crsxcProjectionFiles(t, directives)
 	if len(files) != 2 {
@@ -616,7 +616,7 @@ func TestBuildCorazaDirectives_infraIncludeGuardedByExistence(t *testing.T) {
 	}
 }
 
-// HP77-4（历史，行为钉测取代 T3 实现文件名钉）：crsxc scope=组合键哈希
+// 历史修复-4（历史，行为钉测取代 T3 实现文件名钉）：crsxc scope=组合键哈希
 // （ips 字面+排序后 listRefs 的 sha256[:12]）——身份不变量：
 //
 //	①条目重排不改名（位置无关——旧「组合首次出现序」下重排使旧名承载他条目

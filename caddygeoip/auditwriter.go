@@ -97,12 +97,12 @@ var (
 	// 读、测试收窄参数写，普通变量在 `go test -race` 下构成数据竞争
 	// （PL历史问题）。零值为 0（立即全部过期），默认值在 init 中置入。
 	auditTimingEntryTTLNs atomic.Int64
-	// auditTimingMaxEntries 注册表条目硬上限（A86 历史问题，历史）：计时 ID
+	// auditTimingMaxEntries 注册表条目硬上限（历史修复 历史问题，历史）：计时 ID
 	// 形态校验之外的第二道内存 DoS 防线——任何新键生产路径（含未来写点）都不
 	// 得让注册表无界增长。100k 条目 ≈ 30s TTL × ~3.3k RPS 的合法上限，内存
 	// 约 15MB；满时拒绝新键（该请求不计耗时，静默降级），既有键照常写入。
 	auditTimingMaxEntries = 100_000
-	// auditTimingSweepIntervalNs 周期清扫间隔（纳秒，A86 历史问题）：旧实现清扫仅
+	// auditTimingSweepIntervalNs 周期清扫间隔（纳秒，历史修复 历史问题）：旧实现清扫仅
 	// 由建条驱动（每 64 次建条一次），停流后过期条目永久驻留；后台 sweeper 按
 	// 本周期兜底回收，零流量下注册表同样收敛。atomic 存储原因同上。
 	auditTimingSweepIntervalNs atomic.Int64
@@ -169,7 +169,7 @@ var (
 )
 
 // auditTimingRecord 写入一个分段计时（µs）。id 为空（计时 ID 生成失败的降级
-// 形态）或形态非法（A86 历史问题 纵深：非 16-hex 不得建条——头值客户端可控）
+// 形态）或形态非法（历史修复 历史问题 纵深：非 16-hex 不得建条——头值客户端可控）
 // 静默忽略——耗时是增强信息，不产生请求路径错误。
 // 条目硬上限：注册表满时拒绝新键（该请求不计耗时），既有键照常更新。
 func auditTimingRecord(id, segment string, us int64) {
@@ -190,7 +190,7 @@ func auditTimingRecord(id, segment string, us int64) {
 		auditTimingSweepIfDueLocked(now)
 	}
 	auditTimingMu.Unlock()
-	// A86 历史问题：首个条目创建时启动周期 sweeper（进程级单例，注册表本身即
+	// 历史修复 历史问题：首个条目创建时启动周期 sweeper（进程级单例，注册表本身即
 	// 包级生命周期）——停流后过期条目也由周期清扫回收，不再仅依赖建条驱动。
 	startAuditTimingSweeperForTest()
 	e.mu.Lock()

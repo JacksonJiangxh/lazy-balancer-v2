@@ -75,7 +75,7 @@ var configBackupSections = []struct {
 }
 
 // configBackupSectionKeysText / configBackupSectionsDocText 由
-// configBackupSections 单一事实源派生文档文案（A86 历史问题，历史）：
+// configBackupSections 单一事实源派生文档文案（历史修复 历史问题，历史）：
 // apidocs 的导出 query 枚举与自动备份设置说明此前手工维护分类清单，
 // 第四分类「cluster=节点拓扑」上线后文档漂移为三分类。键与标签一律取自
 // 结构体，分类增删时文档自动跟随；钉测
@@ -211,12 +211,12 @@ var configBackupProtectedConfigKeys = map[string]bool{
 	// 集群快照不携带；导入不得用另一节点的值覆盖——否则降级回从节点后
 	// wafFilesDrifted 误判并触发一次不必要的全量重拉。
 	"applied_waf_ref_hash": true, "applied_waf_ref_version": true,
-	// CL14-新1(历史):恒同步列排除出备份——现行导出恒 1(UpdateSettings
+	// 历史修复-新1(历史):恒同步列排除出备份——现行导出恒 1(UpdateSettings
 	// 拒绝禁用+启动迁移回填),排除无信息损失;防 v2.2.7 前存量备份携带 0 值
 	// 直写,致节点页「系统数据同步=关闭」假状态至重启(同步行为四个在线强制点
 	// 不受影响,纯展示层)。
 	"sync_users": true,
-	// A86 历史问题 同门（历史 历史问题）：auto_backup_sections_version 是
+	// 历史修复 历史问题 同门（历史 历史问题）：auto_backup_sections_version 是
 	// 节点本地的备份范围迁移标记（db.go 启动迁移写入），非配置——随备份搬运
 	// 会让目标节点的存量 sections 迁移状态被源节点覆盖；且该列无导入类型门，
 	// 文本形态落库后下次启动迁移 Scan int 硬失败。导出剔除+导入跳过。
@@ -462,7 +462,7 @@ var backupTableNullDefaults = map[string]map[string]any{
 		"last_checked": "", "next_update": "", "trigger": "", "started_at": "", "finished_at": "",
 		"consecutive_failures": int64(0), "created_at": "", "updated_at": "",
 	},
-	// A86 历史问题（历史）：节点拓扑表写入侧 NULL 归一，与 schema DEFAULT
+	// 历史修复 历史问题（历史）：节点拓扑表写入侧 NULL 归一，与 schema DEFAULT
 	// 逐列对齐——NOT NULL 列（server_map_lat/lon/mode 等）NULL 直写撞约束
 	// 500；port/sync_interval NULL 落库后 cluster_status 节点列表裸扫 500。
 	// name/ip_address 为无默认 NOT NULL 列，由行级门 validateV2BackupNodeRows
@@ -581,7 +581,7 @@ var backupTimeColumns = map[string][]string{
 	"ca_providers":        {"created_at", "updated_at"},
 	"certificate_configs": {"created_at", "updated_at"},
 	"cert_jobs":           {"created_at", "updated_at"},
-	// A86 历史问题：nodes.created_at 同族——垃圾文本落库后节点列表时间扫描失败；
+	// 历史修复 历史问题：nodes.created_at 同族——垃圾文本落库后节点列表时间扫描失败；
 	// 其余 nodes 时间列（last_seen/last_sync_at）由 sanitizeNodeRowsForRestore
 	// 在更上游删除，不进门。
 	"nodes": {"created_at"},
@@ -867,7 +867,7 @@ func restoreTable(ctx context.Context, tx *sql.Tx, database *sql.DB, table strin
 					value = columnDefault
 				}
 			}
-			// CL13-新3(历史):旧从节点库(pre-fix)导出的备份可携带字面量
+			// 历史修复-新3(历史):旧从节点库(pre-fix)导出的备份可携带字面量
 			// "null" 白名单——middleware 把非空串当白名单配置(Unmarshal null 成功
 			// 但 0 CIDR)→ 主端全来源 403 直至重启迁移;导入侧归一为 ''。
 			if table == "api_keys" && column == "mcp_ip_whitelist" {
@@ -1040,9 +1040,9 @@ func materializeImportCertificates(certificates []importCertificate) error {
 	return nil
 }
 
-// normalizeBackupBooleanNulls 把 pre-R24/pre-历史问题 库导出的 NULL 布尔行归一为当前表结构
+// normalizeBackupBooleanNulls 把 pre-历史修复/pre-历史问题 库导出的 NULL 布尔行归一为当前表结构
 // 要求的非空值（lb_rules/upstreams.enabled NULL→0、users.is_enabled NULL→1），与
-// 历史问题/R24 迁移口径一致（用户缺省启用，规则/上游缺省禁用）。
+// 历史问题/历史修复 迁移口径一致（用户缺省启用，规则/上游缺省禁用）。
 // 必须在 checksum 校验之后执行（checksum 覆盖原始内容，先归一会让自带校验和的备份
 // 全部误报篡改），并在管理员校验之前执行（backupBooleanEnabled(nil)=false 会把
 // 全 null 管理员备份先行 400 拦截，归一不可达——历史问题-1）。
@@ -1127,7 +1127,7 @@ func validateBackupRuleReferences(tables map[string][]map[string]any) error {
 	for index, row := range tables["upstreams"] {
 		ruleID := backupString(row["rule_id"])
 		// D-3（历史裁定）：显式 weight<1 响亮拒绝，不再沿用「0→1 静默归一」
-		// 兼容语义（与保存侧 validateRuleUpstreams 的 A86 D-3 门同口径——该门
+		// 兼容语义（与保存侧 validateRuleUpstreams 的 历史修复 D-3 门同口径——该门
 		// 对模型 0 值一律拒绝，故缺键/NULL 必须先归位）。缺键/NULL 按 schema
 		// DEFAULT 1 归位（backupTableNullDefaults 同值——旧库/手造备份的 NULL
 		// 形态保持可导入），显式 0/负值/非整数形态整包 400 点名行号。数值
@@ -1446,7 +1446,7 @@ func validateV2BackupCertJobStatuses(tables map[string][]map[string]any) error {
 	return nil
 }
 
-// validateV2BackupNodeRows（A86 历史问题，历史）：nodes 表行级
+// validateV2BackupNodeRows（历史修复 历史问题，历史）：nodes 表行级
 // 类型/必填/范围门——此前 nodes 无任何行级校验，带 port:null、
 // is_approved:null、server_map_lat:"north"、越界坐标的备份可导入并提交，
 // 随后节点列表每秒 500、snapshotNodeSites 失败。口径：
@@ -1588,7 +1588,7 @@ func validateV2BackupRows(backup configBackup) error {
 			return err
 		}
 	}
-	// A86 历史问题（历史）：nodes 行级类型/必填/范围门——必须在
+	// 历史修复 历史问题（历史）：nodes 行级类型/必填/范围门——必须在
 	// sanitizeNodeRowsForRestore（prepareV2BackupSkips）之后执行，此时瞬态列
 	// 已删除、pending 语义已归一，本门只面对落库候选形态。
 	if rows, ok := backup.Tables["nodes"]; ok {
@@ -1947,7 +1947,7 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 // Caddy 自动签发自愈。
 // 历史问题-历史问题（历史）：原「硬入口」validateV2BackupTLSShape（软入口的
 // 零参数包装）生产零调用（生产一律 validateV2BackupTLSShapeSoft），作为第二
-// 调用链误导维护者——已移入 _test.go（既有 r43-r56 用例同包消费）。
+// 调用链误导维护者——已移入 _test.go（既有 历史修复 用例同包消费）。
 //
 // validateV2BackupTLSShapeSoft 支持 CERT41-1 软降级:softLiveACMERefs=true
 // 时,「备份不含 cert 表、按 live 解析」失败的 ACME 引用不整包 400,计入返回
@@ -3043,7 +3043,7 @@ func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]
 			return fmt.Errorf("备份的默认 CA 提供商（ID %d）在导入后不存在或已禁用", id)
 		}
 	}
-	// A86 历史问题（历史）：access_log_format 导入侧此前零校验——手造
+	// 历史修复 历史问题（历史）：access_log_format 导入侧此前零校验——手造
 	// 备份可落库「删除 request>remote_ip/uri/headers」的格式，日志统计与 UA
 	// 统计静默失效（保存侧 caddy.go UpdateConfig 有 validateAccessLogFormat
 	// 门）。与保存侧同门：校验 + 归一强制携带 X-API-Key 脱敏行（渲染层另有
@@ -3077,7 +3077,7 @@ func validateAutoBackupScheduleCombination(freq string, day int) error {
 }
 
 // revalidateImportLiveDependencies 在取得 caddyOpMu 与事务之后、任何写入之前，
-// 重跑三项依赖 live 数据的合并型校验（历史 B3-历史问题，audit82 B3-82-历史问题
+// 重跑三项依赖 live 数据的合并型校验（历史 B3-历史问题，历史修复 B3-82-历史问题
 // 同族收敛）：初检到加锁之间有秒级窗口（等 configImportBeginMu、暂停调度、
 // 30s 在途排空、等 WAF 锁），窗口内并发删除 IP 名单/保存自动备份排程/删除
 // CA 提供商会让初检结论失效。全部读取走导入事务，与后续写入同一快照。
@@ -3786,7 +3786,7 @@ func clampBackupConfigInts(config map[string]any) []string {
 	return notes
 }
 
-// clearDeletedNodeStateBeforeRestore（A86 历史问题/D-2，历史用户裁定）：
+// clearDeletedNodeStateBeforeRestore（历史修复 历史问题/D-2，历史用户裁定）：
 // 节点拓扑整体替换（DELETE FROM nodes + 重插备份行）之前，按 ip:port 身份
 // 找出「本地有而备份无」的将被删除节点，清除其 TOFU 指纹钉（文件+内存缓存，
 // 与 ForgetClusterNodePin 端点同口径：ForgetNodePin 解析地址删文件 +
@@ -4585,7 +4585,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	if lbbakFiles != nil && len(lbbakFiles.ThreatIplists) > 0 {
 		localThreatRows = captureThreatSourceRows(ctx)
 	}
-	// A86 历史问题/D-2：nodes 整体替换前清理「将被删除节点」的 TOFU 指纹钉与
+	// 历史修复 历史问题/D-2：nodes 整体替换前清理「将被删除节点」的 TOFU 指纹钉与
 	// 分区上报缓存（保留备份仍携带节点的 pin）——必须赶在 DELETE FROM nodes
 	// 之前（pin 地址需按现存行解析）。
 	clearedNodeArtifacts := 0
@@ -4825,7 +4825,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 			return
 		}
 	}
-	// A86 历史问题（历史）：冲突矩阵置禁用的规则与 DisableRule 端点
+	// 历史修复 历史问题（历史）：冲突矩阵置禁用的规则与 DisableRule 端点
 	// 同口径暂停证书任务——否则导入提交后队列恢复（RequeueNonTerminalCertJobs）
 	// 会给已禁用规则续签。写点=Rules 域 历史问题 收敛的单源
 	// disableCertJobsForRuleTx（rules.go，守卫白名单在册），谓词与
@@ -5160,7 +5160,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 		recordAudit(c, action, "配置备份", services.FormatAuditDetail(auditParts...))
 	}
 	recordAudit(c, "重载", "Caddy服务", action+"配置后自动重载")
-	// 2026-09-07 审计 L4（round5 F2 修正）：导入成功后清除陈旧 caddy_apply_error
+	// 2026-09-07 审计 L4（历史修复 F2 修正）：导入成功后清除陈旧 caddy_apply_error
 	// ——但 reseed 失败时不清（reseed 的 caddyApplyNoteLocked 可能刚写入
 	// 失败标记，无条件清除会把真实失败横幅抹掉）。F-SYS-2（历史）：
 	// 未走 reseed 路径时 reseedApplyFailed 恒 false（只在上方 reseed 块内置位），
@@ -5381,7 +5381,7 @@ func autoBackupWatermarkEmptyOrStale(raw string) bool {
 // 原 importCountsDetail 函数内局部字面量）。结构性钉测
 // TestA86_importCountsDetailCoversAllBackupTables 要求 configBackupTables
 // 每张表在此或显式豁免清单（path_rules 随规则计数、security_policy_bindings
-// 为派生数据）——新增备份表漏登记会被当场拦截（A86 历史问题 根因防御）。
+// 为派生数据）——新增备份表漏登记会被当场拦截（历史修复 历史问题 根因防御）。
 var importCountsLabels = []struct {
 	table string
 	label string
@@ -5402,7 +5402,7 @@ var importCountsLabels = []struct {
 	{"security_ip2region_version", "IP2Region 版本 %d 条"},
 	{"security_threat_sources", "威胁情报库源 %d 条"},
 	{"security_crawler_sources", "爬虫地址库源 %d 条"},
-	// A86 历史问题：节点拓扑分类（nodes）补入汇总——此前仅选「节点拓扑」时
+	// 历史修复 历史问题：节点拓扑分类（nodes）补入汇总——此前仅选「节点拓扑」时
 	// countsSummary 为空串（导入响应尾冒号、自动备份 message 无节点计数）。
 	{"nodes", "节点 %d 个"},
 }

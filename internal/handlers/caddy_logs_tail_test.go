@@ -158,7 +158,7 @@ func TestLogContentPreview_shortContentDoesNotPanic(t *testing.T) {
 // Seek(size-128KB) 后 io.ReadAll(f) 无 LimitReader——Stat 与 Read 之间日志
 // 增长时本次返回可超 128KB 上限（certjobs.readCertJobLogFile 同族已用
 // io.LimitReader）。测试钩子在 Stat 之后追加 200KB，钉住读取严格受窗口约束。
-func TestA87GetCaddyLogs_capsWindowReadAt128KB(t *testing.T) {
+func TestGetCaddyLogs_capsWindowReadAt128KB(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	logPath := filepath.Join(t.TempDir(), "caddy.log")
 	line := strings.Repeat("a", 1023) + "\n" // 1024 字节/行

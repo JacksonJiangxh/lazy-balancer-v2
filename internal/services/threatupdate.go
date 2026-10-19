@@ -287,7 +287,7 @@ func threatDueSources(trigger string) ([]threatSourceRow, error) {
 func threatListEmpty(source string) bool {
 	// 历史问题：.iplist 或 .fast 任一缺失都视为未装载——fast 是运行消费面，
 	// 只补文本不补 fast 会让新从节点/崩溃窗口永远缺加速文件。
-	// A86 历史问题：.fast 存在但损坏同样视为未装载（可读性校验，stat 不算数）。
+	// 历史修复 历史问题：.fast 存在但损坏同样视为未装载（可读性校验，stat 不算数）。
 	return threatIplistMissing(source) || threatFastUnusable(source)
 }
 
@@ -549,7 +549,7 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 	}
 	AppendThreatUpdateLog("INFO", "downloading", fmt.Sprintf("下载 %s（%s）", source.name, source.url))
 
-	// 历史问题：fast 不可用（缺失/损坏，A86 历史问题）而文本仍在时优先从现有
+	// 历史问题：fast 不可用（缺失/损坏，历史修复 历史问题）而文本仍在时优先从现有
 	// 文本重建，不依赖重新下载。
 	var entries []string
 	var rawHash string
@@ -607,7 +607,7 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 			// 跳过快照=拦截面静默为空）——记错并继续完整聚合/写库路径。
 			Logf("error", "威胁情报库: 检查源 %s 内置名单存在性失败: %v", source.name, err)
 		case listExists > 0 && threatFilesUnusable(source.name):
-			// RDB 文件化升级引导 + A86 历史问题：名单行在但 .iplist 缺失或 .fast
+			// RDB 文件化升级引导 + 历史修复 历史问题：名单行在但 .iplist 缺失或 .fast
 			// 缺失/损坏（v2.3.3 升级、带外损坏形态）——穿透快速路径照常写盘/
 			// 重编译，否则文件永不落地/损坏永不修复。
 			Logf("info", "威胁情报库: 源 %s 原始哈希一致但名单文件不可用（缺失/损坏），执行落盘修复", source.name)
@@ -721,7 +721,7 @@ func writeThreatSystemList(source string, entries []string) (bool, error) {
 		return false, fmt.Errorf("读源哈希失败: %w", err)
 	}
 	// RDB 文件化：文件缺失时哈希命中不得跳过（升级引导——v2.3.3 升上来
-	// 内容未变，但 .iplist/.fast 尚未落地，须照常写盘）。A86 历史问题：.fast
+	// 内容未变，但 .iplist/.fast 尚未落地，须照常写盘）。历史修复 历史问题：.fast
 	// 存在但损坏同样不得跳过——照常写盘完成重编译修复。
 	if listExists > 0 && storedHash == hash && storedHash != "" && !threatFilesUnusable(source) {
 		return false, nil
@@ -864,7 +864,7 @@ func threatIplistMissing(source string) bool {
 }
 
 // threatFastUnusable 报告源的 .fast 加速文件是否不可用：缺失（stat 失败）
-// 或存在但损坏/不可读（A86 历史问题，历史——旧口径只 stat，损坏文件
+// 或存在但损坏/不可读（历史修复 历史问题，历史——旧口径只 stat，损坏文件
 // 会让哈希快路径永久跳过修复、引用策略在渲染层被整体跳过）。可读性校验
 // 用 ReadFastFile 全量判定（magic/flags/尺寸/bits/掩码/序/不相交）。
 func threatFastUnusable(source string) bool {

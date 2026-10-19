@@ -110,7 +110,7 @@ func TestConfigBackup_threatSourcesRejectsForgedSource(t *testing.T) {
 // update_enabled=0 时不会自动重取，需要可执行提示）。删除行为的 历史问题-03
 // 「记录与执行面恒一致」不变量保持不变。 ──
 
-func TestA3_87_P3_13_threatReconcileDistinguishesAbsenceReasons(t *testing.T) {
+func Test87_P3_13_threatReconcileDistinguishesAbsenceReasons(t *testing.T) {
 	wafDir := t.TempDir()
 	restore := services.OverrideThreatWafDirForTest(wafDir)
 	t.Cleanup(restore)

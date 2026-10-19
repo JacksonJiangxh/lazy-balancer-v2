@@ -301,7 +301,7 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 	}
 	if services.IsConfigRejected(applyErr) {
 		// CLI 校验拒绝与 admin 4xx 同口径：不落库 + 400 + 失败审计。
-		// HP77-1（历史）：渲染副作用（稳定命名投影+证书物化）已按未提交
+		// 历史修复-1（历史）：渲染副作用（稳定命名投影+证书物化）已按未提交
 		// 内容落盘——tx 回滚的同时把磁盘回退到已提交态（零 /load）。
 		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("Caddy 校验未通过", applyErr.Error(), services.AuditResultPart("failure")))
@@ -311,7 +311,7 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 	// 乱填保障（2026-09-06 补充裁定）：CLI 不可用 + 应用传输失败 = 未经任何
 	// Caddy 级校验——不得退化提交（无法排除坏配置），回滚 + 明确提示。
 	if errors.Is(applyErr, services.ErrUnvalidatedApply) {
-		// HP77-1 同收口：回滚分支磁盘回退到已提交态（零 /load）。
+		// 历史修复-1 同收口：回滚分支磁盘回退到已提交态（零 /load）。
 		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		// A85历史问题-B：传输错误可能发生在 Caddy 已应用候选之后（请求断连/
 		// 超时）——只回滚 DB/投影会让运行配置停滞候选态，而看门狗只比对路由
@@ -490,7 +490,7 @@ func validateRuleUpstreams(protocol string, dynamicDNS bool, upstreams []models.
 		if u.Port < 1 || u.Port > 65535 {
 			return 0, fmt.Errorf("上游 #%d：端口 %d 无效（必须在 1-65535 之间）", i+1, u.Port)
 		}
-		// A86 D-3（历史裁定）：weight<1 响亮拒绝——0→1 静默归一废除
+		// 历史修复 D-3（历史裁定）：weight<1 响亮拒绝——0→1 静默归一废除
 		//（保存/导入同口径，导入侧见 config_backup.go 备份校验）；禁用行的
 		// 权重字段无业务意义但同样不得落 0（UI 载荷边界为禁用行送 1）。
 		if u.Weight < 1 {

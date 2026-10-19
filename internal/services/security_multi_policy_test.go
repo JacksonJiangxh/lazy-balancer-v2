@@ -128,7 +128,7 @@ func TestGetSecurityPoliciesForRule_SingleBindingMatchesLegacy(t *testing.T) {
 	}
 }
 
-// A86 历史问题（历史）：GetSecurityPoliciesForRule 不得在 rows 未关闭时
+// 历史修复 历史问题（历史）：GetSecurityPoliciesForRule 不得在 rows 未关闭时
 // 嵌套查询（scanSecurityPolicyByID/resolvePolicyIPListRefs）——连接池耗尽即
 // 永久阻塞（无 context 超时）。单连接池（SetMaxOpenConns(1)）下旧实现必然
 // 自锁；修复后先收集 policy_id、关闭 rows、再逐条加载，单连接即可跑通。

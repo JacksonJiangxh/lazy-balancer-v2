@@ -1,13 +1,13 @@
 package handlers
 
-// 历史修复钉测（HP77-1/HP77-5/T1，TDD RED 先行）。
+// 历史修复钉测（历史修复-1/历史修复-5/T1，TDD RED 先行）。
 //
-// HP77-1【历史问题】：拒绝路径投影未回滚——渲染副作用（稳定命名投影写盘）在
+// 历史修复-1【历史问题】：拒绝路径投影未回滚——渲染副作用（稳定命名投影写盘）在
 // ConfigRejected/ErrUnvalidatedApply 分支只回滚证书不回滚投影，DB 回滚但
 // 投影文件=未提交内容，控制面与库分叉至下次成功渲染。修复：拒绝分支以
 // 已提交库值重渲染一次仅重写投影文件（零 /load）。
 //
-// HP77-5【历史问题】：NeedForce 强制被拒时的证书/投影材料回退——与 HP77-1 同一
+// 历史修复-5【历史问题】：NeedForce 强制被拒时的证书/投影材料回退——与 历史修复-1 同一
 // 机制收口（拒绝=磁盘回滚到已提交态；证书物化内容=已提交 PEM，物化落盘
 // 本身即已提交态，需回退的是投影与 DB 侧）。
 //
@@ -95,7 +95,7 @@ func seedR77InlineACLPolicy(t *testing.T, entries string) int64 {
 	return policyID
 }
 
-// HP77-1 全量链形状（finishTxApply 拒绝分支）：已提交策略投影在役，策略更新
+// 历史修复-1 全量链形状（finishTxApply 拒绝分支）：已提交策略投影在役，策略更新
 // 被 CLI 校验拒绝（渲染先于校验完成，投影文件已按未提交内容落盘）——拒绝后
 // 投影必须回到已提交内容（旧实现停留未提交内容=必红）。
 func TestSecurityPolicySave_cliRejectionRestoresCommittedProjection(t *testing.T) {
@@ -120,7 +120,7 @@ func TestSecurityPolicySave_cliRejectionRestoresCommittedProjection(t *testing.T
 		t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
 	}
 
-	// Then：投影文件回到已提交内容（HP77-1：DB 回滚但文件=未提交内容即分叉）。
+	// Then：投影文件回到已提交内容（历史修复-1：DB 回滚但文件=未提交内容即分叉）。
 	if got := f.projectionContent(policyID); got != committed {
 		t.Fatalf("拒绝后投影文件=%q, want 已提交内容 %q（HP77-1：拒绝路径投影未回滚）", got, committed)
 	}
@@ -133,7 +133,7 @@ func TestSecurityPolicySave_cliRejectionRestoresCommittedProjection(t *testing.T
 	}
 }
 
-// HP77-1 热路径形状 + HP77-5（T1 NeedForce 分支）：名单写经投影热路径重写
+// 历史修复-1 热路径形状 + 历史修复-5（T1 NeedForce 分支）：名单写经投影热路径重写
 // 投影（未提交内容落盘）并物化已提交的新证书 → NeedForce；强制重载被 Caddy
 // 拒绝 → tx 回滚 + 磁盘回退到已提交态（投影=已提交名单内容，证书材料=已
 // 提交 PEM）。旧实现投影停留未提交内容=必红。
@@ -168,11 +168,11 @@ func TestIPListHotPath_needForceRejectedRestoresCommittedState(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 400（NeedForce 强制被拒=拒绝回滚）", rec.Code, rec.Body.String())
 	}
 
-	// HP77-1：投影文件回到已提交内容（refresh 渲染已按未提交条目重写）。
+	// 历史修复-1：投影文件回到已提交内容（refresh 渲染已按未提交条目重写）。
 	if got := f.projectionContent(policyID); got != committed {
 		t.Fatalf("NeedForce 拒绝后投影文件=%q, want 已提交内容 %q（HP77-1 热路径形状）", got, committed)
 	}
-	// HP77-5：磁盘证书材料=已提交 PEM（v2 物化内容即已提交态）。
+	// 历史修复-5：磁盘证书材料=已提交 PEM（v2 物化内容即已提交态）。
 	onDisk, err := os.ReadFile(filepath.Join(certDir, "lb-hot.crt"))
 	if err != nil {
 		t.Fatalf("读物化证书: %v", err)
@@ -312,7 +312,7 @@ func TestIPListHotPath_commitFailureBranchesRestoreCommittedView(t *testing.T) {
 	}
 }
 
-// HP77-1 链覆盖钉（发射面变化形态）：allow 模式名单空↔非空=发射面出现 →
+// 历史修复-1 链覆盖钉（发射面变化形态）：allow 模式名单空↔非空=发射面出现 →
 // 热路径 Fallback 落回 finishTxApply 全量链 → CLI 拒绝 → 400 + DB 回滚。
 // （已提交态不发射该投影——回退后文件停留为未被运行配置引用的惰性孤儿，
 // 由 24h GC 回收；内容级回滚断言由上面两条在役投影形状承载。）
@@ -359,7 +359,7 @@ func TestIPListWrite_cliRejectionRollsBackListEntries(t *testing.T) {
 	}
 }
 
-// HP77-1 链覆盖钉（导入链，ValidateTxRenderViaCLI 快照回退旁）：导入会话
+// 历史修复-1 链覆盖钉（导入链，ValidateTxRenderViaCLI 快照回退旁）：导入会话
 // 的 CLI 校验拒绝 → session.abort 回滚 → 投影回已提交内容（旧实现停留导入
 // 内容=必红）。
 func TestImportConfigBackup_cliRejectionRestoresCommittedProjection(t *testing.T) {

@@ -98,7 +98,7 @@ func (s *ClusterService) ForgetNodePin(ctx context.Context, nodeID int) (string,
 	if err := s.db.QueryRowContext(ctx, `SELECT ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,'') FROM nodes WHERE id=? AND `+masterRoleConditionSQL, nodeID).
 		Scan(&ipAddress, &port, &protocol, &accessURL); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// A86 历史问题：SQL 级角色条件（同族 TOCTOU 唯一漏点）——0 行时复核
+			// 历史修复 历史问题：SQL 级角色条件（同族 TOCTOU 唯一漏点）——0 行时复核
 			// 角色：降级窗口返回 403 哨兵，而不是继续删除主节点目录下的 pin。
 			return "", s.nodeWriteMissError(ctx)
 		}

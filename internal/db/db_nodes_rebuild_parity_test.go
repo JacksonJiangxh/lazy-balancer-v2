@@ -2,7 +2,7 @@ package db
 
 // 历史问题（历史）：nodes 整表重建的两条历史升级路径必须共用单源 DDL。
 // 此前 migrateNodesDeadColumns / migrateNodesDropMasterID 各自手写一份，已文本
-// 分叉（cluster_token_delivered DEFAULT 0 vs FALSE，列序不同），并有 Audit86
+// 分叉（cluster_token_delivered DEFAULT 0 vs FALSE，列序不同），并有 历史修复
 // 历史问题 漏列丢坐标先例。本测试钉住：两条路径产出的表形状逐列等于 fresh 稳态，
 // 且重建保值。
 
