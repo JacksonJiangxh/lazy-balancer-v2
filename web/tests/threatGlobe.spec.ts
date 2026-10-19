@@ -52,10 +52,11 @@ test('WT87-04 暂停态相机变更必须直接落点并补绘一帧', () => {
 test('WT87-02/05 下钻衬底=低透明度世界点阵，hover 他国只提亮点，且不再有 H3 死配置', () => {
   // 与 2D 地图同规则：非下钻国家降透明度点阵，不再使用国家多边形色块。
   assert.match(globeSrc, /worldDots\.filter\(\(d\) => d\.key !== drilledName\)/)
-  assert.match(globeSrc, /DRILL_BACKDROP_OPACITY = 0\.38/)
+  assert.match(globeSrc, /DRILL_BACKDROP_OPACITY = 0\.22/)
   assert.match(globeSrc, /backdropDotsPoints\.visible = !!drilledName/)
   // alphaTest 若高于 opacity 会把低透明度点全部丢弃（本次不可见根因）。
   assert.match(globeSrc, /alphaTest: 0\.05/)
+  assert.match(globeSrc, /size: DRILL_DOT_SIZE,\s+color: DRILL_BACKDROP_COLOR/)
   assert.doesNotMatch(globeSrc, /globe\.polygonsData\(|polygonCapColor\(/,
     '国家多边形衬底已退役，非下钻国家必须走暗度点阵')
   assert.doesNotMatch(globeSrc, /\.hexPolygonsData\(|\.hexPolygonResolution\(|\.hexPolygonMargin\(|\.hexPolygonColor\(/,

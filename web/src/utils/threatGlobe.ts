@@ -104,8 +104,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   const DOT_ALTITUDE = 0.005
   const WORLD_DOT_SIZE = 3.2
   const DRILL_DOT_SIZE = 6.2
-  const DRILL_BACKDROP_OPACITY = 0.38
-  const DRILL_BACKDROP_COLOR = '#58749a'
+  const DRILL_BACKDROP_OPACITY = 0.22
+  const DRILL_BACKDROP_COLOR = DOT_LAND
   const DRILL_HOVER_COLOR = '#8fe6ff'
   interface WorldDot { lat: number; lng: number; key: string }
   let worldDots: WorldDot[] | null = null
@@ -643,7 +643,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
 
     // 下钻衬底：世界点阵降透明度显示；hover 层只含当前悬停国家。
     const backdropMat = new THREE.PointsMaterial({
-      size: WORLD_DOT_SIZE * 1.15,
+      size: DRILL_DOT_SIZE,
       color: DRILL_BACKDROP_COLOR,
       transparent: true,
       opacity: DRILL_BACKDROP_OPACITY,
@@ -661,7 +661,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     dotLayerGroup.add(backdropDotsPoints)
 
     const hoverMat = new THREE.PointsMaterial({
-      size: WORLD_DOT_SIZE,
+      size: DRILL_DOT_SIZE,
       color: DRILL_HOVER_COLOR,
       transparent: true,
       opacity: 0.9,
