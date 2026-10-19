@@ -184,6 +184,13 @@ func TestThreatLib_flagsOnlyToggleUpdateEnabled(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT id, url FROM security_threat_sources WHERE name='ustc'`).Scan(&id, &origURL); err != nil {
 		t.Fatal(err)
 	}
+	// 关闭前留下失败态与未来排程槽：关闭必须清掉瞬时失败态与过期槽，
+	// 否则列表继续显示「更新失败」，重新启用也无法武装首槽。
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources
+		SET update_status='failed', message='下载或解析失败', next_update='2099-01-01 00:00:00', consecutive_failures=3
+		WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
 
 	// When：携带伪造 url/name（必须被忽略）
 	body := `{"update_enabled":false,"url":"https://evil.example/x","name":"forged"}`
@@ -197,9 +204,10 @@ func TestThreatLib_flagsOnlyToggleUpdateEnabled(t *testing.T) {
 		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
 	}
 	var updateEnabled bool
-	var url, name string
-	if err := db.DB.QueryRow(`SELECT update_enabled, url, name FROM security_threat_sources WHERE id=?`, id).
-		Scan(&updateEnabled, &url, &name); err != nil {
+	var url, name, status, message, nextUpdate string
+	var failures int
+	if err := db.DB.QueryRow(`SELECT update_enabled, url, name, update_status, message, COALESCE(next_update,''), consecutive_failures FROM security_threat_sources WHERE id=?`, id).
+		Scan(&updateEnabled, &url, &name, &status, &message, &nextUpdate, &failures); err != nil {
 		t.Fatal(err)
 	}
 	if updateEnabled {
@@ -207,6 +215,34 @@ func TestThreatLib_flagsOnlyToggleUpdateEnabled(t *testing.T) {
 	}
 	if url != origURL || name != "ustc" {
 		t.Fatalf("伪造字段被写入: url=%q name=%q", url, name)
+	}
+	if status != "idle" {
+		t.Errorf("关闭后 update_status=%q want idle（残留失败态会继续显示更新失败）", status)
+	}
+	if message != "已关闭自动更新" {
+		t.Errorf("关闭后 message=%q want 已关闭自动更新", message)
+	}
+	if nextUpdate != "" {
+		t.Errorf("关闭后 next_update=%q want 空（重新启用才能武装首槽）", nextUpdate)
+	}
+	if failures != 0 {
+		t.Errorf("关闭后 consecutive_failures=%d want 0", failures)
+	}
+
+	// When：重新启用 → 关闭提示清除，开关恢复
+	req = httptest.NewRequest(http.MethodPut, "/security/threat-lib/"+strconv.Itoa(id)+"/flags", strings.NewReader(`{"update_enabled":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp = httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("re-enable status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if err := db.DB.QueryRow(`SELECT update_enabled, message FROM security_threat_sources WHERE id=?`, id).
+		Scan(&updateEnabled, &message); err != nil {
+		t.Fatal(err)
+	}
+	if !updateEnabled || message != "" {
+		t.Errorf("重新启用后 update_enabled=%v message=%q want true/空", updateEnabled, message)
 	}
 }
 

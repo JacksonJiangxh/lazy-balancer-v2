@@ -528,7 +528,8 @@
         </el-table-column>
         <el-table-column label="状态" width="110">
           <template #default="{ row }">
-            <el-tag :type="libraryStatusTagType(row.update_status)" size="small" effect="light">{{ libraryStatusLabel(row.update_status) }}</el-tag>
+            <el-tag v-if="!row.update_enabled" type="info" size="small" effect="light">已关闭</el-tag>
+            <el-tag v-else :type="libraryStatusTagType(row.update_status)" size="small" effect="light">{{ libraryStatusLabel(row.update_status) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="自动更新" width="90" align="center">
@@ -586,7 +587,8 @@
         </el-table-column>
         <el-table-column label="状态" width="110">
           <template #default="{ row }">
-            <el-tag :type="libraryStatusTagType(row.update_status)" size="small" effect="light">{{ libraryStatusLabel(row.update_status) }}</el-tag>
+            <el-tag v-if="!row.update_enabled" type="info" size="small" effect="light">已关闭</el-tag>
+            <el-tag v-else :type="libraryStatusTagType(row.update_status)" size="small" effect="light">{{ libraryStatusLabel(row.update_status) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="自动更新" width="90" align="center">

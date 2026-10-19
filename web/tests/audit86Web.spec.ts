@@ -120,29 +120,3 @@ test('A86 历史问题：ThreatScreen 经 createVisibilityIntervals 接管 hidde
   assert.match(unmountBlock, /screenLoop\.stop\(\)/)
   assert.match(unmountBlock, /releaseCollector\(\)/)
 })
-
-// ---- 节点站点列（ClusterMasterPanel 只读抽取，不改组件） ----
-test('A86 历史问题：站点坐标列渲染/继承标注行为与响应式列隐藏阈值', () => {
-  const panel = source('src/views/settings/cluster/ClusterMasterPanel.vue')
-  // siteCoordinateLabel 抽取求值（真实行为）
-  const fnBlock = sectionBetween(panel, 'const siteCoordinateLabel = ', 'const operationColumnFixed')
-  const js = fnBlock.replace(/\(node: ClusterNode\): string/g, '(node)')
-  const siteCoordinateLabel = new Function(`${js}; return siteCoordinateLabel`)() as (node: { server_map_lat?: number | null; server_map_lon?: number | null; site_inherited?: boolean }) => string
-  assert.equal(siteCoordinateLabel({ server_map_lat: 0, server_map_lon: 0 }), '未配置')
-  assert.equal(siteCoordinateLabel({}), '未配置', '缺省坐标按未配置渲染')
-  assert.equal(siteCoordinateLabel({ server_map_lat: 35.19, server_map_lon: 108.87, site_inherited: false }), '35.19, 108.87')
-  assert.equal(siteCoordinateLabel({ server_map_lat: 35.19, server_map_lon: 108.87, site_inherited: true }), '35.19, 108.87（默认）', '继承主节点坐标必须标注（默认）')
-  // 站点列可点编辑且只读禁用
-  const column = sectionBetween(panel, '<el-table-column label="站点坐标"', '</el-table-column>')
-  assert.match(column, /\$emit\('edit-site', row\)/)
-  assert.match(column, /:disabled="readOnly"/)
-  // 响应式列隐藏阈值（求值边界两侧）
-  for (const [name, marker] of [['showHealthColumn', 'const showHealthColumn'], ['showLastSeenColumn', 'const showLastSeenColumn']] as const) {
-    const expr = panel.match(new RegExp(`${marker} = computed\\(\\(\\) => viewportWidth\\.value >= (\\d+)\\)`))
-    assert.ok(expr, `缺 ${name} 阈值表达式`)
-    const threshold = Number(expr[1])
-    const visible = new Function('w', `return w >= ${threshold}`) as (w: number) => boolean
-    assert.equal(visible(threshold - 1), false, `${name} 阈值下界应隐藏`)
-    assert.equal(visible(threshold), true, `${name} 达阈值应显示`)
-  }
-})

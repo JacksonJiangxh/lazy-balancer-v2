@@ -1,14 +1,13 @@
-// 威胁大屏流量/事件量指数纯函数验收：
+// 威胁大屏流量纯函数验收：
 //   A. trafficDelta 首轮基线、normal/attack 双桶、真实间隔、
 //      抽样还原计数不二次放大（历史问题）、计数器回退/抽样比变化、新增国家不尖峰
-//   B. threatIndex 单调且 1/2/9/1000 有区分度、0 分不显示进度
 //
 // 运行：cd web && npm test
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { trafficDelta, threatIndex, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '../src/utils/threatScreenMetrics.ts'
+import { trafficDelta, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '../src/utils/threatScreenMetrics.ts'
 
 function baseline(counts: Record<string, { normal: number; attack?: number }>, at: number, sampleN = 1): TrafficBaseline {
   return {
@@ -94,21 +93,6 @@ test('A9 脏值按 0 处理（缺失/非数值不产生 NaN）', () => {
   assert.equal(dirty.reset, true)
   assert.equal(Number.isNaN(dirty.normalQps), false)
   assert.equal(Number.isNaN(dirty.attackQps), false)
-})
-
-test('B 事件量指数：0→0、有量下限 2、单调且 1/2/9/1000 可区分', () => {
-  assert.equal(threatIndex(0), 0)
-  assert.equal(threatIndex(-5), 0)
-  const marks = [1, 2, 9, 100, 1000, 10000, 100000]
-  const values = marks.map(threatIndex)
-  for (let i = 1; i < values.length; i++) {
-    assert.ok(values[i] > values[i - 1], `标尺非单调: ${marks[i - 1]}→${values[i - 1]} / ${marks[i]}→${values[i]}`)
-  }
-  assert.equal(threatIndex(1), 2, '有事件不得显示 0（下限 2）')
-  assert.ok(threatIndex(9) > threatIndex(2))
-  assert.ok(threatIndex(1000) >= 55, '千次量级应进入中高分区')
-  assert.equal(threatIndex(100000), 100)
-  assert.equal(threatIndex(1_000_000), 100, '上限钳制 100')
 })
 
 test('C 拦截/分钟展示只还原一次 10 倍定点，不再放大', () => {

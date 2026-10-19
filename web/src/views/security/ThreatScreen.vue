@@ -102,7 +102,7 @@
         </div>
         <div>
           <h1 class="glitch" data-text="安全威胁大屏">安全威胁大屏</h1>
-          <p>近 {{ windowHours }} 小时安全态势实时监控 <time class="mono">{{ clockText }}</time><span class="mono clock-date">{{ clockDate }}</span><span class="scope-badge">本节点数据</span></p>
+          <p>近 {{ windowHours }} 小时安全态势实时监控 <time class="mono">{{ clockText }}</time><span class="mono clock-date">{{ clockDate }}</span></p>
         </div>
       </div>
 
@@ -110,7 +110,7 @@
         <div class="kpi"><span class="kpi-value">{{ displayTotal }}</span><span class="kpi-label">{{ windowHours }}h 安全事件 · 拦截 {{ stats?.blocked_events ?? 0 }} / 检测 {{ loggedEvents }}</span></div>
         <div class="kpi"><span class="kpi-value cool">{{ blockRateText }}</span><span class="kpi-label">拦截率 · 拦截 / 全部安全事件</span></div>
         <div class="kpi"><span class="kpi-value">{{ displayRecentRate }}</span><span class="kpi-label">拦截/分钟 · 近 5 分钟</span></div>
-        <div class="kpi"><span class="kpi-value">{{ displayActive }}</span><span class="kpi-label">活跃来源 · 近 10 分钟</span></div>
+        <div class="kpi"><span class="kpi-value">{{ displayActive }}</span><span class="kpi-label">活跃攻击 IP · 近 10 分钟</span></div>
       </div>
 
       <div class="actions">
@@ -139,22 +139,17 @@
         <h2>安全态势统计 <span class="en">POSTURE</span></h2>
       </div>
       <div class="stats">
-        <div class="stat-section">
-          <div class="stat-title"><span title="按当前窗口全局安全事件量定标（对数），不是风险评分：10 次≈20 / 1,000 次≈60 / 10 万次=100">事件量指数</span><span class="n">{{ threatGauge.pct }}</span></div>
-          <div class="gauge-row">
-            <svg class="gauge" viewBox="0 0 120 70" role="img" aria-label="事件量指数">
-              <path class="gauge-track" d="M10 62 A50 50 0 0 1 110 62" fill="none"></path>
-              <path class="gauge-fill" :stroke="threatGauge.color" :stroke-dasharray="`${threatGauge.pct * 1.571} 157.1`" d="M10 62 A50 50 0 0 1 110 62" fill="none"></path>
-              <text x="60" y="52" text-anchor="middle" class="gauge-num">{{ threatGauge.pct }}</text>
-            </svg>
-            <div class="gauge-side">
-              <span class="level" :style="{ '--lv': threatGauge.color }">{{ threatGauge.level }}</span>
-              <dl>
-                <dt>拦截事件</dt><dd>{{ stats?.blocked_events ?? 0 }}</dd>
-                <dt>攻击源国家</dt><dd>{{ countryCount }}</dd>
-                <dt>TOP3 命中次数</dt><dd>{{ topRuleHits }}</dd>
-              </dl>
+        <div class="stat-section overview-section">
+          <div class="stat-title"><span>窗口概览</span></div>
+          <div class="overview-grid">
+            <div class="ov-item"><span>事件总量</span><b>{{ stats?.total_events ?? 0 }}</b></div>
+            <div class="ov-item"><span>拦截 / 检测</span><b>{{ stats?.blocked_events ?? 0 }} / {{ loggedEvents }}</b></div>
+            <div class="ov-item">
+              <span>峰值时段</span>
+              <b>{{ peakSlot.value > 0 ? peakSlot.name : '—' }}</b>
+              <em v-if="peakSlot.value > 0">{{ peakSlot.value }} 次</em>
             </div>
+            <div class="ov-item"><span>有事件小时</span><b>{{ activeHourCount }}/{{ hourlyHist.length }}</b></div>
           </div>
         </div>
 
@@ -162,7 +157,7 @@
           <div class="stat-title"><span>事件族构成</span><span class="n">{{ shareTotal }}</span></div>
           <div class="donut-row">
             <div class="donut">
-              <svg viewBox="0 0 36 36" role="img" aria-label="攻击类型占比">
+              <svg viewBox="0 0 36 36" role="img" :aria-label="`攻击类型占比：共 ${shareTotal} 次`">
                 <circle class="donut-track" cx="18" cy="18" r="15.9" pathLength="100"></circle>
                 <circle
                   v-for="(seg, i) in shareSegments"
@@ -192,7 +187,7 @@
         </div>
 
         <div class="stat-section">
-          <div class="stat-title"><span>来源国家 TOP3</span><span class="n">含检测</span></div>
+          <div class="stat-title"><span title="仅统计窗口内具备 GeoIP 归属地的事件来源">有归属地国家 TOP3</span><span class="n">{{ countryCount }}</span></div>
           <ul v-if="topCountries.length" class="rules country-bars">
             <li v-for="item in topCountries" :key="item.name" class="rule" :title="item.name">
               <span class="rule-name">{{ item.name }}</span>
@@ -204,32 +199,37 @@
         </div>
 
         <div class="stat-section">
-          <div class="stat-title"><span>TOP 被攻击站点</span><span class="n">{{ targetHits }}</span></div>
-          <ul v-if="topTargets.length" class="rules">
-            <li v-for="item in topTargets" :key="item.name + item.domain" class="rule" :title="item.domain || item.name">
-              <span class="rule-name">{{ item.domain || item.name }}</span>
-              <span class="cnt">{{ item.value }}</span>
-              <span class="rule-bar"><i :style="{ width: targetBarWidth(item.value) }"></i></span>
-            </li>
-          </ul>
-          <div v-else class="empty">暂无规则维度数据</div>
+          <div class="stat-title"><span>TOP 目标 / 规则</span><span class="n" title="当前维度前 3 条命中合计">{{ activeStatSum }}</span></div>
+          <div class="stat-tabs" role="tablist" aria-label="TOP 排名维度">
+            <button type="button" class="stat-tab" role="tab" :aria-selected="statTab === 'targets'" @click="statTab = 'targets'">被攻击目标</button>
+            <button type="button" class="stat-tab" role="tab" :aria-selected="statTab === 'rules'" @click="statTab = 'rules'">命中规则</button>
+          </div>
+          <template v-if="statTab === 'targets'">
+            <ul v-if="topTargets.length" class="rules">
+              <li v-for="item in topTargets" :key="item.name + item.domain" class="rule" :title="item.domain || item.name">
+                <span class="rule-name">{{ item.domain || item.name }}</span>
+                <span class="cnt">{{ item.value }}</span>
+                <span class="rule-bar"><i :style="{ width: targetBarWidth(item.value) }"></i></span>
+              </li>
+            </ul>
+            <div v-else class="empty">暂无规则维度数据</div>
+          </template>
+          <template v-else>
+            <ul v-if="topRules.length" class="rules">
+              <li v-for="item in topRules" :key="item.name" class="rule" :title="item.name">
+                <span class="rule-name">{{ ruleLabel(item.name) }}</span>
+                <span class="cnt">{{ item.value }}</span>
+                <span class="rule-bar"><i :style="{ width: ruleBarWidth(item.value) }"></i></span>
+              </li>
+            </ul>
+            <div v-else class="empty">暂无数据</div>
+          </template>
         </div>
-
-        <div class="stat-section">
-          <div class="stat-title"><span title="自最近一次 Caddy 配置重载/进程启动以来累计；含上游自返 429">限流累计（自重载）</span><span class="n">{{ ratelimitAvailable ? displayRatelimit : '—' }}</span></div>
-        </div>
-
-        <div class="stat-section">
-          <div class="stat-title"><span>TOP 命中规则（前 3 条命中次数）</span><span class="n">{{ topRuleHits }}</span></div>
-          <ul v-if="topRules.length" class="rules">
-            <li v-for="item in topRules" :key="item.name" class="rule" :title="item.name">
-              <span class="rule-name">{{ ruleLabel(item.name) }}</span>
-              <span class="cnt">{{ item.value }}</span>
-              <span class="rule-bar"><i :style="{ width: ruleBarWidth(item.value) }"></i></span>
-            </li>
-          </ul>
-          <div v-else class="empty">暂无数据</div>
-        </div>
+      </div>
+      <div class="panel-footer" title="自最近一次 Caddy 配置重载/进程启动以来累计；含上游自返 429；不受窗口切换影响">
+        <span>限流累计 · 自重载</span>
+        <b>{{ ratelimitAvailable ? displayRatelimit : '—' }}</b>
+        <em>不受窗口影响</em>
       </div>
     </aside>
 
@@ -287,7 +287,7 @@ import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
 import { isRealtimeFlowEvent } from '@/utils/threatFlowRules'
 import { useCountUp } from '@/composables/useCountUp'
 import { formatDate } from '@/utils/date'
-import { trafficDelta, threatIndex, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '@/utils/threatScreenMetrics'
+import { trafficDelta, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '@/utils/threatScreenMetrics'
 import { flowBucket, flowBucketKey, flowGroupEvents, flowRegionKey, flowTimestamp, shouldAggregate, normalizeTrafficSampleN, reconstructObservedRate, stepAdaptiveSample, nextFlowCursor } from '@/utils/threatFlowRules'
 import type { ThreatScene, ThreatSceneOptions } from '@/utils/threatScene'
 
@@ -388,6 +388,15 @@ const hourlyTotal = computed(() => hourlyHist.value.reduce((m, slot) => m + slot
 // 文案与变量同口径改为「前 3 条命中次数」；真实 distinct 规则数需后端新增字段。
 const topRuleHits = computed(() => topRules.value.reduce((m, item) => m + item.value, 0))
 const hourlyHist = computed(() => stats.value?.hourly_hist ?? [])
+const statTab = ref<'targets' | 'rules'>('targets')
+const activeStatSum = computed(() => statTab.value === 'rules' ? topRuleHits.value : targetHits.value)
+// 峰值时段与有事件小时：窗口概览摆脱不可解释的对数指数，改为可直接读懂的
+// 分布指标；并列峰值取时间靠前者（后端桶按时间升序）。
+const peakSlot = computed(() => hourlyHist.value.reduce(
+  (best, slot) => slot.value > best.value ? slot : best,
+  { name: '—', value: 0 },
+))
+const activeHourCount = computed(() => hourlyHist.value.filter((slot) => slot.value > 0).length)
 // 原始表最早事件晚于窗口起点 = 窗口前段已被保留期/行帽裁剪，rollup 的 0
 // 不是「无事件」而是「不可重建」；与普通回填进行中区分文案。
 const rawCoverageGap = computed(() => {
@@ -684,16 +693,6 @@ function flushArcs(): void {
   arcQueue = []
 }
 
-// ============ 威胁指数（0-100，24h 全局攻击总量独立标尺） ============
-// 历史 历史问题：原复用单国热力标尺 log10(1..1000)，全局 24h 总量在
-// 1~999 区间几乎无区分度；threatIndex 以 10 万≈满分的独立对数标尺定标。
-const threatGauge = computed(() => {
-  const pct = threatIndex(stats.value?.total_events ?? 0)
-  const level = pct >= 67 ? '严重' : pct >= 34 ? '高' : pct > 0 ? '中' : '低'
-  const color = pct >= 67 ? '#ff4d5e' : pct >= 34 ? '#ff7a2f' : pct > 0 ? '#ffb020' : '#3ddc84'
-  return { pct, level, color }
-})
-
 // ============ 正常流量 sparkline（计数器差分 → QPS 采样窗口） ============
 // 历史 历史问题/历史问题：available=false（Caddy admin 不可达）时保留上一帧
 // 并显性提示，不再把采集失败渲染为 0 流量；首轮只建基线；QPS 按真实间隔
@@ -918,9 +917,9 @@ async function mountEngine(): Promise<void> {
   }
   const mode: 'map' | 'globe' = screenMode.value === 'globe' ? 'globe' : 'map'
   if (threatMap && mountedMode === mode) {
-    // 历史问题：同模式重入也补发本站坐标——/config 晚到时首次 setServer 可能
-    // 落在引擎尚未创建的空窗，remount 早退会永久丢失信标/弹道。
-    if (siteConfigured.value) threatMap.setServer([serverLatLon[1], serverLatLon[0]])
+    // 同模式重入直接返回。本站坐标由 loadServerCentroid 在 /config 到达时
+    // 直接补发；此处再发一次会让 4s 兜底定时器对已装载引擎重复 setServer，
+    // 3D 地球表现为自动旋转数秒后「往回转一下」（相机动画回本站坐标）。
     return
   }
   engineMounting = true
@@ -1216,7 +1215,7 @@ onBeforeUnmount(() => {
 }
 .brand p { font-size: 11px; color: #8ea7d6; letter-spacing: 0.06em; display: flex; gap: 10px; align-items: center; white-space: nowrap; margin-top: 2px; }
 .brand p time { color: #3ad1ff; font-size: 13px; }
-.clock-date { color: #56709f; font-size: 10px; }
+.clock-date { color: #7d93b8; font-size: 13px; font-variant-numeric: tabular-nums; }
 
 .kpis { flex: 1; display: flex; justify-content: center; min-width: 0; }
 .kpi { position: relative; flex: none; display: flex; flex-direction: column; gap: 3px; padding: 2px 26px; }
@@ -1238,7 +1237,6 @@ onBeforeUnmount(() => {
 .window-btn { appearance: none; border: 0; background: transparent; color: #7d93b8; font: 11px/1 mono, monospace; padding: 7px 9px; cursor: pointer; }
 .window-btn + .window-btn { border-left: 1px solid rgba(58, 209, 255, 0.18); }
 .window-btn[aria-pressed='true'] { color: #03101f; background: #3ad1ff; }
-.scope-badge { margin-left: 8px; padding: 2px 6px; border: 1px solid rgba(58, 209, 255, 0.3); border-radius: 3px; color: #7d93b8; font: 10px/1 mono, monospace; }
 @media (prefers-reduced-motion: reduce) {
   .threat-screen::before, .threat-screen::after { animation: none !important; }
   .hud { backdrop-filter: none; }
@@ -1305,7 +1303,8 @@ onBeforeUnmount(() => {
 .event[data-sev='low'] { --sev: #3ddc84; }
 .event:hover { border-color: rgba(80, 170, 255, 0.45); }
 .ev-icon svg { width: 14px; height: 14px; }
-.ev-top { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: #56709f; font-variant-numeric: tabular-nums; }
+.ev-top { display: flex; justify-content: flex-start; align-items: center; gap: 10px; font-size: 11px; color: #56709f; font-variant-numeric: tabular-nums; }
+.ev-top .act { margin-left: auto; }
 .sev { font-size: 10px; line-height: 1; padding: 3px 6px; border: 1px solid; }
 .sev-high { color: #ff4d5e; border-color: rgba(255, 77, 94, 0.5); background: rgba(255, 77, 94, 0.12); }
 .sev-mid { color: #ffb020; border-color: rgba(255, 176, 32, 0.5); background: rgba(255, 176, 32, 0.12); }
@@ -1400,27 +1399,31 @@ onBeforeUnmount(() => {
 
 /* ---------- 右列统计 ---------- */
 .stats { flex: 1; min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: rgba(80, 160, 255, 0.3) transparent; }
-.stat-section { padding: 12px 14px; border-bottom: 1px solid rgba(80, 160, 255, 0.16); }
+.stat-section { padding: 10px 14px; border-bottom: 1px solid rgba(80, 160, 255, 0.16); }
 .stat-section:last-child { border-bottom: 0; }
-.stat-title { display: flex; justify-content: space-between; align-items: baseline; font-size: 11px; color: #8ea7d6; letter-spacing: 0.12em; margin-bottom: 8px; }
+.stat-title { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; color: #8ea7d6; letter-spacing: 0.08em; margin-bottom: 6px; }
 .stat-title .n { font-size: 20px; color: #ffd166; font-weight: 700; line-height: 1; }
 
-.gauge-row { display: grid; grid-template-columns: 130px 1fr; gap: 10px; align-items: center; }
-.gauge { width: 130px; height: 74px; }
-.gauge-track { stroke: rgba(80, 160, 255, 0.12); stroke-width: 7; }
-.gauge-fill { stroke-width: 7; stroke-linecap: round; filter: drop-shadow(0 0 6px currentColor); transition: stroke-dasharray 0.8s ease; }
-.gauge-num { fill: #e2ecff; font-size: 17px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.gauge-side { display: grid; gap: 8px; }
-.level {
-  justify-self: start;
-  font-weight: 700; font-size: 15px; letter-spacing: 0.2em;
-  padding: 3px 10px; border: 1px solid currentColor;
-  color: var(--lv, #ffb020);
-  background: color-mix(in srgb, var(--lv, #ffb020) 14%, transparent);
-  text-shadow: 0 0 10px currentColor;
+.overview-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 14px; }
+.ov-item { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.ov-item span { font-size: 11px; color: #8ea7d6; }
+.ov-item b { font-size: 16px; color: #e2ecff; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ov-item em { font-style: normal; font-size: 10px; color: #56709f; }
+
+.stat-tabs { display: flex; gap: 6px; margin-bottom: 7px; }
+.stat-tab {
+  padding: 3px 9px; border: 1px solid rgba(80, 160, 255, 0.28);
+  background: transparent; color: #8ea7d6; font-size: 11px; cursor: pointer;
 }
-.gauge-side dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 11px; color: #8ea7d6; }
-.gauge-side dd { margin: 0; text-align: right; font-size: 14px; font-weight: 700; color: #e2ecff; font-variant-numeric: tabular-nums; }
+.stat-tab[aria-selected='true'] { background: #3ad1ff; border-color: #3ad1ff; color: #03101f; font-weight: 700; }
+
+.panel-footer {
+  flex: none; display: flex; align-items: baseline; gap: 8px;
+  padding: 8px 14px; border-top: 1px solid rgba(80, 160, 255, 0.16);
+  font-size: 11px; color: #8ea7d6;
+}
+.panel-footer b { margin-left: auto; font-size: 16px; color: #e2ecff; font-variant-numeric: tabular-nums; }
+.panel-footer em { font-style: normal; font-size: 10px; color: #56709f; }
 
 .rules { display: grid; gap: 9px; margin: 0; padding: 0; list-style: none; }
 .rule { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; font-size: 12px; align-items: baseline; }
@@ -1435,18 +1438,18 @@ onBeforeUnmount(() => {
 }
 .country-bars .rule-bar i { background: linear-gradient(90deg, #ffd166, #ff4d4d); box-shadow: 0 0 8px rgba(255, 106, 61, 0.5); }
 
-.donut-row { display: flex; align-items: center; gap: 14px; }
-.donut { position: relative; width: 116px; height: 116px; flex: none; }
+.donut-row { display: flex; align-items: center; gap: 12px; }
+.donut { position: relative; width: 96px; height: 96px; flex: none; }
 .donut svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 .donut-track { fill: none; stroke: rgba(80, 160, 255, 0.1); stroke-width: 2.5; }
 .donut-seg { fill: none; stroke-width: 2.5; }
 .donut-center { position: absolute; inset: 0; display: grid; place-items: center; align-content: center; pointer-events: none; line-height: 1; }
-.donut-center b { font-size: 26px; font-weight: 700; color: #ffd166; }
-.donut-center span { font-size: 10px; color: #8ea7d6; letter-spacing: 0.12em; margin-top: 3px; }
-.type-legend { flex: 1; min-width: 0; display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
-.type-legend li { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.donut-center b { font-size: 24px; font-weight: 700; color: #ffd166; }
+.donut-center span { font-size: 11px; color: #8ea7d6; letter-spacing: 0.12em; margin-top: 3px; }
+.type-legend { flex: 1; min-width: 0; display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.type-legend li { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .type-legend .sw { width: 8px; height: 8px; flex: none; transform: rotate(45deg); }
-.type-legend .cnt { margin-left: auto; font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; color: #e2ecff; }
+.type-legend .cnt { margin-left: auto; font-weight: 700; font-size: 16px; font-variant-numeric: tabular-nums; color: #e2ecff; }
 
 /* ---------- 底部双图 ---------- */
 .chart-box { flex: 1; min-height: 0; padding: 6px 14px 4px; display: flex; flex-direction: column; }

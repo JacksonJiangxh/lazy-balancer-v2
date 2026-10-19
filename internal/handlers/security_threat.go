@@ -191,9 +191,18 @@ func (h *Handlers) UpdateThreatSourceFlags(c *gin.Context) {
 		}
 		return
 	}
-	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=?, updated_at=datetime('now') WHERE id=?`, *body.UpdateEnabled, id); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
-		return
+	if *body.UpdateEnabled {
+		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=1, message='', updated_at=datetime('now') WHERE id=?`, id); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
+			return
+		}
+	} else {
+		// 关闭即退出更新任务：清掉关闭前的瞬时失败态与排程槽，否则列表/库头
+		// 继续显示「更新失败」，重新启用还会因残留未来槽无法武装首槽。
+		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=0, update_status='idle', message='已关闭自动更新', next_update=NULL, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`, id); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
+			return
+		}
 	}
 	if *body.UpdateEnabled {
 		services.ArmThreatFirstSlots()

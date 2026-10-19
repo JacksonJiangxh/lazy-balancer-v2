@@ -5,9 +5,6 @@
 //     1/N 抽样时按 N 累加），前端不得再乘 sample_n（旧实现二次放大，N=8 时
 //     QPS/光流最高高估 8 倍）。sample_n 仅用于基线重建判定（抽样比切换时
 //     计数口径改变，必须重置基线避免尖峰）。
-//   - threatIndex：24h 全局事件总量 → 0-100 仪表标尺（展示「事件量指数」，
-//     不再宣称风险等级）。
-
 export interface TrafficBaseline {
   readonly counts: ReadonlyMap<string, { normal: number; attack: number }>
   /** 采样时刻（与 now 同源）。 */
@@ -73,12 +70,6 @@ export function trafficDelta(
   const normalQps = elapsedSec > 0 ? normalTotal / elapsedSec : 0
   const attackQps = elapsedSec > 0 ? attackTotal / elapsedSec : 0
   return { baseline: false, reset: false, normalDeltas, attackDeltas, normalTotal, attackTotal, normalQps, attackQps, sampleN: safeSample }
-}
-
-/** 全局事件总量 → 仪表百分比（log 标尺 10 万≈满分，下限 2 避免「有事件但显示 0」）。 */
-export function threatIndex(total: number): number {
-  if (!Number.isFinite(total) || total <= 0) return 0
-  return Math.min(100, Math.max(2, Math.round((Math.log10(total) / 5) * 100)))
 }
 
 /** 拦截/分钟展示：后端已是一位小数，UI 用 ×10 整数动画后还原。 */

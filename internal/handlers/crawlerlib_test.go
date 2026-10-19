@@ -106,6 +106,11 @@ func TestCrawlerLibFlags_updateAndNotFound(t *testing.T) {
 	// Given
 	router := newCrawlerTestRouter(t)
 	seedCrawlerSource(t, 1, "googlebot", 170)
+	// 关闭前留下失败状态与排程槽：关闭必须清掉瞬时失败态与过期槽，
+	// 否则列表继续显示「更新失败」，重新启用也无法武装首槽。
+	if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_status='failed', message='下载或解析失败' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
 
 	// When：关闭源开关
 	resp := httptest.NewRecorder()
@@ -117,11 +122,21 @@ func TestCrawlerLibFlags_updateAndNotFound(t *testing.T) {
 		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
 	}
 	var enabled int
-	if err := db.DB.QueryRow(`SELECT update_enabled FROM security_crawler_sources WHERE id=1`).Scan(&enabled); err != nil {
+	var status, message, nextUpdate string
+	if err := db.DB.QueryRow(`SELECT update_enabled, update_status, message, COALESCE(next_update,'') FROM security_crawler_sources WHERE id=1`).Scan(&enabled, &status, &message, &nextUpdate); err != nil {
 		t.Fatal(err)
 	}
 	if enabled != 0 {
 		t.Errorf("update_enabled=%d want 0", enabled)
+	}
+	if status != "idle" {
+		t.Errorf("关闭后 update_status=%q want idle（残留失败态会继续计入库健康）", status)
+	}
+	if message != "已关闭自动更新" {
+		t.Errorf("关闭后 message=%q want 已关闭自动更新", message)
+	}
+	if nextUpdate != "" {
+		t.Errorf("关闭后 next_update=%q want 空（重新启用才能武装首槽）", nextUpdate)
 	}
 
 	// When：不存在的源

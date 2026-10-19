@@ -811,7 +811,9 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       siteConfigured = true
       globe.ringsData([{ lat: server[1], lng: server[0] }])
       applyHotspots()
-      if (!drilledName) globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, 600)
+      // 本站坐标到达即定位：不播放 600ms 相机动画——/config 晚于 4s 兜底
+      // 装载时，动画会让自动旋转中的地球明显「往回转一下」。
+      if (!drilledName) globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, 0)
     },
     zoomOut(): void {
       drilledName = null

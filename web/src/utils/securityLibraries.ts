@@ -24,6 +24,7 @@ const STATUS_LABELS: Record<string, string> = {
   reloading: '重载中',
   success: '已最新',
   idle: '已最新',
+  disabled: '已关闭',
 }
 
 export const libraryStatusLabel = (status: string): string =>
@@ -32,7 +33,7 @@ export const libraryStatusLabel = (status: string): string =>
 export const libraryStatusTagType = (status: string): LibraryTagType => {
   if (!status) return 'info'
   if (status === 'missing' || status === 'failed' || status.includes('失败') || status.includes('错误')) return 'danger'
-  if (status === 'not-installed' || status === 'never') return 'info'
+  if (status === 'not-installed' || status === 'never' || status === 'disabled') return 'info'
   if (status === 'checking' || status === 'downloading' || status === 'installing' || status === 'reloading' || status === 'running') return 'warning'
   if (status === 'success' || status === 'idle' || status.includes('最新')) return 'success'
   if (status.includes('中')) return 'warning'
@@ -42,6 +43,7 @@ export const libraryStatusTagType = (status: string): LibraryTagType => {
 export interface LibrarySourceRow {
   readonly version?: string
   readonly update_status?: string
+  readonly update_enabled?: boolean
   readonly entry_count?: number
   readonly last_checked?: string
   readonly next_update?: string
@@ -50,7 +52,7 @@ export interface LibrarySourceRow {
 export interface LibrarySummary {
   readonly latestVersion: string
   readonly totalEntries: number
-  readonly status: 'running' | 'failed' | 'success' | 'never'
+  readonly status: 'running' | 'failed' | 'success' | 'never' | 'disabled'
   readonly lastChecked: string
   readonly nextUpdate: string
 }
@@ -68,17 +70,22 @@ export const summarizeLibrarySources = (
   sources: readonly LibrarySourceRow[],
   formatDate: (value?: string) => string = (value) => value || '',
 ): LibrarySummary => {
-  const anyRunning = sources.some((s) => s.update_status === 'running')
-  const anyFailed = !anyRunning && sources.some((s) => s.update_status === 'failed')
+  // 已关闭源不参与任务状态聚合：关闭前的 failed 是历史态，继续计入会让
+  // 库头持续显示「N 源更新失败」，而该源实际已不在任何更新任务内。
+  const active = sources.filter((s) => s.update_enabled !== false)
+  const anyRunning = active.some((s) => s.update_status === 'running')
+  const anyFailed = !anyRunning && active.some((s) => s.update_status === 'failed')
   const latestVersion = sources.map((s) => s.version).filter((v): v is string => !!v).sort(compareVersion).pop() || ''
   const totalEntries = sources.reduce((sum, s) => sum + (s.entry_count || 0), 0)
-  // 上次更新取最晚、下次更新取最早（空源 → '—'）
+  // 上次更新取最晚、下次更新取最早（空源 → '—'）；下次排程只看启用源。
   const lastChecked = sources.map((s) => formatDate(s.last_checked)).filter(Boolean).sort().pop() || '—'
-  const nextUpdate = sources.map((s) => formatDate(s.next_update)).filter(Boolean).sort().shift() || '—'
+  const nextUpdate = active.map((s) => formatDate(s.next_update)).filter(Boolean).sort().shift() || '—'
   return {
     latestVersion,
     totalEntries,
-    status: anyRunning ? 'running' : anyFailed ? 'failed' : latestVersion ? 'success' : 'never',
+    status: active.length === 0 && sources.length > 0
+      ? 'disabled'
+      : anyRunning ? 'running' : anyFailed ? 'failed' : latestVersion ? 'success' : 'never',
     lastChecked,
     nextUpdate,
   }
@@ -118,8 +125,10 @@ export const librarySourceHealthTag = (
   if (!loaded) return { label: `${name} · 加载中`, type: 'info' }
   if (loadError) return { label: `${name} · 加载失败`, type: 'danger' }
   if (sources.length === 0) return { label: `${name} · 未配置`, type: 'warning' }
-  if (sources.some((s) => s.update_status === 'running')) return { label: `${name} · 更新中`, type: 'warning' }
-  const failed = sources.filter((s) => s.update_status === 'failed').length
+  const active = sources.filter((s) => s.update_enabled !== false)
+  if (active.length === 0) return { label: `${name} · 已关闭`, type: 'info' }
+  if (active.some((s) => s.update_status === 'running')) return { label: `${name} · 更新中`, type: 'warning' }
+  const failed = active.filter((s) => s.update_status === 'failed').length
   if (failed > 0) return { label: `${name} · ${failed} 源更新失败`, type: 'warning' }
   return { label: `${name} · 正常`, type: 'success' }
 }

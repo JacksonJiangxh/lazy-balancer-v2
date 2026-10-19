@@ -34,7 +34,6 @@
           :settings-loading="settingsLoading"
           :pending-node-id="pendingNodeId"
           :login-node-id="loginNodeId"
-          :access-url-saving="accessUrlSaving"
           :read-only="isReadOnlyProp || status?.node_mode === 'slave'"
           @generate-token="generateRegisterToken"
           @update-sync-field="updateSyncField"
@@ -43,8 +42,7 @@
           @remove="removeNode"
           @login="loginNode"
           @service-control="openServiceControlDialog"
-          @edit-access-url="openAccessUrlDialog"
-          @edit-site="openSiteDialog"
+          @edit-config="openNodeConfigDialog"
         />
       </el-col>
     </el-row>
@@ -58,7 +56,6 @@
       :settings-loading="settingsLoading"
       :pending-node-id="pendingNodeId"
       :login-node-id="loginNodeId"
-      :access-url-saving="accessUrlSaving"
       :read-only="isReadOnlyProp"
       @generate-token="generateRegisterToken"
       @update-sync-field="updateSyncField"
@@ -67,8 +64,7 @@
       @remove="removeNode"
       @login="loginNode"
       @service-control="openServiceControlDialog"
-      @edit-access-url="openAccessUrlDialog"
-      @edit-site="openSiteDialog"
+      @edit-config="openNodeConfigDialog"
     />
 
     <ClusterSlavePanel
@@ -84,20 +80,12 @@
       @forget-pins="forgetPins"
     />
 
-    <ClusterAccessUrlDialog
-      :visible="accessUrlDialogVisible"
-      :node="editingAccessUrlNode"
-      :saving="accessUrlSaving"
-      @close="closeAccessUrlDialog"
-      @save="updateAccessUrl"
-    />
-
-    <ClusterNodeSiteDialog
-      :visible="siteDialogVisible"
-      :node="editingSiteNode"
-      :saving="siteSaving"
-      @close="closeSiteDialog"
-      @save="updateNodeSite"
+    <ClusterNodeConfigDialog
+      :visible="nodeConfigDialogVisible"
+      :node="editingNodeConfig"
+      :saving="nodeConfigSaving"
+      @close="closeNodeConfigDialog"
+      @save="updateNodeConfig"
     />
 
     <el-dialog v-model="tokenDialogVisible" width="min(560px, 92vw)" :close-on-click-modal="false" class="register-token-dialog">
@@ -203,8 +191,7 @@ import type {
   ClusterSyncResult,
 } from '@/types'
 import ClusterMasterPanel from './cluster/ClusterMasterPanel.vue'
-import ClusterAccessUrlDialog from './cluster/ClusterAccessUrlDialog.vue'
-import ClusterNodeSiteDialog from './cluster/ClusterNodeSiteDialog.vue'
+import ClusterNodeConfigDialog from './cluster/ClusterNodeConfigDialog.vue'
 import ClusterModeCard from './cluster/ClusterModeCard.vue'
 import ClusterSlavePanel from './cluster/ClusterSlavePanel.vue'
 import ClusterStatusCard from './cluster/ClusterStatusCard.vue'
@@ -224,7 +211,7 @@ interface LoginTicketResponse {
 const authStore = useAuthStore()
 let disposed = false
 let requestSequence = 0
-// 历史问题：fetchNodes 独立计数器——updateAccessUrl 的手动刷新若与 fetchStatus 共享
+// 历史问题：fetchNodes 独立计数器——updateNodeConfig 的手动刷新若与 fetchStatus 共享
 // requestSequence，会顶掉轮询在途 fetchStatus 的序列号，导致状态响应被当作过期丢弃
 let nodesRequestSequence = 0
 const status = ref<ClusterStatus | null>(null)
@@ -239,12 +226,9 @@ const promoting = ref(false)
 const intervalSaving = ref(false)
 const pendingNodeId = ref<number | null>(null)
 const loginNodeId = ref<number | null>(null)
-const accessUrlDialogVisible = ref(false)
-const editingAccessUrlNode = ref<ClusterNode | null>(null)
-const accessUrlSaving = ref(false)
-const siteDialogVisible = ref(false)
-const editingSiteNode = ref<ClusterNode | null>(null)
-const siteSaving = ref(false)
+const nodeConfigDialogVisible = ref(false)
+const editingNodeConfig = ref<ClusterNode | null>(null)
+const nodeConfigSaving = ref(false)
 const registrationRequest = ref(0)
 const tokenDialogVisible = ref(false)
 
@@ -661,65 +645,50 @@ const loginNode = async (node: ClusterNode): Promise<void> => {
   }
 }
 
-const openAccessUrlDialog = (node: ClusterNode): void => {
-  if (isReadOnlyProp.value || accessUrlSaving.value) return
-  editingAccessUrlNode.value = node
-  accessUrlDialogVisible.value = true
+const openNodeConfigDialog = (node: ClusterNode): void => {
+  if (isReadOnlyProp.value || nodeConfigSaving.value) return
+  editingNodeConfig.value = node
+  nodeConfigDialogVisible.value = true
 }
 
-const closeAccessUrlDialog = (): void => {
-  if (accessUrlSaving.value) return
-  accessUrlDialogVisible.value = false
-  editingAccessUrlNode.value = null
+const closeNodeConfigDialog = (): void => {
+  if (nodeConfigSaving.value) return
+  nodeConfigDialogVisible.value = false
+  editingNodeConfig.value = null
 }
 
-const updateAccessUrl = async (accessUrl: string): Promise<void> => {
-  const node = editingAccessUrlNode.value
-  if (!node || isReadOnlyProp.value || accessUrlSaving.value) return
-  accessUrlSaving.value = true
+const updateNodeConfig = async (payload: { accessUrl: string; lat: number; lon: number; siteChanged: boolean }): Promise<void> => {
+  const node = editingNodeConfig.value
+  if (!node || isReadOnlyProp.value || nodeConfigSaving.value) return
+  nodeConfigSaving.value = true
   try {
-    await request.put<ActionResponse>(`/cluster/nodes/${node.id}/access-url`, { access_url: accessUrl })
-    mfaAwareSuccess('访问地址已更新')
-    accessUrlDialogVisible.value = false
-    editingAccessUrlNode.value = null
+    // 两个写端点在权限/MFA 上同构；顺序提交，任一失败保留弹框与已完成项，
+    // 重试时同值写入为 no-op（站点坐标仅在真实变更时提交，不 bump 集群版本）。
+    const accessChanged = payload.accessUrl !== (node.access_url ?? '')
+    if (accessChanged) {
+      await request.put<ActionResponse>(`/cluster/nodes/${node.id}/access-url`, { access_url: payload.accessUrl })
+    }
+    if (payload.siteChanged) {
+      await request.put<ActionResponse>(`/cluster/nodes/${node.id}/site`, {
+        server_map_lat: payload.lat,
+        server_map_lon: payload.lon,
+      })
+    }
+    if (accessChanged && payload.siteChanged) {
+      mfaAwareSuccess('节点配置已更新，站点坐标下一同步周期生效')
+    } else if (accessChanged) {
+      mfaAwareSuccess('访问地址已更新')
+    } else {
+      mfaAwareSuccess('节点站点坐标已保存，下一同步周期生效')
+    }
+    nodeConfigDialogVisible.value = false
+    editingNodeConfig.value = null
     await fetchNodes()
   } catch (error: unknown) {
     // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
-    console.error('Failed to update access url:', error)
+    console.error('Failed to update node config:', error)
   } finally {
-    accessUrlSaving.value = false
-  }
-}
-
-const openSiteDialog = (node: ClusterNode): void => {
-  if (isReadOnlyProp.value || siteSaving.value) return
-  editingSiteNode.value = node
-  siteDialogVisible.value = true
-}
-
-const closeSiteDialog = (): void => {
-  if (siteSaving.value) return
-  siteDialogVisible.value = false
-  editingSiteNode.value = null
-}
-
-const updateNodeSite = async (coords: { lat: number; lon: number }): Promise<void> => {
-  const node = editingSiteNode.value
-  if (!node || isReadOnlyProp.value || siteSaving.value) return
-  siteSaving.value = true
-  try {
-    await request.put<ActionResponse>(`/cluster/nodes/${node.id}/site`, {
-      server_map_lat: coords.lat,
-      server_map_lon: coords.lon,
-    })
-    mfaAwareSuccess('节点站点坐标已保存，下一同步周期生效')
-    siteDialogVisible.value = false
-    editingSiteNode.value = null
-    await fetchNodes()
-  } catch (error: unknown) {
-    console.error('Failed to update node site coordinates:', error)
-  } finally {
-    siteSaving.value = false
+    nodeConfigSaving.value = false
   }
 }
 

@@ -39,13 +39,6 @@
       <el-table-column label="地址" min-width="130" show-overflow-tooltip>
         <template #default="{ row }"><span class="mono-value">{{ row.ip_address }}:{{ row.port }}</span></template>
       </el-table-column>
-      <el-table-column label="访问地址" min-width="130" show-overflow-tooltip>
-        <template #default="{ row }">
-          <el-link class="access-url-link" type="primary" :disabled="readOnly || accessUrlSaving" @click="$emit('edit-access-url', row)">
-            {{ row.access_url || '-' }}
-          </el-link>
-        </template>
-      </el-table-column>
       <el-table-column label="状态" width="70" align="center" class-name="node-status-col">
         <template #default="{ row }">
           <el-tooltip v-if="versionIncompatibilityError(row)" :content="versionIncompatibilityError(row)" placement="top">
@@ -117,14 +110,7 @@
       <el-table-column v-if="showLastSeenColumn" label="最后上报时间" min-width="130">
         <template #default="{ row }">{{ formatDate(row.last_seen) || '-' }}</template>
       </el-table-column>
-      <el-table-column label="站点坐标" min-width="110" show-overflow-tooltip>
-        <template #default="{ row }">
-          <el-link class="access-url-link" type="primary" :disabled="readOnly" @click="$emit('edit-site', row)">
-            {{ siteCoordinateLabel(row) }}
-          </el-link>
-        </template>
-      </el-table-column>
-      <el-table-column label="操作" width="150" :fixed="operationColumnFixed" align="center">
+      <el-table-column label="操作" width="190" :fixed="operationColumnFixed" align="center">
         <template #default="{ row }">
           <template v-if="row.status === 'pending' || !row.is_approved">
             <el-button link type="primary" size="small" :loading="pendingNodeId === row.id" :disabled="readOnly || pendingNodeId !== null" @click="$emit('approve', row)">确认</el-button>
@@ -132,6 +118,7 @@
           </template>
           <template v-else>
             <div class="op-buttons">
+              <el-button v-if="!readOnly" link type="primary" size="small" @click="$emit('edit-config', row)">配置</el-button>
               <el-button v-if="!readOnly" link type="primary" size="small" :loading="loginNodeId === row.id" :disabled="row.status !== 'online' || loginNodeId !== null" @click="$emit('login', row)">登录</el-button>
               <el-button v-if="!readOnly && row.status === 'online'" link type="warning" size="small" @click="$emit('service-control', row)">服务</el-button>
               <el-button link type="danger" size="small" :loading="pendingNodeId === row.id" :disabled="readOnly || pendingNodeId !== null" @click="$emit('remove', row)">删除</el-button>
@@ -162,7 +149,6 @@ const props = defineProps<{
   readonly settingsLoading: boolean
   readonly pendingNodeId: number | null
   readonly loginNodeId: number | null
-  readonly accessUrlSaving: boolean
   readonly readOnly: boolean
 }>()
 
@@ -174,19 +160,12 @@ const emit = defineEmits<{
   (event: 'remove', node: ClusterNode): void
   (event: 'login', node: ClusterNode): void
   (event: 'service-control', node: ClusterNode): void
-  (event: 'edit-access-url', node: ClusterNode): void
-  (event: 'edit-site', node: ClusterNode): void
+  (event: 'edit-config', node: ClusterNode): void
 }>()
 
 const { width: viewportWidth } = useWindowSize()
-const siteCoordinateLabel = (node: ClusterNode): string => {
-  const lat = node.server_map_lat ?? 0
-  const lon = node.server_map_lon ?? 0
-  if (lat === 0 && lon === 0) return '未配置'
-  return `${lat.toFixed(2)}, ${lon.toFixed(2)}${node.site_inherited ? '（默认）' : ''}`
-}
 const operationColumnFixed = computed<'right' | false>(() => viewportWidth.value > 1440 ? 'right' : false)
-// 窄屏优先保留业务列，隐藏健康/最后上报，避免新增站点列后出现水平滚动。
+// 窄屏优先保留业务列，隐藏健康/最后上报，避免水平滚动。
 const showHealthColumn = computed(() => viewportWidth.value >= 1380)
 const showLastSeenColumn = computed(() => viewportWidth.value >= 1580)
 const syncSwitchItems = [
@@ -278,8 +257,6 @@ const versionIncompatibilityError = (node: ClusterNodeWithSyncError): string => 
 .settings-form .form-tip-inline { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
 .card-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--text-primary); }
 .mono-value { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-.access-url-link { display: inline-flex; max-width: 100%; vertical-align: middle; }
-.access-url-link :deep(.el-link__inner) { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .version-cell { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; min-width: 0; }
 .version-cell-wrap { flex-wrap: wrap; }
 /* F3(第 20.5 轮):stale 分支三元素可超 170px——该分支恢复 wrap,主分支
