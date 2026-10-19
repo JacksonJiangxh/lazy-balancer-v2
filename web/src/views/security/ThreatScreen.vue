@@ -288,7 +288,7 @@ import { isRealtimeFlowEvent } from '@/utils/threatFlowRules'
 import { useCountUp } from '@/composables/useCountUp'
 import { formatDate } from '@/utils/date'
 import { trafficDelta, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '@/utils/threatScreenMetrics'
-import { flowBucket, flowBucketKey, flowGroupEvents, flowRegionKey, flowTimestamp, shouldAggregate, normalizeTrafficSampleN, reconstructObservedRate, stepAdaptiveSample, nextFlowCursor } from '@/utils/threatFlowRules'
+import { flowBucket, flowBucketKey, flowGroupEvents, flowRegionKey, flowTimestamp, shouldAggregate, normalizeTrafficSampleN, reconstructObservedRate, stepAdaptiveSample, nextFlowCursor, groupNormalFlowEvents, planFlowArcs } from '@/utils/threatFlowRules'
 import type { ThreatScene, ThreatSceneOptions } from '@/utils/threatScene'
 
 // 威胁大屏（v2.3.8 Threat Wall 版式）：三栏 HUD 网格（左事件流/中引擎舞台/
@@ -686,9 +686,8 @@ function flushArcs(): void {
     if (cur) cur.count += 1
     else groups.set(g, { key: item.key, count: 1 })
   }
-  for (const { key, count } of groups.values()) {
-    if (shouldAggregate(count)) threatMap.addArcForLocation(key, count)
-    else for (let i = 0; i < count; i++) threatMap.addArcForLocation(key, 1)
+  for (const { key, count } of planFlowArcs([...groups.values()])) {
+    threatMap.addArcForLocation(key, count)
   }
   arcQueue = []
 }
@@ -867,26 +866,11 @@ const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
     return
   }
   const events = data.events ?? []
-  // 有界光流池：同一轮按地区聚合；总弧数上限 30（与引擎池一致）。
-  // ≤10 且预算足够时逐条表达，超出预算或 >10 的地区合并为一条加权光流。
-  const byLocation = new Map<string, number>()
-  for (const ev of events) {
-    if (!ev.country) continue
-    const location = ev.province ? `${ev.country}·${ev.province}` : ev.country
-    byLocation.set(location, (byLocation.get(location) ?? 0) + 1)
-  }
-  let budget = 30
-  for (const [location, count] of [...byLocation].sort((a, b) => b[1] - a[1])) {
-    if (budget <= 0) break
-    if (count > 10 || count > budget) {
-      threatMap?.addNormalArcForLocation(location, count)
-      budget--
-      continue
-    }
-    for (let i = 0; i < count && budget > 0; i++) {
-      threatMap?.addNormalArcForLocation(location, 1)
-      budget--
-    }
+  // 正常流与攻击流同一规则：地区 + 秒桶分组，>10 条合并，单轮预算一致。
+  const groups = groupNormalFlowEvents(events)
+  const regionByKey = new Map(groups.map((g) => [g.key, g.region]))
+  for (const item of planFlowArcs(groups.map((g) => ({ key: g.key, count: g.items.length })))) {
+    threatMap?.addNormalArcForLocation(regionByKey.get(item.key) ?? item.key, item.count)
   }
   flowSince = nextFlowCursor(flowSince, data)
   if (flowSampleN.value === -1 && activeSampleN.value > 0) {

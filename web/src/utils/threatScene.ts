@@ -19,7 +19,8 @@ import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, hasProvinceStats, drillCommitAllowed } from '@/utils/threatShared'
 import { COUNTRY_CENTROIDS, FALLBACK_CENTROID, type Centroid } from '@/utils/countryCentroids'
 import { loadAdmin1Tables } from '@/utils/admin1Loader'
-import { FLOW_ATTACK_COLOR as ATTACK_COLOR, FLOW_NORMAL_COLOR as NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowAttackWidth, flowNormalWidth } from '@/utils/threatTheme'
+import { FLOW_ATTACK_COLOR as ATTACK_COLOR, FLOW_NORMAL_COLOR as NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowArcWidth } from '@/utils/threatTheme'
+import { planFlowArcs } from '@/utils/threatFlowRules'
 
 // 威胁大屏 2D 平面地图引擎（v16 终版：Canvas 2D，参考 Radware/Check Point 平面风格）。
 //
@@ -35,9 +36,8 @@ import { FLOW_ATTACK_COLOR as ATTACK_COLOR, FLOW_NORMAL_COLOR as NORMAL_COLOR, F
 // 点击国家下钻省级平面、点击空白返回、ESC 语义在 Vue 层。
 
 const MAX_PIXEL_RATIO = 2
-const MAX_ACTIVE_ARCS = 30
+const MAX_ACTIVE_ARCS = 60
 const ARC_FLIGHTS = 3
-const ARC_NORMAL_FLIGHTS = 2
 const ARC_FLIGHT_SECONDS = FLOW_FLIGHT_MS / 1000
 const ARC_FLIGHT_GAP = 0.22
 const ARC_FLIGHT_PARTICLES = 12
@@ -95,13 +95,13 @@ interface Arc2D {
   flightT: number
   pulsed: boolean
   normal: boolean
-  w: number
   weight: number
   label?: string
 }
 
 interface Ripple2D {
   age: number
+  color: string
 }
 
 
@@ -727,17 +727,16 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
 
   function spawnArc(origin: Centroid, normal: boolean, weight = 1): void {
     if (!siteConfigured) return
-    if (arcs.length >= MAX_ACTIVE_ARCS) arcs.shift()
-    // 同源聚合权重 → 弧宽（log 标尺上限钳 4：百次/秒下视觉可控）
-    const w = Math.min(4, 0.6 + Math.log10(Math.max(1, weight)))
+    // 正常/攻击共用容量：满池时拒绝新弧线，已开始的动画完整播完。
+    if (arcs.length >= MAX_ACTIVE_ARCS) return
     // 同一地区/秒 >10 条才带聚合标签；≤10 逐条无标签。
     const label = flowArcLabel(weight)
-    arcs.push({ from: origin, elapsed: 0, flight: 0, flightT: 0, pulsed: false, normal, w, weight, label })
+    arcs.push({ from: origin, elapsed: 0, flight: 0, flightT: 0, pulsed: false, normal, weight, label })
   }
 
-  function spawnRipple(): void {
+  function spawnRipple(color: string): void {
     if (ripples.length >= RIPPLE_POOL) ripples.shift()
-    ripples.push({ age: 0 })
+    ripples.push({ age: 0, color })
   }
 
   function bezierPoint(p0: Centroid2D, p1: Centroid2D, p2: Centroid2D, t: number): Centroid2D {
@@ -753,14 +752,14 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       const arc = arcs[i]
       arc.elapsed += delta
       arc.flightT += delta
-      const life = (arc.normal ? ARC_NORMAL_FLIGHTS : ARC_FLIGHTS) * (ARC_FLIGHT_SECONDS + ARC_FLIGHT_GAP)
+      const life = ARC_FLIGHTS * (ARC_FLIGHT_SECONDS + ARC_FLIGHT_GAP)
       if (arc.flightT >= ARC_FLIGHT_SECONDS) {
         if (!arc.pulsed) {
           arc.pulsed = true
-          if (!arc.normal) spawnRipple()
+          spawnRipple(arc.normal ? NORMAL_COLOR : ATTACK_COLOR)
         }
         if (arc.flightT >= ARC_FLIGHT_SECONDS + ARC_FLIGHT_GAP) {
-          if ((arc.normal && arc.flight + 1 >= ARC_NORMAL_FLIGHTS) || (!arc.normal && arc.flight + 1 >= ARC_FLIGHTS)) {
+          if (arc.flight + 1 >= ARC_FLIGHTS) {
             arcs.splice(i, 1)
             continue
           }
@@ -792,8 +791,8 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
         gradient.addColorStop(0, 'rgba(0,0,0,0)')
         gradient.addColorStop(1, color)
         ctx.strokeStyle = gradient
-        ctx.lineWidth = arc.normal ? flowNormalWidth(arc.weight) : flowAttackWidth(arc.weight)
-        ctx.globalAlpha = arc.normal ? 0.78 : Math.min(1, Math.max(0.05, (life - arc.elapsed) / 0.4))
+        ctx.lineWidth = flowArcWidth(arc.weight)
+        ctx.globalAlpha = Math.min(1, Math.max(0.05, (life - arc.elapsed) / 0.4))
         ctx.stroke()
         ctx.globalAlpha = 1
         if (arc.label) {
@@ -803,16 +802,16 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
           ctx.fillText(arc.label, from.x + 8, from.y - 8)
         }
       }
-      // 亮头粒子拖尾
-      if (head < 1 || !arc.normal) {
+      // 亮头粒子拖尾（正常/攻击同一规则）
+      if (head < 1) {
         for (let p = 0; p < ARC_FLIGHT_PARTICLES; p++) {
           const t = Math.max(0, head - p * (0.16 / ARC_FLIGHT_PARTICLES))
           const pt = bezierPoint(from, ctrl, to, t)
-          const r = arc.normal ? 1.5 : 2 - p * 0.12
+          const r = 1.8
           ctx.beginPath()
           ctx.arc(pt.x, pt.y, Math.max(0.4, r), 0, Math.PI * 2)
           ctx.fillStyle = color
-          ctx.globalAlpha = (arc.normal ? 0.78 : 0.9) * (1 - p / ARC_FLIGHT_PARTICLES)
+          ctx.globalAlpha = 0.85 * (1 - p / ARC_FLIGHT_PARTICLES)
           ctx.fill()
         }
         ctx.globalAlpha = 1
@@ -832,7 +831,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       const r = 3 + t * 26
       ctx.beginPath()
       ctx.arc(serverPos.x, serverPos.y, r, 0, Math.PI * 2)
-      ctx.strokeStyle = ATTACK_COLOR
+      ctx.strokeStyle = ripple.color
       ctx.lineWidth = 1.5
       ctx.globalAlpha = 0.85 * (1 - t)
       ctx.stroke()
@@ -1162,10 +1161,10 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       if (paused) renderOnce()
     },
     setTraffic(entries: CountryHeat[]): void {
-      // 正常请求同样按地区聚合：weight=采样窗口计数，>10 带 ×N 标签。
-      for (const entry of entries) {
-        if (entry.count <= 0) continue
-        spawnArc(COUNTRY_CENTROIDS[entry.name] ?? FALLBACK_CENTROID, true, entry.count)
+      // 正常/攻击共用出弧计划：>10 聚合、≤10 逐条、单轮预算一致。
+      const plan = planFlowArcs(entries.filter((e) => e.count > 0).map((e) => ({ key: e.name, count: e.count })))
+      for (const item of plan) {
+        spawnArc(COUNTRY_CENTROIDS[item.key] ?? FALLBACK_CENTROID, true, item.count)
       }
       startLoop()
     },

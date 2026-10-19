@@ -5,19 +5,23 @@ import assert from 'node:assert/strict'
 import {
   ADAPTIVE_SAMPLE_CONFIRM_SAMPLES,
   ADAPTIVE_SAMPLE_MIN_SWITCH_INTERVAL_MS,
+  FLOW_MAX_ARCS_PER_FLUSH,
   flowBucket,
   flowBucketKey,
   flowGroupEvents,
   flowRegionKey,
   flowTimestamp,
+  groupNormalFlowEvents,
   isRealtimeFlowEvent,
   nextAdaptiveSampleN,
   nextFlowCursor,
+  planFlowArcs,
   reconstructObservedRate,
   shouldAggregate,
   stepAdaptiveSample,
   normalizeTrafficSampleN,
 } from '../src/utils/threatFlowRules.ts'
+import { flowArcWidth } from '../src/utils/threatTheme.ts'
 
 test('流量采样配置：仅保留 -1/0/1，固定 2-64 已退役并归一为自适应（历史问题-04/历史问题-历史问题）', () => {
   for (const value of [-1, 0, 1]) assert.equal(normalizeTrafficSampleN(value), value)
@@ -164,4 +168,47 @@ test('历史问题-03：增量批次动效实时性门——回填/延迟到达�
   assert.equal(isRealtimeFlowEvent('not-a-date', now), false)
   // RFC3339 与 DB 墙钟串同口径（均按 UTC）
   assert.equal(isRealtimeFlowEvent('2026-10-19T11:59:30Z', now), true)
+})
+
+test('正常/攻击共用线宽：单条 1.2、10 条 3.2、上限 4', () => {
+  assert.equal(flowArcWidth(1), 1.2)
+  assert.ok(Math.abs(flowArcWidth(10) - 3.2) < 1e-9)
+  assert.equal(flowArcWidth(100), 4)
+  assert.ok(flowArcWidth(1) < flowArcWidth(10))
+})
+
+test('正常流按地区+秒桶分组：跨秒不合并，中国精确到省', () => {
+  const at = 1792281600000
+  const groups = groupNormalFlowEvents([
+    { country: '中国', province: '广东省', at },
+    { country: '中国', province: '广东省', at },
+    { country: '中国', province: '广东省', at: at + 1000 },
+    { country: '美国', at },
+  ])
+  assert.equal(groups.length, 3)
+  const gd = groups.find((g) => g.key === '中国·广东省|1792281600')
+  assert.ok(gd)
+  assert.equal(gd.items.length, 2)
+})
+
+test('正常/攻击共用出弧计划：>10 聚合、≤10 逐条、单轮预算一致', () => {
+  const plan = planFlowArcs([
+    { key: 'a', count: 20 },
+    { key: 'b', count: 5 },
+    { key: 'c', count: 3 },
+  ], 4)
+  assert.equal(plan.length, 4)
+  assert.deepEqual(plan[0], { key: 'a', count: 20 })
+  assert.deepEqual(plan.slice(1), [
+    { key: 'b', count: 1 },
+    { key: 'b', count: 1 },
+    { key: 'b', count: 1 },
+  ])
+  const ten = planFlowArcs([{ key: 'd', count: 10 }], 3)
+  assert.deepEqual(ten, [
+    { key: 'd', count: 1 },
+    { key: 'd', count: 1 },
+    { key: 'd', count: 1 },
+  ])
+  assert.equal(FLOW_MAX_ARCS_PER_FLUSH, 12)
 })

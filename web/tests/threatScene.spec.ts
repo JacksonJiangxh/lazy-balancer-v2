@@ -390,3 +390,13 @@ test('⑤反日界线 unwrap：俄罗斯主环 bbox 不再跨全宽', () => {
   const span = b.maxLon - b.minLon
   assert.ok(span < 180, `俄罗斯主环 bbox span ${span.toFixed(1)}° 仍≈全宽（unwrap 失效）`)
 })
+test('2D 光流池满时拒绝新弧线，不淘汰已开始动画', () => {
+  const src = readFileSync(join(ROOT, 'src/utils/threatScene.ts'), 'utf8')
+  const start = src.indexOf('function spawnArc(')
+  const end = src.indexOf('function spawnRipple(', start)
+  assert.ok(start >= 0 && end > start, 'spawnArc 缺失')
+  const spawn = src.slice(start, end)
+  assert.match(spawn, /if \(arcs\.length >= MAX_ACTIVE_ARCS\) return/, '满池必须拒绝新弧线')
+  assert.doesNotMatch(spawn, /arcs\.shift\(\)/, 'spawnArc 不得淘汰已开始弧线')
+})
+

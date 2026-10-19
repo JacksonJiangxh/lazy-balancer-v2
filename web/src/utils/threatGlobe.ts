@@ -2,7 +2,7 @@
 // 特效。与 threatScene.ts（360°地图+雷达扫掠）实现同一 ThreatScene 接口——
 // ThreatScreen.vue 按设置 threat_screen_mode 二选一装载，数据管线/UI 完全复用。
 // 渲染：世界态=点阵国家热力（可点击下钻，不着色陆地）；下钻态=该国一级行政区
-// 点阵（中国=chinaProvinces 34 省高精度；其余=admin1Provinces）+ 他国暗度多边形
+// 点阵（中国=chinaProvinces 34 省高精度；其余=admin1Provinces）+ 他国暗度点阵
 // 衬底（与地图版下钻同视觉）；攻击弧线/本站涟漪/扫描光带。扫描 shader 移植自
 // 参考实现（threat-wall，用户友人制作，授权改造）。
 import Globe from 'globe.gl'
@@ -15,7 +15,8 @@ import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { loadAdmin1Tables, loadedAdmin1Tables } from '@/utils/admin1Loader'
 import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, adminShortName, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed, DOT_LAND, arcOriginForLocation, hasProvinceStats, drillCommitAllowed } from '@/utils/threatShared'
 import type { ThreatScene, ThreatSceneOptions, CountryHeat } from '@/utils/threatScene'
-import { FLOW_ATTACK_ARC_COLORS, FLOW_NORMAL_ARC_COLORS, FLOW_FLIGHT_MS, flowArcLabel, flowAttackWidth, flowNormalWidth } from '@/utils/threatTheme'
+import { FLOW_ATTACK_ARC_COLORS, FLOW_NORMAL_ARC_COLORS, FLOW_FLIGHT_MS, flowArcLabel, flowArcWidth } from '@/utils/threatTheme'
+import { planFlowArcs } from '@/utils/threatFlowRules'
 import { sphereSurfacePoint } from '@/utils/threatProjection'
 
 interface ArcDatum {
@@ -30,13 +31,9 @@ interface ArcDatum {
   born: number
 }
 
-// 下钻态他国暗度衬底（普通多边形层，不进 H3）：与地图版暗度点阵同视觉。
-const DRILL_BACKDROP_CAP = 'rgba(27, 42, 65, 0.35)'
-// 下钻态 hover 他国：衬底多边形整体提亮（世界态 hover 由点阵改色承担）。
-const DRILL_BACKDROP_HOVER = 'rgba(143, 230, 255, 0.55)'
 // 世界总览相机高度：2.4 实测球体偏小；1.8 放大约 1/3。
 const WORLD_ALTITUDE = 1.63
-const MAX_ARCS = 30
+const MAX_ARCS = 60
 const ARC_TTL = 4200
 
 /** 垂直扫描 shader（参考实现移植）：纬度带自北极向南极往返扫掠。 */
@@ -80,40 +77,6 @@ function flyAltitudeFor(name: string): number {
   return Math.min(2.2, Math.max(0.55, span / 45 + 0.35))
 }
 
-interface BackdropPolygon {
-  /** 归一后的国家名（台湾并入中国）：与下钻名/hoveredDotCountry 同口径。 */
-  readonly key: string
-  readonly geometry: { type: 'MultiPolygon'; coordinates: number[][][][] }
-}
-
-let backdropCache: BackdropPolygon[] | null = null
-
-/** 扁平 [lon,lat,…] 环 → GeoJSON 环（[lon,lat] 且首尾闭合）。 */
-function closedRing(flat: number[]): number[][] {
-  const ring: number[][] = []
-  for (let i = 0; i + 1 < flat.length; i += 2) ring.push([flat[i], flat[i + 1]])
-  if (ring.length > 0) {
-    const [firstLon, firstLat] = ring[0]
-    const [lastLon, lastLat] = ring[ring.length - 1]
-    if (firstLon !== lastLon || firstLat !== lastLat) ring.push([firstLon, firstLat])
-  }
-  return ring
-}
-
-/** 下钻态他国暗度衬底数据（GeoJSON MultiPolygon）：一次性构建并缓存，绝不进
- *  H3 hexbin（首次下钻把 176 国送进 H3 曾产生 3s 主线程长任务）。 */
-function worldBackdropPolygons(): BackdropPolygon[] {
-  if (backdropCache) return backdropCache
-  backdropCache = THREAT_COUNTRIES.map((c) => ({
-    key: normalizeCountryName(c.name),
-    geometry: {
-      type: 'MultiPolygon' as const,
-      coordinates: c.polys.map((poly) => poly.map(closedRing)),
-    },
-  }))
-  return backdropCache
-}
-
 export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOptions): ThreatScene {
   // 历史 历史问题：本站坐标是可变状态——构造期常量会让 setServer 只改
   // 环/点，弧线终点与返回视角仍指向旧坐标（本变量由 setServer/返回视角消费）。
@@ -141,18 +104,21 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   const DOT_ALTITUDE = 0.005
   const WORLD_DOT_SIZE = 3.2
   const DRILL_DOT_SIZE = 6.2
+  const DRILL_BACKDROP_OPACITY = 0.38
+  const DRILL_BACKDROP_COLOR = '#58749a'
+  const DRILL_HOVER_COLOR = '#8fe6ff'
   interface WorldDot { lat: number; lng: number; key: string }
   let worldDots: WorldDot[] | null = null
+  let worldDotsByKey = new Map<string, WorldDot[]>()
   let worldDotPositions: Float32Array | null = null
   let activeDots: WorldDot[] | null = null
   let activeCounts = new Map<string, number>()
   const provinceDotCache = new Map<string, { dots: WorldDot[]; positions: Float32Array }>()
+  const dotLayerGroup = new THREE.Group()
   let dotsPoints: THREE.Points | null = null
+  let backdropDotsPoints: THREE.Points | null = null
+  let hoverDotsPoints: THREE.Points | null = null
   let hoveredDotCountry: string | null = null
-  /** 下钻态衬底配色：hover 的他在国整体提亮（WT87-05 双引擎 hover 契约）。
-   *  重新调用 globe.polygonCapColor(本函数) 即触发该层重算颜色。 */
-  const backdropCapColor = (d: object): string =>
-    (d as BackdropPolygon).key === hoveredDotCountry ? DRILL_BACKDROP_HOVER : DRILL_BACKDROP_CAP
   const dotBboxes = THREAT_COUNTRIES.map((c) => {
     let minLon = 180, maxLon = -180, minLat = 90, maxLat = -90
     for (const poly of c.polys) for (const ring of poly) for (let k = 0; k + 1 < ring.length; k += 2) {
@@ -255,10 +221,10 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   }
   window.requestAnimationFrame = throttledRAF
 
-  // 世界点阵承载层（自定义单 Points 对象，不参与 H3）
+  // 世界/下钻点阵承载层（自定义单 Group，不参与 H3）
   globe
     .customLayerData([])
-    .customThreeObject(() => (dotsPoints as unknown as THREE.Object3D) || new THREE.Object3D())
+    .customThreeObject(() => dotLayerGroup)
     .customThreeObjectUpdate(() => { /* 颜色由 updateDotColors 原地更新 */ })
 
   // 海洋球面基色与地图背景同色（#030a1c），并用 Basic 材质去掉光照加成：
@@ -270,16 +236,6 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     .showAtmosphere(true)
     .atmosphereColor('#3ad1ff')
     .atmosphereAltitude(0.16)
-    // 下钻态他国暗度衬底用普通多边形层（GeoJSON MultiPolygon，一次性缓存），
-    // 避免把 176 国送进 H3 hexbin（首次下钻 3s 主线程长任务根因）；世界态恒为空
-    //（applyLayer 按 drilledName 填充/清空）。H3 六边形配置一并移除——原
-    // hexPolygonsData 恒空数组 + 6 项分辨率/边距配置从未产生任何图元。
-    .polygonsData([])
-    .polygonAltitude(0.002)
-    .polygonCapColor(backdropCapColor)
-    .polygonSideColor(() => 'rgba(0,0,0,0)')
-    .polygonStrokeColor(() => 'rgba(80, 120, 180, 0.12)')
-    .polygonsTransitionDuration(0)
     .ringsData(siteConfigured ? [{ lat: server[1], lng: server[0] }] : [])
     .ringLat('lat')
     .ringLng('lng')
@@ -457,12 +413,11 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   let lastHoverPick = 0
 
   function setHexHover(name: string | null): void {
-    // 世界态：hover 只改点色（同一 Points 层）。下钻态：他国由多边形衬底
-    // 呈现（无世界点阵），必须重算衬底色——否则浮签换了国家、画面不跟随
-    //（WT87-05 双引擎 hover 契约）。
+    // 世界态：hover 只改点色（同一 Points 层）。下钻态：省 hover 改省点色，
+    // 他国 hover 用独立亮色点阵层；不再绘制/提亮国家多边形色块。
     hoveredDotCountry = name
     updateDotColors()
-    if (drilledName) globe.polygonCapColor(backdropCapColor)
+    updateHoverDots(name)
   }
 
   /** 帧内 hover 拾取（每帧最多一次）。 */
@@ -608,6 +563,39 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     updateDotColors()
   }
 
+  /** 复用世界点阵几何生成暗度/ hover 层（单次 BufferGeometry，不重建整颗球）。 */
+  function setPointPositions(points: THREE.Points, dots: WorldDot[]): void {
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.BufferAttribute(dotPositions(dots), 3))
+    const old = points.geometry
+    points.geometry = geometry
+    old.dispose()
+  }
+
+  /** 下钻衬底：非下钻国家显示为 22% 透明度世界点阵（与 2D 地图一致）。 */
+  function buildDrillBackdrop(): void {
+    if (!backdropDotsPoints || !worldDots) return
+    const dots = worldDots.filter((d) => d.key !== drilledName)
+    setPointPositions(backdropDotsPoints, dots)
+    backdropDotsPoints.visible = !!drilledName && dots.length > 0
+  }
+
+  /** 下钻 hover 非下钻国家：只提亮该国点阵，不绘制整块多边形。 */
+  function updateHoverDots(name: string | null): void {
+    if (!hoverDotsPoints) return
+    if (!drilledName || !name || name === drilledName) {
+      hoverDotsPoints.visible = false
+      return
+    }
+    const dots = worldDotsByKey.get(name) ?? []
+    if (dots.length === 0) {
+      hoverDotsPoints.visible = false
+      return
+    }
+    setPointPositions(hoverDotsPoints, dots)
+    hoverDotsPoints.visible = true
+  }
+
   /** 世界点阵：与地图版同源错列网格/国家多边形（球面步长独立校准）。 */
   function buildWorldDots(): void {
     if (worldDots) return
@@ -627,6 +615,12 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     }
     worldDots = dots
     worldDotPositions = dotPositions(dots)
+    worldDotsByKey = new Map()
+    for (const dot of dots) {
+      const list = worldDotsByKey.get(dot.key)
+      if (list) list.push(dot)
+      else worldDotsByKey.set(dot.key, [dot])
+    }
     // 无贴图、非透明、开启深度写入：PointsMaterial 的最轻路径。
     // 圆形/六边形都需要纹理采样 + alphaTest + 透明混合；在 1.3 万点、
     // 60fps 旋转球体上这部分是持续的每帧成本。方形点视觉上仍是点阵，
@@ -645,9 +639,45 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     dotsPoints = new THREE.Points(new THREE.BufferGeometry(), material)
     dotsPoints.frustumCulled = false
     dotsPoints.renderOrder = 2
+    dotLayerGroup.add(dotsPoints)
+
+    // 下钻衬底：世界点阵降透明度显示；hover 层只含当前悬停国家。
+    const backdropMat = new THREE.PointsMaterial({
+      size: WORLD_DOT_SIZE * 1.15,
+      color: DRILL_BACKDROP_COLOR,
+      transparent: true,
+      opacity: DRILL_BACKDROP_OPACITY,
+      map: dotTexture(),
+      // 低透明度材质不能沿用 0.5 alphaTest：alphaTest 在 opacity 之后判定，
+      // 会把 opacity<0.5 的全部点丢弃（本次“非下钻国家不可见”的根因）。
+      alphaTest: 0.05,
+      depthWrite: false,
+      sizeAttenuation: false,
+    })
+    backdropDotsPoints = new THREE.Points(new THREE.BufferGeometry(), backdropMat)
+    backdropDotsPoints.frustumCulled = false
+    backdropDotsPoints.renderOrder = 1
+    backdropDotsPoints.visible = false
+    dotLayerGroup.add(backdropDotsPoints)
+
+    const hoverMat = new THREE.PointsMaterial({
+      size: WORLD_DOT_SIZE,
+      color: DRILL_HOVER_COLOR,
+      transparent: true,
+      opacity: 0.9,
+      map: dotTexture(),
+      alphaTest: 0.5,
+      depthWrite: false,
+      sizeAttenuation: false,
+    })
+    hoverDotsPoints = new THREE.Points(new THREE.BufferGeometry(), hoverMat)
+    hoverDotsPoints.frustumCulled = false
+    hoverDotsPoints.renderOrder = 3
+    hoverDotsPoints.visible = false
+    dotLayerGroup.add(hoverDotsPoints)
+
     globe.customLayerData([{ kind: 'world-dots' }])
     setActiveDots(dots, worldDotPositions, countryCounts)
-    dotsPoints.visible = !drilledName
   }
 
   /** 下钻省点阵：与世界层同错列网格，按 admin 短名染色。 */
@@ -682,22 +712,22 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   /** 板块层重建：世界=国家点阵（热力，无陆地着色）；下钻=省点阵 + 他国暗度
-   *  多边形衬底（与地图版下钻同视觉——用户裁定 2026-10-17）。衬底用缓存的
-   *  GeoJSON 一次性数据，绝不进 H3。 */
+   *  点阵衬底（与地图版下钻同视觉）。衬底复用世界点阵几何，不进 H3。 */
   function applyLayer(): void {
     if (!layerReady) return
     if (drilledName) {
       const set = ensureProvinceDotSet(drilledName)
       setActiveDots(set.dots, set.positions, provinceCounts)
       provincePolysCache = provinceSource(drilledName).map((p) => ({ polys: p.polys }))
-      // 选择国自身由省点阵表达；台湾条目归一后同属中国 → 一并隐藏。
-      globe.polygonsData(worldBackdropPolygons().filter((p) => p.key !== drilledName))
+      buildDrillBackdrop()
     } else {
-      globe.polygonsData([])
       if (!worldDots || !worldDotPositions) return
       setActiveDots(worldDots, worldDotPositions, countryCounts)
       provincePolysCache = []
+      if (backdropDotsPoints) backdropDotsPoints.visible = false
+      if (hoverDotsPoints) hoverDotsPoints.visible = false
     }
+    updateHoverDots(hoveredDotCountry)
   }
 
   // click 处理为 async（按需加载省界）——命名包装器承担 add/removeEventListener
@@ -810,16 +840,14 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
 
   function spawnArc(from: Centroid, normal: boolean, weight = 1): void {
     if (!siteConfigured) return
-    // v2.3.8 弧线中断修复：新弧线 append 到队尾、淘汰从队首移除——原 unshift
-    // 到队头使全部弧线对象次序重排，globe.gl 按次序分配 dash 动画相位 →
-    // 每来一条新弧，其余光流全部跳变（用户实测「光流被打断」）。
-    if (arcs.length >= MAX_ARCS) arcs.shift()
+    // 正常/攻击共用容量：满池时拒绝新弧线，已开始的动画按 TTL 完整播完。
+    if (arcs.length >= MAX_ARCS) return
     arcs.push({
       ...arcEndpoints(server, from),
       // 正常请求固定青色；检测/拦截统一攻击橙红。
       color: normal ? [...FLOW_NORMAL_ARC_COLORS] : [...FLOW_ATTACK_ARC_COLORS],
-      // 与地图同一视觉公式（shared/threatTheme）。
-      strokeW: normal ? flowNormalWidth(weight) : flowAttackWidth(weight),
+      // 正常/攻击同一线宽公式，仅颜色不同。
+      strokeW: flowArcWidth(weight),
       weight,
       label: flowArcLabel(weight),
       born: performance.now(),
@@ -862,9 +890,10 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       }
     },
     setTraffic(entries: CountryHeat[]): void {
-      // 正常请求固定青色，按地区权重聚合；>10 带 ×N 标签。
-      for (const entry of entries) {
-        if (entry.count > 0) spawnArc(COUNTRY_CENTROIDS[entry.name] ?? FALLBACK_CENTROID, true, entry.count)
+      // 正常/攻击共用出弧计划：>10 聚合、≤10 逐条、单轮预算一致。
+      const plan = planFlowArcs(entries.filter((e) => e.count > 0).map((e) => ({ key: e.name, count: e.count })))
+      for (const item of plan) {
+        spawnArc(COUNTRY_CENTROIDS[item.key] ?? FALLBACK_CENTROID, true, item.count)
       }
     },
     setServer(centroid: Centroid | null): void {
@@ -929,20 +958,23 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       }
       cancelAnimationFrame(rafId)
       globe.pauseAnimation()
-      globe.polygonsData([])
       globe.arcsData([])
       globe.labelsData([])
       globe.ringsData([])
       globe.pointsData([])
-      if (dotsPoints) {
-        dotsPoints.geometry.dispose()
-        const dotsMaterial = dotsPoints.material as THREE.PointsMaterial
+      for (const points of [dotsPoints, backdropDotsPoints, hoverDotsPoints]) {
+        if (!points) continue
+        points.geometry.dispose()
+        const pointsMaterial = points.material as THREE.PointsMaterial
         // 历史问题-F6：Material.dispose() 不释放贴图——dotTexture 的 CanvasTexture
         // 必须显式释放，否则反复进出大屏累积 Canvas/GPU 资源。
-        dotsMaterial.map?.dispose()
-        dotsMaterial.dispose()
-        dotsPoints = null
+        pointsMaterial.map?.dispose()
+        pointsMaterial.dispose()
       }
+      dotsPoints = null
+      backdropDotsPoints = null
+      hoverDotsPoints = null
+      dotLayerGroup.clear()
       // 历史问题-F6：海面材质（globe.globeMaterial）随实例销毁释放
       oceanMat.dispose()
       if (scanMat) {

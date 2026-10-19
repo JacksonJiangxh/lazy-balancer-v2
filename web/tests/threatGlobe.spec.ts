@@ -49,13 +49,20 @@ test('WT87-04 暂停态相机变更必须直接落点并补绘一帧', () => {
   assert.match(globeSrc, /threeRenderer\.render\(scene, cam\)/, 'renderOnce 必须真正渲染一帧')
 })
 
-test('WT87-02/05 下钻衬底=普通多边形层，hover 他国提亮，且不再有 H3 死配置', () => {
-  assert.match(globeSrc, /globe\.polygonsData\(worldBackdropPolygons\(\)\.filter\(\(p\) => p\.key !== drilledName\)\)/)
+test('WT87-02/05 下钻衬底=低透明度世界点阵，hover 他国只提亮点，且不再有 H3 死配置', () => {
+  // 与 2D 地图同规则：非下钻国家降透明度点阵，不再使用国家多边形色块。
+  assert.match(globeSrc, /worldDots\.filter\(\(d\) => d\.key !== drilledName\)/)
+  assert.match(globeSrc, /DRILL_BACKDROP_OPACITY = 0\.38/)
+  assert.match(globeSrc, /backdropDotsPoints\.visible = !!drilledName/)
+  // alphaTest 若高于 opacity 会把低透明度点全部丢弃（本次不可见根因）。
+  assert.match(globeSrc, /alphaTest: 0\.05/)
+  assert.doesNotMatch(globeSrc, /globe\.polygonsData\(|polygonCapColor\(/,
+    '国家多边形衬底已退役，非下钻国家必须走暗度点阵')
   assert.doesNotMatch(globeSrc, /\.hexPolygonsData\(|\.hexPolygonResolution\(|\.hexPolygonMargin\(|\.hexPolygonColor\(/,
     'H3 六边形层从未有图元，死配置必须移除（避免再次误以为衬底走 hex）')
   const hover = member(globeSrc, 'function setHexHover(')
-  assert.match(hover, /globe\.polygonCapColor\(backdropCapColor\)/, '下钻态 hover 他国必须重算衬底色')
-  assert.match(globeSrc, /DRILL_BACKDROP_HOVER/)
+  assert.match(hover, /updateHoverDots\(name\)/, '下钻态 hover 他国必须只提亮该国点阵')
+  assert.match(globeSrc, /hoverDotsPoints/, '下钻态 hover 需要独立亮色点阵层')
 })
 
 test('WT87-10 首帧双 RAF 无条件应用图层（两帧内下钻不得残留世界点阵）', () => {
@@ -70,3 +77,9 @@ test('WT87-11 海外下钻浮签显示「无省级统计」而不是 0', () => {
   assert.match(globeSrc, /hasProvinceStats\(drilledName\)/)
   assert.match(globeSrc, /无省级统计/)
 })
+test('光流池满时拒绝新弧线，不淘汰已开始动画', () => {
+  const spawn = member(globeSrc, 'function spawnArc(')
+  assert.match(spawn, /if \(arcs\.length >= MAX_ARCS\) return/, '满池必须拒绝新弧线')
+  assert.doesNotMatch(spawn, /arcs\.shift\(\)/, 'spawnArc 不得淘汰已开始弧线')
+})
+

@@ -14,13 +14,8 @@ export const FLOW_FLIGHT_MS = 950
 export const FLOW_NORMAL_ARC_COLORS = ['rgba(56, 189, 248, 0.1)', 'rgba(56, 189, 248, 0.85)'] as const
 export const FLOW_ATTACK_ARC_COLORS = ['rgba(226, 84, 84, 0.1)', 'rgba(226, 84, 84, 0.95)'] as const
 
-/** 普通请求线宽：固定基础 + log 聚合增益。 */
-export function flowNormalWidth(count: number): number {
-  return 1.8 + Math.min(1.2, Math.log10(Math.max(1, count)))
-}
-
-/** 攻击光流线宽：2×(0.6+log)，上限 4。 */
-export function flowAttackWidth(count: number): number {
+/** 正常/攻击光流共用线宽：2×(0.6+log)，上限 4；仅颜色不同。 */
+export function flowArcWidth(count: number): number {
   return Math.min(4, 2 * (0.6 + Math.log10(Math.max(1, count))))
 }
 

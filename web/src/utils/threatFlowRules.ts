@@ -9,7 +9,7 @@ export interface FlowEventLike {
   action?: string
 }
 
-export interface FlowGroup<T extends FlowEventLike> {
+export interface FlowGroup<T> {
   /** 聚合地域 key（中国精确到省，其余国家） */
   region: string
   /** 秒级时间桶（Unix 秒） */
@@ -166,4 +166,65 @@ export function flowGroupEvents<T extends FlowEventLike>(events: readonly T[], n
     }
   }
   return [...groups.values()]
+}
+
+/** 正常流事件的最小形状（caddygeoip 事件流）：at 为 Unix 毫秒。 */
+export interface NormalFlowLike {
+  country?: string
+  province?: string
+  at?: number
+}
+
+/** 正常流与攻击流共用分组：地区键 + 秒桶，跨秒绝不合并。 */
+export function groupNormalFlowEvents<T extends NormalFlowLike>(
+  events: readonly T[],
+  now = Date.now(),
+): FlowGroup<T>[] {
+  const groups = new Map<string, FlowGroup<T>>()
+  for (const event of events) {
+    if (!event.country) continue
+    const region = flowRegionKey(event.province ? `${event.country}·${event.province}` : event.country)
+    const at = typeof event.at === 'number' && Number.isFinite(event.at) && event.at > 0 ? event.at : now
+    const bucket = flowBucket(at, now)
+    const key = flowBucketKey(region, bucket)
+    const group = groups.get(key)
+    if (group) group.items.push(event)
+    else groups.set(key, { region, bucket, key, items: [event] })
+  }
+  return [...groups.values()]
+}
+
+/** 单轮最多新增光流数；正常流与攻击流共用同一预算。 */
+export const FLOW_MAX_ARCS_PER_FLUSH = 12
+
+export interface FlowArcPlan {
+  key: string
+  count: number
+}
+
+/**
+ * 正常/攻击共用出弧计划：
+ * - >10 条同地区同秒合并为一条加权弧；
+ * - ≤10 逐条出弧；
+ * - 单轮预算用尽即停止，下一轮继续（不把超出预算的请求再合并）。
+ */
+export function planFlowArcs(
+  groups: readonly { key: string; count: number }[],
+  maxArcs = FLOW_MAX_ARCS_PER_FLUSH,
+): FlowArcPlan[] {
+  const ordered = [...groups].sort((a, b) => b.count - a.count || a.key.localeCompare(b.key))
+  const plan: FlowArcPlan[] = []
+  let budget = Math.max(0, maxArcs)
+  for (const group of ordered) {
+    if (budget <= 0) break
+    if (shouldAggregate(group.count)) {
+      plan.push({ key: group.key, count: group.count })
+      budget--
+      continue
+    }
+    const n = Math.min(group.count, budget)
+    for (let i = 0; i < n; i++) plan.push({ key: group.key, count: 1 })
+    budget -= n
+  }
+  return plan
 }
