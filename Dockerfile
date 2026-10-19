@@ -107,7 +107,7 @@ FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4c
 #
 # PD-01（历史）双轨口径（v2.3.6-beta 起有意设计，非分叉）：`VERSION`
 # 恒为**正式版本号**（如 v2.3.8，面板/`/api/v1/branding` 展示口径）；镜像
-# tag/compose image 可带 `-beta` 通道后缀（如 v2.3.8-beta）。二者刻意不同，
+# 正式版 tag 与 VERSION 相同；beta 通道才给 tag 加 `-beta` 后缀。二者刻意不同，
 # 发布时的判定口径是「tag 去掉通道后缀 == APP_VERSION」。改此约定需同时改
 # README 两版示例、docker-compose.yml、branding/config 回退与发布技能。
 ARG VERSION=v2.3.8
