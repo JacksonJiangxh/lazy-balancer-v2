@@ -243,36 +243,15 @@ func BuildWafFileRef() *models.ClusterWafFilesRef {
 
 // buildWafFileRefLocked 是 BuildWafFileRef 的无锁核心（调用方必须已持
 // wafFileMu；BuildWafFileBundle 与导出一侧共用，杜绝锁内自取）。
+// A86 历史问题（历史）：与 checked 变体单源——组件存在但读取/哈希
+// 失败不再静默省略分量（旧行为让快照 ref 少一项：从端不拉取、主端无告警，
+// 主从静默分叉），而是错误日志显式化 + 整体返回 nil。消费侧语义：
+// 主端快照缺 waf_files 引用（从端跳过比对、保留现状）与从端本地漂移检测
+// （wafFilesDrifted：nil → 判分叉全量重拉）均为可见/自愈方向。
 func buildWafFileRefLocked() *models.ClusterWafFilesRef {
-	ref := &models.ClusterWafFilesRef{}
-	seen := false
-	if _, err := os.Stat(filepath.Join(crsLiveDir, "rules")); err == nil {
-		// 历史问题:流式哈希(与 tarGzDir 字节级一致,历史问题 错误传播已补)——
-		// 本函数是快照重建+304 漂移检测热路径,免整档物化。
-		if sum, err := tarGzDirSum(crsLiveDir); err == nil && sum != "" {
-			ref.CRSSha256 = sum
-			seen = true
-		}
-	}
-	if v, err := os.ReadFile(filepath.Join(crsLiveDir, "VERSION")); err == nil {
-		ref.CRSVersion = strings.TrimSpace(string(v))
-	}
-	if sum, err := sha256File(ip2regionLivePath); err == nil && sum != "" {
-		ref.IP2RegionSha = sum
-		seen = true
-	}
-	if v, err := os.ReadFile(ip2regionLivePath + ".version"); err == nil {
-		// 与从端同一规则推导 tag（历史问题 形状校验）：主端原文、从端置空会让
-		// waf_files 节哈希两端永不对齐，从端永久节流重拉（E5 IMP-1）。
-		ref.IP2RegionTag = sanitizeBundleVersion(strings.TrimSpace(string(v)))
-	}
-	// RDB 文件化：扫描威胁库 .fast 文件哈希
-	threatFast := scanThreatFastFiles()
-	if len(threatFast) > 0 {
-		ref.ThreatSha256s = threatFast
-		seen = true
-	}
-	if !seen {
+	ref, err := buildWafFileRefLockedChecked()
+	if err != nil {
+		Logf("error", "WAF 文件引用构建失败（集群同步按无引用处理，从端漂移检测将触发全量重拉自愈）: %v", err)
 		return nil
 	}
 	return ref

@@ -53,6 +53,10 @@ func TestCanonicalACMEDomains_rejectsTrailingDot(t *testing.T) {
 func TestCreateOrRequeueCertJob_returns_persisted_job_id(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
+		VALUES ('lb_job_id','job-id','example.com','http',8443,1,1,'acme_dns')`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
 	manager := &CAQueueManager{queues: make(map[int]*caQueue), active: true}
 	t.Cleanup(manager.Stop)
 
@@ -74,7 +78,9 @@ func TestCreateOrRequeueCertJob_returns_persisted_job_id(t *testing.T) {
 
 func TestCreateOrRequeueCertJob_resets_retry_fields_before_enqueue(t *testing.T) {
 	_, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO cert_jobs
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
+		VALUES ('lb_retry_reset','retry','retry.example','http',8443,1,1,'acme_dns');
+		INSERT INTO cert_jobs
 		(rule_id,domain,status,renewal_attempts,ca_available_after,last_error_code)
 		VALUES ('lb_retry_reset','retry.example','failed',4,datetime('now','-1 hour'),'rate_limited')`); err != nil {
 		t.Fatalf("seed retry job: %v", err)
@@ -144,7 +150,9 @@ func TestCreateOrRequeueCertJob_requeues_downloaded_job(t *testing.T) {
 	// Given：已部署（downloaded）任务——用户再次触发签发必须重新排队，
 	// 不能静默空转（R29 A-M1）
 	_, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO cert_jobs
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
+		VALUES ('lb_downloaded','downloaded','downloaded.example','http',8443,1,1,'acme_dns');
+		INSERT INTO cert_jobs
 		(rule_id,domain,status,ca_provider_id)
 		VALUES ('lb_downloaded','downloaded.example','downloaded',1)`); err != nil {
 		t.Fatalf("seed downloaded job: %v", err)
@@ -181,7 +189,9 @@ func TestCreateOrRequeueCertJob_requeues_downloaded_job(t *testing.T) {
 func TestCreateOrRequeueCertJobWithChange_preservesTransitionSignalOnEnqueueError(t *testing.T) {
 	// Given：既有 failed 行会真实转为 queued，但入队时没有任何可用 CA。
 	_, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status) VALUES ('lb_changed_error','changed.example','failed')`); err != nil {
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
+		VALUES ('lb_changed_error','changed','changed.example','http',8443,1,1,'acme_dns');
+		INSERT INTO cert_jobs (rule_id,domain,status) VALUES ('lb_changed_error','changed.example','failed')`); err != nil {
 		t.Fatalf("seed existing job: %v", err)
 	}
 	if _, err := database.Exec("DELETE FROM ca_providers"); err != nil {
@@ -205,7 +215,9 @@ func TestCreateOrRequeueCertJobWithChange_preservesTransitionSignalOnEnqueueErro
 func TestCreateOrRequeueCertJobVerified_rejectsExistingJobThatWasNotQueued(t *testing.T) {
 	// Given：既有 queued 行不在活动队列中（滞留形态），队列本身处于运行态。
 	_, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO cert_jobs (id,rule_id,domain,status) VALUES (77,'lb_stranded_verify','stranded.example','queued')`); err != nil {
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
+		VALUES ('lb_stranded_verify','stranded','stranded.example','http',8443,1,1,'acme_dns');
+		INSERT INTO cert_jobs (id,rule_id,domain,status) VALUES (77,'lb_stranded_verify','stranded.example','queued')`); err != nil {
 		t.Fatalf("seed stranded job: %v", err)
 	}
 	manager := &CAQueueManager{queues: make(map[int]*caQueue), active: true}
@@ -771,8 +783,8 @@ func TestCertificateService_renewExpiringCertificates_usesRenewalFlowForIssuedMi
 	done := make(chan struct{})
 	resetCertificateServiceForTest(t)
 	service := NewCertificateService()
-	if jobs := service.CheckExpiration(); len(jobs) != 1 || jobs[0].RuleID != "lb_issued_null_flow" {
-		t.Fatalf("renewal candidates=%v, want issued NULL job", jobs)
+	if jobs, _, err := service.CheckExpiration(); err != nil || len(jobs) != 1 || jobs[0].RuleID != "lb_issued_null_flow" {
+		t.Fatalf("renewal candidates=%v err=%v, want issued NULL job", jobs, err)
 	}
 	go func() {
 		service.renewExpiringCertificates()
@@ -1207,7 +1219,10 @@ func TestCertificateService_CheckExpiration_returns_only_current_enabled_acme_do
 
 	// When
 	resetCertificateServiceForTest(t)
-	jobs := NewCertificateService().CheckExpiration()
+	jobs, _, scanErr := NewCertificateService().CheckExpiration()
+	if scanErr != nil {
+		t.Fatalf("CheckExpiration: %v", scanErr)
+	}
 
 	// Then
 	if len(jobs) != 1 || jobs[0].RuleID != "lb_current" {
@@ -1244,7 +1259,10 @@ func TestCertificateService_CheckExpiration_includes_issued_missing_expiry(t *te
 
 	// When
 	resetCertificateServiceForTest(t)
-	jobs := NewCertificateService().CheckExpiration()
+	jobs, _, scanErr := NewCertificateService().CheckExpiration()
+	if scanErr != nil {
+		t.Fatalf("CheckExpiration: %v", scanErr)
+	}
 
 	// Then
 	found := make(map[string]bool, len(jobs))
@@ -1297,7 +1315,10 @@ func TestCertificateService_CheckExpiration_compares_offset_and_fractional_times
 
 	// When
 	resetCertificateServiceForTest(t)
-	jobs := NewCertificateService().CheckExpiration()
+	jobs, _, scanErr := NewCertificateService().CheckExpiration()
+	if scanErr != nil {
+		t.Fatalf("CheckExpiration: %v", scanErr)
+	}
 
 	// Then
 	found := make(map[string]bool, len(jobs))
@@ -1337,7 +1358,10 @@ func TestCertificateService_CheckExpiration_respects_ca_cooldown_for_waiting_ca(
 
 	// When
 	resetCertificateServiceForTest(t)
-	jobs := NewCertificateService().CheckExpiration()
+	jobs, _, scanErr := NewCertificateService().CheckExpiration()
+	if scanErr != nil {
+		t.Fatalf("CheckExpiration: %v", scanErr)
+	}
 
 	// Then：冷却中的任务不得被续期扫描捕获（历史问题），冷却已过与无冷却的正常捕获
 	found := make(map[string]bool, len(jobs))

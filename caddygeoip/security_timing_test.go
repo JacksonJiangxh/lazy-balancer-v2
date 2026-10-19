@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -207,4 +208,47 @@ func auditTimingEntriesSnapshotForTest(t *testing.T) map[string]*auditTimingEntr
 		out[id] = e
 	}
 	return out
+}
+
+// A86 历史问题（历史）：计时 ID 是注册表 key，客户端可对无 counter 的
+// 路由伪造任意头值灌入注册表（内存 DoS）。recordSecurityTiming 只接受与
+// 服务端 securityTimingID 同形态的 16 字符 hex ID，其余一律静默忽略。
+func TestRecordSecurityTiming_rejectsForgedID(t *testing.T) {
+	useTestTimingRegistry(t)
+	start := strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	forged := []struct {
+		name string
+		id   string
+	}{
+		{"超长 ID（64KiB）", strings.Repeat("a", 64*1024)},
+		{"超长 ID（17 字符）", "abcdef0123456789a"},
+		{"短 ID", "abc"},
+		{"非 hex 16 字符", "zzzzzzzzzzzzzzzz"},
+		{"大写 hex", "ABCDEF0123456789"},
+		{"空白", " "},
+	}
+	for _, tt := range forged {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set(securityTimingHeader, tt.id)
+			req.Header.Set(securityTimingStartHeader, start)
+			recordSecurityTiming(req, timingSegmentPre)
+			if snap := auditTimingLookupForTest(t, tt.id); snap.preSet {
+				t.Fatalf("forged id %q must not create registry entries", tt.id)
+			}
+		})
+	}
+	if got := len(auditTimingEntriesSnapshotForTest(t)); got != 0 {
+		t.Fatalf("registry must stay empty under forged ids, got %d entries", got)
+	}
+
+	// 回归形状：合法 16-hex ID 照常记录。
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set(securityTimingHeader, "abcdef0123456789")
+	req.Header.Set(securityTimingStartHeader, start)
+	recordSecurityTiming(req, timingSegmentPre)
+	if snap := auditTimingLookupForTest(t, "abcdef0123456789"); !snap.preSet {
+		t.Fatal("valid 16-hex id must still record")
+	}
 }

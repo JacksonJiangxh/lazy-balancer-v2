@@ -1,9 +1,8 @@
 package handlers
 
 // 大屏本站坐标配置面（v3 规格第 3 项：面板设置里的公网坐标，缺省用地图视觉
-// 中心）——node-local 列（Ruling：站点地理位置是节点属性，随集群同步会让从节点
-// 的信标被主节点坐标覆盖，故不入 cluster_snapshot/cluster_apply 与
-// cluster_version 触发器 OF 列表；先例：auto_backup_last_run 同族）。
+// 中心）——主节点坐标为节点级默认值；未单独配置的从节点通过集群 node_sites
+// 快照继承主节点坐标，主节点自身字段仍不进入 global_config 通用同步列。
 // 写侧范围校验（纬度 ±90 / 经度 ±180），0,0=未设置（前端回退视觉中心）。
 
 import (
@@ -16,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -117,26 +117,38 @@ func TestPutConfig_serverMapCoordsRangeValidation(t *testing.T) {
 	}
 }
 
-func TestServerMapCoords_areNodeLocalNotClusterSynced(t *testing.T) {
-	// Given: 大屏本站坐标为 node-local 列（先例 auto_backup_last_run）——
-	// 集群同步会让从节点信标被主节点坐标覆盖；备份仍随 global_config 通用
-	// 表导出（同节点还原语义正确）。
-	// When/Then: 列不在集群应用 UPDATE 列单，也不在 cluster_version 触发器
-	// OF 列表中（源码级绊线：新增同步列时必须显式决策并更新本测试）。
-	for _, check := range []struct {
-		file   string
-		target string
-	}{
-		{"../services/cluster_apply.go", "server_map_lat"},
-		{"../services/cluster_snapshot.go", "server_map_lat"},
-		{"../middleware/cluster_version.go", "server_map_lat"},
-	} {
-		content, err := os.ReadFile(check.file)
-		if err != nil {
-			t.Fatalf("read %s: %v", check.file, err)
-		}
-		if strings.Contains(string(content), check.target) {
-			t.Errorf("%s 出现 %s——本站坐标应为 node-local（决策依据见本测试注释），若确需集群同步请移除本绊线并说明", check.file, check.target)
-		}
+func TestPutConfig_serverMapCoordsBumpClusterVersion(t *testing.T) {
+	// Given: 主节点坐标作为未配置从节点的默认值
+	router := newServerMapConfigRouter(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET cluster_version=7 WHERE id=1`); err != nil {
+		t.Fatalf("seed version: %v", err)
+	}
+
+	// When: 保存主节点坐标
+	if response := putConfigJSON(t, router, `{"server_map_lat":31.23,"server_map_lon":121.47}`); response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+
+	// Then: 版本递增一次，从节点下次拉取才能拿到新的默认坐标
+	var version int
+	if err := db.DB.QueryRow(`SELECT cluster_version FROM global_config WHERE id=1`).Scan(&version); err != nil {
+		t.Fatalf("read version: %v", err)
+	}
+	if version != 8 {
+		t.Fatalf("cluster_version=%d, want 8", version)
+	}
+}
+
+func TestServerMapCoords_areNodeLocalNotGenericClusterColumns(t *testing.T) {
+	// Given: server_map_lat/lon 是节点级坐标：主节点通过 nodes 表为每个从节点
+	// 独立配置，快照以 node_sites 映射下发（见 cluster_node_site_test.go）。
+	// When/Then: 它们仍不得进入 global_config 通用列/触发器——否则任一节点
+	// 坐标变化会走全量配置节并以主节点单值覆盖所有从节点。
+	content, err := os.ReadFile("../middleware/cluster_version.go")
+	if err != nil {
+		t.Fatalf("read cluster_version.go: %v", err)
+	}
+	if strings.Contains(string(content), "server_map_lat") {
+		t.Errorf("cluster_version.go 出现 server_map_lat——站点坐标不得进入 global_config 通用同步触发器")
 	}
 }

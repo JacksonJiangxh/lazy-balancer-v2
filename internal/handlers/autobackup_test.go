@@ -115,7 +115,7 @@ func TestRunAutoBackupOnce_successWritesFileRowAndAudit(t *testing.T) {
 	if err != nil || info.Size() == 0 {
 		t.Fatalf("backup file stat err=%v size=%d, want non-empty", err, info.Size())
 	}
-	// 行:success + 真实大小 + 全 3 分类(三分类合并后的默认全选)+ 摘要非空
+	// 行:success + 真实大小 + 全 4 分类(默认全选，含节点拓扑)+ 摘要非空
 	rows := autoBackupRows(t, "WHERE trigger_type='manual'")
 	if len(rows) != 1 {
 		t.Fatalf("manual rows=%d, want 1", len(rows))
@@ -128,8 +128,8 @@ func TestRunAutoBackupOnce_successWritesFileRowAndAudit(t *testing.T) {
 		t.Fatalf("size_bytes=%v, want %d", row["size_bytes"], info.Size())
 	}
 	var sections []string
-	if err := json.Unmarshal([]byte(row["sections"].(string)), &sections); err != nil || len(sections) != 3 || sections[0] != "users" || sections[1] != "rules" || sections[2] != "security" {
-		t.Fatalf("sections=%q err=%v, want [users rules security]", row["sections"], err)
+	if err := json.Unmarshal([]byte(row["sections"].(string)), &sections); err != nil || len(sections) != 4 || sections[0] != "users" || sections[1] != "rules" || sections[2] != "security" || sections[3] != "cluster" {
+		t.Fatalf("sections=%q err=%v, want [users rules security cluster]", row["sections"], err)
 	}
 	if row["message"] == "" {
 		t.Fatal("message 为空, want 各表行数摘要")
@@ -315,7 +315,7 @@ func TestLoadAutoBackupKeepSetting_outOfRangeFallsBack(t *testing.T) {
 
 // 三分类合并(2026-09-19 用户裁定):legacy sections 键(global_config→users、
 // waf_files→security)在保存与读取双侧归一——旧值不再因「仅全局配置」被拒,
-// 重存后落库值即收敛为当前三分类。
+// 重存后落库值即收敛为当前分类键（现为 users/rules/security/cluster 四分类）。
 func TestUpdateAutoBackupSettings_normalizesLegacySectionKeys(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
 	body := `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"keep":5,"sections":["global_config","waf_files","rules","users"]}`
@@ -334,7 +334,7 @@ func TestUpdateAutoBackupSettings_normalizesLegacySectionKeys(t *testing.T) {
 }
 
 // 存量行旧 JSON(升级前保存的 5 键)读出即归一——调度器/导出器消费的是当前
-// 三分类口径,无需迁移存量行。
+// 分类口径,无需迁移存量行。
 func TestLoadAutoBackupSectionsSetting_normalizesLegacyKeys(t *testing.T) {
 	newAutoBackupTestHandlers(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_sections='["users","global_config","rules","waf_files","security"]' WHERE id=1`); err != nil {
@@ -516,7 +516,7 @@ func TestAutoBackupSettings_returnsSettingsAndRowsDesc(t *testing.T) {
 		t.Fatalf("decode response: %v", err)
 	}
 	d := payload.Data
-	if !d.Enabled || d.Frequency != "weekly" || d.Time != "04:30" || d.Day != 6 || d.Keep != 9 || len(d.Sections) != 3 {
+	if !d.Enabled || d.Frequency != "weekly" || d.Time != "04:30" || d.Day != 6 || d.Keep != 9 || len(d.Sections) != 4 {
 		t.Fatalf("settings=(%v,%s,%s,%d,%d,%v)", d.Enabled, d.Frequency, d.Time, d.Day, d.Keep, d.Sections)
 	}
 	if len(d.Backups) != 2 || d.Backups[0].Filename != "lbbak-auto-list2.lbbak" {

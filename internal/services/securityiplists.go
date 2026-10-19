@@ -242,12 +242,14 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 // 文本静默遮蔽（新威胁漏拦/已移除误拦）。同代（mtime 相等）保持文本优先
 // （主节点写入相位先落文本后落 fast，内容等价）。
 // 两个文件都缺失返回文本侧错误（os.ErrNotExist 语义由调用方判定）。
+// A86 历史问题（历史）：.fast 较新但损坏/不可读时回退文本（在场时）
+// 并告警——旧实现直接失败，引用名单的 ACL/信任策略被渲染层整体跳过
+// （安全面静默缺失），且更新器哈希快路径按 stat 判定永不修复。
 func readThreatIplistPath(iplistPath string) ([]string, error) {
 	textInfo, textErr := os.Stat(iplistPath)
 	fastPath := wafiplist.FastPath(iplistPath)
 	fastInfo, fastErr := os.Stat(fastPath)
-	useText := textErr == nil && (fastErr != nil || !fastInfo.ModTime().After(textInfo.ModTime()))
-	if useText {
+	readText := func() ([]string, error) {
 		raw, err := os.ReadFile(iplistPath)
 		if err != nil {
 			return nil, err
@@ -263,8 +265,21 @@ func readThreatIplistPath(iplistPath string) ([]string, error) {
 		}
 		return vals, nil
 	}
+	useText := textErr == nil && (fastErr != nil || !fastInfo.ModTime().After(textInfo.ModTime()))
+	if useText {
+		return readText()
+	}
 	if fastErr == nil {
-		return expandThreatFastEntries(fastPath)
+		vals, err := expandThreatFastEntries(fastPath)
+		if err == nil {
+			return vals, nil
+		}
+		// .fast 较新但损坏：文本在场时回退文本（告警留痕）；无文本才报错。
+		if textErr == nil {
+			Logf("warn", "威胁名单 %s 的 .fast 读取失败（回退 .iplist 文本）: %v", fastPath, err)
+			return readText()
+		}
+		return nil, err
 	}
 	if textErr != nil {
 		return nil, textErr

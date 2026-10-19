@@ -1,0 +1,110 @@
+package handlers
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+
+	"lazy-balancer-v2/internal/db"
+)
+
+func newClusterNodeSiteRouter(t *testing.T) *gin.Engine {
+	t.Helper()
+	handler := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/cluster/nodes/:id/site", handler.UpdateClusterNodeSiteCoordinates)
+	return router
+}
+
+func seedClusterNodeSite(t *testing.T, isMaster bool) {
+	t.Helper()
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=?, cluster_version=7 WHERE id=1`, isMaster); err != nil {
+		t.Fatalf("seed global role: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO nodes (id,name,mode,ip_address,port,is_approved) VALUES (2,'edge-a','slave','10.0.0.2',8000,1)`); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+}
+
+func putClusterNodeSite(t *testing.T, router *gin.Engine, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPut, "/cluster/nodes/2/site", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
+
+func readClusterNodeSite(t *testing.T) (float64, float64, int) {
+	t.Helper()
+	var lat, lon float64
+	var version int
+	if err := db.DB.QueryRow(`SELECT server_map_lat, server_map_lon FROM nodes WHERE id=2`).Scan(&lat, &lon); err != nil {
+		t.Fatalf("read node site: %v", err)
+	}
+	if err := db.DB.QueryRow(`SELECT cluster_version FROM global_config WHERE id=1`).Scan(&version); err != nil {
+		t.Fatalf("read cluster version: %v", err)
+	}
+	return lat, lon, version
+}
+
+func TestUpdateClusterNodeSiteCoordinates_updatesNodeAndBumpsVersion(t *testing.T) {
+	// Given: 主节点与一个从节点
+	router := newClusterNodeSiteRouter(t)
+	seedClusterNodeSite(t, true)
+
+	// When: 主节点为该从节点配置站点坐标
+	if response := putClusterNodeSite(t, router, `{"server_map_lat":31.23,"server_map_lon":121.47}`); response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+
+	// Then: 仅该节点坐标变化，并 bump 集群版本触发同步
+	lat, lon, version := readClusterNodeSite(t)
+	if lat != 31.23 || lon != 121.47 {
+		t.Fatalf("node site=(%v,%v), want (31.23,121.47)", lat, lon)
+	}
+	if version != 8 {
+		t.Fatalf("cluster_version=%d, want 8", version)
+	}
+}
+
+func TestUpdateClusterNodeSiteCoordinates_validationAndMasterGate(t *testing.T) {
+	// Given: 主节点，已有坐标
+	router := newClusterNodeSiteRouter(t)
+	seedClusterNodeSite(t, true)
+	if response := putClusterNodeSite(t, router, `{"server_map_lat":10,"server_map_lon":20}`); response.Code != http.StatusOK {
+		t.Fatalf("seed status=%d", response.Code)
+	}
+	if _, err := db.DB.Exec(`UPDATE global_config SET cluster_version=7 WHERE id=1`); err != nil {
+		t.Fatalf("reset version: %v", err)
+	}
+
+	// When/Then: 缺键/越界/类型错误 400 且不写库
+	for _, body := range []string{
+		`{}`,
+		`{"server_map_lat":31.23}`,
+		`{"server_map_lon":121.47}`,
+		`{"server_map_lat":91,"server_map_lon":121.47}`,
+		`{"server_map_lat":31.23,"server_map_lon":181}`,
+		`{"server_map_lat":"north","server_map_lon":121.47}`,
+	} {
+		if response := putClusterNodeSite(t, router, body); response.Code != http.StatusBadRequest {
+			t.Fatalf("%s status=%d body=%s, want 400", body, response.Code, response.Body.String())
+		}
+	}
+	if lat, lon, version := readClusterNodeSite(t); lat != 10 || lon != 20 || version != 7 {
+		t.Fatalf("invalid writes changed node=(%v,%v) version=%d, want unchanged (10,20)/7", lat, lon, version)
+	}
+
+	// 从节点调用 → 主节点门拒绝
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatalf("demote: %v", err)
+	}
+	if response := putClusterNodeSite(t, router, `{"server_map_lat":1,"server_map_lon":2}`); response.Code != http.StatusForbidden {
+		t.Fatalf("slave status=%d body=%s, want 403", response.Code, response.Body.String())
+	}
+}

@@ -253,6 +253,23 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	})
 
 	mustRegisterTask(taskEngine, taskengine.Descriptor{
+		ID:          "metrics-orphan-cleanup",
+		Family:      "system",
+		Name:        "孤儿规则指标清理",
+		Description: "删除 metrics 库中已删除规则的残留历史指标——规则删除时清理失败的兜底（操作审计留痕）与有界重试收敛，每轮限量分批",
+		Category:    "系统",
+		Kind:        taskengine.KindPeriodic,
+		IntervalFn:  func() time.Duration { return 24 * time.Hour },
+		Run: func(rc taskengine.RunContext) error {
+			// A86 D-4：清理失败必须让 task_runs 落 failed，不得恒成功；
+			// 有界=单轮最多清理 metricsOrphanPurgeRulesPerRun 个规则，余量下轮收敛。
+			deletedRules, err := PurgeOrphanMetricsHistory(rc.Ctx)
+			TaskLogf("metrics-orphan-cleanup", "cleanup", "孤儿规则指标清理完成：删除 %d 个规则的历史指标（无残留为 0）", deletedRules)
+			return err
+		},
+	})
+
+	mustRegisterTask(taskEngine, taskengine.Descriptor{
 		ID: "crawlerbot-update", Family: "security", Name: "爬虫地址更新",
 		Description: "定时更新 Google/OpenAI/Bing/360 官方爬虫 IP 段（security_crawler_sources 独立源表）→ security_ip_lists 系统名单原子快照 + wafiplist .fast 预编译加速；主节点执行，从节点经集群快照同步",
 		Category:    "安全防护",
@@ -615,7 +632,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// 定时/循环/触发均可手动调度；常驻族恒不可（启停即可，启停由调度开关+重启承担）。
 
 	// 默认调度启动：
-	// - 循环 9 个全启动（cert-waiting-ca 除外——默认关闭，续期扫描唤醒；
+	// - 循环 10 个全启动（cert-waiting-ca 除外——默认关闭，续期扫描唤醒；
 	//   autoban 除外——调度唯一前提=业务启用，见下）
 	// - 常驻 3 个全启动（系统启动即运行；关闭调度=启动也不运行）
 	// - 定时 5 个启动排程（EnabledFn/NextSlotFn 内含开关判断）
@@ -625,6 +642,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	taskLoopPrefs := loadTaskLoopPrefs()
 	for _, id := range []string{
 		"config-watchdog", "log-cleanup", "audit-retention", "security-events-retention",
+		"metrics-orphan-cleanup",
 		"cert-renewal-scan", "cert-reconcile", "cert-manual-poll",
 		"security-events-ingestion", "cert-issuance", "cluster-sync",
 		"threat", "crs", "ip2region", "auto-backup",

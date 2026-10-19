@@ -221,8 +221,9 @@ func TestInitialize_omitsMetricsRetentionColumnAndAddsCompositeIndexes(t *testin
 	}
 }
 
-func TestInitMetricsSchema_duplicateTransactionIDsWarnAndSkipUniqueIndex(t *testing.T) {
-	// Given 真实存量 metrics 库：唯一索引尚未建立，且已有重复/空 transaction_id。
+func TestInitMetricsSchema_duplicateTransactionIDsDedupedAndIndexCreated(t *testing.T) {
+	// Given 真实存量 metrics 库：唯一索引尚未建立，且已有重复/空 transaction_id
+	//（重复行带区分性 client_ip，用于断言保留最早行）。
 	metrics, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "metrics-duplicates.db"))
 	if err != nil {
 		t.Fatalf("open metrics database: %v", err)
@@ -232,8 +233,9 @@ func TestInitMetricsSchema_duplicateTransactionIDsWarnAndSkipUniqueIndex(t *test
 		t.Fatalf("initialize metrics schema: %v", err)
 	}
 	if _, err := metrics.Exec(`DROP INDEX idx_security_events_transaction;
-		INSERT INTO security_events (transaction_id) VALUES
-		('duplicate-transaction'), ('duplicate-transaction'), ('unique-transaction'), (''), ('')`); err != nil {
+		INSERT INTO security_events (transaction_id, client_ip) VALUES
+		('duplicate-transaction','10.0.0.1'), ('duplicate-transaction','10.0.0.2'),
+		('unique-transaction','10.0.0.3'), ('','10.0.0.4'), ('','10.0.0.5')`); err != nil {
 		t.Fatalf("seed duplicate transaction IDs: %v", err)
 	}
 	var logBuf bytes.Buffer
@@ -244,7 +246,9 @@ func TestInitMetricsSchema_duplicateTransactionIDsWarnAndSkipUniqueIndex(t *test
 	// When 升级再次初始化 schema。
 	err = initMetricsSchema(metrics)
 
-	// Then 重复历史行不得拖垮启动；索引安全阀跳过且保留全部原始行。
+	// Then 重复历史行不得拖垮启动；启动期去重（保留每事务最早行）后唯一索引
+	// 照常建立——不再靠跳过索引放行（Audit86 历史问题：跳过会让 offset 重建/
+	// 轮转补采把重复事件重新入库并重复喂 autoban/rollup）。
 	if err != nil {
 		t.Fatalf("duplicate transaction IDs must not abort initialization: %v", err)
 	}
@@ -252,35 +256,52 @@ func TestInitMetricsSchema_duplicateTransactionIDsWarnAndSkipUniqueIndex(t *test
 	if err := metrics.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_security_events_transaction'`).Scan(&indexCount); err != nil {
 		t.Fatal(err)
 	}
-	if indexCount != 0 {
-		t.Fatalf("unique index count=%d, want safety-valve skip", indexCount)
+	if indexCount != 1 {
+		t.Fatalf("unique index count=%d, want 1（去重后必须建索引，不得跳过）", indexCount)
 	}
 	if err := metrics.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&rowCount); err != nil {
 		t.Fatal(err)
 	}
-	if rowCount != 5 {
-		t.Fatalf("security event rows=%d, want all 5 preserved", rowCount)
+	if rowCount != 4 {
+		t.Fatalf("security event rows=%d, want 4（重复事务保留 1 行 + 唯一事务 + 2 空串行）", rowCount)
 	}
-	if !strings.Contains(logBuf.String(), "duplicate-transaction") || !strings.Contains(logBuf.String(), "跳过") {
-		t.Fatalf("duplicate safety valve must WARN with the duplicated ID, log=%q", logBuf.String())
+	var keptIP string
+	if err := metrics.QueryRow(`SELECT client_ip FROM security_events WHERE transaction_id='duplicate-transaction'`).Scan(&keptIP); err != nil {
+		t.Fatalf("exactly one duplicate-transaction row must survive: %v", err)
+	}
+	if keptIP != "10.0.0.1" {
+		t.Fatalf("dedupe kept client_ip=%q, want earliest row 10.0.0.1", keptIP)
+	}
+	if !strings.Contains(logBuf.String(), "duplicate-transaction") || !strings.Contains(logBuf.String(), "去重") {
+		t.Fatalf("dedupe must WARN with the duplicated ID, log=%q", logBuf.String())
 	}
 
-	// And 人工清理后下次初始化自动补建索引；空串仍不受唯一约束。
-	if _, err := metrics.Exec(`DELETE FROM security_events WHERE transaction_id='duplicate-transaction'
-		AND id NOT IN (SELECT MIN(id) FROM security_events WHERE transaction_id='duplicate-transaction')`); err != nil {
-		t.Fatalf("clean duplicate transaction IDs: %v", err)
-	}
+	// And 幂等：再次初始化零去重、索引仍在。
+	logBuf.Reset()
 	if err := initMetricsSchema(metrics); err != nil {
-		t.Fatalf("reinitialize after duplicate cleanup: %v", err)
+		t.Fatalf("reinitialize after dedupe: %v", err)
 	}
-	if err := metrics.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_security_events_transaction'`).Scan(&indexCount); err != nil {
+	if strings.Contains(logBuf.String(), "去重") {
+		t.Fatalf("idempotent rerun must not dedupe again, log=%q", logBuf.String())
+	}
+	if err := metrics.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&rowCount); err != nil {
 		t.Fatal(err)
 	}
-	if indexCount != 1 {
-		t.Fatalf("unique index count=%d after cleanup, want 1", indexCount)
+	if rowCount != 4 {
+		t.Fatalf("security event rows=%d after rerun, want 4", rowCount)
 	}
+
+	// And 摄取幂等链恒成立：唯一索引拒绝重复非空事务 ID，OR IGNORE 静默去重，
+	// 空串仍不受唯一约束。
 	if _, err := metrics.Exec(`INSERT INTO security_events (transaction_id) VALUES ('duplicate-transaction')`); err == nil {
-		t.Fatal("recreated unique index accepted a duplicate non-empty transaction ID")
+		t.Fatal("unique index accepted a duplicate non-empty transaction ID")
+	}
+	result, err := metrics.Exec(`INSERT OR IGNORE INTO security_events (transaction_id, client_ip) VALUES ('duplicate-transaction','10.0.0.9')`)
+	if err != nil {
+		t.Fatalf("INSERT OR IGNORE must not error on duplicate: %v", err)
+	}
+	if affected, _ := result.RowsAffected(); affected != 0 {
+		t.Fatalf("INSERT OR IGNORE rows affected=%d, want 0（重复摄取不得再入库）", affected)
 	}
 	if _, err := metrics.Exec(`INSERT INTO security_events (transaction_id) VALUES ('')`); err != nil {
 		t.Fatalf("partial unique index rejected an empty transaction ID: %v", err)

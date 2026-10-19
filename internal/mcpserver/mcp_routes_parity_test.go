@@ -139,6 +139,8 @@ var mcpUncoveredRoutes = map[string]string{
 	"POST /api/v1/security/crawler-lib/update":       "手动更新爬虫地址库（低频管理面板操作；与威胁库更新端点同族未覆盖）",
 	"GET /api/v1/security/crawler-lib/update/status": "爬虫地址库更新任务状态（面板更新弹框轮询数据源）",
 	"GET /api/v1/security/crawler-lib/update/logs":   "爬虫地址库更新任务日志（面板更新弹框日志流）",
+	// —— 集群节点站点坐标：主节点节点列表专用，不走 MCP ——
+	"PUT /api/v1/cluster/nodes/:id/site": "主节点为指定从节点配置大屏站点坐标（集群节点管理 UI 专用；MCP 集群工具不承载节点本地展示配置）",
 	// —— MCP 自身镜像端点 ——
 	"POST /api/v1/mcp":             "MCP Streamable HTTP JSON-RPC 端点本身：工具调用的入口即 MCP 协议，不是可经 MCP 转发的 REST 操作",
 	"GET /api/v1/mcp/tools":        "MCP 自身镜像端点：OpenAPI 形态的工具清单，供外部集成方发现工具",

@@ -381,6 +381,7 @@ func TestCRSRollbackAfterReloadFailure_blocksWhileWafFileLockHeld(t *testing.T) 
 	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-901-INITIALIZATION.conf"), "SecRule live")
 	writeTestFile(t, filepath.Join(crsTransientPath(m.crsDir, "rules.bak"), "REQUEST-901-INITIALIZATION.conf"), "SecRule old")
 	writeTestFile(t, filepath.Join(m.crsDir, crsVersionFile), "v4.15.0\n")
+	m.rulesBakCreated = true // 本运行已创建 rules.bak（A86 历史问题 守卫）
 
 	probeBlocksUnderWafFileLock(t, "CRS 重载失败回滚（树+VERSION+版本行）", func() {
 		m.rollbackAfterReloadFailure("v4.14.0")
@@ -399,5 +400,106 @@ func TestCRSRollbackAfterReloadFailure_blocksWhileWafFileLockHeld(t *testing.T) 
 	}
 	if version != "v4.14.0" {
 		t.Fatalf("DB 版本行=%q, want v4.14.0（恢复下轮重试能力）", version)
+	}
+}
+
+// A86 历史问题（历史）：rules/setup/stock .bak 无「本运行创建」守卫——上一
+// 运行在「备份已建→清理前」崩溃残留的完整备份，会在本运行到达备份点前失败
+// （如下载失败走 fail(..., true)）时被 restoreBackup 无条件消费：live 树/setup
+// 被回滚到崩溃前状态（若崩溃发生在 swap 后则与 DB 版本行分叉，同 历史问题 形态；
+// 同版本也会回滚用户崩溃后的 setup 手改）。修复：镜像 overridesBakCreated
+// （历史问题 1.1）为三类备份补「本运行创建」标记，陈旧备份永不消费、原样保全
+// （崩溃现场唯一恢复素材，与 overrides.bak 三-1 保全语义一致）。
+func TestCRSUpdateRun_staleBaksNotConsumedOnEarlyFailure(t *testing.T) {
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.14.0", true)
+	// live 现状：上一运行崩溃后用户又手改了 setup
+	writeTestFile(t, filepath.Join(m.crsDir, "rules", crsRulesProbeFile), "SecRule live-current")
+	writeTestFile(t, filepath.Join(m.crsDir, "crs-setup.conf"), "# user tweaked after crash")
+	writeTestFile(t, filepath.Join(m.crsDir, "crs-setup.stock.conf"), "# current stock")
+	// 上一运行崩溃残留的完整备份（「备份已建→清理前」窗口）
+	writeTestFile(t, filepath.Join(crsTransientPath(m.crsDir, "rules.bak"), crsRulesProbeFile), "SecRule stale")
+	writeTestFile(t, crsTransientPath(m.crsDir, "crs-setup.conf.bak"), "# ancient setup")
+	writeTestFile(t, crsTransientPath(m.crsDir, "crs-setup.stock.conf.bak"), "# ancient stock")
+
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v4.15.0", nil }
+	m.downloadTarball = func(context.Context, string, string, downloadProgressFunc) error {
+		return errors.New("network down")
+	}
+	reloads := 0
+	m.reloader = func() error { reloads++; return nil }
+
+	// When 本运行下载失败（尚未到备份创建点）
+	m.run("manual", nil)
+
+	// Then 失败落库，live 树/setup/stock 原样保留（陈旧备份未被消费）
+	_, status, _, _, _, _, _ := crsVersionRow(t)
+	if status != "failed" {
+		t.Fatalf("update_status=%q, want failed", status)
+	}
+	if data, _ := os.ReadFile(filepath.Join(m.crsDir, "rules", crsRulesProbeFile)); string(data) != "SecRule live-current" {
+		t.Fatalf("live rules 被陈旧 rules.bak 覆盖: %q", data)
+	}
+	if data, _ := os.ReadFile(filepath.Join(m.crsDir, "crs-setup.conf")); string(data) != "# user tweaked after crash" {
+		t.Fatalf("live crs-setup.conf 被陈旧备份覆盖: %q", data)
+	}
+	if data, _ := os.ReadFile(filepath.Join(m.crsDir, "crs-setup.stock.conf")); string(data) != "# current stock" {
+		t.Fatalf("live crs-setup.stock.conf 被陈旧备份覆盖: %q", data)
+	}
+	// 陈旧备份原样保全（崩溃现场唯一恢复素材）
+	for _, name := range []string{"rules.bak", "crs-setup.conf.bak", "crs-setup.stock.conf.bak"} {
+		if _, err := os.Stat(crsTransientPath(m.crsDir, name)); err != nil {
+			t.Fatalf("陈旧备份 %s 不得被消费/删除: %v", name, err)
+		}
+	}
+}
+
+// A86 历史问题 回归形状（正向）：陈旧备份在场时，本运行到达备份点会用新备份覆盖
+// 之（复制覆写语义不变），失败路径消费的是本运行备份——live 回到「本次更新前」
+// 状态而非崩溃前的陈旧状态。
+func TestCRSUpdateRun_thisRunBaksConsumedOnSwapFailure(t *testing.T) {
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.14.0", true)
+	writeTestFile(t, filepath.Join(m.crsDir, "rules", crsRulesProbeFile), "SecRule live-v414")
+	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf"), "SecRule old")
+	writeTestFile(t, filepath.Join(m.crsDir, "crs-setup.conf"), "# user setup")
+	writeTestFile(t, filepath.Join(m.crsDir, "crs-setup.stock.conf"), "# stock")
+	// 陈旧备份与 live 内容不同——若被消费会留下可观测的错误内容
+	writeTestFile(t, filepath.Join(crsTransientPath(m.crsDir, "rules.bak"), crsRulesProbeFile), "SecRule stale")
+	writeTestFile(t, crsTransientPath(m.crsDir, "crs-setup.conf.bak"), "# ancient setup")
+	writeTestFile(t, crsTransientPath(m.crsDir, "crs-setup.stock.conf.bak"), "# ancient stock")
+
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v4.15.0", nil }
+	m.downloadTarball = fakeCRSDownload(t, map[string]string{
+		"coreruleset-4.15.0/crs-setup.conf.example":     "# new setup",
+		"coreruleset-4.15.0/rules/" + crsRulesProbeFile: "# init probe\n",
+	})
+	m.reloader = func() error { return errors.New("reload boom") }
+
+	// When 本运行完成备份与树交换、重载失败回滚
+	m.run("manual", nil)
+
+	// Then 回滚消费的是本运行备份：live 恢复为「本次更新前」内容（非陈旧备份），
+	// 备份全部消费清理，版本行回滚 v4.14.0 + failed
+	_, status, _, _, _, _, _ := crsVersionRow(t)
+	if status != "failed" {
+		t.Fatalf("update_status=%q, want failed", status)
+	}
+	if data, _ := os.ReadFile(filepath.Join(m.crsDir, "rules", crsRulesProbeFile)); string(data) != "SecRule live-v414" {
+		t.Fatalf("live rules 未由本运行备份还原: %q", data)
+	}
+	if data, _ := os.ReadFile(filepath.Join(m.crsDir, "crs-setup.conf")); string(data) != "# user setup" {
+		t.Fatalf("live crs-setup.conf 未由本运行备份还原: %q", data)
+	}
+	if data, _ := os.ReadFile(filepath.Join(m.crsDir, "crs-setup.stock.conf")); string(data) != "# stock" {
+		t.Fatalf("live crs-setup.stock.conf 未由本运行备份还原: %q", data)
+	}
+	for _, name := range []string{"rules.bak", "crs-setup.conf.bak", "crs-setup.stock.conf.bak"} {
+		if _, err := os.Stat(crsTransientPath(m.crsDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("本运行备份 %s 应被消费清理", name)
+		}
+	}
+	if version, _, _, _, _, _, _ := crsVersionRow(t); version != "v4.14.0" {
+		t.Fatalf("version=%q, want v4.14.0（重载失败同代回滚）", version)
 	}
 }

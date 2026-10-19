@@ -2358,10 +2358,12 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			continue
 		}
 		if r.Protocol == "http" && r.EnableTLS && r.TLSHTTPRedirect {
-			if r.TLSSource == "acme_dns" {
-				if _, hasCert := availableCerts[r.CaddyID]; !hasCert {
-					continue
-				}
+			// A86 历史问题（历史，SVCA-86-历史问题）：跳转与 server 同判据——
+			// 证书未就绪（availableCerts 未命中）即不发射 301，不分 tls_source。
+			// 旧判据只门 acme_dns：manual 脏行（空证书）形态下 server 按
+			// A85历史问题-2 跳过而 80 跳转仍发射，域名被 301 到无服务的 TLS 端口。
+			if _, hasCert := availableCerts[r.CaddyID]; !hasCert {
+				continue
 			}
 			domainHosts := splitAndTrim(r.Domain)
 			if len(domainHosts) > 0 {
@@ -4170,7 +4172,11 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 安全处理耗时收点(2026-09-27 双点计时):放行事件的纯评估耗时在此记录
 	// (blocked_counter 只计拦截事件——其 next 返回值混入上游代理往返不可用)。
 	// 置于安全链末尾、reverse_proxy 之前;信任直通时随 subroute 整体跳过。
-	if securityLibsOK && rule.Protocol == "http" && len(securityChain) > 0 {
+	// A86 历史问题（历史）：发射面从「链非空」收窄为「有策略」（=counter
+	// 在场同判据）——request_body 恒发射使旧判据对无策略规则也产 timing_end，
+	// 而无 counter 的路由无服务端 timing ID 注入/覆盖，客户端伪造的计时头会
+	// 直进进程内注册表（内存 DoS 面）；无 counter 即无任何计时写点。
+	if securityLibsOK && rule.Protocol == "http" && len(policies) > 0 {
 		securityChain = append(securityChain, map[string]interface{}{
 			"handler": "lb_security_timing_end",
 		})

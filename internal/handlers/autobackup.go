@@ -52,7 +52,7 @@ func autoBackupSafeFilename(name string) bool {
 // （全部）。数据库读失败、损坏 JSON 与空数组必须显式报错，绝不能静默退化
 // 为全量备份（否则管理员原以为只导局部，实际把全部凭证写入备份文件）。
 // 存量行可能携带三分类合并前的 legacy 键(global_config/waf_files)——读出即
-// 归一(2026-09-19 用户裁定),调度器/导出器消费当前三分类口径,无需迁移存量行。
+// 归一(2026-09-19 用户裁定),调度器/导出器消费当前分类口径,无需迁移存量行。
 func loadAutoBackupSectionsSetting() ([]string, error) {
 	var raw sql.NullString
 	if err := db.DB.QueryRow(`SELECT auto_backup_sections FROM global_config WHERE id=1`).Scan(&raw); err != nil {
@@ -83,7 +83,7 @@ func decodeAutoBackupSectionsRaw(raw sql.NullString) ([]string, error) {
 	return normalized, nil
 }
 
-// allBackupSectionKeys 当前三分类的键序（GET 设置读侧把「未设置=全量」
+// allBackupSectionKeys 当前分类的键序（GET 设置读侧把「未设置=全量」
 // 展开成同一份有效范围，响应与执行语义不再分叉——B2-历史问题）。
 func allBackupSectionKeys() []string {
 	keys := make([]string, 0, len(configBackupSections))
@@ -498,7 +498,7 @@ func (h *Handlers) AutoBackupSettings(c *gin.Context) {
 		day = autoBackupDayDefault
 	}
 	// B2-历史问题：读侧与执行侧（loadAutoBackupSectionsSetting）同一语义——
-	// NULL/空串=全量，展开为三分类全键；损坏 JSON/[]/未知分类显式 500，
+	// NULL/空串=全量，展开为全部分类键；损坏 JSON/[]/未知分类显式 500，
 	// 不再静默呈现空数组（调度侧这些形态本来就每轮失败）。复用本查询已
 	// 扫描的原始值，避免额外一次 DB 读（读侧语义单源在解码 helper）。
 	storedSections, sectionsErr := decodeAutoBackupSectionsRaw(sectionsRaw)
@@ -565,7 +565,8 @@ func (h *Handlers) AutoBackupSettings(c *gin.Context) {
 // UpdateAutoBackupSettings PUT /api/v1/settings/auto-backup：全量保存设置。
 // 校验：freq∈{daily,weekly,monthly}；time 为 HH:MM；keep 1-30(2026-09-19
 // 追加裁定:上限 100→30)；day weekly 1-7 / monthly 1-28；sections 为已知
-// 分类子集且非空(legacy 键保存时归一为当前三分类落库)。off→on 时置水位线
+// 分类子集且非空(legacy 键保存时归一为当前四分类落库——users/rules/
+// security/cluster，键清单单源 configBackupSections)。off→on 时置水位线
 // last_run=now(2026-09-19 用户裁定)——不立即执行、不回补停用期旧槽,
 // 下一次执行=启用后下一个到期槽。
 func (h *Handlers) UpdateAutoBackupSettings(c *gin.Context) {
@@ -635,7 +636,7 @@ func (h *Handlers) UpdateAutoBackupSettings(c *gin.Context) {
 			_ = tx.Rollback()
 		}
 	}()
-	if _, err := tx.Exec(`UPDATE global_config SET auto_backup_frequency=?, auto_backup_time=?, auto_backup_day=?, auto_backup_keep=?, auto_backup_sections=? WHERE id=1`,
+	if _, err := tx.Exec(`UPDATE global_config SET auto_backup_frequency=?, auto_backup_time=?, auto_backup_day=?, auto_backup_keep=?, auto_backup_sections=?, auto_backup_sections_version=1 WHERE id=1`,
 		*req.Frequency, *req.Time, *req.Day, *req.Keep, string(sectionsJSON)); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "保存自动备份设置失败: " + err.Error()})
 		return

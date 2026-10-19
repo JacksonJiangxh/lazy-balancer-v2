@@ -38,6 +38,11 @@ func (h *Handlers) ListClusterNodes(c *gin.Context) {
 }
 
 func (h *Handlers) ReportClusterNode(c *gin.Context) {
+	// A86 历史问题：导入窗口 fast-fail——上报写 nodes 瞬态列与分区上报缓存，
+	// 导入全量替换 nodes 时窗口写入会被覆盖或阻塞至 busy_timeout。
+	if rejectNodeWriteDuringImport(c) {
+		return
+	}
 	// 历史问题:与快照端点对称加 requireMaster——降级主节点残留 nodes 行时,
 	// 旧从节点上报照常写入(无审批),再提升后旧令牌静默重组集群。
 	if !h.requireMaster(c) {
@@ -53,7 +58,7 @@ func (h *Handlers) ReportClusterNode(c *gin.Context) {
 	if req.Detached {
 		if err := h.clusterService.DeleteNode(c.Request.Context(), nodeID); err != nil {
 			if errors.Is(err, services.ErrNotMasterNode) {
-				clusterError(c, http.StatusForbidden, err.Error(), err)
+				clusterMasterForbidden(c, err)
 				return
 			}
 			clusterError(c, http.StatusInternalServerError, "节点脱离处理失败", err)
@@ -65,7 +70,7 @@ func (h *Handlers) ReportClusterNode(c *gin.Context) {
 	}
 	if err := h.clusterService.ReportNode(c.Request.Context(), nodeID, req, time.Now()); err != nil {
 		if errors.Is(err, services.ErrNotMasterNode) {
-			clusterError(c, http.StatusForbidden, err.Error(), err)
+			clusterMasterForbidden(c, err)
 			return
 		}
 		clusterError(c, http.StatusInternalServerError, "节点状态上报失败", err)

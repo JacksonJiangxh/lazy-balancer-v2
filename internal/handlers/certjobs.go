@@ -504,11 +504,12 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 	// 不变量（历史问题 S-1 修正）：'disabled' 对 worker 是终态——所有 worker 侧
 	// transitionJob 的 from 列表均排除 'disabled'，翻转后不会被周期路径复活。
 	// caqueue.EnqueueIfActive 的调用方并非全部持锁：RetryCertJob 持
-	// certJobOperationLock、本函数失败恢复与规则写路径持 caddyOpMu；而
-	// IssueCertificate 与四个周期路径（requeueStrandedJobs/
-	// requeueWaitingCAJobs/requeueNonTerminalCertJobs/renewExpiringCertificates）
-	// 无锁调用——其 UPDATE 均按旧状态 CAS 或 from 列表排除 'disabled'，与翻转
-	// 交错时命中 0 行（先于翻转→翻转 CAS 失败；翻转后→0 行；删除后→行不存在），
+	// certJobOperationLock；本函数失败恢复、规则写路径与手工签发
+	// （IssueCertificate，A86 历史问题 起定向/批量两分支全程持 caddyOpMu）持
+	// caddyOpMu；四个周期路径（requeueStrandedJobs/requeueWaitingCAJobs/
+	// requeueNonTerminalCertJobs/renewExpiringCertificates）无锁调用——其
+	// UPDATE 均按旧状态 CAS 或 from 列表排除 'disabled'，与翻转交错时命中
+	// 0 行（先于翻转→翻转 CAS 失败；翻转后→0 行；删除后→行不存在），
 	// 语义自洽。
 	// CERT 历史问题（历史，A76Cert）：caddyOpMu 覆盖 查询→守卫→disabled 翻转
 	// →删除 全程（历史问题 C-发现3 TOCTOU 不变量保持——与 EnableRule 互斥域不变，

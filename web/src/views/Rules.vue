@@ -1241,7 +1241,7 @@ import { isValidHostName, validatePathRules } from '@/utils/ruleValidation'
 import { getStrategyLabel } from '@/utils/strategyLabels'
 import { popperViewportSafe } from '@/utils/popper'
 import { hostPortKey } from '@/utils/upstreamKeys'
-import { MAX_UPSTREAM_ROWS, normalizeWeights, redistributeWeight, weightPercent } from '@/utils/upstreamWeights'
+import { MAX_UPSTREAM_ROWS, normalizeWeights, payloadWeight, redistributeWeight, weightPercent } from '@/utils/upstreamWeights'
 import { projectRuleFlowPath } from '@/utils/ruleFlow'
 import { dnsServerAfterToggle } from '@/utils/ruleWizard'
 import { certJobStatusLabel } from '@/utils/certJobStatus'
@@ -3129,7 +3129,9 @@ const submitWizard = async () => {
   try {
     const validUpstreams = wizardForm.upstreams.filter(u => u.host && u.port).map(u => ({
       ...u,
-      weight: u.weight ?? 100,
+      // A86 D-3：禁用行草稿权重为 0（变异契约），载荷边界经 payloadWeight
+      // 送 1（后端 weight<1 已响亮 400，0→1 静默归一废除）。
+      weight: payloadWeight(u),
       dynamic_dns: wizardForm.dynamic_dns,
       max_connections: u.max_connections ?? 0,
       // 动态上游模式回源域名不可用（后端同口径 400；UI 列已禁用，此处防 stale 值外泄）

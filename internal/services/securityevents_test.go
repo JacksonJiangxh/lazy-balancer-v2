@@ -1102,7 +1102,7 @@ func TestSecurityEventsPollOnce_reportsPersistentFailureAndRecovery(t *testing.T
 
 	// Then 指标库恢复后的成功轮清除连续失败并记录成功时间。
 	db.MetricsDB = metricsDB
-	if got := SecurityEventsPollOnce(); got != 1 {
+	if got, _ := SecurityEventsPollOnce(); got != 1 {
 		t.Fatalf("恢复后摄取=%d, want 1", got)
 	}
 	status = SecurityEventsIngestionHealthSnapshot()
@@ -1135,7 +1135,7 @@ func TestSecurityEventsPollOnce_returnsCountWithoutWritingTaskLog(t *testing.T) 
 	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
 
 	// When：非 ingestion 调用方直接执行一轮摄取。
-	got := SecurityEventsPollOnce()
+	got, _ := SecurityEventsPollOnce()
 
 	// Then：条数交给调用方，函数自身不得越权写 ingestion 任务日志。
 	if got != 1 {
@@ -1172,7 +1172,7 @@ func TestSecurityEventsPollOnce_callsRollupRewindHookForInsertedBatch(t *testing
 	var rewinds []time.Time
 	SetSecurityEventsRollupRewrite(func(minute time.Time) { rewinds = append(rewinds, minute) })
 
-	if got := SecurityEventsPollOnce(); got != 1 {
+	if got, _ := SecurityEventsPollOnce(); got != 1 {
 		t.Fatalf("ingested=%d, want 1", got)
 	}
 	if len(rewinds) != 1 {
@@ -1194,7 +1194,7 @@ func TestSecurityEventsPollOnce_callsRollupRewindHookForInsertedBatch(t *testing
 	}
 
 	// 幂等重放（INSERT OR IGNORE 未插入）不得再次回退水位。
-	if got := SecurityEventsPollOnce(); got != 0 {
+	if got, _ := SecurityEventsPollOnce(); got != 0 {
 		t.Fatalf("replayed poll ingested=%d, want 0", got)
 	}
 	if len(rewinds) != 1 {

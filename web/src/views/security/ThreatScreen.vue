@@ -283,6 +283,7 @@ import { request } from '@/utils/api'
 import type { APIResponse } from '@/types'
 import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
+import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
 import { isRealtimeFlowEvent } from '@/utils/threatFlowRules'
 import { useCountUp } from '@/composables/useCountUp'
 import { formatDate } from '@/utils/date'
@@ -364,7 +365,6 @@ let threatMap: ThreatScene | null = null
 
 interface ArcTick { key: string; ts: number }
 let arcQueue: ArcTick[] = []
-let arcFlushTimer: number | undefined = undefined
 let disposed = false
 
 const displayTotal = useCountUp(computed(() => stats.value?.total_events ?? 0))
@@ -495,7 +495,6 @@ function tickClock(): void {
   const cam = threatMap?.cameraState()
   if (cam) camReadout.value = `${cam.cy.toFixed(1)}° ${cam.cx.toFixed(1)}°`
 }
-let clockTimer = 0
 
 // ============ 攻击事件弹框（阶段标签单源=rule_triggered） ============
 interface AttackToast {
@@ -972,8 +971,10 @@ async function mountEngine(): Promise<void> {
   }
 }
 
+// 页面隐藏也按暂停渲染（A86 历史问题）：与手动暂停取或，恢复可见后回到手动态。
+let screenHidden = false
 function applyMapPause(): void {
-  threatMap?.setPaused(paused.value)
+  threatMap?.setPaused(paused.value || screenHidden)
 }
 
 function togglePause(): void {
@@ -1013,18 +1014,6 @@ function onKeydown(event: KeyboardEvent): void {
   else exitScreen()
 }
 
-function onVisibilityChange(): void {
-  if (document.hidden) threatMap?.setPaused(true)
-  else {
-    // 后台节流可能让租约过期并清空后端序号；恢复后从 0 追赶，避免旧高水位
-    // 永久过滤新事件。
-    flowCursorEpoch++
-    flowSince = 0
-    acquireCollector()
-    applyMapPause()
-  }
-}
-
 // 大屏流量采集租约：只在屏幕打开时让 Caddy 计数；关闭/崩溃由 TTL 兜底。
 function newCollectorLeaseId(): string {
   try {
@@ -1035,7 +1024,6 @@ function newCollectorLeaseId(): string {
 const collectorLeaseId = newCollectorLeaseId()
 const COLLECTOR_TTL_MS = 30000
 const COLLECTOR_HEARTBEAT_MS = 10000
-let collectorTimer = 0
 
 function acquireCollector(): void {
   if (disposed) return
@@ -1053,18 +1041,37 @@ function releaseCollector(): void {
   }).catch(() => { /* TTL 兜底 */ })
 }
 
+// hidden 停摆/visible 恢复纳管单源（A86 历史问题）：时钟、弧光冲刷、采集租约
+// 心跳三类间隔随页面可见性启停；hidden 时同步释放采集租约——此前仅暂停渲
+// 染，心跳在后台持续续租让 Caddy 空计数。
+const screenLoop = createVisibilityIntervals({
+  intervals: [
+    { tick: tickClock, ms: 1000, immediate: true },
+    { tick: flushArcs, ms: ARC_FLUSH_MS },
+    { tick: acquireCollector, ms: COLLECTOR_HEARTBEAT_MS, immediate: true },
+  ],
+  onHidden: () => {
+    screenHidden = true
+    applyMapPause()
+    releaseCollector()
+  },
+  onVisible: () => {
+    screenHidden = false
+    // 后台节流可能让租约过期并清空后端序号；恢复后从 0 追赶，避免旧高水位
+    // 永久过滤新事件。
+    flowCursorEpoch++
+    flowSince = 0
+    applyMapPause()
+  },
+})
+
 let configTimeout = 0
 
 onMounted(() => {
   // 首屏优先：数据轮询/时钟/引擎并行启动，装饰性 /config 不再阻塞（原实现
   // await /config → await import → 才 start 三个轮询；30s 全局超时时大屏空转）。
   window.addEventListener('keydown', onKeydown)
-  document.addEventListener('visibilitychange', onVisibilityChange)
-  arcFlushTimer = window.setInterval(flushArcs, ARC_FLUSH_MS)
-  tickClock()
-  clockTimer = window.setInterval(tickClock, 1000)
-  acquireCollector()
-  collectorTimer = window.setInterval(acquireCollector, COLLECTOR_HEARTBEAT_MS)
+  screenLoop.start()
   feedTask.start()
   statsTask.start()
   trafficTask.start()
@@ -1085,15 +1092,9 @@ onMounted(() => {
 onBeforeUnmount(() => {
   disposed = true
   window.removeEventListener('keydown', onKeydown)
-  document.removeEventListener('visibilitychange', onVisibilityChange)
-  clearInterval(arcFlushTimer)
-  arcFlushTimer = undefined
+  screenLoop.stop()
   clearTimeout(configTimeout)
   configTimeout = 0
-  clearInterval(clockTimer)
-  clockTimer = 0
-  clearInterval(collectorTimer)
-  collectorTimer = 0
   releaseCollector()
   for (const t of toastTimers.values()) clearTimeout(t)
   toastTimers.clear()

@@ -254,12 +254,57 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 	if err != nil {
 		return models.ClusterRegistration{}, fmt.Errorf("更新待审批节点: %w", err)
 	}
+	// A86 历史问题：nodes 不在 cluster_version 触发器清单（middleware/cluster_version.go
+	// 依赖显式 bump）——注册/覆盖改变节点拓扑后必须同事务 bump，否则快照缓存键
+	// 不变，新节点的 node_sites 缺项，继承坐标静默不生效直至下一次无关 bump。
+	if err := BumpClusterVersion(ctx, tx); err != nil {
+		return models.ClusterRegistration{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return models.ClusterRegistration{}, fmt.Errorf("提交节点注册: %w", err)
 	}
 	// 历史问题-05：同 IP:port 行被覆盖后旧分区哈希不再属于本次注册。
 	s.clearSectionReport(nodeID)
 	return models.ClusterRegistration{RegistrationID: nodeID, RegistrationSecret: secret, OverwrittenNodeID: overwrittenNodeID, OverwrittenNodeName: overwrittenNodeName, AccessURLIgnored: accessURLIgnored}, nil
+}
+
+func (s *ClusterService) UpdateNodeSiteCoordinates(ctx context.Context, nodeID int, lat, lon float64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启节点站点坐标事务: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// A86 历史问题：无变更保存=no-op——现值相同则不写库不 bump（「打开弹框原样
+	// 保存」不得放大为全集群快照重放；继承节点 0,0 原样保存保持继承不固化）。
+	var currentLat, currentLon float64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(server_map_lat,0), COALESCE(server_map_lon,0) FROM nodes WHERE id=? AND `+masterRoleConditionSQL, nodeID).Scan(&currentLat, &currentLon); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return s.nodeWriteMissError(ctx)
+		}
+		return fmt.Errorf("读取节点站点坐标: %w", err)
+	}
+	if currentLat == lat && currentLon == lon {
+		return nil
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE nodes SET server_map_lat=?, server_map_lon=? WHERE id=? AND `+masterRoleConditionSQL, lat, lon, nodeID)
+	if err != nil {
+		return fmt.Errorf("更新节点站点坐标: %w", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("读取节点站点坐标更新结果: %w", err)
+	}
+	if updated != 1 {
+		return s.nodeWriteMissError(ctx)
+	}
+	// 坐标是 node-local 下发数据，必须 bump 版本触发从节点拉取；与节点行同事务。
+	if err := BumpClusterVersion(ctx, tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交节点站点坐标: %w", err)
+	}
+	return nil
 }
 
 func (s *ClusterService) UpdateNodeAccessURL(ctx context.Context, nodeID int, accessURL string) error {

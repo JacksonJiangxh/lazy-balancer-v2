@@ -97,10 +97,12 @@ var ErrNoClusterPin = errors.New("该节点没有已钉扎的证书指纹")
 func (s *ClusterService) ForgetNodePin(ctx context.Context, nodeID int) (string, error) {
 	var ipAddress, protocol, accessURL string
 	var port int
-	if err := s.db.QueryRowContext(ctx, `SELECT ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,'') FROM nodes WHERE id=?`, nodeID).
+	if err := s.db.QueryRowContext(ctx, `SELECT ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,'') FROM nodes WHERE id=? AND `+masterRoleConditionSQL, nodeID).
 		Scan(&ipAddress, &port, &protocol, &accessURL); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", ErrNodeNotFound
+			// A86 历史问题：SQL 级角色条件（同族 TOCTOU 唯一漏点）——0 行时复核
+			// 角色：降级窗口返回 403 哨兵，而不是继续删除主节点目录下的 pin。
+			return "", s.nodeWriteMissError(ctx)
 		}
 		return "", fmt.Errorf("读取节点访问地址: %w", err)
 	}

@@ -490,8 +490,11 @@ func validateRuleUpstreams(protocol string, dynamicDNS bool, upstreams []models.
 		if u.Port < 1 || u.Port > 65535 {
 			return 0, fmt.Errorf("上游 #%d：端口 %d 无效（必须在 1-65535 之间）", i+1, u.Port)
 		}
-		if u.Weight < 0 {
-			return 0, fmt.Errorf("上游 #%d：权重不能为负数", i+1)
+		// A86 D-3（历史裁定）：weight<1 响亮拒绝——0→1 静默归一废除
+		//（保存/导入同口径，导入侧见 config_backup.go 备份校验）；禁用行的
+		// 权重字段无业务意义但同样不得落 0（UI 载荷边界为禁用行送 1）。
+		if u.Weight < 1 {
+			return 0, fmt.Errorf("上游 #%d：权重必须为不小于 1 的整数", i+1)
 		}
 		if protocol == "http" {
 			if u.Protocol != "" && u.Protocol != "http" && u.Protocol != "https" {

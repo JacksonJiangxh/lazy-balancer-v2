@@ -99,12 +99,15 @@ func TestThreatRDBSteadyState_emptyDBEntriesWithFileIsNotDue(t *testing.T) {
 	setupThreatTest(t, nil, nil, nil)
 
 	// 稳态形状：RDB 后正常态（entries=''）+ 文件已物化 + 未到期 + 从未失败
-	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("192.0.2.0/24\n"), 0644); err != nil {
+	iplistPath := filepath.Join(wafDir, "threat-ustc.iplist")
+	if err := os.WriteFile(iplistPath, []byte("192.0.2.0/24\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	// 历史问题：.fast 缺失同样视为未装载（运行消费面），稳态需两者齐备。
-	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist.fast"), []byte("LBF1"), 0644); err != nil {
-		t.Fatal(err)
+	// A86 历史问题：判据含可读性校验——夹具必须是真实编译产物，4 字节伪
+	// 「LBF1」头在可读性口径下即为损坏文件。
+	if err := CompileFromIplistFile(iplistPath); err != nil {
+		t.Fatalf("编译 .fast 夹具: %v", err)
 	}
 	if _, err := db.DB.Exec(`UPDATE security_ip_lists SET entries='' WHERE name=?`, db.ThreatListNameBySource("ustc")); err != nil {
 		t.Fatal(err)

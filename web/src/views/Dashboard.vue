@@ -312,7 +312,7 @@
             </el-table-column>
             <el-table-column label="请求数" width="110">
               <template #default="{ row }">
-                <span class="text-primary" :title="isRuleDisabled(row) ? '已禁用' : ruleMetricsUnavailable[row.caddy_id] ? '采集失败' : ruleMetrics[row.caddy_id]?.requests_total?.toLocaleString() ?? '-'">{{ isRuleDisabled(row) ? '已禁用' : ruleMetricsUnavailable[row.caddy_id] ? '采集失败' : ruleMetrics[row.caddy_id]?.requests_total?.toLocaleString() ?? '-' }}</span>
+                <span class="text-primary" :title="ruleMetricCellTitle({ disabled: isRuleDisabled(row), unavailable: !!ruleMetricsUnavailable[row.caddy_id], tcp: row.protocol === 'tcp', value: ruleMetrics[row.caddy_id]?.requests_total?.toLocaleString() ?? '-' })">{{ isRuleDisabled(row) ? '已禁用' : ruleMetricsUnavailable[row.caddy_id] ? '采集失败' : ruleMetrics[row.caddy_id]?.requests_total?.toLocaleString() ?? '-' }}</span>
               </template>
             </el-table-column>
             <!-- 历史问题 二十八次初版 310 过宽（用户反馈）→ 260：常见量级（万级以内）
@@ -353,7 +353,7 @@
             </el-table-column>
             <el-table-column label="处理中" width="70">
               <template #default="{ row }">
-                <span class="text-secondary">{{ isRuleDisabled(row) ? '已禁用' : ruleMetricsUnavailable[row.caddy_id] ? '采集失败' : ruleMetrics[row.caddy_id]?.requests_in_flight ?? '-' }}</span>
+                <span class="text-secondary" :title="ruleMetricCellTitle({ disabled: isRuleDisabled(row), unavailable: !!ruleMetricsUnavailable[row.caddy_id], tcp: row.protocol === 'tcp', value: String(ruleMetrics[row.caddy_id]?.requests_in_flight ?? '-') })">{{ isRuleDisabled(row) ? '已禁用' : ruleMetricsUnavailable[row.caddy_id] ? '采集失败' : ruleMetrics[row.caddy_id]?.requests_in_flight ?? '-' }}</span>
               </template>
             </el-table-column>
             <el-table-column label="健康状态" width="80">
@@ -432,7 +432,7 @@ import { Monitor, Cpu, Document, Loading, CircleCheck, Odometer, TrendCharts, Da
 import type { APIResponse, SystemInfo, SystemMetrics, CaddyMetrics, Rule, RuleMetrics, HostMetrics, MetricsOverview } from '@/types'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { httpStatusColors } from '@/utils/chartTheme'
-import { buildRuleMetricsUnavailable } from '@/utils/dashboardMetrics'
+import { buildRuleMetricsUnavailable, ruleMetricCellTitle } from '@/utils/dashboardMetrics'
 
 
 const authStore = useAuthStore()

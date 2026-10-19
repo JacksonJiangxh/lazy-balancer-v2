@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/internal/services"
 )
 
 func clusterVersionMiddleware(database *sql.DB) gin.HandlerFunc {
@@ -19,6 +20,17 @@ func clusterVersionMiddleware(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 		if installErr != nil {
+			// 历史问题-13（历史）：登录/MFA 验证步的 fail-closed 仅主节点
+			// 语义——users 触发器 WHEN COALESCE(is_master,1)=1，从节点锁写入
+			// 本就不会 bump，fail-closed 在从端零保护收益、只截断登录可用性
+			// （与票据登录被排除出 fail-closed 面的口径一致）。角色读失败按
+			// 写闸同语义 fail-closed 落入 500（不猜测放行）。
+			if isLoginLockWritePath(c.Request.Method, c.FullPath()) {
+				if isMaster, err := services.RoleOf(c.Request.Context(), database); err == nil && !isMaster {
+					c.Next()
+					return
+				}
+			}
 			_ = c.Error(installErr)
 			c.AbortWithStatusJSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "集群版本触发器不可用"})
 			return
@@ -244,6 +256,13 @@ func installClusterVersionTriggers(database *sql.DB) error {
 	return nil
 }
 
+// isLoginLockWritePath 判定密码登录/MFA 验证步——失败置锁 login_locked_until、
+// 成功清零解锁，均写 users 同步列（SC-4 锁传播）。isSynchronizedWrite 的分类
+// 与触发器降级态的角色分流（clusterVersionMiddleware）共用本清单，单源防漂移。
+func isLoginLockWritePath(method, path string) bool {
+	return method == http.MethodPost && (path == "/api/v1/auth/login" || path == "/api/v1/auth/mfa/verify")
+}
+
 func isSynchronizedWrite(method, path string) bool {
 	// 历史问题:auth/setup(初始化管理员)与 OIDC 回调(JIT 开户)写 users 表,
 	// 但回调是 GET 形态——精确匹配置于方法门之外,触发器不可用时同样
@@ -259,9 +278,12 @@ func isSynchronizedWrite(method, path string) bool {
 	// mfa.go 验证步同计一个账户级计数）、成功清零解锁。触发器不可用时若放行，
 	// 降级态真实置锁不 bump cluster_version，主节点锁状态无法随快照传播到
 	// 从节点（与 SC-4 语义冲突）——与 setup/OIDC 开户同口径 fail-closed。
+	// 历史问题-13（历史）：该 fail-closed 仅主节点语义——触发器降级态下
+	// 从节点由 clusterVersionMiddleware 经 RoleOf 分流放行（users 触发器
+	// WHEN is_master=1，从端锁写入本就不 bump，拦截只损登录可用性）。
 	// 票据登录（ticket-login）不写 users 同步列，不在此列（保全从节点登录
 	// 可用性）。
-	if method == http.MethodPost && (path == "/api/v1/auth/login" || path == "/api/v1/auth/mfa/verify") {
+	if isLoginLockWritePath(method, path) {
 		return true
 	}
 	if method != http.MethodPost && method != http.MethodPut && method != http.MethodPatch && method != http.MethodDelete {

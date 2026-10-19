@@ -251,7 +251,12 @@ func (s *ClusterService) Nodes(ctx context.Context, now time.Time) ([]models.Clu
 	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(cluster_version,0), COALESCE(sync_interval,60) FROM global_config WHERE id=1").Scan(&currentVersion, &syncInterval); err != nil {
 		return nil, fmt.Errorf("读取集群版本: %w", err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),is_approved,COALESCE(reported_version,0),COALESCE(health_json,''),last_seen,created_at FROM nodes ORDER BY id`)
+	var masterSiteLat, masterSiteLon float64
+	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(server_map_lat,0), COALESCE(server_map_lon,0) FROM global_config WHERE id=1").Scan(&masterSiteLat, &masterSiteLon); err != nil {
+		return nil, fmt.Errorf("读取主节点默认站点坐标: %w", err)
+	}
+	masterSiteConfigured := masterSiteLat != 0 || masterSiteLon != 0
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),is_approved,COALESCE(reported_version,0),COALESCE(health_json,''),last_seen,created_at,COALESCE(server_map_lat,0),COALESCE(server_map_lon,0) FROM nodes ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("读取节点列表: %w", err)
 	}
@@ -261,10 +266,15 @@ func (s *ClusterService) Nodes(ctx context.Context, now time.Time) ([]models.Clu
 		var node models.ClusterNodeView
 		var lastSeen, createdAt sql.NullTime
 		var healthJSON string
-		if err := rows.Scan(&node.ID, &node.Name, &node.IPAddress, &node.Port, &node.Protocol, &node.AccessURL, &node.IsApproved, &node.ReportedVersion, &healthJSON, &lastSeen, &createdAt); err != nil {
+		if err := rows.Scan(&node.ID, &node.Name, &node.IPAddress, &node.Port, &node.Protocol, &node.AccessURL, &node.IsApproved, &node.ReportedVersion, &healthJSON, &lastSeen, &createdAt, &node.ServerMapLat, &node.ServerMapLon); err != nil {
 			return nil, fmt.Errorf("扫描节点列表: %w", err)
 		}
 		node.CurrentVersion = currentVersion
+		if node.ServerMapLat == 0 && node.ServerMapLon == 0 && masterSiteConfigured {
+			node.ServerMapLat = masterSiteLat
+			node.ServerMapLon = masterSiteLon
+			node.SiteInherited = true
+		}
 		node.Status = ComputeNodeStatus(node.IsApproved, lastSeen.Time, syncInterval, now)
 		// 单节点 health_json 损坏只降级该节点（Health=nil），不拖垮整个节点列表
 		health, decodeErr := DecodeClusterHealth(healthJSON)
@@ -392,6 +402,19 @@ func (s *ClusterService) clearAllSectionReports() {
 	s.sectionMu.Lock()
 	defer s.sectionMu.Unlock()
 	clear(s.sectionReports)
+}
+
+// ClearNodeSectionReports（A86 历史问题/D-2，历史修复主审授权扩展）：
+// 拓扑整体恢复（备份导入）删除节点时，按库遍历登记的全部 ClusterService
+// 实例清除该节点的分区上报缓存（与 clusterServicesFor 同模式——缓存是实例
+// 本地状态，需逐实例清理）。仅用于「节点已被删除」的清理；仍存在的节点
+// 不得调用（其上报记录保持有效，D-2 裁定）。缓存本为内存态：进程重启或
+// 节点下次上报（≤60s）可自愈，本函数消除的是「备份行复用已删节点 id 时
+// 旧上报错挂到新节点」的窗口。
+func ClearNodeSectionReports(database *sql.DB, nodeID int) {
+	for _, service := range clusterServicesFor(database) {
+		service.clearSectionReport(nodeID)
+	}
 }
 
 func (s *ClusterService) ReportNode(ctx context.Context, nodeID int, report models.ClusterReport, now time.Time) error {

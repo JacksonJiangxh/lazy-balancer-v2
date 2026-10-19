@@ -404,7 +404,9 @@ func initMetricsSchema(db *sql.DB) error {
 	}
 	// transaction_id 的幂等唯一部分索引（WHERE != ''）让重复事务写入被
 	// OR IGNORE 静默去重，同时保留历史遗留空 transaction_id 行不受唯一约束影响。
-	// 存量重复行与 OIDC 唯一索引同口径：WARN + 跳过，不得让历史脏数据阻断启动。
+	// 存量重复行：启动期去重（保留每事务最早行）后照常建索引（Audit86 历史问题，
+	// 台账裁定：去重后再建索引，不靠跳过——跳过会让 offset 重建/轮转补采把
+	// 重复事件重新入库并重复喂 autoban/rollup）。
 	if err := ensureSecurityEventsTransactionIndex(db); err != nil {
 		return err
 	}
@@ -415,8 +417,11 @@ func initMetricsSchema(db *sql.DB) error {
 }
 
 // ensureSecurityEventsTransactionIndex 在建立唯一部分索引前检查存量重复事务。
-// 重复行不自动删除（保留事件历史）；告警并跳过本轮索引创建，人工清理后的
-// 下次启动会自动补建。空串与 NULL 不属于索引约束域。
+// Audit86 历史问题：发现重复时不再 WARN+跳过（跳过期间 INSERT OR IGNORE 失去
+// 唯一约束兜底，offset 重建/轮转补采会把重复事件重新入库并重复喂
+// autoban/rollup）——改为启动期一次性去重：每个非空 transaction_id 保留
+// 最早行（MIN(id)，即首次摄取的事件），删除其余重复行后照常建索引，摄取
+// 幂等链自启动起恒成立。空串与 NULL 不属于索引约束域，不受影响。
 func ensureSecurityEventsTransactionIndex(db *sql.DB) error {
 	rows, err := db.Query(`SELECT transaction_id, COUNT(*) FROM security_events
 		WHERE transaction_id != '' GROUP BY transaction_id HAVING COUNT(*)>1`)
@@ -441,8 +446,16 @@ func ensureSecurityEventsTransactionIndex(db *sql.DB) error {
 		return fmt.Errorf("failed to close duplicate security_events transaction ID rows: %w", err)
 	}
 	if len(duplicates) > 0 {
-		log.Printf("WARN: security_events 表存在重复 transaction_id（%s），跳过 idx_security_events_transaction 唯一索引创建——请人工清理重复行后重启", strings.Join(duplicates, ", "))
-		return nil
+		// 去重：保留每事务最早行（首次摄取），删除其余重复行。事件为追加型
+		// 历史，同 transaction_id 的重复行语义等价，保留最早行与「INSERT OR
+		// IGNORE 命中时保留既有行」的运行时口径一致。
+		result, err := db.Exec(`DELETE FROM security_events WHERE transaction_id != '' AND id NOT IN (
+			SELECT MIN(id) FROM security_events WHERE transaction_id != '' GROUP BY transaction_id)`)
+		if err != nil {
+			return fmt.Errorf("failed to deduplicate security_events transaction IDs: %w", err)
+		}
+		removed, _ := result.RowsAffected()
+		log.Printf("WARN: security_events 表存在重复 transaction_id（%s），已去重删除 %d 行（保留每事务最早行）并继续创建唯一索引", strings.Join(duplicates, ", "), removed)
 	}
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_security_events_transaction ON security_events(transaction_id) WHERE transaction_id != ''`); err != nil {
 		return fmt.Errorf("failed to create security_events transaction index: %w", err)

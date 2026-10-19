@@ -1199,9 +1199,20 @@ func (s *CertificateService) Stop() {
 // 折成 500 让规则保存看起来像内部错误。
 var ErrCertificateQueueInactive = errors.New("证书签发任务未运行")
 
+// ErrCertRuleStateConflict 标记 upsert 时规则当前态守卫拒绝：规则已删除、
+// 被禁用、非 ACME 或域名已变更（A86 历史问题，历史问题-01）。属并发冲突语义——
+// 调用方必须如实呈现（handler 409），不得伪装成 changed=false 的「状态不
+// 支持重排」或折成 500 内部错误。
+var ErrCertRuleStateConflict = errors.New("规则状态已变更或不再支持 ACME 签发")
+
 // upsertQueuedCertJob 持久化「排队签发」任务行（原 EnqueueIfActive transition
-// 闭包单源）。返回任务 id 与是否发生状态迁移；disabled 行仅在规则仍启用
-// ACME 且规范化域名匹配时复活。
+// 闭包单源）。返回任务 id 与是否发生状态迁移。
+//
+// A86 历史问题（历史问题-01）规则当前态守卫：INSERT 与冲突 UPDATE 都要求 lb_rules
+// 当前行仍是「启用 ACME 且规范化域名匹配」（对照 Retry 路径
+// handlers/certjobs.go 的 EXISTS 同口径）——手工签发读规则与 upsert 之间的
+// 改域迁移/删除曾可对旧域发起 CA 签发或留下孤儿任务行。手工签发入口持
+// caddyOpMu 时本守卫不可达，是其余无锁调用方（补建/恢复）与纵深防御的落库闸。
 func upsertQueuedCertJob(ruleID string, list []string, caProviderID int) (int, bool, error) {
 	joined := strings.Join(list, ",")
 	reversed := joined
@@ -1211,7 +1222,12 @@ func upsertQueuedCertJob(ruleID string, list []string, caProviderID int) (int, b
 	var id int
 	err := db.DB.QueryRow(`
 		INSERT INTO cert_jobs (rule_id, domain, status, message, ca_provider_id)
-		VALUES (?, ?, 'queued', '等待排队签发', ?)
+		SELECT ?, ?, 'queued', '等待排队签发', ?
+		WHERE EXISTS (
+			SELECT 1 FROM lb_rules r
+			WHERE r.caddy_id=? AND r.enabled=1 AND r.enable_tls=1
+			  AND r.tls_source='acme_dns' AND lower(replace(r.domain,' ','')) IN (?,?)
+		)
 		ON CONFLICT(rule_id, domain) DO UPDATE SET
 			status = 'queued',
 			message = '重新排队签发',
@@ -1220,15 +1236,30 @@ func upsertQueuedCertJob(ruleID string, list []string, caProviderID int) (int, b
 			last_error_code = NULL,
 			ca_provider_id = excluded.ca_provider_id,
 			updated_at = datetime('now')
-		WHERE cert_jobs.status IN ('waiting_ca','issued','failed','downloaded')
-		   OR (cert_jobs.status='disabled' AND EXISTS (
+		WHERE cert_jobs.status IN ('waiting_ca','issued','failed','downloaded','disabled')
+		  AND EXISTS (
 			SELECT 1 FROM lb_rules r
 			WHERE r.caddy_id=cert_jobs.rule_id AND r.enabled=1 AND r.enable_tls=1
 			  AND r.tls_source='acme_dns' AND lower(replace(r.domain,' ','')) IN (?,?)
-		   ))
+		  )
 		RETURNING id
-	`, ruleID, joined, caProviderID, joined, reversed).Scan(&id)
+	`, ruleID, joined, caProviderID, ruleID, joined, reversed, joined, reversed).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
+		// RETURNING 空有两种成因：①规则当前态守卫拒绝（并发冲突语义，行可
+		// 能根本不存在）；②既有行状态不可重排（原语义，changed=false 让上游
+		// 归因在途/冷却/屏障）。复核守卫区分两者——①必须上抛
+		// ErrCertRuleStateConflict，不得按②吞掉让 handler 报「状态不支持」。
+		var ruleOK bool
+		if gerr := db.DB.QueryRow(`SELECT EXISTS(
+			SELECT 1 FROM lb_rules
+			WHERE caddy_id=? AND enabled=1 AND enable_tls=1 AND tls_source='acme_dns'
+			  AND lower(replace(domain,' ','')) IN (?,?)
+		)`, ruleID, joined, reversed).Scan(&ruleOK); gerr != nil {
+			return 0, false, gerr
+		}
+		if !ruleOK {
+			return 0, false, ErrCertRuleStateConflict
+		}
 		if err := db.DB.QueryRow("SELECT id FROM cert_jobs WHERE rule_id=? AND domain=?", ruleID, joined).Scan(&id); err != nil {
 			return 0, false, err
 		}
@@ -1435,10 +1466,29 @@ func (s *CertificateService) renewExpiringCertificates() {
 	// CheckExpiration locks s.mu internally; the loop below only touches the
 	// DB and the queue, so holding s.mu here would deadlock the renewal.
 	maxAttempts := GetCertRenewalAttempts()
-	jobs := s.CheckExpiration()
-	jobs = append(jobs, s.checkFailedFirstIssuance(maxAttempts)...)
+	jobs, skippedExpiring, scanErr := s.CheckExpiration()
+	firstIssuance, skippedFirstIssuance, firstErr := s.checkFailedFirstIssuance(maxAttempts)
+	if scanErr != nil || firstErr != nil {
+		// A86 历史问题（历史问题-02）fail-visible：候选查询/遍历失败时结果集不可信，
+		// 摘要行必须如实报「扫描失败」并终止本轮（错误细节已入应用日志），
+		// 下一周期重试——此前吞成「无临期证书」会让任务监控呈现假健康。
+		detail := scanErr
+		if detail == nil {
+			detail = firstErr
+		} else if firstErr != nil {
+			detail = errors.Join(scanErr, firstErr)
+		}
+		TaskLogf("cert-renewal-scan", "scan", "扫描失败：续期候选查询/遍历出错（%v），本轮未执行续期，下一周期重试", detail)
+		return
+	}
+	jobs = append(jobs, firstIssuance...)
+	scanSkipped := skippedExpiring + skippedFirstIssuance
+	skippedNote := ""
+	if scanSkipped > 0 {
+		skippedNote = fmt.Sprintf("（另 %d 行扫描失败已跳过）", scanSkipped)
+	}
 	if len(jobs) == 0 {
-		TaskLogf("cert-renewal-scan", "scan", "扫描完成：无临期证书、无待重试签发任务")
+		TaskLogf("cert-renewal-scan", "scan", "扫描完成：无临期证书、无待重试签发任务%s", skippedNote)
 		return
 	}
 	domains := make([]string, 0, len(jobs))
@@ -1453,9 +1503,9 @@ func (s *CertificateService) renewExpiringCertificates() {
 	// 自动重试不可达），摘要须分档标注——否则「待重试」口径失真。全部未达
 	// 上限时保持原文案（不追加空括注）。
 	if capped > 0 {
-		TaskLogf("cert-renewal-scan", "scan", "检测到 %d 个临期/待重试证书任务（其中 %d 个已达重试上限，仅手动重签可达）：%s", len(jobs), capped, strings.Join(domains, "、"))
+		TaskLogf("cert-renewal-scan", "scan", "检测到 %d 个临期/待重试证书任务（其中 %d 个已达重试上限，仅手动重签可达）：%s%s", len(jobs), capped, strings.Join(domains, "、"), skippedNote)
 	} else {
-		TaskLogf("cert-renewal-scan", "scan", "检测到 %d 个临期/待重试证书任务：%s", len(jobs), strings.Join(domains, "、"))
+		TaskLogf("cert-renewal-scan", "scan", "检测到 %d 个临期/待重试证书任务：%s%s", len(jobs), strings.Join(domains, "、"), skippedNote)
 	}
 
 	for _, j := range jobs {
@@ -1612,8 +1662,11 @@ func (s *CertificateService) checkManualCertExpiration() {
 // 域名不一致跳过该行）+ 已有证书判读（选中证书域名匹配且有效期晚于续期窗口则
 // 跳过）+ 行收集。warnPrefix 仅区分 Scan 失败告警的来源扫描（CERT-L2 历史
 // 「不静默」口径，同 checkManualCertExpiration）。
-func scanRenewalCandidates(rows *sql.Rows, days int, warnPrefix string) []models.CertJob {
-	var jobs []models.CertJob
+//
+// A86 历史问题（历史问题-02）fail-visible：逐行 Scan 失败计数返回（scanSkipped），
+// 迭代级 rows.Err() 显式上抛——此前两者都只进应用日志甚至完全静默，巡检
+// 摘要把失败轮伪装成「无候选」。
+func scanRenewalCandidates(rows *sql.Rows, days int, warnPrefix string) (jobs []models.CertJob, scanSkipped int, err error) {
 	now := time.Now()
 	selectedByRule := make(map[string]CertificateSelection)
 	selectionLoaded := make(map[string]bool)
@@ -1623,6 +1676,7 @@ func scanRenewalCandidates(rows *sql.Rows, days int, warnPrefix string) []models
 		if err := rows.Scan(
 			&j.ID, &j.RuleID, &j.Domain, &j.Status, &j.ExpiresAt, &j.CAProviderID, &j.RenewalAttempts, &j.CAAvailableAfter, &j.LastErrorCode, &ruleDomain,
 		); err != nil {
+			scanSkipped++
 			Logf("warn", "%s: scan failed, skipping row: %v", warnPrefix, err)
 			continue
 		}
@@ -1652,10 +1706,15 @@ func scanRenewalCandidates(rows *sql.Rows, days int, warnPrefix string) []models
 		}
 		jobs = append(jobs, j)
 	}
-	return jobs
+	// A86 历史问题：迭代级错误（连接中断/结果集截断）此前被完全吞掉——显式
+	// 上抛让巡检按「扫描失败」终止本轮而非按截断结果集续期。
+	if err := rows.Err(); err != nil {
+		return jobs, scanSkipped, fmt.Errorf("%s: iterate rows: %w", warnPrefix, err)
+	}
+	return jobs, scanSkipped, nil
 }
 
-func (s *CertificateService) CheckExpiration() []models.CertJob {
+func (s *CertificateService) CheckExpiration() ([]models.CertJob, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1680,8 +1739,10 @@ func (s *CertificateService) CheckExpiration() []models.CertJob {
 		ORDER BY j.expires_at ASC
 	`, days)
 	if err != nil {
+		// A86 历史问题：查询失败显式上抛（此前 return nil 被巡检当成「无候选」
+		// 并写假成功摘要）。
 		Logf("error", "Failed to query expiring certificates: %v", err)
-		return nil
+		return nil, 0, fmt.Errorf("query expiring certificates: %w", err)
 	}
 	defer rows.Close()
 
@@ -1693,7 +1754,8 @@ const firstIssuanceRetryCooldownMinutes = 30
 // checkFailedFirstIssuance 返回首次签发失败（expires_at IS NULL，从未签发成功）、
 // 已过冷却期且未达最大重试次数的证书任务，供续期巡检自动重试。规则筛选与
 // 已有证书判读逻辑与 CheckExpiration 保持一致。
-func (s *CertificateService) checkFailedFirstIssuance(maxAttempts int) []models.CertJob {
+// A86 历史问题：查询/遍历失败显式上抛（同 CheckExpiration），不得吞成「无候选」。
+func (s *CertificateService) checkFailedFirstIssuance(maxAttempts int) ([]models.CertJob, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1713,7 +1775,7 @@ func (s *CertificateService) checkFailedFirstIssuance(maxAttempts int) []models.
 	`, maxAttempts, firstIssuanceRetryCooldownMinutes)
 	if err != nil {
 		Logf("error", "Failed to query failed first-issuance certificates: %v", err)
-		return nil
+		return nil, 0, fmt.Errorf("query failed first-issuance certificates: %w", err)
 	}
 	defer rows.Close()
 

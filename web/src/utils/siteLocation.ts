@@ -69,3 +69,39 @@ export function nearestSiteLocation(lat: number, lon: number): string {
   }
   return best
 }
+
+export interface NodeSiteFormValue {
+  siteLocationKey: string
+  lat: number
+  lon: number
+}
+
+/**
+ * A86 历史问题：节点站点弹框的表单初值单源。site_inherited 节点的
+ * server_map_lat/lon 是服务端替换后的主节点坐标副本，必须还原为
+ * 0,0 + 空选择（继承语义），不得把继承值预填为可保存值——否则
+ * 「打开即保存」会把继承静默固化为显式坐标，此后主节点坐标变更不再传播。
+ */
+export function initialNodeSiteForm(node: {
+  readonly server_map_lat?: number
+  readonly server_map_lon?: number
+  readonly site_inherited?: boolean
+}): NodeSiteFormValue {
+  if (node.site_inherited) {
+    return { siteLocationKey: '', lat: 0, lon: 0 }
+  }
+  const lat = node.server_map_lat ?? 0
+  const lon = node.server_map_lon ?? 0
+  return { siteLocationKey: nearestSiteLocation(lat, lon), lat, lon }
+}
+
+/**
+ * A86 历史问题：表单坐标相对打开时初值是否有变化。无变化保存=no-op——
+ * 弹框直接关闭，不发 PUT、不触发集群版本 bump 与全集群同步。
+ */
+export function nodeSiteCoordsChanged(
+  initial: { readonly lat: number; readonly lon: number },
+  form: { readonly lat: number; readonly lon: number },
+): boolean {
+  return initial.lat !== form.lat || initial.lon !== form.lon
+}

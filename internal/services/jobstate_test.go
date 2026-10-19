@@ -238,7 +238,10 @@ func TestCertJobStatusWrites_useApprovedEntryPoints(t *testing.T) {
 		"services/certificates.go":  {"restoreCertJobsForRule": true, "CreateOrRequeueCertJobWithChange": true, "upsertQueuedCertJob": true},
 		"services/cluster_apply.go": {"replaceSnapshotTx": true},
 		"handlers/certjobs.go":      {"RetryCertJob": true, "retryCertJobByID": true, "DeleteCertJob": true},
-		"handlers/rules.go":         {"UpdateRule": true, "EnableRule": true, "DisableRule": true, "retireCertJobsForDomain": true},
+		// A86 历史问题：UpdateRule/DisableRule 的禁用暂停谓词收敛为
+		// disableCertJobsForRuleTx 单源；DisableRule 不再直接持字面量（白名单
+		// 移除保持守卫收紧），UpdateRule 保留（域名迁移/恢复两处自有写点）。
+		"handlers/rules.go": {"UpdateRule": true, "EnableRule": true, "disableCertJobsForRuleTx": true, "retireCertJobsForDomain": true},
 	}
 	var violations []string
 

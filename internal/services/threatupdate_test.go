@@ -513,9 +513,10 @@ func TestThreatDueSources_emptyListIsDue(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("203.0.113.1/32\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	// 历史问题：fast 同样必须在场，否则仍视为未装载。
-	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist.fast"), []byte("LBF1"), 0644); err != nil {
-		t.Fatal(err)
+	// 历史问题：fast 同样必须在场，否则仍视为未装载。A86 历史问题：判据含可读性
+	// 校验——夹具用真实编译产物（伪「LBF1」头在可读性口径下即损坏文件）。
+	if err := CompileFromIplistFile(filepath.Join(wafDir, "threat-ustc.iplist")); err != nil {
+		t.Fatalf("编译 .fast 夹具: %v", err)
 	}
 	due, err = threatDueSources("auto")
 	if err != nil {

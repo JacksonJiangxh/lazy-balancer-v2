@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"strings"
 	"time"
 
 	"lazy-balancer-v2/geoipnames"
@@ -26,13 +25,19 @@ import (
 // 当前无运行态字段，单例仅统一生命周期与调用契约）。
 type CrawlerUpdateManager struct{}
 
-// validateCrawlerEntriesSanity 非结构化源（html/plain）的合理性门（历史问题-02）：
-// 解析结果至少一条须落在该引擎声明的官方段（geoipnames 单一事实源）内，
-// 否则视为错误页/版本串污染，保留上次快照。JSON 源已由结构化字段校验承担。
-func validateCrawlerEntriesSanity(engineID, format string, entries []string) ([]string, error) {
-	if strings.EqualFold(strings.TrimSpace(format), "json") {
-		return entries, nil
-	}
+// validateCrawlerEntriesSanity 爬虫名单合理性门（历史问题-02 + A86 历史问题 收紧）。
+// 引擎声明了官方段（geoipnames 单一事实源）时，一切格式（含 JSON——结构化
+// 字段白名单由 parseCrawlerCIDRsForFormat 承担，本门承担段集一致性）：
+//  1. 子集门：每条解析结果必须 ⊆ 某官方段（off.Bits()<=prefix.Bits() 且
+//     包含首地址）——A86 历史问题 前为「交集」判定，0.0.0.0/0、10.0.0.0/8 等
+//     覆盖官方段的超网会被放行，写入即对启用爬虫豁免的策略整体 fail-open；
+//  2. 覆盖门：每个官方段至少被一条保留条目命中——截断页/仅一条官方段内 IP
+//     的错误页不得整体替换豁免名单（与 crawler_seed_parity_test.go 的
+//     「⊆ + 覆盖」双条件同口径）。
+//
+// 引擎未声明官方段时无可对照口径，原样放行（收缩门 crawlerSnapshotShrinkGuard
+// 仍兜底条数塌缩）。
+func validateCrawlerEntriesSanity(engineID string, entries []string) ([]string, error) {
 	if len(entries) == 0 {
 		return nil, errors.New("解析无产出（疑似错误页/限流页），保留上次快照")
 	}
@@ -49,16 +54,19 @@ func validateCrawlerEntriesSanity(engineID, format string, entries []string) ([]
 	if len(official) == 0 {
 		return entries, nil
 	}
-	// 与官方段有交集的条目才保留；页面里的示例/无关 IP 不得整体写入豁免名单。
+	// 子集门：只保留落在某官方段内的条目；页面里的示例/无关 IP 与覆盖官方段
+	// 的超网都不得进入豁免名单。
 	filtered := make([]string, 0, len(entries))
+	filteredPrefixes := make([]netip.Prefix, 0, len(entries))
 	for _, entry := range entries {
 		prefix, err := netip.ParsePrefix(entry)
 		if err != nil {
 			continue
 		}
 		for _, off := range official {
-			if off.Contains(prefix.Addr()) || prefix.Contains(off.Addr()) {
+			if off.Bits() <= prefix.Bits() && off.Contains(prefix.Addr()) {
 				filtered = append(filtered, entry)
+				filteredPrefixes = append(filteredPrefixes, prefix)
 				break
 			}
 		}
@@ -66,7 +74,42 @@ func validateCrawlerEntriesSanity(engineID, format string, entries []string) ([]
 	if len(filtered) == 0 {
 		return nil, fmt.Errorf("解析结果（%d 条）未落在 %s 声明的官方 IP 段内（疑似错误页/版本串污染），保留上次快照", len(entries), engineID)
 	}
+	// 覆盖门：每个官方段至少一条 ⊆ 条目，缺一即视为截断/部分名单。
+	for _, off := range official {
+		covered := false
+		for _, prefix := range filteredPrefixes {
+			if off.Bits() <= prefix.Bits() && off.Contains(prefix.Addr()) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return nil, fmt.Errorf("解析结果（%d 条）未覆盖 %s 官方段 %s（疑似截断页/部分名单），保留上次快照", len(filtered), engineID, off)
+		}
+	}
 	return filtered, nil
+}
+
+// crawlerSnapshotShrinkGuard 条数收缩门（A86 历史问题）：新名单条数较当前快照
+// 收缩超过一半时拒绝写入、保留上次快照——子集/覆盖门之外的兜底（引擎未
+// 声明官方段时它是唯一闸门）。基线=DB 名单行当前条数，无行回退内置首版
+// （首轮更新也受门），两者皆无则放行（无可对照口径）。基线读取失败按
+// 失败处理（保留上次快照，方向安全）。
+func crawlerSnapshotShrinkGuard(engineID string, newCount int) error {
+	baseline := len(crawlerBuiltinSnapshot[engineID])
+	if db.DB != nil {
+		all, err := loadCrawlerIPListsFromDB()
+		if err != nil {
+			return fmt.Errorf("读取爬虫名单基线失败: %w", err)
+		}
+		if current, ok := all[engineID]; ok {
+			baseline = len(current)
+		}
+	}
+	if baseline >= 2 && newCount*2 < baseline {
+		return fmt.Errorf("解析条数 %d 较当前快照 %d 收缩超过一半（疑似错误页/劫持），保留上次快照", newCount, baseline)
+	}
+	return nil
 }
 
 // crawlerEngineDeclaredRanges 返回引擎声明的官方 IP 段（geoipnames 单一源）。
@@ -188,10 +231,14 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		// 保留上次快照；词法边界已排除版本号/日期等 IP 同形 token）。
 		entries, perr := parseCrawlerCIDRsForFormat(body, src.Format)
 		if perr == nil {
-			// 历史问题-02（历史）：非结构化源（html/plain）增加合理性门——
-			// 错误页/限流页只要含四段数字就可能覆盖豁免名单；解析结果至少一条
-			// 必须落在该引擎声明的官方段内，否则保留上次快照。
-			entries, perr = validateCrawlerEntriesSanity(src.Name, src.Format, entries)
+			// 历史问题-02（历史）+ A86 历史问题（历史收紧）：合理性门——
+			// 子集（每条 ⊆ 官方段，取代旧交集判定）+ 覆盖（官方段全覆盖），
+			// 一切格式同口径；错误页/超网/截断名单保留上次快照。
+			entries, perr = validateCrawlerEntriesSanity(src.Name, entries)
+		}
+		if perr == nil {
+			// A86 历史问题：条数收缩门——较当前快照（DB/内置首版）收缩过半拒绝写入。
+			perr = crawlerSnapshotShrinkGuard(src.Name, len(entries))
 		}
 		if perr != nil {
 			if firstErr == nil {

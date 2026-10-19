@@ -139,8 +139,12 @@ func (m *CRSUpdateManager) cleanupLegacyCRSTransient() {
 }
 
 func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string) error {
-	// 每次运行重置：restoreBackup 仅消费本运行创建的 overrides 备份（历史问题 1.1）。
+	// 每次运行重置：restoreBackup 仅消费本运行创建的备份（历史问题 1.1 + A86 历史问题
+	// 收敛至全四件套：rules/setup/stock/overrides）。
 	m.overridesBakCreated = false
+	m.rulesBakCreated = false
+	m.setupBakCreated = false
+	m.stockBakCreated = false
 	m.setStage(CRSStatusDownloading, fmt.Sprintf("下载 %s", tag))
 	staging := crsTransientPath(m.crsDir, ".staging")
 	if err := os.RemoveAll(staging); err != nil {
@@ -198,6 +202,8 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 		if err := copyDirTransactional(rulesPath, rulesBak); err != nil {
 			return fmt.Errorf("备份现有 rules: %w", err)
 		}
+		// 本运行已创建 rules.bak：restoreBackup 自此可消费（A86 历史问题）。
+		m.rulesBakCreated = true
 	}
 	setupPath := filepath.Join(m.crsDir, "crs-setup.conf")
 	setupBak := crsTransientPath(m.crsDir, "crs-setup.conf.bak")
@@ -206,6 +212,7 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 			m.restoreBackup()
 			return fmt.Errorf("备份 crs-setup.conf: %w", err)
 		}
+		m.setupBakCreated = true // 本运行已创建（A86 历史问题）
 	}
 	// stock 基线同点备份（历史问题）：回滚只恢复 rules/setup/overrides 会让
 	// stock 基线停留在新版本，下次迁移的 diff 基线错位——两版之间上游改动过
@@ -217,6 +224,7 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 			m.restoreBackup()
 			return fmt.Errorf("备份 crs-setup.stock.conf: %w", err)
 		}
+		m.stockBakCreated = true // 本运行已创建（A86 历史问题）
 	}
 
 	// Migrate user customizations out of the live setup before the new stock
@@ -278,6 +286,21 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 		return err
 	}
 
+	// A86 历史问题（历史）：交换段已把 DB 版本行与 live VERSION 落为新
+	// tag——此后观察到取消必须走 rollbackAfterReloadFailure 同代回滚（树+标记+
+	// 版本行，同一 wafFileMu 临界区），不得交由 run() 的 cancel(..., true) 只
+	// 还原文件树：任何「树回滚而版本行/标记不回滚」的组合都会留下
+	// 「旧树+新版本号」，被下轮 tag==current「已是最新」短路永久固化
+	//（ReconcileCRSState 因 liveV==dbV 也不修复）。
+	// demote 在途中止（已非主节点）保持 F-历史问题-01 语义：从节点不回滚——
+	// 树/行/标记同为新 tag 是一致态，交集群同步收敛。
+	if cerr := parent.Err(); cerr != nil {
+		if updateRunStillMaster() {
+			m.rollbackAfterReloadFailure(prevTag)
+		}
+		return cerr
+	}
+
 	// Reload BEFORE deleting backups: if reload fails, restoreBackup can still roll back.
 	// 审计 历史问题：版本行必须先于 reloader 更新（已随上方交换段落库）——
 	// crsPoolFingerprint 以版本行为池键输入，先重载则指纹仍为旧值、coraza 池
@@ -300,6 +323,16 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 		}
 	}
 
+	// A86 历史问题：取消发生在重载期间（reloader 无 ctx 入参，只能在其返回后
+	// 观察）——与重载失败同编舞同代回滚。必须在下方备份清理之前：清理后
+	// rollback 无本运行基线可还原。demote 中止同上门径（从节点不回滚）。
+	if cerr := parent.Err(); cerr != nil {
+		if updateRunStillMaster() {
+			m.rollbackAfterReloadFailure(prevTag)
+		}
+		return cerr
+	}
+
 	os.RemoveAll(rulesBak)
 	// 历史问题 B-#4：rules.old 只可能来自上一次失败更新的崩溃窗口（restoreRulesBackup
 	// 内 moveTree 序列中断），成功路径顺带清理——否则它只能等下一次失败的更新
@@ -309,7 +342,7 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 	os.Remove(setupBak)
 	// 崩溃窗口说明：stock 写入（上方）与本清理之间的进程崩溃会残留陈旧
 	// stock.bak；它与 setup.bak 语义一致——下次运行在备份点用新拷贝覆盖，
-	// 只可能在「备份点之前失败」的极端路径被 restoreBackup 消费（历史问题）。
+	// 且 A86 历史问题 起非本运行创建的 .bak 一律不被 restoreBackup 消费（标记守卫）。
 	os.Remove(stockBak)
 	os.Remove(crsTransientPath(m.crsDir, "zz-user-overrides.conf.bak"))
 	// 标记磁盘实际版本 + 持久化到数据卷快照：未挂载 /app/waf 的部署在容器
@@ -487,18 +520,26 @@ func (m *CRSUpdateManager) restoreBackup() {
 func (m *CRSUpdateManager) restoreBackupInLock() {
 	rulesPath := filepath.Join(m.crsDir, "rules")
 	rulesBak := crsTransientPath(m.crsDir, "rules.bak")
-	if _, err := os.Stat(rulesBak); err == nil {
-		restoreRulesBackup(rulesPath, rulesBak)
+	// A86 历史问题：只消费本运行创建的 rules.bak——跨运行崩溃残留的陈旧备份不得
+	// 在本运行早期失败（尚未到备份点）时被还原进 live（崩溃现场保全素材，
+	// 且可能把 live 树回滚到与 DB 版本行跨代分叉的状态）。
+	if m.rulesBakCreated {
+		if _, err := os.Stat(rulesBak); err == nil {
+			restoreRulesBackup(rulesPath, rulesBak)
+		}
 	}
 	setupPath := filepath.Join(m.crsDir, "crs-setup.conf")
 	setupBak := crsTransientPath(m.crsDir, "crs-setup.conf.bak")
 	// CRS25-4(历史):setup.bak 缺失不得早退——stock.bak/overrides.bak
 	// 的还原独立于 setup,缺失只跳过本段(此前 return 跳过了后续全部还原)。
-	if _, err := os.Stat(setupBak); err == nil {
-		if err := copyFile(setupBak, setupPath); err != nil {
-			Logf("error", "crs update: failed to restore crs-setup.conf backup: %v", err)
-		} else {
-			os.Remove(setupBak)
+	// A86 历史问题：同上——只消费本运行创建的 setup.bak。
+	if m.setupBakCreated {
+		if _, err := os.Stat(setupBak); err == nil {
+			if err := copyFile(setupBak, setupPath); err != nil {
+				Logf("error", "crs update: failed to restore crs-setup.conf backup: %v", err)
+			} else {
+				os.Remove(setupBak)
+			}
 		}
 	}
 	stockPath := filepath.Join(m.crsDir, "crs-setup.stock.conf")
@@ -506,11 +547,14 @@ func (m *CRSUpdateManager) restoreBackupInLock() {
 	// 历史问题-1(历史,CRS25-4 残留):stock 段失败不得 return——
 	// overrides 还原独立于 stock,失败只记日志继续(否则旧 setup+新 overrides
 	// 双重应用,restore 后 reload 再失败)。
-	if _, err := os.Stat(stockBak); err == nil {
-		if err := copyFile(stockBak, stockPath); err != nil {
-			Logf("error", "crs update: failed to restore crs-setup.stock.conf backup: %v", err)
-		} else {
-			os.Remove(stockBak)
+	// A86 历史问题：同上——只消费本运行创建的 stock.bak。
+	if m.stockBakCreated {
+		if _, err := os.Stat(stockBak); err == nil {
+			if err := copyFile(stockBak, stockPath); err != nil {
+				Logf("error", "crs update: failed to restore crs-setup.stock.conf backup: %v", err)
+			} else {
+				os.Remove(stockBak)
+			}
 		}
 	}
 	overridesPath := filepath.Join(m.crsDir, "zz-user-overrides.conf")

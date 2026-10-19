@@ -45,8 +45,7 @@ func (h *Handlers) GenerateClusterRegisterToken(c *gin.Context) {
 	token, expiresAt, err := h.clusterService.GenerateRegisterToken(c.Request.Context(), int(contextUserID(c)), time.Now())
 	if err != nil {
 		if errors.Is(err, services.ErrNotMasterNode) {
-			c.Header("X-LB-Error-Code", masterRequiredErrorCode)
-			clusterError(c, http.StatusForbidden, err.Error(), err)
+			clusterMasterForbidden(c, err)
 			return
 		}
 		clusterError(c, http.StatusInternalServerError, "生成注册令牌失败", err)
@@ -57,6 +56,10 @@ func (h *Handlers) GenerateClusterRegisterToken(c *gin.Context) {
 }
 
 func (h *Handlers) RegisterClusterNode(c *gin.Context) {
+	// A86 历史问题：导入窗口 fast-fail（全量替换 nodes，窗口写入会被覆盖或阻塞）。
+	if rejectNodeWriteDuringImport(c) {
+		return
+	}
 	if !h.requireMaster(c) {
 		return
 	}
@@ -76,8 +79,8 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 		}
 		if errors.Is(err, services.ErrNotMasterNode) {
 			// 历史问题-历史问题：SQL 级角色条件命中 0 行（降级竞态）→ 403，与
-			// requireMaster 同文案，不折叠成 500。
-			clusterError(c, http.StatusForbidden, err.Error(), err)
+			// requireMaster 同文案同头形状，不折叠成 500。
+			clusterMasterForbidden(c, err)
 			return
 		}
 		if errors.Is(err, models.ErrInvalidClusterNodeName) {
@@ -126,8 +129,7 @@ func (h *Handlers) GetClusterRegistrationStatus(c *gin.Context) {
 	status, err := h.clusterService.RegistrationStatus(c.Request.Context(), id, c.GetString("registration_secret"), time.Now())
 	if err != nil {
 		if errors.Is(err, services.ErrNotMasterNode) {
-			c.Header("X-LB-Error-Code", masterRequiredErrorCode)
-			clusterError(c, http.StatusForbidden, err.Error(), err)
+			clusterMasterForbidden(c, err)
 			return
 		}
 		// 历史问题:仅凭证类哨兵 401——DB 故障误映射 401 会驱使从节点走
@@ -143,12 +145,15 @@ func (h *Handlers) GetClusterRegistrationStatus(c *gin.Context) {
 }
 
 func (h *Handlers) ConfirmClusterRegistration(c *gin.Context) {
+	if rejectNodeWriteDuringImport(c) {
+		return
+	}
 	if !h.requireMaster(c) {
 		return
 	}
 	if err := h.clusterService.ConfirmRegistration(c.Request.Context(), authenticatedClusterToken(c)); err != nil {
 		if errors.Is(err, services.ErrNotMasterNode) {
-			clusterError(c, http.StatusForbidden, err.Error(), err)
+			clusterMasterForbidden(c, err)
 			return
 		}
 		// 历史问题:同 RegistrationStatus 分判。
@@ -174,6 +179,55 @@ func (h *Handlers) DeleteClusterNode(c *gin.Context) {
 	h.clusterNodeAction(c, "删除", func(id int) error { return h.clusterService.DeleteNode(c.Request.Context(), id) })
 }
 
+func (h *Handlers) UpdateClusterNodeSiteCoordinates(c *gin.Context) {
+	if rejectNodeWriteDuringImport(c) {
+		return
+	}
+	if !h.requireMaster(c) {
+		return
+	}
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil || id <= 0 {
+		clusterError(c, http.StatusBadRequest, "节点编号无效", err)
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, registerRequestMaxBytes)
+	var req models.ClusterNodeSiteRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		clusterError(c, http.StatusBadRequest, "站点坐标格式错误", err)
+		return
+	}
+	if req.ServerMapLat == nil || req.ServerMapLon == nil {
+		clusterError(c, http.StatusBadRequest, "必须同时提交站点纬度和经度", nil)
+		return
+	}
+	if err := validateServerMapCoordinates(req.ServerMapLat, req.ServerMapLon); err != nil {
+		clusterError(c, http.StatusBadRequest, err.Error(), err)
+		return
+	}
+	if err := h.clusterService.UpdateNodeSiteCoordinates(c.Request.Context(), id, *req.ServerMapLat, *req.ServerMapLon); err != nil {
+		// A86 历史问题：服务层降级竞态 403 与 requireMaster 门同源带头。
+		if errors.Is(err, services.ErrNotMasterNode) {
+			clusterMasterForbidden(c, err)
+			return
+		}
+		status := http.StatusInternalServerError
+		if errors.Is(err, services.ErrNodeNotFound) {
+			status = http.StatusNotFound
+		}
+		clusterError(c, status, "更新节点站点坐标失败", err)
+		return
+	}
+	recordAudit(c, "更新", "集群节点", services.FormatAuditDetail(
+		fmt.Sprintf("节点 %d", id),
+		fmt.Sprintf("站点坐标：纬度 %.4f，经度 %.4f", *req.ServerMapLat, *req.ServerMapLon),
+		services.AuditResultPart("success")))
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "节点站点坐标已保存", Data: gin.H{
+		"server_map_lat": *req.ServerMapLat,
+		"server_map_lon": *req.ServerMapLon,
+	}})
+}
+
 func (h *Handlers) UpdateClusterNodeAccessURL(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
 	var req models.ClusterNodeAccessURLRequest
@@ -187,6 +241,10 @@ func (h *Handlers) UpdateClusterNodeAccessURL(c *gin.Context) {
 }
 
 func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation func(int) error) {
+	// A86 历史问题：审批/拒绝/删除共用的写端点收口——导入窗口 409 fast-fail。
+	if rejectNodeWriteDuringImport(c) {
+		return
+	}
 	if !h.requireMaster(c) {
 		return
 	}
@@ -196,10 +254,12 @@ func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation fu
 		return
 	}
 	if err := operation(id); err != nil {
-		status := http.StatusInternalServerError
+		// A86 历史问题：服务层降级竞态 403 与 requireMaster 门同源带头。
 		if errors.Is(err, services.ErrNotMasterNode) {
-			status = http.StatusForbidden
+			clusterMasterForbidden(c, err)
+			return
 		}
+		status := http.StatusInternalServerError
 		if errors.Is(err, services.ErrNodeNotFound) {
 			status = http.StatusNotFound
 		}

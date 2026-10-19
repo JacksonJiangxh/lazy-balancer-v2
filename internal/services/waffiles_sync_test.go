@@ -945,3 +945,38 @@ func TestWafFilesRefMatchesBundle_verifiesThreatSha256s(t *testing.T) {
 		}
 	})
 }
+
+// A86 历史问题（历史）：集群同步路径的 WAF ref 构建不得静默省略分量——
+// 组件存在但读取/哈希失败时，旧实现少一项分量，从端不拉取、主端无告警，
+// 主从静默分叉（从端继续用旧 WAF 规则/旧库）。修复后读失败显式化：
+// 整个 ref 视为不可用（nil）+ 错误日志，从端漂移检测把 nil 当分叉处理
+// （wafFilesDrifted: localRef==nil → 全量重拉，自愈方向）。
+func TestBuildWafFileRef_readFailureIsExplicit(t *testing.T) {
+	src := t.TempDir()
+	crsDir := filepath.Join(src, "crs")
+	if err := os.MkdirAll(filepath.Join(crsDir, "rules"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", "a.conf"), []byte("SecRule X 1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldLive := crsLiveDir
+	oldXdb := ip2regionLivePath
+	crsLiveDir = crsDir
+	ip2regionLivePath = filepath.Join(src, "ip2region.xdb")
+	t.Cleanup(func() { crsLiveDir, ip2regionLivePath = oldLive, oldXdb })
+
+	// 回归形状：完好树 → ref 含 CRS 分量。
+	ref := BuildWafFileRef()
+	if ref == nil || ref.CRSSha256 == "" {
+		t.Fatalf("完好 CRS 树必须产出含 CRSSha256 的 ref: %+v", ref)
+	}
+
+	// 目标形状：VERSION 是目录（读失败）→ 不得静默省略分量后宣称完整。
+	if err := os.Mkdir(filepath.Join(crsDir, "VERSION"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if ref := BuildWafFileRef(); ref != nil {
+		t.Fatalf("分量读失败必须显式化（nil ref + 错误日志），不得静默省略: %+v", ref)
+	}
+}

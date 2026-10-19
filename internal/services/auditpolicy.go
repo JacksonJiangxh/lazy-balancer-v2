@@ -55,6 +55,7 @@ var auditRoutePolicies = map[string]AuditPolicy{
 	"POST /api/v1/cluster/nodes/:id/reject":       AuditPolicyExplicit,
 	"POST /api/v1/cluster/nodes/:id/login-ticket": AuditPolicyExplicit,
 	"PUT /api/v1/cluster/nodes/:id/access-url":    AuditPolicyExplicit,
+	"PUT /api/v1/cluster/nodes/:id/site":          AuditPolicyExplicit,
 	// 历史问题：主节点侧单节点 pin 重置（handler 显式记录「清除节点证书指纹」审计）。
 	"POST /api/v1/cluster/nodes/:id/forget-pin": AuditPolicyExplicit,
 	// 服务控制（主节点侧 handler 显式记录节点名/动作/结果；从节点机器接口由

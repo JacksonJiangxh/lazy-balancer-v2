@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { normalizeWeights, redistributeWeight, weightPercent } from '../src/utils/upstreamWeights.ts'
+import { normalizeWeights, payloadWeight, redistributeWeight, weightPercent } from '../src/utils/upstreamWeights.ts'
 
 test('历史问题-01：重新启用上游至少分配 1，UI 不再显示 0%', () => {
   const rows = [
@@ -64,4 +64,14 @@ test('A85WT-历史问题：超出 100 行上限的行权重清零且不参与分
   normalizeWeights(rows)
   assert.equal(rows[100]!.weight, 0, '第 101 行必须被清零')
   assert.equal(rows.slice(0, 100).reduce((sum, row) => sum + row.weight, 0), 100)
+})
+
+test('A86 D-3：payloadWeight 保存载荷边界——禁用行送 1、启用行原样、缺省 100', () => {
+  // 禁用行草稿权重被 participatingItems 写 0，载荷边界送 1（后端 weight<1 响亮 400）
+  assert.equal(payloadWeight({ weight: 0, enabled: false }), 1)
+  assert.equal(payloadWeight({ weight: 50, enabled: false }), 1)
+  // 启用行原样送出（含 redistribute 保证的 ≥1）
+  assert.equal(payloadWeight({ weight: 30, enabled: true }), 30)
+  // 缺省键回落 100（既有语义）
+  assert.equal(payloadWeight({ enabled: true }), 100)
 })

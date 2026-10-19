@@ -38,33 +38,13 @@ func TestCreateRule_rejectsNegativeUpstreamWeight(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("负权重上游 status=%d body=%s, want 400", rec.Code, rec.Body.String())
 	}
-	if !bytes.Contains(rec.Body.Bytes(), []byte("权重不能为负数")) {
-		t.Fatalf("错误文案应点名负权重, body=%s", rec.Body.String())
+	// A86 D-3：weight<1 统一「不小于 1」文案（0 与负值同门），与导入侧一致。
+	if !bytes.Contains(rec.Body.Bytes(), []byte("权重必须为不小于 1 的整数")) {
+		t.Fatalf("错误文案应点名权重下限, body=%s", rec.Body.String())
 	}
 }
 
-// Given 创建载荷 weight=0（回归形状：归一为 1 放行）。
-// Then 201（不受新校验影响）。
-func TestCreateRule_zeroWeightStillNormalized(t *testing.T) {
-	handler := newRuleFeatureTestHandlers(t)
-	gin.SetMode(gin.TestMode)
-	router := gin.New()
-	router.POST("/api/v1/rules", handler.CreateRule)
-
-	body := map[string]any{
-		"name": "zero-weight", "protocol": "http", "domain": "zero.example.test",
-		"listen_port": 443, "strategy": "weighted_round_robin",
-		"enable_tls": false, "tls_source": "manual", "enabled": false,
-		"health_check_interval": 10, "health_check_timeout": 2, "health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
-		"upstreams": []map[string]any{{"host": "10.0.0.1", "port": 8080, "weight": 0, "enabled": true}},
-	}
-	raw, _ := json.Marshal(body)
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/rules", bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("weight=0 status=%d body=%s, want 201（归一放行回归形状）", rec.Code, rec.Body.String())
-	}
-}
+// A86 D-3（历史裁定）：weight=0 的「归一为 1 放行」旧钉测已废除——
+// 0 现为 400 拒绝形态，由 audit86_rules_test.go
+// TestCreateRule_rejectsZeroUpstreamWeight（启用行）与
+// TestCreateRule_rejectsZeroWeightForDisabledUpstream（禁用行）钉住。

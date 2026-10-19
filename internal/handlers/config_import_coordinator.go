@@ -126,6 +126,20 @@ func configImportBusy() bool {
 	return true
 }
 
+// rejectNodeWriteDuringImport（A86 历史问题，历史）：配置导入窗口内
+// 节点写端点（注册/审批/拒绝/删除/改访问地址/改站点坐标/清 pin/节点上报等）
+// 一律 409 fast-fail。导入事务全量替换 nodes 表：窗口内的节点写入要么被
+// 导入覆盖（静默丢失），要么阻塞在 SQLite 写锁上至 busy_timeout（30s）后
+// 500——两种形态都比干净 409 差。与 taskmonitor 的调度开关门共用
+// configImportBusy 探测，文案同族。
+func rejectNodeWriteDuringImport(c *gin.Context) bool {
+	if !configImportBusy() {
+		return false
+	}
+	c.JSON(http.StatusConflict, models.APIResponse{Code: http.StatusConflict, Message: "配置导入进行中，暂不能执行节点写操作"})
+	return true
+}
+
 func (h *Handlers) beginConfigImport(ctx context.Context) (*configImportSession, error) {
 	return h.beginConfigImportWithPrelock(ctx, nil)
 }

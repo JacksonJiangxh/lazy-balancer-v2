@@ -196,6 +196,9 @@ export interface ClusterNode {
   readonly health: ClusterHealth | null
   readonly last_seen: string
   readonly created_at: string
+  readonly server_map_lat: number
+  readonly server_map_lon: number
+  readonly site_inherited: boolean
   readonly section_sync?: readonly ClusterSectionSync[] | null
 }
 

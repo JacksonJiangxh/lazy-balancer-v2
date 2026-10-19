@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -244,5 +245,42 @@ func TestFastFile_UnmaskedEntriesRejected(t *testing.T) {
 	}
 	if _, err := ReadFastFile(okPath); err != nil {
 		t.Fatalf("masked entries from WriteFastFile must load, got: %v", err)
+	}
+}
+
+// A86 历史问题（历史）：ReadFastFile 对跨进程 .fast 输入必须先过 Stat
+// 体积门再读字节——异常/恶意超大文件不得在读取阶段就拖垮内存（文本名单
+// 路径已有 MaxFileBytes 同型硬上限，iplistfast.go:249-250）。
+func TestFastFile_ReadSizeCap(t *testing.T) {
+	dir := t.TempDir()
+	old := MaxFastFileBytes
+	MaxFastFileBytes = 4096
+	t.Cleanup(func() { MaxFastFileBytes = old })
+
+	// 超限文件：内容本身合法（写侧产物拼接填充无所谓——体积门先于内容解析）。
+	bigPath := filepath.Join(dir, "big.fast")
+	if err := os.WriteFile(bigPath, make([]byte, 4097), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFastFile(bigPath); err == nil {
+		t.Fatal("oversize .fast must be rejected before reading body")
+	}
+
+	// 回归形状：上限内的合法文件照常加载。
+	okPath := filepath.Join(dir, "ok.fast")
+	if err := WriteFastFile(okPath, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, nil); err != nil {
+		t.Fatalf("WriteFastFile: %v", err)
+	}
+	if _, err := ReadFastFile(okPath); err != nil {
+		t.Fatalf("in-cap .fast must load: %v", err)
+	}
+
+	// 边界形状：恰好等于上限的文件不被体积门误杀（由后续内容校验裁决）。
+	exactPath := filepath.Join(dir, "exact.fast")
+	if err := os.WriteFile(exactPath, make([]byte, 4096), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFastFile(exactPath); err == nil || !strings.Contains(err.Error(), "magic") {
+		t.Fatalf("exact-cap file must pass the size gate and fail on content (magic), got: %v", err)
 	}
 }

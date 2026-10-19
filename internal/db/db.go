@@ -512,7 +512,8 @@ func createTables() error {
 		auto_backup_time TEXT DEFAULT '03:00',
 		auto_backup_day INTEGER DEFAULT 1,
 		auto_backup_keep INTEGER DEFAULT 7,
-		auto_backup_sections TEXT DEFAULT '["users","rules","security"]',
+		auto_backup_sections TEXT DEFAULT '["users","rules","security","cluster"]',
+		auto_backup_sections_version INTEGER NOT NULL DEFAULT 0,
 		auto_backup_last_run DATETIME,
 	-- 威胁大屏本站坐标(v3,node-local):面板设置里的公网坐标,0,0=未设置(前端
 	-- 回退地图视觉中心);节点属性不入集群同步(先例 auto_backup_last_run)。
@@ -555,6 +556,8 @@ func createTables() error {
 		last_sync_error TEXT,
 		last_seen DATETIME,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		server_map_lat REAL NOT NULL DEFAULT 0,
+		server_map_lon REAL NOT NULL DEFAULT 0,
 		UNIQUE(ip_address, port)
 	);
 
@@ -1119,13 +1122,14 @@ func runMigrations() error {
 		"security_policies.ip_acl_list_refs":  "TEXT DEFAULT '[]'",
 		"security_policies.ip_whitelist_refs": "TEXT DEFAULT '[]'",
 		// 自动备份(v2.3.x):设置五列 + 节点本地运行态 last_run
-		"global_config.auto_backup_enabled":   "INTEGER DEFAULT 0",
-		"global_config.auto_backup_frequency": "TEXT DEFAULT 'daily'",
-		"global_config.auto_backup_time":      "TEXT DEFAULT '03:00'",
-		"global_config.auto_backup_day":       "INTEGER DEFAULT 1",
-		"global_config.auto_backup_keep":      "INTEGER DEFAULT 7",
-		"global_config.auto_backup_sections":  "TEXT DEFAULT '[\"users\",\"rules\",\"security\"]'",
-		"global_config.auto_backup_last_run":  "DATETIME",
+		"global_config.auto_backup_enabled":          "INTEGER DEFAULT 0",
+		"global_config.auto_backup_frequency":        "TEXT DEFAULT 'daily'",
+		"global_config.auto_backup_time":             "TEXT DEFAULT '03:00'",
+		"global_config.auto_backup_day":              "INTEGER DEFAULT 1",
+		"global_config.auto_backup_keep":             "INTEGER DEFAULT 7",
+		"global_config.auto_backup_sections":         "TEXT DEFAULT '[\"users\",\"rules\",\"security\",\"cluster\"]'",
+		"global_config.auto_backup_sections_version": "INTEGER NOT NULL DEFAULT 0",
+		"global_config.auto_backup_last_run":         "DATETIME",
 		// 三分类合并·方案A(2026-09-19):文件态记账专用列(wafFilesDrifted
 		// 的 304 兜底与 历史问题 A-#4 标签自愈依赖;哈希域=纯 ref 含版本标签)。
 		"global_config.applied_waf_ref_hash":    "TEXT DEFAULT ''",
@@ -1140,6 +1144,8 @@ func runMigrations() error {
 		"global_config.autoban_duration":       "TEXT NOT NULL DEFAULT '1h'",
 		"global_config.autoban_scope":          "TEXT NOT NULL DEFAULT 'all'",
 		"global_config.autoban_dry_run":        "INTEGER NOT NULL DEFAULT 1",
+		"nodes.server_map_lat":                 "REAL NOT NULL DEFAULT 0",
+		"nodes.server_map_lon":                 "REAL NOT NULL DEFAULT 0",
 	}
 	// 历史问题 F1: 四个全局超时列的 0→推荐默认回填原为「仅新增列时执行一次」——
 	// 当时渲染层把 0 当作「省略=用 Caddy 默认」的有效值，每启动无条件回填会
@@ -1187,6 +1193,12 @@ func runMigrations() error {
 	// 补齐收敛——重建迁移自身漏列不再造成列永久丢失（数据按列默认值回填）。
 	if err := ensureNewColumns(newColumns, newColumnBackfills); err != nil {
 		return err
+	}
+	if err := migrateAutoBackupNodeTopologySection(); err != nil {
+		return fmt.Errorf("failed to migrate auto backup node topology section: %w", err)
+	}
+	if err := normalizeUpstreamWeightsMigration(); err != nil {
+		return fmt.Errorf("failed to normalize upstream weights: %w", err)
 	}
 	if err := migrateSecurityEventRetentionDefaults(); err != nil {
 		return err
@@ -2297,6 +2309,46 @@ func migrateThreatTrafficSampleUnified() error {
 // 默认值（保留天数 90 天、行数上限 100 万），marker 置 1 后不再触碰运行期写值
 // （历史问题-5/历史问题-5：原实现每启动无条件把 0 改写为 90——写侧拒绝 0 后的存量
 // 0 只来自旧版本/旧导入，迁移一次即可；运行期显式值不得被重启静默改写）。
+func migrateAutoBackupNodeTopologySection() error {
+	var version int
+	var raw sql.NullString
+	if err := DB.QueryRow(`SELECT COALESCE(auto_backup_sections_version,0), auto_backup_sections FROM global_config WHERE id=1`).Scan(&version, &raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if version >= 1 {
+		return nil
+	}
+	sections := []string{}
+	if raw.Valid && strings.TrimSpace(raw.String) != "" {
+		if err := json.Unmarshal([]byte(raw.String), &sections); err != nil {
+			// 畸形存量值不在迁移中猜测修复；交由设置读侧 fail-visible。
+			_, err = DB.Exec(`UPDATE global_config SET auto_backup_sections_version=1 WHERE id=1`)
+			return err
+		}
+	}
+	if len(sections) == 0 {
+		sections = []string{"users", "rules", "security", "cluster"}
+	} else if slices.Equal(sections, []string{"users", "rules", "security"}) {
+		// 旧默认全选（三分类）一次追加节点拓扑；用户此后取消勾选会保存
+		// 三键并把 version 置 1，不会在下次启动被重新加回。
+		sections = append(sections, "cluster")
+	}
+	encoded, err := json.Marshal(sections)
+	if err != nil {
+		return err
+	}
+	_, err = DB.Exec(`UPDATE global_config SET auto_backup_sections=?, auto_backup_sections_version=1 WHERE id=1`, string(encoded))
+	return err
+}
+
+func normalizeUpstreamWeightsMigration() error {
+	_, err := DB.Exec(`UPDATE upstreams SET weight=1 WHERE weight IS NULL OR weight < 1`)
+	return err
+}
+
 func migrateSecurityEventRetentionDefaults() error {
 	var done int
 	if err := DB.QueryRow(`SELECT COALESCE(security_events_retention_migrated,0) FROM global_config WHERE id=1`).Scan(&done); err != nil && err != sql.ErrNoRows {
@@ -2651,6 +2703,10 @@ func migrateNodesDeadColumns() error {
 		// 历史问题:重建目标对齐新 schema(无 master_id/自引用 FK,idx_nodes_master；
 		// 补 UNIQUE(ip,port))——master_id 死列经本路径与 migrateNodesDropMasterID
 		// 双路径收敛为同一形态。
+		// Audit86 历史问题:重建 DDL 必须携 server_map_lat/lon 并 COALESCE 保值——
+		// 此前漏列，升级重建丢坐标（第二次 ensureNewColumns 仅以默认 0 补回 schema，
+		// 值已丢失）。与姊妹重建 migrateNodesDropMasterID 同形态（源表两列由
+		// 前置 ensureNewColumns 保证存在）。
 		if _, err := tx.Exec(`DELETE FROM nodes WHERE id NOT IN (SELECT MIN(id) FROM nodes GROUP BY ip_address, port);
 		CREATE TABLE nodes_without_legacy_sync (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100) NOT NULL, mode VARCHAR(10) NOT NULL DEFAULT 'slave',
@@ -2659,9 +2715,10 @@ func migrateNodesDeadColumns() error {
 		cluster_token_hash VARCHAR(64), registration_secret VARCHAR(64), registration_secret_expires_at DATETIME,
 		cluster_token_delivered BOOLEAN DEFAULT 0, reported_version INTEGER DEFAULT 0, health_json TEXT,
 		last_sync_at DATETIME, last_sync_error TEXT, last_seen DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		server_map_lat REAL NOT NULL DEFAULT 0, server_map_lon REAL NOT NULL DEFAULT 0,
 		UNIQUE(ip_address, port));
-		INSERT INTO nodes_without_legacy_sync (id,name,mode,ip_address,port,protocol,access_url,is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at)
-		SELECT id,name,COALESCE(mode,'slave'),ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at FROM nodes;
+		INSERT INTO nodes_without_legacy_sync (id,name,mode,ip_address,port,protocol,access_url,is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,server_map_lat,server_map_lon)
+		SELECT id,name,COALESCE(mode,'slave'),ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,COALESCE(server_map_lat,0),COALESCE(server_map_lon,0) FROM nodes;
 		DROP TABLE nodes;
 		ALTER TABLE nodes_without_legacy_sync RENAME TO nodes;
 		`); err != nil {
@@ -3275,10 +3332,12 @@ func migrateNodesDropMasterID() error {
 		last_sync_error TEXT,
 		last_seen DATETIME,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		server_map_lat REAL NOT NULL DEFAULT 0,
+		server_map_lon REAL NOT NULL DEFAULT 0,
 		UNIQUE(ip_address, port)
 	);
-	INSERT INTO nodes_new (id,name,mode,ip_address,port,protocol,is_approved,sync_interval,status,cluster_token_hash,access_url,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at)
-		SELECT id,name,mode,ip_address,port,protocol,is_approved,sync_interval,status,cluster_token_hash,COALESCE(access_url,''),registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at FROM nodes;
+	INSERT INTO nodes_new (id,name,mode,ip_address,port,protocol,is_approved,sync_interval,status,cluster_token_hash,access_url,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,server_map_lat,server_map_lon)
+		SELECT id,name,mode,ip_address,port,protocol,is_approved,sync_interval,status,cluster_token_hash,COALESCE(access_url,''),registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,COALESCE(server_map_lat,0),COALESCE(server_map_lon,0) FROM nodes;
 	DROP TABLE nodes;
 	ALTER TABLE nodes_new RENAME TO nodes;`
 		if _, err := tx.Exec(rebuild); err != nil {

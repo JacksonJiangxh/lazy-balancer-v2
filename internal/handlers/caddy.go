@@ -515,11 +515,8 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 	}
 	// 威胁大屏本站坐标（v3）：纬度 ±90、经度 ±180，越界 400 不改库值
 	// （fail-visible——静默钳位会让用户以为坐标已生效）。
-	if req.ServerMapLat != nil && (*req.ServerMapLat < -90 || *req.ServerMapLat > 90) {
-		return errors.New("本站纬度必须在 -90 到 90 之间")
-	}
-	if req.ServerMapLon != nil && (*req.ServerMapLon < -180 || *req.ServerMapLon > 180) {
-		return errors.New("本站经度必须在 -180 到 180 之间")
+	if err := validateServerMapCoordinates(req.ServerMapLat, req.ServerMapLon); err != nil {
+		return err
 	}
 	// 威胁大屏模式（v2.3.8）：枚举白名单，非法值 400（fail-visible）
 	if req.ThreatScreenMode != nil && *req.ThreatScreenMode != "map" && *req.ThreatScreenMode != "globe" {
@@ -767,6 +764,18 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("配置写入数据库失败", fmt.Sprintf("影响记录数为 %d", rows), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: fmt.Sprintf("配置写入数据库失败: 影响记录数为 %d", rows)})
 		return
+	}
+	// 主节点坐标是未单独配置坐标的从节点的默认值：变化时必须 bump 集群版本，
+	// 否则从节点 304 继续使用旧默认值；server_map 仍不进入 global_config
+	// 通用同步列/触发器（按节点 node_sites 下发）。
+	siteChanged := (req.ServerMapLat != nil && *req.ServerMapLat != old.ServerMapLat) ||
+		(req.ServerMapLon != nil && *req.ServerMapLon != old.ServerMapLon)
+	if siteChanged {
+		if err := services.BumpClusterVersion(c.Request.Context(), tx); err != nil {
+			recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("递增集群版本失败", err.Error(), services.AuditResultPart("failure")))
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "递增集群版本失败"})
+			return
+		}
 	}
 
 	reloadNote, applyErr := h.applyFromTxNote(c, tx, "保存配置后自动重载")

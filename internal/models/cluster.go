@@ -35,6 +35,12 @@ type ClusterNodeAccessURLRequest struct {
 	AccessURL string `json:"access_url"`
 }
 
+// ClusterNodeSiteRequest 主节点为指定从节点配置大屏站点坐标（node-local 下发）。
+type ClusterNodeSiteRequest struct {
+	ServerMapLat *float64 `json:"server_map_lat"`
+	ServerMapLon *float64 `json:"server_map_lon"`
+}
+
 func ValidateClusterAccessURL(value string) error {
 	if value == "" {
 		return nil
@@ -493,6 +499,16 @@ type ClusterSnapshot struct {
 	// 加性可选字段、omitempty：旧主端缺省 → 从端 no-op；旧从端忽略未知字段
 	// （先例：MasterSyncSwitches/WafFiles），故不 bump CurrentSnapshotSchema。
 	LockedUsers []ClusterLockedUser `json:"locked_users,omitempty"`
+	// NodeSites 为主节点为每个从节点配置的大屏站点坐标（node_id → 坐标）。
+	// 从节点按本地 registration_id 取自己的一项应用；加性可选字段，旧从端
+	// 忽略未知字段，旧主端缺省时新从端保持本地现值（先例 LockedUsers）。
+	NodeSites map[int]ClusterNodeSite `json:"node_sites,omitempty"`
+}
+
+// ClusterNodeSite 是单节点的威胁大屏站点坐标（0,0=未设置）。
+type ClusterNodeSite struct {
+	ServerMapLat float64 `json:"server_map_lat"`
+	ServerMapLon float64 `json:"server_map_lon"`
 }
 
 // ClusterSyncSwitchesPayload 是主节点同步开关随快照下发的形态(三分类合并
@@ -592,6 +608,10 @@ type ClusterNodeView struct {
 	Health          *ClusterHealth `json:"health"`
 	LastSeen        string         `json:"last_seen"`
 	CreatedAt       string         `json:"created_at"`
+	ServerMapLat    float64        `json:"server_map_lat"`
+	ServerMapLon    float64        `json:"server_map_lon"`
+	// SiteInherited 表示该节点未单独配置坐标，当前展示的是主节点默认坐标。
+	SiteInherited bool `json:"site_inherited"`
 	// SectionSync 为主节点聚合的 per-section 同步状态，仅包含主节点同步开关
 	// 开启的节；旧版本从节点无上报时为 nil（JSON 省略），前端展示占位文案。
 	SectionSync []ClusterSectionSyncStatus `json:"section_sync,omitempty"`

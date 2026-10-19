@@ -122,6 +122,11 @@ var ErrEngineStopped = errors.New("taskengine: 引擎已停止")
 var ErrNotMaster = errors.New("taskengine: 该操作仅允许在主节点执行")
 var errPeriodicLoopDisabled = errors.New("taskengine: 周期调度已停止")
 
+// 历史问题-18（历史）：Scheduled admission 同族收口的拒绝哨兵——
+// 调度已停止/Kind 错配 与 槽未到期（窗口内被并发改写）分两值，钉测按值断言。
+var errScheduledLoopDisabled = errors.New("taskengine: 定时调度已停止")
+var errScheduledNotDue = errors.New("taskengine: 定时槽未到期")
+
 // ---- registration ----
 
 type registration struct {
@@ -1131,17 +1136,30 @@ func (res *runReservation) release() {
 // reserveRun 原子占位：stopped/paused/角色/单飞 CAS 与 runNow 同口径。
 // 任何失败同步返回错误（调用方可在写 HTTP 响应前映射状态码）。
 func (e *Engine) reserveRun(id, trigger string) (*runReservation, error) {
-	return e.reserveRunInternal(id, trigger, time.Time{}, false)
+	return e.reserveRunInternal(id, trigger, "", time.Time{})
 }
 
 // reservePeriodicRun 把 Periodic 的节拍推进并入 admission 临界区：
 // 只有 paused/role/loop/单飞门全部通过且 running 占位成功才写 lastCheck。
 // tick 不再先推进节拍、再让迟到 goroutine 承担 admission 失败。
 func (e *Engine) reservePeriodicRun(id string, now time.Time) (*runReservation, error) {
-	return e.reserveRunInternal(id, "auto", now, true)
+	return e.reserveRunInternal(id, "auto", KindPeriodic, now)
 }
 
-func (e *Engine) reserveRunInternal(id, trigger string, periodicBeat time.Time, periodicAdmission bool) (*runReservation, error) {
+// reserveScheduledRun 把 Scheduled 的槽复核并入 admission 临界区（历史问题-18，
+// 与 Periodic 同型收口）：paused/role/loop/单飞门全部通过且槽仍到期才占位。
+// StopLoop/业务关闭落在 tick 判定与本调用之间时拒绝派发——不再出现
+// 「已停止仍启动一次」；槽被并发改写（手动触发/上一轮完成重算到未来）
+// 时按陈旧判定投递会立即多跑一次，一并在临界区内复核。
+func (e *Engine) reserveScheduledRun(id string, now time.Time) (*runReservation, error) {
+	return e.reserveRunInternal(id, "auto", KindScheduled, now)
+}
+
+// reserveRunInternal admission 语义：空值=手动/startup 直排（Trigger/RunSync/
+// RunBootSyncTasks——显式意图，不受 loopEnabled 门拦）；KindPeriodic/
+// KindScheduled=tick 自动派发的收口准入（复核 loopEnabled，Scheduled 另复核
+// 槽到期，Periodic 另推进节拍）。
+func (e *Engine) reserveRunInternal(id, trigger string, admission Kind, beat time.Time) (*runReservation, error) {
 	e.mu.Lock()
 	if e.stopped.Load() {
 		e.mu.Unlock()
@@ -1179,16 +1197,31 @@ func (e *Engine) reserveRunInternal(id, trigger string, periodicBeat time.Time, 
 		e.runWG.Done()
 		return nil, ErrAlreadyRunning
 	}
-	if periodicAdmission && (r.desc.Kind != KindPeriodic || !r.loopEnabled) {
-		r.mu.Unlock()
-		e.roleMu.RUnlock()
-		e.inFlight.Add(-1)
-		e.runWG.Done()
-		return nil, errPeriodicLoopDisabled
+	if admission != "" {
+		if r.desc.Kind != admission || !r.loopEnabled {
+			r.mu.Unlock()
+			e.roleMu.RUnlock()
+			e.inFlight.Add(-1)
+			e.runWG.Done()
+			if admission == KindPeriodic {
+				return nil, errPeriodicLoopDisabled
+			}
+			return nil, errScheduledLoopDisabled
+		}
+		// Scheduled 槽复核（历史问题-18）：窗口内手动触发/上一轮完成可能已把
+		// 槽重算到未来（executeRun 尾部重算），按 tick 的陈旧判定投递会立即
+		// 多跑一次——临界区内复核槽仍到期。
+		if admission == KindScheduled && (r.nextScheduledTime.IsZero() || !beat.After(r.nextScheduledTime)) {
+			r.mu.Unlock()
+			e.roleMu.RUnlock()
+			e.inFlight.Add(-1)
+			e.runWG.Done()
+			return nil, errScheduledNotDue
+		}
 	}
 	r.running = true
-	if periodicAdmission {
-		r.lastCheck = periodicBeat
+	if admission == KindPeriodic {
+		r.lastCheck = beat
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
@@ -1416,9 +1449,22 @@ func (e *Engine) tick() {
 			due := !r.nextScheduledTime.IsZero() && now.After(r.nextScheduledTime)
 			eligible := r.loopEnabled && !r.running
 			r.mu.Unlock()
-			if due && eligible && e.roleAllows(r.desc.RunsOn) {
-				go func(rid string) { _, _ = e.runNow(rid, "auto", "") }(id)
+			if !due || !eligible || !e.roleAllows(r.desc.RunsOn) {
+				continue
 			}
+			// 历史问题-18（历史）：与 Periodic 的 A85历史问题-1 同型收口——
+			// admission 与派发判定同步完成，再异步执行。StopLoop/业务关闭/
+			// 槽并发改写落在判定后窗口时 reservation 失败，不再出现
+			// 「已停止仍启动一次」（旧形态 go runNow 的 admission 由派发
+			// goroutine 承担，不复核 loopEnabled/槽状态）。
+			res, err := e.reserveScheduledRun(id, now)
+			if err != nil {
+				continue
+			}
+			go func(rid string, reservation *runReservation) {
+				defer reservation.release()
+				_, _ = e.executeRun(reservation, rid, "auto", "")
+			}(id, res)
 		case KindPeriodic:
 			// 固定间隔：每轮独立执行（Run→exit→记录）；in-flight 跳过本轮。
 			// 角色不符/业务开关关（EnabledFn=false，历史问题）时置零 lastCheck

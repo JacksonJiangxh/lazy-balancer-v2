@@ -657,6 +657,15 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "证书签发队列已暂停，无法创建签发任务"})
 		return
 	}
+	// A86 历史问题（历史问题-01）：手工签发的 规则当前态读取→冷却门→upsert/入队
+	// 全程与规则写/删除/改域共用 caddyOpMu 临界区——此前无锁读取后与
+	// UpdateRule 改域迁移（任务行已改到新域）交错，本次仍按旧域 INSERT
+	// 新行并入队，对旧域实际发起 CA 签发（部署期域不匹配拒绝，job 滞留
+	// downloaded 至 6h sweep）；与 DeleteRule 交错可留孤儿任务行。
+	// 请求体已在锁外绑定（bind-before-lock 序）；EnqueueIfActive 只取队列
+	// 叶锁（m.mu/q.mu），execute 在锁外 goroutine 运行，无反向锁序。
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	queued := 0
 	// CERT44-2（历史）：批量路径套用与定向签发同款冷却门，冷却中
 	// 任务跳过并单列计数（仅批量分支产生非零值）。
@@ -722,6 +731,13 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		}
 		jobID, changed, err := services.CreateOrRequeueCertJobWithChange(req.CaddyID, canonicalRuleDomain, 0, qm)
 		if err != nil {
+			if errors.Is(err, services.ErrCertRuleStateConflict) {
+				// A86 历史问题：upsert 落库闸的规则当前态复核拒绝（防御纵深——
+				// 持锁临界区内正常不可达）——409 冲突语义，不得折成 500。
+				auditFailure("conflict", "规则状态已变更（规则已删除、禁用或域名已修改）")
+				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "规则状态已变更（规则已删除、禁用或域名已修改），请刷新后重试"})
+				return
+			}
 			auditFailure("failed", "创建签发任务失败: "+err.Error())
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "创建签发任务失败: " + err.Error()})
 			return

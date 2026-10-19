@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -938,7 +939,8 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 	var req models.CreateRuleRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	// ShouldBindBodyWith（缓存请求体）供 A86 D-3 的 weight 省略探针二次解码。
+	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
 		if isRequestBodyTooLarge(err) {
 			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
 			return
@@ -952,6 +954,9 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("Invalid request: %v", err)})
 		return
 	}
+
+	// A86 D-3：省略 weight 的上游行落默认 1（显式 0 由写侧校验 400）。
+	applyOmittedUpstreamWeightDefaults(c, req.Upstreams)
 
 	// 与 UpdateRule/DeleteRule 同一锁序：先 caddyOpMu 后 DB，冲突检查与写入串行化
 	h.caddyOpMu.Lock()
@@ -1182,28 +1187,36 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		enabledVal = 0
 	}
 
-	_, err = tx.Exec(`
-		INSERT INTO lb_rules (name, description, protocol, domain, listen_port, strategy, dynamic_dns, enable_dns_server, dns_server, dns_family,
-			health_check_path, health_check_interval, health_check_timeout,
-			health_check_unhealthy_threshold, health_check_healthy_threshold,
-			enable_active_health_check, tcp_health_check_port, tcp_proxy_protocol, tcp_try_duration, tcp_try_interval,
-		request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden, ntlm_compatible, upstream_force_http1,
-		custom_routes_enabled,
-		proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
-		host_header, health_check_host, enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key, tls_http_redirect,
-		enable_compress, compress_types, enabled, created_by, updated_at, caddy_id, log_enabled,
-		block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, req.Name, req.Description, req.Protocol, req.Domain, req.ListenPort, req.Strategy, req.DynamicDNS, req.EnableDnsServer, req.DnsServer, req.DnsFamily,
-		req.HealthCheckPath, req.HealthCheckInterval, req.HealthCheckTimeout,
-		req.HealthCheckUnhealthyThreshold, req.HealthCheckHealthyThreshold,
-		req.EnableActiveHealthCheck, req.TCPHealthCheckPort, req.TCPProxyProtocol, req.TCPTryDuration, req.TCPTryInterval,
-		req.RequestBodyMaxSizeMB, req.UpstreamKeepaliveTimeout, req.ServerTokensHidden, req.NTLMCompatible, req.UpstreamForceHTTP1,
-		features.CustomRoutesEnabled,
-		features.ProxyDialTimeout, features.ProxyResponseHeaderTimeout, features.ProxyReadTimeout, features.ProxyWriteTimeout, features.ProxyStreamTimeout, features.ProxyFlushInterval, features.ProxyStreamCloseDelay,
-		req.HostHeader, req.HealthCheckHost, req.EnableTLS, req.TLSSource, req.ACMEConfigID, req.CAProviderID, req.TLSCert, req.TLSKey,
-		req.TLSHTTPRedirect, req.EnableCompress, req.CompressTypes, enabledVal, userIDInt, time.Now().UTC().Format("2006-01-02 15:04:05"), caddyID, req.LogEnabled,
-		req.BlockPageStage1ID, req.BlockPageStage1Status, req.BlockPageStage3ID, req.BlockPageStage3Status)
+	// A86 历史问题：INSERT 列清单与值投影走唯一事实源（services.LbRuleInsertSQL/
+	// LbRuleInsertArgs）——新建排除 id/created_at/updated_by（主键自增分配、
+	// created_at 走 schema 默认、updated_by 留 NULL 待首次更新），列形态与
+	// 复制/集群镜像/快照导出同源自此结构性保证。
+	rule := models.LbRule{
+		CaddyID: caddyID, Name: req.Name, Description: req.Description, Protocol: req.Protocol,
+		Domain: req.Domain, ListenPort: req.ListenPort, Strategy: req.Strategy,
+		DynamicDNS: req.DynamicDNS, EnableDnsServer: req.EnableDnsServer, DnsServer: req.DnsServer, DnsFamily: req.DnsFamily,
+		HealthCheckPath: req.HealthCheckPath, HealthCheckInterval: req.HealthCheckInterval, HealthCheckTimeout: req.HealthCheckTimeout,
+		HealthCheckUnhealthyThreshold: req.HealthCheckUnhealthyThreshold, HealthCheckHealthyThreshold: req.HealthCheckHealthyThreshold,
+		EnableActiveHealthCheck: req.EnableActiveHealthCheck, TCPHealthCheckPort: req.TCPHealthCheckPort,
+		TCPProxyProtocol: req.TCPProxyProtocol, TCPTryDuration: req.TCPTryDuration, TCPTryInterval: req.TCPTryInterval,
+		RequestBodyMaxSizeMB: req.RequestBodyMaxSizeMB, UpstreamKeepaliveTimeout: req.UpstreamKeepaliveTimeout,
+		ServerTokensHidden: req.ServerTokensHidden, NTLMCompatible: req.NTLMCompatible, UpstreamForceHTTP1: req.UpstreamForceHTTP1,
+		CustomRoutesEnabled: features.CustomRoutesEnabled,
+		ProxyDialTimeout:    features.ProxyDialTimeout, ProxyResponseHeaderTimeout: features.ProxyResponseHeaderTimeout,
+		ProxyReadTimeout: features.ProxyReadTimeout, ProxyWriteTimeout: features.ProxyWriteTimeout,
+		ProxyStreamTimeout: features.ProxyStreamTimeout, ProxyFlushInterval: features.ProxyFlushInterval,
+		ProxyStreamCloseDelay: features.ProxyStreamCloseDelay,
+		HostHeader:            req.HostHeader, HealthCheckHost: req.HealthCheckHost,
+		EnableTLS: req.EnableTLS, TLSSource: req.TLSSource, ACMEConfigID: req.ACMEConfigID, CAProviderID: req.CAProviderID,
+		TLSCert: req.TLSCert, TLSKey: req.TLSKey, TLSHTTPRedirect: req.TLSHTTPRedirect,
+		EnableCompress: req.EnableCompress, CompressTypes: req.CompressTypes,
+		Enabled: enabledVal == 1, LogEnabled: req.LogEnabled, CreatedBy: int(userIDInt),
+		UpdatedAt:         models.JSONNullTime{NullTime: sql.NullTime{Time: time.Now().UTC(), Valid: true}},
+		BlockPageStage1ID: req.BlockPageStage1ID, BlockPageStage1Status: req.BlockPageStage1Status,
+		BlockPageStage3ID: req.BlockPageStage3ID, BlockPageStage3Status: req.BlockPageStage3Status,
+	}
+	insertColumns := services.LbRuleInsertColumns("id", "created_at", "updated_by")
+	_, err = tx.Exec(services.LbRuleInsertSQL(insertColumns), services.LbRuleInsertArgs(&rule, insertColumns)...)
 
 	if err != nil {
 		tx.Rollback()
@@ -1213,9 +1226,8 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	}
 
 	for _, u := range req.Upstreams {
-		if u.Weight == 0 {
-			u.Weight = 1
-		}
+		// A86 D-3：weight<1 已由 validateRulePayloadBeforeSave 响亮拒绝
+		//（0→1 静默归一废除），此处不再兜底归一。
 		if u.Protocol == "" {
 			if req.Protocol == "tcp" {
 				u.Protocol = "tcp"
@@ -1376,7 +1388,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxUpdateRuleBodyBytes)
 	var req models.UpdateRuleRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	// ShouldBindBodyWith（缓存请求体）供 A86 D-3 的 weight 省略探针二次解码。
+	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
 		// 历史问题(历史):MaxBytesReader 超限(chunked/未知长度)映射 413,
 		// 与 CreateRule/PutCaddyConfig/导入路径口径一致。
 		if isRequestBodyTooLarge(err) {
@@ -1387,6 +1400,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的请求: " + err.Error()})
 		return
 	}
+	// A86 D-3：省略 weight 的上游行落默认 1（显式 0 由写侧校验 400）；
+	// upstreams 整体省略时 len=0 探针 no-op，合并区保留存量。
+	applyOmittedUpstreamWeightDefaults(c, req.Upstreams)
 	requestedProtocol := req.Protocol
 
 	// caddyOpMu 必须覆盖 读取→合并→验证→快照→提交→应用→恢复 全程：锁外读取合并时，
@@ -2156,6 +2172,36 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	var switchedCertJobs int64
 	delReason := ""
 	if orphanACME {
+		// A86 历史问题（收窄裁定 2026-10-19，不反转历史 R10）：409 在途守卫
+		// 前置到删除之前——此前先 DELETE 致下方 UPDATE 的 NOT EXISTS 守卫在
+		// 本路径恒失效，CA 往返在途的规则可被改成 manual/关 TLS（队列取消是
+		// 提交后 best-effort）。仅拦「执行中」状态集（executingACMEJobStatuses
+		// =非终态减 queued/pending 未起动行）；queued/pending 维持 R10
+		// 「删除+提交后取消+200」语义，保留持续失败域名的切换逃生口。
+		executingStatuses := executingACMEJobStatuses()
+		if len(executingStatuses) > 0 {
+			countArgs := make([]any, 0, len(executingStatuses)+1)
+			countArgs = append(countArgs, caddyID)
+			placeholders := ""
+			for i, status := range executingStatuses {
+				if i > 0 {
+					placeholders += ","
+				}
+				placeholders += "?"
+				countArgs = append(countArgs, status)
+			}
+			var executingJobs int
+			if scanErr := tx.QueryRow("SELECT COUNT(*) FROM cert_jobs WHERE rule_id=? AND status IN ("+placeholders+")", countArgs...).Scan(&executingJobs); scanErr != nil {
+				services.Logf("error", "UpdateRule executing cert job check error for caddy_id=%s: %v", caddyID, scanErr)
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "检查证书任务状态失败: " + scanErr.Error()})
+				return
+			}
+			if executingJobs > 0 {
+				tx.Rollback()
+				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "证书申请中，请等待完成或失败后再修改规则"})
+				return
+			}
+		}
 		delReason = "规则已不使用 ACME 自动签发，证书任务已删除"
 		delResult, delErr := tx.Exec("DELETE FROM cert_jobs WHERE rule_id=?", caddyID)
 		if delErr != nil {
@@ -2172,16 +2218,17 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 
 	// PUT enabled=false 与 /disable 同语义：ACME 任务置 disabled 并取消在途，
-	// 否则任务视图仍显示 issued（历史 历史问题-01）。
+	// 否则任务视图仍显示 issued（历史 历史问题-01）。谓词经
+	// disableCertJobsForRuleTx 单源（A86 历史问题，failed 终态行保留失败史实）。
 	disabledByUpdate := !orphanACME && existingRule.Enabled && !derefBool(req.Enabled)
 	var disabledJobs int64
 	if disabledByUpdate {
-		res, derr := tx.Exec(`UPDATE cert_jobs SET status='disabled', message='规则已禁用，任务已暂停', updated_at=datetime('now') WHERE rule_id=? AND status<>'disabled'`, caddyID)
+		var derr error
+		disabledJobs, derr = disableCertJobsForRuleTx(tx, caddyID)
 		if derr != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "暂停证书任务失败: " + derr.Error()})
 			return
 		}
-		disabledJobs, _ = res.RowsAffected()
 	}
 
 	userIDInt := contextUserID(c)
@@ -2236,9 +2283,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// 不再 DELETE+INSERT 重建全部上游行（id 保留、不触发上游表行级同步触发器）。
 	for i := range req.Upstreams {
 		u := &req.Upstreams[i]
-		if u.Weight == 0 {
-			u.Weight = 1
-		}
+		// A86 D-3：weight<1 已由 validateRulePayloadBeforeSave 响亮拒绝
+		//（0→1 静默归一废除），此处不再兜底归一。
 		if u.Protocol == "" {
 			if req.Protocol == "tcp" {
 				u.Protocol = "tcp"
@@ -2734,7 +2780,14 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 
 	if db.MetricsDB != nil {
 		if _, err := db.MetricsDB.Exec("DELETE FROM metrics_history WHERE rule_id = ?", caddyID); err != nil {
+			// A86 D-4（历史裁定）：清理失败不阻断删除（规则已提交），
+			// 但必须显性化——操作审计留痕 + 周期任务 metrics-orphan-cleanup
+			// 按「已删除规则」谓词有界收敛重试（残留行 7 天保留期另兜底）。
 			services.Logf("error", "DeleteRule metrics_history delete error for caddy_id=%s: %v", caddyID, err)
+			recordAudit(c, "清理失败", "规则指标", services.FormatAuditDetail(
+				services.AuditRulePart(caddyID),
+				fmt.Sprintf("metrics_history 清理失败：%v（累计残留由孤儿指标清理任务有界重试收敛）", err),
+			))
 		}
 	}
 
@@ -2846,7 +2899,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		return
 	}
 
-	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	nowTime := time.Now().UTC()
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "开启复制事务失败"})
@@ -2910,30 +2963,20 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		return
 	}
 
-	if _, err := tx.Exec(`
-		INSERT INTO lb_rules (name, description, protocol, domain, listen_port, strategy, dynamic_dns, enable_dns_server, dns_server, dns_family,
-			health_check_path, health_check_interval, health_check_timeout,
-			health_check_unhealthy_threshold, health_check_healthy_threshold,
-			enable_active_health_check, tcp_health_check_port, tcp_proxy_protocol, tcp_try_duration, tcp_try_interval,
-			request_body_max_size_mb, upstream_keepalive_timeout, server_tokens_hidden, ntlm_compatible, upstream_force_http1,
-			enable_tls, tls_source, acme_config_id, ca_provider_id, tls_cert, tls_key,
-	tls_http_redirect, enable_compress, compress_types, enabled, created_by, updated_by, created_at, updated_at, host_header, health_check_host, log_enabled, caddy_id,
-		custom_routes_enabled,
-		proxy_dial_timeout, proxy_response_header_timeout, proxy_read_timeout, proxy_write_timeout, proxy_stream_timeout, proxy_flush_interval, proxy_stream_close_delay,
-		block_page_stage1_id, block_page_stage1_status, block_page_stage3_id, block_page_stage3_status)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, rule.Name+"（副本）", rule.Description, rule.Protocol, rule.Domain, rule.ListenPort, rule.Strategy,
-		rule.DynamicDNS, rule.EnableDnsServer, rule.DnsServer, rule.DnsFamily, rule.HealthCheckPath, rule.HealthCheckInterval, rule.HealthCheckTimeout,
-		rule.HealthCheckUnhealthyThreshold, rule.HealthCheckHealthyThreshold,
-		rule.EnableActiveHealthCheck, rule.TCPHealthCheckPort, rule.TCPProxyProtocol, rule.TCPTryDuration, rule.TCPTryInterval,
-		rule.RequestBodyMaxSizeMB, rule.UpstreamKeepaliveTimeout, rule.ServerTokensHidden, rule.NTLMCompatible, rule.UpstreamForceHTTP1,
-		rule.EnableTLS, rule.TLSSource, rule.ACMEConfigID, rule.CAProviderID, rule.TLSCert, rule.TLSKey,
-		rule.TLSHTTPRedirect, rule.EnableCompress, rule.CompressTypes, 0, userIDInt, userIDInt,
-		now, now, rule.HostHeader, rule.HealthCheckHost, rule.LogEnabled, newCaddyID,
-		rule.CustomRoutesEnabled,
-		rule.ProxyDialTimeout, rule.ProxyResponseHeaderTimeout, rule.ProxyReadTimeout, rule.ProxyWriteTimeout, rule.ProxyStreamTimeout, rule.ProxyFlushInterval, rule.ProxyStreamCloseDelay,
-		rule.BlockPageStage1ID, rule.BlockPageStage1Status, rule.BlockPageStage3ID, rule.BlockPageStage3Status,
-	); err != nil {
+	// A86 历史问题：INSERT 列清单与值投影走唯一事实源（services.LbRuleInsertSQL/
+	// LbRuleInsertArgs）——复制排除 id（AUTOINCREMENT 分配新主键），审计四列
+	// 按复制语义覆写（created_by/updated_by=操作者，created_at/updated_at=现在）。
+	duplicate := rule
+	duplicate.ID = 0
+	duplicate.CaddyID = newCaddyID
+	duplicate.Name = rule.Name + "（副本）"
+	duplicate.Enabled = false
+	duplicate.CreatedBy = int(userIDInt)
+	duplicate.UpdatedBy = int(userIDInt)
+	duplicate.CreatedAt = nowTime
+	duplicate.UpdatedAt = models.JSONNullTime{NullTime: sql.NullTime{Time: nowTime, Valid: true}}
+	duplicateColumns := services.LbRuleInsertColumns("id")
+	if _, err := tx.Exec(services.LbRuleInsertSQL(duplicateColumns), services.LbRuleInsertArgs(&duplicate, duplicateColumns)...); err != nil {
 		services.Logf("error", "Failed to duplicate rule %s: %v", caddyID, err)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "复制规则失败，已回滚: " + err.Error()})
 		return
@@ -3645,6 +3688,71 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "规则已启用"})
 }
 
+// upstreamWeightPresenceProbe 区分「省略 weight」与「显式 0」（A86 D-3）：
+// typed 绑定把省略解码为 0，与显式 0 不可分——省略须落默认 1（与导入侧
+// 缺键→schema DEFAULT 1 同口径，config_backup.go D-3 门），显式 0/负值
+// 留给 validateRuleUpstreams 响亮 400。
+type upstreamWeightPresenceProbe struct {
+	Upstreams []struct {
+		Weight *int `json:"weight"`
+	} `json:"upstreams"`
+}
+
+// applyOmittedUpstreamWeightDefaults 把省略 weight 的上游行置默认 1；显式值
+// （含 0/负）原样保留给写侧校验判定。探针绑定失败或行数不齐时不做填充
+// （主绑定已先行报错，或畸形形态由后续校验兜底）。
+func applyOmittedUpstreamWeightDefaults(c *gin.Context, upstreams []models.Upstream) {
+	if len(upstreams) == 0 {
+		return
+	}
+	var probe upstreamWeightPresenceProbe
+	if err := c.ShouldBindBodyWith(&probe, binding.JSON); err != nil {
+		return
+	}
+	if len(probe.Upstreams) != len(upstreams) {
+		return
+	}
+	for i := range upstreams {
+		if probe.Upstreams[i].Weight == nil {
+			upstreams[i].Weight = 1
+		}
+	}
+}
+
+// executingACMEJobStatuses 派生「执行中/CA 往返在途」cert_jobs 状态集
+// （A86 历史问题 收窄裁定 2026-10-19）：规范枚举（db.CertJobStatuses 单源）减去
+// 终态（issued/failed/disabled）与未起动行（queued/pending）——未起动行
+// 维持历史 R10「删除+取消+200」语义，在途行才在 orphanACME 删除前 409。
+// 逐调用计算：枚举极小（26 项），UpdateRule 非热路径，避免包级缓存漂移。
+func executingACMEJobStatuses() []string {
+	excluded := map[string]bool{"queued": true, "pending": true, "issued": true, "failed": true, "disabled": true}
+	statuses := make([]string, 0, len(db.CertJobStatuses()))
+	for _, status := range db.CertJobStatuses() {
+		if !excluded[status] {
+			statuses = append(statuses, status)
+		}
+	}
+	return statuses
+}
+
+// disableCertJobsForRuleTx 是「规则禁用/停用」暂停证书任务的单源写点
+// （A86 历史问题）：UpdateRule（PUT enabled=false 同语义入口）与 DisableRule
+// 原两份手写 UPDATE 谓词漂移——前者 status<>'disabled' 会把 failed 终态行
+// 改写为 disabled 抹掉失败史实；统一为 NOT IN ('failed','disabled')，与
+// config_backup.go pauseCertJobsForImportDisabledRule（A86 历史问题 导入冲突
+// 暂停）谓词逐字一致。返回受影响行数；审计/日志由调用方负责。
+func disableCertJobsForRuleTx(tx *sql.Tx, caddyID string) (int64, error) {
+	result, err := tx.Exec(`UPDATE cert_jobs SET status='disabled', message='规则已禁用，任务已暂停', updated_at=datetime('now') WHERE rule_id=? AND status NOT IN ('failed','disabled')`, caddyID)
+	if err != nil {
+		return 0, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return rowsAffected, nil
+}
+
 func (h *Handlers) DisableRule(c *gin.Context) {
 	caddyID := c.Param("caddy_id")
 
@@ -3700,14 +3808,12 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 	}
 	var disabledJobs int64
 	if enableTLS && tlsSource == "acme_dns" && domain != "" {
-		result, err := tx.Exec("UPDATE cert_jobs SET status='disabled', message='规则已禁用，任务已暂停', updated_at=datetime('now') WHERE rule_id=? AND status NOT IN ('failed','disabled')", caddyID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新证书任务状态失败: " + err.Error()})
-			return
-		}
-		disabledJobs, err = result.RowsAffected()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "确认证书任务状态失败: " + err.Error()})
+		// 谓词经 disableCertJobsForRuleTx 单源（A86 历史问题）——与 UpdateRule
+		// 禁用入口/config_backup 导入冲突暂停同口径，failed 终态行保留。
+		var derr error
+		disabledJobs, derr = disableCertJobsForRuleTx(tx, caddyID)
+		if derr != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新证书任务状态失败: " + derr.Error()})
 			return
 		}
 	}

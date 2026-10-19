@@ -1895,8 +1895,9 @@ func SecurityEventsSetIngestionHealthForTest(status SecurityEventsIngestionStatu
 }
 
 // SecurityEventsPollOnce 单轮摄取（先采集后轮转——引擎 2s 节拍调用）。
-// 返回本轮摄取条数；任务日志只由 ingestion daemon 自己写，其他调用方不得越权。
-func SecurityEventsPollOnce() int {
+// 返回本轮摄取条数与轮转错误（采集 tick 错误经限流 warn+健康快照记账，
+// 不随返回值暴露）；任务日志只由 ingestion daemon 自己写，其他调用方不得越权。
+func SecurityEventsPollOnce() (int, error) {
 	securityEventsPollState.Lock()
 	defer securityEventsPollState.Unlock()
 	if !securityEventsPollState.inited {
@@ -1911,13 +1912,20 @@ func SecurityEventsPollOnce() int {
 	if tickErr != nil {
 		securityEventsPollState.tailer.securityEventsRateLimitedWarn(tickErr)
 	}
-	securityEventsRecordPollResult(tickErr)
 	ingested := securityEventsPollState.tailer.lastIngested
 	securityEventsPollState.tailer.lastIngested = 0
 	// 历史问题-08：轮转/补采窗口入库的事件计入同一轮摄取数（此前只报 tailer 计数，
 	// 补采事件永不进任务日志）；失败不阻塞返回（轮转自身已限流告警）。
-	ingested += rotateAuditLogIfNeeded()
-	return ingested
+	rotated, rotErr := rotateAuditLogIfNeeded()
+	ingested += rotated
+	// 历史问题-23（历史）：轮转失败与采集失败同口径进健康快照——一轮内
+	// 两类失败只记一次（不双计）；停等（stalled）瞬态不遮蔽轮转失败。
+	healthErr := tickErr
+	if rotErr != nil && (healthErr == nil || errors.Is(healthErr, errSecurityEventsStalled)) {
+		healthErr = rotErr
+	}
+	securityEventsRecordPollResult(healthErr)
+	return ingested, rotErr
 }
 
 // runIngestionLoop 常驻自管理摄取循环（v2.0 Daemon 标准）：2s 节拍尾读 +
@@ -1926,13 +1934,22 @@ func SecurityEventsPollOnce() int {
 func runIngestionLoop(ctx context.Context) error {
 	ticker := time.NewTicker(securityEventsPollInterval)
 	defer ticker.Stop()
+	var lastRotateFailureSummaryAt time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if ingested := SecurityEventsPollOnce(); ingested > 0 {
+			ingested, rotErr := SecurityEventsPollOnce()
+			if ingested > 0 {
 				TaskLogf("security-events-ingestion", "ingest", "摄取 %d 条安全事件", ingested)
+			}
+			// 历史问题-23（历史）：轮转失败写任务摘要——此前任务日志仅在
+			// ingested>0 时留痕，轮转持续失败零可见性。2s 节拍下持续失败每
+			// 分钟至多一行（与应用日志 60s 限流同窗口）。
+			if rotErr != nil && time.Since(lastRotateFailureSummaryAt) >= time.Minute {
+				TaskLogfWarn("security-events-ingestion", "rotate", "审计日志轮转失败：%v", rotErr)
+				lastRotateFailureSummaryAt = time.Now()
 			}
 		}
 	}

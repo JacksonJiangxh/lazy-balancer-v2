@@ -619,6 +619,9 @@ func (s *ClusterService) buildSnapshot(ctx context.Context, store snapshotStore)
 	if snapshot.LockedUsers, err = s.snapshotLockedUsers(ctx, store); err != nil {
 		return models.ClusterSnapshot{}, err
 	}
+	if snapshot.NodeSites, err = s.snapshotNodeSites(ctx, store); err != nil {
+		return models.ClusterSnapshot{}, err
+	}
 	if snapshot.Certs, err = s.snapshotCertificates(ctx, store); err != nil {
 		return models.ClusterSnapshot{}, err
 	}
@@ -653,6 +656,36 @@ func (s *ClusterService) buildSnapshot(ctx context.Context, store snapshotStore)
 		return models.ClusterSnapshot{}, err
 	}
 	return snapshot, nil
+}
+
+func (s *ClusterService) snapshotNodeSites(ctx context.Context, store snapshotStore) (map[int]models.ClusterNodeSite, error) {
+	var masterLat, masterLon float64
+	if err := store.QueryRowContext(ctx, `SELECT COALESCE(server_map_lat,0), COALESCE(server_map_lon,0) FROM global_config WHERE id=1`).Scan(&masterLat, &masterLon); err != nil {
+		return nil, fmt.Errorf("读取主节点默认站点坐标: %w", err)
+	}
+	rows, err := store.QueryContext(ctx, `SELECT id, COALESCE(server_map_lat,0), COALESCE(server_map_lon,0) FROM nodes ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("读取节点站点坐标: %w", err)
+	}
+	defer rows.Close()
+	sites := make(map[int]models.ClusterNodeSite)
+	for rows.Next() {
+		var id int
+		var site models.ClusterNodeSite
+		if err := rows.Scan(&id, &site.ServerMapLat, &site.ServerMapLon); err != nil {
+			return nil, fmt.Errorf("扫描节点站点坐标: %w", err)
+		}
+		// 未单独配置的从节点继承主节点坐标；主节点也未配置时保持 0,0。
+		if site.ServerMapLat == 0 && site.ServerMapLon == 0 {
+			site.ServerMapLat = masterLat
+			site.ServerMapLon = masterLon
+		}
+		sites[id] = site
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return sites, nil
 }
 
 func (s *ClusterService) snapshotSecurityPolicies(ctx context.Context, store snapshotStore) (json.RawMessage, error) {
@@ -901,17 +934,7 @@ func (s *ClusterService) snapshotRules(ctx context.Context, store snapshotStore)
 	// 重建），同版本代码天然一致；滚动升级窗口内存量 NULL 行会引入一次性哈希
 	// 抖动（旧从端按 5 重建 vs 新主端按 2 导出）→ 触发一轮全量重拉，回放把值
 	// 物化为非 NULL 后自然收敛，无需额外迁移。
-	rows, err := store.QueryContext(ctx, `SELECT COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE(description,''), protocol, COALESCE(domain,''), listen_port,
-		COALESCE(strategy,'weighted_round_robin'), COALESCE(dynamic_dns,0), COALESCE(enable_dns_server,0), COALESCE(dns_server,''), COALESCE(dns_family,'ipv4'),
-		COALESCE(health_check_path,''), COALESCE(health_check_interval,10), COALESCE(health_check_timeout,2), COALESCE(health_check_unhealthy_threshold,3), COALESCE(health_check_healthy_threshold,2),
-		COALESCE(enable_active_health_check,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
-	COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0), COALESCE(host_header,''), COALESCE(health_check_host,''),
-		COALESCE(custom_routes_enabled,0),
-		COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
-		COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), COALESCE(tls_cert,''), COALESCE(tls_key,''),
-		COALESCE(tls_http_redirect,0), COALESCE(enable_compress,0), COALESCE(compress_types,'gzip'), IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0), COALESCE(created_by,0), COALESCE(updated_by,0), created_at, updated_at,
-		COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)
-		FROM lb_rules ORDER BY caddy_id`)
+	rows, err := store.QueryContext(ctx, lbRuleSnapshotSelectSQL())
 	if err != nil {
 		return nil, fmt.Errorf("读取快照规则: %w", err)
 	}
@@ -929,15 +952,18 @@ func (s *ClusterService) snapshotRules(ctx context.Context, store snapshotStore)
 	rules := make([]models.LbRule, 0)
 	for rows.Next() {
 		var rule models.LbRule
+		// 扫描序=规范序（lbRuleColumnSpecs，与写侧 INSERT 列清单同源）。
 		if err := rows.Scan(&rule.ID, &rule.CaddyID, &rule.Name, &rule.Description, &rule.Protocol, &rule.Domain, &rule.ListenPort,
 			&rule.Strategy, &rule.DynamicDNS, &rule.EnableDnsServer, &rule.DnsServer, &rule.DnsFamily,
 			&rule.HealthCheckPath, &rule.HealthCheckInterval, &rule.HealthCheckTimeout, &rule.HealthCheckUnhealthyThreshold, &rule.HealthCheckHealthyThreshold,
 			&rule.EnableActiveHealthCheck, &rule.TCPHealthCheckPort, &rule.TCPProxyProtocol, &rule.TCPTryDuration, &rule.TCPTryInterval,
-			&rule.RequestBodyMaxSizeMB, &rule.UpstreamKeepaliveTimeout, &rule.ServerTokensHidden, &rule.NTLMCompatible, &rule.UpstreamForceHTTP1, &rule.HostHeader, &rule.HealthCheckHost,
+			&rule.RequestBodyMaxSizeMB, &rule.UpstreamKeepaliveTimeout, &rule.ServerTokensHidden, &rule.NTLMCompatible, &rule.UpstreamForceHTTP1,
 			&rule.CustomRoutesEnabled,
 			&rule.ProxyDialTimeout, &rule.ProxyResponseHeaderTimeout, &rule.ProxyReadTimeout, &rule.ProxyWriteTimeout, &rule.ProxyStreamTimeout, &rule.ProxyFlushInterval, &rule.ProxyStreamCloseDelay,
+			&rule.HostHeader, &rule.HealthCheckHost,
 			&rule.EnableTLS, &rule.TLSSource, &rule.ACMEConfigID, &rule.CAProviderID, &rule.TLSCert, &rule.TLSKey,
-			&rule.TLSHTTPRedirect, &rule.EnableCompress, &rule.CompressTypes, &rule.Enabled, &rule.LogEnabled, &rule.CreatedBy, &rule.UpdatedBy, &rule.CreatedAt, &rule.UpdatedAt,
+			&rule.TLSHTTPRedirect, &rule.EnableCompress, &rule.CompressTypes, &rule.Enabled, &rule.LogEnabled,
+			&rule.CreatedBy, &rule.CreatedAt, &rule.UpdatedAt, &rule.UpdatedBy,
 			&rule.BlockPageStage1ID, &rule.BlockPageStage1Status, &rule.BlockPageStage3ID, &rule.BlockPageStage3Status); err != nil {
 			return nil, fmt.Errorf("扫描快照规则: %w", err)
 		}

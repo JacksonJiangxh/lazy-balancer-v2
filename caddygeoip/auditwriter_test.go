@@ -1205,7 +1205,7 @@ func TestAuditTimingRegistry_sweep(t *testing.T) {
 	seedAuditTimingEntryForTest(stale, time.Now().Add(-time.Hour))
 
 	for i := range 128 { // 跨过 sweep 周期（64）多批
-		auditTimingRecord(fmt.Sprintf("bbbbbbbbbbbbbb%03d", i), "pre", int64(i))
+		auditTimingRecord(fmt.Sprintf("bbbbbbbbbbbb%04x", i), "pre", int64(i))
 	}
 
 	auditTimingMu.Lock()
@@ -1265,11 +1265,11 @@ func TestAuditTimingRegistry_sweepCostIsIncremental(t *testing.T) {
 	const expired = 100
 	base := time.Now().Add(-2 * time.Hour)
 	for i := range expired {
-		seedAuditTimingEntryForTest(fmt.Sprintf("expired-%04d", i), base)
+		seedAuditTimingEntryForTest(fmt.Sprintf("%016x", i), base)
 	}
 	const fresh = 5000
 	for i := range fresh {
-		auditTimingRecord(fmt.Sprintf("fresh-%04d", i), "pre", 0)
+		auditTimingRecord(fmt.Sprintf("%016x", 0x10000+i), "pre", 0)
 	}
 
 	auditTimingMu.Lock()
@@ -1433,4 +1433,60 @@ func TestAuditPipelineRelease_doesNotHoldRegistryLockWhileDraining(t *testing.T)
 	}
 	close(p.done) // 放行 release
 	<-released
+}
+
+// A86 历史问题（历史）：注册表条目硬上限——无 counter 路由时代理层校验
+// 之外的纵深（任何新 key 生产路径都不得让注册表无界增长）。满时拒绝新键，
+// 既有键的分段写入不受影响。
+func TestAuditTimingRegistry_entryCap(t *testing.T) {
+	useTestTimingRegistry(t)
+	origCap := auditTimingMaxEntries
+	auditTimingMaxEntries = 4
+	t.Cleanup(func() { auditTimingMaxEntries = origCap })
+
+	ids := []string{"0000000000000001", "0000000000000002", "0000000000000003", "0000000000000004"}
+	for _, id := range ids {
+		auditTimingRecord(id, timingSegmentPre, 1)
+	}
+	if got := len(auditTimingEntriesSnapshotForTest(t)); got != 4 {
+		t.Fatalf("cap=4 must admit 4 entries, got %d", got)
+	}
+
+	// 第 5 个新键被拒绝（注册表不增长）；既有键照常更新。
+	auditTimingRecord("0000000000000005", timingSegmentPre, 1)
+	if got := len(auditTimingEntriesSnapshotForTest(t)); got != 4 {
+		t.Fatalf("new key beyond cap must be dropped, got %d entries", got)
+	}
+	auditTimingRecord("0000000000000001", timingSegmentEnd, 2)
+	if snap := auditTimingLookupForTest(t, "0000000000000001"); !snap.endSet {
+		t.Fatal("existing entry must still accept segments at cap")
+	}
+
+	// 畸形形状：非 16-hex key 连单条都不得建（auditTimingRecord 自身纵深）。
+	auditTimingRecord("not-a-valid-id", timingSegmentPre, 1)
+	if snap := auditTimingLookupForTest(t, "not-a-valid-id"); snap.preSet {
+		t.Fatal("malformed id must be rejected at registry write")
+	}
+}
+
+// A86 历史问题：周期清扫——旧实现清扫仅由建条驱动（停流后过期条目永久驻留）。
+// 后台 sweeper 按周期弹出 TTL 过期条目，零建条流量下注册表也必须收敛。
+func TestAuditTimingRegistry_periodicSweep(t *testing.T) {
+	useTestTimingRegistry(t)
+	origInterval := auditTimingSweepInterval
+	auditTimingSweepInterval = 5 * time.Millisecond
+	t.Cleanup(func() { auditTimingSweepInterval = origInterval })
+
+	// 种入已过期条目（不经建条路径——建条驱动的清扫不触发）。
+	seedAuditTimingEntryForTest("00000000000000aa", time.Now().Add(-2*auditTimingEntryTTL))
+	startAuditTimingSweeperForTest()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := len(auditTimingEntriesSnapshotForTest(t)); got == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("expired entry must be reaped by the periodic sweeper without new traffic")
 }

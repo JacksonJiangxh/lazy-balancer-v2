@@ -181,6 +181,20 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	if err := replaceSnapshotTx(ctx, tx, snapshot, skip); err != nil {
 		return err
 	}
+	// 主节点为各从节点独立配置的大屏站点坐标：只取本地 registration_id 对应的
+	// 一项写入本机 global_config；不触碰其他节点，也不参与通用 global_config
+	// 同步列/触发器的版本传播（node-local 字段）。
+	if len(snapshot.NodeSites) > 0 {
+		var registrationID int
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(registration_id,0) FROM global_config WHERE id=1`).Scan(&registrationID); err != nil {
+			return fmt.Errorf("读取本节点注册编号: %w", err)
+		}
+		if site, ok := snapshot.NodeSites[registrationID]; ok {
+			if _, err := tx.ExecContext(ctx, `UPDATE global_config SET server_map_lat=?, server_map_lon=? WHERE id=1 AND COALESCE(is_master,1)=0`, site.ServerMapLat, site.ServerMapLon); err != nil {
+				return fmt.Errorf("应用本节点站点坐标: %w", err)
+			}
+		}
+	}
 	// 历史问题 A-N5：证书文件轴（删旧+写新）与 cert_jobs 替换同门于 rules 开关——
 	// 开关关闭时从节点本地 acme_dns 规则保留，其证书行/文件不得按主节点快照删改。
 	// F-历史问题-01：证书轴差异（删/增/内容变更）是末段条件重载的强制信号——证书
@@ -265,6 +279,21 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 		if ferr == nil {
 			WafFileLock().Lock()
 			crsChanged, xdbChanged, threatChanged, aerr = ApplyWafFileBundle(bundle)
+			if aerr == nil {
+				// A86 收口（SecurityEngine 域移交）：主端删除威胁源后，从端
+				// 残留 threat-<source>.iplist.fast 会让 wafFilesRefDiffers /
+				// wafFilesDrifted 恒判漂移——每轮全量重拉却永不删除，且
+				// 全量重拉永不收敛。应用成功后按主端引用集合真实收敛本地
+				// 文件集（删除失败留下警告，下轮漂移判定重试；方向安全）。
+				pruned, pruneErr := pruneSyncedThreatFiles(snapshot.WafFiles)
+				if pruneErr != nil {
+					Logf("warn", "同步安全数据：威胁库残留文件清理失败（下轮漂移重试）: %v", pruneErr)
+				}
+				if len(pruned) > 0 {
+					threatChanged = true
+					Logf("info", "同步安全数据：清理主端已删除威胁源的本地残留文件: %s", strings.Join(pruned, "、"))
+				}
+			}
 			WafFileLock().Unlock()
 		}
 		if ferr != nil {
@@ -408,6 +437,55 @@ func wafBundleSyncDetail(bundle *WafFileBundle, crsChanged, xdbChanged bool) str
 	// 2026-09-18 用户裁定:明确数据来源语义——从节点不自动升级,规则库变更唯
 	// 一来源是主节点同步
 	return "从主节点同步：" + crsPart + "；" + xdbPart
+}
+
+// pruneSyncedThreatFiles 按主端引用集合收敛本地威胁库文件（A86 收口，
+// SecurityEngine 域移交的「从端 ApplyWafFileBundle 不删多余 .fast」半项）。
+// 主端删除威胁源后，从端残留 threat-<source>.iplist.fast 会让
+// wafFilesRefDiffers（len 不等/逐源不符）与 wafFilesDrifted（本地 ref 含
+// 残留源）恒判漂移，每轮全量重拉却永不删除——收敛必须显式删除。
+//
+// 删除范围=白名单源名（与 scanThreatFastFiles 同口径：白名单外文件不参与
+// ref/漂移比对，同步不管辖）且不在 ref.ThreatSha256s 的 .fast 及其 .iplist
+// 文本伴生文件；ref 为 nil 时不动（主端无任何 WAF 组件——S历史问题 裁定：nullRef
+// 豁免重拉，也无从判定删除集合）。
+//
+// 调用方必须已持 WafFileLock（与 CRS/威胁库更新器、lbbak 导入串行）。
+// 逐文件删除失败不中断（错误聚合返回，下轮漂移判定会重试）；返回至少删除
+// 了一个文件的源名列表。
+func pruneSyncedThreatFiles(ref *models.ClusterWafFilesRef) ([]string, error) {
+	if ref == nil {
+		return nil, nil
+	}
+	matches, err := filepath.Glob(filepath.Join(wafDir, "threat-*.iplist.fast"))
+	if err != nil {
+		return nil, fmt.Errorf("扫描本地威胁库文件: %w", err)
+	}
+	pruned := make([]string, 0)
+	var errs []error
+	for _, fastPath := range matches {
+		source := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(fastPath), "threat-"), ".iplist.fast")
+		if source == "" || !validThreatFileName(source) {
+			continue
+		}
+		if _, kept := ref.ThreatSha256s[source]; kept {
+			continue
+		}
+		removed := false
+		for _, path := range []string{fastPath, filepath.Join(wafDir, "threat-"+source+".iplist")} {
+			if err := os.Remove(path); err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					errs = append(errs, fmt.Errorf("删除威胁库 %s: %w", source, err))
+				}
+				continue
+			}
+			removed = true
+		}
+		if removed {
+			pruned = append(pruned, source)
+		}
+	}
+	return pruned, errors.Join(errs...)
 }
 
 func (s *SyncService) restoreSnapshotArtifacts(previous, current models.ClusterSnapshot) error {
@@ -1154,6 +1232,10 @@ func validateSnapshotACMEState(snapshot models.ClusterSnapshot) error {
 }
 
 func insertSnapshotRules(ctx context.Context, tx *sql.Tx, rules []models.LbRule) error {
+	// A86 历史问题：INSERT 列清单与值投影走唯一事实源（rule_write_columns.go），
+	// 全量列（含 id 与审计四列）——从端镜像必须保留主端主键与审计值。
+	columns := LbRuleInsertColumns()
+	statement := LbRuleInsertSQL(columns)
 	for _, rule := range rules {
 		// 传输归一（单一事实源，2026-10-11）：与主端 snapshotRules 导出共用
 		// normalizeRuleForTransport（body 钳制[历史问题 C-F1]/TCP+TLS 死形态[历史问题 A-N1]/
@@ -1161,8 +1243,7 @@ func insertSnapshotRules(ctx context.Context, tx *sql.Tx, rules []models.LbRule)
 		// 节哈希主从相等的不变量基础。历史两处平行手写块改一侧漏另一侧即
 		// 本次「分区滞后」永不自愈事故的根因。
 		normalizeRuleForTransport(&rule)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO lb_rules (id,caddy_id,name,description,protocol,domain,listen_port,strategy,dynamic_dns,enable_dns_server,dns_server,dns_family,health_check_path,health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold,enable_active_health_check,tcp_health_check_port,tcp_proxy_protocol,tcp_try_duration,tcp_try_interval,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden,ntlm_compatible,upstream_force_http1,custom_routes_enabled,proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,host_header,health_check_host,enable_tls,tls_source,acme_config_id,ca_provider_id,tls_cert,tls_key,tls_http_redirect,enable_compress,compress_types,enabled,log_enabled,created_by,created_at,updated_at,updated_by,block_page_stage1_id,block_page_stage1_status,block_page_stage3_id,block_page_stage3_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			rule.ID, rule.CaddyID, rule.Name, rule.Description, rule.Protocol, rule.Domain, rule.ListenPort, rule.Strategy, rule.DynamicDNS, rule.EnableDnsServer, rule.DnsServer, rule.DnsFamily, rule.HealthCheckPath, rule.HealthCheckInterval, rule.HealthCheckTimeout, rule.HealthCheckUnhealthyThreshold, rule.HealthCheckHealthyThreshold, rule.EnableActiveHealthCheck, rule.TCPHealthCheckPort, rule.TCPProxyProtocol, rule.TCPTryDuration, rule.TCPTryInterval, rule.RequestBodyMaxSizeMB, rule.UpstreamKeepaliveTimeout, rule.ServerTokensHidden, rule.NTLMCompatible, rule.UpstreamForceHTTP1, rule.CustomRoutesEnabled, rule.ProxyDialTimeout, rule.ProxyResponseHeaderTimeout, rule.ProxyReadTimeout, rule.ProxyWriteTimeout, rule.ProxyStreamTimeout, rule.ProxyFlushInterval, rule.ProxyStreamCloseDelay, rule.HostHeader, rule.HealthCheckHost, rule.EnableTLS, rule.TLSSource, rule.ACMEConfigID, rule.CAProviderID, rule.TLSCert, rule.TLSKey, rule.TLSHTTPRedirect, rule.EnableCompress, rule.CompressTypes, rule.Enabled, rule.LogEnabled, rule.CreatedBy, rule.CreatedAt, rule.UpdatedAt, rule.UpdatedBy, rule.BlockPageStage1ID, rule.BlockPageStage1Status, rule.BlockPageStage3ID, rule.BlockPageStage3Status); err != nil {
+		if _, err := tx.ExecContext(ctx, statement, LbRuleInsertArgs(&rule, columns)...); err != nil {
 			return fmt.Errorf("写入快照规则 %s: %w", rule.CaddyID, err)
 		}
 		for _, upstream := range rule.Upstreams {

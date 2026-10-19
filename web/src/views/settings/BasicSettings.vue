@@ -318,7 +318,7 @@
               </li>
             </ul>
             <!-- 历史问题-历史问题：空分类选择不再拼出「将仅覆盖所选分类：，」残句 -->
-            <div v-if="importValidation.type !== 'v1'" class="info-note-bar import-alert"><span class="info-note-desc">{{ importSections.length === BACKUP_SECTIONS.length ? '导入将覆盖当前全部配置（规则、用户、密钥、证书任务）' : importSections.length > 0 ? `将仅覆盖所选分类：${importSections.map((k) => BACKUP_SECTIONS.find((s) => s.key === k)?.label || k).join('、')}，未选分类保持现状` : '未选择导入分类——本次导入不会覆盖任何数据（请至少选择一个分类）' }}</span></div>
+            <div v-if="importValidation.type !== 'v1'" class="info-note-bar import-alert"><span class="info-note-desc">{{ importSections.length === BACKUP_SECTIONS.length ? '导入将覆盖当前全部配置（规则、用户、密钥、证书任务、节点拓扑）' : importSections.length > 0 ? `将仅覆盖所选分类：${importSections.map((k) => BACKUP_SECTIONS.find((s) => s.key === k)?.label || k).join('、')}，未选分类保持现状` : '未选择导入分类——本次导入不会覆盖任何数据（请至少选择一个分类）' }}</span></div>
             <div v-else class="info-note-bar" style="margin-top: 4px"><span class="info-note-desc">仅导入负载均衡规则，其他数据不受影响</span></div>
           </template>
         </div>
@@ -345,7 +345,7 @@
         <el-button text size="small" @click="exportSections = []">全不选</el-button>
         <el-button text size="small" @click="exportSections = BACKUP_SECTIONS.map((s) => s.key)">全选</el-button>
       </div>
-      <div class="info-note-bar" style="margin-top: 8px"><span class="info-note-desc">导出为 .lbbak 备份包（勾选「安全防护」时含 CRS/IP2Region 规则库文件）；包含凭证与证书材料，请加密保管</span></div>
+      <div class="info-note-bar" style="margin-top: 8px"><span class="info-note-desc">导出为 .lbbak 备份包（勾选「安全防护」时含 CRS/IP2Region 规则库文件；勾选「节点拓扑」时含从节点列表与站点坐标，含节点令牌哈希）；包含凭证与证书材料，请加密保管</span></div>
       <template #footer>
         <el-button @click="exportDialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="exporting" :disabled="exportSections.length === 0" @click="exportBackup">
@@ -552,12 +552,13 @@ watch(appLogAutoRefresh, (enabled) => {
 // FE-6（历史）：onUnmounted 生命周期收尾移至 disposed/tlsProtocolFallbackTimer
 // 声明之后（见下方 TLS 段尾），消除「引用其后声明的 let」的脆弱形态。
 
-// 三分类合并(2026-09-19 用户裁定):备份分类收敛为 3 类,与集群同步节同构
+// 备份分类(2026-09-19 三分类合并；本轮新增节点拓扑):与集群同步节同构
 // ——全局配置并入「系统数据」、规则库并入「安全防护」。默认全选。
 const BACKUP_SECTIONS = [
   { key: 'users', label: '系统数据' },
   { key: 'rules', label: '负载规则' },
   { key: 'security', label: '安全防护' },
+  { key: 'cluster', label: '节点拓扑' },
 ] as const
 
 // legacy 分类键归一(与后端 normalizeBackupSectionKeys 同映射):升级前保存的
@@ -947,6 +948,7 @@ const summaryLabels: Record<string, string> = {
   tls_rules: '其中 TLS 规则',
   security_crs_version: 'CRS 版本',
   security_ip2region_version: 'IP2Region 版本',
+  nodes: '节点拓扑',
 }
 
 const conflictIdentifier = (conflict: { name?: string; caddy_id?: string }): string => conflict.name || conflict.caddy_id || '未命名规则'

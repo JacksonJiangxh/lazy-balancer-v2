@@ -273,7 +273,8 @@ func threatDueSources(trigger string) ([]threatSourceRow, error) {
 func threatListEmpty(source string) bool {
 	// 历史问题：.iplist 或 .fast 任一缺失都视为未装载——fast 是运行消费面，
 	// 只补文本不补 fast 会让新从节点/崩溃窗口永远缺加速文件。
-	return threatIplistMissing(source) || threatFastMissing(source)
+	// A86 历史问题：.fast 存在但损坏同样视为未装载（可读性校验，stat 不算数）。
+	return threatIplistMissing(source) || threatFastUnusable(source)
 }
 
 func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
@@ -538,11 +539,12 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 	}
 	AppendThreatUpdateLog("INFO", "downloading", fmt.Sprintf("下载 %s（%s）", source.name, source.url))
 
-	// 历史问题：fast-only 缺失（文本仍在）优先从现有文本重建，不依赖重新下载。
+	// 历史问题：fast 不可用（缺失/损坏，A86 历史问题）而文本仍在时优先从现有
+	// 文本重建，不依赖重新下载。
 	var entries []string
 	var rawHash string
 	healed := false
-	if threatIplistMissing(source.name) == false && threatFastMissing(source.name) {
+	if !threatIplistMissing(source.name) && threatFastUnusable(source.name) {
 		if e, _, ok := healThreatFastFromText(source.name); ok {
 			// heal 的文本 sha256 不是上游原始字节哈希：留空使慢路径不写
 			// raw_hash，保留上次真实下载哈希（历史问题-02）。
@@ -594,10 +596,11 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 			// 历史问题：存在性判定失败不得按「存在」跳过（名单可能已缺失，
 			// 跳过快照=拦截面静默为空）——记错并继续完整聚合/写库路径。
 			Logf("error", "威胁情报库: 检查源 %s 内置名单存在性失败: %v", source.name, err)
-		case listExists > 0 && threatFilesMissing(source.name):
-			// RDB 文件化升级引导：名单行在但 .iplist 缺失（v2.3.3 升级、
-			// 内容未变形态）——穿透快速路径照常写盘，否则文件永不落地。
-			Logf("info", "威胁情报库: 源 %s 原始哈希一致但 .iplist 文件缺失，执行落盘（升级引导）", source.name)
+		case listExists > 0 && threatFilesUnusable(source.name):
+			// RDB 文件化升级引导 + A86 历史问题：名单行在但 .iplist 缺失或 .fast
+			// 缺失/损坏（v2.3.3 升级、带外损坏形态）——穿透快速路径照常写盘/
+			// 重编译，否则文件永不落地/损坏永不修复。
+			Logf("info", "威胁情报库: 源 %s 原始哈希一致但名单文件不可用（缺失/损坏），执行落盘修复", source.name)
 		case listExists > 0:
 			AppendThreatUpdateLog("INFO", "unchanged", fmt.Sprintf("源 %s 名单内容未变化（原始内容哈希一致），跳过解析写入", source.name))
 			// 历史问题：内容未变化不得用本次原始解析条数覆盖源行（源行口径=
@@ -708,8 +711,9 @@ func writeThreatSystemList(source string, entries []string) (bool, error) {
 		return false, fmt.Errorf("读源哈希失败: %w", err)
 	}
 	// RDB 文件化：文件缺失时哈希命中不得跳过（升级引导——v2.3.3 升上来
-	// 内容未变，但 .iplist/.fast 尚未落地，须照常写盘）。
-	if listExists > 0 && storedHash == hash && storedHash != "" && !threatFilesMissing(source) {
+	// 内容未变，但 .iplist/.fast 尚未落地，须照常写盘）。A86 历史问题：.fast
+	// 存在但损坏同样不得跳过——照常写盘完成重编译修复。
+	if listExists > 0 && storedHash == hash && storedHash != "" && !threatFilesUnusable(source) {
 		return false, nil
 	}
 	// RDB 文件化：条目写 .iplist 文件 + 编译 .fast，DB entries 恒空
@@ -849,15 +853,25 @@ func threatIplistMissing(source string) bool {
 	return err != nil
 }
 
-// threatFastMissing 报告源的 .fast 加速文件是否缺失。
-func threatFastMissing(source string) bool {
-	_, err := os.Stat(filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist.fast", source)))
-	return err != nil
+// threatFastUnusable 报告源的 .fast 加速文件是否不可用：缺失（stat 失败）
+// 或存在但损坏/不可读（A86 历史问题，历史——旧口径只 stat，损坏文件
+// 会让哈希快路径永久跳过修复、引用策略在渲染层被整体跳过）。可读性校验
+// 用 ReadFastFile 全量判定（magic/flags/尺寸/bits/掩码/序/不相交）。
+func threatFastUnusable(source string) bool {
+	fastPath := filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist.fast", source))
+	if _, err := os.Stat(fastPath); err != nil {
+		return true
+	}
+	if _, err := wafiplist.ReadFastFile(fastPath); err != nil {
+		Logf("warn", "威胁情报库: 源 %s .fast 存在但读取/校验失败（按不可用处理，触发修复）: %v", source, err)
+		return true
+	}
+	return false
 }
 
-// threatFilesMissing .iplist 或 .fast 任一缺失。
-func threatFilesMissing(source string) bool {
-	return threatIplistMissing(source) || threatFastMissing(source)
+// threatFilesUnusable .iplist 缺失或 .fast 不可用（缺失/损坏）。
+func threatFilesUnusable(source string) bool {
+	return threatIplistMissing(source) || threatFastUnusable(source)
 }
 
 // healThreatFastFromText 从现有 .iplist 文本重建 .fast（历史问题：不依赖
@@ -888,7 +902,7 @@ func healThreatFastFromText(source string) ([]string, string, bool) {
 		return nil, "", false
 	}
 	sum := fmt.Sprintf("%x", sha256.Sum256(data))
-	AppendThreatUpdateLog("INFO", "healed", fmt.Sprintf("源 %s .fast 缺失，已从现有文本重建（未重新下载）", source))
+	AppendThreatUpdateLog("INFO", "healed", fmt.Sprintf("源 %s .fast 缺失/损坏，已从现有文本重建（未重新下载）", source))
 	return entries, sum, true
 }
 

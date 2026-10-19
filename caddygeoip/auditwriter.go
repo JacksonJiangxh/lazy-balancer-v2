@@ -91,6 +91,15 @@ var (
 	// auditTimingEntryTTL 注册表条目存活上限：条目由周期性清扫回收（消费不删——
 	// 同一请求可产多条审计行[预检+策略引擎]，共享同一注册表条目）。
 	auditTimingEntryTTL = 30 * time.Second
+	// auditTimingMaxEntries 注册表条目硬上限（A86 历史问题，历史）：计时 ID
+	// 形态校验之外的第二道内存 DoS 防线——任何新键生产路径（含未来写点）都不
+	// 得让注册表无界增长。100k 条目 ≈ 30s TTL × ~3.3k RPS 的合法上限，内存
+	// 约 15MB；满时拒绝新键（该请求不计耗时，静默降级），既有键照常写入。
+	auditTimingMaxEntries = 100_000
+	// auditTimingSweepInterval 周期清扫间隔（A86 历史问题）：旧实现清扫仅由建条
+	// 驱动（每 64 次建条一次），停流后过期条目永久驻留；后台 sweeper 按本
+	// 周期兜底回收，零流量下注册表同样收敛。
+	auditTimingSweepInterval = 10 * time.Second
 )
 
 // —— per-request 计时注册表 ——
@@ -154,21 +163,30 @@ var (
 )
 
 // auditTimingRecord 写入一个分段计时（µs）。id 为空（计时 ID 生成失败的降级
-// 形态）静默忽略——耗时是增强信息，不产生请求路径错误。
+// 形态）或形态非法（A86 历史问题 纵深：非 16-hex 不得建条——头值客户端可控）
+// 静默忽略——耗时是增强信息，不产生请求路径错误。
+// 条目硬上限：注册表满时拒绝新键（该请求不计耗时），既有键照常更新。
 func auditTimingRecord(id, segment string, us int64) {
-	if id == "" {
+	if id == "" || !isValidSecurityTimingID(id) {
 		return
 	}
 	now := time.Now()
 	auditTimingMu.Lock()
 	e := auditTimingEntries[id]
 	if e == nil {
+		if len(auditTimingEntries) >= auditTimingMaxEntries {
+			auditTimingMu.Unlock()
+			return
+		}
 		e = &auditTimingEntry{created: now}
 		auditTimingEntries[id] = e
 		auditTimingOrder = append(auditTimingOrder, auditTimingQueueEntry{id: id, created: now})
 		auditTimingSweepIfDueLocked(now)
 	}
 	auditTimingMu.Unlock()
+	// A86 历史问题：首个条目创建时启动周期 sweeper（进程级单例，注册表本身即
+	// 包级生命周期）——停流后过期条目也由周期清扫回收，不再仅依赖建条驱动。
+	startAuditTimingSweeperForTest()
 	e.mu.Lock()
 	switch segment {
 	case "pre":
@@ -177,6 +195,34 @@ func auditTimingRecord(id, segment string, us int64) {
 		e.endUs, e.endSet = us, true
 	}
 	e.mu.Unlock()
+}
+
+// auditTimingSweeperOnce 保证周期 sweeper 进程内单例（Caddy reload 不复制）。
+var auditTimingSweeperOnce sync.Once
+
+// startAuditTimingSweeperForTest 启动周期清扫 goroutine（幂等；命名带
+// ForTest 后缀以便测试直接触发启动而不必先建条）。每周期从 FIFO 队首弹出
+// TTL 过期条目并压缩已弹出前缀，成本与过期条目数成正比。
+func startAuditTimingSweeperForTest() {
+	auditTimingSweeperOnce.Do(func() {
+		go func() {
+			// 50ms 量子累加而非一次睡满整周期：测试收窄 auditTimingSweepInterval
+			// 后下个量子即生效（一次睡满会让测试竞速 10s 默认周期）。
+			const tick = 50 * time.Millisecond
+			elapsed := time.Duration(0)
+			for {
+				time.Sleep(tick)
+				elapsed += tick
+				if elapsed < auditTimingSweepInterval {
+					continue
+				}
+				elapsed = 0
+				auditTimingMu.Lock()
+				auditTimingSweepLocked(time.Now())
+				auditTimingMu.Unlock()
+			}
+		}()
+	})
 }
 
 // auditTimingClose 标记该请求的全部分段已写完（终态）。由链最外层收点

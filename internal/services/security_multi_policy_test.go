@@ -2,6 +2,7 @@ package services
 
 import (
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -124,5 +125,36 @@ func TestGetSecurityPoliciesForRule_SingleBindingMatchesLegacy(t *testing.T) {
 		first.BlockStatusCode != legacy.BlockStatusCode {
 		t.Fatalf("single-binding mismatch: list[0] = {id:%d name:%q mode:%q}, legacy = {id:%d name:%q mode:%q}",
 			first.ID, first.Name, first.Mode, legacy.ID, legacy.Name, legacy.Mode)
+	}
+}
+
+// A86 历史问题（历史）：GetSecurityPoliciesForRule 不得在 rows 未关闭时
+// 嵌套查询（scanSecurityPolicyByID/resolvePolicyIPListRefs）——连接池耗尽即
+// 永久阻塞（无 context 超时）。单连接池（SetMaxOpenConns(1)）下旧实现必然
+// 自锁；修复后先收集 policy_id、关闭 rows、再逐条加载，单连接即可跑通。
+func TestGetSecurityPoliciesForRule_singleConnectionPool(t *testing.T) {
+	mpInitDB(t)
+	idA := mpSeedPolicy(t, "policy-pool-a", 1)
+	idB := mpSeedPolicy(t, "policy-pool-b", 1)
+	mpBindRule(t, "lb_mp_pool", idB)
+	mpBindRule(t, "lb_mp_pool", idA)
+
+	db.DB.SetMaxOpenConns(1)
+
+	type result struct {
+		count int
+	}
+	done := make(chan result, 1)
+	go func() {
+		policies := GetSecurityPoliciesForRule("lb_mp_pool")
+		done <- result{count: len(policies)}
+	}()
+	select {
+	case r := <-done:
+		if r.count != 2 {
+			t.Fatalf("want 2 policies, got %d", r.count)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("连接池=1 下调用挂死：rows 打开期间的嵌套查询在等待第二个连接（连接池死锁形态）")
 	}
 }

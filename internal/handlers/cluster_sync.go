@@ -124,6 +124,9 @@ func (h *Handlers) ForgetClusterPins(c *gin.Context) {
 // 删除对应 pin 文件（内存缓存一并失效），下次服务控制按从节点当前证书重新钉扎。
 // 仅主节点管理员可达（requireMaster + admin 路由组），操作留审计。
 func (h *Handlers) ForgetClusterNodePin(c *gin.Context) {
+	if rejectNodeWriteDuringImport(c) {
+		return
+	}
 	if !h.requireMaster(c) {
 		return
 	}
@@ -137,6 +140,8 @@ func (h *Handlers) ForgetClusterNodePin(c *gin.Context) {
 		status := http.StatusInternalServerError
 		switch {
 		case errors.Is(err, services.ErrNotMasterNode):
+			// A86 历史问题：降级竞态 403 与 requireMaster 门同源带头（保留失败审计）。
+			c.Header("X-LB-Error-Code", masterRequiredErrorCode)
 			status = http.StatusForbidden
 		case errors.Is(err, services.ErrNodeNotFound):
 			status = http.StatusNotFound

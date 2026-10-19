@@ -59,6 +59,9 @@ func scanSecurityPolicyByID(policyID int) *models.SecurityPolicy {
 
 // GetSecurityPoliciesForRule returns all enabled policies bound to a rule,
 // ordered by policy_id ASC (历史问题 v2.2.0 multi-policy binding).
+// A86 历史问题（历史）：先收集 policy_id 并关闭 rows，再做逐条策略
+// 加载与引用解析——旧实现在 rows 打开期间嵌套 QueryRow/批量查询，db.DB
+// 连接池（上限 10）打满即互相等待永久阻塞（无 context 超时）。
 func GetSecurityPoliciesForRule(ruleCaddyID string) []*models.SecurityPolicy {
 	if db.DB == nil {
 		return nil
@@ -68,22 +71,28 @@ func GetSecurityPoliciesForRule(ruleCaddyID string) []*models.SecurityPolicy {
 		Logf("error", "GetSecurityPoliciesForRule: 查询规则 %s 的安全策略绑定失败: %v", ruleCaddyID, err)
 		return nil
 	}
-	defer rows.Close()
-	var policies []*models.SecurityPolicy
+	var policyIDs []int
 	for rows.Next() {
 		var policyID int
 		if err := rows.Scan(&policyID); err != nil {
+			rows.Close()
 			Logf("error", "GetSecurityPoliciesForRule: 扫描规则 %s 的安全策略绑定行失败: %v", ruleCaddyID, err)
 			return nil
 		}
+		policyIDs = append(policyIDs, policyID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		Logf("error", "GetSecurityPoliciesForRule: 迭代规则 %s 的安全策略绑定失败: %v", ruleCaddyID, err)
+		return nil
+	}
+	rows.Close()
+	var policies []*models.SecurityPolicy
+	for _, policyID := range policyIDs {
 		// 禁用策略在策略查询处过滤（与单查的 WHERE enabled=1 同口径）。
 		if p := scanSecurityPolicyByID(policyID); p != nil {
 			policies = append(policies, p)
 		}
-	}
-	if err := rows.Err(); err != nil {
-		Logf("error", "GetSecurityPoliciesForRule: 迭代规则 %s 的安全策略绑定失败: %v", ruleCaddyID, err)
-		return nil
 	}
 	// 批次引用解析：跨全部已加载策略收集列表 id，一次批量查询（预算：与策略数
 	// 无关的常数一次），合并集附加到各策略的 Merged* 字段供发射端消费。

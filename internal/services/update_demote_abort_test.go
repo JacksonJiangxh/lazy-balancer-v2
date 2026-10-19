@@ -12,6 +12,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -486,4 +488,66 @@ func TestUpdateInstallEntryCancellationDoesNotWriteSuccess(t *testing.T) {
 			t.Fatalf("update_status=%q version=%q, want cancelled/v3.0.0（未安装不得写成功版本）", status, version)
 		}
 	})
+}
+
+// A86 历史问题（历史）：取消发生在树交换之后（重载阶段）时，交换段已把
+// security_crs_version.version 与 live VERSION 落为新 tag——旧 cancel 路径只
+// 还原文件树（restoreBackup）不回滚版本行/标记，留下「旧树+新版本号」并被
+// 下轮 tag==current「已是最新」短路永久固化（ReconcileCRSState 因 liveV==dbV
+// 也不修复）。修复：交换完成后观察到取消一律走 rollbackAfterReloadFailure
+// 同代回滚（树+VERSION 标记+DB 版本行，同一 wafFileMu 临界区）。
+func TestCRSUpdateRun_cancelDuringReloadRollsBackVersionRowAndMarker(t *testing.T) {
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.14.0", true)
+	writeTestFile(t, filepath.Join(m.crsDir, "rules", crsRulesProbeFile), "SecRule init")
+	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf"), "SecRule old")
+	writeTestFile(t, filepath.Join(m.crsDir, crsVersionFile), "v4.14.0\n")
+
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v4.15.0", nil }
+	m.downloadTarball = fakeCRSDownload(t, map[string]string{
+		"coreruleset-4.15.0/crs-setup.conf.example":     "# new setup",
+		"coreruleset-4.15.0/rules/" + crsRulesProbeFile: "# init probe\n",
+		"coreruleset-4.15.0/rules/REQUEST-NEW.conf":     "SecRule new\n",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// 重载期间用户取消（reloader 无 ctx 入参——取消只能在其返回后被观察到）。
+	m.reloader = func() error { cancel(); return nil }
+
+	done, err := m.StartUpdate("manual", &taskengine.RunContext{Ctx: ctx, Trigger: "manual"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("重载阶段取消后未退出")
+	}
+
+	if got := m.StatusSnapshot().Status; got != "cancelled" {
+		t.Fatalf("manager 终态=%q, want cancelled", got)
+	}
+	// 树必须回到更新前（cancel 的 restore 编舞）
+	data, err := os.ReadFile(filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf"))
+	if err != nil || string(data) != "SecRule old" {
+		t.Fatalf("rules 树未回滚: %q,%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(m.crsDir, "rules", "REQUEST-NEW.conf")); !os.IsNotExist(err) {
+		t.Fatal("新树残影 REQUEST-NEW.conf 不得留在 live")
+	}
+	// VERSION 标记与 DB 版本行必须与树同代回滚——不得停在 v4.15.0。
+	if got := readCRSVersionMarker(m.crsDir); got != "v4.14.0" {
+		t.Fatalf("VERSION 标记=%q, want v4.14.0（同代回滚，否则 liveV!=dbV 对账也不治）", got)
+	}
+	var version, status string
+	if err := db.DB.QueryRow(`SELECT version, COALESCE(update_status,'') FROM security_crs_version WHERE id=1`).Scan(&version, &status); err != nil {
+		t.Fatal(err)
+	}
+	if version != "v4.14.0" {
+		t.Fatalf("DB 版本行=%q, want v4.14.0（否则下轮被「已是最新」短路永久固化）", version)
+	}
+	if status != "cancelled" {
+		t.Fatalf("update_status=%q, want cancelled", status)
+	}
 }

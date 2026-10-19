@@ -143,6 +143,9 @@ func (h *Handlers) GetMetricsDashboard(c *gin.Context) {
 	for _, rule := range rules {
 		metrics := emptyRuleMetrics()
 		if rule.enabled && rule.protocol == "tcp" {
+			// A86 历史问题：TCP 口径=上游地址归集（caddy-l4 指标仅 upstream 标签，
+			// 见 tcpRuleMetrics 注释）——多规则共享上游地址时为跨规则合计值，
+			// Dashboard 请求数/处理中列 tooltip 已明示。
 			metrics = metricsIndex.tcpRuleMetrics(upstreamsByRule[rule.id])
 		} else if rule.enabled {
 			metrics = metricsIndex.ruleMetrics(ruleMetricTarget{ruleID: rule.id, domain: rule.domain, listenPort: rule.listenPort, enableTLS: rule.enableTLS})
@@ -198,6 +201,8 @@ func (h *Handlers) GetRuleMetrics(c *gin.Context) {
 		if parseErr == nil {
 			// F6(第 28.6 轮审计):TCP 规则无 lazybalancer 计数(L4 无插件)——
 			// blocked 恒 0,与 Dashboard 对该形态恒写 blocked 键对齐。
+			// A86 历史问题：本端点 TCP 指标同为上游地址口径（L4 指标仅 upstream
+			// 标签）——共享上游地址的多规则返回相同合计值，非规则独占计数。
 			metrics["blocked"] = int64(0)
 		}
 	} else {

@@ -870,6 +870,13 @@ func (index prometheusMetricsIndex) ruleMetrics(target ruleMetricTarget) gin.H {
 	return result.ruleMetrics(true)
 }
 
+// tcpRuleMetrics 按上游地址归集 TCP 单规则指标（A86 历史问题 口径声明）：
+// caddy-l4 v0.1.2 的 L4 指标（caddy_layer4_proxy_connections_total /
+// active_connections / upstream_healthy）标签仅 []string{"upstream"}
+// （模块源码 modules/l4proxy/metrics.go:57-75 实证）——无 server/listener/
+// rule 级标签，引擎层面无法按规则拆分。多条 TCP 规则共享同一上游地址时，
+// 各规则看到的该上游连接数相同（跨规则合计值），UI（Dashboard 规则表
+// 请求数/处理中列 tooltip）已向用户明示该口径；不硬造规则级标签。
 func (index prometheusMetricsIndex) tcpRuleMetrics(upstreams []models.Upstream) gin.H {
 	var result ruleMetricsAggregate
 	addresses := make(map[string]struct{}, len(upstreams))

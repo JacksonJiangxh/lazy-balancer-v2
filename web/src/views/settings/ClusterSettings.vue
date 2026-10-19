@@ -44,6 +44,7 @@
           @login="loginNode"
           @service-control="openServiceControlDialog"
           @edit-access-url="openAccessUrlDialog"
+          @edit-site="openSiteDialog"
         />
       </el-col>
     </el-row>
@@ -67,6 +68,7 @@
       @login="loginNode"
       @service-control="openServiceControlDialog"
       @edit-access-url="openAccessUrlDialog"
+      @edit-site="openSiteDialog"
     />
 
     <ClusterSlavePanel
@@ -88,6 +90,14 @@
       :saving="accessUrlSaving"
       @close="closeAccessUrlDialog"
       @save="updateAccessUrl"
+    />
+
+    <ClusterNodeSiteDialog
+      :visible="siteDialogVisible"
+      :node="editingSiteNode"
+      :saving="siteSaving"
+      @close="closeSiteDialog"
+      @save="updateNodeSite"
     />
 
     <el-dialog v-model="tokenDialogVisible" width="min(560px, 92vw)" :close-on-click-modal="false" class="register-token-dialog">
@@ -194,6 +204,7 @@ import type {
 } from '@/types'
 import ClusterMasterPanel from './cluster/ClusterMasterPanel.vue'
 import ClusterAccessUrlDialog from './cluster/ClusterAccessUrlDialog.vue'
+import ClusterNodeSiteDialog from './cluster/ClusterNodeSiteDialog.vue'
 import ClusterModeCard from './cluster/ClusterModeCard.vue'
 import ClusterSlavePanel from './cluster/ClusterSlavePanel.vue'
 import ClusterStatusCard from './cluster/ClusterStatusCard.vue'
@@ -231,6 +242,9 @@ const loginNodeId = ref<number | null>(null)
 const accessUrlDialogVisible = ref(false)
 const editingAccessUrlNode = ref<ClusterNode | null>(null)
 const accessUrlSaving = ref(false)
+const siteDialogVisible = ref(false)
+const editingSiteNode = ref<ClusterNode | null>(null)
+const siteSaving = ref(false)
 const registrationRequest = ref(0)
 const tokenDialogVisible = ref(false)
 
@@ -674,6 +688,38 @@ const updateAccessUrl = async (accessUrl: string): Promise<void> => {
     console.error('Failed to update access url:', error)
   } finally {
     accessUrlSaving.value = false
+  }
+}
+
+const openSiteDialog = (node: ClusterNode): void => {
+  if (isReadOnlyProp.value || siteSaving.value) return
+  editingSiteNode.value = node
+  siteDialogVisible.value = true
+}
+
+const closeSiteDialog = (): void => {
+  if (siteSaving.value) return
+  siteDialogVisible.value = false
+  editingSiteNode.value = null
+}
+
+const updateNodeSite = async (coords: { lat: number; lon: number }): Promise<void> => {
+  const node = editingSiteNode.value
+  if (!node || isReadOnlyProp.value || siteSaving.value) return
+  siteSaving.value = true
+  try {
+    await request.put<ActionResponse>(`/cluster/nodes/${node.id}/site`, {
+      server_map_lat: coords.lat,
+      server_map_lon: coords.lon,
+    })
+    mfaAwareSuccess('节点站点坐标已保存，下一同步周期生效')
+    siteDialogVisible.value = false
+    editingSiteNode.value = null
+    await fetchNodes()
+  } catch (error: unknown) {
+    console.error('Failed to update node site coordinates:', error)
+  } finally {
+    siteSaving.value = false
   }
 }
 

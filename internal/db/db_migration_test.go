@@ -191,6 +191,101 @@ func TestRunMigrationsDropsLegacyTLSCertificatesAndNodeSyncColumnsIdempotently(t
 	}
 }
 
+func TestRunMigrationsNodesDeadColumnsPreservesServerMapCoordinates(t *testing.T) {
+	// Given 存量库：nodes 仍带 sync_enabled/sync_scope 死列（触发
+	// migrateNodesDeadColumns 整表重建），且节点已写入大屏坐标——
+	// 重建 DDL 必须携 server_map_lat/lon 并保值（Audit86 历史问题）。
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config) VALUES (1,'{}');
+		ALTER TABLE nodes ADD COLUMN sync_enabled BOOLEAN DEFAULT 1;
+		ALTER TABLE nodes ADD COLUMN sync_scope TEXT DEFAULT 'all';
+		INSERT INTO nodes (id,name,ip_address,port,status,sync_enabled,sync_scope,server_map_lat,server_map_lon)
+		VALUES (7,'mapped-node','10.0.0.7',9000,'online',1,'all',31.2304,121.4737);`); err != nil {
+		t.Fatalf("seed legacy schema with coordinates: %v", err)
+	}
+
+	// When
+	if err := runMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	// Then 死列已删、行存活、坐标保值。
+	var columnCount int
+	var lat, lon float64
+	if err := database.QueryRow("SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name IN ('sync_enabled','sync_scope')").Scan(&columnCount); err != nil {
+		t.Fatal(err)
+	}
+	if columnCount != 0 {
+		t.Fatalf("legacy columns=%d, want 0", columnCount)
+	}
+	if err := database.QueryRow("SELECT server_map_lat,server_map_lon FROM nodes WHERE id=7").Scan(&lat, &lon); err != nil {
+		t.Fatalf("coordinates must survive rebuild: %v", err)
+	}
+	if lat != 31.2304 || lon != 121.4737 {
+		t.Fatalf("rebuild lost coordinates: got (%v,%v), want (31.2304,121.4737)", lat, lon)
+	}
+
+	// And 幂等重跑不再触发重建，坐标不变。
+	if err := runMigrations(); err != nil {
+		t.Fatalf("repeat migrations: %v", err)
+	}
+	if err := database.QueryRow("SELECT server_map_lat,server_map_lon FROM nodes WHERE id=7").Scan(&lat, &lon); err != nil {
+		t.Fatal(err)
+	}
+	if lat != 31.2304 || lon != 121.4737 {
+		t.Fatalf("idempotent rerun changed coordinates: got (%v,%v)", lat, lon)
+	}
+}
+
+func TestRunMigrationsNodesDeadColumnsBackfillsCoordinatesOnPreCoordinateDB(t *testing.T) {
+	// Given 回归形状：坐标功能前的老库——nodes 无 server_map_lat/lon 且带死列。
+	// ensureNewColumns 先补列（默认 0），重建搬运后坐标为 0 而非列丢失。
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config) VALUES (1,'{}');
+		ALTER TABLE nodes ADD COLUMN sync_enabled BOOLEAN DEFAULT 1;
+		ALTER TABLE nodes ADD COLUMN sync_scope TEXT DEFAULT 'all';
+		INSERT INTO nodes (id,name,ip_address,port,status,sync_enabled,sync_scope)
+		VALUES (8,'old-node','10.0.0.8',9000,'online',1,'all');`); err != nil {
+		t.Fatalf("seed legacy schema: %v", err)
+	}
+	// 模拟坐标功能前时代：把两列去掉（通过重建出不带坐标的 nodes 表）。
+	if _, err := database.Exec(`CREATE TABLE nodes_pre_coord (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100) NOT NULL, mode VARCHAR(10) NOT NULL DEFAULT 'slave',
+		ip_address VARCHAR(45) NOT NULL, port INTEGER DEFAULT 8000, protocol VARCHAR(10) DEFAULT 'http', access_url VARCHAR(255) DEFAULT '',
+		is_approved BOOLEAN DEFAULT FALSE, sync_interval INTEGER DEFAULT 60, status VARCHAR(20) DEFAULT 'offline',
+		cluster_token_hash VARCHAR(64), registration_secret VARCHAR(64), registration_secret_expires_at DATETIME,
+		cluster_token_delivered BOOLEAN DEFAULT 0, reported_version INTEGER DEFAULT 0, health_json TEXT,
+		last_sync_at DATETIME, last_sync_error TEXT, last_seen DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		sync_enabled BOOLEAN DEFAULT 1, sync_scope TEXT DEFAULT 'all',
+		UNIQUE(ip_address, port));
+		INSERT INTO nodes_pre_coord (id,name,mode,ip_address,port,protocol,is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,sync_enabled,sync_scope)
+		SELECT id,name,mode,ip_address,port,protocol,is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,sync_enabled,sync_scope FROM nodes;
+		DROP TABLE nodes;
+		ALTER TABLE nodes_pre_coord RENAME TO nodes;`); err != nil {
+		t.Fatalf("simulate pre-coordinate nodes table: %v", err)
+	}
+
+	// When
+	if err := runMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	// Then 坐标列存在、行存活、值为默认 0。
+	var lat, lon float64
+	if err := database.QueryRow("SELECT server_map_lat,server_map_lon FROM nodes WHERE id=8").Scan(&lat, &lon); err != nil {
+		t.Fatalf("coordinate columns must exist after rebuild: %v", err)
+	}
+	if lat != 0 || lon != 0 {
+		t.Fatalf("pre-coordinate DB coordinates=(%v,%v), want backfilled (0,0)", lat, lon)
+	}
+}
+
 func TestRunMigrations_dropsDeadSecurityAndAdminTLSColumns(t *testing.T) {
 	// Given a schema that still carries the dead status_code / admin TLS columns
 	database := openMigrationTestDB(t)

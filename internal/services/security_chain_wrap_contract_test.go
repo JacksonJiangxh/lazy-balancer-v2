@@ -147,16 +147,17 @@ func TestBlockedCounterWrapContract_acrossAllRenderShapes(t *testing.T) {
 	}
 	assertBlockedCounterWrap(t, "lb_wrap4", "main", flattenRouteHandlers(t, mainRoute4))
 
-	// 形状 5：无策略规则——AUD-1 语义面处理器全不发射。lb_security_timing_end
-	// 例外放行：securityChain 由恒发射的 request_body 单独成链，timing_end 作为
-	// 收点随之恒发射——无 counter 即无 timing ID 头注入，该写点惰性（header
-	// 缺失静默跳过），不触碰注册表、无 drain 等待语义，不属包裹契约约束面。
+	// 形状 5：无策略规则——AUD-1 语义面处理器全不发射。A86 历史问题（历史
+	// 审计）起 lb_security_timing_end 也不再例外：无 counter 即无服务端
+	// timing ID 注入/覆盖，发射 timing_end 会让客户端伪造的计时头直进
+	// 进程内注册表（内存 DoS 面）——渲染层单点收口，无 counter 的路由
+	// 不发射任何计时写点。
 	_, database5 := newClusterTestService(t)
 	seedHTTPRuleForGeneration(t, database5, "lb_wrap5", "wrap5.example.test", 8080)
 	routes5, mainRoute5 := mpGenRoutes(t, database5, mpGenHTTPRule("lb_wrap5", "wrap5.example.test"))
 	for _, route := range append(routes5, mainRoute5) {
 		flat := flattenRouteHandlers(t, route)
-		for _, unwanted := range []string{"lb_security_blocked_counter", "waf", "lb_security_timing_pre", "rate_limit"} {
+		for _, unwanted := range []string{"lb_security_blocked_counter", "waf", "lb_security_timing_pre", "lb_security_timing_end", "rate_limit"} {
 			if indexOfHandler(flat, unwanted) >= 0 {
 				t.Fatalf("policy-less rule must not emit %s: %v", unwanted, flat)
 			}

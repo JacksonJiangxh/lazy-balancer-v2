@@ -46,8 +46,9 @@ test('历史问题-4：OIDC 保存门与响应落地都校验当前探测快照'
 test('历史问题-5：流量游标使用回退检测并在 visibility 恢复时归零', () => {
   const text = source('src/views/security/ThreatScreen.vue')
   assert.match(text, /flowSince = nextFlowCursor\(flowSince, data\)/)
-  const start = text.indexOf('function onVisibilityChange')
-  const end = text.indexOf('// 大屏流量采集租约', start)
+  // A86 历史问题 起 visible 恢复语义纳管在 screenLoop.onVisible（原 onVisibilityChange）。
+  const start = text.indexOf('onVisible: () => {')
+  const end = text.indexOf('\n})', start)
   assert.match(text.slice(start, end), /flowSince = 0/)
   assert.match(text, /flowCursorEpoch/)
   assert.match(text, /cursorEpoch !== flowCursorEpoch/)

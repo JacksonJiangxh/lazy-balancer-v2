@@ -83,3 +83,11 @@ export const weightPercent = (
   if (sum <= 0) return 0
   return Math.round(((row.weight || 0) / sum) * 100)
 }
+
+// payloadWeight（A86 D-3）：后端已废除 0→1 静默归一（weight<1 保存/导入均
+// 响亮 400）。草稿态禁用行权重被 participatingItems 写 0（上方变异契约），
+// 保存载荷边界为禁用行送 1——禁用行权重无业务意义（输入框禁用、百分比列
+// 恒显「禁用」），与既有库形态（禁用行历史落库均为 1）一致；启用行原样送出
+// （redistribute 保证 ≥1，异常 0 由后端 400 显性拦截）。
+export const payloadWeight = (item: { weight?: number; enabled?: boolean }): number =>
+  item.enabled === false ? 1 : (item.weight ?? 100)

@@ -250,8 +250,9 @@ func TestTaskEngineWire_PeriodicIntervalAndScheduledSlotPresent(t *testing.T) {
 	}
 	wantPeriodic := map[string]int{
 		"config-watchdog": 60, "log-cleanup": 86400, "audit-retention": 86400,
-		"security-events-retention": 86400, "cert-renewal-scan": 21600,
-		"cert-reconcile": 21600, "cert-manual-poll": 600, "cert-waiting-ca": 30,
+		"security-events-retention": 86400, "metrics-orphan-cleanup": 86400,
+		"cert-renewal-scan": 21600,
+		"cert-reconcile":    21600, "cert-manual-poll": 600, "cert-waiting-ca": 30,
 		"autoban": 60,
 	}
 	wantScheduled := map[string]bool{"threat": true, "crs": true, "ip2region": true, "crawlerbot-update": true, "auto-backup": true}
@@ -290,8 +291,8 @@ func TestTaskEngineWire_PeriodicIntervalAndScheduledSlotPresent(t *testing.T) {
 			t.Errorf("%s 非法 Kind %q", m.ID, m.Kind)
 		}
 	}
-	if seen != 18 {
-		t.Fatalf("注册任务总数=%d, want 18", seen)
+	if seen != 19 {
+		t.Fatalf("注册任务总数=%d, want 19", seen)
 	}
 }
 

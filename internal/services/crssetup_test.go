@@ -213,6 +213,8 @@ func TestRestoreBackup_restoreFailureKeepsOverridesBak(t *testing.T) {
 
 	// When the backup is restored
 	m.overridesBakCreated = true // 本运行已创建 bak（历史问题 1.1）：还原失败时保留 .bak
+	m.rulesBakCreated = true     // 本运行已创建 rules.bak（A86 历史问题 守卫）
+	m.setupBakCreated = true     // 本运行已创建 setup.bak（A86 历史问题 守卫）
 	m.restoreBackup()
 
 	// Then the failed overrides restore keeps the only recovery copy
@@ -316,6 +318,8 @@ func TestRestoreBackup_degenerateRulesBakSkipped(t *testing.T) {
 	writeTestFile(t, filepath.Join(m.crsDir, "crs-setup.conf"), "# clobbered")
 
 	// When 尝试还原备份
+	m.rulesBakCreated = true // 本运行已创建 rules.bak（A86 历史问题 守卫——守卫之后仍由退化门拦截）
+	m.setupBakCreated = true // 本运行已创建 setup.bak
 	m.restoreBackup()
 
 	// Then live 规则树未被退化 bak 替换，退化 bak 留在原地（未消费）
@@ -350,6 +354,7 @@ func TestRestoreBackup_moveTreeFailureKeepsLiveIntact(t *testing.T) {
 	writeTestFile(t, filepath.Join(m.crsDir, "rules", crsRulesProbeFile), "SecRule init")
 
 	// When 尝试还原备份且搬移失败
+	m.rulesBakCreated = true // 本运行已创建 rules.bak（A86 历史问题 守卫）
 	m.restoreBackup()
 
 	// Then live 规则树从 rules.old 完整挪回（无 bak 残影混入），rules.old 被
@@ -418,6 +423,8 @@ func TestRestoreBackup_restoresSetupAndLeavesArtifactsWithoutBak(t *testing.T) {
 	writeTestFile(t, filepath.Join(m.crsDir, "crs-setup.stock.conf"), "# stock")
 
 	// When the backup is restored
+	m.rulesBakCreated = true // 本运行已创建 rules.bak（A86 历史问题 守卫）
+	m.setupBakCreated = true // 本运行已创建 setup.bak
 	m.restoreBackup()
 
 	// Then rules and setup are back and the backups consumed

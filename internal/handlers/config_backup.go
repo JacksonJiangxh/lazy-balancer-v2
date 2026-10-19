@@ -25,7 +25,7 @@ import (
 	"lazy-balancer-v2/internal/services/dnsproviders"
 )
 
-var configBackupTables = []string{"lb_rules", "upstreams", "path_rules", "users", "api_keys", "ca_providers", "certificate_configs", "cert_jobs", "security_policies", "security_policy_bindings", "security_custom_rules", "security_block_pages", "security_ip_lists", "security_crs_version", "security_ip2region_version", "security_threat_sources", "security_crawler_sources"}
+var configBackupTables = []string{"lb_rules", "upstreams", "path_rules", "users", "api_keys", "ca_providers", "certificate_configs", "cert_jobs", "security_policies", "security_policy_bindings", "security_custom_rules", "security_block_pages", "security_ip_lists", "security_crs_version", "security_ip2region_version", "security_threat_sources", "security_crawler_sources", "nodes"}
 
 // importVersionSeedSentinel 标记本次导入为「未导入版本表且导入前无行」临时
 // 插入的占位行：rearm 看到 id=1 已存在便不再补真实种子；提交后仅以该哨兵
@@ -52,9 +52,11 @@ var configBackupLateTables = map[string]struct{}{
 	"security_threat_sources": {},
 	// 爬虫地址库（v2.3.8 起入导出清单）——更早备份缺席=保留本地。
 	"security_crawler_sources": {},
+	// 节点拓扑（本轮起入导出清单）——更早备份缺席=保留本地节点表。
+	"nodes": {},
 }
 
-// 三分类合并(2026-09-19 用户裁定):备份分类=集群同步节,收敛为 3 类——
+// 分类(2026-09-19 三分类合并；本轮新增节点拓扑)：备份分类与集群同步节同构——
 // 全局配置并入「系统数据」(单行键值表单独成类必产无法导入的死备份,BE-历史问题),
 // 规则库数据库并入「安全防护」(CRS/IP2Region 文件与引用它的安全策略同属
 // 一个防护域)。导出/导入可按分类选择,默认全选;表→分类映射与
@@ -68,12 +70,42 @@ var configBackupSections = []struct {
 	{Key: "users", Label: "系统数据", Tables: []string{"users", "api_keys", "ca_providers", "certificate_configs"}, Global: true},
 	{Key: "rules", Label: "负载规则", Tables: []string{"lb_rules", "upstreams", "path_rules", "cert_jobs"}},
 	{Key: "security", Label: "安全防护", Tables: []string{"security_policies", "security_policy_bindings", "security_custom_rules", "security_block_pages", "security_ip_lists", "security_crs_version", "security_ip2region_version", "security_threat_sources", "security_crawler_sources"}},
+	{Key: "cluster", Label: "节点拓扑", Tables: []string{"nodes"}},
+}
+
+// configBackupSectionKeysText / configBackupSectionsDocText 由
+// configBackupSections 单一事实源派生文档文案（A86 历史问题，历史）：
+// apidocs 的导出 query 枚举与自动备份设置说明此前手工维护分类清单，
+// 第四分类「cluster=节点拓扑」上线后文档漂移为三分类。键与标签一律取自
+// 结构体，分类增删时文档自动跟随；钉测
+// TestA86_apiDocsBackupSectionsMatchSingleSource 逐键核对。
+func configBackupSectionKeysText() string {
+	keys := make([]string, 0, len(configBackupSections))
+	for _, sec := range configBackupSections {
+		keys = append(keys, sec.Key)
+	}
+	return strings.Join(keys, "、")
+}
+
+func configBackupSectionsDocText() string {
+	parts := make([]string, 0, len(configBackupSections))
+	for _, sec := range configBackupSections {
+		note := sec.Label
+		switch sec.Key {
+		case "users":
+			note += "含全局配置"
+		case "security":
+			note += "含 CRS/IP2Region 规则库"
+		}
+		parts = append(parts, sec.Key+"="+note)
+	}
+	return strings.Join(parts, "、")
 }
 
 // normalizeBackupSectionKeys 归一 legacy 分类键:三分类合并前的
 // global_config(并入系统数据)与 waf_files(并入安全防护)在导出 query、
 // 旧备份体内 sections、auto_backup_sections 存量存储值三处长期存在
-// (旧备份必须永久可导入,不设淘汰期)——读侧一律先归一到当前三分类再消费,
+// (旧备份必须永久可导入,不设淘汰期)——读侧一律先归一到当前分类再消费,
 // 去重保序;未知键原样透传(由 configBackupSectionTables 400)。
 func normalizeBackupSectionKeys(sections []string) []string {
 	aliases := map[string]string{"global_config": "users", "waf_files": "security"}
@@ -183,6 +215,16 @@ var configBackupProtectedConfigKeys = map[string]bool{
 	// 直写,致节点页「系统数据同步=关闭」假状态至重启(同步行为四个在线强制点
 	// 不受影响,纯展示层)。
 	"sync_users": true,
+	// A86 历史问题 同门（历史 历史问题）：auto_backup_sections_version 是
+	// 节点本地的备份范围迁移标记（db.go 启动迁移写入），非配置——随备份搬运
+	// 会让目标节点的存量 sections 迁移状态被源节点覆盖；且该列无导入类型门，
+	// 文本形态落库后下次启动迁移 Scan int 硬失败。导出剔除+导入跳过。
+	"auto_backup_sections_version": true,
+	// R-12 同族收敛：threat_traffic_sample_unified_migrated /
+	// security_events_retention_migrated 同型（节点本地一次性迁移标记，
+	// db.go:2285/2346 启动迁移 Scan int）——同口径纳入保护。
+	"threat_traffic_sample_unified_migrated": true,
+	"security_events_retention_migrated":     true,
 }
 
 // 历史问题-F6:规则库跳过警告统一文案(审计侧与响应侧共用,全角括号口径)。
@@ -238,6 +280,8 @@ var backupBooleanTableColumns = map[string][]string{
 	"security_crawler_sources": {"update_enabled"},
 	// 历史问题：system（NOT NULL DEFAULT 0）为系统预置名单语义布尔列。
 	"security_ip_lists": {"system"},
+	// 节点拓扑：is_approved / cluster_token_delivered 为 BOOLEAN 语义列。
+	"nodes": {"is_approved", "cluster_token_delivered"},
 }
 
 // audit I-A：备份表 NULL→默认值归一映射（restoreTable 写入侧，覆盖除
@@ -417,6 +461,19 @@ var backupTableNullDefaults = map[string]map[string]any{
 		"last_checked": "", "next_update": "", "trigger": "", "started_at": "", "finished_at": "",
 		"consecutive_failures": int64(0), "created_at": "", "updated_at": "",
 	},
+	// A86 历史问题（历史）：节点拓扑表写入侧 NULL 归一，与 schema DEFAULT
+	// 逐列对齐——NOT NULL 列（server_map_lat/lon/mode 等）NULL 直写撞约束
+	// 500；port/sync_interval NULL 落库后 cluster_status 节点列表裸扫 500。
+	// name/ip_address 为无默认 NOT NULL 列，由行级门 validateV2BackupNodeRows
+	// 先行 400 点名（不静默造默认值）；registration_secret/health_json/last_*
+	// 瞬态列由 sanitizeNodeRowsForRestore 在更上游删除。
+	"nodes": {
+		"mode": "slave", "port": int64(8000), "protocol": "http", "access_url": "",
+		"is_approved": int64(0), "sync_interval": int64(60), "status": "offline",
+		"cluster_token_delivered": int64(0), "reported_version": int64(0),
+		"server_map_lat": float64(0), "server_map_lon": float64(0),
+		"created_at": "1970-01-01 00:00:00",
+	},
 }
 
 // 全局配置区布尔键（global_config）。protected 键（is_master/sync_users 等）
@@ -523,6 +580,10 @@ var backupTimeColumns = map[string][]string{
 	"ca_providers":        {"created_at", "updated_at"},
 	"certificate_configs": {"created_at", "updated_at"},
 	"cert_jobs":           {"created_at", "updated_at"},
+	// A86 历史问题：nodes.created_at 同族——垃圾文本落库后节点列表时间扫描失败；
+	// 其余 nodes 时间列（last_seen/last_sync_at）由 sanitizeNodeRowsForRestore
+	// 在更上游删除，不进门。
+	"nodes": {"created_at"},
 }
 
 // backupTimeFormats 与 modernc.org/sqlite 驱动 parseTime 的布局同集
@@ -711,6 +772,47 @@ type tableQuerier interface {
 
 func dumpTable(ctx context.Context, database tableQuerier, table string) ([]map[string]any, error) {
 	return queryRowsAsMaps(ctx, database, rowQuery{label: "表 " + table, query: "SELECT * FROM " + table})
+}
+
+// sanitizeNodeRowsForExport 只导出节点拓扑与站点坐标，不导出注册明文密钥、
+// 在线状态/健康等瞬态数据；cluster_token_hash 保留，灾备后旧令牌仍可认证。
+func sanitizeNodeRowsForExport(rows []map[string]any) {
+	for _, row := range rows {
+		for _, key := range []string{
+			"registration_secret", "registration_secret_expires_at",
+			"status", "health_json", "last_seen", "last_sync_at", "last_sync_error", "reported_version",
+		} {
+			delete(row, key)
+		}
+		if hash, _ := row["cluster_token_hash"].(string); hash != "" {
+			row["cluster_token_delivered"] = 1
+		}
+	}
+}
+
+// sanitizeNodeRowsForRestore 由预览/导入共用：即使备份来自旧版本或手工构造，
+// 也强制清掉临时注册密钥与瞬态状态，避免把备份时的在线/健康数据当成当前事实。
+func sanitizeNodeRowsForRestore(rows []map[string]any) {
+	for _, row := range rows {
+		for _, key := range []string{
+			"registration_secret", "registration_secret_expires_at",
+			"health_json", "last_seen", "last_sync_at", "last_sync_error",
+		} {
+			delete(row, key)
+		}
+		row["status"] = "offline"
+		row["reported_version"] = 0
+		if hash, _ := row["cluster_token_hash"].(string); hash != "" {
+			row["cluster_token_delivered"] = 1
+		} else {
+			// D-1（历史裁定）：无令牌哈希的节点无法通过集群认证，恢复
+			// 「approved 死行」只会得到一个永不在线的假节点——一律恢复为
+			// pending（重新注册语义）；同时显式清除陈旧 delivered 标记
+			// （原实现只置 1 从不清 0，手造备份可造出「已下发但无令牌」）。
+			row["is_approved"] = 0
+			row["cluster_token_delivered"] = 0
+		}
+	}
 }
 
 func tableColumns(ctx context.Context, database *sql.DB, table string) (map[string]bool, error) {
@@ -993,8 +1095,20 @@ func validateBackupRuleReferences(tables map[string][]map[string]any) error {
 		}
 	}
 	upstreamsByRule := make(map[string][]models.Upstream)
-	for _, row := range tables["upstreams"] {
+	for index, row := range tables["upstreams"] {
 		ruleID := backupString(row["rule_id"])
+		// D-3（历史裁定）：显式 weight<1 响亮拒绝，不再沿用「0→1 静默归一」
+		// 兼容语义（与保存侧 validateRuleUpstreams 的 A86 D-3 门同口径——该门
+		// 对模型 0 值一律拒绝，故缺键/NULL 必须先归位）。缺键/NULL 按 schema
+		// DEFAULT 1 归位（backupTableNullDefaults 同值——旧库/手造备份的 NULL
+		// 形态保持可导入），显式 0/负值/非整数形态整包 400 点名行号。数值
+		// 字符串与既有整型门同族放行。
+		rawWeight, weightExists := row["weight"]
+		if !weightExists || rawWeight == nil {
+			row["weight"] = int64(1)
+		} else if weight, ok := backupInteger(rawWeight); !ok || weight < 1 {
+			return fmt.Errorf("备份校验失败：upstreams 第 %d 行 weight 必须为不小于 1 的整数", index+1)
+		}
 		upstreamsByRule[ruleID] = append(upstreamsByRule[ruleID], models.Upstream{
 			Host: backupString(row["host"]), Port: backupInt(row["port"]),
 			Weight: backupInt(row["weight"]), DynamicDNS: backupBooleanEnabled(row["dynamic_dns"]),
@@ -1239,7 +1353,7 @@ afterChecksum:
 		requiredTables = configBackupV1Tables
 	}
 	// v2.3.0 分类导出只含所选分类的表:必需表清单仅对「全量形态」生效——
-	// 三分类合并(2026-09-19)后以三类表族齐备判全量(全量导出恒含
+	// 分类(2026-09-19 三分类合并；本轮新增节点拓扑)后以表族齐备判全量(全量导出恒含
 	// users/lb_rules/security;V1 恒全量)。旧判定「含 users 即全量」会把
 	// users 分类备份(系统数据+全局配置)误判为全量并以缺表拒绝——正是
 	// BE-历史问题 要消灭的死备份形态。分类备份只要求至少一张已知表,完整性
@@ -1303,6 +1417,91 @@ func validateV2BackupCertJobStatuses(tables map[string][]map[string]any) error {
 	return nil
 }
 
+// validateV2BackupNodeRows（A86 历史问题，历史）：nodes 表行级
+// 类型/必填/范围门——此前 nodes 无任何行级校验，带 port:null、
+// is_approved:null、server_map_lat:"north"、越界坐标的备份可导入并提交，
+// 随后节点列表每秒 500、snapshotNodeSites 失败。口径：
+//   - name/ip_address：NOT NULL 无默认列，缺失/空/非字符串 400 点名
+//     （不静默造默认值——备份行无身份即非法）；
+//   - id/port/sync_interval：整数门，port 1-65535、sync_interval 1-86400
+//     （与全局 sync_interval 门同族边界）；
+//   - server_map_lat/lon：数值门 + 范围（与 validateServerMapCoordinates
+//     单源同边界：-90/90、-180/180）；
+//   - protocol：仅 http/https，空串归一为 http（schema DEFAULT 语义）；
+//   - cluster_token_hash：字符串或 NULL（NULL=待重新注册，D-1）。
+//
+// NULL 可空列不拒绝——写入侧 backupTableNullDefaults["nodes"] 归一；
+// 布尔两列（is_approved/cluster_token_delivered）由
+// validateV2BackupBooleanTypes 覆盖；created_at 由 validateV2BackupTimestamps
+// 覆盖。旧备份缺席 nodes 表由迟到表「缺席=保留本地」语义承接，不进本门。
+func validateV2BackupNodeRows(rows []map[string]any) error {
+	for index, row := range rows {
+		line := fmt.Sprintf("备份校验失败：nodes 第 %d 行", index+1)
+		if name, ok := row["name"].(string); !ok || strings.TrimSpace(name) == "" {
+			return fmt.Errorf("%s name 必须为非空字符串", line)
+		}
+		if ip, ok := row["ip_address"].(string); !ok || strings.TrimSpace(ip) == "" {
+			return fmt.Errorf("%s ip_address 必须为非空字符串", line)
+		}
+		if raw, exists := row["id"]; exists && raw != nil {
+			if id, ok := backupInteger(raw); !ok || id <= 0 {
+				return fmt.Errorf("%s id 必须为正整数", line)
+			}
+		}
+		if raw, exists := row["port"]; exists && raw != nil {
+			port, ok := backupInteger(raw)
+			if !ok || port < 1 || port > 65535 {
+				return fmt.Errorf("%s port 必须是 1-65535 的整数", line)
+			}
+		}
+		if raw, exists := row["sync_interval"]; exists && raw != nil {
+			interval, ok := backupInteger(raw)
+			if !ok || interval < 1 || interval > 86400 {
+				return fmt.Errorf("%s sync_interval 必须是 1-86400 的整数", line)
+			}
+		}
+		for _, item := range []struct {
+			key    string
+			lo, hi float64
+			name   string
+		}{
+			{"server_map_lat", -90, 90, "站点纬度"},
+			{"server_map_lon", -180, 180, "站点经度"},
+		} {
+			raw, exists := row[item.key]
+			if !exists || raw == nil {
+				continue
+			}
+			value, ok := backupFloat(raw)
+			if !ok {
+				return fmt.Errorf("%s %s必须为数值", line, item.name)
+			}
+			if value < item.lo || value > item.hi {
+				return fmt.Errorf("%s %s必须在 %g 到 %g 之间", line, item.name, item.lo, item.hi)
+			}
+		}
+		if raw, exists := row["protocol"]; exists && raw != nil {
+			protocol, ok := raw.(string)
+			if !ok {
+				return fmt.Errorf("%s protocol 必须为字符串", line)
+			}
+			switch protocol {
+			case "http", "https":
+			case "":
+				row["protocol"] = "http" // schema DEFAULT 语义归一
+			default:
+				return fmt.Errorf("%s protocol 仅支持 http/https，实际 %q", line, protocol)
+			}
+		}
+		if raw, exists := row["cluster_token_hash"]; exists && raw != nil {
+			if _, ok := raw.(string); !ok {
+				return fmt.Errorf("%s cluster_token_hash 必须为字符串或 null", line)
+			}
+		}
+	}
+	return nil
+}
+
 // validateV2BackupRows 行级门（布尔类型/白名单/凭证），必须在
 // sections 过滤之后执行（历史问题）：未选分类的坏行不误拒整包，选中分类照常
 // 严格校验。checksum 已在 verifyBackupIntegrity 对全量计算。
@@ -1323,6 +1522,14 @@ func validateV2BackupRows(backup configBackup) error {
 	// 爬虫地址库：仅允许四个内置官方源，拒绝伪造下载地址。
 	if rows, ok := backup.Tables["security_crawler_sources"]; ok {
 		if err := validateImportedCrawlerSources(rows); err != nil {
+			return err
+		}
+	}
+	// A86 历史问题（历史）：nodes 行级类型/必填/范围门——必须在
+	// sanitizeNodeRowsForRestore（prepareV2BackupSkips）之后执行，此时瞬态列
+	// 已删除、pending 语义已归一，本门只面对落库候选形态。
+	if rows, ok := backup.Tables["nodes"]; ok {
+		if err := validateV2BackupNodeRows(rows); err != nil {
 			return err
 		}
 	}
@@ -2665,6 +2872,21 @@ func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]
 			return fmt.Errorf("备份的默认 CA 提供商（ID %d）在导入后不存在或已禁用", id)
 		}
 	}
+	// A86 历史问题（历史）：access_log_format 导入侧此前零校验——手造
+	// 备份可落库「删除 request>remote_ip/uri/headers」的格式，日志统计与 UA
+	// 统计静默失效（保存侧 caddy.go UpdateConfig 有 validateAccessLogFormat
+	// 门）。与保存侧同门：校验 + 归一强制携带 X-API-Key 脱敏行（渲染层另有
+	// 恒等不变量兜底，导入落库值即所见）。
+	if raw, exists := config["access_log_format"]; exists && raw != nil {
+		format, ok := raw.(string)
+		if !ok {
+			return fmt.Errorf("备份的 access_log_format 必须为字符串")
+		}
+		if err := validateAccessLogFormat(format); err != nil {
+			return fmt.Errorf("备份的 access_log_format 无效: %w", err)
+		}
+		config["access_log_format"] = normalizeAccessLogRedaction(format)
+	}
 	return nil
 }
 
@@ -3396,6 +3618,78 @@ func clampBackupConfigInts(config map[string]any) []string {
 	return notes
 }
 
+// clearDeletedNodeStateBeforeRestore（A86 历史问题/D-2，历史用户裁定）：
+// 节点拓扑整体替换（DELETE FROM nodes + 重插备份行）之前，按 ip:port 身份
+// 找出「本地有而备份无」的将被删除节点，清除其 TOFU 指纹钉（文件+内存缓存，
+// 与 ForgetClusterNodePin 端点同口径：ForgetNodePin 解析地址删文件 +
+// ForgetNodePinCache 清内存）与分区上报缓存（ClearNodeSectionReports）。
+// 备份仍携带的节点 pin/上报一律保留（D-2 裁定：只清已删除节点）。
+//
+// 必须在 DELETE 之前执行：ForgetNodePin 需按现存行解析访问地址。若导入随后
+// 回滚，已清 pin 在下次服务控制按 TOFU 重新钉扎（幂等无害）；分区上报缓存
+// 随下次上报（≤60s）重建。清理失败仅留痕不否决导入（与 DeleteNode 的 pin
+// 清理同口径）；返回完成清理的节点数供成功审计留痕。
+func (h *Handlers) clearDeletedNodeStateBeforeRestore(ctx context.Context, tx *sql.Tx, backupRows []map[string]any) int {
+	surviving := make(map[string]bool, len(backupRows))
+	for _, row := range backupRows {
+		// 行级门已先行 400，此处全为合法形态；防御性跳过缺身份行。
+		ip := backupString(row["ip_address"])
+		port, ok := backupInteger(row["port"])
+		if ip == "" || !ok {
+			continue
+		}
+		surviving[ip+":"+strconv.Itoa(port)] = true
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, ip_address, COALESCE(port,8000) FROM nodes`)
+	if err != nil {
+		services.Logf("warn", "配置导入：读取本地节点身份失败（已删除节点 pin/分区上报清理跳过）: %v", err)
+		return 0
+	}
+	type localNode struct {
+		id  int
+		key string
+	}
+	locals := []localNode{}
+	for rows.Next() {
+		var node localNode
+		var ip string
+		var port int
+		if err := rows.Scan(&node.id, &ip, &port); err != nil {
+			_ = rows.Close()
+			services.Logf("warn", "配置导入：扫描本地节点身份失败（已删除节点清理跳过）: %v", err)
+			return 0
+		}
+		node.key = ip + ":" + strconv.Itoa(port)
+		locals = append(locals, node)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		services.Logf("warn", "配置导入：读取本地节点身份失败（已删除节点清理跳过）: %v", err)
+		return 0
+	}
+	_ = rows.Close()
+	cleared := 0
+	for _, node := range locals {
+		if surviving[node.key] {
+			continue
+		}
+		host, pinErr := h.clusterService.ForgetNodePin(ctx, node.id)
+		switch {
+		case pinErr == nil:
+			if h.syncService != nil {
+				h.syncService.ForgetNodePinCache(host)
+			}
+		case errors.Is(pinErr, services.ErrNoClusterPin) || errors.Is(pinErr, services.ErrNodeNotFound):
+			// 无钉可删（http 地址/从未服务控制）——幂等语义，照常清理上报缓存。
+		default:
+			services.Logf("warn", "配置导入：清除已删除节点 %d 的证书指纹钉失败: %v", node.id, pinErr)
+		}
+		services.ClearNodeSectionReports(db.DB, node.id)
+		cleared++
+	}
+	return cleared
+}
+
 // suppressImportClusterVersionBumps 在导入事务内暂时把 is_master 置为 0，
 // 使既有行级触发器跳过逐行 cluster_version 写放大；提交前由返回的 restore
 // 恢复角色。读取/恢复都采用 COALESCE(is_master,1) 单源口径（NULL 视为主节点，
@@ -3463,13 +3757,13 @@ func removeImportVersionSentinel(ctx context.Context, table string) (bool, error
 }
 
 // errUnknownBackupSection:buildLbbakExport 的 4xx 语义哨兵——薄壳端点据此
-// 保持原 400 文案,其余错误一律 500「导出失败: …」。三分类合并后
+// 保持原 400 文案,其余错误一律 500「导出失败: …」。分类合并后
 // 「仅全局配置」形态不可达(global_config 是 users 别名,恒有表),
 // errGlobalOnlyBackup 哨兵随 BE-历史问题 一并撤销。
 var errUnknownBackupSection = errors.New("未知的配置分类")
 
 // buildLbbakExport 生产 lbbak 备份净荷(纯逻辑:无 HTTP、无审计)。sel 为空
-// 表示全部分类;返回净荷字节、实际导出分类(空选择归一为全部 3 类)、各表
+// 表示全部分类;返回净荷字节、实际导出分类(空选择归一为全部分类)、各表
 // 行数摘要(与导入审计同文案)与是否包含规则库文件本体。HTTP 导出端点与
 // 自动/手动备份执行器(autobackup.go)共用。
 func (h *Handlers) buildLbbakExport(ctx context.Context, sel []string) (payload []byte, exportedSections []string, countsSummary string, includesWafFiles bool, err error) {
@@ -3478,7 +3772,7 @@ func (h *Handlers) buildLbbakExport(ctx context.Context, sel []string) (payload 
 	if !ok {
 		return nil, nil, "", false, errUnknownBackupSection
 	}
-	// 实际导出分类（空选择=全部 3 类）写入包体 Sections（历史问题）——还原/导入/
+	// 实际导出分类（空选择=全部分类）写入包体 Sections（历史问题）——还原/导入/
 	// 预览按该值过滤，不再依赖 ?sections= query 或恒「全选」。
 	exportedSections = append([]string(nil), sel...)
 	if len(exportedSections) == 0 {
@@ -3524,6 +3818,9 @@ func (h *Handlers) buildLbbakExport(ctx context.Context, sel []string) (payload 
 		rows, err := dumpTable(ctx, tx, table)
 		if err != nil {
 			return nil, nil, "", false, errors.Join(err, tx.Rollback())
+		}
+		if table == "nodes" {
+			sanitizeNodeRowsForExport(rows)
 		}
 		backup.Tables[table] = rows
 	}
@@ -3629,6 +3926,9 @@ const warningPureJSONThreatSourcesPreserved = "纯 JSON 备份不携带威胁名
 // 400。checksum 与 sections 过滤已由调用方在此之前完成。
 func prepareV2BackupSkips(backup *configBackup, payload *lbbakPayload, sectionTables map[string]bool) ([]string, error) {
 	warnings := []string{}
+	if rows, carried := backup.Tables["nodes"]; carried {
+		sanitizeNodeRowsForRestore(rows)
+	}
 	if payload == nil && sectionTables["security_crs_version"] {
 		if rows, carried := backup.Tables["security_threat_sources"]; carried {
 			// 该表虽不导入，仍需拒绝伪造源 URL/名称，防止纯 JSON 通道绕过
@@ -4089,7 +4389,14 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	if lbbakFiles != nil && len(lbbakFiles.ThreatIplists) > 0 {
 		localThreatRows = captureThreatSourceRows(ctx)
 	}
-	deleteOrder := []string{"security_policy_bindings", "security_crs_version", "security_ip2region_version", "security_threat_sources", "security_crawler_sources", "security_custom_rules", "security_block_pages", "security_ip_lists", "security_policies", "api_keys", "path_rules", "upstreams", "cert_jobs", "lb_rules", "users", "ca_providers", "certificate_configs"}
+	// A86 历史问题/D-2：nodes 整体替换前清理「将被删除节点」的 TOFU 指纹钉与
+	// 分区上报缓存（保留备份仍携带节点的 pin）——必须赶在 DELETE FROM nodes
+	// 之前（pin 地址需按现存行解析）。
+	clearedNodeArtifacts := 0
+	if nodeRows, nodesCarried := backup.Tables["nodes"]; nodesCarried && h.clusterService != nil {
+		clearedNodeArtifacts = h.clearDeletedNodeStateBeforeRestore(ctx, tx, nodeRows)
+	}
+	deleteOrder := []string{"security_policy_bindings", "security_crs_version", "security_ip2region_version", "security_threat_sources", "security_crawler_sources", "security_custom_rules", "security_block_pages", "security_ip_lists", "security_policies", "api_keys", "path_rules", "upstreams", "cert_jobs", "lb_rules", "users", "ca_providers", "certificate_configs", "nodes"}
 	for _, table := range deleteOrder {
 		if _, exists := backup.Tables[table]; !exists {
 			continue
@@ -4101,7 +4408,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 			return
 		}
 	}
-	insertOrder := []string{"users", "lb_rules", "ca_providers", "certificate_configs", "api_keys", "upstreams", "path_rules", "cert_jobs", "security_ip_lists", "security_policies", "security_crs_version", "security_ip2region_version", "security_threat_sources", "security_crawler_sources", "security_block_pages", "security_custom_rules", "security_policy_bindings"}
+	insertOrder := []string{"users", "lb_rules", "ca_providers", "certificate_configs", "api_keys", "upstreams", "path_rules", "cert_jobs", "security_ip_lists", "security_policies", "security_crs_version", "security_ip2region_version", "security_threat_sources", "security_crawler_sources", "security_block_pages", "security_custom_rules", "security_policy_bindings", "nodes"}
 	for _, table := range insertOrder {
 		rows, exists := backup.Tables[table]
 		if !exists {
@@ -4292,6 +4599,23 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 			recordAudit(c, action+"失败", "配置备份", "清理失效证书任务失败: "+err.Error())
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理失效证书任务失败，已回滚: " + err.Error()})
 			return
+		}
+	}
+	// A86 历史问题（历史）：冲突矩阵置禁用的规则与 DisableRule 端点
+	// 同口径暂停证书任务——否则导入提交后队列恢复（RequeueNonTerminalCertJobs）
+	// 会给已禁用规则续签。写点=Rules 域 历史问题 收敛的单源
+	// disableCertJobsForRuleTx（rules.go，守卫白名单在册），谓词与
+	// DisableRule 逐字一致。条件只需 len(disabledConflicts)>0：冲突矩阵只跑
+	// 在备份携带 lb_rules 时；cert_jobs 缺席的分类导入保留 live 任务行，
+	// 同样适用本暂停。
+	if len(disabledConflicts) > 0 {
+		for _, conflict := range disabledConflicts {
+			if _, err := disableCertJobsForRuleTx(tx, conflict.CaddyID); err != nil {
+				err = session.abort(err)
+				recordAudit(c, action+"失败", "配置备份", "暂停冲突禁用规则的证书任务失败: "+err.Error())
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "暂停冲突禁用规则的证书任务失败，已回滚: " + err.Error()})
+				return
+			}
 		}
 	}
 	oidcConverged := false
@@ -4593,6 +4917,9 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	if len(disabledConflicts) > 0 {
 		auditParts = append(auditParts, "冲突置为禁用："+formatDisabledRuleConflicts(disabledConflicts))
 	}
+	if clearedNodeArtifacts > 0 {
+		auditParts = append(auditParts, fmt.Sprintf("清理已删除节点 %d 个的证书指纹钉与分区上报缓存", clearedNodeArtifacts))
+	}
 	if prunedBindings > 0 {
 		auditParts = append(auditParts, fmt.Sprintf("清理悬挂安全策略绑定：%d 条", prunedBindings))
 	}
@@ -4801,30 +5128,39 @@ func autoBackupWatermarkEmptyOrStale(raw string) bool {
 	return time.Since(parsed) > time.Minute
 }
 
+// importCountsLabels 导入/导出/自动备份汇总的分表计数标签（单一清单，
+// 原 importCountsDetail 函数内局部字面量）。结构性钉测
+// TestA86_importCountsDetailCoversAllBackupTables 要求 configBackupTables
+// 每张表在此或显式豁免清单（path_rules 随规则计数、security_policy_bindings
+// 为派生数据）——新增备份表漏登记会被当场拦截（A86 历史问题 根因防御）。
+var importCountsLabels = []struct {
+	table string
+	label string
+}{
+	{"lb_rules", "规则 %d 条"},
+	{"upstreams", "上游 %d 个"},
+	{"users", "用户 %d 个"},
+	{"api_keys", "密钥 %d 个"},
+	{"ca_providers", "CA %d 个"},
+	{"certificate_configs", "DNS %d 个"},
+	{"cert_jobs", "任务 %d 个"},
+	// 历史问题 追加(用户生产观察):安全域用户内容表补入汇总(绑定表为派生数据不加)。
+	{"security_policies", "安全策略 %d 条"},
+	{"security_custom_rules", "自定义规则 %d 条"},
+	{"security_block_pages", "拦截页 %d 个"},
+	{"security_ip_lists", "IP 地址列表 %d 个"},
+	{"security_crs_version", "CRS 版本 %d 条"},
+	{"security_ip2region_version", "IP2Region 版本 %d 条"},
+	{"security_threat_sources", "威胁情报库源 %d 条"},
+	{"security_crawler_sources", "爬虫地址库源 %d 条"},
+	// A86 历史问题：节点拓扑分类（nodes）补入汇总——此前仅选「节点拓扑」时
+	// countsSummary 为空串（导入响应尾冒号、自动备份 message 无节点计数）。
+	{"nodes", "节点 %d 个"},
+}
+
 func importCountsDetail(tables map[string][]map[string]any) string {
 	parts := []string{}
-	labels := []struct {
-		table string
-		label string
-	}{
-		{"lb_rules", "规则 %d 条"},
-		{"upstreams", "上游 %d 个"},
-		{"users", "用户 %d 个"},
-		{"api_keys", "密钥 %d 个"},
-		{"ca_providers", "CA %d 个"},
-		{"certificate_configs", "DNS %d 个"},
-		{"cert_jobs", "任务 %d 个"},
-		// 历史问题 追加(用户生产观察):安全域用户内容表补入汇总(绑定表为派生数据不加)。
-		{"security_policies", "安全策略 %d 条"},
-		{"security_custom_rules", "自定义规则 %d 条"},
-		{"security_block_pages", "拦截页 %d 个"},
-		{"security_ip_lists", "IP 地址列表 %d 个"},
-		{"security_crs_version", "CRS 版本 %d 条"},
-		{"security_ip2region_version", "IP2Region 版本 %d 条"},
-		{"security_threat_sources", "威胁情报库源 %d 条"},
-		{"security_crawler_sources", "爬虫地址库源 %d 条"},
-	}
-	for _, item := range labels {
+	for _, item := range importCountsLabels {
 		if rows, ok := tables[item.table]; ok {
 			parts = append(parts, fmt.Sprintf(item.label, len(rows)))
 		}
