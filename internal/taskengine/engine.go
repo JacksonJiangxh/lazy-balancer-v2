@@ -119,6 +119,8 @@ var ErrSchedulingPaused = errors.New("taskengine: 调度已暂停")
 var ErrTaskSkipped = errors.New("taskengine: 任务跳过")
 var ErrNotFound = errors.New("taskengine: 任务未注册")
 var ErrEngineStopped = errors.New("taskengine: 引擎已停止")
+var ErrNotMaster = errors.New("taskengine: 该操作仅允许在主节点执行")
+var errPeriodicLoopDisabled = errors.New("taskengine: 周期调度已停止")
 
 // ---- registration ----
 
@@ -162,7 +164,7 @@ type Engine struct {
 	runWG     sync.WaitGroup // Scheduled/Periodic/Oneshot 在途 Run 退出等待
 	// inFlight 是 Scheduled/Periodic/Oneshot 在途 Run 计数（历史问题-1/历史问题-1）：
 	// runWG 无可取消 Wait，配置导入的「暂停 + 有界排空」需要可轮询计数。
-	// 与 runWG.Add/Done 严格配对（唯一登记点 runNow）。
+	// 与 runWG.Add/Done 严格配对（唯一登记点 reserveRunInternal）。
 	inFlight atomic.Int64
 
 	// daemonRestartDelays 常驻异常退出后的有界重拉退避表（历史问题-04）
@@ -249,9 +251,19 @@ func (e *Engine) StopWithTimeout(timeout time.Duration) {
 		r.mu.Unlock()
 	}
 	e.mu.Unlock()
-	<-e.schedDone
 	if timeout <= 0 {
 		timeout = engineStopDrainTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	// 历史问题-1（历史）：调度 goroutine 的等待同样纳入 timeout 预算——
+	// tick 在调度 goroutine 内同步调用装配方闭包（IntervalFn/NextSlotFn，
+	// 生产为 DB 直读），闭包阻塞（DB 锁/驱动挂起）时 scheduleLoop 永不退出，
+	// 无界 <-e.schedDone 会把进程退出拖到容器 grace 后 SIGKILL，与本常量
+	// 「审计/日志尾部丢失」的防护目标相悖。
+	select {
+	case <-e.schedDone:
+	case <-time.After(timeout):
+		log.Printf("WARNING: taskengine: 引擎停止等待调度循环退出超时（%s），放弃等待继续退出（调度闭包可能阻塞，遗留 goroutine 随进程退出回收）", timeout)
 	}
 	settled := make(chan struct{})
 	go func() {
@@ -259,11 +271,25 @@ func (e *Engine) StopWithTimeout(timeout time.Duration) {
 		e.daemonWG.Wait() // 等全部 daemon goroutine 退出——防止跨测试/跨引擎残留（2026-10-04）
 		close(settled)
 	}()
+	logUnsettled := func() {
+		if ids := e.unsettledTaskIDs(); len(ids) > 0 {
+			log.Printf("WARNING: taskengine: 引擎停止等待在途任务超时（%s），放弃等待继续退出；未落定任务: %s",
+				timeout, strings.Join(ids, ","))
+		}
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		select {
+		case <-settled:
+		default:
+			logUnsettled()
+		}
+		return
+	}
 	select {
 	case <-settled:
-	case <-time.After(timeout):
-		log.Printf("WARNING: taskengine: 引擎停止等待在途任务超时（%s），放弃等待继续退出；未落定任务: %s",
-			timeout, strings.Join(e.unsettledTaskIDs(), ","))
+	case <-time.After(remaining):
+		logUnsettled()
 	}
 }
 
@@ -295,15 +321,15 @@ func (e *Engine) SetRole(isMaster bool) {
 	// false，不再误栽 pendingRestart（历史问题-01）。Periodic 不启停：角色真实
 	// 获得时置零节拍使下一 tick 即到期（历史问题-02：原置零分支位于仅收集
 	// Daemon 的切片内不可达）；角色不符时中止在途 Run（X-3 历史，与
-	// Scheduled 同型）。F-历史问题-01（历史）：Scheduled 在途 Run 随角色
-	// 不符中止——demote 后继续跑完会让从节点写版本行/名单/规则树，打破
+	// Scheduled 同型）。F-历史问题-01（历史）：Scheduled/Oneshot 在途 Run
+	// 随角色不符中止——demote 后继续跑完会让从节点写版本行/名单/规则树，打破
 	// 只读不变量；取消经 rc.Ctx 传播，三库 Run 体据此落 skipped（与起点
 	// 角色复查同语义）。promote 无需动作（tick 每轮重读 NextSlotFn 自动
 	// 到点触发）。
 	e.mu.RLock()
 	targets := make([]*registration, 0, len(e.regs))
 	for _, r := range e.regs {
-		if r.desc.Kind == KindDaemon || r.desc.Kind == KindPeriodic || r.desc.Kind == KindScheduled {
+		if r.desc.Kind == KindDaemon || r.desc.Kind == KindPeriodic || r.desc.Kind == KindScheduled || r.desc.Kind == KindOneshot {
 			targets = append(targets, r)
 		}
 	}
@@ -317,6 +343,7 @@ func (e *Engine) SetRole(isMaster bool) {
 			// tick 自动恢复排程。
 			if !e.roleAllows(r.desc.RunsOn) {
 				r.mu.Lock()
+				r.lastCheck = time.Time{}
 				c := r.cancel
 				r.mu.Unlock()
 				if c != nil {
@@ -331,9 +358,11 @@ func (e *Engine) SetRole(isMaster bool) {
 			}
 			continue
 		}
-		if r.desc.Kind == KindScheduled {
-			// 角色不符（demote/重申从节点）：取消在途 Run——与下方 Daemon
-			// 分支同型；loopEnabled 保留（promote 后 tick 自动恢复排程）。
+		if r.desc.Kind == KindScheduled || r.desc.Kind == KindOneshot {
+			// 角色不符（demote/重申角色）：取消在途 Run。Oneshot 与
+			// Scheduled 同守只写角色不变量；RoleAny（含 BootSync）恒通过，
+			// 不会因角色翻转被误取消。loopEnabled 保留，后续角色恢复不影响
+			// 已完成/已取消的单次历史。
 			if !e.roleAllows(r.desc.RunsOn) {
 				r.mu.Lock()
 				c := r.cancel
@@ -522,7 +551,7 @@ func (e *Engine) Trigger(id, trigger, operator string) error {
 	// tick 同函数；原 MasterOnly bool 双机制下 cert 族/auto-backup（仅声明
 	// RunsOn）的手动触发门在从节点形同虚设。
 	if !e.roleAllows(r.desc.RunsOn) {
-		return errors.New("taskengine: 该操作仅允许在主节点执行")
+		return ErrNotMaster
 	}
 	_, err := e.runNow(id, trigger, operator)
 	return err
@@ -546,7 +575,7 @@ func (e *Engine) RunSync(id, trigger, operator string) (int64, error) {
 		return 0, errors.New("taskengine: 常驻任务不支持手动触发（启停即可）")
 	}
 	if !e.roleAllows(r.desc.RunsOn) {
-		return 0, errors.New("taskengine: 该操作仅允许在主节点执行")
+		return 0, ErrNotMaster
 	}
 	return e.runNow(id, trigger, operator)
 }
@@ -1102,6 +1131,17 @@ func (res *runReservation) release() {
 // reserveRun 原子占位：stopped/paused/角色/单飞 CAS 与 runNow 同口径。
 // 任何失败同步返回错误（调用方可在写 HTTP 响应前映射状态码）。
 func (e *Engine) reserveRun(id, trigger string) (*runReservation, error) {
+	return e.reserveRunInternal(id, trigger, time.Time{}, false)
+}
+
+// reservePeriodicRun 把 Periodic 的节拍推进并入 admission 临界区：
+// 只有 paused/role/loop/单飞门全部通过且 running 占位成功才写 lastCheck。
+// tick 不再先推进节拍、再让迟到 goroutine 承担 admission 失败。
+func (e *Engine) reservePeriodicRun(id string, now time.Time) (*runReservation, error) {
+	return e.reserveRunInternal(id, "auto", now, true)
+}
+
+func (e *Engine) reserveRunInternal(id, trigger string, periodicBeat time.Time, periodicAdmission bool) (*runReservation, error) {
 	e.mu.Lock()
 	if e.stopped.Load() {
 		e.mu.Unlock()
@@ -1129,7 +1169,7 @@ func (e *Engine) reserveRun(id, trigger string) (*runReservation, error) {
 		e.roleMu.RUnlock()
 		e.inFlight.Add(-1)
 		e.runWG.Done()
-		return nil, errors.New("taskengine: 该操作仅允许在主节点执行")
+		return nil, ErrNotMaster
 	}
 	r.mu.Lock()
 	if r.running {
@@ -1139,7 +1179,17 @@ func (e *Engine) reserveRun(id, trigger string) (*runReservation, error) {
 		e.runWG.Done()
 		return nil, ErrAlreadyRunning
 	}
+	if periodicAdmission && (r.desc.Kind != KindPeriodic || !r.loopEnabled) {
+		r.mu.Unlock()
+		e.roleMu.RUnlock()
+		e.inFlight.Add(-1)
+		e.runWG.Done()
+		return nil, errPeriodicLoopDisabled
+	}
 	r.running = true
+	if periodicAdmission {
+		r.lastCheck = periodicBeat
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 	// 历史问题（历史）：Stop×runNow 竞态兜底——本临界区登记前 Stop() 可能
@@ -1259,13 +1309,13 @@ func truncMsg(err error) string {
 }
 
 func terminalStatus(ctx context.Context, err error) string {
-	if ctx.Err() != nil {
-		return "cancelled"
-	}
-	// TASK-L5：跳过哨兵先于 generic failed 判定——demote 中止等非故障放弃
-	// 落 skipped 终态（task_runs CHECK 约束既有值），不再失真为 success。
+	// TASK-L5/A85历史问题-3：demote 会同时取消 ctx 并返回跳过哨兵；
+	// 非故障放弃必须先于通用 cancelled，才能与用户主动取消区分。
 	if errors.Is(err, ErrTaskSkipped) {
 		return "skipped"
+	}
+	if ctx.Err() != nil {
+		return "cancelled"
 	}
 	if err != nil {
 		return "failed"
@@ -1384,6 +1434,20 @@ func (e *Engine) tick() {
 			intervalFn := r.desc.IntervalFn
 			enabledFn := r.desc.EnabledFn
 			r.mu.Unlock()
+			// 历史问题（历史）+ 历史问题-2（历史）：EnabledFn 先于
+			// IntervalFn 求值——业务关闭时整分支跳过（不再每 tick 执行
+			// IntervalFn 的 DB 查询），与 Scheduled 分支「EnabledFn=false
+			// 整分支跳过」的省读设计对齐。false 置零 lastCheck（不推进
+			// 节拍）——恢复 true 后下一 tick 到期立即跑（历史问题-02 镜像
+			// 语义不变）。历史问题：闭包 panic 经 safeBool fail-closed 为
+			// false。在途 Run 不受门杀（门只作用于调度判定，当前轮跑完、
+			// 下一轮才停）。
+			if enabledFn != nil && !safeBool(id+".EnabledFn", enabledFn) {
+				r.mu.Lock()
+				r.lastCheck = time.Time{}
+				r.mu.Unlock()
+				continue
+			}
 			// TASK-L4（历史）：IntervalFn 锁外求值——F-历史问题-05 同族收敛
 			// 补全（Scheduled NextSlotFn 已移锁外）。IntervalFn 若含 DB 读取
 			// （wire.go 预告「间隔可配置——读 global_config」形态），持 r.mu
@@ -1404,25 +1468,43 @@ func (e *Engine) tick() {
 				taskLogAppend(id, fmt.Sprintf("[error] 调度停止：IntervalFn 必须返回正周期，实际=%s", interval))
 				continue
 			}
-			// 历史问题（历史）：EnabledFn 锁外求值（F-历史问题-05 同族收敛——
-			// ——wire 四族为 DB 直读形态）。false 与角色不符同款处理（历史问题-02
-			// 镜像）：到期不触发且不推进节拍（置零 lastCheck）——恢复 true 后
-			// 下一 tick 到期立即跑。在途 Run 不受门杀（门只作用于调度判定，
-			// 当前轮跑完、下一轮才停）。
-			enabled := enabledFn == nil || safeBool(id+".EnabledFn", enabledFn)
 			r.mu.Lock()
 			due := r.loopEnabled && !r.running && (r.lastCheck.IsZero() || now.Sub(r.lastCheck) >= interval)
-			if due {
-				if allows && enabled {
-					r.lastCheck = now
-				} else {
+			if !due || !allows {
+				if due {
 					r.lastCheck = time.Time{}
 				}
+				r.mu.Unlock()
+				continue
 			}
 			r.mu.Unlock()
-			if due && allows && enabled {
-				go func(rid string) { _, _ = e.runNow(rid, "auto", "") }(id)
+			// IntervalFn 锁外等待期间业务门可能已翻转。仅在 due && allows
+			// 投递路径复核，避免给未到期 tick 增加 DB 读取；false 与首轮门
+			// 同口径置零节拍。复核本身也在锁外，返回后重读状态，防止窗口内
+			// StopLoop/并发 tick 以陈旧快照投递。
+			if enabledFn != nil && !safeBool(id+".EnabledFn", enabledFn) {
+				r.mu.Lock()
+				r.lastCheck = time.Time{}
+				r.mu.Unlock()
+				continue
 			}
+			r.mu.Lock()
+			due = r.loopEnabled && !r.running && (r.lastCheck.IsZero() || now.Sub(r.lastCheck) >= interval)
+			r.mu.Unlock()
+			if !due {
+				continue
+			}
+			// A85历史问题-1：同步完成 admission 与节拍写入，再异步执行。
+			// Pause/角色降级/StopLoop 在窗口内获胜时 reservation 失败，
+			// lastCheck 保持未推进；恢复后下一 tick 立即到期。
+			res, err := e.reservePeriodicRun(id, now)
+			if err != nil {
+				continue
+			}
+			go func(rid string, reservation *runReservation) {
+				defer reservation.release()
+				_, _ = e.executeRun(reservation, rid, "auto", "")
+			}(id, res)
 
 		case KindDaemon:
 			// 不进周期 tick——由 StartLoop 启动（Run 阻塞直到取消）
@@ -1492,8 +1574,9 @@ func TaskLogPath(taskID string) string {
 	// cluster-sync/config-watchdog/crs/ip2region/log-cleanup/security-events-*/
 	// startup:config-load/threat）仅用小写+数字+'-'+'.'+一个 ':'，大写留作未来
 	// 余量——既有注册 ID 零变化。目录穿越需分隔符，白名单剔除后 :id 用户可控
-	// 面（GetSystemTaskLogs）不可能逃出任务日志目录（可达性已核实仅管理+主
-	// 节点只读，属纵深统一，与 certjoblog sanitizePathComponent/logstats
+	// 面（GetSystemTaskLogs）不可能逃出任务日志目录（该路由位于 business
+	// 读组：全部登录用户可读，主节点/管理员不是前置条件；白名单是路径安全
+	// 边界而非授权边界，与 certjoblog sanitizePathComponent/logstats
 	// sanitizeRuleID 同族）。
 	sanitized := strings.Map(func(r rune) rune {
 		switch {
@@ -1505,6 +1588,11 @@ func TaskLogPath(taskID string) string {
 			return -1
 		}
 	}, taskID)
+	// 净化后为空（全非法字符 ID）不得拼出共享的 <dir>/.log——与未初始化
+	// 同语义返回空串（读路径仅此一个消费面，handlers 按空串=无日志处理）。
+	if sanitized == "" {
+		return ""
+	}
 	return filepath.Join(taskLogDir, sanitized+".log")
 }
 

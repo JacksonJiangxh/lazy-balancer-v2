@@ -40,15 +40,10 @@ func requireMasterNode(c *gin.Context) bool {
 		return false
 	}
 	isMaster, err := services.RoleOf(c.Request.Context(), db.DB)
-	if err != nil {
-		clusterError(c, http.StatusInternalServerError, "节点角色查询失败", err)
-		return false
-	}
-	if !isMaster {
-		clusterError(c, http.StatusForbidden, "该操作仅允许在主节点执行", nil)
-		return false
-	}
-	return true
+	return requireMasterResult(c, isMaster, err, masterGateOptions{
+		queryFailure: "节点角色查询失败",
+		forbidden:    "该操作仅允许在主节点执行",
+	})
 }
 
 // triggerAuditContext 预取异步触发审计上下文（gin.Context 在 handler 返回后
@@ -70,6 +65,20 @@ func triggerAuditContext(c *gin.Context, family, name string) services.TriggerAu
 		Name:     name,
 		Detail:   detail,
 	}
+}
+
+// respondTaskTriggerAdmissionError 统一同步 admission 的 HTTP 映射。
+// 审计由触发服务/调用方按既有单记口径处理，本 helper 只写响应。
+func respondTaskTriggerAdmissionError(c *gin.Context, err error) {
+	if errors.Is(err, taskengine.ErrNotMaster) {
+		c.JSON(http.StatusForbidden, models.APIResponse{Code: 403, Message: "任务当前不可触发: " + err.Error()})
+		return
+	}
+	if errors.Is(err, taskengine.ErrAlreadyRunning) || errors.Is(err, taskengine.ErrSchedulingPaused) || errors.Is(err, taskengine.ErrEngineStopped) {
+		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务当前不可触发: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务触发失败: " + err.Error()})
 }
 
 // TriggerSystemTask 手动触发（admin；仅排程/队列类任务族）。
@@ -113,13 +122,10 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 			if err := te.RunAsyncResult(id, "manual", actx.Operator, func(runErr error) {
 				services.RecordTaskTriggerResult(id, actx, runErr)
 			}); err != nil {
-				switch {
-				case errors.Is(err, taskengine.ErrAlreadyRunning), errors.Is(err, taskengine.ErrSchedulingPaused), errors.Is(err, taskengine.ErrEngineStopped):
-					c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务当前不可触发: " + err.Error()})
-				default:
+				if !errors.Is(err, taskengine.ErrAlreadyRunning) && !errors.Is(err, taskengine.ErrSchedulingPaused) && !errors.Is(err, taskengine.ErrEngineStopped) {
 					recordAudit(c, "触发失败", "任务监控", "手动触发任务 "+m.Name+" 失败: "+err.Error())
-					c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务触发失败: " + err.Error()})
 				}
+				respondTaskTriggerAdmissionError(c, err)
 				return
 			}
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
@@ -280,6 +286,10 @@ func (h *Handlers) GetSystemTaskHistory(c *gin.Context) {
 	id := c.Param("id")
 	limit := 50
 	if te := services.TaskEngine(); te != nil {
+		if _, ok := te.Lookup(id); !ok {
+			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "任务不存在"})
+			return
+		}
 		runs := te.History(id, limit)
 		if runs == nil {
 			runs = []taskengine.RunRecord{}
@@ -345,6 +355,21 @@ func (h *Handlers) GetSystemTaskLogs(c *gin.Context) {
 		return
 	}
 	data = tailLogWindow(data, startOffset)
-	content := prependTaskLogRotations(path, string(data))
+	keep := 1 // 普通任务写侧 RotateTaskLogBeforeWrite(..., 1)
+	if strings.HasPrefix(id, "cert-job:") {
+		keep = certJobLogMaxRotatedBackups
+	}
+	content := prependTaskLogRotations(path, string(data), keep)
+	// A85历史问题-1：256KB 是活动文件与轮转副本拼接后的合计预算。必须直接取
+	// 拼接串最后 tail 字节，再丢弃首行残段；tailLogWindow 只负责行边界，
+	// 不能把全串当成已定位的尾窗（否则仅丢首行，响应仍可数倍超限）。
+	if len(content) > tail {
+		start := len(content) - tail
+		if idx := strings.IndexByte(content[start:], '\n'); idx >= 0 {
+			content = content[start+idx+1:]
+		} else {
+			content = ""
+		}
+	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"content": content}})
 }

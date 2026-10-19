@@ -249,8 +249,9 @@ const caddyConfigDegradationKey = caddyInternalKeyPrefix + "generation_degradati
 // recordCaddyApplyResult 的成功清除先查本值——降级不是应用失败，横幅不得被
 // 成功清除吞掉；下次干净渲染+成功 apply 时置空，横幅随清除恢复正常语义。
 var (
-	renderDegradationMu    sync.Mutex
-	lastRenderDegradationV string
+	renderDegradationMu            sync.Mutex
+	lastRenderDegradationV         string
+	renderDegradationAuditPendingV bool
 )
 
 // LastRenderDegradation 返回最近一次成功应用的配置携带的渲染降级说明。
@@ -260,10 +261,26 @@ func LastRenderDegradation() string {
 	return lastRenderDegradationV
 }
 
+// setLastRenderDegradation 设置进程级降级状态（测试缝：审计/横幅收敛用例
+// 需要预置“上一轮降级”形态；生产写入统一经 applyRenderDegradationState）。
 func setLastRenderDegradation(msg string) {
 	renderDegradationMu.Lock()
 	lastRenderDegradationV = msg
 	renderDegradationMu.Unlock()
+}
+
+// TakePendingRenderDegradationAudit 取走「事务内 apply 暂缓落审计」的降级说明
+// （空=无待落）。A85历史问题-1：事务内 apply（persist=false）立即写审计会在随后
+// commit 失败时留下描述「从未提交配置」的降级事件——审计必须等 commit 成功
+// 后由 recordCaddyApplyResult 补落；非事务 apply 仍在应用成功时立即留痕。
+func TakePendingRenderDegradationAudit() string {
+	renderDegradationMu.Lock()
+	defer renderDegradationMu.Unlock()
+	if !renderDegradationAuditPendingV {
+		return ""
+	}
+	renderDegradationAuditPendingV = false
+	return lastRenderDegradationV
 }
 
 // IsSameConfig 报告错误为「配置同字节未变化」短路。
@@ -383,21 +400,32 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 //   - 启用某特性但本轮渲染降级、产物又与运行配置同字节（如受信代理开启瞬间
 //     读设置失败按未启用渲染）→ 保存「成功」、横幅/审计全无，面板显示已启用
 //     而实际未生效；
-//   - 降级已解除但新渲染与运行配置同字节 → setLastRenderDegradation("") 不可达，
+//   - 降级已解除但新渲染与运行配置同字节 → applyRenderDegradationState("") 不可达，
 //     LastRenderDegradation 残留旧值，recordCaddyApplyResult(nil) 会把旧降级
 //     重新持久化。
 //
 // persist=false（事务内 apply）不写主库：未提交事务仍持写锁，持久化交给
-// commit 后的 recordCaddyApplyResult(nil)（历史问题/历史问题）。
+// commit 后的 recordCaddyApplyResult(nil)（历史问题/历史问题）。审计同样暂缓
+// （A85历史问题-1）：立即落「应用降级」会在 commit 失败时描述一份从未提交的
+// 配置；recordCaddyApplyResult 在成功收尾时经 TakePendingRenderDegradationAudit
+// 补落。非事务 apply（persist=true）仍即时留痕。
 func applyRenderDegradationState(config map[string]interface{}, persist bool) {
 	degraded, _ := config[caddyConfigDegradationKey].(string)
+	renderDegradationMu.Lock()
+	lastRenderDegradationV = degraded
+	// persist=false（事务内 apply）只标记待落，commit 成功后由
+	// recordCaddyApplyResult 补审计（A85历史问题-1：否则 commit 失败会留下
+	// 「从未提交配置」的降级事件）。
+	renderDegradationAuditPendingV = degraded != "" && !persist
+	renderDegradationMu.Unlock()
 	if degraded == "" {
-		setLastRenderDegradation("")
 		return
 	}
-	setLastRenderDegradation(degraded)
+	if !persist {
+		return
+	}
 	RecordAuditLog("system", "应用降级", "Caddy配置", degraded, "")
-	if persist && db.DB != nil {
+	if db.DB != nil {
 		if _, err := db.DB.Exec(`UPDATE global_config SET caddy_apply_error=? WHERE id=1`, degraded); err != nil {
 			Logf("warn", "D3: 持久化渲染降级横幅失败: %v", err)
 		}
@@ -2070,6 +2098,20 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			continue
 		}
 
+		// A85历史问题-2：TLS 规则在证书就绪前不得发布——TLS 连接策略只对
+		// availableCerts 命中的规则生成，而 server 仍按端口创建且
+		// automatic_https.disable=true：无证书的同端口 server 会以明文监听器
+		// 对外提供该规则的后端转发（ACME 首签窗口，签发失败时持续）。证书
+		// 物化后 certissuer 的 caddyReloader（强制全量重载）重新渲染并发布；
+		// 在此之前整条规则 fail-closed 不产生路由（端口有其他就绪规则时仅缺
+		// 本规则路由，未匹配请求不会落到后端）。单规则预览路径不受影响。
+		if r.Protocol == "http" && r.EnableTLS {
+			if _, ready := availableCerts[r.CaddyID]; !ready {
+				Logf("warn", "规则 %s 启用 TLS 但证书尚未就绪（tls_source=%s），暂不发布该规则以避免明文降级；证书就绪后自动重载", r.CaddyID, r.TLSSource)
+				continue
+			}
+		}
+
 		if r.Protocol == "http" {
 			httpServersByPort[r.ListenPort] = append(httpServersByPort[r.ListenPort], ru)
 		} else {
@@ -2599,17 +2641,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	logging := buildCaddyLogging(caddyLogLevel, caddyLogSizeMB)
 
 	if logsMap, ok := logging["logs"].(map[string]interface{}); ok {
-		var encoder map[string]interface{}
-		if accessLogJSON {
-			filterFields := parseAccessLogFormat(accessLogFormat)
-			encoder = map[string]interface{}{
-				"format": "filter",
-				"wrap":   map[string]interface{}{"format": "json"},
-				"fields": filterFields,
-			}
-		} else {
-			encoder = map[string]interface{}{"format": "json"}
-		}
+		encoder := buildAccessLogEncoder(accessLogJSON, accessLogFormat)
 		// LBS-A-历史问题（历史）：ruleLogDir 创建移出逐规则循环（此前每条规则一次
 		// 重复 syscall 且错误被丢弃）——有任一启用日志的 http 规则时创建一次，
 		// 失败记日志（writer 落不了盘会体现为 caddy 配置应用错误，此处点名目录）。
@@ -2662,6 +2694,33 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	}
 
 	return conf
+}
+
+// accessLogAPIKeyHeaderPath 是访问日志恒脱敏的请求头路径（A85历史问题-A）。
+// X-API-Key 是面板机器接口凭证：出现在被记录路由（面板/API 反代、上游客户端
+// 同名头）即明文落盘。脱敏必须在渲染层成为恒等不变量——库值可能来自旧格式、
+// 直接改库或备份导入，任何写侧漏网都不得让明文进日志。
+const accessLogAPIKeyHeaderPath = "request>headers>X-API-Key"
+
+// buildAccessLogEncoder 生成访问日志 encoder（全局日志与规则日志共用单源）。
+// 三条形态全部经 filter+wrap json，且恒注入 X-API-Key 删除：
+//   - 自定义格式（access_log_json=true）：用户行映射之上强制覆盖该头；
+//   - 空格式（默认库值）：fields 仅含脱敏行，其余字段保持原生 JSON；
+//   - access_log_json=false（Caddy 原生 JSON）：仍走 filter+wrap json——纯 json
+//     编码器没有任何删除通道，会把 API Key 原样写出。
+//
+// 用户若对同一路径写了 rename/delete，map 同键覆盖为 delete（恒脱敏优先）。
+func buildAccessLogEncoder(accessLogJSON bool, format string) map[string]interface{} {
+	fields := map[string]interface{}{}
+	if accessLogJSON {
+		fields = parseAccessLogFormat(format)
+	}
+	fields[accessLogAPIKeyHeaderPath] = map[string]interface{}{"filter": "delete"}
+	return map[string]interface{}{
+		"format": "filter",
+		"wrap":   map[string]interface{}{"format": "json"},
+		"fields": fields,
+	}
 }
 
 func parseAccessLogFormat(format string) map[string]interface{} {
@@ -4542,7 +4601,7 @@ func (s *CaddyService) refreshIPListProjectionsInLock(store caddyConfigStore) (I
 	}
 	// 历史问题-1：Converged 零 /load 收尾同样必须收敛渲染降级状态——降级键经
 	// caddyPayload 剔除、不参与字节比较；调用方 recordCaddyApplyResult(nil)
-	// 仅在 setLastRenderDegradation 已执行时才持久化横幅，漏此步会让「受信代理
+	// 仅在 applyRenderDegradationState 已执行时才持久化横幅，漏此步会让「受信代理
 	// 引用名单缺失/损坏」这类渲染降级的审计与横幅在热路径上完全丢失。
 	// 事务视图（未提交）不写主库（避免与写锁争用），交给 commit 后的
 	// recordCaddyApplyResult(nil)；DB 视图直接持久化。

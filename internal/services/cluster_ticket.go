@@ -35,10 +35,10 @@ func (s *ClusterService) GenerateLoginTicket(ctx context.Context, claims models.
 	var lastSeen sql.NullTime
 	var approved bool
 	// name 一并取出:审计事件需带节点名(与服务控制事件「节点 %d（%s）」同格式)。
-	if err := s.db.QueryRowContext(ctx, `SELECT ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),COALESCE(cluster_token_hash,''),COALESCE(name,''),last_seen,is_approved FROM nodes WHERE id=?`, claims.NodeID).
+	if err := s.db.QueryRowContext(ctx, `SELECT ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),COALESCE(cluster_token_hash,''),COALESCE(name,''),last_seen,is_approved FROM nodes WHERE id=? AND `+masterRoleConditionSQL, claims.NodeID).
 		Scan(&ipAddress, &port, &protocol, &accessURL, &keyHash, &nodeName, &lastSeen, &approved); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return models.ClusterLoginTicketResponse{}, ErrNodeNotFound
+			return models.ClusterLoginTicketResponse{}, s.nodeWriteMissError(ctx)
 		}
 		return models.ClusterLoginTicketResponse{}, fmt.Errorf("读取登录目标节点: %w", err)
 	}

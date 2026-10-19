@@ -169,6 +169,33 @@ func (h *Handlers) CreateCertificateConfig(c *gin.Context) {
 	c.JSON(http.StatusCreated, models.APIResponse{Code: 0, Message: "Config created", Data: gin.H{"id": id}})
 }
 
+const certificateConfigMaxListedReferences = 5
+
+type certificateConfigRuleRef struct {
+	caddyID string
+	domain  string
+}
+
+func formatCertificateConfigReferences(references []certificateConfigRuleRef, referenceKind, verb string) string {
+	listed := make([]string, 0, min(len(references), certificateConfigMaxListedReferences))
+	for _, ref := range references {
+		if len(listed) == certificateConfigMaxListedReferences {
+			break
+		}
+		if ref.domain != "" {
+			listed = append(listed, fmt.Sprintf("%s (%s)", ref.domain, ref.caddyID))
+		} else {
+			listed = append(listed, ref.caddyID)
+		}
+	}
+	message := fmt.Sprintf("该 DNS 配置正被 %d 条%s引用，%s后这些规则将无法自动签发/续签证书，请先修改规则的 DNS 配置后再%s：%s",
+		len(references), referenceKind, verb, verb, strings.Join(listed, "、"))
+	if len(references) > certificateConfigMaxListedReferences {
+		message += fmt.Sprintf(" 等 %d 条规则", len(references))
+	}
+	return message
+}
+
 func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 
 	id, err := strconv.Atoi(c.Param("id"))
@@ -219,9 +246,11 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 	switch {
 	case effectiveCredentials == nil:
 		effectiveCredentials = map[string]string{}
-		if err := json.Unmarshal([]byte(oldCredentials), &effectiveCredentials); err != nil {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid stored DNS credentials"})
-			return
+		if oldCredentials != "" {
+			if err := json.Unmarshal([]byte(oldCredentials), &effectiveCredentials); err != nil {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid stored DNS credentials"})
+				return
+			}
 		}
 	case isMaskedDNSCredentials(effectiveCredentials):
 		// CERT42-2:全掩码回传(GET 掩码→未改动即保存)按未提交处理——校验
@@ -229,9 +258,11 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 		// 认证方式」);落库侧下方 isMasked 分支保留作防御(req.DNSCredentials
 		// 置 nil 不更新凭证列)。
 		effectiveCredentials = map[string]string{}
-		if err := json.Unmarshal([]byte(oldCredentials), &effectiveCredentials); err != nil {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid stored DNS credentials"})
-			return
+		if oldCredentials != "" {
+			if err := json.Unmarshal([]byte(oldCredentials), &effectiveCredentials); err != nil {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid stored DNS credentials"})
+				return
+			}
 		}
 	default:
 		// CERT40-2:部分掩码回传先逐字段合并——下方早期校验与最终落库都以
@@ -253,9 +284,16 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Unknown DNS provider"})
 		return
 	}
-	if _, err := provider.BuildCredentialsJSON(effectiveCredentials); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
+	// 遗留 NULL/空串表示「尚未配置凭据」，不是损坏 JSON：改名、禁用及保持
+	// 原启用态时不借旧空值阻断；但从禁用转为启用、变更 provider 或显式提交
+	// 凭据仍必须过 provider 校验。非空损坏 JSON 与其他无效存量行维持 400。
+	legacyEmptyUnchanged := oldCredentials == "" && req.DNSCredentials == nil && effectiveProvider == oldProvider
+	enablingLegacyEmpty := legacyEmptyUnchanged && req.Enabled != nil && *req.Enabled && !oldEnabled
+	if !legacyEmptyUnchanged || enablingLegacyEmpty {
+		if _, err := provider.BuildCredentialsJSON(effectiveCredentials); err != nil {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+			return
+		}
 	}
 
 	// 禁用会使启用中的 ACME 规则在下一次签发/续期才失败；与删除路径一样
@@ -267,10 +305,9 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to check rule references"})
 			return
 		}
-		type ruleRef struct{ caddyID, domain string }
-		var references []ruleRef
+		var references []certificateConfigRuleRef
 		for refs.Next() {
-			var ref ruleRef
+			var ref certificateConfigRuleRef
 			if err := refs.Scan(&ref.caddyID, &ref.domain); err != nil {
 				refs.Close()
 				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to check rule references"})
@@ -288,22 +325,7 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 			return
 		}
 		if len(references) > 0 {
-			const maxListedReferences = 5
-			listed := make([]string, 0, len(references))
-			for _, ref := range references {
-				if len(listed) == maxListedReferences {
-					break
-				}
-				if ref.domain != "" {
-					listed = append(listed, fmt.Sprintf("%s (%s)", ref.domain, ref.caddyID))
-				} else {
-					listed = append(listed, ref.caddyID)
-				}
-			}
-			message := fmt.Sprintf("该 DNS 配置正被 %d 条启用中的 ACME 规则引用，禁用后这些规则将无法自动签发/续签证书，请先修改规则的 DNS 配置后再禁用：%s", len(references), strings.Join(listed, "、"))
-			if len(references) > maxListedReferences {
-				message += fmt.Sprintf(" 等 %d 条规则", len(references))
-			}
+			message := formatCertificateConfigReferences(references, "启用中的 ACME 规则", "禁用")
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: message})
 			return
 		}
@@ -398,10 +420,9 @@ func (h *Handlers) DeleteCertificateConfig(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to check rule references"})
 		return
 	}
-	type ruleRef struct{ caddyID, domain string }
-	var references []ruleRef
+	var references []certificateConfigRuleRef
 	for refs.Next() {
-		var ref ruleRef
+		var ref certificateConfigRuleRef
 		if err := refs.Scan(&ref.caddyID, &ref.domain); err != nil {
 			refs.Close()
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to check rule references"})
@@ -419,22 +440,7 @@ func (h *Handlers) DeleteCertificateConfig(c *gin.Context) {
 		return
 	}
 	if len(references) > 0 {
-		const maxListedReferences = 5
-		listed := make([]string, 0, len(references))
-		for _, ref := range references {
-			if len(listed) == maxListedReferences {
-				break
-			}
-			if ref.domain != "" {
-				listed = append(listed, fmt.Sprintf("%s (%s)", ref.domain, ref.caddyID))
-			} else {
-				listed = append(listed, ref.caddyID)
-			}
-		}
-		message := fmt.Sprintf("该 DNS 配置正被 %d 条负载规则引用，删除后这些规则将无法自动签发/续签证书，请先修改规则的 DNS 配置后再删除：%s", len(references), strings.Join(listed, "、"))
-		if len(references) > maxListedReferences {
-			message += fmt.Sprintf(" 等 %d 条规则", len(references))
-		}
+		message := formatCertificateConfigReferences(references, "负载规则", "删除")
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: message})
 		return
 	}

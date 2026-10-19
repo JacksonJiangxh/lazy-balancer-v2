@@ -401,6 +401,15 @@ func startLoginRateLimitCleanup() {
 	})
 }
 
+// requestLogFormatter 请求日志行格式（独立函数以便格式钉测试消费）。
+// 列结构对齐 gin 默认约定：[time] status | latency | clientIP | METHOD "path"
+// ——历史 历史问题-4 修复前 method 传入两次（| GET | GET "/path"）。
+func requestLogFormatter(param gin.LogFormatterParams) string {
+	return fmt.Sprintf("[%s] %3d | %13v | %15s | %-7s %#v\n",
+		param.TimeStamp.In(services.CurrentLocation()).Format("2006/01/02 15:04:05"),
+		param.StatusCode, param.Latency, param.ClientIP, param.Method, param.Path)
+}
+
 func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 	startLoginRateLimitCleanup()
 	services.ApplyLogLevel()
@@ -411,9 +420,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 		if !shouldLogRequest(param.StatusCode, param.Latency) {
 			return ""
 		}
-		return fmt.Sprintf("[%s] %s | %3d | %13v | %15s | %-7s %#v\n",
-			param.TimeStamp.In(services.CurrentLocation()).Format("2006/01/02 15:04:05"),
-			param.Method, param.StatusCode, param.Latency, param.ClientIP, param.Method, param.Path)
+		return requestLogFormatter(param)
 	}), gin.Recovery())
 
 	// U7c-2（历史）：全局安全响应头——面板页面与 API 响应恒施加

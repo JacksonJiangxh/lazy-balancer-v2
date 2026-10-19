@@ -168,7 +168,7 @@ func RestoreIPListProjections(snapshot IPListProjectionSnapshot) {
 		}
 	}
 	for path, data := range snapshot {
-		_ = os.WriteFile(path, data, 0o644)
+		_ = writeFileAtomicSynced(path, data, 0o644)
 	}
 }
 

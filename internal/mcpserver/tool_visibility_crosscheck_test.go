@@ -12,9 +12,10 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// ginPath 将 {param} 形态还原为 Gin 的 :param（mcp_routes_parity_test.go
-// openAPIToGinPath 同义——外部测试包不可共享，此处内联）。
-// APIMCP-R1（历史）：与 openAPIToGinPath 对齐为全替换循环——旧实现只转
+// ginPath 将 {param} 形态还原为 Gin 的 :param（ginPathToOpenAPI 反函数）——
+// 单一实现（历史六维度收敛）：外部测试包经 export_test.go 的
+// GinPathForTest 共享本实现，mcp_routes_parity_test.go 的原地复本已删除。
+// APIMCP-R1（历史）：全替换循环——旧实现只转
 // 首个 {param}，多参路径（如 /security/policies/{id}/bind/{caddy_id}）会得
 // 半转换形态让互检静默失真。
 func ginPath(path string) string {

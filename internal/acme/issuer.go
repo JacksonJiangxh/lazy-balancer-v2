@@ -551,8 +551,8 @@ var (
 	}
 	// propagationPollInterval 探测轮询间隔（生产 3s）。
 	propagationPollInterval = 3 * time.Second
-	// propagationResolverProbeTimeout 单台递归探测的独立 ctx 超时（历史问题）——
-	// 每台 goroutine 各自 WithTimeout，一台黑洞解析器不得拖累同轮其余台。
+	// propagationResolverProbeTimeout 单台权威/递归探测的独立 ctx 超时——
+	// 每台 goroutine 各自 WithTimeout，一台黑洞服务器不得拖累同轮其余台。
 	propagationResolverProbeTimeout = 8 * time.Second
 	// propagationDivergenceDiagAfter 权威/递归分歧诊断日志阈值（生产 30s）。
 	propagationDivergenceDiagAfter = 30 * time.Second
@@ -650,8 +650,9 @@ func (i *Issuer) probeAuthServersLogged(ctx context.Context, servers []string, f
 		}
 	}
 	ready = len(servers) > 0
-	for _, server := range servers {
-		hit, found, err := probeTXT(ctx, server, fqdn, expected, false)
+	for _, probe := range probeDNSParallel(ctx, servers, fqdn, expected, false) {
+		server := probe.resolver
+		hit, found, err := probe.hit, probe.found, probe.err
 		switch {
 		case err != nil:
 			ready = false
@@ -701,34 +702,38 @@ func (s *dnsLogState) changed(key, state string) bool {
 	return true
 }
 
-// recursiveProbeResult 单台公共递归的一轮探测结果（历史问题 并行收集用）。
-type recursiveProbeResult struct {
+// dnsProbeResult 单台权威/递归 DNS 的一轮探测结果。
+type dnsProbeResult struct {
 	resolver string
 	hit      bool
 	found    []string
 	err      error
 }
 
-// probeRecursiveParallel 并行探测全部公共递归，按输入顺序回填结果（历史问题 第
-// 73 轮）。每台独立 ctx 超时（propagationResolverProbeTimeout）——一台黑洞
-// 解析器（8.8.8.8/1.1.1.1 在受限网络内 UDP/TCP 双 8s 超时）不再把单轮串行
-// 拖到 ~32s。日志不在并发 goroutine 内写（Logger 非并发契约），统一由调用方
-// 按结果顺序输出。
-func probeRecursiveParallel(ctx context.Context, resolvers []string, fqdn, expected string) []recursiveProbeResult {
-	results := make([]recursiveProbeResult, len(resolvers))
+// probeDNSParallel 并行探测全部 DNS 服务器，按输入顺序回填结果。每台独立
+// ctx 超时（propagationResolverProbeTimeout）——一台黑洞服务器不再把单轮
+// 串行拖到其余服务器耗时之和。日志不在并发 goroutine 内写（Logger 非并发
+// 契约），统一由调用方按结果顺序输出。
+func probeDNSParallel(ctx context.Context, servers []string, fqdn, expected string, recursion bool) []dnsProbeResult {
+	results := make([]dnsProbeResult, len(servers))
 	var wg sync.WaitGroup
-	for idx, resolver := range resolvers {
+	for idx, server := range servers {
 		wg.Add(1)
-		go func(idx int, resolver string) {
+		go func(idx int, server string) {
 			defer wg.Done()
 			probeCtx, cancel := context.WithTimeout(ctx, propagationResolverProbeTimeout)
 			defer cancel()
-			hit, found, err := probeTXT(probeCtx, resolver, fqdn, expected, true)
-			results[idx] = recursiveProbeResult{resolver: resolver, hit: hit, found: found, err: err}
-		}(idx, resolver)
+			hit, found, err := probeTXT(probeCtx, server, fqdn, expected, recursion)
+			results[idx] = dnsProbeResult{resolver: server, hit: hit, found: found, err: err}
+		}(idx, server)
 	}
 	wg.Wait()
 	return results
+}
+
+// probeRecursiveParallel 保留递归探测语义入口，与权威探测共享同一并行实现。
+func probeRecursiveParallel(ctx context.Context, resolvers []string, fqdn, expected string) []dnsProbeResult {
+	return probeDNSParallel(ctx, resolvers, fqdn, expected, true)
 }
 
 // probeTXT queries a single DNS server for the TXT records of fqdn over UDP,

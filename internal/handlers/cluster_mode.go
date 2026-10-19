@@ -14,6 +14,10 @@ import (
 )
 
 func (h *Handlers) SetClusterMode(c *gin.Context) {
+	if h.syncService == nil {
+		clusterError(c, http.StatusServiceUnavailable, "同步服务未初始化", nil)
+		return
+	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
 	var req models.ClusterModeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -52,7 +56,7 @@ func (h *Handlers) SetClusterMode(c *gin.Context) {
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(req.MasterURL)), "http://") {
 		recordAudit(c, "警告", "集群模式", services.FormatAuditDetail("目标：从节点", "使用明文 HTTP 注册，证书私钥将明文传输，建议改用 HTTPS"))
 	}
-	outboundIP, outboundIPOK := localOutboundIP()
+	outboundIP, outboundIPOK := dialOutboundIP()
 	if models.ClusterAccessURLTargetsNode(req.MasterURL, outboundIP, h.cfg.Port) {
 		const message = "不能将本节点注册为自己的从节点，请填写另一主节点的地址，或使用提升接口保持主节点角色"
 		recordAudit(c, "切换失败", "集群模式", services.FormatAuditDetail("目标："+masterAuditURL, message))
@@ -162,12 +166,6 @@ func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
 	}
 	recordAudit(c, "更新", "集群设置", services.FormatAuditDetail(clusterSettingsChangeDetail(req), services.AuditResultPart("success")))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "集群设置已更新"})
-}
-
-// localOutboundIP(历史问题-5):探测失败时回退 127.0.0.1 并返回 ok=false——
-// 注册的访问地址是坏值,调用方必须在审计中点名。
-func localOutboundIP() (string, bool) {
-	return dialOutboundIP()
 }
 
 // switchToSlaveAuditDetail 构建切换从节点的审计详情;出口 IP 探测失败

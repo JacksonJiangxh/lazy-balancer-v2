@@ -15,6 +15,7 @@ import (
 
 	"lazy-balancer-v2/internal/config"
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/dnsprovider/ownership"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -435,37 +436,10 @@ func (s *SyncService) materializeSnapshotDNSOwnership(acme *models.ClusterACMESt
 			return err
 		}
 	}
-	path := filepath.Join(dataDir, "acme_dns_ownership.json")
-	// 历史问题:内容一致零写(幂等,免每次 apply 的 tmp+fsync+rename)。
-	if existing, rerr := os.ReadFile(path); rerr == nil &&
-		string(existing) == string(acme.DNSOwnership) {
-		return nil
-	}
-	temporary, err := os.CreateTemp(dataDir, ".acme-dns-ownership-*")
-	if err != nil {
-		return fmt.Errorf("创建 DNS 所有权临时文件: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0600); err != nil {
-		return errors.Join(fmt.Errorf("设置 DNS 所有权文件权限: %w", err), temporary.Close())
-	}
-	if _, err := temporary.Write(acme.DNSOwnership); err != nil {
-		return errors.Join(fmt.Errorf("写入 DNS 所有权临时文件: %w", err), temporary.Close())
-	}
-	if err := temporary.Sync(); err != nil {
-		return errors.Join(fmt.Errorf("同步 DNS 所有权临时文件: %w", err), temporary.Close())
-	}
-	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("关闭 DNS 所有权临时文件: %w", err)
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return fmt.Errorf("替换 DNS 所有权状态: %w", err)
-	}
-	if err := syncParentDir(path); err != nil {
-		return fmt.Errorf("同步 DNS 所有权目录: %w", err)
-	}
-	return nil
+	// 与 DNS-01 签发共用 ownership 包的单源原子写与 fileMu：apply 期间即使
+	// 退役队列的 zombie 执行仍在 Add/Remove，也不会与整文件替换交错。锁只在
+	// Replace 内覆盖文件 I/O；调用方事务/其他锁不会在 fileMu 内被反向获取。
+	return ownership.Replace(dataDir, acme.DNSOwnership)
 }
 
 func restoreSnapshotCerts(previous, current []models.ClusterCertificate) error {

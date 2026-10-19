@@ -116,7 +116,13 @@ func rotateAuditLogIfNeeded() int {
 	total := 0
 	// 先重试上次失败的归档补采：成功才删除标记继续轮转；失败则保留 .1 不被 shift
 	// 覆盖（事件尚存），待下次轮转重试，避免补采失败导致窗口事件永久丢失。
-	if pending := securityEventsReadPendingDelta(); pending != nil {
+	pending, pendingErr := securityEventsReadPendingDelta()
+	if pendingErr != nil {
+		// 标记是否存在及其补采责任未知时不得 shift/覆盖任何归档；保留现场，
+		// 下轮读恢复后先重试补采。与其他轮转 I/O 错误同走 fail-closed。
+		return total
+	}
+	if pending != nil {
 		if _, err := os.Stat(pending.Path); os.IsNotExist(err) {
 			// N+9 历史问题：warn 走 60s 限流（throttledAuditFailureLogf）——标记删除
 			// 失败（只读目录等）时标记留在盘上，2s tick 反复进入本分支，裸 warn
@@ -372,25 +378,26 @@ func securityEventsWritePendingDelta(p securityEventsPendingDelta) error {
 	return writeFileAtomicSynced(securityEventsPendingDeltaPath(), data, 0o644)
 }
 
-// securityEventsReadPendingDelta 读取待补采标记；不存在返回 nil。损坏标记
-// 留 WARN 并清除，避免被静默当作无标记后继续轮转。
-func securityEventsReadPendingDelta() *securityEventsPendingDelta {
+// securityEventsReadPendingDelta 读取待补采标记；不存在返回 (nil,nil)。损坏标记
+// 留 WARN 并清除，避免被静默当作无标记后继续轮转；其他读取错误返回给调用方，
+// 由轮转入口中止本轮，绝不在补采责任未知时移位归档。
+func securityEventsReadPendingDelta() (*securityEventsPendingDelta, error) {
 	path := securityEventsPendingDeltaPath()
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		throttledAuditFailureLogf("audit log rotation: pending delta marker read failed: %v", err)
-		return nil
+		throttledAuditFailureLogf("audit log rotation: pending delta marker read failed (rotation deferred): %v", err)
+		return nil, err
 	}
 	var p securityEventsPendingDelta
 	if err := json.Unmarshal(data, &p); err != nil || p.Path == "" {
 		throttledAuditFailureLogf("audit log rotation: pending delta marker corrupt, dropping: %s", path)
 		_ = os.Remove(path)
-		return nil
+		return nil, nil
 	}
-	return &p
+	return &p, nil
 }
 
 // auditLogSizeCacheTTL 是轮转阈值的缓存窗口（N+11 D3-F5b）：2s 轮转 tick 在

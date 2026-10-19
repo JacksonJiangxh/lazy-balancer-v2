@@ -121,7 +121,7 @@ func (s *SyncService) Report(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 	// 历史问题-1(D1):同主机 http→https 升级已被 doWithTLSUpgradeRedirect 按
-	// 原方法重放,残留 3xx(跨主机重定向/302/307 等)说明主节点地址形态需
+	// 原方法重放,残留 3xx(跨主机/反代重定向)说明主节点地址形态需
 	// 人工修正——此前落进「非 4xx 即成功」被静默吞掉;给与 Pull 3xx 分支同款
 	// 可行动指引,经 reportErr→recordSyncError 通道落库(last_sync_error
 	// 显「状态上报失败: …」),审计节流与拒绝分支同口径。

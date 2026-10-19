@@ -136,6 +136,11 @@ func (h *Handlers) recordCaddyApplyResult(err error) {
 		// apply 不写主库（避免与未提交事务争写锁），由本函数在 commit 后落库；
 		// 下次干净渲染（LastRenderDegradation 归空）恢复常规清除。
 		if degraded := services.LastRenderDegradation(); degraded != "" {
+			// A85历史问题-1：事务内 apply 暂缓的降级审计在此补落（commit 已成功，
+			// 降级描述的是真实生效的已提交配置）；非事务路径已即时落过，取不到。
+			if pending := services.TakePendingRenderDegradationAudit(); pending != "" {
+				services.RecordAuditLog("system", "应用降级", "Caddy配置", pending, "")
+			}
 			if db.DB != nil {
 				if _, err := db.DB.Exec(`UPDATE global_config SET caddy_apply_error=? WHERE id=1`, degraded); err != nil {
 					services.Logf("warn", "D3: 持久化渲染降级横幅失败: %v", err)
@@ -308,8 +313,22 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 	if errors.Is(applyErr, services.ErrUnvalidatedApply) {
 		// HP77-1 同收口：回滚分支磁盘回退到已提交态（零 /load）。
 		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
-		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("Caddy 应用失败且 CLI 校验不可用", applyErr.Error(), services.AuditResultPart("failure")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Caddy 应用失败且 CLI 校验不可用，" + f.Resource + "未保存（服务与运行配置不受影响，恢复 Caddy/CLI 后重试）: " + applyErr.Error()})
+		// A85历史问题-B：传输错误可能发生在 Caddy 已应用候选之后（请求断连/
+		// 超时）——只回滚 DB/投影会让运行配置停滞候选态，而看门狗只比对路由
+		// id（纯策略/限流变化不触发漂移横幅）。复用提交失败的统一恢复：
+		// 回滚事务 + 以已提交视图重渲染 /load + 回退 LKG/投影/证书副作用。
+		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		joined := applyErr
+		if restoreErr != nil {
+			joined = errors.Join(applyErr, fmt.Errorf("回滚到已提交运行配置失败: %w", restoreErr))
+		}
+		h.recordCaddyApplyResult(joined)
+		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("Caddy 应用失败且 CLI 校验不可用", joined.Error(), services.AuditResultPart("failure")))
+		restoreNote := "已回滚到已提交运行配置"
+		if restoreErr != nil {
+			restoreNote = "回滚到已提交运行配置失败，请立即检查 Caddy 状态"
+		}
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Caddy 应用失败且 CLI 校验不可用，" + f.Resource + "未保存（" + restoreNote + "，恢复 Caddy/CLI 后重试）: " + joined.Error()})
 		return
 	}
 	if err := tx.Commit(); err != nil {
@@ -335,13 +354,44 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 // 调用契约：调用方处于写路径临界区（已持 caddyOpMu），且此后不得再使用 tx。
 func (h *Handlers) recoverCommittedViewAfterCommitFailure(tx *sql.Tx) error {
 	var errs []error
-	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-		errs = append(errs, fmt.Errorf("回滚未提交事务失败: %w", err))
+	if err := tx.Rollback(); err != nil {
+		if errors.Is(err, sql.ErrTxDone) {
+			// A85历史问题-B：database/sql 在 Commit 失败后把 Tx 标记为 done 且
+			// 不会调用 driver.Rollback（releaseConn 直接归还连接）。SQLite 的
+			// deferred 约束/IO 类失败会让底层事务保持活动——连接归还池后，
+			// 任何复用该连接的读都会看到未提交数据（已提交视图重渲染因此
+			// 读到候选值，恢复等于空转、LKG 滞留未提交字节）。在池上补一次
+			// ROLLBACK：泄漏事务仍持写锁，其他写事务不可能占用该连接，
+			// 因此不会误伤他人；无事务活动时报错忽略即可。
+			rollbackLeakedTx()
+		} else {
+			errs = append(errs, fmt.Errorf("回滚未提交事务失败: %w", err))
+		}
 	}
 	if err := h.caddyService.RestoreRuntimeToCommittedInLock(); err != nil {
 		errs = append(errs, fmt.Errorf("恢复已提交视图运行配置失败: %w", err))
 	}
 	return errors.Join(errs...)
+}
+
+// rollbackLeakedTx 在事务提交失败后补发 ROLLBACK（见调用点注释）。
+// 连接池按 LIFO 复用，刚归还的泄漏连接会被优先取到；若取到的是无活动事务
+// 的其它空闲连接（池内有竞争），重试直到命中或次数用尽——此时泄漏事务仍
+// 持写锁，其它连接不可能有写事务，重复 ROLLBACK 不会误伤。
+func rollbackLeakedTx() {
+	if db.DB == nil {
+		return
+	}
+	for attempt := range 5 {
+		_, err := db.DB.Exec("ROLLBACK")
+		if err == nil {
+			return
+		}
+		if strings.Contains(err.Error(), "no transaction is active") {
+			continue
+		}
+		services.Logf("warn", "提交失败后补发 ROLLBACK 失败（第 %d 次）: %v", attempt+1, err)
+	}
 }
 
 // reloadDetailFor 返回收尾选项的重载审计明细（默认「配置变更后自动重载」）。

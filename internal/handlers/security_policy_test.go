@@ -107,7 +107,7 @@ func createTestPolicy(t *testing.T, router *gin.Engine, payload map[string]any) 
 	return resp.Data.ID
 }
 
-func TestCreateSecurityPolicy_persistsAllColumns(t *testing.T) {
+func TestSecurityPolicy_seededLegacyMixedRoundTripsAllColumns(t *testing.T) {
 	// Given a legacy mixed policy seeded directly (mixed cannot be created via API).
 	setupSecurityPolicyTestDB(t)
 	if _, err := db.DB.Exec(`INSERT INTO security_policies

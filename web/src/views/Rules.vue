@@ -678,11 +678,6 @@
             </el-form-item>
 
             <template v-if="wizardForm.protocol === 'http'">
-              <el-form-item label="超时时间">
-                <el-input-number v-model="wizardForm.health_check_timeout" :min="1" :max="30" controls-position="right" style="width: 120px;" />
-                <span class="form-tip-inline">秒，连接/健康检查超时</span>
-              </el-form-item>
-
               <el-form-item label="主动检查">
                 <div class="active-check-control">
                   <el-switch v-model="wizardForm.enable_active_health_check" :disabled="ntlmOn" />
@@ -701,6 +696,10 @@
               </div>
 
               <template v-if="wizardForm.enable_active_health_check">
+                <el-form-item label="主动探测超时">
+                  <el-input-number v-model="wizardForm.health_check_timeout" :min="1" :max="30" controls-position="right" style="width: 120px;" />
+                  <span class="form-tip-inline">秒，仅主动探测单次超时；被动熔断不使用该值</span>
+                </el-form-item>
                 <el-form-item label="检查路径">
                   <el-input v-model="wizardForm.health_check_path" placeholder="默认 /" style="width: 180px;" />
                   <span class="form-tip-inline">留空探测 /，需返回 2xx 否则判为异常</span>
@@ -717,11 +716,6 @@
             </template>
 
             <template v-if="wizardForm.protocol === 'tcp'">
-              <el-form-item label="超时时间">
-                <el-input-number v-model="wizardForm.health_check_timeout" :min="1" :max="30" controls-position="right" style="width: 120px;" />
-                <span class="form-tip-inline">秒，TCP 连接/健康检查超时</span>
-              </el-form-item>
-
               <el-form-item label="主动检查">
                 <div class="active-check-control">
                   <el-switch v-model="wizardForm.enable_active_health_check" />
@@ -730,6 +724,10 @@
               </el-form-item>
 
               <template v-if="wizardForm.enable_active_health_check">
+                <el-form-item label="主动探测超时">
+                  <el-input-number v-model="wizardForm.health_check_timeout" :min="1" :max="30" controls-position="right" style="width: 120px;" />
+                  <span class="form-tip-inline">秒，仅主动探测单次超时；被动熔断不使用该值</span>
+                </el-form-item>
                 <el-form-item label="检查端口">
                   <el-input-number v-model="wizardForm.tcp_health_check_port" :min="0" :max="65535" controls-position="right" style="width: 120px;" />
                   <span class="form-tip-inline">留空或 0 表示按各上游自身端口探测</span>
@@ -875,13 +873,13 @@
               <template v-if="wizardForm.enable_active_health_check">
                 {{ wizardForm.health_check_path || '/' }} ({{ wizardForm.health_check_interval }}s/{{ wizardForm.health_check_timeout }}s){{ wizardForm.health_check_host ? `，Host: ${wizardForm.health_check_host}` : '' }}
               </template>
-              <template v-else>被动检查 (失败 {{ wizardForm.health_check_unhealthy_threshold }} 次视为不健康, 超时 {{ wizardForm.health_check_timeout }}s)</template>
+              <template v-else>被动检查 (失败 {{ wizardForm.health_check_unhealthy_threshold }} 次视为不健康, 恢复窗口 {{ wizardForm.health_check_interval * 3 }}s)</template>
             </el-descriptions-item>
             <el-descriptions-item label="健康检查" v-if="wizardForm.protocol === 'tcp'">
               <template v-if="wizardForm.enable_active_health_check">
                 TCP 主动探测端口 {{ wizardForm.tcp_health_check_port || '默认' }} ({{ wizardForm.health_check_interval }}s/{{ wizardForm.health_check_timeout }}s)
               </template>
-              <template v-else>被动检查 (失败 {{ wizardForm.health_check_unhealthy_threshold }} 次视为不健康, 超时 {{ wizardForm.health_check_timeout }}s)</template>
+              <template v-else>被动检查 (失败 {{ wizardForm.health_check_unhealthy_threshold }} 次视为不健康, 恢复窗口 {{ wizardForm.health_check_interval * 3 }}s)</template>
             </el-descriptions-item>
             <el-descriptions-item label="连接重试" v-if="wizardForm.protocol === 'tcp'">
               <template v-if="(wizardForm.tcp_try_duration || 0) > 0">
@@ -1002,16 +1000,16 @@
           <el-descriptions-item label="压缩" v-if="ruleConfig.protocol === 'http'">
             {{ ruleConfig.enable_compress ? (Array.isArray(ruleConfig.compress_types) ? ruleConfig.compress_types[0] : (ruleConfig.compress_types || 'gzip')) : '禁用' }}
           </el-descriptions-item>
-          <el-descriptions-item label="主动健康检查" v-if="ruleConfig.protocol === 'http' && ruleConfig.health_check_path">
-            {{ ruleConfig.health_check_path }} ({{ ruleConfig.health_check_interval }}s/{{ ruleConfig.health_check_timeout }}s){{ ruleConfig.health_check_host ? `，Host: ${ruleConfig.health_check_host}` : '' }}
+          <el-descriptions-item label="主动健康检查" v-if="ruleConfig.protocol === 'http' && ruleConfig.enable_active_health_check">
+            {{ ruleConfig.health_check_path || '/' }} ({{ ruleConfig.health_check_interval }}s/{{ ruleConfig.health_check_timeout }}s){{ ruleConfig.health_check_host ? `，Host: ${ruleConfig.health_check_host}` : '' }}
           </el-descriptions-item>
-          <el-descriptions-item label="主动健康检查" v-if="ruleConfig.protocol === 'http' && !ruleConfig.health_check_path">未启用</el-descriptions-item>
+          <el-descriptions-item label="主动健康检查" v-if="ruleConfig.protocol === 'http' && !ruleConfig.enable_active_health_check">未启用</el-descriptions-item>
           <el-descriptions-item label="主动健康检查" v-if="ruleConfig.protocol === 'tcp' && ruleConfig.enable_active_health_check">
             TCP 探测端口 {{ ruleConfig.tcp_health_check_port || '默认' }} ({{ ruleConfig.health_check_interval }}s/{{ ruleConfig.health_check_timeout }}s)
           </el-descriptions-item>
           <el-descriptions-item label="主动健康检查" v-if="ruleConfig.protocol === 'tcp' && !ruleConfig.enable_active_health_check">未启用</el-descriptions-item>
           <el-descriptions-item label="被动健康检查" v-if="ruleConfig.protocol === 'http' || ruleConfig.protocol === 'tcp'">
-            失败 {{ ruleConfig.health_check_unhealthy_threshold || 3 }} 次视为不健康, 间隔 {{ ruleConfig.health_check_interval || 10 }}s, 超时 {{ ruleConfig.health_check_timeout || 2 }}s
+            失败 {{ ruleConfig.health_check_unhealthy_threshold || 3 }} 次视为不健康, 恢复窗口 {{ (ruleConfig.health_check_interval || 10) * 3 }}s
           </el-descriptions-item>
           <el-descriptions-item label="连接重试" v-if="ruleConfig.protocol === 'http' || ruleConfig.protocol === 'tcp'">
             <template v-if="ruleConfig.tcp_try_duration > 0">
@@ -1197,7 +1195,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted, computed, watch, nextTick } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { Plus, Operation, Delete, InfoFilled, Lock, Connection, Guide, Check, ArrowLeft, ArrowRight, Document, CircleCheckFilled, CircleCloseFilled, Setting, RefreshRight, Search, WarningFilled, Location, Monitor, Link, Tickets } from '@element-plus/icons-vue'
@@ -1207,6 +1205,8 @@ import TakeoverBadge from '@/components/common/TakeoverBadge.vue'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import axios from 'axios'
 import { ansiToHtml } from '@/utils/ansi'
+import { useLogTailPolling } from '@/composables/useLogTailPolling'
+import { updaterName } from '@/utils/updaterName'
 import { formatDate, parseDbTimeMs } from '@/utils/date'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import RuleFlowDialog from '@/components/RuleFlowDialog.vue'
@@ -1556,15 +1556,8 @@ const certInfoGenerations = new Map<string, number>()
 let certInfoGeneration = 0
 let rulesRequestSeq = 0
 
-const getUpdaterName = (userId?: number) => {
-  if (!userId || userId === 0) return '-'
-  const user = users.value.find(u => u.id === userId)
-  if (user) {
-    const displayName = user.display_name || ''
-    return displayName || user.username || '-'
-  }
-  return '-'
-}
+// 更新者显示名走 utils/updaterName 单源（A85WA-历史问题 四份同构收敛）
+const getUpdaterName = (userId?: number) => updaterName(users.value, userId)
 
 const fetchRules = async () => {
   if (disposed) return
@@ -1805,7 +1798,7 @@ const ruleLogDialogVisible = ref(false)
 const ruleLogRuleName = ref('')
 const ruleLogCaddyId = ref('')
 const ruleLogContent = ref('')
-const ruleLogLoading = ref(false)
+// ruleLogLoading 由 ruleLogTail.loading 承载（A85WA-历史问题 收敛，声明在日志轮询段）
 const ruleLogAutoRefresh = ref(true)
 const ruleLogContainerRef = ref<HTMLElement | null>(null)
 let ruleLogPollTimer: ReturnType<typeof setInterval> | null = null
@@ -2231,18 +2224,13 @@ watch(() => wizardForm.enable_dns_server, (newVal) => {
   wizardForm.dns_server = dnsServerAfterToggle(wizardForm.dns_server, newVal, hydratingWizard)
 }, { flush: 'sync' })
 
-// Watch for enable_active_health_check toggle to set default path / TCP port
+// Watch for enable_active_health_check toggle to set default path.
+// A85历史问题-6：TCP 探测端口保持用户值——0=按各上游自身端口探测（后端仅在 >0
+// 时发射 active.port）；自动填首上游端口会静默改变多端口上游的探测语义。
 watch(() => wizardForm.enable_active_health_check, (newVal) => {
   if (!newVal) return
   if (!wizardForm.health_check_path) {
     wizardForm.health_check_path = '/'
-  }
-  // For TCP rules, default the active health check port to the first upstream port
-  if (wizardForm.protocol === 'tcp' && wizardForm.tcp_health_check_port === 0) {
-    const firstUpstream = wizardForm.upstreams.find(u => u.port && u.port > 0)
-    if (firstUpstream) {
-      wizardForm.tcp_health_check_port = firstUpstream.port
-    }
   }
 })
 
@@ -2675,6 +2663,10 @@ const resetWizard = () => {
   certValidationSeq++
   resetCertInfo()
   wizardForm.tlsKeySet = false // 掩码态随向导重置（历史 B3-历史问题）
+  // A85WA-历史问题：关闭向导即清空私钥/证书明文（对齐 MFA secret 关闭即清先例）——
+  // 两次打开之间不留明文于响应式状态/DevTools。
+  wizardForm.tls_cert = ''
+  wizardForm.tls_key = ''
   upstreamTouched.value = []
   editingRule.value = null
   isCopyMode.value = false
@@ -3651,7 +3643,7 @@ const startLogStats = async () => {
 
 const onRuleLogTabChange = (tab: string) => {
   ruleLogRequestSeq++
-  ruleLogLoading.value = false
+  ruleLogTail.invalidate()
   logStatsInFlight.value = false
   ruleLogStatsLoading.value = false
   ruleLogStatsError.value = ''
@@ -3672,7 +3664,7 @@ const onRuleLogDialogOpened = () => {
 
 const onRuleLogDialogClosed = () => {
   ruleLogRequestSeq++
-  stopRuleLogPolling()
+  ruleLogTail.stop()
   ruleLogContent.value = ''
   ruleLogCaddyId.value = ''
   logStatsMaps.value = null
@@ -3680,9 +3672,26 @@ const onRuleLogDialogClosed = () => {
   ruleLogStatsLoading.value = false
   ruleLogStatsError.value = ''
   logStatsOffset.value = 0
-  ruleLogLoading.value = false
   logStatsInFlight.value = false
 }
+
+// A85WA-历史问题：日志尾轮询收敛 useLogTailPolling 单源（取数/写回/滚底/单飞/会话
+// 序号守卫）；定时器保留在本地——log/stats 双 tab 分支由 refreshRuleLogs 分发。
+const ruleLogTail = useLogTailPolling({
+  interval: 5000,
+  content: ruleLogContent,
+  container: ruleLogContainerRef,
+  isActive: () => !disposed && ruleLogDialogVisible.value && ruleLogTab.value === 'log' && ruleLogCaddyId.value !== '',
+  fetch: async () => {
+    const targetId = ruleLogCaddyId.value
+    if (!targetId) return null
+    const res = await request.get<APIResponse<RuleLogData>>(`/rules/${targetId}/logs`, { signal: healthPolling.signal, silent: true })
+    if (disposed || !ruleLogDialogVisible.value || ruleLogTab.value !== 'log' || ruleLogCaddyId.value !== targetId) return null
+    return res.data?.content || ''
+  },
+  onError: (error) => { console.error('Failed to fetch rule logs:', error) },
+})
+const ruleLogLoading = ruleLogTail.loading
 
 const startRuleLogPolling = () => {
   stopRuleLogPolling()
@@ -3698,31 +3707,14 @@ const stopRuleLogPolling = () => {
   }
 }
 
-const refreshRuleLogs = async () => {
+const refreshRuleLogs = () => {
   // 后台标签页暂停轮询：定时器空转跳过，回到可见后的下一个 tick 立即补拉
   if (disposed || document.hidden) return
   if (ruleLogTab.value === 'stats') {
     fetchLogStream()
     return
   }
-  if (!ruleLogCaddyId.value || ruleLogLoading.value) return
-  const targetId = ruleLogCaddyId.value
-  const requestSeq = ++ruleLogRequestSeq
-  ruleLogLoading.value = true
-  try {
-    const res = await request.get<APIResponse<RuleLogData>>(`/rules/${targetId}/logs`, { signal: healthPolling.signal, silent: true })
-    if (disposed || requestSeq !== ruleLogRequestSeq || !ruleLogDialogVisible.value || ruleLogTab.value !== 'log' || ruleLogCaddyId.value !== targetId) return
-    ruleLogContent.value = res.data?.content || ''
-    nextTick(() => {
-      if (disposed) return
-      const el = ruleLogContainerRef.value
-      if (el) el.scrollTop = el.scrollHeight
-    })
-  } catch (error: unknown) {
-    if (!disposed) console.error('Failed to fetch rule logs:', error)
-  } finally {
-    if (!disposed && requestSeq === ruleLogRequestSeq) ruleLogLoading.value = false
-  }
+  void ruleLogTail.refresh()
 }
 
 watch(ruleLogAutoRefresh, (val) => {
@@ -3734,12 +3726,14 @@ watch(ruleLogAutoRefresh, (val) => {
 // 历史问题-F4：健康轮询错误态（复用 usePollingErrorState，与证书任务轮询同口径）——
 // 原实现仅 console，/config/health 失败时健康列回落「-」且无任何提示。
 const healthPollingError = usePollingErrorState()
-const healthPolling = usePollingTask(async () => fetchHealthStatus(), {
+const healthPolling = usePollingTask(async () => {
+  // A85WA-历史问题：接入退避门（与 certJobsPolling 同口径）——横幅「自动重试已退避」
+  // 与实际轮询一致；fetchHealthStatus 内部捕获并 recordError 不抛出，
+  // 原轮询错误回调永不可达（死代码已删除）。
+  if (!healthPollingError.canRun()) return
+  await fetchHealthStatus()
+}, {
   interval: 15000,
-  onError: (error) => {
-    console.error('Failed to poll health status:', error)
-    healthPollingError.recordError(error)
-  },
 })
 const healthPollingErrorDescription = computed(() => {
   const lastError = formatDate(healthPollingError.lastErrorAt.value)

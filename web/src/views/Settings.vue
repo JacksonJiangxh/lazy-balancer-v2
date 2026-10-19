@@ -14,6 +14,14 @@
       </div>
     </div>
 
+    <!-- A85WB-历史问题：首屏 /config 失败显性化 + 重试——原仅 console，保存门永久禁用
+         只能整页刷新 -->
+    <el-alert v-if="configLoadFailed" type="error" :closable="false" show-icon class="error-banner" style="margin-bottom: 16px">
+      <template #title>
+        基础配置加载失败，保存已暂停以避免默认值覆盖真实配置。<el-button link type="danger" @click="fetchSettings">重试</el-button>
+      </template>
+    </el-alert>
+
     <div v-if="activeTab === 'tasks'" class="task-monitor-wrap">
       <TaskMonitor />
     </div>
@@ -26,6 +34,7 @@
       />
       <CaddyGlobalSettings
         v-model:settings="settings"
+        :config-loaded="configLoaded"
         @save="handleSaveCaddy"
       />
     </div>
@@ -35,6 +44,7 @@
     <FreeCertificates
       v-else-if="activeTab === 'certificates'"
       v-model:global="global"
+      :config-loaded="configLoaded"
       @save="handleSaveCertificates"
     />
   </div>
@@ -208,6 +218,8 @@ const applyCertKeys = (data: ConfigPayload) => {
 }
 
 const configLoaded = ref(false)
+// A85WB-历史问题：首屏失败显性化（模板重试入口）；任一成功 /config 读取都恢复保存门
+const configLoadFailed = ref(false)
 const fetchSettings = async () => {
   const requestSeq = ++settingsRequestSeq
   configLoaded.value = false
@@ -218,9 +230,11 @@ const fetchSettings = async () => {
       applyCaddyKeys(res.data)
       applyCertKeys(res.data)
       configLoaded.value = true
+      configLoadFailed.value = false
     }
   } catch (error) {
     console.error('Failed to fetch settings:', error)
+    if (requestSeq === settingsRequestSeq) configLoadFailed.value = true
   }
 }
 
@@ -230,6 +244,10 @@ const refreshConfigSection = async (apply: (data: ConfigPayload) => void) => {
     const res = await request.get('/config')
     if (requestSeq === settingsRequestSeq && res.data) {
       apply(res.data)
+      // A85WB-历史问题：任一成功读取即恢复保存门——首屏瞬时失败后经卡片保存后刷新
+      // 成功的路径不再让 Basic/Caddy 保存永久禁用（原只有 fetchSettings 置 true）。
+      configLoaded.value = true
+      configLoadFailed.value = false
     }
   } catch (error) {
     console.error('Failed to fetch settings:', error)

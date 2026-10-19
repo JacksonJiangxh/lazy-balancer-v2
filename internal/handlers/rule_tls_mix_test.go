@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 func newTLSMixRouter(t *testing.T, handler *Handlers) *gin.Engine {
@@ -59,9 +60,7 @@ func tlsMixBody(name, domain string, listenPort int, enableTLS bool) string {
 
 func TestRulePortTLSMix_rejected(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	router := newTLSMixRouter(t, handler)
 	create := func(body string) *httptest.ResponseRecorder {
 		request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
@@ -111,9 +110,7 @@ func TestRulePortTLSMix_rejected(t *testing.T) {
 // 在裸比较下漏检。修复后 NULL 归一为明文（0）参与混布判定。
 func TestRulePortTLSMix_null_enable_tls_row_normalized_as_plaintext(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	router := newTLSMixRouter(t, handler)
 	create := func(body string) *httptest.ResponseRecorder {
 		request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
@@ -152,9 +149,7 @@ func TestRulePortTLSMix_null_enable_tls_row_normalized_as_plaintext(t *testing.T
 // 实际只测了 create×2 + enable；更新开启 TLS 命中同端口混布门无钉测。
 func TestRulePortTLSMix_rejectedOnUpdate(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	router := newTLSMixRouter(t, handler)
 
 	// Given：同端口已启用明文规则 A + 一条禁用明文规则 B（同形态共存合法）

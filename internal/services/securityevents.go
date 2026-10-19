@@ -25,6 +25,7 @@ import (
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/wafiplist"
 )
 
 // Security event ingestion: tails the Coraza WAF audit log (consecutive
@@ -266,14 +267,40 @@ func securityEventsHostWithoutPort(hostport string) string {
 const (
 	securityEventsHeadersCap = 65536 // 64KB(2026-09-28 用户裁定:service mesh 用户携带大量 x-b3/x-envoy 等追踪头,8KB 截断影响调试体验;此上限仅约束事件详情弹框存储,不影响请求本身)
 	securityEventsBodyCap    = 65536
+	// securityEventsDroppedHeadersKey 是写侧合成的丢弃计数键；客户端同名头
+	// 一律剥离，避免伪造字段被展示层当作真实丢弃数。
+	securityEventsDroppedHeadersKey  = "_lb_dropped_headers"
+	securityEventsB64Prefix          = "base64:"
+	securityEventsB64TruncatedPrefix = "base64-truncated:"
+	securityEventsTextPrefix         = "utf8:"
 )
 
 // securityEventsSerializeHeaders 落库事件请求头：JSON 文本，64KB 上限——超限按
 // 值体积从大到小逐条丢弃，并以 _lb_dropped_headers 键记录丢弃条数（始终保持合法 JSON，
-// 前端无需容错解析）。头名/值原文保留，敏感值掩码是展示层姿态。
+// 前端无需容错解析）。头名/值原文保留，敏感值掩码是展示层姿态。合成键保留给
+// 写侧，客户端同名头在序列化前剥离。
 func securityEventsSerializeHeaders(headers map[string][]string) string {
 	if len(headers) == 0 {
 		return ""
+	}
+	clientMarker := false
+	for key := range headers {
+		if strings.EqualFold(key, securityEventsDroppedHeadersKey) {
+			clientMarker = true
+			break
+		}
+	}
+	if clientMarker {
+		clean := make(map[string][]string, len(headers))
+		for key, values := range headers {
+			if !strings.EqualFold(key, securityEventsDroppedHeadersKey) {
+				clean[key] = values
+			}
+		}
+		if len(clean) == 0 {
+			return ""
+		}
+		headers = clean
 	}
 	raw, err := json.Marshal(headers)
 	if err != nil {
@@ -324,7 +351,7 @@ func securityEventsSerializeHeaders(headers map[string][]string) string {
 	if dropped == 0 {
 		return string(raw)
 	}
-	trimmed["_lb_dropped_headers"] = []string{strconv.Itoa(dropped)}
+	trimmed[securityEventsDroppedHeadersKey] = []string{strconv.Itoa(dropped)}
 	raw, err = json.Marshal(trimmed)
 	if err != nil {
 		return ""
@@ -338,7 +365,7 @@ func securityEventsSerializeHeaders(headers map[string][]string) string {
 			delete(trimmed, keys[dropped].key)
 			dropped++
 		}
-		trimmed["_lb_dropped_headers"] = []string{strconv.Itoa(dropped)}
+		trimmed[securityEventsDroppedHeadersKey] = []string{strconv.Itoa(dropped)}
 		raw, err = json.Marshal(trimmed)
 		if err != nil {
 			return ""
@@ -350,12 +377,18 @@ func securityEventsSerializeHeaders(headers map[string][]string) string {
 // securityEventsEncodeBody 落库事件请求体：64KB 上限。UTF-8 文本原样存储，
 // 超限截到符文边界（不劈开多字节字符）并追加 \n...[TRUNCATED]；二进制整体
 // base64 并加 base64: 前缀，超限只编码前 64KB 原始字节、前缀改为
-// base64-truncated:。空体存空串。
+// base64-truncated:。UTF-8 文本若本身以任一保留前缀开头，先加 utf8: 转义，
+// 消除「明文被展示层误当二进制」的歧义。空体存空串。
 func securityEventsEncodeBody(body string) string {
 	if body == "" {
 		return ""
 	}
 	if utf8.ValidString(body) {
+		if strings.HasPrefix(body, securityEventsB64TruncatedPrefix) ||
+			strings.HasPrefix(body, securityEventsB64Prefix) ||
+			strings.HasPrefix(body, securityEventsTextPrefix) {
+			body = securityEventsTextPrefix + body
+		}
 		if len(body) <= securityEventsBodyCap {
 			return body
 		}
@@ -372,9 +405,9 @@ func securityEventsEncodeBody(body string) string {
 		truncated = true
 	}
 	if truncated {
-		return "base64-truncated:" + base64.StdEncoding.EncodeToString([]byte(raw))
+		return securityEventsB64TruncatedPrefix + base64.StdEncoding.EncodeToString([]byte(raw))
 	}
-	return "base64:" + base64.StdEncoding.EncodeToString([]byte(raw))
+	return securityEventsB64Prefix + base64.StdEncoding.EncodeToString([]byte(raw))
 }
 
 // securityEventsRuleRef is an lb_rules identity resolved for one event:
@@ -382,6 +415,62 @@ func securityEventsEncodeBody(body string) string {
 type securityEventsRuleRef struct {
 	caddyID string
 	name    string
+}
+
+// securityEventsTrustMatcher 摄取期「规则→启用策略信任并集」匹配器。只收录
+// 引擎真实发射信任降级面的策略：非 stage0 的信任名单（id:3/5）与 stage0
+// 保留检测（id:12）；直通 stage0（trust_detection=0）零事件，不构成豁免。
+type securityEventsTrustMatcher struct {
+	byRule map[string][]netip.Prefix
+	global []netip.Prefix
+}
+
+func securityEventsBuildTrustMatcher(bindings map[string][]int, policyByID map[int]*models.SecurityPolicy) *securityEventsTrustMatcher {
+	eligible := func(p *models.SecurityPolicy) bool {
+		return p != nil && p.IPWhitelistEnabled && !p.IPRefMissing &&
+			(p.PolicyType != models.PolicyTypeStage0 || p.TrustDetection)
+	}
+	m := &securityEventsTrustMatcher{byRule: make(map[string][]netip.Prefix, len(bindings))}
+	var globalEntries []string
+	for _, p := range policyByID {
+		if eligible(p) {
+			globalEntries = append(globalEntries, mergedWhitelist(p)...)
+		}
+	}
+	m.global = wafiplist.AggregatePrefixes(globalEntries)
+	for rule, ids := range bindings {
+		var entries []string
+		for _, id := range ids {
+			if p := policyByID[id]; eligible(p) {
+				entries = append(entries, mergedWhitelist(p)...)
+			}
+		}
+		m.byRule[rule] = wafiplist.AggregatePrefixes(entries)
+	}
+	return m
+}
+
+func (m *securityEventsTrustMatcher) trusted(ruleCaddyID, ip string) bool {
+	if m == nil {
+		return false
+	}
+	prefixes, known := m.byRule[ruleCaddyID]
+	if ruleCaddyID == "" || !known {
+		// 规则已在发射后被删除/改名：无法确定逐规则信任集，退回启用策略信任
+		// 并集，保证“已信任 IP 不因不可归因的下游 logged 事件被封”。
+		prefixes = m.global
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, prefix := range prefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // securityEventsLoadMappings batch-loads per-tick indexes: host→rule, plus the
@@ -454,7 +543,7 @@ func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string]
 	// 不发射 CRS，不得认领 CRS 事件）；仅加载启用策略（disabled 策略不应再
 	// 接收事件归因）。
 	policyByID := make(map[int]*models.SecurityPolicy)
-	polRows, err := db.DB.Query(`SELECT id, COALESCE(name,''), COALESCE(mode,'off'), COALESCE(custom_rules,'[]'), COALESCE(crs_rule_groups,'[]'), COALESCE(ip_blacklist,'[]'), COALESCE(ip_acl_enabled,0), COALESCE(ip_acl_mode,''), COALESCE(ip_acl_list,'[]'), COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_enabled,1), COALESCE(ip_whitelist,'[]'), COALESCE(ip_whitelist_refs,'[]'), COALESCE(geoip_countries,'[]'), COALESCE(geoip_mode,'off'), COALESCE(waf_check_response,0), COALESCE(policy_type,''), COALESCE(trust_detection,0) FROM security_policies WHERE enabled=1`)
+	polRows, err := db.DB.Query(`SELECT id, COALESCE(name,''), COALESCE(mode,'off'), COALESCE(custom_rules,'[]'), COALESCE(crs_rule_groups,'[]'), COALESCE(crs_excluded_rules,'[]'), COALESCE(ip_blacklist,'[]'), COALESCE(ip_acl_enabled,0), COALESCE(ip_acl_mode,''), COALESCE(ip_acl_list,'[]'), COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_enabled,1), COALESCE(ip_whitelist,'[]'), COALESCE(ip_whitelist_refs,'[]'), COALESCE(geoip_countries,'[]'), COALESCE(geoip_mode,'off'), COALESCE(waf_check_response,0), COALESCE(policy_type,''), COALESCE(trust_detection,0) FROM security_policies WHERE enabled=1`)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("security events: load policies: %w", err)
 	}
@@ -462,13 +551,14 @@ func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string]
 	var policies []*models.SecurityPolicy
 	for polRows.Next() {
 		p := &models.SecurityPolicy{}
-		var customJSON, crsJSON, blacklistJSON, geoipJSON, whitelistJSON, whitelistRefsJSON string
-		if err := polRows.Scan(&p.ID, &p.Name, &p.Mode, &customJSON, &crsJSON, &blacklistJSON, &p.IPACLEnabled, &p.IPACLMode, &p.IPACLList, &p.IPACLListRefs, &p.IPWhitelistEnabled, &whitelistJSON, &whitelistRefsJSON, &geoipJSON, &p.GeoIPMode, &p.WAFCheckResponse, &p.PolicyType, &p.TrustDetection); err != nil {
+		var customJSON, crsJSON, crsExcludedJSON, blacklistJSON, geoipJSON, whitelistJSON, whitelistRefsJSON string
+		if err := polRows.Scan(&p.ID, &p.Name, &p.Mode, &customJSON, &crsJSON, &crsExcludedJSON, &blacklistJSON, &p.IPACLEnabled, &p.IPACLMode, &p.IPACLList, &p.IPACLListRefs, &p.IPWhitelistEnabled, &whitelistJSON, &whitelistRefsJSON, &geoipJSON, &p.GeoIPMode, &p.WAFCheckResponse, &p.PolicyType, &p.TrustDetection); err != nil {
 			return nil, nil, nil, fmt.Errorf("security events: scan policy: %w", err)
 		}
 		p.CustomRules = json.RawMessage(customJSON)
 		p.GeoIPCountries = json.RawMessage(geoipJSON)
 		p.CRSRuleGroups = json.RawMessage(crsJSON)
+		p.CRSExcludedRules = json.RawMessage(crsExcludedJSON)
 		p.IPBlacklist = json.RawMessage(blacklistJSON)
 		// 信任名单（IP 族 fallback 能力首选层的 logged 语义能力判定）：
 		// 既有 SELECT 未携带，能力层不读库补查（摄入 tick 热路径），在此装载。
@@ -489,6 +579,102 @@ func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string]
 		return nil, nil, nil, fmt.Errorf("security events: iterate policies: %w", err)
 	}
 	return rules, bindings, policyByID, nil
+}
+
+// securityEventsPolicyCRSExclusions 是摄取热路径的排除判定快照：JSON 只在
+// tick 装载时解析一次，scope=list 的引用条目同批加载，避免逐事件查库。
+type securityEventsPolicyCRSExclusions struct {
+	entries []CRSExcludedEntry
+	lists   map[int64][]string
+}
+
+func securityEventsBuildCRSExclusionMatcher(policyByID map[int]*models.SecurityPolicy) map[int]securityEventsPolicyCRSExclusions {
+	out := make(map[int]securityEventsPolicyCRSExclusions, len(policyByID))
+	var refIDs []int64
+	seen := make(map[int64]struct{})
+	for id, p := range policyByID {
+		if p == nil {
+			continue
+		}
+		entries := ParseCRSExcludedRules(string(p.CRSExcludedRules))
+		if len(entries) == 0 {
+			continue
+		}
+		out[id] = securityEventsPolicyCRSExclusions{entries: entries}
+		for _, entry := range entries {
+			if entry.Scope != "list" {
+				continue
+			}
+			for _, ref := range entry.ListRefs {
+				if _, ok := seen[ref]; ok {
+					continue
+				}
+				seen[ref] = struct{}{}
+				refIDs = append(refIDs, ref)
+			}
+		}
+	}
+	if len(refIDs) == 0 {
+		return out
+	}
+	lists, _, err := loadIPListEntriesVia(nil, refIDs)
+	if err != nil {
+		// 与发射端一致：列表不可读时该引用不形成排除（宁可记录，不误排除）。
+		Logf("warn", "security events attribution: load CRS exclusion IP lists failed: %v", err)
+	}
+	for id, set := range out {
+		set.lists = lists
+		out[id] = set
+	}
+	return out
+}
+
+func securityEventsCRSExclusionTargetMatches(target, ruleID string) bool {
+	target = strings.TrimSpace(target)
+	n, err := strconv.Atoi(ruleID)
+	if err != nil || n < 900000 || n >= 1000000 {
+		return false
+	}
+	if IsCRSGroupCode(target) {
+		return len(ruleID) == 6 && strings.HasPrefix(ruleID, "9"+target)
+	}
+	mapped := crsFilenameToRuleIDRange(target)
+	if !validSecRuleRemoveTarget(mapped) {
+		return false
+	}
+	loRaw, hiRaw, single := strings.Cut(mapped, "-")
+	if !single {
+		hiRaw = loRaw
+	}
+	lo, loErr := strconv.Atoi(loRaw)
+	hi, hiErr := strconv.Atoi(hiRaw)
+	return loErr == nil && hiErr == nil && n >= lo && n <= hi
+}
+
+func securityEventsCRSExclusionRemovesRule(set securityEventsPolicyCRSExclusions, ruleID, clientIP string) bool {
+	for _, entry := range set.entries {
+		if CRSExclusionTargetRemovesInit(entry.Target) {
+			continue
+		}
+		if entry.Scope == "ip" || entry.Scope == "list" {
+			// 作用域限定只支持组号与 6 位 ID（发射端 expandCRSScopedExclusionTargets
+			// 同口径）；空/无法判定的客户端 IP 不构成命中。
+			if clientIP == "" || !(IsCRSGroupCode(entry.Target) || IsCRSRuleIDTarget(entry.Target)) {
+				continue
+			}
+			match := strings.Split(entry.IPs, ",")
+			for _, ref := range entry.ListRefs {
+				match = append(match, set.lists[ref]...)
+			}
+			if !securityEventsIPInList(clientIP, match) {
+				continue
+			}
+		}
+		if securityEventsCRSExclusionTargetMatches(entry.Target, ruleID) {
+			return true
+		}
+	}
+	return false
 }
 
 // securityEventsPolicyContainsRule reports whether the given rule id belongs to
@@ -512,6 +698,12 @@ func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string]
 // 让位、由 fallback 能力首选层归属（绝不归零）。clientIP 为空（历史调用形状/
 // 记录缺 IP）保持既有「名单非空即认领」口径。
 func securityEventsPolicyContainsRule(policy *models.SecurityPolicy, ruleTriggered, clientIP string) bool {
+	return securityEventsPolicyContainsRuleWithExclusions(policy, ruleTriggered, clientIP, securityEventsPolicyCRSExclusions{})
+}
+
+// securityEventsPolicyContainsRuleWithExclusions 在归属判定中加入配置期/运行时
+// CRS 排除快照：被本策略删除的规则不可能是其发射面。
+func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolicy, ruleTriggered, clientIP string, crsExclusions securityEventsPolicyCRSExclusions) bool {
 	if policy == nil || ruleTriggered == "" {
 		return false
 	}
@@ -595,6 +787,11 @@ func securityEventsPolicyContainsRule(policy *models.SecurityPolicy, ruleTrigger
 		// custom_only 同样零 CRS Include,口径收紧为「CRS 生效模式」——否则
 		// 同规则多策略绑定时 custom_only 策略会抢走 blocking 策略的 CRS 事件归属。
 		if policy.Mode != "blocking" && policy.Mode != "detection" {
+			return false
+		}
+		// 配置期 SecRuleRemoveById / 运行时 ctl 已删除的规则不可能是本策略
+		// 的发射面；先判排除，避免 949/959 强制包含分支与组号分支误认领。
+		if securityEventsCRSExclusionRemovesRule(crsExclusions, ruleTriggered, clientIP) {
 			return false
 		}
 		// 历史问题：949 评估规则自 v2.2.3 起对全部启用 WAF 的策略强制包含（F0
@@ -760,6 +957,13 @@ func securityEventsRuleIsCustomFamily(ruleTriggered string) bool {
 	return (n >= 10000 && n < geoipPrecheckRuleBase) || n >= 1000000
 }
 
+// securityEventsRuleIsCRSFamily 报告规则 id 是否落在 CRS 9xxxxx 段（排除判定
+// 只对该段有意义；IP/自定义族不受 SecRuleRemoveById 影响）。
+func securityEventsRuleIsCRSFamily(ruleTriggered string) bool {
+	n, err := strconv.Atoi(ruleTriggered)
+	return err == nil && n >= 900000 && n < 1000000
+}
+
 // securityEventsCustomRulesEventSurface（2026-09-21，IP 族能力首选层同模式扩展）：
 // 自定义族事件 fallback 首选层的物理发射面判定——emitCustomRules 对 Disabled
 // 规则整条跳过（security.go「if !cr.Enabled { continue }」，合成段 1000000+ 同
@@ -900,6 +1104,10 @@ func securityEventsIPInList(ip string, list []string) bool {
 // 同样走该回退而非归零：事件既已被摄取，必是某绑定策略在发射时的配置发出了它
 // （当前配置可能已变更），归到首启用绑定是最接近发射现实的归属。
 func securityEventsAttributePolicy(ruleCaddyID, ruleTriggered, action, clientIP string, policyByID map[int]*models.SecurityPolicy, bindings map[string][]int) (int, string) {
+	return securityEventsAttributePolicyWithExclusions(ruleCaddyID, ruleTriggered, action, clientIP, policyByID, bindings, nil)
+}
+
+func securityEventsAttributePolicyWithExclusions(ruleCaddyID, ruleTriggered, action, clientIP string, policyByID map[int]*models.SecurityPolicy, bindings map[string][]int, crsExclusions map[int]securityEventsPolicyCRSExclusions) (int, string) {
 	policyIDs := bindings[ruleCaddyID]
 	if len(policyIDs) == 0 {
 		return 0, ""
@@ -913,7 +1121,7 @@ func securityEventsAttributePolicy(ruleCaddyID, ruleTriggered, action, clientIP 
 		if p.IPRefMissing {
 			continue
 		}
-		if securityEventsPolicyContainsRule(p, ruleTriggered, clientIP) {
+		if securityEventsPolicyContainsRuleWithExclusions(p, ruleTriggered, clientIP, crsExclusions[p.ID]) {
 			return pid, p.Name
 		}
 	}
@@ -934,6 +1142,9 @@ func securityEventsAttributePolicy(ruleCaddyID, ruleTriggered, action, clientIP 
 			return false
 		}
 		if customFam && !securityEventsCustomRulesEventSurface(p) {
+			return false
+		}
+		if securityEventsRuleIsCRSFamily(ruleTriggered) && securityEventsCRSExclusionRemovesRule(crsExclusions[p.ID], ruleTriggered, clientIP) {
 			return false
 		}
 		return true
@@ -1259,6 +1470,8 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	for _, ref := range rules {
 		rulesByID[ref.caddyID] = ref
 	}
+	trustMatcher := securityEventsBuildTrustMatcher(bindings, policyByID)
+	crsExclusionMatcher := securityEventsBuildCRSExclusionMatcher(policyByID)
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return offset, fmt.Errorf("security events: seek audit log: %w", err)
 	}
@@ -1457,7 +1670,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 			if rule.caddyID == "" {
 				rule = securityEventsMapHost(rec.Host, rules)
 			}
-			policyID, policyName := securityEventsAttributePolicy(rule.caddyID, rec.RuleTriggered, rec.Action, rec.ClientIP, policyByID, bindings)
+			policyID, policyName := securityEventsAttributePolicyWithExclusions(rule.caddyID, rec.RuleTriggered, rec.Action, rec.ClientIP, policyByID, bindings, crsExclusionMatcher)
 			res, ierr := stmt.Exec(rec.EventTime, rule.caddyID, policyID, rec.ClientIP, rec.Method, rec.URI,
 				rec.EventType, rec.RuleTriggered, rec.RuleMsg, rec.Action, rec.AnomalyScore,
 				rule.name, policyName, rec.TransactionID, rec.DurationUs, rec.PrecheckUs, rec.RequestHeaders, rec.RequestBody)
@@ -1479,7 +1692,13 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 			}
 			if affected == 1 {
 				eventAt, _ := time.ParseInLocation("2006-01-02 15:04:05", rec.EventTime, time.UTC)
-				autobanBatch = append(autobanBatch, autobanFeedItem{IP: rec.ClientIP, Action: rec.Action, RuleTriggered: rec.RuleTriggered, At: eventAt})
+				autobanBatch = append(autobanBatch, autobanFeedItem{
+					IP:            rec.ClientIP,
+					Action:        rec.Action,
+					RuleTriggered: rec.RuleTriggered,
+					At:            eventAt,
+					TrustExempt:   rec.Action == "logged" && trustMatcher.trusted(rule.caddyID, rec.ClientIP),
+				})
 				batchInserted++
 				// 历史问题-1：记录本批最旧插入分钟（event_time 恒 UTC 墙钟串；
 				// 解析失败跳过——仅影响回退精度，不影响摄取）。
@@ -1620,6 +1839,61 @@ var securityEventsPollState struct {
 	inited bool
 }
 
+const securityEventsIngestionFailureThreshold = 3
+
+// SecurityEventsIngestionStatus 是采集 daemon 的进程内健康快照（不改变任务
+// 调度状态）：连续非停等 tick 失败达到阈值即健康位为 false，供事件页显性提示。
+type SecurityEventsIngestionStatus struct {
+	Observed            bool   `json:"observed"`
+	Healthy             bool   `json:"healthy"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	LastError           string `json:"last_error,omitempty"`
+	LastErrorAt         string `json:"last_error_at,omitempty"`
+	LastSuccessAt       string `json:"last_success_at,omitempty"`
+}
+
+var securityEventsIngestionHealth struct {
+	sync.Mutex
+	status SecurityEventsIngestionStatus
+}
+
+func securityEventsRecordPollResult(err error) {
+	if errors.Is(err, errSecurityEventsStalled) {
+		// 残缺文档是正常等待写侧补全的瞬态，不进入失败状态。
+		return
+	}
+	now := time.Now().UTC()
+	securityEventsIngestionHealth.Lock()
+	defer securityEventsIngestionHealth.Unlock()
+	status := &securityEventsIngestionHealth.status
+	status.Observed = true
+	if err == nil {
+		status.ConsecutiveFailures = 0
+		status.Healthy = true
+		status.LastSuccessAt = now.Format(time.RFC3339)
+		return
+	}
+	status.ConsecutiveFailures++
+	status.Healthy = status.ConsecutiveFailures < securityEventsIngestionFailureThreshold
+	status.LastError = err.Error()
+	status.LastErrorAt = now.Format(time.RFC3339)
+}
+
+// SecurityEventsIngestionHealthSnapshot 返回一致的健康快照（事件列表 API 消费）。
+func SecurityEventsIngestionHealthSnapshot() SecurityEventsIngestionStatus {
+	securityEventsIngestionHealth.Lock()
+	defer securityEventsIngestionHealth.Unlock()
+	return securityEventsIngestionHealth.status
+}
+
+// SecurityEventsSetIngestionHealthForTest 直设健康快照（handlers 契约测试用；
+// 生产路径只经 securityEventsRecordPollResult 更新）。
+func SecurityEventsSetIngestionHealthForTest(status SecurityEventsIngestionStatus) {
+	securityEventsIngestionHealth.Lock()
+	defer securityEventsIngestionHealth.Unlock()
+	securityEventsIngestionHealth.status = status
+}
+
 // SecurityEventsPollOnce 单轮摄取（先采集后轮转——引擎 2s 节拍调用）。
 // 返回本轮摄取条数；任务日志只由 ingestion daemon 自己写，其他调用方不得越权。
 func SecurityEventsPollOnce() int {
@@ -1633,9 +1907,11 @@ func SecurityEventsPollOnce() int {
 		securityEventsPollState.inited = true
 		Logf("info", "security events ingestion(engine) started: audit_log=%s", auditLogPath)
 	}
-	if err := securityEventsPollState.tailer.securityEventsTick(); err != nil {
-		securityEventsPollState.tailer.securityEventsRateLimitedWarn(err)
+	tickErr := securityEventsPollState.tailer.securityEventsTick()
+	if tickErr != nil {
+		securityEventsPollState.tailer.securityEventsRateLimitedWarn(tickErr)
 	}
+	securityEventsRecordPollResult(tickErr)
 	ingested := securityEventsPollState.tailer.lastIngested
 	securityEventsPollState.tailer.lastIngested = 0
 	// 历史问题-08：轮转/补采窗口入库的事件计入同一轮摄取数（此前只报 tailer 计数，

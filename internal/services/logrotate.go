@@ -150,10 +150,11 @@ func (w *RotatingFileWriter) Write(p []byte) (int, error) {
 }
 
 func (w *RotatingFileWriter) rotateLocked() error {
-	if err := w.file.Close(); err != nil {
+	file := w.file
+	w.file = nil // Close 失败后运行时描述符也已关闭；下轮 Write 必须能重开。
+	if err := file.Close(); err != nil {
 		return err
 	}
-	w.file = nil
 	stamp := time.Now().Format("20060102-150405")
 	rotated := fmt.Sprintf("%s.%s", w.path, stamp)
 	// SYSB44-2(历史 历史问题):同秒多次轮转的碰撞后缀原为 UnixNano()%1000

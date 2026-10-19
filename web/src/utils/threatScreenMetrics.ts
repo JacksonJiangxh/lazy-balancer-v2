@@ -87,7 +87,10 @@ export function formatRecentRate(raw: number): string {
   return (Math.round(raw * 10) / 10).toFixed(1)
 }
 
-/** 趋势桶 tooltip：≤24h 小时桶补「:00」，>24h 日桶原样。 */
-export function hourlyBucketLabel(name: string, hours: number): string {
-  return hours > 24 ? name : `${name}:00`
+/**
+ * 趋势桶 tooltip：后端槽标签已是最终展示形态（≤24h 为真实 HH:MM，>24h 为
+ * MM-DD），不再补 `:00`。窗口参数保留以兼容调用方；非法/缺失标签回退空串。
+ */
+export function hourlyBucketLabel(name: string, _hours: number): string {
+  return typeof name === 'string' ? name : ''
 }

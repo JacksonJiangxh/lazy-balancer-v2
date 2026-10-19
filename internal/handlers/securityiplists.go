@@ -82,6 +82,7 @@ func loadIPListEntriesForAllow(q ipListQueryer, ids []int64) (map[int64][]string
 				rows.Close()
 				return nil, err
 			}
+			raw = normalizeIPListEntriesJSON(raw)
 			var entries []models.IPListEntry
 			if err := json.Unmarshal([]byte(raw), &entries); err != nil {
 				rows.Close()
@@ -328,47 +329,9 @@ func builtinIPListLabel(name string) string {
 	return "内置威胁情报名单"
 }
 
-// validateBuiltinThreatListRefs 内置威胁名单引用门禁（2026-09-24 用户裁定）：
-// system=1 名单（威胁情报库三源）仅允许 IP ACL 黑名单（deny）引用——
-// 信任名单 / ACL 白名单（allow、绕过）/ CRS 排除作用域一律拒绝。
-// aclMode 为生效模式（请求值 ?? 存量值，由调用方合并）。与存在性校验同型：
-// 单批 IN 查询取 system 标记，命中即返回用户可读提示。
-func validateBuiltinThreatListRefs(q policyQueryRower, aclIDs, wlIDs, excludedIDs []int64, aclMode string) (string, error) {
-	all := append(append(append([]int64{}, aclIDs...), wlIDs...), excludedIDs...)
-	if len(all) == 0 {
-		return "", nil
-	}
-	seen := make(map[int64]struct{}, len(all))
-	unique := make([]interface{}, 0, len(all))
-	placeholders := make([]string, 0, len(all))
-	for _, id := range all {
-		if _, dup := seen[id]; dup {
-			continue
-		}
-		seen[id] = struct{}{}
-		unique = append(unique, id)
-		placeholders = append(placeholders, "?")
-	}
-	builtin := make(map[int64]string)
-	rows, err := q.Query("SELECT id, name FROM security_ip_lists WHERE system=1 AND id IN ("+strings.Join(placeholders, ",")+")", unique...)
-	if err != nil {
-		return "", err
-	}
-	for rows.Next() {
-		var id int64
-		var name string
-		if err := rows.Scan(&id, &name); err != nil {
-			rows.Close()
-			return "", err
-		}
-		builtin[id] = name
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return "", err
-	}
+func validateBuiltinIPListRefs(builtin map[int64]string, aclIDs, wlIDs, excludedIDs []int64, aclMode string) string {
 	if len(builtin) == 0 {
-		return "", nil
+		return ""
 	}
 	in := func(ids []int64) (int64, bool) {
 		for _, id := range ids {
@@ -379,34 +342,89 @@ func validateBuiltinThreatListRefs(q policyQueryRower, aclIDs, wlIDs, excludedID
 		return 0, false
 	}
 	if id, hit := in(wlIDs); hit {
-		return fmt.Sprintf("「%s」是%s，仅允许用于 IP 访问控制的黑名单模式，不能用于信任名单", builtin[id], builtinIPListLabel(builtin[id])), nil
+		return fmt.Sprintf("「%s」是%s，仅允许用于 IP 访问控制的黑名单模式，不能用于信任名单", builtin[id], builtinIPListLabel(builtin[id]))
 	}
 	if aclMode != "deny" {
 		if id, hit := in(aclIDs); hit {
-			return fmt.Sprintf("「%s」是%s，仅允许用于 IP 访问控制的黑名单模式", builtin[id], builtinIPListLabel(builtin[id])), nil
+			return fmt.Sprintf("「%s」是%s，仅允许用于 IP 访问控制的黑名单模式", builtin[id], builtinIPListLabel(builtin[id]))
 		}
 	}
 	if id, hit := in(excludedIDs); hit {
-		return fmt.Sprintf("「%s」是%s，仅允许用于 IP 访问控制的黑名单模式，不能用于 CRS 排除", builtin[id], builtinIPListLabel(builtin[id])), nil
+		return fmt.Sprintf("「%s」是%s，仅允许用于 IP 访问控制的黑名单模式，不能用于 CRS 排除", builtin[id], builtinIPListLabel(builtin[id]))
 	}
-	return "", nil
+	return ""
+}
+
+// validateBuiltinThreatListRefs 内置威胁名单引用门禁（2026-09-24 用户裁定）：
+// system=1 名单仅允许 IP ACL 黑名单（deny）引用；信任名单 / ACL 白名单
+// （allow、绕过）/ CRS 排除作用域一律拒绝。大 ID 集按 500 分块，避免 SQLite
+// 变量上限；判定逻辑与备份导入共用 validateBuiltinIPListRefs。
+func validateBuiltinThreatListRefs(q policyQueryRower, aclIDs, wlIDs, excludedIDs []int64, aclMode string) (string, error) {
+	all := append(append(append([]int64{}, aclIDs...), wlIDs...), excludedIDs...)
+	if len(all) == 0 {
+		return "", nil
+	}
+	seen := make(map[int64]struct{}, len(all))
+	unique := make([]int64, 0, len(all))
+	for _, id := range all {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	builtin := make(map[int64]string)
+	for _, chunk := range chunkIDs(unique, 500) {
+		rows, err := q.Query("SELECT id, name FROM security_ip_lists WHERE system=1 AND id IN ("+chunk.placeholders+")", chunk.args...)
+		if err != nil {
+			return "", err
+		}
+		for rows.Next() {
+			var id int64
+			var name string
+			if err := rows.Scan(&id, &name); err != nil {
+				rows.Close()
+				return "", err
+			}
+			builtin[id] = name
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return "", err
+		}
+	}
+	return validateBuiltinIPListRefs(builtin, aclIDs, wlIDs, excludedIDs, aclMode), nil
+}
+
+func validateIPListMetadataShape(name, description, category string) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("名称不能为空")
+	}
+	if len([]rune(name)) > ipListMaxNameLength {
+		return fmt.Errorf("名称长度不能超过 %d 个字符", ipListMaxNameLength)
+	}
+	if len([]rune(description)) > ipListMaxDescriptionLength {
+		return fmt.Errorf("描述长度不能超过 %d 个字符", ipListMaxDescriptionLength)
+	}
+	if len([]rune(category)) > ipListMaxCategoryLength {
+		return fmt.Errorf("分类长度不能超过 %d 个字符", ipListMaxCategoryLength)
+	}
+	return nil
+}
+
+func normalizeIPListEntriesJSON(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return "[]"
+	}
+	return raw
 }
 
 // validateIPListShape 校验列表载荷并返回解析后的条目：名称非空 ≤50、描述 ≤200、
 // 分类 ≤32、条目数 ≤2000（AU-7 历史修正：2026-10-14 用户裁定上限已 500→2000）、
 // value 过 validIPOrCIDR、remark ≤100。
 func validateIPListShape(name, description, category, entriesJSON string) ([]models.IPListEntry, error) {
-	if strings.TrimSpace(name) == "" {
-		return nil, fmt.Errorf("名称不能为空")
-	}
-	if len([]rune(name)) > ipListMaxNameLength {
-		return nil, fmt.Errorf("名称长度不能超过 %d 个字符", ipListMaxNameLength)
-	}
-	if len([]rune(description)) > ipListMaxDescriptionLength {
-		return nil, fmt.Errorf("描述长度不能超过 %d 个字符", ipListMaxDescriptionLength)
-	}
-	if len([]rune(category)) > ipListMaxCategoryLength {
-		return nil, fmt.Errorf("分类长度不能超过 %d 个字符", ipListMaxCategoryLength)
+	if err := validateIPListMetadataShape(name, description, category); err != nil {
+		return nil, err
 	}
 	var entries []models.IPListEntry
 	if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
@@ -615,6 +633,7 @@ func (h *Handlers) GetIPList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
+	entriesJSON = normalizeIPListEntriesJSON(entriesJSON)
 	// 历史问题：预置自动封禁名单（system=1 但条目在 DB）走自定义分支——威胁文件
 	// 读取对该名恒失败（未映射威胁源）会让弹框 500。
 	row.PresetAutoban = row.System && row.Name == services.AutobanPresetListName
@@ -778,9 +797,7 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 	if req.Entries != nil {
 		entriesJSON = *req.Entries
 	}
-	if strings.TrimSpace(entriesJSON) == "" {
-		entriesJSON = "[]"
-	}
+	entriesJSON = normalizeIPListEntriesJSON(entriesJSON)
 	entries, err := validateIPListShape(name, description, category, entriesJSON)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
@@ -1034,6 +1051,7 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 			return
 		}
 	}
+	entriesJSON = normalizeIPListEntriesJSON(entriesJSON)
 	var entries []models.IPListEntry
 	if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "存储的 IP 列表条目已损坏，请删除后重建"})
@@ -1111,6 +1129,10 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 // 引用策略重载。
 func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 	id := c.Param("id")
+	if _, ok := parsePositiveNumericID(id); !ok {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的列表 ID"})
+		return
+	}
 	var req models.AddIPToListRequest
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -1152,6 +1174,7 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 			return
 		}
 	}
+	entriesJSON = normalizeIPListEntriesJSON(entriesJSON)
 	var entries []models.IPListEntry
 	if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "存储的 IP 列表条目已损坏，请删除后重建"})

@@ -32,27 +32,24 @@ type TriggerAuditContext struct {
 //     skipped 行，静默。
 //   - 其它错误：日志 + 「触发失败」补偿审计（任务未执行/失败不得无痕）。
 //
-// operator 归人：te.Trigger 的 operator 参数与审计 username 同源。
-func TriggerTaskAsync(te *taskengine.Engine, taskID string, actx TriggerAuditContext) {
+// TriggerTaskAsync 同步完成 admission（暂停/停止/角色/单飞 CAS），成功后
+// 才异步执行并统一错误分类。调用方必须在写 HTTP 响应前消费返回错误，
+// 不得把未受理任务伪报为 running。
+//
+// operator 归人：RunAsyncResult 的 operator 参数与审计 username 同源。
+func TriggerTaskAsync(te *taskengine.Engine, taskID string, actx TriggerAuditContext) error {
 	if te == nil {
-		return
+		return taskengine.ErrEngineStopped
 	}
-	go func() {
-		err := te.Trigger(taskID, "manual", actx.Operator)
-		switch {
-		case err == nil:
-			if TaskTriggerSelfRecordsAudit(taskID) {
-				return
-			}
-			RecordAuditLog(actx.Operator, "触发", actx.Family, triggerAuditDetail(actx), actx.IP)
-		case errors.Is(err, taskengine.ErrAlreadyRunning), errors.Is(err, taskengine.ErrTaskSkipped):
-			// 语义非失败：已由先到请求启动 / 任务体明确放弃（见函数注释）。
-		default:
-			Logf("error", "手动触发任务 %s 失败: %v", taskID, err)
-			RecordAuditLog(actx.Operator, "触发失败", actx.Family,
-				fmt.Sprintf("手动触发任务 %s 失败: %v", actx.Name, err), actx.IP)
-		}
-	}()
+	err := te.RunAsyncResult(taskID, "manual", actx.Operator, func(runErr error) {
+		RecordTaskTriggerResult(taskID, actx, runErr)
+	})
+	if err != nil {
+		// admission 失败没有执行回调；在此处保留原有补偿审计与
+		// ErrAlreadyRunning/ErrTaskSkipped 静默分类。
+		RecordTaskTriggerResult(taskID, actx, err)
+	}
+	return err
 }
 
 // RecordTaskTriggerResult 供同步预占位（Engine.RunAsyncResult）的完成回调：

@@ -134,7 +134,7 @@
             <span class="form-tip-inline">密码或验证码失败 5 次锁 10 分钟（关闭则不锁定）</span>
           </el-form-item>
           <el-form-item label="强制加密">
-            <el-switch v-model="adminTls.enabled" :disabled="isReadOnly" @change="onAdminTlsToggle" />
+            <el-switch v-model="adminTls.enabled" :disabled="isReadOnly || !adminTlsLoaded" @change="onAdminTlsToggle" />
             <el-button v-if="adminTls.enabled" size="small" style="margin-left: 8px;" @click="openAdminTlsDialog">配置证书</el-button>
             <el-text v-if="adminTlsDirty" type="warning" size="small" style="margin-left: 8px">已暂存，点击下方保存后生效</el-text>
             <span v-else class="form-tip-inline">启用后 :8000 仅经 HTTPS 访问，需重启服务生效</span>
@@ -437,7 +437,7 @@
           </el-table-column>
           <el-table-column label="操作" width="150" align="right">
             <template #default="{ row }">
-              <el-button link type="primary" size="small" @click="downloadAutoBackup(row)">下载</el-button>
+              <el-button v-if="row.status === 'success'" link type="primary" size="small" @click="downloadAutoBackup(row)">下载</el-button>
               <el-button v-if="row.status === 'success'" link type="warning" size="small" @click="restoreAutoBackup(row)">还原</el-button>
               <el-button link type="danger" size="small" @click="deleteAutoBackup(row)">删除</el-button>
             </template>
@@ -447,7 +447,7 @@
       </div>
       <template #footer>
         <el-button @click="autoBackupVisible = false">取消</el-button>
-        <el-button type="primary" plain :loading="autoBackupRunning" :disabled="!autoBackupSectionsValid" title="按已保存的自动备份设置执行一次备份；上方表单改动需先保存设置" @click="runAutoBackupNow">
+        <el-button type="primary" plain :loading="autoBackupRunning" :disabled="!autoBackupCanRunNow" title="按已保存的自动备份设置执行一次备份；上方表单改动需先保存设置" @click="runAutoBackupNow">
           立即备份
         </el-button>
         <el-button type="primary" :loading="autoBackupSaving" :disabled="!autoBackupSectionsValid || !autoBackupLoaded || autoBackupLoading" @click="saveAutoBackupSettings">
@@ -475,10 +475,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, h, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
+import { useLogTailPolling } from '@/composables/useLogTailPolling'
 import { restartServiceWithFeedback } from '@/utils/restart'
 import { formatDate } from '@/utils/date'
 import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
@@ -506,57 +507,46 @@ onMounted(async () => {
 
 const appLogVisible = ref(false)
 const appLogContent = ref('')
-const appLogLoading = ref(false)
 const appLogAutoRefresh = ref(true)
 const appLogContainer = ref<HTMLElement | null>(null)
-let appLogTimer: ReturnType<typeof setInterval> | null = null
 
 // （历史问题 过度修复审查 REMOVE：appLogRequestSeq 已删——入口 loading 门 +
 // appLogVisible 析取使其作为裁决条件永不为真。）
-const fetchAppLogs = async (): Promise<void> => {
-  // 后台标签页暂停轮询：定时器空转跳过，回到可见后的下一个 tick 立即补拉
-  if (appLogLoading.value || document.hidden) return
-  appLogLoading.value = true
-  try {
+// A85WA-历史问题：日志尾轮询收敛 useLogTailPolling 单源（hidden 暂停/单飞/滚底统一）。
+const appLogTail = useLogTailPolling({
+  interval: 3000,
+  content: appLogContent,
+  container: appLogContainer,
+  isActive: () => appLogVisible.value,
+  fetch: async () => {
     const res = await request.get<{ data?: { content?: string } }>('/system/logs', { silent: true })
-    if (!appLogVisible.value) return
-    appLogContent.value = res.data?.content || ''
-    await nextTick()
-    if (appLogContainer.value) appLogContainer.value.scrollTop = appLogContainer.value.scrollHeight
-  } catch (error) {
-    console.error('Failed to fetch app logs:', error)
-  } finally {
-    appLogLoading.value = false
-  }
-}
+    if (!appLogVisible.value) return null
+    return res.data?.content || ''
+  },
+  onError: (error) => { console.error('Failed to fetch app logs:', error) },
+})
+const appLogLoading = appLogTail.loading
 
-const stopAppLogTimer = (): void => {
-  if (appLogTimer) {
-    clearInterval(appLogTimer)
-    appLogTimer = null
-  }
-}
+const fetchAppLogs = async (): Promise<void> => appLogTail.refresh()
 
 const openAppLogDialog = (): void => {
   appLogVisible.value = true
 }
 
 const onAppLogOpened = (): void => {
-  void fetchAppLogs()
-  stopAppLogTimer()
-  if (appLogAutoRefresh.value) appLogTimer = setInterval(() => void fetchAppLogs(), 3000)
+  if (appLogAutoRefresh.value) appLogTail.start()
+  else void appLogTail.refresh()
 }
 
 const onAppLogClosed = (): void => {
-  stopAppLogTimer()
-  appLogLoading.value = false
+  appLogTail.stop()
   appLogContent.value = ''
 }
 
 watch(appLogAutoRefresh, (enabled) => {
   if (!appLogVisible.value) return
-  stopAppLogTimer()
-  if (enabled) appLogTimer = setInterval(() => void fetchAppLogs(), 3000)
+  if (enabled) appLogTail.start()
+  else appLogTail.stop()
 })
 
 // FE-6（历史）：onUnmounted 生命周期收尾移至 disposed/tlsProtocolFallbackTimer
@@ -656,6 +646,8 @@ interface AutoBackupSettingsResponse {
   sections: string[]
   last_run: string | null
   last_success_at: string | null
+  next_run_at: string | null
+  catch_up_due: boolean
   backups: AutoBackupRow[]
 }
 
@@ -664,78 +656,34 @@ const autoBackupLoading = ref(false)
 // 读取失败/未完成时表单仍是默认值（enabled=false、daily/03:00/keep 7），
 // 此时允许保存会用默认值覆盖服务端配置（历史 历史问题-2）。
 const autoBackupLoaded = ref(false)
+// A85WA-历史问题：quiet 轮询失败 toast 节流水位（30s，对齐 usePollingErrorState 语义）
+let lastAutoBackupErrorToastAt = 0
 const autoBackupSaving = ref(false)
 const autoBackupRunning = ref(false)
 const autoBackupForm = ref({ enabled: false, frequency: 'daily', time: '03:00', day: 1, keep: 7 })
 const autoBackupSections = ref<string[]>(BACKUP_SECTIONS.map((s) => s.key))
 const autoBackupRows = ref<AutoBackupRow[]>([])
+// 立即备份只认最近一次成功读取/保存的服务端范围；未保存表单编辑不参与门控。
+const autoBackupSavedSections = ref<string[]>([])
 const autoBackupLastRun = ref<string | null>(null)
+const autoBackupNextRunAt = ref<string | null>(null)
+const autoBackupCatchUpDue = ref(false)
 
 const autoBackupLastRunLabel = computed(() => (autoBackupLastRun.value ? formatDate(autoBackupLastRun.value) : '—'))
-
-// 下一次备份时刻(启用态才有):镜像后端 autoBackupDueSlot 的「下一槽」语义——
-// 日=当日/次日 HH:MM;周=下一个目标周几;月=当月/次月 day 日(短月收敛到月末)。
-// 时区取基础设置 timezone(与调度器 CurrentLocation 同源;未保存的时区编辑即时预览)。
 const autoBackupNextRunLabel = computed<string | null>(() => {
-  const form = autoBackupForm.value
-  if (!autoBackupVisible.value || !form.enabled) return null
-  const [hh, mm] = form.time.split(':').map(Number)
-  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null
-  const tz = settings.value.timezone || 'Asia/Shanghai'
-  try {
-    // 配置时区的当前墙钟(Intl 受保护构造——非法 tz 走 catch 返回 null)
-    const partsFmt = new Intl.DateTimeFormat('en-US', {
-      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', hour12: false, weekday: 'short',
-    })
-    const parts: Record<string, string> = {}
-    for (const part of partsFmt.formatToParts(new Date())) parts[part.type] = part.value
-    const WD: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }
-    const nowCarrier = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour) % 24, Number(parts.minute))
-    const wallNow = new Date(nowCarrier)
-    const slotCarrier = (y: number, mo: number, d: number): number => Date.UTC(y, mo - 1, d, hh, mm)
-    const daysInMonth = (y: number, mo: number): number => new Date(Date.UTC(y, mo, 0)).getUTCDate()
-    let candidate: number
-    if (form.frequency === 'weekly') {
-      const target = (form.day || 1) % 7 // 本包 1=周一…7=周日 → JS 0=周日
-      const delta = (target - WD[parts.weekday ?? 'Sun'] + 7) % 7
-      const targetDate = new Date(wallNow.getTime() + delta * 86400000)
-      candidate = slotCarrier(targetDate.getUTCFullYear(), targetDate.getUTCMonth() + 1, targetDate.getUTCDate())
-      if (candidate <= wallNow.getTime()) candidate += 7 * 86400000
-    } else if (form.frequency === 'monthly') {
-      const day = Math.min(Math.max(form.day || 1, 1), 28)
-      const y = wallNow.getUTCFullYear()
-      const mo = wallNow.getUTCMonth() + 1
-      candidate = slotCarrier(y, mo, Math.min(day, daysInMonth(y, mo)))
-      if (candidate <= nowCarrier) {
-        const ny = mo === 12 ? y + 1 : y
-        const nmo = mo === 12 ? 1 : mo + 1
-        candidate = slotCarrier(ny, nmo, Math.min(day, daysInMonth(ny, nmo)))
-      }
-    } else {
-      candidate = slotCarrier(wallNow.getUTCFullYear(), wallNow.getUTCMonth() + 1, wallNow.getUTCDate())
-      if (candidate <= wallNow.getTime()) candidate += 86400000
-    }
-    // 墙钟 → 瞬时:用该时区在候选时刻的偏移换算(DST 边界二次收敛)
-    const offsetAt = (instant: number): number => {
-      const p: Record<string, string> = {}
-      for (const part of partsFmt.formatToParts(new Date(instant))) p[part.type] = part.value
-      return Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day), Number(p.hour) % 24, Number(p.minute)) - Math.floor(instant / 60000) * 60000
-    }
-    const guess = candidate - offsetAt(candidate)
-    const epoch = candidate - offsetAt(guess)
-    // 展示走 formatDate(配置时区)——与列表时间同口径;formatDate 契约只收
-    // 字符串(Date 对象被 parseDateValue 判为非法返回空串),传 ISO 形态
-    return formatDate(new Date(epoch).toISOString())
-  } catch {
-    return null
-  }
+  if (!autoBackupVisible.value || !autoBackupNextRunAt.value) return null
+  const formatted = formatDate(autoBackupNextRunAt.value)
+  if (!formatted) return null
+  return autoBackupCatchUpDue.value ? `待补跑（${formatted}）` : formatted
 })
+const autoBackupCanRunNow = computed(() => autoBackupLoaded.value && !autoBackupLoading.value && autoBackupSavedSections.value.length > 0)
 // 与导出按钮同口径：范围非空(users 恒有表,不存在不可还原形态)
 const autoBackupSectionsValid = computed(() => autoBackupSections.value.length > 0)
 
 const openAutoBackupDialog = (): void => {
   if (backupDisabled.value) return
+  autoBackupNextRunAt.value = null
+  autoBackupCatchUpDue.value = false
   autoBackupVisible.value = true
 }
 
@@ -757,16 +705,32 @@ const fetchAutoBackup = async (quiet = false): Promise<void> => {
         day: d.day || 1,
         keep: d.keep || 7,
       }
-      autoBackupSections.value = d.sections?.length ? normalizeBackupSectionKeys(d.sections) : BACKUP_SECTIONS.map((s) => s.key)
+      const loadedSections = d.sections?.length ? normalizeBackupSectionKeys(d.sections) : BACKUP_SECTIONS.map((s) => s.key)
+      autoBackupSections.value = loadedSections
+      autoBackupSavedSections.value = [...loadedSections]
     }
+    autoBackupNextRunAt.value = d.next_run_at ?? null
+    autoBackupCatchUpDue.value = d.catch_up_due === true
     autoBackupRows.value = d.backups || []
     // last_run 是调度水位线（off→on=now），不是执行事实；「上次成功备份」
     // 只认最近一次 success 行（last_success_at）——否则启用后即谎报「刚刚」。
     autoBackupLastRun.value = d.last_success_at ?? null
     autoBackupLoaded.value = true
   } catch {
-    // silent 模式全局拦截器不会提示：显式告知并保持保存禁用，避免默认值覆盖。
-    ElMessage.error('自动备份设置读取失败，请关闭弹框后重试；读取完成前无法保存')
+    if (quiet) {
+      // A85WA-历史问题：「立即备份」2s 静默轮询失败不得逐轮弹 toast（60s 窗口最多
+      // ~30 条相同错误）。quiet 轮不重置 autoBackupLoaded——此前已加载成功时保存
+      // 仍可用；仅「从未加载成功」时令节流提示一次。
+      console.error('Failed to poll auto-backup status')
+      const now = Date.now()
+      if (!autoBackupLoaded.value && now - lastAutoBackupErrorToastAt > 30_000) {
+        lastAutoBackupErrorToastAt = now
+        ElMessage.error('自动备份状态刷新失败，将持续自动重试')
+      }
+    } else {
+      // silent 模式全局拦截器不会提示：显式告知并保持保存禁用，避免默认值覆盖。
+      ElMessage.error('自动备份设置读取失败，请关闭弹框后重试；读取完成前无法保存')
+    }
   } finally {
     if (!quiet) autoBackupLoading.value = false
   }
@@ -791,6 +755,9 @@ const saveAutoBackupSettings = async (): Promise<boolean> => {
   autoBackupSaving.value = true
   try {
     await request.put('/settings/auto-backup', { ...autoBackupForm.value, sections: autoBackupSections.value })
+    autoBackupSavedSections.value = [...autoBackupSections.value]
+    autoBackupNextRunAt.value = null
+    await fetchAutoBackup(true)
     mfaAwareSuccess('自动备份设置已保存')
     return true
   } catch {
@@ -806,8 +773,8 @@ const saveAutoBackupSettings = async (): Promise<boolean> => {
 // 不生效,避免每次手动备份都重写设置并产生多余的「备份设置」审计事件。
 const runAutoBackupNow = async (): Promise<void> => {
   if (autoBackupRunning.value) return
-  if (!autoBackupSectionsValid.value) {
-    ElMessage.warning('备份范围至少需选择一个分类')
+  if (!autoBackupCanRunNow.value) {
+    ElMessage.warning('自动备份设置尚未加载或已保存的备份范围为空，暂不能立即备份')
     return
   }
   // 异步契约（历史问题）：202 只代表已受理，不代表完成——记录基线 id，轮询
@@ -829,6 +796,8 @@ const runAutoBackupNow = async (): Promise<void> => {
       mfaAwareSuccess('手动备份完成')
     } else if (completed) {
       ElMessage.error(completed.message || '手动备份失败')
+    } else if (!completed && autoBackupVisible.value) {
+      ElMessage.warning('60 秒内未检测到本次备份结果，任务可能仍在执行；请稍后刷新列表查看')
     }
   } catch {
     // 全局拦截器已提示（409=已有备份在执行）
@@ -867,9 +836,10 @@ const downloadAutoBackup = async (row: AutoBackupRow): Promise<void> => {
 }
 
 const restoreAutoBackup = async (row: AutoBackupRow): Promise<void> => {
+  const scope = autoBackupScopeText(row)
   try {
     await ElMessageBox.confirm(
-      `将使用备份「${row.filename}」覆盖当前全部配置（规则、用户、API 密钥、证书任务及全部凭证），此操作不可撤销。确认还原？`,
+      `将使用备份「${row.filename}」覆盖该备份包含的分类：${scope}；未包含的分类保持现状。此操作不可撤销。确认还原？`,
       '还原配置',
       { type: 'warning', confirmButtonText: '确认还原', cancelButtonText: '取消' },
     )
@@ -958,7 +928,8 @@ const importDialogVisible = ref(false)
 const importFileName = ref('')
 const importSections = ref<string[]>([])
 const importFileIsLbbak = ref(false)
-const importFileContent = ref<string | ArrayBuffer>('')
+const IMPORT_MAX_BYTES = 128 * 1024 * 1024
+const importFileContent = ref<string | Blob>('')
 const importValidation = ref<ImportValidation | null>(null)
 const importValidating = ref(false)
 const importInput = ref<HTMLInputElement | null>(null)
@@ -993,6 +964,8 @@ const triggerImport = (): void => {
   importValidating.value = false
   importFileName.value = ''
   importFileContent.value = ''
+  importFileIsLbbak.value = false
+  importSections.value = []
   importValidation.value = null
   importDialogVisible.value = true
 }
@@ -1000,7 +973,7 @@ const triggerImport = (): void => {
 const onImportDialogClosed = (): void => {
   importValidationSeq++
   importValidating.value = false
-  // 历史问题:关闭即释放备份内容(最大 48MB ArrayBuffer/字符串),不驻留至下次选择
+  // 历史问题:关闭即释放备份内容(lbbak Blob/JSON 字符串),不驻留至下次选择
   importFileContent.value = ''
   importFileName.value = ''
   importFileIsLbbak.value = false
@@ -1019,10 +992,15 @@ const handleImportFile = async (event: Event): Promise<void> => {
   if (!file) return
   const validationSeq = ++importValidationSeq
   importFileName.value = file.name
+  // 新文件一选定即作废旧内容；任何后续拒绝分支都不能让旧字节配新文件名。
+  importFileContent.value = ''
+  importFileIsLbbak.value = false
+  importSections.value = []
   importValidation.value = null
-  if (file.size > 48 * 1024 * 1024) {
+  importValidating.value = false
+  if (file.size > IMPORT_MAX_BYTES) {
     // 历史问题:先于全量读入内存拒绝(后端 413 同口径),防超大文件撑爆标签页
-    importValidation.value = { valid: false, error: '备份文件不能超过 48MB', disabled_conflicts: [] }
+    importValidation.value = { valid: false, error: '备份文件不能超过 128MB', disabled_conflicts: [] }
     return
   }
   importValidating.value = true
@@ -1036,8 +1014,11 @@ const handleImportFile = async (event: Event): Promise<void> => {
     const head = new Uint8Array(await file.slice(bomLen, bomLen + 2).arrayBuffer())
     const isLbbak = head[0] === 0x1f && head[1] === 0x8b
     importFileIsLbbak.value = isLbbak
-    const fileContent = isLbbak ? await file.slice(bomLen).arrayBuffer() : await file.slice(bomLen).text()
-    importFileContent.value = fileContent
+    if (isLbbak) {
+      importFileContent.value = file.slice(bomLen)
+    } else {
+      importFileContent.value = await file.slice(bomLen).text()
+    }
     // 历史问题-02：预览请求携带分类选择（初始=全选，与下方 V2 默认选择一致；
     // V1 备份不消费该参数）——预览与导入同参，预览结果按所选分类过滤
     const data = await postImportValidation(BACKUP_SECTIONS.map((sec) => sec.key))
@@ -1070,7 +1051,7 @@ const handleImportFile = async (event: Event): Promise<void> => {
 const postImportValidation = async (sections: string[]): Promise<ImportValidation | undefined> => {
   const isLbbak = importFileIsLbbak.value
   let endpoint = '/config/import/validate'
-  let body: string | ArrayBuffer = importFileContent.value
+  let body: string | Blob = importFileContent.value
   if (isLbbak) {
     endpoint = `/config/import/validate?sections=${encodeURIComponent(sections.join(','))}`
   } else {
@@ -1128,7 +1109,7 @@ const confirmImport = async (): Promise<void> => {
   importing.value = true
   try {
     let endpoint = validation.type === 'v1' ? '/config/import/v1' : '/config/import'
-    let importBody: string | ArrayBuffer = importFileContent.value
+    let importBody: string | Blob = importFileContent.value
     if (!importFileIsLbbak.value && validation.type !== 'v1') {
       // 顶层注入 sections(不重排原 JSON)
       try {
@@ -1365,6 +1346,9 @@ const adminTlsDirty = computed(() => {
   return adminTls.value.mode !== adminTlsSaved.value.mode || stagedAdminTlsCert.value !== null
 })
 
+// A85WA-历史问题：/admin-tls 读取失败不再静默吞错——开关禁用直到加载成功，
+// 避免长期以默认关闭态误导「HTTPS 已关闭」。
+const adminTlsLoaded = ref(false)
 const loadAdminTls = async () => {
   try {
     const res = await request.get('/admin-tls')
@@ -1374,8 +1358,11 @@ const loadAdminTls = async () => {
       adminTls.value = { ...saved }
       adminTlsHasCert.value = res.data.cert_info != null || saved.mode === 'selfsigned'
       stagedAdminTlsCert.value = null
+      adminTlsLoaded.value = true
     }
-  } catch { /* ignore */ }
+  } catch {
+    console.warn('管理 TLS 配置读取失败，强制加密开关暂不可用')
+  }
 }
 
 const openAdminTlsDialog = () => {
@@ -1422,7 +1409,7 @@ let disposed = false
 // （原位于 appLogTimer watch 附近、引用其后声明的 let——当前安全但形态脆弱）。
 onUnmounted(() => {
   disposed = true
-  stopAppLogTimer()
+  appLogTail.stop()
   if (tlsProtocolFallbackTimer) clearTimeout(tlsProtocolFallbackTimer)
   tlsProtocolFallbackTimer = null
 })

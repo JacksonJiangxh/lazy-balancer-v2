@@ -67,8 +67,29 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	// 历史问题（RG-CLUSTER-STATUS-RESET）：last_sync 与 applied_version 同语义
 	// ——旧集群的同步时间对新集群无意义，同一 UPDATE 里置 NULL，状态卡不残留
 	// 旧集群时间（Status() 仅对 Valid 值格式化）。
-	if _, err := s.db.ExecContext(ctx, `UPDATE global_config SET is_master=0, master_url=?, cluster_token='', registration_id=?, registration_secret=?, applied_version=0, sync_fingerprint='', last_sync_error='', registration_confirm_failures=0, last_sync=NULL WHERE id=1`, masterURL, registration.RegistrationID, registration.RegistrationSecret); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始从节点拓扑事务: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `UPDATE global_config SET is_master=0, master_url=?, cluster_token='', registration_id=?, registration_secret=?, applied_version=0, sync_fingerprint='', last_sync_error='', registration_confirm_failures=0, last_sync=NULL, applied_waf_ref_hash='', applied_waf_ref_version=0 WHERE id=1`, masterURL, registration.RegistrationID, registration.RegistrationSecret)
+	if err != nil {
 		return fmt.Errorf("保存从节点注册状态: %w", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("读取从节点注册状态保存结果: %w", err)
+	}
+	if updated != 1 {
+		return fmt.Errorf("保存从节点注册状态: 影响 %d 行", updated)
+	}
+	// 与 Promote 对称：旧拓扑的节哈希/WAF 文件态不得成为新主节点的
+	// 跳过或漂移判定依据；清理与角色落库必须同成同败。
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_applied_sections`); err != nil {
+		return fmt.Errorf("清理从节点已应用节记账: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交从节点拓扑事务: %w", err)
 	}
 	// 拓扑已提交：先恢复拉取准入，再让新 daemon 起步——若等到函数尾部才重开，
 	// 新循环的首次 Pull 可能撞上仍关闭的准入并以 errSyncPullStopped 静默失败
@@ -119,7 +140,7 @@ func (s *ClusterService) UpdateSettings(ctx context.Context, req models.ClusterS
 	if err != nil {
 		return err
 	}
-	if req.SyncInterval != nil && !isMaster {
+	if !isMaster {
 		return ErrSlaveReadOnly
 	}
 	// sync_interval 无下限校验会让从节点 run 循环 waitDelay(0) 进入零间隔

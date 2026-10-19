@@ -315,7 +315,7 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	       COALESCE(threat_traffic_sample_n,-1) as threat_traffic_sample_n,
 	       COALESCE(security_events_retention_days,90) as security_events_retention_days,
 	       COALESCE(security_events_row_cap,1000000) as security_events_row_cap,
-	       is_master, COALESCE(master_url, '') as master_url, sync_interval,
+	       COALESCE(is_master,1) as is_master, COALESCE(master_url, '') as master_url, sync_interval,
 	       last_sync, updated_at
 		FROM global_config WHERE id = 1
 	`,
@@ -409,6 +409,11 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 		if err := validateAccessLogFormat(*req.AccessLogFormat); err != nil {
 			return err
 		}
+		// A85历史问题-A：写侧归一强制携带 X-API-Key 脱敏行（渲染层另有恒等
+		// 不变量兜底旧库/直接改库/导入形态）——落库值即所见，UI 不再需要
+		// 猜测渲染层偷偷追加了什么。空格式保持为空（=「不裁剪原生字段」，
+		// 渲染层仍注入脱敏行）。
+		*req.AccessLogFormat = normalizeAccessLogRedaction(*req.AccessLogFormat)
 	}
 
 	// 历史问题(历史):补上限与 UI :max=10240(CaddyGlobalSettings.vue)对齐——
@@ -788,15 +793,11 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		rollbackErr := tx.Rollback()
-		if errors.Is(rollbackErr, sql.ErrTxDone) {
-			rollbackErr = nil
-		}
-		// 历史问题: apply 已把未提交事务视图的投影文件写盘；commit 失败必须
-		// 与 apply 拒绝分支同构回滚到已提交视图，再恢复运行配置。
-		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
-		restoreErr := h.caddyService.ApplyConfig(oldRuntimeConfig)
-		err = errors.Join(err, rollbackErr, restoreErr)
+		// 历史问题 + A85历史问题-B: apply 已把未提交事务视图的投影/证书写盘并把
+		// 该内容写入 LKG；commit 失败统一走已提交视图恢复（回滚事务 + 重渲染
+		// /load + 回退 LKG——恢复 /load 失败时仍把已提交字节写回 LKG）。
+		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		err = errors.Join(err, restoreErr)
 		// 历史问题-2：提交失败后的回弹同样可能失败——持久化横幅（事务已回滚）。
 		h.recordCaddyApplyResult(err)
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("提交配置失败", err.Error(), services.AuditResultPart("failure")))
@@ -1197,12 +1198,11 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		rollbackErr := tx.Rollback()
-		if errors.Is(rollbackErr, sql.ErrTxDone) {
-			rollbackErr = nil
-		}
-		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
-		err = errors.Join(err, rollbackErr, restoreErr)
+		// A85历史问题-B：commit 失败统一走已提交视图恢复（回滚事务 + 重渲染
+		// /load + 回退 LKG/投影/证书物化——恢复 /load 失败时仍把已提交字节
+		// 写回 LKG，运行配置不停留在一次性逃生口载荷上）。
+		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		err = errors.Join(err, restoreErr)
 		h.recordCaddyApplyResult(err)
 		recordAudit(c, "更新失败", "Caddy配置", services.FormatAuditDetail("提交 Caddy 配置失败", err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交 Caddy 配置失败: " + err.Error()})
@@ -1273,6 +1273,30 @@ func (h *Handlers) RestartCaddy(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "Caddy 已重启"})
+}
+
+// accessLogRedactionLine 恒脱敏行的规范形态（与 services 渲染层同一路径，
+// 此处是该契约的写入侧视图）。
+const accessLogRedactionLine = "request>headers>X-API-Key -> delete"
+
+// normalizeAccessLogRedaction 把脱敏行归一为规范形态（A85历史问题-A）：
+// 移除任何既有的 X-API-Key 映射行（rename 会让头改道，delete 可能写在中间
+// 被后续行覆盖），再追加唯一的 delete 行——幂等。
+// 空白格式原样返回（默认形态：不裁剪原生字段，渲染层注入脱敏行）。
+func normalizeAccessLogRedaction(format string) string {
+	if strings.TrimSpace(format) == "" {
+		return format
+	}
+	const path = "request>headers>X-API-Key"
+	out := make([]string, 0, 8)
+	for _, line := range strings.Split(format, "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), "->", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[0]) == path {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(append(out, accessLogRedactionLine), "\n")
 }
 
 // validateAccessLogFormat enforces the fields the log stats feature relies

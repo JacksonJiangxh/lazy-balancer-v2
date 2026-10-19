@@ -117,7 +117,11 @@ test('C 拦截/分钟展示只还原一次 10 倍定点，不再放大', () => {
   assert.equal(formatRecentRate(-1), '0.0')
 })
 
-test('D 趋势桶 tooltip 按窗口形态区分小时/日桶', () => {
-  assert.equal(hourlyBucketLabel('14:00', 24), '14:00:00')
+test('D 趋势桶 tooltip 原样展示真实槽标签（小时 HH:MM / 日 MM-DD）', () => {
+  assert.equal(hourlyBucketLabel('13:34', 24), '13:34')
+  assert.equal(hourlyBucketLabel('13:34', 3), '13:34')
   assert.equal(hourlyBucketLabel('10-12', 168), '10-12')
+  // 非法/缺失窗口与空标签不得改写后端真实格式
+  assert.equal(hourlyBucketLabel('13:34', Number.NaN), '13:34')
+  assert.equal(hourlyBucketLabel('', 24), '')
 })

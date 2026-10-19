@@ -53,8 +53,9 @@ func ensureCrawlerSources() error {
 // 继续每日产出错误名单。用户只能改 update_enabled，状态/排程/开关列保持原值。
 func refreshCrawlerSources() error {
 	for _, src := range crawlerBotSources {
-		if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET url=?, format=?, updated_at=datetime('now') WHERE name=?`,
-			src.URL, src.Format, src.Name); err != nil {
+		if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET url=?, format=?, updated_at=datetime('now')
+			WHERE name=? AND (COALESCE(url,'')<>? OR COALESCE(format,'')<>?)`,
+			src.URL, src.Format, src.Name, src.URL, src.Format); err != nil {
 			return err
 		}
 	}

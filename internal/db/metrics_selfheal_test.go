@@ -336,9 +336,23 @@ func TestNextQuarantinePath_returnsCandidateOnPersistentStatError(t *testing.T) 
 	}
 }
 
-// 历史问题-3：伴生文件（-wal/-shm）改名失败必须上抛——静默留下旧 WAL 会让
-// 重建的新库下次打开时重放脏页，再现损坏。主文件已隔离后由调用方中止重建。
+// A85 历史问题：伴生文件（-wal/-shm）必须先于主文件隔离。伴生改名失败时
+// 主文件必须仍在原位并中止重建，避免下次启动在旧 WAL 残留时新建同名空库。
 func TestQuarantineCorruptSQLiteFile_companionRenameErrorPropagates(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		quarantine func(string) (string, error)
+	}{
+		{"header-check", quarantineCorruptSQLiteFile},
+		{"ping-corruption", quarantineMetricsFileUnconditionally},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testQuarantineCompanionRenameFailure(t, tc.quarantine)
+		})
+	}
+}
+
+func testQuarantineCompanionRenameFailure(t *testing.T, quarantine func(string) (string, error)) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "metrics.db")
 	if err := os.WriteFile(path, []byte("not-a-sqlite-header"), 0600); err != nil {
@@ -356,7 +370,7 @@ func TestQuarantineCorruptSQLiteFile_companionRenameErrorPropagates(t *testing.T
 	}
 	t.Cleanup(func() { quarantineRename = saved })
 
-	quarantined, err := quarantineCorruptSQLiteFile(path)
+	quarantined, err := quarantine(path)
 	if err == nil {
 		t.Fatalf("伴生文件改名失败必须上抛，quarantined=%q", quarantined)
 	}
@@ -365,6 +379,24 @@ func TestQuarantineCorruptSQLiteFile_companionRenameErrorPropagates(t *testing.T
 	}
 	if _, statErr := os.Stat(path + "-wal"); statErr != nil {
 		t.Fatalf("失败路径不应移动 -wal: %v", statErr)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("伴生文件未隔离成功前主文件必须留在原位: %v", statErr)
+	}
+	if matches, _ := filepath.Glob(path + ".corrupt.*"); len(matches) != 0 {
+		t.Fatalf("伴生隔离失败时主文件不得先行改名: %v", matches)
+	}
+
+	// And 故障解除后可原路径重试，主文件与 WAL 一并隔离，无脏伴生残留。
+	quarantineRename = saved
+	quarantined, err = quarantine(path)
+	if err != nil || quarantined == "" {
+		t.Fatalf("retry quarantine after recovery: path=%q err=%v", quarantined, err)
+	}
+	for _, original := range []string{path, path + "-wal"} {
+		if _, statErr := os.Stat(original); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("%s 重试后仍在原位 err=%v", original, statErr)
+		}
 	}
 }
 

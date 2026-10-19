@@ -111,12 +111,14 @@ func (h *Handlers) StartCrawlerLibUpdate(c *gin.Context) {
 		return
 	}
 	op := auditOperator(c)
-	// 历史问题：统一异步触发与错误分类（自记族成功零 handler 审计，
-	// ErrAlreadyRunning/ErrTaskSkipped 静默，真失败留补偿审计）。
-	services.TriggerTaskAsync(te, "crawlerbot-update", services.TriggerAuditContext{
+	// 历史问题/A85历史问题-2：响应前同步预占位；自记族成功零 handler 审计，
+	// ErrAlreadyRunning/ErrTaskSkipped 静默，真失败留补偿审计。
+	if err := services.TriggerTaskAsync(te, "crawlerbot-update", services.TriggerAuditContext{
 		Operator: op, Family: "爬虫地址库", Name: "爬虫地址更新",
-	})
-	// 审计由任务体 defer 自记（operator 经 RunContext 归人，与威胁库同口径）
+	}); err != nil {
+		respondTaskTriggerAdmissionError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 }
 

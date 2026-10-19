@@ -3,16 +3,20 @@ package services
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"lazy-balancer-v2/internal/config"
+	"lazy-balancer-v2/internal/dnsprovider/ownership"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -190,6 +194,165 @@ func TestClusterSnapshot_roundTrip_preservesACMEState_for_promoted_slave(t *test
 	if string(restoredOwnership) != ownership {
 		t.Fatalf("restored DNS ownership=%s", restoredOwnership)
 	}
+}
+
+func TestSyncService_materializeSnapshotDNSOwnership_usesSharedOwnershipLock(t *testing.T) {
+	// Given：一份较大快照，以及 ownership 包锁被另一个真实 writer 持有。
+	dataDir := t.TempDir()
+	service := &SyncService{cfg: &config.Config{DataDir: dataDir}}
+	records := make([]ownership.Record, 64)
+	for i := range records {
+		records[i] = ownership.Record{
+			Provider: "dnspod", Zone: "example.com", FQDN: "_acme-challenge.example.com.",
+			Value: fmt.Sprintf("value-%d", i), RecordID: fmt.Sprintf("snapshot-%d", i),
+		}
+	}
+	snapshot, err := json.Marshal(map[string]any{"version": 1, "records": records})
+	if err != nil {
+		t.Fatalf("encode ownership snapshot: %v", err)
+	}
+	acme := &models.ClusterACMEState{DNSOwnership: snapshot}
+	release := ownership.AcquireFileLockForTest()
+	locked := true
+	t.Cleanup(func() {
+		if locked {
+			release()
+		}
+	})
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		done <- service.materializeSnapshotDNSOwnership(acme)
+	}()
+	<-started
+
+	// When/Then：共享锁下必须等待；旧独立 temp+rename 会在此窗口内完成。
+	select {
+	case err := <-done:
+		release()
+		locked = false
+		t.Fatalf("snapshot write 绕过ed ownership fileMu: err=%v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	release()
+	locked = false
+	if err := <-done; err != nil {
+		t.Fatalf("snapshot write after lock release: %v", err)
+	}
+	path := filepath.Join(dataDir, "acme_dns_ownership.json")
+	if got, err := os.ReadFile(path); err != nil || string(got) != string(snapshot) {
+		t.Fatalf("snapshot bytes=(%q,%v), want exact replacement", got, err)
+	}
+
+	// Then：锁释放后与 Store.Add 真实并发仍全部成功，文件保持可解码。
+	store, err := ownership.New(dataDir)
+	if err != nil {
+		t.Fatalf("open ownership store: %v", err)
+	}
+	for round := range 10 {
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			errs <- service.materializeSnapshotDNSOwnership(acme)
+		}()
+		go func(round int) {
+			defer wg.Done()
+			errs <- store.Add(ownership.Record{
+				Provider: "dnspod", Zone: "example.com", FQDN: "_acme-challenge.example.com.",
+				Value: fmt.Sprintf("burst-%d", round), RecordID: fmt.Sprintf("burst-%d", round), CreatedAt: time.Now(),
+			})
+		}(round)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("round %d concurrent ownership operation: %v", round, err)
+			}
+		}
+	}
+	if _, err := store.Matching("dnspod", "example.com", "_acme-challenge.example.com."); err != nil {
+		t.Fatalf("concurrent ownership file is unreadable: %v", err)
+	}
+}
+
+func TestSyncService_applySnapshot_rollsBackWhenDNSOwnershipWriteFails(t *testing.T) {
+	// Given：从端应用快照，但 ownership 目标路径被目录占据，原子替换必败。
+	_, database := newClusterTestService(t)
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, applied_version=0 WHERE id=1"); err != nil {
+		t.Fatalf("seed slave role: %v", err)
+	}
+	dataDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dataDir, "acme_dns_ownership.json"), 0700); err != nil {
+		t.Fatalf("block ownership target: %v", err)
+	}
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer caddyServer.Close()
+	service := NewSyncService(database, &config.Config{DataDir: dataDir, CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
+	snapshot := v3SnapshotWithACMESection(models.ClusterSnapshot{Version: 10})
+	snapshot.SectionHashes = ComputeSnapshotSectionHashes(&snapshot)
+
+	// When
+	err := service.applySnapshot(context.Background(), snapshot)
+
+	// Then：错误不得被吞，快照事务整体回滚（applied_version 不前进）。
+	if err == nil || !strings.Contains(err.Error(), "DNS 所有权") {
+		t.Fatalf("apply error=%v, want DNS ownership failure", err)
+	}
+	var appliedVersion int
+	if err := database.QueryRow("SELECT COALESCE(applied_version,0) FROM global_config WHERE id=1").Scan(&appliedVersion); err != nil {
+		t.Fatalf("read applied version: %v", err)
+	}
+	if appliedVersion != 0 {
+		t.Fatalf("applied_version=%d, want rollback to 0", appliedVersion)
+	}
+}
+
+func TestSyncService_materializeSnapshotDNSOwnership_preservesFailureSemantics(t *testing.T) {
+	dataDir := t.TempDir()
+	service := &SyncService{cfg: &config.Config{DataDir: dataDir}}
+	path := filepath.Join(dataDir, "acme_dns_ownership.json")
+
+	t.Run("invalid snapshot leaves committed bytes", func(t *testing.T) {
+		old := []byte(`{"version":1,"records":[]}`)
+		if err := os.WriteFile(path, old, 0600); err != nil {
+			t.Fatalf("seed committed ownership: %v", err)
+		}
+		err := service.materializeSnapshotDNSOwnership(&models.ClusterACMEState{
+			DNSOwnership: []byte(`{"version":1,"records":[{"provider":"dnspod"}]}`),
+		})
+		if err == nil {
+			t.Fatal("invalid ownership snapshot was accepted")
+		}
+		if got, readErr := os.ReadFile(path); readErr != nil || !bytes.Equal(got, old) {
+			t.Fatalf("invalid snapshot changed committed bytes: got=%q err=%v", got, readErr)
+		}
+	})
+
+	t.Run("atomic replace failure propagates and keeps target", func(t *testing.T) {
+		blockedPath := filepath.Join(t.TempDir(), "acme_dns_ownership.json")
+		if err := os.Mkdir(blockedPath, 0700); err != nil {
+			t.Fatalf("block ownership target: %v", err)
+		}
+		blockedService := &SyncService{cfg: &config.Config{DataDir: filepath.Dir(blockedPath)}}
+		err := blockedService.materializeSnapshotDNSOwnership(&models.ClusterACMEState{
+			DNSOwnership: []byte(`{"version":1,"records":[]}`),
+		})
+		if err == nil {
+			t.Fatal("ownership replace failure was swallowed")
+		}
+		info, statErr := os.Stat(blockedPath)
+		if statErr != nil || !info.IsDir() {
+			t.Fatalf("blocked target changed: info=%v err=%v", info, statErr)
+		}
+		if _, tmpErr := os.Stat(blockedPath + ".tmp"); !os.IsNotExist(tmpErr) {
+			t.Fatalf("failed replace left temporary file: %v", tmpErr)
+		}
+	})
 }
 
 func TestSyncService_applySnapshot_restarts_for_uploaded_admin_certificate_rotation(t *testing.T) {

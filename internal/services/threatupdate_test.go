@@ -979,6 +979,60 @@ func TestThreatDueSources_ignoresCrawlerAddressSources(t *testing.T) {
 	}
 }
 
+func TestThreatDueSources_usesThreatSystemListRegistry(t *testing.T) {
+	// Given 模拟未来新增的第四个内置源：名单注册表与真实源表均扩展；
+	// 同表另有一个未注册的历史爬虫源。
+	original := db.ThreatSystemLists
+	extended := append([]db.ThreatSystemList{}, original...)
+	extended = append(extended, db.ThreatSystemList{Source: "future_source", Name: "未来威胁名单"})
+	db.ThreatSystemLists = extended
+	t.Cleanup(func() { db.ThreatSystemLists = original })
+	newClusterTestService(t)
+	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources
+		(id,name,display_name,url,update_enabled,next_update) VALUES
+		(1040,'future_source','未来威胁源','https://example.com/future.txt',1,'2000-01-01 00:00:00'),
+		(1041,'googlebot','Google 官方爬虫 IP','https://example.com/google.json',1,'2000-01-01 00:00:00')`); err != nil {
+		t.Fatalf("seed future and crawler sources: %v", err)
+	}
+
+	// When
+	sources, err := threatDueSources("manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Then 已注册的未来源自动纳入，未注册爬虫源仍排除。
+	if len(sources) != 4 {
+		t.Fatalf("sources=%d, want three current seeds plus future_source: %+v", len(sources), sources)
+	}
+	futureFound := false
+	for _, source := range sources {
+		if source.name == "future_source" {
+			futureFound = true
+		}
+		if source.name == "googlebot" {
+			t.Fatalf("unregistered crawler source entered threat update: %+v", sources)
+		}
+	}
+	if !futureFound {
+		t.Fatalf("registered future source was not selected: %+v", sources)
+	}
+
+	// And update_enabled 仍是独立门控。
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=0 WHERE name='future_source'`); err != nil {
+		t.Fatal(err)
+	}
+	sources, err = threatDueSources("manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range sources {
+		if source.name == "future_source" {
+			t.Fatalf("disabled future source remained due: %+v", sources)
+		}
+	}
+}
+
 func TestThreatUpdateRun_usesTaskRunStartedAt(t *testing.T) {
 	// Given：三个成功源与 task_runs 预插开始时刻。
 	newClusterTestService(t)

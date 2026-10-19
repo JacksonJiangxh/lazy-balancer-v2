@@ -21,7 +21,7 @@ func TestMCPToolSpecs_cover_registeredGinRoutes(t *testing.T) {
 	missing := 0
 	specs := mcpserver.ListToolSpecs()
 	for _, spec := range specs {
-		ginPath := openAPIToGinPath(spec.Path)
+		ginPath := mcpserver.GinPathForTest(spec.Path)
 		if _, ok := registered[spec.Method+" "+ginPath]; !ok {
 			t.Errorf("工具 %s 指向未注册路由 %s %s——REST 路由已改名/删除而工具规格未同步", spec.Name, spec.Method, spec.Path)
 			missing++
@@ -30,21 +30,6 @@ func TestMCPToolSpecs_cover_registeredGinRoutes(t *testing.T) {
 	if missing == 0 && len(specs) == 0 {
 		t.Fatal("工具清单为空——ListToolSpecs 可能已重构，请同步更新本绊线")
 	}
-}
-
-// openAPIToGinPath 将 {param} 形态还原为 Gin 的 :param（ginPathToOpenAPI 反函数）。
-func openAPIToGinPath(path string) string {
-	var b strings.Builder
-	for i := 0; i < len(path); i++ {
-		switch path[i] {
-		case '{':
-			b.WriteByte(':')
-		case '}':
-		default:
-			b.WriteByte(path[i])
-		}
-	}
-	return b.String()
 }
 
 // mcpUncoveredRoutes：注册但无 MCP 工具覆盖的路由的显式豁免清单（历史问题，
@@ -164,7 +149,7 @@ func TestMCPUncoveredRoutes_areExplicitlyExempted(t *testing.T) {
 	router := newAPIDocTestRouter(t)
 	covered := make(map[string]struct{})
 	for _, spec := range mcpserver.ListToolSpecs() {
-		covered[spec.Method+" "+openAPIToGinPath(spec.Path)] = struct{}{}
+		covered[spec.Method+" "+mcpserver.GinPathForTest(spec.Path)] = struct{}{}
 	}
 	registered := make(map[string]struct{}, len(router.Routes()))
 	for _, route := range router.Routes() {

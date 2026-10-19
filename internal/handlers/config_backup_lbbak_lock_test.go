@@ -93,6 +93,16 @@ func decodeValidateResponse(t *testing.T, rec *httptest.ResponseRecorder) import
 	return envelope.Data
 }
 
+// applyLbbakWafFiles 是本测试文件的锁序探针缝；生产导入只消费 InLock 变体。
+func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip2regionTag string) lbbakWafApplyResult {
+	if payload.CRSTarGz == nil && payload.Xdb == nil && len(payload.ThreatIplists) == 0 {
+		return lbbakWafApplyResult{}
+	}
+	services.WafFileLock().Lock()
+	defer services.WafFileLock().Unlock()
+	return applyLbbakWafFilesInLock(c, action, payload, ip2regionTag)
+}
+
 // ── 历史问题-02 handlers 侧：applyLbbakWafFiles 文件相位必须受 wafFileMu 互斥 ──
 
 // Given wafFileMu 被预持（模拟并发的三库更新器文件相位）。
@@ -240,6 +250,10 @@ func TestLbbakImport_waitsForWafLockBeforeDBTransaction(t *testing.T) {
 	}
 	payload := exportRec.Body.Bytes()
 
+	prelockReached := make(chan struct{})
+	oldPrelockHook := configImportBeforePrelockHook
+	configImportBeforePrelockHook = func() { close(prelockReached) }
+	t.Cleanup(func() { configImportBeforePrelockHook = oldPrelockHook })
 	services.WafFileLock().Lock()
 	importDone := make(chan int, 1)
 	go func() {
@@ -249,7 +263,14 @@ func TestLbbakImport_waitsForWafLockBeforeDBTransaction(t *testing.T) {
 		g.ServeHTTP(rec, req)
 		importDone <- rec.Code
 	}()
-	time.Sleep(300 * time.Millisecond)
+	// 已确证导入到达 WAF prelock、尚未开启 DB 事务；DB 探针不再依赖 300ms
+	// 猜测 goroutine 已阻塞。
+	select {
+	case <-prelockReached:
+	case <-time.After(5 * time.Second):
+		services.WafFileLock().Unlock()
+		t.Fatal("import did not reach WAF prelock")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	_, dbErr := db.DB.ExecContext(ctx, `UPDATE global_config SET log_level=log_level WHERE id=1`)

@@ -48,16 +48,6 @@ func unpackLbbak(t *testing.T, raw []byte) map[string][]byte {
 	return out
 }
 
-func unpackLbbakJSONTables(t *testing.T, raw []byte) map[string]any {
-	t.Helper()
-	pack := unpackLbbak(t, raw)
-	var cfg struct {
-		Tables map[string]any `json:"tables"`
-	}
-	_ = json.Unmarshal(pack["config.json"], &cfg)
-	return cfg.Tables
-}
-
 func TestConfigBackup_lbbakRoundTrip(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	t.Cleanup(services.ResetIP2RegionSearcherForTest)
@@ -132,9 +122,6 @@ func TestConfigBackup_lbbakRoundTrip(t *testing.T) {
 	}
 
 	// ---- 导入:.lbbak 整包回放 → 版本记录与文件一致落库 ----
-	var dbgAdmins int
-	db.DB.QueryRow(`SELECT COUNT(*) FROM users WHERE role='admin' AND is_enabled=1`).Scan(&dbgAdmins)
-	t.Logf("pre-import admins=%d tables_in_pack=%d", dbgAdmins, len(unpackLbbakJSONTables(t, rec.Body.Bytes())))
 	req := httptest.NewRequest(http.MethodPost, "/config/import", bytes.NewReader(rec.Body.Bytes()))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	rec2 := httptest.NewRecorder()

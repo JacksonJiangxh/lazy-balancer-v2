@@ -440,9 +440,10 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 		}
 		return nil, fmt.Errorf("内部 API 请求失败: %w", err)
 	}
-	// 面板启用 HTTPS 时 HTTP 请求会收到 301；客户端不自动跟随（避免 POST 变 GET），
+	// 面板启用 HTTPS 时明文请求命中 TLS 嗅探层收到 302（cmd/server
+	// http_redirect_mux.go）；客户端不自动跟随（避免 POST 变 GET），
 	// 这里按原方法原请求体重试一次重定向地址
-	if response.StatusCode == http.StatusMovedPermanently || response.StatusCode == http.StatusTemporaryRedirect || response.StatusCode == http.StatusPermanentRedirect {
+	if isReplayableRedirectStatus(response.StatusCode) {
 		location := response.Header.Get("Location")
 		response.Body.Close()
 		if location == "" {
@@ -477,7 +478,7 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 		if err != nil {
 			return nil, fmt.Errorf("内部 API 请求失败: %w", err)
 		}
-		if response.StatusCode == http.StatusMovedPermanently || response.StatusCode == http.StatusTemporaryRedirect || response.StatusCode == http.StatusPermanentRedirect {
+		if isReplayableRedirectStatus(response.StatusCode) {
 			response.Body.Close()
 			return nil, fmt.Errorf("内部 API 重定向次数超过限制")
 		}
@@ -531,6 +532,19 @@ func generateRandomPassword(length int) (string, error) {
 		buffer[i] = randomPasswordCharset[index.Int64()]
 	}
 	return string(buffer), nil
+}
+
+// isReplayableRedirectStatus 判定可按原方法/原请求体重放的重定向状态码
+// （历史 历史问题-1）：面板 TLS 嗅探层对明文请求回 302，兼容 301/307/308；
+// 与集群同主机升级客户端（services DoWithSameHostTLSUpgradeRedirect）同一
+// 集合——单一语义，避免第三处再写 301/307/308 字面量分叉。重放目标仍由
+// isLoopbackHTTPURL 约束（凭证不出回环）。
+func isReplayableRedirectStatus(code int) bool {
+	switch code {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	}
+	return false
 }
 
 func isLoopbackHTTPURL(target *url.URL) bool {

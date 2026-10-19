@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"runtime"
@@ -32,6 +31,11 @@ import (
 // threatScreenMaxHours hours 参数上限（30 天）——超出回退默认 24h，与非法
 // 值同口径（大屏固定 24h 消费，参数仅为后续扩展保留）。
 const threatScreenMaxHours = 24 * 30
+
+// threatRollupRewindWindowHours 回退水位默认窗口 = warmer 预热窗口 = 大屏
+// 7d 展示窗口：重启后 requestedHours=0 时，48h+ 积压回放仍须触发重算，
+// 否则覆盖水位推进后 7d 永久少计。
+const threatRollupRewindWindowHours = 24 * 7
 
 // threatActiveSourceWindow 活跃攻击源窗口（设计定稿）：近 10 分钟去重 client_ip。
 const threatActiveSourceWindow = 10 * time.Minute
@@ -141,7 +145,7 @@ func loadThreatRollupRawState(database *sql.DB, key string) (string, bool, error
 // 重算历史 rollup（用户不可见），且避免把水位推到 emptyCoverage 判定之前
 // 导致每次摄取都整窗重固。
 func threatRollupRewindMinute(minute time.Time) time.Time {
-	hours := 24
+	hours := threatRollupRewindWindowHours
 	if req := int(threatRollupRequestedHours.Load()); req > hours {
 		hours = req
 	}
@@ -305,11 +309,18 @@ func ensureThreatRollupWithYields(hours int) error {
 	// 在窗口之后、或 lastFixed 早于 coveredFrom-1（陈旧水位先于已覆盖底端）
 	// 一律按空覆盖处理——空覆盖区间的端点=(dTo+1, dTo)，旧侧缺口一次性覆盖到
 	// 窗口末端，回填有界且幂等。
-	emptyCoverage := !okCovered || !okFixed || coveredFrom.After(dTo) || lastFixed.After(dTo) ||
-		lastFixed.Before(coveredFrom.Add(-time.Minute)) ||
-		// 历史问题：窗口起点早于已覆盖末端——中间存在未固化长缺口。不得把新侧
-		// 起点钳到 dFrom 后仍保留旧 coveredFrom（会伪造连续覆盖并永久漏数）。
-		lastFixed.Before(dFrom.Add(-time.Minute))
+	validCoverage := okCovered && okFixed && !coveredFrom.After(dTo) && !lastFixed.After(dTo) &&
+		!lastFixed.Before(coveredFrom.Add(-time.Minute))
+	emptyCoverage := !validCoverage
+	// 历史问题：窗口起点晚于已覆盖末端——中间存在未固化长缺口。窄窗（24h）
+	// 不得把更早的回退目标当陈旧水位重置：从 lastFixed+1 续做，并受可见上限
+	// 720h 约束，保证 7d 积压重固不被后续窄窗请求吞掉。
+	if validCoverage && lastFixed.Before(dFrom.Add(-time.Minute)) {
+		dFrom = lastFixed.Add(time.Minute)
+		if floor := lastComplete.Add(-time.Duration(threatScreenMaxHours) * time.Hour); dFrom.Before(floor) {
+			dFrom = floor
+		}
+	}
 	// 历史问题：目标维度 rollup 升级标记缺失（旧库首次运行含此修复的版本）→
 	// 覆盖区间同按空处理，窗口内分钟全部重固并补出 rule_caddy_id 计数。
 	rebuildNeeded := false
@@ -531,7 +542,7 @@ var (
 )
 
 // threatRollupRequestedHours 最近请求过的最大窗口（小时）：宽窗口请求把
-// 需求告知 warmer，后台每轮按 max(24, 需求) 扩窗回填（历史 历史问题）。
+// 需求告知 warmer，后台每轮按 max(7d, 需求) 扩窗回填（历史 历史问题）。
 var threatRollupRequestedHours atomic.Int64
 
 // markThreatRollupSuccess 记录一次成功固化（任何路径：warmer / 请求懒固化）。
@@ -576,7 +587,7 @@ func threatRollupCoverageReaches(hours int) bool {
 }
 
 // StartThreatRollupWarmer 启动 rollup 后台固化协程（幂等：CAS 标志，重复
-// 调用为空操作）：启动时立即 ensureThreatRollup(24)，之后每 60s 一轮；
+// 调用为空操作）：启动时立即 ensureThreatRollup(7d)，之后每 60s 一轮；
 // ctx 取消即退出。单轮失败仅告警，下一轮自愈（固化本身幂等）。
 func StartThreatRollupWarmer(ctx context.Context) {
 	if !threatRollupWarmerStarted.CompareAndSwap(false, true) {
@@ -589,7 +600,7 @@ func StartThreatRollupWarmer(ctx context.Context) {
 			// 启动即预固化 7 天（UI 最大窗口），赶在保留期/行帽裁剪之前；
 			// 只预热 24h 会让升级后 24h–7d 区间在裁剪后永久少计
 			// （历史 历史问题-01）。单次调用按 25 批有界推进，后续轮次续做。
-			hours := 24 * 7
+			hours := threatRollupRewindWindowHours
 			if req := int(threatRollupRequestedHours.Load()); req > hours {
 				hours = req
 			}
@@ -662,12 +673,8 @@ func saveThreatRollupEventHighwater(tx *sql.Tx, minute string, id int64) error {
 	return err
 }
 
-// threatFixMinute 单分钟固化（增量模式）：首次/旧状态按全量重建，已有事件
-// 高水位后只叠加 id 更大的迟到事件——原始行被裁剪后不会把已固化计数覆盖掉。
-func threatFixMinute(tx *sql.Tx, m time.Time) error {
-	return threatFixMinuteWithMode(tx, m, false)
-}
-
+// threatFixMinuteWithMode 单分钟固化：首次/旧状态按全量重建，已有事件高水位后
+// 增量模式只叠加 id 更大的迟到事件；fullRebuild 强制丢弃旧水位并全量重建。
 func threatFixMinuteWithMode(tx *sql.Tx, m time.Time, fullRebuild bool) error {
 	next := m.Add(time.Minute)
 	minuteStr := m.Format("2006-01-02 15:04")
@@ -1007,32 +1014,36 @@ func fetchThreatTrafficSnapshot(adminURL string) (gin.H, bool) {
 	}, true
 }
 
-// threatHourlyBuckets 生成威胁大屏滑动直方图槽（小时或日桶）；返回桶起点
-// （用于落桶）与已零填充的槽。hours<=24 为本地小时槽，否则日桶（上限 30）。
+// threatHourlyBuckets 生成威胁大屏滑动直方图槽（小时或日桶）；槽从真实
+// 窗口起点等宽切分（标签=槽终点），避免整点/整日对齐把窗口前 sliver 钳入
+// 首桶造成首柱跨度失真。hours<=24 为小时槽，否则日桶（上限 30）。
 func threatHourlyBuckets(hours int, now time.Time, offset int) ([]time.Time, []models.SecurityAttackType) {
 	shift := time.Duration(offset) * time.Second
 	shiftedNow := now.UTC().Add(shift)
+	if hours < 1 {
+		hours = 1
+	}
+	if hours > threatScreenMaxHours {
+		hours = threatScreenMaxHours
+	}
+	windowStart := shiftedNow.Add(-time.Duration(hours) * time.Hour)
 	var bucketStarts []time.Time
 	var bucketNames []string
 	if hours <= 24 {
-		curHour := shiftedNow.Truncate(time.Hour)
-		start := curHour.Add(-time.Duration(hours-1) * time.Hour)
 		for i := range hours {
-			tb := start.Add(time.Duration(i) * time.Hour)
+			tb := windowStart.Add(time.Duration(i) * time.Hour)
 			bucketStarts = append(bucketStarts, tb)
-			bucketNames = append(bucketNames, fmt.Sprintf("%02d:00", tb.Hour()))
+			bucketNames = append(bucketNames, tb.Add(time.Hour).Format("15:04"))
 		}
 	} else {
 		n := (hours + 23) / 24
 		if n > 30 {
 			n = 30
 		}
-		dayStart := time.Date(shiftedNow.Year(), shiftedNow.Month(), shiftedNow.Day(), 0, 0, 0, 0, time.UTC)
-		start := dayStart.AddDate(0, 0, -(n - 1))
 		for i := range n {
-			tb := start.AddDate(0, 0, i)
+			tb := windowStart.AddDate(0, 0, i)
 			bucketStarts = append(bucketStarts, tb)
-			bucketNames = append(bucketNames, tb.Format("01-02"))
+			bucketNames = append(bucketNames, tb.AddDate(0, 0, 1).Format("01-02"))
 		}
 	}
 	hourly := make([]models.SecurityAttackType, len(bucketNames))
@@ -1150,12 +1161,15 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 	// coveredFrom 可能已推进到窗口起点，单看覆盖无法发现「不可重建」。
 	// 披露原始表最早事件，并把窗口前段标为不完整（历史 历史问题-01）。
 	rawCoverageFrom := ""
-	if err := db.MetricsDB.QueryRow(`SELECT COALESCE(MIN(event_time),'') FROM security_events`).Scan(&rawCoverageFrom); err != nil {
+	if raw, err := threatRawCoverageStart(db.MetricsDB); err != nil {
 		trackErr(err)
-	} else if rawCoverageFrom != "" && rawCoverageFrom > windowStartMinute.Format("2006-01-02 15:04:05") {
-		backfillIncomplete = true
-		if coverageFrom == "" {
-			coverageFrom = rawCoverageFrom[:16]
+	} else {
+		rawCoverageFrom = raw
+		if rawCoverageFrom != "" && rawCoverageFrom > windowStartMinute.Format("2006-01-02 15:04:05") {
+			backfillIncomplete = true
+			if coverageFrom == "" {
+				coverageFrom = rawCoverageFrom[:16]
+			}
 		}
 	}
 	var total, blocked int
@@ -1198,9 +1212,10 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 				if idx < 0 {
 					idx = 0
 				}
-				if idx < len(hourly) {
-					hourly[idx].Value += count
+				if idx >= len(hourly) {
+					idx = len(hourly) - 1
 				}
+				hourly[idx].Value += count
 			}
 		}
 		trackErr(rollRows.Err())
@@ -1221,7 +1236,7 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		trackErr(activeRows.Err())
 		activeRows.Close()
 	}
-	// top_targets：前 5 被攻击目标（历史 历史问题：读分钟 rollup 的目标
+	// top_targets：前 3 被攻击目标（历史 历史问题：读分钟 rollup 的目标
 	// 维度，与 total/国家同窗口；原始表受保留期/行帽裁剪，不能作为旁路）
 	topTargets, terr := threatTopTargets(sinceMinute, hours)
 	trackErr(terr)
@@ -1460,22 +1475,20 @@ func (h *Handlers) GetSecurityEventFeed(c *gin.Context) {
 
 // triggerTypeForRule 触发类型显示映射（v2.3.8 单源）：阶段 id → 业务语义类型。
 // 爬虫事件独立于地域拦截（豁免/伪装不再落「IP 访问控制」桶，消除歧义）；
-// WAF 拆 CRS/自定义（10000-899999=自定义规则库、1000000+=合成自定义）；
-// 429→限流、GeoIP 老 id:8 兼容。
+// WAF 拆 CRS/自定义（各数值段互斥：10000-799999 与 1000000+=自定义、
+// 900000-999999=CRS）；429→限流、GeoIP 老 id:8 兼容。
 func triggerTypeForRule(ruleTriggered string) string {
 	n, err := strconv.Atoi(ruleTriggered)
 	if err == nil {
 		switch {
-		case n >= 810000 && n < 850000, n >= 850000 && n < 900000:
+		case n >= 810000 && n < 900000:
 			return "爬虫Bot"
 		case n >= 800000 && n < 810000:
 			return "地域拦截"
-		case n >= 1000000:
-			return "WAF·自定义"
-		case n >= 10000 && n < 900000:
-			return "WAF·自定义"
-		case n >= 900000:
+		case n >= 900000 && n < 1000000:
 			return "WAF·CRS"
+		case n >= 10000 && n < 800000, n >= 1000000:
+			return "WAF·自定义"
 		}
 	}
 	switch ruleTriggered {

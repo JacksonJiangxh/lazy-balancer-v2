@@ -13,7 +13,6 @@ import (
 	"testing"
 	"testing/iotest"
 	"time"
-	_ "unsafe"
 
 	"github.com/gin-gonic/gin"
 
@@ -21,9 +20,6 @@ import (
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/services"
 )
-
-//go:linkname testServicesCertDir lazy-balancer-v2/internal/services.certDir
-var testServicesCertDir string
 
 type importRollbackHarness struct {
 	handler       *Handlers
@@ -43,9 +39,9 @@ func newImportRollbackHarness(t *testing.T) importRollbackHarness {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
 	})
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	certDir := t.TempDir()
+	restoreCertDir := services.SetCertDirForTest(certDir)
+	t.Cleanup(restoreCertDir)
 
 	var stateMu sync.Mutex
 	currentConfig := `{"marker":"before-import"}`
@@ -95,7 +91,7 @@ func newImportRollbackHarness(t *testing.T) importRollbackHarness {
 			caddyService:   services.NewCaddyService(fakeCaddy.URL),
 			clusterService: services.NewClusterService(db.DB, ""),
 		},
-		certDir: testServicesCertDir,
+		certDir: certDir,
 		currentConfig: func() string {
 			stateMu.Lock()
 			defer stateMu.Unlock()

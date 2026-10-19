@@ -22,8 +22,12 @@ test('历史问题-1：只有已启用信任命中才抑制新增信任', () => 
 test('历史问题-2：引用列表仅精确条目可移除，removed=false 不得报成功', () => {
   const text = source('src/views/security/IPLocationAction.vue')
   assert.match(text, /const ipExactListIds = computed/)
-  assert.match(text, /removableTrustRefLists[\s\S]*ipExactListIds\.value\.has/)
-  assert.match(text, /removableRefLists[\s\S]*ipExactListIds\.value\.has/)
+  // A85WT-历史问题：限定在各自赋值语句块内（终点=该语句的 .map 收尾）——原
+  // /removableTrustRefLists[\s\S]*ipExactListIds/ 跨全文贪婪匹配，删任一守卫仍通过。
+  const trustBlock = text.match(/view\.removableTrustRefLists = ipLists\.value[\s\S]*?\.map\(\(l\) => \(\{ id: l\.id, name: l\.name \}\)\)/)
+  assert.ok(trustBlock?.[0].includes('ipExactListIds.value.has'), '信任引用移除列表必须过滤为精确条目命中')
+  const aclBlock = text.match(/view\.removableRefLists = ipLists\.value[\s\S]*?\.map\(\(l\) => \(\{ id: l\.id, name: l\.name \}\)\)/)
+  assert.ok(aclBlock?.[0].includes('ipExactListIds.value.has'), 'ACL 引用移除列表必须过滤为精确条目命中')
   assert.match(source('src/composables/useTrustAssociation.ts'), /res\.data\?\.removed !== true/)
 })
 

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -262,5 +263,160 @@ func TestImportConfigBackup_emptyIPListsTableWipesLocalLists(t *testing.T) {
 	}
 	if systemCount != 4 {
 		t.Fatalf("system ip lists=%d after empty-table import, want 4", systemCount)
+	}
+}
+
+func emptyBackupSecurityTables() map[string][]map[string]any {
+	return map[string][]map[string]any{
+		"security_custom_rules": {},
+		"security_ip_lists":     {},
+		"security_policies":     {},
+		"security_block_pages":  {},
+	}
+}
+
+func TestValidateV2BackupSecurityPolicies_rejectsBuiltinListMisuse(t *testing.T) {
+	builtinList := map[string]any{"id": 1, "name": "内置威胁名单", "system": 1, "entries": `[{"value":"203.0.113.8","remark":""}]`}
+	for _, tc := range []struct {
+		name   string
+		policy map[string]any
+		want   string
+	}{
+		{name: "trust whitelist", policy: map[string]any{"id": 7, "name": "bad-trust", "mode": "off", "ip_whitelist_refs": "[1]"}, want: "不能用于信任名单"},
+		{name: "ACL allow", policy: map[string]any{"id": 7, "name": "bad-allow", "mode": "off", "ip_acl_enabled": 1, "ip_acl_mode": "allow", "ip_acl_list": "[]", "ip_acl_list_refs": "[1]"}, want: "仅允许用于 IP 访问控制的黑名单模式"},
+		{name: "ACL 绕过", policy: map[string]any{"id": 7, "name": "bad-绕过", "mode": "off", "ip_acl_mode": "绕过", "ip_acl_list_refs": "[1]"}, want: "仅允许用于 IP 访问控制的黑名单模式"},
+		{name: "CRS exclusion", policy: map[string]any{"id": 7, "name": "bad-crs", "mode": "off", "crs_excluded_rules": `[{"target":"942550","scope":"list","listRefs":[1]}]`}, want: "不能用于 CRS 排除"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tables := emptyBackupSecurityTables()
+			tables["security_ip_lists"] = []map[string]any{builtinList}
+			tables["security_policies"] = []map[string]any{tc.policy}
+			if err := validateV2BackupSecurityPolicies(tables, true); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%v, want containing %q", err, tc.want)
+			}
+		})
+	}
+
+	// 回归：唯一合法用途 ACL deny 必须继续通过。
+	tables := emptyBackupSecurityTables()
+	tables["security_ip_lists"] = []map[string]any{builtinList}
+	tables["security_policies"] = []map[string]any{{"id": 7, "name": "valid-deny", "mode": "off", "ip_acl_enabled": 1, "ip_acl_mode": "deny", "ip_acl_list_refs": "[1]"}}
+	if err := validateV2BackupSecurityPolicies(tables, true); err != nil {
+		t.Fatalf("builtin deny reference must remain valid: %v", err)
+	}
+}
+
+func TestValidateV2BackupSecurityPolicies_enforcesSaveSideQuotas(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(map[string][]map[string]any)
+		want   string
+	}{
+		{name: "list name", mutate: func(t map[string][]map[string]any) {
+			t["security_ip_lists"] = []map[string]any{{"id": 1, "name": strings.Repeat("n", 51), "entries": "[]"}}
+		}, want: "名称长度"},
+		{name: "list description", mutate: func(t map[string][]map[string]any) {
+			t["security_ip_lists"] = []map[string]any{{"id": 1, "name": "ok", "description": strings.Repeat("d", 201), "entries": "[]"}}
+		}, want: "描述长度"},
+		{name: "list category", mutate: func(t map[string][]map[string]any) {
+			t["security_ip_lists"] = []map[string]any{{"id": 1, "name": "ok", "category": strings.Repeat("c", 33), "entries": "[]"}}
+		}, want: "分类长度"},
+		{name: "list entries", mutate: func(t map[string][]map[string]any) {
+			t["security_ip_lists"] = []map[string]any{{"id": 1, "name": "ok", "entries": bigEntriesJSON(2001)}}
+		}, want: "条目数量"},
+		{name: "entry remark", mutate: func(t map[string][]map[string]any) {
+			t["security_ip_lists"] = []map[string]any{{"id": 1, "name": "ok", "entries": fmt.Sprintf(`[{"value":"10.0.0.1","remark":"%s"}]`, strings.Repeat("r", 101))}}
+		}, want: "备注长度"},
+		{name: "global list count", mutate: func(t map[string][]map[string]any) {
+			rows := make([]map[string]any, 201)
+			for i := range rows {
+				rows[i] = map[string]any{"id": i + 1, "name": fmt.Sprintf("list-%d", i+1), "entries": "[]"}
+			}
+			t["security_ip_lists"] = rows
+		}, want: "数量已达上限"},
+		{name: "policy name", mutate: func(t map[string][]map[string]any) {
+			t["security_policies"] = []map[string]any{{"id": 7, "name": strings.Repeat("p", 101), "mode": "off"}}
+		}, want: "策略名称"},
+		{name: "policy description", mutate: func(t map[string][]map[string]any) {
+			t["security_policies"] = []map[string]any{{"id": 7, "name": "ok", "description": strings.Repeat("d", 501), "mode": "off"}}
+		}, want: "策略描述"},
+		{name: "page name", mutate: func(t map[string][]map[string]any) {
+			t["security_block_pages"] = []map[string]any{{"id": 9, "name": strings.Repeat("p", 101), "content": "x"}}
+		}, want: "拦截页面名称"},
+		{name: "page description", mutate: func(t map[string][]map[string]any) {
+			t["security_block_pages"] = []map[string]any{{"id": 9, "name": "ok", "description": strings.Repeat("d", 501), "content": "x"}}
+		}, want: "拦截页面描述"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tables := emptyBackupSecurityTables()
+			tc.mutate(tables)
+			if err := validateV2BackupSecurityPolicies(tables, true); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%v, want containing %q", err, tc.want)
+			}
+		})
+	}
+
+	// 边界回归：2000 条目、100/500 rune 文本与 200 个名单均合法。
+	tables := emptyBackupSecurityTables()
+	lists := make([]map[string]any, 200)
+	for i := range lists {
+		lists[i] = map[string]any{"id": i + 1, "name": fmt.Sprintf("list-%d", i+1), "entries": "[]"}
+	}
+	lists[0]["name"] = strings.Repeat("n", 50)
+	lists[0]["description"] = strings.Repeat("d", 200)
+	lists[0]["category"] = strings.Repeat("c", 32)
+	lists[0]["entries"] = bigEntriesJSON(2000)
+	tables["security_ip_lists"] = lists
+	tables["security_policies"] = []map[string]any{{"id": 7, "name": strings.Repeat("p", 100), "description": strings.Repeat("d", 500), "mode": "off"}}
+	tables["security_block_pages"] = []map[string]any{{"id": 9, "name": strings.Repeat("p", 100), "description": strings.Repeat("d", 500), "content": "x"}}
+	if err := validateV2BackupSecurityPolicies(tables, true); err != nil {
+		t.Fatalf("boundary-valid backup rejected: %v", err)
+	}
+}
+
+func TestValidateV2BackupSecurityPolicies_checksBuiltinPageProvenance(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		page    map[string]any
+		wantErr bool
+	}{
+		{name: "forged custom builtin", page: map[string]any{"id": 7, "name": "forged", "content": "x", "is_builtin": 1}, wantErr: true},
+		{name: "wrong name at builtin id", page: map[string]any{"id": 9001, "name": "forged", "content": "x", "is_builtin": 1}, wantErr: true},
+		{name: "legitimate rate limit", page: map[string]any{"id": 9001, "name": "限流拦截页面", "content": "x", "is_builtin": 1}},
+		{name: "legitimate maintenance", page: map[string]any{"id": 9002, "name": "系统维护页面", "content": "x", "is_builtin": 1}},
+		{name: "legacy missing builtin flag", page: map[string]any{"id": 9001, "name": "限流拦截页面", "content": "x", "is_builtin": 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tables := emptyBackupSecurityTables()
+			tables["security_block_pages"] = []map[string]any{tc.page}
+			err := validateV2BackupSecurityPolicies(tables, true)
+			if tc.wantErr && (err == nil || !strings.Contains(err.Error(), "is_builtin")) {
+				t.Fatalf("err=%v, want forged is_builtin rejection", err)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("legitimate builtin page rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateBuiltinThreatListRefs_chunksLargeReferenceSets(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	_ = h
+	var builtinID int64
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE system=1 ORDER BY id LIMIT 1`).Scan(&builtinID); err != nil {
+		t.Fatal(err)
+	}
+	refs := make([]int64, 33001)
+	for i := range 33000 {
+		refs[i] = int64(100000 + i)
+	}
+	refs[33000] = builtinID
+	message, err := validateBuiltinThreatListRefs(db.DB, nil, nil, refs, "deny")
+	if err != nil {
+		t.Fatalf("large reference set must be chunked instead of exceeding SQLite variables: %v", err)
+	}
+	if !strings.Contains(message, "不能用于 CRS 排除") {
+		t.Fatalf("message=%q, want built-in exclusion rejection after chunked lookup", message)
 	}
 }

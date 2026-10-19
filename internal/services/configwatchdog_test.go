@@ -29,6 +29,7 @@ func resetConfigWatchdogForTest(t *testing.T) {
 		configDriftStreak = 0
 		configDriftCleanRounds = 0
 		configDriftSkipped = 0
+		configDriftHeartbeatSkipped = 0
 		configDriftQueryWarned = false
 		configDriftReadWarned = false
 		configDriftMu.Unlock()
@@ -266,6 +267,32 @@ func TestConfigWatchdog_heartbeatGatesConsistentRounds(t *testing.T) {
 	}
 }
 
+func TestConfigWatchdog_heartbeatRetainsSkippedCountAcrossCleanWindow(t *testing.T) {
+	// Given one undetermined round followed by 60 real, consistent checks.
+	newClusterTestService(t)
+	resetConfigWatchdogForTest(t)
+	newTaskLogDir(t)
+	oldURL := watchdogAdminURLValue
+	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
+	watchdogAdminURLValue = "http://127.0.0.1:1"
+	WatchdogCheckOnce()
+	server := fakeCaddyWithRoutes(t, emptyCaddyConfig)
+	watchdogAdminURLValue = server.URL
+	for range configWatchdogHeartbeatRounds {
+		WatchdogCheckOnce()
+	}
+
+	// Then the public since-last-check counter is zero, while the heartbeat's
+	// independent since-last-heartbeat window still reports the skipped round.
+	if drift := CurrentConfigDrift(); drift.SkippedRounds != 0 {
+		t.Fatalf("status skipped rounds=%d, want 0 after real checks", drift.SkippedRounds)
+	}
+	log := readTaskLog(t, "config-watchdog")
+	if !strings.Contains(log, "期间跳过 1 轮未判定") {
+		t.Fatalf("heartbeat lost its skipped-round window: %q", log)
+	}
+}
+
 // 心跳窗口诚实性：漂移把窗口清零——恢复后须重新积满 60 轮一致才发下一条
 // 心跳；漂移期逐轮漂移行与恢复序列行为不变（仅原漂移防抖首轮的「配置一致」
 // 行随一致轮收敛消失——该轮本就是未确认轮）。
@@ -338,6 +365,44 @@ func TestConfigWatchdog_skippedRoundsDoNotEmitHeartbeat(t *testing.T) {
 	}
 	if drift := CurrentConfigDrift(); drift.SkippedRounds != 2*configWatchdogHeartbeatRounds {
 		t.Fatalf("状态跳过轮字段=%d, want %d", drift.SkippedRounds, 2*configWatchdogHeartbeatRounds)
+	}
+}
+
+func TestConfigWatchdog_successfulCheckResetsSkippedRounds(t *testing.T) {
+	// Given two undetermined rounds followed by a real, consistent check.
+	newClusterTestService(t)
+	resetConfigWatchdogForTest(t)
+	oldURL := watchdogAdminURLValue
+	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
+	watchdogAdminURLValue = "http://127.0.0.1:1"
+	WatchdogCheckOnce()
+	WatchdogCheckOnce()
+	if drift := CurrentConfigDrift(); drift.SkippedRounds != 2 {
+		t.Fatalf("setup skipped rounds=%d, want 2", drift.SkippedRounds)
+	}
+	server := fakeCaddyWithRoutes(t, emptyCaddyConfig)
+	watchdogAdminURLValue = server.URL
+
+	// When a real check succeeds.
+	WatchdogCheckOnce()
+
+	// Then the counter defined as "since the last real check" returns to zero,
+	// while the successful round still advances the clean-round window.
+	if drift := CurrentConfigDrift(); drift.SkippedRounds != 0 {
+		t.Fatalf("skipped rounds after real consistent check=%d, want 0", drift.SkippedRounds)
+	}
+	configDriftMu.RLock()
+	cleanRounds := configDriftCleanRounds
+	configDriftMu.RUnlock()
+	if cleanRounds != 1 {
+		t.Fatalf("clean rounds=%d, want 1", cleanRounds)
+	}
+
+	// And a later skipped round is counted from this new real-check boundary.
+	watchdogAdminURLValue = "http://127.0.0.1:1"
+	WatchdogCheckOnce()
+	if drift := CurrentConfigDrift(); drift.SkippedRounds != 1 {
+		t.Fatalf("skipped rounds after new failure=%d, want 1", drift.SkippedRounds)
 	}
 }
 

@@ -145,7 +145,8 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  // 历史问题：节点模式拉取失败与用户身份同口径——定时重试使未知窗口自动恢复
+  // 成功后每 15s 刷新全站 nodeMode；空数据/瞬时失败复用同一定时器重试。
+  // 单定时器防重让登录、设置保存与后台刷新可以共用此入口而不叠加轮询。
   const scheduleConfigRetry = (): void => {
     if (configRetryTimer !== null || !token.value) return
     configRetryTimer = window.setTimeout(() => {
@@ -163,6 +164,7 @@ export const useAuthStore = defineStore('auth', () => {
         if (res.data.timezone) timezone.value = res.data.timezone
         const renewalDays = res.data.cert_renewal_days ?? 30
         certRenewalDays.value = renewalDays > 0 ? renewalDays : 30
+        scheduleConfigRetry()
       } else {
         scheduleConfigRetry()
       }

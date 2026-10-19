@@ -33,6 +33,23 @@ func resetCertificateServiceForTest(t *testing.T) {
 	})
 }
 
+func TestCanonicalACMEDomains_rejectsTrailingDot(t *testing.T) {
+	// The audit's trailing-dot example is not a valid alternate canonical form:
+	// the single-source helper rejects it just like the SQL revival gate does.
+	if _, err := CanonicalACMEDomains("example.com."); err == nil {
+		t.Fatal("trailing-dot ACME domain must remain invalid")
+	}
+	// Regression: case, surrounding whitespace, and root/www ordering still
+	// canonicalize through the single-source helper.
+	got, err := CanonicalACMEDomains(" WWW.Example.COM , example.com ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "example.com,www.example.com" {
+		t.Fatalf("canonical domains=%q, want example.com,www.example.com", got)
+	}
+}
+
 func TestCreateOrRequeueCertJob_returns_persisted_job_id(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
@@ -158,6 +175,47 @@ func TestCreateOrRequeueCertJob_requeues_downloaded_job(t *testing.T) {
 	}
 	if status != "queued" {
 		t.Fatalf("status=%q, want queued", status)
+	}
+}
+
+func TestCreateOrRequeueCertJobWithChange_preservesTransitionSignalOnEnqueueError(t *testing.T) {
+	// Given：既有 failed 行会真实转为 queued，但入队时没有任何可用 CA。
+	_, database := newClusterTestService(t)
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status) VALUES ('lb_changed_error','changed.example','failed')`); err != nil {
+		t.Fatalf("seed existing job: %v", err)
+	}
+	if _, err := database.Exec("DELETE FROM ca_providers"); err != nil {
+		t.Fatalf("remove CA providers: %v", err)
+	}
+	manager := &CAQueueManager{queues: make(map[int]*caQueue), active: true}
+	t.Cleanup(manager.Stop)
+
+	// When
+	jobID, changed, err := CreateOrRequeueCertJobWithChange("lb_changed_error", "changed.example", 999, manager)
+
+	// Then：错误来自入队阶段，不得抹掉前面已经发生的 DB transition 信号。
+	if err == nil {
+		t.Fatal("enqueue unexpectedly succeeded without a CA provider")
+	}
+	if jobID <= 0 || !changed {
+		t.Fatalf("result jobID=%d changed=%v err=%v, want persisted ID and changed=true", jobID, changed, err)
+	}
+}
+
+func TestCreateOrRequeueCertJobVerified_rejectsExistingJobThatWasNotQueued(t *testing.T) {
+	// Given：既有 queued 行不在活动队列中（滞留形态），队列本身处于运行态。
+	_, database := newClusterTestService(t)
+	if _, err := database.Exec(`INSERT INTO cert_jobs (id,rule_id,domain,status) VALUES (77,'lb_stranded_verify','stranded.example','queued')`); err != nil {
+		t.Fatalf("seed stranded job: %v", err)
+	}
+	manager := &CAQueueManager{queues: make(map[int]*caQueue), active: true}
+
+	// When
+	jobID, changed, err := CreateOrRequeueCertJobVerified("lb_stranded_verify", "stranded.example", 1, manager)
+
+	// Then：未入队必须如实报错，不能被当作成功。
+	if err == nil || jobID != 77 || changed {
+		t.Fatalf("result jobID=%d changed=%v err=%v, want existing ID and not-queued error", jobID, changed, err)
 	}
 }
 
@@ -860,6 +918,45 @@ func TestCertificateService_renewExpiringCertificates_summaryKeepsPlainFormWitho
 	if strings.Contains(string(data), "已达重试上限") {
 		t.Fatalf("无上限任务时不得追加空分档括注: %q", string(data))
 	}
+}
+
+func TestCertificateService_waitingCALogsScanAndIterationFailures(t *testing.T) {
+	t.Run("scan error", func(t *testing.T) {
+		_, database := newClusterTestService(t)
+		ResetCAQueueManagerForTest()
+		InitCAQueueManager(func() error { return nil })
+		t.Cleanup(ResetCAQueueManagerForTest)
+		if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_available_after,ca_provider_id)
+			VALUES ('lb_bad_waiting','bad.example','waiting_ca',datetime('now','-1 minute'),'not-an-integer')`); err != nil {
+			t.Fatal(err)
+		}
+		logs := captureApplicationLogs(t)
+		resetCertificateServiceForTest(t)
+
+		NewCertificateService().requeueWaitingCAJobs()
+
+		if !strings.Contains(logs.String(), "waiting_ca scan: scan row failed") {
+			t.Fatalf("scan failure must be visible, logs=%q", logs.String())
+		}
+	})
+	t.Run("iteration error", func(t *testing.T) {
+		newClusterTestService(t)
+		ResetCAQueueManagerForTest()
+		InitCAQueueManager(func() error { return nil })
+		t.Cleanup(ResetCAQueueManagerForTest)
+		logs := captureApplicationLogs(t)
+		realDB := db.DB
+		fake := sql.OpenDB(&fakeIterErrConnector{failNeedle: "FROM cert_jobs"})
+		db.DB = fake
+		t.Cleanup(func() { db.DB = realDB; _ = fake.Close() })
+		resetCertificateServiceForTest(t)
+
+		NewCertificateService().requeueWaitingCAJobs()
+
+		if !strings.Contains(logs.String(), "waiting_ca scan: iterate rows failed") {
+			t.Fatalf("rows.Err failure must be visible, logs=%q", logs.String())
+		}
+	})
 }
 
 func TestCertificateService_requeueWaitingCAJobs_disables_orphaned_waiting_job(t *testing.T) {
@@ -2074,6 +2171,39 @@ func TestRestoreCertJobs_roundtripsCanonicalDatetimeFormat(t *testing.T) {
 			t.Fatalf("%s drifted to non-canonical format %q: %v (历史问题 regression)", col, raw.String, err)
 		}
 	}
+}
+
+func TestCertificateService_rescanLogsScanAndIterationFailures(t *testing.T) {
+	t.Run("scan error", func(t *testing.T) {
+		_, database := newClusterTestService(t)
+		if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem,deployment_attempts,deployment_available_after)
+			VALUES ('lb_bad_rescan','bad.example','downloaded','x','y','not-an-integer',datetime('now'))`); err != nil {
+			t.Fatal(err)
+		}
+		logs := captureApplicationLogs(t)
+		resetCertificateServiceForTest(t)
+
+		NewCertificateService().rescanDroppedDeploymentRetries()
+
+		if !strings.Contains(logs.String(), "resume deployment retries: scan row failed") {
+			t.Fatalf("scan failure must be visible, logs=%q", logs.String())
+		}
+	})
+	t.Run("iteration error", func(t *testing.T) {
+		newClusterTestService(t)
+		logs := captureApplicationLogs(t)
+		realDB := db.DB
+		fake := sql.OpenDB(&fakeIterErrConnector{failNeedle: "FROM cert_jobs"})
+		db.DB = fake
+		t.Cleanup(func() { db.DB = realDB; _ = fake.Close() })
+		resetCertificateServiceForTest(t)
+
+		NewCertificateService().rescanDroppedDeploymentRetries()
+
+		if !strings.Contains(logs.String(), "resume deployment retries: iterate rows failed") {
+			t.Fatalf("rows.Err failure must be visible, logs=%q", logs.String())
+		}
+	})
 }
 
 // 历史问题(历史):rescanDroppedDeploymentRetries 周期化(30s ticker)——

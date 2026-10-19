@@ -89,11 +89,12 @@ test('②360° 环绕：panBy 横向平移后中心拾取正确；纵向钳制�
   const center = screenToLonLat(W / 2, H / 2, { ...CAM, camX: panned.camX, camY: panned.camY })
   const expected = -91.1 // 向左拖 480px=指针位移 -480 → camX +160 → wrap 至 -91.1
   assert.ok(Math.abs(center.lon - expected) < 1e-6, `平移后中心 lon=${center.lon}, want ${expected}`)
-  // 纵向越界拖动被钳在世界内
+  // 纵向越界拖动被钳在世界内（A85WT-历史问题：钉精确钳制值，替代恒真区间断言与
+  // 死代码 centerY——总览 zoom=3 下 visH=300 ≥ WORLD_D，相机恒居中）
   const clamped = panBy(CAM, 0, -100000)
-  const centerY = LAT_TOP - center.lat
-  assert.ok(clamped.camY >= 0 && clamped.camY <= WORLD_D, `camY 越界: ${clamped.camY}`)
-  void centerY
+  assert.ok(Math.abs(clamped.camY - WORLD_D / 2) < 1e-9, `总览纵向应钉在 WORLD_D/2: ${clamped.camY}`)
+  const clampedDown = panBy(CAM, 0, 100000)
+  assert.ok(Math.abs(clampedDown.camY - WORLD_D / 2) < 1e-9, `总览下拖同样钉在 WORLD_D/2: ${clampedDown.camY}`)
 })
 
 test('④下钻口径：统一倍率=9、主环取景中心为 bbox 中心、南界 -55 钳制', () => {

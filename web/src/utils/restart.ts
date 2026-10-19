@@ -16,6 +16,9 @@ export const reloadAfterRestart = async (isDisposed?: () => boolean): Promise<bo
     if (isDisposed?.()) return false
     try {
       await request.get('/caddy/status', { silent: true })
+      // A85WB-历史问题：状态请求在途期间组件可能已卸载——reload 前复查，
+      // 兑现「isDisposed 提前终止轮询（不触发 reload）」契约。
+      if (isDisposed?.()) return false
       window.location.reload()
       return true
     } catch {

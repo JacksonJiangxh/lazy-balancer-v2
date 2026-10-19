@@ -21,6 +21,13 @@ var (
 	autoBackupExecutor func(ctx context.Context, trigger, operator string, engineRunID int64) error
 )
 
+// WriteAutoBackupFileSynced 复用服务层持久化原子落盘单源：唯一临时文件、
+// 文件 fsync、rename、父目录 fsync，最终权限 0600。handlers 不另造 tmp+rename
+// 平行实现；失败时单源 helper 负责清理临时文件。
+func WriteAutoBackupFileSynced(path string, data []byte) error {
+	return writeFileAtomicSynced(path, data, 0o600)
+}
+
 // SetAutoBackupExecutor 注入备份执行器（main.go 装配 handlers 实现；nil 解除）。
 // ctx 由引擎 Run 上下文透传（历史 历史问题-10）：demote/停止时在途备份
 // 必须可被取消，而非跑完并记 success。
@@ -245,6 +252,12 @@ func nextAutoBackupSlot(now time.Time) (time.Time, bool) {
 		due, ok = autoBackupDueSlot(step, row.freq, row.hhmm, row.day, loc)
 	}
 	return due, ok
+}
+
+// NextAutoBackupSlot 返回调度器自身使用的下一执行槽（含 last_run 漏跑补跑
+// 判定）。设置页只读展示复用同一入口，不再用未保存表单复制一套推算逻辑。
+func NextAutoBackupSlot(now time.Time) (time.Time, bool) {
+	return nextAutoBackupSlot(now)
 }
 
 // runAutoBackupScheduled 定时任务执行体（v2.0 Scheduled 标准——引擎在排程

@@ -2,8 +2,10 @@ package services
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"lazy-balancer-v2/geoipnames"
 	"net"
@@ -40,6 +42,9 @@ func scanSecurityPolicyByID(policyID int) *models.SecurityPolicy {
 		Scan(&p.ID, &p.Name, &p.Description, &p.Mode, &p.AnomalyThreshold, &p.IPACLMode, &p.IPACLList, &p.IPACLEnabled, &p.IPWhitelistEnabled, &ipWhitelist, &ipBlacklist,
 			&p.RateLimitEnabled, &p.RateLimitRPS, &p.RateLimitBurst, &crsRuleGroups, &crsExcludedRules, &customRules, &p.BlockPageID, &p.BlockStatusCode, &p.Enabled, &p.CreatedAt, &p.UpdatedAt, &geoipCountries, &p.GeoIPMode, &p.GeoIPCrawlerExempt, &crawlerEnginesRaw, &p.WAFCheckResponse, &p.LogRequestBody, &p.IPACLListRefs, &p.IPWhitelistRefs, &p.PolicyType, &p.TrustDetection)
 	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			Logf("error", "scanSecurityPolicyByID: 读取安全策略 #%d 失败: %v", policyID, err)
+		}
 		return nil
 	}
 	p.IPWhitelist = json.RawMessage(ipWhitelist)

@@ -31,7 +31,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -281,6 +280,9 @@ type autobanFeedItem struct {
 	Action        string
 	RuleTriggered string
 	At            time.Time
+	// TrustExempt 表示该 logged 事件来自规则绑定的信任 IP（含 stage0 保留
+	// 检测）。生产喂入侧按规则信任并集计算；direct test seam 恒 false。
+	TrustExempt bool
 }
 
 var autobanMu sync.Mutex
@@ -338,6 +340,9 @@ func autobanObserveBatch(items []autobanFeedItem) {
 		return
 	}
 	for _, it := range items {
+		if it.TrustExempt {
+			continue
+		}
 		autobanObserveEventScopedAt(cfg, it.IP, it.Action, it.RuleTriggered, it.At)
 	}
 }
@@ -359,16 +364,10 @@ func autobanObserveEventScoped(cfg AutobanConfig, ip, action, ruleTriggered stri
 	autobanObserveEventScopedAt(cfg, ip, action, ruleTriggered, time.Time{})
 }
 
-// autobanSourceEligible 排除验证爬虫与信任名单事件：它们是正常/已信任
-// 流量，计入会把 Googlebot 等写入封禁名单（历史 历史问题-02）。
+// autobanSourceEligible 只排除真实验证爬虫豁免事件；伪装爬虫是实际 deny，
+// 与普通 WAF 事件一样进入计数。分类复用摄取评分的 ID 编解码单源。
 func autobanSourceEligible(ruleTriggered string) bool {
-	if ruleTriggered == "3" || ruleTriggered == "12" {
-		return false
-	}
-	if n, err := strconv.Atoi(ruleTriggered); err == nil && n >= 810000 && n < 900000 {
-		return false
-	}
-	return true
+	return !securityEventsIsCrawlerExemptRule(ruleTriggered)
 }
 
 func autobanObserveEventScopedAt(cfg AutobanConfig, ip, action, ruleTriggered string, at time.Time) {
@@ -430,8 +429,8 @@ type AutobanSuggestion struct {
 // autobanCandidates 评估候选：先评估后修剪（AB-1，历史）——过期桶若计数
 // 已跨阈值（桶尾达标形态：最后采样在窗口尾、周期 tick 晚于窗口到期）必须并入
 // 候选再删，否则该 IP 永不封禁；未跨阈值的过期桶照常修剪不产生候选。曾达标
-// IP 的过期桶修剪时落一行 expire（与 Feed 路径同文案——窗口过期清零的唯一
-// 两条发射面）。
+// IP 的过期桶修剪时按轮汇总一条 expire（与 Feed 路径同语义——窗口过期清零的
+// 唯一两条发射面）。
 func autobanCandidates(threshold int, window time.Duration) []AutobanSuggestion {
 	now := autobanNow()
 	var expiredReached []string
@@ -467,8 +466,20 @@ func autobanCandidates(threshold int, window time.Duration) []AutobanSuggestion 
 	// 第 201 个达标 IP 永远不会被封禁）；容量由 AutobanListEntryCap 收敛。
 	// 观察模式在 autobanSetSuggestions 前单独截断（展示口径）。
 	autobanMu.Unlock()
-	for _, ip := range expiredReached {
-		TaskLogf(AutobanTaskID, "expire", "IP %s 计数窗口过期，清零", ip)
+	if len(expiredReached) > 0 {
+		// 洪峰下一轮可有数万过期 IP：按轮只写一条汇总，保留排序后的少量
+		// 样本用于排障，避免逐 IP TaskLogf 淹没任务日志。
+		sort.Strings(expiredReached)
+		const sampleCap = 5
+		sample := expiredReached
+		if len(sample) > sampleCap {
+			sample = sample[:sampleCap]
+		}
+		detail := "IP " + strings.Join(sample, "、")
+		if rest := len(expiredReached) - len(sample); rest > 0 {
+			detail += fmt.Sprintf(" 等，另有 %d 个", rest)
+		}
+		TaskLogf(AutobanTaskID, "expire", "%d 个 IP 计数窗口过期，清零（%s）", len(expiredReached), detail)
 	}
 	return out
 }

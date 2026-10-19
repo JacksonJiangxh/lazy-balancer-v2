@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"encoding/json"
 	"lazy-balancer-v2/internal/config"
@@ -41,6 +42,64 @@ func TestSyncService_Report_returnsActionableErrorOnUnfollowedRedirect(t *testin
 	}
 	if !strings.Contains(err.Error(), "重定向") || !strings.Contains(err.Error(), "https://") {
 		t.Fatalf("report error=%q, want actionable redirect guidance", err)
+	}
+}
+
+func TestSyncService_Report_followsSameHostTLSUpgradeFound(t *testing.T) {
+	// Given the real plaintext-to-HTTPS upgrade shape emitted as 302.
+	_, database := newClusterTestService(t)
+	received := make(chan string, 1)
+	tlsMaster := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			t.Errorf("method=%q, want POST", request.Method)
+		}
+		received <- request.Header.Get("X-Cluster-Token")
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer tlsMaster.Close()
+	plaintext := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		http.Redirect(response, request, tlsMaster.URL+request.URL.Path, http.StatusFound)
+	}))
+	defer plaintext.Close()
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token='cluster-token' WHERE id=1", plaintext.URL); err != nil {
+		t.Fatal(err)
+	}
+	service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
+
+	// When the node reports through the plaintext address.
+	err := service.Report(context.Background())
+
+	// Then 302 is replayed before the residual-3xx guard and the report succeeds.
+	if err != nil {
+		t.Fatalf("same-host 302 upgrade must succeed: %v", err)
+	}
+	select {
+	case token := <-received:
+		if token != "cluster-token" {
+			t.Fatalf("token=%q, want cluster-token", token)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HTTPS target never received report")
+	}
+}
+
+func TestSyncService_Report_rejectsCrossHostFound(t *testing.T) {
+	// Given a 302 to another hostname, which must never receive cluster credentials.
+	_, database := newClusterTestService(t)
+	master := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Location", "https://master-elsewhere.example.com/api/v1/cluster/nodes/report")
+		response.WriteHeader(http.StatusFound)
+	}))
+	defer master.Close()
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token='cluster-token' WHERE id=1", master.URL); err != nil {
+		t.Fatal(err)
+	}
+	service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
+
+	// When/Then the residual-3xx guard remains fail-visible for cross-host 302.
+	err := service.Report(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "302") || !strings.Contains(err.Error(), "重定向") {
+		t.Fatalf("cross-host 302 error=%v, want actionable redirect rejection", err)
 	}
 }
 

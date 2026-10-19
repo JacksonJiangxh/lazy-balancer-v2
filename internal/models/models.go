@@ -270,8 +270,9 @@ type GlobalConfig struct {
 	// 1/4/8 档与滞回切换）、0=关闭、1=全量。固定 2..64 契约已废除（历史
 	// 用户裁定）；DB DEFAULT/迁移见 db.go（2..64 一次性归 -1）。
 	ThreatTrafficSampleN int `json:"threat_traffic_sample_n"`
-	// SecurityEventsRetentionDays/RowCap 安全事件保留（v2.3.8 显式设置，0=跟随
-	// 旧通道 audit_retention_months×30 / 内置 100 万行）
+	// SecurityEventsRetentionDays/RowCap 安全事件保留（v2.3.8 显式设置）：
+	// 写侧只接受 1-3650 天 / 1-1 亿行（旧「0=自动」语义已废除）；库内 0/NULL
+	// 属 legacy 形态，由启动迁移一次性归一。渲染/查询直读库值。
 	SecurityEventsRetentionDays int `json:"security_events_retention_days"`
 	SecurityEventsRowCap        int `json:"security_events_row_cap"`
 	// v2.1.8 MFA 全局开关（响应面）
@@ -616,8 +617,8 @@ type UpdateConfigRequest struct {
 	// 仅允许 -1=自适应、0=关闭、1=全量——固定 2..64 契约已废除，写侧门
 	// 由 handlers 校验（-1/0/1）。
 	ThreatTrafficSampleN *int `json:"threat_traffic_sample_n"`
-	// 安全事件保留（v2.3.8）：nil=保持现值；天数 0-3650（0=自动）、行数上限
-	// 0-1 亿（0=自动，内置 100 万）。
+	// 安全事件保留（v2.3.8）：nil=保持现值；写侧只接受天数 1-3650、行数上限
+	// 1-1 亿（0=自动的旧语义已废除，0/NULL 仅作 legacy 库值由启动迁移归一）。
 	SecurityEventsRetentionDays *int `json:"security_events_retention_days"`
 	SecurityEventsRowCap        *int `json:"security_events_row_cap"`
 	// v2.1.8 MFA 全局开关（基础设置卡片，决策6）：默认均关。

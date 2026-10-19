@@ -13,8 +13,11 @@ import (
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
-	"lazy-balancer-v2/internal/taskengine"
 )
+
+// logRotatedBackups 是读侧轮转展示统一保留份数；与 services 写侧常量由
+// TestLogRotatedBackups_matchServiceWriters 钉住。
+const logRotatedBackups = 5
 
 // LogStorageInfo 描述一类日志的体量与治理状态。
 // SizeBytes 为当前活跃文件/库的大小；RotatedBytes 为轮转副本合计（DB 类为 0）。
@@ -39,9 +42,9 @@ type LogStorageInfo struct {
 // (SYS-1,2026-09-10 审计):自研 .1..9 shift 后缀;时间戳后缀家族——运行日志
 // <path>.YYYYMMDD-HHMMSS(logrotate.go)与 Caddy/timberjack 的 <name>-<ts>-size.log
 // isTimberjackRotationCopy 判定文件名是否为 timberjack 轮转副本
-// (<stem>-<ts>-size.log / .gz,ts 首字符为数字)。与 timestampedRotationStats
+// (<stem>-<ts>-size.log / .gz,ts 首字符为数字)。与 timestampedRotationStatsWithEntries
 // 的 timberjack 分支同口径(历史问题 数字边界校验),聚合枚举时跳过这些副本
-// ——它们已由 base 文件的 timestampedRotationStats 计入 rotated,
+// ——它们已由 base 文件的 timestampedRotationStatsWithEntries 计入 rotated,
 // 再计入 active 即双计(F-A,历史)。
 func isTimberjackRotationCopy(name string) bool {
 	suffix := ""
@@ -82,14 +85,6 @@ func dirBytesWithEntries(path string, entries []os.DirEntry) (int64, int64, int)
 	rotated += rotBytes
 	count += rotCount
 	return active, rotated, count
-}
-
-// timestampedRotationStats 统计同目录下以「去扩展名 base + 分隔符 + 时间戳」
-// 命名的轮转副本的字节数与份数——dirBytes 消费,供 LogStorageBar
-// 「已归档 N/M 份」展示。(历史问题-1:计数弱化版 timestampedRotations/mustSecond
-// 生产零调用,已删。)
-func timestampedRotationStats(path string) (int64, int) {
-	return timestampedRotationStatsWithEntries(path, nil)
 }
 
 func timestampedRotationStatsWithEntries(path string, entries []os.DirEntry) (int64, int) {
@@ -267,7 +262,7 @@ func isRotationCopyShape(name string) bool {
 	return false
 }
 
-// rotationCopyBaseOf 把轮转副本归到所属 base（与 dirBytes/timestampedRotationStats
+// rotationCopyBaseOf 把轮转副本归到所属 base（与 dirBytes/timestampedRotationStatsWithEntries
 // 同口径：移位后缀、运行日志时间戳后缀、timberjack 时间戳后缀三族）。
 func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[string]string) (string, bool) {
 	if dot := strings.LastIndexByte(name, '.'); dot > 0 && isDigits(name[dot+1:]) {
@@ -481,18 +476,18 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	infos := []LogStorageInfo{
 		{Key: "audit", Name: "操作日志", KeepCount: 0, RetentionNote: retentionNote, ConfigSource: "基础设置 · 日志保留（操作/运行/安全事件）"},
 		{Key: "security_events", Name: "安全事件", KeepCount: 0, LimitRows: securityEventsMaxRows(), LimitBytes: auditLogLimit, RetentionNote: securityRetentionNote, ConfigSource: "基础设置 · 日志保留（操作/运行/安全事件）"},
-		{Key: "certjob", Name: "证书任务日志", LimitBytes: taskLogLimit, KeepCount: 5, ConfigSource: "基础设置 · 任务日志大小"},
+		{Key: "certjob", Name: "证书任务日志", LimitBytes: taskLogLimit, KeepCount: logRotatedBackups, ConfigSource: "基础设置 · 任务日志大小"},
 		{Key: "crs_update", Name: "CRS 更新日志", LimitBytes: taskLogLimit, KeepCount: 1, ConfigSource: "统一任务日志（tasks/crs.log）"},
 		{Key: "ip2region_update", Name: "IP 库更新日志", LimitBytes: taskLogLimit, KeepCount: 1, ConfigSource: "统一任务日志（tasks/ip2region.log）"},
 		{Key: "threat_update", Name: "威胁库更新日志", LimitBytes: taskLogLimit, KeepCount: 1, ConfigSource: "统一任务日志（tasks/threat.log）"},
 		{Key: "crawlerbot_update", Name: "爬虫地址库更新日志", LimitBytes: taskLogLimit, KeepCount: 1, ConfigSource: "统一任务日志（tasks/crawlerbot-update.log）"},
 		{Key: "runtime", Name: "运行日志", LimitBytes: runtimeLogLimit, KeepCount: 0, RetentionNote: "时间戳轮转，按保留期清理（份数随保留期）", ConfigSource: "基础设置 · 运行日志大小"},
-		{Key: "caddy", Name: "Caddy 运行日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
-		{Key: "caddy_runtime", Name: "Caddy 运行时日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
-		{Key: "caddy_tls", Name: "Caddy TLS 日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
-		{Key: "caddy_server", Name: "Caddy HTTP 服务器日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
-		{Key: "caddy_proxy", Name: "Caddy 反向代理日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
-		{Key: "rule_access", Name: "规则访问日志", LimitBytes: caddyLimit, KeepCount: 5, ConfigSource: "Caddy 全局配置 · 日志大小"},
+		{Key: "caddy", Name: "Caddy 运行日志", LimitBytes: caddyLimit, KeepCount: logRotatedBackups, ConfigSource: "Caddy 全局配置 · 日志大小"},
+		{Key: "caddy_runtime", Name: "Caddy 运行时日志", LimitBytes: caddyLimit, KeepCount: logRotatedBackups, ConfigSource: "Caddy 全局配置 · 日志大小"},
+		{Key: "caddy_tls", Name: "Caddy TLS 日志", LimitBytes: caddyLimit, KeepCount: logRotatedBackups, ConfigSource: "Caddy 全局配置 · 日志大小"},
+		{Key: "caddy_server", Name: "Caddy HTTP 服务器日志", LimitBytes: caddyLimit, KeepCount: logRotatedBackups, ConfigSource: "Caddy 全局配置 · 日志大小"},
+		{Key: "caddy_proxy", Name: "Caddy 反向代理日志", LimitBytes: caddyLimit, KeepCount: logRotatedBackups, ConfigSource: "Caddy 全局配置 · 日志大小"},
+		{Key: "rule_access", Name: "规则访问日志", LimitBytes: caddyLimit, KeepCount: logRotatedBackups, ConfigSource: "Caddy 全局配置 · 日志大小"},
 		// F-历史问题-03（历史）：原 coraza_audit 行删除——前端零消费方
 		// （LogStorageBar 仅 security_events/rule_access 两键），且与
 		// security_events 行同文件同统计，纯重复死面；audit_log_size_mb 配置
@@ -515,7 +510,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 				byKey("audit").Rows = &n
 			}
 		}
-		if st, err := os.Stat(filepath.Join(dataDir, "lazy-balancer-audit.db")); err == nil {
+		if st, err := os.Stat(filepath.Join(dataDir, db.AuditDBFilename)); err == nil {
 			byKey("audit").SizeBytes = st.Size()
 		}
 	}
@@ -526,7 +521,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 				byKey("security_events").Rows = &n
 			}
 		}
-		if st, err := os.Stat(filepath.Join(dataDir, "lazy-balancer-metrics.db")); err == nil {
+		if st, err := os.Stat(filepath.Join(dataDir, db.MetricsDBFilename)); err == nil {
 			sz := st.Size()
 			byKey("security_events").DBBytes = &sz
 		}
@@ -596,42 +591,9 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		}
 	}
 	// 逐任务真实文件统计（任务监控弹框 log-key=task:<id>）：活动大小、
-	// 轮转副本与归档份数均按本任务文件计算，不再使用目录聚合值冒充。
-	// 历史问题：cert-job 行的 cert_jobs.rule_id 一次性载入（原逐行
-	// systemTaskLogPath 每行一次点查 = N+1）。
-	certJobRuleIDs := map[string]string{}
-	certJobRuleIDsLoaded := false
-	taskLogPath := func(taskID string) (string, error) {
-		if !strings.HasPrefix(taskID, "cert-job:") {
-			return taskengine.TaskLogPath(taskID), nil
-		}
-		if !certJobRuleIDsLoaded {
-			certJobRuleIDsLoaded = true
-			if db.DB != nil {
-				rows, err := db.DB.Query(`SELECT id, rule_id FROM cert_jobs`)
-				if err != nil {
-					return "", err
-				}
-				for rows.Next() {
-					var jobID int
-					var ruleID string
-					if scanErr := rows.Scan(&jobID, &ruleID); scanErr == nil {
-						certJobRuleIDs[strconv.Itoa(jobID)] = ruleID
-					}
-				}
-				err = rows.Err()
-				rows.Close()
-				if err != nil {
-					return "", err
-				}
-			}
-		}
-		ruleID := certJobRuleIDs[strings.TrimPrefix(taskID, "cert-job:")]
-		if ruleID == "" {
-			return "", nil
-		}
-		return services.CertJobLogPath(ruleID), nil
-	}
+	// 轮转副本与归档份数均按本任务文件计算。批量路径解析复用同一个
+	// systemTaskLogPathResolver，cert_jobs 只首批载入一次，避免 N+1。
+	var taskLogPath systemTaskLogPathResolver
 	taskDirEntries := map[string][]os.DirEntry{}
 	readTaskDir := func(dir string) []os.DirEntry {
 		if entries, ok := taskDirEntries[dir]; ok {
@@ -649,7 +611,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		if !want(key) {
 			continue
 		}
-		path, err := taskLogPath(task.ID)
+		path, err := taskLogPath.resolve(task.ID)
 		if err != nil {
 			services.Logf("warn", "任务 %s 日志路径解析失败: %v", task.ID, err)
 			continue
@@ -659,7 +621,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		}
 		keep := 1
 		if strings.HasPrefix(task.ID, "cert-job:") {
-			keep = 5
+			keep = logRotatedBackups
 		}
 		active, rotated, rotCount := dirBytesWithEntries(path, readTaskDir(filepath.Dir(path)))
 		infos = append(infos, LogStorageInfo{

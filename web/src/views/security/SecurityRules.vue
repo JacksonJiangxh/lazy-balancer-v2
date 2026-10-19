@@ -625,6 +625,7 @@ import { Aim, Filter, List, Location, Lock, Search, Notebook, Plus, WarningFille
 import { formatDate, parseDbTimeMs } from '@/utils/date'
 import { IP_LIST_CATEGORIES, invalidateSharedEntriesCache } from '@/utils/securityStages'
 import { libraryHealthTag, librarySourceHealthTag, libraryStatusLabel, libraryStatusTagType, summarizeLibrarySources } from '@/utils/securityLibraries'
+import { updaterName } from '@/utils/updaterName'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import RuleLibScheduleEditor from '@/components/RuleLibScheduleEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
@@ -660,9 +661,11 @@ const fetchThreatLib = async () => {
       if (res.data.schedule_days?.length) threatSchedule.value = { days: res.data.schedule_days, time: res.data.schedule_time || '04:00' }
     }
     threatLibError.value = false
+    threatLibLoaded.value = true
   } catch {
     // 只读拉取失败：不打断页面，但健康标签必须显性为「加载失败」（历史问题）
     threatLibError.value = true
+    threatLibLoaded.value = true
   }
 }
 
@@ -691,8 +694,10 @@ const fetchCrawlerLib = async () => {
       if (res.data.schedule_days?.length) crawlerSchedule.value = { days: res.data.schedule_days, time: res.data.schedule_time || '04:00' }
     }
     crawlerLibError.value = false
+    crawlerLibLoaded.value = true
   } catch {
     crawlerLibError.value = true
+    crawlerLibLoaded.value = true
   }
 }
 
@@ -791,17 +796,20 @@ const libHealthTags = computed(() => [
   // 历史问题-F1/F2：健康标签单源（utils/securityLibraries）——IP 库未安装时
   // 显示「未安装」警示，不再与版本列「未安装」/状态列「已最新」互相矛盾。
   libraryHealthTag('CRS 规则库', {
+    // A85WA-历史问题：首次响应未落地不得冒充「正常」——loaded 三态
+    loaded: crsInfoLoaded.value,
     loadError: crsInfoError.value,
     available: crsInfo.value.available,
     status: crsInfoError.value ? 'failed' : crsInfo.value.update_status,
   }),
   libraryHealthTag('IP 地理库', {
+    loaded: ip2regionInfoLoaded.value,
     loadError: ip2regionInfoError.value,
     available: ip2regionInfo.value.available,
     status: ip2regionInfoError.value ? 'failed' : ip2regionStatusForTag.value,
   }),
-  librarySourceHealthTag('威胁情报库', threatSources.value, threatLibError.value),
-  librarySourceHealthTag('爬虫地址库', crawlerSources.value, crawlerLibError.value),
+  librarySourceHealthTag('威胁情报库', threatSources.value, threatLibError.value, threatLibLoaded.value),
+  librarySourceHealthTag('爬虫地址库', crawlerSources.value, crawlerLibError.value, crawlerLibLoaded.value),
 ])
 const libSummaryWarn = computed(() => crsInfo.value.available === false || ip2regionInfo.value.available === false)
 
@@ -915,11 +923,8 @@ const isSlaveNode = computed(() => authStore.isSlaveNode)
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 
 const users = ref<UserListItem[]>([])
-const getUpdaterName = (userId?: number) => {
-  if (!userId || userId === 0) return '-'
-  const user = users.value.find(u => u.id === userId)
-  return user?.display_name || user?.username || '-'
-}
+// 更新者显示名走 utils/updaterName 单源（A85WA-历史问题 四份同构收敛）
+const getUpdaterName = (userId?: number) => updaterName(users.value, userId)
 
 const crsInfo = ref({ version: '', auto_update: true, updated_at: '', last_checked: '', next_update: '', update_status: '', message: '', available: true, rule_count: 0, schedule_days: [1, 2, 3, 4, 5, 6, 7] as number[], schedule_time: '04:00' })
 
@@ -930,6 +935,12 @@ const crsInfoError = ref(false)
 const ip2regionInfoError = ref(false)
 const threatLibError = ref(false)
 const crawlerLibError = ref(false)
+// A85WA-历史问题：加载三态——首次响应落地（成功或失败）前健康标签显示「加载中」，
+// 初值 available:true/空源列表不得冒充「正常」。
+const crsInfoLoaded = ref(false)
+const ip2regionInfoLoaded = ref(false)
+const threatLibLoaded = ref(false)
+const crawlerLibLoaded = ref(false)
 const ip2regionVersionLabel = computed(() => {
   if (ip2regionInfo.value.version === 'bundled') return '内置版本（未更新）'
   return (ip2regionInfo.value.version && ip2regionInfo.value.version !== 'unknown') ? ip2regionInfo.value.version : '未安装'
@@ -1408,9 +1419,11 @@ const fetchCRS = async () => {
     const res = await request.get<APIResponse<typeof crsInfo.value>>('/security/crs')
     if (res.data) crsInfo.value = res.data
     crsInfoError.value = false
+    crsInfoLoaded.value = true
   } catch {
     // 读取失败：标签/行状态显性化（历史问题），不沿用默认值伪装正常
     crsInfoError.value = true
+    crsInfoLoaded.value = true
   }
 }
 
@@ -1516,8 +1529,10 @@ const fetchIP2RegionInfo = async () => {
     const res = await request.get<APIResponse<typeof ip2regionInfo.value>>('/security/ip2region')
     if (res.data) ip2regionInfo.value = res.data
     ip2regionInfoError.value = false
+    ip2regionInfoLoaded.value = true
   } catch {
     ip2regionInfoError.value = true
+    ip2regionInfoLoaded.value = true
   }
 }
 const toggleIP2RegionAutoUpdate = async (val: boolean) => { try { await request.put('/security/ip2region/auto-update', { auto_update: val }); mfaAwareSuccess('已更新') } catch { ip2regionInfo.value.auto_update = !val } }
@@ -1629,7 +1644,9 @@ const openRuleDialog = (row?: CustomRule) => {
   editingRuleId.value = row?.id ?? null
   if (row) {
     // 存量空条件规则：自动补一条空条件行，让用户可见地修正而非卡在无法保存的死角
-    const conditions = row.conditions.length ? [...row.conditions] : [{ target: 'uri', operator: 'contains', pattern: '' }]
+    // A85WA-历史问题：逐条深拷贝——浅拷贝数组会让弹框 v-model 直接改写
+    // 列表行对象（取消/保存失败后表格展示未落库的修改态）。
+    const conditions = row.conditions.length ? row.conditions.map((c) => ({ ...c })) : [{ target: 'uri', operator: 'contains', pattern: '' }]
     ruleForm.value = { name: row.name, description: row.description, conditions, action: row.action, score: row.score, enabled: row.enabled }
   } else {
     ruleForm.value = { name: '', description: '', conditions: [{ target: 'uri', operator: 'contains', pattern: '' }], action: 'block', score: 5, enabled: true }

@@ -31,6 +31,9 @@ const (
 	// CRSStatusSkipped 历史问题-05（历史）：起点角色复查中止的正常语义
 	// 终态——对齐威胁族 lastTaskOutcome=skipped（从节点中止非故障）。
 	CRSStatusSkipped CRSUpdateStatus = "skipped"
+	// CRSStatusCancelled 用户主动取消：与 task_runs cancelled 同终态，
+	// 不增加连续失败计数，也不与 demote skipped 混用。
+	CRSStatusCancelled CRSUpdateStatus = "cancelled"
 )
 
 var (
@@ -216,6 +219,9 @@ func currentCRSVersion() string {
 	return version
 }
 
+// crsCurrentVersionForRun 安装前版本判定的测试缝；生产恒指向 currentCRSVersion。
+var crsCurrentVersionForRun = currentCRSVersion
+
 // StartUpdate begins an async update; only one may run at a time. 返回本次 run
 // 的完成通道（历史问题 B-F2）：调度器 rearm 须等待该捕获通道而非回读现行 m.runDone
 // ——StartUpdate 返回与 rearm 取锁之间存在微秒级窗口，快失败的 auto run 被手动
@@ -257,8 +263,8 @@ func (m *CRSUpdateManager) setStage(status CRSUpdateStatus, message string) {
 	switch status {
 	case CRSStatusFailed:
 		level = "ERROR"
-	case CRSStatusSkipped:
-		// 历史问题-05：跳过语义用 WARN（对齐威胁族 AppendThreatUpdateLog WARN skipped）。
+	case CRSStatusSkipped, CRSStatusCancelled:
+		// 跳过/用户取消均为非故障中止，使用 WARN。
 		level = "WARN"
 	}
 	WriteCRSUpdateLog(level, string(status), message)
@@ -293,16 +299,19 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		// 状态中文归一（历史问题-08b：曾混英文 status token，与 threat 族口径不一）
 		statusLabel := map[string]string{
 			string(CRSStatusSuccess): "成功", string(CRSStatusFailed): "失败",
-			string(CRSStatusSkipped): "跳过",
-			string(CRSStatusIdle):    "空闲", string(CRSStatusChecking): "检测中",
+			string(CRSStatusSkipped): "跳过", string(CRSStatusCancelled): "已取消",
+			string(CRSStatusIdle): "空闲", string(CRSStatusChecking): "检测中",
 		}[snap.Status]
 		if statusLabel == "" {
 			statusLabel = snap.Status
 		}
 		detail := fmt.Sprintf("更新%s（触发：%s）%s", statusLabel, trigger, snap.Message)
-		if snap.Status == string(CRSStatusFailed) {
+		switch snap.Status {
+		case string(CRSStatusFailed):
 			RecordAuditLog(operator, "更新失败", "CRS规则库", detail, "")
-		} else {
+		case string(CRSStatusCancelled):
+			RecordAuditLog(operator, "取消", "CRS规则库", detail, "")
+		default:
 			RecordAuditLog(operator, "更新", "CRS规则库", detail, "")
 		}
 	}()
@@ -352,7 +361,7 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	// 任务内重试（2026-09-25 用户裁定）：瞬断在当前任务内重试，耗尽才落定失败——
 	// 失败退避不再改写排程槽，下一运行=下一排程槽。
 	var tag string
-	err := runWithInTaskRetry(func() error {
+	err := runWithInTaskRetry(runCtx, func() error {
 		var ferr error
 		tag, ferr = m.fetchLatestTag(runCtx)
 		if _, dbErr := db.DB.Exec("UPDATE security_crs_version SET last_checked=? WHERE id=1", runStartedAt); dbErr != nil {
@@ -369,6 +378,10 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 			m.setStage(CRSStatusSkipped, "节点已降级为从节点，终止 CRS 更新")
 			return
 		}
+		if runCtx.Err() != nil {
+			m.cancel(err, false)
+			return
+		}
 		m.fail(err, false)
 		m.advanceSlotIfAuto(trigger)
 		return
@@ -380,7 +393,7 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	// 无条件 downloadAndInstall 降级为更旧树,与 UI IsLatest(<=0 即最新)语义相悖。
 	// 历史问题：精确相等短路（与格式无关）——相同版本即「已是最新」，不再依赖
 	// 版本解析；不同且不可比较显式 fail-visible（见下方 else-if）。
-	currentVersion := currentCRSVersion()
+	currentVersion := crsCurrentVersionForRun()
 	if tag == currentVersion {
 		WriteCRSUpdateLog("INFO", string(CRSStatusSuccess), "已是最新版本，无需更新")
 		m.recordLatestSkip(trigger)
@@ -403,7 +416,9 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	m.mu.Unlock()
 
 	var installErr error
-	_ = runWithInTaskRetry(func() error {
+	installAttempted := false
+	installRetErr := runWithInTaskRetry(runCtx, func() error {
+		installAttempted = true
 		installErr = m.downloadAndInstall(runCtx, tag)
 		// crsReloadError=安装成功但重载失败（restore 编舞已执行）——非瞬断，不重试
 		// （errIP2RegionReload 同型先例）。
@@ -415,11 +430,23 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	}, func(nextAttempt int, wait time.Duration, rerr error) {
 		WriteCRSUpdateLog("WARN", "retry", fmt.Sprintf("下载安装 CRS %s 失败: %v；等待 %s 重试，第 %d 次，共 %d 次", tag, rerr, wait, nextAttempt, updateMaxAttempts))
 	})
+	// 取消可能发生在安装循环执行 op 之前：此时 installErr 仍为 nil，但
+	// runWithInTaskRetry 已返回 ctx 错误。必须消费返回值，禁止写成功版本。
+	if installRetErr != nil && (installErr == nil || runCtx.Err() != nil) {
+		installErr = installRetErr
+	}
+	if installErr == nil && runCtx.Err() != nil {
+		installErr = runCtx.Err()
+	}
 	if installErr != nil {
 		// F-历史问题-01：同上方 fetch 分支——demote 在途中止落 skipped（不 restore：
 		// 从节点不回滚不 reload，保持只读不变量）。
 		if runCtx.Err() != nil && !updateRunStillMaster() {
 			m.setStage(CRSStatusSkipped, "节点已降级为从节点，终止 CRS 更新")
+			return
+		}
+		if runCtx.Err() != nil {
+			m.cancel(installErr, installAttempted)
 			return
 		}
 		m.fail(installErr, true)
@@ -473,7 +500,7 @@ func advanceVersionSlotIfDue(table string) {
 	}
 }
 
-func (m *CRSUpdateManager) fail(cause error, restore bool) {
+func (m *CRSUpdateManager) restoreAfterInstallError(restore bool) {
 	if restore {
 		m.restoreBackup()
 		// CRS25-8(历史):reloader nil 守卫(与 crsinstall.go:314 同口径)——
@@ -484,6 +511,28 @@ func (m *CRSUpdateManager) fail(cause error, restore bool) {
 			}
 		}
 	}
+}
+
+// cancel 记录用户主动取消：安装段已发生树变更时沿用失败路径的回滚/重载
+// 安全编舞，但终态不是 failed，连续失败计数不增加。
+func (m *CRSUpdateManager) cancel(cause error, restore bool) {
+	m.restoreAfterInstallError(restore)
+	if _, err := db.DB.Exec(
+		"UPDATE security_crs_version SET update_status='cancelled', message=?, finished_at=datetime('now') WHERE id=1",
+		cause.Error(),
+	); err != nil {
+		Logf("error", "crs update: failed to record cancellation: %v", err)
+	}
+	m.mu.Lock()
+	m.state.status = CRSStatusCancelled
+	m.state.message = cause.Error()
+	m.state.finishedAt = time.Now().UTC()
+	m.mu.Unlock()
+	WriteCRSUpdateLog("WARN", string(CRSStatusCancelled), cause.Error())
+}
+
+func (m *CRSUpdateManager) fail(cause error, restore bool) {
+	m.restoreAfterInstallError(restore)
 	// 连续失败计数 +1（失败趋势可观测；操作审计由 run 的 defer 单记——
 	// 历史问题-2 收敛后内联首败审计已撤）。
 	if _, err := db.DB.Exec(

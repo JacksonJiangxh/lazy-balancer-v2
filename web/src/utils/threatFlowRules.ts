@@ -77,8 +77,8 @@ export function nextFlowCursor(previous: number, data: { enabled?: boolean; next
   return typeof data.next_seq === 'number' ? data.next_seq : previous
 }
 
-/** 自适应档位：全量 / 1/4 / 1/8（1/N 的 N）。 */
-export const ADAPTIVE_SAMPLE_TIERS = [1, 4, 8] as const
+/** 自适应档位取值集合（1/4/8）曾是零消费导出常量，A85WA-历史问题 移除；
+ *  档位语义由 nextAdaptiveSampleN/stepAdaptiveSample 承载。 */
 
 /**
  * 自适应切换阈值（事件/秒，用服务端 sample_n 还原后的真实速率）：

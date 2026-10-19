@@ -49,7 +49,7 @@ var cancelCertJob = func(id int) {
 
 // certJobLogMaxRotatedBackups 对齐 services/certjoblog.go 的 maxRotatedFiles=5
 // （.1 最新 → .5 最旧）；写侧未来扩大保留数时读侧须同步调整。
-const certJobLogMaxRotatedBackups = 5
+const certJobLogMaxRotatedBackups = logRotatedBackups
 
 const maxCertJobPage int64 = 1_000_000
 
@@ -142,22 +142,23 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 	defer rows.Close()
 
 	type certJobListItem struct {
-		ID                int                 `json:"id"`
-		RuleID            string              `json:"rule_id"`
-		Domain            string              `json:"domain"`
-		CAProviderID      int                 `json:"ca_provider_id"`
-		CAProviderName    string              `json:"ca_provider_name,omitempty"`
-		Status            string              `json:"status"`
-		Message           string              `json:"message"`
-		Issuer            string              `json:"issuer"`
-		DaysRemaining     int                 `json:"days_remaining"`
-		CertificateStatus string              `json:"certificate_status"`
-		RenewalAttempts   int                 `json:"renewal_attempts,omitempty"`
-		CAAvailableAfter  models.JSONNullTime `json:"ca_available_after,omitempty"`
-		LastErrorCode     string              `json:"last_error_code,omitempty"`
-		ExpiresAt         models.JSONNullTime `json:"expires_at"`
-		CreatedAt         time.Time           `json:"created_at"`
-		UpdatedAt         models.JSONNullTime `json:"updated_at"`
+		ID                   int                 `json:"id"`
+		RuleID               string              `json:"rule_id"`
+		Domain               string              `json:"domain"`
+		CAProviderID         int                 `json:"ca_provider_id"`
+		CAProviderName       string              `json:"ca_provider_name,omitempty"`
+		Status               string              `json:"status"`
+		Message              string              `json:"message"`
+		Issuer               string              `json:"issuer"`
+		DaysRemaining        int                 `json:"days_remaining"`
+		CertificateStatus    string              `json:"certificate_status"`
+		RenewalAttempts      int                 `json:"renewal_attempts,omitempty"`
+		CAAvailableAfter     models.JSONNullTime `json:"ca_available_after,omitempty"`
+		LastErrorCode        string              `json:"last_error_code,omitempty"`
+		ExpiresAt            models.JSONNullTime `json:"expires_at"`
+		CreatedAt            time.Time           `json:"created_at"`
+		UpdatedAt            models.JSONNullTime `json:"updated_at"`
+		RetryCooldownSeconds *int64              `json:"retry_cooldown_seconds"`
 	}
 	jobs := make([]certJobListItem, 0, pageSize)
 	now := time.Now()
@@ -169,6 +170,10 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取证书任务失败: " + err.Error()})
 			return
+		}
+		if cooldown, retryable := certJobRetryCooldown(j.Status); retryable {
+			seconds := int64(cooldown / time.Second)
+			j.RetryCooldownSeconds = &seconds
 		}
 		j.Issuer = certificateIssuer(certPEM)
 		j.CertificateStatus = "unknown"
@@ -297,6 +302,15 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	// 恢复 / requeueCertJobsSnapshot 的取向）。改为把部署窗口推到 now 并立即
 	// 重排部署重试；仅「无材料」的 downloaded（历史脏行）才回落重新签发。
 	if rescheduled, err := rescheduleDownloadedCertJobDeployment(id, ruleID, domain); err != nil {
+		if errors.Is(err, services.ErrCertificateDeploymentRetryBusy) {
+			c.JSON(http.StatusConflict, models.APIResponse{Code: http.StatusConflict, Message: "上一次部署回调仍在退出中，请稍后重试"})
+			return
+		}
+		if errors.Is(err, services.ErrCertificateQueueInactive) {
+			status, message := certEnqueueErrorResponse("部署重试未触发", err)
+			c.JSON(status, models.APIResponse{Code: status, Message: message})
+			return
+		}
 		services.Logf("error", "Manual deployment retry failed for job %d: %v", id, err)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to enqueue retry"})
 		return
@@ -401,43 +415,53 @@ func rescheduleDownloadedCertJobDeployment(id int, ruleID, domain string) (bool,
 	if rowsAffected == 0 {
 		return false, nil
 	}
-	// 证书服务在运行则立即重排（取消挂起退避 timer）；服务缺失时
-	// deployment_available_after=now 已被启动恢复/补扫覆盖，不会静默丢失。
-	services.RetryCertificateDeploymentNow(id, ruleID)
+	// deployment_available_after=now 仍可供服务恢复后的补扫接管；但只有实际
+	// 登记了立即 timer 才允许上层报告「已触发」，停止/忙状态必须返回 409。
+	if err := services.RetryCertificateDeploymentNow(id, ruleID); err != nil {
+		return true, err
+	}
 	return true, nil
+}
+
+// certJobRetryCooldown 是重试冷却的唯一策略源；列表 API 直接下发该值，
+// certJobRetryBlocked 复用同一判定执行服务端门禁。
+func certJobRetryCooldown(status string) (time.Duration, bool) {
+	switch status {
+	case "disabled":
+		return 0, false
+	case "issued", "waiting_ca":
+		return 0, true
+	case "queued":
+		return 15 * time.Minute, true
+	case "failed":
+		return 5 * time.Minute, true
+	default:
+		return 2 * time.Minute, true
+	}
 }
 
 // certJobRetryBlocked 返回任务是否被重试门拦截，以及应返回的 HTTP 状态码。
 // 429 =「稍后重试可成功」（执行中/冷却），409 =「永久条件不可重试」（已退役）。
 func certJobRetryBlocked(status string, updatedAt sql.NullTime, now time.Time) (bool, int, string) {
-	if status == "disabled" {
+	cooldown, retryable := certJobRetryCooldown(status)
+	if !retryable {
 		// 历史问题（历史）：永久条件不得用 429（SDK/前端会按限流退避轮询）。
 		return true, http.StatusConflict, "已退役的证书任务不能重试"
 	}
-	if !updatedAt.Valid {
+	if !updatedAt.Valid || cooldown == 0 || now.Sub(updatedAt.Time) >= cooldown {
 		return false, 0, ""
 	}
-	if status == "failed" && now.Sub(updatedAt.Time) < 5*time.Minute {
+	if status == "failed" {
 		return true, http.StatusTooManyRequests, "失败后请等待 5 分钟再重试"
 	}
-	if status == "issued" || status == "failed" || status == "waiting_ca" {
-		return false, 0, ""
-	}
-	guard := 2 * time.Minute
 	message := "任务正在执行中，请稍后重试"
-	if status == "queued" {
-		guard = 15 * time.Minute
-	}
 	// CERT-N3（历史）：downloaded 态签发已完成（证书在库），停在部署
 	// 退避窗口——复用在途文案会误导用户以为签发流程卡住，单列部署口径。
 	// 历史问题（历史）：冷却到期后再点重试 = 立即重排部署（不重签）。
 	if status == "downloaded" {
 		message = "证书已下载完成，正在等待部署生效；稍后可重试以立即重新部署（不会重新签发）"
 	}
-	if now.Sub(updatedAt.Time) < guard {
-		return true, http.StatusTooManyRequests, message
-	}
-	return false, 0, ""
+	return true, http.StatusTooManyRequests, message
 }
 
 // reversedCertJobDomain 交换双域名任务的域名顺序：cert_jobs.domain 存排序
@@ -694,15 +718,16 @@ func (h *Handlers) GetCertJobLogs(c *gin.Context) {
 	// 历史问题（2026-09-05 证书域审计裁定）：按旧→新拼接全部轮转备份再加当前文件
 	//（.5 最旧 → .1 最新，对齐写侧 maxRotatedFiles=5），每文件保留 128KB/500 行
 	// 截断；缺失的备份序号按空跳过。
-	content := prependTaskLogRotations(logPath, readCertJobLogFile(logPath))
+	content := prependTaskLogRotations(logPath, readCertJobLogFile(logPath), certJobLogMaxRotatedBackups)
 
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": content}})
 }
 
-// prependTaskLogRotations 把 .1～.5 逐代前置到活动日志内容之前，最终顺序
-// 恒为 .5→.1→活动文件；任务监控与证书任务日志共用同一轮转口径。
-func prependTaskLogRotations(path, content string) string {
-	for i := 1; i <= certJobLogMaxRotatedBackups; i++ {
+// prependTaskLogRotations 按 maxBackups 把 .1～.N 逐代前置到活动日志
+// 内容之前，最终顺序恒为最旧→最新→活动文件。普通任务写侧 keep=1，
+// 证书任务 keep=5；调用方必须传本族真实保留数，禁止统一扫满证书代数。
+func prependTaskLogRotations(path, content string, maxBackups int) string {
+	for i := 1; i <= maxBackups; i++ {
 		if backup := readCertJobLogFile(fmt.Sprintf("%s.%d", path, i)); backup != "" {
 			content = backup + content
 		}

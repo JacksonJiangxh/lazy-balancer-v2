@@ -267,6 +267,8 @@
           <el-descriptions-item v-if="detailTask.last_run" label="触发 / 结果"><span class="tm-inline-flex">{{ triggerLabel(detailTask.last_run.trigger) }} · {{ detailTask.last_run.operator || '系统' }} · <el-tag size="small" :type="resultTagType(detailTask.last_run.result)">{{ statusResultLabel(detailTask.last_run.result) }}</el-tag></span></el-descriptions-item>
         </el-descriptions>
         <div v-if="detailTask.last_run?.message" class="tm-detail-msg">{{ detailTask.last_run.message }}</div>
+        <!-- A85WA-历史问题：历史加载失败显性化（原静默呈现为空表，与「无记录」不可区分） -->
+        <el-alert v-if="detailHistoryError" type="error" :closable="false" show-icon title="运行历史加载失败，请关闭后重新打开" style="margin-bottom: 12px" />
         <template v-if="history.length">
           <div class="tm-detail-section">{{ historyTitle }}</div>
           <el-table :data="history" size="small" max-height="240" class="tm-nowrap-table">
@@ -309,6 +311,7 @@
       </div>
       <template #footer>
         <div style="display: flex; align-items: center;">
+          <span v-if="logsLoadError" style="font-size: 12px; color: var(--el-color-danger); margin-right: 12px;">日志加载失败，自动重试中</span>
           <span style="font-size: 12px; color: #9aa0b5; margin-right: auto;">每 5 秒自动刷新</span>
           <el-button @click="logsVisible = false">关闭</el-button>
         </div>
@@ -318,15 +321,17 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import '@/utils/echarts' // 统一注册（含 LineChart——直刷本页不再依赖先到 Dashboard）
 import type { EChartsOption } from 'echarts'
 import VChart from 'vue-echarts'
+import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, PieChart as PieChartIcon, DataLine, List, Monitor, Lock, Box, Timer } from '@element-plus/icons-vue'
 import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
+import { useLogTailPolling } from '@/composables/useLogTailPolling'
 import { formatDate } from '@/utils/date'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
 import { useClampedPagination } from '@/composables/useClampedPagination'
@@ -407,7 +412,7 @@ const polling = usePollingTask(async ({ signal }) => {
   // 历史问题-4：证书队列横幅与任务列表同频 10s（曾只在 mounted/手动刷新拉取，横幅最长陈旧一个会话）
   if (!pollingError.canRun()) return
   // 历史问题-F5：消费每轮 abort signal——pause/stop（含组件卸载）可取消在途请求。
-  await Promise.all([fetchTasks(signal), fetchSeries(signal), fetchCertQueue()])
+  await Promise.all([fetchTasks(signal), fetchSeries(signal), fetchCertQueue(signal)])
   pollingError.clear()
 }, {
   interval: 10000,
@@ -431,9 +436,11 @@ const certQueueError = ref(false)
 // 服务端聚合计数（/certificates/jobs 未提供时按可见行推导，且只在 total 超页时
 // 声明「≥」——历史 历史问题：原 page_size=50 忽略 total，>50 任务时计数偏小）
 const CERT_QUEUE_PAGE_SIZE = 200
-const fetchCertQueue = async () => {
+// A85WA-历史问题：接入轮询 AbortSignal——pause/stop（含组件卸载）可取消在途请求，
+// 与 fetchTasks/fetchSeries 同口径（补齐 :409 注释承诺）。
+const fetchCertQueue = async (signal?: AbortSignal) => {
   try {
-    const res = await request.get<APIResponse<{ list: CertJobRow[]; total: number; status_counts?: Record<string, number> }>>('/certificates/jobs', { params: { page: 1, page_size: CERT_QUEUE_PAGE_SIZE }, silent: true })
+    const res = await request.get<APIResponse<{ list: CertJobRow[]; total: number; status_counts?: Record<string, number> }>>('/certificates/jobs', { params: { page: 1, page_size: CERT_QUEUE_PAGE_SIZE }, silent: true, signal })
     const list = res.data?.list || []
     const counts = res.data?.status_counts
     const statusCount = (statuses: string[]): number => statuses.reduce((sum, s) => sum + (counts?.[s] || 0), 0)
@@ -462,9 +469,10 @@ const fetchCertQueue = async () => {
       waiting,
       jobs: liveJobs.slice(0, 6),
     }
-  } catch {
-    // 静默自动重试（下一轮轮询），但错误态必须显性——0 值会被误读为「无排队」
-    certQueueError.value = true
+  } catch (error: unknown) {
+    // 静默自动重试（下一轮轮询），但错误态必须显性——0 值会被误读为「无排队」；
+    // pause/stop 触发的取消不是失败（A85WA-历史问题）
+    if (!axios.isCancel(error)) certQueueError.value = true
   }
 }
 
@@ -658,11 +666,15 @@ const fetchCertJobHistory = async (jobId: number): Promise<RunRecord[]> => {
   }]
 }
 let detailSeq = 0
+// A85WA-历史问题：详情历史加载失败显性化（原静默 catch 呈现为空「运行历史」，与
+// 无记录不可区分）
+const detailHistoryError = ref(false)
 const openDetail = async (row: TaskInfo) => {
   const seq = ++detailSeq
   detailTask.value = row
   detailVisible.value = true
   history.value = []
+  detailHistoryError.value = false
   try {
     let runs: RunRecord[] = []
     if (isCertJobRow(row.id)) {
@@ -672,7 +684,9 @@ const openDetail = async (row: TaskInfo) => {
       runs = res.data?.runs || []
     }
     if (seq === detailSeq) history.value = runs
-  } catch { /* 无历史族静默 */ }
+  } catch {
+    if (seq === detailSeq) detailHistoryError.value = true
+  }
 }
 
 // ===== 日志抽屉（content 纯文本解析） =====
@@ -681,42 +695,38 @@ const logsText = ref('')
 const logsTask = ref<TaskInfo | null>(null)
 const logsTaskStorageKey = computed(() => logsTask.value ? `task:${logsTask.value.id}` : 'tasks')
 const logContainerRef = ref<HTMLElement | null>(null)
-let logsTimer: ReturnType<typeof setInterval> | null = null
-// 会话序号：刷新回调捕获打开时的会话，关闭/切换任务后迟到的响应不得写回。
-let logsSession = 0
+// A85WA-历史问题：日志加载失败显性化（原静默）；A85WA-历史问题：轮询收敛
+// useLogTailPolling 单源——补上本页原缺的后台标签页暂停。
+const logsLoadError = ref(false)
 const taskLogEndpoint = (id: string): string =>
   id.startsWith('cert-job:') ? `/certificates/jobs/${id.slice(9)}/logs` : `/system/tasks/${id}/logs`
-const startLogPolling = (): void => {
-  if (logsTimer) { clearInterval(logsTimer); logsTimer = null }
-  logsTimer = setInterval(() => { void refreshLogs() }, 5000)
-}
+const logsTail = useLogTailPolling({
+  interval: 5000,
+  content: logsText,
+  container: logContainerRef,
+  isActive: () => logsVisible.value && logsTask.value !== null,
+  fetch: async () => {
+    const task = logsTask.value
+    if (!task) return null
+    const res = await request.get<APIResponse<{ content: string }>>(taskLogEndpoint(task.id), { silent: true })
+    logsLoadError.value = false
+    if (logsTask.value?.id !== task.id) return null
+    return (res.data?.content || '').trim()
+  },
+  onError: () => { logsLoadError.value = true },
+})
 const openLogs = (row: TaskInfo): void => {
-  // 历史问题-F2：先清空上一任务内容并同步装定时器——不再清空残留，也不会出现
-  // 「首拉未完成就关闭 → await 后续体又装 interval」的关闭后永久轮询。
-  logsSession++
+  // 历史问题-F2：先清空上一任务内容并同步装定时器（start 内部即此序）——不再清空
+  // 残留，也不会出现「首拉未完成就关闭 → await 后续体又装 interval」的关闭后
+  // 永久轮询。
   logsTask.value = row
   logsVisible.value = true
   logsText.value = ''
-  startLogPolling()
-  void refreshLogs()
-}
-const refreshLogs = async (): Promise<void> => {
-  const task = logsTask.value
-  if (!task) return
-  const session = logsSession
-  try {
-    const res = await request.get<APIResponse<{ content: string }>>(taskLogEndpoint(task.id), { silent: true })
-    if (session !== logsSession) return
-    logsText.value = (res.data?.content || '').trim()
-    await nextTick(() => {
-      if (session !== logsSession) return
-      if (logContainerRef.value) logContainerRef.value.scrollTop = logContainerRef.value.scrollHeight
-    })
-  } catch { /* 静默 */ }
+  logsLoadError.value = false
+  logsTail.start()
 }
 const closeLogs = (): void => {
-  logsSession++
-  if (logsTimer) { clearInterval(logsTimer); logsTimer = null }
+  logsTail.stop()
   logsTask.value = null
   logsText.value = ''
 }

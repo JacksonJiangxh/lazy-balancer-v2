@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 
 	"github.com/gin-gonic/gin"
 )
@@ -17,9 +18,7 @@ import (
 // 同域名直接监听 80 的规则会被遮蔽为死规则——保存/启用两条路径都必须拒绝。
 func TestRuleDomainConflict_redirectShadow(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
@@ -117,9 +116,7 @@ func TestRuleDomainConflict_redirectShadow(t *testing.T) {
 // 不应被遮蔽检查 400 阻塞；相关字段（域名）变化时遮蔽检查仍须生效。
 func TestUpdateRule_name_only_change_passes_with_legacy_shadow_combo(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", handler.UpdateRule)
@@ -178,9 +175,7 @@ func TestUpdateRule_name_only_change_passes_with_legacy_shadow_combo(t *testing.
 // 统计 enabled=1 的规则）；域名/启用态真正变化时检查仍须生效。
 func TestUpdateRule_domain_conflict_check_gated_on_change(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", handler.UpdateRule)
@@ -238,9 +233,7 @@ func TestUpdateRule_domain_conflict_check_gated_on_change(t *testing.T) {
 // 触发（与 EnableRule 端点口径一致），否则跳转路由会把 80 规则遮蔽成死规则。
 func TestUpdateRule_enable_trigger_redirect_shadow_check(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", handler.UpdateRule)
@@ -284,9 +277,7 @@ func TestUpdateRule_enable_trigger_redirect_shadow_check(t *testing.T) {
 // 启用方向仍须触发检查。
 func TestUpdateRule_disable_direction_skips_conflict_checks(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", handler.UpdateRule)
@@ -385,9 +376,7 @@ func TestUpdateRule_disable_direction_skips_conflict_checks(t *testing.T) {
 // 启用方向仍二次把关（上方"启用方向仍触发遮蔽检查"用例覆盖）。
 func TestUpdateRule_disabled_rule_skips_shadow_gate(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", handler.UpdateRule)

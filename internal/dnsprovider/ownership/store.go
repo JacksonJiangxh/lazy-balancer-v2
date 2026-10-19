@@ -1,6 +1,7 @@
 package ownership
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +36,14 @@ const staleOwnershipAge = 75 * time.Minute
 
 var fileMu sync.Mutex
 
+// AcquireFileLockForTest exposes the package lock's contention boundary to
+// cross-package tests proving callers use the same writer. Production code must
+// never call it; the returned release must be called exactly once.
+func AcquireFileLockForTest() func() {
+	fileMu.Lock()
+	return fileMu.Unlock
+}
+
 // Record is one owned DNS TXT record. Value and CreatedAt were added later;
 // files written by older binaries decode with zero values and are handled as
 // legacy entries (see MatchingValue).
@@ -64,6 +73,29 @@ func New(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("create DNS ownership directory: %w", err)
 	}
 	return &Store{path: filepath.Join(dataDir, ownershipFileName)}, nil
+}
+
+// Replace atomically replaces the ownership file with a validated cluster
+// snapshot. It deliberately shares fileMu and the same atomic writer as Store
+// mutations so a snapshot apply cannot overwrite a concurrent Add/Remove.
+func Replace(dataDir string, data []byte) error {
+	var snapshot state
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return fmt.Errorf("decode DNS ownership snapshot: %w", err)
+	}
+	if snapshot.Version != 1 || snapshot.Records == nil {
+		return errors.New("invalid DNS ownership snapshot")
+	}
+	store, err := New(dataDir)
+	if err != nil {
+		return err
+	}
+	fileMu.Lock()
+	defer fileMu.Unlock()
+	if existing, readErr := os.ReadFile(store.path); readErr == nil && bytes.Equal(existing, data) {
+		return nil
+	}
+	return store.writeAtomic(data)
 }
 
 func (s *Store) Add(record Record) error {
@@ -188,6 +220,12 @@ func (s *Store) save(current state) error {
 	if err != nil {
 		return fmt.Errorf("encode DNS ownership: %w", err)
 	}
+	return s.writeAtomic(data)
+}
+
+// writeAtomic writes one complete snapshot. The caller must hold fileMu; the
+// fixed temporary path is safe precisely because Store and Replace share it.
+func (s *Store) writeAtomic(data []byte) error {
 	tmp := s.path + ".tmp"
 	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {

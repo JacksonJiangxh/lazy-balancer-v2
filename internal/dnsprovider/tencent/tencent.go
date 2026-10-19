@@ -190,7 +190,11 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 		for _, record := range records {
 			recordID, parseErr := strconv.ParseUint(record.RecordID, 10, 64)
 			if parseErr != nil {
-				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("parse persisted Tencent record ID %q: %w", record.RecordID, parseErr))
+				parseFailure := fmt.Errorf("parse persisted Tencent record ID %q: %w", record.RecordID, parseErr)
+				// 无法解析的 ID 永远无法调用删除 API；保留条目只会让每次清理
+				// 永久重复报错。告警并移除该不可恢复条目，本轮仍返回解析错误。
+				logf("warn", "tencent: 所有权 RecordID %q 无法解析，按不可恢复条目处理: %v", record.RecordID, parseErr)
+				cleanupErr = errors.Join(cleanupErr, parseFailure, p.ownership.Remove(record))
 				continue
 			}
 			// Per-record independence: a record whose deletion failed keeps

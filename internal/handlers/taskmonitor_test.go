@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -47,6 +48,38 @@ func taskMonitorRouter() (*gin.Engine, *Handlers) {
 	r.POST("/system/tasks/:id/toggle", h.ToggleSystemTask)
 	r.POST("/system/tasks/:id/cancel", h.CancelSystemTask)
 	return r, h
+}
+
+// A85历史问题-3：历史端点与 trigger/toggle 同口径做注册存在性门；
+// 已注册但零历史的任务仍返回 200 + 空数组。
+func TestGetSystemTaskHistory_checksTaskExistence(t *testing.T) {
+	newBackupTestHandlers(t)
+	initTaskEngineForTest(t)
+	te := services.TaskEngine()
+	if err := te.Register(taskengine.Descriptor{
+		ID: "history-empty", Family: "test", Name: "空历史任务", Kind: taskengine.KindOneshot, RunsOn: taskengine.RoleAny,
+		Run: func(taskengine.RunContext) error { return nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	h := &Handlers{}
+	router.GET("/system/tasks/:id/history", h.GetSystemTaskHistory)
+
+	t.Run("unknown", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/system/tasks/not-a-task/history", nil))
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("不存在任务 status=%d body=%s, want 404", recorder.Code, recorder.Body.String())
+		}
+	})
+	t.Run("registered empty", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/system/tasks/history-empty/history", nil))
+		if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"runs":[]`) {
+			t.Fatalf("已注册空历史 status=%d body=%s, want 200 runs=[]", recorder.Code, recorder.Body.String())
+		}
+	})
 }
 
 // Given 空库（迁移种子三威胁源）。
@@ -326,6 +359,39 @@ func TestTaskWriteHandlers_unifiedStatusCodes(t *testing.T) {
 	}
 }
 
+func TestSystemTaskLogPath_certJobAndFallbackShapes(t *testing.T) {
+	// Given 普通任务、有效/空 rule_id 的 cert-job，以及缺失与畸形 job id。
+	newBackupTestHandlers(t)
+	var validJobID, emptyRuleJobID int
+	if err := db.DB.QueryRow(`INSERT INTO cert_jobs (rule_id,domain,status) VALUES ('lb_path','path.example','queued') RETURNING id`).Scan(&validJobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB.QueryRow(`INSERT INTO cert_jobs (rule_id,domain,status) VALUES ('','empty.example','queued') RETURNING id`).Scan(&emptyRuleJobID); err != nil {
+		t.Fatal(err)
+	}
+
+	// When/Then 单条入口保持既有路径语义，批量解析重构不得改变这些形状。
+	if got, err := systemTaskLogPath("crs"); err != nil || got != taskengine.TaskLogPath("crs") {
+		t.Fatalf("ordinary task path=%q err=%v, want %q", got, err, taskengine.TaskLogPath("crs"))
+	}
+	if got, err := systemTaskLogPath(fmt.Sprintf("cert-job:%d", validJobID)); err != nil || got != services.CertJobLogPath("lb_path") {
+		t.Fatalf("cert job path=%q err=%v, want %q", got, err, services.CertJobLogPath("lb_path"))
+	}
+	for _, id := range []string{fmt.Sprintf("cert-job:%d", emptyRuleJobID), "cert-job:999999", "cert-job:not-a-number"} {
+		if got, err := systemTaskLogPath(id); err != nil || got != "" {
+			t.Fatalf("%s path=%q err=%v, want empty path", id, got, err)
+		}
+	}
+
+	oldDB := db.DB
+	db.DB = nil
+	db.SetDB(nil)
+	t.Cleanup(func() { db.DB = oldDB; db.SetDB(oldDB) })
+	if got, err := systemTaskLogPath(fmt.Sprintf("cert-job:%d", validJobID)); err != nil || got != "" {
+		t.Fatalf("nil DB path=%q err=%v, want empty path", got, err)
+	}
+}
+
 // 历史问题/B3-历史问题：任务日志只读尾窗；偏移起点的残段（含整窗无换行的
 // 巨型行）统一经 tailLogWindow 丢弃，小文件保持原样。
 func TestGetSystemTaskLogs_boundedTailDropsPartialFirstLine(t *testing.T) {
@@ -368,9 +434,107 @@ func TestGetSystemTaskLogs_boundedTailDropsPartialFirstLine(t *testing.T) {
 	}
 }
 
-// 历史问题-历史问题：任务监控与证书/更新日志端点同为轮转感知——活动文件外加
-// .1～.5，按最旧到最新拼接，轮转后不得出现历史缺口。
-func TestGetSystemTaskLogs_includesFiveRotations(t *testing.T) {
+func TestGetSystemTaskLogs_rotationBudgetUsesConcatenatedTail(t *testing.T) {
+	const tail = 256 << 10
+	fetchContent := func(t *testing.T, h *Handlers, taskID string) string {
+		t.Helper()
+		router := gin.New()
+		router.GET("/system/tasks/:id/logs", h.GetSystemTaskLogs)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/system/tasks/"+taskID+"/logs", nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+		var payload struct {
+			Data map[string]string `json:"data"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload.Data["content"]
+	}
+
+	t.Run("plain task rotation is included in 256KiB budget", func(t *testing.T) {
+		dir := t.TempDir()
+		oldLogDir := taskengine.LogDir()
+		taskengine.SetLogDir(dir)
+		t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
+		path := taskengine.TaskLogPath("budget")
+		rotation := strings.Repeat("old-line-0123456789\n", 200)
+		active := strings.Repeat("active-line-123456789\n", 12000) + "ACTIVE-END\n"
+		if err := os.WriteFile(path+".1", []byte(rotation), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(active), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		content := fetchContent(t, &Handlers{}, "budget")
+		if len(content) > tail {
+			t.Fatalf("content=%d bytes, want ≤%d", len(content), tail)
+		}
+		if !strings.Contains(content, "ACTIVE-END") || strings.Contains(content, "old-line-") {
+			t.Fatalf("want latest active tail only; len=%d", len(content))
+		}
+	})
+
+	t.Run("cert-job five rotations share the same budget", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		dir := t.TempDir()
+		oldLogDir := taskengine.LogDir()
+		taskengine.SetLogDir(dir)
+		t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
+		var jobID int
+		if err := db.DB.QueryRow(`INSERT INTO cert_jobs (rule_id,domain,status) VALUES ('lb_budget','budget.example','queued') RETURNING id`).Scan(&jobID); err != nil {
+			t.Fatal(err)
+		}
+		path := services.CertJobLogPath("lb_budget")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		rotation := func(n int) string {
+			return fmt.Sprintf("FILE%d-FIRST\n", n) + strings.Repeat(fmt.Sprintf("file%d-line-%s\n", n, strings.Repeat("x", 4800)), 20)
+		}
+		for i := 1; i <= 5; i++ {
+			if err := os.WriteFile(fmt.Sprintf("%s.%d", path, i), []byte(rotation(i)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		active := "ACTIVE-FIRST\n" + strings.Repeat("active-line-"+strings.Repeat("y", 4800)+"\n", 20) + "ACTIVE-END\n"
+		if err := os.WriteFile(path, []byte(active), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		content := fetchContent(t, h, fmt.Sprintf("cert-job:%d", jobID))
+		if len(content) > tail {
+			t.Fatalf("cert-job content=%d bytes, want ≤%d", len(content), tail)
+		}
+		if !strings.Contains(content, "ACTIVE-END") || strings.Contains(content, "FILE5-FIRST") || strings.Contains(content, "FILE4-FIRST") {
+			t.Fatalf("want newest tail across five rotations; len=%d", len(content))
+		}
+	})
+
+	t.Run("short rotations preserved verbatim", func(t *testing.T) {
+		dir := t.TempDir()
+		oldLogDir := taskengine.LogDir()
+		taskengine.SetLogDir(dir)
+		t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
+		path := taskengine.TaskLogPath("short")
+		rotation := strings.Repeat("short-old-line\n", 200)
+		active := "short-active-first\nshort-active-last\n"
+		if err := os.WriteFile(path+".1", []byte(rotation), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(active), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := fetchContent(t, &Handlers{}, "short"), rotation+active; got != want {
+			t.Fatalf("short content length=%d, want %d", len(got), len(want))
+		}
+	})
+}
+
+// A85历史问题-1：普通任务写侧只保留 1 份轮转副本，读侧不得按证书任务
+// 扫描 .1～.5；仅最近 .1 前置到活动日志，避免读取不存在/越权保留代。
+func TestGetSystemTaskLogs_includesOnlyLatestOrdinaryRotation(t *testing.T) {
 	dir := t.TempDir()
 	oldLogDir := taskengine.LogDir()
 	taskengine.SetLogDir(dir)
@@ -398,9 +562,56 @@ func TestGetSystemTaskLogs_includesFiveRotations(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	want := "archive-5\narchive-4\narchive-3\narchive-2\narchive-1\ncurrent\n"
+	want := "archive-1\ncurrent\n"
 	if got := payload.Data["content"]; got != want {
 		t.Fatalf("content=%q, want %q", got, want)
+	}
+}
+
+// 同一响应的活动文件+轮转副本合计仍受 256KB 文档容量约束。
+func TestGetSystemTaskLogs_rotationContentStaysWithinTailBudget(t *testing.T) {
+	dir := t.TempDir()
+	oldLogDir := taskengine.LogDir()
+	taskengine.SetLogDir(dir)
+	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
+	path := taskengine.TaskLogPath("budgeted")
+	line := strings.Repeat("a", 1023) + "\n"
+	lastLine := strings.Repeat("b", 1024-len("active-tail\n")) + "active-tail\n"
+	active := strings.Repeat(line, 255) + lastLine // 恰好 256KB，且均为完整行
+	if len(active) != 256<<10 {
+		t.Fatalf("fixture size=%d", len(active))
+	}
+	if err := os.WriteFile(path, []byte(active), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for i, content := range []string{"", "archive-one\n", "archive-two\n"} {
+		if i == 0 {
+			continue
+		}
+		if err := os.WriteFile(fmt.Sprintf("%s.%d", path, i), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/system/tasks/:id/logs", h.GetSystemTaskLogs)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/system/tasks/budgeted/logs", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	content := payload.Data["content"]
+	if len(content) > 256<<10 {
+		t.Fatalf("活动+轮转内容=%d bytes, want <= %d", len(content), 256<<10)
+	}
+	if !strings.Contains(content, "active-tail\n") {
+		t.Fatal("容量截断不得丢失活动文件最新完整行")
 	}
 }
 
@@ -451,10 +662,18 @@ func TestTriggerSystemTask_triggerAuditMatchesManualRuns(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	// 等待异步审计落库稳定（Trigger 返回后才写审计）。
-	time.Sleep(200 * time.Millisecond)
-	got := countTriggerAudit(t) - before
-	if got != manualRuns {
-		t.Fatalf("「触发」审计=%d 与实际 manual task_runs=%d 不一致（孤儿/缺失审计）", got, manualRuns)
+	// Trigger 返回后异步写审计：按实际条件轮询至与 manual task_runs 收敛，
+	// 不再固定等待 200ms。
+	got := 0
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		got = countTriggerAudit(t) - before
+		if got == manualRuns {
+			break
+		}
+		if got > manualRuns || time.Now().After(deadline) {
+			t.Fatalf("「触发」审计=%d 与实际 manual task_runs=%d 不一致（孤儿/缺失审计）", got, manualRuns)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

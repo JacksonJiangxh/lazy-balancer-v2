@@ -89,18 +89,22 @@ func quarantineCorruptSQLiteFile(path string) (string, error) {
 	if n == 0 || (n == len(sqliteHeaderMagic) && bytes.Equal(header, sqliteHeaderMagic)) {
 		return "", nil
 	}
+	// 先隔离 -wal/-shm，主文件最后改名：伴生失败时主库仍在原位且调用方
+	// 中止重建，不会在残留旧 WAL 的同名路径新建空库。故障解除后可原样重试。
+	if err := quarantineCompanions(path); err != nil {
+		return "", err
+	}
 	quarantined := nextQuarantinePath(path)
 	if err := os.Rename(path, quarantined); err != nil {
 		return "", fmt.Errorf("quarantine corrupted database file: %w", err)
 	}
-	if err := quarantineCompanions(path); err != nil {
-		return "", err
-	}
 	return quarantined, nil
 }
 
+const MetricsDBFilename = "lazy-balancer-metrics.db"
+
 func InitializeMetricsDB(dataDir string) (err error) {
-	dbPath := filepath.Join(dataDir, "lazy-balancer-metrics.db")
+	dbPath := filepath.Join(dataDir, MetricsDBFilename)
 	if err := secureDataDirectory(dataDir); err != nil {
 		return fmt.Errorf("failed to secure metrics data directory: %w", err)
 	}
@@ -186,12 +190,14 @@ func quarantineMetricsFileUnconditionally(path string) (string, error) {
 	if info.Size() == 0 {
 		return "", nil
 	}
+	// 先隔离 -wal/-shm，主文件最后改名：伴生失败时主库仍在原位且调用方
+	// 中止重建，不会在残留旧 WAL 的同名路径新建空库。故障解除后可原样重试。
+	if err := quarantineCompanions(path); err != nil {
+		return "", err
+	}
 	quarantined := nextQuarantinePath(path)
 	if err := os.Rename(path, quarantined); err != nil {
 		return "", fmt.Errorf("quarantine corrupted database file: %w", err)
-	}
-	if err := quarantineCompanions(path); err != nil {
-		return "", err
 	}
 	return quarantined, nil
 }
@@ -398,11 +404,48 @@ func initMetricsSchema(db *sql.DB) error {
 	}
 	// transaction_id 的幂等唯一部分索引（WHERE != ''）让重复事务写入被
 	// OR IGNORE 静默去重，同时保留历史遗留空 transaction_id 行不受唯一约束影响。
-	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_security_events_transaction ON security_events(transaction_id) WHERE transaction_id != ''`); err != nil {
-		return fmt.Errorf("failed to create security_events transaction index: %w", err)
+	// 存量重复行与 OIDC 唯一索引同口径：WARN + 跳过，不得让历史脏数据阻断启动。
+	if err := ensureSecurityEventsTransactionIndex(db); err != nil {
+		return err
 	}
 	if err := migrateMetricsHistoryBlocked(db); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ensureSecurityEventsTransactionIndex 在建立唯一部分索引前检查存量重复事务。
+// 重复行不自动删除（保留事件历史）；告警并跳过本轮索引创建，人工清理后的
+// 下次启动会自动补建。空串与 NULL 不属于索引约束域。
+func ensureSecurityEventsTransactionIndex(db *sql.DB) error {
+	rows, err := db.Query(`SELECT transaction_id, COUNT(*) FROM security_events
+		WHERE transaction_id != '' GROUP BY transaction_id HAVING COUNT(*)>1`)
+	if err != nil {
+		return fmt.Errorf("failed to inspect duplicate security_events transaction IDs: %w", err)
+	}
+	var duplicates []string
+	for rows.Next() {
+		var transactionID string
+		var count int
+		if err := rows.Scan(&transactionID, &count); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to scan duplicate security_events transaction IDs: %w", err)
+		}
+		duplicates = append(duplicates, fmt.Sprintf("%s×%d", transactionID, count))
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("failed to iterate duplicate security_events transaction IDs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("failed to close duplicate security_events transaction ID rows: %w", err)
+	}
+	if len(duplicates) > 0 {
+		log.Printf("WARN: security_events 表存在重复 transaction_id（%s），跳过 idx_security_events_transaction 唯一索引创建——请人工清理重复行后重启", strings.Join(duplicates, ", "))
+		return nil
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_security_events_transaction ON security_events(transaction_id) WHERE transaction_id != ''`); err != nil {
+		return fmt.Errorf("failed to create security_events transaction index: %w", err)
 	}
 	return nil
 }

@@ -1158,3 +1158,135 @@ func TestDeploymentFailed_warnsWhenStatusWritebackFails(t *testing.T) {
 		t.Fatalf("status writeback failure not surfaced as WARN:\n%s", data)
 	}
 }
+
+func TestRetryCertificateDeploymentNow_tracksServiceLifecycle(t *testing.T) {
+	// Given：运行中的证书服务接受立即部署重排。
+	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
+	service.retryDeployment = func(context.Context, int) error { return nil }
+	if err := RetryCertificateDeploymentNow(41, "lb_retry_lifecycle"); err != nil {
+		t.Fatalf("running certificate service rejected deployment retry: %v", err)
+	}
+
+	// When：服务停止后再触发同一入口。
+	service.Stop()
+
+	// Then：必须明确拒绝，不得把 stopping 分支的静默丢弃报告为已调度。
+	if err := RetryCertificateDeploymentNow(42, "lb_retry_lifecycle"); !errors.Is(err, ErrCertificateQueueInactive) {
+		t.Fatalf("stopped service retry error=%v, want ErrCertificateQueueInactive", err)
+	}
+}
+
+func TestRetryCertificateDeploymentNow_reportsBusyCallback(t *testing.T) {
+	// Given：服务运行中，但同任务的上一次部署回调尚未在取消等待内退出。
+	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
+	service.cancelWaitTimeout = 20 * time.Millisecond
+	entry := &deploymentTimer{done: make(chan struct{}), ruleID: "lb_retry_busy"}
+	entry.ctx, entry.cancel = context.WithCancel(service.ctx)
+	service.deploymentCallbacks[42] = map[*deploymentTimer]struct{}{entry: {}}
+	t.Cleanup(func() { close(entry.done) })
+
+	// When
+	err := RetryCertificateDeploymentNow(42, "lb_retry_busy")
+
+	// Then：必须与「服务已停止」区分，避免把回调忙误报为任务停止。
+	if !errors.Is(err, ErrCertificateDeploymentRetryBusy) {
+		t.Fatalf("retry error=%v, want ErrCertificateDeploymentRetryBusy", err)
+	}
+}
+
+func TestCAQueue_execute_roleInterruptionRequeuesWithoutRenewalAttempts(t *testing.T) {
+	// Given：签发执行体经生产错误包装返回角色中断，任务已有 2 次续签尝试。
+	jobID, ruleID := seedCertificateJob(t, "downloading")
+	if _, err := db.DB.Exec("UPDATE cert_jobs SET renewal_attempts=2 WHERE id=?", jobID); err != nil {
+		t.Fatalf("seed attempts: %v", err)
+	}
+	if _, err := db.DB.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
+		t.Fatalf("demote node: %v", err)
+	}
+	queue := newCAQueue(models.CAProvider{ID: 1, MaxConcurrent: 1}, nil)
+	queue.executeFn = func(ctx context.Context, _ queueItem, _ models.CAProvider) error {
+		return fmt.Errorf("execute issuance: %w", checkCertificateIssuanceRole(ctx))
+	}
+	queue.enqueue(queueItem{jobID: jobID, ruleID: ruleID, domains: "example.com"})
+	queue.mu.Lock()
+	execution, ok := queue.prepareExecutionLocked(context.Background())
+	queue.mu.Unlock()
+	if !ok {
+		t.Fatal("role interruption execution was not prepared")
+	}
+
+	// When
+	queue.execute(execution)
+
+	// Then：经真实 execute→handleQueueExecutionError 链路仍不消耗预算。
+	var status string
+	var attempts int
+	if err := db.DB.QueryRow("SELECT status,renewal_attempts FROM cert_jobs WHERE id=?", jobID).Scan(&status, &attempts); err != nil {
+		t.Fatalf("read executed job: %v", err)
+	}
+	if status != "queued" || attempts != 2 {
+		t.Fatalf("job status=%q attempts=%d, want queued/2", status, attempts)
+	}
+}
+
+func TestHandleQueueExecutionError_roleInterruptionDoesNotConsumeRenewalAttempts(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		status        string
+		prepare       func(*testing.T)
+		wantRoleError bool
+		wantStatus    string
+	}{
+		{name: "master remains unchanged", status: "downloading", prepare: func(*testing.T) {}, wantStatus: "downloading"},
+		{name: "slave transition requeues", status: "downloading", prepare: func(t *testing.T) {
+			if _, err := db.DB.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
+				t.Fatalf("demote node: %v", err)
+			}
+		}, wantRoleError: true, wantStatus: "queued"},
+		{name: "role read failure requeues", status: "downloading", prepare: func(t *testing.T) {
+			if _, err := db.DB.Exec("DELETE FROM global_config WHERE id=1"); err != nil {
+				t.Fatalf("remove role row: %v", err)
+			}
+		}, wantRoleError: true, wantStatus: "queued"},
+		{name: "disabled job remains disabled", status: "disabled", prepare: func(t *testing.T) {
+			if _, err := db.DB.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
+				t.Fatalf("demote node: %v", err)
+			}
+		}, wantRoleError: true, wantStatus: "disabled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given：角色检查发生在 CA 已签发之后，既有预算为 2。
+			jobID, _ := seedCertificateJob(t, tc.status)
+			if _, err := db.DB.Exec("UPDATE cert_jobs SET renewal_attempts=2 WHERE id=?", jobID); err != nil {
+				t.Fatalf("seed renewal attempts: %v", err)
+			}
+			tc.prepare(t)
+			roleErr := checkCertificateIssuanceRole(context.Background())
+			if !tc.wantRoleError {
+				if roleErr != nil {
+					t.Fatalf("master role check failed: %v", roleErr)
+				}
+				return
+			}
+			var typedRoleErr *certificateRoleError
+			if !errors.As(roleErr, &typedRoleErr) {
+				t.Fatalf("role error=%v, want certificateRoleError", roleErr)
+			}
+
+			// When：队列按执行错误分类（含包装层）。
+			handleQueueExecutionError(jobID, fmt.Errorf("execute: %w", roleErr))
+
+			// Then：生命周期中断不得进入 CA failed 终态或消耗预算。
+			var status string
+			var attempts int
+			if err := db.DB.QueryRow("SELECT status,renewal_attempts FROM cert_jobs WHERE id=?", jobID).Scan(&status, &attempts); err != nil {
+				t.Fatalf("read job after role interruption: %v", err)
+			}
+			if status != tc.wantStatus || attempts != 2 {
+				t.Fatalf("job status=%q attempts=%d, want %q/2", status, attempts, tc.wantStatus)
+			}
+		})
+	}
+}

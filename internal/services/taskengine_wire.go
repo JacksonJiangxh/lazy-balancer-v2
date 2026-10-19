@@ -75,15 +75,21 @@ func SetTaskEngineForTest(te *taskengine.Engine) { taskEngine = te }
 // 引擎角色此前只在 InitTaskEngine 播种一次：播种连续失败即 SetRole(false)，
 // 若 DB 实为主节点则形成「DB=主/引擎=从」的进程内半主半从——master-only
 // 任务全部静默停摆，且再次 Promote 返回 ErrAlreadyMaster 无法自愈。本函数
-// 由低频率巡检（config-watchdog，60s）调用，使角色成为可收敛的 DB 投影。
+// 由独立 startRoleReconciler 每 60s 调用（A85历史问题-7；不是 config-watchdog
+// 任务体），使角色成为可收敛的 DB 投影，且不受用户停止看门狗影响。
 //
 // 并发安全：与 ClusterService.Promote/BecomeSlave 的 roleMu 串行——两处
 // 翻转都在持 roleMu 时完成「DB 更新 + SetRole」。不串行则对账可能读到翻转
 // 前的旧角色，并在降级落定后把引擎重新升主（从节点启动 master-only daemon
 // 写库）。锁序 roleMu → 引擎内部锁，与翻转路径同序，无反向获取。
 func reconcileTaskEngineRole() {
+	reconcileTaskEngineRoleFor(TaskEngine())
+}
+
+// reconcileTaskEngineRoleFor 限定到调用方持有的引擎代际，防止旧 reconciler
+// 在快速重建后误操作新一代实例。
+func reconcileTaskEngineRoleFor(te *taskengine.Engine) {
 	database := db.DB
-	te := taskEngine
 	if database == nil || te == nil {
 		return
 	}
@@ -131,7 +137,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		logsDir = filepath.Dir(runtimeLogFile)
 	}
 	tasksLogDir := filepath.Join(logsDir, "tasks")
-	_ = os.MkdirAll(tasksLogDir, 0755)
+	if err := os.MkdirAll(tasksLogDir, 0755); err != nil {
+		Logf("error", "任务日志目录创建失败（%s）: %v", tasksLogDir, err)
+	}
 	taskengine.SetLogDir(tasksLogDir)
 	taskengine.SetTaskLogSizeBytesFn(getTaskLogSizeBytes)
 	// 历史问题（历史）：以暂停 tick 形态建引擎——BootSync（startup:config-load）
@@ -641,25 +649,31 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// 历史问题（历史）：BootSync 完成后解除 tick 暂停——此前 ticker 在
 	// NewEngine 即起跑，周期/定时任务可在配置载入前执行首轮。
 	taskEngine.ResumeScheduling()
-	startRoleReconciler()
+	startRoleReconciler(taskEngine)
 	return taskEngine
 }
 
 // startRoleReconciler 把引擎角色对账从用户可停止的 config-watchdog 中解耦
 // （历史 历史问题-2）：看门狗被停后，播种失败/角色漂移仍能每 60s 自愈。
-// 每次 InitTaskEngine 启动一个；引擎停止后循环退出。
-func startRoleReconciler() {
+// 每次 InitTaskEngine 启动一个并绑定该代引擎；全局换代或本代停止后退出。
+var roleReconcilerInterval = 60 * time.Second
+
+func startRoleReconciler(te *taskengine.Engine) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(60 * time.Second)
+		defer close(done)
+		ticker := time.NewTicker(roleReconcilerInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			te := TaskEngine()
-			if te == nil || te.IsStopped() {
+			// S-A-历史问题：不能每 tick 重读全局后继续运行——StopTaskEngine
+			// 置 nil 后快速 Init 会让旧 goroutine 误认新引擎而永久泄漏。
+			if TaskEngine() != te || te.IsStopped() {
 				return
 			}
-			reconcileTaskEngineRole()
+			reconcileTaskEngineRoleFor(te)
 		}
 	}()
+	return done
 }
 
 // businessTaskDriver 业务开关与引擎调度同步的唯一任务清单。

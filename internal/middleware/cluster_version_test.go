@@ -95,6 +95,15 @@ func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testi
 		{"DELETE", "/api/v1/security/overview/threat-screen/collector", false},
 		{"GET", "/api/v1/security/policies", false},
 		{"GET", "/api/v1/security/custom-rules", false},
+		// SC-4 登录锁传播（历史 历史问题-3）：密码登录与 MFA 验证步均写
+		// users 同步列（失败置锁 login_locked_until/成功清零解锁），触发器
+		// 不可用时须与 setup/OIDC 开户同口径 fail-closed。
+		{"POST", "/api/v1/auth/login", true},
+		{"POST", "/api/v1/auth/mfa/verify", true},
+		// 票据登录不写 users 同步列（失败仅记审计）——不误伤从节点登录
+		// 可用性；GET 形态同样不入。
+		{"POST", "/api/v1/auth/ticket-login", false},
+		{"GET", "/api/v1/auth/login", false},
 	}
 	for _, test := range tests {
 		if got := isSynchronizedWrite(test.method, test.path); got != test.want {

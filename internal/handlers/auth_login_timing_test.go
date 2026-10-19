@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -155,6 +156,85 @@ func TestLogin_successClearsLockoutCounter(t *testing.T) {
 	if attempts != 0 {
 		t.Fatalf("login_failed_attempts=%d, want 0（成功登录应清零）", attempts)
 	}
+}
+
+func TestLogin_resetFailureIsLoggedWithoutRevokingJWT(t *testing.T) {
+	seed := func(t *testing.T, failReset bool) (*Handlers, *gin.Engine, *sql.DB) {
+		t.Helper()
+		database := setupAuthTestDB(t)
+		if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,20,1)`); err != nil {
+			t.Fatalf("create global config: %v", err)
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Exec(`INSERT INTO users (username,password_hash,role,is_enabled,login_failed_attempts) VALUES ('root',?,'admin',1,4)`, string(hash)); err != nil {
+			t.Fatal(err)
+		}
+		if failReset {
+			if _, err := database.Exec(`CREATE TRIGGER fail_login_reset
+				BEFORE UPDATE OF login_failed_attempts, login_locked_until ON users
+				BEGIN SELECT RAISE(FAIL, 'login reset blocked'); END`); err != nil {
+				t.Fatalf("create reset fault trigger: %v", err)
+			}
+		}
+		h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
+		router := gin.New()
+		router.POST("/auth/login", h.Login)
+		return h, router, database
+	}
+	post := func(router *gin.Engine) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"username":"root","password":"Secret123!"}`))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+
+	t.Run("success clears counter without warning", func(t *testing.T) {
+		_, router, database := seed(t, false)
+		var logs strings.Builder
+		oldWriter := log.Writer()
+		log.SetOutput(&logs)
+		t.Cleanup(func() { log.SetOutput(oldWriter) })
+		response := post(router)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"token"`) {
+			t.Fatalf("status=%d body=%s, want successful login", response.Code, response.Body.String())
+		}
+		var attempts int
+		if err := database.QueryRow(`SELECT login_failed_attempts FROM users WHERE username='root'`).Scan(&attempts); err != nil {
+			t.Fatal(err)
+		}
+		if attempts != 0 {
+			t.Fatalf("login_failed_attempts=%d, want 0", attempts)
+		}
+		if strings.Contains(logs.String(), "登录成功清零登录失败计数与锁定失败") {
+			t.Fatalf("healthy reset must not warn, logs=%q", logs.String())
+		}
+	})
+
+	t.Run("reset failure logs and preserves verified login", func(t *testing.T) {
+		_, router, database := seed(t, true)
+		var logs strings.Builder
+		oldWriter := log.Writer()
+		log.SetOutput(&logs)
+		t.Cleanup(func() { log.SetOutput(oldWriter) })
+		response := post(router)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"token"`) {
+			t.Fatalf("verified login status=%d body=%s, want 200 with token", response.Code, response.Body.String())
+		}
+		var attempts int
+		if err := database.QueryRow(`SELECT login_failed_attempts FROM users WHERE username='root'`).Scan(&attempts); err != nil {
+			t.Fatal(err)
+		}
+		if attempts != 4 {
+			t.Fatalf("fault injection expected old attempts=4, got %d", attempts)
+		}
+		if !strings.Contains(logs.String(), "登录成功清零登录失败计数与锁定失败") || !strings.Contains(logs.String(), "login reset blocked") {
+			t.Fatalf("missing reset failure warning, logs=%q", logs.String())
+		}
+	})
 }
 
 // 2026-09 用户裁定：登录失败锁定受「登录失败锁定」开关控制——开关关闭时

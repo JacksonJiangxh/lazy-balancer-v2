@@ -55,6 +55,46 @@ func TestWriteFileAtomicSynced_MissingDirFails(t *testing.T) {
 	}
 }
 
+// 真实调用点：IP 名单投影回滚恢复真实文件并清理新增文件，不留临时制品。
+func TestRestoreIPListProjections_restoresRealFilesWithoutTempArtifacts(t *testing.T) {
+	// Given a snapshot, then a render that rewrites one projection and adds another.
+	dir := t.TempDir()
+	oldDir := IPListDataDir
+	IPListDataDir = dir
+	t.Cleanup(func() { IPListDataDir = oldDir })
+	existing := filepath.Join(dir, "p1-acl.txt")
+	if err := os.WriteFile(existing, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := SnapshotIPListProjections()
+	if err := os.WriteFile(existing, []byte("new-render\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	added := filepath.Join(dir, "p2-acl.txt")
+	if err := os.WriteFile(added, []byte("added\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// When CLI validation fails and the projection snapshot is restored.
+	RestoreIPListProjections(snapshot)
+
+	// Then original bytes return, the new projection disappears, and atomic
+	// writes leave no temporary artifacts.
+	if raw, err := os.ReadFile(existing); err != nil || string(raw) != "old\n" {
+		t.Fatalf("restored content=%q err=%v, want old", raw, err)
+	}
+	if _, err := os.Stat(added); !os.IsNotExist(err) {
+		t.Fatalf("new projection must be removed, stat err=%v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "p1-acl.txt" {
+		t.Fatalf("restore left unexpected files: %v", entries)
+	}
+}
+
 // 真实调用点：安全事件采集偏移的原子落盘 round-trip（读回 + 无 .tmp 残留）。
 func TestSecurityEventsWriteOffset_AtomicRoundTrip(t *testing.T) {
 	dir := t.TempDir()

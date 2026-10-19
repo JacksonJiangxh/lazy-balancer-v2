@@ -432,6 +432,48 @@ func TestRedirectedPOSTPreservesMethodAndBody(t *testing.T) {
 	}
 }
 
+// 历史 历史问题-1：面板 TLS 嗅探层对明文请求实际返回 302（cmd/server
+// http_redirect_mux.go），转发重放集合必须含 302——否则面板启用 HTTPS 后
+// 全部 tools/call 收到 302 空 body 走 {} 错误。本测试钉「302 同样按原方法/
+// 原请求体重放一次」。
+func TestRedirect302PreservesMethodAndBody(t *testing.T) {
+	wantBody := `{"caddy_id":"rule-1","domain":"example.com"}`
+	requests := 0
+	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			w.Header().Set("Location", "/api/v1/redirected")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/redirected" || string(body) != wantBody {
+			t.Errorf("request=%s %s body=%q", r.Method, r.URL.Path, body)
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer rest.Close()
+
+	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "issue_certificate", wantBody)
+	if requests != 2 || !strings.Contains(result, "ok") {
+		t.Fatalf("requests=%d result=%q（302 须与 301 同口径重放）", requests, result)
+	}
+}
+
+// 畸形形状：第二次仍是 302 时必须报「重定向次数超过限制」（重放只一次）。
+func TestSecond302RedirectReturnsError(t *testing.T) {
+	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "/again")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer rest.Close()
+
+	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "issue_certificate", `{}`)
+	if !strings.Contains(result, "重定向次数超过限制") {
+		t.Fatalf("result=%q", result)
+	}
+}
+
 func TestSecondRedirectReturnsError(t *testing.T) {
 	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", "/again")

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"lazy-balancer-v2/internal/db"
 )
 
 func TestDecideCRSSeedSource(t *testing.T) {
@@ -327,6 +329,17 @@ func TestSeedCRSRules_blocksWhileWafFileLockHeld(t *testing.T) {
 	probeBlocksUnderWafFileLock(t, "CRS 播种判定与写相位", func() {
 		seedCRSRulesFrom(liveDir, snapshotDir, distDir)
 	})
+}
+
+func TestReconcileCRSState_nilDatabaseIsNoOp(t *testing.T) {
+	// Given a direct call before database initialization (a supported test and
+	// startup-defensive shape); there is no role to reconcile or files to touch.
+	oldDB := db.DB
+	db.DB = nil
+	t.Cleanup(func() { db.DB = oldDB })
+
+	// When/Then: reconciliation returns without dereferencing a nil *sql.DB.
+	ReconcileCRSState()
 }
 
 func TestReconcileCRSState_blocksWhileWafFileLockHeld(t *testing.T) {

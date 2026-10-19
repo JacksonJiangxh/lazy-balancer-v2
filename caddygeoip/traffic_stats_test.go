@@ -112,6 +112,49 @@ func TestTrafficRecord_rejectsNonCountryKeys(t *testing.T) {
 	}
 }
 
+// A85PLG 历史问题：xdb 中文异体国名（「美国」）与英文规范名必须归一到同一桶——
+// 分键各自计数时，app 聚合端点按翻译后中文名重建 map（后写覆盖先写）会丢掉
+// 其中一桶的 attack/normal 计数。归一经 geoipnames.NormalizeCountry，与发射
+// 侧 geoipLocFor 同表同函数；「中国」保留不折叠。
+func TestTrafficRecord_normalizesOverseasAliases(t *testing.T) {
+	resetTrafficState(t)
+	resetTrafficEvents()
+	trafficEventSampleN.Store(1)
+
+	// 目标形状：中文异体与英文名进同一桶，事件流同口径。
+	trafficRecord("美国", true)
+	trafficRecord("United States", true)
+	trafficRecord("United States", false)
+	trafficEventRecord("美国", "")
+
+	trafficMu.RLock()
+	e := trafficCountries["United States"]
+	_, aliasBucket := trafficCountries["美国"]
+	buckets := len(trafficCountries)
+	trafficMu.RUnlock()
+	if e == nil || e.attack.Load() != 2 || e.normal.Load() != 1 {
+		t.Fatalf("United States bucket=%+v, want attack=2 normal=1（异体合桶）", e)
+	}
+	if aliasBucket {
+		t.Fatal("中文异体「美国」不得建独立桶")
+	}
+	if buckets != 1 {
+		t.Fatalf("country buckets=%d, want 1（异体归一）", buckets)
+	}
+	if len(trafficEvents) != 1 || trafficEvents[0].Country != "United States" {
+		t.Fatalf("event country=%+v, want normalized to United States", trafficEvents)
+	}
+
+	// 回归形状：「中国」保留（NormalizeCountry 对其返回空串，不得被吞）。
+	trafficRecord("中国", false)
+	trafficMu.RLock()
+	cn := trafficCountries["中国"]
+	trafficMu.RUnlock()
+	if cn == nil || cn.normal.Load() != 1 {
+		t.Fatalf("中国 bucket=%+v, want normal=1（保留不折叠）", cn)
+	}
+}
+
 func TestTrafficRecord_countryCapacity(t *testing.T) {
 	// Given: 国名桶达到硬上限，且其中一个已有桶随后继续命中。
 	resetTrafficState(t)

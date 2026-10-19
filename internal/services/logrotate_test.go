@@ -39,6 +39,41 @@ func TestRotatingFileWriter_Write_returns_rotation_reopen_error(t *testing.T) {
 	}
 }
 
+func TestRotatingFileWriter_Write_reopensAfterCloseFailure(t *testing.T) {
+	// Given a writer whose descriptor has already been closed underneath it;
+	// rotateLocked observes a real os.File.Close error on the second close.
+	path := filepath.Join(t.TempDir(), "runtime.log")
+	writer, err := NewRotatingFileWriter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+	oldSizeMB := runtimeLogSizeMB.Load()
+	runtimeLogSizeMB.Store(100)
+	t.Cleanup(func() { runtimeLogSizeMB.Store(oldSizeMB) })
+	if err := writer.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.rotateLocked(); err == nil {
+		t.Fatal("second close must fail to exercise the recovery path")
+	}
+
+	// When the next write arrives after that close failure.
+	n, err := writer.Write([]byte("recovered\n"))
+
+	// Then the poisoned descriptor is forgotten and the file is reopened.
+	if err != nil || n != len("recovered\n") {
+		t.Fatalf("write after close failure n=%d err=%v, want successful reopen", n, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "recovered\n") {
+		t.Fatalf("log content=%q, want recovered entry", data)
+	}
+}
+
 // 历史问题-1(历史):LogFileEnabled 恒 true 的用户裁定意图在裸二进制
 // 部署落空——open() 不建父目录,/app/logs 不存在时恒回退 stdout。必须 MkdirAll。
 func TestNewRotatingFileWriter_createsParentDirs(t *testing.T) {

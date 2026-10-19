@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -66,12 +67,24 @@ func TestBeginConfigImport_serializesConcurrentSessions(t *testing.T) {
 		session *configImportSession
 		err     error
 	}
+	secondAttempt := make(chan struct{})
+	var attemptOnce sync.Once
+	oldAttemptHook := configImportBeginAttemptHook
+	configImportBeginAttemptHook = func() { attemptOnce.Do(func() { close(secondAttempt) }) }
+	t.Cleanup(func() { configImportBeginAttemptHook = oldAttemptHook })
 	secondDone := make(chan result, 1)
 	go func() {
 		session, err := h.beginConfigImport(context.Background())
 		secondDone <- result{session: session, err: err}
 	}()
-	time.Sleep(100 * time.Millisecond) // 给旧实现机会执行 Pause 后阻塞在 caddyOpMu
+	// 第二个会话已确证在首个 close 前到达会话锁入口；无需猜测 100ms 是否
+	// 足以让旧实现先 Pause。
+	select {
+	case <-secondAttempt:
+	case <-time.After(5 * time.Second):
+		first.close()
+		t.Fatal("second import did not reach session lock")
+	}
 	first.close()
 	var second result
 	select {
@@ -88,6 +101,103 @@ func TestBeginConfigImport_serializesConcurrentSessions(t *testing.T) {
 		t.Fatalf("second import session is not paused (trigger err=%v)", err)
 	}
 	second.session.close()
+}
+
+// A85历史问题-1：Resume 必须先于串行会话锁释放；否则后到导入可先 Pause，
+// 再被前一代 Resume 覆盖，在调度恢复状态下执行事务。
+func TestConfigImportSessionClose_resumesBeforeReleasingSerialization(t *testing.T) {
+	h := &Handlers{}
+	h.caddyOpMu.Lock()
+	events := make([]string, 0, 2)
+	session := &configImportSession{
+		h:        h,
+		finished: true,
+		releaseBeforeLock: func() {
+			events = append(events, "release")
+		},
+		resumeEngine: func() {
+			events = append(events, "resume")
+		},
+	}
+
+	session.close()
+
+	if got := strings.Join(events, ","); got != "resume,release" {
+		t.Fatalf("close 锁序=%s, want resume,release", got)
+	}
+}
+
+// A85历史问题-4：ctx-blind 在途任务超过排空预算后不得继续全量导入；
+// 必须恢复调度、释放会话锁并返回可重试 409，而非留下 last-writer-wins 窗口。
+func TestBeginConfigImport_taskDrainTimeoutAbortsBeforeTransaction(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initTaskEngineForTest(t)
+	oldTimeout := importInFlightDrainTimeout
+	importInFlightDrainTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { importInFlightDrainTimeout = oldTimeout })
+	te := services.TaskEngine()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	if err := te.Register(taskengine.Descriptor{
+		ID: "import-drain-blocker", Family: "test", Name: "导入排空阻塞", Kind: taskengine.KindOneshot, RunsOn: taskengine.RoleAny,
+		Run: func(taskengine.RunContext) error {
+			close(entered)
+			<-release // 故意不消费 rc.Ctx，模拟既有 ctx-blind 扫描
+			close(done)
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := te.Register(taskengine.Descriptor{
+		ID: "import-drain-resumed", Family: "test", Name: "导入拒绝后调度恢复", Kind: taskengine.KindOneshot, RunsOn: taskengine.RoleAny,
+		Run: func(taskengine.RunContext) error { return nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := te.RunAsync("import-drain-blocker", "manual", "tester"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("阻塞任务未进入")
+	}
+
+	session, err := h.beginConfigImport(context.Background())
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("阻塞任务未退出")
+	}
+	if session != nil {
+		session.close()
+	}
+	if err == nil {
+		t.Fatal("在途 ctx-blind 任务未排空时仍允许导入，必须返回拒绝")
+	}
+	if !strings.Contains(err.Error(), "在途任务") {
+		t.Fatalf("err=%v, want 在途任务排空原因", err)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	respondImportBeginError(ctx, err)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("排空失败 HTTP status=%d body=%s, want 409", recorder.Code, recorder.Body.String())
+	}
+	var action, detail string
+	if queryErr := db.AuditDB.QueryRow(`SELECT action,detail FROM audit_log WHERE resource='配置备份' ORDER BY id DESC LIMIT 1`).Scan(&action, &detail); queryErr != nil {
+		t.Fatal(queryErr)
+	}
+	if action != "导入失败" || !strings.Contains(detail, "未执行") {
+		t.Fatalf("排空失败审计 action=%q detail=%q, want 导入失败/未执行", action, detail)
+	}
+	if err := te.Trigger("import-drain-resumed", "manual", "tester"); err != nil {
+		t.Fatalf("排空拒绝后调度未恢复: %v", err)
+	}
 }
 
 func TestBeginConfigImport_preservesStoppedCAQueue(t *testing.T) {

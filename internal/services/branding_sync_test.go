@@ -2,7 +2,10 @@ package services
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,8 +14,61 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/config"
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
+
+type brandingRowsAffectedErrorConnector struct{}
+
+func (brandingRowsAffectedErrorConnector) Connect(context.Context) (driver.Conn, error) {
+	return brandingRowsAffectedErrorConn{}, nil
+}
+func (brandingRowsAffectedErrorConnector) Driver() driver.Driver {
+	return brandingRowsAffectedErrorDriver{}
+}
+
+type brandingRowsAffectedErrorDriver struct{}
+
+func (brandingRowsAffectedErrorDriver) Open(string) (driver.Conn, error) {
+	return brandingRowsAffectedErrorConn{}, nil
+}
+
+type brandingRowsAffectedErrorConn struct{}
+
+func (brandingRowsAffectedErrorConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("unexpected Prepare")
+}
+func (brandingRowsAffectedErrorConn) Close() error { return nil }
+func (brandingRowsAffectedErrorConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("unexpected Begin")
+}
+func (brandingRowsAffectedErrorConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+	return brandingRowsAffectedErrorResult{}, nil
+}
+
+type brandingRowsAffectedErrorResult struct{}
+
+func (brandingRowsAffectedErrorResult) LastInsertId() (int64, error) { return 0, nil }
+func (brandingRowsAffectedErrorResult) RowsAffected() (int64, error) {
+	return 0, errors.New("injected RowsAffected failure")
+}
+
+func TestRefreshBrandingMirror_returnsRowsAffectedError(t *testing.T) {
+	// Given a successful Exec whose driver cannot determine the affected count.
+	newClusterTestService(t)
+	realDB := db.DB
+	fake := sql.OpenDB(brandingRowsAffectedErrorConnector{})
+	db.DB = fake
+	t.Cleanup(func() { db.DB = realDB; _ = fake.Close() })
+
+	// When mirroring a missing branding file (empty content is a valid shape).
+	changed, err := RefreshBrandingMirror(t.TempDir())
+
+	// Then the unknown write result is an error, never "unchanged, no error".
+	if err == nil || changed {
+		t.Fatalf("RefreshBrandingMirror changed=%v err=%v, want false plus RowsAffected error", changed, err)
+	}
+}
 
 // RefreshBrandingMirror(2026-09-11 裁定):branding.json 原文镜像到
 // global_config.branding_json——内容变化才写(触发器 bump cluster_version,

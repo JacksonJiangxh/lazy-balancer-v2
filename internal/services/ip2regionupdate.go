@@ -34,6 +34,8 @@ const (
 	// IP2RegionStatusSkipped 历史问题-01（历史）：起点角色复查中止的正常语义
 	// 终态——镜像 CRS 侧 历史问题-05（历史漏收敛本侧；从节点中止非故障）。
 	IP2RegionStatusSkipped IP2RegionUpdateStatus = "skipped"
+	// IP2RegionStatusCancelled 用户主动取消，与 task_runs cancelled 同口径。
+	IP2RegionStatusCancelled IP2RegionUpdateStatus = "cancelled"
 )
 
 // IP2RegionUpdateManager runs ip2region xdb updates single-flight and persists
@@ -139,6 +141,9 @@ func currentIP2RegionVersion() string {
 	return version
 }
 
+// ip2RegionCurrentVersionForRun 安装前版本判定的测试缝；生产恒指向 currentIP2RegionVersion。
+var ip2RegionCurrentVersionForRun = currentIP2RegionVersion
+
 // StartUpdate begins an async update; only one may run at a time. 返回本次 run
 // 的完成通道（历史问题 B-F2，与 CRS 侧同形）：调度器 rearm 须等待该捕获通道而非
 // 回读现行 m.runDone，防手动更新插队覆盖后的错等与误判。手动调用方可忽略。
@@ -185,8 +190,8 @@ func (m *IP2RegionUpdateManager) setStage(status IP2RegionUpdateStatus, message 
 	switch status {
 	case IP2RegionStatusFailed:
 		level = "ERROR"
-	case IP2RegionStatusSkipped:
-		// 历史问题-01：跳过语义用 WARN（镜像 CRS 侧 历史问题-05，对齐威胁族 WARN skipped）。
+	case IP2RegionStatusSkipped, IP2RegionStatusCancelled:
+		// 跳过/用户取消均为非故障中止，使用 WARN。
 		level = "WARN"
 	}
 	WriteIP2RegionUpdateLog(level, string(status), message)
@@ -208,18 +213,21 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 		// 状态中文归一（历史问题-08b：曾混英文 status token，与 threat 族口径不一）
 		statusLabel := map[string]string{
 			string(IP2RegionStatusSuccess): "成功", string(IP2RegionStatusFailed): "失败",
-			string(IP2RegionStatusSkipped): "跳过",
-			string(IP2RegionStatusIdle):    "空闲", string(IP2RegionStatusChecking): "检测中",
+			string(IP2RegionStatusSkipped): "跳过", string(IP2RegionStatusCancelled): "已取消",
+			string(IP2RegionStatusIdle): "空闲", string(IP2RegionStatusChecking): "检测中",
 		}[status]
 		if statusLabel == "" {
 			statusLabel = status
 		}
 		detail := fmt.Sprintf("更新%s（触发：%s）%s", statusLabel, trigger, message)
-		if status == string(IP2RegionStatusFailed) {
+		switch status {
+		case string(IP2RegionStatusFailed):
 			// SEC-C-U1（历史）：资源名用归一表规范名「IP数据库」——旧名
 			// 「IP2Region数据库」属归一表旧值，写入即被下次启动迁移重写。
 			RecordAuditLog(operator, "更新失败", "IP数据库", detail, "")
-		} else {
+		case string(IP2RegionStatusCancelled):
+			RecordAuditLog(operator, "取消", "IP数据库", detail, "")
+		default:
 			RecordAuditLog(operator, "更新", "IP数据库", detail, "")
 		}
 	}()
@@ -268,7 +276,7 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 	m.setStage(IP2RegionStatusChecking, "查询最新 ip2region 版本")
 	// 任务内重试（2026-09-25 用户裁定）：同 CRS 侧——耗尽才落定，排程槽不污染。
 	var tag string
-	err := runWithInTaskRetry(func() error {
+	err := runWithInTaskRetry(runCtx, func() error {
 		var ferr error
 		tag, ferr = m.fetchLatestTag(runCtx)
 		if _, dbErr := db.DB.Exec("UPDATE security_ip2region_version SET last_checked=? WHERE id=1", runStartedAt); dbErr != nil {
@@ -285,6 +293,10 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 			m.setStage(IP2RegionStatusSkipped, "节点已降级为从节点，终止 IP2Region 更新")
 			return
 		}
+		if runCtx.Err() != nil {
+			m.cancel(err)
+			return
+		}
 		m.fail(err)
 		m.advanceSlotIfAuto(trigger)
 		return
@@ -296,7 +308,7 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 	// 安装更旧 xdb；格式不可比（cmpErr!=nil）保持现行「不等即更新」行为。
 	// 历史问题：精确相等短路（与格式无关）并入既有跳过分支；不同且不可比较
 	// 显式失败（不再隐含「必然更新」）。
-	currentVersion := currentIP2RegionVersion()
+	currentVersion := ip2RegionCurrentVersionForRun()
 	cmp, cmpErr := CompareCRSVersions(tag, currentVersion)
 	// 空 current（首装）永远走安装路径；`bundled`/`unknown` 是未写版本哨兵，
 	// 同样允许从远端建立基线；不同且不可比较（非首装）显式失败。
@@ -337,7 +349,7 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 	m.mu.Unlock()
 
 	var installErr error
-	_ = runWithInTaskRetry(func() error {
+	installRetErr := runWithInTaskRetry(runCtx, func() error {
 		installErr = m.downloadAndInstall(runCtx, tag)
 		// errIP2RegionReload=内存热换失败（fail-open 回滚路径），非瞬断——不重试。
 		if errors.Is(installErr, errIP2RegionReload) {
@@ -347,11 +359,22 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 	}, func(nextAttempt int, wait time.Duration, rerr error) {
 		WriteIP2RegionUpdateLog("WARN", "retry", fmt.Sprintf("下载安装 ip2region %s 失败: %v；等待 %s 重试，第 %d 次，共 %d 次", tag, rerr, wait, nextAttempt, updateMaxAttempts))
 	})
+	// 取消发生在 op 前时 installErr 仍 nil，但重试器已返回 ctx 错误。
+	if installRetErr != nil && (installErr == nil || runCtx.Err() != nil) {
+		installErr = installRetErr
+	}
+	if installErr == nil && runCtx.Err() != nil {
+		installErr = runCtx.Err()
+	}
 	if installErr != nil && !errors.Is(installErr, errIP2RegionReload) {
 		// F-历史问题-01：同上方 fetch 分支——demote 在途中止落 skipped（不回滚
 		// 不重载：从节点保持只读不变量）。
 		if runCtx.Err() != nil && !updateRunStillMaster() {
 			m.setStage(IP2RegionStatusSkipped, "节点已降级为从节点，终止 IP2Region 更新")
+			return
+		}
+		if runCtx.Err() != nil {
+			m.cancel(installErr)
 			return
 		}
 		m.fail(fmt.Errorf("安装 ip2region xdb 失败: %w", installErr))
@@ -491,6 +514,22 @@ func (m *IP2RegionUpdateManager) advanceSlotIfAuto(trigger string) {
 		return
 	}
 	advanceVersionSlotIfDue("security_ip2region_version")
+}
+
+// cancel 记录用户主动取消：保留既有工件/快照，不增加连续失败计数。
+func (m *IP2RegionUpdateManager) cancel(cause error) {
+	if _, err := db.DB.Exec(
+		"UPDATE security_ip2region_version SET update_status='cancelled', message=?, finished_at=datetime('now') WHERE id=1",
+		cause.Error(),
+	); err != nil {
+		Logf("error", "ip2region update: failed to record cancellation: %v", err)
+	}
+	m.mu.Lock()
+	m.state.status = IP2RegionStatusCancelled
+	m.state.message = cause.Error()
+	m.state.finishedAt = time.Now().UTC()
+	m.mu.Unlock()
+	WriteIP2RegionUpdateLog("WARN", string(IP2RegionStatusCancelled), cause.Error())
 }
 
 func (m *IP2RegionUpdateManager) fail(cause error) {

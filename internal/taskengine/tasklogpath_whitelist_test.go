@@ -37,6 +37,12 @@ func TestTaskLogPath_whitelistAlphabet(t *testing.T) {
 		t.Fatalf("穿越形态净化基名=%q, want ....etcpasswd.log（分隔符剔除、字母表内字符保留）", filepath.Base(got))
 	}
 
+	// 全非法字符 ID：净化后为空——不得拼出共享的 <dir>/.log（与未初始化
+	// 同语义返回空串，历史六维度 历史问题 观察项）。
+	if got := TaskLogPath(`///???###`); got != "" {
+		t.Fatalf("全非法 ID TaskLogPath=%q, want 空串（不得产出共享 <dir>/.log）", got)
+	}
+
 	// 未初始化目录=空串（既有契约）
 	SetLogDir("")
 	if got := TaskLogPath("crs"); got != "" {

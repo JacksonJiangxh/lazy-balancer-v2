@@ -25,7 +25,7 @@
           <span v-else-if="kind === 'geo' && geoLabel" class="trg-source-geo">{{ geoLabel }}</span>
         </div>
         <div class="trg-hero-policy">
-          <span class="trg-hero-policy-name">{{ policy?.name ?? (loading ? '加载中…' : policyMissing ? '（策略已删除）' : '（策略信息不可用）') }}</span>
+          <span class="trg-hero-policy-name">{{ policy?.name ?? (loading ? '加载中…' : noPolicyAttribution ? '（本次事件无策略归属）' : policyMissing ? '（策略已删除）' : '（策略信息不可用）') }}</span>
           <el-tag size="small" :type="policy?.enabled ? 'success' : 'info'" effect="plain">
             {{ loading ? '…' : policy?.enabled ? '已启用' : '已禁用' }}
           </el-tag>
@@ -336,6 +336,9 @@ const heroHitSource = computed(() => {
 const loading = ref(false)
 const policyMissing = ref(false)
 const loadError = ref(false)
+// A85WB-历史问题：policy_id<=0 是后端归因的合法「无策略归属」态（规则未绑定策略时
+// securityevents.go 返回 (0, "")），不是「策略已删除」——文案分离。
+const noPolicyAttribution = computed(() => (props.row?.policy_id ?? 0) <= 0)
 // 弹框会话序号（历史 历史问题）：快速关开换行时丢弃在途响应（同文件 crsDialogSeq
 // / IPLocationAction loadPoliciesSeq 同仓模式）
 let loadSeq = 0
@@ -409,7 +412,8 @@ const loadAll = async (): Promise<void> => {
         if (!policyMissing.value) loadError.value = true
       }
     } else {
-      policyMissing.value = true
+      // policy_id<=0 = 无策略归属（合法态），展示文案由 noPolicyAttribution 承载，
+      // 不归入「策略已删除」（A85WB-历史问题）
     }
     // 全部启用策略 + 名单/条目：ACL 与信任 refs 的条目缓存（信息展示用 +
     // 跨策略信任成员判定——历史追加修复）

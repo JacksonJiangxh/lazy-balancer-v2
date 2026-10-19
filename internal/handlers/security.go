@@ -69,6 +69,11 @@ func (h *Handlers) ListSecurityCustomRules(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: rules})
 }
 
+const (
+	securityNameMaxRunes        = 100
+	securityDescriptionMaxRunes = 500
+)
+
 func validateSecurityCustomRule(rule *models.SecurityCustomRule) error {
 	// 历史问题-01（历史）：负 ID 发射 id:crID+10000 会生成重复（id:10 撞
 	// body processor）或负 SecRule id，整份 coraza 配置被拒——本函数是
@@ -87,13 +92,13 @@ func validateSecurityCustomRule(rule *models.SecurityCustomRule) error {
 		}
 	}
 	// 历史问题-4:规则名随 SecRule msg 发射,长度封顶 100 rune。
-	if utf8.RuneCountInString(rule.Name) > 100 {
+	if utf8.RuneCountInString(rule.Name) > securityNameMaxRunes {
 		return fmt.Errorf("规则名称不能超过 100 字符")
 	}
 	// SEC-U1（历史）：description 补封顶（历史问题-4 家族漏收敛点）——
 	// 对齐策略描述 500 rune 口径；DB 列无长度约束，超长串随列表响应/审计
 	// 详情放大。本函数是 Create/Update/导入三路径的单一收口点。
-	if utf8.RuneCountInString(rule.Description) > 500 {
+	if utf8.RuneCountInString(rule.Description) > securityDescriptionMaxRunes {
 		return fmt.Errorf("规则描述不能超过 500 字符")
 	}
 	if rule.Action != "block" && rule.Action != "log" && rule.Action != "pass" {
@@ -114,6 +119,10 @@ func validateSecurityCustomRule(rule *models.SecurityCustomRule) error {
 // ipListMaxGlobalCount 同阈值的双限额口径（历史问题 历史引入）。
 const securityCustomRuleMaxGlobalCount = 200
 
+// createSecurityCustomRulePreLockHook 测试屏障（生产恒 nil）：用于证明写请求
+// 已到达共享 caddyOpMu 入口，避免负向锁测试依赖固定等待。
+var createSecurityCustomRulePreLockHook func()
+
 func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 	var req models.SecurityCustomRule
 	if !guardConfiguredJSONBody(c) {
@@ -122,6 +131,9 @@ func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
+	}
+	if createSecurityCustomRulePreLockHook != nil {
+		createSecurityCustomRulePreLockHook()
 	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
@@ -394,11 +406,11 @@ func (h *Handlers) CreateSecurityBlockPage(c *gin.Context) {
 	// SEC-A-2（历史）：name/description 补 rune 封顶（历史问题-4 家族漏收敛
 	// 点——策略/自定义规则同口径 100/500；DB 列无长度约束，超长串随列表响应/
 	// 审计详情放大）。
-	if utf8.RuneCountInString(req.Name) > 100 {
+	if utf8.RuneCountInString(req.Name) > securityNameMaxRunes {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面名称不能超过 100 字符"})
 		return
 	}
-	if utf8.RuneCountInString(req.Description) > 500 {
+	if utf8.RuneCountInString(req.Description) > securityDescriptionMaxRunes {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面描述不能超过 500 字符"})
 		return
 	}
@@ -468,11 +480,11 @@ func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
 		return
 	}
 	// SEC-A-2（历史）：name/description rune 封顶（与创建同口径）。
-	if utf8.RuneCountInString(req.Name) > 100 {
+	if utf8.RuneCountInString(req.Name) > securityNameMaxRunes {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面名称不能超过 100 字符"})
 		return
 	}
-	if utf8.RuneCountInString(req.Description) > 500 {
+	if utf8.RuneCountInString(req.Description) > securityDescriptionMaxRunes {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面描述不能超过 500 字符"})
 		return
 	}
@@ -968,11 +980,11 @@ func (h *Handlers) CreateSecurityPolicy(c *gin.Context) {
 		return
 	}
 	// 历史问题-4:DB 列无长度约束,超长名/描述随审计与列表响应放大。
-	if utf8.RuneCountInString(req.Name) > 100 {
+	if utf8.RuneCountInString(req.Name) > securityNameMaxRunes {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略名称不能超过 100 字符"})
 		return
 	}
-	if utf8.RuneCountInString(req.Description) > 500 {
+	if utf8.RuneCountInString(req.Description) > securityDescriptionMaxRunes {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略描述不能超过 500 字符"})
 		return
 	}
@@ -1453,11 +1465,11 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 		return
 	}
 	// 历史问题-4:更新侧同封顶(指针字段仅在提供时校验)。
-	if req.Name != nil && utf8.RuneCountInString(*req.Name) > 100 {
+	if req.Name != nil && utf8.RuneCountInString(*req.Name) > securityNameMaxRunes {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略名称不能超过 100 字符"})
 		return
 	}
-	if req.Description != nil && utf8.RuneCountInString(*req.Description) > 500 {
+	if req.Description != nil && utf8.RuneCountInString(*req.Description) > securityDescriptionMaxRunes {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略描述不能超过 500 字符"})
 		return
 	}
@@ -3063,7 +3075,7 @@ func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
 		}
 		return false
 	}()
-	if utf8.RuneCountInString(p.Name)+utf8.RuneCountInString(stageSuffix[models.PolicyTypeStage3]) > 100 {
+	if utf8.RuneCountInString(p.Name)+utf8.RuneCountInString(stageSuffix[models.PolicyTypeStage3]) > securityNameMaxRunes {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拆分后的子策略名称将超过 100 字符，请先缩短原策略名称"})
 		return
 	}
@@ -3725,7 +3737,7 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 	if db.MetricsDB == nil {
 		// MetricsDB 未装配：返回空列表而非 panic（历史 历史问题）。键与成功
 		// 路径同形状（events——历史问题-05 历史修正，此前误用 list 键）。
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]any{"events": []any{}, "total": 0, "page": 1, "page_size": 20}})
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]any{"events": []any{}, "total": 0, "page": 1, "page_size": 20, "ingestion": services.SecurityEventsIngestionHealthSnapshot()}})
 		return
 	}
 	// event_time 恒为 'YYYY-MM-DD HH:MM:SS' UTC 字符串，参数同形 —— 直接字符串比较
@@ -3789,7 +3801,7 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 	if events == nil {
 		events = []models.SecurityEvent{}
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"events": events, "total": total, "page": page, "page_size": pageSize}})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"events": events, "total": total, "page": page, "page_size": pageSize, "ingestion": services.SecurityEventsIngestionHealthSnapshot()}})
 }
 
 const securityEventListFieldCap = 16 * 1024
@@ -4079,7 +4091,11 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 	_, offset := time.Now().In(loc).Zone()
 	offsetMinutes := offset / 60
 	now := time.Now().In(loc)
-	todayStartUTC := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc).UTC().Format("2006-01-02 15:04:05")
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	todayStartUTC := todayStart.UTC().Format("2006-01-02 15:04:05")
+	sevenDayStartUTC := todayStart.UTC().Add(-6 * 24 * time.Hour).Format("2006-01-02 15:04:05")
+	rawCoverageFrom := ""
+	backfillIncomplete := false
 
 	var overview models.SecurityOverview
 	overview.CRSAvailable, overview.IP2RegionAvailable = services.SecurityLibraryStatus()
@@ -4094,6 +4110,10 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 	if db.MetricsDB != nil {
 		trackErr(db.MetricsDB.QueryRow("SELECT COUNT(*) FROM security_events WHERE action='blocked' AND event_time >= ?", todayStartUTC).Scan(&overview.TodayBlocked))
 		trackErr(db.MetricsDB.QueryRow("SELECT COUNT(*) FROM security_events WHERE action='logged' AND event_time >= ?", todayStartUTC).Scan(&overview.TodayDetected))
+		coverageFrom, err := threatRawCoverageStart(db.MetricsDB)
+		trackErr(err)
+		rawCoverageFrom = coverageFrom
+		backfillIncomplete = rawCoverageFrom != "" && rawCoverageFrom > sevenDayStartUTC
 	}
 	// 活跃策略=启用且任一阶段特征非空（历史 历史问题，用户裁定）：旧口径
 	// `mode!='off'` 滞留阶段化前语义——stage1/stage2 策略 mode 恒归一 off，
@@ -4158,7 +4178,11 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "安全总览查询失败"})
 			return
 		}
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: overview})
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: securityOverviewResponse{
+			SecurityOverview:   overview,
+			RawCoverageFrom:    rawCoverageFrom,
+			BackfillIncomplete: backfillIncomplete,
+		}})
 		return
 	}
 	// printf('+%d', -240) 会产出非法修饰符 "+-240" 使 date() 返回 NULL，导致趋势全零。
@@ -4177,7 +4201,11 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "安全总览查询失败"})
 		return
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: overview})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: securityOverviewResponse{
+		SecurityOverview:   overview,
+		RawCoverageFrom:    rawCoverageFrom,
+		BackfillIncomplete: backfillIncomplete,
+	}})
 }
 
 func (h *Handlers) GetCRSInfo(c *gin.Context) {
@@ -4352,11 +4380,14 @@ func (h *Handlers) StartCRSUpdate(c *gin.Context) {
 		return
 	}
 	op := auditOperator(c)
-	// 历史问题：统一异步触发与错误分类（见 services.TriggerTaskAsync）。
-	services.TriggerTaskAsync(te, "crs", services.TriggerAuditContext{
+	// 历史问题/A85历史问题-2：响应前同步预占位；暂停/停止/角色/单飞拒绝
+	// 不得伪报 200 running。任务体审计仍按自记族单记口径。
+	if err := services.TriggerTaskAsync(te, "crs", services.TriggerAuditContext{
 		Operator: op, Family: "CRS规则库", Name: "CRS 更新",
-	})
-	// 审计由任务体自记（operator 经 RunContext 归人——2026-09-29 裁定单记口径）
+	}); err != nil {
+		respondTaskTriggerAdmissionError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 }
 
@@ -4512,11 +4543,13 @@ func (h *Handlers) StartIP2RegionUpdate(c *gin.Context) {
 		return
 	}
 	op := auditOperator(c)
-	// 历史问题：统一异步触发与错误分类（见 services.TriggerTaskAsync）。
-	services.TriggerTaskAsync(te, "ip2region", services.TriggerAuditContext{
+	// 历史问题/A85历史问题-2：响应前同步预占位，拒绝时不得伪报 running。
+	if err := services.TriggerTaskAsync(te, "ip2region", services.TriggerAuditContext{
 		Operator: op, Family: "IP数据库", Name: "IP2Region 更新",
-	})
-	// 审计由任务体自记（operator 经 RunContext 归人——2026-09-29 裁定单记口径）
+	}); err != nil {
+		respondTaskTriggerAdmissionError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 }
 

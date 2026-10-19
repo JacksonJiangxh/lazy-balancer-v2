@@ -76,7 +76,7 @@ type threatScreenPayload struct {
 		AttackTypeShare    []models.SecurityAttackType `json:"attack_type_share"`
 		RecentRate         float64                     `json:"recent_rate"`
 		// v2.4.x 大屏加固：logged=total-blocked（夹 >=0）、限流可用性位、
-		// 被攻击目标 Top5（name/domain/value）
+		// 被攻击目标 Top3（name/domain/value）
 		LoggedEvents       int  `json:"logged_events"`
 		RatelimitAvailable bool `json:"ratelimit_available"`
 		TopTargets         []struct {
@@ -785,19 +785,29 @@ func TestTriggerTypeForRule_fullTaxonomy(t *testing.T) {
 	cases := map[string]string{
 		"429":     "限流",
 		"2":       "IP 访问控制",
+		"3":       "信任名单",
 		"4":       "IP 访问控制",
+		"5":       "IP 访问控制",
 		"7":       "IP 访问控制",
 		"8":       "地域拦截",
 		"12":      "信任名单",
 		"14":      "威胁情报库",
 		"11":      "请求体异常",
+		"10001":   "WAF·自定义",
+		"799999":  "WAF·自定义",
 		"800007":  "地域拦截",
+		"809999":  "地域拦截",
+		"810000":  "爬虫Bot",
 		"810016":  "爬虫Bot",
 		"850003":  "爬虫Bot",
+		"899999":  "爬虫Bot",
+		"900000":  "WAF·CRS",
 		"942100":  "WAF·CRS",
-		"10001":   "WAF·自定义",
-		"1000001": "WAF·自定义",
 		"999999":  "WAF·CRS",
+		"1000000": "WAF·自定义",
+		"1000001": "WAF·自定义",
+		"garbage": "其他",
+		"":        "其他",
 	}
 	for id, want := range cases {
 		if got := triggerTypeForRule(id); got != want {
@@ -832,9 +842,9 @@ func TestThreatFixMinute_groupByUsesExpressions(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := string(raw)
-	start := strings.Index(source, "func threatFixMinute(")
+	start := strings.Index(source, "func threatFixMinuteWithMode(")
 	if start < 0 {
-		t.Fatal("threatFixMinute not found")
+		t.Fatal("threatFixMinuteWithMode not found")
 	}
 	body := source[start:]
 	if end := strings.Index(body, "\nfunc threatLocationParts("); end > 0 {
@@ -1223,7 +1233,7 @@ func TestGetSecurityThreatScreen_topTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Then: top_targets 按计数降序取前 5；已删除规则跳过；空 rule_caddy_id 排除
+	// Then: top_targets 按计数降序取前 3；已删除规则跳过；空 rule_caddy_id 排除
 	targets := payload.Data.TopTargets
 	if len(targets) != 2 {
 		t.Fatalf("top_targets=%+v, want 2 项（lb_gone 无 lb_rules 行跳过、空 id 排除）", targets)
@@ -1295,6 +1305,7 @@ func TestGetSecurityThreatScreen_topTargetsLimitThree(t *testing.T) {
 func TestGetSecurityThreatScreen_topTargetsCached(t *testing.T) {
 	// Given: 一条规则 + 1 条窗口内事件
 	setupSecurityPolicyTestDB(t)
+	installThreatClock(t, time.Now().UTC())
 	t.Cleanup(resetThreatScreenCachesForTest)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 	seedThreatLBRule(t, "lb_aaa", "API 服务", "api.example.com")
@@ -1431,12 +1442,15 @@ func TestStartThreatRollupWarmer_runsImmediately(t *testing.T) {
 }
 
 func TestGetSecurityThreatScreen_hourlyHistSlidingHours(t *testing.T) {
-	// Given: 30 分钟前与 90 分钟前各 1 条事件
+	// Given: 固定时钟下 30 分钟前与 90 分钟前各 1 条事件
 	setupSecurityPolicyTestDB(t)
+	base := time.Date(2026, 10, 18, 4, 34, 30, 0, time.UTC)
+	installThreatClock(t, base)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
-	now := time.Now()
-	seedThreatScreenEvent(t, now.UTC().Add(-30*time.Minute).Truncate(time.Second).Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, now.UTC().Add(-90*time.Minute).Truncate(time.Second).Format("2006-01-02 15:04:05"), "203.0.113.8", "941100", "XSS", "blocked")
+	event30 := base.Add(-30 * time.Minute)
+	event90 := base.Add(-90 * time.Minute)
+	seedThreatScreenEvent(t, event30.Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, event90.Format("2006-01-02 15:04:05"), "203.0.113.8", "941100", "XSS", "blocked")
 
 	// When: hours=3
 	recorder := getRequest(t, router, "/security/overview/threat-screen?hours=3")
@@ -1448,21 +1462,28 @@ func TestGetSecurityThreatScreen_hourlyHistSlidingHours(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Then: 滑动窗口分桶——3 槽（min(hours,24)）、名称 HH:00、末槽=当前
-	// 小时（配置时区），不再按本地固定 0..23 小时折叠
+	// Then: 3 槽按真实窗口起点等宽滑动，标签=槽终点（配置时区），
+	// 不再按整点对齐后把窗口前 sliver 钳进首桶。
 	hist := payload.Data.HourlyHist
 	if len(hist) != 3 {
 		t.Fatalf("hourly_hist=%d 槽, want 3（hours=3 滑动窗口）", len(hist))
 	}
 	loc := services.CurrentLocation()
-	lastHour := time.Now().In(loc).Truncate(time.Hour)
+	_, offset := base.In(loc).Zone()
+	shiftedNow := base.UTC().Add(time.Duration(offset) * time.Second)
+	windowStart := shiftedNow.Add(-3 * time.Hour)
 	for i, slot := range hist {
-		want := lastHour.Add(-time.Duration(len(hist)-1-i) * time.Hour)
-		if slot.Name != fmt.Sprintf("%02d:00", want.Hour()) {
-			t.Fatalf("hist[%d].Name=%q, want %02d:00（末槽为当前小时，逐槽回溯）", i, slot.Name, want.Hour())
+		want := windowStart.Add(time.Duration(i+1) * time.Hour).Format("15:04")
+		if slot.Name != want {
+			t.Fatalf("hist[%d].Name=%q, want %q（槽终点标签，等宽滑动）", i, slot.Name, want)
 		}
 	}
-	// 事件按本地小时落槽（总量守恒）
+	labelFor := func(ts time.Time) string {
+		shifted := ts.UTC().Add(time.Duration(offset) * time.Second)
+		idx := int(shifted.Sub(windowStart) / time.Hour)
+		return windowStart.Add(time.Duration(idx+1) * time.Hour).Format("15:04")
+	}
+	// 事件按等宽滑动槽落桶（总量守恒）
 	byName := map[string]int{}
 	total := 0
 	for _, slot := range hist {
@@ -1472,10 +1493,47 @@ func TestGetSecurityThreatScreen_hourlyHistSlidingHours(t *testing.T) {
 	if total != 2 {
 		t.Fatalf("hourly 总计=%d, want 2", total)
 	}
-	slot30 := fmt.Sprintf("%02d:00", now.Add(-30*time.Minute).In(loc).Hour())
-	slot90 := fmt.Sprintf("%02d:00", now.Add(-90*time.Minute).In(loc).Hour())
+	slot30 := labelFor(event30)
+	slot90 := labelFor(event90)
 	if byName[slot30] != 1 || byName[slot90] != 1 {
 		t.Fatalf("落槽=%v, want %s=1 且 %s=1", byName, slot30, slot90)
+	}
+}
+
+// Given 窗口起点不在整点/零点，窗口内事件分布在首桶 sliver 与后续槽。
+// When 请求威胁大屏直方图。
+// Then 首桶从真实窗口起点起算，不吸收对齐边界前的额外分钟；日桶同口径。
+func TestGetSecurityThreatScreen_hourlyHistUsesWindowStart(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	base := time.Date(2026, 10, 18, 4, 34, 30, 0, time.UTC)
+	installThreatClock(t, base)
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	// 本地 12:35（窗口起点后 1min；旧整点对齐时被钳入首桶）与
+	// 本地 13:40（旧首桶 13:00 内；新第二桶）。
+	seedThreatScreenEvent(t, base.Add(-24*time.Hour+time.Minute).Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, base.Add(-24*time.Hour+66*time.Minute).Format("2006-01-02 15:04:05"), "203.0.113.8", "941100", "XSS", "blocked")
+
+	recorder := getRequest(t, router, "/security/overview/threat-screen?hours=24")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload threatScreenPayload
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Data.TotalEvents != 2 {
+		t.Fatalf("total_events=%d, want 2", payload.Data.TotalEvents)
+	}
+	if len(payload.Data.HourlyHist) != 24 || payload.Data.HourlyHist[0].Value != 1 || payload.Data.HourlyHist[1].Value != 1 {
+		t.Fatalf("hourly_hist 首两槽=%+v, want 1/1（首桶不得吸收 sliver）", payload.Data.HourlyHist[:2])
+	}
+
+	loc := services.CurrentLocation()
+	_, offset := base.In(loc).Zone()
+	dayStarts, _ := threatHourlyBuckets(24*7, base, offset)
+	wantDayStart := base.UTC().Add(time.Duration(offset) * time.Second).Add(-24 * 7 * time.Hour)
+	if len(dayStarts) != 7 || !dayStarts[0].Equal(wantDayStart) {
+		t.Fatalf("7d 首槽起点=%v, want %v（真实窗口起点）", dayStarts[0], wantDayStart)
 	}
 }
 
@@ -1649,15 +1707,101 @@ func TestThreatRollupRewindTo_lockContentionReturnsAndClampsWindow(t *testing.T)
 		threatRollupRequestedHours.Store(0)
 		t.Cleanup(func() { threatRollupRequestedHours.Store(0) })
 		lastComplete := base.Add(-time.Minute).Truncate(time.Minute)
-		dFrom := lastComplete.Add(-24 * time.Hour)
+		dFrom := lastComplete.Add(-time.Duration(threatRollupRewindWindowHours) * time.Hour)
 		if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key,value) VALUES (?,?)`, threatRollupWatermarkKey, lastComplete.Add(-time.Minute).Format("2006-01-02 15:04")); err != nil {
 			t.Fatal(err)
 		}
-		ThreatRollupRewindTo(base.Add(-48 * time.Hour))
+		ThreatRollupRewindTo(base.Add(-200 * time.Hour))
 		if got, want := threatRollupWatermarkForTest(t), dFrom.Add(-time.Minute).Format("2006-01-02 15:04"); got != want {
 			t.Fatalf("clamped watermark=%q, want %q", got, want)
 		}
 	})
+}
+
+// seedThreatRollupCoveredWindow 写入「整窗已固化」的持久状态，供回退窗口
+// 测试隔离回填路径（只剩回退目标分钟需要重算）。
+func seedThreatRollupCoveredWindow(t *testing.T, base time.Time, hours int) time.Time {
+	t.Helper()
+	lastComplete := base.Add(-time.Minute).Truncate(time.Minute)
+	for key, value := range map[string]string{
+		threatRollupCoveredFromKey:     base.Add(-time.Duration(hours) * time.Hour).Format("2006-01-02 15:04"),
+		threatRollupWatermarkKey:       lastComplete.Add(-time.Minute).Format("2006-01-02 15:04"),
+		threatRollupTargetReadyKey:     lastComplete.Format("2006-01-02 15:04"),
+		threatRollupGeoIPGenerationKey: fmt.Sprintf("%d", services.GeoIPDataGeneration()),
+	} {
+		if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return lastComplete
+}
+
+// Given 重启后 requestedHours=0、7d 覆盖已固化。
+// When 48h 前积压事件提交触发回退。
+// Then 回退目标不得被默认 24h 钳制，宽窗重固后计数恰为 1。
+func TestThreatRollupRewindTo_defaultCoversSevenDays(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	base := time.Date(2026, 10, 18, 12, 0, 30, 0, time.UTC)
+	installThreatClock(t, base)
+	threatRollupRequestedHours.Store(0)
+	t.Cleanup(func() { threatRollupRequestedHours.Store(0) })
+	seedThreatRollupCoveredWindow(t, base, 24*7)
+
+	eventTime := base.Add(-48 * time.Hour)
+	eventMinute := eventTime.Truncate(time.Minute)
+	seedThreatScreenEvent(t, eventTime.Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	if err := ensureThreatRollup(24 * 7); err != nil {
+		t.Fatal(err)
+	}
+	if got := threatRollupCountForMinute(t, eventMinute.Format("2006-01-02 15:04")); got != 0 {
+		t.Fatalf("前提失效：未回退时积压分钟 count=%d, want 0", got)
+	}
+
+	ThreatRollupRewindTo(eventTime)
+	wantWatermark := eventMinute.Add(-time.Minute).Format("2006-01-02 15:04")
+	if got := threatRollupWatermarkForTest(t); got != wantWatermark {
+		t.Fatalf("watermark=%q, want %q（7d 默认窗口不得钳到 24h）", got, wantWatermark)
+	}
+	for range 4 {
+		if err := ensureThreatRollup(24 * 7); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := threatRollupCountForMinute(t, eventMinute.Format("2006-01-02 15:04")); got != 1 {
+		t.Fatalf("积压分钟 count=%d, want 1", got)
+	}
+	if err := ensureThreatRollup(24 * 7); err != nil {
+		t.Fatal(err)
+	}
+	if got := threatRollupCountForMinute(t, eventMinute.Format("2006-01-02 15:04")); got != 1 {
+		t.Fatalf("重复固化后 count=%d, want 1（幂等去重）", got)
+	}
+}
+
+// Given 7d 覆盖已固化、48h 前积压事件触发回退。
+// When 随后一个窄窗（24h）请求执行固化。
+// Then 窄窗不得把回退目标当作陈旧水位重置并吞掉 48h 分钟。
+func TestThreatRollupRewindTo_narrowEnsureDoesNotSwallowRewind(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	base := time.Date(2026, 10, 18, 12, 0, 30, 0, time.UTC)
+	installThreatClock(t, base)
+	threatRollupRequestedHours.Store(0)
+	t.Cleanup(func() { threatRollupRequestedHours.Store(0) })
+	seedThreatRollupCoveredWindow(t, base, 24*7)
+
+	eventTime := base.Add(-48 * time.Hour)
+	eventMinute := eventTime.Truncate(time.Minute)
+	seedThreatScreenEvent(t, eventTime.Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	ThreatRollupRewindTo(eventTime)
+
+	for range 4 {
+		if err := ensureThreatRollup(24); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := threatRollupCountForMinute(t, eventMinute.Format("2006-01-02 15:04")); got != 1 {
+		t.Fatalf("窄窗固化后积压分钟 count=%d, want 1（回退目标不得被吞）", got)
+	}
 }
 
 func TestThreatFixMinute_prunedRowsAndLateEventsAreAdditive(t *testing.T) {
@@ -1671,7 +1815,7 @@ func TestThreatFixMinute_prunedRowsAndLateEventsAreAdditive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := threatFixMinute(tx, minute); err != nil {
+	if err := threatFixMinuteWithMode(tx, minute, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -1686,7 +1830,7 @@ func TestThreatFixMinute_prunedRowsAndLateEventsAreAdditive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := threatFixMinute(tx, minute); err != nil {
+	if err := threatFixMinuteWithMode(tx, minute, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {

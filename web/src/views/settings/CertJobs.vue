@@ -120,16 +120,17 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { Timer } from '@element-plus/icons-vue'
 import { request, mfaAwareSuccess } from '@/utils/api'
+import { useLogTailPolling } from '@/composables/useLogTailPolling'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import { formatDate } from '@/utils/date'
 import { escapeHtml } from '@/utils/escape'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import type { APIResponse, CertJobsPage } from '@/types'
-import { certJobStatusLabel, certJobStatusTone, certJobRetryCooldown } from '@/utils/certJobStatus'
+import { certJobStatusLabel, certJobStatusTone, certJobRetryReady } from '@/utils/certJobStatus'
 import type { CertJobStatus } from '@/utils/certJobStatus'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
@@ -142,6 +143,7 @@ interface CertJob {
   message: string
   expires_at?: string | null
   updated_at?: string | null
+  retry_cooldown_seconds: number | null
   issuer?: string
   days_remaining: number
   certificate_status: CertificateStatus
@@ -170,13 +172,10 @@ const total = ref(0)
 const retryingJobIds = ref(new Set<number>())
 
 const logDialogVisible = ref(false)
-const logLoading = ref(false)
 const logContent = ref('')
 const currentJob = ref<CertJob | null>(null)
-let logRequestSeq = 0
 let lastLogErrorToastAt = 0
 const logContainerRef = ref<HTMLDivElement | null>(null)
-let logPollTimer: ReturnType<typeof setInterval> | null = null
 
 const logHtml = computed(() => {
   if (!logContent.value) return ''
@@ -187,35 +186,44 @@ const logHtml = computed(() => {
     .replace(/\[DEBUG\]/g, '<span style="color:#a855f7">$&</span>')
 })
 
-const scrollToBottom = async () => {
-  await nextTick()
-  if (disposed) return
-  if (logContainerRef.value) {
-    logContainerRef.value.scrollTop = logContainerRef.value.scrollHeight
-  }
-}
+// A85WA-历史问题：日志尾轮询收敛 useLogTailPolling 单源（后台标签页暂停/单飞/会话
+// 序号作废/滚底统一）；30s 节流错误 toast（历史问题 D-N5）保留在 onError。
+const logTail = useLogTailPolling({
+  interval: 3000,
+  content: logContent,
+  container: logContainerRef,
+  isActive: () => !disposed && logDialogVisible.value && currentJob.value !== null,
+  fetch: async () => {
+    const job = currentJob.value
+    if (!job) return null
+    const res = await request.get<APIResponse<{ content: string }>>(`/certificates/jobs/${job.id}/logs`, { signal: jobsPolling.signal, silent: true })
+    if (disposed || currentJob.value?.id !== job.id) return null
+    return res.data?.content || ''
+  },
+  onError: (error) => {
+    if (disposed) return
+    console.error('Failed to fetch cert job logs:', error)
+    // 历史问题 D-N5：toast 节流（对齐 usePollingErrorState 的 30s 语义）——弹窗内
+    // 3s 轮询持续失败时不再每 tick 叠加一条「获取日志失败」刷屏。
+    const now = Date.now()
+    if (now - lastLogErrorToastAt > 30_000) {
+      lastLogErrorToastAt = now
+      ElMessage.error('获取日志失败')
+    }
+  },
+})
+const logLoading = logTail.loading
 
 const statusType = (status: CertJobStatus) => certJobStatusTone(status)
 
-const retryCooldownMinutes = (status: CertJobStatus): number | null => certJobRetryCooldown(status)
-
-const canRetry = (row: CertJob): boolean => {
-  const cooldownMinutes = retryCooldownMinutes(row.status)
-  if (cooldownMinutes === null) return false
-  if (cooldownMinutes === 0) return true
-  const updatedAtValue = row.updated_at
-  if (!updatedAtValue) return true
-  const updatedAt = new Date(updatedAtValue).getTime()
-  if (Number.isNaN(updatedAt)) return true
-  return Date.now() - updatedAt >= cooldownMinutes * 60 * 1000
-}
+const canRetry = (row: CertJob): boolean =>
+  certJobRetryReady(row.retry_cooldown_seconds, row.updated_at)
 
 const retryDisabledReason = (row: CertJob): string => {
   if (isReadOnly.value) return authStore.readOnlyMessage
   if (row.status === 'disabled') return '已禁用的任务无法重签'
   if (canRetry(row)) return ''
-  const cooldownMinutes = retryCooldownMinutes(row.status)
-  return `当前状态需等待 ${cooldownMinutes ?? 0} 分钟后重签`
+  return `当前状态需等待 ${Math.ceil((row.retry_cooldown_seconds ?? 0) / 60)} 分钟后重签`
 }
 
 const renewalInfo = (row: CertJob): { renewalDate?: string } => {
@@ -302,64 +310,25 @@ const retryJob = async (row: CertJob) => {
 }
 
 const viewLogs = async (row: CertJob) => {
-  logRequestSeq++
-  logLoading.value = false
+  logTail.invalidate()
   currentJob.value = row
   logDialogVisible.value = true
 }
 
-// 历史问题-F3：先同步装定时器再触发首拉——原 await 后才 startLogPolling，首拉慢于
-// 关闭时 @closed 已清 timer，随后续体又装上 3s 轮询（关闭后持续请求日志端点）。
+// 历史问题-F3：先同步装定时器再触发首拉（logTail.start 内部即此序）——原 await 后才
+// startLogPolling，首拉慢于关闭时 @closed 已清 timer，随后续体又装上 3s 轮询
+// （关闭后持续请求日志端点）。
 const onLogDialogOpened = (): void => {
-  startLogPolling()
-  void refreshLogs()
+  logTail.start()
 }
 
 const onLogDialogClosed = () => {
-  logRequestSeq++
-  stopLogPolling()
+  logTail.stop()
   currentJob.value = null
   logContent.value = ''
 }
 
-const startLogPolling = () => {
-  stopLogPolling()
-  logPollTimer = setInterval(refreshLogs, 3000)
-}
-
-const stopLogPolling = () => {
-  if (logPollTimer) {
-    clearInterval(logPollTimer)
-    logPollTimer = null
-  }
-}
-
-const refreshLogs = async () => {
-  // 后台标签页暂停轮询：定时器空转跳过，回到可见后的下一个 tick 立即补拉
-  if (disposed || document.hidden || !currentJob.value || logLoading.value) return
-  const jobId = currentJob.value.id
-  const requestSeq = ++logRequestSeq
-  logLoading.value = true
-  try {
-    const res = await request.get<APIResponse<{ content: string }>>(`/certificates/jobs/${jobId}/logs`, { signal: jobsPolling.signal, silent: true })
-    if (disposed || !logDialogVisible.value || currentJob.value?.id !== jobId || requestSeq !== logRequestSeq) return
-    logContent.value = res.data?.content || ''
-    await scrollToBottom()
-  } catch (error) {
-    if (!disposed && logDialogVisible.value && currentJob.value?.id === jobId && requestSeq === logRequestSeq) {
-      console.error('Failed to fetch cert job logs:', error)
-      // 历史问题 D-N5：toast 节流（对齐 usePollingErrorState 的 30s 语义）——弹窗内
-      // 3s 轮询持续失败时不再每 tick 叠加一条「获取日志失败」刷屏。
-      const now = Date.now()
-      if (now - lastLogErrorToastAt > 30_000) {
-        lastLogErrorToastAt = now
-        ElMessage.error('获取日志失败')
-      }
-    }
-  } finally {
-    if (!disposed && requestSeq === logRequestSeq) logLoading.value = false
-  }
-}
+const refreshLogs = async (): Promise<void> => logTail.refresh()
 
 const jobsPollingError = usePollingErrorState()
 const jobsPollingErrorDescription = computed(() => {
@@ -393,8 +362,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   disposed = true
-  logRequestSeq++
-  stopLogPolling()
+  logTail.stop()
 })
 </script>
 

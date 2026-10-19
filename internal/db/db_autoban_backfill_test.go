@@ -73,6 +73,11 @@ func TestInitialize_backfillsAutobanColumns(t *testing.T) {
 			if _, err := DB.Exec(tc.seed); err != nil {
 				t.Fatalf("seed: %v", err)
 			}
+			// 每轮重初始化前关闭上一轮主/metrics/audit 三个句柄；真实文件保留，
+			// 既验证重启回填路径，也避免前序连接泄漏到后续 14 轮。
+			if err := Close(); err != nil {
+				t.Fatalf("close before re-initialize: %v", err)
+			}
 			if err := Initialize(dir); err != nil {
 				t.Fatalf("re-initialize database: %v", err)
 			}

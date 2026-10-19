@@ -1061,6 +1061,56 @@ func TestRotateAuditLog_retriesPendingDeltaBeforeShifting(t *testing.T) {
 	}
 }
 
+func TestSecurityEventsPollOnce_reportsPersistentFailureAndRecovery(t *testing.T) {
+	// Given 可摄取日志与已装配指标库。
+	dataDir := t.TempDir()
+	if err := db.Initialize(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitializeMetricsDB(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	metricsDB := db.MetricsDB
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	offsetPath := filepath.Join(dir, "security_events.offset")
+	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldAuditLog, oldAuditOffset := auditLogPath, securityEventsOffsetPath
+	auditLogPath, securityEventsOffsetPath = logPath, offsetPath
+	resetSecurityEventsPollState(t)
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
+	t.Cleanup(func() {
+		db.MetricsDB = metricsDB
+		auditLogPath, securityEventsOffsetPath = oldAuditLog, oldAuditOffset
+		SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
+	})
+
+	// When 指标库暂时不可用导致连续 tick 失败。
+	db.MetricsDB = nil
+	for range securityEventsIngestionFailureThreshold {
+		SecurityEventsPollOnce()
+	}
+	status := SecurityEventsIngestionHealthSnapshot()
+	if !status.Observed || status.Healthy || status.ConsecutiveFailures != securityEventsIngestionFailureThreshold {
+		t.Fatalf("失败健康快照=%+v, want observed+unhealthy+%d failures", status, securityEventsIngestionFailureThreshold)
+	}
+	if status.LastError == "" || status.LastErrorAt == "" {
+		t.Fatalf("失败快照缺错误/时间: %+v", status)
+	}
+
+	// Then 指标库恢复后的成功轮清除连续失败并记录成功时间。
+	db.MetricsDB = metricsDB
+	if got := SecurityEventsPollOnce(); got != 1 {
+		t.Fatalf("恢复后摄取=%d, want 1", got)
+	}
+	status = SecurityEventsIngestionHealthSnapshot()
+	if !status.Healthy || status.ConsecutiveFailures != 0 || status.LastSuccessAt == "" {
+		t.Fatalf("恢复健康快照=%+v, want healthy+0 failures+last_success", status)
+	}
+}
+
 func TestSecurityEventsPollOnce_returnsCountWithoutWritingTaskLog(t *testing.T) {
 	// Given：一条可摄取事务与空任务日志目录。
 	dataDir := t.TempDir()
@@ -1282,6 +1332,49 @@ func TestRotateAuditLog_recoversCrossBoundaryTransaction(t *testing.T) {
 	}
 }
 
+func TestRotateAuditLog_pendingMarkerReadFailurePreservesArchives(t *testing.T) {
+	// Given an unreadable pending marker, a live file ready to rotate, and an
+	// existing .1 archive whose pending tail has not been proved ingested.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	oldLogPath, oldOffsetPath, oldSizeBytes := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes
+	auditLogPath = logPath
+	securityEventsOffsetPath = filepath.Join(dir, "security_events.offset")
+	auditLogSizeBytes = func() int64 { return 1 }
+	t.Cleanup(func() {
+		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes = oldLogPath, oldOffsetPath, oldSizeBytes
+	})
+	if err := os.WriteFile(logPath, []byte("live-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath+".1", []byte("pending-archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(securityEventsPendingDeltaPath(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// When the pending marker cannot be read.
+	rotateAuditLogIfNeeded()
+
+	// Then rotation must stop before shifting or replacing any archive.
+	for path, want := range map[string]string{
+		logPath:        "live-content",
+		logPath + ".1": "pending-archive",
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read preserved file %s: %v", path, err)
+		}
+		if string(got) != want {
+			t.Fatalf("%s=%q, want %q", path, got, want)
+		}
+	}
+	if _, err := os.Stat(logPath + ".2"); !os.IsNotExist(err) {
+		t.Fatalf(".1 must not shift to .2 while marker readability is unknown, stat err=%v", err)
+	}
+}
+
 func TestSecurityEventsPendingDeltaMarker_atomicWriteAndRead(t *testing.T) {
 	// Given：临时日志路径下的 pending 标记位置
 	dir := t.TempDir()
@@ -1299,7 +1392,10 @@ func TestSecurityEventsPendingDeltaMarker_atomicWriteAndRead(t *testing.T) {
 	if _, err := os.Stat(securityEventsPendingDeltaPath() + ".tmp"); !os.IsNotExist(err) {
 		t.Fatalf("tmp file must be cleaned up after atomic rename, stat err=%v", err)
 	}
-	got := securityEventsReadPendingDelta()
+	got, err := securityEventsReadPendingDelta()
+	if err != nil {
+		t.Fatalf("read pending marker: %v", err)
+	}
 	if got == nil || got.Path != p.Path || got.Offset != p.Offset || got.Size != p.Size {
 		t.Fatalf("read back=%+v, want %+v", got, p)
 	}
@@ -1307,7 +1403,11 @@ func TestSecurityEventsPendingDeltaMarker_atomicWriteAndRead(t *testing.T) {
 	if err := os.WriteFile(securityEventsPendingDeltaPath(), []byte(`{"path": "broken`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := securityEventsReadPendingDelta(); got != nil {
+	got, err = securityEventsReadPendingDelta()
+	if err != nil {
+		t.Fatalf("read corrupt pending marker: %v", err)
+	}
+	if got != nil {
 		t.Fatalf("corrupt marker must read as nil, got %+v", got)
 	}
 	if _, err := os.Stat(securityEventsPendingDeltaPath()); !os.IsNotExist(err) {
@@ -1776,6 +1876,11 @@ func securityEventsFixtureForRule(ruleID string) string {
 // customJSON/crsJSON 存储口径与生产一致：custom_rules JSON 持有 security_custom_rules
 // 的 DB 主键 id（emit id = DB id + 10000，见 emitCustomRules）。enabled=0 可模拟
 // 禁用策略（归因只加载启用策略）。
+type securityEventsAttrCRS struct {
+	ExcludedJSON     string
+	WAFCheckResponse int
+}
+
 func securityEventsSeedAttrPolicy(t *testing.T, ruleTriggered string, policies []struct {
 	id         int
 	name       string
@@ -1783,7 +1888,7 @@ func securityEventsSeedAttrPolicy(t *testing.T, ruleTriggered string, policies [
 	mode       string
 	customJSON string
 	crsJSON    string
-}) (int, string) {
+}, crs ...map[int]securityEventsAttrCRS) (int, string) {
 	t.Helper()
 	dataDir := t.TempDir()
 	if err := db.Initialize(dataDir); err != nil {
@@ -1803,6 +1908,19 @@ func securityEventsSeedAttrPolicy(t *testing.T, ruleTriggered string, policies [
 		if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,enabled,mode,custom_rules,crs_rule_groups) VALUES (?,?,?,?,?,?)`,
 			p.id, p.name, p.enabled, p.mode, p.customJSON, p.crsJSON); err != nil {
 			t.Fatal(err)
+		}
+		for _, setup := range crs {
+			cfg, ok := setup[p.id]
+			if !ok {
+				continue
+			}
+			excluded := cfg.ExcludedJSON
+			if excluded == "" {
+				excluded = "[]"
+			}
+			if _, err := db.DB.Exec(`UPDATE security_policies SET crs_excluded_rules=?, waf_check_response=? WHERE id=?`, excluded, cfg.WAFCheckResponse, p.id); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if _, err := db.DB.Exec(`INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES ('lb_rule1',?)`, p.id); err != nil {
 			t.Fatal(err)
@@ -2560,6 +2678,68 @@ func TestSecurityEventsEncodeBody_binaryTruncated(t *testing.T) {
 	}
 	if len(decoded) != securityEventsBodyCap {
 		t.Errorf("decoded len=%d, want exactly the 64KB raw cap", len(decoded))
+	}
+}
+
+func TestSecurityEventsSerializeHeaders_reservedMarkerIsWriterOnly(t *testing.T) {
+	headers := map[string][]string{
+		"Host":                {"a.example.com"},
+		"_lb_dropped_headers": {"999"},
+	}
+	got := securityEventsSerializeHeaders(headers)
+	var roundTrip map[string][]string
+	if err := json.Unmarshal([]byte(got), &roundTrip); err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	if _, ok := roundTrip["_lb_dropped_headers"]; ok {
+		t.Fatalf("客户端伪造的合成键不得入库: %s", got)
+	}
+	if len(roundTrip["Host"]) != 1 {
+		t.Fatalf("真实头必须保留: %s", got)
+	}
+
+	oversized := map[string][]string{
+		"Host":                {"a.example.com"},
+		"_lb_dropped_headers": {"999"},
+		"X-Big":               {strings.Repeat("B", securityEventsHeadersCap)},
+	}
+	got = securityEventsSerializeHeaders(oversized)
+	if err := json.Unmarshal([]byte(got), &roundTrip); err != nil {
+		t.Fatalf("serialize truncated: %v", err)
+	}
+	if values := roundTrip["_lb_dropped_headers"]; len(values) != 1 || values[0] != "1" {
+		t.Fatalf("丢弃计数只能由写侧产生: %v", roundTrip["_lb_dropped_headers"])
+	}
+}
+
+func TestSecurityEventsEncodeBody_escapesReservedTextPrefix(t *testing.T) {
+	for _, body := range []string{"base64:aGVsbG8=", "base64-truncated:abc", "utf8:plain"} {
+		if got, want := securityEventsEncodeBody(body), "utf8:"+body; got != want {
+			t.Errorf("encodeBody(%q)=%q, want %q", body, got, want)
+		}
+	}
+	oversized := "base64:" + strings.Repeat("a", securityEventsBodyCap)
+	got := securityEventsEncodeBody(oversized)
+	if !strings.HasPrefix(got, "utf8:base64:") || !strings.HasSuffix(got, "\n...[TRUNCATED]") {
+		t.Fatalf("超限保留前缀文本必须先转义再截断: %.40q", got)
+	}
+}
+
+func TestSecurityEventsParseTransaction_contextTypeSafety(t *testing.T) {
+	raw := `{"transaction":{"unix_timestamp":1754910200000000000,"id":"tx-ctx-safe","client_ip":"1.2.3.4","server_id":"go029.com","request":{"method":"POST","uri":"/login","headers":{"Host":["go029.com"],"_lb_dropped_headers":["999"]},"body":"base64:aGVsbG8="},"is_interrupted":false},"messages":[]}`
+	rec, err := securityEventsParseTransaction(json.RawMessage(raw))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if rec.RequestBody != "utf8:base64:aGVsbG8=" {
+		t.Fatalf("RequestBody=%q, want escaped text prefix", rec.RequestBody)
+	}
+	var headers map[string][]string
+	if err := json.Unmarshal([]byte(rec.RequestHeaders), &headers); err != nil {
+		t.Fatalf("headers JSON: %v", err)
+	}
+	if _, ok := headers["_lb_dropped_headers"]; ok {
+		t.Fatalf("reserved marker leaked into stored headers: %v", headers)
 	}
 }
 
@@ -3411,6 +3591,90 @@ func resetSecurityEventsPollState(t *testing.T) {
 	})
 }
 
+// Given 首绑定策略排除了 949/959 评估规则，后续绑定策略未排除。
+// When 摄取该评估规则事件。
+// Then 排除项不认领，事件归未排除策略；合法兄弟规则与无排除回归保持首绑定。
+func TestSecurityEventsAttribution_CRSExcludedRulesSkipFirstBinding(t *testing.T) {
+	type policySeed = struct {
+		id         int
+		name       string
+		enabled    int
+		mode       string
+		customJSON string
+		crsJSON    string
+	}
+	cases := []struct {
+		name       string
+		rule       string
+		excluded   string
+		wafCheck   int
+		second     bool
+		wantPolicy int
+	}{
+		{name: "949 exact", rule: "949110", excluded: `["949110"]`, second: true, wantPolicy: 2},
+		{name: "949 group", rule: "949110", excluded: `[{"target":"49","scope":"all"}]`, second: true, wantPolicy: 2},
+		{name: "949 regression no exclusion", rule: "949110", excluded: `[]`, second: true, wantPolicy: 1},
+		{name: "959 exact", rule: "959100", excluded: `["959100"]`, wafCheck: 1, second: true, wantPolicy: 2},
+		{name: "959 sibling still owned", rule: "959110", excluded: `["959100"]`, wafCheck: 1, second: true, wantPolicy: 1},
+		{name: "excluded only binding keeps attribution", rule: "949110", excluded: `["949110"]`, wantPolicy: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			policies := []policySeed{
+				{id: 1, name: "policy-A", enabled: 1, mode: "blocking", customJSON: `[]`, crsJSON: `[]`},
+			}
+			crs := map[int]securityEventsAttrCRS{
+				1: {ExcludedJSON: tc.excluded, WAFCheckResponse: tc.wafCheck},
+			}
+			if tc.second {
+				policies = append(policies, policySeed{id: 2, name: "policy-B", enabled: 1, mode: "blocking", customJSON: `[]`, crsJSON: `[]`})
+				crs[2] = securityEventsAttrCRS{ExcludedJSON: `[]`, WAFCheckResponse: tc.wafCheck}
+			}
+			pid, _ := securityEventsSeedAttrPolicy(t, tc.rule, policies, crs)
+			if pid != tc.wantPolicy {
+				t.Fatalf("attribution policy=%d, want %d", pid, tc.wantPolicy)
+			}
+		})
+	}
+}
+
+// Given 排除条目的作用域/目标形态矩阵。
+// When 判定事件规则是否被排除。
+// Then 只排除真实发射面：ip/list 精确命中、组号/ID/文件名/区间，901 与畸形目标不生效。
+func TestSecurityEventsCRSExclusionMatcher_shapes(t *testing.T) {
+	build := func(raw string, lists map[int64][]string) securityEventsPolicyCRSExclusions {
+		return securityEventsPolicyCRSExclusions{entries: ParseCRSExcludedRules(raw), lists: lists}
+	}
+	cases := []struct {
+		name    string
+		set     securityEventsPolicyCRSExclusions
+		rule    string
+		ip      string
+		removed bool
+	}{
+		{name: "ip scope hit", set: build(`[{"target":"949110","scope":"ip","ips":"198.51.100.9"}]`, nil), rule: "949110", ip: "198.51.100.9", removed: true},
+		{name: "ip scope miss", set: build(`[{"target":"949110","scope":"ip","ips":"198.51.100.9"}]`, nil), rule: "949110", ip: "198.51.100.10"},
+		{name: "list scope hit", set: build(`[{"target":"949110","scope":"list","listRefs":[7]}]`, map[int64][]string{7: {"203.0.113.0/24"}}), rule: "949110", ip: "203.0.113.7", removed: true},
+		{name: "list scope miss", set: build(`[{"target":"949110","scope":"list","listRefs":[7]}]`, map[int64][]string{7: {"203.0.113.0/24"}}), rule: "949110", ip: "198.51.100.7"},
+		{name: "scoped file target ignored", set: build(`[{"target":"REQUEST-942-APPLICATION-ATTACK-SQLI.conf","scope":"ip","ips":"198.51.100.9"}]`, nil), rule: "942100", ip: "198.51.100.9"},
+		{name: "group", set: build(`[{"target":"49","scope":"all"}]`, nil), rule: "949110", removed: true},
+		{name: "filename range", set: build(`["REQUEST-942-APPLICATION-ATTACK-SQLI.conf"]`, nil), rule: "942100", removed: true},
+		{name: "numeric range", set: build(`["941000-941999"]`, nil), rule: "941100", removed: true},
+		{name: "range miss", set: build(`["941000-941999"]`, nil), rule: "942100"},
+		{name: "901 init skipped", set: build(`["901100"]`, nil), rule: "901100"},
+		{name: "invalid target", set: build(`["999999999"]`, nil), rule: "942100"},
+		{name: "unknown scope treated all", set: build(`[{"target":"949110","scope":"bogus"}]`, nil), rule: "949110", removed: true},
+		{name: "non CRS rule", set: build(`["949110"]`, nil), rule: "10003"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := securityEventsCRSExclusionRemovesRule(tc.set, tc.rule, tc.ip); got != tc.removed {
+				t.Fatalf("removed=%v, want %v", got, tc.removed)
+			}
+		})
+	}
+}
+
 // TestSecurityEventsPolicyContainsRule_leadingZeroRuleIDGroupDecode（SEC-历史问题，
 // 历史）：ruleTriggered 前导零等畸形串（Atoi 可解析入 900000-999999
 // 区间但长度≠6）的组号解码防御——7 位串 "0942100" 的 [1:3] 切片错位切出
@@ -3485,6 +3749,89 @@ func autobanCountForTest(ip string) int {
 		return w.Count
 	}
 	return 0
+}
+
+// securityEventsLoggedRuleFixture 生成一条非中断（logged）事务，并用
+// X-LB-Rule-ID 固定归属规则；时间取当前时钟以通过自动封禁窗口。
+func securityEventsLoggedRuleFixture(txID, ip, ruleCaddyID string) string {
+	now := time.Now().UTC()
+	fixture := securityEvents历史Fixture(txID, ip, "/trust")
+	fixture = strings.Replace(fixture, `"timestamp": "2026/08/11 19:16:57"`, fmt.Sprintf(`"timestamp": %q`, now.Format("2006/01/02 15:04:05")), 1)
+	fixture = strings.Replace(fixture, "1786447017841320426", fmt.Sprintf("%d", now.UnixNano()), 1)
+	fixture = strings.Replace(fixture, `"is_interrupted": true`, `"is_interrupted": false`, 1)
+	fixture = strings.Replace(fixture, `"headers": { "host": ["go029.com"] }`, fmt.Sprintf(`"headers": { "host": ["go029.com"], "X-LB-Rule-ID": [%q] }`, ruleCaddyID), 1)
+	return fixture
+}
+
+// Given 信任策略的 inline/引用的信任 IP 收到下游 logged 事件。
+// When 事件提交后喂入自动封禁。
+// Then 仅该规则绑定的信任 IP 被排除；其他规则、未保留检测策略与 blocked 事件照常计数。
+func TestSecurityEventsAutoban_excludesRuleTrustLoggedEvents(t *testing.T) {
+	installSecurityEventsAutobanFixture(t)
+	setAutobanConfigRaw(t, true, 1, 60, "1h", "all", false)
+	listID := seedIPList(t, "信任引用", `[{"value":"203.0.113.78"}]`)
+
+	for _, rule := range []struct{ caddyID, domain string }{
+		{"lb_trust", "trust.example.com"},
+		{"lb_trust_ref", "trust-ref.example.com"},
+		{"lb_trust_off", "trust-off.example.com"},
+		{"lb_other", "other.example.com"},
+	} {
+		if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES (?,?, 'http', ?, 443, 1)`, rule.caddyID, rule.caddyID, rule.domain); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_policies
+		(id,name,enabled,mode,ip_whitelist_enabled,ip_whitelist,policy_type,trust_detection)
+		VALUES (1,'p-inline',1,'off',1,'["203.0.113.77"]','stage0',1),
+		       (2,'p-other',1,'blocking',0,'[]','stage3',0),
+		       (3,'p-ref',1,'blocking',1,'[]','mixed',0),
+		       (4,'p-passthrough',1,'off',1,'["203.0.113.79"]','stage0',0)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE security_policies SET ip_whitelist_refs=? WHERE id=3`, fmt.Sprintf(`[%d]`, listID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES
+		('lb_trust',1),('lb_trust_ref',3),('lb_trust_off',4),('lb_other',2)`); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	offsetPath := filepath.Join(dir, "security_events.offset")
+	docs := []string{
+		securityEventsLoggedRuleFixture("tx-trust-inline", "203.0.113.77", "lb_trust"),
+		securityEventsLoggedRuleFixture("tx-trust-ref", "203.0.113.78", "lb_trust_ref"),
+		securityEventsLoggedRuleFixture("tx-trust-off", "203.0.113.79", "lb_trust_off"),
+		securityEventsLoggedRuleFixture("tx-untrusted", "203.0.113.80", "lb_trust"),
+		securityEventsLoggedRuleFixture("tx-other-rule", "203.0.113.77", "lb_other"),
+		strings.Replace(securityEventsLoggedRuleFixture("tx-trust-blocked", "203.0.113.77", "lb_trust"), `"is_interrupted": false`, `"is_interrupted": true`, 1),
+		securityEventsLoggedRuleFixture("tx-trust-deleted-rule", "203.0.113.77", "lb_deleted"),
+		securityEventsLoggedRuleFixture("tx-untrusted-deleted-rule", "203.0.113.81", "lb_deleted"),
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Join(docs, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := securityEventsNewTailer(logPath, offsetPath).securityEventsTick(); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	if got := autobanCountForTest("203.0.113.77"); got != 2 {
+		t.Fatalf("inline trust IP count=%d, want 2（其他规则 logged + 本规则 blocked）", got)
+	}
+	if got := autobanCountForTest("203.0.113.78"); got != 0 {
+		t.Fatalf("引用信任 IP count=%d, want 0（引用名单并集必须生效）", got)
+	}
+	if got := autobanCountForTest("203.0.113.79"); got != 1 {
+		t.Fatalf("直通策略 drift logged count=%d, want 1（无保留检测不发射信任事件）", got)
+	}
+	if got := autobanCountForTest("203.0.113.80"); got != 1 {
+		t.Fatalf("未信任 IP count=%d, want 1", got)
+	}
+	if got := autobanCountForTest("203.0.113.81"); got != 1 {
+		t.Fatalf("未信任 IP（已删除规则）count=%d, want 1", got)
+	}
 }
 
 func TestSecurityEventsIngest_duplicateTransactionNotFedToAutoban(t *testing.T) {

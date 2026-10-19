@@ -136,40 +136,29 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 			}
 		}
 	}
-	// 分段平均处理耗时（2026-09-27 用户裁定）：security_events.duration_us 按
-	// 预检/WAF 段分桶平均（摄取管道已按规则归属选段值——预检事件=纯预检耗时,
-	// WAF 事件=隔离预检后的 WAF 耗时）。24h 窗口对齐计数口径;duration_us>0 过滤
-	// 历史行/未命中行;高并发下 GROUP BY 走 idx_security_events_rule+time 索引。
+	// 分段平均处理耗时：预检段使用全部正 precheck_us 快照（含 WAF 事件）；
+	// WAF 段只使用非预检事件的正 duration_us。两个分桶共用
+	// Stage1PrecheckSegmentSQL，避免 SQL 选值与 Go 分组谓词分叉；升级前
+	// precheck_us=0 的存量行不进入任何均值样本。
 	preAvg, preCnt, wafAvg, wafCnt := 0.0, 0, 0.0, 0
-	// 预检平均用 precheck_us 全样本(含 WAF 事件的预检快照,样本更大更准);
-	// WAF 平均只用 WAF 段事件的 duration_us(已隔离预检开销)。
-	stageTimingSQL := fmt.Sprintf(`SELECT rule_triggered, AVG(CASE WHEN %s THEN precheck_us ELSE duration_us END), COUNT(*) FROM security_events WHERE rule_caddy_id=? AND event_time >= datetime('now','-1 day') AND duration_us > 0 GROUP BY rule_triggered`, services.Stage1PrecheckSegmentSQL)
-	if trows, terr := db.MetricsDB.Query(stageTimingSQL, ruleCaddyID); terr == nil {
-		for trows.Next() {
-			var triggered string
-			var avg float64
-			var cnt int
-			if serr := trows.Scan(&triggered, &avg, &cnt); serr != nil {
-				break
-			}
-			if n, cerr := strconv.Atoi(triggered); cerr == nil && services.IsStage1PrecheckID(n) {
-				preAvg = (preAvg*float64(preCnt) + avg*float64(cnt)) / float64(preCnt+cnt)
-				preCnt += cnt
-			} else {
-				wafAvg = (wafAvg*float64(wafCnt) + avg*float64(cnt)) / float64(wafCnt+cnt)
-				wafCnt += cnt
-			}
-		}
-		// SEC-历史问题（历史）：分段耗时迭代失败不再静默——与 历史问题 查询失败
-		// 同待遇记 warn（耗时为增强信息，响应仍 200，已收样本保留）。
-		if err := trows.Err(); err != nil {
-			services.Logf("warn", "stage-stats timing rows iteration failed for %s: %v", ruleCaddyID, err)
-		}
-		trows.Close()
-	} else {
-		// 历史 历史问题:查询失败不再静默——留 warn 便于排查(响应仍 200,
-		// 耗时为增强信息,与计数/429 的 500 纪律不同——已声明口径)
+	stageTimingSQL := fmt.Sprintf(`SELECT
+		AVG(CASE WHEN precheck_us > 0 THEN precheck_us END),
+		SUM(CASE WHEN precheck_us > 0 THEN 1 ELSE 0 END),
+		AVG(CASE WHEN duration_us > 0 THEN CASE WHEN %s THEN NULL ELSE duration_us END END),
+		SUM(CASE WHEN duration_us > 0 THEN CASE WHEN %s THEN 0 ELSE 1 END ELSE 0 END)
+		FROM security_events
+		WHERE rule_caddy_id=? AND event_time >= datetime('now','-1 day')`, services.Stage1PrecheckSegmentSQL, services.Stage1PrecheckSegmentSQL)
+	var preAverage, wafAverage sql.NullFloat64
+	if terr := db.MetricsDB.QueryRow(stageTimingSQL, ruleCaddyID).Scan(&preAverage, &preCnt, &wafAverage, &wafCnt); terr != nil {
+		// 耗时为增强信息：查询失败留 warn，响应仍返回其余已取数据。
 		services.Logf("warn", "stage-stats timing query failed for %s: %v", ruleCaddyID, terr)
+	} else {
+		if preAverage.Valid {
+			preAvg = preAverage.Float64
+		}
+		if wafAverage.Valid {
+			wafAvg = wafAverage.Float64
+		}
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
 		"stage1_blocked_24h":      stage1,
@@ -216,6 +205,22 @@ func resetSecurityOverviewAggCacheForTest() {
 	securityOverviewAggCacheMu.Lock()
 	securityOverviewAggCache = map[securityOverviewAggCacheKey]securityOverviewAggCacheEntry{}
 	securityOverviewAggCacheMu.Unlock()
+}
+
+// threatRawCoverageStart 返回原始事件表最早事件时间（空表=""）。总览与
+// 威胁大屏共用同一覆盖事实，避免保留期/行帽裁剪后的披露口径分叉。
+func threatRawCoverageStart(database *sql.DB) (string, error) {
+	var earliest string
+	err := database.QueryRow(`SELECT COALESCE(MIN(event_time),'') FROM security_events`).Scan(&earliest)
+	return earliest, err
+}
+
+// securityOverviewResponse 在不改变公共 SecurityOverview 模型的前提下，为
+// 原始表直读的近 7 天卡片附带覆盖披露；nil metrics 的零面板也保持同键。
+type securityOverviewResponse struct {
+	models.SecurityOverview
+	RawCoverageFrom    string `json:"raw_coverage_from"`
+	BackfillIncomplete bool   `json:"backfill_incomplete"`
 }
 
 // loadSecurityOverviewAggregates 计算（或命中缓存）近 7 天聚合。错误不缓存、

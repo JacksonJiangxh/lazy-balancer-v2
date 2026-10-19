@@ -26,6 +26,7 @@ func newIPListRouter(t *testing.T) *gin.Engine {
 	router := gin.New()
 	router.GET("/security/ip-lists", h.ListIPLists)
 	router.POST("/security/ip-lists", h.CreateIPList)
+	router.GET("/security/ip-lists/:id", h.GetIPList)
 	router.PUT("/security/ip-lists/:id", h.UpdateIPList)
 	router.DELETE("/security/ip-lists/:id", h.DeleteIPList)
 	router.POST("/security/ip-lists/:id/ips", h.AddIPToList)
@@ -218,6 +219,65 @@ func TestCreateIPList_globalCountLimit(t *testing.T) {
 	rec := postJSON(t, router, "/security/ip-lists", map[string]any{"name": "第201个", "entries": "[]"})
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "上限") {
 		t.Fatalf("status=%d body=%s, want 400 上限", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRemoveIPFromList_rejectsNonCanonicalIDs(t *testing.T) {
+	for _, id := range []string{"5.0", "%205", "abc", "0", "-1"} {
+		t.Run(id, func(t *testing.T) {
+			setupSecurityPolicyTestDB(t)
+			router := newIPListRouter(t)
+			if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (id,name,entries) VALUES (5,'ids','[{"value":"203.0.113.8","remark":""}]')`); err != nil {
+				t.Fatal(err)
+			}
+			response := postJSON(t, router, "/security/ip-lists/"+id+"/remove-ip", map[string]any{"value": "203.0.113.8"})
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("id %q status=%d body=%s, want canonical-id 400", id, response.Code, response.Body.String())
+			}
+		})
+	}
+
+	// 回归：规范十进制 ID 正常移除。
+	setupSecurityPolicyTestDB(t)
+	router := newIPListRouter(t)
+	if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (id,name,entries) VALUES (5,'ids','[{"value":"203.0.113.8","remark":""}]')`); err != nil {
+		t.Fatal(err)
+	}
+	response := postJSON(t, router, "/security/ip-lists/5/remove-ip", map[string]any{"value": "203.0.113.8"})
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"removed":true`) {
+		t.Fatalf("canonical id status=%d body=%s, want successful removal", response.Code, response.Body.String())
+	}
+}
+
+func TestIPListHandlers_emptyEntriesAreNormalized(t *testing.T) {
+	for _, operation := range []string{"get", "update", "add", "remove"} {
+		t.Run(operation, func(t *testing.T) {
+			setupSecurityPolicyTestDB(t)
+			router := newIPListRouter(t)
+			if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (id,name,entries) VALUES (5,'empty','')`); err != nil {
+				t.Fatal(err)
+			}
+			var response *httptest.ResponseRecorder
+			switch operation {
+			case "get":
+				response = getRequest(t, router, "/security/ip-lists/5")
+			case "update":
+				response = putJSON(t, router, "/security/ip-lists/5", map[string]any{"description": "changed"})
+			case "add":
+				response = postJSON(t, router, "/security/ip-lists/5/ips", map[string]any{"value": "203.0.113.8"})
+			case "remove":
+				response = postJSON(t, router, "/security/ip-lists/5/remove-ip", map[string]any{"value": "203.0.113.8"})
+			}
+			if response.Code != http.StatusOK {
+				t.Fatalf("%s empty entries status=%d body=%s, want normalized 200", operation, response.Code, response.Body.String())
+			}
+			if operation == "get" && (!strings.Contains(response.Body.String(), `"entries":[]`) || !strings.Contains(response.Body.String(), `"entry_count":0`)) {
+				t.Fatalf("get empty entries body=%s, want []/0", response.Body.String())
+			}
+			if operation == "remove" && !strings.Contains(response.Body.String(), `"removed":false`) {
+				t.Fatalf("remove empty entries body=%s, want idempotent removed=false", response.Body.String())
+			}
+		})
 	}
 }
 

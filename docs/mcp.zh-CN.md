@@ -2,7 +2,7 @@
 
 ## 概述
 
-Lazy Balancer V2 内置 **Model Context Protocol (MCP)** 服务，AI 代理可通过 136 个工具操作全部功能。
+Lazy Balancer V2 内置 **Model Context Protocol (MCP)** 服务，AI 代理可通过 136 个工具操作全部主要功能。少数聚合/只读便利端点仅经 REST API 提供，见文末「仅 REST 可用的端点」。
 
 ## 接入
 
@@ -84,3 +84,17 @@ lazy-balancer://docs/ops-playbook
 | 413 | 请求体超过 1 MiB |
 | 401 | API Key 无效 |
 | 403 | MCP 未启用 / IP 不在白名单 / 只读 Key 调写工具 ；非 admin 属主的写工具 403；从节点非集群写工具 403 |
+
+## 仅 REST 可用的端点
+
+以下聚合/只读便利端点暂无对应 MCP 工具，需要时经 REST API（`http://<host>:8000/api/v1`，同一 API Key 认证）访问：
+
+| 端点 | 说明 |
+|---|---|
+| `GET /caddy/metrics` | Caddy 进程级聚合指标（Prometheus 解析结果） |
+| `GET /caddy/host-metrics` | 按域名（host）维度的请求数/状态码/流量指标 |
+| `GET /logs/stats` | 日志文件大小与保留统计 |
+| `POST /rules/cert-info` | 按域名批量查询规则关联证书信息 |
+| `POST /certificates/jobs/current` | 查询当前进行中的证书签发任务 |
+| `GET /audit-logs/options` | 审计日志筛选下拉选项 |
+| `GET /security/crs/setup` | CRS 全局配置（crs-setup 摘要） |

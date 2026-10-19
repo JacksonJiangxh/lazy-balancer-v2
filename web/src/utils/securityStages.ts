@@ -628,8 +628,9 @@ const rateLimitDetailCaption = (rps: number, burst: number): string =>
     : `1s 窗口上限 ${rps} 次`
 
 // 原生 JSON（/security/rules/:id/policy 的 RawMessage 字段）→ 数字 id 数组
-//（兼容对象形态 [{id:…}]，与 SecurityPolicies.parseCustomRuleIds 同守卫）
-const parseUnknownIds = (raw: unknown): number[] => {
+//（兼容对象形态 [{id:…}]；A85WB-历史问题 起导出为单源——SecurityPolicies 的
+// custom_rules 文本解析 JSON.parse 后同样走本守卫，不再各持一份同构实现）
+export const parseUnknownIds = (raw: unknown): number[] => {
   if (!Array.isArray(raw)) return []
   return raw.map((item) => {
     if (typeof item === 'number') return item

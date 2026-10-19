@@ -4,9 +4,11 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createSSRApp, h } from 'vue'
+import { renderToString } from 'vue/server-renderer'
 
 import { createLazyLoader } from '../src/utils/lazyOnce.ts'
-import { usePollingTask } from '../src/composables/usePollingTask.ts'
+import { usePollingTask, type PollingTask } from '../src/composables/usePollingTask.ts'
 import { createSessionSingleFlight } from '../src/utils/sessionSingleFlight.ts'
 
 test('暂停轮询：中止在途任务信号、作废旧结果，恢复后用新信号（历史问题）', async () => {
@@ -15,15 +17,23 @@ test('暂停轮询：中止在途任务信号、作废旧结果，恢复后用�
   const signals: AbortSignal[] = []
   let staleCurrent: boolean | null = null
   let calls = 0
-  const polling = usePollingTask(async ({ signal, isCurrent }) => {
-    calls++
-    signals.push(signal)
-    if (calls === 1) {
-      started.resolve()
-      await gate.promise
-      staleCurrent = isCurrent()
-    }
-  })
+  // A85WT-历史问题：usePollingTask 内部 onUnmounted 需要活跃组件实例——经 SSR 渲染
+  // 提供真实实例上下文，不再以「无实例」状态触碰 Vue 生命周期（no-op 警告）。
+  let polling!: PollingTask
+  await renderToString(createSSRApp({
+    setup() {
+      polling = usePollingTask(async ({ signal, isCurrent }) => {
+        calls++
+        signals.push(signal)
+        if (calls === 1) {
+          started.resolve()
+          await gate.promise
+          staleCurrent = isCurrent()
+        }
+      })
+      return () => h('div')
+    },
+  }))
   const firstRun = polling.run()
   await started.promise
   polling.pause()

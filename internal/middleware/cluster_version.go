@@ -254,6 +254,16 @@ func isSynchronizedWrite(method, path string) bool {
 	if method == http.MethodGet && path == "/api/v1/auth/oidc/callback" {
 		return true
 	}
+	// SC-4 登录锁传播（历史 历史问题-3）：密码登录与 MFA 验证步都会写
+	// users 同步列——失败置锁 login_locked_until（auth.go recordLoginFailure /
+	// mfa.go 验证步同计一个账户级计数）、成功清零解锁。触发器不可用时若放行，
+	// 降级态真实置锁不 bump cluster_version，主节点锁状态无法随快照传播到
+	// 从节点（与 SC-4 语义冲突）——与 setup/OIDC 开户同口径 fail-closed。
+	// 票据登录（ticket-login）不写 users 同步列，不在此列（保全从节点登录
+	// 可用性）。
+	if method == http.MethodPost && (path == "/api/v1/auth/login" || path == "/api/v1/auth/mfa/verify") {
+		return true
+	}
 	if method != http.MethodPost && method != http.MethodPut && method != http.MethodPatch && method != http.MethodDelete {
 		return false
 	}

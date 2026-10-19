@@ -423,6 +423,14 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			return fmt.Errorf("TCP 重试时长/间隔必须在 0 到 60000 毫秒之间")
 		}
 	}
+	// A85历史问题-4：渲染侧要求「重试窗口 >0 时重试间隔必填」（HTTP
+	// buildHTTPHandleChain 与 TCP buildTCPProxyRoute 两处 <=0 显性报错），
+	// 字段门此前只拒负值/越界——duration>0 + interval=0 可通过保存门后在
+	// 事务渲染阶段失败，用户拿到「Caddy 配置应用失败」泛化 400。此处与渲染门
+	// 同文案前置，两协议同口径（负值仍由上方值域门先行点名）。
+	if input.TCPTryDuration > 0 && input.TCPTryInterval < 1 {
+		return fmt.Errorf("重试间隔必须大于 0（重试窗口 >0 时必填）")
+	}
 	if !input.CustomRoutesEnabled && len(input.PathRules) > 0 {
 		return fmt.Errorf("自定义路径规则未启用，不能提交路径规则")
 	}
@@ -881,18 +889,8 @@ func contextUserID(c *gin.Context) int64 {
 }
 
 // 历史 历史问题: 列表查询不加载 tls_cert/tls_key 正文，减少大字段 I/O。
-// 列顺序与 lbRuleColumns 完全一致，scanLbRules 无需修改。
-const lbRuleListColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE(description,''), protocol, COALESCE(domain,''), listen_port, COALESCE(strategy,''),
-	COALESCE(dynamic_dns,0), COALESCE(enable_dns_server,0), COALESCE(dns_server,''), COALESCE(dns_family,'ipv4'),
-	COALESCE(health_check_path,''), COALESCE(health_check_interval,10), COALESCE(health_check_timeout,2), COALESCE(health_check_unhealthy_threshold,3), COALESCE(health_check_healthy_threshold,2),
-	COALESCE(enable_active_health_check,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
-	COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0),
-	COALESCE(custom_routes_enabled,0),
-	COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
-	COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), '', '',
-	COALESCE(tls_http_redirect,0), COALESCE(enable_compress,0), COALESCE(compress_types,'gzip'), IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0),
-	created_by, created_at, updated_at, updated_by, COALESCE(host_header,''), COALESCE(health_check_host,''),
-	COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)`
+// 由完整投影派生两个空占位，列顺序与 lbRuleColumns 恒一致，scanLbRules 无需修改。
+var lbRuleListColumns = strings.Replace(lbRuleColumns, "COALESCE(tls_cert,''), COALESCE(tls_key,'')", "'', ''", 1)
 
 const lbRuleColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE(description,''), protocol, COALESCE(domain,''), listen_port, COALESCE(strategy,''),
 	COALESCE(dynamic_dns,0), COALESCE(enable_dns_server,0), COALESCE(dns_server,''), COALESCE(dns_family,'ipv4'),

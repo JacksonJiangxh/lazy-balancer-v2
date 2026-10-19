@@ -126,7 +126,10 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 		return
 	}
 	// 完整登录成功：清零登录失败计数与锁定（密码步未清零，见 Login 注释）。
-	_, _ = db.DB.Exec("UPDATE users SET login_failed_attempts=0, login_locked_until=NULL WHERE id=?", userID)
+	// 已验证的登录不因此撤销 JWT，但清零失败必须留痕，避免旧计数无声残留。
+	if _, err := db.DB.Exec("UPDATE users SET login_failed_attempts=0, login_locked_until=NULL WHERE id=?", userID); err != nil {
+		services.Logf("warn", "MFA 登录成功清零登录失败计数与锁定失败: user_id=%d: %v", userID, err)
+	}
 	h.respondLoginWithMFA(c, user, passwordVersion, time.Now().Unix(), true)
 }
 

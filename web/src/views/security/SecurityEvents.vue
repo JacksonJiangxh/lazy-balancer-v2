@@ -8,7 +8,9 @@
         </h2>
         <p class="page-desc">查看安全拦截与检测事件记录</p>
       </div>
-      <el-button :icon="Refresh" @click="fetchEvents">刷新</el-button>
+      <!-- A85WB-历史问题：刷新联动自动封禁状态卡——建议列表/今日封禁/名单数不再
+           停留在进入页面时的快照 -->
+      <el-button :icon="Refresh" @click="refreshPage">刷新</el-button>
     </div>
 
     <!-- 自动封禁状态卡（历史问题）：状态/口径/窗口/阈值/时长/今日封禁/名单数；
@@ -102,6 +104,9 @@
     </el-card>
 
     <el-card>
+      <div v-if="ingestionStatus.observed && !ingestionStatus.healthy" class="info-note-bar autoban-warn-bar">
+        <span class="info-note-desc">安全事件采集连续失败 {{ ingestionStatus.consecutive_failures }} 次{{ ingestionStatus.last_error ? `：${ingestionStatus.last_error}` : '' }}，事件数据可能滞后；请检查任务日志与审计日志目录。</span>
+      </div>
       <div class="table-toolbar">
         <el-date-picker
           v-model="filters.timeRange"
@@ -389,11 +394,11 @@ interface AutobanStatus {
   enabled: boolean; dry_run: boolean; threshold: number; window_minutes: number
   duration: string; scope: string; banned_today: number; list_entries: number
   // 历史问题-02：黄条判据 = 封禁是否真正生效（名单非空 ∧ 被启用+IP ACL 启用+deny 的
-  // 策略在 ip_acl_list_refs 引用）。list_referenced 为后端热路径资格门的四面
+  // 策略在 ip_acl_list_refs 引用）。后端 list_referenced 为热路径资格门的四面
   // 引用集（含白名单/受信代理/CRS 排除），不能区分「引用」与「拦截生效」——
-  // 仅保留为内部字段，不再驱动 UI。
+  // 纯后端内部字段，本卡不声明不消费（A85WB-历史问题 死字段移除）。
   ban_effective: boolean
-  list_referenced: boolean; suggestions: AutobanSuggestion[]
+  suggestions: AutobanSuggestion[]
   // 后端另有 running/last_run/last_status/role/tracked_ips（API 契约保留）——
   // 本卡零消费，不再声明（历史问题：声明即暗示已渲染）。
   is_master: boolean
@@ -410,7 +415,7 @@ const AUTOBAN_SCOPES = [
 
 const autobanStatus = ref<AutobanStatus>({
   enabled: false, dry_run: true, threshold: 100, window_minutes: 5, duration: '1h', scope: 'all',
-  banned_today: 0, list_entries: 0, list_referenced: true, ban_effective: true, suggestions: [],
+  banned_today: 0, list_entries: 0, ban_effective: true, suggestions: [],
   // 默认 false：成功响应前不得假定主节点可写（历史问题 失败关闭）
   is_master: false,
 })
@@ -642,6 +647,8 @@ const openTriggerDetail = (row: SecurityEvent): void => {
 
 const loading = ref(false)
 const events = ref<SecurityEvent[]>([])
+interface IngestionStatus { observed: boolean; healthy: boolean; consecutive_failures: number; last_error?: string; last_error_at?: string; last_success_at?: string }
+const ingestionStatus = ref<IngestionStatus>({ observed: false, healthy: false, consecutive_failures: 0 })
 
 // —— 请求上下文详情弹框（策略「记录请求体」开启后事件携带 request_headers/request_body）——
 const ctxDialogVisible = ref(false)
@@ -651,6 +658,7 @@ const ctxRevealed = ref<Set<string>>(new Set())
 
 const CTX_SENSITIVE_HEADERS = new Set(['cookie', 'authorization', 'set-cookie', 'proxy-authorization'])
 const CTX_TRUNCATED_SUFFIX = '\n...[TRUNCATED]'
+const CTX_UTF8_PREFIX = 'utf8:'
 const CTX_B64_TRUNCATED_PREFIX = 'base64-truncated:'
 const CTX_B64_PREFIX = 'base64:'
 
@@ -658,8 +666,8 @@ interface CtxHeaderRow { name: string; value: string; sensitive: boolean }
 interface CtxHeadersParsed { rows: CtxHeaderRow[]; dropped: number; failed: boolean }
 
 // 请求头解析："" → 空态；JSON.parse try/catch 防御（失败展示原始内容 + 错误说明）；
-// 合成键 _lb_dropped_headers: ["N"] 提取为信息行（N = 因 64KB 上限被丢弃的头数），不作为头行渲染；
-// 多值头以 ", " 连接
+// 合成键 _lb_dropped_headers 是写侧保留键（客户端同名头已在摄取侧剥离），
+// 提取为信息行（N = 因 64KB 上限被丢弃的头数），不作为头行渲染；多值头以 ", " 连接
 const ctxHeadersParsed = computed<CtxHeadersParsed>(() => {
   const raw = ctxEvent.value?.request_headers ?? ''
   if (raw === '') return { rows: [], dropped: 0, failed: false }
@@ -685,11 +693,19 @@ const ctxHeadersParsed = computed<CtxHeadersParsed>(() => {
 
 interface CtxBodyParsed { state: 'empty' | 'ok' | 'error'; text: string; truncated: boolean; binary: boolean }
 
-// 请求体解析：前缀检查顺序 base64-truncated: → base64: → 明文；base64 系 atob 解码
-//（失败回退原始内容 + error 态）；明文以 \n...[TRUNCATED] 结尾时剥离标记转为截断横幅
+// 请求体解析：utf8:（显式文本转义，必须先于 base64 判断）→ base64-truncated:
+// → base64: → 明文；base64 系 atob 解码（失败回退原始内容 + error 态）；
+// 明文以 \n...[TRUNCATED] 结尾时剥离标记转为截断横幅。
 const ctxBodyParsed = computed<CtxBodyParsed>(() => {
   const raw = ctxEvent.value?.request_body ?? ''
   if (raw === '') return { state: 'empty', text: '', truncated: false, binary: false }
+  if (raw.startsWith(CTX_UTF8_PREFIX)) {
+    const text = raw.slice(CTX_UTF8_PREFIX.length)
+    if (text.endsWith(CTX_TRUNCATED_SUFFIX)) {
+      return { state: 'ok', text: text.slice(0, -CTX_TRUNCATED_SUFFIX.length), truncated: true, binary: false }
+    }
+    return { state: 'ok', text, truncated: false, binary: false }
+  }
   if (raw.startsWith(CTX_B64_TRUNCATED_PREFIX)) return decodeCtxBody(raw.slice(CTX_B64_TRUNCATED_PREFIX.length), true)
   if (raw.startsWith(CTX_B64_PREFIX)) return decodeCtxBody(raw.slice(CTX_B64_PREFIX.length), false)
   if (raw.endsWith(CTX_TRUNCATED_SUFFIX)) {
@@ -819,10 +835,11 @@ const fetchEvents = async () => {
     if (filters.value.uri) p.set('uri', filters.value.uri)
     if (filters.value.timeRange?.[0]) p.set('start_time', filters.value.timeRange[0])
     if (filters.value.timeRange?.[1]) p.set('end_time', filters.value.timeRange[1])
-    const res = await request.get<APIResponse<{ events: SecurityEvent[]; total: number }>>(`/security/events?${p}`)
+    const res = await request.get<APIResponse<{ events: SecurityEvent[]; total: number; ingestion?: IngestionStatus }>>(`/security/events?${p}`)
     if (requestSeq !== fetchEventsSeq) return
     events.value = res.data?.events || []
     total.value = res.data?.total || 0
+    if (res.data?.ingestion) ingestionStatus.value = res.data.ingestion
     logStorageRefreshKey.value++
   } catch {
     // 历史问题 D-N5：瞬态失败保留末次成功数据（对齐 AuditLog 口径）——此前清空列表
@@ -836,6 +853,13 @@ onMounted(() => {
   fetchEvents()
   fetchAutobanStatus()
 })
+
+// A85WB-历史问题：页面刷新同时拉自动封禁状态（调度在后台持续运行，dry-run 建议
+// 列表/banned_today/list_entries 不作长期快照）。
+const refreshPage = (): void => {
+  void fetchEvents()
+  void fetchAutobanStatus()
+}
 </script>
 
 <style scoped>
@@ -934,7 +958,4 @@ onMounted(() => {
 :global(.autoban-confirm-box .el-message-box__container) { padding: 0 24px; }
 :global(.autoban-confirm-box .el-message-box__message) { display: block; padding: 4px 0 0; }
 :global(.autoban-confirm-box .el-message-box__btns) { padding: 18px 24px 20px 0; }
-.autoban-confirm-list { margin: 0; padding: 0; list-style: none; }
-.autoban-confirm-list li + li { margin-top: 4px; }
-.autoban-confirm-text { margin: 0; }
 </style>

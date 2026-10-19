@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -156,6 +157,46 @@ func TestMFAVerifyLogin_wrongCodeKeepsChallengeRetryable(t *testing.T) {
 	second := postMFAVerify(t, router, "retry-tok", correct)
 	if second.Code != http.StatusOK {
 		t.Fatalf("retry status=%d body=%s, want 200", second.Code, second.Body.String())
+	}
+}
+
+func TestMFAVerifyLogin_resetFailureIsLoggedWithoutRevokingJWT(t *testing.T) {
+	// Given 有效第二因子与旧失败计数；仅清零 login_* 两列的 UPDATE 被真实
+	// SQLite 触发器拒绝，其他登录读写保持正常。
+	secret, userID := seedMFAChallengeLoginFixture(t, "reset-log-tok", 0)
+	if _, err := db.DB.Exec(`UPDATE users SET login_failed_attempts=4 WHERE id=?`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`CREATE TRIGGER fail_login_reset
+		BEFORE UPDATE OF login_failed_attempts, login_locked_until ON users
+		BEGIN SELECT RAISE(FAIL, 'login reset blocked'); END`); err != nil {
+		t.Fatalf("create reset fault trigger: %v", err)
+	}
+	var logs strings.Builder
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
+	router := gin.New()
+	router.POST("/auth/mfa/verify", h.MFAVerifyLogin)
+
+	// When 第二因子登录成功，但收尾清零失败。
+	response := postMFAVerify(t, router, "reset-log-tok", currentTOTPCode(t, secret))
+
+	// Then 已验证的登录仍返回 JWT，旧计数未被静默当作清零，运行日志包含
+	// 明确 warn 与底层错误，便于排障。
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"token"`) {
+		t.Fatalf("verified login status=%d body=%s, want 200 with token", response.Code, response.Body.String())
+	}
+	var attempts int
+	if err := db.DB.QueryRow(`SELECT login_failed_attempts FROM users WHERE id=?`, userID).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 4 {
+		t.Fatalf("fault injection did not preserve old attempts: got %d, want 4", attempts)
+	}
+	if !strings.Contains(logs.String(), "MFA 登录成功清零登录失败计数与锁定失败") || !strings.Contains(logs.String(), "login reset blocked") {
+		t.Fatalf("missing reset failure warning, logs=%q", logs.String())
 	}
 }
 

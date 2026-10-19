@@ -531,6 +531,18 @@ func blockPageFooterHTML(text string) string {
 
 var urlLinkRe = regexp.MustCompile(`https?://(?:[^\s"'&]|&amp;)+`)
 
+type builtinBlockPageIdentity struct {
+	id      int
+	name    string
+	desc    string
+	variant string
+}
+
+var builtinBlockPageIdentities = []builtinBlockPageIdentity{
+	{9001, "限流拦截页面", "系统内置 429 限流拦截页面（备选，手动选用后生效）", "ratelimit"},
+	{9002, "系统维护页面", "系统内置维护页面（备选，手动选用后生效）", "maintenance"},
+}
+
 // SeedDefaultBlockPage re-renders the default block page row (is_default=1) from
 // branding.json，并对内置备选页（id 9001 限流/9002 维护，2026-09-25 用户裁定）
 // 播种+自愈——内容漂移或 is_builtin 标志丢失（备份导入/带外改库形态）均归位
@@ -566,15 +578,7 @@ func SeedDefaultBlockPage(dataDir string) (bool, error) {
 	changed := n > 0
 	// 内置备选页：INSERT OR IGNORE 播种（新库/被删形态），漂移行重写归位——
 	// 标志修复与内容库存同事完成，仅漂移时写（updated_at 不抖动）。
-	for _, bp := range []struct {
-		id      int
-		name    string
-		desc    string
-		variant string
-	}{
-		{9001, "限流拦截页面", "系统内置 429 限流拦截页面（备选，手动选用后生效）", "ratelimit"},
-		{9002, "系统维护页面", "系统内置维护页面（备选，手动选用后生效）", "maintenance"},
-	} {
+	for _, bp := range builtinBlockPageIdentities {
 		stock := renderBuiltinBlockPage(cfg, bp.variant)
 		if _, err := db.DB.Exec(`INSERT OR IGNORE INTO security_block_pages (id, name, description, content, is_default, is_builtin, created_at, updated_at) VALUES (?, ?, ?, ?, FALSE, TRUE, datetime('now'), datetime('now'))`, bp.id, bp.name, bp.desc, stock); err != nil {
 			return changed, fmt.Errorf("播种内置拦截页面 %d: %w", bp.id, err)

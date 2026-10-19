@@ -50,7 +50,7 @@ var TaiwanCities = map[string]bool{
 // 只读：禁止修改（全局单份）。
 var CityPinyinFixes = map[string]string{
 	"Wulumuqi": "乌鲁木齐市", "Shanghai": "上海市", "Beijing": "北京市",
-	"Fengyuan": "丰原市", "Taipei City": "台北市", "Zhongli District": "中坜区",
+	"Fengyuan": "丰原市", "Taipei City": "台北市", "Taichung County": "台中县", "Zhongli District": "中坜区",
 	"Changchun Shi": "长春市", "Chengdu Shi": "成都市", "Tianjin": "天津市",
 	"Fuyang Shi": "阜阳市", "Hefei Shi": "合肥市", "Heze Shi": "菏泽市",
 	"Jining Shi": "济宁市", "Linyi Xian": "临沂县", "Weifang Shi": "潍坊市",

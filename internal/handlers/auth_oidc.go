@@ -524,42 +524,71 @@ func lookupOIDCIdentity(issuer, subject string) (oidcIdentity, error) {
 	return ident, err
 }
 
-// oidcCandidateUsername 选择未被占用的 JIT 用户名（先 COUNT 后 INSERT；
-// 与并发写入者的唯一冲突由 createOIDCUserWithRetry 兜底重试）。
+// oidcCandidateUsername 选择未被占用的 JIT 用户名。无冲突保持一次唯一索引
+// 点查；base 已占用时一次批量载入相关候选，在内存中选择首个空档，查询数不随
+// 冲突数增长。并发写入者的唯一冲突仍由 createOIDCUserWithRetry 兜底重试。
 func oidcCandidateUsername(base string) (string, error) {
-	candidate := base
+	var exists int
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM users WHERE username=?", base).Scan(&exists); err != nil {
+		return "", err
+	}
+	if exists == 0 {
+		return base, nil
+	}
+
+	// 50 字符预算会让长 base 在不同后缀宽度下截到 48/47… 位；批量查询使用
+	// 共同前 47 位覆盖全部截断形态。LIKE 元字符按字面转义，额外相似用户名
+	// 由下方精确 map 判定过滤，不影响结果。
+	baseRunes := []rune(base)
+	prefix := base
+	if len(baseRunes) >= 48 {
+		prefix = string(baseRunes[:47])
+	}
+	escapedPrefix := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
+	rows, err := db.DB.Query(`SELECT username FROM users WHERE username LIKE ? ESCAPE '\'`, escapedPrefix+"%")
+	if err != nil {
+		return "", err
+	}
+	occupied := map[string]struct{}{}
+	for rows.Next() {
+		var username string
+		if scanErr := rows.Scan(&username); scanErr != nil {
+			rows.Close()
+			return "", scanErr
+		}
+		occupied[username] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return "", err
+	}
+	rows.Close()
+
 	for i := 2; ; i++ {
-		var exists int
-		if err := db.DB.QueryRow("SELECT COUNT(*) FROM users WHERE username=?", candidate).Scan(&exists); err != nil {
-			return "", err
-		}
-		if exists == 0 {
-			return candidate, nil
-		}
 		suffix := fmt.Sprintf("-%d", i)
-		// 后缀去重同受 历史问题-3 的 50 字符预算约束(后缀为 ASCII,字节数=rune 数)。
-		baseRunes := []rune(base)
+		candidate := base + suffix
 		if len(baseRunes)+len(suffix) > 50 {
 			budget := 50 - len(suffix)
 			if budget < 0 {
 				budget = 0
 			}
 			candidate = string(baseRunes[:budget]) + suffix
-		} else {
-			candidate = base + suffix
+		}
+		if _, taken := occupied[candidate]; !taken {
+			return candidate, nil
 		}
 	}
 }
 
-// oidcJITInsertAttempts JIT 开户唯一冲突的重试上限（每次重试重新 COUNT）。
+// oidcJITInsertAttempts JIT 开户唯一冲突的重试上限（每次重试重新选择候选名）。
 const oidcJITInsertAttempts = 3
 
 // oidcJITInsertAttemptHook 测试缝（生产恒 nil）：在每次 INSERT 前调用，
-// attempt 从 1 起；返回非 nil 即按该错误处理（模拟「COUNT 已通过、INSERT
+// attempt 从 1 起；返回非 nil 即按该错误处理（模拟「候选检查已通过、INSERT
 // 前并发者抢占候选名」的竞态），不执行真实 INSERT。
 var oidcJITInsertAttemptHook func(attempt int) error
 
-// createOIDCUserWithRetry JIT 开户（U04c-08）：候选名「先 COUNT 后 INSERT」
+// createOIDCUserWithRetry JIT 开户（U04c-08）：候选检查与 INSERT 之间
 // 在「不同 subject、相同 preferred_username 并发首登」下仍会撞 username
 // 唯一约束——旧实现只按 (issuer,subject) 回查，身份行不存在即令本次登录
 // 失败。新语义：唯一冲突且身份行不存在时重算候选名并有限重试；同一 subject

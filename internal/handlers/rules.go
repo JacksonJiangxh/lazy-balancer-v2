@@ -21,8 +21,8 @@ import (
 )
 
 var (
-	createOrRequeueCertJob = services.CreateOrRequeueCertJob
-	cancelRuleJobs         = func(ctx context.Context, manager *services.CAQueueManager, ruleID string) error {
+	createOrRequeueCertJobVerified = services.CreateOrRequeueCertJobVerified
+	cancelRuleJobs                 = func(ctx context.Context, manager *services.CAQueueManager, ruleID string) error {
 		return manager.CancelJobsForRule(ctx, ruleID)
 	}
 	cancelRuleJobsTimeout = 2 * time.Minute
@@ -500,7 +500,8 @@ func validateRuleListenPort(protocol string, port int) error {
 // cmd/server/main.go）与 Caddy admin API 端口（cfg.CaddyAdminURL 解析）。此前
 // 仅硬编码 8000/2019，部署自定义端口（config 文件 port / caddy_admin_url）时
 // 规则可抢占面板端口导致管理面失联。导入链（config_backup/config_import_v1）
-// 仍走包级默认口径。
+// 经 validateV2BackupRules/validateConvertedV1Rules 的可选 portGate 传入本函数，
+// 与保存链同口径（A85历史问题-5）。
 func (h *Handlers) validateRuleListenPortForSave(protocol string, port int) error {
 	if err := validateRuleListenPort(protocol, port); err != nil {
 		return err
@@ -632,6 +633,25 @@ func (h *Handlers) respondRuleApplyError(c *gin.Context, applyErr, restoreErr er
 	if restoreErr != nil {
 		applyErr = errors.Join(applyErr, restoreErr)
 	}
+	// A85历史问题-A：规则五端点均为 Explicit 审计策略（中间件对 Explicit 整体
+	// 跳过）——此前 apply 失败只写 HTTP 响应，操作审计完全缺席。与配置域
+	// finishTxApply（拒绝/未校验分支）及安全域同口径：失败必须留痕。
+	// 审计词条用字面量（词汇表门禁禁止动态 action；动词集合固定为五值）。
+	failureDetail := services.FormatAuditDetail("Caddy 配置应用失败", applyErr.Error(), services.AuditResultPart("failure"))
+	switch verb {
+	case "创建":
+		recordAudit(c, "创建失败", "负载规则", failureDetail)
+	case "更新":
+		recordAudit(c, "更新失败", "负载规则", failureDetail)
+	case "删除":
+		recordAudit(c, "删除失败", "负载规则", failureDetail)
+	case "启用":
+		recordAudit(c, "启用失败", "负载规则", failureDetail)
+	case "禁用":
+		recordAudit(c, "禁用失败", "负载规则", failureDetail)
+	default:
+		recordAudit(c, "应用失败", "负载规则", failureDetail)
+	}
 	if services.IsConfigRejected(applyErr) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 配置应用失败，规则未" + verb + ": " + applyErr.Error()})
 		return
@@ -666,6 +686,10 @@ type tcpDeadFields struct {
 	BlockPageStage1Status    *int
 	BlockPageStage3ID        *int
 	BlockPageStage3Status    *int
+	// A85历史问题：访问日志渲染仅对 HTTP 生成 logger_names（caddy.go 按
+	// r.Protocol=="http" 门控），TCP 行的 log_enabled 是死配置——UI 已对
+	// TCP 隐藏开关，API/导入仍可写入，随导出/快照放大。
+	LogEnabled *bool
 }
 
 // tcpDeadFieldReset 是 TCP 规则归一的单一事实源（历史问题，2026-10-18）：
@@ -677,7 +701,7 @@ func tcpDeadFieldReset(protocol string, fields tcpDeadFields) {
 		return
 	}
 	deadFalse, deadZero, deadEmpty := false, 0, ""
-	for _, target := range []*bool{fields.EnableTLS, fields.TLSHTTPRedirect, fields.EnableCompress} {
+	for _, target := range []*bool{fields.EnableTLS, fields.TLSHTTPRedirect, fields.EnableCompress, fields.LogEnabled} {
 		if target != nil {
 			*target = deadFalse
 		}
@@ -730,6 +754,7 @@ func createRuleTCPDeadFields(req *models.CreateRuleRequest) tcpDeadFields {
 		BlockPageStage1Status:    &req.BlockPageStage1Status,
 		BlockPageStage3ID:        &req.BlockPageStage3ID,
 		BlockPageStage3Status:    &req.BlockPageStage3Status,
+		LogEnabled:               &req.LogEnabled,
 	}
 }
 
@@ -758,6 +783,7 @@ func updateRuleTCPDeadFields(req *models.UpdateRuleRequest) tcpDeadFields {
 		BlockPageStage1Status:    req.BlockPageStage1Status,
 		BlockPageStage3ID:        req.BlockPageStage3ID,
 		BlockPageStage3Status:    req.BlockPageStage3Status,
+		LogEnabled:               req.LogEnabled,
 	}
 }
 
@@ -786,6 +812,7 @@ func storedRuleTCPDeadFields(rule *models.LbRule) tcpDeadFields {
 		BlockPageStage1Status:    &rule.BlockPageStage1Status,
 		BlockPageStage3ID:        &rule.BlockPageStage3ID,
 		BlockPageStage3Status:    &rule.BlockPageStage3Status,
+		LogEnabled:               &rule.LogEnabled,
 	}
 }
 
@@ -1045,6 +1072,11 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"})
 		return
 	}
+	// A85历史问题：手动证书模式不消费 acme_config_id（签发/渲染均按 tls_source
+	// 分流）——清理跨模式死引用，避免随导出/快照放大不可达配置。
+	if req.TLSSource == "manual" {
+		req.ACMEConfigID = 0
+	}
 	// Validate TLS certificate if provided (manual source only)
 	var certWarnings []string
 	if req.EnableTLS && req.TLSSource == "manual" {
@@ -1218,11 +1250,16 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		// LBH79-历史问题：commit 失败与 finishTxApply/UpdateConfig 同收口——
-		// 事务内两轮渲染已按未提交视图重写名单投影，先回滚到已提交视图
-		// 再恢复运行配置。
-		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
-		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
+		// LBH79-历史问题 + A85历史问题-B：commit 失败与 finishTxApply/UpdateConfig
+		// 同收口——统一恢复回滚事务、按已提交视图重渲染并 /load，双失败时
+		// 仍把已提交字节写回 LKG（restoreImportRuntime 只用运行时快照，恢复
+		// /load 失败会让 LKG 滞留未提交内容）。
+		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		// 新规则证书文件可能已在事务内渲染时物化——已提交视图不引用该规则，
+		// 不回退即为惰性孤儿（A85历史问题-3）。
+		if certErr := services.RemoveCertFiles(caddyID); certErr != nil {
+			restoreErr = errors.Join(restoreErr, certErr)
+		}
 		services.Logf("error", "CreateRule transaction commit error: %v", err)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则失败: " + errors.Join(err, restoreErr).Error()})
 		return
@@ -1472,6 +1509,13 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.ACMEConfigID == 0 {
 		req.ACMEConfigID = existingRule.ACMEConfigID
 	}
+	// A85历史问题：手动证书模式同格清理残留 ACME 配置引用（存量导入/旧版本
+	// 行可携带 acme_config_id 而 tls_source=manual；渲染/签发零消费）。必须在
+	// validateRulePayloadBeforeSave 之前——否则残留引用指向已删除配置时，
+	// 编辑会被不存在的 ACME 引用门 400 卡死，清理永远不可达。
+	if req.TLSSource == "manual" {
+		req.ACMEConfigID = 0
+	}
 	// 历史问题 历史问题（写侧）：nil=保留现值先合并，validateRulePayloadBeforeSave
 	// 才能对合并后的生效值做存在性校验（与上方 acme_config_id 同口径）。
 	if req.CAProviderID == nil {
@@ -1664,6 +1708,12 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 		if req.BlockPageStage3Status == nil {
 			req.BlockPageStage3Status = &tcpZero
+		}
+		// A85历史问题：log_enabled 仅 HTTP 渲染消费（logger_names 按协议门控）——
+		// 指针合并会把存量 1 带进 TCP 终态，显式补 false 指针使同协议编辑也自愈。
+		if req.LogEnabled == nil {
+			tcpLogOff := false
+			req.LogEnabled = &tcpLogOff
 		}
 		tcpDeadFieldReset(req.Protocol, updateRuleTCPDeadFields(&req))
 		// LBH-A-N1（历史）：重试窗口是 http/tcp 共用字段（方案 C），http 侧
@@ -2166,6 +2216,22 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// 的删除已先行命中同一 rule_id（cert_jobs 按 rule_id 唯一），且 409 早退
 	// 保证无在途非终态行。文件清理段（下方 RemoveCertFiles）保留。
 
+	// A85历史问题-3：HTTP→TCP 协议切换同事务解除安全策略绑定——TCP 渲染链
+	// （buildTCPProxyRoute）不加载策略，绑定残留会在策略页 rule_count/绑定视图
+	// 中显示为生效而运行态零防护；绑定写接口又拒绝 TCP，用户无法在面板内自救。
+	// 同协议编辑保留绑定（对照行为由 audit85_l7_test 钉住）。
+	var droppedBindings int64
+	if protocolChanged && req.Protocol == "tcp" {
+		result, err := tx.Exec("DELETE FROM security_policy_bindings WHERE rule_caddy_id = ?", caddyID)
+		if err != nil {
+			tx.Rollback()
+			services.Logf("error", "UpdateRule security_policy_bindings cleanup error for caddy_id=%s: %v", caddyID, err)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "写入数据库失败（清理安全策略绑定）: " + err.Error()})
+			return
+		}
+		droppedBindings, _ = result.RowsAffected()
+	}
+
 	// 历史问题：归一（weight/protocol/tls 校验）前置后走增量收敛——同内容编辑
 	// 不再 DELETE+INSERT 重建全部上游行（id 保留、不触发上游表行级同步触发器）。
 	for i := range req.Upstreams {
@@ -2211,14 +2277,18 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		// LBH79-历史问题：commit 失败必须同时回滚 IP 名单投影（历史问题 同族）。
-		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
-		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
+		// LBH79-历史问题 + A85历史问题-B：commit 失败统一走已提交视图恢复
+		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
+		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		services.Logf("error", "UpdateRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则更新失败: " + errors.Join(err, restoreErr).Error()})
 		return
 	}
 	committed = true
+
+	if droppedBindings > 0 {
+		recordAudit(c, "更新", "安全策略", fmt.Sprintf("规则 %s 切换为 TCP，已解除 %d 条安全策略绑定（TCP 不参与策略渲染）", caddyID, droppedBindings))
+	}
 
 	// 历史问题-01/R10：规则脱离 ACME（改手动/禁用 TLS）第二步——提交成功后留痕
 	// 并取消队列在途签发（DisableRule 同序：先收敛任务行后取消）。有界等待；
@@ -2446,8 +2516,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				return
 			}
 			services.Logf("info", "UpdateRule enqueueing cert job for caddy_id=%s domain=%s ca_provider_id=%d", caddyID, domain, caProviderID)
-			jobID, err := createOrRequeueCertJob(caddyID, domain, caProviderID, queueManager)
-			enqueuedJobID = jobID
+			jobID, changed, err := createOrRequeueCertJobVerified(caddyID, domain, caProviderID, queueManager)
+			if changed {
+				enqueuedJobID = jobID
+			}
 			if err != nil {
 				restoreErr := restoreACMEState()
 				if restoreErr != nil {
@@ -2644,9 +2716,9 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		// LBH79-历史问题：commit 失败必须同时回滚 IP 名单投影（历史问题 同族）。
-		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
-		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
+		// LBH79-历史问题 + A85历史问题-B：commit 失败统一走已提交视图恢复
+		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
+		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		services.Logf("error", "DeleteRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
 		if restoreErr != nil {
 			services.Logf("error", "问题: DeleteRule commit and runtime restore failed for caddy_id=%s: commit=%v restore=%v", caddyID, err, restoreErr)
@@ -2751,6 +2823,11 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		// 共用字段，不在此列。
 		rule.TCPProxyProtocol = false
 		rule.TCPHealthCheckPort = 0
+	}
+	// A85历史问题：手动 TLS 源的残留 acme_config_id 不被消费——副本不放大该
+	// 跨模式死引用（与 Create/Update/导入同口径；两协议同判）。
+	if rule.TLSSource == "manual" {
+		rule.ACMEConfigID = 0
 	}
 
 	// 历史问题（历史）：复制前把源行投影为共享保存输入并执行字段层校验
@@ -2924,12 +3001,16 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	// 2026-09-20 用户裁定（样式批第 4 项）：副本携带安全策略绑定——不携带
 	// 会在「启用副本」时形成零防护静默缺口。同事务 INSERT SELECT（与上游/
 	// 路径规则复制同口径），成功消息明示携带数量。
-	if _, err := tx.Exec(`
-		INSERT INTO security_policy_bindings (rule_caddy_id, policy_id)
-		SELECT ?, policy_id FROM security_policy_bindings WHERE rule_caddy_id = ?
-	`, newCaddyID, caddyID); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "复制策略绑定失败，已回滚: " + err.Error()})
-		return
+	// A85历史问题-3：TCP 副本不复制绑定——TCP 渲染链零消费策略，复制只会把
+	// 存量惰性绑定放大到副本（复制路径与协议切换/导入同口径不自造惰性绑定）。
+	if rule.Protocol != "tcp" {
+		if _, err := tx.Exec(`
+			INSERT INTO security_policy_bindings (rule_caddy_id, policy_id)
+			SELECT ?, policy_id FROM security_policy_bindings WHERE rule_caddy_id = ?
+		`, newCaddyID, caddyID); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "复制策略绑定失败，已回滚: " + err.Error()})
+			return
+		}
 	}
 	var copiedBindings int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM security_policy_bindings WHERE rule_caddy_id = ?`, newCaddyID).Scan(&copiedBindings); err != nil {
@@ -3384,9 +3465,9 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		// LBH79-历史问题：commit 失败必须同时回滚 IP 名单投影（历史问题 同族）。
-		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
-		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
+		// LBH79-历史问题 + A85历史问题-B：commit 失败统一走已提交视图恢复
+		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
+		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则启用失败: " + errors.Join(err, restoreErr).Error()})
 		return
 	}
@@ -3446,6 +3527,13 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		}
 		caProviderID = resolvedCAProviderID
 		queueManager = services.GetCAQueueManager()
+		enqueueCertJob := func() error {
+			jobID, changed, enqueueErr := createOrRequeueCertJobVerified(caddyID, domain, caProviderID, queueManager)
+			if changed {
+				enqueuedJobID = jobID
+			}
+			return enqueueErr
+		}
 
 		var jobStatus, jobMsg string
 		var jobExpiresAt sql.NullTime
@@ -3485,7 +3573,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 				failEnable("CA 队列未初始化，无法创建证书任务")
 				return
 			}
-			enqueuedJobID, err = services.CreateOrRequeueCertJob(caddyID, domain, caProviderID, queueManager)
+			err = enqueueCertJob()
 			if err != nil {
 				failCertEnqueue("创建证书任务失败", err)
 				return
@@ -3530,7 +3618,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 				failEnable("CA 队列未初始化，无法续签证书")
 				return
 			}
-			enqueuedJobID, err = services.CreateOrRequeueCertJob(caddyID, domain, caProviderID, queueManager)
+			err = enqueueCertJob()
 			if err != nil {
 				failCertEnqueue("续签排队失败", err)
 				return
@@ -3541,7 +3629,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 				failEnable("CA 队列未初始化，无法重试证书任务")
 				return
 			}
-			enqueuedJobID, err = services.CreateOrRequeueCertJob(caddyID, domain, caProviderID, queueManager)
+			err = enqueueCertJob()
 			if err != nil {
 				failCertEnqueue("重试排队失败", err)
 				return
@@ -3630,9 +3718,9 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		// LBH79-历史问题：commit 失败必须同时回滚 IP 名单投影（历史问题 同族）。
-		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
-		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
+		// LBH79-历史问题 + A85历史问题-B：commit 失败统一走已提交视图恢复
+		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
+		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则禁用失败: " + errors.Join(err, restoreErr).Error()})
 		return
 	}

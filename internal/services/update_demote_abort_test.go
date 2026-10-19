@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -208,4 +209,281 @@ func TestThreatRunUpdate_demoteOnLastSourceAbortsAsSkipped(t *testing.T) {
 	if got := GetThreatUpdateManager().StatusSnapshot().Outcome; got != "skipped" {
 		t.Fatalf("末源在途 demote outcome=%q, want skipped（中止点归一补判）", got)
 	}
+}
+
+// A85历史问题-2：手动取消必须立即打断任务内重试，且 manager/DB/审计与
+// task_runs 同为 cancelled；不得重试后落 failed + 「更新失败」。
+func TestWireLibraryUpdates_manualCancelAlignsTerminalAndAudit(t *testing.T) {
+	tests := []struct {
+		id            string
+		table         string
+		resource      string
+		reset         func()
+		initManager   func()
+		setFetch      func(func(context.Context) (string, error))
+		managerStatus func() string
+	}{
+		{
+			id: "crs", table: "security_crs_version", resource: "CRS规则库",
+			reset: ResetCRSUpdateManagerForTest,
+			initManager: func() {
+				InitCRSUpdateManager(nil)
+			},
+			setFetch: func(fn func(context.Context) (string, error)) {
+				GetCRSUpdateManager().fetchLatestTag = fn
+			},
+			managerStatus: func() string { return GetCRSUpdateManager().StatusSnapshot().Status },
+		},
+		{
+			id: "ip2region", table: "security_ip2region_version", resource: "IP数据库",
+			reset: ResetIP2RegionUpdateManagerForTest,
+			initManager: func() {
+				InitIP2RegionUpdateManager(nil)
+			},
+			setFetch: func(fn func(context.Context) (string, error)) {
+				GetIP2RegionUpdateManager().fetchLatestTag = fn
+			},
+			managerStatus: func() string { return GetIP2RegionUpdateManager().StatusSnapshot().Status },
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.id, func(t *testing.T) {
+			stubUpdateRetrySleep(t)
+			te := newWireTestEngine(t)
+			tc.reset()
+			tc.initManager()
+			t.Cleanup(tc.reset)
+			var calls atomic.Int32
+			entered := make(chan struct{})
+			var once sync.Once
+			tc.setFetch(func(ctx context.Context) (string, error) {
+				calls.Add(1)
+				once.Do(func() { close(entered) })
+				<-ctx.Done()
+				return "", ctx.Err()
+			})
+			if err := te.RunAsync(tc.id, "manual", "tester"); err != nil {
+				t.Fatalf("启动更新: %v", err)
+			}
+			select {
+			case <-entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("更新未进入下载/版本查询")
+			}
+			if !te.Cancel(tc.id) {
+				t.Fatal("运行中任务 Cancel=false")
+			}
+			waitForCond(t, 3*time.Second, func() bool {
+				latest := te.LatestRun(tc.id)
+				return latest != nil && latest.Status != "running"
+			})
+
+			if latest := te.LatestRun(tc.id); latest == nil || latest.Status != "cancelled" {
+				t.Fatalf("task_runs 终态=%+v, want cancelled", latest)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("取消后底层操作次数=%d, want 1（不得继续重试）", got)
+			}
+			if got := tc.managerStatus(); got != "cancelled" {
+				t.Fatalf("manager 终态=%q, want cancelled", got)
+			}
+			var storedStatus string
+			if err := db.DB.QueryRow(`SELECT update_status FROM ` + tc.table + ` WHERE id=1`).Scan(&storedStatus); err != nil {
+				t.Fatal(err)
+			}
+			if storedStatus != "cancelled" {
+				t.Fatalf("DB update_status=%q, want cancelled", storedStatus)
+			}
+			var action string
+			if err := db.AuditDB.QueryRow(`SELECT action FROM audit_log WHERE resource=? ORDER BY id DESC LIMIT 1`, tc.resource).Scan(&action); err != nil {
+				t.Fatal(err)
+			}
+			if action != "取消" {
+				t.Fatalf("审计动作=%q, want 取消（不得记更新失败）", action)
+			}
+		})
+	}
+}
+
+// 同族收敛：威胁/爬虫源下载中的手动取消不得把源行与审计写成失败。
+func TestThreatRunUpdate_manualCancelDoesNotFailSourceOrAudit(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	var requests atomic.Int32
+	entered := make(chan struct{})
+	var once sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		once.Do(func() { close(entered) })
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name='ustc'`, server.URL); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- GetThreatUpdateManager().RunUpdate("manual", &taskengine.RunContext{Ctx: ctx, Trigger: "manual"})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("威胁源下载未进入")
+	}
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("手动取消 RunUpdate err=%v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("手动取消未中断威胁源下载/重试")
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("取消后请求次数=%d, want 1", got)
+	}
+	if got := GetThreatUpdateManager().StatusSnapshot().Outcome; got != "cancelled" {
+		t.Fatalf("任务 outcome=%q, want cancelled", got)
+	}
+	var status string
+	if err := db.DB.QueryRow(`SELECT update_status FROM security_threat_sources WHERE name='ustc'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "cancelled" {
+		t.Fatalf("源 update_status=%q, want cancelled", status)
+	}
+	var action string
+	if err := db.AuditDB.QueryRow(`SELECT action FROM audit_log WHERE resource='威胁情报库' ORDER BY id DESC LIMIT 1`).Scan(&action); err != nil {
+		t.Fatal(err)
+	}
+	if action != "取消" {
+		t.Fatalf("审计动作=%q, want 取消", action)
+	}
+}
+
+func TestCrawlerRunUpdate_manualCancelDoesNotFailSourceOrAudit(t *testing.T) {
+	_, database := newClusterTestService(t)
+	newTaskLogDir(t)
+	if err := ensureCrawlerSources(); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	entered := make(chan struct{})
+	var once sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		once.Do(func() { close(entered) })
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	if _, err := database.Exec(`UPDATE security_crawler_sources SET update_enabled=0;
+		UPDATE security_crawler_sources SET update_enabled=1,url=? WHERE name='googlebot'`, server.URL); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- GetCrawlerUpdateManager().RunUpdate(ctx, taskengine.RunContext{Ctx: ctx, Trigger: "manual"})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("爬虫源下载未进入")
+	}
+	cancel()
+	select {
+	case err := <-runErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("手动取消 RunUpdate err=%v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("手动取消未中断爬虫源下载/重试")
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("取消后请求次数=%d, want 1", got)
+	}
+	var status string
+	if err := database.QueryRow(`SELECT update_status FROM security_crawler_sources WHERE name='googlebot'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "cancelled" {
+		t.Fatalf("源 update_status=%q, want cancelled", status)
+	}
+	var action string
+	if err := db.AuditDB.QueryRow(`SELECT action FROM audit_log WHERE resource='爬虫地址库' ORDER BY id DESC LIMIT 1`).Scan(&action); err != nil {
+		t.Fatal(err)
+	}
+	if action != "取消" {
+		t.Fatalf("审计动作=%q, want 取消", action)
+	}
+}
+
+// 复核 历史问题：取消发生在安装循环入口前（op 从未执行）时，runWithInTaskRetry
+// 返回 ctx 错误但 installErr 仍 nil；不得据此写 success/推进版本。
+func TestUpdateInstallEntryCancellationDoesNotWriteSuccess(t *testing.T) {
+	t.Run("crs", func(t *testing.T) {
+		m := newTestCRSManager(t)
+		seedCRSVersionRow(t, "v4.14.0", true)
+		m.fetchLatestTag = func(context.Context) (string, error) { return "v4.15.0", nil }
+		ctx, cancel := context.WithCancel(context.Background())
+		oldVersion := crsCurrentVersionForRun
+		crsCurrentVersionForRun = func() string {
+			cancel()
+			return "v4.14.0"
+		}
+		t.Cleanup(func() { crsCurrentVersionForRun = oldVersion })
+		done, err := m.StartUpdate("manual", &taskengine.RunContext{Ctx: ctx, Trigger: "manual"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("安装入口取消后未退出")
+		}
+		if got := m.StatusSnapshot().Status; got != "cancelled" {
+			t.Fatalf("manager 终态=%q, want cancelled", got)
+		}
+		var status, version string
+		if err := db.DB.QueryRow(`SELECT update_status,version FROM security_crs_version WHERE id=1`).Scan(&status, &version); err != nil {
+			t.Fatal(err)
+		}
+		if status != "cancelled" || version != "v4.14.0" {
+			t.Fatalf("update_status=%q version=%q, want cancelled/v4.14.0（未安装不得写成功版本）", status, version)
+		}
+	})
+
+	t.Run("ip2region", func(t *testing.T) {
+		m := newTestIP2RegionManager(t)
+		seedIP2RegionVersionRow(t, "v3.0.0", true)
+		m.fetchLatestTag = func(context.Context) (string, error) { return "v3.1.0", nil }
+		ctx, cancel := context.WithCancel(context.Background())
+		oldVersion := ip2RegionCurrentVersionForRun
+		ip2RegionCurrentVersionForRun = func() string {
+			cancel()
+			return "v3.0.0"
+		}
+		t.Cleanup(func() { ip2RegionCurrentVersionForRun = oldVersion })
+		done, err := m.StartUpdate("manual", &taskengine.RunContext{Ctx: ctx, Trigger: "manual"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("安装入口取消后未退出")
+		}
+		if got := m.StatusSnapshot().Status; got != "cancelled" {
+			t.Fatalf("manager 终态=%q, want cancelled", got)
+		}
+		var status, version string
+		if err := db.DB.QueryRow(`SELECT update_status,version FROM security_ip2region_version WHERE id=1`).Scan(&status, &version); err != nil {
+			t.Fatal(err)
+		}
+		if status != "cancelled" || version != "v3.0.0" {
+			t.Fatalf("update_status=%q version=%q, want cancelled/v3.0.0（未安装不得写成功版本）", status, version)
+		}
+	})
 }

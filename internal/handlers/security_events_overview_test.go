@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -759,6 +760,135 @@ func TestGetSecurityOverview_groupsAttackTypesByFamily(t *testing.T) {
 	}
 }
 
+func insertOverviewAggregateEvent(t *testing.T, metrics *sql.DB, eventTime string) {
+	t.Helper()
+	if _, err := metrics.Exec(`INSERT INTO security_events
+		(event_time,client_ip,rule_triggered,rule_msg,action)
+		VALUES (?,'192.0.2.9','942100','SQL Injection','blocked')`, eventTime); err != nil {
+		t.Fatalf("seed aggregate event: %v", err)
+	}
+}
+
+func overviewAggregateEventCount(data securityOverviewAggregates) int {
+	total := 0
+	for _, point := range data.trend {
+		total += point.Blocked + point.Detected
+	}
+	return total
+}
+
+func TestLoadSecurityOverviewAggregates_cacheHitAndExpiry(t *testing.T) {
+	// Given 一个真实指标库与固定缓存键。
+	setupSecurityPolicyTestDB(t)
+	resetSecurityOverviewAggCacheForTest()
+	t.Cleanup(resetSecurityOverviewAggCacheForTest)
+	today := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	const todayStart = "2026-10-18 16:00:00"
+	const tzModifier = "+08:00"
+	insertOverviewAggregateEvent(t, db.MetricsDB, "2026-10-19 01:00:00")
+	first, err := loadSecurityOverviewAggregates(db.MetricsDB, today, todayStart, tzModifier)
+	if err != nil || overviewAggregateEventCount(first) != 1 {
+		t.Fatalf("first aggregate=(count %d, err %v), want (1,nil)", overviewAggregateEventCount(first), err)
+	}
+
+	// When 同键再次读取，期间新增事件不应穿透 30s 缓存。
+	insertOverviewAggregateEvent(t, db.MetricsDB, "2026-10-19 01:01:00")
+	cached, err := loadSecurityOverviewAggregates(db.MetricsDB, today, todayStart, tzModifier)
+	if err != nil || overviewAggregateEventCount(cached) != 1 {
+		t.Fatalf("cached aggregate=(count %d, err %v), want (1,nil)", overviewAggregateEventCount(cached), err)
+	}
+
+	// Then 缓存过期后同一键必须重算并看到新事件（直接调整测试缓存项的
+	// 过期时刻，避免 30s wall-clock sleep）。
+	securityOverviewAggCacheMu.Lock()
+	for key, entry := range securityOverviewAggCache {
+		if key.metrics == db.MetricsDB {
+			entry.expiresAt = time.Now().Add(-time.Second)
+			securityOverviewAggCache[key] = entry
+		}
+	}
+	securityOverviewAggCacheMu.Unlock()
+	expired, err := loadSecurityOverviewAggregates(db.MetricsDB, today, todayStart, tzModifier)
+	if err != nil || overviewAggregateEventCount(expired) != 2 {
+		t.Fatalf("expired aggregate=(count %d, err %v), want (2,nil)", overviewAggregateEventCount(expired), err)
+	}
+}
+
+func TestLoadSecurityOverviewAggregates_cacheKeysIncludeDayTimezoneAndDatabase(t *testing.T) {
+	// Given 同库初始键的缓存。
+	setupSecurityPolicyTestDB(t)
+	resetSecurityOverviewAggCacheForTest()
+	t.Cleanup(resetSecurityOverviewAggCacheForTest)
+	firstDB := db.MetricsDB
+	today := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	const todayStart = "2026-10-18 16:00:00"
+	insertOverviewAggregateEvent(t, firstDB, "2026-10-19 01:00:00")
+	if _, err := loadSecurityOverviewAggregates(firstDB, today, todayStart, "+08:00"); err != nil {
+		t.Fatal(err)
+	}
+
+	// When 日界变化，必须重算而不是复用前一日键。
+	insertOverviewAggregateEvent(t, firstDB, "2026-10-19 01:01:00")
+	nextDay, err := loadSecurityOverviewAggregates(firstDB, today.AddDate(0, 0, 1), "2026-10-19 16:00:00", "+08:00")
+	if err != nil || overviewAggregateEventCount(nextDay) != 2 {
+		t.Fatalf("next-day aggregate=(count %d, err %v), want (2,nil)", overviewAggregateEventCount(nextDay), err)
+	}
+
+	// Then 时区键变化同样重算；原始日界/时区键仍保留自己的快照。
+	insertOverviewAggregateEvent(t, firstDB, "2026-10-19 01:02:00")
+	otherTimezone, err := loadSecurityOverviewAggregates(firstDB, today.AddDate(0, 0, 1), "2026-10-19 16:00:00", "-04:00")
+	if err != nil || overviewAggregateEventCount(otherTimezone) != 3 {
+		t.Fatalf("timezone aggregate=(count %d, err %v), want (3,nil)", overviewAggregateEventCount(otherTimezone), err)
+	}
+	original, err := loadSecurityOverviewAggregates(firstDB, today, todayStart, "+08:00")
+	if err != nil || overviewAggregateEventCount(original) != 1 {
+		t.Fatalf("original key aggregate=(count %d, err %v), want cached (1,nil)", overviewAggregateEventCount(original), err)
+	}
+
+	// When 换指标库，即使日界与时区相同也不得命中旧库缓存。
+	if err := db.InitializeMetricsDB(t.TempDir()); err != nil {
+		t.Fatalf("initialize second metrics DB: %v", err)
+	}
+	secondDB := db.MetricsDB
+	t.Cleanup(func() {
+		_ = secondDB.Close()
+		db.MetricsDB = firstDB
+	})
+	secondDBData, err := loadSecurityOverviewAggregates(secondDB, today, todayStart, "+08:00")
+	if err != nil || overviewAggregateEventCount(secondDBData) != 0 {
+		t.Fatalf("second DB aggregate=(count %d, err %v), want (0,nil)", overviewAggregateEventCount(secondDBData), err)
+	}
+}
+
+func TestLoadSecurityOverviewAggregates_doesNotCacheFailures(t *testing.T) {
+	// Given 同键首轮聚合因表缺失而失败。
+	setupSecurityPolicyTestDB(t)
+	resetSecurityOverviewAggCacheForTest()
+	t.Cleanup(resetSecurityOverviewAggCacheForTest)
+	today := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	const todayStart = "2026-10-18 16:00:00"
+	if _, err := db.MetricsDB.Exec(`DROP TABLE security_events`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadSecurityOverviewAggregates(db.MetricsDB, today, todayStart, "+08:00"); err == nil {
+		t.Fatal("aggregate with missing events table must fail")
+	}
+
+	// When 故障消除后用完全相同的键重试。
+	if _, err := db.MetricsDB.Exec(`CREATE TABLE security_events (
+		event_time DATETIME, action TEXT, client_ip TEXT, rule_triggered TEXT, rule_msg TEXT
+	)`); err != nil {
+		t.Fatalf("recreate events table: %v", err)
+	}
+	insertOverviewAggregateEvent(t, db.MetricsDB, "2026-10-19 01:00:00")
+	recovered, err := loadSecurityOverviewAggregates(db.MetricsDB, today, todayStart, "+08:00")
+
+	// Then 失败轮不得缓存，重试必须真实执行并返回新数据。
+	if err != nil || overviewAggregateEventCount(recovered) != 1 {
+		t.Fatalf("recovered aggregate=(count %d, err %v), want (1,nil)", overviewAggregateEventCount(recovered), err)
+	}
+}
+
 // S4/S5(2026-09-10 审计):①family 筛选单数字前缀无长度约束,自定义 5 位 ID
 // (24567 等)交叉命中 IP/地域族;②id:11(请求体解析失败守卫)三侧分类缺标签。
 func TestRuleTriggeredFilterSQL_singleDigitFamiliesUseExactMatch(t *testing.T) {
@@ -941,5 +1071,95 @@ func TestAttackFamilyClassOf_crawlerSegment(t *testing.T) {
 	}
 	if got := stageCategorizeAttack("850003", ""); got != "IP 访问控制" {
 		t.Errorf("stageCategorizeAttack(850003)=%q, want IP 访问控制", got)
+	}
+}
+
+// Given 总览近 7 天卡片直读原始事件表。
+// When 原始表被裁剪、覆盖完整或为空。
+// Then API 始终披露最早原始事件时间，且只在窗口前段缺失时标记不完整。
+func TestGetSecurityOverview_rawCoverageDisclosure(t *testing.T) {
+	readData := func(t *testing.T) map[string]any {
+		t.Helper()
+		recorder := getRequest(t, newSecurityEventsRouter(t), "/security/overview")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var payload struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode overview: %v", err)
+		}
+		return payload.Data
+	}
+	assertShape := func(t *testing.T, data map[string]any) (string, bool) {
+		t.Helper()
+		rawValue, rawOK := data["raw_coverage_from"]
+		incompleteValue, incompleteOK := data["backfill_incomplete"]
+		if !rawOK || !incompleteOK {
+			t.Fatalf("覆盖披露字段缺失: %+v", data)
+		}
+		raw, rawIsString := rawValue.(string)
+		incomplete, incompleteIsBool := incompleteValue.(bool)
+		if !rawIsString || !incompleteIsBool {
+			t.Fatalf("覆盖披露字段类型错误: %+v", data)
+		}
+		return raw, incomplete
+	}
+
+	t.Run("裁剪后披露缺口", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		seedThreatScreenEvent(t, utcStringAgo(time.Hour), "203.0.113.7", "942100", "SQL Injection", "blocked")
+		raw, incomplete := assertShape(t, readData(t))
+		if raw == "" || !incomplete {
+			t.Fatalf("raw=%q incomplete=%v, want 非空且 true", raw, incomplete)
+		}
+	})
+	t.Run("覆盖完整不误报", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		seedThreatScreenEvent(t, utcStringAgo(8*24*time.Hour), "203.0.113.7", "942100", "SQL Injection", "blocked")
+		raw, incomplete := assertShape(t, readData(t))
+		if raw == "" || incomplete {
+			t.Fatalf("raw=%q incomplete=%v, want 非空且 false", raw, incomplete)
+		}
+	})
+	t.Run("空表不算裁剪", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		raw, incomplete := assertShape(t, readData(t))
+		if raw != "" || incomplete {
+			t.Fatalf("raw=%q incomplete=%v, want 空且 false", raw, incomplete)
+		}
+	})
+}
+
+// Given 采集 daemon 连续失败达到阈值。
+// When 事件列表 API 返回。
+// Then ingestion 状态位显性暴露 unhealthy 与错误，供事件页提示。
+func TestListSecurityEvents_disclosesIngestionHealth(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	services.SecurityEventsSetIngestionHealthForTest(services.SecurityEventsIngestionStatus{
+		Observed:            true,
+		Healthy:             false,
+		ConsecutiveFailures: 3,
+		LastError:           "metrics database unavailable",
+		LastErrorAt:         "2026-10-19T00:00:00Z",
+	})
+	t.Cleanup(func() { services.SecurityEventsSetIngestionHealthForTest(services.SecurityEventsIngestionStatus{}) })
+
+	recorder := getRequest(t, newSecurityEventsRouter(t), "/security/events")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Ingestion services.SecurityEventsIngestionStatus `json:"ingestion"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	got := payload.Data.Ingestion
+	if !got.Observed || got.Healthy || got.ConsecutiveFailures != 3 || got.LastError == "" {
+		t.Fatalf("ingestion=%+v, want unhealthy snapshot with error", got)
 	}
 }

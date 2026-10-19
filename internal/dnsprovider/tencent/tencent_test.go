@@ -460,6 +460,68 @@ func TestProvider_CleanUp_removes_ownership_of_independently_deleted_records(t *
 	}
 }
 
+// A85 历史问题：不可解析的持久化 RecordID 只告警一次并移除，正常兄弟条目不受影响。
+func TestProvider_CleanUp_malformedPersistedRecordIDRemovedAfterWarning(t *testing.T) {
+	// Given 同一 challenge 下一条不可解析的持久化 ID 与一条正常 ID（真实 ownership 文件）。
+	dataDir := t.TempDir()
+	store, err := ownership.New(dataDir)
+	if err != nil {
+		t.Fatalf("open ownership store: %v", err)
+	}
+	fqdn := "_acme-challenge.example.com."
+	for _, record := range []ownership.Record{
+		{Provider: "tencent", Zone: "example.com", FQDN: fqdn, Value: "broken", RecordID: "broken-record-id"},
+		{Provider: "tencent", Zone: "example.com", FQDN: fqdn, Value: "valid", RecordID: "200"},
+	} {
+		if err := store.Add(record); err != nil {
+			t.Fatalf("seed ownership record %+v: %v", record, err)
+		}
+	}
+	transport := &recordTransport{records: map[uint64]string{200: "owned"}}
+	provider, err := NewPersistent("secret-id", "secret-key", dataDir)
+	if err != nil {
+		t.Fatalf("create persistent provider: %v", err)
+	}
+	provider.client.WithHttpTransport(transport)
+	var warnings strings.Builder
+	oldLogf := logf
+	logf = func(level, format string, args ...any) {
+		if level == "warn" {
+			warnings.WriteString(fmt.Sprintf(format, args...))
+		}
+	}
+	t.Cleanup(func() { logf = oldLogf })
+
+	// When 首次清理同时遇到畸形与正常条目。
+	err = provider.CleanUp(t.Context(), "example.com", fqdn)
+
+	// Then 本轮仍上报解析错误，但畸形条目被移除，正常条目照常删除。
+	if err == nil || !strings.Contains(err.Error(), "broken-record-id") {
+		t.Fatalf("first cleanup error=%v, want malformed record ID surfaced", err)
+	}
+	left, err := store.Matching("tencent", "example.com", fqdn)
+	if err != nil {
+		t.Fatalf("read ownership after cleanup: %v", err)
+	}
+	if len(left) != 0 {
+		t.Fatalf("ownership left=%+v, want malformed and successfully deleted entries removed", left)
+	}
+	transport.mu.Lock()
+	_, validStillAlive := transport.records[200]
+	transport.mu.Unlock()
+	if validStillAlive {
+		t.Fatal("valid record 200 was not deleted while handling malformed sibling")
+	}
+	if got := strings.Count(warnings.String(), "无法解析"); got != 1 {
+		t.Fatalf("malformed record warnings=%d, want exactly 1; warnings=%q", got, warnings.String())
+	}
+
+	// And 第二次清理为空操作，不再形成永久 cleanup_warning 循环。
+	if err := provider.CleanUp(t.Context(), "example.com", fqdn); err != nil {
+		t.Fatalf("second cleanup after malformed entry removal: %v", err)
+	}
+}
+
 // 历史问题（历史）基线钉：内存模式下删除失败仍回填 owned——failed 存储
 // 的唯一消费者是 ownership==nil 分支，失败条目门控后该既有形状不得破坏。
 func TestProvider_CleanUp_memoryModeReappendsFailedRecord(t *testing.T) {

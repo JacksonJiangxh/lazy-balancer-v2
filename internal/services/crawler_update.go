@@ -97,9 +97,12 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		detail := fmt.Sprintf("更新%s（触发：%s）", map[string]string{
 			"success": "成功", "failed": "失败", "cancelled": "已取消", "skipped": "跳过",
 		}[outcome], rc.Trigger)
-		if outcome == "failed" || outcome == "cancelled" {
+		switch outcome {
+		case "failed":
 			RecordAuditLog(operator, "更新失败", "爬虫地址库", detail, "")
-		} else {
+		case "cancelled":
+			RecordAuditLog(operator, "取消", "爬虫地址库", detail, "")
+		default:
 			RecordAuditLog(operator, "更新", "爬虫地址库", detail, "")
 		}
 	}()
@@ -154,7 +157,7 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		}
 		TaskLogf("crawlerbot-update", "downloading", "下载 %s（%s）", src.Name, src.URL)
 		var body string
-		err = runWithInTaskRetry(func() error {
+		err = runWithInTaskRetry(ctx, func() error {
 			var fetchErr error
 			body, fetchErr = crawlerFetchBody(ctx, src)
 			return fetchErr
@@ -162,6 +165,17 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 			TaskLogfWarn("crawlerbot-update", "retry", "源 %s 下载失败: %v；等待 %s 重试，第 %d 次，共 3 次", src.Name, rerr, wait, attempt)
 		})
 		if err != nil {
+			if ctx.Err() != nil {
+				if !updateRunStillMaster() {
+					outcome = "skipped"
+					TaskLogfWarn("crawlerbot-update", "skipped", "节点已降级为从节点，终止爬虫地址更新（已完成源保留）")
+					return taskengine.ErrTaskSkipped
+				}
+				outcome = "cancelled"
+				markCrawlerSourceCancelled(src.Name)
+				TaskLogfWarn("crawlerbot-update", "cancelled", "源 %s 更新已手动取消（保留上次快照）", src.Name)
+				return ctx.Err()
+			}
 			if firstErr == nil {
 				firstErr = fmt.Errorf("源 %s 下载失败: %w", src.Name, err)
 			}
@@ -270,6 +284,15 @@ func markCrawlerSourceSuccess(name, trigger string, entryCount int) {
 		entryCount, time.Now().UTC().Format("2006.01.02"), trigger, next, name)
 	if err != nil {
 		Logf("error", "crawlerbot-update: 源 %s 写成功态失败: %v", name, err)
+	}
+}
+
+// markCrawlerSourceCancelled 用户取消终态：保留上次快照、版本与失败计数，
+// 不推进排程槽。
+func markCrawlerSourceCancelled(name string) {
+	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_status='cancelled', message='已手动取消（保留上次快照）', finished_at=datetime('now') WHERE name=?`, name)
+	if err != nil {
+		Logf("error", "crawlerbot-update: 源 %s 写取消态失败: %v", name, err)
 	}
 }
 

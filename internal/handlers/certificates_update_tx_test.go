@@ -1,81 +1,107 @@
 package handlers
 
-// LBS/LBH-4（历史 历史问题）：UpdateCertificateConfig 旧行读取与动态 UPDATE 分属
-// 两个 autocommit 语句（SELECT 旧值 → UPDATE），审计 changed 清单的比对基线
-// 取自事务外预读——预读与写入之间的并发提交会让基线陈旧（漏记/多记变更字段）。
-// 镜像 CERT-N1：旧行快照与写入同事务（BEGIN IMMEDIATE），基线即写入前那一刻
-// 的真实行。本用例以「并发持写锁改行 + 请求提交同值」的交错暴露差异：
-//   - 修复前：事务外 SELECT 读到未提交前的 'orig'，与请求 'concurrent' 不等
-//     → 记「变更：名称」并写库（响应 Config updated）。
-//   - 修复：BEGIN IMMEDIATE 先取写锁，待并发提交后再读 → 读到 'concurrent'
-//     == 请求值 → 无变化（响应 Config unchanged）。
+// LBS/LBH-4（历史 历史问题）：UpdateCertificateConfig 旧行读取与动态 UPDATE 必须
+// 同事务。本测试直接记录真实 SQLite driver 的 BEGIN/旧行 SELECT 顺序，避免用
+// 固定 sleep 制造并发交错：旧实现会先 SELECT 后 BEGIN/UPDATE，契约顺序即失败。
 
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
+	sqlitedriver "github.com/glebarez/go-sqlite"
 
 	"lazy-balancer-v2/internal/db"
 )
 
-func TestUpdateCertificateConfig_readsOldRowInsideTransaction(t *testing.T) {
-	h := newBackupTestHandlers(t)
-	if _, err := db.DB.Exec(`INSERT INTO certificate_configs (id, name, dns_provider, dns_credentials, enabled) VALUES
-		(1, 'orig', 'dnspod', '{"auth_mode":"dnspod","app_id":"old-id","app_token":"old-token"}', 1)`); err != nil {
-		t.Fatalf("seed certificate config: %v", err)
+type certificateTxOrder struct {
+	mu         sync.Mutex
+	statements []string
+}
+
+func (o *certificateTxOrder) add(statement string) {
+	o.mu.Lock()
+	o.statements = append(o.statements, statement)
+	o.mu.Unlock()
+}
+
+type certificateTxOrderConnector struct {
+	dsn   string
+	inner driver.Driver
+	order *certificateTxOrder
+}
+
+func (c certificateTxOrderConnector) Connect(context.Context) (driver.Conn, error) {
+	conn, err := c.inner.Open(c.dsn)
+	if err != nil {
+		return nil, err
 	}
+	return &certificateTxOrderConn{Conn: conn, order: c.order}, nil
+}
+
+func (c certificateTxOrderConnector) Driver() driver.Driver { return c.inner }
+
+type certificateTxOrderConn struct {
+	driver.Conn
+	order *certificateTxOrder
+}
+
+func (c *certificateTxOrderConn) Begin() (driver.Tx, error) {
+	c.order.add("begin")
+	return c.Conn.Begin()
+}
+
+func (c *certificateTxOrderConn) Prepare(query string) (driver.Stmt, error) {
+	if strings.Contains(query, "SELECT name, dns_provider") {
+		c.order.add("read-old")
+	}
+	return c.Conn.Prepare(query)
+}
+
+func TestUpdateCertificateConfig_readsOldRowInsideTransaction(t *testing.T) {
+	// Given 一个只含本端点所需真实表结构的 SQLite 库与语句顺序探针。
+	order := &certificateTxOrder{}
+	database := sql.OpenDB(certificateTxOrderConnector{dsn: t.TempDir() + "/certificates.db", inner: &sqlitedriver.Driver{}, order: order})
+	if _, err := database.Exec(`CREATE TABLE certificate_configs (
+		id INTEGER PRIMARY KEY, name TEXT, dns_provider TEXT, dns_credentials TEXT, enabled BOOLEAN
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled) VALUES
+		(1,'concurrent','dnspod','{"auth_mode":"dnspod","app_id":"old-id","app_token":"old-token"}',1)`); err != nil {
+		t.Fatal(err)
+	}
+	oldDB := db.DB
+	db.DB = database
+	db.SetDB(database)
+	t.Cleanup(func() {
+		_ = database.Close()
+		db.DB = oldDB
+		db.SetDB(oldDB)
+	})
+	h := &Handlers{}
 	router := gin.New()
 	router.PUT("/certificate-configs/:id", h.UpdateCertificateConfig)
 
-	ctx := context.Background()
-	// Given：并发写持写锁把 name 改成 'concurrent'（未提交）
-	holdTx, err := db.DB.BeginTx(ctx, &sql.TxOptions{}) // _txlock=immediate → BEGIN IMMEDIATE 持写锁
-	if err != nil {
-		t.Fatalf("begin hold tx: %v", err)
-	}
-	defer holdTx.Rollback()
-	if _, err := holdTx.ExecContext(ctx, `UPDATE certificate_configs SET name='concurrent' WHERE id=1`); err != nil {
-		t.Fatalf("hold tx update: %v", err)
-	}
+	// When 提交与库中现值相同的名称，触发旧行读取和无变化收尾。
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPut, "/certificate-configs/1", strings.NewReader(`{"name":"concurrent"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, request)
 
-	// When：PUT 把 name 改成 'concurrent'（与并发写目标同值）
-	rec := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		req := httptest.NewRequest(http.MethodPut, "/certificate-configs/1", strings.NewReader(`{"name":"concurrent"}`))
-		req.Header.Set("Content-Type", "application/json")
-		router.ServeHTTP(rec, req)
-	}()
-	// 让修复前的事务外 SELECT 先于并发提交发生（WAL 下读不被写锁阻塞）
-	time.Sleep(200 * time.Millisecond)
-	if err := holdTx.Commit(); err != nil {
-		t.Fatalf("commit hold tx: %v", err)
+	// Then 响应不变，且 BEGIN 必须先于旧行 SELECT；不依赖 goroutine 时序。
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "unchanged") {
+		t.Fatalf("status=%d body=%s, want 200 unchanged", recorder.Code, recorder.Body.String())
 	}
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("UpdateCertificateConfig 未在并发提交后完成")
-	}
-
-	// Then：事务内旧行 = 'concurrent'（已提交）→ 与请求同值 → 无变化
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "unchanged") {
-		t.Fatalf("body=%s, want unchanged（changed 基线须取事务内旧行）", rec.Body.String())
-	}
-	var name string
-	if err := db.DB.QueryRow(`SELECT name FROM certificate_configs WHERE id=1`).Scan(&name); err != nil {
-		t.Fatalf("read config: %v", err)
-	}
-	if name != "concurrent" {
-		t.Fatalf("name=%q, want concurrent（并发提交不得被陈旧基线覆盖）", name)
+	order.mu.Lock()
+	defer order.mu.Unlock()
+	if len(order.statements) != 2 || order.statements[0] != "begin" || order.statements[1] != "read-old" {
+		t.Fatalf("statement order=%v, want [begin read-old]", order.statements)
 	}
 }

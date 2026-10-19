@@ -82,6 +82,64 @@ func TestCertJobRetryBlocked_downloaded_job_uses_deployment_message(t *testing.T
 	}
 }
 
+func TestListCertJobs_exposesBackendRetryCooldowns(t *testing.T) {
+	// Given：各冷却档位的真实任务行。
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (id,rule_id,domain,status,updated_at) VALUES
+		(101,'lb_cooldown','queued.example','queued',datetime('now')),
+		(102,'lb_cooldown','failed.example','failed',datetime('now')),
+		(103,'lb_cooldown','disabled.example','disabled',datetime('now')),
+		(104,'lb_cooldown','issued.example','issued',datetime('now')),
+		(105,'lb_cooldown','waiting.example','waiting_ca',datetime('now')),
+		(106,'lb_cooldown','downloaded.example','downloaded',datetime('now'))`); err != nil {
+		t.Fatalf("seed cooldown jobs: %v", err)
+	}
+	router := gin.New()
+	router.GET("/jobs", h.ListCertJobs)
+	response := httptest.NewRecorder()
+
+	// When
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/jobs?page=1&page_size=50", nil))
+
+	// Then：秒值由后端唯一下发；disabled 用 null 与零冷却区分。
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			List []struct {
+				Status               string `json:"status"`
+				RetryCooldownSeconds *int64 `json:"retry_cooldown_seconds"`
+			} `json:"list"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	want := map[string]int64{"queued": 900, "failed": 300, "issued": 0, "waiting_ca": 0, "downloaded": 120}
+	seen := make(map[string]bool)
+	for _, job := range payload.Data.List {
+		seen[job.Status] = true
+		if job.Status == "disabled" {
+			if job.RetryCooldownSeconds != nil {
+				t.Fatalf("disabled cooldown=%d, want null", *job.RetryCooldownSeconds)
+			}
+			continue
+		}
+		if job.RetryCooldownSeconds == nil || *job.RetryCooldownSeconds != want[job.Status] {
+			t.Fatalf("status=%q cooldown=%v, want %d", job.Status, job.RetryCooldownSeconds, want[job.Status])
+		}
+	}
+	for status := range want {
+		if !seen[status] {
+			t.Fatalf("status %q missing from list response", status)
+		}
+	}
+	if !seen["disabled"] {
+		t.Fatal("disabled job missing from list response")
+	}
+}
+
 func TestRetryCertJob_rejects_inactive_rule_atomically(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()

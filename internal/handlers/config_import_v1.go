@@ -142,6 +142,38 @@ func validateRuleConflictMatrix(candidates []ruleConflictCandidate) []disabledRu
 		domainSets[index] = set
 		byPort[candidates[index].listenPort] = append(byPort[candidates[index].listenPort], index)
 	}
+	// A85历史问题-1：同端口 TLS/明文混布（保存/启用链 checkPortTLSMix 的导入侧
+	// 同口径落地）。Caddy 按端口生成单一 server，只要任一启用 HTTP 规则带证书
+	// 即生成 tls_connection_policies——同端口明文规则在该监听器上握手必败，
+	// 整条规则静默不可达。导入无法像保存链一样即时 400（备份可能来自旧版本/
+	// 手造/nginx 转换），按矩阵既有「冲突置禁用」语义只禁用不可达的明文一侧，
+	// TLS 一侧继续服务（该侧行为健康）。禁用行为不参与（不渲染、不占端口）。
+	for port, indexes := range byPort {
+		var tlsIndexes, plainIndexes []int
+		for _, index := range indexes {
+			candidate := candidates[index]
+			if !candidate.enabled || candidate.protocol != "http" {
+				continue
+			}
+			if candidate.enableTLS {
+				tlsIndexes = append(tlsIndexes, index)
+			} else {
+				plainIndexes = append(plainIndexes, index)
+			}
+		}
+		if len(tlsIndexes) == 0 || len(plainIndexes) == 0 {
+			continue
+		}
+		reason := fmt.Sprintf("端口 %d 的 TLS 与明文规则不能混布（该端口监听器将整体切换为 TLS，明文规则不可达）", port)
+		for _, plainIndex := range plainIndexes {
+			reasons[plainIndex] = append(reasons[plainIndex], reason)
+			for _, tlsIndex := range tlsIndexes {
+				opponents[plainIndex] = append(opponents[plainIndex], ruleConflictOpponent{
+					Name: candidates[tlsIndex].name, CaddyID: candidates[tlsIndex].caddyID, Reason: reason,
+				})
+			}
+		}
+	}
 	intersectFirst := func(primaryIndex, otherIndex int) (string, bool) {
 		for _, domain := range domainLists[primaryIndex] {
 			if _, exists := domainSets[otherIndex][domain]; exists {
@@ -393,12 +425,18 @@ func mapV1BalancerStrategy(value string) (string, bool) {
 	}
 }
 
-func validateConvertedV1Rules(rules []convertedRule) ([]convertedRule, []string, []string) {
+// validateConvertedV1Rules 的 portGate 与 validateV2BackupRules 同口径
+// （A85历史问题-5）：生产预览/导入传入进程实际管理端口门；省略退回包级默认。
+func validateConvertedV1Rules(rules []convertedRule, portGates ...func(string, int) error) ([]convertedRule, []string, []string) {
+	validatePort := validateRuleListenPort
+	if len(portGates) > 0 && portGates[0] != nil {
+		validatePort = portGates[0]
+	}
 	var valid []convertedRule
 	var skips []string
 	var normalizations []string
 	for index, rule := range rules {
-		if err := validateRuleListenPort(rule.Protocol, rule.ListenPort); err != nil {
+		if err := validatePort(rule.Protocol, rule.ListenPort); err != nil {
 			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：%v", index+1, rule.Name, err))
 			continue
 		}
@@ -533,9 +571,11 @@ type importValidateResponse struct {
 	HasWafFiles bool `json:"has_waf_files"`
 }
 
-// v2.3.0:lbbak(tar.gz 含规则库文件)可达 ~15MB(xdb 10.6MB 原始字节+CRS 包),
-// 上限提至 48MB;纯 JSON 备份远小于此。
-const maxConfigImportBytes int64 = 48 << 20
+// lbbak 解压总字节上限 256MB；压缩上传上限取 128MB（远高于已知 ~15MB 完整包），
+// 导出侧同样拒绝超限产物，兼顾大备份往返与导入瞬态内存峰值。
+var maxConfigImportBytes int64 = 128 << 20
+
+const configImportLimitMessage = "备份文件不能超过 128MB"
 
 // lbbakPayloadFromCtx 取 validate 流程中解包的 lbbak 载荷(可能为 nil)。
 func lbbakPayloadFromCtx(c *gin.Context) *lbbakPayload {
@@ -546,7 +586,7 @@ func lbbakPayloadFromCtx(c *gin.Context) *lbbakPayload {
 
 func limitConfigImportBody(c *gin.Context) bool {
 	if c.Request.ContentLength > maxConfigImportBytes {
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "备份文件不能超过 48MB"})
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage})
 		return false
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxConfigImportBytes)
@@ -567,7 +607,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 	}
 	body, err := c.GetRawData()
 	if isRequestBodyTooLarge(err) {
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "备份文件不能超过 48MB"})
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage})
 		return
 	}
 	if err != nil {
@@ -647,7 +687,14 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		if !includeGlobal {
 			backup.Config = nil
 		}
-		// 历史问题：行级门在 sections 过滤之后（与导入同序）。
+		// 与导入共用准备序列：纯 JSON 威胁源保留本地、空域名规则/空内容页软跳过，
+		// 然后才执行行级结构门，保证预览摘要/告警与实际导入一致。
+		skipWarnings, prepErr := prepareV2BackupSkips(&backup, lbbakPayloadFromCtx(c), sectionTables)
+		if prepErr != nil {
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: prepErr.Error()}})
+			return
+		}
+		// 历史问题：行级门在 sections 过滤与软跳过之后（与导入同序）。
 		if err := validateV2BackupRows(backup); err != nil {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
@@ -658,10 +705,6 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: "备份 users 表为空，导入将清空全部账户，已拒绝"}})
 			return
 		}
-		skipWarnings := skipEmptyDomainHTTPRules(backup.Tables)
-		// N+13 H2-F3：与 ImportConfigBackup 同序——空内容拦截页软跳过也须
-		// 进预览，否则预览静默、导入才跳（summary/warnings 口径一致）。
-		skipWarnings = append(skipWarnings, skipEmptyBlockPages(backup.Tables)...)
 		if err := validateV2BackupCertJobStatuses(backup.Tables); err != nil {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
@@ -681,7 +724,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
-		if err := validateV2BackupRules(backup.Tables); err != nil {
+		if err := validateV2BackupRules(backup.Tables, h.validateRuleListenPortForSave); err != nil {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
@@ -746,6 +789,9 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		// (与导入侧 历史问题-F3 口径一致)。
 		validateWarnings := skipWarnings[:0:0]
 		validateWarnings = append(validateWarnings, skipWarnings...)
+		if warning := backupProductVersionWarning(backup.Meta, h.cfg.Version); warning != "" {
+			validateWarnings = append(validateWarnings, warning)
+		}
 		if crsTreeReplaced {
 			validateWarnings = append(validateWarnings, warningCRSTreeReplaced)
 		}
@@ -815,7 +861,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			return
 		}
 		rules, conversionWarnings := convertV1Rules(proxies, upstreams)
-		validRules, validationSkips, normalizations := validateConvertedV1Rules(rules)
+		validRules, validationSkips, normalizations := validateConvertedV1Rules(rules, h.validateRuleListenPortForSave)
 		allWarnings := append(conversionWarnings, validationSkips...)
 		allWarnings = append(allWarnings, normalizations...)
 		if len(validRules) == 0 {
@@ -862,7 +908,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	}
 	body, err := c.GetRawData()
 	if isRequestBodyTooLarge(err) {
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "备份文件不能超过 48MB"})
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage})
 		return
 	}
 	if err != nil {
@@ -891,7 +937,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		return
 	}
 	rules, conversionWarnings := convertV1Rules(proxies, upstreams)
-	validRules, validationSkips, normalizations := validateConvertedV1Rules(rules)
+	validRules, validationSkips, normalizations := validateConvertedV1Rules(rules, h.validateRuleListenPortForSave)
 	var allWarnings []string
 	allWarnings = append(allWarnings, conversionWarnings...)
 	allWarnings = append(allWarnings, validationSkips...)
@@ -909,6 +955,12 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	}
 	defer session.close()
 	tx := session.tx
+	restoreImportNodeRole, err := suppressImportClusterVersionBumps(ctx, tx)
+	if err != nil {
+		err = session.abort(err)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "准备导入事务失败，已回滚: " + err.Error()})
+		return
+	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM path_rules"); err != nil {
 		err = session.abort(err)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧路径规则失败，已回滚: " + err.Error()})
@@ -986,10 +1038,20 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	// 协议门，TCP 行可携带 host_header/enable_compress/compress_types 死值落库。
 	// INSERT 后统一调与 v2 备份导入共享的 normalizeRuleRowsForTransport（单一
 	// 事实源）。
-	if err := normalizeRuleRowsForTransport(ctx, tx); err != nil {
+	droppedTCPBindings, err := normalizeRuleRowsForTransport(ctx, tx)
+	if err != nil {
 		err = session.abort(err)
 		recordAudit(c, "导入失败", "配置备份", err.Error())
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入规则归一失败，已回滚: " + err.Error()})
+		return
+	}
+	if droppedTCPBindings > 0 {
+		allWarnings = append(allWarnings, fmt.Sprintf("已解除 %d 条 TCP 规则的安全策略绑定（TCP 不参与策略渲染）", droppedTCPBindings))
+	}
+	if err := restoreImportNodeRole(); err != nil {
+		err = session.abort(err)
+		recordAudit(c, "导入失败", "配置备份", err.Error())
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "恢复导入前节点角色失败，已回滚: " + err.Error()})
 		return
 	}
 	if err := session.commit(affectedRuleIDs, pendingCerts); err != nil {

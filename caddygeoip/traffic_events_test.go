@@ -22,7 +22,8 @@ func TestTrafficEventRing_recordsAndSnapshots(t *testing.T) {
 		t.Fatalf("event0=%+v", events[0])
 	}
 	more, _ := trafficEventSnapshot(events[0].Seq, 10)
-	if len(more) != 1 || more[0].Country != "美国" {
+	// 「美国」入口归一为英文规范名（A85PLG 历史问题，与计数桶/app 聚合同口径）。
+	if len(more) != 1 || more[0].Country != "United States" {
 		t.Fatalf("incremental=%+v", more)
 	}
 	releaseTrafficLease("events-test")

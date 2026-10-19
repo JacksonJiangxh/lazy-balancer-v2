@@ -109,9 +109,9 @@ func tokenHash(token string) string {
 // 上报/改访问地址」的 TOCTOU 类别。
 const masterRoleConditionSQL = `(SELECT COALESCE(is_master,1) FROM global_config WHERE id=1)=1`
 
-// nodeWriteMissError 在带角色条件的节点写命中 0 行后区分「已降级」与
-// 「节点不存在」：角色读取失败按内部错误上抛（不误报 404/403）。
-func (s *ClusterService) nodeWriteMissError(ctx context.Context) error {
+// masterScopeMissError 在带 SQL 角色条件的读写命中 0 行后复核角色：
+// 已降级统一返回 403 哨兵；主节点下的 0 行由调用方提供 NotFound/内部错误语义。
+func (s *ClusterService) masterScopeMissError(ctx context.Context, fallback error) error {
 	isMaster, err := RoleOf(ctx, s.db)
 	if err != nil {
 		return fmt.Errorf("复核节点角色: %w", err)
@@ -119,7 +119,12 @@ func (s *ClusterService) nodeWriteMissError(ctx context.Context) error {
 	if !isMaster {
 		return ErrNotMasterNode
 	}
-	return ErrNodeNotFound
+	return fallback
+}
+
+// nodeWriteMissError 区分节点写未生效时的「已降级」与「节点不存在」。
+func (s *ClusterService) nodeWriteMissError(ctx context.Context) error {
+	return s.masterScopeMissError(ctx, ErrNodeNotFound)
 }
 
 func permanentClusterToken(registrationSecret string) string {
@@ -130,7 +135,7 @@ func permanentClusterToken(registrationSecret string) string {
 func (s *ClusterService) GenerateRegisterToken(ctx context.Context, createdBy int, now time.Time) (string, time.Time, error) {
 	// A-M2 令牌卫生：生成新令牌前作废所有未使用令牌（一次性语义——重新生成即让旧令牌
 	// 失效），并顺带删除已过期记录（GC），避免令牌表无限增长、旧令牌残留可复用。
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM cluster_register_tokens WHERE used_at IS NULL OR expires_at < ?`, now.UTC()); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM cluster_register_tokens WHERE (used_at IS NULL OR expires_at < ?) AND `+masterRoleConditionSQL, now.UTC()); err != nil {
 		return "", time.Time{}, fmt.Errorf("清理旧注册令牌: %w", err)
 	}
 	token, err := randomHex(32)
@@ -138,9 +143,17 @@ func (s *ClusterService) GenerateRegisterToken(ctx context.Context, createdBy in
 		return "", time.Time{}, err
 	}
 	expiresAt := now.UTC().Add(30 * time.Minute)
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO cluster_register_tokens (token_hash, expires_at, created_by, created_at) VALUES (?, ?, ?, ?)`,
-		tokenHash(token), expiresAt, createdBy, now.UTC()); err != nil {
+	result, err := s.db.ExecContext(ctx, `INSERT INTO cluster_register_tokens (token_hash, expires_at, created_by, created_at) SELECT ?, ?, ?, ? WHERE `+masterRoleConditionSQL,
+		tokenHash(token), expiresAt, createdBy, now.UTC())
+	if err != nil {
 		return "", time.Time{}, fmt.Errorf("保存注册令牌: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("读取注册令牌保存结果: %w", err)
+	}
+	if inserted != 1 {
+		return "", time.Time{}, s.masterScopeMissError(ctx, fmt.Errorf("保存注册令牌: 影响 %d 行", inserted))
 	}
 	return token, expiresAt, nil
 }
@@ -329,8 +342,18 @@ func (s *ClusterService) RegistrationStatus(ctx context.Context, nodeID int, sec
 		// cluster_snapshot.go 的 Snapshot() 清除。这是有意设计：从节点可能在收到
 		// token 前遭遇网络问题，需要重复调用 RegistrationStatus 重新获取同一 token。
 		// 详见 TestClusterService_ApproveNode_redelivers_cluster_token_until_confirmed。
-		if _, err := tx.ExecContext(ctx, "UPDATE nodes SET cluster_token_hash=?, cluster_token_delivered=1 WHERE id=? AND "+masterRoleConditionSQL, tokenHash(clusterToken), nodeID); err != nil {
+		result, err := tx.ExecContext(ctx, "UPDATE nodes SET cluster_token_hash=?, cluster_token_delivered=1 WHERE id=? AND "+masterRoleConditionSQL, tokenHash(clusterToken), nodeID)
+		if err != nil {
 			return models.ClusterRegistrationStatus{}, fmt.Errorf("保存集群令牌: %w", err)
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return models.ClusterRegistrationStatus{}, fmt.Errorf("读取集群令牌保存结果: %w", err)
+		}
+		if updated != 1 {
+			// 先回滚再复核角色：nodeWriteMissError 使用独立连接，不能在持锁事务内调用。
+			_ = tx.Rollback()
+			return models.ClusterRegistrationStatus{}, s.nodeWriteMissError(ctx)
 		}
 		response.ClusterToken = clusterToken
 	} else if status != "pending" {
@@ -444,8 +467,21 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	// 历史问题-05(a)：last_sync 与 applied_version 同语义——旧集群的同步时间对
 	// 新主节点无意义；此前漏置 NULL 让 Status() 继续格式化旧集群时间（与
 	// BecomeSlave 的 历史问题 对称缺失）。
-	if _, err := tx.ExecContext(ctx, `UPDATE global_config SET is_master=1, master_url='', cluster_token='', registration_id=0, registration_secret='', applied_version=0, sync_fingerprint='', last_sync_error='', registration_confirm_failures=0, last_sync=NULL WHERE id=1`); err != nil {
+	result, err := tx.ExecContext(ctx, `UPDATE global_config SET is_master=1, master_url='', cluster_token='', registration_id=0, registration_secret='', applied_version=0, sync_fingerprint='', last_sync_error='', registration_confirm_failures=0, last_sync=NULL, applied_waf_ref_hash='', applied_waf_ref_version=0 WHERE id=1`)
+	if err != nil {
 		return fmt.Errorf("重置主节点状态: %w", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("读取主节点状态重置结果: %w", err)
+	}
+	if updated != 1 {
+		return fmt.Errorf("重置主节点状态: 影响 %d 行", updated)
+	}
+	// 已应用节哈希与 WAF 文件态只属于旧拓扑；与角色更新同事务清空，
+	// 后续再次切从时首轮按新主节点重建，不沿用旧集群的跳过/漂移依据。
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_applied_sections`); err != nil {
+		return fmt.Errorf("清理主节点已应用节记账: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交提升事务: %w", err)

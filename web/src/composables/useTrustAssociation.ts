@@ -88,17 +88,20 @@ export const useTrustAssociation = (options: {
     const lead = parseRefIds(policy[cfg.refField]).length === 0
       ? `策略「${policy.name}」尚未关联${cfg.verb}用地址列表`
       : `策略「${policy.name}」同侧仅关联系统内置名单（快捷处置不直接操作系统名单）`
-    try {
-      await ElMessageBox.confirm(
-        `${lead}，将创建「${policy.name}${cfg.suffix}」并把 ${ip} 加入${tip}。是否继续？`,
-        `创建列表并${cfg.verb}`,
-        { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' },
-      )
-    } catch {
-      return
-    }
+    // A85WB-历史问题：确认框弹出前即占位——双击不再叠两个确认框/重复创建
+    // （原 creating 在 confirm 之后才置位）。
+    if (creating.value) return
     creating.value = true
     try {
+      try {
+        await ElMessageBox.confirm(
+          `${lead}，将创建「${policy.name}${cfg.suffix}」并把 ${ip} 加入${tip}。是否继续？`,
+          `创建列表并${cfg.verb}`,
+          { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' },
+        )
+      } catch {
+        return
+      }
       // 历史 历史问题：同侧已有同名未引用列表（历史创建后解绑）时复用而非
       // 重复创建——按名称在现有列表中查找（category 无关，仅看名字精确相等）。
       const wantName = `${policy.name}${cfg.suffix}`
@@ -137,17 +140,19 @@ export const useTrustAssociation = (options: {
 
   /** 从引用列表移除 IP（关联保留） */
   const removeFromSideRef = async (list: TrustListRef, ip: string): Promise<void> => {
-    try {
-      await ElMessageBox.confirm(
-        `将从地址列表「${list.name}」移除 ${ip}。是否继续？`,
-        '从列表移除',
-        { confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning' },
-      )
-    } catch {
-      return
-    }
+    // A85WB-历史问题：确认框弹出前即占位（双击重入锁）
+    if (creating.value) return
     creating.value = true
     try {
+      try {
+        await ElMessageBox.confirm(
+          `将从地址列表「${list.name}」移除 ${ip}。是否继续？`,
+          '从列表移除',
+          { confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning' },
+        )
+      } catch {
+        return
+      }
       const res = await request.post<APIResponse<{ removed?: boolean }>>(`/security/ip-lists/${list.id}/remove-ip`, { value: ip })
       if (res.data?.removed !== true) {
         ElMessage.info(`列表「${list.name}」中没有 ${ip} 的精确条目；若由 CIDR 覆盖，请编辑列表处理`)

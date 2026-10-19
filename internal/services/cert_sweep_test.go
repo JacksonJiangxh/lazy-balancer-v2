@@ -44,6 +44,33 @@ func seedOrphanCertJob(t *testing.T, ruleID, domain, status string) int {
 	return int(id)
 }
 
+func TestCertJobsActive_nilDBSkipsWithoutMaskingQueryErrors(t *testing.T) {
+	useCertSweepTickTestEnv(t)
+	seedOrphanCertJob(t, "lb_nil_guard", "nil-guard.example.test", "queued")
+	if !certJobsActive() {
+		t.Fatal("non-terminal certificate job was not reported active")
+	}
+
+	// Given/When：DB 尚未装配的启动窗口。
+	database := db.DB
+	db.DB = nil
+
+	// Then：按无活处理并静默跳过，不得 nil dereference。
+	if certJobsActive() {
+		t.Fatal("nil database must not report certificate work as runnable")
+	}
+	CertWaitingCATickOnce()
+
+	// 回归：普通查询错误仍维持「宁扫勿漏」，不被 nil 守卫吞掉。
+	db.DB = database
+	if err := database.Close(); err != nil {
+		t.Fatalf("close test database: %v", err)
+	}
+	if !certJobsActive() {
+		t.Fatal("query errors must retain fail-visible active=true safety semantics")
+	}
+}
+
 // 历史问题-02：sweepOrphanedCertJobs 返回值必须等于实际收敛的孤儿任务数——
 // CertReconcileOnce 的「孤儿清理 %d 个」任务日志行直接消费该值，swept 恒 0
 // 使对账轮永远上报「清理 0 个」。

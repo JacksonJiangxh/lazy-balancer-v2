@@ -130,6 +130,10 @@ func TestSecurityWrites_serializeWithRuleWrites(t *testing.T) {
 
 	// When：规则域视角持锁（模拟并发的规则写/手动重载），安全写必须阻塞
 	handler.caddyOpMu.Lock()
+	prelockReached := make(chan struct{})
+	oldPrelockHook := createSecurityCustomRulePreLockHook
+	createSecurityCustomRulePreLockHook = func() { close(prelockReached) }
+	t.Cleanup(func() { createSecurityCustomRulePreLockHook = oldPrelockHook })
 	done := make(chan struct{})
 	go func() {
 		request := httptest.NewRequest(http.MethodPost, "/security/custom-rules", strings.NewReader(body))
@@ -137,11 +141,19 @@ func TestSecurityWrites_serializeWithRuleWrites(t *testing.T) {
 		router.ServeHTTP(httptest.NewRecorder(), request)
 		close(done)
 	}()
+	// 已确证请求到达 caddyOpMu 入口且主协程仍持锁，因此它不可能已经完成；
+	// 不再用 200ms 作为「尚未被调度」的假绿窗口。
+	select {
+	case <-prelockReached:
+	case <-time.After(5 * time.Second):
+		handler.caddyOpMu.Unlock()
+		t.Fatal("security write did not reach caddyOpMu")
+	}
 	select {
 	case <-done:
 		handler.caddyOpMu.Unlock()
 		t.Fatal("安全写未与规则写共享 caddyOpMu（持锁期间应阻塞）")
-	case <-time.After(200 * time.Millisecond):
+	default:
 	}
 
 	// Then：释放后安全写完成且成功

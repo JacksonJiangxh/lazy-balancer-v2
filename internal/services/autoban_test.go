@@ -274,6 +274,33 @@ func TestAutobanObserve_gates(t *testing.T) {
 	})
 }
 
+// Given 验证爬虫豁免与爬虫伪装拦截同时进入自动封禁喂入。
+// When 按来源资格过滤。
+// Then 只排除真实豁免段，伪装 deny 与普通 WAF 事件继续计数，畸形 ID 不误排除。
+func TestAutobanObserve_crawlerSpoofRemainsEligible(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", true)
+
+	autobanObserveBatch([]autobanFeedItem{
+		{IP: "203.0.113.10", Action: "logged", RuleTriggered: "810016"},
+		{IP: "203.0.113.11", Action: "blocked", RuleTriggered: "850001"},
+		{IP: "203.0.113.12", Action: "blocked", RuleTriggered: "899999"},
+		{IP: "203.0.113.13", Action: "blocked", RuleTriggered: "942100"},
+		{IP: "203.0.113.14", Action: "blocked", RuleTriggered: "not-a-rule"},
+	})
+
+	autobanMu.Lock()
+	defer autobanMu.Unlock()
+	if autobanWindows["203.0.113.10"] != nil {
+		t.Fatal("验证爬虫豁免事件不得进入自动封禁计数")
+	}
+	for _, ip := range []string{"203.0.113.11", "203.0.113.12", "203.0.113.13", "203.0.113.14"} {
+		if w := autobanWindows[ip]; w == nil || w.Count != 1 {
+			t.Fatalf("%s 计数=%+v, want 1（伪装/普通/畸形 ID 不得误排除）", ip, w)
+		}
+	}
+}
+
 // ---- 配置：校验 + 口径/窗口变更重置 ----
 
 func TestAutobanConfig_validation(t *testing.T) {
@@ -1225,8 +1252,44 @@ func TestAutobanCounter_tieredLogging(t *testing.T) {
 	}
 	f.Advance(6 * time.Minute)
 	autobanCandidates(3, 5*time.Minute)
-	if got := strings.Count(autobanLogNow(t), "IP 203.0.113.7 计数窗口过期，清零"); got != 1 {
-		t.Fatalf("Run 修剪路径清零日志=%d 行, want 1（同链保留）:\n%s", got, autobanLogNow(t))
+	if got := strings.Count(autobanLogNow(t), "1 个 IP 计数窗口过期，清零"); got != 1 {
+		t.Fatalf("Run 修剪路径汇总清零日志=%d 行, want 1（同链保留）:\n%s", got, autobanLogNow(t))
+	}
+	if !strings.Contains(autobanLogNow(t), "203.0.113.7") {
+		t.Fatalf("汇总清零日志应保留 IP 样本:\n%s", autobanLogNow(t))
+	}
+}
+
+// Given 同一轮有多个曾达阈值的过期 IP 与一个未达阈值过期 IP。
+// When 修剪计数桶。
+// Then 只写一条按轮汇总日志，样本有界且候选评估不丢失。
+func TestAutobanCandidates_aggregateExpiryLog(t *testing.T) {
+	f := installAutobanFixture(t, "2026-10-14 10:00:00")
+	for i := 1; i <= 6; i++ {
+		AutobanSeedCounterForTest(fmt.Sprintf("203.0.113.%d", i), 1, 1)
+	}
+	AutobanSeedCounterForTest("203.0.113.99", 0, 1)
+	f.Advance(6 * time.Minute)
+
+	candidates := autobanCandidates(1, 5*time.Minute)
+
+	if len(candidates) != 6 {
+		t.Fatalf("过期达标候选=%d, want 6（汇总日志不得改变评估）", len(candidates))
+	}
+	log := autobanLogNow(t)
+	if got := strings.Count(log, "计数窗口过期，清零"); got != 1 {
+		t.Fatalf("过期清零日志=%d 行, want 1（按轮汇总）:\n%s", got, log)
+	}
+	if !strings.Contains(log, "6 个 IP 计数窗口过期，清零") || !strings.Contains(log, "另有 1 个") {
+		t.Fatalf("汇总行应包含总数与截断余量:\n%s", log)
+	}
+	if strings.Contains(log, "203.0.113.99") {
+		t.Fatalf("未达阈值 IP 不得进入过期汇总:\n%s", log)
+	}
+	for i := 1; i <= 6; i++ {
+		if strings.Count(log, fmt.Sprintf("203.0.113.%d", i)) > 1 {
+			t.Fatalf("IP %d 仍被逐条写日志:\n%s", i, log)
+		}
 	}
 }
 

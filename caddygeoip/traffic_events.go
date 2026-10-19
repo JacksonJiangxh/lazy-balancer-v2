@@ -41,8 +41,10 @@ func resetTrafficEvents() {
 }
 
 // trafficEventRecord 记录一条正常请求（抽样在写入前完成）。国名键非国家值
-// （空/0/Reserved）不记录——与计数桶及聚合端点同口径（E81-历史问题）。
+// （空/0/Reserved）不记录——与计数桶及聚合端点同口径（E81-历史问题）；异体
+// 归一与计数桶同 helper（A85PLG 历史问题，事件流与计数桶键口径一致）。
 func trafficEventRecord(country, province string) {
+	country = normalizeTrafficCountryKey(country)
 	if !trafficCountryKeyValid(country) || !trafficCollectorActive() {
 		return
 	}

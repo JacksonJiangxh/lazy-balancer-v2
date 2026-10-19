@@ -132,6 +132,10 @@
       </el-col>
     </el-row>
 
+    <div v-if="overview.backfill_incomplete" class="info-note-bar">
+      <span class="info-note-desc">原始事件仅保留自 {{ overview.raw_coverage_from }}，更早区间无法重建，7 天趋势 / Top 10 源 IP / 攻击类型统计可能少计</span>
+    </div>
+
     <el-row :gutter="20" class="mb-5">
       <el-col :span="16">
         <el-card shadow="always">
@@ -285,6 +289,7 @@ interface Overview {
   today_blocked: number; today_detected: number; active_policies: number; crs_version: string
   crs_available?: boolean; ip2region_available?: boolean; update_status?: string
   trend: TrendPoint[]; top_ips: TopIP[]; attack_types: AttackType[]; attack_types_stage: AttackType[]
+  raw_coverage_from?: string; backfill_incomplete?: boolean
 }
 interface SecurityEvent { id: number; event_time: string; client_ip: string; rule_caddy_id: string; rule_name: string; policy_name: string; ip_location?: string }
 
@@ -299,7 +304,7 @@ const topIpAttackLabel = (row: TopIP): string => {
   if (!attackByStage.value) return row.attack_type || '—'
   return row.attack_type_stage || '—'
 }
-const overview = ref<Overview>({ today_blocked: 0, today_detected: 0, active_policies: 0, crs_version: '', trend: [], top_ips: [], attack_types: [], attack_types_stage: [] })
+const overview = ref<Overview>({ today_blocked: 0, today_detected: 0, active_policies: 0, crs_version: '', trend: [], top_ips: [], attack_types: [], attack_types_stage: [], raw_coverage_from: '', backfill_incomplete: false })
 // 分布图展示模式：勾选=按阶段五桶（默认，与触发阶段口径一致）；取消=具体分类
 // 总览加载失败（如 metrics 库故障导致后端 500）时置位：避免把全零面板
 // 误当「无攻击」，用户目标与 历史问题 D2 的后端显式报错对齐（历史问题 F1）。

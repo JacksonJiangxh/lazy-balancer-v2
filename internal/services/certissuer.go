@@ -56,6 +56,27 @@ type certificateDeploymentError struct {
 func (e *certificateDeploymentError) Error() string { return e.err.Error() }
 func (e *certificateDeploymentError) Unwrap() error { return e.err }
 
+// certificateRoleError marks post-issuance role confirmation failures. They
+// are lifecycle/infrastructure interruptions, not CA failures, and must not
+// consume renewal attempts when the queue classifies the returned error.
+type certificateRoleError struct {
+	err error
+}
+
+func (e *certificateRoleError) Error() string { return e.err.Error() }
+func (e *certificateRoleError) Unwrap() error { return e.err }
+
+func checkCertificateIssuanceRole(ctx context.Context) error {
+	isMaster, err := RoleOf(ctx, db.DB)
+	if err != nil {
+		return &certificateRoleError{err: fmt.Errorf("读取主从角色失败: %w", err)}
+	}
+	if !isMaster {
+		return &certificateRoleError{err: errors.New("节点已切换为从节点，停止保存签发结果")}
+	}
+	return nil
+}
+
 // CAProviderRateLimitError indicates the CA rejected the request with 429.
 type CAProviderRateLimitError struct {
 	RetryAfter time.Duration
@@ -180,20 +201,25 @@ func rescanDroppedCertificateDeploymentRetries() {
 	}
 }
 
+// ErrCertificateDeploymentRetryBusy marks a manual retry refused because an
+// earlier deployment callback for the same job is still unwinding; the service
+// is running and reporting it as "stopped" would misdiagnose the condition.
+var ErrCertificateDeploymentRetryBusy = errors.New("证书部署重试回调仍在退出中")
+
 // RetryCertificateDeploymentNow 手动重试入口（历史问题 历史）：把 downloaded
 // 任务的部署重试立即重排（取消挂起的退避 timer 并在当前时刻执行一次部署）。
-// 证书服务未运行（测试/启动窗口）时返回 false——调用方已把
-// deployment_available_after 推到 now，启动恢复/周期补扫会接手，不会丢失。
-func RetryCertificateDeploymentNow(jobID int, ruleID string) bool {
+// 返回 nil 表示 timer 已登记；服务停止返回 ErrCertificateQueueInactive，旧回调
+// 未退出返回 ErrCertificateDeploymentRetryBusy。deployment_available_after
+// 已由调用方推到 now，启动恢复/周期补扫仍会接手，不会丢失。
+func RetryCertificateDeploymentNow(jobID int, ruleID string) error {
 	certificateServiceMu.Lock()
 	service := certificateService
 	certificateServiceMu.Unlock()
 	if service == nil {
 		Logf("warn", "证书服务未运行：任务 %d 的部署重试将在服务启动/补扫时执行", jobID)
-		return false
+		return ErrCertificateQueueInactive
 	}
-	service.scheduleDeploymentRetry(jobID, ruleID, 0)
-	return true
+	return service.scheduleDeploymentRetry(jobID, ruleID, 0)
 }
 
 func retryCertificateDeployment(ctx context.Context, jobID int, reloader func() error) error {
@@ -549,12 +575,8 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 		return err
 	}
 	// 历史 历史问题: 区分 DB 错误与角色变化，避免误报"节点切换为从节点"。
-	isMaster, err := RoleOf(ctx, db.DB)
-	if err != nil {
-		return fmt.Errorf("读取主从角色失败: %w", err)
-	}
-	if !isMaster {
-		return fmt.Errorf("节点已切换为从节点，停止保存签发结果")
+	if err := checkCertificateIssuanceRole(ctx); err != nil {
+		return err
 	}
 
 	if err := s.deployIssuedCertificate(ctx, jobID, issuedCertificate{

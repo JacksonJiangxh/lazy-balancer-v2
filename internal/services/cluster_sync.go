@@ -204,8 +204,8 @@ func (s *SyncService) do(req *http.Request) (*http.Response, error) {
 	return s.doWithTLSUpgradeRedirect(req)
 }
 
-// doWithTLSUpgradeRedirect 处理同主机 http→https 301/308:主节点启用管理
-// HTTPS 后明文端口整体 301(TCP 嗅探层,早于路由),而本客户端
+// doWithTLSUpgradeRedirect 处理同主机 http→https 301/302/307/308:主节点启用管理
+// HTTPS 后明文端口整体 301/302(TCP 嗅探层,早于路由),而本客户端
 // CheckRedirect=ErrUseLastResponse 会让从节点拿到空 body 走 JSON 解析,
 // 报「解析集群快照: unexpected end of JSON input」且无自愈路径(2026-09-18
 // 实测)。仅当 Location 与原请求**同主机名**且升级为 https 时按原方法重放
@@ -709,7 +709,7 @@ func (s *SyncService) RegisterWithMaster(ctx context.Context, masterURL string, 
 		return models.ClusterRegistration{}, fmt.Errorf("连接主节点失败: %w", err)
 	}
 	defer resp.Body.Close()
-	// 历史问题-1(D1):未跟随的 3xx(跨主机重定向/302/307)在读 body 前拦截——
+	// 历史问题-1(D1):未跟随的 3xx(跨主机/反代重定向)在读 body 前拦截——
 	// 同主机 https 升级已由 doWithTLSUpgradeRedirect 重放,残留 3xx 的空 body
 	// 落进 JSON 解析只会报「unexpected end of JSON input」;给与 Pull 3xx
 	// 分支同款的可行动指引。

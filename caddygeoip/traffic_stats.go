@@ -10,8 +10,9 @@ package caddygeoip
 //     每 N 个请求计 1 次×N 还原），翻秒且上一秒计数低于阈值 1/4 时回落 N=1。
 //     误差口径披露：抽样期估计量=真值±N/2（整秒口径无偏），瞬时分布有量化
 //     误差——大屏光流为密度示意，可接受。
-//   - 国名口径：geoip2region 写入的 Caddy 变量 geoip.country_name（xdb 英文
-//     名/「中国」），由 app 代理端点翻译为中文（app 单源 geoipnames）；
+//   - 国名口径：计数/事件桶键经 geoipnames.NormalizeCountry 归一（xdb 中文
+//     异体如「美国」折叠为英文规范名；「中国」保留）——app 聚合端点按翻译
+//     后中文名重建 map（覆盖语义），异体分键会被丢计数（A85PLG 历史问题）；
 //     客户端请求头不参与计数，本模块不加依赖。
 //   - 统计边界：计数由链尾 lb_security_blocked_counter 执行；国名只来自
 //     geoip2region 的服务端变量。未启用地域能力的规则没有该变量，因此不产生
@@ -28,6 +29,8 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+
+	"lazy-balancer-v2/geoipnames"
 )
 
 type trafficEntry struct {
@@ -120,13 +123,27 @@ func trafficEntryFor(country string) *trafficEntry {
 	return e
 }
 
+// normalizeTrafficCountryKey 归一统计/事件桶的国名键（A85PLG 历史问题）：
+// TrimSpace 后海外异体（xdb 中文「美国」等）经 geoipnames.NormalizeCountry
+// 折叠为规范名——与发射侧 geoipLocFor（handler.go）同表同函数；「中国」
+// 保留（NormalizeCountry 对其返回空串，须前置保留）；无效值（空/0/Reserved）
+// 折叠为空串，由 trafficCountryKeyValid 过滤。归一在入口完成：app 聚合端点
+// 按翻译后中文名重建 map 是覆盖语义，异体分键会丢一桶计数。
+func normalizeTrafficCountryKey(country string) string {
+	country = strings.TrimSpace(country)
+	if country == "中国" {
+		return country
+	}
+	return geoipnames.NormalizeCountry(country)
+}
+
 // trafficRecord 记一次请求（country 非国家值=未解析/私网保留段——跳过；
 // 抽样期按 1/N 计数并 ×N 还原）。
 func trafficRecord(country string, attack bool) {
-	// E83-历史问题：国名键与发射侧/校验侧同口径 TrimSpace——否则空白异形
-	// 国家列（" 中国"）通过校验（校验本身 Trim）却建成带空格的独立脏桶，
-	// 大屏出现两个「中国」桶。发射侧已归一，此处为纵深防御。
-	country = strings.TrimSpace(country)
+	// E83-历史问题 + A85PLG 历史问题：国名键 TrimSpace + 异体归一——否则空白异形
+	// （" 中国"）与中文异体（"美国"）各建脏桶，大屏出现重复国桶且 app 侧
+	// 覆盖式聚合丢计数。发射侧已归一，此处为纵深防御。
+	country = normalizeTrafficCountryKey(country)
 	if !trafficCountryKeyValid(country) {
 		return
 	}

@@ -14,7 +14,7 @@ var taskLogSizeBytesFn func() int64
 
 func SetTaskLogSizeBytesFn(fn func() int64) { taskLogSizeBytesFn = fn }
 
-func TaskLogSizeBytes() int64 {
+func taskLogSizeBytes() int64 {
 	if taskLogSizeBytesFn != nil {
 		return taskLogSizeBytesFn()
 	}
@@ -75,17 +75,17 @@ func RotateTaskLogBeforeWrite(path string, incoming int64, keep int) (bool, erro
 	if err != nil {
 		return false, err
 	}
-	if info.Size()+incoming <= TaskLogSizeBytes() {
+	if info.Size()+incoming <= taskLogSizeBytes() {
 		return false, nil
 	}
-	if err := RotateTaskLogFile(path, keep); err != nil {
+	if err := rotateTaskLogFile(path, keep); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-// RotateTaskLogFile 把 current 逐代下移到 .1（.1→.2 …），删除最旧代。
-func RotateTaskLogFile(path string, keep int) error {
+// rotateTaskLogFile 把 current 逐代下移到 .1（.1→.2 …），删除最旧代。
+func rotateTaskLogFile(path string, keep int) error {
 	if keep < 1 {
 		keep = 1
 	}

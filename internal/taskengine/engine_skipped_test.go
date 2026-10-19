@@ -24,6 +24,23 @@ func TestTerminalStatus_mapsSkippedSentinel(t *testing.T) {
 	}
 }
 
+// A85历史问题-3：demote 同时取消 ctx 并返回 ErrTaskSkipped；非故障放弃必须
+// 优先于通用 cancelled，才能与用户主动取消区分。
+func TestTerminalStatus_demoteSkipPrecedesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := terminalStatus(ctx, fmt.Errorf("角色降级，本轮中止: %w", ErrTaskSkipped)); got != "skipped" {
+		t.Fatalf("demote skipped 终态=%q, want skipped", got)
+	}
+	// 真值表回归：同一 cancelled ctx 下，普通错误与 nil 不得被误归为 skipped。
+	if got := terminalStatus(ctx, ErrAlreadyRunning); got != "cancelled" {
+		t.Fatalf("普通错误的取消终态=%q, want cancelled", got)
+	}
+	if got := terminalStatus(ctx, nil); got != "cancelled" {
+		t.Fatalf("nil 错误的取消终态=%q, want cancelled", got)
+	}
+}
+
 // TASK-5（历史 历史问题）：skipped 终态同样落 message——跳过原因此前只进
 // 任务日志 [done] 行，task_runs.message 恒空，任务历史页丢失「为何跳过」。
 func TestRunNow_skippedRunCarriesSkipReason(t *testing.T) {

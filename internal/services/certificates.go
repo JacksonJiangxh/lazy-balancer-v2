@@ -398,12 +398,12 @@ func waitDoneOrTimeout(done <-chan struct{}, timeout time.Duration, jobID int, w
 	}
 }
 
-func (s *CertificateService) scheduleDeploymentRetry(jobID int, ruleID string, delay time.Duration) {
+func (s *CertificateService) scheduleDeploymentRetry(jobID int, ruleID string, delay time.Duration) error {
 	for {
 		s.timerMu.Lock()
 		if s.stopping || s.timersPaused {
 			s.timerMu.Unlock()
-			return
+			return ErrCertificateQueueInactive
 		}
 		if previous := s.deploymentTimers[jobID]; previous != nil {
 			previous.canceled = true
@@ -449,7 +449,7 @@ func (s *CertificateService) scheduleDeploymentRetry(jobID int, ruleID string, d
 			s.timerMu.Unlock()
 			if stillRunning {
 				Logf("warn", "证书任务 %d：在途部署回调未在 %s 内退出，放弃本轮部署重试调度（补扫/恢复接管）", jobID, s.cancelWaitTimeout)
-				return
+				return ErrCertificateDeploymentRetryBusy
 			}
 			continue
 		}
@@ -486,7 +486,7 @@ func (s *CertificateService) scheduleDeploymentRetry(jobID int, ruleID string, d
 		})
 		s.deploymentTimers[jobID] = entry
 		s.timerMu.Unlock()
-		return
+		return nil
 	}
 }
 
@@ -630,9 +630,15 @@ func (s *CertificateService) rescanDroppedDeploymentRetries() {
 	for rows.Next() {
 		var job droppedRetry
 		if err := rows.Scan(&job.id, &job.ruleID, &job.jobDomain, &job.providerID, &job.deploymentAttempts, &job.ruleDomain, &job.applicable, &job.hasCertMaterial, &job.availableAfter); err != nil {
+			Logf("error", "resume deployment retries: scan row failed: %v", err)
 			continue
 		}
 		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		Logf("error", "resume deployment retries: iterate rows failed: %v", err)
+		_ = rows.Close()
+		return
 	}
 	// 先关闭读迭代器再写库：SQLite 连接池上行迭代未结束时写入会触发 SQLITE_BUSY。
 	if err := rows.Close(); err != nil {
@@ -739,6 +745,11 @@ func CertManualCheckOnce() {
 // certJobsActive 报告是否存在非终态证书任务（issued/failed/disabled 之外）——
 // 含 stranded queued / 断链 downloaded / 停车 waiting_ca 全部孤儿形态。
 func certJobsActive() bool {
+	if db.DB == nil {
+		// 启动/测试装配窗口没有可执行的数据库工作；与查询错误的「宁扫勿漏」
+		// 不同，nil DB 必须静默跳过而不是触发 nil dereference。
+		return false
+	}
 	var n int
 	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE status NOT IN ('issued','failed','disabled')`).Scan(&n); err != nil {
 		return true // 判定失败按有活处理——宁扫勿漏（安全网语义）
@@ -815,9 +826,15 @@ func (s *CertificateService) requeueWaitingCAJobs() {
 	for rows.Next() {
 		var job waitingJob
 		if err := rows.Scan(&job.id, &job.ruleID, &job.domain, &job.caProviderID, &job.ruleDomain, &job.ruleBound); err != nil {
+			Logf("error", "waiting_ca scan: scan row failed: %v", err)
 			continue
 		}
 		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		Logf("error", "waiting_ca scan: iterate rows failed: %v", err)
+		_ = rows.Close()
+		return
 	}
 	// 先关闭读迭代器再写库：SQLite 连接池上行迭代未结束时 UPDATE 会触发 SQLITE_BUSY。
 	if err := rows.Close(); err != nil {
@@ -1159,6 +1176,13 @@ func (s *CertificateService) Stop() {
 	s.timerMu.Lock()
 	s.stopping = true
 	s.timerMu.Unlock()
+	// 手动重试入口与后台补扫共用全局服务指针。停止时按实例身份摘除，
+	// 防止已停服务继续接受「立即部署」请求；旧代 Stop 不得误清新一代实例。
+	certificateServiceMu.Lock()
+	if certificateService == s {
+		certificateService = nil
+	}
+	certificateServiceMu.Unlock()
 	s.pauseDeploymentRetries()
 	s.cancel()
 	// D2-历史问题：done 仅由 Start 的 defer 关闭——Start 未执行的 Stop 不得裸
@@ -1213,20 +1237,29 @@ func upsertQueuedCertJob(ruleID string, list []string, caProviderID int) (int, b
 	return id, err == nil, err
 }
 
-// CreateOrRequeueCertJob creates a queued cert job for the rule and enqueues it.
-// Uses an atomic INSERT ... ON CONFLICT to avoid races between concurrent callers.
+// CreateOrRequeueCertJob creates a queued cert job and verifies it is either
+// active in the queue or the caller can report a precise enqueue failure.
 func CreateOrRequeueCertJob(ruleID, domains string, caProviderID int, qm *CAQueueManager) (int, error) {
+	jobID, _, err := CreateOrRequeueCertJobVerified(ruleID, domains, caProviderID, qm)
+	return jobID, err
+}
+
+// CreateOrRequeueCertJobVerified is CreateOrRequeueCertJob plus the transition
+// signal needed by rule-write compensation. It preserves the raw WithChange
+// result for manual issuance, but rejects a no-change result whose job is not
+// actually active in a running queue.
+func CreateOrRequeueCertJobVerified(ruleID, domains string, caProviderID int, qm *CAQueueManager) (int, bool, error) {
 	jobID, changed, err := CreateOrRequeueCertJobWithChange(ruleID, domains, caProviderID, qm)
 	if err != nil || changed {
-		return jobID, err
+		return jobID, changed, err
 	}
-	if jobID > 0 && qm.IsJobActive(jobID) {
-		return jobID, nil
+	if jobID > 0 && qm != nil && qm.IsJobActive(jobID) {
+		return jobID, false, nil
 	}
 	if qm != nil && !qm.IsActive() {
-		return jobID, fmt.Errorf("%w（任务 %d 未入队）", ErrCertificateQueueInactive, jobID)
+		return jobID, false, fmt.Errorf("%w（任务 %d 未入队）", ErrCertificateQueueInactive, jobID)
 	}
-	return jobID, fmt.Errorf("certificate job %d was not queued", jobID)
+	return jobID, false, fmt.Errorf("certificate job %d was not queued", jobID)
 }
 
 func CreateOrRequeueCertJobWithChange(ruleID, domains string, caProviderID int, qm *CAQueueManager) (int, bool, error) {
@@ -1253,7 +1286,7 @@ func CreateOrRequeueCertJobWithChange(ruleID, domains string, caProviderID int, 
 		return upsertQueuedCertJob(ruleID, list, caProviderID)
 	})
 	if err != nil {
-		return jobID, false, fmt.Errorf("create or enqueue cert job: %w", err)
+		return jobID, changed, fmt.Errorf("create or enqueue cert job: %w", err)
 	}
 	if !changed {
 		if jobID != 0 {

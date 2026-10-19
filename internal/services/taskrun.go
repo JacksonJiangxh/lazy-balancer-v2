@@ -17,20 +17,41 @@ const (
 // updateAttemptWaits 第 N 次失败后的重试等待（30s/60s）。
 var updateAttemptWaits = []time.Duration{30 * time.Second, 60 * time.Second}
 
-// updateRetrySleep 重试等待（测试可替换为即时返回）。
-var updateRetrySleep = func(d time.Duration) { time.Sleep(d) }
+// updateRetrySleep 重试等待（测试可替换为即时返回）。父 ctx 取消会立即
+// 中断等待；返回 nil 表示等待完整结束，可进入下一次尝试。
+var updateRetrySleep = func(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // runWithInTaskRetry 在同一任务内重试失败步骤：第 N 次失败后经 onWait 回调
 // （调用方落「等待 Ns 重试，第 x 次，共 x 次」日志），等待后重试；耗尽返回最后错误。
-func runWithInTaskRetry(op func() error, onWait func(nextAttempt int, wait time.Duration, err error)) error {
+// 父 runCtx 取消在每次操作后、等待前与等待中均优先返回，不得把手动取消
+// 当成瞬断再尝试。这里只检查父 ctx，不把源级 DeadlineExceeded 错当取消。
+func runWithInTaskRetry(ctx context.Context, op func() error, onWait func(nextAttempt int, wait time.Duration, err error)) error {
 	var err error
 	for attempt := 1; ; attempt++ {
-		if err = op(); err == nil || attempt >= updateMaxAttempts {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		err = op()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if err == nil || attempt >= updateMaxAttempts {
 			return err
 		}
 		wait := updateAttemptWaits[attempt-1]
 		onWait(attempt+1, wait, err)
-		updateRetrySleep(wait)
+		if err := updateRetrySleep(ctx, wait); err != nil {
+			return err
+		}
 	}
 }
 

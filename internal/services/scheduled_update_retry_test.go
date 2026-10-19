@@ -22,8 +22,46 @@ import (
 func stubUpdateRetrySleep(t *testing.T) {
 	t.Helper()
 	old := updateRetrySleep
-	updateRetrySleep = func(time.Duration) {}
+	updateRetrySleep = func(context.Context, time.Duration) error { return nil }
 	t.Cleanup(func() { updateRetrySleep = old })
+}
+
+// 边界基线钉：取消发生在首次失败后的退避中（而非底层请求中）时，
+// 默认等待同样必须立即退出，且不得进入第二次尝试。
+func TestRunWithInTaskRetry_cancelInterruptsBackoff(t *testing.T) {
+	oldWaits := updateAttemptWaits
+	updateAttemptWaits = []time.Duration{time.Hour}
+	t.Cleanup(func() { updateAttemptWaits = oldWaits })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	var attempts atomic.Int32
+	waiting := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- runWithInTaskRetry(ctx, func() error {
+			attempts.Add(1)
+			return errors.New("transient")
+		}, func(int, time.Duration, error) {
+			close(waiting)
+		})
+	}()
+	select {
+	case <-waiting:
+	case <-time.After(time.Second):
+		t.Fatal("未进入首次失败后的退避")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("退避取消 err=%v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("取消未中断任务内退避")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("退避取消后尝试次数=%d, want 1", got)
+	}
 }
 
 // Given：fetchLatestTag 连续 2 次瞬断、第 3 次成功（且 tag 更新）。

@@ -97,17 +97,24 @@ type configImportSession struct {
 // 超时后仍有执行中的签发任务——此时开始导入会让证书任务与全量替换并发，
 // 明确拒绝（409）而非沿用「已排干」假设。
 var errCertQueueDrainIncomplete = errors.New("证书任务执行中，请稍后重试")
+var errImportTaskDrainIncomplete = errors.New("在途任务未排空，请稍后重试")
 
 // importInFlightDrainTimeout 导入前排空在途任务的有界等待（历史问题-1，历史
-// 审计）：与证书队列 PauseAndDrain 的 30s 屏障同量级。超时不阻塞导入（部分
-// Run 体不消费取消信号），但留痕 warn + 审计。
-const importInFlightDrainTimeout = 30 * time.Second
+// 审计）：与证书队列 PauseAndDrain 的 30s 屏障同量级。A85历史问题-4 起超时
+// fail-closed 拒绝导入（部分 Run 体不消费取消信号），恢复调度并留失败审计，
+// 不再让旧任务与全量替换并发。
+var importInFlightDrainTimeout = 30 * time.Second
 
 // configImportBeginMu 串行化整个导入会话（B3-82-历史问题/历史问题-历史问题）：
 // Pause/Resume 是单布尔位，若两个导入都先 Pause 再抢 caddyOpMu，先结束者
 // Resume 会让后者在调度已恢复的状态下执行。此锁覆盖 Pause→事务→close，
 // 后到导入在暂停开始前排队。
 var configImportBeginMu sync.Mutex
+
+// 测试屏障（生产恒 nil）：分别在会话锁获取前与业务 prelock 获取前触发，
+// 供锁序测试用通道证明到达点，替代固定 sleep。
+var configImportBeginAttemptHook func()
+var configImportBeforePrelockHook func()
 
 // configImportBusy 探测导入会话是否持有全局导入锁（不阻塞）：启停/控制
 // 常驻任务在导入期间必须 409，避免绕过 PauseAndDrain（历史 历史问题-03）。
@@ -127,6 +134,9 @@ func (h *Handlers) beginConfigImport(ctx context.Context) (*configImportSession,
 // caddyOpMu 与开启事务之前调用 prelock（返回释放函数）。配置导入用它把
 // WAF 文件锁放在排空之后：先取锁会让阻塞在 wafFileMu 的更新任务无法被取消。
 func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock func() func()) (*configImportSession, error) {
+	if configImportBeginAttemptHook != nil {
+		configImportBeginAttemptHook()
+	}
 	configImportBeginMu.Lock()
 	releaseSession := func() { configImportBeginMu.Unlock() }
 	// 历史问题 / 历史问题-1（历史）：导入将全量替换业务数据——先暂停 tick
@@ -151,8 +161,12 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 		drained := engine.WaitInFlightRuns(drainCtx)
 		cancel()
 		if !drained {
-			services.Logf("warn", "配置导入：等待在途任务落定超时（%s），继续导入", importInFlightDrainTimeout)
-			services.RecordAuditLog("system", "导入警告", "配置备份", "导入前排空在途任务超时，已继续导入（可能在导入后仍有任务提交）", "")
+			services.Logf("warn", "配置导入：等待在途任务落定超时（%s），已中止导入", importInFlightDrainTimeout)
+			services.RecordAuditLog("system", "导入失败", "配置备份", "在途任务未排空，导入未执行（配置未修改）", "")
+			// 与 close 同序：先恢复本代暂停，再允许下一代导入进入。
+			resumeEngine()
+			releaseSession()
+			return nil, errImportTaskDrainIncomplete
 		}
 	}
 	// 历史问题-02（历史）：CA 队列 PauseAndDrain 必须先于 caddyOpMu——在途
@@ -171,13 +185,16 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 			if recovery.wasActive {
 				recovery.manager.Resume()
 			}
-			releaseSession()
 			resumeEngine()
+			releaseSession()
 			return nil, errCertQueueDrainIncomplete
 		}
 	}
 	releaseBeforeLock := releaseSession
 	if prelock != nil {
+		if configImportBeforePrelockHook != nil {
+			configImportBeforePrelockHook()
+		}
 		if release := prelock(); release != nil {
 			releaseBeforeLock = func() {
 				release()
@@ -187,8 +204,8 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 	}
 	releaseBegin := func() {
 		h.caddyOpMu.Unlock()
-		releaseBeforeLock()
 		resumeEngine()
+		releaseBeforeLock()
 	}
 	h.caddyOpMu.Lock()
 	session := &configImportSession{h: h, ctx: ctx, recovery: recovery, resumeEngine: resumeEngine, releaseBeforeLock: releaseBeforeLock}
@@ -213,7 +230,7 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 // respondImportBeginError 导入会话建立失败的统一响应：排空未完成 → 409
 // （可重试语义），其余（读规则/开事务）→ 500。
 func respondImportBeginError(c *gin.Context, err error) {
-	if errors.Is(err, errCertQueueDrainIncomplete) {
+	if errors.Is(err, errCertQueueDrainIncomplete) || errors.Is(err, errImportTaskDrainIncomplete) {
 		c.JSON(http.StatusConflict, models.APIResponse{Code: http.StatusConflict, Message: err.Error()})
 		return
 	}
@@ -225,12 +242,14 @@ func (session *configImportSession) close() {
 		_ = session.abort(errors.New("导入流程未完成"))
 	}
 	session.h.caddyOpMu.Unlock()
-	if session.releaseBeforeLock != nil {
-		session.releaseBeforeLock()
-	}
-	// 历史问题-1：导入全程（含失败 abort 的恢复动作）结束后才恢复 tick 派发。
+	// 历史问题-1/A85历史问题-1：导入全程（含失败 abort 的恢复动作）结束后
+	// 先恢复 tick，再释放串行会话锁。反向释放会让下一代导入的 Pause 被
+	// 本代 Resume 覆盖，破坏 Pause→事务→close 的串行排空不变量。
 	if session.resumeEngine != nil {
 		session.resumeEngine()
+	}
+	if session.releaseBeforeLock != nil {
+		session.releaseBeforeLock()
 	}
 }
 

@@ -217,9 +217,21 @@ type threatSourceRow struct {
 // （next_update 空或已过）——失败重试在任务内完成（runWithInTaskRetry），
 // 落定后下一运行=下一排程槽，不拖累健康源的重下载。
 func threatDueSources(trigger string) ([]threatSourceRow, error) {
+	// 源名由内置名单注册表驱动：未来新增源只需扩充注册表与源表种子，
+	// 不再复制第三份硬编码名单；未注册的历史爬虫源仍不会混入威胁任务。
+	args := make([]any, 0, len(db.ThreatSystemLists))
+	for _, source := range db.ThreatSystemLists {
+		if source.Source != "" {
+			args = append(args, source.Source)
+		}
+	}
+	if len(args) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(args)), ",")
 	rows, err := db.DB.Query(`SELECT id, name, url, COALESCE(next_update,''), COALESCE(consecutive_failures,0)
 		FROM security_threat_sources
-		WHERE update_enabled=1 AND name IN ('ustc','firehol_l1','et_compromised') ORDER BY id`)
+		WHERE update_enabled=1 AND name IN (`+placeholders+`) ORDER BY id`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -279,9 +291,12 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		detail := fmt.Sprintf("更新%s（触发：%s）", map[string]string{
 			"success": "成功", "failed": "失败", "cancelled": "已取消", "skipped": "跳过",
 		}[outcome], trigger)
-		if outcome == "failed" || outcome == "cancelled" {
+		switch outcome {
+		case "failed":
 			RecordAuditLog(operator, "更新失败", "威胁情报库", detail, "")
-		} else {
+		case "cancelled":
+			RecordAuditLog(operator, "取消", "威胁情报库", detail, "")
+		default:
 			RecordAuditLog(operator, "更新", "威胁情报库", detail, "")
 		}
 	}()
@@ -538,7 +553,7 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 	// 失败退避不再改写排程槽（failSourceRow 写下一排程槽）。
 	err := error(nil)
 	if !healed {
-		err = runWithInTaskRetry(func() error {
+		err = runWithInTaskRetry(ctx, func() error {
 			var derr error
 			entries, rawHash, derr = downloadAndParseThreatSourceCtx(ctx, source)
 			return derr
@@ -548,6 +563,16 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 	}
 	finished := time.Now().UTC().Format(crsTimeLayout)
 	if err != nil {
+		if ctx.Err() != nil {
+			if updateRunStillMaster() {
+				cancelSourceRow(source.id, finished, ctx.Err())
+				AppendThreatUpdateLog("WARN", "cancelled", fmt.Sprintf("源 %s 更新已手动取消（保留上次快照）", source.name))
+			} else {
+				// demote 后从节点不写源行；任务级由 run 统一落 skipped。
+				AppendThreatUpdateLog("WARN", "skipped", fmt.Sprintf("节点已降级，源 %s 更新中止", source.name))
+			}
+			return false, false
+		}
 		failSourceRow(source.id, finished, err, trigger)
 		AppendThreatUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", source.name, err))
 		return false, true
@@ -734,6 +759,15 @@ func threatListDescription(source string) string {
 	return ""
 }
 
+// cancelSourceRow 用户取消落库：保留上次快照与连续失败计数，排程槽不推进，
+// 使配置导入等暂停解除后到期轮仍可补跑。
+func cancelSourceRow(id int, finished string, cause error) {
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='cancelled', message=?, finished_at=?, updated_at=datetime('now') WHERE id=?`,
+		cause.Error(), finished, id); err != nil {
+		Logf("error", "威胁情报库: 取消状态落库失败: %v", err)
+	}
+}
+
 // failSourceRow 失败落库：status=failed + message + consecutive_failures+1（遥测计数，
 // 不再驱动排程）+ next_update=下一排程槽（2026-09-25 用户裁定：退避不污染排程，
 // 重试已在任务内完成，耗尽后下一运行=下一排程槽）。
@@ -858,9 +892,14 @@ func healThreatFastFromText(source string) ([]string, string, bool) {
 	return entries, sum, true
 }
 
+// osLink 是测试 seam（镜像 crsinstall.go 的 osRename）：注入不支持硬链接
+// 或跨设备失败形态，覆盖原子复制回退。生产恒为 os.Link。
+var osLink = os.Link
+
 // WriteThreatIplistCompiled 在同目录临时文件上完成文本写入与 .fast 编译，
-// 全部成功后才替换 live 文件。fast 先替换时保留硬链接备份，第二个 rename
-// 若失败可恢复旧 fast；任何前置失败均不触碰 live .iplist。
+// 全部成功后才替换 live 文件。fast 先替换时优先保留硬链接备份，硬链接失败
+// 改用同目录原子复制；第二个 rename 若失败可恢复旧 fast。
+// 任何前置失败均不触碰 live .iplist。
 // 调用方必须持 WafFileLock（lbbak 导入与威胁更新器均已在外层持有）。
 func WriteThreatIplistCompiled(iplistPath string, data []byte) error {
 	fastPath := iplistPath + ".fast"
@@ -914,8 +953,13 @@ func WriteThreatIplistCompiled(iplistPath string, data []byte) error {
 		if err := os.Remove(fastBackup); err != nil {
 			return err
 		}
-		if err := os.Link(fastPath, fastBackup); err != nil {
-			return err
+		if err := osLink(fastPath, fastBackup); err != nil {
+			if copyErr := copyFile(fastPath, fastBackup); copyErr != nil {
+				return errors.Join(
+					fmt.Errorf("硬链接旧 .fast 备份失败: %w", err),
+					fmt.Errorf("复制旧 .fast 备份失败: %w", copyErr),
+				)
+			}
 		}
 		defer os.Remove(fastBackup)
 	} else if !errors.Is(err, os.ErrNotExist) {

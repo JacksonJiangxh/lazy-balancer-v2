@@ -584,6 +584,11 @@
                   style="width: 100%"
                 />
                 <div class="form-tip-line">基于 IP2Region 离线库判断访客所在区域，与 CIDR 规则同时生效；只选省份 = 整省生效</div>
+                <!-- A85WB-历史问题：加载失败显性化+重试；已保存的地域值保留不清空 -->
+                <div v-if="regionsError" class="form-tip-line">
+                  <el-text type="danger" size="small">地域数据加载失败，已保存的地域配置仍保留。</el-text>
+                  <el-link type="primary" size="small" @click="fetchRegions">重试</el-link>
+                </div>
               </el-form-item>
               <!-- v2.3.8 爬虫豁免（方案 B）：已验证搜索引擎/AI 爬虫跳过地域拦截。
                    验证=UA+PTR 双跳（360=官方 IP 段），伪装 UA 独立记「爬虫伪装」事件。 -->
@@ -914,8 +919,9 @@ import type { CrsExcludedRow, CrsRuleOptionView } from '@/composables/useCrsRule
 import type { APIResponse, UserListItem } from '@/types'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
-import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, buildStageModel, chunkForBulk, entriesIntersect, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, normalizeStringEntries, parseIPList, parseRefIds, IP_LIST_CATEGORIES, SECURITY_BULK_LIMITS} from '@/utils/securityStages'
+import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, buildStageModel, chunkForBulk, entriesIntersect, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, normalizeStringEntries, parseIPList, parseRefIds, parseUnknownIds, IP_LIST_CATEGORIES, SECURITY_BULK_LIMITS} from '@/utils/securityStages'
 import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy } from '@/utils/securityStages'
+import { updaterName } from '@/utils/updaterName'
 
 interface PolicyDetail { id: number; name: string; description: string; mode: string; anomaly_threshold: number; ip_acl_mode: string; ip_acl_list: string; ip_acl_enabled: boolean; ip_whitelist: string; ip_whitelist_enabled?: boolean; ip_blacklist?: string; ip_acl_list_refs?: string; ip_whitelist_refs?: string; rate_limit_enabled: boolean; rate_limit_rps: number; rate_limit_burst: number; crs_rule_groups: string; crs_excluded_rules: string; custom_rules: string; block_page_id: number; block_status_code: number; enabled: boolean; updated_at: string; geoip_mode?: string; geoip_countries?: string; geoip_crawler_exempt?: boolean; geoip_crawler_engines?: string; waf_check_response?: boolean; log_request_body?: boolean; trust_detection?: boolean }
 // 规则行携带阶段拦截页覆盖 4 字段（关联规则行内编辑与生效投影同源）
@@ -993,11 +999,8 @@ const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 
 const users = ref<UserListItem[]>([])
-const getUpdaterName = (userId?: number) => {
-  if (!userId || userId === 0) return '-'
-  const user = users.value.find(u => u.id === userId)
-  return user?.display_name || user?.username || '-'
-}
+// 更新者显示名走 utils/updaterName 单源（A85WA-历史问题 四份同构收敛）
+const getUpdaterName = (userId?: number) => updaterName(users.value, userId)
 
 const crsRuleOptions = ref<CRSRuleOption[]>([])
 // CRS 规则索引（约 832 条，id/msg/file/category）：规则组/排除目标级联的规则叶与
@@ -1629,20 +1632,13 @@ const fetchData = async (): Promise<boolean> => {
   } finally { loading.value = false }
 }
 
-// JSON 数组文本解析走 utils/securityStages.parseIPList（单源，历史问题-10）。
+// JSON 数组文本解析走 utils/securityStages（单源）：文本 JSON.parse 后委托
+// parseUnknownIds 的对象/数字双形态守卫（A85WB-历史问题 收敛——原与本模块
+// parseUnknownIds 同构两份，存在漂移风险）。
 const parseCustomRuleIds = (raw: string | undefined): number[] => {
   if (!raw) return []
   try {
-    const parsed: unknown = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed.map((item) => {
-      if (typeof item === 'number') return item
-      if (typeof item === 'object' && item !== null && 'id' in item) {
-        const id = item.id
-        return typeof id === 'number' ? id : 0
-      }
-      return 0
-    }).filter((id) => id > 0)
+    return parseUnknownIds(JSON.parse(raw))
   } catch { return [] }
 }
 
@@ -3148,6 +3144,9 @@ const openRuleInNewTab = (caddyId: string): void => {
   window.open(`/?page=rules&rs=${encodeURIComponent(caddyId)}`, '_blank')
 }
 
+// A85WB-历史问题：地域树加载失败显性化——不再静默清空（保留已加载/已选值可见可
+// 编辑），给 toast 与弹框内重试入口；「加载失败」不伪装成「无区域」。
+const regionsError = ref(false)
 const fetchRegions = async () => {
   try {
     const res = await request.get<APIResponse<RegionTree>>('/security/ip2region/regions')
@@ -3157,8 +3156,10 @@ const fetchRegions = async () => {
       countries: res.data?.countries || [],
       country_names_cn: res.data?.country_names_cn || {},
     }
+    regionsError.value = false
   } catch {
-    regionTree.value = { provinces: [], cities: {}, countries: [], country_names_cn: {} }
+    regionsError.value = true
+    ElMessage.error('地域数据加载失败，策略编辑中的地域选择暂不可用，可在编辑弹框内重试')
   }
 }
 
@@ -3276,7 +3277,6 @@ onMounted(async () => {
 .crs-ghost-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .crs-ghost-tags :deep(.el-tag__content) { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .exclusion-toolbar { display: flex; align-items: center; justify-content: flex-start; gap: 8px; margin-top: 8px; }
-.exclusion-empty .el-button + .el-button { margin-left: 0; }
 /* 条目数徽标（N/50）随工具行右侧 */
 .exclusion-count { margin-left: auto; }
 

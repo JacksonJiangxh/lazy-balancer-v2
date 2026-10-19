@@ -11,7 +11,7 @@ interface PollingTaskOptions {
   readonly onError?: (error: unknown) => void
 }
 
-interface PollingTask {
+export interface PollingTask {
   readonly signal: AbortSignal
   readonly run: () => Promise<void>
   readonly start: () => void

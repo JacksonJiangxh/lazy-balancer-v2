@@ -146,6 +146,34 @@ func TestLoad_warnsOnSupportedConfigFileKeyTypeMismatch(t *testing.T) {
 	}
 }
 
+// 历史 历史问题-5：jwt_secret 路径存在但读取失败（非 ENOENT——瞬时
+// IO/ACL 形态，测试用「同名目录」确定性复现）此前静默落入重生成——写入
+// 成功则全部 JWT 失效且零日志。必须 warn 可见（与过短/目录/写失败分支
+// 同一可见性准则）。
+func TestLoadOrCreateJWTSecret_readErrorWarnsBeforeRegenerate(t *testing.T) {
+	// Given：jwt_secret 路径被同名目录占据——os.ReadFile 返回非 ENOENT 错误
+	dir := t.TempDir()
+	secretPath := filepath.Join(dir, "jwt_secret")
+	if err := os.Mkdir(secretPath, 0755); err != nil {
+		t.Fatalf("seed blocking directory: %v", err)
+	}
+	var logBuf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+
+	// When
+	secret := loadOrCreateJWTSecret(dir)
+
+	// Then：照常产出 64 字符 hex（可用性不变），但读取失败必须 warn 可见
+	if len(secret) != 64 {
+		t.Fatalf("secret len=%d; want 64-char hex", len(secret))
+	}
+	if !strings.Contains(logBuf.String(), "读取失败") {
+		t.Fatalf("unreadable existing secret must log a warning before regenerating, got %q", logBuf.String())
+	}
+}
+
 // ADNS-N1（历史）：jwt_secret 文件存在但内容过短（非空且 <32 字节）时，
 // 覆写重生成必须 log warn——对齐同文件端口回退/密钥目录创建失败分支的可见性
 // 准则；此前静默覆写，旧令牌全部失效且零信号。

@@ -375,6 +375,62 @@ func TestRunMigrations_migratesLegacyHTTPSRulesWithACMECertJobToHTTPWithTLS(t *t
 	}
 }
 
+func TestMigrateLegacyHTTPSProtocol_secondUpdateFailureRollsBackAndDefersAudit(t *testing.T) {
+	// Given 一条有证与一条无证 legacy HTTPS 规则，并用真实 SQLite 触发器让第二条 UPDATE 失败。
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO lb_rules
+		(name,protocol,domain,listen_port,enable_tls,tls_cert,tls_key,tls_http_redirect,caddy_id) VALUES
+		('cert-bearing','https','cert.example.test',8443,0,'CERT','KEY',1,'lb_https_atomic_cert'),
+		('certless','https','plain.example.test',8444,1,'','',1,'lb_https_atomic_plain');
+		CREATE TRIGGER fail_second_legacy_https_update
+		BEFORE UPDATE OF protocol,enable_tls ON lb_rules
+		WHEN OLD.protocol='https' AND NEW.enable_tls=0
+		BEGIN SELECT RAISE(ABORT, 'injected certless update failure'); END;`); err != nil {
+		t.Fatalf("seed legacy HTTPS rows and failure trigger: %v", err)
+	}
+	drainSystemAuditBuffer()
+
+	// When 第一条 UPDATE 成功、第二条失败。
+	err := migrateLegacyHTTPSProtocol()
+
+	// Then 两条规则与审计缓冲均保持迁移前状态，不得留下半迁移且无审计的有证行。
+	if err == nil || !strings.Contains(err.Error(), "injected certless update failure") {
+		t.Fatalf("migration error=%v, want injected second-update failure", err)
+	}
+	var migrated int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE caddy_id IN
+		('lb_https_atomic_cert','lb_https_atomic_plain') AND protocol<>'https'`).Scan(&migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated != 0 {
+		t.Fatalf("partially migrated rows=%d, want transactional rollback", migrated)
+	}
+	if entries := drainSystemAuditBuffer(); len(entries) != 0 {
+		t.Fatalf("audit entries=%d after rollback, want 0: %+v", len(entries), entries)
+	}
+
+	// And 故障解除后同一迁移可完整重试，两行迁移且各留一条审计。
+	if _, err := database.Exec(`DROP TRIGGER fail_second_legacy_https_update`); err != nil {
+		t.Fatalf("drop failure trigger: %v", err)
+	}
+	if err := migrateLegacyHTTPSProtocol(); err != nil {
+		t.Fatalf("retry migration after recovery: %v", err)
+	}
+	if err := database.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE caddy_id IN
+		('lb_https_atomic_cert','lb_https_atomic_plain') AND protocol='http'`).Scan(&migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated != 2 {
+		t.Fatalf("migrated rows=%d after retry, want 2", migrated)
+	}
+	if entries := drainSystemAuditBuffer(); len(entries) != 2 {
+		t.Fatalf("audit entries=%d after complete retry, want 2: %+v", len(entries), entries)
+	}
+}
+
 func drainSystemAuditBuffer() []systemAuditEntry {
 	systemAuditBuffer.mu.Lock()
 	defer systemAuditBuffer.mu.Unlock()
@@ -681,6 +737,46 @@ func TestMigrateLbRulesPrimaryKey_preserves_upstream_connection_settings(t *test
 		if count != 0 {
 			t.Fatalf("legacy column %s survived primary key migration", column)
 		}
+	}
+}
+
+func TestMigrateLbRulesPrimaryKey_auditsDiscardedOrphanUpstreams(t *testing.T) {
+	// Given 旧 PK 表中一条正常 upstream 与一条无对应规则的孤儿 upstream。
+	database := openMigrationTestDB(t)
+	createLegacyLbRulesTables(t, database, legacyLbRulesSchema{withCaddyID: true, withStagePages: true, withNewHealthCols: true, upstreams: legacyUpstreamsLegacyOrigin})
+	if _, err := database.Exec(`
+		INSERT INTO lb_rules (id, name, protocol, listen_port, caddy_id) VALUES (7, 'legacy', 'tcp', 443, 'lb_orphan_audit');
+		INSERT INTO upstreams (id, rule_id, host, port) VALUES
+			(9, 7, '127.0.0.1', 8443),
+			(10, 999, '192.0.2.10', 9000);
+	`); err != nil {
+		t.Fatalf("seed legacy upstreams: %v", err)
+	}
+	drainSystemAuditBuffer()
+
+	// When
+	if err := migrateLbRulesPrimaryKey(); err != nil {
+		t.Fatalf("migrate load-balancer primary key: %v", err)
+	}
+
+	// Then 内连接丢弃孤儿行的既有数据语义不变，但必须留下可追溯审计。
+	var validRows, orphanRows int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM upstreams WHERE id=9 AND rule_id='lb_orphan_audit'`).Scan(&validRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT COUNT(*) FROM upstreams WHERE id=10`).Scan(&orphanRows); err != nil {
+		t.Fatal(err)
+	}
+	if validRows != 1 || orphanRows != 0 {
+		t.Fatalf("migrated upstream rows valid=%d orphan=%d, want 1/0", validRows, orphanRows)
+	}
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 1 {
+		t.Fatalf("system audit entries=%d, want one orphan-discard record: %+v", len(entries), entries)
+	}
+	wantDetail := "lb_rules 主键迁移丢弃 1 条孤儿 upstream 行（rule_id 无对应规则）"
+	if entries[0].detail != wantDetail {
+		t.Fatalf("orphan audit detail=%q, want %q", entries[0].detail, wantDetail)
 	}
 }
 
@@ -2056,6 +2152,129 @@ func TestNormalizeRuleTimestampsMigration_preservesMalformedAndCanonicalizesVali
 	}
 }
 
+func TestRunMigrations_removesLegacyTCPRulePolicyBindings(t *testing.T) {
+	// Given 真实旧库数据形态：HTTP 绑定、TCP 惰性绑定、无对应规则的历史绑定。
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config,cluster_version) VALUES (1,'{}',0);
+		INSERT INTO lb_rules (caddy_id,name,protocol,listen_port) VALUES
+		('lb_bind_http','http-rule','http',8080);
+		INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,compress_types) VALUES
+		('lb_bind_tcp','tcp-rule','tcp',9000,'');
+		INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES
+		('lb_bind_http',7),
+		('lb_bind_tcp',7),
+		('lb_bind_missing',7)`); err != nil {
+		t.Fatalf("seed legacy rules and policy bindings: %v", err)
+	}
+
+	// When 启动迁移执行。
+	if err := runMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	// Then 仅 TCP 规则绑定被清理；HTTP 与无规则绑定原样保留。
+	assertBindingRows := func() (httpRows, tcpRows, missingRows int) {
+		t.Helper()
+		if err := database.QueryRow(`SELECT
+			SUM(CASE WHEN rule_caddy_id='lb_bind_http' THEN 1 ELSE 0 END),
+			SUM(CASE WHEN rule_caddy_id='lb_bind_tcp' THEN 1 ELSE 0 END),
+			SUM(CASE WHEN rule_caddy_id='lb_bind_missing' THEN 1 ELSE 0 END)
+			FROM security_policy_bindings`).Scan(&httpRows, &tcpRows, &missingRows); err != nil {
+			t.Fatalf("count policy bindings: %v", err)
+		}
+		return httpRows, tcpRows, missingRows
+	}
+	httpRows, tcpRows, missingRows := assertBindingRows()
+	if httpRows != 1 || tcpRows != 0 || missingRows != 1 {
+		t.Fatalf("bindings after migration http/tcp/missing=%d/%d/%d, want 1/0/1", httpRows, tcpRows, missingRows)
+	}
+	var clusterVersion int
+	if err := database.QueryRow(`SELECT cluster_version FROM global_config WHERE id=1`).Scan(&clusterVersion); err != nil {
+		t.Fatalf("read cluster_version: %v", err)
+	}
+	if clusterVersion != 1 {
+		t.Fatalf("cluster_version=%d after TCP binding cleanup, want 1 (same bump path as synced-table migrations)", clusterVersion)
+	}
+
+	// And 幂等：重复启动零额外写、不再 bump 版本。
+	if err := runMigrations(); err != nil {
+		t.Fatalf("repeat migrations: %v", err)
+	}
+	httpRows, tcpRows, missingRows = assertBindingRows()
+	if httpRows != 1 || tcpRows != 0 || missingRows != 1 {
+		t.Fatalf("bindings after repeated migration http/tcp/missing=%d/%d/%d, want 1/0/1", httpRows, tcpRows, missingRows)
+	}
+	if err := database.QueryRow(`SELECT cluster_version FROM global_config WHERE id=1`).Scan(&clusterVersion); err != nil {
+		t.Fatalf("read cluster_version after repeat: %v", err)
+	}
+	if clusterVersion != 1 {
+		t.Fatalf("cluster_version after idempotent rerun=%d, want unchanged 1", clusterVersion)
+	}
+}
+
+func TestMigrateTCPRuleSecurityPolicyBindings_clusterBumpFailureRollsBack(t *testing.T) {
+	// Given 存在待清理 TCP 绑定，且真实 SQLite 触发器阻断 cluster_version bump。
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config,cluster_version) VALUES (1,'{}',0);
+		INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,compress_types) VALUES
+		('lb_bind_atomic_http','http-rule','http',8080,'gzip'),
+		('lb_bind_atomic_tcp','tcp-rule','tcp',9000,'');
+		INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES
+		('lb_bind_atomic_http',7),('lb_bind_atomic_tcp',7);
+		CREATE TRIGGER fail_tcp_binding_version_bump
+		BEFORE UPDATE OF cluster_version ON global_config
+		BEGIN SELECT RAISE(ABORT, 'injected cluster version failure'); END;`); err != nil {
+		t.Fatalf("seed bindings and bump failure trigger: %v", err)
+	}
+
+	// When
+	err := migrateTCPRuleSecurityPolicyBindings()
+
+	// Then 删除与 bump 同事务：bump 失败时 TCP 绑定也必须保留，避免表已改而版本未推进。
+	if err == nil || !strings.Contains(err.Error(), "injected cluster version failure") {
+		t.Fatalf("migration error=%v, want injected cluster_version failure", err)
+	}
+	var tcpBindings, httpBindings, version int
+	if err := database.QueryRow(`SELECT
+		SUM(CASE WHEN rule_caddy_id='lb_bind_atomic_tcp' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN rule_caddy_id='lb_bind_atomic_http' THEN 1 ELSE 0 END)
+		FROM security_policy_bindings`).Scan(&tcpBindings, &httpBindings); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT cluster_version FROM global_config WHERE id=1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if tcpBindings != 1 || httpBindings != 1 || version != 0 {
+		t.Fatalf("after bump failure tcp/http/version=%d/%d/%d, want 1/1/0", tcpBindings, httpBindings, version)
+	}
+
+	// And 故障解除后重试成功，版本恰好推进一次。
+	if _, err := database.Exec(`DROP TRIGGER fail_tcp_binding_version_bump`); err != nil {
+		t.Fatalf("drop failure trigger: %v", err)
+	}
+	if err := migrateTCPRuleSecurityPolicyBindings(); err != nil {
+		t.Fatalf("retry binding cleanup: %v", err)
+	}
+	if err := database.QueryRow(`SELECT
+		SUM(CASE WHEN rule_caddy_id='lb_bind_atomic_tcp' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN rule_caddy_id='lb_bind_atomic_http' THEN 1 ELSE 0 END)
+		FROM security_policy_bindings`).Scan(&tcpBindings, &httpBindings); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT cluster_version FROM global_config WHERE id=1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if tcpBindings != 0 || httpBindings != 1 || version != 1 {
+		t.Fatalf("after retry tcp/http/version=%d/%d/%d, want 0/1/1", tcpBindings, httpBindings, version)
+	}
+}
+
 func TestMigrateTCPRuleDeadFields_bumpsNullClusterVersion(t *testing.T) {
 	// Given：带外/旧备份形态 cluster_version=NULL，以及一条确需清理的 TCP 行。
 	database := openMigrationTestDB(t)
@@ -2100,6 +2319,120 @@ func TestMigrateTCPRuleDeadFields_bumpsNullClusterVersion(t *testing.T) {
 	}
 	if version.Int64 != 1 {
 		t.Fatalf("cluster_version after no-op=%d, want unchanged 1", version.Int64)
+	}
+}
+
+func TestMigrateLegacyAuditLogs_copiesVerifiesAndDropsLegacyTable(t *testing.T) {
+	// Given 真实主库/audit 库与两条含 NULL 的历史审计行。
+	dir := t.TempDir()
+	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
+	t.Cleanup(func() {
+		_ = Close()
+		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	if err := Initialize(dir); err != nil {
+		t.Fatalf("initialize databases: %v", err)
+	}
+	if _, err := AuditDB.Exec(`DELETE FROM audit_log`); err != nil {
+		t.Fatalf("clear destination audit log: %v", err)
+	}
+	const legacyAuditDDL = `CREATE TABLE audit_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username VARCHAR(100), action VARCHAR(50) NOT NULL, resource VARCHAR(100),
+		detail TEXT, ip_address VARCHAR(45), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`
+	if _, err := DB.Exec(legacyAuditDDL + `;
+		INSERT INTO audit_log (id,username,action,resource,detail,ip_address,created_at) VALUES
+		(101,NULL,'登录','认证',NULL,'','2026-01-01 00:00:00'),
+		(102,'admin','更新','系统配置','legacy detail','127.0.0.1','2026-01-02 00:00:00')`); err != nil {
+		t.Fatalf("seed legacy audit rows: %v", err)
+	}
+
+	// When
+	if err := migrateLegacyAuditLogs(DB, filepath.Join(dir, AuditDBFilename)); err != nil {
+		t.Fatalf("migrate legacy audit logs: %v", err)
+	}
+
+	// Then 逐列复制成功后主库旧表删除；重复调用按无旧表 no-op。
+	var legacyTables, copied int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='audit_log'`).Scan(&legacyTables); err != nil {
+		t.Fatal(err)
+	}
+	if err := AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE id IN (101,102)`).Scan(&copied); err != nil {
+		t.Fatal(err)
+	}
+	if legacyTables != 0 || copied != 2 {
+		t.Fatalf("legacyTables=%d copied=%d, want 0/2", legacyTables, copied)
+	}
+	var username, detail string
+	if err := AuditDB.QueryRow(`SELECT COALESCE(username,'<null>'),COALESCE(detail,'<null>') FROM audit_log WHERE id=101`).Scan(&username, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if username != "<null>" || detail != "<null>" {
+		t.Fatalf("NULL fields changed during migration: username=%q detail=%q", username, detail)
+	}
+	if err := migrateLegacyAuditLogs(DB, filepath.Join(dir, AuditDBFilename)); err != nil {
+		t.Fatalf("repeat migration without legacy table: %v", err)
+	}
+
+	// And 同 id 不同内容的冲突不得 DROP 源表或覆盖目标行。
+	if _, err := DB.Exec(legacyAuditDDL + `;
+		INSERT INTO audit_log (id,username,action,resource,detail,ip_address,created_at)
+		VALUES (101,'attacker','篡改','冲突','different','','2020-01-01 00:00:00')`); err != nil {
+		t.Fatalf("seed conflicting legacy row: %v", err)
+	}
+	if err := migrateLegacyAuditLogs(DB, filepath.Join(dir, AuditDBFilename)); err == nil {
+		t.Fatal("conflicting legacy audit row passed verification")
+	}
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='audit_log'`).Scan(&legacyTables); err != nil {
+		t.Fatal(err)
+	}
+	if legacyTables != 1 {
+		t.Fatal("legacy audit table dropped after verification conflict")
+	}
+	var originalAction string
+	if err := AuditDB.QueryRow(`SELECT action FROM audit_log WHERE id=101`).Scan(&originalAction); err != nil {
+		t.Fatal(err)
+	}
+	if originalAction != "登录" {
+		t.Fatalf("destination conflict row overwritten: action=%q", originalAction)
+	}
+}
+
+func TestMigrateSyncSwitches_forcesUsersEvenWhenMarkerDone(t *testing.T) {
+	// Given 存量 global_config 有 sync_users=0，尚无一次性 marker 列。
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`ALTER TABLE global_config ADD COLUMN sync_users BOOLEAN DEFAULT 1;
+		INSERT INTO global_config (id,caddy_config,sync_users) VALUES (1,'{}',0)`); err != nil {
+		t.Fatalf("seed legacy sync switches: %v", err)
+	}
+
+	// When/Then 首轮补 marker 并强制 sync_users=1。
+	if err := migrateSyncSwitches(); err != nil {
+		t.Fatalf("first sync switch migration: %v", err)
+	}
+	var syncUsers, marker int
+	if err := database.QueryRow(`SELECT sync_users,sync_switches_migrated FROM global_config WHERE id=1`).Scan(&syncUsers, &marker); err != nil {
+		t.Fatal(err)
+	}
+	if syncUsers != 1 || marker != 1 {
+		t.Fatalf("first migration sync_users=%d marker=%d, want 1/1", syncUsers, marker)
+	}
+
+	// And 带外再次写 0 时，即使 marker=1 也必须再次收敛。
+	if _, err := database.Exec(`UPDATE global_config SET sync_users=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSyncSwitches(); err != nil {
+		t.Fatalf("second sync switch migration: %v", err)
+	}
+	if err := database.QueryRow(`SELECT sync_users,sync_switches_migrated FROM global_config WHERE id=1`).Scan(&syncUsers, &marker); err != nil {
+		t.Fatal(err)
+	}
+	if syncUsers != 1 || marker != 1 {
+		t.Fatalf("marker-done migration sync_users=%d marker=%d, want 1/1", syncUsers, marker)
 	}
 }
 

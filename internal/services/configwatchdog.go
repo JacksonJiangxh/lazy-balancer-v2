@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,13 +29,14 @@ type ConfigDriftStatus struct {
 }
 
 var (
-	configDriftMu          sync.RWMutex
-	configDriftStatus      = ConfigDriftStatus{Consistent: true}
-	configDriftStreak      int
-	configDriftCleanRounds int  // 历史问题 心跳窗口：连续「真实检查且一致」轮计数（60s 节拍 × 60 轮 ≈ 1h 一条心跳）
-	configDriftSkipped     int  // 历史问题：自上次真实检查以来的跳过轮数（未判定，不计入干净轮）
-	configDriftQueryWarned bool // 规则数据读取失败首报留痕
-	configDriftReadWarned  bool // 运行配置读取失败首报留痕
+	configDriftMu               sync.RWMutex
+	configDriftStatus           = ConfigDriftStatus{Consistent: true}
+	configDriftStreak           int
+	configDriftCleanRounds      int  // 历史问题 心跳窗口：连续「真实检查且一致」轮计数（60s 节拍 × 60 轮 ≈ 1h 一条心跳）
+	configDriftSkipped          int  // 历史问题：自上次真实检查以来的跳过轮数（未判定，不计入干净轮）
+	configDriftHeartbeatSkipped int  // 自上次心跳以来的跳过轮数：仅用于心跳文案，与状态字段窗口分离。
+	configDriftQueryWarned      bool // 规则数据读取失败首报留痕
+	configDriftReadWarned       bool // 运行配置读取失败首报留痕
 	// LBS-B-D1（历史）：configWatchdogMu/Cancel/Done 三个引擎化前残留
 	// 死变量已删（StartConfigWatchdog/StopConfigWatchdog 随 M2 退役，零消费方）。
 )
@@ -48,6 +50,7 @@ func ResetConfigDrift() {
 	configDriftStreak = 0
 	configDriftCleanRounds = 0
 	configDriftSkipped = 0
+	configDriftHeartbeatSkipped = 0
 	configDriftQueryWarned = false
 	configDriftReadWarned = false
 }
@@ -105,17 +108,21 @@ func WatchdogCheckOnce() {
 		configDriftMu.Lock()
 		if !checked {
 			configDriftSkipped++
+			configDriftHeartbeatSkipped++
 		} else if configDriftStatus.Consistent {
 			configDriftCleanRounds++
+			configDriftSkipped = 0 // 字段口径为「自上次真实检查以来」；真实检查成功即开启新窗口。
 		} else {
 			configDriftCleanRounds = 0
 			configDriftSkipped = 0 // 漂移证据丢弃本窗口（恢复后重新累计）
+			configDriftHeartbeatSkipped = 0
 		}
 		rounds := configDriftCleanRounds
-		skipped := configDriftSkipped
+		skipped := configDriftHeartbeatSkipped
 		heartbeat := checked && configDriftStatus.Consistent && rounds%configWatchdogHeartbeatRounds == 0
 		if heartbeat {
 			configDriftSkipped = 0 // 窗口关闭：跳过轮计数随心跳归零
+			configDriftHeartbeatSkipped = 0
 		}
 		configDriftStatus.SkippedRounds = configDriftSkipped
 		status := configDriftStatus
@@ -180,11 +187,17 @@ func checkConfigConsistency(adminURL string) (checked bool, err error) {
 }
 
 // expectedRenderedRules 计算应出现在运行配置中的规则：启用中且至少有一个启用上游，
-// 并排除渲染侧有意跳过的两类（与 caddy.go:1949-1974 同口径——TCP+动态 DNS 逐规则
-// 跳过、同端口多 TCP 整组拒绝），否则这两类规则会被误报为「缺失」（历史问题 历史问题）。
+// 并排除渲染侧有意跳过的三类，否则会被误报为「缺失」：
+//   - TCP+动态 DNS 逐规则跳过、同端口多 TCP 整组拒绝（历史问题 历史问题，与 caddy.go 同口径）；
+//   - A85历史问题-2：HTTP+TLS 规则在 caddy.go 渲染门因「无可用证书（manual 材料缺失 /
+//     ACME 无域匹配且未过期证书）」整条 fail-closed 跳过。看门狗必须消费同一判据，
+//     否则 ACME 首签窗口（或证书过期窗口）连续两轮即误报配置漂移、全局横幅常亮。
+//
 // 返回 caddy_id → 规则名称。
 func expectedRenderedRules() (map[string]string, error) {
-	rows, err := db.DB.Query(`SELECT caddy_id, name, protocol, COALESCE(dynamic_dns,0), listen_port FROM lb_rules WHERE enabled=1
+	rows, err := db.DB.Query(`SELECT caddy_id, name, protocol, COALESCE(dynamic_dns,0), listen_port,
+		IIF(enable_tls IN ('1',1),1,0), COALESCE(tls_source,'manual'), COALESCE(tls_cert,''), COALESCE(tls_key,''), COALESCE(domain,'')
+		FROM lb_rules WHERE enabled=1
 		AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=lb_rules.caddy_id AND IIF(u.enabled IN ('1',1),1,0)=1)`)
 	if err != nil {
 		return nil, err
@@ -196,19 +209,74 @@ func expectedRenderedRules() (map[string]string, error) {
 		protocol   string
 		dynamicDNS bool
 		listenPort int
+		enableTLS  int
+		tlsSource  string
+		tlsCert    string
+		tlsKey     string
+		domain     string
 	}
 	var all []ruleRow
+	hasACMEHTTPTLS := false
 	for rows.Next() {
 		var r ruleRow
-		if err := rows.Scan(&r.caddyID, &r.name, &r.protocol, &r.dynamicDNS, &r.listenPort); err != nil {
+		if err := rows.Scan(&r.caddyID, &r.name, &r.protocol, &r.dynamicDNS, &r.listenPort,
+			&r.enableTLS, &r.tlsSource, &r.tlsCert, &r.tlsKey, &r.domain); err != nil {
 			return nil, err
+		}
+		if r.protocol == "http" && r.enableTLS == 1 && r.tlsSource == "acme_dns" {
+			hasACMEHTTPTLS = true
 		}
 		all = append(all, r)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	// 渲染侧的同端口多 TCP 判定作用于动态 DNS 过滤之后的集合——统计口径保持一致。
+
+	// 与 caddy.go 渲染门同源：ACME 候选查询 + SelectCertificate（域匹配/有效期/
+	// 可解析性）。证书候选只服务于 enabled+TLS+acme 规则，无此类规则时零查询。
+	acmeCerts := make(map[string][]CertificateCandidate)
+	if hasACMEHTTPTLS {
+		certRows, certErr := db.DB.Query(acmeCertCandidatesQuery)
+		if certErr != nil {
+			return nil, fmt.Errorf("读取 ACME 证书候选失败: %w", certErr)
+		}
+		for certRows.Next() {
+			var ruleID string
+			var candidate CertificateCandidate
+			if scanErr := certRows.Scan(&ruleID, &candidate.ID, &candidate.Domain, &candidate.Status, &candidate.CertPEM, &candidate.KeyPEM, &candidate.UpdatedAt); scanErr != nil {
+				closeErr := certRows.Close()
+				return nil, fmt.Errorf("解析 ACME 证书候选失败: %w", errors.Join(scanErr, closeErr))
+			}
+			acmeCerts[ruleID] = append(acmeCerts[ruleID], candidate)
+		}
+		if rowsErr := certRows.Err(); rowsErr != nil {
+			closeErr := certRows.Close()
+			return nil, fmt.Errorf("遍历 ACME 证书候选失败: %w", errors.Join(rowsErr, closeErr))
+		}
+		if closeErr := certRows.Close(); closeErr != nil {
+			return nil, fmt.Errorf("关闭 ACME 证书候选结果集失败: %w", closeErr)
+		}
+	}
+	selectionNow := time.Now()
+	certReady := func(r ruleRow) bool {
+		if r.enableTLS != 1 {
+			return true
+		}
+		switch r.tlsSource {
+		case "manual":
+			return r.tlsCert != "" && r.tlsKey != ""
+		case "acme_dns":
+			_, ok := SelectCertificate(acmeCerts[r.caddyID], r.domain, selectionNow)
+			return ok
+		default:
+			// 渲染层 availableCerts 只认 manual/acme_dns；其他形态无证可载，
+			// 同 caddy.go 门一并跳过（fail-closed）。
+			return false
+		}
+	}
+
+	// 渲染侧的同端口多 TCP 判定作用于动态 DNS/证书过滤之前的 TCP 集合——
+	// 统计口径与 caddy.go 分组前一致（TLS 过滤只作用于 HTTP 规则）。
 	tcpPorts := make(map[int]int)
 	for _, r := range all {
 		if r.protocol == "tcp" && !r.dynamicDNS {
@@ -218,6 +286,9 @@ func expectedRenderedRules() (map[string]string, error) {
 	expected := make(map[string]string)
 	for _, r := range all {
 		if r.protocol == "tcp" && (r.dynamicDNS || tcpPorts[r.listenPort] > 1) {
+			continue
+		}
+		if r.protocol == "http" && !certReady(r) {
 			continue
 		}
 		expected[r.caddyID] = r.name

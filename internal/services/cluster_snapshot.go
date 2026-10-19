@@ -78,6 +78,13 @@ func warnCorruptedSnapshotRow(table string, rowID any, err error) {
 	duplicate := seen && now.Sub(last) < snapshotRowIsolationWindow
 	if !duplicate {
 		snapshotRowIsolationSeen[key] = now
+		// 与证书告警限频表同型：新坏行到达时顺带回收过期键，避免行 ID
+		// churn 让进程生命周期内的 map 单调增长。
+		for k, seenAt := range snapshotRowIsolationSeen {
+			if now.Sub(seenAt) >= snapshotRowIsolationWindow {
+				delete(snapshotRowIsolationSeen, k)
+			}
+		}
 	}
 	hook := snapshotRowIsolationHook
 	snapshotRowIsolationMu.Unlock()

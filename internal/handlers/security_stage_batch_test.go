@@ -380,6 +380,61 @@ caddy_http_request_duration_seconds_count{code="200",handler="rate_limit",host="
 	}
 }
 
+func TestGetRuleStageStats_timingUsesConsistentSegmentsAndPositiveSamples(t *testing.T) {
+	// Given：WAF 事件携带预检快照、3/5/12 防御性预检 ID、升级前 precheck_us=0
+	// 的存量预检行，以及非数字触发 ID 和 24h 界外行。
+	handler, _ := newStageBatchTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enabled) VALUES ('lb_timing','timing','http','',8080,'weighted_round_robin',1)`); err != nil {
+		t.Fatal(err)
+	}
+	seedTiming := func(triggered, timeExpr string, durationUS, precheckUS int) {
+		t.Helper()
+		if _, err := db.MetricsDB.Exec(`INSERT INTO security_events
+			(event_time,rule_caddy_id,client_ip,rule_triggered,action,duration_us,precheck_us)
+			VALUES (`+timeExpr+`,'lb_timing','203.0.113.10',?,'blocked',?,?)`, triggered, durationUS, precheckUS); err != nil {
+			t.Fatalf("seed timing event %q: %v", triggered, err)
+		}
+	}
+	seedTiming("942100", "datetime('now','-1 hour')", 300, 40)
+	seedTiming("10005", "datetime('now','-1 hour')", 100, 60)
+	seedTiming("3", "datetime('now','-1 hour')", 20, 20)
+	seedTiming("5", "datetime('now','-1 hour')", 40, 0)
+	seedTiming("12", "datetime('now','-1 hour')", 60, 60)
+	seedTiming("800123", "datetime('now','-1 hour')", 80, 80)
+	seedTiming("2", "datetime('now','-1 hour')", 10, 0)
+	seedTiming("949110", "datetime('now','-1 hour')", 500, 0)
+	seedTiming("garbage", "datetime('now','-1 hour')", 900, 0)
+	seedTiming("942100", "datetime('now','-25 hours')", 10000, 10000)
+
+	// When
+	response := httptest.NewRecorder()
+	stageBatchRouter(handler).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/security/rules/lb_timing/stage-stats", nil))
+
+	// Then：预检均值使用所有正 precheck_us 快照（40/60/20/60/80）；WAF 均值只
+	// 使用非预检段的正 duration_us（300/100/500/900）。零快照存量行不稀释，
+	// 3/5/12 不得混入 WAF 桶。
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			PrecheckAvg     float64 `json:"precheck_avg_us"`
+			PrecheckSamples int     `json:"precheck_samples"`
+			WafAvg          float64 `json:"waf_avg_us"`
+			WafSamples      int     `json:"waf_samples"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode timing stats: %v", err)
+	}
+	if payload.Data.PrecheckAvg != 52 || payload.Data.PrecheckSamples != 5 {
+		t.Fatalf("precheck timing=(%v,%d), want (52,5); body=%s", payload.Data.PrecheckAvg, payload.Data.PrecheckSamples, response.Body.String())
+	}
+	if payload.Data.WafAvg != 450 || payload.Data.WafSamples != 4 {
+		t.Fatalf("waf timing=(%v,%d), want (450,4); body=%s", payload.Data.WafAvg, payload.Data.WafSamples, response.Body.String())
+	}
+}
+
 func TestGetRuleStageStats_nilMetricsDBReturnsFullZeroShape(t *testing.T) {
 	handler, _ := newStageBatchTestHandlers(t)
 	saved := db.MetricsDB

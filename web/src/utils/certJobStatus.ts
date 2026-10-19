@@ -101,17 +101,18 @@ export const certJobStatusTone = (status: CertJobStatus): 'success' | 'danger' |
   }
 }
 
-/** 证书任务重试冷却（分钟）；null=不可重试。 */
-export const certJobRetryCooldown = (status: CertJobStatus): number | null => {
-  if (!status) return 2
-  switch (status) {
-    case 'disabled': return null
-    case 'issued':
-    case 'waiting_ca':
-      return 0
-    case 'queued': return 15
-    case 'failed': return 5
-    default:
-      return 2
-  }
+/**
+ * 证书任务是否已过后端下发的重试冷却。冷却时长唯一由 API 决定；
+ * 缺失/畸形时间戳维持原有 fail-open 行为，最终仍以后端重试门为准。
+ */
+export const certJobRetryReady = (
+  cooldownSeconds: number | null,
+  updatedAtValue: string | null | undefined,
+  nowMs = Date.now(),
+): boolean => {
+  if (cooldownSeconds === null) return false
+  if (cooldownSeconds <= 0 || !updatedAtValue) return true
+  const updatedAt = new Date(updatedAtValue).getTime()
+  if (Number.isNaN(updatedAt)) return true
+  return nowMs - updatedAt >= cooldownSeconds * 1000
 }

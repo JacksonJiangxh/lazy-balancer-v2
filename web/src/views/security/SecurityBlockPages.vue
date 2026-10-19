@@ -133,6 +133,7 @@ import { showSaveResult } from '@/utils/saveResult'
 import { escapeHtml } from '@/utils/escape'
 import { useAuthStore } from '@/stores/auth'
 import { formatDate } from '@/utils/date'
+import { updaterName } from '@/utils/updaterName'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import CodeEditor from '@/components/CodeEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
@@ -221,12 +222,8 @@ const fetchData = async () => {
   } finally { loading.value = false }
 }
 
-const getUpdaterName = (userId?: number) => {
-  if (!userId || userId === 0) return '-'
-
-  const user = users.value.find(u => u.id === userId)
-  return user?.display_name || user?.username || '-'
-}
+// 更新者显示名走 utils/updaterName 单源（A85WA-历史问题 四份同构收敛）
+const getUpdaterName = (userId?: number) => updaterName(users.value, userId)
 
 const openDialog = (row?: BlockPage) => {
   editingId.value = row?.id ?? null

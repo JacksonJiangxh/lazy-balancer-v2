@@ -19,7 +19,10 @@ x-common-healthcheck: &common-healthcheck
   interval: 30s
   timeout: 5s
   retries: 3
-  start_period: 30s
+  # 与镜像 HEALTHCHECK --start-period=90s 对齐（compose healthcheck 会整体替换
+  # 镜像定义）：冷启动含 CRS 种子/证书物化/启动回放，30s 宽限在慢盘下必然
+  # 探针失败，容器在预期启动窗口内误显 unhealthy。
+  start_period: 90s
 
 services:
   # 主从两个容器共用同一镜像（image 标签与 Docker Hub 推送的一致）。

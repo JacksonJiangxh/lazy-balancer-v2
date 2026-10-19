@@ -92,7 +92,7 @@ func TestLbRulesRebuildSchema_matchesFreshDDL(t *testing.T) {
 	// Then：重建后的 notnull/dflt_value 逐列与 fresh 相等（列集合一致；
 	// 列序不参与比较——fresh 的 newColumns 通道以 ALTER 追加列，顺序天然不同）
 	rebuiltShape := lbRulesPragmaShape(t, DB)
-	freshColumns := make(map[string]lbRulesPragmaColumn, len(freshShape))
+	freshColumns := make(map[string]pragmaColumn, len(freshShape))
 	for _, column := range freshShape {
 		freshColumns[column.Name] = column
 	}
@@ -111,7 +111,54 @@ func TestLbRulesRebuildSchema_matchesFreshDDL(t *testing.T) {
 	}
 }
 
-type lbRulesPragmaColumn struct {
+func TestCertJobsRebuildSchema_matchesFreshDDL(t *testing.T) {
+	// Given fresh DDL 的列形，以及同库模拟的旧约束 cert_jobs 表。
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create fresh tables: %v", err)
+	}
+	freshShape := tablePragmaShape(t, database, "cert_jobs")
+	if _, err := database.Exec(`DROP TABLE cert_jobs`); err != nil {
+		t.Fatalf("drop fresh cert_jobs for legacy fixture: %v", err)
+	}
+	createLegacyCertJobs(t, database, "'queued'", "'queued','disabled','waiting_order_ready'")
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status) VALUES ('lb_parity','parity.example','waiting_order_ready')`); err != nil {
+		t.Fatalf("seed legacy certificate job: %v", err)
+	}
+
+	// When 旧约束触发生成真实重建表。
+	if err := migrateCertJobsStatusConstraint(); err != nil {
+		t.Fatalf("rebuild cert_jobs: %v", err)
+	}
+
+	// Then 重建列集合及 name/type/notnull/default/pk 与 fresh 逐列一致。
+	rebuiltShape := tablePragmaShape(t, database, "cert_jobs")
+	freshColumns := make(map[string]pragmaColumn, len(freshShape))
+	for _, column := range freshShape {
+		freshColumns[column.Name] = column
+	}
+	if len(rebuiltShape) != len(freshColumns) {
+		t.Fatalf("cert_jobs rebuilt column count=%d, fresh=%d", len(rebuiltShape), len(freshColumns))
+	}
+	for _, rebuilt := range rebuiltShape {
+		fresh, ok := freshColumns[rebuilt.Name]
+		if !ok {
+			t.Fatalf("cert_jobs rebuilt column %q missing from fresh schema", rebuilt.Name)
+		}
+		if rebuilt != fresh {
+			t.Fatalf("cert_jobs column %q rebuilt=%+v, fresh=%+v", rebuilt.Name, rebuilt, fresh)
+		}
+	}
+	var status string
+	if err := database.QueryRow(`SELECT status FROM cert_jobs WHERE rule_id='lb_parity'`).Scan(&status); err != nil {
+		t.Fatalf("read rebuilt certificate job: %v", err)
+	}
+	if status != "waiting_order_ready" {
+		t.Fatalf("rebuilt certificate job status=%q, want preserved waiting_order_ready", status)
+	}
+}
+
+type pragmaColumn struct {
 	Name    string
 	Type    string
 	NotNull int
@@ -119,23 +166,28 @@ type lbRulesPragmaColumn struct {
 	PK      int
 }
 
-func lbRulesPragmaShape(t *testing.T, database *sql.DB) []lbRulesPragmaColumn {
+func lbRulesPragmaShape(t *testing.T, database *sql.DB) []pragmaColumn {
 	t.Helper()
-	rows, err := database.Query(`SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info('lb_rules') ORDER BY cid`)
+	return tablePragmaShape(t, database, "lb_rules")
+}
+
+func tablePragmaShape(t *testing.T, database *sql.DB, table string) []pragmaColumn {
+	t.Helper()
+	rows, err := database.Query(`SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info(?) ORDER BY cid`, table)
 	if err != nil {
-		t.Fatalf("read lb_rules pragma: %v", err)
+		t.Fatalf("read %s pragma: %v", table, err)
 	}
 	defer rows.Close()
-	var shape []lbRulesPragmaColumn
+	var shape []pragmaColumn
 	for rows.Next() {
-		var column lbRulesPragmaColumn
+		var column pragmaColumn
 		if err := rows.Scan(&column.Name, &column.Type, &column.NotNull, &column.Default, &column.PK); err != nil {
-			t.Fatalf("scan lb_rules pragma: %v", err)
+			t.Fatalf("scan %s pragma: %v", table, err)
 		}
 		shape = append(shape, column)
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate lb_rules pragma: %v", err)
+		t.Fatalf("iterate %s pragma: %v", table, err)
 	}
 	return shape
 }

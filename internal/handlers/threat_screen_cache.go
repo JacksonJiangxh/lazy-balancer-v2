@@ -17,9 +17,9 @@ import (
 // 原始表扫描与 admin 代理出口收敛。所有缓存带 TTL 且失败不缓存（降级响应
 // 下一轮重试自愈）。
 
-// ---- top_targets（被攻击目标 Top5）缓存：TTL 5 分钟 ----
+// ---- top_targets（被攻击目标 Top3）缓存：TTL 5 分钟 ----
 
-// threatTopTarget 大屏「被攻击目标 Top5」条目（JSON 契约：name/domain/value）。
+// threatTopTarget 大屏「被攻击目标 Top3」条目（JSON 契约：name/domain/value）。
 type threatTopTarget struct {
 	Name   string `json:"name"`
 	Domain string `json:"domain"`
@@ -52,11 +52,11 @@ var (
 )
 
 // threatTopTargets 窗口内目标维度 rollup（security_event_target_rollup，
-// rule_caddy_id 分组）计数前 5 → 主库 lb_rules 取 name/domain。
+// rule_caddy_id 分组）计数前 3 → 主库 lb_rules 取 name/domain。
 //   - 历史 历史问题：读分钟 rollup 而非原始事件表——原始表受保留期/行帽
 //     裁剪，旁路会让「TOP 被攻击站点」与同屏其余卡片窗口分裂；
 //   - 历史问题：保留/私网地址在固化期已排除（与其余维度同口径）；
-//   - 历史问题：先批量解析现存规则，再按计数顺序取前 5 条**现存**目标——已
+//   - 历史问题：先批量解析现存规则，再按计数顺序取前 3 条**现存**目标——已
 //     删除规则不得挤掉后续真实站点；
 //   - 查询失败不缓存、错误上抛（调用方整卡 500，与现有错误口径一致）。
 func threatTopTargets(sinceMinute string, hours int) ([]threatTopTarget, error) {
@@ -155,7 +155,7 @@ func threatTopTargets(sinceMinute string, hours int) ([]threatTopTarget, error) 
 		}
 		info, ok := existing[id]
 		if !ok {
-			continue // 规则已删除：跳过，继续补足现存前 5
+			continue // 规则已删除：跳过，继续补足现存前 3
 		}
 		targets = append(targets, threatTopTarget{Name: info.name, Domain: info.domain, Value: counts[id]})
 	}

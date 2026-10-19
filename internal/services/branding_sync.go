@@ -44,7 +44,10 @@ func RefreshBrandingMirror(dataDir string) (changed bool, err error) {
 	if err != nil {
 		return false, fmt.Errorf("镜像品牌配置: %w", err)
 	}
-	n, _ := result.RowsAffected()
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("读取品牌配置镜像写入结果: %w", err)
+	}
 	return n > 0, nil
 }
 

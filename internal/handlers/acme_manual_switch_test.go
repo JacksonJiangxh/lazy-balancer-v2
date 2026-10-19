@@ -67,9 +67,7 @@ func putUpdateRule(t *testing.T, h interface{}, caddyID, body string) *httptest.
 // disabled」——30s 补扫对象已不存在），acme_config_id 清零。
 func TestUpdateRule_acmeToManual_convergesNonTerminalCertJobs(t *testing.T) {
 	// Given
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	harness := newUpdateAuditRuleHandlers(t, "lb_sw_manual", 0, false)
 	jobID := seedACMEManualSwitchFixture(t, "lb_sw_manual", "sw.example.test", "queued")
 	services.ResetCAQueueManagerForTest()
@@ -111,9 +109,7 @@ func TestUpdateRule_acmeToManual_convergesNonTerminalCertJobs(t *testing.T) {
 // 已翻终态的任务行与旧规则不一致的漂移）。
 func TestUpdateRule_acmeToManual_flipRollsBackWhenApplyFails(t *testing.T) {
 	// Given：/load 首次必失败
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	harness := newUpdateAuditRuleHandlers(t, "lb_sw_rb", 1, false)
 	jobID := seedACMEManualSwitchFixture(t, "lb_sw_rb", "rb.example.test", "queued")
 	certPEM, keyPEM, err := generateTestCert("rb.example.test", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))

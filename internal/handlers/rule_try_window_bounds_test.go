@@ -82,7 +82,11 @@ func TestValidateRuleFeatures_rejectsOutOfRangeTryWindow(t *testing.T) {
 			i.TCPTryDuration = -1
 			i.TCPTryInterval = 250
 		}},
-		{"http", "http zero interval", func(i *ruleFeatureInput) {
+		// A85历史问题-4：interval=0 仅在零窗口时合法——渲染层要求
+		// duration>0 时 interval 必填（字段门已同源，见
+		// TestAudit85L7_P2_4_tryWindowRequiresPositiveIntervalAtFieldGate）。
+		{"http", "http zero interval with zero window", func(i *ruleFeatureInput) {
+			i.TCPTryDuration = 0
 			i.TCPTryInterval = 0
 		}},
 	}

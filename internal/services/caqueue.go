@@ -18,7 +18,7 @@ type CAQueueManager struct {
 	mu                  sync.Mutex
 	queues              map[int]*caQueue
 	retiredQueues       []retiredCAQueue
-	zombieJobs          map[int]struct{}
+	zombieJobs          map[int]zombieJob
 	reloader            func() error
 	active              bool
 	blockedRules        map[string]map[RuleBlockToken]struct{}
@@ -45,6 +45,13 @@ type RuleBlockToken uint64
 type retiredCAQueue struct {
 	queue     *caQueue
 	retiredAt time.Time
+}
+
+// zombieJob retains the rule and completion signal after an aged-out retired
+// queue is forgotten, so rule-scoped drains keep the same execution barrier.
+type zombieJob struct {
+	ruleID string
+	done   <-chan struct{}
 }
 
 type RuleDeletionCompensation struct {
@@ -232,6 +239,31 @@ func (m *CAQueueManager) CancelJobsForRule(ctx context.Context, ruleID string) e
 		}
 		q.mu.Unlock()
 	}
+	// PauseAndDrain 超时后，仍在执行的旧队列迁入 retiredQueues；它们与
+	// 当前队列同属 drain 真源，漏掉会让 DeleteRule 在私钥写入尚未退出时删文件。
+	for _, entry := range m.retiredQueues {
+		q := entry.queue
+		q.mu.Lock()
+		for jobID, runningRuleID := range q.runningRules {
+			if runningRuleID != ruleID {
+				continue
+			}
+			if cancel := q.cancels[jobID]; cancel != nil {
+				cancels = append(cancels, cancel)
+			}
+			if executionDone := q.executionDone[jobID]; executionDone != nil {
+				done = append(done, executionDone)
+			}
+		}
+		q.mu.Unlock()
+	}
+	for _, zombie := range m.zombieJobs {
+		if zombie.ruleID == ruleID {
+			// nil done 是永久僵尸形态：加入等待集合后该 case 不成立，只能由
+			// ctx/共享 deadline 失败退出，绝不可当成「已排空」放行删除。
+			done = append(done, zombie.done)
+		}
+	}
 	m.mu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
@@ -248,8 +280,8 @@ func (m *CAQueueManager) CancelJobsForRule(ctx context.Context, ruleID string) e
 		case <-ctx.Done():
 			return fmt.Errorf("等待规则 %s 的证书任务退出: %w", ruleID, ctx.Err())
 		case <-deadline:
-			Logf("warn", "取消规则 %s 证书任务：等待在途执行退出超时（%s），继续后续流程", ruleID, caCancelWaitTimeout)
-			return nil
+			Logf("warn", "取消规则 %s 证书任务：等待在途执行退出超时（%s），中止本轮删除并由补偿链重试", ruleID, caCancelWaitTimeout)
+			return fmt.Errorf("等待规则 %s 的证书任务退出: %w", ruleID, context.DeadlineExceeded)
 		}
 	}
 	return nil
@@ -588,6 +620,22 @@ func (m *CAQueueManager) HasRunningJobForRule(ruleID string) bool {
 		}
 		queue.mu.Unlock()
 	}
+	for _, entry := range m.retiredQueues {
+		queue := entry.queue
+		queue.mu.Lock()
+		for _, runningRuleID := range queue.runningRules {
+			if runningRuleID == ruleID {
+				queue.mu.Unlock()
+				return true
+			}
+		}
+		queue.mu.Unlock()
+	}
+	for _, zombie := range m.zombieJobs {
+		if zombie.ruleID == ruleID {
+			return true
+		}
+	}
 	return false
 }
 
@@ -612,6 +660,22 @@ func (m *CAQueueManager) MarkJobRunningForTest(ruleID string, jobID int) {
 		queue.mu.Unlock()
 		return
 	}
+}
+
+// MarkRetiredJobRunningForTest registers a straggler in the same retired-queue
+// shape produced by PauseAndDrain timeout. Production code must not call it.
+func (m *CAQueueManager) MarkRetiredJobRunningForTest(ruleID string, jobID int) chan struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	queue := newCAQueue(models.CAProvider{}, m.reloader, m.dataDir)
+	done := make(chan struct{})
+	queue.active[jobID] = struct{}{}
+	queue.runningRules[jobID] = ruleID
+	queue.executionDone[jobID] = done
+	queue.cancels[jobID] = func() {}
+	queue.running++
+	m.retiredQueues = append(m.retiredQueues, retiredCAQueue{queue: queue, retiredAt: time.Now()})
+	return done
 }
 
 // IsJobActive reports whether the job is currently queued or running.
@@ -642,11 +706,11 @@ func (m *CAQueueManager) IsJobActive(jobID int) bool {
 		_, jobActive := queue.active[jobID]
 		remaining := len(queue.active)
 		agedOut := remaining > 0 && time.Since(entry.retiredAt) > caExecutionTimeoutMax+10*time.Minute
-		var stranded map[int]chan struct{}
+		var stranded map[int]zombieJob
 		if agedOut {
-			stranded = make(map[int]chan struct{}, remaining)
+			stranded = make(map[int]zombieJob, remaining)
 			for strandedJobID := range queue.active {
-				stranded[strandedJobID] = queue.executionDone[strandedJobID]
+				stranded[strandedJobID] = zombieJob{ruleID: queue.runningRules[strandedJobID], done: queue.executionDone[strandedJobID]}
 			}
 		}
 		queue.mu.Unlock()
@@ -677,20 +741,20 @@ func (m *CAQueueManager) IsJobActive(jobID int) bool {
 // executionDone 信号的 jobID 挂 goroutine 等待执行退出后解除保护；无信号的
 // （理论不可达：退役队列 active 均为在途执行）永久保留并记日志——僵尸事件本身
 // 罕见，宁可永久保护也不放双执行。
-func (m *CAQueueManager) migrateZombieJobsLocked(stranded map[int]chan struct{}) {
+func (m *CAQueueManager) migrateZombieJobsLocked(stranded map[int]zombieJob) {
 	if m.zombieJobs == nil {
-		m.zombieJobs = make(map[int]struct{}, len(stranded))
+		m.zombieJobs = make(map[int]zombieJob, len(stranded))
 	}
-	for jobID, done := range stranded {
+	for jobID, zombie := range stranded {
 		if _, exists := m.zombieJobs[jobID]; exists {
 			continue
 		}
-		m.zombieJobs[jobID] = struct{}{}
-		if done == nil {
+		m.zombieJobs[jobID] = zombie
+		if zombie.done == nil {
 			Logf("warn", "CA 队列僵尸任务 %d 无 executionDone 信号，永久保留在途保护", jobID)
 			continue
 		}
-		go m.releaseZombieJob(jobID, done)
+		go m.releaseZombieJob(jobID, zombie.done)
 	}
 }
 
@@ -1216,6 +1280,13 @@ func requeueCanceledJob(jobID int) {
 }
 
 func handleQueueExecutionError(jobID int, err error) {
+	var roleErr *certificateRoleError
+	if errors.As(err, &roleErr) {
+		// 主从翻转/角色读取瞬时失败不是 CA 签发失败：复用生命周期取消的
+		// queued/部署保留语义，renewal_attempts 不增加，恢复后自动接续。
+		requeueCanceledJob(jobID)
+		return
+	}
 	var deploymentErr *certificateDeploymentError
 	if errors.As(err, &deploymentErr) {
 		return

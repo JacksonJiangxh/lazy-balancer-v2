@@ -4,6 +4,10 @@ package services
 // 调度开关（历史问题/历史问题-2）/证书族角色门（历史问题-2）。
 
 import (
+	"bytes"
+	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +35,73 @@ func newWireTestEngine(t *testing.T) *taskengine.Engine {
 	})
 	// runtimeLogFile 指向临时目录——避免默认 /app/logs 写出测试沙箱
 	return InitTaskEngine("", t.TempDir()+"/app.log")
+}
+
+// S-A-历史问题：任务日志目录创建失败必须显式留痕，不能在只读/异常挂载下
+// 静默退化为零任务日志。
+func TestInitTaskEngine_logsTaskLogDirMkdirFailure(t *testing.T) {
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	SetConfigLoadRerun(func(string) error { return nil })
+	t.Cleanup(func() {
+		StopTaskEngine()
+		SetConfigLoadRerun(nil)
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "tasks"), []byte("not a directory"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	InitTaskEngine("", filepath.Join(root, "app.log"))
+
+	if got := logs.String(); !strings.Contains(got, "任务日志目录创建失败") || !strings.Contains(got, filepath.Join(root, "tasks")) {
+		t.Fatalf("MkdirAll 失败未形成可观测错误日志:\n%s", got)
+	}
+}
+
+// S-A-历史问题：reconciler 必须绑定启动它的引擎代际；StopTaskEngine 后快速
+// 再 Init 时，上一代不得因读到新全局引擎而永久存活。
+func TestStartRoleReconciler_stopsPreviousGeneration(t *testing.T) {
+	oldInterval := roleReconcilerInterval
+	roleReconcilerInterval = 5 * time.Millisecond
+	t.Cleanup(func() { roleReconcilerInterval = oldInterval })
+	previous := TaskEngine()
+	first := taskengine.NewEngine(taskengine.Options{StartPaused: true, TickInterval: time.Hour})
+	second := taskengine.NewEngine(taskengine.Options{StartPaused: true, TickInterval: time.Hour})
+	t.Cleanup(func() {
+		SetTaskEngineForTest(previous)
+		first.Stop()
+		second.Stop()
+	})
+	SetTaskEngineForTest(first)
+	firstDone := startRoleReconciler(first)
+	SetTaskEngineForTest(second)
+	secondDone := startRoleReconciler(second)
+
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("上一代 reconciler 在全局引擎换代后未退出")
+	}
+	select {
+	case <-secondDone:
+		t.Fatal("当前代 reconciler 被上一代退出信号误伤")
+	case <-time.After(20 * time.Millisecond):
+	}
+	SetTaskEngineForTest(previous)
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("当前代 reconciler 在引擎替换/停止后未退出")
+	}
 }
 
 func TestMustRegisterTask_panicsOnInvalidDescriptor(t *testing.T) {

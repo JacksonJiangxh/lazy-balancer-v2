@@ -234,6 +234,11 @@ func loadOrCreateJWTSecret(dataDir string) string {
 			// 及端口回退的可见性准则对齐。空文件等同未初始化，不告警。
 			log.Printf("JWT 密钥文件 %s 内容过短（%d 字节 < 32），已重新生成（旧令牌将失效）", secretPath, len(data))
 		}
+	} else if !os.IsNotExist(err) {
+		// 历史问题-5（历史）：文件存在但读取失败（瞬时 IO/ACL 形态）
+		// 此前静默落入重生成——写入成功则全部 JWT 失效且零日志，是同文件
+		// 唯一未留痕分支；ENOENT（首次启动）不告警。
+		log.Printf("JWT 密钥文件 %s 读取失败（%v），将重新生成（旧令牌将失效）", secretPath, err)
 	}
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {

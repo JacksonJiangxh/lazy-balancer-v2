@@ -198,6 +198,13 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   let hoverScreen: Centroid2D | null = null
   let pendingHover: Centroid2D | null = null
 
+  // A85WB-历史问题：悬停高亮 Path2D 缓存——悬停大国（数千点）每帧重建路径是主线程
+  // 热点；几何只随 hover 目标/相机/视口尺寸/下钻层变化，同键逐帧复用。
+  let worldHoverCache: { key: string; path: Path2D; count: number } | null = null
+  let drillHoverCache: { key: string; path: Path2D; count: number } | null = null
+  const hoverCacheKey = (name: string): string =>
+    `${drillLayerCountry}|${name}|${cam.camX}|${cam.camY}|${cam.zoom}|${cam.width}|${cam.height}`
+
   // ---- DOM 标签 ----
   const hoverTip = makeLabelElement('', '#e2e8f0')
   hoverTip.style.display = 'none'
@@ -394,36 +401,40 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     if (staticDirty) rebuildStaticLayer()
   }
 
-  /** 下钻悬浮点高亮（只画命中省的点，数量小，不进入离屏缓存）。 */
+  /** 下钻悬浮点高亮（只画命中省的点，数量小；路径按 hover+相机键缓存，A85WB-历史问题）。 */
   function drawDrillHover(): void {
     if (!hoverName || !provinceDots) return
-    const hoverShort = shortName(hoverName)
-    const view = visibleWorldBox()
-    const halfW = cam.width / 2 / cam.zoom
-    const r = DOT_R * 1.35 * cam.zoom
-    const path = new Path2D()
-    let drew = false
-    for (const d of provinceDots) {
-      if (d.key !== hoverShort) continue
-      if (Math.abs(wrapDeg(d.lon - cam.camX)) > halfW + 1) continue
-      if (d.lat < view.minLat - 1 || d.lat > view.maxLat + 1) continue
-      dotSubPath(path, cam.width / 2 + wrapDeg(d.lon - cam.camX) * cam.zoom, cam.height / 2 + (latToY(d.lat) - cam.camY) * cam.zoom, r)
-      drew = true
-    }
-    if (!drew) {
-      // 下钻态悬停其他国家（暗度衬底）：同样直接提亮该国点阵。
-      buildWorldDots()
-      for (const d of worldDotsByKey?.get(hoverName) ?? []) {
+    const key = hoverCacheKey(hoverName)
+    if (!drillHoverCache || drillHoverCache.key !== key) {
+      const hoverShort = shortName(hoverName)
+      const view = visibleWorldBox()
+      const halfW = cam.width / 2 / cam.zoom
+      const r = DOT_R * 1.35 * cam.zoom
+      const path = new Path2D()
+      let drew = false
+      for (const d of provinceDots) {
+        if (d.key !== hoverShort) continue
         if (Math.abs(wrapDeg(d.lon - cam.camX)) > halfW + 1) continue
         if (d.lat < view.minLat - 1 || d.lat > view.maxLat + 1) continue
         dotSubPath(path, cam.width / 2 + wrapDeg(d.lon - cam.camX) * cam.zoom, cam.height / 2 + (latToY(d.lat) - cam.camY) * cam.zoom, r)
         drew = true
       }
+      if (!drew) {
+        // 下钻态悬停其他国家（暗度衬底）：同样直接提亮该国点阵。
+        buildWorldDots()
+        for (const d of worldDotsByKey?.get(hoverName) ?? []) {
+          if (Math.abs(wrapDeg(d.lon - cam.camX)) > halfW + 1) continue
+          if (d.lat < view.minLat - 1 || d.lat > view.maxLat + 1) continue
+          dotSubPath(path, cam.width / 2 + wrapDeg(d.lon - cam.camX) * cam.zoom, cam.height / 2 + (latToY(d.lat) - cam.camY) * cam.zoom, r)
+          drew = true
+        }
+      }
+      drillHoverCache = { key, path, count: drew ? 1 : 0 }
     }
-    if (drew) {
+    if (drillHoverCache.count > 0) {
       ctx.fillStyle = 'rgba(143, 230, 255, 0.55)'
       ctx.globalAlpha = 0.9
-      ctx.fill(path)
+      ctx.fill(drillHoverCache.path)
       ctx.globalAlpha = 1
     }
   }
@@ -562,8 +573,19 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     event.preventDefault()
   }
 
+  // A85WB-历史问题：指针移出画布即清悬停态+浮签（对齐地球引擎 pointerleave 清理）——
+  // 原实现移入右侧 HUD/底部图区后最后国家的提示框与提亮长期残留。
+  function onPointerLeave(): void {
+    hoverName = null
+    hoverScreen = null
+    pendingHover = null
+    hoverTip.style.display = 'none'
+    canvas.style.cursor = 'grab'
+  }
+
   canvas.addEventListener('pointerdown', onPointerDown)
   canvas.addEventListener('pointermove', onPointerMove)
+  canvas.addEventListener('pointerleave', onPointerLeave)
   window.addEventListener('pointerup', onPointerUp)
   canvas.addEventListener('click', onClick)
   canvas.addEventListener('wheel', onWheel, { passive: false })
@@ -891,23 +913,29 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     if (!hoverName) return
     // 与地球模式统一：不铺半透明多边形，直接把命中该国的点阵提亮（地球是
     // 直接改 hex 颜色）。worldDotsByKey 预索引，悬停国通常数百点。
+    // A85WB-历史问题：路径按 hover+相机键缓存——原每帧全量重建 Path2D，悬停大国时
+    // CPU 成本随点数线性放大。
     buildWorldDots()
     const dots = worldDotsByKey?.get(hoverName)
     if (!dots) return
-    const view = visibleWorldBox()
-    const halfW = cam.width / 2 / cam.zoom
-    const path = new Path2D()
-    let n = 0
-    for (const d of dots) {
-      if (Math.abs(wrapDeg(d.lon - cam.camX)) > halfW + 1) continue
-      if (d.lat < view.minLat - 1 || d.lat > view.maxLat + 1) continue
-      dotSubPath(path, cam.width / 2 + wrapDeg(d.lon - cam.camX) * cam.zoom, cam.height / 2 + (latToY(d.lat) - cam.camY) * cam.zoom, DOT_R * 1.35 * cam.zoom)
-      n++
+    const key = hoverCacheKey(hoverName)
+    if (!worldHoverCache || worldHoverCache.key !== key) {
+      const view = visibleWorldBox()
+      const halfW = cam.width / 2 / cam.zoom
+      const path = new Path2D()
+      let n = 0
+      for (const d of dots) {
+        if (Math.abs(wrapDeg(d.lon - cam.camX)) > halfW + 1) continue
+        if (d.lat < view.minLat - 1 || d.lat > view.maxLat + 1) continue
+        dotSubPath(path, cam.width / 2 + wrapDeg(d.lon - cam.camX) * cam.zoom, cam.height / 2 + (latToY(d.lat) - cam.camY) * cam.zoom, DOT_R * 1.35 * cam.zoom)
+        n++
+      }
+      worldHoverCache = { key, path, count: n }
     }
-    if (n > 0) {
+    if (worldHoverCache.count > 0) {
       ctx.fillStyle = '#8fe6ff'
       ctx.globalAlpha = 0.9
-      ctx.fill(path)
+      ctx.fill(worldHoverCache.path)
       ctx.globalAlpha = 1
     }
   }
@@ -1193,10 +1221,13 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       window.removeEventListener('pointerup', onPointerUp)
       canvas.removeEventListener('pointerdown', onPointerDown)
       canvas.removeEventListener('pointermove', onPointerMove)
+      canvas.removeEventListener('pointerleave', onPointerLeave)
       canvas.removeEventListener('click', onClick)
       canvas.removeEventListener('wheel', onWheel)
       hoverTip.remove()
       // 提前释放离屏位图后备存储（GC 前即可归还内存）
+      worldHoverCache = null
+      drillHoverCache = null
       staticCanvas.width = 0
       staticCanvas.height = 0
       drillWorldCanvas.width = 0

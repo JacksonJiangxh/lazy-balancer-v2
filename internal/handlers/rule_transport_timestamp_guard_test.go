@@ -29,7 +29,7 @@ func TestNormalizeRuleRowsForTransport_preservesMalformedTimestamps(t *testing.T
 	defer func() { _ = tx.Rollback() }()
 
 	// When：执行导入事务内的共享归一实现。
-	if err := normalizeRuleRowsForTransport(context.Background(), tx); err != nil {
+	if _, err := normalizeRuleRowsForTransport(context.Background(), tx); err != nil {
 		t.Fatalf("normalize rule rows: %v", err)
 	}
 	if err := tx.Commit(); err != nil {

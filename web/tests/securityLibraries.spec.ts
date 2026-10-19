@@ -82,3 +82,24 @@ test('多源库健康标签：未配置源不再显示正常', () => {
     { label: '威胁情报库 · 正常', type: 'success' },
   )
 })
+
+test('健康标签加载三态：首次响应落地前显示「加载中」，不得冒充「正常」（A85WA-历史问题）', () => {
+  // 首屏窗口：初值 available:true/status:'' 不代表已确认正常
+  assert.deepEqual(
+    libraryHealthTag('CRS 规则库', { loadError: false, available: true, status: '', loaded: false }),
+    { label: 'CRS 规则库 · 加载中', type: 'info' },
+  )
+  assert.deepEqual(
+    librarySourceHealthTag('威胁情报库', [], false, false),
+    { label: '威胁情报库 · 加载中', type: 'info' },
+  )
+  // loaded 缺省=true：既有调用方（含 SecurityOverview）口径不变
+  assert.deepEqual(
+    libraryHealthTag('CRS 规则库', { loadError: false, available: true, status: 'success' }),
+    { label: 'CRS 规则库 · 正常', type: 'success' },
+  )
+  assert.deepEqual(
+    librarySourceHealthTag('威胁情报库', [], false),
+    { label: '威胁情报库 · 未配置', type: 'warning' },
+  )
+})

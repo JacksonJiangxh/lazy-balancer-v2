@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -416,20 +417,18 @@ func TestUpdateRule_reissues_when_default_CA_differs_from_latest_job_provider(t 
 		VALUES ('lb_default_ca_switch','switch.example.test','issued',?,?,datetime('now','+90 days'),?)`, certPEM, keyPEM, oldProviderID); err != nil {
 		t.Fatalf("seed historical certificate job: %v", err)
 	}
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(nil, t.TempDir())
 	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
-	oldCreate := createOrRequeueCertJob
+	oldCreate := createOrRequeueCertJobVerified
 	enqueuedProvider := make(chan int, 1)
-	createOrRequeueCertJob = func(_ string, _ string, providerID int, _ *services.CAQueueManager) (int, error) {
+	createOrRequeueCertJobVerified = func(_ string, _ string, providerID int, _ *services.CAQueueManager) (int, bool, error) {
 		enqueuedProvider <- providerID
-		return 77, nil
+		return 77, true, nil
 	}
-	t.Cleanup(func() { createOrRequeueCertJob = oldCreate })
+	t.Cleanup(func() { createOrRequeueCertJobVerified = oldCreate })
 	router := gin.New()
 	router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
 	request := httptest.NewRequest(http.MethodPut, "/rules/lb_default_ca_switch", strings.NewReader(`{"name":"after"}`))
@@ -522,6 +521,54 @@ func TestDeleteRule_returns_timeout_and_preserves_rule_when_worker_does_not_exit
 	}
 	if services.GetCAQueueManager().IsRuleBlocked("lb_delete_timeout") {
 		t.Fatal("rule block lease was not released after cancellation compensation")
+	}
+}
+
+func TestDeleteRule_retiredCertificateExecutionPreservesRuleAndCertFiles(t *testing.T) {
+	// Given：规则证书文件与一条退役队列中的滞行签发执行。
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+	seedAuditRule(t, "lb_delete_retired", "delete-retired", "delete-retired.example.test", 8080, true, "acme_dns", true)
+	seedAuditUpstream(t, "lb_delete_retired")
+	if _, err := db.DB.Exec("INSERT INTO cert_jobs (id,rule_id,domain,status) VALUES (42,'lb_delete_retired','delete-retired.example.test','creating_order')"); err != nil {
+		t.Fatalf("seed certificate job: %v", err)
+	}
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
+	if err := services.WriteCertFiles("lb_delete_retired", "cert-material", "key-material"); err != nil {
+		t.Fatalf("write certificate pair: %v", err)
+	}
+	services.ResetCAQueueManagerForTest()
+	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+	done := services.GetCAQueueManager().MarkRetiredJobRunningForTest("lb_delete_retired", 42)
+	t.Cleanup(func() { close(done) })
+	router := gin.New()
+	router.DELETE("/rules/:caddy_id", handler.DeleteRule)
+	response := httptest.NewRecorder()
+
+	// When
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/rules/lb_delete_retired", nil))
+
+	// Then：退役执行仍可见时拒绝删除，DB 行与私钥文件均不得被清理。
+	if response.Code != http.StatusConflict {
+		t.Errorf("delete status=%d body=%s, want 409 while retired execution is active", response.Code, response.Body.String())
+	}
+	var ruleCount, jobCount int
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM lb_rules WHERE caddy_id='lb_delete_retired'").Scan(&ruleCount); err != nil {
+		t.Fatalf("count preserved rule: %v", err)
+	}
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM cert_jobs WHERE rule_id='lb_delete_retired'").Scan(&jobCount); err != nil {
+		t.Fatalf("count preserved jobs: %v", err)
+	}
+	if ruleCount != 1 || jobCount != 1 {
+		t.Fatalf("preserved rows rule=%d job=%d, want 1/1", ruleCount, jobCount)
+	}
+	certPath, keyPath := services.CertFilePaths("lb_delete_retired")
+	for path, want := range map[string]string{certPath: "cert-material", keyPath: "key-material"} {
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != want {
+			t.Errorf("certificate file %s=(%q,%v), want preserved %q", path, got, err, want)
+		}
 	}
 }
 
@@ -922,9 +969,7 @@ func TestDisableRule_returns_error_instead_of_panicking_when_cert_job_update_fai
 
 func TestUpdateRule_preserves_omitted_boolean_fields(t *testing.T) {
 	// Given
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	harness := newUpdateAuditRuleHandlers(t, "lb_bool_keep", 0, false)
 	handler, currentConfig := harness.handler, harness.currentConfig
 	seedAuditRule(t, "lb_bool_keep", "before", "bool-keep.example.test", 8080, true, "manual", true)
@@ -1066,53 +1111,189 @@ func TestUpdateRule_restores_database_and_Caddy_when_ACME_enqueue_fails(t *testi
 	}
 }
 
-func TestUpdateRule_cancels_job_before_restore_when_create_returns_jobID_and_error(t *testing.T) {
-	// Given
-	harness := newUpdateAuditRuleHandlers(t, "lb_acme_cancel", 0, false)
-	seedAuditRule(t, "lb_acme_cancel", "before", "cancel-old.example.test", 8080, true, "acme_dns", true)
-	seedAuditUpstream(t, "lb_acme_cancel")
-	var providerID int
-	if err := db.DB.QueryRow("SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1").Scan(&providerID); err != nil {
-		t.Fatalf("read CA provider: %v", err)
+func TestUpdateRule_compensationCancelsOnlyJobChangedByCurrentAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		changed    bool
+		wantCancel bool
+	}{
+		{name: "existing job returned with error", changed: false, wantCancel: false},
+		{name: "job changed by current attempt", changed: true, wantCancel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given：补偿入口拿到 jobID+error，但只有 changed=true 才属于本次写入。
+			harness := newUpdateAuditRuleHandlers(t, "lb_acme_cancel", 0, false)
+			seedAuditRule(t, "lb_acme_cancel", "before", "cancel-old.example.test", 8080, true, "acme_dns", true)
+			seedAuditUpstream(t, "lb_acme_cancel")
+			var providerID int
+			if err := db.DB.QueryRow("SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1").Scan(&providerID); err != nil {
+				t.Fatalf("read CA provider: %v", err)
+			}
+			if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=?,ca_provider_id=? WHERE caddy_id='lb_acme_cancel'", seedR52CertificateConfig(t), providerID); err != nil {
+				t.Fatalf("set rule CA provider: %v", err)
+			}
+			services.ResetCAQueueManagerForTest()
+			services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+			services.GetCAQueueManager().Start()
+			t.Cleanup(services.ResetCAQueueManagerForTest)
+			oldCreate := createOrRequeueCertJobVerified
+			oldCancel := cancelCertJob
+			createOrRequeueCertJobVerified = func(string, string, int, *services.CAQueueManager) (int, bool, error) {
+				return 77, tc.changed, errors.New("enqueue failed")
+			}
+			cancelled := make(chan int, 1)
+			cancelCertJob = func(jobID int) { cancelled <- jobID }
+			t.Cleanup(func() {
+				createOrRequeueCertJobVerified = oldCreate
+				cancelCertJob = oldCancel
+			})
+			router := gin.New()
+			router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
+			request := httptest.NewRequest(http.MethodPut, "/rules/lb_acme_cancel", strings.NewReader(`{"domain":"cancel-new.example.test"}`))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+
+			// When
+			router.ServeHTTP(response, request)
+
+			// Then
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			select {
+			case jobID := <-cancelled:
+				if !tc.wantCancel {
+					t.Fatalf("cancelled pre-existing job %d after changed=false error", jobID)
+				}
+				if jobID != 77 {
+					t.Fatalf("cancelled job=%d, want 77", jobID)
+				}
+			default:
+				if tc.wantCancel {
+					t.Fatal("job changed by current attempt was not cancelled before restore")
+				}
+			}
+		})
 	}
-	if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=?,ca_provider_id=? WHERE caddy_id='lb_acme_cancel'", seedR52CertificateConfig(t), providerID); err != nil {
-		t.Fatalf("set rule CA provider: %v", err)
+}
+
+func TestEnableRule_rejectsExistingJobThatWasNotQueued(t *testing.T) {
+	// Given：任务处于 creating_order 且不在活动队列中；规则切换到另一 CA，
+	// EnableRule 会被强制到 Retry 分支，但 upsert 的状态白名单不会迁移该行。
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+	seedAuditRule(t, "lb_enable_notqueued", "enable-notqueued", "enable-notqueued.example.test", 8080, false, "acme_dns", true)
+	seedAuditUpstream(t, "lb_enable_notqueued")
+	if _, err := db.DB.Exec(`INSERT OR REPLACE INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled) VALUES (1,'test-dns','dnspod','{}',1)`); err != nil {
+		t.Fatalf("seed certificate config: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT OR IGNORE INTO ca_providers (id,name,provider,directory_url,enabled) VALUES (2,'switched','letsencrypt','https://acme.test/directory',1)`); err != nil {
+		t.Fatalf("seed switched CA provider: %v", err)
+	}
+	var originalProviderID int
+	if err := db.DB.QueryRow("SELECT id FROM ca_providers WHERE id<>2 AND enabled=1 ORDER BY id LIMIT 1").Scan(&originalProviderID); err != nil {
+		t.Fatalf("read original CA provider: %v", err)
+	}
+	if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=1,ca_provider_id=2 WHERE caddy_id='lb_enable_notqueued'"); err != nil {
+		t.Fatalf("bind switched provider: %v", err)
+	}
+	if _, err := db.DB.Exec("INSERT INTO cert_jobs (id,rule_id,domain,status,ca_provider_id) VALUES (77,'lb_enable_notqueued','enable-notqueued.example.test','creating_order',?)", originalProviderID); err != nil {
+		t.Fatalf("seed stranded job: %v", err)
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
 	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
-	oldCreate := createOrRequeueCertJob
-	oldCancel := cancelCertJob
-	createOrRequeueCertJob = func(string, string, int, *services.CAQueueManager) (int, error) {
-		return 77, errors.New("enqueue failed")
-	}
-	cancelled := make(chan int, 1)
-	cancelCertJob = func(jobID int) { cancelled <- jobID }
-	t.Cleanup(func() {
-		createOrRequeueCertJob = oldCreate
-		cancelCertJob = oldCancel
-	})
 	router := gin.New()
-	router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
-	request := httptest.NewRequest(http.MethodPut, "/rules/lb_acme_cancel", strings.NewReader(`{"domain":"cancel-new.example.test"}`))
-	request.Header.Set("Content-Type", "application/json")
+	router.POST("/rules/:caddy_id/enable", handler.EnableRule)
 	response := httptest.NewRecorder()
 
 	// When
-	router.ServeHTTP(response, request)
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_enable_notqueued/enable", nil))
 
-	// Then
+	// Then：未真正入队不得返回成功；补偿恢复规则禁用与任务原状。
 	if response.Code != http.StatusInternalServerError {
-		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		t.Fatalf("status=%d body=%s, want failure when existing job was not queued", response.Code, response.Body.String())
 	}
-	select {
-	case jobID := <-cancelled:
-		if jobID != 77 {
-			t.Fatalf("cancelled job=%d, want 77", jobID)
-		}
-	default:
-		t.Fatal("job was not cancelled before restore returned")
+	var enabled int
+	var jobStatus string
+	if err := db.DB.QueryRow("SELECT IIF(enabled IN ('1',1),1,0) FROM lb_rules WHERE caddy_id='lb_enable_notqueued'").Scan(&enabled); err != nil {
+		t.Fatalf("read restored rule: %v", err)
+	}
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=77").Scan(&jobStatus); err != nil {
+		t.Fatalf("read restored job: %v", err)
+	}
+	if enabled != 0 || jobStatus != "creating_order" {
+		t.Fatalf("restored enabled=%d job=%q, want disabled and original status", enabled, jobStatus)
+	}
+}
+
+func TestEnableRule_compensationCancelsOnlyJobChangedByCurrentAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		changed    bool
+		wantCancel bool
+	}{
+		{name: "existing job returned with error", changed: false, wantCancel: false},
+		{name: "job changed by current attempt", changed: true, wantCancel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given：禁用规则持有一条 failed 任务，EnableRule 会走 Retry 入队。
+			handler, _, _ := newAuditRuleHandlers(t, 0)
+			seedAuditRule(t, "lb_enable_cancel", "enable-cancel", "enable-cancel.example.test", 8080, false, "acme_dns", true)
+			seedAuditUpstream(t, "lb_enable_cancel")
+			if _, err := db.DB.Exec(`INSERT OR REPLACE INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled) VALUES (1,'test-dns','dnspod','{}',1)`); err != nil {
+				t.Fatalf("seed certificate config: %v", err)
+			}
+			var providerID int
+			if err := db.DB.QueryRow("SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1").Scan(&providerID); err != nil {
+				t.Fatalf("read CA provider: %v", err)
+			}
+			if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=1,ca_provider_id=? WHERE caddy_id='lb_enable_cancel'", providerID); err != nil {
+				t.Fatalf("bind ACME provider: %v", err)
+			}
+			if _, err := db.DB.Exec("INSERT INTO cert_jobs (id,rule_id,domain,status,ca_provider_id) VALUES (77,'lb_enable_cancel','enable-cancel.example.test','failed',?)", providerID); err != nil {
+				t.Fatalf("seed failed certificate job: %v", err)
+			}
+			services.ResetCAQueueManagerForTest()
+			services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+			services.GetCAQueueManager().Start()
+			t.Cleanup(services.ResetCAQueueManagerForTest)
+			oldCreate := createOrRequeueCertJobVerified
+			oldCancel := cancelCertJob
+			createOrRequeueCertJobVerified = func(string, string, int, *services.CAQueueManager) (int, bool, error) {
+				return 77, tc.changed, errors.New("enqueue failed")
+			}
+			cancelled := make(chan int, 1)
+			cancelCertJob = func(jobID int) { cancelled <- jobID }
+			t.Cleanup(func() {
+				createOrRequeueCertJobVerified = oldCreate
+				cancelCertJob = oldCancel
+			})
+			router := gin.New()
+			router.POST("/rules/:caddy_id/enable", handler.EnableRule)
+			response := httptest.NewRecorder()
+
+			// When
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_enable_cancel/enable", nil))
+
+			// Then
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			select {
+			case jobID := <-cancelled:
+				if !tc.wantCancel {
+					t.Fatalf("cancelled pre-existing job %d after changed=false error", jobID)
+				}
+				if jobID != 77 {
+					t.Fatalf("cancelled job=%d, want 77", jobID)
+				}
+			default:
+				if tc.wantCancel {
+					t.Fatal("job changed by current attempt was not cancelled during enable compensation")
+				}
+			}
+		})
 	}
 }
 

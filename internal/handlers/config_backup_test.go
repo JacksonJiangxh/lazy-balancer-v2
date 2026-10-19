@@ -179,6 +179,22 @@ func newBackupTestHandlers(t *testing.T) *Handlers {
 	}
 }
 
+// validateV2Backup 是历史测试夹具的整包兼容包装；生产导入/预览必须按
+// 「完整性 → sections 过滤 → 软跳过 → 行级门」分别调用，不消费本测试缝。
+func validateV2Backup(backup configBackup) (bool, error) {
+	usedLegacy, err := verifyBackupIntegrity(backup)
+	if err != nil {
+		return false, err
+	}
+	if err := validateV2BackupRows(backup); err != nil {
+		return false, err
+	}
+	if err := validateV2BackupCertJobStatuses(backup.Tables); err != nil {
+		return false, err
+	}
+	return usedLegacy, nil
+}
+
 func completeBackupJSON(t *testing.T, tables map[string][]map[string]any) string {
 	t.Helper()
 	completeTables := make(map[string][]map[string]any, len(configBackupTables))
@@ -648,9 +664,7 @@ func TestConfigBackup_export_preserves_sensitive_columns(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
 	// 导入完整恢复会物化证书文件，certDir 指向临时目录
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	if _, err := db.DB.Exec(`INSERT INTO users (username, password_hash, role) VALUES ('keep', 'hash', 'admin')`); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}

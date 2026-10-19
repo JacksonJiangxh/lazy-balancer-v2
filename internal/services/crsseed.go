@@ -372,6 +372,11 @@ func reconcileCRSStateFromInLock(liveDir, snapshotDir, dbV string) {
 			Logf("error", "crs reconcile: 校正版本记录为磁盘实际版本 %s 失败: %v", plan.dbVersion, err)
 			return
 		}
+		// CorrectDB 同样改变主节点发布事实；必须主动 bump，已对齐的从节点
+		// 才不会因 304 继续持有校正前的版本标识。
+		if err := BumpClusterVersion(context.Background(), db.DB); err != nil {
+			Logf("error", "crs reconcile: 校正版本记录后递增集群版本失败: %v", err)
+		}
 		Logf("info", "crs reconcile: 版本记录已校正为磁盘实际版本 %s（原记录 %s）", plan.dbVersion, dbV)
 		// 历史问题 发现2：原记录对应的更新成果随规则树丢失被静默废弃，必须留审计痕迹。
 		RecordAuditLog("system", "恢复", "CRS规则库", FormatAuditDetail(fmt.Sprintf("磁盘规则树与版本记录不一致，版本记录已从 %s 校正为磁盘实际版本 %s（原记录对应的更新成果已废弃）", dbV, plan.dbVersion), AuditResultPart("success")), "")

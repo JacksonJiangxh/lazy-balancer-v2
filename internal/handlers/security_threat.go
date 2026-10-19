@@ -59,7 +59,7 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 	}
 	defer rows.Close()
 	sources := []threatSourceDTO{}
-	var rawRows []threatSourceDTO
+	totalEntries := 0
 	for rows.Next() {
 		var s threatSourceDTO
 		if err := rows.Scan(&s.ID, &s.Name, &s.DisplayName, &s.URL, &s.Format, &s.UpdateEnabled,
@@ -67,7 +67,8 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取威胁情报库失败: " + err.Error()})
 			return
 		}
-		rawRows = append(rawRows, s)
+		sources = append(sources, s)
+		totalEntries += s.EntryCount
 	}
 	// SEC-C-N1（历史 历史问题·家族漏收敛）：迭代错误（rows.Err）不得以
 	// 「部分/空列表 + 200」返回——与 历史问题/历史问题 在总览/事件列表建立的
@@ -76,21 +77,32 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取威胁情报库失败: " + err.Error()})
 		return
 	}
-	totalEntries := 0
-	for _, s := range rawRows {
-		listName := db.ThreatListNameBySource(s.Name)
-		if listName != "" {
-			// 历史问题：缺行=未生成内置名单（list_id=0 由前端引导），其余
-			// 数据库错误必须显式 500——静默吞错会让「查看名单」无提示失效。
-			// 历史问题：按 system=1 定位（同名用户列表不是内置行）。
-			lerr := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND system=1`, listName).Scan(&s.ListID)
-			if lerr != nil && !errors.Is(lerr, sql.ErrNoRows) {
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取内置名单失败: " + lerr.Error()})
-				return
-			}
+	// 与 GetCrawlerLib 同一批量形态：内置名单最多 200 行，一次预载代替逐源
+	// 点查；缺行保留 list_id=0，查询/扫描/迭代故障均显式 500。
+	listRows, err := db.DB.Query(`SELECT name, id FROM security_ip_lists WHERE system=1`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取内置名单失败: " + err.Error()})
+		return
+	}
+	listIDs := map[string]int{}
+	for listRows.Next() {
+		var name string
+		var id int
+		if err := listRows.Scan(&name, &id); err != nil {
+			listRows.Close()
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取内置名单失败: " + err.Error()})
+			return
 		}
-		totalEntries += s.EntryCount
-		sources = append(sources, s)
+		listIDs[name] = id
+	}
+	if err := listRows.Err(); err != nil {
+		listRows.Close()
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取内置名单失败: " + err.Error()})
+		return
+	}
+	listRows.Close()
+	for i := range sources {
+		sources[i].ListID = listIDs[db.ThreatListNameBySource(sources[i].Name)]
 	}
 	days, hhmm := services.ThreatSchedule()
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
@@ -207,11 +219,13 @@ func (h *Handlers) StartThreatLibUpdate(c *gin.Context) {
 		return
 	}
 	op := auditOperator(c)
-	// 历史问题：统一异步触发与错误分类（见 services.TriggerTaskAsync）。
-	services.TriggerTaskAsync(te, "threat", services.TriggerAuditContext{
+	// 历史问题/A85历史问题-2：响应前同步预占位，拒绝时不得伪报 running。
+	if err := services.TriggerTaskAsync(te, "threat", services.TriggerAuditContext{
 		Operator: op, Family: "威胁情报库", Name: "威胁情报库更新",
-	})
-	// 审计由任务体自记（operator 经 RunContext 归人——2026-09-29 裁定单记口径）
+	}); err != nil {
+		respondTaskTriggerAdmissionError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
 }
 

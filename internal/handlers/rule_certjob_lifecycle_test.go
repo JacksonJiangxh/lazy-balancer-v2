@@ -31,9 +31,7 @@ func countRuleCertJobs(t *testing.T, caddyID string) int {
 // 主形状一：acme→manual 切换时 failed（与 issued）任务一并删除——
 // 未实现时 failed 行残留（RED）。
 func TestUpdateRule_acmeToManual_deletesAllCertJobsIncludingFailed(t *testing.T) {
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	harness := newUpdateAuditRuleHandlers(t, "lb_r10_manual", 0, false)
 	failedID := seedACMEManualSwitchFixture(t, "lb_r10_manual", "r10.example.test", "failed")
 	// 补一条 issued 形态（切换后证书不再被规则引用，任务行一并退役）；
@@ -69,9 +67,7 @@ func TestUpdateRule_acmeToManual_deletesAllCertJobsIncludingFailed(t *testing.T)
 // 主形状二：禁用 TLS 时关联任务一并删除——此前该路径无任何 cert_jobs
 // 处理，failed 行残留（RED）。
 func TestUpdateRule_disableTLS_deletesAllCertJobs(t *testing.T) {
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	harness := newUpdateAuditRuleHandlers(t, "lb_r10_nodtls", 0, false)
 	seedACMEManualSwitchFixture(t, "lb_r10_nodtls", "nodtls.example.test", "failed")
 	services.ResetCAQueueManagerForTest()
@@ -96,9 +92,7 @@ func TestUpdateRule_disableTLS_deletesAllCertJobs(t *testing.T) {
 // 事务性回归：禁用 TLS 路径的删除同样随事务回滚（应用失败时任务行必须
 // 原样保留——与 acme→manual 回滚形状对称）。
 func TestUpdateRule_disableTLS_deleteRollsBackWhenApplyFails(t *testing.T) {
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	harness := newUpdateAuditRuleHandlers(t, "lb_r10_rbnod", 1, false) // /load 首次必失败
 	jobID := seedACMEManualSwitchFixture(t, "lb_r10_rbnod", "rbnod.example.test", "failed")
 
@@ -139,9 +133,7 @@ func TestUpdateRule_tlsUnchanged_keepsCertJobs(t *testing.T) {
 // 遗留的残留行），重存（manual→manual，无转换事件）同样按终态删除孤儿行。
 // 实现与钉测同批落盘（终态判定超集自然覆盖）——基线钉豁免 RED。
 func TestUpdateRule_manualResave_healsOrphanCertJobs(t *testing.T) {
-	oldCertDir := testServicesCertDir
-	testServicesCertDir = t.TempDir()
-	t.Cleanup(func() { testServicesCertDir = oldCertDir })
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	harness := newUpdateAuditRuleHandlers(t, "lb_r10_heal", 0, false)
 	seedAuditRule(t, "lb_r10_heal", "before", "heal.example.test", 8080, true, "manual", true)
 	seedAuditUpstream(t, "lb_r10_heal")
@@ -185,9 +177,7 @@ func TestUpdateRule_leavingACMEConvergesCertificateFiles(t *testing.T) {
 	}
 
 	t.Run("disable TLS removes obsolete ACME files", func(t *testing.T) {
-		oldCertDir := testServicesCertDir
-		testServicesCertDir = t.TempDir()
-		t.Cleanup(func() { testServicesCertDir = oldCertDir })
+		t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 		harness := newUpdateAuditRuleHandlers(t, "lb_files_disable", 0, false)
 		seedACMEManualSwitchFixture(t, "lb_files_disable", "files-disable.example.test", "failed")
 		certPath, keyPath := seedFiles(t, "lb_files_disable")
@@ -205,9 +195,7 @@ func TestUpdateRule_leavingACMEConvergesCertificateFiles(t *testing.T) {
 	})
 
 	t.Run("manual replacement installs new files", func(t *testing.T) {
-		oldCertDir := testServicesCertDir
-		testServicesCertDir = t.TempDir()
-		t.Cleanup(func() { testServicesCertDir = oldCertDir })
+		t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 		harness := newUpdateAuditRuleHandlers(t, "lb_files_manual", 0, false)
 		seedACMEManualSwitchFixture(t, "lb_files_manual", "files-manual.example.test", "failed")
 		certPath, keyPath := seedFiles(t, "lb_files_manual")
@@ -231,9 +219,7 @@ func TestUpdateRule_leavingACMEConvergesCertificateFiles(t *testing.T) {
 	})
 
 	t.Run("apply rejection restores ACME files", func(t *testing.T) {
-		oldCertDir := testServicesCertDir
-		testServicesCertDir = t.TempDir()
-		t.Cleanup(func() { testServicesCertDir = oldCertDir })
+		t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 		harness := newUpdateAuditRuleHandlers(t, "lb_files_rollback", 1, false)
 		seedACMEManualSwitchFixture(t, "lb_files_rollback", "files-rollback.example.test", "failed")
 		certPath, keyPath := seedFiles(t, "lb_files_rollback")

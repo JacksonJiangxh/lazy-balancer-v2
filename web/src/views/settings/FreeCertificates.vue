@@ -47,7 +47,7 @@
           <span class="form-tip-inline">全局默认 DNS 提供商，创建规则时默认使用</span>
         </el-form-item>
           <el-form-item>
-            <el-button type="primary" :loading="savingGlobal" :disabled="isReadOnly" @click="handleSave">
+            <el-button type="primary" :loading="savingGlobal" :disabled="isReadOnly || !props.configLoaded" @click="handleSave">
               <el-icon><Check /></el-icon>
               <span class="btn-text">保存</span>
             </el-button>
@@ -312,6 +312,10 @@ const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 
 const global = defineModel<GlobalCertificateConfig>('global', { required: true })
+// A85历史问题-C：父级 /config 加载完成前禁止保存——表单此刻仍是默认值，补填
+// 邮箱后保存会把 30/30/5/dnspod 等默认续签参数静默覆盖已定制值。
+// 与 BasicSettings/CaddyGlobalSettings 同一 configLoaded 契约。
+const props = defineProps<{ configLoaded: boolean }>()
 const emit = defineEmits<{
   (e: 'save'): void
 }>()
@@ -593,6 +597,9 @@ const saveConfig = async () => {
   try {
     // 编辑保存前测试：表单凭证含全掩码 ***（非 admin GET 回显、用户未改）时仍测
     // DB 存量（:id/test）；用户实际改过凭证（无 ***）则内联新凭证走无 id 的 /test
+    // A85WA-历史问题：当前面板恒 admin JWT（GET 回显明文）且只读用户打不开本弹框，
+    // 掩码回传分支在 UI 内不可达——保留作为非 UI 客户端（API Key/只读通道拿到
+    // 掩码值直接回传）的防御路径；该分支只验证库中原值，不验证表单改动。
     const hasMaskedCred = Object.values(payload.dns_credentials).some(v => v === '***')
     const url = targetId && hasMaskedCred
       ? `/certificate-configs/${targetId}/test`
@@ -688,6 +695,10 @@ const testConfig = async (config: CertConfig) => {
 }
 
 const handleSave = async () => {
+  if (!props.configLoaded) {
+    ElMessage.warning('配置尚未加载完成，暂不能保存')
+    return
+  }
   if (isReadOnly.value) return
   if (savingGlobal.value) return
   if (!global.value.acme_email || !global.value.acme_email.trim()) {

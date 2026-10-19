@@ -5,11 +5,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
-
-	"lazy-balancer-v2/internal/dnsprovider/ownership"
 )
 
 // toggleDeleteFailTransport 让 DeleteRecord 一律返回 API 错误（其余委托
@@ -44,16 +43,9 @@ func (transport *toggleDeleteFailTransport) RoundTrip(request *http.Request) (*h
 // A-2（历史，tencent 侧同族）：ownership.Add 失败且回滚删除亦失败时
 // 告警留痕 + 回填内存兜底表；cleanUp 的 ownership 分支排空兜底表重试删除。
 func TestProvider_Present_ownershipAddAndRollbackFailureRefillsFallback(t *testing.T) {
-	// Given：有效 ownership 文件（load 成功）但目录只读 → Add 失败；
+	// Given：ownership 文件路径被目录占据（root 下也必定读写失败）→ Add 失败；
 	// DeleteRecord 失败 → 回滚删除亦失败。
 	dataDir := t.TempDir()
-	store, err := ownership.New(dataDir)
-	if err != nil {
-		t.Fatalf("open ownership store: %v", err)
-	}
-	if err := store.Add(ownership.Record{Provider: "tencent", Zone: "example.com", FQDN: "_acme-challenge.seed.example.com.", Value: "seed", RecordID: "999"}); err != nil {
-		t.Fatalf("seed ownership file: %v", err)
-	}
 	transport := &toggleDeleteFailTransport{recordTransport: recordTransport{records: map[uint64]string{}}, failDelete: true}
 	provider, err := NewPersistent("secret-id", "secret-key", dataDir)
 	if err != nil {
@@ -69,10 +61,10 @@ func TestProvider_Present_ownershipAddAndRollbackFailureRefillsFallback(t *testi
 		}
 	}
 	t.Cleanup(func() { logf = oldLogf })
-	if err := os.Chmod(dataDir, 0o555); err != nil {
-		t.Fatalf("make ownership dir read-only: %v", err)
+	ownershipPath := filepath.Join(dataDir, "acme_dns_ownership.json")
+	if err := os.Mkdir(ownershipPath, 0o755); err != nil {
+		t.Fatalf("block ownership file with directory: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(dataDir, 0o755) })
 
 	// When
 	err = provider.Present(t.Context(), "example.com", "_acme-challenge.example.com.", "value", 600)
@@ -92,8 +84,8 @@ func TestProvider_Present_ownershipAddAndRollbackFailureRefillsFallback(t *testi
 	}
 
 	// When：存储与删除均恢复 → cleanUp 排空兜底表并重试删除
-	if err := os.Chmod(dataDir, 0o755); err != nil {
-		t.Fatalf("restore ownership dir: %v", err)
+	if err := os.Remove(ownershipPath); err != nil {
+		t.Fatalf("remove blocking ownership directory: %v", err)
 	}
 	transport.setFailDelete(false)
 	if err := provider.CleanUp(t.Context(), "example.com", "_acme-challenge.example.com."); err != nil {

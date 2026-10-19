@@ -54,8 +54,9 @@ const (
 	DefaultCertRenewalDays     = 30
 	DefaultCertRenewalAttempts = 5
 	// DefaultAnomalyThreshold（G6，历史）：security_policies.anomaly_threshold
-	// 类型①值列默认值——DDL DEFAULT（:604）+启动归一（security_normalize.go
-	// legacySecurityEnumBackfills）+DB 侧钉测三处单源。
+	// 类型①值列默认值——fresh CREATE 的 security_policies.anomaly_threshold
+	// DDL DEFAULT + 启动归一（security_normalize.go legacySecurityEnumBackfills）
+	// + DB 侧钉测三处单源。
 	DefaultAnomalyThreshold = 5
 )
 
@@ -1313,14 +1314,29 @@ func runMigrations() error {
 	}
 
 	// Sensitive credential headers are dropped from access logs (Cookie and
-	// Authorization are redacted by Caddy itself; API keys are not).
+	// Authorization are redacted by Caddy itself; API keys are not). A85历史问题-A：
+	// 归一为唯一规范行——既有的 X-API-Key rename 行会被移除（渲染层虽强制
+	// delete 覆盖，落库值仍应与所见一致）；空格式不写回（「不裁剪原生字段」
+	// 的默认形态，渲染层恒注入脱敏行）。
 	var lf2 string
 	if err := DB.QueryRow("SELECT COALESCE(access_log_format,'') FROM global_config WHERE id=1").Scan(&lf2); err != nil {
 		return fmt.Errorf("failed to reread global config access log format: %w", err)
 	}
-	if lf2 != "" && !strings.Contains(lf2, "X-API-Key") {
-		if _, err := DB.Exec("UPDATE global_config SET access_log_format = ? WHERE id=1", lf2+"\nrequest>headers>X-API-Key -> delete"); err != nil {
-			return fmt.Errorf("failed to redact API key access log header: %w", err)
+	const apiKeyPath = "request>headers>X-API-Key"
+	if lf2 != "" {
+		kept := make([]string, 0, 8)
+		for _, line := range strings.Split(lf2, "\n") {
+			parts := strings.SplitN(strings.TrimSpace(line), "->", 2)
+			if len(parts) == 2 && strings.TrimSpace(parts[0]) == apiKeyPath {
+				continue
+			}
+			kept = append(kept, line)
+		}
+		normalized := strings.Join(append(kept, apiKeyPath+" -> delete"), "\n")
+		if normalized != lf2 {
+			if _, err := DB.Exec("UPDATE global_config SET access_log_format = ? WHERE id=1", normalized); err != nil {
+				return fmt.Errorf("failed to redact API key access log header: %w", err)
+			}
 		}
 	}
 
@@ -1712,6 +1728,10 @@ func runMigrations() error {
 	if err := migrateTCPRuleDeadFields(); err != nil {
 		return err
 	}
+	// A85历史问题-3-RESIDUAL：旧版本 HTTP→TCP 切换前遗留的惰性策略绑定。
+	if err := migrateTCPRuleSecurityPolicyBindings(); err != nil {
+		return err
+	}
 	if err := normalizeRuleTimestampsMigration(); err != nil {
 		return err
 	}
@@ -1890,14 +1910,24 @@ func migrateLegacyHTTPSProtocol() error {
 	if len(legacy) == 0 {
 		return nil
 	}
-	if _, err := DB.Exec(`UPDATE lb_rules SET protocol='http', enable_tls=1
+	tx, err := DB.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin legacy https lb_rules migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`UPDATE lb_rules SET protocol='http', enable_tls=1
 		WHERE protocol='https' AND ` + legacyHTTPSHasCertPredicate); err != nil {
 		return fmt.Errorf("failed to normalize cert-bearing legacy https lb_rules: %w", err)
 	}
-	if _, err := DB.Exec(`UPDATE lb_rules SET protocol='http', enable_tls=0, tls_http_redirect=0
+	if _, err := tx.Exec(`UPDATE lb_rules SET protocol='http', enable_tls=0, tls_http_redirect=0
 		WHERE protocol='https'`); err != nil {
 		return fmt.Errorf("failed to normalize certless legacy https lb_rules: %w", err)
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit legacy https lb_rules migration: %w", err)
+	}
+	// 系统审计走内存缓冲而非 SQL 事务：只在数据库提交成功后入缓冲；
+	// 任一 UPDATE 失败会整体回滚且不留半迁移审计。
 	for _, rule := range legacy {
 		var detail string
 		if rule.hasCert {
@@ -2795,6 +2825,14 @@ func migrateLbRulesPrimaryKey() error {
 		return nil
 	}
 
+	// 拷贝阶段的 INNER JOIN 会丢弃 FK OFF 历史期积累的孤儿 upstream。
+	// 迁移前计数，成功后留痕；保持既有数据收敛语义，但不允静默消失。
+	var orphanUpstreams int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM upstreams u
+		LEFT JOIN lb_rules r ON u.rule_id=r.id WHERE r.id IS NULL`).Scan(&orphanUpstreams); err != nil {
+		return fmt.Errorf("failed to count orphan upstreams before lb_rules primary key migration: %w", err)
+	}
+
 	log.Println("Migrating lb_rules to use caddy_id as primary key...")
 
 	if err := withTableRebuild(context.Background(), "lb_rules", func(tx *sql.Tx) error {
@@ -2980,6 +3018,11 @@ func migrateLbRulesPrimaryKey() error {
 		return err
 	}
 
+	if orphanUpstreams > 0 {
+		detail := fmt.Sprintf("lb_rules 主键迁移丢弃 %d 条孤儿 upstream 行（rule_id 无对应规则）", orphanUpstreams)
+		log.Print("WARN: " + detail)
+		recordSystemAudit("启动迁移", "系统配置", detail)
+	}
 	log.Println("Successfully migrated lb_rules to use caddy_id as primary key")
 	return nil
 }
@@ -3253,6 +3296,49 @@ func ensureClusterAppliedSections() error {
 		applied_at DATETIME
 	)`)
 	return err
+}
+
+func migrateTCPRuleSecurityPolicyBindings() error {
+	// TCP 渲染链零消费策略绑定，绑定写接口、协议切换、导入和复制均已在保存
+	// 侧阻断新行；旧版本切换前产生的行只会抬高策略 rule_count/绑定视图。
+	// 仅删除指向 TCP 规则的绑定，HTTP 与无对应规则的历史行保持不变。
+	// 删除改变同步表 security_policy_bindings：在同一事务内沿用现有
+	// cluster_version bump 表达式，让从端按既有版本门于下一轮收敛。
+	// 先探测再开事务：重复启动无 TCP 绑定时零写入、零版本扰动。
+	var stale int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM security_policy_bindings
+		WHERE rule_caddy_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp')`).Scan(&stale); err != nil {
+		return fmt.Errorf("failed to inspect TCP rule policy bindings: %w", err)
+	}
+	if stale == 0 {
+		return nil
+	}
+	tx, err := DB.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin TCP rule policy binding cleanup: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(`DELETE FROM security_policy_bindings
+		WHERE rule_caddy_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp')`)
+	if err != nil {
+		return fmt.Errorf("failed to delete TCP rule policy bindings: %w", err)
+	}
+	removed, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to read deleted TCP rule policy binding count: %w", err)
+	}
+	if removed > 0 {
+		if _, err := tx.Exec(`UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1`); err != nil {
+			return fmt.Errorf("failed to bump cluster_version after TCP rule policy binding cleanup: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit TCP rule policy binding cleanup: %w", err)
+	}
+	if removed > 0 {
+		log.Printf("迁移：已清理 %d 条 TCP 规则安全策略绑定", removed)
+	}
+	return nil
 }
 
 // normalizeRuleTimestampsMigration（2026-10-11 用户裁定「时间戳格式本来就应该

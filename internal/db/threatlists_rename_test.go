@@ -46,10 +46,10 @@ func TestThreatSystemListRename_migratesLegacyNames(t *testing.T) {
 	}
 }
 
-func TestThreatSystemListRename_skipsWhenNewNameOccupied(t *testing.T) {
-	// Given 旧名 system=1 行 + 用户手工占用的同名（新名）system=0 行——CORE-U3
-	//（历史）：name 无 UNIQUE 约束，无守卫改名会产出同名双行（选择器混淆），
-	// 须跳过改名留给人工处置。
+func TestThreatSystemListRename_renamesUserConflictAndTakesCanonicalName(t *testing.T) {
+	// Given 旧名 system=1 行 + 用户手工占用的同名（新名）system=0 行。
+	// 冲突用户行必须改名为「规范名（用户 <id>）」（保 id/数据），随后
+	// system 行接管规范名，避免同名双行与内置名单永久失更。
 	openMigrationTestDB(t)
 	if err := createTables(); err != nil {
 		t.Fatalf("create tables: %v", err)
@@ -63,7 +63,7 @@ func TestThreatSystemListRename_skipsWhenNewNameOccupied(t *testing.T) {
 
 	// When
 	if err := migrateThreatSystemListNames(); err != nil {
-		t.Fatalf("migrate: %v（同名冲突须跳过改名而非报错阻断启动）", err)
+		t.Fatalf("migrate: %v（冲突用户行改名与规范名接管不得阻断启动）", err)
 	}
 
 	// Then 旧 system 行接管规范名；占用新名的用户行被改名（保 id/数据），
@@ -92,6 +92,44 @@ func TestThreatSystemListRename_skipsWhenNewNameOccupied(t *testing.T) {
 	// And 幂等：二次执行不报错且不再改名
 	if err := migrateThreatSystemListNames(); err != nil {
 		t.Fatalf("二次执行: %v", err)
+	}
+}
+
+func TestThreatSystemListRename_returnsConflictScanError(t *testing.T) {
+	// Given 真实 SQLite 中的畸形存量 schema：id 携带不可转 int64 的文本。
+	openMigrationTestDB(t)
+	if _, err := DB.Exec(`CREATE TABLE security_ip_lists (
+		id TEXT PRIMARY KEY,
+		name TEXT,
+		description TEXT,
+		system INTEGER,
+		updated_at TEXT
+	)`); err != nil {
+		t.Fatalf("create malformed legacy list table: %v", err)
+	}
+	newName := ThreatListNameBySource("ustc")
+	if _, err := DB.Exec(`INSERT INTO security_ip_lists (id,name,description,system,updated_at) VALUES
+		('system-row','威胁情报库-中科大黑 IP','旧',1,datetime('now')),
+		('broken-user-id',?,'用户自建同名名单',0,datetime('now'))`, newName); err != nil {
+		t.Fatalf("seed malformed conflict row: %v", err)
+	}
+
+	// When
+	err := migrateThreatSystemListNames()
+
+	// Then Scan 错误必须上抛，且不得让 system 行在冲突未处理时接管规范名。
+	if err == nil {
+		t.Fatal("conflict row Scan error was swallowed")
+	}
+	var legacySystem, canonicalUser int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE id='system-row' AND name='威胁情报库-中科大黑 IP'`).Scan(&legacySystem); err != nil {
+		t.Fatal(err)
+	}
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE id='broken-user-id' AND name=?`, newName).Scan(&canonicalUser); err != nil {
+		t.Fatal(err)
+	}
+	if legacySystem != 1 || canonicalUser != 1 {
+		t.Fatalf("rows changed despite Scan failure: legacySystem=%d canonicalUser=%d", legacySystem, canonicalUser)
 	}
 }
 

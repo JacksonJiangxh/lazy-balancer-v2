@@ -61,6 +61,136 @@ func TestUpdateCertificateConfig_validatesEffectiveCredentials(t *testing.T) {
 	}
 }
 
+func TestUpdateCertificateConfig_legacyEmptyCredentialsAllowNonCredentialUpdates(t *testing.T) {
+	put := func(h *Handlers, id int64, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		router := gin.New()
+		router.PUT("/certificate-configs/:id", h.UpdateCertificateConfig)
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPut, "/certificate-configs/"+strconv.FormatInt(id, 10), strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(response, request)
+		return response
+	}
+	seed := func(t *testing.T, credentials any, enabled int) (*Handlers, int64) {
+		t.Helper()
+		h := newBackupTestHandlers(t)
+		result, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('legacy','dnspod',?,?)`, credentials, enabled)
+		if err != nil {
+			t.Fatalf("seed legacy config: %v", err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h, id
+	}
+
+	t.Run("NULL rename", func(t *testing.T) {
+		h, id := seed(t, nil, 1)
+		response := put(h, id, `{"name":"renamed"}`)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want rename 200", response.Code, response.Body.String())
+		}
+		var name string
+		var isNull int
+		if err := db.DB.QueryRow(`SELECT name, dns_credentials IS NULL FROM certificate_configs WHERE id=?`, id).Scan(&name, &isNull); err != nil {
+			t.Fatal(err)
+		}
+		if name != "renamed" || isNull != 1 {
+			t.Fatalf("updated row name=%q credentials_null=%d, want renamed/NULL", name, isNull)
+		}
+	})
+
+	t.Run("empty string disable", func(t *testing.T) {
+		h, id := seed(t, "", 1)
+		response := put(h, id, `{"enabled":false}`)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want disable 200", response.Code, response.Body.String())
+		}
+		var enabled int
+		if err := db.DB.QueryRow(`SELECT enabled FROM certificate_configs WHERE id=?`, id).Scan(&enabled); err != nil {
+			t.Fatal(err)
+		}
+		if enabled != 0 {
+			t.Fatalf("enabled=%d, want 0", enabled)
+		}
+	})
+
+	t.Run("empty credentials cannot be enabled", func(t *testing.T) {
+		h, id := seed(t, "", 0)
+		response := put(h, id, `{"enabled":true}`)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "请选择认证方式") {
+			t.Fatalf("status=%d body=%s, want provider credential validation 400", response.Code, response.Body.String())
+		}
+		var enabled int
+		if err := db.DB.QueryRow(`SELECT enabled FROM certificate_configs WHERE id=?`, id).Scan(&enabled); err != nil {
+			t.Fatal(err)
+		}
+		if enabled != 0 {
+			t.Fatalf("invalid empty config was enabled")
+		}
+	})
+
+	t.Run("malformed stored JSON remains rejected", func(t *testing.T) {
+		h, id := seed(t, "not-json", 1)
+		response := put(h, id, `{"name":"renamed"}`)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "Invalid stored DNS credentials") {
+			t.Fatalf("status=%d body=%s, want malformed stored JSON 400", response.Code, response.Body.String())
+		}
+	})
+}
+
+func TestCertificateConfigReferenceGuards_formatListedReferencesConsistently(t *testing.T) {
+	seed := func(t *testing.T) *Handlers {
+		t.Helper()
+		h := newRuleFeatureTestHandlers(t)
+		if _, err := db.DB.Exec(`INSERT INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled) VALUES (1,'refs','dnspod','{"mode":"tencent","secret_id":"id","secret_key":"key"}',1)`); err != nil {
+			t.Fatal(err)
+		}
+		domains := []string{"one.example", "two.example", "", "four.example", "five.example", "six.example"}
+		for i, domain := range domains {
+			id := "lb_ref" + strconv.Itoa(i+1)
+			if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enabled,enable_tls,tls_source,acme_config_id)
+				VALUES (?,?,'http',?,8443,'weighted_round_robin',1,1,'acme_dns',1)`, id, id, domain); err != nil {
+				t.Fatalf("seed reference %s: %v", id, err)
+			}
+		}
+		return h
+	}
+	const listed = "one.example (lb_ref1)、two.example (lb_ref2)、lb_ref3、four.example (lb_ref4)、five.example (lb_ref5) 等 6 条规则"
+
+	t.Run("disable", func(t *testing.T) {
+		h := seed(t)
+		router := gin.New()
+		router.PUT("/configs/:id", h.UpdateCertificateConfig)
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPut, "/configs/1", strings.NewReader(`{"enabled":false}`))
+		request.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "6 条启用中的 ACME 规则引用") || !strings.Contains(response.Body.String(), listed) {
+			t.Fatalf("status=%d body=%s, want six-reference disable message", response.Code, response.Body.String())
+		}
+		if strings.Contains(response.Body.String(), "six.example") {
+			t.Fatalf("more than five references listed: %s", response.Body.String())
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		h := seed(t)
+		router := gin.New()
+		router.DELETE("/configs/:id", h.DeleteCertificateConfig)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/configs/1", nil))
+		if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "6 条负载规则引用") || !strings.Contains(response.Body.String(), listed) {
+			t.Fatalf("status=%d body=%s, want six-reference delete message", response.Code, response.Body.String())
+		}
+		if strings.Contains(response.Body.String(), "six.example") {
+			t.Fatalf("more than five references listed: %s", response.Body.String())
+		}
+	})
+}
+
 func TestIssueCertificate_records_queue_unavailable_failure(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)

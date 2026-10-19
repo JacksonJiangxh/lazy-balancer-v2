@@ -565,9 +565,7 @@ func TestCreateRule_does_not_require_CA_provider_outside_ACME(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Given
-			oldCertDir := testServicesCertDir
-			testServicesCertDir = t.TempDir()
-			t.Cleanup(func() { testServicesCertDir = oldCertDir })
+			t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 			handler, _ := newRuleFeatureTestHandlersWithCapture(t)
 			if _, err := db.DB.Exec("UPDATE ca_providers SET enabled=0"); err != nil {
 				t.Fatalf("disable CA providers: %v", err)

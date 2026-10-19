@@ -224,8 +224,11 @@ func (h *Handlers) Login(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"mfa_required": true, "mfa_token": mfaToken})
 		return
 	}
-	// 完整登录成功（无 MFA）：清零登录失败计数与锁定。
-	_, _ = db.DB.Exec("UPDATE users SET login_failed_attempts=0, login_locked_until=NULL WHERE id=?", user.ID)
+	// 完整登录成功（无 MFA）：清零登录失败计数与锁定。已验证登录不因收尾
+	// 清零失败撤销 JWT，但旧计数残留必须留痕（与 MFA 成功路径同口径）。
+	if _, err := db.DB.Exec("UPDATE users SET login_failed_attempts=0, login_locked_until=NULL WHERE id=?", user.ID); err != nil {
+		services.Logf("warn", "登录成功清零登录失败计数与锁定失败: user_id=%d: %v", user.ID, err)
+	}
 
 	h.respondLogin(c, user, passwordVersion)
 }

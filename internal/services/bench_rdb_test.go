@@ -8,8 +8,9 @@ import (
 	"time"
 )
 
-// RDB 验证基准（Steps 13-20）: 20万条 .fast 加载 vs .iplist 文本加载 + 查询一致性。
-func TestRDBBenchmark_200k(t *testing.T) {
+// RDB 编译规模回归：20 万条 /24 文本编译为聚合 .fast，并约束产物大小。
+// 加载与查询一致性由 wafiplist 的 Parse/Evaluate 契约测试覆盖，本测试不宣称基准对比。
+func TestRDBCompile_200kAggregates(t *testing.T) {
 	restoreWaf := OverrideThreatWafDirForTest(t.TempDir())
 	defer restoreWaf()
 	wafDir := WafDir()

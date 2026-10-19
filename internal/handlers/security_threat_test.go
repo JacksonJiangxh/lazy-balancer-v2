@@ -88,6 +88,21 @@ func TestThreatLib_getListsSourcesWithTotal(t *testing.T) {
 	}
 }
 
+func TestThreatLib_listLookupFailureReturns500(t *testing.T) {
+	// Given 源主表可读但内置名单表故障。
+	router := newThreatTestRouter(t)
+	if _, err := db.DB.Exec(`DROP TABLE security_ip_lists`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When/Then 名单 ID 解析必须 fail-visible，不得退化为 list_id=0 的 200。
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/security/threat-lib", nil))
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "读取内置名单失败") {
+		t.Fatalf("status=%d body=%s, want list lookup 500", response.Code, response.Body.String())
+	}
+}
+
 func TestThreatLib_excludesCrawlerAddressSources(t *testing.T) {
 	// Given：历史合并形态在威胁源表残留爬虫地址库源行
 	router := newThreatTestRouter(t)

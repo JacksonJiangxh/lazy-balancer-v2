@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,6 +16,29 @@ import (
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/taskengine"
 )
+
+func TestLogRotatedBackups_matchServiceWriters(t *testing.T) {
+	// 跨包常量未导出时的契约钉（直接读取生产源，不用 /tmp 副本）：services
+	// 写侧改保留份数时，本测试迫使读侧常量与六处展示同步更新。
+	if logRotatedBackups != 5 {
+		t.Fatalf("handler logRotatedBackups=%d, want 5", logRotatedBackups)
+	}
+	certSource, err := os.ReadFile("../services/certjoblog.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(certSource), "const maxRotatedFiles = 5") {
+		t.Fatal("services certjob maxRotatedFiles drifted from handler retention")
+	}
+	caddySource, err := os.ReadFile("../services/caddy.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches := regexp.MustCompile(`roll_keep"?:\s*5`).FindAllString(string(caddySource), -1)
+	if len(matches) != 2 {
+		t.Fatalf("services Caddy roll_keep=5 sites=%d, want 2", len(matches))
+	}
+}
 
 // 安全事件统计行(2026-09-14 用户裁定):SizeBytes=真实审计日志文件大小
 // (非 metrics.db 库文件);DBBytes=metrics.db 容量(同行展示);LimitRows=

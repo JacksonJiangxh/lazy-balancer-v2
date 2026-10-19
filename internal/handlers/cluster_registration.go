@@ -44,6 +44,11 @@ func (h *Handlers) GenerateClusterRegisterToken(c *gin.Context) {
 	}
 	token, expiresAt, err := h.clusterService.GenerateRegisterToken(c.Request.Context(), int(contextUserID(c)), time.Now())
 	if err != nil {
+		if errors.Is(err, services.ErrNotMasterNode) {
+			c.Header("X-LB-Error-Code", masterRequiredErrorCode)
+			clusterError(c, http.StatusForbidden, err.Error(), err)
+			return
+		}
 		clusterError(c, http.StatusInternalServerError, "生成注册令牌失败", err)
 		return
 	}
@@ -120,6 +125,11 @@ func (h *Handlers) GetClusterRegistrationStatus(c *gin.Context) {
 	}
 	status, err := h.clusterService.RegistrationStatus(c.Request.Context(), id, c.GetString("registration_secret"), time.Now())
 	if err != nil {
+		if errors.Is(err, services.ErrNotMasterNode) {
+			c.Header("X-LB-Error-Code", masterRequiredErrorCode)
+			clusterError(c, http.StatusForbidden, err.Error(), err)
+			return
+		}
 		// 历史问题:仅凭证类哨兵 401——DB 故障误映射 401 会驱使从节点走
 		// 五连败轨道耗尽注册配额。
 		if errors.Is(err, services.ErrNodeNotFound) || errors.Is(err, services.ErrInvalidClusterAuth) {

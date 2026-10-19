@@ -665,6 +665,9 @@ const sortedRules = computed(() => rankableRules.value.slice(0, 10))
 const rulesEmptyText = computed(() => {
   if (rulesUnavailable.value) return '采集失败'
   if (rules.value.length === 0) return '暂无负载均衡规则'
+  // A85WB-历史问题：指标采集失败 ≠ 无流量——失败口径与页面其它「采集失败」一致，
+  // 不再把采集故障误报为「暂无请求/流量数据」。
+  if (caddyMetricsUnavailable.value) return '采集失败'
   return rankBy.value === 'bytes' ? '暂无流量数据' : '暂无请求数据'
 })
 

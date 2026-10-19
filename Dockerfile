@@ -134,15 +134,21 @@ ARG CRS_VERSION=v4.28.0
 # 一次装 curl → CRS 下载/校验/解包 → waf.dist 快照 → xdb 下载/校验 → 一次
 # apk del curl；少两层、少一次装删、重试逻辑单份。
 # apk add 包 3 次重试：Alpine CDN 偶发 zstd 解压 I/O error（下载块损坏类
-# 瞬态错误），重试重新拉包即可消化；curl 双源回退逻辑保持不变
+# 瞬态错误），重试重新拉包即可消化；CRS/xdb 双源下载同样包 3 次重试——
+# 受限网络下双源同时瞬时失败不应直接终止构建（与同 RUN 内 apk 及构建期
+# go mod download/xcaddy 的重试口径对齐，失败仍显性报错、行为不弱化）。
 RUN n=0; until apk add --no-cache curl; do \
       n=$((n+1)); \
       if [ "$n" -ge 3 ]; then echo ">>> apk add curl 3 次失败" >&2; exit 1; fi; \
       echo ">>> apk add curl 第 ${n}/3 次失败，10s 后重试" >&2; sleep 10; \
     done && \
     mkdir -p /tmp/crs-src && \
-    (curl -sfL -o /tmp/crs.tar.gz "https://ghfast.top/https://github.com/coreruleset/coreruleset/archive/refs/tags/${CRS_VERSION}.tar.gz" || \
-     curl -sfL -o /tmp/crs.tar.gz "https://github.com/coreruleset/coreruleset/archive/refs/tags/${CRS_VERSION}.tar.gz") && \
+    n=0; until (curl -sfL -o /tmp/crs.tar.gz "https://ghfast.top/https://github.com/coreruleset/coreruleset/archive/refs/tags/${CRS_VERSION}.tar.gz" || \
+                curl -sfL -o /tmp/crs.tar.gz "https://github.com/coreruleset/coreruleset/archive/refs/tags/${CRS_VERSION}.tar.gz"); do \
+      n=$((n+1)); \
+      if [ "$n" -ge 3 ]; then echo ">>> CRS 下载 3 次失败" >&2; exit 1; fi; \
+      echo ">>> CRS 下载第 ${n}/3 次失败，10s 后重试" >&2; sleep 10; \
+    done && \
     echo "d8acc96f25ad07c8e3a595a23c797324f6d77e59ddf9e26e90dd95ebd2e676ce  /tmp/crs.tar.gz" | sha256sum -c - && \
     tar xzf /tmp/crs.tar.gz --strip-components=1 -C /tmp/crs-src && \
     cp -r /tmp/crs-src/rules /app/waf/crs/rules && \
@@ -150,8 +156,12 @@ RUN n=0; until apk add --no-cache curl; do \
     echo "${CRS_VERSION}" > /app/waf/crs/VERSION && \
     rm -rf /tmp/crs-src /tmp/crs.tar.gz && \
     cp -r /app/waf /app/waf.dist && \
-    (curl -sfL -o /app/waf.dist/ip2region.xdb "https://ghfast.top/https://raw.githubusercontent.com/lionsoul2014/ip2region/v3.17.0/data/ip2region_v4.xdb" || \
-     curl -sfL -o /app/waf.dist/ip2region.xdb "https://raw.githubusercontent.com/lionsoul2014/ip2region/v3.17.0/data/ip2region_v4.xdb") && \
+    n=0; until (curl -sfL -o /app/waf.dist/ip2region.xdb "https://ghfast.top/https://raw.githubusercontent.com/lionsoul2014/ip2region/v3.17.0/data/ip2region_v4.xdb" || \
+                curl -sfL -o /app/waf.dist/ip2region.xdb "https://raw.githubusercontent.com/lionsoul2014/ip2region/v3.17.0/data/ip2region_v4.xdb"); do \
+      n=$((n+1)); \
+      if [ "$n" -ge 3 ]; then echo ">>> ip2region xdb 下载 3 次失败" >&2; exit 1; fi; \
+      echo ">>> ip2region xdb 下载第 ${n}/3 次失败，10s 后重试" >&2; sleep 10; \
+    done && \
     echo "6307a9696f5711f84bcb8b25f07894de68a64a0ed4a1cc7e990562dd3084f210  /app/waf.dist/ip2region.xdb" | sha256sum -c - && \
     apk del curl
 

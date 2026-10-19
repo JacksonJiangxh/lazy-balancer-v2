@@ -56,9 +56,11 @@ import (
 // （coraza GetWriter 大小写不敏感）。
 const auditWriterName = "lbfile"
 
-// auditRequestBodyMaxBytes 限制审计 part C 在快照/队列/格式化链中保留的
-// 原始请求体字节数。截断只影响审计展示，不影响 WAF 已完成的规则评估。
-const auditRequestBodyMaxBytes = 64 * 1024
+// auditBodyMaxBytes 限制审计 part C（请求体）与 part E（响应体）在快照/队列/
+// 格式化链中保留的原始体字节数（A85PLG 历史问题：两侧同一硬上限——coraza 默认
+// SecResponseBodyLimit=512KiB，响应侧不设限会让 2048 深队列放大到 ~1GiB）。
+// 截断只影响审计展示，不影响 WAF 已完成的规则评估。
+const auditBodyMaxBytes = 64 * 1024
 
 func init() {
 	plugins.RegisterAuditLogWriter(auditWriterName, func() plugintypes.AuditLogWriter {
@@ -68,7 +70,7 @@ func init() {
 
 // 管线参数（var 供测试收窄）。
 var (
-	// auditQueueSize 有界队列容量：2048 条 × 典型 2-8KB；part C 另由快照侧
+	// auditQueueSize 有界队列容量：2048 条 × 典型 2-8KB；part C/E 另由快照侧
 	// 64KiB 硬限。打满即请求路径阻塞（零丢弃的退化价，与退役前 serial 同步写同价）。
 	auditQueueSize = 2048
 	// auditFlushThreshold bufio 批量刷盘字节数阈值；auditFlushInterval 周期
@@ -557,11 +559,13 @@ func (f auditSnapshotFile) Size() int64 { return f.Size_ }
 func (f auditSnapshotFile) Mime() string { return f.Mime_ }
 
 // auditSnapshotResponse 实现 plugintypes.AuditLogTransactionResponse。
+// BodyTruncated_ 与请求侧同标记位（A85PLG 历史问题，JSON 契约对称 omitempty）。
 type auditSnapshotResponse struct {
-	Protocol_ string              `json:"protocol"`
-	Status_   int                 `json:"status"`
-	Headers_  map[string][]string `json:"headers"`
-	Body_     string              `json:"body"`
+	Protocol_      string              `json:"protocol"`
+	Status_        int                 `json:"status"`
+	Headers_       map[string][]string `json:"headers"`
+	Body_          string              `json:"body"`
+	BodyTruncated_ bool                `json:"body_truncated,omitempty"`
 }
 
 func (r *auditSnapshotResponse) Protocol() string {
@@ -654,13 +658,14 @@ var (
 	_ plugintypes.AuditLogTransactionProducer     = (*auditSnapshotProducer)(nil)
 )
 
-// snapshotAuditRequestBody 对 part C 做字节级硬截断。超长前缀必须 Clone：
-// 直接切片会让快照继续持有原始大 string 的整个 backing array，失去内存上限意义。
-func snapshotAuditRequestBody(body string) (string, bool) {
-	if len(body) <= auditRequestBodyMaxBytes {
+// snapshotAuditBody 对审计体（part C 请求体 / part E 响应体，A85PLG 历史问题 同
+// 上限同语义）做字节级硬截断。超长前缀必须 Clone：直接切片会让快照继续持有
+// 原始大 string 的整个 backing array，失去内存上限意义。
+func snapshotAuditBody(body string) (string, bool) {
+	if len(body) <= auditBodyMaxBytes {
 		return body, false
 	}
-	cut := auditRequestBodyMaxBytes
+	cut := auditBodyMaxBytes
 	// 写侧与读侧上限相等，读侧无法凭长度判断截断；文本在写侧显式追加
 	// 标记，避免 UI 把半截 body 当完整内容（历史 E-历史问题）。二进制不
 	// 追加（会破坏 base64 判定）。
@@ -700,7 +705,7 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 		IsInterrupted_:   tx.IsInterrupted(),
 	}
 	if req := tx.Request(); !isNilInterface(req) {
-		body, bodyTruncated := snapshotAuditRequestBody(req.Body())
+		body, bodyTruncated := snapshotAuditBody(req.Body())
 		r := &auditSnapshotRequest{
 			Method_:        req.Method(),
 			Protocol_:      req.Protocol(),
@@ -724,10 +729,14 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 		t.Request_ = r
 	}
 	if resp := tx.Response(); !isNilInterface(resp) {
+		// A85PLG 历史问题：响应体与请求体同硬上限（coraza 默认
+		// SecResponseBodyLimit=512KiB——不截断则快照/队列/落盘全链放大）。
+		respBody, respTruncated := snapshotAuditBody(resp.Body())
 		q := &auditSnapshotResponse{
-			Protocol_: resp.Protocol(),
-			Status_:   resp.Status(),
-			Body_:     resp.Body(),
+			Protocol_:      resp.Protocol(),
+			Status_:        resp.Status(),
+			Body_:          respBody,
+			BodyTruncated_: respTruncated,
 		}
 		if hs := resp.Headers(); hs != nil {
 			q.Headers_ = make(map[string][]string, len(hs))

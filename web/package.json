@@ -9,7 +9,7 @@
     "dev": "vite",
     "test": "node --test tests/*.spec.ts",
     "typecheck:test": "vue-tsc -p tsconfig.test.json --noEmit",
-    "build": "vue-tsc --noEmit && vite build",
+    "build": "npm test && npm run typecheck:test && vue-tsc --noEmit && vite build",
     "preview": "vite preview"
   },
   "dependencies": {

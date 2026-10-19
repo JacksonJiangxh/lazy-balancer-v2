@@ -12,13 +12,13 @@ import (
 	"time"
 )
 
-const auditDBFilename = "lazy-balancer-audit.db"
+const AuditDBFilename = "lazy-balancer-audit.db"
 
 func InitializeAuditDB(dataDir string) error {
 	if err := secureDataDirectory(dataDir); err != nil {
 		return fmt.Errorf("failed to create audit data directory: %w", err)
 	}
-	path := filepath.Join(dataDir, auditDBFilename)
+	path := filepath.Join(dataDir, AuditDBFilename)
 	if err := prepareSQLiteDatabase(path); err != nil {
 		return fmt.Errorf("failed to secure audit database: %w", err)
 	}

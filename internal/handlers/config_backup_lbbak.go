@@ -50,9 +50,52 @@ const (
 	lbbakEntryThreatPrefix = "threat/"
 )
 
+// validateLbbakExportEntries 在导出前套用 parseLbbak 的条目数、单条目与总解压
+// 上限，禁止生成一个面板自身无法还原的 lbbak。遍历不分配第二份条目内容。
+func validateLbbakExportEntries(entries map[string][]byte) error {
+	if len(entries) > maxLbbakEntryCount {
+		return fmt.Errorf("备份条目数超过可还原上限 %d", maxLbbakEntryCount)
+	}
+	var total int64
+	for name, data := range entries {
+		if len(data) > 64<<20 {
+			return fmt.Errorf("备份条目 %s 超过可还原上限 64MB", name)
+		}
+		total += int64(len(data))
+		if total > maxLbbakTotalBytes {
+			return fmt.Errorf("备份解压总字节超过可还原上限 %dMB", maxLbbakTotalBytes>>20)
+		}
+	}
+	return nil
+}
+
+// snapshotLbbakThreatIplists 在 WafFileLock 内读取导出所需威胁名单原文，
+// 之后组包/哈希/压缩可在锁外消费内存快照，避免长持锁。
+func snapshotLbbakThreatIplists(bundle *services.WafFileBundle) (map[string][]byte, error) {
+	if bundle == nil {
+		return nil, nil
+	}
+	threatIplists := make(map[string][]byte, len(bundle.ThreatFiles))
+	for _, tf := range bundle.ThreatFiles {
+		data, err := services.ReadThreatIplistBySource(tf.Name)
+		if err != nil {
+			// 可 stat 但不可读/解析失败：静默缺件会让还原删除本地旧文件
+			// （历史 历史问题-3），导出必须显式失败。
+			return nil, fmt.Errorf("读取威胁名单 %s: %w", tf.Name, err)
+		}
+		threatIplists[tf.Name] = data
+	}
+	return threatIplists, nil
+}
+
 // buildLbbakPayload 组包:backupJSON 为已序列化的 V2 备份;bundle 为活动文件
-// (nil 时 waf 条目缺席——全新安装未更新过规则库的形态)。
+// (nil 时 waf 条目缺席——全新安装未更新过规则库的形态)。威胁名单在调用方
+// 未提供锁内快照时即时读取（测试/独立调用）；生产导出传内存快照。
 func buildLbbakPayload(backupJSON []byte, bundle *services.WafFileBundle) ([]byte, error) {
+	return buildLbbakPayloadWithThreatIplists(backupJSON, bundle, nil)
+}
+
+func buildLbbakPayloadWithThreatIplists(backupJSON []byte, bundle *services.WafFileBundle, threatSnapshot map[string][]byte) ([]byte, error) {
 	entries := map[string][]byte{
 		lbbakEntryConfig: backupJSON,
 	}
@@ -67,11 +110,15 @@ func buildLbbakPayload(backupJSON []byte, bundle *services.WafFileBundle) ([]byt
 	// RDB: 威胁库 .iplist 源文件
 	if bundle != nil {
 		for _, tf := range bundle.ThreatFiles {
-			data, err := services.ReadThreatIplistBySource(tf.Name)
-			if err != nil {
-				// 可 stat 但不可读/解析失败：静默缺件会让还原删除本地旧文件
-				// （历史 历史问题-3），导出必须显式失败。
-				return nil, fmt.Errorf("读取威胁名单 %s: %w", tf.Name, err)
+			data, ok := threatSnapshot[tf.Name]
+			if threatSnapshot == nil {
+				var err error
+				data, err = services.ReadThreatIplistBySource(tf.Name)
+				if err != nil {
+					return nil, fmt.Errorf("读取威胁名单 %s: %w", tf.Name, err)
+				}
+			} else if !ok {
+				continue
 			}
 			if len(data) > 0 {
 				entries[lbbakEntryThreatPrefix+tf.Name+".iplist"] = data
@@ -91,6 +138,9 @@ func buildLbbakPayload(backupJSON []byte, bundle *services.WafFileBundle) ([]byt
 		return nil, err
 	}
 	entries[lbbakEntryManifest] = manifestJSON
+	if err := validateLbbakExportEntries(entries); err != nil {
+		return nil, err
+	}
 
 	var buf bytes.Buffer
 	gzw := gzip.NewWriter(&buf)
@@ -131,6 +181,9 @@ func buildLbbakPayload(backupJSON []byte, bundle *services.WafFileBundle) ([]byt
 	if err := gzw.Close(); err != nil {
 		return nil, err
 	}
+	if int64(buf.Len()) > maxConfigImportBytes {
+		return nil, fmt.Errorf("备份压缩包超过可还原上限 %dMB", maxConfigImportBytes>>20)
+	}
 	return buf.Bytes(), nil
 }
 
@@ -149,7 +202,7 @@ type lbbakPayload struct {
 	UnregisteredThreatEntries []string
 }
 
-// 解压放大防护(BE-历史问题):请求体上限只约束压缩字节(48MB,gzip 最高 ~1032:1
+// 解压放大防护(BE-历史问题):请求体上限只约束压缩字节(128MB,gzip 最高 ~1032:1
 // 膨胀),条目数与总解压字节必须在读入内存前拦截——对齐仓内 untarGzTo 的
 // maxWafSyncExtract* 同款标准。var 供测试收窄构造边界。
 var (
@@ -273,10 +326,10 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 // 导出只为非空源写 .iplist 条目，而导入源表是全量替换——备份中「空/缺席」的源
 // 不会覆盖本地旧文件，运行时 WAF 仍按旧名单拦截（DB 与执行面分叉）。此处按
 // 导入后的源集合删除多余/空源文件；调用方必须已持 WafFileLock。
-func reconcileImportedThreatFiles(tables map[string][]map[string]any, payload *lbbakPayload, failedSources []string) []string {
+func reconcileImportedThreatFiles(tables map[string][]map[string]any, payload *lbbakPayload, failedSources []string) ([]string, bool) {
 	rows, carried := tables["security_threat_sources"]
 	if !carried || payload == nil {
-		return nil // 表缺席=保留本地现状
+		return nil, false // 表缺席=保留本地现状
 	}
 	failed := make(map[string]bool, len(failedSources))
 	for _, source := range failedSources {
@@ -284,6 +337,7 @@ func reconcileImportedThreatFiles(tables map[string][]map[string]any, payload *l
 	}
 	kept := make(map[string]bool, len(rows))
 	var warnings []string
+	changed := false
 	removePair := func(source, reason string) {
 		for _, path := range []string{
 			filepath.Join(services.WafDir(), "threat-"+source+".iplist"),
@@ -291,6 +345,8 @@ func reconcileImportedThreatFiles(tables map[string][]map[string]any, payload *l
 		} {
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				warnings = append(warnings, "删除威胁库 "+source+" 本地文件失败: "+err.Error())
+			} else if err == nil {
+				changed = true
 			}
 		}
 		warnings = append(warnings, "威胁库 "+source+" "+reason)
@@ -310,7 +366,7 @@ func reconcileImportedThreatFiles(tables map[string][]map[string]any, payload *l
 	entries, err := os.ReadDir(services.WafDir())
 	if err != nil {
 		warnings = append(warnings, "扫描威胁库目录失败: "+err.Error())
-		return warnings
+		return warnings, changed
 	}
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -327,9 +383,11 @@ func reconcileImportedThreatFiles(tables map[string][]map[string]any, payload *l
 		}
 		if err := os.Remove(filepath.Join(services.WafDir(), name)); err != nil && !os.IsNotExist(err) {
 			warnings = append(warnings, "删除威胁库 "+source+" 本地文件失败: "+err.Error())
+		} else if err == nil {
+			changed = true
 		}
 	}
-	return warnings
+	return warnings, changed
 }
 
 // lbbakWafApplyResult 逐文件落盘结果（历史问题/03/08）：此前失败仅返回单条
@@ -367,25 +425,12 @@ func validateLbbakXdbPayload(data []byte) error {
 	return services.ValidateIP2RegionFile(path)
 }
 
-// applyLbbakWafFiles 落盘 waf 文件(sha 比对幂等);与集群同步落盘同构。
+// applyLbbakWafFilesInLock 落盘 waf 文件(sha 比对幂等);与集群同步落盘同构。
 // 历史问题:ip2regionTag 从备份表区传入——空 tag 会让 ApplyWafFileBundle 删除
 // .version 伴生文件,破坏「文件与版本记录同批」不变量。
 // 历史问题/历史问题/03/08:逐文件结果返回（不再是单一 warning）——落盘失败的
 // CRS/xdb 由调用方在事务内丢弃对应版本表、威胁库逐源失败并入响应告警；
 // xdb 落盘前必须通过装载验证（坏文件拒绝并保留本地文件）。
-// applyLbbakWafFiles 自锁包装（独立调用/测试路径）：有文件时持
-// services.WafFileLock 后委托 InLock 变体。
-// 历史问题-02：WAF 文件写者（CRS 树交换/xdb/威胁 .iplist+.fast）必须与三库
-// 更新器串行；导入核心走 InLock 变体，在开启 DB 事务前先行取锁。
-func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip2regionTag string) lbbakWafApplyResult {
-	if payload.CRSTarGz == nil && payload.Xdb == nil && len(payload.ThreatIplists) == 0 {
-		return lbbakWafApplyResult{}
-	}
-	services.WafFileLock().Lock()
-	defer services.WafFileLock().Unlock()
-	return applyLbbakWafFilesInLock(c, action, payload, ip2regionTag)
-}
-
 // applyLbbakWafFilesInLock 在有 WAF 文件时要求调用方已持
 // services.WafFileLock（导入核心在开启 DB 事务前取锁，与 CRS/威胁库更新器
 // 的 WAF→DB 锁序一致，消除 DB tx→wafFileMu 的 AB-BA 反转）；不自锁，避免重入。

@@ -115,6 +115,133 @@ func TestCAQueueManager_CancelJobsForRule_removes_pending_and_cancels_running(t 
 	}
 }
 
+func TestCAQueueManager_CancelJobsForRule_waitsForRetiredExecution(t *testing.T) {
+	// Given：PauseAndDrain 超时后的退役队列仍持有本规则执行。
+	queue := newCAQueue(models.CAProvider{ID: 7, MaxConcurrent: 1}, nil)
+	executionDone := make(chan struct{})
+	t.Cleanup(func() { close(executionDone) })
+	executionCtx, cancelExecution := context.WithCancel(context.Background())
+	var cancelOnce sync.Once
+	queue.mu.Lock()
+	queue.active[42] = struct{}{}
+	queue.runningRules[42] = "lb_retired_drain"
+	queue.executionDone[42] = executionDone
+	queue.cancels[42] = func() { cancelOnce.Do(cancelExecution) }
+	queue.mu.Unlock()
+	manager := &CAQueueManager{
+		queues:        make(map[int]*caQueue),
+		retiredQueues: []retiredCAQueue{{queue: queue, retiredAt: time.Now()}},
+	}
+
+	// 回归：其他规则不等待、不取消本执行。
+	if err := manager.CancelJobsForRule(context.Background(), "lb_other"); err != nil {
+		t.Fatalf("cancel unrelated rule: %v", err)
+	}
+	select {
+	case <-executionCtx.Done():
+		t.Fatal("unrelated rule cancelled retired execution")
+	default:
+	}
+
+	// When：本规则 drain 必须看到退役执行并在 ctx 到期时如实失败。
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := manager.CancelJobsForRule(ctx, "lb_retired_drain")
+
+	// Then
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("retired drain error=%v, want deadline exceeded instead of pseudo-success", err)
+	}
+	select {
+	case <-executionCtx.Done():
+	default:
+		t.Fatal("retired execution was not cancelled")
+	}
+}
+
+func TestCAQueueManager_HasRunningJobForRule_includesRetiredExecution(t *testing.T) {
+	queue := newCAQueue(models.CAProvider{ID: 7, MaxConcurrent: 1}, nil)
+	queue.mu.Lock()
+	queue.active[42] = struct{}{}
+	queue.runningRules[42] = "lb_retired_precheck"
+	queue.mu.Unlock()
+	manager := &CAQueueManager{retiredQueues: []retiredCAQueue{{queue: queue, retiredAt: time.Now()}}}
+
+	if !manager.HasRunningJobForRule("lb_retired_precheck") {
+		t.Fatal("retired execution is invisible to rule deletion precheck")
+	}
+	if manager.HasRunningJobForRule("lb_other") {
+		t.Fatal("unrelated rule unexpectedly matched retired execution")
+	}
+}
+
+func TestCAQueueManager_CancelJobsForRule_waitsForZombieExecution(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		done chan struct{}
+	}{
+		{name: "completion signal", done: make(chan struct{})},
+		{name: "missing completion signal", done: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := &CAQueueManager{zombieJobs: map[int]zombieJob{42: {ruleID: "lb_zombie_drain", done: tc.done}}}
+			if tc.done != nil {
+				t.Cleanup(func() { close(tc.done) })
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			if err := manager.CancelJobsForRule(ctx, "lb_zombie_drain"); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("zombie drain error=%v, want deadline exceeded instead of pseudo-success", err)
+			}
+		})
+	}
+}
+
+func TestCAQueueManager_agedOutZombieRetainsRuleDrainMetadata(t *testing.T) {
+	// Given：超龄退役队列中的执行带 rule 元数据，迁移后仍须可被规则级 drain 看见。
+	queue := newCAQueue(models.CAProvider{ID: 7, MaxConcurrent: 1}, nil)
+	done := make(chan struct{})
+	queue.mu.Lock()
+	queue.active[42] = struct{}{}
+	queue.runningRules[42] = "lb_ageout_drain"
+	queue.executionDone[42] = done
+	queue.mu.Unlock()
+	manager := &CAQueueManager{
+		queues:        make(map[int]*caQueue),
+		retiredQueues: []retiredCAQueue{{queue: queue, retiredAt: time.Now().Add(-(caExecutionTimeoutMax + 11*time.Minute))}},
+	}
+	if !manager.IsJobActive(42) {
+		t.Fatal("aged-out execution lost activity protection")
+	}
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	})
+
+	// Then：规则级预检与 drain 仍使用迁移后的 ruleID/完成信号。
+	if !manager.HasRunningJobForRule("lb_ageout_drain") {
+		t.Fatal("aged-out zombie lost its rule identity")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := manager.CancelJobsForRule(ctx, "lb_ageout_drain"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("aged-out zombie drain error=%v, want deadline exceeded", err)
+	}
+}
+
+func TestCAQueueManager_HasRunningJobForRule_includesZombieExecution(t *testing.T) {
+	manager := &CAQueueManager{zombieJobs: map[int]zombieJob{42: {ruleID: "lb_zombie_precheck"}}}
+	if !manager.HasRunningJobForRule("lb_zombie_precheck") {
+		t.Fatal("zombie execution is invisible to rule deletion precheck")
+	}
+	if manager.HasRunningJobForRule("lb_other") {
+		t.Fatal("unrelated rule unexpectedly matched zombie execution")
+	}
+}
+
 func TestCAQueue_prepareExecution_covers_issuer_worst_case_budget(t *testing.T) {
 	// Given
 	queue := newCAQueue(models.CAProvider{ID: 1, MaxConcurrent: 1}, nil)

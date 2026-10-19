@@ -59,6 +59,11 @@ func (h *Handlers) GenerateClusterLoginTicket(c *gin.Context) {
 	if err != nil {
 		status := http.StatusInternalServerError
 		message := "生成登录票据失败"
+		if errors.Is(err, services.ErrNotMasterNode) {
+			c.Header("X-LB-Error-Code", masterRequiredErrorCode)
+			status = http.StatusForbidden
+			message = err.Error()
+		}
 		if errors.Is(err, services.ErrNodeNotFound) {
 			// 历史问题(历史):节点不存在属客户端寻址错误,与同族端点
 			// (cluster_registration.go:151、cluster_service.go:71、

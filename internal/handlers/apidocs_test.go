@@ -325,7 +325,7 @@ func TestAPIDocRoutes_document_validation_and_error_statuses(t *testing.T) {
 	validate := routes["POST /config/import/validate"]
 
 	// Then
-	for _, text := range []string{"200", "valid=false", "400", "413", "48MB"} {
+	for _, text := range []string{"200", "valid=false", "400", "413", "128MB"} {
 		if !strings.Contains(validate.Description, text) && !containsRouteError(validate.Errors, text) {
 			t.Errorf("validation contract missing %q: description=%q errors=%v", text, validate.Description, validate.Errors)
 		}
@@ -353,6 +353,25 @@ func TestAPIDocRoutes_document_validation_and_error_statuses(t *testing.T) {
 // (warnings 为软跳过/会话吊销/ACME 悬挂等警告的唯一机器可读出口);promote 描述
 // 对齐实现(不调 BumpClusterVersion,启动自动备份调度器);/mcp/tools 登记
 // read_only 字段语义(HTTP 语义只读,不代表只读 Key 可见性)。
+func TestAPIDocRoutes_A85L6V1ImportQueuePartialContract(t *testing.T) {
+	routes := make(map[string]apiDocRoute, len(apiDocRoutes))
+	for _, route := range apiDocRoutes {
+		routes[route.Method+" "+route.Path] = route
+	}
+	route := routes["POST /config/import/v1"]
+	if !containsRouteError(route.Errors, "409") {
+		t.Fatalf("V1 import errors=%v, want certificate queue drain 409", route.Errors)
+	}
+	for _, field := range []string{"partial", "warnings", "disabled_conflicts"} {
+		if !strings.Contains(route.Response, field) {
+			t.Fatalf("V1 import response missing %s: %s", field, route.Response)
+		}
+	}
+	if !strings.Contains(route.Description, "200") || !strings.Contains(route.Description, "partial=true") {
+		t.Fatalf("V1 import description lacks committed/partial contract: %s", route.Description)
+	}
+}
+
 func TestAPIDocRoutes_round41_documentation_contracts(t *testing.T) {
 	routes := make(map[string]apiDocRoute, len(apiDocRoutes))
 	for _, route := range apiDocRoutes {
@@ -662,7 +681,7 @@ func containsRouteError(errors []string, status string) bool {
 }
 
 // 历史问题(C1)+历史问题(C2)+APIMCP-6(C7):OIDC 公开契约登记、lbbak 导出形态、
-// validate 48MB 上限与 settings/oidc 重试契约的文档漂移绊线。
+// validate 128MB 上限与 settings/oidc 重试契约的文档漂移绊线。
 func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *testing.T) {
 	// Given
 	var document struct {
@@ -716,10 +735,10 @@ func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *tes
 		t.Errorf("C2: /config/export description=%q, want lbbak tar.gz form", export.Description)
 	}
 
-	// C2②:validate 上限与错误码按 48MB 实现口径(maxConfigImportBytes=48<<20)。
+	// C2②:validate 上限与错误码按 128MB 实现口径(maxConfigImportBytes=128<<20)。
 	validate := routesEntry(t, "POST /config/import/validate")
-	if !strings.Contains(validate.Description, "48MB") || !containsRouteError(validate.Errors, "413") {
-		t.Errorf("C2: validate description=%q errors=%v, want 48MB limit text and 413 error", validate.Description, validate.Errors)
+	if !strings.Contains(validate.Description, "128MB") || !containsRouteError(validate.Errors, "413") {
+		t.Errorf("C2: validate description=%q errors=%v, want 128MB limit text and 413 error", validate.Description, validate.Errors)
 	}
 	for _, routeError := range validate.Errors {
 		if strings.Contains(routeError, "16") {

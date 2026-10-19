@@ -141,7 +141,7 @@
       <el-divider content-position="left">访问日志</el-divider>
       <el-form-item label="自定义格式">
         <el-switch v-model="settings.access_log_json" :disabled="isReadOnly" active-text="自定义 JSON" inactive-text="Caddy JSON" />
-        <div class="form-tip-line">开启后使用 filter 编码器按自定义格式输出；关闭时输出 Caddy 原生完整 JSON</div>
+        <div class="form-tip-line">开启后使用 filter 编码器按自定义格式输出；关闭时输出 Caddy 原生 JSON（X-API-Key 请求头始终脱敏）</div>
       </el-form-item>
       <el-form-item v-if="settings.access_log_json" label="日志格式">
         <div class="format-field">
@@ -155,13 +155,14 @@
           <el-button text type="primary" size="small" :disabled="isReadOnly" @click="settings.access_log_format = DEFAULT_ACCESS_LOG_FORMAT">还原默认格式</el-button>
           <div class="form-tip-line format-tip">
             每行一条规则：字段重命名 <code>request&gt;remote_ip -&gt; src</code> 或删除字段 <code>request&gt;headers -&gt; delete</code>。
+            无论格式如何，<code>request&gt;headers&gt;X-API-Key</code> 恒被删除（面板 API Key 不落日志）。
             可用字段：<code>request&gt;remote_ip</code> <code>request&gt;client_ip</code> <code>request&gt;method</code> <code>request&gt;host</code> <code>request&gt;uri</code> <code>request&gt;proto</code> <code>request&gt;headers&gt;User-Agent</code> <code>status</code> <code>size</code> <code>duration</code> <code>bytes_read</code> <code>user_id</code> <code>ts</code> <code>resp_headers</code> <code>request&gt;tls</code>。
             Caddy 日志文档：<a href="https://caddyserver.com/docs/json/apps/http/servers/logs/" target="_blank" rel="noopener noreferrer">官方字段说明</a>
           </div>
         </div>
       </el-form-item>
       <div class="form-actions">
-        <el-button type="primary" :loading="saving" :disabled="isReadOnly" @click="handleSave">保存</el-button>
+        <el-button type="primary" :loading="saving" :disabled="isReadOnly || !props.configLoaded" @click="handleSave">保存</el-button>
         <el-button type="warning" :loading="reloading" :disabled="isReadOnly || reloading" @click="handleReloadCaddy">重载 Caddy</el-button>
       </div>
     </el-form>
@@ -232,10 +233,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { RefreshRight, Setting, Tickets, View } from '@element-plus/icons-vue'
 import { useAuthStore } from '@/stores/auth'
+import { useLogTailPolling } from '@/composables/useLogTailPolling'
 import { ansiToHtml } from '@/utils/ansi'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { CDN_PRESETS, DEFAULT_ACCESS_LOG_FORMAT } from '@/utils/caddyDefaults'
@@ -302,6 +304,9 @@ type CaddyLogsResponse = {
 }
 
 const settings = defineModel<CaddySettingsConfig>('settings', { required: true })
+// 父级 /config 加载完成前禁止保存：表单此刻仍是默认值——与 BasicSettings 同门
+// （A85WB-历史问题，历史 历史问题-1 同族缺口）。
+const props = defineProps<{ configLoaded: boolean }>()
 const emit = defineEmits<{ (event: 'save'): void }>()
 const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
@@ -411,17 +416,37 @@ const caddyTabLogKey = computed(() => ({
 
 const activeLogTab = ref('runtime')
 const logHtml = computed(() => ansiToHtml(logContent.value))
-const logLoading = ref(false)
 const autoRefresh = ref(true)
 const logContainerRef = ref<HTMLElement | null>(null)
-let logPollTimer: ReturnType<typeof setInterval> | null = null
-let logRequestSeq = 0
+
+// A85WA-历史问题：日志尾轮询收敛 useLogTailPolling 单源（补上原缺的后台标签页暂停；
+// tab 切换/关闭的迟到响应守卫由 composable 序号 + fetch 内目标校验双层保证）。
+const logTail = useLogTailPolling({
+  interval: 2000,
+  content: logContent,
+  container: logContainerRef,
+  isActive: () => logDialogVisible.value,
+  fetch: async () => {
+    const targetTab = activeLogTab.value
+    const response = await request.get<CaddyLogsResponse>('/caddy/logs', { params: { type: targetTab }, silent: true })
+    if (!logDialogVisible.value || activeLogTab.value !== targetTab) return null
+    return response.data?.content || ''
+  },
+  onError: (error) => { console.error('Failed to fetch caddy logs:', error) },
+})
+const logLoading = logTail.loading
+const refreshLogs = async (): Promise<void> => logTail.refresh()
 
 const updateProxyTimeout = (field: keyof ProxyTimeoutConfig, value: number): void => {
   settings.value[field] = value
 }
 
 const handleSave = async (): Promise<void> => {
+  // 配置未加载完成时表单为默认值——保存即整体覆盖真实配置（A85WB-历史问题）
+  if (!props.configLoaded) {
+    ElMessage.warning('配置尚未加载完成，暂不能保存')
+    return
+  }
   if (isReadOnly.value || saving.value) return
   saving.value = true
   try {
@@ -481,49 +506,21 @@ const handleReloadCaddy = async (): Promise<void> => {
   }
 }
 
-const stopLogPolling = (): void => {
-  if (!logPollTimer) return
-  clearInterval(logPollTimer)
-  logPollTimer = null
-}
-
-const refreshLogs = async (): Promise<void> => {
-  // 后台标签页暂停轮询：定时器空转跳过，回到可见后的下一个 tick 立即补拉
-  if (document.hidden) return
-  const targetTab = activeLogTab.value
-  const requestSeq = ++logRequestSeq
-  logLoading.value = true
-  try {
-    const response = await request.get<CaddyLogsResponse>('/caddy/logs', { params: { type: targetTab }, silent: true })
-    if (requestSeq !== logRequestSeq || !logDialogVisible.value || activeLogTab.value !== targetTab) return
-    logContent.value = response.data?.content || ''
-    await nextTick()
-    const container = logContainerRef.value
-    if (container) container.scrollTop = container.scrollHeight
-  } catch (error: unknown) {
-    console.error('Failed to fetch caddy logs:', error)
-  } finally {
-    if (requestSeq === logRequestSeq) logLoading.value = false
-  }
-}
-
-const startLogPolling = (): void => {
-  stopLogPolling()
-  if (autoRefresh.value) logPollTimer = setInterval(() => { if (!logLoading.value) void refreshLogs() }, 2000)
-}
-
 const openLogDialog = (): void => { logDialogVisible.value = true }
-const onLogDialogOpened = (): void => { logRequestSeq++; void refreshLogs(); startLogPolling() }
-const onLogDialogClosed = (): void => { logRequestSeq++; logLoading.value = false; stopLogPolling(); logContent.value = '' }
-const onLogTabChange = (): void => { logRequestSeq++; logLoading.value = false; logContent.value = ''; void refreshLogs() }
+const onLogDialogOpened = (): void => {
+  if (autoRefresh.value) logTail.start()
+  else void logTail.refresh()
+}
+const onLogDialogClosed = (): void => { logTail.stop(); logContent.value = '' }
+const onLogTabChange = (): void => { logTail.invalidate(); logContent.value = ''; void logTail.refresh() }
 
 watch(autoRefresh, (enabled) => {
   if (!logDialogVisible.value) return
-  if (enabled) startLogPolling()
-  else stopLogPolling()
+  if (enabled) logTail.start()
+  else logTail.stop()
 })
 
-onUnmounted(stopLogPolling)
+onUnmounted(() => logTail.stop())
 </script>
 
 <style scoped>

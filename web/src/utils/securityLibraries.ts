@@ -92,11 +92,14 @@ export interface LibraryHealthTag {
 /**
  * 单库（CRS/IP 地理库）健康标签：加载失败/文件缺失 → danger；库未安装
  * （版本未知/空）→ warning，不得再显示「正常」（历史问题-F1 自相矛盾态）。
+ * loaded=false（首次响应未落地）→ 「加载中」（A85WA-历史问题：初值 available:true
+ * 不得冒充正常态）；缺省 true，既有调用方口径不变。
  */
 export const libraryHealthTag = (
   name: string,
-  state: { loadError: boolean; available?: boolean; status?: string },
+  state: { loadError: boolean; available?: boolean; status?: string; loaded?: boolean },
 ): LibraryHealthTag => {
+  if (state.loaded === false) return { label: `${name} · 加载中`, type: 'info' }
   if (state.loadError) return { label: `${name} · 加载失败`, type: 'danger' }
   if (state.available === false) return { label: `${name} · 缺失`, type: 'danger' }
   if (state.status === 'not-installed') return { label: `${name} · 未安装`, type: 'warning' }
@@ -104,12 +107,15 @@ export const libraryHealthTag = (
   return { label: `${name} · 正常`, type: 'success' }
 }
 
-/** 多源库（威胁情报库/爬虫地址库）健康标签：更新中/部分失败为 warning。 */
+/** 多源库（威胁情报库/爬虫地址库）健康标签：更新中/部分失败为 warning；
+ *  loaded=false（首次响应未落地）→ 「加载中」（A85WA-历史问题，缺省 true）。 */
 export const librarySourceHealthTag = (
   name: string,
   sources: readonly LibrarySourceRow[],
   loadError: boolean,
+  loaded = true,
 ): LibraryHealthTag => {
+  if (!loaded) return { label: `${name} · 加载中`, type: 'info' }
   if (loadError) return { label: `${name} · 加载失败`, type: 'danger' }
   if (sources.length === 0) return { label: `${name} · 未配置`, type: 'warning' }
   if (sources.some((s) => s.update_status === 'running')) return { label: `${name} · 更新中`, type: 'warning' }

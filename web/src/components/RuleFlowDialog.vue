@@ -634,7 +634,7 @@ interface FlowNode {
   key: string
   title: string
   subtitle: string
-  tone: 'blue' | 'green' | 'primary' | 'orange' | 'red' | 'gray'
+  tone: 'blue' | 'green' | 'primary' | 'orange' | 'red'
   icon: typeof Connection
   disabled?: boolean
   chip?: string
@@ -773,7 +773,6 @@ const onDialogOpen = (): void => {
 .tl-dot--blue { background: var(--el-color-primary); }
 .tl-dot--orange { background: var(--el-color-warning); }
 .tl-dot--red { background: var(--el-color-danger); }
-.tl-dot--gray { background: var(--el-color-info); }
 .tl-row.is-off .tl-dot { background: #c9cdd4; box-shadow: 0 0 0 3px #f3f4f6; }
 .tl-line {
   flex: 1 1 auto;

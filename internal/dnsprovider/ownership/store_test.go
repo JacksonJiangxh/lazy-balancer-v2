@@ -433,3 +433,62 @@ func TestStore_Remove_semantic_match_after_reload(t *testing.T) {
 		})
 	}
 }
+
+func TestReplace_sharesStoreLockAndPreservesStateOnInvalidSnapshot(t *testing.T) {
+	// Given：一个由集群快照携带的合法 ownership 状态。
+	dir := t.TempDir()
+	initial := []byte(`{"version":1,"records":[]}`)
+	if err := Replace(dir, initial); err != nil {
+		t.Fatalf("replace initial snapshot: %v", err)
+	}
+	path := filepath.Join(dir, ownershipFileName)
+	if got, err := os.ReadFile(path); err != nil || string(got) != string(initial) {
+		t.Fatalf("initial snapshot=(%q,%v), want exact raw bytes", got, err)
+	}
+
+	// When：Store 的读写锁被持有时，快照替换必须等待同一把锁。
+	replacement := []byte(`{"version":1,"records":[{"provider":"dnspod","zone":"example.com","fqdn":"_acme-challenge.example.com.","value":"token","record_id":"200"}]}`)
+	fileMu.Lock()
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		done <- Replace(dir, replacement)
+	}()
+	<-started
+	select {
+	case err := <-done:
+		fileMu.Unlock()
+		t.Fatalf("Replace 绕过ed store fileMu: err=%v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	fileMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("replace after store lock release: %v", err)
+	}
+
+	// Then：非法快照不得破坏已提交状态；普通 Store.Add 仍可继续复用同一文件。
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read committed replacement: %v", err)
+	}
+	for _, invalid := range [][]byte{[]byte(`{"version":`), []byte(`{"version":2,"records":[]}`)} {
+		if err := Replace(dir, invalid); err == nil {
+			t.Fatalf("Replace accepted invalid snapshot %q", invalid)
+		}
+		after, readErr := os.ReadFile(path)
+		if readErr != nil || string(after) != string(before) {
+			t.Fatalf("invalid snapshot changed committed state: after=%q err=%v", after, readErr)
+		}
+	}
+	store, err := New(dir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	if err := store.Add(Record{Provider: "dnspod", Zone: "example.com", FQDN: "_acme-challenge.example.com.", Value: "second", RecordID: "201"}); err != nil {
+		t.Fatalf("add after snapshot replacement: %v", err)
+	}
+	if records := readStoreRecords(t, store); len(records) != 2 {
+		t.Fatalf("records=%+v, want replacement plus newly added record", records)
+	}
+}

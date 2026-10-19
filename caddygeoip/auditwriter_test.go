@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -55,11 +56,17 @@ func (fullJSONFormatter) MIME() string { return "application/json" }
 
 // blockingFormatter 首次 Format 阻塞至 release 关闭——钉「格式化已移出请求
 // 路径」：若 Write 仍在请求路径同步格式化，ProcessLogging 将无法在超时内返回。
+// 经 plugins.RegisterAuditLogFormatter 装入被测 WAF 的 SecAuditLogFormat（同
+// lbfence 模式）——只有挂进 coraza 真实写路径，栅栏与调用计数才有意义
+// （A85PLG 历史问题：挂在手工创建、WAF 从不使用的 writer 上时栅栏失效）。
+// calls 计数钉「栅栏确在写路径」——formatter 未被调用即布线失效，确定性红。
 type blockingFormatter struct {
 	release chan struct{}
+	calls   atomic.Int32
 }
 
 func (f *blockingFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
+	f.calls.Add(1)
 	<-f.release
 	return json.Marshal(al)
 }
@@ -100,9 +107,12 @@ func (cannedFormatter) MIME() string { return "application/json" }
 // per-tx 计时终态后注入 lb_timing 顶层字段并 bufio 批量刷盘。
 
 // useTestAuditPipeline 把默认管线参数收窄到测试量级并隔离全局注册表。
+// 清理顺序（t.Cleanup LIFO）：先注册「恢复全局参数」，后注册「释放全部
+// 管线」——执行时 drain 先退出（release 等 p.done），再恢复
+// auditFlushThreshold/auditTiming* 全局值；逆序会在 drain 仍读这些变量时
+// 写入（-race 实测：cleanup 恢复 vs appendLine/process 读，A85PLG 验证期暴露）。
 func useTestAuditPipeline(t *testing.T) {
 	t.Helper()
-	releaseAllAuditPipelines(t)
 	origQueue, origThreshold, origInterval := auditQueueSize, auditFlushThreshold, auditFlushInterval
 	origWait, origPoll, origTTL := auditTimingWaitLimit, auditTimingPollStep, auditTimingEntryTTL
 	auditQueueSize = 64
@@ -121,6 +131,7 @@ func useTestAuditPipeline(t *testing.T) {
 		resetAuditTimingRegistryLockedForTest()
 		auditTimingMu.Unlock()
 	})
+	releaseAllAuditPipelines(t)
 }
 
 // resetAuditTimingRegistryLockedForTest 清空计时注册表全部状态（调用方持
@@ -416,20 +427,20 @@ func TestAuditWriter_snapshotSurvivesTxCycle(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
 
+	// A85PLG 历史问题：栅栏 formatter 必须经注册名装入被测 WAF 的
+	// SecAuditLogFormat（lbfence 同模式）——旧实现把它挂在手工创建、WAF
+	// 从不使用的 writer 上（WAF 自建 lbfile writer 用 JSON 格式化器），
+	// 栅栏永不触发，「ProcessLogging 未被格式化阻塞」恒真、计时注入依赖
+	// 调度序偶发红。calls 计数把布线失效变成确定性红。
 	fmtr := &blockingFormatter{release: make(chan struct{})}
-	cfg := plugintypesConfigFor(t, logPath)
-	cfg.Formatter = fmtr
-	w := &lbAuditWriter{}
-	if err := w.Init(cfg); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
+	plugins.RegisterAuditLogFormatter("lbsnapfmt", fmtr)
 
 	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives(strings.Join([]string{
 		"SecRuleEngine On",
 		"SecRequestBodyAccess On",
 		"SecAuditEngine RelevantOnly",
 		"SecAuditLog " + logPath,
-		"SecAuditLogFormat JSON",
+		"SecAuditLogFormat lbsnapfmt",
 		"SecAuditLogType lbfile",
 		"SecAuditLogParts ABCIJDEFHKZ",
 		"SecRule ARGS:payload \"@streq hit\" \"id:990003,phase:2,deny,status:403,log,msg:'probe-body'\"",
@@ -538,8 +549,10 @@ func TestAuditWriter_snapshotSurvivesTxCycle(t *testing.T) {
 	if doc.LbTiming.End == nil || *doc.LbTiming.End != 77 {
 		t.Fatalf("lb_timing.end_us = %v; want 77", doc.LbTiming.End)
 	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	// 栅栏确实挂在 WAF 写路径（drain 侧格式化恰好一次）：0=布线失效
+	// （A85PLG 历史问题 旧形态，上述阻塞/计时断言全部形同虚设）。
+	if n := fmtr.calls.Load(); n != 1 {
+		t.Fatalf("fence formatter invocations = %d; want exactly 1 on the WAF write path", n)
 	}
 }
 
@@ -556,24 +569,37 @@ func (f *captureFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
 
 func (*captureFormatter) MIME() string { return "application/json" }
 
-func TestSnapshotAuditRequestBody_capAndBoundaries(t *testing.T) {
+func TestSnapshotAuditBody_capAndBoundaries(t *testing.T) {
 	tests := []struct {
 		name      string
 		body      string
 		wantLen   int
 		truncated bool
+		marker    bool
 	}{
 		{name: "small body unchanged", body: "payload=hit", wantLen: len("payload=hit")},
-		{name: "exact limit unchanged", body: strings.Repeat("x", auditRequestBodyMaxBytes), wantLen: auditRequestBodyMaxBytes},
-		{name: "over limit truncated", body: strings.Repeat("x", auditRequestBodyMaxBytes+1), wantLen: auditRequestBodyMaxBytes, truncated: true},
+		{name: "exact limit unchanged", body: strings.Repeat("x", auditBodyMaxBytes), wantLen: auditBodyMaxBytes},
+		// 目标形状：超限文本 = 前缀 64KiB + 显式截断标记（写侧与读侧上限相等，
+		// 读侧无法凭长度判断截断——E-历史问题 契约，标记 15 字节超出上限部分）。
+		{name: "over limit truncated", body: strings.Repeat("x", auditBodyMaxBytes+1), wantLen: auditBodyMaxBytes + len("\n...[TRUNCATED]"), truncated: true, marker: true},
+		// 畸形形状：前缀含非法 UTF-8 时不追加标记（会破坏读侧 base64 判定），
+		// 只保留 64KiB 前缀。
+		{name: "over limit binary no marker", body: strings.Repeat("x", 100) + "\xff" + strings.Repeat("y", auditBodyMaxBytes), wantLen: auditBodyMaxBytes, truncated: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, truncated := snapshotAuditRequestBody(tc.body)
+			got, truncated := snapshotAuditBody(tc.body)
 			if len(got) != tc.wantLen || truncated != tc.truncated {
 				t.Fatalf("len=%d truncated=%v, want len=%d truncated=%v", len(got), truncated, tc.wantLen, tc.truncated)
 			}
-			if got != tc.body[:tc.wantLen] {
+			prefix := got
+			if tc.marker {
+				if !strings.HasSuffix(got, "\n...[TRUNCATED]") {
+					t.Fatalf("truncated text body must carry the explicit marker: ...%q", got[len(got)-24:])
+				}
+				prefix = strings.TrimSuffix(got, "\n...[TRUNCATED]")
+			}
+			if prefix != tc.body[:len(prefix)] {
 				t.Fatal("captured body must preserve the original prefix")
 			}
 		})
@@ -601,7 +627,7 @@ func TestAuditWriter_requestBodyCapAndTruncationMarker(t *testing.T) {
 		t.Fatalf("NewWAF: %v", err)
 	}
 
-	body := "payload=hit&pad=" + strings.Repeat("x", auditRequestBodyMaxBytes+32)
+	body := "payload=hit&pad=" + strings.Repeat("x", auditBodyMaxBytes+32)
 	tx := waf.NewTransaction()
 	defer tx.Close()
 	req := httptest.NewRequest(http.MethodPost, "/probe-large", nil)
@@ -632,8 +658,10 @@ func TestAuditWriter_requestBodyCapAndTruncationMarker(t *testing.T) {
 	if !ok {
 		t.Fatalf("snapshot request type = %T", al.Transaction().Request())
 	}
-	if got := len(sr.Body()); got != auditRequestBodyMaxBytes {
-		t.Fatalf("snapshot body len=%d, want cap=%d", got, auditRequestBodyMaxBytes)
+	// 契约（E-历史问题）：快照体 = 原始前缀 64KiB + 显式标记 \n...[TRUNCATED]。
+	wantPrefix := body[:auditBodyMaxBytes]
+	if got := sr.Body(); got != wantPrefix+"\n...[TRUNCATED]" {
+		t.Fatalf("snapshot body must be the %d-byte prefix plus truncation marker (len=%d)", auditBodyMaxBytes, len(got))
 	}
 	if !sr.BodyTruncated_ {
 		t.Fatal("oversized snapshot body must carry the truncation marker")
@@ -653,8 +681,112 @@ func TestAuditWriter_requestBodyCapAndTruncationMarker(t *testing.T) {
 	if err := json.Unmarshal(line, &wire); err != nil {
 		t.Fatalf("audit line not JSON: %v", err)
 	}
-	if len(wire.Transaction.Request.Body) != auditRequestBodyMaxBytes || !wire.Transaction.Request.BodyTruncated {
+	if wire.Transaction.Request.Body != wantPrefix+"\n...[TRUNCATED]" || !wire.Transaction.Request.BodyTruncated {
 		t.Fatalf("serialized body len=%d truncated=%v", len(wire.Transaction.Request.Body), wire.Transaction.Request.BodyTruncated)
+	}
+}
+
+// A85PLG 历史问题：审计响应体快照与请求体同上限（64KiB 前缀 + 显式截断标记 +
+// body_truncated 标记位，JSON 契约对称）。check-response 策略形态
+// （SecResponseBodyAccess On + SecAuditLogParts 恒含 E）下 coraza 默认
+// SecResponseBodyLimit=512KiB，无快照侧硬限时单条审计行可携带约 512KiB
+// 响应体——2048 深队列内存放大 + 落盘放大。真实 coraza phase:4 命中验证。
+func TestAuditWriter_responseBodyCapAndTruncationMarker(t *testing.T) {
+	useTestAuditPipeline(t)
+	capture := &captureFormatter{ch: make(chan plugintypes.AuditLog, 1)}
+	plugins.RegisterAuditLogFormatter("lbrespcap", capture)
+	logPath := filepath.Join(t.TempDir(), "audit.log")
+	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives(strings.Join([]string{
+		"SecRuleEngine On",
+		"SecResponseBodyAccess On",
+		"SecResponseBodyMimeType text/plain",
+		"SecAuditEngine RelevantOnly",
+		"SecAuditLog " + logPath,
+		"SecAuditLogFormat lbrespcap",
+		"SecAuditLogType lbfile",
+		"SecAuditLogParts ABIJDEFHKZ",
+		"SecRule RESPONSE_BODY \"@rx leak\" \"id:990006,phase:4,deny,status:403,log,msg:'probe-resp-body'\"",
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("NewWAF: %v", err)
+	}
+
+	body := "leak:" + strings.Repeat("y", auditBodyMaxBytes+64)
+	tx := waf.NewTransaction()
+	defer tx.Close()
+	req := httptest.NewRequest(http.MethodGet, "/probe-resp", nil)
+	tx.ProcessConnection(req.RemoteAddr, 0, "127.0.0.1", 8080)
+	tx.ProcessURI(req.URL.String(), req.Method, "HTTP/1.1")
+	tx.ProcessRequestHeaders()
+	tx.AddResponseHeader("Content-Type", "text/plain")
+	tx.ProcessResponseHeaders(200, "HTTP/1.1")
+	if _, n, err := tx.WriteResponseBody([]byte(body)); err != nil || n != len(body) {
+		t.Fatalf("WriteResponseBody: n=%d err=%v", n, err)
+	}
+	if intr, err := tx.ProcessResponseBody(); err != nil || intr == nil {
+		t.Fatalf("rule must interrupt response phase: intr=%v err=%v", intr, err)
+	}
+	tx.ProcessLogging()
+
+	var al plugintypes.AuditLog
+	select {
+	case al = <-capture.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("response-body audit snapshot was not captured")
+	}
+	sresp, ok := al.Transaction().Response().(*auditSnapshotResponse)
+	if !ok {
+		t.Fatalf("snapshot response type = %T", al.Transaction().Response())
+	}
+	wantPrefix := body[:auditBodyMaxBytes]
+	if got := sresp.Body(); got != wantPrefix+"\n...[TRUNCATED]" {
+		t.Fatalf("response snapshot body must be the %d-byte prefix plus truncation marker (len=%d)", auditBodyMaxBytes, len(got))
+	}
+	line, err := json.Marshal(al)
+	if err != nil {
+		t.Fatalf("marshal capped response snapshot: %v", err)
+	}
+	var wire struct {
+		Transaction struct {
+			Response struct {
+				Body          string `json:"body"`
+				BodyTruncated bool   `json:"body_truncated"`
+			} `json:"response"`
+		} `json:"transaction"`
+	}
+	if err := json.Unmarshal(line, &wire); err != nil {
+		t.Fatalf("audit line not JSON: %v", err)
+	}
+	if wire.Transaction.Response.Body != wantPrefix+"\n...[TRUNCATED]" || !wire.Transaction.Response.BodyTruncated {
+		t.Fatalf("serialized response body len=%d truncated=%v", len(wire.Transaction.Response.Body), wire.Transaction.Response.BodyTruncated)
+	}
+
+	// 回归形状：未超限响应体原样保留、无截断标记位（同测试第二事务）。
+	tx2 := waf.NewTransaction()
+	defer tx2.Close()
+	tx2.ProcessConnection(req.RemoteAddr, 0, "127.0.0.1", 8080)
+	tx2.ProcessURI(req.URL.String(), req.Method, "HTTP/1.1")
+	tx2.ProcessRequestHeaders()
+	tx2.AddResponseHeader("Content-Type", "text/plain")
+	tx2.ProcessResponseHeaders(200, "HTTP/1.1")
+	if _, _, err := tx2.WriteResponseBody([]byte("leak:small")); err != nil {
+		t.Fatalf("WriteResponseBody small: %v", err)
+	}
+	if intr, err := tx2.ProcessResponseBody(); err != nil || intr == nil {
+		t.Fatalf("small response must interrupt: intr=%v err=%v", intr, err)
+	}
+	tx2.ProcessLogging()
+	select {
+	case al = <-capture.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("small response audit snapshot was not captured")
+	}
+	sresp2, ok := al.Transaction().Response().(*auditSnapshotResponse)
+	if !ok {
+		t.Fatalf("snapshot response type = %T", al.Transaction().Response())
+	}
+	if got := sresp2.Body(); got != "leak:small" {
+		t.Fatalf("small response body must pass through unchanged, got len=%d", len(got))
 	}
 }
 

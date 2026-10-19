@@ -1088,6 +1088,23 @@ func TestRunAutoBackupNow_asyncReturnsBeforeSlowBackupCompletes(t *testing.T) {
 	})
 }
 
+// 非 NotExist 的 Stat 故障不得被文件名分配器吞掉。
+func TestNextAutoBackupFilename_statFailureIsNotAvailable(t *testing.T) {
+	// Given 一个普通文件冒充备份目录；Stat 其子路径返回 ENOTDIR，而非
+	// ErrNotExist。该故障不得被当作「文件名可用」继续走到后续 Rename。
+	newAutoBackupTestHandlers(t)
+	notDirectory := filepath.Join(t.TempDir(), "regular-file")
+	if err := os.WriteFile(notDirectory, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.Local)
+
+	// When/Then 非 NotExist 的 Stat 错误必须 fail-visible。
+	if _, err := nextAutoBackupFilename(notDirectory, "auto", now); err == nil || !strings.Contains(err.Error(), "检查备份文件名") {
+		t.Fatalf("err=%v, want explicit stat failure", err)
+	}
+}
+
 // B2-历史问题（历史）：文件名分配器在 200 个变体全冲突时必须报错，
 // 不得回退到基础名（可能已存在）——否则写盘会覆盖既有备份。
 func TestNextAutoBackupFilename_errorsWhenAllVariantsTaken(t *testing.T) {

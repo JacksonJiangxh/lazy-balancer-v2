@@ -73,7 +73,7 @@
 
 - 轻量优先：能 `get_metrics_overview` 就不用 `get_metrics_dashboard`；能 `get_rule` 就不用反复 `list_rules`
 - 审计日志务必分页；单工具响应上限 4 MiB，超限请改用分页参数（page/page_size）缩小返回范围
-- 配置备份导入（import_config/import_v1_config/validate_import）请求体上限 1 MiB（网关体积限制，REST 侧为 48 MiB）：备份超过 1 MiB 时 MCP 通道不可用，请改用管理面板或 REST 导入
+- 配置备份导入（import_config/import_v1_config/validate_import）请求体上限 1 MiB（网关体积限制，REST 侧为 128 MiB）：备份超过 1 MiB 时 MCP 通道不可用，请改用管理面板或 REST 导入
 - 保持 HTTP 连接复用（一个 MCP 会话内不要每次新建连接）
 
 ## 7. 错误码速查
