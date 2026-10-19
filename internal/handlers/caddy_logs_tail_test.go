@@ -153,3 +153,62 @@ func TestLogContentPreview_shortContentDoesNotPanic(t *testing.T) {
 		t.Fatalf("preview=%q, want abc…", got)
 	}
 }
+
+// 历史问题（历史 历史问题，族内一致性）：GetCaddyLogs 先 os.Stat 得 size 再
+// Seek(size-128KB) 后 io.ReadAll(f) 无 LimitReader——Stat 与 Read 之间日志
+// 增长时本次返回可超 128KB 上限（certjobs.readCertJobLogFile 同族已用
+// io.LimitReader）。测试钩子在 Stat 之后追加 200KB，钉住读取严格受窗口约束。
+func TestA87GetCaddyLogs_capsWindowReadAt128KB(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	logPath := filepath.Join(t.TempDir(), "caddy.log")
+	line := strings.Repeat("a", 1023) + "\n" // 1024 字节/行
+	writeLines := func(n int) {
+		t.Helper()
+		var builder strings.Builder
+		for builder.Len() < n {
+			builder.WriteString(line)
+		}
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			t.Fatalf("open log: %v", err)
+		}
+		if _, err := f.WriteString(builder.String()); err != nil {
+			f.Close()
+			t.Fatalf("append log: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("close log: %v", err)
+		}
+	}
+	writeLines(300 * 1024)
+	oldPaths := caddyLogPaths
+	caddyLogPaths = map[string]string{"runtime": logPath}
+	t.Cleanup(func() { caddyLogPaths = oldPaths })
+	oldHook := caddyLogsStatHook
+	// Stat 与读取之间的增长窗口：追加 200KB（轮转滞后/高流量形态）。
+	caddyLogsStatHook = func() { writeLines(200 * 1024) }
+	t.Cleanup(func() { caddyLogsStatHook = oldHook })
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/caddy/logs", h.GetCaddyLogs)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/caddy/logs?type=runtime", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Data struct {
+			Content string `json:"content"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(envelope.Data.Content) > 128*1024 {
+		t.Fatalf("content=%d 字节, want ≤128KB（Stat/Read 窗口增长必须受 LimitReader 约束）", len(envelope.Data.Content))
+	}
+	if envelope.Data.Content == "" {
+		t.Fatal("content 为空——夹具日志应命中完整行窗口")
+	}
+}

@@ -63,6 +63,7 @@ import { computed, nextTick, reactive, ref, watch } from 'vue'
 import type { FormInstance, FormRules, InputInstance } from 'element-plus'
 import { Setting } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
+import { validateClusterUrl } from '@/utils/clusterUrl'
 import { CHINA_SITE_CHOICES, COUNTRY_SITE_CHOICES, coordsForSiteLocation, initialNodeSiteForm, nearestSiteLocation, nodeSiteCoordsChanged } from '@/utils/siteLocation'
 import type { ClusterNode } from '@/types'
 
@@ -97,39 +98,14 @@ const form = reactive<NodeConfigForm>({ access_url: '', siteLocationKey: '', lat
 // 打开时的坐标基线：保存前对比判定站点坐标是否真实变更（A86 历史问题）。
 const baseline = reactive({ lat: 0, lon: 0 })
 
+// WS-18：与主节点地址共用 utils/clusterUrl（后端 ValidateClusterAccessURL 同规则）
 const validateAccessUrl = (_rule: unknown, value: string, callback: (error?: Error) => void): void => {
-  const normalized = value.trim()
-  if (!normalized) {
-    callback()
+  const error = validateClusterUrl(value, { label: '访问地址' })
+  if (error) {
+    callback(new Error(error))
     return
   }
-  if (!/^https?:\/\//.test(normalized)) {
-    callback(new Error('访问地址必须使用 HTTP 或 HTTPS'))
-    return
-  }
-  try {
-    const parsed = new URL(normalized)
-    if (!parsed.host) {
-      callback(new Error('访问地址必须包含主机'))
-      return
-    }
-    if (parsed.username || parsed.password) {
-      callback(new Error('访问地址不能包含用户名或密码'))
-      return
-    }
-    if (parsed.hash) {
-      callback(new Error('访问地址不能包含片段'))
-      return
-    }
-    if (parsed.search) {
-      callback(new Error('访问地址不能包含查询参数'))
-      return
-    }
-    callback()
-  } catch {
-    // new URL() 仅抛 TypeError；其余异常同样视为地址非法，走统一提示，不向外抛。
-    callback(new Error('访问地址格式不正确'))
-  }
+  callback()
 }
 
 const rules: FormRules<NodeConfigForm> = {

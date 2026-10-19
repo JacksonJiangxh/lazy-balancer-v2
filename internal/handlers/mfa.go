@@ -103,6 +103,10 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 		return
 	}
 	if !consumed {
+		// H-B1-11（历史）：并发登录落败/挑战达阈值作废后的重放是爆破与
+		// 外部竞态的观测面——与同函数其余拒绝分支同密度留痕（此前这是唯一
+		// 无审计的拒绝分支，事后无法区分「客户端重试」与「重放已消费挑战」）。
+		services.RecordAuditLog(user.Username, "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "挑战已被使用"), c.ClientIP())
 		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "MFA 挑战已被使用，请重新登录"})
 		return
 	}
@@ -175,6 +179,21 @@ func rejectOIDCUserMFAOperation(c *gin.Context, targetUserID int) bool {
 	return false
 }
 
+// mfaVerifyFailureResponse 收敛「登录后验码失败」的响应与审计口径（H-B1-02，
+// 历史）：verr != nil = 查询/写库故障 → 500（不把底层 SQL 错误文本透给
+// 客户端、也不写「验证码错误」误导排障）；verr == nil = 真验证码错误 → 调用方
+// 既有审计文案 + 401。四处入口（重绑/禁用/step-up/管理员重置）共用，与 Login
+// 的 U04c-05 及 MFAActivate 已确立的三态口径一致。
+func mfaVerifyFailureResponse(c *gin.Context, verr error, failureDetail string) {
+	if verr != nil {
+		recordAudit(c, "认证拒绝", "用户认证", services.FormatAuditDetail("验证服务故障", services.AuditResultPart("failure")))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 验证服务暂时不可用，请稍后重试"})
+		return
+	}
+	recordAudit(c, "认证拒绝", "用户认证", failureDetail)
+	c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "验证码错误"})
+}
+
 func (h *Handlers) MFASetup(c *gin.Context) {
 	if rejectOIDCUserMFAOperation(c, 0) {
 		return
@@ -202,12 +221,7 @@ func (h *Handlers) MFASetup(c *gin.Context) {
 		// 历史问题(历史问题 同形对齐):守卫验码放行路径跳过本层验码(同 MFADisable)。
 		if !mfaStepUpVerifiedInContext(c) {
 			if ok, verr := services.MFAVerifyTOTPCode(userID, req.Code, time.Now()); !ok {
-				recordAudit(c, "认证拒绝", "用户认证", services.FormatAuditDetail("重绑 MFA 前验证失败", services.AuditResultPart("failure")))
-				msg := "验证码错误"
-				if verr != nil {
-					msg = verr.Error()
-				}
-				c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: msg})
+				mfaVerifyFailureResponse(c, verr, services.FormatAuditDetail("重绑 MFA 前验证失败", services.AuditResultPart("failure")))
 				return
 			}
 		}
@@ -298,12 +312,7 @@ func (h *Handlers) MFADisable(c *gin.Context) {
 	if !mfaStepUpVerifiedInContext(c) {
 		if ok, verr := services.MFAVerifyTOTPCode(userID, req.Code, time.Now()); !ok {
 			// B5 I-A：高敏动作的失败尝试与成功同等可审计（对齐 MFAResetByAdmin 前置验码失败留痕）。
-			recordAudit(c, "认证拒绝", "用户认证", services.FormatAuditDetail("禁用 MFA 前验证失败", services.AuditResultPart("failure")))
-			msg := "验证码错误"
-			if verr != nil {
-				msg = verr.Error()
-			}
-			c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: msg})
+			mfaVerifyFailureResponse(c, verr, services.FormatAuditDetail("禁用 MFA 前验证失败", services.AuditResultPart("failure")))
 			return
 		}
 	}
@@ -364,12 +373,7 @@ func (h *Handlers) MFAVerifyStep(c *gin.Context) {
 		return
 	}
 	if ok, verr := services.MFAVerifyTOTPCode(userID, req.Code, time.Now()); !ok {
-		recordAudit(c, "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "step-up 验证失败"))
-		msg := "验证码错误"
-		if verr != nil {
-			msg = verr.Error()
-		}
-		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: msg})
+		mfaVerifyFailureResponse(c, verr, services.FormatAuditDetail("MFA", "step-up 验证失败"))
 		return
 	}
 	// 重签 JWT：保留原身份声明，仅刷新 mfa_ts（与 respondLogin 同构；node_mode 重读）
@@ -377,8 +381,12 @@ func (h *Handlers) MFAVerifyStep(c *gin.Context) {
 	var passwordVersion int64
 	// B3-历史问题（历史）：重读用户的 DB 错误不得并入 401「用户不可用」
 	// ——基础设施故障 500；行缺失/禁用保持 401（JWT 仍有效但账号已不可用）。
-	if err := db.DB.QueryRow(`SELECT id, username, role, display_name, is_enabled, created_at, last_login, password_version FROM users WHERE id=?`, userID).
-		Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &passwordVersion); err != nil {
+	// H-B1-03（历史）：重读列必须含 auth_provider（COALESCE 与登录路径同
+	// 口径）——漏列会让所有 step-up 响应的 auth_provider 变成 ""，且存量
+	// OIDC 行（mfa_enabled=1）在 verify-step 成功后丢掉 auth_method=oidc 声明
+	// （middleware 的 MFA 门短路与集群票据直通依赖该声明）。
+	if err := db.DB.QueryRow(`SELECT id, username, role, display_name, is_enabled, created_at, last_login, password_version, COALESCE(auth_provider,'local') FROM users WHERE id=?`, userID).
+		Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &passwordVersion, &user.AuthProvider); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户信息失败"})
 		return
 	}
@@ -448,12 +456,7 @@ func (h *Handlers) MFAResetByAdmin(c *gin.Context) {
 		if ok, verr := services.MFAVerifyCode(operatorID, req.Code, time.Now()); !ok {
 			// 历史问题 七次：重置前置验码失败留痕——高敏动作的失败尝试与成功同等
 			// 可审计（含 brute 尝试面）。
-			recordAudit(c, "认证拒绝", "用户认证", services.FormatAuditDetail("重置 MFA 前验证失败", services.AuditResultPart("failure")))
-			msg := "验证码错误"
-			if verr != nil {
-				msg = verr.Error()
-			}
-			c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: msg})
+			mfaVerifyFailureResponse(c, verr, services.FormatAuditDetail("重置 MFA 前验证失败", services.AuditResultPart("failure")))
 			return
 		}
 	}

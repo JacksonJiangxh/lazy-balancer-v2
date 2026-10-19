@@ -1,0 +1,207 @@
+package services
+
+import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
+	"io"
+	"log"
+	"math/big"
+	"testing"
+	"time"
+
+	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/internal/taskengine"
+)
+
+const snapshotSchemaV2 = 2
+
+type snapshotV2Fixture struct {
+	SchemaVersion    int                         `json:"schema_version"`
+	MinReaderVersion int                         `json:"min_reader_version"`
+	Version          int                         `json:"version"`
+	Fingerprint      string                      `json:"fingerprint"`
+	Signature        string                      `json:"signature,omitempty"`
+	CanonicalPayload json.RawMessage             `json:"canonical_payload,omitempty"`
+	Rules            []models.LbRule             `json:"rules"`
+	Users            []models.ClusterUser        `json:"users"`
+	APIKeys          []models.ClusterAPIKey      `json:"api_keys"`
+	BasicSettings    models.ClusterBasicSettings `json:"basic_settings"`
+	CaddyConfig      *string                     `json:"caddy_config,omitempty"`
+	Certs            []models.ClusterCertificate `json:"certs"`
+}
+
+func (snapshot snapshotV2Fixture) canonicalBytes() ([]byte, error) {
+	snapshot.Fingerprint = ""
+	snapshot.Signature = ""
+	snapshot.CanonicalPayload = nil
+	return json.Marshal(snapshot)
+}
+
+type clusterLifecycleHooks interface {
+	StartACME()
+	StopACME()
+	StartSync()
+	StopSync()
+}
+
+type spaceFillReader struct{ remaining int64 }
+
+func (r *spaceFillReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+	n := int64(len(p))
+	if n > r.remaining {
+		n = r.remaining
+	}
+	for i := range n {
+		p[i] = ' '
+	}
+	r.remaining -= n
+	return int(n), nil
+}
+
+func initServicesDB(t *testing.T) {
+	t.Helper()
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize test database: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+}
+
+func findRouteByID(t *testing.T, routes []interface{}, id string) map[string]interface{} {
+	t.Helper()
+	for _, routeValue := range routes {
+		route := mustMap(t, routeValue, "route")
+		if routeID, _ := route["@id"].(string); routeID == id {
+			return route
+		}
+	}
+	return nil
+}
+
+func seedSnapshotCertificate(t *testing.T, database *sql.DB, ruleID, ruleDomain, jobDomain, certPEM, keyPEM string, expiresAt time.Time, jobID int) {
+	t.Helper()
+	if _, err := database.Exec(`INSERT OR IGNORE INTO ca_providers (id,name,provider,directory_url,enabled) VALUES (7,'snapshot CA','letsencrypt','https://acme.example/directory',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT OR IGNORE INTO certificate_configs (id,name,dns_provider,enabled) VALUES (11,'snapshot DNS','dnspod',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enable_tls,tls_source,acme_config_id,ca_provider_id,enabled) VALUES (?,?,'http',?,443,1,'acme_dns',11,7,1)`, ruleID, ruleID, ruleDomain); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,enabled) VALUES (?,'127.0.0.1',8080,1)`, ruleID); err != nil {
+		t.Fatal(err)
+	}
+	seedSnapshotCertificateJob(t, database, ruleID, jobDomain, certPEM, keyPEM, expiresAt, jobID)
+}
+
+func seedSnapshotCertificateJob(t *testing.T, database *sql.DB, ruleID, jobDomain, certPEM, keyPEM string, expiresAt time.Time, jobID int) {
+	t.Helper()
+	if _, err := database.Exec(`INSERT INTO cert_jobs (id,rule_id,domain,status,expires_at,cert_pem,key_pem,ca_provider_id,updated_at) VALUES (?, ?, ?, 'issued', ?, ?, ?, 7, ?)`, jobID, ruleID, jobDomain, expiresAt, certPEM, keyPEM, expiresAt.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func signedSnapshotV2Fixture(version int, token string) snapshotV2Fixture {
+	snapshot := snapshotV2Fixture{
+		SchemaVersion:    snapshotSchemaV2,
+		MinReaderVersion: snapshotSchemaV2,
+		Version:          version,
+		Rules:            []models.LbRule{},
+		Users:            []models.ClusterUser{},
+		APIKeys:          []models.ClusterAPIKey{},
+		Certs:            []models.ClusterCertificate{},
+	}
+	canonical, err := snapshot.canonicalBytes()
+	if err != nil {
+		panic(err)
+	}
+	hash := sha256.Sum256(canonical)
+	snapshot.Fingerprint = hex.EncodeToString(hash[:])
+	snapshot.CanonicalPayload = canonical
+	mac := hmac.New(sha256.New, []byte(token))
+	_, _ = mac.Write(canonical)
+	snapshot.Signature = hex.EncodeToString(mac.Sum(nil))
+	return snapshot
+}
+
+func wireClusterLifecycleEngineForTest(t *testing.T, lifecycle clusterLifecycleHooks, master bool) *taskengine.Engine {
+	t.Helper()
+	te := taskengine.NewEngine(taskengine.Options{TickInterval: time.Hour})
+	SetTaskEngineForTest(te)
+	SetCertIssuanceLifecycleHooks(lifecycle.StartACME, lifecycle.StopACME)
+	SetSyncLifecycleHooks(lifecycle.StartSync, lifecycle.StopSync)
+	t.Cleanup(func() {
+		StopTaskEngine()
+		SetCertIssuanceLifecycleHooks(nil, nil)
+		SetSyncLifecycleHooks(nil, nil)
+	})
+	te.SetRole(master)
+	mustRegisterTask(te, taskengine.Descriptor{
+		ID: "cert-issuance", Family: "certificates", Name: "证书签发", Kind: taskengine.KindDaemon, RunsOn: taskengine.RoleMasterOnly,
+		Run: func(rc taskengine.RunContext) error {
+			return daemonLifecycleRun(rc, certIssuanceLifecycleStart, certIssuanceLifecycleStop)
+		},
+	})
+	mustRegisterTask(te, taskengine.Descriptor{
+		ID: "cluster-sync", Family: "cluster", Name: "集群同步", Kind: taskengine.KindDaemon, RunsOn: taskengine.RoleAny, RestartOnRoleFlip: true,
+		Run: func(rc taskengine.RunContext) error {
+			if te.IsMaster() {
+				return daemonLifecycleRun(rc, nil, nil)
+			}
+			return daemonLifecycleRun(rc, syncLifecycleStart, syncLifecycleStop)
+		},
+	})
+	te.StartLoop("cert-issuance")
+	te.StartLoop("cluster-sync")
+	return te
+}
+
+func certificatePairForDomains(t *testing.T, notBefore, notAfter time.Time, domains ...string) (string, string) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{SerialNumber: big.NewInt(notAfter.UnixNano()), Subject: pkix.Name{CommonName: domains[0]}, DNSNames: domains, NotBefore: notBefore, NotAfter: notAfter}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})), string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}))
+}
+
+func captureApplicationLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	previousLevel := CurrentLogLevel()
+	if err := ConfigureLogLevel("info"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ConfigureLogLevel(previousLevel) })
+	var logs bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	})
+	return &logs
+}

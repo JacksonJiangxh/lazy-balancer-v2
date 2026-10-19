@@ -12,8 +12,37 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// nodeHealthWarn 是节点列表 health_json 解析失败的限频状态（S历史问题-08）：
+// Nodes() 每次节点列表请求都会碰到同一坏行，前端轮询（秒级/十秒级）下同一条
+// warn 会持续刷屏。与同包 snapshotRowIsolation / throttled*Logf 家族同口径：
+// 同一 nodeID 在窗口内只告警一次，插入时顺带回收过期键（节点 ID 有界）。
+var (
+	nodeHealthWarnMu     sync.Mutex
+	nodeHealthWarnSeen   = map[int]time.Time{}
+	nodeHealthWarnWindow = 60 * time.Second
+)
+
+// warnNodeHealthParseThrottled 按 nodeID 限频输出 health_json 解析失败告警。
+func warnNodeHealthParseThrottled(nodeID int, cause error, now time.Time) {
+	nodeHealthWarnMu.Lock()
+	last, seen := nodeHealthWarnSeen[nodeID]
+	if seen && now.Sub(last) < nodeHealthWarnWindow {
+		nodeHealthWarnMu.Unlock()
+		return
+	}
+	nodeHealthWarnSeen[nodeID] = now
+	for id, seenAt := range nodeHealthWarnSeen {
+		if now.Sub(seenAt) >= nodeHealthWarnWindow {
+			delete(nodeHealthWarnSeen, id)
+		}
+	}
+	nodeHealthWarnMu.Unlock()
+	Logf("warn", "解析节点 %d 健康状态失败: %v", nodeID, cause)
+}
 
 // RoleOf 读取节点角色（主节点=true）的单源实现（历史问题-07）。COALESCE(is_master,1)
 // 与 readonly 写闸（readonly.go）及 cluster_version 触发器口径一致：历史库 NULL
@@ -50,19 +79,23 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	}
 	// 换主与升主同样需要排干旧拓扑已准入的拉取：否则旧主快照的提交后
 	// 阶段可能越过新凭据落库点，继续物化旧配置/触发旧 Caddy 重载。
-	drainer := syncDrainerFor(s.db)
-	if drainer != nil {
-		if err := drainer.DrainPulls(ctx); err != nil {
-			drainer.reopenPullAdmission()
-			return fmt.Errorf("等待在途同步拉取结束: %w", err)
+	// S历史问题-06：同库全部实例逐个排干（只处理最后注册的一个会漏掉在途 apply）。
+	drainers := syncDrainersFor(s.db)
+	if len(drainers) > 0 {
+		for _, drainer := range drainers {
+			// 历史问题-01：排干成功后所有返回路径都必须恢复拉取准入。原实现只在
+			// 成功尾部重开——下方 UPDATE 失败（SQLITE_BUSY/磁盘满）时准入永久
+			// 关闭；而「已是从节点换主」不触发引擎换代（SetRole(false) flipped=
+			// false），旧 daemon 不会重新 Start，后续每轮 Pull 在 beginPull 即
+			// 返回 errSyncPullStopped 且该哨兵刻意不落库 → 静默脱同步、状态面
+			// 全绿、无自愈。defer 覆盖失败路径，成功路径另行提前重开。
+			defer drainer.reopenPullAdmission()
 		}
-		// 历史问题-01：排干成功后所有返回路径都必须恢复拉取准入。原实现只在
-		// 成功尾部重开——下方 UPDATE 失败（SQLITE_BUSY/磁盘满）时准入永久
-		// 关闭；而「已是从节点换主」不触发引擎换代（SetRole(false) flipped=
-		// false），旧 daemon 不会重新 Start，后续每轮 Pull 在 beginPull 即
-		// 返回 errSyncPullStopped 且该哨兵刻意不落库 → 静默脱同步、状态面
-		// 全绿、无自愈。defer 覆盖失败路径，成功路径另行提前重开。
-		defer drainer.reopenPullAdmission()
+		for _, drainer := range drainers {
+			if err := drainer.DrainPulls(ctx); err != nil {
+				return fmt.Errorf("等待在途同步拉取结束: %w", err)
+			}
+		}
 	}
 	// 历史问题（RG-CLUSTER-STATUS-RESET）：last_sync 与 applied_version 同语义
 	// ——旧集群的同步时间对新集群无意义，同一 UPDATE 里置 NULL，状态卡不残留
@@ -94,8 +127,10 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	// 拓扑已提交：先恢复拉取准入，再让新 daemon 起步——若等到函数尾部才重开，
 	// 新循环的首次 Pull 可能撞上仍关闭的准入并以 errSyncPullStopped 静默失败
 	//（该哨兵不落库），延迟 = 一个 sync_interval。
-	if drainer != nil {
-		drainer.reopenPullAdmission()
+	if len(drainers) > 0 {
+		for _, drainer := range drainers {
+			drainer.reopenPullAdmission()
+		}
 	}
 	// 历史问题-06：角色翻转显式失效快照缓存。缓存键只有 version/ownership/开关，
 	// 降级瞬间在途的 master-only Run 可越过角色检查写库且 is_master=0 不 bump
@@ -119,12 +154,14 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 		}
 	}
 	// 拉取准入已在上方拓扑提交后重开（defer 兜底失败路径）；此处不再重复。
-	if drainer != nil {
+	if len(drainers) > 0 {
 		// 历史问题-05(b)：换主后内存 TOFU pin 缓存与磁盘生命周期对齐——磁盘侧由
 		// detachFromMaster 删除旧主 pin，内存 verifiedPins 若不清空会残留旧主
 		// 指纹（与 Promote handler 的 ForgetClusterPins 收尾对称）。同主重注册
 		// 也一并清空：下次请求按 pin 文件重钉，行为等价且无落盘副作用。
-		drainer.ForgetClusterPins()
+		for _, drainer := range drainers {
+			drainer.ForgetClusterPins()
+		}
 	}
 	// 仅在主节点地址实际变化时通知旧主。相同主节点重新注册可能刚复用
 	// 节点行， detached 会误删本次新注册。
@@ -279,7 +316,8 @@ func (s *ClusterService) Nodes(ctx context.Context, now time.Time) ([]models.Clu
 		// 单节点 health_json 损坏只降级该节点（Health=nil），不拖垮整个节点列表
 		health, decodeErr := DecodeClusterHealth(healthJSON)
 		if decodeErr != nil {
-			Logf("warn", "解析节点 %d 健康状态失败: %v", node.ID, decodeErr)
+			// S历史问题-08：同一坏行按 nodeID 限频告警（节点页轮询不再刷屏）。
+			warnNodeHealthParseThrottled(node.ID, decodeErr, now)
 		} else {
 			node.Health = health
 		}
@@ -475,21 +513,39 @@ func nodePinPathFromAccessURL(database *sql.DB, accessURL string) (pinPath, host
 }
 
 func (s *ClusterService) DeleteNode(ctx context.Context, nodeID int) error {
+	// 历史问题-05（历史）：nodes 不在 cluster_version 触发器清单——拓扑
+	// 变更（注册/改坐标）历来在同事务显式 BumpClusterVersion，删除节点此前漏
+	// bump：快照缓存（键含 cluster_version）会继续携带被删节点的站点项，直到
+	// 下一次无关 bump（消费方仅该节点自身，功能影响≈0，但同族约定不得不对称
+	// ——后续给 nodes 增加同步字段会漏传播）。此处把删行与 bump 并入同一事务。
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启删除节点事务: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	// 历史问题(历史):删行前取访问地址——删行后 pin 成孤儿且无 API
 	// 清除通道,同 host:port 复用时服务控制 fail-closed PinMismatch 只能手工
 	// 删盘。地址解析与 ForgetNodePin 同口径(access_url 优先)。
 	var ipAddress, protocol, accessURL string
 	var port int
-	addrErr := s.db.QueryRowContext(ctx, `SELECT ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,'') FROM nodes WHERE id=?`, nodeID).
+	addrErr := tx.QueryRowContext(ctx, `SELECT ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,'') FROM nodes WHERE id=?`, nodeID).
 		Scan(&ipAddress, &port, &protocol, &accessURL)
-	result, err := s.db.ExecContext(ctx, "DELETE FROM nodes WHERE id=? AND "+masterRoleConditionSQL, nodeID)
+	result, err := tx.ExecContext(ctx, "DELETE FROM nodes WHERE id=? AND "+masterRoleConditionSQL, nodeID)
 	if err != nil {
 		return fmt.Errorf("删除节点: %w", err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil || rows != 1 {
 		// 历史问题-历史问题：降级窗口内的删除按 403 语义拒绝（节点仍在），而非 404。
+		// 复核角色用独立连接（nodeWriteMissError），必须先退出写事务。
+		_ = tx.Rollback()
 		return s.nodeWriteMissError(ctx)
+	}
+	if err := BumpClusterVersion(ctx, tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交删除节点: %w", err)
 	}
 	s.clearSectionReport(nodeID)
 	// 行已删:清 pin(读址失败/无 pin/地址无效均不影响删除结果,仅留痕)。

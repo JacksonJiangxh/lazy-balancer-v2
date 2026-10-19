@@ -56,11 +56,14 @@ func newClusterTestService(t *testing.T) (*ClusterService, *sql.DB) {
 		t.Fatalf("initialize test database: %v", err)
 	}
 	database := db.DB
+	service := NewClusterService(database, "")
 	t.Cleanup(func() {
+		// S历史问题-06：显式注销全局注册表条目（LIFO：先注销，再 Close/恢复）。
+		unregisterClusterService(service)
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
 	})
-	return NewClusterService(database, ""), database
+	return service, database
 }
 
 func replaceSnapshotDB(ctx context.Context, database *sql.DB, snapshot models.ClusterSnapshot) error {
@@ -1230,7 +1233,11 @@ func TestClusterSnapshot_alwaysCarriesGlobalSettings(t *testing.T) {
 	}
 }
 
-func TestUpdateSnapshotSettings_preservesSlaveAccessLogSettingsWhenCaddySyncOff(t *testing.T) {
+// S历史问题-14（历史）：测试名/注释原以「Caddy 同步开关关闭」描述行为，
+// 但三分类合并后已无 sync_caddy_config 开关（列已删，见下方
+// TestClusterService_Status_removesLegacySyncCaddyConfig）。真实契约是：
+// 快照未携带 caddy_config（=旧主端缺席）时跳过 Caddy 全局列，保留从端本地值。
+func TestUpdateSnapshotSettings_preservesSlaveAccessLogSettingsWhenSnapshotOmitsCaddyConfig(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
 	ctx := context.Background()
@@ -1261,7 +1268,7 @@ func TestUpdateSnapshotSettings_preservesSlaveAccessLogSettingsWhenCaddySyncOff(
 		return jsonOut, format
 	}
 
-	// When snapshot carries no caddy config (sync off)
+	// When snapshot omits caddy_config（旧主端快照缺席；无开关语义）
 	apply(t, models.ClusterSnapshot{BasicSettings: models.ClusterBasicSettings{
 		LogLevel: new("debug"), AccessLogJSON: new(true), AccessLogFormat: new("master-format"), JWTExpireMinutes: new(20),
 	}})
@@ -1269,7 +1276,7 @@ func TestUpdateSnapshotSettings_preservesSlaveAccessLogSettingsWhenCaddySyncOff(
 	// Then slave-local access log settings survive, ungated settings applied
 	gotJSON, gotFormat := readAccessLog(t)
 	if gotJSON || gotFormat != "slave-format" {
-		t.Fatalf("access log settings overwritten without caddy sync: json=%v format=%q", gotJSON, gotFormat)
+		t.Fatalf("access log settings overwritten when snapshot omits caddy_config: json=%v format=%q", gotJSON, gotFormat)
 	}
 	var logLevel string
 	if err := database.QueryRowContext(ctx, "SELECT log_level FROM global_config WHERE id=1").Scan(&logLevel); err != nil {
@@ -1279,14 +1286,14 @@ func TestUpdateSnapshotSettings_preservesSlaveAccessLogSettingsWhenCaddySyncOff(
 		t.Fatalf("ungated log level not applied: %q", logLevel)
 	}
 
-	// When snapshot carries caddy config (sync on)
+	// When snapshot carries caddy_config
 	caddyConfig := "{}"
 	apply(t, models.ClusterSnapshot{CaddyConfig: &caddyConfig, BasicSettings: models.ClusterBasicSettings{
 		AccessLogJSON: new(true), AccessLogFormat: new("master-format"), JWTExpireMinutes: new(20),
 	}})
 	gotJSON, gotFormat = readAccessLog(t)
 	if !gotJSON || gotFormat != "master-format" {
-		t.Fatalf("access log settings not applied with caddy sync: json=%v format=%q", gotJSON, gotFormat)
+		t.Fatalf("access log settings not applied when snapshot carries caddy_config: json=%v format=%q", gotJSON, gotFormat)
 	}
 }
 
@@ -1549,5 +1556,28 @@ func TestConfirmRegistration_clearsSecretAndExpiry(t *testing.T) {
 	}
 	if secret.Valid || expires.Valid {
 		t.Fatalf("registration_secret.Valid=%v expires_at.Valid=%v（值 %q/%q）, want 双列均 NULL", secret.Valid, expires.Valid, secret.String, expires.String)
+	}
+}
+
+// 历史问题-05（历史）：nodes 不在 cluster_version 触发器清单——删除节点
+// 必须与注册/改坐标同构地在同事务 bump，否则快照缓存（键含 cluster_version）
+// 继续携带被删节点的站点项，直到下一次无关 bump。
+func TestDeleteNodeBumpsClusterVersion(t *testing.T) {
+	service, database := newClusterTestService(t)
+	nodeID := insertApprovedClusterNode(t, database, "slave-del")
+	version := func() int {
+		t.Helper()
+		var v int
+		if err := database.QueryRow(`SELECT COALESCE(cluster_version,0) FROM global_config WHERE id=1`).Scan(&v); err != nil {
+			t.Fatalf("read cluster_version: %v", err)
+		}
+		return v
+	}
+	before := version()
+	if err := service.DeleteNode(context.Background(), nodeID); err != nil {
+		t.Fatalf("delete node: %v", err)
+	}
+	if after := version(); after != before+1 {
+		t.Fatalf("cluster_version %d→%d，want +1（拓扑变更必须传播）", before, after)
 	}
 }

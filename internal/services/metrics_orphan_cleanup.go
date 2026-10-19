@@ -21,8 +21,8 @@ import (
 )
 
 // metricsOrphanPurgeRulesPerRun 单轮最多清理的孤儿规则数（有界重试的
-// 「有界」落点：积压超限时下一轮继续，不在一轮内无限放大删除事务）。var
-// 以便测试收窄。
+// 「有界」落点：积压超限时下一轮继续，不在一轮内无限放大删除事务）。
+// 变量形态便于测试收窄。
 var metricsOrphanPurgeRulesPerRun = 500
 
 // PurgeOrphanMetricsHistory 清理 metrics 库中已删除规则的残留历史指标，

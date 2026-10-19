@@ -187,6 +187,26 @@ func autoBackupDueSlot(now time.Time, freq, hhmm string, day int, loc *time.Loca
 	}
 }
 
+// autoBackupDayHigh 返回各频率 auto_backup_day 的合法上限（weekly 1=周一…7=周日；
+// daily/monthly 1-28——29-31 在短月没有对应日）。与 handlers 写侧/读侧同名
+// helper 同值；services 不能 import handlers（依赖成环），此处是调度侧单源。
+func autoBackupDayHigh(freq string) int {
+	if freq == "weekly" {
+		return 7
+	}
+	return 28
+}
+
+// normalizeAutoBackupDay 把读到的 day 收敛到 1..autoBackupDayHigh(freq)，越界
+// 回退 DB 默认 1——与 handlers 读侧 SYS-F1「越界存量值回退默认」同口径，保证
+// 「UI 显示的即生效值」（V87-TO-03，历史）。
+func normalizeAutoBackupDay(freq string, day int) int {
+	if day < 1 || day > autoBackupDayHigh(freq) {
+		return 1
+	}
+	return day
+}
+
 // autoBackupSettingsRow 调度器消费的 global_config 设置快照。
 type autoBackupSettingsRow struct {
 	enabled bool
@@ -211,6 +231,13 @@ func loadAutoBackupSettings() (autoBackupSettingsRow, error) {
 	if err != nil {
 		return row, err
 	}
+	// V87-TO-03（历史）：读侧收敛 day 到写侧允许区间（weekly 1-7、
+	// daily/monthly 1-28）。带外写入的 29-31（集群快照直写不校验）会让
+	// monthly「已执行→步进」在短月回退到已执行的过去槽——水位线不再推进，
+	// 引擎每 tick 重跑备份；weekly 越界则让 autoBackupDueSlot ok=false，调度面
+	// 零槽（任务静默停摆）。越界回退默认 1，与 handlers 读侧同口径。
+	row.day = normalizeAutoBackupDay(row.freq, row.day)
+
 	if lastRun.Valid && lastRun.String != "" {
 		if parsed, perr := time.Parse(time.RFC3339, lastRun.String); perr == nil {
 			row.lastRun = &parsed

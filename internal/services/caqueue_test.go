@@ -700,13 +700,13 @@ func TestCAQueueManager_CancelJobsForRule_blocks_retry_created_during_worker_exi
 	manager.mu.Lock()
 	manager.queues[1] = queue
 	manager.mu.Unlock()
-	manager.BlockJobsForRule("lb_deleted")
+	blockToken := manager.BlockJobsForRule("lb_deleted")
 
 	// When
 	if err := manager.CancelJobsForRule(context.Background(), "lb_deleted"); err != nil {
 		t.Fatalf("cancel rule jobs: %v", err)
 	}
-	manager.UnblockJobsForRule("lb_deleted")
+	manager.UnblockJobsForRule("lb_deleted", blockToken)
 
 	// Then
 	select {
@@ -1819,4 +1819,246 @@ func TestCAQueue_tick_appliesProviderConfigUpdateWhileQueued(t *testing.T) {
 			t.Fatalf("pending=%d running=%d, want 0/1（间隔下调后必须按新值放行）", pending, running)
 		}
 	})
+}
+
+// 历史问题-04（历史核实成立）：生命周期取消的重入队 from 集合此前含终态
+// issued/failed——并发部署回调的终态落定可被无条件拉回 queued（issued→整轮
+// 重签烧配额 / failed→终态复活）。终态必须不被改写；downloaded 保持部署语义；
+// 中间态照常重排。
+func TestRequeueCanceledJobDoesNotResurrectTerminalStates(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00") // 通用临时库 + 任务日志目录
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,message,cert_pem,key_pem) VALUES
+		('lb_issued','issued.example.com','issued','签发成功','CERT','KEY'),
+		('lb_failed','failed.example.com','failed','CA 签发失败: boom',NULL,NULL),
+		('lb_downloaded','downloaded.example.com','downloaded','部署退避中','CERT2','KEY2'),
+		('lb_mid','mid.example.com','creating_account','开始申请证书',NULL,NULL)`); err != nil {
+		t.Fatalf("seed cert jobs: %v", err)
+	}
+	ids := map[string]int{}
+	rows, err := db.DB.Query(`SELECT rule_id, id FROM cert_jobs`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var ruleID string
+		var id int
+		if err := rows.Scan(&ruleID, &id); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		ids[ruleID] = id
+	}
+	rows.Close()
+
+	for _, ruleID := range []string{"lb_issued", "lb_failed", "lb_downloaded", "lb_mid"} {
+		requeueCanceledJob(ids[ruleID])
+	}
+
+	read := func(ruleID string) (status, message string, deploymentAfter bool) {
+		t.Helper()
+		var after any
+		if err := db.DB.QueryRow(`SELECT status, COALESCE(message,''), deployment_available_after FROM cert_jobs WHERE id=?`, ids[ruleID]).
+			Scan(&status, &message, &after); err != nil {
+			t.Fatalf("read %s: %v", ruleID, err)
+		}
+		return status, message, after != nil
+	}
+
+	if status, _, _ := read("lb_issued"); status != "issued" {
+		t.Fatalf("issued 被拉回 %q（终态复活 = 整轮重签烧配额）", status)
+	}
+	if status, _, _ := read("lb_failed"); status != "failed" {
+		t.Fatalf("failed 被拉回 %q（终态不复活契约被绕过）", status)
+	}
+	if status, message, after := read("lb_downloaded"); status != "downloaded" || !after || !strings.Contains(message, "等待恢复部署") {
+		t.Fatalf("downloaded 必须保持部署语义: status=%q after=%v message=%q", status, after, message)
+	}
+	if status, _, _ := read("lb_mid"); status != "queued" {
+		t.Fatalf("中间态 creating_account 应重排为 queued，得到 %q", status)
+	}
+}
+
+// ---- 历史（SV历史问题 / SV历史问题）----
+
+// seedRuleWithCAProvider 落一条启用中的 ACME 规则并固定其 CA 提供商。
+func seedRuleWithCAProvider(t *testing.T, ruleID, domain string, providerID int) {
+	t.Helper()
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source,ca_provider_id)
+		VALUES (?,?,?,'http',8080,1,1,'acme_dns',?)`, ruleID, ruleID, domain, providerID); err != nil {
+		t.Fatalf("seed rule %s: %v", ruleID, err)
+	}
+}
+
+func seedQueuedCertJob(t *testing.T, ruleID, domain string, providerID int) int64 {
+	t.Helper()
+	result, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_provider_id) VALUES (?,?,'queued',?)`, ruleID, domain, providerID)
+	if err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("read job id: %v", err)
+	}
+	return id
+}
+
+// SV历史问题（历史问题）：显式选择的 CA 提供商「存在但已禁用」时不得静默改派到其它
+// 启用提供商（改派会消耗另一 CA 配额并持久化改写 cert_jobs.ca_provider_id），
+// 必须以可见失败落定任务；已删除 ID 仍保留回退（历史任务延续）。
+func TestCAQueue_loadCAProvider_disabled_explicit_id_fails_instead_of_silent_switch(t *testing.T) {
+	// Given：两个启用提供商，其中一个被禁用（守卫只拦截启用中规则引用，
+	// 禁用规则/历史任务仍可能持有该 ID）。
+	_, database := newClusterTestService(t)
+	rows, err := database.Query(`SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id`)
+	if err != nil {
+		t.Fatalf("read providers: %v", err)
+	}
+	var enabledIDs []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan provider: %v", err)
+		}
+		enabledIDs = append(enabledIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate providers: %v", err)
+	}
+	rows.Close()
+	if len(enabledIDs) < 2 {
+		t.Fatalf("seeded providers=%d, want >= 2（回退可用性前置）", len(enabledIDs))
+	}
+	disabledID := enabledIDs[1]
+	if _, err := database.Exec(`UPDATE ca_providers SET enabled=0 WHERE id=?`, disabledID); err != nil {
+		t.Fatalf("disable provider: %v", err)
+	}
+	seedRuleWithCAProvider(t, "lb_disabled_ca", "disabled-ca.example.test", disabledID)
+	jobID := seedQueuedCertJob(t, "lb_disabled_ca", "disabled-ca.example.test", disabledID)
+
+	manager := &CAQueueManager{
+		queues:       make(map[int]*caQueue),
+		active:       true,
+		blockedRules: map[string]map[RuleBlockToken]struct{}{},
+	}
+
+	// When
+	manager.mu.Lock()
+	enqueueErr := manager.enqueueLocked(disabledID, int(jobID), "lb_disabled_ca", "disabled-ca.example.test")
+	queues := len(manager.queues)
+	manager.mu.Unlock()
+
+	// Then：可见失败（errCAProviderUnavailable），且未回退/未创建其它 CA 队列
+	if !errors.Is(enqueueErr, errCAProviderUnavailable) {
+		t.Fatalf("enqueue err=%v, want errCAProviderUnavailable", enqueueErr)
+	}
+	if !strings.Contains(enqueueErr.Error(), "已禁用") {
+		t.Fatalf("enqueue err=%q, want 点明「已禁用」", enqueueErr.Error())
+	}
+	if queues != 0 {
+		t.Fatalf("queues=%d, want 0（禁用提供商不得回退建队列）", queues)
+	}
+	var status, message string
+	var persistedProvider int
+	if err := database.QueryRow("SELECT status, COALESCE(message,''), COALESCE(ca_provider_id,0) FROM cert_jobs WHERE id=?", jobID).Scan(&status, &message, &persistedProvider); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if status != "failed" || !strings.Contains(message, "已禁用") {
+		t.Fatalf("job status=%q message=%q, want failed + 已禁用", status, message)
+	}
+	if persistedProvider != disabledID {
+		t.Fatalf("job provider=%d, want 保留原 ID %d（不得静默改派并持久化）", persistedProvider, disabledID)
+	}
+}
+
+func TestCAQueue_loadCAProvider_deleted_explicit_id_still_falls_back(t *testing.T) {
+	// Given：任务指向已删除的提供商（历史/导入残留），仍有启用提供商可延续
+	_, database := newClusterTestService(t)
+	var firstEnabled int
+	if err := database.QueryRow(`SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1`).Scan(&firstEnabled); err != nil {
+		t.Fatalf("read enabled provider: %v", err)
+	}
+	seedRuleWithCAProvider(t, "lb_deleted_ca", "deleted-ca.example.test", 0)
+	jobID := seedQueuedCertJob(t, "lb_deleted_ca", "deleted-ca.example.test", 9999)
+	manager := &CAQueueManager{
+		queues:       make(map[int]*caQueue),
+		active:       true,
+		blockedRules: map[string]map[RuleBlockToken]struct{}{},
+		reloader:     func() error { return nil },
+	}
+
+	// When
+	manager.mu.Lock()
+	enqueueErr := manager.enqueueLocked(9999, int(jobID), "lb_deleted_ca", "deleted-ca.example.test")
+	queues := len(manager.queues)
+	manager.mu.Unlock()
+
+	// Then：回退到首个启用提供商并持久化该 ID（用户裁定方案 A）
+	if enqueueErr != nil {
+		t.Fatalf("enqueue err=%v, want nil（已删除 ID 保留历史回退）", enqueueErr)
+	}
+	if queues != 1 {
+		t.Fatalf("queues=%d, want 1（按回退提供商建队列）", queues)
+	}
+	var persistedProvider int
+	if err := database.QueryRow("SELECT COALESCE(ca_provider_id,0) FROM cert_jobs WHERE id=?", jobID).Scan(&persistedProvider); err != nil {
+		t.Fatalf("read job provider: %v", err)
+	}
+	if persistedProvider != firstEnabled {
+		t.Fatalf("job provider=%d, want 回退 ID %d", persistedProvider, firstEnabled)
+	}
+	manager.Stop()
+}
+
+// SV历史问题/SV历史问题：CancelJob 必须与按规则取消同口径覆盖退役队列与僵尸任务
+// ——此前只扫 m.queues，退役/僵尸形态仅靠 ctx 已取消「碰巧安全」。
+func TestCancelJob_waits_for_retired_and_zombie_executions(t *testing.T) {
+	newClusterTestService(t)
+	manager := &CAQueueManager{
+		queues:       make(map[int]*caQueue),
+		active:       true,
+		zombieJobs:   make(map[int]zombieJob),
+		blockedRules: map[string]map[RuleBlockToken]struct{}{},
+	}
+	// 退役队列形态：MarkRetiredJobRunningForTest 登记 active+runningRules+cancels+done
+	done := manager.MarkRetiredJobRunningForTest("lb_retired_job", 42)
+
+	returned := make(chan struct{})
+	go func() {
+		manager.CancelJob(42)
+		close(returned)
+	}()
+	// Then 1：在途执行未退出前 CancelJob 不得返回
+	select {
+	case <-returned:
+		t.Fatal("CancelJob returned before retired execution finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(done)
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CancelJob did not return after retired execution finished")
+	}
+
+	// Given 2：僵尸形态（age-out 摘除退役条目后迁入 zombieJobs，执行仍悬挂）
+	zombieDone := make(chan struct{})
+	manager.mu.Lock()
+	manager.zombieJobs[43] = zombieJob{ruleID: "lb_zombie_job", done: zombieDone}
+	manager.mu.Unlock()
+	zombieReturned := make(chan struct{})
+	go func() {
+		manager.CancelJob(43)
+		close(zombieReturned)
+	}()
+	select {
+	case <-zombieReturned:
+		t.Fatal("CancelJob returned before zombie execution finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(zombieDone)
+	select {
+	case <-zombieReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CancelJob did not return after zombie execution finished")
+	}
 }

@@ -81,7 +81,9 @@ func New(secretID, secretKey string) (*Provider, error) {
 	}, nil
 }
 
-// Present creates or updates the _acme-challenge TXT record.
+// Present creates a distinct _acme-challenge TXT record (no upsert): a repeated
+// Present for the same name adds another record, and cleanup removes records by
+// ownership record ID / value (DNS-87-F8，历史).
 func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, ttl int) error {
 	zone = strings.TrimSuffix(zone, ".")
 	subDomain := strings.TrimSuffix(tokenFQDN, ".")

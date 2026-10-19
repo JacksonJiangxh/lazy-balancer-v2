@@ -6,10 +6,12 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -109,7 +111,7 @@ func TestBuildSnapshot_alwaysCarriesBranding(t *testing.T) {
 	svc, database := newClusterTestService(t)
 	database.Exec(`UPDATE global_config SET branding_json='{"app_name":"Y"}' WHERE id=1`)
 
-	snap, err := svc.SnapshotForTest(context.Background())
+	snap, err := svc.clusterSnapshotBypassingCache(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,5 +392,122 @@ func TestApplySnapshot_emptyWhitelistLandsEmptyString(t *testing.T) {
 	database.QueryRow(`SELECT COALESCE(mcp_ip_whitelist,'') FROM api_keys WHERE id=1`).Scan(&stored)
 	if stored != "" {
 		t.Fatalf("empty whitelist stored=%q, want empty string (not \"null\")", stored)
+	}
+}
+
+// S历史问题-01 家族收敛（R-12）：品牌落盘失败的审计同样按内容节流。
+func TestApplySnapshotBrandingChecked_throttlesRepeatedFailureAudit(t *testing.T) {
+	_, database := newClusterTestService(t)
+	sync := NewSyncService(database, nil, nil)
+	t.Cleanup(func() { unregisterSyncDrainer(sync) })
+	// 确定性失败：非对象 JSON 会被 MaterializeBranding 拒绝（错误串固定，
+	// 不含临时文件随机名——节流键=动作+类别+错误内容）。
+	cfg := &config.Config{DataDir: t.TempDir()}
+	for range 2 {
+		if err := sync.applySnapshotBrandingChecked(cfg, `[1,2]`); err == nil {
+			t.Fatal("non-object branding JSON must be rejected")
+		}
+	}
+	if got := countAuditRows(t, db.AuditDB, "同步失败", "集群同步"); got != 1 {
+		t.Fatalf("repeated branding failures wrote %d audit rows, want 1 (throttle)", got)
+	}
+}
+
+// brandingMirrorProbe 是 S历史问题-05 零写断言的观测驱动：记录 UPDATE 执行次数，
+// 并让镜像列预读返回指定内容（与文件内容一致时应完全不执行写语句）。
+type brandingMirrorProbe struct {
+	execCount atomic.Int32
+	content   string
+}
+
+func (probe *brandingMirrorProbe) Connect(context.Context) (driver.Conn, error) {
+	return brandingMirrorProbeConn{probe: probe}, nil
+}
+func (probe *brandingMirrorProbe) Driver() driver.Driver {
+	return brandingMirrorProbeDriver{probe: probe}
+}
+
+type brandingMirrorProbeDriver struct{ probe *brandingMirrorProbe }
+
+func (d brandingMirrorProbeDriver) Open(string) (driver.Conn, error) {
+	return brandingMirrorProbeConn{probe: d.probe}, nil
+}
+
+type brandingMirrorProbeConn struct{ probe *brandingMirrorProbe }
+
+func (brandingMirrorProbeConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("unexpected Prepare")
+}
+func (brandingMirrorProbeConn) Close() error              { return nil }
+func (brandingMirrorProbeConn) Begin() (driver.Tx, error) { return nil, errors.New("unexpected Begin") }
+func (conn brandingMirrorProbeConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+	conn.probe.execCount.Add(1)
+	return driver.RowsAffected(1), nil
+}
+func (conn brandingMirrorProbeConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
+	return &brandingMirrorProbeRows{content: conn.probe.content}, nil
+}
+
+type brandingMirrorProbeRows struct {
+	content string
+	done    bool
+}
+
+func (*brandingMirrorProbeRows) Columns() []string { return []string{"branding_json"} }
+func (*brandingMirrorProbeRows) Close() error      { return nil }
+func (rows *brandingMirrorProbeRows) Next(dest []driver.Value) error {
+	if rows.done {
+		return io.EOF
+	}
+	rows.done = true
+	dest[0] = rows.content
+	return nil
+}
+
+// S历史问题-05：内容未变时零写（先读短路），且显式库句柄决定落点。
+func TestRefreshBrandingMirrorDB_zeroWriteWhenUnchanged(t *testing.T) {
+	newClusterTestService(t)
+	dir := t.TempDir()
+	if _, err := db.DB.Exec("UPDATE global_config SET is_master=1 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	content := `{"app_name":"A"}`
+	if err := os.WriteFile(filepath.Join(dir, "branding.json"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := RefreshBrandingMirror(dir); err != nil || !changed {
+		t.Fatalf("first mirror changed=%v err=%v", changed, err)
+	}
+	if changed, err := RefreshBrandingMirror(dir); err != nil || changed {
+		t.Fatalf("unchanged mirror changed=%v err=%v", changed, err)
+	}
+
+	// 观测驱动：镜像列与文件内容一致 → 不得执行任何 UPDATE。
+	same := &brandingMirrorProbe{content: content}
+	sameDB := sql.OpenDB(same)
+	t.Cleanup(func() { _ = sameDB.Close() })
+	if changed, err := RefreshBrandingMirrorDB(sameDB, dir); err != nil || changed {
+		t.Fatalf("unchanged mirror on probe handle changed=%v err=%v", changed, err)
+	}
+	if got := same.execCount.Load(); got != 0 {
+		t.Fatalf("unchanged mirror executed %d UPDATE statement(s), want 0 (read short-circuit)", got)
+	}
+
+	// 镜像列不同 → 必须执行一次 UPDATE，且落点是指定句柄而非全局 db.DB。
+	stale := &brandingMirrorProbe{content: `{"app_name":"old"}`}
+	staleDB := sql.OpenDB(stale)
+	t.Cleanup(func() { _ = staleDB.Close() })
+	if changed, err := RefreshBrandingMirrorDB(staleDB, dir); err != nil || !changed {
+		t.Fatalf("stale mirror on probe handle changed=%v err=%v", changed, err)
+	}
+	if got := stale.execCount.Load(); got != 1 {
+		t.Fatalf("stale mirror executed %d UPDATE statement(s), want 1", got)
+	}
+	var globalMirrored string
+	if err := db.DB.QueryRow("SELECT COALESCE(branding_json,'') FROM global_config WHERE id=1").Scan(&globalMirrored); err != nil {
+		t.Fatal(err)
+	}
+	if globalMirrored != content {
+		t.Fatalf("explicit handle mirror leaked into global DB: %q", globalMirrored)
 	}
 }

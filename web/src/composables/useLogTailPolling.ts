@@ -13,7 +13,7 @@
 // 触发），避免 composable 与 Vue 生命周期耦合（A85WT-历史问题 同口径）。
 import { nextTick, ref, type Ref } from 'vue'
 
-export interface LogTailPollingOptions {
+interface LogTailPollingOptions {
   /** 轮询间隔（毫秒；调用方自管定时器时仅作文档值） */
   interval: number
   /** 单次取数：返回日志全文；返回 null 表示本轮不写回（守卫未过/迟到响应） */
@@ -28,7 +28,7 @@ export interface LogTailPollingOptions {
   onError?: (error: unknown) => void
 }
 
-export interface LogTailPolling {
+interface LogTailPolling {
   /** 单飞 loading 门（模板刷新按钮 loading 态同源） */
   readonly loading: Ref<boolean>
   /** 手动刷新一轮（受 hidden/loading/isActive 门控） */

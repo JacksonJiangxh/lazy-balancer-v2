@@ -7,6 +7,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"strings"
@@ -476,4 +477,86 @@ func TestClusterService_Snapshot_badRuleDomainSkipsCandidateInsteadOfFailing(t *
 	if strings.Count(message, "lb_bad_domain") != 1 || !strings.Contains(message, "993") {
 		t.Fatalf("warning output=%q, want 恰好一次包含规则与 job ID 的限频告警", message)
 	}
+}
+
+// S历史问题-02：apply 基线只装载消费面——无 WafFiles（不再全树 tar.gz+sha256），
+// 三节哈希与漂移守卫同口径，证书轴/ACME ownership 齐全。
+func TestClusterSnapshotForApply_skipsWafFileTreeHash(t *testing.T) {
+	service, _ := newClusterTestService(t)
+	ctx := context.Background()
+
+	previous, err := service.clusterSnapshotForApply(ctx)
+	if err != nil {
+		t.Fatalf("build apply baseline: %v", err)
+	}
+	if previous.WafFiles != nil {
+		t.Fatal("apply baseline must not build WafFiles (BuildWafFileRef is not consumed by apply)")
+	}
+	if previous.LockedUsers != nil || previous.NodeSites != nil {
+		t.Fatal("apply baseline must not load locked users / node sites")
+	}
+	if previous.ACME == nil {
+		t.Fatal("apply baseline must carry ACME ownership for restore")
+	}
+	if previous.Certs == nil {
+		t.Fatal("apply baseline must carry certificate axis")
+	}
+	hashes, err := service.driftGuardSectionHashes(ctx)
+	if err != nil {
+		t.Fatalf("drift guard hashes: %v", err)
+	}
+	for _, key := range driftGuardSections {
+		if previous.SectionHashes[key] != hashes[key] {
+			t.Fatalf("section %s hash parity broken: apply=%q drift=%q", key, previous.SectionHashes[key], hashes[key])
+		}
+	}
+}
+
+// S历史问题-10（verify，契约钉死）：证书轴只镜像启用规则的 ACME 证书。
+func TestSnapshotCertificates_mirrorsOnlyEnabledRules(t *testing.T) {
+	service, database := newClusterTestService(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	certPEM, keyPEM := certificatePairForDomains(t, now.Add(-time.Hour), now.Add(24*time.Hour), "enabled.example.com")
+	disabledCertPEM, disabledKeyPEM := certificatePairForDomains(t, now.Add(-time.Hour), now.Add(24*time.Hour), "disabled.example.com")
+	seedSnapshotCertificate(t, database, "lb_enabled", "enabled.example.com", "enabled.example.com", certPEM, keyPEM, now.Add(24*time.Hour), 501)
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enable_tls,tls_source,acme_config_id,ca_provider_id,enabled) VALUES ('lb_disabled','lb_disabled','http','disabled.example.com',443,1,'acme_dns',11,7,0)`); err != nil {
+		t.Fatal(err)
+	}
+	seedSnapshotCertificateJob(t, database, "lb_disabled", "disabled.example.com", disabledCertPEM, disabledKeyPEM, now.Add(24*time.Hour), 502)
+
+	certs, err := service.snapshotCertificates(ctx, database)
+	if err != nil {
+		t.Fatalf("snapshot certificates: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, cert := range certs {
+		seen[cert.RuleID] = true
+	}
+	if !seen["lb_enabled"] {
+		t.Fatalf("enabled rule certificate missing: %#v", seen)
+	}
+	if seen["lb_disabled"] {
+		t.Fatal("disabled rule certificate must not be mirrored (S历史问题-10 contract)")
+	}
+}
+
+// clusterSnapshotBypassingCache 绕过共享快照缓存，直接从数据库全量重建快照
+// （含 BuildWafFileRef 与证书解析）。缓存键为 cluster_version/所有权/开关，
+// 本地写入（如 users.last_login）不会递增 cluster_version——测试需要真实库
+// 状态时必须走本函数，不能命中 cachedSnapshot。
+func (s *ClusterService) clusterSnapshotBypassingCache(ctx context.Context) (models.ClusterSnapshot, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return models.ClusterSnapshot{}, fmt.Errorf("开启集群快照事务: %w", err)
+	}
+	defer tx.Rollback()
+	snapshot, err := s.buildFullSnapshot(ctx, tx)
+	if err != nil {
+		return models.ClusterSnapshot{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return models.ClusterSnapshot{}, fmt.Errorf("提交集群快照事务: %w", err)
+	}
+	return snapshot, nil
 }

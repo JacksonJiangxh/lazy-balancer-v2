@@ -50,7 +50,7 @@ func TestGetCurrentCertJobs_rejects_more_than_200_rule_ids(t *testing.T) {
 }
 
 func TestCertJobRetryBlocked_rejects_disabled_job_without_timestamp(t *testing.T) {
-	blocked, statusCode, _ := certJobRetryBlocked("disabled", sql.NullTime{}, time.Now())
+	blocked, statusCode, _ := certJobRetryBlocked("disabled", sql.NullTime{}, sql.NullTime{}, time.Now())
 	if !blocked {
 		t.Fatal("disabled job retry was allowed")
 	}
@@ -68,7 +68,7 @@ func TestCertJobRetryBlocked_downloaded_job_uses_deployment_message(t *testing.T
 	now := time.Now()
 
 	// When
-	blocked, _, message := certJobRetryBlocked("downloaded", sql.NullTime{Time: now.Add(-time.Minute), Valid: true}, now)
+	blocked, _, message := certJobRetryBlocked("downloaded", sql.NullTime{Time: now.Add(-time.Minute), Valid: true}, sql.NullTime{Time: now.Add(-time.Hour), Valid: true}, now)
 
 	// Then：仍被拦截（部署窗口守卫不变），但文案单列
 	if !blocked {
@@ -994,5 +994,184 @@ func TestListCertJobs_returnsStatusCountsForQueueBanner(t *testing.T) {
 	}
 	if body.Data.StatusCounts["queued"] != 2 || body.Data.StatusCounts["waiting_ca"] != 1 || body.Data.StatusCounts["issued"] != 1 {
 		t.Fatalf("status_counts=%v", body.Data.StatusCounts)
+	}
+}
+
+// 历史问题（历史 历史问题，锁序并发回归）：DeleteCertJob 删除失败的恢复分支曾在
+// 持有 per-job operationLock 时反向获取 caddyOpMu——与入口锁序
+// （caddyOpMu→operationLock）构成 AB-BA：同 id 连点/同桶（id%64）并发删除
+// 先取到 caddyOpMu 后在桶锁排队，双向互等且 caddyOpMu 被永久占用（规则/配置
+// 写与 Caddy 启停全部挂起）。本测试用 cancelCertJob 阻塞窗确定性复现：
+//
+//	T1（删除失败，恢复前）此时只持 operationLock；
+//	T2 按入口锁序先持 caddyOpMu，再请求同一把 operationLock。
+//
+// 修复前 T1 继续反向取 caddyOpMu → 死锁（5s 超时失败）；修复后 T1 先释放
+// per-job 锁再按规范顺序重取，两者依次完成且行按恢复语义落库。
+func TestA87DeleteCertJob_recoveryKeepsCanonicalLockOrder(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status) VALUES ('lb_lockorder','lockorder.example.test','issued');
+		CREATE TRIGGER fail_lockorder_delete BEFORE DELETE ON cert_jobs BEGIN SELECT RAISE(ABORT,'delete failed'); END`); err != nil {
+		t.Fatalf("seed lock-order job: %v", err)
+	}
+
+	cancelEntered := make(chan struct{})
+	allowCancelReturn := make(chan struct{})
+	oldCancel := cancelCertJob
+	cancelCertJob = func(int) {
+		close(cancelEntered)
+		<-allowCancelReturn
+	}
+	t.Cleanup(func() { cancelCertJob = oldCancel })
+
+	router := gin.New()
+	router.DELETE("/jobs/:id", h.DeleteCertJob)
+	firstDone := make(chan int, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/jobs/1", nil))
+		firstDone <- response.Code
+	}()
+	select {
+	case <-cancelEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("DeleteCertJob 未到达取消点（夹具前置失败）")
+	}
+
+	// T2：与入口同锁序（caddyOpMu → operationLock）的同桶并发操作。
+	secondEntered := make(chan struct{})
+	secondReleased := make(chan struct{})
+	go func() {
+		h.caddyOpMu.Lock()
+		close(secondEntered)
+		lock := certJobOperationLock(1)
+		lock.Lock()
+		lock.Unlock()
+		h.caddyOpMu.Unlock()
+		close(secondReleased)
+	}()
+	select {
+	case <-secondEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("并发方未取得 caddyOpMu（夹具前置失败）")
+	}
+	// 给 T2 足够时间排到桶锁上——修复前 T1 解阻后会在此反向取 caddyOpMu。
+	time.Sleep(50 * time.Millisecond)
+	close(allowCancelReturn)
+
+	select {
+	case code := <-firstDone:
+		if code != http.StatusInternalServerError {
+			t.Fatalf("status=%d, want 500（删除失败）", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("DeleteCertJob 恢复分支死锁：在持 operationLock 时等待 caddyOpMu（AB-BA）")
+	}
+	select {
+	case <-secondReleased:
+	case <-time.After(5 * time.Second):
+		t.Fatal("并发同桶操作未完成：caddyOpMu 被恢复分支永久占用")
+	}
+
+	var status string
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=1").Scan(&status); err != nil {
+		t.Fatalf("job row missing after failed delete: %v", err)
+	}
+	if status != "issued" {
+		t.Fatalf("status=%q, want issued（删除失败按原状态恢复）", status)
+	}
+}
+
+// 历史问题（历史 历史问题，verify→fixed）：cert_jobs.updated_at 在 DDL 中可空
+// （internal/db/db.go 建表语句），NULL 时重试冷却门曾直接放行（fail-open）：
+// 历史行/带外插入的 queued/failed 任务可连点绕过 15/5 分钟冷却、连续消耗
+// CA 配额。修复：updated_at 无效时回退 created_at 计算；两列都缺失时
+// fail-closed（视为刚更新，按冷却拒绝）。
+func TestCertJobRetryBlocked_updatedAtNullFallsBackToCreatedAt(t *testing.T) {
+	now := time.Now()
+	// 目标形状：updated_at=NULL 且 created_at 刚写入 → 仍受 15 分钟冷却。
+	blocked, statusCode, _ := certJobRetryBlocked("queued", sql.NullTime{}, sql.NullTime{Time: now.Add(-time.Minute), Valid: true}, now)
+	if !blocked || statusCode != http.StatusTooManyRequests {
+		t.Fatalf("blocked=%v status=%d, want true/429（NULL updated_at 不得放行冷却）", blocked, statusCode)
+	}
+	// 回归形状：updated_at 有效时以 updated_at 为准（created_at 很老也不提前放行）。
+	blocked, _, _ = certJobRetryBlocked("failed", sql.NullTime{Time: now.Add(-time.Minute), Valid: true}, sql.NullTime{Time: now.Add(-time.Hour), Valid: true}, now)
+	if !blocked {
+		t.Fatal("updated_at 有效且未过冷却时必须拦截（不得回退 created_at）")
+	}
+	// fail-closed 形状：两列都缺失 → 视为冷却中（不得因缺时间戳立即放行）。
+	blocked, statusCode, _ = certJobRetryBlocked("queued", sql.NullTime{}, sql.NullTime{}, now)
+	if !blocked || statusCode != http.StatusTooManyRequests {
+		t.Fatalf("blocked=%v status=%d, want true/429（缺时间戳 fail-closed）", blocked, statusCode)
+	}
+	// 回归形状：updated_at=NULL 但 created_at 已过冷却 → 放行。
+	blocked, _, _ = certJobRetryBlocked("queued", sql.NullTime{}, sql.NullTime{Time: now.Add(-30 * time.Minute), Valid: true}, now)
+	if blocked {
+		t.Fatal("created_at 已过冷却时必须放行（不得永久锁死历史行）")
+	}
+}
+
+// 历史问题-01（历史）：导入会话持写事务且 CA 队列已 PauseAndDrain——证书
+// 任务重试的 UPDATE 会阻塞写锁到 busy_timeout（500）或落到已被全量替换的
+// cert_jobs 行。RetryCertJob 端点与任务监控 cert-job 触发分支共用重试核心，
+// 两侧都必须在写任何行之前 409 fast-fail。
+func TestRetryCertJobBlockedDuringConfigImport(t *testing.T) {
+	newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
+		VALUES ('lb_imp','imp','http','imp.example.test',8080,1,1,'acme_dns');
+		INSERT INTO cert_jobs (rule_id,domain,status,message,updated_at)
+		VALUES ('lb_imp','imp.example.test','failed','原失败原因',datetime('now','-10 minutes'))`); err != nil {
+		t.Fatalf("seed cert job: %v", err)
+	}
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	router := gin.New()
+	router.POST("/jobs/:id/retry", h.RetryCertJob)
+	router.POST("/system/tasks/:id/trigger", h.TriggerSystemTask)
+
+	// 模拟导入会话持锁（configImportBusy 的探测对象）。
+	configImportBeginMu.Lock()
+	defer configImportBeginMu.Unlock()
+
+	for _, tc := range []struct{ name, path string }{
+		{"RetryCertJob 端点", "/jobs/1/retry"},
+		{"任务监控 cert-job 触发分支", "/system/tasks/cert-job:1/trigger"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, tc.path, nil))
+			if recorder.Code != http.StatusConflict {
+				t.Fatalf("status=%d body=%s, want 409（导入窗口必须 fast-fail）", recorder.Code, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), "配置导入进行中") {
+				t.Fatalf("body=%s, want 导入窗口文案族", recorder.Body.String())
+			}
+		})
+	}
+
+	// 零写库：状态/消息均未被改动（重试可能迁移状态或推进部署窗）。
+	var status, message string
+	if err := db.DB.QueryRow(`SELECT status, COALESCE(message,'') FROM cert_jobs WHERE id=1`).Scan(&status, &message); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if status != "failed" || message != "原失败原因" {
+		t.Fatalf("导入窗口内 job 被改写: status=%q message=%q", status, message)
+	}
+}
+
+// 历史问题-01 回归形状：非导入窗口内同一入口不被误拦（门只在 busy 时生效）。
+func TestRetryCertJobNotBlockedWhenNoImport(t *testing.T) {
+	newBackupTestHandlers(t)
+	h := &Handlers{}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/jobs/:id/retry", h.RetryCertJob)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/jobs/999/retry", nil))
+	if recorder.Code == http.StatusConflict {
+		t.Fatalf("无导入会话时不得 409 导入窗口文案: body=%s", recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "配置导入进行中") {
+		t.Fatalf("无导入会话时命中导入窗口门: body=%s", recorder.Body.String())
 	}
 }

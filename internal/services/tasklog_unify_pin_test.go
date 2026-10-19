@@ -181,3 +181,28 @@ func TestCollectCertJobRows_oldTerminalStillShown(t *testing.T) {
 		t.Fatal("超 1 天的 issued 行仍应显示（存在即显示）")
 	}
 }
+
+// V87-TO-06：读库失败的回退值不得写入缓存——DB 瞬时不可用时任务日志此前按
+// 10MB 滚动并钉死整个 5 分钟窗口（审计侧同职责缓存已按「失败不缓存」实现）。
+func TestGetTaskLogSizeBytes_readFailureNotCached(t *testing.T) {
+	initServicesDB(t)
+	t.Cleanup(InvalidateTaskLogSizeCache)
+	if _, err := db.DB.Exec(`UPDATE global_config SET task_log_size_mb=20 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	InvalidateTaskLogSizeCache()
+
+	// 读库失败形态（表暂时不可用）——回退 10MB 当轮生效，不得进缓存
+	if _, err := db.DB.Exec(`ALTER TABLE global_config RENAME TO global_config_v87_to06`); err != nil {
+		t.Fatal(err)
+	}
+	if got := getTaskLogSizeBytes(); got != 10<<20 {
+		t.Fatalf("读库失败降级=%d, want 10MB", got)
+	}
+	if _, err := db.DB.Exec(`ALTER TABLE global_config_v87_to06 RENAME TO global_config`); err != nil {
+		t.Fatal(err)
+	}
+	if got := getTaskLogSizeBytes(); got != 20<<20 {
+		t.Fatalf("读库恢复后阈值=%d, want 20MB（失败的 10MB 回退值被缓存钉死整窗口）", got)
+	}
+}

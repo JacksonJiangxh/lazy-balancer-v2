@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -146,6 +147,10 @@ func GenerateCaddyID() (string, error) {
 }
 
 // ApplyConfig pushes configuration to Caddy
+// 调用方 MUST 已持有 CaddyOpLock（与 GenerateAndApplyConfig 同契约，S历史问题）：
+// 本函数仅持 s.mu 保护 CaddyService 内部状态；跨层互斥（与后台重载/其他写路径
+// 的 apply→commit 窗口）由调用方的 CaddyOpLock 临界区承担——生产调用点
+// （handlers 写路径 / cluster_apply）均全程持锁，函数内自取锁会重入死锁。
 func (s *CaddyService) ApplyConfig(config map[string]interface{}) (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -308,6 +313,10 @@ func (s *CaddyService) applyConfigLocked(config map[string]interface{}, persistD
 
 // ApplyConfigForce 与 ApplyConfig 同语义，但强制 Caddy 重载（Cache-Control:
 // must-revalidate）——供数据类更新路径与测试使用。
+// 调用方 MUST 已持有 CaddyOpLock（S历史问题）：当前唯一生产调用方
+// （cluster_apply.go 的同步应用路径）在锁内；本函数仅持 s.mu，新增调用方漏锁会
+// 重现 历史问题 的 apply→commit 混合态窗口。已持锁调用方不得再经
+// GenerateAndApplyConfigForce 自取锁（重入死锁）。
 func (s *CaddyService) ApplyConfigForce(config map[string]interface{}) (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -529,19 +538,55 @@ func execCaddyValidate(rendered []byte) error {
 	tmp.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), caddyCLIValidateTimeout)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, "caddy", "validate", "--config", tmpPath).CombinedOutput()
+	// S历史问题：输出收集侧有界——异常巨量输出（病态配置/插件刷屏）不得无界驻留
+	// 内存；超出上限的字节继续读取但不保留。
+	output := &cappedOutputBuffer{limit: caddyValidateOutputLimit}
+	cmd := exec.CommandContext(ctx, "caddy", "validate", "--config", tmpPath)
+	cmd.Stdout = output
+	cmd.Stderr = output
+	err = cmd.Run()
 	if err != nil {
 		if ctx.Err() != nil || errors.Is(err, exec.ErrNotFound) {
 			return fmt.Errorf("%w: %v", ErrCLIValidatorUnavailable, err)
 		}
 		// caddy validate 以非零退出码表达「配置被拒」。
-		detail := truncateValidUTF8Tail(output)
-		if len(detail) > caddyErrorBodyMaxBytes {
-			detail = detail[:caddyErrorBodyMaxBytes]
-		}
-		return fmt.Errorf("caddy validate 拒绝配置: %s", string(detail))
+		return fmt.Errorf("caddy validate 拒绝配置: %s", string(boundedValidateDetail(output.buf.Bytes())))
 	}
 	return nil
+}
+
+// caddyValidateOutputLimit 是 execCaddyValidate 收集子进程输出的上限：错误详情
+// 只保留 caddyErrorBodyMaxBytes，额外留一个 rune 的余量，使「先按上限切字节→
+// 再归一到 UTF-8 边界」的尾 rune 回退有可用的合法字节序列。
+const caddyValidateOutputLimit = caddyErrorBodyMaxBytes + utf8.UTFMax
+
+// cappedOutputBuffer 是有界输出收集器（子进程 stdout/stderr 可用）。
+// Write 恒报告全额消费（短写会让子进程/管道误判），仅保留前 limit 字节。
+type cappedOutputBuffer struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (c *cappedOutputBuffer) Write(p []byte) (int, error) {
+	written := len(p)
+	if remain := c.limit - c.buf.Len(); remain > 0 {
+		if len(p) > remain {
+			p = p[:remain]
+		}
+		c.buf.Write(p)
+	}
+	return written, nil
+}
+
+// boundedValidateDetail 生成嵌入 error 的校验输出详情：先按上限切字节、再回退
+// 到合法 UTF-8 边界（S历史问题，与 jobstate.go 消息截断、readCaddyErrorBody 同序
+// ——先归一再按固定字节位硬切会把切口落在多字节字符中间，序列化后成为 U+FFFD
+// 残片）。
+func boundedValidateDetail(output []byte) []byte {
+	if len(output) > caddyErrorBodyMaxBytes {
+		output = output[:caddyErrorBodyMaxBytes]
+	}
+	return truncateValidUTF8Tail(output)
 }
 
 // ErrUnvalidatedApply 标记「应用失败时配置未经过任何 Caddy 级校验」（CLI
@@ -824,6 +869,34 @@ func cloneUpstreamHealthDetails(src map[string]map[string]*UpstreamHealthDetail)
 // metrics 缺失=空表，config 读取失败=错误（不静默空表）。
 var upstreamHealthAggregateTimeout = 10 * time.Second
 
+// upstreamDetailFor 由被动指标与主动健康观测推导单个上游的展示明细——
+// HTTP 静态上游 / 动态上游 / layer4 三段共用此单源（S历史问题：原三份逐字
+// 重复的推导副本，健康语义修订需改三处且易漂移）。
+func upstreamDetailFor(dial string, metrics map[string]*upstreamMetric, health map[string]bool, dynamic bool) *UpstreamHealthDetail {
+	detail := &UpstreamHealthDetail{Dynamic: dynamic}
+	if metric, ok := metrics[dial]; ok && metric != nil {
+		detail.NumRequests = metric.NumRequests
+		detail.Fails = metric.Fails
+	}
+	if observedHealthy, ok := health[dial]; ok {
+		// Caddy reports a definitive health status for this upstream.
+		detail.Healthy = observedHealthy
+		// Passive circuit breakers forget failures after the fail window, so the
+		// gauge flaps back to healthy while the upstream is still erroring;
+		// surface that as degraded.
+		if observedHealthy && detail.Fails > 0 {
+			detail.Degraded = true
+		}
+	} else if detail.Fails > 0 {
+		// Passive health observed failures.
+		detail.Healthy = false
+	} else {
+		// No observation from Caddy at all.
+		detail.Unknown = true
+	}
+	return detail
+}
+
 func (s *CaddyService) getUpstreamHealthDetailedUncached() (map[string]map[string]*UpstreamHealthDetail, error) {
 	healthStatus := make(map[string]map[string]*UpstreamHealthDetail)
 
@@ -908,31 +981,7 @@ func (s *CaddyService) getUpstreamHealthDetailedUncached() (map[string]map[strin
 									continue
 								}
 
-								detail := &UpstreamHealthDetail{}
-
-								if metrics, ok := upstreamMetrics[dial]; ok {
-									detail.NumRequests = metrics.NumRequests
-									detail.Fails = metrics.Fails
-								}
-
-								if observedHealthy, ok := upstreamHealth[dial]; ok {
-									// Caddy reports a definitive health status for this upstream.
-									detail.Healthy = observedHealthy
-									// Passive circuit breakers forget failures after the fail
-									// window, so the gauge flaps back to healthy while the
-									// upstream is still erroring; surface that as degraded.
-									if observedHealthy && detail.Fails > 0 {
-										detail.Degraded = true
-									}
-								} else if detail.Fails > 0 {
-									// Passive health observed failures.
-									detail.Healthy = false
-								} else {
-									// No observation from Caddy at all.
-									detail.Unknown = true
-								}
-
-								healthStatus[serverName][dial] = detail
+								healthStatus[serverName][dial] = upstreamDetailFor(dial, upstreamMetrics, upstreamHealth, false)
 							}
 						}
 
@@ -946,25 +995,7 @@ func (s *CaddyService) getUpstreamHealthDetailedUncached() (map[string]map[strin
 								// 而非误导性的「未知」)。查找保持原样(命中即附带数据)。
 								dial := net.JoinHostPort(name, port)
 
-								detail := &UpstreamHealthDetail{Dynamic: true}
-
-								if metrics, ok := upstreamMetrics[dial]; ok {
-									detail.NumRequests = metrics.NumRequests
-									detail.Fails = metrics.Fails
-								}
-
-								if observedHealthy, ok := upstreamHealth[dial]; ok {
-									detail.Healthy = observedHealthy
-									if observedHealthy && detail.Fails > 0 {
-										detail.Degraded = true
-									}
-								} else if detail.Fails > 0 {
-									detail.Healthy = false
-								} else {
-									detail.Unknown = true
-								}
-
-								healthStatus[serverName][dial] = detail
+								healthStatus[serverName][dial] = upstreamDetailFor(dial, upstreamMetrics, upstreamHealth, true)
 							}
 						}
 					}
@@ -1014,26 +1045,17 @@ func (s *CaddyService) getUpstreamHealthDetailedUncached() (map[string]map[strin
 							if !ok || len(dialList) == 0 {
 								continue
 							}
-							dial, _ := dialList[0].(string)
-							if dial == "" {
-								continue
-							}
-							detail := &UpstreamHealthDetail{}
-							if metrics, ok := upstreamMetrics[dial]; ok {
-								detail.NumRequests = metrics.NumRequests
-								detail.Fails = metrics.Fails
-							}
-							if observedHealthy, ok := upstreamHealth[dial]; ok {
-								detail.Healthy = observedHealthy
-								if observedHealthy && detail.Fails > 0 {
-									detail.Degraded = true
+							// S历史问题：layer4 upstream 的 dial 是数组——遍历全部条目
+							// 逐个导出健康明细（原实现只取 dialList[0]，带外/外来
+							// 多 peer 配置的其余 peer 静默漏报）。本产品渲染恒单 dial，
+							// 常规路径形状不变。
+							for _, dialValue := range dialList {
+								dial, _ := dialValue.(string)
+								if dial == "" {
+									continue
 								}
-							} else if detail.Fails > 0 {
-								detail.Healthy = false
-							} else {
-								detail.Unknown = true
+								healthStatus[serverName][dial] = upstreamDetailFor(dial, upstreamMetrics, upstreamHealth, false)
 							}
-							healthStatus[serverName][dial] = detail
 						}
 					}
 				}
@@ -1676,12 +1698,9 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		HealthCheckHealthyThreshold   int
 		EnableTLS                     bool
 		TLSSource                     string
-		ACMEConfigID                  int
-		ACMEEmail                     string
 		TLSCert                       string
 		TLSKey                        string
 		TLSHTTPRedirect               bool
-		Enabled                       bool
 		EnableCompress                bool
 		CompressTypes                 string
 		EnableActiveHealthCheck       bool
@@ -1735,9 +1754,9 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		       IIF(dynamic_dns IN ('1',1),1,0), IIF(enable_dns_server IN ('1',1),1,0), COALESCE(dns_server,''), COALESCE(dns_family,'ipv4'),
 		       COALESCE(health_check_path,''), health_check_interval,
 		       health_check_timeout, health_check_unhealthy_threshold, health_check_healthy_threshold,
-		       IIF(enable_tls IN ('1',1),1,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(tls_cert,''), COALESCE(tls_key,''),
+		       IIF(enable_tls IN ('1',1),1,0), COALESCE(tls_source,'manual'), COALESCE(tls_cert,''), COALESCE(tls_key,''),
 		       IIF(tls_http_redirect IN ('1',1),1,0),
-		       IIF(enabled IN ('1',1),1,0), IIF(enable_compress IN ('1',1),1,0), COALESCE(compress_types,'gzip'),
+		       IIF(enable_compress IN ('1',1),1,0), COALESCE(compress_types,'gzip'),
 		       IIF(enable_active_health_check IN ('1',1),1,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), tcp_try_interval,
 	       COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0), COALESCE(host_header,''), COALESCE(health_check_host,''),
 		       IIF(log_enabled IN ('1',1),1,0), IIF(custom_routes_enabled IN ('1',1),1,0),
@@ -1756,8 +1775,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		err := rows.Scan(&r.CaddyID, &r.Name, &r.Protocol, &r.Domain, &r.ListenPort, &r.Strategy,
 			&r.DynamicDNS, &r.EnableDnsServer, &r.DnsServer, &r.DnsFamily, &r.HealthCheckPath, &r.HealthCheckInterval,
 			&r.HealthCheckTimeout, &r.HealthCheckUnhealthyThreshold, &r.HealthCheckHealthyThreshold,
-			&r.EnableTLS, &r.TLSSource, &r.ACMEConfigID, &r.TLSCert, &r.TLSKey,
-			&r.TLSHTTPRedirect, &r.Enabled, &r.EnableCompress, &r.CompressTypes,
+			&r.EnableTLS, &r.TLSSource, &r.TLSCert, &r.TLSKey,
+			&r.TLSHTTPRedirect, &r.EnableCompress, &r.CompressTypes,
 			&r.EnableActiveHealthCheck, &r.TCPHealthCheckPort, &r.TCPProxyProtocol, &r.TCPTryDuration, &r.TCPTryInterval,
 			&r.RequestBodyMaxSizeMB, &r.UpstreamKeepaliveTimeout, &r.ServerTokensHidden, &r.NTLMCompatible, &r.UpstreamForceHTTP1, &r.HostHeader, &r.HealthCheckHost, &r.LogEnabled,
 			&r.CustomRoutesEnabled, &r.ProxyDialTimeout, &r.ProxyResponseHeaderTimeout,
@@ -1882,6 +1901,11 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 				closeErr := certRows.Close()
 				return generationFailure("读取 ACME 证书阶段解析失败: %v", errors.Join(scanErr, closeErr))
 			}
+			// SV历史问题：装载阶段统一预解析（disabled 候选由 SelectCertificate
+			// 直接跳过，无需付解析成本），选择/后续复用走 Leaf 快路径。
+			if candidate.Status != "disabled" {
+				candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
+			}
 			acmeCerts[ruleID] = append(acmeCerts[ruleID], candidate)
 		}
 		if rowsErr := certRows.Err(); rowsErr != nil {
@@ -1952,7 +1976,6 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		}
 	}
 
-	var dnsProvider, acmeEmail string
 	var caddyLogLevel string
 	var caddyLogSizeMB int
 	var accessLogJSON bool
@@ -1963,15 +1986,17 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		proxyFlushInterval, proxyStreamCloseDelay                                                             int
 		serverTokensHidden                                                                                    bool
 	}
+	// S历史问题：dns_provider/acme_email 不参与 Caddy 渲染（签发链路 certissuer 侧
+	// 独立消费），渲染侧不再读列也不再接受 overrides 覆写——原读取+覆写后零消费
+	// 是死链，会让读者误判「改这两项会触发渲染」。
 	if err := store.QueryRow(`
-		SELECT COALESCE(dns_provider,''), COALESCE(acme_email,''),
-		       COALESCE(caddy_log_level,'info'), caddy_log_size_mb,
+		SELECT COALESCE(caddy_log_level,'info'), caddy_log_size_mb,
 		       request_body_max_size_mb, http_read_timeout, http_write_timeout,
 		       http_idle_timeout, COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,FALSE),
 		       COALESCE(access_log_json,TRUE), COALESCE(access_log_format,''), COALESCE(proxy_dial_timeout,0),
 		       COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0)
 		FROM global_config WHERE id = 1
-	`).Scan(&dnsProvider, &acmeEmail, &caddyLogLevel, &caddyLogSizeMB,
+	`).Scan(&caddyLogLevel, &caddyLogSizeMB,
 		&global.requestBodyMaxSizeMB, &global.httpReadTimeout, &global.httpWriteTimeout, &global.httpIdleTimeout,
 		&global.upstreamKeepaliveTimeout, &global.serverTokensHidden, &accessLogJSON, &accessLogFormat,
 		&global.proxyDialTimeout, &global.proxyResponseHeaderTimeout, &global.proxyReadTimeout, &global.proxyWriteTimeout,
@@ -2041,12 +2066,6 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		}
 		if o.AccessLogFormat != nil {
 			accessLogFormat = *o.AccessLogFormat
-		}
-		if o.DNSProvider != nil {
-			dnsProvider = *o.DNSProvider
-		}
-		if o.ACMEEmail != nil {
-			acmeEmail = *o.ACMEEmail
 		}
 	}
 
@@ -2150,7 +2169,6 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 				HealthCheckHealthyThreshold:    r.HealthCheckHealthyThreshold,
 				EnableTLS:                      r.EnableTLS,
 				TLSSource:                      r.TLSSource,
-				ACMEConfigID:                   r.ACMEConfigID,
 				TLSCert:                        r.TLSCert,
 				TLSKey:                         r.TLSKey,
 				TLSHTTPRedirect:                r.TLSHTTPRedirect,
@@ -2228,14 +2246,18 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		emittedSynthetic := make(map[string]struct{})
 		for _, ru := range rules {
 			r := ru.rule
+			// S历史问题：nil 上下文门必须在两个拦截页构建器之前——二者内部直接
+			// 解引用 securityCtx.blockPageByID（policiesForRule 虽支持 nil，但
+			// 页面查找不支持）。当前生产路径 loadSecurityPolicyContext 失败即
+			// generationFailure（ctx 恒非 nil），此门是未来调用点的 fail-safe。
+			if securityCtx == nil {
+				continue
+			}
 			if errorRoute := buildBlockPageErrorRoute(r.CaddyID, splitAndTrim(r.Domain), securityCtx); errorRoute != nil {
 				errorRoutes = append(errorRoutes, errorRoute)
 			}
 			if errorRoute := buildRateLimitErrorRoute(r.CaddyID, splitAndTrim(r.Domain), securityCtx); errorRoute != nil {
 				errorRoutes = append(errorRoutes, errorRoute)
-			}
-			if securityCtx == nil {
-				continue
 			}
 			// 阶段拦截页（规则级覆盖层）：规则配了阶段页（id>0 且页内容非空）→
 			// 发射 host 限定的阶段路由（481/482 + interruption 消息；terminal；
@@ -2669,7 +2691,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 					"output":       "file",
 					"filename":     RuleLogPath(r.CaddyID),
 					"roll_size_mb": caddyLogSizeMB,
-					"roll_keep":    5,
+					"roll_keep":    caddyLogRollKeep,
 				},
 				"encoder": encoder,
 				"include": []string{"http.log.access.rule_" + r.CaddyID},
@@ -2764,7 +2786,7 @@ func buildCaddyLogging(level string, sizeMB int) map[string]interface{} {
 			"output":       "file",
 			"filename":     filename,
 			"roll_size_mb": sizeMB,
-			"roll_keep":    5,
+			"roll_keep":    caddyLogRollKeep,
 		}
 	}
 	return map[string]interface{}{
@@ -2826,6 +2848,11 @@ func acmeCertCandidatesForRule(store caddyConfigStore, ruleID string) []Certific
 		if err := rows.Scan(&candidate.ID, &candidate.Domain, &candidate.Status, &candidate.CertPEM, &candidate.KeyPEM, &candidate.UpdatedAt); err != nil {
 			Logf("warn", "ACME 证书候选解析失败（规则 %s）: %v", ruleID, err)
 			return nil
+		}
+		// SV历史问题：与批量装载同口径预解析 Leaf（规则候选可能被
+		// loadACMECertificateFromStore 的多个消费点多轮选择）。
+		if candidate.Status != "disabled" {
+			candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
 		}
 		candidates = append(candidates, candidate)
 	}
@@ -2957,7 +2984,6 @@ type SingleRuleConfig struct {
 	HealthCheckHealthyThreshold    int
 	EnableTLS                      bool
 	TLSSource                      string
-	ACMEConfigID                   int
 	TLSCert                        string
 	TLSKey                         string
 	TLSHTTPRedirect                bool
@@ -4086,11 +4112,11 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		}
 		// 预检段耗时收点(2026-09-27 分段计时):预检之后、body/限流/WAF 之前——
 		// 摄取管道预检段事件取 :pre,WAF 段取 :end-:pre(隔离 WAF 评估成本)。
-		if rule.Protocol == "http" {
-			securityChain = append(securityChain, map[string]interface{}{
-				"handler": "lb_security_timing_pre",
-			})
-		}
+		// S历史问题：外层门已含 rule.Protocol=="http"，原嵌套同条件恒真已删；
+		// 未来若新增非 http 链，由外层门统一守卫。
+		securityChain = append(securityChain, map[string]interface{}{
+			"handler": "lb_security_timing_pre",
+		})
 	}
 
 	// R1(2026-09-10 审计):规则级压缩必须位于全部 waf 处理器之外侧(链序在前)

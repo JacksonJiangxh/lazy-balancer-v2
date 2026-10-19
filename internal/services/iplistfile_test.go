@@ -128,8 +128,11 @@ func TestWriteIPListFile_scopeCharsetGuard(t *testing.T) {
 	}
 }
 
-// 同字节跳写：内容一致的重投影（全量渲染重投影不动）不得重写文件——mtime
-// 保持不变（wafiplist stat 形态缓存命中，运行期匹配器零重建）。
+// 同字节跳写：内容一致的重投影（全量渲染重投影不动）不得重写文件——
+// wafiplist stat 形态缓存命中，运行期匹配器零重建。
+// SS87-历史问题：跳写判据用文件身份（os.SameFile）而非 mtime 相等——粗粒度
+// 文件系统下「重写但 mtime 未变」会让旧断言假绿；写入路径是同目录 tmp+
+// rename，真实重写必然换 inode。
 func TestWriteIPListFile_identicalContentSkipsWrite(t *testing.T) {
 	entries := []string{"203.0.113.9"}
 	path, err := writeIPListFile("u-skip", entries)
@@ -144,13 +147,24 @@ func TestWriteIPListFile_identicalContentSkipsWrite(t *testing.T) {
 	if _, err := writeIPListFile("u-skip", entries); err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
-	// Then：mtime 未变（未发生重写）
+	// Then：文件身份未变（未发生重写）
 	second, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !first.ModTime().Equal(second.ModTime()) {
-		t.Fatalf("同内容重投影不应重写文件: mtime %v → %v", first.ModTime(), second.ModTime())
+	if !os.SameFile(first, second) {
+		t.Fatalf("同内容重投影不应重写文件: inode 变化 %v → %v", first, second)
+	}
+	// 方法学对照：内容变化必须换文件身份，否则上面的断言无鉴别力
+	if _, err := writeIPListFile("u-skip", []string{"203.0.113.10"}); err != nil {
+		t.Fatalf("content change: %v", err)
+	}
+	third, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(second, third) {
+		t.Fatal("内容变化必须原子替换（inode 变化），SameFile 判定无鉴别力")
 	}
 }
 

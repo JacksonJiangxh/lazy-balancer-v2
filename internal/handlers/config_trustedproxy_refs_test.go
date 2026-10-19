@@ -240,3 +240,40 @@ func TestConfigBackup_trustedProxyRangeRefsRoundTrip(t *testing.T) {
 		t.Fatalf("imported trusted_proxy_range_refs=%q, want [903,907]", got)
 	}
 }
+
+// 历史问题（历史 历史问题）：引用展开计数曾按原始 len(entries) 累加，而逐条校验
+// 与渲染层都跳过空 value 条目——名单含空条目（带外改库/旧数据）时，实际
+// 展开 ≤2000 的合法载荷会被总量门 400 拒绝。钉：两侧（refs 载荷分支与
+// inline-only 存量分支）都只计通过校验的非空条目。
+func TestA87UpdateConfig_trustedProxyRefs_countsOnlyNonEmptyEntries(t *testing.T) {
+	router := newTrustedProxyRefsRouter(t)
+	entries := make([]string, 0, 2001)
+	for i := range 2000 {
+		entries = append(entries, fmt.Sprintf(`{"value":"10.1.%d.%d/24","remark":""}`, i/250, i%250))
+	}
+	entries = append(entries, `{"value":"","remark":"历史空条目"}`)
+	listID := seedTrustedRefList(t, "empties-ref-list", "["+strings.Join(entries, ",")+"]")
+
+	// 形状 1：refs 载荷分支——实际展开 2000 条（1 条空值跳过）→ 200。
+	body := fmt.Sprintf(`{"source":"caddy","trusted_proxy_ranges":"[]","trusted_proxy_range_refs":"[%d]"}`, listID)
+	if rec := putConfig(t, router, body); rec.Code != http.StatusOK {
+		t.Fatalf("refs 载荷：实际展开 2000 条（1 条空值跳过）必须 200, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 形状 2：inline-only 分支——存量 refs 展开同样只计非空条目 → 200。
+	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_range_refs=? WHERE id=1`, fmt.Sprintf("[%d]", listID)); err != nil {
+		t.Fatal(err)
+	}
+	inlineOnly := `{"source":"caddy","trusted_proxy_ranges":"[]"}`
+	if rec := putConfig(t, router, inlineOnly); rec.Code != http.StatusOK {
+		t.Fatalf("inline-only：存量展开 2000 条（1 条空值跳过）必须 200, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 回归形状：多出 1 条真实条目即越过上限 → 仍 400。
+	over := append([]string{`{"value":"192.0.2.0/24","remark":""}`}, entries...)
+	overID := seedTrustedRefList(t, "over-ref-list", "["+strings.Join(over, ",")+"]")
+	overBody := fmt.Sprintf(`{"source":"caddy","trusted_proxy_ranges":"[]","trusted_proxy_range_refs":"[%d]"}`, overID)
+	if rec := putConfig(t, router, overBody); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "2000") {
+		t.Fatalf("over-cap 必须 400 且点名 2000 上限, got %d %s", rec.Code, rec.Body.String())
+	}
+}

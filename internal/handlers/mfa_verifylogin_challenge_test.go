@@ -257,3 +257,32 @@ func TestMFAVerifyLogin_consumeDBFailureReturns500AndKeepsChallenge(t *testing.T
 		t.Fatalf("consume failure audit events=%d, want 1", events)
 	}
 }
+
+// H-B1-11：挑战已被使用（并发登录落败/阈值作废后重放）是观测面，必须留痕，
+// 与同函数其余拒绝分支同密度。
+func TestMFAVerifyLogin_consumedChallengeIsAudited(t *testing.T) {
+	newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO users (username,password_hash,role,is_enabled,mfa_enabled,mfa_secret)
+		VALUES ('audit-root','x','admin',1,1,'JBSWY3DPEHPK3PXP')`); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO mfa_challenges (token,user_id,expires_at,consumed,password_version)
+		VALUES ('consumed-audit-tok',(SELECT id FROM users WHERE username='audit-root'),datetime('now','+5 minutes'),1,0)`); err != nil {
+		t.Fatalf("seed consumed challenge: %v", err)
+	}
+	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
+	router := gin.New()
+	router.POST("/auth/mfa/verify", h.MFAVerifyLogin)
+
+	recorder := postMFAVerify(t, router, "consumed-audit-tok", "000000")
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s, want 401", recorder.Code, recorder.Body.String())
+	}
+	var audits int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='认证拒绝' AND detail LIKE '%挑战已被使用%'`).Scan(&audits); err != nil {
+		t.Fatalf("count audits: %v", err)
+	}
+	if audits != 1 {
+		t.Fatalf("audit rows=%d, want 1（「挑战已被使用」拒绝必须留痕）", audits)
+	}
+}

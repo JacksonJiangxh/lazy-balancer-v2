@@ -1612,7 +1612,8 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 		// v2.3.8 爬虫豁免（用户裁定方案 B）：已验证爬虫（caddygeoip handler 双跳
 		// PTR/官方 IP 段验证后注入 X-LB-Crawler-Verified=引擎 ID）逐引擎放行——
 		// ctl 移除本策略 GeoIP 链；伪装（UA 声称引擎但验证失败，handler 置
-		// X-LB-Crawler-Spoof=1）独立事件族显式拒绝。id 编码见
+		// X-LB-Crawler-Spoof=引擎 ID，PL历史问题：旧注释的「=1」与发射值矛盾）
+		// 独立事件族显式拒绝。id 编码见
 		// encodeCrawlerExemptRuleID/encodeCrawlerSpoofRuleID（历史：豁免 id
 		// 越出 [810000,850000) 时跳过+告警，不再溢出伪装段）。
 		if p.GeoIPCrawlerExempt {
@@ -2512,10 +2513,24 @@ func escapeCorazaPattern(pattern string) string {
 }
 
 // crawlerEngineSelected（v2.3.8 爬虫豁免）：策略勾选引擎集合判定——空集视为
-// 全部引擎（向后兼容豁免开启但未存 engines 的形态）。
+// 全部引擎（向后兼容豁免开启但未存 engines 的形态；空串/`[]` 均属未配置）。
+// SSA-87-08（历史）：畸形非空 JSON 与空集分流——旧实现失败即返回
+// true，勾选面被静默放大成「全部引擎」且零告警。保留向后兼容的「全部引擎」
+// 语义，但按同文件畸形 JSON 既定口径（auditFailureShouldLog）留痕。
 func crawlerEngineSelected(p *models.SecurityPolicy, engineID string) bool {
+	if p == nil {
+		return true
+	}
 	var engines []string
-	if err := json.Unmarshal(p.GeoIPCrawlerEngines, &engines); err != nil || len(engines) == 0 {
+	if raw := strings.TrimSpace(string(p.GeoIPCrawlerEngines)); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &engines); err != nil {
+			msg := fmt.Sprintf("渲染: 策略 #%d 爬虫豁免引擎 geoip_crawler_engines 解析失败（按全部引擎处理）: %v", p.ID, err)
+			if auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
+		}
+	}
+	if len(engines) == 0 {
 		return true
 	}
 	for _, e := range engines {

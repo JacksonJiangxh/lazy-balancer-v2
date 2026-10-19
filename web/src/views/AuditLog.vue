@@ -10,6 +10,17 @@
       </div>
     </div>
 
+    <!-- W87-04：历史问题-F5 家族口径——列表失败必须显性化（「暂无操作日志」不得
+         同时代表空库与故障），并给重试入口。 -->
+    <el-alert v-if="loadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+      <template #title>
+        <div class="polling-error-title">
+          <span>操作日志加载失败：列表为空不代表没有日志</span>
+          <el-button link type="danger" @click="fetchLogs">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
+
     <el-card>
       <div class="filter-bar">
         <el-date-picker
@@ -24,13 +35,13 @@
           :default-time="[new Date(2000, 0, 1, 0, 0, 0), new Date(2000, 0, 1, 23, 59, 59)]"
           class="filter-date-range"
         />
-        <el-select v-model="filters.username" placeholder="操作人" clearable filterable style="width: 130px">
+        <el-select v-model="filters.username" :placeholder="optionsIncomplete ? '操作人（选项加载失败）' : '操作人'" clearable filterable style="width: 130px">
           <el-option v-for="o in usernameOptions" :key="o" :label="o" :value="o" />
         </el-select>
-        <el-select v-model="filters.action" placeholder="操作" clearable filterable style="width: 120px">
+        <el-select v-model="filters.action" :placeholder="optionsIncomplete ? '操作（选项加载失败）' : '操作'" clearable filterable style="width: 120px">
           <el-option v-for="o in actionOptions" :key="o" :label="o" :value="o" />
         </el-select>
-        <el-select v-model="filters.resource" placeholder="对象" clearable filterable allow-create style="width: 150px">
+        <el-select v-model="filters.resource" :placeholder="optionsIncomplete ? '对象（选项加载失败）' : '对象'" clearable filterable allow-create style="width: 150px">
           <el-option v-for="o in resourceOptions" :key="o" :label="o" :value="o" />
         </el-select>
         <el-input v-model="filters.ip" placeholder="IP" clearable style="width: 120px" @keyup.enter="applyFilters" />
@@ -39,10 +50,16 @@
           <el-button type="primary" @click="applyFilters">筛选</el-button>
           <el-button @click="resetFilters">重置</el-button>
         </div>
+        <!-- W87-13：消费后端 partial=true（部分下拉）与整体失败——下拉缺项必须可见，
+             且不得与「真空库」混淆。 -->
+        <el-text v-if="optionsIncomplete" type="warning" size="small">
+          筛选选项未完整加载，下拉列表可能缺项
+          <el-button link type="warning" size="small" @click="fetchOptions">重试</el-button>
+        </el-text>
       </div>
       <el-table :data="logs" v-loading="loading" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="" :tooltip-options="{ popperClass: 'log-overflow-popper' }">
         <template #empty>
-          <el-empty description="暂无操作日志" :image-size="60" />
+          <el-empty :description="loadError ? '日志加载失败' : '暂无操作日志'" :image-size="60" />
         </template>
         <el-table-column prop="created_at" label="时间" width="190" :formatter="(row: AuditLogEntry) => formatDate(row.created_at)" />
         <el-table-column label="操作人" width="200">
@@ -80,11 +97,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { request } from '@/utils/api'
 import { formatDate } from '@/utils/date'
 import { Document } from '@element-plus/icons-vue'
 import LogStorageBar from '@/components/LogStorageBar.vue'
+
+import { buildAuditLogParams } from '@/utils/auditLogFilters'
 
 interface AuditLogEntry {
   id: number
@@ -116,29 +135,30 @@ const filters = ref({
 const usernameOptions = ref<string[]>([])
 const actionOptions = ref<string[]>([])
 const resourceOptions = ref<string[]>([])
+// W87-04：列表请求失败与「确实没有日志」必须可区分（历史问题-F5 家族漏点）。
+const loadError = ref(false)
+// W87-13：后端在任一 option 查询失败时下发 partial=true（auditlog.go）——原实现
+// 只映射三列、把「部分下拉」渲染成「下拉为空」。optionsError 覆盖请求整体失败。
+const optionsPartial = ref(false)
+const optionsError = ref(false)
+const optionsIncomplete = computed(() => optionsPartial.value || optionsError.value)
 
 const fetchOptions = async () => {
   try {
-    const res = await request.get<{ data?: { usernames?: { value: string }[]; actions?: { value: string }[]; resources?: { value: string }[] } }>('/audit-logs/options')
+    const res = await request.get<{ data?: { partial?: boolean; usernames?: { value: string }[]; actions?: { value: string }[]; resources?: { value: string }[] } }>('/audit-logs/options')
     const d = res.data
     usernameOptions.value = (d?.usernames || []).map((o) => o.value)
     actionOptions.value = (d?.actions || []).map((o) => o.value)
     resourceOptions.value = (d?.resources || []).map((o) => o.value)
+    optionsPartial.value = d?.partial === true
+    optionsError.value = false
   } catch (e) {
     console.error('Failed to fetch audit log options:', e)
+    optionsError.value = true
   }
 }
 
-const buildParams = () => {
-  const params: Record<string, string | number> = { page: page.value, page_size: pageSize.value }
-  const f = filters.value
-  if (f.timeRange?.[0]) params.start_time = f.timeRange[0]
-  if (f.timeRange?.[1]) params.end_time = f.timeRange[1]
-  for (const key of ['username', 'action', 'resource', 'ip', 'keyword'] as const) {
-    if (f[key].trim()) params[key] = f[key].trim()
-  }
-  return params
-}
+const buildParams = () => buildAuditLogParams(filters.value, page.value, pageSize.value)
 
 const applyFilters = () => {
   page.value = 1
@@ -274,8 +294,11 @@ const fetchLogs = async () => {
     if (currentRequestSeq !== requestSeq || page.value !== targetPage || pageSize.value !== targetPageSize) return
     logs.value = res.data?.list || []
     total.value = res.data?.total || 0
+    loadError.value = false
   } catch (e) {
     console.error('Failed to fetch audit logs:', e)
+    // 仅最新请求可置错误态（陈旧请求的失败不得覆盖新结果）。
+    if (currentRequestSeq === requestSeq) loadError.value = true
   } finally {
     if (currentRequestSeq === requestSeq) loading.value = false
   }
@@ -299,6 +322,7 @@ onMounted(() => {
 .operator-email { font-size: 11.5px; color: var(--el-text-color-secondary); }
 
 .filter-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
+.polling-error-alert { margin-bottom: 16px; }
 .filter-actions { display: flex; gap: 0; margin-left: 8px; }
 .filter-actions .el-button + .el-button { margin-left: 8px; }
 </style>

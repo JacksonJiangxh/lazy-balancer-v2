@@ -152,9 +152,10 @@ func TestImportConfigBackup_cliRejectionAbortsImport(t *testing.T) {
 	h.caddyService.SetCLIValidatorForTest(func(rendered []byte) error {
 		return errors.New("cli: import render rejected")
 	})
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_ip_lists": {{"id": 1, "name": "cli-abort-list", "entries": "[]"}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 

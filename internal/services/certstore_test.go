@@ -409,3 +409,74 @@ func TestMaterializeAllCertsFromDB_selectsLatestApplicableRow(t *testing.T) {
 		t.Fatalf("materialized cert is not the latest applicable row (want new.example.test cert)")
 	}
 }
+
+// ---- 历史（SV历史问题 / SV历史问题）----
+
+// SV历史问题（R-12 同族）：启动物化必须「先判适用性、后标记 seen」——最新行是
+// 旧域（不适用）时不得短路较旧的适用行，否则整条规则不物化。
+func TestMaterializeAllCertsFromDB_latest_inapplicable_row_does_not_shadow_older_applicable(t *testing.T) {
+	_, database := newClusterTestService(t)
+	useTemporaryCertDir(t)
+	seedGenerationRule(t, database, "lb_shadow_row", false)
+	if _, err := database.Exec("UPDATE lb_rules SET enable_tls=1,tls_source='acme_dns',domain='current.example.test' WHERE caddy_id='lb_shadow_row'"); err != nil {
+		t.Fatal(err)
+	}
+	currentCert, currentKey := matchingCertificatePair(t, "current.example.test")
+	staleCert, staleKey := matchingCertificatePair(t, "stale.example.test")
+	// 最新行=旧域（不适用），较旧行=当前域（适用）
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem,updated_at) VALUES
+		('lb_shadow_row','current.example.test','issued',?,?,'2026-09-14 01:00:00'),
+		('lb_shadow_row','stale.example.test','issued',?,?,'2026-09-14 02:00:00')`,
+		currentCert, currentKey, staleCert, staleKey); err != nil {
+		t.Fatal(err)
+	}
+
+	// When
+	MaterializeAllCertsFromDB()
+
+	// Then：物化的是较旧的适用行（当前域），最新不适用行不得遮蔽它
+	certPath, _ := CertFilePaths("lb_shadow_row")
+	data, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("applicable cert not materialized: %v", err)
+	}
+	if string(data) != currentCert {
+		t.Fatalf("materialized cert is not the older applicable row (current.example.test)")
+	}
+}
+
+// SV历史问题：零写（内容与权限已一致）不得计入「恢复」审计/任务日志——否则每次
+// 启动都报「恢复 N 个」，真实恢复事件被稀释。
+func TestMaterializeAllCertsFromDB_counts_only_actual_writes(t *testing.T) {
+	_, database := newClusterTestService(t)
+	useTemporaryCertDir(t)
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,enabled,enable_tls,tls_source,tls_cert,tls_key)
+		VALUES ('lb_manual_count','manual-count','http',8080,1,1,'manual','','')`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	certPEM, keyPEM := matchingCertificatePair(t, "manual.example.test")
+	if _, err := database.Exec(`UPDATE lb_rules SET tls_cert=?, tls_key=? WHERE caddy_id='lb_manual_count'`, certPEM, keyPEM); err != nil {
+		t.Fatalf("seed manual cert: %v", err)
+	}
+	readRecoveries := func() int {
+		var count int
+		if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='恢复' AND resource='证书文件'`).Scan(&count); err != nil {
+			t.Fatalf("count audit rows: %v", err)
+		}
+		return count
+	}
+
+	// When：首次物化真写入，第二次内容/权限一致=零写
+	MaterializeAllCertsFromDB()
+	afterFirst := readRecoveries()
+	MaterializeAllCertsFromDB()
+	afterSecond := readRecoveries()
+
+	// Then
+	if afterFirst != 1 {
+		t.Fatalf("recovery audit rows=%d after first materialization, want 1", afterFirst)
+	}
+	if afterSecond != afterFirst {
+		t.Fatalf("recovery audit rows=%d after no-op materialization, want unchanged %d（零写不得计为恢复）", afterSecond, afterFirst)
+	}
+}

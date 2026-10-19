@@ -8,6 +8,14 @@ type CredentialField struct {
 	Type        string `json:"type"`
 	Required    bool   `json:"required"`
 	Placeholder string `json:"placeholder,omitempty"`
+	// VisibleWhen 声明字段可见性：{其它字段名: 允许取值}，全部条件命中才显示。
+	// 前端据此渲染表单（WS-13，历史）——原前端按 dnspod 的两种认证模式
+	// 硬编码可见字段，后端新增 provider 时其 credential_fields 会被整体隐藏。
+	// 为空 = 恒显示。
+	VisibleWhen map[string][]string `json:"visible_when,omitempty"`
+	// OptionLabels 为 select 字段的选项显示文案（值 → 文案）；缺失时前端回退
+	// 原始值，不再硬编码到具体 provider。
+	OptionLabels map[string]string `json:"option_labels,omitempty"`
 }
 
 type Provider interface {

@@ -18,6 +18,21 @@ const (
 	trafficLeaseTTLDefault = 30 * time.Second
 	trafficLeaseTTLMax     = 120 * time.Second
 	trafficLeaseTTLMin     = 5 * time.Second
+	// trafficLeaseIDMaxLen 租约 ID 长度上限（PL历史问题）：管理端 POST 原样接受
+	// 调用方投递的 lease_id（app 端点仅限 body 4096B），不设上限时单个键即可
+	// 占 4KiB 并驻留至 TTL 上限。正常形态每标签页一个 UUID（36 字符）。
+	trafficLeaseIDMaxLen = 64
+	// trafficLeasesMax 租约表条目上限（PL历史问题）：正常形态条目数=并发打开的
+	// 大屏标签页数（个位数）。满时拒绝新键，既有键续租照常——绝不淘汰活跃租约
+	// （淘汰会让真实标签页静默失去采集）。
+	trafficLeasesMax = 64
+)
+
+// 租约申请失败原因（固定文案，可直接拼进 JSON error 字段）。
+var (
+	errTrafficLeaseIDRequired = errors.New("lease_id required")
+	errTrafficLeaseIDTooLong  = errors.New("lease_id too long")
+	errTrafficLeaseLimit      = errors.New("too many leases")
 )
 
 type trafficLease struct {
@@ -38,7 +53,11 @@ func trafficCollectorActive() bool {
 
 func acquireTrafficLease(id string, ttl time.Duration, sampleN uint32) error {
 	if id == "" {
-		return errors.New("lease_id required")
+		return errTrafficLeaseIDRequired
+	}
+	// PL历史问题：字节长度上限（正常形态 UUID 36 字节），超限直接拒绝。
+	if len(id) > trafficLeaseIDMaxLen {
+		return errTrafficLeaseIDTooLong
 	}
 	if ttl <= 0 {
 		ttl = trafficLeaseTTLDefault
@@ -51,6 +70,12 @@ func acquireTrafficLease(id string, ttl time.Duration, sampleN uint32) error {
 	}
 	// sampleN=0 表示关闭逐请求事件（仍可保留聚合计数）。
 	trafficLeasesMu.Lock()
+	// PL历史问题：条目上限只拦新键——续租既有键走原路径（否则满表会让真实
+	// 标签页的心跳失败而静默断采）。
+	if _, exists := trafficLeases[id]; !exists && len(trafficLeases) >= trafficLeasesMax {
+		trafficLeasesMu.Unlock()
+		return errTrafficLeaseLimit
+	}
 	wasEmpty := len(trafficLeases) == 0
 	trafficLeases[id] = trafficLease{expires: time.Now().Add(ttl), sampleN: sampleN}
 	trafficCollectorEnabled.Store(true)
@@ -166,7 +191,9 @@ func serveTrafficCollector(w http.ResponseWriter, r *http.Request) error {
 			return nil
 		}
 		if err := acquireTrafficLease(req.LeaseID, time.Duration(req.TTLMs)*time.Millisecond, req.SampleN); err != nil {
-			http.Error(w, `{"error":"lease_id required"}`, http.StatusBadRequest)
+			// 三种失败原因均为固定 ASCII 文案（无引号/控制字符），可直接拼进
+			// JSON；调用方（app 端点）原样转发该 400 状态。
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
 			return nil
 		}
 		_, _ = w.Write([]byte(`{"enabled":true}`))

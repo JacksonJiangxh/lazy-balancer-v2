@@ -81,3 +81,16 @@ docs/superpowers/
 .omp/
 .agent/
 story.md
+
+# TypeScript 增量构建缓存
+*.tsbuildinfo
+
+# 审计过程记录/轮次测试——仅本地保留 .omp/legacy-audit，不入公网仓库
+docs/audit/
+**/audit[0-9]*_test.go
+**/*_audit[0-9]*_test.go
+**/audit_round[0-9]*_test.go
+**/r[0-9]*_test.go
+**/round[0-9]*_test.go
+**/*_r[0-9]*_test.go
+**/*_round[0-9]*_test.go

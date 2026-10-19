@@ -213,9 +213,9 @@ func TestLoadOrCreateJWTSecret_shortSecretWarnsAndRegenerates(t *testing.T) {
 // 重生成但不 warn（warn 仅针对非空过短——空文件等同未初始化）。
 func TestLoadOrCreateJWTSecret_validReusedAndEmptyQuiet(t *testing.T) {
 	t.Run("valid secret reused quietly", func(t *testing.T) {
-		// Given 合法长度密钥文件
+		// Given 合法长度且高熵的密钥文件
 		dir := t.TempDir()
-		want := strings.Repeat("s", 48)
+		want := "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a3928"
 		if err := os.WriteFile(filepath.Join(dir, "jwt_secret"), []byte(want), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -273,17 +273,18 @@ func TestLoad_warnsOnShortEnvJWTSecret(t *testing.T) {
 	if loaded.JWTSecret != "abc" {
 		t.Fatalf("env secret=%q; want operator-provided value preserved", loaded.JWTSecret)
 	}
-	if !strings.Contains(logBuf.String(), "JWT_SECRET 环境变量过短") {
+	if !strings.Contains(logBuf.String(), "强度不足") || !strings.Contains(logBuf.String(), "过短") {
 		t.Fatalf("short env secret must warn, got %q", logBuf.String())
 	}
 
-	// 回归形状：≥32 字节的环境变量零告警。
-	t.Setenv("JWT_SECRET", strings.Repeat("s", 32))
+	// 回归形状：≥32 字节的高熵环境变量零告警（CI87-09 起仅长度达标不足够）。
+	strong := "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a3928"
+	t.Setenv("JWT_SECRET", strong)
 	logBuf.Reset()
-	if loaded := Load(""); loaded.JWTSecret != strings.Repeat("s", 32) {
+	if loaded := Load(""); loaded.JWTSecret != strong {
 		t.Fatalf("valid env secret=%q", loaded.JWTSecret)
 	}
-	if strings.Contains(logBuf.String(), "JWT_SECRET 环境变量过短") {
+	if strings.Contains(logBuf.String(), "强度不足") || strings.Contains(logBuf.String(), "过短") {
 		t.Fatalf("valid env secret must not warn, got %q", logBuf.String())
 	}
 }
@@ -343,5 +344,79 @@ func TestLoad_normalizesRelativeDataDir(t *testing.T) {
 	}
 	if cfg.BackupDir != filepath.Join(dir, "backup") {
 		t.Fatalf("BackupDir=%q, want absolute sibling backup", cfg.BackupDir)
+	}
+}
+
+// CI87-09：仅长度检查会让 32 个空格/单字符重复通过——可预测的 HS256 密钥
+// 等价于无签名（JWT/OIDC state 可离线伪造）。低熵形态必须告警可见，且仍
+// 保持「env 是运维显式输入、不自动替换」的既有裁定。
+func TestLoad_warnsOnLowEntropyEnvJWTSecret(t *testing.T) {
+	cases := []struct {
+		name   string
+		secret string
+	}{
+		{name: "all spaces", secret: strings.Repeat(" ", 32)},
+		{name: "single repeated byte", secret: strings.Repeat("k", 32)},
+		{name: "short distinct set", secret: strings.Repeat("ab", 16)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("JWT_SECRET", tc.secret)
+			var logBuf bytes.Buffer
+			origOut := log.Writer()
+			log.SetOutput(&logBuf)
+			t.Cleanup(func() { log.SetOutput(origOut) })
+
+			loaded := Load("")
+
+			if loaded.JWTSecret != tc.secret {
+				t.Fatalf("env secret=%q; want operator-provided value preserved", loaded.JWTSecret)
+			}
+			if !strings.Contains(logBuf.String(), "强度不足") {
+				t.Fatalf("low-entropy env secret must warn, got %q", logBuf.String())
+			}
+		})
+	}
+}
+
+// CI87-10：port 必须与 metrics_interval 同口径——先判界再 float→int 转换。
+// 1e300/0 直接转换会产生实现相关整数与怪日志；8000.9 仍须留痕截断。
+func TestLoad_portBoundsBeforeConversion(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    int
+		wantLog string
+	}{
+		{name: "in range", raw: "8081", want: 8081, wantLog: ""},
+		{name: "fractional truncation", raw: "8000.9", want: 8000, wantLog: "not an integer"},
+		{name: "huge magnitude", raw: "1e300", want: 8000, wantLog: "outside 1-65535"},
+		{name: "zero", raw: "0", want: 8000, wantLog: "outside 1-65535"},
+		{name: "negative", raw: "-1", want: 8000, wantLog: "outside 1-65535"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("JWT_SECRET", "test-secret")
+			var logBuf bytes.Buffer
+			origOut := log.Writer()
+			log.SetOutput(&logBuf)
+			t.Cleanup(func() { log.SetOutput(origOut) })
+
+			configPath := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(configPath, []byte(`{"port":`+tc.raw+`}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			loaded := Load(configPath)
+
+			if loaded.Port != tc.want {
+				t.Fatalf("port=%d, want %d (raw %s)", loaded.Port, tc.want, tc.raw)
+			}
+			if tc.wantLog != "" && !strings.Contains(logBuf.String(), tc.wantLog) {
+				t.Fatalf("expected log %q, got %q", tc.wantLog, logBuf.String())
+			}
+			if tc.wantLog == "" && strings.Contains(logBuf.String(), "port") {
+				t.Fatalf("in-range port must not log, got %q", logBuf.String())
+			}
+		})
 	}
 }

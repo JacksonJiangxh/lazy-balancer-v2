@@ -57,8 +57,12 @@ Open `http://localhost:8000` for the admin panel. First visit opens an initializ
 # Docker Compose (Linux; the primary node uses host networking)
 docker compose up -d
 
-# Build from source
+# Build from source (frontend needs Node.js >= 22.18: `npm test` runs .ts files
+# directly via node --test, which relies on default type stripping since that
+# version; see the engines field in web/package.json)
 cd web && npm install && npm run build && cd ..
+# VERSION is the formal version (what the panel displays); the image tag may carry
+# a -beta channel suffix - they differ on purpose: tag minus suffix == APP_VERSION
 docker buildx build --platform linux/amd64,linux/arm64 \
   --build-arg VERSION=v2.3.8 \
   --provenance=false --sbom=false \

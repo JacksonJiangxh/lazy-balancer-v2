@@ -47,6 +47,31 @@ test('A3 计数器回退：标记 reset 并重建基线，不静默丢负数', (
   assert.deepEqual(after.normalDeltas, [])
 })
 
+test('A3b attack 桶回退同样 reset（审计 87 WEBT-08③：此前只覆盖 normal 回退）', () => {
+  // normal 继续增长、attack 计数器回退（Caddy 重载/租约重建）——必须断开曲线
+  // 重建基线，不得把负增量当 0 静默吞掉（否则攻击速率会持续偏负/失真）。
+  const prev = baseline({ 中国: { normal: 100, attack: 50 } }, 0)
+  const after = trafficDelta(prev, { 中国: { normal: 160, attack: 2 } }, 1000)
+  assert.equal(after.reset, true)
+  assert.equal(after.baseline, true)
+  assert.equal(after.normalTotal, 0, '回退轮不得落地任何半截增量')
+  assert.equal(after.attackTotal, 0)
+  assert.deepEqual(after.attackDeltas, [])
+})
+
+test('A3c 抽样比非法（0/负数/NaN）按 1 处理且不误触发基线重建', () => {
+  // 审计 87 WEBT-08③：safeSample 分支此前无覆盖——sampleN=0 若参与比较会让
+  // 每轮都「抽样比变化」→ 恒重置基线（大屏流量曲线永久空白）。
+  for (const sampleN of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const prev = baseline({ 中国: { normal: 100 } }, 0, 1)
+    const next = trafficDelta(prev, { 中国: { normal: 120 } }, 1000, sampleN)
+    assert.equal(next.sampleN, 1, `sampleN=${sampleN} 必须归一为 1`)
+    assert.equal(next.reset, false, `sampleN=${sampleN} 不得触发重置`)
+    assert.equal(next.baseline, false)
+    assert.equal(next.normalTotal, 20)
+  }
+})
+
 test('A4 新出现国家不计差分（其累计值不是本间隔新增）', () => {
   const prev = baseline({ 中国: { normal: 100 } }, 0)
   const next = trafficDelta(prev, { 中国: { normal: 110 }, 德国: { normal: 999 } }, 1000)
@@ -93,6 +118,24 @@ test('A9 脏值按 0 处理（缺失/非数值不产生 NaN）', () => {
   assert.equal(dirty.reset, true)
   assert.equal(Number.isNaN(dirty.normalQps), false)
   assert.equal(Number.isNaN(dirty.attackQps), false)
+})
+
+test('A10 归一 counts 单源：调用方用返回 counts 建基线，脏值下一轮仍正常差分（WT87-07）', () => {
+  type Raw = { normal?: number; attack?: number }
+  const first = trafficDelta(null, { 中国: {} as Raw, 美国: { normal: 7 } }, 0)
+  assert.equal(first.baseline, true)
+  // 归一结果必须对外可见：缺 normal/attack 的条目按 0 落库
+  assert.deepEqual(first.counts.get('中国'), { normal: 0, attack: 0 })
+  assert.deepEqual(first.counts.get('美国'), { normal: 7, attack: 0 })
+  // 消费方原实现从原始响应重建基线（缺字段存 undefined）→ 下一轮 NaN 静默丢国
+  const prev: TrafficBaseline = { counts: first.counts, at: 0, sampleN: first.sampleN }
+  const next = trafficDelta(prev, { 中国: { normal: 30, attack: 2 }, 美国: { normal: 7 } }, 2000)
+  assert.equal(next.baseline, false)
+  assert.deepEqual(next.normalDeltas, [{ name: '中国', count: 30 }])
+  assert.deepEqual(next.attackDeltas, [{ name: '中国', count: 2 }])
+  assert.equal(next.normalTotal, 30)
+  assert.equal(next.attackTotal, 2)
+  assert.equal(Number.isNaN(next.normalQps), false)
 })
 
 test('C 拦截/分钟展示只还原一次 10 倍定点，不再放大', () => {

@@ -126,3 +126,31 @@ func TestGzippedRuntimeRotation_mergesIntoBaseBothPaths(t *testing.T) {
 		t.Fatal("gzipped rotation must not surface as standalone entry")
 	}
 }
+
+// H-B1-05：整文件 gzip 归档 <base>.gz 属于该文件的轮转副本——两套分类器
+// 同输入必须等价，且聚合键不得多出独立 ".gz" 条目（消费侧按固定基名取值，
+// 独立键无人读取 → 字节从展示中消失）。
+func TestAggregateDirStats_wholeFileGzipArchiveJoinsBase(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]int{
+		"caddy.log":    200,
+		"caddy.log.gz": 40,
+	}
+	for name, size := range files {
+		if err := os.WriteFile(dir+"/"+name, make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	aggregate := aggregateDirStats(dir, caddyLogFamilyMatch)
+	stats := aggregate["caddy.log"]
+	if stats.Active != 200 || stats.Rotated != 40 || stats.RotCount != 1 {
+		t.Fatalf("aggregate[caddy.log]=(%d,%d,%d), want (200,40,1)", stats.Active, stats.Rotated, stats.RotCount)
+	}
+	if _, exists := aggregate["caddy.log.gz"]; exists {
+		t.Fatal("caddy.log.gz 落成独立键——消费侧按基名取值，该归档字节将被丢弃")
+	}
+	active, rotated, count := dirBytes(dir + "/caddy.log")
+	if active != stats.Active || rotated != stats.Rotated || count != stats.RotCount {
+		t.Fatalf("dirBytes=(%d,%d,%d) aggregate=(%d,%d,%d)——两套分类器分叉", active, rotated, count, stats.Active, stats.Rotated, stats.RotCount)
+	}
+}

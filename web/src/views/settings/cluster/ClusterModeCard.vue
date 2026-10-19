@@ -79,6 +79,7 @@ import type { FormInstance, FormRules } from 'element-plus'
 import { Connection } from '@element-plus/icons-vue'
 import type { ClusterNodeMode, ClusterRegistrationInput, ClusterStatus } from '@/types'
 import { shouldCloseRegistrationDialog } from '@/utils/clusterRegistration'
+import { validateClusterUrl } from '@/utils/clusterUrl'
 
 interface RegistrationForm {
   master_url: string
@@ -90,6 +91,8 @@ const props = defineProps<{
   readonly status: ClusterStatus | null
   readonly loading: boolean
   readonly registrationRequest: number
+  /** 父级注册请求成功计数（WS-17：成功后清空一次性令牌；取消/失败保留）。 */
+  readonly registrationSucceeded: number
   readonly readOnly: boolean
   readonly intervalSaving: boolean
 }>()
@@ -107,22 +110,15 @@ let registrationOriginMode: ClusterNodeMode | null = null
 const syncInterval = ref(60)
 const form = reactive<RegistrationForm>({ master_url: '', register_token: '', node_name: '' })
 
+// WS-18：与节点访问地址共用 utils/clusterUrl——原实现只校验 scheme，带凭证/
+// query/fragment 的地址会通过前端校验、提交时被后端同一规则拒绝（晚失败）。
 const validateMasterUrl = (_rule: unknown, value: string, callback: (error?: Error) => void): void => {
-  if (!value.trim()) {
-    callback(new Error('请输入主节点地址'))
+  const error = validateClusterUrl(value, { label: '主节点地址', emptyMessage: '请输入主节点地址' })
+  if (error) {
+    callback(new Error(error))
     return
   }
-  try {
-    const parsed = new URL(value.trim())
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      callback(new Error('主节点地址必须使用 HTTP 或 HTTPS'))
-      return
-    }
-    callback()
-  } catch {
-    // new URL() 仅抛 TypeError；其余异常同样视为地址非法，走统一提示，不向外抛。
-    callback(new Error('主节点地址格式不正确'))
-  }
+  callback()
 }
 
 const rules: FormRules<RegistrationForm> = {
@@ -164,6 +160,10 @@ watch(
     registrationOpen.value = true
   },
 )
+
+// 注册请求被主节点受理（父级二次确认后的 POST 成功）→ 令牌已消耗，清空；
+// 取消确认/入口守卫早退/请求失败都保留输入（WS-17）。
+watch(() => props.registrationSucceeded, () => { form.register_token = '' })
 
 // 注册令牌为一次性凭据：注册流程结束（提交/取消/成功关闭）后不回填，避免下次打开残留旧令牌
 watch(registrationOpen, (open) => {
@@ -210,7 +210,9 @@ const submitRegistration = async (): Promise<void> => {
     register_token: form.register_token.trim(),
     ...(nodeName ? { node_name: nodeName } : {}),
   })
-  form.register_token = ''
+  // WS-17：不在此清空令牌——emit 之后父级的二次确认/入口守卫才可能发生，
+  // 取消确认或守卫早退都会让已粘贴的一次性令牌白白丢失。弹框关闭
+  //（成功/取消/X）统一由 watch(registrationOpen) 清空。
 }
 </script>
 

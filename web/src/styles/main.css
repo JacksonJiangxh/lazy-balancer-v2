@@ -20,6 +20,9 @@
   --text-regular: #374151;
   --text-secondary: #6b7280;
   --text-muted: #9ca3af;
+  /* 历史问题：ClusterSettings 服务控制弹框以 var(--text-tertiary) 消费（同文件
+     相邻行以 #909399 为回退）——补进变量集，避免声明无效回落继承色。 */
+  --text-tertiary: #909399;
   
   /* Border Colors */
   --border: #e5e7eb;
@@ -148,13 +151,6 @@ body {
   margin-top: 6px;
   line-height: 1.5;
   width: 100%;
-}
-
-.card-header .form-tip-line {
-  width: auto;
-  margin-top: 0;
-  white-space: nowrap;
-  flex-shrink: 0;
 }
 
 .form-tip-line .el-link {

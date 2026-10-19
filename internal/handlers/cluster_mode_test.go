@@ -292,3 +292,63 @@ func TestUpdateClusterSettings_auditUsesUnifiedRulesLabel(t *testing.T) {
 		t.Fatalf("audit detail=%q, want unified label 负载均衡规则", detail)
 	}
 }
+
+// 历史问题（历史 历史问题）：空 body 的幂等空保存曾落「更新/集群设置」零详情审计
+// （parts 为空 → Join 空串），无法区分「无修改」与记录缺陷——复用同域既有
+// 「无修改」文案（caproviders/certificates 同口径）。
+func TestA87UpdateClusterSettings_emptyChangeAuditsNoModification(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	router := gin.New()
+	router.PUT("/cluster/settings", h.UpdateClusterSettings)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPut, "/cluster/settings", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200（幂等空保存）", response.Code, response.Body.String())
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='集群设置' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("query settings audit: %v", err)
+	}
+	if !strings.Contains(detail, "无修改") {
+		t.Fatalf("audit detail=%q, want 无修改（空变更不得零详情）", detail)
+	}
+}
+
+// 历史问题（历史 历史问题，R-12 家族收敛）：A86 历史问题 的导入窗口节点写门覆盖了
+// 注册/审批/改址/清 pin/上报，但漏掉角色切换端点——SetClusterMode 在远端
+// 注册后写 global_config、Promote 写 global_config，导入事务全量替换
+// global_config 时会被覆盖（含远端孤儿注册）。本测试钉住三端点在导入窗口内
+// 一律 409 fast-fail（先于任何网络副作用与 DB 写）。
+func TestA87_clusterRoleEndpoints409DuringImport(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	h.syncService = services.NewSyncService(db.DB, &config.Config{DataDir: t.TempDir()}, nil)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/cluster/mode", h.SetClusterMode)
+	router.POST("/cluster/promote", h.PromoteClusterNode)
+	router.PUT("/cluster/settings", h.UpdateClusterSettings)
+
+	configImportBeginMu.Lock()
+	defer configImportBeginMu.Unlock()
+	calls := []struct {
+		method, path, body string
+	}{
+		{"POST", "/cluster/mode", `{"mode":"slave","master_url":"https://master.example:8443","register_token":"one-time","node_name":"slave-a"}`},
+		{"POST", "/cluster/promote", ``},
+		{"PUT", "/cluster/settings", `{"sync_interval":60}`},
+	}
+	for _, call := range calls {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(call.method, call.path, strings.NewReader(call.body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("%s %s status=%d body=%s, want 409（导入窗口角色切换 fast-fail）", call.method, call.path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "配置导入进行中") {
+			t.Fatalf("%s %s body=%s, want 配置导入进行中 文案", call.method, call.path, rec.Body.String())
+		}
+	}
+}

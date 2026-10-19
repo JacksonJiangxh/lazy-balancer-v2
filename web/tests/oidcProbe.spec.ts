@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createOidcProbeGuard, oidcProbeKey } from '../src/utils/oidcProbe.ts'
+import { createOidcProbeGuard, isOidcProbeFresh, oidcProbeKey } from '../src/utils/oidcProbe.ts'
+import { section, source } from './_helpers.ts'
 
 const values = { issuer: ' https://idp.example ', clientId: ' client ', clientSecret: 'secret' }
 
@@ -25,4 +26,19 @@ test('历史问题-4：关闭弹框或重新 load 作废同快照在途探测', 
   const token = guard.token(values)
   guard.invalidate()
   assert.equal(guard.isCurrent(token, values), false)
+})
+
+// WS-14：issuer 失焦原无条件重发 discovery+JWKS（+可选凭证校验）外部请求，
+// 字段间来回切换会重复打 IdP。结果仍对应当前表单值时必须直接复用。
+test('WS-14：已通过且值未变的探测结果可复用', () => {
+  const key = oidcProbeKey(values)
+  assert.equal(isOidcProbeFresh({ ok: true, key }, values), true)
+  assert.equal(isOidcProbeFresh({ ok: true, key }, { ...values, clientSecret: 'changed' }), false)
+  assert.equal(isOidcProbeFresh({ ok: false, key }, values), false)
+  assert.equal(isOidcProbeFresh({ ok: true }, values), false, '无键=不可复用')
+  const page = source('src/views/settings/OIDCSettings.vue')
+  assert.match(
+    section(page, 'const probeOnBlur = () => {', '\n}'),
+    /if \(isOidcProbeFresh\(probe, currentProbeValues\(\)\)\) return/,
+  )
 })

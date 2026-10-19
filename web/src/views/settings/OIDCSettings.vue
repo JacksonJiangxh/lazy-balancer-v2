@@ -4,9 +4,12 @@
     destroy-on-close append-to-body class="oidc-dialog" @update:model-value="emit('update:modelValue', $event)">
     <template #header>
       <DialogHeader :icon="Connection" title="登录认证（OIDC）"
-        :subtitle="configured ? (enabled ? '已启用——登录页展示认证服务入口' : '已配置未启用') : '配置企业认证服务,本地账号登录始终保留'" />
+        :subtitle="loadFailed ? '配置读取失败' : configured ? (enabled ? '已启用——登录页展示认证服务入口' : '已配置未启用') : '配置企业认证服务,本地账号登录始终保留'" />
     </template>
-    <div v-if="!configured" class="info-note-bar"><span class="info-note-desc">通过企业认证服务（OIDC）登录——配置仅 3 项，端点自动发现；本地账号登录始终保留。</span></div>
+    <!-- WS-15：读取失败显性化（此前静默呈现上一轮残留状态或空白表单） -->
+    <el-alert v-if="loadFailed" type="error" :closable="false" show-icon class="mb12"
+      title="OIDC 配置读取失败——当前按「未配置」展示，读取成功前无法保存；请关闭弹框后重试" />
+    <div v-else-if="!configured" class="info-note-bar"><span class="info-note-desc">通过企业认证服务（OIDC）登录——配置仅 3 项，端点自动发现；本地账号登录始终保留。</span></div>
     <el-alert v-else-if="enabled" type="success" :closable="false" class="mb12"
       :title="`OIDC 已启用（${displayName || 'OIDC'}）——登录页默认展示认证服务入口，本地账号可折叠进入。`" />
 
@@ -98,7 +101,7 @@ import DialogHeader from '@/components/DialogHeader.vue'
 import { request, ApiRequestError } from '@/utils/api'
 import { copyText } from '@/utils/copy'
 import { useAuthStore } from '@/stores/auth'
-import { createOidcProbeGuard, oidcProbeKey } from '@/utils/oidcProbe'
+import { createOidcProbeGuard, isOidcProbeFresh, oidcProbeKey } from '@/utils/oidcProbe'
 import type { OidcProbeToken, OidcProbeValues } from '@/utils/oidcProbe'
 
 const authStore = useAuthStore()
@@ -168,8 +171,13 @@ watch(() => props.modelValue, (open) => {
 
 const notify = () => emit('status', { enabled: enabled.value, configured: configured.value })
 
+// WS-15：读取失败不得沿用上一轮残留状态（二次打开弹框 GET 失败时仍显示
+// 「已启用/删除配置/暂停使用」，父级标签也被回填旧值）。catch 清空为未配置态
+// 并显性提示；保存门同时拦截，避免用户以「空表单」覆盖现有配置。
+const loadFailed = ref(false)
 const load = async () => {
   invalidateProbe()
+  loadFailed.value = false
   try {
     // 历史问题:silent——非管理员打开入口时 403 不弹全局 toast(入口按角色收口)
     const res = await request.get<{ data?: { enabled?: boolean; issuer?: string; client_id?: string; display_name?: string; has_secret?: boolean } }>('/settings/oidc', { silent: true })
@@ -184,7 +192,19 @@ const load = async () => {
       form.clientSecret = ''
       // load 开始已推进探测世代；响应回填的字段 watcher 会再次失效旧快照。
     }
-  } catch { /* 未配置/无权限 */ }
+  } catch {
+    // 未配置/无权限/网络失败：一律回到「未配置」可见态（fail-visible）
+    enabled.value = false
+    displayName.value = ''
+    hasSecret.value = false
+    form.issuer = ''
+    form.clientId = ''
+    form.displayName = ''
+    form.clientSecret = ''
+    hasFetchedConfig.value = false
+    lastTest.value = null
+    loadFailed.value = true
+  }
   notify()
 }
 
@@ -233,7 +253,13 @@ const doRunProbe = async (values: OidcProbeValues, token: OidcProbeToken): Promi
   }
 }
 
-const probeOnBlur = () => { if (form.issuer.trim() || probe.checked) void runProbe() }
+// WS-14：已通过且表单值未变时直接复用结果——原每次失焦都触发一次 discovery+
+// JWKS（+ 可选凭证校验）外部请求，字段间来回切换会重复打 IdP。
+const probeOnBlur = () => {
+  if (!form.issuer.trim() && !probe.checked) return
+  if (isOidcProbeFresh(probe, currentProbeValues())) return
+  void runProbe()
+}
 
 // 任一凭证/地址字段变动→探测结果与上次测试立即失效(表单值≠已测值)
 watch(() => [form.issuer, form.clientId, form.clientSecret], () => {
@@ -250,12 +276,14 @@ const test = async () => {
 }
 
 const save = async () => {
-  if (saving.value) return
+  // WS-11/WS-15：函数级守卫 + 读取未成功时禁止保存（空表单会覆盖现有配置）
+  if (isReadOnly.value || saving.value) return
+  if (loadFailed.value) { ElMessage.warning('OIDC 配置读取失败，请关闭弹框后重试'); return }
   if (!form.issuer.trim()) { ElMessage.warning('请填写服务地址'); return }
   if (!form.clientId.trim()) { ElMessage.warning('请填写 Client ID'); return }
   if (!hasSecret.value && !form.clientSecret) { ElMessage.warning('请填写 Client Secret'); return }
   // 保存门:以「当前表单值」测试通过才允许保存——防止改了凭证未测就落库
-  if (!probe.ok || probe.key !== oidcProbeKey(currentProbeValues())) {
+  if (!isOidcProbeFresh(probe, currentProbeValues())) {
     const ok = await runProbe()
     if (!ok) { ElMessage.warning('测试连接未通过，请先修正配置再保存'); return }
   }
@@ -288,6 +316,7 @@ const save = async () => {
 }
 
 const toggleEnabled = async (on: boolean) => {
+  if (isReadOnly.value || saving.value || loadFailed.value) return
   saving.value = true
   try {
     await request.put('/settings/oidc', { enabled: on })
@@ -299,6 +328,7 @@ const toggleEnabled = async (on: boolean) => {
 }
 
 const remove = async () => {
+  if (isReadOnly.value || saving.value || loadFailed.value) return
   try {
     await ElMessageBox.confirm('删除后 OIDC 登录入口消失（已创建的 OIDC 用户保留，可另行管理）。确认删除？', '删除 OIDC 配置', { type: 'warning' })
   } catch { return }

@@ -5,7 +5,8 @@
 //   ④ 下钻口径：统一倍率常量 / 主环取景中心 / 南界钳制（已退役的按国自适应
 //      fitDrillZoom 不再有生产消费方——v2.3.8 用户裁定统一倍率）
 //   ④b 反日界线 unwrap：俄罗斯主环 bbox 不跨全宽
-//   ⑥ 下钻分桶环绕：wrappedBucketKeys 跨日界线键序列去重且覆盖视口
+//   ⑥ 地球球面逆投影往返：sphereSurfacePoint(正投影 NDC) 还原经纬度（含西半球
+//      wrap、高纬极区与背向射线 null）
 //
 // 运行：cd web && npm test
 
@@ -20,13 +21,12 @@ import {
   LAT_BOTTOM,
   WORLD_D,
   latToY,
-  WORLD_W,
   DRILL_UNIFIED_ZOOM,
   worldToScreen,
   screenToLonLat,
   panBy,
   principalBounds,
-  wrappedBucketKeys,
+  sphereSurfacePoint,
   type Cam2D,
 } from '../src/utils/threatProjection.ts'
 import { ADMIN1_PROVINCES } from '../src/utils/admin1Provinces.ts'
@@ -146,26 +146,102 @@ test('④c 已退役取景辅助零生产消费方（fitDrillZoom / zoomAt）', 
   assert.deepEqual(offenders, [], `已退役取景辅助仍有生产消费方: ${offenders.join(', ')}`)
 })
 
-test('⑥下钻分桶环绕：跨日界线键序列去重且覆盖视口', () => {
-  // 世界带内：键集单调且覆盖视口
-  const inside = wrappedBucketKeys(-20, 40)
-  assert.deepEqual(inside, [-2, -1, 0, 1, 2, 3])
-  // 跨日界线（minLon < -180 或 maxLon > 180）：归一后无重复、键值 ∈ [-15, 14]
-  for (const [minLon, maxLon] of [[170, 190], [-190, -170], [-380, 380]] as const) {
-    const keys = wrappedBucketKeys(minLon, maxLon)
-    assert.equal(new Set(keys).size, keys.length, `键序列含重复: ${keys}`)
-    for (const key of keys) assert.ok(key >= -15 && key <= 14, `桶键 ${key} 越出世界带`)
+// ---- 地球球面逆投影往返辅助（与 threatGlobe 相机基向量同构） ----
+type Vec3 = [number, number, number]
+
+function vecSub(a: Vec3, b: Vec3): Vec3 {
+  return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+function vecDot(a: Vec3, b: Vec3): number {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+function vecCross(a: Vec3, b: Vec3): Vec3 {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+function vecNorm(a: Vec3): Vec3 {
+  const len = Math.hypot(a[0], a[1], a[2])
+  return [a[0] / len, a[1] / len, a[2] / len]
+}
+
+/** 经纬度 → 球面笛卡尔（three-globe polar2Cartesian 约定）。 */
+function sphereXyz(lat: number, lng: number, radius: number): Vec3 {
+  const phi = ((90 - lat) * Math.PI) / 180
+  const a = ((90 - lng) * Math.PI) / 180
+  const rho = radius * Math.sin(phi)
+  return [rho * Math.cos(a), radius * Math.cos(phi), rho * Math.sin(a)]
+}
+
+/** 相机基向量（俯视球心）与正投影（球面点 → NDC）；背向相机返回 null。 */
+function cameraAt(lat: number, lng: number, altitudeRatio: number, radius: number, aspect = 16 / 9) {
+  const origin = sphereXyz(lat, lng, radius * (1 + altitudeRatio))
+  const dir = vecNorm([-origin[0], -origin[1], -origin[2]])
+  const right = vecNorm(vecCross(dir, [0, 1, 0]))
+  const up = vecCross(right, dir)
+  const fovHalf = (45 * Math.PI) / 360
+  const cam = { origin, dir, right, up, fovHalf, aspect }
+  const project = (lat2: number, lng2: number): { ndcX: number; ndcY: number } | null => {
+    const v = vecSub(sphereXyz(lat2, lng2, radius), origin)
+    const a = vecDot(v, dir)
+    if (a <= 0) return null
+    const tan = Math.tan(fovHalf)
+    return { ndcX: vecDot(v, right) / a / (tan * aspect), ndcY: vecDot(v, up) / a / tan }
   }
-  // 170°→190° 覆盖 15→(15 归一 -15)：日界线两侧同一份点阵副本
-  assert.deepEqual(wrappedBucketKeys(170, 190), [14, -15])
-  // 整世界带：30 个键一个不少
-  assert.equal(wrappedBucketKeys(-180, 180).length, 30)
-  // 桶宽参数化：6° 桶=60 键
-  assert.equal(wrappedBucketKeys(-180, 180, 6).length, 60)
-  void WORLD_W
+  return { cam, project }
+}
+
+test('⑥地球球面逆投影往返：正投影的 NDC → 经纬度误差 < 1e-6°（WT87-09）', () => {
+  const R = 100 * 1.005
+  let checked = 0
+  // 覆盖东半球/西半球（美加 lng<-90 曾整片 miss）与高纬（俄/加）
+  for (const [clat, clng] of [[35, 116], [38, -97], [60, 90], [-30, 140]] as const) {
+    const { cam, project } = cameraAt(clat, clng, 1.2, R)
+    for (const dLat of [-12, 0, 12]) {
+      for (const dLng of [-15, 0, 15]) {
+        const lat = clat + dLat
+        const lng = clng + dLng
+        const ndc = project(lat, lng)
+        assert.ok(ndc, `目标 (${lat},${lng}) 应在相机前方`)
+        const picked = sphereSurfacePoint(cam, ndc.ndcX, ndc.ndcY, R)
+        assert.ok(picked, `拾取失败 (${lat},${lng})`)
+        assert.ok(Math.abs(picked.lat - lat) < 1e-6, `纬度往返误差 ${picked.lat} vs ${lat}`)
+        const dLon = Math.abs((((picked.lng - lng) % 360) + 540) % 360 - 180)
+        assert.ok(dLon < 1e-6, `经度往返误差 ${picked.lng} vs ${lng}`)
+        checked++
+      }
+    }
+  }
+  assert.equal(checked, 36)
+  // 西半球经度必须还原为负值（原逆变换域 (-90°,270°] 未 wrap 时的回归形状）
+  const west = cameraAt(0, -120, 1, R)
+  const westNdc = west.project(0, -120)
+  assert.ok(westNdc)
+  const pickedWest = sphereSurfacePoint(west.cam, westNdc.ndcX, westNdc.ndcY, R)
+  assert.ok(pickedWest)
+  assert.ok(Math.abs(pickedWest.lng + 120) < 1e-6)
 })
 
-test('⑦地图/地球引擎修复契约（历史问题/历史问题/历史问题/历史问题）', () => {
+test('⑥b地球拾取：射线背向球面/未命中返回 null（WT87-09）', () => {
+  const R = 100
+  const away = {
+    origin: [0, 0, 3 * R] as Vec3,
+    dir: [0, 0, 1] as Vec3,
+    right: [1, 0, 0] as Vec3,
+    up: [0, 1, 0] as Vec3,
+    fovHalf: (45 * Math.PI) / 360,
+    aspect: 1,
+  }
+  assert.equal(sphereSurfacePoint(away, 0, 0, R), null)
+  // 正上方（+y）俯视球心命中北极
+  const down = { ...away, origin: [0, 3 * R, 0] as Vec3, dir: [0, -1, 0] as Vec3, up: [0, 0, -1] as Vec3 }
+  const hit = sphereSurfacePoint(down, 0, 0, R)
+  assert.ok(hit)
+  assert.ok(Math.abs(hit.lat - 90) < 1e-6, `北极拾取纬度 ${hit.lat}`)
+})
+
+test('⑦地图/地球引擎修复契约（历史问题/历史问题/历史问题/历史问题 + WT87-11）', () => {
   const mapSrc = readFileSync(join(ROOT, 'src/utils/threatScene.ts'), 'utf8')
   const globeSrc = readFileSync(join(ROOT, 'src/utils/threatGlobe.ts'), 'utf8')
   assert.match(mapSrc, /POINTY_TOP_HEX_VERTICES/, '地图点阵必须消费六边形顶点，而非圆弧')
@@ -176,9 +252,19 @@ test('⑦地图/地球引擎修复契约（历史问题/历史问题/历史问�
   }
   assert.doesNotMatch(mapSrc, /sawServerConfig/, 'setServer 不得只接受首次配置')
   assert.match(mapSrc, /server = \[centroid\[0\], centroid\[1\]\]/)
+  // WT87-11：两引擎的省级 hover 都必须按数据能力边界标注，不得把「无省级
+  // 数据源」渲染成「该省 0 次攻击」。
+  for (const src of [mapSrc, globeSrc]) {
+    assert.match(src, /hasProvinceStats\(/, '省级统计边界必须走共享判定')
+    assert.match(src, /无省级统计/, '海外下钻浮签必须显式标注无省级统计')
+  }
 })
 
-// ---- 数据级：省板包含断言（逐行解析三个静态模块） ----
+// ---- 数据级：省板包含断言（消费运行时导出的真实数据） ----
+// 审计 87 WEBT-09③：原实现按「一实体一行 + 两空格缩进」逐行正则解析三个数据
+// 模块源码——纯格式化（换行/缩进）即假红，结构重排则可能命中错误行（假绿）。
+// 三个模块本身已 import 为本测试的运行时导出，直接对数据结构求 bbox 即可；
+// 源码文本只保留「静态字面量、零运行时抓取」的构建期契约交叉校验。
 
 interface BBox {
   minLon: number
@@ -187,47 +273,43 @@ interface BBox {
   maxLat: number
 }
 
-/** 解析 admin1Provinces：行首 `"国家": [{ name: "省", …` → 国家键 → 聚合 bbox。 */
-function countryKeyBBoxes(src: string): Map<string, BBox> {
-  const map = new Map<string, BBox>()
-  for (const line of src.split('\n')) {
-    const keyM = line.match(/^  "([^"]+)": \[\{ name:/)
-    if (!keyM) continue
-    const b = lineBBox(line)
-    if (!b) continue
-    map.set(keyM[1], b)
+/** 多边形组（polygons → rings → 扁平 [lon,lat,…]）的聚合 bbox；无有效点 → null。 */
+function polysBBox(polys: readonly number[][][]): BBox | null {
+  let minLon = Infinity
+  let maxLon = -Infinity
+  let minLat = Infinity
+  let maxLat = -Infinity
+  for (const poly of polys) {
+    for (const ring of poly) {
+      for (let i = 0; i + 1 < ring.length; i += 2) {
+        const lon = ring[i]
+        const lat = ring[i + 1]
+        if (lon < minLon) minLon = lon
+        if (lon > maxLon) maxLon = lon
+        if (lat < minLat) minLat = lat
+        if (lat > maxLat) maxLat = lat
+      }
+    }
   }
-  return map
+  return Number.isFinite(minLon) ? { minLon, maxLon, minLat, maxLat } : null
 }
 
-/** 解析「每行一个条目」的模块：`name: "…"` 行 → 全部坐标对的聚合 bbox。 */
-function lineBBoxes(src: string): Map<string, BBox> {
-  const map = new Map<string, BBox>()
-  for (const line of src.split('\n')) {
-    const nameM = line.match(/name: "([^"]+)"/)
-    if (!nameM) continue
-    const b = lineBBox(line)
+/** 一组省级行（每行自身含 polys）的聚合 bbox。 */
+function rowsBBox(rows: readonly { polys: readonly number[][][] }[]): BBox | null {
+  let box: BBox | null = null
+  for (const row of rows) {
+    const b = polysBBox(row.polys)
     if (!b) continue
-    map.set(nameM[1], b)
+    box = box === null
+      ? b
+      : {
+          minLon: Math.min(box.minLon, b.minLon),
+          maxLon: Math.max(box.maxLon, b.maxLon),
+          minLat: Math.min(box.minLat, b.minLat),
+          maxLat: Math.max(box.maxLat, b.maxLat),
+        }
   }
-  return map
-}
-
-/** 单行数字 → bbox。 */
-function lineBBox(line: string): BBox | null {
-  const nums = line.match(/-?\d+(?:\.\d+)?/g)?.map(Number) ?? []
-  let minLon = 1e9
-  let maxLon = -1e9
-  let minLat = 1e9
-  let maxLat = -1e9
-  for (let k = 0; k + 1 < nums.length; k += 2) {
-    minLon = Math.min(minLon, nums[k])
-    maxLon = Math.max(maxLon, nums[k])
-    minLat = Math.min(minLat, nums[k + 1])
-    maxLat = Math.max(maxLat, nums[k + 1])
-  }
-  if (minLon === 1e9) return null
-  return { minLon, maxLon, minLat, maxLat }
+  return box
 }
 
 function within(inner: BBox, outer: BBox, tol: number): boolean {
@@ -243,28 +325,26 @@ test('③省板包含：10 国省级 bbox ⊆ 国家 bbox ±18°（拦截生成/
   // 统一 ±18°：覆盖全部源数据离岛噪声，仍拦截生成/映射类缺陷（度弧混淆/
   // 镜像/坐标轴互换的错位量级 ≥ 30°，国家尺度）。
   const TOL = 18
-  const admin1Src = readFileSync(join(ROOT, 'src/utils/admin1Provinces.ts'), 'utf8')
-  const worldSrc = readFileSync(join(ROOT, 'src/utils/worldBorders.ts'), 'utf8')
-  const chinaSrc = readFileSync(join(ROOT, 'src/utils/chinaProvinces.ts'), 'utf8')
-
-  const world = lineBBoxes(worldSrc)
-  assert.ok(world.size >= 150, `worldBorders 国家数 ${world.size} < 150`)
+  const countryBox = new Map<string, BBox>()
+  for (const country of WORLD_COUNTRIES) {
+    const box = polysBBox(country.polys)
+    if (box) countryBox.set(country.name, box)
+  }
+  assert.ok(countryBox.size >= 150, `worldBorders 国家数 ${countryBox.size} < 150`)
 
   // 中国高精度省界：逐省 bbox ⊆ 中国国家板 ± 18°
-  const chinaCountry = world.get('中国')
+  const chinaCountry = countryBox.get('中国')
   assert.ok(chinaCountry, 'worldBorders 缺「中国」')
   let chinaChecked = 0
-  for (const line of chinaSrc.split('\n')) {
-    const nameM = line.match(/\{ name: "([^"]+)"/)
-    if (!nameM) continue
+  for (const province of CHINA_PROVINCES) {
     // datav 南海诸岛为示意要素（南至 lat≈4°，内嵌于海南省多边形），NE 国界不含——豁免
-    if (nameM[1] === '南海诸岛' || nameM[1] === '海南省') continue
-    const b = lineBBox(line)
+    if (province.name === '南海诸岛' || province.name === '海南省') continue
+    const b = polysBBox(province.polys)
     if (!b) continue
     chinaChecked++
     assert.ok(
       within(b, chinaCountry, TOL),
-      `中国省界 ${nameM[1]} 越出国家板 ±${TOL}°: ${JSON.stringify(b)} vs ${JSON.stringify(chinaCountry)}`,
+      `中国省界 ${province.name} 越出国家板 ±${TOL}°: ${JSON.stringify(b)} vs ${JSON.stringify(chinaCountry)}`,
     )
   }
   assert.ok(chinaChecked >= 30, `中国省界校验 ${chinaChecked} < 30`)
@@ -272,15 +352,16 @@ test('③省板包含：10 国省级 bbox ⊆ 国家 bbox ±18°（拦截生成/
   // 9 国（admin1 聚合 bbox ⊆ 国家板 bbox ±18°）。选样排除海外领地成建制国家
   // （美/法/西/葡的 10m admin1 含 DOM-TOM/领地，110m 板不含——跨洋级源数据
   // 语义差非映射缺陷）；俄罗斯跨 ±180：110m 板 bbox 即全幅，包含恒成立。
-  const admin1 = countryKeyBBoxes(admin1Src)
-  assert.ok(admin1.size >= 200, `admin1 国家数 ${admin1.size} < 200`)
+  assert.ok(Object.keys(ADMIN1_PROVINCES).length >= 200, `admin1 国家数 ${Object.keys(ADMIN1_PROVINCES).length} < 200`)
   const targets = ['俄罗斯', '德国', '英国', '日本', '巴西', '印度', '澳大利亚', '意大利', '瑞典']
   let checked9 = 0
   for (const target of targets) {
-    const country = world.get(target)
+    const country = countryBox.get(target)
     assert.ok(country, `worldBorders 缺 ${target}`)
-    const aggr = admin1.get(target)
-    assert.ok(aggr, `admin1Provinces 缺 ${target}`)
+    const rows = ADMIN1_PROVINCES[target]
+    assert.ok(rows && rows.length > 0, `admin1Provinces 缺 ${target}`)
+    const aggr = rowsBBox(rows)
+    assert.ok(aggr, `${target} 省板无有效坐标`)
     assert.ok(
       within(aggr, country, TOL),
       `${target} 省板越出国家板 ±${TOL}°: ${JSON.stringify(aggr)} vs ${JSON.stringify(country)}`,
@@ -289,10 +370,17 @@ test('③省板包含：10 国省级 bbox ⊆ 国家 bbox ±18°（拦截生成/
   }
   assert.ok(checked9 === 9, `9 国校验 ${checked9} ≠ 9`)
 
-  // 导入自检：三个模块的运行时导出可用（单测加载链与 vite 同源）
-  assert.ok(ADMIN1_PROVINCES && typeof ADMIN1_PROVINCES === 'object')
-  assert.ok(Array.isArray(CHINA_PROVINCES) && CHINA_PROVINCES.length >= 30)
-  assert.ok(Array.isArray(WORLD_COUNTRIES) && WORLD_COUNTRIES.length >= 150)
+  // 构建期契约（唯一保留的源码文本校验）：三个数据模块必须是静态字面量导出，
+  // 运行时不抓取外部数据（零 CDN/零请求是威胁大屏的设计约束）。
+  for (const [relative, exportPattern] of [
+    ['src/utils/worldBorders.ts', /export const WORLD_COUNTRIES: CountryBorders\[\] = \[/],
+    ['src/utils/admin1Provinces.ts', /export const ADMIN1_PROVINCES: Record<string, Admin1Province\[\]> = \{/],
+    ['src/utils/chinaProvinces.ts', /export const CHINA_PROVINCES: ChinaProvince\[\] = \[/],
+  ] as const) {
+    const src = readFileSync(join(ROOT, relative), 'utf8')
+    assert.match(src, exportPattern, `${relative} 必须导出静态字面量`)
+    assert.doesNotMatch(src, /\bfetch\(|XMLHttpRequest/, `${relative} 不得运行时抓取数据`)
+  }
 })
 
 test('⑤反日界线 unwrap：俄罗斯主环 bbox 不再跨全宽', () => {

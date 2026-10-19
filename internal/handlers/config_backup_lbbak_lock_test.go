@@ -306,7 +306,7 @@ func TestLbbakImport_pausesSchedulingBeforeWafLock(t *testing.T) {
 	}
 	g := newBackupSectionRouter(h)
 	overrideTestWafPaths(t)
-	body := buildTestLbbak(t, completeBackupJSON(t, nil), []byte("x"))
+	body := buildTestLbbak(t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true}), []byte("x"))
 	services.WafFileLock().Lock()
 	unlocked := false
 	unlockWaf := func() {
@@ -472,7 +472,7 @@ func TestLbbakImport_unregistered_threat_entry_warns(t *testing.T) {
 	taskengine.SetLogDir(t.TempDir())
 	t.Cleanup(func() { taskengine.SetLogDir("") })
 
-	body := buildLbbakWithExtraThreatEntry(t, completeBackupJSON(t, nil), []byte("1.2.3.4\n5.6.7.8\n"))
+	body := buildLbbakWithExtraThreatEntry(t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true}), []byte("1.2.3.4\n5.6.7.8\n"))
 	rec := postLbbakImport(g, t, body, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("未登记威胁条目不应拒绝导入（老备份兼容）, got %d body=%s", rec.Code, rec.Body.String())
@@ -496,7 +496,7 @@ func TestLbbakImport_unregisteredThreatSkippedBySectionsWarnsNotImported(t *test
 		t.Fatalf("seed local admin: %v", err)
 	}
 
-	body := buildLbbakWithExtraThreatEntry(t, completeBackupJSON(t, nil), []byte("1.2.3.4\n"))
+	body := buildLbbakWithExtraThreatEntry(t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true}), []byte("1.2.3.4\n"))
 	rec := postLbbakImport(g, t, body, "?sections=rules")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
@@ -517,7 +517,7 @@ func TestLbbakImport_unregisteredThreatSkippedBySectionsWarnsNotImported(t *test
 // Then 预览 warnings 同样携带未登记告警（预览/导入口径一致）。
 func TestLbbakValidate_unregistered_threat_entry_warns(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	body := buildLbbakWithExtraThreatEntry(t, completeBackupJSON(t, nil), []byte("1.2.3.4\n"))
+	body := buildLbbakWithExtraThreatEntry(t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true}), []byte("1.2.3.4\n"))
 	rec := postLbbakValidate(t, h, body, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("validate status=%d body=%s", rec.Code, rec.Body.String())

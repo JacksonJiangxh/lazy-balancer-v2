@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"lazy-balancer-v2/internal/taskengine"
@@ -61,8 +62,6 @@ type CRSUpdateStatusSnapshot struct {
 	FinishedAt string
 	Message    string
 	Version    string
-	// Cancellable: 运行中且支持手动取消（任务监控，v2.3.4）。
-	Cancellable bool
 }
 
 // CRSUpdateManager runs CRS manual/auto updates single-flight and persists
@@ -223,16 +222,41 @@ func (m *CRSUpdateManager) RefreshLatestAsync() {
 	}()
 }
 
-func currentCRSVersion() string {
+// readCurrentCRSVersion 是版本读取的唯一真源（SS87-历史问题/历史问题）：区分
+// 「行缺失/空值（首装→镜像捆绑版本，与 ensureCRSVersionRow 播种同口径）」与
+// 「读失败（返回错误，由调用方 fail-visible）」。此前二者共用一处回落逻辑，
+// 版本行瞬时读取失败被当作 bundled 参与「已是最新」短路——远端 tag 恰等于
+// bundled 时更新被静默跳过（下一轮才重试，且无任何可见失败信号）。
+func readCurrentCRSVersion() (string, error) {
 	var version string
-	if err := db.DB.QueryRow("SELECT version FROM security_crs_version WHERE id=1").Scan(&version); err != nil || version == "" {
+	err := db.DB.QueryRow("SELECT version FROM security_crs_version WHERE id=1").Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CRSBundledVersion, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if version == "" {
+		return CRSBundledVersion, nil
+	}
+	return version, nil
+}
+
+// currentCRSVersion 是展示/日志口径的容错读取（更新判定使用
+// crsCurrentVersionForRun 拿错误，不得用本函数短路）：读失败记 warn 后回落
+// 镜像捆绑版本，避免展示层因瞬时 DB 故障中断。
+func currentCRSVersion() string {
+	version, err := readCurrentCRSVersion()
+	if err != nil {
+		Logf("warn", "crs update: 读取当前 CRS 版本失败，按镜像捆绑版本展示: %v", err)
 		return CRSBundledVersion
 	}
 	return version
 }
 
-// crsCurrentVersionForRun 安装前版本判定的测试缝；生产恒指向 currentCRSVersion。
-var crsCurrentVersionForRun = currentCRSVersion
+// crsCurrentVersionForRun 安装前版本判定的测试缝；生产恒指向
+// readCurrentCRSVersion（读错误必须上抛，不得静默回落 bundled）。
+var crsCurrentVersionForRun = readCurrentCRSVersion
 
 // StartUpdate begins an async update; only one may run at a time. 返回本次 run
 // 的完成通道（历史问题 B-F2）：调度器 rearm 须等待该捕获通道而非回读现行 m.runDone
@@ -250,14 +274,30 @@ func (m *CRSUpdateManager) StartUpdate(trigger string, rc *taskengine.RunContext
 	m.running = true
 	m.runDone = make(chan struct{})
 	m.state = crsTaskState{status: CRSStatusChecking, trigger: trigger, startedAt: time.Now().UTC()}
+	// SS87-历史问题：可取消 ctx 与 running 在同一临界区登记——StartUpdate 返回后
+	// 立刻 CancelRunning（任务引擎 CancelHook／前端连点／自动化脚本）必须命中，
+	// 不得因 run goroutine 尚未执行而读到 runCancel==nil 静默返回 false。
+	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
+	m.runCancel = runCancel
 	done := m.runDone
 	m.mu.Unlock()
 
 	go func() {
 		defer close(done)
-		m.run(trigger, rc)
+		defer runCancel()
+		m.runWithContext(runCtx, trigger, rc)
 	}()
 	return done, nil
+}
+
+// updateRunBaseContext 任务运行上下文基座（CRS/IP2Region 同源）：F-历史问题-01
+// 引擎 demote 中止（SetRole 取消在途 Scheduled）与手动取消同通道传播；
+// nil rc（测试/内部路径）回退 Background 保持旧语义。
+func updateRunBaseContext(rc *taskengine.RunContext) context.Context {
+	if rc != nil && rc.Ctx != nil {
+		return rc.Ctx
+	}
+	return context.Background()
 }
 
 func (m *CRSUpdateManager) IsRunning() bool {
@@ -298,8 +338,21 @@ func (m *CRSUpdateManager) recordLatestSkip(trigger string) {
 	m.mu.Unlock()
 }
 
-// run executes the full update pipeline synchronously.
+// run 同步执行一次更新（测试/内部直调路径）：自建可取消 ctx 并登记
+// runCancel；生产入口经 StartUpdate 预建 ctx（SS87-历史问题——取消能力不得晚于
+// StartUpdate 返回才就绪）。
 func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
+	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
+	defer runCancel()
+	m.mu.Lock()
+	m.runCancel = runCancel
+	m.mu.Unlock()
+	m.runWithContext(runCtx, trigger, rc)
+}
+
+// runWithContext 是更新管线本体；runCtx 由调用方创建（StartUpdate 或 run），
+// 生命周期归还调用方。
+func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string, rc *taskengine.RunContext) {
 	operator := "system"
 	if rc != nil && rc.Operator != "" {
 		operator = rc.Operator
@@ -332,17 +385,8 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	// 族体零 RecordRun 调用。
 	// F-历史问题-01（历史）：runCtx 派生自 rc.Ctx——引擎 demote 中止（SetRole
 	// 取消在途 Scheduled）与手动取消同通道传播；nil rc（测试/内部路径）回退
-	// Background 保持旧语义。
-	runBase := context.Background()
-	if rc != nil && rc.Ctx != nil {
-		runBase = rc.Ctx
-	}
-	runCtx, runCancel := context.WithCancel(runBase)
-	m.mu.Lock()
-	m.runCancel = runCancel
-	m.mu.Unlock()
+	// Background 保持旧语义。SS87-历史问题：ctx 由调用方（StartUpdate/run）预建。
 	defer func() {
-		runCancel()
 		m.mu.Lock()
 		m.running = false
 		m.mu.Unlock()
@@ -405,7 +449,15 @@ func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	// 无条件 downloadAndInstall 降级为更旧树,与 UI IsLatest(<=0 即最新)语义相悖。
 	// 历史问题：精确相等短路（与格式无关）——相同版本即「已是最新」，不再依赖
 	// 版本解析；不同且不可比较显式 fail-visible（见下方 else-if）。
-	currentVersion := crsCurrentVersionForRun()
+	// SS87-历史问题：读版本行失败（非「行缺失」）不再回落 bundled 参与短路——
+	// 以 bundled 参与「已是最新」判定会在远端 tag 恰等于 bundled 时静默跳过，
+	// 且掩盖瞬时 DB 故障；此处显式失败（下一排程槽重试）。
+	currentVersion, verErr := crsCurrentVersionForRun()
+	if verErr != nil {
+		m.fail(fmt.Errorf("读取当前 CRS 版本失败: %w", verErr), false)
+		m.advanceSlotIfAuto(trigger)
+		return
+	}
 	if tag == currentVersion {
 		WriteCRSUpdateLog("INFO", string(CRSStatusSuccess), "已是最新版本，无需更新")
 		m.recordLatestSkip(trigger)

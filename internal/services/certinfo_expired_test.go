@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"lazy-balancer-v2/internal/db"
 )
 
 // expiredShapeCertAndKey 生成指定域名/有效期外的证书+私钥 PEM 对。
@@ -52,7 +54,10 @@ func TestGetRuleCertInfo_reportsExpiredACMECert(t *testing.T) {
 	}
 
 	// When
-	info := GetRuleCertInfo("lb_expired")
+	info, err := GetRuleCertInfo("lb_expired")
+	if err != nil {
+		t.Fatalf("GetRuleCertInfo: %v", err)
+	}
 
 	// Then:expired 而非「尚未签发」
 	if info == nil {
@@ -63,5 +68,40 @@ func TestGetRuleCertInfo_reportsExpiredACMECert(t *testing.T) {
 	}
 	if !strings.Contains(info.Error, "已过期") {
 		t.Fatalf("error=%q, want ACME 证书已过期", info.Error)
+	}
+}
+
+// ---- 历史（SV历史问题）----
+
+// SV历史问题：GetRuleCertInfo 的读故障必须上抛（handler 500），不得折叠成
+// 「无证书信息」假成功；规则不存在仍是 (nil, nil)。
+func TestGetRuleCertInfo_propagates_database_errors(t *testing.T) {
+	newClusterTestService(t)
+	if err := db.DB.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	// When
+	info, err := GetRuleCertInfo("lb_missing")
+
+	// Then
+	if err == nil {
+		t.Fatalf("info=%v err=nil, want DB error（fail-visible）", info)
+	}
+	if info != nil {
+		t.Fatalf("info=%v, want nil on error", info)
+	}
+}
+
+func TestGetRuleCertInfo_missing_rule_is_not_an_error(t *testing.T) {
+	newClusterTestService(t)
+
+	info, err := GetRuleCertInfo("lb_missing")
+
+	if err != nil {
+		t.Fatalf("err=%v, want nil（规则不存在沿用 200+null 契约）", err)
+	}
+	if info != nil {
+		t.Fatalf("info=%v, want nil", info)
 	}
 }

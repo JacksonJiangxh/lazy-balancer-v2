@@ -18,6 +18,11 @@ export interface TrafficDeltaResult {
   readonly baseline: boolean
   /** 计数器回退或抽样比变化——曲线应断开并重建基线。 */
   readonly reset: boolean
+  /** 本轮**归一后**的计数（缺失/非数值已按 0 处理）：调用方必须用它与
+   *  `at`/`sampleN` 直接组装下一轮 `TrafficBaseline`，不得再从原始响应重建
+   *  （原实现两侧各自归一，原始响应缺字段时基线存 undefined → 差分恒 NaN
+   *  静默丢弃该国，WT87-07）。 */
+  readonly counts: ReadonlyMap<string, { normal: number; attack: number }>
   readonly normalDeltas: { name: string; count: number }[]
   readonly attackDeltas: { name: string; count: number }[]
   readonly normalTotal: number
@@ -63,13 +68,13 @@ export function trafficDelta(
       }
     }
   }
-  if (!prev) return { baseline: true, reset: false, normalDeltas: [], attackDeltas: [], normalTotal: 0, attackTotal: 0, normalQps: 0, attackQps: 0, sampleN: safeSample }
+  if (!prev) return { baseline: true, reset: false, counts, normalDeltas: [], attackDeltas: [], normalTotal: 0, attackTotal: 0, normalQps: 0, attackQps: 0, sampleN: safeSample }
   if (prev.sampleN !== safeSample) reset = true
-  if (reset) return { baseline: true, reset: true, normalDeltas: [], attackDeltas: [], normalTotal: 0, attackTotal: 0, normalQps: 0, attackQps: 0, sampleN: safeSample }
+  if (reset) return { baseline: true, reset: true, counts, normalDeltas: [], attackDeltas: [], normalTotal: 0, attackTotal: 0, normalQps: 0, attackQps: 0, sampleN: safeSample }
   const elapsedSec = (now - prev.at) / 1000
   const normalQps = elapsedSec > 0 ? normalTotal / elapsedSec : 0
   const attackQps = elapsedSec > 0 ? attackTotal / elapsedSec : 0
-  return { baseline: false, reset: false, normalDeltas, attackDeltas, normalTotal, attackTotal, normalQps, attackQps, sampleN: safeSample }
+  return { baseline: false, reset: false, counts, normalDeltas, attackDeltas, normalTotal, attackTotal, normalQps, attackQps, sampleN: safeSample }
 }
 
 /** 拦截/分钟展示：后端已是一位小数，UI 用 ×10 整数动画后还原。 */

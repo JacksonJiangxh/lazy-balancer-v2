@@ -8,6 +8,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+./scripts/check-no-audit-artifacts.sh
+
 modules=(
   "."
   "caddygeoip"

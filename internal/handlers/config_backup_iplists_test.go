@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 func postBackupImport(t *testing.T, h *Handlers, backup string) *httptest.ResponseRecorder {
@@ -30,10 +31,10 @@ func postBackupImport(t *testing.T, h *Handlers, backup string) *httptest.Respon
 func TestImportConfigBackup_rejectsPolicyReferencingMissingIPList(t *testing.T) {
 	// Given：策略引用列表 99，备份仅有列表 1
 	h := newBackupTestHandlers(t)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_policies": {{"id": 7, "name": "refs-policy", "mode": "off", "ip_acl_list_refs": "[99]", "ip_whitelist_refs": "[1]"}},
 		"security_ip_lists": {{"id": 1, "name": "list-1", "entries": "[]"}},
-	})
+	}, EmptyConfigIfNil: true})
 
 	// When
 	response := postBackupImport(t, h, backup)
@@ -68,13 +69,13 @@ func TestImportConfigBackup_rejectsPolicyReferencingMissingIPList(t *testing.T) 
 func TestImportConfigBackup_acceptsValidIPListReferences(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_policies": {{"id": 7, "name": "refs-policy", "mode": "off", "ip_acl_list_refs": "[1,2]", "ip_whitelist_refs": "[2]"}},
 		"security_ip_lists": {
 			{"id": 1, "name": "acl-list", "entries": `[{"value":"10.0.0.1","remark":"r"}]`},
 			{"id": 2, "name": "wl-list", "entries": ""},
 		},
-	})
+	}, EmptyConfigIfNil: true})
 
 	// When
 	response := postBackupImport(t, h, backup)
@@ -125,10 +126,10 @@ func TestImportConfigBackup_rejectsMalformedIPListRefs(t *testing.T) {
 			h := newBackupTestHandlers(t)
 			policy := map[string]any{"id": 7, "name": "refs-policy", "mode": "off"}
 			policy[tt.field] = tt.refs
-			backup := completeBackupJSON(t, map[string][]map[string]any{
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 				"security_policies": {policy},
 				"security_ip_lists": {{"id": 1, "name": "list-1", "entries": "[]"}},
-			})
+			}, EmptyConfigIfNil: true})
 
 			// When
 			response := postBackupImport(t, h, backup)
@@ -161,9 +162,9 @@ func TestImportConfigBackup_rejectsIPListWithInvalidEntries(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Given
 			h := newBackupTestHandlers(t)
-			backup := completeBackupJSON(t, map[string][]map[string]any{
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 				"security_ip_lists": {{"id": 1, "name": "bad-list", "entries": tt.entries}},
-			})
+			}, EmptyConfigIfNil: true})
 
 			// When
 			response := postBackupImport(t, h, backup)
@@ -238,9 +239,9 @@ func TestImportConfigBackup_emptyIPListsTableWipesLocalLists(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (id,name,entries) VALUES (11,'local-only','[]')`); err != nil {
 		t.Fatal(err)
 	}
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_ip_lists": {},
-	})
+	}, EmptyConfigIfNil: true})
 
 	// When
 	response := postBackupImport(t, h, backup)
@@ -276,7 +277,9 @@ func emptyBackupSecurityTables() map[string][]map[string]any {
 }
 
 func TestValidateV2BackupSecurityPolicies_rejectsBuiltinListMisuse(t *testing.T) {
-	builtinList := map[string]any{"id": 1, "name": "内置威胁名单", "system": 1, "entries": `[{"value":"203.0.113.8","remark":""}]`}
+	// 历史问题-历史问题：内置名单名称走种子白名单，夹具必须使用真实种子名（此前
+	// 用「内置威胁名单」占位名——A3 门会按伪造内置名拒绝）。
+	builtinList := map[string]any{"id": 1, "name": db.ThreatSystemLists()[0].Name, "system": 1, "entries": `[{"value":"203.0.113.8","remark":""}]`}
 	for _, tc := range []struct {
 		name   string
 		policy map[string]any
@@ -418,5 +421,38 @@ func TestValidateBuiltinThreatListRefs_chunksLargeReferenceSets(t *testing.T) {
 	}
 	if !strings.Contains(message, "不能用于 CRS 排除") {
 		t.Fatalf("message=%q, want built-in exclusion rejection after chunked lookup", message)
+	}
+}
+
+// ── 历史问题-历史问题（历史）：system=1 名单名称白名单（威胁/爬虫/自动封禁
+// 种子集合）——任意伪造内置名入库后管理员无法编辑/删除，UI 却宣称任务维护。 ──
+
+func TestA3_87_P3_02_rejectsForgedSystemIPListNames(t *testing.T) {
+	threatName := db.ThreatSystemLists()[0].Name
+	crawlerName := services.CrawlerIPListName("googlebot")
+	for _, tc := range []struct {
+		name    string
+		listRow map[string]any
+		wantErr bool
+	}{
+		{"威胁库种子名", map[string]any{"id": 1, "name": threatName, "entries": "[]", "system": 1}, false},
+		{"爬虫种子名", map[string]any{"id": 2, "name": crawlerName, "entries": "[]", "system": 1}, false},
+		{"自动封禁预置名", map[string]any{"id": 3, "name": services.AutobanPresetListName, "entries": "[]", "system": 1}, false},
+		{"任意伪造内置名", map[string]any{"id": 4, "name": "任意内置名单", "entries": "[]", "system": 1}, true},
+		{"普通用户名单不受限", map[string]any{"id": 5, "name": "我的黑名单", "entries": "[]", "system": 0}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tables := map[string][]map[string]any{"security_ip_lists": {tc.listRow}}
+			err := validateV2BackupSecurityPolicies(tables, true)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "内置名单") {
+					t.Fatalf("err=%v, want 内置名单来源拒绝", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("err=%v, want nil（合法来源）", err)
+			}
+		})
 	}
 }

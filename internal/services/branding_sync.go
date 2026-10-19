@@ -1,14 +1,14 @@
 package services
 
 import (
-	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"lazy-balancer-v2/internal/db"
-	"lazy-balancer-v2/internal/models"
 )
 
 // RefreshBrandingMirror 把主节点 branding.json 原文镜像到
@@ -16,9 +16,19 @@ import (
 // (branding_json 已入 OF 列表)bump cluster_version,快照缓存随之失效,
 // 变更自然流向从节点;内容不变零写入零版本扰动。文件缺失镜像为空串。
 // 仅主节点生效(WHERE is_master=1,与触发器 WHEN 同守卫)。
-// 调用点:快照服务入口(每同步周期)与 GetBranding(文件变化检测路径)。
+// 调用点:GetBranding(文件变化检测路径)等经全局 db.DB 的既有调用方。
 func RefreshBrandingMirror(dataDir string) (changed bool, err error) {
-	if db.DB == nil {
+	return RefreshBrandingMirrorDB(db.DB, dataDir)
+}
+
+// RefreshBrandingMirrorDB 是 RefreshBrandingMirror 的显式库句柄形态
+// （S历史问题-05，历史）：快照入口必须写本服务的 s.db，而不是全局
+// db.DB——测试/多库构造下两者不同源，镜像可能落到非本服务的库。
+// 同时把「先读后写」短路落在这里：每次从节点轮询（含纯 304 轮）都会调用
+// 本函数，内容未变时不再向主库发一条 UPDATE 写语句（N 从节点 = N 次/分钟
+// 写事务此前无谓放大）。
+func RefreshBrandingMirrorDB(database *sql.DB, dataDir string) (changed bool, err error) {
+	if database == nil {
 		return false, nil
 	}
 	content := ""
@@ -38,7 +48,18 @@ func RefreshBrandingMirror(dataDir string) (changed bool, err error) {
 	} else if !os.IsNotExist(rerr) {
 		return false, fmt.Errorf("读取品牌配置文件: %w", rerr)
 	}
-	result, err := db.DB.Exec(
+	// 先读后写短路：与 UPDATE 的 is_master=1 守卫同语义（非主节点无行，
+	// 直接返回「未变更」）。读失败且非「无行」时按不可判定继续走写入——
+	// 保持旧行为（写入自身会暴露真实失败面），不把读故障伪装成未变更。
+	var current string
+	if qerr := database.QueryRow(`SELECT COALESCE(branding_json,'') FROM global_config WHERE id=1 AND COALESCE(is_master,1)=1`).Scan(&current); qerr == nil {
+		if current == content {
+			return false, nil
+		}
+	} else if errors.Is(qerr, sql.ErrNoRows) {
+		return false, nil
+	}
+	result, err := database.Exec(
 		`UPDATE global_config SET branding_json=? WHERE id=1 AND COALESCE(is_master,1)=1 AND COALESCE(branding_json,'')<>?`,
 		content, content)
 	if err != nil {
@@ -130,21 +151,24 @@ func MaterializeBranding(dataDir, content string) error {
 // 恒同步+schema v3 强制,旧语义「开关关闭/旧主节点」消失,历史问题):重置为
 // 全空模板收敛默认品牌——不直接删除,loadBrandingConfig 对缺失文件保内存
 // 上一份旧值(2026-09-11 半截写窗口裁定),删除会让从端 /branding 长期陈旧。
-func applySnapshotBranding(dataDir, content string) {
+func applySnapshotBranding(dataDir, content string) error {
 	if dataDir == "" {
-		return
+		return nil
 	}
 	reset := content == ""
 	if err := MaterializeBranding(dataDir, content); err != nil {
 		Logf("error", "同步品牌配置落盘失败: %v", err)
-		RecordAuditLog("system", "同步失败", "集群同步", fmt.Sprintf("品牌配置落盘失败: %v", err), "")
-		return
+		// 失败审计由调用方（applySnapshotBrandingChecked）经 SyncService 的
+		// 失败节流写入（S历史问题-01）：品牌落盘失败会在 304 补偿重拉/标记重试
+		// 下每轮重达此处，未节流的操作审计会按退避轮次洪泛。
+		return err
 	}
 	if reset {
 		RecordAuditLog("system", "同步", "集群同步", "品牌配置已重置为默认（主节点无品牌文件）", "")
 	} else {
 		RecordAuditLog("system", "同步", "集群同步", "品牌配置已同步生效", "")
 	}
+	return nil
 }
 
 // ReconcileBrandingFile 核对本地 branding.json 与 global_config.branding_json
@@ -153,11 +177,17 @@ func applySnapshotBranding(dataDir, content string) {
 // 通道：文件被删除或损坏后会永久停留默认品牌，直到 users 节发生任意变更。
 // 返回是否发生重写；内容一致时为 false（零 mtime 扰动）。
 func ReconcileBrandingFile(dataDir string) (bool, error) {
-	if db.DB == nil || dataDir == "" {
+	return ReconcileBrandingFileDB(db.DB, dataDir)
+}
+
+// ReconcileBrandingFileDB 是 ReconcileBrandingFile 的显式库句柄形态
+// （S历史问题-05）：集群同步路径读本服务 s.db 的镜像列，与写入侧同源。
+func ReconcileBrandingFileDB(database *sql.DB, dataDir string) (bool, error) {
+	if database == nil || dataDir == "" {
 		return false, nil
 	}
 	var content string
-	if err := db.DB.QueryRow("SELECT COALESCE(branding_json,'') FROM global_config WHERE id=1").Scan(&content); err != nil {
+	if err := database.QueryRow("SELECT COALESCE(branding_json,'') FROM global_config WHERE id=1").Scan(&content); err != nil {
 		return false, fmt.Errorf("读取品牌配置镜像: %w", err)
 	}
 	expected := content
@@ -202,9 +232,4 @@ func extractBrandingStringField(content, field string) string {
 		return "" // 非字符串/畸形值按空处理(消费方回退默认)
 	}
 	return s
-}
-
-// SnapshotForTest 暴露缓存旁路快照供测试断言(生产路径经 Snapshot)。
-func (s *ClusterService) SnapshotForTest(ctx context.Context) (models.ClusterSnapshot, error) {
-	return s.clusterSnapshotBypassingCache(ctx)
 }

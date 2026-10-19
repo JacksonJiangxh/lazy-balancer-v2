@@ -308,6 +308,44 @@ func TestStore_quarantines_unsupported_version_state_file(t *testing.T) {
 	}
 }
 
+// DNS-87-F11（历史）：隔离文件名原为秒级时间戳——同一秒内二次损坏时
+// os.Rename 覆盖上一份隔离文件（POSIX rename 语义），取证样本丢失。判定用
+// 固定时钟（corruptClock 接缝）制造同刻碰撞：两轮损坏必须留下两份独立样本。
+func TestStore_quarantineKeepsDistinctSamplesOnClockCollision(t *testing.T) {
+	original := corruptClock
+	corruptClock = func() time.Time { return time.Unix(1700000000, 0) }
+	t.Cleanup(func() { corruptClock = original })
+
+	store := newStore(t)
+	corrupt := `{"version":1,"records":[{`
+	for round := range 2 {
+		if err := os.WriteFile(store.path, []byte(corrupt), 0600); err != nil {
+			t.Fatalf("seed corrupt store (round %d): %v", round, err)
+		}
+		if err := store.Add(Record{Provider: "dnspod", Zone: "example.com", FQDN: "_acme-challenge.example.com.",
+			Value: "alpha", RecordID: strconv.Itoa(200 + round)}); err != nil {
+			t.Fatalf("add after corruption (round %d): %v", round, err)
+		}
+	}
+
+	quarantined, err := filepath.Glob(store.path + ".corrupt-*")
+	if err != nil {
+		t.Fatalf("glob quarantined files: %v", err)
+	}
+	if len(quarantined) != 2 {
+		t.Fatalf("quarantined files=%v, want two distinct samples（同秒碰撞不得互相覆盖）", quarantined)
+	}
+	for _, path := range quarantined {
+		original, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatalf("read quarantined %s: %v", path, readErr)
+		}
+		if string(original) != corrupt {
+			t.Fatalf("quarantined %s content=%q, want corrupt bytes %q", path, original, corrupt)
+		}
+	}
+}
+
 func TestStore_concurrent_stores_mixed_operations(t *testing.T) {
 	// Given: two Store instances over the same file (writer plus a
 	// restarted reader) and concurrent goroutines mixing Add / Remove /
@@ -447,6 +485,10 @@ func TestReplace_sharesStoreLockAndPreservesStateOnInvalidSnapshot(t *testing.T)
 	}
 
 	// When：Store 的读写锁被持有时，快照替换必须等待同一把锁。
+	// DNS-87-F6（历史）：原形态只用 50ms 固定窗口判定「未返回」——负载高
+	// 时 goroutine 尚未走到 fileMu.Lock() 也会静默通过（锁共享断言变成空
+	// 断言）。现按可观察副作用判定：锁内文件内容必须保持原快照，解锁后必须
+	// 变成 replacement；Replace 自身先取锁再解码，锁前准备工作为零。
 	replacement := []byte(`{"version":1,"records":[{"provider":"dnspod","zone":"example.com","fqdn":"_acme-challenge.example.com.","value":"token","record_id":"200"}]}`)
 	fileMu.Lock()
 	started := make(chan struct{})
@@ -460,11 +502,18 @@ func TestReplace_sharesStoreLockAndPreservesStateOnInvalidSnapshot(t *testing.T)
 	case err := <-done:
 		fileMu.Unlock()
 		t.Fatalf("Replace 绕过ed store fileMu: err=%v", err)
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(200 * time.Millisecond):
+	}
+	if got, readErr := os.ReadFile(path); readErr != nil || string(got) != string(initial) {
+		fileMu.Unlock()
+		t.Fatalf("Replace wrote the file while store fileMu was held: content=%q err=%v", got, readErr)
 	}
 	fileMu.Unlock()
 	if err := <-done; err != nil {
 		t.Fatalf("replace after store lock release: %v", err)
+	}
+	if got, readErr := os.ReadFile(path); readErr != nil || string(got) != string(replacement) {
+		t.Fatalf("replace did not apply the snapshot after lock release: content=%q err=%v", got, readErr)
 	}
 
 	// Then：非法快照不得破坏已提交状态；普通 Store.Add 仍可继续复用同一文件。

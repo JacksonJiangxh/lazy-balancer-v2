@@ -43,6 +43,9 @@ services:
         # 两处 image tag + 本行、Dockerfile ARG VERSION、branding.ts appVersion
         # 回退值、internal/config/config.go APP_VERSION 回退、buildx --build-arg。
         # 发版检查单以 lazy-balancer-release 技能步骤 2 为唯一清单。
+        # PD-01（历史）双轨口径：VERSION 恒为正式版本号（面板展示口径），
+        # 上方两处 image tag 可带 -beta 通道后缀——刻意不同，判定口径是
+        # 「tag 去掉通道后缀 == APP_VERSION」（v2.3.8-beta 镜像内 APP_VERSION=v2.3.8）。
         VERSION: v2.3.8
     container_name: lazy-balancer
     network_mode: host

@@ -108,7 +108,7 @@ import { useTrustAssociation } from '@/composables/useTrustAssociation'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type { IpListOption } from '@/composables/useIpListAdd'
 // 分组类型路由（历史问题）：inferPolicyType 为策略类型单一实现（securityStages 导出，禁第二实现）
-import { inferPolicyType, parseIPList, parseRefIds, entryMatchesIp, invalidateSharedEntriesCache, ensureSharedEntries, sharedEntriesCache, subscribeSharedEntriesCache, mergeIpEntryValues } from '@/utils/securityStages'
+import { aclAssociateSides, inferPolicyType, parseIPList, parseRefIds, entryMatchesIp, invalidateSharedEntriesCache, ensureSharedEntries, sharedEntriesCache, subscribeSharedEntriesCache, mergeIpEntryValues } from '@/utils/securityStages'
 import { popperViewportSafe } from '@/utils/popper'
 import type { SecurityPolicyType, SecurityPolicyTypeInput } from '@/utils/securityStages'
 import { planTrustRemoval } from '@/utils/trustRemoval'
@@ -162,6 +162,11 @@ interface PolicyDetail {
 
 const props = defineProps<{ ip: string; location: string; ruleCaddyId?: string }>()
 
+// W87-07：client_ip 可能带首尾空白（导入/带外数据）。parseIPList 内部已 trim，
+// 而移除/legacy 判定曾用未 trim 的原始 props.ip——状态显示「已信任/已拦截」却在
+// 移除时提示「已不在名单」或过滤不生效。全流程统一读本 computed。
+const trimmedIp = computed(() => props.ip.trim())
+
 // 紧凑归属地：国内只显市/海外显国家（2026-10-13 用户裁定确认，覆盖 2026-09-13
 // 「海外恒显海外」旧裁定——GeoIP 海外国家细化配套）/保留地址原样，弹窗/悬浮
 // 显示完整
@@ -187,7 +192,7 @@ let eventCountSeq = 0
 const loadEventCount = async (): Promise<void> => {
   const seq = ++eventCountSeq
   try {
-    const res = await request.get<APIResponse<{ count: number }>>('/security/events/count', { params: { ip: props.ip, days: 30 }, silent: true })
+    const res = await request.get<APIResponse<{ count: number }>>('/security/events/count', { params: { ip: trimmedIp.value, days: 30 }, silent: true })
     if (seq === eventCountSeq) eventCount.value = res.data?.count ?? 0
   } catch {
     if (seq === eventCountSeq) eventCount.value = null
@@ -405,7 +410,7 @@ const countryZh = useCountryNamesCn()
 // computed：本 IP 是否被任一策略信任 + 命中本 IP 的非系统引用名单集合，
 // rowView 内退化为布尔读取/Set 查询（O(策略×条目) 一次）。
 const trustHitSummary = computed(() => {
-  const ip = props.ip.trim()
+  const ip = trimmedIp.value
   let trusted = false
   let detectionOwner: PolicyRow | undefined
   let passthroughOwner: PolicyRow | undefined
@@ -423,14 +428,14 @@ const ipHitListIds = computed(() => {
   const hit = new Set<number>()
   for (const l of ipLists.value) {
     if (l.system) continue
-    if ((ipListEntries.value[l.id] ?? []).some((e) => entryMatchesIp(e, props.ip.trim()))) hit.add(l.id)
+    if ((ipListEntries.value[l.id] ?? []).some((e) => entryMatchesIp(e, trimmedIp.value))) hit.add(l.id)
   }
   return hit
 })
 // remove-ip 只删除精确 value；CIDR 覆盖命中仅用于状态展示，不产生移除按钮。
 const ipExactListIds = computed(() => {
   const hit = new Set<number>()
-  const ip = props.ip.trim()
+  const ip = trimmedIp.value
   for (const l of ipLists.value) {
     if (l.system) continue
     if ((ipListEntries.value[l.id] ?? []).includes(ip)) hit.add(l.id)
@@ -446,11 +451,11 @@ const rowView = (policy: PolicyRow): RowView => {
   // 覆盖的 IP 无法由 PUT 精确剔除）
   const trustEntries = mergedTrustEntries(policy)
   const trustInlineEntries = parseIPList(policy.ip_whitelist)
-  const inTrustInlineExact = trustInlineEntries.includes(props.ip.trim())
+  const inTrustInlineExact = trustInlineEntries.includes(trimmedIp.value)
   const view: RowView = {
     policy,
-    inTrust: trustEntries.some((e) => entryMatchesIp(e, props.ip.trim())),
-    inTrustInline: trustInlineEntries.some((e) => entryMatchesIp(e, props.ip.trim())),
+    inTrust: trustEntries.some((e) => entryMatchesIp(e, trimmedIp.value)),
+    inTrustInline: trustInlineEntries.some((e) => entryMatchesIp(e, trimmedIp.value)),
     inTrustInlineExact,
     trustEnabled: policy.ip_whitelist_enabled !== false,
     trustCount: trustEntries.length,
@@ -460,7 +465,7 @@ const rowView = (policy: PolicyRow): RowView => {
     canAddTrust: false,
     canRemoveTrust: false,
     canClearDeadTrust: false,
-    inLegacy: parseIPList(policy.ip_blacklist).includes(props.ip),
+    inLegacy: parseIPList(policy.ip_blacklist).includes(trimmedIp.value),
     tagType: 'info',
     tagLabel: '未启用',
     statusClass: '',
@@ -537,13 +542,22 @@ const rowView = (policy: PolicyRow): RowView => {
   view.geoRegions = regionCount > 0 ? regions.map((r) => countryLabel(zh, r)).join('、') : ''
   if (!policy.ip_acl_enabled) {
     // ACL 未启用：如地域拦截在用则明示「地域拦截在用（本事件可来自地域）」；
-    // 关联地址列表动作仍可用（关联后随 ACL 启用生效）
+    // 关联地址列表动作仍可用（关联后随 ACL 启用生效）。历史问题：黑白共用
+    // ip_acl_list_refs，动作必须按当前 ip_acl_mode 门控——同时给「拦截」「放行」
+    // 会把条目写进同一字段，ACL 启用后按模式生效，用户意图被反转。
     if (geoActive) {
       view.tagType = 'warning'
       view.tagLabel = '地域拦截'
-      view.statusLabel = `地域拦截已启用 · 拦截区域：${view.geoRegions}（IP ACL 未启用）`
-      view.canAssociate = true
-      view.canAssociateAllow = true
+      // 模式如实展示：动作集合被模式门控（绕过/空模式不给动作），用户需要
+      // 知道当前生效语义，才不会把「放行/拦截」理解成对两种模式都成立。
+      const modeLabel = policy.ip_acl_mode === 'deny' ? ' · 黑名单模式'
+        : policy.ip_acl_mode === 'allow' ? ' · 白名单模式'
+          : policy.ip_acl_mode === '绕过' ? ' · 免检测模式'
+            : ' · 模式未配置'
+      view.statusLabel = `地域拦截已启用 · 拦截区域：${view.geoRegions}（IP ACL 未启用${modeLabel}）`
+      const sides = aclAssociateSides(policy.ip_acl_mode)
+      view.canAssociate = sides.deny
+      view.canAssociateAllow = sides.allow
     }
     return view
   }
@@ -555,9 +569,9 @@ const rowView = (policy: PolicyRow): RowView => {
   // 不再亮「移除」，状态行改标「来自内联 CIDR」引导到策略编辑。
   const list = mergedAclEntries(policy)
   const aclInlineEntries = parseIPList(policy.ip_acl_list)
-  const inInlineExact = aclInlineEntries.includes(props.ip.trim())
-  const inInline = aclInlineEntries.some((e) => entryMatchesIp(e, props.ip.trim()))
-  const inList = list.some((e) => entryMatchesIp(e, props.ip.trim()))
+  const inInlineExact = aclInlineEntries.includes(trimmedIp.value)
+  const inInline = aclInlineEntries.some((e) => entryMatchesIp(e, trimmedIp.value))
+  const inList = list.some((e) => entryMatchesIp(e, trimmedIp.value))
 
   view.removableRefLists = ipLists.value
     .filter((l) => !l.system && parseRefIds(policy.ip_acl_list_refs).includes(l.id))
@@ -613,7 +627,7 @@ const rowView = (policy: PolicyRow): RowView => {
 // 剔除 + 逐个引用列表 remove-ip；随后整行刷新（状态即时翻转为名单/规则拦截）。
 const cancelTrustAll = async (row: RowView): Promise<void> => {
   if (!lockBusy(row.policy.id, 'untrust')) return
-  const ip = props.ip.trim()
+  const ip = trimmedIp.value
   // 历史问题 对齐：信任生效仅由本弹窗不可移除的条目（内联 CIDR 覆盖 / 系统名单精确
   // 条目）提供时，「取消信任」是空操作——不再弹确认框走流程后谎报成功，直接
   // 指引到对应编辑面。
@@ -648,25 +662,25 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
   try {
     try {
       await ElMessageBox.confirm(
-        `将把 ${props.ip} 从策略「${row.policy.name}」的信任名单可移除条目（内联精确条目与命中引用列表的精确条目）移除${residualNote}。是否继续？`,
+        `将把 ${trimmedIp.value} 从策略「${row.policy.name}」的信任名单可移除条目（内联精确条目与命中引用列表的精确条目）移除${residualNote}。是否继续？`,
         '取消信任',
         { confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning' },
       )
     } catch { return }
     const detail = await fetchDetail(row.policy.id)
     if (detail) {
-      const inline = parseIPList(detail.ip_whitelist).filter((v) => v !== props.ip.trim())
+      const inline = parseIPList(detail.ip_whitelist).filter((v) => v !== trimmedIp.value)
       if (inline.length !== parseIPList(detail.ip_whitelist).length) {
         await request.put(`/security/policies/${row.policy.id}`, { ip_whitelist: JSON.stringify(inline) })
       }
     }
     for (const m of exactRefLists) {
-      await request.post(`/security/ip-lists/${m.id}/remove-ip`, { value: props.ip })
+      await request.post(`/security/ip-lists/${m.id}/remove-ip`, { value: trimmedIp.value })
     }
     if (residualTrustSources.length > 0) {
-      ElMessage.warning(`已移除 ${props.ip} 的可移除信任条目；但该 IP 仍由${residualTrustSources.join('、')}提供信任，拦截尚未恢复`)
+      ElMessage.warning(`已移除 ${trimmedIp.value} 的可移除信任条目；但该 IP 仍由${residualTrustSources.join('、')}提供信任，拦截尚未恢复`)
     } else {
-      ElMessage.success(`已取消 ${props.ip} 对「${row.policy.name}」的信任`)
+      ElMessage.success(`已取消 ${trimmedIp.value} 对「${row.policy.name}」的信任`)
     }
     invalidateSharedEntriesCache()
     await loadPolicies()
@@ -747,7 +761,7 @@ const rowActions = (row: RowView): RowAction[] => {
           type: 'success',
           loading: busyTrust.value || trustCreating.value,
           tip: row.trustEnabled ? undefined : '该策略信任名单已关闭：加入后暂不生效，启用后自动生效',
-          run: () => { void joinSpecificList(list, props.ip.trim(), '信任') },
+          run: () => { void joinSpecificList(list, trimmedIp.value, '信任') },
         })
       }
     } else {
@@ -759,7 +773,7 @@ const rowActions = (row: RowView): RowAction[] => {
         type: 'success',
         loading: busyTrust.value || trustCreating.value,
         tip: row.trustEnabled ? undefined : '该策略信任名单已关闭：加入后暂不生效，启用后自动生效',
-        run: () => { void ensureListAndJoin(row.policy, props.ip.trim(), 'trust') },
+        run: () => { void ensureListAndJoin(row.policy, trimmedIp.value, 'trust') },
       })
     }
   }
@@ -767,9 +781,15 @@ const rowActions = (row: RowView): RowAction[] => {
     acts.push({ key: 'rm-inline', label: `从内联${row.policy.ip_acl_mode === 'allow' ? '白' : '黑'}名单移除`, type: 'danger', loading: isBusy(pid, 'remove'), run: () => { void removeFromAcl(row.policy) } })
   }
   for (const m of row.removableRefLists) {
-    acts.push({ key: `rm-${m.id}`, label: `从「${m.name}」移除`, type: 'danger', loading: isBusy(pid, `remove-ref-${m.id}`), run: () => { void removeFromSideRef(m, props.ip.trim()) } })
+    acts.push({ key: `rm-${m.id}`, label: `从「${m.name}」移除`, type: 'danger', loading: isBusy(pid, `remove-ref-${m.id}`), run: () => { void removeFromSideRef(m, trimmedIp.value) } })
   }
-  const aclOffTip = row.policy.ip_acl_enabled === false ? '该策略 IP 访问控制未启用：加入后暂不拦截，启用后生效' : undefined
+  // 历史问题：动作文案按模式区分——放行入白名单与拦截入黑名单的「未启用」后果描述
+  // 不同（原两者都说「暂不拦截」）。
+  const aclOffTip = row.policy.ip_acl_enabled === false
+    ? (row.policy.ip_acl_mode === 'allow'
+        ? '该策略 IP 访问控制未启用：加入白名单后暂不放行，启用后生效'
+        : '该策略 IP 访问控制未启用：加入后暂不拦截，启用后生效')
+    : undefined
   if (row.canAssociate) {
     const denyLists = resolveSideLists(row.policy, 'deny')
     if (denyLists.length > 0) {
@@ -782,7 +802,7 @@ const rowActions = (row: RowView): RowAction[] => {
           tip: aclOffTip,
           run: () => {
             if (!lockBusy(pid, `associate-${list.id}`)) return
-            void joinSpecificList(list, props.ip.trim(), '拦截').finally(() => unlockBusy(pid, `associate-${list.id}`))
+            void joinSpecificList(list, trimmedIp.value, '拦截').finally(() => unlockBusy(pid, `associate-${list.id}`))
           },
         })
       }
@@ -795,7 +815,7 @@ const rowActions = (row: RowView): RowAction[] => {
         tip: aclOffTip,
         run: () => {
           if (!lockBusy(pid, 'associate-new')) return
-          void ensureListAndJoin(row.policy, props.ip.trim(), 'deny').finally(() => unlockBusy(pid, 'associate-new'))
+          void ensureListAndJoin(row.policy, trimmedIp.value, 'deny').finally(() => unlockBusy(pid, 'associate-new'))
         },
       })
     }
@@ -812,7 +832,7 @@ const rowActions = (row: RowView): RowAction[] => {
           tip: aclOffTip,
           run: () => {
             if (!lockBusy(pid, `associate-a-${list.id}`)) return
-            void joinSpecificList(list, props.ip.trim(), '放行').finally(() => unlockBusy(pid, `associate-a-${list.id}`))
+            void joinSpecificList(list, trimmedIp.value, '放行').finally(() => unlockBusy(pid, `associate-a-${list.id}`))
           },
         })
       }
@@ -825,13 +845,13 @@ const rowActions = (row: RowView): RowAction[] => {
         tip: aclOffTip,
         run: () => {
           if (!lockBusy(pid, 'associate-a-new')) return
-          void ensureListAndJoin(row.policy, props.ip.trim(), 'allow').finally(() => unlockBusy(pid, 'associate-a-new'))
+          void ensureListAndJoin(row.policy, trimmedIp.value, 'allow').finally(() => unlockBusy(pid, 'associate-a-new'))
         },
       })
     }
   }
   if (granularTrustRemove) for (const m of row.removableTrustRefLists) {
-    acts.push({ key: `unt-${m.id}`, label: `从「${m.name}」移除信任`, type: 'success', run: () => { void removeFromSideRef(m, props.ip.trim()) } })
+    acts.push({ key: `unt-${m.id}`, label: `从「${m.name}」移除信任`, type: 'success', run: () => { void removeFromSideRef(m, trimmedIp.value) } })
   }
   if (granularTrustRemove && row.canRemoveTrust) {
     acts.push({ key: 'unt-in', label: '从内联信任移除', type: 'success', loading: isBusy(pid, 'untrust'), run: () => { void removeTrust(row.policy) } })
@@ -927,7 +947,7 @@ const removeFromAcl = async (policy: PolicyRow): Promise<void> => {
     const detail = await fetchDetail(policy.id)
     if (!detail) return
     const list = parseIPList(detail.ip_acl_list)
-    if (!list.includes(props.ip)) {
+    if (!list.includes(trimmedIp.value)) {
       ElMessage.info(`该 IP 已不在策略「${policy.name}」的访问控制列表中`)
       return
     }
@@ -937,21 +957,21 @@ const removeFromAcl = async (policy: PolicyRow): Promise<void> => {
     if (!detail.ip_acl_enabled) {
       tip = 'IP 访问控制当前未启用，仅清理列表条目。'
     } else if (mode === 'allow') {
-      tip = `当前为白名单模式，移除后 ${props.ip} 将不在允许名单中、无法访问。`
+      tip = `当前为白名单模式，移除后 ${trimmedIp.value} 将不在允许名单中、无法访问。`
     } else {
-      tip = `移除后 ${props.ip} 将恢复正常访问。`
+      tip = `移除后 ${trimmedIp.value} 将恢复正常访问。`
     }
     try {
       await ElMessageBox.confirm(
-        `将把 ${props.ip} 从策略「${policy.name}」的${listLabel}中移除，${tip}是否继续？`,
+        `将把 ${trimmedIp.value} 从策略「${policy.name}」的${listLabel}中移除，${tip}是否继续？`,
         '移除 IP',
         { confirmButtonText: '确定', cancelButtonText: '取消', type: mode === 'allow' && detail.ip_acl_enabled ? 'warning' : 'info' },
       )
     } catch {
       return
     }
-    const res = await request.put(`/security/policies/${policy.id}`, { ip_acl_list: JSON.stringify(list.filter((entry) => entry !== props.ip)) })
-    showSaveResult(res as unknown as { message?: string }, `已从策略「${policy.name}」的${listLabel}移除 ${props.ip}`)
+    const res = await request.put(`/security/policies/${policy.id}`, { ip_acl_list: JSON.stringify(list.filter((entry) => entry !== trimmedIp.value)) })
+    showSaveResult(res as unknown as { message?: string }, `已从策略「${policy.name}」的${listLabel}移除 ${trimmedIp.value}`)
     await refreshRow(policy.id)
   } catch {
     // 失败提示由全局拦截器弹出，这里只需终止流程
@@ -969,7 +989,7 @@ const removeTrust = async (policy: PolicyRow): Promise<void> => {
     const detail = await fetchDetail(policy.id)
     if (!detail) return
     const list = parseIPList(detail.ip_whitelist)
-    if (!list.includes(props.ip)) {
+    if (!list.includes(trimmedIp.value)) {
       ElMessage.info(`该 IP 已不在策略「${policy.name}」的信任名单中`)
       return
     }
@@ -977,16 +997,16 @@ const removeTrust = async (policy: PolicyRow): Promise<void> => {
     try {
       await ElMessageBox.confirm(
         trustEnabled
-          ? `将把 ${props.ip} 从策略「${policy.name}」的信任名单移除，该 IP 将恢复常规评估。是否继续？`
-          : `策略「${policy.name}」的信任名单当前为关闭状态，该条目暂不生效；将把 ${props.ip} 从信任名单条目中清除。是否继续？`,
+          ? `将把 ${trimmedIp.value} 从策略「${policy.name}」的信任名单移除，该 IP 将恢复常规评估。是否继续？`
+          : `策略「${policy.name}」的信任名单当前为关闭状态，该条目暂不生效；将把 ${trimmedIp.value} 从信任名单条目中清除。是否继续？`,
         trustEnabled ? '移除信任' : '清除未生效条目',
         { confirmButtonText: '确定', cancelButtonText: '取消', type: trustEnabled ? 'warning' : 'info' },
       )
     } catch {
       return
     }
-    const res = await request.put(`/security/policies/${policy.id}`, { ip_whitelist: JSON.stringify(list.filter((entry) => entry !== props.ip)) })
-    showSaveResult(res as unknown as { message?: string }, `已从策略「${policy.name}」的信任名单移除 ${props.ip}`)
+    const res = await request.put(`/security/policies/${policy.id}`, { ip_whitelist: JSON.stringify(list.filter((entry) => entry !== trimmedIp.value)) })
+    showSaveResult(res as unknown as { message?: string }, `已从策略「${policy.name}」的信任名单移除 ${trimmedIp.value}`)
     await refreshRow(policy.id)
   } catch {
     // 失败提示由全局拦截器弹出，这里只需终止流程

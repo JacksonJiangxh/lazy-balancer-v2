@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -197,24 +196,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Kind:        taskengine.KindPeriodic,
 		IntervalFn:  func() time.Duration { return 24 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
-			if logFile != "" {
-				res := RuntimeLogCleanupOnce(logFile)
-				months := 3
-				if database := db.GetDB(); database != nil {
-					var m int
-					if err := database.QueryRow("SELECT COALESCE(audit_retention_months,3) FROM global_config WHERE id=1").Scan(&m); err == nil && m >= 1 {
-						months = m
-					}
-				}
-				summary := fmt.Sprintf("日志清理完成：应用日志副本删除 %d 个（保留 %d 月，无过期为 0）；%s", res.AppRemoved, months, res.TaskLogs.Summary())
-				// F-历史问题-01（历史）：daemon 停机时的 waf-audit 兜底
-				// 动作如实进任务日志（2026-10-01 用户裁定：清理了哪个文件
-				// 必须可见）；无动作时不加尾段，日志行形态不变。
-				if len(res.WafAudit) > 0 {
-					summary += "；waf-audit 兜底：" + strings.Join(res.WafAudit, "、")
-				}
-				TaskLogf("log-cleanup", "cleanup", "%s", summary)
-			}
+			TaskLogf("log-cleanup", "cleanup", "%s", logCleanupSummaryLine(logFile))
 			return nil
 		},
 	})
@@ -247,8 +229,14 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			// 历史问题-06：传任务 ctx——Stop(cancel) 可在大批量首遍中途生效。
 			// 历史问题-09：清理失败必须让 task_runs 落 failed，不得恒成功。
 			deleted, err := SecurityEventsRetentionCleanupCtxErr(rc.Ctx)
+			// V87-TO-10（历史）：失败轮不得写「清理完成」——task_runs 已落
+			// failed（历史问题-09），任务日志称完成会把排障方向带偏。
+			if err != nil {
+				TaskLogfWarn("security-events-retention", "cleanup", "安全事件保留清理失败：本轮已删除 %d 条后中止（保留期与条数上限），错误：%v", deleted, err)
+				return err
+			}
 			TaskLogf("security-events-retention", "cleanup", "安全事件保留清理完成：删除 %d 条（保留期与条数上限，无过期为 0）", deleted)
-			return err
+			return nil
 		},
 	})
 
@@ -264,8 +252,13 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			// A86 D-4：清理失败必须让 task_runs 落 failed，不得恒成功；
 			// 有界=单轮最多清理 metricsOrphanPurgeRulesPerRun 个规则，余量下轮收敛。
 			deletedRules, err := PurgeOrphanMetricsHistory(rc.Ctx)
+			// V87-TO-10：失败轮不得写「清理完成」（task_runs 已落 failed）。
+			if err != nil {
+				TaskLogfWarn("metrics-orphan-cleanup", "cleanup", "孤儿规则指标清理失败：本轮已清理 %d 个规则后中止，错误：%v", deletedRules, err)
+				return err
+			}
 			TaskLogf("metrics-orphan-cleanup", "cleanup", "孤儿规则指标清理完成：删除 %d 个规则的历史指标（无残留为 0）", deletedRules)
-			return err
+			return nil
 		},
 	})
 
@@ -405,12 +398,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Kind:              taskengine.KindDaemon,
 		RunsOn:            taskengine.RoleAny,
 		RestartOnRoleFlip: true,
-		Run: func(rc taskengine.RunContext) error {
-			if taskEngine.IsMaster() {
-				return masterSyncServingLifecycleRun(rc)
-			}
-			return daemonLifecycleRun(rc, syncLifecycleStart, syncLifecycleStop)
-		},
+		Run:               clusterSyncDaemonRun,
 	})
 
 	// ============ 定时（5）============
@@ -632,10 +620,12 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// 定时/循环/触发均可手动调度；常驻族恒不可（启停即可，启停由调度开关+重启承担）。
 
 	// 默认调度启动：
-	// - 循环 10 个全启动（cert-waiting-ca 除外——默认关闭，续期扫描唤醒；
+	// - 循环 8 个全启动（cert-waiting-ca 除外——默认关闭，续期扫描唤醒；
 	//   autoban 除外——调度唯一前提=业务启用，见下）
 	// - 常驻 3 个全启动（系统启动即运行；关闭调度=启动也不运行）
-	// - 定时 5 个启动排程（EnabledFn/NextSlotFn 内含开关判断）
+	// - 定时 4 个启动排程（threat/crs/ip2region/auto-backup——EnabledFn/
+	//   NextSlotFn 内含开关判断；crawlerbot-update 不在本清单，调度由
+	//   SyncBusinessTaskDrivers 按业务开关对齐）
 	// 历史问题/历史问题：默认启动前先读偏好——显式停止的 daemon 必须在任何
 	// StartLoop 副作用（启动记录/首轮执行）之前跳过；否则先启动再 StopLoop
 	// 会留下假启动记录并可能实际跑一轮。
@@ -749,6 +739,24 @@ func WakeCertWaitingCAForEnqueuedJob() {
 		return
 	}
 	te.RearmLoop("cert-waiting-ca", true)
+}
+
+// clusterSyncDaemonRun 集群同步 daemon 的 Run 体（从 InitTaskEngine 的描述符
+// 闭包抽出，便于对「引擎句柄固定」契约直接钉测）。
+// V87-TO-02（历史）：先固定引擎句柄再读角色——StopTaskEngine 在
+// engine.Stop() 的 drain 超时后置全局 taskEngine=nil，daemon goroutine 若在
+// 超时后首次进入 Run，裸读全局会 nil 解引用 panic（同族 cert-renewal-scan /
+// cert-waiting-ca 已按历史 历史问题-06 固定句柄）。句柄为空=引擎已停机/换代：
+// 直接退出，不得把「无引擎」误判成从节点去拉起同步生命周期。
+func clusterSyncDaemonRun(rc taskengine.RunContext) error {
+	te := TaskEngine()
+	if te == nil {
+		return nil
+	}
+	if te.IsMaster() {
+		return masterSyncServingLifecycleRun(rc)
+	}
+	return daemonLifecycleRun(rc, syncLifecycleStart, syncLifecycleStop)
 }
 
 // StopTaskEngine 进程退出收尾。

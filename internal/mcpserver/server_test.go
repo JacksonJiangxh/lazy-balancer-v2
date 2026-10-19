@@ -158,10 +158,10 @@ func TestUpdateConfigSchemaCurrentWritableFields(t *testing.T) {
 
 func TestToolsListHidesWriteTools_forReadOnlyAPIKey(t *testing.T) {
 	// Given
-	resolver := func(apiKey string) (bool, error) {
-		return apiKey == "lb_sk_read-only", nil
+	resolver := func(apiKey string) (apiKeyVisibility, error) {
+		return apiKeyVisibility{readOnly: apiKey == "lb_sk_read-only"}, nil
 	}
-	handler := newWithReadOnlyResolver("http://127.0.0.1/api/v1", http.DefaultClient, "", resolver)
+	handler := newWithVisibilityResolver("http://127.0.0.1/api/v1", http.DefaultClient, "", resolver)
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
@@ -976,5 +976,84 @@ func TestToolSpecs_stageStatsSchemaDeclaresCaddyID(t *testing.T) {
 	}
 	if !required {
 		t.Fatalf("stage-stats input_schema required=%v, want caddy_id declared required", schema.Required)
+	}
+}
+
+// resolveAPIKeyReadOnly 是只读判定的测试便利包装（生产只用
+// resolveAPIKeyVisibility——避免生产侧保留零消费函数）。
+func resolveAPIKeyReadOnly(apiKey string) (bool, error) {
+	visibility, err := resolveAPIKeyVisibility(apiKey)
+	return visibility.readOnly, err
+}
+
+// requestToolNames 发起 tools/list 并返回工具名集合（CI87-06 可见性测试共用）。
+func requestToolNames(t *testing.T, handler http.Handler, apiKey string) map[string]bool {
+	t.Helper()
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("X-API-Key", apiKey)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("tools/list status=%d body=%q", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Result struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("parse tools/list response: %v", err)
+	}
+	names := make(map[string]bool, len(payload.Result.Tools))
+	for _, tool := range payload.Result.Tools {
+		names[tool.Name] = true
+	}
+	return names
+}
+
+// CI87-06：admin 组路由对非管理员恒 403（adminOnly 先于其它守卫），tools/list
+// 必须同口径隐藏——否则非管理员属主的 Key 反复试错恒 403 工具。管理员全权
+// Key 不受影响（get_caddy_config 等按文档仅管理员可用）。
+func TestToolsListHidesAdminOnlyToolsForNonAdminKey(t *testing.T) {
+	// Given：admin 组路由集合（生产由 middleware.SetupRouter 注入，此处按同形态）
+	previous := adminOnlyRoutePaths.Load()
+	t.Cleanup(func() { adminOnlyRoutePaths.Store(previous) })
+	SetAdminOnlyRoutes(map[string]struct{}{
+		"GET /api/v1/caddy/config":            {},
+		"POST /api/v1/config/preview":         {},
+		"POST /api/v1/config/import/validate": {},
+		"PUT /api/v1/users/:id":               {},
+	})
+
+	// When：非管理员全权 Key
+	nonAdmin := newWithVisibilityResolver("http://127.0.0.1/api/v1", http.DefaultClient, "",
+		func(string) (apiKeyVisibility, error) { return apiKeyVisibility{}, nil })
+	names := requestToolNames(t, nonAdmin, "lb_sk_non-admin")
+
+	// Then：admin 组工具不可见，business 组工具照常
+	for _, hidden := range []string{"get_caddy_config", "preview_config", "validate_import", "update_user"} {
+		if names[hidden] {
+			t.Errorf("non-admin tools/list exposes admin-only tool %s (调用恒 403)", hidden)
+		}
+	}
+	if !names["list_rules"] || !names["get_config"] {
+		t.Fatalf("non-admin tools/list must keep business-group tools: %v", names)
+	}
+
+	// When：管理员全权 Key
+	admin := newWithVisibilityResolver("http://127.0.0.1/api/v1", http.DefaultClient, "",
+		func(string) (apiKeyVisibility, error) { return apiKeyVisibility{admin: true}, nil })
+	adminNames := requestToolNames(t, admin, "lb_sk_admin")
+
+	// Then：管理员全量可见
+	for _, visible := range []string{"get_caddy_config", "preview_config", "validate_import", "update_user"} {
+		if !adminNames[visible] {
+			t.Errorf("admin tools/list hides admin tool %s", visible)
+		}
 	}
 }

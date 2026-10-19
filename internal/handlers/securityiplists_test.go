@@ -870,3 +870,39 @@ func TestAllowEffectiveListNonEmpty_ignoresExpiredEntries(t *testing.T) {
 		t.Fatal("future entry must count as non-empty allow set")
 	}
 }
+
+// HC-02（历史）：保存一组「全部已到期」的条目等价于生效集合为空——
+// allow 引用名单的清空门不得被原始 len>0 绕过（与 remove-ip 的 历史问题 同源：
+// 判据用 AutobanActiveEntries 过滤后的有效集合，渲染侧同口径）。此前仅
+// remove-ip 修了口径，UpdateIPList 仍按原始条目数判定 ⇒ allow 策略 fail-open。
+func TestUpdateIPList_expiredOnlyEntriesBlockedByAllowPolicy(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newIPListRouter(t)
+	id := seedIPListRow(t, "allow-引用-到期条目", `[{"value":"10.0.0.1","remark":""}]`)
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (name, ip_acl_enabled, ip_acl_mode, ip_acl_list_refs, enabled) VALUES ('启用allow策略', 1, 'allow', ?, 1)`, fmt.Sprintf("[%d]", id)); err != nil {
+		t.Fatal(err)
+	}
+
+	// 形状 1：仅已到期条目 → 生效集合为空 → 409（原实现 len(entries)>0 放行）
+	rec := putJSON(t, router, fmt.Sprintf("/security/ip-lists/%d", id), map[string]any{
+		"entries": `[{"value":"10.9.9.9","remark":"","expires_at":"2000-01-01 00:00:00"}]`,
+	})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expired-only save status=%d body=%s, want 409（生效集合为空=放行全部）", rec.Code, rec.Body.String())
+	}
+	var stored string
+	if err := db.DB.QueryRow(`SELECT entries FROM security_ip_lists WHERE id=?`, id).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stored, "10.0.0.1") {
+		t.Fatalf("rejected save must not mutate entries, got %s", stored)
+	}
+
+	// 形状 2（回归）：含一条未到期条目 → 生效集合非空 → 200
+	rec = putJSON(t, router, fmt.Sprintf("/security/ip-lists/%d", id), map[string]any{
+		"entries": `[{"value":"10.9.9.9","remark":"","expires_at":"2099-01-01 00:00:00"},{"value":"10.9.9.10","remark":"","expires_at":"2000-01-01 00:00:00"}]`,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("active+expired save status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+}

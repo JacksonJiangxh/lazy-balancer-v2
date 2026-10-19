@@ -1918,10 +1918,8 @@ func (e *Engine) RunOverview() (map[string]*RunRecord, map[string]TaskRunsStats)
 		return latest, stats
 	}
 	// 最近运行：每任务最大 id（与 History(...,1) 的 ORDER BY id DESC LIMIT 1 同义）。
-	rows, err := db.DB.Query(
-		`SELECT id, task_id, family, trigger, COALESCE(operator,''), status, started_at,
-			COALESCE(finished_at,''), COALESCE(duration_ms,0), COALESCE(message,'')
-			FROM task_runs WHERE id IN (SELECT MAX(id) FROM task_runs GROUP BY task_id)`)
+	// 查询文本单源=db.TaskRunsLatestPerTaskQuery（索引计划钉测同源，历史问题）。
+	rows, err := db.DB.Query(db.TaskRunsLatestPerTaskQuery)
 	if err != nil {
 		// 降级为空记录（视图仍可用），但不得静默——与同文件其余查询同口径。
 		log.Printf("WARNING: taskengine: 最近运行批量查询失败（任务视图无运行记录）: %v", err)

@@ -190,3 +190,28 @@ func TestGetClusterWafFiles_demotedMasterForbidden(t *testing.T) {
 		t.Fatalf("status=%d body=%q, want 403（与快照端点对称的 requireMaster 门）", response.Code, response.Body.String())
 	}
 }
+
+// 历史问题（历史 历史问题，R-12 同族收敛）：PullClusterSnapshot 曾直接调用
+// h.syncService.Pull/Resume 而无 nil 判定——同族（SetClusterMode/Promote/
+// ForgetClusterPins）均以 503「同步服务未初始化」前置。装配缺失或测试注入
+// nil 时，从节点手动同步会 nil 指针 panic（Gin recovery → 500 空体），
+// 与同族错误形状分叉。
+func TestA87PullClusterSnapshot_missingSyncServiceReturnsUnavailable(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	h.syncService = nil
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(gin.Recovery())
+	router.POST("/cluster/sync/pull", h.PullClusterSnapshot)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/cluster/sync/pull", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s, want 503（nil syncService 不得 panic）", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "同步服务未初始化") {
+		t.Fatalf("body=%s, want 同步服务未初始化", response.Body.String())
+	}
+}

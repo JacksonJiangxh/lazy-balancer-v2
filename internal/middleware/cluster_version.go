@@ -14,6 +14,12 @@ import (
 
 func clusterVersionMiddleware(database *sql.DB) gin.HandlerFunc {
 	installErr := installClusterVersionTriggers(database)
+	// CI87-04：装配期 DDL 失败后所有同步写与主端登录恒 500，此前只把错误塞进
+	// gin 上下文（无日志落点）——系统日志看不到根因。此处一次性留痕，响应与
+	// fail-closed 语义不变。
+	if installErr != nil {
+		services.Logf("error", "集群版本触发器安装失败（同步写与主端登录将 fail-closed 返回 500）: %v", installErr)
+	}
 	return func(c *gin.Context) {
 		if !isSynchronizedWrite(c.Request.Method, c.FullPath()) {
 			c.Next()

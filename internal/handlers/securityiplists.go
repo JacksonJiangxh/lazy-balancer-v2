@@ -809,18 +809,30 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 	// 走 allowEmptyingBlockedByPolicies 的「并集是否为空」语义（策略内联或
 	// 其他引用名单仍有条目时清空本列表不会放行全部请求），此前按「是否被
 	// 引用」一律 409 的偏严口径给出的文案在并集非空时是假的。
-	if req.Entries != nil && len(entries) == 0 {
-		blocked, berr := allowEmptyingBlockedByPolicies(tx, listID, nil)
-		if berr != nil {
-			// S历史问题(历史):守卫查询失败 fail-closed——静默放行
-			// 「清空被 allow 引用的列表」正是 N1 要防的发射端 fail-open 形态。
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "校验 IP 列表引用失败: " + berr.Error()})
-			return
+	// HC-02（历史）：判据用**过滤到期后**的有效集合——与 remove-ip
+	// 路径（历史问题）同源。导入/带外名单可含 expires_at，保存一组仅已到期
+	// 条目时原始 len>0 会绕过本门，而渲染侧（AutobanActiveEntries）生效集
+	// 为空 = allow 策略放行全部。
+	if req.Entries != nil {
+		activeValues := make([]string, 0, len(entries))
+		for _, entry := range services.AutobanActiveEntries(entries) {
+			if entry.Value != "" {
+				activeValues = append(activeValues, entry.Value)
+			}
 		}
-		if blocked {
-			c.JSON(http.StatusConflict, models.APIResponse{Code: 409,
-				Message: "清空后会使引用它的白名单策略生效集合为空（空名单会放行所有请求）；请先为相关策略补充内联条目或其他引用名单，或解除引用"})
-			return
+		if len(activeValues) == 0 {
+			blocked, berr := allowEmptyingBlockedByPolicies(tx, listID, activeValues)
+			if berr != nil {
+				// S历史问题(历史):守卫查询失败 fail-closed——静默放行
+				// 「清空被 allow 引用的列表」正是 N1 要防的发射端 fail-open 形态。
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "校验 IP 列表引用失败: " + berr.Error()})
+				return
+			}
+			if blocked {
+				c.JSON(http.StatusConflict, models.APIResponse{Code: 409,
+					Message: "清空后会使引用它的白名单策略生效集合为空（空名单会放行所有请求）；请先为相关策略补充内联条目或其他引用名单，或解除引用"})
+				return
+			}
 		}
 	}
 	var dup int
@@ -846,8 +858,7 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	if rows, _ := result.RowsAffected(); rows == 0 {
-		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "IP 地址列表不存在"})
+	if !rowsAffectedOrRespond(c, result, "IP 地址列表不存在") {
 		return
 	}
 	// 历史 F2/AB-1 同族收敛：预置名单差集全量保存中被移除的条目即解封
@@ -987,22 +998,36 @@ func (h *Handlers) DeleteIPList(c *gin.Context) {
 		}
 	}
 	// 快照条目数须在 DELETE 前取（名称已在前置门 listName 取得；同事务无写点）
+	// HC-08（历史）：快照读/解析失败降级为「条目数未知」并留 warn——
+	// 此前 `_ =` 双吞错会把 DB 瞬时故障记成「0 条」，删除审计与实际删除量不符。
 	var delEntries string
-	_ = tx.QueryRowContext(c.Request.Context(), "SELECT COALESCE(entries,'[]') FROM security_ip_lists WHERE id=?", id).Scan(&delEntries)
+	delEntriesKnown := true
+	if err := tx.QueryRowContext(c.Request.Context(), "SELECT COALESCE(entries,'[]') FROM security_ip_lists WHERE id=?", id).Scan(&delEntries); err != nil {
+		services.Logf("warn", "security: 删除 IP 列表 #%s 前读取条目快照失败（审计条目数记未知）: %v", id, err)
+		delEntriesKnown = false
+	}
 	var delParsed []models.IPListEntry
-	_ = json.Unmarshal([]byte(delEntries), &delParsed)
+	if delEntriesKnown {
+		if err := json.Unmarshal([]byte(delEntries), &delParsed); err != nil {
+			services.Logf("warn", "security: 删除 IP 列表 #%s 前解析条目快照失败（审计条目数记未知）: %v", id, err)
+			delEntriesKnown = false
+		}
+	}
 	result, err := tx.ExecContext(c.Request.Context(), "DELETE FROM security_ip_lists WHERE id=?", id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	if rows, _ := result.RowsAffected(); rows == 0 {
-		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "IP 地址列表不存在"})
+	if !rowsAffectedOrRespond(c, result, "IP 地址列表不存在") {
 		return
+	}
+	entryCountLabel := "条目数未知"
+	if delEntriesKnown {
+		entryCountLabel = fmt.Sprintf("%d 条", len(delParsed))
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "删除",
-		AuditDetail: fmt.Sprintf("名称：%s（#%s，%d 条）", listName, id, len(delParsed)),
+		AuditDetail: fmt.Sprintf("名称：%s（#%s，%s）", listName, id, entryCountLabel),
 		SuccessMsg:  "IP 地址列表已删除",
 	})
 }
@@ -1395,9 +1420,13 @@ func (h *Handlers) ExportIPList(c *gin.Context) {
 	id := c.Param("id")
 	var name, entriesJSON string
 	var system int
+	// HC-09（历史）：文件名恒为「名单 ID」形态——此前以 name 非空作
+	// 条件却仍用 id 组名，死分支误导（阅读者以为名称参与文件名）。取库内行 ID
+	// 而非路由段，避免非规范路由段（"5.0"）导出成 ip-list-0.txt。
+	var listID int64
 	err := db.DB.QueryRowContext(c.Request.Context(),
-		`SELECT COALESCE(name,''), COALESCE(entries,'[]'), COALESCE(system,0) FROM security_ip_lists WHERE id=?`, id).
-		Scan(&name, &entriesJSON, &system)
+		`SELECT id, COALESCE(name,''), COALESCE(entries,'[]'), COALESCE(system,0) FROM security_ip_lists WHERE id=?`, id).
+		Scan(&listID, &name, &entriesJSON, &system)
 	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "IP 地址列表不存在"})
 		return
@@ -1447,16 +1476,7 @@ func (h *Handlers) ExportIPList(c *gin.Context) {
 		}
 		b.WriteString("\n")
 	}
-	filename := "ip-list-export.txt"
-	if name != "" {
-		filename = "ip-list-" + strconv.Itoa(safeAtoiOrZero(id)) + ".txt"
-	}
+	filename := "ip-list-" + strconv.FormatInt(listID, 10) + ".txt"
 	c.Header("Content-Disposition", `attachment; filename="`+filename+`"`)
 	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(b.String()))
-}
-
-// safeAtoiOrZero 导出文件名用的宽松 id 解析（路由段恒为数字，畸形归 0）。
-func safeAtoiOrZero(s string) int {
-	n, _ := strconv.Atoi(s)
-	return n
 }

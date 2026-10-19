@@ -84,6 +84,7 @@ func resetAutobanStateForTest() {
 	autobanReloadPending = false
 	autobanLastReload = time.Time{}
 	autobanCapWarned = false
+	autobanFeedDegradedWarned = false
 }
 
 // setAutobanConfigRaw 直接写列（绕过 SetAutobanConfig 的重置副作用——
@@ -1611,5 +1612,132 @@ func TestAutobanMerge_expiredEntryNotRebannedSameRound(t *testing.T) {
 	}
 	if again := autobanCandidates(3, time.Hour); len(again) != 0 {
 		t.Fatalf("到期清桶后零新事件不得再产候选，got=%v", again)
+	}
+}
+
+// installFeedHealthTestEngine 装配只含喂入源 daemon 的引擎（StartPaused：默认
+// 调度关闭 = 用户显式停止 / 自愈预算用尽后的共同终态形状）。历史问题-02。
+func installFeedHealthTestEngine(t *testing.T) *taskengine.Engine {
+	t.Helper()
+	te := taskengine.NewEngine(taskengine.Options{StartPaused: true})
+	t.Cleanup(te.Stop)
+	if err := te.Register(taskengine.Descriptor{
+		ID: AutobanFeedTaskID, Family: "system", Name: "安全事件采集",
+		Kind: taskengine.KindDaemon,
+		Run: func(rc taskengine.RunContext) error {
+			<-rc.Ctx.Done()
+			return nil
+		},
+	}); err != nil {
+		t.Fatalf("register feed task: %v", err)
+	}
+	old := taskEngine
+	SetTaskEngineForTest(te)
+	t.Cleanup(func() { SetTaskEngineForTest(old) })
+	return te
+}
+
+// 历史问题-02（历史）：计数唯一喂入源（安全事件采集）停摆时必须判降级；
+// LoopOn=false 是用户显式停止与「自愈用尽后停环」的共同终态，恢复调度即不降级。
+func TestAutobanFeedHealth_reportsStoppedIngestion(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+
+	// 引擎未装配：不判定（测试/装配早期，避免误报）。
+	prevEngine := taskEngine
+	t.Cleanup(func() { taskEngine = prevEngine })
+	taskEngine = nil
+	if degraded, reason := AutobanFeedHealth(); degraded {
+		t.Fatalf("引擎未装配时不得报降级: reason=%q", reason)
+	}
+
+	te := installFeedHealthTestEngine(t)
+	if degraded, reason := AutobanFeedHealth(); !degraded || !strings.Contains(reason, "调度已停止") {
+		t.Fatalf("degraded=%v reason=%q, want 调度停止降级", degraded, reason)
+	}
+	te.StartLoop(AutobanFeedTaskID)
+	if degraded, reason := AutobanFeedHealth(); degraded {
+		t.Fatalf("调度恢复后不得报降级: reason=%q", reason)
+	}
+	te.StopLoop(AutobanFeedTaskID)
+	if degraded, _ := AutobanFeedHealth(); !degraded {
+		t.Fatal("用户停止采集任务后必须报降级（自动封禁计数不再更新）")
+	}
+}
+
+// 历史问题-02：喂入源停摆时 RunAutobanCycle 仍正常收尾（只做可见性），但必须留
+// WARN 转换行 + 每轮摘要停摆注记；恢复后记一次恢复行且摘要不再带注记。
+func TestRunAutobanCycle_surfacesFeedDegraded(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 100, 5, "24h", "all", true)
+	te := installFeedHealthTestEngine(t)
+
+	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
+		t.Fatalf("喂入源停摆不得让本轮失败（可见性语义）: %v", err)
+	}
+	logPath := taskengine.TaskLogPath(AutobanTaskID)
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read autoban task log: %v", err)
+	}
+	if !strings.Contains(string(data), "数据源异常") {
+		t.Fatalf("停摆必须留 WARN 转换行: %q", string(data))
+	}
+	if !strings.Contains(string(data), "数据源停摆") {
+		t.Fatalf("每轮摘要必须追加停摆注记: %q", string(data))
+	}
+	// 停摆持续期不重复刷屏：再做一轮，WARN 行仍只有一条。
+	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(logPath)
+	if got := strings.Count(string(data), "数据源异常"); got != 1 {
+		t.Fatalf("WARN 转换行=%d，want 1（60s 周期不得刷屏）: %q", got, string(data))
+	}
+
+	te.StartLoop(AutobanFeedTaskID)
+	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(logPath)
+	if !strings.Contains(string(data), "数据源已恢复") {
+		t.Fatalf("恢复沿必须记一次恢复行: %q", string(data))
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if last := lines[len(lines)-1]; strings.Contains(last, "数据源停摆") {
+		t.Fatalf("恢复后的摘要不得再带停摆注记: %q", last)
+	}
+}
+
+// —— 禁用收尾不清到期计数桶（SSA-87-02，历史） ——
+
+// 禁用收尾的到期解封必须同步清计数桶（与 Run 轮 历史问题 同语义）：否则窗口内
+// 重新启用且零新流量时旧计数仍 ≥ 阈值，下一轮立即重封刚解封的 IP。
+// 未到期条目的桶不得清（仅到期解封同步清桶）。
+func TestSSA8702_disableFlushForgetsExpiredCounters(t *testing.T) {
+	clock := installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
+	seedPresetEntries(t, []models.IPListEntry{
+		{Value: "198.51.100.1", Remark: AutobanEntryRemark, CreatedAt: "2026-10-13 10:00:00", ExpiresAt: "2026-10-14 09:00:00"}, // 已到期
+		{Value: "198.51.100.2", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:30:00", ExpiresAt: "2026-10-14 11:00:00"}, // 未到期
+	})
+	oldReloader := autobanReloader
+	autobanReloader = func() error { return nil }
+	t.Cleanup(func() { autobanReloader = oldReloader })
+	autobanMu.Lock()
+	autobanWindows["198.51.100.1"] = &autobanCounter{Count: 9, WindowStart: clock.Now(), LastSeen: clock.Now()}
+	autobanWindows["198.51.100.2"] = &autobanCounter{Count: 9, WindowStart: clock.Now(), LastSeen: clock.Now()}
+	autobanMu.Unlock()
+
+	AutobanDisableFlush()
+
+	autobanMu.Lock()
+	_, expiredBucket := autobanWindows["198.51.100.1"]
+	_, liveBucket := autobanWindows["198.51.100.2"]
+	autobanMu.Unlock()
+	if expiredBucket {
+		t.Fatal("禁用收尾的到期解封必须同步清计数桶（否则重新启用且零新流量时旧计数立即重封）")
+	}
+	if !liveBucket {
+		t.Fatal("未到期条目的计数桶不得清空（仅到期解封同步清桶）")
 	}
 }

@@ -709,6 +709,11 @@ func SetActiveCertificateService(svc *CertificateService) {
 // 转换记一次恢复行（历史问题 收敛：空转轮逐轮刷行改状态变化行）。
 var lastCertServiceMissing atomic.Bool
 
+// certRenewalRoleRecheckHook 续期扫描逐任务角色复核前的测试屏障（生产恒
+// nil，历史问题-03）：用于在「候选已快照、尚未入队」的窗口内翻转节点角色，
+// 钉住 demote 竞争形态（Run 体不消费 ctx，入口角色检查只做一次）。
+var certRenewalRoleRecheckHook func()
+
 // withActiveCertServiceTick 引擎单轮 tick 的活动证书服务执行体（历史问题-11）：
 // 服务未运行时跳过执行，轮次本身照常按 success 记账。历史问题 收敛（2026-10-03
 // 裁定）：跳过说明收敛为状态变化行——lastCertServiceMissing false→true 转换
@@ -932,8 +937,13 @@ func reconcileMissingCertFiles(dbh *sql.DB) int {
 		if fileExists(certPath) && fileExists(keyPath) {
 			continue
 		}
-		if err := materializeCertPair(ruleID, certPEM, keyPEM); err != nil {
-			Logf("error", "cert reconcile: rebuild certificate files for %s failed: %v", ruleID, err)
+		changed, materializeErr := materializeCertPair(ruleID, certPEM, keyPEM)
+		if materializeErr != nil {
+			Logf("error", "cert reconcile: rebuild certificate files for %s failed: %v", ruleID, materializeErr)
+			continue
+		}
+		if !changed {
+			// 前置 fileExists 检查后仍零写=并发重建已完成，不得重复计数。
 			continue
 		}
 		rebuilt++
@@ -1508,10 +1518,17 @@ func (s *CertificateService) renewExpiringCertificates() {
 		TaskLogf("cert-renewal-scan", "scan", "检测到 %d 个临期/待重试证书任务：%s%s", len(jobs), strings.Join(domains, "、"), skippedNote)
 	}
 
-	for _, j := range jobs {
+	for idxRenewalJob, j := range jobs {
 		if j.RenewalAttempts >= maxAttempts {
 			if j.Status == "waiting_ca" {
-				if err := transitionJob(db.DB, j.ID, []string{"waiting_ca"}, "failed", map[string]any{"message": "已达到最大重试次数，请检查 CA 配置后手动重签"}); err != nil {
+				// SV历史问题：终态迁移与 caqueue.markJobWaitingCA 的上限分支同字段集
+				// ——清 ca_available_after/last_error_code，避免 failed 行残留冷却
+				// 时间与 429 错误码（UI/导出看到与终态矛盾的残留字段）。
+				if err := transitionJob(db.DB, j.ID, []string{"waiting_ca"}, "failed", map[string]any{
+					"message":            "已达到最大重试次数，请检查 CA 配置后手动重签",
+					"ca_available_after": nil,
+					"last_error_code":    nil,
+				}); err != nil {
 					Logf("error", "Renewal: failed to convert waiting_ca job %d to failed: %v", j.ID, err)
 				} else {
 					RecordAuditLog("system", "签发失败", "证书任务", FormatAuditDetail(AuditJobPart(j.ID), AuditRulePart(j.RuleID), AuditResultPart("max_attempts")), "")
@@ -1528,6 +1545,25 @@ func (s *CertificateService) renewExpiringCertificates() {
 
 		if qm == nil {
 			Logf("error", "Renewal: CA queue manager not initialized")
+			return
+		}
+		// 历史问题-03（历史）：入口只做一次角色检查，而本 Run 体不消费
+		// rc.Ctx（SetRole 取消对它是 no-op）——demote 落在最长 6h 扫描/多任务
+		// 候选窗口内时，循环会在队列停止前继续入队，已入队的签发要跑完 ACME 才
+		// 被 certissuer 的角色检查拦下（白烧 CA 配额）。入队前用与入口同一
+		// SQL 口径（RoleOf）逐任务复核；非主节点立即中止本轮剩余入队。
+		// 代价=每候选一次主库单行查询（候选通常个位数）。
+		if certRenewalRoleRecheckHook != nil {
+			certRenewalRoleRecheckHook()
+		}
+		masterNow, roleErr := RoleOf(context.Background(), db.DB)
+		if roleErr != nil {
+			// 与入口同口径：读失败不猜测角色（fail-visible），中止本轮。
+			TaskLogf("cert-renewal-scan", "scan", "续期中止：入队前复核节点角色失败（%v），剩余 %d 个任务本轮未入队，下一周期重试", roleErr, len(jobs)-idxRenewalJob)
+			return
+		}
+		if !masterNow {
+			TaskLogf("cert-renewal-scan", "scan", "续期中止：扫描期间节点已切换为从节点，剩余 %d 个任务本轮未入队（从节点不签发）", len(jobs)-idxRenewalJob)
 			return
 		}
 		message := "等待排队续期"
@@ -1795,6 +1831,10 @@ func selectStoredRuleCertificate(ctx context.Context, ruleID, ruleDomains string
 		var candidate CertificateCandidate
 		if err := rows.Scan(&candidate.ID, &candidate.Domain, &candidate.Status, &candidate.CertPEM, &candidate.KeyPEM, &candidate.UpdatedAt); err != nil {
 			return CertificateSelection{}, false, err
+		}
+		// SV历史问题（R-12 同族）：候选装载统一预解析 Leaf，选择走快路径。
+		if candidate.Status != "disabled" {
+			candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
 		}
 		candidates = append(candidates, candidate)
 	}

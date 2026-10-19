@@ -65,9 +65,10 @@ func TestConfigBackup_sectionFiltering(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (5,'local-keeper','x','admin',1)`); err != nil {
 		t.Fatal(err)
 	}
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {{"caddy_id": "imp1", "name": "imp", "protocol": "http", "domain": "a.example.com", "listen_port": 80, "enabled": 1}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	// 顶层注入 sections(避免 strings.Replace 命中嵌套 '}')
 	var parsed map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(backup), &parsed); err != nil {

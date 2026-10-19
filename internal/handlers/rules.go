@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -189,6 +190,17 @@ func (h *Handlers) GetRuleCaddyConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: responseData})
 }
 
+// sortedInterfaceKeys 按字典序返回 map 的键（B2-07：多处「同一对象出现在
+// 多个命名容器」的读取路径需要确定性遍历，避免 map 序导致的展示漂移）。
+func sortedInterfaceKeys(values map[string]interface{}) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // buildRuleCaddyContext extracts the server and TLS context relevant to a rule from the full Caddy config.
 func buildRuleCaddyContext(fullConfig map[string]interface{}, caddyID string, domain string) map[string]interface{} {
 	result := map[string]interface{}{
@@ -202,31 +214,41 @@ func buildRuleCaddyContext(fullConfig map[string]interface{}, caddyID string, do
 		return result
 	}
 
-	// Search HTTP servers first
+	// B2-07（历史）：同一 @id 若出现在多个 server（外部写入/历史漂移，
+	// 本仓另有漂移检测守卫但仍属可能形态），旧实现只在 routes 循环内 break，
+	// 外层继续遍历并用后遍历者覆盖 result["server"]——map 序遍历不确定，
+	// 配置查看框的 server_context 随机漂移，误导排障。改为按 server 名排序
+	// 遍历 + 命中即跳出外层循环：同一份配置恒得同一结果（确定性=排序首个）。
 	if httpApp, ok := apps["http"].(map[string]interface{}); ok {
 		if servers, ok := httpApp["servers"].(map[string]interface{}); ok {
-			for serverName, serverVal := range servers {
-				server, _ := serverVal.(map[string]interface{})
+			for _, serverName := range sortedInterfaceKeys(servers) {
+				server, _ := servers[serverName].(map[string]interface{})
 				if server == nil {
 					continue
 				}
 				routes, _ := server["routes"].([]interface{})
+				matched := false
 				for _, routeVal := range routes {
 					route, _ := routeVal.(map[string]interface{})
 					if route == nil {
 						continue
 					}
 					if route["@id"] == caddyID {
-						scopedPolicies := scopedTLSConnectionPolicies(server["tls_connection_policies"], caddyID, domain)
-						result["server"] = map[string]interface{}{
-							"server_name":             serverName,
-							"listen":                  server["listen"],
-							"tls_connection_policies": scopedPolicies,
-						}
-						result["tls_connection_policies"] = scopedPolicies
+						matched = true
 						break
 					}
 				}
+				if !matched {
+					continue
+				}
+				scopedPolicies := scopedTLSConnectionPolicies(server["tls_connection_policies"], caddyID, domain)
+				result["server"] = map[string]interface{}{
+					"server_name":             serverName,
+					"listen":                  server["listen"],
+					"tls_connection_policies": scopedPolicies,
+				}
+				result["tls_connection_policies"] = scopedPolicies
+				break
 			}
 		}
 	}
@@ -235,25 +257,31 @@ func buildRuleCaddyContext(fullConfig map[string]interface{}, caddyID string, do
 	if result["server"] == nil {
 		if layer4App, ok := apps["layer4"].(map[string]interface{}); ok {
 			if servers, ok := layer4App["servers"].(map[string]interface{}); ok {
-				for serverName, serverVal := range servers {
-					server, _ := serverVal.(map[string]interface{})
+				for _, serverName := range sortedInterfaceKeys(servers) {
+					server, _ := servers[serverName].(map[string]interface{})
 					if server == nil {
 						continue
 					}
 					routes, _ := server["routes"].([]interface{})
+					matched := false
 					for _, routeVal := range routes {
 						route, _ := routeVal.(map[string]interface{})
 						if route == nil {
 							continue
 						}
 						if route["@id"] == caddyID {
-							result["server"] = map[string]interface{}{
-								"server_name": serverName,
-								"listen":      server["listen"],
-							}
+							matched = true
 							break
 						}
 					}
+					if !matched {
+						continue
+					}
+					result["server"] = map[string]interface{}{
+						"server_name": serverName,
+						"listen":      server["listen"],
+					}
+					break
 				}
 			}
 		}
@@ -531,6 +559,10 @@ func (h *Handlers) caddyAdminListenPort() int {
 	return 2019
 }
 
+// enabledRuleDomainConflict 同域名同端口冲突检查（B2-06，历史：删除
+// 原 ruleDomainConflict 空包装，Create/Update/Enable 三处直用本函数）。
+// 仅统计启用中的规则：禁用规则不占用域名，创建/更新时不应被其阻塞；启用时
+// 由 EnableRule 侧同一函数二次把关，避免两条禁用规则同时启用产生冲突。
 func enabledRuleDomainConflict(domain string, listenPort int, excludeCaddyID string) (bool, error) {
 	return queryRuleDomainConflict(domain, listenPort, excludeCaddyID, " AND enabled = 1")
 }
@@ -583,12 +615,6 @@ func queryRedirectShadowConflict(domain string, listenPort int, enableTLS, tlsHT
 		}
 	}
 	return "", "", rows.Err()
-}
-
-func ruleDomainConflict(domain string, listenPort int, excludeCaddyID string) (bool, error) {
-	// 仅统计启用中的规则：禁用规则不占用域名，创建/更新时不应被其阻塞；启用时
-	// 仍由 enabledRuleDomainConflict 二次把关，避免两条禁用规则同时启用产生冲突。
-	return enabledRuleDomainConflict(domain, listenPort, excludeCaddyID)
 }
 
 func queryRuleDomainConflict(domain string, listenPort int, excludeCaddyID, extraWhere string) (bool, error) {
@@ -904,9 +930,6 @@ func duplicateRulePayloadRequest(rule models.LbRule) models.CreateRuleRequest {
 // 上游 host/端口/权重/查重/健康检查与请求体大小等坏形态必须 400 点名源
 // 规则，不得原样放大到副本。
 func (h *Handlers) validateDuplicateRulePayload(rule models.LbRule) error {
-	if err := validateRuleRequestBodyMaxSizeMB(rule.RequestBodyMaxSizeMB); err != nil {
-		return err
-	}
 	return h.validateRulePayloadBeforeSave(duplicateRulePayloadRequest(rule))
 }
 
@@ -1042,7 +1065,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 
 	// Domain uniqueness: HTTP/HTTPS rules cannot share the same domain.
 	if req.Protocol == "http" && req.Domain != "" {
-		existing, err := ruleDomainConflict(req.Domain, req.ListenPort, "")
+		existing, err := enabledRuleDomainConflict(req.Domain, req.ListenPort, "")
 		if err != nil {
 			services.Logf("error", "CreateRule domain conflict query failed for domain=%s: %v", req.Domain, err)
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "检查域名冲突失败"})
@@ -1073,14 +1096,16 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	// 库值唯一真相（批 1+2）：健康检查 interval/timeout 为类型①值型列——
 	// 0→10/2 的写侧静默归一废除（0 由 validateRulePayloadBeforeSave 的 <1
 	// 边界 400；前端表单初值=默认，清空提交被拦）。
-	if req.EnableTLS && req.TLSSource != "manual" && req.TLSSource != "acme_dns" {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"})
-		return
-	}
 	// A85历史问题：手动证书模式不消费 acme_config_id（签发/渲染均按 tls_source
 	// 分流）——清理跨模式死引用，避免随导出/快照放大不可达配置。
 	if req.TLSSource == "manual" {
 		req.ACMEConfigID = 0
+	}
+	// B2-04（历史）：生效来源非 manual 时一律弃置证书材料——API/MCP/导入
+	// 给 acme 行携带 tls_cert/tls_key 时私钥正文会随导出/备份/快照放大（渲染
+	// 按 tls_source 分流零消费）。与 UpdateRule 的对称清理同口径。
+	if req.TLSSource != "manual" {
+		req.TLSCert, req.TLSKey = "", ""
 	}
 	// Validate TLS certificate if provided (manual source only)
 	var certWarnings []string
@@ -1107,10 +1132,6 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		req.CompressTypes = "gzip"
 	}
 
-	if err := validateRuleRequestBodyMaxSizeMB(req.RequestBodyMaxSizeMB); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
 	if req.UpstreamKeepaliveTimeout < 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "上游 keepalive 超时不能为负数"})
 		return
@@ -1125,7 +1146,9 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 	// 后端字段层校验（三层校验第 2 层；Caddy 层由 applyFromTxNote 的 CLI 预检
-	// + 事务内应用承担，裁定 2026-09-06 ④'）。
+	// + 事务内应用承担，裁定 2026-09-06 ④'）。H-B1-06（历史）：本门同时
+	// 承担 tls_source 白名单与请求体上限——Create/Update 入口的同款本地检查
+	// 已删除（单源，杜绝两处文案/边界漂移）。
 	if err := h.validateRulePayloadBeforeSave(req); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
@@ -1350,10 +1373,15 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 
 // certEnqueueErrorResponse 证书任务入队失败的状态/文案单源（历史问题-05）：
 // 证书签发任务未运行（队列 paused/inactive）→ 409 点名可操作原因，与手工
-// 签发端点同口径；其余内部失败维持 500。
+// 签发端点同口径；B2-03（历史）：规则当前态守卫拒绝（服务层
+// ErrCertRuleStateConflict——并发禁用/改域/删除，services/certificates.go
+// 明确要求 handler 409、不得折成 500）同样映射 409；其余内部失败维持 500。
 func certEnqueueErrorResponse(prefix string, err error) (int, string) {
 	if errors.Is(err, services.ErrCertificateQueueInactive) {
 		return http.StatusConflict, prefix + "：证书签发任务已停止，请先在任务监控中恢复后再试（" + err.Error() + "）"
+	}
+	if errors.Is(err, services.ErrCertRuleStateConflict) {
+		return http.StatusConflict, prefix + "：规则状态已变更，请刷新后重试（" + err.Error() + "）"
 	}
 	return http.StatusInternalServerError, prefix + ": " + err.Error()
 }
@@ -1779,14 +1807,14 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			}
 		}
 		// 历史问题 历史问题: 域名冲突检查同样加变更门控——仅当域名/监听端口/启用态相对存量
-		// 变化时才执行（ruleDomainConflict 只统计 enabled=1 的规则）。导入遗留的
+		// 变化时才执行（enabledRuleDomainConflict 只统计 enabled=1 的规则）。导入遗留的
 		// 「一启用一禁用同域名」组合中，禁用方仅改名等无关更新不再被 400 卡死；
 		// 启用态变化仍走检查（启用时二次把关，与 enabledRuleDomainConflict 口径一致）。
 		// 历史问题 历史问题: 启用态门控收敛为仅启用方向（*req.Enabled && !existingRule.Enabled）——
 		// 禁用方向不渲染、无冲突可言，存量冲突组合（同域名同端口双启用）的禁用操作
 		// 不应被 400 误拦（DisableRule 端点本就不查，口径对齐）。
 		if req.Domain != existingDomain || req.ListenPort != existingRule.ListenPort || (*req.Enabled && !existingRule.Enabled) {
-			existing, err := ruleDomainConflict(req.Domain, req.ListenPort, caddyID)
+			existing, err := enabledRuleDomainConflict(req.Domain, req.ListenPort, caddyID)
 			if err != nil {
 				services.Logf("error", "UpdateRule domain conflict query failed for caddy_id=%s domain=%s: %v", caddyID, req.Domain, err)
 				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "检查域名冲突失败"})
@@ -1878,12 +1906,6 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 	}
 
-	if req.RequestBodyMaxSizeMB != nil {
-		if err := validateRuleRequestBodyMaxSizeMB(*req.RequestBodyMaxSizeMB); err != nil {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-			return
-		}
-	}
 	if req.UpstreamKeepaliveTimeout != nil && *req.UpstreamKeepaliveTimeout < 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "上游 keepalive 超时不能为负数"})
 		return
@@ -1917,10 +1939,6 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 
 	// Validate TLS certificate if provided (manual source only)
 	var certWarnings []string
-	if *req.EnableTLS && req.TLSSource != "manual" && req.TLSSource != "acme_dns" {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"})
-		return
-	}
 	if (*req.EnableTLS || req.TLSCert != "" || req.TLSKey != "") && req.TLSSource == "manual" {
 		tlsCert := req.TLSCert
 		tlsKey := req.TLSKey
@@ -1973,6 +1991,20 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		return
 	}
 
+	// B2-02（历史）：PUT enabled=false 与 /disable 同语义，同样在副作用
+	// 之前做「执行中签发」快路径 409——此前 UpdateRule 直接进入有界取消等待
+	// （最长数分钟）并返回 200，/disable 同场景秒回 409，任务史与行为分叉。
+	// 仅拦「执行中」（HasRunningJobForRule）；queued/pending 维持既有语义。
+	// 单源判据：updatingToDisabled 同时供事务内 disableCertJobsForRuleTx 使用。
+	updatingToDisabled := existingRule.Enabled && !derefBool(req.Enabled) &&
+		derefBool(req.EnableTLS) && req.TLSSource == "acme_dns"
+	if updatingToDisabled {
+		if qm := services.GetCAQueueManager(); qm != nil && qm.HasRunningJobForRule(caddyID) {
+			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "该规则有正在进行的证书签发任务（约需几分钟），请任务完成后再禁用或稍后重试"})
+			return
+		}
+	}
+
 	// 运行配置快照：仅用于事务内应用失败的恢复（同 CreateRule，裁定 ④'）。
 	runtimeSnapshot, snapErr := h.snapshotImportRuntime([]string{caddyID})
 	if snapErr != nil {
@@ -1990,8 +2022,20 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	switchingFromACME := existingRule.TLSSource == "acme_dns" && req.TLSSource == "manual"
 	if switchingFromACME {
 		req.ACMEConfigID = 0
-		// LBH79-历史问题：与 CreateRule 非 ACME 强制 CAProviderID=0 同口径——
-		// 手动证书不再引用 CA 提供商，残留引用随导出/备份/快照放大。
+	}
+	// B2-04（历史）：生效证书来源非 manual 时不保留任何证书材料——
+	// manual→acme_dns 此前保留 tls_cert/tls_key（渲染按 tls_source 分流零消费，
+	// 但私钥正文长期留在 lb_rules 并随导出/备份/集群快照放大）。与 历史问题-1
+	// 「acme→manual 必须重新上传」对称清理。
+	clearingTLSMaterial := req.TLSSource != "manual"
+	if clearingTLSMaterial {
+		req.TLSCert, req.TLSKey = "", ""
+	}
+	// B2-05（历史）：生效来源非 acme_dns 时 ca_provider_id 归零（与
+	// CreateRule 非 ACME 分支同口径）。此前仅 switchingFromACME / tcp 归零，
+	// manual→manual 编辑把存量残留值原样写回；而 ResolveCAProviderID 对非 0
+	// 直接返回（不校验存在性），残留死引用会随导出放大并在签发期才暴露。
+	if req.TLSSource != "acme_dns" {
 		zeroCA := 0
 		req.CAProviderID = &zeroCA
 	}
@@ -2100,11 +2144,11 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// TCP 行经上方 tcpDeadFieldReset 已把 TLSCert/TLSKey 置空，但同协议编辑
 	// 时两条件此前皆假 → DELETE 列不写，死证书/私钥材料永久滞留并随导出/
 	// 快照放大。TCP 恒写（值为归一后的空串）。
-	if req.TLSCert != "" || protocolChanged || req.Protocol == "tcp" {
+	if req.TLSCert != "" || protocolChanged || req.Protocol == "tcp" || clearingTLSMaterial {
 		query += "tls_cert = ?, "
 		args = append(args, req.TLSCert)
 	}
-	if req.TLSKey != "" || protocolChanged || req.Protocol == "tcp" {
+	if req.TLSKey != "" || protocolChanged || req.Protocol == "tcp" || clearingTLSMaterial {
 		query += "tls_key = ?, "
 		args = append(args, req.TLSKey)
 	}
@@ -2220,7 +2264,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// PUT enabled=false 与 /disable 同语义：ACME 任务置 disabled 并取消在途，
 	// 否则任务视图仍显示 issued（历史 历史问题-01）。谓词经
 	// disableCertJobsForRuleTx 单源（A86 历史问题，failed 终态行保留失败史实）。
-	disabledByUpdate := !orphanACME && existingRule.Enabled && !derefBool(req.Enabled)
+	// 单源判据：上方 updatingToDisabled 已含 !orphanACME 的全部条件（启用中 +
+	// 请求禁用 + 终态仍为 acme_dns + TLS 开启），此处复用避免两处谓词漂移。
+	disabledByUpdate := updatingToDisabled
 	var disabledJobs int64
 	if disabledByUpdate {
 		var derr error
@@ -2437,6 +2483,18 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 					`SELECT id FROM cert_jobs WHERE rule_id=? ORDER BY id DESC LIMIT 1`,
 					caddyID).Scan(&existingJobID)
 				migrationRolledBack := false
+				// B2-01（历史）：真实查询错误（busy/IO，非 ErrNoRows）不得当作
+				// 「无任务」继续空提交——迁移未生效，旧域 issued+PEM 行永驻（sweep
+				// 跳过终态），needJob 又为新域另建行，破坏「一规则一任务」且无留痕。
+				// 与下方 UPDATE 失败/commit 失败分支同语义：回滚 + 退役旧域任务。
+				if queryErr != nil && !errors.Is(queryErr, sql.ErrNoRows) {
+					if rbErr := certTx.Rollback(); rbErr != nil {
+						services.Logf("error", "UpdateRule: cert job domain migration lookup rollback failed for caddy_id=%s: %v", caddyID, rbErr)
+					}
+					services.Logf("error", "UpdateRule: failed to read cert job during domain migration for caddy_id=%s: %v", caddyID, queryErr)
+					retireOldDomainCertJobOrAudit(c, caddyID, existingRule, "域名迁移查询任务失败", "migration lookup failure", "域名迁移查询失败后旧域任务退役失败")
+					migrationRolledBack = true
+				}
 				if queryErr == nil && existingJobID > 0 {
 					if _, err := certTx.Exec(
 						`UPDATE cert_jobs SET domain=?, status='failed', message='域名已更新，等待重新签发', cert_pem='', key_pem='', expires_at=NULL, renewal_attempts=0, ca_available_after=NULL, last_error_code=NULL, updated_at=datetime('now') WHERE id=?`,
@@ -2881,6 +2939,14 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	// 跨模式死引用（与 Create/Update/导入同口径；两协议同判）。
 	if rule.TLSSource == "manual" {
 		rule.ACMEConfigID = 0
+	}
+	// B2-04/B2-05（历史）：副本同样按生效来源清理跨模式残留——
+	// 非 manual 不复制证书材料；非 acme_dns 不复制 CA 提供商引用。
+	if rule.TLSSource != "manual" {
+		rule.TLSCert, rule.TLSKey = "", ""
+	}
+	if rule.TLSSource != "acme_dns" {
+		rule.CAProviderID = 0
 	}
 
 	// 历史问题（历史）：复制前把源行投影为共享保存输入并执行字段层校验

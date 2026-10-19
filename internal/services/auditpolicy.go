@@ -215,14 +215,16 @@ func ClassifyAuditRoute(method, path string) AuditPolicy {
 // taskTriggerSelfAuditIDs 手动触发审计自记族（历史问题-1，历史）：
 //   - threat/crs/ip2region：manager run 的 defer 每轮单记（2026-09-29 用户裁定
 //   - 历史问题 历史问题-2 收敛），operator 经 RunContext 归人；
+//   - crawlerbot-update：源更新入口 defer 自记（crawler_update.go）；
 //   - auto-backup：备份执行器（handlers/autobackup.go）按结果记「备份/备份失败」；
 //   - startup:config-load：runConfigLoad 载入审计（启动与手动同体）。
 //
-// 其余 9 个可手动触发族（config-watchdog/log-cleanup/audit-retention/
-// security-events-retention/cert-renewal-scan/cert-reconcile/cert-manual-poll/
-// cert-waiting-ca/autoban）任务体零
+// 其余 10 个可手动触发族（config-watchdog/log-cleanup/audit-retention/
+// security-events-retention/metrics-orphan-cleanup/cert-renewal-scan/
+// cert-reconcile/cert-manual-poll/cert-waiting-ca/autoban）任务体零
 // RecordAuditLog，由 trigger handler 显式补记。新增可触发族时必须评估本集合
-// （任务体自记 → 加入；否则 handler 自动补记）。
+// （任务体自记 → 加入；否则 handler 自动补记）；清单与
+// audit_policy_test.go 的可手动触发族断言同源，两处必须同步。
 var taskTriggerSelfAuditIDs = map[string]struct{}{
 	"threat":              {},
 	"crs":                 {},

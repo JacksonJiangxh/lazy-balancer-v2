@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -620,7 +621,7 @@ func TestClusterSnapshot_danglingBindingPreserved(t *testing.T) {
 }
 
 // queryRecordingSnapshotStore 记录最近一次 QueryContext 的 SQL 后委托真实 DB
-// 执行（同时验证 SQL 可执行），用于钉住 dumpTableAsJSON 的 ORDER BY 契约。
+// 执行（同时验证 SQL 可执行）——仅用于 SS87-历史问题 的宽松 ORDER BY 成员断言。
 type queryRecordingSnapshotStore struct {
 	database *sql.DB
 	query    string
@@ -635,24 +636,89 @@ func (s *queryRecordingSnapshotStore) QueryRowContext(ctx context.Context, query
 	return s.database.QueryRowContext(ctx, query, args...)
 }
 
-func TestClusterSnapshot_securityBindingsFullyOrdered(t *testing.T) {
-	// E-F2 回归：v2.2.0 多策略后同一 rule_caddy_id 最多 8 行绑定（SEC-B-GAP-U3：
-	// 上限 2026-09-21 已 5→8，注释滞同步）。ORDER BY 只给 rule_caddy_id 时行间
-	// 顺序在 SQL 层无定义（当前靠复合主键覆盖索引碰巧稳定，属查询计划偶然），
-	// 而快照指纹/缓存键要求字节级确定性——顺序保证必须来自
-	// ORDER BY rule_caddy_id, policy_id 全序，与运行侧 caddy.go 同口径（去行号化防再漂移）。
-	// Given
-	cluster, database := newClusterTestService(t)
+func captureSnapshotQuery(t *testing.T, database *sql.DB, cluster *ClusterService) string {
+	t.Helper()
 	store := &queryRecordingSnapshotStore{database: database}
-
-	// When
 	if _, err := cluster.snapshotSecurityBindings(context.Background(), store); err != nil {
 		t.Fatalf("snapshot security bindings: %v", err)
 	}
+	return store.query
+}
 
-	// Then
-	if !strings.HasSuffix(store.query, "ORDER BY rule_caddy_id, policy_id") {
-		t.Fatalf("bindings query=%q, want deterministic ORDER BY rule_caddy_id, policy_id", store.query)
+// orderByNameSet 判定 ORDER BY 子句是否以列名形式覆盖给定全部列（大小写/
+// 空白/列序不敏感，容忍 ASC/DESC 后缀）。不做文本后缀钉——等价 SQL 改写
+// （列序、空白、别名）都可通过。
+func orderByNameSet(query string, names ...string) bool {
+	lower := strings.ToLower(query)
+	idx := strings.LastIndex(lower, "order by")
+	if idx < 0 {
+		return false
+	}
+	terms := make(map[string]struct{})
+	for _, term := range strings.Split(lower[idx+len("order by"):], ",") {
+		fields := strings.Fields(term)
+		if len(fields) == 0 {
+			continue
+		}
+		terms[strings.Trim(fields[0], " ;")] = struct{}{}
+	}
+	for _, name := range names {
+		if _, ok := terms[strings.ToLower(name)]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func TestClusterSnapshot_securityBindingsFullyOrdered(t *testing.T) {
+	// E-F2 回归：v2.2.0 多策略后同一 rule_caddy_id 最多 8 行绑定（SEC-B-GAP-U3：
+	// 上限 2026-09-21 已 5→8，注释滞同步）。ORDER BY 只给 rule_caddy_id 时行间
+	// 顺序在 SQL 层无定义（靠复合主键覆盖索引碰巧稳定，属查询计划偶然），而
+	// 快照指纹/缓存键要求字节级确定性。
+	// SS87-历史问题：旧断言钉 SQL 文本后缀（ORDER BY rule_caddy_id, policy_id），
+	// 对等价改写（ORDER BY 1,2 / 子查询 / CTE）过敏且不证明行为——改为行为钉：
+	// 同一绑定集合按两种相反的物理插入顺序落库，快照字节必须一致。
+	cluster, database := newClusterTestService(t)
+	rows := [][2]any{{"rule-a", 10}, {"rule-a", 5}, {"rule-a", 7}, {"rule-b", 3}, {"rule-b", 1}}
+	insertAndSnapshot := func(order []int) []byte {
+		t.Helper()
+		if _, err := database.Exec("DELETE FROM security_policy_bindings"); err != nil {
+			t.Fatal(err)
+		}
+		for _, i := range order {
+			if _, err := database.Exec("INSERT INTO security_policy_bindings(rule_caddy_id, policy_id) VALUES(?,?)", rows[i][0], rows[i][1]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		data, err := cluster.snapshotSecurityBindings(context.Background(), database)
+		if err != nil {
+			t.Fatalf("snapshot security bindings: %v", err)
+		}
+		return data
+	}
+
+	// When：正序与逆序落库各取一次快照
+	forward := insertAndSnapshot([]int{0, 1, 2, 3, 4})
+	reverse := insertAndSnapshot([]int{4, 3, 2, 1, 0})
+
+	// Then：字节级一致（全序由 (rule_caddy_id, policy_id) 决定，与物理行序无关）
+	if !bytes.Equal(forward, reverse) {
+		t.Fatalf("同一绑定集合的两种物理插入顺序产出不同快照字节:\n %s\n %s\n（ORDER BY 未覆盖 (rule_caddy_id, policy_id) 全序）", forward, reverse)
+	}
+	// 内容自证：按 (rule_caddy_id, policy_id) 升序
+	want := `[{"policy_id":5,"rule_caddy_id":"rule-a"},{"policy_id":7,"rule_caddy_id":"rule-a"},{"policy_id":10,"rule_caddy_id":"rule-a"},{"policy_id":1,"rule_caddy_id":"rule-b"},{"policy_id":3,"rule_caddy_id":"rule-b"}]`
+	if string(forward) != want {
+		t.Fatalf("bindings snapshot=%s\nwant %s", forward, want)
+	}
+
+	// 契约钉（SS87-历史问题 取舍说明）：字节确定性用例在 SQLite 上无法区分
+	// 「ORDER BY 只给 rule_caddy_id」——复合主键覆盖索引恰可满足该排序，行间
+	// 次序仍稳定（正是找出项所说的「查询计划偶然」）。因此补一条宽松的
+	// ORDER BY 成员断言：只要求子句里出现两列（去空白后按词元比较），容忍
+	// 空白/列序/别名写法，不对 SQL 文本做后缀级钉。
+	query := captureSnapshotQuery(t, database, cluster)
+	if !orderByNameSet(query, "rule_caddy_id", "policy_id") {
+		t.Fatalf("bindings query=%q, want ORDER BY 同时覆盖 rule_caddy_id 与 policy_id（仅一列时次序依赖查询计划）", query)
 	}
 }
 

@@ -289,17 +289,37 @@ func (h *Handlers) GetAdminTLS(c *gin.Context) {
 		"mode":    cfg.Mode,
 	}
 	if cfg.Cert != "" {
-		if info, err := parseAdminTLSCertInfo(cfg.Cert); err == nil {
+		info, err := parseAdminTLSCertInfo(cfg.Cert)
+		if err != nil {
+			// 历史问题（历史）：库内证书损坏/非 PEM（带外改库、旧版本导入）
+			// 时此前静默省略 cert_info——UI 只见 enabled=true 却无证书信息，
+			// 运维零信号。读路径与写路径口径对齐：显式暴露不可读状态。
+			services.Logf("warn", "管理面板 HTTPS 证书解析失败（库内证书不可读）: %v", err)
+			resp["cert_info"] = nil
+			resp["cert_info_error"] = "证书内容不可读"
+		} else {
 			resp["cert_info"] = info
 		}
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: resp})
 }
 
+// auditAdminTLSFailure 记录管理面板 HTTPS 保存失败尝试（历史问题，历史）。
+// 词条沿用 UpdateConfig 的「更新失败/基础设置」（既有 danger 词表，不新增
+// 动作名）。detail 不落证书/私钥材料，只落原因。
+func auditAdminTLSFailure(c *gin.Context, reason string) {
+	recordAudit(c, "更新失败", "基础设置", services.FormatAuditDetail(
+		"操作：保存管理面板 HTTPS 配置",
+		"原因："+reason,
+		services.AuditResultPart("failure"),
+	))
+}
+
 func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)
 	input, err := decodeAdminTLSInput(c)
 	if err != nil {
+		auditAdminTLSFailure(c, "请求体无法解析")
 		respondAdminTLSBodyError(c, err)
 		return
 	}
@@ -307,6 +327,7 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		switch v {
 		case "true", "1", "false", "0":
 		default:
+			auditAdminTLSFailure(c, "enabled 取值不在白名单（仅 true/1/false/0）")
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "enabled 仅支持 true、1、false 或 0"})
 			return
 		}
@@ -316,6 +337,7 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 	// 已上传证书/私钥合并成空值）。
 	current, err := services.LoadAdminTLSConfigE()
 	if err != nil {
+		auditAdminTLSFailure(c, "读取当前 HTTPS 配置失败: "+err.Error())
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取当前 HTTPS 配置失败，已中止保存: " + err.Error()})
 		return
 	}
@@ -335,6 +357,7 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		if modeText == "" {
 			modeText = "未设置"
 		}
+		auditAdminTLSFailure(c, "证书材料来源与 mode 不一致（当前 mode："+modeText+"）")
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "提交了证书材料但证书来源不是 upload（当前：" + modeText + "）；如需上传证书请同时提交 mode=upload，否则请移除 cert_file/key_file 后重试"})
 		return
 	}
@@ -343,6 +366,7 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 	if mode == "upload" && input.hasUploadPayload() {
 		certPEM, keyPEM, err := input.certificatePair()
 		if err != nil {
+			auditAdminTLSFailure(c, "证书材料读取失败: "+err.Error())
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 			return
 		}
@@ -367,6 +391,7 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 	// 导入（config_backup.go）共用同一实现（历史问题 LBH-F6 收敛：原内联校验与
 	// validateAdminTLSConfigValues 双份——改一处漏一处即分叉）。
 	if err := validateAdminTLSConfigValues(services.AdminTLSConfig{Enabled: enabled, Mode: mode, Cert: cert, Key: key}); err != nil {
+		auditAdminTLSFailure(c, "配置校验失败: "+err.Error())
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
@@ -375,6 +400,7 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 	if enabled {
 		probe := services.AdminTLSConfig{Enabled: true, Mode: mode, Cert: cert, Key: key}
 		if _, err := probe.ResolveCertificate(h.cfg.DataDir); err != nil {
+			auditAdminTLSFailure(c, "证书不可用: "+err.Error())
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "证书不可用: " + err.Error()})
 			return
 		}
@@ -383,6 +409,7 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 	// 契约见 TestUpdateAdminTLSJSONBody_rejectsMismatchedPairWithoutSaving）。
 	if mode == "upload" && uploadedCertificate && !enabled {
 		if err := validateUploadCertificatePair(cert, key, time.Now()); err != nil {
+			auditAdminTLSFailure(c, "证书材料校验失败: "+err.Error())
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 			return
 		}
@@ -391,11 +418,17 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 	res, err := db.DB.Exec(`UPDATE global_config SET admin_tls_enabled=?, admin_tls_mode=?, admin_tls_cert=?, admin_tls_key=?, updated_at=datetime('now') WHERE id=1`,
 		enabled, mode, cert, key)
 	if err != nil {
+		auditAdminTLSFailure(c, "写入 HTTPS 配置失败: "+err.Error())
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "保存 HTTPS 配置失败: " + err.Error()})
 		return
 	}
 	if n, rowsErr := res.RowsAffected(); rowsErr != nil || n != 1 {
 		// global_config 行缺失/损坏时不能报成功并重启（历史 B2-历史问题）。
+		reason := "配置行不存在"
+		if rowsErr != nil {
+			reason = "读取更新结果失败: " + rowsErr.Error()
+		}
+		auditAdminTLSFailure(c, "HTTPS 配置未落库（"+reason+"）")
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "HTTPS 配置未落库（配置行不存在）"})
 		return
 	}

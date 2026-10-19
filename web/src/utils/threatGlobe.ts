@@ -1,10 +1,10 @@
 // 威胁大屏「地球模式」引擎（v2.3.8）：globe.gl(three.js) 旋转地球 + 垂直扫描
 // 特效。与 threatScene.ts（360°地图+雷达扫掠）实现同一 ThreatScene 接口——
 // ThreatScreen.vue 按设置 threat_screen_mode 二选一装载，数据管线/UI 完全复用。
-// 渲染：实心多边形国家板（choropleth 热力，可点击下钻）→ 下钻态换该国
-// 一级行政区板（中国=chinaProvinces 34 省高精度；其余=admin1Provinces）；
-// 攻击弧线/本站涟漪/扫描光带。扫描 shader 移植自参考实现（threat-wall，
-// 用户友人制作，授权改造）。
+// 渲染：世界态=点阵国家热力（可点击下钻，不着色陆地）；下钻态=该国一级行政区
+// 点阵（中国=chinaProvinces 34 省高精度；其余=admin1Provinces）+ 他国暗度多边形
+// 衬底（与地图版下钻同视觉）；攻击弧线/本站涟漪/扫描光带。扫描 shader 移植自
+// 参考实现（threat-wall，用户友人制作，授权改造）。
 import Globe from 'globe.gl'
 import type { GlobeInstance } from 'globe.gl'
 import * as THREE from 'three'
@@ -13,9 +13,10 @@ import { COUNTRY_CENTROIDS, FALLBACK_CENTROID } from '@/utils/countryCentroids'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { loadAdmin1Tables, loadedAdmin1Tables } from '@/utils/admin1Loader'
-import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, adminShortName, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed, DOT_LAND, arcOriginForLocation } from '@/utils/threatShared'
+import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, adminShortName, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed, DOT_LAND, arcOriginForLocation, hasProvinceStats, drillCommitAllowed } from '@/utils/threatShared'
 import type { ThreatScene, ThreatSceneOptions, CountryHeat } from '@/utils/threatScene'
 import { FLOW_ATTACK_ARC_COLORS, FLOW_NORMAL_ARC_COLORS, FLOW_FLIGHT_MS, flowArcLabel, flowAttackWidth, flowNormalWidth } from '@/utils/threatTheme'
+import { sphereSurfacePoint } from '@/utils/threatProjection'
 
 interface ArcDatum {
   startLat: number
@@ -29,7 +30,10 @@ interface ArcDatum {
   born: number
 }
 
-const LAND_DARK = 'rgb(27,42,65)'
+// 下钻态他国暗度衬底（普通多边形层，不进 H3）：与地图版暗度点阵同视觉。
+const DRILL_BACKDROP_CAP = 'rgba(27, 42, 65, 0.35)'
+// 下钻态 hover 他国：衬底多边形整体提亮（世界态 hover 由点阵改色承担）。
+const DRILL_BACKDROP_HOVER = 'rgba(143, 230, 255, 0.55)'
 // 世界总览相机高度：2.4 实测球体偏小；1.8 放大约 1/3。
 const WORLD_ALTITUDE = 1.63
 const MAX_ARCS = 30
@@ -76,6 +80,40 @@ function flyAltitudeFor(name: string): number {
   return Math.min(2.2, Math.max(0.55, span / 45 + 0.35))
 }
 
+interface BackdropPolygon {
+  /** 归一后的国家名（台湾并入中国）：与下钻名/hoveredDotCountry 同口径。 */
+  readonly key: string
+  readonly geometry: { type: 'MultiPolygon'; coordinates: number[][][][] }
+}
+
+let backdropCache: BackdropPolygon[] | null = null
+
+/** 扁平 [lon,lat,…] 环 → GeoJSON 环（[lon,lat] 且首尾闭合）。 */
+function closedRing(flat: number[]): number[][] {
+  const ring: number[][] = []
+  for (let i = 0; i + 1 < flat.length; i += 2) ring.push([flat[i], flat[i + 1]])
+  if (ring.length > 0) {
+    const [firstLon, firstLat] = ring[0]
+    const [lastLon, lastLat] = ring[ring.length - 1]
+    if (firstLon !== lastLon || firstLat !== lastLat) ring.push([firstLon, firstLat])
+  }
+  return ring
+}
+
+/** 下钻态他国暗度衬底数据（GeoJSON MultiPolygon）：一次性构建并缓存，绝不进
+ *  H3 hexbin（首次下钻把 176 国送进 H3 曾产生 3s 主线程长任务）。 */
+function worldBackdropPolygons(): BackdropPolygon[] {
+  if (backdropCache) return backdropCache
+  backdropCache = THREAT_COUNTRIES.map((c) => ({
+    key: normalizeCountryName(c.name),
+    geometry: {
+      type: 'MultiPolygon' as const,
+      coordinates: c.polys.map((poly) => poly.map(closedRing)),
+    },
+  }))
+  return backdropCache
+}
+
 export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOptions): ThreatScene {
   // 历史 历史问题：本站坐标是可变状态——构造期常量会让 setServer 只改
   // 环/点，弧线终点与返回视角仍指向旧坐标（本变量由 setServer/返回视角消费）。
@@ -111,6 +149,10 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   const provinceDotCache = new Map<string, { dots: WorldDot[]; positions: Float32Array }>()
   let dotsPoints: THREE.Points | null = null
   let hoveredDotCountry: string | null = null
+  /** 下钻态衬底配色：hover 的他在国整体提亮（WT87-05 双引擎 hover 契约）。
+   *  重新调用 globe.polygonCapColor(本函数) 即触发该层重算颜色。 */
+  const backdropCapColor = (d: object): string =>
+    (d as BackdropPolygon).key === hoveredDotCountry ? DRILL_BACKDROP_HOVER : DRILL_BACKDROP_CAP
   const dotBboxes = THREAT_COUNTRIES.map((c) => {
     let minLon = 180, maxLon = -180, minLat = 90, maxLat = -90
     for (const poly of c.polys) for (const ring of poly) for (let k = 0; k + 1 < ring.length; k += 2) {
@@ -152,6 +194,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   // 会继续以构造默认 window 尺寸显示一帧以上。这里直接同步 renderer 与
   // scene-container，保证第一帧就是容器尺寸。
   const renderer = (globe as unknown as { renderer?: () => THREE.WebGLRenderer }).renderer?.()
+  const threeRenderer: THREE.WebGLRenderer | null = renderer ?? null
   if (renderer) {
     // 客户端 DPR=2 时 canvas 实际 1808×1402，透明度+深度测试点阵 60fps
     // 会让 CPU/GPU 占用明显偏高；上限 1.5 保留清晰度并显著降载。
@@ -227,19 +270,13 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     .showAtmosphere(true)
     .atmosphereColor('#3ad1ff')
     .atmosphereAltitude(0.16)
-    .hexPolygonsData([])
-    // 世界总览按分辨率 2 生成（res3 实测首屏 4.4s 主线程长任务，打开即卡死）；
-    // 省级下钻同样用 2，确保首屏与下钻都不触发 H3 炸弹。
-    .hexPolygonResolution(2)
-    .hexPolygonMargin(0.25)
-    .hexPolygonUseDots(false)
-    .hexPolygonColor(LAND_DARK)
-    .hexPolygonsTransitionDuration(0)
-    // 下钻态他国暗度衬底用普通多边形层，避免把 176 国再次送进 H3 hexbin
-    //（首次下钻 3s 长任务根因）；世界态恒为空。
+    // 下钻态他国暗度衬底用普通多边形层（GeoJSON MultiPolygon，一次性缓存），
+    // 避免把 176 国送进 H3 hexbin（首次下钻 3s 主线程长任务根因）；世界态恒为空
+    //（applyLayer 按 drilledName 填充/清空）。H3 六边形配置一并移除——原
+    // hexPolygonsData 恒空数组 + 6 项分辨率/边距配置从未产生任何图元。
     .polygonsData([])
     .polygonAltitude(0.002)
-    .polygonCapColor(() => 'rgba(27, 42, 65, 0.35)')
+    .polygonCapColor(backdropCapColor)
     .polygonSideColor(() => 'rgba(0,0,0,0)')
     .polygonStrokeColor(() => 'rgba(80, 120, 180, 0.12)')
     .polygonsTransitionDuration(0)
@@ -293,35 +330,40 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     const ndcX = ((px - r.left) / r.width) * 2 - 1
     const ndcY = -(((py - r.top) / r.height) * 2 - 1)
     cam.updateMatrixWorld()
-    const fovHalf = (cam.fov * Math.PI) / 360
-    const dir = new THREE.Vector3()
-    cam.getWorldDirection(dir)
+    const dir = cam.getWorldDirection(new THREE.Vector3())
     const right = new THREE.Vector3().crossVectors(dir, cam.up).normalize()
     const up = new THREE.Vector3().crossVectors(right, dir).normalize()
-    const ray = dir
-      .add(right.multiplyScalar(ndcX * Math.tan(fovHalf) * cam.aspect))
-      .add(up.multiplyScalar(ndcY * Math.tan(fovHalf)))
-      .normalize()
     const origin = new THREE.Vector3().setFromMatrixPosition(cam.matrixWorld)
-    // 与点阵同一壳层求交（不是球面）：消除高纬/球缘的视差。
-    const R = globe.getGlobeRadius() * (1 + DOT_ALTITUDE)
-    // 射线 ∩ 球（球心原点）：|o + t·d|² = R²
-    const b = origin.dot(ray)
-    const c = origin.dot(origin) - R * R
-    const disc = b * b - c
-    if (disc < 0) return null
-    const t = -b - Math.sqrt(disc)
-    if (t < 0) return null
-    const p = origin.clone().add(ray.clone().multiplyScalar(t))
-    // three-globe 球面约定（polar2Cartesian 逆变换）——逆变换产出域为
-    // (-90°, 270°]，必须 wrap 到 [-180,180]：西半球国家（美/加等 lng<-90）
-    // 曾整片 hover/点击 miss（v2.3.8-beta 实测）。
-    const lat = 90 - (Math.acos(p.y / R) * 180) / Math.PI
-    const lng = ((((90 - (Math.atan2(p.z, p.x) * 180) / Math.PI) + 540) % 360) - 180)
-    return { lat, lng }
+    // 逆投影纯数学单源（threatProjection.sphereSurfacePoint，WT87-09）：
+    // 与点阵同一壳层求交（不是球面），消除高纬/球缘的视差。
+    return sphereSurfacePoint(
+      {
+        origin: [origin.x, origin.y, origin.z],
+        dir: [dir.x, dir.y, dir.z],
+        right: [right.x, right.y, right.z],
+        up: [up.x, up.y, up.z],
+        fovHalf: (cam.fov * Math.PI) / 360,
+        aspect: cam.aspect,
+      },
+      ndcX,
+      ndcY,
+      globe.getGlobeRadius() * (1 + DOT_ALTITUDE),
+    )
   }
 
   
+  /**
+   * 单帧补绘（WT87-04）：暂停态 `globe.pauseAnimation()` 停掉库自循环后，
+   * 同步的相机/图层变更无人渲染。globe.gl 无 manual-render API，这里直接用
+   * 已捕获的 renderer 画一帧（与地图引擎 renderOnce 同语义）。
+   */
+  function renderOnce(): void {
+    if (!threeRenderer || disposed) return
+    const scene = globe.scene()
+    const cam = globe.camera()
+    if (scene && cam) threeRenderer.render(scene, cam)
+  }
+
   /** 共享点内判定的批量包装（国家/省多边形组命中）。 */
   function pointInEntries(lon: number, lat: number, entries: { polys: number[][][] }[]): boolean {
     return entries.some((e) => sharedPointInPolys(lon, lat, e.polys))
@@ -346,9 +388,10 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     const seq = ++drillSeq
     if (name !== '中国') {
       const tables = await loadAdmin1Tables()
-      // 历史问题-F5：chunk 加载期间用户退出大屏 → disposed 后不得再操作已销毁
-      // 的 globe（pointOfView/applyLayer 抛错会经 void 调用成为 unhandled rejection）。
-      if (seq !== drillSeq || disposed) return
+      // 历史问题-F5：chunk 加载期间用户退出大屏/复位/返回 → 丢弃结果（判定单源，
+      // 与地图引擎共用）。原地球 zoomOut/resetView 不递增 drillSeq，迟到续体
+      // 会把用户刚做的复位覆盖成下钻（WT87-03）。
+      if (!drillCommitAllowed(seq, drillSeq, disposed)) return
       if (!tables) {
         if (!disposed) opts?.onProvinceLoadError?.()
         return
@@ -357,10 +400,21 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     }
     drilledName = name
     const c2 = COUNTRY_CENTROIDS[name] ?? FALLBACK_CENTROID
-    globe.pointOfView({ lat: c2[1], lng: c2[0], altitude: flyAltitudeFor(name) }, 700)
+    // 暂停态无动画帧驱动：直接落点并补绘一帧（与地图版 历史问题 同语义）。
+    globe.pointOfView({ lat: c2[1], lng: c2[0], altitude: flyAltitudeFor(name) }, paused ? 0 : 700)
     globe.controls().autoRotate = false
     applyLayer()
+    if (paused) renderOnce()
     onDrillChange?.(name)
+  }
+
+  /** 返回世界视角（空白点击/zoomOut/resetView 共用；暂停态直接落点+补绘）。 */
+  function enterWorldView(duration: number): void {
+    drilledName = null
+    globe.controls().autoRotate = !paused
+    globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, paused ? 0 : duration)
+    applyLayer()
+    if (paused) renderOnce()
   }
 
   async function handleCanvasClick(ev: MouseEvent): Promise<void> {
@@ -369,18 +423,16 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     if (drilledName) {
       // 本省（选中国家内）：保持
       if (pointInEntries(geo.lng, geo.lat, provincePolysCache)) return
-      // 命中其他国家：切换下钻（手势语义与地图版统一）
-      const other = THREAT_COUNTRIES.find((c) => c.name !== drilledName && pointInEntries(geo.lng, geo.lat, [c]))
+      // 命中其他国家：切换下钻（手势语义与地图版统一；台湾归一后与选择国
+      // 同名，不得当「其他国家」重复下钻）
+      const other = THREAT_COUNTRIES.find((c) => normalizeCountryName(c.name) !== drilledName && pointInEntries(geo.lng, geo.lat, [c]))
       if (other) {
         await drillCountry(normalizeCountryName(other.name))
         return
       }
       // 空白：返回世界
       drillSeq += 1
-      drilledName = null
-      globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, 700)
-      globe.controls().autoRotate = !paused
-      applyLayer()
+      enterWorldView(700)
       onDrillChange?.(null)
       return
     }
@@ -405,9 +457,12 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   let lastHoverPick = 0
 
   function setHexHover(name: string | null): void {
-    // 世界/下钻都由同一 Points 点阵承载，hover 只改点色，不再重建 hex。
+    // 世界态：hover 只改点色（同一 Points 层）。下钻态：他国由多边形衬底
+    // 呈现（无世界点阵），必须重算衬底色——否则浮签换了国家、画面不跟随
+    //（WT87-05 双引擎 hover 契约）。
     hoveredDotCountry = name
     updateDotColors()
+    if (drilledName) globe.polygonCapColor(backdropCapColor)
   }
 
   /** 帧内 hover 拾取（每帧最多一次）。 */
@@ -429,16 +484,18 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     }
     let name: string | null = null
     let count = 0
+    let provinceHover = false
     if (drilledName) {
       for (const pv of provinceSource(drilledName)) {
         if (pointInEntries(geo.lng, geo.lat, [{ polys: pv.polys }])) {
           name = 'short' in pv && pv.short ? String(pv.short) : String(pv.name)
           count = provinceCounts.get(name) ?? 0
+          provinceHover = true
           break
         }
       }
       if (!name) {
-        const other = THREAT_COUNTRIES.find((c) => c.name !== drilledName && pointInEntries(geo.lng, geo.lat, [c]))
+        const other = THREAT_COUNTRIES.find((c) => normalizeCountryName(c.name) !== drilledName && pointInEntries(geo.lng, geo.lat, [c]))
         if (other) { name = normalizeCountryName(other.name); count = countryCounts.get(name) ?? 0 }
       }
     } else {
@@ -453,7 +510,10 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       const cv = container.querySelector('canvas')
       const r = (cv ?? container).getBoundingClientRect()
       hoverTipEl.style.display = 'block'
-      hoverTipEl.textContent = `${name} ${count}`
+      // WT87-11：省级统计只覆盖中国，海外下钻不得显示「该省 0 次攻击」。
+      hoverTipEl.textContent = provinceHover && drilledName && !hasProvinceStats(drilledName)
+        ? `${name} 无省级统计`
+        : `${name} ${count}`
       hoverTipEl.style.left = `${move.x - r.left + 14}px`
       hoverTipEl.style.top = `${move.y - r.top - 6}px`
     } else {
@@ -621,17 +681,19 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     return result
   }
 
-  /** 板块层重建：世界=国家六边形板（热力）；下钻=省板（全亮）+他国板（暗度
-   * 衬底，与地图版下钻同视觉——用户裁定 2026-10-17）。 */
+  /** 板块层重建：世界=国家点阵（热力，无陆地着色）；下钻=省点阵 + 他国暗度
+   *  多边形衬底（与地图版下钻同视觉——用户裁定 2026-10-17）。衬底用缓存的
+   *  GeoJSON 一次性数据，绝不进 H3。 */
   function applyLayer(): void {
     if (!layerReady) return
-    globe.hexPolygonsData([])
-    globe.polygonsData([])
     if (drilledName) {
       const set = ensureProvinceDotSet(drilledName)
       setActiveDots(set.dots, set.positions, provinceCounts)
       provincePolysCache = provinceSource(drilledName).map((p) => ({ polys: p.polys }))
+      // 选择国自身由省点阵表达；台湾条目归一后同属中国 → 一并隐藏。
+      globe.polygonsData(worldBackdropPolygons().filter((p) => p.key !== drilledName))
     } else {
+      globe.polygonsData([])
       if (!worldDots || !worldDotPositions) return
       setActiveDots(worldDots, worldDotPositions, countryCounts)
       provincePolysCache = []
@@ -720,13 +782,16 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       }
     }
   }
-  // 两个 RAF：第一个让首帧（球体 + 正确尺寸）真正上屏，第二个再做 H3。
+  // 两个 RAF：第一个让首帧（球体 + 正确尺寸）真正上屏，第二个再建点阵。
   requestAnimationFrame(() => requestAnimationFrame(() => {
     if (disposed) return
     layerReady = true
     buildWorldDots()
     applyHotspots()
-    if (!drilledName) applyLayer()
+    // 无条件应用：两帧内已下钻（中国路径同步完成，drillCountry 不 await）时
+    // applyLayer 此前因 !layerReady 早退，而 setCountries/setProvinces 只走
+    // 「activeDots 已存在」重着色分支 → 省点阵永不应用（WT87-10）。
+    applyLayer()
   }))
   let rafId = requestAnimationFrame(frame)
 
@@ -816,16 +881,14 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       if (!drilledName) globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, 0)
     },
     zoomOut(): void {
-      drilledName = null
-      globe.controls().autoRotate = !paused
-      globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, 600)
-      applyLayer()
+      // WT87-03：与地图版同源——复位/返回必须作废在途省界加载，否则迟到的
+      // chunk 续体会把用户刚做的复位覆盖成下钻。
+      drillSeq += 1
+      enterWorldView(600)
     },
     resetView(): void {
-      drilledName = null
-      globe.controls().autoRotate = !paused
-      globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, 600)
-      applyLayer()
+      drillSeq += 1
+      enterWorldView(600)
     },
     cameraState(): { zoom: number; cx: number; cy: number; dist: number; pos: [number, number, number] } {
       const pov = globe.pointOfView()
@@ -866,7 +929,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       }
       cancelAnimationFrame(rafId)
       globe.pauseAnimation()
-      globe.hexPolygonsData([])
+      globe.polygonsData([])
       globe.arcsData([])
       globe.labelsData([])
       globe.ringsData([])

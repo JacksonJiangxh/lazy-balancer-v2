@@ -6,8 +6,8 @@
 //   条目求和、状态=更新中>失败>成功>未更新）
 // - libraryHealthTag / librarySourceHealthTag：卡头健康标签
 // 状态词表：missing=文件缺失（danger）、not-installed=库未安装（info）、
-// never=从未更新（info）、failed/running/checking/downloading/installing/
-// reloading/success/idle 与后端 update_status 同词。
+// never=从未更新（info）、cancelled=已取消（info）、failed/running/checking/
+// downloading/installing/reloading/success/idle 与后端 update_status 同词。
 import { compareVersion } from './securityStages.ts'
 
 export type LibraryTagType = 'success' | 'warning' | 'danger' | 'info'
@@ -24,6 +24,7 @@ const STATUS_LABELS: Record<string, string> = {
   reloading: '重载中',
   success: '已最新',
   idle: '已最新',
+  cancelled: '已取消',
   disabled: '已关闭',
 }
 
@@ -34,6 +35,9 @@ export const libraryStatusTagType = (status: string): LibraryTagType => {
   if (!status) return 'info'
   if (status === 'missing' || status === 'failed' || status.includes('失败') || status.includes('错误')) return 'danger'
   if (status === 'not-installed' || status === 'never' || status === 'disabled') return 'info'
+  // 历史问题-01 同族收敛：cancelled 是后端的持久状态（四类库均会写），原词表漏映射
+  // 会让状态列直接显示英文原词——中立 info，不冒充失败/成功。
+  if (status === 'cancelled') return 'info'
   if (status === 'checking' || status === 'downloading' || status === 'installing' || status === 'reloading' || status === 'running') return 'warning'
   if (status === 'success' || status === 'idle' || status.includes('最新')) return 'success'
   if (status.includes('中')) return 'warning'
@@ -111,6 +115,14 @@ export const libraryHealthTag = (
   if (state.available === false) return { label: `${name} · 缺失`, type: 'danger' }
   if (state.status === 'not-installed') return { label: `${name} · 未安装`, type: 'warning' }
   if (state.status === 'never') return { label: `${name} · 未更新`, type: 'warning' }
+  // 历史问题-01：持久 update_status 的失败/进行中/关闭态必须显性——该列可为
+  // failed（更新失败落库），活动期还会 overlay checking/downloading/installing/
+  // reloading/running。此前一律落「正常」，与同卡状态列（libraryStatusTagType）
+  // 的「更新失败/更新中」自相矛盾（历史问题-F1 同族）。词表复用状态列单源。
+  const status = state.status ?? ''
+  if (status !== '' && status !== 'success' && status !== 'idle') {
+    return { label: `${name} · ${libraryStatusLabel(status)}`, type: libraryStatusTagType(status) }
+  }
   return { label: `${name} · 正常`, type: 'success' }
 }
 
@@ -131,4 +143,24 @@ export const librarySourceHealthTag = (
   const failed = active.filter((s) => s.update_status === 'failed').length
   if (failed > 0) return { label: `${name} · ${failed} 源更新失败`, type: 'warning' }
   return { label: `${name} · 正常`, type: 'success' }
+}
+
+/**
+ * CRS 规则库「数量」列文案（审计 87 W87-02）：后端 `rule_count` 是 SecRule
+ * 指令条数（internal/services/crsrelease.go countSecRules 只数 SecRule 行）——
+ * 写「条规则」而不是「个文件」，否则 832 条规则会被读成 832 个文件。
+ * 读取失败由调用方先行置 '—'；0/缺省同样 '—'（0 条不等于「库已就绪」）。
+ */
+export const crsRuleCountLabel = (ruleCount: number | undefined): string =>
+  ruleCount && ruleCount > 0 ? `${ruleCount.toLocaleString()} 条规则` : '—'
+
+/**
+ * 规则库「定时更新」保存前校验（历史问题）：返回错误文案，合法时 null。
+ * 时间被清空时原实现静默回落 04:00——输入框显示空、落库却是 04:00，用户看不到
+ * 差异。改为显式拒绝保存（不代填），由组件以 warning 呈现。
+ */
+export const libraryScheduleError = (days: readonly number[], time: string | null | undefined): string | null => {
+  if (days.length === 0) return '至少选择一天'
+  if (!time) return '请选择时间'
+  return null
 }

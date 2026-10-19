@@ -65,7 +65,7 @@
           <template #default="{ row }">
             <el-button size="small" link type="primary" @click="previewPage(row)">预览</el-button>
             <el-button size="small" link :type="row.is_default || row.is_builtin || isReadOnly ? 'info' : 'primary'" @click="openDialog(row)">{{ row.is_default || row.is_builtin || isReadOnly ? '查看' : '编辑' }}</el-button>
-            <el-button size="small" link type="danger" :disabled="row.is_default || row.is_builtin || isReadOnly" @click="handleDelete(row)">删除</el-button>
+            <el-button size="small" link type="danger" :loading="deletingId === row.id" :disabled="row.is_default || row.is_builtin || isReadOnly || deletingId !== null" @click="handleDelete(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -248,9 +248,16 @@ const handleSave = async () => {
   } catch { /* 具体错误已由全局 axios 拦截器统一展示 */ } finally { saving.value = false }
 }
 
+// W87-08：删除重入守卫（双击叠两个确认框 → 两次 DELETE，第二次 404 误报失败）——
+// 与 SecurityPolicies.deletingPolicyId 同款范式。
+const deletingId = ref<number | null>(null)
 const handleDelete = (row: BlockPage) => {
+  if (deletingId.value !== null) return
+  deletingId.value = row.id
   ElMessageBox.confirm(`确定删除拦截页面"${row.name}"？`, '确认', { type: 'warning' })
-    .then(async () => { const del = await request.delete(`/security/block-pages/${row.id}`); showSaveResult(del, '已删除'); fetchData() }).catch(() => {})
+    .then(async () => { const del = await request.delete(`/security/block-pages/${row.id}`); showSaveResult(del, '已删除'); fetchData() })
+    .catch(() => { /* 用户取消或请求失败（全局拦截器已 toast）——列表保持不变 */ })
+    .finally(() => { deletingId.value = null })
 }
 
 const previewPage = (row: BlockPage) => {

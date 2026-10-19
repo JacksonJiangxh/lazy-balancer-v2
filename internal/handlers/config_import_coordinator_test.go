@@ -259,7 +259,7 @@ func TestConfigImport_mapsCaddyTransportAndRejectionDifferently(t *testing.T) {
 				t.Cleanup(server.Close)
 				h.caddyService = services.NewCaddyService(server.URL)
 				router := gin.New()
-				path, body := "/config/import", r78BackupJSON(t, nil, nil, nil)
+				path, body := "/config/import", buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, Config: nil, Sections: nil, EmptyConfigIfNil: true})
 				if format == "v1" {
 					path, body = "/config/import/v1", v1Backup
 					router.POST(path, h.ImportV1Config)
@@ -342,9 +342,9 @@ func TestImportConfigBackup_invalidatesTaskLogCacheAndCancelsInFlightRuns(t *tes
 	t.Cleanup(func() {
 		invalidateImportTaskLogCache, cancelImportInFlightRuns = oldInvalidate, oldCancel
 	})
-	body := r78BackupJSON(t, map[string][]map[string]any{
+	body := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"users": {{"id": 1, "username": "admin", "password_hash": "hash", "role": "admin", "is_enabled": 1}},
-	}, map[string]any{"task_log_size_mb": 20}, []string{"users"})
+	}, Config: map[string]any{"task_log_size_mb": 20}, Sections: []string{"users"}, EmptyConfigIfNil: true})
 
 	// When committing an import that writes task_log_size_mb.
 	rec := r78Import(h, t, body)

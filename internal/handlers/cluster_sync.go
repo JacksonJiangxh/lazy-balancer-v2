@@ -63,6 +63,13 @@ func (h *Handlers) PullClusterSnapshot(c *gin.Context) {
 		clusterError(c, http.StatusBadRequest, "主节点无需手动同步", err)
 		return
 	}
+	// 历史问题（历史 历史问题，R-12 同族收敛）：与 SetClusterMode/Promote/
+	// ForgetClusterPins 同口径——装配缺失时 503，不得 nil 指针 panic 落成
+	// Gin recovery 的 500 空体。
+	if h.syncService == nil {
+		clusterError(c, http.StatusServiceUnavailable, "同步服务未初始化", nil)
+		return
+	}
 	result, err := h.syncService.Pull(c.Request.Context())
 	if err != nil {
 		recordAudit(c, "同步失败", "集群同步", err.Error())

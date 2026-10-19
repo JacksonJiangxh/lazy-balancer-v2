@@ -80,28 +80,55 @@ export function panBy(cam: Cam2D, dxPx: number, dyPx: number): { camX: number; c
  *  只能源文本断言）。 */
 export const DRILL_UNIFIED_ZOOM = 9
 
+/** 球面相机基向量（正交归一；球心=原点、半径=radius 的世界坐标系）。 */
+export interface SpherePickCamera {
+  readonly origin: readonly [number, number, number]
+  readonly dir: readonly [number, number, number]
+  readonly right: readonly [number, number, number]
+  readonly up: readonly [number, number, number]
+  /** 纵向半视角（弧度）。 */
+  readonly fovHalf: number
+  readonly aspect: number
+}
+
 /**
- * 视口经度范围 → 覆盖的 12° 分桶键序列（去重、按世界带归一）。
- *
- * 世界点阵按 `Math.floor(lon / 12)` 分桶（lon∈[-180,180) → 键 -15..14）。
- * 下钻态横向拖动跨日界线时 minLon/maxLon 会越出世界带（camX 自由实数），
- * 直接 floor 得到的键不在桶表中 → 整段点阵消失。此处把每个键按
- * `((b + 15) % 30) - 15` 归一，与渲染公式 `wrapDeg` 同源。
+ * 地球引擎自研拾取的逆投影单源（WT87-09）：NDC 坐标 + 相机基向量 → 射线 ∩
+ * 半径 radius 的球面 → three-globe 球面约定经纬度（经度 wrap 到 [-180,180)）。
+ * 原实现内嵌在 threatGlobe 闭包里（依赖 three/globe 实例），无法确定性断言；
+ * 抽成纯数学后可经「正投影→逆投影」往返验证西半球 wrap 与高纬极区。
+ * 射线背向球面/未命中返回 null。
  */
-export function wrappedBucketKeys(minLon: number, maxLon: number, bucketSize = 12): number[] {
-  const count = Math.round(WORLD_W / bucketSize)
-  const first = Math.floor(minLon / bucketSize)
-  const last = Math.floor(maxLon / bucketSize)
-  const half = count / 2
-  const keys: number[] = []
-  const seen = new Set<number>()
-  for (let b = first; b <= last; b++) {
-    const key = (((b + half) % count) + count) % count - half
-    if (seen.has(key)) continue
-    seen.add(key)
-    keys.push(key)
-  }
-  return keys
+export function sphereSurfacePoint(
+  cam: SpherePickCamera,
+  ndcX: number,
+  ndcY: number,
+  radius: number,
+): { lat: number; lng: number } | null {
+  const tx = ndcX * Math.tan(cam.fovHalf) * cam.aspect
+  const ty = ndcY * Math.tan(cam.fovHalf)
+  let rx = cam.dir[0] + cam.right[0] * tx + cam.up[0] * ty
+  let ry = cam.dir[1] + cam.right[1] * tx + cam.up[1] * ty
+  let rz = cam.dir[2] + cam.right[2] * tx + cam.up[2] * ty
+  const len = Math.hypot(rx, ry, rz)
+  if (!(len > 0)) return null
+  rx /= len
+  ry /= len
+  rz /= len
+  // 射线 ∩ 球（球心原点）：|o + t·d|² = r²
+  const b = cam.origin[0] * rx + cam.origin[1] * ry + cam.origin[2] * rz
+  const c = cam.origin[0] ** 2 + cam.origin[1] ** 2 + cam.origin[2] ** 2 - radius * radius
+  const disc = b * b - c
+  if (disc < 0) return null
+  const t = -b - Math.sqrt(disc)
+  if (t < 0) return null
+  const px = cam.origin[0] + rx * t
+  const py = cam.origin[1] + ry * t
+  const pz = cam.origin[2] + rz * t
+  const lat = 90 - (Math.acos(Math.max(-1, Math.min(1, py / radius))) * 180) / Math.PI
+  // three-globe 球面约定（polar2Cartesian 逆变换）产出域 (-90°, 270°]，
+  // 必须 wrap 到 [-180,180)：西半球（美/加等 lng<-90）曾整片 hover/点击 miss。
+  const lng = wrapDeg(90 - (Math.atan2(pz, px) * 180) / Math.PI)
+  return { lat, lng }
 }
 
 interface BoundsBox {

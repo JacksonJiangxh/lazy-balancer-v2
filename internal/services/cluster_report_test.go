@@ -1,7 +1,9 @@
 package services
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -187,5 +189,68 @@ func TestSyncService_Report_countsExpiringCertificatesAcrossDeployableStates(t *
 		}
 	default:
 		t.Fatal("master did not receive second cluster report")
+	}
+}
+
+// S历史问题-09：cert_expiry_days 非法时按状态转换只记一次 warn，恢复记一次 info。
+func TestReport_certExpiryWarnOnlyOnStateTransition(t *testing.T) {
+	// 隔离共享状态转换 map 的该 key（同 metrics_test.go isolateMetricsState 范式）：
+	// 同文件其它 Report 用例可能已把该 key 置为 failed，状态机对「已失败→再失败」
+	// 不重复记，会静默吞掉本用例的首次失败告警（整文件顺序跑时复现）。
+	const certExpiryStateKey = "cluster-report-cert-expiry"
+	metricsStateMu.Lock()
+	previousState, hadPrevious := metricsStateFailed[certExpiryStateKey]
+	delete(metricsStateFailed, certExpiryStateKey)
+	metricsStateMu.Unlock()
+	t.Cleanup(func() {
+		metricsStateMu.Lock()
+		if hadPrevious {
+			metricsStateFailed[certExpiryStateKey] = previousState
+		} else {
+			delete(metricsStateFailed, certExpiryStateKey)
+		}
+		metricsStateMu.Unlock()
+	})
+
+	_, database := newClusterTestService(t)
+	sync := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
+	t.Cleanup(func() { unregisterSyncDrainer(sync) })
+	ctx := context.Background()
+
+	var buf bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	if _, err := database.Exec("UPDATE global_config SET cert_expiry_days=0 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := sync.Report(ctx); err == nil {
+			t.Fatal("report with empty master URL must fail")
+		}
+	}
+	if got := strings.Count(buf.String(), "读取证书到期口径失败"); got != 1 {
+		t.Fatalf("invalid cert_expiry_days logged %d times, want 1 (state transition gate)", got)
+	}
+
+	if _, err := database.Exec("UPDATE global_config SET cert_expiry_days=30 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sync.Report(ctx); err == nil {
+		t.Fatal("report with empty master URL must fail")
+	}
+	if got := strings.Count(buf.String(), "证书到期口径读取恢复正常"); got != 1 {
+		t.Fatalf("recovery log count=%d, want 1", got)
+	}
+
+	if _, err := database.Exec("UPDATE global_config SET cert_expiry_days=0 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sync.Report(ctx); err == nil {
+		t.Fatal("report with empty master URL must fail")
+	}
+	if got := strings.Count(buf.String(), "读取证书到期口径失败"); got != 2 {
+		t.Fatalf("failure after recovery logged %d times, want 2", got)
 	}
 }

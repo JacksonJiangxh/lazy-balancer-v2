@@ -312,21 +312,19 @@ func (h *Handlers) respondLoginWithMFA(c *gin.Context, user models.User, passwor
 		services.RecordAuditLog(user.Username, "登录成功", "用户认证", services.FormatAuditDetail(services.AuditUserPart(user.ID, user.Username), services.AuditResultPart("success")), c.ClientIP())
 	}
 
-	response := models.NewUserResponse(user)
-	// 历史问题 十次：登录/step-up 响应携带 mfa_enabled——NewUserResponse 不含该字段
-	//（User 模型无此列），此前所有登录路径的 user.mfa_enabled 恒 false，导致
-	// 前端「登录从节点需先启用 MFA」预检对自己已启用的用户误报。一次查询填齐。
-	// 与登录密码步的 mfa_enabled 判定查询为两处独立查询（历史 F56B2-5
-	// 裁定保留：step-up/登录共用本函数，透传会增加 MFA 关键流签名复杂度，
-	// 代价仅一次索引点查）。
+	// 历史问题 十次：登录/step-up 响应必须携带 mfa_enabled——此前所有登录路径的
+	// user.mfa_enabled 恒 false，导致前端「登录从节点需先启用 MFA」预检对自己
+	// 已启用的用户误报。CI87-08：标志经 NewUserResponse 签名单源填充（遗漏即
+	// 编译失败）。与登录密码步的 mfa_enabled 判定查询为两处独立查询（历史
+	// F56B2-5 裁定保留：step-up/登录共用本函数，透传会增加 MFA 关键流签名
+	// 复杂度，代价仅一次索引点查）。
 	var mfaEnabled int
-	if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", user.ID).Scan(&mfaEnabled); err == nil {
-		response.MFAEnabled = mfaEnabled == 1
-	} else {
+	if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", user.ID).Scan(&mfaEnabled); err != nil {
 		// U7a-历史问题（历史）：查询失败此前静默保持 false——响应语义不变
 		//（该字段为展示性预检），但错误必须留痕便于诊断。
 		services.Logf("error", "login response mfa_enabled lookup: %v", err)
 	}
+	response := models.NewUserResponse(user, mfaEnabled == 1)
 
 	c.JSON(http.StatusOK, models.LoginResponse{
 		Token:    tokenString,
@@ -386,8 +384,7 @@ func (h *Handlers) GetCurrentUser(c *gin.Context) {
 		return
 	}
 
-	response := models.NewUserResponse(user)
-	response.MFAEnabled = mfaEnabled == 1
+	response := models.NewUserResponse(user, mfaEnabled == 1)
 	// v2.3.0:OIDC 来源标记——前端据此隐藏本地显示名/密码编辑(数据源自 IdP)
 	response.AuthProvider = authProvider
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: response})
@@ -596,8 +593,7 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 	} else {
 		recordAudit(c, "更新信息", "用户", services.FormatAuditDetail(services.AuditUserPart(user.ID, user.Username), fmt.Sprintf("变更：%s", strings.Join(changed, "、"))))
 	}
-	response := models.NewUserResponse(user)
-	response.MFAEnabled = mfaEnabled == 1
+	response := models.NewUserResponse(user, mfaEnabled == 1)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: response})
 }
 

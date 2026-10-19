@@ -105,30 +105,39 @@ func (err *SnapshotSchemaTooNewError) Error() string {
 }
 
 type SyncService struct {
-	db                     *sql.DB
-	cfg                    *config.Config
-	caddy                  *CaddyService
-	cluster                *ClusterService
-	client                 *http.Client
-	transport              *http.Transport
-	transportOnce          sync.Once
-	pinMu                  sync.Mutex
-	verifiedPins           map[string]string
-	lifecycleMu            sync.Mutex
-	pullAdmissionMu        sync.Mutex
-	pullApplyMu            sync.Mutex
-	pullMu                 sync.Mutex
-	wakeMu                 sync.Mutex
-	wakeCh                 chan struct{}
-	mu                     sync.Mutex
-	cancel                 context.CancelFunc
-	done                   chan struct{}
-	generation             uint64
-	state                  atomic.Uint32
-	pullsStopped           bool
-	pullWG                 sync.WaitGroup
-	reportAuditMu          sync.Mutex
-	lastReportFailureMsg   string
+	db                   *sql.DB
+	cfg                  *config.Config
+	caddy                *CaddyService
+	cluster              *ClusterService
+	client               *http.Client
+	transport            *http.Transport
+	transportOnce        sync.Once
+	pinMu                sync.Mutex
+	verifiedPins         map[string]string
+	lifecycleMu          sync.Mutex
+	pullAdmissionMu      sync.Mutex
+	pullApplyMu          sync.Mutex
+	pullMu               sync.Mutex
+	wakeMu               sync.Mutex
+	wakeCh               chan struct{}
+	mu                   sync.Mutex
+	cancel               context.CancelFunc
+	done                 chan struct{}
+	generation           uint64
+	state                atomic.Uint32
+	pullsStopped         bool
+	pullWG               sync.WaitGroup
+	reportAuditMu        sync.Mutex
+	lastReportFailureMsg string
+	// syncAuditMu/lastSyncFailureKey 是同步失败操作审计的节流状态（S历史问题-01，
+	// 历史 历史问题）：同一失败内容（动作+类别+明细）只写一条操作审计，
+	// 内容变化或同步恢复成功后再失败时重记——与 Report 的
+	// lastReportFailureMsg 同口径。主节点持续返回签名无效/schema 不匹配/应用
+	// 失败时 run 按 1s→30s 退避无限重试，此前每轮 1 条操作审计（默认 60s
+	// 周期≈1440 条/天）；last_sync_error 与失败日志仍按轮刷新，页面可见性
+	// 与取证面不变。键含动作与类别，WAF/重载/完整性三类失败互不抑制。
+	syncAuditMu            sync.Mutex
+	lastSyncFailureKey     string
 	runFn                  func(context.Context)
 	loadRunState           func(context.Context) (bool, string, int, error)
 	waitRunDelay           func(context.Context, time.Duration) bool
@@ -620,6 +629,7 @@ func (s *SyncService) Stop() {
 	// 防御性清零：与 startLocked 配对，确保 Stop 后实例处于干净状态（历史问题 历史问题）。
 	s.wafRepullFailures.Store(0)
 	s.reloadRepullFailures.Store(0)
+	s.resetSyncFailureAuditThrottle()
 	if syncLifecycleState(s.state.Load()) != syncStateHalted {
 		s.state.Store(uint32(syncStateStopped))
 	}
@@ -628,9 +638,12 @@ func (s *SyncService) Stop() {
 // syncDrainers 按数据库句柄登记同步服务实例，供 ClusterService.Promote 在
 // 角色翻转前显式排干在途拉取（历史问题）。用 *sql.DB 作键隔离测试实例
 // （每个夹具独立库），避免全局单例被跨测试覆盖。
+// S历史问题-06（历史）：按库保留全部实例（与 clusterServices 对称）——
+// 原「后注册覆盖」在测试或同库重建服务时只排干最后一个实例，其余在途 apply
+// 不受 drain 保护；同时提供 unregister 与死句柄回收，避免全局表无限累积。
 var (
 	syncDrainersMu sync.Mutex
-	syncDrainers   = map[*sql.DB]*SyncService{}
+	syncDrainers   = map[*sql.DB][]*SyncService{}
 )
 
 func registerSyncDrainer(service *SyncService) {
@@ -638,18 +651,63 @@ func registerSyncDrainer(service *SyncService) {
 		return
 	}
 	syncDrainersMu.Lock()
-	syncDrainers[service.db] = service
+	for _, existing := range syncDrainers[service.db] {
+		if existing == service {
+			syncDrainersMu.Unlock()
+			return
+		}
+	}
+	syncDrainers[service.db] = append(syncDrainers[service.db], service)
 	syncDrainersMu.Unlock()
 }
 
-func syncDrainerFor(database *sql.DB) *SyncService {
+// unregisterSyncDrainer 移除单个实例（S历史问题-06）：测试 teardown 与显式释放
+// 路径调用，避免全局表强引用已 Close 的 *sql.DB。
+func unregisterSyncDrainer(service *SyncService) {
+	if service == nil || service.db == nil {
+		return
+	}
+	syncDrainersMu.Lock()
+	remaining := syncDrainers[service.db][:0]
+	for _, candidate := range syncDrainers[service.db] {
+		if candidate != service {
+			remaining = append(remaining, candidate)
+		}
+	}
+	if len(remaining) == 0 {
+		delete(syncDrainers, service.db)
+	} else {
+		syncDrainers[service.db] = remaining
+	}
+	syncDrainersMu.Unlock()
+}
+
+// syncDrainersFor 返回该库登记的全部同步服务实例：Promote/BecomeSlave 必须
+// 逐个排干（DrainPulls 幂等且可重入），不能只处理最后注册的一个。
+func syncDrainersFor(database *sql.DB) []*SyncService {
 	if database == nil {
 		return nil
 	}
 	syncDrainersMu.Lock()
-	service := syncDrainers[database]
-	syncDrainersMu.Unlock()
-	return service
+	defer syncDrainersMu.Unlock()
+	registered := syncDrainers[database]
+	services := make([]*SyncService, 0, len(registered))
+	for _, service := range registered {
+		if service != nil {
+			services = append(services, service)
+		}
+	}
+	if len(services) == 0 {
+		delete(syncDrainers, database)
+		return nil
+	}
+	// 死句柄兜底回收（同 clusterServicesFor）：库已 Close 时条目不再可用，
+	// 查询路径顺手剔除，防止测试/重建场景无限累积。
+	if !clusterDBHandleAlive(database) {
+		delete(syncDrainers, database)
+		return nil
+	}
+	return services
 }
 
 // brandingDirectory 返回品牌配置文件所在数据目录（cfg 可能为 nil——构造契约
@@ -787,6 +845,30 @@ func syncRoundSuccessLines(prevFailed bool, res SyncResult) []string {
 	return lines
 }
 
+// syncFailureAuditDue 判定本轮同步失败是否应写操作审计（S历史问题-01）：
+// 同一失败内容（动作+类别+明细）只放行一次，内容变化或同步恢复后清空，
+// 再次失败重新放行——与 Report 的 lastReportFailureMsg 同口径。
+// 字段级状态见 SyncService.lastSyncFailureKey。失败日志与 last_sync_error
+// 仍按轮刷新（页面可见性与取证面不变）。
+// 调用方在放行分支内以字面量写 RecordAuditLog（操作标签/事件对象词汇守卫
+// 只认字面量，动态透传会触发 audit_vocabulary 门禁）。
+func (s *SyncService) syncFailureAuditDue(action, category, detail string) bool {
+	key := action + "\x00" + category + "\x00" + detail
+	s.syncAuditMu.Lock()
+	due := s.lastSyncFailureKey != key
+	s.lastSyncFailureKey = key
+	s.syncAuditMu.Unlock()
+	return due
+}
+
+// resetSyncFailureAuditThrottle 清空失败去重状态：同步恢复成功后下一次失败
+// 必须重新记录（与 Report 成功分支清空 lastReportFailureMsg 同语义）。
+func (s *SyncService) resetSyncFailureAuditThrottle() {
+	s.syncAuditMu.Lock()
+	s.lastSyncFailureKey = ""
+	s.syncAuditMu.Unlock()
+}
+
 func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	if err := s.beginPull(); err != nil {
 		err = newSyncFailure(models.SyncErrorCodeValidationFailed, err)
@@ -895,7 +977,7 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 			// 文件没有物化通道——文件被删除/损坏会永久停留默认品牌（进程重启时
 			// EnsureBrandingFile 也只会写全空模板）。按 global_config.branding_json
 			// 镜像重写文件，零 Caddy 重载；失败用状态转换日志限噪。
-			if healed, herr := ReconcileBrandingFile(s.brandingDirectory()); herr != nil {
+			if healed, herr := ReconcileBrandingFileDB(s.db, s.brandingDirectory()); herr != nil {
 				if logStateTransition("cluster-branding-reconcile", true) != "" {
 					Logf("warn", "同步周期品牌文件自愈失败（下轮重试）: %v", herr)
 				}
@@ -935,6 +1017,9 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotModified {
+		// 304=主节点确认本地版本与指纹一致：同步链路健康，清空失败去重状态
+		// （S历史问题-01——恢复后再次失败必须重新记录）。
+		s.resetSyncFailureAuditThrottle()
 		return SyncResult{AppliedVersion: appliedVersion}, nil
 	}
 	// 未跟随的重定向(跨主机):给可行动错误,而非让空 body 落进 JSON 解析报
@@ -979,7 +1064,11 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	s.applyGuard = syncApplyGuard{MasterURL: currentMasterURL, Token: currentToken}
 	verifiedSnapshot, err := verifiedSnapshotIntegrity(snapshot, token, appliedVersion)
 	if err != nil {
-		RecordAuditLog("system", "同步失败", "集群同步", FormatAuditDetail(fmt.Sprintf("版本：%d", snapshot.Version), err.Error()), "")
+		// S历史问题-01：同一失败内容不按重试轮重复写操作审计。
+		detail := FormatAuditDetail(fmt.Sprintf("版本：%d", snapshot.Version), err.Error())
+		if s.syncFailureAuditDue("同步失败", "集群同步", detail) {
+			RecordAuditLog("system", "同步失败", "集群同步", detail, "")
+		}
 		// last_sync_error 落库由下方 Pull defer 统一覆盖（err != nil 时执行，
 		// 主节点节点列表经 Report 通道可见真实失败原因）：此处不再显式写，
 		// 避免同一错误单周期重复 UPDATE（历史问题 收敛单写）。
@@ -1009,10 +1098,17 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	}
 	if err := s.applySnapshot(ctx, snapshot); err != nil {
 		s.pullApplyMu.Unlock()
-		RecordAuditLog("system", "同步失败", "集群同步", FormatAuditDetail(fmt.Sprintf("版本：%d", snapshot.Version), err.Error()), "")
+		// S历史问题-01：同内容失败（含补偿重拉轮）只留一条操作审计。
+		detail := FormatAuditDetail(fmt.Sprintf("版本：%d", snapshot.Version), err.Error())
+		if s.syncFailureAuditDue("同步失败", "集群同步", detail) {
+			RecordAuditLog("system", "同步失败", "集群同步", detail, "")
+		}
 		return SyncResult{}, newSyncFailure(models.SyncErrorCodeApplyFailed, err)
 	}
 	s.pullApplyMu.Unlock()
+	// 本轮应用成功=同步恢复：清空失败去重状态，下一次失败重新记录
+	// （S历史问题-01，与 Report 成功分支同语义）。
+	s.resetSyncFailureAuditThrottle()
 	// 每次成功应用后核对 WAF 文件态：已收敛则清零连续失败计数，恢复正常的
 	// 兜底重拉频率与 last_sync_error 语义。
 	s.trackWafRepullConvergence(ctx)
@@ -1025,8 +1121,8 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 // 仅覆盖 rules/users/security 三个纯全量替换节（见 driftGuardSections）。
 // 重建必须绕过快照缓存：从节点本地写入不递增 cluster_version，命中缓存会把
 // 稳态漂移永久掩盖。但漂移比对只消费三节哈希，故改用轻量 driftGuardSectionHashes
-// （只重建三节 payload，不含 WAF 文件哈希与证书解析），而非全量
-// clusterSnapshotBypassingCache。开关关闭的节跳过比对（镜像 computeSectionSkips
+// （只重建三节 payload，不含 WAF 文件哈希与证书解析），而非全量快照重建。
+// 开关关闭的节跳过比对（镜像 computeSectionSkips
 // 语义），避免「曾同步→开关关闭→本地改动」时每轮都触发全量重拉、apply 又跳过
 // 该节导致的死循环。
 func (s *SyncService) driftedSections(ctx context.Context) string {

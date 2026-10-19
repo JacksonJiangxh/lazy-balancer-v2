@@ -223,6 +223,7 @@ import DialogHeader from '@/components/DialogHeader.vue'
 import AppLogo from '@/components/AppLogo.vue'
 import { appName, footerHtml } from '@/utils/branding'
 import { restartServiceWithFeedback } from '@/utils/restart'
+import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
 
 const authStore = useAuthStore()
 const collapsed = ref(false)
@@ -362,7 +363,6 @@ const saveProfile = async () => {
 const configDrift = ref('')
 const configDriftSince = ref('')
 const restarting = ref(false)
-let driftTimer: number | undefined
 let disposed = false
 
 const fetchDriftStatus = async () => {
@@ -393,20 +393,22 @@ const handleRestartForDrift = async () => {
   if (result !== 'reloaded') restarting.value = false
 }
 
+// FE40-D1-5 / 历史问题：漂移轮询接可见性间隔单源（与 usePollingTask/
+// useLogTailPolling 同范式）——hidden 停表、恢复可见立即补查；原手写
+// setInterval+document.hidden 只跳过轮次，返回页后横幅最长 60s 陈旧。
+// immediate:true = 挂载即首查（替代原显式 fetchDriftStatus 调用）。
+const driftPolling = createVisibilityIntervals({
+  intervals: [{ tick: () => { void fetchDriftStatus() }, ms: 60000, immediate: true }],
+})
+
 onMounted(() => {
   syncProfileForm()
-  fetchDriftStatus()
-  // FE40-D1-5：后台标签页跳过漂移轮询——不可见页的持续请求无意义,
-  // visibilitychange 恢复可见时下一周期自然补查。
-  driftTimer = window.setInterval(() => {
-    if (document.hidden) return
-    void fetchDriftStatus()
-  }, 60000)
+  driftPolling.start()
 })
 
 onUnmounted(() => {
   disposed = true
-  if (driftTimer) clearInterval(driftTimer)
+  driftPolling.stop()
 })
 </script>
 
@@ -618,8 +620,6 @@ onUnmounted(() => {
   align-items: center;
   padding: 0 24px;
 }
-
-.header-left { flex: 1; }
 
 .header-right { display: flex; align-items: center; gap: 12px; }
 .readonly-tag { cursor: default; }

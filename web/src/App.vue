@@ -80,11 +80,13 @@ onMounted(async () => {
   // fragment 携带令牌(不发服务器),此处接收建会话(与票据登录同型)。
   const oidcToken = url.hash.includes('/oidc/callback') ? (fragment.get('token') ?? '') : ''
   const oidcReturnTo = url.hash.includes('/oidc/callback') ? (fragment.get('return_to') ?? '') : ''
-  // 历史问题:后端回调失败以 error 片段 302 回前端——登录页读取展示(一次性)
+  // 历史问题:后端回调失败以 error 片段 302 回前端。历史问题：必须当场提示——
+  // 原实现写入 sessionStorage 只在 Login 挂载时消费一次；已持有效会话的用户
+  // 回跳时 init() 成功、Login 不挂载，错误既不提示也不清除，等之后登出才看到
+  // 一条过期的「OIDC 登录失败」。此处提示后即从 hash 剥离（下方 delete），
+  // sessionStorage 通道不再使用。
   const oidcError = url.hash.includes('/oidc/callback') ? (fragment.get('error') ?? '') : ''
-  if (oidcError) {
-    try { sessionStorage.setItem('oidc_login_error', oidcError) } catch { /* 隐私模式 */ }
-  }
+  if (oidcError) ElMessage.error(`OIDC 登录失败：${oidcError}`)
   if (hasLoginTicket || url.hash.includes('/oidc/callback')) {
     fragment.delete('login_ticket')
     fragment.delete('token')

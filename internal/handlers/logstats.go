@@ -265,6 +265,15 @@ func isRotationCopyShape(name string) bool {
 // rotationCopyBaseOf 把轮转副本归到所属 base（与 dirBytes/timestampedRotationStatsWithEntries
 // 同口径：移位后缀、运行日志时间戳后缀、timberjack 时间戳后缀三族）。
 func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[string]string) (string, bool) {
+	// H-B1-05（历史）：整文件 gzip 归档 <base>.gz 归到 base——与
+	// dirBytes/timestampedRotationStatsWithEntries 的 B2-历史问题 分支同口径。
+	// 此前只对齐了运行日志族与 timberjack 族，整文件归档落入下方通用 .gz
+	// 独立键（消费侧按固定基名取值 → 该文件字节从聚合行消失）。
+	if base := strings.TrimSuffix(name, ".gz"); base != name {
+		if _, ok := bases[base]; ok {
+			return base, true
+		}
+	}
 	if dot := strings.LastIndexByte(name, '.'); dot > 0 && isDigits(name[dot+1:]) {
 		if n, err := strconv.Atoi(name[dot+1:]); err == nil && n >= 1 && n <= 9 {
 			if base := name[:dot]; base != "" {
@@ -337,9 +346,21 @@ func sizeLimitMB(column string, def int64) *int64 {
 //   - runtimePath is the runtime log path, which follows LogFile
 //     （空 → /app/logs/lazy-balancer.log）。
 //
-// wafAuditLogFile 是 Coraza 审计日志文件路径(包级 var 支持测试注入;
-// 生产值经 services.AuditLogPath() 单一源——SYSRENDE历史问题)。
-var wafAuditLogFile = services.AuditLogPath()
+// wafAuditLogFile 是 Coraza 审计日志文件路径覆盖值。空值=运行期按
+// services.AuditLogPath() 解析——审计路径随 ConfigureWafDirs 按 data_dir 派生
+// （历史问题-08），而本包 init 早于 main 的派生调用，包级固化会指向陈旧的 /app
+// 路径（自定义 data_dir 下统计恒 0B）。测试可注入具体路径。
+var wafAuditLogFile = ""
+
+// resolvedWafAuditLogFile 返回审计日志路径：测试注入值优先，否则运行期解析
+// services.AuditLogPath()（历史问题-08：路径随 ConfigureWafDirs 派生，包级固化
+// 会在自定义 data_dir 下陈旧）。
+func resolvedWafAuditLogFile() string {
+	if wafAuditLogFile != "" {
+		return wafAuditLogFile
+	}
+	return services.AuditLogPath()
+}
 
 // defaultRuntimeLogPath 空 LOG_FILE 下的运行日志兜底路径（写入端写死
 // /app/logs，见 logPaths 注释）。包级 var 支持测试注入（wafAuditLogFile 同模式）。
@@ -360,13 +381,6 @@ func logPaths(cfg *config.Config) (fixedDir, runtimePath string) {
 // GetLogStats 返回全部日志存储的体量与治理信息，供各日志页显示
 // 「当前大小 / 阈值（保留 N 份）」与清理策略说明。caddy_id 参数可将
 // 证书任务/规则访问两项收窄到单规则。
-// securityEventsMaxRows 读事件上限(services 常量导出封装,供 LimitRows 与
-// 进度条语义使用;2026-09-14 用户裁定 100 万)。
-func securityEventsMaxRows() *int64 {
-	v := int64(services.SecurityEventsRetentionMax())
-	return &v
-}
-
 // requestedLogKeys 解析可选 ?key=a,b / ?keys=a,b（缺省 nil=全量）——任务监控
 // 弹框只关心单行日志统计（历史问题）。空串与空白项忽略。
 func requestedLogKeys(c *gin.Context) map[string]bool {
@@ -438,11 +452,11 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	// ——ConfigSource 类目清单不得再含指标历史(历史问题,历史)。
 	// 历史(用户裁定文案精简):可见文案短化——类目清单移 ConfigSource
 	// (tooltip 展示),行内只留「每日清理 · 保留 N 个月」。
-	retentionNote := "每日清理 · 保留 " + strconv.FormatInt(globalConfigInt("audit_retention_months", 3), 10) + " 个月"
-	// 历史问题：安全事件行文案/行帽由 services 单源生成（显式
-	// security_events_retention_days/row_cap 生效，不再复用审计月数文案）；
-	// 其写入侧与审计日志同文件，大小限值随 audit_log_size_mb。
-	securityRetentionNote := services.SecurityEventsRetentionSummary()
+	//
+	// H-B1-04（历史）：保留口径/事件上限同样按 want 门控——此前三处无条件
+	// 求值（audit_retention_months 点查 + 安全事件策略两次点查），单行轮询也付
+	// 3 次多余 SQLite 往返，与下方 U04d-06 声明的门控不成立；安全事件两项
+	// （摘要+行帽）收敛为一次策略读取（services.SecurityEventsRetentionSnapshot）。
 	// U04d-06：阈值按 want 门控——日志弹框只请求单行时不得读其它配置列。
 	// 每列只读一次（此前任务循环逐任务重复读 task_log_size_mb）。
 	var (
@@ -474,8 +488,8 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	}
 
 	infos := []LogStorageInfo{
-		{Key: "audit", Name: "操作日志", KeepCount: 0, RetentionNote: retentionNote, ConfigSource: "基础设置 · 日志保留（操作/运行/安全事件）"},
-		{Key: "security_events", Name: "安全事件", KeepCount: 0, LimitRows: securityEventsMaxRows(), LimitBytes: auditLogLimit, RetentionNote: securityRetentionNote, ConfigSource: "基础设置 · 日志保留（操作/运行/安全事件）"},
+		{Key: "audit", Name: "操作日志", KeepCount: 0, ConfigSource: "基础设置 · 日志保留（操作/运行/安全事件）"},
+		{Key: "security_events", Name: "安全事件", KeepCount: 0, LimitBytes: auditLogLimit, ConfigSource: "基础设置 · 日志保留（操作/运行/安全事件）"},
 		{Key: "certjob", Name: "证书任务日志", LimitBytes: taskLogLimit, KeepCount: logRotatedBackups, ConfigSource: "基础设置 · 任务日志大小"},
 		{Key: "crs_update", Name: "CRS 更新日志", LimitBytes: taskLogLimit, KeepCount: 1, ConfigSource: "统一任务日志（tasks/crs.log）"},
 		{Key: "ip2region_update", Name: "IP 库更新日志", LimitBytes: taskLogLimit, KeepCount: 1, ConfigSource: "统一任务日志（tasks/ip2region.log）"},
@@ -500,6 +514,19 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 			}
 		}
 		return nil
+	}
+	// H-B1-04：保留口径与事件上限只在所请求行内读取（各一次点查）。
+	if info := byKey("audit"); info != nil && want("audit") {
+		info.RetentionNote = "每日清理 · 保留 " + strconv.FormatInt(globalConfigInt("audit_retention_months", 3), 10) + " 个月"
+	}
+	if info := byKey("security_events"); info != nil && want("security_events") {
+		// 历史问题：安全事件行文案/行帽由 services 单源生成（显式
+		// security_events_retention_days/row_cap 生效，不再复用审计月数文案）；
+		// 其写入侧与审计日志同文件，大小限值随 audit_log_size_mb。
+		note, rowCap := services.SecurityEventsRetentionSnapshot()
+		info.RetentionNote = note
+		limitRows := int64(rowCap)
+		info.LimitRows = &limitRows
 	}
 
 	// DB 体量按库文件大小近似；行数供 UI 显示条目规模
@@ -528,7 +555,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		// SizeBytes=真实审计日志文件(2026-09-14 用户裁定:不再用 metrics.db 库文件
 		// 虚标,DBBytes 单独展示库容量)。一次 dirBytes 供 security_events 行复用
 		// (原先每次响应各调一次,重复全目录 ReadDir)。
-		auditActive, auditRotated, auditRotCount := dirBytes(wafAuditLogFile)
+		auditActive, auditRotated, auditRotCount := dirBytes(resolvedWafAuditLogFile())
 		if info := byKey("security_events"); info != nil {
 			info.SizeBytes, info.RotatedBytes, info.RotatedCount = auditActive, auditRotated, auditRotCount
 		}

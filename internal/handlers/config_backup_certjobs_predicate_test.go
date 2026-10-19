@@ -18,7 +18,7 @@ import (
 func TestImportConfigBackup_purgesCertJobsOfNonACMERules(t *testing.T) {
 	// Given：备份含一条 manual 来源规则 + 其 cert_jobs 行（规则非 ACME 态）
 	h := newBackupTestHandlers(t)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {
 			{"caddy_id": "lb_manualrule", "name": "manualrule", "protocol": "http", "domain": "manual.example.test",
 				"listen_port": 8080, "enabled": 1, "enable_tls": 0, "tls_source": "manual"},
@@ -26,7 +26,7 @@ func TestImportConfigBackup_purgesCertJobsOfNonACMERules(t *testing.T) {
 		"cert_jobs": {
 			{"rule_id": "lb_manualrule", "domain": "manual.example.test", "status": "issued"},
 		},
-	})
+	}, EmptyConfigIfNil: true})
 
 	// When
 	response := postBackupImport(t, h, backup)
@@ -56,7 +56,7 @@ func TestImportConfigBackup_purgesCertJobsOfNonACMERules(t *testing.T) {
 func TestImportConfigBackup_keepsDisabledACMERuleCertJobs(t *testing.T) {
 	// Given：备份含一条禁用但 acme_dns 态规则 + 其 cert_jobs 行
 	h := newBackupTestHandlers(t)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {
 			{"caddy_id": "lb_disabledacme", "name": "disabledacme", "protocol": "http", "domain": "disacme.example.test",
 				"listen_port": 8081, "enabled": 0, "enable_tls": 1, "tls_source": "acme_dns"},
@@ -64,7 +64,7 @@ func TestImportConfigBackup_keepsDisabledACMERuleCertJobs(t *testing.T) {
 		"cert_jobs": {
 			{"rule_id": "lb_disabledacme", "domain": "disacme.example.test", "status": "disabled"},
 		},
-	})
+	}, EmptyConfigIfNil: true})
 
 	// When
 	response := postBackupImport(t, h, backup)
@@ -108,7 +108,7 @@ func TestValidateV2BackupCertJobs_canonicalizesStoredDomain(t *testing.T) {
 func TestImportConfigBackup_canonicalizesACMEJobDomains(t *testing.T) {
 	// Given a disabled ACME rule whose resumable job uses a case/order-variant domain.
 	h := newBackupTestHandlers(t)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {{
 			"caddy_id": "lb_jobdomain", "name": "jobdomain", "protocol": "http",
 			"domain": "WWW.JobDomain.example.test, jobdomain.example.test", "listen_port": 8082,
@@ -117,7 +117,7 @@ func TestImportConfigBackup_canonicalizesACMEJobDomains(t *testing.T) {
 		"cert_jobs": {{
 			"rule_id": "lb_jobdomain", "domain": " WWW.JobDomain.example.test, JOBDOMAIN.example.test ", "status": "disabled",
 		}},
-	})
+	}, EmptyConfigIfNil: true})
 
 	// When importing the backup.
 	response := postBackupImport(t, h, backup)

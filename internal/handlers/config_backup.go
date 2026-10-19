@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -932,15 +933,24 @@ func normalizeRuleRowsForTransport(ctx context.Context, tx *sql.Tx) (int64, erro
 	if _, err := tx.ExecContext(ctx, `UPDATE lb_rules SET acme_config_id=0 WHERE tls_source='manual' AND COALESCE(acme_config_id,0)<>0`); err != nil {
 		return 0, fmt.Errorf("规则手动 TLS 残留 ACME 引用归一失败: %w", err)
 	}
+	// B2-04/B2-05（历史）：跨模式残留归一——非 manual 源不保留证书材料
+	// （私钥正文随导出/备份/快照放大）；非 acme_dns 源不保留 CA 提供商引用
+	// （ResolveCAProviderID 对非 0 不校验存在性，残留死引用签发期才暴露）。
+	if _, err := tx.ExecContext(ctx, `UPDATE lb_rules SET tls_cert='', tls_key=''
+		WHERE COALESCE(tls_source,'manual')<>'manual' AND (COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>'')`); err != nil {
+		return 0, fmt.Errorf("规则跨模式证书材料归一失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE lb_rules SET ca_provider_id=0
+		WHERE COALESCE(tls_source,'manual')<>'acme_dns' AND COALESCE(ca_provider_id,0)<>0`); err != nil {
+		return 0, fmt.Errorf("规则跨模式 CA 提供商引用归一失败: %w", err)
+	}
 	// A85历史问题-3：TCP 规则的安全策略绑定不参与渲染（buildTCPProxyRoute 无策略
 	// 加载），绑定写接口又拒绝 TCP——残留绑定会在策略页 rule_count/绑定视图中
 	// 显示生效而运行态零防护。导入事务内按导入后规则视图清理。
-	result, err := tx.ExecContext(ctx, `DELETE FROM security_policy_bindings
-		WHERE rule_caddy_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp')`)
+	droppedBindings, err := pruneTCPRuleBindings(ctx, tx)
 	if err != nil {
-		return 0, fmt.Errorf("清理 TCP 规则安全策略绑定失败: %w", err)
+		return 0, err
 	}
-	droppedBindings, _ := result.RowsAffected()
 	for _, table := range []string{"lb_rules", "path_rules"} {
 		for _, col := range []string{"created_at", "updated_at"} {
 			if _, err := tx.ExecContext(ctx, `UPDATE `+table+` SET `+col+`=strftime('%Y-%m-%d %H:%M:%S', `+col+`)
@@ -951,6 +961,25 @@ func normalizeRuleRowsForTransport(ctx context.Context, tx *sql.Tx) (int64, erro
 		}
 	}
 	return droppedBindings, nil
+}
+
+// pruneTCPRuleBindings 清理导入后规则视图中 TCP 规则的策略绑定（A85历史问题-3
+// 不变量：TCP 渲染链不消费策略，绑定为死绑定）。幂等——无命中返回 0。
+//
+// 历史问题-历史问题（历史）：本清理原本只随 normalizeRuleRowsForTransport
+// 在「备份携带 lb_rules」时执行；仅导入「安全防护」分类（lb_rules 缺席）而
+// security_policy_bindings 被携带时，指向 live TCP 规则的绑定仍会插入并存活，
+// 策略页 rule_count/绑定视图宣称生效而运行态零防护。故 v2 导入把本步从
+// hasRules 门中提出，无条件执行一次（与 cleanupDisappearedRuleArtifacts 的
+// 幂等重复无害同型）。
+func pruneTCPRuleBindings(ctx context.Context, tx *sql.Tx) (int64, error) {
+	result, err := tx.ExecContext(ctx, `DELETE FROM security_policy_bindings
+		WHERE rule_caddy_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp')`)
+	if err != nil {
+		return 0, fmt.Errorf("清理 TCP 规则安全策略绑定失败: %w", err)
+	}
+	dropped, _ := result.RowsAffected()
+	return dropped, nil
 }
 
 type importRuntimeSnapshot struct {
@@ -1430,6 +1459,19 @@ func validateV2BackupCertJobStatuses(tables map[string][]map[string]any) error {
 //   - protocol：仅 http/https，空串归一为 http（schema DEFAULT 语义）；
 //   - cluster_token_hash：字符串或 NULL（NULL=待重新注册，D-1）。
 //
+// 历史问题-历史问题（历史）：name 落库前走 models.NormalizeClusterNodeName
+// 单源归一（去首尾空白/剥离 历史问题 控制字符/截断 100 rune），但只静默归一
+// 首尾空白——控制字符或超长值 400 点名（不静默改写：篡改备份注入的换行/
+// 控制字符会污染节点列表、审计与日志文本，静默剥离会让「导入成功」掩盖
+// 篡改事实）；ip_address 与注册侧 binding:"required,ip" 同口径，必须是可
+// 解析的 IP 字面量（net.ParseIP），拒绝首尾空白/控制字符/路径与 host:port
+// 混写（这些形态在 resolveNodeAccessURL 派生 authority 时产生混淆）。
+//
+// 历史问题-历史问题（历史）：access_url 是能力票据（服务控制/登录票据）
+// 的投递地址——保存侧 RegisterNode/UpdateNodeAccessURL 均过
+// models.ValidateClusterAccessURL，导入侧此前完全放行，可把票据引向任意
+// 第三方主机（含 query/userinfo 的回传通道）。导入与保存侧同门。
+//
 // NULL 可空列不拒绝——写入侧 backupTableNullDefaults["nodes"] 归一；
 // 布尔两列（is_approved/cluster_token_delivered）由
 // validateV2BackupBooleanTypes 覆盖；created_at 由 validateV2BackupTimestamps
@@ -1437,11 +1479,32 @@ func validateV2BackupCertJobStatuses(tables map[string][]map[string]any) error {
 func validateV2BackupNodeRows(rows []map[string]any) error {
 	for index, row := range rows {
 		line := fmt.Sprintf("备份校验失败：nodes 第 %d 行", index+1)
-		if name, ok := row["name"].(string); !ok || strings.TrimSpace(name) == "" {
+		rawName, exists := row["name"]
+		name, ok := rawName.(string)
+		if !exists || !ok || strings.TrimSpace(name) == "" {
 			return fmt.Errorf("%s name 必须为非空字符串", line)
 		}
-		if ip, ok := row["ip_address"].(string); !ok || strings.TrimSpace(ip) == "" {
+		normalized := models.NormalizeClusterNodeName(name)
+		if normalized != strings.TrimSpace(name) {
+			return fmt.Errorf("%s name 含控制字符或超过 %d 个字符（不支持自动改写）", line, models.ClusterNodeNameMaxLen)
+		}
+		row["name"] = normalized // 首尾空白归一（restoreTable 直写归一值）
+		rawIP, exists := row["ip_address"]
+		ip, ok := rawIP.(string)
+		if !exists || !ok || strings.TrimSpace(ip) == "" {
 			return fmt.Errorf("%s ip_address 必须为非空字符串", line)
+		}
+		if ip != strings.TrimSpace(ip) || net.ParseIP(ip) == nil {
+			return fmt.Errorf("%s ip_address 必须为 IP 地址（不允许端口、路径、空白或控制字符）", line)
+		}
+		if raw, exists := row["access_url"]; exists && raw != nil {
+			accessURL, ok := raw.(string)
+			if !ok {
+				return fmt.Errorf("%s access_url 必须为字符串", line)
+			}
+			if err := models.ValidateClusterAccessURL(accessURL); err != nil {
+				return fmt.Errorf("%s access_url 无效：%w", line, err)
+			}
 		}
 		if raw, exists := row["id"]; exists && raw != nil {
 			if id, ok := backupInteger(raw); !ok || id <= 0 {
@@ -1652,7 +1715,24 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 		validatePort = portGates[0]
 	}
 	rows := tables["lb_rules"]
-	pathRows := tables["path_rules"]
+	// 历史问题-历史问题（历史）：逐规则全表扫描 upstreams/path_rules 与
+	// 每规则两次 live 查页在 2000 规则×10000 上游规模下是 2×10⁷ 级比较——改为
+	// 一次预计算（与冲突矩阵分桶预计算同型）。谓词与语义逐项保持不变。
+	enabledHostsByRule := make(map[string][]string, len(rows))
+	for _, row := range tables["upstreams"] {
+		if !backupBooleanEnabled(row["enabled"]) {
+			continue
+		}
+		ruleID := backupString(row["rule_id"])
+		if ruleID == "" {
+			continue
+		}
+		enabledHostsByRule[ruleID] = append(enabledHostsByRule[ruleID], backupString(row["host"]))
+	}
+	pathRulesByRule, err := backupPathRulesByRule(tables["path_rules"])
+	if err != nil {
+		return err
+	}
 	// B3-历史问题（历史）：阶段拦截页引用/状态码必须与保存侧同门。页存在性按
 	// 「备份携带 security_block_pages 则备份行、缺席则 live」解析（历史问题 B-N3
 	// 同口径）——备份行才是导入后的真实数据。
@@ -1665,13 +1745,33 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 			}
 		}
 	}
+	livePageIDs := map[int]bool{}
+	if !carriedBlockPages && db.DB != nil {
+		// 页表是小表（管理员配置的拦截页），一次读入即可——此前每条规则×2
+		// 次 live EXISTS 查询。
+		pageRows, err := db.DB.Query("SELECT id FROM security_block_pages")
+		if err != nil {
+			return fmt.Errorf("读取拦截页视图失败: %w", err)
+		}
+		for pageRows.Next() {
+			var id int
+			if err := pageRows.Scan(&id); err != nil {
+				_ = pageRows.Close()
+				return fmt.Errorf("读取拦截页视图失败: %w", err)
+			}
+			livePageIDs[id] = true
+		}
+		if err := pageRows.Err(); err != nil {
+			_ = pageRows.Close()
+			return fmt.Errorf("读取拦截页视图失败: %w", err)
+		}
+		_ = pageRows.Close()
+	}
 	stagePageExists := func(id int) (bool, error) {
 		if carriedBlockPages {
 			return backupPageIDs[id], nil
 		}
-		var ok bool
-		err := db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM security_block_pages WHERE id = ?)", id).Scan(&ok)
-		return ok, err
+		return livePageIDs[id], nil
 	}
 	for index, rule := range rows {
 		protocol, _ := rule["protocol"].(string)
@@ -1734,12 +1834,7 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 				}
 			}
 		}
-		enabledHosts := make([]string, 0, 2)
-		for _, row := range tables["upstreams"] {
-			if backupString(row["rule_id"]) == ruleID && backupBooleanEnabled(row["enabled"]) {
-				enabledHosts = append(enabledHosts, backupString(row["host"]))
-			}
-		}
+		enabledHosts := enabledHostsByRule[ruleID]
 		// 历史问题-1（历史）：补 EnableDnsServer/DnsServer——此前恒零值，
 		// validateRuleFeatures 的 历史问题-1 门（TCP 携带 DNS 服务发现配置即拒）
 		// 在导入链恒不触发，TCP+dns_server 脏行原样落库成死配置（保存侧 历史问题
@@ -1769,9 +1864,7 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 			EnableCompress:             backupBooleanEnabled(rule["enable_compress"]),
 			CompressTypes:              backupString(rule["compress_types"]),
 		}
-		if pathRules, found, err := backupPathRulesForRule(pathRows, backupString(rule["caddy_id"])); err != nil {
-			return fmt.Errorf("规则 #%d：%w", index+1, err)
-		} else if found {
+		if pathRules, found := pathRulesByRule[ruleID]; found {
 			// 历史 历史问题: 保存路径先 normalizePathRules（TrimSpace）再校验
 			// （createRuleFeatures/updateRuleFeatures），备份路径此前直传导致手造备份
 			// 含前导空格路径时 validateRuleFeatures 的 HasPrefix("/") 误拒绝。
@@ -1852,17 +1945,20 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 // 导入此前是唯一能绕过该校验的门：无证书规则不在 availableCerts 内 → 无
 // TLS policy → TLS 端口明文服务，且 autohttps.disable_certificates 阻止
 // Caddy 自动签发自愈。
-func validateV2BackupTLSShape(tables map[string][]map[string]any) error {
-	_, err := validateV2BackupTLSShapeSoft(tables, false)
-	return err
-}
-
-// validateV2BackupTLSShapeSoft 同 validateV2BackupTLSShape,额外支持
-// CERT41-1 软降级:softLiveACMERefs=true 时,「备份不含 cert 表、按 live
-// 解析」失败的 ACME 引用不整包 400,计入返回的悬挂数(调用方降级警告,
-// 与 历史问题 预检对称;导入/预览双路径同序)。返回 (悬挂数, 硬错误)。
+// 历史问题-历史问题（历史）：原「硬入口」validateV2BackupTLSShape（软入口的
+// 零参数包装）生产零调用（生产一律 validateV2BackupTLSShapeSoft），作为第二
+// 调用链误导维护者——已移入 _test.go（既有 r43-r56 用例同包消费）。
+//
+// validateV2BackupTLSShapeSoft 支持 CERT41-1 软降级:softLiveACMERefs=true
+// 时,「备份不含 cert 表、按 live 解析」失败的 ACME 引用不整包 400,计入返回
+// 的悬挂数(调用方降级警告,与 历史问题 预检对称;导入/预览双路径同序)。
+// 返回 (悬挂数, 硬错误)。
 func validateV2BackupTLSShapeSoft(tables map[string][]map[string]any, softLiveACMERefs bool) (int, error) {
 	acmeDangling := 0
+	// 历史问题-历史问题（历史）：ACME 引用解析索引（惰性构建，每个表最多
+	// 一次读取；此前每条 ACME 规则全表扫 certificate_configs/ca_providers
+	// 或逐 id 打库）。
+	acmeRefs := newACMEImportRefIndex(tables)
 	for index, rule := range tables["lb_rules"] {
 		protocol, _ := rule["protocol"].(string)
 		// 历史问题 历史问题（传播通道钳制）：TCP 规则不终结入站 TLS，携带 enable_tls=1 +
@@ -1897,7 +1993,7 @@ func validateV2BackupTLSShapeSoft(tables map[string][]map[string]any, softLiveAC
 			if err := services.ValidateACMEDomains(backupString(rule["domain"])); err != nil {
 				return 0, fmt.Errorf("规则 #%d（%s）：%w", index+1, backupString(rule["name"]), err)
 			}
-			if err := validateBackupACMEReferenceIDs(tables, rule); err != nil {
+			if err := acmeRefs.validate(rule); err != nil {
 				// CERT41-1:「备份不含 cert 表、按 live 解析」失败在软降级方向
 				// (导规则不导系统数据、备份从未携带 cert 表)计入悬挂数,不整包 400。
 				var liveRefErr *acmeLiveRefUnresolvedError
@@ -2003,16 +2099,45 @@ func validateV2BackupCertJobs(tables map[string][]map[string]any) error {
 	return nil
 }
 
+// backupSystemIPListNames 内置（system=1）名单名全集：威胁库三源内置名单 ∪
+// 自动封禁预置名单 ∪ 四个爬虫官方名单。历史问题-历史问题（历史）：导入的
+// system 行名称白名单与配额口径共用本注册表（此前任意 system=1 行都被当作
+// 「内置名单」计数并登记，管理员随后无法编辑/删除——UI 宣称由任务维护，
+// 实际上只能再导入或改库）。
+func backupSystemIPListNames() map[string]bool {
+	names := make(map[string]bool)
+	for _, seed := range db.ThreatSystemLists() {
+		names[seed.Name] = true
+	}
+	names[services.AutobanPresetListName] = true
+	for _, name := range services.CrawlerSystemListNames() {
+		names[name] = true
+	}
+	return names
+}
+
+// validateImportedSystemIPLists 仅接受种子名称集合的 system=1 行，其余 400
+// 点名（威胁/爬虫源行本身已走名称白名单，名单行此前是唯一开口）。
+func validateImportedSystemIPLists(rows []map[string]any) error {
+	allowed := backupSystemIPListNames()
+	for index, row := range rows {
+		if !backupBooleanEnabled(row["system"]) {
+			continue
+		}
+		name := backupString(row["name"])
+		if !allowed[name] {
+			return fmt.Errorf("安全 IP 列表 #%d：内置名单名称 %q 不受支持（内置名单由威胁情报库、爬虫地址库与自动封禁任务维护）", index+1, name)
+		}
+	}
+	return nil
+}
+
 // validateBackupIPListQuota 以导入后最终状态校验名单配额：200 是用户可管理
 // 名单额度（与 ipListMaxGlobalCount 一致），服务端系统名单在提交后由
 // SeedSystemIPLists 自动补齐，不应占用用户额度；最终总行数再以
 // 「200 + 固定系统种子数」封顶，防止备份注入任意数量的 system 行绕过资源门。
 func validateBackupIPListQuota(rows []map[string]any) error {
-	systemNames := make(map[string]bool, len(db.ThreatSystemLists)+1)
-	for _, seed := range db.ThreatSystemLists {
-		systemNames[seed.Name] = true
-	}
-	systemNames[services.AutobanPresetListName] = true
+	systemNames := backupSystemIPListNames()
 	presentSystem := make(map[string]bool, len(systemNames))
 	userCount := 0
 	for _, row := range rows {
@@ -2105,6 +2230,9 @@ func validateV2BackupSecurityPoliciesWithQuerier(ctx context.Context, tables map
 		rows.Close()
 	}
 	if err := validateBackupIPListQuota(tables["security_ip_lists"]); err != nil {
+		return err
+	}
+	if err := validateImportedSystemIPLists(tables["security_ip_lists"]); err != nil {
 		return err
 	}
 	for index, row := range tables["security_ip_lists"] {
@@ -2468,42 +2596,97 @@ func validateV2BackupSecurityPoliciesWithQuerier(ctx context.Context, tables map
 	return nil
 }
 
-// validateBackupACMEReferenceIDs 按 validateRuleACMEReferences（rule_features.go）
-// 同口径校验备份行的 ACME 引用，错误文案保持一致。引用优先在备份自带表中解析——
-// 导入为全量替换（deleteOrder 清光 live 的 certificate_configs/ca_providers），
-// 备份行才是导入后的真实数据；备份缺该表时回退 live 表（直测/非常规调用场景，
-// 及 CERT41-1 起「该 cert 表不参与本次分类导入」的常规场景——sections 过滤前置
-// 后，过滤掉的表在 backup.Tables 中缺席，live 回退自动等于「过滤后导入表∪live
-// 保留表」正确口径）。配置/提供商行缺 enabled 键时按表默认值 TRUE 处理（与
-// backupRuleEnabled 的校验侧口径一致）。
+// acmeImportRefIndex 导入后视图的 ACME 引用解析索引（历史问题-历史问题，历史
+// 审计）：按 validateRuleACMEReferences（rule_features.go）同口径按需建立
+// certificate_configs / ca_providers 的 id→启用 视图（每个表最多构建一次），
+// 逐规则解析 O(1)。引用优先在备份自带表中解析——导入为全量替换（deleteOrder
+// 清光 live 的这两张表），备份行才是导入后的真实数据；备份缺该表时回退 live
+// 表一次读取（直测/非常规调用场景，及 CERT41-1 起「该 cert 表不参与本次分类
+// 导入」的常规场景——sections 过滤前置后，过滤掉的表在 backup.Tables 中缺席，
+// live 回退自动等于「过滤后导入表∪live 保留表」正确口径）。配置/提供商行缺
+// enabled 键时按表默认值 TRUE 处理（backupRowEnabled 单源口径）。
+//
+// 惰性构建是语义的一部分：旧逐规则实现只在规则真正引用某表时才触碰该表
+// （纯校验夹具无 DB 句柄时，未引用的表不得触发查询）。
+type acmeImportRefIndex struct {
+	tables   map[string][]map[string]any
+	enabled  map[string]map[int]bool
+	fromLive map[string]bool
+}
+
+func newACMEImportRefIndex(tables map[string][]map[string]any) *acmeImportRefIndex {
+	return &acmeImportRefIndex{
+		tables:   tables,
+		enabled:  map[string]map[int]bool{},
+		fromLive: map[string]bool{},
+	}
+}
+
+// enabledIDs 返回该表在导入后的 id→启用视图（首次访问时构建并缓存）。
+func (acmeIndex *acmeImportRefIndex) enabledIDs(table string) (map[int]bool, error) {
+	if ids, built := acmeIndex.enabled[table]; built {
+		return ids, nil
+	}
+	ids := map[int]bool{}
+	if rows, carried := acmeIndex.tables[table]; carried {
+		for _, row := range rows {
+			if id, ok := backupInteger(row["id"]); ok {
+				ids[id] = backupRowEnabled(row)
+			}
+		}
+	} else {
+		acmeIndex.fromLive[table] = true
+		label := "校验 DNS 提供商配置失败"
+		if table == "ca_providers" {
+			label = "校验 CA 提供商失败"
+		}
+		rows, err := db.DB.Query("SELECT id, COALESCE(enabled,1) FROM " + table)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %v", label, err)
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var id int
+			var enabled bool
+			if err := rows.Scan(&id, &enabled); err != nil {
+				return nil, fmt.Errorf("%s: %v", label, err)
+			}
+			ids[id] = enabled
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("%s: %v", label, err)
+		}
+	}
+	acmeIndex.enabled[table] = ids
+	return ids, nil
+}
+
+func (acmeIndex *acmeImportRefIndex) resolveEnabled(table string, id int) (bool, error) {
+	ids, err := acmeIndex.enabledIDs(table)
+	if err != nil {
+		return false, err
+	}
+	enabled, found := ids[id]
+	return found && enabled, nil
+}
+
+// validate 与 validateBackupACMEReferenceIDs 原逐规则实现同序、同文案。
 // CERT41-1：live 回退解析失败的错误包装为 acmeLiveRefUnresolvedError——分类
 // 导入「导规则不导系统数据」且备份从未携带 cert 表时，调用方按 历史问题 对称
 // 语义把它降级为悬挂警告；其余错误（备份行解析失败、acme_config_id=0、DB
 // 查询失败）维持整包 400。
-func validateBackupACMEReferenceIDs(tables map[string][]map[string]any, rule map[string]any) error {
+func (acmeIndex *acmeImportRefIndex) validate(rule map[string]any) error {
 	acmeConfigID, ok := backupInteger(rule["acme_config_id"])
 	if !ok || acmeConfigID == 0 {
 		return errors.New("使用 ACME 签发时必须选择 DNS 提供商配置")
 	}
-	configOK := false
-	configFromLive := false
-	if configRows, exists := tables["certificate_configs"]; exists {
-		for _, configRow := range configRows {
-			id, idOK := backupInteger(configRow["id"])
-			if idOK && id == acmeConfigID {
-				enabledRaw, hasEnabled := configRow["enabled"]
-				configOK = !hasEnabled || backupBooleanEnabled(enabledRaw)
-			}
-		}
-	} else {
-		configFromLive = true
-		if err := db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM certificate_configs WHERE id = ? AND enabled = 1)", acmeConfigID).Scan(&configOK); err != nil {
-			return fmt.Errorf("校验 DNS 提供商配置失败: %v", err)
-		}
+	configOK, err := acmeIndex.resolveEnabled("certificate_configs", acmeConfigID)
+	if err != nil {
+		return err
 	}
 	if !configOK {
 		err := errors.New("选择的 DNS 提供商配置不存在或已禁用")
-		if configFromLive {
+		if acmeIndex.fromLive["certificate_configs"] {
 			return &acmeLiveRefUnresolvedError{inner: err}
 		}
 		return err
@@ -2512,25 +2695,13 @@ func validateBackupACMEReferenceIDs(tables map[string][]map[string]any, rule map
 	if !ok || caProviderID == 0 {
 		return nil
 	}
-	providerOK := false
-	providerFromLive := false
-	if providerRows, exists := tables["ca_providers"]; exists {
-		for _, providerRow := range providerRows {
-			id, idOK := backupInteger(providerRow["id"])
-			if idOK && id == caProviderID {
-				enabledRaw, hasEnabled := providerRow["enabled"]
-				providerOK = !hasEnabled || backupBooleanEnabled(enabledRaw)
-			}
-		}
-	} else {
-		providerFromLive = true
-		if err := db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM ca_providers WHERE id = ? AND enabled = 1)", caProviderID).Scan(&providerOK); err != nil {
-			return fmt.Errorf("校验 CA 提供商失败: %v", err)
-		}
+	providerOK, err := acmeIndex.resolveEnabled("ca_providers", caProviderID)
+	if err != nil {
+		return err
 	}
 	if !providerOK {
 		err := errors.New("指定的 CA 提供商不存在或已禁用")
-		if providerFromLive {
+		if acmeIndex.fromLive["ca_providers"] {
 			return &acmeLiveRefUnresolvedError{inner: err}
 		}
 		return err
@@ -2831,20 +3002,20 @@ func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]
 		switch value {
 		case -1, 0, 1:
 		default:
-			config["threat_traffic_sample_n"] = -1
+			config["threat_traffic_sample_n"] = db.DefaultThreatTrafficSampleN
 		}
 	}
 	// 历史问题-5（历史裁定）：0=自动的旧语义废除——导入侧 0 归一为显式默认
-	// （天数 90 / 行数上限 1,000,000，对齐既有「越界钳制」导入风格），其余
-	// 越界/非整数响亮 400；写侧只接受 1..max。
+	// （历史问题 起 def 取 db.Default* 单源），其余越界/非整数响亮 400；
+	// 写侧只接受 1..max。
 	for _, item := range []struct {
 		key   string
 		max   int
 		def   int64
 		label string
 	}{
-		{key: "security_events_retention_days", max: 3650, def: 90, label: "安全事件保留天数"},
-		{key: "security_events_row_cap", max: 100000000, def: 1000000, label: "安全事件行数上限"},
+		{key: "security_events_retention_days", max: 3650, def: db.DefaultSecurityEventsRetentionDays, label: "安全事件保留天数"},
+		{key: "security_events_row_cap", max: 100000000, def: db.DefaultSecurityEventsRowCap, label: "安全事件行数上限"},
 	} {
 		if raw, exists := config[item.key]; exists && raw != nil {
 			value, ok := backupInteger(raw)
@@ -3010,22 +3181,9 @@ func revalidateImportLiveDependencies(ctx context.Context, tx *sql.Tx, backup *c
 // 备份携带 ca_providers 表时，导入后该表=备份行集合（W2 全量替换），只能
 // 在备份行内解析；表缺席（分类导出未选系统数据）=本地行保留，按库内解析。
 func backupCAProviderExistsPostImport(tables map[string][]map[string]any, id int) bool {
-	if rows, carried := tables["ca_providers"]; carried {
-		for _, row := range rows {
-			rowID, ok := backupInteger(row["id"])
-			if !ok || rowID != id {
-				continue
-			}
-			// schema 默认 enabled=TRUE；键缺失/NULL 表示启用，显式 false 才禁用。
-			enabled := true
-			if raw, exists := row["enabled"]; exists && raw != nil {
-				enabled = backupBooleanEnabled(raw)
-			}
-			if enabled {
-				return true
-			}
-		}
-		return false
+	if _, carried := tables["ca_providers"]; carried {
+		row, found := backupRowByID(tables, "ca_providers", id)
+		return found && backupRowEnabled(row)
 	}
 	if db.DB == nil {
 		return false
@@ -3235,21 +3393,31 @@ func backupString(value any) string {
 	return ""
 }
 
-// backupContainsUsername 报告备份 users 表是否包含指定账户。审计 B3 自锁门使用：
-// 导入全量替换 users/api_keys 且递增 password_version 吊销现有 JWT，备份缺少
-// 操作者自身账户时导入后需用备份内账户重新登录——2026-09-18 裁定降级为
-// warning+照常导入(见下方 operatorReplaced)。
+// backupRowByID 在备份表行中按 id 查找（表缺席时自然返回未命中——调用方
+// 自行决定 live 回退）。历史问题-历史问题（历史）：CA/ACME 引用解析的三处
+// 同构循环收敛到此单一实现，避免「备份行 enabled 口径」在多处漂移。
+func backupRowByID(tables map[string][]map[string]any, table string, id int) (map[string]any, bool) {
+	for _, row := range tables[table] {
+		if rowID, ok := backupInteger(row["id"]); ok && rowID == id {
+			return row, true
+		}
+	}
+	return nil, false
+}
+
+// backupRowEnabled 读取备份行的 enabled 列：键缺失/NULL=启用（schema DEFAULT
+// TRUE 语义），显式禁用值才为 false。CA/ACME 引用校验的单一口径。
+func backupRowEnabled(row map[string]any) bool {
+	raw, exists := row["enabled"]
+	return !exists || raw == nil || backupBooleanEnabled(raw)
+}
+
 // acmeRefResolvablePostImport:导入后某 ACME 引用(id)是否仍可解析——备份携带
 // 该表时以备份行为准(整表替换),否则 live 表原样保留(历史问题 预检口径)。
 func acmeRefResolvablePostImport(tables map[string][]map[string]any, table string, id int) bool {
-	if rows, carried := tables[table]; carried {
-		for _, row := range rows {
-			if rid, ok := backupInteger(row["id"]); ok && rid == id {
-				enabledRaw, hasEnabled := row["enabled"]
-				return !hasEnabled || backupBooleanEnabled(enabledRaw)
-			}
-		}
-		return false
+	if _, carried := tables[table]; carried {
+		row, found := backupRowByID(tables, table, id)
+		return found && backupRowEnabled(row)
 	}
 	var exists bool
 	if err := db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM "+table+" WHERE id = ? AND enabled = 1)", id).Scan(&exists); err != nil {
@@ -3269,6 +3437,10 @@ func ip2regionTagFromBackup(tables map[string][]map[string]any) string {
 	return tag
 }
 
+// backupContainsUsername 报告备份 users 表是否包含指定账户。审计 B3 自锁门使用：
+// 导入全量替换 users/api_keys 且递增 password_version 吊销现有 JWT，备份缺少
+// 操作者自身账户时导入后需用备份内账户重新登录——2026-09-18 裁定降级为
+// warning+照常导入(见下方 operatorReplaced)。
 func backupContainsUsername(users []map[string]any, username string) bool {
 	for _, row := range users {
 		if backupString(row["username"]) == username {
@@ -3278,23 +3450,19 @@ func backupContainsUsername(users []map[string]any, username string) bool {
 	return false
 }
 
-// backupPathRulesForRule 从备份 path_rules 表收集指定规则的自定义路径规则，
-// 供 validateV2Backup 按保存路径同口径校验；无该规则行时返回 found=false。
+// backupPathRulesByRule 一次性把备份 path_rules 行按 rule_id 分桶并解析为模型
+// （历史问题-历史问题，历史）：此前每条规则对 path_rules 全表扫描一次。
 // upstreams_json 形态错误必须上抛（历史问题 历史问题）：吞错后 Upstreams=nil 被
 // validateRuleFeatures 按「回退主上游」放行，落库后 loadPathRulesBatch 对
 // 同一 JSON 硬失败——ListRules/GetRule/UpdateRule/EnableRule 全 500。
-func backupPathRulesForRule(rows []map[string]any, ruleID string) ([]models.PathRule, bool, error) {
-	if ruleID == "" {
-		return nil, false, nil
-	}
-	found := false
-	pathRules := make([]models.PathRule, 0)
+// 错误文案保留全局行号，定位与逐规则扫描时代一致。
+func backupPathRulesByRule(rows []map[string]any) (map[string][]models.PathRule, error) {
+	byRule := make(map[string][]models.PathRule, len(rows))
 	for i, row := range rows {
-		ownerID, _ := row["rule_id"].(string)
-		if ownerID != ruleID {
-			continue
+		ruleID, _ := row["rule_id"].(string)
+		if ruleID == "" {
+			continue // 行级引用门已先行 400，防御性跳过
 		}
-		found = true
 		pathRule := models.PathRule{
 			SortOrder:    backupInt(row["sort_order"]),
 			MatchType:    backupString(row["match_type"]),
@@ -3309,12 +3477,12 @@ func backupPathRulesForRule(rows []map[string]any, ruleID string) ([]models.Path
 		}
 		if raw, ok := row["upstreams_json"].(string); ok && raw != "" {
 			if err := json.Unmarshal([]byte(raw), &pathRule.Upstreams); err != nil {
-				return nil, false, fmt.Errorf("规则 %s 的路径规则行 #%d upstreams_json 无法解析: %w", ruleID, i+1, err)
+				return nil, fmt.Errorf("规则 %s 的路径规则行 #%d upstreams_json 无法解析: %w", ruleID, i+1, err)
 			}
 		}
-		pathRules = append(pathRules, pathRule)
+		byRule[ruleID] = append(byRule[ruleID], pathRule)
 	}
-	return pathRules, found, nil
+	return byRule, nil
 }
 
 // validateCredentialsJSONObject allows empty strings but requires non-empty values to be JSON objects.
@@ -3630,16 +3798,7 @@ func clampBackupConfigInts(config map[string]any) []string {
 // 随下次上报（≤60s）重建。清理失败仅留痕不否决导入（与 DeleteNode 的 pin
 // 清理同口径）；返回完成清理的节点数供成功审计留痕。
 func (h *Handlers) clearDeletedNodeStateBeforeRestore(ctx context.Context, tx *sql.Tx, backupRows []map[string]any) int {
-	surviving := make(map[string]bool, len(backupRows))
-	for _, row := range backupRows {
-		// 行级门已先行 400，此处全为合法形态；防御性跳过缺身份行。
-		ip := backupString(row["ip_address"])
-		port, ok := backupInteger(row["port"])
-		if ip == "" || !ok {
-			continue
-		}
-		surviving[ip+":"+strconv.Itoa(port)] = true
-	}
+	surviving := nodeSurvivingIdentities(backupRows)
 	rows, err := tx.QueryContext(ctx, `SELECT id, ip_address, COALESCE(port,8000) FROM nodes`)
 	if err != nil {
 		services.Logf("warn", "配置导入：读取本地节点身份失败（已删除节点 pin/分区上报清理跳过）: %v", err)
@@ -3688,6 +3847,30 @@ func (h *Handlers) clearDeletedNodeStateBeforeRestore(ctx context.Context, tx *s
 		cleared++
 	}
 	return cleared
+}
+
+// nodeSurvivingIdentities 把备份 nodes 行映射为「导入后仍存活」的 ip:port
+// 身份键集合。历史问题-历史问题（历史）：port 缺键/NULL 必须取与落库同源的
+// 默认值（backupTableNullDefaults["nodes"]["port"]，schema DEFAULT 8000）——
+// 此前缺 port 行在存活集中缺席，而 restoreTable 仍按默认 8000 落库，导致
+// 「备份带 ip:8000 节点且本地同身份节点实际存活」时其 TOFU 指纹钉与分区上报
+// 缓存被误清（无安全后果，但产生无谓 churn）。扫描侧的本地键同为
+// COALESCE(port,8000)，三处口径一致。
+func nodeSurvivingIdentities(backupRows []map[string]any) map[string]bool {
+	surviving := make(map[string]bool, len(backupRows))
+	for _, row := range backupRows {
+		// 行级门已先行 400，此处全为合法形态；防御性跳过缺身份行。
+		ip := backupString(row["ip_address"])
+		if ip == "" {
+			continue
+		}
+		port, ok := backupInteger(row["port"])
+		if !ok {
+			port = backupInt(backupTableNullDefaults["nodes"]["port"])
+		}
+		surviving[ip+":"+strconv.Itoa(port)] = true
+	}
+	return surviving
 }
 
 // suppressImportClusterVersionBumps 在导入事务内暂时把 is_master 置为 0，
@@ -4021,7 +4204,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// CERT41-1(历史 历史问题,用户裁定):sections 过滤前置到全部形态/任务
 	// 校验之前——过滤后 backup.Tables 只剩实际导入表:
 	// ①未选分类的坏行不再误拒整包(此前 validateV2BackupRules 等对全量表执行);
-	// ②validateBackupACMEReferenceIDs「备份有表按备份行、缺表按 live」自动等于
+	// ②acmeImportRefIndex.validate「备份有表按备份行、缺表按 live」自动等于
 	//   「过滤后导入表∪live 保留表」正确口径——备份带 certificate_configs 但用户
 	//   未勾系统数据时,不再按将被丢弃的备份行误放行;
 	// ③全局配置区同理:仅 includeGlobal 时参与校验/钳制(未选系统数据时
@@ -4274,7 +4457,10 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// 锁外读会在「读→取得 caddyOpMu」窗口与规则更新竞态（历史问题-2）。
 	acmeDanglingRules := 0
 	// 历史问题：导入前快照自动备份开关——提交后仅在 off→on 转换时重置水位线。
+	// 历史问题-06：known=false 表示该列读取失败（未知）——off→on 判定不可信，
+	// 跳过水位重置。
 	oldAutoBackupEnabled := 0
+	oldAutoBackupEnabledKnown := false
 	wafFilePhase := sectionTables["security_crs_version"] && lbbakFiles != nil &&
 		(lbbakFiles.CRSTarGz != nil || lbbakFiles.Xdb != nil || len(lbbakFiles.ThreatIplists) > 0)
 	// 历史问题-03：威胁源表随备份全量替换时，文件收敛（删除空/缺席源的本地旧
@@ -4355,7 +4541,17 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		}
 	}
 	if db.DB != nil {
-		_ = tx.QueryRowContext(ctx, `SELECT COALESCE(auto_backup_enabled,0) FROM global_config WHERE id=1`).Scan(&oldAutoBackupEnabled)
+		// 历史问题-06（历史）：读失败不得当作 off——旧形态 `_ = ...Scan()`
+		// 吞错、变量保持 0，会把「原本已启用」误判为 off→on，导入后可能重置
+		// 自动备份水位线（推迟下一次自动备份至多一个周期）。读失败=未知：跳过
+		// 水位重置分支（保守不重置）并留 warn；不升级为导入失败（该列与导入
+		// 主体无关）。
+		enabled, readErr := readImportOldAutoBackupEnabled(ctx, tx)
+		if readErr != nil {
+			services.Logf("warn", "配置导入：读取导入前自动备份开关失败，已跳过自动备份水位重置: %v", readErr)
+		} else {
+			oldAutoBackupEnabled, oldAutoBackupEnabledKnown = enabled, true
+		}
 	}
 	// 历史问题 配套：两版本表单行是否存在同样在加锁后的同一事务快照内读取。
 	versionRowExistedBefore := map[string]bool{}
@@ -4443,7 +4639,8 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// （缺 TLS 三字段与 path_rules 时间戳），现改调与 v1 导入共享的
 	// normalizeRuleRowsForTransport（单一事实源）。
 	var droppedTCPBindings int64
-	if _, hasRules := backup.Tables["lb_rules"]; hasRules {
+	_, rulesReplaced := backup.Tables["lb_rules"]
+	if rulesReplaced {
 		droppedTCPBindings, err = normalizeRuleRowsForTransport(ctx, tx)
 		if err != nil {
 			err = session.abort(err)
@@ -4451,13 +4648,40 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
 			return
 		}
+	} else if _, bindingsCarried := backup.Tables["security_policy_bindings"]; bindingsCarried {
+		// 历史问题-历史问题：规则表缺席（如仅导入「安全防护」）时上面的归一不跑，
+		// 但 security_policy_bindings 被携带——指向 live TCP 规则的绑定会随
+		// 插入存活，必须在插入后清理（幂等）。绑定表也缺席的分类导入不得顺手
+		// 改写安全绑定（U04B-01 同口径）。
+		droppedTCPBindings, err = pruneTCPRuleBindings(ctx, tx)
+		if err != nil {
+			err = session.abort(err)
+			recordAudit(c, action+"失败", "配置备份", err.Error())
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
+			return
+		}
+	}
+
+	// 历史问题-历史问题（历史）：规则整体替换但 upstreams/path_rules 未随包
+	// 携带（手工/截断备份）时，live 的 upstream/path 行会指向已被替换掉的规则
+	// ——渲染不可见，但集群快照原样 dump（snapshotRules/snapshotAllPathRules），
+	// 且极小概率的 caddy_id 复用会误挂。此处按导入后规则视图幂等剪枝（与
+	// cert_jobs 孤儿清理同型）。
+	if rulesReplaced {
+		for _, table := range []string{"upstreams", "path_rules"} {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE rule_id NOT IN (SELECT caddy_id FROM lb_rules)"); err != nil {
+				err = session.abort(err)
+				recordAudit(c, action+"失败", "配置备份", "清理孤立 "+table+" 失败: "+err.Error())
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
+				return
+			}
+		}
 	}
 
 	// U04B-01：规则或策略被整体替换而绑定表缺席时，live 绑定仍保留。
 	// 在事务内按导入后视图清理两端任一悬挂的绑定；未触碰这三张表的
 	// 分类导入不得顺手改写安全绑定。
 	var prunedBindings int64
-	_, rulesReplaced := backup.Tables["lb_rules"]
 	_, policiesReplaced := backup.Tables["security_policies"]
 	if rulesReplaced || policiesReplaced {
 		result, err := tx.ExecContext(ctx, `DELETE FROM security_policy_bindings
@@ -4887,7 +5111,9 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	}
 	// 历史问题：off→on 且水位线为空/陈旧（>1 分钟）→ 置 now，避免导入后立即
 	// 补跑停用期首轮。直接写列而非 SetAutoBackupEnabled（后者会二次 StartLoop）。
-	if oldAutoBackupEnabled == 0 {
+	// 历史问题-06：导入前开关读取失败（known=false）时不重置——把「未知」当 off
+	// 会在原本已启用时误重置水位线。
+	if importAutoBackupResetNeeded(oldAutoBackupEnabledKnown, oldAutoBackupEnabled) {
 		var newEnabled int
 		var lastRun string
 		if err := db.DB.QueryRow(`SELECT COALESCE(auto_backup_enabled,0), COALESCE(auto_backup_last_run,'') FROM global_config WHERE id=1`).Scan(&newEnabled, &lastRun); err == nil && newEnabled == 1 {
@@ -5111,6 +5337,29 @@ func captureThreatSourceRows(ctx context.Context) map[string]map[string]any {
 		}
 	}
 	return out
+}
+
+// importRowQuerier 导入事务的单行读取面（*sql.Tx 满足；测试可注入真实 tx
+// 的失败形态）。历史问题-06。
+type importRowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// readImportOldAutoBackupEnabled 读取导入前的 auto_backup_enabled（历史问题-06）。
+// 错误必须向上返回——调用方据此把「off→on」判定降级为未知并跳过水位重置；
+// 禁止把错误吞成 0（会把已启用误判为 off）。
+func readImportOldAutoBackupEnabled(ctx context.Context, q importRowQuerier) (int, error) {
+	var enabled int
+	if err := q.QueryRowContext(ctx, `SELECT COALESCE(auto_backup_enabled,0) FROM global_config WHERE id=1`).Scan(&enabled); err != nil {
+		return 0, err
+	}
+	return enabled, nil
+}
+
+// importAutoBackupResetNeeded 判定导入提交后是否重置自动备份水位（历史问题 口径
+// + 历史问题-06 未知态）：仅「导入前开关已知且为 off」才重置（off→on 转换）。
+func importAutoBackupResetNeeded(oldEnabledKnown bool, oldEnabled int) bool {
+	return oldEnabledKnown && oldEnabled == 0
 }
 
 // autoBackupWatermarkEmptyOrStale 判定自动备份水位线是否需要重置（历史问题）：

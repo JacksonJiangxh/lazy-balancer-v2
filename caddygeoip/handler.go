@@ -187,7 +187,10 @@ const (
 )
 
 // applyCrawlerVerification UA 命中引擎 → PTR 双跳验证：通过置 Verified=引擎 ID
-// （下游豁免规则 @streq 消费）；未通过置 Spoof=1（伪装事件规则消费）。
+// （下游豁免规则 @streq 消费）；未通过置 Spoof=引擎 ID（伪装事件规则消费——
+// 渲染侧按策略已选引擎集合 @rx^(?:engine|…)$ 匹配，见 buildIPPrecheckDirectives。
+// PL历史问题：旧注释写 Spoof=1 与实际发射的引擎 ID 矛盾，按旧注释把规则改回
+// @eq 1 会让伪装事件族静默永不命中）。
 // 非爬虫 UA 不做 DNS/PTR，但 MatchCrawlerEngine 仍需顺序扫描引擎正则表；
 // 未命中时承担全表预编译正则成本，命中时每个 UA 只匹配一次。
 func (h *GeoIPHandler) applyCrawlerVerification(r *http.Request) {

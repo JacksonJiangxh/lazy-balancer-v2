@@ -140,11 +140,11 @@ func TestThreatLib_excludesCrawlerAddressSources(t *testing.T) {
 }
 
 func TestThreatLib_usesThreatSystemListRegistry(t *testing.T) {
-	original := db.ThreatSystemLists
+	original := db.ThreatSystemLists()
 	extended := append([]db.ThreatSystemList{}, original...)
 	extended = append(extended, db.ThreatSystemList{Source: "future_source", Name: "未来威胁名单"})
-	db.ThreatSystemLists = extended
-	t.Cleanup(func() { db.ThreatSystemLists = original })
+	restore := db.SetThreatSystemListsForTest(extended)
+	t.Cleanup(restore)
 	router := newThreatTestRouter(t)
 	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (id,name,display_name,url,update_enabled,entry_count)
 		VALUES (1040,'future_source','未来威胁源','https://example.com/future.txt',1,7)`); err != nil {

@@ -264,14 +264,20 @@ func TestAutobanStatus_banEffectiveTruthTable(t *testing.T) {
 		refsField   string
 		bind        bool
 		ruleEnabled bool
+		upstreams   []bool // 每条上游的 enabled（空=无上游）
 		want        bool
 	}{
-		{name: "bound deny policy with active entries", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, want: true},
-		{name: "unbound deny policy", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", ruleEnabled: true, want: false},
-		{name: "disabled rule", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: false, want: false},
-		{name: "empty list", entries: `[]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, want: false},
-		{name: "IP ACL disabled", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: false, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, want: false},
-		{name: "whitelist reference only", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: false, aclMode: "deny", refsField: "ip_whitelist_refs", bind: true, ruleEnabled: true, want: false},
+		{name: "bound deny policy with active entries", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, upstreams: []bool{true}, want: true},
+		{name: "unbound deny policy", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", ruleEnabled: true, upstreams: []bool{true}, want: false},
+		{name: "disabled rule", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: false, upstreams: []bool{true}, want: false},
+		{name: "empty list", entries: `[]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, upstreams: []bool{true}, want: false},
+		{name: "IP ACL disabled", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: false, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, upstreams: []bool{true}, want: false},
+		{name: "whitelist reference only", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: false, aclMode: "deny", refsField: "ip_whitelist_refs", bind: true, ruleEnabled: true, upstreams: []bool{true}, want: false},
+		// 历史问题（历史）：渲染层对零启用上游的规则整条 continue——此时名单
+		// 实际不拦截，卡片不得再报 ban_effective=true（否则黄条被抑制）。
+		{name: "no upstream", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, upstreams: nil, want: false},
+		{name: "only disabled upstream", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, upstreams: []bool{false}, want: false},
+		{name: "mixed upstreams with one enabled", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, upstreams: []bool{false, true}, want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -291,6 +297,11 @@ func TestAutobanStatus_banEffectiveTruthTable(t *testing.T) {
 			policyID, _ := res.LastInsertId()
 			if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_ban_effective','ban-effective','http','ban-effective.test',8080,?)`, tc.ruleEnabled); err != nil {
 				t.Fatal(err)
+			}
+			for _, upstreamEnabled := range tc.upstreams {
+				if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_ban_effective','127.0.0.1',9000,1,?,'http')`, upstreamEnabled); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if tc.bind {
 				if _, err := db.DB.Exec(`INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES ('lb_ban_effective',?)`, policyID); err != nil {
@@ -326,6 +337,24 @@ func TestAutobanStatus_banEffectiveTruthTable(t *testing.T) {
 			t.Fatalf("query failure must suppress the misleading warning, status=%d body=%s", response.Code, response.Body.String())
 		}
 	})
+}
+
+// 历史问题（历史）：autobanListReferenced / autobanBanEffective 的查询失败
+// fail-closed 分支此前无测试——预置名单查询失败时必须按「已引用/已生效」处理
+// （不弹误导性黄条）。status 端点在名单表缺失时更早的 AutobanListEntries 已
+// 500，故直接钉两个判据 helper 的失败分支。
+func TestAutobanStatus_listReferencedFailClosed(t *testing.T) {
+	newAutobanTestEnv(t)
+	if _, err := db.DB.Exec(`DROP TABLE security_ip_lists`); err != nil {
+		t.Fatal(err)
+	}
+	h := &Handlers{}
+	if !h.autobanListReferenced() {
+		t.Fatal("list_referenced 查询失败必须 fail-closed 返回 true（不弹黄条）")
+	}
+	if !h.autobanBanEffective() {
+		t.Fatal("ban_effective 查询失败必须 fail-closed 返回 true（不弹黄条）")
+	}
 }
 
 // TestAutobanStatus_suggestionsCarryIPLocation：观察建议逐条携带归属地——与
@@ -630,5 +659,52 @@ func TestExportIPList_threatFileReadErrorReturns500(t *testing.T) {
 	rec = getRequest(t, router, fmt.Sprintf("/security/ip-lists/%d/export", id))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("missing file: status=%d body=%s, want 200 空导出", rec.Code, rec.Body.String())
+	}
+}
+
+// 历史问题-02（历史）：自动封禁计数的唯一喂入源是安全事件采集任务——
+// 用户停止它（或自愈预算用尽停环）后本任务仍每轮 success 记「计数 0 IP」。
+// /security/autoban/status 必须暴露降级原因（只做可见性，不自动拉起显式停止
+// 的任务）。
+func TestGetAutobanStatusExposesFeedHealth(t *testing.T) {
+	newBackupTestHandlers(t)
+	initTaskEngineForTest(t)
+	te := services.TaskEngine()
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/autoban/status", h.GetAutobanStatus)
+
+	get := func() map[string]any {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/security/autoban/status", nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var payload struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return payload.Data
+	}
+
+	// 默认装配：采集任务在调度中 → 不降级。
+	if data := get(); data["feed_degraded"] != false {
+		t.Fatalf("feed_degraded=%v, want false（采集任务在调度中）", data["feed_degraded"])
+	}
+	// 用户停止采集任务 → 状态卡必须给出降级原因。
+	te.StopLoop(services.AutobanFeedTaskID)
+	data := get()
+	if data["feed_degraded"] != true {
+		t.Fatalf("feed_degraded=%v, want true（喂入源停摆必须可见）", data["feed_degraded"])
+	}
+	if reason, _ := data["feed_degraded_reason"].(string); !strings.Contains(reason, "调度已停止") {
+		t.Fatalf("feed_degraded_reason=%q, want 调度停止说明", reason)
+	}
+	if m, ok := te.Lookup(services.AutobanFeedTaskID); !ok || m.LoopOn {
+		t.Fatal("可见性修复不得自动拉起用户显式停止的任务")
 	}
 }

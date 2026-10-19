@@ -52,10 +52,10 @@ func TestImportConfigBackup_postImportRuleBindingView(t *testing.T) {
 			VALUES ('lb_live','live','http','live.example.test',18081,'weighted_round_robin',0)`); err != nil {
 			t.Fatal(err)
 		}
-		body := r41BackupJSON(t, []string{"security"}, map[string][]map[string]any{
+		body := buildBackup(t, backupFixtureOptions{Sections: []string{"security"}, Tables: map[string][]map[string]any{
 			"security_policies":        {{"id": 7, "name": "restored", "mode": "off", "enabled": 1}},
 			"security_policy_bindings": {{"rule_caddy_id": "lb_live", "policy_id": 7}},
-		}, nil)
+		}, Config: nil})
 
 		// When previewing and importing the security section.
 		preview := r41PostValidate(t, h, body)
@@ -87,7 +87,7 @@ func TestImportConfigBackup_postImportRuleBindingView(t *testing.T) {
 		tables := audit79RuleTables()
 		tables["lb_rules"][0]["caddy_id"] = "lb_new"
 		tables["upstreams"][0]["rule_id"] = "lb_new"
-		body := r41BackupJSON(t, []string{"rules"}, tables, nil)
+		body := buildBackup(t, backupFixtureOptions{Sections: []string{"rules"}, Tables: tables, Config: nil})
 
 		// When importing only the rules section.
 		response := postBackupImport(t, h, body)
@@ -154,9 +154,10 @@ func TestImportConfigBackup_unselectedSectionsHaveNoPostProcessing(t *testing.T)
 		INSERT INTO security_block_pages (id,name,content,is_default) VALUES (2,'second-default','<html>custom</html>',1)`); err != nil {
 		t.Fatal(err)
 	}
-	body := r41BackupJSON(t, []string{"users"}, map[string][]map[string]any{
+	body := buildBackup(t, backupFixtureOptions{Sections: []string{"users"}, Tables: map[string][]map[string]any{
 		"users": {{"id": 1, "username": "operator", "password_hash": "hash", "role": "admin", "is_enabled": 1}},
-	}, map[string]any{})
+	}, Config: map[string]any{}})
+
 	router := gin.New()
 	router.POST("/config/import", func(c *gin.Context) {
 		c.Set("username", "operator")
@@ -317,7 +318,7 @@ func TestImportAutoBackupSettings_validatesMergedLiveSchedule(t *testing.T) {
 			if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_frequency=?, auto_backup_day=? WHERE id=1`, tt.liveFreq, tt.liveDay); err != nil {
 				t.Fatal(err)
 			}
-			body := r78BackupJSON(t, nil, tt.cfg, []string{"users"})
+			body := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, Config: tt.cfg, Sections: []string{"users"}, EmptyConfigIfNil: true})
 
 			// When running both preview and import.
 			preview := r78ValidateResponse(t, h, body)
@@ -358,7 +359,7 @@ func TestImportConfigBackup_materializesBranding(t *testing.T) {
 			if _, err := db.DB.Exec(`UPDATE security_block_pages SET content='old page' WHERE id=1`); err != nil {
 				t.Fatal(err)
 			}
-			body := r78BackupJSON(t, nil, map[string]any{"branding_json": tt.content}, []string{"users"})
+			body := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, Config: map[string]any{"branding_json": tt.content}, Sections: []string{"users"}, EmptyConfigIfNil: true})
 
 			// When importing the mirrored value and then refreshing the mirror once more.
 			response := r78Import(h, t, body)
@@ -410,7 +411,7 @@ func TestImportConfigBackup_malformedBrandingWarnsAndKeepsFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	body := r78BackupJSON(t, nil, map[string]any{"branding_json": "not-json"}, []string{"users"})
+	body := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, Config: map[string]any{"branding_json": "not-json"}, Sections: []string{"users"}, EmptyConfigIfNil: true})
 
 	// When importing it.
 	response := r78Import(h, t, body)
@@ -448,10 +449,10 @@ func TestImportConfigBackup_rebuildsCrawlerSnapshot(t *testing.T) {
 	if err := os.WriteFile(snapshotPath, []byte(`{"googlebot":["192.0.2.0/24"]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	body := r41BackupJSON(t, []string{"security"}, map[string][]map[string]any{
+	body := buildBackup(t, backupFixtureOptions{Sections: []string{"security"}, Tables: map[string][]map[string]any{
 		"security_crawler_sources": {{"name": "googlebot", "url": "https://developers.google.com/static/crawling/ipranges/common-crawlers.json", "format": "json", "update_enabled": 1}},
 		"security_ip_lists":        {{"id": 41, "name": services.CrawlerIPListName("googlebot"), "category": "搜索引擎爬虫", "entries": `[{"value":"198.51.100.0/24"}]`, "system": 1}},
-	}, nil)
+	}, Config: nil})
 
 	// When importing the security section.
 	response := postBackupImport(t, h, body)
@@ -527,7 +528,7 @@ func TestImportConfigBackup_normalizesRequestBodyIntegerShapes(t *testing.T) {
 		t.Run("global "+fmt.Sprint(raw), func(t *testing.T) {
 			// Given a non-integer global request-body value.
 			h := newBackupTestHandlers(t)
-			body := r78BackupJSON(t, nil, map[string]any{"request_body_max_size_mb": raw}, []string{"users"})
+			body := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, Config: map[string]any{"request_body_max_size_mb": raw}, Sections: []string{"users"}, EmptyConfigIfNil: true})
 
 			// When importing it.
 			response := r78Import(h, t, body)
@@ -622,7 +623,7 @@ func TestImportConfigBackup_normalizesRemainingNullDefaults(t *testing.T) {
 		tables := audit79RuleTables()
 		tables["path_rules"] = []map[string]any{{"rule_id": "lb_audit79", "sort_order": nil, "match_type": nil, "path": "/null"}}
 		tables["lb_rules"][0]["custom_routes_enabled"] = 1
-		body := r41BackupJSON(t, []string{"rules"}, tables, nil)
+		body := buildBackup(t, backupFixtureOptions{Sections: []string{"rules"}, Tables: tables, Config: nil})
 
 		// When / Then both preview and import use the schema defaults, not a 400/500.
 		if preview := r41PostValidate(t, h, body); !preview.Valid {
@@ -647,5 +648,40 @@ func TestValidateCredentialsJSONObject_rejectsNull(t *testing.T) {
 		if err := validateCredentialsJSONObject(raw); err != nil {
 			t.Errorf("credentials %q regression: %v", raw, err)
 		}
+	}
+}
+
+// ── 历史问题-历史问题（历史）：仅导入「安全防护」分类时，备份携带的
+// security_policy_bindings 指向 live TCP 规则——TCP 渲染链不消费策略，绑定为
+// 死绑定，必须在插入后清理（策略页不得宣称生效而运行态零防护）。 ──
+
+func TestA3_87_P3_04_securityOnlyImportDropsTCPRuleBindings(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	a3SeedLiveAdmin(t)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled)
+		VALUES ('lb_live_tcp','tcp-live','tcp','tcp.example.test',19000,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,mode,enabled) VALUES (7,'live-policy','off',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES ('lb_live_tcp',7)`); err != nil {
+		t.Fatal(err)
+	}
+	body := buildBackup(t, backupFixtureOptions{Sections: []string{"security"}, Tables: map[string][]map[string]any{
+		"security_policies":        {{"id": 7, "name": "restored", "mode": "off", "enabled": 1}},
+		"security_policy_bindings": {{"rule_caddy_id": "lb_live_tcp", "policy_id": 7}},
+	}, Config: nil})
+
+	rec := postBackupImport(t, h, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var bindings int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_policy_bindings WHERE rule_caddy_id='lb_live_tcp'`).Scan(&bindings); err != nil {
+		t.Fatal(err)
+	}
+	if bindings != 0 {
+		t.Fatalf("TCP 绑定条数=%d, want 0（TCP 渲染链不消费策略，绑定为死绑定）", bindings)
 	}
 }

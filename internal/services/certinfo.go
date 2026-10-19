@@ -2,7 +2,9 @@ package services
 
 import (
 	"crypto/x509"
+	"database/sql"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -145,6 +147,13 @@ func GetCertRenewalAttempts() int {
 // 统一快照，避免逐规则 time.Now 漂移）；caddyID 非空时回填。source=acme_dns 且
 // PEM 为空时给出 ACME 专属「尚未签发」文案（其余来源「证书不存在」）。
 func FormatRuleCertInfo(certPEM, source, ruleDomains, caddyID string, expiryDays int, now time.Time) *models.RuleCertInfo {
+	return formatRuleCertInfo(certPEM, nil, source, ruleDomains, caddyID, expiryDays, now)
+}
+
+// formatRuleCertInfo 与 FormatRuleCertInfo 同源：cert 非空时复用已解析证书
+// （候选装载阶段预解析的 Leaf），不再 pem.Decode + x509.ParseCertificate
+// （SV历史问题：过期回退逐个候选择优后再解析一次的重复成本）。
+func formatRuleCertInfo(certPEM string, cert *x509.Certificate, source, ruleDomains, caddyID string, expiryDays int, now time.Time) *models.RuleCertInfo {
 	info := &models.RuleCertInfo{
 		CaddyID: caddyID,
 		Source:  source,
@@ -161,16 +170,19 @@ func FormatRuleCertInfo(certPEM, source, ruleDomains, caddyID string, expiryDays
 		return info
 	}
 
-	block, _ := pem.Decode([]byte(certPEM))
-	if block == nil {
-		info.Error = "证书格式无效"
-		return info
-	}
+	if cert == nil {
+		block, _ := pem.Decode([]byte(certPEM))
+		if block == nil {
+			info.Error = "证书格式无效"
+			return info
+		}
 
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		info.Error = fmt.Sprintf("证书解析失败: %v", err)
-		return info
+		parsed, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			info.Error = fmt.Sprintf("证书解析失败: %v", err)
+			return info
+		}
+		cert = parsed
 	}
 
 	// Domains：证书 DNSNames 优先，CommonName 兜底，去重后均无则保留 ruleDomains
@@ -220,39 +232,51 @@ func ParseCertInfo(certPEM, source, ruleDomains string) *models.RuleCertInfo {
 }
 
 // GetRuleCertInfo returns parsed certificate info for a single rule.
-func GetRuleCertInfo(caddyID string) *models.RuleCertInfo {
+// SV历史问题：返回 error 仅表示读取失败（DB 故障必须 fail-visible，不得折叠成
+// 「无证书信息」假成功）；「规则不存在」与「未启用 TLS」仍以 (nil, nil) 表达
+// ——handler 保持 200 + data:null 的既有契约。批量端点 GetRulesCertInfo 走
+// 另一入口（整批失败已 500），不受本签名影响。
+func GetRuleCertInfo(caddyID string) (*models.RuleCertInfo, error) {
 	var enableTLS bool
 	var tlsSource, ruleDomain, tlsCert string
 	err := db.DB.QueryRow(`
 		SELECT COALESCE(enable_tls, 0), COALESCE(tls_source, 'manual'), COALESCE(domain, ''), COALESCE(tls_cert, '')
 		FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(&enableTLS, &tlsSource, &ruleDomain, &tlsCert)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
 		Logf("error", "GetRuleCertInfo: failed to read rule %s: %v", caddyID, err)
-		return nil
+		return nil, fmt.Errorf("读取规则 %s 证书配置: %w", caddyID, err)
 	}
 
 	if !enableTLS {
-		return nil
+		return nil, nil
 	}
 
 	switch tlsSource {
 	case "manual":
 		info := ParseCertInfo(tlsCert, "manual", ruleDomain)
 		info.CaddyID = caddyID
-		return info
+		return info, nil
 	case "acme_dns":
-		return getACMECertInfo(caddyID, ruleDomain)
+		return getACMECertInfo(caddyID, ruleDomain), nil
 	default:
 		// Fallback to manual cert if source is unrecognized but tls_cert exists
 		info := ParseCertInfo(tlsCert, tlsSource, ruleDomain)
 		info.CaddyID = caddyID
-		return info
+		return info, nil
 	}
 }
 
 // getACMECertInfo returns parsed certificate info for an ACME-issued rule.
 // It reads the issued certificate from cert_jobs.cert_pem.
 func getACMECertInfo(caddyID, ruleDomain string) *models.RuleCertInfo {
+	// SV历史问题：阈值/基准取一次，供候选选择与过期回退共用——此前
+	// ExpiredACMECertInfoFallback 对每个候选调用 ParseCertInfo，每候选一次
+	// global_config 读 + 重复 X509 解析。
+	now := time.Now()
+	expiryDays := GetCertExpiryThreshold()
 	rows, err := db.DB.Query(`
 		SELECT id, status, COALESCE(cert_pem, ''), COALESCE(key_pem, ''),
 		       COALESCE(julianday(COALESCE(updated_at, created_at)), 0), COALESCE(domain, '')
@@ -271,19 +295,22 @@ func getACMECertInfo(caddyID, ruleDomain string) *models.RuleCertInfo {
 			Logf("error", "GetRuleCertInfo: failed to scan ACME certificate for %s: %v", caddyID, err)
 			return missingACMECertInfo(caddyID, ruleDomain)
 		}
+		// SV历史问题/09：预解析一次，供 SelectRuleCertificate 与过期回退共用。
+		if candidate.Status != "disabled" {
+			candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
+		}
 		candidates = append(candidates, candidate)
 	}
 	if err := rows.Err(); err != nil {
 		Logf("error", "GetRuleCertInfo: failed to iterate ACME certificates for %s: %v", caddyID, err)
 		return missingACMECertInfo(caddyID, ruleDomain)
 	}
-	if certPEM, selected := SelectRuleCertificate(candidates, ruleDomain, time.Now()); selected {
-		info := ParseCertInfo(certPEM, "acme_dns", ruleDomain)
-		info.CaddyID = caddyID
+	if certPEM, selected := SelectRuleCertificate(candidates, ruleDomain, now); selected {
+		info := FormatRuleCertInfo(certPEM, "acme_dns", ruleDomain, caddyID, expiryDays, now)
 		return info
 	}
 	// CERT40-1:选中失败区分「已过期」与「尚未签发」。
-	if info := ExpiredACMECertInfoFallback(candidates, caddyID, ruleDomain); info != nil {
+	if info := ExpiredACMECertInfoFallback(candidates, caddyID, ruleDomain, expiryDays, now); info != nil {
 		return info
 	}
 	return missingACMECertInfo(caddyID, ruleDomain)
@@ -294,13 +321,14 @@ func getACMECertInfo(caddyID, ruleDomain string) *models.RuleCertInfo {
 // 的已过期候选按 expired 呈现(Error=「ACME 证书已过期」),不再误报「尚未
 // 签发或不存在」;无已过期候选(解析失败/未过期)返回 nil,调用方维持原口径。
 // 单规则(GetRuleCertInfo)与批量(handlers GetRulesCertInfo)两路径同用。
-func ExpiredACMECertInfoFallback(candidates []CertificateCandidate, caddyID, ruleDomain string) *models.RuleCertInfo {
+// SV历史问题：expiryDays/now 由调用方一次性提供（批量端点已有阈值与 now），
+// 避免每个候选一次 global_config 查询；解析结果直接复用 FormatRuleCertInfo。
+func ExpiredACMECertInfoFallback(candidates []CertificateCandidate, caddyID, ruleDomain string, expiryDays int, now time.Time) *models.RuleCertInfo {
 	for _, candidate := range candidates {
 		if strings.TrimSpace(candidate.CertPEM) == "" || candidate.Status == "disabled" {
 			continue
 		}
-		info := ParseCertInfo(candidate.CertPEM, "acme_dns", ruleDomain)
-		info.CaddyID = caddyID
+		info := formatRuleCertInfo(candidate.CertPEM, candidate.Leaf, "acme_dns", ruleDomain, caddyID, expiryDays, now)
 		if info.Status == "expired" {
 			info.Error = "ACME 证书已过期"
 			return info

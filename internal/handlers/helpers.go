@@ -2,8 +2,7 @@ package handlers
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/rsa"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -127,46 +126,26 @@ func parseTLSCertificate(certPEM, keyPEM string) (*CertificateInfo, error) {
 		info.Warning = fmt.Sprintf("证书尚未生效 (生效时间: %s)", x509Cert.NotBefore.In(services.CurrentLocation()).Format("2006-01-02"))
 	}
 
-	// Extract public key from certificate
-	var certPubKey interface{}
-	switch pub := x509Cert.PublicKey.(type) {
-	case *rsa.PublicKey:
-		certPubKey = pub
-	case *ecdsa.PublicKey:
-		certPubKey = pub
-	default:
-		return nil, fmt.Errorf("unsupported public key type in certificate")
-	}
-
-	// Extract public key from private key
-	var keyPubKey interface{}
-	switch priv := cert.PrivateKey.(type) {
-	case *rsa.PrivateKey:
-		keyPubKey = &priv.PublicKey
-	case *ecdsa.PrivateKey:
-		keyPubKey = &priv.PublicKey
-	default:
+	// 公钥等价比较（H-B1-01，历史）：原实现按 *rsa.PublicKey/*ecdsa.PublicKey
+	// 白名单分型——Ed25519（内部 CA/自签常用，tls.X509KeyPair 与 Caddy 均支持）
+	// 被硬拒 400，面板支持面比引擎更窄。改为 crypto.Signer.Public() + PKIX 字节
+	// 比较（同类型同参数编码恒等，跨类型/不同密钥恒不等），保留「类型不可用」
+	// 与「不配对」两类错误文案。X509KeyPair 已先行拦截不配对形态，本段是引擎
+	// 接受面内的纵深校验。
+	signer, ok := cert.PrivateKey.(crypto.Signer)
+	if !ok {
 		return nil, fmt.Errorf("unsupported private key type")
 	}
-
-	// Compare public keys
-	switch certPub := certPubKey.(type) {
-	case *rsa.PublicKey:
-		keyPub, ok := keyPubKey.(*rsa.PublicKey)
-		if !ok {
-			return nil, fmt.Errorf("certificate and key public key types do not match")
-		}
-		if certPub.N.Cmp(keyPub.N) != 0 || certPub.E != keyPub.E {
-			return nil, fmt.Errorf("certificate and private key do not match")
-		}
-	case *ecdsa.PublicKey:
-		keyPub, ok := keyPubKey.(*ecdsa.PublicKey)
-		if !ok {
-			return nil, fmt.Errorf("certificate and key public key types do not match")
-		}
-		if !certPub.Equal(keyPub) {
-			return nil, fmt.Errorf("certificate and private key do not match")
-		}
+	certKeyDER, err := x509.MarshalPKIXPublicKey(x509Cert.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("unsupported public key type in certificate: %w", err)
+	}
+	keyDER, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil {
+		return nil, fmt.Errorf("unsupported public key type in private key: %w", err)
+	}
+	if !bytes.Equal(certKeyDER, keyDER) {
+		return nil, fmt.Errorf("certificate and private key do not match")
 	}
 
 	return info, nil

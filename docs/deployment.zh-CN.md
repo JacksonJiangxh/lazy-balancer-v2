@@ -23,7 +23,7 @@
 | `LOG_FILE` | `/app/logs/lazy-balancer.log` | 运行日志文件路径（恒启用，LOG_FILE 仅覆盖路径） |
 | `NODE_NAME` | `node-1` | 集群注册的默认节点名 |
 | `BACKUP_DIR` | `data_dir` 同级 `backup`（容器 `/app/backup`） | 自动备份落盘目录 |
-| `APP_VERSION` | 构建时注入 | 显示版本号 |
+| `APP_VERSION` | 构建时注入 | 显示版本号（正式版本号，不含 `-beta` 等通道后缀；镜像 tag 可带后缀，二者刻意不同） |
 | `TZ` | 数据库 `timezone` | 进程时区。数据库已初始化后，容器启动时 entrypoint 会以数据库时区覆盖该变量（`-e TZ=...` 传入不生效）；时区请经面板「基础设置」修改 |
 
 ## 端口

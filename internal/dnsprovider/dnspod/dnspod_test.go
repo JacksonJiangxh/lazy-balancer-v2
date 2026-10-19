@@ -327,6 +327,48 @@ func TestProvider_apiCall_retries_transient_failures(t *testing.T) {
 	}
 }
 
+// gatewayBodyTransport 返回网关错误页（非 JSON），用于观察 apiCall 的失败形态。
+type gatewayBodyTransport struct {
+	status int
+	body   string
+}
+
+func (transport *gatewayBodyTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Body != nil {
+		_, _ = io.Copy(io.Discard, request.Body)
+		_ = request.Body.Close()
+	}
+	return &http.Response{
+		StatusCode: transport.status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(transport.body)),
+		Request:    request,
+	}, nil
+}
+
+// DNS-87-F10（历史）：网关返回 HTML/空体（502/503）时解码失败必须带
+// HTTP 状态码与动作名——原文案只剩「decode response: invalid character '<'…」，
+// 排障只能翻 network 日志（429/5xx 已由 retry.Transport 吸收，这里是最终失败形态）。
+func TestProvider_apiCall_decodeErrorCarriesStatusAndMethod(t *testing.T) {
+	// Given
+	provider := New("id,token")
+	provider.client.Transport = &gatewayBodyTransport{status: http.StatusBadGateway, body: "<html>bad gateway</html>"}
+	var result struct {
+		Status struct{ Code string } `json:"status"`
+	}
+
+	// When
+	err := provider.apiCall(t.Context(), "Record.Create", url.Values{}, &result)
+
+	// Then
+	if err == nil {
+		t.Fatal("HTML body was accepted as a JSON response")
+	}
+	if !strings.Contains(err.Error(), "HTTP 502") || !strings.Contains(err.Error(), "Record.Create") {
+		t.Fatalf("error=%q, want action name and HTTP status in the decode failure", err)
+	}
+}
+
 // 历史问题（历史）：Record.Create 命中 5xx 不得重放——创建响应丢失时
 // 重试会产生无 ID 幽灵 TXT（ownership 清理只按记录 ID 删除），首个 5xx
 // 原样上抛、创建动作单次调用。

@@ -61,9 +61,34 @@ func TestDNSPod_Validate_returns_cleanup_error(t *testing.T) {
 	}
 }
 
+// S历史问题（历史）：原断言 len(List())==1 既是脆性计数（新增任何 DNS
+// 提供商即失败），又不验证注册表语义。改为钉「Get 命中 + List 含 dnspod + List
+// 非空 + 按 Code 升序（B431-3 契约）」。
 func TestListProviders(t *testing.T) {
+	provider, ok := Get("dnspod")
+	if !ok || provider == nil {
+		t.Fatal("dnspod must be registered")
+	}
+	if provider.Code() != "dnspod" {
+		t.Fatalf("Get(dnspod).Code()=%q, want dnspod", provider.Code())
+	}
+	if _, ok := Get("no-such-provider"); ok {
+		t.Fatal("unknown provider code must not resolve")
+	}
 	list := List()
-	if len(list) != 1 {
-		t.Fatalf("expected 1 provider, got %d", len(list))
+	if len(list) == 0 {
+		t.Fatal("List() must not be empty")
+	}
+	found := false
+	for i, item := range list {
+		if item.Code() == "dnspod" {
+			found = true
+		}
+		if i > 0 && list[i-1].Code() > item.Code() {
+			t.Fatalf("List() codes=%v, want 按 Code 升序", []string{list[i-1].Code(), item.Code()})
+		}
+	}
+	if !found {
+		t.Fatalf("List() must include dnspod, got %d providers", len(list))
 	}
 }

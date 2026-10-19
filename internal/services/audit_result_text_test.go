@@ -164,3 +164,185 @@ func TestAuditResultText_dynamicClosureCodes(t *testing.T) {
 		t.Fatalf("blocked 渲染=%q，want 重试被阻止", got)
 	}
 }
+
+// —— 审计来源码渲染（V87-TO-01，历史）——
+
+// scanAuditSourceLiterals 扫描 internal/ 非测试源码中给定函数的**字面量**首参，
+// 返回 字面量 → 首处位置。
+func scanAuditSourceLiterals(t *testing.T, funcs map[string]struct{}) map[string]string {
+	t.Helper()
+	root, err := filepath.Abs(filepath.Join("..", "..", "internal"))
+	if err != nil {
+		t.Fatalf("resolve internal dir: %v", err)
+	}
+	found := map[string]string{}
+	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		fset := token.NewFileSet()
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			t.Errorf("parse %s: %v", path, perr)
+			return nil
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || len(call.Args) == 0 {
+				return true
+			}
+			var name string
+			switch fn := call.Fun.(type) {
+			case *ast.SelectorExpr:
+				name = fn.Sel.Name
+			case *ast.Ident:
+				name = fn.Name
+			}
+			if _, wanted := funcs[name]; !wanted {
+				return true
+			}
+			lit, ok := call.Args[0].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			value, uerr := strconv.Unquote(lit.Value)
+			if uerr != nil {
+				return true
+			}
+			if _, seen := found[value]; !seen {
+				found[value] = fset.Position(call.Pos()).String()
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk internal: %v", err)
+	}
+	return found
+}
+
+// hasASCIILetter 报告 s 是否含 ASCII 字母（区分「内部来源码」与「已中文化
+// 字面量」——handlers 侧存在直接传中文展示串的调用点，如「保存前测试」）。
+func hasASCIILetter(s string) bool {
+	for i := range s {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			return true
+		}
+	}
+	return false
+}
+
+// V87-TO-01：来源码字面量覆盖钉（与 TestAuditResultText_literalArgsCovered 对称）。
+// 扫描 AuditSourcePart 的字面量实参以及两条把首参直接转发给它的链
+// （recordSystemReloadAudit / txReloadDetail）——每个含 ASCII 字母的字面量必须
+// 在 auditSourceTextMap 有中文映射，否则落 default 渲染英文内部标识
+// （runtime_reconcile/runtime_sweep/promote_or_startup 曾如此）。
+func TestAuditSourcePart_literalArgsCovered(t *testing.T) {
+	found := scanAuditSourceLiterals(t, map[string]struct{}{
+		"AuditSourcePart":         {},
+		"recordSystemReloadAudit": {},
+		"txReloadDetail":          {},
+	})
+	missing := make([]string, 0, len(found))
+	for value, pos := range found {
+		if !hasASCIILetter(value) {
+			continue // 已中文化的展示串（不经码表）
+		}
+		if _, ok := auditSourceTextMap[value]; !ok {
+			missing = append(missing, strconv.Quote(value)+" @ "+pos)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Fatalf("来源码缺中文映射（请在 auditSourceTextMap 补齐）:\n  %s", strings.Join(missing, "\n  "))
+	}
+}
+
+// V87-TO-01：动态实参（变量/表达式）不在字面量扫描范围——新增动态入口必须
+// 同步审查取值域。这里钉住当前动态调用点数量：新增即红。
+func TestAuditSourcePart_dynamicCallSitesTripwire(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", "..", "internal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dynamic := 0
+	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		fset := token.NewFileSet()
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			t.Errorf("parse %s: %v", path, perr)
+			return nil
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || len(call.Args) == 0 {
+				return true
+			}
+			var name string
+			switch fn := call.Fun.(type) {
+			case *ast.SelectorExpr:
+				name = fn.Sel.Name
+			case *ast.Ident:
+				name = fn.Name
+			}
+			if name != "AuditSourcePart" {
+				return true
+			}
+			if _, ok := call.Args[0].(*ast.BasicLit); !ok {
+				dynamic++
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 当前动态入口：recordSystemReloadAudit 内 2 处（失败/成功）、txReloadDetail
+	// 1 处（handlers）、renewExpiringCertificates 的 source 变量 1 处。
+	const want = 4
+	if dynamic != want {
+		t.Fatalf("AuditSourcePart 动态调用点=%d，want %d：新增动态入口必须审查取值域并更新本绊线", dynamic, want)
+	}
+}
+
+// V87-TO-01：内部来源码必须渲染中文（映射值不得回显内部码）。
+func TestAuditSourcePart_internalCodesRenderChinese(t *testing.T) {
+	want := map[string]string{
+		"runtime_reconcile":  "来源：运行时对账",
+		"runtime_sweep":      "来源：运行时清扫",
+		"promote_or_startup": "来源：升主或启动补建",
+	}
+	for code, expected := range want {
+		if got := AuditSourcePart(code); got != expected {
+			t.Errorf("AuditSourcePart(%q)=%q, want %q", code, got, expected)
+		}
+	}
+	for code, text := range auditSourceTextMap {
+		if strings.Contains(text, code) {
+			t.Errorf("映射值 %q → %q 仍含内部来源码（渲染仍中英混杂）", code, text)
+		}
+		if !strings.HasPrefix(text, "来源：") {
+			t.Errorf("映射值 %q → %q 缺「来源：」前缀（详情段口径）", code, text)
+		}
+	}
+	// 动态取值域（certificates.go renewExpiringCertificates / txReloadDetail /
+	// recordSystemReloadAudit 调用方）必须在表内。
+	for _, code := range []string{
+		"renewal", "first_issuance_retry",
+		"rule_create", "rule_update", "rule_delete", "rule_enable", "rule_disable",
+		"certificate_issued", "crs_update", "threat_update", "ip2region_update", "autoban",
+	} {
+		if _, ok := auditSourceTextMap[code]; !ok {
+			t.Errorf("动态来源码 %q 缺映射（落 default 渲染英文）", code)
+		}
+	}
+	if got := AuditSourcePart("unknown_source_code"); got != "来源：unknown_source_code" {
+		t.Errorf("未知来源码必须原样兜底（便于定位漏映射）, got %q", got)
+	}
+}

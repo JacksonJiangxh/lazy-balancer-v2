@@ -117,10 +117,12 @@ export function nextAdaptiveSampleN(current: number, observedRate: number): numb
 export interface AdaptiveSampleState {
   /** 当前生效档位（1/4/8） */
   active: number
-  /** 已连续确认的同向采样次数 */
+  /** 已连续确认的**同一目标**采样次数 */
   stable: number
   /** 上次换档时刻（ms；0=尚未换过档） */
   lastSwitch: number
+  /** 正在累计确认的目标档位（0=尚未累计）。目标变化即视为方向反转，计数重来。 */
+  pendingTarget?: number
 }
 
 export interface AdaptiveSampleOutcome extends AdaptiveSampleState {
@@ -128,8 +130,11 @@ export interface AdaptiveSampleOutcome extends AdaptiveSampleState {
 }
 
 /**
- * 自适应采样单步状态机：连续 2 次采样同向且距上次换档 ≥4s 才换档。
- * 目标与当前一致时清空确认计数（但保留上次换档时刻——回摆同样受 4s 门约束）。
+ * 自适应采样单步状态机：连续 2 次采样**同向**且距上次换档 ≥4s 才换档。
+ * 同向=两次采样算出的目标档位一致（`pendingTarget`）；目标改变（含高→低反转）
+ * 时确认计数从 1 重新累计——只按次数累加会把「突发一次+骤停一次」误判为
+ * 连续确认（WT87-06）。目标与当前一致时清空确认计数（但保留上次换档时刻——
+ * 回摆同样受 4s 门约束）。
  */
 export function stepAdaptiveSample(state: AdaptiveSampleState, observedRate: number, now: number): AdaptiveSampleOutcome {
   if (state.active !== 1 && state.active !== 4 && state.active !== 8) {
@@ -137,13 +142,13 @@ export function stepAdaptiveSample(state: AdaptiveSampleState, observedRate: num
   }
   const target = nextAdaptiveSampleN(state.active, observedRate)
   if (target === state.active) {
-    return { active: state.active, stable: 0, lastSwitch: state.lastSwitch, changed: false }
+    return { active: state.active, stable: 0, pendingTarget: 0, lastSwitch: state.lastSwitch, changed: false }
   }
-  const stable = state.stable + 1
+  const stable = state.pendingTarget === target ? state.stable + 1 : 1
   if (stable >= ADAPTIVE_SAMPLE_CONFIRM_SAMPLES && now - state.lastSwitch >= ADAPTIVE_SAMPLE_MIN_SWITCH_INTERVAL_MS) {
-    return { active: target, stable: 0, lastSwitch: now, changed: true }
+    return { active: target, stable: 0, pendingTarget: 0, lastSwitch: now, changed: true }
   }
-  return { active: state.active, stable, lastSwitch: state.lastSwitch, changed: false }
+  return { active: state.active, stable, pendingTarget: target, lastSwitch: state.lastSwitch, changed: false }
 }
 
 /** 按 region + 秒桶分组；保持输入顺序，供光流和弹框共同消费。 */

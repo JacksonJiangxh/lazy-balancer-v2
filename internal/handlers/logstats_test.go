@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,29 +13,19 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 	"lazy-balancer-v2/internal/taskengine"
 )
 
 func TestLogRotatedBackups_matchServiceWriters(t *testing.T) {
-	// 跨包常量未导出时的契约钉（直接读取生产源，不用 /tmp 副本）：services
-	// 写侧改保留份数时，本测试迫使读侧常量与六处展示同步更新。
-	if logRotatedBackups != 5 {
-		t.Fatalf("handler logRotatedBackups=%d, want 5", logRotatedBackups)
+	// H-B1-08（历史）：契约以服务端导出的数值钉住（此前读取 services 源码
+	// 文本——常量改类型/加注释/第三个 writer 出现时会误红或漏验）。写侧与
+	// 展示层的保留份数必须同源同值。
+	if logRotatedBackups != services.CertJobLogMaxRotatedFiles() {
+		t.Fatalf("handler logRotatedBackups=%d, services 写侧=%d", logRotatedBackups, services.CertJobLogMaxRotatedFiles())
 	}
-	certSource, err := os.ReadFile("../services/certjoblog.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(certSource), "const maxRotatedFiles = 5") {
-		t.Fatal("services certjob maxRotatedFiles drifted from handler retention")
-	}
-	caddySource, err := os.ReadFile("../services/caddy.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	matches := regexp.MustCompile(`roll_keep"?:\s*5`).FindAllString(string(caddySource), -1)
-	if len(matches) != 2 {
-		t.Fatalf("services Caddy roll_keep=5 sites=%d, want 2", len(matches))
+	if logRotatedBackups != services.CaddyLogRollKeep() {
+		t.Fatalf("handler logRotatedBackups=%d, Caddy 日志 roll_keep=%d", logRotatedBackups, services.CaddyLogRollKeep())
 	}
 }
 
@@ -445,5 +434,65 @@ func TestGetLogStats_aggregateCountsRotationsAndGzAsArchive(t *testing.T) {
 	}
 	if row.RotatedBytes != 80 || row.RotatedCount != 2 {
 		t.Errorf("rotated=%d/%d, want 80/2（移位副本 + .gz 归档）", row.RotatedBytes, row.RotatedCount)
+	}
+}
+
+// 历史问题-08（历史）：审计日志路径随 ConfigureWafDirs 按 data_dir 派生，
+// 而 handlers 包 init 早于 main 的派生调用——包级固化会指向陈旧的 /app 路径。
+// 解析必须运行期进行：注入值优先，否则取 services.AuditLogPath()。
+func TestResolvedWafAuditLogFile_tracksDerivedPath(t *testing.T) {
+	oldWafLog := wafAuditLogFile
+	t.Cleanup(func() { wafAuditLogFile = oldWafLog })
+
+	wafAuditLogFile = ""
+	if got, want := resolvedWafAuditLogFile(), services.AuditLogPath(); got != want {
+		t.Fatalf("空注入值必须跟随 services.AuditLogPath(): got=%q want=%q", got, want)
+	}
+	injected := filepath.Join(t.TempDir(), "audit.log")
+	wafAuditLogFile = injected
+	if got := resolvedWafAuditLogFile(); got != injected {
+		t.Fatalf("注入值必须优先: got=%q want=%q", got, injected)
+	}
+}
+
+// H-B1-04：单行轮询（?key=certjob）不得读取与所选行无关的配置列。
+func TestGetLogStats_singleRowRequestSkipsUnrelatedConfigReads(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	probe := &prepareProbe{}
+	wrapHandlerDBWithProbe(t, probe)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/logs/stats", h.GetLogStats)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/logs/stats?key=certjob", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	for _, column := range []string{"audit_retention_months", "security_events_retention_days", "security_events_row_cap"} {
+		if count := probe.count(column); count != 0 {
+			t.Errorf("%s 在单行请求下被读取 %d 次, want 0（阈值必须按 want 门控）", column, count)
+		}
+	}
+	if probe.count("task_log_size_mb") != 1 {
+		t.Errorf("task_log_size_mb 读取次数=%d, want 1（所选行的阈值仍需一次）", probe.count("task_log_size_mb"))
+	}
+
+	// 回归形态：全量请求仍读且只读一次（安全事件策略一次查询同时取两列）。
+	full := &prepareProbe{}
+	wrapHandlerDBWithProbe(t, full)
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/logs/stats", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("full status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if count := full.count("security_events_retention_days"); count != 1 {
+		t.Errorf("全量请求 security_events_retention_days 读取 %d 次, want 1", count)
+	}
+	if count := full.count("security_events_row_cap"); count != 1 {
+		t.Errorf("全量请求 security_events_row_cap 读取 %d 次, want 1", count)
+	}
+	if count := full.count("audit_retention_months"); count != 1 {
+		t.Errorf("全量请求 audit_retention_months 读取 %d 次, want 1", count)
 	}
 }

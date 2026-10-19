@@ -23,6 +23,10 @@ import (
 
 var wafDir = "/app/waf"
 
+// wafDistDir 镜像内 WAF 发行版目录（CRS 树/xdb/爬虫种子的兜底来源）。
+// ConfigureWafDirs 随 data_dir 派生（SS87-历史问题）。
+var wafDistDir = "/app/waf.dist"
+
 // OverrideThreatWafDirForTest 测试注入临时 waf 目录（macOS 无 /app）。
 func OverrideThreatWafDirForTest(dir string) (restore func()) {
 	old := wafDir
@@ -166,15 +170,25 @@ func SetThreatProjectionRefresher(fn func() (IPListProjectionOutcome, error)) {
 // StartUpdate 异步启动更新任务（单实例在飞）；返回完成通道。rc 语义同 CRS。
 func (m *ThreatUpdateManager) StartUpdate(trigger string, rc *taskengine.RunContext) (chan struct{}, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.running {
+		m.mu.Unlock()
 		return nil, ErrThreatUpdateRunning
 	}
 	m.running = true
+	// SSA-87-06 同族（SS87-历史问题 家族收敛，历史）：可取消 ctx 与 running
+	// 在同一临界区登记——StartUpdate 返回后立刻 CancelRunning（任务引擎
+	// CancelHook／前端连点／自动化脚本）必须命中，不得因 run goroutine 尚未
+	// 执行而读到 runCancel==nil（首次）或上一轮的陈旧 cancel（非首次）静默
+	// 失效/取消错轮。CRS/IP2Region 已同形收敛。
+	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
+	m.runCancel = runCancel
 	done := make(chan struct{})
+	m.mu.Unlock()
+
 	go func() {
 		defer close(done)
-		m.run(trigger, rc)
+		defer runCancel()
+		m.runWithContext(runCtx, trigger, rc)
 		m.mu.Lock()
 		m.running = false
 		m.mu.Unlock()
@@ -219,8 +233,8 @@ type threatSourceRow struct {
 func threatDueSources(trigger string) ([]threatSourceRow, error) {
 	// 源名由内置名单注册表驱动：未来新增源只需扩充注册表与源表种子，
 	// 不再复制第三份硬编码名单；未注册的历史爬虫源仍不会混入威胁任务。
-	args := make([]any, 0, len(db.ThreatSystemLists))
-	for _, source := range db.ThreatSystemLists {
+	args := make([]any, 0, len(db.ThreatSystemLists()))
+	for _, source := range db.ThreatSystemLists() {
 		if source.Source != "" {
 			args = append(args, source.Source)
 		}
@@ -277,7 +291,21 @@ func threatListEmpty(source string) bool {
 	return threatIplistMissing(source) || threatFastUnusable(source)
 }
 
+// run 同步执行（测试/内部直调路径）：自建可取消 ctx 并登记 runCancel；
+// 生产入口经 StartUpdate 预建 ctx（SSA-87-06 同族 SS87-历史问题——取消能力不得
+// 晚于 StartUpdate 返回才就绪）。
 func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
+	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
+	defer runCancel()
+	m.mu.Lock()
+	m.runCancel = runCancel
+	m.mu.Unlock()
+	m.runWithContext(runCtx, trigger, rc)
+}
+
+// runWithContext 是更新管线本体；runCtx 由调用方创建（StartUpdate 或 run），
+// 生命周期归还调用方。
+func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger string, rc *taskengine.RunContext) {
 	operator := "system"
 	if rc != nil && rc.Operator != "" {
 		operator = rc.Operator
@@ -304,19 +332,11 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	// 历史问题（历史）：本轮四个状态字段在角色门之前初始化——旧实现 skipped
 	// 早退只写 lastFinishedAt/lastTaskOutcome，status 端点会展示上一成功轮的
 	// trigger/start/cancelled，四个字段不同轮（自相矛盾）。
-	runBase := context.Background()
-	if rc != nil && rc.Ctx != nil {
-		runBase = rc.Ctx
-	}
-	// F-历史问题-01（历史）：runCtx 派生自 rc.Ctx——引擎 demote 中止随 rc.Ctx
-	// 传播；nil rc（测试/内部路径）回退 Background 保持旧语义。
-	runCtx, runCancel := context.WithCancel(runBase)
+	// runCtx 由调用方创建（StartUpdate 预建并登记取消 / run 同步自建）。
 	m.mu.Lock()
 	m.lastTrigger = trigger
 	m.lastStartedAt = time.Now().UTC().Format(crsTimeLayout)
-	m.runCancel = runCancel
 	m.mu.Unlock()
-	defer runCancel()
 	// 起点角色复查（历史 历史问题，历史问题 家族收敛）：调度器 tick 的 is_master
 	// 守卫与更新启动之间存在 demote 竞态窗口——从节点继续执行会写
 	// security_ip_lists 并触发重载，打破只读不变量。NULL 兜底归一为 1（同
@@ -347,7 +367,7 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		return
 	}
 	AppendThreatUpdateLog("INFO", "checking", fmt.Sprintf("开始更新威胁情报库（%d 个启用源）", len(sources)))
-	var changedIDs []int // 内容真实变化的名单 id（收敛分支的判定面）
+	anyChanged := false // 内容真实变化的源存在（收敛分支的判定面）
 	anyFailed := false
 	cancelled := false
 	demoted := false // F-历史问题-01：demote 在途中止标记（outcome=skipped，优先于 cancelled/failed）
@@ -366,11 +386,10 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 			break
 		}
 		changed, failed := m.updateOneSource(runCtx, source, trigger, runStartedAt)
-		if changed {
-			if id := threatListIDBySource(source.name); id > 0 {
-				changedIDs = append(changedIDs, id)
-			}
-		}
+		// SSA-87-11（历史）：判定面只需「是否有源变化」。旧实现逐源查
+		// 一次名单 id 只被 len() 消费（元素从不读取），且 id 查询失败时该源的
+		// 变化被静默排除出收敛面——纯冗余 + 可观测性缺口，查询已删除。
+		anyChanged = anyChanged || changed
 		anyFailed = anyFailed || failed
 	}
 	// 中止点归一（F-历史问题-01）：末源在途取消时循环自然结束（无下一轮顶部
@@ -404,7 +423,7 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	// 漏判）：内容变化即全量渲染（投影重写为渲染副作用），结构级比对证实
 	// 零发射面变化 → 零 /load，天然覆盖一切引用形态；未被引用的变化同样是
 	// 「渲染证实无发射面 → 零重载」，成本=一次毫秒级渲染+比对。
-	if len(changedIDs) == 0 {
+	if !anyChanged {
 		AppendThreatUpdateLog("INFO", "unchanged", "全部源名单内容未变化，不重载 Caddy 配置")
 	} else if threatProjectionRefresher == nil {
 		// 未注册热路径（测试二进制/异常装配）：名单文件已更新，引用方投影
@@ -428,15 +447,6 @@ func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 		Logf("info", "威胁情报库: 名单内容变化经投影热路径收敛（零 Caddy 重载，匹配器 ≤1s 热感知生效）")
 		AppendThreatUpdateLog("INFO", "hot", "名单内容变化经投影热路径收敛（零重载，匹配器 ≤1s 热感知生效）")
 	}
-}
-
-// threatListIDBySource 源名 → 内置名单 id（缺失=0）。
-func threatListIDBySource(source string) int {
-	var id int
-	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=?`, db.ThreatListNameBySource(source)).Scan(&id); err != nil {
-		return 0
-	}
-	return id
 }
 
 // IPListsReferencedByEnabledPolicy 名单写路径热路径资格判定（2026-10-15 用户
@@ -755,7 +765,7 @@ func writeThreatSystemList(source string, entries []string) (bool, error) {
 }
 
 func threatListDescription(source string) string {
-	for _, sl := range db.ThreatSystemLists {
+	for _, sl := range db.ThreatSystemLists() {
 		if sl.Source == source {
 			return sl.Description
 		}

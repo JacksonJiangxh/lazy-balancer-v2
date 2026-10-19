@@ -4030,3 +4030,82 @@ func TestSecurityEventsSerializeHeaders_manyHeadersDroppedConsistently(t *testin
 		t.Fatal("small Host header should be kept")
 	}
 }
+
+// BenchmarkSecurityEventsLoadMappingsReferencedThreatList 量化「有事件流量时
+// 每 2s tick 重建全部映射」的成本上界：20 万条威胁名单文本（单源上限量级）
+// + N 条引用它的 deny 策略，并单列文件读取与聚合两个分项。
+//
+// 实测（Apple M4 Max，10x）：readList=200k ≈ 4.6ms/次，aggregate=200k ≈
+// 19ms/次；mappings 在策略数 1→10（同一名单、来源列相同）时保持 ≈23ms/次
+// ——按来源列去重展开（resolvePolicyIPListRefs 的 expandMemo）之前为
+// 183ms/次（每策略各聚合一次）。剩余成本 = 每 tick 一次读文件+聚合，占 2s
+// tick 预算约 1.1%，且仅在确有新事件字节的 tick 才加载（空闲 tick 已提前
+// 返回）；名单规模上限 20 万条/源由设计钉死。
+func BenchmarkSecurityEventsLoadMappingsReferencedThreatList(b *testing.B) {
+	entries := make([]string, 0, 200000)
+	for i := range 200000 {
+		entries = append(entries, fmt.Sprintf("10.%d.%d.0/24", (i/250)%256, i%250))
+	}
+	iplistPath := filepath.Join(b.TempDir(), "threat-ustc.iplist")
+	if err := os.WriteFile(iplistPath, []byte(strings.Join(entries, "\n")+"\n"), 0o644); err != nil {
+		b.Fatal(err)
+	}
+
+	b.Run("readList=200k", func(b *testing.B) {
+		for b.Loop() {
+			if _, err := readThreatIplistPath(iplistPath); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("aggregate=200k", func(b *testing.B) {
+		for b.Loop() {
+			aggregateIPEntries(entries)
+		}
+	})
+
+	for _, policyCount := range []int{1, 10} {
+		b.Run(fmt.Sprintf("mappings/policies=%d", policyCount), func(b *testing.B) {
+			oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+			dataDir := b.TempDir()
+			if err := db.Initialize(dataDir); err != nil {
+				b.Fatal(err)
+			}
+			if err := db.InitializeMetricsDB(dataDir); err != nil {
+				b.Fatal(err)
+			}
+			restoreWaf := OverrideThreatWafDirForTest(b.TempDir())
+			b.Cleanup(func() {
+				restoreWaf()
+				_ = db.Close()
+				db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+			})
+			if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte(strings.Join(entries, "\n")+"\n"), 0o644); err != nil {
+				b.Fatal(err)
+			}
+			listName := db.ThreatListNameBySource("ustc")
+			res, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at)
+				VALUES (?, 'bench', '恶意 IP', '', 1, datetime('now'), datetime('now'))`, listName)
+			if err != nil {
+				b.Fatal(err)
+			}
+			listID, err := res.LastInsertId()
+			if err != nil {
+				b.Fatal(err)
+			}
+			for i := range policyCount {
+				if _, err := db.DB.Exec(`INSERT INTO security_policies (id, name, mode, ip_acl_enabled, ip_acl_mode, ip_acl_list_refs, policy_type, enabled)
+					VALUES (?, ?, 'blocking', 1, 'deny', ?, 'stage1', 1)`, 8700+i, fmt.Sprintf("bench-%d", i), fmt.Sprintf("[%d]", listID)); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			b.ResetTimer()
+			for b.Loop() {
+				if _, _, _, err := securityEventsLoadMappings(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

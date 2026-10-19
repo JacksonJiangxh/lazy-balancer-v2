@@ -79,14 +79,14 @@ func TestUserResponse_serializes_nullable_fields_as_values_or_null(t *testing.T)
 	}
 
 	// When
-	data, err := json.Marshal([]UserResponse{NewUserResponse(users[0]), NewUserResponse(users[1])})
+	data, err := json.Marshal([]UserResponse{NewUserResponse(users[0], true), NewUserResponse(users[1], false)})
 
 	// Then
 	if err != nil {
 		t.Fatalf("marshal user responses: %v", err)
 	}
 	jsonBody := string(data)
-	for _, expected := range []string{`"display_name":"Alice"`, `"last_login":"2026-07-30T02:02:03Z"`, `"display_name":null`, `"last_login":null`} {
+	for _, expected := range []string{`"display_name":"Alice"`, `"last_login":"2026-07-30T02:02:03Z"`, `"display_name":null`, `"last_login":null`, `"mfa_enabled":true`, `"mfa_enabled":false`} {
 		if !strings.Contains(jsonBody, expected) {
 			t.Fatalf("UserResponse JSON=%s, want %s", jsonBody, expected)
 		}

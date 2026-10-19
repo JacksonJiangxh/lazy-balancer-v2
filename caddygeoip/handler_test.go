@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -389,6 +390,43 @@ func TestParseGeoIPRegion_trimsCountryForEmission(t *testing.T) {
 	}
 	if _, ok := parseGeoIPRegion("中国|广东省"); ok {
 		t.Fatal("截断行（<5 列）必须拒绝发射")
+	}
+}
+
+// TestParseGeoIPRegion_noCityWithoutProvince（PL历史问题 核实结论）：随包三份
+// xdb（caddygeoip/testdata、data/、data-slave/，各 553,954+ 段全量扫描）中
+// 「国家=中国 + 省列无效 + 城市列有效」的行数为 0——省列无效的 13 种 region
+// 串（如「中国|0|0|阿里|CN」）城市列同为 0/空。因此不会发射树侧不可表达的
+// 「/城市」Loc 值：省无效行 Loc 为空（省/城市规则均不命中，与树不变式一致），
+// 台湾城市误置省列的行由 ProvinceForEmit 归一为台湾省，仍落「省/城市」形态。
+func TestParseGeoIPRegion_noCityWithoutProvince(t *testing.T) {
+	cases := []struct {
+		region   string
+		wantProv string
+		wantCity string
+		wantLoc  string
+	}{
+		// 真实形态（xdb 中的 13 种省无效行同族）：ISP 可识别、省市均无效。
+		{"中国|0|0|阿里|CN", "", "", ""},
+		{"中国|0|0|0|CN", "", "", ""},
+		{"中国|0|0|中国移动|CN", "", "", ""},
+		// 台湾城市误置省列：省列归一为台湾省（树侧同样挂到台湾省下）。
+		{"中国|台中市|0|0|CN", "台湾省", "台中市", "台湾省/台中市"},
+	}
+	for _, tc := range cases {
+		got, ok := parseGeoIPRegion(tc.region)
+		if !ok {
+			t.Fatalf("parseGeoIPRegion(%q) rejected", tc.region)
+		}
+		if got.Province != tc.wantProv || got.City != tc.wantCity || got.Loc != tc.wantLoc {
+			t.Errorf("parseGeoIPRegion(%q) = {prov:%q city:%q loc:%q}; want {%q %q %q}",
+				tc.region, got.Province, got.City, got.Loc, tc.wantProv, tc.wantCity, tc.wantLoc)
+		}
+		// 树侧不变式（ip2region.go 中 prov=="" → continue）保证省无效行不会
+		// 出现在选项树里；发射侧因此不得产生以 "/" 开头的 Loc。
+		if strings.HasPrefix(got.Loc, "/") {
+			t.Fatalf("parseGeoIPRegion(%q).Loc=%q must not start with '/' (unrepresentable in the policy tree)", tc.region, got.Loc)
+		}
 	}
 }
 

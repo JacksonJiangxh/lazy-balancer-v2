@@ -1238,7 +1238,7 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 	}
 	// top_targets：前 3 被攻击目标（历史 历史问题：读分钟 rollup 的目标
 	// 维度，与 total/国家同窗口；原始表受保留期/行帽裁剪，不能作为旁路）
-	topTargets, terr := threatTopTargets(sinceMinute, hours)
+	topTargets, terr := threatTopTargets(sinceMinute)
 	trackErr(terr)
 	if firstErr != nil {
 		services.Logf("error", "threat-screen query failed: %v", firstErr)

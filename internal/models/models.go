@@ -36,12 +36,18 @@ type UserResponse struct {
 	LastLogin    *time.Time `json:"last_login"`
 }
 
-func NewUserResponse(user User) UserResponse {
+// NewUserResponse 构造用户响应。mfaEnabled 必须由调用方从 users.mfa_enabled
+// 读取后传入：CI87-08（历史）将原本「构造后手工 response.MFAEnabled=…」
+// 的口径收敛为签名参数——历史 历史问题 十次/B1-历史问题 两次都因新增返回路径忘记
+// 补字段导致 mfa_enabled 恒 false（前端登录预检误报）。签名强制让遗漏在
+// 编译期失败，而不是静默返回错误值。
+func NewUserResponse(user User, mfaEnabled bool) UserResponse {
 	response := UserResponse{
 		ID:           user.ID,
 		Username:     user.Username,
 		Role:         user.Role,
 		IsEnabled:    user.IsEnabled,
+		MFAEnabled:   mfaEnabled,
 		CreatedAt:    user.CreatedAt,
 		AuthProvider: user.AuthProvider,
 	}
@@ -411,10 +417,14 @@ type CertJob struct {
 	UpdatedAt        JSONNullTime `json:"updated_at"`
 }
 
-// Request/Response types
+// LoginRequest 登录入参。历史问题（历史）：username/password 补长度上限——
+// 此前仅 required，未认证请求可携带 ~64KiB「用户名」，失败登录按原文写入
+// audit_log（每次一行等大，限流 10/min/IP 可被分布式绕开，放大审计库）。
+// 上限与写入侧对齐：username=users.username 列宽 50；password=bcrypt 有效
+// 上限 72 字节（更长值永远无法匹配任何已存哈希）。
 type LoginRequest struct {
-	Username string `json:"username" binding:"required"`
-	Password string `json:"password" binding:"required"`
+	Username string `json:"username" binding:"required,max=50"`
+	Password string `json:"password" binding:"required,max=72"`
 }
 
 type LoginResponse struct {
@@ -677,8 +687,10 @@ type SystemInfo struct {
 	CaddyVersion  string            `json:"caddy_version"`
 	RunningStatus string            `json:"running_status"`
 	Uptime        int64             `json:"uptime"`
-	NodeMode      string            `json:"node_mode"`
-	Version       string            `json:"version"`
+	// NodeMode 三态：master / slave / unknown（unknown=角色查询失败或库未装配，
+	// 历史 HC-11——不得把查询失败静默呈现为 master 误导排障）。
+	NodeMode string `json:"node_mode"`
+	Version  string `json:"version"`
 }
 
 // SystemMetrics contains system resource usage

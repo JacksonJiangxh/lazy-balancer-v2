@@ -16,6 +16,7 @@
           :status="status"
           :loading="clusterModeChanging"
           :registration-request="registrationRequest"
+          :registration-succeeded="registrationSucceeded"
           :read-only="isReadOnlyProp"
           :interval-saving="intervalSaving"
           @register="registerAsSlave"
@@ -230,6 +231,9 @@ const nodeConfigDialogVisible = ref(false)
 const editingNodeConfig = ref<ClusterNode | null>(null)
 const nodeConfigSaving = ref(false)
 const registrationRequest = ref(0)
+// WS-17：注册请求被主节点受理后递增——子组件据此清空已消耗的一次性令牌
+//（取消确认或请求失败时令牌仍可能有效，必须保留）。
+const registrationSucceeded = ref(0)
 const tokenDialogVisible = ref(false)
 
 const serviceControlDialogVisible = ref(false)
@@ -268,18 +272,24 @@ const openServiceControlDialog = (node: ClusterNode): void => {
 }
 
 const executeServiceControl = async (): Promise<void> => {
+  if (isReadOnlyProp.value) return
   if (!serviceControlNode.value || !serviceControlAction.value) return
-  // 2026-09-20 用户裁定:执行服务控制前必须二次确认(停止 Caddy/重启应用
-  // 会中断从节点服务),复用本文件 confirmAction(与清除指纹钉同格)。
-  const option = serviceControlOptions.find((o) => o.value === serviceControlAction.value)
-  const nodeName = serviceControlNodeLive.value?.name ?? `#${serviceControlNode.value.id}`
-  const confirmed = await confirmAction(
-    `确定对节点“${nodeName}”执行「${option?.label ?? serviceControlAction.value}」吗？${option?.description ?? ''}`,
-    '服务控制确认',
-  )
-  if (!confirmed) return
+  // WS-04：占位先于确认——双击「执行操作」不再叠加两个确认框/重复下发。
+  if (serviceControlLoading.value) {
+    ElMessage.warning('服务控制请求正在执行，请稍候')
+    return
+  }
   serviceControlLoading.value = true
   try {
+    // 2026-09-20 用户裁定:执行服务控制前必须二次确认(停止 Caddy/重启应用
+    // 会中断从节点服务),复用本文件 confirmAction(与清除指纹钉同格)。
+    const option = serviceControlOptions.find((o) => o.value === serviceControlAction.value)
+    const nodeName = serviceControlNodeLive.value?.name ?? `#${serviceControlNode.value.id}`
+    const confirmed = await confirmAction(
+      `确定对节点“${nodeName}”执行「${option?.label ?? serviceControlAction.value}」吗？${option?.description ?? ''}`,
+      '服务控制确认',
+    )
+    if (!confirmed) return
     await request.post(`/cluster/nodes/${serviceControlNode.value.id}/service`, { action: serviceControlAction.value })
     serviceControlDialogVisible.value = false
     serviceControlPinMismatch.value = false
@@ -300,14 +310,15 @@ const executeServiceControl = async (): Promise<void> => {
 // 成功后留在弹框内便于直接重试服务控制。
 const forgetNodePin = async (): Promise<void> => {
   const node = serviceControlNodeLive.value
-  if (!node || nodePinForgetting.value) return
-  const confirmed = await confirmAction(
-    `确定清除对节点“${node.name}”的证书指纹钉吗？下次服务控制将按该节点当前证书重新验证并钉扎。`,
-    '清除节点证书指纹',
-  )
-  if (!confirmed) return
+  if (isReadOnlyProp.value || !node || nodePinForgetting.value) return
+  // WS-04：占位先于确认（原确认后才置位——双击叠加确认框/重复请求）
   nodePinForgetting.value = true
   try {
+    const confirmed = await confirmAction(
+      `确定清除对节点“${node.name}”的证书指纹钉吗？下次服务控制将按该节点当前证书重新验证并钉扎。`,
+      '清除节点证书指纹',
+    )
+    if (!confirmed) return
     const response = await request.post<ActionResponse>(`/cluster/nodes/${node.id}/forget-pin`)
     mfaAwareSuccess(response.message || '已清除该节点的证书指纹，下次服务控制将按其当前证书重新钉扎')
     serviceControlPinMismatch.value = false
@@ -390,6 +401,7 @@ const registerAsSlave = async (input: ClusterRegistrationInput): Promise<void> =
     if (!confirmed) return
     await request.post<APIResponse<ClusterModeResult>>('/cluster/mode', { mode: 'slave', ...input })
     mfaAwareSuccess('注册请求已提交，等待主节点审批')
+    registrationSucceeded.value += 1
     await clusterPolling.run()
   } catch (error: unknown) {
     // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
@@ -419,11 +431,17 @@ const promoteToMaster = async (): Promise<void> => {
 }
 
 const syncNow = async (): Promise<void> => {
-  if (isReadOnlyProp.value || clusterModeChanging.value) return
-  const ok = await confirmAction('立即从主节点拉取并应用最新配置？', '手动同步')
-  if (!ok) return
+  if (isReadOnlyProp.value) return
+  // WS-04：占位先于确认——双击「立即同步」不再叠加确认框或重复拉取。
+  if (syncing.value) {
+    ElMessage.warning('同步请求正在执行，请稍候')
+    return
+  }
+  if (clusterModeChanging.value) return
   syncing.value = true
   try {
+    const ok = await confirmAction('立即从主节点拉取并应用最新配置？', '手动同步')
+    if (!ok) return
     // 历史问题-07：/cluster/sync/pull 同样含「拉快照 → 应用 → Caddy 重载」，与
     // Promote 同口径放大到 120s——沿用全局 30s 会在后端成功时先超时误报失败，
     // 诱导用户重复点击（后端可能仍在应用）。
@@ -445,19 +463,18 @@ const syncNow = async (): Promise<void> => {
 // （POST /cluster/forget-pins）后，下一同步周期按主节点当前证书重新验证并钉扎。
 const forgettingPins = ref(false)
 const forgetPins = async (): Promise<void> => {
-  if (isReadOnlyProp.value || forgettingPins.value) return
-  try {
-    await ElMessageBox.confirm(
-      '将清除本节点保存的全部主节点 TLS 证书指纹钉（TOFU），下一同步周期将按主节点当前证书重新验证并钉扎。是否继续？',
-      '清除证书指纹',
-      { confirmButtonText: '清除并重新钉扎', cancelButtonText: '取消', type: 'warning' },
-    )
-  } catch {
-    // 取消弹框：不做任何操作
+  if (isReadOnlyProp.value) return
+  // WS-04：占位先于确认（原确认后才置位——双击叠加确认框/重复请求）
+  if (forgettingPins.value) {
+    ElMessage.warning('清除指纹请求正在执行，请稍候')
     return
   }
   forgettingPins.value = true
   try {
+    if (!(await confirmAction(
+      '将清除本节点保存的全部主节点 TLS 证书指纹钉（TOFU），下一同步周期将按主节点当前证书重新验证并钉扎。是否继续？',
+      '清除证书指纹',
+    ))) return
     await request.post<ActionResponse>('/cluster/forget-pins')
     mfaAwareSuccess('已清除全部主节点证书指纹，下次同步将按当前证书重新钉扎')
     // 刷新状态：last_sync_error 的 pin_mismatch 将随下一同步周期成功而自清
@@ -507,20 +524,24 @@ const syncSwitchLabels: Record<string, string> = {
 
 const updateSyncField = async (field: string, value: boolean): Promise<void> => {
   if (isReadOnlyProp.value) return
-  const label = syncSwitchLabels[field] ?? field
-  const action = value ? '开启' : '关闭'
-  try {
-    await ElMessageBox.confirm(
-      `确定要${action}「${label}」的集群同步吗？${value ? '开启后主节点该类变更将同步到所有从节点。' : '关闭后从节点将保留本地数据，不再接收主节点该类变更。'}`,
-      '同步设置确认',
-      { confirmButtonText: action, cancelButtonText: '取消', type: 'warning' },
-    )
-  } catch {
-    await fetchStatus().catch((error: unknown) => console.error('Failed to refresh cluster status:', error))
+  // WS-04：占位先于确认（双击开关不再叠加确认框/重复 PUT）；取消路径回读状态
+  // 复位开关显示。
+  if (settingsLoading.value) {
+    ElMessage.warning('同步设置正在保存，请稍候')
     return
   }
+  const label = syncSwitchLabels[field] ?? field
+  const action = value ? '开启' : '关闭'
   settingsLoading.value = true
   try {
+    const confirmed = await confirmAction(
+      `确定要${action}「${label}」的集群同步吗？${value ? '开启后主节点该类变更将同步到所有从节点。' : '关闭后从节点将保留本地数据，不再接收主节点该类变更。'}`,
+      '同步设置确认',
+    )
+    if (!confirmed) {
+      await fetchStatus().catch((error: unknown) => console.error('Failed to refresh cluster status:', error))
+      return
+    }
     await request.put<ActionResponse>('/cluster/settings', { [field]: value })
     mfaAwareSuccess('同步设置已更新')
     await fetchStatus().catch((error: unknown) => console.error('Failed to refresh cluster status:', error))
@@ -548,9 +569,12 @@ const updateSyncInterval = async (value: number): Promise<void> => {
   }
 }
 
+// WS-04：「入口取占位 → 确认 → 请求 → finally 释放」。占位（pendingNodeId）必须
+// 先于确认弹框取得——原实现在确认之后才占位，双击审批/拒绝/删除会叠加两个确认框，
+// 确认第二个时动作被静默丢弃（用户以为已处理）。与 TaskMonitor.runTaskAction
+// （历史问题）同范式。
 const runNodeAction = async (node: ClusterNode, action: 'approve' | 'reject' | 'remove'): Promise<void> => {
-  if (isReadOnlyProp.value || pendingNodeId.value !== null) return
-  pendingNodeId.value = node.id
+  // 占位已由调用方取得；本函数只负责请求与释放。
   try {
     if (action === 'approve') {
       await request.post<ActionResponse>(`/cluster/nodes/${node.id}/approve`)
@@ -567,46 +591,45 @@ const runNodeAction = async (node: ClusterNode, action: 'approve' | 'reject' | '
     // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
     console.error('Failed to run node action:', error)
   } finally {
-    pendingNodeId.value = null
+    if (pendingNodeId.value === node.id) pendingNodeId.value = null
+  }
+}
+
+const confirmAndRunNodeAction = async (
+  node: ClusterNode,
+  action: 'approve' | 'reject' | 'remove',
+  message: string,
+  title: string,
+): Promise<void> => {
+  if (isReadOnlyProp.value) return
+  if (pendingNodeId.value !== null) {
+    ElMessage.warning('节点操作正在进行，请稍候')
+    return
+  }
+  pendingNodeId.value = node.id
+  try {
+    if (!(await confirmAction(message, title))) return
+    await runNodeAction(node, action)
+  } finally {
+    if (pendingNodeId.value === node.id) pendingNodeId.value = null
   }
 }
 
 // 历史问题 D-N1：审批是三个节点操作中安全面最大的「信任授予」动作（确认后外部节点
 // 入集群并开始同步），与拒绝/删除对称补二次确认，防 pending 列表误点。
-const approveNode = async (node: ClusterNode): Promise<void> => {
-  try {
-    const confirmed = await confirmAction(`确定确认节点“${node.name}”加入集群吗？确认后该节点将开始同步。`, '审批确认')
-    if (confirmed) await runNodeAction(node, 'approve')
-  } catch (error: unknown) {
-    // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
-    console.error('Failed to approve node:', error)
-  }
-}
+const approveNode = (node: ClusterNode): Promise<void> =>
+  confirmAndRunNodeAction(node, 'approve', `确定确认节点“${node.name}”加入集群吗？确认后该节点将开始同步。`, '审批确认')
 
 const requestRegistration = (): void => {
   if (isReadOnlyProp.value) return
   registrationRequest.value += 1
 }
 
-const rejectNode = async (node: ClusterNode): Promise<void> => {
-  try {
-    const confirmed = await confirmAction(`确定拒绝节点“${node.name}”吗？`, '拒绝确认')
-    if (confirmed) await runNodeAction(node, 'reject')
-  } catch (error: unknown) {
-    // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
-    console.error('Failed to reject node:', error)
-  }
-}
+const rejectNode = (node: ClusterNode): Promise<void> =>
+  confirmAndRunNodeAction(node, 'reject', `确定拒绝节点“${node.name}”吗？`, '拒绝确认')
 
-const removeNode = async (node: ClusterNode): Promise<void> => {
-  try {
-    const confirmed = await confirmAction(`确定删除节点“${node.name}”吗？删除后该节点将无法继续同步。`, '删除确认')
-    if (confirmed) await runNodeAction(node, 'remove')
-  } catch (error: unknown) {
-    // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
-    console.error('Failed to remove node:', error)
-  }
-}
+const removeNode = (node: ClusterNode): Promise<void> =>
+  confirmAndRunNodeAction(node, 'remove', `确定删除节点“${node.name}”吗？删除后该节点将无法继续同步。`, '删除确认')
 
 const loginNode = async (node: ClusterNode): Promise<void> => {
   if (isReadOnlyProp.value || node.status !== 'online' || loginNodeId.value !== null) return

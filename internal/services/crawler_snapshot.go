@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"lazy-balancer-v2/geoipnames"
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
@@ -23,24 +24,14 @@ func SetCrawlerIPListFileForTest(path string) func() {
 	return func() { crawlerIPListFile = old }
 }
 
-// crawlerBuiltinSnapshot 新实例内置首版（v2.3.8：官方源已核实的快照子集，
-// 新实例启动即用，无需等待首轮下载；后续由更新任务覆盖为最新官方数据）。
-var crawlerBuiltinSnapshot = map[string][]string{
-	"googlebot": {
-		"66.249.66.0/24", "66.249.67.0/24", "66.249.68.0/24", "66.249.69.0/24",
-	},
-	"gptbot": {
-		"23.98.142.0/24", "23.98.143.0/24", "20.191.0.0/16",
-	},
-	"bingbot": {
-		"157.55.39.0/24", "207.46.13.0/24", "40.77.167.0/24", "13.66.139.0/24",
-		"13.66.144.0/24", "52.167.144.0/24", "13.67.10.16/28", "13.69.66.240/28",
-		"13.71.172.224/28", "139.217.52.0/28", "191.233.204.0/24",
-	},
-	"so360spider": {
-		"42.236.8.0/21", "42.236.17.0/24", "42.236.101.0/24", "180.153.236.0/24", "180.163.220.0/24",
-	},
-}
+// crawlerBuiltinSnapshot 新实例内置首版（单一事实源见
+// geoipnames.BuiltinCrawlerIPLists：官方源快照随 geoipnames 包嵌入，镜像内
+// /app/waf.dist 的同名文件由 Dockerfile 从同一路径 COPY）。PD-04（历史）
+// 删除了此处的第二份手写副本——它曾与镜像种子分叉（gptbot 3 条 vs 18 条，
+// 且含官方已不发布的 20.191.0.0/16 超网）。消费点仅剩「收缩门基线」
+// （crawler_update.go 的 crawlerSnapshotShrinkGuard），运行期名单恒以 DB 为
+// 唯一真相。
+var crawlerBuiltinSnapshot = geoipnames.BuiltinCrawlerIPLists()
 
 // crawlerDistSeedFile 镜像内置首版（JSON map[engine][]CIDR）。运行期快照
 // crawlerIPListFile 同形，均为按引擎隔离的 JSON 对象。
@@ -81,8 +72,9 @@ func loadCrawlerIPListsFromDB() (map[string][]string, error) {
 	return all, nil
 }
 
-// loadCrawlerBundledSeed 读镜像内置首版；文件缺失/损坏时保留 Go 内置最小
-// 回退，保证离线新实例也不产生空名单。
+// loadCrawlerBundledSeed 读镜像内置首版；文件缺失/损坏时回退到嵌入二进制的
+// 同一份数据（geoipnames.BuiltinCrawlerIPLists），保证离线新实例也不产生空名单。
+// 两条路径内容同源（Dockerfile 从嵌入路径 COPY），不存在「两份数据分叉」。
 func loadCrawlerBundledSeed() map[string][]string {
 	if data, err := os.ReadFile(crawlerDistSeedFile); err == nil {
 		var seed map[string][]string
@@ -90,7 +82,7 @@ func loadCrawlerBundledSeed() map[string][]string {
 			return seed
 		}
 	}
-	return crawlerBuiltinSnapshot
+	return geoipnames.BuiltinCrawlerIPLists()
 }
 
 // Prime 启动预载：DB 为空时优先使用镜像内置种子，随后以 DB 为唯一真相
@@ -164,11 +156,14 @@ func upsertCrawlerIPListChanged(engineID string, entries []string) (bool, error)
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		return false, scanErr
 	}
-	if scanErr == nil && existing == string(encoded) {
-		// 历史问题：快速路径必须校验**快照内容**（本引擎条目 == DB 条目），
-		// 不能只看文件存在——文件缺失/坏 JSON/陈旧内容（首轮快照写失败、
-		// 升级遗留）都要从 DB/entries 重建；writeCrawlerIPListSnapshot 从 DB
-		// 全量重建并覆盖本引擎，其他引擎分片保留。
+	if scanErr == nil && crawlerEntriesUnchanged(existing, entries) {
+		// SSA-87-07（历史）：判定改为内容（多重集）比较而非顺序敏感
+		// 字节比较——源站同集合换序曾每轮误判 changed=true（写放大+「更新成功」
+		// 噪声）。DB 展示顺序保持不变（未变化不重写）。
+		// 未变化仍须校验**快照内容**（历史问题）：不能只看文件存在/DB 值——
+		// 文件缺失/坏 JSON/陈旧内容（首轮快照写失败、升级遗留）都要从 DB/entries
+		// 重建；writeCrawlerIPListSnapshot 从 DB 全量重建并覆盖本引擎，其他引擎
+		// 分片保留。
 		if crawlerSnapshotMatchesEngine(engineID, entries) {
 			return false, nil
 		}
@@ -213,6 +208,30 @@ func crawlerSnapshotMatchesEngine(engineID string, entries []string) bool {
 		if _, ok := seen[v]; !ok {
 			return false
 		}
+	}
+	return true
+}
+
+// crawlerEntriesUnchanged 报告已存 entries JSON 与本次解析条目是否同值多重集
+// （SSA-87-07：顺序无关的内容比较；解析失败按「已变化」处理→走完整写入路径
+// 重建畸形行）。DB 展示顺序保持原状（未变化不重写）。
+func crawlerEntriesUnchanged(existingJSON string, entries []string) bool {
+	var stored []models.IPListEntry
+	if err := json.Unmarshal([]byte(existingJSON), &stored); err != nil {
+		return false
+	}
+	if len(stored) != len(entries) {
+		return false
+	}
+	counts := make(map[string]int, len(entries))
+	for _, e := range entries {
+		counts[e]++
+	}
+	for _, e := range stored {
+		if counts[e.Value] == 0 {
+			return false
+		}
+		counts[e.Value]--
 	}
 	return true
 }

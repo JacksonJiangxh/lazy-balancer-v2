@@ -1290,3 +1290,27 @@ func TestHandleQueueExecutionError_roleInterruptionDoesNotConsumeRenewalAttempts
 		})
 	}
 }
+
+// ---- 历史（SV历史问题）----
+
+func TestParseRetryAfter_non_positive_seconds_zeroes(t *testing.T) {
+	for _, header := range []string{"-5", "0"} {
+		if got := parseRetryAfter(header); got != 0 {
+			t.Fatalf("parseRetryAfter(%q)=%v, want 0（契约：非正值归零）", header, got)
+		}
+	}
+}
+
+func TestExtractRetryAfterFromError_parses_go_time_string(t *testing.T) {
+	// 注释文档化的 Go time.Time.String() 形态必须命中（此前该分支永不命中，
+	// 退化为自有阶梯 1–3h）。
+	target := time.Now().Add(90 * time.Minute)
+	text := "rate limit exceeded, retry after " + target.Format("2006-01-02 15:04:05 -0700 MST")
+	got := extractRetryAfterFromError(text)
+	if got <= 0 {
+		t.Fatalf("extractRetryAfterFromError(%q)=%v, want >0", text, got)
+	}
+	if got > 91*time.Minute || got < 88*time.Minute {
+		t.Fatalf("extractRetryAfterFromError=%v, want ≈90m", got)
+	}
+}

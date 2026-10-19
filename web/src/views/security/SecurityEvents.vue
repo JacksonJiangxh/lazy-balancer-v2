@@ -256,7 +256,10 @@
     <!-- 自动封禁配置弹框（历史问题）：六项配置+口径/窗口变更重置提示 -->
     <el-dialog v-model="autobanDialogVisible" width="min(600px, 94vw)" top="8vh" append-to-body class="dialog-body-inset">
       <template #header>
-        <DialogHeader :icon="Lock" title="自动封禁配置" subtitle="WAF 事件固定窗口计数达到阈值即写入「自动封禁名单」（调度开启时到期自动解封）" />
+        <!-- W87-06：喂入门只排除「已验证爬虫豁免」事件，ACL/GeoIP/威胁情报事件
+             同样计数——文案不得自缩为「WAF 事件」，否则用户按「只有 WAF 命中才
+             计数」校准阈值会过早封禁 -->
+        <DialogHeader :icon="Lock" title="自动封禁配置" subtitle="安全事件（IP 访问控制/地域/WAF/威胁情报，已验证爬虫豁免除外）固定窗口计数达到阈值即写入「自动封禁名单」（调度开启时到期自动解封）" />
       </template>
       <el-form :model="autobanForm" label-width="96px" label-position="right">
         <el-form-item label="观察模式">
@@ -380,6 +383,7 @@ import { useAuthStore } from '@/stores/auth'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import TriggerDetailDialog from '@/components/events/TriggerDetailDialog.vue'
 import { formatDurationUs, triggerStageFamily } from '@/utils/securityStages'
+import { TRIGGERED_CATEGORIES, serializeTriggeredFilter } from '@/utils/triggeredFilter'
 import { isAutobanIneffective } from '@/utils/autobanStatus'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
 import { formatDate } from '@/utils/date'
@@ -745,23 +749,8 @@ const total = ref(0)
 const logStorageRefreshKey = ref(0)
 
 // 触发阶段筛选为固定预置八类（历史用户裁定：固定预置值，不接受任意值）。
-// 令牌 → 后端族段映射：请求侧展开为族名逗号串（后端逐段 OR）。
-// 历史 历史问题：限流（429）无 sec_events 数据源，不再作为筛选项/分类。
-const TRIGGERED_CATEGORIES = ['爬虫Bot', '地域拦截', 'IP 访问控制', '信任名单', '威胁情报库', '请求体异常', 'WAF·CRS', 'WAF·自定义'] as const
-type TriggeredCategory = typeof TRIGGERED_CATEGORIES[number]
-// v2.3.8 触发类型筛选映射（值=后端 family 键，与新 trigger_type 同语义）：
-// 每类对应的 ruleTriggeredFamilyPrefixes 映射键。
-const TRIGGERED_FAMILY_SEGMENTS: Record<TriggeredCategory, string[]> = {
-  '爬虫Bot': ['爬虫Bot'],
-  '地域拦截': ['地域拦截'],
-  'IP 访问控制': ['IP 访问控制'],
-  '信任名单': ['信任名单'],
-  '威胁情报库': ['威胁情报库'],
-  '请求体异常': ['请求体异常'],
-  'WAF·CRS': ['WAF·CRS'],
-  'WAF·自定义': ['WAF·自定义', '自定义规则'],
-}
-
+// 令牌 → 后端族段映射与序列化单源在 utils/triggeredFilter（审计 87 W87-15：
+// 原实现内联在本文件、无行为测试）。
 const filters = ref({ action: '', ip: '', uri: '', rule_name: '', rule_triggered: [...TRIGGERED_CATEGORIES] as string[], policy_name: '', timeRange: null as [string, string] | null })
 
 // 头部全选复选框三态：八类全中=全选；部分中=半选
@@ -818,19 +807,9 @@ const fetchEvents = async () => {
     if (filters.value.ip) p.set('ip', filters.value.ip)
     if (filters.value.rule_name) p.set('rule_name', filters.value.rule_name)
     // 触发规则：全选（八类全中且无自定义 tag）或空选 = 不过滤，不发送参数；
-    // 子集（1~7 个类别）或含自定义 tag 时，全部选中值英文逗号连接发送 rule_triggered
-    //（后端逐段独立解析、OR 连接；含逗号的消息关键词会整串回退为消息搜索，前端只管连接）
-    // 历史 历史问题：allow-create 自定义 tag（如 CRS 规则 ID 942100）原样
-    // 并入发送段（后端逐段独立解析 OR）；免发送条件=八类全中且无自定义 tag。
-    const triggeredSelected = filters.value.rule_triggered
-    const categorySelected = triggeredSelected.filter((v): v is TriggeredCategory =>
-      (TRIGGERED_CATEGORIES as readonly string[]).includes(v))
-    const customTags = triggeredSelected.filter((v) => !(TRIGGERED_CATEGORIES as readonly string[]).includes(v))
-    const triggeredAllHit = TRIGGERED_CATEGORIES.every((c) => categorySelected.includes(c))
-    if (triggeredSelected.length > 0 && (!triggeredAllHit || customTags.length > 0)) {
-      const segments = categorySelected.flatMap((c) => TRIGGERED_FAMILY_SEGMENTS[c])
-      p.set('rule_triggered', [...segments, ...customTags].join(','))
-    }
+    // 子集或含自定义 tag 时按族段展开 + 自定义 tag 原样连接（单源 serializeTriggeredFilter）。
+    const triggeredValue = serializeTriggeredFilter(filters.value.rule_triggered)
+    if (triggeredValue !== null) p.set('rule_triggered', triggeredValue)
     if (filters.value.policy_name) p.set('policy_name', filters.value.policy_name)
     if (filters.value.uri) p.set('uri', filters.value.uri)
     if (filters.value.timeRange?.[0]) p.set('start_time', filters.value.timeRange[0])

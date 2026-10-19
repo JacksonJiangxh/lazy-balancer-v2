@@ -421,11 +421,9 @@ func securityEventsReadPendingDelta() (*securityEventsPendingDelta, error) {
 // 不把瞬时故障的回退值钉死整个窗口。
 const auditLogSizeCacheTTL = 60 * time.Second
 
-var (
-	auditLogSizeCacheMu sync.Mutex
-	auditLogSizeCache   int64
-	auditLogSizeCacheAt time.Time
-)
+// 审计轮转阈值缓存（V87-TO-06：缓存机制单源 dbValueCache，「读库失败不缓存」
+// 语义与任务日志侧统一——此前两套实现易单侧漏改）。
+var auditLogSizeValueCache = dbValueCache{ttl: auditLogSizeCacheTTL}
 
 func getAuditLogSizeBytes() int64 {
 	// SVC-F2（历史）：未初始化库回退默认 10MB，不得 nil deref（当前
@@ -433,20 +431,14 @@ func getAuditLogSizeBytes() int64 {
 	if db.DB == nil {
 		return 10 * 1024 * 1024
 	}
-	auditLogSizeCacheMu.Lock()
-	defer auditLogSizeCacheMu.Unlock()
-	if auditLogSizeCache > 0 && time.Since(auditLogSizeCacheAt) < auditLogSizeCacheTTL {
-		return auditLogSizeCache
-	}
-	var sizeMB int
-	if err := db.DB.QueryRow("SELECT COALESCE(audit_log_size_mb, 10) FROM global_config WHERE id = 1").Scan(&sizeMB); err != nil {
-		sizeMB = 10
-		return int64(sizeMB) * 1024 * 1024
-	}
-	if sizeMB <= 0 {
-		sizeMB = 10
-	}
-	auditLogSizeCache = int64(sizeMB) * 1024 * 1024
-	auditLogSizeCacheAt = time.Now()
-	return auditLogSizeCache
+	return auditLogSizeValueCache.get(func() (int64, error) {
+		var sizeMB int
+		if err := db.DB.QueryRow("SELECT COALESCE(audit_log_size_mb, 10) FROM global_config WHERE id = 1").Scan(&sizeMB); err != nil {
+			return 0, err // 失败不缓存：回退 10MB 当轮生效，下一 tick 重试
+		}
+		if sizeMB <= 0 {
+			sizeMB = 10
+		}
+		return int64(sizeMB) * 1024 * 1024, nil
+	}, 10*1024*1024)
 }

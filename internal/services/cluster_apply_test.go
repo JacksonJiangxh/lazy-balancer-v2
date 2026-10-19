@@ -606,3 +606,67 @@ func TestSyncService_applySnapshot_preservesOIDCIdentityAndConfig(t *testing.T) 
 		t.Fatalf("applied global oidc_config lost: %q", cfg)
 	}
 }
+
+// S历史问题-11：nil 版本行规范化为空切片，空表不再恒判「有差异」。
+func TestSnapshotSecurityVersionRowsDiffer_normalizesNilRows(t *testing.T) {
+	_, database := newClusterTestService(t)
+	ctx := context.Background()
+	// 种子库可能带默认版本行：先清空，夹具才是「本地空表」形态。
+	if _, err := database.Exec("DELETE FROM security_crs_version; DELETE FROM security_ip2region_version"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if snapshotSecurityVersionRowsDiffer(ctx, tx, models.ClusterSnapshot{}) {
+		t.Fatal("nil snapshot version rows vs empty local tables must be equal")
+	}
+	if snapshotSecurityVersionRowsDiffer(ctx, tx, models.ClusterSnapshot{SecurityCRSVersion: []models.ClusterSecurityCRSVersion{{ID: 1, Version: "v1", AutoUpdate: true, UpdateStatus: "idle", ScheduleDays: "1,2,3,4,5,6,7", ScheduleTime: "04:00"}}}) != true {
+		t.Fatal("non-empty snapshot version rows vs empty local tables must differ")
+	}
+}
+
+// S历史问题-15：版本行读取列清单单源——排程列变化可被差分行观测（列清单分叉的
+// 历史教训：差分行漏列 → 变化永判无差异）。
+func TestClusterRuleLibVersionRows_diffSeesScheduleColumns(t *testing.T) {
+	service, database := newClusterTestService(t)
+	ctx := context.Background()
+	if _, err := database.Exec(`INSERT OR REPLACE INTO security_crs_version (id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time) VALUES (1,'v1','2026-10-19 12:00:00',1,'idle','','','','','','','1,2,3','05:00')`); err != nil {
+		t.Fatalf("seed CRS version row: %v", err)
+	}
+	if _, err := database.Exec(`INSERT OR REPLACE INTO security_ip2region_version (id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time) VALUES (1,'v1','2026-10-19 12:00:00',1,'idle','','','','','','','1,2,3','05:00')`); err != nil {
+		t.Fatalf("seed IP2Region version row: %v", err)
+	}
+	var snapshot models.ClusterSnapshot
+	var err error
+	if snapshot.SecurityCRSVersion, err = service.snapshotSecurityCRSVersion(ctx, database); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.SecurityIP2RegionVersion, err = service.snapshotSecurityIP2RegionVersion(ctx, database); err != nil {
+		t.Fatal(err)
+	}
+
+	// 每次差分用独立事务：同一事务内的第二次读会沿用首个读快照（WAL 快照
+	// 隔离），看不到下方外部 UPDATE。
+	differ := func(t *testing.T) bool {
+		t.Helper()
+		tx, err := database.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		return snapshotSecurityVersionRowsDiffer(ctx, tx, snapshot)
+	}
+	if differ(t) {
+		t.Fatal("identical version rows must compare equal")
+	}
+
+	if _, err := database.Exec(`UPDATE security_crs_version SET schedule_days='6,7' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if !differ(t) {
+		t.Fatal("schedule_days change must be visible to the differ (shared column list)")
+	}
+}

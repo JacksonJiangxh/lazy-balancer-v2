@@ -61,6 +61,18 @@ func restoreDirtyAPIKeys(ids []int) {
 	}
 }
 
+// CleanupExpiredRevokedJTI 删除已过期的吊销 JWT 记录（每小时清理 tick 的
+// 单一实现）。CI87-13（历史）：导出供测试驱动真实 SQL——此前测试自写
+// 一条等价 DELETE，清理语句/时间格式回归（历史问题 B-F4 的 T/空格分隔陷阱）不会
+// 被任何测试发现。
+// 历史问题 B-F4：写入侧为 RFC3339 T 分隔（models.RevokedTokenTimeFormat），
+// datetime('now') 产出空格分隔——TEXT 逐字符比较下当日过期行永不满足
+// <=（'T' > ' '），延迟约 24h 才清理。strftime 对齐写入格式。
+func CleanupExpiredRevokedJTI(database *sql.DB) error {
+	_, err := database.Exec("DELETE FROM revoked_jti WHERE expires_at<=strftime('%Y-%m-%dT%H:%M:%SZ','now')")
+	return err
+}
+
 func startAPIKeyLastUsedFlusher() {
 	stopAPIKeyLastUsedFlusher()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -83,10 +95,7 @@ func startAPIKeyLastUsedFlusher() {
 				}
 			case <-cleanupTicker.C:
 				if database := GetDB(); database != nil {
-					// 历史问题 B-F4：写入侧为 RFC3339 T 分隔（auth.go revokedTokenTimeFormat），
-					// datetime('now') 产出空格分隔——TEXT 逐字符比较下当日过期行永不满足
-					// <=（'T' > ' '），延迟约 24h 才清理。strftime 对齐写入格式。
-					if _, err := database.Exec("DELETE FROM revoked_jti WHERE expires_at<=strftime('%Y-%m-%dT%H:%M:%SZ','now')"); err != nil {
+					if err := CleanupExpiredRevokedJTI(database); err != nil {
 						logDBError("cleanup revoked JWT IDs", err)
 					}
 					if err := cleanupExpiredRegistrationSecrets(ctx, database); err != nil {

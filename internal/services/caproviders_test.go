@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -82,9 +81,7 @@ func TestCAProviderService_TestCAProviderWithContext_cancels_while_query_waits(t
 	go func() {
 		result <- NewCAProviderService().TestCAProviderWithContext(ctx, 1)
 	}()
-	for database.Stats().WaitCount == 0 {
-		runtime.Gosched()
-	}
+	waitForCond(t, time.Second, func() bool { return database.Stats().WaitCount > 0 })
 	cancel()
 	select {
 	case err := <-result:
@@ -503,5 +500,131 @@ func TestCAProviderService_UpdateCAProvider_concurrentDisable_neverReachesZeroEn
 		if enabledCount != 1 {
 			t.Fatalf("round %d: enabled count=%d, want exactly 1（守卫必须拦住第二个禁用）", round, enabledCount)
 		}
+	}
+}
+
+// ---- 历史（SV历史问题 / SV历史问题 / SV历史问题）----
+
+// SV历史问题/SV历史问题：默认提供商禁用守卫必须有钉测——此前 ErrCAProviderDefault
+// 零测试引用，守卫读失败还 fail-open（静默跳过）。
+func TestUpdateCAProvider_rejects_disabling_default_provider(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var providerID int
+	if err := database.QueryRow(`SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1`).Scan(&providerID); err != nil {
+		t.Fatalf("read enabled provider: %v", err)
+	}
+	if _, err := database.Exec(`UPDATE global_config SET default_ca_provider_id=? WHERE id=1`, providerID); err != nil {
+		t.Fatalf("set default provider: %v", err)
+	}
+	disabled := false
+
+	// When
+	_, err := NewCAProviderService().UpdateCAProvider(providerID, models.UpdateCAProviderRequest{Enabled: &disabled})
+
+	// Then
+	if !errors.Is(err, ErrCAProviderDefault) {
+		t.Fatalf("disable default provider err=%v, want ErrCAProviderDefault", err)
+	}
+	var enabled bool
+	if err := database.QueryRow(`SELECT enabled FROM ca_providers WHERE id=?`, providerID).Scan(&enabled); err != nil {
+		t.Fatalf("read provider: %v", err)
+	}
+	if !enabled {
+		t.Fatal("default provider was disabled despite guard")
+	}
+}
+
+// SV历史问题：global_config 行缺失（ErrNoRows）语义=未配置默认提供商——守卫
+// 不适用，禁用应放行（fail-closed 只针对读故障，不针对「无默认」这一合法态）。
+func TestUpdateCAProvider_missing_global_config_row_means_no_default(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var providerID int
+	if err := database.QueryRow(`SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1`).Scan(&providerID); err != nil {
+		t.Fatalf("read enabled provider: %v", err)
+	}
+	if _, err := database.Exec(`DELETE FROM global_config`); err != nil {
+		t.Fatalf("delete global_config: %v", err)
+	}
+	disabled := false
+
+	// When
+	_, err := NewCAProviderService().UpdateCAProvider(providerID, models.UpdateCAProviderRequest{Enabled: &disabled})
+
+	// Then
+	if err != nil {
+		t.Fatalf("disable provider without default row err=%v, want nil", err)
+	}
+}
+
+// SV历史问题：默认提供商守卫的读取故障必须 fail-closed（返回错误），不得静默
+// 跳过守卫——否则可禁用当前默认提供商，令 0 值引用规则静默改派。
+func TestUpdateCAProvider_default_guard_fails_closed_on_read_error(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var providerID int
+	if err := database.QueryRow(`SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1`).Scan(&providerID); err != nil {
+		t.Fatalf("read enabled provider: %v", err)
+	}
+	if _, err := database.Exec(`ALTER TABLE global_config RENAME TO global_config_audit87`); err != nil {
+		t.Fatalf("rename global_config: %v", err)
+	}
+	disabled := false
+
+	// When
+	_, err := NewCAProviderService().UpdateCAProvider(providerID, models.UpdateCAProviderRequest{Enabled: &disabled})
+
+	// Then
+	if err == nil {
+		t.Fatal("disable provider with unreadable global_config returned nil, want fail-closed error")
+	}
+	var enabled bool
+	if err := database.QueryRow(`SELECT enabled FROM ca_providers WHERE id=?`, providerID).Scan(&enabled); err != nil {
+		t.Fatalf("read provider: %v", err)
+	}
+	if !enabled {
+		t.Fatal("provider was disabled despite fail-closed guard")
+	}
+}
+
+// SV历史问题：EAB 落库后必须递增 caProviderConfigVersion，令队列缓存的 provider
+// 快照失效（否则积压任务继续持空 EAB，签发前重复请求 ZeroSSL API）。
+func TestAutoProvisionZeroSSLEAB_bumps_provider_config_version(t *testing.T) {
+	_, database := newClusterTestService(t)
+	result, err := database.Exec(`INSERT INTO ca_providers (name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled)
+		VALUES ('eab-version','zerossl',?,'',1,1000,1)`, ZeroSSLDirectoryURL)
+	if err != nil {
+		t.Fatalf("seed provider: %v", err)
+	}
+	providerID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("read provider id: %v", err)
+	}
+	if _, err := database.Exec(`UPDATE global_config SET acme_email='admin@example.test' WHERE id=1`); err != nil {
+		t.Fatalf("seed acme email: %v", err)
+	}
+	oldURL := zerosslEABURL
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"eab_kid":"kid","eab_hmac_key":"hmac"}`))
+	}))
+	zerosslEABURL = server.URL
+	t.Cleanup(func() { zerosslEABURL = oldURL; server.Close() })
+	provider := models.CAProvider{ID: int(providerID), Provider: ProviderZeroSSL}
+	before := caProviderConfigVersion.Load()
+
+	// When
+	if err := AutoProvisionZeroSSLEAB(context.Background(), &provider); err != nil {
+		t.Fatalf("auto provision: %v", err)
+	}
+
+	// Then
+	if got := caProviderConfigVersion.Load(); got <= before {
+		t.Fatalf("config version=%d, want > %d（EAB 落库必须失效队列 provider 快照）", got, before)
+	}
+	var credentials string
+	if err := database.QueryRow(`SELECT COALESCE(credentials,'') FROM ca_providers WHERE id=?`, providerID).Scan(&credentials); err != nil {
+		t.Fatalf("read credentials: %v", err)
+	}
+	if !strings.Contains(credentials, "kid") {
+		t.Fatalf("credentials=%q, want persisted EAB", credentials)
 	}
 }

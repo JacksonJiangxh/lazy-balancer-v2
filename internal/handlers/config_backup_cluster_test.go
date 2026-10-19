@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
@@ -100,5 +101,158 @@ func TestConfigBackup_oldBackupWithoutNodesPreservesLocalTopology(t *testing.T) 
 	var count int
 	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM nodes WHERE id=2 AND name='edge-a'`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("local node count=%d err=%v, want preserved", count, err)
+	}
+}
+
+// ── 历史问题-历史问题/历史问题/历史问题（历史）：nodes 导入行级门的
+// access_url / name+ip_address 形态，以及「存活身份键与落库 port 默认同源」。 ──
+
+func a3SeedLiveAdmin(t *testing.T) {
+	t.Helper()
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'admin','hash','admin',1)`); err != nil {
+		t.Fatalf("seed live admin: %v", err)
+	}
+}
+
+func a3ImportClusterRows(t *testing.T, h *Handlers, rows []map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	a3SeedLiveAdmin(t)
+	body := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{"nodes": rows}, Config: nil, Sections: []string{"cluster"}, EmptyConfigIfNil: true})
+	return r78Import(h, t, body)
+}
+
+func TestA3_87_P2_01_nodesImportValidatesAccessURL(t *testing.T) {
+	base := func() map[string]any {
+		return map[string]any{"name": "edge-a", "ip_address": "10.0.0.2", "port": 8000, "protocol": "https"}
+	}
+	rejected := []struct {
+		name      string
+		accessURL any
+	}{
+		{"带查询参数", "https://attacker.example/collect?token=1"},
+		{"带用户信息", "http://user:pass@10.0.0.2:8000"},
+		{"非 http(s) scheme", "ftp://10.0.0.2"},
+		{"带片段", "https://10.0.0.2:8000/#frag"},
+		{"非字符串类型", 42},
+	}
+	for _, tc := range rejected {
+		t.Run("拒绝/"+tc.name, func(t *testing.T) {
+			h := newBackupTestHandlers(t)
+			row := base()
+			row["access_url"] = tc.accessURL
+			rec := a3ImportClusterRows(t, h, []map[string]any{row})
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "access_url") {
+				t.Fatalf("body=%s, want access_url 点名拒绝", rec.Body.String())
+			}
+		})
+	}
+
+	accepted := []string{"", "https://10.0.0.2:8000", "http://[::1]:8000"}
+	for _, value := range accepted {
+		t.Run("接受/"+value, func(t *testing.T) {
+			h := newBackupTestHandlers(t)
+			row := base()
+			row["access_url"] = value
+			rec := a3ImportClusterRows(t, h, []map[string]any{row})
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+			}
+			var stored string
+			if err := db.DB.QueryRow(`SELECT COALESCE(access_url,'') FROM nodes WHERE name='edge-a'`).Scan(&stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored != value {
+				t.Fatalf("access_url=%q, want %q", stored, value)
+			}
+		})
+	}
+}
+
+func TestA3_87_P3_01_nodeRowsNormalizeNameAndValidateAddress(t *testing.T) {
+	t.Run("名称", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			value   any
+			wantErr string
+		}{
+			{"合法", "edge-a", ""},
+			{"首尾空白归一去空白", "  edge-a  ", ""},
+			{"恰好 100 字符", strings.Repeat("n", 100), ""},
+			{"101 字符超长", strings.Repeat("n", 101), "name"},
+			{"含换行控制字符", "edge\r\n-a", "name"},
+			{"非字符串", 42, "name"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				rows := []map[string]any{{"name": tc.value, "ip_address": "10.0.0.2", "port": 8000}}
+				err := validateV2BackupNodeRows(rows)
+				if tc.wantErr == "" {
+					if err != nil {
+						t.Fatalf("err=%v, want nil", err)
+					}
+					if got := rows[0]["name"]; got != strings.TrimSpace(tc.value.(string)) {
+						t.Fatalf("name=%v, want %q（落库前归一）", got, strings.TrimSpace(tc.value.(string)))
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err=%v, want containing %q", err, tc.wantErr)
+				}
+			})
+		}
+	})
+
+	t.Run("地址", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			value   any
+			wantErr bool
+		}{
+			{"IPv4", "10.0.0.2", false},
+			{"IPv6", "::1", false},
+			{"主机+端口形态", "10.0.0.2:8000", true},
+			{"路径形态", "10.0.0.2/admin", true},
+			{"主机名/非 IP", "not-an-ip", true},
+			{"带首尾空白", " 10.0.0.2 ", true},
+			{"URL 形态", "https://10.0.0.2", true},
+			{"非字符串", 10, true},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				rows := []map[string]any{{"name": "edge-a", "ip_address": tc.value, "port": 8000}}
+				err := validateV2BackupNodeRows(rows)
+				if tc.wantErr {
+					if err == nil || !strings.Contains(err.Error(), "ip_address") {
+						t.Fatalf("err=%v, want ip_address 点名拒绝", err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("err=%v, want nil", err)
+				}
+			})
+		}
+	})
+}
+
+func TestA3_87_P3_03_nodeSurvivingIdentitiesUseStoreDefaultPort(t *testing.T) {
+	rows := []map[string]any{
+		{"name": "缺 port", "ip_address": "10.0.0.2"},
+		{"name": "port null", "ip_address": "10.0.0.3", "port": nil},
+		{"name": "port 8000", "ip_address": "10.0.0.4", "port": 8000},
+		{"name": "port 字符串", "ip_address": "10.0.0.5", "port": "8000"},
+		{"name": "port 非默认", "ip_address": "10.0.0.6", "port": 9000},
+	}
+	surviving := nodeSurvivingIdentities(rows)
+	for _, want := range []string{"10.0.0.2:8000", "10.0.0.3:8000", "10.0.0.4:8000", "10.0.0.5:8000", "10.0.0.6:9000"} {
+		if !surviving[want] {
+			t.Fatalf("surviving 缺 %s（身份键须与 restoreTable 的 port 默认 8000 同源）: %v", want, surviving)
+		}
+	}
+	if len(surviving) != 5 {
+		t.Fatalf("surviving=%v, want 5 条身份键", surviving)
 	}
 }

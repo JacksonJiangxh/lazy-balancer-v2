@@ -164,7 +164,7 @@
                 <el-option
                   v-for="opt in field.options"
                   :key="opt"
-                  :label="opt === 'dnspod' ? 'DNSPod API' : '腾讯云 API'"
+                  :label="credentialOptionLabel(field, opt)"
                   :value="opt"
                 />
               </el-select>
@@ -250,16 +250,12 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Connection, Document, OfficeBuilding, Plus, Postcard, Setting } from '@element-plus/icons-vue'
 import CertJobs from './CertJobs.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
+import { credentialFieldVisible, credentialOptionLabel, defaultCredentialsFor, type CredentialFieldMeta } from '@/utils/dnsProviderFields'
 import type { APIResponse } from '@/types'
 
-interface CredentialField {
-  name: string
-  label: string
-  type: string
-  required: boolean
-  placeholder?: string
-  options?: string[]
-}
+// WS-13：字段可见性/选项文案由后端元数据驱动（visible_when/option_labels），
+// 不再按 dnspod 的两种认证模式在前端硬编码字段名。
+type CredentialField = CredentialFieldMeta
 
 interface DNSProvider {
   code: string
@@ -355,12 +351,14 @@ const isTesting = computed(() => testingId.value !== null || testingCAId.value !
 const caDialogVisible = ref(false)
 const savingCA = ref(false)
 const editingCAProvider = ref<CAProvider | null>(null)
-const caForm = reactive<CAProvider>({
+// WS-12：表单副本不再携带 credentials——凭证经 caCreds（EAB 键对）单独编辑，
+// 保存载荷按 provider 计算；原 `credentials: '{}'` 全文件零读取，误导读者以为
+// 表单凭证来源。（CAProvider.credentials 仍用于列表行解析，保留。）
+const caForm = reactive<Omit<CAProvider, 'credentials'>>({
   id: 0,
   name: '',
   provider: 'zerossl',
   directory_url: '',
-  credentials: '{}',
   max_concurrent: 1,
   min_interval_ms: 10000,
   enabled: true,
@@ -373,23 +371,21 @@ const caCreds = reactive<CAProviderCredentials>({
 const enabledCAProviders = computed(() => caProviders.value.filter(p => p.enabled))
 
 const selectedProvider = computed(() => providers.value.find(p => p.code === form.value.dns_provider))
-const authMode = computed(() => form.value.dns_credentials['auth_mode'] || 'dnspod')
+const authMode = computed(() => form.value.dns_credentials['auth_mode'] || '')
 
-const shouldShowField = (field: CredentialField) => {
-  if (field.name === 'auth_mode') return true
-  if (authMode.value === 'tencent_cloud') {
-    return field.name === 'secret_id' || field.name === 'secret_key'
-  }
-  return field.name === 'app_id' || field.name === 'app_token'
-}
+// WS-13：可见性完全由后端元数据（visible_when）决定——新增 provider 的字段
+// 不会被隐藏，也不再依赖 dnspod 的字段名。
+const shouldShowField = (field: CredentialField) => credentialFieldVisible(field, form.value.dns_credentials)
 
 const onProviderChange = () => {
-  form.value.dns_credentials = { auth_mode: 'dnspod' }
+  form.value.dns_credentials = defaultCredentialsFor(selectedProvider.value?.credential_fields ?? [])
 }
 
+// 选择类字段（当前仅 auth_mode）变更即重置凭证——不同模式的字段集互斥，旧值
+// 保留会以隐藏字段的形式随保存载荷提交。
 const onAuthModeChange = () => {
-  const mode = authMode.value
-  form.value.dns_credentials = { auth_mode: mode }
+  if (!authMode.value) return
+  form.value.dns_credentials = { auth_mode: authMode.value }
 }
 
 const fetchConfigs = async () => {
@@ -482,7 +478,8 @@ const closeCADialog = (): void => {
 }
 
 const saveCAProvider = async () => {
-  if (savingCA.value) return
+  // WS-11：写动作函数级守卫（弹框打开期间角色/节点模式可能变化）
+  if (isReadOnly.value || savingCA.value) return
 
   savingCA.value = true
   try {
@@ -512,7 +509,8 @@ const saveCAProvider = async () => {
 }
 
 const testCAProvider = async (p: CAProvider) => {
-  if (isTesting.value) return
+  // WS-11：测试会真实申请 EAB（写 ca_providers.credentials），属写操作
+  if (isReadOnly.value || isTesting.value) return
   testingCAId.value = p.id
   try {
     const res = await request.post<APIResponse>(`/ca-providers/${p.id}/test`)
@@ -558,7 +556,8 @@ const openConfigDialog = (config?: CertConfig) => {
     form.value = {
       name: '',
       dns_provider: providers.value[0]?.code || 'dnspod',
-      dns_credentials: { auth_mode: 'dnspod' },
+      // WS-13：默认凭证由 provider 的 select 字段首个选项派生（不再写死 auth_mode）
+      dns_credentials: defaultCredentialsFor(providers.value[0]?.credential_fields ?? []),
       enabled: true,
     }
   }
@@ -574,7 +573,8 @@ const closeConfigDialog = (): void => {
 }
 
 const saveConfig = async () => {
-  if (savingConfig.value) return
+  // WS-11：写动作函数级守卫
+  if (isReadOnly.value || savingConfig.value) return
   const targetId = editingId.value
   const payload = {
     name: form.value.name,
@@ -631,7 +631,9 @@ const saveConfig = async () => {
 }
 
 const deleteConfig = async (config: CertConfig) => {
-  if (isReadOnly.value || deletingId.value !== null) return
+  // WS-11：savingConfig 在途时不得删除（保存 = test → PUT 两步，删除会让第二步
+  // 打向已不存在的 id）；deletingId 防重入照旧。
+  if (isReadOnly.value || savingConfig.value || deletingId.value !== null) return
   const configId = config.id
   if (configId === undefined) return
   try {
@@ -679,7 +681,8 @@ const promptTestDomain = async (isSave = false): Promise<string | null> => {
 }
 
 const testConfig = async (config: CertConfig) => {
-  if (isTesting.value || !config.id) return
+  // WS-11：测试会真实 Present+CleanUp DNS TXT（后端已移出只读豁免），属写操作
+  if (isReadOnly.value || isTesting.value || !config.id) return
   testingId.value = config.id
   try {
     const domain = await promptTestDomain(false)

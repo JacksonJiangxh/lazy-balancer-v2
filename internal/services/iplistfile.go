@@ -27,17 +27,49 @@ func init() {
 // 按 data_dir 同级 waf/ 派生。测试可改。
 var IPListDataDir = "/app/waf/ip-lists"
 
-// ConfigureWafDirs 按最终 data_dir 派生 WAF 文件目录（容器内 /app/data →
-// /app/waf 与既有打包路径逐字节一致；本地开发落到数据目录同级，避免
-// /app 只读文件系统写入失败）。算子白名单前缀同步对齐。
+// ConfigureWafDirs 按最终 data_dir 派生**全部** WAF 文件路径（SS87-历史问题
+// 单点派生）：容器内 /app/data → 全部 /app/* 与既有打包路径逐字节一致；
+// 本地开发/自定义挂载落到数据目录同级，避免 /app 只读文件系统写入失败。
+// 此前只有 wafDir/IPListDataDir/白名单跟随 data_dir，CRS 树/快照/dist、
+// xdb、指令目录与爬虫种子仍是独立硬编码真源——data_dir ≠ /app/data 时
+// 播种/更新写出数据卷之外、SecurityLibraryStatus 恒 false（安全链静默
+// 不渲染）。派生覆盖 CRSRuleIndexDir（索引读侧）与 crsDirectivesDir
+// （渲染读侧），保证写读同源。算子白名单前缀同步对齐。
+// 历史问题-08：派生面同时含 Coraza 审计日志（<parent>/logs/waf-audit/audit.log）
+// 与摄取 offset（<data_dir>/security_events.offset）——此前两者硬编码 /app，
+// 非容器/自定义挂载部署会写到只读或错误的路径。
 func ConfigureWafDirs(dataDir string) {
 	if filepath.Dir(dataDir) == "/app" {
-		return // 容器默认形态：保持 /app/waf/* 常量
+		return // 容器默认形态：保持 /app/* 常量
 	}
-	wafDir = filepath.Join(filepath.Dir(dataDir), "waf")
+	parent := filepath.Dir(dataDir)
+	wafDir = filepath.Join(parent, "waf")
+	wafDistDir = filepath.Join(parent, "waf.dist")
 	IPListDataDir = filepath.Join(wafDir, "ip-lists")
 	wafiplist.AllowedPathPrefix = wafDir + string(filepath.Separator)
+	// CRS 活树/指令目录/索引目录同源（同一棵树的写侧与读侧）。
+	crsLiveDir = filepath.Join(wafDir, "crs")
+	crsDirectivesDir = crsLiveDir
+	CRSRuleIndexDir = filepath.Join(crsLiveDir, "rules")
+	// 快照在数据卷内，发行版在镜像相对目录。
+	crsSnapshotDir = filepath.Join(dataDir, "crs")
+	crsDistDir = filepath.Join(wafDistDir, "crs")
+	ip2regionLivePath = filepath.Join(dataDir, "ip2region.xdb")
+	ip2regionDistPath = filepath.Join(wafDistDir, "ip2region.xdb")
+	crawlerDistSeedFile = filepath.Join(wafDistDir, "crawler-ip-lists.seed.json")
+	// 历史问题-08（历史）：Coraza 审计日志与摄取 offset 同属「随 data_dir
+	// 落数据卷/日志根」的路径域，必须与上列路径同批派生——此前硬编码 /app：
+	// 自定义 data_dir 的非容器部署会继续读写 /app（常不可写）→ 摄取持续失败、
+	// WAF 审计写入失败。日志根取数据目录同级的 logs/（与容器
+	// /app/data→/app/logs 同构）；offset 落数据目录内（与 ip2region.xdb 同域）。
+	auditLogPath = filepath.Join(parent, "logs", "waf-audit", "audit.log")
+	securityEventsOffsetPath = filepath.Join(dataDir, "security_events.offset")
 }
+
+// CRSLiveDir 返回 CRS 活树目录（ConfigureWafDirs 派生后的当前值）。handlers
+// 的规则文件读取测试缝以空值表示「按本函数派生」，避免同一条路径出现第二处
+// 硬编码真源（SS87-历史问题）。
+func CRSLiveDir() string { return crsLiveDir }
 
 // EnsureIPListDir 启动期建目录（0755）。
 func EnsureIPListDir() error {

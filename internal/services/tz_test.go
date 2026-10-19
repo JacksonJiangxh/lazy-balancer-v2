@@ -153,3 +153,51 @@ func (s *shortWriteSink) Write(p []byte) (int, error) {
 	}
 	return s.n, nil
 }
+
+// S历史问题（历史）：多行 payload（Logf 消息内嵌换行）必须逐行按级别过滤
+// 后重组——只看首行会让 warn/error 档整体放行后续低级别行（级别过滤被绕过）。
+func TestApplicationLogWriter_filtersEachLineOfMultilinePayload(t *testing.T) {
+	oldLevel := CurrentLogLevel()
+	t.Cleanup(func() { _ = ConfigureLogLevel(oldLevel) })
+
+	t.Run("warn keeps warn and error lines only", func(t *testing.T) {
+		if err := ConfigureLogLevel("warn"); err != nil {
+			t.Fatal(err)
+		}
+		var output bytes.Buffer
+		payload := []byte("WARNING: degraded\nordinary info line\nERROR: boom\n")
+		if _, err := NewApplicationLogWriter(&output).Write(payload); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if got, want := output.String(), "WARNING: degraded\nERROR: boom\n"; got != want {
+			t.Fatalf("output=%q, want 仅 warn/error 行（info 行必须逐行滤除）", got)
+		}
+	})
+
+	t.Run("error keeps error lines only", func(t *testing.T) {
+		if err := ConfigureLogLevel("error"); err != nil {
+			t.Fatal(err)
+		}
+		var output bytes.Buffer
+		payload := []byte("WARNING: degraded\nERROR: boom\nstill ordinary\n")
+		if _, err := NewApplicationLogWriter(&output).Write(payload); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if got, want := output.String(), "ERROR: boom\n"; got != want {
+			t.Fatalf("output=%q, want 仅 error 行", got)
+		}
+	})
+
+	t.Run("single line path unchanged", func(t *testing.T) {
+		if err := ConfigureLogLevel("warn"); err != nil {
+			t.Fatal(err)
+		}
+		var output bytes.Buffer
+		if _, err := NewApplicationLogWriter(&output).Write([]byte("WARN hello\n")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if got, want := output.String(), "WARN hello\n"; got != want {
+			t.Fatalf("output=%q, want 单行原样透传", got)
+		}
+	})
+}

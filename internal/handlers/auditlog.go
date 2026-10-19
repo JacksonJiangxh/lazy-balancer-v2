@@ -40,14 +40,20 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 		Value string `json:"value"`
 		Count int64  `json:"count"`
 	}
+	// 历史问题（历史）：锁只保护缓存读写（double-check，与 brandingStore 慢
+	// 路径同型）——此前持锁执行三条全表 GROUP BY，深审计库/IO 抖动时全部
+	// 筛选面板请求（含命中缓存路径）被串行阻塞。缓存 miss 时释放锁再查询，
+	// 并发 miss 各自查询后写回（同内容，最后写入者胜，无撕裂读）。
 	auditOptionsCache.Lock()
-	defer auditOptionsCache.Unlock()
 	if time.Now().Before(auditOptionsCache.expiresAt) && auditOptionsCache.payload != nil {
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: auditOptionsCache.payload})
+		payload := auditOptionsCache.payload
+		auditOptionsCache.Unlock()
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: payload})
 		return
 	}
+	auditOptionsCache.Unlock()
 	fetchDistinct := func(column string, limit int) ([]optionRow, error) {
-		rows, err := db.AuditDB.Query(`
+		rows, err := db.AuditDB.QueryContext(c.Request.Context(), `
 			SELECT `+column+`, COUNT(*) AS cnt FROM audit_log
 			WHERE `+column+` != ''
 			GROUP BY `+column+`
@@ -107,8 +113,10 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 	// 历史问题：故障轮响应携带可选 partial=true（旧字段原样保留，前端/JSON
 	// 消费方兼容），让「部分下拉」与「真空库」可区分。
 	if fetchErr == nil {
+		auditOptionsCache.Lock()
 		auditOptionsCache.payload = payload
 		auditOptionsCache.expiresAt = time.Now().Add(60 * time.Second)
+		auditOptionsCache.Unlock()
 	} else {
 		payload["partial"] = true
 	}

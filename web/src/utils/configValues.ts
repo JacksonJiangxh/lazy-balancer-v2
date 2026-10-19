@@ -9,3 +9,21 @@
 export function displaySecurityEventsRowCap(value: number | null | undefined): number {
   return value !== null && value !== undefined && value > 0 ? value : 1_000_000
 }
+
+/**
+ * 安全事件保留/行数上限的保存载荷（历史问题-05）：仅在用户**实际编辑过**时携带
+ * 该字段。库值 0=自动 是合法哨兵，展示层归一会把 0 显示为 90 天 / 1,000,000 行；
+ * 若无条件随保存回传，任何一次基础设置保存都会把展示归一值物化进库（丢失自动
+ * 哨兵，内置默认调整后不再跟随）。未编辑 → 省略键，后端 COALESCE 保持现值。
+ */
+export function securityEventsWritePayload(input: {
+  retentionDays: number
+  retentionDirty: boolean
+  rowCap: number
+  rowCapDirty: boolean
+}): { security_events_retention_days?: number; security_events_row_cap?: number } {
+  return {
+    ...(input.retentionDirty ? { security_events_retention_days: input.retentionDays } : {}),
+    ...(input.rowCapDirty ? { security_events_row_cap: input.rowCap } : {}),
+  }
+}

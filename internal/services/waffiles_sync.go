@@ -180,16 +180,17 @@ func wafFileBundleComplete(ref *models.ClusterWafFilesRef, bundle *WafFileBundle
 	return len(bundle.ThreatFiles) == len(ref.ThreatSha256s)
 }
 
-// buildWafFileBundleLocked 返回 bundle 与引用键（调用方必须已持 wafFileMu）。
-// 命中缓存时不重读任何文件。
-func buildWafFileBundleLocked() (*WafFileBundle, string) {
+// buildWafFileBundleLocked 返回 bundle、引用键与本次引用（调用方必须已持
+// wafFileMu）。命中缓存时不重读任何文件；ref 始终是当前时刻的引用（用于
+// 响应体缓存的完整性门，SS87-历史问题）。
+func buildWafFileBundleLocked() (*WafFileBundle, string, *models.ClusterWafFilesRef) {
 	ref := buildWafFileRefLocked()
 	if ref == nil {
-		return nil, ""
+		return nil, "", nil
 	}
 	key := wafFileRefKey(ref)
 	if wafFileBundleCache.bundle != nil && wafFileBundleCache.key == key {
-		return wafFileBundleCache.bundle, key
+		return wafFileBundleCache.bundle, key, ref
 	}
 	bundle := materializeWafFileBundle(ref)
 	if wafFileBundleComplete(ref, bundle) {
@@ -197,7 +198,7 @@ func buildWafFileBundleLocked() (*WafFileBundle, string) {
 		wafFileBundleCache.bundle = bundle
 		wafFileBundleCache.response = nil
 	}
-	return bundle, key
+	return bundle, key, ref
 }
 
 // BuildWafFileBundleResponse 返回集群按需端点的完整 API 响应体（一次序列化，
@@ -209,7 +210,7 @@ func BuildWafFileBundleResponse() []byte {
 	if wafFileBundleCache.response != nil && time.Since(wafFileBundleCache.responseValidatedAt) < wafFileBundleResponseCoalesceWindow {
 		return wafFileBundleCache.response
 	}
-	bundle, key := buildWafFileBundleLocked()
+	bundle, key, ref := buildWafFileBundleLocked()
 	if bundle == nil {
 		return nil
 	}
@@ -224,7 +225,10 @@ func BuildWafFileBundleResponse() []byte {
 		Logf("error", "序列化 WAF 数据包失败: %v", err)
 		return nil
 	}
-	if wafFileBundleCache.key == key {
+	// SS87-历史问题：响应体缓存也以完整性与引用键为门——主端瞬时读失败产出
+	// 「声明哈希非空但缺内容」的 bundle 时，不得把异常形态缓存并在合并窗口内
+	// 放大传播（从端每次都拒绝，仅浪费重试周期）。不完整时照常返回本次字节。
+	if wafFileBundleCache.key == key && wafFileBundleComplete(ref, bundle) {
 		wafFileBundleCache.response = body
 		wafFileBundleCache.responseValidatedAt = time.Now()
 	}
@@ -335,24 +339,14 @@ func validThreatFileName(name string) bool {
 	return ok
 }
 
-// scanThreatFastFiles 扫描 /app/waf/threat-*.iplist.fast 文件，返回源名→sha256 映射。
+// scanThreatFastFiles 是 scanThreatFastFilesChecked 的静默容错形态
+// （SS87-历史问题 单源——此前两份 glob+白名单+哈希实现，后续修补易漏一侧）：
+// 仅 wafFilesRefDiffers 消费，任一枚举/哈希失败按「不可判定」返回空映射，
+// 使漂移判定成立（全量重拉，方向安全），不向比对路径上抛错误。
 func scanThreatFastFiles() map[string]string {
-	result := make(map[string]string)
-	matches, _ := filepath.Glob(filepath.Join(wafDir, "threat-*.iplist.fast"))
-	for _, path := range matches {
-		base := filepath.Base(path)
-		source := strings.TrimSuffix(strings.TrimPrefix(base, "threat-"), ".iplist.fast")
-		if source == "" {
-			continue
-		}
-		// 历史问题：与从端写侧同一白名单——主端出现历史/运维/未来源文件时
-		// 不得进入 ref/bundle（否则从端拒绝整包，同步循环永久失败）。
-		if !validThreatFileName(source) {
-			continue
-		}
-		if sum, err := sha256File(path); err == nil && sum != "" {
-			result[source] = sum
-		}
+	result, err := scanThreatFastFilesChecked()
+	if err != nil || result == nil {
+		return map[string]string{}
 	}
 	return result
 }
@@ -369,7 +363,7 @@ func scanThreatFastFiles() map[string]string {
 func BuildWafFileBundle() *WafFileBundle {
 	wafFileMu.Lock()
 	defer wafFileMu.Unlock()
-	bundle, _ := buildWafFileBundleLocked()
+	bundle, _, _ := buildWafFileBundleLocked()
 	return bundle
 }
 
@@ -388,7 +382,7 @@ func BuildWafFileBundleInLockChecked() (*WafFileBundle, bool) {
 	if ref == nil {
 		return nil, true // 无任何 WAF 组件可导出：不构成不完整
 	}
-	bundle, _ := buildWafFileBundleLocked()
+	bundle, _, _ := buildWafFileBundleLocked()
 	return bundle, bundle != nil && wafFileBundleComplete(ref, bundle)
 }
 
@@ -490,6 +484,15 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 	// 历史问题-1:反向防御——声明哈希非空但未携带内容(主端瞬态 IO 读失败
 	// 时 BuildWafFileBundle 会产出该形状):从端应用「无操作」后漂移判定
 	// 永不收敛,必须拒绝(主端恢复后下轮同步自愈)。
+	//
+	// SS87-历史问题 边界披露（有意设计，不修）：本函数只对「bundle 携带的组件」
+	// 动作——主端引用缺席某组件（ref 无 CRS 哈希 / 无 xdb / 无威胁条目）时
+	// 从端既有树/库**原样保留**，不以缺席表达删除。安全语义边界：主端组件
+	// 缺失时其安全链因库缺失不渲染，而从端仍按旧树全量拦截——主从拦截面
+	// 分叉（从端更严）。不构成漂移死循环：wafFilesRefDiffers 只比对非空分量。
+	// 若要闭合需主端显式「已删除」标记（删除数据库是不可逆高风险管理动作，
+	// 不以「ref 省略」隐式传播），威胁面已有显式 prune（pruneSyncedThreatFiles）
+	// 走的是独立通道，不在此列。
 	if bundle.CRSSha256 != "" && len(bundle.CRSTarGz) == 0 {
 		return crsChanged, xdbChanged, threatChanged, newWafFileApplyError("crs", errors.New("同步包声明 CRS 哈希非空但未携带内容，拒绝应用该同步包"))
 	}
@@ -525,12 +528,6 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 		// SEC-A-1：读失败时 liveSum 为空串，恒不等于非空声明哈希（上方已拒
 		// 空声明），落入重写路径——方向安全，与威胁分支同口径。
 		liveSum, _ := sha256File(ip2regionLivePath)
-		// 历史问题 A-#4：xdb 未变化也要校验/补写 .version——.version 丢失或写失败
-		// 会让本地 ref 的 tag 为空，wafFilesDrifted 每轮误判漂移且全量重拉
-		// 走不到本分支的自愈（重拉时 sha 相同），从节点永久假警报。
-		if tagErr := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", bundle.IP2RegionTag); tagErr != nil {
-			return crsChanged, xdbChanged, threatChanged, newWafFileApplyError("xdb", fmt.Errorf("写入同步 IP2Region数据库版本标记: %w", tagErr))
-		}
 		if liveSum != bundle.IP2RegionSha {
 			sum := sha256.Sum256(bundle.Xdb)
 			if got := hex.EncodeToString(sum[:]); got != bundle.IP2RegionSha {
@@ -541,10 +538,15 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 			if err := writeFileAtomicSynced(ip2regionLivePath, bundle.Xdb, 0644); err != nil {
 				return crsChanged, xdbChanged, threatChanged, newWafFileApplyError("xdb", fmt.Errorf("落盘同步 IP2Region数据库: %w", err))
 			}
-			if tagErr := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", bundle.IP2RegionTag); tagErr != nil {
-				return crsChanged, xdbChanged, threatChanged, newWafFileApplyError("xdb", fmt.Errorf("写入同步 IP2Region数据库版本标记: %w", tagErr))
-			}
 			xdbChanged = true
+		}
+		// 历史问题 A-#4：xdb 未变化也要校验/补写 .version——.version 丢失或写失败
+		// 会让本地 ref 的 tag 为空，wafFilesDrifted 每轮误判漂移且全量重拉
+		// 走不到本分支的自愈（重拉时 sha 相同），从节点永久假警报。
+		// SS87-历史问题：补写必须晚于内容哈希校验——先写 sidecar 再验哈希会在
+		// 拒绝路径留下「新标签 + 旧库」跨代偏斜（F-历史问题-02 的收敛目标）。
+		if tagErr := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", bundle.IP2RegionTag); tagErr != nil {
+			return crsChanged, xdbChanged, threatChanged, newWafFileApplyError("xdb", fmt.Errorf("写入同步 IP2Region数据库版本标记: %w", tagErr))
 		}
 	}
 	// RDB 文件化：从节点写威胁库 .fast 文件（直接使用，零编译）
@@ -556,7 +558,14 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 			return crsChanged, xdbChanged, threatChanged, fmt.Errorf("同步威胁库文件名非法 %q，已拒绝整包", tf.Name)
 		}
 		if len(tf.Content) == 0 {
-			continue
+			// SS87-历史问题：声明哈希非空 = 主端引用声称存在该文件（0 字节文件
+			// 的 sha256 也非空），但包内无内容——从端若静默 continue 则永不
+			// 落盘、ref 哈希永不等，每轮误判漂移全量重拉永不收敛。与缺哈希
+			// 同纵深：拒绝整包（主端恢复后下轮自愈）。
+			if tf.Sha256 != "" {
+				return crsChanged, xdbChanged, threatChanged, fmt.Errorf("同步威胁库 %s 内容为空但声明哈希非空，已拒绝整包", tf.Name)
+			}
+			continue // 无声明哈希的空条目=缺席，无可应用内容
 		}
 		// 声明哈希为空但携带内容：合法主节点 BuildWafFileBundle 恒成对设置，
 		// 仅恶意/损坏主节点可构造——与 CRS/xdb 侧同纵深防御（历史问题-1），

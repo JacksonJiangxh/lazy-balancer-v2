@@ -1133,3 +1133,22 @@ func TestNextAutoBackupFilename_errorsWhenAllVariantsTaken(t *testing.T) {
 		t.Fatal("exhausted variants must return error instead of reusing an existing name")
 	}
 }
+
+// 历史问题（历史）：注释承诺「取消不落 failed 行」，但写盘阶段
+// （services.WriteAutoBackupFileSynced 无 ctx）出错时直接走 fail() —— 取消 +
+// 写盘错误同时发生会落 failed 行与「备份失败」审计，而 task_runs 记 cancelled。
+// 写盘错误归一 helper：ctx 已取消时必须按取消返回（与 历史问题-10 同口径）。
+func TestWriteAutoBackupPayload_canceledContextReturnsCancelError(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "missing-subdir", "x.lbbak")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := writeAutoBackupPayload(ctx, target, []byte("payload")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消态写盘错误=%v, want context.Canceled（不得落入 failed 行/失败审计）", err)
+	}
+
+	// 未取消时同一写盘错误必须原样上抛（错误归一不得吞掉真实磁盘故障）。
+	if err := writeAutoBackupPayload(context.Background(), target, []byte("payload")); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("未取消写盘错误=%v, want 真实写盘错误（非取消）", err)
+	}
+}

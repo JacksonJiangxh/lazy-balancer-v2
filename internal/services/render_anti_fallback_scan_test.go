@@ -10,6 +10,9 @@ package services
 // 不在扫描命中面。允许列表逐条携带 Ruling（类型②省略型/治理范围外），
 // 双向精确匹配：扫描出清单外命中=有人往渲染层塞了写死兜底（FAIL）；
 // 清单条目在源码中消失=该条目已退役、清单过期（FAIL）——防允许列表腐化。
+// S历史问题（历史）：命中面扩展到 LSS(<0/<1)、NEQ(!=0)、GTR/GEQ 反向分支、
+// switch/case 零值守卫与非 map 非空复合字面量默认值，并为每形态配夹具（
+// TestFallbackScan_detectsEquivalentGuardShapes）——语义等价写法不得绕过机制。
 
 import (
 	"bytes"
@@ -182,70 +185,174 @@ func TestRenderLayer_hasNoHardcodedZeroFallbacks(t *testing.T) {
 }
 
 // fallbackAssignmentsInFunction 扫描函数体内的「零值守卫 + 字面量赋值」兜底
-// 形态（G3 形状：INT/STRING 字面量、plain `=`、else 链纳入），返回
-// 赋值文本 → 位置。
+// 形态，返回赋值文本 → 位置。
+// G3 形状：INT/STRING 字面量、plain `=`、else 链纳入。
+// S历史问题 扩展：LSS(<0/<1)、NEQ(!=0 的 else 链)、GEQ(>=1 的 else 链) 零值守卫、
+// switch/case 的零值守卫分支、复合字面量默认值（`v = cfg{...}`）——原命中面
+// 可被这些语义等价写法绕过，机制失效时无红灯。
 func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[string]string {
 	hits := map[string]string{}
 	if fn.Body == nil {
 		return hits
 	}
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		ifStmt, ok := n.(*ast.IfStmt)
-		if !ok {
-			return true
+	scanAssigns := func(branch ast.Node) {
+		if branch == nil {
+			return
 		}
-		// G3：零值守卫条件含 GTR（`x > 0 {…} else {兜底}` 形态的尾 else）。
-		bin, ok := ifStmt.Cond.(*ast.BinaryExpr)
-		if !ok || (bin.Op != token.EQL && bin.Op != token.LEQ && bin.Op != token.GTR) {
-			return true
-		}
-		lit, ok := bin.Y.(*ast.BasicLit)
-		if !ok || lit.Kind != token.INT || lit.Value != "0" {
-			return true
-		}
-		scanAssigns := func(branch ast.Node) {
-			ast.Inspect(branch, func(m ast.Node) bool {
-				assign, ok := m.(*ast.AssignStmt)
-				// G3：仅 plain `=`（:= 定义与 += 累加非兜底赋值）。
-				if !ok || assign.Tok != token.ASSIGN {
-					return true
+		ast.Inspect(branch, func(m ast.Node) bool {
+			assign, ok := m.(*ast.AssignStmt)
+			// G3：仅 plain `=`（:= 定义与 += 累加非兜底赋值）。
+			if !ok || assign.Tok != token.ASSIGN {
+				return true
+			}
+			for _, rhs := range assign.Rhs {
+				if isLiteralDefault(rhs) {
+					var buf bytes.Buffer
+					_ = printer.Fprint(&buf, fset, assign)
+					hits[buf.String()] = fset.Position(assign.Pos()).String()
+					break
 				}
-				for _, rhs := range assign.Rhs {
-					// G3：STRING 字面量兜底（"5s"/"250ms" 形态）与 INT 同罪。
-					if num, ok := rhs.(*ast.BasicLit); ok && (num.Kind == token.INT || num.Kind == token.STRING) {
-						var buf bytes.Buffer
-						_ = printer.Fprint(&buf, fset, assign)
-						hits[buf.String()] = fset.Position(assign.Pos()).String()
+			}
+			return true
+		})
+	}
+	scanElseBlock := func(ifStmt *ast.IfStmt) {
+		// 只扫终端 else 块；else-if 由链循环按各自守卫独立判定（直接 Inspect
+		// else-if 节点会下钻其 body，把「非零值显式分支」误判为兜底）。
+		if block, ok := ifStmt.Else.(*ast.BlockStmt); ok {
+			scanAssigns(block)
+		}
+	}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.IfStmt:
+			// S历史问题：逐级 else-if 链按各自守卫判定（外层守卫形态变化不改变
+			// 内层判定的独立性）。
+			matched := false
+			for current := node; current != nil; {
+				switch guardBranchOf(current.Cond) {
+				case guardFallbackBody:
+					scanAssigns(current.Body)
+					matched = true
+				case guardFallbackElse:
+					scanElseBlock(current)
+					matched = true
+				case guardFallbackBoth:
+					scanAssigns(current.Body)
+					matched = true
+				}
+				next, ok := current.Else.(*ast.IfStmt)
+				if !ok {
+					break
+				}
+				current = next
+			}
+			if matched {
+				// 守卫链的终端 else 块=链整体反向分支（旧实现同样纳入命中面：
+				// `if td > 0 {…} else if td == -1 {…} else {5s}` 的兜底在此）。
+				terminal := node
+				for {
+					next, ok := terminal.Else.(*ast.IfStmt)
+					if !ok {
+						break
+					}
+					terminal = next
+				}
+				if block, ok := terminal.Else.(*ast.BlockStmt); ok {
+					scanAssigns(block)
+				}
+			}
+		case *ast.SwitchStmt:
+			// S历史问题：`switch { case x <= 0: x = 10 }` 与 `case x == 0:` 形态。
+			for _, stmt := range node.Body.List {
+				clause, ok := stmt.(*ast.CaseClause)
+				if !ok {
+					continue
+				}
+				for _, expr := range clause.List {
+					if guardBranchOf(expr) != guardNone {
+						scanAssigns(&ast.BlockStmt{List: clause.Body})
 						break
 					}
 				}
-				return true
-			})
-		}
-		scanAssigns(ifStmt.Body)
-		// G3：else 链纳入命中面——逐级 else-if 体（同为零值守卫时）+
-		// 终端 else 块（外层守卫的反向兜底形态）。
-		els := ifStmt.Else
-		for els != nil {
-			switch e := els.(type) {
-			case *ast.BlockStmt:
-				scanAssigns(e)
-				els = nil
-			case *ast.IfStmt:
-				if ebin, ok := e.Cond.(*ast.BinaryExpr); ok {
-					if elit, ok := ebin.Y.(*ast.BasicLit); ok && elit.Kind == token.INT && elit.Value == "0" &&
-						(ebin.Op == token.EQL || ebin.Op == token.LEQ || ebin.Op == token.GTR) {
-						scanAssigns(e.Body)
-					}
-				}
-				els = e.Else
-			default:
-				els = nil
 			}
 		}
 		return true
 	})
 	return hits
+}
+
+// guardBranch 枚举零值守卫的兜底分支位置。
+type guardBranch int
+
+const (
+	guardNone guardBranch = iota
+	guardFallbackBody
+	guardFallbackElse
+	guardFallbackBoth
+)
+
+// guardBranchOf 报告条件是否为零值/无效值守卫及其兜底赋值所在分支。整数域等价
+// 形态：
+//
+//	x == 0 / x <= 0 / x < 0 / x < 1  → if 体
+//	x != 0 / x >= 1                   → else 块
+//	x > 0                             → else 块 + if 体（历史命中面保留）
+//
+// GTR 保留 if 体扫描：`if len(x) > 0 { … }` 体内的字面量赋值由旧扫描器纳入，
+// 收窄会让既有 allowlist 条目腐化——命中面只扩不收。
+func guardBranchOf(cond ast.Expr) guardBranch {
+	bin, isBinary := cond.(*ast.BinaryExpr)
+	if !isBinary {
+		return guardNone
+	}
+	lit, isInt := bin.Y.(*ast.BasicLit)
+	if !isInt || lit.Kind != token.INT {
+		return guardNone
+	}
+	switch bin.Op {
+	case token.EQL, token.LEQ:
+		if lit.Value == "0" {
+			return guardFallbackBody
+		}
+	case token.LSS:
+		if lit.Value == "0" || lit.Value == "1" {
+			return guardFallbackBody
+		}
+	case token.NEQ:
+		if lit.Value == "0" {
+			return guardFallbackElse
+		}
+	case token.GTR:
+		if lit.Value == "0" {
+			return guardFallbackBoth
+		}
+	case token.GEQ:
+		if lit.Value == "1" {
+			return guardFallbackElse
+		}
+	}
+	return guardNone
+}
+
+// isLiteralDefault 报告赋值右值是否为写死字面量默认值（INT/STRING 字面量、
+// 非空命名/匿名结构的复合字面量或非空切片字面量）。排除：
+//   - map 字面量（`m["k"] = map[string]interface{}{...}` 是结构装配，不是库值兜底）；
+//   - 空复合字面量（`struct{}{}` 集合插入惯用法、`[]string{}` 非 nil 空切片 flag）。
+func isLiteralDefault(rhs ast.Expr) bool {
+	switch value := rhs.(type) {
+	case *ast.BasicLit:
+		return value.Kind == token.INT || value.Kind == token.STRING
+	case *ast.CompositeLit:
+		if _, isMap := value.Type.(*ast.MapType); isMap {
+			return false
+		}
+		return len(value.Elts) > 0
+	case *ast.UnaryExpr:
+		// 负数字面量（-1）与一元取反同属字面量默认值。
+		return value.Op == token.SUB && isLiteralDefault(value.X)
+	}
+	return false
 }
 
 // isRenderFamilyFunction 按命名识别渲染族函数（历史问题 覆盖面扫描）：
@@ -280,4 +387,77 @@ func containsString(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// S历史问题（历史）：兜底扫描命中面必须覆盖语义等价写法——原实现只认
+// `EQL/LEQ/GTR 对比 INT 0` 的 if 体，以下形态全部逃逸（机制失效时无红灯）：
+//   - `x < 1`（LSS 对比 1，整数域等价 x<=0）；
+//   - `x != 0 { … } else { x = 7 }`（NEQ 对比 0，兜底在 else 链）；
+//   - `switch { case x <= 0: x = 10 }`（switch/case 零值守卫）；
+//   - `if x == 0 { v = c{Timeout: 5} }`（复合字面量默认值）。
+//
+// 每个形态一个夹具：扫描器必须命中（否则「渲染层无写死兜底」第五链可被改写绕过）。
+func TestFallbackScan_detectsEquivalentGuardShapes(t *testing.T) {
+	fixtures := []struct {
+		name   string
+		source string
+	}{
+		{
+			name:   "less-than-one",
+			source: "package p\nfunc f(x int) int { if x < 1 { x = 5 }; return x }\n",
+		},
+		{
+			name:   "not-equal-zero-else",
+			source: "package p\nfunc f(x int) int { if x != 0 { x = x } else { x = 7 }; return x }\n",
+		},
+		{
+			name:   "switch-case-zero-guard",
+			source: "package p\nfunc f(x int) int { switch { case x <= 0: x = 10 }; return x }\n",
+		},
+		{
+			name:   "composite-literal",
+			source: "package p\ntype c struct{ Timeout int }\nfunc f(x int) c { var v c; if x == 0 { v = c{Timeout: 5} }; return v }\n",
+		},
+	}
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, fixture.name+".go", fixture.source, 0)
+			if err != nil {
+				t.Fatalf("parse fixture: %v", err)
+			}
+			var fn *ast.FuncDecl
+			for _, decl := range file.Decls {
+				if candidate, ok := decl.(*ast.FuncDecl); ok && candidate.Name.Name == "f" {
+					fn = candidate
+					break
+				}
+			}
+			if fn == nil {
+				t.Fatal("fixture function f not found")
+			}
+			if hits := fallbackAssignmentsInFunction(fset, fn); len(hits) == 0 {
+				t.Fatalf("等价兜底形态未被扫描命中——机制存在绕过路径: %s", fixture.source)
+			}
+		})
+	}
+}
+
+// 反向形状：正常业务分支的数值赋值（非零值守卫）不得被误判为兜底。
+func TestFallbackScan_ignoresNonZeroGuardBranches(t *testing.T) {
+	source := "package p\nfunc f(x int) int { if x == 1 { x = 5 }; return x }\n"
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "nonzero.go", source, 0)
+	if err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "f" {
+			continue
+		}
+		if hits := fallbackAssignmentsInFunction(fset, fn); len(hits) != 0 {
+			t.Fatalf("非零值守卫被误报为兜底: %v", hits)
+		}
+	}
 }

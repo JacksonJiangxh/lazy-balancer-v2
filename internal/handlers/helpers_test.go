@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -224,6 +225,41 @@ func generateECDSACert(domain string, notBefore, notAfter time.Time) (certPEM, k
 	return certPEM, keyPEM, nil
 }
 
+// generateEd25519Cert creates an Ed25519 certificate（H-B1-01：内部 CA/自签
+// 常用密钥类型，tls.X509KeyPair 与 Caddy 均支持）。
+func generateEd25519Cert(domain string, notBefore, notAfter time.Time) (certPEM, keyPEM string, err error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: domain,
+		},
+		DNSNames:              []string{domain},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, pub, priv)
+	if err != nil {
+		return "", "", err
+	}
+
+	certPEM = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}))
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return "", "", err
+	}
+	keyPEM = string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes}))
+	return certPEM, keyPEM, nil
+}
+
 func TestParseTLSCertificate(t *testing.T) {
 	now := time.Now()
 
@@ -272,14 +308,25 @@ func TestParseTLSCertificate(t *testing.T) {
 			wantErr:     false,
 		},
 		{
+			// H-B1-10（历史）：只断言本包自有的错误文案（"invalid certificate
+			// or key pair"），不钉 Go 标准库 crypto/tls 的措辞——小版本改写错误串
+			// 不得误红，也不得让「配对检测坏了」与「引擎文案变了」混为一谈。
 			name:        "mismatched cert and key",
 			wantErr:     true,
-			errContains: "private key does not match public key",
+			errContains: "invalid certificate or key pair",
 		},
 		{
 			name:       "valid ECDSA certificate",
 			wantValid:  true,
 			wantDomain: "ecdsa.example.com",
+			wantErr:    false,
+		},
+		{
+			// H-B1-01（历史）：Ed25519 手动证书此前被公钥类型白名单硬拒
+			// （"unsupported public key type in certificate"）——面板比引擎更窄。
+			name:       "valid Ed25519 certificate",
+			wantValid:  true,
+			wantDomain: "ed25519.example.com",
 			wantErr:    false,
 		},
 	}
@@ -316,6 +363,11 @@ func TestParseTLSCertificate(t *testing.T) {
 				certPEM, keyPEM, err = generateECDSACert("ecdsa.example.com", now.Add(-1*time.Hour), now.Add(24*time.Hour))
 				if err != nil {
 					t.Fatalf("failed to generate ECDSA cert: %v", err)
+				}
+			case "valid Ed25519 certificate":
+				certPEM, keyPEM, err = generateEd25519Cert("ed25519.example.com", now.Add(-1*time.Hour), now.Add(24*time.Hour))
+				if err != nil {
+					t.Fatalf("failed to generate Ed25519 cert: %v", err)
 				}
 			}
 

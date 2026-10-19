@@ -39,7 +39,9 @@
         <el-table-column label="版本" width="120">
           <template #default="{ row }"><span class="lib-version">{{ row.version }}</span></template>
         </el-table-column>
-        <el-table-column label="数量" width="110" align="right">
+        <!-- W87-10：本列对 CRS/威胁/爬虫是条目数，对 IP 地理库是库文件大小——
+             列名必须两义都覆盖，否则字节数会被读成条目数 -->
+        <el-table-column label="数量 / 大小" width="120" align="right">
           <template #default="{ row }"><span class="lib-count">{{ row.count }}</span></template>
         </el-table-column>
         <el-table-column label="状态" width="110">
@@ -51,7 +53,10 @@
         </el-table-column>
         <el-table-column label="自动更新" width="90" align="center">
           <template #default="{ row }">
-            <el-switch :model-value="row.autoUpdate" :disabled="isReadOnly || isSlaveNode" @change="(v: boolean) => toggleLibAutoUpdate(row, v)" />
+            <!-- W87-16：库状态读取失败/首次响应未落地时开关态不可信——显示「—」并禁用，
+                 不得按本地默认 true 冒充「已开启」 -->
+            <span v-if="!row.autoUpdateKnown" class="text-secondary" title="库状态未知（读取失败），开关态不可信">—</span>
+            <el-switch v-else :model-value="row.autoUpdate" :disabled="isReadOnly || isSlaveNode" @change="(v: boolean) => toggleLibAutoUpdate(row, v)" />
           </template>
         </el-table-column>
         <el-table-column v-if="!isSlaveNode" label="上次更新" width="150">
@@ -626,7 +631,7 @@ import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { Aim, Filter, List, Location, Lock, Search, Notebook, Plus, WarningFilled, Link } from '@element-plus/icons-vue'
 import { formatDate, parseDbTimeMs } from '@/utils/date'
 import { IP_LIST_CATEGORIES, invalidateSharedEntriesCache } from '@/utils/securityStages'
-import { libraryHealthTag, librarySourceHealthTag, libraryStatusLabel, libraryStatusTagType, summarizeLibrarySources } from '@/utils/securityLibraries'
+import { crsRuleCountLabel, libraryHealthTag, librarySourceHealthTag, libraryStatusLabel, libraryStatusTagType, summarizeLibrarySources } from '@/utils/securityLibraries'
 import { updaterName } from '@/utils/updaterName'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import RuleLibScheduleEditor from '@/components/RuleLibScheduleEditor.vue'
@@ -724,6 +729,9 @@ interface LibRow {
   count: string
   status: string
   autoUpdate: boolean
+  // W87-16：读取失败/首次响应未落地时 autoUpdate 是本地默认值而非库值——
+  // 开关必须显示「未知」并禁用，不得冒充「已开启」。
+  autoUpdateKnown: boolean
   lastChecked: string
   nextUpdate: string
 }
@@ -736,7 +744,10 @@ const libRows = computed<LibRow[]>(() => {
       version: crsInfoError.value ? '—' : crsInfo.value.available === false ? '未安装' : (crsInfo.value.version || '—'),  // 缺失态文案与 IP 库统一「未安装」（2026-09-24 用户裁定）
       // 库容量=GET /security/crs 的 rule_count（服务端全量）；分页 total 只反映
       // 当前搜索条件下的结果集，二者不可共用（历史问题）。
-      count: crsInfoError.value || !crsInfo.value.rule_count ? '—' : crsInfo.value.rule_count.toLocaleString() + ' 个文件',
+      // W87-02：rule_count 是 SecRule 指令条数（后端 countSecRules 只数 SecRule 行），
+      // 不是文件数——文案必须是「条规则」（单源 crsRuleCountLabel，有行为测试）。
+      count: crsInfoError.value ? '—' : crsRuleCountLabel(crsInfo.value.rule_count),
+      autoUpdateKnown: !crsInfoError.value && crsInfoLoaded.value,
       status: crsInfoError.value ? 'failed' : crsInfo.value.available === false ? 'missing' : crsInfo.value.update_status,
       autoUpdate: crsInfo.value.auto_update,
       lastChecked: formatDate(crsInfo.value.last_checked) || '—',
@@ -745,7 +756,10 @@ const libRows = computed<LibRow[]>(() => {
     {
       key: 'ip2region', icon: Location, iconClass: 'lib-icon--ip', name: 'IP 地理库', sub: 'IP 地理归属数据库',
       version: ip2regionInfoError.value ? '—' : ip2regionInfo.value.available === false ? '未安装' : ip2regionVersionLabel.value,
-      count: !ip2regionInfoError.value && ip2regionInfo.value.db_size && ip2regionInfo.value.version && ip2regionInfo.value.version !== 'unknown' ? ip2regionInfo.value.db_size.toLocaleString() : '—',
+      // W87-10：db_size 是库文件字节数——必须带单位（B/KB/MB）呈现，不得让
+      // 用户把字节数读成条目数（条目口径见「数量/大小」列名的「大小」段）。
+      count: !ip2regionInfoError.value && ip2regionInfo.value.db_size && ip2regionInfo.value.version && ip2regionInfo.value.version !== 'unknown' ? formatSize(ip2regionInfo.value.db_size) : '—',
+      autoUpdateKnown: !ip2regionInfoError.value && ip2regionInfoLoaded.value,
       status: ip2regionInfoError.value ? 'failed' : ip2regionInfo.value.available === false ? 'missing' : ip2regionStatusForTag.value,
       autoUpdate: ip2regionInfo.value.auto_update,
       lastChecked: formatDate(ip2regionInfo.value.last_checked) || '—',
@@ -768,6 +782,7 @@ const libRows = computed<LibRow[]>(() => {
       count: summary.totalEntries > 0 ? summary.totalEntries.toLocaleString() + ' 条' : '—',
       status: summary.status,
       autoUpdate: threatAutoUpdate.value,
+      autoUpdateKnown: threatLibLoaded.value && !threatLibError.value,
       lastChecked: summary.lastChecked,
       nextUpdate: summary.nextUpdate,
     })
@@ -784,6 +799,7 @@ const libRows = computed<LibRow[]>(() => {
       count: summary.totalEntries > 0 ? summary.totalEntries.toLocaleString() + ' 条' : '—',
       status: summary.status,
       autoUpdate: crawlerAutoUpdate.value,
+      autoUpdateKnown: crawlerLibLoaded.value && !crawlerLibError.value,
       lastChecked: summary.lastChecked,
       nextUpdate: summary.nextUpdate,
     })
@@ -1103,7 +1119,9 @@ const openIpListDialog = async (row?: IPListRow) => {
   ipListDialogVisible.value = true
   loadingIpListDetail.value = true
   try {
-    const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${row.id}`)
+    // W87-13：全局拦截器已 toast——本请求 silent，失败提示只用本地那条带
+    // 「已禁用保存」动作信息的文案（否则同一次失败弹两条 error）。
+    const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${row.id}`, { silent: true })
     if (requestSeq !== ipListDetailSeq) return
     if (res.data && ipListDialogVisible.value) {
       // 历史问题：自动封禁名单条目保留 created_at/expires_at（保存随全量写回，
@@ -1127,7 +1145,8 @@ const reloadIpListDetail = async (): Promise<void> => {
   const requestSeq = ++ipListDetailSeq
   loadingIpListDetail.value = true
   try {
-    const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${id}`)
+    // W87-13：同 openIpListDialog——silent + 本地文案，避免双 toast。
+    const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${id}`, { silent: true })
     if (requestSeq !== ipListDetailSeq) return
     ipListForm.value.entries = (res.data?.entries || []).map((e) => ({ value: e.value, remark: e.remark, created_at: e.created_at, expires_at: e.expires_at }))
     ipListDetailFailed.value = false

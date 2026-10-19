@@ -191,3 +191,34 @@ func TestBuildRuleCaddyContext_TLSConnectionPoliciesScopedToRule(t *testing.T) {
 		})
 	}
 }
+
+// B2-07：同一 @id 出现在多个 server（外部写入/历史漂移）时，配置查看框的
+// server_context 必须确定性选定（排序后首个命中），不得随 map 序遍历漂移。
+func TestBuildRuleCaddyContext_deterministicServerSelection(t *testing.T) {
+	fullConfig := map[string]interface{}{
+		"apps": map[string]interface{}{
+			"http": map[string]interface{}{
+				"servers": map[string]interface{}{
+					"srv_b": map[string]interface{}{
+						"listen": []interface{}{":9000"},
+						"routes": []interface{}{map[string]interface{}{"@id": "lb_drift"}},
+					},
+					"srv_a": map[string]interface{}{
+						"listen": []interface{}{":8000"},
+						"routes": []interface{}{map[string]interface{}{"@id": "lb_drift"}},
+					},
+				},
+			},
+		},
+	}
+	for i := range 30 {
+		result := buildRuleCaddyContext(fullConfig, "lb_drift", "drift.example.test")
+		server, ok := result["server"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("iteration %d: server context missing", i)
+		}
+		if name := server["server_name"]; name != "srv_a" {
+			t.Fatalf("iteration %d: server_name=%v, want srv_a（排序后首个命中，确定性）", i, name)
+		}
+	}
+}

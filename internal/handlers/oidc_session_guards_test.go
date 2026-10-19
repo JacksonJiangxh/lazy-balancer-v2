@@ -403,3 +403,94 @@ func TestOIDCCallback_jit_username_rune_safe_truncation(t *testing.T) {
 		t.Fatalf("collision-suffixed username rune count=%d, want 50 (got %q)", got, name)
 	}
 }
+
+// 历史问题（历史）：未认证访问者可见的错误位不得回显服务端原始错误——
+// OIDCLogin 的 discovery 失败此前直接 fail(err.Error())，把 IdP 地址/网络
+// 错误文本写进 #/login?oidc_error=；与回调 error 参数白名单清洗口径相悖。
+// 失败文案归一为固定短句，原始错误仅落日志。
+func TestOIDCLogin_failureMessageDoesNotLeakProviderDetail(t *testing.T) {
+	idp := newMockIdP(t)
+	router, _ := setupOIDCTest(t, idp)
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	t.Cleanup(dead.Close)
+	oidcProviderInvalidate(dead.URL)
+	putOIDCConfig(t, router, `{"issuer":"`+dead.URL+`","client_id":"test-client","client_secret":"s","enabled":true}`)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/login", nil))
+	if recorder.Code != http.StatusFound {
+		t.Fatalf("status=%d body=%s, want 302", recorder.Code, recorder.Body.String())
+	}
+	loc := recorder.Header().Get("Location")
+	raw := loc[strings.Index(loc, "oidc_error=")+len("oidc_error="):]
+	message, err := url.QueryUnescape(raw)
+	if err != nil {
+		t.Fatalf("unescape oidc_error: %v", err)
+	}
+	if message != "OIDC 服务不可达，请检查配置" {
+		t.Fatalf("oidc_error=%q, want 固定短句「OIDC 服务不可达，请检查配置」", message)
+	}
+	for _, leaked := range []string{dead.URL, "OIDC 发现失败", "127.0.0.1"} {
+		if strings.Contains(message, leaked) {
+			t.Fatalf("oidc_error 泄露服务端细节 %q: %q", leaked, message)
+		}
+	}
+}
+
+// 历史问题 同族（R-12）：回调侧 provider 构建/令牌交换/id_token 校验失败同样
+// 不得把原始错误回显给未认证浏览器。
+func TestOIDCCallback_failureMessageDoesNotLeakProviderDetail(t *testing.T) {
+	idp := newMockIdP(t)
+	router, _ := setupOIDCTest(t, idp)
+	putOIDCConfig(t, router, `{"issuer":"`+idp.issuer+`","client_id":"test-client","client_secret":"s","enabled":true}`)
+
+	// 先取一个合法 state，再切到不可达 issuer——回调在 provider 构建阶段失败。
+	login := httptest.NewRecorder()
+	router.ServeHTTP(login, httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/login", nil))
+	state, _ := url.Parse(login.Header().Get("Location"))
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	t.Cleanup(dead.Close)
+	oidcProviderInvalidate(dead.URL)
+	putOIDCConfig(t, router, `{"issuer":"`+dead.URL+`","client_id":"test-client","client_secret":"s","enabled":true}`)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback?code=x&state="+state.Query().Get("state"), nil))
+	if recorder.Code != http.StatusFound {
+		t.Fatalf("status=%d body=%s, want 302", recorder.Code, recorder.Body.String())
+	}
+	loc := recorder.Header().Get("Location")
+	frag := loc[strings.Index(loc, "#")+1:]
+	frag = frag[strings.Index(frag, "?")+1:]
+	values, _ := url.ParseQuery(frag)
+	message := values.Get("error")
+	if message != "OIDC 服务不可达，请检查配置" {
+		t.Fatalf("callback error=%q, want 固定短句「OIDC 服务不可达，请检查配置」", message)
+	}
+	if strings.Contains(message, dead.URL) || strings.Contains(message, "127.0.0.1") {
+		t.Fatalf("callback error 泄露服务端细节: %q", message)
+	}
+}
+
+// 历史问题（历史）：sanitizeOIDCErrorParam 此前无直接测试——表驱动钉住
+// 白名单/超长/伪造值三形状（回调端到端形态另有
+// TestOIDCCallback_error_param_sanitized）。
+func TestSanitizeOIDCErrorParam_shapes(t *testing.T) {
+	cases := []struct{ name, raw, want string }{
+		{name: "whitelist code", raw: "access_denied", want: "access_denied"},
+		{name: "case-insensitive keeps original", raw: "ACCESS_DENIED", want: "ACCESS_DENIED"},
+		{name: "surrounding whitespace trimmed", raw: "  login_required  ", want: "login_required"},
+		{name: "forged value swallowed", raw: "custom-injected-text", want: ""},
+		{name: "html injection swallowed", raw: `<script>alert(1)</script>`, want: ""},
+		{name: "oversized swallowed", raw: strings.Repeat("a", 65), want: ""},
+		{name: "empty swallowed", raw: "", want: ""},
+	}
+	for _, tc := range cases {
+		if got := sanitizeOIDCErrorParam(tc.raw); got != tc.want {
+			t.Fatalf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

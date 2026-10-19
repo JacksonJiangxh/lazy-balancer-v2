@@ -1,6 +1,9 @@
 package db
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // 内置威胁名单专业化改名迁移（2026-09-24 用户裁定）：存量 system=1 行按旧名
 // 更新为新名（保 id——策略 refs 按 id 引用），新库直接以新名种子。
@@ -62,6 +65,7 @@ func TestThreatSystemListRename_renamesUserConflictAndTakesCanonicalName(t *test
 	}
 
 	// When
+	drainSystemAuditBuffer()
 	if err := migrateThreatSystemListNames(); err != nil {
 		t.Fatalf("migrate: %v（冲突用户行改名与规范名接管不得阻断启动）", err)
 	}
@@ -92,6 +96,11 @@ func TestThreatSystemListRename_renamesUserConflictAndTakesCanonicalName(t *test
 	// And 幂等：二次执行不报错且不再改名
 	if err := migrateThreatSystemListNames(); err != nil {
 		t.Fatalf("二次执行: %v", err)
+	}
+	// And 历史问题：用户名单被改名留痕（聚合一行，含 ids）。
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 1 || entries[0].resource != "IP 名单" || !strings.Contains(entries[0].detail, "已改名用户名单 1 条") {
+		t.Fatalf("冲突改名审计=%+v, want 一行用户名单改名记录", entries)
 	}
 }
 
@@ -136,7 +145,7 @@ func TestThreatSystemListRename_returnsConflictScanError(t *testing.T) {
 // 新名口径：去「威胁情报库-」前缀，专业化命名
 func TestThreatSystemLists_professionalNames(t *testing.T) {
 	names := map[string]string{}
-	for _, sl := range ThreatSystemLists {
+	for _, sl := range ThreatSystemLists() {
 		names[sl.Source] = sl.Name
 	}
 	want := map[string]string{
@@ -148,5 +157,40 @@ func TestThreatSystemLists_professionalNames(t *testing.T) {
 		if names[src] != w {
 			t.Fatalf("%s 名单名=%q, want %q", src, names[src], w)
 		}
+	}
+}
+
+// 历史问题（历史）：注册表只读出口——返回副本，任一消费方 append/改
+// 元素不得污染全局（播种、备份配额校验、详情计数、快照链路共用）。
+func TestThreatSystemLists_returnsIsolatedClone(t *testing.T) {
+	original := ThreatSystemLists()
+	if len(original) == 0 {
+		t.Fatal("registry must not be empty")
+	}
+
+	mutated := ThreatSystemLists()
+	mutated[0].Name = "tampered"
+	_ = append(ThreatSystemLists(), ThreatSystemList{Source: "ghost", Name: "幽灵名单"})
+
+	if got := ThreatSystemLists(); got[0].Name != original[0].Name || len(got) != len(original) {
+		t.Fatalf("registry polluted by consumer mutation: %+v", got)
+	}
+}
+
+// SetThreatSystemListsForTest 是跨包测试的注入缝（模拟未来新增内置源）：
+// 注入内容被复制、还原函数恢复原注册表。
+func TestSetThreatSystemListsForTest_isolatesAndRestores(t *testing.T) {
+	original := ThreatSystemLists()
+	injected := append([]ThreatSystemList{}, original...)
+	injected = append(injected, ThreatSystemList{Source: "future_source", Name: "未来威胁名单"})
+
+	restore := SetThreatSystemListsForTest(injected)
+	injected[0].Name = "mutated-after-inject"
+	if got := ThreatSystemLists(); len(got) != len(original)+1 || got[0].Name == "mutated-after-inject" {
+		t.Fatalf("injected registry not isolated: %+v", got)
+	}
+	restore()
+	if got := ThreatSystemLists(); len(got) != len(original) || got[0].Name != original[0].Name {
+		t.Fatalf("restore failed: %+v", got)
 	}
 }

@@ -212,7 +212,7 @@
                 <span class="rule-bar"><i :style="{ width: targetBarWidth(item.value) }"></i></span>
               </li>
             </ul>
-            <div v-else class="empty">暂无规则维度数据</div>
+            <div v-else class="empty">暂无目标数据</div>
           </template>
           <template v-else>
             <ul v-if="topRules.length" class="rules">
@@ -718,8 +718,10 @@ const trafficTask = usePollingTask(async ({ signal, isCurrent }) => {
   const countries = res.data?.countries ?? {}
   const now = Date.now()
   const sample = trafficDelta(trafficBaseline, countries, now, sampleN)
+  // WT87-07：基线必须取 trafficDelta **归一后**的计数（缺失/非数值→0），
+  // 不得从原始响应重建——否则缺字段时基线存 undefined，差分恒 NaN 且静默丢国。
   trafficBaseline = {
-    counts: new Map(Object.entries(countries).map(([name, entry]) => [name, { normal: entry.normal, attack: entry.attack }])),
+    counts: sample.counts,
     at: now,
     sampleN,
   }
@@ -849,6 +851,9 @@ let flowSince = 0
 let flowCursorEpoch = 0
 let adaptiveStable = 0
 let adaptiveLastSwitch = 0
+// 正在累计确认的目标档位：必须跨轮持久化，否则「连续同向」永远只有 1 次
+//（WT87-06：方向反转要靠它识别，丢失后自适应档位将永不切换）。
+let adaptivePendingTarget = 0
 const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
   const cursorEpoch = flowCursorEpoch
   const res = await request.get<APIResponse<{ enabled?: boolean; events?: NormalFlowEvent[]; next_seq?: number; sample_n?: number }>>(
@@ -890,12 +895,13 @@ const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
     // 上次换档 ≥4s（滞回阈值见 ADAPTIVE_SAMPLE_THRESHOLDS）。
     const observedRate = reconstructObservedRate(events.length, data.sample_n ?? 0, activeSampleN.value)
     const outcome = stepAdaptiveSample(
-      { active: activeSampleN.value, stable: adaptiveStable, lastSwitch: adaptiveLastSwitch },
+      { active: activeSampleN.value, stable: adaptiveStable, lastSwitch: adaptiveLastSwitch, pendingTarget: adaptivePendingTarget },
       observedRate,
       Date.now(),
     )
     adaptiveStable = outcome.stable
     adaptiveLastSwitch = outcome.lastSwitch
+    adaptivePendingTarget = outcome.pendingTarget ?? 0
     if (outcome.changed) {
       activeSampleN.value = outcome.active
       acquireCollector()
@@ -1240,7 +1246,7 @@ onBeforeUnmount(() => {
 @media (prefers-reduced-motion: reduce) {
   .threat-screen::before, .threat-screen::after { animation: none !important; }
   .hud { backdrop-filter: none; }
-  .glitch, .live-chip i, .scanline, .viewport-grid { animation: none !important; }
+  .glitch, .live-chip i { animation: none !important; }
 }
 .btn {
   display: inline-flex; align-items: center; gap: 6px;
@@ -1302,7 +1308,6 @@ onBeforeUnmount(() => {
 .event[data-sev='mid'] { --sev: #ffb020; }
 .event[data-sev='low'] { --sev: #3ddc84; }
 .event:hover { border-color: rgba(80, 170, 255, 0.45); }
-.ev-icon svg { width: 14px; height: 14px; }
 .ev-top { display: flex; justify-content: flex-start; align-items: center; gap: 10px; font-size: 11px; color: #56709f; font-variant-numeric: tabular-nums; }
 .ev-top .act { margin-left: auto; }
 .sev { font-size: 10px; line-height: 1; padding: 3px 6px; border: 1px solid; }

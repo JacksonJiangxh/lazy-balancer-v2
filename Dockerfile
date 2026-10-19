@@ -54,8 +54,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 #  做逐段数值化语义比较，不设上限，依赖升到大版本也不会误报。
 #  ge() 的局部变量必须以多余形参声明，否则会覆盖主循环的 i 导致漏检；
 #  且 awk 程序必须保持单行——多行函数体会破坏 RUN 指令解析）
+#  唯一例外是 github.com/corazawaf/coraza/v3（PL历史问题）：安全拦截计数/计时
+#  分段归属依赖 coraza tx.ID 长度=16，MVS 抬升次版本可能静默改变该假设，故按
+#  [v3.8.1, v3.9) 区间断言（ge(v,"v3.8.1") && !ge(v,"v3.9.0")）——此处刻意设
+#  上限，升级需同步复核 blocked_counter.go 的 len(ID)==16 判定与本断言。
 RUN go version -m /app/caddy | tee /tmp/caddy-mods.txt && \
-    awk -F'\t' 'function ge(v, f,  a, b, av, bv, i) { split(substr(v, 2), a, "."); split(substr(f, 2), b, "."); for (i = 1; i <= 3; i++) { av = a[i] + 0; bv = b[i] + 0; if (av > bv) return 1; if (av < bv) return 0 } return 1 } { for (i = 1; i < NF; i++) { if ($i == "google.golang.org/grpc") ok1 = ge($(i+1), "v1.83.2"); else if ($i == "go.opentelemetry.io/otel") ok2 = ge($(i+1), "v1.45.0"); else if ($i == "golang.org/x/net") ok3 = ge($(i+1), "v0.58.0"); else if ($i == "golang.org/x/crypto") ok4 = ge($(i+1), "v0.56.0"); else if ($i == "cel.dev/cel-go") ok5 = ge($(i+1), "v0.32.0") } } END { exit (ok1 && ok2 && ok3 && ok4 && ok5) ? 0 : 1 }' /tmp/caddy-mods.txt
+    awk -F'\t' 'function ge(v, f,  a, b, av, bv, i) { split(substr(v, 2), a, "."); split(substr(f, 2), b, "."); for (i = 1; i <= 3; i++) { av = a[i] + 0; bv = b[i] + 0; if (av > bv) return 1; if (av < bv) return 0 } return 1 } { for (i = 1; i < NF; i++) { if ($i == "google.golang.org/grpc") ok1 = ge($(i+1), "v1.83.2"); else if ($i == "go.opentelemetry.io/otel") ok2 = ge($(i+1), "v1.45.0"); else if ($i == "golang.org/x/net") ok3 = ge($(i+1), "v0.58.0"); else if ($i == "golang.org/x/crypto") ok4 = ge($(i+1), "v0.56.0"); else if ($i == "cel.dev/cel-go") ok5 = ge($(i+1), "v0.32.0"); else if ($i == "github.com/corazawaf/coraza/v3") ok6 = (ge($(i+1), "v3.8.1") && !ge($(i+1), "v3.9.0")) } } END { exit (ok1 && ok2 && ok3 && ok4 && ok5 && ok6) ? 0 : 1 }' /tmp/caddy-mods.txt
 
 # Build Go backend
 FROM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS backend
@@ -100,6 +104,12 @@ FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4c
 # web/src/utils/branding.ts appVersion 回退值、本文件 ARG VERSION、
 # internal/config/config.go APP_VERSION 回退、buildx --build-arg（发布时必须
 # 显式传）。发版检查单以 lazy-balancer-release 技能步骤 2 为唯一清单。
+#
+# PD-01（历史）双轨口径（v2.3.6-beta 起有意设计，非分叉）：`VERSION`
+# 恒为**正式版本号**（如 v2.3.8，面板/`/api/v1/branding` 展示口径）；镜像
+# tag/compose image 可带 `-beta` 通道后缀（如 v2.3.8-beta）。二者刻意不同，
+# 发布时的判定口径是「tag 去掉通道后缀 == APP_VERSION」。改此约定需同时改
+# README 两版示例、docker-compose.yml、branding/config 回退与发布技能。
 ARG VERSION=v2.3.8
 # 构建机网络受限时经 --build-arg HTTP(S)_PROXY 透传给 RUN 下载步骤
 # （CRS/ip2region 钉版下载）；未传参时为空值，行为不变（官方惯例形态）。
@@ -129,7 +139,10 @@ RUN mkdir -p /app/data /app/config /app/logs /app/certs /app/waf/crs /app/waf/au
 # from the build network complements each other. Proxy does not support git
 # protocol, so use the archive tarball instead of git clone). VERSION marker
 # lets startup reconciliation tell the bundled version from user-updated ones.
-ARG CRS_VERSION=v4.28.0
+# PD-02（历史）：CRS 版本与校验和收敛为本 RUN 内的一对变量（单一事实源）。
+# 此前是 `ARG CRS_VERSION` + 写死校验和——`--build-arg CRS_VERSION=` 覆盖版本后
+# 校验必然失败，属「可覆盖但覆盖即坏」的假参数；版本与校验和必须成对修改，
+# 相邻书写让升级时漏改其中一行立刻显性失败。ip2region xdb 的钉版同理。
 # INFRA-R1（历史）：两段逐字相同的 apk-curl 三次重试循环合并为单个 RUN——
 # 一次装 curl → CRS 下载/校验/解包 → waf.dist 快照 → xdb 下载/校验 → 一次
 # apk del curl；少两层、少一次装删、重试逻辑单份。
@@ -137,36 +150,44 @@ ARG CRS_VERSION=v4.28.0
 # 瞬态错误），重试重新拉包即可消化；CRS/xdb 双源下载同样包 3 次重试——
 # 受限网络下双源同时瞬时失败不应直接终止构建（与同 RUN 内 apk 及构建期
 # go mod download/xcaddy 的重试口径对齐，失败仍显性报错、行为不弱化）。
-RUN n=0; until apk add --no-cache curl; do \
+# PD-02：校验和（sha256sum -c）在重试环**内**——镜像源返回 200 但内容是
+# 损坏包/HTML 错误页时同样重试，否则「瞬态污染」这一被重试覆盖的形态会在
+# 环外立即终止构建；3 次仍失败照常 exit 1，可复现性不减。
+RUN crs_version=v4.28.0; \
+    crs_sha256=d8acc96f25ad07c8e3a595a23c797324f6d77e59ddf9e26e90dd95ebd2e676ce; \
+    xdb_sha256=6307a9696f5711f84bcb8b25f07894de68a64a0ed4a1cc7e990562dd3084f210; \
+    n=0; until apk add --no-cache curl; do \
       n=$((n+1)); \
       if [ "$n" -ge 3 ]; then echo ">>> apk add curl 3 次失败" >&2; exit 1; fi; \
       echo ">>> apk add curl 第 ${n}/3 次失败，10s 后重试" >&2; sleep 10; \
     done && \
     mkdir -p /tmp/crs-src && \
-    n=0; until (curl -sfL -o /tmp/crs.tar.gz "https://ghfast.top/https://github.com/coreruleset/coreruleset/archive/refs/tags/${CRS_VERSION}.tar.gz" || \
-                curl -sfL -o /tmp/crs.tar.gz "https://github.com/coreruleset/coreruleset/archive/refs/tags/${CRS_VERSION}.tar.gz"); do \
+    n=0; until (curl -sfL -o /tmp/crs.tar.gz "https://ghfast.top/https://github.com/coreruleset/coreruleset/archive/refs/tags/${crs_version}.tar.gz" || \
+                curl -sfL -o /tmp/crs.tar.gz "https://github.com/coreruleset/coreruleset/archive/refs/tags/${crs_version}.tar.gz") && \
+               echo "${crs_sha256}  /tmp/crs.tar.gz" | sha256sum -c -; do \
       n=$((n+1)); \
-      if [ "$n" -ge 3 ]; then echo ">>> CRS 下载 3 次失败" >&2; exit 1; fi; \
-      echo ">>> CRS 下载第 ${n}/3 次失败，10s 后重试" >&2; sleep 10; \
+      if [ "$n" -ge 3 ]; then echo ">>> CRS 下载/校验 3 次失败" >&2; exit 1; fi; \
+      echo ">>> CRS 下载/校验第 ${n}/3 次失败，10s 后重试" >&2; sleep 10; \
     done && \
-    echo "d8acc96f25ad07c8e3a595a23c797324f6d77e59ddf9e26e90dd95ebd2e676ce  /tmp/crs.tar.gz" | sha256sum -c - && \
     tar xzf /tmp/crs.tar.gz --strip-components=1 -C /tmp/crs-src && \
     cp -r /tmp/crs-src/rules /app/waf/crs/rules && \
     cp /tmp/crs-src/crs-setup.conf.example /app/waf/crs/crs-setup.conf && \
-    echo "${CRS_VERSION}" > /app/waf/crs/VERSION && \
+    echo "${crs_version}" > /app/waf/crs/VERSION && \
     rm -rf /tmp/crs-src /tmp/crs.tar.gz && \
     cp -r /app/waf /app/waf.dist && \
     n=0; until (curl -sfL -o /app/waf.dist/ip2region.xdb "https://ghfast.top/https://raw.githubusercontent.com/lionsoul2014/ip2region/v3.17.0/data/ip2region_v4.xdb" || \
-                curl -sfL -o /app/waf.dist/ip2region.xdb "https://raw.githubusercontent.com/lionsoul2014/ip2region/v3.17.0/data/ip2region_v4.xdb"); do \
+                curl -sfL -o /app/waf.dist/ip2region.xdb "https://raw.githubusercontent.com/lionsoul2014/ip2region/v3.17.0/data/ip2region_v4.xdb") && \
+               echo "${xdb_sha256}  /app/waf.dist/ip2region.xdb" | sha256sum -c -; do \
       n=$((n+1)); \
-      if [ "$n" -ge 3 ]; then echo ">>> ip2region xdb 下载 3 次失败" >&2; exit 1; fi; \
-      echo ">>> ip2region xdb 下载第 ${n}/3 次失败，10s 后重试" >&2; sleep 10; \
+      if [ "$n" -ge 3 ]; then echo ">>> ip2region xdb 下载/校验 3 次失败" >&2; exit 1; fi; \
+      echo ">>> ip2region xdb 下载/校验第 ${n}/3 次失败，10s 后重试" >&2; sleep 10; \
     done && \
-    echo "6307a9696f5711f84bcb8b25f07894de68a64a0ed4a1cc7e990562dd3084f210  /app/waf.dist/ip2region.xdb" | sha256sum -c - && \
     apk del curl
 
 # 爬虫地址库内置首版：离线新实例由 PrimeCrawlerIPLists 读取并落库/生成 .fast。
-COPY config/crawler-ip-lists.seed.json /app/waf.dist/crawler-ip-lists.seed.json
+# PD-04（历史）：数据文件移入 geoipnames 包并随包嵌入二进制（同一份字节
+# 同时是镜像资产与 services 的离线回退），此处 COPY 必须指向嵌入路径。
+COPY geoipnames/crawler-ip-lists.seed.json /app/waf.dist/crawler-ip-lists.seed.json
 # 容器以 root 运行（无 USER/降权，与常见 Caddy 镜像同态）；如需非 root，需
 # 同时给 80/443 加 CAP_NET_BIND_SERVICE 并预置 bind 挂载属主（历史 历史问题-29）
 

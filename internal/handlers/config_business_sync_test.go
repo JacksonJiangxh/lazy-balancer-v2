@@ -15,15 +15,15 @@ func TestImportConfigBackup_realignsBusinessTaskLoops(t *testing.T) {
 	for _, id := range []string{"threat", "crs", "ip2region", "crawlerbot-update", "auto-backup", "autoban"} {
 		te.StopLoop(id)
 	}
-	backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_crs_version":       {{"id": 1, "version": "v4.28.0", "auto_update": 1}},
 		"security_ip2region_version": {{"id": 1, "version": "v3.17.0", "auto_update": 1}},
-	}, map[string]any{
+	}, Config: map[string]any{
 		"threat_auto_update":  true,
 		"crawler_auto_update": true,
 		"auto_backup_enabled": true,
 		"autoban_enabled":     true,
-	})
+	}})
 
 	// When：导入提交成功。
 	response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)

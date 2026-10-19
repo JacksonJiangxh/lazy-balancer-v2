@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/models"
 )
@@ -625,6 +626,9 @@ func TestUntarGzTo_restoreFailure_joinedIntoReturnedError(t *testing.T) {
 				_ = os.Chmod(blocker, 0000)
 				return
 			}
+			// SS87-历史问题：轮询退避——无 sleep 的忙转会在整段 32MB 解包期间
+			// 空转一个核（CI 资源浪费）；写入窗口由 glob 观测，1ms 粒度足够。
+			time.Sleep(time.Millisecond)
 		}
 	}()
 	defer func() {
@@ -978,5 +982,121 @@ func TestBuildWafFileRef_readFailureIsExplicit(t *testing.T) {
 	}
 	if ref := BuildWafFileRef(); ref != nil {
 		t.Fatalf("分量读失败必须显式化（nil ref + 错误日志），不得静默省略: %+v", ref)
+	}
+}
+
+// SS87-历史问题：xdb sidecar 只在内容哈希校验通过后才改写（拒绝路径不得留下
+// 「新标签 + 旧库」跨代偏斜）。
+func TestApplyWafFileBundle_xdbHashMismatchLeavesVersionSidecarUntouched(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "ip2region.xdb")
+	withIP2RegionPaths(t, live, filepath.Join(dir, "missing-dist.xdb"))
+	if err := os.WriteFile(live, []byte("old-live-xdb"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(live+".version", []byte("v3.0.0"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// 声明哈希与携带内容不符（传输损坏/异常主端）
+	declared := sha256.Sum256([]byte("declared-bytes"))
+	bundle := &WafFileBundle{
+		IP2RegionTag: "v9.9.9",
+		IP2RegionSha: hex.EncodeToString(declared[:]),
+		Xdb:          []byte("tampered-bytes"),
+	}
+
+	// When
+	if _, _, _, err := ApplyWafFileBundle(bundle); err == nil {
+		t.Fatal("哈希不符的 xdb 包必须被拒绝")
+	}
+
+	// Then：live 与 sidecar 均保持更新前状态
+	if got, err := os.ReadFile(live); err != nil || string(got) != "old-live-xdb" {
+		t.Fatalf("live xdb 被改写: %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(live + ".version"); err != nil || strings.TrimSpace(string(got)) != "v3.0.0" {
+		t.Fatalf("拒绝路径改写了 .version sidecar: %q, %v（新标签+旧库跨代偏斜）", got, err)
+	}
+}
+
+// SS87-历史问题：空内容 + 非空声明哈希的威胁条目拒绝整包（否则从端永不落盘、
+// ref 哈希永不等，每轮误判漂移全量重拉永不收敛）。
+func TestApplyWafFileBundle_emptyThreatContentWithDeclaredHashRejected(t *testing.T) {
+	dir := t.TempDir()
+	restore := OverrideThreatWafDirForTest(dir)
+	t.Cleanup(restore)
+	emptySum := sha256.Sum256(nil)
+	bundle := &WafFileBundle{ThreatFiles: []models.ThreatFileEntry{{
+		Name:    "ustc",
+		Sha256:  hex.EncodeToString(emptySum[:]),
+		Content: nil,
+	}}}
+
+	// When
+	_, _, _, err := ApplyWafFileBundle(bundle)
+
+	// Then：整体拒绝
+	if err == nil {
+		t.Fatal("空内容+非空声明哈希必须拒绝整包")
+	}
+	if !strings.Contains(err.Error(), "内容为空但声明哈希非空") {
+		t.Fatalf("err=%v, want 空内容拒绝语义", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "threat-ustc.iplist.fast")); !os.IsNotExist(statErr) {
+		t.Fatalf("拒绝路径不得落盘: %v", statErr)
+	}
+}
+
+// SS87-历史问题：不完整 bundle 的响应体不得进入合并缓存（异常形态不得在 2s
+// 窗口内放大传播）；完整 bundle 仍必须缓存。
+func TestBuildWafFileBundleResponse_incompleteBundleNotCached(t *testing.T) {
+	dir := t.TempDir()
+	restoreWaf := OverrideThreatWafDirForTest(dir)
+	t.Cleanup(restoreWaf)
+	oldCache := wafFileBundleCache
+	t.Cleanup(func() { wafFileBundleCache = oldCache })
+	oldWindow := wafFileBundleResponseCoalesceWindow
+	t.Cleanup(func() { wafFileBundleResponseCoalesceWindow = oldWindow })
+
+	// Given 引用声明 CRS 哈希但物化缺内容（瞬时读失败形态）的缓存条目
+	crsDir := filepath.Join(dir, "crs")
+	if err := os.MkdirAll(filepath.Join(crsDir, "rules"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", "REQUEST-901.conf"), []byte("SecRule x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldLive := crsLiveDir
+	crsLiveDir = crsDir
+	t.Cleanup(func() { crsLiveDir = oldLive })
+
+	ref := BuildWafFileRef()
+	if ref == nil || ref.CRSSha256 == "" {
+		t.Skip("测试布景未能构造 CRS 引用（目录不可哈希）")
+	}
+	wafFileBundleCache.key = wafFileRefKey(ref)
+	wafFileBundleCache.bundle = &WafFileBundle{CRSVersion: ref.CRSVersion, CRSSha256: ref.CRSSha256} // 缺 CRSTarGz
+	wafFileBundleCache.response = nil
+	wafFileBundleCache.responseValidatedAt = time.Time{}
+
+	// When
+	body := BuildWafFileBundleResponse()
+
+	// Then 响应可返回但不得缓存
+	if body == nil {
+		t.Fatal("不完整 bundle 也应返回本次字节（只是不缓存）")
+	}
+	if wafFileBundleCache.response != nil {
+		t.Fatal("不完整 bundle 的响应体被缓存（2s 窗口内持续放大异常形态）")
+	}
+
+	// 正对照：完整 bundle 仍必须缓存（门只排除异常形态，不影响合并优化）
+	wafFileBundleCache.bundle = nil
+	wafFileBundleResponseCoalesceWindow = 0 // 强制重算引用
+	if BuildWafFileBundleResponse() == nil {
+		t.Fatal("完整 bundle 响应为空")
+	}
+	if wafFileBundleCache.response == nil {
+		t.Fatal("完整 bundle 的响应体未被缓存（合并窗口失效）")
 	}
 }

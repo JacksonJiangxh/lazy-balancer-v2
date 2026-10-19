@@ -982,7 +982,8 @@ func TestPrecheckRuleConfig_carriesNewFeatureColumns(t *testing.T) {
 	}
 
 	// When
-	config := precheckRuleConfig(rule)
+	// B2-08：全局请求体上限由调用方传入（聚合校验一次读取）。
+	config := precheckRuleConfig(rule, 128)
 
 	// Then：新特性列全保真
 	if len(config.Upstreams) != 1 || config.Upstreams[0].OriginDomain != "origin.example" {
@@ -1000,5 +1001,55 @@ func TestPrecheckRuleConfig_carriesNewFeatureColumns(t *testing.T) {
 	// 有意子集钉零：TLS 材料不随预检渲染（单规则形态约定，勿回填）。
 	if config.EnableTLS || config.TLSCert != "" || config.TLSKey != "" {
 		t.Fatalf("预检输入不应携带 TLS 形态: enable_tls=%v", config.EnableTLS)
+	}
+}
+
+// B2-08：聚合校验一次读取全局 request_body_max_size_mb，不随规则数线性加点查。
+func TestValidateEnabledStoredRuleConfigs_readsGlobalBodyLimitOnce(t *testing.T) {
+	newBackupTestHandlers(t)
+	for i := range 3 {
+		id := fmt.Sprintf("lb_a87_body_%d", i)
+		domain := fmt.Sprintf("body%d.example.test", i)
+		if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,
+			health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold,enabled,enable_tls)
+			VALUES (?,?,'http',?,8080,'weighted_round_robin','/',10,2,3,2,1,0)`, id, id, domain); err != nil {
+			t.Fatalf("seed rule: %v", err)
+		}
+		if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES (?,'127.0.0.1',9000,1,1,'http')`, id); err != nil {
+			t.Fatalf("seed upstream: %v", err)
+		}
+	}
+	probe := &prepareProbe{}
+	wrapHandlerDBWithProbe(t, probe)
+
+	if err := validateEnabledStoredRuleConfigs(context.Background()); err != nil {
+		t.Fatalf("aggregate validation: %v", err)
+	}
+	if count := probe.count("SELECT request_body_max_size_mb FROM global_config"); count != 1 {
+		t.Fatalf("全局请求体上限读取 %d 次, want 1（N 条规则不得 N 次点查）", count)
+	}
+}
+
+// B2-09：关系批量查询按 500 分块——IN (...) 占位符不再随规则数无限增长。
+func TestRuleRelationBatchQueriesChunkLargeRuleSets(t *testing.T) {
+	newBackupTestHandlers(t)
+	ids := make([]string, 1200)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("lb_a87_chunk_%d", i)
+	}
+	probe := &prepareProbe{}
+	wrapHandlerDBWithProbe(t, probe)
+
+	if _, err := loadUpstreamsBatch(context.Background(), ids); err != nil {
+		t.Fatalf("load upstreams: %v", err)
+	}
+	if count := probe.count("FROM upstreams WHERE rule_id IN"); count != 3 {
+		t.Errorf("上游批量查询 %d 次, want 3（1200/500 向上取整）", count)
+	}
+	if _, err := loadPathRulesBatch(context.Background(), ids); err != nil {
+		t.Fatalf("load path rules: %v", err)
+	}
+	if count := probe.count("FROM path_rules WHERE rule_id IN"); count != 3 {
+		t.Errorf("路径规则批量查询 %d 次, want 3（1200/500 向上取整）", count)
 	}
 }

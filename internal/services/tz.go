@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -193,6 +194,8 @@ func Logf(level, format string, args ...any) {
 // applicationLogWriter 按 "WARNING:"/"ERROR:" 行首前缀做级别过滤（F-SYSR-5，
 // 历史·声明）——隐式依赖 main.go log.SetFlags(0)：标准 log 的时间戳/
 // 文件名前缀会顶掉级别前缀使过滤全数落空。两侧契约互指（见 main.go 同名注释）。
+// S历史问题：多行 payload（Logf 消息内嵌换行）逐行判定后重组——只看首行会把
+// 后续低级别行一并放行（warn/error 档过滤被绕过）。
 type applicationLogWriter struct {
 	w io.Writer
 }
@@ -206,20 +209,51 @@ func (writer *applicationLogWriter) Write(p []byte) (int, error) {
 	if threshold <= logLevelInfo {
 		return writer.w.Write(p)
 	}
-	line := trimLeadingASCIIWhitespace(p)
-	if threshold >= logLevelError && !hasASCIIPrefixFold(line, "ERROR") {
+	trailingNewline := len(p) > 0 && p[len(p)-1] == '\n'
+	body := p
+	if trailingNewline {
+		body = p[:len(p)-1]
+	}
+	if !bytes.ContainsRune(body, '\n') {
+		// 单行热路径（标准 log 常态）：行首前缀判定一次，零额外分配。
+		if !lineAllowedAtThreshold(body, threshold) {
+			return len(p), nil
+		}
+		return writer.w.Write(p)
+	}
+	// S历史问题（历史）：多行 payload（Logf 消息内嵌换行）必须逐行判定并
+	// 重组——只看首行会让 warn/error 档把后续 info 级行整体放行（级别过滤失效）。
+	lines := bytes.Split(body, []byte("\n"))
+	kept := make([][]byte, 0, len(lines))
+	for _, line := range lines {
+		if lineAllowedAtThreshold(line, threshold) {
+			kept = append(kept, line)
+		}
+	}
+	if len(kept) == 0 {
 		return len(p), nil
 	}
-	if threshold == logLevelWarn && !hasASCIIPrefixFold(line, "WARN") && !hasASCIIPrefixFold(line, "ERROR") {
-		return len(p), nil
+	out := bytes.Join(kept, []byte("\n"))
+	if trailingNewline {
+		out = append(out, '\n')
 	}
-	written, err := writer.w.Write(p)
+	written, err := writer.w.Write(out)
 	if err != nil {
 		return written, err
 	}
 	// U7b-F5（历史）：短写必须如实返回 sink 的写入量——返回 len(p) 偏离
 	// io.Writer 契约（装饰器不得替 sink 谎报）。
 	return written, nil
+}
+
+// lineAllowedAtThreshold 报告单行日志是否达到配置阈值（行首级别前缀判定）。
+// 调用方不得把多行 payload 直接交给本函数——只看首行会让整体放行（S历史问题）。
+func lineAllowedAtThreshold(line []byte, threshold int32) bool {
+	line = trimLeadingASCIIWhitespace(line)
+	if threshold >= logLevelError {
+		return hasASCIIPrefixFold(line, "ERROR")
+	}
+	return hasASCIIPrefixFold(line, "WARN") || hasASCIIPrefixFold(line, "ERROR")
 }
 
 func trimLeadingASCIIWhitespace(value []byte) []byte {

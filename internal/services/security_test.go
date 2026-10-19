@@ -1,8 +1,10 @@
 package services
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"testing"
 
@@ -368,5 +370,47 @@ func TestCountEnabledCustomRulesBatch_matchesSingles(t *testing.T) {
 		if got[i] != want[i] || got[i] != single {
 			t.Fatalf("batch[%d]=%d, want %d (single=%d)", i, got[i], want[i], single)
 		}
+	}
+}
+
+// —— 畸形爬虫引擎列静默等价「全部引擎」（SSA-87-08，历史） ——
+
+// 畸形非空 engines 保留「全部引擎」向后兼容语义但必须 WARN 留痕（否则豁免面
+// 被静默放大且零告警）；空集（""/空白/"[]"）不是畸形、不告警；合法形态只命中
+// 勾选引擎。
+func TestSSA8708_malformedCrawlerEnginesWarnsAndKeepsCompat(t *testing.T) {
+	var logs bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	malformed := &models.SecurityPolicy{ID: 8708, GeoIPCrawlerEngines: json.RawMessage(`{"engine":"googlebot"}`)}
+	if !crawlerEngineSelected(malformed, "googlebot") || !crawlerEngineSelected(malformed, "bingbot") {
+		t.Fatal("畸形 engines 保留「全部引擎」向后兼容语义")
+	}
+	if !strings.Contains(logs.String(), "geoip_crawler_engines") || !strings.Contains(logs.String(), "解析失败") {
+		t.Fatalf("畸形 engines 必须 WARN 留痕（否则豁免面被静默放大且零告警）:\n%s", logs.String())
+	}
+
+	// 空集形态（""/空白/"[]"/nil 模型）不告警且视为全部引擎。
+	logs.Reset()
+	empty := &models.SecurityPolicy{ID: 8709}
+	for _, raw := range []string{"", "   ", "[]"} {
+		empty.GeoIPCrawlerEngines = json.RawMessage(raw)
+		if !crawlerEngineSelected(empty, "bingbot") {
+			t.Fatalf("空 engines %q 必须视为全部引擎", raw)
+		}
+	}
+	if strings.Contains(logs.String(), "解析失败") {
+		t.Fatalf("空集不是畸形，不得留痕:\n%s", logs.String())
+	}
+
+	// 合法形态：仅勾选引擎命中。
+	legal := &models.SecurityPolicy{ID: 8710, GeoIPCrawlerEngines: json.RawMessage(`["googlebot"]`)}
+	if !crawlerEngineSelected(legal, "googlebot") || crawlerEngineSelected(legal, "bingbot") {
+		t.Fatal("合法 engines 必须只命中勾选引擎")
+	}
+	if strings.Contains(logs.String(), "解析失败") {
+		t.Fatalf("合法 engines 不得留痕:\n%s", logs.String())
 	}
 }

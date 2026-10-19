@@ -761,3 +761,381 @@ func TestIssuer_Issue_cleans_challenge_when_present_itself_fails(t *testing.T) {
 		t.Fatalf("records=%v, want empty after deferred cleanup", provider.written)
 	}
 }
+
+// 历史（DNS-ACME 域）：ACME 授权/订单状态机、终态授权错误链、
+// 清理预算与验证轮询限流透传的桩与钉测（DNS-87-F1/F3/F4）。
+
+// stubACME 是可配置的 ACME 端点桩：newOrder / order 轮询 / 授权 / 挑战 /
+// finalize / 证书下载全部走同一 server。finalize 之后订单轮询自动转 valid
+// （镜像真实 CA：finalize 成功即订单有效）。
+type stubACME struct {
+	server *httptest.Server
+
+	authCount      int    // 授权数量（默认 1）
+	orderOnCreate  string // newOrder 返回的订单状态（默认 pending）
+	orderOnPoll    string // 订单轮询状态（finalize 前，默认 ready）
+	authStatus     string // 授权状态（默认 pending）
+	challengeError string // 非空则 dns-01 挑战携带 error.detail
+	finalizeStatus string // finalize 返回的订单状态（默认 valid）
+
+	mu        sync.Mutex
+	accepts   int
+	finalizes int
+}
+
+func newStubACME(t *testing.T, stub *stubACME) *httptest.Server {
+	t.Helper()
+	if stub.authCount == 0 {
+		stub.authCount = 1
+	}
+	if stub.orderOnCreate == "" {
+		stub.orderOnCreate = "pending"
+	}
+	if stub.orderOnPoll == "" {
+		stub.orderOnPoll = "ready"
+	}
+	if stub.authStatus == "" {
+		stub.authStatus = "pending"
+	}
+	if stub.finalizeStatus == "" {
+		stub.finalizeStatus = "valid"
+	}
+	authURLs := make([]string, 0, stub.authCount)
+	for idx := 1; idx <= stub.authCount; idx++ {
+		authURLs = append(authURLs, fmt.Sprintf("auth/%d", idx))
+	}
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Replay-Nonce", "test-nonce")
+		response.Header().Set("Content-Type", "application/json")
+		order := func(status string) string {
+			quoted := make([]string, len(authURLs))
+			for idx, path := range authURLs {
+				quoted[idx] = fmt.Sprintf("%q", server.URL+"/"+path)
+			}
+			cert := ""
+			if status == "valid" {
+				cert = fmt.Sprintf(`,"certificate":%q`, server.URL+"/cert/1")
+			}
+			return fmt.Sprintf(`{"status":%q,"authorizations":[%s],"finalize":%q%s}`,
+				status, strings.Join(quoted, ","), server.URL+"/finalize/1", cert)
+		}
+		switch {
+		case request.URL.Path == "/directory":
+			_, _ = fmt.Fprintf(response, `{"newNonce":%q,"newAccount":%q,"newOrder":%q}`,
+				server.URL+"/nonce", server.URL+"/account", server.URL+"/new-order")
+		case request.URL.Path == "/nonce":
+			response.WriteHeader(http.StatusOK)
+		case request.URL.Path == "/account":
+			response.Header().Set("Location", server.URL+"/account/1")
+			response.WriteHeader(http.StatusCreated)
+			_, _ = response.Write([]byte(`{"status":"valid"}`))
+		case request.URL.Path == "/new-order":
+			response.Header().Set("Location", server.URL+"/order/1")
+			response.WriteHeader(http.StatusCreated)
+			_, _ = response.Write([]byte(order(stub.orderOnCreate)))
+		case request.URL.Path == "/order/1":
+			stub.mu.Lock()
+			finalized := stub.finalizes > 0
+			stub.mu.Unlock()
+			status := stub.orderOnPoll
+			if finalized {
+				status = "valid"
+			}
+			_, _ = response.Write([]byte(order(status)))
+		case strings.HasPrefix(request.URL.Path, "/auth/"):
+			idx := strings.TrimPrefix(request.URL.Path, "/auth/")
+			domain := "example.com"
+			if idx != "1" {
+				domain = "www.example.com"
+			}
+			challengeErr := ""
+			if stub.challengeError != "" {
+				challengeErr = fmt.Sprintf(`,"error":{"type":"urn:ietf:params:acme:error:dns","detail":%q}`, stub.challengeError)
+			}
+			_, _ = fmt.Fprintf(response, `{"status":%q,"identifier":{"type":"dns","value":%q},"challenges":[{"type":"dns-01","url":%q,"status":%q,"token":"token-%s"%s}]}`,
+				stub.authStatus, domain, server.URL+"/challenge/"+idx, stub.authStatus, idx, challengeErr)
+		case strings.HasPrefix(request.URL.Path, "/challenge/"):
+			stub.mu.Lock()
+			stub.accepts++
+			stub.mu.Unlock()
+			_, _ = fmt.Fprintf(response, `{"type":"dns-01","status":"processing","url":%q,"token":"token"}`, server.URL+request.URL.Path)
+		case request.URL.Path == "/finalize/1":
+			stub.mu.Lock()
+			stub.finalizes++
+			stub.mu.Unlock()
+			_, _ = fmt.Fprintf(response, `{"status":%q,"certificate":%q}`, stub.finalizeStatus, server.URL+"/cert/1")
+		case request.URL.Path == "/cert/1":
+			_, _ = response.Write([]byte("-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n"))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	stub.server = server
+	t.Cleanup(server.Close)
+	return server
+}
+
+// countingProvider 记录 Present/CleanUp 次数；Present 可按调用序失败。
+type countingProvider struct {
+	mu         sync.Mutex
+	presents   int
+	failOnCall int // >0 时第 N 次 Present 起失败
+	cleanups   []time.Duration
+}
+
+func (p *countingProvider) Present(_ context.Context, _, _, _ string, _ int) error {
+	p.mu.Lock()
+	p.presents++
+	call := p.presents
+	p.mu.Unlock()
+	if p.failOnCall > 0 && call >= p.failOnCall {
+		return errors.New("present failed")
+	}
+	return nil
+}
+
+func (p *countingProvider) CleanUp(ctx context.Context, _, _ string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// 只记录 deferred 清理（带独立截止时间）的剩余预算；per-authz 预清理
+	// 使用任务 ctx（无 deadline）。
+	if deadline, ok := ctx.Deadline(); ok {
+		p.cleanups = append(p.cleanups, time.Until(deadline))
+	}
+	return nil
+}
+
+func (p *countingProvider) presentCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.presents
+}
+
+func (stub *stubACME) acceptCount() int {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	return stub.accepts
+}
+
+func (stub *stubACME) finalizeCount() int {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	return stub.finalizes
+}
+
+func newIssuerForStub(t *testing.T, stub *stubACME, provider *countingProvider) *Issuer {
+	t.Helper()
+	return &Issuer{Client: newValidationTestClient(t, stub.server, nil), Provider: provider}
+}
+
+// DNS-87-F1 valid 形状：CA 复用同账号同标识的已 valid 授权（RFC 8555 §7.4.1，
+// LE reuseValidAuthz 长期开启）时必须跳过 TXT 写入与挑战提交——原实现无条件
+// Present + Accept，会把复用窗口内的重复签发打成持续失败。
+func TestIssuer_Issue_skipsChallengeForReusedValidAuthorization(t *testing.T) {
+	// Given：订单 pending、唯一授权已 valid、后续订单轮询为 invalid（阻断在
+	// 订单就绪阶段，避免测试依赖真实 DNS 传播）。provider 在 Present 处直接
+	// 报错——修复前路径会立即中止（不进入 5min 传播等待），也能精确计数「是否
+	// 发生 TXT 写入」。
+	stub := &stubACME{orderOnCreate: "pending", orderOnPoll: "invalid", authStatus: "valid"}
+	newStubACME(t, stub)
+	provider := &countingProvider{failOnCall: 1}
+	issuer := newIssuerForStub(t, stub, provider)
+
+	// When
+	_, _, issueErr := issuer.Issue(context.Background(), []string{"example.com"})
+
+	// Then：授权阶段必须零副作用（不写 TXT、不提交挑战）
+	if provider.presentCount() != 0 {
+		t.Fatalf("valid 授权仍写入了 %d 条 TXT 记录", provider.presentCount())
+	}
+	if got := stub.acceptCount(); got != 0 {
+		t.Fatalf("valid 授权仍提交了 %d 次挑战", got)
+	}
+	if issueErr == nil || !strings.Contains(issueErr.Error(), "wait order ready") {
+		t.Fatalf("应越过授权阶段并在订单就绪阶段失败, got %v", issueErr)
+	}
+}
+
+// DNS-87-F1 invalid 形状：终态授权必须立即 fail-loud（原实现仍 Present + 等满
+// 5 分钟传播再 Accept，把终态拖成超时/400）。
+func TestIssuer_Issue_failsFastOnTerminalAuthorization(t *testing.T) {
+	for _, status := range []string{"invalid", "deactivated", "expired", "revoked"} {
+		t.Run(status, func(t *testing.T) {
+			stub := &stubACME{
+				orderOnCreate:  "pending",
+				authStatus:     status,
+				challengeError: "no TXT record found",
+			}
+			newStubACME(t, stub)
+			// Present 直接报错：修复前路径立即中止（不进入 5min 传播等待）。
+			provider := &countingProvider{failOnCall: 1}
+			issuer := newIssuerForStub(t, stub, provider)
+
+			_, _, issueErr := issuer.Issue(context.Background(), []string{"example.com"})
+
+			if issueErr == nil {
+				t.Fatalf("授权状态 %s 仍继续签发", status)
+			}
+			if !strings.Contains(issueErr.Error(), status) {
+				t.Fatalf("错误未指明授权状态 %s: %v", status, issueErr)
+			}
+			if !strings.Contains(issueErr.Error(), "no TXT record found") {
+				t.Fatalf("错误未保留 CA 的挑战失败详情: %v", issueErr)
+			}
+			if provider.presentCount() != 0 || stub.acceptCount() != 0 {
+				t.Fatalf("终态授权仍写入 TXT(=%d)/提交挑战(=%d)", provider.presentCount(), stub.acceptCount())
+			}
+		})
+	}
+}
+
+// DNS-87-F1 ready 形状：订单创建即 ready（授权已全部 valid）时必须零 TXT 写入
+// 直达 finalize——回归保护，防止状态分流把 ready 误当 pending。
+func TestIssuer_Issue_completesFromReadyOrder(t *testing.T) {
+	stub := &stubACME{orderOnCreate: "ready", orderOnPoll: "ready", authStatus: "valid"}
+	newStubACME(t, stub)
+	// Present 直接报错：修复前路径对 valid 授权仍会写 TXT（随后进入 5min 传播
+	// 等待），报错让基线立即暴露「ready 订单不该有任何 TXT 写入」。
+	provider := &countingProvider{failOnCall: 1}
+	issuer := newIssuerForStub(t, stub, provider)
+
+	certPEM, keyPEM, err := issuer.Issue(context.Background(), []string{"example.com"})
+	if err != nil {
+		t.Fatalf("ready 订单签发失败: %v", err)
+	}
+	if !strings.Contains(certPEM, "BEGIN CERTIFICATE") || !strings.Contains(keyPEM, "PRIVATE KEY") {
+		t.Fatalf("材料不完整: cert=%q key=%q", certPEM, keyPEM)
+	}
+	if provider.presentCount() != 0 || stub.acceptCount() != 0 {
+		t.Fatalf("ready 订单仍写入 TXT(=%d)/提交挑战(=%d)", provider.presentCount(), stub.acceptCount())
+	}
+	if stub.finalizeCount() != 1 {
+		t.Fatalf("finalize 次数=%d, want 1", stub.finalizeCount())
+	}
+}
+
+// DNS-87-F1 订单 valid 形状：新建订单直接返回 valid 说明该订单的证书绑定的是
+// 上一轮 CSR 私钥，本次无法复用——必须显式失败，而不是把 CA 的 finalize 拒绝
+// 磨成泛化错误。
+func TestIssuer_Issue_rejectsAlreadyValidOrder(t *testing.T) {
+	stub := &stubACME{orderOnCreate: "valid", orderOnPoll: "pending", authStatus: "valid"}
+	newStubACME(t, stub)
+	provider := &countingProvider{failOnCall: 1}
+	issuer := newIssuerForStub(t, stub, provider)
+
+	_, _, issueErr := issuer.Issue(context.Background(), []string{"example.com"})
+	if issueErr == nil || !strings.Contains(issueErr.Error(), "已处于 valid 状态") {
+		t.Fatalf("valid 订单未显式拒绝: %v", issueErr)
+	}
+	if stub.finalizeCount() != 0 || provider.presentCount() != 0 {
+		t.Fatalf("valid 订单仍进入 finalize(=%d)/Present(=%d)", stub.finalizeCount(), provider.presentCount())
+	}
+}
+
+// DNS-87-F3：终态授权错误必须用 %w 保留错误链——detectRateLimit 依赖
+// errors.As(*acme.Error) 把 429 记入 waiting_ca。
+func TestTerminalAuthorizationError_preservesUnderlyingChain(t *testing.T) {
+	rateLimit := &acme.Error{StatusCode: http.StatusTooManyRequests, Detail: "too many certificates"}
+	err := terminalAuthorizationError("invalid", rateLimit, nil)
+	if err == nil {
+		t.Fatal("terminalAuthorizationError returned nil")
+	}
+	var got *acme.Error
+	if !errors.As(err, &got) || got.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("错误链丢失 429（errors.As 未命中）: %v", err)
+	}
+	if !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("文案未保留授权状态: %v", err)
+	}
+}
+
+// DNS-87-F3 生产路径：invalid 分支的 WaitAuthorization 轮询 429 必须透传结构
+// 化错误（原实现只保留 *AuthorizationError，429 被丢弃 → 普通失败退避）。
+func TestIssuer_waitForValidation_propagatesRateLimitFromInvalidAuthorization(t *testing.T) {
+	var mu sync.Mutex
+	authHits := 0
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Replay-Nonce", "test-nonce")
+		response.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/directory":
+			_, _ = fmt.Fprintf(response, `{"newNonce":%q,"newOrder":%q,"newAccount":%q}`, server.URL+"/nonce", server.URL+"/order", server.URL+"/account")
+		case "/nonce":
+			response.WriteHeader(http.StatusOK)
+		case "/chal/1":
+			_, _ = fmt.Fprintf(response, `{"type":"dns-01","status":"invalid","url":%q,"token":"tok"}`, server.URL+"/chal/1")
+		case "/auth/1":
+			mu.Lock()
+			authHits++
+			hit := authHits
+			mu.Unlock()
+			if hit == 1 {
+				_, _ = fmt.Fprintf(response, `{"status":"invalid","identifier":{"type":"dns","value":"example.com"}}`)
+				return
+			}
+			// WaitAuthorization 的轮询被 CA 限流。
+			response.WriteHeader(http.StatusTooManyRequests)
+			response.Header().Set("Content-Type", "application/problem+json")
+			_, _ = response.Write([]byte(`{"type":"urn:ietf:params:acme:error:rateLimited","detail":"too many certificates"}`))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	issuer := &Issuer{Client: newValidationTestClient(t, server, nil)}
+	err := issuer.waitForValidation(context.Background(), server.URL+"/auth/1", server.URL+"/chal/1")
+	if err == nil {
+		t.Fatal("invalid 授权的 WaitAuthorization 429 被吞掉")
+	}
+	var acmeErr *acme.Error
+	if !errors.As(err, &acmeErr) || acmeErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("429 未透传到错误链（waiting_ca 记账失效）: %v", err)
+	}
+	if !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("文案未保留授权状态: %v", err)
+	}
+}
+
+// DNS-87-F4：deferred 清理预算必须随挑战数缩放——单条删除链最坏 90s，固定
+// 2min 会让第二个 TXT 的清理被 ctx 取消。判定用 provider 观察到的 ctx 截止时间。
+func TestIssuer_cleanupBudget_scalesWithChallengeCount(t *testing.T) {
+	// 单元口径：预算公式
+	for _, tc := range []struct {
+		challenges int
+		want       time.Duration
+	}{
+		{0, 2 * time.Minute},
+		{1, 2 * time.Minute},
+		{2, 200 * time.Second},
+		{4, 400 * time.Second},
+		{10, 8 * time.Minute},
+	} {
+		if got := dnsCleanupBudget(tc.challenges); got != tc.want {
+			t.Fatalf("dnsCleanupBudget(%d)=%v, want %v", tc.challenges, got, tc.want)
+		}
+	}
+
+	// 行为口径：两个挑战的 deferred 清理必须获得 >120s 预算（原固定 2min）。
+	stub := &stubACME{orderOnCreate: "pending", authStatus: "pending", authCount: 2}
+	newStubACME(t, stub)
+	provider := &countingProvider{failOnCall: 2}
+	issuer := newIssuerForStub(t, stub, provider)
+
+	if _, _, err := issuer.Issue(context.Background(), []string{"example.com", "www.example.com"}); err == nil {
+		t.Fatal("第二个 Present 失败时签发应失败")
+	}
+	provider.mu.Lock()
+	observed := append([]time.Duration(nil), provider.cleanups...)
+	provider.mu.Unlock()
+	if len(observed) == 0 {
+		t.Fatal("deferred 清理未执行（provider 未观察到清理 ctx）")
+	}
+	for _, remaining := range observed {
+		if remaining < 180*time.Second {
+			t.Fatalf("两个挑战的清理预算=%v, want ≥180s（固定 120s 会取消第二个 TXT 清理）", remaining)
+		}
+	}
+}

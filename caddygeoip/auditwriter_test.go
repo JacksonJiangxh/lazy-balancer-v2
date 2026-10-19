@@ -114,19 +114,21 @@ func (cannedFormatter) MIME() string { return "application/json" }
 func useTestAuditPipeline(t *testing.T) {
 	t.Helper()
 	origQueue, origThreshold, origInterval := auditQueueSize, auditFlushThreshold, auditFlushInterval
-	origWait, origPoll, origTTL := auditTimingWaitLimit, auditTimingPollStep, auditTimingEntryTTL
+	origWait, origPoll := auditTimingWaitLimit, auditTimingPollStep
+	origTTL := auditTimingEntryTTLNs.Load()
 	auditQueueSize = 64
 	auditFlushThreshold = 1
 	auditFlushInterval = 5 * time.Millisecond
 	auditTimingWaitLimit = 200 * time.Millisecond
 	auditTimingPollStep = time.Millisecond
-	auditTimingEntryTTL = 50 * time.Millisecond
+	auditTimingEntryTTLNs.Store(int64(50 * time.Millisecond))
 	auditTimingMu.Lock()
 	resetAuditTimingRegistryLockedForTest()
 	auditTimingMu.Unlock()
 	t.Cleanup(func() {
 		auditQueueSize, auditFlushThreshold, auditFlushInterval = origQueue, origThreshold, origInterval
-		auditTimingWaitLimit, auditTimingPollStep, auditTimingEntryTTL = origWait, origPoll, origTTL
+		auditTimingWaitLimit, auditTimingPollStep = origWait, origPoll
+		auditTimingEntryTTLNs.Store(origTTL)
 		auditTimingMu.Lock()
 		resetAuditTimingRegistryLockedForTest()
 		auditTimingMu.Unlock()
@@ -1260,7 +1262,7 @@ func TestAuditTimingRegistry_sweepClosesWaitedEntry(t *testing.T) {
 // 每 64 次建条全表 map 扫描（O(n)，n≈TTL×RPS ⇒ CPU 随 RPS² 增长）。
 func TestAuditTimingRegistry_sweepCostIsIncremental(t *testing.T) {
 	useTestAuditPipeline(t)
-	auditTimingEntryTTL = time.Hour // 焦点在清扫检查量，不让新条目过期
+	auditTimingEntryTTLNs.Store(int64(time.Hour)) // 焦点在清扫检查量，不让新条目过期
 
 	const expired = 100
 	base := time.Now().Add(-2 * time.Hour)
@@ -1473,12 +1475,12 @@ func TestAuditTimingRegistry_entryCap(t *testing.T) {
 // 后台 sweeper 按周期弹出 TTL 过期条目，零建条流量下注册表也必须收敛。
 func TestAuditTimingRegistry_periodicSweep(t *testing.T) {
 	useTestTimingRegistry(t)
-	origInterval := auditTimingSweepInterval
-	auditTimingSweepInterval = 5 * time.Millisecond
-	t.Cleanup(func() { auditTimingSweepInterval = origInterval })
+	origInterval := auditTimingSweepIntervalNs.Load()
+	auditTimingSweepIntervalNs.Store(int64(5 * time.Millisecond))
+	t.Cleanup(func() { auditTimingSweepIntervalNs.Store(origInterval) })
 
 	// 种入已过期条目（不经建条路径——建条驱动的清扫不触发）。
-	seedAuditTimingEntryForTest("00000000000000aa", time.Now().Add(-2*auditTimingEntryTTL))
+	seedAuditTimingEntryForTest("00000000000000aa", time.Now().Add(-2*time.Duration(auditTimingEntryTTLNs.Load())))
 	startAuditTimingSweeperForTest()
 
 	deadline := time.Now().Add(2 * time.Second)

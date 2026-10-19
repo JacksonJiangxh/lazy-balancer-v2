@@ -34,13 +34,13 @@ func TestImportBackup_oidcConfigConvergesWhenAbsent(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 备份：含全局配置区（users 节）但 Config 无 oidc_config 键（旧版导出）
-	backup := round40BackupJSON(t, []string{"users"}, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{Sections: []string{"users"}, Tables: map[string][]map[string]any{
 		"users":      {{"id": 1, "username": "current-admin", "password_hash": "hash", "role": "admin", "is_enabled": 1}},
 		"api_keys":   nil,
 		"lb_rules":   {{"caddy_id": "imp1", "name": "imp", "protocol": "http", "domain": "a.example.com", "listen_port": 80, "enabled": 1}},
 		"upstreams":  nil,
 		"path_rules": nil,
-	})
+	}, DropNil: true, EmptyConfigIfNil: true})
 
 	rec := postJSONImport(t, g, backup)
 	if rec.Code != http.StatusOK {

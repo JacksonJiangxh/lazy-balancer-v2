@@ -114,3 +114,40 @@ func TestImportConfigBackup_legacyBackupWithoutUpstreamPath_restoresEmptyDefault
 		t.Fatalf("explicit-null row upstream_path=%q, want empty", nullRowPath)
 	}
 }
+
+// ── 历史问题-历史问题（历史）：携带 lb_rules 但 upstreams/path_rules 缺席的
+// 截断备份会让 live upstream/path 行指向已被整体替换的规则（渲染不可见、集群
+// 快照原样 dump、极小概率 id 复用误挂）——导入事务内按导入后视图幂等剪枝。 ──
+
+func TestA3_87_P3_05_rulesOnlyImportPrunesOrphanUpstreamAndPathRows(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	a3SeedLiveAdmin(t)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled)
+		VALUES ('lb_orphan','orphan','http','orphan.example.test',18081,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_orphan','127.0.0.1',9100,1,1,'http')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO path_rules (rule_id,sort_order,match_type,path,upstream_path) VALUES ('lb_orphan',0,'prefix','/api','')`); err != nil {
+		t.Fatal(err)
+	}
+	// 截断备份形态：携带 lb_rules 但 upstreams/path_rules 缺席。
+	body := buildBackup(t, backupFixtureOptions{Sections: []string{"rules"}, Tables: map[string][]map[string]any{
+		"lb_rules": {{"caddy_id": "lb_new", "name": "new", "protocol": "http", "domain": "new.example.test", "listen_port": 80, "enabled": 1}},
+	}, Config: nil})
+
+	rec := postBackupImport(t, h, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	for _, table := range []string{"upstreams", "path_rules"} {
+		var orphans int
+		if err := db.DB.QueryRow(`SELECT COUNT(*) FROM ` + table + ` WHERE rule_id='lb_orphan'`).Scan(&orphans); err != nil {
+			t.Fatal(err)
+		}
+		if orphans != 0 {
+			t.Fatalf("%s 孤儿行=%d, want 0（规则已被整体替换）", table, orphans)
+		}
+	}
+}

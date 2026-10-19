@@ -43,12 +43,38 @@ func (h *Handlers) GetCAProvider(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: p})
 }
 
-func credentialsMeaningfullyChanged(newCredentials, oldCredentials string) bool {
+// credentialAuditState 是 CA 提供商凭证字段的审计口径（历史问题，历史）：
+// 把「空白串（会真实清空 credentials 列）」「全星号占位（前端掩码回传，
+// 保留占位而非用户意图值）」「真实值变更」「无变更」四态区分开。旧实现
+// 把空白串与全星号一律视为未变更——清空落库却审计成「无修改」，占位也被
+// 误读为把凭证改成了星号。
+type credentialAuditState int
+
+const (
+	credentialUnchanged credentialAuditState = iota
+	credentialChanged
+	credentialCleared
+	credentialMaskEcho
+)
+
+// credentialAuditStateFor 判定凭证载荷的审计/变更语义。全星号为保留占位
+// 契约（mask-sentinel）：只有整串星号视为占位，不参与落库比较。
+func credentialAuditStateFor(newCredentials, oldCredentials string) credentialAuditState {
 	trimmed := strings.TrimSpace(newCredentials)
-	if trimmed == "" || strings.Trim(trimmed, "*") == "" {
-		return false
+	if trimmed == "" {
+		if strings.TrimSpace(oldCredentials) == "" {
+			return credentialUnchanged
+		}
+		// 空串=显式清空：服务层会把 credentials 写成空（ZeroSSL 分支放行空值）。
+		return credentialCleared
 	}
-	return trimmed != oldCredentials
+	if strings.Trim(trimmed, "*") == "" {
+		return credentialMaskEcho
+	}
+	if trimmed == oldCredentials {
+		return credentialUnchanged
+	}
+	return credentialChanged
 }
 
 func (h *Handlers) UpdateCAProvider(c *gin.Context) {
@@ -120,14 +146,22 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 	// 消除「事务外预读 → 事务提交」窗口内并发写入导致的清单失真（基于陈旧
 	// 旧值漏记/多记变更字段）。
 	changed := []string{}
+	credentialState := credentialUnchanged
+	if req.Credentials != nil {
+		credentialState = credentialAuditStateFor(*req.Credentials, old.Credentials)
+	}
 	if req.Name != nil && *req.Name != old.Name {
 		changed = append(changed, "名称")
 	}
 	if req.Provider != nil && *req.Provider != old.Provider {
 		changed = append(changed, "提供商类型")
 	}
-	if req.Credentials != nil && credentialsMeaningfullyChanged(*req.Credentials, old.Credentials) {
+	switch credentialState {
+	case credentialChanged:
 		changed = append(changed, "凭证")
+	case credentialCleared:
+		// 历史问题（历史 历史问题）：空串会真实清空 credentials 列，不得记「无修改」。
+		changed = append(changed, "凭证（清空）")
 	}
 	if req.MaxConcurrent != nil && *req.MaxConcurrent != old.MaxConcurrent {
 		changed = append(changed, "最大并发")
@@ -139,7 +173,14 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 		changed = append(changed, "启用状态")
 	}
 	if len(changed) == 0 {
-		recordAudit(c, "更新", "CA提供商", services.FormatAuditDetail(fmt.Sprintf("提供商 %d", id), old.Name, "无修改"))
+		parts := []string{fmt.Sprintf("提供商 %d", id), old.Name}
+		if credentialState == credentialMaskEcho {
+			// 全星号=前端掩码回传占位（保留占位契约），不是用户意图值——
+			// 单列备注以便追溯，不记成真实变更。
+			parts = append(parts, "凭证（掩码回传，未变更）")
+		}
+		parts = append(parts, "无修改")
+		recordAudit(c, "更新", "CA提供商", services.FormatAuditDetail(parts...))
 	} else {
 		recordAudit(c, "更新", "CA提供商", services.FormatAuditDetail(fmt.Sprintf("提供商 %d", id), old.Name, fmt.Sprintf("变更：%s", strings.Join(changed, "、"))))
 	}

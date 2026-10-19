@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/config"
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -2084,4 +2086,148 @@ func TestSyncService_do_followsSameHostTLSUpgradeRedirect(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("redirect target never received the request")
 	}
+}
+
+func countAuditRows(t *testing.T, database *sql.DB, action, resource string) int {
+	t.Helper()
+	if database == nil {
+		t.Fatal("audit database not initialized")
+	}
+	var count int
+	if err := database.QueryRow("SELECT COUNT(*) FROM audit_log WHERE action=? AND resource=?", action, resource).Scan(&count); err != nil {
+		t.Fatalf("count audit rows: %v", err)
+	}
+	return count
+}
+
+// S历史问题-01：同一失败内容只写一条操作审计；内容变化重记；恢复后清空状态。
+func TestSyncFailureAudit_throttlesIdenticalFailuresAndRerecords(t *testing.T) {
+	newClusterTestService(t)
+	sync := NewSyncService(nil, nil, nil)
+	t.Cleanup(func() { unregisterSyncDrainer(sync) })
+	auditDB := db.AuditDB
+
+	// When：同一失败内容记录三次
+	record := func(detail string) {
+		if sync.syncFailureAuditDue("同步失败", "集群同步", detail) {
+			RecordAuditLog("system", "同步失败", "集群同步", detail, "")
+		}
+	}
+	for range 3 {
+		record("版本：7 签名校验失败")
+	}
+	// Then：只留一条
+	if got := countAuditRows(t, auditDB, "同步失败", "集群同步"); got != 1 {
+		t.Fatalf("identical failures wrote %d audit rows, want 1", got)
+	}
+
+	// When：失败内容变化（版本递增/错误形态变化）
+	record("版本：8 签名校验失败")
+	if got := countAuditRows(t, auditDB, "同步失败", "集群同步"); got != 2 {
+		t.Fatalf("changed failure content rows=%d, want 2", got)
+	}
+
+	// When：同步恢复后再次失败（状态被清空）
+	sync.resetSyncFailureAuditThrottle()
+	record("版本：8 签名校验失败")
+	if got := countAuditRows(t, auditDB, "同步失败", "集群同步"); got != 3 {
+		t.Fatalf("failure after recovery rows=%d, want 3", got)
+	}
+
+	// 类别隔离：安全数据/重载失败不与被抑制的集群同步内容互相吞并
+	if sync.syncFailureAuditDue("同步失败", "安全数据", "拉取安全数据失败: x") {
+		RecordAuditLog("system", "同步失败", "安全数据", "拉取安全数据失败: x", "")
+	}
+	if sync.syncFailureAuditDue("重载失败", "Caddy服务", "同步应用后自动重载失败: y") {
+		RecordAuditLog("system", "重载失败", "Caddy服务", "同步应用后自动重载失败: y", "")
+	}
+	if got := countAuditRows(t, auditDB, "同步失败", "安全数据"); got != 1 {
+		t.Fatalf("security data failure rows=%d, want 1", got)
+	}
+	if got := countAuditRows(t, auditDB, "重载失败", "Caddy服务"); got != 1 {
+		t.Fatalf("reload failure rows=%d, want 1", got)
+	}
+}
+
+// S历史问题-01 集成面：主节点持续返回签名无效快照时，两轮 Pull 只写一条审计。
+func TestSyncService_Pull_throttlesRepeatedIntegrityFailureAudit(t *testing.T) {
+	_, database := newClusterTestService(t)
+	const token = "cluster-token"
+	now := time.Now().UTC()
+	broken := signedTestSnapshot(7, token)
+	broken.Signature = strings.Repeat("0", 64)
+	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(response).Encode(map[string]any{"data": broken})
+	}))
+	defer master.Close()
+	if _, err := database.Exec("INSERT OR REPLACE INTO nodes (id,name,ip_address,port,status,is_approved,cluster_token_hash,last_seen) VALUES (1,'master','127.0.0.1',443,'online',1,?,?)", tokenHash(token), now.Format("2006-01-02 15:04:05")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token=? WHERE id=1", master.URL, token); err != nil {
+		t.Fatal(err)
+	}
+	sync := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
+	t.Cleanup(func() { unregisterSyncDrainer(sync) })
+	auditDB := db.AuditDB
+
+	for i := range 2 {
+		if _, err := sync.Pull(context.Background()); err == nil {
+			t.Fatalf("pull %d accepted a tampered snapshot", i)
+		}
+	}
+	if got := countAuditRows(t, auditDB, "同步失败", "集群同步"); got != 1 {
+		t.Fatalf("two failed pulls wrote %d audit rows, want 1 (audit throttle)", got)
+	}
+}
+
+// S历史问题-06：按库登记全部同步服务实例，支持显式注销；注销后 Promote/BecomeSlave
+// 的排干面随之收缩（不再只排干最后注册的一个）。
+func TestSyncDrainers_registersAllInstancesAndUnregisters(t *testing.T) {
+	_, database := newClusterTestService(t)
+	first := NewSyncService(database, nil, nil)
+	second := NewSyncService(database, nil, nil)
+
+	drainers := syncDrainersFor(database)
+	if len(drainers) < 2 {
+		t.Fatalf("registered drainers=%d, want >=2 (per-database slice)", len(drainers))
+	}
+	found := map[*SyncService]bool{}
+	for _, drainer := range drainers {
+		found[drainer] = true
+	}
+	if !found[first] || !found[second] {
+		t.Fatal("both services must be registered (last-registered overwrite regression)")
+	}
+
+	unregisterSyncDrainer(first)
+	drainers = syncDrainersFor(database)
+	if len(drainers) != 1 || drainers[0] != second {
+		t.Fatalf("after unregister drainers=%v, want only second service", drainers)
+	}
+	unregisterSyncDrainer(second)
+	if got := syncDrainersFor(database); len(got) != 0 {
+		t.Fatalf("registry not cleaned: %v", got)
+	}
+
+	// clusterServices 同样支持逐个注销。
+	clusterA := NewClusterService(database, "")
+	clusterB := NewClusterService(database, "")
+	unregisterClusterService(clusterA)
+	remaining := clusterServicesFor(database)
+	for _, service := range remaining {
+		if service == clusterA {
+			t.Fatal("unregistered cluster service still returned")
+		}
+	}
+	foundB := false
+	for _, service := range remaining {
+		if service == clusterB {
+			foundB = true
+		}
+	}
+	if !foundB {
+		t.Fatal("unregister must only remove the target instance")
+	}
+	unregisterClusterService(clusterB)
 }

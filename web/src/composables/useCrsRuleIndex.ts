@@ -46,7 +46,7 @@ export const crsRuleLabelView = (entry: Pick<CrsRuleIndexEntry, 'msg' | 'categor
 }
 
 /** 策略字段 crs_excluded_rules 的行形状（存储：对象数组 JSON 文本） */
-export type CrsExclusionScope = 'all' | 'ip' | 'list'
+type CrsExclusionScope = 'all' | 'ip' | 'list'
 export interface CrsExcludedRow {
   target: string
   scope: CrsExclusionScope
@@ -165,7 +165,11 @@ const indexLoader = createSessionSingleFlight<CrsRuleIndexEntry[]>({
   },
   onError: (error) => {
     console.warn('Failed to load CRS rule index:', error)
-    rules.value = []
+    // 历史问题：失败不得清空已加载索引（stale-while-error）——ensureForDialog 每次
+    // 打开弹框都会新会话重拉（~832 条/100KB+），任一次网络抖动原实现把模块级
+    // rules 清空，当前已打开的向导/规则集页下拉与描述列同时变空。保留旧索引供
+    // 展示，loaded 复位允许同会话重试（消费方的「规则已移除 vs 索引未加载」文案
+    // 只读 loaded，不受影响）。
     loaded.value = false
   },
   onLoadingChange: (value) => { loading.value = value },

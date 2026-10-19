@@ -53,8 +53,8 @@ export function siteDistanceKm(aLat: number, aLon: number, bLat: number, bLon: n
 
 /**
  * 已有坐标 → 最近地点 key（用于编辑现有配置时回显）。
- * 零坐标（未设置）返回空串；其余取全表最近项——城市表更密，境内优先命中城市，
- * 境外由海外国家兜底。
+ * 零坐标（未设置）返回空串；其余取全表最近项——表粒度为中国省级质心 +
+ * 海外国家质心（无城市粒度），故回显精度只到省/国家。
  */
 export function nearestSiteLocation(lat: number, lon: number): string {
   if (!Number.isFinite(lat) || !Number.isFinite(lon) || (lat === 0 && lon === 0)) return ''

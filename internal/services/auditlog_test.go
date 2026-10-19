@@ -99,14 +99,8 @@ func TestGetAuditLogSizeBytes_cachesThresholdWithinTTL(t *testing.T) {
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
 	})
 	// 包级缓存隔离：进入与退出均重置，测试间互不串扰
-	auditLogSizeCacheMu.Lock()
-	auditLogSizeCache, auditLogSizeCacheAt = 0, time.Time{}
-	auditLogSizeCacheMu.Unlock()
-	t.Cleanup(func() {
-		auditLogSizeCacheMu.Lock()
-		auditLogSizeCache, auditLogSizeCacheAt = 0, time.Time{}
-		auditLogSizeCacheMu.Unlock()
-	})
+	auditLogSizeValueCache.invalidate()
+	t.Cleanup(auditLogSizeValueCache.invalidate)
 	if _, err := db.DB.Exec(`UPDATE global_config SET audit_log_size_mb=5 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
@@ -123,9 +117,9 @@ func TestGetAuditLogSizeBytes_cachesThresholdWithinTTL(t *testing.T) {
 		t.Fatalf("cached=%d, want %d (TTL not yet expired)", got, 5<<20)
 	}
 	// When/Then：过期后重查，观察新阈值
-	auditLogSizeCacheMu.Lock()
-	auditLogSizeCacheAt = time.Now().Add(-auditLogSizeCacheTTL - time.Second)
-	auditLogSizeCacheMu.Unlock()
+	auditLogSizeValueCache.mu.Lock()
+	auditLogSizeValueCache.at = time.Now().Add(-auditLogSizeCacheTTL - time.Second)
+	auditLogSizeValueCache.mu.Unlock()
 	if got := getAuditLogSizeBytes(); got != 7<<20 {
 		t.Fatalf("refreshed=%d, want %d after TTL expiry", got, 7<<20)
 	}

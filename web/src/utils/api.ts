@@ -15,6 +15,7 @@ import type {
   UpdateCurrentUserInput,
 } from '@/types'
 import { isCurrentPasswordRejection } from '@/utils/profileUpdate'
+import { isMfaCredentialRejection } from '@/utils/mfaErrors'
 
 declare module 'axios' {
   interface AxiosRequestConfig {
@@ -259,17 +260,18 @@ service.interceptors.response.use(
       // 历史问题 D-新2：MFA 自助端点的 401 是「凭证错误」（持有效 JWT 输错密码/验证码），
       // 不是会话失效——直接传播后端文案，不得弹「会话失效」并强制登出。
       // 历史问题 补正：管理员重置端点 /users/:id/mfa/reset 同样以 401 返回「验证码错误」，
-      // 需同口径放行（Users.vue 的 catch 展示后端文案供重试），否则误杀会话并在
-      // 仅匹配 /mfa/reset 路径段，不泛化放行（2026-09 裁定后登录失败计数仅登录阶段）。
+      // 需同口径放行（Users.vue 的 catch 展示后端文案供重试），否则误杀会话。
       // 历史问题-历史问题：只有后端明确的「当前密码错误」才豁免会话失效；同端点的
       // token 过期/未登录 401 仍必须进入下方重新登录流程。
+      // 历史问题-04：MFA 端点同样收窄到后端文案白名单（验证码/挑战错误）——
+      // 428→verify-step 窗口内的会话过期 401 必须弹「会话失效」并重登。
       const isSelfProfileCurrentPasswordError = isCurrentPasswordRejection(
         error.config?.method,
         error.config?.url,
         status,
         message,
       )
-      if (error.config?.url?.includes('/auth/mfa/') || error.config?.url?.includes('/mfa/reset') || isSelfProfileCurrentPasswordError) {
+      if (isMfaCredentialRejection(error.config?.url, status, message) || isSelfProfileCurrentPasswordError) {
         return Promise.reject(new ApiRequestError(message, status))
       }
       if (!isLoginRequest) {

@@ -424,10 +424,16 @@ func MFAGetStatus(userID int) (MFAStatus, error) {
 }
 
 // MFAWriteGuardEnabled 读全局写操作验证开关。
-func MFAWriteGuardEnabled() bool {
+// S历史问题（历史）：读取失败必须显式报错——旧实现返回 false 把「读不到」
+// 降级为「开关关闭」且无任何留痕，与 MFALockoutEnabled 的 U04c-04 裁定（读失败
+// 显式报错、调用方决定口径）分裂。调用方各自决定 fail-open/fail-closed：路由级
+// step-up 守卫按 SA1 裁定维持 fail-open（第二因子便利层，jwtAuth 已在前序
+// fail-closed 把关）但必须留痕；API Key 创建路径与相邻的 MFA 状态读取同口径
+// fail-closed（历史问题 C-历史问题）。
+func MFAWriteGuardEnabled() (bool, error) {
 	var v int
 	if err := db.DB.QueryRow("SELECT COALESCE(mfa_write_guard,0) FROM global_config WHERE id=1").Scan(&v); err != nil {
-		return false
+		return false, err
 	}
-	return v == 1
+	return v == 1, nil
 }

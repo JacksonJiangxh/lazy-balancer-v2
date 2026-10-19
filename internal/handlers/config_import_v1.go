@@ -804,9 +804,17 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		}
 		hasWaf := false
 		if payload := lbbakPayloadFromCtx(c); payload != nil {
-			hasWaf = payload.CRSTarGz != nil || payload.Xdb != nil
+			// 历史问题-历史问题（历史）：威胁库名单条目也是规则库数据文件
+			// ——RDB 文件化后存在「仅威胁 .iplist、无 CRS/xdb」的合法 lbbak
+			// （只启用威胁库更新的节点）。此前 hasWaf 只认 CRS/xdb，预览据此
+			// 提示「不含规则库文件」而实际会落盘名单文件（文案与真实能力不符）。
+			hasWaf = payload.CRSTarGz != nil || payload.Xdb != nil || len(payload.ThreatIplists) > 0
 			if hasWaf {
-				validateWarnings = append(validateWarnings, "lbbak 完整备份（含规则库数据文件，完整性已校验）——规则库数据库分类将随导入落盘")
+				if payload.CRSTarGz != nil || payload.Xdb != nil {
+					validateWarnings = append(validateWarnings, "lbbak 完整备份（含规则库数据文件，完整性已校验）——规则库数据库分类将随导入落盘")
+				} else {
+					validateWarnings = append(validateWarnings, "lbbak 含威胁库名单文件（完整性已校验）——导入「安全防护」将落盘名单文件；本包不含 CRS/IP2Region 数据文件")
+				}
 			}
 			// F-B1（历史）：manifest 未登记的威胁库条目——预览/导入
 			// 同文案告警（不拒绝，老备份兼容）。

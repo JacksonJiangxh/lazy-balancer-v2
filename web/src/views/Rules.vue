@@ -985,7 +985,7 @@
               {{ ruleConfig.protocol === 'tcp' ? 'TCP' : (ruleConfig.enable_tls ? 'HTTPS' : 'HTTP') }}
             </el-tag>
           </el-descriptions-item>
-          <el-descriptions-item label="负载策略">{{ ruleConfig.strategy }}</el-descriptions-item>
+          <el-descriptions-item label="负载策略">{{ getStrategyLabel(ruleConfig.strategy) }}</el-descriptions-item>
           <el-descriptions-item label="动态上游">{{ ruleConfig.dynamic_dns ? '启用' : '禁用' }}</el-descriptions-item>
           <el-descriptions-item label="DNS 服务器" v-if="ruleConfig.protocol === 'http'">
             {{ ruleConfig.enable_dns_server ? (ruleConfig.dns_server || '未配置') : '禁用' }}
@@ -1243,7 +1243,7 @@ import { popperViewportSafe } from '@/utils/popper'
 import { hostPortKey } from '@/utils/upstreamKeys'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, payloadWeight, redistributeWeight, weightPercent } from '@/utils/upstreamWeights'
 import { projectRuleFlowPath } from '@/utils/ruleFlow'
-import { dnsServerAfterToggle } from '@/utils/ruleWizard'
+import { clampPassiveHealthCheckTimeout, copyRuleHostHeader, dnsServerAfterToggle, newRuleWizardStageOverrides, stageBlockPageOverrides } from '@/utils/ruleWizard'
 import { certJobStatusLabel } from '@/utils/certJobStatus'
 import type { CertJobStatus } from '@/utils/certJobStatus'
 import { usePollingTask } from '@/composables/usePollingTask'
@@ -1773,6 +1773,9 @@ const isCopyMode = ref(false)
 // 复制源规则（openCopyWizard 带入）——POST /rules 不携带策略绑定，副本创建后
 // 经 PUT /security/rules/:id/policies 从源快照复制（submitWizard 复制分支消费）
 const copySourceRuleId = ref<string | null>(null)
+// W87-02：复制走 POST /rules 重建，Create 无 nil=保留语义——规则级回源 Host
+// 必须显式随载荷携带，否则副本静默丢失 Host 覆盖（编辑路径不受影响）。
+const copySourceHostHeader = ref('')
 const WIZARD_STEP = {
   BASIC: 0,
   TLS: 1,
@@ -2441,11 +2444,9 @@ const wizardFormFromRule = (fullRule: Rule): Partial<RuleForm> => ({
   request_body_max_size_mb: fullRule.request_body_max_size_mb || 0,
   upstream_keepalive_timeout: fullRule.upstream_keepalive_timeout || 0,
   server_tokens_hidden: fullRule.server_tokens_hidden || 0,
-  // 阶段拦截页覆盖：复制/编辑均保留（后端 DuplicateRule 同口径）。
-  block_page_stage1_id: fullRule.block_page_stage1_id || 0,
-  block_page_stage1_status: fullRule.block_page_stage1_status || 0,
-  block_page_stage3_id: fullRule.block_page_stage3_id || 0,
-  block_page_stage3_status: fullRule.block_page_stage3_status || 0,
+  // 阶段拦截页覆盖：复制/编辑均保留（后端 DuplicateRule 同口径）；键集与
+  // 新建/重置路径共用 stageBlockPageOverrides（W87-01）。
+  ...stageBlockPageOverrides(fullRule),
   // NTLM 接管态原样回填；编辑/复制均保留实际接管字段。
   ntlm_compatible: fullRule.ntlm_compatible === 1 ? 1 : 0,
   upstream_force_http1: fullRule.upstream_force_http1 === 1 ? 1 : 0,
@@ -2570,6 +2571,7 @@ const openWizard = async (rule?: Rule) => {
   upstreamTouched.value = []
   isCopyMode.value = false
   copySourceRuleId.value = null
+  copySourceHostHeader.value = ''
   if (rule) {
     // 编辑态一律保留已存端口：DB 中的 listen_port 即用户显式配置，TLS/协议切换不再静默迁移端口
     userExplicitPort.value = true
@@ -2649,6 +2651,9 @@ const openWizard = async (rule?: Rule) => {
       proxy_stream_timeout: 0,
       proxy_flush_interval: 0, // 此前重置族缺失：NTLM 开启后 flush=-1 为可达态，防 stale 泄漏进新建表单
       proxy_stream_close_delay: 0,
+      // W87-01：「新建规则」必须清掉上一条规则（编辑/复制水合而来）的阶段
+      // 拦截页覆盖——否则新规则静默继承旧规则的 stage1/stage3 页面与状态码。
+      ...newRuleWizardStageOverrides(),
     })
   }
   hydratingWizard = false
@@ -2671,6 +2676,10 @@ const resetWizard = () => {
   editingRule.value = null
   isCopyMode.value = false
   copySourceRuleId.value = null
+  copySourceHostHeader.value = ''
+  // W87-01：关闭向导同样清态——resetWizard 是下次「新建」之前的最后一道
+  // 兜底（openWizard 新建分支已同源清零，两处共用 newRuleWizardStageOverrides）。
+  Object.assign(wizardForm, newRuleWizardStageOverrides())
   wizardForm.enable_dns_server = false
   wizardForm.dns_server = ''
   currentStep.value = WIZARD_STEP.BASIC
@@ -3010,6 +3019,17 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
+  // 审计 87 WEBT-10：被动模式不展示超时输入（A85历史问题-1），但校验与提交载荷
+  // 不区分主动/被动——存量数据 timeout >= interval 时会被下面 历史 校验拦下，
+  // 而输入框不可见=无处修改。保存前在被动模式把越界值钳到合法区间并显性提示
+  // （后端不变式保留；主动模式仍走原校验与提示）。
+  if (!wizardForm.enable_active_health_check) {
+    const clampedTimeout = clampPassiveHealthCheckTimeout(wizardForm.health_check_interval, wizardForm.health_check_timeout)
+    if (clampedTimeout.clamped) {
+      ElMessage.info(`被动检查不展示「健康检查超时」：该值须小于间隔 ${wizardForm.health_check_interval} 秒，已自动从 ${wizardForm.health_check_timeout} 秒调整为 ${clampedTimeout.timeout} 秒`)
+      wizardForm.health_check_timeout = clampedTimeout.timeout
+    }
+  }
   // 历史 历史问题 / LB-18：health_check_timeout >= health_check_interval 校验——
   // 与后端 validateRuleFeatures（历史 历史问题）同口径，不区分主动/被动场景。
   if (wizardForm.health_check_interval > 0
@@ -3140,6 +3160,9 @@ const submitWizard = async () => {
 
     const data: UpdateRuleRequest = {
       name: wizardForm.name,
+      // W87-02：复制重建规则时必须显式携带源规则级回源 Host（省略=落空串）；
+      // 编辑/新建不带该键——Update 的 nil=保留语义不需要，新建本就无覆盖。
+      ...(isCopyMode.value ? { host_header: copySourceHostHeader.value } : {}),
       description: wizardForm.description,
       protocol: wizardForm.protocol,
       domain: wizardForm.domain,
@@ -3404,6 +3427,7 @@ const openCopyWizard = async (rule: Rule) => {
       markTlsDetailFailed(rule.caddy_id)
     }
   }
+  copySourceHostHeader.value = copyRuleHostHeader(fullRule)
   Object.assign(wizardForm, wizardFormFromRule(fullRule), {
     name: `${fullRule.name}（副本）`,
     enabled: false,
@@ -3666,6 +3690,9 @@ const onRuleLogDialogOpened = () => {
 
 const onRuleLogDialogClosed = () => {
   ruleLogRequestSeq++
+  // W87-09：关闭即停本地 5s 定时器——原实现只停 tail，定时器继续空转
+  //（refreshRuleLogs 被 isActive/空 caddyId 挡掉，仍每 5s 白跑分发链）。
+  stopRuleLogPolling()
   ruleLogTail.stop()
   ruleLogContent.value = ''
   ruleLogCaddyId.value = ''

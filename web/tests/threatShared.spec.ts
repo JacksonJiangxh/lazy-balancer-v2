@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { heatEntriesEqual, arcEndpoints, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation } from '../src/utils/threatShared.ts'
+import { heatEntriesEqual, arcEndpoints, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, normalizeCountryName, adminShortName, aggregateCountryCounts, hasProvinceStats, drillCommitAllowed } from '../src/utils/threatShared.ts'
 
 test('六边形点阵：pointy-top 六顶点且上下尖角（历史问题）', () => {
   assert.equal(POINTY_TOP_HEX_VERTICES.length, 6)
@@ -52,4 +52,53 @@ test('B 弧线端点：终点跟随当前本站坐标（构造期常量即失效
   const second = arcEndpoints([-74.0, 40.71], origin)
   assert.deepEqual(second, { startLat: 39.9, startLng: 116.4, endLat: 40.71, endLng: -74.0 })
   assert.notEqual(first.endLat, second.endLat)
+})
+
+// WT87-09：台湾归一/短名/计数合并此前零断言——热力、命中、下钻三处都靠它们。
+// 失效时台湾点阵不与大陆同色、下钻/命中回退 FALLBACK_CENTROID（中太平洋），
+// 且没有任何测试会拦住。
+test('台湾归一：Taiwan/台湾 → 中国，其他国名原样（用户裁定 2026-10-18）', () => {
+  assert.equal(normalizeCountryName('Taiwan'), '中国')
+  assert.equal(normalizeCountryName('台湾'), '中国')
+  assert.equal(normalizeCountryName('中国'), '中国')
+  assert.equal(normalizeCountryName('日本'), '日本')
+  assert.equal(normalizeCountryName(''), '')
+})
+
+test('计数合并：台湾计数并入中国，其他键保持独立（热力/hover 单源）', () => {
+  const merged = aggregateCountryCounts([
+    { name: '中国', count: 3 },
+    { name: 'Taiwan', count: 4 },
+    { name: '台湾', count: 5 },
+    { name: '美国', count: 7 },
+  ])
+  assert.equal(merged.get('中国'), 12)
+  assert.equal(merged.get('美国'), 7)
+  assert.equal(merged.has('Taiwan'), false, '台湾不得残留独立键（点阵按中国染色）')
+  assert.equal(merged.size, 2)
+})
+
+test('省短名：34 省后缀逐条剥离，非行政后缀不动（与后端 ip2RegionShortenName 同口径）', () => {
+  assert.equal(adminShortName('广西壮族自治区'), '广西')
+  assert.equal(adminShortName('宁夏回族自治区'), '宁夏')
+  assert.equal(adminShortName('新疆维吾尔自治区'), '新疆')
+  assert.equal(adminShortName('内蒙古自治区'), '内蒙古')
+  assert.equal(adminShortName('香港特别行政区'), '香港')
+  assert.equal(adminShortName('广东省'), '广东')
+  assert.equal(adminShortName('北京市'), '北京')
+  // 无后缀/后缀即全名时不得截成空串
+  assert.equal(adminShortName('California'), 'California')
+  assert.equal(adminShortName('省'), '省')
+})
+
+test('省级统计边界：仅中国有省级数据源，海外下钻必须显示「无省级统计」（WT87-11）', () => {
+  assert.equal(hasProvinceStats('中国'), true)
+  assert.equal(hasProvinceStats('美国'), false)
+  assert.equal(hasProvinceStats(''), false)
+})
+
+test('下钻续体作废：seq 过期或已销毁一律丢弃（双引擎共用判定，WT87-03）', () => {
+  assert.equal(drillCommitAllowed(3, 3, false), true)
+  assert.equal(drillCommitAllowed(2, 3, false), false, '复位/返回递增 seq 后迟到续体必须丢弃')
+  assert.equal(drillCommitAllowed(3, 3, true), false, '退出大屏后不得再操作已销毁引擎')
 })

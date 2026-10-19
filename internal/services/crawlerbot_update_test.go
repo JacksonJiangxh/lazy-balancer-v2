@@ -2,6 +2,7 @@ package services
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -93,7 +95,9 @@ func TestPrimeCrawlerIPLists_builtinFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("snapshot file missing: %v", err)
 	}
-	if !strings.Contains(string(data), "66.249.66.0/24") {
+	// PD-04（历史）：内置首版=官方快照（googlebot 官方段以 /27 粒度发布，
+	// 旧断言 66.249.66.0/24 钉的是已删除的手写表形态）。
+	if !strings.Contains(string(data), "192.178.4.0/27") {
 		t.Errorf("内置首版未包含 Google CIDR: %s", string(data))
 	}
 	if !strings.Contains(string(data), "157.55.39.0/24") {
@@ -318,5 +322,78 @@ func TestPrimeCrawlerIPLists_usesBundledSeedFile(t *testing.T) {
 	data, err := os.ReadFile(crawlerIPListFile)
 	if err != nil || !strings.Contains(string(data), "192.0.2.123/32") {
 		t.Errorf("内置种子未生成快照: %s err=%v", data, err)
+	}
+}
+
+// —— 回退 /load 无系统重载审计（SSA-87-03，历史） ——
+
+// 爬虫名单变化且投影热路径未证实收敛 → 真实 /load 必须与 threat_update/autoban
+// 同口径留系统重载审计（成功/失败两态）。
+func TestSSA8703_crawlerFallbackReloadRecordsSystemAudit(t *testing.T) {
+	newClusterTestService(t)
+	oldRefresher, oldReloader := threatProjectionRefresher, threatReloader
+	t.Cleanup(func() { threatProjectionRefresher, threatReloader = oldRefresher, oldReloader })
+	threatProjectionRefresher = func() (IPListProjectionOutcome, error) { return ProjectionNeedForce, nil }
+	threatReloader = func() error { return nil }
+
+	convergeIPListProjectionAfterMutation("crawlerbot-update")
+	var success int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='重载' AND resource='Caddy服务' AND detail LIKE ?`, "%爬虫地址库更新%").Scan(&success); err != nil {
+		t.Fatal(err)
+	}
+	if success != 1 {
+		t.Fatalf("爬虫回退 /load 成功审计行=%d, want 1（与 threat_update/autoban 同口径留系统重载审计）", success)
+	}
+
+	threatReloader = func() error { return errors.New("injected reload failure") }
+	convergeIPListProjectionAfterMutation("crawlerbot-update")
+	var failure int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='重载失败' AND resource='Caddy服务' AND detail LIKE ? AND detail LIKE ?`, "%爬虫地址库更新%", "%injected reload failure%").Scan(&failure); err != nil {
+		t.Fatal(err)
+	}
+	if failure != 1 {
+		t.Fatalf("爬虫回退 /load 失败审计行=%d, want 1", failure)
+	}
+}
+
+// —— 快照变化判定顺序敏感（SSA-87-07，历史） ——
+
+// 同集合换序不得判为变化（源站重排不产生写放大/「更新成功」噪声），且未变化
+// 不重写 DB entries（展示顺序保持）；真实内容变化仍须探测到。
+func TestSSA8707_upsertChangeDetectionIgnoresOrder(t *testing.T) {
+	_, database := newClusterTestService(t)
+	oldFile := crawlerIPListFile
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	t.Cleanup(func() { crawlerIPListFile = oldFile })
+
+	first := []string{"66.249.66.0/24", "66.249.67.0/24"}
+	changed, err := upsertCrawlerIPListChanged("googlebot", first)
+	if err != nil || !changed {
+		t.Fatalf("首次写入 changed=%v err=%v, want true/nil", changed, err)
+	}
+	// 同集合换序：不得判为变化（源站重排不产生写放大/「更新成功」噪声）。
+	changed, err = upsertCrawlerIPListChanged("googlebot", []string{"66.249.67.0/24", "66.249.66.0/24"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("同集合换序必须判为未变化（顺序敏感的字节比较=SSA-87-07）")
+	}
+	// DB 展示顺序保持原状（未变化不重写）。
+	var raw string
+	if err := database.QueryRow(`SELECT entries FROM security_ip_lists WHERE name=? AND system=1`, CrawlerIPListName("googlebot")).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var stored []models.IPListEntry
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 2 || stored[0].Value != "66.249.66.0/24" {
+		t.Fatalf("未变化不得重写 DB entries（顺序应保持）: %+v", stored)
+	}
+	// 真实变化仍须探测到。
+	changed, err = upsertCrawlerIPListChanged("googlebot", []string{"66.249.66.0/24"})
+	if err != nil || !changed {
+		t.Fatalf("内容变化 changed=%v err=%v, want true/nil", changed, err)
 	}
 }

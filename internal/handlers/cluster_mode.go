@@ -14,6 +14,12 @@ import (
 )
 
 func (h *Handlers) SetClusterMode(c *gin.Context) {
+	// 历史问题（历史 历史问题，R-12 守卫族收敛）：导入事务全量替换 global_config，
+	// 窗口内切换角色会在远端留下无法本地回滚的注册（BecomeSlave 之后被导入
+	// 覆盖 → 远端孤儿注册 + 本地仍为主节点）。必须先于任何网络副作用 fast-fail。
+	if rejectNodeWriteDuringImport(c) {
+		return
+	}
 	if h.syncService == nil {
 		clusterError(c, http.StatusServiceUnavailable, "同步服务未初始化", nil)
 		return
@@ -111,6 +117,11 @@ func requestProtocol(c *gin.Context) string {
 }
 
 func (h *Handlers) PromoteClusterNode(c *gin.Context) {
+	// 历史问题（历史 历史问题）：导入窗口写 global_config 会被全量替换覆盖——
+	// 与节点写端点同族 fast-fail（先于任何状态读取/生效）。
+	if rejectNodeWriteDuringImport(c) {
+		return
+	}
 	// 历史问题(历史):syncService 缺失判定前置——此前 Promote 已生效才报
 	// 503,调用方见到失败但角色已提升,重试撞 ErrAlreadyMaster。
 	if h.syncService == nil {
@@ -138,6 +149,11 @@ func (h *Handlers) PromoteClusterNode(c *gin.Context) {
 }
 
 func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
+	// 历史问题（历史 历史问题）：同步开关与间隔写 global_config，导入窗口内的写入
+	// 会被全量替换覆盖（静默丢失）——与节点写端点同族 fast-fail。
+	if rejectNodeWriteDuringImport(c) {
+		return
+	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
 	var req models.ClusterSettingsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -164,7 +180,14 @@ func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
 		clusterError(c, status, msg, err)
 		return
 	}
-	recordAudit(c, "更新", "集群设置", services.FormatAuditDetail(clusterSettingsChangeDetail(req), services.AuditResultPart("success")))
+	// 历史问题（历史 历史问题）：空 body = 幂等空保存，parts 为空时审计详情曾落空串
+	// （无法区分「无修改」与记录缺陷）——复用同域既有「无修改」文案
+	// （caproviders/certificates 同口径）。
+	detail := clusterSettingsChangeDetail(req)
+	if detail == "" {
+		detail = "无修改"
+	}
+	recordAudit(c, "更新", "集群设置", services.FormatAuditDetail(detail, services.AuditResultPart("success")))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "集群设置已更新"})
 }
 

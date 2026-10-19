@@ -26,12 +26,28 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// crsRulesDir 是 CRS 规则文件目录；定义为变量以便测试注入临时目录。
-var crsRulesDir = "/app/waf/crs/rules"
+// crsRulesDir 是 CRS 规则文件目录测试缝：空值=按 services.CRSLiveDir() 派生
+// （SS87-历史问题 单点派生——避免 services 写侧与 handlers 读侧各持一份 /app
+// 硬编码，data_dir ≠ /app/data 时分叉）；测试注入临时目录。
+var crsRulesDir = ""
 
-// crsSetupConfPath 与 crsRulesDir 同款测试缝（历史 历史问题）：默认生产路径，
-// 测试可覆写以覆盖 404/413 分支。
-var crsSetupConf = "/app/waf/crs/crs-setup.conf"
+// crsSetupConf 与 crsRulesDir 同款测试缝（历史 历史问题）：空值=派生。
+var crsSetupConf = ""
+
+// crsRulesDirPath / crsSetupConfPath 解析当前 CRS 读取路径（测试缝优先）。
+func crsRulesDirPath() string {
+	if crsRulesDir != "" {
+		return crsRulesDir
+	}
+	return filepath.Join(services.CRSLiveDir(), "rules")
+}
+
+func crsSetupConfPath() string {
+	if crsSetupConf != "" {
+		return crsSetupConf
+	}
+	return filepath.Join(services.CRSLiveDir(), "crs-setup.conf")
+}
 
 func (h *Handlers) ListSecurityCustomRules(c *gin.Context) {
 	rows, err := db.DB.Query("SELECT id, name, COALESCE(description,''), COALESCE(conditions,'[]'), COALESCE(action,'block'), COALESCE(score,5), COALESCE(enabled,1), COALESCE(created_at,''), COALESCE(updated_at,''), COALESCE(updated_by,0) FROM security_custom_rules ORDER BY id")
@@ -124,7 +140,7 @@ const securityCustomRuleMaxGlobalCount = 200
 var createSecurityCustomRulePreLockHook func()
 
 func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
-	var req models.SecurityCustomRule
+	var req models.CreateCustomRuleRequest
 	if !guardConfiguredJSONBody(c) {
 		return
 	}
@@ -132,16 +148,26 @@ func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
+	// HC-06（历史）：省略 enabled = 启用（零值陷阱家族 B1-历史问题）——
+	// MCP/API 无需感知默认值，也不得因省略而创建静默禁用的 WAF 规则。
+	rule := models.SecurityCustomRule{
+		Name:        req.Name,
+		Description: req.Description,
+		Conditions:  req.Conditions,
+		Action:      req.Action,
+		Score:       req.Score,
+		Enabled:     req.Enabled == nil || *req.Enabled,
+	}
 	if createSecurityCustomRulePreLockHook != nil {
 		createSecurityCustomRulePreLockHook()
 	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
-	if err := validateSecurityCustomRule(&req); err != nil {
+	if err := validateSecurityCustomRule(&rule); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
-	conditionsJSON, _ := json.Marshal(req.Conditions)
+	conditionsJSON, _ := json.Marshal(rule.Conditions)
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "开启事务失败"})
@@ -162,7 +188,7 @@ func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 		return
 	}
 	result, err := tx.Exec(`INSERT INTO security_custom_rules (name, description, conditions, action, score, enabled, updated_by) VALUES (?,?,?,?,?,?,?)`,
-		req.Name, req.Description, string(conditionsJSON), req.Action, req.Score, req.Enabled, int(contextUserID(c)))
+		rule.Name, rule.Description, string(conditionsJSON), rule.Action, rule.Score, rule.Enabled, int(contextUserID(c)))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
@@ -170,7 +196,7 @@ func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 	id, _ := result.LastInsertId()
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "自定义规则", AuditAction: "创建",
-		AuditDetail: fmt.Sprintf("名称：%s（#%d）", req.Name, id),
+		AuditDetail: fmt.Sprintf("名称：%s（#%d）", rule.Name, id),
 		SuccessMsg:  "规则创建成功",
 		Data:        gin.H{"id": id},
 	})
@@ -264,8 +290,7 @@ func (h *Handlers) UpdateSecurityCustomRule(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	if rows, _ := result.RowsAffected(); rows == 0 {
-		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "规则不存在"})
+	if !rowsAffectedOrRespond(c, result, "规则不存在") {
 		return
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
@@ -340,8 +365,7 @@ func (h *Handlers) DeleteSecurityCustomRule(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	if rows, _ := result.RowsAffected(); rows == 0 {
-		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "规则不存在"})
+	if !rowsAffectedOrRespond(c, result, "规则不存在") {
 		return
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
@@ -538,8 +562,7 @@ func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	if rows, _ := result.RowsAffected(); rows == 0 {
-		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "拦截页面不存在"})
+	if !rowsAffectedOrRespond(c, result, "拦截页面不存在") {
 		return
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
@@ -616,8 +639,7 @@ func (h *Handlers) DeleteSecurityBlockPage(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	if rows, _ := result.RowsAffected(); rows == 0 {
-		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "拦截页面不存在"})
+	if !rowsAffectedOrRespond(c, result, "拦截页面不存在") {
 		return
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
@@ -2062,8 +2084,7 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	if rows, _ := result.RowsAffected(); rows == 0 {
-		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "策略不存在"})
+	if !rowsAffectedOrRespond(c, result, "策略不存在") {
 		return
 	}
 	// 缺省（nil）提交按合并后内容重推断 policy_type（类型与内容不漂移；
@@ -2267,8 +2288,7 @@ func (h *Handlers) DeleteSecurityPolicy(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	if rows, _ := result.RowsAffected(); rows == 0 {
-		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "策略不存在"})
+	if !rowsAffectedOrRespond(c, result, "策略不存在") {
 		return
 	}
 	if _, err := tx.Exec("DELETE FROM security_policy_bindings WHERE policy_id=?", id); err != nil {
@@ -2289,6 +2309,13 @@ func (h *Handlers) DeleteSecurityPolicy(c *gin.Context) {
 // 前端 SecurityBindingEditor/SecurityPolicies 的 MAX_POLICY_BINDINGS 与
 // mcpserver schema maxItems 为镜像口径，调整时须同步。
 const maxBindingsPerRule = 8
+
+// maxBatchBindRules 批量绑定端点（POST /security/policies/batch-bind）单次规则
+// 数上限（历史 HC-01）：与 BulkUpdatePolicyBindings 的 100 同口径，
+// 前端 SECURITY_BULK_LIMITS.policyBindings 为其镜像。判据按 normalizeRuleIDs
+// 归一后集合计数（空白/重复 id 不占额度），超限 400 整体拒绝——不得带着写锁
+// （BEGIN IMMEDIATE + caddyOpMu）逐规则执行 N×3~4 次查询。
+const maxBatchBindRules = 100
 
 func (h *Handlers) BindRuleToPolicy(c *gin.Context) {
 	policyID := c.Param("id")
@@ -2439,7 +2466,11 @@ func (h *Handlers) SetRuleSecurityPolicies(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
-	if msg, err := setRulePoliciesInTx(c.Request.Context(), tx, ruleCaddyID, req.PolicyIDs); err != nil {
+	// HC-07（历史）：审计串与写入共用同一归一集合——此前审计用原始
+	// req.PolicyIDs（重复项保留），提交 [1,1,2] 时审计记 [1,1,2] 而库内为
+	// [1,2]，取证时无法从审计还原最终绑定集。
+	policyIDs := normalizePolicyIDs(req.PolicyIDs)
+	if msg, err := setRulePoliciesInTx(c.Request.Context(), tx, ruleCaddyID, policyIDs); err != nil {
 		// DB 故障（锁/IO）映射 500 而非 400 裸串外泄（历史 NEW-2）。
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取/写入策略绑定失败"})
 		return
@@ -2447,8 +2478,8 @@ func (h *Handlers) SetRuleSecurityPolicies(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: msg})
 		return
 	}
-	idStrs := make([]string, len(req.PolicyIDs))
-	for i, id := range req.PolicyIDs {
+	idStrs := make([]string, len(policyIDs))
+	for i, id := range policyIDs {
 		idStrs[i] = strconv.Itoa(id)
 	}
 	summary := strings.Join(idStrs, ",")
@@ -2462,6 +2493,22 @@ func (h *Handlers) SetRuleSecurityPolicies(c *gin.Context) {
 	})
 }
 
+// normalizePolicyIDs 策略 ID 去重（保序）单实现（历史 HC-07/R-12）：
+// 绑定上限判定、存在性校验、写入与审计串必须共用归一后集合——上限按原始长度
+// 判定会让 [1,1,…] 重复项被误判超限，审计按原始数组判定则与库内终态分叉。
+func normalizePolicyIDs(ids []int) []int {
+	seen := make(map[int]struct{}, len(ids))
+	unique := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	return unique
+}
+
 // setRulePoliciesInTx 校验并原子替换单规则的策略绑定集（DELETE+按去重序
 // INSERT OR IGNORE），供单条端点 SetRuleSecurityPolicies 使用（历史 R-12
 // 单实现）。返回 (userMsg, err)：userMsg 非空=面向用户的 400 校验消息；err
@@ -2473,15 +2520,7 @@ func setRulePoliciesInTx(ctx context.Context, tx *sql.Tx, ruleCaddyID string, po
 	// 上限判定须先去重（B-I2）：[1,1,2,3,4,5] 为 5 条唯一策略，不得因原始数组
 	// 长度 6 误判超限。去重同时避免同一 id 重复计数导致存在性校验误判
 	// （INSERT OR IGNORE 本来就会去重，但 COUNT 必须与去重后的集合对齐）。
-	seen := map[int]struct{}{}
-	uniqueIDs := make([]int, 0, len(policyIDs))
-	for _, id := range policyIDs {
-		if _, dup := seen[id]; dup {
-			continue
-		}
-		seen[id] = struct{}{}
-		uniqueIDs = append(uniqueIDs, id)
-	}
+	uniqueIDs := normalizePolicyIDs(policyIDs)
 	if len(uniqueIDs) > maxBindingsPerRule {
 		return fmt.Sprintf("最多绑定 %d 条策略", maxBindingsPerRule), nil
 	}
@@ -2790,6 +2829,8 @@ func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 // DELETE（replace 或绑定变化时）+INSERT OR IGNORE；全程一次 finishTxApply
 // （单渲染——批量绑定的成本模型与逐条调 PUT /security/rules/:id/policies
 // N 次渲染对齐）。响应 {bound:n, skipped:[{rule_id,reason}]}。
+// 历史 HC-01：rule_ids 归一后上限 maxBatchBindRules（100），超限 400
+// 整体拒绝——同族 BulkUpdatePolicyBindings / batch-block-pages 均有上限。
 func (h *Handlers) BatchBindSecurityPolicies(c *gin.Context) {
 	var req struct {
 		RuleIDs   []string `json:"rule_ids"`
@@ -2817,16 +2858,14 @@ func (h *Handlers) BatchBindSecurityPolicies(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "rule_ids 不能为空"})
 		return
 	}
-	// 去重后上限判定（同 SetRuleSecurityPolicies 的 B-I2 口径）
-	seen := map[int]struct{}{}
-	uniqueIDs := make([]int, 0, len(req.PolicyIDs))
-	for _, id := range req.PolicyIDs {
-		if _, dup := seen[id]; dup {
-			continue
-		}
-		seen[id] = struct{}{}
-		uniqueIDs = append(uniqueIDs, id)
+	// HC-01（历史）：单次规则数上限与兄弟批量端点同口径（归一后计数）
+	// ——无上限时数万条 rule_ids 会在写锁内逐规则查询/写入，阻塞全部主库配置写。
+	if len(req.RuleIDs) > maxBatchBindRules {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("单次最多提交 %d 条规则（去重后计数）", maxBatchBindRules)})
+		return
 	}
+	// 去重后上限判定（同 SetRuleSecurityPolicies 的 B-I2 口径）
+	uniqueIDs := normalizePolicyIDs(req.PolicyIDs)
 	if len(uniqueIDs) > maxBindingsPerRule {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("每条规则最多绑定 %d 条策略", maxBindingsPerRule)})
 		return
@@ -3001,6 +3040,13 @@ func (h *Handlers) BatchBindSecurityPolicies(c *gin.Context) {
 // 标记）。单事务一次
 // finishTxApply（单渲染）。
 func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
+	// HC-03（历史）：非规范数字 ID 家族门——SQLite INTEGER 亲和会让
+	// "5.0" 命中行 5，使本端点绕过同族一致的输入门（Delete/Unbind/更新端点
+	// 均在此 400）。
+	if _, ok := parsePositiveNumericID(c.Param("id")); !ok {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的策略 ID"})
+		return
+	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 
@@ -3762,8 +3808,11 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 	// 历史问题（历史）：事件表这些列 schema 可空（仅 DEFAULT、无 NOT NULL），
 	// 带外/异常写入显式 NULL 会让整页 500——列表投影统一 COALESCE，与策略/拦截页/
 	// 自定义规则的 NULL 容忍口径一致（security_null_coalesce_test.go）。
+	// HC-10（历史）：request_headers/request_body 在 SQL 侧只取截断上限
+	//（+1 探针）——此前整列（上行落库上限 64KB/字段）取回再在 Go 侧截到 16KB，
+	// 100 行 × 2 字段最多传输 ~12.8MB 只为返回 ≤1.6MB；列表弹框只消费截断内容。
 	rows, err := db.MetricsDB.Query(`SELECT e.id, e.event_time, COALESCE(e.rule_caddy_id,''), COALESCE(e.policy_id,0), COALESCE(e.client_ip,''), COALESCE(e.method,''), COALESCE(e.uri,''), COALESCE(e.event_type,''), COALESCE(e.rule_triggered,''), COALESCE(e.rule_msg,''), COALESCE(e.action,''), COALESCE(e.anomaly_score, 0),
-		COALESCE(e.rule_name,''), COALESCE(e.policy_name,''), COALESCE(e.duration_us,0), COALESCE(e.precheck_us,0), COALESCE(e.request_headers,''), COALESCE(e.request_body,'')
+		COALESCE(e.rule_name,''), COALESCE(e.policy_name,''), COALESCE(e.duration_us,0), COALESCE(e.precheck_us,0), `+securityEventListFieldSQL("e.request_headers")+`, `+securityEventListFieldSQL("e.request_body")+`
 		FROM security_events e`+where+" ORDER BY e.event_time DESC, e.id DESC LIMIT ? OFFSET ?", queryArgs...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
@@ -3805,6 +3854,14 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 }
 
 const securityEventListFieldCap = 16 * 1024
+
+// securityEventListFieldSQL 事件列表的大字段投影：SQL 侧只取截断上限 +1 个
+// **字符**（SQLite SUBSTR 按字符计，天然不切断 UTF-8）。+1 是超限探针——
+// truncateEventListField 据此判定「原值更长」并追加截断标记，响应字节与
+// 此前「整列取回再截断」完全一致（HC-10 历史）。
+func securityEventListFieldSQL(column string) string {
+	return "COALESCE(SUBSTR(" + column + ",1," + strconv.Itoa(securityEventListFieldCap+1) + "),'')"
+}
 
 func truncateEventListField(value string) string {
 	if len(value) <= securityEventListFieldCap {
@@ -4372,7 +4429,7 @@ func (h *Handlers) StartCRSUpdate(c *gin.Context) {
 	// 执行体不变：引擎 Run 体仍走 manager.StartUpdate（taskengine_wire 注册）。
 	te := services.TaskEngine()
 	if te == nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务引擎未初始化"})
+		respondTaskEngineUnavailable(c)
 		return
 	}
 	if te.IsTaskInFlight("crs") {
@@ -4535,7 +4592,7 @@ func (h *Handlers) StartIP2RegionUpdate(c *gin.Context) {
 	// V2（历史用户裁定）：手动触发统一经任务引擎（同 StartCRSUpdate）。
 	te := services.TaskEngine()
 	if te == nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务引擎未初始化"})
+		respondTaskEngineUnavailable(c)
 		return
 	}
 	if te.IsTaskInFlight("ip2region") {
@@ -4952,7 +5009,7 @@ func validIPOrCIDR(entry string) bool {
 // (→string) 删除,调用点按需 int()/strconv.FormatInt 型转换。
 
 func (h *Handlers) ListCRSRules(c *gin.Context) {
-	entries, err := os.ReadDir(crsRulesDir)
+	entries, err := os.ReadDir(crsRulesDirPath())
 	if err != nil {
 		// SH-1(历史):降级空列表 200 与「确实无规则」不可区分——
 		// 同域标准(历史问题 D2 全零面板必须报错)对齐,改 500。
@@ -5044,7 +5101,7 @@ func (h *Handlers) GetCRSRuleContent(c *gin.Context) {
 	}
 	// W8：经 crsRulesDir 测试缝解析（与 ListCRSRules 同源），消除硬编码路径与
 	// 局部变量对 filepath 包名的遮蔽；上方路径穿越门（../ 与 /）原样保留。
-	path := filepath.Join(crsRulesDir, filename)
+	path := filepath.Join(crsRulesDirPath(), filename)
 	f, err := os.Open(path)
 	if err != nil {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "规则文件不存在"})
@@ -5076,7 +5133,7 @@ func (h *Handlers) GetCRSSetupConfig(c *gin.Context) {
 	// crs-setup.conf / rules/*.conf；带外手改后池键不变、新配置 Provision 复用
 	// 旧 WAF，手改静默不生效（直到进程重启或下一次 CRS 版本变更）。CRS 配置
 	// 变更必须经 CRS 更新流程；本端点仅为只读查看。
-	f, err := os.Open(crsSetupConf)
+	f, err := os.Open(crsSetupConfPath())
 	if err != nil {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "CRS 配置文件不存在"})
 		return
@@ -5097,6 +5154,23 @@ func (h *Handlers) GetCRSSetupConfig(c *gin.Context) {
 func parsePositiveNumericID(raw string) (int64, bool) {
 	id, err := strconv.ParseInt(raw, 10, 64)
 	return id, err == nil && id > 0
+}
+
+// rowsAffectedOrRespond 统一写后存在性判定（历史 HC-08）：RowsAffected
+// 返回错误时必须显式 500——此前 8 处 `if rows, _ := result.RowsAffected(); rows
+// == 0` 把驱动层错误吞成「0 行」，真实故障被误报为 404（重试语义误导）。
+// 返回 false 表示已写出响应，调用方直接 return。
+func rowsAffectedOrRespond(c *gin.Context, result sql.Result, notFoundMsg string) bool {
+	rows, err := result.RowsAffected()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取写入结果失败: " + err.Error()})
+		return false
+	}
+	if rows == 0 {
+		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: notFoundMsg})
+		return false
+	}
+	return true
 }
 
 func derefInt(p *int) int {

@@ -93,8 +93,8 @@ func loadConfigSnapshot() (configSnapshot, error) {
 		COALESCE(mfa_write_guard,0),
 		COALESCE(mfa_lockout_enabled,0),
 		COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_ranges,'[]'), COALESCE(trusted_proxy_range_refs,'[]'), COALESCE(trusted_proxy_headers,'[]'), COALESCE(trusted_proxy_strict,1),
-		COALESCE(server_map_lat,0), COALESCE(server_map_lon,0), COALESCE(threat_screen_mode,'map'), COALESCE(threat_traffic_sample_n,-1), COALESCE(security_events_retention_days,90), COALESCE(security_events_row_cap,1000000)
-		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays).Scan(
+		COALESCE(server_map_lat,0), COALESCE(server_map_lon,0), COALESCE(threat_screen_mode,?), COALESCE(threat_traffic_sample_n,?), COALESCE(security_events_retention_days,?), COALESCE(security_events_row_cap,?)
+		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays, db.DefaultThreatScreenMode, db.DefaultThreatTrafficSampleN, db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap).Scan(
 		&old.ACMEEmail, &old.DNSProvider, &old.DNSCredentials,
 		&old.CertExpiryDays, &old.CertRenewalDays, &old.CertRenewalAttempts,
 		&old.DefaultCAProviderID, &old.LogLevel,

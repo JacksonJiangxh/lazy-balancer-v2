@@ -316,25 +316,32 @@ func TestEngine_DaemonLifecycle(t *testing.T) {
 }
 
 // Given Periodic 任务（30ms 间隔）。
-// When 调度运行至 ≥5 轮落行（3s 截止兜底——全量套件并行争抢 CPU 时墙钟
-// 300ms 窗口可能只排到 4 轮，历史期两次全量运行实证；契约是
-// 「每轮独立执行且每轮落行」，不是 300ms 内的绝对轮数）。
+// When 调度运行至 ≥5 轮落行。
 // Then ≥5 行且全部终态 success（无 RFO 静默）。
+// CI87-15（历史）：编排同步点用 Run 内部信号，不再以 10ms 墙钟轮询推断
+// 执行进度——契约是「每轮独立执行且每轮落行」，不是固定窗口内的绝对轮数；
+// 3s 截止只在真回归时触发。
 func TestEngine_PeriodicRecordsEveryCycle(t *testing.T) {
 	e := newTestEngine(t)
+	executed := make(chan struct{}, 64)
 	e.Register(Descriptor{ID: "t-per", Family: "t", Name: "循环", Kind: KindPeriodic,
 		IntervalFn: func() time.Duration { return 30 * time.Millisecond },
-		Run:        func(rc RunContext) error { return nil }})
+		Run:        func(rc RunContext) error { executed <- struct{}{}; return nil }})
 	e.SetRole(true)
 	e.StartLoop("t-per")
-	deadline := time.Now().Add(3 * time.Second)
-	for countRuns(t, "t-per") < 5 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	for tick := 0; tick < 5; tick++ {
+		select {
+		case <-executed:
+		case <-time.After(3 * time.Second):
+			e.StopLoop("t-per")
+			t.Fatalf("30ms 间隔任务 3s 内仅执行 %d 轮, want ≥5", tick)
+		}
 	}
 	e.StopLoop("t-per")
+	waitForEngine(t, "每轮落行", 2*time.Second, func() bool { return countRuns(t, "t-per") >= 5 })
 	rows := countRuns(t, "t-per")
 	if rows < 5 {
-		t.Fatalf("30ms 间隔 3s 内应≥5 轮且每轮落行, got %d 行", rows)
+		t.Fatalf("30ms 间隔应≥5 轮且每轮落行, got %d 行", rows)
 	}
 	var success int
 	_ = db.DB.QueryRow(`SELECT COUNT(*) FROM task_runs WHERE task_id='t-per' AND status='success'`).Scan(&success)

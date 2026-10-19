@@ -85,16 +85,19 @@
         </div>
         <div class="tm-cq-banner-live">
           <span v-if="certQueueError" class="tm-cq-idle">证书队列状态加载失败（下一轮轮询自动重试）</span>
-          <template v-else-if="certQueue.jobs.length">
-            <span v-for="j in certQueue.jobs.slice(0, 4)" :key="j.id" class="tm-cq-domain-chip">
+          <!-- WS-01：正文空态改按聚合存活计数判定（原只看首页存活行——
+               首页均为终态而聚合计数非空时会谎报「空闲」）。 -->
+          <template v-else-if="certQueueHasLive(certQueue)">
+            <span v-for="j in certQueue.jobs.slice(0, CERT_QUEUE_VISIBLE_JOBS)" :key="j.id" class="tm-cq-domain-chip">
               {{ j.domain }}<i :class="'tm-cq-dot tm-cq-dot--' + j.status" />
             </span>
-            <span v-if="certQueue.total > 4" class="tm-cq-more">+{{ certQueue.total - 4 }}</span>
+            <span v-if="certQueueMoreCount(certQueue) > 0" class="tm-cq-more">+{{ certQueueMoreCount(certQueue) }}</span>
           </template>
           <span v-else class="tm-cq-idle">空闲——临期证书由「证书续期扫描」自动入队</span>
         </div>
-        <el-tag :type="certQueueError ? 'danger' : certQueue.running > 0 ? 'primary' : 'success'" size="small" effect="plain">
-          {{ certQueueError ? '加载失败' : certQueue.running > 0 ? '签发进行中' : '空闲' }}
+        <!-- WS-01：标签判据与聚合计数同口径——排队/等 CA 亦为「非空闲」。 -->
+        <el-tag :type="certQueueError ? 'danger' : certQueueIsBusy(certQueue) ? 'primary' : 'success'" size="small" effect="plain">
+          {{ certQueueError ? '加载失败' : certQueueIsBusy(certQueue) ? '队列非空' : '空闲' }}
         </el-tag>
       </div>
     </el-card>
@@ -238,7 +241,8 @@
     </el-card>
 
     <!-- 任务详情 -->
-    <el-dialog v-model="detailVisible" width="720px" top="8vh">
+    <!-- WS-16：同类弹框均 min(…,92vw)——固定 720px 在窄屏横向溢出。 -->
+    <el-dialog v-model="detailVisible" width="min(720px, 92vw)" top="8vh">
       <template #header>
         <DialogHeader
           :icon="detailIcon" :title="detailTask?.name || ''"
@@ -337,6 +341,7 @@ import { usePollingErrorState } from '@/composables/usePollingErrorState'
 import { useClampedPagination } from '@/composables/useClampedPagination'
 import { statusColor } from '@/utils/chartTheme'
 import { certJobStatusLabel, type CertJobStatus } from '@/utils/certJobStatus'
+import { CERT_QUEUE_VISIBLE_JOBS, certQueueHasLive, certQueueIsBusy, certQueueMoreCount } from '@/utils/certQueue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import type { APIResponse } from '@/types'
@@ -372,14 +377,19 @@ const refreshing = ref(false)
 const readOnly = computed(() => authStore.readOnlyReason !== null)
 const canOperate = computed(() => isAdmin.value && !readOnly.value)
 
+// WS-02：200 但缺 data 是契约违约，不得静默渲染成「0 任务 / 空图表」——与
+// CertJobs.vue 同口径抛 TypeError，才能进入 usePollingErrorState 的契约退避与
+// 错误横幅（原 `res.data?.tasks || []` 把违约伪装成合法空集）。
 const fetchTasks = async (signal?: AbortSignal) => {
   const res = await request.get<APIResponse<{ tasks: TaskInfo[] }>>('/system/tasks', { silent: true, signal })
-  tasks.value = res.data?.tasks || []
+  if (!res.data) throw new TypeError('任务列表响应缺少 data')
+  tasks.value = res.data.tasks || []
   loaded.value = true
 }
 const fetchSeries = async (signal?: AbortSignal) => {
   const res = await request.get<APIResponse<{ series: TaskHourlyStat[] }>>('/system/tasks/stats-24h-series', { silent: true, signal })
-  series24h.value = res.data?.series || []
+  if (!res.data) throw new TypeError('任务统计响应缺少 data')
+  series24h.value = res.data.series || []
 }
 const refreshNow = async () => {
   refreshing.value = true
@@ -433,15 +443,19 @@ const certQueue = ref<{ queued: number; running: number; waiting: number; total:
 })
 // 历史问题-F5：队列加载失败不得呈现为「全 0 / 空闲」——显式错误态（下一轮轮询自愈）
 const certQueueError = ref(false)
-// 服务端聚合计数（/certificates/jobs 未提供时按可见行推导，且只在 total 超页时
-// 声明「≥」——历史 历史问题：原 page_size=50 忽略 total，>50 任务时计数偏小）
-const CERT_QUEUE_PAGE_SIZE = 200
+// WS-03：列表只用于横幅列 4 个域名 chip——page_size=6 即够（原 200，每 10s
+// 让后端逐行截取 cert_pem/解析 issuer/算到期状态后丢弃）。计数仍以
+// status_counts 聚合为真源；该字段缺席时才退回「首页可见行推导 + total 超页
+// 声明 ≥」（历史 历史问题 的降级路径保留）。
+const CERT_QUEUE_PAGE_SIZE = 6
 // A85WA-历史问题：接入轮询 AbortSignal——pause/stop（含组件卸载）可取消在途请求，
 // 与 fetchTasks/fetchSeries 同口径（补齐 :409 注释承诺）。
 const fetchCertQueue = async (signal?: AbortSignal) => {
   try {
     const res = await request.get<APIResponse<{ list: CertJobRow[]; total: number; status_counts?: Record<string, number> }>>('/certificates/jobs', { params: { page: 1, page_size: CERT_QUEUE_PAGE_SIZE }, silent: true, signal })
-    const list = res.data?.list || []
+    // WS-02：缺 data 为契约违约（同 fetchTasks/fetchSeries），下面向上抛。
+    if (!res.data) throw new TypeError('证书队列响应缺少 data')
+    const list = res.data.list || []
     const counts = res.data?.status_counts
     const statusCount = (statuses: string[]): number => statuses.reduce((sum, s) => sum + (counts?.[s] || 0), 0)
     let liveCount: number
@@ -473,6 +487,9 @@ const fetchCertQueue = async (signal?: AbortSignal) => {
     // 静默自动重试（下一轮轮询），但错误态必须显性——0 值会被误读为「无排队」；
     // pause/stop 触发的取消不是失败（A85WA-历史问题）
     if (!axios.isCancel(error)) certQueueError.value = true
+    // WS-02：契约违约（缺 data）与其余两份请求同语义——向上抛，交由轮询入口
+    // 记录并进入 TypeError 退避；普通网络/5xx 仍在本层吞掉（下一轮自愈）。
+    if (error instanceof TypeError) throw error
   }
 }
 
@@ -631,7 +648,16 @@ const onRestart = (row: TaskInfo): Promise<void> => runTaskAction(row, {
 
 // ===== 详情 =====
 const detailVisible = ref(false)
-const detailTask = ref<TaskInfo | null>(null)
+// WS-16：详情按 id 从最新 tasks 派生（此前持有打开时的行快照——轮询每轮整体替换
+// tasks 后，状态/24h 计数/下次执行在弹框内永远不再更新）。行从列表消失（cert-job
+// 完成退役）时退回打开时的行，避免正文瞬间清空。
+const detailTaskId = ref<string | null>(null)
+const detailSeed = ref<TaskInfo | null>(null)
+const detailTask = computed<TaskInfo | null>(() => {
+  const id = detailTaskId.value
+  if (!id) return null
+  return tasks.value.find(t => t.id === id) ?? detailSeed.value
+})
 const history = ref<RunRecord[]>([])
 const detailIcon = computed(() => (detailTask.value?.category === '证书' ? Lock : detailTask.value?.category === '备份' ? Box : Monitor))
 const detailTone = computed((): 'primary' | 'success' | 'warning' | 'danger' | undefined => {
@@ -671,7 +697,8 @@ let detailSeq = 0
 const detailHistoryError = ref(false)
 const openDetail = async (row: TaskInfo) => {
   const seq = ++detailSeq
-  detailTask.value = row
+  detailTaskId.value = row.id
+  detailSeed.value = row
   detailVisible.value = true
   history.value = []
   detailHistoryError.value = false

@@ -1,11 +1,16 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -185,5 +190,42 @@ func TestIssueServiceControlTicketPrefersAccessURL(t *testing.T) {
 	}
 	if issued.URL != "https://node.example:8443" {
 		t.Fatalf("url=%q, want access_url", issued.URL)
+	}
+}
+
+// S历史问题-12：无 GetBody 的带体请求在同主机 https 升级重定向下返回合成 301
+// 空体，且目标端不再收到请求。
+func TestDoWithSameHostTLSUpgradeRedirect_unreplayableBodySynthetic301(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Location", "https://"+r.Host+"/upgraded")
+		w.WriteHeader(http.StatusMovedPermanently)
+	}))
+	defer server.Close()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req, err := http.NewRequest(http.MethodPost, server.URL, bytes.NewReader([]byte("payload")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟不可重放请求：Body 存在但 GetBody 为 nil。
+	req.GetBody = nil
+	resp, err := DoWithSameHostTLSUpgradeRedirect(client, req)
+	if err != nil {
+		t.Fatalf("synthetic redirect returned error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMovedPermanently {
+		t.Fatalf("status=%d, want 301", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read synthetic body: %v", err)
+	}
+	if len(body) != 0 {
+		t.Fatalf("synthetic 301 body=%q, want empty", body)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("target received %d requests, want 1 (no replay for unreplayable body)", got)
 	}
 }

@@ -1,5 +1,6 @@
 import { ElMessage } from 'element-plus'
 import { mfaAwareSuccess } from '@/utils/api'
+import { CADDY_APPLY_FAILED_MARKER } from '@/utils/bulkApplyResult'
 
 interface SaveResultLike {
   message?: string
@@ -9,7 +10,7 @@ interface SaveResultLike {
 // 必须以持续警告形式呈现给用户，否则失败对 UI 不可见。
 export function showSaveResult(res: SaveResultLike | undefined | void, fallback: string): void {
   const message = res?.message || fallback
-  if (message.includes('Caddy 配置应用失败')) {
+  if (message.includes(CADDY_APPLY_FAILED_MARKER)) {
     ElMessage({ type: 'warning', message, duration: 0, showClose: true })
     return
   }

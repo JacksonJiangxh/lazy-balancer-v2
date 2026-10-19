@@ -462,14 +462,22 @@ func (h *Handlers) ListDNSProviders(c *gin.Context) {
 		fields := p.CredentialFields()
 		var fieldList []gin.H
 		for _, f := range fields {
-			fieldList = append(fieldList, gin.H{
+			field := gin.H{
 				"name":        f.Name,
 				"label":       f.Label,
 				"type":        f.Type,
 				"required":    f.Required,
 				"placeholder": f.Placeholder,
 				"options":     p.CredentialFieldOptions(f.Name),
-			})
+			}
+			// WS-13：可见性/选项文案元数据（前端表单渲染单源，替代 provider 硬编码）
+			if len(f.VisibleWhen) > 0 {
+				field["visible_when"] = f.VisibleWhen
+			}
+			if len(f.OptionLabels) > 0 {
+				field["option_labels"] = f.OptionLabels
+			}
+			fieldList = append(fieldList, field)
 		}
 		result = append(result, gin.H{
 			"code":              p.Code(),
@@ -716,10 +724,10 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			}
 		}
 		var jobStatus string
-		var jobUpdatedAt sql.NullTime
-		err = db.DB.QueryRow("SELECT status, updated_at FROM cert_jobs WHERE rule_id=? AND domain=?", req.CaddyID, canonicalRuleDomain).Scan(&jobStatus, &jobUpdatedAt)
+		var jobUpdatedAt, jobCreatedAt sql.NullTime
+		err = db.DB.QueryRow("SELECT status, updated_at, created_at FROM cert_jobs WHERE rule_id=? AND domain=?", req.CaddyID, canonicalRuleDomain).Scan(&jobStatus, &jobUpdatedAt, &jobCreatedAt)
 		if err == nil {
-			if blocked, statusCode, message := certJobRetryBlocked(jobStatus, jobUpdatedAt, time.Now()); blocked {
+			if blocked, statusCode, message := certJobRetryBlocked(jobStatus, jobUpdatedAt, jobCreatedAt, time.Now()); blocked {
 				auditFailure("blocked", message)
 				c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
 				return
@@ -823,11 +831,11 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			// （certJobRetryBlocked）——失败 5 分钟内/执行中的任务跳过，不再
 			// 被批量重签静默重排队、反复消耗 CA 配额；跳过数单列响应计数。
 			var jobStatus string
-			var jobUpdatedAt sql.NullTime
-			jobErr := db.DB.QueryRow("SELECT status, updated_at FROM cert_jobs WHERE rule_id=? AND domain=?", target.ruleID, canonicalDomain).Scan(&jobStatus, &jobUpdatedAt)
+			var jobUpdatedAt, jobCreatedAt sql.NullTime
+			jobErr := db.DB.QueryRow("SELECT status, updated_at, created_at FROM cert_jobs WHERE rule_id=? AND domain=?", target.ruleID, canonicalDomain).Scan(&jobStatus, &jobUpdatedAt, &jobCreatedAt)
 			switch {
 			case jobErr == nil:
-				if blocked, _, _ := certJobRetryBlocked(jobStatus, jobUpdatedAt, time.Now()); blocked {
+				if blocked, _, _ := certJobRetryBlocked(jobStatus, jobUpdatedAt, jobCreatedAt, time.Now()); blocked {
 					skippedCooldown++
 					continue
 				}

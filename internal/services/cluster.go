@@ -80,13 +80,59 @@ func registerClusterService(service *ClusterService) {
 	clusterServicesMu.Unlock()
 }
 
+// unregisterClusterService 移除单个实例（S历史问题-06）：全局表以 *sql.DB 为键
+// 且此前永不移除条目——测试/运行期重建 DB 时全局表强引用已 Close 的句柄，
+// 内存与其关联的 service 无法回收。测试 teardown 与显式释放路径调用本函数。
+func unregisterClusterService(service *ClusterService) {
+	if service == nil || service.db == nil {
+		return
+	}
+	clusterServicesMu.Lock()
+	remaining := clusterServices[service.db][:0]
+	for _, candidate := range clusterServices[service.db] {
+		if candidate != service {
+			remaining = append(remaining, candidate)
+		}
+	}
+	if len(remaining) == 0 {
+		delete(clusterServices, service.db)
+	} else {
+		clusterServices[service.db] = remaining
+	}
+	clusterServicesMu.Unlock()
+}
+
+// clusterDBHandleAlive 报告句柄是否仍可 Ping（S历史问题-06 的兜底回收：库已
+// Close 而未见显式 unregister 时，查询路径顺手剔除死条目，防止全局表在
+// 测试/重建场景无限累积）。查询路径仅在主节点巡检与 Promote/BecomeSlave
+// 触发，Ping 成本可忽略。
+func clusterDBHandleAlive(database *sql.DB) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	return database.PingContext(ctx) == nil
+}
+
 func clusterServicesFor(database *sql.DB) []*ClusterService {
 	if database == nil {
 		return nil
 	}
 	clusterServicesMu.Lock()
-	services := append([]*ClusterService(nil), clusterServices[database]...)
-	clusterServicesMu.Unlock()
+	defer clusterServicesMu.Unlock()
+	registered := clusterServices[database]
+	services := make([]*ClusterService, 0, len(registered))
+	for _, service := range registered {
+		if service != nil {
+			services = append(services, service)
+		}
+	}
+	if len(services) == 0 {
+		delete(clusterServices, database)
+		return nil
+	}
+	if !clusterDBHandleAlive(database) {
+		delete(clusterServices, database)
+		return nil
+	}
 	return services
 }
 
@@ -470,15 +516,19 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	// daemon 的 Stop 在另一 goroutine 异步执行——不显式排干则在途拉取（含已
 	// 通过 admission 的 apply）可能在升主提交后继续把从节点数据写回库。
 	// 排干失败（ctx 到期）即中止提升，不做半程角色翻转。
-	if drainer := syncDrainerFor(s.db); drainer != nil {
+	// S历史问题-06：同库可能登记多个同步服务实例（测试/重建），逐个排干——
+	// 只排干最后注册的一个会让其余实例的在途 apply 越过升主提交点。
+	if drainers := syncDrainersFor(s.db); len(drainers) > 0 {
 		// 历史问题-历史问题：排干失败的返回路径同样必须重开准入（defer 必须先于
 		// DrainPulls 注册）。DrainPulls 自身已置 pullsStopped=true，原实现只在
 		// 成功后注册 defer：失败路径若 cluster-sync 已停（用户关闭）或
 		// TaskEngine()==nil，准入永久关闭——从节点「立即同步」被 beginPull 拒绝
 		// 且哨兵不落库，静默脱同步直到再次 Promote/BecomeSlave/重启。
-		defer drainer.reopenPullAdmission()
-		if err := drainer.DrainPulls(ctx); err != nil {
-			return fmt.Errorf("等待在途同步拉取结束: %w", err)
+		for _, drainer := range drainers {
+			defer drainer.reopenPullAdmission()
+			if err := drainer.DrainPulls(ctx); err != nil {
+				return fmt.Errorf("等待在途同步拉取结束: %w", err)
+			}
 		}
 		// 历史问题-02：排干成功后的任意返回路径都必须重开准入。成功升主后再降级
 		// 也有 BecomeSlave 的显式重开，此处兜底保持不变量。

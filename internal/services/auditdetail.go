@@ -101,41 +101,44 @@ func AuditResultPart(result string) string {
 	return fmt.Sprintf("结果：%s", AuditResultText(result))
 }
 
+// auditSourceTextMap 是审计来源码 → 中文渲染的唯一事实源（V87-TO-01，历史：
+// 由 switch 改为 map，供 audit_result_text_test.go 以 AST 字面量互检钉住「来源码
+// 字面量集合 ⊆ 映射键集」）。此前 switch 形态没有任何覆盖钉，生产者传入的
+// runtime_reconcile/runtime_sweep/promote_or_startup 三个来源长期落 default，
+// 操作审计详情直接渲染英文内部标识。
+// 未收录码在 AuditSourcePart 中原样返回（保留英文兜底，便于定位漏映射）。
+var auditSourceTextMap = map[string]string{
+	"certificate_issued":      "来源：证书签发",
+	"startup_materialization": "来源：启动恢复",
+	"ca_cooldown":             "来源：CA 冷却结束",
+	"startup_recovery":        "来源：启动恢复",
+	"renewal":                 "来源：自动续签",
+	// "manual"：词汇表预留项——全仓当前无生产者（手动操作类来源码未落审计），
+	// 保留键以便未来接入时不改渲染层（V87-TO-07 反向核查结论）。
+	"manual":            "来源：手动操作",
+	"rule_create":       "来源：创建规则",
+	"rule_update":       "来源：更新规则",
+	"rule_delete":       "来源：删除规则",
+	"rule_enable":       "来源：启用规则",
+	"rule_disable":      "来源：禁用规则",
+	"ip2region_update":  "来源：IP 库更新",
+	"crs_update":        "来源：CRS 规则库更新",
+	"threat_update":     "来源：威胁情报库更新",
+	"crawlerbot_update": "来源：爬虫地址库更新",
+	"autoban":           "来源：自动封禁名单",
+	// 运行时/升主补建来源（V87-TO-01，历史）：生产者一直在传，此前全落
+	// default → 操作审计详情显示「来源：runtime_sweep」等英文内部标识。
+	"runtime_reconcile":    "来源：运行时对账",
+	"runtime_sweep":        "来源：运行时清扫",
+	"promote_or_startup":   "来源：升主或启动补建",
+	"first_issuance_retry": "来源：首次签发重试",
+}
+
 func AuditSourcePart(source string) string {
-	switch source {
-	case "certificate_issued":
-		return "来源：证书签发"
-	case "startup_materialization":
-		return "来源：启动恢复"
-	case "ca_cooldown":
-		return "来源：CA 冷却结束"
-	case "startup_recovery":
-		return "来源：启动恢复"
-	case "renewal":
-		return "来源：自动续签"
-	case "manual":
-		return "来源：手动操作"
-	case "rule_create":
-		return "来源：创建规则"
-	case "rule_update":
-		return "来源：更新规则"
-	case "rule_delete":
-		return "来源：删除规则"
-	case "rule_enable":
-		return "来源：启用规则"
-	case "rule_disable":
-		return "来源：禁用规则"
-	case "ip2region_update":
-		return "来源：IP 库更新"
-	case "crs_update":
-		return "来源：CRS 规则库更新"
-	case "threat_update":
-		return "来源：威胁情报库更新"
-	case "autoban":
-		return "来源：自动封禁名单"
-	default:
-		return fmt.Sprintf("来源：%s", source)
+	if text, ok := auditSourceTextMap[source]; ok {
+		return text
 	}
+	return fmt.Sprintf("来源：%s", source)
 }
 
 // recordSystemReloadAudit 数据类更新（IP 库/CRS）触发的真实 Caddy 重载统一

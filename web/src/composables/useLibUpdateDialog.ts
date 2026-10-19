@@ -123,7 +123,12 @@ export function useLibUpdateDialog<TInfo>(options: UseLibUpdateDialogOptions<TIn
     if (!visible.value) return
     await refreshStatus()
     if (!visible.value) return
-    startPolling()
+    // 历史问题：refreshStatus 在终态时已 stopPolling + onSuccess——若本次状态已是
+    // 终态成功（409 且任务刚好完成 / 任务瞬时完成），无条件 startPolling 会让 2s
+    // 后的下一轮再判终态、onSuccess 二次执行（重复 fetchCRS/fetchRules 等）。
+    // 与 onOpened 同口径：仅「任务仍在运行」或「状态未取到」（status=null，
+    // 瞬时失败需靠轮询收敛）时继续轮询；已取到终态则不再自启。
+    if (updating.value || status.value === null) startPolling()
   }
 
   const close = () => { visible.value = false }

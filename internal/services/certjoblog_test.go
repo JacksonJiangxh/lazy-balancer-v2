@@ -21,16 +21,13 @@ import (
 func useCertJobLogTestEnv(t *testing.T, thresholdBytes int64) {
 	t.Helper()
 	oldDir := taskengine.LogDir()
-	oldCached, oldCachedAt := certJobLogSizeCached.Load(), certJobLogSizeCachedAt.Load()
 	taskengine.SetLogDir(filepath.Join(t.TempDir(), "logs", "tasks"))
+	// 阈值注入缝直接替换 taskengine 的读取函数，绕过 getTaskLogSizeBytes/缓存
+	// （V87-TO-06 后缓存内部结构不可直接写入；本注入缝已完全覆盖阈值取值）。
 	taskengine.SetTaskLogSizeBytesFn(func() int64 { return thresholdBytes })
-	certJobLogSizeCached.Store(thresholdBytes)
-	certJobLogSizeCachedAt.Store(time.Now().UnixNano())
 	t.Cleanup(func() {
 		taskengine.SetLogDir(oldDir)
 		taskengine.SetTaskLogSizeBytesFn(nil)
-		certJobLogSizeCached.Store(oldCached)
-		certJobLogSizeCachedAt.Store(oldCachedAt)
 	})
 }
 

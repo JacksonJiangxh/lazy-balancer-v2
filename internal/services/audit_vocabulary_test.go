@@ -38,8 +38,9 @@ import (
 //     字段（16 个调用点：动作 创建/更新/删除/写入+失败，对象 自定义规则/
 //     拦截页面/安全策略/IP 地址列表，均 ≤ 上限；2026-09-06 裁定 ①② 家族 3
 //     统一收尾）；
-//   - services/downloadintegrity.go recordDownloadIntegrity 的对象变量由调用方
-//     传入字面量（CRS规则库/IP数据库，已纳入扫描）；
+//   - services/downloadintegrity.go recordDownloadIntegrityAudits 的动作/对象变量由调用方
+//     传入字面量（动作 校验阻断/下载校验、对象 CRS规则库/IP数据库/完整性记录，
+//     均纳入扫描；S历史问题 锁外落库改造后审计写点收敛到该 flush 函数）；
 var auditVocabDynamicAllowlist = map[string]map[int][]string{
 	"handlers/audit.go":                {1: {"recordAudit"}, 2: {"recordAudit"}},
 	"middleware/middleware.go":         {1: {"auditMiddleware"}, 2: {"auditMiddleware"}},
@@ -61,7 +62,7 @@ var auditVocabDynamicAllowlist = map[string]map[int][]string{
 	// 2026-10-15 核清入白名单）。
 	"handlers/securityiplists.go":   {1: {"tryIPListHotPathApply"}, 2: {"tryIPListHotPathApply"}},
 	"services/certificates.go":      {1: {"renewExpiringCertificates"}},
-	"services/downloadintegrity.go": {2: {"recordDownloadIntegrity"}},
+	"services/downloadintegrity.go": {1: {"recordDownloadIntegrityAudits"}, 2: {"recordDownloadIntegrityAudits"}},
 	// RunAutobanCycle 的动作传 AutobanAuditAction 包级常量（字面值「自动封禁」
 	// 单源——merge 审计写点与 AutobanBannedToday 的 audit_log 计数共用同一
 	// 常量，两处字面量漂移会让今日封禁恒 0；2026-10-15 核清入白名单）。

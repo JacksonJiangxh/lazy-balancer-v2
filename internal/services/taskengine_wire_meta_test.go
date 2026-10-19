@@ -5,6 +5,7 @@ package services
 
 import (
 	"bytes"
+	"context"
 	"log"
 	"os"
 	"path/filepath"
@@ -17,6 +18,14 @@ import (
 )
 
 func newWireTestEngine(t *testing.T) *taskengine.Engine {
+	t.Helper()
+	// runtimeLogFile 指向临时目录——避免默认 /app/logs 写出测试沙箱
+	return newWireTestEngineWithRuntimeLog(t, t.TempDir()+"/app.log")
+}
+
+// newWireTestEngineWithRuntimeLog 同 newWireTestEngine，但显式指定
+// runtimeLogFile（V87-TO-05③：注入空串模拟「旋转写入器打开失败」形态）。
+func newWireTestEngineWithRuntimeLog(t *testing.T, runtimeLogFile string) *taskengine.Engine {
 	t.Helper()
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -33,8 +42,7 @@ func newWireTestEngine(t *testing.T) *taskengine.Engine {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
 	})
-	// runtimeLogFile 指向临时目录——避免默认 /app/logs 写出测试沙箱
-	return InitTaskEngine("", t.TempDir()+"/app.log")
+	return InitTaskEngine("", runtimeLogFile)
 }
 
 // S-A-历史问题：任务日志目录创建失败必须显式留痕，不能在只读/异常挂载下
@@ -329,5 +337,18 @@ func TestTaskEngineWire_canTriggerDerivedFromKind(t *testing.T) {
 		if m.CanTrigger != want {
 			t.Fatalf("task %s (kind=%s) CanTrigger=%v, want %v（类型派生，非白名单）", m.ID, m.Kind, m.CanTrigger, want)
 		}
+	}
+}
+
+// V87-TO-02：StopTaskEngine 先 engine.Stop()（drain 超时即放弃等待）再置全局
+// taskEngine=nil；daemon goroutine 若在超时后首次进入 Run，裸读 taskEngine
+// 会 nil 解引用 panic。同族 cert-renewal-scan / cert-waiting-ca 已固定句柄
+// （历史 历史问题-06），本处为第三处。
+func TestClusterSyncDaemonRun_nilEngineReturnsWithoutPanic(t *testing.T) {
+	old := taskEngine
+	taskEngine = nil
+	t.Cleanup(func() { taskEngine = old })
+	if err := clusterSyncDaemonRun(taskengine.RunContext{Ctx: context.Background()}); err != nil {
+		t.Fatalf("引擎已置 nil（关机窄窗）时集群同步 Run 必须安全退出, got err=%v", err)
 	}
 }

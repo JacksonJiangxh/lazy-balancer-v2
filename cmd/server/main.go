@@ -153,6 +153,11 @@ func run() error {
 	// Seed the CRS rules tree into a fresh /app/waf bind mount (a persisted
 	// snapshot with user-updated rules wins over the pristine image copy),
 	// then materialize cert files from DB, then apply Caddy config on startup
+	// WAF 文件目录按 data_dir 派生（容器 /app/data → /app/waf 恒等；本地开发
+	// 落到数据目录同级）。须在首个渲染（ApplyConfigOnStartup）之前。
+	// 历史问题-08：派生面含 Coraza 审计日志路径——目录创建必须排在其后，否则
+	// 自定义 data_dir 下仍会去建 /app/logs/waf-audit 并漏建真实目录。
+	services.ConfigureWafDirs(cfg.DataDir)
 	// 历史问题-1(历史):审计日志目录必须在首次 ApplyConfigOnStartup
 	// 前保证存在——coraza NewWAF 时 OpenFile 不建父目录,缺失=/load 拒收。
 	// INFRA-71-5（历史）：告警改走 services.Logf("warn")——绕过日志
@@ -160,9 +165,6 @@ func run() error {
 	if err := services.EnsureWafAuditDir(); err != nil {
 		services.Logf("warn", "create waf audit dir failed: %v", err)
 	}
-	// WAF 文件目录按 data_dir 派生（容器 /app/data → /app/waf 恒等；本地开发
-	// 落到数据目录同级）。须在首个渲染（ApplyConfigOnStartup）之前。
-	services.ConfigureWafDirs(cfg.DataDir)
 	// @ipListFast 名单投影目录（v2.3.x）：渲染期 fail-closed 依赖目录可写。
 	if err := services.EnsureIPListDir(); err != nil {
 		services.Logf("error", "初始化 IP 名单目录失败: %v", err)
@@ -197,7 +199,11 @@ func run() error {
 	// B 完全标准化：常驻服务真实生命周期挂钩（daemon Run start→阻塞→stop；
 	// 幂等守卫吸收 lifecycle 直调与 daemon 挂钩的双调用）
 	services.SetCertIssuanceLifecycleHooks(lifecycle.StartACME, lifecycle.StopACME)
-	services.SetSyncLifecycleHooks(syncService.Start, syncService.Stop)
+	// CI87-02：同步侧必须与证书侧对称注入 runtimeLifecycle 的方法而非裸
+	// syncService.Start/Stop——stopped 门（历史问题-2「Shutdown 后不得再拉起」）
+	// 与 l.mu 串行化只存在于 lifecycle 包装内，裸方法会让任何迟代/新增调用方
+	// 绕过退出门。StopSync 自身幂等（Shutdown 已调用）。
+	services.SetSyncLifecycleHooks(lifecycle.StartSync, lifecycle.StopSync)
 	// 自动备份执行器必须先于 InitTaskEngine：启用且存在补跑槽时，
 	// 引擎首轮可能在毫秒内到期，不得在 nil executor 下记录成功。
 	services.SetAutoBackupExecutor(func(ctx context.Context, trigger, operator string, engineRunID int64) error {

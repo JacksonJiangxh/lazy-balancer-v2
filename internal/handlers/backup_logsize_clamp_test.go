@@ -31,7 +31,7 @@ func TestImportConfigBackup_clamps_caddy_log_size_mb(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
 			r55SeedCurrentAdmin(t)
-			backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, map[string]any{"caddy_log_size_mb": tt.value})
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{}, Config: map[string]any{"caddy_log_size_mb": tt.value}})
 			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
 			if response.Code != http.StatusOK {
 				t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
@@ -65,7 +65,7 @@ func TestImportConfigBackup_clamps_audit_log_size_mb(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
 			r55SeedCurrentAdmin(t)
-			backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, map[string]any{"audit_log_size_mb": tt.value})
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{}, Config: map[string]any{"audit_log_size_mb": tt.value}})
 			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
 			if response.Code != http.StatusOK {
 				t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
@@ -105,7 +105,7 @@ func TestImportConfigBackup_clamps_task_log_size_mb(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
 			r55SeedCurrentAdmin(t)
-			backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, map[string]any{"task_log_size_mb": tt.value})
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{}, Config: map[string]any{"task_log_size_mb": tt.value}})
 			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
 			if response.Code != http.StatusOK {
 				t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
@@ -140,7 +140,7 @@ func TestImportConfigBackup_clamps_runtime_log_size_mb(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
 			r55SeedCurrentAdmin(t)
-			backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, map[string]any{"runtime_log_size_mb": tt.value})
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{}, Config: map[string]any{"runtime_log_size_mb": tt.value}})
 			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
 			if response.Code != http.StatusOK {
 				t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())

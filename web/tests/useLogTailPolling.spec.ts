@@ -4,17 +4,11 @@
 //
 // 运行：cd web && npm test
 
-import { test } from 'node:test'
+import { test, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import { ref } from 'vue'
 
 import { useLogTailPolling } from '../src/composables/useLogTailPolling.ts'
-
-const sleep = (ms: number): Promise<void> => {
-  const { promise, resolve } = Promise.withResolvers<void>()
-  setTimeout(resolve, ms)
-  return promise
-}
 
 test('refresh 写回内容并滚到底部', async () => {
   const content = ref('')
@@ -134,6 +128,9 @@ test('后台标签页暂停：document.hidden 时轮次跳过（node 无 documen
 })
 
 test('start 装定时器并立即刷新；stop 冻结后续轮次', async () => {
+  // 审计 87 WEBT-08①：原实现用真实时钟 sleep(75)/sleep(60) 断言 20ms 定时器——
+  // 慢机/CI 负载下可假红。改为 node:test mock timers（只替换 setInterval，
+  // setTimeout 仍真实，用于等待异步 refresh 落地），时间推进即断言。
   let calls = 0
   const tail = useLogTailPolling({
     interval: 20,
@@ -141,11 +138,25 @@ test('start 装定时器并立即刷新；stop 冻结后续轮次', async () => 
     isActive: () => true,
     fetch: async () => { calls++; return 'x' },
   })
-  tail.start()
-  await sleep(75)
-  assert.ok(calls >= 2, `start 应立即首拉并按间隔轮询，实际 ${calls} 次`)
-  tail.stop()
-  const frozen = calls
-  await sleep(60)
-  assert.equal(calls, frozen, 'stop 后不得再有轮次')
+  const flush = (): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, 0))
+  mock.timers.enable({ apis: ['setInterval'] })
+  try {
+    tail.start()
+    await flush()
+    assert.equal(calls, 1, 'start 应立即首拉')
+    mock.timers.tick(20)
+    await flush()
+    assert.equal(calls, 2, '按 interval 轮询')
+    mock.timers.tick(20)
+    await flush()
+    assert.equal(calls, 3)
+    tail.stop()
+    const frozen = calls
+    mock.timers.tick(200)
+    await flush()
+    assert.equal(calls, frozen, 'stop 后不得再有轮次')
+  } finally {
+    mock.timers.reset()
+    tail.stop()
+  }
 })

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"encoding/json"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -276,5 +277,66 @@ func TestLogin_lockoutDisabledBySwitch(t *testing.T) {
 	}
 	if attempts != 0 || lockedUntil.Valid {
 		t.Fatalf("attempts=%d locked=%v, want 0 + 未置锁（成功清零、全程无锁）", attempts, lockedUntil)
+	}
+}
+
+// 历史问题（历史）：未认证登录请求的 username/password 此前无长度上限
+// （guardAuthJSONBody 只限 64KiB 整体）——失败登录把 ~64KiB 用户名原文写入
+// audit_log，分布式绕开 10/min/IP 限流即可放大审计库。登录侧补齐与
+// users 列宽（50）/bcrypt 上限（72）对齐的 binding max，超限在写库/审计前拒绝。
+func TestLogin_rejectsOverlongCredentials(t *testing.T) {
+	database := setupAuthTestDB(t)
+	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,20,1)`); err != nil {
+		t.Fatalf("create global config: %v", err)
+	}
+	oldAuditDB := db.AuditDB
+	auditDB, err := sql.Open("sqlite", t.TempDir()+"/audit.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auditDB.Exec(`CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, username VARCHAR(100), action VARCHAR(50) NOT NULL, resource VARCHAR(100), detail TEXT, ip_address VARCHAR(45), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	db.AuditDB = auditDB
+	t.Cleanup(func() {
+		auditDB.Close()
+		db.AuditDB = oldAuditDB
+	})
+
+	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
+	router := gin.New()
+	router.POST("/auth/login", h.Login)
+	post := func(username, password string) *httptest.ResponseRecorder {
+		body, err := json.Marshal(map[string]string{"username": username, "password": password})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(string(body)))
+		request.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, request)
+		return rec
+	}
+	long := strings.Repeat("u", 300)
+
+	// 超长用户名与超长密码都必须在 binding 层 400（未落认证查询/审计原文）。
+	if rec := post(long, "Secret123!"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("overlong username status=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+	if rec := post("root", strings.Repeat("p", 300)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("overlong password status=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+	// 边界回归：50 字符用户名与 72 字符密码不因新上限被误拒（进入认证查询后
+	// 按 401 返回，而不是 400）。
+	if rec := post(strings.Repeat("u", 50), strings.Repeat("p", 72)); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("boundary-length credentials status=%d body=%s, want 401", rec.Code, rec.Body.String())
+	}
+	// 审计放大回归：无任何审计行携带超长用户名。
+	var maxLen int
+	if err := auditDB.QueryRow(`SELECT COALESCE(MAX(LENGTH(username)),0) FROM audit_log`).Scan(&maxLen); err != nil {
+		t.Fatal(err)
+	}
+	if maxLen > 50 {
+		t.Fatalf("audit_log 出现超长用户名（len=%d），未认证请求可放大审计库", maxLen)
 	}
 }

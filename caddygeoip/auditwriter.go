@@ -63,6 +63,9 @@ const auditWriterName = "lbfile"
 const auditBodyMaxBytes = 64 * 1024
 
 func init() {
+	// 计时注册表清扫参数默认值（atomic 存储，见下方 var 块说明）。
+	auditTimingEntryTTLNs.Store(int64(30 * time.Second))
+	auditTimingSweepIntervalNs.Store(int64(10 * time.Second))
 	plugins.RegisterAuditLogWriter(auditWriterName, func() plugintypes.AuditLogWriter {
 		return &lbAuditWriter{}
 	})
@@ -88,18 +91,21 @@ var (
 	// 短等上限：等待发生在请求路径，正常形态 µs 级置位终态；上限只兜底异常
 	// 形态，超限按已到场分段落盘（行不丢、缺段省略）。
 	auditSyncTimingWaitLimit = 5 * time.Millisecond
-	// auditTimingEntryTTL 注册表条目存活上限：条目由周期性清扫回收（消费不删——
-	// 同一请求可产多条审计行[预检+策略引擎]，共享同一注册表条目）。
-	auditTimingEntryTTL = 30 * time.Second
+	// auditTimingEntryTTLNs 注册表条目存活上限（纳秒）：条目由周期性清扫回收
+	// （消费不删——同一请求可产多条审计行[预检+策略引擎]，共享同一注册表条目）。
+	// 以 atomic.Int64 纳秒存储而非普通 time.Duration：常驻 sweeper goroutine
+	// 读、测试收窄参数写，普通变量在 `go test -race` 下构成数据竞争
+	// （PL历史问题）。零值为 0（立即全部过期），默认值在 init 中置入。
+	auditTimingEntryTTLNs atomic.Int64
 	// auditTimingMaxEntries 注册表条目硬上限（A86 历史问题，历史）：计时 ID
 	// 形态校验之外的第二道内存 DoS 防线——任何新键生产路径（含未来写点）都不
 	// 得让注册表无界增长。100k 条目 ≈ 30s TTL × ~3.3k RPS 的合法上限，内存
 	// 约 15MB；满时拒绝新键（该请求不计耗时，静默降级），既有键照常写入。
 	auditTimingMaxEntries = 100_000
-	// auditTimingSweepInterval 周期清扫间隔（A86 历史问题）：旧实现清扫仅由建条
-	// 驱动（每 64 次建条一次），停流后过期条目永久驻留；后台 sweeper 按本
-	// 周期兜底回收，零流量下注册表同样收敛。
-	auditTimingSweepInterval = 10 * time.Second
+	// auditTimingSweepIntervalNs 周期清扫间隔（纳秒，A86 历史问题）：旧实现清扫仅
+	// 由建条驱动（每 64 次建条一次），停流后过期条目永久驻留；后台 sweeper 按
+	// 本周期兜底回收，零流量下注册表同样收敛。atomic 存储原因同上。
+	auditTimingSweepIntervalNs atomic.Int64
 )
 
 // —— per-request 计时注册表 ——
@@ -206,14 +212,14 @@ var auditTimingSweeperOnce sync.Once
 func startAuditTimingSweeperForTest() {
 	auditTimingSweeperOnce.Do(func() {
 		go func() {
-			// 50ms 量子累加而非一次睡满整周期：测试收窄 auditTimingSweepInterval
-			// 后下个量子即生效（一次睡满会让测试竞速 10s 默认周期）。
+			// 50ms 量子累加而非一次睡满整周期：测试收窄清扫间隔后下个量子即
+			// 生效（一次睡满会让测试竞速 10s 默认周期）。
 			const tick = 50 * time.Millisecond
 			elapsed := time.Duration(0)
 			for {
 				time.Sleep(tick)
 				elapsed += tick
-				if elapsed < auditTimingSweepInterval {
+				if elapsed < time.Duration(auditTimingSweepIntervalNs.Load()) {
 					continue
 				}
 				elapsed = 0
@@ -256,10 +262,12 @@ func auditTimingSweepIfDueLocked(now time.Time) {
 // auditTimingSweepLocked 从队首弹出 TTL 过期条目（调用方持 auditTimingMu）。
 // 队列 created 单调不减 ⇒ 队首未过期即整队未过期。
 func auditTimingSweepLocked(now time.Time) {
+	// TTL 只读一次：清扫循环内无需重复 Load（sweeper 与测试并发时口径一致）。
+	ttl := time.Duration(auditTimingEntryTTLNs.Load())
 	for auditTimingHead < len(auditTimingOrder) {
 		item := auditTimingOrder[auditTimingHead]
 		auditTimingSweepVisitsForTest.Add(1)
-		if now.Sub(item.created) <= auditTimingEntryTTL {
+		if now.Sub(item.created) <= ttl {
 			break
 		}
 		if e, ok := auditTimingEntries[item.id]; ok && e.created.Equal(item.created) {

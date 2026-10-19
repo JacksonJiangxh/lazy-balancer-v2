@@ -1,3 +1,5 @@
+import { hostPortKey } from './upstreamKeys.ts'
+
 type PathUpstreamInput = {
   readonly protocol: 'http' | 'https'
   readonly address: string
@@ -77,6 +79,14 @@ export const canonicalPathKey = (matchType: 'prefix' | 'exact', raw: string): st
   return canonical === '' ? '/' : canonical
 }
 
+/**
+ * 同类型路径查重键（历史问题-07）：与后端 rule_features.go 同口径——prefix 用归一键
+ * （剥尾 / 与 *），exact 用 trim 后**原串**（不剥尾 /：`/a` 与 `/a/` 是两条独立
+ * exact matcher，后端接受并渲染）。跨类型遮蔽互查仍用 canonicalPathKey。
+ */
+export const pathDuplicateKey = (matchType: 'prefix' | 'exact', raw: string): string =>
+  `${matchType}:${matchType === 'prefix' ? canonicalPathKey('prefix', raw) : raw.trim()}`
+
 
 // 直接返回的常用状态码白名单（与后端 validStaticResponseStatuses 同源）
 const STATIC_RESPONSE_STATUSES: Readonly<Record<number, true>> = {
@@ -100,7 +110,7 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
       if (/[\s?#]/.test(rule.upstream_path)) return `第 ${rowNumber} 条路径的上游路径 不能包含空格 ? # 字符`
     }
     const canonical = canonicalPathKey(rule.match_type, rule.path)
-    const duplicateKey = `${rule.match_type}:${canonical}`
+    const duplicateKey = pathDuplicateKey(rule.match_type, rule.path)
     const seenAt = seen.get(duplicateKey)
     if (seenAt !== undefined) return `第 ${rowNumber} 条路径与第 ${seenAt} 条重复（${rule.path.trim()}）`
     seen.set(duplicateKey, rowNumber)
@@ -144,10 +154,34 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
     if (rule.upstreams === null) continue
     if (rule.upstreams.length === 0) return `第 ${rowNumber} 条路径至少需要一个自定义上游`
 
+    // —— 自定义上游池（历史问题-06）：与后端 rule_features.go 同口径的三项池级
+    // 校验——http/https 混布（同池 reverse_proxy 池级 TLS 传输下 http 上游静默
+    // 全灭）、主机形态（后端 isValidHost：IP 字面量或主机名）、host:port 去重
+    // （重复条使权重翻倍、均衡语义静默漂移）。此前只校验空/端口/权重，非法行
+    // 行内无错、点保存才被全局 toast 拒绝且不定位到行。
+    const poolProtocols = new Set(rule.upstreams.map((upstream) => (upstream.protocol || 'http')))
+    if (poolProtocols.has('http') && poolProtocols.has('https')) {
+      return `第 ${rowNumber} 条路径的自定义上游 http/https 混布（同一上游池协议须一致）`
+    }
+    const seenHostPorts = new Set<string>()
     for (const upstream of rule.upstreams) {
-      if (!upstream.address.trim()) return `第 ${rowNumber} 条路径的自定义上游地址不能为空`
+      const address = upstream.address.trim()
+      if (!address) return `第 ${rowNumber} 条路径的自定义上游地址不能为空`
+      // 上游地址接受 IP 字面量与主机名（isValidHostName 有意排除 IP 字面量——
+      // SNI 语义不需要，上游地址需要），与后端 isValidHost 同形。
+      if (!(isValidIpv4(address) || isValidIpv6(address) || isValidHostName(address))) {
+        return `第 ${rowNumber} 条路径的自定义上游主机「${address}」无效`
+      }
       if (upstream.port < 1 || upstream.port > 65535) return `第 ${rowNumber} 条路径的自定义上游端口无效`
+      const protocol = (upstream.protocol ?? '') as string
+      if (protocol !== '' && protocol !== 'http' && protocol !== 'https') {
+        return `第 ${rowNumber} 条路径的自定义上游协议只能是 http 或 https`
+      }
       if (upstream.weight < 1) return `第 ${rowNumber} 条路径的自定义上游权重必须大于 0`
+      // 与后端 net.JoinHostPort + strings.ToLower 同口径（IPv6 带方括号）。
+      const hostPort = hostPortKey(address, upstream.port).toLowerCase()
+      if (seenHostPorts.has(hostPort)) return `第 ${rowNumber} 条路径的自定义上游 ${hostPort} 重复`
+      seenHostPorts.add(hostPort)
     }
   }
   return null

@@ -178,7 +178,7 @@ import { ArrowDown, ArrowUp, Delete, Plus } from '@element-plus/icons-vue'
 import FieldHelpIcon from '@/components/common/FieldHelpIcon.vue'
 import type { PathRule, PathRuleUpstream } from '@/types'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, redistributeWeight } from '@/utils/upstreamWeights'
-import { canonicalPathKey } from '@/utils/ruleValidation'
+import { canonicalPathKey, pathDuplicateKey } from '@/utils/ruleValidation'
 
 const pathRules = defineModel<PathRule[]>({ required: true })
 
@@ -191,8 +191,14 @@ const rowError = (index: number): string => {
   if (/[*?{}]/.test(rule.path)) return '不能包含 * ? { } 通配字符'
   if (rule.path.trim() === '') return ''
   const canonical = canonicalPathKey(rule.match_type, rule.path)
+  const duplicateKey = pathDuplicateKey(rule.match_type, rule.path)
+  // 历史问题-07：同类型查重按后端口径（exact 不剥尾 /，/a 与 /a/ 是两条独立
+  // matcher）；canonicalPathKey 归一键只用于跨类型遮蔽互查。
   const dupIndex = pathRules.value.findIndex((other, otherIndex) =>
-    otherIndex !== index && other.path.trim() !== '' && canonicalPathKey(other.match_type, other.path) === canonical)
+    otherIndex !== index && other.path.trim() !== ''
+      && (other.match_type === rule.match_type
+        ? pathDuplicateKey(other.match_type, other.path) === duplicateKey
+        : canonicalPathKey(other.match_type, other.path) === canonical))
   if (dupIndex >= 0) {
     const other = pathRules.value[dupIndex]
     if (!other) return ''

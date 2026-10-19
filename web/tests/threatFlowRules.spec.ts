@@ -46,14 +46,14 @@ test('自适应档位滞回阈值：1↔4 用 180/120，4↔8 用 720/480（边�
 test('自适应切换：连续 2 次采样同向才换档，单次尖峰不生效', () => {
   let state = { active: 1, stable: 0, lastSwitch: 0 }
   let outcome = stepAdaptiveSample(state, 500, 10_000)
-  assert.deepEqual(outcome, { active: 1, stable: 1, lastSwitch: 0, changed: false })
+  assert.deepEqual(outcome, { active: 1, stable: 1, pendingTarget: 4, lastSwitch: 0, changed: false })
   // 第二次同向 → 换到 1/4
   outcome = stepAdaptiveSample(outcome, 500, 11_000)
-  assert.deepEqual(outcome, { active: 4, stable: 0, lastSwitch: 11_000, changed: true })
+  assert.deepEqual(outcome, { active: 4, stable: 0, pendingTarget: 0, lastSwitch: 11_000, changed: true })
   // 单次低速后回到中间带：确认计数清零，不降档
   state = { active: 4, stable: 1, lastSwitch: 0 }
   outcome = stepAdaptiveSample(state, 200, 12_000)
-  assert.deepEqual(outcome, { active: 4, stable: 0, lastSwitch: 0, changed: false })
+  assert.deepEqual(outcome, { active: 4, stable: 0, pendingTarget: 0, lastSwitch: 0, changed: false })
 })
 
 test('自适应切换：两次换档间隔必须 ≥4s（回摆同样受限）', () => {
@@ -67,19 +67,34 @@ test('自适应切换：两次换档间隔必须 ≥4s（回摆同样受限）',
   assert.equal(outcome.stable, ADAPTIVE_SAMPLE_CONFIRM_SAMPLES)
   // 达到 4s 门 → 允许换到 1/8
   outcome = stepAdaptiveSample(outcome, 900, lastSwitch + ADAPTIVE_SAMPLE_MIN_SWITCH_INTERVAL_MS)
-  assert.deepEqual(outcome, { active: 8, stable: 0, lastSwitch: lastSwitch + 4000, changed: true })
+  assert.deepEqual(outcome, { active: 8, stable: 0, pendingTarget: 0, lastSwitch: lastSwitch + 4000, changed: true })
 })
 
 test('自适应切换：档位与目标一致时清空确认计数但保留上次换档时刻', () => {
   const matched = stepAdaptiveSample({ active: 8, stable: 1, lastSwitch: 30_000 }, 900, 31_000)
-  assert.deepEqual(matched, { active: 8, stable: 0, lastSwitch: 30_000, changed: false })
+  assert.deepEqual(matched, { active: 8, stable: 0, pendingTarget: 0, lastSwitch: 30_000, changed: false })
   // 之后转低速：需重新累计 2 次确认且跨过 4s 门
   const first = stepAdaptiveSample(matched, 100, 32_000)
-  assert.deepEqual(first, { active: 8, stable: 1, lastSwitch: 30_000, changed: false })
+  assert.deepEqual(first, { active: 8, stable: 1, pendingTarget: 4, lastSwitch: 30_000, changed: false })
   const second = stepAdaptiveSample(first, 100, 33_000)
-  assert.deepEqual(second, { active: 8, stable: 2, lastSwitch: 30_000, changed: false }, '间隔不足 4s')
+  assert.deepEqual(second, { active: 8, stable: 2, pendingTarget: 4, lastSwitch: 30_000, changed: false }, '间隔不足 4s')
   const third = stepAdaptiveSample(second, 100, 34_000)
-  assert.deepEqual(third, { active: 4, stable: 0, lastSwitch: 34_000, changed: true })
+  assert.deepEqual(third, { active: 4, stable: 0, pendingTarget: 0, lastSwitch: 34_000, changed: true })
+})
+
+test('自适应切换：方向反转不累计（突发+骤停不得直接跳档，WT87-06）', () => {
+  // 高流量一次 → 目标 8；随后骤停一次 → 目标 1。旧实现只按次数累加，
+  // 在 4s 门已过时会把这两次相反采样当作「连续 2 次同向」直接切到 1/1。
+  let outcome = stepAdaptiveSample({ active: 4, stable: 0, lastSwitch: 0 }, 900, 10_000)
+  assert.deepEqual(outcome, { active: 4, stable: 1, pendingTarget: 8, lastSwitch: 0, changed: false })
+  outcome = stepAdaptiveSample(outcome, 100, 11_000)
+  assert.equal(outcome.changed, false, '方向反转不得换档')
+  assert.equal(outcome.active, 4)
+  assert.equal(outcome.stable, 1, '确认计数必须从 1 重新累计')
+  assert.equal(outcome.pendingTarget, 1)
+  // 第二次同向（低）→ 才允许降档
+  const confirmed = stepAdaptiveSample(outcome, 100, 12_000)
+  assert.deepEqual(confirmed, { active: 1, stable: 0, pendingTarget: 0, lastSwitch: 12_000, changed: true })
 })
 
 test('自适应切换：非自适应档位（0=关闭）不参与换档', () => {

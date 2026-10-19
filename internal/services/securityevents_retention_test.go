@@ -394,3 +394,65 @@ func TestSecurityEventsRetentionCleanup_prunesRollupHighwaterKeys(t *testing.T) 
 		t.Fatalf("近期高水位键被误删（count=%d）", recentCount)
 	}
 }
+
+// 历史问题-07（历史）：行帽裁剪必须按「最旧事件」而非「最早插入」——
+// 摄取停摆后的补采/归档重放会以新 id 插入旧 event_time 的行，按 id 删会先丢
+// 新事件、留住补采的旧事件。
+func TestSecurityEventsRetentionCleanup_rowCapTrimsByEventTime(t *testing.T) {
+	setupSecurityEventsRetentionTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=3650, security_events_row_cap=3 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	// 插入顺序（id）与事件时间顺序刻意错乱：
+	//   id1 now-1h（新） / id2 now-10d（最旧） / id3 now-2d / id4 now-5d / id5 now-30m（最新）
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, event_type) VALUES
+		(datetime('now','-1 hour'), '198.51.100.1', 'evt-1'),
+		(datetime('now','-10 days'), '198.51.100.2', 'evt-2'),
+		(datetime('now','-2 days'), '198.51.100.3', 'evt-3'),
+		(datetime('now','-5 days'), '198.51.100.4', 'evt-4'),
+		(datetime('now','-30 minutes'), '198.51.100.5', 'evt-5')`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := securityEventsRetentionCleanup(context.Background()); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+
+	// cap=3 → 删最旧两事件（evt-2 10d、evt-4 5d），保留 1h/2d/30m。
+	for _, evt := range []string{"evt-1", "evt-3", "evt-5"} {
+		if got := countSecurityEventsByType(t, evt); got != 1 {
+			t.Fatalf("%s 应保留，got=%d（按 id 裁剪会误删新事件）", evt, got)
+		}
+	}
+	for _, evt := range []string{"evt-2", "evt-4"} {
+		if got := countSecurityEventsByType(t, evt); got != 0 {
+			t.Fatalf("%s 应被裁剪（最旧事件），got=%d", evt, got)
+		}
+	}
+}
+
+// —— 保留摘要漏行帽（SSA-87-05，历史） ——
+
+// 摘要必须同时表达天数与行帽：cleanup 按 count-max 裁剪，只写「保留 N 天」
+// 会让行帽提前裁剪时的用户可见文案与实际行为漂移。
+func TestSSA8705_retentionSummaryIncludesRowCap(t *testing.T) {
+	setupSecurityEventsRetentionTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=30, security_events_row_cap=5000 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	summary, rowCap := SecurityEventsRetentionSnapshot()
+	if rowCap != 5000 {
+		t.Fatalf("rowCap=%d, want 5000", rowCap)
+	}
+	if summary != "每日清理 · 保留 30 天 / 上限 5000 行" {
+		t.Fatalf("summary=%q, want 同时表达天数与行帽（cleanup 按 count-max 提前裁剪）", summary)
+	}
+	// 缺省形态（0=内置默认）同样表达双口径。
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=0, security_events_row_cap=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	summary, _ = SecurityEventsRetentionSnapshot()
+	if !strings.Contains(summary, "90 天") || !strings.Contains(summary, "1000000 行") {
+		t.Fatalf("默认 summary=%q, want 含 90 天与 1000000 行", summary)
+	}
+}

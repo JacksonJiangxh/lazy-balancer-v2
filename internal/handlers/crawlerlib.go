@@ -103,7 +103,7 @@ func (h *Handlers) StartCrawlerLibUpdate(c *gin.Context) {
 	}
 	te := services.TaskEngine()
 	if te == nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务引擎未初始化"})
+		respondTaskEngineUnavailable(c)
 		return
 	}
 	if te.IsTaskInFlight("crawlerbot-update") {
@@ -160,7 +160,7 @@ func (h *Handlers) UpdateCrawlerSchedule(c *gin.Context) {
 func (h *Handlers) GetCrawlerLibUpdateStatus(c *gin.Context) {
 	te := services.TaskEngine()
 	if te == nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务引擎未初始化"})
+		respondTaskEngineUnavailable(c)
 		return
 	}
 	data := gin.H{

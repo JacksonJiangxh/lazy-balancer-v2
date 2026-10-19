@@ -246,7 +246,7 @@
         <el-button v-if="mfaBinding.step === 0" @click="mfaBinding.visible = false">取消</el-button>
         <el-button v-if="mfaBinding.step === 0" type="primary" @click="mfaBinding.step = 1">下一步</el-button>
         <el-button v-if="mfaBinding.step === 1" @click="mfaBinding.step = 0">上一步</el-button>
-        <el-button v-if="mfaBinding.step === 1" type="primary" :loading="mfaBinding.loading" @click="activateMfa">验证并启用</el-button>
+        <el-button v-if="mfaBinding.step === 1" type="primary" :loading="mfaBinding.loading" :disabled="mfaBinding.code.length !== 6" @click="activateMfa">验证并启用</el-button>
         <el-button v-if="mfaBinding.step === 2" @click="copyMfaRecovery">复制全部</el-button>
         <el-button v-if="mfaBinding.step === 2" type="primary" @click="mfaBinding.visible = false">我已保存</el-button>
       </template>
@@ -296,6 +296,7 @@ import { copyText } from '@/utils/copy'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { UserFilled, User, Plus, Key, Lock, Warning } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
+import { useClampedPagination } from '@/composables/useClampedPagination'
 import QRCode from 'qrcode'
 import type { APIResponse, UserListItem } from '@/types'
 const oidcOpen = ref(false)
@@ -333,10 +334,10 @@ const submittingUserId = ref<number | null>(null)
 const operatingUserIds = ref(new Set<number>())
 const currentPage = ref(1)
 const pageSize = ref(10)
-const paginatedUsers = computed(() => {
-  const start = (currentPage.value - 1) * pageSize.value
-  return users.value.slice(start, start + pageSize.value)
-})
+// W87-16（复用优先）：分页切片 + 页越界夹紧收敛到 useClampedPagination 单源——
+// 原实现手写 slice 并在 fetchUsers 内手工夹紧 maxPage（与 Rules/BlockPages/
+// Policies 的共享范式并存两份）。
+const { pagedItems: paginatedUsers } = useClampedPagination(users, currentPage, pageSize)
 
 const openCreateForm = () => {
   if (submitting.value) return
@@ -368,8 +369,7 @@ const fetchUsers = async () => {
     if (requestSeq === usersRequestSeq) {
       users.value = res.data || []
       loadError.value = false
-      const maxPage = Math.max(1, Math.ceil(users.value.length / pageSize.value))
-      if (currentPage.value > maxPage) currentPage.value = maxPage
+      // 页越界夹紧归 useClampedPagination（W87-16）——不再手工重算 maxPage。
     }
   } catch (error: unknown) {
     // Error toast is already shown by the global axios interceptor; swallow here
@@ -590,10 +590,10 @@ const resetPassword = async (id: number) => {
       mfaAwareSuccess('密码重置成功')
     }
   } catch (e) {
-    // ElMessageBox 取消/关闭以字符串形式 reject，静默放行；请求本身不带 silent，
-    // 失败已由全局拦截器 toast（此处仅记录防吞线索）；仅对无法归因到拦截器的
-    // 意外拒绝（非 Error 值）兜底提示，避免二次弹窗。
-    if (e === 'cancel' || e === 'close') return
+    // W87-12：lbOpen 取消/关闭以 {ok:false} **resolve**（不走 reject），上面已
+    // `if (!r.ok) return` 处理——此处不存在 'cancel'/'close' 字符串拒绝（那些是
+    // ElMessageBox 时代残留）。请求本身不带 silent，失败已由全局拦截器 toast，
+    // 此处仅记录；仅对无法归因到拦截器的意外拒绝（非 Error 值）兜底提示。
     console.error('Failed to reset password:', e)
     if (!(e instanceof Error)) {
       ElMessage.error('密码重置失败，请重试')
@@ -683,6 +683,9 @@ const mfaBindingClosed = () => {
 }
 
 const openMfaBinding = async (row: UserListItem): Promise<void> => {
+  // W87-10：与 resetMfa/resetPassword 同款函数级纵深守卫（按钮已禁用；此处防
+  // 后续调用方绕过）。是否向非管理员放行自助绑定属产品裁定（见 fix 报告）。
+  if (isReadOnly.value || mfaBinding.value.loading) return
   try {
     const res = await request.post<APIResponse<{ secret: string; uri: string }>>('/auth/mfa/setup', {}, { silent: true })
     if (!res.data) return
@@ -702,7 +705,9 @@ const openMfaBinding = async (row: UserListItem): Promise<void> => {
 }
 
 const activateMfa = async (): Promise<void> => {
-  if (mfaBinding.value.code.length !== 6 || mfaBinding.value.loading) return
+  // W87-11：按钮已按 6 位禁用（原实现在不足 6 位时静默 no-op，用户以为页面卡住）；
+  // 函数内保留短路作为纵深兜底（脚本/键盘直触路径）。
+  if (isReadOnly.value || mfaBinding.value.code.length !== 6 || mfaBinding.value.loading) return
   mfaBinding.value.loading = true
   try {
     const res = await request.post<APIResponse<{ recovery_codes: string[] }>>('/auth/mfa/activate', { code: mfaBinding.value.code }, { silent: true })

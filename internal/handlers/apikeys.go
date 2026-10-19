@@ -213,20 +213,29 @@ func createAPIKeyForUser(c *gin.Context, userID int) {
 	// 历史问题 历史问题 为路由补前置守卫后，守卫开启时本层通常已被前置放行/拦截，保留
 	// 仅作纵深防御（历史问题 历史问题 前守卫独扛时代的产物）。
 	if !req.ReadOnly || req.MCPEnabled {
-		if c.GetString("auth_type") == "jwt" && services.MFAWriteGuardEnabled() {
-			var mfaEnabled bool
-			if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", userID).Scan(&mfaEnabled); err != nil {
-				// 与 mfaStepUpGuard 同口径：MFA 状态查询失败 fail-closed（历史问题 C-历史问题）。
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 状态查询失败"})
+		if c.GetString("auth_type") == "jwt" {
+			guardEnabled, guardErr := services.MFAWriteGuardEnabled()
+			if guardErr != nil {
+				// S历史问题：开关读取失败 fail-closed（与相邻 MFA 状态查询同口径，
+				// 历史问题 C-历史问题）——特权 Key 创建不能因「读不到开关」静默跳过第二因子。
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 写操作验证开关读取失败"})
 				return
 			}
-			if mfaEnabled {
-				mfaTs := c.GetFloat64("mfa_ts")
-				if elapsed := time.Since(time.Unix(int64(mfaTs), 0)); mfaTs > 0 && elapsed < 60*time.Second {
-					c.Header("X-Mfa-Verified-Seconds-Ago", strconv.FormatInt(int64(elapsed.Seconds()), 10))
-				} else {
-					c.JSON(http.StatusPreconditionRequired, gin.H{"code": 428, "message": "MFA_STEP_UP_REQUIRED", "detail": "此操作需要 MFA 验证"})
+			if guardEnabled {
+				var mfaEnabled bool
+				if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", userID).Scan(&mfaEnabled); err != nil {
+					// 与 mfaStepUpGuard 同口径：MFA 状态查询失败 fail-closed（历史问题 C-历史问题）。
+					c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 状态查询失败"})
 					return
+				}
+				if mfaEnabled {
+					mfaTs := c.GetFloat64("mfa_ts")
+					if elapsed := time.Since(time.Unix(int64(mfaTs), 0)); mfaTs > 0 && elapsed < 60*time.Second {
+						c.Header("X-Mfa-Verified-Seconds-Ago", strconv.FormatInt(int64(elapsed.Seconds()), 10))
+					} else {
+						c.JSON(http.StatusPreconditionRequired, gin.H{"code": 428, "message": "MFA_STEP_UP_REQUIRED", "detail": "此操作需要 MFA 验证"})
+						return
+					}
 				}
 			}
 		}
@@ -287,7 +296,17 @@ func createAPIKeyForUser(c *gin.Context, userID int) {
 	if expiresAt != nil {
 		expiry = expiresAt.Format("2006-01-02")
 	}
-	recordAudit(c, "创建", "API密钥", services.FormatAuditDetail(fmt.Sprintf("密钥 %d", id), req.Name, fmt.Sprintf("过期：%s", expiry)))
+	// 历史问题（历史）：字段级留痕——只读/可写、MCP 开关、白名单条数此前
+	// 不可见，「可写 + MCP 开启 + 白名单」的高权授予与只读 Key 审计文案相同。
+	// 不落完整密钥（明文仅在创建响应出现一次）。
+	recordAudit(c, "创建", "API密钥", services.FormatAuditDetail(
+		fmt.Sprintf("密钥 %d", id),
+		req.Name,
+		fmt.Sprintf("过期：%s", expiry),
+		"权限："+map[bool]string{true: "只读", false: "可写"}[req.ReadOnly],
+		"MCP："+boolOnOff(req.MCPEnabled),
+		fmt.Sprintf("MCP 白名单：%d 条", len(whitelist)),
+	))
 	c.JSON(http.StatusCreated, models.APIResponse{Code: 0, Data: gin.H{
 		"id":      id,
 		"key":     apiKey,
@@ -363,14 +382,18 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 		}
 		whitelistJSON = &encoded
 	}
-	query := "SELECT name FROM api_keys WHERE id = ?"
+	// 历史问题（历史）：审计 delta 需要变更前的键状态（启用态/MCP/只读/
+	// 白名单），与更新同条件取行（currentUserOnly 时限定创建者）。
+	query := "SELECT name, COALESCE(is_enabled,1), COALESCE(mcp_enabled,0), COALESCE(read_only,0), COALESCE(mcp_ip_whitelist,'') FROM api_keys WHERE id = ?"
 	args := []any{id}
 	if currentUserOnly {
 		query += " AND created_by = ?"
 		args = append(args, userID)
 	}
 	var name string
-	if err := db.DB.QueryRow(query, args...).Scan(&name); dbQueryNotFound(c, err, "API 密钥不存在", "updateAPIKeyStatus query key") {
+	var beforeEnabled, beforeMCPEnabled, beforeReadOnly int
+	var beforeWhitelist string
+	if err := db.DB.QueryRow(query, args...).Scan(&name, &beforeEnabled, &beforeMCPEnabled, &beforeReadOnly, &beforeWhitelist); dbQueryNotFound(c, err, "API 密钥不存在", "updateAPIKeyStatus query key") {
 		return
 	}
 	setClauses := make([]string, 0, 4)
@@ -412,7 +435,29 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "API 密钥不存在"})
 		return
 	}
-	recordAudit(c, "更新", "API密钥", services.FormatAuditDetail(fmt.Sprintf("密钥 %d", id), name))
+	// 历史问题（历史）：更新审计记真 delta——启用态/MCP/只读/白名单是安全
+	// 相关变更，此前四个字段零留痕（同族先例：安全策略 历史问题/B1-历史问题）。
+	auditDetail := services.FormatAuditDetail(fmt.Sprintf("密钥 %d", id), name)
+	changes := make([]string, 0, 4)
+	if req.IsEnabled != nil && *req.IsEnabled != (beforeEnabled == 1) {
+		changes = append(changes, "启用状态："+boolOnOff(beforeEnabled == 1)+"→"+boolOnOff(*req.IsEnabled))
+	}
+	if req.MCPEnabled != nil && *req.MCPEnabled != (beforeMCPEnabled == 1) {
+		changes = append(changes, "MCP："+boolOnOff(beforeMCPEnabled == 1)+"→"+boolOnOff(*req.MCPEnabled))
+	}
+	if req.ReadOnly != nil && *req.ReadOnly != (beforeReadOnly == 1) {
+		changes = append(changes, fmt.Sprintf("只读：%t→%t", beforeReadOnly == 1, *req.ReadOnly))
+	}
+	if req.MCPIPWhitelist != nil && whitelistJSON != nil {
+		beforeCount := apiKeyWhitelistCount(beforeWhitelist)
+		if beforeCount != len(*req.MCPIPWhitelist) || *whitelistJSON != beforeWhitelist {
+			changes = append(changes, fmt.Sprintf("MCP 白名单：%d 条→%d 条", beforeCount, len(*req.MCPIPWhitelist)))
+		}
+	}
+	if len(changes) > 0 {
+		auditDetail = services.FormatAuditDetail(auditDetail, "变更："+strings.Join(changes, "、"))
+	}
+	recordAudit(c, "更新", "API密钥", auditDetail)
 	// 历史问题-19①：禁用即清扫白名单解析缓存（条目随 Key 失活永不再命中）。
 	// U6a-5-6（历史）：在位编辑白名单也清扫——缓存键含白名单内容，旧键
 	// 成为孤儿永不再命中（曾仅禁用/删除清扫）。
@@ -420,6 +465,19 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 		purgeAPIKeyWhitelistCache(id)
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "API 密钥已更新"})
+}
+
+// apiKeyWhitelistCount 统计库内 MCP 白名单条目数（历史问题 审计 delta 用；
+// 损坏/空值按 0 计——只影响审计文案，不参与鉴权判定）。
+func apiKeyWhitelistCount(raw string) int {
+	if raw == "" {
+		return 0
+	}
+	var items []string
+	if err := json.Unmarshal([]byte(raw), &items); err != nil {
+		return 0
+	}
+	return len(items)
 }
 
 func encodeMCPIPWhitelist(whitelist []string) (string, error) {

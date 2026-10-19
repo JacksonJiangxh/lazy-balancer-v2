@@ -27,14 +27,26 @@ func TestSecurityWritePaths_rejectNoncanonicalIDs(t *testing.T) {
 	router.PUT("/security/policies/:id", h.UpdateSecurityPolicy)
 	router.DELETE("/security/policies/:id/bind/:caddy_id", h.UnbindRuleFromPolicy)
 	router.PUT("/security/custom-rules/:id", h.UpdateSecurityCustomRule)
+	router.POST("/security/policies/:id/split", h.SplitSecurityPolicy)
 
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,mode,enabled) VALUES (5,'policy','off',1)`); err != nil {
+		t.Fatal(err)
+	}
+	// HC-03（历史）：拆分端点此前缺规范 ID 门——用 mixed 策略做哨兵：
+	// 无门时 "6.0" 会被 SQLite 亲和命中并真正进入拆分（生成子策略），有门则
+	// 在查库前 400。
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,mode,policy_type,enabled) VALUES (6,'mixed-sentinel','blocking','mixed',1)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_custom_rules (id,name,conditions,action,enabled) VALUES (5,'rule','[]','block',1)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES ('lb_x',5)`); err != nil {
+		t.Fatal(err)
+	}
+
+	var baselinePolicies int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_policies`).Scan(&baselinePolicies); err != nil {
 		t.Fatal(err)
 	}
 
@@ -47,6 +59,7 @@ func TestSecurityWritePaths_rejectNoncanonicalIDs(t *testing.T) {
 		{"policy update", http.MethodPut, "/security/policies/5.0", map[string]any{"name": "changed"}},
 		{"custom rule update", http.MethodPut, "/security/custom-rules/5.0", map[string]any{"name": "changed"}},
 		{"policy unbind", http.MethodDelete, "/security/policies/5.0/bind/lb_x", nil},
+		{"policy split", http.MethodPost, "/security/policies/6.0/split", nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -80,5 +93,13 @@ func TestSecurityWritePaths_rejectNoncanonicalIDs(t *testing.T) {
 	}
 	if policyName != "policy" || ruleName != "rule" || bindings != 1 {
 		t.Fatalf("noncanonical ids mutated rows: policy=%q rule=%q bindings=%d", policyName, ruleName, bindings)
+	}
+	// 拆分端点：非规范 ID 不得生成子策略（无门时 "6.0" 会命中 mixed 行并拆分）
+	var policies int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_policies`).Scan(&policies); err != nil {
+		t.Fatal(err)
+	}
+	if policies != baselinePolicies {
+		t.Fatalf("security_policies count=%d, want %d（split 不得因非规范 ID 生成子策略）", policies, baselinePolicies)
 	}
 }

@@ -302,8 +302,16 @@ func (s *CAProviderService) UpdateCAProvider(id int, req models.UpdateCAProvider
 	// 历史问题-04：禁用引用守卫与 DNS 配置禁用同口径（失败即 409，点名引用方）。
 	// 放在事务内、UPDATE 之前：与写锁同事务，判定与写入原子。
 	if disabling {
+		// SV历史问题：默认提供商守卫不得 fail-open——读失败时此前静默跳过守卫，
+		// 只剩「最后一个启用」兜底，可禁用当前默认提供商，令 ca_provider_id=0
+		// 的规则/未显式选择 CA 的规则在下次签发时静默改派。行缺失（ErrNoRows）
+		// 语义=未配置默认提供商（无守卫对象），DB 读故障则显性失败（fail-closed）。
 		var defaultID int
-		if derr := tx.QueryRow(`SELECT COALESCE(default_ca_provider_id,0) FROM global_config WHERE id=1`).Scan(&defaultID); derr == nil && defaultID == id {
+		derr := tx.QueryRow(`SELECT COALESCE(default_ca_provider_id,0) FROM global_config WHERE id=1`).Scan(&defaultID)
+		if derr != nil && !errors.Is(derr, sql.ErrNoRows) {
+			return models.CAProvider{}, fmt.Errorf("读取默认 CA 提供商: %w", derr)
+		}
+		if derr == nil && defaultID == id {
 			return models.CAProvider{}, ErrCAProviderDefault
 		}
 		references, total, refErr := caProviderReferences(tx, id)
@@ -435,10 +443,18 @@ func AutoProvisionZeroSSLEAB(ctx context.Context, provider *models.CAProvider) e
 			return fmt.Errorf("re-read zerossl EAB credentials: %w", err)
 		}
 		provider.Credentials = persisted
+		// SV历史问题：DB 凭据已被并发写入者改变——同样递增配置版本，令队列缓存的
+		// provider 快照（可能仍持空 EAB）按新凭据刷新，避免每个后续任务再请求
+		// 一次 ZeroSSL API（虽有 CAS 兜底，但外部调用重复且无谓）。
+		caProviderConfigVersion.Add(1)
 		Logf("warn", "AutoProvisionZeroSSLEAB: provider %d credentials already set by concurrent worker, skipping persist", provider.ID)
 		return nil
 	}
 	provider.Credentials = string(credsJSON)
+	// SV历史问题：EAB 落库后递增配置版本（与 UpdateCAProvider 同口径）——队列
+	// 积压时缓存的 provider 快照仍持空 EAB，纯版本失效即可避免签发前再次
+	// 请求 ZeroSSL API；CAS 兜底只保证正确性、不消除这次外部调用。
+	caProviderConfigVersion.Add(1)
 	Logf("info", "AutoProvisionZeroSSLEAB: success, EAB persisted for provider %d (%s)", provider.ID, maskEmail(acmeEmail))
 	return nil
 }

@@ -189,8 +189,12 @@ func (w *RotatingFileWriter) Close() error {
 // RuntimeLogCleanupOnce，由任务引擎 log-cleanup 族按 24h 节拍驱动）。
 type RuntimeCleanupResult struct {
 	AppRemoved int // 应用日志过期副本删除数（app.log.*）
-	TaskLogs   TaskLogHousekeepingResult
-	WafAudit   []string // waf-audit 目录兜底动作明细（daemon 停机时的超阈轮转/截断）
+	// RetentionMonths 本轮生效的保留月数（单一来源 auditRetentionMonths 回填，
+	// V87-TO-04：任务日志摘要行直接展示本字段——此前 wire 处自行查库复算，
+	// 同值两实现会在默认值/钳位逻辑变更时与实际清理口径分裂）。
+	RetentionMonths int
+	TaskLogs        TaskLogHousekeepingResult
+	WafAudit        []string // waf-audit 目录兜底动作明细（daemon 停机时的超阈轮转/截断）
 }
 
 // TaskLogHousekeepingResult 任务日志清理明细。
@@ -217,14 +221,13 @@ func (r TaskLogHousekeepingResult) Summary() string {
 // 无独立启动器）。
 func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 	result := RuntimeCleanupResult{TaskLogs: taskLogsHousekeeping(logFile), WafAudit: wafAuditHousekeeping()}
-	months := 3
-	database := db.GetDB()
-	if database == nil {
-		return result
-	}
-	// LBS-B-U2（历史）：统一经 auditRetentionMonths——读取失败回退默认
-	// 3 月 + warn 留痕（曾三消费点三态分裂，此处为静默默认形态）。
-	months = auditRetentionMonths()
+	// V87-TO-05②（历史）：库未初始化不再整体跳过——保留期单源
+	// auditRetentionMonths 自带 nil 库回退默认 3 月；此前 `months := 3` 后
+	// 直接 return 使应用日志副本清理被静默跳过（AppRemoved=0），与「清理不得
+	// 静默跳过」口径相反。死初值一并删除（唯一使用点必被 auditRetentionMonths
+	// 覆盖）。
+	months := auditRetentionMonths()
+	result.RetentionMonths = months
 	cutoff := time.Now().AddDate(0, -months, 0)
 
 	dir := filepath.Dir(logFile)
@@ -253,6 +256,28 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 	}
 	result.AppRemoved = removed
 	return result
+}
+
+// logCleanupSummaryLine log-cleanup 任务单轮摘要行（从 wire 描述符闭包抽出，
+// 便于对「摘要行口径 = 实际清理口径」直接钉测）。
+func logCleanupSummaryLine(logFile string) string {
+	// V87-TO-05③（历史）：旋转写入器打开失败（runtimeLogFile 为空，
+	// main.go 已有 error 留痕）时不得让 log-cleanup 静默零动作——任务监控恒绿
+	// 却没有任何留痕，排障时看不出「清理为什么没跑」。
+	if logFile == "" {
+		return "日志清理未启用：运行日志文件未打开（应用日志副本清理与 waf-audit 兜底跳过）"
+	}
+	res := RuntimeLogCleanupOnce(logFile)
+	// V87-TO-04：保留月数取 RuntimeCleanupResult 的单源回填值（与实际删除口径
+	// 同源），不再在本层复算。
+	summary := fmt.Sprintf("日志清理完成：应用日志副本删除 %d 个（保留 %d 月，无过期为 0）；%s", res.AppRemoved, res.RetentionMonths, res.TaskLogs.Summary())
+	// F-历史问题-01（历史）：daemon 停机时的 waf-audit 兜底动作如实进
+	// 任务日志（2026-10-01 用户裁定：清理了哪个文件必须可见）；无动作时不加
+	// 尾段，日志行形态不变。
+	if len(res.WafAudit) > 0 {
+		summary += "；waf-audit 兜底：" + strings.Join(res.WafAudit, "、")
+	}
+	return summary
 }
 
 // wafAuditHousekeeping waf-audit 目录超阈兜底（F-历史问题-01，历史）——

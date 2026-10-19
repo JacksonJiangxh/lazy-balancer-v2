@@ -2284,3 +2284,40 @@ func TestExtractMetricLabel_boundaryAware(t *testing.T) {
 		t.Fatalf("值未闭合应返回空串: %q", got)
 	}
 }
+
+// ---- 历史（SV历史问题）----
+
+// SV历史问题：候选装载阶段必须预解析 Leaf（disabled 候选除外），供
+// SelectCertificate 走快路径并供过期回退复用。
+func TestACMECertCandidatesForRule_preparses_leaf(t *testing.T) {
+	_, database := newClusterTestService(t)
+	seedRuleWithCAProvider(t, "lb_leaf", "leaf.example.test", 0)
+	certPEM, keyPEM := matchingCertificatePair(t, "leaf.example.test")
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem) VALUES
+		('lb_leaf','leaf.example.test','issued',?,?),
+		('lb_leaf','disabled.leaf.example.test','disabled',?,?)`, certPEM, keyPEM, certPEM, keyPEM); err != nil {
+		t.Fatalf("seed jobs: %v", err)
+	}
+
+	// When
+	candidates := acmeCertCandidatesForRule(database, "lb_leaf")
+
+	// Then
+	if len(candidates) != 2 {
+		t.Fatalf("candidates=%d, want 2", len(candidates))
+	}
+	for _, candidate := range candidates {
+		if candidate.Status == "disabled" {
+			if candidate.Leaf != nil {
+				t.Fatal("disabled candidate must skip leaf pre-parse")
+			}
+			continue
+		}
+		if candidate.Leaf == nil {
+			t.Fatal("issued candidate leaf not pre-parsed")
+		}
+		if candidate.Leaf.Subject.CommonName != "leaf.example.test" {
+			t.Fatalf("leaf CN=%q, want leaf.example.test", candidate.Leaf.Subject.CommonName)
+		}
+	}
+}

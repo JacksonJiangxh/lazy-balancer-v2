@@ -124,7 +124,12 @@ func newClient(directoryURL, email, dataDir string, eab *acme.ExternalAccountBin
 				// 历史问题（历史）：自定义曲线会丢失默认实现的 jitter——多规则
 				// 并发签发（max_concurrent>1）在同一 CA 5xx 窗口会以相同延迟同步
 				// 重试（thundering herd）。补 0~1s 均匀抖动（同默认曲线量级）。
-				base := min(time.Duration(1<<min(n, 4))*time.Second, 10*time.Second)
+				// DNS-87-F2（历史）：x/crypto 文档「The value of n for the
+				// first call on failure is 1」（acme.go），实际序列必须从 n=1
+				// 起跳为 1s——原实现 1<<min(n,4) 使首召即 2s，整条曲线右移一档
+				// 且提前封顶。n<1 仅防御（生产不出现）。
+				attempt := max(n, 1)
+				base := min(time.Duration(1<<min(attempt-1, 4))*time.Second, 10*time.Second)
 				return base + time.Duration(mathrand.IntN(1000))*time.Millisecond
 			},
 		},
@@ -193,8 +198,11 @@ func loadOrCreateAccountKey(dataDir, directoryURL, email, eabKID string, eabKey 
 			created = fmt.Sprintf("，首次注册时间: %s", fi.ModTime().Format("2006-01-02 15:04:05"))
 		}
 		logf("info", "ACME 账户密钥 %s 已加载%s", filepath.Base(keyPath), created)
+		// DNS-87-F9（历史）：元数据只服务 removeStaleAccountKeys 的卫生
+		// 清理（mtime=最近使用时间），刷新失败（只读挂载/权限漂移）不得连坐
+		// 签发主路径——镜像注册侧「清理失败仅记 warn」的同族口径（CERT44-3）。
 		if err := writeAccountKeyMetadata(keyPath, directoryURL, email, eabKID, eabKeyDigestOf(eabKey)); err != nil {
-			return nil, err
+			logf("warn", "acme: 刷新账户密钥元数据失败（密钥可用，不影响本次签发）: %v", err)
 		}
 		return key, nil
 	}
@@ -217,8 +225,10 @@ func loadOrCreateAccountKey(dataDir, directoryURL, email, eabKID string, eabKey 
 		_ = os.Remove(tmp)
 		return nil, fmt.Errorf("部署 ACME 账户密钥: %w", err)
 	}
+	// DNS-87-F9（历史，R-12 同族收敛）：与既有密钥路径同口径——密钥已
+	// 落盘即可用，元数据仅是卫生清理的输入，写失败只记 warn。
 	if err := writeAccountKeyMetadata(keyPath, directoryURL, email, eabKID, eabKeyDigestOf(eabKey)); err != nil {
-		return nil, err
+		logf("warn", "acme: 写入账户密钥元数据失败（密钥可用，不影响本次签发）: %v", err)
 	}
 	return key, nil
 }

@@ -560,3 +560,134 @@ func TestUpdateAdminTLS_enabledValueWhitelist(t *testing.T) {
 		})
 	}
 }
+
+// 历史问题（历史）：库内证书损坏/非 PEM（带外改库、旧版本导入）时，读路径
+// 此前静默省略 cert_info——UI 只见 enabled=true 无证书信息、运维零信号。
+// 现在必须显式暴露 cert_info_error（fail-visible，与写路径严格校验同口径）。
+func TestGetAdminTLS_corruptStoredCertIsVisible(t *testing.T) {
+	initializeRuleFeatureTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET admin_tls_enabled=1, admin_tls_mode='upload',
+		admin_tls_cert='not-a-pem', admin_tls_key='not-a-key' WHERE id=1`); err != nil {
+		t.Fatalf("seed corrupt admin TLS cert: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/admin-tls", nil)
+	(&Handlers{}).GetAdminTLS(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200（读路径不得因损坏证书 500）", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Data struct {
+			Enabled       bool   `json:"enabled"`
+			CertInfo      any    `json:"cert_info"`
+			CertInfoError string `json:"cert_info_error"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Data.Enabled {
+		t.Fatalf("enabled=false body=%s, want true（保留库内开关原值）", recorder.Body.String())
+	}
+	if body.Data.CertInfo != nil {
+		t.Fatalf("cert_info=%v, want null（解析失败不得给出伪造信息）", body.Data.CertInfo)
+	}
+	if body.Data.CertInfoError == "" {
+		t.Fatalf("cert_info_error 为空：损坏证书必须显式暴露，body=%s", recorder.Body.String())
+	}
+}
+
+// 历史问题（历史）：管理面板 HTTPS 保存属高危设置——非法载荷（enabled 白名单）
+// 与写库失败此前只回 400/500、不写审计，失败尝试不可回溯。沿用既有
+// 「更新失败/基础设置」词条（同 UpdateConfig 失败留痕口径）。
+func TestUpdateAdminTLS_failuresAreAudited(t *testing.T) {
+	initializeRuleFeatureTestDB(t)
+	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
+		t.Fatalf("initialize audit db: %v", err)
+	}
+	handler := &Handlers{cfg: &config.Config{Port: 8000}}
+	send := func(payload string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPut, "/admin-tls", strings.NewReader(payload))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		handler.UpdateAdminTLS(ctx)
+		return recorder
+	}
+	latestFailure := func() string {
+		t.Helper()
+		var detail string
+		if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新失败' AND resource='基础设置' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+			t.Fatalf("read failure audit detail: %v", err)
+		}
+		return detail
+	}
+
+	// 形状一：enabled 非法拼写 → 400 + 审计
+	if recorder := send(`{"enabled":"TRUE"}`); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid enabled status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
+	}
+	if detail := latestFailure(); !strings.Contains(detail, "enabled") || !strings.Contains(detail, "结果：失败") {
+		t.Fatalf("非法 enabled 未留痕：detail=%q", detail)
+	}
+
+	// 形状二：UPDATE 写库失败 → 500 + 审计（SQLite 触发器强制失败，避免依赖
+	// 真实磁盘故障）。
+	if _, err := db.DB.Exec(`UPDATE global_config SET admin_tls_enabled=1, admin_tls_mode='selfsigned', admin_tls_cert='', admin_tls_key='' WHERE id=1`); err != nil {
+		t.Fatalf("seed admin TLS config: %v", err)
+	}
+	if _, err := db.DB.Exec(`CREATE TRIGGER fail_admin_tls_update BEFORE UPDATE ON global_config BEGIN SELECT RAISE(ABORT,'forced'); END`); err != nil {
+		t.Fatalf("create failing trigger: %v", err)
+	}
+	if recorder := send(`{"enabled":false}`); recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("update failure status=%d body=%s, want 500", recorder.Code, recorder.Body.String())
+	}
+	if detail := latestFailure(); !strings.Contains(detail, "写入") {
+		t.Fatalf("写库失败未留痕：detail=%q", detail)
+	}
+}
+
+// 历史问题（历史）：413 口径此前只测 JSON 通道——multipart 超 2 MiB 未覆盖，
+// 表单解析错误须同样映射 413（respondAdminTLSBodyError 的 *http.MaxBytesError
+// 分支）。两入口（保存/预检）同门。
+func TestAdminTLSOversizedMultipartBodyReturns413(t *testing.T) {
+	var body strings.Builder
+	writer := multipart.NewWriter(&body)
+	filePart, err := writer.CreateFormFile("cert_file", "cert.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := filePart.Write(bytes.Repeat([]byte("a"), (2<<20)+64)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("mode", "selfsigned"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newRouter := func(handler gin.HandlerFunc, method, path string) *gin.Engine {
+		router := gin.New()
+		router.Handle(method, path, handler)
+		return router
+	}
+	send := func(router *gin.Engine, method, path string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, path, strings.NewReader(body.String()))
+		request.Header.Set("Content-Type", writer.FormDataContentType())
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+
+	updateResponse := send(newRouter((&Handlers{cfg: &config.Config{}}).UpdateAdminTLS, http.MethodPut, "/admin-tls"), http.MethodPut, "/admin-tls")
+	inspectResponse := send(newRouter((&Handlers{cfg: &config.Config{}}).InspectAdminTLSCert, http.MethodPost, "/admin-tls/inspect"), http.MethodPost, "/admin-tls/inspect")
+
+	if updateResponse.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("PUT /admin-tls multipart oversized status=%d body=%s, want 413", updateResponse.Code, updateResponse.Body.String())
+	}
+	if inspectResponse.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("POST /admin-tls/inspect multipart oversized status=%d body=%s, want 413", inspectResponse.Code, inspectResponse.Body.String())
+	}
+}

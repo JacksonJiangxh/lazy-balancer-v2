@@ -9,8 +9,8 @@
                 <el-icon class="title-icon"><Monitor /></el-icon>
                 <span>系统概览</span>
               </div>
-              <el-tag :type="isSlave ? 'warning' : 'success'" size="small" effect="plain">
-                {{ isSlave ? '从节点' : '主节点' }}
+              <el-tag :type="nodeModeTagType" size="small" effect="plain">
+                {{ nodeModeLabel }}
               </el-tag>
             </div>
           </template>
@@ -55,7 +55,7 @@
                   :type="caddyStatus === 'running' ? 'success' : caddyStatus === 'stopped' ? 'danger' : 'info'" 
                   size="small" 
                   effect="plain"
-                  :class="['status-tag', caddyStatus]"
+                  :class="['status-tag', caddyStatusClass]"
                 >
                   {{ caddyStatus === 'running' ? (caddyPid !== '0' && caddyPid !== '' ? `运行中 ${caddyPid}` : '运行中') : caddyStatus === 'stopped' ? '已停止' : '未知' }}
                 </el-tag>
@@ -391,27 +391,39 @@
       </div>
       <el-empty v-if="ruleHistoryUnsupported" description="TCP 规则暂无历史流量统计（四层代理无流量计数指标）" :image-size="60" />
       <template v-else>
-        <el-empty v-if="!ruleHistoryLoading && ruleHistoryRows.length === 0" description="该时间范围内暂无数据" :image-size="60" />
-        <div v-else v-loading="ruleHistoryLoading">
-          <el-card shadow="never" class="history-card">
-            <template #header>
-              <div class="history-card-header">
-                <el-icon><Odometer /></el-icon>
-                <span>请求数与状态码</span>
-              </div>
-            </template>
-            <v-chart :option="ruleRequestsChartOption" autoresize style="height: 260px;" />
-          </el-card>
-          <el-card shadow="never" class="history-card">
-            <template #header>
-              <div class="history-card-header">
-                <el-icon><DataLine /></el-icon>
-                <span>流量（入站 / 出站）</span>
-              </div>
-            </template>
-            <v-chart :option="ruleBytesChartOption" autoresize style="height: 260px;" />
-          </el-card>
-        </div>
+        <!-- W87-06：加载失败 ≠ 该时间范围无数据——失败态与空态分文案（同页
+             A85WB-历史问题「采集失败 ≠ 无数据」固化口径），并提供重试。 -->
+        <el-alert v-if="ruleHistoryError" type="error" :closable="false" show-icon class="polling-error-alert error-banner history-error-alert">
+          <template #title>
+            <div class="polling-error-title">
+              <span>历史统计加载失败：图表为空不代表该时间范围没有流量</span>
+              <el-button link type="danger" @click="fetchRuleHistory">立即重试</el-button>
+            </div>
+          </template>
+        </el-alert>
+        <template v-else>
+          <el-empty v-if="!ruleHistoryLoading && ruleHistoryRows.length === 0" description="该时间范围内暂无数据" :image-size="60" />
+          <div v-else v-loading="ruleHistoryLoading">
+            <el-card shadow="never" class="history-card">
+              <template #header>
+                <div class="history-card-header">
+                  <el-icon><Odometer /></el-icon>
+                  <span>请求数与状态码</span>
+                </div>
+              </template>
+              <v-chart :option="ruleRequestsChartOption" autoresize style="height: 260px;" />
+            </el-card>
+            <el-card shadow="never" class="history-card">
+              <template #header>
+                <div class="history-card-header">
+                  <el-icon><DataLine /></el-icon>
+                  <span>流量（入站 / 出站）</span>
+                </div>
+              </template>
+              <v-chart :option="ruleBytesChartOption" autoresize style="height: 260px;" />
+            </el-card>
+          </div>
+        </template>
       </template>
     </el-dialog>
   </div>
@@ -488,7 +500,20 @@ const connEstablishedHistory = ref<number[]>([])
 const connTimeWaitHistory = ref<number[]>([])
 const connTimestamps = ref<number[]>([])
 
-const isSlave = computed(() => authStore.nodeMode === 'slave')
+// W87-07：节点角色三态（fail-closed 展示）——nodeMode 为 null（/config 首拉失败
+// 或 15s 重试窗口内）时不显示「主节点」：同页写控件按 readOnlyReason（含
+// 'unknown'）隐藏，展示层不能反向宣告「主节点」误导运维。
+const nodeModeRole = computed<'master' | 'slave' | 'unknown'>(() => {
+  if (authStore.nodeMode === 'master') return 'master'
+  if (authStore.nodeMode === 'slave') return 'slave'
+  return 'unknown'
+})
+const nodeModeLabel = computed(() => nodeModeRole.value === 'master' ? '主节点' : nodeModeRole.value === 'slave' ? '从节点' : '节点角色未知')
+const nodeModeTagType = computed(() => nodeModeRole.value === 'master' ? 'success' : nodeModeRole.value === 'slave' ? 'warning' : 'info')
+
+// W87-08：caddyStatus 取值 running/stopped/unknown，样式类须映射——原先直接拼
+// caddyStatus 使 `.status-tag.info`（未知态灰底）零命中。
+const caddyStatusClass = computed(() => caddyStatus.value === 'running' ? 'running' : caddyStatus.value === 'stopped' ? 'stopped' : 'info')
 
 interface RuleHistoryRow {
   timestamp: string
@@ -541,6 +566,8 @@ const ruleHistoryRows = ref<RuleHistoryRow[]>([])
 const ruleHistoryBucketSeconds = ref(0)
 const ruleHistoryLoading = ref(false)
 const ruleHistoryUnsupported = ref(false)
+// W87-06：请求失败必须与「该时间范围内暂无数据」区分（否则取证/排障会被误导）。
+const ruleHistoryError = ref('')
 
 const openRuleHistory = (rule: Rule) => {
   ruleHistoryRule.value = rule
@@ -556,6 +583,7 @@ const fetchRuleHistory = async () => {
   const seq = ++ruleHistorySeq
   ruleHistoryLoading.value = true
   ruleHistoryUnsupported.value = false
+  ruleHistoryError.value = ''
   ruleHistoryRows.value = []
   ruleHistoryBucketSeconds.value = 0
   try {
@@ -575,6 +603,7 @@ const fetchRuleHistory = async () => {
     if (!disposed && seq === ruleHistorySeq) {
       console.error('Failed to fetch rule history:', error)
       ruleHistoryRows.value = []
+      ruleHistoryError.value = error instanceof Error ? error.message : '历史统计请求失败'
     }
   } finally {
     if (!disposed && seq === ruleHistorySeq) {
@@ -654,13 +683,28 @@ const ruleRankValue = (caddyId: string): number => {
   return rankBy.value === 'requests' ? (metrics.requests_total ?? 0) : (metrics.bytes_in ?? 0) + (metrics.bytes_out ?? 0)
 }
 
-const rankableRules = computed(() =>
-  rules.value
-    .filter((rule) => ruleRankValue(rule.caddy_id) > 0)
-    .sort((a, b) => ruleRankValue(b.caddy_id) - ruleRankValue(a.caddy_id)),
-)
+const rankableRules = computed(() => {
+  // W87-05：单条规则指标缺失时 ruleRankValue=0 会被「>0」过滤掉，外观等同
+  // 「无流量」且逐列「采集失败」分支永不渲染（A85WB-历史问题 只覆盖了全表失败）。
+  // 采集失败的行必须可见——排在正常行之后，保持「故障 ≠ 无数据」口径。
+  const ranked = rules.value.filter((rule) =>
+    ruleRankValue(rule.caddy_id) > 0 || ruleMetricsUnavailable.value[rule.caddy_id] === true,
+  )
+  return ranked.sort((a, b) => {
+    const aUnavailable = ruleMetricsUnavailable.value[a.caddy_id] === true
+    const bUnavailable = ruleMetricsUnavailable.value[b.caddy_id] === true
+    if (aUnavailable !== bUnavailable) return aUnavailable ? 1 : -1
+    return ruleRankValue(b.caddy_id) - ruleRankValue(a.caddy_id)
+  })
+})
 
-const sortedRules = computed(() => rankableRules.value.slice(0, 10))
+const sortedRules = computed(() => {
+  // W87-05：失败行不占排行榜的 10 个名额——前 10 按指标排，失败行全部追加在
+  // 末尾。否则 10 条有流量规则会把失败行挤出 slice，故障再次静默消失。
+  const ranked = rankableRules.value.filter((rule) => ruleMetricsUnavailable.value[rule.caddy_id] !== true)
+  const failed = rankableRules.value.filter((rule) => ruleMetricsUnavailable.value[rule.caddy_id] === true)
+  return [...ranked.slice(0, 10), ...failed]
+})
 
 const rulesEmptyText = computed(() => {
   if (rulesUnavailable.value) return '采集失败'
@@ -1149,6 +1193,7 @@ onUnmounted(() => {
 .dialog-title-main { font-size: 16px; font-weight: 600; color: #111827; margin-right: 16px; }
 .dialog-title-sub { overflow: hidden; text-overflow: ellipsis; line-height: 1; padding-top: 3px; }
 .history-toolbar { display: flex; justify-content: flex-end; margin-top: 8px; padding-bottom: 16px; border-bottom: 1px solid var(--border-lighter); margin-bottom: 20px; }
+.history-error-alert { margin-bottom: 16px; }
 .history-card { margin-bottom: 24px; border: 1px solid var(--border-lighter); border-radius: 8px; }
 .history-card:last-child { margin-bottom: 0; }
 .history-card :deep(.el-card__header) { padding: 8px 14px; background: #f9fafb; }

@@ -7,11 +7,13 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -423,5 +425,115 @@ func TestResolvePolicyIPListRefs_iterationErrorFailsClosed(t *testing.T) {
 	resolvePolicyIPListRefs([]*models.SecurityPolicy{p}, broken)
 	if !p.IPRefMissing {
 		t.Fatal("迭代错误必须 fail-closed：引用该列表的策略须标记 IPRefMissing 跳过渲染")
+	}
+}
+
+// —— 畸形 refs 静默 fail-open（SSA-87-01，历史） ——
+
+// 全形状：畸形（非 JSON / 错元素类型）/空/合法 + deny/allow 两种 ACL 语义。
+// 畸形：留痕且仅保留 inline（行为不变）；空：零告警（未配置引用）；合法：
+// refs 条目进入合并集（deny 与 allow 同口径）。
+func TestSSA8701_refsShapesWarnAndMerge(t *testing.T) {
+	_, database := newClusterTestService(t)
+	res, err := database.Exec(`INSERT INTO security_ip_lists (name, category, entries, system, created_at, updated_at)
+		VALUES ('引用自定义列表', '常规', '[{"value":"203.0.113.0/24"}]', 0, datetime('now'), datetime('now'))`)
+	if err != nil {
+		t.Fatalf("seed list: %v", err)
+	}
+	listID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := fmt.Sprintf("[%d]", listID)
+	var logs bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+	// 限流隔离：同包先序用例（如 TestExpandPolicyIPRefs_missingAndMalformedRefsSkipped
+	// 用 `not-json`）已放行过同一归一化键（auditFailureThrottleKey 把数字统一
+	// 成 #，不同策略 id 同键），60s 窗口会抑制本用例的 WARN 断言。推进注入
+	// 时钟并清空窗口记录（仅测试缝隙，不改生产限流口径）。
+	oldClock := auditFailureLogClock
+	auditFailureLogClock = func() time.Time { return time.Now().Add(2 * time.Minute) }
+	auditFailureLogMu.Lock()
+	auditFailureLogTimes = map[string]time.Time{}
+	auditFailureLogMu.Unlock()
+	t.Cleanup(func() {
+		auditFailureLogClock = oldClock
+		auditFailureLogMu.Lock()
+		auditFailureLogTimes = map[string]time.Time{}
+		auditFailureLogMu.Unlock()
+	})
+
+	policies := []*models.SecurityPolicy{
+		{ID: 8701, Name: "畸形 JSON", IPACLList: `["198.51.100.0/24"]`, IPACLListRefs: `not-json`},
+		{ID: 8702, Name: "错元素类型", IPACLList: `["198.51.100.0/24"]`, IPACLListRefs: `["1"]`},
+		{ID: 8703, Name: "空 refs", IPACLList: `["198.51.100.0/24"]`},
+		{ID: 8704, Name: "deny 引用", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`, IPACLListRefs: refs},
+		{ID: 8705, Name: "allow 引用", IPACLEnabled: true, IPACLMode: "allow", IPACLList: `[]`, IPACLListRefs: refs, IPWhitelistRefs: refs},
+	}
+
+	resolvePolicyIPListRefs(policies, nil)
+
+	// 畸形形状：仅保留 inline（不升级 IPRefMissing——整条策略不被跳过）。
+	for _, p := range policies[:2] {
+		if p.IPRefMissing {
+			t.Fatalf("策略 %q 不得因畸形 refs 置 IPRefMissing（放大会跳过 WAF/限流渲染）", p.Name)
+		}
+		if got := p.MergedACLList; len(got) != 1 || got[0] != "198.51.100.0/24" {
+			t.Fatalf("策略 %q 畸形 refs 合并集=%v, want 仅 inline 198.51.100.0/24", p.Name, got)
+		}
+	}
+	if !strings.Contains(logs.String(), "ip_acl_list_refs") || !strings.Contains(logs.String(), "解析失败") {
+		t.Fatalf("畸形 refs 必须 WARN 留痕（同一 fail-open 方向的内联畸形已留痕）:\n%s", logs.String())
+	}
+	// 空形状：不告警。
+	logs.Reset()
+	resolvePolicyIPListRefs([]*models.SecurityPolicy{{ID: 8706, IPACLList: `["198.51.100.0/24"]`}}, nil)
+	if strings.Contains(logs.String(), "解析失败") {
+		t.Fatalf("空 refs（未配置引用）不得留痕:\n%s", logs.String())
+	}
+	// 合法形状：deny / allow 两语义都拿到引用条目；信任面同口径。
+	for _, p := range policies[3:] {
+		if p.IPRefMissing {
+			t.Fatalf("策略 %q 合法 refs 不得置 IPRefMissing", p.Name)
+		}
+		if got := p.MergedACLList; len(got) != 1 || got[0] != "203.0.113.0/24" {
+			t.Fatalf("策略 %q 合法 refs 合并集=%v, want 引用条目 203.0.113.0/24", p.Name, got)
+		}
+	}
+	if got := policies[4].MergedWhitelist; len(got) != 1 || got[0] != "203.0.113.0/24" {
+		t.Fatalf("信任面合法 refs 合并集=%v, want 203.0.113.0/24", got)
+	}
+}
+
+// —— 同一 tick 内相同来源列的展开结果去重（SSA-87-06） ——
+
+// 多策略引用同一名单（相同来源列）共享一次性展开；不同 inline 的策略仍各自
+// 得到独立合并集（去重不得跨输入串味）。
+func TestSSA8706_identicalRefColumnsShareExpansion(t *testing.T) {
+	_, database := newClusterTestService(t)
+	res, err := database.Exec(`INSERT INTO security_ip_lists (name, category, entries, system, created_at, updated_at)
+		VALUES ('共享引用名单', '常规', '[{"value":"203.0.113.0/24"}]', 0, datetime('now'), datetime('now'))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listID, _ := res.LastInsertId()
+	refs := fmt.Sprintf("[%d]", listID)
+
+	shared := []*models.SecurityPolicy{
+		{ID: 8721, Name: "共享 A", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`, IPACLListRefs: refs},
+		{ID: 8722, Name: "共享 B", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `[]`, IPACLListRefs: refs},
+		{ID: 8723, Name: "独有 inline", IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["198.51.100.0/24"]`, IPACLListRefs: refs},
+	}
+	resolvePolicyIPListRefs(shared, nil)
+
+	for _, p := range shared[:2] {
+		if got := p.MergedACLList; len(got) != 1 || got[0] != "203.0.113.0/24" {
+			t.Fatalf("策略 %q 共享展开=%v, want 203.0.113.0/24", p.Name, got)
+		}
+	}
+	if got := shared[2].MergedACLList; len(got) != 2 || got[0] != "198.51.100.0/24" || got[1] != "203.0.113.0/24" {
+		t.Fatalf("不同 inline 的策略不得复用他人展开: %v", got)
 	}
 }

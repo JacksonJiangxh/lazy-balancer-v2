@@ -5,8 +5,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/taskengine"
@@ -526,5 +528,113 @@ func TestCRSUpdateRun_usesTaskRunStartedAt(t *testing.T) {
 	}
 	if startedAt != wantUTC {
 		t.Fatalf("started_at=%q, want task_runs 同源 UTC %q", startedAt, wantUTC)
+	}
+}
+
+// SS87-历史问题：StartUpdate 返回前必须已登记取消函数——返回后立刻 CancelRunning
+// （任务引擎 CancelHook／前端连点／自动化脚本）必须命中，不得静默返回 false。
+func TestStartUpdate_registersCancelBeforeReturn(t *testing.T) {
+	// Given 单 P 调度：调用方在 StartUpdate 返回后立刻取消时，旧实现因 runCancel
+	// 由 run goroutine 稍后登记而存在 nil 窗口（取消静默失效）。
+	oldProcs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(oldProcs) })
+
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.14.0", true)
+	m.fetchLatestTag = func(ctx context.Context) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+
+	// When
+	done, err := m.StartUpdate("manual", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.CancelRunning() {
+		// 旧实现：run goroutine 尚未登记取消函数。让 goroutine 推进后自行取消，
+		// 避免测试挂起（失败断言即 RED 证据）。
+		for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+			if m.CancelRunning() {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		<-done
+		t.Fatal("StartUpdate 返回后立刻 CancelRunning=false（取消函数尚未登记，取消静默失效）")
+	}
+
+	// Then 运行以 cancelled 终态结束
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("取消后运行未退出")
+	}
+	if got := m.StatusSnapshot().Status; got != string(CRSStatusCancelled) {
+		t.Fatalf("终态=%q, want cancelled", got)
+	}
+}
+
+// SS87-历史问题 / 历史问题：版本读取区分「行缺失→bundled」与「读失败→错误」。
+func TestReadCurrentCRSVersion_rowMissingFallsBackToBundled(t *testing.T) {
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec("DELETE FROM security_crs_version"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readCurrentCRSVersion()
+	if err != nil {
+		t.Fatalf("行缺失不应报错: %v", err)
+	}
+	if got != CRSBundledVersion {
+		t.Fatalf("行缺失回落=%q, want bundled %q", got, CRSBundledVersion)
+	}
+}
+
+func TestReadCurrentCRSVersion_readErrorSurfaces(t *testing.T) {
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec("DROP TABLE security_crs_version"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readCurrentCRSVersion(); err == nil {
+		t.Fatal("读失败的版本读取必须返回错误（不得回落 bundled 参与更新短路）")
+	}
+}
+
+// SS87-历史问题：读版本行失败时更新必须 fail-visible——旧实现以 bundled 参与
+// 「已是最新」短路，远端 tag 恰等于 bundled 时更新被静默跳过。
+func TestCRSUpdateRun_versionReadFailureIsVisible(t *testing.T) {
+	// Given 版本行不可读（表缺失）+ 远端 tag 恰等于镜像捆绑版本
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.14.0", true)
+	if _, err := db.DB.Exec("DROP TABLE security_crs_version"); err != nil {
+		t.Fatal(err)
+	}
+	m.fetchLatestTag = func(context.Context) (string, error) { return CRSBundledVersion, nil }
+	m.downloadTarball = func(context.Context, string, string, downloadProgressFunc) error {
+		return errors.New("下载不应发生")
+	}
+
+	// When
+	done, err := m.StartUpdate("manual", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("读版本失败后运行未退出")
+	}
+
+	// Then 显式失败（fail-visible）而非「已是最新」
+	snap := m.StatusSnapshot()
+	if snap.Status != string(CRSStatusFailed) {
+		t.Fatalf("终态=%q, want failed（读失败不得静默跳过）", snap.Status)
+	}
+	if !strings.Contains(snap.Message, "读取当前 CRS 版本失败") {
+		t.Fatalf("message=%q, want 版本读取失败根因", snap.Message)
 	}
 }

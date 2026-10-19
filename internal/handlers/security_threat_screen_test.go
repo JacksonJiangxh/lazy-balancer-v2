@@ -1541,7 +1541,10 @@ func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
 	// Given: 30 小时前与 2 小时前各 1 条事件
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	// 固定时间轴：否则 now:=time.Now() 与下方 today:=time.Now() 跨午夜时
+	// 日桶标签会整体错位一天（本地 00:xx 窗口可稳定复现）。
 	now := time.Now()
+	installThreatClock(t, now)
 	// 73h 前原始事件保证原始表覆盖到 72h 窗口起点之前（否则按 历史问题-01
 	// 口径应披露“窗口前段不可重建”，不能断言回填完成）。
 	seedThreatScreenEvent(t, now.UTC().Add(-73*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "203.0.113.6", "942100", "SQL Injection", "blocked")
@@ -1570,11 +1573,12 @@ func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
 		t.Fatalf("hourly_hist=%d 槽, want 3（ceil(72/24) 日桶）", len(hist))
 	}
 	loc := services.CurrentLocation()
-	today := time.Now().In(loc)
+	_, offset := now.In(loc).Zone()
+	bucketStarts, _ := threatHourlyBuckets(72, now, offset)
 	for i, slot := range hist {
-		want := today.AddDate(0, 0, -(len(hist) - 1 - i))
-		if slot.Name != want.Format("01-02") {
-			t.Fatalf("hist[%d].Name=%q, want %s（末槽为今天，逐日回溯）", i, slot.Name, want.Format("01-02"))
+		want := bucketStarts[i].AddDate(0, 0, 1).Format("01-02")
+		if slot.Name != want {
+			t.Fatalf("hist[%d].Name=%q, want %s（滚动 24h 桶的结束日）", i, slot.Name, want)
 		}
 	}
 	byName := map[string]int{}
@@ -1586,8 +1590,21 @@ func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
 	if total != 2 {
 		t.Fatalf("hourly 总计=%d, want 2", total)
 	}
-	day30 := now.Add(-30 * time.Hour).In(loc).Format("01-02")
-	day2 := now.Add(-2 * time.Hour).In(loc).Format("01-02")
+	// 72h 日桶是滚动 24h 窗口（起点 now-72h），不是自然日；按事件在窗口内
+	// 的偏移映射到桶，避免跨午夜/自然日假设造成的假失败。
+	bucketFor := func(at time.Time) string {
+		shifted := at.UTC().Add(time.Duration(offset) * time.Second)
+		idx := int(shifted.Sub(bucketStarts[0]) / (24 * time.Hour))
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(hist) {
+			idx = len(hist) - 1
+		}
+		return hist[idx].Name
+	}
+	day30 := bucketFor(now.Add(-30 * time.Hour))
+	day2 := bucketFor(now.Add(-2 * time.Hour))
 	if byName[day30] != 1 || byName[day2] != 1 {
 		t.Fatalf("落桶=%v, want %s=1 且 %s=1", byName, day30, day2)
 	}

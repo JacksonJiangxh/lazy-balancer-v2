@@ -286,14 +286,8 @@ onMounted(async () => {
       }
     }
   } catch { /* 隐私模式 */ }
-  // 历史问题:回调失败 302 回前端,错误经 sessionStorage 一次性带到这里展示
-  try {
-    const oidcErr = sessionStorage.getItem('oidc_login_error')
-    if (oidcErr) {
-      sessionStorage.removeItem('oidc_login_error')
-      ElMessage.error(`OIDC 登录失败：${oidcErr}`)
-    }
-  } catch { /* 隐私模式 */ }
+  // 历史问题（历史问题）：回调失败不再经 sessionStorage 传递——App 在解析 hash 时
+  // 当场提示（已持有效会话、Login 不挂载的路径也能看到），此读取通道随之删除。
   try {
     const res = await request.get<{ data?: { enabled?: boolean; display_name?: string } }>('/auth/oidc/status', { silent: true })
     if (res.data?.enabled) {

@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/mcpserver"
 )
 
 func TestAPIKeyReadOnlyGuardBlocksWritesAndAllowsReadOnlyPOST(t *testing.T) {
@@ -102,9 +103,91 @@ func TestMCPEndpointAuthenticationGatesAndProtocol(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	// 136 = 全量工具数（v2.3.4 +5 任务监控工具：list/trigger/toggle/cancel/control；只读计数以 server_test 动态判定为准）
-	if len(payload.Result.Tools) != 136 {
-		t.Fatalf("tool count=%d, want 136", len(payload.Result.Tools))
+	// CI87-11：不钉工具总数——硬编码 136 在每次增删工具时都红，且不表达任何
+	// 可观察契约。改为断言 tools/list 与 ListToolSpecs 全量一致（无遗漏/无重复/
+	// 无多余），新增工具无需改测试。
+	specs := mcpserver.ListToolSpecs()
+	expected := make(map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		expected[spec.Name] = struct{}{}
+	}
+	if len(payload.Result.Tools) != len(expected) {
+		t.Fatalf("tools/list count=%d, want %d (= ListToolSpecs)", len(payload.Result.Tools), len(expected))
+	}
+	seen := make(map[string]struct{}, len(payload.Result.Tools))
+	for _, raw := range payload.Result.Tools {
+		var tool struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(raw, &tool); err != nil {
+			t.Fatalf("tool entry unmarshal: %v", err)
+		}
+		if _, ok := expected[tool.Name]; !ok {
+			t.Fatalf("tools/list exposes unregistered tool %q", tool.Name)
+		}
+		if _, duplicate := seen[tool.Name]; duplicate {
+			t.Fatalf("tools/list repeats tool %q", tool.Name)
+		}
+		seen[tool.Name] = struct{}{}
+	}
+}
+
+// CI87-06 装配钉：SetupRouter 把 admin 组路由集合注入 MCP 可见性后，非管理员
+// 属主的 MCP Key 的 tools/list 不再暴露恒 403 的管理工具（真实守卫链 + 真实
+// 注入），business 组工具照常可见。
+func TestMCPToolsListForNonAdminKeyHidesAdminGroupTools(t *testing.T) {
+	router := newMiddlewareTestRouter(t)
+	key := "lb_sk_mcp-nonadmin"
+	hash := sha256.Sum256([]byte(key))
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (31,'mcp-nonadmin','x','user',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO api_keys (name,key_hash,key_prefix,created_by,is_enabled,mcp_enabled,mcp_ip_whitelist)
+		VALUES ('mcp-nonadmin',?,?,31,1,1,'')`, hex.EncodeToString(hash[:]), key[:12]); err != nil {
+		t.Fatal(err)
+	}
+	request := func(body []byte) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/mcp", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("X-API-Key", key)
+		router.ServeHTTP(recorder, req)
+		return recorder
+	}
+	initialize := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`)
+	if response := request(initialize); response.Code != http.StatusOK {
+		t.Fatalf("initialize status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	// When
+	response := request([]byte(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`))
+
+	// Then
+	if response.Code != http.StatusOK {
+		t.Fatalf("tools/list status=%d body=%q", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Result struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	visible := make(map[string]bool, len(payload.Result.Tools))
+	for _, tool := range payload.Result.Tools {
+		visible[tool.Name] = true
+	}
+	for _, hidden := range []string{"get_caddy_config", "preview_config", "validate_import", "update_user", "create_user"} {
+		if visible[hidden] {
+			t.Errorf("non-admin tools/list exposes admin-only tool %s", hidden)
+		}
+	}
+	if !visible["list_rules"] || !visible["create_rule"] {
+		t.Fatalf("non-admin tools/list must keep business-group tools: %v", visible)
 	}
 }
 

@@ -1,0 +1,72 @@
+// 威胁大屏地球引擎契约守卫（WT87-02/03/04/05/10/11）。
+//
+// threatGlobe 依赖 globe.gl/three 的 WebGL 实例与 DOM，node:test 无法装载；
+// 其可确定性验证的数学已抽到 threatProjection（sphereSurfacePoint 往返见
+// threatScene.spec ⑥/⑥b）。此处沿用 threatScene.spec ⑦ 的源码契约断言先例，
+// 钉住「引擎接线」本身——这些修复全是单行接线，缺一行不会有编译错误，只能靠
+// 契约断言守住。
+//
+// 运行：cd web && npm test
+
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const HERE = dirname(fileURLToPath(import.meta.url))
+const ROOT = join(HERE, '..')
+const globeSrc = readFileSync(join(ROOT, 'src/utils/threatGlobe.ts'), 'utf8')
+
+/** 截取成员体：对象方法（4 空格缩进）或闭包内函数（2 空格缩进）。 */
+function member(src: string, marker: string): string {
+  const start = src.indexOf(marker)
+  assert.notEqual(start, -1, `缺少成员 ${marker}`)
+  const objEnd = src.indexOf('\n    }', start)
+  const fnEnd = src.indexOf('\n  }', start)
+  const end = objEnd >= 0 && (fnEnd < 0 || objEnd < fnEnd) ? objEnd : fnEnd
+  assert.notEqual(end, -1, `无法截取成员体 ${marker}`)
+  return src.slice(start, end)
+}
+
+test('WT87-03 复位/返回必须作废在途省界加载（与地图引擎同源）', () => {
+  for (const name of ['zoomOut', 'resetView']) {
+    const body = member(globeSrc, `${name}(): void {`)
+    const seqIdx = body.indexOf('drillSeq += 1')
+    const viewIdx = body.indexOf('enterWorldView(')
+    assert.ok(seqIdx >= 0, `${name} 必须递增 drillSeq`)
+    assert.ok(viewIdx > seqIdx, `${name} 必须先作废在途加载再返回世界视角`)
+  }
+  // 续体判定必须走共享纯函数（地图/地球同一口径）
+  assert.match(globeSrc, /drillCommitAllowed\(seq, drillSeq, disposed\)/)
+})
+
+test('WT87-04 暂停态相机变更必须直接落点并补绘一帧', () => {
+  assert.match(globeSrc, /paused \? 0 : 700/, '下钻 pointOfView 必须按暂停态取 0 时长')
+  const enter = member(globeSrc, 'function enterWorldView(')
+  assert.match(enter, /paused \? 0 : duration/, '返回世界视角必须按暂停态取 0 时长')
+  assert.match(enter, /if \(paused\) renderOnce\(\)/, '暂停态无自循环，必须手动补绘')
+  assert.match(globeSrc, /threeRenderer\.render\(scene, cam\)/, 'renderOnce 必须真正渲染一帧')
+})
+
+test('WT87-02/05 下钻衬底=普通多边形层，hover 他国提亮，且不再有 H3 死配置', () => {
+  assert.match(globeSrc, /globe\.polygonsData\(worldBackdropPolygons\(\)\.filter\(\(p\) => p\.key !== drilledName\)\)/)
+  assert.doesNotMatch(globeSrc, /\.hexPolygonsData\(|\.hexPolygonResolution\(|\.hexPolygonMargin\(|\.hexPolygonColor\(/,
+    'H3 六边形层从未有图元，死配置必须移除（避免再次误以为衬底走 hex）')
+  const hover = member(globeSrc, 'function setHexHover(')
+  assert.match(hover, /globe\.polygonCapColor\(backdropCapColor\)/, '下钻态 hover 他国必须重算衬底色')
+  assert.match(globeSrc, /DRILL_BACKDROP_HOVER/)
+})
+
+test('WT87-10 首帧双 RAF 无条件应用图层（两帧内下钻不得残留世界点阵）', () => {
+  assert.doesNotMatch(globeSrc, /if \(!drilledName\) applyLayer\(\)/)
+  const start = globeSrc.indexOf('两个 RAF')
+  const end = globeSrc.indexOf('let rafId = requestAnimationFrame(frame)')
+  assert.ok(start >= 0 && end > start, '双 RAF 首帧块缺失')
+  assert.match(globeSrc.slice(start, end), /^\s*applyLayer\(\)$/m, '双 RAF 回调必须无条件 applyLayer()')
+})
+
+test('WT87-11 海外下钻浮签显示「无省级统计」而不是 0', () => {
+  assert.match(globeSrc, /hasProvinceStats\(drilledName\)/)
+  assert.match(globeSrc, /无省级统计/)
+})

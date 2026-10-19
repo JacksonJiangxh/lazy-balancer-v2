@@ -14,9 +14,15 @@ import (
 )
 
 // GetRuleCertInfo returns parsed certificate information for a single rule.
+// SV历史问题：服务层读取故障必须回 500（fail-visible）；规则不存在/未启用 TLS
+// 保持 200 + data:null（既有契约，前端据此显示「无证书信息」）。
 func (h *Handlers) GetRuleCertInfo(c *gin.Context) {
 	caddyID := c.Param("caddy_id")
-	info := services.GetRuleCertInfo(caddyID)
+	info, err := services.GetRuleCertInfo(caddyID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则证书信息失败"})
+		return
+	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: info})
 }
 
@@ -103,6 +109,10 @@ func (h *Handlers) GetRulesCertInfo(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "批量读取签发证书失败"})
 			return
 		}
+		// SV历史问题/09：装载阶段预解析一次，选择与过期回退共用同一 Leaf。
+		if candidate.Status != "disabled" {
+			candidate.Leaf = services.ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
+		}
 		candidates[id] = append(candidates[id], candidate)
 	}
 	if err := jobRows.Err(); err != nil {
@@ -124,7 +134,7 @@ func (h *Handlers) GetRulesCertInfo(c *gin.Context) {
 			// CERT42-1:CERT40-1 同型回退——候选全过期时按 expired 呈现,
 			// 与单规则端点同口径(此前批量恒报「尚未签发或不存在」)。
 			if !selected {
-				if info := services.ExpiredACMECertInfoFallback(candidates[id], id, rule.domains); info != nil {
+				if info := services.ExpiredACMECertInfoFallback(candidates[id], id, rule.domains, rule.expiryDays, now); info != nil {
 					result[id] = info
 					continue
 				}

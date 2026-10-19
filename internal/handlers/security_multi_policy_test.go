@@ -1052,3 +1052,35 @@ func TestListSecurityPolicies_summaryIncludesCRSRuleGroups(t *testing.T) {
 		t.Fatalf("crs_rule_groups=%s, want %s", resp.Data[0].CRSRuleGroups, `["20","42"]`)
 	}
 }
+
+// HC-07（历史）：审计详情必须记录**去重后**的绑定集合。提交
+// [1,1,2] 时库内终态为 [1,2]，此前审计串用原始 req.PolicyIDs 生成
+// 「[1,1,2]」——取证时无法从审计还原最终绑定集。修复=归一次、写入与审计共用。
+func TestSetRuleSecurityPolicies_auditUsesDeduplicatedSet(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newMultiPolicyRouter(t)
+	seedHTTPRule(t, "lb_hc07")
+	first := createMultiPolicy(t, router, "hc07-first")
+	second := createMultiPolicy(t, router, "hc07-second")
+
+	recorder := putMultiJSON(t, router, "/security/rules/lb_hc07/policies", map[string]any{
+		"policy_ids": []int{first, first, second},
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_hc07"), []int{first, second})
+
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT COALESCE(detail,'') FROM audit_log WHERE action='更新' AND resource='安全策略' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatal(err)
+	}
+	dup := fmt.Sprintf("[%d,%d,%d]", first, first, second)
+	want := fmt.Sprintf("[%d,%d]", first, second)
+	if strings.Contains(detail, dup) {
+		t.Fatalf("audit detail=%q 仍含原始重复集合 %s（应记录去重后终态）", detail, dup)
+	}
+	if !strings.Contains(detail, want) {
+		t.Fatalf("audit detail=%q, want containing %s", detail, want)
+	}
+}

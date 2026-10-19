@@ -131,6 +131,30 @@ func TestRDBStrictRender_threatFilePresentRendersNormally(t *testing.T) {
 	if mainRoute == nil && len(routes) == 0 {
 		t.Fatal("路由必须正常生成")
 	}
+	// S历史问题（历史）：原断言只证明「不是空路由」，未钉住文件在场时
+	// 的实际契约——引用策略必须以 @ipListFast 文件投影参与预检，且投影内容=
+	// .iplist 条目聚合（ACL 保护面不得静默收窄）。
+	wafs := wafHandlers(t, mainRoute)
+	var precheck string
+	for _, waf := range wafs {
+		directives, _ := waf["directives"].(string)
+		if strings.Contains(directives, `"id:2,phase:1,deny`) {
+			precheck = directives
+			break
+		}
+	}
+	if precheck == "" {
+		t.Fatalf("引用策略必须发射 deny ACL 预检指令（id:2）: %#v", wafs)
+	}
+	if !strings.Contains(precheck, "@ipListFast ") {
+		t.Fatalf("deny ACL 必须经 @ipListFast 文件投影:\n%s", precheck)
+	}
+	projection := readRenderedIPList(t, precheck, "u-deny")
+	for _, want := range []string{"192.0.2.0/24", "198.51.100.7/32"} {
+		if !strings.Contains(projection, want) {
+			t.Fatalf("u-deny 投影缺 %s（.iplist 条目必须完整进入 ACL 匹配集）: %q", want, projection)
+		}
+	}
 }
 
 // 从节点形状（RDB）：.iplist 文本缺失但 .fast 在场（waf_files 通道同步产物）

@@ -268,7 +268,8 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	// 原状（不在库值唯一真相治理批次内）。
 	// B1-09（历史）：threat_traffic_sample_n/security_events_retention_days/
 	// security_events_row_cap 三处兜底字面量与 DDL DEFAULT+迁移回填对齐
-	// （4/90/1000000；均 NOT NULL+回填，兜底实际不可达）。
+	//（历史问题 起改为绑定 db.Default* 常量，含 threat_screen_mode；均 NOT NULL+
+	// 回填，兜底实际不可达）。
 	err := db.DB.QueryRow(`
 		SELECT id, caddy_config, dns_provider,
 		       COALESCE(acme_email,'') as acme_email, COALESCE(cert_expiry_days,?) as cert_expiry_days,
@@ -311,18 +312,21 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	       COALESCE(trusted_proxy_strict,1) as trusted_proxy_strict,
 	       COALESCE(server_map_lat,0) as server_map_lat,
 	       COALESCE(server_map_lon,0) as server_map_lon,
-	       COALESCE(threat_screen_mode,'map') as threat_screen_mode,
-	       COALESCE(threat_traffic_sample_n,-1) as threat_traffic_sample_n,
-	       COALESCE(security_events_retention_days,90) as security_events_retention_days,
-	       COALESCE(security_events_row_cap,1000000) as security_events_row_cap,
+	       COALESCE(threat_screen_mode,?) as threat_screen_mode,
+	       COALESCE(threat_traffic_sample_n,?) as threat_traffic_sample_n,
+	       COALESCE(security_events_retention_days,?) as security_events_retention_days,
+	       COALESCE(security_events_row_cap,?) as security_events_row_cap,
 	       COALESCE(is_master,1) as is_master, COALESCE(master_url, '') as master_url, sync_interval,
 	       last_sync, updated_at
 		FROM global_config WHERE id = 1
 	`,
 		// G4：占位符序=cert_expiry_days/caddy_log_size_mb/request_body_max_size_mb/
-		// http_read_timeout/http_write_timeout/http_idle_timeout。
+		// http_read_timeout/http_write_timeout/http_idle_timeout；历史问题 追加
+		// 大屏/安全事件四列（threat_screen_mode/sample/retention/row_cap）。
 		db.DefaultCertExpiryDays, db.DefaultCaddyLogSizeMB, db.DefaultRequestBodyMaxSizeMB,
 		db.DefaultHTTPReadTimeout, db.DefaultHTTPWriteTimeout, db.DefaultHTTPIdleTimeout,
+		db.DefaultThreatScreenMode, db.DefaultThreatTrafficSampleN,
+		db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap,
 	).Scan(
 		&cfg.ID, &cfg.CaddyConfig, &cfg.DNSProvider,
 		&cfg.ACMEEmail, &cfg.CertExpiryDays, &cfg.CertRenewalDays, &cfg.CertRenewalAttempts, &cfg.DefaultCAProviderID,
@@ -1027,6 +1031,11 @@ var caddyLogPaths = map[string]string{
 	"proxy":   "/app/logs/caddy-proxy.log",
 }
 
+// caddyLogsStatHook 是测试专用钩子（生产恒 nil）：在 Stat 成功之后、打开并
+// 读取之前触发，用于模拟「Stat 与 Read 之间日志增长」的窗口（历史问题 回归测试：
+// 读取必须受 128KB 窗口上限约束，不得随增长无界放大）。
+var caddyLogsStatHook func()
+
 func (h *Handlers) GetCaddyLogs(c *gin.Context) {
 	logType := c.DefaultQuery("type", "runtime")
 	logPath, ok := caddyLogPaths[logType]
@@ -1051,6 +1060,11 @@ func (h *Handlers) GetCaddyLogs(c *gin.Context) {
 	if info.Size() > maxBytes {
 		startOffset = info.Size() - maxBytes
 	}
+	// 测试专用钩子（生产恒 nil）：在 Stat 与读取之间模拟日志增长，钉住
+	// 「读取严格受窗口上限约束」的不变量（历史问题 回归测试）。
+	if caddyLogsStatHook != nil {
+		caddyLogsStatHook()
+	}
 
 	f, err := os.Open(logPath)
 	if err != nil {
@@ -1064,7 +1078,10 @@ func (h *Handlers) GetCaddyLogs(c *gin.Context) {
 		return
 	}
 
-	data, err := io.ReadAll(f)
+	// 历史问题（历史 历史问题）：与 certjobs.readCertJobLogFile 同源形态——
+	// Stat 与 Read 之间日志增长（高流量 + 轮转滞后）时，裸 ReadAll 会突破
+	// 128KB 尾窗上限；LimitReader 把读取严格钉在窗口大小。
+	data, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取日志文件失败: " + err.Error()})
 		return

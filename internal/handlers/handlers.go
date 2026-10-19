@@ -735,6 +735,19 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		}
 	}
 
+	// H-B1-06（历史）：证书来源白名单与规则级请求体上限收进共享保存门——
+	// 四条调用路径（Create/Update/Duplicate/未来写入口）不再靠调用方自觉。
+	// 此前 tls_source 白名单在 Create/Update/存量启用门各写一遍，复制路径靠
+	// 「副本默认禁用 + 启用侧 stored 门」兜底（历史问题 在导入侧实证的漂移形态：
+	// enable_tls=1 + tls_source 非白名单值 → 渲染 availableCerts 不认 → TLS
+	// 端口明文服务）；request_body_max_size_mb 同样在三处各调一次。
+	if data.EnableTLS && data.TLSSource != "manual" && data.TLSSource != "acme_dns" {
+		return fmt.Errorf("启用 TLS 时必须选择证书来源（manual 或 acme_dns）")
+	}
+	if err := validateRuleRequestBodyMaxSizeMB(data.RequestBodyMaxSizeMB); err != nil {
+		return err
+	}
+
 	if data.EnableTLS && data.TLSSource == "acme_dns" {
 		// 历史问题 历史问题/历史问题（写侧）→ 历史问题 发现4 共享门：0 值、悬挂 id 与引用已禁用
 		// （enabled=0）配置/提供商一律 400——与签发侧 certissuer.go 的
@@ -1137,8 +1150,13 @@ func validateSingleDnsAddress(server string) error {
 	if host == "localhost" {
 		return nil
 	}
-	if !strings.Contains(host, ".") {
-		return fmt.Errorf("DNS 服务器地址须为 IP 或完整域名")
+	// H-B1-07（历史）：host 部分复用 isValidHost 的标签字母表/首尾校验——
+	// 此前只判「不含控制字符 + 含点」，`a!b.example.com`、`x/y.example.com`
+	// 等畸形串通过字段门并落库；渲染侧把该串直接放进 resolver.addresses，
+	// Caddy 接受地址但不做可达性校验 → 动态上游解析静默失败（规则 502），
+	// 保存时零提示。isValidHost 保留了下划线放宽语义（Docker 服务名）。
+	if !strings.Contains(host, ".") || !isValidHost(host) {
+		return fmt.Errorf("DNS 服务器地址须为 IP 或完整域名: %s", server)
 	}
 	return nil
 }

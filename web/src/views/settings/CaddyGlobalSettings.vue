@@ -372,7 +372,8 @@ const openSaveListDialog = (): void => {
   saveListDialogVisible.value = true
 }
 const confirmSaveAsList = async (): Promise<void> => {
-  if (savingList.value) return
+  // WS-11：创建名单是写操作——弹框打开期间角色/节点模式变化时函数级拦截。
+  if (isReadOnly.value || savingList.value) return
   const name = saveListForm.value.name.trim()
   if (!name) { ElMessage.warning('请输入列表名称'); return }
   if (name.length > 50) { ElMessage.warning('列表名称不能超过 50 字符'); return }

@@ -2,8 +2,6 @@ package services
 
 import (
 	"fmt"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -35,18 +33,15 @@ func AppendThreatUpdateLog(level, stage, message string) {
 	taskengine.TeeTaskLog("threat", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
 }
 
-// 任务日志大小配置缓存（5 分钟 TTL；写入前滚动统一读取）。
-var (
-	certJobLogSizeCached     atomic.Int64
-	certJobLogSizeCachedAt   atomic.Int64
-	certJobLogSizeCacheTTLNs = int64(5 * time.Minute)
-	certJobLogSizeRefreshMu  sync.Mutex
-)
+// 任务日志大小配置缓存（V87-TO-06：缓存机制单源 dbValueCache——此前与审计
+// 侧各有一套实现，任务侧还把读库失败的回退值写进缓存）。TTL 5 分钟：设置保存
+// 经 InvalidateTaskLogSizeCache 立刻生效，TTL 只覆盖带外改库。
+var taskLogSizeCache = dbValueCache{ttl: 5 * time.Minute}
 
 // InvalidateTaskLogSizeCache 使任务日志大小配置缓存失效（历史问题）。
 // 设置保存成功后必须调用——否则改库后仍有最长 5 分钟（TTL）按旧阈值滚动。
 func InvalidateTaskLogSizeCache() {
-	certJobLogSizeCachedAt.Store(0)
+	taskLogSizeCache.invalidate()
 }
 
 func getTaskLogSizeBytes() int64 {
@@ -54,27 +49,16 @@ func getTaskLogSizeBytes() int64 {
 	if db.DB == nil {
 		return 10 * 1024 * 1024
 	}
-	now := time.Now().UnixNano()
-	cachedAt := certJobLogSizeCachedAt.Load()
-	if cachedAt != 0 && now-cachedAt < certJobLogSizeCacheTTLNs {
-		return certJobLogSizeCached.Load()
-	}
-	certJobLogSizeRefreshMu.Lock()
-	defer certJobLogSizeRefreshMu.Unlock()
-	// Double-check after acquiring lock to avoid thundering herd.
-	if cachedAt = certJobLogSizeCachedAt.Load(); cachedAt != 0 && time.Now().UnixNano()-cachedAt < certJobLogSizeCacheTTLNs {
-		return certJobLogSizeCached.Load()
-	}
-	var sizeMB int
-	if err := db.DB.QueryRow("SELECT COALESCE(task_log_size_mb, 10) FROM global_config WHERE id = 1").Scan(&sizeMB); err != nil {
-		Logf("warn", "读取任务日志大小配置失败,按 10MB 降级: %v", err)
-		sizeMB = 10
-	}
-	if sizeMB <= 0 {
-		sizeMB = 10
-	}
-	bytes := int64(sizeMB) * 1024 * 1024
-	certJobLogSizeCached.Store(bytes)
-	certJobLogSizeCachedAt.Store(now)
-	return bytes
+	return taskLogSizeCache.get(func() (int64, error) {
+		var sizeMB int
+		if err := db.DB.QueryRow("SELECT COALESCE(task_log_size_mb, 10) FROM global_config WHERE id = 1").Scan(&sizeMB); err != nil {
+			Logf("warn", "读取任务日志大小配置失败,按 10MB 降级: %v", err)
+			// 失败不缓存（V87-TO-06）：回退值只对本轮生效，下一轮重试。
+			return 0, err
+		}
+		if sizeMB <= 0 {
+			sizeMB = 10
+		}
+		return int64(sizeMB) * 1024 * 1024, nil
+	}, 10*1024*1024)
 }

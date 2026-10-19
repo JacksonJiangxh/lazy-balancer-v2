@@ -171,7 +171,7 @@ func TestUpdateRule_name_only_change_passes_with_legacy_shadow_combo(t *testing.
 }
 
 // 历史问题 历史问题: 域名冲突检查须与遮蔽检查同样加变更门控——导入遗留的「一启用一禁用
-// 同域名」组合中，禁用方仅改名等无关更新不应被 400 卡死（ruleDomainConflict 只
+// 同域名」组合中，禁用方仅改名等无关更新不应被 400 卡死（enabledRuleDomainConflict 只
 // 统计 enabled=1 的规则）；域名/启用态真正变化时检查仍须生效。
 func TestUpdateRule_domain_conflict_check_gated_on_change(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)

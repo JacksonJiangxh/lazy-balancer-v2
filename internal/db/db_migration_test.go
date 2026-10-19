@@ -382,14 +382,30 @@ func TestRunMigrations_migratesLegacyHTTPSRulesToHTTPWithTLS(t *testing.T) {
 		t.Fatalf("certless rule protocol=%q enable_tls=%d tls_http_redirect=%d, want http/0/0", protocol, enableTLS, redirect)
 	}
 
-	// And 受影响规则逐条进入操作日志缓冲（待审计库就绪落库），重跑零命中
+	// And 受影响规则逐条进入操作日志缓冲（待审计库就绪落库），重跑零命中。
+	// 第三个条目是 历史问题 新增的 TCP 死字段清零聚合审计（本夹具的 tcp 行
+	// compress_types 默认 'gzip' 命中死值谓词，首轮被归一）。
 	entries := drainSystemAuditBuffer()
-	if len(entries) != 2 {
-		t.Fatalf("system audit entries=%d, want 2（重跑幂等）", len(entries))
+	if len(entries) != 3 {
+		t.Fatalf("system audit entries=%d, want 3（2 条 https 逐条 + 1 条 TCP 死字段聚合；重跑幂等）", len(entries))
 	}
+	details := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if entry.action != "启动迁移" || entry.resource != "系统配置" {
-			t.Fatalf("audit entry action=%q resource=%q, want 启动迁移/系统配置", entry.action, entry.resource)
+		if entry.action != "启动迁移" {
+			t.Fatalf("audit entry action=%q, want 启动迁移", entry.action)
+		}
+		details = append(details, entry.detail)
+	}
+	for _, want := range []string{"lb_https_tls", "lb_https_notls", "TCP 规则 HTTP 专属死字段已清零"} {
+		found := false
+		for _, detail := range details {
+			if strings.Contains(detail, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("缺少审计条目 %q: %v", want, details)
 		}
 	}
 
@@ -912,8 +928,20 @@ func TestMigrateCertJobsStatusConstraint_rebuilds_constraint_with_deprecated_sta
 	if err := database.QueryRow("SELECT status FROM cert_jobs WHERE rule_id='lb_old'").Scan(&status); err != nil {
 		t.Fatalf("read migrated certificate job status: %v", err)
 	}
-	if status != "queued" {
-		t.Fatalf("migrated deprecated status=%q, want queued", status)
+	// 历史问题（历史）：枚举外状态归一到终态 failed——'queued' 是活跃
+	// 起始态会被签发队列立即拾取，等于升级时静默发起一次签发/部署尝试。
+	if status != "failed" {
+		t.Fatalf("migrated deprecated status=%q, want failed", status)
+	}
+	// 历史问题：改写用户可见数据必须留痕（系统审计聚合一行）。
+	audited := false
+	for _, entry := range drainSystemAuditBuffer() {
+		if strings.Contains(entry.detail, "枚举外状态归一到 failed") {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Fatal("枚举外状态改写缺少系统审计记录")
 	}
 	if _, err := database.Exec("INSERT INTO cert_jobs (rule_id, domain, status) VALUES ('lb_rejected', 'rejected.example', 'deprecated')"); err == nil {
 		t.Fatal("deprecated status accepted after migration")
@@ -1629,8 +1657,18 @@ func TestInitialize_cleansOrphanedPathRules(t *testing.T) {
 	if _, err := DB.Exec(`INSERT INTO path_rules (rule_id,sort_order,match_type,path) VALUES ('lb_alive',1,'prefix','/api'), ('lb_ghost',1,'prefix','/x')`); err != nil {
 		t.Fatal(err)
 	}
+	drainSystemAuditBuffer()
 	if err := Initialize(dir); err != nil {
 		t.Fatalf("re-initialize database: %v", err)
+	}
+	// 历史问题：删除用户数据（孤儿 path_rules）必须留痕。完整 Initialize 会把
+	// 迁移期缓冲 flush 进审计库，故在 AuditDB 断言而非内存缓冲。
+	var audited int
+	if err := AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='启动迁移' AND detail LIKE '%孤儿 path_rules%'`).Scan(&audited); err != nil {
+		t.Fatalf("query audit log: %v", err)
+	}
+	if audited != 1 {
+		t.Fatalf("孤儿 path_rules 清理审计记录=%d, want 1", audited)
 	}
 	var orphan, alive int
 	_ = DB.QueryRow(`SELECT COUNT(*) FROM path_rules WHERE rule_id='lb_ghost'`).Scan(&orphan)
@@ -1826,6 +1864,7 @@ func TestSanitizeLegacyCustomRulePatterns_disablesDirtyRulesIdempotently(t *test
 	}
 
 	// When the migration runs twice (idempotency)
+	drainSystemAuditBuffer()
 	if err := sanitizeLegacyCustomRulePatterns(); err != nil {
 		t.Fatalf("sanitize: %v", err)
 	}
@@ -1869,6 +1908,12 @@ func TestSanitizeLegacyCustomRulePatterns_disablesDirtyRulesIdempotently(t *test
 	}
 	if embedded[1].Name != "内嵌干净" || !embedded[1].Enabled {
 		t.Fatalf("embedded clean entry = %+v, want enabled", embedded[1])
+	}
+
+	// And 历史问题：改写用户规则留痕（独立 2 条 + 内嵌 1 条 = 聚合审计一行）。
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 1 || entries[0].action != "启动迁移" || !strings.Contains(entries[0].detail, "已禁用 3 条") {
+		t.Fatalf("自定义规则清洗审计=%+v, want 一行「已禁用 3 条」", entries)
 	}
 }
 
@@ -2016,6 +2061,7 @@ func TestMigrateCanonicalDomains_normalizesAndRebuildsIndexWhenWorkNeeded(t *tes
 	}
 
 	// When
+	drainSystemAuditBuffer()
 	if err := migrateCanonicalDomains(); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -2027,6 +2073,11 @@ func TestMigrateCanonicalDomains_normalizesAndRebuildsIndexWhenWorkNeeded(t *tes
 	}
 	if domain != "example.com" {
 		t.Fatalf("domain=%q, want normalized example.com", domain)
+	}
+	// 历史问题：域名归一改写用户数据 → 聚合审计一行。
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 1 || !strings.Contains(entries[0].detail, "域名归一为规范形") {
+		t.Fatalf("域名归一审计=%+v, want 一行归一记录", entries)
 	}
 	var count int
 	if err := database.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_cert_jobs_rule_domain_unique'").Scan(&count); err != nil {
@@ -2049,6 +2100,7 @@ func TestMigrateCanonicalDomains_deduplicatesAndRebuildsIndexWhenDuplicatesExist
 	}
 
 	// When
+	drainSystemAuditBuffer()
 	if err := migrateCanonicalDomains(); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -2060,6 +2112,11 @@ func TestMigrateCanonicalDomains_deduplicatesAndRebuildsIndexWhenDuplicatesExist
 	}
 	if rows != 1 {
 		t.Fatalf("duplicate group rows=%d, want deduplicated to 1", rows)
+	}
+	// 历史问题：删除重复证书任务行（用户数据）→ 聚合审计一行。
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 1 || !strings.Contains(entries[0].detail, "重复行已去重") {
+		t.Fatalf("cert_jobs 去重审计=%+v, want 一行去重记录", entries)
 	}
 	var count int
 	if err := database.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_cert_jobs_rule_domain_unique'").Scan(&count); err != nil {
@@ -3114,14 +3171,29 @@ func TestRunMigrations_clearsTCPRuleStaleDNSServerFields(t *testing.T) {
 		}
 	}
 
-	// And 受影响规则逐条进入操作日志缓冲，重跑零命中（2 条而非 4 条=幂等）
+	// And 受影响规则逐条进入操作日志缓冲，重跑零命中（2 条逐条 DNS + 1 条
+	// 历史问题 新增的 TCP 死字段清零聚合审计=3 条；第二轮不再新增）。
 	entries := drainSystemAuditBuffer()
-	if len(entries) != 2 {
-		t.Fatalf("system audit entries=%d, want 2（重跑幂等）", len(entries))
+	if len(entries) != 3 {
+		t.Fatalf("system audit entries=%d, want 3（2 条 stale DNS 逐条 + 1 条 TCP 死字段聚合；重跑幂等）", len(entries))
 	}
+	details := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if entry.action != "启动迁移" || entry.resource != "系统配置" {
-			t.Fatalf("audit entry action=%q resource=%q, want 启动迁移/系统配置", entry.action, entry.resource)
+		if entry.action != "启动迁移" {
+			t.Fatalf("audit entry action=%q, want 启动迁移", entry.action)
+		}
+		details = append(details, entry.detail)
+	}
+	for _, want := range []string{"lb_tcp_dns_on", "lb_tcp_dns_addr", "TCP 规则 HTTP 专属死字段已清零"} {
+		found := false
+		for _, detail := range details {
+			if strings.Contains(detail, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("缺少审计条目 %q: %v", want, details)
 		}
 	}
 
@@ -3503,5 +3575,46 @@ func TestMigrateCrawlerSourcesOutOfThreat_preservesStateAndRemovesLegacyRows(t *
 	}
 	if crawlerRows != 1 || legacyRows != 0 {
 		t.Errorf("迁移行数错误: crawler=%d legacy=%d", crawlerRows, legacyRows)
+	}
+}
+
+// 启动迁移改写用户数据必须留痕：覆盖规则负载策略归一与上游权重无效值归一
+// 两条姊妹迁移（此前仅写进程 stdout）。
+func TestRunMigrations_recordsStrategyAndWeightNormalization(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config) VALUES (1,'{}');
+		INSERT INTO lb_rules (name,protocol,listen_port,strategy,caddy_id) VALUES ('legacy','http',8080,'round_robin','lb_audit');
+		INSERT INTO upstreams (rule_id,host,port,weight) VALUES ('lb_audit','127.0.0.1',8080,NULL), ('lb_audit','127.0.0.2',8080,0);`); err != nil {
+		t.Fatalf("seed legacy strategy/weights: %v", err)
+	}
+	drainSystemAuditBuffer()
+
+	if err := runMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 2 {
+		t.Fatalf("audit entries=%d, want 2: %+v", len(entries), entries)
+	}
+	wants := []string{"round_robin 归一为 weighted_round_robin：1 条", "上游权重无效值（NULL/<1）归 1：2 条"}
+	for _, want := range wants {
+		found := false
+		for _, entry := range entries {
+			if entry.action == "启动迁移" && strings.Contains(entry.detail, want) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("缺少审计 %q: %+v", want, entries)
+		}
+	}
+	if err := runMigrations(); err != nil {
+		t.Fatalf("rerun migrations: %v", err)
+	}
+	if entries := drainSystemAuditBuffer(); len(entries) != 0 {
+		t.Fatalf("idempotent rerun produced audits: %+v", entries)
 	}
 }

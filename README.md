@@ -57,8 +57,11 @@ docker run -d --name lazy-balancer \
 # Docker Compose（Linux；主节点为 host 网络）
 docker compose up -d
 
-# 从源码构建
+# 从源码构建（前端需 Node.js ≥ 22.18：`npm test` 用 node --test 直跑 .ts，
+# 依赖该版本起的默认 type stripping；见 web/package.json 的 engines 字段）
 cd web && npm install && npm run build && cd ..
+# VERSION=正式版本号（面板展示口径）；镜像 tag 可带 -beta 通道后缀——两者
+# 刻意不同，判定口径「tag 去掉通道后缀 == APP_VERSION」
 docker buildx build --platform linux/amd64,linux/arm64 \
   --build-arg VERSION=v2.3.8 \
   --provenance=false --sbom=false \

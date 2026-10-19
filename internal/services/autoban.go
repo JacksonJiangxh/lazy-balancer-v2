@@ -43,6 +43,10 @@ import (
 const (
 	// AutobanTaskID 任务 ID（taskengine 注册/任务监控/日志文件名共用）。
 	AutobanTaskID = "autoban"
+	// AutobanFeedTaskID 自动封禁计数的唯一喂入源（安全事件采集 daemon，
+	// 与 taskengine 注册 ID 同值——摄取批次提交后 autobanObserveBatch 喂入；
+	// 健康联动见 AutobanFeedHealth）。
+	AutobanFeedTaskID = "security-events-ingestion"
 	// AutobanPresetListName 预置名单行名（迁移种子同字面值，db_autoban_migration_test 锚定）。
 	AutobanPresetListName = "自动封禁名单"
 	// autobanPresetListDescription 预置行描述（db 播种文案同字面值；描述禁改，
@@ -297,6 +301,54 @@ var autobanSuggestions []AutobanSuggestion
 var autobanReloadPending bool
 var autobanLastReload time.Time
 var autobanCapWarned bool
+
+// autobanFeedDegradedWarned 上一轮是否已就「喂入源停摆」告警（转换沿单次留痕，
+// 防 60s 周期刷屏；恢复时记一次恢复行）。
+var autobanFeedDegradedWarned bool
+
+// AutobanFeedHealth 报告自动封禁数据源（安全事件采集 daemon）的健康状态
+// （历史问题-02，历史）。计数器唯一喂入点是摄取批次提交后的
+// autobanObserveBatch：喂入源停摆时计数恒 0，而 RunAutobanCycle 只校验自身
+// 角色/启用/配置，仍以 success 记轮并输出「计数 0 IP」——自动封禁静默失效且
+// 任务监控显示运行中。
+//
+// 判据（持久停摆才降级）：LoopOn=false 是用户显式停止与「异常自愈预算用尽后
+// 停环」的共同终态（引擎 restartExhausted 同时置 LoopOn=false）；瞬时态
+// （LoopOn=true 而 Run 正处于 1s/5s/30s 重拉退避）不报——自愈通道仍在。
+// 引擎未装配/任务未注册=不判定（测试与装配早期，避免误报）。
+func AutobanFeedHealth() (degraded bool, reason string) {
+	te := TaskEngine()
+	if te == nil {
+		return false, ""
+	}
+	m, ok := te.Lookup(AutobanFeedTaskID)
+	if !ok {
+		return false, ""
+	}
+	switch {
+	case m.RestartExhausted:
+		return true, "安全事件采集任务异常自愈预算已用尽并停止调度，自动封禁计数不再更新"
+	case !m.LoopOn:
+		return true, "安全事件采集任务调度已停止，自动封禁计数不再更新"
+	}
+	return false, ""
+}
+
+// autobanReportFeedHealth 喂入源健康的状态变化留痕（RunAutobanCycle 每轮调用）：
+// 降级沿 Warn 一次、恢复沿 Info 一次。不自动拉起用户显式停止的任务（尊重调度
+// 语义，只做可见性——见 AutobanFeedHealth）。
+func autobanReportFeedHealth(degraded bool, reason string) {
+	autobanMu.Lock()
+	prev := autobanFeedDegradedWarned
+	autobanFeedDegradedWarned = degraded
+	autobanMu.Unlock()
+	switch {
+	case degraded && !prev:
+		TaskLogfWarn(AutobanTaskID, "feed", "数据源异常：%s", reason)
+	case !degraded && prev:
+		TaskLogf(AutobanTaskID, "feed", "数据源已恢复：安全事件采集任务在调度中，自动封禁计数恢复更新")
+	}
+}
 
 // ResetAutobanCounters 清空计数器（口径/窗口变更/测试用）：计数桶+上一轮观察
 // 建议一并清空——建议是同一窗口口径下的观察输出，口径变更/名单全量替换后旧
@@ -916,9 +968,12 @@ func autobanForceFlushPendingReload() {
 
 // AutobanDisableFlush 禁用路径收尾（AU-8/D5，PUT 保存 enabled=false 后、
 // StopLoop 前调用）：①到期自动条目清理一次（禁用后无循环清理点——最后一批
-// 已到期条目立即解封并留「自动解封」审计）；②暂存重载强制收敛一次（绕过节流
-// ——禁用前节流暂存的名单变化与本次清理变化必须落盘生效）。重载失败按 D4
-// 留痕+保持暂存（重新启用后下一轮 flush 重试）。
+// 已到期条目立即解封并留「自动解封」审计）；②已到期条目的计数桶同步清空
+// （SSA-87-02：到期自动解封与手动解封同语义，历史问题——否则
+// 窗口内重新启用且零新流量时，旧计数仍 ≥ 阈值会立即重封刚解封的 IP）；
+// ③暂存重载强制收敛一次（绕过节流——禁用前节流暂存的名单变化与本次清理
+// 变化必须落盘生效）。重载失败按 D4 留痕+保持暂存（重新启用后下一轮 flush
+// 重试）。
 func AutobanDisableFlush() {
 	cfg := GetAutobanConfig()
 	CaddyOpLock.Lock()
@@ -927,9 +982,13 @@ func AutobanDisableFlush() {
 		msg := fmt.Sprintf("禁用收尾到期条目清理失败: %v", err)
 		Logf("error", "自动封禁%s", msg)
 		RecordAuditLog("system", "写入失败", "自动封禁", FormatAuditDetail(msg, AuditResultPart("failed")), "")
-	} else if out.Changed {
-		autobanAuditExpiredUnban(out.Expired)
-		autobanConvergeLocked("自动封禁禁用收尾", out.ListID)
+	} else {
+		// SSA-87-02：与 Run 轮（历史问题）同口径——到期解封必须同步丢弃计数桶。
+		AutobanForgetIPs(out.Expired)
+		if out.Changed {
+			autobanAuditExpiredUnban(out.Expired)
+			autobanConvergeLocked("自动封禁禁用收尾", out.ListID)
+		}
 	}
 	CaddyOpLock.Unlock()
 	autobanForceFlushPendingReload()
@@ -994,6 +1053,18 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 	window := time.Duration(cfg.WindowMinutes) * time.Minute
 	autobanFlushPendingReload()
 
+	// 历史问题-02（历史）：喂入源健康联动。计数唯一喂入点是被停掉的
+	// 安全事件采集时，本任务仍会每轮 success 记「计数 0 IP」——自动封禁静默
+	// 失效。此处只做可见性：状态变化沿 Warn/Info 各一次 + 每轮摘要追加停摆
+	// 注记（+ /security/autoban/status 的 feed_degraded/reason）。不自动拉起
+	// 用户显式停止的任务（尊重调度语义）。
+	feedDegraded, feedReason := AutobanFeedHealth()
+	autobanReportFeedHealth(feedDegraded, feedReason)
+	feedNote := ""
+	if feedDegraded {
+		feedNote = "；数据源停摆：" + feedReason
+	}
+
 	if cfg.DryRun {
 		// 观察模式不写名单，无 TOCTOU 面——候选评估无需临界区。展示/建议
 		// 口径在此截断（历史问题：评估层不截断，正式 merge 消费全量）。
@@ -1002,8 +1073,8 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 			candidates = candidates[:autobanSuggestionCap]
 		}
 		autobanSetSuggestions(candidates)
-		TaskLogf(AutobanTaskID, "cycle", "观察模式：计数 %d IP / 活跃 %d 个 IP / 达阈值 %d（阈值 %d 次/%d 分钟，口径 %s）",
-			autobanTrackedCount(), autobanReachedCount(), len(candidates), cfg.Threshold, cfg.WindowMinutes, autobanScopeLabel(cfg.Scope))
+		TaskLogf(AutobanTaskID, "cycle", "观察模式：计数 %d IP / 活跃 %d 个 IP / 达阈值 %d（阈值 %d 次/%d 分钟，口径 %s）%s",
+			autobanTrackedCount(), autobanReachedCount(), len(candidates), cfg.Threshold, cfg.WindowMinutes, autobanScopeLabel(cfg.Scope), feedNote)
 		return nil
 	}
 
@@ -1061,8 +1132,8 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 				fmt.Sprintf("自动封禁容量收敛：挤出 %d、丢弃 %d（上限 %d）", out.Evicted, out.DroppedNew, AutobanListEntryCap), "")
 		}
 	}
-	TaskLogf(AutobanTaskID, "cycle", "本轮：计数 %d IP / 活跃 %d 个 IP / 候选 %d / 新封 %d / 到期解封 %d / 名单 %d 条%s",
-		autobanTrackedCount(), autobanReachedCount(), len(candidates), len(out.Banned), len(out.Expired), out.Total, reloadNote(out.Changed, reloadState))
+	TaskLogf(AutobanTaskID, "cycle", "本轮：计数 %d IP / 活跃 %d 个 IP / 候选 %d / 新封 %d / 到期解封 %d / 名单 %d 条%s%s",
+		autobanTrackedCount(), autobanReachedCount(), len(candidates), len(out.Banned), len(out.Expired), out.Total, reloadNote(out.Changed, reloadState), feedNote)
 	return nil
 }
 

@@ -233,8 +233,16 @@ func trustedProxyStoredRefEntriesWithSource(source trustedProxyBackupSource) (in
 	total := 0
 	for _, row := range resolved {
 		var entries []models.IPListEntry
-		if row.entries != "" && json.Unmarshal([]byte(row.entries), &entries) == nil {
-			total += len(entries)
+		if row.entries == "" || json.Unmarshal([]byte(row.entries), &entries) != nil {
+			continue
+		}
+		// 历史问题（历史 历史问题）：与写入侧逐条校验/渲染层同口径——空 value 条目
+		// 展开时被跳过，计数不得按原始 len 累加（否则实际展开 ≤2000 的合法
+		// 载荷会被总量门 400 拒绝）。
+		for _, entry := range entries {
+			if strings.TrimSpace(entry.Value) != "" {
+				total++
+			}
 		}
 	}
 	return total, nil
@@ -314,8 +322,10 @@ func normalizeTrustedProxyRangeRefsWithSource(raw string, source trustedProxyBac
 			if prefix.Bits() < services.TrustedProxyMinPrefixBits(prefix.Addr()) {
 				return "", 0, fmt.Errorf("引用的地址列表「%s」含过宽网段 %s：最小允许 /8（IPv4）与 /29（IPv6），请收窄到该 CDN 的回源网段", row.name, prefix.String())
 			}
+			// 历史问题（历史 历史问题）：计数口径=通过校验的条数（空 value 在上方
+			// continue 已跳过）——与渲染层实际注入的集合一致。
+			total++
 		}
-		total += len(entries)
 	}
 	out, err := json.Marshal(unique)
 	if err != nil {

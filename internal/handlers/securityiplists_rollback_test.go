@@ -378,12 +378,13 @@ func TestImportConfigBackup_cliRejectionRestoresCommittedProjection(t *testing.T
 	f.h.caddyService.SetCLIValidatorForTest(func([]byte) error {
 		return fmt.Errorf("cli: r77 rejected")
 	})
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules":                 {{"caddy_id": "lb-hot", "name": "hot", "protocol": "http", "domain": "hot.example.test", "listen_port": 8080, "enabled": 1}},
 		"upstreams":                {{"rule_id": "lb-hot", "host": "127.0.0.1", "port": 9000, "enabled": 1}},
 		"security_policies":        {{"id": policyID, "name": "历史问题 策略", "mode": "off", "enabled": 1, "policy_type": "stage1", "ip_acl_enabled": 1, "ip_acl_mode": "deny", "ip_acl_list": `["198.51.100.7"]`, "ip_acl_list_refs": "[]"}},
 		"security_policy_bindings": {{"rule_caddy_id": "lb-hot", "policy_id": policyID}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
 	req.Header.Set("Content-Type", "application/json")

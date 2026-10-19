@@ -521,3 +521,51 @@ func TestGetRuleStageStats_unknownRuleReturns404(t *testing.T) {
 		}
 	})
 }
+
+// HC-01（历史 历史问题）：批量绑定端点的 rule_ids 数量上限。同族端点均有
+// 上限（bindings/bulk=100、batch-block-pages=500），本端点此前无界——超大
+// rule_ids 会在 BEGIN IMMEDIATE + caddyOpMu 内逐规则查询/写入，阻塞全部主库
+// 配置写。判据按 normalizeRuleIDs 归一后集合计数（空白/重复 id 不占额度）。
+func TestBatchBindSecurityPolicies_ruleIDLimit(t *testing.T) {
+	handler, loadCount := newStageBatchTestHandlers(t)
+	seedStageBatchRules(t)
+	router := stageBatchRouter(handler)
+
+	ruleIDs := func(n int) []string {
+		ids := make([]string, n)
+		for i := range ids {
+			ids[i] = fmt.Sprintf("lb_limit_%03d", i)
+		}
+		return ids
+	}
+	body := func(ids []string) string {
+		raw, err := json.Marshal(map[string]any{"rule_ids": ids, "policy_ids": []int{1}, "mode": "merge"})
+		if err != nil {
+			t.Fatalf("marshal body: %v", err)
+		}
+		return string(raw)
+	}
+
+	// 形状 1：归一后 101 条 → 400 整批拒绝，且不进入写路径（零 /load）
+	response := postStageJSON(t, router, "/security/policies/batch-bind", body(ruleIDs(101)))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("over-limit status=%d body=%s, want 400", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "100 条规则") {
+		t.Fatalf("over-limit body=%s, want limit message", response.Body.String())
+	}
+	if *loadCount != 0 {
+		t.Fatalf("rejected batch must not render caddy, got %d loads", *loadCount)
+	}
+
+	// 形状 2：原始 102 项（100 唯一 + 1 空白 + 1 重复）→ 归一后 100，边界通过
+	ids := ruleIDs(100)
+	ids = append(ids, "   ", ids[0])
+	response = postStageJSON(t, router, "/security/policies/batch-bind", body(ids))
+	if response.Code != http.StatusOK {
+		t.Fatalf("boundary status=%d body=%s, want 200（上限按归一后集合判定）", response.Code, response.Body.String())
+	}
+	if *loadCount != 1 {
+		t.Fatalf("boundary batch loads=%d, want 1", *loadCount)
+	}
+}

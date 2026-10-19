@@ -168,28 +168,57 @@ const rateLimitBucketCapacity = 1024
 // 历史问题-1：修复前容量满时新键 fail-open 放行（不建桶=本分钟对分布式来源
 // 零限流）——攻击者可推满桶表形成暴力尝试窗口。改为有界 LRU：新来源仍拿到
 // 自己的计数桶（照常 10/min 限流），内存上限不变。
+// CI87-01（历史）：淘汰次序 credential → 非受保护匿名桶 → 受保护桶。
+// 历史 历史问题-1 只保护了「非 credential 桶」集合，但匿名端点
+// （oidc-callback / service-control / 机器 scope 的 |ip 桶）同样无需凭证即可
+// 每源 IP 建桶——约 147 个源 IP 就能把 1024 容量填成全匿名桶，回退全表 LRU
+// 时最旧的 ip|login / ip|register 被淘汰 = 爆破/审计放大窗口被重置且可循环。
+// 受保护桶仅在「表内只剩受保护桶」时才可能被淘汰（仍保证新键必建桶）。
 // 调用方须持有 loginRateBuckets.Lock。
 func evictLeastRecentlyUsedRateLimitBucketLocked() {
-	// 未认证机器端点的 credential 桶可由攻击者用任意令牌无限生成；若按
-	// 全局 LRU 淘汰，1024 个唯一凭证即可冲掉 <ip>|login，重置登录/MFA
-	// 暴力破解限流（历史 历史问题-1）。淘汰优先只看 credential 桶，
-	// 非凭证作用域（login/register/ip）保留为受保护集合；仅当全是
-	// credential 桶时才回退全表淘汰。
-	victim, _ := lruVictimLocked(true)
+	victim, _ := lruVictimLocked(rateLimitEvictCredentialOnly)
 	if victim == "" {
-		victim, _ = lruVictimLocked(false)
+		victim, _ = lruVictimLocked(rateLimitEvictUnprotected)
+	}
+	if victim == "" {
+		victim, _ = lruVictimLocked(rateLimitEvictAny)
 	}
 	if victim != "" {
 		delete(loginRateBuckets.entries, victim)
 	}
 }
 
-func lruVictimLocked(credentialOnly bool) (string, int64) {
+type rateLimitEvictTier int
+
+const (
+	// rateLimitEvictCredentialOnly：未认证机器端点的 credential 桶可由攻击者
+	// 用任意令牌无限生成，属于最可牺牲的一类（历史 历史问题-1）。
+	rateLimitEvictCredentialOnly rateLimitEvictTier = iota
+	// rateLimitEvictUnprotected：其余非受保护键（匿名回调/机器 |ip 桶）。
+	rateLimitEvictUnprotected
+	// rateLimitEvictAny：别无选择时回退全表（受保护桶也只剩它们时）。
+	rateLimitEvictAny
+)
+
+// isProtectedRateLimitKey 报告键是否承载登录/注册类爆破防护窗口：键形为
+// <ip>|login（登录/MFA/setup/OIDC 登录共桶）与 <ip>|register（公开注册端点）。
+func isProtectedRateLimitKey(key string) bool {
+	return strings.HasSuffix(key, "|login") || strings.HasSuffix(key, "|register")
+}
+
+func lruVictimLocked(tier rateLimitEvictTier) (string, int64) {
 	var victim string
 	oldest := int64(1<<63 - 1)
 	for key, bucket := range loginRateBuckets.entries {
-		if credentialOnly && !strings.Contains(key, "|credential:") {
-			continue
+		switch tier {
+		case rateLimitEvictCredentialOnly:
+			if !strings.Contains(key, "|credential:") {
+				continue
+			}
+		case rateLimitEvictUnprotected:
+			if isProtectedRateLimitKey(key) {
+				continue
+			}
 		}
 		if used := bucket.lastUsed.Load(); used < oldest {
 			oldest = used
@@ -410,6 +439,44 @@ func requestLogFormatter(param gin.LogFormatterParams) string {
 		param.StatusCode, param.Latency, param.ClientIP, param.Method, param.Path)
 }
 
+// recordingRouterGroup 在注册 admin 组路由的同时记录「METHOD + 完整 gin 路径」
+// 到 recorded（CI87-06）：mcpserver 的 tools/list 可见性必须与 adminOnly 守卫
+// 同口径隐藏恒 403 的工具。清单与注册点同源，新增 admin 路由自动同步，不存在
+// 第二份手工清单漂移（区别于只读探测集等显式白名单）。
+type recordingRouterGroup struct {
+	*gin.RouterGroup
+	recorded map[string]struct{}
+}
+
+func (g recordingRouterGroup) record(method, path string) {
+	g.recorded[method+" "+g.BasePath()+path] = struct{}{}
+}
+
+func (g recordingRouterGroup) GET(path string, handlers ...gin.HandlerFunc) {
+	g.RouterGroup.GET(path, handlers...)
+	g.record(http.MethodGet, path)
+}
+
+func (g recordingRouterGroup) POST(path string, handlers ...gin.HandlerFunc) {
+	g.RouterGroup.POST(path, handlers...)
+	g.record(http.MethodPost, path)
+}
+
+func (g recordingRouterGroup) PUT(path string, handlers ...gin.HandlerFunc) {
+	g.RouterGroup.PUT(path, handlers...)
+	g.record(http.MethodPut, path)
+}
+
+func (g recordingRouterGroup) PATCH(path string, handlers ...gin.HandlerFunc) {
+	g.RouterGroup.PATCH(path, handlers...)
+	g.record(http.MethodPatch, path)
+}
+
+func (g recordingRouterGroup) DELETE(path string, handlers ...gin.HandlerFunc) {
+	g.RouterGroup.DELETE(path, handlers...)
+	g.record(http.MethodDelete, path)
+}
+
 func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 	startLoginRateLimitCleanup()
 	services.ApplyLogLevel()
@@ -541,11 +608,12 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 			v1.GET("/caddy/metrics", h.GetCaddyMetrics)
 			v1.POST("/auth/logout", h.Logout)
 			// User management (admin only)
-			admin := v1.Group("")
+			adminGroup := v1.Group("")
 			// U7c-68-01：adminOnly 先于 mfaStepUpGuard——非管理员打 admin 端点
 			// 先见 403 角色真因；step-up 仍在 readOnlyGuard 之前（U7c-3 从节点
 			// 403 先于 428 的守卫内短路口径不变）。
-			admin.Use(adminOnly(), mfaStepUpGuard(), readOnlyGuard(db.DB))
+			adminGroup.Use(adminOnly(), mfaStepUpGuard(), readOnlyGuard(db.DB))
+			admin := recordingRouterGroup{RouterGroup: adminGroup, recorded: make(map[string]struct{})}
 			{
 				admin.POST("/users", h.CreateUser)
 				admin.PUT("/users/:id", h.UpdateUser)
@@ -664,6 +732,10 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				// 调度启停——2026-10-14 裁定，/run 端点已废除）
 				admin.PUT("/security/autoban", h.UpdateAutobanConfig)
 			}
+			// CI87-06：admin 组路由集合注入 MCP 工具可见性——非管理员属主的 Key
+			// 不应在 tools/list 看到恒 403 的工具（get_caddy_config / preview_config /
+			// validate_import 等）。清单即上面的注册记录，无第二份手工维护。
+			mcpserver.SetAdminOnlyRoutes(admin.recorded)
 
 			// User + Admin
 			business := v1.Group("")
@@ -1047,24 +1119,10 @@ func apiKeyAuth(cfg *config.Config) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		prefix := apiKey[:12]
-		hash := sha256.Sum256([]byte(apiKey))
-		keyHash := hex.EncodeToString(hash[:])
-
-		var keyID, userID int
-		var keyName, username, role string
-		var mcpEnabled, readOnly bool
-		var mcpIPWhitelist string
-		err := db.DB.QueryRow(`
-			SELECT k.id, k.name, u.id, u.username, u.role,
-			       COALESCE(k.mcp_enabled,0), COALESCE(k.read_only,0), COALESCE(k.mcp_ip_whitelist,'')
-			FROM api_keys k
-			JOIN users u ON u.id = k.created_by
-			WHERE k.key_prefix = ? AND k.key_hash = ?
-			  AND k.is_enabled = 1
-			  AND u.is_enabled = 1
-			  AND (k.expires_at IS NULL OR datetime(k.expires_at) > datetime('now'))
-		`, prefix, keyHash).Scan(&keyID, &keyName, &userID, &username, &role, &mcpEnabled, &readOnly, &mcpIPWhitelist)
+		// CI87-07：认证查询收敛到 db.ResolveAPIKeyIdentity 单源（prefix + sha256
+		// + 有效性条件），与 mcpserver 只读可见性共用——此前两处手写同形 SQL，
+		// 认证条件变更时可见性会静默漂移。
+		identity, err := db.ResolveAPIKeyIdentity(db.DB, apiKey)
 		if err != nil {
 			if hasJWTBearer(c) {
 				c.Next()
@@ -1075,6 +1133,14 @@ func apiKeyAuth(cfg *config.Config) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+		keyID := identity.ID
+		userID := identity.UserID
+		keyName := identity.Name
+		username := identity.Username
+		role := identity.Role
+		mcpEnabled := identity.MCPEnabled
+		readOnly := identity.ReadOnly
+		mcpIPWhitelist := identity.MCPIPWhitelist
 		trustedInternalMCP := subtle.ConstantTimeCompare([]byte(c.GetHeader(mcpserver.InternalAuthHeader)), []byte(internalMCPAuthSecret)) == 1
 		if mcpIPWhitelist != "" && !trustedInternalMCP {
 			var whitelist []string
@@ -1198,11 +1264,17 @@ func mfaStepUpGuard() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		if !services.MFAWriteGuardEnabled() {
-			// 2026-09-08 审计 SA1：DB 读失败时 MFAWriteGuardEnabled 返回 false
-			// → 守卫静默关闭（fail-open）。这是有意设计：step-up 是第二因子
-			// 便利层（ jwtAuth 已在前序 fail-closed 把关），DB 故障时锁死全部
-			// 写操作不可取。全局开关默认 off 与此行为一致。
+		guardEnabled, guardErr := services.MFAWriteGuardEnabled()
+		if guardErr != nil {
+			// 2026-09-08 审计 SA1 裁定维持：DB 读失败时守卫关闭（fail-open）是
+			// 有意设计——step-up 是第二因子便利层（jwtAuth 已在前序 fail-closed
+			// 把关），DB 故障时锁死全部写操作不可取。S历史问题：降级不再静默——
+			// 显式留痕（口径与 MFALockoutEnabled 的读失败显性错误一致）。
+			services.Logf("warn", "MFA 写操作验证开关读取失败，按关闭处理（fail-open，SA1 裁定）: %v", guardErr)
+			c.Next()
+			return
+		}
+		if !guardEnabled {
 			c.Next()
 			return
 		}

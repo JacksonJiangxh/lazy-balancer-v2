@@ -280,7 +280,7 @@ func TestImportConfigBackup_rejects_ntlm_with_invalid_shape(t *testing.T) {
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			backup := completeBackupJSON(t, map[string][]map[string]any{"lb_rules": {testCase.rule}})
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{"lb_rules": {testCase.rule}}, EmptyConfigIfNil: true})
 			response := httptest.NewRecorder()
 			importRequest := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
 			importRequest.Header.Set("Content-Type", "application/json")

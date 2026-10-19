@@ -964,23 +964,55 @@ func TestIP2RegionUpdateFail_counterUpdateFailureDoesNotReaudit(t *testing.T) {
 	}
 }
 
-func TestWriteIP2RegionUpdateLog_rotatesAtSize(t *testing.T) {
+func TestWriteIP2RegionUpdateLog_rotatesBeforeWriteAtSize(t *testing.T) {
+	// SS87-历史问题：旧用例名声称「尺寸轮转」但只断言行数（未覆盖写前尺寸
+	// 滚动）——此处按真实阈值驱动：预置接近阈值的历史内容，写入一行必须
+	// 先滚动到 .1，活动文件只含新行。随后放宽阈值再验证 tee 单点（每行只
+	// 写一次）。
 	dir := t.TempDir()
 	taskengine.SetLogDir(dir)
 	t.Cleanup(func() { taskengine.SetLogDir("") })
+	taskengine.SetTaskLogSizeBytesFn(func() int64 { return 64 })
+	t.Cleanup(func() { taskengine.SetTaskLogSizeBytesFn(nil) })
 
 	path := taskengine.TaskLogPath("ip2region")
-	for i := 0; i < 100; i++ {
-		WriteIP2RegionUpdateLog("INFO", "checking", "x")
+	history := strings.Repeat("h", 60)
+	if err := os.WriteFile(path, []byte(history), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	// 历史问题-3：写入落 tasks/ip2region.log（写前尺寸滚动统一入口；
-	// 保留期清理由 crslog_test.go TestTaskLogsHousekeeping_retentionOnlyDoesNotRotate 钉）
+	// When：一行写入使 size+line 超阈
+	WriteIP2RegionUpdateLog("INFO", "checking", "x")
+
+	// Then：写前滚动——.1 保留滚动前字节，活动文件只含新行
+	rotated, err := os.ReadFile(path + ".1")
+	if err != nil {
+		t.Fatalf("写前尺寸滚动未发生（.1 缺失）: %v", err)
+	}
+	if len(rotated) != len(history) {
+		t.Fatalf(".1 大小=%d, want %d（滚动应保留滚动前全部字节）", len(rotated), len(history))
+	}
+	active, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(active), history) {
+		t.Fatalf("活动文件仍含滚动前内容: %q", active)
+	}
+	if !strings.Contains(string(active), "[INFO] checking - x") {
+		t.Fatalf("活动文件缺少滚动后的新行: %q", active)
+	}
+
+	// tee 单点（历史问题-3）：放宽阈值后 100 行写入应恰 100 行
+	taskengine.SetTaskLogSizeBytesFn(func() int64 { return 1 << 20 })
+	for range 100 {
+		WriteIP2RegionUpdateLog("INFO", "tee", "y")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := strings.Count(string(data), "[INFO] checking - x"); n != 100 {
+	if n := strings.Count(string(data), "[INFO] tee - y"); n != 100 {
 		t.Fatalf("100 行写入应恰 100 行（tee 单点），got %d", n)
 	}
 }
@@ -1103,5 +1135,76 @@ func TestIP2RegionFailOpenPrecondition_rejectsMissingLive(t *testing.T) {
 	m.newXdbSha = "deadbeef"
 	if m.failOpenPreconditionHolds() {
 		t.Fatal("missing live xdb must not satisfy fail-open precondition")
+	}
+}
+
+// SS87-历史问题：陈旧 .bak 只在本运行创建时才可清理（成功路径）。
+func TestIP2RegionUpdateRun_freshInstallKeepsStaleBakOnSuccess(t *testing.T) {
+	// Given 全新部署（live 缺失→本轮不建备份）+ 跨运行残留 .bak
+	m := newTestIP2RegionManager(t)
+	seedIP2RegionVersionRow(t, "unknown", true)
+	dir := t.TempDir()
+	live := filepath.Join(dir, "ip2region.xdb")
+	withIP2RegionPaths(t, live, filepath.Join(dir, "missing-dist.xdb"))
+	stale := []byte("stale-bak-from-crashed-run")
+	if err := os.WriteFile(live+".bak", stale, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.1.0", nil }
+	m.downloadXDB = fakeIP2RegionDownload(t, true)
+	m.reloader = func() error { return nil }
+
+	// When 更新成功
+	m.run("manual", nil)
+
+	// Then 陈旧 .bak 原样保留（bakCreated=false → 不得清理他运行的恢复副本）
+	got, err := os.ReadFile(live + ".bak")
+	if err != nil || string(got) != string(stale) {
+		t.Fatalf("成功路径删除了非本运行创建的陈旧 .bak: %q, %v", got, err)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("live xdb 未安装: %v", err)
+	}
+	if _, status, _, _, _, _, _ := ip2RegionVersionRow(t); status != "success" {
+		t.Fatalf("update_status=%q, want success", status)
+	}
+}
+
+// SS87-历史问题：安装 rename 失败路径同样不得清理非本运行的 .bak。
+func TestIP2RegionUpdateRun_freshInstallKeepsStaleBakOnRenameFailure(t *testing.T) {
+	// Given 同上，但安装 rename 失败（安装未发生）
+	m := newTestIP2RegionManager(t)
+	seedIP2RegionVersionRow(t, "unknown", true)
+	dir := t.TempDir()
+	live := filepath.Join(dir, "ip2region.xdb")
+	withIP2RegionPaths(t, live, filepath.Join(dir, "missing-dist.xdb"))
+	stale := []byte("stale-bak-from-crashed-run")
+	if err := os.WriteFile(live+".bak", stale, 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldRename := osRename
+	osRename = func(src, dst string) error {
+		if dst == live {
+			return errors.New("forced rename failure")
+		}
+		return oldRename(src, dst)
+	}
+	t.Cleanup(func() { osRename = oldRename })
+
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.1.0", nil }
+	m.downloadXDB = fakeIP2RegionDownload(t, true)
+	m.reloader = func() error { return nil }
+
+	// When
+	m.run("manual", nil)
+
+	// Then 安装未发生且陈旧 .bak 未被删除
+	if _, err := os.Stat(live); !os.IsNotExist(err) {
+		t.Fatalf("rename 失败后 live 不应存在: %v", err)
+	}
+	got, err := os.ReadFile(live + ".bak")
+	if err != nil || string(got) != string(stale) {
+		t.Fatalf("rename 失败路径删除了非本运行创建的陈旧 .bak: %q, %v", got, err)
 	}
 }

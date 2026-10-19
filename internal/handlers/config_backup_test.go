@@ -195,31 +195,6 @@ func validateV2Backup(backup configBackup) (bool, error) {
 	return usedLegacy, nil
 }
 
-func completeBackupJSON(t *testing.T, tables map[string][]map[string]any) string {
-	t.Helper()
-	completeTables := make(map[string][]map[string]any, len(configBackupTables))
-	for _, table := range configBackupTables {
-		completeTables[table] = []map[string]any{}
-	}
-	completeTables["users"] = []map[string]any{{"id": 1, "username": "backup-admin", "password_hash": "hash", "role": "admin", "is_enabled": 1}}
-	for table, rows := range tables {
-		completeTables[table] = rows
-	}
-	cfg := map[string]any{}
-	backup := configBackup{
-		Meta:   configBackupMeta{App: "lazy-balancer-v2", Version: 2, ExportedAt: "2026-08-19T00:00:00Z"},
-		Config: cfg,
-		Tables: completeTables,
-	}
-	// 历史问题 历史问题 起 v2 备份必带校验和，夹具按真实导出形态计算。
-	backup.Meta.Checksum = checksumBackupPayload(t, completeTables, cfg)
-	data, err := json.Marshal(backup)
-	if err != nil {
-		t.Fatalf("marshal complete backup: %v", err)
-	}
-	return string(data)
-}
-
 func TestImportConfigBackup_rejects_backup_without_enabled_admin_and_preserves_current_admin(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -240,7 +215,7 @@ func TestImportConfigBackup_rejects_backup_without_enabled_admin_and_preserves_c
 			}
 			router := gin.New()
 			router.POST("/config/import", h.ImportConfigBackup)
-			request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(completeBackupJSON(t, map[string][]map[string]any{"users": tt.users})))
+			request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{"users": tt.users}, EmptyConfigIfNil: true})))
 			request.Header.Set("Content-Type", "application/json")
 			response := httptest.NewRecorder()
 
@@ -263,9 +238,10 @@ func TestImportConfigBackup_rejects_backup_without_enabled_admin_and_preserves_c
 func TestImportConfigBackup_accepts_enabled_admin_and_increments_password_version(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"users": {{"id": 7, "username": "enabled-admin", "password_hash": "hash", "role": "admin", "is_enabled": true, "password_version": 12}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
@@ -295,11 +271,12 @@ func TestImportConfigBackup_normalizes_null_boolean_rows(t *testing.T) {
 	// enabled null→0，导入成功且落库值正确。
 	// Given
 	h := newBackupTestHandlers(t)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"users":     {{"id": 2, "username": "null-admin", "password_hash": "hash", "role": "admin", "is_enabled": nil}},
 		"lb_rules":  {{"caddy_id": "lb_nullnorm", "name": "null-rule", "protocol": "http", "domain": "nullnorm.example.test", "listen_port": 8080, "enabled": nil}},
 		"upstreams": {{"rule_id": "lb_nullnorm", "host": "127.0.0.1", "port": 9000, "weight": 1, "enabled": nil}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
@@ -340,13 +317,14 @@ func TestImportConfigBackup_normalizes_null_security_rows(t *testing.T) {
 	// Given：三张安全表各携带一行 NULL 毒化可空列（content 给非空值以越过
 	// 空内容软跳过门，保留 description/is_default NULL 归一覆盖）
 	h := newBackupTestHandlers(t)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_block_pages": {{"id": 2, "name": "null-poison-page", "description": nil, "content": "<html>poison</html>", "is_default": nil}},
 		"security_custom_rules": {{"id": 1, "name": "null-poison-rule",
 			"conditions":  `[{"target":"uri","operator":"contains","pattern":"/nullpoison"}]`,
 			"description": nil, "action": nil, "score": nil, "enabled": nil}},
 		"security_policies": {{"id": 1, "name": "null-poison-policy", "description": nil, "custom_rules": nil}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
@@ -368,7 +346,7 @@ func TestImportConfigBackup_normalizes_null_security_rows(t *testing.T) {
 		t.Fatalf("read restored block page: %v", err)
 	}
 	if pageContent != "<html>poison</html>" || pageDesc != "" || pageDefault != 0 {
-		t.Fatalf("block page=(content:%q desc:%q is_default:%d), want ('' '' 0)", pageContent, pageDesc, pageDefault)
+		t.Fatalf("block page=(content:%q desc:%q is_default:%d), want (<html>poison</html> '' 0)", pageContent, pageDesc, pageDefault)
 	}
 	var ruleAction, ruleDesc string
 	var ruleScore, ruleEnabled int
@@ -393,7 +371,7 @@ func TestImportConfigBackup_normalizes_null_security_rows(t *testing.T) {
 func TestImportConfigBackup_skips_empty_content_block_pages(t *testing.T) {
 	// Given：两行空内容拦截页 + 一行正常页 + 一行无关表数据
 	h := newBackupTestHandlers(t)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_block_pages": {
 			{"id": 2, "name": "empty-page", "content": "", "is_default": 0},
 			{"id": 3, "name": "blank-page", "content": "   ", "is_default": 0},
@@ -402,7 +380,8 @@ func TestImportConfigBackup_skips_empty_content_block_pages(t *testing.T) {
 		"security_custom_rules": {
 			{"id": 9, "name": "other-row", "conditions": `[{"target":"uri","operator":"contains","pattern":"/x"}]`, "enabled": 1},
 		},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
@@ -476,12 +455,13 @@ func TestValidateConfigImport_reports_empty_content_block_page_skips(t *testing.
 	// Given
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_block_pages": {
 			{"id": 2, "name": "empty-page", "content": "", "is_default": 0},
 			{"id": 4, "name": "good-page", "content": "<html>blocked</html>", "is_default": 0},
 		},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/validate", h.ValidateConfigImport)
 	request := httptest.NewRequest(http.MethodPost, "/config/validate", strings.NewReader(backup))
@@ -515,9 +495,10 @@ func TestValidateConfigImport_rejects_dangling_rule_references(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"upstreams": {{"rule_id": "lb_ghost_ref", "host": "127.0.0.1", "port": 9000, "weight": 1, "enabled": 1}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/validate", h.ValidateConfigImport)
 	request := httptest.NewRequest(http.MethodPost, "/config/validate", strings.NewReader(backup))
@@ -549,17 +530,19 @@ func TestImportConfigBackup_rejects_invalid_certificate_job_status(t *testing.T)
 	tests := []struct {
 		name   string
 		status any
+		want   string
 	}{
-		{name: "NULL status", status: nil},
-		{name: "status outside allowed set", status: "unknown"},
+		{name: "NULL status", status: nil, want: "证书任务状态不能为空"},
+		{name: "status outside allowed set", status: "unknown", want: "无效的证书任务状态"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Given
 			h := newBackupTestHandlers(t)
-			backup := completeBackupJSON(t, map[string][]map[string]any{
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 				"cert_jobs": {{"id": 1, "rule_id": "lb_invalid", "domain": "invalid.example", "status": test.status}},
-			})
+			}, EmptyConfigIfNil: true})
+
 			router := gin.New()
 			router.POST("/config/import", h.ImportConfigBackup)
 			request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
@@ -572,6 +555,11 @@ func TestImportConfigBackup_rejects_invalid_certificate_job_status(t *testing.T)
 			// Then
 			if response.Code != http.StatusBadRequest {
 				t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
+			}
+			// 历史问题-历史问题（历史）：仅断言 400 会被前置门（管理员门等）
+			// 的 400 假通过——必须点名证书任务状态门。
+			if !strings.Contains(response.Body.String(), test.want) {
+				t.Fatalf("body=%s, want contains %q（不得被其他前置门假通过）", response.Body.String(), test.want)
 			}
 		})
 	}
@@ -918,14 +906,15 @@ func TestImportConfigBackup_ignoresDeadMetricsRetentionDaysKey(t *testing.T) {
 func TestImportConfigBackup_remaps_rule_updated_by_to_restored_user(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"users":      {{"id": 7, "username": "importer", "password_hash": "hash", "role": "admin", "is_enabled": true, "password_version": 0}},
 		"lb_rules":   {{"caddy_id": "lb_remap", "name": "remap", "protocol": "http", "domain": "remap.example.test", "listen_port": 8080, "enabled": true}},
 		"upstreams":  {{"rule_id": "lb_remap", "host": "127.0.0.1", "port": 9000, "weight": 1, "enabled": true}},
 		"cert_jobs":  {},
 		"api_keys":   {},
 		"path_rules": {},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.Use(func(c *gin.Context) { c.Set("username", "importer"); c.Next() })
 	router.POST("/config/import", h.ImportConfigBackup)
@@ -960,11 +949,12 @@ func TestImportConfigBackup_missingOperatorAccount_respectsChoice(t *testing.T) 
 		INSERT INTO upstreams (rule_id,host,port,weight,enabled) VALUES ('lb_pre','127.0.0.1',9000,1,1)`); err != nil {
 		t.Fatalf("seed operator and rule: %v", err)
 	}
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"users":     {{"id": 50, "username": "otheradmin", "password_hash": "hash", "role": "admin", "is_enabled": true}},
 		"lb_rules":  {{"caddy_id": "lb_selflock", "name": "selflock", "protocol": "http", "domain": "selflock.example.test", "listen_port": 8082, "enabled": true, "updated_by": 50}},
 		"upstreams": {{"rule_id": "lb_selflock", "host": "127.0.0.1", "port": 9001, "weight": 1, "enabled": true}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.Use(func(c *gin.Context) { c.Set("username", "operator-admin"); c.Next() })
 	router.POST("/config/import", h.ImportConfigBackup)
@@ -1007,10 +997,11 @@ func TestImportConfigBackup_preserves_backup_rule_attribution_without_operator_c
 	// 备份的场景已被自锁前置门 400 拦截，见上一用例）。
 	// Given
 	h := newBackupTestHandlers(t)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules":  {{"caddy_id": "lb_attr", "name": "attr", "protocol": "http", "domain": "attr.example.test", "listen_port": 8083, "enabled": true, "updated_by": 7}},
 		"upstreams": {{"rule_id": "lb_attr", "host": "127.0.0.1", "port": 9000, "weight": 1, "enabled": true}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
@@ -1169,7 +1160,7 @@ func TestImportConfigBackup_queueFailureStillRunsPostCommitConvergence(t *testin
 	invalidateImportTaskLogCache = func() { invalidations++ }
 	t.Cleanup(func() { invalidateImportTaskLogCache = oldInvalidate })
 
-	rec := r78Import(h, t, r78BackupJSON(t, nil, nil, nil))
+	rec := r78Import(h, t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, Config: nil, Sections: nil, EmptyConfigIfNil: true}))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "证书任务恢复失败") || !strings.Contains(rec.Body.String(), `"partial":true`) {
 		t.Fatalf("status=%d body=%s, want partial success (200+partial)", rec.Code, rec.Body.String())
 	}
@@ -1188,9 +1179,10 @@ func TestImportConfigBackup_joins_import_and_certificate_job_recovery_failures(t
 	oldRequeue := requeueNonTerminalCertJobs
 	requeueNonTerminalCertJobs = func() error { return errors.New("requeue failed") }
 	t.Cleanup(func() { requeueNonTerminalCertJobs = oldRequeue })
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {{"caddy_id": "lb_bad_recovery", "name": "bad", "protocol": "http", "domain": "bad-recovery.example.test", "listen_port": 8443, "enable_tls": 1, "tls_source": "manual", "tls_cert": "invalid-cert", "tls_key": "invalid-key"}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
@@ -1398,10 +1390,11 @@ func TestValidateV2Backup_credentials_must_be_json_object(t *testing.T) {
 			if tt.dnsCase {
 				dnsCredentials = tt.dnsCred
 			}
-			backup := completeBackupJSON(t, map[string][]map[string]any{
-				"ca_providers":        {{"credentials": tt.caCred, "provider": caProvider}}, // CERT44-1:provider 为 NOT NULL 列,真实导出恒携带,夹具补齐
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
+				"ca_providers":        {{"credentials": tt.caCred, "provider": caProvider}},
 				"certificate_configs": {{"dns_provider": "dnspod", "dns_credentials": dnsCredentials}},
-			})
+			}, EmptyConfigIfNil: true})
+
 			var b configBackup
 			if err := json.Unmarshal([]byte(backup), &b); err != nil {
 				t.Fatalf("unmarshal backup: %v", err)
@@ -1452,10 +1445,11 @@ func TestValidateV2Backup_caProviderLimitsAndDNSProviderContracts(t *testing.T) 
 			if tt.mutateDNS != nil {
 				tt.mutateDNS(dnsRow)
 			}
-			backup := completeBackupJSON(t, map[string][]map[string]any{
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 				"ca_providers":        {caRow},
 				"certificate_configs": {dnsRow},
-			})
+			}, EmptyConfigIfNil: true})
+
 			var b configBackup
 			if err := json.Unmarshal([]byte(backup), &b); err != nil {
 				t.Fatal(err)
@@ -1474,10 +1468,11 @@ func TestValidateV2Backup_caProviderLimitsAndDNSProviderContracts(t *testing.T) 
 // B3-82-历史问题/04 收窄：legacy 空 provider/空凭证行保持放行；只有非空且
 // 未知或必填缺失的形态才拒绝。
 func TestValidateV2Backup_legacyEmptyProviderRowsAllowed(t *testing.T) {
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"ca_providers":        {{"id": 1, "provider": "", "credentials": ""}},
 		"certificate_configs": {{"id": 1, "dns_provider": "", "dns_credentials": ""}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	var b configBackup
 	if err := json.Unmarshal([]byte(backup), &b); err != nil {
 		t.Fatal(err)
@@ -1515,7 +1510,7 @@ func TestValidateV2Backup_rejects_self_loop_80_tls_redirect_rule(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			backup := completeBackupJSON(t, map[string][]map[string]any{"lb_rules": {tt.rule}})
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{"lb_rules": {tt.rule}}, EmptyConfigIfNil: true})
 			var b configBackup
 			if err := json.Unmarshal([]byte(backup), &b); err != nil {
 				t.Fatalf("unmarshal backup: %v", err)
@@ -1584,7 +1579,7 @@ func TestValidateV2Backup_rejects_wildcard_domain(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			backup := completeBackupJSON(t, map[string][]map[string]any{"lb_rules": {tt.rule}})
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{"lb_rules": {tt.rule}}, EmptyConfigIfNil: true})
 			var b configBackup
 			if err := json.Unmarshal([]byte(backup), &b); err != nil {
 				t.Fatalf("unmarshal backup: %v", err)
@@ -1643,7 +1638,7 @@ func TestValidateV2Backup_rejects_tcp_rule_with_dns_server(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			backup := completeBackupJSON(t, map[string][]map[string]any{"lb_rules": {tt.rule}})
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{"lb_rules": {tt.rule}}, EmptyConfigIfNil: true})
 			var b configBackup
 			if err := json.Unmarshal([]byte(backup), &b); err != nil {
 				t.Fatalf("unmarshal backup: %v", err)
@@ -1801,9 +1796,10 @@ func TestValidateV2BackupTLSShape_clamps_tcp_stale_tls(t *testing.T) {
 func TestImportConfigBackup_rejects_invalid_credentials_json(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"ca_providers": {{"credentials": "not-json"}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 
@@ -1830,10 +1826,11 @@ func TestImportConfigBackup_rolls_back_when_certificate_materialization_fails(t 
 	if _, err := db.DB.Exec("INSERT INTO lb_rules (caddy_id, name, protocol, listen_port, enabled) VALUES ('lb_old', 'old-rule', 'http', 8080, 1)"); err != nil {
 		t.Fatalf("seed rule: %v", err)
 	}
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"users":    {{"id": 2, "username": "new-user", "password_hash": "hash", "role": "admin"}},
 		"lb_rules": {{"caddy_id": "lb_badcert", "name": "new-rule", "protocol": "http", "listen_port": 8443, "enabled": 1, "enable_tls": 1, "tls_source": "manual", "tls_cert": "invalid-cert", "tls_key": "invalid-key"}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 
@@ -1863,7 +1860,7 @@ func TestImportConfigBackup_skips_empty_domain_HTTP_rules(t *testing.T) {
 	// Given：v2 备份中一条 HTTP 规则域名为空，一条 HTTP 规则正常，一条 TCP 规则无域名
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {
 			{"caddy_id": "lb_empty_domain", "name": "empty-domain", "protocol": "http", "domain": "", "listen_port": 8441, "enabled": 1},
 			{"caddy_id": "lb_valid", "name": "valid", "protocol": "http", "domain": "valid.example.test", "listen_port": 8442, "enabled": 1},
@@ -1874,7 +1871,8 @@ func TestImportConfigBackup_skips_empty_domain_HTTP_rules(t *testing.T) {
 			{"rule_id": "lb_valid", "host": "127.0.0.1", "port": 9002, "weight": 1, "enabled": 1},
 			{"rule_id": "lb_tcp", "host": "127.0.0.1", "port": 9003, "weight": 1, "enabled": 1},
 		},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
@@ -1988,9 +1986,10 @@ func TestImportConfigBackup_reports_import_and_runtime_restore_failures(t *testi
 	// Given
 	harness := newImportRollbackHarness(t)
 	harness.failRestore()
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {{"caddy_id": "lb_bad_restore", "name": "bad-cert", "protocol": "http", "domain": "bad-restore.example.test", "listen_port": 8443, "enable_tls": 1, "tls_source": "manual", "tls_cert": "invalid-cert", "tls_key": "invalid-key"}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", harness.handler.ImportConfigBackup)
 
@@ -2058,10 +2057,10 @@ func TestImportConfigBackup_normalizesNullEnabled(t *testing.T) {
 	}
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
-	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(completeBackupJSON(t, map[string][]map[string]any{
+	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules":  {ruleRow},
 		"upstreams": {upstreamRow},
-	})))
+	}, EmptyConfigIfNil: true})))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
@@ -2092,12 +2091,12 @@ func TestImportConfigBackup_normalizesNullUserIsEnabled(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
-	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(completeBackupJSON(t, map[string][]map[string]any{
+	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"users": {
 			{"id": 2, "username": "legacy-null", "password_hash": "hash", "role": "user", "is_enabled": nil},
 			{"id": 3, "username": "enabled-admin", "password_hash": "hash", "role": "admin", "is_enabled": 1},
 		},
-	})))
+	}, EmptyConfigIfNil: true})))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 
@@ -2134,7 +2133,7 @@ func TestImportConfigBackup_skips_empty_domain_rule_before_row_validation(t *tes
 	}
 
 	t.Run("空域名+非法端口行软跳过并告警", func(t *testing.T) {
-		backup := completeBackupJSON(t, map[string][]map[string]any{
+		backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 			"lb_rules": {
 				{"caddy_id": "lb_empty_badport", "name": "empty-bad-port", "protocol": "http", "domain": "", "listen_port": 0, "enabled": 1},
 				{"caddy_id": "lb_valid", "name": "valid", "protocol": "http", "domain": "valid.example.test", "listen_port": 8442, "enabled": 1},
@@ -2143,7 +2142,8 @@ func TestImportConfigBackup_skips_empty_domain_rule_before_row_validation(t *tes
 				{"rule_id": "lb_empty_badport", "host": "127.0.0.1", "port": 9001, "weight": 1, "enabled": 1},
 				{"rule_id": "lb_valid", "host": "127.0.0.1", "port": 9002, "weight": 1, "enabled": 1},
 			},
-		})
+		}, EmptyConfigIfNil: true})
+
 		response := importBackup(backup)
 		if response.Code != http.StatusOK {
 			t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
@@ -2164,9 +2164,10 @@ func TestImportConfigBackup_skips_empty_domain_rule_before_row_validation(t *tes
 	})
 
 	t.Run("非空域名+非法端口行仍整包 400", func(t *testing.T) {
-		backup := completeBackupJSON(t, map[string][]map[string]any{
+		backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 			"lb_rules": {{"caddy_id": "lb_badport", "name": "bad-port", "protocol": "http", "domain": "badport.example.test", "listen_port": 0, "enabled": 1}},
-		})
+		}, EmptyConfigIfNil: true})
+
 		response := importBackup(backup)
 		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "1-65535") {
 			t.Fatalf("status=%d body=%s, want 400 invalid port", response.Code, response.Body.String())
@@ -2178,10 +2179,11 @@ func TestImportConfigBackup_skips_empty_domain_rule_before_row_validation(t *tes
 // 再执行状态门；非跳过规则的非法状态仍必须拒绝。
 func TestConfigBackup_emptyDomainRuleSkipsCertJobBeforeStatusGate(t *testing.T) {
 	backupWithJob := func(ruleDomain, status string) string {
-		return completeBackupJSON(t, map[string][]map[string]any{
+		return buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 			"lb_rules":  {{"caddy_id": "lb_job_skip", "name": "job-skip", "protocol": "http", "domain": ruleDomain, "listen_port": 8442, "enabled": 1}},
 			"cert_jobs": {{"rule_id": "lb_job_skip", "domain": ruleDomain, "status": status}},
-		})
+		}, EmptyConfigIfNil: true})
+
 	}
 	t.Run("preview skips associated invalid job", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
@@ -2314,7 +2316,7 @@ func TestConfigBackup_danglingBindingRejected(t *testing.T) {
 	// (no such row in security_policies).
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {
 			{"caddy_id": "lb_dangle", "name": "dangle", "protocol": "http", "domain": "dangle.example.com", "listen_port": 80, "enabled": 1},
 		},
@@ -2328,7 +2330,8 @@ func TestConfigBackup_danglingBindingRejected(t *testing.T) {
 			{"rule_caddy_id": "lb_dangle", "policy_id": 1},
 			{"rule_caddy_id": "lb_dangle", "policy_id": 99},
 		},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 
@@ -2361,13 +2364,11 @@ func TestImportConfigBackup_normalizes_null_rows_for_all_backup_tables(t *testin
 	// Given：11 张非安全表各携带一行 NULL 毒化可空列
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"users": {{"id": 2, "username": "null-user", "password_hash": "hash", "role": "admin", "is_enabled": nil,
 			"display_name": nil, "created_at": nil, "last_login": nil,
 			"mfa_enabled": nil, "mfa_secret": nil, "mfa_recovery_codes": nil}},
-		// X-1（历史 历史问题）：cert_jobs 行的被测规则须处于 ACME 自动签发态
-		//（enabled=1+enable_tls=1+tls_source=acme_dns），否则导入侧的失效任务
-		// 清理（config_backup.go）会删除该行——本规则专供 cert_jobs 消费点使用。
+
 		"lb_rules": {
 			{"caddy_id": "lb_nulldump", "name": "null-cols", "protocol": "http", "domain": "nulldump.example.test",
 				"listen_port": 8461, "enabled": nil, "description": nil, "strategy": nil, "dns_server": nil, "dns_family": nil,
@@ -2400,7 +2401,8 @@ func TestImportConfigBackup_normalizes_null_rows_for_all_backup_tables(t *testin
 		"security_policy_bindings":   {{"rule_caddy_id": "lb_nulldump", "policy_id": 1}},
 		"security_crs_version":       {{"id": 1, "version": "v4.99.0", "updated_at": nil, "auto_update": nil, "update_status": nil, "message": nil, "last_checked": nil, "next_update": nil, "trigger": nil, "started_at": nil, "finished_at": nil, "consecutive_failures": nil}},
 		"security_ip2region_version": {{"id": 1, "version": "v3.99.0", "updated_at": nil, "auto_update": nil, "update_status": nil, "message": nil, "last_checked": nil, "next_update": nil, "trigger": nil, "started_at": nil, "finished_at": nil, "consecutive_failures": nil}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
@@ -2870,9 +2872,10 @@ func TestImportConfigBackup_toleratesTopLevelStringCustomRules(t *testing.T) {
 	// 历史问题：旧夹具缺 meta.app，在 validateV2Backup 首行 400 早退，只断言
 	// 「非 500」等于没测。改用完整 v2 夹具注入顶层字符串 custom_rules，断言
 	// 200 且策略行真实落库（若转红即暴露真实归一缺口）。
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_policies": {{"id": 1, "name": "top-str", "mode": "off", "custom_rules": `"str"`, "enabled": 1}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	recorder := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
 	req.Header.Set("Content-Type", "application/json")
@@ -2966,9 +2969,10 @@ func TestValidateV2BackupBooleanTypes_rejectsMalformedTrustDetection(t *testing.
 	for _, tt := range rejects {
 		t.Run("rejects_"+tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			backup := completeBackupJSON(t, map[string][]map[string]any{
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 				"security_policies": {{"id": 1, "name": "p", "trust_detection": tt.raw}},
-			})
+			}, EmptyConfigIfNil: true})
+
 			router := gin.New()
 			router.POST("/config/import", h.ImportConfigBackup)
 			request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
@@ -2997,9 +3001,10 @@ func TestValidateV2BackupBooleanTypes_rejectsMalformedTrustDetection(t *testing.
 	for _, tt := range accepts {
 		t.Run("accepts_"+tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			backup := completeBackupJSON(t, map[string][]map[string]any{
+			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 				"security_policies": {{"id": 1, "name": "p", "trust_detection": tt.raw}},
-			})
+			}, EmptyConfigIfNil: true})
+
 			router := gin.New()
 			router.POST("/config/import", h.ImportConfigBackup)
 			request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
@@ -3140,4 +3145,141 @@ func TestValidateV2BackupSecurityPolicies_normalizesLegacyValueColumns(t *testin
 			t.Fatal("enabled=1 + rps=0 must stay rejected (写侧同口径), not normalized")
 		}
 	})
+}
+
+// 历史问题-06（历史）：导入前 auto_backup_enabled 的读取必须把错误如实
+// 上抛——旧形态 `_ = ...Scan()` 吞错使变量保持 0，会把「原本已启用」误判为
+// off→on，导入提交后可能重置自动备份水位线（推迟下一次自动备份一个周期）。
+func TestReadImportOldAutoBackupEnabled_surfacesReadError(t *testing.T) {
+	newBackupTestHandlers(t)
+	ctx := context.Background()
+
+	// 正常形态：读到库值（先写再开事务——SQLite 单写连接下事务外 Exec 会等锁）。
+	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	enabled, err := readImportOldAutoBackupEnabled(ctx, tx)
+	if err != nil {
+		t.Fatalf("正常读取失败: %v", err)
+	}
+	if enabled != 1 {
+		t.Fatalf("enabled=%d, want 1", enabled)
+	}
+
+	// 失败形态：同事务内 global_config 行不可见（等价单行读失败）→ 必须返回
+	// 错误而不是 (0, nil)。
+	if _, err := tx.Exec(`DELETE FROM global_config WHERE id=1`); err != nil {
+		t.Fatalf("drop global_config row: %v", err)
+	}
+	if _, err := readImportOldAutoBackupEnabled(ctx, tx); err == nil {
+		t.Fatal("读取失败必须上抛错误（吞成 0 会把已启用误判为 off）")
+	}
+}
+
+// 历史问题-06：off→on 水位重置判定——读取失败（未知）时不重置。
+func TestImportAutoBackupResetNeeded(t *testing.T) {
+	cases := []struct {
+		name    string
+		known   bool
+		old     int
+		want    bool
+		comment string
+	}{
+		{"已知 off → 重置（off→on）", true, 0, true, "原 历史问题 语义保持"},
+		{"已知 on → 不重置", true, 1, false, "非 off→on 转换"},
+		{"未知（读失败）→ 不重置", false, 0, false, "不得把未知当 off 重置水位"},
+		{"未知且旧值 1 → 不重置", false, 1, false, "同上"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := importAutoBackupResetNeeded(tc.known, tc.old); got != tc.want {
+				t.Fatalf("reset=%v, want %v（%s）", got, tc.want, tc.comment)
+			}
+		})
+	}
+}
+
+// ── v2 备份 JSON 夹具（历史问题-历史问题，历史） ──
+//
+// 这是全包唯一的 v2 备份 JSON 构造器。此前并存 9 个 *BackupJSON 构造器
+// （completeBackupJSON / completeBackupJSONOmit / r41BackupJSON /
+// round40BackupJSON / round44BackupJSONWithTableSet / r55BackupJSONWithConfig /
+// r75bBackupJSONWithoutIPListsTable / r78BackupJSON / audit85BackupJSON），
+// 语义各不相同（全表回填 / 精确表集 / 缺席集合 / sections 注入 / nil 视同缺席 /
+// 是否补默认管理员行）。新用例选错构造器会静默绕过目标门（历史事故：缺
+// exported_at/checksum 导致全部早退，断言只命中「非 true」的假绿——见
+// v2BackupBody 上方 历史问题 注释）。
+//
+// 现在所有形态都由 backupFixtureOptions 显式表达：
+//   - 精确表集（真实分类导出/迟到表形态）：只给 Tables，FillAll=false；
+//   - 全表回填（users 恒含 backup-admin 管理员行）：FillAll=true；
+//   - 「表未携带」形态：FillAll=true + Omit；
+//   - 分类导出产物把 nil 行集视同缺席：DropNil=true；
+//   - sections/全局配置区按需注入；Config 的 nil 与 {} 语义不同（null 全局
+//     配置区与空对象在导入侧分支不同），EmptyConfigIfNil 保留历史夹具的
+//     「nil→空对象」形态，其余调用方原样透传。
+//
+// checksum 恒按真实导出形态（{tables,config} 摘要）计算——「缺 checksum」这类
+// 畸形 meta 形态由下方 v2BackupBody 专门构造（它覆盖 version 越界与缺席校验和，
+// 属于故意畸形的契约用例，不进本构造器）。
+
+type backupFixtureOptions struct {
+	// Tables 显式表行（覆盖 FillAll 回填的空表集）。
+	Tables map[string][]map[string]any
+	// FillAll 回填 configBackupTables 全键为空表，并为 users 补一个启用管理员
+	// 行（过导入侧管理员门）。
+	FillAll bool
+	// Omit FillAll 时不回填（缺席）的表集合。
+	Omit map[string]struct{}
+	// DropNil Tables 中值为 nil 的行集视同缺席（分类导出产物形态）。
+	DropNil bool
+	// Sections 备份声明的分类（导入侧按此过滤表集）。
+	Sections []string
+	// Config 全局配置区；nil 原样序列化为 null（与平台真实导出一致）。
+	Config map[string]any
+	// EmptyConfigIfNil 把 nil Config 归一为空对象（历史夹具默认形态）。
+	EmptyConfigIfNil bool
+}
+
+// buildBackup 序列化一份 V2 备份 JSON（checksum 与真实导出口径一致）。
+func buildBackup(t *testing.T, options backupFixtureOptions) string {
+	t.Helper()
+	tables := make(map[string][]map[string]any, len(configBackupTables))
+	if options.FillAll {
+		for _, table := range configBackupTables {
+			if _, skip := options.Omit[table]; skip {
+				continue
+			}
+			tables[table] = []map[string]any{}
+		}
+		tables["users"] = []map[string]any{{"id": 1, "username": "backup-admin", "password_hash": "hash", "role": "admin", "is_enabled": 1}}
+	}
+	for table, rows := range options.Tables {
+		if options.DropNil && rows == nil {
+			continue
+		}
+		tables[table] = rows
+	}
+	config := options.Config
+	if config == nil && options.EmptyConfigIfNil {
+		config = map[string]any{}
+	}
+	backup := configBackup{
+		Sections: options.Sections,
+		Meta: configBackupMeta{
+			App:        "lazy-balancer-v2",
+			Version:    2,
+			ExportedAt: "2026-10-20T00:00:00Z",
+			Checksum:   checksumBackupPayload(t, tables, config),
+		},
+		Config: config,
+		Tables: tables,
+	}
+	return marshalJSONForTest(t, backup)
 }

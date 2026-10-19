@@ -247,3 +247,30 @@ func TestScrapeRateLimitBlocks_emptyMetricsReturnsNonNilSlice(t *testing.T) {
 		t.Fatalf("blocks=%+v, want empty", blocks)
 	}
 }
+
+// V87-TO-09：按 Prometheus exposition 规范解码标签值转义（\\ \" \n）——
+// 此前反斜杠被吞掉后原样写下一字节，\n 被解析成字面 n。规范未定义的转义
+// （\t 等）原样保留（含反斜杠），不静默丢字节。
+func TestParsePromLabelPairs_prometheusEscapes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "escaped newline", in: `host="a\nb",code="429"`, want: "a\nb"},
+		{name: "escaped backslash", in: `host="a\\b",code="429"`, want: `a\b`},
+		{name: "escaped quote", in: `host="a\"b",code="429"`, want: `a"b`},
+		{name: "undefined escape kept verbatim", in: `host="a\tb",code="429"`, want: `a\tb`},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			labels := parsePromLabelPairs(tt.in)
+			if got := labels["host"]; got != tt.want {
+				t.Fatalf("host=%q, want %q", got, tt.want)
+			}
+			if labels["code"] != "429" {
+				t.Fatalf("code=%q, want 429（转义处理不得影响后续标签）", labels["code"])
+			}
+		})
+	}
+}

@@ -361,7 +361,7 @@ import { computed, ref, onMounted } from 'vue'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import { formatDate, formatDateShort } from '@/utils/date'
-import { isValidCidr } from '@/utils/ruleValidation'
+import { serializeWhitelist } from '@/utils/apiKeyWhitelist'
 import { copyText } from '@/utils/copy'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { CircleCheckFilled, Connection, CopyDocument, Delete, Document, Key, Plus, Setting, SetUp, SwitchButton, VideoPlay } from '@element-plus/icons-vue'
@@ -466,11 +466,7 @@ const fetchKeys = async () => {
   }
 }
 
-const normalizeCidr = (rawValue: string): string => {
-  const value = rawValue.trim()
-  if (!value || value.includes('/')) return value
-  return value.includes(':') ? `${value}/128` : `${value}/32`
-}
+// W87-16：白名单归一/序列化/逐行 CIDR 校验收敛到 utils/apiKeyWhitelist 单源（可 node 行为测试）。
 
 // 后端契约恒为 string[]（internal/models/models.go APIKey/APIKeyResponse），无需 string 兼容分支
 const parseWhitelist = (value: readonly string[]): string => value.join('\n')
@@ -481,15 +477,6 @@ const whitelistSummary = (value: readonly string[]): string => {
   const entries = whitelistEntries(value)
   const preview = entries.slice(0, 3).join('、')
   return `${entries.length} 条：${preview}${entries.length > 3 ? ' 等' : ''}`
-}
-
-const serializeWhitelist = (value: string): { readonly value: string[]; readonly error: string } => {
-  const rows = value.split(/\r?\n/)
-    .map((cidr, originalIndex) => ({ cidr: normalizeCidr(cidr), originalIndex }))
-    .filter((row) => row.cidr !== '')
-  const invalidRow = rows.find((row) => !isValidCidr(row.cidr))
-  if (invalidRow) return { value: [], error: `第 ${invalidRow.originalIndex + 1} 行 IP 或 CIDR 格式不正确` }
-  return { value: rows.map((row) => row.cidr), error: '' }
 }
 
 const openCreateDialog = (): void => {

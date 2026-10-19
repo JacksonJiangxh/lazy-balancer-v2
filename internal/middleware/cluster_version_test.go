@@ -112,7 +112,11 @@ func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testi
 	}
 }
 
-func TestClusterVersionMiddleware_bumps_in_business_write_transaction(t *testing.T) {
+// CI87-12（历史）：名称如实反映覆盖面——中间件不开启事务（无 BeginTx），
+// 版本递增由 users/lb_rules 等表上的语句级触发器完成；本测试只证明「同步写
+// 单语句即 bump」，不证明多语句 handler 的原子性（见
+// TestClusterVersionMiddleware_statementLevelAtomicityWithoutExplicitTx）。
+func TestClusterVersionMiddleware_bumps_on_synchronized_statement(t *testing.T) {
 	// Given
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -154,7 +158,9 @@ func TestClusterVersionMiddleware_bumps_in_business_write_transaction(t *testing
 	}
 }
 
-func TestClusterVersionMiddleware_rolls_back_business_write_when_version_bump_fails(t *testing.T) {
+// CI87-12（历史）：回滚来自 SQLite 触发器 ABORT 的**语句级**原子性——
+// 不是中间件事务。多语句 handler 若不显式事务，前序语句会保留提交。
+func TestClusterVersionMiddleware_statement_rolls_back_when_version_bump_fails(t *testing.T) {
 	// Given
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -197,6 +203,61 @@ func TestClusterVersionMiddleware_rolls_back_business_write_when_version_bump_fa
 	}
 	if count != 0 || version != 0 {
 		t.Fatalf("rule count=%d version=%d, want both unchanged", count, version)
+	}
+}
+
+// CI87-12：契约显式化——中间件只做「同步写分类 + 触发器可用性」门，不包裹
+// 业务事务。多语句 handler 未显式 BEGIN 时，前序语句（非同步表）保留提交，
+// 同步语句因 bump 失败单独 ABORT。需要整体原子性的 handler 必须自建事务。
+func TestClusterVersionMiddleware_statementLevelAtomicityWithoutExplicitTx(t *testing.T) {
+	// Given
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize database: %v", err)
+	}
+	database := db.DB
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(clusterVersionMiddleware(database))
+	if _, err := database.Exec(`CREATE TRIGGER reject_cluster_version BEFORE UPDATE OF cluster_version ON global_config
+		BEGIN SELECT RAISE(ABORT, 'cluster version unavailable'); END`); err != nil {
+		t.Fatalf("install failing bump trigger: %v", err)
+	}
+	router.POST("/api/v1/rules", func(c *gin.Context) {
+		// 语句 1：非同步表（revoked_jti）——不触发 cluster_version。
+		if _, err := database.Exec(`INSERT INTO revoked_jti (jti_hash, expires_at) VALUES ('atomicity-probe','2099-01-01T00:00:00Z')`); err != nil {
+			c.AbortWithStatus(http.StatusInternalServerError)
+			return
+		}
+		// 语句 2：同步写——版本 bump 失败 → 仅本语句 ABORT。
+		if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port) VALUES ('lb_atomicity','atomicity','http',8081)`); err != nil {
+			c.AbortWithStatus(http.StatusInternalServerError)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
+	recorder := httptest.NewRecorder()
+
+	// When
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/rules", nil))
+
+	// Then：同步写回滚但前序语句保留——handler 需自建事务才能整体回滚。
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500", recorder.Code)
+	}
+	var probe, rules int
+	if err := database.QueryRow("SELECT COUNT(*) FROM revoked_jti WHERE jti_hash='atomicity-probe'").Scan(&probe); err != nil {
+		t.Fatalf("count probe row: %v", err)
+	}
+	if err := database.QueryRow("SELECT COUNT(*) FROM lb_rules WHERE caddy_id='lb_atomicity'").Scan(&rules); err != nil {
+		t.Fatalf("count synchronized rule: %v", err)
+	}
+	if probe != 1 || rules != 0 {
+		t.Fatalf("probe=%d rules=%d, want first statement persisted and synchronized statement rolled back", probe, rules)
 	}
 }
 

@@ -100,13 +100,16 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	if ctx.Err() != nil {
 		return
 	}
-	if db.DB == nil {
+	// 快照全局句柄：测试/停机清理可能在 nil 检查与查询之间把 db.DB 置空，
+	// 直接读全局会让巡检 goroutine 在 database/sql 的 nil *DB 上 SIGSEGV。
+	database := db.DB
+	if database == nil {
 		return
 	}
 	// 历史问题-07：提升后 pin 清理失败的重试挂巡检周期。此前唯一重试点是
 	// Snapshot()（从节点 Pull）入口——刚提升、无从节点的主节点永不重试，
 	// 旧主节点 pin 文件与「清理失败」审计长期残留（进程重启连内存态也丢）。
-	for _, service := range clusterServicesFor(db.DB) {
+	for _, service := range clusterServicesFor(database) {
 		service.retryPendingPinCleanup()
 	}
 	var clusterVersion, syncInterval int
@@ -114,12 +117,12 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	// cluster_sync 同口径读 global_config（COALESCE 60 兜底）；nodes.sync_interval
 	// 是写侧（RegisterNode/ReportNode）从不写的死列（schema 默认 60），读它会把
 	// 阈值钉死在 120s 下限，真实 interval>120s 时逐轮误报离线。
-	if err := db.DB.QueryRowContext(ctx,
+	if err := database.QueryRowContext(ctx,
 		`SELECT COALESCE(cluster_version,0), COALESCE(sync_interval,60) FROM global_config WHERE id=1`).Scan(&clusterVersion, &syncInterval); err != nil {
 		TaskLogfWarn("cluster-sync", "serving", "巡检失败：读取集群版本与同步间隔失败（下一轮重试）：%v", err)
 		return
 	}
-	rows, err := db.DB.QueryContext(ctx,
+	rows, err := database.QueryContext(ctx,
 		`SELECT id, COALESCE(name,''), last_seen, COALESCE(reported_version,0)
 		 FROM nodes WHERE is_approved=1 AND mode='slave'`)
 	if err != nil {

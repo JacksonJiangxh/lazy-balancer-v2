@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"lazy-balancer-v2/internal/models"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -194,10 +193,12 @@ func TestJWTLogout_revocation_usesUTCTextAcrossNegativeTimezoneQueryAndCleanup(t
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM revoked_jti WHERE expires_at > ?", time.Now().UTC().Format("2006-01-02T15:04:05Z")).Scan(&active); err != nil {
 		t.Fatal(err)
 	}
-	var cleanupErr error
-	if _, err := db.DB.Exec("DELETE FROM revoked_jti WHERE expires_at<=?", time.Unix(expiresAt+1, 0).UTC().Format(models.RevokedTokenTimeFormat)); err != nil {
-		cleanupErr = err
+	// CI87-13：驱动生产清理实现（db.CleanupExpiredRevokedJTI）而非在测试里复刻
+	// DELETE——真实 SQL 与时间格式（历史问题 B-F4 的 T/空格分隔陷阱）由此被覆盖。
+	if _, err := db.DB.Exec("INSERT INTO revoked_jti (jti_hash, expires_at) VALUES ('stale-jti','2000-01-01T00:00:00Z')"); err != nil {
+		t.Fatal(err)
 	}
+	cleanupErr := db.CleanupExpiredRevokedJTI(db.DB)
 	var remaining int
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM revoked_jti").Scan(&remaining); err != nil {
 		t.Fatal(err)
@@ -207,8 +208,9 @@ func TestJWTLogout_revocation_usesUTCTextAcrossNegativeTimezoneQueryAndCleanup(t
 	if logout.Code != http.StatusOK || revoked.Code != http.StatusUnauthorized {
 		t.Fatalf("logout=%d revoked=%d", logout.Code, revoked.Code)
 	}
-	if !strings.HasSuffix(stored, "Z") || active != 1 || cleanupErr != nil || remaining != 0 {
-		t.Fatalf("stored=%q active=%d cleanup=%v remaining=%d", stored, active, cleanupErr, remaining)
+	// 过期行被清理、未过期的登出行保留（UTC 文本比较格式与生产一致）。
+	if !strings.HasSuffix(stored, "Z") || active != 1 || cleanupErr != nil || remaining != 1 {
+		t.Fatalf("stored=%q active=%d cleanup=%v remaining=%d, want stale removed and active kept", stored, active, cleanupErr, remaining)
 	}
 }
 

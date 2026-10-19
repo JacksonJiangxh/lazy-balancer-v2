@@ -109,9 +109,6 @@ func cloneRateLimitBlocks(src []RateLimitHostBlocks) []RateLimitHostBlocks {
 	return out
 }
 
-// scrapeRateLimitBlocksUncached 实际抓取与解析（缓存/单飞外壳见
-// ScrapeRateLimitBlocks）。
-
 // RateLimitHostBlocks 单个站点的限流拦截累计次数。
 type RateLimitHostBlocks struct {
 	Host  string  `json:"host"`
@@ -212,8 +209,11 @@ func parseRateLimit429Counts(body string) map[string]float64 {
 	return counts
 }
 
-// parsePromLabelPairs 解析 Prometheus 标签列表（key="value",...），
-// 容忍值内的转义引号与逗号；残缺片段直接丢弃。
+// parsePromLabelPairs 解析 Prometheus 标签列表（key="value",...），容忍值内的
+// 逗号；残缺片段直接丢弃。
+// 转义按 exposition format 规范解码（V87-TO-09）：`\\`→`\`、`\"`→`"`、
+// `\n`→换行。规范未定义的转义（如 `\t`）原样保留（反斜杠+字符）——此前
+// 实现直接吞掉反斜杠写下一字节，`\n` 被解析成字面 n（值失真），且静默丢字节。
 func parsePromLabelPairs(s string) map[string]string {
 	labels := map[string]string{}
 	for len(s) > 0 {
@@ -227,7 +227,19 @@ func parsePromLabelPairs(s string) map[string]string {
 		i := 0
 		for i < len(s) && s[i] != '"' {
 			if s[i] == '\\' && i+1 < len(s) {
-				i++
+				switch s[i+1] {
+				case '\\':
+					value.WriteByte('\\')
+				case '"':
+					value.WriteByte('"')
+				case 'n':
+					value.WriteByte('\n')
+				default:
+					value.WriteByte('\\')
+					value.WriteByte(s[i+1])
+				}
+				i += 2
+				continue
 			}
 			value.WriteByte(s[i])
 			i++

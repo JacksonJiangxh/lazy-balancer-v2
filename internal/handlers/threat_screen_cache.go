@@ -31,13 +31,14 @@ type threatTopTarget struct {
 // （历史问题-01：旧键只有 hours，命中时会把 5 分钟前的旧窗口结果当当前窗口）。
 const topTargetsCacheTTL = time.Minute
 
-// topTargetsCacheKey 缓存键含 *sql.DB 指针、hours 与窗口锚点 sinceMinute——
+// topTargetsCacheKey 缓存键含 *sql.DB 指针与窗口锚点 sinceMinute——
 // 测试换库/换窗口即失效，不串库不串窗口；窗口每分钟前移即新键，不会返回
-// 含窗口外事件的过期聚合。
+// 含窗口外事件的过期聚合。窗口粒度只由 sinceMinute 编码（HC-04 历史：
+// 此前键上还带无消费方的 hours，形成第二事实源——查询只按 sinceMinute 过滤，
+// 键上的 hours 会让后续改动窗口语义时误判已有隔离）。
 type topTargetsCacheKey struct {
 	metrics     *sql.DB // security_event_target_rollup 所在库
 	main        *sql.DB // lb_rules 所在库
-	hours       int
 	sinceMinute string
 }
 
@@ -59,11 +60,11 @@ var (
 //   - 历史问题：先批量解析现存规则，再按计数顺序取前 3 条**现存**目标——已
 //     删除规则不得挤掉后续真实站点；
 //   - 查询失败不缓存、错误上抛（调用方整卡 500，与现有错误口径一致）。
-func threatTopTargets(sinceMinute string, hours int) ([]threatTopTarget, error) {
+func threatTopTargets(sinceMinute string) ([]threatTopTarget, error) {
 	if db.MetricsDB == nil || db.DB == nil {
 		return nil, errors.New("database unavailable")
 	}
-	key := topTargetsCacheKey{metrics: db.MetricsDB, main: db.DB, hours: hours, sinceMinute: sinceMinute}
+	key := topTargetsCacheKey{metrics: db.MetricsDB, main: db.DB, sinceMinute: sinceMinute}
 	now := time.Now()
 	topTargetsCacheMu.Lock()
 	if entry, ok := topTargetsCache[key]; ok && now.Before(entry.expiresAt) {

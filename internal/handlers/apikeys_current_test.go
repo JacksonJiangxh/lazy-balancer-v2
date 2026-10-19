@@ -509,3 +509,75 @@ func TestCreateAPIKey_quotaAtomicUnderConcurrency(t *testing.T) {
 		t.Fatalf("created=%d, want exactly %d（限额满后其余必须 400 拒绝）", created, apiKeyMaxPerUser)
 	}
 }
+
+// 历史问题（历史）：创建审计必须区分特权授予——此前只记 id/name/过期，
+// 「可写 + MCP 开 + 白名单」的 Key 与只读 Key 审计文案完全相同。字段级
+// detail 不得落完整密钥。
+func TestCreateAPIKey_auditDetailRecordsPrivilegeFields(t *testing.T) {
+	setupAPIKeyTestDB(t)
+	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
+		t.Fatalf("initialize audit db: %v", err)
+	}
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/api-keys",
+		strings.NewReader(`{"name":"privileged","read_only":false,"mcp_enabled":true,"mcp_ip_whitelist":["127.0.0.1","10.0.0.0/8"]}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set("user_id", 1)
+	ctx.Set("role", "admin")
+	(&Handlers{}).CreateCurrentUserAPIKey(ctx)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s, want 201", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Data struct {
+			Key string `json:"key"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='创建' AND resource='API密钥' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read audit detail: %v", err)
+	}
+	for _, want := range []string{"权限：可写", "MCP：开", "MCP 白名单：2 条"} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("audit detail=%q, want 含 %q", detail, want)
+		}
+	}
+	if body.Data.Key != "" && strings.Contains(detail, body.Data.Key) {
+		t.Fatalf("audit detail 不得落完整密钥: %q", detail)
+	}
+}
+
+// 历史问题（历史）：更新审计必须留痕安全相关变更（启用态/MCP/只读/白名单），
+// 此前只有「密钥 id name」，禁用与放宽权限在审计中不可回溯。
+func TestUpdateAPIKey_auditDetailRecordsSecurityDelta(t *testing.T) {
+	setupAPIKeyTestDB(t)
+	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
+		t.Fatalf("initialize audit db: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/api/v1/users/me/api-keys/10",
+		strings.NewReader(`{"is_enabled":false,"mcp_enabled":true,"read_only":true,"mcp_ip_whitelist":["192.0.2.0/24"]}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Params = gin.Params{{Key: "id", Value: "10"}}
+	ctx.Set("user_id", 1)
+	ctx.Set("role", "admin")
+	(&Handlers{}).UpdateCurrentUserAPIKeyStatus(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='API密钥' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read audit detail: %v", err)
+	}
+	for _, want := range []string{"启用状态：开→关", "MCP：关→开", "只读：false→true", "MCP 白名单：0 条→1 条"} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("audit detail=%q, want 含 %q", detail, want)
+		}
+	}
+}

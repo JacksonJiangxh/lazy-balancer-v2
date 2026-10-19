@@ -401,10 +401,11 @@ func MaterializeAllCertsFromDB() {
 				Logf("error", "certstore: scan manual cert failed: %v", err)
 				continue
 			}
-			if err := materializeCertPair(ruleID, certPEM, keyPEM); err != nil {
-				Logf("error", "certstore: write manual cert %s failed: %v", ruleID, err)
+			changed, materializeErr := materializeCertPair(ruleID, certPEM, keyPEM)
+			if materializeErr != nil {
+				Logf("error", "certstore: write manual cert %s failed: %v", ruleID, materializeErr)
 				RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditRulePart(ruleID), "类型：手动证书", AuditResultPart("io_error")), "")
-			} else {
+			} else if changed {
 				manualRecovered++
 			}
 		}
@@ -433,21 +434,24 @@ func MaterializeAllCertsFromDB() {
 				Logf("error", "certstore: scan ACME cert failed: %v", err)
 				continue
 			}
-			// 同 rule_id 多行只取首行(ORDER BY updated_at DESC=最新),旧行跳过——
-			// 防旧域/旧材料覆盖新物化(历史问题)。
+			// 同 rule_id 多行只取首个**适用**行（ORDER BY updated_at DESC, id DESC）。
+			// SV历史问题（R-12 同族收敛，对齐 certificates.go reconcile 历史
+			// D2-历史问题）：必须先判适用性再标记 seen——先 seen 后适用性会让最新
+			// 旧域行短路较旧的适用行，整条规则被跳过、证书文件不物化。
 			if seenRules[ruleID] {
 				continue
 			}
-			seenRules[ruleID] = true
 			// 历史问题:域名适用性校验(与 certJobRuleApplicable 同语义)——任务签发
 			// 域名与规则当前域名不一致时物化会写入不匹配证书。
 			if !certJobRuleApplicable(true, ruleDomain, jobDomain) {
 				continue
 			}
-			if err := materializeCertPair(ruleID, certPEM, keyPEM); err != nil {
-				Logf("error", "certstore: write ACME cert %s failed: %v", ruleID, err)
+			seenRules[ruleID] = true
+			changed, materializeErr := materializeCertPair(ruleID, certPEM, keyPEM)
+			if materializeErr != nil {
+				Logf("error", "certstore: write ACME cert %s failed: %v", ruleID, materializeErr)
 				RecordAuditLog("system", "恢复失败", "证书文件", FormatAuditDetail(AuditRulePart(ruleID), "类型：ACME证书", AuditResultPart("io_error")), "")
-			} else {
+			} else if changed {
 				acmeRecovered++
 			}
 		}
@@ -462,13 +466,17 @@ func MaterializeAllCertsFromDB() {
 	TaskLogf("startup:config-load", "certs", "证书物化完成：手动证书 %d 个、ACME 证书 %d 个落盘", manualRecovered, acmeRecovered)
 }
 
-func materializeCertPair(ruleID, certPEM, keyPEM string) error {
+// materializeCertPair 把库内证书对物化到磁盘，返回是否真正发生了写入。
+// SV历史问题：内容与权限已一致时零写（返回 changed=false）——调用方的恢复计数
+// 与审计/任务日志必须只统计 changed，否则每次启动都报「恢复 N 个」，稀释真正
+// 的恢复事件（运维无法区分「真恢复」与「本来就在」）。
+func materializeCertPair(ruleID, certPEM, keyPEM string) (bool, error) {
 	if _, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM)); err != nil {
-		return fmt.Errorf("证书与私钥不匹配: %w", err)
+		return false, fmt.Errorf("证书与私钥不匹配: %w", err)
 	}
 	certPath, keyPath := CertFilePaths(ruleID)
 	if certPath == "" {
-		return fmt.Errorf("非法的规则编号: %q", ruleID)
+		return false, fmt.Errorf("非法的规则编号: %q", ruleID)
 	}
 	diskCert, certErr := os.ReadFile(certPath)
 	diskKey, keyErr := os.ReadFile(keyPath)
@@ -480,9 +488,12 @@ func materializeCertPair(ruleID, certPEM, keyPEM string) error {
 				// CERT-历史问题（历史）：删除对磁盘字节的重复 X509KeyPair 解析——
 				// :467 的 bytes.Equal 已证明磁盘字节与 :458 刚验证通过的库内
 				// 字节完全相同，二次解析不可能产生不同结果。
-				return nil
+				return false, nil
 			}
 		}
 	}
-	return WriteCertFiles(ruleID, certPEM, keyPEM)
+	if err := WriteCertFiles(ruleID, certPEM, keyPEM); err != nil {
+		return false, err
+	}
+	return true, nil
 }

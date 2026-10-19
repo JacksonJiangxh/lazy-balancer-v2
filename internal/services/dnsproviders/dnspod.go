@@ -14,6 +14,19 @@ import (
 
 var newDNSProviderFromCredentials = dnsprovider.NewProviderFromCredentials
 
+// warnLog 是本包的告警输出接缝（SV历史问题）：包边界不允许导入 services 的分级
+// Logf，默认写标准库 log 并保留原有 "warn: " 前缀形态；services 侧在 init
+// 注入 Logf("warn", ...)，使告警与全局日志级别过滤/JSON 输出同形态（此前
+// 直接 log.Printf 的残留在 warn 以上级别过滤或 JSON 输出场景会丢失/形态分叉）。
+var warnLog = func(format string, args ...any) { log.Printf("warn: "+format, args...) }
+
+// SetWarnLogger 注入分级告警输出（生产由 services 包 init 调用；nil 忽略）。
+func SetWarnLogger(fn func(format string, args ...any)) {
+	if fn != nil {
+		warnLog = fn
+	}
+}
+
 func init() { Register(&DNSPod{}) }
 
 type DNSPod struct {
@@ -25,12 +38,20 @@ func (d *DNSPod) Name() string       { return "DNSPod (腾讯云)" }
 func (d *DNSPod) ModuleName() string { return "dns.providers.dnspod" }
 
 func (d *DNSPod) CredentialFields() []CredentialField {
+	// visible_when/option_labels（WS-13，历史）：字段可见性与选项文案
+	// 由后端元数据下发，前端不再硬编码两种认证模式的字段名。
+	visibleOnly := func(mode string) map[string][]string {
+		return map[string][]string{"auth_mode": {mode}}
+	}
 	return []CredentialField{
-		{Name: "auth_mode", Label: "认证方式", Type: "select", Required: true, Placeholder: "dnspod"},
-		{Name: "app_id", Label: "App ID", Type: "text", Required: false, Placeholder: "DNSPod 账号的 App ID（旧版）"},
-		{Name: "app_token", Label: "App Token", Type: "password", Required: false, Placeholder: "DNSPod 账号的 API Token（旧版）"},
-		{Name: "secret_id", Label: "SecretId", Type: "text", Required: false, Placeholder: "腾讯云 API SecretId（新版）"},
-		{Name: "secret_key", Label: "SecretKey", Type: "password", Required: false, Placeholder: "腾讯云 API SecretKey（新版）"},
+		{
+			Name: "auth_mode", Label: "认证方式", Type: "select", Required: true, Placeholder: "dnspod",
+			OptionLabels: map[string]string{"dnspod": "DNSPod API", "tencent_cloud": "腾讯云 API"},
+		},
+		{Name: "app_id", Label: "App ID", Type: "text", Required: false, Placeholder: "DNSPod 账号的 App ID（旧版）", VisibleWhen: visibleOnly("dnspod")},
+		{Name: "app_token", Label: "App Token", Type: "password", Required: false, Placeholder: "DNSPod 账号的 API Token（旧版）", VisibleWhen: visibleOnly("dnspod")},
+		{Name: "secret_id", Label: "SecretId", Type: "text", Required: false, Placeholder: "腾讯云 API SecretId（新版）", VisibleWhen: visibleOnly("tencent_cloud")},
+		{Name: "secret_key", Label: "SecretKey", Type: "password", Required: false, Placeholder: "腾讯云 API SecretKey（新版）", VisibleWhen: visibleOnly("tencent_cloud")},
 	}
 }
 
@@ -161,7 +182,7 @@ func (d *DNSPod) Validate(creds map[string]string, testDomain string) error {
 	if err := provider.CleanUp(cleanupCtx, zone, challengeName); err != nil {
 		// CERT42-6（历史）：清理失败时测试 TXT 记录可能已残留——记告警
 		// 并在错误文案点名手动清理路径；返回错误语义不变（验证仍判失败）。
-		log.Printf("warn: dnspod 验证清理失败，测试记录 %s 可能残留，请手动清理: %v", challengeName, err)
+		warnLog("dnspod 验证清理失败，测试记录 %s 可能残留，请手动清理: %v", challengeName, err)
 		return fmt.Errorf("DNS 清理测试失败: %w（测试记录可能已残留，请登录 DNS 控制台手动清理 %s TXT 记录）", err, strings.TrimSuffix(challengeName, "."))
 	}
 	return nil

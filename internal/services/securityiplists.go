@@ -31,13 +31,23 @@ type policyIPRefExpansion struct {
 // parseIPListRefs 与 handlers.parseIPListRefsIDs 为镜像实现（历史 历史问题
 // 裁定保留双份并声明）：本侧投影路径去重保序，handlers 侧校验路径不去重
 // ——语义有意分叉，勿单方面合并。
+// SSA-87-01（历史）：本函数为零日志形态（判定/兼容调用）；渲染路径
+// 必须走 parseIPListRefsLogged——畸形 refs 静默按空集处理会让 deny ACL 仅引用
+// 列表的策略合并集为空、id:2 永不命中（静默 fail-open），此前零告警。
 func parseIPListRefs(raw string) []int64 {
+	ids, _ := parseIPListRefsChecked(raw)
+	return ids
+}
+
+// parseIPListRefsChecked 与 parseIPListRefs 同解析语义，另把「非空但畸形」暴露
+// 为错误（空/空白=未配置引用，不算畸形）。
+func parseIPListRefsChecked(raw string) ([]int64, error) {
 	if strings.TrimSpace(raw) == "" {
-		return nil
+		return nil, nil
 	}
 	var ids []int64
 	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
-		return nil
+		return nil, err
 	}
 	seen := make(map[int64]struct{}, len(ids))
 	out := make([]int64, 0, len(ids))
@@ -48,7 +58,28 @@ func parseIPListRefs(raw string) []int64 {
 		seen[id] = struct{}{}
 		out = append(out, id)
 	}
-	return out
+	return out, nil
+}
+
+// parseIPListRefsLogged 渲染路径解析入口（SSA-87-01）：非空畸形 refs 留痕后按
+// 空集处理——行为与旧实现一致（仅保留 inline，不升级 IPRefMissing：该标记会
+// 让整条策略含 WAF/限流一并跳过渲染，缺失面反而放大）。
+func parseIPListRefsLogged(policyID int, field, raw string) []int64 {
+	ids, err := parseIPListRefsChecked(raw)
+	if err != nil {
+		logMalformedIPListRefs(policyID, field, err)
+	}
+	return ids
+}
+
+// logMalformedIPListRefs 渲染期引用 IP 名单 JSON 畸形留痕（SSA-87-01，限流）：
+// 与 logMalformedInlineIPList 同口径。写侧（handlers parseIPListRefsPayload）/
+// 导入校验已拒畸形，仅带外改库/集群快照继承/旧备份可达。
+func logMalformedIPListRefs(policyID int, field string, err error) {
+	msg := fmt.Sprintf("渲染: 策略 #%d 引用 IP 名单 %s 解析失败（该列按空集处理，仅保留 inline 条目）: %v", policyID, field, err)
+	if auditFailureShouldLog(msg) {
+		Logf("warn", "%s", msg)
+	}
 }
 
 // ipListRefsNonEmpty 报告 refs JSON 是否解析出至少一个条目（畸形视为空）。
@@ -67,6 +98,22 @@ func logMalformedInlineIPList(policyID int, field string, err error) {
 	}
 }
 
+// logMalformedInlineIPLists 按策略留痕两个内联 IP 列（SSA-87-06：合并集缓存
+// 命中时不再走 expandPolicyIPRefs，需在此补齐该策略自身的畸形留痕）。
+func logMalformedInlineIPLists(p *models.SecurityPolicy) {
+	if p == nil {
+		return
+	}
+	var list []string
+	if err := json.Unmarshal([]byte(p.IPACLList), &list); err != nil {
+		logMalformedInlineIPList(p.ID, "ip_acl_list", err)
+	}
+	list = nil
+	if err := json.Unmarshal([]byte(string(p.IPWhitelist)), &list); err != nil {
+		logMalformedInlineIPList(p.ID, "ip_whitelist", err)
+	}
+}
+
 // expandPolicyIPRefs 把策略的 inline IP 条目与引用的 IP 列表条目合并为生效集：
 // inline 条目优先，其后按 refs 出现顺序追加各列表条目；跨来源逐值去重；
 // listsByID 缺失的 id 与内嵌 null 值跳过。纯函数，不触碰数据库。
@@ -75,7 +122,7 @@ func expandPolicyIPRefs(p *models.SecurityPolicy, listsByID map[int64][]string) 
 	if p == nil {
 		return exp
 	}
-	merge := func(field, inlineRaw string, refsRaw string) []string {
+	merge := func(field, refsField, inlineRaw string, refsRaw string) []string {
 		var merged []string
 		seen := make(map[string]struct{})
 		addAll := func(entries []string) {
@@ -95,7 +142,8 @@ func expandPolicyIPRefs(p *models.SecurityPolicy, listsByID map[int64][]string) 
 			logMalformedInlineIPList(p.ID, field, err)
 		}
 		addAll(inline)
-		for _, id := range parseIPListRefs(refsRaw) {
+		// SSA-87-01：非法 refs 与非 inline 同口径留痕（同一消息限流，不重复刷屏）。
+		for _, id := range parseIPListRefsLogged(p.ID, refsField, refsRaw) {
 			addAll(listsByID[id])
 		}
 		return merged
@@ -104,8 +152,8 @@ func expandPolicyIPRefs(p *models.SecurityPolicy, listsByID map[int64][]string) 
 	// 发射端 mergedACLList/mergedWhitelist 按规则×策略逐次调用，若在此处不
 	// 聚合，万条级合并集（如 USTC 11415 条）会被每次调用全量重聚合——保存
 	// 耗时随绑定规则数线性放大。聚合幂等，此处一次完成后发射端直接返回。
-	exp.ACLList = aggregateIPEntries(merge("ip_acl_list", p.IPACLList, p.IPACLListRefs))
-	exp.Whitelist = aggregateIPEntries(merge("ip_whitelist", string(p.IPWhitelist), p.IPWhitelistRefs))
+	exp.ACLList = aggregateIPEntries(merge("ip_acl_list", "ip_acl_list_refs", p.IPACLList, p.IPACLListRefs))
+	exp.Whitelist = aggregateIPEntries(merge("ip_whitelist", "ip_whitelist_refs", string(p.IPWhitelist), p.IPWhitelistRefs))
 	return exp
 }
 
@@ -321,7 +369,7 @@ func readThreatIplistEntries(listName string) ([]string, error) {
 
 // threatSourceByListName 列表名 → 威胁源名（反向映射 ThreatListNameBySource）。
 func threatSourceByListName(listName string) string {
-	for _, sl := range db.ThreatSystemLists {
+	for _, sl := range db.ThreatSystemLists() {
 		if sl.Name == listName {
 			return sl.Source
 		}
@@ -386,14 +434,16 @@ func resolvePolicyIPListRefs(policies []*models.SecurityPolicy, store caddyConfi
 		if p == nil {
 			continue
 		}
-		for _, id := range parseIPListRefs(p.IPACLListRefs) {
+		// SSA-87-01：渲染解析路径（本循环覆盖每条策略两个 refs 列各一次）对
+		// 畸形非空 refs 留痕——空/空白不告警（未配置引用）。
+		for _, id := range parseIPListRefsLogged(p.ID, "ip_acl_list_refs", p.IPACLListRefs) {
 			if _, dup := seen[id]; dup {
 				continue
 			}
 			seen[id] = struct{}{}
 			refIDs = append(refIDs, id)
 		}
-		for _, id := range parseIPListRefs(p.IPWhitelistRefs) {
+		for _, id := range parseIPListRefsLogged(p.ID, "ip_whitelist_refs", p.IPWhitelistRefs) {
 			if _, dup := seen[id]; dup {
 				continue
 			}
@@ -422,6 +472,12 @@ func resolvePolicyIPListRefs(policies []*models.SecurityPolicy, store caddyConfi
 			RecordAuditLog("system", "渲染跳过", "安全策略", refErr+"，已跳过该策略渲染", "")
 		}
 	}
+	// SSA-87-06（历史）：展开结果按「四条来源列完全相同」在本次调用内
+	// 去重。多策略引用同一大名单（常见形态）时，per-policy aggregateIPEntries
+	// （20 万条 ≈ 19ms）只做一次；单一策略形态零行为差异。键只含策略来源列
+	// （纯函数输入，本次调用内 listsByID 固定），故不存在跨 tick 陈旧风险，
+	// 也无内存常驻（随调用生命周期回收）。
+	expandMemo := make(map[string]policyIPRefExpansion, len(policies))
 	for _, p := range policies {
 		if p == nil {
 			continue
@@ -454,7 +510,16 @@ func resolvePolicyIPListRefs(policies []*models.SecurityPolicy, store caddyConfi
 		if p.IPRefMissing {
 			continue
 		}
-		exp := expandPolicyIPRefs(p, listsByID)
+		key := strings.Join([]string{p.IPACLList, p.IPACLListRefs, string(p.IPWhitelist), p.IPWhitelistRefs}, "\x00")
+		exp, cached := expandMemo[key]
+		if cached {
+			// 命中时不再付聚合成本，但仍按本策略留痕内联畸形（expand 里的
+			// 同一消息在限流窗口内会被抑制）。
+			logMalformedInlineIPLists(p)
+		} else {
+			exp = expandPolicyIPRefs(p, listsByID)
+			expandMemo[key] = exp
+		}
 		p.MergedACLList = exp.ACLList
 		p.MergedWhitelist = exp.Whitelist
 	}

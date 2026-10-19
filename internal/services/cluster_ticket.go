@@ -29,6 +29,71 @@ var (
 	ErrLoginTicketUserUnavailable = errors.New("登录票据用户不存在或已禁用")
 )
 
+// clusterTicketVerify 是集群一次性票据的验签结果分类（S历史问题-04）：登录票据
+// 与服务控制票据共用同一 HMAC/base64 实现，调用方只按分类映射各自哨兵
+// （两者错误文案不同，不能合并成同一 error）。
+type clusterTicketVerify uint8
+
+const (
+	clusterTicketOK        clusterTicketVerify = iota
+	clusterTicketMalformed                     // 结构/载荷不可解析
+	clusterTicketSignature                     // HMAC 不匹配
+)
+
+// signClusterTicket 把 claims 编码为 "b64(payload).b64(HMAC-SHA256)"。
+// 登录票据与服务控制票据的唯一签发实现（此前两份逐字重复，安全细节单点收敛）。
+func signClusterTicket(claims any, key []byte) (string, error) {
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+	encodedPayload := base64.RawURLEncoding.EncodeToString(payload)
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(encodedPayload))
+	return encodedPayload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+}
+
+// verifyClusterTicket 拆分并用 key 验签（常数时间比较），返回载荷与分类。
+func verifyClusterTicket(ticket string, key []byte) ([]byte, clusterTicketVerify) {
+	parts := strings.Split(ticket, ".")
+	if len(parts) != 2 {
+		return nil, clusterTicketMalformed
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, clusterTicketSignature
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(parts[0]))
+	if !hmac.Equal(signature, mac.Sum(nil)) {
+		return nil, clusterTicketSignature
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, clusterTicketMalformed
+	}
+	return payload, clusterTicketOK
+}
+
+// consumeClusterTicketJTI 在调用方事务内一次性消费票据（清理过期记录 +
+// jti 去重插入）；返回 false 表示重放。事务提交由调用方负责，DB 错误不消耗
+// 票据——登录票据与服务控制票据的唯一消费实现（S历史问题-04）。
+func consumeClusterTicketJTI(ctx context.Context, tx *sql.Tx, jti string, now, expiresAt time.Time) (bool, error) {
+	if _, err := tx.ExecContext(ctx, "DELETE FROM used_login_tickets WHERE expires_at<=?", now); err != nil {
+		return false, err
+	}
+	jtiHash := sha256.Sum256([]byte(jti))
+	result, err := tx.ExecContext(ctx, `INSERT INTO used_login_tickets (jti_hash,expires_at) VALUES (?,?) ON CONFLICT(jti_hash) DO NOTHING`, hex.EncodeToString(jtiHash[:]), expiresAt)
+	if err != nil {
+		return false, err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return inserted == 1, nil
+}
+
 func (s *ClusterService) GenerateLoginTicket(ctx context.Context, claims models.ClusterLoginTicketClaims, now time.Time) (models.ClusterLoginTicketResponse, error) {
 	var ipAddress, protocol, accessURL, keyHash, nodeName string
 	var port int
@@ -71,14 +136,10 @@ func (s *ClusterService) GenerateLoginTicket(ctx context.Context, claims models.
 	// 签发侧预留时钟偏移（60s→90s）：从节点按自身时钟校验，两侧偏差超过
 	// 一分钟时票据恒被拒且无重试窗口。校验侧语义不变。
 	claims.ExpiresAt = now.UTC().Add(90 * time.Second).Unix()
-	payload, err := json.Marshal(claims)
+	ticket, err := signClusterTicket(claims, key)
 	if err != nil {
 		return models.ClusterLoginTicketResponse{}, fmt.Errorf("编码登录票据: %w", err)
 	}
-	encodedPayload := base64.RawURLEncoding.EncodeToString(payload)
-	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write([]byte(encodedPayload))
-	ticket := encodedPayload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	accessURL = resolveNodeAccessURL(ipAddress, port, protocol, accessURL)
 	return models.ClusterLoginTicketResponse{Ticket: ticket, URL: accessURL, NodeName: nodeName}, nil
 }
@@ -110,17 +171,11 @@ func (s *ClusterService) ValidateLoginTicket(ctx context.Context, ticket string,
 		return models.ClusterLoginTicketClaims{}, models.User{}, 0, ErrInvalidLoginTicket
 	}
 	key := sha256.Sum256([]byte(clusterToken))
-	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
+	payload, verify := verifyClusterTicket(ticket, key[:])
+	switch verify {
+	case clusterTicketSignature:
 		return models.ClusterLoginTicketClaims{}, models.User{}, 0, errors.Join(ErrInvalidLoginTicket, ErrLoginTicketSignature)
-	}
-	mac := hmac.New(sha256.New, key[:])
-	_, _ = mac.Write([]byte(parts[0]))
-	if !hmac.Equal(signature, mac.Sum(nil)) {
-		return models.ClusterLoginTicketClaims{}, models.User{}, 0, errors.Join(ErrInvalidLoginTicket, ErrLoginTicketSignature)
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
+	case clusterTicketMalformed:
 		return models.ClusterLoginTicketClaims{}, models.User{}, 0, ErrInvalidLoginTicket
 	}
 	var claims models.ClusterLoginTicketClaims
@@ -146,19 +201,11 @@ func (s *ClusterService) ValidateLoginTicket(ctx context.Context, ticket string,
 	if err != nil {
 		return claims, models.User{}, 0, fmt.Errorf("读取登录票据用户: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM used_login_tickets WHERE expires_at<=?", now.UTC()); err != nil {
-		return claims, models.User{}, 0, fmt.Errorf("清理过期登录票据: %w", err)
-	}
-	jtiHash := sha256.Sum256([]byte(claims.JTI))
-	result, err := tx.ExecContext(ctx, `INSERT INTO used_login_tickets (jti_hash,expires_at) VALUES (?,?) ON CONFLICT(jti_hash) DO NOTHING`, hex.EncodeToString(jtiHash[:]), time.Unix(claims.ExpiresAt, 0).UTC())
+	consumed, err := consumeClusterTicketJTI(ctx, tx, claims.JTI, now.UTC(), time.Unix(claims.ExpiresAt, 0).UTC())
 	if err != nil {
 		return claims, models.User{}, 0, fmt.Errorf("消费登录票据: %w", err)
 	}
-	inserted, err := result.RowsAffected()
-	if err != nil {
-		return claims, models.User{}, 0, fmt.Errorf("读取登录票据消费结果: %w", err)
-	}
-	if inserted != 1 {
+	if !consumed {
 		return claims, models.User{}, 0, errors.Join(ErrInvalidLoginTicket, ErrLoginTicketReplay)
 	}
 	if err := tx.Commit(); err != nil {

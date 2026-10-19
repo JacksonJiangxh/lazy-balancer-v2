@@ -39,9 +39,10 @@ type threatSourceDTO struct {
 }
 
 func (h *Handlers) GetThreatLib(c *gin.Context) {
-	sourceNames := make([]string, 0, len(db.ThreatSystemLists))
-	args := make([]interface{}, 0, len(db.ThreatSystemLists))
-	for _, sl := range db.ThreatSystemLists {
+	registry := db.ThreatSystemLists()
+	sourceNames := make([]string, 0, len(registry))
+	args := make([]interface{}, 0, len(registry))
+	for _, sl := range registry {
 		sourceNames = append(sourceNames, "?")
 		args = append(args, sl.Source)
 	}
@@ -220,7 +221,7 @@ func (h *Handlers) StartThreatLibUpdate(c *gin.Context) {
 	// V2（历史用户裁定）：手动触发统一经任务引擎（同 StartCRSUpdate）。
 	te := services.TaskEngine()
 	if te == nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务引擎未初始化"})
+		respondTaskEngineUnavailable(c)
 		return
 	}
 	if te.IsTaskInFlight("threat") {

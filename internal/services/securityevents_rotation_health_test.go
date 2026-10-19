@@ -8,27 +8,18 @@ package services
 import (
 	"errors"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
-
-	"lazy-balancer-v2/internal/db"
 )
 
 // 目标形状：注入 copy 失败 → 连续 tick 后 ingestion.healthy=false 且
 // last_error 指向轮转失败；恢复后健康位复位；「补采失败不截断」语义不变。
 func TestSecurityEventsPollOnce_rotationFailureEntersHealthSnapshot(t *testing.T) {
 	// Given：一条已摄取事件 + 超阈活文件（每 tick 触发轮转）。
-	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.InitializeMetricsDB(dataDir); err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "audit.log")
-	offsetPath := filepath.Join(dir, "security_events.offset")
+	// SSA-87-10（历史）：库夹具必须保存/还原全局指针并 Close（同包
+	// stallSetup/setupSecurityEventsRetentionTestDB 口径）——裸 Initialize 会让
+	// 包级 DB 指向已删除的临时目录。
+	logPath, offsetPath := stallSetup(t)
 	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

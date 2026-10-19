@@ -36,9 +36,9 @@
             <span class="form-tip-inline">个月，仅操作审计日志超期自动清理</span>
           </el-form-item>
           <el-form-item label="安全事件保留">
-            <el-input-number v-model="seRetentionDays" :disabled="isReadOnly" :min="1" :max="3650" :step="30" controls-position="right" style="width: 120px;" />
+            <el-input-number v-model="seRetentionDays" :disabled="isReadOnly" :min="1" :max="3650" :step="30" controls-position="right" style="width: 120px;" @change="seRetentionDaysDirty = true" />
             <span class="form-tip-inline">天</span>
-            <el-input-number v-model="seRowCap" :disabled="isReadOnly" :min="1" :max="100000000" :step="100000" controls-position="right" style="width: 170px; margin-left: 10px;" />
+            <el-input-number v-model="seRowCap" :disabled="isReadOnly" :min="1" :max="100000000" :step="100000" controls-position="right" style="width: 170px; margin-left: 10px;" @change="seRowCapDirty = true" />
             <span class="form-tip-inline">行数上限</span>
             <div class="form-tip-line">安全事件日志每日清理：超出保留天数或行数上限时按最旧优先删除（行数上限在两次清理之间可能短暂超出）。默认 90 天 / 1,000,000 行；高攻击流量部署可按需上调。</div>
           </el-form-item>
@@ -135,8 +135,13 @@
           </el-form-item>
           <el-form-item label="强制加密">
             <el-switch v-model="adminTls.enabled" :disabled="isReadOnly || !adminTlsLoaded" @change="onAdminTlsToggle" />
-            <el-button v-if="adminTls.enabled" size="small" style="margin-left: 8px;" @click="openAdminTlsDialog">配置证书</el-button>
+            <el-button v-if="adminTls.enabled" size="small" style="margin-left: 8px;" :disabled="isReadOnly" @click="openAdminTlsDialog">配置证书</el-button>
             <el-text v-if="adminTlsDirty" type="warning" size="small" style="margin-left: 8px">已暂存，点击下方保存后生效</el-text>
+            <!-- WS-07：读取失败显性化 + 重试（与 githubProxyLoaded 的提示同口径） -->
+            <template v-else-if="adminTlsLoadFailed">
+              <el-text type="danger" size="small" style="margin-left: 8px">TLS 配置读取失败，开关暂不可用</el-text>
+              <el-link type="primary" underline="never" size="small" style="margin-left: 6px" @click="retryLoadAdminTls">重试</el-link>
+            </template>
             <span v-else class="form-tip-inline">启用后 :8000 仅经 HTTPS 访问，需重启服务生效</span>
           </el-form-item>
           <el-form-item label="运行日志">
@@ -294,7 +299,9 @@
             <el-text v-if="importValidation.type === 'v1'" type="info" size="small" class="import-v1-hint">V1 备份仅支持负载均衡规则导入</el-text>
             <el-text v-else-if="!importValidation.valid" type="warning" size="small" class="import-v1-hint">校验未通过——取消勾选包含异常数据的分类后将自动重新校验</el-text>
           </div>
-          <template v-if="importValidation.valid">
+          <!-- WS-10：0 选择时摘要/冲突/覆盖范围必须一并隐藏（否则与「本次不会
+               覆盖任何数据」并存，展示的是上次选择的陈旧预览）。 -->
+          <template v-if="importValidation.valid && importPreviewSelected">
             <el-tag :type="importValidation.type === 'v1' ? 'warning' : 'success'" size="small">
               {{ importValidation.type === 'v1' ? 'V1 兼容导入' : 'V2 完整备份' }}
             </el-tag>
@@ -304,11 +311,14 @@
               </span>
             </div>
             <!-- 历史问题-2:勾选「安全防护」但备份无规则库文件时预览提示(后端兜底
-                 跳过规则库版本记录表并在导入结果 warnings 中说明) -->
+                 跳过规则库版本记录表并在导入结果 warnings 中说明)
+                 历史问题-历史问题（历史）：has_waf_files 已纳入威胁库名单条目，
+                 本提示仅剩「CRS/IP2Region/威胁名单条目全无」形态——文案按真实能力
+                 点明缺失的是规则库版本文件，避免与「导入将落盘名单文件」矛盾 -->
             <el-text
               v-if="importValidation.has_waf_files === false && importSections.includes('security')"
               type="warning" size="small" class="import-waf-hint"
-            >该备份不含规则库文件，导入「安全防护」将跳过规则库版本记录</el-text>
+            >该备份不含规则库版本文件（CRS/IP2Region 与威胁库名单条目），导入「安全防护」将跳过规则库版本记录</el-text>
             <ul v-if="importValidation.warnings?.length" class="import-warnings">
               <li v-for="(warning, index) in importValidation.warnings" :key="index">{{ warning }}</li>
             </ul>
@@ -317,16 +327,19 @@
                 {{ formatImportConflict(conflict) }}
               </li>
             </ul>
-            <!-- 历史问题-历史问题：空分类选择不再拼出「将仅覆盖所选分类：，」残句 -->
-            <div v-if="importValidation.type !== 'v1'" class="info-note-bar import-alert"><span class="info-note-desc">{{ importSections.length === BACKUP_SECTIONS.length ? '导入将覆盖当前全部配置（规则、用户、密钥、证书任务、节点拓扑）' : importSections.length > 0 ? `将仅覆盖所选分类：${importSections.map((k) => BACKUP_SECTIONS.find((s) => s.key === k)?.label || k).join('、')}，未选分类保持现状` : '未选择导入分类——本次导入不会覆盖任何数据（请至少选择一个分类）' }}</span></div>
+            <!-- 历史问题-历史问题：空分类选择不再拼出「将仅覆盖所选分类：，」残句
+                 （0 选择的文案已由下方 v-else 分支承担，本块恒有 ≥1 分类） -->
+            <div v-if="importValidation.type !== 'v1'" class="info-note-bar import-alert"><span class="info-note-desc">{{ importSections.length === BACKUP_SECTIONS.length ? '导入将覆盖当前全部配置（规则、用户、密钥、证书任务、节点拓扑）' : `将仅覆盖所选分类：${importSections.map((k) => BACKUP_SECTIONS.find((s) => s.key === k)?.label || k).join('、')}，未选分类保持现状` }}</span></div>
             <div v-else class="info-note-bar" style="margin-top: 4px"><span class="info-note-desc">仅导入负载均衡规则，其他数据不受影响</span></div>
           </template>
+          <div v-else-if="importValidation.valid" class="info-note-bar import-alert"><span class="info-note-desc">未选择导入分类——本次导入不会覆盖任何数据（请至少选择一个分类）</span></div>
         </div>
       </template>
 
       <template #footer>
         <el-button @click="importDialogVisible = false">取消</el-button>
-        <el-button type="primary" :disabled="!importValidation?.valid" :loading="importing" @click="confirmImport">确认导入</el-button>
+        <!-- WS-10/WS-11：0 选择与只读态一律置灰（函数级守卫见 confirmImport） -->
+        <el-button type="primary" :disabled="!importValidation?.valid || !importPreviewSelected || isReadOnly" :loading="importing" @click="confirmImport">确认导入</el-button>
       </template>
     </el-dialog>
 
@@ -458,13 +471,18 @@
   </div>
 
   <!-- 历史问题 十四次（用户裁决）：写操作验证「支持的操作」清单——与后端 mfaStepUpGuard
-       实际覆盖面一致（全部 RESTful 写端点：POST/PUT/PATCH/DELETE，排除测试/预览/
-       解析类只读 POST 与 MFA 自身端点）。 -->
+       实际覆盖面一致（admin/business 两组的 POST/PUT/PATCH/DELETE，排除
+       readOnlyWriteRoutes 的读语义 POST 与 MFA 自身端点；WS-05 起「测试」不再
+       一概豁免：证书配置/CA 提供商的 test 会真实写 DNS TXT / 申请 EAB）。 -->
   <el-dialog v-model="mfaScopeVisible" class="dialog-body-inset" width="min(640px, 94vw)">
     <template #header>
-      <DialogHeader :icon="Lock" title="写操作验证支持的操作" subtitle="覆盖全部 RESTful 写端点，与后端实际拦截面一致" />
+      <DialogHeader :icon="Lock" title="写操作验证支持的操作" subtitle="覆盖全部管理写操作（只读语义 POST 与 MFA 自助端点除外）" />
     </template>
-    <div class="info-note-bar"><span class="info-note-desc">开启后，以下操作需要 1 分钟内验证过 MFA（TOTP 同片不可重用，验证后 60 秒内的连续操作免重复弹码）。测试连接、预览、解析类操作不受影响。</span></div>
+    <!-- WS-05：与 middleware.go 的 mfaStepUpGuard 挂载面（admin/business 两组级）
+         及 readOnlyWriteRoutes 豁免清单同源。注意：证书配置/DNS 凭证/CA 提供商
+         的「测试」会真实写入 DNS TXT 或自动申请 EAB——属写操作，需验证；仅
+         OIDC 连接测试、配置预览/备份校验、证书解析、批量查询为读语义豁免。 -->
+    <div class="info-note-bar"><span class="info-note-desc">开启后，以下操作需要 1 分钟内验证过 MFA（TOTP 同片不可重用，验证后 60 秒内的连续操作免重复弹码）。配置预览、备份校验、证书解析、批量证书状态查询与 OIDC 连接测试等只读语义操作不受影响。</span></div>
     <div class="mfa-scope-list">
       <div v-for="group in mfaScopeGroups" :key="group.title" class="mfa-scope-row">
         <div class="mfa-scope-title">{{ group.title }}</div>
@@ -483,7 +501,8 @@ import { useLogTailPolling } from '@/composables/useLogTailPolling'
 import { restartServiceWithFeedback } from '@/utils/restart'
 import { formatDate } from '@/utils/date'
 import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
-import { displaySecurityEventsRowCap } from '@/utils/configValues'
+import { shouldToastQuietPollError } from '@/utils/pollErrorToast'
+import { displaySecurityEventsRowCap, securityEventsWritePayload } from '@/utils/configValues'
 import { CHINA_SITE_CHOICES, COUNTRY_SITE_CHOICES, coordsForSiteLocation, nearestSiteLocation } from '@/utils/siteLocation'
 import { Setting, InfoFilled, Check, View, Upload, Download, Timer, Lock, Document } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
@@ -724,7 +743,7 @@ const fetchAutoBackup = async (quiet = false): Promise<void> => {
       // 仍可用；仅「从未加载成功」时令节流提示一次。
       console.error('Failed to poll auto-backup status')
       const now = Date.now()
-      if (!autoBackupLoaded.value && now - lastAutoBackupErrorToastAt > 30_000) {
+      if (shouldToastQuietPollError(autoBackupLoaded.value, now, lastAutoBackupErrorToastAt)) {
         lastAutoBackupErrorToastAt = now
         ElMessage.error('自动备份状态刷新失败，将持续自动重试')
       }
@@ -748,7 +767,9 @@ const toggleAutoBackupSection = (key: string): void => {
 }
 
 const saveAutoBackupSettings = async (): Promise<boolean> => {
-  if (!autoBackupSectionsValid.value || autoBackupSaving.value) return false
+  // WS-11：函数级纵深防御——角色/节点模式在弹框打开期间变化时不得仍发请求
+  // （按钮禁用只是入口层，不能覆盖全部触发路径）。
+  if (isReadOnly.value || !autoBackupSectionsValid.value || autoBackupSaving.value) return false
   if (!autoBackupLoaded.value || autoBackupLoading.value) {
     ElMessage.warning('自动备份设置尚未加载完成，暂不能保存')
     return false
@@ -773,7 +794,7 @@ const saveAutoBackupSettings = async (): Promise<boolean> => {
 // 已保存的设置(频率/范围等)执行;弹框中未保存的表单改动对本次手动备份
 // 不生效,避免每次手动备份都重写设置并产生多余的「备份设置」审计事件。
 const runAutoBackupNow = async (): Promise<void> => {
-  if (autoBackupRunning.value) return
+  if (isReadOnly.value || autoBackupRunning.value) return
   if (!autoBackupCanRunNow.value) {
     ElMessage.warning('自动备份设置尚未加载或已保存的备份范围为空，暂不能立即备份')
     return
@@ -787,12 +808,16 @@ const runAutoBackupNow = async (): Promise<void> => {
     mfaAwareSuccess('备份已开始，完成后将自动刷新列表')
     const deadline = Date.now() + 60000
     let completed: AutoBackupRow | undefined
-    while (autoBackupVisible.value && Date.now() < deadline) {
+    // WS-08：组件卸载（切到其它设置页/离开系统设置）后必须终止轮询——原只以
+    // 弹框可见为门，卸载后仍会每 2s 拉取最多 30 次并在其它页面弹结果 toast。
+    while (!disposed && autoBackupVisible.value && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 2000))
+      if (disposed) break
       await fetchAutoBackup(true)
       completed = autoBackupRows.value.find((row) => Number(row.id) > baselineId && row.trigger_type === 'manual')
       if (completed) break
     }
+    if (disposed) return
     if (completed?.status === 'success') {
       mfaAwareSuccess('手动备份完成')
     } else if (completed) {
@@ -837,6 +862,8 @@ const downloadAutoBackup = async (row: AutoBackupRow): Promise<void> => {
 }
 
 const restoreAutoBackup = async (row: AutoBackupRow): Promise<void> => {
+  // WS-11：写动作函数级守卫（还原会覆盖配置，仅主节点管理员可执行）
+  if (backupDisabled.value) return
   const scope = autoBackupScopeText(row)
   try {
     await ElMessageBox.confirm(
@@ -872,6 +899,8 @@ const restoreAutoBackup = async (row: AutoBackupRow): Promise<void> => {
 }
 
 const deleteAutoBackup = async (row: AutoBackupRow): Promise<void> => {
+  // WS-11：写动作函数级守卫
+  if (backupDisabled.value) return
   try {
     await ElMessageBox.confirm(`确认删除备份「${row.filename}」？删除后不可恢复。`, '删除备份', {
       type: 'warning',
@@ -933,6 +962,9 @@ const IMPORT_MAX_BYTES = 128 * 1024 * 1024
 const importFileContent = ref<string | Blob>('')
 const importValidation = ref<ImportValidation | null>(null)
 const importValidating = ref(false)
+// WS-10：0 个分类 = 无可导内容。原实现 revalidateImport 早退，弹框却继续显示
+// 上一次选择的校验摘要/冲突，按钮也可点（点了才提示）——预览与按钮必须同门。
+const importPreviewSelected = computed<boolean>(() => importSections.value.length > 0)
 const importInput = ref<HTMLInputElement | null>(null)
 let importValidationSeq = 0
 
@@ -1090,6 +1122,9 @@ const revalidateImport = async (): Promise<void> => {
 }
 
 const confirmImport = async (): Promise<void> => {
+  // WS-11：确认按钮的 isReadOnly 门之外，函数级再守一道（角色/节点模式在弹框
+  // 打开期间变化时仍可能触发点击）。
+  if (isReadOnly.value) return
   const validation = importValidation.value
   if (!validation?.valid || importing.value) return
   // FE44-6：未选分类先于最终确认弹框拦截（V1 路径强制 ['rules']，不可达此分支）
@@ -1221,13 +1256,15 @@ interface AdminTlsForm {
 }
 
 const mfaScopeVisible = ref(false)
+// WS-05：与 middleware.go 的 admin/business 组写路由逐族对齐（清单层由
+// audit87Settings.spec.ts 反向钉住缺失项——新增写端点族必须同步本清单）。
 const mfaScopeGroups = [
   { title: '负载规则', items: ['创建', '编辑', '删除', '启用', '禁用', '复制'] },
-  { title: '证书与 DNS', items: ['DNS 配置增删改', 'CA 提供商修改', '触发证书签发', '证书任务重试/删除'] },
-  { title: '安全防护', items: ['安全策略增删改/绑定', '自定义规则增删改', '拦截页面增删改', 'CRS/IP 库更新与自动更新开关'] },
+  { title: '证书与 DNS', items: ['DNS 配置增删改', '证书配置增删改', 'DNS 凭证连通性测试', 'CA 提供商修改/测试', '触发证书签发', '证书任务重试/删除'] },
+  { title: '安全防护', items: ['安全策略增删改/绑定/拆分', '自定义规则增删改', '拦截页面增删改', 'IP 名单增删改与条目增删', 'CRS/IP 库更新与自动更新开关', '威胁情报库/爬虫库更新与开关', '自动封禁配置'] },
   { title: '用户与密钥', items: ['用户增删改/启停/重置密码（管理员）', '个人资料修改', 'API 密钥创建/启停/删除（含自己的）', '重置 MFA（含管理员代重置）', '启用/禁用/重新生成恢复码（自己的）'] },
-  { title: '系统与服务', items: ['基础设置/Caddy 全局配置保存', '配置重载/校验', '配置导入（v1/v2）', '配置导出与自动备份（设置保存/立即备份/删除/还原/下载）', '管理 TLS 设置修改', 'OIDC 配置修改/删除', 'Caddy 服务启动/停止/重启', 'Caddyfile 手动编辑', '系统重启'] },
-  { title: '集群管理', items: ['节点审批/拒绝/删除', '访问地址修改', '注册令牌生成', '主从模式切换/提升', '手动同步', '集群同步设置', '登录从节点（票据签发，每次验证）'] },
+  { title: '系统与服务', items: ['基础设置/Caddy 全局配置保存', '配置重载/校验', '配置导入（v1/v2）', '配置导出与自动备份（设置保存/立即备份/删除/还原/下载）', '管理 TLS 设置修改', 'OIDC 配置修改/删除', 'Caddy 服务启动/停止/重启', 'Caddyfile 手动编辑', '任务监控 运行/停止调度/取消/重启', '系统重启'] },
+  { title: '集群管理', items: ['节点审批/拒绝/删除', '访问地址修改', '节点站点坐标配置', '服务控制（启动/停止/重启 Caddy、重启应用）', '清除节点证书指纹/清空指纹钉', '注册令牌生成', '主从模式切换/提升', '手动同步', '集群同步设置', '登录从节点（票据签发，每次验证）'] },
 ]
 
 const settings = defineModel<BasicSettingsConfig>('settings', { required: true })
@@ -1316,9 +1353,13 @@ watch(
 // v2.3.8 威胁大屏中央视觉模式（map/globe）：独立持有，父组件配置装载后经
 // watch 同步（settings 为父级响应式对象）
 const threatScreenMode = ref<'map' | 'globe'>('map')
-// 安全事件滚动保留：默认显式 90 天 / 1,000,000 行（不再用 0=自动）
+// 安全事件滚动保留：展示归一 90 天 / 1,000,000 行；库值 0=自动 的哨兵保持不变
+// （历史问题-05）——dirty 标记记录用户是否实际编辑，保存载荷只在编辑过时携带该
+// 字段，避免把展示归一值物化进库（见 utils/configValues securityEventsWritePayload）。
 const seRetentionDays = ref(90)
 const seRowCap = ref(1_000_000)
+const seRetentionDaysDirty = ref(false)
+const seRowCapDirty = ref(false)
 const trafficSampleN = ref(-1)
 watch(() => settings.value.threat_screen_mode, (v) => { threatScreenMode.value = v === 'globe' ? 'globe' : 'map' }, { immediate: true })
 watch(() => [settings.value.security_events_retention_days, settings.value.security_events_row_cap] as const, ([d, c]) => {
@@ -1351,7 +1392,11 @@ const adminTlsDirty = computed(() => {
 // A85WA-历史问题：/admin-tls 读取失败不再静默吞错——开关禁用直到加载成功，
 // 避免长期以默认关闭态误导「HTTPS 已关闭」。
 const adminTlsLoaded = ref(false)
+// WS-07（A85WA-历史问题 未完成项）：读取失败必须显性化——原仅 console.warn，
+// 开关永久灰置且页面不解释（用户只能整页刷新碰运气）。内联错误 + 重试入口。
+const adminTlsLoadFailed = ref(false)
 const loadAdminTls = async () => {
+  adminTlsLoadFailed.value = false
   try {
     const res = await request.get('/admin-tls')
     if (res.data) {
@@ -1363,11 +1408,15 @@ const loadAdminTls = async () => {
       adminTlsLoaded.value = true
     }
   } catch {
+    adminTlsLoadFailed.value = true
     console.warn('管理 TLS 配置读取失败，强制加密开关暂不可用')
   }
 }
+const retryLoadAdminTls = (): void => { void loadAdminTls() }
 
 const openAdminTlsDialog = () => {
+  // WS-11：上传/校验走 admin-tls/inspect（后端写语义端点，非只读豁免）
+  if (isReadOnly.value) return
   adminTlsForm.value = {
     mode: adminTls.value.mode === 'upload' ? 'upload' : 'selfsigned',
     certFile: stagedAdminTlsCert.value?.certFile ?? null,
@@ -1419,6 +1468,9 @@ onUnmounted(() => {
 const onTlsFile = async (e: Event, kind: 'cert' | 'key') => {
   const input = e.target as HTMLInputElement
   const file = input.files?.[0]
+  // WS-06：读完即复位（与导入选择器同口径）——否则再次选择同一路径/同名文件
+  // 不触发 change，换盘内容或重试同一证书时弹框停在旧状态。
+  input.value = ''
   if (!file) return
   if (kind === 'cert') adminTlsForm.value.certFile = file
   else adminTlsForm.value.keyFile = file
@@ -1466,7 +1518,8 @@ const notifyTlsRestarting = (toHttps: boolean) => {
   if (tlsProtocolFallbackTimer) clearTimeout(tlsProtocolFallbackTimer)
   // 兜底提醒（不导航）：无论是否已关闭弹窗，15s 后提示一次手动访问新地址
   tlsProtocolFallbackTimer = setTimeout(() => {
-    if (!disposed) ElMessage.warning(`若未自动跳转请手动访问新地址：${target}`)
+    // WS-09：实现明确「不盲跳」（见上），文案不得再承诺自动跳转
+    if (!disposed) ElMessage.warning(`请手动访问新地址：${target}`)
   }, 15000)
 }
 
@@ -1523,8 +1576,14 @@ const handleSave = async () => {
       server_map_lat: settings.value.server_map_lat ?? 0,
       server_map_lon: settings.value.server_map_lon ?? 0,
       threat_screen_mode: threatScreenMode.value,
-      security_events_retention_days: seRetentionDays.value,
-      security_events_row_cap: seRowCap.value,
+      // 历史问题-05：仅在用户实际编辑过时才提交保留/行数上限（未编辑省略键，
+      // 后端 COALESCE 保持现值——库值 0=自动 不被展示归一值物化）。
+      ...securityEventsWritePayload({
+        retentionDays: seRetentionDays.value,
+        retentionDirty: seRetentionDaysDirty.value,
+        rowCap: seRowCap.value,
+        rowCapDirty: seRowCapDirty.value,
+      }),
       threat_traffic_sample_n: trafficSampleN.value,
       mfa_write_guard: settings.value.mfa_write_guard,
       mfa_lockout_enabled: settings.value.mfa_lockout_enabled,
@@ -1564,6 +1623,10 @@ const handleSave = async () => {
       settings.value.has_github_token = true
       githubTokenInput.value = ''
     }
+    // 历史问题-05：保存成功后清除编辑标记——后续保存继续省略未再编辑的字段，
+    // 避免一次编辑把值永久物化为每次提交的显式载荷。
+    seRetentionDaysDirty.value = false
+    seRowCapDirty.value = false
     // 保存成功后立即刷新全局配置，让 timezone 在 authStore 中立竿见影（date.ts formatDate 展示侧即时生效）；
     // silent：保存已成功，随后的 GET /config 刷新失败不应再弹误导性错误 toast
     await authStore.fetchConfig(true)

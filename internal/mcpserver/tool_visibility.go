@@ -2,17 +2,79 @@ package mcpserver
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"sync/atomic"
 
 	"lazy-balancer-v2/internal/db"
 )
 
-type readOnlyResolver func(apiKey string) (bool, error)
+// apiKeyVisibility 是 tools/list 过滤所需的 Key 属主属性。
+// CI87-06：role 与 readOnly 由同一次解析返回——admin 组路由对非管理员恒 403，
+// 可见性必须同口径隐藏（此前只过滤只读 Key，非管理员属主的写工具全部可见）。
+type apiKeyVisibility struct {
+	readOnly bool
+	admin    bool
+	// unknown 表示无身份可判定（未携带 Key / DB 未初始化）——按「不过滤」处理，
+	// 与旧实现（resolver 返回错误或非只读时原样透传）一致。
+	unknown bool
+}
+
+type visibilityResolver func(apiKey string) (apiKeyVisibility, error)
+
+// adminOnlyRoutePaths 是 admin 组路由集合（"METHOD /api/v1/path"，Gin :param
+// 形态），由 middleware.SetupRouter 注册期注入（adminOnly 守卫与集合同一处
+// 产生，新增 admin 路由自动同步，无需第二份清单）。未注入时（mcpserver 单测/
+// 独立使用）不做角色过滤，等价旧行为。
+var adminOnlyRoutePaths atomic.Pointer[map[string]struct{}]
+
+// SetAdminOnlyRoutes 注入 admin 组路由集合（装配期一次，拷贝隔离防调用方后续改动）。
+func SetAdminOnlyRoutes(routes map[string]struct{}) {
+	copied := make(map[string]struct{}, len(routes))
+	for key := range routes {
+		copied[key] = struct{}{}
+	}
+	adminOnlyRoutePaths.Store(&copied)
+}
+
+// ginPath 将工具规格的 {param} 形态还原为 Gin 的 :param（ginPathToOpenAPI
+// 反函数，全替换循环——多参路径逐段转换）。历史起为生产单一实现
+// （原位于跨包互检测试文件），外部测试包经 export_test.go 共享。
+func ginPath(path string) string {
+	for {
+		i := strings.IndexByte(path, '{')
+		if i < 0 {
+			return path
+		}
+		j := strings.IndexByte(path[i:], '}')
+		if j < 0 {
+			return path
+		}
+		path = path[:i] + ":" + path[i+1:i+j] + path[i+j+1:]
+	}
+}
+
+// toolSpecsByName 是工具名 → 规格的索引（可见性过滤按名称回查能力）。
+var toolSpecsByName = func() map[string]toolSpec {
+	result := make(map[string]toolSpec, len(tools))
+	for _, spec := range tools {
+		result[spec.name] = spec
+	}
+	return result
+}()
+
+// isAdminOnlyTool 报告工具指向的 REST 路由是否在 admin 组（非管理员恒 403）。
+func isAdminOnlyTool(spec toolSpec) bool {
+	routes := adminOnlyRoutePaths.Load()
+	if routes == nil || len(*routes) == 0 {
+		return false
+	}
+	_, ok := (*routes)[spec.method+" /api/v1"+ginPath(spec.path)]
+	return ok
+}
 
 // ReadOnlyProbeTools 只读 Key 可见的读探测 POST 工具清单（REST 白名单
 // auditpolicy.go readOnlyWriteRoutes 同口径）——serveWithToolVisibility 与
@@ -47,7 +109,7 @@ func isReadOnlyTool(spec toolSpec) bool {
 	return probe
 }
 
-func serveWithToolVisibility(writer http.ResponseWriter, request *http.Request, next http.Handler, resolver readOnlyResolver) {
+func serveWithToolVisibility(writer http.ResponseWriter, request *http.Request, next http.Handler, resolver visibilityResolver) {
 	requestBody, err := io.ReadAll(request.Body)
 	if err != nil {
 		next.ServeHTTP(writer, request)
@@ -61,14 +123,27 @@ func serveWithToolVisibility(writer http.ResponseWriter, request *http.Request, 
 		next.ServeHTTP(writer, request)
 		return
 	}
-	readOnly, err := resolver(extractAPIKey(request.Header))
-	if err != nil || !readOnly {
+	visibility, err := resolver(extractAPIKey(request.Header))
+	if err != nil || visibility.unknown || (visibility.admin && !visibility.readOnly) {
+		// 解析失败/无身份按原样透传（与旧行为一致）；管理员全权 Key 无需过滤。
 		next.ServeHTTP(writer, request)
 		return
 	}
 	recorder := newResponseRecorder()
 	next.ServeHTTP(recorder, request)
-	filtered, err := filterReadOnlyTools(recorder.body.Bytes())
+	var filtered []byte
+	if visibility.admin {
+		// 管理员属主的只读 Key：仅只读约束（admin 组工具可由管理员只读 Key 读取）。
+		filtered, err = filterReadOnlyTools(recorder.body.Bytes())
+	} else {
+		filtered, err = filterTools(recorder.body.Bytes(), func(name string) bool {
+			spec, ok := toolSpecsByName[name]
+			if !ok || isAdminOnlyTool(spec) {
+				return false
+			}
+			return !visibility.readOnly || isReadOnlyTool(spec)
+		})
+	}
 	if err != nil {
 		filtered = recorder.body.Bytes()
 	}
@@ -79,28 +154,29 @@ func serveWithToolVisibility(writer http.ResponseWriter, request *http.Request, 
 	_, _ = writer.Write(filtered)
 }
 
-func resolveAPIKeyReadOnly(apiKey string) (bool, error) {
+// resolveAPIKeyVisibility 解析 Key 属主属性（只读 + 是否管理员）。CI87-07：
+// 与 middleware 认证共用 db.ResolveAPIKeyIdentity 单源。
+func resolveAPIKeyVisibility(apiKey string) (apiKeyVisibility, error) {
 	if apiKey == "" || db.DB == nil {
-		return false, nil
+		return apiKeyVisibility{unknown: true}, nil
 	}
-	if len(apiKey) < 13 {
-		return false, sql.ErrNoRows
+	identity, err := db.ResolveAPIKeyIdentity(db.DB, apiKey)
+	if err != nil {
+		return apiKeyVisibility{}, err
 	}
-	hash := sha256.Sum256([]byte(apiKey))
-	var readOnly bool
-	err := db.DB.QueryRow(`
-		SELECT COALESCE(k.read_only,0)
-		FROM api_keys k
-		JOIN users u ON u.id = k.created_by
-		WHERE k.key_prefix = ? AND k.key_hash = ?
-		  AND k.is_enabled = 1
-		  AND u.is_enabled = 1
-		  AND (k.expires_at IS NULL OR datetime(k.expires_at) > datetime('now'))
-	`, apiKey[:12], fmt.Sprintf("%x", hash[:])).Scan(&readOnly)
-	return readOnly, err
+	return apiKeyVisibility{readOnly: identity.ReadOnly, admin: identity.IsAdmin()}, nil
 }
 
 func filterReadOnlyTools(response []byte) ([]byte, error) {
+	return filterTools(response, func(name string) bool {
+		spec, ok := toolSpecsByName[name]
+		return ok && isReadOnlyTool(spec)
+	})
+}
+
+// filterTools 按 keep 谓词重建 tools 列表。keep 之外的形状语义见
+// filterReadOnlyTools 的历史注释（错误形态原样透传）。
+func filterTools(response []byte, keep func(name string) bool) ([]byte, error) {
 	// APIMCP44-1(历史 历史问题):错误形态(含 error 成员)或缺 result/
 	// result.tools 的响应原样透传——下方固定结构体重建会把 error 形态改写为
 	// 「result.tools:null」假成功,吞掉上游错误信号。
@@ -137,15 +213,6 @@ func filterReadOnlyTools(response []byte) ([]byte, error) {
 	if err := json.Unmarshal(result["tools"], &toolsArr); err != nil {
 		return nil, fmt.Errorf("解析 tools/list tools: %w", err)
 	}
-	// 只读 Key 可见集合 = 包级 isReadOnlyTool 判据（GET 且非隐藏 + 读探测 POST
-	// 白名单），与 ListToolSpecs.read_only 元数据同源（历史问题 MISC-F1 收敛；历史
-	// 历史问题 已把探测清单收敛为 ReadOnlyProbeTools，钉测试直接消费）。
-	readOnlyNames := make(map[string]struct{}, len(tools))
-	for _, spec := range tools {
-		if isReadOnlyTool(spec) {
-			readOnlyNames[spec.name] = struct{}{}
-		}
-	}
 	filtered := make([]json.RawMessage, 0, len(toolsArr))
 	for _, rawTool := range toolsArr {
 		var tool struct {
@@ -154,7 +221,7 @@ func filterReadOnlyTools(response []byte) ([]byte, error) {
 		if err := json.Unmarshal(rawTool, &tool); err != nil {
 			return nil, fmt.Errorf("解析 MCP 工具: %w", err)
 		}
-		if _, exists := readOnlyNames[tool.Name]; exists {
+		if keep(tool.Name) {
 			filtered = append(filtered, rawTool)
 		}
 	}

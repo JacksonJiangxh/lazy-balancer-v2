@@ -391,3 +391,48 @@ func TestAutoBackupScheduled_nilExecutorReturnsError(t *testing.T) {
 		t.Fatalf("last_run=%q, want NULL(未装配不推进)", *lastRun)
 	}
 }
+
+// V87-TO-03：monthly day 带外写入 29-31（集群快照直写不校验）时，短月
+// 「已执行→步进」会回退到已执行的过去槽：nextAutoBackupSlot 返回不晚于 now
+// 且不晚于水位线的时刻，引擎每 tick 重跑备份并刷 task_runs。
+// 读侧须把 day 收敛到写侧允许区间（越界回退默认 1——与 handlers 读侧 SYS-F1
+// 同口径，保证「UI 显示的即生效值」）。
+func TestAutoBackupNextSlot_outOfRangeMonthlyDayDoesNotRepeatExecutedSlot(t *testing.T) {
+	setupAutoBackupTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1, auto_backup_frequency='monthly',
+		auto_backup_time='03:00', auto_backup_day=31, auto_backup_last_run='2026-02-28T03:00:00Z' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 2, 28, 10, 0, 0, 0, time.UTC)
+
+	slot, ok := nextAutoBackupSlot(now)
+	if !ok {
+		t.Fatal("已启用应有下一槽")
+	}
+	if !slot.After(now) {
+		t.Fatalf("next slot=%v 不晚于 now=%v：day 越界把步进回退到已执行的过去槽（引擎每 tick 重跑备份）", slot, now)
+	}
+	if want := time.Date(2026, 3, 1, 3, 0, 0, 0, time.UTC); !slot.Equal(want) {
+		t.Fatalf("slot=%v, want %v（day 越界回退默认 1）", slot, want)
+	}
+}
+
+// V87-TO-03（回归形状）：weekly day 越界（0 或 >7）此前让 autoBackupDueSlot
+// ok=false → 调度面零槽（任务静默停摆）。读侧收敛到可调度区间后必须有槽。
+func TestAutoBackupNextSlot_outOfRangeWeeklyDayStillSchedules(t *testing.T) {
+	setupAutoBackupTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1, auto_backup_frequency='weekly',
+		auto_backup_time='03:00', auto_backup_day=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 2, 28, 10, 0, 0, 0, time.UTC)
+
+	slot, ok := nextAutoBackupSlot(now)
+	if !ok {
+		t.Fatal("weekly day 越界不得让调度面零槽（任务静默停摆）")
+	}
+	if slot.After(now) {
+		// 未跑过 → 返回最近过去槽（≤now，跨停机补跑）；形态断言即可。
+		t.Fatalf("slot=%v 应 ≤now（未执行过时返回最近槽）", slot)
+	}
+}

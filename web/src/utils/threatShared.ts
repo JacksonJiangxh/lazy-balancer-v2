@@ -123,6 +123,24 @@ export function normalizeCountryName(name: string): string {
   return name === 'Taiwan' || name === '台湾' ? '中国' : name
 }
 
+/**
+ * 该下钻国家是否有省级统计源（WT87-11）：后端 `threatLocationParts` 只对中国
+ * 从归属地串取省，`china_provinces` 也只聚合中国省——海外下钻的省板是纯几何，
+ * UI 必须显示「无省级统计」而不是 0，避免把缺失当成「该省 0 次攻击」。
+ */
+export function hasProvinceStats(country: string): boolean {
+  return country === '中国'
+}
+
+/**
+ * 异步下钻续体的提交判定（WT87-03）：`seq` 已被返回/复位/销毁递增，或引擎已
+ * 销毁 → 丢弃加载结果。地图/地球共用，防止一侧补了作废逻辑另一侧漏（原地球
+ * 的 zoomOut/resetView 不递增 drillSeq，迟到的 chunk 会把用户刚做的复位覆盖）。
+ */
+export function drillCommitAllowed(seq: number, currentSeq: number, disposed: boolean): boolean {
+  return seq === currentSeq && !disposed
+}
+
 /** 国家计数归一+合并：台湾计数并入中国，避免 hover 中国时台湾计数缺失。 */
 export function aggregateCountryCounts(entries: readonly { name: string; count: number }[]): Map<string, number> {
   const out = new Map<string, number>()

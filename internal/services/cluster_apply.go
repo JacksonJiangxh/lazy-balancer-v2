@@ -90,7 +90,9 @@ var snapshotBrandingDegradeWarned atomic.Bool
 // 后回读校验落盘结果，把「只记日志」的失败转换成可重试 error，供调用方写
 // apply_ok_branding_failed 标记（历史问题）。回读路径必须与单源写入路径保持一致
 // （dataDir/branding.json）。cfg 缺失或 dataDir 未配置=显式降级：留痕一次并跳过。
-func applySnapshotBrandingChecked(cfg *config.Config, content string) error {
+// S历史问题-01：失败操作审计经 SyncService 的失败节流写入（同一错误内容不按
+// 重试轮重复）——本 path 在标记驱动重试下会每轮重达，未节流即审计洪泛。
+func (s *SyncService) applySnapshotBrandingChecked(cfg *config.Config, content string) error {
 	if cfg == nil || cfg.DataDir == "" {
 		if snapshotBrandingDegradeWarned.CompareAndSwap(false, true) {
 			Logf("warn", "集群品牌配置同步已降级：数据目录未配置，branding.json 不落盘（下次重启请检查品牌配置）")
@@ -98,7 +100,13 @@ func applySnapshotBrandingChecked(cfg *config.Config, content string) error {
 		}
 		return nil
 	}
-	applySnapshotBranding(cfg.DataDir, content)
+	if err := applySnapshotBranding(cfg.DataDir, content); err != nil {
+		detail := fmt.Sprintf("品牌配置落盘失败: %v", err)
+		if s.syncFailureAuditDue("同步失败", "集群同步", detail) {
+			RecordAuditLog("system", "同步失败", "集群同步", detail, "")
+		}
+		return err
+	}
 	expected := content
 	if expected == "" {
 		expected = emptyBrandingTemplate
@@ -141,7 +149,9 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 状态」会清空 last_sync_error，提交后再读永远漏判，品牌节又不在哈希口径内
 	// （users 节未变时不会重放），没有标记就会永久停在上轮失败态。
 	brandingRetry := s.syncBrandingFailureMarkerPresent(ctx)
-	previous, err := s.cluster.clusterSnapshotBypassingCache(ctx)
+	// S历史问题-02：previous 只装载 apply 消费面（三节哈希/证书轴/ACME
+	// ownership），不再全量构建快照（避免每次 apply 白做 CRS 树全量哈希）。
+	previous, err := s.cluster.clusterSnapshotForApply(ctx)
 	if err != nil {
 		return fmt.Errorf("备份本地快照: %w", err)
 	}
@@ -243,7 +253,7 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// （apply_ok_reload_failed 同族），304 分支据此全量重拉并在下一轮强制
 	// 重试；users 节被哈希跳过时标记同样强制重试。
 	if snapshot.BasicSettings.BrandingJSON != nil && (!skip.skip("users") || brandingRetry || reloadCompensation) {
-		if brandingErr := applySnapshotBrandingChecked(s.cfg, *snapshot.BasicSettings.BrandingJSON); brandingErr != nil {
+		if brandingErr := s.applySnapshotBrandingChecked(s.cfg, *snapshot.BasicSettings.BrandingJSON); brandingErr != nil {
 			Logf("error", "同步品牌配置未落盘（数据库已应用，文件未收敛，下轮重试）: %v", brandingErr)
 			s.persistSyncError(ctx, syncBrandingFailureMarkerPrefix+": 品牌配置落盘失败（数据库已应用，文件未收敛，下轮同步重试）", models.SyncErrorCodeApplyFailed)
 		}
@@ -298,10 +308,17 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 		}
 		if ferr != nil {
 			Logf("error", "同步安全数据失败（数据库版本行已同步）: %v", ferr)
-			RecordAuditLog("system", "同步失败", "安全数据", fmt.Sprintf("拉取安全数据失败: %v", ferr), "")
+			// S历史问题-01：安全数据失败按内容去重（每轮 apply 都会重试）。
+			detail := fmt.Sprintf("拉取安全数据失败: %v", ferr)
+			if s.syncFailureAuditDue("同步失败", "安全数据", detail) {
+				RecordAuditLog("system", "同步失败", "安全数据", detail, "")
+			}
 		} else if aerr != nil {
 			Logf("error", "落盘同步安全数据失败: %v", aerr)
-			RecordAuditLog("system", "同步失败", "安全数据", fmt.Sprintf("落盘安全数据失败: %v", aerr), "")
+			detail := fmt.Sprintf("落盘安全数据失败: %v", aerr)
+			if s.syncFailureAuditDue("同步失败", "安全数据", detail) {
+				RecordAuditLog("system", "同步失败", "安全数据", detail, "")
+			}
 		} else if crsChanged || xdbChanged || threatChanged {
 			detail := wafBundleSyncDetail(bundle, crsChanged, xdbChanged)
 			RecordAuditLog("system", "同步", "安全数据", detail, "")
@@ -360,7 +377,12 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	if reloadErr != nil {
 		err := reloadErr
 		Logf("error", "集群同步后重载 Caddy 失败（快照已提交）: %v", err)
-		RecordAuditLog("system", "重载失败", "Caddy服务", fmt.Sprintf("同步应用后自动重载失败: %v", err), "")
+		// S历史问题-01：Caddy /load 持续故障时补偿重拉每轮都会到达此处——同内容
+		// 重载失败只留一条操作审计（标记/日志仍按轮刷新）。
+		detail := fmt.Sprintf("同步应用后自动重载失败: %v", err)
+		if s.syncFailureAuditDue("重载失败", "Caddy服务", detail) {
+			RecordAuditLog("system", "重载失败", "Caddy服务", detail, "")
+		}
 		// 写入标记：运行配置与数据库不一致。304 分支识别该标记并全量重拉补偿重试，
 		// 避免陈旧运行配置存活到下次真实变更或重启。标记必须跨调用方 ctx 取消存活，
 		// 套用 persistSyncError 的 WithoutCancel+2s 超时模式（历史问题 历史问题）。
@@ -385,7 +407,13 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	if snapshot.CaddyConfig != nil {
 		caddySync = "已同步"
 	}
-	if RuntimeAdminTLSChanged(LoadAdminTLSConfig()) {
+	// S历史问题（历史）：重启判定必须用严格读取变体——宽容版
+	// LoadAdminTLSConfig 读失败回退 {selfsigned, disabled}，运行态为 upload 证书
+	// 时一次瞬时读失败会被误判「配置变化」触发进程重启（重启抖动），反向则可能
+	// 漏判真实变化。读失败仅 warn 并跳过本轮判定：不重启、不改状态。
+	if adminTLS, tlsErr := LoadAdminTLSConfigE(); tlsErr != nil {
+		Logf("warn", "集群同步后读取 Admin TLS 配置失败，跳过重启判定（不触发重启）: %v", tlsErr)
+	} else if RuntimeAdminTLSChanged(adminTLS) {
 		RecordAuditLog("system", "重启", "系统", "同步到新的 HTTPS 访问配置，自动重启生效", "")
 		Logf("info", "Admin TLS config changed via sync, restarting to apply")
 		requestRestart()
@@ -1127,32 +1155,41 @@ func applySecurityBlockPages(ctx context.Context, tx *sql.Tx, pages []models.Sec
 	return nil
 }
 
-func applySecurityCRSVersion(ctx context.Context, tx *sql.Tx, versions []models.ClusterSecurityCRSVersion) error {
-	for _, version := range versions {
+// clusterRuleLibVersionInsertSQL 是 CRS/IP2Region 版本行的写入单源
+// （S历史问题-15）：与 clusterRuleLibVersionColumns 的列集合逐列对应；
+// 表名由调用方白名单传入（仅两张固定表）。
+const clusterRuleLibVersionInsertSQL = `INSERT INTO %s (id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+
+// applyRuleLibVersionRows 全量替换写入一张版本表（先清后插由调用方负责）。
+func applyRuleLibVersionRows(ctx context.Context, tx *sql.Tx, table string, rows []clusterRuleLibVersionRow) error {
+	statement := fmt.Sprintf(clusterRuleLibVersionInsertSQL, table)
+	for _, row := range rows {
 		// 历史问题-01（历史）：schedule_days/schedule_time 随版本行全量替换
 		// 落库（升主即生效）；空串来源=旧主端快照缺列，读取端 normalizeScheduleRow
 		// 回落默认，与 NOT NULL 约束兼容。
-		if _, err := tx.ExecContext(ctx, `INSERT INTO security_crs_version (id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			version.ID, version.Version, nullableString(version.UpdatedAt), version.AutoUpdate, version.UpdateStatus, version.Message,
-			nullableString(version.LastChecked), nullableString(version.NextUpdate), nullableString(version.Trigger), nullableString(version.StartedAt), nullableString(version.FinishedAt),
-			version.ScheduleDays, version.ScheduleTime); err != nil {
-			return fmt.Errorf("写入快照 CRS 版本 %d: %w", version.ID, err)
+		if _, err := tx.ExecContext(ctx, statement, row.ID, row.Version, nullableString(row.UpdatedAt), row.AutoUpdate, row.UpdateStatus, row.Message,
+			nullableString(row.LastChecked), nullableString(row.NextUpdate), nullableString(row.Trigger), nullableString(row.StartedAt), nullableString(row.FinishedAt),
+			row.ScheduleDays, row.ScheduleTime); err != nil {
+			return fmt.Errorf("写入快照 %s 版本 %d: %w", table, row.ID, err)
 		}
 	}
 	return nil
 }
 
-func applySecurityIP2RegionVersion(ctx context.Context, tx *sql.Tx, versions []models.ClusterSecurityIP2RegionVersion) error {
+func applySecurityCRSVersion(ctx context.Context, tx *sql.Tx, versions []models.ClusterSecurityCRSVersion) error {
+	rows := make([]clusterRuleLibVersionRow, 0, len(versions))
 	for _, version := range versions {
-		// 历史问题-01：同 CRS 侧——排程两列随版本行全量替换落库。
-		if _, err := tx.ExecContext(ctx, `INSERT INTO security_ip2region_version (id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			version.ID, version.Version, nullableString(version.UpdatedAt), version.AutoUpdate, version.UpdateStatus, version.Message,
-			nullableString(version.LastChecked), nullableString(version.NextUpdate), nullableString(version.Trigger), nullableString(version.StartedAt), nullableString(version.FinishedAt),
-			version.ScheduleDays, version.ScheduleTime); err != nil {
-			return fmt.Errorf("写入快照 ip2region 版本 %d: %w", version.ID, err)
-		}
+		rows = append(rows, clusterRuleLibVersionRow(version))
 	}
-	return nil
+	return applyRuleLibVersionRows(ctx, tx, "security_crs_version", rows)
+}
+
+func applySecurityIP2RegionVersion(ctx context.Context, tx *sql.Tx, versions []models.ClusterSecurityIP2RegionVersion) error {
+	rows := make([]clusterRuleLibVersionRow, 0, len(versions))
+	for _, version := range versions {
+		rows = append(rows, clusterRuleLibVersionRow(version))
+	}
+	return applyRuleLibVersionRows(ctx, tx, "security_ip2region_version", rows)
 }
 
 func validateSnapshotACMEState(snapshot models.ClusterSnapshot) error {
@@ -1620,11 +1657,24 @@ func nullableTimeFlat(value sql.NullTime) any {
 	return value.Time.UTC().Format(crsTimeLayout)
 }
 
+// normalizeVersionRows 把 nil 规范化为空切片（S历史问题-11，历史）：
+// 手造/旧主端快照 nil 序列化为 "null"，本地空表为 "[]"，旧比较口径恒判
+// 「有差异」→ 每次 apply 白做 DELETE+INSERT。生产快照恒非 nil
+// （snapshotSecurity*Version 返回 make(...)），本归一让手造形态与生产一致。
+func normalizeVersionRows[T any](rows []T) []T {
+	if rows == nil {
+		return []T{}
+	}
+	return rows
+}
+
 // snapshotSecurityVersionRowsDiffer 比较快照携带的 CRS/IP2Region 版本行与
 // 本地行(2026-09-11:版本行差分门控——不进节哈希,以内容差分决定重放)。
 // 查询失败时本地行保持空切片:快照非空即判「有差异」触发重放(向主端收敛,
 // 历史问题:原「按无差异处理」描述对非空快照分支不成立);序列化失败(不可
 // 达,类型固定)按无差异。
+// S历史问题-15：本地读取列清单与快照 dump 共用 clusterRuleLibVersionColumns /
+// scanClusterRuleLibVersionRow（历史问题-01 的「快照列与差分行不同步」教训）。
 func snapshotSecurityVersionRowsDiffer(ctx context.Context, tx *sql.Tx, snapshot models.ClusterSnapshot) bool {
 	snapJSON := func(v any) string {
 		b, err := json.Marshal(v)
@@ -1633,38 +1683,26 @@ func snapshotSecurityVersionRowsDiffer(ctx context.Context, tx *sql.Tx, snapshot
 		}
 		return string(b)
 	}
-	wantCRS := snapJSON(snapshot.SecurityCRSVersion)
-	wantIP2R := snapJSON(snapshot.SecurityIP2RegionVersion)
+	wantCRS := snapJSON(normalizeVersionRows(snapshot.SecurityCRSVersion))
+	wantIP2R := snapJSON(normalizeVersionRows(snapshot.SecurityIP2RegionVersion))
 
 	localCRS := make([]models.ClusterSecurityCRSVersion, 0)
-	// 历史问题-01（历史）：本地行读取列与快照 dump（cluster_snapshot.go）
-	// 逐列对齐——差分口径分叉会使排程列变化永判「无差异」而跳过重放。
-	rows, err := tx.QueryContext(ctx, `SELECT id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,''),COALESCE(schedule_days,'1,2,3,4,5,6,7'),COALESCE(schedule_time,'04:00') FROM security_crs_version ORDER BY id`)
+	rows, err := readClusterRuleLibVersionRows(ctx, tx, "security_crs_version")
 	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var v models.ClusterSecurityCRSVersion
-			if err := rows.Scan(&v.ID, &v.Version, &v.UpdatedAt, &v.AutoUpdate, &v.UpdateStatus, &v.Message, &v.LastChecked, &v.NextUpdate, &v.Trigger, &v.StartedAt, &v.FinishedAt, &v.ScheduleDays, &v.ScheduleTime); err == nil {
-				localCRS = append(localCRS, v)
-			}
+		for _, row := range rows {
+			localCRS = append(localCRS, row.crsVersion())
 		}
-		if err := rows.Err(); err != nil {
-			return true
-		}
+	} else {
+		return true
 	}
 	localIP2R := make([]models.ClusterSecurityIP2RegionVersion, 0)
-	rows2, err2 := tx.QueryContext(ctx, `SELECT id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,''),COALESCE(schedule_days,'1,2,3,4,5,6,7'),COALESCE(schedule_time,'04:00') FROM security_ip2region_version ORDER BY id`)
+	rows2, err2 := readClusterRuleLibVersionRows(ctx, tx, "security_ip2region_version")
 	if err2 == nil {
-		defer rows2.Close()
-		for rows2.Next() {
-			var v models.ClusterSecurityIP2RegionVersion
-			if err := rows2.Scan(&v.ID, &v.Version, &v.UpdatedAt, &v.AutoUpdate, &v.UpdateStatus, &v.Message, &v.LastChecked, &v.NextUpdate, &v.Trigger, &v.StartedAt, &v.FinishedAt, &v.ScheduleDays, &v.ScheduleTime); err == nil {
-				localIP2R = append(localIP2R, v)
-			}
+		for _, row := range rows2 {
+			localIP2R = append(localIP2R, row.ip2RegionVersion())
 		}
-		if err := rows2.Err(); err != nil {
-			return true
-		}
+	} else {
+		return true
 	}
 	return snapJSON(localCRS) != wantCRS || snapJSON(localIP2R) != wantIP2R
 }

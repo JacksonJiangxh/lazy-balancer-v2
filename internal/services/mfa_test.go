@@ -235,12 +235,23 @@ func TestMFAResetForUser(t *testing.T) {
 
 func TestMFAWriteGuardEnabled(t *testing.T) {
 	mfaTestEnv(t)
-	if MFAWriteGuardEnabled() {
+	enabled, err := MFAWriteGuardEnabled()
+	if err != nil {
+		t.Fatalf("default read: %v", err)
+	}
+	if enabled {
 		t.Fatal("default must be off")
 	}
 	_, _ = db.DB.Exec("UPDATE global_config SET mfa_write_guard=1 WHERE id=1")
-	if !MFAWriteGuardEnabled() {
-		t.Fatal("toggle read failed")
+	if enabled, err = MFAWriteGuardEnabled(); err != nil || !enabled {
+		t.Fatalf("toggle read: enabled=%v err=%v", enabled, err)
+	}
+	// S历史问题：读取失败必须显式报错，不得静默降级为「开关关闭」（fail-open）。
+	if _, err := db.DB.Exec("DELETE FROM global_config WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, err = MFAWriteGuardEnabled(); err == nil {
+		t.Fatalf("read failure must surface, got enabled=%v err=nil", enabled)
 	}
 }
 

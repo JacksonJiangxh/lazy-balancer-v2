@@ -2403,3 +2403,99 @@ func TestCertIssuer_deploymentFailed_persistsMaterial(t *testing.T) {
 		t.Fatal("expires_at not persisted")
 	}
 }
+
+// 历史问题-03（历史）：续期扫描 Run 体不消费 rc.Ctx（SetRole 取消等价
+// no-op），入口角色检查只做一次——demote 落在最长 6h 扫描/多任务候选窗口时，
+// 循环会在队列停止前继续入队（已入队签发要跑完 ACME 才被角色检查拦下，白烧
+// CA 配额）。逐任务入队前必须用同一 SQL 口径复核角色。
+func TestRenewalScanRechecksRoleBeforeEachEnqueue(t *testing.T) {
+	_, database := newClusterTestService(t)
+	ResetCAQueueManagerForTest()
+	InitCAQueueManager(func() error { return nil })
+	GetCAQueueManager().Start()
+	t.Cleanup(ResetCAQueueManagerForTest)
+	for _, ruleID := range []string{"lb_demote_a", "lb_demote_b"} {
+		if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
+			VALUES (?,?,?,'http',8080,1,1,'acme_dns')`, ruleID, ruleID, ruleID+".example.com"); err != nil {
+			t.Fatalf("seed rule %s: %v", ruleID, err)
+		}
+	}
+	// ORDER BY expires_at ASC：A 先入队，B 在 demote 后被逐任务复核拦下。
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,expires_at,renewal_attempts,ca_provider_id) VALUES
+		('lb_demote_a','lb_demote_a.example.com','issued',datetime('now','+1 day'),0,1),
+		('lb_demote_b','lb_demote_b.example.com','issued',datetime('now','+2 day'),0,1)`); err != nil {
+		t.Fatalf("seed cert jobs: %v", err)
+	}
+	logDir := filepath.Join(t.TempDir(), "tasks")
+	oldDir := taskengine.LogDir()
+	taskengine.SetLogDir(logDir)
+	t.Cleanup(func() { taskengine.SetLogDir(oldDir) })
+
+	calls := 0
+	oldHook := certRenewalRoleRecheckHook
+	certRenewalRoleRecheckHook = func() {
+		calls++
+		if calls == 2 {
+			// 第二个任务入队前 demote（模拟 SetRole 与长扫描的竞争窗口）。
+			if _, err := database.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+				t.Errorf("demote: %v", err)
+			}
+		}
+	}
+	t.Cleanup(func() { certRenewalRoleRecheckHook = oldHook })
+
+	resetCertificateServiceForTest(t)
+	NewCertificateService().renewExpiringCertificates()
+
+	if calls < 2 {
+		t.Fatalf("逐任务角色复核未执行（hook 调用 %d 次）", calls)
+	}
+	var statusB string
+	if err := database.QueryRow(`SELECT status FROM cert_jobs WHERE rule_id='lb_demote_b'`).Scan(&statusB); err != nil {
+		t.Fatal(err)
+	}
+	if statusB != "issued" {
+		t.Fatalf("demote 后第二个任务 status=%q, want issued（从节点不得继续入队）", statusB)
+	}
+	data, err := os.ReadFile(taskengine.TaskLogPath("cert-renewal-scan"))
+	if err != nil {
+		t.Fatalf("read renewal task log: %v", err)
+	}
+	if !strings.Contains(string(data), "续期中止：扫描期间节点已切换为从节点，剩余 1 个任务本轮未入队") {
+		t.Fatalf("demote 中止必须留痕: %q", string(data))
+	}
+}
+
+// ---- 历史（SV历史问题）----
+
+// SV历史问题：续期扫描把达上限 waiting_ca 转 failed 时，必须与
+// markJobWaitingCA 上限分支同字段集清理冷却时间与 429 错误码。
+func TestRenewalScan_capped_waiting_ca_failure_clears_cooldown_fields(t *testing.T) {
+	_, database := newClusterTestService(t)
+	resetCertificateServiceForTest(t)
+	seedRuleWithCAProvider(t, "lb_capped_waiting", "capped.example.test", 0)
+	maxAttempts := GetCertRenewalAttempts()
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,expires_at,renewal_attempts,ca_available_after,last_error_code)
+		VALUES ('lb_capped_waiting','capped.example.test','waiting_ca',datetime('now','+10 days'),?,datetime('now','-1 hour'),'429')`, maxAttempts); err != nil {
+		t.Fatalf("seed waiting_ca job: %v", err)
+	}
+
+	// When
+	NewCertificateService().renewExpiringCertificates()
+
+	// Then
+	var status string
+	var availableAfter, lastErrorCode any
+	if err := database.QueryRow(`SELECT status, ca_available_after, last_error_code FROM cert_jobs WHERE rule_id='lb_capped_waiting'`).Scan(&status, &availableAfter, &lastErrorCode); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if status != "failed" {
+		t.Fatalf("status=%q, want failed", status)
+	}
+	if availableAfter != nil {
+		t.Fatalf("ca_available_after=%v, want NULL（终态不得残留冷却时间）", availableAfter)
+	}
+	if lastErrorCode != nil {
+		t.Fatalf("last_error_code=%v, want NULL（终态不得残留 429）", lastErrorCode)
+	}
+}

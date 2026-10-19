@@ -81,7 +81,9 @@ func New(loginToken string) *Provider {
 	}
 }
 
-// Present creates or updates the _acme-challenge TXT record.
+// Present creates a distinct _acme-challenge TXT record (no upsert): a repeated
+// Present for the same name adds another record, and cleanup removes records by
+// ownership record ID / value (DNS-87-F8，历史).
 func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, ttl int) error {
 	zone = strings.TrimSuffix(zone, ".")
 	subDomain := strings.TrimSuffix(tokenFQDN, ".")
@@ -313,7 +315,11 @@ func (p *Provider) apiCall(ctx context.Context, method string, params url.Values
 
 	if result != nil {
 		if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
-			return fmt.Errorf("decode response: %w", err)
+			// DNS-87-F10（历史）：网关返回 HTML/空体（502/503）时原文案
+			// 「decode response: invalid character '<'…」丢失状态码与动作名，
+			// 排障只能翻 network 日志。429/5xx 已由 retry.Transport 吸收，
+			// 这里是最终失败形态——状态码与方法名必须自明。
+			return fmt.Errorf("decode %s response (HTTP %d): %w", method, resp.StatusCode, err)
 		}
 	}
 	return nil

@@ -37,9 +37,9 @@ func postUsersGateImport(t *testing.T, h *Handlers, body string) *httptest.Respo
 // Then 校验期 400 且错误文案点名「users 表为空，导入将清空全部账户」。
 func TestImportConfigBackup_rejects_empty_users_array_with_dedicated_message(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	body := r41BackupJSON(t, nil, map[string][]map[string]any{
+	body := buildBackup(t, backupFixtureOptions{Sections: nil, Tables: map[string][]map[string]any{
 		"users": {},
-	}, nil)
+	}, Config: nil})
 
 	response := postUsersGateImport(t, h, body)
 
@@ -56,9 +56,9 @@ func TestImportConfigBackup_rejects_empty_users_array_with_dedicated_message(t *
 // Then valid=false 且错误文案与导入一致（此前预览显示「用户 0 个」仍 valid=true）。
 func TestValidateConfigImport_rejects_empty_users_array(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	body := r41BackupJSON(t, nil, map[string][]map[string]any{
+	body := buildBackup(t, backupFixtureOptions{Sections: nil, Tables: map[string][]map[string]any{
 		"users": {},
-	}, nil)
+	}, Config: nil})
 
 	got := r41PostValidate(t, h, body)
 
@@ -76,10 +76,10 @@ func TestImportConfigBackup_users_key_absent_still_imports(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (9,'local-keeper','hash','admin',1)`); err != nil {
 		t.Fatalf("seed local keeper: %v", err)
 	}
-	body := r41BackupJSON(t, nil, map[string][]map[string]any{
+	body := buildBackup(t, backupFixtureOptions{Sections: nil, Tables: map[string][]map[string]any{
 		"lb_rules":  {{"caddy_id": "lb_nousers", "name": "no-users", "protocol": "http", "domain": "nousers.example.test", "listen_port": 8081, "enabled": 1}},
 		"upstreams": {{"rule_id": "lb_nousers", "host": "127.0.0.1", "port": 9001, "weight": 1, "enabled": 1}},
-	}, nil)
+	}, Config: nil})
 
 	response := postUsersGateImport(t, h, body)
 
@@ -103,7 +103,7 @@ func TestImportConfigBackup_users_key_absent_still_imports(t *testing.T) {
 // （此前预览计数含两表且无警告，与导入侧实际落库分叉）。
 func TestValidateConfigImport_single_side_missing_crs_skips_table_and_warns(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	backupJSON := completeBackupJSON(t, nil)
+	backupJSON := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true})
 	body := buildTestLbbak(t, backupJSON, []byte("XDB-ONLY-PAYLOAD"))
 
 	rec := postLbbakValidate(t, h, body, "")
@@ -150,7 +150,7 @@ func TestValidateConfigImport_single_side_missing_xdb_skips_table_and_warns(t *t
 	if bundle == nil || len(bundle.CRSTarGz) == 0 || bundle.Xdb != nil {
 		t.Fatalf("仅 CRS bundle 构建失败: %+v", bundle)
 	}
-	backupJSON := completeBackupJSON(t, nil)
+	backupJSON := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true})
 	body, err := buildLbbakPayload([]byte(backupJSON), bundle)
 	if err != nil {
 		t.Fatalf("buildLbbakPayload: %v", err)

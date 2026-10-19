@@ -153,3 +153,43 @@ func TestSecurityUpdateEndpoints_conflictWhileInFlight(t *testing.T) {
 		t.Fatalf("占位解除后应 200, got %d %s", resp.Code, resp.Body.String())
 	}
 }
+
+// HC-05（历史）：任务引擎未装配时，库更新触发端点统一 503（引擎缺失
+// =服务暂不可用，非内部错误）。此前 CRS/IP2Region/威胁库三处 + 爬虫库触发
+// 500，与 taskmonitor 的 503 家族口径漂移；爬虫库状态读端点同族收敛。
+func TestLibraryUpdateEndpoints_engineUnavailableReturns503(t *testing.T) {
+	newBackupTestHandlers(t)
+	services.StopTaskEngine()
+	t.Cleanup(services.StopTaskEngine)
+
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	r := gin.New()
+	r.POST("/security/crs/update", h.StartCRSUpdate)
+	r.POST("/security/ip2region/update", h.StartIP2RegionUpdate)
+	r.POST("/security/threat-lib/update", h.StartThreatLibUpdate)
+	r.POST("/security/crawler-lib/update", h.StartCrawlerLibUpdate)
+	r.GET("/security/crawler-lib/update/status", h.GetCrawlerLibUpdateStatus)
+
+	for _, path := range []string{
+		"/security/crs/update",
+		"/security/ip2region/update",
+		"/security/threat-lib/update",
+		"/security/crawler-lib/update",
+	} {
+		resp := httptest.NewRecorder()
+		r.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, path, nil))
+		if resp.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s status=%d body=%s, want 503", path, resp.Code, resp.Body.String())
+		}
+		if !strings.Contains(resp.Body.String(), "任务引擎未初始化") {
+			t.Fatalf("%s body=%s, want 引擎未初始化文案", path, resp.Body.String())
+		}
+	}
+
+	resp := httptest.NewRecorder()
+	r.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/security/crawler-lib/update/status", nil))
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("crawler status=%d body=%s, want 503", resp.Code, resp.Body.String())
+	}
+}

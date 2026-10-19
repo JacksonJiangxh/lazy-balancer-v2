@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 )
 
@@ -65,5 +66,51 @@ func TestExtractLabel_exactKeyMatch(t *testing.T) {
 	}
 	if got := services.ExtractMetricLabel(`caddy_http_requests_total{x_host="evil"}`, "x_host"); got != "evil" {
 		t.Fatalf("x_host label must match its own key, got %q", got)
+	}
+}
+
+// H-B1-06：共享保存门收录 tls_source 白名单与 request_body_max_size_mb 值域
+// ——新增写路径只调共享门也不得落库跨模式 TLS 形态/越界值。
+func TestRulePayloadSaveGateRejectsTLSSourceAndBodyLimit(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	valid := func() models.CreateRuleRequest {
+		return models.CreateRuleRequest{
+			Name: "gate", Protocol: "http", Domain: "gate.example.test", ListenPort: 8443,
+			Strategy: "weighted_round_robin", HealthCheckPath: "/", HealthCheckInterval: 10,
+			HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2,
+			Upstreams: []models.Upstream{{Host: "127.0.0.1", Port: 9000, Weight: 1, Enabled: true, Protocol: "http"}},
+		}
+	}
+
+	baseline := valid()
+	if err := h.validateRulePayloadBeforeSave(baseline); err != nil {
+		t.Fatalf("基线载荷应通过共享门: %v", err)
+	}
+
+	badSource := valid()
+	badSource.EnableTLS = true
+	badSource.TLSSource = "https"
+	if err := h.validateRulePayloadBeforeSave(badSource); err == nil || !strings.Contains(err.Error(), "证书来源") {
+		t.Fatalf("tls_source=https 应被共享门拒绝, err=%v", err)
+	}
+
+	badBody := valid()
+	badBody.RequestBodyMaxSizeMB = 5000
+	if err := h.validateRulePayloadBeforeSave(badBody); err == nil || !strings.Contains(err.Error(), "0-4096") {
+		t.Fatalf("request_body_max_size_mb=5000 应被共享门拒绝, err=%v", err)
+	}
+}
+
+// H-B1-07：DNS 服务器 host 不得「含点即 FQDN」——非法字符保存即拒。
+func TestValidateSingleDnsAddress_rejectsIllegalHostCharacters(t *testing.T) {
+	for _, bad := range []string{"a!b.example.com", "x/y.example.com", "dns example.com", `dns"bad.example.com`, "a:b:c"} {
+		if err := validateSingleDnsAddress(bad); err == nil {
+			t.Errorf("validateSingleDnsAddress(%q)=nil, want error", bad)
+		}
+	}
+	for _, good := range []string{"8.8.8.8", "8.8.8.8:53", "dns.example.com", "dns.example.com:5353", "[2001:db8::1]:53", "localhost"} {
+		if err := validateSingleDnsAddress(good); err != nil {
+			t.Errorf("validateSingleDnsAddress(%q)=%v, want nil", good, err)
+		}
 	}
 }

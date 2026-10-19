@@ -46,8 +46,14 @@ func (s *SyncService) Report(ctx context.Context) error {
 	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(cert_expiry_days,?) FROM global_config WHERE id=1", db.DefaultCertExpiryDays).Scan(&expiryDays); err != nil || expiryDays <= 0 || expiryDays > 365 {
 		// 读失败/非法值回退治理默认时留痕（历史 R-12 家族扫描唯一漏点，
 		// 同族 certissuer/certificates/certinfo/certjobs 均已带留痕）。
-		Logf("warn", "集群报告: 读取证书到期口径失败，回退 %d 天", db.DefaultCertExpiryDays)
+		// S历史问题-09：Report 每同步周期都会读该列——列持续非法（带外直写）时
+		// 按状态转换「失败/恢复各记一次」，不再每 60s 一条 warn。
+		if level := logStateTransition("cluster-report-cert-expiry", true); level != "" {
+			Logf(level, "集群报告: 读取证书到期口径失败，回退 %d 天", db.DefaultCertExpiryDays)
+		}
 		expiryDays = db.DefaultCertExpiryDays
+	} else if level := logStateTransition("cluster-report-cert-expiry", false); level != "" {
+		Logf(level, "集群报告: 证书到期口径读取恢复正常")
 	}
 	// expiryDays 经 Scan 已是纯整数（非法/非数字值回退 30），strconv.Itoa 只产生
 	// 数字修饰符；SQLite datetime 修饰符无法参数化，格式化必须保证纯数字。

@@ -965,67 +965,96 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 	return rules, rows.Err()
 }
 
+// ruleRelationBatchSize 关系批量查询的分块大小（B2-09，历史）：单条
+// IN (...) 的占位符数量随规则数线性增长，超过驱动绑定变量上限（旧 SQLite
+// 999）时 ListRules/GetRule/DuplicateRule 直接 500。按 500 分块（与
+// BatchRuleBlockPages 的显式上限同量级），超大规模只增加往返次数。
+const ruleRelationBatchSize = 500
+
+// ruleIDChunks 按 ruleRelationBatchSize 切分规则 ID 列表。
+func ruleIDChunks(ruleIDs []string) [][]string {
+	chunks := make([][]string, 0, (len(ruleIDs)+ruleRelationBatchSize-1)/ruleRelationBatchSize)
+	for start := 0; start < len(ruleIDs); start += ruleRelationBatchSize {
+		end := start + ruleRelationBatchSize
+		if end > len(ruleIDs) {
+			end = len(ruleIDs)
+		}
+		chunks = append(chunks, ruleIDs[start:end])
+	}
+	return chunks
+}
+
 func loadUpstreamsBatch(ctx context.Context, ruleIDs []string) (map[string][]models.Upstream, error) {
 	result := make(map[string][]models.Upstream, len(ruleIDs))
-	if len(ruleIDs) == 0 {
-		return result, nil
+	loadChunk := func(batch []string) error {
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		// 历史: 与渲染侧同口径（IIF(enabled IN ('1',1),1,0)，NULL 视禁用）——
+		// 此前 COALESCE(enabled,1) 将遗留 NULL 行视为启用，UI 显示与生成配置分裂。
+		rows, err := db.DB.QueryContext(ctx, `SELECT id, rule_id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'')
+			FROM upstreams WHERE rule_id IN (`+strings.Join(placeholders, ",")+`) ORDER BY id`, args...)
+		if err != nil {
+			return fmt.Errorf("批量读取上游: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var u models.Upstream
+			if err := rows.Scan(&u.ID, &u.RuleID, &u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain); err != nil {
+				return err
+			}
+			result[u.RuleID] = append(result[u.RuleID], u)
+		}
+		return rows.Err()
 	}
-	placeholders := make([]string, len(ruleIDs))
-	args := make([]any, len(ruleIDs))
-	for i, id := range ruleIDs {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	// 历史: 与渲染侧同口径（IIF(enabled IN ('1',1),1,0)，NULL 视禁用）——
-	// 此前 COALESCE(enabled,1) 将遗留 NULL 行视为启用，UI 显示与生成配置分裂。
-	rows, err := db.DB.QueryContext(ctx, `SELECT id, rule_id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'')
-		FROM upstreams WHERE rule_id IN (`+strings.Join(placeholders, ",")+`) ORDER BY id`, args...)
-	if err != nil {
-		return nil, fmt.Errorf("批量读取上游: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var u models.Upstream
-		if err := rows.Scan(&u.ID, &u.RuleID, &u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain); err != nil {
+	for _, batch := range ruleIDChunks(ruleIDs) {
+		if err := loadChunk(batch); err != nil {
 			return nil, err
 		}
-		result[u.RuleID] = append(result[u.RuleID], u)
 	}
-	return result, rows.Err()
+	return result, nil
 }
 
 func loadPathRulesBatch(ctx context.Context, ruleIDs []string) (map[string][]models.PathRule, error) {
 	result := make(map[string][]models.PathRule, len(ruleIDs))
-	if len(ruleIDs) == 0 {
-		return result, nil
+	loadChunk := func(batch []string) error {
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		rows, err := db.DB.QueryContext(ctx, `SELECT id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to
+			FROM path_rules WHERE rule_id IN (`+strings.Join(placeholders, ",")+`) ORDER BY rule_id, sort_order, id`, args...)
+		if err != nil {
+			return fmt.Errorf("批量读取路径规则: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var pathRule models.PathRule
+			var upstreamsJSON sql.NullString
+			if err := rows.Scan(&pathRule.ID, &pathRule.RuleID, &pathRule.SortOrder, &pathRule.MatchType, &pathRule.Path, &pathRule.UpstreamPath, &upstreamsJSON,
+				&pathRule.ResponseMode, &pathRule.ResponseStatus, &pathRule.ResponseBody, &pathRule.ResponseContentType, &pathRule.RedirectTo); err != nil {
+				return err
+			}
+			if upstreamsJSON.Valid {
+				if err := json.Unmarshal([]byte(upstreamsJSON.String), &pathRule.Upstreams); err != nil {
+					return fmt.Errorf("解析路径规则 %d 的上游: %w", pathRule.ID, err)
+				}
+			}
+			result[pathRule.RuleID] = append(result[pathRule.RuleID], pathRule)
+		}
+		return rows.Err()
 	}
-	placeholders := make([]string, len(ruleIDs))
-	args := make([]any, len(ruleIDs))
-	for i, id := range ruleIDs {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	rows, err := db.DB.QueryContext(ctx, `SELECT id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to
-		FROM path_rules WHERE rule_id IN (`+strings.Join(placeholders, ",")+`) ORDER BY rule_id, sort_order, id`, args...)
-	if err != nil {
-		return nil, fmt.Errorf("批量读取路径规则: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var pathRule models.PathRule
-		var upstreamsJSON sql.NullString
-		if err := rows.Scan(&pathRule.ID, &pathRule.RuleID, &pathRule.SortOrder, &pathRule.MatchType, &pathRule.Path, &pathRule.UpstreamPath, &upstreamsJSON,
-			&pathRule.ResponseMode, &pathRule.ResponseStatus, &pathRule.ResponseBody, &pathRule.ResponseContentType, &pathRule.RedirectTo); err != nil {
+	for _, batch := range ruleIDChunks(ruleIDs) {
+		if err := loadChunk(batch); err != nil {
 			return nil, err
 		}
-		if upstreamsJSON.Valid {
-			if err := json.Unmarshal([]byte(upstreamsJSON.String), &pathRule.Upstreams); err != nil {
-				return nil, fmt.Errorf("解析路径规则 %d 的上游: %w", pathRule.ID, err)
-			}
-		}
-		result[pathRule.RuleID] = append(result[pathRule.RuleID], pathRule)
 	}
-	return result, rows.Err()
+	return result, nil
 }
 
 func hydrateRuleRelations(ctx context.Context, rules []models.LbRule) error {
@@ -1072,7 +1101,7 @@ type acmeReferenceInput struct {
 // *configValidationError（调用侧映射 400），查询失败返回普通错误（500）。
 // 全部「把规则投入运行/复制引用」入口（Create/Update 写侧、EnableRule、启动与
 // UpdateConfig 聚合校验、DuplicateRule、v2 备份导入）共用本门或其备份行同口径
-// 变体（config_backup.go validateBackupACMEReferenceIDs），保证悬挂/禁用引用
+// 变体（config_backup.go acmeImportRefIndex.validate），保证悬挂/禁用引用
 // 无从进入运行态（历史问题 发现1/发现5）。
 func validateRuleACMEReferences(input acmeReferenceInput) error {
 	if !input.EnableTLS || input.TLSSource != "acme_dns" {
@@ -1256,6 +1285,12 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// B2-08（历史）：全局请求体上限只读一次（此前 precheckRuleConfig 逐
+	// 规则点查同值配置 → 启动/UpdateConfig 聚合校验 N 条规则 N 次往返）。
+	globalBody := 0
+	if len(rules) > 0 {
+		globalBody = globalRequestBodyMaxSizeMBForPrecheck()
+	}
 	problems := make([]error, 0)
 	for _, rule := range rules {
 		// 存量规则可能建于校验上线前：80 端口 + TLS 跳转生成自环 Location，
@@ -1303,7 +1338,7 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 			}
 			continue
 		}
-		if err := validateRuleConfigGeneration(rule); err != nil {
+		if err := validateRuleConfigGenerationWithGlobalBody(rule, globalBody); err != nil {
 			problems = append(problems, fmt.Errorf("规则 %s（%s）配置无效：%w", rule.Name, rule.CaddyID, err))
 		}
 	}
@@ -1385,7 +1420,26 @@ func loadRulesForConfigValidation(ctx context.Context, suffix string, args ...an
 // 「健康检查间隔族」一项就此移除；代理超时族维持 0=省略合法语义，保留空口）。
 // TLS 开关与证书材料仍为有意空口（GenerateSingleRuleCaddyConfig 单规则形态
 // 约定——TLS 跳转分支自述无预检调用方）。
-func precheckRuleConfig(rule models.LbRule) services.SingleRuleConfig {
+// globalRequestBodyMaxSizeMBForPrecheck 读取全局 request_body_max_size_mb 供
+// 单规则预检携带（生产渲染由 generateCaddyConfigWithCertSource 从
+// global_config 灌入；预检此前缺位、靠渲染层「兜底 128」幸存——兜底废除后
+// 必须显式携带）。查询失败置 0：渲染层 resolveRuleOverrides 显性报错，预检
+// 随真实渲染同 fail-visible。B2-08（历史）：聚合校验把本函数的结果一次
+// 传入（N 条规则不再 N 次点查同值配置）。
+func globalRequestBodyMaxSizeMBForPrecheck() int {
+	globalBody := 0
+	if db.DB != nil {
+		if err := db.DB.QueryRow(`SELECT request_body_max_size_mb FROM global_config WHERE id=1`).Scan(&globalBody); err != nil {
+			services.Logf("warn", "precheckRuleConfig: 读取全局 request_body_max_size_mb 失败: %v", err)
+			globalBody = 0
+		}
+	}
+	return globalBody
+}
+
+// precheckRuleConfig 把库行投影为单规则渲染输入；globalBody 为全局
+// request_body_max_size_mb（调用方按批量/单条语义取一次）。
+func precheckRuleConfig(rule models.LbRule, globalBody int) services.SingleRuleConfig {
 	upstreams := make([]services.UpstreamConfig, 0, len(rule.Upstreams))
 	for _, upstream := range rule.Upstreams {
 		upstreams = append(upstreams, services.UpstreamConfig{
@@ -1393,17 +1447,6 @@ func precheckRuleConfig(rule models.LbRule) services.SingleRuleConfig {
 			Protocol: upstream.Protocol, Enabled: upstream.Enabled, MaxConnections: upstream.MaxConnections,
 			OriginDomain: upstream.OriginDomain,
 		})
-	}
-	// 库值唯一真相（批 1+2）：单规则预校验路径需携带全局 request_body_max_size_mb
-	//（生产渲染由 generateCaddyConfigWithCertSource 从 global_config 灌入；预检
-	// 此前缺位、靠渲染层「兜底 128」幸存——兜底废除后必须显式携带）。查询失败
-	// 置 0：渲染层 resolveRuleOverrides 显性报错，预检随真实渲染同 fail-visible。
-	globalBody := 0
-	if db.DB != nil {
-		if err := db.DB.QueryRow(`SELECT request_body_max_size_mb FROM global_config WHERE id=1`).Scan(&globalBody); err != nil {
-			services.Logf("warn", "precheckRuleConfig: 读取全局 request_body_max_size_mb 失败: %v", err)
-			globalBody = 0
-		}
 	}
 	return services.SingleRuleConfig{
 		CaddyID: rule.CaddyID, Protocol: rule.Protocol, Domain: rule.Domain, ListenPort: rule.ListenPort,
@@ -1428,8 +1471,16 @@ func precheckRuleConfig(rule models.LbRule) services.SingleRuleConfig {
 	}
 }
 
+// validateRuleConfigGeneration 单规则渲染预校验（EnableRule 单条语义：
+// 全局请求体上限就地读取一次）。
 func validateRuleConfigGeneration(rule models.LbRule) error {
-	config := services.GenerateSingleRuleCaddyConfig(precheckRuleConfig(rule))
+	return validateRuleConfigGenerationWithGlobalBody(rule, globalRequestBodyMaxSizeMBForPrecheck())
+}
+
+// validateRuleConfigGenerationWithGlobalBody 同上一形态，全局请求体上限由
+// 调用方传入（B2-08：聚合校验一次读取，逐规则复用）。
+func validateRuleConfigGenerationWithGlobalBody(rule models.LbRule, globalBody int) error {
+	config := services.GenerateSingleRuleCaddyConfig(precheckRuleConfig(rule, globalBody))
 	genErr, hasErr := config["error"].(error)
 	if !hasErr {
 		return nil
@@ -1449,5 +1500,10 @@ func validateRuleConfigGeneration(rule models.LbRule) error {
 	if errors.Is(genErr, services.ErrDynamicDNSUpstreamCount) {
 		return &configValidationError{message: "动态 DNS 模式仅支持一个启用的上游"}
 	}
-	return fmt.Errorf("生成规则配置失败: %s", genErr.Error())
+	// B2-10（历史）：其余生成失败同样源于规则数据/库值（预检输入全部来自
+	// 库行 + 一次全局配置值，生成路径无 DB I/O），按 configValidationError 分类
+	// ——EnableRule 映射 400「可自行修正」而非 500 内部故障，UpdateConfig 的
+	// isPureConfigValidationError 判定同受益；错误文本是渲染层确定性文案，
+	// 不含底层 DB 错误（DB 故障在更早的读行阶段已 500）。
+	return &configValidationError{message: "生成规则配置失败: " + genErr.Error()}
 }

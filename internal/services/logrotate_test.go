@@ -117,7 +117,7 @@ func TestTaskLogsHousekeeping_reportsDetails(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 强制刷新大小缓存（5min TTL 会命中旧值）
-	certJobLogSizeCachedAt.Store(0)
+	InvalidateTaskLogSizeCache()
 	// 超期文件（4 个月前）
 	old := filepath.Join(tasksDir, "stale.log")
 	if err := os.WriteFile(old, []byte("x"), 0644); err != nil {
@@ -316,5 +316,102 @@ func TestTaskLogsHousekeeping_waitsForTaskLogWriteLock(t *testing.T) {
 	data, err := os.ReadFile(path)
 	if err != nil || !strings.Contains(string(data), "fresh") {
 		t.Fatalf("写入后的活动日志必须保留, err=%v body=%q", err, data)
+	}
+}
+
+// —— 运行日志清理口径（V87-TO-04 / V87-TO-05，历史）——
+
+// writeStaleAppLogCopy 在 dir 下写入一份超保留期的 app.log.* 副本。
+func writeStaleAppLogCopy(t *testing.T, dir, name string) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("stale\n"), 0o644); err != nil {
+		t.Fatalf("write stale log: %v", err)
+	}
+	old := time.Now().AddDate(0, -13, 0)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+}
+
+// V87-TO-04：log-cleanup 摘要行的「保留 N 月」必须来自单源 auditRetentionMonths
+// （经 RuntimeCleanupResult.RetentionMonths 回填），不得在 wire/摘要层另行查库
+// 复算——同值两实现会在默认值/钳位逻辑变更时分裂（用户看到的保留期≠实际口径）。
+func TestRuntimeLogCleanupOnce_reportsRetentionMonthsSingleSource(t *testing.T) {
+	initServicesDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET audit_retention_months=6 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "app.log")
+	writeStaleAppLogCopy(t, dir, "app.log.1")
+
+	// When
+	res := RuntimeLogCleanupOnce(logFile)
+
+	// Then：保留月数=单源取值，且与实际删除口径一致（13 月前副本超 6 月保留期）
+	if got, want := res.RetentionMonths, auditRetentionMonths(); got != want || got != 6 {
+		t.Fatalf("RetentionMonths=%d, want %d（单源 auditRetentionMonths）", got, want)
+	}
+	if res.AppRemoved != 1 {
+		t.Fatalf("AppRemoved=%d, want 1（13 月前副本超 6 月保留期须删除）", res.AppRemoved)
+	}
+
+	// Then：摘要行直接展示该单源值
+	if summary := logCleanupSummaryLine(logFile); !strings.Contains(summary, "保留 6 月") {
+		t.Fatalf("摘要行未使用单源保留月数: %q", summary)
+	}
+}
+
+// V87-TO-04（回归形状）：保留月数配置越界（<1）时单源回退默认 3 月——摘要行与
+// 删除口径必须同回退（此前两处各自实现，一侧漏改即分裂）。
+func TestRuntimeLogCleanupOnce_outOfRangeRetentionFallsBackToDefault(t *testing.T) {
+	initServicesDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET audit_retention_months=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "app.log")
+
+	res := RuntimeLogCleanupOnce(logFile)
+	if res.RetentionMonths != 3 {
+		t.Fatalf("RetentionMonths=%d, want 3（越界回退默认）", res.RetentionMonths)
+	}
+	if summary := logCleanupSummaryLine(logFile); !strings.Contains(summary, "保留 3 月") {
+		t.Fatalf("摘要行未体现默认回退: %q", summary)
+	}
+}
+
+// V87-TO-05②：库未初始化时不得整体跳过应用日志副本清理（此前 db 为 nil 直接
+// return，AppRemoved=0 静默跳过——与「清理不得静默跳过」口径相反）。
+func TestRuntimeLogCleanupOnce_nilDBStillCleansAppCopies(t *testing.T) {
+	oldDB, oldMetrics, oldAudit := db.DB, db.MetricsDB, db.AuditDB
+	oldCurrent := db.GetDB()
+	db.DB, db.MetricsDB, db.AuditDB = nil, nil, nil
+	db.SetDB(nil) // GetDB() 与 db.DB 是两个句柄来源，必须同时清空才是真实 nil 库形态
+	t.Cleanup(func() {
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetrics, oldAudit
+		db.SetDB(oldCurrent)
+	})
+
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "app.log")
+	writeStaleAppLogCopy(t, dir, "app.log.1")
+
+	res := RuntimeLogCleanupOnce(logFile)
+	if res.AppRemoved != 1 {
+		t.Fatalf("nil 库时 AppRemoved=%d, want 1（不得跳过应用日志副本清理）", res.AppRemoved)
+	}
+	if res.RetentionMonths != 3 {
+		t.Fatalf("nil 库时 RetentionMonths=%d, want 3（默认保留期）", res.RetentionMonths)
+	}
+}
+
+// V87-TO-05③：运行日志文件未打开（runtimeLogFile 为空）时摘要行必须是显式
+// 「未启用」形态，而非静默零动作。
+func TestLogCleanupSummaryLine_disabledShape(t *testing.T) {
+	got := logCleanupSummaryLine("")
+	if !strings.HasPrefix(got, "日志清理未启用") {
+		t.Fatalf("logFile 为空时摘要=%q, want 「日志清理未启用…」", got)
 	}
 }

@@ -81,6 +81,14 @@ func respondTaskTriggerAdmissionError(c *gin.Context, err error) {
 	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务触发失败: " + err.Error()})
 }
 
+// respondTaskEngineUnavailable 任务引擎未装配的统一响应。引擎缺失属「服务
+// 暂不可用」而非内部错误——与触发/启停/取消路径的 503 同口径（历史问题 裁定），
+// 全仓单一出口（历史 HC-05：库更新触发端点此前 500，与任务监控 503
+// 形成家族状态码漂移）。
+func respondTaskEngineUnavailable(c *gin.Context) {
+	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
+}
+
 // TriggerSystemTask 手动触发（admin；仅排程/队列类任务族）。
 func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 	id := c.Param("id")
@@ -135,7 +143,7 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 		return
 	}
 	// 历史问题：无引擎时统一 503（回退 switch 删除）。
-	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
+	respondTaskEngineUnavailable(c)
 }
 
 // ToggleSystemTask 调度开关（admin；body {"enabled": bool}）。
@@ -191,7 +199,8 @@ func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "任务不存在"})
 		return
 	}
-	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
+	// 历史问题：无引擎时统一 503（回退 switch 删除）。
+	respondTaskEngineUnavailable(c)
 }
 
 // CancelSystemTask 取消运行中任务（admin；仅 Cancelable 声明族）。
@@ -217,7 +226,7 @@ func (h *Handlers) CancelSystemTask(c *gin.Context) {
 		return
 	}
 	// 历史问题：无引擎时统一 503（回退 switch 删除）。
-	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
+	respondTaskEngineUnavailable(c)
 }
 
 // ControlSystemTask 常驻循环启停（admin；body {"action":"start|stop|restart"}）。
@@ -243,7 +252,7 @@ func (h *Handlers) ControlSystemTask(c *gin.Context) {
 	}
 	te := services.TaskEngine()
 	if te == nil {
-		c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
+		respondTaskEngineUnavailable(c)
 		return
 	}
 	m, ok := te.Lookup(id)

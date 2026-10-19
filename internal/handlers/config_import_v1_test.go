@@ -18,6 +18,7 @@ import (
 
 	"lazy-balancer-v2/internal/config"
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 )
 
@@ -605,4 +606,60 @@ func stringMustMarshal(t *testing.T, value string) string {
 		t.Fatalf("marshal string: %v", err)
 	}
 	return string(data)
+}
+
+// ── 历史问题-历史问题（历史）：预览 has_waf_files 必须纳入威胁库名单条目
+// ——RDB 文件化后存在「仅威胁 .iplist、无 CRS/xdb」的合法 lbbak，此前预览提示
+// 「不含规则库文件」而实际会落盘名单文件（文案与真实能力不符）。 ──
+
+func a3CanonicalThreatURL(t *testing.T, source string) string {
+	t.Helper()
+	seed, ok := db.CanonicalThreatSource(source)
+	if !ok {
+		t.Fatalf("未登记的内置威胁源 %q", source)
+	}
+	return seed.URL
+}
+
+func TestA3_87_P3_12_previewHasWafFilesIncludesThreatOnlyLbbak(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	overrideTestWafPaths(t)
+	restore := services.OverrideThreatWafDirForTest(t.TempDir())
+	t.Cleanup(restore)
+
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
+		"security_threat_sources": {{"name": "ustc", "display_name": "USTC", "url": a3CanonicalThreatURL(t, "ustc"), "format": "plain", "update_enabled": 1, "apply_enabled": 1}},
+	}, Config: nil, Sections: nil, EmptyConfigIfNil: true})
+
+	bundle := &services.WafFileBundle{ThreatFiles: []models.ThreatFileEntry{{Name: "ustc"}}}
+	payload, err := buildLbbakPayloadWithThreatIplists([]byte(backup), bundle, map[string][]byte{"ustc": []byte("203.0.113.9\n")})
+	if err != nil {
+		t.Fatalf("build lbbak: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/config/import/validate", h.ValidateConfigImport)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/config/import/validate", strings.NewReader(string(payload)))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Data struct {
+			Valid       bool `json:"valid"`
+			HasWafFiles bool `json:"has_waf_files"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode preview: %v body=%s", err, rec.Body.String())
+	}
+	if !response.Data.Valid {
+		t.Fatalf("preview invalid: %s", rec.Body.String())
+	}
+	if !response.Data.HasWafFiles {
+		t.Fatalf("has_waf_files=false, want true（仅含威胁库名单条目的合法 lbbak）: %s", rec.Body.String())
+	}
 }

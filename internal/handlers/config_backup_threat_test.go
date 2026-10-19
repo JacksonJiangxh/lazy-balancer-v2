@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 // 威胁情报库备份接入（v2.3.x）：security_threat_sources 随「安全防护」节
@@ -80,12 +83,12 @@ func TestConfigBackup_threatSourcesRejectsForgedSource(t *testing.T) {
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 
-	body := completeBackupJSON(t, map[string][]map[string]any{
+	body := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_threat_sources": {
 			{"id": 1, "name": "ustc", "display_name": "中科大黑 IP", "url": "https://blackip.ustc.edu.cn/list.php?txt", "format": "plain", "update_enabled": 1, "apply_enabled": 1},
 			{"id": 99, "name": "evil", "display_name": "伪造源", "url": "https://evil.example/list.txt", "format": "plain", "update_enabled": 1, "apply_enabled": 1},
 		},
-	})
+	}, EmptyConfigIfNil: true})
 
 	// When
 	rec := httptest.NewRecorder()
@@ -99,5 +102,43 @@ func TestConfigBackup_threatSourcesRejectsForgedSource(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "威胁库源不受支持") {
 		t.Fatalf("body=%s, want 含「威胁库源不受支持」", rec.Body.String())
+	}
+}
+
+// ── 历史问题-历史问题（历史）：威胁文件收敛文案必须区分两种「备份未携带源
+// 文件」成因——上次下载成功但名单为空 vs 导出节点从未成功下载（后者在
+// update_enabled=0 时不会自动重取，需要可执行提示）。删除行为的 历史问题-03
+// 「记录与执行面恒一致」不变量保持不变。 ──
+
+func TestA3_87_P3_13_threatReconcileDistinguishesAbsenceReasons(t *testing.T) {
+	wafDir := t.TempDir()
+	restore := services.OverrideThreatWafDirForTest(wafDir)
+	t.Cleanup(restore)
+	for _, name := range []string{"threat-ustc.iplist", "threat-gptbot.iplist"} {
+		if err := os.WriteFile(filepath.Join(wafDir, name), []byte("1.2.3.4\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tables := map[string][]map[string]any{
+		"security_threat_sources": {
+			// 导出节点上次下载成功但名单为空 —— 备份内为空是真事实。
+			{"name": "ustc", "update_status": "success", "version": "2026-10-01", "entry_count": 0},
+			// 导出节点从未成功下载 —— 文件缺席不代表空名单。
+			{"name": "gptbot", "update_status": "idle", "version": "", "entry_count": 0},
+		},
+	}
+	warnings, _ := reconcileImportedThreatFiles(tables, &lbbakPayload{}, nil)
+	joined := strings.Join(warnings, " | ")
+	if !strings.Contains(joined, "ustc") || !strings.Contains(joined, "上次下载成功但无条目") {
+		t.Fatalf("warnings=%s, want 成功空名单语义（备份中该源为空）", joined)
+	}
+	if !strings.Contains(joined, "gptbot") || !strings.Contains(joined, "尚未成功下载") {
+		t.Fatalf("warnings=%s, want 未下载语义（备份未携带该源文件）", joined)
+	}
+	if _, err := os.Stat(filepath.Join(wafDir, "threat-ustc.iplist")); !os.IsNotExist(err) {
+		t.Fatalf("空名单源的本地旧文件必须删除（记录与执行面一致）")
+	}
+	if _, err := os.Stat(filepath.Join(wafDir, "threat-gptbot.iplist")); !os.IsNotExist(err) {
+		t.Fatalf("未成功下载源的本地文件同样按记录清空（DB 与执行面一致）")
 	}
 }

@@ -165,12 +165,17 @@ func (m *IP2RegionUpdateManager) StartUpdate(trigger string, rc *taskengine.RunC
 	m.running = true
 	m.runDone = make(chan struct{})
 	m.state = ip2RegionTaskState{status: IP2RegionStatusChecking, trigger: trigger, startedAt: time.Now().UTC()}
+	// SS87-历史问题：可取消 ctx 与 running 同临界区登记（镜像 CRS）——StartUpdate
+	// 返回后立刻 CancelRunning 必须命中，不得读到未登记的 runCancel 静默放行。
+	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
+	m.runCancel = runCancel
 	done := m.runDone
 	m.mu.Unlock()
 
 	go func() {
 		defer close(done)
-		m.run(trigger, rc)
+		defer runCancel()
+		m.runWithContext(runCtx, trigger, rc)
 	}()
 	return done, nil
 }
@@ -197,8 +202,19 @@ func (m *IP2RegionUpdateManager) setStage(status IP2RegionUpdateStatus, message 
 	WriteIP2RegionUpdateLog(level, string(status), message)
 }
 
-// run executes the full update pipeline synchronously.
+// run 同步执行一次更新（测试/内部直调路径）：自建可取消 ctx 并登记
+// runCancel（镜像 CRS 的 SS87-历史问题 形态）。
 func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) {
+	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
+	defer runCancel()
+	m.mu.Lock()
+	m.runCancel = runCancel
+	m.mu.Unlock()
+	m.runWithContext(runCtx, trigger, rc)
+}
+
+// runWithContext 是更新管线本体；runCtx 生命周期归调用方。
+func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger string, rc *taskengine.RunContext) {
 	operator := "system"
 	if rc != nil && rc.Operator != "" {
 		operator = rc.Operator
@@ -235,16 +251,8 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 	// 历史问题 单写方：task_runs 由引擎统一记录。
 	// F-历史问题-01（历史）：runCtx 派生自 rc.Ctx（镜像 CRS 侧）——引擎 demote
 	// 中止（SetRole 取消在途 Scheduled）随 rc.Ctx 传播；nil rc 回退 Background。
-	runBase := context.Background()
-	if rc != nil && rc.Ctx != nil {
-		runBase = rc.Ctx
-	}
-	runCtx, runCancel := context.WithCancel(runBase)
-	m.mu.Lock()
-	m.runCancel = runCancel
-	m.mu.Unlock()
+	// SS87-历史问题：ctx 由调用方（StartUpdate/run）预建。
 	defer func() {
-		runCancel()
 		m.mu.Lock()
 		m.running = false
 		m.mu.Unlock()
@@ -481,7 +489,13 @@ func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) 
 			return
 		}
 	}
-	os.Remove(ip2regionLivePath + ".bak")
+	// SS87-历史问题：只清理本运行创建的备份（与 rollbackXDB 的 bakCreated 口径、
+	// 历史问题/历史问题/A86 历史问题「本运行创建才可消费/清理」统一）——fresh-install（live
+	// 不存在→本轮未建备份）时磁盘上的陈旧 .bak 是崩溃现场唯一恢复副本，
+	// 成功路径删除会无谓销毁它。
+	if m.bakCreated {
+		os.Remove(ip2regionLivePath + ".bak")
+	}
 
 	if _, err := db.DB.Exec(
 		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotAdvanceSQL+" WHERE id=1",
@@ -605,9 +619,13 @@ func (m *IP2RegionUpdateManager) downloadAndInstall(parent context.Context, tag 
 		}
 		m.bakCreated = true
 	}
-	if err := os.Rename(staged, ip2regionLivePath); err != nil {
-		// 安装未发生：清理备份，避免陈旧 .bak 干扰后续运行的回滚判断。
-		os.Remove(liveBak)
+	if err := osRename(staged, ip2regionLivePath); err != nil {
+		// 安装未发生：仅清理本运行创建的备份（SS87-历史问题——无 bakCreated 守
+		// 卫时 fresh-install 会删除跨运行的陈旧 .bak，而该备份是崩溃现场唯一
+		// 恢复副本；陈旧 bak 本就不会被 rollback 消费）。
+		if m.bakCreated {
+			os.Remove(liveBak)
+		}
 		wafFileMu.Unlock()
 		return fmt.Errorf("安装 ip2region xdb: %w", err)
 	}

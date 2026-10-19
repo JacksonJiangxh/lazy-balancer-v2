@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -162,4 +164,75 @@ func TestDuplicateRule_copiesSecurityPolicyBindings(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "2 条策略绑定") {
 		t.Fatalf("success message must state carried bindings, body=%.300s", response.Body.String())
 	}
+}
+
+// B2-04 / B2-05：跨模式残留清理——生效来源非 manual 不保留证书材料；
+// 非 acme_dns 的 ca_provider_id 归零（manual→manual 编辑同样自愈）。
+func TestUpdateRule_clearsCrossSourceTLSResidue(t *testing.T) {
+	t.Run("manual-to-acme-drops-certificate-material", func(t *testing.T) {
+		handler := newRuleFeatureTestHandlers(t)
+		seedAuditRule(t, "lb_a87_cross", "cross", "cross-a87.example.test", 8088, false, "manual", true)
+		seedAuditUpstream(t, "lb_a87_cross")
+		certPEM, keyPEM, err := generateTestCert("cross-a87.example.test", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+		if err != nil {
+			t.Fatalf("generate cert: %v", err)
+		}
+		if _, err := db.DB.Exec("UPDATE lb_rules SET tls_cert=?,tls_key=? WHERE caddy_id='lb_a87_cross'", certPEM, keyPEM); err != nil {
+			t.Fatalf("seed material: %v", err)
+		}
+		configID := seedR52CertificateConfig(t)
+		router := gin.New()
+		router.PUT("/rules/:caddy_id", handler.UpdateRule)
+		request := httptest.NewRequest(http.MethodPut, "/rules/lb_a87_cross",
+			strings.NewReader(fmt.Sprintf(`{"tls_source":"acme_dns","acme_config_id":%d}`, configID)))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+
+		router.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var storedCert, storedKey, source string
+		if err := db.DB.QueryRow("SELECT COALESCE(tls_cert,''),COALESCE(tls_key,''),COALESCE(tls_source,'') FROM lb_rules WHERE caddy_id='lb_a87_cross'").Scan(&storedCert, &storedKey, &source); err != nil {
+			t.Fatalf("read rule: %v", err)
+		}
+		if source != "acme_dns" {
+			t.Fatalf("tls_source=%q, want acme_dns", source)
+		}
+		if storedCert != "" || storedKey != "" {
+			t.Fatal("acme 源规则仍保留手动证书材料——私钥正文会随导出/备份/快照放大")
+		}
+	})
+
+	t.Run("manual-edit-zeroes-stale-ca-provider", func(t *testing.T) {
+		handler := newRuleFeatureTestHandlers(t)
+		seedAuditRule(t, "lb_a87_ca", "ca", "ca-a87.example.test", 8089, false, "manual", false)
+		seedAuditUpstream(t, "lb_a87_ca")
+		var providerID int
+		if err := db.DB.QueryRow("SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1").Scan(&providerID); err != nil {
+			t.Fatalf("read CA provider: %v", err)
+		}
+		if _, err := db.DB.Exec("UPDATE lb_rules SET ca_provider_id=? WHERE caddy_id='lb_a87_ca'", providerID); err != nil {
+			t.Fatalf("seed stale provider: %v", err)
+		}
+		router := gin.New()
+		router.PUT("/rules/:caddy_id", handler.UpdateRule)
+		request := httptest.NewRequest(http.MethodPut, "/rules/lb_a87_ca", strings.NewReader(`{"description":"touch"}`))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+
+		router.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var storedProvider int
+		if err := db.DB.QueryRow("SELECT COALESCE(ca_provider_id,0) FROM lb_rules WHERE caddy_id='lb_a87_ca'").Scan(&storedProvider); err != nil {
+			t.Fatalf("read rule: %v", err)
+		}
+		if storedProvider != 0 {
+			t.Fatalf("ca_provider_id=%d, want 0（manual 行不得继承陈旧 CA 提供商）", storedProvider)
+		}
+	})
 }

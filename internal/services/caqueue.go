@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -165,34 +166,69 @@ func ResetCAQueueManagerForTest() {
 // 测试注入缩短时限以覆盖超时路径，生产代码不得改写。
 var caCancelWaitTimeout = 30 * time.Second
 
+// collectCancellationLocked 收集匹配任务的取消函数与在途执行完成信号，供
+// CancelJob（按任务）与 CancelJobsForRule（按规则）共用同一扫描口径
+// （SV历史问题：此前按规则入口扫 m.queues + retiredQueues + zombieJobs，按任务
+// 入口只扫 m.queues，契约不对称且退役/僵尸形态靠 ctx 已取消「碰巧安全」）。
+// 调用方须持有 m.mu（锁序恒为 m.mu→q.mu）；返回的 cancel 必须在解锁后调用。
+// pending 命中项从队列摘除并清 active（执行中任务不由这里摘 active，仍由
+// execute 退出路径维护）。僵尸任务即使 done 为 nil 也必须加入等待集合——
+// nil 表示永久僵尸，等待方只能由 ctx/共享 deadline 失败退出。
+func (m *CAQueueManager) collectCancellationLocked(matches func(jobID int, ruleID string) bool) ([]context.CancelFunc, []<-chan struct{}) {
+	var cancels []context.CancelFunc
+	var done []<-chan struct{}
+	collectQueue := func(q *caQueue) {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		for jobID, cancel := range q.cancels {
+			if !matches(jobID, q.runningRules[jobID]) {
+				continue
+			}
+			if cancel != nil {
+				cancels = append(cancels, cancel)
+			}
+		}
+		for jobID, executionDone := range q.executionDone {
+			if !matches(jobID, q.runningRules[jobID]) {
+				continue
+			}
+			if executionDone != nil {
+				done = append(done, executionDone)
+			}
+		}
+	}
+	for _, q := range m.queues {
+		q.mu.Lock()
+		pending := q.pending[:0]
+		for _, item := range q.pending {
+			if matches(item.jobID, item.ruleID) {
+				delete(q.active, item.jobID)
+				continue
+			}
+			pending = append(pending, item)
+		}
+		q.pending = pending
+		q.mu.Unlock()
+		collectQueue(q)
+	}
+	for _, entry := range m.retiredQueues {
+		collectQueue(entry.queue)
+	}
+	for jobID, zombie := range m.zombieJobs {
+		if matches(jobID, zombie.ruleID) {
+			done = append(done, zombie.done)
+		}
+	}
+	return cancels, done
+}
+
 // CancelJob aborts an in-flight issuance for the given job across all
 // provider queues; deletion handlers call this before removing the row so a
 // worker cannot keep issuing and deploying after the job is gone.
 func (m *CAQueueManager) CancelJob(jobID int) {
 	cancelCertificateDeploymentRetry(jobID)
 	m.mu.Lock()
-	var done []<-chan struct{}
-	var cancels []context.CancelFunc
-	for _, q := range m.queues {
-		q.mu.Lock()
-		pending := q.pending[:0]
-		for _, item := range q.pending {
-			if item.jobID == jobID {
-				delete(q.active, jobID)
-				continue
-			}
-			pending = append(pending, item)
-		}
-		q.pending = pending
-		cancel, ok := q.cancels[jobID]
-		if ok {
-			cancels = append(cancels, cancel)
-		}
-		if executionDone := q.executionDone[jobID]; executionDone != nil {
-			done = append(done, executionDone)
-		}
-		q.mu.Unlock()
-	}
+	cancels, done := m.collectCancellationLocked(func(id int, _ string) bool { return id == jobID })
 	m.mu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
@@ -214,56 +250,7 @@ func (m *CAQueueManager) CancelJob(jobID int) {
 func (m *CAQueueManager) CancelJobsForRule(ctx context.Context, ruleID string) error {
 	deploymentDone := signalCancelCertificateDeploymentRetriesForRule(ruleID)
 	m.mu.Lock()
-	var done []<-chan struct{}
-	var cancels []context.CancelFunc
-	for _, q := range m.queues {
-		q.mu.Lock()
-		pending := q.pending[:0]
-		for _, item := range q.pending {
-			if item.ruleID == ruleID {
-				delete(q.active, item.jobID)
-				continue
-			}
-			pending = append(pending, item)
-		}
-		q.pending = pending
-		for jobID, runningRuleID := range q.runningRules {
-			if runningRuleID == ruleID {
-				if cancel := q.cancels[jobID]; cancel != nil {
-					cancels = append(cancels, cancel)
-				}
-				if executionDone := q.executionDone[jobID]; executionDone != nil {
-					done = append(done, executionDone)
-				}
-			}
-		}
-		q.mu.Unlock()
-	}
-	// PauseAndDrain 超时后，仍在执行的旧队列迁入 retiredQueues；它们与
-	// 当前队列同属 drain 真源，漏掉会让 DeleteRule 在私钥写入尚未退出时删文件。
-	for _, entry := range m.retiredQueues {
-		q := entry.queue
-		q.mu.Lock()
-		for jobID, runningRuleID := range q.runningRules {
-			if runningRuleID != ruleID {
-				continue
-			}
-			if cancel := q.cancels[jobID]; cancel != nil {
-				cancels = append(cancels, cancel)
-			}
-			if executionDone := q.executionDone[jobID]; executionDone != nil {
-				done = append(done, executionDone)
-			}
-		}
-		q.mu.Unlock()
-	}
-	for _, zombie := range m.zombieJobs {
-		if zombie.ruleID == ruleID {
-			// nil done 是永久僵尸形态：加入等待集合后该 case 不成立，只能由
-			// ctx/共享 deadline 失败退出，绝不可当成「已排空」放行删除。
-			done = append(done, zombie.done)
-		}
-	}
+	cancels, done := m.collectCancellationLocked(func(_ int, runningRuleID string) bool { return runningRuleID == ruleID })
 	m.mu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
@@ -304,13 +291,12 @@ func (m *CAQueueManager) BlockJobsForRule(ruleID string) RuleBlockToken {
 }
 
 // UnblockJobsForRule releases only the barrier created by the matching token.
-func (m *CAQueueManager) UnblockJobsForRule(ruleID string, tokens ...RuleBlockToken) {
-	if len(tokens) != 1 {
-		return
-	}
+// SV历史问题：单参形态由编译器保证恰好一个 token——变参 + len!=1 静默 no-op 曾
+// 让误传 0/2 个 token 的调用方永久持有租约（该规则证书操作长期 409）且无日志。
+func (m *CAQueueManager) UnblockJobsForRule(ruleID string, token RuleBlockToken) {
 	m.mu.Lock()
 	barriers := m.blockedRules[ruleID]
-	delete(barriers, tokens[0])
+	delete(barriers, token)
 	lastBarrierReleased := false
 	if len(barriers) == 0 {
 		delete(m.blockedRules, ruleID)
@@ -1274,7 +1260,15 @@ func requeueCanceledJob(jobID int) {
 			return
 		}
 	}
-	if err := transitionJob(db.DB, jobID, jobStatusesExceptDisabled, "queued", map[string]any{"message": "节点生命周期切换，等待恢复签发"}); err != nil && !errors.Is(err, ErrJobTransitionConflict) {
+	// 历史问题-04（历史核实成立）：from 集合收紧为 nonTerminalJobStatuses
+	// （原 jobStatusesExceptDisabled 含终态 issued/failed）。可达性证据=本文件
+	// 的并发部署回调形态：在途执行已把行推进到 'downloaded' 后被生命周期取消
+	//（q.ctx 取消）与并发部署回调（30s 补扫/部署 timer）交错——回调 CAS 胜者
+	// 已提交 'issued'（或在途执行在 failJob 落 'failed' 后 ctx 才被取消），
+	// 本函数随后读到终态行。原实现会把终态无条件拉回 'queued'：issued→整轮
+	// 重签（烧 CA 配额）、failed→终态不复活契约被绕过（导入/对账均以终态为
+	// 不可复活边界）。'disabled' 本就排除，'downloaded' 由上分支保留部署语义。
+	if err := transitionJob(db.DB, jobID, nonTerminalJobStatuses, "queued", map[string]any{"message": "节点生命周期切换，等待恢复签发"}); err != nil && !errors.Is(err, ErrJobTransitionConflict) {
 		Logf("error", "CA queue: failed to requeue canceled job %d: %v", jobID, err)
 	}
 }
@@ -1308,6 +1302,7 @@ func jobExists(jobID int) bool {
 
 func loadCAProvider(id int) (models.CAProvider, error) {
 	var p models.CAProvider
+	explicitID := id
 	if id == 0 {
 		// Use system default.
 		var err error
@@ -1319,13 +1314,42 @@ func loadCAProvider(id int) (models.CAProvider, error) {
 	}
 
 	err := scanCAProvider(db.DB.QueryRow("SELECT "+caProviderColumns+" FROM ca_providers WHERE id=? AND enabled=1", id), &p)
-	if err != nil {
-		// If the requested/default provider is disabled or missing, fall back to the first enabled provider.
-		var fallbackID int
-		if fallbackErr := db.DB.QueryRow("SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1").Scan(&fallbackID); fallbackErr == nil {
-			id = fallbackID
-			err = scanCAProvider(db.DB.QueryRow("SELECT "+caProviderColumns+" FROM ca_providers WHERE id=? AND enabled=1", id), &p)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return p, fmt.Errorf("load CA provider %d: %w", id, err)
+	}
+	if err == nil {
+		return p, nil
+	}
+	// SV历史问题（历史问题）：显式选择的提供商「存在但已禁用」时不得静默改派——回退会
+	// 把任务签到另一 CA（消耗其配额）并持久化改写 cert_jobs.ca_provider_id，
+	// 规则 UI 仍显示原提供商，仅有一条 resolved= 应用日志。改为显性失败（经
+	// enqueueLocked 落 failed + job 日志/审计）。「已删除」仍保留回退：历史/
+	// 导入任务的提供商行被清理后，续签链按首个启用提供商延续（用户裁定方案 A）。
+	if explicitID != 0 {
+		var enabled bool
+		var name string
+		stateErr := db.DB.QueryRow("SELECT enabled, COALESCE(name,'') FROM ca_providers WHERE id=?", explicitID).Scan(&enabled, &name)
+		switch {
+		case stateErr == nil && !enabled:
+			return p, fmt.Errorf("CA 提供商 %d（%s）已禁用：显式选择不会静默改派，请先启用该提供商或修改规则选择", explicitID, name)
+		case stateErr == nil:
+			// enabled=1 而首查落空=两次查询之间状态被并发改写（或行被重建），
+			// 不能当「已禁用」定局，也不能回退——返回可重试错误。
+			return p, fmt.Errorf("CA 提供商 %d 状态在解析期间发生变化，请重试", explicitID)
+		case !errors.Is(stateErr, sql.ErrNoRows):
+			return p, fmt.Errorf("load CA provider %d: %w", explicitID, stateErr)
 		}
+	}
+	// If the requested/default provider is disabled or missing, fall back to the first enabled provider.
+	var fallbackID int
+	if fallbackErr := db.DB.QueryRow("SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1").Scan(&fallbackID); fallbackErr == nil {
+		if explicitID != 0 {
+			// 已删除的显式 ID 回退是历史延续，但不得完全无声：点名原 ID 与
+			// 实际使用的提供商，便于运维判断是否该清理旧任务。
+			Logf("warn", "CA queue: 显式 CA 提供商 %d 已不存在，回退到提供商 %d（历史任务延续，后续签发将持久化该 ID）", explicitID, fallbackID)
+		}
+		id = fallbackID
+		err = scanCAProvider(db.DB.QueryRow("SELECT "+caProviderColumns+" FROM ca_providers WHERE id=? AND enabled=1", id), &p)
 	}
 	if err != nil {
 		return p, fmt.Errorf("load CA provider %d: %w", id, err)

@@ -2,10 +2,12 @@ package services
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +32,13 @@ func TestRunCrawlerBotUpdate_taskLifecycleLogsAndTimestamps(t *testing.T) {
 	}
 	if _, err := database.Exec(`UPDATE security_crawler_sources SET update_enabled=0;
 		UPDATE security_crawler_sources SET update_enabled=1,url=? WHERE name='googlebot'`, ts.URL); err != nil {
+		t.Fatal(err)
+	}
+	// PD-04（历史）：内置首版已与官方快照对齐（googlebot 170 条），收缩门
+	// 基线在「DB 无行」时取内置条数——2 条的合成响应会被判截断。生产形态恒有
+	// DB 行（首轮由 Prime 落库），此处按同一形态预置当前快照 2 条，使基线走
+	// DB 分支（本用例的断言对象是任务生命周期日志与时间，不是收缩门）。
+	if err := upsertCrawlerIPList("googlebot", []string{"66.249.66.0/24", "66.249.67.0/24"}); err != nil {
 		t.Fatal(err)
 	}
 	const wantStart = "2026-10-17 14:09:17"
@@ -119,5 +128,143 @@ func TestRunCrawlerBotUpdate_downloadFailureMarksFailedAndLogs(t *testing.T) {
 	}
 	if logText := readTaskLog(t, "crawlerbot-update"); !strings.Contains(logText, "源 googlebot 更新失败") {
 		t.Errorf("任务日志缺少源失败行:\n%s", logText)
+	}
+}
+
+// —— RunUpdate 取消/降级分支（SSA-87-09，历史） ——
+
+// 下载在途取消：源行落 cancelled、保留上次快照（排程槽与版本不动）。
+func TestSSA8709_runUpdateCancelMarksSourceCancelled(t *testing.T) {
+	_, database := newClusterTestService(t)
+	oldFile := crawlerIPListFile
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	t.Cleanup(func() { crawlerIPListFile = oldFile })
+	if err := ensureCrawlerSources(); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(started) })
+		<-release // 模拟下载在途（取消发生在响应前）
+	}))
+	t.Cleanup(ts.Close)
+	t.Cleanup(func() { close(release) })
+	if _, err := database.Exec(`UPDATE security_crawler_sources SET update_enabled=0`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE security_crawler_sources SET update_enabled=1, url=? WHERE name='googlebot'`, ts.URL); err != nil {
+		t.Fatal(err)
+	}
+	var nextBefore string
+	if err := database.QueryRow(`SELECT COALESCE(next_update,'') FROM security_crawler_sources WHERE name='googlebot'`).Scan(&nextBefore); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- GetCrawlerUpdateManager().RunUpdate(ctx, taskengine.RunContext{Ctx: ctx, Trigger: "manual"})
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("下载未开始")
+	}
+	cancel()
+	var runErr error
+	select {
+	case runErr = <-errCh:
+	case <-time.After(15 * time.Second):
+		t.Fatal("取消后 RunUpdate 未返回")
+	}
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("取消须回传 ctx 错误，得到 %v", runErr)
+	}
+
+	var status, message, nextAfter, version string
+	if err := database.QueryRow(`SELECT update_status, COALESCE(message,''), COALESCE(next_update,''), COALESCE(version,'') FROM security_crawler_sources WHERE name='googlebot'`).
+		Scan(&status, &message, &nextAfter, &version); err != nil {
+		t.Fatal(err)
+	}
+	if status != "cancelled" {
+		t.Fatalf("取消后源状态=%q, want cancelled（保留上次快照）", status)
+	}
+	if !strings.Contains(message, "已手动取消") {
+		t.Fatalf("取消提示=%q, want 含「已手动取消」", message)
+	}
+	if nextAfter != nextBefore {
+		t.Fatalf("取消不得推进排程槽: next_update %q -> %q", nextBefore, nextAfter)
+	}
+	var lists int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=?`, CrawlerIPListName("googlebot")).Scan(&lists); err != nil {
+		t.Fatal(err)
+	}
+	if lists != 0 {
+		t.Fatalf("取消不得写入名单行: rows=%d", lists)
+	}
+}
+
+// 下载在途降级为从节点（demote 同时取消 ctx）：任务落 skipped、源行不被改写
+// （从节点只读不变量）、名单不写。
+func TestSSA8709_runUpdateDemoteSkipsWithoutWriting(t *testing.T) {
+	_, database := newClusterTestService(t)
+	oldFile := crawlerIPListFile
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	t.Cleanup(func() { crawlerIPListFile = oldFile })
+	if err := ensureCrawlerSources(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE security_crawler_sources SET update_enabled=0`); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	var once sync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(started) })
+		if _, err := database.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+			t.Errorf("flip role: %v", err)
+		}
+		cancel()
+	}))
+	t.Cleanup(ts.Close)
+	if _, err := database.Exec(`UPDATE security_crawler_sources SET update_enabled=1, url=? WHERE name='googlebot'`, ts.URL); err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- GetCrawlerUpdateManager().RunUpdate(ctx, taskengine.RunContext{Ctx: ctx, Trigger: "manual"})
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("下载未开始")
+	}
+	var runErr error
+	select {
+	case runErr = <-errCh:
+	case <-time.After(15 * time.Second):
+		t.Fatal("降级后 RunUpdate 未返回")
+	}
+	if !errors.Is(runErr, taskengine.ErrTaskSkipped) {
+		t.Fatalf("降级须落 skipped，得到 %v", runErr)
+	}
+
+	var status string
+	if err := database.QueryRow(`SELECT update_status FROM security_crawler_sources WHERE name='googlebot'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "running" {
+		t.Fatalf("降级后从节点不得改写源行终态: status=%q, want running（未落终态）", status)
+	}
+	var lists int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=?`, CrawlerIPListName("googlebot")).Scan(&lists); err != nil {
+		t.Fatal(err)
+	}
+	if lists != 0 {
+		t.Fatalf("降级后不得写入名单行: rows=%d", lists)
 	}
 }

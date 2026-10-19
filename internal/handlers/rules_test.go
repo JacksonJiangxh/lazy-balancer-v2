@@ -3,8 +3,11 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -115,5 +118,56 @@ func TestCreateRule_enabledACMECreatesCertJob(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("cert_jobs count=%d, want 1（启用 ACME 规则必须创建签发任务）", count)
+	}
+}
+
+// B2-03：证书入队失败映射——规则态冲突（并发禁用/改域/删除）必须 409 且
+// 可操作，不得折成 500「内部故障」。
+func TestCertEnqueueErrorResponse_mapsRuleStateConflictTo409(t *testing.T) {
+	status, message := certEnqueueErrorResponse("创建证书任务失败", services.ErrCertRuleStateConflict)
+	if status != http.StatusConflict {
+		t.Fatalf("status=%d, want 409", status)
+	}
+	if !strings.Contains(message, "规则状态已变更") {
+		t.Fatalf("message=%q, want 状态已变更提示", message)
+	}
+	if wrapped := fmt.Errorf("upsert: %w", services.ErrCertRuleStateConflict); func() int {
+		code, _ := certEnqueueErrorResponse("x", wrapped)
+		return code
+	}() != http.StatusConflict {
+		t.Fatal("包装后的规则态冲突也必须映射 409")
+	}
+	if code, _ := certEnqueueErrorResponse("x", errors.New("boom")); code != http.StatusInternalServerError {
+		t.Fatalf("普通错误 status=%d, want 500", code)
+	}
+}
+
+// B2-10：规则数据导致的生成失败是「可自行修正」的配置问题 → 400，不是 500。
+// 形态：全局 request_body_max_size_mb 被带外写成 0，启用规则时渲染必败。
+func TestEnableRule_generationFailureMapsTo400(t *testing.T) {
+	h := newRuleFeatureTestHandlers(t)
+	seedAuditRule(t, "lb_a87_gen", "gen", "gen.example.test", 8085, false, "manual", false)
+	seedAuditUpstream(t, "lb_a87_gen")
+	if _, err := db.DB.Exec("UPDATE global_config SET request_body_max_size_mb=0 WHERE id=1"); err != nil {
+		t.Fatalf("zero global body limit: %v", err)
+	}
+	router := gin.New()
+	router.POST("/rules/:caddy_id/enable", h.EnableRule)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/rules/lb_a87_gen/enable", nil))
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400（规则数据导致的生成失败）", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "生成规则配置失败") {
+		t.Fatalf("body=%s, want 生成失败点名", recorder.Body.String())
+	}
+	var enabled int
+	if err := db.DB.QueryRow("SELECT enabled FROM lb_rules WHERE caddy_id='lb_a87_gen'").Scan(&enabled); err != nil {
+		t.Fatalf("read rule: %v", err)
+	}
+	if enabled != 0 {
+		t.Fatal("生成的预检失败不得把规则置为启用")
 	}
 }

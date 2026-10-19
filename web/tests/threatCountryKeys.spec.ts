@@ -16,7 +16,14 @@ import { CHINA_PROVINCES } from '../src/utils/chinaProvinces.ts'
 test('A 威胁国家表：排除南极洲且其余国家与 worldBorders 一致', () => {
   assert.equal(WORLD_COUNTRIES.length - THREAT_COUNTRIES.length, 1)
   assert.ok(!THREAT_COUNTRIES.some((c) => c.name === 'Antarctica'), '南极洲必须从威胁国家表剔除')
-  assert.notEqual(THREAT_COUNTRIES as unknown, WORLD_COUNTRIES as unknown, '必须是过滤后的独立数组')
+  // 审计 87 WEBT-03：原 `assert.notEqual(THREAT_COUNTRIES, WORLD_COUNTRIES)` 是
+  // 同义反复（两个数组对象恒不相等）——若过滤谓词改成别的国家、或顺序/集合漂移
+  // 也通过。改为与「唯一预期谓词」逐项同集同序比对（元素对象按设计共享）。
+  assert.deepEqual(
+    THREAT_COUNTRIES,
+    WORLD_COUNTRIES.filter((c) => c.name !== 'Antarctica'),
+    '威胁国家表必须是 worldBorders 去掉南极洲的逐项同序投影',
+  )
   for (const c of THREAT_COUNTRIES) {
     assert.ok(WORLD_COUNTRIES.includes(c), `${c.name} 不在 worldBorders`)
   }
@@ -45,7 +52,7 @@ test('B2 省层数据非空且首项含多边形（归一后仍是真实数据�
   }
 })
 
-test('C 别名表：11 个历史英文/旧名分组全部可用且目标为中文键', () => {
+test('C 别名表：10 个历史英文/旧名分组 + 巴勒斯坦双源/南极洲完整性', () => {
   const hasRows = (key: string): boolean => Array.isArray(ADMIN1_PROVINCES[key]) && ADMIN1_PROVINCES[key].length > 0
   const expected: Record<string, string> = {
     Turkey: '土耳其',
@@ -59,6 +66,8 @@ test('C 别名表：11 个历史英文/旧名分组全部可用且目标为中�
     Brunei: '文莱',
     Swaziland: '斯威士兰',
   }
+  // 标题口径与实际校验面一致（审计 87 WEBT-04：标题曾写 11 个而表只有 10 个）
+  assert.equal(Object.keys(expected).length, 10)
   for (const [alias, target] of Object.entries(expected)) {
     assert.equal(COUNTRY_ALIAS[alias], target, `别名 ${alias} 目标漂移`)
     assert.ok(hasRows(alias), `别名源键 ${alias} 在 ADMIN1_PROVINCES 缺失`)
@@ -68,6 +77,14 @@ test('C 别名表：11 个历史英文/旧名分组全部可用且目标为中�
   assert.equal(COUNTRY_ALIAS['Gaza Strip'], '巴勒斯坦')
   assert.equal(COUNTRY_ALIAS['West Bank'], '巴勒斯坦')
   assert.ok(hasRows('巴勒斯坦'))
+  // WT87-01：两源必须**逐省合并**——只断言目标键非空会让「后到别名被静默
+  // 丢弃」（原实现仅 Gaza 条带）也通过，下钻西岸整片成空洞。
+  const palestine = ADMIN1_PROVINCES['巴勒斯坦']
+  const palestineNames = palestine.map((row) => row.name)
+  assert.ok(palestineNames.includes('Gaza Strip'), `巴勒斯坦缺少 Gaza Strip: ${palestineNames.join('、')}`)
+  assert.ok(palestineNames.includes('West Bank'), `巴勒斯坦缺少 West Bank: ${palestineNames.join('、')}`)
+  assert.ok(palestine.length >= 2, `巴勒斯坦条目数应 ≥2，实际 ${palestine.length}`)
+  assert.equal(new Set(palestineNames).size, palestineNames.length, '合并后省名不得重复')
   assert.equal(COUNTRY_ALIAS.Antarctica, '南极洲')
   // 每个别名目标都必须是非空省层（防「键存在但数据空」的假通过）
   for (const target of new Set(Object.values(COUNTRY_ALIAS))) {

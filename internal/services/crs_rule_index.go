@@ -286,14 +286,17 @@ var (
 	crsRuleIndexKey   string
 )
 
-// crsRuleIndexVersion 读取 security_crs_version 行值；库不可用/行缺失时
-// 回落空串（索引仍可用，仅版本展示为空）。
+// crsRuleIndexVersion 读取 security_crs_version 行值（SS87-历史问题：收敛到
+// readCurrentCRSVersion 单一真源——此前这里与更新判定各有一套「空串 vs
+// bundled」口径）。索引读取的容错口径保留：库不可用/读失败回落空串（索引
+// 仍可用，仅版本展示为空）；行缺失/空值按首装口径回落 bundled，与更新判定
+// 同源不漂移。
 func crsRuleIndexVersion() string {
 	if db.DB == nil {
 		return ""
 	}
-	var version string
-	if err := db.DB.QueryRow("SELECT COALESCE(version,'') FROM security_crs_version WHERE id=1").Scan(&version); err != nil {
+	version, err := readCurrentCRSVersion()
+	if err != nil {
 		return ""
 	}
 	return version
@@ -360,6 +363,17 @@ func buildCRSRuleIndex() *CRSRuleIndex {
 
 // GetCRSRuleIndex 返回规则索引（命中缓存或重建）。永不返回 nil，Rules
 // 恒为非 nil 空切片起步。
+//
+// SS87-历史问题（verify 结论：确认为有界瞬态窗口，不修锁）：本函数与
+// BuildCorazaDirectives 的读侧不持 wafFileMu，而 CRS 树交换
+// （swapCRSTreeFromStaging）持 wafFileMu 执行 RemoveAll(rules)→moveTree。
+// 两者互不阻塞，交换窗口内并发生成可能读到缺失/部分 rules 树（索引为空 →
+// 混选组缺项）。不需要额外锁的理由：①生成+应用与更新自身的 reloader 同持
+// CaddyOpLock，更新触发必然在交换完成后以正确代重新生成并最后应用；②窗口内
+// 并发生成若选中已被移除的文件，coraza 加载失败→/load 被拒，运行配置保持
+// 上一代（不发布半代）；③交换完成后引用键（目录条目数/尺寸/最大 mtime）必然
+// 变化，窗口内缓存的空索引不会被后续渲染复用。禁止让渲染持 wafFileMu：导入
+// 路径持锁序为 CaddyOpLock→wafFileMu，反向嵌套即 AB-BA 死锁。
 func GetCRSRuleIndex() *CRSRuleIndex {
 	key := crsRuleIndexCacheKey(crsRuleIndexVersion())
 	crsRuleIndexMu.Lock()

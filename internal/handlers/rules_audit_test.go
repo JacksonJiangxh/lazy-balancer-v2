@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	sqlitedriver "github.com/glebarez/go-sqlite"
 
 	"lazy-balancer-v2/internal/config"
 	"lazy-balancer-v2/internal/db"
@@ -1341,16 +1344,20 @@ func TestUpdateRule_migrates_cert_job_domain_inplace(t *testing.T) {
 	if ruleDomain != "new.example.test" {
 		t.Fatalf("rule domain=%q, want new.example.test", ruleDomain)
 	}
+	// B2-12（历史）：原谓词 `status NOT IN ('retired')` 是死条件——db 的
+	// CertJobStatuses 枚举无 retired 状态（全仓仅此测试出现该字面量），谓词
+	// 恒真，测试意图（只留一行）未被表达。改为按 rule_id 全量计数：本用例
+	// 目的就是「迁移就地进行、不留多余行」。
 	var jobCount int
-	if err := db.DB.QueryRow("SELECT COUNT(*) FROM cert_jobs WHERE rule_id='lb_acme_retire' AND status NOT IN ('retired')").Scan(&jobCount); err != nil {
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM cert_jobs WHERE rule_id='lb_acme_retire'").Scan(&jobCount); err != nil {
 		t.Fatalf("count cert jobs: %v", err)
 	}
 	if jobCount != 1 {
-		t.Fatalf("non-retired cert job count=%d, want 1 (domain should be migrated in-place)", jobCount)
+		t.Fatalf("cert job count=%d, want 1 (domain should be migrated in-place, no leftover rows)", jobCount)
 	}
 	var migratedJobID int
 	var migratedDomain string
-	if err := db.DB.QueryRow("SELECT id,domain FROM cert_jobs WHERE rule_id='lb_acme_retire' AND status NOT IN ('retired')").Scan(&migratedJobID, &migratedDomain); err != nil {
+	if err := db.DB.QueryRow("SELECT id,domain FROM cert_jobs WHERE rule_id='lb_acme_retire'").Scan(&migratedJobID, &migratedDomain); err != nil {
 		t.Fatalf("read migrated job: %v", err)
 	}
 	if migratedJobID != originalJobID {
@@ -1648,9 +1655,20 @@ func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T)
 	router.POST("/rules", handler.CreateRule)
 
 	done := make(chan struct{})
+	// B2-13（历史）：此前只断言「15s 内未死锁」+ `remaining > 2`（终态断言
+	// 过宽，且 Create 请求体缺 health_check_* 恒 400 → 根本未验证写成功）。
+	// 现按端点收集状态码并断言各自合法集（无 5xx/无未预期码），再断言终态
+	// 行数与被删/新建规则的存在性，既保留死锁门也证明并发写无丢失/异常。
+	var codesMu sync.Mutex
+	codes := map[string][]int{}
+	record := func(kind string, code int) {
+		codesMu.Lock()
+		codes[kind] = append(codes[kind], code)
+		codesMu.Unlock()
+	}
 	go func() {
 		var wg sync.WaitGroup
-		for i := 0; i < 4; i++ {
+		for i := range 4 {
 			wg.Add(1)
 			go func(n int) {
 				defer wg.Done()
@@ -1659,13 +1677,19 @@ func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T)
 					body := strings.NewReader(`{"description":"u"}`)
 					recorder := httptest.NewRecorder()
 					router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/rules/lb_lockorder", body))
+					record("update", recorder.Code)
 				case 1:
 					recorder := httptest.NewRecorder()
 					router.ServeHTTP(recorder, httptest.NewRequest(http.MethodDelete, "/rules/lb_lockorder", nil))
+					record("delete", recorder.Code)
 				case 2:
-					body := strings.NewReader(`{"name":"newbie","protocol":"tcp","listen_port":19000,"upstreams":[{"host":"127.0.0.1","port":9001}]}`)
+					body := strings.NewReader(`{"name":"newbie","protocol":"tcp","listen_port":19000,
+						"health_check_interval":10,"health_check_timeout":2,
+						"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
+						"upstreams":[{"host":"127.0.0.1","port":9001,"weight":1,"enabled":true,"protocol":"tcp"}]}`)
 					recorder := httptest.NewRecorder()
 					router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/rules", body))
+					record("create", recorder.Code)
 				}
 			}(i)
 		}
@@ -1679,12 +1703,42 @@ func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T)
 		t.Fatal("concurrent rule write endpoints deadlocked (lock order inversion)")
 	}
 
-	var remaining int
-	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE caddy_id IN ('lb_lockorder','lb_newbie') OR name='newbie'`).Scan(&remaining); err != nil {
-		t.Fatalf("read final rules: %v", err)
+	assertCodes := func(kind string, allowed ...int) {
+		t.Helper()
+		for _, code := range codes[kind] {
+			ok := false
+			for _, candidate := range allowed {
+				if code == candidate {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				t.Fatalf("%s status=%d, want one of %v", kind, code, allowed)
+			}
+		}
 	}
-	if remaining > 2 {
-		t.Fatalf("unexpected rule count %d after concurrent writes", remaining)
+	assertCodes("update", http.StatusOK, http.StatusNotFound)
+	assertCodes("delete", http.StatusOK, http.StatusNotFound)
+	assertCodes("create", http.StatusCreated)
+	if len(codes["create"]) == 0 {
+		t.Fatal("create 端点未执行（夹具失靶）")
+	}
+
+	// 并发写无丢失：新建规则恰一行；lb_lockorder 至多一行（被删则零行）。
+	var created int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE name='newbie' AND protocol='tcp' AND listen_port=19000`).Scan(&created); err != nil {
+		t.Fatalf("count created rule: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("created rule count=%d, want 1（并发创建丢失或被重复写入）", created)
+	}
+	var remaining int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE caddy_id='lb_lockorder'`).Scan(&remaining); err != nil {
+		t.Fatalf("read remaining rule: %v", err)
+	}
+	if remaining > 1 {
+		t.Fatalf("lb_lockorder count=%d, want ≤1", remaining)
 	}
 }
 
@@ -2251,5 +2305,217 @@ func TestRuleCertCancellation_releasesCaddyOpLock(t *testing.T) {
 				t.Fatalf("%s status=%d body=%s, want 200", label, response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+// ---- 通用探针：真实 SQLite driver 的 Prepare 观测/故障注入 ----
+//
+// 与历史 certificateTxOrder 同款：包装器只嵌入 driver.Conn（接口），
+// 不提升 QueryerContext/ExecerContext 等可选接口，database/sql 因而回落到
+// Prepare 路径——语句级观测与故障注入都发生在同一处。
+
+type prepareProbe struct {
+	mu      sync.Mutex
+	queries []string
+	inTx    bool
+	fail    func(query string, inTx bool) error
+}
+
+func (p *prepareProbe) record(query string) error {
+	p.mu.Lock()
+	p.queries = append(p.queries, query)
+	inTx := p.inTx
+	fail := p.fail
+	p.mu.Unlock()
+	if fail != nil {
+		return fail(query, inTx)
+	}
+	return nil
+}
+
+func (p *prepareProbe) setInTx() {
+	p.mu.Lock()
+	p.inTx = true
+	p.mu.Unlock()
+}
+
+func (p *prepareProbe) count(substring string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := 0
+	for _, query := range p.queries {
+		if strings.Contains(query, substring) {
+			count++
+		}
+	}
+	return count
+}
+
+type prepareProbeConnector struct {
+	dsn   string
+	inner driver.Driver
+	probe *prepareProbe
+}
+
+func (c prepareProbeConnector) Connect(context.Context) (driver.Conn, error) {
+	conn, err := c.inner.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &prepareProbeConn{Conn: conn, probe: c.probe}, nil
+}
+
+func (c prepareProbeConnector) Driver() driver.Driver { return c.inner }
+
+type prepareProbeConn struct {
+	driver.Conn
+	probe *prepareProbe
+}
+
+func (c *prepareProbeConn) Begin() (driver.Tx, error) {
+	c.probe.setInTx()
+	return c.Conn.Begin()
+}
+
+func (c *prepareProbeConn) Prepare(query string) (driver.Stmt, error) {
+	if err := c.probe.record(query); err != nil {
+		return nil, err
+	}
+	return c.Conn.Prepare(query)
+}
+
+// wrapHandlerDBWithProbe 用探针包装器指向当前测试库的同一文件（WAL 允许多
+// 句柄），并把 db.DB/SetDB 换成包装句柄；Cleanup 复位。
+func wrapHandlerDBWithProbe(t *testing.T, probe *prepareProbe) {
+	t.Helper()
+	var seq int
+	var name, file string
+	if err := db.DB.QueryRow("PRAGMA database_list").Scan(&seq, &name, &file); err != nil {
+		t.Fatalf("read database path: %v", err)
+	}
+	if file == "" {
+		t.Fatal("测试库不是文件库，无法附加探针句柄")
+	}
+	previous := db.DB
+	wrapped := sql.OpenDB(prepareProbeConnector{
+		dsn:   file + "?_txlock=immediate&_pragma=busy_timeout(30000)",
+		inner: &sqlitedriver.Driver{},
+		probe: probe,
+	})
+	db.DB = wrapped
+	db.SetDB(wrapped)
+	t.Cleanup(func() {
+		_ = wrapped.Close()
+		db.DB = previous
+		db.SetDB(previous)
+	})
+}
+
+// B2-01：域名迁移前「最新任务行」查询遇到真实 DB 错误（非 ErrNoRows）时，
+// 必须回滚迁移事务并退役旧域任务——不得空提交留下 issued+PEM 行永驻。
+func TestUpdateRule_domainMigrationReadFailureRetiresOldJob(t *testing.T) {
+	harness := newUpdateAuditRuleHandlers(t, "lb_a87_migfail", 0, false)
+	seedAuditRule(t, "lb_a87_migfail", "migfail", "old-a87.example.test", 8086, true, "acme_dns", true)
+	seedAuditUpstream(t, "lb_a87_migfail")
+	var providerID int
+	if err := db.DB.QueryRow("SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1").Scan(&providerID); err != nil {
+		t.Fatalf("read CA provider: %v", err)
+	}
+	if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=?,ca_provider_id=? WHERE caddy_id='lb_a87_migfail'", seedR52CertificateConfig(t), providerID); err != nil {
+		t.Fatalf("bind ACME references: %v", err)
+	}
+	result, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_provider_id,cert_pem,key_pem)
+		VALUES ('lb_a87_migfail','old-a87.example.test','issued',?,'CERT-PEM','KEY-PEM')`, providerID)
+	if err != nil {
+		t.Fatalf("seed certificate job: %v", err)
+	}
+	originalJobID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	services.ResetCAQueueManagerForTest()
+	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+
+	probe := &prepareProbe{fail: func(query string, inTx bool) error {
+		if inTx && strings.Contains(query, "SELECT id FROM cert_jobs WHERE rule_id=? ORDER BY id DESC LIMIT 1") {
+			return errors.New("injected cert_jobs read failure")
+		}
+		return nil
+	}}
+	wrapHandlerDBWithProbe(t, probe)
+
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", harness.handler.UpdateRule)
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_a87_migfail", strings.NewReader(`{"domain":"new-a87.example.test"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var status string
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", originalJobID).Scan(&status); err != nil {
+		t.Fatalf("read original job: %v", err)
+	}
+	if status != "disabled" {
+		t.Fatalf("旧域任务状态=%q, want disabled（迁移读取失败必须退役旧行，否则 issued+PEM 永驻且 sweep 跳过）", status)
+	}
+	var ruleDomain string
+	if err := db.DB.QueryRow("SELECT domain FROM lb_rules WHERE caddy_id='lb_a87_migfail'").Scan(&ruleDomain); err != nil {
+		t.Fatalf("read rule domain: %v", err)
+	}
+	if ruleDomain != "new-a87.example.test" {
+		t.Fatalf("rule domain=%q, want new-a87.example.test", ruleDomain)
+	}
+}
+
+// B2-02：PUT enabled=false 与 /disable 同语义——执行中签发必须前置 409，
+// 且不得把任务行翻成 disabled（用户以为已暂停而 worker 仍在跑）。
+func TestUpdateRule_disableWithRunningJobReturnsConflict(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	seedAuditRule(t, "lb_a87_running", "running", "running-a87.example.test", 8087, true, "acme_dns", true)
+	seedAuditUpstream(t, "lb_a87_running")
+	if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=? WHERE caddy_id='lb_a87_running'", seedR52CertificateConfig(t)); err != nil {
+		t.Fatalf("bind ACME config: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem)
+		VALUES ('lb_a87_running','running-a87.example.test','issued','CERT-PEM','KEY-PEM')`); err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+	services.ResetCAQueueManagerForTest()
+	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+	services.GetCAQueueManager().MarkJobRunningForTest("lb_a87_running", 4242)
+
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_a87_running", strings.NewReader(`{"enabled":false}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	started := time.Now()
+	router.ServeHTTP(recorder, request)
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("409 快路径耗时 %v", elapsed)
+	}
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409（执行中签发与 /disable 同口径）", recorder.Code, recorder.Body.String())
+	}
+	var enabled int
+	var jobStatus string
+	if err := db.DB.QueryRow("SELECT enabled FROM lb_rules WHERE caddy_id='lb_a87_running'").Scan(&enabled); err != nil {
+		t.Fatalf("read rule: %v", err)
+	}
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE rule_id='lb_a87_running'").Scan(&jobStatus); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if enabled != 1 || jobStatus != "issued" {
+		t.Fatalf("enabled=%d job_status=%q, want 1/issued（409 分支零写入）", enabled, jobStatus)
 	}
 }

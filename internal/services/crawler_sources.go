@@ -80,6 +80,17 @@ func CrawlerIPListName(engineID string) string {
 // crawlerDisplayName 源表展示名与名单名同一事实源。
 func crawlerDisplayName(engineID string) string { return CrawlerIPListName(engineID) }
 
+// CrawlerSystemListNames 内置爬虫名单名全集（security_ip_lists system=1 的
+// 合法来源之一）。历史问题-历史问题（历史）：备份导入的 system 名单白名单
+// 与配额口径共用本注册表——新增内置源只改 crawlerBotSources 一处。
+func CrawlerSystemListNames() []string {
+	names := make([]string, 0, len(crawlerBotSources))
+	for _, src := range crawlerBotSources {
+		names = append(names, CrawlerIPListName(src.Name))
+	}
+	return names
+}
+
 // migrateCrawlerIPListNames 将旧内部键 crawlerbot:<engine> 迁移为用户可读名，
 // 保留列表 ID、条目与策略引用；重复执行幂等。
 func migrateCrawlerIPListNames() error {

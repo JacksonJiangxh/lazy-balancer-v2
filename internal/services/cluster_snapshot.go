@@ -113,8 +113,10 @@ func (s *ClusterService) Snapshot(ctx context.Context, sinceVersion int, clientF
 	// 品牌镜像刷新(2026-09-11):每次同步轮询先对账 branding.json→
 	// global_config.branding_json——文件变化即 bump 版本,304 门自然失效,
 	// 变更流向从节点;内容不变零扰动。快照缓存随版本失效自然重建。
+	// S历史问题-05：显式传本服务 s.db（不再依赖全局 db.DB），内容未变时
+	// 函数内先读短路，纯 304 轮不再向主库写。
 	if s.dataDir != "" {
-		if changed, err := RefreshBrandingMirror(s.dataDir); err != nil {
+		if changed, err := RefreshBrandingMirrorDB(s.db, s.dataDir); err != nil {
 			Logf("warn", "刷新品牌配置镜像失败: %v", err)
 		} else if changed {
 			clusterSnapshotCaches.Delete(s.db)
@@ -269,27 +271,91 @@ func (s *ClusterService) buildFullSnapshot(ctx context.Context, store snapshotSt
 	return snapshot, nil
 }
 
-// clusterSnapshotBypassingCache 绕过共享快照缓存，直接从数据库全量重建快照。
-// apply 路径的 previous 备份必须读取当前库状态：缓存键为 cluster_version/所有权/
-// 开关，从节点本地写入（如 users.last_login）不会递增 cluster_version，稳态下
-// 缓存永不失效，命中缓存会把真实漂移掩盖掉。apply 频率低，全量重建开销可接受。
-// 注：漂移检测已改用轻量 driftGuardSectionHashes（见 cluster_snapshot.go），不再
-// 经过本函数；本函数仍需为 applySnapshot 的 previous 保留全量快照（证书清理与
-// 工件需要完整 Certs / WafFiles）。
-func (s *ClusterService) clusterSnapshotBypassingCache(ctx context.Context) (models.ClusterSnapshot, error) {
+// clusterSnapshotForApply 绕过共享快照缓存，为 apply 的 previous 备份读取
+// 当前库状态。缓存键为 cluster_version/所有权/开关，从节点本地写入（如
+// users.last_login）不会递增 cluster_version，稳态下缓存永不失效，命中缓存
+// 会把真实漂移掩盖掉——因此本路径必须直读库，不能复用 cachedSnapshot。
+// 装载面刻意收敛到 apply 的实际消费面（见函数内注释），不再全量构建。
+func (s *ClusterService) clusterSnapshotForApply(ctx context.Context) (models.ClusterSnapshot, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return models.ClusterSnapshot{}, fmt.Errorf("开启集群快照事务: %w", err)
+		return models.ClusterSnapshot{}, fmt.Errorf("开启 apply 基线事务: %w", err)
 	}
 	defer tx.Rollback()
-	snapshot, err := s.buildFullSnapshot(ctx, tx)
-	if err != nil {
+	var previous models.ClusterSnapshot
+	// S历史问题-02（历史）：apply 的 previous 只消费三节哈希、证书轴与
+	// ACME ownership（computeSectionSkips/recordAppliedSectionHashes 的
+	// localHashes、snapshotCertsDiffer/removeMissingSnapshotCerts、
+	// restoreSnapshotArtifacts）。此前复用 clusterSnapshotBypassingCache 全量
+	// 快照，每次 apply（含补偿重拉循环）白做一次 CRS 树 tar.gz+sha256
+	// （BuildWafFileRef）与 xdb 哈希——WafFiles 字段全程零消费。此处按消费面
+	// 装载：节 payload 输入 + 证书候选（X.509 解析是证书轴必需）+ ACME
+	// ownership；不调用 BuildWafFileRef。
+	if err := s.loadSectionHashInputs(ctx, tx, &previous); err != nil {
 		return models.ClusterSnapshot{}, err
 	}
-	if err := tx.Commit(); err != nil {
-		return models.ClusterSnapshot{}, fmt.Errorf("提交集群快照事务: %w", err)
+	if previous.Certs, err = s.snapshotCertificates(ctx, tx); err != nil {
+		return models.ClusterSnapshot{}, err
 	}
-	return snapshot, nil
+	if previous.ACME, err = s.snapshotACME(ctx, tx); err != nil {
+		return models.ClusterSnapshot{}, err
+	}
+	// 节哈希与全量快照同源（sectionPayloadFor 单源），供 computeSectionSkips
+	// 的本地重建口径比对；waf_files 不在 syncSections，无需 BuildWafFileRef。
+	previous.SectionHashes = ComputeSnapshotSectionHashes(&previous)
+	if err := tx.Commit(); err != nil {
+		return models.ClusterSnapshot{}, fmt.Errorf("提交 apply 基线事务: %w", err)
+	}
+	return previous, nil
+}
+
+// loadSectionHashInputs 装载 users/rules/security 三节哈希所需的全部输入
+// （全局配置区 + 三节表域），与 buildSnapshot 共用同一装载函数族（哈希奇偶
+// 不变式）。漂移守卫与 apply 基线共用本函数，避免两套「哪些列进哈希」的
+// 平行清单——S历史问题-02/S历史问题-03 家族收敛点。
+func (s *ClusterService) loadSectionHashInputs(ctx context.Context, store snapshotStore, snapshot *models.ClusterSnapshot) error {
+	// 三分类合并:users 节 payload 含 basic_settings/caddy_config——必须装载
+	// 全局配置区,且与 BuildSnapshot 复用同一装载函数(哈希奇偶不变式)。
+	if err := s.loadSnapshotGlobalSettings(ctx, store, snapshot); err != nil {
+		return err
+	}
+	var err error
+	// (security 节 payload 为纯表域——文件态由 wafFilesDrifted 专用通道比对,
+	// 与漂移守卫的轻量约束一致:不调用 BuildWafFileRef 的全树哈希。)
+	if snapshot.Rules, err = s.snapshotRules(ctx, store); err != nil {
+		return err
+	}
+	if snapshot.Users, err = s.snapshotUsers(ctx, store); err != nil {
+		return err
+	}
+	if snapshot.APIKeys, err = s.snapshotAPIKeys(ctx, store); err != nil {
+		return err
+	}
+	if snapshot.SecurityPolicies, err = s.snapshotSecurityPolicies(ctx, store); err != nil {
+		return err
+	}
+	if snapshot.SecurityBindings, err = s.snapshotSecurityBindings(ctx, store); err != nil {
+		return err
+	}
+	if snapshot.SecurityCustomRules, err = s.snapshotSecurityCustomRules(ctx, store); err != nil {
+		return err
+	}
+	if snapshot.SecurityBlockPages, err = s.snapshotSecurityBlockPages(ctx, store); err != nil {
+		return err
+	}
+	if snapshot.SecurityIPLists, err = s.snapshotSecurityIPLists(ctx, store); err != nil {
+		return err
+	}
+	if snapshot.SecurityThreatSources, err = s.snapshotSecurityThreatSources(ctx, store); err != nil {
+		return err
+	}
+	if snapshot.SecurityCrawlerSources, err = s.snapshotSecurityCrawlerSources(ctx, store); err != nil {
+		return err
+	}
+	// 历史问题(历史):CRS/IP2Region 版本行装载已删——版本行移出全部
+	// 守卫节 payload(766f4c81 差分门控裁定)后此处为死装载,每 304 白扫
+	// 2 表且引入无谓失败面。
+	return nil
 }
 
 // driftGuardSectionHashes 仅重建漂移守卫三节（rules/users/security）的节哈希，
@@ -310,47 +376,10 @@ func (s *ClusterService) driftGuardSectionHashes(ctx context.Context) (map[strin
 	defer tx.Rollback()
 
 	var snapshot models.ClusterSnapshot
-	// 三分类合并:users 节 payload 含 basic_settings/caddy_config——漂移守卫
-	// 必须装载全局配置区,且与 BuildSnapshot 复用同一装载函数(哈希奇偶
-	// 不变式)。装载失败语义与现有守卫节一致(报错上抛)。
-	if err := s.loadSnapshotGlobalSettings(ctx, tx, &snapshot); err != nil {
+	// 装载失败语义与既有守卫节一致(报错上抛)。
+	if err := s.loadSectionHashInputs(ctx, tx, &snapshot); err != nil {
 		return nil, err
 	}
-	// (security 节 payload 为纯表域——文件态由 wafFilesDrifted 专用通道比对,
-	// 与漂移守卫的轻量约束一致:不调用 BuildWafFileRef 的全树哈希。)
-	if snapshot.Rules, err = s.snapshotRules(ctx, tx); err != nil {
-		return nil, err
-	}
-	if snapshot.Users, err = s.snapshotUsers(ctx, tx); err != nil {
-		return nil, err
-	}
-	if snapshot.APIKeys, err = s.snapshotAPIKeys(ctx, tx); err != nil {
-		return nil, err
-	}
-	if snapshot.SecurityPolicies, err = s.snapshotSecurityPolicies(ctx, tx); err != nil {
-		return nil, err
-	}
-	if snapshot.SecurityBindings, err = s.snapshotSecurityBindings(ctx, tx); err != nil {
-		return nil, err
-	}
-	if snapshot.SecurityCustomRules, err = s.snapshotSecurityCustomRules(ctx, tx); err != nil {
-		return nil, err
-	}
-	if snapshot.SecurityBlockPages, err = s.snapshotSecurityBlockPages(ctx, tx); err != nil {
-		return nil, err
-	}
-	if snapshot.SecurityIPLists, err = s.snapshotSecurityIPLists(ctx, tx); err != nil {
-		return nil, err
-	}
-	if snapshot.SecurityThreatSources, err = s.snapshotSecurityThreatSources(ctx, tx); err != nil {
-		return nil, err
-	}
-	if snapshot.SecurityCrawlerSources, err = s.snapshotSecurityCrawlerSources(ctx, tx); err != nil {
-		return nil, err
-	}
-	// 历史问题(历史):CRS/IP2Region 版本行装载已删——版本行移出全部
-	// 守卫节 payload(766f4c81 差分门控裁定)后此处为死装载,每 304 白扫
-	// 2 表且引入无谓失败面。
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("提交漂移守卫事务: %w", err)
 	}
@@ -572,9 +601,10 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 	snapshot.BasicSettings.CrawlerScheduleTime = &crawlerTime
 	// v2.3.8：安全事件保留与大屏采样随 users 节同步（从节点/升主后口径一致）。
 	var seDays, seCap, trafficSample int
-	if err := store.QueryRowContext(ctx, `SELECT COALESCE(security_events_retention_days,90),
-		COALESCE(security_events_row_cap,1000000), COALESCE(threat_traffic_sample_n,-1)
-		FROM global_config WHERE id=1`).Scan(&seDays, &seCap, &trafficSample); err != nil {
+	if err := store.QueryRowContext(ctx, `SELECT COALESCE(security_events_retention_days,?),
+		COALESCE(security_events_row_cap,?), COALESCE(threat_traffic_sample_n,?)
+		FROM global_config WHERE id=1`,
+		db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap, db.DefaultThreatTrafficSampleN).Scan(&seDays, &seCap, &trafficSample); err != nil {
 		return fmt.Errorf("读取安全事件保留/流量采样设置: %w", err)
 	}
 	snapshot.BasicSettings.SecurityEventsRetentionDays = &seDays
@@ -772,40 +802,99 @@ func (s *ClusterService) snapshotSecurityBlockPages(ctx context.Context, store s
 	return pages, rows.Err()
 }
 
+// clusterRuleLibVersionColumns 是 CRS/IP2Region 版本行的列清单单源
+// （S历史问题-15，历史）：快照导出、差分本地读取、从端写侧三处此前
+// 各抄一份（列增减需同时改 6 处，历史问题-01 已出现「快照列与差分行不同步」
+// 教训）。两张表列清单/扫描顺序完全一致，共享本常量与下方中性行扫描。
+const clusterRuleLibVersionColumns = `id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,''),COALESCE(schedule_days,'1,2,3,4,5,6,7'),COALESCE(schedule_time,'04:00')`
+
+// clusterRuleLibVersionRow 是 CRS/IP2Region 版本行的中性投影：两模型字段与
+// JSON 标签逐字段相同，故可无损转换为任一模型（差分比对按模型序列化，
+// 保证与快照侧 JSON 字节口径一致）。
+type clusterRuleLibVersionRow struct {
+	ID           int
+	Version      string
+	UpdatedAt    string
+	AutoUpdate   bool
+	UpdateStatus string
+	Message      string
+	LastChecked  string
+	NextUpdate   string
+	Trigger      string
+	StartedAt    string
+	FinishedAt   string
+	ScheduleDays string
+	ScheduleTime string
+}
+
+func scanClusterRuleLibVersionRow(rows *sql.Rows) (clusterRuleLibVersionRow, error) {
+	var row clusterRuleLibVersionRow
+	err := rows.Scan(&row.ID, &row.Version, &row.UpdatedAt, &row.AutoUpdate, &row.UpdateStatus, &row.Message,
+		&row.LastChecked, &row.NextUpdate, &row.Trigger, &row.StartedAt, &row.FinishedAt, &row.ScheduleDays, &row.ScheduleTime)
+	return row, err
+}
+
+func (row clusterRuleLibVersionRow) crsVersion() models.ClusterSecurityCRSVersion {
+	return models.ClusterSecurityCRSVersion{
+		ID: row.ID, Version: row.Version, UpdatedAt: row.UpdatedAt, AutoUpdate: row.AutoUpdate,
+		UpdateStatus: row.UpdateStatus, Message: row.Message, LastChecked: row.LastChecked,
+		NextUpdate: row.NextUpdate, Trigger: row.Trigger, StartedAt: row.StartedAt,
+		FinishedAt: row.FinishedAt, ScheduleDays: row.ScheduleDays, ScheduleTime: row.ScheduleTime,
+	}
+}
+
+func (row clusterRuleLibVersionRow) ip2RegionVersion() models.ClusterSecurityIP2RegionVersion {
+	return models.ClusterSecurityIP2RegionVersion{
+		ID: row.ID, Version: row.Version, UpdatedAt: row.UpdatedAt, AutoUpdate: row.AutoUpdate,
+		UpdateStatus: row.UpdateStatus, Message: row.Message, LastChecked: row.LastChecked,
+		NextUpdate: row.NextUpdate, Trigger: row.Trigger, StartedAt: row.StartedAt,
+		FinishedAt: row.FinishedAt, ScheduleDays: row.ScheduleDays, ScheduleTime: row.ScheduleTime,
+	}
+}
+
+// readClusterRuleLibVersionRows 按共享列清单读取一张版本表（快照导出与
+// 差分本地读取共用；ORDER BY id 保证两侧顺序一致）。
+func readClusterRuleLibVersionRows(ctx context.Context, store snapshotStore, table string) ([]clusterRuleLibVersionRow, error) {
+	rows, err := store.QueryContext(ctx, "SELECT "+clusterRuleLibVersionColumns+" FROM "+table+" ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]clusterRuleLibVersionRow, 0)
+	for rows.Next() {
+		row, err := scanClusterRuleLibVersionRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
 func (s *ClusterService) snapshotSecurityCRSVersion(ctx context.Context, store snapshotStore) ([]models.ClusterSecurityCRSVersion, error) {
 	// 历史问题-01（历史）：schedule_days/schedule_time 随版本行同步（升主即生效）。
-	rows, err := store.QueryContext(ctx, `SELECT id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,''),COALESCE(schedule_days,'1,2,3,4,5,6,7'),COALESCE(schedule_time,'04:00') FROM security_crs_version ORDER BY id`)
+	rows, err := readClusterRuleLibVersionRows(ctx, store, "security_crs_version")
 	if err != nil {
 		return nil, fmt.Errorf("读取快照 CRS 版本: %w", err)
 	}
-	defer rows.Close()
-	versions := make([]models.ClusterSecurityCRSVersion, 0)
-	for rows.Next() {
-		var version models.ClusterSecurityCRSVersion
-		if err := rows.Scan(&version.ID, &version.Version, &version.UpdatedAt, &version.AutoUpdate, &version.UpdateStatus, &version.Message, &version.LastChecked, &version.NextUpdate, &version.Trigger, &version.StartedAt, &version.FinishedAt, &version.ScheduleDays, &version.ScheduleTime); err != nil {
-			return nil, fmt.Errorf("扫描快照 CRS 版本: %w", err)
-		}
-		versions = append(versions, version)
+	versions := make([]models.ClusterSecurityCRSVersion, 0, len(rows))
+	for _, row := range rows {
+		versions = append(versions, row.crsVersion())
 	}
-	return versions, rows.Err()
+	return versions, nil
 }
 
 func (s *ClusterService) snapshotSecurityIP2RegionVersion(ctx context.Context, store snapshotStore) ([]models.ClusterSecurityIP2RegionVersion, error) {
 	// 历史问题-01（历史）：schedule_days/schedule_time 随版本行同步（升主即生效）。
-	rows, err := store.QueryContext(ctx, `SELECT id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,''),COALESCE(schedule_days,'1,2,3,4,5,6,7'),COALESCE(schedule_time,'04:00') FROM security_ip2region_version ORDER BY id`)
+	rows, err := readClusterRuleLibVersionRows(ctx, store, "security_ip2region_version")
 	if err != nil {
 		return nil, fmt.Errorf("读取快照 ip2region 版本: %w", err)
 	}
-	defer rows.Close()
-	versions := make([]models.ClusterSecurityIP2RegionVersion, 0)
-	for rows.Next() {
-		var version models.ClusterSecurityIP2RegionVersion
-		if err := rows.Scan(&version.ID, &version.Version, &version.UpdatedAt, &version.AutoUpdate, &version.UpdateStatus, &version.Message, &version.LastChecked, &version.NextUpdate, &version.Trigger, &version.StartedAt, &version.FinishedAt, &version.ScheduleDays, &version.ScheduleTime); err != nil {
-			return nil, fmt.Errorf("扫描快照 ip2region 版本: %w", err)
-		}
-		versions = append(versions, version)
+	versions := make([]models.ClusterSecurityIP2RegionVersion, 0, len(rows))
+	for _, row := range rows {
+		versions = append(versions, row.ip2RegionVersion())
 	}
-	return versions, rows.Err()
+	return versions, nil
 }
 
 // snapshotTime 把快照时间统一到秒：从端落库使用 crsTimeLayout（秒），
@@ -966,6 +1055,15 @@ func (s *ClusterService) snapshotRules(ctx context.Context, store snapshotStore)
 			&rule.CreatedBy, &rule.CreatedAt, &rule.UpdatedAt, &rule.UpdatedBy,
 			&rule.BlockPageStage1ID, &rule.BlockPageStage1Status, &rule.BlockPageStage3ID, &rule.BlockPageStage3Status); err != nil {
 			return nil, fmt.Errorf("扫描快照规则: %w", err)
+		}
+		// S历史问题-03（历史）：与 path_rules/users/api_keys/ACME 逐行
+		// 对称，规则时间戳截到秒（写侧 crsTimeLayout=秒/UTC）。仅启动迁移处理
+		// 存量行，运行期导入/备份恢复/带外写入的亚秒或 +08:00 形态会让主端
+		// 导出 JSON 与从端落库重建形态分叉 → rules 节哈希永久不等，每次主端
+		// 版本递增多一轮全量重拉+强制重载。主从两侧同走本函数，归一无行为变化。
+		rule.CreatedAt = snapshotTime(rule.CreatedAt)
+		if rule.UpdatedAt.Valid {
+			rule.UpdatedAt.Time = snapshotTime(rule.UpdatedAt.Time)
 		}
 		// 传输归一（单一事实源，2026-10-11）：body 钳制 + TCP 死形态 + TCP
 		// 七字段——导出侧与从端 insertSnapshotRules 共用 normalizeRuleForTransport。
@@ -1137,6 +1235,13 @@ func (s *ClusterService) snapshotCertificates(ctx context.Context, store snapsho
 		return nil, fmt.Errorf("关闭手工证书结果: %w", err)
 	}
 
+	// S历史问题-10（历史·契约声明）：证书轴仅镜像**启用**规则
+	// （r.enabled=1）的 ACME 证书。主从「规则-证书」页面对禁用规则不一致是
+	// 有意取舍而非缺陷：从端 cert_jobs 全量替换 + removeMissingSnapshotCerts
+	// 会移除禁用规则的历史证书行与文件（disabled 规则不参与流量，无可用性
+	// 影响）；该从节点升主后，禁用规则的历史证书需重新签发才能恢复。
+	// 改为「启用或仍持有有效证书」属数据面语义变更，需用户裁定——本轮仅
+	// 声明契约并以 TestSnapshotCertificates_mirrorsOnlyEnabledRules 钉死。
 	rows, err = store.QueryContext(ctx, `SELECT r.caddy_id,r.domain,j.domain,j.cert_pem,j.key_pem,COALESCE(j.expires_at,''),COALESCE(j.ca_provider_id,0),j.status,
 		COALESCE(j.renewal_attempts,0),j.ca_available_after,COALESCE(j.last_error_code,''),COALESCE(julianday(COALESCE(j.updated_at,j.created_at)),0),j.id
 		FROM lb_rules r JOIN cert_jobs j ON j.rule_id=r.caddy_id

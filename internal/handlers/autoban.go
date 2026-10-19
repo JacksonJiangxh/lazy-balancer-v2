@@ -122,6 +122,12 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 			resp["last_status"] = last.Status
 		}
 	}
+	// 历史问题-02（历史）：喂入源（安全事件采集）健康——数据源停摆时自动封禁
+	// 静默失效（计数恒 0、轮次仍 success）。状态卡据此显示降级原因，不自动
+	// 拉起用户显式停止的任务。
+	feedDegraded, feedReason := services.AutobanFeedHealth()
+	resp["feed_degraded"] = feedDegraded
+	resp["feed_degraded_reason"] = feedReason
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: resp})
 }
 
@@ -142,7 +148,15 @@ func (h *Handlers) autobanListReferenced() bool {
 
 // autobanBanEffective 封禁是否真正生效（历史问题-02 黄条判据）：预置名单存在且
 // 含未到期条目，并被至少一个「启用 + IP 访问控制启用 + deny 模式」的策略在
-// ip_acl_list_refs 中引用，且该策略已绑定到启用的 HTTP 规则。白名单/受信代理/CRS 排除引用不构成拦截生效。
+// ip_acl_list_refs 中引用，且该策略已绑定到「启用 + 至少一个启用上游」的
+// HTTP 规则（历史问题，历史：渲染层对零启用上游的规则整条跳过——见
+// services/caddy.go 全量渲染的 enabledUpstreamCount 门——此前判据只看到规则
+// 启用，名单实际不拦截却抑制黄条）。白名单/受信代理/CRS 排除引用不构成拦截
+// 生效。
+// 已知边界：TLS 规则在证书待签发窗口同样被渲染层整条跳过（availableCerts
+// 门），本判据不覆盖该窗口——证书可用集在渲染器内部计算（含 ACME 签发态与
+// 文件就绪探测），在此复制判据会形成第二份实现；签发起步通常以分钟计，且
+// 证书就绪后自动重载，黄条在窗口内可能短暂假阴性。
 // 查询失败 fail-closed（返回 true，不弹误导性黄条——与 list_referenced 同口径）。
 func (h *Handlers) autobanBanEffective() bool {
 	var listID int64
@@ -163,7 +177,9 @@ func (h *Handlers) autobanBanEffective() bool {
 		  AND EXISTS (SELECT 1 FROM json_each(COALESCE(p.ip_acl_list_refs,'[]')) je WHERE je.value=?)
 		  AND EXISTS (SELECT 1 FROM security_policy_bindings b
 		              JOIN lb_rules r ON r.caddy_id=b.rule_caddy_id
-		              WHERE b.policy_id=p.id AND r.protocol='http' AND COALESCE(r.enabled,0)=1)`,
+		              WHERE b.policy_id=p.id AND r.protocol='http' AND COALESCE(r.enabled,0)=1
+		                AND EXISTS (SELECT 1 FROM upstreams u
+		                            WHERE u.rule_id=r.caddy_id AND IIF(u.enabled IN ('1',1),1,0)=1))`,
 		listID).Scan(&count); err != nil {
 		return true
 	}

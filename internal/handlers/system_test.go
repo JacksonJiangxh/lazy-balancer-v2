@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/config"
+	"lazy-balancer-v2/internal/db"
 )
 
 func TestGetAppLogs_reads_configured_log_file(t *testing.T) {
@@ -66,5 +67,39 @@ func TestGetAppLogs_returns_empty_content_when_log_file_missing(t *testing.T) {
 	// Then
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"content":""`) {
 		t.Fatalf("status=%d body=%s, want 200 with empty content", response.Code, response.Body.String())
+	}
+}
+
+// HC-11（历史）：节点角色查询失败/库未装配时 node_mode 为 unknown，
+// 不得静默冒充 master（排障窗口的误导；同域写门对同一故障响亮 500）。
+func TestGetSystemInfo_nodeModeUnknownWhenRoleUnavailable(t *testing.T) {
+	oldDB := db.DB
+	db.DB = nil
+	db.SetDB(nil)
+	t.Cleanup(func() {
+		db.DB = oldDB
+		db.SetDB(oldDB)
+	})
+
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{cfg: &config.Config{DataDir: t.TempDir()}}
+	router := gin.New()
+	router.GET("/system/info", h.GetSystemInfo)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/system/info", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			NodeMode string `json:"node_mode"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode system info: %v", err)
+	}
+	if payload.Data.NodeMode != "unknown" {
+		t.Fatalf("node_mode=%q, want unknown（查询失败不得冒充 master）", payload.Data.NodeMode)
 	}
 }

@@ -137,13 +137,17 @@ func autoBackupFilenameBase(trigger string, now time.Time) string {
 	return fmt.Sprintf("lbbak-%s-%s", kind, now.Format("20060102-150405"))
 }
 
+// autoBackupNameVariants 同秒文件名候选数：基础名 + -2..-200 共 200 个候选
+// （历史问题，历史：原注释写 -2..-201 与实现不符，按注释调参易错）。
+const autoBackupNameVariants = 200
+
 // nextAutoBackupFilename 生成不冲突的备份文件名：lbbak-{auto|manual}-YYYYMMDD-
-// HHMMSS.lbbak，同秒冲突追加 -2..-201（调度与手动同秒串行执行的场景）。
+// HHMMSS.lbbak，同秒冲突追加 -2..-200（调度与手动同秒串行执行的场景）。
 // B2-历史问题（历史）：200 个变体全冲突时必须报错，不得回退到基础名
 // （可能是已存在文件）——否则后续 os.Rename 会覆盖既有备份。
 func nextAutoBackupFilename(dir, trigger string, now time.Time) (string, error) {
 	base := autoBackupFilenameBase(trigger, now)
-	for i := 0; i < 200; i++ {
+	for i := range autoBackupNameVariants {
 		name := base + ".lbbak"
 		if i > 0 {
 			name = fmt.Sprintf("%s-%d.lbbak", base, i+1)
@@ -159,7 +163,7 @@ func nextAutoBackupFilename(dir, trigger string, now time.Time) (string, error) 
 		}
 		return name, nil
 	}
-	return "", fmt.Errorf("同名备份文件冲突超过 200 次（基准名 %s）", base)
+	return "", fmt.Errorf("同名备份文件冲突超过 %d 次（基准名 %s）", autoBackupNameVariants, base)
 }
 
 // appVersion 为系统真实版本（cfg.Version，不受 branding.json 版本覆盖影响，
@@ -267,6 +271,21 @@ func cleanupAutoBackupTempFiles(dir string) error {
 		}
 	}
 	return nil
+}
+
+// writeAutoBackupPayload 备份写盘单源（历史问题，历史）：写盘函数本身无 ctx，
+// 取消与写盘错误同时发生时此前直接走 fail()——task_runs 记 cancelled 而
+// auto_backups 落 failed 行 + 「备份失败」审计，两处终态分叉。写盘报错后先看
+// ctx：已取消（含 deadline）则按取消返回，交由调用方零行/零审计收尾（与
+// 历史问题-10 同口径）；未取消才是真实磁盘故障。
+func writeAutoBackupPayload(ctx context.Context, path string, payload []byte) error {
+	err := services.WriteAutoBackupFileSynced(path, payload)
+	if err != nil && ctx != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+	}
+	return err
 }
 
 // RunAutoBackupOnce 执行一次完整备份（调度/手动共用；main.go 经
@@ -394,7 +413,12 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 	if cerr := ctx.Err(); cerr != nil {
 		return autoBackupRowView{}, cerr
 	}
-	if err := services.WriteAutoBackupFileSynced(finalPath, payload); err != nil {
+	if err := writeAutoBackupPayload(ctx, finalPath, payload); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			// 历史问题：取消发生在写盘阶段——按取消返回，不落 failed 行/审计。
+			_ = os.Remove(finalPath)
+			return autoBackupRowView{}, cerr
+		}
 		return autoBackupRowView{}, fail("备份文件写入失败", err)
 	}
 	if cerr := ctx.Err(); cerr != nil {
@@ -704,7 +728,7 @@ func (h *Handlers) RunAutoBackupNow(c *gin.Context) {
 	}
 	te := services.TaskEngine()
 	if te == nil {
-		c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
+		respondTaskEngineUnavailable(c)
 		return
 	}
 	if err := te.RunAsync("auto-backup", "manual", operator); err != nil {

@@ -1,11 +1,11 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -170,10 +170,15 @@ func checkConfigConsistency(adminURL string) (checked bool, err error) {
 	if err != nil {
 		// Caddy 不可达由 GetCaddyStatus 的 status 通道报告；但「配置超解析上限/
 		// 解析失败」会让看门狗永久静默——须留痕（首次失败告警，恢复后复位）。
+		// S历史问题：超限（与瞬时读失败不同——不会自愈）单独留痕文案。
 		configDriftMu.Lock()
 		if !configDriftReadWarned {
 			configDriftReadWarned = true
-			Logf("warn", "配置一致性看门狗：读取运行配置失败（本轮起跳过检查）: %v", err)
+			if errors.Is(err, errCaddyAdminConfigTooLarge) {
+				Logf("warn", "配置一致性看门狗：运行配置超过 %d 字节上限，漂移检测无法进行（本轮起跳过，直至配置缩回上限内）: %v", caddyAdminConfigMaxBytes, err)
+			} else {
+				Logf("warn", "配置一致性看门狗：读取运行配置失败（本轮起跳过检查）: %v", err)
+			}
 		}
 		configDriftMu.Unlock()
 		return false, err
@@ -247,6 +252,11 @@ func expectedRenderedRules() (map[string]string, error) {
 				closeErr := certRows.Close()
 				return nil, fmt.Errorf("解析 ACME 证书候选失败: %w", errors.Join(scanErr, closeErr))
 			}
+			// SV历史问题：与渲染装载同口径预解析（certReady 对每条规则只做选择，
+			// 但同一候选集会在多次巡检比较中重复使用）。
+			if candidate.Status != "disabled" {
+				candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
+			}
 			acmeCerts[ruleID] = append(acmeCerts[ruleID], candidate)
 		}
 		if rowsErr := certRows.Err(); rowsErr != nil {
@@ -300,13 +310,12 @@ func expectedRenderedRules() (map[string]string, error) {
 // 「配置一致」心跳（历史问题 收敛——一致轮不再逐轮记录）。
 const configWatchdogHeartbeatRounds = 60
 
-// maxAdminConfigBytes 看门狗读取 Caddy 运行配置的解码上限——历史问题 家族口径
-// 32MB（与 caddy.go:210/565/780 同源；历史问题-2 对齐，原先 4MB 上限使 >4MB 配置
-// 漂移检测永久静默而 apply 仍工作至 32MB）。
-const maxAdminConfigBytes = 32 << 20
-
 // runningRuleRouteIDs 从 Caddy 运行配置收集规则路由 @id（lb_ 前缀），
 // 覆盖 http 与 layer4 两类服务器。
+// S历史问题：读取/上限/状态分类统一委托 readAdminConfigBody（caddy.go）——
+// 32MB+1 超限探测、非 2xx 显式错误、超限返回 errCaddyAdminConfigTooLarge，
+// 与 GetConfig/getRunningConfigBytes 同源；裸 LimitReader 会让「超限」与
+// 「瞬时读失败」不可区分，超大部署漂移检测长期静默。
 func runningRuleRouteIDs(adminURL string) (map[string]bool, error) {
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(strings.TrimRight(adminURL, "/") + "/config/")
@@ -314,11 +323,17 @@ func runningRuleRouteIDs(adminURL string) (map[string]bool, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("caddy admin status %d", resp.StatusCode)
+	body, err := readAdminConfigBody(resp)
+	if err != nil {
+		return nil, err
 	}
 	var config map[string]interface{}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxAdminConfigBytes)).Decode(&config); err != nil {
+	// 解析保持与旧实现同容忍度：json.Decoder 只消费第一个顶层值（尾随字节/
+	// 多余闭合符被忽略），json.Unmarshal 则要求整份字节恰为一个值。Caddy admin
+	// 契约外尾随内容不应把「运行配置可读」降级为「读取失败」——看门狗与启动
+	// 守卫的探针宁可沿用既有容忍面（S历史问题 只统一读取上限/状态分类，未收紧
+	// 解析语义）。
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&config); err != nil {
 		return nil, err
 	}
 	ids := make(map[string]bool)

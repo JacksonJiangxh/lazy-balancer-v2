@@ -58,6 +58,15 @@ const (
 	// DDL DEFAULT + 启动归一（security_normalize.go legacySecurityEnumBackfills）
 	// + DB 侧钉测三处单源。
 	DefaultAnomalyThreshold = 5
+	// 安全事件保留 / 威胁大屏口径默认值（历史问题 历史单源化）：
+	// 此前 90 天 / 100 万行 / 采样 -1 / 模式 'map' 在 DDL（newColumns）、启动
+	// 迁移、读侧 COALESCE、导入归一四处各写一份字面量，改默认值需同步 4+ 处
+	// （request_body 多年漏检同族）。现以本组常量为唯一事实源：DDL/回填/
+	// 读侧绑定参数/导入归一全部引用，db_truth_defaults_test 双向钉死。
+	DefaultSecurityEventsRetentionDays = 90
+	DefaultSecurityEventsRowCap        = 1000000
+	DefaultThreatTrafficSampleN        = -1 // -1=自适应/0=关闭/1=全量
+	DefaultThreatScreenMode            = "map"
 )
 
 // certJobStatuses 是 cert_jobs.status 的规范枚举（历史问题，历史单源化）。
@@ -93,6 +102,16 @@ func certJobStatusListSQL() string {
 func certJobStatusCheckSQL() string {
 	return "CHECK (status IN (" + certJobStatusListSQL() + "))"
 }
+
+// TaskRunsLatestPerTaskQuery 是「每任务最新运行」查询的唯一事实源：生产消费方
+// = taskengine.Engine.RunOverview（services 层任务视图），索引服务对象 =
+// idx_task_runs_task_latest(task_id, id)。常量落在 db 包是因为索引 DDL 与
+// EXPLAIN 查询计划钉测同包（db 不可 import taskengine：反向会成环），
+// 历史问题（历史）以此消除测试「按反引号切片生产源码文本」的脆性——
+// 查询重构不再假红，查询与索引列序漂移仍由计划钉测拦截。
+const TaskRunsLatestPerTaskQuery = `SELECT id, task_id, family, trigger, COALESCE(operator,''), status, started_at,
+			COALESCE(finished_at,''), COALESCE(duration_ms,0), COALESCE(message,'')
+			FROM task_runs WHERE id IN (SELECT MAX(id) FROM task_runs GROUP BY task_id)`
 
 func CanonicalDomains(value string) (string, error) {
 	seen := make(map[string]struct{})
@@ -847,8 +866,15 @@ func runMigrations() error {
 	// 三代并存惯用法（逐列硬编码/局部 map 循环/通用 ensureNewColumns）只留后者，
 	// 下次加列只有一处登记点（schedule_days 单侧漏登记事故即登记点分裂的代价）。
 
-	if _, err := DB.Exec("UPDATE lb_rules SET strategy='weighted_round_robin' WHERE strategy='round_robin'"); err != nil {
+	strategyResult, err := DB.Exec("UPDATE lb_rules SET strategy='weighted_round_robin' WHERE strategy='round_robin'")
+	if err != nil {
 		return fmt.Errorf("failed to normalize lb_rules strategy: %w", err)
+	}
+	if n, _ := strategyResult.RowsAffected(); n > 0 {
+		// 历史问题（历史）：用户规则配置被改写须留痕。
+		detail := fmt.Sprintf("启动迁移：存量规则负载策略 round_robin 归一为 weighted_round_robin：%d 条", n)
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "负载规则", detail)
 	}
 
 	if _, err := DB.Exec("DROP TABLE IF EXISTS config_versions"); err != nil {
@@ -1041,35 +1067,41 @@ func runMigrations() error {
 		"global_config.github_proxy_url":                       "TEXT NOT NULL DEFAULT 'https://v4.gh-proxy.org/'",
 		"global_config.github_token":                           "TEXT NOT NULL DEFAULT ''",
 		"global_config.server_map_lat":                         "REAL NOT NULL DEFAULT 0",
-		"global_config.threat_screen_mode":                     "TEXT NOT NULL DEFAULT 'map'",
-		"global_config.threat_traffic_sample_n":                "INTEGER NOT NULL DEFAULT -1", // -1=自适应/0=关闭/1=全量（历史；2..64 废除）
+		"global_config.threat_screen_mode":                     fmt.Sprintf("TEXT NOT NULL DEFAULT '%s'", DefaultThreatScreenMode),
+		"global_config.threat_traffic_sample_n":                fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultThreatTrafficSampleN), // -1=自适应/0=关闭/1=全量（历史；2..64 废除）
 		"global_config.threat_traffic_sample_unified_migrated": "INTEGER NOT NULL DEFAULT 0",
 		// 安全事件保留显式化：默认 90 天 / 100 万行由配置本身承载，
-		// 不再用 0 隐式映射服务层写死默认值。
-		"global_config.security_events_retention_days":     "INTEGER NOT NULL DEFAULT 90",
-		"global_config.security_events_row_cap":            "INTEGER NOT NULL DEFAULT 1000000",
+		// 不再用 0 隐式映射服务层写死默认值。历史问题：默认值单源=Default* 常量。
+		"global_config.security_events_retention_days":     fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultSecurityEventsRetentionDays),
+		"global_config.security_events_row_cap":            fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultSecurityEventsRowCap),
 		"global_config.security_events_retention_migrated": "INTEGER NOT NULL DEFAULT 0",
-		"global_config.server_map_lon":                     "REAL NOT NULL DEFAULT 0",
-		"lb_rules.log_enabled":                             "BOOLEAN DEFAULT 0",
-		"lb_rules.custom_routes_enabled":                   "BOOLEAN NOT NULL DEFAULT 0",
-		"lb_rules.proxy_dial_timeout":                      "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_response_header_timeout":           "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_read_timeout":                      "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_write_timeout":                     "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_stream_timeout":                    "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_flush_interval":                    "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_stream_close_delay":                "INTEGER NOT NULL DEFAULT 0",
-		"global_config.proxy_dial_timeout":                 "INTEGER DEFAULT 0",
-		"global_config.proxy_response_header_timeout":      "INTEGER DEFAULT 0",
-		"global_config.proxy_read_timeout":                 "INTEGER DEFAULT 0",
-		"global_config.proxy_write_timeout":                "INTEGER DEFAULT 0",
-		"global_config.proxy_stream_timeout":               "INTEGER DEFAULT 0",
-		"global_config.proxy_flush_interval":               "INTEGER DEFAULT 0",
-		"global_config.proxy_stream_close_delay":           "INTEGER DEFAULT 0",
-		"users.password_changed_at":                        "DATETIME",
-		"users.password_version":                           "INTEGER NOT NULL DEFAULT 0",
-		"global_config.cluster_version":                    "INTEGER DEFAULT 0",
-		"global_config.sync_users":                         "BOOLEAN DEFAULT 1",
+		// 历史问题（历史）：CA 提供商播种一次性 marker。此前「表空即
+		// 播种」每次启动评估——导入/集群快照把 ca_providers 清空后重启会复活
+		// ZeroSSL/LE 并覆盖 default_ca_provider_id，与「删除即不存在」相悖。
+		// marker=1 表示本库已完成首播，此后表空保持空（节点本地语义：不参与
+		// 集群快照/配置备份——见 runMigrations 播种块注释）。
+		"global_config.ca_providers_seeded":           "INTEGER NOT NULL DEFAULT 0",
+		"global_config.server_map_lon":                "REAL NOT NULL DEFAULT 0",
+		"lb_rules.log_enabled":                        "BOOLEAN DEFAULT 0",
+		"lb_rules.custom_routes_enabled":              "BOOLEAN NOT NULL DEFAULT 0",
+		"lb_rules.proxy_dial_timeout":                 "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.proxy_response_header_timeout":      "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.proxy_read_timeout":                 "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.proxy_write_timeout":                "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.proxy_stream_timeout":               "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.proxy_flush_interval":               "INTEGER NOT NULL DEFAULT 0",
+		"lb_rules.proxy_stream_close_delay":           "INTEGER NOT NULL DEFAULT 0",
+		"global_config.proxy_dial_timeout":            "INTEGER DEFAULT 0",
+		"global_config.proxy_response_header_timeout": "INTEGER DEFAULT 0",
+		"global_config.proxy_read_timeout":            "INTEGER DEFAULT 0",
+		"global_config.proxy_write_timeout":           "INTEGER DEFAULT 0",
+		"global_config.proxy_stream_timeout":          "INTEGER DEFAULT 0",
+		"global_config.proxy_flush_interval":          "INTEGER DEFAULT 0",
+		"global_config.proxy_stream_close_delay":      "INTEGER DEFAULT 0",
+		"users.password_changed_at":                   "DATETIME",
+		"users.password_version":                      "INTEGER NOT NULL DEFAULT 0",
+		"global_config.cluster_version":               "INTEGER DEFAULT 0",
+		"global_config.sync_users":                    "BOOLEAN DEFAULT 1",
 		// branding.json 原文镜像(2026-09-11):主节点经快照分发到从节点,
 		// 入触发器 OF 列表——文件变化即 bump cluster_version。
 		"global_config.branding_json":                 "TEXT DEFAULT ''",
@@ -1228,8 +1260,15 @@ func runMigrations() error {
 	}
 	// 审计 B2-I1：FK OFF 时代 DeleteRule 缺 path_rules 显式删除所积累的孤儿行
 	// 一次性清理（幂等，无孤儿零命中）——孤儿随备份导出会使导入侧引用校验 400。
-	if _, err := DB.Exec("DELETE FROM path_rules WHERE rule_id NOT IN (SELECT caddy_id FROM lb_rules)"); err != nil {
+	orphanPathResult, err := DB.Exec("DELETE FROM path_rules WHERE rule_id NOT IN (SELECT caddy_id FROM lb_rules)")
+	if err != nil {
 		return fmt.Errorf("failed to clean orphaned path_rules: %w", err)
+	}
+	if n, _ := orphanPathResult.RowsAffected(); n > 0 {
+		// 历史问题（历史）：删除用户数据须留痕（与孤儿 upstream 审计同口径）。
+		detail := fmt.Sprintf("启动迁移：已清理 %d 条孤儿 path_rules 行（rule_id 无对应规则）", n)
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "负载规则", detail)
 	}
 	if _, err := DB.Exec("CREATE INDEX IF NOT EXISTS idx_api_keys_prefix_hash ON api_keys(key_prefix,key_hash)"); err != nil {
 		return fmt.Errorf("failed to index API key authentication: %w", err)
@@ -1664,36 +1703,51 @@ func runMigrations() error {
 		return fmt.Errorf("failed to sanitize legacy custom rule patterns: %w", err)
 	}
 
-	// Seed default CA providers if table is empty.
-	var caCount int
-	if err := DB.QueryRow("SELECT COUNT(*) FROM ca_providers").Scan(&caCount); err != nil {
-		return fmt.Errorf("failed to count CA providers: %w", err)
+	// Seed default CA providers once per database (历史问题，历史)。
+	// 此前「表空即播种」每次启动评估：导入/集群快照把 ca_providers 清空后重
+	// 启会复活 ZeroSSL+LE 并覆盖 default_ca_provider_id，与「删除即不存在」的
+	// 用户预期相悖。marker=1 后表空保持空（cert 签发会显式失败，用户可经导入
+	// 恢复；UI 无新增入口，这是删除路径的唯一来源）。marker 为节点本地语义：
+	// 不进入集群快照（snapshotACME 显式列）与配置备份（显式设置键清单）。
+	var caSeeded int
+	if err := DB.QueryRow(`SELECT COALESCE(ca_providers_seeded,0) FROM global_config WHERE id=1`).Scan(&caSeeded); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to read CA provider seed marker: %w", err)
 	}
-	if caCount == 0 {
-		if _, err := DB.Exec(`
-			INSERT INTO ca_providers (name, provider, directory_url, credentials, max_concurrent, min_interval_ms, enabled)
-			VALUES
-				('ZeroSSL', 'zerossl', 'https://acme.zerossl.com/v2/DV90', '{}', 1, 10000, 1),
-				('Let''s Encrypt', 'letsencrypt', 'https://acme-v02.api.letsencrypt.org/directory', '{}', 2, 5000, 1)
-		`); err != nil {
-			return fmt.Errorf("failed to seed CA providers: %w", err)
+	if caSeeded == 0 {
+		var caCount int
+		if err := DB.QueryRow("SELECT COUNT(*) FROM ca_providers").Scan(&caCount); err != nil {
+			return fmt.Errorf("failed to count CA providers: %w", err)
 		}
-		// LastInsertId returns the last row of the multi-row insert (Let's Encrypt),
-		// so look up Let's Encrypt's actual ID directly and set it as the default.
-		var leid int64
-		if err := DB.QueryRow("SELECT id FROM ca_providers WHERE provider = 'letsencrypt' ORDER BY id LIMIT 1").Scan(&leid); err != nil {
-			return fmt.Errorf("failed to find seeded Let's Encrypt provider: %w", err)
+		if caCount == 0 {
+			if _, err := DB.Exec(`
+				INSERT INTO ca_providers (name, provider, directory_url, credentials, max_concurrent, min_interval_ms, enabled)
+				VALUES
+					('ZeroSSL', 'zerossl', 'https://acme.zerossl.com/v2/DV90', '{}', 1, 10000, 1),
+					('Let''s Encrypt', 'letsencrypt', 'https://acme-v02.api.letsencrypt.org/directory', '{}', 2, 5000, 1)
+			`); err != nil {
+				return fmt.Errorf("failed to seed CA providers: %w", err)
+			}
+			// LastInsertId returns the last row of the multi-row insert (Let's Encrypt),
+			// so look up Let's Encrypt's actual ID directly and set it as the default.
+			var leid int64
+			if err := DB.QueryRow("SELECT id FROM ca_providers WHERE provider = 'letsencrypt' ORDER BY id LIMIT 1").Scan(&leid); err != nil {
+				return fmt.Errorf("failed to find seeded Let's Encrypt provider: %w", err)
+			}
+			res, err := DB.Exec("UPDATE global_config SET default_ca_provider_id = ? WHERE id = 1", leid)
+			if err != nil {
+				return fmt.Errorf("failed to set default CA provider: %w", err)
+			}
+			rowsAffected, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("failed to read default CA provider update result: %w", err)
+			}
+			if rowsAffected == 0 {
+				return fmt.Errorf("failed to set default CA provider: global config singleton not found")
+			}
+			log.Print("已播种默认 CA 提供商（ZeroSSL / Let's Encrypt）")
 		}
-		res, err := DB.Exec("UPDATE global_config SET default_ca_provider_id = ? WHERE id = 1", leid)
-		if err != nil {
-			return fmt.Errorf("failed to set default CA provider: %w", err)
-		}
-		rowsAffected, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("failed to read default CA provider update result: %w", err)
-		}
-		if rowsAffected == 0 {
-			return fmt.Errorf("failed to set default CA provider: global config singleton not found")
+		if _, err := DB.Exec(`UPDATE global_config SET ca_providers_seeded=1 WHERE id=1`); err != nil {
+			return fmt.Errorf("failed to record CA provider seed marker: %w", err)
 		}
 	}
 
@@ -1725,14 +1779,9 @@ func runMigrations() error {
 	if err := SeedSystemIPLists(DB); err != nil {
 		return err
 	}
-	// 预置行描述文案归一（2026-10-15「删除条目即解封」裁定）：存量行的旧种子
-	// 描述（「可手动追加或解封」）同步为删除条目口径。仅命中旧文案行——预置行
-	// 描述禁改（UpdateIPList 400 守卫），不存在用户自定义形态；威胁名单描述
-	// 不受影响。
-	if _, err := DB.Exec(`UPDATE security_ip_lists SET description='自动封禁命中 IP（自动封禁任务维护；可手动追加或删除条目）'
-		WHERE name='自动封禁名单' AND COALESCE(system,0)=1 AND description='自动封禁命中 IP（自动封禁任务维护；可手动追加或解封）'`); err != nil {
-		return fmt.Errorf("failed to normalize autoban preset description: %w", err)
-	}
+	// 预置行描述文案归一由 SeedSystemIPLists（EnsureSystemIPList 的已存在行
+	// 分支）统一承担（历史问题：种子即文案真相，幂等 UPDATE）——此处不再保留
+	// 针对单一文案的一次性补丁。
 
 	// 规则三面同构迁移（2026-10-11 用户裁定「如果没有就都应该没有/时间戳格式
 	// 统一」）：TCP 死值清零（bump cluster_version 触发从端下轮收敛）+ 时间戳
@@ -1989,10 +2038,37 @@ func migrateTCPRuleStaleDNSServer() error {
 	if len(stale) == 0 {
 		return nil
 	}
-	if _, err := DB.Exec(`UPDATE lb_rules SET enable_dns_server=0, dns_server=''
-		WHERE protocol='tcp' AND (IIF(enable_dns_server IN ('1',1),1,0)=1 OR TRIM(COALESCE(dns_server,''))<>'')`); err != nil {
+	// 历史问题（历史）：清理与 cluster_version bump 同事务——与姊妹
+	// 迁移 migrateTCPRuleSecurityPolicyBindings 同口径。此前清字段但不 bump，
+	// 从端快照版本门永不失效（主从 canonical 分叉）。
+	tx, err := DB.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin tcp stale dns server cleanup: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	res, err := tx.Exec(`UPDATE lb_rules SET enable_dns_server=0, dns_server=''
+		WHERE protocol='tcp' AND (IIF(enable_dns_server IN ('1',1),1,0)=1 OR TRIM(COALESCE(dns_server,''))<>'')`)
+	if err != nil {
 		return fmt.Errorf("failed to normalize tcp rules with stale dns server: %w", err)
 	}
+	cleared, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to read normalized tcp rule count: %w", err)
+	}
+	if cleared > 0 {
+		if _, err := tx.Exec(`UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1`); err != nil {
+			return fmt.Errorf("failed to bump cluster_version after tcp stale dns cleanup: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit tcp stale dns server cleanup: %w", err)
+	}
+	committed = true
 	for _, rule := range stale {
 		detail := fmt.Sprintf("存量 TCP 规则携带无效 DNS 服务发现配置（渲染永不消费），已清空 enable_dns_server/dns_server：caddy_id=%s name=%s", rule.caddyID, rule.name)
 		log.Print(detail)
@@ -2127,7 +2203,11 @@ func sanitizeLegacyCustomRulePatterns() error {
 	}
 
 	if disabled > 0 {
-		log.Printf("已禁用 %d 条含非法 pattern 的存量自定义规则（尾部反斜杠/空条件）", disabled)
+		// 历史问题（历史）：禁用用户规则属于用户可见数据改写，须留痕
+		//（此前只有进程 stdout）。
+		detail := fmt.Sprintf("启动迁移：已禁用 %d 条含非法 pattern 的存量自定义规则（尾部反斜杠/空条件/不可解析 conditions）", disabled)
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "自定义规则", detail)
 	}
 	return nil
 }
@@ -2236,6 +2316,7 @@ func migrateCanonicalDomains() error {
 		}
 	}
 
+	renamedDomains := 0
 	for _, row := range rowsToNormalize {
 		if row.table == "upstreams" && net.ParseIP(strings.TrimSpace(row.value)) != nil {
 			continue
@@ -2255,18 +2336,21 @@ func migrateCanonicalDomains() error {
 		if _, err := tx.Exec("UPDATE "+row.table+" SET "+row.column+"=? WHERE "+keyColumn+"=?", canonical, row.key); err != nil {
 			return fmt.Errorf("update %s.%s row %v: %w", row.table, row.column, row.key, err)
 		}
+		renamedDomains++
 	}
 	// 历史问题 历史问题：去重保留判据改为「优先有证书材料的行，同列再比 id」——原 MAX(id)
 	// 在规范域碰撞时（legacy 大小写/IDN 变体行）可能删掉带已签发证书的旧行、
 	// 保留其后创建的无证书行，规则丢失现网证书需重签。一次性迁移窗口内生效。
-	if _, err := tx.Exec(`DELETE FROM cert_jobs WHERE id NOT IN (
+	dedupeResult, err := tx.Exec(`DELETE FROM cert_jobs WHERE id NOT IN (
 		SELECT a.id FROM cert_jobs a WHERE a.id = (
 			SELECT b.id FROM cert_jobs b
 			WHERE b.rule_id = a.rule_id AND b.domain = a.domain
 			ORDER BY (CASE WHEN COALESCE(b.cert_pem,'')='' OR COALESCE(b.key_pem,'')='' THEN 0 ELSE 1 END) DESC, b.id DESC
-			LIMIT 1))`); err != nil {
+			LIMIT 1))`)
+	if err != nil {
 		return fmt.Errorf("deduplicate cert_jobs: %w", err)
 	}
+	dedupedJobs, _ := dedupeResult.RowsAffected()
 	if _, err := tx.Exec("CREATE UNIQUE INDEX idx_cert_jobs_rule_domain_unique ON cert_jobs(rule_id, domain)"); err != nil {
 		return fmt.Errorf("create cert_jobs domain index: %w", err)
 	}
@@ -2274,6 +2358,18 @@ func migrateCanonicalDomains() error {
 		return fmt.Errorf("commit domain normalization: %w", err)
 	}
 	committed = true
+	// 历史问题（历史）：域名归一/证书任务去重都是用户可见数据改写，
+	// 提交成功后聚合留痕。
+	if renamedDomains > 0 {
+		detail := fmt.Sprintf("启动迁移：存量域名归一为规范形（lb_rules/cert_jobs/upstreams）：%d 行", renamedDomains)
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "证书配置", detail)
+	}
+	if dedupedJobs > 0 {
+		detail := fmt.Sprintf("启动迁移：cert_jobs 同规则同域重复行已去重（优先保留带证书材料行）：%d 条", dedupedJobs)
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "证书任务", detail)
+	}
 	return nil
 }
 
@@ -2293,14 +2389,25 @@ func migrateThreatTrafficSampleUnified() error {
 	}
 	// 列 NOT NULL，但历史库存在带外直写 NULL 的可能：NULL 一并归一 -1，
 	// 其余非 -1/0/1 值（含 2..64 与畸形越界值）全部归自适应。
+	var invalidRows int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM global_config
+		WHERE id=1 AND (threat_traffic_sample_n IS NULL OR threat_traffic_sample_n NOT IN (-1,0,1))`).Scan(&invalidRows); err != nil {
+		return err
+	}
 	if _, err := DB.Exec(`UPDATE global_config
 		SET threat_traffic_sample_n = CASE
-		        WHEN threat_traffic_sample_n IS NULL OR threat_traffic_sample_n NOT IN (-1,0,1) THEN -1
+		        WHEN threat_traffic_sample_n IS NULL OR threat_traffic_sample_n NOT IN (-1,0,1) THEN ?
 		        ELSE threat_traffic_sample_n
 		    END,
 		    threat_traffic_sample_unified_migrated = 1
-		WHERE id = 1`); err != nil {
+		WHERE id = 1`, DefaultThreatTrafficSampleN); err != nil {
 		return err
+	}
+	if invalidRows > 0 {
+		// 历史问题：配置值被改写须留痕（与 retention 回填同口径）。
+		detail := fmt.Sprintf("启动迁移：大屏流量采样列归一为 %d（自适应，旧契约 2..64 废除）：%d 行", DefaultThreatTrafficSampleN, invalidRows)
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "系统配置", detail)
 	}
 	return nil
 }
@@ -2345,8 +2452,17 @@ func migrateAutoBackupNodeTopologySection() error {
 }
 
 func normalizeUpstreamWeightsMigration() error {
-	_, err := DB.Exec(`UPDATE upstreams SET weight=1 WHERE weight IS NULL OR weight < 1`)
-	return err
+	res, err := DB.Exec(`UPDATE upstreams SET weight=1 WHERE weight IS NULL OR weight < 1`)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		// 历史问题（历史）：上游权重被改写须留痕。
+		detail := fmt.Sprintf("启动迁移：存量上游权重无效值（NULL/<1）归 1：%d 条", n)
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "负载规则", detail)
+	}
+	return nil
 }
 
 func migrateSecurityEventRetentionDefaults() error {
@@ -2357,12 +2473,26 @@ func migrateSecurityEventRetentionDefaults() error {
 	if done != 0 {
 		return nil
 	}
+	var invalidRows int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM global_config WHERE id=1
+		AND (COALESCE(security_events_retention_days,0)<=0 OR COALESCE(security_events_row_cap,0)<=0)`).Scan(&invalidRows); err != nil {
+		return err
+	}
 	_, err := DB.Exec(`UPDATE global_config
-		SET security_events_retention_days = CASE WHEN COALESCE(security_events_retention_days,0) <= 0 THEN 90 ELSE security_events_retention_days END,
-		    security_events_row_cap = CASE WHEN COALESCE(security_events_row_cap,0) <= 0 THEN 1000000 ELSE security_events_row_cap END,
+		SET security_events_retention_days = CASE WHEN COALESCE(security_events_retention_days,0) <= 0 THEN ? ELSE security_events_retention_days END,
+		    security_events_row_cap = CASE WHEN COALESCE(security_events_row_cap,0) <= 0 THEN ? ELSE security_events_row_cap END,
 		    security_events_retention_migrated = 1
-		WHERE id = 1`)
-	return err
+		WHERE id = 1`, DefaultSecurityEventsRetentionDays, DefaultSecurityEventsRowCap)
+	if err != nil {
+		return err
+	}
+	if invalidRows > 0 {
+		// 历史问题：旧语义 0=自动 被改写为显式默认，须留痕。
+		detail := fmt.Sprintf("启动迁移：安全事件保留 0/缺省回填为显式默认（%d 天 / %d 行）", DefaultSecurityEventsRetentionDays, DefaultSecurityEventsRowCap)
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "系统配置", detail)
+	}
+	return nil
 }
 
 // EnsureSystemIPList 幂等确保一条内置 system=1 名单行存在（name+system=1
@@ -2386,13 +2516,23 @@ func EnsureSystemIPList(database *sql.DB, name, description, category string) (b
 		if err := database.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=0`, name).Scan(&userOwned); err == nil && userOwned > 0 {
 			log.Printf("内置名单 %q 与用户自建列表同名：已创建独立 system=1 行（按 id 引用，互不影响）；建议重命名用户列表以消除选择器歧义", name)
 		}
+		return true, nil
 	}
-	return n > 0, nil
+	// 历史问题（历史）：已存在的 system=1 行描述随代码文案收敛（幂等）——
+	// 此前只在缺失时 INSERT，任何文案修订都要再写一次性 UPDATE 补丁才生效，
+	// 存量库与新库文案长期分叉（2026-10-15「删除条目即解封」即此复发路径）。
+	// 预置行描述禁改由 UpdateIPList 400 守卫保证，不存在用户自定义描述形态；
+	// 备份/快照恢复带入的旧文案在下一次启动/导入重播时归一。
+	if _, err := database.Exec(`UPDATE security_ip_lists SET description=?, updated_at=datetime('now')
+		WHERE name=? AND system=1 AND COALESCE(description,'')<>?`, description, name, description); err != nil {
+		return false, fmt.Errorf("failed to normalize system list %s description: %w", name, err)
+	}
+	return false, nil
 }
 
 // SeedSystemIPLists 重播全部内置 system 名单（启动播种与导入提交后共用单源）。
 func SeedSystemIPLists(database *sql.DB) error {
-	for _, sl := range ThreatSystemLists {
+	for _, sl := range ThreatSystemLists() {
 		if _, err := EnsureSystemIPList(database, sl.Name, sl.Description, "恶意 IP"); err != nil {
 			return err
 		}
@@ -2418,17 +2558,46 @@ func ensureNewColumns(columns, backfills map[string]string) error {
 		if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?", table, name).Scan(&colCount); err != nil {
 			return fmt.Errorf("failed to check column %s.%s: %w", table, name, err)
 		}
-		if colCount == 0 {
-			if _, err := DB.Exec("ALTER TABLE " + table + " ADD COLUMN " + name + " " + dtype); err != nil {
-				return fmt.Errorf("failed to add column %s.%s: %w", table, name, err)
-			}
-			if backfill, ok := backfills[col]; ok {
-				if _, err := DB.Exec(backfill); err != nil {
-					return fmt.Errorf("failed to backfill column %s.%s: %w", table, name, err)
-				}
-			}
+		if colCount != 0 {
+			continue
+		}
+		// 历史问题（历史）：ALTER 与一次性回填必须落同一事务。此前两条
+		// 语句各自自动提交——ALTER 成功、回填前崩溃会让「列已存在」成为下次
+		// 启动的跳过判据，回填永久丢失（mfa_challenges.password_version 令存量
+		// 挑战按 0 校验；upstream_keepalive_timeout 残留旧默认 60）。SQLite DDL
+		// 可事务化：失败整体回滚→列不存在→下次启动重试 ALTER+回填。
+		if err := addColumnWithBackfill(table, name, dtype, backfills[col]); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+// addColumnWithBackfill 在同一事务内完成 ADD COLUMN 与（可选）一次性回填，
+// 保证二者原子（历史问题）。backfill 为空串表示无回填。
+func addColumnWithBackfill(table, name, dtype, backfill string) error {
+	tx, err := DB.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin column %s.%s migration: %w", table, name, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err := tx.Exec("ALTER TABLE " + table + " ADD COLUMN " + name + " " + dtype); err != nil {
+		return fmt.Errorf("failed to add column %s.%s: %w", table, name, err)
+	}
+	if backfill != "" {
+		if _, err := tx.Exec(backfill); err != nil {
+			return fmt.Errorf("failed to backfill column %s.%s: %w", table, name, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit column %s.%s migration: %w", table, name, err)
+	}
+	committed = true
 	return nil
 }
 
@@ -2705,20 +2874,13 @@ func migrateNodesDeadColumns() error {
 		// 双路径收敛为同一形态。
 		// Audit86 历史问题:重建 DDL 必须携 server_map_lat/lon 并 COALESCE 保值——
 		// 此前漏列，升级重建丢坐标（第二次 ensureNewColumns 仅以默认 0 补回 schema，
-		// 值已丢失）。与姊妹重建 migrateNodesDropMasterID 同形态（源表两列由
-		// 前置 ensureNewColumns 保证存在）。
+		// 值已丢失）。
+		// 历史问题（历史）：DDL 与拷贝 SELECT 抽到 nodesRebuildDDL/
+		// nodesRebuildCopySQL 单源——本路径与 migrateNodesDropMasterID 曾各自
+		// 手写一份并已文本分叉（cluster_token_delivered DEFAULT 0/FALSE），
+		// 未来给 nodes 加列只需改单源。
 		if _, err := tx.Exec(`DELETE FROM nodes WHERE id NOT IN (SELECT MIN(id) FROM nodes GROUP BY ip_address, port);
-		CREATE TABLE nodes_without_legacy_sync (
-		id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100) NOT NULL, mode VARCHAR(10) NOT NULL DEFAULT 'slave',
-		ip_address VARCHAR(45) NOT NULL, port INTEGER DEFAULT 8000, protocol VARCHAR(10) DEFAULT 'http', access_url VARCHAR(255) DEFAULT '',
-		is_approved BOOLEAN DEFAULT FALSE, sync_interval INTEGER DEFAULT 60, status VARCHAR(20) DEFAULT 'offline',
-		cluster_token_hash VARCHAR(64), registration_secret VARCHAR(64), registration_secret_expires_at DATETIME,
-		cluster_token_delivered BOOLEAN DEFAULT 0, reported_version INTEGER DEFAULT 0, health_json TEXT,
-		last_sync_at DATETIME, last_sync_error TEXT, last_seen DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		server_map_lat REAL NOT NULL DEFAULT 0, server_map_lon REAL NOT NULL DEFAULT 0,
-		UNIQUE(ip_address, port));
-		INSERT INTO nodes_without_legacy_sync (id,name,mode,ip_address,port,protocol,access_url,is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,server_map_lat,server_map_lon)
-		SELECT id,name,COALESCE(mode,'slave'),ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,COALESCE(server_map_lat,0),COALESCE(server_map_lon,0) FROM nodes;
+		` + nodesRebuildDDL("nodes_without_legacy_sync") + nodesRebuildCopySQL("nodes_without_legacy_sync") + `
 		DROP TABLE nodes;
 		ALTER TABLE nodes_without_legacy_sync RENAME TO nodes;
 		`); err != nil {
@@ -2726,6 +2888,52 @@ func migrateNodesDeadColumns() error {
 		}
 		return nil
 	})
+}
+
+// nodesRebuildDDL 与 nodesRebuildCopySQL 是 nodes 整表重建的唯一 DDL 单源
+// （历史问题，历史）：两条历史升级路径——migrateNodesDeadColumns
+// （legacy sync 列）与 migrateNodesDropMasterID（master_id 死列）——共用本形态，
+// 杜绝「加列只改一处、另一条升级路径静默丢值」（Audit86 历史问题 丢过
+// server_map_lat/lon）。target 为迁移期临时表名。
+//
+// fresh CREATE（createTables）的列集合是本函数的超集前提：新增列须同时登记
+// newColumns（存量库补列）与本 DDL（重建保留），db_truth_defaults_test 的
+// nodes 全形 parity 钉测对 fresh/重建两种稳态逐列比对 name/type/notnull/
+// default/pk。
+func nodesRebuildDDL(target string) string {
+	return `CREATE TABLE ` + target + ` (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name VARCHAR(100) NOT NULL,
+		mode VARCHAR(10) NOT NULL DEFAULT 'slave',
+		ip_address VARCHAR(45) NOT NULL,
+		port INTEGER DEFAULT 8000,
+		protocol VARCHAR(10) DEFAULT 'http',
+		access_url VARCHAR(255) DEFAULT '',
+		is_approved BOOLEAN DEFAULT FALSE,
+		sync_interval INTEGER DEFAULT 60,
+		status VARCHAR(20) DEFAULT 'offline',
+		cluster_token_hash VARCHAR(64),
+		registration_secret VARCHAR(64),
+		registration_secret_expires_at DATETIME,
+		cluster_token_delivered BOOLEAN DEFAULT FALSE,
+		reported_version INTEGER DEFAULT 0,
+		health_json TEXT,
+		last_sync_at DATETIME,
+		last_sync_error TEXT,
+		last_seen DATETIME,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		server_map_lat REAL NOT NULL DEFAULT 0,
+		server_map_lon REAL NOT NULL DEFAULT 0,
+		UNIQUE(ip_address, port)
+	);`
+}
+
+// nodesRebuildCopySQL 与 nodesRebuildDDL 同源配套：列清单与 COALESCE 归一
+// 必须逐项对应（mode/protocol/access_url/坐标在存量脏行上可能为 NULL，重建
+// 时归一到当前默认，避免 NOT NULL 列拒绝拷贝）。
+func nodesRebuildCopySQL(target string) string {
+	return `INSERT INTO ` + target + ` (id,name,mode,ip_address,port,protocol,access_url,is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,server_map_lat,server_map_lon)
+		SELECT id,name,COALESCE(mode,'slave'),ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,COALESCE(server_map_lat,0),COALESCE(server_map_lon,0) FROM nodes;`
 }
 
 // migrateOidcIdentityUniqueIndex（U6a-1，历史）：OIDC 身份三元组唯一
@@ -3159,6 +3367,16 @@ func migrateCertJobsStatusConstraint() error {
 
 	log.Println("Migrating cert_jobs status constraint...")
 
+	// 历史问题/04（历史）：枚举外状态（已废弃/拼写错误）是用户可见数据
+	// 改写——归一到终态 failed（保守：failed 不会被签发队列拾取，且
+	// certificates.go 的「无 expires_at 的 failed」重签路径可手动恢复），
+	// 不再回 'queued'（活跃起始态，会被队列立刻拾取并触发一次无审计的签发/
+	// 部署尝试）。改写数量先计数，重建提交后聚合写一条系统审计。
+	var unknownStatusRows int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE status IS NOT NULL AND status NOT IN (` + certJobStatusListSQL() + `)`).Scan(&unknownStatusRows); err != nil {
+		return fmt.Errorf("failed to count unknown cert_jobs statuses: %w", err)
+	}
+
 	if err := withTableRebuild(context.Background(), "cert_jobs", func(tx *sql.Tx) error {
 		if _, err := tx.Exec("ALTER TABLE cert_jobs RENAME TO cert_jobs_old"); err != nil {
 			return rollbackMigration(tx, fmt.Errorf("failed to rename cert_jobs: %w", err))
@@ -3195,7 +3413,7 @@ func migrateCertJobsStatusConstraint() error {
 		)
 		SELECT
 			id, rule_id, domain,
-			CASE WHEN COALESCE(status,'queued') IN (` + certJobStatusListSQL() + `) THEN COALESCE(status,'queued') ELSE 'queued' END,
+			CASE WHEN COALESCE(status,'queued') IN (` + certJobStatusListSQL() + `) THEN COALESCE(status,'queued') ELSE 'failed' END,
 			message, expires_at, cert_pem, key_pem,
 			ca_provider_id, renewal_attempts, ca_available_after, last_error_code, deployment_attempts, deployment_available_after,
 			created_at, updated_at
@@ -3213,6 +3431,11 @@ func migrateCertJobsStatusConstraint() error {
 	}
 
 	log.Println("cert_jobs status constraint migration completed")
+	if unknownStatusRows > 0 {
+		detail := fmt.Sprintf("cert_jobs 枚举外状态归一到 failed（不再回 queued，避免触发新签发）：%d 行", unknownStatusRows)
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "证书任务", detail)
+	}
 	return nil
 }
 
@@ -3309,38 +3532,13 @@ func migrateNodesDropMasterID() error {
 	// 空表,节点注册表全量丢失。事务化后失败整体回滚、重跑幂等（历史问题：骨架
 	// 已收敛到 withTableRebuild）。
 	return withTableRebuild(context.Background(), "nodes master_id", func(tx *sql.Tx) error {
-		const rebuild = `DROP INDEX IF EXISTS idx_nodes_master;
+		// 历史问题（历史）：DDL/拷贝 SELECT 与 migrateNodesDeadColumns
+		// 共用 nodesRebuildDDL/nodesRebuildCopySQL 单源。
+		if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_nodes_master;
 	DELETE FROM nodes WHERE id NOT IN (SELECT MIN(id) FROM nodes GROUP BY ip_address, port);
-	CREATE TABLE nodes_new (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name VARCHAR(100) NOT NULL,
-		mode VARCHAR(10) NOT NULL DEFAULT 'slave',
-		ip_address VARCHAR(45) NOT NULL,
-		port INTEGER DEFAULT 8000,
-		protocol VARCHAR(10) DEFAULT 'http',
-		is_approved BOOLEAN DEFAULT FALSE,
-		sync_interval INTEGER DEFAULT 60,
-		status VARCHAR(20) DEFAULT 'offline',
-		cluster_token_hash VARCHAR(64),
-		access_url VARCHAR(255) DEFAULT '',
-		registration_secret VARCHAR(64),
-		registration_secret_expires_at DATETIME,
-		cluster_token_delivered BOOLEAN DEFAULT FALSE,
-		reported_version INTEGER DEFAULT 0,
-		health_json TEXT,
-		last_sync_at DATETIME,
-		last_sync_error TEXT,
-		last_seen DATETIME,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		server_map_lat REAL NOT NULL DEFAULT 0,
-		server_map_lon REAL NOT NULL DEFAULT 0,
-		UNIQUE(ip_address, port)
-	);
-	INSERT INTO nodes_new (id,name,mode,ip_address,port,protocol,is_approved,sync_interval,status,cluster_token_hash,access_url,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,server_map_lat,server_map_lon)
-		SELECT id,name,mode,ip_address,port,protocol,is_approved,sync_interval,status,cluster_token_hash,COALESCE(access_url,''),registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,COALESCE(server_map_lat,0),COALESCE(server_map_lon,0) FROM nodes;
+	` + nodesRebuildDDL("nodes_new") + nodesRebuildCopySQL("nodes_new") + `
 	DROP TABLE nodes;
-	ALTER TABLE nodes_new RENAME TO nodes;`
-		if _, err := tx.Exec(rebuild); err != nil {
+	ALTER TABLE nodes_new RENAME TO nodes;`); err != nil {
 			return fmt.Errorf("rebuild nodes: %w", err)
 		}
 		return nil
@@ -3426,7 +3624,21 @@ func normalizeRuleTimestampsMigration() error {
 // WHERE 谓词与归一函数逐字对齐：enable_tls=1 即入选（CL-2，历史——
 // 此前要求证书材料非空会漏掉「TCP+enable_tls=1+双空证书」形态的存量行）。
 func migrateTCPRuleDeadFields() error {
-	res, err := DB.Exec(`UPDATE lb_rules SET
+	// 历史问题（历史）：清零与 cluster_version bump 必须同事务。此前两条
+	// 独立语句：bump 失败→启动失败，但清零已提交→下次启动 WHERE 不再命中→
+	// bump 永不发生（主从 canonical 分叉不收敛）。对照 TCP 绑定清理
+	// （migrateTCPRuleSecurityPolicyBindings）已在同一事务内完成删除+bump。
+	tx, err := DB.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin TCP dead-field cleanup: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	res, err := tx.Exec(`UPDATE lb_rules SET
 		host_header='', health_check_path='', enable_compress=0, compress_types='',
 		request_body_max_size_mb=0, upstream_keepalive_timeout=0, server_tokens_hidden=0, ntlm_compatible=0, upstream_force_http1=0,
 		enable_tls=0, tls_cert='', tls_key=''
@@ -3439,12 +3651,27 @@ func migrateTCPRuleDeadFields() error {
 	if err != nil {
 		return fmt.Errorf("failed to zero TCP dead fields: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to read zeroed TCP rule count: %w", err)
+	}
+	if affected > 0 {
 		// 快照缓存随版本失效；bump 让从端下一轮拉到归一后 canonical，
 		// rules 节哈希两侧收敛（「分区滞后」自愈）。
-		if _, err := DB.Exec(`UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1`); err != nil {
+		if _, err := tx.Exec(`UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1`); err != nil {
 			return fmt.Errorf("failed to bump cluster_version after TCP dead-field cleanup: %w", err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit TCP dead-field cleanup: %w", err)
+	}
+	committed = true
+	if affected > 0 {
+		// 历史问题：用户规则数据被改写须留痕（与 TCP stale DNS / legacy HTTPS /
+		// 孤儿 upstream 三个姊妹迁移同口径，聚合一行+计数）。
+		detail := fmt.Sprintf("存量 TCP 规则 HTTP 专属死字段已清零：%d 条（主端库/导出 canonical/从端落库三面同值）", affected)
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "系统配置", detail)
 	}
 	return nil
 }

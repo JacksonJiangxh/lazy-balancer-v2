@@ -82,6 +82,12 @@ func migrateLegacyCertJobLogs(legacyRoot, target string) {
 
 const maxRotatedFiles = 5
 
+// CertJobLogMaxRotatedFiles 导出证书任务日志写侧的保留份数契约（H-B1-08，
+// 历史）：handlers 的 logRotatedBackups 与展示层必须与写侧同源——此前
+// 靠测试读取本文件源码文本（`const maxRotatedFiles = 5`）钉住，改注释/加类型
+// 声明即误红，且第三个 writer 出现时漏验。导出 getter 让契约以数值断言。
+func CertJobLogMaxRotatedFiles() int { return maxRotatedFiles }
+
 // certJobLogWarnf 是轮转失败告警的测试接缝（var 而非直接 log.Printf，镜像
 // finalizeTimeout 等先例：测试捕获告警调用，生产代码不得改写）。
 var certJobLogWarnf = log.Printf

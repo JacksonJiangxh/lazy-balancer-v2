@@ -11,6 +11,9 @@ import { readFileSync } from 'node:fs'
 
 import { canSaveIpList, needsEmptyListConfirm } from '../src/utils/ipListSaveGuard.ts'
 import { formatIpListEntryLine, parseIpListEntryLine } from '../src/utils/ipListCsv.ts'
+// 审计 87 WEBT-02：注入本测试自己的 IPv4-only 正则会让「IPv6 CIDR」被文档化成
+// 非法值，与生产注入的 isValidCidr（SecurityRules.vue CSV 导入）语义相反。
+import { isValidCidr } from '../src/utils/ruleValidation.ts'
 import {
   ensureSharedEntries,
   invalidateSharedEntriesCache,
@@ -33,8 +36,6 @@ test('规则流程只拉本规则阶段 0 策略的信任引用（历史问题�
   assert.match(src, /if \(!boundTrustPolicyIds\.has\(pol\.id\)\) continue/)
 })
 
-const isIp = (value: string): boolean => /^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/.test(value)
-
 test('A 保存守卫：加载中/失败两种形态均禁止保存', () => {
   assert.equal(canSaveIpList(false, false), true)
   assert.equal(canSaveIpList(true, false), false, '详情在途：entries 为空，禁止保存')
@@ -53,14 +54,14 @@ test('C1 CSV 往返：备注含逗号/引号逐字相等', () => {
   const remark = '备注,含逗号"和引号"'
   const line = formatIpListEntryLine(value, remark)
   assert.equal(line, '10.0.0.1,"备注,含逗号""和引号"""')
-  assert.deepEqual(parseIpListEntryLine(line, isIp), { value, remark })
+  assert.deepEqual(parseIpListEntryLine(line, isValidCidr), { value, remark })
 })
 
 test('C2 二次往返不累积漂移', () => {
   let remark = 'a,"b",c'
   let line = formatIpListEntryLine('192.168.1.0/24', remark)
   for (let i = 0; i < 3; i++) {
-    const parsed = parseIpListEntryLine(line, isIp)
+    const parsed = parseIpListEntryLine(line, isValidCidr)
     assert.ok(parsed)
     assert.equal(parsed.remark, remark)
     line = formatIpListEntryLine(parsed.value, parsed.remark)
@@ -68,32 +69,48 @@ test('C2 二次往返不累积漂移', () => {
 })
 
 test('C3 旧格式（无引号、逗号/空白分隔）保持兼容', () => {
-  assert.deepEqual(parseIpListEntryLine('10.0.0.1,普通备注', isIp), { value: '10.0.0.1', remark: '普通备注' })
-  assert.deepEqual(parseIpListEntryLine('10.0.0.1 普通备注', isIp), { value: '10.0.0.1', remark: '普通备注' })
-  assert.deepEqual(parseIpListEntryLine('10.0.0.1', isIp), { value: '10.0.0.1', remark: '' })
-  assert.deepEqual(parseIpListEntryLine('2001:db8::/32', isIp), null, '非法值由注入校验拒绝')
+  assert.deepEqual(parseIpListEntryLine('10.0.0.1,普通备注', isValidCidr), { value: '10.0.0.1', remark: '普通备注' })
+  assert.deepEqual(parseIpListEntryLine('10.0.0.1 普通备注', isValidCidr), { value: '10.0.0.1', remark: '普通备注' })
+  assert.deepEqual(parseIpListEntryLine('10.0.0.1', isValidCidr), { value: '10.0.0.1', remark: '' })
+  // 审计 87 WEBT-02：IPv6 CIDR 是生产校验器的合法输入（isValidCidr 走 isValidIpv6，
+  // prefix≤128）——原测试用 IPv4-only 替身把它断言成非法值（假前提）。
+  assert.deepEqual(parseIpListEntryLine('2001:db8::/32', isValidCidr), { value: '2001:db8::/32', remark: '' })
+})
+
+test('C9 IPv6 导入往返与非法形态（审计 87 WEBT-02）', () => {
+  // 生产注入的真实校验器语义：合法 IPv6 CIDR/单地址可导入并逐字往返
+  for (const value of ['2001:db8::/32', '2001:db8::1', 'fe80::/10', '::1']) {
+    assert.equal(isValidCidr(value), true, `${value} 应为合法值`)
+    const line = formatIpListEntryLine(value, 'v6 备注')
+    assert.deepEqual(parseIpListEntryLine(line, isValidCidr), { value, remark: 'v6 备注' }, `${value} 往返漂移`)
+  }
+  // 非法 IPv6：超界 prefix / 非法字符 / 双斜杠
+  for (const value of ['2001:db8::/129', '::gg', '2001:db8::/32/1', '10.0.0.256']) {
+    assert.equal(isValidCidr(value), false, `${value} 应为非法值`)
+    assert.equal(parseIpListEntryLine(`${value},备注`, isValidCidr), null, `${value} 必须被拒绝`)
+  }
 })
 
 test('C4 畸形行：未闭合引号/空值返回 null（导入计数为非法，不静默吞）', () => {
-  assert.equal(parseIpListEntryLine('"10.0.0.1', isIp), null)
-  assert.equal(parseIpListEntryLine(',remark', isIp), null)
-  assert.equal(parseIpListEntryLine('   ', isIp), null)
-  assert.equal(parseIpListEntryLine('10.0.0.1,"未闭合', isIp), null)
+  assert.equal(parseIpListEntryLine('"10.0.0.1', isValidCidr), null)
+  assert.equal(parseIpListEntryLine(',remark', isValidCidr), null)
+  assert.equal(parseIpListEntryLine('   ', isValidCidr), null)
+  assert.equal(parseIpListEntryLine('10.0.0.1,"未闭合', isValidCidr), null)
 })
 
 test('C5 引号包裹的 IP 字段（外部 CSV 工具产物）可解析', () => {
-  assert.deepEqual(parseIpListEntryLine('"10.0.0.2","备注"', isIp), { value: '10.0.0.2', remark: '备注' })
+  assert.deepEqual(parseIpListEntryLine('"10.0.0.2","备注"', isValidCidr), { value: '10.0.0.2', remark: '备注' })
 })
 
 test('C6 多行备注导出归一为空格——导入端按行切分，往返不丢备注（历史问题-11）', () => {
   const line = formatIpListEntryLine('10.0.0.1', '第一行\r\n第二行')
   assert.equal(line, '10.0.0.1,第一行 第二行')
-  const parsed = parseIpListEntryLine(line, isIp)
+  const parsed = parseIpListEntryLine(line, isValidCidr)
   assert.deepEqual(parsed, { value: '10.0.0.1', remark: '第一行 第二行' })
 })
 
 test('C7 备注按 Unicode code point 截断 100，不产生半个代理对（历史问题-15）', () => {
-  const parsed = parseIpListEntryLine(`10.0.0.1,${'😀'.repeat(100)}尾`, isIp)
+  const parsed = parseIpListEntryLine(`10.0.0.1,${'😀'.repeat(100)}尾`, isValidCidr)
   assert.ok(parsed)
   assert.equal(Array.from(parsed.remark).length, 100)
   assert.equal(parsed.remark, '😀'.repeat(100))
@@ -130,6 +147,47 @@ test('D 共享条目缓存：缺失才拉、并发去重、失败可重试、inv
   calls.length = 0
   await ensureSharedEntries([1], loader)
   assert.deepEqual(calls, [1])
+  invalidateSharedEntriesCache()
+})
+
+test('D3 代际竞态：失效后复用方必须按新代际补取，await 返回即已缓存（历史问题-02）', async () => {
+  invalidateSharedEntriesCache()
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const calls: string[] = []
+  // 首个调用发起请求（代际 g0），请求在途
+  const creator = ensureSharedEntries([7], async () => {
+    calls.push('old')
+    await gate
+    return ['10.0.0.7-old']
+  })
+  // 写动作：失效缓存并递增代际，随后 IP 处置链路立刻 ensure 同一名单
+  invalidateSharedEntriesCache()
+  const waiter = ensureSharedEntries([7], async () => {
+    calls.push('new')
+    return ['10.0.0.7-new']
+  })
+  release()
+  await Promise.all([creator, waiter])
+  // 等待者不得静默返回空缓存：跨代际在途请求不复用，按当前代际补取并落地
+  assert.deepEqual(sharedEntriesCache[7], ['10.0.0.7-new'])
+  assert.deepEqual(calls.sort(), ['new', 'old'])
+  invalidateSharedEntriesCache()
+})
+
+test('D4 失败语义不变：失败不补取、不留缓存（下次调用重试）', async () => {
+  invalidateSharedEntriesCache()
+  let calls = 0
+  const failing = async (): Promise<string[]> => {
+    calls += 1
+    throw new Error('boom')
+  }
+  await ensureSharedEntries([11], failing)
+  assert.equal(calls, 1, '失败一次即返回，调用方自行重试')
+  assert.equal(11 in sharedEntriesCache, false)
+  // 并发第二次调用在首次失败后（无在途）→ 再发起一次
+  await ensureSharedEntries([11], failing)
+  assert.equal(calls, 2)
   invalidateSharedEntriesCache()
 })
 

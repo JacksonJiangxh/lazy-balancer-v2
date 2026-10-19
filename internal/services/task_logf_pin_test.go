@@ -190,3 +190,63 @@ func TestTaskEngineWire_KindMapping(t *testing.T) {
 		t.Error("cert-waiting-ca 默认调度应关闭（LoopOn=false，续期扫描唤醒）")
 	}
 }
+
+// V87-TO-05③：runtimeLogFile 未打开（旋转写入器打开失败）时 log-cleanup
+// 整个 Run 体此前为空——任务监控恒绿却零动作、任务日志零行。必须留「未启用」行。
+func TestTaskLogf_LogCleanupDisabledWhenRuntimeLogFileMissing(t *testing.T) {
+	// runtimeLogFile 为空=旋转写入器打开失败的真实形态；InitTaskEngine 会按
+	// 生产默认 /app/logs 派生任务日志目录，故引擎装配后再把任务日志目录指回
+	// 临时目录（TaskLogPath 为读时取值）。
+	te := newWireTestEngineWithRuntimeLog(t, "")
+	newTaskLogDir(t)
+	if err := te.Trigger("log-cleanup", "manual", ""); err != nil {
+		t.Fatalf("trigger log-cleanup: %v", err)
+	}
+	log := readTaskLog(t, "log-cleanup")
+	if !strings.Contains(log, "未启用") {
+		t.Fatalf("运行日志文件未打开时必须留「未启用」留痕（此前 Run 体整段静默）: %q", log)
+	}
+}
+
+// V87-TO-10：失败轮任务日志不得写「清理完成」——task_runs 已落 failed，
+// 日志称完成会把排障方向带偏（metrics 库不可用/ctx 取消）。
+func TestTaskLogf_SecurityEventsRetentionFailureSaysFailed(t *testing.T) {
+	newTaskLogDir(t)
+	te := newWireTestEngine(t)
+	if err := db.InitializeMetricsDB(t.TempDir()); err != nil {
+		t.Fatalf("initialize metrics database: %v", err)
+	}
+	// 指标库表不可用 → 清理返回 err（真实失败面）
+	if _, err := db.MetricsDB.Exec(`ALTER TABLE security_events RENAME TO security_events_v87`); err != nil {
+		t.Fatal(err)
+	}
+	_ = te.Trigger("security-events-retention", "manual", "")
+	log := readTaskLog(t, "security-events-retention")
+	if !strings.Contains(log, "清理失败") {
+		t.Fatalf("失败轮缺失败摘要行: %q", log)
+	}
+	if strings.Contains(log, "清理完成") {
+		t.Fatalf("失败轮不得写「清理完成」（与 task_runs failed 语义冲突）: %q", log)
+	}
+}
+
+// V87-TO-10：孤儿规则指标清理同族。
+func TestTaskLogf_MetricsOrphanCleanupFailureSaysFailed(t *testing.T) {
+	newTaskLogDir(t)
+	te := newWireTestEngine(t)
+	if err := db.InitializeMetricsDB(t.TempDir()); err != nil {
+		t.Fatalf("initialize metrics database: %v", err)
+	}
+	// 主库存活规则清单不可读 → PurgeOrphanMetricsHistory 返回 err
+	if _, err := db.DB.Exec(`ALTER TABLE lb_rules RENAME TO lb_rules_v87`); err != nil {
+		t.Fatal(err)
+	}
+	_ = te.Trigger("metrics-orphan-cleanup", "manual", "")
+	log := readTaskLog(t, "metrics-orphan-cleanup")
+	if !strings.Contains(log, "清理失败") {
+		t.Fatalf("失败轮缺失败摘要行: %q", log)
+	}
+	if strings.Contains(log, "清理完成") {
+		t.Fatalf("失败轮不得写「清理完成」（与 task_runs failed 语义冲突）: %q", log)
+	}
+}

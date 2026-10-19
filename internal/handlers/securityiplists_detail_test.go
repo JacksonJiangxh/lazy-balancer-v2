@@ -238,6 +238,11 @@ func TestExportIPList_threatUsesFileTruth(t *testing.T) {
 	if got, want := resp.Body.String(), "192.0.2.0/24\n198.51.100.7\n"; got != want {
 		t.Fatalf("threat export=%q, want file truth %q (stale DB entries must be ignored)", got, want)
 	}
+	// HC-09（历史）：文件名恒为「名单 ID」形态（此前 name 非空只作条件，
+	// 实际仍用 id，死分支误导）。
+	if got, want := resp.Header().Get("Content-Disposition"), `attachment; filename="ip-list-`+strconv.FormatInt(id, 10)+`.txt"`; got != want {
+		t.Fatalf("Content-Disposition=%q, want %q", got, want)
+	}
 }
 
 func TestExportIPList_corruptEntriesReturns500(t *testing.T) {
@@ -387,4 +392,33 @@ func threatSystemListNameForOrderTest(t *testing.T) string {
 		t.Fatalf("threat list missing: %v", err)
 	}
 	return name
+}
+
+// HC-09（历史）：导出文件名恒取**库内行 ID**。此前以 name 非空作条件
+// 却仍用路由段经 safeAtoiOrZero 折算——名称从不参与文件名（死分支），且非规范
+// 路由段 "<id>.0"（SQLite INTEGER 亲和命中该行）会导出成 ip-list-0.txt。
+func TestExportIPList_filenameUsesListRowID(t *testing.T) {
+	newBackupTestHandlers(t)
+	res, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, entries) VALUES ('导出命名', '[{"value":"198.51.100.1","remark":""}]')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists/:id/export", h.ExportIPList)
+	// 非规范路由段仍命中该行（亲和），文件名必须回到真实行 ID
+	path := "/security/ip-lists/" + strconv.FormatInt(id, 10) + ".0/export"
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, path, nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", resp.Code, resp.Body.String())
+	}
+	want := `attachment; filename="ip-list-` + strconv.FormatInt(id, 10) + `.txt"`
+	if got := resp.Header().Get("Content-Disposition"); got != want {
+		t.Fatalf("Content-Disposition=%q, want %q（文件名须取库内行 ID，名称不参与）", got, want)
+	}
 }

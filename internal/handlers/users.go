@@ -34,8 +34,8 @@ func (h *Handlers) ListUsers(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
 			return
 		}
-		response := models.NewUserResponse(u)
-		response.MFAEnabled = mfaEnabled == 1
+		// CI87-08：mfa_enabled 由构造器单源填充，删除手工补字段。
+		response := models.NewUserResponse(u, mfaEnabled == 1)
 		response.AuthProvider = authProvider
 		users = append(users, response)
 	}
@@ -306,8 +306,7 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	} else {
 		recordAudit(c, "更新", "用户", services.FormatAuditDetail(services.AuditUserPart(id, user.Username), fmt.Sprintf("变更：%s", strings.Join(changed, "、"))))
 	}
-	response := models.NewUserResponse(user)
-	response.MFAEnabled = mfaEnabled == 1
+	response := models.NewUserResponse(user, mfaEnabled == 1)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "用户更新成功", Data: response})
 }
 

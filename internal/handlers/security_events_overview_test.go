@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -1161,5 +1162,54 @@ func TestListSecurityEvents_disclosesIngestionHealth(t *testing.T) {
 	got := payload.Data.Ingestion
 	if !got.Observed || got.Healthy || got.ConsecutiveFailures != 3 || got.LastError == "" {
 		t.Fatalf("ingestion=%+v, want unhealthy snapshot with error", got)
+	}
+}
+
+// HC-10（历史）：列表投影在 SQL 侧只取「截断上限 +1 字符」探针，Go 侧
+// 仍追加同一截断标记——响应形态不变，但 DB→进程传输不再是大字段全量
+// （100 行 × 64KB/字段）。SUBSTR 按字符计，多字节值不得被切断成非法 UTF-8。
+func TestListSecurityEvents_largeFieldsCappedWithMarker(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	router := gin.New()
+	// 管理视角：服务端脱敏对 admin 不触发（否则 request_body 恒空、无法断言截断）。
+	router.GET("/security/events", func(c *gin.Context) { c.Set("role", "admin") }, h.ListSecurityEvents)
+
+	ascii := strings.Repeat("a", 20*1024)
+	multibyte := strings.Repeat("中", 7000) // 21000 字节 > 16KB 上限
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, action, request_headers, request_body)
+		VALUES ('2026-10-19 10:00:00','198.51.100.9','blocked',?,?)`, ascii, multibyte); err != nil {
+		t.Fatalf("seed event: %v", err)
+	}
+
+	recorder := getRequest(t, router, "/security/events")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Events []models.SecurityEvent `json:"events"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode events: %v", err)
+	}
+	if len(payload.Data.Events) != 1 {
+		t.Fatalf("events=%d, want 1", len(payload.Data.Events))
+	}
+	event := payload.Data.Events[0]
+	if got, want := event.RequestHeaders, strings.Repeat("a", securityEventListFieldCap)+"\n...[TRUNCATED]"; got != want {
+		t.Fatalf("request_headers len=%d, want 上限+标记（%d）", len(got), len(want))
+	}
+	if !strings.HasSuffix(event.RequestBody, "\n...[TRUNCATED]") {
+		t.Fatalf("request_body lacks truncation marker (len=%d)", len(event.RequestBody))
+	}
+	trimmed := strings.TrimSuffix(event.RequestBody, "\n...[TRUNCATED]")
+	if trimmed != strings.Repeat("中", len(trimmed)/len("中")) || !utf8.ValidString(trimmed) {
+		t.Fatalf("request_body 截断必须落在字符边界且不超上限，len=%d", len(trimmed))
+	}
+	if len(trimmed) > securityEventListFieldCap {
+		t.Fatalf("request_body 截断后 len=%d > cap=%d", len(trimmed), securityEventListFieldCap)
 	}
 }

@@ -147,8 +147,9 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	// 精确判定:len(ID)==16(coraza tx.ID,randomString(16))或 status==429
 	// (限流,caddyhttp.Error 生成 9 字符 ID)——覆盖安全拦截全部,排除
 	// proxy 499/request_body 413/其他 caddyhttp.Error 4xx(全 9 字符)。
-	// 脆弱点:coraza 若改 tx.ID 长度→断;但 v2.x 一直 16 且 coraza 由
-	// Dockerfile pin+构建断言控制——可控。
+	// 脆弱点:coraza 若改 tx.ID 长度→断;但 v2.x 一直 16,且 coraza 版本由
+	// go.mod pin(v3.8.1)+Dockerfile 构建断言(区间 [v3.8.1,v3.9),PL历史问题)
+	// 双重控制——可控。
 	isSecurityBlock = err != nil && errors.As(err, &herr) &&
 		herr.StatusCode >= 400 && herr.StatusCode < 500 &&
 		(len(herr.ID) == 16 || herr.StatusCode == http.StatusTooManyRequests)

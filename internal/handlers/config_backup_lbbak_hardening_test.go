@@ -54,10 +54,11 @@ func TestLbbakImport_xdbFailurePreservesAppliedCrsRecord(t *testing.T) {
 			if err := os.Mkdir(xdbPath+".version", 0o755); err != nil {
 				t.Fatal(err)
 			}
-			backup := r41BackupJSON(t, []string{"security"}, map[string][]map[string]any{
+			backup := buildBackup(t, backupFixtureOptions{Sections: []string{"security"}, Tables: map[string][]map[string]any{
 				"security_crs_version":       {{"id": 1, "version": "v4.29.0", "auto_update": 1}},
 				"security_ip2region_version": {{"id": 1, "version": "xdb-backup", "auto_update": 1}},
-			}, nil)
+			}, Config: nil})
+
 			payload, err := buildLbbakPayload([]byte(backup), bundle)
 			if err != nil {
 				t.Fatal(err)
@@ -112,9 +113,11 @@ func TestLbbakImport_threatCompileFailurePreservesLiveIplist(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET updated_at='2020-01-01 00:00:00' WHERE name='ustc'`); err != nil {
 		t.Fatal(err)
 	}
-	body := buildLbbakWithExtraThreatEntry(t, completeBackupJSON(t, map[string][]map[string]any{
+	body := buildLbbakWithExtraThreatEntry(t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_threat_sources": {{"name": "ustc", "display_name": "USTC", "url": "https://blackip.ustc.edu.cn/list.php?txt", "format": "plain", "update_enabled": 1, "apply_enabled": 1, "updated_at": "2030-01-01 00:00:00"}},
-	}), []byte("203.0.113.1\n"))
+	}, EmptyConfigIfNil: true}),
+
+		[]byte("203.0.113.1\n"))
 
 	// When the threat component fails during lbbak import.
 	response := postLbbakImport(g, t, body, "")
@@ -151,9 +154,11 @@ func TestLbbakImport_threatOnlyCommitFailureWarnsFileLanded(t *testing.T) {
 	restore := services.OverrideThreatWafDirForTest(wafDir)
 	t.Cleanup(restore)
 	h.caddyService.SetCLIValidatorForTest(func([]byte) error { return errors.New("cli: reject threat-only import") })
-	body := buildLbbakWithExtraThreatEntry(t, completeBackupJSON(t, map[string][]map[string]any{
+	body := buildLbbakWithExtraThreatEntry(t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_threat_sources": {{"name": "ustc", "display_name": "USTC", "url": "https://blackip.ustc.edu.cn/list.php?txt", "format": "plain", "update_enabled": 1, "apply_enabled": 1}},
-	}), []byte("203.0.113.7\n"))
+	}, EmptyConfigIfNil: true}),
+
+		[]byte("203.0.113.7\n"))
 
 	// When the files land but the transaction fails.
 	response := postLbbakImport(g, t, body, "")

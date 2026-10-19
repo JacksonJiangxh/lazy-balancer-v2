@@ -29,9 +29,9 @@ const ownershipFileName = "acme_dns_ownership.json"
 
 // staleOwnershipAge is the age beyond which an ownership entry can no longer
 // belong to a live issuance: the CA queue caps execution at 60 minutes and the
-// deferred cleanup window adds 2 more, so anything older is provably abandoned
-// and may be removed by any later cleanup without endangering a concurrent
-// challenge.
+// deferred cleanup budget is capped at 8 minutes (acme dnsCleanupBudgetMax,
+// DNS-87-F4), so anything older is provably abandoned and may be removed by any
+// later cleanup without endangering a concurrent challenge.
 const staleOwnershipAge = 75 * time.Minute
 
 var fileMu sync.Mutex
@@ -79,6 +79,12 @@ func New(dataDir string) (*Store, error) {
 // snapshot. It deliberately shares fileMu and the same atomic writer as Store
 // mutations so a snapshot apply cannot overwrite a concurrent Add/Remove.
 func Replace(dataDir string, data []byte) error {
+	// DNS-87-F6（历史）：先取锁再做任何准备工作（解码/建目录）——锁前
+	// 的准备会给「Replace 确实共用 fileMu」的并发测试留下假绿窗口：goroutine
+	// 还没走到加锁点，固定等待就静默通过，断言变成空断言。锁内解码的代价
+	// 可忽略（快照为单文件、签发级频次）。
+	fileMu.Lock()
+	defer fileMu.Unlock()
 	var snapshot state
 	if err := json.Unmarshal(data, &snapshot); err != nil {
 		return fmt.Errorf("decode DNS ownership snapshot: %w", err)
@@ -90,8 +96,6 @@ func Replace(dataDir string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	fileMu.Lock()
-	defer fileMu.Unlock()
 	if existing, readErr := os.ReadFile(store.path); readErr == nil && bytes.Equal(existing, data) {
 		return nil
 	}
@@ -205,7 +209,10 @@ func (s *Store) load() (state, error) {
 		// brick all DNS-01 issuance) until manual deletion. The quarantined
 		// file stays on disk for inspection; only a failed quarantine (bytes
 		// not preserved) keeps returning the error.
-		quarantined := fmt.Sprintf("%s.corrupt-%d", s.path, time.Now().Unix())
+		// DNS-87-F11（历史）：文件名原为秒级时间戳，同一秒内二次损坏会被
+		// os.Rename 覆盖（POSIX rename 语义）而丢失上一份取证样本——改为
+		// 纳秒时间戳 + 冲突探测。
+		quarantined := s.quarantinePath()
 		if err := os.Rename(s.path, quarantined); err != nil {
 			return state{}, fmt.Errorf("quarantine DNS ownership %s: %w", s.path, errors.Join(decodeErr, err))
 		}
@@ -213,6 +220,29 @@ func (s *Store) load() (state, error) {
 		return state{Version: 1}, nil
 	}
 	return current, nil
+}
+
+// corruptClock 是隔离文件名的时间源（DNS-87-F11 测试接缝：固定时钟下连续两次
+// 隔离必须产生两份独立样本）。生产代码不得改写。
+var corruptClock = time.Now
+
+// quarantinePath 返回一个未被占用的隔离文件名：纳秒时间戳为基底，冲突时追加
+// 递增序号（os.Stat 探测为 best-effort，命中竞态时由 Rename 的覆盖语义兜底，
+// 仅为取证样本，不参与业务判定）。
+func (s *Store) quarantinePath() string {
+	stamp := corruptClock().UnixNano()
+	for suffix := 0; ; suffix++ {
+		candidate := fmt.Sprintf("%s.corrupt-%d", s.path, stamp)
+		if suffix > 0 {
+			candidate = fmt.Sprintf("%s.corrupt-%d-%d", s.path, stamp, suffix)
+		}
+		if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate
+		} else if err != nil {
+			// 无法探测（权限等）：交给 Rename 报错，不在此吞掉。
+			return candidate
+		}
+	}
 }
 
 func (s *Store) save(current state) error {

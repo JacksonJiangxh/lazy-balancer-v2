@@ -281,18 +281,28 @@ func (h *Handlers) RetryCertJob(c *gin.Context) {
 // TriggerSystemTask 的 cert-job 行触发分支共用——用户裁定 cert-job 行视为
 // 触发任务（可自动调度即可手动调度，证书可重签发）。
 func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
+	// 历史问题-01（历史）：导入窗口门与任务监控 toggle/control 同源。
+	// 导入会话持 db.DB 写事务直至 commit，且 CA 队列已 PauseAndDrain——此处的
+	// UPDATE（部署窗推进/重入队）要么阻塞在 SQLite 写锁上到 busy_timeout 后
+	// 500，要么提交后落到已被全量替换的 cert_jobs 行上，绕过导入的暂停/排空
+	// 契约。409 fast-fail（拒绝重试是幂等可重试语义，不改变任何任务状态），
+	// 两个入口（RetryCertJob / TriggerSystemTask 的 cert-job 分支）共用本核心。
+	if configImportBusy() {
+		c.JSON(http.StatusConflict, models.APIResponse{Code: http.StatusConflict, Message: "配置导入进行中，暂不能重试证书任务"})
+		return
+	}
 	operationLock := certJobOperationLock(id)
 	operationLock.Lock()
 	defer operationLock.Unlock()
 	var ruleID, domain, status string
 	var caProviderID int
-	var updatedAt sql.NullTime
-	err := db.DB.QueryRow("SELECT rule_id, domain, status, updated_at, COALESCE(ca_provider_id,0) FROM cert_jobs WHERE id=?", id).Scan(&ruleID, &domain, &status, &updatedAt, &caProviderID)
+	var updatedAt, createdAt sql.NullTime
+	err := db.DB.QueryRow("SELECT rule_id, domain, status, updated_at, created_at, COALESCE(ca_provider_id,0) FROM cert_jobs WHERE id=?", id).Scan(&ruleID, &domain, &status, &updatedAt, &createdAt, &caProviderID)
 	if dbQueryNotFound(c, err, "任务不存在", "RetryCertJob query job") {
 		return
 	}
 
-	if blocked, statusCode, message := certJobRetryBlocked(status, updatedAt, time.Now()); blocked {
+	if blocked, statusCode, message := certJobRetryBlocked(status, updatedAt, createdAt, time.Now()); blocked {
 		c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
 		return
 	}
@@ -303,16 +313,19 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	// 重排部署重试；仅「无材料」的 downloaded（历史脏行）才回落重新签发。
 	if rescheduled, err := rescheduleDownloadedCertJobDeployment(id, ruleID, domain); err != nil {
 		if errors.Is(err, services.ErrCertificateDeploymentRetryBusy) {
-			c.JSON(http.StatusConflict, models.APIResponse{Code: http.StatusConflict, Message: "上一次部署回调仍在退出中，请稍后重试"})
+			c.JSON(http.StatusConflict, models.APIResponse{Code: http.StatusConflict, Message: "上一次部署回调仍在退出中，已登记自动部署，稍后自动执行"})
 			return
 		}
 		if errors.Is(err, services.ErrCertificateQueueInactive) {
 			status, message := certEnqueueErrorResponse("部署重试未触发", err)
+			// 历史问题（历史）：失败响应必须点明 DB 真实状态——部署窗口已
+			// 推进到 now，服务恢复后补扫会自动部署（不是「什么都没发生」）。
+			message += "；已登记自动部署，恢复后自动执行"
 			c.JSON(status, models.APIResponse{Code: status, Message: message})
 			return
 		}
 		services.Logf("error", "Manual deployment retry failed for job %d: %v", id, err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to enqueue retry"})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to enqueue retry; 已登记自动部署，稍后自动执行"})
 		return
 	} else if rescheduled {
 		recordAudit(c, "重试", "证书任务", services.FormatAuditDetail(services.AuditJobPart(id), services.AuditRulePart(ruleID), domain, fmt.Sprintf("原状态：%s", status), services.AuditResultPart("deployment_retry")))
@@ -418,6 +431,13 @@ func rescheduleDownloadedCertJobDeployment(id int, ruleID, domain string) (bool,
 	// deployment_available_after=now 仍可供服务恢复后的补扫接管；但只有实际
 	// 登记了立即 timer 才允许上层报告「已触发」，停止/忙状态必须返回 409。
 	if err := services.RetryCertificateDeploymentNow(id, ruleID); err != nil {
+		// 历史问题（历史）：立即 timer 登记失败时上方 UPDATE 已把消息写成
+		// 「手动重试：等待恢复部署」，与 409/500 响应矛盾（报文说失败、DB 说
+		// 已重排）。窗口推进保留（启动恢复/周期补扫会接手，可用性收益不变），
+		// 文案改为如实描述自动接管；响应侧同步点明「已登记自动部署」。
+		if _, updateErr := db.DB.Exec(`UPDATE cert_jobs SET message=?, updated_at=datetime('now') WHERE id=? AND status='downloaded'`, "手动重试未触发，等待自动部署", id); updateErr != nil {
+			return true, errors.Join(err, updateErr)
+		}
 		return true, err
 	}
 	return true, nil
@@ -442,13 +462,21 @@ func certJobRetryCooldown(status string) (time.Duration, bool) {
 
 // certJobRetryBlocked 返回任务是否被重试门拦截，以及应返回的 HTTP 状态码。
 // 429 =「稍后重试可成功」（执行中/冷却），409 =「永久条件不可重试」（已退役）。
-func certJobRetryBlocked(status string, updatedAt sql.NullTime, now time.Time) (bool, int, string) {
+func certJobRetryBlocked(status string, updatedAt, createdAt sql.NullTime, now time.Time) (bool, int, string) {
 	cooldown, retryable := certJobRetryCooldown(status)
 	if !retryable {
 		// 历史问题（历史）：永久条件不得用 429（SDK/前端会按限流退避轮询）。
 		return true, http.StatusConflict, "已退役的证书任务不能重试"
 	}
-	if !updatedAt.Valid || cooldown == 0 || now.Sub(updatedAt.Time) >= cooldown {
+	// 历史问题（历史）：cert_jobs.updated_at 在 DDL 中可空（历史行/带外插入可
+	// 为 NULL），此前 NULL 直接放行冷却门（fail-open）——连点可连续绕过 15/5
+	// 分钟冷却、放大 CA 配额消耗。回退 created_at 计算；两列都缺失时 fail-
+	// closed（视为刚更新，按冷却拒绝），避免不可归因的即时重试。
+	reference := updatedAt
+	if !reference.Valid {
+		reference = createdAt
+	}
+	if cooldown == 0 || (reference.Valid && now.Sub(reference.Time) >= cooldown) {
 		return false, 0, ""
 	}
 	if status == "failed" {
@@ -518,7 +546,17 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 	h.caddyOpMu.Lock()
 	operationLock := certJobOperationLock(id)
 	operationLock.Lock()
-	defer operationLock.Unlock()
+	// 历史问题（历史 历史问题）：per-job 锁改为手动配对——失败恢复分支必须在不持有
+	// operationLock 的前提下重取 caddyOpMu（锁序铁律：先 caddyOpMu 后
+	// operationLock，见恢复点注释），defer 只能通过本闭包释放。
+	operationLockHeld := true
+	releaseOperationLock := func() {
+		if operationLockHeld {
+			operationLock.Unlock()
+			operationLockHeld = false
+		}
+	}
+	defer releaseOperationLock()
 	var ruleID, domain, status, certPEM, keyPEM string
 	var caProviderID int
 	if err := db.DB.QueryRow("SELECT rule_id, domain, status, COALESCE(ca_provider_id,0), COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id = ?", id).Scan(&ruleID, &domain, &status, &caProviderID, &certPEM, &keyPEM); err != nil {
@@ -596,8 +634,9 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 	// 互斥）；顺序对调（删除→取消）依据：worker 全部状态迁移按旧态 CAS 且
 	// from 列表排除 'disabled'，删除窗内在途执行不可能复活/改写行；取消先于
 	// 失败恢复路径（CancelJob 会清 pending 并取消部署重试——先恢复后取消会把
-	// 恢复重入队的条目清掉，恢复语义要求先取消）。per-job operationLock 仍
-	// 全程持有：等待期间同任务 Retry/重复 Delete 保持互斥。
+	// 恢复重入队的条目清掉，恢复语义要求先取消）。per-job operationLock 在
+	// 取消等待期间仍持有：等待期间同任务 Retry/重复 Delete 保持互斥；失败
+	// 恢复点按 历史问题 锁序（先 caddyOpMu 后 operationLock）释放并按规范顺序重取。
 	result, err = db.DB.Exec("DELETE FROM cert_jobs WHERE id = ?", id)
 	h.caddyOpMu.Unlock()
 	cancelCertJob(id)
@@ -607,7 +646,18 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 		//（无 CAS 写，历史问题 S-3）互斥需持锁；重取窗口内 EnableRule 可见 disabled
 		// 行并 Resume——恢复 CAS（status='disabled'）0 行命中→「恢复已跳过」
 		// 并入 deleteErr（500 如实呈现，删除本就失败；行存活+启用=一致终态）。
+		// 历史问题（历史 历史问题）：锁序铁律=先 caddyOpMu 后 operationLock（与入口
+		// 同序）。此处若在持 operationLock 时反向取 caddyOpMu，与同 id 连点/同桶
+		// （id%64）并发删除构成 AB-BA：对方先取到 caddyOpMu 后在桶锁排队 → 双向
+		// 互等，且 caddyOpMu 被永久占用（规则/配置写、Caddy 启停、证书部署
+		// reload 全部挂起，只能重启进程）。恢复写与 EnableRule 的
+		// EnableCertJobCreate（无 CAS 写）互斥仍需 caddyOpMu：先释放 per-job 锁
+		// 再按规范顺序重取——窗口内同任务 Retry 对 disabled 恒 409、重复 Delete
+		// 走 CAS 0 行的「已被并发移离 disabled」归因，语义自洽。
+		releaseOperationLock()
 		h.caddyOpMu.Lock()
+		operationLock.Lock()
+		operationLockHeld = true
 		if deleteCertJobPreRestoreHook != nil {
 			deleteCertJobPreRestoreHook(id)
 		}

@@ -16,7 +16,7 @@ import {
 } from '@/utils/threatProjection'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
-import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation } from '@/utils/threatShared'
+import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, hasProvinceStats, drillCommitAllowed } from '@/utils/threatShared'
 import { COUNTRY_CENTROIDS, FALLBACK_CENTROID, type Centroid } from '@/utils/countryCentroids'
 import { loadAdmin1Tables } from '@/utils/admin1Loader'
 import { FLOW_ATTACK_COLOR as ATTACK_COLOR, FLOW_NORMAL_COLOR as NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowAttackWidth, flowNormalWidth } from '@/utils/threatTheme'
@@ -248,7 +248,9 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   let worldDots: Dot[] | null = null
-  /** 经度分桶（12°/桶）：下钻衬底每帧只遍历视口命中桶（原全量 ~1.3 万点/帧）。 */
+  /** 归一国家名 → 世界点阵索引：hover/下钻衬底按国家直接取点，免全量扫描。
+   *  （原注释误称「经度分桶、视口只遍历命中桶」——从未分桶，视口裁剪由消费方
+   *  逐点按 wrapDeg/halfW 判定。） */
   let worldDotsByKey: Map<string, Dot[]> | null = null
   let provinceDots: Dot[] | null = null
   // 与地球版同源：0.95° 错列网格、加大点径以匹配地球 5px/10px 的视觉尺寸。
@@ -337,13 +339,11 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   // ---- 静态层 ----
   let staticDirty = true
 
-  /** 视口可见世界范围（经度 wrap 归一、纬度截断）。 */
-  function visibleWorldBox(): { minLon: number; maxLon: number; minLat: number; maxLat: number } {
-    const halfW = cam.width / 2 / cam.zoom
+  /** 视口可见世界的纬度范围（纵向截断）。经度不在此返回：两处消费方都以
+   *  「wrapDeg(点经度-camX) ≤ halfW」逐点判定，横向范围从未被消费。 */
+  function visibleWorldBox(): { minLat: number; maxLat: number } {
     const halfH = cam.height / 2 / cam.zoom
     return {
-      minLon: cam.camX - halfW,
-      maxLon: cam.camX + halfW,
       minLat: Math.max(LAT_BOTTOM, yToLat(cam.camY + halfH)),
       maxLat: Math.min(LAT_TOP, yToLat(cam.camY - halfH)),
     }
@@ -661,7 +661,8 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       : Math.min(WORLD_D - visH / 2, Math.max(visH / 2, latToY(clat)))
     // 中国走内置高精度表（无需异步）；其余国家按需加载省界 chunk。
     const provinces = await loadProvinceRows(country)
-    if (seq !== drillSeq || disposed) return // 加载期间又点击了别国/返回/退出大屏 → 丢弃
+    // 加载期间又点击了别国/返回/退出大屏 → 丢弃（与地球引擎共用判定单源）
+    if (!drillCommitAllowed(seq, drillSeq, disposed)) return
     // 无省层数据（含加载失败）：不进入下钻、不切换提示/返回按钮——
     // 原实现先 flyTo+onDrillChange 再发现无数据，画面成「被选国家空洞」。
     if (!provinces || provinces.length === 0) return
@@ -1028,7 +1029,12 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
         for (const pv of drillProvinceData) {
           if (pointInPolys(geo.lon, geo.lat, pv.polys)) {
             hoverName = pv.name
-            hoverTip.textContent = `${shortName(pv.name)} ${provinceCounts.get(shortName(pv.name)) ?? provinceCounts.get(pv.name) ?? 0}`
+            const short = shortName(pv.name)
+            // WT87-11：省级统计只覆盖中国（后端 threatLocationParts 仅对中国
+            // 取省）；海外下钻不得把「无数据源」渲染成「该省 0 次攻击」。
+            hoverTip.textContent = hasProvinceStats(drillLayerCountry)
+              ? `${short} ${provinceCounts.get(short) ?? provinceCounts.get(pv.name) ?? 0}`
+              : `${short} 无省级统计`
             break
           }
         }

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"os"
@@ -64,9 +65,31 @@ const minJWTSecretBytes = 32
 // 直接转 int 是未定义语义（巨值可能回绕成负数再被静默抬到下限），必须先判界。
 const metricsIntervalMax = 86400
 
-// jwtSecretStrongEnough 判定密钥是否满足最短长度。空串（未配置）不走本判定
-// ——文件通道会生成随机密钥。
-func jwtSecretStrongEnough(secret string) bool { return len(secret) >= minJWTSecretBytes }
+// minJWTSecretDistinctBytes 是密钥的最小不同字节数（熵下限）。仅长度检查会
+// 让 32 个空格、或单字符重复 32 次通过——HS256 密钥可预测等价于无签名
+// （JWT/OIDC state 可离线伪造）。随机 hex（64 字符）与正常口令短语都远高于
+// 该下限，只有明显退化的密钥形态被拒。
+const minJWTSecretDistinctBytes = 8
+
+// jwtSecretWeakness 返回密钥不合格的原因（空串=合格）。文件通道（生成随机
+// 64 位 hex）、环境变量通道与既有密钥文件校验共用本判据。
+func jwtSecretWeakness(secret string) string {
+	if len(secret) < minJWTSecretBytes {
+		return fmt.Sprintf("长度过短（%d 字节 < %d）", len(secret), minJWTSecretBytes)
+	}
+	distinct := make(map[byte]struct{}, minJWTSecretDistinctBytes)
+	for index := range len(secret) {
+		distinct[secret[index]] = struct{}{}
+		if len(distinct) >= minJWTSecretDistinctBytes {
+			return ""
+		}
+	}
+	return fmt.Sprintf("熵不足（仅 %d 个不同字节 < %d）", len(distinct), minJWTSecretDistinctBytes)
+}
+
+// jwtSecretStrongEnough 判定密钥是否满足最短长度与熵下限。空串（未配置）不走
+// 本判定——文件通道会生成随机密钥。
+func jwtSecretStrongEnough(secret string) bool { return jwtSecretWeakness(secret) == "" }
 
 // Load 加载运行配置：默认值 → 配置文件（仅 configFileKeys 支持的键）→ 环境变量。
 // 配置文件中的未知键逐条 log 告警后忽略；读取/解析失败同样可见（回退默认值）。
@@ -142,11 +165,19 @@ func Load(path string) *Config {
 				}
 				if v, ok := fileCfg["port"].(float64); ok {
 					// 历史问题-7（历史）：浮点截断不得静默——8000.9→8000 会让
-					// 「配置未生效」无从排查。
-					if v != math.Trunc(v) {
-						log.Printf("config: port %v is not an integer; truncated to %d", v, int(v))
+					// 「配置未生效」无从排查。CI87-10（历史）：与
+					// metrics_interval 同口径先判界再转换——1e300 之类巨值直接
+					// float→int 是实现相关结果（实测回绕成 MaxInt64），先转换
+					// 再回退会产生诡异日志与一次无意义的越界整数。
+					switch {
+					case math.IsNaN(v) || v < 1 || v > 65535:
+						log.Printf("config: port %v outside 1-65535; using default %d", v, 8000)
+					default:
+						if v != math.Trunc(v) {
+							log.Printf("config: port %v is not an integer; truncated to %d", v, int(v))
+						}
+						cfg.Port = int(v)
 					}
-					cfg.Port = int(v)
 				}
 				if v, ok := fileCfg["caddy_admin_url"].(string); ok && v != "" {
 					cfg.CaddyAdminURL = v
@@ -196,12 +227,12 @@ func Load(path string) *Config {
 	// restarts and the secret is never predictable.
 	if cfg.JWTSecret == "" {
 		cfg.JWTSecret = loadOrCreateJWTSecret(cfg.DataDir)
-	} else if !jwtSecretStrongEnough(cfg.JWTSecret) {
+	} else if reason := jwtSecretWeakness(cfg.JWTSecret); reason != "" {
 		// 历史问题-2：环境变量通道此前完全不校验长度（文件通道强制 ≥32 并再生）。
 		// env 是运维显式输入，不自动替换（替换会让所有令牌静默失效），只告警
-		// 可见；强度要求与文件通道同阈值。
-		log.Printf("config: JWT_SECRET 环境变量过短（%d 字节 < %d）——JWT HS256 与 OIDC state 签名强度不足，请改用 ≥%d 字节的随机密钥",
-			len(cfg.JWTSecret), minJWTSecretBytes, minJWTSecretBytes)
+		// 可见。CI87-09：判据增加熵下限——纯长度达标但形态可预测（空格/重复
+		// 字节）的密钥同样告警。
+		log.Printf("config: JWT_SECRET 环境变量强度不足——%s；JWT HS256 与 OIDC state 可被离线伪造，请改用 ≥%d 字节的高熵随机密钥", reason, minJWTSecretBytes)
 	}
 
 	// 历史问题 二十六次 W3-3：端口范围校验——port=0 会绑随机端口、>65535 只在
@@ -229,10 +260,11 @@ func loadOrCreateJWTSecret(dataDir string) string {
 			return string(data)
 		}
 		if len(data) > 0 {
-			// ADNS-N1（历史）：非空过短密钥的覆写必须可见——此前静默
+			// ADNS-N1（历史）：非空弱密钥的覆写必须可见——此前静默
 			// 重生成，旧令牌全部失效且零日志信号；与下方目录/写失败分支
 			// 及端口回退的可见性准则对齐。空文件等同未初始化，不告警。
-			log.Printf("JWT 密钥文件 %s 内容过短（%d 字节 < 32），已重新生成（旧令牌将失效）", secretPath, len(data))
+			// CI87-09：原因含长度或熵两类（"长度过短"/"熵不足"）。
+			log.Printf("JWT 密钥文件 %s 内容%s，已重新生成（旧令牌将失效）", secretPath, jwtSecretWeakness(string(data)))
 		}
 	} else if !os.IsNotExist(err) {
 		// 历史问题-5（历史）：文件存在但读取失败（瞬时 IO/ACL 形态）

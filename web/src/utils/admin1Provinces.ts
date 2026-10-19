@@ -259,9 +259,12 @@ export const ADMIN1_PROVINCES: Record<string, Admin1Province[]> = {
 // Natural Earth admin-1 以英文名/旧名分组，而 worldBorders / 后端 ip_location /
 // countryCentroids 用中文名：按中文键查省层必然落空（下钻仍 flyTo+onDrillChange，
 // 画面成「被选国家空洞」，与「无省层即不进入下钻」的语义冲突）。
-// 此表是唯一英文→中文别名源；导入期把别名键数据挂到中文键（原英文键保留，
-// 避免已按英文名分组的消费方断链）。测试 `threatCountryKeys.spec.ts` 全量断言
-// THREAT_COUNTRIES 每键（中国走 chinaProvinces 高精度表）均可命中。
+// 此表是唯一英文→中文别名源；导入期把别名键数据**合并**到目标键（原英文键
+// 保留，便于按英文名取原始分组）。多个别名源可指向同一目标（巴勒斯坦 =
+// Gaza Strip + West Bank），必须逐省合并——原「目标键不存在才赋值」会让后到
+// 的别名源被静默丢弃，下钻只显示先到的那一片（WT87-01）。测试
+// `threatCountryKeys.spec.ts` 全量断言 THREAT_COUNTRIES 每键（中国走
+// chinaProvinces 高精度表）均可命中，并断言多源目标条目齐全。
 export const COUNTRY_ALIAS: Record<string, string> = {
   Turkey: '土耳其',
   Vietnam: '越南',
@@ -280,5 +283,11 @@ export const COUNTRY_ALIAS: Record<string, string> = {
 
 for (const [alias, target] of Object.entries(COUNTRY_ALIAS)) {
   const rows = ADMIN1_PROVINCES[alias]
-  if (rows && !ADMIN1_PROVINCES[target]) ADMIN1_PROVINCES[target] = rows
+  if (!rows) continue
+  // 目标键可能是原生中文条目，也可能由本循环前序别名创建；统一按省名去重追加。
+  const merged = ADMIN1_PROVINCES[target] ?? (ADMIN1_PROVINCES[target] = [])
+  for (const row of rows) {
+    if (merged.some((existing) => existing.name === row.name)) continue
+    merged.push(row)
+  }
 }

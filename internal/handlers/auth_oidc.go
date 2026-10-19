@@ -452,7 +452,11 @@ func (h *Handlers) OIDCLogin(c *gin.Context) {
 	}()
 	p, err := oidcProvider(cfg.Issuer)
 	if err != nil {
-		fail(err.Error())
+		// 历史问题（历史）：登录页错误位对未认证访问者可见——原始 discovery
+		// 错误（含 IdP 地址/网络细节）此前直接回显；归一为固定短句，原始错误
+		// 仅落日志（管理员侧 test 端点保留详细错误，已 admin 门）。
+		services.Logf("warn", "OIDC 登录服务发现失败: %v", err)
+		fail("OIDC 服务不可达，请检查配置")
 		return
 	}
 	stateRaw := make([]byte, 16)
@@ -695,7 +699,8 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 	}
 	p, err := oidcProvider(cfg.Issuer)
 	if err != nil {
-		fail(err.Error(), "")
+		services.Logf("warn", "OIDC 回调服务发现失败: %v", err)
+		fail("OIDC 服务不可达，请检查配置", "OIDC 服务发现失败")
 		return
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
@@ -704,7 +709,10 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 	oauth2Token, err := oauthCfg.Exchange(ctx, c.Query("code"),
 		oauth2.SetAuthURLParam("code_verifier", entry.verifier))
 	if err != nil {
-		fail("令牌交换失败: "+err.Error(), "OIDC 令牌交换失败")
+		// 历史问题 同族（R-12）：交换错误含 token_endpoint 地址/HTTP 细节，不得
+		// 回显给未认证浏览器——固定短句 + 原始错误仅日志。
+		services.Logf("warn", "OIDC 令牌交换失败: %v", err)
+		fail("OIDC 令牌交换失败，请稍后重试", "OIDC 令牌交换失败")
 		return
 	}
 	rawIDToken, _ := oauth2Token.Extra("id_token").(string)
@@ -715,7 +723,8 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 	verifier := p.Verifier(&oidc.Config{ClientID: cfg.ClientID})
 	idToken, err := verifier.Verify(ctx, rawIDToken)
 	if err != nil {
-		fail("ID Token 校验失败: "+err.Error(), "OIDC id_token 校验失败")
+		services.Logf("warn", "OIDC id_token 校验失败: %v", err)
+		fail("ID Token 校验失败，请稍后重试", "OIDC id_token 校验失败")
 		return
 	}
 	var claims struct {

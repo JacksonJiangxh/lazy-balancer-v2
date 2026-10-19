@@ -92,3 +92,63 @@ func TestDNSPod_Validate_rejects_whitespace_test_domain(t *testing.T) {
 		t.Fatalf("validation error=%v, want empty-domain error", err)
 	}
 }
+
+// 凭证字段的可见性/选项文案元数据（WS-13）：前端表单由 visible_when/
+// option_labels 驱动（不再按 dnspod 两种认证模式硬编码字段名）。本测试钉住
+// DNSPod 的元数据形态，并反向校验每个 visible_when 条件键都是同 provider 声明的
+// select 字段（引用错键会让字段永远不显示）。
+func TestDNSPod_CredentialFieldMetadata(t *testing.T) {
+	fields := (&DNSPod{}).CredentialFields()
+	byName := make(map[string]CredentialField, len(fields))
+	for _, f := range fields {
+		byName[f.Name] = f
+	}
+
+	authMode, ok := byName["auth_mode"]
+	if !ok {
+		t.Fatalf("DNSPod 缺 auth_mode 字段: %#v", fields)
+	}
+	if authMode.Type != "select" {
+		t.Fatalf("auth_mode type=%q, want select", authMode.Type)
+	}
+	if got, want := authMode.OptionLabels["dnspod"], "DNSPod API"; got != want {
+		t.Errorf("auth_mode option_labels[dnspod]=%q, want %q", got, want)
+	}
+	if got, want := authMode.OptionLabels["tencent_cloud"], "腾讯云 API"; got != want {
+		t.Errorf("auth_mode option_labels[tencent_cloud]=%q, want %q", got, want)
+	}
+
+	cases := []struct {
+		field string
+		mode  string
+	}{
+		{"app_id", "dnspod"},
+		{"app_token", "dnspod"},
+		{"secret_id", "tencent_cloud"},
+		{"secret_key", "tencent_cloud"},
+	}
+	for _, tc := range cases {
+		f, ok := byName[tc.field]
+		if !ok {
+			t.Fatalf("DNSPod 缺字段 %q", tc.field)
+		}
+		modes, ok := f.VisibleWhen["auth_mode"]
+		if !ok || len(modes) != 1 || modes[0] != tc.mode {
+			t.Errorf("%s VisibleWhen=%v, want {auth_mode:[%s]}", tc.field, f.VisibleWhen, tc.mode)
+		}
+	}
+
+	// 反向校验：visible_when 的每个条件键必须是已声明的 select 字段。
+	for _, f := range fields {
+		for key := range f.VisibleWhen {
+			cond, ok := byName[key]
+			if !ok {
+				t.Errorf("%s VisibleWhen 引用未声明字段 %q", f.Name, key)
+				continue
+			}
+			if cond.Type != "select" {
+				t.Errorf("%s VisibleWhen 条件字段 %q type=%q, want select", f.Name, key, cond.Type)
+			}
+		}
+	}
+}

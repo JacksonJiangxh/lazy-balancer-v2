@@ -137,6 +137,7 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   let configRetryTimer: number | null = null
+  let configVisibilityBound = false
 
   const clearConfigRetryTimer = (): void => {
     if (configRetryTimer !== null) {
@@ -145,12 +146,31 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
+  // 历史问题：恢复可见立即补查（与 usePollingTask/useLogTailPolling 的
+  // 「hidden 暂停 + visible 立即补拉」同范式）——15s 轮询在隐藏页被顺延，
+  // 回来时不必再等一个周期。单次绑定（store 生命周期内常驻；token 已清时空转）。
+  const bindConfigVisibilityRefresh = (): void => {
+    if (configVisibilityBound || typeof document === 'undefined') return
+    configVisibilityBound = true
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden || !token.value) return
+      clearConfigRetryTimer()
+      void fetchConfig(true)
+    })
+  }
+
   // 成功后每 15s 刷新全站 nodeMode；空数据/瞬时失败复用同一定时器重试。
   // 单定时器防重让登录、设置保存与后台刷新可以共用此入口而不叠加轮询。
   const scheduleConfigRetry = (): void => {
     if (configRetryTimer !== null || !token.value) return
+    bindConfigVisibilityRefresh()
     configRetryTimer = window.setTimeout(() => {
       configRetryTimer = null
+      // 后台标签页不发请求：顺延一个周期（可见时经 visibilitychange 立即补查）
+      if (typeof document !== 'undefined' && document.hidden) {
+        scheduleConfigRetry()
+        return
+      }
       void fetchConfig(true)
     }, 15_000)
   }

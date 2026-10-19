@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -983,11 +984,11 @@ func TestThreatDueSources_ignoresCrawlerAddressSources(t *testing.T) {
 func TestThreatDueSources_usesThreatSystemListRegistry(t *testing.T) {
 	// Given 模拟未来新增的第四个内置源：名单注册表与真实源表均扩展；
 	// 同表另有一个未注册的历史爬虫源。
-	original := db.ThreatSystemLists
+	original := db.ThreatSystemLists()
 	extended := append([]db.ThreatSystemList{}, original...)
 	extended = append(extended, db.ThreatSystemList{Source: "future_source", Name: "未来威胁名单"})
-	db.ThreatSystemLists = extended
-	t.Cleanup(func() { db.ThreatSystemLists = original })
+	restore := db.SetThreatSystemListsForTest(extended)
+	t.Cleanup(restore)
 	newClusterTestService(t)
 	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources
 		(id,name,display_name,url,update_enabled,next_update) VALUES
@@ -1123,5 +1124,98 @@ func TestUpdateOneSource_healPreservesRawHash(t *testing.T) {
 	}
 	if raw != "legacy-raw-hash" {
 		t.Fatalf("raw_hash=%q, want preserved upstream raw hash (heal text hash is not upstream bytes)", raw)
+	}
+}
+
+// —— 变化面判定不再依赖名单 id 查询（SSA-87-11，历史） ——
+
+// 内容变化 → 收敛；内容未变 → 零收敛。钉住 changedIDs→changed bool 重构后的
+// 判定面无行为漂移（旧的逐源 id 查询只被 len() 消费，已删除）。
+func TestSSA8711_changeDetectionDrivesConvergence(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	var refreshes int
+	SetThreatReloader(func() error { return nil })
+	SetThreatProjectionRefresher(func() (IPListProjectionOutcome, error) {
+		refreshes++
+		return ProjectionConverged, nil
+	})
+	t.Cleanup(func() { SetThreatReloader(nil); SetThreatProjectionRefresher(nil) })
+
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run1: %v", err)
+	}
+	if refreshes != 1 {
+		t.Fatalf("首轮建名单须收敛一次: refreshes=%d", refreshes)
+	}
+	// 内容未变：不再次收敛。
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run2: %v", err)
+	}
+	if refreshes != 1 {
+		t.Fatalf("内容未变不得收敛: refreshes=%d", refreshes)
+	}
+	// 内容变化：收敛一次。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("192.0.2.99\n"))
+	}))
+	t.Cleanup(srv.Close)
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name='ustc'`, srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run3: %v", err)
+	}
+	if refreshes != 2 {
+		t.Fatalf("内容变化须收敛: refreshes=%d, want 2", refreshes)
+	}
+}
+
+// —— StartUpdate 返回即 CancelRunning 必真（SSA-87-06 同族，SS87-历史问题） ——
+
+// 旧实现把 runCancel 登记放在 run goroutine 内：StartUpdate 返回后立刻取消
+// （任务引擎 CancelHook／前端连点）会读到 nil（首次）或上一轮陈旧 cancel，
+// 取消静默失效/取消错轮。单 P 调度使该窗口确定可复现。
+func TestSSA87_threatStartUpdateRegistersCancelBeforeReturn(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(oldProcs) })
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // 下载在途：只有取消能结束
+	}))
+	t.Cleanup(blocked.Close)
+	for _, name := range []string{"ustc", "firehol_l1", "et_compromised"} {
+		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name=?`, blocked.URL, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := GetThreatUpdateManager()
+	done, err := m.StartUpdate("manual", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.CancelRunning() {
+		// 旧实现：run goroutine 尚未登记取消函数。推进 goroutine 后自行取消，
+		// 避免测试挂起（失败断言即 RED 证据）。
+		for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+			if m.CancelRunning() {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		<-done
+		t.Fatal("StartUpdate 返回后立刻 CancelRunning=false（取消函数尚未登记，取消静默失效）")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消后运行未退出")
+	}
+	if got := m.StatusSnapshot().Outcome; got != "cancelled" {
+		t.Fatalf("终态=%q, want cancelled", got)
 	}
 }

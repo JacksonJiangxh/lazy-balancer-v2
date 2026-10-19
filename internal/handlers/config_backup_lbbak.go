@@ -58,8 +58,8 @@ func validateLbbakExportEntries(entries map[string][]byte) error {
 	}
 	var total int64
 	for name, data := range entries {
-		if len(data) > 64<<20 {
-			return fmt.Errorf("备份条目 %s 超过可还原上限 64MB", name)
+		if int64(len(data)) > maxLbbakEntryBytes {
+			return fmt.Errorf("备份条目 %s 超过可还原上限 %dMB", name, maxLbbakEntryBytes>>20)
 		}
 		total += int64(len(data))
 		if total > maxLbbakTotalBytes {
@@ -88,13 +88,10 @@ func snapshotLbbakThreatIplists(bundle *services.WafFileBundle) (map[string][]by
 	return threatIplists, nil
 }
 
-// buildLbbakPayload 组包:backupJSON 为已序列化的 V2 备份;bundle 为活动文件
-// (nil 时 waf 条目缺席——全新安装未更新过规则库的形态)。威胁名单在调用方
-// 未提供锁内快照时即时读取（测试/独立调用）；生产导出传内存快照。
-func buildLbbakPayload(backupJSON []byte, bundle *services.WafFileBundle) ([]byte, error) {
-	return buildLbbakPayloadWithThreatIplists(backupJSON, bundle, nil)
-}
-
+// 历史问题-历史问题（历史）：原 buildLbbakPayload（threatSnapshot 缺省的
+// 组包快捷入口）生产零调用——生产导出一律 buildLbbakPayloadWithThreatIplists
+// 传入 WafFileLock 内的内存快照。测试专用入口已移入 _test.go，避免生产文件
+// 承载第二调用链。
 func buildLbbakPayloadWithThreatIplists(backupJSON []byte, bundle *services.WafFileBundle, threatSnapshot map[string][]byte) ([]byte, error) {
 	entries := map[string][]byte{
 		lbbakEntryConfig: backupJSON,
@@ -205,8 +202,12 @@ type lbbakPayload struct {
 // 解压放大防护(BE-历史问题):请求体上限只约束压缩字节(128MB,gzip 最高 ~1032:1
 // 膨胀),条目数与总解压字节必须在读入内存前拦截——对齐仓内 untarGzTo 的
 // maxWafSyncExtract* 同款标准。var 供测试收窄构造边界。
+// 历史问题-历史问题（历史）：单条目上限提为 maxLbbakEntryBytes 单源——导出
+// 预检（validateLbbakExportEntries）与解包（parseLbbak）共用同一上限，避免
+// 两处字面量漂移让面板导出「自身无法还原」的包。
 var (
 	maxLbbakTotalBytes int64 = 256 << 20
+	maxLbbakEntryBytes int64 = 64 << 20
 	maxLbbakEntryCount       = 64
 )
 
@@ -236,8 +237,8 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 		if totalBytes > maxLbbakTotalBytes {
 			return nil, fmt.Errorf("lbbak 解压总字节超过上限 %dMB", maxLbbakTotalBytes>>20)
 		}
-		if hdr.Size > 64<<20 {
-			return nil, fmt.Errorf("lbbak 条目 %s 超过 64MB", hdr.Name)
+		if hdr.Size > maxLbbakEntryBytes {
+			return nil, fmt.Errorf("lbbak 条目 %s 超过 %dMB", hdr.Name, maxLbbakEntryBytes>>20)
 		}
 		data, err := io.ReadAll(io.LimitReader(tr, hdr.Size+1))
 		if err != nil {
@@ -360,7 +361,19 @@ func reconcileImportedThreatFiles(tables map[string][]map[string]any, payload *l
 		if _, hasFile := payload.ThreatIplists[name]; hasFile || failed[name] {
 			continue // 随包文件已落盘（失败源保留本地文件与记录）
 		}
-		removePair(name, "在备份中为空，已删除本地旧名单文件（记录按备份）")
+		// 历史问题-历史问题（历史，verify 裁定）：导出侧只为已存在文件写条目，
+		// 因此「备份未携带该源文件」有两种含义——上次下载成功但名单为空（备份
+		// 记录 version 非空/update_status=success），或导出节点从未成功下载过该
+		// 源（version 为空/idle）。两种形态都必须删除本地旧文件：DB 行已按备份
+		// 全量替换，保留文件会让运行时 WAF 按旧名单拦截而 DB/UI 显示空（历史问题-03
+		// 的「记录与执行面恒一致」不变量）。差别只在留痕：未下载形态若
+		// update_enabled=0 不会自动重取，必须给出可执行提示，不能笼统说「在备份
+		// 中为空」。
+		if backupString(row["update_status"]) == "success" || backupString(row["version"]) != "" {
+			removePair(name, "在备份中为空（上次下载成功但无条目），已删除本地旧名单文件（记录按备份）")
+			continue
+		}
+		removePair(name, "备份未携带该源文件（导出节点尚未成功下载），已删除本地旧名单文件——如该源需继续生效，请启用更新后手动触发一次威胁库更新")
 	}
 	// 源表全量替换后不再存在的源：本地残留文件同样删除。
 	entries, err := os.ReadDir(services.WafDir())

@@ -96,8 +96,15 @@ func trafficEventSnapshot(since uint64, limit int) ([]trafficEvent, uint64) {
 	}
 	// next 必须是本批最后一条的 seq，而不是全局最新 seq；否则一批被 limit
 	// 截断时前端会把未返回的事件永久跳过（全量 1000/s 下必现）。
+	// PL历史问题：入参游标超过本进程已分配的最大 seq，只可能来自上一进程代际
+	// （trafficEventSeq 是进程内计数器，Caddy 重启后归零）——此时必须显式回吐
+	// 0 要求前端从最新窗口重新追赶。原样回吐 since 会让前端「next_seq <
+	// previous 才复位」的判据永不成立，光流在该标签页内永久停更。
+	// 注意 since == 已分配 seq（正常追平/空窗）不得复位，否则会被反复重放。
 	next := since
-	if len(out) > 0 {
+	if since > trafficEventSeq.Load() {
+		next = 0
+	} else if len(out) > 0 {
 		next = out[len(out)-1].Seq
 	}
 	return out, next

@@ -14,6 +14,17 @@
       </el-button>
     </div>
 
+    <!-- W87-04：主数据失败与「确实没有策略」必须可区分——保留旧表 + 重试入口
+         （同族页 SecurityRules/SecurityBlockPages 同款 error-banner 范式） -->
+    <el-alert v-if="policiesLoadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner mb-5">
+      <template #title>
+        <div class="polling-error-title">
+          <span>安全策略加载失败：列表为空/停留旧值不代表策略被清空</span>
+          <el-button link type="danger" :loading="loading" @click="fetchData">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
+
     <el-card class="list-card">
       <el-tabs v-model="activeTypeTab" class="policy-type-tabs">
         <el-tab-pane v-for="tab in policyTypeTabs" :key="tab.type" :label="`${tab.label}（${tab.count}）`" :name="tab.type" />
@@ -23,7 +34,8 @@
       </div>
       <el-table :data="pagedPolicies" v-loading="loading" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="">
         <template #empty>
-          <el-empty description="暂无安全策略" :image-size="60" />
+          <el-empty v-if="!policiesLoadError" description="暂无安全策略" :image-size="60" />
+          <span v-else class="text-secondary">加载失败，请点击上方「立即重试」</span>
         </template>
         <el-table-column prop="name" label="策略名称" min-width="200">
           <template #default="{ row }">
@@ -599,6 +611,11 @@
                     <el-checkbox v-for="e in crawlerEngineOptions" :key="e.id" :value="e.id">{{ e.name }}</el-checkbox>
                   </el-checkbox-group>
                   <div class="form-tip-line">勾选的引擎经反向 DNS/官方 IP 段验证为真实爬虫后豁免地域拦截（IP 名单/WAF/限流仍全量生效）；伪装爬虫 UA 的请求会被拒绝并记录攻击事件。360 无反查支持按官方 IP 段验证；标注「观察级」的引擎按厂商域名验证</div>
+                  <!-- W87-03：空选=全部引擎（后端空集语义），必须显性说明——否则
+                       用户以为「全不选=不豁免」，实际是全豁免 -->
+                  <div v-if="form.geoip_crawler_engines.length === 0" class="form-tip-line">
+                    <el-text type="warning" size="small">未勾选任何引擎：等于豁免全部引擎（此形态不可保存，请至少勾选一个或关闭爬虫豁免）</el-text>
+                  </div>
                 </template>
               </el-form-item>
             </template>
@@ -696,11 +713,12 @@
                         </el-select>
                         <el-tag
                           v-if="overrideEditOf(row.caddyId)[stage === 1 ? 'stage1_id' : 'stage3_id'] > 0"
-                          :type="pendingStageOverride(row.caddyId, stage) ? 'primary' : 'warning'"
+                          :type="stageOverrideSkipped[row.caddyId] ? 'danger' : pendingStageOverride(row.caddyId, stage) ? 'primary' : 'warning'"
                           size="small"
                           effect="plain"
                           disable-transitions
-                        >{{ stageOverrideFailed[row.caddyId] ? '待重试' : pendingStageOverride(row.caddyId, stage) ? '待保存' : '已覆盖' }}</el-tag>
+                          :title="stageOverrideSkipped[row.caddyId] ? `未写入（${stageOverrideSkipped[row.caddyId]}）` : undefined"
+                        >{{ stageOverrideSkipped[row.caddyId] ? '未写入' : stageOverrideFailed[row.caddyId] ? '待重试' : pendingStageOverride(row.caddyId, stage) ? '待保存' : '已覆盖' }}</el-tag>
                         <el-icon v-if="stageOverrideSaving[row.caddyId]" class="is-loading stage-override-saving"><Loading /></el-icon>
                       </div>
                     </div>
@@ -716,7 +734,7 @@
         <!-- Step: 拦截页（阶段 1/2/3 策略可配；阶段 2 状态码恒 429——步内隐藏状态码项） -->
         <div v-show="currentStep === WIZARD_STEP.BLOCK_PAGE" class="step-content">
           <div class="stage-projection-bar">
-            <span class="stage-projection-desc">规则可配阶段页覆盖；未覆盖时按触发策略显示</span>
+            <span class="stage-projection-desc">规则可配阶段 1/3 页覆盖；未覆盖时按触发策略显示（阶段 1 预检合并拦截、阶段 2 限流 429 由绑定链首位有页策略显示）</span>
             <div class="stage-projection-rules">
               <span v-if="boundRules.length === 0" class="stage-projection-empty">尚未关联规则</span>
               <span v-else class="stage-projection-empty">将应用于 {{ boundRules.length }} 条已关联规则</span>
@@ -730,13 +748,13 @@
               </el-select>
               <div v-if="form.block_page_id === 0" class="form-tip-line">{{ editorPolicyType === 'stage2' ? '不配置拦截页：429 返回空响应体（可选内置「限流拦截页面」）' : '不配置拦截页；规则无阶段页覆盖且同规则无其他策略页时，拦截返回 Caddy 默认 403' }}</div>
               <div v-else class="form-tip-line">拦截时返回给客户端的自定义页面，在"拦截页面"页面管理，<el-link type="primary" @click="goToBlockPagesPage">去创建/编辑</el-link></div>
-              <!-- 拦截页归因分层口径：规则可配阶段页覆盖；未覆盖时按触发策略显示 -->
+              <!-- 拦截页归因分层口径：规则可配阶段页覆盖；未覆盖时按触发策略显示。
+                   W87-01：逐阶段按后端渲染事实判定（阶段 1/2 取绑定链首个有页策略，
+                   阶段 3 逐策略合成码；规则级覆盖压过策略页），不再恒渲染绿色「生效中」。 -->
               <div v-if="boundRuleRows.length > 0" class="block-page-rule-annotations">
                 <div v-for="row in boundRuleRows" :key="row.caddyId" class="block-page-rule-annotation">
                   <span class="block-page-rule-annotation-name">{{ row.name }}</span>
-                  <span v-if="row.selfBlockPageActive" class="block-page-rule-annotation-status is-active">✓ 拦截页面生效中（触发本策略拦截时显示）</span>
-                  <span v-else-if="!form.enabled" class="block-page-rule-annotation-status is-disabled">策略禁用中，拦截页面不生效</span>
-                  <span v-else class="block-page-rule-annotation-status is-warning">规则可配阶段页覆盖；未覆盖时按触发策略显示；多策略 IP 访问控制的合并拦截显示首位策略的拦截页</span>
+                  <span v-for="(note, i) in row.blockPageNotes" :key="i" class="block-page-rule-annotation-status" :class="`is-${note.kind}`">{{ note.text }}</span>
                 </div>
               </div>
             </el-form-item>
@@ -909,6 +927,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import type { CascaderOption, CascaderProps, CascaderValue, LazyLoad } from 'element-plus'
 import { request, ApiRequestError, mfaAwareSuccess } from '@/utils/api'
 import { showSaveResult } from '@/utils/saveResult'
+import { CADDY_APPLY_FAILED_MARKER, mergeBulkResults } from '@/utils/bulkApplyResult'
 import { isValidCidr } from '@/utils/ruleValidation'
 import { popperViewportSafe } from '@/utils/popper'
 import { formatDate } from '@/utils/date'
@@ -919,9 +938,10 @@ import type { CrsExcludedRow, CrsRuleOptionView } from '@/composables/useCrsRule
 import type { APIResponse, UserListItem } from '@/types'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
-import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, buildStageModel, chunkForBulk, entriesIntersect, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, normalizeStringEntries, parseIPList, parseRefIds, parseUnknownIds, IP_LIST_CATEGORIES, SECURITY_BULK_LIMITS} from '@/utils/securityStages'
+import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, blockPageMissing, buildStageModel, chunkForBulk, entriesIntersect, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, normalizeStringEntries, parseIPList, parseRefIds, parseUnknownIds, IP_LIST_CATEGORIES, MAX_POLICIES_PER_RULE, SECURITY_BULK_LIMITS, resolveBlockPageAttribution, type BlockPageAttribution, type BlockPageStage } from '@/utils/securityStages'
 import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy } from '@/utils/securityStages'
 import { updaterName } from '@/utils/updaterName'
+import { buildPolicyPayload, crawlerExemptionNeedsEngines } from '@/utils/policyPayload'
 
 interface PolicyDetail { id: number; name: string; description: string; mode: string; anomaly_threshold: number; ip_acl_mode: string; ip_acl_list: string; ip_acl_enabled: boolean; ip_whitelist: string; ip_whitelist_enabled?: boolean; ip_blacklist?: string; ip_acl_list_refs?: string; ip_whitelist_refs?: string; rate_limit_enabled: boolean; rate_limit_rps: number; rate_limit_burst: number; crs_rule_groups: string; crs_excluded_rules: string; custom_rules: string; block_page_id: number; block_status_code: number; enabled: boolean; updated_at: string; geoip_mode?: string; geoip_countries?: string; geoip_crawler_exempt?: boolean; geoip_crawler_engines?: string; waf_check_response?: boolean; log_request_body?: boolean; trust_detection?: boolean }
 // 规则行携带阶段拦截页覆盖 4 字段（关联规则行内编辑与生效投影同源）
@@ -933,7 +953,8 @@ interface BindingInfo { policy_id: number; name: string; mode: string; enabled: 
 interface RuleBoundPolicy { id: number; name: string; mode: string; enabled: boolean; ip_acl_enabled: boolean; ip_acl_mode: string; crs_rule_groups: unknown; custom_rules: unknown; block_page_id: number }
 interface CustomRuleRef { id: number; action: string }
 interface ChainEntry { policyId: number | null; name: string; enabled: boolean; isSelf: boolean; blockPageId?: number; blockStatusCode?: number }
-interface BoundRuleRow { caddyId: string; name: string; domain: string; listenPort: number; chain: ChainEntry[]; selfBlockPageActive: boolean; mergedCount: number; showPerfTip: boolean; hints: string[]; infoHints: string[] }
+interface BlockPageNote { kind: 'active' | 'disabled' | 'warning' | 'info'; text: string }
+interface BoundRuleRow { caddyId: string; name: string; domain: string; listenPort: number; chain: ChainEntry[]; blockPageNotes: BlockPageNote[]; mergedCount: number; showPerfTip: boolean; hints: string[]; infoHints: string[] }
 interface CRSRuleOption { filename: string; category: string }
 interface BlockPage { id: number; name: string; content?: string }
 
@@ -1013,6 +1034,12 @@ const crsExcludedRows = ref<CrsExcludedRow[]>([])
 const loading = ref(false)
 const saving = ref(false)
 const policies = ref<PolicySummary[]>([])
+// W87-04：主列表拉取失败必须可辨识（否则「加载失败」与「确实没有策略」同形，
+// 用户会误以为策略被清空）。失败保留旧数据，仅置错误态供横幅+重试。
+const policiesLoadError = ref(false)
+// W87-05：拦截页列表是否至少成功落地过一次——未落地时不得做「页面已删除/
+// 内容为空」的空页预告（bpRes 部分失败会让所有启用策略显示假警告）。
+const blockPagesLoaded = ref(false)
 const policySearch = ref('')
 
 // ── 列表按类型分组（阶段 1/2/3 + 混合兼容组）：policy_type 缺省时按内容推断（inferPolicyType
@@ -1112,7 +1139,10 @@ const policySummaryLine = (row: PolicySummary): string => {
     // 与锁摘要/详情弹框共用共享投影器口径（历史问题-05）：
     // ① ACL 关闭但遗留独立黑名单仍在拦截时不得显示「未启用 ACL」；
     // ② 地域关闭但保留区域时如实标注「已关闭（保留 N 区域）」。
-    const aclPart = hasIPACLControl(row) ? formatAclModeDetail(ipLists.value, row) : '未启用 ACL'
+    // WU-09（审计 87 口径分层）：内容门 hasIPACLControl 只决定「是否有渲染产物」，
+    // 列表摘要展示必须与后端 SecurityPolicyHasIPControl（ip_acl_enabled 开启即
+    // true）对齐——显式开启 ACL 但名单为空时显示模式与 0 条，而不是「未启用」。
+    const aclPart = row.ip_acl_enabled === true || hasIPACLControl(row) ? formatAclModeDetail(ipLists.value, row) : '未启用 ACL'
     const geoPart = hasGeoIPControl(row)
       ? `GeoIP ${geoCount} 区域`
       : geoCount > 0 ? `GeoIP 已关闭（保留 ${geoCount} 区域）` : 'GeoIP 未启用'
@@ -1129,6 +1159,9 @@ const stageOverrideSaving = ref<Record<string, boolean>>({})
 // 上次保存失败待重试（历史问题）：失败不得回写 seed（待提交项消失=与「重新
 // 点击保存可重试」承诺矛盾），改记失败标记并在行内显示「待重试」。
 const stageOverrideFailed = ref<Record<string, boolean>>({})
+// W87-09：批量端点会跳过 TCP/不存在的规则（200 + skipped 列表）——被跳过的规则
+// 不得回写「已覆盖」，需逐条记住原因并保持待提交（下次保存重试）。
+const stageOverrideSkipped = ref<Record<string, string>>({})
 
 const stageOverrideSeed = (caddyId: string): StageOverrideEdit => {
   const rule = allRules.value.find((r) => r.caddy_id === caddyId)
@@ -1165,6 +1198,12 @@ const onStageOverrideChange = (caddyId: string, stage: 1 | 3, field: 'id' | 'sta
   } else if (stage === 1) edit.stage1_status = value
   else edit.stage3_status = value
   stageOverrideEdits.value = { ...stageOverrideEdits.value, [caddyId]: edit }
+  // W87-09：用户重新选择即清除「未写入」标记（原因来自上一次写入，已不适用）
+  if (stageOverrideSkipped.value[caddyId]) {
+    const nextSkipped = { ...stageOverrideSkipped.value }
+    delete nextSkipped[caddyId]
+    stageOverrideSkipped.value = nextSkipped
+  }
   // 历史（用户裁定 A）：只暂存，不再即时 PUT——规则级覆盖随向导「保存」
   // 统一提交（handleSave 收尾逐规则 PUT），与向导其余步骤的延迟语义一致。
 }
@@ -1315,7 +1354,9 @@ const viewPolicySections = computed<ViewPolicySection[]>(() => {
     {
       title: '阶段 1 · IP 访问控制',
       rows: [
-        { label: '访问控制', value: hasIPACLControl(d) ? formatAclModeDetail(ipLists.value, d) : '未启用' },
+        // WU-09：与列表摘要同口径——ip_acl_enabled 开启即展示模式（即使名单为空），
+        // 内容门只用于阶段能力/类型推断
+        { label: '访问控制', value: d.ip_acl_enabled === true || hasIPACLControl(d) ? formatAclModeDetail(ipLists.value, d) : '未启用' },
         // 信任名单只归阶段 0 段（2026-09-21 用户裁定：独立阶段 0，阶段 1 不再重复展示）
         { label: '地域拦截', value: (d.geoip_mode ?? 'off') !== 'off' ? `${GEOIP_MODE_LABELS[d.geoip_mode ?? 'deny'] ?? d.geoip_mode} · ${geoCount} 区域` : (geoCount > 0 ? `已关闭（保留 ${geoCount} 区域）` : '未启用') },
       ],
@@ -1329,7 +1370,7 @@ const viewPolicySections = computed<ViewPolicySection[]>(() => {
       title: '拦截页',
       rows: [
         { label: '拦截页面', value: d.block_page_id > 0 ? `${page?.name ?? `页面 #${d.block_page_id}`}（状态码 ${d.block_status_code || 403}）` : '不使用自定义页面（Caddy 默认 403）' },
-        { label: '归因口径', value: '规则可配阶段页覆盖；未覆盖时按触发策略显示' },
+        { label: '归因口径', value: '阶段 3 按触发策略显示；阶段 1 预检合并拦截与阶段 2 限流 429 由绑定链首位有页策略显示；规则级阶段 1/3 覆盖优先' },
       ],
     },
   ]
@@ -1361,6 +1402,11 @@ const applyStageOverrideSuccess = (caddyId: string, edit: StageOverrideEdit): vo
     const next = { ...stageOverrideFailed.value }
     delete next[caddyId]
     stageOverrideFailed.value = next
+  }
+  if (stageOverrideSkipped.value[caddyId]) {
+    const nextSkipped = { ...stageOverrideSkipped.value }
+    delete nextSkipped[caddyId]
+    stageOverrideSkipped.value = nextSkipped
   }
 }
 
@@ -1613,12 +1659,15 @@ const fetchData = async (): Promise<boolean> => {
     ])
     if (polRes.status === 'rejected') {
       console.error('Failed to load policies data:', polRes.reason)
+      // W87-04：错误态显性化——保留旧数据（若有），横幅+重试由模板渲染
+      policiesLoadError.value = true
       return false
     }
     policies.value = polRes.value.data || []
+    policiesLoadError.value = false
     if (ruleRes.status === 'fulfilled') allRules.value = ruleRes.value.data || []
     if (crsRes.status === 'fulfilled') crsRuleOptions.value = crsRes.value.data?.rules || []
-    if (bpRes.status === 'fulfilled') blockPages.value = bpRes.value.data || []
+    if (bpRes.status === 'fulfilled') { blockPages.value = bpRes.value.data || []; blockPagesLoaded.value = true }
     if (crRes.status === 'fulfilled') allCustomRules.value = crRes.value.data || []
     if (bindRes.status === 'fulfilled') securityBindings.value = bindRes.value.data || {}
     if (userRes.status === 'fulfilled') users.value = userRes.value.data || []
@@ -1628,6 +1677,7 @@ const fetchData = async (): Promise<boolean> => {
     return true
   } catch (error: unknown) {
     console.error('Failed to load policies data:', error)
+    policiesLoadError.value = true
     return false
   } finally { loading.value = false }
 }
@@ -2172,10 +2222,9 @@ const handlePickerSelectAll = (checked: string | number | boolean): void => {
 }
 
 // 拦截页面 = 首绑策略的页面（启用策略中 policy_id 最小者）；单规则最多
-// MAX_POLICIES_PER_RULE=8 条（与后端 maxBindingsPerRule 同口径）；
+// MAX_POLICIES_PER_RULE 条（securityStages 单源，与后端 maxBindingsPerRule 同口径）；
 // security_policies.id 为 AUTOINCREMENT——新建策略的 ID 必然大于全部现存策略，
 // 因此新建策略在任何规则的绑定链上都落在末位。
-const MAX_POLICIES_PER_RULE = 8
 const PERF_POLICY_THRESHOLD = 3
 
 // 选中规则的完整绑定策略明细（冲突检测需要 crs_rule_groups/custom_rules 内容，
@@ -2603,11 +2652,79 @@ const whitelistSectionAlert = computed<string>(() => {
 // 拦截页归因（哪条策略触发的拦截就显示哪条策略的拦截页）的两类可静态检测提示：
 // ② 空页预告（warn）——策略配置了拦截页但页已删除/内容为空（后端等同无页，
 // 该策略 deny 不抬码，中断落首绑定有页策略的 403 兜底路由）。
-const blockPageBroken = (e: ChainEntry): boolean => {
-  const id = e.blockPageId ?? 0
-  if (id <= 0) return false
-  const page = blockPages.value.find((p) => p.id === id)
-  return !page || (page.content ?? '') === ''
+// W87-05：拦截页列表未成功落地过一次时不得判定「已删除/内容为空」——bpRes
+// 部分失败会让所有启用策略挂上假警告；加载门在单源谓词内（blockPageMissing）。
+const blockPageBroken = (e: ChainEntry): boolean =>
+  blockPageMissing(e.blockPageId ?? 0, blockPages.value, blockPagesLoaded.value)
+
+// W87-01：本策略拦截页「按阶段实际生效」判定——单源走 resolveBlockPageAttribution
+// （与 caddy.go 的阶段 1 首绑定有页/阶段 2 429 首绑定有页/阶段 3 逐策略合成码
+// 逐条对齐）。旧实现 `enabled && block_page_id>0` 恒渲染绿色「生效中」，多策略
+// 绑定或规则级覆盖在场时是假绿。
+const BLOCK_PAGE_STAGE_LABEL: Record<BlockPageStage, string> = { 1: '阶段 1', 2: '阶段 2', 3: '阶段 3' }
+const pageHasContent = (id: number): boolean =>
+  blockPagesLoaded.value && id > 0 && !blockPageMissing(id, blockPages.value, blockPagesLoaded.value)
+const editorBlockPageStages = (): BlockPageStage[] => {
+  const type = editorPolicyType.value
+  if (type === 'stage1') return [1]
+  if (type === 'stage2') return [2]
+  if (type === 'stage3') return [3]
+  if (type === 'mixed') return [1, 2, 3]
+  return [] // stage0 无拦截页概念
+}
+const stageListText = (stages: readonly BlockPageStage[]): string => stages.map((s) => BLOCK_PAGE_STAGE_LABEL[s]).join('/')
+const inactiveReason = (a: BlockPageAttribution): string => {
+  if (a.effective === 'rule-override') return '规则已配置阶段页覆盖，实际显示规则级页面'
+  if (a.effective === 'peer') return `实际显示绑定链首位有页策略「${a.winnerName ?? '其他策略'}」的页面`
+  if (a.stage === 2) return '没有启用限流的策略，不会产生 429'
+  return '绑定链无其他有效拦截页，拦截回落 Caddy 默认响应'
+}
+const blockPageNotes = (caddyId: string, chain: ChainEntry[]): BlockPageNote[] => {
+  if (!form.value.enabled) return [{ kind: 'disabled', text: '策略禁用中，拦截页面不生效' }]
+  const type = editorPolicyType.value
+  if (form.value.block_page_id <= 0) {
+    return [{ kind: 'info', text: type === 'stage2'
+      ? '未选择自定义页面：限流拦截返回空响应体 429'
+      : '未选择自定义页面：拦截返回 Caddy 默认 403（规则级阶段 1/3 覆盖除外）' }]
+  }
+  const stages = editorBlockPageStages()
+  if (stages.length === 0) return []
+  // 页面列表未落地：不做任何生效判定（不得假设页面存在或已删除）
+  if (!blockPagesLoaded.value) {
+    return [{ kind: 'info', text: '拦截页列表未加载成功，无法判定本策略页面是否实际生效' }]
+  }
+  const notes: BlockPageNote[] = []
+  if (!pageHasContent(form.value.block_page_id)) {
+    notes.push({ kind: 'warning', text: '本策略拦截页已失效（页面已删除或内容为空）——保存前请重新选择' })
+  }
+  const rule = allRules.value.find((r) => r.caddy_id === caddyId)
+  const overrideFor = (stage: 1 | 3): { pageId: number; pageHasContent: boolean } | null => {
+    const pageId = (stage === 1 ? rule?.block_page_stage1_id : rule?.block_page_stage3_id) ?? 0
+    return pageId > 0 ? { pageId, pageHasContent: pageHasContent(pageId) } : null
+  }
+  const input = chain.map((e) => ({
+    policyId: e.policyId,
+    name: e.name,
+    enabled: e.enabled,
+    isSelf: e.isSelf,
+    blockPageId: e.blockPageId ?? 0,
+    pageHasContent: pageHasContent(e.blockPageId ?? 0),
+    // 列表摘要无 rate_limit_enabled 原始字段——has_rate_limit 即「启用且 rps>0」
+    // （后端同一判定），用于阶段 2 是否可能产生 429 的门。
+    rateLimitEnabled: e.isSelf
+      ? form.value.rate_limit_enabled
+      : (policies.value.find((p) => p.id === e.policyId)?.has_rate_limit ?? false),
+  }))
+  const results = stages.map((stage) =>
+    resolveBlockPageAttribution(stage, input, stage === 2 ? null : overrideFor(stage as 1 | 3)))
+  const active = results.filter((r) => r.effective === 'self').map((r) => r.stage)
+  if (active.length > 0) {
+    notes.push({ kind: 'active', text: `✓ 拦截页面生效中（${stageListText(active)} 触发本策略拦截时显示）` })
+  }
+  for (const r of results.filter((x) => x.effective !== 'self')) {
+    notes.push({ kind: 'warning', text: `${BLOCK_PAGE_STAGE_LABEL[r.stage]}：${inactiveReason(r)}` })
+  }
+  return notes
 }
 
 // Step 4 已关联规则的逐条视图：绑定链 + 拦截页面生效标注 + 冲突提示
@@ -2620,11 +2737,11 @@ const boundRuleRows = computed<BoundRuleRow[]>(() => boundRules.value.map((caddy
     .filter((e) => blockPageBroken(e))
     .map((e) => `策略「${e.name}」配置的拦截页面已删除或内容为空，该策略拦截时将显示首位策略的拦截页`)
   // ① 配置不一致提示（info 级）：启用策略间 (拦截页, 状态码) 组合不一致——
-  // 非错误，声明归因语义：按实际触发的策略显示各自的拦截页
+  // 非错误，声明归因语义（与渲染层逐阶段对齐：阶段 3 逐策略，阶段 1/2 首位有页）
   const combos = new Set(enabledEntries.map((e) => `${e.blockPageId ?? 0}:${e.blockStatusCode || 403}`))
   const infoHints: string[] = []
   if (enabledEntries.length > 1 && combos.size > 1) {
-    infoHints.push('这些策略的拦截页/状态码不同——拦截时按实际触发的策略显示各自的拦截页')
+    infoHints.push('这些策略的拦截页/状态码不同——阶段 3（WAF）按实际触发的策略显示，阶段 1/2 由绑定链首位有页策略显示')
   }
   return {
     caddyId,
@@ -2632,7 +2749,7 @@ const boundRuleRows = computed<BoundRuleRow[]>(() => boundRules.value.map((caddy
     domain: rule?.domain || '',
     listenPort: rule?.listen_port ?? 0,
     chain,
-    selfBlockPageActive: form.value.enabled && form.value.block_page_id > 0,
+    blockPageNotes: blockPageNotes(caddyId, chain),
     // 审计 W-S5（第六轮）：性能提示应按实际生效的处理链计——禁用策略不产生处理链，
     // 计入会虚高（提示"超过 3 条可能影响性能"在不达 3 条时误报）。
     mergedCount: enabledEntries.length,
@@ -2879,7 +2996,7 @@ async function openDialog(row?: PolicySummary) {
 const resetForm = () => {
   form.value = defaultForm()
   ipACLList.value = []; ipWhitelist.value = []; ipWhitelistEnabled.value = false; ipBlacklistSelf.value = []; ipACLListRefs.value = []; ipWhitelistRefs.value = []; geoipCountries.value = []; crsRuleGroups.value = []; crsExcludedRows.value = []; selectedCustomRules.value = []; boundRules.value = []; editingId.value = null
-  stageOverrideEdits.value = {}; stageOverrideSaving.value = {}; stageOverrideFailed.value = {}
+  stageOverrideEdits.value = {}; stageOverrideSaving.value = {}; stageOverrideFailed.value = {}; stageOverrideSkipped.value = {}
 }
 
 const resetWizard = () => {
@@ -2895,6 +3012,7 @@ const resetWizard = () => {
   stageOverrideEdits.value = {}
   stageOverrideSaving.value = {}
   stageOverrideFailed.value = {}
+  stageOverrideSkipped.value = {}
 }
 
 const beforeWizardClose = (done: () => void): void => {
@@ -2933,6 +3051,14 @@ const handleSave = async () => {
     currentStep.value = WIZARD_STEP.WAF_RULES
     return
   }
+  // W87-03：爬虫豁免开启但未勾选任何引擎 = 后端渲染器空集语义「全部引擎」
+  // （crawlerEngineSelected: len==0 → true，为兼容存量不允许改），而 UI 复选框
+  // 「全不选」的直觉语义是「不豁免任何引擎」——两者相反，必须阻止静默放宽。
+  if (crawlerExemptionNeedsEngines({ geoipEnabled: form.value.geoip_enabled, crawlerExempt: form.value.geoip_crawler_exempt, engines: form.value.geoip_crawler_engines })) {
+    ElMessage.error('已开启爬虫豁免但未勾选任何引擎：空选等于豁免「全部引擎」。请至少勾选一个引擎，或关闭爬虫豁免')
+    currentStep.value = WIZARD_STEP.IP_ACL
+    return
+  }
   // 保存确认（与提取为列表/删除确认同款 warning 弹窗）：取消静默返回，不进入提交
   try {
     await ElMessageBox.confirm(`确定保存安全策略「${form.value.name.trim()}」？将立即重新加载 Caddy 配置。`, '确认', { type: 'warning' })
@@ -2966,45 +3092,39 @@ const handleSave = async () => {
     // IP 地址列表引用（refs）：与内联名单位列存储的列表 ID 数组，同样以 JSON
     // 数组文本下发（ip_acl_list_refs / ip_whitelist_refs）；后端将引用列表条目与
     // 内联条目合并生效，允许/拒绝侧归属与对应内联字段一致。
-    // 显式白名单：仅提交 UpdateSecurityPolicyRequest 实际字段。
-    const payload = {
+    // 显式白名单：仅提交 UpdateSecurityPolicyRequest 实际字段；组装单源见
+    // utils/policyPayload（审计 87 W87-15——字段语义有行为测试）。
+    const payload = buildPolicyPayload({
       name: form.value.name,
       description: form.value.description,
       enabled: form.value.enabled,
       mode: form.value.mode,
-      anomaly_threshold: form.value.anomaly_threshold,
-      ip_acl_enabled: form.value.ip_acl_enabled,
-      ip_acl_mode: form.value.ip_acl_mode,
-      ip_acl_list: JSON.stringify(ipACLList.value),
-      ip_whitelist: JSON.stringify(ipWhitelist.value),
-      // 阶段 0 信任名单策略：名单非空即生效（恒启用）；其余类型按开关语义保留
-      ip_whitelist_enabled: editorPolicyType.value === 'stage0' ? true : ipWhitelistEnabled.value,
-      // 开关关闭即解除引用（内联名单按三态语义保留，refs 指向共享列表——
-      // 消费方关闭时释放，IP 地址列表页的引用数反映真实占用，且不阻塞列表删除）
-      ip_acl_list_refs: form.value.ip_acl_enabled ? JSON.stringify(ipACLListRefs.value) : '[]',
-      ip_whitelist_refs: (editorPolicyType.value === 'stage0' ? true : ipWhitelistEnabled.value) ? JSON.stringify(ipWhitelistRefs.value) : '[]',
-      rate_limit_enabled: form.value.rate_limit_enabled,
-      rate_limit_rps: form.value.rate_limit_rps,
-      rate_limit_burst: form.value.rate_limit_burst,
-      crs_rule_groups: JSON.stringify(crsRuleGroups.value),
-      // 排除规则：统一写对象数组（旧字符串数组读取时已归一为 scope:all 行），
-      // 全空行丢弃 + 去重后的提交口径
-      crs_excluded_rules: JSON.stringify(serializedExcludedRules.value),
-      custom_rules: JSON.stringify(selectedCustomRules.value),
-      block_page_id: form.value.block_page_id,
-      block_status_code: form.value.block_status_code,
-      geoip_countries: JSON.stringify(geoipCountries.value),
-      geoip_mode: form.value.geoip_enabled ? (form.value.geoip_mode === 'off' ? 'deny' : form.value.geoip_mode) : 'off',
-      geoip_crawler_exempt: form.value.geoip_enabled && form.value.geoip_crawler_exempt,
-      geoip_crawler_engines: JSON.stringify(form.value.geoip_crawler_engines ?? []),
-      waf_check_response: form.value.waf_check_response,
-      log_request_body: form.value.log_request_body,
-      // 阶段 0：保留检测记录开关（false=直通上游零安全事件；true=事件动作=检测）
-      trust_detection: form.value.trust_detection,
-      // 实体单职化：显式提交类型（服务端将阶段外字段归一为零值）；
-      // mixed 不允许显式提交（兼容组仅存量可编辑），省略=后端按内容推断
-      policy_type: editorPolicyType.value === 'mixed' ? undefined : editorPolicyType.value,
-    }
+      anomalyThreshold: form.value.anomaly_threshold,
+      ipAclEnabled: form.value.ip_acl_enabled,
+      ipAclMode: form.value.ip_acl_mode,
+      ipAclList: ipACLList.value,
+      ipAclListRefs: ipACLListRefs.value,
+      ipWhitelist: ipWhitelist.value,
+      ipWhitelistRefs: ipWhitelistRefs.value,
+      ipWhitelistEnabled: ipWhitelistEnabled.value,
+      rateLimitEnabled: form.value.rate_limit_enabled,
+      rateLimitRps: form.value.rate_limit_rps,
+      rateLimitBurst: form.value.rate_limit_burst,
+      crsRuleGroups: crsRuleGroups.value,
+      crsExcludedRules: serializedExcludedRules.value,
+      customRuleIds: selectedCustomRules.value,
+      blockPageId: form.value.block_page_id,
+      blockStatusCode: form.value.block_status_code,
+      geoipCountries: geoipCountries.value,
+      geoipEnabled: form.value.geoip_enabled,
+      geoipMode: form.value.geoip_mode,
+      geoipCrawlerExempt: form.value.geoip_crawler_exempt,
+      geoipCrawlerEngines: form.value.geoip_crawler_engines ?? [],
+      wafCheckResponse: form.value.waf_check_response,
+      logRequestBody: form.value.log_request_body,
+      trustDetection: form.value.trust_detection,
+      policyType: editorPolicyType.value,
+    })
     let saveRes: APIResponse<{ id: number }> | undefined
     if (editingId.value) {
       saveRes = await request.put(`/security/policies/${editingId.value}`, payload)
@@ -3022,7 +3142,9 @@ const handleSave = async () => {
     // v2.2.0 多策略绑定保存组合（SC-BIND-02）：新增/取消走策略侧批量端点
     // （历史：单事务批量增删本策略绑定行，不触碰兄弟绑定——与原逐规则
     // additive POST/DELETE 语义一致，但从 N 次全链请求收敛为 1 次单渲染请求）。
-    let bindLastRes: { message?: string } | undefined
+    // 历史问题（R-12 同族）：逐片响应汇总后再呈现——只保留末片会让早先分片的
+    // 退化 200（Caddy 应用失败但 DB 已提交）被覆盖丢失。
+    const bindResponses: Array<{ message?: string } | undefined> = []
     try {
       // 2026-09-08 审计 FE1：捕获响应传 showSaveResult——退化 200+后缀
       // （Caddy 应用失败但 DB 已提交）时持续警告可见（有全局横幅兜底但即时
@@ -3030,16 +3152,16 @@ const handleSave = async () => {
       // 历史问题-06：后端单次 bind+unbind 合计 ≤100（超限整批 400 且原样重试仍失败）
       // ——按方向分片提交（每片 ≤100，天然满足合计上限）；端点幂等，重试安全。
       for (const ids of chunkForBulk(added, SECURITY_BULK_LIMITS.policyBindings)) {
-        bindLastRes = await request.post<{ message?: string }>(`/security/policies/${editingId.value}/bindings/bulk`, {
+        bindResponses.push(await request.post<{ message?: string }>(`/security/policies/${editingId.value}/bindings/bulk`, {
           bind: ids,
           unbind: [],
-        }) as { message?: string }
+        }) as { message?: string })
       }
       for (const ids of chunkForBulk(removed, SECURITY_BULK_LIMITS.policyBindings)) {
-        bindLastRes = await request.post<{ message?: string }>(`/security/policies/${editingId.value}/bindings/bulk`, {
+        bindResponses.push(await request.post<{ message?: string }>(`/security/policies/${editingId.value}/bindings/bulk`, {
           bind: [],
           unbind: ids,
-        }) as { message?: string }
+        }) as { message?: string })
       }
     } catch (error: unknown) {
       // 失败的绑定请求已由全局拦截器 toast，这里仅记录并中止收尾
@@ -3079,8 +3201,21 @@ const handleSave = async () => {
               block_page_stage3_id: edit.stage3_id,
               block_page_stage3_status: edit.stage3_id > 0 ? edit.stage3_status : 0,
             })
-            for (const caddyId of chunk) applyStageOverrideSuccess(caddyId, edit)
-            for (const item of res.data?.skipped ?? []) skippedNotes.push(`${item.rule_id}（${item.reason}）`)
+            const skippedItems = res.data?.skipped ?? []
+            // W87-09：先归集 skipped 再回写——被跳过的规则（TCP/规则不存在等）库中
+            // 未写入，回写会让 UI 谎报「已覆盖」且下次保存不再重试。
+            const skippedIds = new Set(skippedItems.map((item) => item.rule_id))
+            for (const caddyId of chunk) {
+              if (!skippedIds.has(caddyId)) applyStageOverrideSuccess(caddyId, edit)
+            }
+            if (skippedItems.length > 0) {
+              const skipNotes = { ...stageOverrideSkipped.value }
+              for (const item of skippedItems) {
+                skipNotes[item.rule_id] = item.reason
+                skippedNotes.push(`${item.rule_id}（${item.reason}）`)
+              }
+              stageOverrideSkipped.value = skipNotes
+            }
           } catch (error: unknown) {
             for (const caddyId of chunk) {
               failedRules.push(allRules.value.find((r) => r.caddy_id === caddyId)?.name || caddyId)
@@ -3101,14 +3236,18 @@ const handleSave = async () => {
         return
       }
       if (skippedNotes.length > 0) {
-        ElMessage.warning(`部分规则未写入阶段拦截页覆盖：${skippedNotes.join('；')}`)
+        // W87-09：被跳过的规则行内已标「未写入（原因）」，此处给汇总口径；
+        // 成功计数只数真正写入的规则（不得把 skipped 计入「已同步」）。
+        ElMessage.warning(`部分规则未写入阶段拦截页覆盖：${skippedNotes.join('；')}；这些规则保持待保存，可重试`)
       }
-      mfaAwareSuccess(`已同步 ${pendingOverrides.length} 条规则的阶段拦截页覆盖`)
+      const syncedCount = pendingOverrides.length - skippedNotes.length
+      if (syncedCount > 0) mfaAwareSuccess(`已同步 ${syncedCount} 条规则的阶段拦截页覆盖`)
     }
     showSaveResult(saveRes, '保存成功')
     // 2026-09-08 审计 FE1：bind/unbind 的退化 200+后缀也需可见（有后缀才弹，
-    // 无后缀不重复 toast）
-    if (bindLastRes?.message?.includes('Caddy 配置应用失败')) showSaveResult(bindLastRes, '')
+    // 无后缀不重复 toast）；历史问题：汇总全部分片而非末片。
+    const mergedBind = mergeBulkResults(bindResponses)
+    if (mergedBind?.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(mergedBind, '')
     dialogVisible.value = false; fetchData()
     // FE18-1(历史):本地契约 throw(如「响应缺少 id」)不经 axios 拦截器,
     // 空 catch 会静默吞掉——点保存无反应且已落库可致重试重复创建;按错误
@@ -3325,11 +3464,12 @@ onMounted(async () => {
 /* v2.2.0 拦截页面按规则生效状态注释块：跟随 .form-tip-line 的 12px/灰调，
    仅状态词使用克制的成功/警告/灰着色，避免使用 el-tag 造成视觉噪声。 */
 .block-page-rule-annotations { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; font-size: 12px; line-height: 1.5; color: #9ca3af; width: 100%; }
-.block-page-rule-annotation { display: flex; align-items: center; gap: 6px; }
+.block-page-rule-annotation { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 .block-page-rule-annotation-name { color: #6b7280; }
 .block-page-rule-annotation-status.is-active { color: #10b981; }
 .block-page-rule-annotation-status.is-warning { color: #d97706; }
 .block-page-rule-annotation-status.is-disabled { color: #9ca3af; }
+.block-page-rule-annotation-status.is-info { color: #6b7280; }
 
 .rule-binding-preview { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 2px 0 4px 24px; }
 .rule-binding-landing { font-size: 12px; color: #6b7280; }

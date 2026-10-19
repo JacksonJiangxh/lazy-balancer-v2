@@ -187,7 +187,25 @@ func TestMigrateAuditVocabulary_secondRunIssuesNoUpdate(t *testing.T) {
 // resource 均为字面量且命中归一表旧侧即违规——动态传参不参与（其词条在调用方
 // 字面量处已由 services 的词数门扫描）。归一表多为动作作用域条目（重载+
 // Caddy配置→Caddy服务），必须成对判定。
-func TestAuditWritePointsUseCanonicalVocabulary(t *testing.T) {
+// auditWritePoint 是一次审计写入口调用点的字面量对（动态传参不参与——其词条
+// 在调用方字面量处由词数门扫描）。
+type auditWritePoint struct {
+	pos      string
+	action   string
+	resource string
+}
+
+// collectAuditWritePoints 以 AST 遍历 internal/ 非测试源码，收集审计写入口的
+// action/resource 字面量参数。
+//
+// 为什么是 AST（历史问题，历史）：这组契约是「每个审计写点都在用规范
+// 词条」「迁移目标存在真实写点」。写点分散在 handlers/services/taskengine 且
+// 动态传参不可穷举，行为测试无法覆盖；AST 绑定调用契约（函数名+参数位），不
+// 依赖源码文本格式/反引号边界，纯重构不会假红——属 AGENTS.md「只测可观察契约
+// …禁止断言源码文本」的登记豁免形态（本行即豁免声明）。迁移表自身所在文件
+// （db/audit.go）不参与，避免自证。
+func collectAuditWritePoints(t *testing.T) []auditWritePoint {
+	t.Helper()
 	root, err := filepath.Abs(filepath.Join("..", "..", "internal"))
 	if err != nil {
 		t.Fatalf("resolve internal dir: %v", err)
@@ -198,18 +216,6 @@ func TestAuditWritePointsUseCanonicalVocabulary(t *testing.T) {
 		"recordAudit":                       {1, 2},
 		"recordSystemAudit":                 {0, 1},
 		"recordAuthenticationSecurityAudit": {1, 2},
-	}
-	isRetired := func(action, resource string) bool {
-		for _, r := range auditVocabularyRenames {
-			if r.oldAction != "" && r.oldAction != action {
-				continue
-			}
-			if r.oldResource != "" && r.oldResource != resource {
-				continue
-			}
-			return true
-		}
-		return false
 	}
 	literal := func(e ast.Expr) (string, bool) {
 		lit, ok := e.(*ast.BasicLit)
@@ -222,9 +228,13 @@ func TestAuditWritePointsUseCanonicalVocabulary(t *testing.T) {
 		return strings.Trim(lit.Value, "\""), true
 	}
 
-	var violations []string
+	points := make([]auditWritePoint, 0)
 	walkErr := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, path)
+		if rel == filepath.Join("db", "audit.go") {
 			return nil
 		}
 		fset := token.NewFileSet()
@@ -257,8 +267,55 @@ func TestAuditWritePointsUseCanonicalVocabulary(t *testing.T) {
 			if !ok || resource == "" {
 				return true
 			}
-			if isRetired(action, resource) {
-				violations = append(violations, fset.Position(call.Pos()).String()+" ("+strconv.Quote(action)+","+strconv.Quote(resource)+") 命中归一表旧侧，请改用规范名")
+			points = append(points, auditWritePoint{
+				pos:      fset.Position(call.Pos()).String(),
+				action:   action,
+				resource: resource,
+			})
+			return true
+		})
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("walk internal: %v", walkErr)
+	}
+	return points
+}
+
+// collectProductionStringLiterals 以 AST 收集 internal/ 非测试源码中的全部字符串
+// 字面量（注释天然不参与——AST 不含注释；也不依赖反引号边界/换行/文件归属）。
+// 用于「迁移目标必须存在写点」：新值可能经包装函数/映射表间接进入审计写点
+// （如 RecordAuditLog("system","校验阻断",resource,…) 的 resource 是动态值、
+// ACME配置 经 auditConfigResource 映射），逐个写入口取字面量参数会漏报，
+// 所以此契约要求「值在非测试源码中以字面量存在」即可——这是 历史问题 登记的
+// AST 形态豁免，替代原实现的全文件字符串包含（注释/日志假绿、纯文本重构假红）。
+func collectProductionStringLiterals(t *testing.T) map[string]bool {
+	t.Helper()
+	root, err := filepath.Abs(filepath.Join("..", "..", "internal"))
+	if err != nil {
+		t.Fatalf("resolve internal dir: %v", err)
+	}
+	literals := make(map[string]bool)
+	walkErr := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, path)
+		if rel == filepath.Join("db", "audit.go") {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			t.Errorf("parse %s: %v", path, err)
+			return nil
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			lit, ok := node.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			if unquoted, err := strconv.Unquote(lit.Value); err == nil {
+				literals[unquoted] = true
 			}
 			return true
 		})
@@ -266,6 +323,28 @@ func TestAuditWritePointsUseCanonicalVocabulary(t *testing.T) {
 	})
 	if walkErr != nil {
 		t.Fatalf("walk internal: %v", walkErr)
+	}
+	return literals
+}
+
+func TestAuditWritePointsUseCanonicalVocabulary(t *testing.T) {
+	isRetired := func(action, resource string) bool {
+		for _, r := range auditVocabularyRenames {
+			if r.oldAction != "" && r.oldAction != action {
+				continue
+			}
+			if r.oldResource != "" && r.oldResource != resource {
+				continue
+			}
+			return true
+		}
+		return false
+	}
+	var violations []string
+	for _, point := range collectAuditWritePoints(t) {
+		if isRetired(point.action, point.resource) {
+			violations = append(violations, point.pos+" ("+strconv.Quote(point.action)+","+strconv.Quote(point.resource)+") 命中归一表旧侧，请改用规范名")
+		}
 	}
 	if len(violations) != 0 {
 		t.Fatalf("审计写点使用归一表旧词条:\n%s", strings.Join(violations, "\n"))
@@ -298,34 +377,12 @@ func TestMigrateAuditVocabulary_convergesChainedRenameInOnePass(t *testing.T) {
 }
 
 // TestMigrateAuditVocabulary_newValuesHaveWritePoints 防「迁移目标与写点漂移」：
-// 每条映射的新值必须作为字面量出现在 internal/ 非测试源码中（即存在真实审计
-// 写点），否则迁移会把存量行归并到一个永不产生新事件的幽灵词条。迁移表自身
-// 所在文件（db/audit.go）不参与匹配，避免自证。
+// 每条映射的新值必须在 internal/ 非测试源码中以字面量存在（写点可能经包装
+// 函数/映射表间接引用，见 collectProductionStringLiterals 注释），否则迁移会把
+// 存量行归并到一个永不产生新事件的幽灵词条。历史问题：原实现读文件做子串包含
+// （注释/日志假绿、文本重构假红），改为 AST 字面量集合。
 func TestMigrateAuditVocabulary_newValuesHaveWritePoints(t *testing.T) {
-	root, err := filepath.Abs(filepath.Join("..", "..", "internal"))
-	if err != nil {
-		t.Fatalf("resolve internal dir: %v", err)
-	}
-	var sources []string
-	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		rel, _ := filepath.Rel(root, path)
-		if rel == filepath.Join("db", "audit.go") {
-			return nil
-		}
-		content, readErr := os.ReadFile(path)
-		if readErr != nil {
-			t.Errorf("read %s: %v", path, readErr)
-			return nil
-		}
-		sources = append(sources, string(content))
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk internal: %v", err)
-	}
+	literals := collectProductionStringLiterals(t)
 	seen := map[string]bool{}
 	for _, r := range auditVocabularyRenames {
 		for _, newValue := range []string{r.newAction, r.newResource} {
@@ -333,15 +390,8 @@ func TestMigrateAuditVocabulary_newValuesHaveWritePoints(t *testing.T) {
 				continue
 			}
 			seen[newValue] = true
-			found := false
-			for _, source := range sources {
-				if strings.Contains(source, `"`+newValue+`"`) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				t.Errorf("迁移目标 %q 在 internal/ 非测试源码中无任何字面量写点——迁移会归并到幽灵词条", newValue)
+			if !literals[newValue] {
+				t.Errorf("迁移目标 %q 在 internal/ 非测试源码中无任何字面量使用——迁移会归并到幽灵词条", newValue)
 			}
 		}
 	}

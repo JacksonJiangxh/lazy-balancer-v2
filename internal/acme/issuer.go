@@ -52,6 +52,22 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 		return "", "", fmt.Errorf("authorize order: %w", err)
 	}
 	log("order_created", fmt.Sprintf("订单已创建，共 %d 个授权", len(order.AuthzURLs)))
+	// DNS-87-F1（历史）：订单初始状态必须分流。新建订单正常为 pending；
+	// ready 表示授权已全部 valid（CA 幂等复用），继续走挑战循环是无害的空转；
+	// valid 表示该订单已有证书——其证书绑定的是签发方当时的 CSR 私钥，本次
+	// 新生成的 CSR 私钥与它不匹配，无法复用，必须显式失败而不是把 CA 对
+	// finalize 的拒绝（403 orderAlreadyValid/orderNotReady）磨成泛化错误；
+	// invalid 是终态。ready 无需在此拦截（下方授权分流已覆盖）。
+	switch order.Status {
+	case "valid":
+		return "", "", fmt.Errorf("订单 %s 已处于 valid 状态（CA 返回了已完成订单，其证书与本次 CSR 不匹配），请稍后重试", order.URI)
+	case "invalid":
+		errMsg := ""
+		if order.Error != nil {
+			errMsg = fmt.Sprintf(" (%d: %s)", order.Error.StatusCode, order.Error.Detail)
+		}
+		return "", "", fmt.Errorf("订单 %s 状态 invalid%s", order.URI, errMsg)
+	}
 
 	// Step 3: Clean up any stale DNS-01 TXT records first, then present new challenges.
 	type challengeInfo struct {
@@ -63,7 +79,11 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 	var localChallenges []challengeInfo
 	var presentedChallenges []ChallengeInfo
 	defer func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		// DNS-87-F4（历史）：清理预算按挑战数缩放——Cleanup 串行删除，单条
+		// 删除链最坏 90s（dnspod http.Client.Timeout / tencent ReqTimeout=90），
+		// 固定 2min 会让 root+www 两域名的第二个 TXT 清理被 ctx 取消
+		//（cleanup_warning + 残留延长）。
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), dnsCleanupBudget(len(presentedChallenges)))
 		defer cleanupCancel()
 		log("cleanup_dns", "清理 ACME DNS TXT 记录")
 		i.Cleanup(cleanupCtx, presentedChallenges)
@@ -75,18 +95,33 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 			return "", "", fmt.Errorf("fetch authorization %s: %w", authURL, err)
 		}
 
-		var chal *acme.Challenge
-		for _, c := range auth.Challenges {
-			if c.Type == "dns-01" {
-				chal = c
-				break
-			}
-		}
-		if chal == nil {
-			return "", "", fmt.Errorf("no dns-01 challenge for %s", auth.Identifier.Value)
+		domain := auth.Identifier.Value
+		// DNS-87-F1（历史）：RFC 8555 §7.4.1 允许 CA 复用同账号同标识的
+		// 已 valid 授权（Let's Encrypt boulder reuseValidAuthz 长期开启）。
+		// valid 授权无需 TXT/挑战，直接视为已验证；终态（invalid 家族）必须
+		// 立即失败。原实现对两者都无条件 Present（多写一条 TXT 并等满 5min
+		// 传播）再 Accept，在授权复用窗口内把本可成功的签发打成持续失败。
+		switch auth.Status {
+		case "valid":
+			log("validated", fmt.Sprintf("授权已有效（CA 复用），跳过 DNS-01 挑战 %s", domain))
+			continue
+		case "invalid", "deactivated", "expired", "revoked":
+			return "", "", fmt.Errorf("wait authorization %s: %w", authURL,
+				terminalAuthorizationError(auth.Status, nil, dns01Challenge(auth)))
+		case "pending":
+			// 常规路径：写 TXT → 等传播 → 提交挑战。
+		default:
+			// 未知状态 fail-loud：按 pending 处理会盲写 TXT 并提交挑战，
+			// 按 valid 处理会掩盖真实状态，两者都可能把可在下一轮成功的
+			// 签发拖成失败。
+			return "", "", fmt.Errorf("授权 %s 状态 %q 无法继续 DNS-01 挑战", authURL, auth.Status)
 		}
 
-		domain := auth.Identifier.Value
+		chal := dns01Challenge(auth)
+		if chal == nil {
+			return "", "", fmt.Errorf("no dns-01 challenge for %s", domain)
+		}
+
 		tokenFQDN := "_acme-challenge." + domain + "."
 		keyAuth, err := i.Client.DNS01ChallengeRecord(chal.Token)
 		if err != nil {
@@ -251,6 +286,29 @@ func (i *Issuer) Cleanup(ctx context.Context, challenges []ChallengeInfo) {
 	}
 }
 
+// 清理预算（DNS-87-F4，历史）：单条删除链最坏 90s（dnspod
+// http.Client.Timeout / tencent HttpProfile.ReqTimeout=90s，覆盖重试包络），
+// Cleanup 串行处理全部挑战，故预算须随挑战数线性放大；下限保留原 2min，
+// 上限 8min 保证「CA 队列执行预算 60min + 清理 ≤8min < staleOwnershipAge
+// 75min」——ownership 条目不会在清理进行中被他方判为陈旧。上限覆盖到
+// 4 个域名（4×100s=400s），更多域名按 8min 尽力清理，失败条目由
+// ownership 自愈兜底（记录不泄漏）。
+const (
+	dnsCleanupBudgetMin          = 2 * time.Minute
+	dnsCleanupBudgetPerChallenge = 100 * time.Second
+	dnsCleanupBudgetMax          = 8 * time.Minute
+)
+
+// dnsCleanupBudget 返回给定挑战数下的清理总预算（下限 2min、逐挑战 100s、
+// 上限 8min）。
+func dnsCleanupBudget(challengeCount int) time.Duration {
+	if challengeCount <= 1 {
+		return dnsCleanupBudgetMin
+	}
+	budget := time.Duration(challengeCount) * dnsCleanupBudgetPerChallenge
+	return min(max(budget, dnsCleanupBudgetMin), dnsCleanupBudgetMax)
+}
+
 // ChallengeInfo holds the info needed to clean up a DNS record.
 type ChallengeInfo struct {
 	Domain    string
@@ -335,8 +393,15 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 				if auth.Status == "invalid" {
 					_, waitErr := i.Client.WaitAuthorization(ctx, authURL)
 					var authorizationErr *acme.AuthorizationError
-					if errors.As(waitErr, &authorizationErr) {
+					switch {
+					case errors.As(waitErr, &authorizationErr):
 						authErr = authorizationErr
+					case waitErr != nil:
+						// DNS-87-F3（历史）：非授权错误的轮询失败（429/
+						// 网络）此前被丢弃——429 的结构化 *acme.Error 因此
+						// 无法传到 detectRateLimit，任务退化为普通失败退避
+						// 而非 waiting_ca。原样保留错误链。
+						authErr = waitErr
 					}
 				}
 				return terminalAuthorizationError(auth.Status, authErr, lastChal)
@@ -368,12 +433,30 @@ func isACMERRateLimit(err error) bool {
 	return errors.As(err, &acmeErr) && acmeErr.StatusCode == http.StatusTooManyRequests
 }
 
+// dns01Challenge 返回授权中的 dns-01 挑战（无则 nil）。DNS-87-F1（历史）
+// 抽出供授权状态分流与常规路径共用，避免两处各写一遍遍历。
+func dns01Challenge(auth *acme.Authorization) *acme.Challenge {
+	if auth == nil {
+		return nil
+	}
+	for _, c := range auth.Challenges {
+		if c.Type == "dns-01" {
+			return c
+		}
+	}
+	return nil
+}
+
 func terminalAuthorizationError(status string, authorizationErr error, challenge *acme.Challenge) error {
+	// DNS-87-F3（历史）：%w 保留错误链——invalid 分支的 WaitAuthorization
+	// 错误可能是 CA 429/网络错误，services/detectRateLimit 依赖
+	// errors.As(*acme.Error) 把任务记入 waiting_ca；%v 会让它退化为字符串
+	// 匹配。文案形态不变（单错误 %v/%w 渲染一致）。
 	if authorizationErr != nil {
-		return fmt.Errorf("授权状态 %s: %v", status, authorizationErr)
+		return fmt.Errorf("授权状态 %s: %w", status, authorizationErr)
 	}
 	if challenge != nil && challenge.Error != nil {
-		return fmt.Errorf("授权状态 %s: %v", status, challenge.Error)
+		return fmt.Errorf("授权状态 %s: %w", status, challenge.Error)
 	}
 	return fmt.Errorf("授权状态: %s", status)
 }
@@ -747,11 +830,11 @@ func probeTXT(ctx context.Context, server, fqdn, expected string, recursion bool
 		m.RecursionDesired = recursion
 
 		c := &dns.Client{Net: network}
-		// Short per-exchange timeout so a blocked server fails over quickly
-		// instead of consuming the whole propagation budget.
-		exchangeCtx, exCancel := context.WithTimeout(ctx, 8*time.Second)
-		r, _, err := c.ExchangeContext(exchangeCtx, m, server)
-		exCancel()
+		// DNS-87-F5（历史）：单台预算单源——probeDNSParallel 已为每台
+		// 设置 propagationResolverProbeTimeout 独立 ctx，此处不再叠加第二个
+		// 8s 硬编码（原实现 UDP+TCP 各 8s=16s，与接缝同名不同义：按接缝上调
+		// 单台预算时实际仍被内层 16s 截断）。直接调用方（测试）须自带 deadline。
+		r, _, err := c.ExchangeContext(ctx, m, server)
 		if err != nil || r == nil {
 			lastErr = err
 			continue

@@ -152,6 +152,9 @@ func AppendAPIKeyAuditDetail(detail string, keyID int, keyName string) string {
 // taskLogsHousekeeping）统一口径——读取失败（含 global_config 行缺失的
 // ErrNoRows）回退默认 3 月 + warn 留痕（曾静默跳过/静默默认三态分裂）；
 // 值越界（<1）同回退默认（写侧 1-12 校验+启动钳位兜底，正常不可达）。
+// V87-TO-04（历史）：log-cleanup 摘要行不再自行查库复算月数，改为复用
+// RuntimeLogCleanupOnce 回填的 RuntimeCleanupResult.RetentionMonths——仍在
+// 上述三消费点内，未新增第四份口径。
 func auditRetentionMonths() int {
 	const defaultMonths = 3
 	if db.DB == nil {

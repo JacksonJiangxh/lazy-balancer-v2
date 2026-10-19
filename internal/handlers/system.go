@@ -61,8 +61,20 @@ func (h *Handlers) GetSystemInfo(c *gin.Context) {
 		Uptime:        getUptime(),
 		Version:       version,
 	}
-	if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err == nil && !isMaster {
-		info.NodeMode = "slave"
+	// HC-11（历史）：角色查询失败/库未装配时不得静默呈现 master——
+	// 排障窗口里「显示主节点」会把方向引偏（同域写门 requireMasterNode 对同一
+	// 故障响亮 500）。三态化：unknown 并留 warn。
+	switch {
+	case db.DB == nil:
+		services.Logf("warn", "system info: 数据库未装配，节点角色未知（node_mode=unknown）")
+		info.NodeMode = "unknown"
+	default:
+		if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err != nil {
+			services.Logf("warn", "system info: 节点角色查询失败，按 unknown 呈现: %v", err)
+			info.NodeMode = "unknown"
+		} else if !isMaster {
+			info.NodeMode = "slave"
+		}
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: info})
 }

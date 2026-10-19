@@ -152,7 +152,7 @@ import { ArrowRight } from '@element-plus/icons-vue'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import { request } from '@/utils/api'
 import { formatDate } from '@/utils/date'
-import { parseIPList, parseRefIds, entryMatchesIp, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, formatDurationUs } from '@/utils/securityStages'
+import { parseIPList, parseRefIds, entryMatchesIp, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, formatDurationUs, eventDetailRefIds, detectionModeExplains, isTrustExemptionCandidate } from '@/utils/securityStages'
 import { useCrsRuleIndex } from '@/composables/useCrsRuleIndex'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type { APIResponse } from '@/types'
@@ -240,8 +240,9 @@ const formatTriggerTime = (v: string): string => formatDate(v)
 const exemptingTrustPolicy = computed<string | null>(() => {
   if (!props.row || props.row.action === 'blocked') return null
   const ip = props.row.client_ip.trim()
-  for (const p of [policy.value, ...enabledPolicies.value].filter((x): x is PolicyRow => !!x)) {
-    if (!p.ip_whitelist_enabled || p.trust_detection !== true) continue
+  // 历史问题：策略详情端点不过滤 enabled——属主策略可能事后被禁用，禁用策略不
+  // 渲染、不可能放行，不得参与豁免归因（判定单源 isTrustExemptionCandidate）。
+  for (const p of [policy.value, ...enabledPolicies.value].filter((x): x is PolicyRow => !!x && isTrustExemptionCandidate(x))) {
     if (parseIPList(p.ip_whitelist).some((e) => entryMatchesIp(e, ip))) return p.name
     const refs = parseRefIds(p.ip_whitelist_refs)
     if (refs.some((id) => (entriesCache.value[id] ?? []).some((e) => entryMatchesIp(e, ip)))) return p.name
@@ -251,7 +252,10 @@ const exemptingTrustPolicy = computed<string | null>(() => {
 const detectionNote = computed<string>(() => {
   if (!props.row || props.row.action === 'blocked') return ''
   if (kind.value === 'trust') return ''
-  if (policy.value?.mode === 'detection') return '所属策略为检测模式：命中只记录，不拦截'
+  // 历史问题：检测模式的 DetectionOnly 切换只覆盖 WAF 段（CRS/自定义含 body
+  // 目标）——阶段 1 族（IP ACL/地域/威胁/爬虫）的 logged 与模式无关，成因是
+  // 信任保留检测，不能归因「检测模式」。
+  if (detectionModeExplains(kind.value) && policy.value?.mode === 'detection') return '所属策略为检测模式：命中只记录，不拦截'
   if (exemptingTrustPolicy.value) return `信任保留检测（跨策略豁免）：由策略「${exemptingTrustPolicy.value}」的信任名单放行，命中记录为检测`
   return ''
 })
@@ -429,12 +433,10 @@ const loadAll = async (): Promise<void> => {
       loadError.value = true
       lists.value = []
     }
-    const refIds = new Set<number>()
-    const allPolicies = [policy.value, ...enabledPolicies.value].filter((p): p is PolicyRow => !!p)
-    for (const p of allPolicies) {
-      for (const id of parseRefIds(p.ip_acl_list_refs)) refIds.add(id)
-      for (const id of parseRefIds(p.ip_whitelist_refs)) refIds.add(id)
-    }
+    // 历史问题：只补拉详情弹框真实消费的名单——属主策略 ACL refs（命中列表/
+    // 内联判定）+ 全部信任 refs（跨策略信任豁免）；他策略 ACL refs 在本弹框
+    // 零消费，原实现在启用策略多/引用大名单时首屏无谓全量下载。
+    const refIds = eventDetailRefIds(policy.value, enabledPolicies.value)
     // 只补拉共享缓存缺失的名单（历史 历史问题）：原实现对全部 refIds 无条件
     // 并发 GET——连续打开事件详情时同一批名单反复下载。写回/通知由缓存单源负责。
     try {

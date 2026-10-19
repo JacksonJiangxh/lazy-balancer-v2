@@ -431,9 +431,9 @@ func TestUpdateInstallEntryCancellationDoesNotWriteSuccess(t *testing.T) {
 		m.fetchLatestTag = func(context.Context) (string, error) { return "v4.15.0", nil }
 		ctx, cancel := context.WithCancel(context.Background())
 		oldVersion := crsCurrentVersionForRun
-		crsCurrentVersionForRun = func() string {
+		crsCurrentVersionForRun = func() (string, error) {
 			cancel()
-			return "v4.14.0"
+			return "v4.14.0", nil
 		}
 		t.Cleanup(func() { crsCurrentVersionForRun = oldVersion })
 		done, err := m.StartUpdate("manual", &taskengine.RunContext{Ctx: ctx, Trigger: "manual"})

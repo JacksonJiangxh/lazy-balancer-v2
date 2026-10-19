@@ -38,8 +38,8 @@ func TestTaskLogsHousekeeping_retentionOnlyDoesNotRotate(t *testing.T) {
 	if _, err := db.DB.Exec("UPDATE global_config SET task_log_size_mb = 1 WHERE id = 1"); err != nil {
 		t.Fatal(err)
 	}
-	certJobLogSizeCachedAt.Store(0)
-	t.Cleanup(func() { certJobLogSizeCachedAt.Store(0) })
+	InvalidateTaskLogSizeCache()
+	t.Cleanup(InvalidateTaskLogSizeCache)
 
 	logsDir := t.TempDir()
 	tasksDir := logsDir + "/tasks"
@@ -68,8 +68,8 @@ func TestTaskLogsHousekeeping_certjobsExemptFromSizeRotation(t *testing.T) {
 	if _, err := db.DB.Exec("UPDATE global_config SET task_log_size_mb = 1 WHERE id = 1"); err != nil {
 		t.Fatal(err)
 	}
-	certJobLogSizeCachedAt.Store(0)
-	t.Cleanup(func() { certJobLogSizeCachedAt.Store(0) })
+	InvalidateTaskLogSizeCache()
+	t.Cleanup(InvalidateTaskLogSizeCache)
 
 	logsDir := t.TempDir()
 	certDir := logsDir + "/tasks/certjobs"

@@ -17,7 +17,7 @@ import type { APIResponse } from '@/types'
 //      三侧全部接线此出口；
 //   3) 移除 = 从引用列表 remove-ip（关联保留，仅移除条目）。
 // 信任侧未启用（ip_whitelist_enabled=false）时不阻断操作，仅提示「暂不生效」。
-export type ListSide = 'deny' | 'allow' | 'trust'
+type ListSide = 'deny' | 'allow' | 'trust'
 
 const SIDE_CONFIG: Record<ListSide, {
   refField: 'ip_acl_list_refs' | 'ip_whitelist_refs'
@@ -29,7 +29,7 @@ const SIDE_CONFIG: Record<ListSide, {
   trust: { refField: 'ip_whitelist_refs', suffix: '-信任', verb: '信任' },
 }
 
-export interface TrustPolicyLike {
+interface TrustPolicyLike {
   id: number
   name: string
   ip_acl_list?: string
@@ -39,7 +39,7 @@ export interface TrustPolicyLike {
   ip_whitelist_enabled?: boolean
 }
 
-export interface TrustListRef {
+interface TrustListRef {
   id: number
   name: string
   entry_count?: number

@@ -31,6 +31,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import { libraryScheduleError } from '@/utils/securityLibraries'
 
 // 规则库（CRS/IP2Region/威胁情报库）更新弹框共享的「定时更新」卡片区：
 // 星期多选（1=周一…7=周日）+ HH:MM 时间，保存即由后端重排下次更新。
@@ -71,11 +72,15 @@ watch(() => [props.days, props.time] as const, ([days, time], prev) => {
 })
 
 const emitSave = () => {
-  if (!editDays.value.length) {
-    ElMessage.warning('至少选择一天')
+  // 历史问题：时间被清空时不得静默回落 04:00（原 `editTime.value || '04:00'`
+  // 让输入框显示空、落库却是 04:00）；校验单源 utils/securityLibraries。
+  const time = editTime.value
+  const error = libraryScheduleError(editDays.value, time)
+  if (error) {
+    ElMessage.warning(error)
     return
   }
-  emit('save', { days: [...editDays.value], time: editTime.value || '04:00' })
+  emit('save', { days: [...editDays.value], time })
 }
 </script>
 

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 
 	"github.com/gin-gonic/gin"
@@ -119,5 +121,31 @@ func TestMFAVerifyStep_userReloadFailureReturns500(t *testing.T) {
 	rec := postMfaVerifyStep(router, fmt.Sprintf(`{"code":%q}`, code))
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s, want 500（DB 故障不得报 401 用户不可用）", rec.Code, rec.Body.String())
+	}
+}
+
+// H-B1-03：verify-step 重读用户必须带 auth_provider（此前 SELECT 漏列 →
+// 所有 step-up 响应 auth_provider=""，存量 OIDC 行丢 auth_method 声明）。
+func TestMFAVerifyStep_preservesAuthProvider(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	h.cfg.JWTSecret = "test-secret"
+	secret := seedMfaVerifyStepUser(t)
+	if _, err := db.DB.Exec("UPDATE users SET auth_provider='oidc' WHERE id=1"); err != nil {
+		t.Fatalf("set auth provider: %v", err)
+	}
+	router := mfaVerifyStepRouter(h, "jwt")
+	rec := postMfaVerifyStep(router, fmt.Sprintf(`{"code":%q}`, currentTOTPCode(t, secret)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload models.LoginResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, rec.Body.String())
+	}
+	if payload.User.AuthProvider != "oidc" {
+		t.Fatalf("auth_provider=%q, want oidc（verify-step 重读用户漏列）", payload.User.AuthProvider)
+	}
+	if !strings.Contains(payload.Token, ".") {
+		t.Fatalf("token=%q 不是 JWT", payload.Token)
 	}
 }

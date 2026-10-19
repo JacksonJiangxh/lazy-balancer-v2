@@ -427,8 +427,11 @@ func TestNewClientRetryBackoff_curve(t *testing.T) {
 		t.Fatal("RetryBackoff not configured")
 	}
 
-	// When/Then：n=0..6 基线 1,2,4,8,10,10,10 秒 + 0~1s 抖动（历史问题：多规则
-	// 并发签发不得在同一 CA 5xx 窗口以相同延迟同步重试）。
+	// When/Then：n 从 1 起跳（x/crypto 文档：首次失败 n=1）— 基线
+	// 1,2,4,8,10,10,10 秒 + 0~1s 抖动（历史问题：多规则并发签发不得在同一 CA
+	// 5xx 窗口以相同延迟同步重试）。DNS-87-F2（历史）：原测试从 n=0 起跳
+	// 断言 1,2,4,8,10…，而生产首召即 n=1 → 曲线整体右移一档（2,4,8,10…）却
+	// 恰好被 n=0 这一永不出现的档位掩蔽。
 	assertCurve := func(n int, base time.Duration) {
 		t.Helper()
 		for range 20 {
@@ -438,12 +441,15 @@ func TestNewClientRetryBackoff_curve(t *testing.T) {
 			}
 		}
 	}
-	for n, base := range []time.Duration{
+	bases := []time.Duration{
 		1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second,
 		10 * time.Second, 10 * time.Second, 10 * time.Second,
-	} {
-		assertCurve(n, base)
 	}
+	for idx, base := range bases {
+		assertCurve(idx+1, base)
+	}
+	// n<1 仅防御（生产不出现）：不得小于 1s 基线。
+	assertCurve(0, 1*time.Second)
 	// 抖动必须真实存在（否则多任务仍在同一 ms 同步重试）。
 	distinct := map[time.Duration]struct{}{}
 	for range 10 {
@@ -452,12 +458,44 @@ func TestNewClientRetryBackoff_curve(t *testing.T) {
 	if len(distinct) < 2 {
 		t.Fatal("backoff 无抖动：10 次采样恒等（thundering herd 未消除）")
 	}
-	if got := backoff(2, nil, &http.Response{StatusCode: http.StatusInternalServerError}); got < 4*time.Second || got > 5*time.Second {
-		t.Fatalf("backoff(n=2, 500)=%v, want [4s,5s]（非 429 响应同样走指数曲线）", got)
+	if got := backoff(3, nil, &http.Response{StatusCode: http.StatusInternalServerError}); got < 4*time.Second || got > 5*time.Second {
+		t.Fatalf("backoff(n=3, 500)=%v, want [4s,5s]（非 429 响应同样走指数曲线）", got)
 	}
 
 	// 429：返回 0 立即放弃库内重试（waiting_ca 记账语义，保持不变）
 	if got := backoff(3, nil, &http.Response{StatusCode: http.StatusTooManyRequests}); got != 0 {
 		t.Fatalf("backoff(n=3, 429)=%v, want 0", got)
+	}
+}
+
+// 历史（DNS-ACME 域）：既有账户密钥可用时，元数据（卫生清理输入）
+// 写失败不得阻断签发（DNS-87-F9）。
+
+// DNS-87-F9：既有账户密钥可用时，元数据（卫生清理输入）写失败不得阻断签发。
+func TestLoadOrCreateAccountKey_metadataWriteFailureDoesNotBlockIssuance(t *testing.T) {
+	dir := t.TempDir()
+	const directoryURL = "https://acme.example/directory"
+	const email = "admin@example.com"
+	keyPath := acmeAccountKeyPath(dir, directoryURL, email, "", nil)
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o755); err != nil {
+		t.Fatalf("create account dir: %v", err)
+	}
+	// 元数据路径被目录占用 → 元数据写必然失败（不依赖只读挂载/权限漂移）。
+	if err := os.MkdirAll(keyPath+".json", 0o755); err != nil {
+		t.Fatalf("occupy metadata path: %v", err)
+	}
+
+	// 首次：生成密钥（元数据写失败只记 warn）
+	created, err := loadOrCreateAccountKey(dir, directoryURL, email, "", nil)
+	if err != nil || created == nil {
+		t.Fatalf("新密钥生成被元数据写失败连坐: key=%v err=%v", created, err)
+	}
+	// 既有密钥路径：加载成功，不得被元数据刷新失败阻断
+	loaded, err := loadOrCreateAccountKey(dir, directoryURL, email, "", nil)
+	if err != nil || loaded == nil {
+		t.Fatalf("既有密钥加载被元数据写失败连坐: key=%v err=%v", loaded, err)
+	}
+	if !loaded.Equal(created) {
+		t.Fatal("既有密钥路径返回了不同密钥（应复用已落盘账户密钥）")
 	}
 }

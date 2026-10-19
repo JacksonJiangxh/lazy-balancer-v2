@@ -78,9 +78,10 @@ func TestLbbakImport_sectionsQueryScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {{"caddy_id": "imp1", "name": "imp", "protocol": "http", "domain": "a.example.com", "listen_port": 80, "enabled": 1}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	body := buildTestLbbak(t, backup, []byte("NEW-XDB-PAYLOAD"))
 
 	rec := postLbbakImport(g, t, body, "?sections=rules")
@@ -115,9 +116,10 @@ func TestLbbakImport_passwordVersionBumpScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {{"caddy_id": "imp2", "name": "imp", "protocol": "http", "domain": "a.example.com", "listen_port": 80, "enabled": 1}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	body := buildTestLbbak(t, backup, nil)
 
 	// 仅 rules:password_version 不动,响应无吊销提示
@@ -138,7 +140,7 @@ func TestLbbakImport_passwordVersionBumpScoped(t *testing.T) {
 	if _, err := db.DB.Exec(`DELETE FROM lb_rules WHERE caddy_id='imp2'`); err != nil {
 		t.Fatal(err)
 	}
-	body2 := buildTestLbbak(t, completeBackupJSON(t, nil), nil)
+	body2 := buildTestLbbak(t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, EmptyConfigIfNil: true}), nil)
 	rec = postLbbakImport(g, t, body2, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("full import: %d %s", rec.Code, rec.Body.String())
@@ -214,9 +216,10 @@ func TestLbbakImport_preservesXdbVersionSidecar(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_ip2region_version": {{"id": 1, "version": "tag-keep", "auto_update": 1}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	body := buildTestLbbak(t, backup, xdb)
 	rec := postLbbakImport(g, t, body, "")
 	if rec.Code != http.StatusOK {
@@ -239,9 +242,10 @@ func TestLbbakImport_wafFileFailureWarns(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(xdbPath + ".sync") })
 
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_ip2region_version": {{"id": 1, "version": "t", "auto_update": 1}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	body := buildTestLbbak(t, backup, []byte("DIFFERENT-XDB"))
 	rec := postLbbakImport(g, t, body, "")
 	if rec.Code != http.StatusOK {
@@ -367,9 +371,10 @@ func TestLbbakImport_singleSideWafBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_ip2region_version": {{"id": 1, "version": "tag-x", "auto_update": 1}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	body := buildTestLbbak(t, backup, []byte("ONLY-XDB"))
 	rec := postLbbakImport(g, t, body, "")
 	if rec.Code != http.StatusOK {
@@ -396,9 +401,10 @@ func TestImportConfigBackup_warnsDanglingACMEReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"certificate_configs": {},
-	})
+	}, EmptyConfigIfNil: true})
+
 	// JSON 注入 sections=users(系统数据)
 	var parsed map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(backup), &parsed); err != nil {
@@ -428,9 +434,10 @@ func TestImportConfigBackup_normalizesNullHealthCheckTimeout(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (5,'local-admin','x','admin',1)`); err != nil {
 		t.Fatal(err)
 	}
-	backup := completeBackupJSON(t, map[string][]map[string]any{
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules": {{"caddy_id": "nullh", "name": "n", "protocol": "http", "domain": "c.example.com", "listen_port": 80, "enabled": 1, "health_check_timeout": nil}},
-	})
+	}, EmptyConfigIfNil: true})
+
 	var parsed map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(backup), &parsed); err != nil {
 		t.Fatal(err)
@@ -461,7 +468,7 @@ func TestValidateImport_crsTreeReplacementSkipsLiveIndexExistence(t *testing.T) 
 		"id": 1, "name": "crs-policy", "mode": "blocking", "enabled": 1,
 		"crs_rule_groups": `["42"]`,
 	}
-	backupJSON := r78BackupJSON(t, map[string][]map[string]any{"security_policies": {policyRow}}, nil, []string{"security"})
+	backupJSON := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{"security_policies": {policyRow}}, Config: nil, Sections: []string{"security"}, EmptyConfigIfNil: true})
 
 	// 对照：纯 JSON 备份不携带 CRS 文件 → 按 live 索引（测试环境无规则目录）
 	// 判「规则组不存在」。

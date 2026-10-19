@@ -20,6 +20,8 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+
+	"lazy-balancer-v2/internal/netutil"
 )
 
 type toolSpec struct {
@@ -105,9 +107,9 @@ var tools = []toolSpec{
 	{"get_rate_limit_blocks", "获取限流拦截统计", http.MethodGet, "/security/rate-limit-blocks", nil, nil, emptySchema},
 	{"get_rule_stage_stats", "获取单规则三阶段安全统计（阶段 1/3 近 24h 拦截数+限流重载口径计数）", http.MethodGet, "/security/rules/{caddy_id}/stage-stats", []string{"caddy_id"}, nil, idSchema("caddy_id", "规则 Caddy ID", "string")},
 	{"create_security_policy", "创建安全策略（WAF 模式/CRS/IP ACL/GeoIP/限流/拦截页面）", http.MethodPost, "/security/policies", nil, nil, bodySchema},
-	{"update_security_policy", "更新指定安全策略", http.MethodPut, "/security/policies/{id}", []string{"id"}, nil, bodySchema},
+	{"update_security_policy", "更新指定安全策略", http.MethodPut, "/security/policies/{id}", []string{"id"}, nil, bodySchemaWithID("策略 ID")},
 	{"delete_security_policy", "删除指定安全策略", http.MethodDelete, "/security/policies/{id}", []string{"id"}, nil, idSchema("id", "策略 ID", "integer")},
-	{"bind_security_policy", "将安全策略绑定到指定规则", http.MethodPost, "/security/policies/{id}/bind", []string{"id"}, nil, bodySchema},
+	{"bind_security_policy", "将安全策略绑定到指定规则", http.MethodPost, "/security/policies/{id}/bind", []string{"id"}, nil, bodySchemaWithID("策略 ID")},
 	// McpB-2(历史问题):DELETE 请求体恒被后端丢弃——bodySchema(任意字段放行)会误导
 	// Agent 构造无效 body;换成路径参数契约形态(required id+caddy_id,
 	// forward 按 pathArgs 从 arguments 取值)。
@@ -116,17 +118,17 @@ var tools = []toolSpec{
 	// policy_ids maxItems=8 与后端 maxBindingsPerRule 校验对齐。
 	{"set_rule_security_policies", "原子设置规则的安全策略集合（按 policy_id ASC 顺序评估）", http.MethodPut, "/security/rules/{caddy_id}/policies", []string{"caddy_id"}, nil, setRuleSecurityPoliciesSchema},
 	{"create_custom_rule", "创建自定义安全规则", http.MethodPost, "/security/custom-rules", nil, nil, bodySchema},
-	{"update_custom_rule", "更新指定自定义安全规则", http.MethodPut, "/security/custom-rules/{id}", []string{"id"}, nil, bodySchema},
+	{"update_custom_rule", "更新指定自定义安全规则", http.MethodPut, "/security/custom-rules/{id}", []string{"id"}, nil, bodySchemaWithID("规则 ID")},
 	{"delete_custom_rule", "删除指定自定义安全规则", http.MethodDelete, "/security/custom-rules/{id}", []string{"id"}, nil, idSchema("id", "规则 ID", "integer")},
 	{"create_block_page", "创建拦截页面", http.MethodPost, "/security/block-pages", nil, nil, bodySchema},
-	{"update_block_page", "更新指定拦截页面", http.MethodPut, "/security/block-pages/{id}", []string{"id"}, nil, bodySchema},
+	{"update_block_page", "更新指定拦截页面", http.MethodPut, "/security/block-pages/{id}", []string{"id"}, nil, bodySchemaWithID("页面 ID")},
 	{"delete_block_page", "删除指定拦截页面", http.MethodDelete, "/security/block-pages/{id}", []string{"id"}, nil, idSchema("id", "页面 ID", "integer")},
 	{"list_ip_lists", "列出全部 IP 地址列表", http.MethodGet, "/security/ip-lists", nil, nil, emptySchema},
 	// 历史问题（历史）：v2.3.2 名单瘦身后 list_ip_lists 仅含 entry_count，
 	// 读条目唯一通道是 GET /security/ip-lists/:id——补工具覆盖，免豁免。
 	{"get_ip_list", "获取指定 IP 地址列表详情（含全部条目）", http.MethodGet, "/security/ip-lists/{id}", []string{"id"}, nil, idSchema("id", "列表 ID", "integer")},
 	{"create_ip_list", "创建 IP 地址列表", http.MethodPost, "/security/ip-lists", nil, nil, bodySchema},
-	{"update_ip_list", "更新指定 IP 地址列表", http.MethodPut, "/security/ip-lists/{id}", []string{"id"}, nil, bodySchema},
+	{"update_ip_list", "更新指定 IP 地址列表", http.MethodPut, "/security/ip-lists/{id}", []string{"id"}, nil, bodySchemaWithID("列表 ID")},
 	{"delete_ip_list", "删除指定 IP 地址列表", http.MethodDelete, "/security/ip-lists/{id}", []string{"id"}, nil, idSchema("id", "列表 ID", "integer")},
 	// 历史问题（2026-09 审计）：安全事件处置工作流——单条追加幂等（已存在返回
 	// added=false），免去 Agent 读全表-改-全量替换的竞态路径。
@@ -159,7 +161,7 @@ var tools = []toolSpec{
 	{"update_cluster_settings", "更新集群同步设置", http.MethodPut, "/cluster/settings", nil, nil, updateClusterSettingsSchema},
 	{"list_certificate_configs", "列出全部 DNS 证书配置", http.MethodGet, "/certificate-configs", nil, nil, emptySchema},
 	{"create_certificate_config", "创建 DNS 证书配置", http.MethodPost, "/certificate-configs", nil, nil, bodySchema},
-	{"update_certificate_config", "更新指定 DNS 证书配置", http.MethodPut, "/certificate-configs/{id}", []string{"id"}, nil, bodySchema},
+	{"update_certificate_config", "更新指定 DNS 证书配置", http.MethodPut, "/certificate-configs/{id}", []string{"id"}, nil, bodySchemaWithID("配置 ID")},
 	{"delete_certificate_config", "删除指定 DNS 证书配置", http.MethodDelete, "/certificate-configs/{id}", []string{"id"}, nil, idSchema("id", "配置 ID", "integer")},
 	// 历史问题 二十八次审计 F2：handler 要求 body 携带 domain（测试用的域名）——此前
 	// schema 只有 id（additionalProperties:false），经 MCP 调用恒 400「请求参数
@@ -174,13 +176,13 @@ var tools = []toolSpec{
 	{"get_cert_job_logs", "获取指定证书签发任务日志", http.MethodGet, "/certificates/jobs/{id}/logs", []string{"id"}, nil, idSchema("id", "任务 ID", "integer")},
 	{"parse_certificate", "解析上传的证书内容", http.MethodPost, "/certificates/parse", nil, nil, parseCertificateSchema},
 	{"create_user", "创建用户", http.MethodPost, "/users", nil, nil, bodySchema},
-	{"update_user", "更新指定用户", http.MethodPut, "/users/{id}", []string{"id"}, nil, bodySchema},
+	{"update_user", "更新指定用户", http.MethodPut, "/users/{id}", []string{"id"}, nil, bodySchemaWithID("用户 ID")},
 	{"toggle_user_status", "启用/禁用指定用户", http.MethodPut, "/users/{id}/status", []string{"id"}, nil, toggleUserStatusSchema},
 	{"reset_user_password", "重置指定用户密码", http.MethodPost, "/users/{id}/reset-password", []string{"id"}, nil, idSchema("id", "用户 ID", "integer")},
 	{"delete_user", "删除指定用户", http.MethodDelete, "/users/{id}", []string{"id"}, nil, idSchema("id", "用户 ID", "integer")},
 	{"reset_user_mfa", "重置用户 MFA（仅管理员；操作者已启用 MFA 时须提交本人 6 位动态验证码，未启用传空串——MCP/API Key 路径不走 428 step-up，直接在本接口验码）", http.MethodPost, "/users/{id}/mfa/reset", []string{"id"}, nil, `{"type":"object","required":["id","code"],"properties":{"id":{"type":"integer","description":"用户 ID"},"code":{"type":"string","description":"操作者自己的 6 位 MFA 动态验证码；操作者未启用 MFA 时传空串"}},"additionalProperties":false}`},
 	{"create_api_key", "创建 API 密钥", http.MethodPost, "/api-keys", nil, nil, bodySchema},
-	{"update_api_key_status", "更新 API 密钥状态（启用/只读/MCP 开关）", http.MethodPatch, "/api-keys/{id}/status", []string{"id"}, nil, bodySchema},
+	{"update_api_key_status", "更新 API 密钥状态（启用/只读/MCP 开关）", http.MethodPatch, "/api-keys/{id}/status", []string{"id"}, nil, bodySchemaWithID("密钥 ID")},
 	{"delete_api_key", "删除指定 API 密钥", http.MethodDelete, "/api-keys/{id}", []string{"id"}, nil, idSchema("id", "密钥 ID", "integer")},
 	{"preview_config", "预览配置变更（不应用）", http.MethodPost, "/config/preview", nil, nil, bodySchema},
 	{"validate_config", "验证配置文件有效性", http.MethodPost, "/config/validate", nil, nil, bodySchema},
@@ -316,10 +318,10 @@ func New(baseURL string, client *http.Client) http.Handler {
 }
 
 func NewWithInternalAuth(baseURL string, client *http.Client, internalAuthSecret string) http.Handler {
-	return newWithReadOnlyResolver(baseURL, client, internalAuthSecret, resolveAPIKeyReadOnly)
+	return newWithVisibilityResolver(baseURL, client, internalAuthSecret, resolveAPIKeyVisibility)
 }
 
-func newWithReadOnlyResolver(baseURL string, client *http.Client, internalAuthSecret string, resolver readOnlyResolver) http.Handler {
+func newWithVisibilityResolver(baseURL string, client *http.Client, internalAuthSecret string, resolver visibilityResolver) http.Handler {
 	if client == nil {
 		client = &http.Client{Timeout: 60 * time.Second}
 	}
@@ -535,16 +537,12 @@ func generateRandomPassword(length int) (string, error) {
 }
 
 // isReplayableRedirectStatus 判定可按原方法/原请求体重放的重定向状态码
-// （历史 历史问题-1）：面板 TLS 嗅探层对明文请求回 302，兼容 301/307/308；
-// 与集群同主机升级客户端（services DoWithSameHostTLSUpgradeRedirect）同一
-// 集合——单一语义，避免第三处再写 301/307/308 字面量分叉。重放目标仍由
-// isLoopbackHTTPURL 约束（凭证不出回环）。
+// （历史 历史问题-1）：面板 TLS 嗅探层对明文请求回 302，兼容 301/307/308。
+// CI87-14（历史）：集合单源化到 netutil.IsTLSUpgradeRedirect——此前 MCP
+// 转发与 services 同主机升级客户端各写一份 301/302/307/308 字面量，一侧新增
+// 状态码即静默分叉。重放目标仍由 isLoopbackHTTPURL 约束（凭证不出回环）。
 func isReplayableRedirectStatus(code int) bool {
-	switch code {
-	case http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
-		return true
-	}
-	return false
+	return netutil.IsTLSUpgradeRedirect(code)
 }
 
 func isLoopbackHTTPURL(target *url.URL) bool {
@@ -578,4 +576,12 @@ func scalarString(value any) string {
 
 func idSchema(name, description, valueType string) string {
 	return fmt.Sprintf(`{"type":"object","required":[%q],"properties":{%q:{"type":%q,"description":%q}},"additionalProperties":false}`, name, name, valueType, description)
+}
+
+// bodySchemaWithID 为「按 id 更新且 body 字段随工具而异」的工具声明路径参数：
+// 保留宽松 body（additionalProperties:true 向前兼容），同时把 id 写进
+// properties（CI87-05：此前这些工具复用 bodySchema，pathArgs 声明了 id 却无
+// 任何 schema 线索，Agent 只能凭描述猜参数名）。
+func bodySchemaWithID(description string) string {
+	return fmt.Sprintf(`{"type":"object","properties":{"id":{"type":"integer","description":%q}},"additionalProperties":true}`, description)
 }

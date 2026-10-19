@@ -77,11 +77,11 @@ func TestConfigBackup_crawlerSourcesRejectsForgedSource(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
-	body := completeBackupJSON(t, map[string][]map[string]any{
+	body := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"security_crawler_sources": {
 			{"id": 99, "name": "evil", "display_name": "伪造爬虫源", "url": "https://evil.example/list.json", "format": "json", "update_enabled": 1},
 		},
-	})
+	}, EmptyConfigIfNil: true})
 
 	// When
 	rec := httptest.NewRecorder()

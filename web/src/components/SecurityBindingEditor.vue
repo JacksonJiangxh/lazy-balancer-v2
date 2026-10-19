@@ -83,7 +83,7 @@
               <span class="picker-rule-name">{{ rule.name }}</span>
               <span class="picker-rule-meta">{{ rule.domain || '-' }}:{{ rule.listen_port }}</span>
             </el-checkbox>
-            <el-tooltip v-if="pickerWouldExceed(rule)" :content="`该规则已绑定 ${MAX_POLICY_BINDINGS} 条策略（上限），需先解绑`" placement="top">
+            <el-tooltip v-if="pickerWouldExceed(rule)" :content="`该规则已绑定 ${MAX_POLICIES_PER_RULE} 条策略（上限），需先解绑`" placement="top">
               <el-icon class="picker-cap-icon"><WarningFilled /></el-icon>
             </el-tooltip>
           </div>
@@ -123,8 +123,8 @@
 
     <template #footer>
       <div class="bind-editor-footer">
-        <span v-if="mode === 'rule'" class="bind-total" :class="{ 'is-over': ruleModeTotal > MAX_POLICY_BINDINGS }">
-          已选合计 {{ ruleModeTotal }} 条（每条规则上限 {{ MAX_POLICY_BINDINGS }} 条）
+        <span v-if="mode === 'rule'" class="bind-total" :class="{ 'is-over': ruleModeTotal > MAX_POLICIES_PER_RULE }">
+          已选合计 {{ ruleModeTotal }} 条（每条规则上限 {{ MAX_POLICIES_PER_RULE }} 条）
         </span>
         <span v-else class="bind-total">已选 {{ pickerSelected.length }} 条规则</span>
         <div class="bind-footer-buttons">
@@ -138,7 +138,7 @@
               <el-button
                 type="primary"
                 :loading="saving"
-                :disabled="mode === 'rule' && (ruleModeTotal > MAX_POLICY_BINDINGS || boundMixedPolicies.length > 0)"
+                :disabled="mode === 'rule' && (ruleModeTotal > MAX_POLICIES_PER_RULE || boundMixedPolicies.length > 0)"
                 @click="submit"
               >保存绑定</el-button>
             </span>
@@ -163,6 +163,7 @@ import {
   resolveStageOverride,
   chunkForBulk,
   SECURITY_BULK_LIMITS,
+  MAX_POLICIES_PER_RULE,
 } from '@/utils/securityStages'
 import type {
   SecurityPolicyType,
@@ -170,9 +171,8 @@ import type {
   SecurityStageBinding,
   SecurityStageBlockPage,
 } from '@/utils/securityStages'
+import { mergeBulkResults } from '@/utils/bulkApplyResult'
 
-// 与后端 SetRuleSecurityPolicies 上限（maxBindingsPerRule=8）同口径
-const MAX_POLICY_BINDINGS = 8
 const PICKER_PAGE_SIZE = 20
 // 绑定摘要排序严格按处理流程（任务 7）：阶段 0（最高优先）→ 1 → 2 → 3 → mixed
 const STAGE_ORDER: readonly SecurityPolicyType[] = ['stage0', 'stage1', 'stage2', 'stage3', 'mixed']
@@ -280,7 +280,7 @@ const pickerWouldExceed = (rule: BindingEditorRule): boolean => {
   const current = props.bindings[rule.caddy_id] || []
   if (current.some((b) => b.policy_id === props.policyId)) return false
   if (pickerSelected.value.includes(rule.caddy_id)) return false
-  return current.length >= MAX_POLICY_BINDINGS
+  return current.length >= MAX_POLICIES_PER_RULE
 }
 
 const pickerSelectableRules = computed(() => pickerFilteredRules.value.filter((rule) => !pickerWouldExceed(rule)))
@@ -367,8 +367,8 @@ const submit = async (): Promise<void> => {
   if (props.mode === 'rule') {
     const rule = props.rule
     if (!rule) return
-    if (ruleModeTotal.value > MAX_POLICY_BINDINGS) {
-      ElMessage.warning(`每条规则最多绑定 ${MAX_POLICY_BINDINGS} 条策略，当前已选 ${ruleModeTotal.value} 条`)
+    if (ruleModeTotal.value > MAX_POLICIES_PER_RULE) {
+      ElMessage.warning(`每条规则最多绑定 ${MAX_POLICIES_PER_RULE} 条策略，当前已选 ${ruleModeTotal.value} 条`)
       return
     }
     saving.value = true
@@ -417,14 +417,16 @@ const submit = async (): Promise<void> => {
   try {
     // 历史问题-06：bulk 端点单次 bind+unbind 合计 ≤100——按方向分片提交（每片 ≤100
     // 天然满足合计上限）；端点幂等，部分失败后重试安全。
-    let res: APIResponse<unknown> | undefined
+    // 历史问题：逐片响应必须汇总后再呈现——原实现只保留末片，早先分片的退化
+    // 200（DB 已提交但 Caddy 应用失败）被覆盖，常驻警告丢失。
+    const responses: Array<APIResponse<unknown> | undefined> = []
     for (const ids of chunkForBulk(toBind, SECURITY_BULK_LIMITS.policyBindings)) {
-      res = await request.post<APIResponse>(`/security/policies/${pid}/bindings/bulk`, { bind: ids, unbind: [] })
+      responses.push(await request.post<APIResponse>(`/security/policies/${pid}/bindings/bulk`, { bind: ids, unbind: [] }))
     }
     for (const ids of chunkForBulk(toUnbind, SECURITY_BULK_LIMITS.policyBindings)) {
-      res = await request.post<APIResponse>(`/security/policies/${pid}/bindings/bulk`, { bind: [], unbind: ids })
+      responses.push(await request.post<APIResponse>(`/security/policies/${pid}/bindings/bulk`, { bind: [], unbind: ids }))
     }
-    showSaveResult(res, `已更新 ${toBind.length + toUnbind.length} 条规则的绑定`)
+    showSaveResult(mergeBulkResults(responses), `已更新 ${toBind.length + toUnbind.length} 条规则的绑定`)
     emit('update:modelValue', false)
     emit('saved')
   } catch (error: unknown) {

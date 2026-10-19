@@ -302,7 +302,11 @@ func convergeIPListProjectionAfterMutation(task string) {
 		TaskLogfWarn(task, "reloading", "重载回调未注册，引用方渲染由下次配置变更收敛")
 		return
 	}
-	if rerr := threatReloader(); rerr != nil {
+	// SSA-87-03：真实 /load 与同族（threat_update/autoban/crs/ip2region）同口径
+	// 留系统重载审计——此前爬虫路径只写应用日志，审计中心无记录。
+	rerr := threatReloader()
+	recordSystemReloadAudit("crawlerbot_update", rerr)
+	if rerr != nil {
 		Logf("error", "爬虫地址库: 名单变化后重载失败: %v", rerr)
 		TaskLogfWarn(task, "reloading", "重载 Caddy 配置失败: %v", rerr)
 	}

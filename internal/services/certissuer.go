@@ -91,13 +91,18 @@ func (e *CAProviderRateLimitError) Error() string {
 //
 // 历史问题（历史）：本函数与 internal/dnsprovider/internal/retry.After 是
 // 同语义双实现（包边界所致：dnsprovider/internal 不可被 services 导入）。
-// 两者都接受 delay-seconds 与 HTTP-date、不可解析/非正值归零；任一侧修改
-// 解析口径（例如支持毫秒、处理负值）MUST 同步另一侧并保持语义一致。
+// 两者都接受 delay-seconds 与 HTTP-date、不可解析/非正值（含零/负数秒）归零；
+// 任一侧修改解析口径（例如支持毫秒、处理负值）MUST 同步另一侧并保持语义一致。
 func parseRetryAfter(header string) time.Duration {
 	if header == "" {
 		return 0
 	}
 	if seconds, err := strconv.Atoi(header); err == nil {
+		// SV历史问题：非正值显式归零（此前 "-5" 返回 -5s，仅靠下游 >0 判断
+		// 才无害）——与 dnsprovider/retry.After 及本条契约注释同口径。
+		if seconds <= 0 {
+			return 0
+		}
 		return time.Duration(seconds) * time.Second
 	}
 	if t, err := http.ParseTime(header); err == nil {
@@ -789,8 +794,8 @@ func detectRateLimit(err error) *CAProviderRateLimitError {
 	}
 
 	// Try to extract a Retry-After hint from the error text. The ACME library
-	// sometimes includes it as "retry after 2026-01-02 03:04:05 +0000 UTC" or
-	// "retry after 3600s".
+	// sometimes includes it as "retry after 2026-01-02 03:04:05 +0000 UTC"
+	// (Go time.Time.String()) or "retry after 3600s".
 	retryAfter := time.Duration(0)
 	if d := extractRetryAfterFromError(err.Error()); d > 0 {
 		retryAfter = d
@@ -823,6 +828,15 @@ func extractRetryAfterFromError(errText string) time.Duration {
 		}
 		// Try parsing as HTTP date.
 		if t, err := time.Parse(http.TimeFormat, suffix); err == nil {
+			if d := time.Until(t); d > 0 {
+				return d
+			}
+		}
+		// Try parsing as Go time.Time.String()（"2006-01-02 15:04:05 -0700 MST"，
+		// 即上方注释文档化的形态）。SV历史问题：此前只试 RFC3339/HTTP-date，该
+		// 文档化分支永不命中，退化为自有阶梯（1–3h，偏长）；Go 解析布局虽无
+		// 小数秒字段，但解析器接受任意长度的小数秒（标准库特例）。
+		if t, err := time.Parse("2006-01-02 15:04:05 -0700 MST", suffix); err == nil {
 			if d := time.Until(t); d > 0 {
 				return d
 			}

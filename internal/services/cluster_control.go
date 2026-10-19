@@ -2,10 +2,8 @@ package services
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,6 +15,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/internal/netutil"
 )
 
 var (
@@ -74,15 +73,14 @@ func (s *ClusterService) IssueServiceControlTicket(ctx context.Context, nodeID i
 	return models.ClusterServiceControlIssue{Ticket: ticket, NodeName: name, URL: accessURL}, nil
 }
 
+// signServiceControlTicket 保留包装（服务控制票据的调用面命名），实现与
+// 登录票据共用 signClusterTicket（S历史问题-04：签发单源）。
 func signServiceControlTicket(claims models.ClusterServiceControlClaims, key []byte) (string, error) {
-	payload, err := json.Marshal(claims)
+	ticket, err := signClusterTicket(claims, key)
 	if err != nil {
 		return "", fmt.Errorf("编码服务控制票据: %w", err)
 	}
-	encodedPayload := base64.RawURLEncoding.EncodeToString(payload)
-	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write([]byte(encodedPayload))
-	return encodedPayload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+	return ticket, nil
 }
 
 // ErrNoClusterPin 表示目标节点在本地没有 TOFU 指纹钉（http 地址或从未对其
@@ -145,17 +143,11 @@ func (s *ClusterService) ValidateServiceControlTicket(ctx context.Context, ticke
 		return ErrInvalidServiceControlTicket
 	}
 	key := sha256.Sum256([]byte(clusterToken))
-	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
+	payload, verify := verifyClusterTicket(ticket, key[:])
+	switch verify {
+	case clusterTicketSignature:
 		return errors.Join(ErrInvalidServiceControlTicket, ErrServiceControlSignature)
-	}
-	mac := hmac.New(sha256.New, key[:])
-	_, _ = mac.Write([]byte(parts[0]))
-	if !hmac.Equal(signature, mac.Sum(nil)) {
-		return errors.Join(ErrInvalidServiceControlTicket, ErrServiceControlSignature)
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
+	case clusterTicketMalformed:
 		return ErrInvalidServiceControlTicket
 	}
 	var claims models.ClusterServiceControlClaims
@@ -166,19 +158,11 @@ func (s *ClusterService) ValidateServiceControlTicket(ctx context.Context, ticke
 	if claims.ExpiresAt <= now.UTC().Unix() {
 		return errors.Join(ErrInvalidServiceControlTicket, ErrServiceControlExpired)
 	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM used_login_tickets WHERE expires_at<=?", now.UTC()); err != nil {
-		return fmt.Errorf("清理过期服务控制票据: %w", err)
-	}
-	jtiHash := sha256.Sum256([]byte(claims.JTI))
-	result, err := tx.ExecContext(ctx, `INSERT INTO used_login_tickets (jti_hash,expires_at) VALUES (?,?) ON CONFLICT(jti_hash) DO NOTHING`, hex.EncodeToString(jtiHash[:]), time.Unix(claims.ExpiresAt, 0).UTC())
+	consumed, err := consumeClusterTicketJTI(ctx, tx, claims.JTI, now.UTC(), time.Unix(claims.ExpiresAt, 0).UTC())
 	if err != nil {
 		return fmt.Errorf("消费服务控制票据: %w", err)
 	}
-	inserted, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("读取服务控制票据消费结果: %w", err)
-	}
-	if inserted != 1 {
+	if !consumed {
 		return errors.Join(ErrInvalidServiceControlTicket, ErrServiceControlReplay)
 	}
 	if err := tx.Commit(); err != nil {
@@ -214,10 +198,8 @@ func DoWithSameHostTLSUpgradeRedirect(client *http.Client, req *http.Request) (*
 	if err != nil {
 		return nil, err
 	}
-	switch resp.StatusCode {
-	case http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
-		// 候选升级信号；仍需通过下同主机名 + https 门。
-	default:
+	if !netutil.IsTLSUpgradeRedirect(resp.StatusCode) {
+		// 非升级信号直接返回。
 		return resp, nil
 	}
 	location := resp.Header.Get("Location")

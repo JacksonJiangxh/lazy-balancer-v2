@@ -1,4 +1,3 @@
-/// <reference lib="es2024.promise" />
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
