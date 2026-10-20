@@ -798,17 +798,18 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     return 1 - Math.pow(1 - Math.min(1, Math.max(0, t)), 3)
   }
 
-  /** xyz 世界坐标 → 屏幕坐标；背面点返回 false（叠加层不得穿透球体）。 */
+  /** xyz 世界坐标 → 屏幕坐标；返回是否在可见半球。
+   *  背面点也会写入 flowProjected（供背面淡色弧段使用），调用方按返回值区分。 */
   function projectFlowXyz(x: number, y: number, z: number, cam: THREE.Camera): boolean {
     const len = Math.hypot(x, y, z) || 1
     const nx = x / len
     const ny = y / len
     const nz = z / len
-    if (nx * (cam.position.x - x) + ny * (cam.position.y - y) + nz * (cam.position.z - z) <= 0.01) return false
+    const front = nx * (cam.position.x - x) + ny * (cam.position.y - y) + nz * (cam.position.z - z) > 0.01
     flowProjectVec.set(x, y, z).project(cam)
     flowProjected.x = ((flowProjectVec.x + 1) * flowW) / 2
     flowProjected.y = ((1 - flowProjectVec.y) * flowH) / 2
-    return true
+    return front
   }
 
   /** 经纬度 → 屏幕坐标；背面点返回 null。 */
@@ -830,8 +831,9 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     ctx.setTransform(flowDpr, 0, 0, flowDpr, 0, 0)
     ctx.clearRect(0, 0, flowW, flowH)
     if (!siteConfigured) return
+    // 站点转到球背面时不再整层跳过：仍绘制弧线落在可见半球的部分，
+    // 否则地球自转几十秒后光流会长期“消失”（地图页不受此影响）。
     const site = projectFlow(server[1], server[0])
-    if (!site) return
     const cam = globe.camera()
     cam.updateMatrixWorld()
     for (const arc of arcs) {
@@ -846,22 +848,50 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       const headIndex = Math.max(1, Math.min(samples - 1, Math.ceil(head * (samples - 1))))
       const alpha = Math.min(1, Math.max(0.05, (FLOW_LIFE_SECONDS - elapsed) / 0.4))
       let firstIndex = -1
+      let visibleCount = 0
+      let backCount = 0
       const maxSamples = flowScreen.length / 2
       const count = Math.min(headIndex, maxSamples - 1)
       for (let i = 0; i <= count; i++) {
         const o = i * 3
-        if (!projectFlowXyz(curve[o], curve[o + 1], curve[o + 2], cam)) {
-          flowFront[i] = 0
-          continue
-        }
-        flowFront[i] = 1
+        const front = projectFlowXyz(curve[o], curve[o + 1], curve[o + 2], cam)
+        flowFront[i] = front ? 1 : 0
         flowScreen[i * 2] = flowProjected.x
         flowScreen[i * 2 + 1] = flowProjected.y
-        if (firstIndex < 0) firstIndex = i
+        if (front) {
+          visibleCount++
+          if (firstIndex < 0) firstIndex = i
+        } else {
+          backCount++
+        }
       }
-      if (firstIndex < 0) continue
-      const dist = Math.hypot(site.x - flowScreen[firstIndex * 2], site.y - flowScreen[firstIndex * 2 + 1])
-      if (dist < 2 || dist > Math.max(flowW, flowH) * 1.2) continue
+      if (visibleCount < 2 && backCount < 2) continue
+      if (site && firstIndex >= 0) {
+        const dist = Math.hypot(site.x - flowScreen[firstIndex * 2], site.y - flowScreen[firstIndex * 2 + 1])
+        if (dist < 2 || dist > Math.max(flowW, flowH) * 1.2) continue
+      }
+      // 背面淡色弧段：地球自转/来源位于球背面时仍能看到流向；真实 3D 深度
+      // 遮挡由低透明度表达，避免光流在背半球完全消失。
+      if (backCount >= 2) {
+        ctx.beginPath()
+        let drawing = false
+        for (let i = 0; i <= count; i++) {
+          if (flowFront[i]) {
+            drawing = false
+            continue
+          }
+          const x = flowScreen[i * 2]
+          const y = flowScreen[i * 2 + 1]
+          if (drawing) ctx.lineTo(x, y)
+          else ctx.moveTo(x, y)
+          drawing = true
+        }
+        ctx.lineWidth = Math.max(1, flowArcWidth(arc.weight) * 0.8)
+        ctx.strokeStyle = arc.color
+        ctx.globalAlpha = alpha * 0.28
+        ctx.stroke()
+      }
+      ctx.globalAlpha = 1
       // 曲线不能使用「起点→站点」单一线性渐变：球面弧在屏幕上的弯曲会落到
       // 渐变轴起点之外，被 Canvas 钳成透明（历史实测 300ms 后整条消失）。
       // 改为沿弧长分段绘制，段尾透明度按进度递增：尾隐头亮且覆盖全曲线。
@@ -889,7 +919,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
         ctx.stroke()
       }
       ctx.globalAlpha = 1
-      if (arc.label) {
+      if (arc.label && firstIndex >= 0) {
         ctx.font = '11px ui-monospace, monospace'
         ctx.fillStyle = arc.color
         ctx.textBaseline = 'middle'

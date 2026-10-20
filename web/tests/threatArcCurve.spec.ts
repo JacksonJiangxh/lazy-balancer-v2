@@ -19,8 +19,10 @@ test('球面弧端点落在球面、中点高于球面、采样数正确', () =>
   for (const value of points) assert.ok(Number.isFinite(value), '曲线不得出现 NaN')
 })
 
-test('重合起终点不产生 NaN', () => {
+test('重合起终点不产生 NaN（短弧仍抬升，端点仍在球面）', () => {
   const points = buildSphericalArc(35.2, 108.9, 35.2, 108.9, 100, 8)
   for (const value of points) assert.ok(Number.isFinite(value))
-  for (let i = 0; i < 8; i++) assert.ok(Math.abs(norm(points, i) - 100) < 1e-6)
+  assert.ok(Math.abs(norm(points, 0) - 100) < 1e-3)
+  assert.ok(Math.abs(norm(points, 7) - 100) < 1e-3)
+  assert.ok(norm(points, 4) > 100)
 })

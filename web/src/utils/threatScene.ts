@@ -354,6 +354,9 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       minLat = Math.min(minLat, b.minLat); maxLat = Math.max(maxLat, b.maxLat)
     }
     const dots: Dot[] = []
+    // 省级 bbox 预筛：34 省 × 全网格点直接 pointInPolys 会在首次下钻产生
+    // 明显长任务；先按 bbox 排除绝大多数省份，再对候选做射线判定。
+    const provinceBounds = drillProvinceData.map((pv) => polysBounds(pv.polys))
     let pRow = 0
     // 与世界层同一 Mercator 投影 y 步长/错列，避免下钻后密度随纬度变化。
     const pTopY = latToY(maxLat)
@@ -362,9 +365,11 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       const lat = yToLat(y)
       const lonOffset = pRow % 2 === 1 ? DOT_STEP / 2 : 0
       for (let lon = minLon + lonOffset; lon <= maxLon; lon += DOT_STEP) {
-        for (const pv of drillProvinceData) {
-          if (!pointInPolys(lon, lat, pv.polys)) continue
-          dots.push({ lon, lat, key: shortName(pv.name) })
+        for (let pi = 0; pi < drillProvinceData.length; pi++) {
+          const b = provinceBounds[pi]
+          if (lon < b.minLon || lon > b.maxLon || lat < b.minLat || lat > b.maxLat) continue
+          if (!pointInPolys(lon, lat, drillProvinceData[pi].polys)) continue
+          dots.push({ lon, lat, key: shortName(drillProvinceData[pi].name) })
           break
         }
       }
@@ -509,29 +514,18 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     }
   }
 
-  // 世界暗度衬底用低分辨率缓存（约 720px 宽）：下钻高分辨率层只叠加省点阵，
-  // 避免每次下钻把 1.3 万世界点重新栅格化到 4096px 画布（首帧长任务根因）。
-  const dimWorldCanvas = document.createElement('canvas')
-  const dimWorldCtx = dimWorldCanvas.getContext('2d')!
-  let dimWorldScale = 0
-  function ensureDimWorldLayer(): void {
-    if (dimWorldScale > 0) return
+  // 下钻世界暗度衬底：复用世界点阵按国缓存的 Path2D，一次性 addPath 成
+  // 单一暗色路径。旧实现在新离屏 canvas 上重建 1.4 万条六边形（已删除），
+  // 是首次下钻卡顿的主要来源。
+  let dimWorldPath: Path2D | null = null
+  function ensureDimWorldPath(): Path2D | null {
+    if (dimWorldPath) return dimWorldPath
     buildWorldDots()
-    if (!worldDots) return
-    const scale = Math.min(2, Math.max(1, dpr))
-    dimWorldCanvas.width = Math.ceil(WORLD_W * scale)
-    dimWorldCanvas.height = Math.ceil(WORLD_D * scale)
-    dimWorldCtx.setTransform(scale, 0, 0, scale, 0, 0)
-    dimWorldCtx.clearRect(0, 0, WORLD_W, WORLD_D)
+    const byKey = ensureWorldDotPaths()
     const path = new Path2D()
-    for (const d of worldDots) {
-      dotSubPath(path, d.lon + WORLD_W / 2, latToY(d.lat), DOT_R * 1.35)
-    }
-    dimWorldCtx.globalAlpha = 0.22
-    dimWorldCtx.fillStyle = DOT_LAND
-    dimWorldCtx.fill(path)
-    dimWorldCtx.globalAlpha = 1
-    dimWorldScale = scale
+    for (const sub of byKey.values()) path.addPath(sub)
+    dimWorldPath = path
+    return path
   }
 
   // 下钻世界坐标离屏层：按目标下钻 zoom 只构建一次，动画/拖动期间只做
@@ -553,10 +547,15 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       drillWorldCanvas.width = w
       drillWorldCanvas.height = h
     }
-    ensureDimWorldLayer()
     drillWorldCtx.setTransform(scale, 0, 0, scale, 0, 0)
     drillWorldCtx.clearRect(0, 0, WORLD_W, WORLD_D)
-    if (dimWorldScale > 0) drillWorldCtx.drawImage(dimWorldCanvas, 0, 0, WORLD_W, WORLD_D)
+    const dimPath = ensureDimWorldPath()
+    if (dimPath) {
+      drillWorldCtx.globalAlpha = 0.22
+      drillWorldCtx.fillStyle = DOT_LAND
+      drillWorldCtx.fill(dimPath)
+      drillWorldCtx.globalAlpha = 1
+    }
     const byColor = new Map<string, Path2D>()
     for (const d of provinceDots) {
       const cnt = provinceCounts.get(d.key) ?? 0
@@ -1323,8 +1322,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       staticCanvas.height = 0
       drillWorldCanvas.width = 0
       drillWorldCanvas.height = 0
-      dimWorldCanvas.width = 0
-      dimWorldCanvas.height = 0
+      dimWorldPath = null
       canvas.remove()
       labelLayer.remove()
     },

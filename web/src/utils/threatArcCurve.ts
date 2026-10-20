@@ -3,6 +3,8 @@
 // 坐标约定与 globe.gl 一致：y 轴朝北极，经度绕 y 轴。
 
 export const SPHERICAL_ARC_ALTITUDE_SCALE = 0.4
+/** 短弧最小抬升：同省/邻省弧在球面上投影过短，容易被站点/扫描带遮住。 */
+export const SPHERICAL_ARC_MIN_ALTITUDE = 0.12
 export const SPHERICAL_ARC_SAMPLES = 48
 
 function toUnit(lat: number, lng: number): [number, number, number] {
@@ -35,7 +37,7 @@ export function buildSphericalArc(
   const cosAngle = Math.max(-1, Math.min(1, dot3(a, b)))
   const angle = Math.acos(cosAngle)
   const sinAngle = Math.sin(angle)
-  const altitude = (angle / 2) * SPHERICAL_ARC_ALTITUDE_SCALE
+  const altitude = Math.max(SPHERICAL_ARC_MIN_ALTITUDE, (angle / 2) * SPHERICAL_ARC_ALTITUDE_SCALE)
   const out = new Float32Array(count * 3)
   for (let i = 0; i < count; i++) {
     const t = i / (count - 1)
