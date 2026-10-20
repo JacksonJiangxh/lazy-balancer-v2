@@ -19,6 +19,15 @@ test('球面弧端点落在球面、中点高于球面、采样数正确', () =>
   for (const value of points) assert.ok(Number.isFinite(value), '曲线不得出现 NaN')
 })
 
+test('坐标轴与 globe.gl 一致：lng=0 在 +z，lng=90 在 +x', () => {
+  const points = buildSphericalArc(0, 0, 0, 90, 100, 2)
+  assert.ok(Math.abs(points[0]) < 1e-4, '起点 x≈0')
+  assert.ok(Math.abs(points[1]) < 1e-4, '起点 y≈0')
+  assert.ok(Math.abs(points[2] - 100) < 1e-3, 'lng=0 起点 z≈R')
+  assert.ok(Math.abs(points[3] - 100) < 1e-3, 'lng=90 终点 x≈R')
+  assert.ok(Math.abs(points[5]) < 1e-4, 'lng=90 终点 z≈0')
+})
+
 test('重合起终点不产生 NaN（短弧仍抬升，端点仍在球面）', () => {
   const points = buildSphericalArc(35.2, 108.9, 35.2, 108.9, 100, 8)
   for (const value of points) assert.ok(Number.isFinite(value))

@@ -11,7 +11,9 @@ function toUnit(lat: number, lng: number): [number, number, number] {
   const phi = (lat * Math.PI) / 180
   const lambda = (lng * Math.PI) / 180
   const cosPhi = Math.cos(phi)
-  return [cosPhi * Math.cos(lambda), Math.sin(phi), cosPhi * Math.sin(lambda)]
+  // 与 globe.gl polar2Cartesian 同口径：x=cos(lat)sin(lng)，
+  // z=cos(lat)cos(lng)。旧实现 cos/sin 轴互换，弧线整体旋转 90°。
+  return [cosPhi * Math.sin(lambda), Math.sin(phi), cosPhi * Math.cos(lambda)]
 }
 
 function dot3(a: readonly number[], b: readonly number[]): number {
