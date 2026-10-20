@@ -816,6 +816,9 @@ const attackFlowTask = usePollingTask(async ({ signal, isCurrent }) => {
     attackFlowSince = 0
     return
   }
+  // 引擎尚在异步装载：不消费游标，下一轮重新拉取，否则首波爆发的攻击流
+  // 会在 threatMap=null 时被静默丢弃（页面刚打开/模式切换后必现）。
+  if (!threatMap) return
   const weighted = new Map<string, { key: string; region: string; count: number }>()
   const heavy = (data.events?.length ?? 0) > 60
   const now = Date.now()
@@ -871,14 +874,19 @@ const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
     flowSince = 0
     return
   }
+  // 同攻击流：引擎未装载时不得推进游标，否则首轮正常流事件被丢弃。
+  if (!threatMap) return
   const events = data.events ?? []
   // 正常流与攻击流同一规则：地区 + 秒桶分组，>10 条合并，单轮预算一致。
-  // 采样后的 count 必须乘 sample_n 还原量级，否则 1/8 档弧线会系统性变细。
+  // 预算必须按“采样后事件数”计，不能先乘 sample_n：否则 1/8 下一个事件
+  // 会膨胀成 8 条重复弧，吃掉 12 条预算，其他地区正常弧被挤掉。
+  // sample_n 只还原每条弧的 weight（线宽/标签量级）。
   const sampleFactor = data.sample_n && data.sample_n > 0 ? data.sample_n : Math.max(1, activeSampleN.value)
   const groups = groupNormalFlowEvents(events)
   const regionByKey = new Map(groups.map((g) => [g.key, g.region]))
-  for (const item of planFlowArcs(groups.map((g) => ({ key: g.key, count: g.items.length * sampleFactor })))) {
-    threatMap?.addNormalArcForLocation(regionByKey.get(item.key) ?? item.key, item.count)
+  for (const item of planFlowArcs(groups.map((g) => ({ key: g.key, count: g.items.length })))) {
+    const weight = Math.max(1, Math.round(item.count * sampleFactor))
+    threatMap?.addNormalArcForLocation(regionByKey.get(item.key) ?? item.key, weight)
   }
   flowSince = nextFlowCursor(flowSince, data)
   if (flowSampleN.value === -1 && activeSampleN.value > 0) {
