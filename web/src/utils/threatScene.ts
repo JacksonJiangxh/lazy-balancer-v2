@@ -39,7 +39,7 @@ import { planFlowArcs } from '@/utils/threatFlowRules'
 
 const MAX_PIXEL_RATIO = 2
 const MAX_ACTIVE_ARCS = 60
-const ARC_FLIGHTS = 3
+const ARC_FLIGHTS = 1 // 每个请求只播一次（用户裁定；禁止循环 3 航次）
 const ARC_FLIGHT_SECONDS = FLOW_FLIGHT_MS / 1000
 const ARC_FLIGHT_GAP = 0.22
 const ARC_FLIGHT_PARTICLES = 12

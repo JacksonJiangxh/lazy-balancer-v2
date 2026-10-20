@@ -38,7 +38,7 @@ const WORLD_ALTITUDE = 1.63
 const MAX_ARCS = 60
 // 地图书写口径：3 个航次（3 × (0.95s + 0.22s) ≈ 3.51s）后移除；地球叠加层
 // 使用同一寿命，确保两页光流残留时长一致。
-const ARC_TTL = 3550
+const ARC_TTL = 1400
 
 /** 垂直扫描 shader（参考实现移植）：纬度带自北极向南极往返扫掠。 */
 const FRESNEL_VS = `
@@ -767,7 +767,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   const FLOW_TRAIL_SECONDS = FLOW_FLIGHT_MS / 1000
   const FLOW_GAP_SECONDS = 0.22
   const FLOW_CYCLE_SECONDS = FLOW_TRAIL_SECONDS + FLOW_GAP_SECONDS
-  const FLOW_LIFE_SECONDS = 3 * FLOW_CYCLE_SECONDS
+  const FLOW_LIFE_SECONDS = FLOW_CYCLE_SECONDS
   const flowCanvas = document.createElement('canvas')
   flowCanvas.style.cssText =
     'position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1;'
