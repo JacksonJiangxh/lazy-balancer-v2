@@ -284,11 +284,10 @@ import type { APIResponse } from '@/types'
 import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
-import { isRealtimeFlowEvent } from '@/utils/threatFlowRules'
 import { useCountUp } from '@/composables/useCountUp'
 import { formatDate } from '@/utils/date'
 import { trafficDelta, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '@/utils/threatScreenMetrics'
-import { flowBucket, flowBucketKey, flowGroupEvents, flowRegionKey, flowTimestamp, shouldAggregate, normalizeTrafficSampleN, reconstructObservedRate, stepAdaptiveSample, nextFlowCursor, groupNormalFlowEvents, planFlowArcs } from '@/utils/threatFlowRules'
+import { flowBucket, flowBucketKey, flowRegionKey, flowTimestamp, normalizeTrafficSampleN, reconstructObservedRate, stepAdaptiveSample, nextFlowCursor, groupNormalFlowEvents, planFlowArcs, FLOW_REALTIME_MAX_AGE_MS } from '@/utils/threatFlowRules'
 import type { ThreatScene, ThreatSceneOptions } from '@/utils/threatScene'
 
 // 威胁大屏（v2.3.8 Threat Wall 版式）：三栏 HUD 网格（左事件流/中引擎舞台/
@@ -344,12 +343,31 @@ interface NormalFlowEvent {
   at: number
 }
 
+interface AttackFlowEvent {
+  seq: number
+  at: number
+  country: string
+  province?: string
+  action?: string
+  rule_triggered?: string
+  weight?: number
+}
+
+interface ToastSummaryGroup {
+  client_ip: string
+  ip_location: string
+  action: string
+  attack_type: string
+  count: number
+  last_id: number
+  avg_duration_us?: number
+}
+
 const FEED_LIMIT = 50
 const FEED_POLL_MS = 3000
 const STATS_POLL_MS = 30000
-const ARC_FLUSH_MS = 500
-const FEED_PAGE_LIMIT = 200
-const FEED_MAX_PAGES = 5
+const ATTACK_FLOW_POLL_MS = 1000
+const TOAST_STALE_MS = 30000
 const windowOptions = [{ value: 1, label: '1h' }, { value: 24, label: '24h' }, { value: 168, label: '7d' }] as const
 const windowHours = ref<number>(24)
 
@@ -357,14 +375,11 @@ const authStore = useAuthStore()
 const stats = ref<ThreatScreenStats | null>(null)
 const statsError = ref(false)
 const feedItems = ref<FeedEvent[]>([])
-const sinceId = ref(0)
 const paused = ref(false)
 const mapHost = ref<HTMLElement | null>(null)
 const zoomedName = ref<string | null>(null)
 let threatMap: ThreatScene | null = null
 
-interface ArcTick { key: string; ts: number }
-let arcQueue: ArcTick[] = []
 let disposed = false
 
 const displayTotal = useCountUp(computed(() => stats.value?.total_events ?? 0))
@@ -530,44 +545,24 @@ function actionLabel(action: string): string {
 function triggerLabel(ev: FeedEvent): string {
   return ev.trigger_type || ev.attack_type || '—'
 }
-function pushAttackToasts(events: FeedEvent[]): void {
-  // 检测/拦截都视为攻击；同一地区（中国精确到省）同一秒 >10 条聚合成
-  // 一个带 ×N 的弹框，其余逐条弹。聚合规则与光流共用 threatFlowRules。
-  if (events.length === 0) return
-  const next: AttackToast[] = []
-  for (const group of flowGroupEvents(events)) {
-    const list = group.items
-    const count = list.length
-    if (shouldAggregate(count)) {
-      const ev = list[list.length - 1]
-      const actions = new Set(list.map((x) => x.action))
-      const action = actions.size > 1 ? 'mixed' : ev.action
-      const durMs = Math.max(0.1, (ev.duration_us ?? 0) / 1000)
-      next.push({
-        id: ev.id,
-        country: group.region.split('·')[0] || '未知',
-        ip: ev.client_ip,
-        stage: triggerLabel(ev),
-        action,
-        durationMs: durMs >= 100 ? Math.round(durMs).toString() : durMs.toFixed(1),
-        count,
-      })
-    } else {
-      for (const ev of list) {
-        const durMs = Math.max(0.1, (ev.duration_us ?? 0) / 1000)
-        next.push({
-          id: ev.id,
-          country: group.region.split('·')[0] || '未知',
-          ip: ev.client_ip,
-          stage: triggerLabel(ev),
-          action: ev.action,
-          durationMs: durMs >= 100 ? Math.round(durMs).toString() : durMs.toFixed(1),
-        })
-      }
+function pushAttackToasts(groups: ToastSummaryGroup[]): void {
+  // 服务端按「IP + 攻击类型 + 动作」精确计数；这里只负责取前 3 组展示。
+  if (groups.length === 0) return
+  const next = [...groups]
+    .filter((g) => g.count > 0 && g.client_ip)
+    .sort((a, b) => (b.count - a.count) || (b.last_id - a.last_id))
+    .slice(0, TOAST_MAX)
+  for (const group of next) {
+    const durMs = Math.max(0.1, (group.avg_duration_us ?? 0) / 1000)
+    const toast: AttackToast = {
+      id: group.last_id,
+      country: (group.ip_location.split('·')[0] || '未知'),
+      ip: group.client_ip,
+      stage: group.attack_type || '—',
+      action: group.action,
+      durationMs: durMs >= 100 ? Math.round(durMs).toString() : durMs.toFixed(1),
+      count: group.count,
     }
-  }
-  next.sort((a, b) => b.id - a.id)
-  for (const toast of next.slice(0, TOAST_MAX)) {
     attackToasts.value = [toast, ...attackToasts.value].slice(0, TOAST_MAX)
     const timer = window.setTimeout(() => {
       attackToasts.value = attackToasts.value.filter((t) => t.id !== toast.id)
@@ -664,34 +659,6 @@ const filteredFeed = computed(() =>
   sevFilter.value === 'all' ? windowFeed.value : windowFeed.value.filter((ev) => sevOf(ev) === sevFilter.value),
 )
 
-
-function enqueueArcs(events: FeedEvent[]): void {
-  for (const event of events) {
-    if (!event.ip_location) continue
-    const key = flowRegionKey(event.ip_location)
-    if (key) arcQueue.push({ key, ts: flowTimestamp(event.event_time ?? '') })
-  }
-}
-
-function flushArcs(): void {
-  if (!threatMap || arcQueue.length === 0) {
-    arcQueue = []
-    return
-  }
-  // 同一地区同一秒 >10 条合并为一条加权弧；≤10 逐条表达（攻击类型不区分）。
-  const groups = new Map<string, { key: string; count: number }>()
-  for (const item of arcQueue) {
-    const g = flowBucketKey(item.key, flowBucket(item.ts))
-    const cur = groups.get(g)
-    if (cur) cur.count += 1
-    else groups.set(g, { key: item.key, count: 1 })
-  }
-  for (const { key, count } of planFlowArcs([...groups.values()])) {
-    threatMap.addArcForLocation(key, count)
-  }
-  arcQueue = []
-}
-
 // ============ 正常流量 sparkline（计数器差分 → QPS 采样窗口） ============
 // 历史 历史问题/历史问题：available=false（Caddy admin 不可达）时保留上一帧
 // 并显性提示，不再把采集失败渲染为 0 流量；首轮只建基线；QPS 按真实间隔
@@ -752,7 +719,7 @@ function setWindow(hours: number): void {
 // 本站坐标 + 大屏模式（threat_screen_mode：map/globe）——/config 读一次。
 // 历史 历史问题：不阻塞引擎/轮询启动（见 onMounted）。
 const screenMode = ref('map')
-// 采样配置单源：-1=自适应、0=关闭、1=全量（固定 2-64 已退役，存量值归一为 -1）。
+// 采样配置单源：-1=自适应、0=关闭（全量/固定 2-64 已退役，存量值归一为 -1）。
 const flowSampleN = ref(-1)
 // 自适应档位（1 全量 / 4 / 8）；非自适应配置直接取配置值，0=关闭不申请逐请求采集。
 const activeSampleN = ref(1)
@@ -787,50 +754,89 @@ async function loadServerCentroid(): Promise<void> {
   }
 }
 
-// ============ 事件流 ============
+// ============ 左侧实时列表：安全日志最新 50 条快照 ============
 const feedError = ref(false)
-// 入场回溯只在「首次轮询」回放；不能用 sinceId===0 判定——会话库为空时首轮
-// sinceId 保持 0，此后第一批真实攻击会被误当回溯而丢掉光流/弹框。
-let feedFirstBatchDone = false
 const feedTask = usePollingTask(async ({ signal, isCurrent }) => {
-  const isInitialBatch = !feedFirstBatchDone
-  let cursor = sinceId.value
-  let hasMore = true
-  const events: FeedEvent[] = []
-  // 高水位不丢事件：后端升序返回，单页 200；积压超过一页时连续补拉到
-  // 追平或达到 5 页上限（1000 条/3s），不再像原 DESC+LIMIT 50 那样把中间
-  // 事件永久跳过。首屏 since=0 由后端返回最新一页。
-  for (let page = 0; page < FEED_MAX_PAGES && hasMore; page++) {
-    const res = await request.get<APIResponse<{ events: FeedEvent[]; next_since_id?: number; has_more?: boolean }>>(
-      `/security/events/feed?since_id=${cursor}&limit=${FEED_PAGE_LIMIT}`,
-      { silent: true, signal },
-    )
-    if (!isCurrent()) return
-    const batch = res.data?.events ?? []
-    events.push(...batch)
-    const nextSince = res.data?.next_since_id
-    if (typeof nextSince === 'number' && nextSince > cursor) cursor = nextSince
-    hasMore = res.data?.has_more === true
-    if (batch.length === 0) break
-  }
+  const res = await request.get<APIResponse<{ events: FeedEvent[] }>>(
+    `/security/events/feed?since_id=0&limit=${FEED_LIMIT}`,
+    { silent: true, signal },
+  )
   if (!isCurrent()) return
   feedError.value = false
-  feedFirstBatchDone = true
-  sinceId.value = cursor
-  if (events.length === 0) return
-  feedItems.value = [...events, ...feedItems.value].sort((a, b) => b.id - a.id).slice(0, FEED_LIMIT)
-  // 弧线/弹框仅对增量批次：首批（入场回溯）不回放——消除「开局三连流光」。
-  // 历史问题-03：增量批次同样需实时性门——入库延迟/轮转回填会把历史事件塞进
-  // 增量页，直接绘制会冒充「正在发生」；仅 5 分钟内事件做动效（列表照旧按
-  // windowFeed 时间窗口展示）。
-  if (!isInitialBatch) {
-    const fresh = events.filter((ev) => isRealtimeFlowEvent(ev.event_time))
-    if (fresh.length > 0) {
-      enqueueArcs(fresh)
-      pushAttackToasts(fresh)
-    }
-  }
+  feedItems.value = [...(res.data?.events ?? [])].sort((a, b) => b.id - a.id).slice(0, FEED_LIMIT)
 }, { interval: FEED_POLL_MS, onError: () => { feedError.value = true } })
+
+// ============ 攻击弹框：安全日志按游标精确聚合（IP + 类型 + 动作） ============
+let toastCursor = 0
+let toastInitialized = false
+let toastLastPollAt = 0
+const toastTask = usePollingTask(async ({ signal, isCurrent }) => {
+  const now = Date.now()
+  // 页面冻结/长时间阻塞后游标可能落后数分钟；直接重新取基线，避免一次
+  // 聚合大区间（400/s 上限也挡不住陈旧游标的扫描成本）。
+  if (toastInitialized && toastLastPollAt > 0 && now - toastLastPollAt > TOAST_STALE_MS) {
+    toastInitialized = false
+    toastCursor = 0
+  }
+  const baseline = !toastInitialized
+  const res = await request.get<APIResponse<{ groups?: ToastSummaryGroup[]; next_id?: number }>>(
+    `/security/events/toast-summary?since_id=${toastCursor}&limit=50${baseline ? '&baseline=1' : ''}`,
+    { silent: true, signal },
+  )
+  if (!isCurrent()) return
+  toastLastPollAt = Date.now()
+  const next = res.data?.next_id ?? toastCursor
+  const groups = res.data?.groups ?? []
+  // 首次调用只取当前高水位，不回放历史事件为弹框；空库也要标记已初始化，
+  // 否则第一条真实攻击会被当成基线吞掉。
+  if (!toastInitialized) {
+    toastInitialized = true
+  } else if (groups.length > 0) {
+    pushAttackToasts(groups)
+  }
+  if (typeof next === 'number' && next <= 0 && toastCursor > 0) {
+    // DB 重置/游标超前：下一轮重新取基线，避免把历史事件回放成弹框。
+    toastInitialized = false
+    toastCursor = 0
+  } else {
+    toastCursor = typeof next === 'number' && next >= 0 ? next : 0
+  }
+}, { interval: FEED_POLL_MS, onError: () => { /* 弹框不可用不阻断大屏 */ } })
+
+// ============ 攻击光流：独立攻击流环形缓冲（采样只影响本流） ============
+let attackFlowSince = 0
+const attackFlowTask = usePollingTask(async ({ signal, isCurrent }) => {
+  const res = await request.get<APIResponse<{ enabled?: boolean; events?: AttackFlowEvent[]; next_seq?: number }>>(
+    `/security/overview/threat-screen/attack-flow?since=${attackFlowSince}&limit=1000`,
+    { silent: true, signal },
+  )
+  if (!isCurrent()) return
+  const data = res.data
+  if (!data?.enabled) {
+    attackFlowSince = 0
+    return
+  }
+  const weighted = new Map<string, { key: string; region: string; count: number }>()
+  const heavy = (data.events?.length ?? 0) > 60
+  const now = Date.now()
+  for (const ev of data.events ?? []) {
+    // 入库延迟/轮转补采的旧事件不得画成实时攻击流光。
+    if (!Number.isFinite(ev.at) || now - ev.at > FLOW_REALTIME_MAX_AGE_MS) continue
+    const region = flowRegionKey(ev.province ? `${ev.country}·${ev.province}` : ev.country)
+    // 洪峰期按地区汇总整个批次（仍保留全部 weight），避免逐秒组数超过
+    // planFlowArcs 预算后静默丢弃计数；低速保持地区+秒粒度。
+    const key = heavy ? region : flowBucketKey(region, flowBucket(ev.at))
+    const weight = Number.isFinite(ev.weight) && (ev.weight ?? 0) > 0 ? Number(ev.weight) : 1
+    const cur = weighted.get(key)
+    if (cur) cur.count += weight
+    else weighted.set(key, { key, region, count: weight })
+  }
+  const regionByKey = new Map([...weighted.values()].map((g) => [g.key, g.region]))
+  for (const item of planFlowArcs([...weighted.values()])) {
+    threatMap?.addArcForLocation(regionByKey.get(item.key) ?? item.key, item.count)
+  }
+  attackFlowSince = nextFlowCursor(attackFlowSince, { enabled: true, next_seq: data.next_seq })
+}, { interval: ATTACK_FLOW_POLL_MS, onError: () => { /* 攻击流不可用不阻断大屏 */ } })
 
 const statsTask = usePollingTask(async ({ signal, isCurrent }) => {
   const res = await request.get<APIResponse<ThreatScreenStats>>(`/security/overview/threat-screen?hours=${windowHours.value}`, { silent: true, signal })
@@ -867,9 +873,11 @@ const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
   }
   const events = data.events ?? []
   // 正常流与攻击流同一规则：地区 + 秒桶分组，>10 条合并，单轮预算一致。
+  // 采样后的 count 必须乘 sample_n 还原量级，否则 1/8 档弧线会系统性变细。
+  const sampleFactor = data.sample_n && data.sample_n > 0 ? data.sample_n : Math.max(1, activeSampleN.value)
   const groups = groupNormalFlowEvents(events)
   const regionByKey = new Map(groups.map((g) => [g.key, g.region]))
-  for (const item of planFlowArcs(groups.map((g) => ({ key: g.key, count: g.items.length })))) {
+  for (const item of planFlowArcs(groups.map((g) => ({ key: g.key, count: g.items.length * sampleFactor })))) {
     threatMap?.addNormalArcForLocation(regionByKey.get(item.key) ?? item.key, item.count)
   }
   flowSince = nextFlowCursor(flowSince, data)
@@ -970,11 +978,19 @@ function togglePause(): void {
   paused.value = !paused.value
   if (paused.value) {
     feedTask.pause()
+    toastTask.pause()
+    attackFlowTask.pause()
     statsTask.pause()
     trafficTask.pause()
     flowTask.pause()
   } else {
+    // 暂停期间可能积累大量安全事件；恢复时重新取基线，避免一次性扫描/回放。
+    toastCursor = 0
+    toastInitialized = false
+    toastLastPollAt = 0
     feedTask.resume()
+    toastTask.resume()
+    attackFlowTask.resume()
     statsTask.resume()
     trafficTask.resume()
     flowTask.resume()
@@ -1036,7 +1052,6 @@ function releaseCollector(): void {
 const screenLoop = createVisibilityIntervals({
   intervals: [
     { tick: tickClock, ms: 1000, immediate: true },
-    { tick: flushArcs, ms: ARC_FLUSH_MS },
     { tick: acquireCollector, ms: COLLECTOR_HEARTBEAT_MS, immediate: true },
   ],
   onHidden: () => {
@@ -1047,9 +1062,13 @@ const screenLoop = createVisibilityIntervals({
   onVisible: () => {
     screenHidden = false
     // 后台节流可能让租约过期并清空后端序号；恢复后从 0 追赶，避免旧高水位
-    // 永久过滤新事件。
+    // 永久过滤新事件。弹框游标同样归零，首次摘要只取高水位、不回放历史。
     flowCursorEpoch++
     flowSince = 0
+    attackFlowSince = 0
+    toastCursor = 0
+    toastInitialized = false
+    toastLastPollAt = 0
     applyMapPause()
   },
 })
@@ -1062,10 +1081,12 @@ onMounted(() => {
   window.addEventListener('keydown', onKeydown)
   screenLoop.start()
   feedTask.start()
+  toastTask.start()
+  attackFlowTask.start()
   statsTask.start()
   trafficTask.start()
   flowTask.start()
-  void Promise.allSettled([feedTask.run(), statsTask.run(), trafficTask.run(), flowTask.run()])
+  void Promise.allSettled([feedTask.run(), toastTask.run(), attackFlowTask.run(), statsTask.run(), trafficTask.run(), flowTask.run()])
   // 配置最多等 4s（模式/本站坐标）；到达或超时都立即装载引擎。配置晚到且
   // 模式不同则 mountEngine 内部重装。
   const configPromise = loadServerCentroid().then(() => {
@@ -1088,6 +1109,8 @@ onBeforeUnmount(() => {
   for (const t of toastTimers.values()) clearTimeout(t)
   toastTimers.clear()
   feedTask.stop()
+  toastTask.stop()
+  attackFlowTask.stop()
   statsTask.stop()
   trafficTask.stop()
   flowTask.stop()

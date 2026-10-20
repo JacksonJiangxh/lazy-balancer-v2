@@ -15,26 +15,30 @@ import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { loadAdmin1Tables, loadedAdmin1Tables } from '@/utils/admin1Loader'
 import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, adminShortName, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed, DOT_LAND, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent } from '@/utils/threatShared'
 import type { ThreatScene, ThreatSceneOptions, CountryHeat } from '@/utils/threatScene'
-import { FLOW_ATTACK_ARC_COLORS, FLOW_NORMAL_ARC_COLORS, FLOW_FLIGHT_MS, flowArcLabel, flowArcWidth } from '@/utils/threatTheme'
+import { FLOW_ATTACK_COLOR, FLOW_NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowArcWidth } from '@/utils/threatTheme'
 import { planFlowArcs } from '@/utils/threatFlowRules'
 import { sphereSurfacePoint, DOT_LAT_TOP, DOT_LAT_BOTTOM } from '@/utils/threatProjection'
+import { buildSphericalArc, SPHERICAL_ARC_SAMPLES } from '@/utils/threatArcCurve'
 
 interface ArcDatum {
   startLat: number
   startLng: number
   endLat: number
   endLng: number
-  color: string[]
-  strokeW: number
+  color: string
   weight: number
   label?: string
   born: number
+  /** 球面大圆采样点 xyz 平铺；spawn 时生成一次，帧内只投影不重建。 */
+  curve: Float32Array
 }
 
 // 世界总览相机高度：2.4 实测球体偏小；1.8 放大约 1/3。
 const WORLD_ALTITUDE = 1.63
 const MAX_ARCS = 60
-const ARC_TTL = 4200
+// 地图书写口径：3 个航次（3 × (0.95s + 0.22s) ≈ 3.51s）后移除；地球叠加层
+// 使用同一寿命，确保两页光流残留时长一致。
+const ARC_TTL = 3550
 
 /** 垂直扫描 shader（参考实现移植）：纬度带自北极向南极往返扫掠。 */
 const FRESNEL_VS = `
@@ -241,17 +245,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     .ringMaxRadius(3)
     .ringPropagationSpeed(1.1)
     .ringRepeatPeriod(900)
-    .arcsData(arcs)
-    .arcStartLat('startLat')
-    .arcStartLng('startLng')
-    .arcEndLat('endLat')
-    .arcEndLng('endLng')
-    .arcColor('color')
-    .arcAltitudeAutoScale(0.4)
-    .arcStroke('strokeW' as never)
-    .arcDashLength(0.45)
-    .arcDashGap(2)
-    .arcDashAnimateTime(FLOW_FLIGHT_MS)
+    .arcsData([])
     // 聚合光流计数标签（世界/下钻共用；无标签时数据为空）
     .labelsData([])
     .labelLat('lat')
@@ -517,27 +511,26 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   const HOVER_DOT_COLOR = new THREE.Color(0.56, 0.9, 1)
-  // 热力色缓存：heatCss 返回 CSS 字符串，逐点 new THREE.Color().setStyle 会
-  // 把 1.3 万个颜色串解析一遍（hover 跨国家/30s 计数刷新时主线程抖动）。
-  // 颜色只由计数决定，按计数缓存即可（地图侧 heatCache 同口径）。
-  const heatColorCache = new Map<number, THREE.Color>()
-  function heatColor(count: number): THREE.Color {
-    const cached = heatColorCache.get(count)
-    if (cached) return cached
-    const color = new THREE.Color()
-    color.setStyle(count > 0 ? heatCss(count) : DOT_BASE)
-    heatColorCache.set(count, color)
-    return color
-  }
 
   function updateDotColors(): void {
     if (!dotsPoints || !activeDots) return
     const colorAttr = dotsPoints.geometry.getAttribute('color') as THREE.BufferAttribute | undefined
     if (!colorAttr) return
+    // 局部缓存：每次计数刷新最多 239 个颜色，函数结束即可回收；旧实现按
+    // count 永久缓存 THREE.Color，长时间 30s 轮询会无界增长（慢泄漏）。
+    const colorCache = new Map<number, THREE.Color>()
+    const colorFor = (count: number): THREE.Color => {
+      const cached = colorCache.get(count)
+      if (cached) return cached
+      const color = new THREE.Color()
+      color.setStyle(count > 0 ? heatCss(count) : DOT_BASE)
+      colorCache.set(count, color)
+      return color
+    }
     const arr = colorAttr.array as Float32Array
     for (let i = 0; i < activeDots.length; i++) {
       const d = activeDots[i]
-      const c = hoveredDotCountry && d.key === hoveredDotCountry ? HOVER_DOT_COLOR : heatColor(activeCounts.get(d.key) ?? 0)
+      const c = hoveredDotCountry && d.key === hoveredDotCountry ? HOVER_DOT_COLOR : colorFor(activeCounts.get(d.key) ?? 0)
       arr[i * 3] = c.r
       arr[i * 3 + 1] = c.g
       arr[i * 3 + 2] = c.b
@@ -695,9 +688,15 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   /** 下钻省点阵：与世界层同错列网格，按 admin 短名染色。 */
+  const PROVINCE_DOT_CACHE_MAX = 8
   function ensureProvinceDotSet(country: string): { dots: WorldDot[]; positions: Float32Array } {
     const cached = provinceDotCache.get(country)
-    if (cached) return cached
+    if (cached) {
+      // LRU：命中刷新到队尾，避免反复下钻热门国家被淘汰。
+      provinceDotCache.delete(country)
+      provinceDotCache.set(country, cached)
+      return cached
+    }
     const source = provinceSource(country)
     let minLon = 180, maxLon = -180, minLat = 90, maxLat = -90
     for (const pv of source) {
@@ -722,6 +721,11 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     }
     const result = { dots, positions: dotPositions(dots) }
     provinceDotCache.set(country, result)
+    while (provinceDotCache.size > PROVINCE_DOT_CACHE_MAX) {
+      const oldest = provinceDotCache.keys().next().value
+      if (oldest === undefined) break
+      provinceDotCache.delete(oldest)
+    }
     return result
   }
 
@@ -756,11 +760,172 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     cv.addEventListener('pointerleave', onPointerLeave)
   }
 
+  // ---- 光流叠加层（球面曲线 + 地图同款样式） ----
+  // 曲线在 spawn 时按球面大圆预计算（buildSphericalArc）；每帧只做零分配
+  // 投影并复用一块屏幕坐标标量，不创建逐段对象。3D tube/dash 已退役。
+  const FLOW_PARTICLES = 12
+  const FLOW_TRAIL_SECONDS = FLOW_FLIGHT_MS / 1000
+  const FLOW_GAP_SECONDS = 0.22
+  const FLOW_CYCLE_SECONDS = FLOW_TRAIL_SECONDS + FLOW_GAP_SECONDS
+  const FLOW_LIFE_SECONDS = 3 * FLOW_CYCLE_SECONDS
+  const flowCanvas = document.createElement('canvas')
+  flowCanvas.style.cssText =
+    'position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1;'
+  container.appendChild(flowCanvas)
+  const flowCtx = flowCanvas.getContext('2d')
+  let flowW = 0
+  let flowH = 0
+  let flowDpr = 1
+  const flowProjectVec = new THREE.Vector3()
+  const flowProjected = { x: 0, y: 0 }
+  const flowScreen = new Float32Array(SPHERICAL_ARC_SAMPLES * 2)
+  const flowFront = new Uint8Array(SPHERICAL_ARC_SAMPLES)
+
+  const syncFlowSize = (): void => {
+    const w = Math.max(1, container.clientWidth || 1)
+    const h = Math.max(1, container.clientHeight || 1)
+    const dpr = Math.min(window.devicePixelRatio || 1, 2)
+    if (w === flowW && h === flowH && dpr === flowDpr) return
+    flowW = w
+    flowH = h
+    flowDpr = dpr
+    flowCanvas.width = Math.round(w * dpr)
+    flowCanvas.height = Math.round(h * dpr)
+  }
+  syncFlowSize()
+
+  function easeOutCubic(t: number): number {
+    return 1 - Math.pow(1 - Math.min(1, Math.max(0, t)), 3)
+  }
+
+  /** xyz 世界坐标 → 屏幕坐标；背面点返回 false（叠加层不得穿透球体）。 */
+  function projectFlowXyz(x: number, y: number, z: number, cam: THREE.Camera): boolean {
+    const len = Math.hypot(x, y, z) || 1
+    const nx = x / len
+    const ny = y / len
+    const nz = z / len
+    if (nx * (cam.position.x - x) + ny * (cam.position.y - y) + nz * (cam.position.z - z) <= 0.01) return false
+    flowProjectVec.set(x, y, z).project(cam)
+    flowProjected.x = ((flowProjectVec.x + 1) * flowW) / 2
+    flowProjected.y = ((1 - flowProjectVec.y) * flowH) / 2
+    return true
+  }
+
+  /** 经纬度 → 屏幕坐标；背面点返回 null。 */
+  function projectFlow(lat: number, lng: number): { x: number; y: number } | null {
+    const cam = globe.camera()
+    const raw = (globe as unknown as { getCoords?: (lat: number, lng: number, alt?: number) => { x: number; y: number; z: number } }).getCoords?.(
+      lat,
+      lng,
+      0.005,
+    )
+    if (!cam || !raw || !projectFlowXyz(raw.x, raw.y, raw.z, cam)) return null
+    return { x: flowProjected.x, y: flowProjected.y }
+  }
+
+  function drawFlowOverlay(now: number): void {
+    if (!flowCtx) return
+    syncFlowSize()
+    const ctx = flowCtx
+    ctx.setTransform(flowDpr, 0, 0, flowDpr, 0, 0)
+    ctx.clearRect(0, 0, flowW, flowH)
+    if (!siteConfigured) return
+    const site = projectFlow(server[1], server[0])
+    if (!site) return
+    const cam = globe.camera()
+    cam.updateMatrixWorld()
+    for (const arc of arcs) {
+      const elapsed = (now - arc.born) / 1000
+      if (elapsed > FLOW_LIFE_SECONDS) continue
+      const local = elapsed % FLOW_CYCLE_SECONDS
+      if (local >= FLOW_TRAIL_SECONDS) continue
+      const curve = arc.curve
+      const samples = curve.length / 3
+      if (samples < 2) continue
+      const head = easeOutCubic(local / FLOW_TRAIL_SECONDS)
+      const headIndex = Math.max(1, Math.min(samples - 1, Math.ceil(head * (samples - 1))))
+      const alpha = Math.min(1, Math.max(0.05, (FLOW_LIFE_SECONDS - elapsed) / 0.4))
+      let firstIndex = -1
+      const maxSamples = flowScreen.length / 2
+      const count = Math.min(headIndex, maxSamples - 1)
+      for (let i = 0; i <= count; i++) {
+        const o = i * 3
+        if (!projectFlowXyz(curve[o], curve[o + 1], curve[o + 2], cam)) {
+          flowFront[i] = 0
+          continue
+        }
+        flowFront[i] = 1
+        flowScreen[i * 2] = flowProjected.x
+        flowScreen[i * 2 + 1] = flowProjected.y
+        if (firstIndex < 0) firstIndex = i
+      }
+      if (firstIndex < 0) continue
+      const dist = Math.hypot(site.x - flowScreen[firstIndex * 2], site.y - flowScreen[firstIndex * 2 + 1])
+      if (dist < 2 || dist > Math.max(flowW, flowH) * 1.2) continue
+      // 曲线不能使用「起点→站点」单一线性渐变：球面弧在屏幕上的弯曲会落到
+      // 渐变轴起点之外，被 Canvas 钳成透明（历史实测 300ms 后整条消失）。
+      // 改为沿弧长分段绘制，段尾透明度按进度递增：尾隐头亮且覆盖全曲线。
+      const chunks = Math.min(12, count)
+      ctx.lineWidth = flowArcWidth(arc.weight)
+      ctx.strokeStyle = arc.color
+      for (let c = 0; c < chunks; c++) {
+        const fromIdx = Math.floor((count * c) / chunks)
+        const toIdx = c === chunks - 1 ? count : Math.floor((count * (c + 1)) / chunks)
+        const ratio = toIdx / Math.max(1, count)
+        ctx.beginPath()
+        let drawing = false
+        for (let i = fromIdx; i <= toIdx; i++) {
+          if (!flowFront[i]) {
+            drawing = false
+            continue
+          }
+          const x = flowScreen[i * 2]
+          const y = flowScreen[i * 2 + 1]
+          if (drawing) ctx.lineTo(x, y)
+          else ctx.moveTo(x, y)
+          drawing = true
+        }
+        ctx.globalAlpha = alpha * (0.05 + 0.95 * ratio)
+        ctx.stroke()
+      }
+      ctx.globalAlpha = 1
+      if (arc.label) {
+        ctx.font = '11px ui-monospace, monospace'
+        ctx.fillStyle = arc.color
+        ctx.textBaseline = 'middle'
+        ctx.fillText(arc.label, flowScreen[firstIndex * 2] + 8, flowScreen[firstIndex * 2 + 1] - 8)
+      }
+
+      if (head < 1) {
+        for (let p = 0; p < FLOW_PARTICLES; p++) {
+          const t = Math.max(0, head - p * (0.16 / FLOW_PARTICLES))
+          const pos = t * (samples - 1)
+          const i0 = Math.min(samples - 1, Math.floor(pos))
+          const i1 = Math.min(samples - 1, i0 + 1)
+          const frac = pos - i0
+          const a0 = i0 * 3
+          const a1 = i1 * 3
+          const x = curve[a0] + (curve[a1] - curve[a0]) * frac
+          const y = curve[a0 + 1] + (curve[a1 + 1] - curve[a0 + 1]) * frac
+          const z = curve[a0 + 2] + (curve[a1 + 2] - curve[a0 + 2]) * frac
+          if (!projectFlowXyz(x, y, z, cam)) continue
+          ctx.beginPath()
+          ctx.arc(flowProjected.x, flowProjected.y, 1.8, 0, Math.PI * 2)
+          ctx.fillStyle = arc.color
+          ctx.globalAlpha = 0.85 * (1 - p / FLOW_PARTICLES)
+          ctx.fill()
+        }
+        ctx.globalAlpha = 1
+      }
+    }
+  }
+
   // 尺寸重试同步（构造竞态：容器 0×0 时双 RAF 单次尝试会静默失败）
   const syncSize = (): void => {
     const w = container.clientWidth
     const h = container.clientHeight
     if (w > 0 && h > 0 && (globe.width() !== w || globe.height() !== h)) globe.width(w).height(h)
+    syncFlowSize()
   }
   let syncTries = 0
   const syncTimer = window.setInterval(() => {
@@ -812,13 +977,13 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     last = now
     // hover 拾取每帧最多一次（pointermove 只记坐标——历史 历史问题）
     processHover()
+    drawFlowOverlay(now)
     if (!paused) {
       clock.t += dt / 1000
       if (scanMat) scanMat.uniforms.uTime.value = clock.t
       // 弧线老化淘汰（队首=最旧；保持其余对象次序稳定，动画相位不重排）
       if (arcs.length > 0 && now - arcs[0].born > ARC_TTL) {
         arcs.shift()
-        globe.arcsData([...arcs])
         syncArcLabels()
       }
     }
@@ -855,15 +1020,12 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     if (arcs.length >= MAX_ARCS) return
     arcs.push({
       ...arcEndpoints(server, from),
-      // 正常请求固定青色；检测/拦截统一攻击橙红。
-      color: normal ? [...FLOW_NORMAL_ARC_COLORS] : [...FLOW_ATTACK_ARC_COLORS],
-      // 正常/攻击同一线宽公式，仅颜色不同。
-      strokeW: flowArcWidth(weight),
+      color: normal ? FLOW_NORMAL_COLOR : FLOW_ATTACK_COLOR,
       weight,
       label: flowArcLabel(weight),
       born: performance.now(),
+      curve: buildSphericalArc(from[1], from[0], server[1], server[0], globe.getGlobeRadius(), SPHERICAL_ARC_SAMPLES),
     })
-    globe.arcsData([...arcs])
     syncArcLabels()
   }
 
@@ -972,6 +1134,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
         cvd.removeEventListener('pointermove', onCanvasMove)
         cvd.removeEventListener('pointerleave', onPointerLeave)
       }
+      flowCanvas.remove()
       cancelAnimationFrame(rafId)
       globe.pauseAnimation()
       globe.arcsData([])

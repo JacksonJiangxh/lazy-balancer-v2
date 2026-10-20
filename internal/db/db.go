@@ -65,7 +65,7 @@ const (
 	// 读侧绑定参数/导入归一全部引用，db_truth_defaults_test 双向钉死。
 	DefaultSecurityEventsRetentionDays = 90
 	DefaultSecurityEventsRowCap        = 1000000
-	DefaultThreatTrafficSampleN        = -1 // -1=自适应/0=关闭/1=全量
+	DefaultThreatTrafficSampleN        = -1 // -1=自适应/0=关闭（全量与固定档已废除）
 	DefaultThreatScreenMode            = "map"
 )
 
@@ -1068,7 +1068,7 @@ func runMigrations() error {
 		"global_config.github_token":                           "TEXT NOT NULL DEFAULT ''",
 		"global_config.server_map_lat":                         "REAL NOT NULL DEFAULT 0",
 		"global_config.threat_screen_mode":                     fmt.Sprintf("TEXT NOT NULL DEFAULT '%s'", DefaultThreatScreenMode),
-		"global_config.threat_traffic_sample_n":                fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultThreatTrafficSampleN), // -1=自适应/0=关闭/1=全量（历史；2..64 废除）
+		"global_config.threat_traffic_sample_n":                fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultThreatTrafficSampleN), // -1=自适应/0=关闭（全量/固定档废除）
 		"global_config.threat_traffic_sample_unified_migrated": "INTEGER NOT NULL DEFAULT 0",
 		// 安全事件保留显式化：默认 90 天 / 100 万行由配置本身承载，
 		// 不再用 0 隐式映射服务层写死默认值。历史问题：默认值单源=Default* 常量。
@@ -2380,30 +2380,42 @@ func migrateCanonicalDomains() error {
 	return nil
 }
 
-// migrateThreatTrafficSampleUnified 把大屏采样列收敛到 -1/0/1 三值契约
-// （历史用户裁定：固定 2..64 废除，-1=自适应 / 0=关闭 / 1=全量）。
-// 一次性迁移取代历史两条默认值迁移（8→4、4/8→-1）——本契约发布后任何
-// 2..64 值（旧默认 4/8、用户历史固定选择、旧备份恢复）都无意义，统一归
-// 自适应；{-1,0,1} 原样保留。marker 置 1 后不再触碰运行期写值（写侧门
-// -1/0/1 已单点约束）。
+// migrateThreatTrafficSampleUnified 把大屏采样列收敛到 -1/0 两值契约
+// （全量档已退役；自适应从 1/1 起步，低流量等价全量）。
+// 一次性迁移：1、固定 2..64 与畸形越界值统一归自适应；{-1,0} 原样保留。
+// marker 置 1 后不再触碰运行期写值（写侧门 -1/0 已单点约束）。
 func migrateThreatTrafficSampleUnified() error {
 	var done int
 	if err := DB.QueryRow(`SELECT COALESCE(threat_traffic_sample_unified_migrated,0) FROM global_config WHERE id=1`).Scan(&done); err != nil && err != sql.ErrNoRows {
 		return err
 	}
 	if done != 0 {
+		// marker 已置位的旧库仍可能残留全量 1（旧契约允许）；全量已退役，
+		// 每次启动做一次幂等收敛（仅命中 1，未命中零写入）。
+		var legacyFull int
+		if err := DB.QueryRow(`SELECT COUNT(*) FROM global_config WHERE id=1 AND threat_traffic_sample_n=1`).Scan(&legacyFull); err != nil {
+			return err
+		}
+		if legacyFull > 0 {
+			if _, err := DB.Exec(`UPDATE global_config SET threat_traffic_sample_n=? WHERE id=1 AND threat_traffic_sample_n=1`, DefaultThreatTrafficSampleN); err != nil {
+				return err
+			}
+			detail := fmt.Sprintf("启动迁移：大屏流量采样全量档已退役，归一为 %d（自适应）", DefaultThreatTrafficSampleN)
+			log.Print(detail)
+			recordSystemAudit("启动迁移", "系统配置", detail)
+		}
 		return nil
 	}
-	// 列 NOT NULL，但历史库存在带外直写 NULL 的可能：NULL 一并归一 -1，
-	// 其余非 -1/0/1 值（含 2..64 与畸形越界值）全部归自适应。
+	// 列 NOT NULL，但历史库存在带外直写 NULL 的可能：NULL 一并归一 -1；
+	// 1/2..64/畸形越界值全部归自适应。
 	var invalidRows int
 	if err := DB.QueryRow(`SELECT COUNT(*) FROM global_config
-		WHERE id=1 AND (threat_traffic_sample_n IS NULL OR threat_traffic_sample_n NOT IN (-1,0,1))`).Scan(&invalidRows); err != nil {
+		WHERE id=1 AND (threat_traffic_sample_n IS NULL OR threat_traffic_sample_n NOT IN (-1,0))`).Scan(&invalidRows); err != nil {
 		return err
 	}
 	if _, err := DB.Exec(`UPDATE global_config
 		SET threat_traffic_sample_n = CASE
-		        WHEN threat_traffic_sample_n IS NULL OR threat_traffic_sample_n NOT IN (-1,0,1) THEN ?
+		        WHEN threat_traffic_sample_n IS NULL OR threat_traffic_sample_n NOT IN (-1,0) THEN ?
 		        ELSE threat_traffic_sample_n
 		    END,
 		    threat_traffic_sample_unified_migrated = 1
@@ -2412,7 +2424,7 @@ func migrateThreatTrafficSampleUnified() error {
 	}
 	if invalidRows > 0 {
 		// 历史问题：配置值被改写须留痕（与 retention 回填同口径）。
-		detail := fmt.Sprintf("启动迁移：大屏流量采样列归一为 %d（自适应，旧契约 2..64 废除）：%d 行", DefaultThreatTrafficSampleN, invalidRows)
+		detail := fmt.Sprintf("启动迁移：大屏流量采样列归一为 %d（自适应，全量/旧固定档废除）：%d 行", DefaultThreatTrafficSampleN, invalidRows)
 		log.Print(detail)
 		recordSystemAudit("启动迁移", "系统配置", detail)
 	}

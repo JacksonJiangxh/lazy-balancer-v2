@@ -131,8 +131,8 @@ func TestUpdateConfigSchemaCurrentWritableFields(t *testing.T) {
 	var sample struct {
 		Enum []int `json:"enum"`
 	}
-	if raw := schema.Properties["threat_traffic_sample_n"]; json.Unmarshal(raw, &sample) != nil || len(sample.Enum) != 3 || sample.Enum[0] != -1 || sample.Enum[1] != 0 || sample.Enum[2] != 1 {
-		t.Errorf("threat_traffic_sample_n enum=%v, want [-1,0,1]", sample.Enum)
+	if raw := schema.Properties["threat_traffic_sample_n"]; json.Unmarshal(raw, &sample) != nil || len(sample.Enum) != 2 || sample.Enum[0] != -1 || sample.Enum[1] != 0 {
+		t.Errorf("threat_traffic_sample_n enum=%v, want [-1,0]", sample.Enum)
 	}
 	for field, wantMax := range map[string]int{"security_events_retention_days": 3650, "security_events_row_cap": 100000000} {
 		var property struct {

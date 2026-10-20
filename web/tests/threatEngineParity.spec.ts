@@ -102,22 +102,33 @@ test('地球 hover/click 命中必须复用点阵 bbox 预筛，且静止态不�
   assert.match(hover, /autoRotate && hoverPoint && now - lastHoverPick >= 120/, '仅自转时复测静止指针')
 })
 
-test('地球点色更新按计数缓存 THREE.Color（不得逐点解析色串）', () => {
+test('地球点色更新用单次局部缓存（不得跨 30s 轮询累积）', () => {
   const update = member(globeSrc, 'function updateDotColors(')
-  assert.doesNotMatch(update, /new THREE\.Color\(/, '逐点 new THREE.Color 必须退役')
-  assert.doesNotMatch(update, /setStyle\(/, '逐点 CSS 色串解析必须退役')
-  assert.match(update, /heatColor\(/, '必须复用缓存的颜色')
+  assert.doesNotMatch(globeSrc, /const heatColorCache = new Map/, '全局按计数缓存必须退役（慢泄漏）')
+  assert.match(update, /const colorCache = new Map<number, THREE\.Color>\(\)/, '每次更新使用局部缓存')
+  assert.match(update, /const colorFor = \(count: number\)/, '颜色复用局部 colorFor')
 })
 
-test('地图静态层按色聚合 Path2D 后批量填充', () => {
+test('地图静态层复用国家 Path2D 后按色批量填充', () => {
   const rebuild = member(sceneSrc, 'function rebuildStaticLayer(')
-  assert.match(rebuild, /const byColor = new Map<string, Path2D>\(\)/)
+  assert.match(rebuild, /const byKey = ensureWorldDotPaths\(\)/, '必须复用国家点阵路径缓存')
+  assert.match(rebuild, /const byFill = new Map<string, Path2D>\(\)/)
   assert.match(rebuild, /staticCtx\.fill\(path\)/, '必须逐色一次 fill')
   assert.doesNotMatch(rebuild, /dotPath\(/, '逐点 beginPath+fill 必须退役')
+  const cache = member(sceneSrc, 'function ensureWorldDotPaths(')
+  assert.match(cache, /dotSubPath\(path/, '路径缓存只在首次构建时逐点生成')
   // 弧线渐变同样必须缓存（相机静止时无逐帧 createLinearGradient）
   const arcs = member(sceneSrc, 'function drawArcs(')
   assert.doesNotMatch(arcs, /createLinearGradient\(/, 'drawArcs 不得逐帧逐弧重建渐变')
   assert.match(arcs, /arcGradient\(from, to, color\)/)
+})
+
+test('地球光流叠加层复用地图的像素线宽/尾迹/粒子口径', () => {
+  const overlay = member(globeSrc, 'function drawFlowOverlay(')
+  assert.match(overlay, /flowArcWidth\(arc\.weight\)/, '3D 光流线宽必须沿用地图像素公式')
+  assert.match(overlay, /ctx\.globalAlpha = alpha \* \(0\.05 \+ 0\.95 \* ratio\)/, '尾迹必须尾隐头亮（沿弧长分段，避免直线渐变裁剪）')
+  assert.match(overlay, /FLOW_PARTICLES/, '必须绘制同地图亮头粒子')
+  assert.doesNotMatch(globeSrc, /arcStroke\('strokeW'/, '3D tube 弧线必须退役，避免双套样式')
 })
 
 test('帧率脚手架已删（两档恒等常量与交互时间窗不再伪装成自适应）', () => {

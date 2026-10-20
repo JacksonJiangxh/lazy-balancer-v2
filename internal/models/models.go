@@ -272,9 +272,9 @@ type GlobalConfig struct {
 	// ThreatScreenMode 威胁大屏中央视觉模式（v2.3.8）：map=360°地图+雷达扫掠 /
 	// globe=旋转地球+垂直扫描。node-local 列，缺省 map。
 	ThreatScreenMode string `json:"threat_screen_mode"`
-	// ThreatTrafficSampleN 大屏逐请求正常流量采样：-1=自适应（内部按 QPS
-	// 1/4/8 档与滞回切换）、0=关闭、1=全量。固定 2..64 契约已废除（历史
-	// 用户裁定）；DB DEFAULT/迁移见 db.go（2..64 一次性归 -1）。
+	// ThreatTrafficSampleN 大屏逐请求光流采样：-1=自适应（内部从 1/1 起步，
+	// 按事件速率在 1/4/8 档与滞回切换）、0=关闭。全量档已退役（自适应低流量
+	// 等价全量）；固定 2..64/1 存量由启动迁移归一 -1。
 	ThreatTrafficSampleN int `json:"threat_traffic_sample_n"`
 	// SecurityEventsRetentionDays/RowCap 安全事件保留（v2.3.8 显式设置）：
 	// 写侧只接受 1-3650 天 / 1-1 亿行（旧「0=自动」语义已废除）；库内 0/NULL
@@ -623,9 +623,8 @@ type UpdateConfigRequest struct {
 	ServerMapLon *float64 `json:"server_map_lon"`
 	// 威胁大屏模式（v2.3.8）：nil=保持现值；仅允许 map/globe。
 	ThreatScreenMode *string `json:"threat_screen_mode"`
-	// 大屏逐请求正常流量采样（v2.3.8；历史收口）：nil=保持现值；
-	// 仅允许 -1=自适应、0=关闭、1=全量——固定 2..64 契约已废除，写侧门
-	// 由 handlers 校验（-1/0/1）。
+	// 大屏逐请求光流采样：nil=保持现值；仅允许 -1=自适应、0=关闭。
+	// 全量与固定 2..64 已废除（存量由启动迁移归一 -1）。
 	ThreatTrafficSampleN *int `json:"threat_traffic_sample_n"`
 	// 安全事件保留（v2.3.8）：nil=保持现值；写侧只接受天数 1-3650、行数上限
 	// 1-1 亿（0=自动的旧语义已废除，0/NULL 仅作 legacy 库值由启动迁移归一）。

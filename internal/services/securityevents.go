@@ -1551,6 +1551,8 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	// ——commit 成功后才喂（回滚路径不喂，重试不重复计数）；feedBatch 为 nil
 	// 时 autobanObserveBatch 零动作（未启用/从节点等门在函数内收敛）。
 	var autobanBatch []autobanFeedItem
+	// 攻击流光流批次：与日志事务提交点对齐，回滚路径不喂。
+	var attackFlowBatch []threatScreenAttackFlowItem
 	// 历史问题-1：本批实际插入事件的最旧分钟（UTC）——提交成功后通知 rollup
 	// 回退钩子（积压事件落在已覆盖分钟区间时重固，防止大屏永久少计）。
 	var batchOldestMinute time.Time
@@ -1562,6 +1564,8 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 		batchInserted = 0
 		autobanObserveBatch(autobanBatch)
 		autobanBatch = nil
+		threatScreenAttackFlowRecordBatch(attackFlowBatch)
+		attackFlowBatch = nil
 		notifySecurityEventsRollupRewrite(batchOldestMinute)
 		batchOldestMinute = time.Time{}
 		return nil
@@ -1732,6 +1736,9 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 			}
 			if affected == 1 {
 				eventAt, _ := time.ParseInLocation("2006-01-02 15:04:05", rec.EventTime, time.UTC)
+				if eventAt.IsZero() {
+					eventAt = time.Now().UTC()
+				}
 				autobanBatch = append(autobanBatch, autobanFeedItem{
 					IP:            rec.ClientIP,
 					Action:        rec.Action,
@@ -1739,6 +1746,15 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 					At:            eventAt,
 					TrustExempt:   rec.Action == "logged" && trustMatcher.trusted(rule.caddyID, rec.ClientIP),
 				})
+				if threatScreenAttackFlowSampleN.Load() > 0 {
+					attackFlowBatch = append(attackFlowBatch, threatScreenAttackFlowItem{
+						at:            eventAt,
+						clientIP:      rec.ClientIP,
+						action:        rec.Action,
+						ruleTriggered: rec.RuleTriggered,
+						ruleMsg:       rec.RuleMsg,
+					})
+				}
 				batchInserted++
 				// 历史问题-1：记录本批最旧插入分钟（event_time 恒 UTC 墙钟串；
 				// 解析失败跳过——仅影响回退精度，不影响摄取）。

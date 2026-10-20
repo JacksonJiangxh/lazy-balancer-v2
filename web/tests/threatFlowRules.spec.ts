@@ -8,11 +8,9 @@ import {
   FLOW_MAX_ARCS_PER_FLUSH,
   flowBucket,
   flowBucketKey,
-  flowGroupEvents,
   flowRegionKey,
   flowTimestamp,
   groupNormalFlowEvents,
-  isRealtimeFlowEvent,
   nextAdaptiveSampleN,
   nextFlowCursor,
   planFlowArcs,
@@ -23,9 +21,10 @@ import {
 } from '../src/utils/threatFlowRules.ts'
 import { flowArcWidth } from '../src/utils/threatTheme.ts'
 
-test('流量采样配置：仅保留 -1/0/1，固定 2-64 已退役并归一为自适应（历史问题-04/历史问题-历史问题）', () => {
-  for (const value of [-1, 0, 1]) assert.equal(normalizeTrafficSampleN(value), value)
-  for (const value of [2, 4, 8, 64, -2, 65, 1.5, Number.NaN, undefined, null]) {
+test('流量采样配置：仅保留 -1/0，全量与固定 2-64 归一为自适应', () => {
+  assert.equal(normalizeTrafficSampleN(-1), -1)
+  assert.equal(normalizeTrafficSampleN(0), 0)
+  for (const value of [1, 2, 4, 8, 64, -2, 65, 1.5, Number.NaN, undefined, null]) {
     assert.equal(normalizeTrafficSampleN(value), -1, `值 ${String(value)} 必须归一为自适应`)
   }
 })
@@ -130,21 +129,6 @@ test('阈值：10 条不聚合，11 条聚合', () => {
   assert.equal(shouldAggregate(11), true)
 })
 
-test('同地区同秒聚合，跨秒不混合', () => {
-  const events = [
-    { id: 1, ip_location: '中国·广东省', event_time: '2026-10-18T00:00:00Z', action: 'blocked' },
-    { id: 2, ip_location: '中国·广东省', event_time: '2026-10-18T00:00:00Z', action: 'logged' },
-    { id: 3, ip_location: '中国·广东省', event_time: '2026-10-18T00:00:01Z', action: 'blocked' },
-    { id: 4, ip_location: '美国', event_time: '2026-10-18T00:00:00Z', action: 'blocked' },
-  ]
-  const groups = flowGroupEvents(events)
-  assert.equal(groups.length, 3)
-  const gd = groups.find((g) => g.key === '中国·广东省|1792281600')
-  assert.ok(gd)
-  assert.equal(gd.items.length, 2)
-  assert.equal(new Set(gd.items.map((e) => e.action)).size, 2)
-})
-
 test('历史问题-5：采集租约重置后游标回零，正常递增与缺失值保持', () => {
   assert.equal(nextFlowCursor(500, { enabled: true, next_seq: 4 }), 0)
   assert.equal(nextFlowCursor(500, { enabled: false, next_seq: 501 }), 0)
@@ -153,22 +137,6 @@ test('历史问题-5：采集租约重置后游标回零，正常递增与缺失
   assert.equal(nextFlowCursor(500, { enabled: true }), 500)
 })
 
-
-test('历史问题-03：增量批次动效实时性门——回填/延迟到达的历史事件不得冒充实时攻击', () => {
-  const now = Date.parse('2026-10-19T12:00:00Z')
-  // 新鲜：2 分钟前 / 边界 5 分钟前
-  assert.equal(isRealtimeFlowEvent('2026-10-19 11:58:00', now), true)
-  assert.equal(isRealtimeFlowEvent('2026-10-19 11:55:00', now), true)
-  // 陈旧：5 分 1 秒前 / 数小时前（轮转回填）
-  assert.equal(isRealtimeFlowEvent('2026-10-19 11:54:59', now), false)
-  assert.equal(isRealtimeFlowEvent('2026-10-19 03:00:00', now), false)
-  // 无法解析的时间不得绘制为实时
-  assert.equal(isRealtimeFlowEvent('', now), false)
-  assert.equal(isRealtimeFlowEvent(undefined, now), false)
-  assert.equal(isRealtimeFlowEvent('not-a-date', now), false)
-  // RFC3339 与 DB 墙钟串同口径（均按 UTC）
-  assert.equal(isRealtimeFlowEvent('2026-10-19T11:59:30Z', now), true)
-})
 
 test('正常/攻击共用线宽：单条 1.2、10 条 3.2、上限 4', () => {
   assert.equal(flowArcWidth(1), 1.2)

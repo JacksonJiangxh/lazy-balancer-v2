@@ -2,13 +2,6 @@
 // 口径：攻击类型不区分，只按地域；中国精确到省；同一地区同一秒为一桶。
 import { FLOW_AGGREGATE_THRESHOLD } from './threatTheme.ts'
 
-export interface FlowEventLike {
-  id?: number
-  ip_location?: string
-  event_time?: string
-  action?: string
-}
-
 export interface FlowGroup<T> {
   /** 聚合地域 key（中国精确到省，其余国家） */
   region: string
@@ -30,16 +23,6 @@ export function flowTimestamp(value: string): number {
 /** 增量批次动效（流光/弹框）的实时性上限（历史问题-03）：入库延迟/轮转回填会把
  *  数小时前的事件塞进增量批次，直接绘制会表现为「正在发生」。列表仍按窗口展示。 */
 export const FLOW_REALTIME_MAX_AGE_MS = 5 * 60_000
-
-/** 事件时间是否属于可绘制为实时攻击的新鲜事件（不可解析时间一律视为不新鲜）。 */
-export function isRealtimeFlowEvent(
-  eventTime: string | undefined,
-  now = Date.now(),
-  maxAgeMs = FLOW_REALTIME_MAX_AGE_MS,
-): boolean {
-  const ts = flowTimestamp(eventTime ?? '')
-  return Number.isFinite(ts) && now - ts <= maxAgeMs
-}
 
 /** 攻击只按地域聚合；中国精确到省（地图/地球同一口径）。 */
 export function flowRegionKey(ipLocation: string | undefined): string {
@@ -63,11 +46,11 @@ export function shouldAggregate(count: number): boolean {
 }
 
 /**
- * 后端采样契约（2026-10-18 用户裁定）：-1=自适应、0=关闭逐请求光流、1=全量。
- * 固定 1/N（2-64）档已退役——存量/外来值一律按自适应归一。
+ * 后端采样契约：-1=自适应、0=关闭逐请求光流。全量档已退役（自适应本身从
+ * 1/1 起步，低流量等价全量）；存量/外来 1 与固定 2-64 一律归一为自适应。
  */
 export function normalizeTrafficSampleN(value: number | null | undefined): number {
-  return value === -1 || value === 0 || value === 1 ? value : -1
+  return value === 0 ? 0 : -1
 }
 
 /** 序号回退或采集关闭表示租约/事件缓冲区已重置；下轮必须从 0 重新追赶。 */
@@ -149,23 +132,6 @@ export function stepAdaptiveSample(state: AdaptiveSampleState, observedRate: num
     return { active: target, stable: 0, pendingTarget: 0, lastSwitch: now, changed: true }
   }
   return { active: state.active, stable, pendingTarget: target, lastSwitch: state.lastSwitch, changed: false }
-}
-
-/** 按 region + 秒桶分组；保持输入顺序，供光流和弹框共同消费。 */
-export function flowGroupEvents<T extends FlowEventLike>(events: readonly T[], now = Date.now()): FlowGroup<T>[] {
-  const groups = new Map<string, FlowGroup<T>>()
-  for (const event of events) {
-    const region = flowRegionKey(event.ip_location)
-    const bucket = flowBucket(flowTimestamp(event.event_time ?? ''), now)
-    const key = flowBucketKey(region, bucket)
-    const group = groups.get(key)
-    if (group) {
-      group.items.push(event)
-    } else {
-      groups.set(key, { region, bucket, key, items: [event] })
-    }
-  }
-  return [...groups.values()]
 }
 
 /** 正常流事件的最小形状（caddygeoip 事件流）：at 为 Unix 毫秒。 */

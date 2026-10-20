@@ -954,6 +954,18 @@ func (h *Handlers) ControlThreatScreenCollector(c *gin.Context) {
 		return
 	}
 	target := strings.TrimRight(h.cfg.CaddyAdminURL, "/") + "/lb/traffic-collector"
+	// 威胁大屏的攻击光流使用独立采样源；本次 collector 请求同时同步其
+	// sample_n（0=关闭，1/4/8=对应采样档）。安全事件日志不受影响。
+	if c.Request.Method == http.MethodDelete {
+		services.SetThreatScreenAttackFlowSampleN(0)
+	} else {
+		var collectorReq struct {
+			SampleN *int `json:"sample_n"`
+		}
+		if json.Unmarshal(body, &collectorReq) == nil && collectorReq.SampleN != nil {
+			services.SetThreatScreenAttackFlowSampleN(*collectorReq.SampleN)
+		}
+	}
 	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, target, bytes.NewReader(body))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "采集控制请求构造失败"})
@@ -1388,6 +1400,194 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		"hourly_hist":          hourly,
 		"attack_type_share":    topThreatEntries(familyCounts, len(familyCounts)),
 		"recent_rate":          recentRate,
+	}})
+}
+
+// GetThreatScreenAttackFlow GET /security/overview/threat-screen/attack-flow
+// 独立攻击流光流：只读内存环形缓冲，不扫描 security_events。安全事件日志
+// 由 securityevents.go 全量落库，本端点仅供威胁大屏光流/弹框态势消费。
+func (h *Handlers) GetThreatScreenAttackFlow(c *gin.Context) {
+	since := uint64(0)
+	if raw := c.Query("since"); raw != "" {
+		if n, err := strconv.ParseUint(raw, 10, 64); err == nil {
+			since = n
+		}
+	}
+	limit := 200
+	if raw := c.Query("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	events, next := services.ThreatScreenAttackFlowSnapshot(since, limit)
+	out := make([]gin.H, 0, len(events))
+	for _, ev := range events {
+		if isReservedIP(ev.ClientIP) {
+			continue
+		}
+		location := enrichIPLocation(ev.ClientIP)
+		country := ""
+		province := ""
+		if parts := strings.Split(location, "·"); len(parts) > 0 {
+			country = parts[0]
+			if len(parts) > 1 {
+				province = parts[1]
+			}
+		}
+		if country == "" {
+			country = "未知"
+		}
+		out = append(out, gin.H{
+			"seq":            ev.Seq,
+			"at":             ev.At,
+			"country":        country,
+			"province":       province,
+			"action":         ev.Action,
+			"rule_triggered": ev.RuleTriggered,
+			"weight":         ev.Weight,
+		})
+	}
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
+		"enabled":  services.ThreatScreenAttackFlowSampleN() > 0,
+		"events":   out,
+		"next_seq": next,
+		"sample_n": services.ThreatScreenAttackFlowSampleN(),
+	}})
+}
+
+// GetSecurityEventToastSummary GET /security/events/toast-summary?since_id=N
+// 弹框专用精确聚合：按游标扫描全部新安全事件，按「IP + 攻击类型 + 动作」
+// 计数后返回摘要。事件列表仍走最新 N 条快照；本端点不受列表窗口截断影响。
+func (h *Handlers) GetSecurityEventToastSummary(c *gin.Context) {
+	sinceID := int64(0)
+	if raw := c.Query("since_id"); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+			sinceID = n
+		}
+	}
+	baseline := c.Query("baseline") == "1"
+	limit := 20
+	if raw := c.Query("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	empty := func(next int64) gin.H {
+		return gin.H{"groups": []any{}, "next_id": next}
+	}
+	if db.MetricsDB == nil {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: empty(sinceID)})
+		return
+	}
+	var maxID int64
+	if err := db.MetricsDB.QueryRow(`SELECT COALESCE(MAX(id),0) FROM security_events`).Scan(&maxID); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "安全事件查询失败"})
+		return
+	}
+	if baseline {
+		// 首次调用只给游标，不把历史事件回放成弹框；空库时下次 since=0
+		// 仍按全量增量扫描（不会吞掉库中第一批真实攻击）。
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: empty(maxID)})
+		return
+	}
+	if sinceID > maxID {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: empty(0)})
+		return
+	}
+	if sinceID == maxID {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: empty(sinceID)})
+		return
+	}
+	// 默认聚合上限：400 事件/秒 × 3s 轮询 ≈ 1200 条。超限时只聚合最新
+	// 1200 条并推进到 maxID（跳过更老的弹框展示，安全日志仍完整）。这样
+	// 2000/s 洪峰下 SQL 扫描与临时分组有硬上限，不会随积压无限增长。
+	const toastSummaryMaxEvents = 400 * 3
+	rows, err := db.MetricsDB.Query(`
+		SELECT client_ip, action, COALESCE(rule_triggered,''), COALESCE(rule_msg,''),
+		       COUNT(*), MAX(id), AVG(COALESCE(duration_us,0))
+		FROM (
+			SELECT client_ip, action, rule_triggered, rule_msg, duration_us, id
+			FROM security_events
+			WHERE id > ? AND event_time >= datetime('now','-5 minutes')
+			ORDER BY id DESC
+			LIMIT ?
+		)
+		GROUP BY client_ip, action, rule_triggered, rule_msg
+		ORDER BY COUNT(*) DESC, MAX(id) DESC
+		LIMIT 200`, sinceID, toastSummaryMaxEvents)
+	if err != nil {
+		services.Logf("error", "security event toast summary: query failed: %v", err)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "安全事件查询失败"})
+		return
+	}
+	defer rows.Close()
+
+	type summary struct {
+		ClientIP      string  `json:"client_ip"`
+		IPLocation    string  `json:"ip_location"`
+		Action        string  `json:"action"`
+		AttackType    string  `json:"attack_type"`
+		Count         int64   `json:"count"`
+		LastID        int64   `json:"last_id"`
+		AvgDurationUS float64 `json:"avg_duration_us"`
+	}
+	merged := make(map[string]*summary)
+	for rows.Next() {
+		var ip, action, ruleTriggered, ruleMsg string
+		var count, lastID int64
+		var avgDuration float64
+		if err := rows.Scan(&ip, &action, &ruleTriggered, &ruleMsg, &count, &lastID, &avgDuration); err != nil {
+			services.Logf("error", "security event toast summary: scan failed: %v", err)
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "安全事件查询失败"})
+			return
+		}
+		if isReservedIP(ip) {
+			continue
+		}
+		attackType := categorizeAttack(ruleTriggered, ruleMsg)
+		key := ip + "\x00" + action + "\x00" + attackType
+		cur := merged[key]
+		if cur == nil {
+			cur = &summary{
+				ClientIP:   ip,
+				IPLocation: enrichIPLocation(ip),
+				Action:     action,
+				AttackType: attackType,
+				LastID:     lastID,
+			}
+			merged[key] = cur
+		}
+		if cur.LastID < lastID {
+			cur.LastID = lastID
+		}
+		total := cur.Count + count
+		cur.AvgDurationUS = (cur.AvgDurationUS*float64(cur.Count) + avgDuration*float64(count)) / float64(total)
+		cur.Count = total
+	}
+	if err := rows.Err(); err != nil {
+		services.Logf("error", "security event toast summary: rows iteration failed: %v", err)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "安全事件查询失败"})
+		return
+	}
+	groups := make([]*summary, 0, len(merged))
+	for _, item := range merged {
+		groups = append(groups, item)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].Count != groups[j].Count {
+			return groups[i].Count > groups[j].Count
+		}
+		return groups[i].LastID > groups[j].LastID
+	})
+	if len(groups) > limit {
+		groups = groups[:limit]
+	}
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
+		"groups":  groups,
+		"next_id": maxID,
 	}})
 }
 

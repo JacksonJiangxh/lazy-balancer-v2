@@ -10,9 +10,12 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/config"
+	"lazy-balancer-v2/internal/services"
 )
 
 func TestControlThreatScreenCollector_proxiesLease(t *testing.T) {
+	services.ResetThreatScreenAttackFlowForTest()
+	t.Cleanup(services.ResetThreatScreenAttackFlowForTest)
 	var gotMethod, gotPath, gotBody string
 	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
@@ -40,11 +43,17 @@ func TestControlThreatScreenCollector_proxiesLease(t *testing.T) {
 	if gotMethod != http.MethodPost || gotPath != "/lb/traffic-collector" || gotBody != body {
 		t.Fatalf("admin got method=%s path=%s body=%s", gotMethod, gotPath, gotBody)
 	}
+	if got := services.ThreatScreenAttackFlowSampleN(); got != 1 {
+		t.Fatalf("attack flow sample_n=%d, want 1（与大屏采集租约同步）", got)
+	}
 
 	req = httptest.NewRequest(http.MethodDelete, "/security/overview/threat-screen/collector", strings.NewReader(body))
 	rec = httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	if gotMethod != http.MethodDelete {
 		t.Fatalf("DELETE method=%s", gotMethod)
+	}
+	if got := services.ThreatScreenAttackFlowSampleN(); got != 0 {
+		t.Fatalf("attack flow sample_n=%d after release, want 0", got)
 	}
 }

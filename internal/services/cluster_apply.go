@@ -1634,7 +1634,7 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	}
 	if settings.ThreatTrafficSampleN != nil {
 		sample := *settings.ThreatTrafficSampleN
-		if sample != -1 && sample != 0 && sample != 1 {
+		if sample != -1 && sample != 0 {
 			sample = -1
 		}
 		settingClauses = append(settingClauses, "threat_traffic_sample_n=?")

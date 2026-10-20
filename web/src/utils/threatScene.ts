@@ -278,9 +278,41 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     return b
   }
 
+  // 国家 bbox 空间网格：首屏点阵不再对每个点全量遍历 239 国。5° 网格把
+  // pointInPolys 候选压到个位数，点阵构建从秒级降到毫秒级。
+  const COUNTRY_GRID_DEG = 5
+  let countryGrid: Map<number, number[]> | null = null
+  const countryCell = (lon: number, lat: number): number => {
+    const x = Math.min(71, Math.max(0, Math.floor((lon + 180) / COUNTRY_GRID_DEG)))
+    const y = Math.min(35, Math.max(0, Math.floor((lat + 90) / COUNTRY_GRID_DEG)))
+    return y * 100 + x
+  }
+  function ensureCountryGrid(): Map<number, number[]> {
+    if (countryGrid) return countryGrid
+    const grid = new Map<number, number[]>()
+    for (let ci = 0; ci < THREAT_COUNTRIES.length; ci++) {
+      const b = bboxOf(ci)
+      const x0 = Math.min(71, Math.max(0, Math.floor((b.minLon + 180) / COUNTRY_GRID_DEG)))
+      const x1 = Math.min(71, Math.max(0, Math.floor((b.maxLon + 180) / COUNTRY_GRID_DEG)))
+      const y0 = Math.min(35, Math.max(0, Math.floor((b.minLat + 90) / COUNTRY_GRID_DEG)))
+      const y1 = Math.min(35, Math.max(0, Math.floor((b.maxLat + 90) / COUNTRY_GRID_DEG)))
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          const key = y * 100 + x
+          const list = grid.get(key)
+          if (list) list.push(ci)
+          else grid.set(key, [ci])
+        }
+      }
+    }
+    countryGrid = grid
+    return grid
+  }
+
   function buildWorldDots(): void {
     if (worldDots) return
     const dots: Dot[] = []
+    const grid = ensureCountryGrid()
     let rowIdx = 0
     // Mercator 下按「投影后 y」等距布点，而不是按纬度等距：等纬度步长
     // 会在高纬被拉稀、低纬挤密（用户实测：上方稀、下方密、南半球显小）。
@@ -291,7 +323,8 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       const lat = yToLat(y)
       const lonOffset = rowIdx % 2 === 1 ? DOT_STEP / 2 : 0
       for (let lon = -179.5 + lonOffset; lon < 180; lon += DOT_STEP) {
-        for (let ci = 0; ci < THREAT_COUNTRIES.length; ci++) {
+        const candidates = grid.get(countryCell(lon, lat)) ?? []
+        for (const ci of candidates) {
           const b = bboxOf(ci)
           if (lon < b.minLon || lon > b.maxLon || lat < b.minLat || lat > b.maxLat) continue
           if (pointInPolys(lon, lat, THREAT_COUNTRIES[ci].polys)) {
@@ -339,6 +372,28 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     provinceDots = dots
   }
 
+  // 世界点阵按国家缓存的 Path2D：点坐标与画布缩放无关，路径只需构建一次。
+  // 原实现每次静态层重建（首屏 ResizeObserver + 数据到达可触发多次）都重新
+  // 构造 1.4 万条六边形子路径，是地图首开长任务的主因。
+  let worldDotPathByKey: Map<string, Path2D> | null = null
+  function ensureWorldDotPaths(): Map<string, Path2D> {
+    if (worldDotPathByKey) return worldDotPathByKey
+    const paths = new Map<string, Path2D>()
+    if (worldDots) {
+      for (const d of worldDots) {
+        let path = paths.get(d.key)
+        if (!path) {
+          path = new Path2D()
+          paths.set(d.key, path)
+        }
+        dotSubPath(path, d.lon + WORLD_W / 2, latToY(d.lat), DOT_R * 1.35)
+      }
+    }
+    worldDotPathByKey = paths
+    return paths
+  }
+
+
   // ---- 静态层 ----
   let staticDirty = true
 
@@ -376,26 +431,28 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     // 点阵：普通陆地暗点，命中国家按热力染色（log10 计数标尺与地球版同源）
     buildWorldDots()
     if (worldDots) {
-      // 按色聚合 Path2D 后逐色一次 fill（与下钻层同形态）：原实现逐点
-      // fillStyle+beginPath+fill，1.3 万点=1.3 万次绘制调用，4K 下是静态层
-      // 重建的主线程热点。
-      const heatCache = new Map<string, string>()
-      const byColor = new Map<string, Path2D>()
-      for (const d of worldDots) {
-        let fill = heatCache.get(d.key)
-        if (fill === undefined) {
-          const cnt = countryCounts.get(d.key) ?? 0
-          fill = cnt > 0 ? heatCss(cnt) : DOT_LAND
-          heatCache.set(d.key, fill)
+      // 路径缓存按国家复用：只有热力色分组/填充是每次重建的成本，不再逐点
+      // 重新构造六边形子路径（原首屏多次重建的主线程热点）。
+      const byKey = ensureWorldDotPaths()
+      const land = new Path2D()
+      const byFill = new Map<string, Path2D>()
+      for (const [key, path] of byKey) {
+        const cnt = countryCounts.get(key) ?? 0
+        if (cnt <= 0) {
+          land.addPath(path)
+          continue
         }
-        let path = byColor.get(fill)
-        if (!path) {
-          path = new Path2D()
-          byColor.set(fill, path)
+        const fill = heatCss(cnt)
+        let group = byFill.get(fill)
+        if (!group) {
+          group = new Path2D()
+          byFill.set(fill, group)
         }
-        dotSubPath(path, d.lon + WORLD_W / 2, latToY(d.lat), DOT_R * 1.35)
+        group.addPath(path)
       }
-      for (const [fill, path] of byColor) {
+      staticCtx.fillStyle = DOT_LAND
+      staticCtx.fill(land)
+      for (const [fill, path] of byFill) {
         staticCtx.fillStyle = fill
         staticCtx.fill(path)
       }
@@ -484,7 +541,6 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   let drillDirty = true
   let drillWorldTargetZoom = DRILL_UNIFIED_ZOOM
   let drillWorldScale = 0
-  let cacheDisposed = false
   function rebuildDrillWorldLayer(): void {
     buildWorldDots()
     if (!worldDots || !provinceDots) return
@@ -756,12 +812,14 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     ripples.push({ age: 0, color })
   }
 
-  function bezierPoint(p0: Centroid2D, p1: Centroid2D, p2: Centroid2D, t: number): Centroid2D {
+  function bezierX(p0: Centroid2D, p1: Centroid2D, p2: Centroid2D, t: number): number {
     const u = 1 - t
-    return {
-      x: u * u * p0.x + 2 * u * t * p1.x + t * t * p2.x,
-      y: u * u * p0.y + 2 * u * t * p1.y + t * t * p2.y,
-    }
+    return u * u * p0.x + 2 * u * t * p1.x + t * t * p2.x
+  }
+
+  function bezierY(p0: Centroid2D, p1: Centroid2D, p2: Centroid2D, t: number): number {
+    const u = 1 - t
+    return u * u * p0.y + 2 * u * t * p1.y + t * t * p2.y
   }
 
   // 弧线渐变缓存：端点按 0.5px 量化后作键（视觉无差），相机静止时复用，
@@ -810,17 +868,19 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       const color = arc.normal ? NORMAL_COLOR : ATTACK_COLOR
       const segments = 64
       ctx.beginPath()
-      let last: Centroid2D | null = null
+      let hasPath = false
       for (let s = 0; s <= segments * head; s++) {
-        const pt = bezierPoint(from, ctrl, to, s / segments)
-        if (!last) ctx.moveTo(pt.x, pt.y)
-        else ctx.lineTo(pt.x, pt.y)
-        last = pt
+        const t = s / segments
+        const x = bezierX(from, ctrl, to, t)
+        const y = bezierY(from, ctrl, to, t)
+        if (!hasPath) ctx.moveTo(x, y)
+        else ctx.lineTo(x, y)
+        hasPath = true
       }
       // 渐变发光描边（头亮尾隐）。渐变只由（起点,终点,颜色）决定，相机静止
       // 时逐帧重建 60 个 createLinearGradient 纯属浪费——按量化后的端点缓存，
       // 相机移动/越界时整体失效重建。
-      if (last) {
+      if (hasPath) {
         const gradient = arcGradient(from, to, color)
         ctx.strokeStyle = gradient
         ctx.lineWidth = flowArcWidth(arc.weight)
@@ -838,10 +898,8 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       if (head < 1) {
         for (let p = 0; p < ARC_FLIGHT_PARTICLES; p++) {
           const t = Math.max(0, head - p * (0.16 / ARC_FLIGHT_PARTICLES))
-          const pt = bezierPoint(from, ctrl, to, t)
-          const r = 1.8
           ctx.beginPath()
-          ctx.arc(pt.x, pt.y, Math.max(0.4, r), 0, Math.PI * 2)
+          ctx.arc(bezierX(from, ctrl, to, t), bezierY(from, ctrl, to, t), 1.8, 0, Math.PI * 2)
           ctx.fillStyle = color
           ctx.globalAlpha = 0.85 * (1 - p / ARC_FLIGHT_PARTICLES)
           ctx.fill()
@@ -1126,18 +1184,26 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   const applySize = (): void => {
     const w = container.clientWidth || 1
     const h = container.clientHeight || 1
-    dpr = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO)
-    canvas.width = Math.round(w * dpr)
-    canvas.height = Math.round(h * dpr)
+    const prevDpr = dpr
+    const prevZoom = cam.zoom
+    const nextDpr = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO)
+    const sizeChanged = w !== cam.width || h !== cam.height || nextDpr !== prevDpr
+    dpr = nextDpr
+    const pixelW = Math.round(w * dpr)
+    const pixelH = Math.round(h * dpr)
+    if (canvas.width !== pixelW) canvas.width = pixelW
+    if (canvas.height !== pixelH) canvas.height = pixelH
     cam.width = w
     cam.height = h
     // v26 修复：minZoom 固定 0.35——原 Math.max(h/WORLD_D, 0.35) 强制地图高≥视口，
     // 总览缩小（宽高双适配留边）从未生效，顶/底国家恒贴边不可选（用户实测实锤）。
     minZoom = 0.35
-    staticDirty = true
     // v27 修复（初始地图偏高）：ResizeObserver 在布局落定后二次触发 applySize，
     // 但 zoom 仍是旧尺寸算的总览值——用户未交互且未下钻时随尺寸刷新总览。
     if (!userInteracted && !drillLayerCountry && !camAnim) cam.zoom = overviewZoom()
+    // ResizeObserver 在首屏可能多次回调；尺寸与总览 zoom 都没变时不得置脏，
+    // 否则每次回调都全量重绘静态层（用户实测地图刚打开卡顿）。
+    if (sizeChanged || cam.zoom !== prevZoom) staticDirty = true
     // 暂停态无 tick 驱动：尺寸变化后必须补绘一帧，否则画布是新尺寸的空白
     // （历史 历史问题）。
     if (paused) renderOnce()
@@ -1151,18 +1217,8 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   cam.zoom = overviewZoom()
   startLoop()
 
-  // 预热世界暗度衬底（约 1.3 万点 Path2D）——放到空闲期，避免用户第一次
-  // 点击下钻时同步构建造成 300–500ms 首帧长任务。
-  const warmDrillCaches = (): void => {
-    if (cacheDisposed) return
-    buildWorldDots()
-    ensureDimWorldLayer()
-  }
-  if (typeof window.requestIdleCallback === 'function') {
-    window.requestIdleCallback(warmDrillCaches, { timeout: 2000 })
-  } else {
-    window.setTimeout(warmDrillCaches, 50)
-  }
+  // 下钻暗层按需构建（首次下钻时 rebuildDrillWorldLayer 内部 ensure）；
+  // 不在首屏 idle 预构建，避免地图刚打开后的秒级长任务（用户实测卡顿）。
 
   return {
     addArcForLocation(ipLocation: string, weight = 1): void {
@@ -1246,7 +1302,6 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       }
     },
     dispose(): void {
-      cacheDisposed = true
       // 历史问题-F5：作废在途下钻（drillToCountry 的 await 后继体检查 disposed）
       disposed = true
       drillSeq += 1

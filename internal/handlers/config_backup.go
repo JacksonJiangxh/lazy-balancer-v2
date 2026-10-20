@@ -3010,12 +3010,12 @@ func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]
 	if raw, exists := config["threat_traffic_sample_n"]; exists && raw != nil {
 		value, ok := backupInteger(raw)
 		if !ok {
-			return fmt.Errorf("备份的大屏流量采样必须是整数（-1 自适应 / 0 关闭 / 1 全量）")
+			return fmt.Errorf("备份的大屏流量采样必须是整数（-1 自适应 / 0 关闭）")
 		}
-		// 历史统一契约：仅 -1/0/1。旧备份的固定 2..64（含历史默认 4/8）
-		// 按启动迁移同口径归一到 -1（自适应），导入不因旧契约整包被拒。
+		// 仅 -1/0。旧备份的 1（全量）与固定 2..64 按启动迁移同口径归一到 -1
+		//（自适应），导入不因旧契约整包被拒。
 		switch value {
-		case -1, 0, 1:
+		case -1, 0:
 		default:
 			config["threat_traffic_sample_n"] = db.DefaultThreatTrafficSampleN
 		}

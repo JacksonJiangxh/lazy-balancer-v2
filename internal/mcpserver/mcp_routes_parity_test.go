@@ -41,6 +41,8 @@ var mcpUncoveredRoutes = map[string]string{
 	//    list_security_events 已覆盖同等数据面，专用工具冗余）——
 	"GET /api/v1/security/overview/threat-screen":              "威胁大屏聚合（24h 总量/拦截率/限流/活跃源/国家计数 Top5）：前端全屏可视化数据源；Agent 可用 get_security_overview/list_security_events 等价获取",
 	"GET /api/v1/security/events/feed":                         "威胁大屏增量事件流（since_id 游标）：大屏 3 秒轮询专用形态；Agent 可用 list_security_events 按时间倒序等价查询",
+	"GET /api/v1/security/events/toast-summary":                "威胁大屏攻击弹框精确聚合：按游标扫描全部新安全事件并 aggregate，前端弹框专用；Agent 可用 list_security_events 自行聚合",
+	"GET /api/v1/security/overview/threat-screen/attack-flow":  "威胁大屏攻击光流内存环形缓冲：采样态势可视化专用；安全事件日志仍可用 list_security_events 查询",
 	"GET /api/v1/security/overview/threat-screen/traffic":      "大屏实时流量快照代理（Caddy admin 计数器）：光流可视化专用 1-2s 轮询数据源；Agent 无消费场景",
 	"POST /api/v1/security/overview/threat-screen/collector":   "大屏流量采集租约申请/续租：浏览器生命周期内部动作，Agent 无 UI 会话场景且不应远程控制采集开关",
 	"GET /api/v1/security/overview/threat-screen/events":       "大屏逐请求正常流量增量事件流：前端光流可视化专用，Agent 无消费场景",

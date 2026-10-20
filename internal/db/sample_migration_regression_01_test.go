@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-// 固定 2..64 契约废除——一次性迁移把存量 2..64（含旧默认 4/8）与其它越界值
-// 全部归 -1；{-1,0,1} 原样保留；marker 置位后不再触碰运行期写值。
+// 固定 2..64 与全量 1 契约废除——一次性迁移把存量 1、2..64（含旧默认 4/8）
+// 与其它越界值全部归 -1；{-1,0} 原样保留；marker 置位后不再触碰运行期写值。
 func TestMigrateThreatTrafficSampleUnified_normalizesToAdaptive(t *testing.T) {
 	openMigrationTestDB(t)
 	if err := createTables(); err != nil {
@@ -26,7 +26,7 @@ func TestMigrateThreatTrafficSampleUnified_normalizesToAdaptive(t *testing.T) {
 		t.Fatalf("fresh threat_traffic_sample_n DEFAULT=%q, want -1", got)
 	}
 
-	for _, legacy := range []int{2, 4, 8, 64, 365, -7} {
+	for _, legacy := range []int{1, 2, 4, 8, 64, 365, -7} {
 		if _, err := DB.Exec(`UPDATE global_config SET threat_traffic_sample_n=?, threat_traffic_sample_unified_migrated=0 WHERE id=1`, legacy); err != nil {
 			t.Fatal(err)
 		}
@@ -42,7 +42,7 @@ func TestMigrateThreatTrafficSampleUnified_normalizesToAdaptive(t *testing.T) {
 		}
 	}
 
-	for _, valid := range []int{-1, 0, 1} {
+	for _, valid := range []int{-1, 0} {
 		if _, err := DB.Exec(`UPDATE global_config SET threat_traffic_sample_n=?, threat_traffic_sample_unified_migrated=0 WHERE id=1`, valid); err != nil {
 			t.Fatal(err)
 		}
@@ -71,6 +71,20 @@ func TestMigrateThreatTrafficSampleUnified_normalizesToAdaptive(t *testing.T) {
 	}
 	if got != 4 {
 		t.Fatalf("second run overwrote marker-protected value: got %d, want 4", got)
+	}
+
+	// 已置 marker 的旧库若仍残留全量 1，也必须幂等收敛（不触碰 -1/0）。
+	if _, err := DB.Exec(`UPDATE global_config SET threat_traffic_sample_n=1, threat_traffic_sample_unified_migrated=1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateThreatTrafficSampleUnified(); err != nil {
+		t.Fatal(err)
+	}
+	if err := DB.QueryRow(`SELECT threat_traffic_sample_n FROM global_config WHERE id=1`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != -1 {
+		t.Fatalf("marker-protected legacy full value=%d, want -1", got)
 	}
 }
 

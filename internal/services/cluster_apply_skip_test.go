@@ -207,14 +207,14 @@ func TestUpdateSnapshotSettings_normalizesSecurityEventValueDomains(t *testing.T
 	}
 
 	applySnapshotBasicSettingsForTest(t, database, models.ClusterBasicSettings{
-		ThreatTrafficSampleN:        new(1),
+		ThreatTrafficSampleN:        new(0),
 		SecurityEventsRetentionDays: new(3650),
 		SecurityEventsRowCap:        new(100000000),
 	})
 	if err := database.QueryRow(`SELECT threat_traffic_sample_n,security_events_retention_days,security_events_row_cap FROM global_config WHERE id=1`).Scan(&sample, &days, &cap); err != nil {
 		t.Fatal(err)
 	}
-	if sample != 1 || days != 3650 || cap != 100000000 {
+	if sample != 0 || days != 3650 || cap != 100000000 {
 		t.Fatalf("valid values changed=(sample %d,days %d,cap %d)", sample, days, cap)
 	}
 }

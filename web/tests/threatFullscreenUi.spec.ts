@@ -33,10 +33,14 @@ test('ThreatScreen 经 createVisibilityIntervals 接管 hidden 停摆', () => {
   const page = source('src/views/security/ThreatScreen.vue')
   assert.match(page, /import \{ createVisibilityIntervals \} from '@\/composables\/useVisibilityIntervals'/)
   const loopBlock = section(page, 'const screenLoop = createVisibilityIntervals({', '})')
-  // 三类间隔全部纳管：时钟(1s, immediate)/弧光冲刷(ARC_FLUSH_MS)/采集租约心跳(immediate)
+  // 时钟(1s, immediate)/采集租约心跳(immediate) 纳管；攻击光流由独立
+  // usePollingTask 轮询（页签隐藏自动暂停），不再使用弧光冲刷间隔。
   assert.match(loopBlock, /\{ tick: tickClock, ms: 1000, immediate: true \}/)
-  assert.match(loopBlock, /\{ tick: flushArcs, ms: ARC_FLUSH_MS \}/)
   assert.match(loopBlock, /\{ tick: acquireCollector, ms: COLLECTOR_HEARTBEAT_MS, immediate: true \}/)
+  assert.match(page, /attackFlowTask\.start\(\)/)
+  assert.match(page, /attackFlowTask\.stop\(\)/)
+  assert.match(page, /TOAST_STALE_MS = 30000/)
+  assert.match(page, /now - toastLastPollAt > TOAST_STALE_MS/)
   // hidden 回调必须释放租约；visible 回调必须重置流量游标
   const onHidden = section(page, 'onHidden: () => {', 'onVisible: () => {')
   assert.match(onHidden, /releaseCollector\(\)/, 'hidden 不释放租约=Caddy 后台空计数')

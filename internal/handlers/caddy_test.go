@@ -687,8 +687,8 @@ func TestStartCaddy_zombieSupervisorFallsBackToDirectSpawn(t *testing.T) {
 	}
 }
 
-// 历史采样契约（用户裁定）：threat_traffic_sample_n 仅 -1（自适应）/
-// 0（关闭）/1（全量）；固定 2..64 已废除，写侧 400。
+// 采样契约（用户裁定）：threat_traffic_sample_n 仅 -1（自适应）/0（关闭）；
+// 全量与固定 2..64 已废除，写侧 400。
 func TestUpdateConfig_samplingContractOnlyAdaptiveOffFull(t *testing.T) {
 	handler := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -703,13 +703,13 @@ func TestUpdateConfig_samplingContractOnlyAdaptiveOffFull(t *testing.T) {
 		return response
 	}
 
-	for _, value := range []string{"2", "4", "8", "64", "-2"} {
+	for _, value := range []string{"1", "2", "4", "8", "64", "-2"} {
 		response := put(`{"source":"basic","threat_traffic_sample_n":` + value + `}`)
-		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "仅支持 -1（自适应）、0（关闭）或 1（全量）") {
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "仅支持 -1（自适应）或 0（关闭）") {
 			t.Fatalf("sample_n=%s status=%d body=%s, want 400 contract", value, response.Code, response.Body.String())
 		}
 	}
-	for _, value := range []string{"-1", "0", "1"} {
+	for _, value := range []string{"-1", "0"} {
 		response := put(`{"source":"basic","threat_traffic_sample_n":` + value + `}`)
 		if response.Code != http.StatusOK {
 			t.Fatalf("sample_n=%s status=%d body=%s, want 200", value, response.Code, response.Body.String())

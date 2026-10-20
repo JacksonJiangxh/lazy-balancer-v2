@@ -92,10 +92,9 @@
           <el-form-item label="流量采样">
             <el-select v-model="trafficSampleN" :disabled="isReadOnly" style="width: 160px">
               <el-option label="自适应（推荐）" :value="-1" />
-              <el-option label="全量（不采样）" :value="1" />
               <el-option label="关闭逐请求光流" :value="0" />
             </el-select>
-            <div class="form-tip-line">大屏正常请求光流的逐请求采样；自适应会根据每秒事件量在全量、1/4、1/8 之间自动切换。关闭后仅保留聚合流量统计，不影响安全事件日志。</div>
+            <div class="form-tip-line">大屏逐请求光流的采样开关；自适应从全量起步，并随事件量在 1/4、1/8 档之间自动切换。关闭后仅保留聚合流量统计，不影响安全事件日志。</div>
           </el-form-item>
           <el-form-item label="下载代理">
             <el-select v-model="githubProxyUrl" :disabled="isReadOnly || !githubProxyLoaded" style="width: 160px" :placeholder="githubProxyLoaded ? '选择代理' : '未加载'">

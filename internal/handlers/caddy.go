@@ -526,14 +526,14 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 	if req.ThreatScreenMode != nil && *req.ThreatScreenMode != "map" && *req.ThreatScreenMode != "globe" {
 		return errors.New("威胁大屏模式仅支持 map 或 globe")
 	}
-	// 大屏逐请求流量采样（历史统一契约）：仅 -1=自适应（内部按事件速率在
-	// 1/4/8 档间滞回）、0=关闭、1=全量。固定 2..64 档已废除；存量旧值由启动
-	// 迁移归一到 -1，写侧不再接受。
+	// 大屏逐请求流量采样：仅 -1=自适应（内部从全量起步，按事件速率在 1/4/8
+	// 档间滞回）、0=关闭。全量档已退役（自适应低流量等价全量）；存量 1 与
+	// 固定 2..64 由启动迁移归一为 -1，写侧不再接受。
 	if req.ThreatTrafficSampleN != nil {
 		switch *req.ThreatTrafficSampleN {
-		case -1, 0, 1:
+		case -1, 0:
 		default:
-			return errors.New("大屏流量采样仅支持 -1（自适应）、0（关闭）或 1（全量）")
+			return errors.New("大屏流量采样仅支持 -1（自适应）或 0（关闭）")
 		}
 	}
 	// 安全事件保留（历史问题-5，历史裁定）：0=自动的旧语义废除——写侧只接受
