@@ -236,7 +236,7 @@ func TestUpdateAdminTLSJSONBody_rejectsMismatchedPairWithoutSaving(t *testing.T)
 	}
 }
 
-// 历史问题 LBH-F9：2 MiB MaxBytesReader 上限超限 body 须 413（原恒 400，与规则域
+// 历史问题 2 MiB MaxBytesReader 上限超限 body 须 413（原恒 400，与规则域
 // 413 口径不一致）。JSON 通道两入口（保存/预检）同门。
 func TestAdminTLSOversizedBodyReturns413(t *testing.T) {
 	// Given：超过 2 MiB 的 JSON 体（cert_file 承载超长 PEM 串）
@@ -360,7 +360,7 @@ func TestUpdateAdminTLS_auditDetailRecordsCertificateReplacement(t *testing.T) {
 	})
 }
 
-// B2-03（历史）：upload → selfsigned 切换此前把已上传证书/私钥继续留在
+// 历史修复（历史）：upload → selfsigned 切换此前把已上传证书/私钥继续留在
 // global_config（selfsigned 由 ResolveCertificate 自生成，残留 upload 材料无消费者，
 // 且随备份/导入继续传播）。切换后必须清空；upload 模式禁用保留既有钉测已锁。
 func TestUpdateAdminTLS_switchingToSelfsignedClearsUploadedMaterial(t *testing.T) {
@@ -402,7 +402,7 @@ func TestUpdateAdminTLS_switchingToSelfsignedClearsUploadedMaterial(t *testing.T
 	}
 }
 
-// B2-04（历史）：值未变更时 PUT /admin-tls 此前仍写库并触发进程重启
+// 历史修复（历史）：值未变更时 PUT /历史修复 此前仍写库并触发进程重启
 // （设置页重复保存=无谓停机）。未变更 → 200「未变更」、不写库、不重启。
 func TestUpdateAdminTLS_unchangedConfigSkipsWriteAndRestart(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
@@ -563,7 +563,7 @@ func TestUpdateAdminTLS_enabledValueWhitelist(t *testing.T) {
 
 // 历史问题（历史）：库内证书损坏/非 PEM（带外改库、旧版本导入）时，读路径
 // 此前静默省略 cert_info——UI 只见 enabled=true 无证书信息、运维零信号。
-// 现在必须显式暴露 cert_info_error（fail-visible，与写路径严格校验同口径）。
+// 现在必须显式暴露 cert_info_error（历史修复，与写路径严格校验同口径）。
 func TestGetAdminTLS_corruptStoredCertIsVisible(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET admin_tls_enabled=1, admin_tls_mode='upload',
@@ -689,5 +689,64 @@ func TestAdminTLSOversizedMultipartBodyReturns413(t *testing.T) {
 	}
 	if inspectResponse.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("POST /admin-tls/inspect multipart oversized status=%d body=%s, want 413", inspectResponse.Code, inspectResponse.Body.String())
+	}
+}
+
+// UpdateAdminTLS 是 历史修复（读 current → 合并四列 →
+// 整体 UPDATE）。未持 caddyOpMu 时并发保存会以各自基线整体覆盖，前一次变更
+// 静默丢失。本测试钉住「锁被占用时保存必须等待」——修复前请求会立即完成。
+func TestUpdateAdminTLS_serializesReadModifyWriteWithCaddyOpLock(t *testing.T) {
+	initializeRuleFeatureTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET admin_tls_enabled=1,admin_tls_mode='upload',
+		admin_tls_cert='existing cert',admin_tls_key='existing key' WHERE id=1`); err != nil {
+		t.Fatalf("seed admin TLS config: %v", err)
+	}
+	oldExit := exitProcess
+	exited := make(chan struct{}, 1)
+	exitProcess = func(int) { exited <- struct{}{} }
+	t.Cleanup(func() { exitProcess = oldExit })
+
+	var body strings.Builder
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("enabled", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	handler := &Handlers{cfg: &config.Config{Port: 8000}}
+	router := gin.New()
+	router.POST("/admin-tls", handler.UpdateAdminTLS)
+	request := httptest.NewRequest(http.MethodPost, "/admin-tls", strings.NewReader(body.String()))
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	response := httptest.NewRecorder()
+
+	handler.caddyOpMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(response, request)
+		close(done)
+	}()
+	select {
+	case <-done:
+		handler.caddyOpMu.Unlock()
+		t.Fatal("UpdateAdminTLS 在 caddyOpMu 被占用时仍完成——读改写未串行化，并发保存会互相覆盖")
+	case <-time.After(150 * time.Millisecond):
+	}
+	handler.caddyOpMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("UpdateAdminTLS 在解锁后仍未完成（死锁或锁未释放）")
+	}
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	// restartProcess 的延迟退出必须在桩生效期内消费，避免清理还原 exitProcess
+	// 后被迟到的 os.Exit 打穿测试进程（既有用例同口径）。
+	select {
+	case <-exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restart was not scheduled after successful save")
 	}
 }

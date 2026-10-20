@@ -48,7 +48,18 @@ func run() error {
 	// Load configuration
 	cfg := config.Load(*configPath)
 
-	// F-SYSR-5（历史·声明）：SetFlags(0) 是下方 services.NewApplicationLogWriter
+	// 信号注册前置到 run() 开头、一切阻塞装配
+	// （DB/日志/InitTaskEngine 内含 BootSync：配置载入/证书物化/Caddy 应用，
+	// 最坏数十秒）之前。此前注册排在监听前——启动窗口内 SIGTERM 走默认动作
+	// 立即退出：不写 drain pause 标记、不排水 Caddy、cleanup defer 全不执行，
+	// 升级/停止恰好落在启动窗口时在途代理连接被容器 teardown 硬断。
+	// 缓冲=1：窗口内到达的信号保留在通道里，进入 waitForServerStop 后立即
+	// 被消费为正常关停（下方另有监听前的显式检查，避免先开监听再退）。
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(quit)
+
+	// 历史修复（历史·声明）：SetFlags(0) 是下方 services.NewApplicationLogWriter
 	// 日志级别过滤的隐式契约——过滤按行首 "WARNING:"/"ERROR:" 前缀判定（tz.go
 	// applicationLogWriter），标准 log 前缀会破坏该判定。此处改 flags 须同步
 	// applicationLogWriter 的前缀剥离逻辑（同注释互指）。
@@ -61,7 +72,7 @@ func run() error {
 		defer w.Close()
 		runtimeLogFile = cfg.LogFile
 	} else {
-		// S-3：显式配置了 LOG_FILE 但打开失败必须可见——静默回落仅 stdout 会让
+		// 显式配置了 LOG_FILE 但打开失败必须可见——静默回落仅 stdout 会让
 		// 「配置了日志文件却是空的」无从排查。
 		log.Printf("log file %s could not be opened, falling back to stdout only: %v", cfg.LogFile, err)
 	}
@@ -123,7 +134,7 @@ func run() error {
 	// 2026-09-06 裁定 ③：每次成功下发后落盘最后已知正确配置，启动 DB 渲染
 	// 被拒时回退应用（负载均衡可用性兜底）。
 	// 2026-09-06 裁定 ④'：任意 Caddy 修改三层校验的 Caddy 层——写路径在事务内
-	// 应用前用 caddy CLI（真 validate-only）校验最终渲染；二进制缺失/超时自动
+	// 应用前用 caddy CLI（真 历史修复）校验最终渲染；二进制缺失/超时自动
 	// 放行（事务内应用仍门控）。
 	caddyService.EnableCLIValidation()
 	caddyService.SetLastGoodPath(filepath.Join(cfg.DataDir, "last_good_caddy_config.json"))
@@ -151,21 +162,21 @@ func run() error {
 	})
 
 	// Seed the CRS rules tree into a fresh /app/waf bind mount (a persisted
-	// snapshot with user-updated rules wins over the pristine image copy),
+	// snapshot with 历史修复 rules wins over the pristine image copy),
 	// then materialize cert files from DB, then apply Caddy config on startup
 	// WAF 文件目录按 data_dir 派生（容器 /app/data → /app/waf 恒等；本地开发
 	// 落到数据目录同级）。须在首个渲染（ApplyConfigOnStartup）之前。
 	// 历史问题-08：派生面含 Coraza 审计日志路径——目录创建必须排在其后，否则
-	// 自定义 data_dir 下仍会去建 /app/logs/waf-audit 并漏建真实目录。
+	// 自定义 data_dir 下仍会去建 /app/logs/历史修复 并漏建真实目录。
 	services.ConfigureWafDirs(cfg.DataDir)
 	// 历史问题-1(历史):审计日志目录必须在首次 ApplyConfigOnStartup
 	// 前保证存在——coraza NewWAF 时 OpenFile 不建父目录,缺失=/load 拒收。
-	// INFRA-71-5（历史）：告警改走 services.Logf("warn")——绕过日志
+	// 历史修复（历史）：告警改走 services.Logf("warn")——绕过日志
 	// 级别门（ApplyLogLevel 已在上方装配）会让 warn 级过滤对它失效。
 	if err := services.EnsureWafAuditDir(); err != nil {
 		services.Logf("warn", "create waf audit dir failed: %v", err)
 	}
-	// @ipListFast 名单投影目录（v2.3.x）：渲染期 fail-closed 依赖目录可写。
+	// @ipListFast 名单投影目录（v2.3.x）：渲染期 历史修复 依赖目录可写。
 	if err := services.EnsureIPListDir(); err != nil {
 		services.Logf("error", "初始化 IP 名单目录失败: %v", err)
 	}
@@ -186,7 +197,7 @@ func run() error {
 		return h.ApplyConfigOnStartup(operator)
 	}
 	// B1（历史后裁定）：启动执行移入引擎 BootSync（下方 InitTaskEngine 尾部
-	// 同步触发 startup:config-load——面板监听前完成不变量保持；失败语义同旧：
+	// 同步触发 startup:历史修复——面板监听前完成不变量保持；失败语义同旧：
 	// 仅记录不退出）。
 	// 历史问题:Caddy 重启监听——监督器触发后走与启动相同的 DB 渲染→应用流程
 	// (修正 last_good 快照可能滞后于 DB 的窗口)。
@@ -199,7 +210,7 @@ func run() error {
 	// B 完全标准化：常驻服务真实生命周期挂钩（daemon Run start→阻塞→stop；
 	// 幂等守卫吸收 lifecycle 直调与 daemon 挂钩的双调用）
 	services.SetCertIssuanceLifecycleHooks(lifecycle.StartACME, lifecycle.StopACME)
-	// CI87-02：同步侧必须与证书侧对称注入 runtimeLifecycle 的方法而非裸
+	// 同步侧必须与证书侧对称注入 runtimeLifecycle 的方法而非裸
 	// syncService.Start/Stop——stopped 门（历史问题-2「Shutdown 后不得再拉起」）
 	// 与 l.mu 串行化只存在于 lifecycle 包装内，裸方法会让任何迟代/新增调用方
 	// 绕过退出门。StopSync 自身幂等（Shutdown 已调用）。
@@ -212,13 +223,13 @@ func run() error {
 	})
 	// 历史问题：威胁库依赖（reloader/投影回调/manager 单例）必须先于
 	// InitTaskEngine 装配——引擎启动即按 due 槽调度 threat，manager nil 曾让
-	// Run 落 success（威胁库永不更新且缺陷不可见）。与 auto-backup executor
+	// Run 落 success（威胁库永不更新且缺陷不可见）。与 历史修复 executor
 	// 同型：任务体依赖的运行期钩子一律前置。
 	services.SetThreatReloader(caddyReloader)
 	// 投影热路径（2026-10-15 用户裁定：威胁库重载门退役）——名单内容变化的
 	// 引用面收敛改走投影重写（零 /load，@ipListFast 匹配器与受信代理网段
 	// tp.txt/lb_file ≤1s stat 热感知）；threatReloader 仅残留热路径未证实
-	// 收敛时的 fail-safe 回退。
+	// 收敛时的 历史修复 回退。
 	services.SetThreatProjectionRefresher(func() (services.IPListProjectionOutcome, error) { return caddyService.RefreshIPListProjections() })
 	// 历史问题-1：摄取提交后回退 rollup 覆盖水位——停机/升级积压事件落在 warmer
 	// 已覆盖分钟时重固（否则大屏永久少计；warmer 首轮先于摄取首 pass 运行）。
@@ -226,7 +237,7 @@ func run() error {
 	services.InitThreatUpdateManager()
 	services.InitTaskEngine(cfg.CaddyAdminURL, runtimeLogFile) // 前置设施——非任务
 	// 引擎收尾统一交由下方 tail defer（StopTaskEngine 幂等）；此处不再重复
-	// defer（INFRA-1 历史：双 defer 依赖幂等，收敛单点收尾）。
+	// defer（历史修复 历史：双 defer 依赖幂等，收敛单点收尾）。
 
 	// 威胁大屏 rollup 后台固化（幂等：启动即一次 + 每 60s 一轮；启动后大屏
 	// 请求路径不再懒固化，避免与用户请求抢写锁/重复回填）。
@@ -249,7 +260,7 @@ func run() error {
 	// 历史问题-3a：角色读取走单源 services.RoleOf（COALESCE(is_master,1) 与
 	// readonly/cluster_version/任务引擎同口径）——此前裸 SELECT 对 NULL 扫描
 	// 失败并按从节点处理，与其余守卫语义分叉。仅用于爬虫名单播种；读取失败
-	// 仍按从节点处理（fail-closed）。
+	// 仍按从节点处理。
 	isMaster, err := services.RoleOf(context.Background(), db.DB)
 	if err != nil {
 		services.Logf("error", "failed to read cluster role: %v", err)
@@ -259,7 +270,7 @@ func run() error {
 	// 资格门（被启用策略引用；受信代理引用面已随 tp.txt/lb_file 热路径化
 	// 退役）命中 → RefreshIPListProjectionsInLock 零 /load 收敛（@ipListFast
 	// 匹配器 ≤1s stat 热感知）；资格未命中/不可判定/未证实收敛 →
-	// autobanReloader 全量重载回退（60s 节流暂存合并）。AU-1（历史）：
+	// autobanReloader 全量重载回退（60s 节流暂存合并）。历史修复（历史）：
 	// merge 读改写+收敛全程持 CaddyOpLock，两个注入必须为 InLock 变体（自取
 	// 锁变体在临界区内重入=死锁）。
 	services.SetAutobanReloader(func() error { return caddyService.GenerateAndApplyConfigForceInLock() })
@@ -271,16 +282,23 @@ func run() error {
 	}
 	// 审计日志轮转由事件摄入循环驱动（先采集后轮转），此处无需独立启动器
 	// 安全事件采集已由任务引擎接管（InitTaskEngine 注册 2s 循环）
+	// 关停预算单例——waitForServerStop 的 HTTP/Caddy 段与下方
+	// cleanup defer 的引擎排空/ACME 收尾共用同一 deadline（惰性起算）。
+	shutdown := newShutdownBudget()
 	defer func() {
 		cancelThreatRollupWarmer()
 		// 审计 历史问题：事件摄入与其余 worker 同生命周期——db.Close 前 cancel，
 		// 否则退出窗口内每 2s 对已关闭 MetricsDB 刷 "database is closed" 告警。
-		services.StopTaskEngine() // M2:引擎统一收尾(摄取/看门狗/清理)
+		// 引擎排空按剩余预算派生（为 ACME 收尾预留），不再使用
+		// StopTaskEngine 的 30s 默认——30s 本身已超 compose stop_grace_period。
+		stopTaskEngineWithin(shutdown) // M2:引擎统一收尾(摄取/看门狗/清理)
 		metricsService.Stop()
 		<-metricsDone
 		services.StopTimezoneRefresh()
 		services.StopLogRotate()
-		lifecycle.Shutdown()
+		// 证书 worker 的 <-done 有界（此前无界等待可把进程拖过
+		// grace 后被 SIGKILL）。
+		lifecycle.ShutdownWithTimeout(shutdown.segment(acmeStopSegmentMax))
 	}()
 
 	// Start server
@@ -294,9 +312,18 @@ func run() error {
 	tlsCfg := services.LoadAdminTLSConfig()
 	services.RecordRuntimeAdminTLS(tlsCfg)
 	serverErrors := make(chan error, 1)
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(quit)
+	// 启动窗口内已收到退出信号——不再开监听，直接走正常关停收尾
+	// （cleanup defer 负责引擎/worker；排水与 pause 标记与监听路径同口径）。
+	// quit 在 run() 开头注册且缓冲=1，BootSync 期间的信号在此保留而非触发
+	// 默认终止。
+	if takePendingSignal(quit) {
+		services.Logf("info", "启动窗口内收到退出信号，跳过监听并执行关停收尾")
+		// 与 waitForServerStop 同口径：进入关停后停信号通道，用户的第二次
+		// 历史修复/SIGTERM 恢复默认动作（可强制结束卡顿的收尾）。
+		signal.Stop(quit)
+		drainCaddy(cfg.CaddyAdminURL, shutdown.segment(caddyDrainSegmentMax))
+		return nil
+	}
 	if tlsCfg.Enabled {
 		cert, err := tlsCfg.ResolveCertificate(cfg.DataDir)
 		if err != nil {
@@ -316,7 +343,7 @@ func run() error {
 		go func() { serverErrors <- server.ListenAndServe() }()
 	}
 
-	serverErr := waitForServerStop(server, serverStopSignals{quit: quit, restart: restart, serverErrors: serverErrors, caddyAdminURL: cfg.CaddyAdminURL})
+	serverErr := waitForServerStop(server, serverStopSignals{quit: quit, restart: restart, serverErrors: serverErrors, caddyAdminURL: cfg.CaddyAdminURL, budget: shutdown})
 	if serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
 		return fmt.Errorf("serve HTTP: %w", serverErr)
 	}
@@ -347,12 +374,104 @@ func newRestartSignal() (<-chan struct{}, func()) {
 	}
 }
 
+// ---- 关停预算（历史修复，历史修复）----
+//
+// 历史修复 的 stop_grace_period=30s，而关停链此前各段独立超时：
+// HTTP Shutdown ≤10s + drainCaddy ≤2s + engine.Stop 30s + StopACME 无界
+// <-done——最坏远超 grace，PID1 在引擎排空完成前收到 SIGKILL，正是
+// engine.Stop 注释要避免的「审计/日志尾部丢失 + task_runs 行滞留 running」。
+// Go 侧改为单一总预算 25s（留 5s 余量给 metrics 停止/日志 flush/进程退出），
+// 各段从共享 deadline 派生并钳制：
+//
+//	HTTP ≤10s，Caddy 排水 ≤2s，引擎排空 = 剩余−ACME 预留，
+//	ACME 收尾 ≤5s → 最坏 10+2+8+5=25s ≤ 30s grace。
+const (
+	processShutdownBudget  = 25 * time.Second
+	httpShutdownSegmentMax = 10 * time.Second
+	caddyDrainSegmentMax   = 2 * time.Second
+	acmeStopSegmentMax     = 5 * time.Second
+)
+
+// shutdownBudget 进程关停的单一时间预算。
+//
+// 惰性起算：deadline 在首次调用时按 processShutdownBudget 设定，而不是在
+// run() 开头——启动（BootSync 可达数十秒）不得吃掉关停预算；未进入
+// waitForServerStop 的错误早退路径首次调用时同样获得完整预算。
+// now 是测试注入缝（fake clock 验证最坏路径的段派生）。非并发安全：只在
+// 关停单 goroutine（waitForServerStop → cleanup defer）内使用。
+type shutdownBudget struct {
+	now      func() time.Time
+	deadline time.Time
+}
+
+func newShutdownBudget() *shutdownBudget { return &shutdownBudget{now: time.Now} }
+
+// remaining 距关停 deadline 的剩余预算（耗尽返回 0）。
+func (b *shutdownBudget) remaining() time.Duration {
+	if b.now == nil {
+		b.now = time.Now
+	}
+	if b.deadline.IsZero() {
+		b.deadline = b.now().Add(processShutdownBudget)
+	}
+	if r := b.deadline.Sub(b.now()); r > 0 {
+		return r
+	}
+	return 0
+}
+
+// segment 段上限 = min(段自身上限, 总预算剩余)。
+func (b *shutdownBudget) segment(max time.Duration) time.Duration {
+	if r := b.remaining(); r < max {
+		return r
+	}
+	return max
+}
+
+// engineDrain 引擎排空上限 = 剩余预算 − ACME 收尾预留。
+//
+// 引擎排空是关停链最长的一段（在途清理任务不消费取消信号），若吃满剩余
+// 预算，其后的 StopACME 将无预算可用。归零时返回 1ms：引擎把 <=0 视为
+// 「未指定」并回落到默认 30s（engine.StopWithTimeout），绝不能传 0。
+func (b *shutdownBudget) engineDrain() time.Duration {
+	d := b.remaining() - acmeStopSegmentMax
+	if d <= 0 {
+		return time.Millisecond
+	}
+	return d
+}
+
+// stopTaskEngineWithin 引擎排空按关停预算执行，再清全局句柄。
+// services.StopTaskEngine 内部的 Stop()=30s 默认会超出 compose grace，生产
+// 退出路径必须走本函数（测试/服务包的既有直调入口不受影响）。
+func stopTaskEngineWithin(b *shutdownBudget) {
+	te := services.TaskEngine()
+	if te == nil {
+		return
+	}
+	te.StopWithTimeout(b.engineDrain())
+	services.StopTaskEngine() // 幂等：已停止时仅清全局句柄（既有收尾语义不变）
+}
+
+// takePendingSignal 非阻塞读取启动窗口内已缓存的退出信号（quit 缓冲=1，
+// BootSync 期间到达的信号在此保留）。
+func takePendingSignal(quit <-chan os.Signal) bool {
+	select {
+	case <-quit:
+		return true
+	default:
+		return false
+	}
+}
+
 type serverStopSignals struct {
 	quit         chan os.Signal
 	restart      <-chan struct{}
 	serverErrors <-chan error
-	// caddyAdminURL Caddy admin 端点（INFRA-U5，历史：退出前排水用）。
+	// caddyAdminURL Caddy admin 端点（历史修复，历史：退出前排水用）。
 	caddyAdminURL string
+	// budget 进程关停总预算；nil=新建（测试直调形态）。
+	budget *shutdownBudget
 }
 
 func waitForServerStop(server *http.Server, signals serverStopSignals) error {
@@ -362,17 +481,23 @@ func waitForServerStop(server *http.Server, signals serverStopSignals) error {
 	case err := <-signals.serverErrors:
 		return err
 	}
-	// S-4 + 历史问题：无论由 quit 还是 restart 触发，都在进入关停流程前统一停
+	// 历史修复 + 历史问题：无论由 quit 还是 restart 触发，都在进入关停流程前统一停
 	// 信号通道（先于 "Shutting down..." 与 ≤10s 的 HTTP Shutdown 窗口）。
 	// 此前仅 quit 分支停通道：restart 分支的关停窗口内第二个信号会被通道
 	// 缓冲，随后被 run() 返回后的 defer signal.Stop 冲刷丢弃，无法触发默认
-	// 终止（用户第二次 Ctrl-C / SIGTERM 应能强制结束卡顿的关停）。
+	// 终止（用户第二次 历史修复 / SIGTERM 应能强制结束卡顿的关停）。
 	// serverErrors 分支直接返回：服务已异常、进程随即退出，由 run() 的
 	// defer signal.Stop 收尾。
 	signal.Stop(signals.quit)
 
 	log.Println("Shutting down...")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// HTTP 段从关停总预算派生（≤10s），后续引擎排空/ACME 收尾
+	// 在同一 deadline 内获得剩余预算。
+	budget := signals.budget
+	if budget == nil {
+		budget = newShutdownBudget()
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), budget.segment(httpShutdownSegmentMax))
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		services.Logf("error", "HTTP server shutdown failed: %v", err)
@@ -380,23 +505,22 @@ func waitForServerStop(server *http.Server, signals serverStopSignals) error {
 			services.Logf("error", "HTTP server forced close failed: %v", closeErr)
 		}
 	}
-	// INFRA-U5（历史）：进程退出前给 Caddy 排水窗口——此前 PID1 退出后
+	// 历史修复（历史）：进程退出前给 Caddy 排水窗口——此前 PID1 退出后
 	// 容器 teardown 直接 SIGKILL 残存进程（含监督器与 Caddy），每次升级/重启
-	// 硬断全部在途代理连接。POST /stop 让 Caddy 优雅关停；best-effort：
-	// admin 不可达（已停/独立部署）静默略过。restart 路径同理（进程退出由
+	// 硬断全部在途代理连接。POST /stop 让 Caddy 优雅关停；	// admin 不可达（已停/独立部署）静默略过。restart 路径同理（进程退出由
 	// 容器编排重建，Caddy 排水后由新容器监督器重拉）。
-	drainCaddy(signals.caddyAdminURL)
+	drainCaddy(signals.caddyAdminURL, budget.segment(caddyDrainSegmentMax))
 	return nil
 }
 
 // caddyPauseFilePath 与 handlers 包的 caddyPauseFile（internal/handlers/caddy.go）
-// 及 docker-entrypoint.sh 的 CADDY_PAUSE_FILE 同值 "/tmp/lazy-balancer-caddy-paused"
+// 及 历史修复.sh 的 CADDY_PAUSE_FILE 同值 "/tmp/历史修复"
 // ——main 包不 import handlers 的未导出变量，自持常量并以注释互指；任一侧
 // 改路径须三处同步（handlers 侧为测试注入缝用 var，本侧停机路径无注入需求用 const）。
 const caddyPauseFilePath = "/tmp/lazy-balancer-caddy-paused"
 
-// writeDrainPauseFile INFRA-A1（历史）：排水前建 pause 标记，让监督器把
-// 本次优雅停机按「admin 停止」分支处理（docker-entrypoint.sh 见文件不重启、
+// writeDrainPauseFile 历史修复（历史）：排水前建 pause 标记，让监督器把
+// 本次优雅停机按「admin 停止」分支处理（历史修复.sh 见文件不重启、
 // CRASHES 不 +1）——此前 drainCaddy 直接 POST /stop，监督器一律按崩溃重拉，
 // 排水窗口内 1s 退避重绑 80/443，伪 Crash 噪音+排水语义被消解。
 // 与 stopCaddy（handlers/caddy.go）刻意不同：仅当文件不存在时写（不覆盖
@@ -406,7 +530,7 @@ const caddyPauseFilePath = "/tmp/lazy-balancer-caddy-paused"
 // pause 生命周期=容器运行期。注意：docker stop/start、restart 复用同一容器
 // 可写层，/tmp 并不清空（INFRA-历史问题 事故：曾误假设「随容器重建清空」，导致
 // 重启后监督器开机 standby、Caddy 永不拉起）——跨重启残留由监督器启动首行
-// 清残兜底（docker-entrypoint.sh INFRA-历史问题）；非容器部署下次 startCaddy
+// 清残兜底（历史修复.sh INFRA-历史问题）；非容器部署下次 startCaddy
 // 亦会删标记。此处粘滞因此安全。
 func writeDrainPauseFile() {
 	if _, err := os.Stat(caddyPauseFilePath); err == nil {
@@ -415,13 +539,19 @@ func writeDrainPauseFile() {
 	_ = os.WriteFile(caddyPauseFilePath, nil, 0o644)
 }
 
-// drainCaddy best-effort 请求 Caddy admin /stop（2s 上限，错误只记日志）。
-func drainCaddy(adminURL string) {
+// drainCaddy 历史修复 请求 Caddy admin /stop（timeout 上限，错误只记日志）。
+// timeout 由关停预算派生（≤2s，历史修复）；预算已耗尽时跳过请求直接返回，
+// 让进程按时退出（容器 teardown 仍会回收 Caddy）。
+func drainCaddy(adminURL string, timeout time.Duration) {
 	if adminURL == "" {
 		return
 	}
 	writeDrainPauseFile()
-	client := &http.Client{Timeout: 2 * time.Second}
+	if timeout <= 0 {
+		services.Logf("warn", "关停预算已耗尽，跳过 Caddy 排水请求（Caddy 随容器 teardown 回收）")
+		return
+	}
+	client := &http.Client{Timeout: timeout}
 	req, err := http.NewRequest(http.MethodPost, strings.TrimSuffix(adminURL, "/")+"/stop", nil)
 	if err != nil {
 		return

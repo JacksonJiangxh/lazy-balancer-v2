@@ -41,6 +41,12 @@
     <div v-if="policiesLoading" class="ipo-tip">策略加载中…</div>
     <div v-else-if="policiesError" class="info-note-bar"><span class="info-note-desc">策略列表加载失败</span></div>
     <template v-else-if="rows.length > 0">
+      <!-- 名单/引用条目加载失败：命中判定退化为仅内联（「已在名单」会被误显示为未命中），
+           依据不可靠——处置动作禁用，横幅给出重试 -->
+      <div v-if="listsError" class="info-note-bar">
+        <span class="info-note-desc">地址列表加载失败：引用名单的命中状态不可见，处置动作已暂停</span>
+        <el-button size="small" type="primary" plain :loading="policiesLoading" @click="retryLists">重新加载</el-button>
+      </div>
       <div v-if="groupedRows.offstage > 0" class="ipo-tip">另有 {{ groupedRows.offstage }} 条限流/WAF 策略不涉及 IP 管控</div>
       <!-- 阶段 0 空态（历史用户裁定：提示创建，不自动代建）。判定基于全部
            策略（不受下方筛选影响）——绑定存在但被筛掉时不出该引导 -->
@@ -69,9 +75,9 @@
           <div v-if="rowActions(row).length > 0" class="ipo-acts">
             <template v-for="act in rowActions(row)" :key="act.key">
               <el-tooltip v-if="act.tip" :content="act.tip" placement="top">
-                <el-button size="small" :type="act.type" plain :loading="act.loading" @click="act.run()">{{ act.label }}</el-button>
+                <el-button size="small" :type="act.type" plain :loading="act.loading" :disabled="act.disabled" @click="act.run()">{{ act.label }}</el-button>
               </el-tooltip>
-              <el-button v-else size="small" :type="act.type" plain :loading="act.loading" @click="act.run()">{{ act.label }}</el-button>
+              <el-button v-else size="small" :type="act.type" plain :loading="act.loading" :disabled="act.disabled" @click="act.run()">{{ act.label }}</el-button>
             </template>
           </div>
         </div>
@@ -229,6 +235,10 @@ const { busyTrust, creating: trustCreating, resolveSideLists, joinSpecificList, 
 const policies = ref<PolicyRow[]>([])
 const policiesLoading = ref(false)
 const policiesError = ref(false)
+// 地址列表/引用条目加载失败态：失败时 rowView 的 inList/inTrust 只剩内联口径，
+// 引用名单命中会被误显示为「未命中」（与真实未命中无法区分）——必须显性暴露
+// 并提供重试，同时禁用处置动作（依据不可靠时不得写入）。
+const listsError = ref(false)
 const busyKeys = ref<Set<string>>(new Set())
 
 // —— 显式存入地址列表：与策略名单动作同口径（确认弹框 + 全局 MFA 428 守卫 +
@@ -273,10 +283,14 @@ const loadIpLists = async (): Promise<void> => {
       return (res.data?.entries || []).map((e) => e.value.trim()).filter((v) => v !== '')
     })
     ipListEntries.value = { ...sharedEntriesCache }
+    // ensureSharedEntries 的单名单失败保持「未缓存」（securityStages 契约：下次可重试）
+    // ——引用条目缺失即成员判定不完整，与列表接口失败同口径暴露。
+    listsError.value = [...refIds].some((id) => !(id in sharedEntriesCache))
   } catch {
     // 单弹层加载失败不清全局共享缓存：其它组件可能仍持有有效条目；
     // 下次 ensureSharedEntries 会按名单 ID 自行重拉。
     ipLists.value = []
+    listsError.value = true
   }
 }
 
@@ -369,6 +383,9 @@ const loadPolicies = async (): Promise<void> => {
     if (seq === loadPoliciesSeq) policiesLoading.value = false
   }
 }
+
+// 加载失败横幅的重试入口：名单与条目同轮重取（loadPolicies 内串接 loadIpLists）
+const retryLists = (): void => { void loadPolicies() }
 
 // —— 每行视图状态：模式标签 / 该 IP 的归属状态 / 可用动作 ——
 
@@ -726,7 +743,7 @@ const stage0BoundAny = computed(() => policies.value.some((p) => policyTypeOf(p)
 // 顺序 = 信任（绿）→ 黑名单移除（红）→ 关联拦截/放行（红/蓝）→ 信任移除（绿）。
 // 历史裁定：「未关联…」死提示退役——无同侧非系统列表时一律出自动创建
 // 动作（run 必备，动作区只渲染可执行动作；无动作→整区不渲染）。
-interface RowAction { key: string; label: string; type: 'primary' | 'success' | 'warning' | 'danger' | 'info'; loading?: boolean; tip?: string; run: () => void }
+interface RowAction { key: string; label: string; type: 'primary' | 'success' | 'warning' | 'danger' | 'info'; loading?: boolean; disabled?: boolean; tip?: string; run: () => void }
 
 
 const rowActions = (row: RowView): RowAction[] => {
@@ -859,7 +876,9 @@ const rowActions = (row: RowView): RowAction[] => {
   if (trustAllowed && row.canClearDeadTrust) {
     acts.push({ key: 'dead', label: '清除条目', type: 'success', tip: '该 IP 的信任条目存在但信任名单已关闭，可一键清除', loading: isBusy(pid, 'untrust'), run: () => { void removeTrust(row.policy) } })
   }
-  return acts
+  // 名单未就绪（加载失败）时动作依据不可靠（inList/inTrust 只剩内联口径，
+  // resolveSideLists 看不到真实列表集）——整区禁用，由横幅的重试恢复。
+  return listsError.value ? acts.map((act) => ({ ...act, disabled: true })) : acts
 }
 
 // —— 历史问题 四组分组：阶段 1（ACL）/ 阶段 0（信任）/ 混合（兼容）/ 阶段 2·3 不涉 IP 管控 ——

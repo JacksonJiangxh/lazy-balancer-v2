@@ -144,7 +144,7 @@ func TestConfigWatchdog_slaveSkipsWholeRound(t *testing.T) {
 }
 
 func TestConfigWatchdog_subRoutesBelongToParentRule(t *testing.T) {
-	// Given：运行配置含子路由 @id（lb_x_redirect / lb_x_path_0）——历史问题 WD-1 误报场景
+	// Given：运行配置含子路由 @id（lb_x_redirect / lb_x_path_0）——历史问题 历史修复 误报场景
 	_, database := newClusterTestService(t)
 	seedGenerationRule(t, database, "lb_watchdog_sub", false)
 	resetConfigWatchdogForTest(t)
@@ -282,8 +282,8 @@ func TestConfigWatchdog_heartbeatRetainsSkippedCountAcrossCleanWindow(t *testing
 		WatchdogCheckOnce()
 	}
 
-	// Then the public since-last-check counter is zero, while the heartbeat's
-	// independent since-last-heartbeat window still reports the skipped round.
+	// Then the public 历史修复 counter is zero, while the heartbeat's
+	// independent 历史修复 window still reports the skipped round.
 	if drift := CurrentConfigDrift(); drift.SkippedRounds != 0 {
 		t.Fatalf("status skipped rounds=%d, want 0 after real checks", drift.SkippedRounds)
 	}
@@ -368,6 +368,53 @@ func TestConfigWatchdog_skippedRoundsDoNotEmitHeartbeat(t *testing.T) {
 	}
 }
 
+// 防抖轮（streak=1、状态仍是 Consistent）不得被当作
+// 干净轮——漂移起点恰落在第 60 个检查周期时，原实现会写出「配置一致（心跳）」这一
+// 与事实相反的结论，并虚增干净轮计数。
+func TestConfigWatchdog_debounceRoundDoesNotCountOrHeartbeat(t *testing.T) {
+	// Given：已累积 59 个干净轮，且本轮将观测到第一轮不一致（防抖）
+	_, database := newClusterTestService(t)
+	seedGenerationRule(t, database, "lb_watchdog_debounce", false)
+	resetConfigWatchdogForTest(t)
+	newTaskLogDir(t)
+	configDriftMu.Lock()
+	configDriftCleanRounds = configWatchdogHeartbeatRounds - 1
+	configDriftMu.Unlock()
+	oldURL := watchdogAdminURLValue
+	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
+	// 运行配置为空 → 本轮不一致（streak=1，状态仍 Consistent）
+	watchdogAdminURLValue = fakeCaddyWithRoutes(t, emptyCaddyConfig).URL
+
+	// When：第 60 个检查周期（防抖轮）
+	WatchdogCheckOnce()
+
+	// Then：不写心跳，干净轮不增
+	if data, err := os.ReadFile(taskengine.TaskLogPath("config-watchdog")); err == nil && strings.Contains(string(data), "配置一致") {
+		t.Fatalf("防抖轮不得输出「配置一致」心跳: %q", string(data))
+	}
+	configDriftMu.RLock()
+	rounds, streak := configDriftCleanRounds, configDriftStreak
+	configDriftMu.RUnlock()
+	if rounds != configWatchdogHeartbeatRounds-1 {
+		t.Fatalf("干净轮=%d, want %d（防抖轮不是一致证据）", rounds, configWatchdogHeartbeatRounds-1)
+	}
+	if streak != 1 {
+		t.Fatalf("防抖 streak=%d, want 1", streak)
+	}
+
+	// 回归形状：确认漂移后恢复（第二轮不一致 → 状态翻 false，干净轮归零）
+	WatchdogCheckOnce()
+	if drift := CurrentConfigDrift(); drift.Consistent {
+		t.Fatalf("第二轮不一致应置漂移态: %+v", drift)
+	}
+	configDriftMu.RLock()
+	roundsAfterDrift := configDriftCleanRounds
+	configDriftMu.RUnlock()
+	if roundsAfterDrift != 0 {
+		t.Fatalf("漂移态干净轮=%d, want 0", roundsAfterDrift)
+	}
+}
+
 func TestConfigWatchdog_successfulCheckResetsSkippedRounds(t *testing.T) {
 	// Given two undetermined rounds followed by a real, consistent check.
 	newClusterTestService(t)
@@ -387,7 +434,7 @@ func TestConfigWatchdog_successfulCheckResetsSkippedRounds(t *testing.T) {
 	WatchdogCheckOnce()
 
 	// Then the counter defined as "since the last real check" returns to zero,
-	// while the successful round still advances the clean-round window.
+	// while the successful round still advances the 历史修复 window.
 	if drift := CurrentConfigDrift(); drift.SkippedRounds != 0 {
 		t.Fatalf("skipped rounds after real consistent check=%d, want 0", drift.SkippedRounds)
 	}
@@ -398,7 +445,7 @@ func TestConfigWatchdog_successfulCheckResetsSkippedRounds(t *testing.T) {
 		t.Fatalf("clean rounds=%d, want 1", cleanRounds)
 	}
 
-	// And a later skipped round is counted from this new real-check boundary.
+	// And a later skipped round is counted from this new 历史修复 boundary.
 	watchdogAdminURLValue = "http://127.0.0.1:1"
 	WatchdogCheckOnce()
 	if drift := CurrentConfigDrift(); drift.SkippedRounds != 1 {
@@ -543,5 +590,55 @@ func TestUpdateConfigDrift_releasesLockBeforeAuditIO(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("CurrentConfigDrift 在审计库 busy 时被 configDriftMu 阻塞（锁内 I/O）")
+	}
+}
+
+// 整轮未判定必须上报失败。此前 WatchdogCheckOnce
+// 丢弃 checkConfigConsistency 的 (checked, err)，Caddy 不可达/运行配置读取失败
+// 时本轮零业务日志、task_runs 恒 success，任务监控无法区分「真实检查且一致」
+// 与「整轮没查」（与同文件「跳过轮不构成一致证据」口径冲突）。
+func TestConfigWatchdog_uncheckedRoundFailsTaskRun(t *testing.T) {
+	// Given：引擎已装配（DB 初始化、任务日志目录已注入）+ Caddy admin 不可达
+	newTaskLogDir(t)
+	resetConfigWatchdogForTest(t)
+	te := newWireTestEngine(t)
+	oldURL := watchdogAdminURLValue
+	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
+	watchdogAdminURLValue = "http://127.0.0.1:1"
+
+	// When：经引擎真实 Run 体执行一轮（Caddy 不可达 → 本轮无法判定）
+	err := te.Trigger("config-watchdog", "manual", "")
+
+	// Then：运行返回错误，task_runs 落 failed（不是 success）
+	if err == nil {
+		t.Fatal("整轮未判定必须返回错误（否则 task_runs 恒 success，监控看不到跳过）")
+	}
+	var status string
+	if qerr := db.DB.QueryRow(`SELECT status FROM task_runs WHERE task_id='config-watchdog' ORDER BY id DESC LIMIT 1`).Scan(&status); qerr != nil {
+		t.Fatalf("read task run status: %v", qerr)
+	}
+	if status != "failed" {
+		t.Fatalf("task_runs.status=%q, want failed（跳过轮须在任务面可见）", status)
+	}
+
+	// And：任务日志有业务摘要行，说明本轮未完成判定
+	logText := readTaskLog(t, "config-watchdog")
+	if !strings.Contains(logText, "配置检查未完成") {
+		t.Fatalf("任务日志缺少未判定摘要行:\n%s", logText)
+	}
+}
+
+// 历史修复 反向形状：真实完成的检查轮仍返回 nil（不得把「一致」误报为失败）。
+func TestConfigWatchdog_checkedRoundSucceeds(t *testing.T) {
+	newTaskLogDir(t)
+	resetConfigWatchdogForTest(t)
+	te := newWireTestEngine(t)
+	server := fakeCaddyWithRoutes(t, emptyCaddyConfig)
+	oldURL := watchdogAdminURLValue
+	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
+	watchdogAdminURLValue = server.URL
+
+	if err := te.Trigger("config-watchdog", "manual", ""); err != nil {
+		t.Fatalf("真实完成的一致轮必须成功: %v", err)
 	}
 }

@@ -23,15 +23,15 @@ import (
 func rdbStrictSeedThreatList(t *testing.T, database *sql.DB, source string) int64 {
 	t.Helper()
 	name := db.ThreatListNameBySource(source)
-	res, err := database.Exec(
-		`INSERT INTO security_ip_lists (name, description, entries, system, created_at) VALUES (?,?,?,?,datetime('now'))`,
-		name, "", "[]", 1)
-	if err != nil {
+	// system=1 名单名唯一，威胁库三源由 DB 初始化播种；复用其 id。
+	if _, err := database.Exec(
+		`INSERT OR IGNORE INTO security_ip_lists (name, description, entries, system, created_at) VALUES (?,?,?,?,datetime('now'))`,
+		name, "", "[]", 1); err != nil {
 		t.Fatalf("seed threat list %s: %v", source, err)
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		t.Fatalf("seed threat list %s last id: %v", source, err)
+	var id int64
+	if err := database.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND system=1`, name).Scan(&id); err != nil {
+		t.Fatalf("seed threat list %s id: %v", source, err)
 	}
 	return id
 }
@@ -158,7 +158,7 @@ func TestRDBStrictRender_threatFilePresentRendersNormally(t *testing.T) {
 }
 
 // 从节点形状（RDB）：.iplist 文本缺失但 .fast 在场（waf_files 通道同步产物）
-// → 回退展开 .fast 前缀集，策略照常渲染（match-set 等价）。
+// → 回退展开 .fast 前缀集，策略照常渲染（历史修复 等价）。
 func TestRDBStrictRender_slaveShape_fastOnlyRenders(t *testing.T) {
 	stubSecurityLibsAvailable(t)
 	wafDir := t.TempDir()

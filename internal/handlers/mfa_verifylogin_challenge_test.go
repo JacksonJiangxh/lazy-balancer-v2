@@ -28,25 +28,14 @@ import (
 )
 
 // seedMFAChallengeLoginFixture 建 MFA 登录二步的最小夹具：启用 MFA 的用户 +
-// 一条挑战；返回 (secret, 用户 ID)。与 auth_login_provider_test.go 同 schema 形状。
+// 一条挑战；返回 (secret, 用户 ID)。schema 由 setupAuthTestDB →
+// ensureMFATestSchema 单源提供。
 func seedMFAChallengeLoginFixture(t *testing.T, challengeToken string, consumed int) (string, int64) {
 	t.Helper()
-	database := setupAuthTestDB(t)
-	if _, err := database.Exec(`ALTER TABLE users ADD COLUMN mfa_secret TEXT DEFAULT '';
-		ALTER TABLE users ADD COLUMN mfa_recovery_codes TEXT DEFAULT '[]';
-		ALTER TABLE users ADD COLUMN mfa_last_timestep INTEGER DEFAULT 0;
-		CREATE TABLE IF NOT EXISTS mfa_challenges (
-			token TEXT PRIMARY KEY,
-			user_id INTEGER NOT NULL,
-			expires_at DATETIME NOT NULL,
-			consumed BOOLEAN DEFAULT 0,
-			attempts INTEGER DEFAULT 0,
-			password_version INTEGER NOT NULL DEFAULT 0,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		);
-		CREATE TABLE global_config (id INTEGER PRIMARY KEY, mfa_lockout_enabled INTEGER NOT NULL DEFAULT 0);
+	database := setupAuthTestDB(t) // 已含 MFA 列/挑战表（ensureMFATestSchema 单源）
+	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, mfa_lockout_enabled INTEGER NOT NULL DEFAULT 0);
 		INSERT INTO global_config (id) VALUES (1)`); err != nil {
-		t.Fatalf("add mfa schema: %v", err)
+		t.Fatalf("seed global config: %v", err)
 	}
 	key, err := totp.Generate(totp.GenerateOpts{
 		Issuer: "LazyBalancer", AccountName: "mfa-user",
@@ -200,7 +189,7 @@ func TestMFAVerifyLogin_resetFailureIsLoggedWithoutRevokingJWT(t *testing.T) {
 	}
 }
 
-// F-SYS-1（历史）：挑战查询的 DB 故障（非 ErrNoRows）不得与「无效
+// 历史修复（历史）：挑战查询的 DB 故障（非 ErrNoRows）不得与「无效
 // 挑战」混同 401——基础设施错误必须显式 500，无效挑战（ErrNoRows）仍 401
 // 且不泄露具体原因。
 func TestMFAVerifyLogin_dbFailureReturns500Not401(t *testing.T) {
@@ -222,7 +211,7 @@ func TestMFAVerifyLogin_dbFailureReturns500Not401(t *testing.T) {
 	}
 }
 
-// B3-82-历史问题：消费挑战的 DB 故障不得折叠成 401「已消费」；挑战保持未消费，
+// 历史修复-历史问题：消费挑战的 DB 故障不得折叠成 401「已消费」；挑战保持未消费，
 // 并留下服务故障审计，客户端可重试。
 func TestMFAVerifyLogin_consumeDBFailureReturns500AndKeepsChallenge(t *testing.T) {
 	seedMFAChallengeLoginFixture(t, "consume-db-err", 0)
@@ -258,7 +247,7 @@ func TestMFAVerifyLogin_consumeDBFailureReturns500AndKeepsChallenge(t *testing.T
 	}
 }
 
-// H-B1-11：挑战已被使用（并发登录落败/阈值作废后重放）是观测面，必须留痕，
+// 挑战已被使用（并发登录落败/阈值作废后重放）是观测面，必须留痕，
 // 与同函数其余拒绝分支同密度。
 func TestMFAVerifyLogin_consumedChallengeIsAudited(t *testing.T) {
 	newBackupTestHandlers(t)

@@ -18,7 +18,7 @@ import (
 	"lazy-balancer-v2/wafiplist"
 )
 
-// ---- U03-F06：爬虫名单词法边界与格式校验 ----
+// ---- 爬虫名单词法边界与格式校验 ----
 
 func TestParseCrawlerCIDRs_strictTokenBoundaries(t *testing.T) {
 	body := "not.an.ip.version.1.2.3.4.5\n2026.10.18 release 9.9.9.9.1\nhost 42.236.12.130\n"
@@ -57,7 +57,7 @@ func TestParseCrawlerCIDRsForFormat_rejectsErrorPage(t *testing.T) {
 	}
 }
 
-// ---- U03-F08：陈旧 .iplist 文本不得遮蔽集群刚同步的 .fast ----
+// ---- 陈旧 .iplist 文本不得遮蔽集群刚同步的 .fast ----
 
 func TestReadThreatIplistEntries_newerFastWinsOverStaleText(t *testing.T) {
 	restore := OverrideThreatWafDirForTest(t.TempDir())
@@ -87,7 +87,7 @@ func TestReadThreatIplistEntries_newerFastWinsOverStaleText(t *testing.T) {
 	}
 }
 
-// ---- U03-F13：主端 fast 扫描须复用威胁源白名单（与从端写侧对称） ----
+// ---- 主端 fast 扫描须复用威胁源白名单（与从端写侧对称） ----
 
 func TestScanThreatFastFiles_ignoresUnknownSources(t *testing.T) {
 	restore := OverrideThreatWafDirForTest(t.TempDir())
@@ -108,7 +108,7 @@ func TestScanThreatFastFiles_ignoresUnknownSources(t *testing.T) {
 	}
 }
 
-// ---- U03-F14：同名 system=0 名单不得抑制内置 system=1 行 ----
+// ---- 同名 system=0 名单不得抑制内置 system=1 行 ----
 
 func TestWriteThreatSystemList_seedsSystemRowDespiteUserNameCollision(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -136,7 +136,7 @@ func TestWriteThreatSystemList_seedsSystemRowDespiteUserNameCollision(t *testing
 	}
 }
 
-// ---- U03-F15：渲染被跳过的策略不得抢走事件归因 ----
+// ---- 渲染被跳过的策略不得抢走事件归因 ----
 
 func TestSecurityEventsAttributePolicy_skipsRenderSkippedPolicy(t *testing.T) {
 	missing := &models.SecurityPolicy{
@@ -175,7 +175,7 @@ func TestSecurityEventsAttributePolicy_fallbackPrefersRenderedBeforeMissing(t *t
 	}
 }
 
-// ---- U03-F16：缺失引用错误审计须限流 ----
+// ---- 缺失引用错误审计须限流 ----
 
 func TestResolvePolicyIPListRefs_missingRefAuditThrottled(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -185,22 +185,12 @@ func TestResolvePolicyIPListRefs_missingRefAuditThrottled(t *testing.T) {
 	restore := OverrideThreatWafDirForTest(t.TempDir())
 	defer restore()
 	name := db.ThreatListNameBySource("ustc")
-	res, err := database.Exec(`INSERT INTO security_ip_lists (name, category, entries, system, created_at, updated_at)
-		VALUES (?, '恶意 IP', '', 1, datetime('now'), datetime('now'))`, name)
-	if err != nil {
+	// system=1 名单名唯一，威胁库行由 DB 初始化播种；直接复用其 id
+	// （空 entries + 缺失 .iplist = 装载失败形态）。
+	var listID int64
+	if err := database.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND system=1`, name).Scan(&listID); err != nil {
 		t.Fatal(err)
 	}
-	listID, _ := res.LastInsertId()
-	if _, err := database.Exec(`DELETE FROM security_ip_lists WHERE id=?`, listID); err != nil {
-		t.Fatal(err)
-	}
-	// 直接插入一条 system=1 名单行按名映射；文件缺失 → 装载失败。
-	res, err = database.Exec(`INSERT INTO security_ip_lists (name, category, entries, system, created_at, updated_at)
-		VALUES (?, '恶意 IP', '', 1, datetime('now'), datetime('now'))`, name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	listID, _ = res.LastInsertId()
 
 	policy := func() []*models.SecurityPolicy {
 		return []*models.SecurityPolicy{{
@@ -219,7 +209,7 @@ func TestResolvePolicyIPListRefs_missingRefAuditThrottled(t *testing.T) {
 	}
 }
 
-// ---- U03-F07：爬虫名单更新后的投影收敛（复用威胁库单源热路径） ----
+// ---- 爬虫名单更新后的投影收敛（复用威胁库单源热路径） ----
 
 func TestCrawlerRunUpdate_convergesProjectionWhenContentChanged(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -267,7 +257,7 @@ func TestConvergeIPListProjection_fallsBackToReload(t *testing.T) {
 	}
 }
 
-// ---- U03-F05：集群 apply 后重建爬虫运行快照 ----
+// ---- 集群 apply 后重建爬虫运行快照 ----
 
 func TestApplySnapshot_rebuildsCrawlerRuntimeSnapshot(t *testing.T) {
 	service, database := newClusterTestService(t)

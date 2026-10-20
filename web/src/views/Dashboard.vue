@@ -805,13 +805,15 @@ let fetchAllDataPromise: Promise<void> | null = null
 let isFetchingRuleHealth = false
 let rulesVersion = 0
 
-const fetchAllData = (): Promise<void> => {
+const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
   if (disposed) return Promise.resolve()
   if (fetchAllDataPromise) return fetchAllDataPromise
 
   // FE43-7(历史):删除手造 Authorization 头——api.ts 请求拦截器对全部
   // 同域相对路径请求统一从 localStorage 注入同一 token(api.ts:186-196)。
-  const config = { signal: dashboardPolling.signal, silent: true }
+  // 轮询轮次传入本轮 signal（pause/stop 可取消在途请求）；手动刷新（Caddy
+  // 操作后的补偿刷新）无轮次可用，回落页级永久 signal（随卸载终止）。
+  const config = { signal: roundSignal ?? dashboardPolling.signal, silent: true }
   fetchAllDataPromise = Promise.allSettled([
     request.get('/system/info', config).then((res) => {
       if (disposed) return
@@ -888,7 +890,7 @@ const fetchAllData = (): Promise<void> => {
       )
       const version = ++rulesVersion
       const currentRules = rules.value
-       await fetchRuleHealth(currentRules, version)
+       await fetchRuleHealth(currentRules, version, roundSignal)
      }).catch(() => { if (!disposed) rulesUnavailable.value = true }),
     request.get('/metrics/connections', config).then((res) => {
       if (disposed) return
@@ -921,11 +923,11 @@ const fetchAllData = (): Promise<void> => {
   return fetchAllDataPromise
 }
 
-const fetchRuleHealth = async (currentRules: Rule[], version: number) => {
+const fetchRuleHealth = async (currentRules: Rule[], version: number, roundSignal?: AbortSignal) => {
   if (disposed || currentRules.length === 0 || isFetchingRuleHealth) return
   isFetchingRuleHealth = true
   try {
-    const res = await request.get<APIResponse<HealthResponse>>('/config/health', { signal: dashboardPolling.signal, silent: true })
+    const res = await request.get<APIResponse<HealthResponse>>('/config/health', { signal: roundSignal ?? dashboardPolling.signal, silent: true })
     if (disposed || version !== rulesVersion) return
     const healthData = res.data || {}
     // 历史问题(历史):healthData 是 {server: {hostPort: health}} 嵌套——
@@ -1039,7 +1041,7 @@ const controlCaddy = async (action: 'start' | 'stop' | 'restart') => {
   }
 }
 
-const dashboardPolling = usePollingTask(async () => fetchAllData(), {
+const dashboardPolling = usePollingTask(async (task) => fetchAllData(task.signal), {
   interval: 5000,
   onError: (error) => console.error('Failed to poll dashboard:', error),
 })

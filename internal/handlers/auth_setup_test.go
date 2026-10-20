@@ -53,21 +53,14 @@ func setupAuthTestDB(t *testing.T) *sql.DB {
 	CREATE TABLE api_keys (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		created_by INTEGER NOT NULL
-	);
-	-- 挑战表随生产 schema 常备（U04c-02：三条改密路径在同一事务内吊销挑战，
-	-- 缺表会让改密 500）。
-	CREATE TABLE mfa_challenges (
-		token TEXT PRIMARY KEY,
-		user_id INTEGER NOT NULL,
-		expires_at DATETIME NOT NULL,
-		consumed BOOLEAN DEFAULT 0,
-		attempts INTEGER DEFAULT 0,
-		password_version INTEGER NOT NULL DEFAULT 0,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// MFA 列与挑战表统一由 ensureMFATestSchema 创建（此前内联副本
+	// 导致四份 DDL 漂移）。挑战表随生产 schema 常备（三条改密路径
+	// 在同一事务内吊销挑战，缺表会让改密 500）。
+	ensureMFATestSchema(t, database)
 	return database
 }
 

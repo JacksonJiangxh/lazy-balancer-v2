@@ -18,7 +18,9 @@ func feedAndRun(t *testing.T, threshold, windowMin int, duration, scope string, 
 	t.Helper()
 	installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, threshold, windowMin, duration, scope, dryRun)
-	if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, entries, system) VALUES (?, '[]', 1)`, AutobanPresetListName); err != nil {
+	// system=1 名单名唯一（部分唯一索引），内置预置行由 DB 初始化
+	// 播种——这里按幂等语义复用，不再插入第二行。
+	if _, err := db.DB.Exec(`INSERT OR IGNORE INTO security_ip_lists (name, entries, system) VALUES (?, '[]', 1)`, AutobanPresetListName); err != nil {
 		t.Fatalf("seed preset list: %v", err)
 	}
 	autobanObserveEvent("203.0.113.5", "blocked", "id:911100")

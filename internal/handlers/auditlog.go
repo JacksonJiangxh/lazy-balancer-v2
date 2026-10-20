@@ -36,11 +36,18 @@ func resetAuditOptionsCacheForTest() {
 }
 
 func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
+	// 审计库未装配时降级为空结果——同包日志统计
+	// （GetLogStats）与审计写路径都有 nil 守卫，此处此前裸解引用会把生命周期
+	// 边界形态变成 panic/500。
+	if db.AuditDB == nil {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]interface{}{}})
+		return
+	}
 	type optionRow struct {
 		Value string `json:"value"`
 		Count int64  `json:"count"`
 	}
-	// 历史问题（历史）：锁只保护缓存读写（double-check，与 brandingStore 慢
+	// 历史问题（历史）：锁只保护缓存读写（历史修复，与 brandingStore 慢
 	// 路径同型）——此前持锁执行三条全表 GROUP BY，深审计库/IO 抖动时全部
 	// 筛选面板请求（含命中缓存路径）被串行阻塞。缓存 miss 时释放锁再查询，
 	// 并发 miss 各自查询后写回（同内容，最后写入者胜，无撕裂读）。
@@ -71,10 +78,10 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 		for rows.Next() {
 			var o optionRow
 			if err := rows.Scan(&o.Value, &o.Count); err != nil {
-				// F-CORE-2（历史）：单行 Scan 失败须留痕——静默丢行让下拉
+				// 历史修复（历史）：单行 Scan 失败须留痕——静默丢行让下拉
 				// 缺项零信号（主查询 500 口径在此分裂为静默）。
 				services.Logf("warn", "审计日志下拉选项（%s）行扫描失败: %v", column, err)
-				// U04d-05：Scan 失败也是故障轮——此前只 continue，fetchErr 不置位，
+				// Scan 失败也是故障轮——此前只 continue，fetchErr 不置位，
 				// 缺项下拉被当作完整结果写进 60s 缓存（同文件 历史问题 门禁的
 				// 遗漏分支）。保留首错用于缓存门判定。
 				if scanErr == nil {
@@ -84,7 +91,7 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 			}
 			out = append(out, o)
 		}
-		// F-CORE-2：迭代错误上抛 fetchErr——历史问题 缓存门口径统一（查询失败
+		// 迭代错误上抛 fetchErr——历史问题 缓存门口径统一（查询失败
 		// 与迭代失败同为故障轮，空/部分结果不得写 60s 缓存）。
 		if err := rows.Err(); err != nil {
 			services.Logf("warn", "审计日志下拉选项（%s）迭代失败: %v", column, err)
@@ -182,7 +189,7 @@ func buildAuditLogFilters(c *gin.Context, loc *time.Location) (string, []interfa
 	if startT, ok1, abort1 := parseBoundary(c.Query("start_time"), "00:00:00"); abort1 {
 		return "", nil, true
 	} else if ok1 {
-		// SYS-5(2026-09-10 审计):裸列比较替代 datetime(created_at) 包裹——包裹
+		// 历史修复(2026-09-10 审计):裸列比较替代 datetime(created_at) 包裹——包裹
 		// 使 idx_audit_log_created 失效全表扫;created_at 为 SQLite 规范 UTC 文本
 		// 与 datetime(?) 输出同格式,直接比较等价且可走索引。
 		conds = append(conds, " AND created_at >= datetime(?)")
@@ -201,11 +208,18 @@ func buildAuditLogFilters(c *gin.Context, loc *time.Location) (string, []interfa
 }
 
 func (h *Handlers) GetAuditLogs(c *gin.Context) {
+	// 与 GetAuditLogOptions 同口径的 nil 守卫。
+	if db.AuditDB == nil {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "审计库未就绪", Data: map[string]interface{}{
+			"list": []map[string]any{}, "total": 0, "page": 1, "page_size": 20, "partial": true,
+		}})
+		return
+	}
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	if page < 1 {
 		page = 1
 	}
-	// clamp 上限防 (page-1)*pageSize 整数溢出为负 → SQLite OFFSET 报错 500
+	// clamp 上限防 *pageSize 整数溢出为负 → SQLite OFFSET 报错 500
 	// （与 ListSecurityEvents security.go:815 同口径，历史问题 C）。
 	// 历史问题:上限收紧 100000→10000——审计库全量在百万行量级内,10 万页
 	// (200 万行偏移)无命中语义只浪费深翻页扫描。

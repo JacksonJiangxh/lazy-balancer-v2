@@ -66,7 +66,7 @@ func isMaskedDNSCredentials(m map[string]string) bool {
 	return true
 }
 
-// mergeMaskedDNSCredentials(CERT40-2):部分掩码回传逐字段合并——值为掩码
+// mergeMaskedDNSCredentials:部分掩码回传逐字段合并——值为掩码
 // 占位的字段取库中原值,非占位取提交值;库中亦无该字段时占位无处可取,
 // 返回错误(防掩码串覆盖真实凭证)。
 func mergeMaskedDNSCredentials(submitted, stored map[string]string) (map[string]string, error) {
@@ -122,6 +122,10 @@ func (h *Handlers) ListCertificateConfigs(c *gin.Context) {
 }
 
 func (h *Handlers) CreateCertificateConfig(c *gin.Context) {
+	// 导入窗口内写入会被全量替换静默覆盖。
+	if rejectWriteDuringImport(c, "保存证书配置（配置导入进行中）") {
+		return
+	}
 
 	var req models.CreateCertificateConfigRequest
 	if !guardConfiguredJSONBody(c) {
@@ -132,7 +136,7 @@ func (h *Handlers) CreateCertificateConfig(c *gin.Context) {
 		return
 	}
 
-	// B2-08（历史）：删除「空则默认 dnspod」死代码——binding:"required"
+	// 历史修复（历史）：删除「空则默认 dnspod」死代码——binding:"required"
 	// 保证 dns_provider 非空，兜底不可达；缺字段请求由 400 契约拒绝。
 	provider, ok := dnsproviders.Get(req.DNSProvider)
 	if !ok {
@@ -140,7 +144,7 @@ func (h *Handlers) CreateCertificateConfig(c *gin.Context) {
 		return
 	}
 
-	// CERT40-2:Create 无库值可取,含掩码占位直接拒绝。
+	// Create 无库值可取,含掩码占位直接拒绝。
 	for _, v := range req.DNSCredentials {
 		if v == maskedDNSCredentialsSentinel {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "凭证字段不能为掩码占位符"})
@@ -164,7 +168,13 @@ func (h *Handlers) CreateCertificateConfig(c *gin.Context) {
 		return
 	}
 
-	id, _ := result.LastInsertId()
+	// LastInsertId 失败时审计会落「配置 0」，
+	// 与同域已修的「配置 0」文案问题同型——失败留痕后按 0 继续（行已落库，
+	// 不能因审计 id 丢失而回滚）。
+	id, idErr := result.LastInsertId()
+	if idErr != nil {
+		services.Logf("error", "CreateCertificateConfig: 读取新配置 ID 失败（审计将记为 0）: %v", idErr)
+	}
 	recordAudit(c, "创建", "DNS配置", services.FormatAuditDetail(fmt.Sprintf("配置 %d", id), req.Name, req.DNSProvider, fmt.Sprintf("启用：%t", req.Enabled)))
 	c.JSON(http.StatusCreated, models.APIResponse{Code: 0, Message: "Config created", Data: gin.H{"id": id}})
 }
@@ -217,10 +227,10 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 
-	// LBS/LBH-4（历史 历史问题）：旧行读取与动态 UPDATE 收敛到同一事务
+	// LBS/历史修复（历史 历史问题）：旧行读取与动态 UPDATE 收敛到同一事务
 	//（_txlock=immediate → BEGIN IMMEDIATE 先取写锁）——审计 changed 清单的
 	//比对基线即写入前那一刻的真实行，消除「事务外预读 → 写入」窗口内并发
-	//提交导致的清单失真（镜像 CERT-N1 的事务内旧行模式）。
+	//提交导致的清单失真（镜像 历史修复 的事务内旧行模式）。
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to update config"})
@@ -253,7 +263,7 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 			}
 		}
 	case isMaskedDNSCredentials(effectiveCredentials):
-		// CERT42-2:全掩码回传(GET 掩码→未改动即保存)按未提交处理——校验
+		// 全掩码回传(GET 掩码→未改动即保存)按未提交处理——校验
 		// 路径以库中旧值为准(掩码串进 BuildCredentialsJSON 会 400「请选择
 		// 认证方式」);落库侧下方 isMasked 分支保留作防御(req.DNSCredentials
 		// 置 nil 不更新凭证列)。
@@ -265,7 +275,7 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 			}
 		}
 	default:
-		// CERT40-2:部分掩码回传先逐字段合并——下方早期校验与最终落库都以
+		// 部分掩码回传先逐字段合并——下方早期校验与最终落库都以
 		// 合并结果为准(掩码字段取库值),掩码串不得进入校验/落库。
 		stored := map[string]string{}
 		if oldCredentials != "" {
@@ -349,7 +359,7 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 	if req.DNSCredentials != nil {
 		// 历史问题 二十六次 D4：全掩码回传（非 admin GET 后未改动即保存）按未提交
 		// 处理——否则掩码串会覆盖真实凭证。部分掩码已在上方合并进
-		// req.DNSCredentials(CERT40-2)。
+		// req.DNSCredentials。
 		if isMaskedDNSCredentials(req.DNSCredentials) {
 			req.DNSCredentials = nil
 		} else {
@@ -470,7 +480,7 @@ func (h *Handlers) ListDNSProviders(c *gin.Context) {
 				"placeholder": f.Placeholder,
 				"options":     p.CredentialFieldOptions(f.Name),
 			}
-			// WS-13：可见性/选项文案元数据（前端表单渲染单源，替代 provider 硬编码）
+			// 可见性/选项文案元数据（前端表单渲染单源，替代 provider 硬编码）
 			if len(f.VisibleWhen) > 0 {
 				field["visible_when"] = f.VisibleWhen
 			}
@@ -520,7 +530,7 @@ func (h *Handlers) TestCertificateConfig(c *gin.Context) {
 		if dbQueryNotFound(c, err, "Config not found", "TestCertificateConfig query config") {
 			return
 		}
-		// 历史问题 B-F5：存储凭证「非空但解析失败」与「凭证填错」是不同故障——
+		// 历史问题 存储凭证「非空但解析失败」与「凭证填错」是不同故障——
 		// unmarshal 错误此前被吞，creds=nil 走到 Validate 报「缺少凭证」，被误
 		// 归因为 credentials_invalid（400），运营方会反复重改凭证。损坏归 500 +
 		// 独立审计类别；空凭证（未填写/NULL）仍走 Validate 的缺凭证 400 原语义。
@@ -563,7 +573,7 @@ func (h *Handlers) TestCertificateConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "凭证有效"})
 }
 
-// ListCertificates 返回证书任务聚合清单(C-F3,2026-09-10 审计:原实现请求
+// ListCertificates 返回证书任务聚合清单(历史修复,2026-09-10 审计:原实现请求
 // Caddy /pki/ca/local 返回内部 local CA 信息——与业务证书无关(autoHTTPS 已
 // disable_certificates,证书由 cert_jobs 落盘经 load_files 加载),前端零消费、
 // MCP 描述误导。改为从 cert_jobs 聚合每规则、每域名最新任务；同域不同规则
@@ -585,8 +595,8 @@ func (h *Handlers) ListCertificates(c *gin.Context) {
 		var ruleID, domain, status, message, expiresAt, updatedAt string
 		var expiresNull, updatedNull sql.NullString
 		if err := rows.Scan(&id, &ruleID, &domain, &status, &message, &expiresNull, &updatedNull); err != nil {
-			// SYS-F2（历史 历史问题）：单行 Scan 失败 warn 留痕+跳过（对齐
-			// F-CORE-2 口径）——静默丢行会让该域名在证书清单中无故缺席；
+			// 历史修复（历史 历史问题）：单行 Scan 失败 warn 留痕+跳过（对齐
+			// 历史修复 口径）——静默丢行会让该域名在证书清单中无故缺席；
 			// 迭代级失败仍由下方 rows.Err() 500 兜底。
 			services.Logf("warn", "证书任务列表：跳过扫描失败行（该域名聚合行本轮缺失）: %v", err)
 			continue
@@ -670,12 +680,12 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 	// UpdateRule 改域迁移（任务行已改到新域）交错，本次仍按旧域 INSERT
 	// 新行并入队，对旧域实际发起 CA 签发（部署期域不匹配拒绝，job 滞留
 	// downloaded 至 6h sweep）；与 DeleteRule 交错可留孤儿任务行。
-	// 请求体已在锁外绑定（bind-before-lock 序）；EnqueueIfActive 只取队列
+	// 请求体已在锁外绑定（历史修复 序）；EnqueueIfActive 只取队列
 	// 叶锁（m.mu/q.mu），execute 在锁外 goroutine 运行，无反向锁序。
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 	queued := 0
-	// CERT44-2（历史）：批量路径套用与定向签发同款冷却门，冷却中
+	// 历史修复（历史）：批量路径套用与定向签发同款冷却门，冷却中
 	// 任务跳过并单列计数（仅批量分支产生非零值）。
 	skippedCooldown := 0
 	// 历史问题：其余 changed=false 出口的归因计数（仅批量分支产生非零值）。
@@ -827,7 +837,7 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 				failed = append(failed, fmt.Sprintf("%s(%v)", target.domain, canonicalErr))
 				continue
 			}
-			// CERT44-2（历史）：逐目标套用与定向签发同款冷却门
+			// 历史修复（历史）：逐目标套用与定向签发同款冷却门
 			// （certJobRetryBlocked）——失败 5 分钟内/执行中的任务跳过，不再
 			// 被批量重签静默重排队、反复消耗 CA 配额；跳过数单列响应计数。
 			var jobStatus string
@@ -953,7 +963,7 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 }
 
 func (h *Handlers) ParseCertificate(c *gin.Context) {
-	// 历史问题 二十八次审计 F3：证书解析入参 PEM 上限 2MB（对齐 admin-tls inspect 的
+	// 历史问题 二十八次审计 F3：证书解析入参 PEM 上限 2MB（对齐 历史修复 inspect 的
 	// maxAdminTLSJSONBytes 量级）——此前无上限，任何持凭证者（含只读 API key，
 	// 本端点在 readOnlyWriteRoutes）可投递任意大 body 造成内存压力。
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)

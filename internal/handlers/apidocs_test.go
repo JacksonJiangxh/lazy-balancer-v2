@@ -680,7 +680,7 @@ func containsRouteError(errors []string, status string) bool {
 	return false
 }
 
-// 历史问题(C1)+历史问题(C2)+APIMCP-6(C7):OIDC 公开契约登记、lbbak 导出形态、
+// 历史问题(C1)+历史问题(C2)+API历史修复(C7):OIDC 公开契约登记、lbbak 导出形态、
 // validate 128MB 上限与 settings/oidc 重试契约的文档漂移绊线。
 func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *testing.T) {
 	// Given

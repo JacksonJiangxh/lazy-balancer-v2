@@ -1,6 +1,8 @@
 import {
   LAT_TOP,
   LAT_BOTTOM,
+  DOT_LAT_TOP,
+  DOT_LAT_BOTTOM,
   WORLD_W,
   WORLD_D,
   DRILL_UNIFIED_ZOOM,
@@ -16,7 +18,7 @@ import {
 } from '@/utils/threatProjection'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
-import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, hasProvinceStats, drillCommitAllowed } from '@/utils/threatShared'
+import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent } from '@/utils/threatShared'
 import { COUNTRY_CENTROIDS, FALLBACK_CENTROID, type Centroid } from '@/utils/countryCentroids'
 import { loadAdmin1Tables } from '@/utils/admin1Loader'
 import { FLOW_ATTACK_COLOR as ATTACK_COLOR, FLOW_NORMAL_COLOR as NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowArcWidth } from '@/utils/threatTheme'
@@ -182,8 +184,10 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   const cam: Cam2D = { camX: 0, camY: 0, zoom: 2, width: 1, height: 1 }
   // v26：总览按宽高双适配（取较小 zoom）——顶栏/底部卡片占位后上下留边，
   // 国家不再贴边无法点选。
-  // v2.3.8 三轮放大（用户裁定）：高度满格（留 8px 缓冲）；宽度系数 1.15
-  // （360° 环绕冗余可裁）让高度主导——世界高≈面板 98%。
+  // v2.3.8 三轮放大（用户裁定）：高度项 = 可视高 90%（上下各留 5%），
+  // 宽度项 = 视口宽 ×2 / 世界宽——2 倍宽度只保证横向 180° 可见（360° 环绕
+  // 冗余可裁），所以 16:9 等宽屏下恒由高度项主导；窄/竖屏容器才可能由宽度项
+  // 主导（可见经度多于 180°）。
   const overviewZoom = (): number => Math.max(minZoom, Math.min((cam.width * 2) / WORLD_W, (cam.height * 0.9) / WORLD_D))
 
   // ---- 数据 ----
@@ -224,11 +228,9 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
 
   // ---- 点阵网格（v2.3.8：与地球版六边形瓦片同视觉语言；一次栅格化缓存） ----
   /** 六边形瓦片路径（pointy-top，与 globe.gl hexbin 同款——用户裁定
-   * 2026-10-17：地图点阵改成地球页面的六边形样式，替代圆点）。 */
-  function dotPath(ctx2: CanvasRenderingContext2D, x: number, y: number, r: number): void {
-    ctx2.beginPath()
-    dotSubPath(ctx2, x, y, r)
-  }
+   * 2026-10-17：地图点阵改成地球页面的六边形样式，替代圆点）。
+   *  只提供 Path2D 版本：静态层/下钻层/悬停层全部按色聚合后一次 fill，
+   *  逐点 beginPath+fill 的 ctx 版本已退役（1.3 万次绘制调用是重建热点）。 */
   function dotSubPath(path: CanvasRenderingContext2D | Path2D, x: number, y: number, r: number): void {
     const first = POINTY_TOP_HEX_VERTICES[0]
     path.moveTo(x + first[0] * r, y + first[1] * r)
@@ -282,8 +284,9 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     let rowIdx = 0
     // Mercator 下按「投影后 y」等距布点，而不是按纬度等距：等纬度步长
     // 会在高纬被拉稀、低纬挤密（用户实测：上方稀、下方密、南半球显小）。
-    const topY = latToY(84)
-    const bottomY = latToY(-54.5)
+    // 扫描域由投影域派生（DOT_LAT_TOP/BOTTOM 单源），不再写死 84/-54.5。
+    const topY = latToY(DOT_LAT_TOP)
+    const bottomY = latToY(DOT_LAT_BOTTOM)
     for (let y = topY; y < bottomY; y += DOT_STEP, rowIdx++) {
       const lat = yToLat(y)
       const lonOffset = rowIdx % 2 === 1 ? DOT_STEP / 2 : 0
@@ -373,8 +376,11 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     // 点阵：普通陆地暗点，命中国家按热力染色（log10 计数标尺与地球版同源）
     buildWorldDots()
     if (worldDots) {
+      // 按色聚合 Path2D 后逐色一次 fill（与下钻层同形态）：原实现逐点
+      // fillStyle+beginPath+fill，1.3 万点=1.3 万次绘制调用，4K 下是静态层
+      // 重建的主线程热点。
       const heatCache = new Map<string, string>()
-      staticCtx.beginPath()
+      const byColor = new Map<string, Path2D>()
       for (const d of worldDots) {
         let fill = heatCache.get(d.key)
         if (fill === undefined) {
@@ -382,9 +388,16 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
           fill = cnt > 0 ? heatCss(cnt) : DOT_LAND
           heatCache.set(d.key, fill)
         }
+        let path = byColor.get(fill)
+        if (!path) {
+          path = new Path2D()
+          byColor.set(fill, path)
+        }
+        dotSubPath(path, d.lon + WORLD_W / 2, latToY(d.lat), DOT_R * 1.35)
+      }
+      for (const [fill, path] of byColor) {
         staticCtx.fillStyle = fill
-        dotPath(staticCtx, d.lon + WORLD_W / 2, latToY(d.lat), DOT_R * 1.35)
-        staticCtx.fill()
+        staticCtx.fill(path)
       }
     }
     // 国界描边退役（v2.3.8 用户裁定：点阵已表意，无需分隔线）
@@ -559,10 +572,14 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     const p = canvasPoint(event)
     const geo = screenToLonLat(p.x, p.y, cam)
     for (const country of THREAT_COUNTRIES) {
-      if (pointInPolys(geo.lon, geo.lat, country.polys)) {
-        void drillToCountry(normalizeCountryName(country.name))
-        return
-      }
+      if (!pointInPolys(geo.lon, geo.lat, country.polys)) continue
+      const intent = drillClickIntent(normalizeCountryName(country.name), drillLayerCountry || null)
+      // 'stay'：下钻态单击当前下钻国自身 = 保持（与地球引擎「本省保持」同语义）。
+      // 缺这行时每次单击国境都会重钻：清 hover、全量重建省点阵、把用户拖动后
+      // 的取景拉回国土中心。
+      if (intent === 'stay') return
+      if (intent === 'drill' || intent === 'switch') void drillToCountry(normalizeCountryName(country.name))
+      return
     }
     if (drillLayerCountry) returnToWorld()
   }
@@ -747,6 +764,21 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     }
   }
 
+  // 弧线渐变缓存：端点按 0.5px 量化后作键（视觉无差），相机静止时复用，
+  // 无界增长防护=超过上限整体清空（弧线池上限 60，键数天然有界）。
+  const arcGradients = new Map<string, CanvasGradient>()
+  function arcGradient(from: Centroid2D, to: Centroid2D, color: string): CanvasGradient {
+    const key = `${Math.round(from.x * 2)},${Math.round(from.y * 2)},${Math.round(to.x * 2)},${Math.round(to.y * 2)},${color}`
+    const cached = arcGradients.get(key)
+    if (cached) return cached
+    if (arcGradients.size > MAX_ACTIVE_ARCS * 4) arcGradients.clear()
+    const gradient = ctx.createLinearGradient(from.x, from.y, to.x, to.y)
+    gradient.addColorStop(0, 'rgba(0,0,0,0)')
+    gradient.addColorStop(1, color)
+    arcGradients.set(key, gradient)
+    return gradient
+  }
+
   function drawArcs(delta: number): void {
     for (let i = arcs.length - 1; i >= 0; i--) {
       const arc = arcs[i]
@@ -785,11 +817,11 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
         else ctx.lineTo(pt.x, pt.y)
         last = pt
       }
-      // 渐变发光描边（头亮尾隐）
+      // 渐变发光描边（头亮尾隐）。渐变只由（起点,终点,颜色）决定，相机静止
+      // 时逐帧重建 60 个 createLinearGradient 纯属浪费——按量化后的端点缓存，
+      // 相机移动/越界时整体失效重建。
       if (last) {
-        const gradient = ctx.createLinearGradient(from.x, from.y, to.x, to.y)
-        gradient.addColorStop(0, 'rgba(0,0,0,0)')
-        gradient.addColorStop(1, color)
+        const gradient = arcGradient(from, to, color)
         ctx.strokeStyle = gradient
         ctx.lineWidth = flowArcWidth(arc.weight)
         ctx.globalAlpha = Math.min(1, Math.max(0.05, (life - arc.elapsed) / 0.4))
@@ -1150,7 +1182,6 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       if (heatEntriesEqual(countryCounts, [...nextCounts].map(([name, count]) => ({ name, count })))) return
       countryCounts = nextCounts
       staticDirty = true
-      if (!drillLayerCountry) drillDirty = true
       // 暂停态无 tick 驱动：数据到达即补绘（否则热力染色停在上一次暂停帧）
       if (paused) renderOnce()
     },

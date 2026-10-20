@@ -615,7 +615,7 @@ func TestCAQueueManager_CancelJobsForRule_cancels_and_waits_for_deployment_callb
 	cancellationObserved := make(chan struct{})
 	releaseCallback := make(chan struct{})
 	wroteFiles := make(chan struct{}, 1)
-	// close 幂等（U4b-02）：取消/补扫路径可能对同一任务二次触发本闭包，
+	// close 幂等：取消/补扫路径可能对同一任务二次触发本闭包，
 	// 裸 close 已关闭通道必 panic。
 	var callbackOnce, cancellationOnce sync.Once
 	service.retryDeployment = func(ctx context.Context, _ int) error {
@@ -780,7 +780,7 @@ func TestCAQueueManager_PauseAndDrain_waits_for_deployment_retry_callback(t *tes
 	cancellationObserved := make(chan struct{})
 	releaseCallback := make(chan struct{})
 	resumedRetry := make(chan struct{}, 1)
-	// close 幂等（U4b-02）：同 TestCAQueueManager_CancelJobsForRule 闭包。
+	// close 幂等：同 TestCAQueueManager_CancelJobsForRule 闭包。
 	var callbackOnce, cancellationOnce sync.Once
 	service.retryDeployment = func(ctx context.Context, jobID int) error {
 		if jobID == 42 {
@@ -1163,7 +1163,7 @@ func TestCAQueueManager_enqueueCompensation_skips_when_job_still_active(t *testi
 	}
 }
 
-// 历史问题 A-F1：补偿循环必须在规则被并发删除后终止并释放租约。drain 成功后规则已
+// 历史问题 补偿循环必须在规则被并发删除后终止并释放租约。drain 成功后规则已
 // 不存在（管理员重试 DeleteRule 或配置导入整树替换）时，没有可恢复对象——
 // restore 不得写入幽灵 cert_jobs 行（无外键），requeue 的规则 SELECT 命中
 // ErrNoRows 必须按成功语义收尾，否则补偿进入永久退避循环且 blockedRules 租约
@@ -1240,7 +1240,7 @@ func TestCAQueueManager_StartRuleDeletionCompensation_exits_when_rule_deleted_mi
 	}
 }
 
-// 历史问题 A-F1：Stop 弃置补偿（角色翻转/进程停止）后必须回收全部 blockedRules
+// 历史问题 Stop 弃置补偿（角色翻转/进程停止）后必须回收全部 blockedRules
 // 租约——补偿 goroutine 已退出，其租约再无释放者；残留租约会让复用同
 // caddy_id 的新规则被 EnqueueIfActive 永久拦截（证书静默停发）。
 func TestCAQueueManager_Stop_releases_abandoned_rule_block_leases(t *testing.T) {
@@ -1265,7 +1265,7 @@ func TestCAQueueManager_Stop_releases_abandoned_rule_block_leases(t *testing.T) 
 	}
 }
 
-// 历史问题 A-F2（历史问题 发现3 回归）：退役条目 age-out 摘除不得遗忘在途 jobID——摘除后
+// 历史问题 历史修复（历史问题 发现3 回归）：退役条目 历史修复 摘除不得遗忘在途 jobID——摘除后
 // IsJobActive 必须继续返回 true（zombieJobs 迁移），直到滞行执行经 executionDone
 // 信号退出；无 executionDone 的 jobID 永久保留保护（罕见，宁可永久保护不放双执行）。
 func TestCAQueueManager_IsJobActive_agedOutRetiredEntry_migratesZombieProtection(t *testing.T) {
@@ -1332,7 +1332,7 @@ func TestCAQueue_prepareExecution_scales_budget_with_domain_count(t *testing.T) 
 	execution, ok := queue.prepareExecutionLocked(context.Background())
 	queue.mu.Unlock()
 
-	// Then：预算按 30min 基础 + 每增加一个域名 15min 缩放（CERT-B 历史）
+	// Then：预算按 40min 基础（caExecutionTimeout）+ 每增加一个域名 15min 缩放（历史修复 历史）
 	if !ok {
 		t.Fatal("pending job was not prepared")
 	}
@@ -1372,7 +1372,7 @@ func TestCAQueue_prepareExecution_budget_capped_at_max(t *testing.T) {
 }
 
 func TestCaExecutionTimeoutFor_counts_domains(t *testing.T) {
-	// Given/When/Then（CERT-B 历史：每域增量 10min→15min——单域内部分段
+	// Given/When/Then（历史修复 历史：每域增量 10min→15min——单域内部分段
 	// 最坏 ≈17min（传播 5m+递归 2m/域+验证 10m），15min 贴合最坏段和）
 	testCases := []struct {
 		domains string
@@ -1507,7 +1507,7 @@ func TestCAQueue_providerUnavailable_fail_skips_deleted_or_disabled_job(t *testi
 	queue.cancel()
 }
 
-// N+11 D1-S2：并发/间隔闸门只需缓存 provider 与内存态即可判定，必须先于
+// N+11 并发/间隔闸门只需缓存 provider 与内存态即可判定，必须先于
 // loadCAProvider——否则积压窗口内每 100ms tick 都打 1-2 次 provider 查询
 // （~10 次/秒）。可观测判据：provider 已在 DB 禁用（无 enabled 回退），闸门
 // 关闭时 tick 不得触发 provider 加载——一旦加载必然走 drain→failJob 路径。
@@ -1700,7 +1700,7 @@ func TestCAQueue_tick_dispatches_with_refreshed_provider(t *testing.T) {
 	}
 }
 
-// LBS-B-L1（历史 历史问题）：requeueStrandedJobs 迭代健壮性——Scan 失败补
+// 历史修复（历史 历史问题）：requeueStrandedJobs 迭代健壮性——Scan 失败补
 // warn 留痕（曾静默 continue 零信号），循环后补 rows.Err() 检查（曾迭代
 // 中途出错时部分任务集被当全量处理）。
 func TestCAQueue_requeueStrandedJobsLogsScanFailure(t *testing.T) {
@@ -2040,7 +2040,7 @@ func TestCancelJob_waits_for_retired_and_zombie_executions(t *testing.T) {
 		t.Fatal("CancelJob did not return after retired execution finished")
 	}
 
-	// Given 2：僵尸形态（age-out 摘除退役条目后迁入 zombieJobs，执行仍悬挂）
+	// Given 2：僵尸形态（历史修复 摘除退役条目后迁入 zombieJobs，执行仍悬挂）
 	zombieDone := make(chan struct{})
 	manager.mu.Lock()
 	manager.zombieJobs[43] = zombieJob{ruleID: "lb_zombie_job", done: zombieDone}
@@ -2060,5 +2060,56 @@ func TestCancelJob_waits_for_retired_and_zombie_executions(t *testing.T) {
 	case <-zombieReturned:
 	case <-time.After(2 * time.Second):
 		t.Fatal("CancelJob did not return after zombie execution finished")
+	}
+}
+
+// PauseAndDrain 的 drained 判据必须并入既有
+// retiredQueues / zombieJobs——否则前一次排空超时退役的滞行执行仍存活时，
+// 第二次调用会谎报 drained=true，配置导入据此放行整树替换（同 jobID 写入
+// 与导入快照竞争）。
+func TestCAQueueManager_PauseAndDrain_secondCallSeesPriorRetiredStragglers(t *testing.T) {
+	// Given：一个「旧队列」仍持有在途执行（模拟上一次 PauseAndDrain 超时退役）
+	queue := newCAQueue(models.CAProvider{ID: 1, MaxConcurrent: 1}, nil)
+	go queue.loop()
+	t.Cleanup(queue.stop)
+	queue.mu.Lock()
+	queue.active[42] = struct{}{}
+	queue.mu.Unlock()
+	manager := &CAQueueManager{
+		queues:        map[int]*caQueue{},
+		retiredQueues: []retiredCAQueue{{queue: queue, retiredAt: time.Now()}},
+		active:        true,
+	}
+
+	// When：第二次调用（本次没有新队列可停）
+	drained := manager.PauseAndDrain()
+
+	// Then：旧退役队列仍有在途 active → 必须 历史修复
+	if drained {
+		t.Fatal("PauseAndDrain drained=true, want false（既有退役队列仍有在途执行）")
+	}
+
+	// 回归形状：在途执行清空后同一调用报告已排空
+	queue.mu.Lock()
+	delete(queue.active, 42)
+	queue.mu.Unlock()
+	manager.mu.Lock()
+	manager.zombieJobs = nil
+	manager.mu.Unlock()
+	if drained := manager.PauseAndDrain(); !drained {
+		t.Fatal("PauseAndDrain drained=false, want true（退役队列已无在途执行）")
+	}
+}
+
+// 历史修复 畸形形态：zombieJobs 非空（退役队列已 历史修复 但 jobID 仍受保护）
+// 同样视为未排空。
+func TestCAQueueManager_PauseAndDrain_zombieJobsBlockDrain(t *testing.T) {
+	manager := &CAQueueManager{
+		queues:     map[int]*caQueue{},
+		zombieJobs: map[int]zombieJob{42: {}},
+		active:     true,
+	}
+	if drained := manager.PauseAndDrain(); drained {
+		t.Fatal("PauseAndDrain drained=true, want false（zombieJobs 非空代表仍有未知在途签发）")
 	}
 }

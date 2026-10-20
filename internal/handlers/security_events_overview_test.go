@@ -39,6 +39,9 @@ func seedSecurityEvent(t *testing.T, eventTime, ruleCaddyID string, policyID any
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, rule_name, policy_name)
 		VALUES (?, ?, ?, '192.0.2.9', 'GET', '/a', 'crs', ?, ?, 'blocked', ?, ?)`,
 		eventTime, ruleCaddyID, policyID, ruleTriggered, ruleMsg, ruleName, policyName); err != nil {
+		// 种子失败必须显式失败——空错误体让未播种形态被当成功能行为
+		//（假绿/假红不可辨），聚合口径的回归保护随之失效。
+		t.Fatalf("seed security event: %v", err)
 	}
 }
 
@@ -137,7 +140,7 @@ func TestListSecurityEvents_excludeKeepsNullRuleTriggered(t *testing.T) {
 }
 
 func TestListSecurityEvents_legacyRowsFallBackToJoinedNames(t *testing.T) {
-	// Given a rule and policy, plus a pre-migration event with empty snapshot columns
+	// Given a rule and policy, plus a 历史修复 event with empty snapshot columns
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityEventsRouter(t)
 
@@ -384,8 +387,8 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 		{"crawler segment upper bound", "899999", "", "爬虫Bot"},
 		{"empty input", "", "", "其他"},
 		{"custom rule six-digit id", "123456", "something else", "自定义规则"},
-		// SEC-R1（历史）收敛前语义钉：未列名 3 位前缀的 9xxxxx（CRS 保留段
-		// 余数）在概览视图走 fall-through——msg 命中 IP 黑白名单门仍归 IP 访问
+		// 历史修复（历史）收敛前语义钉：未列名 3 位前缀的 9xxxxx（CRS 保留段
+		// 余数）在概览视图走 历史修复——msg 命中 IP 黑白名单门仍归 IP 访问
 		// 控制，裸形态归「其他」（阶段视图则整段归 WAF，两视图有意分叉）。
 		{"unlisted crs id with acl msg", "960100", "命中 IP 黑名单", "IP 访问控制"},
 		{"unlisted crs id bare", "960100", "something else", "其他"},
@@ -476,7 +479,7 @@ func TestGetSecurityOverview_fallsBackToBundledCRSVersion(t *testing.T) {
 	}
 }
 
-// SC-11（2026-09-05 安全核心域审计 · 批准修复）：CRS 版本行查询失败必须显式报错。
+// 历史修复（2026-09-05 安全核心域审计 · 批准修复）：CRS 版本行查询失败必须显式报错。
 // Given：库已初始化但 security_crs_version 表缺失（单表异常窗口——主库整体
 // 故障时 ActivePolicies 会同挂触发 500，本测试钉住仅该表异常的静默窗口）。
 // When：请求 /security/overview。
@@ -499,7 +502,7 @@ func TestGetSecurityOverview_crsVersionQueryFailureReturns500(t *testing.T) {
 }
 
 func TestGetSecurityOverview_trendBucketsLocalDateForNegativeOffset(t *testing.T) {
-	// Given a western timezone (America/New_York, UTC-4 in summer) so the offset is negative
+	// Given a western timezone (America/New_York, 历史修复 in summer) so the offset is negative
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityEventsRouter(t)
 	if _, err := time.LoadLocation("America/New_York"); err != nil {
@@ -515,7 +518,7 @@ func TestGetSecurityOverview_trendBucketsLocalDateForNegativeOffset(t *testing.T
 	// When the overview is requested
 	recorder := getRequest(t, router, "/security/overview")
 
-	// Then the event lands in the correct local-date bucket (no all-zero trend from "+-240")
+	// Then the event lands in the correct 历史修复 bucket (no 历史修复 trend from "+-240")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("overview status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -560,7 +563,7 @@ func TestGetSecurityOverview_trendZeroFillsSevenDays(t *testing.T) {
 	// When the overview is requested
 	recorder := getRequest(t, router, "/security/overview")
 
-	// Then the trend always covers today-6 … today ascending with zero-filled gaps
+	// Then the trend always covers 历史修复 … today ascending with 历史修复 gaps
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("overview status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -658,7 +661,7 @@ func TestGetSecurityOverview_topIPsEmptyMessageYieldsOtherFamily(t *testing.T) {
 }
 
 func TestGetSecurityOverview_topIPsSharesLocalSixDayWindowWithTrend(t *testing.T) {
-	// Given a positive-offset timezone so local midnight precedes UTC midnight
+	// Given a 历史修复 timezone so local midnight precedes UTC midnight
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityEventsRouter(t)
 	services.ConfigureLocation("Asia/Shanghai")
@@ -800,7 +803,7 @@ func TestLoadSecurityOverviewAggregates_cacheHitAndExpiry(t *testing.T) {
 	}
 
 	// Then 缓存过期后同一键必须重算并看到新事件（直接调整测试缓存项的
-	// 过期时刻，避免 30s wall-clock sleep）。
+	// 过期时刻，避免 30s 历史修复 sleep）。
 	securityOverviewAggCacheMu.Lock()
 	for key, entry := range securityOverviewAggCache {
 		if key.metrics == db.MetricsDB {
@@ -1165,9 +1168,9 @@ func TestListSecurityEvents_disclosesIngestionHealth(t *testing.T) {
 	}
 }
 
-// HC-10（历史）：列表投影在 SQL 侧只取「截断上限 +1 字符」探针，Go 侧
+// 历史修复（历史）：列表投影在 SQL 侧只取「截断上限 +1 字符」探针，Go 侧
 // 仍追加同一截断标记——响应形态不变，但 DB→进程传输不再是大字段全量
-// （100 行 × 64KB/字段）。SUBSTR 按字符计，多字节值不得被切断成非法 UTF-8。
+// （100 行 × 64KB/字段）。SUBSTR 按字符计，多字节值不得被切断成非法 历史修复。
 func TestListSecurityEvents_largeFieldsCappedWithMarker(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	gin.SetMode(gin.TestMode)

@@ -13,11 +13,11 @@ import { COUNTRY_CENTROIDS, FALLBACK_CENTROID } from '@/utils/countryCentroids'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { loadAdmin1Tables, loadedAdmin1Tables } from '@/utils/admin1Loader'
-import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, adminShortName, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed, DOT_LAND, arcOriginForLocation, hasProvinceStats, drillCommitAllowed } from '@/utils/threatShared'
+import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, adminShortName, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed, DOT_LAND, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent } from '@/utils/threatShared'
 import type { ThreatScene, ThreatSceneOptions, CountryHeat } from '@/utils/threatScene'
 import { FLOW_ATTACK_ARC_COLORS, FLOW_NORMAL_ARC_COLORS, FLOW_FLIGHT_MS, flowArcLabel, flowArcWidth } from '@/utils/threatTheme'
 import { planFlowArcs } from '@/utils/threatFlowRules'
-import { sphereSurfacePoint } from '@/utils/threatProjection'
+import { sphereSurfacePoint, DOT_LAT_TOP, DOT_LAT_BOTTOM } from '@/utils/threatProjection'
 
 interface ArcDatum {
   startLat: number
@@ -119,6 +119,9 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   let backdropDotsPoints: THREE.Points | null = null
   let hoverDotsPoints: THREE.Points | null = null
   let hoveredDotCountry: string | null = null
+  // 国家级 bbox 预筛（构造期算一次）：点阵构建 + hover/click 命中测试共用
+  // （countryHit）。历史：只给 buildWorldDots 消费，hover/click 对 177 国全量
+  // 射线，下钻态每 120ms 复测仍付全表成本。
   const dotBboxes = THREAT_COUNTRIES.map((c) => {
     let minLon = 180, maxLon = -180, minLat = 90, maxLat = -90
     for (const poly of c.polys) for (const ring of poly) for (let k = 0; k + 1 < ring.length; k += 2) {
@@ -190,12 +193,10 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   //（历史 历史问题-6，原实现会让补丁永久残留）。
   const rafPatch = { active: true, prev: originalRAF }
   const globeCycle = (globe as unknown as { _animationCycle?: FrameRequestCallback })._animationCycle
-  // 自适应帧率：静止自动旋转 60fps（用户实测 30fps 自动旋转观感卡顿）；
-  // 拖拽/悬停/缩放同样 60fps。保留累计时间预算结构，后续可只改常量
-  // 降档。
-  const IDLE_FRAME_INTERVAL = 1000 / 60
-  const ACTIVE_FRAME_INTERVAL = 1000 / 60
-  const ACTIVE_WINDOW = 350
+  // 60fps 节流：globe.gl 自循环没有 FPS 选项，这里按累计时间预算把它的
+  // _animationCycle 限到 60fps（其它 RAF 原样转发）。历史上此处有两档常量
+  // （IDLE/ACTIVE 恒等 60fps）与交互时间窗，两档从未分叉——纯脚手架，已删。
+  const FRAME_INTERVAL = 1000 / 60
   let lastGlobeFrame = 0
   let frameCredit = 0
   const throttledRAF = (cb: FrameRequestCallback): number => {
@@ -207,11 +208,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       const delta = Math.min(100, t - lastGlobeFrame)
       lastGlobeFrame = t
       frameCredit += delta
-      const frameInterval = performance.now() - lastInteraction < ACTIVE_WINDOW
-        ? ACTIVE_FRAME_INTERVAL
-        : IDLE_FRAME_INTERVAL
-      if (frameCredit >= frameInterval) {
-        frameCredit = Math.min(frameInterval, frameCredit - frameInterval)
+      if (frameCredit >= FRAME_INTERVAL) {
+        frameCredit = Math.min(FRAME_INTERVAL, frameCredit - FRAME_INTERVAL)
         cb(t)
       } else {
         nativeRAF(run)
@@ -379,22 +377,20 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     if (drilledName) {
       // 本省（选中国家内）：保持
       if (pointInEntries(geo.lng, geo.lat, provincePolysCache)) return
-      // 命中其他国家：切换下钻（手势语义与地图版统一；台湾归一后与选择国
-      // 同名，不得当「其他国家」重复下钻）
-      const other = THREAT_COUNTRIES.find((c) => normalizeCountryName(c.name) !== drilledName && pointInEntries(geo.lng, geo.lat, [c]))
-      if (other) {
-        await drillCountry(normalizeCountryName(other.name))
-        return
-      }
-      // 空白：返回世界
+    }
+    // 命中判定的手势语义与地图版单源（drillClickIntent）：下钻态命中他国=切换
+    // （台湾归一后与选择国同名，不得当「其他国家」重复下钻）、空白=返回世界。
+    const hit = countryHit(geo.lng, geo.lat, drilledName ?? undefined)
+    const intent = drillClickIntent(hit?.name ?? null, drilledName)
+    if (intent === 'drill' || intent === 'switch') {
+      if (hit) await drillCountry(hit.name)
+      return
+    }
+    if (intent === 'world') {
       drillSeq += 1
       enterWorldView(700)
       onDrillChange?.(null)
-      return
     }
-    const hit = THREAT_COUNTRIES.find((c) => pointInEntries(geo.lng, geo.lat, [c]))
-    if (!hit) return
-    await drillCountry(normalizeCountryName(hit.name))
   }
 
   // ---- hover：国家/省 hex 标记重着色 + 悬浮名（与地图版同构：pointermove 只
@@ -404,13 +400,27 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   hoverTipEl.style.cssText = 'position:absolute;z-index:6;pointer-events:none;display:none;padding:5px 10px;background:rgba(4,12,32,.92);border:1px solid rgba(80,170,255,.45);color:#e2ecff;font:12px "Noto Sans SC","PingFang SC",sans-serif;white-space:nowrap;border-radius:2px'
   container.appendChild(hoverTipEl)
   let hoverKeyCache: string | null = null
-  // 交互状态窗口保留帧率档位切换点；当前交互与静止两档均为 60fps。
-  let lastInteraction = 0
   let pendingMove: { x: number; y: number } | null = null
   // 自转时指针可能不动而国家从光标下滑过：保留最后指针位置并低频复测，
   // 否则高亮/浮签停在旧国家，视觉上就是「hover 位置错位」。
   let hoverPoint: { x: number; y: number } | null = null
   let lastHoverPick = 0
+
+  /**
+   * 国家命中测试（单源，hover/click 共用）：先用点阵构建期的 bbox 预筛，
+   * 再对候选国做多边形射线。原实现对 177 国逐个全量射线（俄/美多环最重），
+   * 且 bbox 已算好却只给 buildWorldDots 用——下钻态每 120ms 复测都在付全表成本。
+   */
+  function countryHit(lng: number, lat: number, exclude?: string): { name: string; index: number } | null {
+    for (let i = 0; i < THREAT_COUNTRIES.length; i++) {
+      const b = dotBboxes[i]
+      if (lng < b.minLon || lng > b.maxLon || lat < b.minLat || lat > b.maxLat) continue
+      const name = normalizeCountryName(THREAT_COUNTRIES[i].name)
+      if (exclude && name === exclude) continue
+      if (sharedPointInPolys(lng, lat, THREAT_COUNTRIES[i].polys)) return { name, index: i }
+    }
+    return null
+  }
 
   function setHexHover(name: string | null): void {
     // 世界态：hover 只改点色（同一 Points 层）。下钻态：省 hover 改省点色，
@@ -423,9 +433,11 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   /** 帧内 hover 拾取（每帧最多一次）。 */
   function processHover(): void {
     const now = performance.now()
-    const move = pendingMove ?? (hoverPoint && now - lastHoverPick >= 120 ? hoverPoint : null)
+    // 指针不动的复测只为「自转时国家从光标下滑过」服务：下钻/暂停自转后
+    // 画面静止，复测不会再改变结果，只会每 120ms 付一次全表拾取成本。
+    const autoRotate = globe.controls().autoRotate
+    const move = pendingMove ?? (autoRotate && hoverPoint && now - lastHoverPick >= 120 ? hoverPoint : null)
     if (!move) return
-    if (!pendingMove && now - lastHoverPick < 120) return
     lastHoverPick = now
     pendingMove = null
     const geo = screenToLatLng(move.x, move.y)
@@ -450,12 +462,12 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
         }
       }
       if (!name) {
-        const other = THREAT_COUNTRIES.find((c) => normalizeCountryName(c.name) !== drilledName && pointInEntries(geo.lng, geo.lat, [c]))
-        if (other) { name = normalizeCountryName(other.name); count = countryCounts.get(name) ?? 0 }
+        const other = countryHit(geo.lng, geo.lat, drilledName)
+        if (other) { name = other.name; count = countryCounts.get(name) ?? 0 }
       }
     } else {
-      const hit = THREAT_COUNTRIES.find((c) => pointInEntries(geo.lng, geo.lat, [c]))
-      if (hit) { name = normalizeCountryName(hit.name); count = countryCounts.get(name) ?? 0 }
+      const hit = countryHit(geo.lng, geo.lat)
+      if (hit) { name = hit.name; count = countryCounts.get(name) ?? 0 }
     }
     if (name !== hoverKeyCache) {
       hoverKeyCache = name
@@ -477,17 +489,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   function onCanvasMove(ev: PointerEvent): void {
-    lastInteraction = performance.now()
     hoverPoint = { x: ev.clientX, y: ev.clientY }
     pendingMove = { ...hoverPoint }
-  }
-
-  function onCanvasDown(): void {
-    lastInteraction = performance.now()
-  }
-
-  function onCanvasWheel(): void {
-    lastInteraction = performance.now()
   }
 
   function onPointerLeave(): void {
@@ -513,19 +516,28 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     return tex
   }
 
+  const HOVER_DOT_COLOR = new THREE.Color(0.56, 0.9, 1)
+  // 热力色缓存：heatCss 返回 CSS 字符串，逐点 new THREE.Color().setStyle 会
+  // 把 1.3 万个颜色串解析一遍（hover 跨国家/30s 计数刷新时主线程抖动）。
+  // 颜色只由计数决定，按计数缓存即可（地图侧 heatCache 同口径）。
+  const heatColorCache = new Map<number, THREE.Color>()
+  function heatColor(count: number): THREE.Color {
+    const cached = heatColorCache.get(count)
+    if (cached) return cached
+    const color = new THREE.Color()
+    color.setStyle(count > 0 ? heatCss(count) : DOT_BASE)
+    heatColorCache.set(count, color)
+    return color
+  }
+
   function updateDotColors(): void {
     if (!dotsPoints || !activeDots) return
     const colorAttr = dotsPoints.geometry.getAttribute('color') as THREE.BufferAttribute | undefined
     if (!colorAttr) return
     const arr = colorAttr.array as Float32Array
-    const c = new THREE.Color()
     for (let i = 0; i < activeDots.length; i++) {
       const d = activeDots[i]
-      if (hoveredDotCountry && d.key === hoveredDotCountry) c.setRGB(0.56, 0.9, 1)
-      else {
-        const n = activeCounts.get(d.key) ?? 0
-        c.setStyle(n > 0 ? heatCss(n) : DOT_BASE)
-      }
+      const c = hoveredDotCountry && d.key === hoveredDotCountry ? HOVER_DOT_COLOR : heatColor(activeCounts.get(d.key) ?? 0)
       arr[i * 3] = c.r
       arr[i * 3 + 1] = c.g
       arr[i * 3 + 2] = c.b
@@ -601,7 +613,9 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     if (worldDots) return
     const dots: WorldDot[] = []
     let row = 0
-    for (let lat = -54.5; lat < 84; lat += DOT_STEP, row++) {
+    // 扫描纬度域与地图共用派生常量（DOT_LAT_TOP/BOTTOM），不再各自写死
+    // 84/-54.5——改投影域时两引擎点阵覆盖必须同步。
+    for (let lat = DOT_LAT_BOTTOM; lat < DOT_LAT_TOP; lat += DOT_STEP, row++) {
       const offset = row % 2 === 1 ? DOT_STEP / 2 : 0
       for (let lon = -179.5 + offset; lon < 180; lon += DOT_STEP) {
         for (let ci = 0; ci < THREAT_COUNTRIES.length; ci++) {
@@ -733,15 +747,12 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   // click 处理为 async（按需加载省界）——命名包装器承担 add/removeEventListener
   // 同一引用；void 丢弃 Promise 是刻意的（内部处理全部失败分支）。
   const onCanvasClick = (ev: MouseEvent): void => {
-    lastInteraction = performance.now()
     void handleCanvasClick(ev)
   }
   const cv = container.querySelector('canvas')
   if (cv) {
     cv.addEventListener('click', onCanvasClick)
     cv.addEventListener('pointermove', onCanvasMove)
-    cv.addEventListener('pointerdown', onCanvasDown)
-    cv.addEventListener('wheel', onCanvasWheel, { passive: true })
     cv.addEventListener('pointerleave', onPointerLeave)
   }
 
@@ -880,6 +891,9 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
           updateDotColors()
         }
       }
+      // 暂停态库自循环已停：数据到达必须补绘一帧，否则点色停在暂停帧
+      // （与地图引擎 setCountries 同口径）。
+      if (paused) renderOnce()
     },
     setProvinces(entries: CountryHeat[]): void {
       if (heatEntriesEqual(provinceCounts, entries)) return
@@ -888,6 +902,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
         activeCounts = provinceCounts
         updateDotColors()
       }
+      if (paused) renderOnce()
     },
     setTraffic(entries: CountryHeat[]): void {
       // 正常/攻击共用出弧计划：>10 聚合、≤10 逐条、单轮预算一致。
@@ -908,6 +923,9 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       // 本站坐标到达即定位：不播放 600ms 相机动画——/config 晚于 4s 兜底
       // 装载时，动画会让自动旋转中的地球明显「往回转一下」。
       if (!drilledName) globe.pointOfView({ lat: server[1], lng: server[0], altitude: WORLD_ALTITUDE }, 0)
+      // 暂停态无自循环：信标/环数据变更同样要补绘（首帧 paused 装载时
+      // 否则一直看不到本站信标）。
+      if (paused) renderOnce()
     },
     zoomOut(): void {
       // WT87-03：与地图版同源——复位/返回必须作废在途省界加载，否则迟到的
@@ -952,8 +970,6 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       if (cvd) {
         cvd.removeEventListener('click', onCanvasClick)
         cvd.removeEventListener('pointermove', onCanvasMove)
-        cvd.removeEventListener('pointerdown', onCanvasDown)
-        cvd.removeEventListener('wheel', onCanvasWheel)
         cvd.removeEventListener('pointerleave', onPointerLeave)
       }
       cancelAnimationFrame(rafId)

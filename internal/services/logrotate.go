@@ -22,12 +22,6 @@ var runtimeLogSizeRefresh struct {
 	done   chan struct{}
 }
 
-var runtimeLogCleanup struct {
-	sync.Mutex
-	cancel context.CancelFunc
-	done   chan struct{}
-}
-
 func init() {
 	runtimeLogSizeMB.Store(100)
 	StartLogRotate(context.Background())
@@ -95,7 +89,7 @@ func StopLogRotate() {
 
 // RotatingFileWriter writes to a log file and rotates it once it exceeds the
 // size limit. Rotated files are suffixed with a timestamp and are subject to
-// retention cleanup (log-cleanup 任务体的 RuntimeLogCleanupOnce——旧启动器
+// retention cleanup (历史修复 任务体的 RuntimeLogCleanupOnce——旧启动器
 // StartRuntimeLogCleanup 已随 M2 任务引擎化退役).
 type RotatingFileWriter struct {
 	path string
@@ -157,7 +151,7 @@ func (w *RotatingFileWriter) rotateLocked() error {
 	}
 	stamp := time.Now().Format("20060102-150405")
 	rotated := fmt.Sprintf("%s.%s", w.path, stamp)
-	// SYSB44-2(历史 历史问题):同秒多次轮转的碰撞后缀原为 UnixNano()%1000
+	// 历史修复(历史 历史问题):同秒多次轮转的碰撞后缀原为 UnixNano()%1000
 	// 随机数——撞上既有副本名时 os.Rename 静默覆盖,吞掉上一份轮转日志。
 	// 改循环递增 -2/-3/...(与 autobackup 同秒序号 -2..-201 同模式)直至文件名
 	// 不存在,确定性避让;stat 出非「不存在」错误时按可选用(与原 lenient
@@ -169,7 +163,7 @@ func (w *RotatingFileWriter) rotateLocked() error {
 		rotated = fmt.Sprintf("%s.%s-%d", w.path, stamp, n)
 	}
 	if err := os.Rename(w.path, rotated); err != nil {
-		// Rename failed (e.g. cross-device); keep appending to the old file.
+		// Rename failed (e.g. 历史修复); keep appending to the old file.
 		return w.open()
 	}
 	return w.open()
@@ -184,13 +178,13 @@ func (w *RotatingFileWriter) Close() error {
 	return w.file.Close()
 }
 
-// RuntimeCleanupResult 单轮运行日志清理结果（log-cleanup 任务日志展示明细——
+// RuntimeCleanupResult 单轮运行日志清理结果（历史修复 任务日志展示明细——
 // 2026-10-01 用户裁定：清理了哪个文件必须可见；单轮执行体=
-// RuntimeLogCleanupOnce，由任务引擎 log-cleanup 族按 24h 节拍驱动）。
+// RuntimeLogCleanupOnce，由任务引擎 历史修复 族按 24h 节拍驱动）。
 type RuntimeCleanupResult struct {
 	AppRemoved int // 应用日志过期副本删除数（app.log.*）
 	// RetentionMonths 本轮生效的保留月数（单一来源 auditRetentionMonths 回填，
-	// V87-TO-04：任务日志摘要行直接展示本字段——此前 wire 处自行查库复算，
+	// 任务日志摘要行直接展示本字段——此前 wire 处自行查库复算，
 	// 同值两实现会在默认值/钳位逻辑变更时与实际清理口径分裂）。
 	RetentionMonths int
 	TaskLogs        TaskLogHousekeepingResult
@@ -217,11 +211,11 @@ func (r TaskLogHousekeepingResult) Summary() string {
 }
 
 // RuntimeLogCleanupOnce 单轮清理：应用日志过期副本删除 + 任务日志统一
-// 清理轮转（taskLogsHousekeeping）。由任务引擎 log-cleanup 族驱动（M2 起
+// 清理轮转（taskLogsHousekeeping）。由任务引擎 历史修复 族驱动（M2 起
 // 无独立启动器）。
 func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 	result := RuntimeCleanupResult{TaskLogs: taskLogsHousekeeping(logFile), WafAudit: wafAuditHousekeeping()}
-	// V87-TO-05②（历史）：库未初始化不再整体跳过——保留期单源
+	// 历史修复②（历史）：库未初始化不再整体跳过——保留期单源
 	// auditRetentionMonths 自带 nil 库回退默认 3 月；此前 `months := 3` 后
 	// 直接 return 使应用日志副本清理被静默跳过（AppRemoved=0），与「清理不得
 	// 静默跳过」口径相反。死初值一并删除（唯一使用点必被 auditRetentionMonths
@@ -258,20 +252,20 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 	return result
 }
 
-// logCleanupSummaryLine log-cleanup 任务单轮摘要行（从 wire 描述符闭包抽出，
+// logCleanupSummaryLine 历史修复 任务单轮摘要行（从 wire 描述符闭包抽出，
 // 便于对「摘要行口径 = 实际清理口径」直接钉测）。
 func logCleanupSummaryLine(logFile string) string {
-	// V87-TO-05③（历史）：旋转写入器打开失败（runtimeLogFile 为空，
-	// main.go 已有 error 留痕）时不得让 log-cleanup 静默零动作——任务监控恒绿
+	// 历史修复③（历史）：旋转写入器打开失败（runtimeLogFile 为空，
+	// main.go 已有 error 留痕）时不得让 历史修复 静默零动作——任务监控恒绿
 	// 却没有任何留痕，排障时看不出「清理为什么没跑」。
 	if logFile == "" {
 		return "日志清理未启用：运行日志文件未打开（应用日志副本清理与 waf-audit 兜底跳过）"
 	}
 	res := RuntimeLogCleanupOnce(logFile)
-	// V87-TO-04：保留月数取 RuntimeCleanupResult 的单源回填值（与实际删除口径
+	// 保留月数取 RuntimeCleanupResult 的单源回填值（与实际删除口径
 	// 同源），不再在本层复算。
 	summary := fmt.Sprintf("日志清理完成：应用日志副本删除 %d 个（保留 %d 月，无过期为 0）；%s", res.AppRemoved, res.RetentionMonths, res.TaskLogs.Summary())
-	// F-历史问题-01（历史）：daemon 停机时的 waf-audit 兜底动作如实进
+	// F-历史问题-01（历史）：daemon 停机时的 历史修复 兜底动作如实进
 	// 任务日志（2026-10-01 用户裁定：清理了哪个文件必须可见）；无动作时不加
 	// 尾段，日志行形态不变。
 	if len(res.WafAudit) > 0 {
@@ -280,21 +274,21 @@ func logCleanupSummaryLine(logFile string) string {
 	return summary
 }
 
-// wafAuditHousekeeping waf-audit 目录超阈兜底（F-历史问题-01，历史）——
-// audit.log 轮转的正常驱动面是 security-events-ingestion daemon 的 2s tick
+// wafAuditHousekeeping 历史修复 目录超阈兜底（F-历史问题-01，历史）——
+// audit.log 轮转的正常驱动面是 历史修复 daemon 的 2s tick
 // （SecurityEventsPollOnce）；daemon 停机（任务被禁用/取消）时文件无守护
 // 无界增长——写侧（Coraza 审计流，经 caddygeoip 审计写插件异步批量落盘）
 // 在 Caddy 进程内持续追加，本进程不消费即只增不减。此处按 audit_log_size_mb
-// 阈值在 log-cleanup 任务体（24h 节拍）内兜底：
+// 阈值在 历史修复 任务体（24h 节拍）内兜底：
 //
 //   - audit.log 超阈 → SecurityEventsPollOnce()（与 daemon tick 同锁同路径，
-//     摄取+pending-delta+copytruncate 全套安全链——绝不无补采截断；daemon
+//     摄取+历史修复+copytruncate 全套安全链——绝不无补采截断；daemon
 //     在场时文件本不会积到阈值，触发即等价一次普通 tick，无竞争）。
 //
 // （历史：耗时侧车退役——耗时随审计行内嵌流转，
 // 本目录仅剩 audit.log 家族文件，无需独立截断兜底。）
 //
-// 返回动作明细（log-cleanup 任务日志与运行日志双写——清理了哪个文件必须
+// 返回动作明细（历史修复 任务日志与运行日志双写——清理了哪个文件必须
 // 可见，2026-10-01 用户裁定口径）。
 func wafAuditHousekeeping() []string {
 	var actions []string
@@ -314,7 +308,7 @@ func wafAuditHousekeeping() []string {
 	return actions
 }
 
-// taskLogsHousekeeping 任务日志统一清理与轮转（log-cleanup 任务体）——
+// taskLogsHousekeeping 任务日志统一清理与轮转（历史修复 任务体）——
 // 返回清理明细（哪个文件被删/轮转——用户可见）。
 func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 	result := TaskLogHousekeepingResult{}
@@ -351,7 +345,7 @@ func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 	if len(all) == 0 {
 		return result
 	}
-	// LBS-B-U2（历史）：统一经 auditRetentionMonths（读取失败回退默认
+	// 历史修复（历史）：统一经 auditRetentionMonths（读取失败回退默认
 	// 3 月 + warn 留痕；nil DB 时静默默认——与既有形态一致）。
 	months := auditRetentionMonths()
 	cutoff := time.Now().AddDate(0, -months, 0)
@@ -387,10 +381,12 @@ func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 	return result
 }
 
-// certJobLogRuleIDFromName 从证书任务日志文件名（certjob-<rule>.log 及
+// certJobLogRuleIDFromName 从证书任务日志文件名（certjob-<component>.log 及
 // .N/.gz 轮转副本）解析 ruleID——与写入侧 lockCertJobLog 的键空间同源
-// （写入端 ruleID 经 sanitizePathComponent 后落文件名；caddy_id 字母表下
-// 二者恒等）。
+// （写入端 ruleID 经 certJobLogFileComponent 可逆编码落文件名，这里解码回
+// 原始 ID，再由 lockCertJobLog 重新编码取同一把锁）。
+// 向后兼容：旧实现剔除非法字符的文件名（历史修复.log）不含 '%'，解码为
+// 字面值返回——存量文件继续参与保留期清理与写锁串行化。
 func certJobLogRuleIDFromName(name string) (string, bool) {
 	if !strings.HasPrefix(name, "certjob-") {
 		return "", false
@@ -403,5 +399,5 @@ func certJobLogRuleIDFromName(name string) (string, bool) {
 	if ruleID == "" {
 		return "", false
 	}
-	return ruleID, true
+	return decodeFileComponent(ruleID), true
 }

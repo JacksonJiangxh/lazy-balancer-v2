@@ -265,53 +265,6 @@ func TestIPListHotPath_needForceCommitFailureRestoresCommittedView(t *testing.T)
 	assertCommittedHotPathList(t, listID)
 }
 
-func TestIPListHotPath_commitFailureBranchesRestoreCommittedView(t *testing.T) {
-	// SQLite 测试夹具另有可执行 seam 行为测试；本门锁定三个分支各自的恢复收口。
-	raw, err := os.ReadFile("securityiplists.go")
-	if err != nil {
-		t.Fatalf("read securityiplists.go: %v", err)
-	}
-	source := string(raw)
-	start := strings.Index(source, "func (h *Handlers) tryIPListHotPathApply(")
-	if start < 0 {
-		t.Fatal("tryIPListHotPathApply not found")
-	}
-	body := source[start:]
-	if end := strings.Index(body, "\n// ExportIPList "); end > 0 {
-		body = body[:end]
-	}
-	needle := "if err := commitIPListTx(tx); err != nil {"
-	searchFrom := 0
-	for branch := 1; ; branch++ {
-		index := strings.Index(body[searchFrom:], needle)
-		if index < 0 {
-			if branch != 4 {
-				t.Fatalf("commit failure branches=%d, want 3", branch-1)
-			}
-			break
-		}
-		branchStart := searchFrom + index
-		searchFrom = branchStart + len(needle)
-		windowEnd := branchStart + 500
-		if windowEnd > len(body) {
-			windowEnd = len(body)
-		}
-		window := body[branchStart:windowEnd]
-		switch branch {
-		case 1, 2: // NeedForce 退化提交 + 成功提交
-			if !strings.Contains(window, "recoverCommittedViewAfterCommitFailure(tx)") {
-				t.Fatalf("NeedForce commit branch %d missing committed-view recovery", branch)
-			}
-		case 3: // Converged：零 /load，仅投影回滚
-			if !strings.Contains(window, "RollbackIPListProjectionsToCommittedInLock()") {
-				t.Fatalf("Converged commit branch missing projection rollback")
-			}
-		default:
-			t.Fatalf("unexpected extra commit branch %d", branch)
-		}
-	}
-}
-
 // 历史修复-1 链覆盖钉（发射面变化形态）：allow 模式名单空↔非空=发射面出现 →
 // 热路径 Fallback 落回 finishTxApply 全量链 → CLI 拒绝 → 400 + DB 回滚。
 // （已提交态不发射该投影——回退后文件停留为未被运行配置引用的惰性孤儿，

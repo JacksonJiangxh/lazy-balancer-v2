@@ -36,7 +36,8 @@ for module in "${modules[@]}"; do
   (cd "$module" && go test ./... -count=1)
 done
 
-echo "== frontend tests/typecheck =="
-(cd web && npm test && npm run typecheck:test)
+echo "== frontend tests/typecheck/build =="
+# vue-tsc 看不到模板编译期错误，发布契约要求真实 vite build
+(cd web && npm test && npm run typecheck:test && npm run build:vite)
 
 echo "all verification gates passed"

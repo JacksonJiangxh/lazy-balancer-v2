@@ -1,6 +1,8 @@
 package services
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -166,24 +168,49 @@ func normalizeScheduleRow(daysRaw, hhmm string) ([]int, string) {
 
 // versionTableSchedule 读版本表（CRS/IP2Region）排程两列。
 func versionTableSchedule(table string) ([]int, string) {
-	var daysRaw, hhmm string
-	if err := db.DB.QueryRow(`SELECT COALESCE(schedule_days,''), COALESCE(schedule_time,'') FROM `+table+` WHERE id=1`).Scan(&daysRaw, &hhmm); err != nil {
+	if db.DB == nil {
 		return normalizeScheduleRow(defaultScheduleDays, defaultScheduleTime)
 	}
+	var daysRaw, hhmm string
+	if err := db.DB.QueryRow(`SELECT COALESCE(schedule_days,''), COALESCE(schedule_time,'') FROM `+table+` WHERE id=1`).Scan(&daysRaw, &hhmm); err != nil {
+		logScheduleReadFailure("schedule-read-"+table, err)
+		return normalizeScheduleRow(defaultScheduleDays, defaultScheduleTime)
+	}
+	logScheduleReadRecovered("schedule-read-" + table)
 	return normalizeScheduleRow(daysRaw, hhmm)
 }
 
-// versionTableNextUpdate 读版本表当前排程槽（空串=未排程）——TASK-L1 同批，
+// logScheduleReadFailure 排程读取失败的状态转换留痕。// 此前三处读取错误全部静默——库不可读/表缺失时威胁库、爬虫地址库、CRS、
+// IP2Region 自动更新「静默停摆」（auto_update 读成 false + 槽位空），排障
+// 零信号。按首报留痕（同 tz/logrotate 的 logStateTransition 口径），恢复时
+// 补一条 info，避免 30s/60s 轮询刷日志。
+func logScheduleReadFailure(key string, err error) {
+	if lvl := logStateTransition(key, true); lvl != "" {
+		Logf(lvl, "读取任务排程失败（%s），按默认排程/关闭状态继续: %v", key, err)
+	}
+}
+
+func logScheduleReadRecovered(key string) {
+	if lvl := logStateTransition(key, false); lvl != "" {
+		Logf(lvl, "读取任务排程已恢复（%s）", key)
+	}
+}
+
+// versionTableNextUpdate 读版本表当前排程槽（空串=未排程）——历史修复 同批，
 // 引擎 NextSlotFn 的 DB 直读数据源（不经管理器实例）。
 func versionTableNextUpdate(table string) string {
-	// B1-8（历史）：nil 库守卫——NextSlotFn fail-closed（零值槽）。
+	// 历史修复（历史）：nil 库守卫——NextSlotFn 历史修复（零值槽）。
 	if db.DB == nil {
 		return ""
 	}
 	var s string
 	if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM ` + table + ` WHERE id=1`).Scan(&s); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			logScheduleReadFailure("schedule-next-update-"+table, err)
+		}
 		return ""
 	}
+	logScheduleReadRecovered("schedule-next-update-" + table)
 	return s
 }
 
@@ -193,15 +220,19 @@ func versionTableNextSlot(table string, now time.Time) string {
 	return NextScheduledSlot(now, days, hhmm, CurrentLocation()).UTC().Format(crsTimeLayout)
 }
 
-// versionTableAutoUpdateEnabled 读版本表自动更新开关（读错 fail-closed）。
+// versionTableAutoUpdateEnabled 读版本表自动更新开关（读错 历史修复）。
 func versionTableAutoUpdateEnabled(table string) bool {
 	if db.DB == nil {
 		return false
 	}
 	var enabled int
 	if err := db.DB.QueryRow(`SELECT COALESCE(auto_update,1) FROM ` + table + ` WHERE id=1`).Scan(&enabled); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			logScheduleReadFailure("schedule-auto-update-"+table, err)
+		}
 		return false
 	}
+	logScheduleReadRecovered("schedule-auto-update-" + table)
 	return enabled == 1
 }
 
@@ -214,11 +245,17 @@ func IP2RegionSchedule() ([]int, string) { return versionTableSchedule("security
 // globalTaskSchedule 读任务级排程（global_config 两列；threat/crawler 共用
 // 同一读取与归一逻辑，列前缀隔离配置）。
 func globalTaskSchedule(prefix string) ([]int, string) {
+	// nil 库守卫与 versionTableNextUpdate/versionTableAutoUpdateEnabled 同口径。
+	if db.DB == nil {
+		return normalizeScheduleRow(defaultScheduleDays, defaultScheduleTime)
+	}
 	var daysRaw, hhmm string
 	query := `SELECT COALESCE(` + prefix + `_schedule_days,''), COALESCE(` + prefix + `_schedule_time,'') FROM global_config WHERE id=1`
 	if err := db.DB.QueryRow(query).Scan(&daysRaw, &hhmm); err != nil {
+		logScheduleReadFailure("schedule-read-"+prefix, err)
 		return normalizeScheduleRow(defaultScheduleDays, defaultScheduleTime)
 	}
+	logScheduleReadRecovered("schedule-read-" + prefix)
 	return normalizeScheduleRow(daysRaw, hhmm)
 }
 
@@ -269,15 +306,26 @@ func setVersionTableSchedule(table, seedVersion string, days []int, hhmm string)
 	if err != nil {
 		return err
 	}
-	if _, err := db.DB.Exec(`INSERT OR IGNORE INTO `+table+` (id, version, auto_update) VALUES (1, ?, TRUE)`, seedVersion); err != nil {
-		return fmt.Errorf("初始化版本记录: %w", err)
-	}
 	// 2026-09-25 用户裁定：失败退避撤除——一律重排到新槽（原 历史问题 失败行保留
 	// 退避的 IIF 守卫随退避机制一并移除）。
 	next := NextScheduledSlot(time.Now().UTC(), norm, hhmm, CurrentLocation()).UTC().Format(crsTimeLayout)
-	if _, err := db.DB.Exec(`UPDATE `+table+` SET schedule_days=?, schedule_time=?, next_update=? WHERE id=1`,
+	// 两步写事务化，与同文件 setGlobalTaskSchedule
+	//同构——INSERT 成功而 UPDATE 失败会留「行已建、排程未生效、
+	// next_update 为空」的中间态（下次自动更新按 DDL 默认触发）。
+	tx, err := db.DB.Begin()
+	if err != nil {
+		return fmt.Errorf("开启排程事务: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // 已 Commit 后为 no-op
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO `+table+` (id, version, auto_update) VALUES (1, ?, TRUE)`, seedVersion); err != nil {
+		return fmt.Errorf("初始化版本记录: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE `+table+` SET schedule_days=?, schedule_time=?, next_update=? WHERE id=1`,
 		FormatScheduleDays(norm), hhmm, next); err != nil {
 		return fmt.Errorf("保存定时更新设置: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交排程事务: %w", err)
 	}
 	return nil
 }
@@ -320,7 +368,7 @@ func setGlobalTaskSchedule(prefix, sourceTable string, days []int, hhmm string) 
 
 // SetThreatSchedule 保存威胁库任务级排程（global_config）并重排全部启用源的
 // next_update（2026-09-25 用户裁定：失败源不再保留退避，一律重排到新槽）。
-// LBS-B-U1（历史）：两步写事务化——跨表双写曾各自独立提交，第二步失败
+// 历史修复（历史）：两步写事务化——跨表双写曾各自独立提交，第二步失败
 // 留「排程已改、槽位照旧」中间态；现失败整体回滚报错。
 func SetThreatSchedule(days []int, hhmm string) error {
 	return setGlobalTaskSchedule("threat", "security_threat_sources", days, hhmm)

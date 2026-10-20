@@ -202,3 +202,56 @@ func TestPropagationConsensusDefaults(t *testing.T) {
 		t.Fatalf("propagationConsensusMinRounds=%d < 2 would release on a single poll round", propagationConsensusMinRounds)
 	}
 }
+
+// 单台×单轮兜底只允许在「从未发现权威」形态生效。
+// 域名本来没有可用 NS（解析失败/无 NS）时递归是唯一信号，单台命中即放行。
+func TestIssuer_waitForDNS_noAuthoritativeEver_singleResolverReleases(t *testing.T) {
+	const expected = "no-auth-value"
+	const fqdn = "_acme-challenge.noauth.example.com."
+	recHit := startFakeDNSServer(t, txtResponder(true, expected))
+	logger := setupPropagationSeams(t, nil) // resolveAuthoritativeNSFn 恒返回 nil
+	propagationRecursiveResolvers = []string{recHit}
+
+	issuer := &Issuer{Logger: logger}
+	start := time.Now()
+	if err := issuer.waitForDNS(context.Background(), fqdn, expected, 3*time.Second); err != nil {
+		t.Fatalf("无可用权威时单台递归命中应放行: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("无权威兜底放行耗时 %v（应首轮即放行）", elapsed)
+	}
+}
+
+// 曾有权威但本轮全部探针失败的窗口不得退化为
+// 单台×单轮放行——那会绕过 3×2 共识（缓存超前会被当成真传播，CA 验证失败
+// 消耗 5 次/时配额）。此形态必须继续等共识直到超时。
+func TestIssuer_waitForDNS_allAuthoritativeTransientlyFailed_doesNotBypassConsensus(t *testing.T) {
+	const expected = "transient-fail-value"
+	const fqdn = "_acme-challenge.transient.example.com."
+	recHit := startFakeDNSServer(t, txtResponder(true, expected))
+	// 127.0.0.1:1 无监听 → 每轮探针失败，权威清单被清空（模拟瞬时全失败）
+	logger := setupPropagationSeams(t, []string{"127.0.0.1:1"})
+	propagationRecursiveResolvers = []string{recHit}
+
+	issuer := &Issuer{Logger: logger}
+	if err := issuer.waitForDNS(context.Background(), fqdn, expected, 500*time.Millisecond); err == nil {
+		t.Fatalf("曾有权威后全失败时单台递归命中不得放行（会绕过 M9 3×2 共识）")
+	}
+}
+
+// 回归形状：曾有权威、全失败，但递归多台共识达标 → 仍按共识放行
+// （M9 裁定口径不变，只是不再接受单台证据）。
+func TestIssuer_waitForDNS_allAuthoritativeTransientlyFailed_consensusStillReleases(t *testing.T) {
+	const expected = "transient-consensus-value"
+	const fqdn = "_acme-challenge.transientconsensus.example.com."
+	rec1 := startFakeDNSServer(t, txtResponder(true, expected))
+	rec2 := startFakeDNSServer(t, txtResponder(true, expected))
+	rec3 := startFakeDNSServer(t, txtResponder(true, expected))
+	logger := setupPropagationSeams(t, []string{"127.0.0.1:1"})
+	propagationRecursiveResolvers = []string{rec1, rec2, rec3}
+
+	issuer := &Issuer{Logger: logger}
+	if err := issuer.waitForDNS(context.Background(), fqdn, expected, 3*time.Second); err != nil {
+		t.Fatalf("权威全瞬时失败时 3 台×2 轮共识仍应放行: %v", err)
+	}
+}

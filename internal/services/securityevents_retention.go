@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	// GEO25-2(历史):默认保留与操作日志同口径 90 天(3 个月)——
+	// 历史修复(历史):默认保留与操作日志同口径 90 天(3 个月)——
 	// 原 30 天静默分裂(读 DB 失败/0 值时静默降级 30 天,兄弟组件 90 天)。
 	// 历史问题（历史）：默认值单源=db.Default*（DDL/启动迁移/读侧
 	// COALESCE/导入归一同一常量族），本包别名仅供包内可读性。
@@ -27,18 +27,11 @@ const (
 // 删除——两处不得各自硬编码（A83A-历史问题 历史：写入存在而清理缺失）。
 const ThreatRollupEventHighwaterPrefix = "threat_rollup_max_event_id:"
 
-// SecurityEventsRetentionMax 返回安全事件行数上限（v2.3.8 起可经
-// security_events_row_cap 显式设置，0=内置默认）。
-func SecurityEventsRetentionMax() int {
-	_, maxRows := SecurityEventsRetentionSnapshot()
-	return maxRows
-}
-
 // SecurityEventsRetentionSnapshot 一次读取策略并返回（面板摘要, 行数上限）：
-// 日志统计面板同一响应内需同时展示两项，H-B1-04（历史）收敛为单次
+// 日志统计面板同一响应内需同时展示两项，历史修复（历史）收敛为单次
 // global_config 点查（此前 Summary 与 Max 各读一遍同一条 SQL）。
-// SSA-87-05（历史）：摘要必须同时表达 Days 与 Max 双口径——cleanup
-// 按 count-max 裁剪，只写「保留 N 天」会让行帽提前裁剪的用户可见文案与实际
+// 历史修复（历史）：摘要必须同时表达 Days 与 Max 双口径——cleanup
+// 按 历史修复 裁剪，只写「保留 N 天」会让行帽提前裁剪的用户可见文案与实际
 // 行为漂移（securityEventsRetentionPolicy 本就 Days+Max 双口径）。
 func SecurityEventsRetentionSnapshot() (string, int) {
 	policy := securityEventsRetentionPolicyFromDB()
@@ -50,14 +43,6 @@ func SecurityEventsRetentionSnapshot() (string, int) {
 type securityEventsRetentionPolicy struct {
 	Days int // 生效保留天数
 	Max  int // 生效行数上限
-}
-
-// SecurityEventsRetentionSummary 返回安全事件保留口径的可读摘要（日志统计面板
-// security_events 行展示）。安全事件保留完全由本表两个配置项决定，不再读取
-// audit_retention_months（审计表独立口径）。
-func SecurityEventsRetentionSummary() string {
-	summary, _ := SecurityEventsRetentionSnapshot()
-	return summary
 }
 
 // securityEventsRetentionPolicyFromDB 读取安全事件保留策略（独立配置项）：
@@ -97,7 +82,7 @@ func securityEventsRetentionSettings() (days, max int) {
 // securityEventsRetentionCleanup deletes events older than the configured
 // retention window, then trims the oldest rows while the table still holds
 // more rows than the configured maximum. The DB handle is captured locally so
-// a concurrent test teardown (db.DB = nil) cannot nil-deref mid-pass.
+// a concurrent test teardown (db.DB = nil) cannot 历史修复 历史修复.
 // 历史问题：批间让出写锁的等待同时检查 ctx——Stop（cancel 后等待 worker 退出）
 // 得以在大批量首遍（如数据恢复后的百万行）中及时中止，不再被拖到 docker
 // SIGKILL 跳过 db.Close。
@@ -105,7 +90,7 @@ func securityEventsRetentionSettings() (days, max int) {
 // 传 rc.Ctx（批间 ctx.Done() 分支才在生产可达，停机时百万行清理可及时中止，
 // 不拖过宽限期被 SIGKILL 跳过 db.Close/WAL 落盘），并返回本轮首个清理错误，
 // 供任务引擎把失败写进 task_runs（历史 历史问题-09）。
-// SSA-87-04（历史）：Once（无 ctx 包装）与 Ctx（吞错误的 int 包装）全仓
+// 历史修复（历史）：Once（无 ctx 包装）与 Ctx（吞错误的 int 包装）全仓
 // 零调用，已删除——注释曾称「保留给测试/兼容调用」与事实不符。
 func SecurityEventsRetentionCleanupCtxErr(ctx context.Context) (int, error) {
 	return securityEventsRetentionCleanup(ctx)
@@ -135,7 +120,7 @@ func securityEventsRetentionCleanup(ctx context.Context) (int, error) {
 		select {
 		case <-ctx.Done():
 			Logf("info", "security events retention: age-based cleanup canceled mid-pass")
-			// SEC-L1（历史）：返回契约统一为「已删多少报多少」——取消
+			// 历史修复（历史）：返回契约统一为「已删多少报多少」——取消
 			// 路径此前 return 0 丢弃已提交批次，§6.5 摘要行少报。下同三处。
 			return total, nil
 		case <-time.After(10 * time.Millisecond):
@@ -171,7 +156,7 @@ func securityEventsRetentionCleanup(ctx context.Context) (int, error) {
 				break
 			}
 			remaining -= int(affected)
-			// SEC-L1：count 阶段删除同样计入返回（此前只减 remaining 从不累加
+			// count 阶段删除同样计入返回（此前只减 remaining 从不累加
 			// total——审计建议遗漏点：仅改 return 不补累计，count 阶段删除在
 			// 正常终点同样少报）。
 			total += int(affected)
@@ -244,7 +229,7 @@ func securityEventsRetentionCleanup(ctx context.Context) (int, error) {
 	// A83A-历史问题（历史）：分钟事件高水位键 threat_rollup_max_event_id:<minute>
 	// 与 rollup 同生命周期——此前每分钟一行常驻 metrics_state（约 1440 行/天、
 	// 52.5 万行/年），全仓无删除点。按同一 rollupCutoff 清理（键后缀为
-	// 'YYYY-MM-DD HH:MM' 同形态，字符串比较即时间序）。
+	// '历史修复 HH:MM' 同形态，字符串比较即时间序）。
 	highwaterDeleted := 0
 	for {
 		res, err := database.Exec(`DELETE FROM metrics_state WHERE key IN (

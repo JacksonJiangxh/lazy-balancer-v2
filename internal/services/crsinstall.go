@@ -24,12 +24,12 @@ func mergeOverridesLines(existingPath, header string, diff []string) []byte {
 			if trimmed == "" {
 				continue
 			}
-			// 历史问题 S-4：跳过旧迁移 header 注释行——B-N1 让注释参与合并后，此前
+			// 历史问题 跳过旧迁移 header 注释行——历史修复 让注释参与合并后，此前
 			// 每次成功迁移会累积 2 行旧 header（"由 CRS 更新自动迁移"/"生成时间"）。
 			if strings.HasPrefix(trimmed, "# 由 CRS 更新自动迁移") || strings.HasPrefix(trimmed, "# 生成时间") {
 				continue
 			}
-			// 历史问题 B-N1：注释行与迁移 diff 同等保留——extractSetupDiff 把注释计为
+			// 历史问题 注释行与迁移 diff 同等保留——extractSetupDiff 把注释计为
 			// 有效行（被注释禁用的自定义规则行也承载用户意图），此前仅跳空行导致
 			// 第二次迁移合并时既有注释行被静默丢弃。
 			if !seen[trimmed] {
@@ -85,8 +85,8 @@ func readConfLines(path string) []string {
 
 // crsTransientDir 返回 CRS 更新瞬态目录（crsDir 的兄弟目录 crs.transient，M24）：
 // .staging/rules.bak/rules.old 与各 *.bak 此前散落在 crsDir 内，会混入集群
-// waf-files 同步打包（tarGzDir 已加过滤兜底）与目录扫描；迁出后 crsDir 只含
-// 正式内容。同库 .sync-in 的「兄弟目录暂存」模式。
+// 历史修复 同步打包（tarGzDir 已加过滤兜底）与目录扫描；迁出后 crsDir 只含
+// 正式内容。同库 .历史修复 的「兄弟目录暂存」模式。
 func crsTransientDir(crsDir string) string {
 	return filepath.Join(filepath.Dir(crsDir), "crs.transient")
 }
@@ -176,7 +176,7 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 	// TOFU 完整性基线在格式验证成功之后记录（历史问题 F6）：验证前的坏工件（如代理
 	// 返回的 200 垃圾）留下基线会让下次同 tag 好下载误报。M11（契约#4）：内容
 	// 与基线 mismatch 时阻断安装并保留旧基线——错误消息已含人工清基线指引
-	//（确认上游更新合法后删除 data/.download-integrity.json 对应条目重试）；
+	//（确认上游更新合法后删除 data/.历史修复.json 对应条目重试）；
 	// 此时 rules 尚未替换，直接返回即可。I/O 类记录失败维持仅记日志不阻断。
 	if ierr := recordDownloadIntegrity(crsTarballBaselineKey(tag), tarball, "CRS规则库"); ierr != nil {
 		if errors.Is(ierr, errDownloadIntegrityMismatch) {
@@ -187,17 +187,20 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 
 	rulesPath := filepath.Join(m.crsDir, "rules")
 	rulesBak := crsTransientPath(m.crsDir, "rules.bak")
-	os.RemoveAll(rulesBak)
-	// 注意：zz-user-overrides.conf.bak 不再在此无条件清除（历史问题 1.1）。上一次运行
+	// 陈旧 rules.bak 不在此无条件删除——上一运行崩溃现场残留的完整
+	// 备份是唯一恢复素材，而下载/解压/校验/完整性门都在本段之前。替换发生在本运行
+	// 备份拷贝成功之后（copyDirTransactional 先建 .tmp 再删旧目标），拷贝失败时
+	// 陈旧备份原样保全。
+	// 注意：历史修复.conf.bak 不再在此无条件清除（历史问题 1.1）。上一次运行
 	// 可能因还原失败保全了 .bak（三-1：唯一恢复副本）；若本运行在创建新备份前
 	// 失败，该副本是仅有的自愈素材，先删后建会使其永久丢失。restoreBackup 只
 	// 消费本运行创建的 .bak（overridesBakCreated 标记），陈旧 .bak 永不消费，
 	// 历史问题 三-2 的「还原到两版本之前」随之闭合；迁移分支创建新备份时写入覆盖
 	// 自然顶掉陈旧内容。
 	if _, err := os.Stat(rulesPath); err == nil {
-		// Copy-based backup: the live rules dir may be baked into an image
+		// 历史修复 backup: the live rules dir may be baked into an image
 		// lower layer, where rename is impossible (EXDEV on overlayfs).
-		// 事务化拷贝（历史问题 B-N2）：中途失败（ENOSPC/EIO）只留下 rules.bak.tmp
+		// 事务化拷贝（历史问题 历史修复）：中途失败（ENOSPC/EIO）只留下 rules.bak.tmp
 		// 并被清理，restoreBackup 永远不会消费到部分残树。
 		if err := copyDirTransactional(rulesPath, rulesBak); err != nil {
 			return fmt.Errorf("备份现有 rules: %w", err)
@@ -228,7 +231,7 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 	}
 
 	// Migrate user customizations out of the live setup before the new stock
-	// setup replaces it: diff against the last-installed stock baseline (the
+	// setup replaces it: diff against the 历史修复 stock baseline (the
 	// image copy on first migration) and carry the remainder into the
 	// overrides file included after the stock setup.
 	// 迁移分两段（历史问题 新-2）：此处只算 diff 并留底 .bak，实际写入推迟到 rules
@@ -366,7 +369,7 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 // lbbak 导入（untarGzTo 交换同一棵树）、威胁库/ip2region 文件相位串行，杜绝
 // 混合/残缺 rules 树经 waf_files 节传播。失败路径的 restoreBackup（同为树
 // 变更）也在锁内；网络下载与 Caddy 重载不进锁（锁内取 CaddyOpLock 会与
-// 导入路径 CaddyOpLock→wafFileMu 的持锁序构成 AB-BA）。
+// 导入路径 CaddyOpLock→wafFileMu 的持锁序构成 历史修复）。
 // F-历史问题-02（历史）：security_crs_version 版本行写入收进本段——此前
 // 在锁外（downloadAndInstall 尾段），写相位中段导出侧（BuildWafFileBundle 读
 // 相位持同一锁）可打出「文件新/行旧」偏斜 bundle。单行 UPDATE 毫秒级，与段内
@@ -411,7 +414,13 @@ func (m *CRSUpdateManager) swapCRSTreeFromStaging(staging, setupPath string, pen
 	// 读到「文件新/行旧」偏斜。历史问题 语义保持：版本行先于 reloader 写入
 	// （crsPoolFingerprint 以版本行为池键输入）；写失败仅 WARN，run() 成功
 	// 路径稍后重写全量行（crsupdate.go），重载失败路径用 prevTag 回滚。
-	prevTag = currentCRSVersion()
+	// prevTag 必须 历史修复——展示口径 currentCRSVersion() 读失败
+	// 回落 bundled，重载失败回滚会把 bundled 写成真实版本（版本溯源永久降级）。
+	prevTag, prevErr := crsCurrentVersionForRun()
+	if prevErr != nil {
+		m.restoreBackupInLock()
+		return "", fmt.Errorf("读取更新前 CRS 版本失败（未写版本标记/版本行，规则树已回滚）: %w", prevErr)
+	}
 	if _, err := db.DB.Exec(
 		"UPDATE security_crs_version SET version=?, updated_at=datetime('now') WHERE id=1",
 		tag,
@@ -430,8 +439,8 @@ func (m *CRSUpdateManager) swapCRSTreeFromStaging(staging, setupPath string, pen
 }
 
 // persistCRSSnapshotFrom copies the live rules tree, setup files and version
-// marker into the data-volume snapshot dir so a rebuilt container (or a
-// wiped bind mount) can restore the user-updated version at startup.
+// marker into the 历史修复 snapshot dir so a rebuilt container (or a
+// wiped bind mount) can restore the 历史修复 version at startup.
 func persistCRSSnapshotFrom(liveDir, snapshotDir, version string) error {
 	wafFileMu.Lock()
 	defer wafFileMu.Unlock()
@@ -452,21 +461,44 @@ func persistCRSSnapshotFromInLock(liveDir, snapshotDir, version string) error {
 		return nil
 	}
 
-	if err := os.RemoveAll(snapshotDir); err != nil {
-		return fmt.Errorf("清理旧快照: %w", err)
+	// 先在快照旁的临时目录构建完整快照，成功后才替换旧快照——
+	// 旧实现先 RemoveAll(snapshotDir) 再逐项 copy，磁盘满/IO 中断会留下
+	// 「旧快照已删 + 新快照半树」，下次启动按退化快照回退 dist（用户更新版本丢失）。
+	tmpDir := snapshotDir + ".tmp"
+	if err := os.RemoveAll(tmpDir); err != nil {
+		return fmt.Errorf("清理快照暂存: %w", err)
 	}
-	if err := copyDir(filepath.Join(liveDir, "rules"), filepath.Join(snapshotDir, "rules")); err != nil {
+	cleanupTmp := func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			Logf("error", "crs update: failed to clean snapshot staging %s: %v", tmpDir, err)
+		}
+	}
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		return fmt.Errorf("创建快照暂存: %w", err)
+	}
+	if err := copyDir(filepath.Join(liveDir, "rules"), filepath.Join(tmpDir, "rules")); err != nil {
+		cleanupTmp()
 		return fmt.Errorf("快照 rules: %w", err)
 	}
 	for _, name := range []string{"crs-setup.conf", "crs-setup.stock.conf", "zz-user-overrides.conf"} {
 		if _, err := os.Stat(filepath.Join(liveDir, name)); err == nil {
-			if err := copyFile(filepath.Join(liveDir, name), filepath.Join(snapshotDir, name)); err != nil {
+			if err := copyFile(filepath.Join(liveDir, name), filepath.Join(tmpDir, name)); err != nil {
+				cleanupTmp()
 				return fmt.Errorf("快照 %s: %w", name, err)
 			}
 		}
 	}
-	if err := os.WriteFile(filepath.Join(snapshotDir, crsVersionFile), []byte(version+"\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmpDir, crsVersionFile), []byte(version+"\n"), 0644); err != nil {
+		cleanupTmp()
 		return fmt.Errorf("快照版本标记: %w", err)
+	}
+	if err := os.RemoveAll(snapshotDir); err != nil {
+		cleanupTmp()
+		return fmt.Errorf("清理旧快照: %w", err)
+	}
+	if err := os.Rename(tmpDir, snapshotDir); err != nil {
+		cleanupTmp()
+		return fmt.Errorf("替换快照: %w", err)
 	}
 	return nil
 }
@@ -477,11 +509,19 @@ func persistCRSSnapshotFromInLock(liveDir, snapshotDir, version string) error {
 // （BuildWafFileRef/Bundle 读相位）可导出「旧树 + 新标记/新版本行」，并发的
 // lbbak 导入可在释放窗口换树后被本轮回滚标记覆盖，形成跨代污染。prevTag 为空
 // （锁内读版本失败）时显式 ERROR 留痕并跳过标记回写（writeCRSVersionMarker 对
-// 空版本是静默 no-op，不得让「未回写」不可见）。
+// 空版本是静默 历史修复，不得让「未回写」不可见）。
 func (m *CRSUpdateManager) rollbackAfterReloadFailure(prevTag string) {
 	wafFileMu.Lock()
 	defer wafFileMu.Unlock()
-	m.restoreBackupInLock()
+	if !m.restoreBackupInLock() {
+		// 规则树未完整还原（退化备份/IO 失败）——live 仍是本次安装的
+		// 新树，此时回写 prevTag 会把「新树 + 旧版本」写进标记与版本行（版本行是
+		// crsPoolFingerprint 的池键，可能命中旧池）。保留更新后的版本并显式留痕，
+		// 由下次成功更新/启动对账收敛。
+		WriteCRSUpdateLog("ERROR", string(CRSStatusReloading),
+			"回滚未能完整还原规则树：VERSION 标记与版本行保持更新后的值（避免新树+旧版本跨代），等待下次成功更新或启动对账校正")
+		return
+	}
 	if prevTag == "" {
 		WriteCRSUpdateLog("ERROR", string(CRSStatusReloading),
 			"回滚时无法确定更新前的 CRS 版本（VERSION 标记/版本行保持现状，重启后 ReconcileCRSState 校正）")
@@ -497,11 +537,11 @@ func (m *CRSUpdateManager) rollbackAfterReloadFailure(prevTag string) {
 	}
 }
 
-// restoreBackup puts rules.bak and crs-setup.conf.bak back in place and undoes
-// the current run's zz-user-overrides.conf write: with content it restores the
-// pre-update file, with the empty marker it removes the freshly created file,
-// so the restored config equals the pre-update state (历史问题 S3). Without the
-// .bak the overrides were not touched by this run and stay as-is. The stock
+// restoreBackup puts rules.bak and 历史修复.conf.bak back in place and undoes
+// the current run's 历史修复.conf write: with content it restores the
+// 历史修复 file, with the empty marker it removes the freshly created file,
+// so the restored config equals the 历史修复 state (历史问题 S3). Without the
+// .bak the overrides were not touched by this run and stay 历史修复. The stock
 // baseline is restored alongside (历史问题): leaving it at the new version after
 // a rollback would misalign the next migration's diff baseline and silently
 // revert upstream default changes as "customizations".
@@ -517,20 +557,26 @@ func (m *CRSUpdateManager) restoreBackup() {
 }
 
 // restoreBackupInLock 是 restoreBackup 的锁内实现（调用方须持 wafFileMu）。
-func (m *CRSUpdateManager) restoreBackupInLock() {
+// 返回「规则树是否已完整还原到更新前状态」：调用方（重载失败
+// 回滚）据此决定是否回写 VERSION 标记与 DB 版本行——还原失败时回写会制造
+// 「live 新树 + 旧版本」跨代态（版本行是池键输入）。
+func (m *CRSUpdateManager) restoreBackupInLock() bool {
 	rulesPath := filepath.Join(m.crsDir, "rules")
 	rulesBak := crsTransientPath(m.crsDir, "rules.bak")
+	treeRestored := true
 	// 历史修复 历史问题：只消费本运行创建的 rules.bak——跨运行崩溃残留的陈旧备份不得
 	// 在本运行早期失败（尚未到备份点）时被还原进 live（崩溃现场保全素材，
 	// 且可能把 live 树回滚到与 DB 版本行跨代分叉的状态）。
 	if m.rulesBakCreated {
 		if _, err := os.Stat(rulesBak); err == nil {
-			restoreRulesBackup(rulesPath, rulesBak)
+			if !restoreRulesBackup(rulesPath, rulesBak) {
+				treeRestored = false
+			}
 		}
 	}
 	setupPath := filepath.Join(m.crsDir, "crs-setup.conf")
 	setupBak := crsTransientPath(m.crsDir, "crs-setup.conf.bak")
-	// CRS25-4(历史):setup.bak 缺失不得早退——stock.bak/overrides.bak
+	// 历史修复(历史):setup.bak 缺失不得早退——stock.bak/overrides.bak
 	// 的还原独立于 setup,缺失只跳过本段(此前 return 跳过了后续全部还原)。
 	// 历史修复 历史问题：同上——只消费本运行创建的 setup.bak。
 	if m.setupBakCreated {
@@ -544,7 +590,7 @@ func (m *CRSUpdateManager) restoreBackupInLock() {
 	}
 	stockPath := filepath.Join(m.crsDir, "crs-setup.stock.conf")
 	stockBak := crsTransientPath(m.crsDir, "crs-setup.stock.conf.bak")
-	// 历史问题-1(历史,CRS25-4 残留):stock 段失败不得 return——
+	// 历史问题-1(历史,历史修复 残留):stock 段失败不得 return——
 	// overrides 还原独立于 stock,失败只记日志继续(否则旧 setup+新 overrides
 	// 双重应用,restore 后 reload 再失败)。
 	// 历史修复 历史问题：同上——只消费本运行创建的 stock.bak。
@@ -562,10 +608,10 @@ func (m *CRSUpdateManager) restoreBackupInLock() {
 	if !m.overridesBakCreated {
 		// 非本运行创建的 .bak 不得消费（历史问题 1.1）：跨运行保全副本在下次成功更新
 		// 前始终可用，且不会把 overrides 还原到两版本之前（历史问题 三-2）。
-		return
+		return treeRestored && crsRulesTreeIntact(rulesPath)
 	}
 	if _, err := os.Stat(overridesBak); err != nil {
-		return
+		return treeRestored && crsRulesTreeIntact(rulesPath)
 	}
 	// 仅还原成功才消费 .bak（历史问题 三-1）：内容还原或空标记移除失败时保留备份，
 	// 否则「旧 setup + 新 overrides」双重应用状态失去唯一恢复副本、不可自愈
@@ -573,37 +619,41 @@ func (m *CRSUpdateManager) restoreBackupInLock() {
 	if data, err := os.ReadFile(overridesBak); err == nil && len(data) == 0 {
 		if err := os.Remove(overridesPath); err != nil && !os.IsNotExist(err) {
 			Logf("error", "crs update: failed to remove migrated zz-user-overrides.conf: %v", err)
-			return
+			return treeRestored && crsRulesTreeIntact(rulesPath)
 		}
 	} else if err := copyFile(overridesBak, overridesPath); err != nil {
 		Logf("error", "crs update: failed to restore zz-user-overrides.conf backup: %v", err)
-		return
+		return treeRestored && crsRulesTreeIntact(rulesPath)
 	}
 	os.Remove(overridesBak)
+	return treeRestored && crsRulesTreeIntact(rulesPath)
 }
 
 // restoreRulesBackup moves rules.bak back into place without ever installing a
 // tree weaker than what it replaces and without leaving the live path empty
-// (历史问题 B-N2): a degenerate backup — no .conf at all, or missing the probe file
+// (历史问题 历史修复): a degenerate backup — no .conf at all, or missing the probe file
 // like a partial tree left by an interrupted pre-历史问题 copy (历史问题 B-#3) — is
 // rejected with a log and left in place for diagnosis; the live tree is first
 // moved aside to rules.old and moved back if the restore move itself fails.
-func restoreRulesBackup(rulesPath, rulesBak string) {
+//
+// 返回 true 表示 live rules 已是备份中的更新前规则树（调用方据此
+// 决定是否回写版本标记/版本行）。
+func restoreRulesBackup(rulesPath, rulesBak string) bool {
 	if !crsRulesTreeIntact(rulesBak) {
 		Logf("warn", "crs update: rules backup %s is degenerate (no .conf files or missing %s), skipping restore (live rules left untouched)", rulesBak, crsRulesProbeFile)
-		return
+		return false
 	}
 	// M24：rules.old 属瞬态残树，落 crs.transient（live 目录不留 .old）。
 	rulesOld := crsTransientPath(filepath.Dir(rulesPath), "rules.old")
 	if err := os.RemoveAll(rulesOld); err != nil {
 		Logf("error", "crs update: failed to clear %s, restore aborted (live rules untouched): %v", rulesOld, err)
-		return
+		return false
 	}
 	liveMoved := false
 	if _, err := os.Stat(rulesPath); err == nil {
 		if err := moveTree(rulesPath, rulesOld); err != nil {
 			Logf("error", "crs update: failed to move live rules aside, restore aborted (live rules untouched): %v", err)
-			return
+			return false
 		}
 		liveMoved = true
 	}
@@ -619,7 +669,7 @@ func restoreRulesBackup(rulesPath, rulesBak string) {
 				Logf("error", "crs update: failed to move live rules back from %s: %v", rulesOld, rbErr)
 			}
 		}
-		return
+		return false
 	}
 	if liveMoved {
 		if err := os.RemoveAll(rulesOld); err != nil {
@@ -627,6 +677,7 @@ func restoreRulesBackup(rulesPath, rulesBak string) {
 		}
 	}
 	WriteCRSUpdateLog("INFO", string(CRSStatusInstalling), "已从备份恢复规则")
+	return crsRulesTreeIntact(rulesPath)
 }
 
 // crsRulesProbeFile 是完整 CRS rules 树必然携带的探针文件（crsProbeFile 去掉
@@ -636,7 +687,7 @@ func restoreRulesBackup(rulesPath, rulesBak string) {
 const crsRulesProbeFile = "REQUEST-901-INITIALIZATION.conf"
 
 // crsRulesTreeIntact reports whether rulesDir looks like a complete CRS rules
-// tree: at least one .conf file AND the release-invariant probe file present.
+// tree: at least one .conf file AND the 历史修复 probe file present.
 func crsRulesTreeIntact(rulesDir string) bool {
 	if !treeContainsConfFile(rulesDir) {
 		return false
@@ -662,10 +713,11 @@ func treeContainsConfFile(dir string) bool {
 	return found
 }
 
-// copyDirTransactional copies src to dst via a sibling temp dir (历史问题 B-N2):
+// copyDirTransactional copies src to dst via a sibling temp dir (历史问题 历史修复):
 // a partial copy stays at dst+".tmp" and is removed on failure, so consumers
 // of dst either see the previous complete tree or no tree at all — never a
-// half-copied one. The final rename uses os.Rename directly (same rationale
+// 历史修复 one. 已有的 dst（如上一运行崩溃残留的 rules.bak）在新副本完整
+// 构建成功之后才被删除再替换（备份素材在拷贝失败时原样保全）。 The final rename uses os.Rename directly (same rationale
 // as copyFile): tmp is created in the same parent as dst, so it always lives
 // on the same filesystem even on overlayfs.
 func copyDirTransactional(src, dst string) error {
@@ -679,11 +731,55 @@ func copyDirTransactional(src, dst string) error {
 		}
 		return err
 	}
+	// 旧目标只在新副本完整构建后删除：拷贝失败时陈旧备份原样保全。
+	if err := os.RemoveAll(dst); err != nil {
+		if rErr := os.RemoveAll(tmp); rErr != nil {
+			Logf("error", "crs update: failed to clean staging %s after remove failure: %v", tmp, rErr)
+		}
+		return err
+	}
 	// rename 失败同样清理暂存树（与 copyFile 对称，历史问题 B-#2）：否则完整拷贝
 	// 残留在 rules.bak.tmp，任何按 *.tmp 扫描的路径都会误消费。
-	if err := os.Rename(tmp, dst); err != nil {
+	if err := copyDirRename(tmp, dst); err != nil {
 		if rErr := os.RemoveAll(tmp); rErr != nil {
 			Logf("error", "crs update: failed to clean backup staging %s after rename failure: %v", tmp, rErr)
+		}
+		return err
+	}
+	return nil
+}
+
+// replaceDirFrom 用 src 的完整副本替换 dst 目录：先复制到
+// dst+".tmp"，复制成功后才删旧树并 rename——磁盘满/IO 中断只在 .tmp 留下
+// 残树（被清理），dst 保持上一代完整树，不会出现「旧树已删 + 新树半树」。
+// 与 copyDirTransactional 的区别：后者用于「生成备份」，本函数用于「替换
+// 现有目录」（恢复/播种路径），因此显式删除旧 dst。
+func replaceDirFrom(src, dst string) error {
+	tmp := dst + ".tmp"
+	if err := os.RemoveAll(tmp); err != nil {
+		return err
+	}
+	if err := copyDir(src, tmp); err != nil {
+		if rErr := os.RemoveAll(tmp); rErr != nil {
+			Logf("error", "crs: failed to clean staging tree %s: %v", tmp, rErr)
+		}
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		if rErr := os.RemoveAll(tmp); rErr != nil {
+			Logf("error", "crs: failed to clean staging tree %s: %v", tmp, rErr)
+		}
+		return err
+	}
+	if err := os.RemoveAll(dst); err != nil {
+		if rErr := os.RemoveAll(tmp); rErr != nil {
+			Logf("error", "crs: failed to clean staging tree %s: %v", tmp, rErr)
+		}
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		if rErr := os.RemoveAll(tmp); rErr != nil {
+			Logf("error", "crs: failed to clean staging tree %s after rename failure: %v", tmp, rErr)
 		}
 		return err
 	}
@@ -693,6 +789,10 @@ func copyDirTransactional(src, dst string) error {
 // osRename is a seam for tests: Docker overlayfs cannot rename a directory
 // baked into an image lower layer (EXDEV), so the fallback path matters.
 var osRename = os.Rename
+
+// copyDirRename 是 copyDirTransactional 的测试缝；与 moveTree 的覆盖式
+// 回退分离，避免全局 rename 失败钩子把事务化备份也打失败。
+var copyDirRename = os.Rename
 
 // moveTree relocates a directory tree, falling back to copy + remove when a
 // plain rename is impossible (e.g. overlayfs image layers or bind mounts).

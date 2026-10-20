@@ -1,5 +1,5 @@
-// 历史 WEB 修复源码钉（A85WA/A85WB/A85WT）：每条对应一个已修发现的回归守卫。
-// 形态与 audit82Ui.spec.ts 一致——关键修复点用限段/带边界的断言，避免跨全文空转。
+// 视图/设置/安全页源码接线守卫：每条对应一个已修行为缺陷的回归断言，关键点用
+// 限段（section，缺 marker 即抛错）或带边界的断言，避免跨全文空转。
 //
 // 运行：cd web && npm test
 
@@ -17,17 +17,14 @@ import {
 } from '../src/utils/certQueue.ts'
 import { credentialFieldVisible, credentialOptionLabel, defaultCredentialsFor } from '../src/utils/dnsProviderFields.ts'
 
-test('A85WA-历史问题：自定义规则编辑深拷贝条件行（取消/保存失败不得污染列表行）', () => {
-  const text = source('src/views/security/SecurityRules.vue')
-  const start = text.indexOf('const openRuleDialog')
-  const end = text.indexOf('const saveCustomRule', start)
-  const body = text.slice(start, end)
+test('自定义规则编辑深拷贝条件行（取消/保存失败不得污染列表行）', () => {
+  const body = section(source('src/views/security/SecurityRules.vue'), 'const openRuleDialog', 'const saveCustomRule')
   assert.match(body, /row\.conditions\.map\(\(c\) => \(\{ \.\.\.c \}\)\)/)
   assert.doesNotMatch(body, /\[\.\.\.row\.conditions\]/, '浅拷贝数组会让弹框 v-model 直接改写列表行对象')
 })
 
-test('A85WA-历史问题：自动备份 quiet 轮询失败不逐轮弹 toast', () => {
-  // 审计 87 WEBT-01：原断言 /if \(!quiet\) \{[\s\S]*?ElMessage\.error/ 从 loading 门
+test('自动备份 quiet 轮询失败不逐轮弹 toast', () => {
+  // 原断言 /if \(!quiet\) \{[\s\S]*?ElMessage\.error/ 从 loading 门
   // 开始惰性匹配，命中的是 **quiet 分支自身**的节流 toast——删掉非 quiet 提示、或
   // 让 quiet 分支每轮无条件弹窗（本条要防的 30 条/60s 刷屏回归）仍然通过。
   // 改为对抽取出的判定做行为断言（单源 src/utils/pollErrorToast.ts）：
@@ -50,51 +47,43 @@ test('A85WA-历史问题：自动备份 quiet 轮询失败不逐轮弹 toast', (
   assert.match(catchBody.slice(elseAt), /^} else \{[\s\S]*?ElMessage\.error/, '非 quiet 失败必须无条件提示')
 })
 
-test('A85WA-历史问题：健康轮询接入退避门，不可达 onError 已删除', () => {
-  const text = source('src/views/Rules.vue')
-  const start = text.indexOf('const healthPolling = usePollingTask')
-  const end = text.indexOf('const healthPollingErrorDescription', start)
-  const body = text.slice(start, end)
+test('健康轮询接入退避门，不可达 onError 已删除', () => {
+  const body = section(source('src/views/Rules.vue'), 'const healthPolling = usePollingTask', 'const healthPollingErrorDescription')
   assert.match(body, /healthPollingError\.canRun\(\)/)
   assert.doesNotMatch(body, /onError/, 'fetchHealthStatus 内部捕获不抛出——onError 是不可达死代码')
 })
 
-test('A85WA-历史问题：证书队列拉取接入轮询 AbortSignal', () => {
+test('证书队列拉取接入轮询 AbortSignal', () => {
   const text = source('src/views/settings/TaskMonitor.vue')
   assert.match(text, /const fetchCertQueue = async \(signal\?: AbortSignal\)/)
   assert.match(text, /fetchCertQueue\(signal\)/)
 })
 
-test('A85WA-历史问题：任务详情历史与日志加载失败显性化', () => {
+test('任务详情历史与日志加载失败显性化', () => {
   const text = source('src/views/settings/TaskMonitor.vue')
   assert.match(text, /detailHistoryError/)
   assert.match(text, /logsLoadError/)
-  const start = text.indexOf('const openDetail')
-  const end = text.indexOf('// ===== 日志抽屉', start)
-  assert.doesNotMatch(text.slice(start, end), /catch \{ \/\/ 无历史族静默 \}/, '详情历史失败不得静默')
+  assert.doesNotMatch(section(text, 'const openDetail', '// ===== 日志抽屉'), /catch \{ \/\/ 无历史族静默 \}/, '详情历史失败不得静默')
 })
 
-test('A85WA-历史问题：规则向导关闭即清空私钥/证书明文', () => {
-  const text = source('src/views/Rules.vue')
-  const start = text.indexOf('const resetWizard = () =>')
-  const end = text.indexOf('const beforeWizardClose', start)
-  const body = text.slice(start, end)
+test('规则向导关闭即清空私钥/证书明文', () => {
+  const body = section(source('src/views/Rules.vue'), 'const resetWizard = () =>', 'const beforeWizardClose')
   assert.match(body, /wizardForm\.tls_cert = ''/)
   assert.match(body, /wizardForm\.tls_key = ''/)
 })
 
-test('A85WA-历史问题：库健康标签加载三态（未加载不得显示「正常」）', () => {
+test('库健康标签加载三态（未加载不得显示「正常」）', () => {
   assert.match(source('src/utils/securityLibraries.ts'), /loaded === false/)
   const page = source('src/views/security/SecurityRules.vue')
   assert.match(page, /loaded: crsInfoLoaded\.value/)
   assert.match(page, /loaded: ip2regionInfoLoaded\.value/)
 })
 
-test('A85WA-历史问题：死导出 ADAPTIVE_SAMPLE_TIERS 已移除', () => {
+test('死导出 ADAPTIVE_SAMPLE_TIERS 已移除', () => {
   assert.doesNotMatch(source('src/utils/threatFlowRules.ts'), /ADAPTIVE_SAMPLE_TIERS/)
 })
 
-test('A85WA-历史问题：更新者名称四处复用收敛为 utils/updaterName 单源', () => {
+test('更新者名称四处复用收敛为 utils/updaterName 单源', () => {
   for (const file of [
     'src/views/Rules.vue',
     'src/views/security/SecurityRules.vue',
@@ -105,7 +94,7 @@ test('A85WA-历史问题：更新者名称四处复用收敛为 utils/updaterNam
   }
 })
 
-test('A85WA-历史问题：日志尾轮询五处收敛为 useLogTailPolling', () => {
+test('日志尾轮询五处收敛为 useLogTailPolling', () => {
   for (const file of [
     'src/views/Rules.vue',
     'src/views/settings/CertJobs.vue',
@@ -119,8 +108,8 @@ test('A85WA-历史问题：日志尾轮询五处收敛为 useLogTailPolling', ()
   assert.match(source('src/composables/useLogTailPolling.ts'), /document\.hidden/)
 })
 
-test('A85WA-历史问题：DNS 凭证测试按掩码回传分流（***→库中原值 :id/test）', () => {
-  // 审计 87 WEBT-05①：原断言匹配注释文本「非 UI 客户端」——注释保留而分流逻辑
+test('DNS 凭证测试按掩码回传分流（***→库中原值 :id/test）', () => {
+  // 原断言匹配注释文本「非 UI 客户端」——注释保留而分流逻辑
   // 被删/改向也通过。改为钉分流语义：只有表单凭证含 *** 时打 :id/test（验证库中
   // 存量），用户实际改过凭证（无 ***）走无 id 的 /test。
   const page = source('src/views/settings/FreeCertificates.vue')
@@ -131,36 +120,35 @@ test('A85WA-历史问题：DNS 凭证测试按掩码回传分流（***→库中�
   assert.match(block, /:\s*'\/certificate-configs\/test'/)
 })
 
-test('A85WA-历史问题：管理 TLS 读取失败显性化，开关禁用至加载成功', () => {
+test('管理 TLS 读取失败显性化，开关禁用至加载成功', () => {
   const text = source('src/views/settings/BasicSettings.vue')
   assert.match(text, /adminTlsLoaded/)
   assert.match(text, /:disabled="isReadOnly \|\| !adminTlsLoaded"/)
 })
 
-test('A85WB-历史问题：Caddy 全局配置卡接入 configLoaded 双重门控', () => {
+test('Caddy 全局配置卡接入 configLoaded 双重门控', () => {
   const card = source('src/views/settings/CaddyGlobalSettings.vue')
   assert.match(card, /defineProps<\{ configLoaded: boolean \}>/)
   assert.match(card, /:disabled="isReadOnly \|\| !props\.configLoaded"/)
-  const start = card.indexOf('const handleSave = async')
-  assert.match(card.slice(start, start + 400), /!props\.configLoaded/)
+  const save = section(card, 'const handleSave = async', 'if (isReadOnly.value || saving.value) return')
+  assert.match(save, /!props\.configLoaded/, 'configLoaded 门必须早于常规写守卫')
   const page = source('src/views/Settings.vue')
   assert.match(page, /<CaddyGlobalSettings[\s\S]*?:config-loaded="configLoaded"/)
 })
 
-test('A85WB-历史问题：任一 /config 成功读取恢复 configLoaded，失败可重试', () => {
+test('任一 /config 成功读取恢复 configLoaded，失败可重试', () => {
   const text = source('src/views/Settings.vue')
-  const start = text.indexOf('const refreshConfigSection')
-  const end = text.indexOf('const handleSaveBasic', start)
-  assert.match(text.slice(start, end), /configLoaded\.value = true/, '卡片保存后刷新成功必须恢复保存门')
+  const block = section(text, 'const refreshConfigSection', 'const handleSaveBasic')
+  assert.match(block, /configLoaded\.value = true/, '卡片保存后刷新成功必须恢复保存门')
   assert.match(text, /configLoadFailed/)
 })
 
-test('A85WB-历史问题：policy_id=0 展示「无策略归属」而非「策略已删除」', () => {
+test('policy_id=0 展示「无策略归属」而非「策略已删除」', () => {
   const text = source('src/components/events/TriggerDetailDialog.vue')
   assert.match(text, /本次事件无策略归属/)
   // 无策略归属态由 policy_id<=0 判定（后端 securityevents.go 返回 (0, "")）
   assert.match(text, /const noPolicyAttribution = computed\(\(\) => \(props\.row\?\.policy_id \?\? 0\) <= 0\)/)
-  // 审计 87 WEBT-05②：原实现用「首个 } else { + 下一处 policyMissing」推段——
+  // 原实现用「首个 } else { + 下一处 policyMissing」推段——
   // 若 policyMissing 首次出现在段外则 indexOf 得 -1、切片为空，断言空转。
   // 改为语义断言：loadAll 内「策略已删除」的每处赋值都必须落在 policy_id>0 分支，
   // 无策略归属分支（} else { 之后）不得出现任何归因赋值。
@@ -175,38 +163,31 @@ test('A85WB-历史问题：policy_id=0 展示「无策略归属」而非「策�
   }
 })
 
-test('A85WB-历史问题：威胁地图 canvas 注册/注销 pointerleave 清理悬停态', () => {
+test('威胁地图 canvas 注册/注销 pointerleave 清理悬停态', () => {
   const text = source('src/utils/threatScene.ts')
   assert.match(text, /addEventListener\('pointerleave', onPointerLeave\)/)
   assert.match(text, /removeEventListener\('pointerleave', onPointerLeave\)/)
-  const start = text.indexOf('function onPointerLeave')
-  assert.match(text.slice(start, start + 300), /hoverName = null/)
+  assert.match(section(text, 'function onPointerLeave', '\n  }'), /hoverName = null/, '离开画布必须复位悬停名')
 })
 
-test('A85WB-历史问题：悬停高亮 Path2D 按 hover+相机键缓存（不再每帧重建）', () => {
+test('悬停高亮 Path2D 按 hover+相机键缓存（不再每帧重建）', () => {
   const text = source('src/utils/threatScene.ts')
   assert.match(text, /HoverCache|hoverPathCache/)
-  const start = text.indexOf('function drawHoverHighlight')
-  const end = text.indexOf('// ---- 主循环 ----', start)
-  assert.match(text.slice(start, end), /Cache\.key !== key|cache\.key !== key/i)
+  assert.match(section(text, 'function drawHoverHighlight', '// ---- 主循环 ----'), /Cache\.key !== key|cache\.key !== key/i)
 })
 
-test('A85WB-历史问题：指标采集失败时规则表空态报「采集失败」', () => {
-  const text = source('src/views/Dashboard.vue')
-  const start = text.indexOf('const rulesEmptyText')
-  const end = text.indexOf('const hasRuleRequests', start)
-  assert.match(text.slice(start, end), /caddyMetricsUnavailable/)
+test('指标采集失败时规则表空态报「采集失败」', () => {
+  assert.match(section(source('src/views/Dashboard.vue'), 'const rulesEmptyText', 'const hasRuleRequests'), /caddyMetricsUnavailable/)
 })
 
-test('A85WB-历史问题：区域树加载失败保留旧数据并显性提示+重试', () => {
+test('区域树加载失败保留旧数据并显性提示+重试', () => {
   const text = source('src/views/security/SecurityPolicies.vue')
   assert.match(text, /regionsError/)
-  const start = text.indexOf('const fetchRegions')
-  const end = text.indexOf('onMounted', start)
-  assert.doesNotMatch(text.slice(start, end), /\} catch \{\s*regionTree\.value =/, '失败不得静默清空区域树')
+  const fetchRegions = section(text, 'const fetchRegions', 'onMounted')
+  assert.doesNotMatch(fetchRegions, /\} catch \{\s*regionTree\.value =/, '失败不得静默清空区域树')
 })
 
-test('A85WB-历史问题：事件页刷新按钮联动自动封禁状态', () => {
+test('事件页刷新按钮联动自动封禁状态', () => {
   const text = source('src/views/security/SecurityEvents.vue')
   const start = text.indexOf('const refreshPage')
   assert.ok(start > 0, '缺 refreshPage')
@@ -214,9 +195,9 @@ test('A85WB-历史问题：事件页刷新按钮联动自动封禁状态', () =>
   assert.match(text, /@click="refreshPage"/)
 })
 
-test('A85WB-历史问题：信任关联写动作确认前即占位（双击不再叠确认框）', () => {
+test('信任关联写动作确认前即占位（双击不再叠确认框）', () => {
   const text = source('src/composables/useTrustAssociation.ts')
-  // 审计 87 WEBT-05③：原断言只数 `if (creating.value) return` 出现次数 ≥2——
+  // 原断言只数 `if (creating.value) return` 出现次数 ≥2——
   // 同一函数里写两次也通过，无法证明「两个写入口都有锁」。改为逐函数限段：
   // 每个写入口的入口守卫必须早于占位与确认框。
   const writers = [
@@ -235,8 +216,8 @@ test('A85WB-历史问题：信任关联写动作确认前即占位（双击不�
   }
 })
 
-test('A85WB-历史问题：restart 就绪响应落地后 reload 前复查 isDisposed', () => {
-  // 审计 87 WEBT-05④：原断言取 260 字符窗口——isDisposed 与 reload 可来自无关语句。
+test('restart 就绪响应落地后 reload 前复查 isDisposed', () => {
+  // 原断言取 260 字符窗口——isDisposed 与 reload 可来自无关语句。
   // 改为函数级限段 + 顺序断言：状态请求成功后的 dispose 复查必须紧邻 reload。
   const body = section(source('src/utils/restart.ts'), 'const reloadAfterRestart = async', 'export interface RestartServiceOptions')
   const statusAt = body.indexOf("await request.get('/caddy/status'")
@@ -251,7 +232,7 @@ test('A85WB-历史问题：restart 就绪响应落地后 reload 前复查 isDisp
   assert.match(beforeStatus, /if \(isDisposed\?\.\(\)\) return false/)
 })
 
-test('A85WB-历史问题：死代码清理（灰 tone/死 CSS/死字段/解析器单源）', () => {
+test('死代码清理（灰 tone/死 CSS/死字段/解析器单源）', () => {
   assert.doesNotMatch(source('src/components/RuleFlowDialog.vue'), /tl-dot--gray|\| 'gray'/)
   assert.doesNotMatch(source('src/views/security/SecurityEvents.vue'), /autoban-confirm-list|autoban-confirm-text/)
   assert.doesNotMatch(source('src/views/security/SecurityEvents.vue'), /list_referenced: boolean/, '死字段声明应移除')
@@ -262,32 +243,31 @@ test('A85WB-历史问题：死代码清理（灰 tone/死 CSS/死字段/解析�
   assert.match(source('src/utils/securityStages.ts'), /export const parseUnknownIds|export function parseUnknownIds/)
 })
 
-test('A85WT-历史问题：build 门禁先跑测试与测试类型检查', () => {
+test('build 门禁先跑测试与测试类型检查', () => {
   const pkg = JSON.parse(source('package.json')) as { scripts: Record<string, string> }
   assert.ok(
     pkg.scripts.build.startsWith('npm test && npm run typecheck:test &&'),
     `build 必须先执行 npm test 与 typecheck:test，实际: ${pkg.scripts.build}`,
   )
-  // 审计 87 WEBT-06：tsconfig.test.json extends 根 include（含全部 src/**/*.vue），
+  // tsconfig.test.json extends 根 include（含全部 src/**/*.vue），
   // typecheck:test 已是 src+tests 的超集——再跑 `vue-tsc --noEmit` 只是把全量 SFC
   // 类型检查重复一遍（构建期约 2× 时间）。
   assert.doesNotMatch(pkg.scripts.build, /(^|&& )vue-tsc --noEmit/, `build 不得重复全量类型检查: ${pkg.scripts.build}`)
 })
 
-test('A85历史问题-C：ACME 证书卡接入 configLoaded 双重门控（与 Basic/Caddy 同契约）', () => {
+test('证书卡：ACME 证书卡接入 configLoaded 双重门控（与 Basic/Caddy 同契约）', () => {
   const card = source('src/views/settings/FreeCertificates.vue')
   assert.match(card, /defineProps<\{ configLoaded: boolean \}>/)
   assert.match(card, /:disabled="isReadOnly \|\| !props\.configLoaded"/)
-  const start = card.indexOf('const handleSave = async ()')
-  assert.ok(start >= 0, 'handleSave 未找到')
-  assert.match(card.slice(start, start + 400), /!props\.configLoaded/)
+  const save = section(card, 'const handleSave = async', 'if (isReadOnly.value) return')
+  assert.match(save, /!props\.configLoaded/, 'configLoaded 门必须早于常规写守卫')
   const page = source('src/views/Settings.vue')
   assert.match(page, /<FreeCertificates[\s\S]*?:config-loaded="configLoaded"/)
 })
 
-// ===== 历史 WEB-VIEWS-SETTINGS 修复回归（WS-01…WS-17 视图面） =====
+// ===== 设置/安全视图接线（证书队列、任务监控、集群、TLS、DNS 凭证、OIDC） =====
 
-test('WS-01：证书队列非空判据 = 排队 + 进行中 + 等 CA（任何一项 > 0 都非「空闲」）', () => {
+test('证书队列非空判据 = 排队 + 进行中 + 等 CA（任何一项 > 0 都非「空闲」）', () => {
   assert.equal(certQueueIsBusy({ queued: 0, running: 0, waiting: 0 }), false)
   assert.equal(certQueueIsBusy({ queued: 3, running: 0, waiting: 0 }), true, '全部排队时曾被误报空闲')
   assert.equal(certQueueIsBusy({ queued: 0, running: 0, waiting: 2 }), true, '等 CA 也是队列非空')
@@ -305,7 +285,7 @@ test('WS-01：证书队列非空判据 = 排队 + 进行中 + 等 CA（任何一
   assert.equal(certQueueMoreCount({ ...base, total: 0, jobs: [] }), 0)
 })
 
-test('WS-01/WS-03：证书队列横幅接线与 page_size=6', () => {
+test('证书队列横幅接线与 page_size=6', () => {
   const page = source('src/views/settings/TaskMonitor.vue')
   assert.match(page, /certQueueIsBusy\(certQueue\) \? 'primary' : 'success'/)
   assert.match(page, /v-else-if="certQueueHasLive\(certQueue\)"/)
@@ -315,7 +295,7 @@ test('WS-01/WS-03：证书队列横幅接线与 page_size=6', () => {
   assert.match(page, /page_size: CERT_QUEUE_PAGE_SIZE/)
 })
 
-test('WS-02：任务监控三份轮询请求缺 data 一律抛 TypeError（进入契约退避）', () => {
+test('任务监控三份轮询请求缺 data 一律抛 TypeError（进入契约退避）', () => {
   const page = source('src/views/settings/TaskMonitor.vue')
   const tasks = section(page, 'const fetchTasks = async', 'const refreshNow =')
   assert.match(tasks, /if \(!res\.data\) throw new TypeError\('任务列表响应缺少 data'\)/)
@@ -326,7 +306,7 @@ test('WS-02：任务监控三份轮询请求缺 data 一律抛 TypeError（进�
   assert.match(queue, /if \(error instanceof TypeError\) throw error/)
 })
 
-test('WS-16：任务详情弹框适配窄屏并实时派生（不持打开时快照）', () => {
+test('任务详情弹框适配窄屏并实时派生（不持打开时快照）', () => {
   const page = source('src/views/settings/TaskMonitor.vue')
   assert.match(page, /<el-dialog v-model="detailVisible" width="min\(720px, 92vw\)"/)
   const block = section(page, 'const detailTask = computed<TaskInfo | null>', 'const history = ref')
@@ -334,8 +314,8 @@ test('WS-16：任务详情弹框适配窄屏并实时派生（不持打开时快
   assert.match(section(page, 'const openDetail = async', '// ===== 日志抽屉'), /detailTaskId\.value = row\.id/)
 })
 
-test('WS-04：节点审批/拒绝/删除在确认弹框之前取得占位', () => {
-  const block = section(source('src/views/settings/ClusterSettings.vue'), 'const confirmAndRunNodeAction = async', '// 历史问题 D-N1')
+test('节点审批/拒绝/删除在确认弹框之前取得占位', () => {
+  const block = section(source('src/views/settings/ClusterSettings.vue'), 'const confirmAndRunNodeAction = async', 'const approveNode = (node: ClusterNode)')
   const takePlaceholder = block.indexOf('pendingNodeId.value = node.id')
   const confirm = block.indexOf('confirmAction(')
   assert.ok(takePlaceholder >= 0 && confirm > takePlaceholder, '占位必须先于 confirmAction')
@@ -345,13 +325,13 @@ test('WS-04：节点审批/拒绝/删除在确认弹框之前取得占位', () =
   assert.match(page, /const removeNode = \(node: ClusterNode\): Promise<void> =>\n  confirmAndRunNodeAction\(/)
 })
 
-test('WS-04：服务控制/同步/同步设置/清钉同样在确认前占位', () => {
+test('服务控制/同步/同步设置/清钉同样在确认前占位', () => {
   const page = source('src/views/settings/ClusterSettings.vue')
-  const service = section(page, 'const executeServiceControl = async', '// 历史问题：清除该节点的 TOFU')
+  const service = section(page, 'const executeServiceControl = async', 'const forgetNodePin = async')
   assert.ok(service.indexOf('serviceControlLoading.value = true') < service.indexOf('confirmAction('), '服务控制占位须先于确认')
   const forgetPin = section(page, 'const forgetNodePin = async', 'const registerToken = ref')
   assert.ok(forgetPin.indexOf('nodePinForgetting.value = true') < forgetPin.indexOf('confirmAction('))
-  const sync = section(page, 'const syncNow = async', '// 历史问题：PinMismatch')
+  const sync = section(page, 'const syncNow = async', 'const forgetPins = async')
   assert.ok(sync.indexOf('syncing.value = true') < sync.indexOf('confirmAction('))
   const syncField = section(page, 'const updateSyncField = async', 'const updateSyncInterval = async')
   assert.ok(syncField.indexOf('settingsLoading.value = true') < syncField.indexOf('confirmAction('))
@@ -359,14 +339,14 @@ test('WS-04：服务控制/同步/同步设置/清钉同样在确认前占位', 
   assert.ok(pins.indexOf('forgettingPins.value = true') < pins.indexOf('confirmAction('))
 })
 
-test('WS-06：TLS 文件选择器读完即复位（同路径重选可再次触发 change）', () => {
+test('TLS 文件选择器读完即复位（同路径重选可再次触发 change）', () => {
   const block = section(source('src/views/settings/BasicSettings.vue'), 'const onTlsFile = async', 'const notifyTlsRestarting')
   const reset = block.indexOf("input.value = ''")
   const firstUse = block.indexOf('adminTlsForm.value.certFile')
   assert.ok(reset >= 0 && reset < firstUse, 'file input 必须在读取后立即复位')
 })
 
-test('WS-07：/admin-tls 读取失败显性化并提供重试', () => {
+test('/admin-tls 读取失败显性化并提供重试', () => {
   const page = source('src/views/settings/BasicSettings.vue')
   assert.match(page, /const adminTlsLoadFailed = ref\(false\)/)
   const load = section(page, 'const loadAdminTls = async', 'const retryLoadAdminTls')
@@ -375,13 +355,13 @@ test('WS-07：/admin-tls 读取失败显性化并提供重试', () => {
   assert.match(page, /v-else-if="adminTlsLoadFailed"[\s\S]{0,400}retryLoadAdminTls/, '开关旁必须有错误文案与重试入口')
 })
 
-test('WS-09：兜底提醒不承诺不会发生的自动跳转', () => {
+test('兜底提醒不承诺不会发生的自动跳转', () => {
   const page = source('src/views/settings/BasicSettings.vue')
   assert.doesNotMatch(page, /若未自动跳转/)
   assert.match(page, /ElMessage\.warning\(`请手动访问新地址：\$\{target\}`\)/)
 })
 
-test('WS-11：各写函数入口自带只读/在途守卫（纵深防御）', () => {
+test('各写函数入口自带只读/在途守卫（纵深防御）', () => {
   const basic = source('src/views/settings/BasicSettings.vue')
   const checks: Array<[string, string, RegExp]> = [
     ['const saveAutoBackupSettings = async', '\nconst ', /if \(isReadOnly\.value \|\| !autoBackupSectionsValid\.value/],
@@ -408,14 +388,14 @@ test('WS-11：各写函数入口自带只读/在途守卫（纵深防御）', ()
   assert.match(section(oidc, 'const remove = async', '\nconst '), /if \(isReadOnly\.value \|\| saving\.value \|\| loadFailed\.value\) return/)
 })
 
-test('WS-12：CA 表单不再持有零读取的 credentials 副本', () => {
+test('CA 表单不再持有零读取的 credentials 副本', () => {
   const page = source('src/views/settings/FreeCertificates.vue')
   const block = section(page, 'const caForm = reactive', 'const caCreds = reactive')
   assert.doesNotMatch(block, /credentials: '\{\}'/, 'caForm 初始值不得再含零读取的 credentials')
   assert.match(page, /reactive<Omit<CAProvider, 'credentials'>>/)
 })
 
-test('WS-13：DNS 凭证字段可见性按 visible_when 求值，无元数据时恒显示', () => {
+test('DNS 凭证字段可见性按 visible_when 求值，无元数据时恒显示', () => {
   const fields = [
     { name: 'auth_mode', label: '认证方式', type: 'select', required: true, options: ['dnspod', 'tencent_cloud'], option_labels: { dnspod: 'DNSPod API', tencent_cloud: '腾讯云 API' } },
     { name: 'app_id', label: 'App ID', type: 'text', required: false, visible_when: { auth_mode: ['dnspod'] } },
@@ -432,7 +412,7 @@ test('WS-13：DNS 凭证字段可见性按 visible_when 求值，无元数据时
   assert.deepEqual(defaultCredentialsFor([]), {})
 })
 
-test('WS-13：后端下发 visible_when/option_labels，前端不再硬编码 dnspod 字段名', () => {
+test('后端下发 visible_when/option_labels，前端不再硬编码 dnspod 字段名', () => {
   const go = source('../internal/services/dnsproviders/dnspod.go')
   const cf = section(go, 'func (d *DNSPod) CredentialFields()', '\nfunc (d *DNSPod) CredentialFieldOptions')
   assert.match(cf, /VisibleWhen: visibleOnly\("dnspod"\)/)
@@ -449,10 +429,12 @@ test('WS-13：后端下发 visible_when/option_labels，前端不再硬编码 dn
   assert.doesNotMatch(vue, /opt === 'dnspod' \? 'DNSPod API' : '腾讯云 API'/)
 })
 
-test('WS-15：OIDC GET 失败清空为未配置态并禁止保存（不得回填上一轮状态）', () => {
+test('OIDC GET 失败清空为未配置态并禁止保存（不得回填上一轮状态）', () => {
   const page = source('src/views/settings/OIDCSettings.vue')
   const load = section(page, 'const load = async', 'let probeInFlight')
-  const catchBlock = load.slice(load.indexOf('} catch {'))
+  const catchAt = load.indexOf('} catch {')
+  assert.ok(catchAt > 0, 'load 缺 catch 分支')
+  const catchBlock = load.slice(catchAt)
   for (const cleared of ['enabled.value = false', 'hasSecret.value = false', 'hasFetchedConfig.value = false', "form.issuer = ''", 'loadFailed.value = true']) {
     assert.ok(catchBlock.includes(cleared), `load catch 未复位 ${cleared}——父级会回填陈旧状态`)
   }

@@ -25,3 +25,17 @@ test('A85历史问题-9：成功拉取配置后排下一轮全站角色刷新', 
   assert.match(fetchBody, /!\(e instanceof ApiRequestError && e\.status === 401\)\) scheduleConfigRetry\(\)/)
   assert.match(source, /function localLogout[\s\S]*?clearConfigRetryTimer\(\)/)
 })
+
+test('mfa_write_guard 随 /config 投影单源：Users 页不再单独整取 GET /config', () => {
+  const fetchStart = source.indexOf('async function fetchConfig')
+  const fetchEnd = source.indexOf('interface LoginResult', fetchStart)
+  const fetchBody = source.slice(fetchStart, fetchEnd)
+  assert.match(fetchBody, /mfa_write_guard\?: boolean/, '/config 契约声明该键')
+  assert.match(fetchBody, /mfaWriteGuard\.value = res\.data\.mfa_write_guard === true/)
+  assert.match(source, /const mfaWriteGuard = ref\(false\)/, '首值 false = 守卫关闭的保守形态')
+  assert.match(source, /^\s+mfaWriteGuard,$/m, 'store 对外暴露 ref')
+
+  const users = readFileSync(new URL('../src/views/Users.vue', import.meta.url), 'utf8')
+  assert.match(users, /const mfaWriteGuard = computed\(\(\) => authStore\.mfaWriteGuard\)/)
+  assert.doesNotMatch(users, /request\.get\('\/config'\)/, '不得再为单键重复拉整份配置')
+})

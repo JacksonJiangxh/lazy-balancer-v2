@@ -5,7 +5,7 @@ package services
 // 常驻(3)：Run 阻塞自管理循环，引擎仅管生命周期
 // 循环(9)：IntervalFn 固定间隔，每轮独立执行+记录
 // 触发(1)：仅手动/代码触发
-// cert-waiting-ca：默认调度关闭——cert-renewal-scan 入队时唤醒，全部终态自动停。
+// 默认调度关闭——历史修复 入队时唤醒，全部终态自动停。
 
 import (
 	"context"
@@ -72,14 +72,14 @@ func SetTaskEngineForTest(te *taskengine.Engine) { taskEngine = te }
 // reconcileTaskEngineRole 把引擎角色对齐到 DB 单源角色（历史问题-1）。
 //
 // 引擎角色此前只在 InitTaskEngine 播种一次：播种连续失败即 SetRole(false)，
-// 若 DB 实为主节点则形成「DB=主/引擎=从」的进程内半主半从——master-only
+// 若 DB 实为主节点则形成「DB=主/引擎=从」的进程内半主半从——历史修复
 // 任务全部静默停摆，且再次 Promote 返回 ErrAlreadyMaster 无法自愈。本函数
-// 由独立 startRoleReconciler 每 60s 调用（A85历史问题-7；不是 config-watchdog
+// 由独立 startRoleReconciler 每 60s 调用（A85历史问题-7；不是 历史修复
 // 任务体），使角色成为可收敛的 DB 投影，且不受用户停止看门狗影响。
 //
 // 并发安全：与 ClusterService.Promote/BecomeSlave 的 roleMu 串行——两处
 // 翻转都在持 roleMu 时完成「DB 更新 + SetRole」。不串行则对账可能读到翻转
-// 前的旧角色，并在降级落定后把引擎重新升主（从节点启动 master-only daemon
+// 前的旧角色，并在降级落定后把引擎重新升主（从节点启动 历史修复 daemon
 // 写库）。锁序 roleMu → 引擎内部锁，与翻转路径同序，无反向获取。
 func reconcileTaskEngineRole() {
 	reconcileTaskEngineRoleFor(TaskEngine())
@@ -126,7 +126,7 @@ func mustRegisterTask(te *taskengine.Engine, d taskengine.Descriptor) {
 // 排程槽生命周期 2026-10-11：失败落定落库推进，NextSlotFn 纯读库。）
 
 // InitTaskEngine 建引擎、恢复孤儿运行、注册全部 18 任务并启动默认循环。
-// TASK-L8（历史）：非幂等——调用方保证单次装配；重复调用前须先
+// 历史修复（历史）：非幂等——调用方保证单次装配；重复调用前须先
 // StopTaskEngine（否则旧 scheduleLoop goroutine 泄漏、双引擎双写 task_runs）。
 // 测试环境须先 db.Initialize。
 func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine {
@@ -141,15 +141,15 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	}
 	taskengine.SetLogDir(tasksLogDir)
 	taskengine.SetTaskLogSizeBytesFn(getTaskLogSizeBytes)
-	// 历史问题（历史）：以暂停 tick 形态建引擎——BootSync（startup:config-load）
+	// 历史问题（历史）：以暂停 tick 形态建引擎——BootSync（startup:历史修复）
 	// 完成前面板装配期的周期/定时任务不得抢跑（配置未加载即执行首轮）；下方
 	// RunBootSyncTasks 之后 ResumeScheduling 恢复调度。
 	taskEngine = taskengine.NewEngine(taskengine.Options{StartPaused: true})
 	// 角色种子（v2.0 角色门前置）：按 DB 角色初始化——从节点不瞬启
-	// master-only daemon（否则 boot 行噪音：启动→SetRole 停止）。
+	// 历史修复 daemon（否则 boot 行噪音：启动→SetRole 停止）。
 	// 历史问题-1 修复：曾在此前多建一个引擎（种子落在被弃实例上失效+泄漏）。
-	// 历史问题：读失败 warn+重试一次；仍失败按 fail-closed 从节点启动——
-	// 不得因读错误保持 NewEngine 默认主节点（会拉起 master-only daemon 并
+	// 历史问题：读失败 warn+重试一次；仍失败按 历史修复 从节点启动——
+	// 不得因读错误保持 NewEngine 默认主节点（会拉起 历史修复 daemon 并
 	// 放开写面）。并发角色翻转由后续 SetRole 正常收敛。
 	var roleMaster bool
 	roleErr := errors.New("数据库未初始化")
@@ -180,8 +180,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		IntervalFn:  func() time.Duration { return 60 * time.Second },
 		Run: func(rc taskengine.RunContext) error {
 			// 角色对账已移至独立 startRoleReconciler（不受用户停止看门狗影响）。
-			WatchdogCheckOnce()
-			return nil
+			// 整轮未判定（Caddy 不可达/规则读取失败）必须落 failed——
+			// 直接透传看门狗错误，引擎通用行为不变。
+			return WatchdogCheckOnce()
 		},
 	})
 
@@ -229,7 +230,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			// 历史问题-06：传任务 ctx——Stop(cancel) 可在大批量首遍中途生效。
 			// 历史问题-09：清理失败必须让 task_runs 落 failed，不得恒成功。
 			deleted, err := SecurityEventsRetentionCleanupCtxErr(rc.Ctx)
-			// V87-TO-10（历史）：失败轮不得写「清理完成」——task_runs 已落
+			// 历史修复（历史）：失败轮不得写「清理完成」——task_runs 已落
 			// failed（历史问题-09），任务日志称完成会把排障方向带偏。
 			if err != nil {
 				TaskLogfWarn("security-events-retention", "cleanup", "安全事件保留清理失败：本轮已删除 %d 条后中止（保留期与条数上限），错误：%v", deleted, err)
@@ -249,10 +250,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Kind:        taskengine.KindPeriodic,
 		IntervalFn:  func() time.Duration { return 24 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
-			// 历史修复 D-4：清理失败必须让 task_runs 落 failed，不得恒成功；
+			// 历史修复 清理失败必须让 task_runs 落 failed，不得恒成功；
 			// 有界=单轮最多清理 metricsOrphanPurgeRulesPerRun 个规则，余量下轮收敛。
 			deletedRules, err := PurgeOrphanMetricsHistory(rc.Ctx)
-			// V87-TO-10：失败轮不得写「清理完成」（task_runs 已落 failed）。
+			// 失败轮不得写「清理完成」（task_runs 已落 failed）。
 			if err != nil {
 				TaskLogfWarn("metrics-orphan-cleanup", "cleanup", "孤儿规则指标清理失败：本轮已清理 %d 个规则后中止，错误：%v", deletedRules, err)
 				return err
@@ -290,14 +291,14 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			// 长跑期间 StopTaskEngine 可能把全局置 nil；闭包内固定句柄，
 			// 收尾调用不会 nil 解引用（历史 历史问题-06）。
 			te := taskEngine
-			CertRenewalScanOnce()
+			result := CertRenewalScanOnce()
 			// 入队即唤醒 CA 等待补扫（默认调度关闭）。历史问题：走 RearmLoop
 			// 有活唤醒——仅在确有在途任务时越过「已停止」态，不再无条件
 			// StartLoop（避免把用户手动停止的调度隐式打开）。
 			if te != nil {
 				te.RearmLoop("cert-waiting-ca", certJobsActiveFn())
 			}
-			return nil
+			return result
 		},
 	})
 
@@ -306,7 +307,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Description: "核对证书文件与数据库状态一致性，修复中断任务残留的中间态",
 		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
 		IntervalFn: func() time.Duration { return 6 * time.Hour },
-		Run:        func(rc taskengine.RunContext) error { CertReconcileOnce(); return nil },
+		Run:        func(rc taskengine.RunContext) error { return CertReconcileOnce() },
 	})
 
 	mustRegisterTask(taskEngine, taskengine.Descriptor{
@@ -388,7 +389,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	//   噪音口径见 cluster_masterserving.go）。
 	// RunsOn=RoleAny + RestartOnRoleFlip：两角色同启停语义（调度开关/引擎
 	// 生命周期一致）；角色翻转换代重启使 Run 分支与角色同步切换；boot/
-	// 停止/成功/失败行与 tasks/cluster-sync.log 两角色共写（各节点本地文件）。
+	// 停止/成功/失败行与 tasks/历史修复.log 两角色共写（各节点本地文件）。
 	mustRegisterTask(taskEngine, taskengine.Descriptor{
 		ID:                "cluster-sync",
 		Family:            "cluster",
@@ -429,7 +430,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 				return errors.New("威胁库管理器未初始化（InitThreatUpdateManager 必须先于 InitTaskEngine）")
 			}
 			// 引擎已在排程槽调用——直接执行（manager 内部自带总闸/单飞/到期源筛选）
-			// TASK-L5：demote/中止语义（lastTaskOutcome=skipped）不再失真为 success——
+			// demote/中止语义（lastTaskOutcome=skipped）不再失真为 success——
 			// 映射引擎 skipped 终态（ErrTaskSkipped 哨兵，task_runs CHECK 既有值）。
 			if err := m.RunUpdate(rc.Trigger, &rc); err != nil {
 				return err
@@ -446,11 +447,11 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Description: "检查并更新 OWASP CoreRuleSet 规则集到最新版本（保留用户 overrides），供 WAF 拦截模式消费",
 		Category:    "安全防护", Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
 		NextSlotFn: func() time.Time {
-			// TASK-L1 同批：DB 直读不依赖管理器实例（EnabledFn 亦同源直读）——
+			// 历史修复 同批：DB 直读不依赖管理器实例（EnabledFn 亦同源直读）——
 			// 测试环境不建管理器，生产管理器初始化晚于引擎注册，管理器门会让
 			// 首槽武装在窗口期读不到。历史问题：开关/槽统一读单源 helper
 			// （versionTableAutoUpdateEnabled/versionTableNextUpdate，nil 库与
-			// 读错均 fail-closed 零值槽）。
+			// 读错均 历史修复 零值槽）。
 			if !versionTableAutoUpdateEnabled("security_crs_version") {
 				return time.Time{}
 			}
@@ -486,7 +487,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			}
 			<-done
 			if snap := m.StatusSnapshot(); snap.Status == string(CRSStatusSkipped) {
-				// TASK-L5：demote 中止落 skipped 终态而非 success
+				// demote 中止落 skipped 终态而非 success
 				return taskengine.ErrTaskSkipped
 			}
 			if snap := m.StatusSnapshot(); snap.Status == string(CRSStatusFailed) {
@@ -501,18 +502,18 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Description: "更新 IP 地理位置离线库（xdb），供 GeoIP 地域拦截与归属地展示使用",
 		Category:    "安全防护", Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
 		NextSlotFn: func() time.Time {
-			// TASK-L1 同批：DB 直读不依赖管理器实例（与 crs 同形）。
-			// 历史问题：开关/槽统一读单源 helper（nil 库/读错 fail-closed 零值槽）。
+			// 历史修复 同批：DB 直读不依赖管理器实例（与 crs 同形）。
+			// 历史问题：开关/槽统一读单源 helper（nil 库/读错 历史修复 零值槽）。
 			if !versionTableAutoUpdateEnabled("security_ip2region_version") {
 				return time.Time{}
 			}
 			return parseUTCSlot(versionTableNextUpdate("security_ip2region_version"))
 		},
 		// 业务开关门（关=已停止——展示+调度面跳过，历史问题；DB 直读）。
-		// 历史问题：读库失败 fail-closed（helper 同源，与 crs/threat 同口径）。
+		// 历史问题：读库失败 历史修复（helper 同源，与 crs/threat 同口径）。
 		EnabledFn: func() bool { return versionTableAutoUpdateEnabled("security_ip2region_version") },
 		StatusFn: func() string {
-			// B1-8（历史）：nil 库守卫——空状态 fail-closed。
+			// 历史修复（历史）：nil 库守卫——空状态 历史修复。
 			if db.DB == nil {
 				return ""
 			}
@@ -537,7 +538,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			}
 			<-done
 			if snap := m.StatusSnapshot(); snap.Status == string(IP2RegionStatusSkipped) {
-				// TASK-L5：demote 中止落 skipped 终态而非 success
+				// demote 中止落 skipped 终态而非 success
 				return taskengine.ErrTaskSkipped
 			}
 			if snap := m.StatusSnapshot(); snap.Status == string(IP2RegionStatusFailed) {
@@ -572,7 +573,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			return time.Time{}
 		},
 		EnabledFn: func() bool { // 业务开关门（备份未启用=已停止——展示+调度面跳过，历史问题）
-			// TASK-2（历史）：读库失败 fail-closed——曾 err!=nil||enabled
+			// 历史修复（历史）：读库失败 历史修复——曾 err!=nil||enabled
 			// 把读错误报为启用。
 			row, err := loadAutoBackupSettings()
 			return err == nil && row.enabled
@@ -601,7 +602,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		RunsOn:      taskengine.RoleAny, // R3（历史）：BootSync 仅 RoleAny（注册期强制；启动执行面无角色语义）
 		BootSync:    true,               // B1（历史后裁定）：启动执行=引擎同步触发（面板监听前完成）
 		Run: func(rc taskengine.RunContext) error {
-			// V1（历史）：caddy-restart=Caddy 崩溃自愈 watcher 经引擎调度
+			// V1（历史）：历史修复=Caddy 崩溃自愈 watcher 经引擎调度
 			// （曾 watcher 直调执行体绕过引擎——task_runs/单飞/日志双行）。
 			if rc.Trigger != "manual" && rc.Trigger != "startup" && rc.Trigger != "caddy-restart" {
 				return nil
@@ -616,15 +617,15 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// ============ 手动触发语义 + 默认调度启动 ============
 
 	// 手动触发=类型派生（2026-10-11 用户裁定，取代 SetManualRun 白名单——
-	// config-watchdog 曾被白名单遗漏致循环任务无「运行」操作）：
+	// 历史修复 曾被白名单遗漏致循环任务无「运行」操作）：
 	// 定时/循环/触发均可手动调度；常驻族恒不可（启停即可，启停由调度开关+重启承担）。
 
 	// 默认调度启动：
-	// - 循环 8 个全启动（cert-waiting-ca 除外——默认关闭，续期扫描唤醒；
+	// - 循环 8 个全启动（历史修复 除外——默认关闭，续期扫描唤醒；
 	//   autoban 除外——调度唯一前提=业务启用，见下）
 	// - 常驻 3 个全启动（系统启动即运行；关闭调度=启动也不运行）
-	// - 定时 4 个启动排程（threat/crs/ip2region/auto-backup——EnabledFn/
-	//   NextSlotFn 内含开关判断；crawlerbot-update 不在本清单，调度由
+	// - 定时 4 个启动排程（threat/crs/ip2region/历史修复——EnabledFn/
+	//   NextSlotFn 内含开关判断；历史修复 不在本清单，调度由
 	//   SyncBusinessTaskDrivers 按业务开关对齐）
 	// 历史问题/历史问题：默认启动前先读偏好——显式停止的 daemon 必须在任何
 	// StartLoop 副作用（启动记录/首轮执行）之前跳过；否则先启动再 StopLoop
@@ -643,7 +644,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		taskEngine.StartLoop(id)
 	}
 	// 首槽武装先落默认源/版本行，随后的业务开关同步才能读到全新库的
-	// 默认启用态（否则 ErrNoRows 被 fail-closed 误译为关闭并 StopLoop）。
+	// 默认启用态（否则 ErrNoRows 被 历史修复 误译为关闭并 StopLoop）。
 	armSecurityLibraryFirstSlots()
 	// 历史问题：套用用户显式启停偏好——覆盖默认启动清单（停止态不复活；
 	// 用户主动开启的默认关闭任务恢复调度）；业务驱动任务跳过。
@@ -651,7 +652,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	applyTaskLoopPrefs(taskEngine, taskLoopPrefs)
 	// 业务驱动任务启动均按业务实态对齐（唯一清单见 businessTaskDrivers）。
 	SyncBusinessTaskDrivers()
-	// B1：BootSync 任务同步执行（startup:config-load——面板监听前完成，
+	// B1：BootSync 任务同步执行（startup:历史修复——面板监听前完成，
 	// 替代 main.go 直调+legacy startupPhase 记录旁路）
 	taskEngine.RunBootSyncTasks()
 	// 历史问题（历史）：BootSync 完成后解除 tick 暂停——此前 ticker 在
@@ -661,7 +662,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	return taskEngine
 }
 
-// startRoleReconciler 把引擎角色对账从用户可停止的 config-watchdog 中解耦
+// startRoleReconciler 把引擎角色对账从用户可停止的 历史修复 中解耦
 // （历史 历史问题-2）：看门狗被停后，播种失败/角色漂移仍能每 60s 自愈。
 // 每次 InitTaskEngine 启动一个并绑定该代引擎；全局换代或本代停止后退出。
 var roleReconcilerInterval = 60 * time.Second
@@ -673,7 +674,7 @@ func startRoleReconciler(te *taskengine.Engine) <-chan struct{} {
 		ticker := time.NewTicker(roleReconcilerInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			// S-A-历史问题：不能每 tick 重读全局后继续运行——StopTaskEngine
+			// 历史修复-历史问题：不能每 tick 重读全局后继续运行——StopTaskEngine
 			// 置 nil 后快速 Init 会让旧 goroutine 误认新引擎而永久泄漏。
 			if TaskEngine() != te || te.IsStopped() {
 				return
@@ -743,10 +744,10 @@ func WakeCertWaitingCAForEnqueuedJob() {
 
 // clusterSyncDaemonRun 集群同步 daemon 的 Run 体（从 InitTaskEngine 的描述符
 // 闭包抽出，便于对「引擎句柄固定」契约直接钉测）。
-// V87-TO-02（历史）：先固定引擎句柄再读角色——StopTaskEngine 在
+// 历史修复（历史）：先固定引擎句柄再读角色——StopTaskEngine 在
 // engine.Stop() 的 drain 超时后置全局 taskEngine=nil，daemon goroutine 若在
-// 超时后首次进入 Run，裸读全局会 nil 解引用 panic（同族 cert-renewal-scan /
-// cert-waiting-ca 已按历史 历史问题-06 固定句柄）。句柄为空=引擎已停机/换代：
+// 超时后首次进入 Run，裸读全局会 nil 解引用 panic（同族 历史修复 /
+// 历史修复 已按历史 历史问题-06 固定句柄）。句柄为空=引擎已停机/换代：
 // 直接退出，不得把「无引擎」误判成从节点去拉起同步生命周期。
 func clusterSyncDaemonRun(rc taskengine.RunContext) error {
 	te := TaskEngine()
@@ -775,7 +776,7 @@ func RearmSecurityLibrarySlots() {
 	armSecurityLibraryFirstSlots()
 }
 
-// armSecurityLibraryFirstSlots 四个规则库首槽武装（TASK-L1，历史 历史问题）：
+// armSecurityLibraryFirstSlots 四个规则库首槽武装（历史修复，历史 历史问题）：
 // auto_update 开且 next_update 空的行写入下一排程槽（versionTableNextSlot/
 // threatNextSlot 与既有排程写侧同函数同口径）。已有槽的行、开关关闭的行
 // 一律不动；武装失败仅告警不阻断启动（下一排程保存路径会自愈）。

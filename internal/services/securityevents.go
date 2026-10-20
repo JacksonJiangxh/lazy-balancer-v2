@@ -1,6 +1,6 @@
 package services
 
-// allow: SIZE_OK — single cohesive WAF audit-log ingestion module; the
+// allow: SIZE_OK — single cohesive WAF 历史修复 ingestion module; the
 // deliverable is mandated as this one file and splitting is not authorized.
 
 import (
@@ -29,9 +29,9 @@ import (
 )
 
 // Security event ingestion: tails the Coraza WAF audit log (consecutive
-// pretty-printed JSON transactions) and inserts parsed rows into the
+// 历史修复 JSON transactions) and inserts parsed rows into the
 // security_events table. All identifiers carry the securityEvents prefix to
-// avoid package-level symbol clashes inside services.
+// avoid 历史修复 symbol clashes inside services.
 
 var (
 	securityEventsOffsetPath   = "/app/data/security_events.offset"
@@ -43,7 +43,7 @@ type securityEventRecord struct {
 	TransactionID string
 	EventTime     string
 	Host          string
-	// AttributionRuleID 是链首注入的 X-LB-Rule-ID 请求头值（F3）：规则归因的
+	// AttributionRuleID 是链首注入的 历史修复 请求头值（F3）：规则归因的
 	// 一等信号，优先于 host 反查；注入头缺失/指向已删除规则时回退 host 映射。
 	AttributionRuleID string
 	ClientIP          string
@@ -60,6 +60,10 @@ type securityEventRecord struct {
 	PrecheckUs     int64
 	RequestHeaders string
 	RequestBody    string
+	// chainedCustomRule 标记「多条件链式自定义规则」的起始条（审计 raw 以 ,chain
+	// 结尾）——历史修复 把 setvar 迁到链尾后，该形态的 raw 不含评分字面量，
+	// AnomalyScore 需按发射 id 回查 cr.Score 补齐。
+	chainedCustomRule bool
 }
 
 // securityEventsAuditMessage 是一条审计消息：message 为宏展开后的规则 msg，
@@ -73,7 +77,7 @@ type securityEventsAuditMessage struct {
 }
 
 // securityEventsAuditTransaction mirrors the Coraza JSON audit envelope:
-// messages is a TOP-LEVEL sibling of transaction, not nested inside it.
+// messages is a 历史修复 sibling of transaction, not nested inside it.
 // coraza v3 审计格式没有 data.score 字段——异常评分藏在两处（见
 // securityEventsExtractAnomalyScore）。lb_timing 是本系统审计写插件
 // （caddygeoip auditwriter.go）注入的顶层扩展字段：安全链分段耗时（µs），
@@ -139,6 +143,37 @@ func securityEventsExtractAnomalyScore(messages []securityEventsAuditMessage) in
 	return max(totalFromMsg, setvarSum)
 }
 
+// securityEventsRawIsChainStarter 报告审计 raw 是否为链式规则的起始条：
+// 起始条动作串以 ,chain 结尾（链子条只带 phase，不进审计 raw）。
+func securityEventsRawIsChainStarter(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	trimmed = strings.TrimRight(trimmed, "\"' \t\r\n")
+	return strings.HasSuffix(trimmed, ",chain")
+}
+
+// securityEventsChainedCustomRuleScore 按发射 id 回查自定义规则分：
+// 多条件 block/pass 规则的 setvar 在链尾，审计 raw 只有起始条 → 摄入侧评分恒 0。
+// 发射 id = DB id + 10000（合成 id 1000000+ 不带评分），[10001,799999] 是自定义
+// 规则独占段（IP 族 1-14 / GeoIP 800000-899999 / CRS 9xxxxx 均不重叠）。
+func securityEventsChainedCustomRuleScore(ruleTriggered string, policyByID map[int]*models.SecurityPolicy) int {
+	n, err := strconv.Atoi(ruleTriggered)
+	if err != nil || n <= 10000 || n >= 800000 {
+		return 0
+	}
+	ruleID := n - 10000
+	for _, p := range policyByID {
+		if p == nil {
+			continue
+		}
+		for _, cr := range policyCustomRulesCached(p, nil) {
+			if cr.ID == ruleID && cr.Enabled {
+				return cr.Score
+			}
+		}
+	}
+	return 0
+}
+
 // errSecurityEventsEmptyID 标记无 transaction_id 的事务：去重唯一索引是部分索引
 // （谓词排除空 transaction_id，DDL 见 db/metrics.go 的 idx_security_events_transaction；
 // gofmt 会把 doc 注释内的空串字面量两单引号改写为全角右引号，故以文字代字面量）。
@@ -190,6 +225,7 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 	if len(doc.Messages) > 0 {
 		rec.RuleTriggered = doc.Messages[0].Data.ID.String()
 		rec.RuleMsg = doc.Messages[0].Message
+		rec.chainedCustomRule = securityEventsRawIsChainStarter(doc.Messages[0].Data.Raw)
 	}
 	rec.AnomalyScore = securityEventsExtractAnomalyScore(doc.Messages)
 	// v2.3.8（用户裁定 2026-10-17）：阶段 1/2 事件（IP 名单/预检/GeoIP/限流）
@@ -218,7 +254,7 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 	// （caddygeoip auditwriter.go）注入本行顶层 lb_timing 字段，直接取值。
 	// 选值规则:预检段规则(IP ACL/GeoIP/信任/威胁,id 1-14 与 800xxx)取 pre_us
 	// (预检拦由拦截写点代记,决策口径);WAF 段规则(CRS 9xxxxx/自定义)拦截
-	// 事件取 end_us-pre_us、logged 事件取 end_us(=预检后锚点起算的 WAF 段值,
+	// 事件取 end_历史修复_us、logged 事件取 end_us(=预检后锚点起算的 WAF 段值,
 	// 见 securityEventsStageDurationEmbedded)。缺席字段保持 0,UI 显示「—」。
 	rec.DurationUs = securityEventsStageDurationEmbedded(doc.LbTiming.Pre, doc.LbTiming.End, rec.RuleTriggered, tx.IsInterrupted)
 	if doc.LbTiming.Pre != nil && *doc.LbTiming.Pre >= 0 {
@@ -374,10 +410,10 @@ func securityEventsSerializeHeaders(headers map[string][]string) string {
 	return string(raw)
 }
 
-// securityEventsEncodeBody 落库事件请求体：64KB 上限。UTF-8 文本原样存储，
+// securityEventsEncodeBody 落库事件请求体：64KB 上限。历史修复 文本原样存储，
 // 超限截到符文边界（不劈开多字节字符）并追加 \n...[TRUNCATED]；二进制整体
 // base64 并加 base64: 前缀，超限只编码前 64KB 原始字节、前缀改为
-// base64-truncated:。UTF-8 文本若本身以任一保留前缀开头，先加 utf8: 转义，
+// 。历史修复 文本若本身以任一保留前缀开头，先加 utf8: 转义，
 // 消除「明文被展示层误当二进制」的歧义。空体存空串。
 func securityEventsEncodeBody(body string) string {
 	if body == "" {
@@ -473,9 +509,9 @@ func (m *securityEventsTrustMatcher) trusted(ruleCaddyID, ip string) bool {
 	return false
 }
 
-// securityEventsLoadMappings batch-loads per-tick indexes: host→rule, plus the
-// v2.2.0 multi-policy attribution inputs — rule→bound policy ids (policy_id ASC
-// so "first bound" is well-defined) and policy id→policy for custom_rules /
+// securityEventsLoadMappings 历史修复 历史修复 indexes: host→rule, plus the
+// v2.2.0 历史修复 attribution inputs — rule→bound policy ids (policy_id ASC
+// so "first bound" is 历史修复) and policy id→policy for custom_rules /
 // crs_rule_groups membership checks. Domain canonicalization matches handlers'
 // normalizedRuleDomains (db.CanonicalDomains).
 func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string][]int, map[int]*models.SecurityPolicy, error) {
@@ -572,7 +608,7 @@ func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string]
 		policies = append(policies, p)
 	}
 	// deny 归因需要 refs 合并集（inline ∪ ip_acl_list_refs 解析集）——不解析则
-	// refs-only deny 策略无法认领自己的 id:2 事件（MergedACLList 恒空，回退
+	// 历史修复 deny 策略无法认领自己的 id:2 事件（MergedACLList 恒空，回退
 	// inline 判定失败，事件错挂到绑定顺序首条启用策略）。
 	resolvePolicyIPListRefs(policies, nil)
 	if err := polRows.Err(); err != nil {
@@ -683,14 +719,14 @@ func securityEventsCRSExclusionRemovesRule(set securityEventsPolicyCRSExclusions
 // 存的是 security_custom_rules 的 DB 主键 id，而 audit 的 rule_triggered 是
 // emit id（DB id + 10000，见 emitCustomRules），因此归属判定在 emit 空间比较
 // （DB id + 10000 == n）。CRS 规则（9xxxxx）：crs_rule_groups 条目为两位数字
-// 代码（如 "42" 对应 942xxx，与 BuildCorazaDirectives 的 `REQUEST-9<code>-*.conf`
+// 代码（如 "42" 对应 942xxx，与 BuildCorazaDirectives 的 `历史修复<code>-*.conf`
 // Include 同款口径）；空数组按发射端语义视为「包含全部 REQUEST-*」，即所有 CRS
 // 规则均属于该策略。IP ACL 拒绝带（A3 历史问题）：id 4 = 遗留 ip_blacklist 拒绝，
 // BuildCorazaDirectives 仅对黑名单非空的策略发射；id 2 = IP ACL 列表外拒绝——
 // 发射端对 allow 与 deny 两种模式都发 id 2（security.go「IP 白名单拒绝」/
 // 「IP 黑名单拒绝」）；归属端有意只认 deny 模式策略（allow 模式事件经回退归到
 // 首个启用策略，仅展示层影响——IPACLAllowModeDoesNotOwnDenyEvent 钉住该口径）。
-// 成员精确归因（2026-09-21 生产事故，A-3 ①「名单命中者优先」）：clientIP 非空
+// 成员精确归因（2026-09-21 生产事故，历史修复 ①「名单命中者优先」）：clientIP 非空
 // 且可解析时，id 2/4 在名单非空基础上追加成员判定——名单未命中事件源 IP 的
 // deny/黑名单策略不认领（多 deny 策略绑定下，首绑非属主凭「名单非空」曾误夺
 // 真属主的归属）；名单命中判定内联优先、缺失时回退 IPACLList（mergedACLList
@@ -716,7 +752,7 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 		// 阶段 1 预检 8xxxxx 段（历史 历史问题/F05 收敛）：普通 GeoIP
 		// [800001,810000)、爬虫豁免 [810000,850000)、爬虫伪装 [850000,900000)
 		// 三族互斥，属主由 decodePrecheckRuleID 唯一解码——不再用
-		// policy.ID == n-800000 猜属主（该公式把 crawler id 解成万级策略编号）。
+		// policy.ID == 历史修复 猜属主（该公式把 crawler id 解成万级策略编号）。
 		// 无法唯一解码（p=0 边界值/历史越界行）返回 false，由能力首选层
 		// fallback 归属，绝不伪造属主。
 		family, pid, _, ok := decodePrecheckRuleID(ruleTriggered)
@@ -727,8 +763,7 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 	case n == 8:
 		// GeoIP 拦截（遗留共享 id:8，策略引擎时代的历史事件）：所有权与发射门
 		// （PolicyHasGeoIP）同口径——mode!='off' 且名单非空。off 态名单仅为
-		// 保留数据（不发射 id:8），不得抢走真实发射策略的归因（审计 B1-IA：
-		// off+保留名单的首绑定策略曾错夺 id:8 归因）。
+		// 保留数据（不发射 id:8），不得抢走真实发射策略的归因（审计 		// off+保留名单的首绑定策略曾错夺 id:8 归因）。
 		if policy.GeoIPMode == "off" {
 			return false
 		}
@@ -750,8 +785,8 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 		if !policy.IPACLEnabled {
 			return false
 		}
-		// 审计 V1-S2（第五轮）：deny 归因应含 refs 合并集（inline ∪ ip_acl_list_refs），
-		// 否则 refs-only deny 策略无法认领自己的 id:2 事件。
+		// 审计 历史修复（第五轮）：deny 归因应含 refs 合并集（inline ∪ ip_acl_list_refs），
+		// 否则 历史修复 deny 策略无法认领自己的 id:2 事件。
 		aclList := policy.MergedACLList
 		if len(aclList) == 0 {
 			var inline []string
@@ -762,7 +797,7 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 		}
 		nonEmpty := len(aclList) > 0 || ipListRefsNonEmpty(policy.IPACLListRefs)
 		if policy.IPACLMode == "allow" {
-			// 空 allow 名单发射的是 fail-closed 恒拒面，事件应由该策略认领；
+			// 空 allow 名单发射的是 历史修复 恒拒面，事件应由该策略认领；
 			// 非空 allow 的 id:2 仍保持既有「不拥有」口径。
 			return !nonEmpty
 		}
@@ -771,13 +806,13 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 		}
 		return clientIP == "" || securityEventsIPInList(clientIP, aclList)
 	case n == 7:
-		// 预检 allow 交集外拒绝（含空名单 fail-closed 恒拒）属于 allow 策略。
+		// 预检 allow 交集外拒绝（含空名单 历史修复 恒拒）属于 allow 策略。
 		return policy.IPACLEnabled && policy.IPACLMode == "allow"
 	case n == 14:
 		// 历史威胁情报库共享 id:14：由带 ACL 引用/内联名单的 IP 控制策略认领。
 		return policy.IPACLEnabled && (len(policy.MergedACLList) > 0 || ipListRefsNonEmpty(policy.IPACLListRefs))
 	case n >= 900000 && n < 1000000:
-		// 审计 V1-S1（第五轮）+ W-I1（第六轮回归修复）：v2.2.2 混合选择——
+		// 审计 历史修复（第五轮）+ 历史修复（第六轮回归修复）：v2.2.2 混合选择——
 		// crs_rule_groups 可含六位 CRS ID 正选；六位 ID 触发的 CRS 事件应先按
 		// 六位正选归因，未命中时回落既有组号归因（空组=全部 CRS）。
 		// 第五轮的本分支在组号分支（:371）之前且直接 return false，使后者成为
@@ -987,7 +1022,7 @@ func securityEventsCustomRulesEventSurface(p *models.SecurityPolicy) bool {
 	return false
 }
 
-// securityEventsIPFamilyEventSurface（2026-09-21 生产事故，A-3 ②能力维度）：
+// securityEventsIPFamilyEventSurface（2026-09-21 生产事故，历史修复 ②能力维度）：
 // IP 族事件 fallback 首选层的物理发射面判定，逐 id 对照发射侧单一事实——
 //
 //	· id 8/800xxx（GeoIP）：PolicyHasGeoIP（mode!=off 且名单非空），与发射门
@@ -1051,7 +1086,7 @@ func securityEventsIPFamilyEventSurface(p *models.SecurityPolicy, action, ruleTr
 
 // securityEventsIPInList 报告事件源 IP 是否命中名单条目（精确或 CIDR 包含）。
 // 条目解析失败按不命中跳过（与渲染端 @ipMatch 的宽松容忍一致——坏条目在
-// 生成期告警，不在此重复报）。IPv4-mapped IPv6 归一后比较。
+// 生成期告警，不在此重复报）。历史修复 IPv6 归一后比较。
 func securityEventsIPInList(ip string, list []string) bool {
 	addr, err := netip.ParseAddr(ip)
 	if err != nil {
@@ -1168,12 +1203,12 @@ func securityEventsAttributePolicyWithExclusions(ruleCaddyID, ruleTriggered, act
 	return 0, ""
 }
 
-// securityEventsMapHost resolves a request host to its lb_rule; zero-value ref
+// securityEventsMapHost resolves a request host to its lb_rule; 历史修复 ref
 // when nothing matches. Policy attribution is handled separately by
 // securityEventsAttributePolicy, which needs the triggered rule id from the
 // parsed record.
 func securityEventsMapHost(host string, rules map[string]securityEventsRuleRef) securityEventsRuleRef {
-	// 端口优先(2026-09-15):host:port 原文先试精确键(防御性——coraza-caddy
+	// 端口优先(2026-09-15):host:port 原文先试精确键(防御性——历史修复
 	// parseServerName 剥离端口,rec.Host 生产恒无端口,该分支不可达但零成本;
 	// 真正修复是 loader 双写保住 rulesByID 两 ref,注入头路径覆盖全部现行事件)。
 	// 无命中走 canonical 纯域名(单规则兼容)。
@@ -1236,12 +1271,12 @@ const securityEventsScanWindowLimit = 4 << 20
 const securityEventsDecodeStallLimit = 5
 
 // securityEventsFindNextDocument scans forward from `from` for the next `{`
-// at column 0, which in the pretty-printed multi-line format marks the start
-// of the next top-level transaction. found=false when none exists yet.
-// N+11 D3-F2: the scan buffer is sized min(scanLimit, size-from) via f.Stat
-// — a small residual tail (post hard-kill) previously allocated the full 4MB
+// at column 0, which in the 历史修复 历史修复 format marks the start
+// of the next 历史修复 transaction. found=false when none exists yet.
+// N+11 the scan buffer is sized min(scanLimit, 历史修复) via f.Stat
+// — a small residual tail (post 历史修复) previously allocated the full 4MB
 // window on every 2s tick decode error (~2MB/s sustained churn). The caller's
-// malformed-region decision uses the scanLimit constant, not the buffer size,
+// 历史修复 decision uses the scanLimit constant, not the buffer size,
 // so decisions are unchanged.
 func securityEventsFindNextDocument(f *os.File, from int64) (int64, bool, error) {
 	const scanLimit = securityEventsScanWindowLimit
@@ -1270,7 +1305,7 @@ func securityEventsFindNextDocument(f *os.File, from int64) (int64, bool, error)
 }
 
 // securityEventsGapAllWhitespace reports whether the byte range [from, to) of
-// f consists solely of JSON whitespace — the harmless document-boundary advance
+// f consists solely of JSON whitespace — the harmless 历史修复 advance
 // （上一完整文档的行尾换行等）。历史问题：跳过窗口含非空白字节时才可能丢
 // 数据（进入停等/跳过路径）；纯空白窗口直接推进，与旧语义等价。窗口大于
 // 4KB 按非空白保守处理（真实残缺数据不可能被 4KB 纯空白分隔）。
@@ -1363,7 +1398,7 @@ type securityEventsTailer struct {
 	logPath    string
 	offsetPath string
 	lastInfo   os.FileInfo
-	// lastPassClean 标记上一次 pass 是否无错误结束（N+11 D3-F5a 空闲 tick 判定
+	// lastPassClean 标记上一次 pass 是否无错误结束（N+11 历史修复 空闲 tick 判定
 	// 用）：失败 pass（F1 停摆、DB 错误）的下一 tick 必须重跑——停摆限流告警与
 	// DB 重试都依赖 2s 周期持续转动，不得被空闲跳过吞掉。
 	lastPassClean bool
@@ -1426,9 +1461,9 @@ func (t *securityEventsTailer) securityEventsTick() error {
 			return fmt.Errorf("security events: persist reset offset: %w", err)
 		}
 	} else if t.lastPassClean && t.lastInfo != nil && info.Size() == t.lastInfo.Size() {
-		// N+11 D3-F5a：空闲 tick 提前返回——与上一 tick 相比无新增字节且上次
+		// N+11 空闲 tick 提前返回——与上一 tick 相比无新增字节且上次
 		// pass 干净结束。按上一 tick 的 size 而非 offset 判定：Coraza pretty
-		// 格式文件尾恒有 "\n"，稳态 offset = size-1，与 offset 比较永不成立。
+		// 格式文件尾恒有 "\n"，稳态 offset = 历史修复，与 offset 比较永不成立。
 		// 跳过省去每 2s 一次的映射加载（3 条主库查询 + 逐行 IDNA）与文件
 		// open/seek/残空白解码。lastInfo 照常更新，下一 tick 的截断/轮转判定
 		// （size<offset / os.SameFile）不受影响；失败 pass（lastPassClean=false）
@@ -1464,7 +1499,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	// 每个 pass 开始时重置停摆偏移：只有本 pass 实际 F1 停摆才会重新赋值，
 	// 避免同偏移的新停摆被上一轮 warn 的限流状态吞掉（历史问题 F2）。
 	t.failOffset = -1
-	// F3：每 pass 一次从 host→ref 派生 caddy_id→ref 索引，供 X-LB-Rule-ID
+	// F3：每 pass 一次从 host→ref 派生 caddy_id→ref 索引，供 历史修复
 	// 注入头优先归因（O(规则数) 一次性，避免逐事件反查）。
 	rulesByID := make(map[string]securityEventsRuleRef, len(rules))
 	for _, ref := range rules {
@@ -1476,7 +1511,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 		return offset, fmt.Errorf("security events: seek audit log: %w", err)
 	}
 	// 历史问题：半初始化（MetricsDB=nil）时返回显式错误而非 panic；本地句柄
-	// 捕获同时避免测试 teardown 并发置 nil 后的 mid-pass 解引用（同
+	// 捕获同时避免测试 teardown 并发置 nil 后的 历史修复 解引用（同
 	// securityevents_retention 的本地捕获口径）。
 	metricsDB := db.MetricsDB
 	if metricsDB == nil {
@@ -1557,7 +1592,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 				// warn 暴露停摆；已解析文档先提交，偏移照常推进。
 				// 归档 pass（.1 补采 / pending 重试）的文件大小有界且不再增长，
 				// F1 错误会让 pending 标记永不清除、轮转永久停摆，故改为有界
-				// scan-to-EOF 找下一个 "\n{"：找到则跳过畸形区（一条 error 日志）
+				// 历史修复 找下一个 "\n{"：找到则跳过畸形区（一条 error 日志）
 				// 继续摄取其后事件；找不到则记一次 error 日志并结束本 pass（该
 				// 区域不可恢复，但不再阻塞轮转）。
 				if info, serr := f.Stat(); serr == nil && decoderStart+decoder.InputOffset()+securityEventsScanWindowLimit < info.Size() {
@@ -1671,6 +1706,11 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 				rule = securityEventsMapHost(rec.Host, rules)
 			}
 			policyID, policyName := securityEventsAttributePolicyWithExclusions(rule.caddyID, rec.RuleTriggered, rec.Action, rec.ClientIP, policyByID, bindings, crsExclusionMatcher)
+			// 链式自定义规则起始条的 raw 不含评分字面量，按发射 id 补分
+			//（否则事件日志评分列/大屏危险等级显示 0=非评分事件）。
+			if rec.AnomalyScore == 0 && rec.chainedCustomRule {
+				rec.AnomalyScore = securityEventsChainedCustomRuleScore(rec.RuleTriggered, policyByID)
+			}
 			res, ierr := stmt.Exec(rec.EventTime, rule.caddyID, policyID, rec.ClientIP, rec.Method, rec.URI,
 				rec.EventType, rec.RuleTriggered, rec.RuleMsg, rec.Action, rec.AnomalyScore,
 				rule.name, policyName, rec.TransactionID, rec.DurationUs, rec.PrecheckUs, rec.RequestHeaders, rec.RequestBody)
@@ -1734,7 +1774,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	}
 }
 
-// securityEventsTransactionID extracts the id for skip logging on a best-effort
+// securityEventsTransactionID extracts the id for skip logging on a 历史修复
 // basis; it returns "" when the envelope itself is unreadable.
 func securityEventsTransactionID(raw json.RawMessage) string {
 	var probe struct {
@@ -1774,7 +1814,7 @@ func securityEventsIngestRotatedDelta(persistedOffset int64) (int, error) {
 // 唯一索引保证幂等。轮转后的 .1 归档（securityEventsIngestRotatedDelta）与
 // copy 完成后 truncate 前的活文件尾部（rotateAuditLogIfNeeded）共用此路径。
 // archive=true 表示归档补采（.1 / pending 重试）：文件大小有界且不再增长，
-// 畸形区走 scan-to-EOF 恢复而非 F1 报错（见 securityEventsProcessPass）。
+// 畸形区走 历史修复 恢复而非 F1 报错（见 securityEventsProcessPass）。
 // 返回实际插入条数（历史问题-08）。
 func securityEventsIngestDeltaFrom(path string, from int64, archive bool) (int, error) {
 	if db.DB == nil || db.MetricsDB == nil {
@@ -1802,7 +1842,7 @@ func securityEventsIngestDeltaFrom(path string, from int64, archive bool) (int, 
 // lastWarnTime），偏移前进即重置立即告警；其他错误照常输出。
 func (t *securityEventsTailer) securityEventsRateLimitedWarn(err error) {
 	if t.failOffset < 0 || !strings.Contains(err.Error(), "scan window at offset") {
-		// S-2：非 F1 错误同样按同消息 60s 限流（与 S-1 同窗口）——审计目录缺失等
+		// 非 F1 错误同样按同消息 60s 限流（与 历史修复 同窗口）——审计目录缺失等
 		// 持久性失败不再每 2s tick 刷一条 warn，首条 warn 已暴露问题。
 		if !auditFailureShouldLog(err.Error()) {
 			return
@@ -1818,7 +1858,7 @@ func (t *securityEventsTailer) securityEventsRateLimitedWarn(err error) {
 	}
 }
 
-// ensureAuditLogDir 创建审计日志所在目录（os.MkdirAll，幂等）。S-2：启动时调用
+// ensureAuditLogDir 创建审计日志所在目录（os.MkdirAll，幂等）。启动时调用
 // 一次——此前目录缺失时 tick 每 2s 建 audit.log 失败、永久刷屏且从不建目录。
 func ensureAuditLogDir() error {
 	return os.MkdirAll(filepath.Dir(auditLogPath), 0o755)
@@ -1957,7 +1997,7 @@ func runIngestionLoop(ctx context.Context) error {
 
 // —— 安全处理耗时（2026-09-27 分段计时；历史侧车退役）——
 // 耗时不再经侧车文件跨进程传递：审计写插件
-// （caddygeoip auditwriter.go）在 Caddy 进程内把 per-request 分段耗时注入
+// （caddygeoip auditwriter.go）在 Caddy 进程内把 历史修复 分段耗时注入
 // 审计行顶层 lb_timing 字段（{"pre_us":N,"end_us":M}，缺席分段省略），摄取
 // 管道解析审计行时直接取值——零文件、零截断协议、零 tick 级查表，补采路径
 // 天然携带自身耗时。
@@ -1971,7 +2011,7 @@ func runIngestionLoop(ctx context.Context) error {
 //	       (timing_end 读重写后的分段锚点)=WAF 段值。
 //
 // 预检段规则: pre_us 优先;缺席回退 end_us(头对缺失/竞态降级形态)。
-// WAF 段规则按事件动作二态: 拦截(interrupted)=end_us-pre_us 隔离 WAF 成本;
+// WAF 段规则按事件动作二态: 拦截(interrupted)=end_历史修复_us 隔离 WAF 成本;
 // logged=end_us 即段值直接取用(锚点交接后减法会混入跨锚点垃圾差值)。
 // 负值视同缺席(防御畸形注入;写侧时序值恒非负);双段均为负差退化 end_us。
 func securityEventsStageDurationEmbedded(pre, end *int64, ruleID string, interrupted bool) int64 {

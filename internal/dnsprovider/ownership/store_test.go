@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -93,7 +94,7 @@ func TestStore_MatchingValue_includes_legacy_entries_best_effort(t *testing.T) {
 		t.Fatalf("matching value: %v", err)
 	}
 
-	// Then: the legacy entry (empty value) is included best-effort; the live
+	// Then: the legacy entry (empty value) is included 历史修复; the live
 	// beta record is not
 	if len(matching) != 1 {
 		t.Fatalf("matching=%v, want legacy entry only", matching)
@@ -163,7 +164,7 @@ func TestStore_MatchingValue_empty_value_falls_back_to_name_match(t *testing.T) 
 		t.Fatalf("matching value: %v", err)
 	}
 
-	// Then: legacy name-based semantics return both
+	// Then: legacy 历史修复 semantics return both
 	if len(matching) != 2 {
 		t.Fatalf("matching=%v, want both records", matching)
 	}
@@ -295,7 +296,7 @@ func TestStore_quarantines_unsupported_version_state_file(t *testing.T) {
 		t.Fatalf("add after version mismatch: %v", err)
 	}
 
-	// Then: the future-version file was quarantined, not silently reset
+	// Then: the 历史修复 file was quarantined, not silently reset
 	quarantined, err := filepath.Glob(store.path + ".corrupt-*")
 	if err != nil {
 		t.Fatalf("glob quarantined files: %v", err)
@@ -308,7 +309,7 @@ func TestStore_quarantines_unsupported_version_state_file(t *testing.T) {
 	}
 }
 
-// DNS-87-F11（历史）：隔离文件名原为秒级时间戳——同一秒内二次损坏时
+// 历史修复（历史）：隔离文件名原为秒级时间戳——同一秒内二次损坏时
 // os.Rename 覆盖上一份隔离文件（POSIX rename 语义），取证样本丢失。判定用
 // 固定时钟（corruptClock 接缝）制造同刻碰撞：两轮损坏必须留下两份独立样本。
 func TestStore_quarantineKeepsDistinctSamplesOnClockCollision(t *testing.T) {
@@ -349,7 +350,7 @@ func TestStore_quarantineKeepsDistinctSamplesOnClockCollision(t *testing.T) {
 func TestStore_concurrent_stores_mixed_operations(t *testing.T) {
 	// Given: two Store instances over the same file (writer plus a
 	// restarted reader) and concurrent goroutines mixing Add / Remove /
-	// MatchingValue; the package-level fileMu must serialize every access
+	// MatchingValue; the 历史修复 fileMu must serialize every access
 	dir := t.TempDir()
 	storeA, err := New(dir)
 	if err != nil {
@@ -386,7 +387,7 @@ func TestStore_concurrent_stores_mixed_operations(t *testing.T) {
 					return
 				}
 				if i%2 == 0 {
-					// Remove must receive the disk-round-tripped record (as
+					// Remove must receive the 历史修复 record (as
 					// the providers do via MatchingValue): the local struct's
 					// CreatedAt keeps nanosecond precision and would not
 					// compare equal after the JSON round trip
@@ -415,7 +416,7 @@ func TestStore_concurrent_stores_mixed_operations(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Then: the final file decodes and holds exactly the never-removed
+	// Then: the final file decodes and holds exactly the 历史修复
 	// records — odd iterations of every goroutine, each exactly once
 	records := readStoreRecords(t, storeA)
 	got := make(map[string]int, len(records))
@@ -440,7 +441,7 @@ func TestStore_concurrent_stores_mixed_operations(t *testing.T) {
 
 // 历史问题（历史）：Remove 的相等判定必须按语义（CreatedAt.Equal）——
 // Record 内联 == 比较含 time.Time 的表示细节（monotonic 位、loc 指针），
-// 语义相同的记录被判不等 → Remove 静默 no-op，记录永久残留两种真实形态：
+// 语义相同的记录被判不等 → Remove 静默 历史修复，记录永久残留两种真实形态：
 //  1. 调用方持有写入时的原值（time.Now() 带 monotonic）与文件读回值比较；
 //  2. 文件记录时区与当前进程 Local 不同（时区设置变更后重启）——两侧各
 //     解析出独立 FixedZone 指针。
@@ -464,7 +465,7 @@ func TestStore_Remove_semantic_match_after_reload(t *testing.T) {
 			if err := store.Remove(record); err != nil {
 				t.Fatalf("remove: %v", err)
 			}
-			// Then：语义相等的记录必须被删除（旧内联 == 比较 no-op 残留）。
+			// Then：语义相等的记录必须被删除（旧内联 == 比较 历史修复 残留）。
 			if records := readStoreRecords(t, store); len(records) != 0 {
 				t.Fatalf("语义相等的记录未被删除（Remove no-op）：%+v", records)
 			}
@@ -485,7 +486,7 @@ func TestReplace_sharesStoreLockAndPreservesStateOnInvalidSnapshot(t *testing.T)
 	}
 
 	// When：Store 的读写锁被持有时，快照替换必须等待同一把锁。
-	// DNS-87-F6（历史）：原形态只用 50ms 固定窗口判定「未返回」——负载高
+	// 历史修复（历史）：原形态只用 50ms 固定窗口判定「未返回」——负载高
 	// 时 goroutine 尚未走到 fileMu.Lock() 也会静默通过（锁共享断言变成空
 	// 断言）。现按可观察副作用判定：锁内文件内容必须保持原快照，解锁后必须
 	// 变成 replacement；Replace 自身先取锁再解码，锁前准备工作为零。
@@ -539,5 +540,78 @@ func TestReplace_sharesStoreLockAndPreservesStateOnInvalidSnapshot(t *testing.T)
 	}
 	if records := readStoreRecords(t, store); len(records) != 2 {
 		t.Fatalf("records=%+v, want replacement plus newly added record", records)
+	}
+}
+
+// Account 是 Remove 相等判定的一部分——同一 name/value/
+// record_id 但账户不同的两条记录（换凭据后的历史残留 vs 当前账户条目）必须
+// 各自可独立移除，丢弃一条不得连带删掉另一条。
+func TestStore_Remove_keepsOtherAccountEntryWithSameRecordID(t *testing.T) {
+	store := newStore(t)
+	createdAt := time.Now().Add(-2 * time.Hour)
+	legacy := Record{Provider: "dnspod", Zone: "example.com", FQDN: "_acme-challenge.example.com.",
+		Value: "alpha", RecordID: "500", CreatedAt: createdAt}
+	current := legacy
+	current.Account = AccountDigest("id,token")
+	for _, record := range []Record{legacy, current} {
+		if err := store.Add(record); err != nil {
+			t.Fatalf("add %+v: %v", record, err)
+		}
+	}
+
+	// When：丢弃他账户条目（legacy）
+	if err := store.Remove(legacy); err != nil {
+		t.Fatalf("remove legacy: %v", err)
+	}
+
+	// Then：本账户条目仍在
+	records := readStoreRecords(t, store)
+	if len(records) != 1 || records[0].Account != AccountDigest("id,token") {
+		t.Fatalf("records=%+v, want 仅保留本账户条目", records)
+	}
+}
+
+// 账户归属判定表（dnspod/tencent 两厂商共用单源）。
+func TestDecideRemoval_table(t *testing.T) {
+	now := time.Now()
+	stale := now.Add(-2 * time.Hour)
+	recent := now.Add(-time.Minute)
+	const mine = "mine0000"
+	for _, tc := range []struct {
+		name   string
+		record Record
+		want   Disposition
+	}{
+		{"本账户新条目可删", Record{Account: mine, CreatedAt: recent}, DispositionDelete},
+		{"本账户陈旧条目可删", Record{Account: mine, CreatedAt: stale}, DispositionDelete},
+		{"他账户条目只丢弃", Record{Account: "other000", CreatedAt: stale}, DispositionDrop},
+		{"他账户新条目同样只丢弃", Record{Account: "other000", CreatedAt: recent}, DispositionDrop},
+		{"legacy 在途条目保持删除语义", Record{CreatedAt: recent}, DispositionDelete},
+		{"legacy 陈旧条目只丢弃", Record{CreatedAt: stale}, DispositionDrop},
+		{"零值时间 legacy 不判陈旧", Record{}, DispositionDelete},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DecideRemoval(tc.record, mine, now); got != tc.want {
+				t.Fatalf("DecideRemoval = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	// 调用方未声明账户：legacy 宽松、带账户条目无法证明归属
+	if got := DecideRemoval(Record{Account: mine, CreatedAt: recent}, "", now); got != DispositionDrop {
+		t.Fatalf("未声明账户时带账户条目处置=%v, want Drop", got)
+	}
+}
+
+// 账户摘要不落凭据明文且同凭据稳定（所有权文件是明文 JSON）。
+func TestAccountDigest_stableAndOpaque(t *testing.T) {
+	first := AccountDigest("id,token")
+	if first != AccountDigest("id,token") {
+		t.Fatal("同一凭据的摘要不稳定")
+	}
+	if first == AccountDigest("id,othertoken") {
+		t.Fatal("不同凭据得到相同摘要")
+	}
+	if strings.Contains(first, "token") || len(first) != 8 {
+		t.Fatalf("digest=%q, want 8 位十六进制且不含凭据明文", first)
 	}
 }

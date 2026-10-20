@@ -61,6 +61,10 @@ export const useAuthStore = defineStore('auth', () => {
   // FE-70-8：cert_renewal_days 并入 /config 消费面（CertJobs 曾挂载整取单键）；
   // ≤0（含 0）时按 30 展示，与后端口径对齐
   const certRenewalDays = ref(30)
+  // 与 cert_renewal_days 同源：mfa_write_guard 随 /config 投影（Users 页曾为此
+  // 单独挂载整取 GET /config 单键，与 15s 轮询的 /config 请求重复）。
+  // 首值 false = 守卫关闭的保守形态（读取失败/未就绪时对话框维持验码形态）。
+  const mfaWriteGuard = ref(false)
   const loading = ref(false)
   const intentionalLogout = ref(false)
   const currentPage = ref<PageId>(initialCurrentPage)
@@ -178,12 +182,13 @@ export const useAuthStore = defineStore('auth', () => {
   async function fetchConfig(silent = false) {
     if (!token.value) return
     try {
-      const res = await request.get<APIResponse<{ readonly is_master: boolean; readonly timezone?: string; readonly cert_renewal_days?: number }>>('/config', { silent })
+      const res = await request.get<APIResponse<{ readonly is_master: boolean; readonly timezone?: string; readonly cert_renewal_days?: number; readonly mfa_write_guard?: boolean }>>('/config', { silent })
       if (res.data) {
         nodeMode.value = res.data.is_master ? 'master' : 'slave'
         if (res.data.timezone) timezone.value = res.data.timezone
         const renewalDays = res.data.cert_renewal_days ?? 30
         certRenewalDays.value = renewalDays > 0 ? renewalDays : 30
+        mfaWriteGuard.value = res.data.mfa_write_guard === true
         scheduleConfigRetry()
       } else {
         scheduleConfigRetry()
@@ -351,6 +356,7 @@ interface LoginResult {
     nodeMode,
     timezone,
     certRenewalDays,
+    mfaWriteGuard,
     loading,
     intentionalLogout,
     currentPage,

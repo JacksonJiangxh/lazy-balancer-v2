@@ -521,7 +521,7 @@ func validateConvertedV1Rules(rules []convertedRule, portGates ...func(string, i
 			rule.TLSCert, rule.TLSKey = "", ""
 			normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）：TCP 规则不支持入站 TLS，已按关闭 TLS 导入", index+1, rule.Name))
 		}
-		// 历史问题 F-C: v1 SSL 规则导入后 tls_source 恒为 manual（tlsSource()）；启用但
+		// 历史问题 v1 SSL 规则导入后 tls_source 恒为 manual（tlsSource()）；启用但
 		// 证书/私钥为空的规则会在 TLS 端口明文服务（镜像 rule_features.go 保存/启用侧
 		// 口径），按 v1 风格软跳过并警告而非整包拒绝。
 		if rule.Enabled && rule.Protocol == "http" && rule.EnableTLS &&
@@ -644,14 +644,14 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: "备份文件格式不正确: " + err.Error()}})
 			return
 		}
-		// CERT41-1:与 ImportConfigBackup 同序——lbbak 的分类选择经 ?sections=
+		// 与 ImportConfigBackup 同序——lbbak 的分类选择经 ?sections=
 		// query 传输(JSON 备份以体内 sections 字段为准)。
 		if lbbakPayloadFromCtx(c) != nil {
 			if sel := parseSectionsParam(c.Query("sections")); len(sel) > 0 {
 				backup.Sections = sel
 			}
 		}
-		// CERT41-1:validateV2Backup 会回填缺失表(校验均匀性),快照真实携带
+		// validateV2Backup 会回填缺失表(校验均匀性),快照真实携带
 		// 表集——缺席还原与反向悬挂降级口径都依赖「备份原本是否携带」。
 		exportedTables := map[string]bool{}
 		for table := range backup.Tables {
@@ -663,14 +663,14 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
-		// CERT41-1:与 ImportConfigBackup 同序——还原「缺席」语义,回填表不得
+		// 与 ImportConfigBackup 同序——还原「缺席」语义,回填表不得
 		// 被当作「清空本地表」参与校验/汇总。
 		for table := range backup.Tables {
 			if !exportedTables[table] {
 				delete(backup.Tables, table)
 			}
 		}
-		// CERT41-1:与 ImportConfigBackup 同序——sections 过滤前置到全部形态/
+		// 与 ImportConfigBackup 同序——sections 过滤前置到全部形态/
 		// 任务校验之前:①未选分类的坏行预览不误报;②ACME 引用「备份有表按
 		// 备份行、缺表按 live」自动等于「过滤后导入表∪live 保留表」正确口径;
 		// 未选系统数据时全局配置区不参与校验。
@@ -740,7 +740,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		}
 		// 历史问题 历史问题：与 ImportConfigBackup 同序——TLS 形态校验在冲突置禁用之后
 		// 执行，预览结果与实际导入一致（冲突可自愈备份不得在预览误报不可导入）。
-		// CERT41-1:与 ImportConfigBackup 同序——「导规则不导 cert 配置且备份
+		// 与 ImportConfigBackup 同序——「导规则不导 cert 配置且备份
 		// 从未携带 cert 表」方向按 live 解析失败的 ACME 引用降级为悬挂警告。
 		softLiveACMERefs := sectionTables["lb_rules"] &&
 			!sectionTables["certificate_configs"] && !sectionTables["ca_providers"] &&
@@ -785,7 +785,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		}
 		// 2026-09-18 用户裁定:操作者缺席不再阻断——降级为预览 warning(分类
 		// 未选系统数据时操作者不受影响;选了也尊重用户选择)。
-		// CERT41-1:同序后 sections 已知——未选系统数据/备份 users 缺席不再误告
+		// 同序后 sections 已知——未选系统数据/备份 users 缺席不再误告
 		// (与导入侧 历史问题-F3 口径一致)。
 		validateWarnings := skipWarnings[:0:0]
 		validateWarnings = append(validateWarnings, skipWarnings...)
@@ -798,7 +798,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		if importUsername := c.GetString("username"); importUsername != "" && sectionTables["users"] && len(backup.Tables["users"]) > 0 && !backupContainsUsername(backup.Tables["users"], importUsername) {
 			validateWarnings = append(validateWarnings, "备份不包含当前操作账户——若导入时勾选“系统数据”，导入后请使用备份内的管理员账户登录")
 		}
-		// CERT41-1:反向悬挂降级警告进预览(与导入 responseWarnings 同文案)。
+		// 反向悬挂降级警告进预览(与导入 responseWarnings 同文案)。
 		if acmeDanglingImported > 0 {
 			validateWarnings = append(validateWarnings, fmt.Sprintf("导入后 %d 条启用规则的 DNS 提供商配置悬挂（引用未随备份导入，且现有配置中不存在或已禁用）——下一次签发/续签将失败，请及时补齐", acmeDanglingImported))
 		}
@@ -816,7 +816,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 					validateWarnings = append(validateWarnings, "lbbak 含威胁库名单文件（完整性已校验）——导入「安全防护」将落盘名单文件；本包不含 CRS/IP2Region 数据文件")
 				}
 			}
-			// F-B1（历史）：manifest 未登记的威胁库条目——预览/导入
+			// 历史修复（历史）：manifest 未登记的威胁库条目——预览/导入
 			// 同文案告警（不拒绝，老备份兼容）。
 			if len(payload.UnregisteredThreatEntries) > 0 {
 				warning := fmt.Sprintf("lbbak 含 manifest 未登记的威胁库条目（%s）——内容未经完整性校验，已按原样落盘；建议核实来源后重新导出备份", strings.Join(payload.UnregisteredThreatEntries, "、"))
@@ -826,7 +826,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 				validateWarnings = append(validateWarnings, warning)
 			}
 		}
-		// SYS-U4（历史，已声明例外）：本剔除步位于全部校验器之后，与导入侧
+		// 历史修复（历史，已声明例外）：本剔除步位于全部校验器之后，与导入侧
 		//（ImportConfigBackup 在行级校验之前剔除）顺序不一致——「导入/预览双路径
 		// 同序」不变量的有意例外：现存校验器均不读 security_crs_version/
 		// security_ip2region_version 两行表（历史逐函数核实），剔除先后无可观察
@@ -923,6 +923,10 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件读取失败: " + err.Error()})
 		return
 	}
+	// BOM 剥离先于魔数检测——与 validate/v2 两路径同序。
+	// 此前 BOM+lbbak 请求绕过 lbbak 指引、落入「不是有效的 JSON」，提示失真
+	// （安全面本就拒绝，仅语义质量）。BOM 与 gzip 魔数不冲突。
+	body = bytes.TrimPrefix(body, []byte("\xef\xbb\xbf"))
 	// lbbak(tar.gz)是 V2 形态:提前给出正确端点指引,避免落入 JSON 解析
 	// 「不是有效的 JSON」困惑(安全面本就必拒,仅提示质量)。
 	if len(body) > 2 && body[0] == 0x1f && body[1] == 0x8b {
@@ -933,7 +937,6 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件内容为空"})
 		return
 	}
-	body = bytes.TrimPrefix(body, []byte("\xef\xbb\xbf"))
 	var v1 v1Backup
 	if err := json.Unmarshal(body, &v1); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件不是有效的 JSON"})
@@ -1041,7 +1044,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		}
 		imported++
 	}
-	// CL-3（历史）：v1 导入此前是规则归一四面（导出/从端落库/v2 备份
+	// 历史修复（历史）：v1 导入此前是规则归一四面（导出/从端落库/v2 备份
 	// 导入/此处）中唯一事务内零归一的写路径——转换器对 BackendDomain/Gzip 无
 	// 协议门，TCP 行可携带 host_header/enable_compress/compress_types 死值落库。
 	// INSERT 后统一调与 v2 备份导入共享的 normalizeRuleRowsForTransport（单一

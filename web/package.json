@@ -8,8 +8,9 @@
   "scripts": {
     "dev": "vite",
     "test": "node --test tests/*.spec.ts",
-    "typecheck:test": "vue-tsc -p tsconfig.test.json --noEmit",
-    "build": "npm test && npm run typecheck:test && vite build",
+    "typecheck:test": "vue-tsc -p tsconfig.test.json --noEmit && tsc -p tsconfig.node.json",
+    "build:vite": "vite build",
+    "build": "npm test && npm run typecheck:test && npm run build:vite",
     "preview": "vite preview"
   },
   "dependencies": {

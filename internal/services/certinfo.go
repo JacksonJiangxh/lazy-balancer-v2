@@ -24,7 +24,7 @@ func SelectRuleCertificate(candidates []CertificateCandidate, ruleDomains string
 // CertDaysRemaining 证书剩余天数单源（历史 CERT 域冗余收敛：原
 // certjobs/certinfo/certificates/admintls/helpers 五份同表达式——历史问题 的
 // -int(Ceil(-x)) 与 历史问题 真截断逐值恒等，表达式已统一，本函数固化单一出口）。
-// 口径=向零截断（CERT42-3/历史问题 D-2：未过期 23h→0、过期 1 天 3 小时→-1）；
+// 口径=向零截断（历史修复/历史问题 未过期 23h→0、过期 1 天 3 小时→-1）；
 // 过期判定勿以返回值 ≤0 兼判（-1h 过期返回 0），另用 !now.Before(notAfter)。
 func CertDaysRemaining(notAfter, now time.Time) int {
 	return int(notAfter.Sub(now).Hours() / 24)
@@ -48,12 +48,12 @@ func CertificateExpiryStatus(notAfter, now time.Time, thresholdDays int) string 
 // GetCertExpiryThreshold returns the configured cert expiry warning threshold in days.
 // 库值唯一真相（批 3）：cert_expiry_days 类型①值型列直读（COALESCE 兜底
 // 删除）——NULL/<=0 由启动回填（db.go defaultUpdates）收敛；此处的降级分支
-// 仅覆盖带外直写/读故障，两分支均 error 级显性留痕后按 CERT42-5 读故障族
+// 仅覆盖带外直写/读故障，两分支均 error 级显性留痕后按 历史修复 读故障族
 // 口径取治理默认 db.DefaultCertExpiryDays（R2，历史：降级取值/日志文本
 // 全部单源到常量，禁字面量回流——见 handlers/config_get_test.go 消费点族扫描）。
-// 对任务/展示类消费方 fail-visible=日志留痕，不静默。
+// 对任务/展示类消费方 历史修复=日志留痕，不静默。
 func GetCertExpiryThreshold() int {
-	// SVC-F2（历史）：同包多数配置读取 helper 有 db.DB==nil 守卫——
+	// 历史修复（历史）：同包多数配置读取 helper 有 db.DB==nil 守卫——
 	// 未初始化库回退默认值，不得 nil deref（当前不可达，防御性一致）。
 	if db.DB == nil {
 		return db.DefaultCertExpiryDays
@@ -78,12 +78,12 @@ func GetCertExpiryThreshold() int {
 // GetCertRenewalDays returns the configured certificate renewal window in days.
 // 历史问题-2（历史）：cert_renewal_days 读取收敛到本 helper（原四处内联：
 // certificates.go 启动恢复/续签巡检/首发失败重试 + certissuer.go 快速路径）。
-// CERT42-5（历史）：读取失败降级默认值必须告警——静默落 30 天默认会让
+// 历史修复（历史）：读取失败降级默认值必须告警——静默落 30 天默认会让
 // 配置读取退化无任何可观测痕迹。历史问题（历史）：库值 0/负值（带外直写/导入
 // 遗留；API 与导入下界已钳到 1）同属「读侧带外防线」，降级 30 天时必须 error
 // 级留痕库值，禁止静默改写。
 func GetCertRenewalDays() int {
-	// SVC-F2（历史）：未初始化库回退默认 30 天（同 GetCertExpiryThreshold）。
+	// 历史修复（历史）：未初始化库回退默认 30 天（同 GetCertExpiryThreshold）。
 	// 历史问题（历史）：读侧直读库值零兜底——启动回填保证 NULL/<=0 已收敛，
 	// 此后的无效值只可能来自运行期带外直写，显性留痕降级。
 	if db.DB == nil {
@@ -117,7 +117,7 @@ func GetCertRenewalDays() int {
 // 历史问题（历史）：与 GetCertRenewalDays 同口径——直读库值、无效值 error 级
 // 留痕（此前 <=0 静默返回 5，排障无法区分「配置为 0」与「读失败」）。
 func GetCertRenewalAttempts() int {
-	// SVC-F2（历史）：未初始化库回退默认 5 次（同 GetCertExpiryThreshold）。
+	// 历史修复（历史）：未初始化库回退默认 5 次（同 GetCertExpiryThreshold）。
 	if db.DB == nil {
 		return db.DefaultCertRenewalAttempts
 	}
@@ -141,7 +141,7 @@ func GetCertRenewalAttempts() int {
 }
 
 // FormatRuleCertInfo 从 PEM 证书内容生成展示用 RuleCertInfo——批量
-// (handlers.GetRulesCertInfo)与单规则(ParseCertInfo)两路径同用（历史问题 LBH-F7
+// (handlers.GetRulesCertInfo)与单规则(ParseCertInfo)两路径同用（历史问题 历史修复
 // 收敛：原 handlers.parseBatchRuleCertInfo 与本文件 ParseCertInfo 两份实现历史
 // 三度分叉）。参数显式化：expiryDays=expiring 阈值天数、now=判定基准（批量取
 // 统一快照，避免逐规则 time.Now 漂移）；caddyID 非空时回填。source=acme_dns 且
@@ -232,7 +232,7 @@ func ParseCertInfo(certPEM, source, ruleDomains string) *models.RuleCertInfo {
 }
 
 // GetRuleCertInfo returns parsed certificate info for a single rule.
-// SV历史问题：返回 error 仅表示读取失败（DB 故障必须 fail-visible，不得折叠成
+// SV历史问题：返回 error 仅表示读取失败（DB 故障必须 历史修复，不得折叠成
 // 「无证书信息」假成功）；「规则不存在」与「未启用 TLS」仍以 (nil, nil) 表达
 // ——handler 保持 200 + data:null 的既有契约。批量端点 GetRulesCertInfo 走
 // 另一入口（整批失败已 500），不受本签名影响。
@@ -260,7 +260,7 @@ func GetRuleCertInfo(caddyID string) (*models.RuleCertInfo, error) {
 		info.CaddyID = caddyID
 		return info, nil
 	case "acme_dns":
-		return getACMECertInfo(caddyID, ruleDomain), nil
+		return getACMECertInfo(caddyID, ruleDomain)
 	default:
 		// Fallback to manual cert if source is unrecognized but tls_cert exists
 		info := ParseCertInfo(tlsCert, tlsSource, ruleDomain)
@@ -269,9 +269,12 @@ func GetRuleCertInfo(caddyID string) (*models.RuleCertInfo, error) {
 	}
 }
 
-// getACMECertInfo returns parsed certificate info for an ACME-issued rule.
+// getACMECertInfo returns parsed certificate info for an 历史修复 rule.
 // It reads the issued certificate from cert_jobs.cert_pem.
-func getACMECertInfo(caddyID, ruleDomain string) *models.RuleCertInfo {
+// SV历史问题：与规则行读取同契约——cert_jobs 的查询/Scan/迭代失败必须上抛
+// （handler 500），不得折叠成 missingACMECertInfo「尚未签发或不存在」假成功：
+// DB 故障与「确实还没有证书」对操作者必须可区分。仅「无候选行」返回 missing。
+func getACMECertInfo(caddyID, ruleDomain string) (*models.RuleCertInfo, error) {
 	// SV历史问题：阈值/基准取一次，供候选选择与过期回退共用——此前
 	// ExpiredACMECertInfoFallback 对每个候选调用 ParseCertInfo，每候选一次
 	// global_config 读 + 重复 X509 解析。
@@ -285,7 +288,7 @@ func getACMECertInfo(caddyID, ruleDomain string) *models.RuleCertInfo {
 		ORDER BY updated_at DESC, id DESC`, caddyID)
 	if err != nil {
 		Logf("error", "GetRuleCertInfo: failed to read ACME certificates for %s: %v", caddyID, err)
-		return missingACMECertInfo(caddyID, ruleDomain)
+		return nil, fmt.Errorf("读取规则 %s 的 ACME 证书: %w", caddyID, err)
 	}
 	defer rows.Close()
 	candidates := make([]CertificateCandidate, 0)
@@ -293,7 +296,7 @@ func getACMECertInfo(caddyID, ruleDomain string) *models.RuleCertInfo {
 		var candidate CertificateCandidate
 		if err := rows.Scan(&candidate.ID, &candidate.Status, &candidate.CertPEM, &candidate.KeyPEM, &candidate.UpdatedAt, &candidate.Domain); err != nil {
 			Logf("error", "GetRuleCertInfo: failed to scan ACME certificate for %s: %v", caddyID, err)
-			return missingACMECertInfo(caddyID, ruleDomain)
+			return nil, fmt.Errorf("解析规则 %s 的 ACME 证书行: %w", caddyID, err)
 		}
 		// SV历史问题/09：预解析一次，供 SelectRuleCertificate 与过期回退共用。
 		if candidate.Status != "disabled" {
@@ -303,20 +306,20 @@ func getACMECertInfo(caddyID, ruleDomain string) *models.RuleCertInfo {
 	}
 	if err := rows.Err(); err != nil {
 		Logf("error", "GetRuleCertInfo: failed to iterate ACME certificates for %s: %v", caddyID, err)
-		return missingACMECertInfo(caddyID, ruleDomain)
+		return nil, fmt.Errorf("遍历规则 %s 的 ACME 证书: %w", caddyID, err)
 	}
 	if certPEM, selected := SelectRuleCertificate(candidates, ruleDomain, now); selected {
 		info := FormatRuleCertInfo(certPEM, "acme_dns", ruleDomain, caddyID, expiryDays, now)
-		return info
+		return info, nil
 	}
-	// CERT40-1:选中失败区分「已过期」与「尚未签发」。
+	// 选中失败区分「已过期」与「尚未签发」。
 	if info := ExpiredACMECertInfoFallback(candidates, caddyID, ruleDomain, expiryDays, now); info != nil {
-		return info
+		return info, nil
 	}
-	return missingACMECertInfo(caddyID, ruleDomain)
+	return missingACMECertInfo(caddyID, ruleDomain), nil
 }
 
-// ExpiredACMECertInfoFallback(CERT40-1/CERT42-1 共享):候选集 PEM 非空但
+// ExpiredACMECertInfoFallback(历史修复/历史修复 共享):候选集 PEM 非空但
 // SelectRuleCertificate 无一可选中时,逐个解析——首个非 disabled 且 PEM 非空
 // 的已过期候选按 expired 呈现(Error=「ACME 证书已过期」),不再误报「尚未
 // 签发或不存在」;无已过期候选(解析失败/未过期)返回 nil,调用方维持原口径。

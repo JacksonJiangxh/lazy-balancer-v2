@@ -11,7 +11,7 @@ import (
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
 )
 
-// 运行期韧性（fail-stale）：文件被删/被写坏时，在役名单不清空——继续按
+// 运行期韧性：文件被删/被写坏时，在役名单不清空——继续按
 // 最近一次成功加载的集合判定（原子投影器保证写入侧无半截文件；删除/损坏
 // 属运维事故，清空拒绝面比陈旧更危险）。
 func TestIPListFast_servesStaleOnRuntimeDelete(t *testing.T) {
@@ -69,7 +69,7 @@ func TestParseIPEntry_unmaps4in6Entries(t *testing.T) {
 	if want := netip.MustParsePrefix("1.2.3.4/32"); p != want {
 		t.Fatalf("bare 4in6 = %s, want %s", p, want)
 	}
-	// 4in6 前缀 → v4 /24（bits-96）
+	// 4in6 前缀 → v4 /24
 	p, err = ParseIPEntry("::ffff:1.2.3.0/120")
 	if err != nil {
 		t.Fatalf("parse 4in6 prefix: %v", err)
@@ -108,7 +108,7 @@ func TestIPListFast_4in6EntriesHitV4Queries(t *testing.T) {
 }
 
 // EvictIPListCache（历史问题 缓存 GC）：淘汰后同路径下次加载重新读盘解析——
-// services 侧删除孤儿文件后，fail-stale 不得把旧集合无限期留在内存。
+// services 侧删除孤儿文件后，历史修复 不得把旧集合无限期留在内存。
 func TestIPListFast_evictCacheForcesReparse(t *testing.T) {
 	dir := useAllowedDir(t)
 	path := writeListFile(t, dir, "evict.txt", []string{"203.0.113.0/24"})
@@ -133,7 +133,7 @@ func TestIPListFast_evictCacheForcesReparse(t *testing.T) {
 	}
 }
 
-// 体积/条目上限：超限文件构建期拒绝（fail-closed），防异常文件拖垮内存。
+// 体积/条目上限：超限文件构建期拒绝，防异常文件拖垮内存。
 func TestIPListFast_loadCaps(t *testing.T) {
 	dir := useAllowedDir(t)
 	oldBytes, oldEntries := MaxFileBytes, MaxEntries
@@ -371,5 +371,62 @@ func TestIPListFast_factoryDedupSharedState(t *testing.T) {
 	t.Cleanup(func() { StatCheckInterval = old })
 	if op4.Evaluate(nil, "203.0.113.7") || !op4.Evaluate(nil, "198.51.100.9") {
 		t.Fatal("内容变化后新算子判定未更新")
+	}
+}
+
+// 体积上限必须是**读侧**硬上限：调用方 历史修复 与本次读之间有窗口（tmp+rename
+// 原子替换任意大小文件），只按 历史修复 判限等于没判——这里绕过 loadIPListFile
+// 直接喂解析器，模拟「stat 见小、实际读到超大」的形态。
+func TestParseIPListFile_enforcesMaxFileBytesAfterRead(t *testing.T) {
+	dir := useAllowedDir(t)
+	oldBytes := MaxFileBytes
+	MaxFileBytes = 16
+	t.Cleanup(func() { MaxFileBytes = oldBytes })
+
+	path := writeListFile(t, dir, "grew.txt", []string{"203.0.113.7", "198.51.100.0/24", "2001:db8::/32"})
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() <= MaxFileBytes {
+		t.Fatalf("fixture too small: %d bytes", info.Size())
+	}
+	if _, err := parseIPListFile(path); err == nil {
+		t.Fatal("超过 MaxFileBytes 的内容必须在读侧被拒绝（pre-stat 判限不构成硬上限）")
+	}
+}
+
+// 代际元数据必须取自**实际读到的内容**：调用方 stat 之后文件被原子替换时，
+// 解析结果与其 (mtime,size) 必须同代际——否则缓存命中判据会把上一代的
+// stat 形态贴到新内容上。
+func TestParseIPListFile_stampsGenerationFromReadContent(t *testing.T) {
+	dir := useAllowedDir(t)
+	path := writeListFile(t, dir, "gen.txt", []string{"203.0.113.7"})
+	oldInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟 stat→读 之间被 tmp+rename 替换为另一代际（尺寸不同）。
+	time.Sleep(10 * time.Millisecond) // 保证 mtime 可辨
+	if err := os.WriteFile(path, []byte("203.0.113.7\n198.51.100.0/24\n2001:db8::/32\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := parseIPListFile(path)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if state.size != newInfo.Size() {
+		t.Fatalf("state.size=%d, want %d (读取内容的尺寸，而非 pre-stat 的 %d)",
+			state.size, newInfo.Size(), oldInfo.Size())
+	}
+	if !state.mtime.Equal(newInfo.ModTime()) {
+		t.Fatalf("state.mtime=%v, want %v (读取内容的 mtime，而非 pre-stat 的 %v)",
+			state.mtime, newInfo.ModTime(), oldInfo.ModTime())
 	}
 }

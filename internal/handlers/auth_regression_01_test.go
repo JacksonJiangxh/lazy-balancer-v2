@@ -1,14 +1,14 @@
 package handlers
 
-//   U04c-01 自助改密 current_password 不再被新密码策略 max=24 提前拦截；
-//   U04c-02 MFA 挑战绑定签发时 password_version，改密吊销在册挑战；
-//   U04c-03 自助改密复用 passwordResetColumns（清失败计数与锁定）；
-//   U04c-04 锁定开关读取失败 fail-closed（500，不消费挑战）；
-//   U04c-05 MFA 验证存储错误不按「验证码错误」计数；
-//   U04c-06 OIDC 重复登录刷新 IdP 侧显示名；
-//   U04c-07 OIDC state 封顶改为原子预留（并发不越界）；
-//   U04c-08 JIT 用户名并发竞态有限重试（不同 subject 同名不失败）；
-//   U04c-09 OIDC 配置测试区分空 body 与畸形 body。
+//   历史修复 自助改密 current_password 不再被新密码策略 max=24 提前拦截；
+//   历史修复 MFA 挑战绑定签发时 password_version，改密吊销在册挑战；
+//   历史修复 自助改密复用 passwordResetColumns（清失败计数与锁定）；
+//   历史修复 锁定开关读取失败 历史修复（500，不消费挑战）；
+//   历史修复 MFA 验证存储错误不按「验证码错误」计数；
+//   历史修复 OIDC 重复登录刷新 IdP 侧显示名；
+//   历史修复 OIDC state 封顶改为原子预留（并发不越界）；
+//   历史修复 JIT 用户名并发竞态有限重试（不同 subject 同名不失败）；
+//   历史修复 OIDC 配置测试区分空 body 与畸形 body。
 
 import (
 	"context"
@@ -31,14 +31,27 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// ensureMFATestSchema 给 setupAuthTestDB 的最小 users 表补 MFA 列与挑战表。
-// 挑战表列形状与内部 migrations 后的生产形态一致（含 U04c-02 的 password_version）。
+// ensureMFATestSchema 给 setupAuthTestDB 的最小 users 表补 MFA 列与挑战表
+// （挑战表列形状与 migrations 后的生产形态一致，含 历史修复 的 password_version）。
+// 单源：此前四个测试
+// 文件各自内联一份 DDL（auth_setup/auth_login_provider/auth_regression/
+// mfa_verifylogin_challenge），列集合漂移（如 历史修复 的 password_version）时
+// 四处不同步 → 单文件测试假绿/假红。重复调用安全（duplicate column 容忍、
+// 挑战表 IF NOT EXISTS）。
 func ensureMFATestSchema(t *testing.T, database *sql.DB) {
 	t.Helper()
-	if _, err := database.Exec(`ALTER TABLE users ADD COLUMN mfa_secret TEXT DEFAULT '';
-		ALTER TABLE users ADD COLUMN mfa_recovery_codes TEXT DEFAULT '[]';
-		ALTER TABLE users ADD COLUMN mfa_last_timestep INTEGER DEFAULT 0;
-		CREATE TABLE IF NOT EXISTS mfa_challenges (
+	for _, col := range []string{
+		"mfa_secret TEXT DEFAULT ''",
+		"mfa_pending_secret TEXT DEFAULT ''",
+		"mfa_pending_fails INTEGER DEFAULT 0",
+		"mfa_recovery_codes TEXT DEFAULT '[]'",
+		"mfa_last_timestep INTEGER DEFAULT 0",
+	} {
+		if _, err := database.Exec("ALTER TABLE users ADD COLUMN " + col); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			t.Fatalf("add mfa column %s: %v", col, err)
+		}
+	}
+	if _, err := database.Exec(`CREATE TABLE IF NOT EXISTS mfa_challenges (
 			token TEXT PRIMARY KEY,
 			user_id INTEGER NOT NULL,
 			expires_at DATETIME NOT NULL,
@@ -47,11 +60,11 @@ func ensureMFATestSchema(t *testing.T, database *sql.DB) {
 			password_version INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`); err != nil {
-		t.Fatalf("add mfa schema: %v", err)
+		t.Fatalf("create mfa_challenges: %v", err)
 	}
 }
 
-// U04c-01：旧策略下设置的 25-72 字符密码仍可登录，就必须可以自助改密——
+// 旧策略下设置的 25-72 字符密码仍可登录，就必须可以自助改密——
 // current_password 的 max=24 绑定会把确认输入在 bcrypt 比较前拦成 400。
 func TestUpdateCurrentUser_acceptsLegacyLongCurrentPassword(t *testing.T) {
 	database := setupAuthTestDB(t)
@@ -85,7 +98,7 @@ func TestUpdateCurrentUser_acceptsLegacyLongCurrentPassword(t *testing.T) {
 	}
 }
 
-// U04c-03：自助改密与管理员重置同语义——清空登录失败计数与锁定。
+// 自助改密与管理员重置同语义——清空登录失败计数与锁定。
 func TestUpdateCurrentUser_clearsStaleLoginLock(t *testing.T) {
 	database := setupAuthTestDB(t)
 	hash, err := bcrypt.GenerateFromPassword([]byte("OldPass123!"), bcrypt.MinCost)
@@ -119,7 +132,7 @@ func TestUpdateCurrentUser_clearsStaleLoginLock(t *testing.T) {
 	}
 }
 
-// U04c-02：挑战绑定签发时的密码版本；密码已变更的挑战必须 401 并删除，
+// 挑战绑定签发时的密码版本；密码已变更的挑战必须 401 并删除，
 // 不得以新 pwd_ver 完成第二因素登录。
 func TestMFAVerifyLogin_rejectsChallengeIssuedForOlderPassword(t *testing.T) {
 	secret, userID := seedMFAChallengeLoginFixture(t, "stale-ver-tok", 0)
@@ -143,7 +156,7 @@ func TestMFAVerifyLogin_rejectsChallengeIssuedForOlderPassword(t *testing.T) {
 	}
 }
 
-// U04c-02：三条改密路径（自助/管理员更新/管理员重置）都必须吊销在册 MFA 挑战。
+// 三条改密路径（自助/管理员更新/管理员重置）都必须吊销在册 MFA 挑战。
 func TestPasswordUpdateRevokesMFALoginChallenges(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -211,7 +224,7 @@ func TestPasswordUpdateRevokesMFALoginChallenges(t *testing.T) {
 	}
 }
 
-// U04c-04：锁定开关读取失败必须 fail-closed（500 且不消费挑战），
+// 锁定开关读取失败必须 历史修复（500 且不消费挑战），
 // 不得静默按「未锁定 + 开关关闭」放行。
 func TestMFAVerifyLogin_lockoutConfigReadFailureFailsClosed(t *testing.T) {
 	secret, _ := seedMFAChallengeLoginFixture(t, "cfg-fail-tok", 0)
@@ -235,7 +248,7 @@ func TestMFAVerifyLogin_lockoutConfigReadFailureFailsClosed(t *testing.T) {
 	}
 }
 
-// U04c-05：验证码存储错误（恢复码 JSON 损坏/写库失败）是基础设施错误，
+// 验证码存储错误（恢复码 JSON 损坏/写库失败）是基础设施错误，
 // 必须 500 且不消耗挑战、不累加挑战/账户失败计数。
 func TestMFAVerifyLogin_storageErrorDoesNotCountAsCredentialFailure(t *testing.T) {
 	_, userID := seedMFAChallengeLoginFixture(t, "store-err-tok", 0)
@@ -261,7 +274,7 @@ func TestMFAVerifyLogin_storageErrorDoesNotCountAsCredentialFailure(t *testing.T
 	}
 }
 
-// U04c-06：重复登录刷新 IdP 侧显示名（本地 username/role 不受影响）。
+// 重复登录刷新 IdP 侧显示名（本地 username/role 不受影响）。
 func TestOIDCCallback_refreshesDisplayNameFromIdP(t *testing.T) {
 	idp := newMockIdP(t)
 	router, _ := setupOIDCTest(t, idp)
@@ -296,7 +309,7 @@ func TestOIDCCallback_refreshesDisplayNameFromIdP(t *testing.T) {
 	}
 }
 
-// U04c-07：state 封顶是检查+预留原子操作——并发未认证登录不得越过上限。
+// state 封顶是检查+预留原子操作——并发未认证登录不得越过上限。
 func TestOIDCLogin_stateReservationAtomicUnderConcurrency(t *testing.T) {
 	idp := newMockIdP(t)
 	router, _ := setupOIDCTest(t, idp)
@@ -469,7 +482,7 @@ func TestOIDCCandidateUsername_boundedQueriesForCollisionShapes(t *testing.T) {
 	})
 }
 
-// U04c-08：不同 subject 并发首登撞同一候选用户名时，唯一冲突后重算候选名
+// 不同 subject 并发首登撞同一候选用户名时，唯一冲突后重算候选名
 // 有限重试——不得把瞬时竞态升级为登录失败；重试上限内仍冲突才失败。
 func TestCreateOIDCUserWithRetry_survivesUsernameRace(t *testing.T) {
 	idp := newMockIdP(t)
@@ -479,7 +492,7 @@ func TestCreateOIDCUserWithRetry_survivesUsernameRace(t *testing.T) {
 	t.Cleanup(func() { oidcJITInsertAttemptHook = oldHook })
 
 	// 第一次 INSERT 前模拟「并发者已抢占 alice」：hook 落库对端身份行并返回
-	// 唯一冲突错误；重试时批量候选查询能看到对端行 → 选 alice-2 成功。
+	// 唯一冲突错误；重试时批量候选查询能看到对端行 → 选 历史修复 成功。
 	oidcJITInsertAttemptHook = func(attempt int) error {
 		if attempt != 1 {
 			return nil
@@ -516,7 +529,7 @@ func TestCreateOIDCUserWithRetry_survivesUsernameRace(t *testing.T) {
 	}
 }
 
-// U04c-09：畸形请求体必须 400；真正的空 body 才回退「测试已保存配置」。
+// 畸形请求体必须 400；真正的空 body 才回退「测试已保存配置」。
 func TestOIDCSettingsTest_distinguishesMalformedFromEmptyBody(t *testing.T) {
 	idp := newMockIdP(t)
 	router, _ := setupOIDCTest(t, idp)

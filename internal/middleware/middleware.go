@@ -37,7 +37,7 @@ var jwtAuthenticationQuery = func(query string, args ...any) *sql.Row {
 }
 
 // mfaUserEnabledCheck：MFA 启用态查询的测试注入点（与 jwtAuthenticationQuery 同模式）——
-// 历史 I-J 的 fail-closed 回归测试需要模拟「瞬时 DB 失败」，真实关闭 DB 会
+// 历史 历史修复 的 历史修复 回归测试需要模拟「瞬时 DB 失败」，真实关闭 DB 会
 // 连带让 jwtAuth 的会话校验先失败（401），无法单独触发守卫分支。
 var mfaUserEnabledCheck = services.MFAUserEnabled
 
@@ -67,7 +67,7 @@ func (limiter *authenticationAuditLimiter) allow(key string, now time.Time) bool
 			}
 		}
 	}
-	// SYSMW-U1（历史 历史问题）：硬上限——上方清扫只清 >=2min 陈旧键，洪水期
+	// 历史修复（历史 历史问题）：硬上限——上方清扫只清 >=2min 陈旧键，洪水期
 	// 唯一键高速涌入时全部键新鲜、清扫零效果，map 曾无界增长。清扫后仍达
 	// 4096 则丢弃新键：不进 map 也不记审计（审计丢失可接受，内存必须有界）。
 	// 注意与 loginRateBuckets 不同：限流桶必须保持强制力，容量满改 LRU
@@ -124,7 +124,7 @@ func init() {
 	services.SetAPIKeyWhitelistCachePurgeAll(PurgeAllAPIKeyWhitelistCache)
 }
 
-// auditClientIP 审计源 IP（历史 K-1）：内部 MCP 转发请求（本机回环
+// auditClientIP 审计源 IP（历史 历史修复）：内部 MCP 转发请求（本机回环
 // 自调用）携带网关注入的真实客户端 IP 头；仅当内部认证密钥匹配（与
 // apiKeyAuth 的 trustedInternalMCP 判定同口径）时采信，外部请求伪造该头不
 // 产生任何效果，其余请求沿用 gin ClientIP。
@@ -165,12 +165,12 @@ type loginRateBucket struct {
 const rateLimitBucketCapacity = 1024
 
 // evictLeastRecentlyUsedRateLimitBucketLocked 淘汰最久未命中的桶为新键腾位。
-// 历史问题-1：修复前容量满时新键 fail-open 放行（不建桶=本分钟对分布式来源
+// 历史问题-1：修复前容量满时新键 历史修复 放行（不建桶=本分钟对分布式来源
 // 零限流）——攻击者可推满桶表形成暴力尝试窗口。改为有界 LRU：新来源仍拿到
 // 自己的计数桶（照常 10/min 限流），内存上限不变。
-// CI87-01（历史）：淘汰次序 credential → 非受保护匿名桶 → 受保护桶。
+// 历史修复（历史）：淘汰次序 credential → 非受保护匿名桶 → 受保护桶。
 // 历史 历史问题-1 只保护了「非 credential 桶」集合，但匿名端点
-// （oidc-callback / service-control / 机器 scope 的 |ip 桶）同样无需凭证即可
+// （历史修复 / 历史修复 / 机器 scope 的 |ip 桶）同样无需凭证即可
 // 每源 IP 建桶——约 147 个源 IP 就能把 1024 容量填成全匿名桶，回退全表 LRU
 // 时最旧的 ip|login / ip|register 被淘汰 = 爆破/审计放大窗口被重置且可循环。
 // 受保护桶仅在「表内只剩受保护桶」时才可能被淘汰（仍保证新键必建桶）。
@@ -233,8 +233,8 @@ var loginRateBuckets = struct {
 	entries map[string]*loginRateBucket
 }{entries: make(map[string]*loginRateBucket)}
 
-// loginRateLimit 登录族端点限流（10/min/IP：login/ticket-login/mfa-verify/
-// setup×2/oidc-login 共用同一桶）。SYSMW-R1（历史 历史问题）：与 clusterRateLimit
+// loginRateLimit 登录族端点限流（10/min/IP：login/历史修复/历史修复/
+// setup×2/历史修复 共用同一桶）。历史修复（历史 历史问题）：与 clusterRateLimit
 // 桶机制收敛——共享 loginRateBuckets map、1024 容量上限、分钟窗、429 形态全同，
 // 差异仅键形（ip|scope）/限额/文案三个参数；五端点同 scope="login" 共桶语义
 // 不变（内存态无迁移面），oidc/setup 共桶钉测试为回归钉。
@@ -243,7 +243,7 @@ func loginRateLimit() gin.HandlerFunc {
 }
 
 // acquireRateLimitBucket 在首次记账时创建；容量满按 LRU 淘汰最久未命中的
-// 桶腾位（历史问题-1：不再 fail-open——新来源照常限流且内存有界）。
+// 桶腾位（历史问题-1：不再 历史修复——新来源照常限流且内存有界）。
 func acquireRateLimitBucket(ip, scope string, now time.Time) *loginRateBucket {
 	loginRateBuckets.Lock()
 	defer loginRateBuckets.Unlock()
@@ -265,10 +265,10 @@ func acquireRateLimitBucket(ip, scope string, now time.Time) *loginRateBucket {
 // 未认证、无速率限制的写端点——每次无效令牌尝试 16KB 体读+条件 UPDATE+
 // 审计 INSERT,互联网可达主节点可被线速打审计库。同威胁模型的 login/setup
 // 均有限流,此处补同等待遇(宽桶:注册属低频管理操作,30/min/IP)。
-// clusterRateLimit 是共享桶限流的统一实现（SYSMW-R1 历史收敛，登录族
+// clusterRateLimit 是共享桶限流的统一实现（历史修复 历史收敛，登录族
 // loginRateLimit 亦为薄包装）：键=ip|scope 按 scope 分桶，桶间独立。
 // 集群公开写端点(历史问题/历史问题-2):register(无效令牌尝试=16KB 体读+条件
-// UPDATE+审计 INSERT)与 service-control(匿名可达,每尝试 BEGIN IMMEDIATE 写锁+
+// UPDATE+审计 INSERT)与 历史修复(匿名可达,每尝试 BEGIN IMMEDIATE 写锁+
 // 恒审计 INSERT,写放大更强)——同威胁模型的 login/setup 均有限流,补同等待遇。
 // 按端点独立分桶,宽桶(低频管理操作)。
 func clusterRateLimit(scope string, limit int, message string) gin.HandlerFunc {
@@ -308,7 +308,7 @@ const (
 // clusterMachineRateLimit 在 token/registration 认证与 DB 查询之前预占额度：
 // 同一凭证最多 30 次/分钟，同一 IP 全凭证合计最多 300 次/分钟。凭证来源
 // 必须与对应路由认证中间件一致，防止攻击者用无关头打散凭证桶。预占在锁内
-// 原子完成，401 保留额度、非 401 回滚——并发无效请求不能击穿 check-then-act
+// 原子完成，401 保留额度、非 401 回滚——并发无效请求不能击穿 历史修复
 // 窗口；合法节点（含同一 NAT 出口）成功请求不消耗失败预算。窗口换代编号
 // 防止旧窗口在途请求污染新窗口。
 func clusterMachineRateLimit(scope string, source clusterCredentialSource) gin.HandlerFunc {
@@ -366,7 +366,7 @@ func reserveRateLimitBucket(ip, scope string, now time.Time, limit int) (*loginR
 	loginRateBuckets.Lock()
 	bucket, exists := loginRateBuckets.entries[key]
 	if !exists {
-		// 历史问题-1：容量满不再 fail-open 跳过限流——LRU 淘汰腾位后照常预占。
+		// 历史问题-1：容量满不再 历史修复 跳过限流——LRU 淘汰腾位后照常预占。
 		if len(loginRateBuckets.entries) >= rateLimitBucketCapacity {
 			evictLeastRecentlyUsedRateLimitBucketLocked()
 		}
@@ -440,7 +440,7 @@ func requestLogFormatter(param gin.LogFormatterParams) string {
 }
 
 // recordingRouterGroup 在注册 admin 组路由的同时记录「METHOD + 完整 gin 路径」
-// 到 recorded（CI87-06）：mcpserver 的 tools/list 可见性必须与 adminOnly 守卫
+// 到 recorded：mcpserver 的 tools/list 可见性必须与 adminOnly 守卫
 // 同口径隐藏恒 403 的工具。清单与注册点同源，新增 admin 路由自动同步，不存在
 // 第二份手工清单漂移（区别于只读探测集等显式白名单）。
 type recordingRouterGroup struct {
@@ -490,7 +490,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 		return requestLogFormatter(param)
 	}), gin.Recovery())
 
-	// U7c-2（历史）：全局安全响应头——面板页面与 API 响应恒施加
+	// 历史修复（历史）：全局安全响应头——面板页面与 API 响应恒施加
 	// nosniff+DENY（点击劫持/MIME 嗅探表面；认证走 Authorization 头无
 	// cookie 向量，此为纵深加固）。
 	r.Use(func(c *gin.Context) {
@@ -514,8 +514,8 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 			// Vite 产物文件名带内容哈希，可长期缓存
 			c.Header("Cache-Control", "public, max-age=31536000, immutable")
 		} else if path == "/ui" || path == "/ui/" || path == "/ui/index.html" {
-			// SYSMW-U3（历史 历史问题）：/ui 壳 index.html 与根路径 GET / 同策略
-			// no-cache——FileServer 直出只有 Last-Modified，浏览器启发式缓存
+			// 历史修复（历史 历史问题）：/ui 壳 index.html 与根路径 GET / 同策略
+			// 历史修复——FileServer 直出只有 历史修复，浏览器启发式缓存
 			// （10% 规则）会让升级后的旧壳引用已删哈希资产白屏。裸 /ui 实际
 			// 由 gin 尾斜杠 301 重定向先行应答（不经本链），列入仅作防御。
 			c.Header("Cache-Control", "no-cache")
@@ -551,7 +551,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				return
 			}
 			c.Request.Body = io.NopCloser(bytes.NewReader(body))
-			// 历史 K-1：把真实客户端 IP 注入 MCP 转发 context——内部
+			// 历史 把真实客户端 IP 注入 MCP 转发 context——内部
 			// 转发是本机回环自调用，不注入则 MCP 操作的审计源 IP 恒为
 			// 127.0.0.1（接收端 auditClientIP 凭内部认证密钥采信）。
 			c.Request = c.Request.WithContext(mcpserver.WithClientIP(c.Request.Context(), c.ClientIP()))
@@ -588,11 +588,11 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 		v1.Use(apiKeyAuth(cfg))
 		v1.Use(jwtAuth(cfg))
 		v1.Use(apiKeyReadOnlyGuard())
-		// U7c-68-01（历史）：mfaStepUpGuard 不在 v1 级挂载——admin 组内
-		// adminOnly 必须先于 step-up（非管理员先见 403 角色真因，而非 428 后
+		// 历史修复（历史）：mfaStepUpGuard 不在 v1 级挂载——admin 组内
+		// adminOnly 必须先于 历史修复（非管理员先见 403 角色真因，而非 428 后
 		// 输码重试才见真因）；守卫改在 admin/business 两组级挂载（见下方组装配，
 		// 组内次序 adminOnly → mfaStepUpGuard → readOnlyGuard）。
-		// A-1(2026-09-10 审计):把 auditClientIP(内部 MCP 转发采信头)结果
+		// 历史修复(2026-09-10 审计):把 auditClientIP(内部 MCP 转发采信头)结果
 		// 注入 context,handlers 侧 recordAudit 优先读取——此前 handler 审计
 		// 路径的 c.ClientIP() 对回环自调用恒 127.0.0.1,来源 IP 取证断裂。
 		v1.Use(func(c *gin.Context) {
@@ -609,8 +609,8 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 			v1.POST("/auth/logout", h.Logout)
 			// User management (admin only)
 			adminGroup := v1.Group("")
-			// U7c-68-01：adminOnly 先于 mfaStepUpGuard——非管理员打 admin 端点
-			// 先见 403 角色真因；step-up 仍在 readOnlyGuard 之前（U7c-3 从节点
+			// adminOnly 先于 mfaStepUpGuard——非管理员打 admin 端点
+			// 先见 403 角色真因；历史修复 仍在 readOnlyGuard 之前（历史修复 从节点
 			// 403 先于 428 的守卫内短路口径不变）。
 			adminGroup.Use(adminOnly(), mfaStepUpGuard(), readOnlyGuard(db.DB))
 			admin := recordingRouterGroup{RouterGroup: adminGroup, recorded: make(map[string]struct{})}
@@ -622,7 +622,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				admin.DELETE("/users/:id", h.DeleteUser)
 				admin.POST("/users/:id/mfa/reset", h.MFAResetByAdmin)
 
-				// 历史问题 二十六次 W1-3：管理语义端点收紧至 admin 组——服务重启/管理面板
+				// 历史问题 二十六次 管理语义端点收紧至 admin 组——服务重启/管理面板
 				// TLS/原始 Caddy 配置覆写/Caddy 进程启停均为管理员级操作；此前挂在
 				// business 组（仅 readOnlyGuard），apidocs 承诺的 403 admin_required
 				// 实际不存在（PutCaddyConfig/StartCaddy/RestartService/UpdateAdminTLS
@@ -652,7 +652,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				admin.PUT("/cluster/nodes/:id/site", h.UpdateClusterNodeSiteCoordinates)
 				admin.POST("/cluster/nodes/:id/service", h.ControlClusterNodeService)
 				// 历史问题：主节点侧单节点 TOFU 指纹钉重置——从节点更换管理面板证书后
-				// 服务控制持续 PinMismatch 的补救通道（与 forget-pins 对称）。
+				// 服务控制持续 PinMismatch 的补救通道（与 历史修复 对称）。
 				admin.POST("/cluster/nodes/:id/forget-pin", h.ForgetClusterNodePin)
 				admin.DELETE("/cluster/nodes/:id", h.DeleteClusterNode)
 				admin.POST("/cluster/mode", h.SetClusterMode)
@@ -732,18 +732,18 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				// 调度启停——2026-10-14 裁定，/run 端点已废除）
 				admin.PUT("/security/autoban", h.UpdateAutobanConfig)
 			}
-			// CI87-06：admin 组路由集合注入 MCP 工具可见性——非管理员属主的 Key
+			// admin 组路由集合注入 MCP 工具可见性——非管理员属主的 Key
 			// 不应在 tools/list 看到恒 403 的工具（get_caddy_config / preview_config /
 			// validate_import 等）。清单即上面的注册记录，无第二份手工维护。
 			mcpserver.SetAdminOnlyRoutes(admin.recorded)
 
 			// User + Admin
 			business := v1.Group("")
-			// SYSMW-U2（历史 历史问题）：business 组次序对称 U7c-68-01——readOnlyGuard
+			// 历史修复（历史 历史问题）：business 组次序对称 历史修复——readOnlyGuard
 			// 先于 mfaStepUpGuard：非管理员打管理写端点直见 403 角色真因（旧次序
-			// step-up 在前，验码重试后才见 403，与 admin 组已修的误导链同型）。
-			// 自助路径经 isSelfServicePath 放行后照常进 step-up（428 链不变）；
-			// 从节点 403 先于 428 由只读门直接达成（U7c-3 守卫内短路降级为兜底）。
+			// 历史修复 在前，验码重试后才见 403，与 admin 组已修的误导链同型）。
+			// 自助路径经 isSelfServicePath 放行后照常进 历史修复（428 链不变）；
+			// 从节点 403 先于 428 由只读门直接达成（历史修复 守卫内短路降级为兜底）。
 			business.Use(readOnlyGuard(db.DB), mfaStepUpGuard())
 			{
 				// 任务监控聚合视图（全员可见；从节点经 readOnlyGuard 只读可用）
@@ -766,7 +766,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				business.PATCH("/users/me/api-keys/:id", h.UpdateCurrentUserAPIKeyStatus)
 				business.DELETE("/users/me/api-keys/:id", h.DeleteCurrentUserAPIKey)
 
-				// Read-only lists (all authenticated users)
+				// 历史修复 lists (all authenticated users)
 				business.GET("/mcp/tools", h.GetMCPTools)
 				business.GET("/mcp/ops-playbook", h.GetMCPOpsPlaybook)
 				business.GET("/users", h.ListUsers)
@@ -848,7 +848,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				business.GET("/security/crs/rules/:filename", h.GetCRSRuleContent)
 				business.GET("/security/crs/setup", h.GetCRSSetupConfig)
 
-				// Config (read only for non-admin)
+				// Config (read only for 历史修复)
 				business.GET("/config", h.GetConfig)
 				business.GET("/cluster/status", h.GetClusterStatus)
 
@@ -982,7 +982,7 @@ func jwtAuth(cfg *config.Config) gin.HandlerFunc {
 		}, jwt.WithExpirationRequired(), jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
 
 		if err != nil || !token.Valid {
-			// 历史 S-2：过期与无效分判——过期是自然态（重登即可），签名
+			// 历史 过期与无效分判——过期是自然态（重登即可），签名
 			// 无效/格式损坏是凭证问题；旧代码两类同发「登录状态已过期」，把无效
 			// 凭证误导成「重新登录就能好」。401 状态码不变，仅消息分语义。
 			if errors.Is(err, jwt.ErrTokenExpired) {
@@ -1040,7 +1040,17 @@ func jwtAuth(cfg *config.Config) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if queryErr != nil || !dbUsername.Valid || !dbRole.Valid || !dbEnabled.Valid || !dbEnabled.Bool || !passwordVersion.Valid {
+		// DB 故障不得折叠成「用户不存在或已禁用」——
+		// 否则库锁/IO 故障期间全站表现为凭据问题（客户端被诱导重登），运维
+		// 日志也拿不到底层错误、无法与真实凭据攻击区分。基础设施错误 → 500
+		// 历史修复（与 readOnlyGuard/clusterTokenAuth 口径一致）。
+		if queryErr != nil {
+			services.Logf("error", "jwt auth state query failed: %v", queryErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "认证状态查询失败"})
+			c.Abort()
+			return
+		}
+		if !dbUsername.Valid || !dbRole.Valid || !dbEnabled.Valid || !dbEnabled.Bool || !passwordVersion.Valid {
 			recordAuthenticationRejection(c, "jwt_user_unavailable")
 			c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "用户不存在或已禁用"})
 			c.Abort()
@@ -1079,7 +1089,7 @@ func jwtAuth(cfg *config.Config) gin.HandlerFunc {
 		if am, ok := claims["auth_method"].(string); ok && am != "" {
 			c.Set("auth_method", am)
 		}
-		// v2.1.8 MFA step-up：mfa_ts 声明透传（无声明=0，guard 视为过期）
+		// v2.1.8 MFA mfa_ts 声明透传（无声明=0，guard 视为过期）
 		if ts, ok := claims["mfa_ts"].(float64); ok {
 			c.Set("mfa_ts", ts)
 		}
@@ -1090,7 +1100,7 @@ func jwtAuth(cfg *config.Config) gin.HandlerFunc {
 
 func apiKeyAuth(cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 历史 APISYS-F2：原「JWT 已认证则跳过」首行分支删除——生产链
+		// 历史 原「JWT 已认证则跳过」首行分支删除——生产链
 		// 不可达（挂载次序固定：v1.Use(apiKeyAuth) 先于 v1.Use(jwtAuth)，/mcp
 		// 路由仅 apiKeyAuth；全链无更早 user_id 写者），user_id 在本中间件
 		// 之前恒不存在。删除后不改变任何可达请求的判定路径。
@@ -1111,7 +1121,7 @@ func apiKeyAuth(cfg *config.Config) gin.HandlerFunc {
 				return
 			}
 			recordAuthenticationRejection(c, "api_key_invalid")
-			// 历史 K-2：MCP/Key 认证链的通用 401 消息此前为英文
+			// 历史 MCP/Key 认证链的通用 401 消息此前为英文
 			// "Invalid API key"，与本认证链其余消息（缺少认证信息/认证格式无效/
 			// 登录状态已过期等）及 serverInstructions 的中文错误约定不一致——
 			// Agent 与前端按中文解析。
@@ -1119,13 +1129,22 @@ func apiKeyAuth(cfg *config.Config) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		// CI87-07：认证查询收敛到 db.ResolveAPIKeyIdentity 单源（prefix + sha256
+		// 认证查询收敛到 db.ResolveAPIKeyIdentity 单源（prefix + sha256
 		// + 有效性条件），与 mcpserver 只读可见性共用——此前两处手写同形 SQL，
 		// 认证条件变更时可见性会静默漂移。
 		identity, err := db.ResolveAPIKeyIdentity(db.DB, apiKey)
 		if err != nil {
 			if hasJWTBearer(c) {
 				c.Next()
+				return
+			}
+			// 区分「Key 无效」与基础设施故障——
+			// ResolveAPIKeyIdentity 已给出 ErrAPIKeyNotFound 分类，此前全部
+			// 折叠成 401，DB 故障期间表现为密钥无效且日志零线索。
+			if !errors.Is(err, db.ErrAPIKeyNotFound) {
+				services.Logf("error", "api key identity query failed: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "API 密钥校验失败"})
+				c.Abort()
 				return
 			}
 			recordAuthenticationRejection(c, "api_key_invalid")
@@ -1196,15 +1215,15 @@ func apiKeyAuth(cfg *config.Config) gin.HandlerFunc {
 
 // sensitiveExportGetRoutes 与写操作同敏感级的导出类 GET（2026-09-24 用户裁定：
 // 导入导出/备份视为写入操作）——产物均含私钥/凭证明文。apiKeyReadOnlyGuard
-// （只读 Key 403）与 mfaStepUpGuard（JWT step-up 428）共用同一名单，任一侧
-// 新增敏感 GET 必须登记于此（历史问题：download 曾只在 step-up 侧在列，只读
+// （只读 Key 403）与 mfaStepUpGuard（JWT 历史修复 428）共用同一名单，任一侧
+// 新增敏感 GET 必须登记于此（历史问题：download 曾只在 历史修复 侧在列，只读
 // Key 侧漏网）。
 var sensitiveExportGetRoutes = map[string]bool{
 	"/api/v1/config/export":            true,
 	"/api/v1/auto-backup/:id/download": true,
 }
 
-// writeMethods 写方法集合（SYSMW-R2 历史 历史问题 收敛：auditMiddleware/
+// writeMethods 写方法集合（历史修复 历史 历史问题 收敛：auditMiddleware/
 // apiKeyReadOnlyGuard/mfaStepUpGuard 三处字面量与 readonly.go 的 switch 四形态
 // 并存）——四处守卫共用同一事实源。包级只读使用，无写入者。
 var writeMethods = map[string]bool{"POST": true, "PUT": true, "PATCH": true, "DELETE": true}
@@ -1239,9 +1258,9 @@ func apiKeyReadOnlyGuard() gin.HandlerFunc {
 	}
 }
 
-// 挂载面：admin/business 两组级（U7c-68-01 自 v1 级下沉）——admin 组内 adminOnly
+// 挂载面：admin/business 两组级（历史修复 自 v1 级下沉）——admin 组内 adminOnly
 // 先于本守卫（非管理员先见 403 角色真因），business 组内 readOnlyGuard 先于本
-// 守卫（SYSMW-U2 历史对称同口径；U7c-3 从节点短路保留在守卫内作兜底）。
+// 守卫（历史修复 历史对称同口径；历史修复 从节点短路保留在守卫内作兜底）。
 // v1 级直挂路由（openapi.yaml/caddy/metrics/logout）本就不在覆盖面（GET 非敏感
 // 导出、logout 豁免），下沉无行为变化。
 
@@ -1250,7 +1269,7 @@ func apiKeyReadOnlyGuard() gin.HandlerFunc {
 // 绊线自动覆盖两侧）且 mfa_ts 距今超过 60 秒 → 428，前端全局弹码验证后携新
 // JWT 重试。API Key/MCP 认证豁免（机器身份无 MFA 概念）。M8（2026-09 审计）：
 // GET /config/export 与写操作同级（导出含全部用户/密钥哈希的完整备份），一并
-// 纳入 step-up 覆盖。
+// 纳入 历史修复 覆盖。
 func mfaStepUpGuard() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		path := c.FullPath()
@@ -1266,8 +1285,8 @@ func mfaStepUpGuard() gin.HandlerFunc {
 		}
 		guardEnabled, guardErr := services.MFAWriteGuardEnabled()
 		if guardErr != nil {
-			// 2026-09-08 审计 SA1 裁定维持：DB 读失败时守卫关闭（fail-open）是
-			// 有意设计——step-up 是第二因子便利层（jwtAuth 已在前序 fail-closed
+			// 2026-09-08 审计 SA1 裁定维持：DB 读失败时守卫关闭是
+			// 有意设计——历史修复 是第二因子便利层（jwtAuth 已在前序 历史修复
 			// 把关），DB 故障时锁死全部写操作不可取。S历史问题：降级不再静默——
 			// 显式留痕（口径与 MFALockoutEnabled 的读失败显性错误一致）。
 			services.Logf("warn", "MFA 写操作验证开关读取失败，按关闭处理（fail-open，SA1 裁定）: %v", guardErr)
@@ -1278,10 +1297,10 @@ func mfaStepUpGuard() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		// 历史问题 C-历史问题：step-up 机制本体必须永可达——豁免 verify-step 自身（POST，
-		// 位于本守卫之下），否则守卫生效后「弹码→verify-step→再 428」无限循环，
+		// 历史问题 C-历史问题：历史修复 机制本体必须永可达——豁免 历史修复 自身（POST，
+		// 位于本守卫之下），否则守卫生效后「弹码→历史修复→再 428」无限循环，
 		// 全员写操作死锁；/auth/logout 同理（登出不该要求验证码）。
-		// SYSMW-A1（历史）：当前 logout 挂 v1 级不经本守卫（守卫仅挂
+		// 历史修复（历史）：当前 logout 挂 v1 级不经本守卫（守卫仅挂
 		// admin/business 组级），本条为防御性豁免——若日后 logout 挪入组级，
 		// 豁免仍须在场（对齐 readonly.go 白名单同款防御条目）。
 		if path == "/api/v1/auth/mfa/verify-step" || path == "/api/v1/auth/logout" {
@@ -1289,8 +1308,8 @@ func mfaStepUpGuard() gin.HandlerFunc {
 			return
 		}
 		// 历史问题 十六次（用户反馈）：豁免只读语义 POST（readOnlyWriteRoutes——批量
-		// 证书状态查询 cert-info/jobs/current、测试连接、预览/解析等）——它们
-		// 用 POST 承载查询/预览载荷，语义是读，不该触发 step-up（用户打开规则
+		// 证书状态查询 历史修复/jobs/current、测试连接、预览/解析等）——它们
+		// 用 POST 承载查询/预览载荷，语义是读，不该触发 历史修复（用户打开规则
 		// 列表页就被弹码）。与只读 API Key 的写操作判定同一事实源。
 		if services.IsReadOnlyWriteRoute(c.Request.Method, path) {
 			c.Next()
@@ -1322,16 +1341,16 @@ func mfaStepUpGuard() gin.HandlerFunc {
 		// (其 MFA 已在登录时验证),本地写保护仅对本地用户生效。历史问题:auth_method
 		// 为 HMAC 签名 claim,在 DB 状态查询前显式短路——不再依赖「OIDC 行
 		// mfa_enabled 恒 0」的跨文件不变量(该不变量被导入/未来写路径破坏时,
-		// OIDC 用户会落入 verify-step 必败的 428 死锁)。
+		// OIDC 用户会落入 历史修复 必败的 428 死锁)。
 		if c.GetString("auth_method") == "oidc" {
 			c.Next()
 			return
 		}
-		// 历史 I-J（历史问题 C-历史问题）：DB 错误与「MFA 未启用」必须分判——未启用
-		// 是合理直通（该用户未启用 MFA，守卫不适用）；DB 错误必须 fail-closed
+		// 历史 历史修复（历史问题 C-历史问题）：DB 错误与「MFA 未启用」必须分判——未启用
+		// 是合理直通（该用户未启用 MFA，守卫不适用）；DB 错误必须 历史修复
 		// （与本文件同类守卫的基建错误 500 中止同口径，如 apiKeyAuth 的白名单
 		// 解析失败）：瞬时 DB 失败落穿此处会让已启用 MFA 的用户整体绕过
-		// step-up（fail-open），等同二因子静默旁路。
+		// 历史修复，等同二因子静默旁路。
 		mfaEnabled, err := mfaUserEnabledCheck(userID)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "MFA 状态查询失败"})
@@ -1363,10 +1382,10 @@ func mfaStepUpGuard() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		// U7c-3（历史）：从节点短路先于 428——只读门（readOnlyGuard）挂载
+		// 历史修复（历史）：从节点短路先于 428——只读门（readOnlyGuard）挂载
 		// 在本守卫之后的 admin 组，从节点 MFA 用户此前先收 428、输码重试后才见
 		// 403 真因。此处按只读门同法查询（COALESCE 兜底）；从节点直接 403，
-		// 查询失败与只读门同语义 fail-closed 500。verify-step/logout 已在上游
+		// 查询失败与只读门同语义 历史修复 500。历史修复/logout 已在上游
 		// 豁免，本判定影响本将收到 428 的写请求与敏感 GET 导出（从节点敏感 GET 导出现同此短路，直收 403，不再先 428——U7c-历史问题 注释勘正）。
 		var isMaster bool
 		database := db.GetDB()
@@ -1378,10 +1397,10 @@ func mfaStepUpGuard() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "节点角色查询失败"})
 			return
 		}
-		// SYSMW-L1（历史 历史问题）：从节点短路排除只读门白名单路径——/cluster/*
-		// 补救端点（forget-pins/promote 等仅能从节点执行，主节点 handler 拒绝）
+		// 历史修复（历史 历史问题）：从节点短路排除只读门白名单路径——/cluster/*
+		// 补救端点（历史修复/promote 等仅能从节点执行，主节点 handler 拒绝）
 		// 若短路 403「请在主节点操作」则前端弹码链（仅 428 触发）断裂、补救
-		// 实质不可达。白名单路径落穿至 428：弹码→verify-step 刷新 mfa_ts→重试
+		// 实质不可达。白名单路径落穿至 428：弹码→历史修复 刷新 mfa_ts→重试
 		// →readOnlyGuard 白名单放行（readonly.go:68-74），链路恢复。
 		if !isMaster && !isReadOnlyGuardWhitelisted(c.Request.URL.Path) {
 			recordAuthenticationRejection(c, "slave_write_denied")

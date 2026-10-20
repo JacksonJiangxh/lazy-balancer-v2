@@ -50,7 +50,7 @@ func snapshotFromState(state crsTaskState) CRSUpdateStatusSnapshot {
 	return snap
 }
 
-// IsActiveCRSStatus reports whether the status describes an in-flight update.
+// IsActiveCRSStatus reports whether the status describes an 历史修复 update.
 func IsActiveCRSStatus(status string) bool {
 	switch CRSUpdateStatus(status) {
 	case CRSStatusChecking, CRSStatusDownloading, CRSStatusInstalling, CRSStatusReloading:
@@ -73,7 +73,7 @@ func (m *CRSUpdateManager) RuleCount() int {
 		Logf("error", "crs update: failed to count SecRules: %v", err)
 		return 0
 	}
-	// CRS25-5(历史):放锁扫描期间 rescan 可能已写入新值——
+	// 历史修复(历史):放锁扫描期间 rescan 可能已写入新值——
 	// 重锁写回前双重检查,不覆盖更新值(展示层一致性)。
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -95,4 +95,25 @@ func (m *CRSUpdateManager) rescanRuleCount() {
 	m.ruleCount = count
 	m.hasRuleCount = true
 	m.mu.Unlock()
+}
+
+// InvalidateRuleCount 丢弃规则数缓存：/security/crs 的
+// rule_count 是首次扫描后的进程内缓存，而集群同步（ApplyWafFileBundle）与
+// lbbak 备份导入都会带外替换 live CRS 树——不失效则规则数滞留旧值直到进程
+// 重启或下一次成功更新。下次 RuleCount() 调用重新扫描。
+func (m *CRSUpdateManager) InvalidateRuleCount() {
+	m.mu.Lock()
+	m.ruleCount = -1
+	m.hasRuleCount = false
+	m.mu.Unlock()
+}
+
+// InvalidateCRSRuleCount 供带外替换 live CRS 树的通道丢弃规则数缓存
+// ：集群同步/备份导入的文件相位统一收敛在
+// ApplyWafFileBundle，由该函数在 CRS 落盘成功后调用；manager 未初始化
+// （测试/半初始化装配）时为空操作，不 panic。
+func InvalidateCRSRuleCount() {
+	if mgr := GetCRSUpdateManager(); mgr != nil {
+		mgr.InvalidateRuleCount()
+	}
 }

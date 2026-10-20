@@ -16,7 +16,7 @@ import (
 	"golang.org/x/crypto/acme"
 )
 
-// Issuer orchestrates the full ACME DNS-01 issuance flow.
+// Issuer orchestrates the full ACME 历史修复 issuance flow.
 type Issuer struct {
 	Client              *Client
 	Provider            dnsprovider.Provider
@@ -24,7 +24,7 @@ type Issuer struct {
 	RequireRecursiveDNS bool
 }
 
-// Issue obtains a certificate for the given domains via DNS-01 challenge.
+// Issue obtains a certificate for the given domains via 历史修复 challenge.
 // It logs each stage through the Logger and cleans up DNS records afterwards.
 func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM string, err error) {
 	if len(domains) == 0 {
@@ -52,7 +52,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 		return "", "", fmt.Errorf("authorize order: %w", err)
 	}
 	log("order_created", fmt.Sprintf("订单已创建，共 %d 个授权", len(order.AuthzURLs)))
-	// DNS-87-F1（历史）：订单初始状态必须分流。新建订单正常为 pending；
+	// 历史修复（历史）：订单初始状态必须分流。新建订单正常为 pending；
 	// ready 表示授权已全部 valid（CA 幂等复用），继续走挑战循环是无害的空转；
 	// valid 表示该订单已有证书——其证书绑定的是签发方当时的 CSR 私钥，本次
 	// 新生成的 CSR 私钥与它不匹配，无法复用，必须显式失败而不是把 CA 对
@@ -69,7 +69,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 		return "", "", fmt.Errorf("订单 %s 状态 invalid%s", order.URI, errMsg)
 	}
 
-	// Step 3: Clean up any stale DNS-01 TXT records first, then present new challenges.
+	// Step 3: Clean up any stale 历史修复 TXT records first, then present new challenges.
 	type challengeInfo struct {
 		domain    string
 		tokenFQDN string
@@ -79,7 +79,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 	var localChallenges []challengeInfo
 	var presentedChallenges []ChallengeInfo
 	defer func() {
-		// DNS-87-F4（历史）：清理预算按挑战数缩放——Cleanup 串行删除，单条
+		// 历史修复（历史）：清理预算按挑战数缩放——Cleanup 串行删除，单条
 		// 删除链最坏 90s（dnspod http.Client.Timeout / tencent ReqTimeout=90），
 		// 固定 2min 会让 root+www 两域名的第二个 TXT 清理被 ctx 取消
 		//（cleanup_warning + 残留延长）。
@@ -96,7 +96,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 		}
 
 		domain := auth.Identifier.Value
-		// DNS-87-F1（历史）：RFC 8555 §7.4.1 允许 CA 复用同账号同标识的
+		// 历史修复（历史）：RFC 8555 §7.4.1 允许 CA 复用同账号同标识的
 		// 已 valid 授权（Let's Encrypt boulder reuseValidAuthz 长期开启）。
 		// valid 授权无需 TXT/挑战，直接视为已验证；终态（invalid 家族）必须
 		// 立即失败。原实现对两者都无条件 Present（多写一条 TXT 并等满 5min
@@ -111,7 +111,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 		case "pending":
 			// 常规路径：写 TXT → 等传播 → 提交挑战。
 		default:
-			// 未知状态 fail-loud：按 pending 处理会盲写 TXT 并提交挑战，
+			// 未知状态 按 pending 处理会盲写 TXT 并提交挑战，
 			// 按 valid 处理会掩盖真实状态，两者都可能把可在下一轮成功的
 			// 签发拖成失败。
 			return "", "", fmt.Errorf("授权 %s 状态 %q 无法继续 DNS-01 挑战", authURL, auth.Status)
@@ -286,7 +286,7 @@ func (i *Issuer) Cleanup(ctx context.Context, challenges []ChallengeInfo) {
 	}
 }
 
-// 清理预算（DNS-87-F4，历史）：单条删除链最坏 90s（dnspod
+// 清理预算（历史修复，历史）：单条删除链最坏 90s（dnspod
 // http.Client.Timeout / tencent HttpProfile.ReqTimeout=90s，覆盖重试包络），
 // Cleanup 串行处理全部挑战，故预算须随挑战数线性放大；下限保留原 2min，
 // 上限 8min 保证「CA 队列执行预算 60min + 清理 ≤8min < staleOwnershipAge
@@ -313,7 +313,7 @@ func dnsCleanupBudget(challengeCount int) time.Duration {
 type ChallengeInfo struct {
 	Domain    string
 	TokenFQDN string
-	// Value is the DNS-01 TXT value (key authorization digest) this record
+	// Value is the 历史修复 TXT value (key authorization digest) this record
 	// was presented with; cleanup removes only records of that value so
 	// concurrent issuances for the same domain cannot delete each other.
 	Value string
@@ -348,7 +348,7 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 	}
 
 	// ZeroSSL validation can legitimately take several minutes, so allow a
-	// generous budget instead of failing fast into an order-recreating retry.
+	// generous budget instead of failing fast into an 历史修复 retry.
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
@@ -361,7 +361,7 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 	for {
 		if chal, err := i.Client.GetChallenge(ctx, chalURL); err != nil {
 			// 历史问题：CA 限流（429）必须立即上抛——外层 detectRateLimit 据此把
-			// 任务记入 waiting_ca 按 Retry-After 退避；吞掉继续轮询会把限流
+			// 任务记入 waiting_ca 按 历史修复 退避；吞掉继续轮询会把限流
 			// 错误磨成 10 分钟超时，丢失限流语义并持续给 CA 加压。
 			if isACMERRateLimit(err) {
 				return err
@@ -397,7 +397,7 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 					case errors.As(waitErr, &authorizationErr):
 						authErr = authorizationErr
 					case waitErr != nil:
-						// DNS-87-F3（历史）：非授权错误的轮询失败（429/
+						// 历史修复（历史）：非授权错误的轮询失败（429/
 						// 网络）此前被丢弃——429 的结构化 *acme.Error 因此
 						// 无法传到 detectRateLimit，任务退化为普通失败退避
 						// 而非 waiting_ca。原样保留错误链。
@@ -433,7 +433,7 @@ func isACMERRateLimit(err error) bool {
 	return errors.As(err, &acmeErr) && acmeErr.StatusCode == http.StatusTooManyRequests
 }
 
-// dns01Challenge 返回授权中的 dns-01 挑战（无则 nil）。DNS-87-F1（历史）
+// dns01Challenge 返回授权中的 历史修复 挑战（无则 nil）。历史修复（历史）
 // 抽出供授权状态分流与常规路径共用，避免两处各写一遍遍历。
 func dns01Challenge(auth *acme.Authorization) *acme.Challenge {
 	if auth == nil {
@@ -448,7 +448,7 @@ func dns01Challenge(auth *acme.Authorization) *acme.Challenge {
 }
 
 func terminalAuthorizationError(status string, authorizationErr error, challenge *acme.Challenge) error {
-	// DNS-87-F3（历史）：%w 保留错误链——invalid 分支的 WaitAuthorization
+	// 历史修复（历史）：%w 保留错误链——invalid 分支的 WaitAuthorization
 	// 错误可能是 CA 429/网络错误，services/detectRateLimit 依赖
 	// errors.As(*acme.Error) 把任务记入 waiting_ca；%v 会让它退化为字符串
 	// 匹配。文案形态不变（单错误 %v/%w 渲染一致）。
@@ -493,6 +493,11 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 	initialAuthServers := append([]string(nil), authServers...)
 	if len(authServers) > 0 {
 		log("权威 DNS 服务器: %s", strings.Join(authServers, ", "))
+	} else {
+		// 权威快路径未建立必须留痕。原实现完全静默——用户
+		// 只能看到 30s 后那句「疑似 CNAME 委托/NS 变更」，而真实原因
+		// （查询丢包/超时/截断）在日志里没有任何痕迹。
+		log("未发现权威 DNS 服务器（%s），本次仅依赖递归共识判定传播", fqdn)
 	}
 
 	ticker := time.NewTicker(propagationPollInterval)
@@ -514,7 +519,7 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 	for {
 		// Authoritative name servers first: every reachable server must have
 		// the record before we let the CA validate. Servers that fail to
-		// respond are dropped from the list so a network-blocked server does
+		// respond are dropped from the list so a 历史修复 server does
 		// not consume the propagation budget on every tick.
 		var authLastFound []string
 		var authLastResolver string
@@ -575,10 +580,14 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 			consensusRounds = 0
 		}
 
-		// 现行兜底保留：权威存活列表为空（全部下线/解析失败）时单台递归命中
-		// 即放行——此时无权威可问，递归是唯一信号（审计 M9 场景语义不变）。
-		if len(authServers) == 0 && len(recursiveHits) > 0 {
-			log("DNS 已命中 %s @ %s, 值: %s", fqdn, recursiveHits[0], expected)
+		// 兜底限缩（历史修复，历史修复）：仅当**从未发现过权威服务器**
+		// （initialAuthServers 为空——域名没有可用 NS/解析失败）时，单台递归
+		// 命中即放行，此时递归确实是无权威可问时的唯一信号。
+		// 曾经有权威、而本轮全部探针瞬时失败的情形**不**适用该兜底：那是网络
+		// 抖动窗口，放行单台×单轮会绕过 M9 的 3 台×2 轮共识（缓存污染/超前
+		// 会被当成真传播），CA 验证失败即消耗 Let's Encrypt 5 次/时配额。
+		if len(authServers) == 0 && len(initialAuthServers) == 0 && len(recursiveHits) > 0 {
+			log("DNS 已命中 %s @ %s, 值: %s（域名无可用权威，按递归单台放行）", fqdn, recursiveHits[0], expected)
 			return nil
 		}
 
@@ -830,7 +839,7 @@ func probeTXT(ctx context.Context, server, fqdn, expected string, recursion bool
 		m.RecursionDesired = recursion
 
 		c := &dns.Client{Net: network}
-		// DNS-87-F5（历史）：单台预算单源——probeDNSParallel 已为每台
+		// 历史修复（历史）：单台预算单源——probeDNSParallel 已为每台
 		// 设置 propagationResolverProbeTimeout 独立 ctx，此处不再叠加第二个
 		// 8s 硬编码（原实现 UDP+TCP 各 8s=16s，与接缝同名不同义：按接缝上调
 		// 单台预算时实际仍被内层 16s 截断）。直接调用方（测试）须自带 deadline。
@@ -853,7 +862,7 @@ func probeTXT(ctx context.Context, server, fqdn, expected string, recursion bool
 			lastErr = fmt.Errorf("dns %s: server %s", dns.RcodeToString[r.Rcode], server)
 			continue
 		}
-		// AD-3（历史）：TC=1 的「成功」应答其 Answer 段不可信（UDP
+		// 历史修复（历史）：TC=1 的「成功」应答其 Answer 段不可信（UDP
 		// 512B 载荷上限内常被截空；同域并存多条 TXT 时权威应答恒截断）——
 		// 按 miss 处理会致 authReady 永假、假阴性烧签发配额。continue 承接
 		// 到下一网络（TCP）重查。
@@ -898,45 +907,159 @@ func detectIPv6Egress() bool {
 	return true
 }
 
+// 权威 NS 发现的网络参数。UDP 查询无连接：丢包只表现为
+// 超时，一次超时就让权威快路径在整个传播预算内静默关闭并退化为共识路径，
+// 因此 NS 查询做有限重试（2 次 + 200ms 间隔，代价远小于退化的等待）。
+const (
+	authoritativeNSQueryTimeout = 5 * time.Second
+	authoritativeNSAttempts     = 2
+	authoritativeNSRetryDelay   = 200 * time.Millisecond
+)
+
+// dnsExchange 是权威 NS 发现的 DNS 交换接缝（测试注入固定应答，生产走真实
+// 网络）。返回 nil 表示本次交换失败。包级变量——测试替换后不得并行复用。
+var dnsExchange = exchangeDNSMessage
+
+func exchangeDNSMessage(ctx context.Context, m *dns.Msg, network, addr string) *dns.Msg {
+	client := &dns.Client{Net: network, Timeout: authoritativeNSQueryTimeout}
+	r, _, err := client.ExchangeContext(ctx, m, addr)
+	if err != nil {
+		return nil
+	}
+	return r
+}
+
 // resolveAuthoritativeNS finds the authoritative name servers of fqdn's zone
 // by walking up the domain labels and querying NS records through a public
-// recursive resolver, then resolves the servers' addresses. Best-effort:
-// returns nil when the zone cannot be determined.
+// recursive resolver, then resolves the servers' addresses. // returns nil when the zone cannot be determined (and logs why once)。
 func resolveAuthoritativeNS(ctx context.Context, fqdn, bootstrap string) []string {
+	servers, reason := discoverAuthoritativeNS(ctx, fqdn, bootstrap)
+	if reason != "" {
+		// 失败留痕：原实现静默返回 nil——签发表里只剩
+		// 30s 后那条「疑似 CNAME 委托/NS 变更」的误导性诊断，无法区分解析器
+		// 丢包与真的没有权威。每次签发至多一条（本函数每次等待只调用一次）。
+		logf("warn", "acme: 权威 NS 发现失败 %s: %s（本次签发按递归共识判定传播）", fqdn, reason)
+	}
+	return servers
+}
+
+// discoverAuthoritativeNS 是 resolveAuthoritativeNS 的实现体：返回可用权威
+// 地址清单，或 nil + 失败原因（供调用方/包级日志使用）。
+func discoverAuthoritativeNS(ctx context.Context, fqdn, bootstrap string) ([]string, string) {
+	var failure string
 	query := func(name string, qtype uint16) *dns.Msg {
 		m := new(dns.Msg)
-		m.SetQuestion(name, qtype)
+		m.SetQuestion(normalizeDNSName(name), qtype)
 		m.RecursionDesired = true
-		c := &dns.Client{Net: "udp", Timeout: 5 * time.Second}
-		r, _, err := c.ExchangeContext(ctx, m, bootstrap)
-		if err != nil {
-			return nil
+		// EDNS0 4096：默认 512B UDP 载荷下 NS 应答容易被
+		// 截断（TC=1 且 Answer 段整体为空），截断应答被当作 NODATA 会一路
+		// 上溯到父域/顶级域，把别人的服务器当成本域权威。
+		m.SetEdns0(4096, false)
+		for attempt := 1; attempt <= authoritativeNSAttempts; attempt++ {
+			if attempt > 1 {
+				select {
+				case <-ctx.Done():
+					failure = "查询被取消: " + ctx.Err().Error()
+					return nil
+				case <-time.After(authoritativeNSRetryDelay):
+				}
+			}
+			r := dnsExchange(ctx, m, "udp", bootstrap)
+			if r != nil && r.Truncated {
+				// TC=1：UDP 应答不可信（Answer 可能被整体丢弃），必须 TCP 重查。
+				tcp := dnsExchange(ctx, m, "tcp", bootstrap)
+				if tcp == nil {
+					failure = fmt.Sprintf("%s %s 查询 UDP 应答被截断且 TCP 重查失败", m.Question[0].Name, dns.TypeToString[qtype])
+					continue
+				}
+				r = tcp
+			}
+			if r == nil {
+				failure = fmt.Sprintf("%s %s 查询超时或网络错误（第 %d 次）", m.Question[0].Name, dns.TypeToString[qtype], attempt)
+				continue
+			}
+			if r.Rcode != dns.RcodeSuccess && r.Rcode != dns.RcodeNameError {
+				failure = fmt.Sprintf("%s %s 查询返回 %s", m.Question[0].Name, dns.TypeToString[qtype], dns.RcodeToString[r.Rcode])
+				continue
+			}
+			return r
 		}
-		return r
+		return nil
 	}
 
 	// Walk up the labels until NS records are found, so delegated subdomains
 	// resolve to their own zone's servers.
-	name := fqdn
+	labels := strings.Split(strings.TrimSuffix(normalizeDNSName(fqdn), "."), ".")
+	zone := ""
 	var nsNames []string
 	for {
-		labels := strings.Split(strings.TrimSuffix(name, "."), ".")
-		if len(labels) <= 1 {
-			return nil
-		}
-		name = strings.Join(labels[1:], ".") + "."
-		r := query(name, dns.TypeNS)
-		if r == nil {
-			return nil
-		}
-		for _, ans := range r.Answer {
-			if ns, ok := ans.(*dns.NS); ok {
-				nsNames = append(nsNames, ns.Ns)
+		labels = labels[1:]
+		// 顶级域（单标签）不是任何 ACME 域名的区：宁可返回 nil 走共识路径，
+		// 也不把 TLD 服务器当成该域权威（88-03 的误走父域形态）。
+		if len(labels) < 2 {
+			if len(nsNames) == 0 {
+				failure = fmt.Sprintf("上溯至 %q 仍未发现 NS（%s 的区无法确定）", strings.Join(labels, "."), fqdn)
 			}
-		}
-		if len(nsNames) > 0 {
 			break
 		}
+		candidate := normalizeDNSName(strings.Join(labels, "."))
+		r := query(candidate, dns.TypeNS)
+		if r == nil {
+			return nil, failure
+		}
+		for _, ans := range r.Answer {
+			ns, ok := ans.(*dns.NS)
+			// 只接受「回答问题本身」的 NS（owner 必须等于被查询名）：应答段
+			// 里混入的其他 owner（CNAME 目标、上级区权威）不是本域的权威。
+			if !ok || !sameDNSName(ns.Hdr.Name, candidate) {
+				continue
+			}
+			nsNames = append(nsNames, normalizeDNSName(ns.Ns))
+		}
+		if len(nsNames) > 0 {
+			zone = candidate
+			break
+		}
+		// SOA 停止条件：NOERROR/NODATA 且 Authority 段带
+		// SOA 时，SOA owner 就是被查名字所属的区（可能已跳过若干标签）。直接
+		// 在该区上重查 NS，比继续按标签上溯更准确——上溯会把父域甚至顶级域
+		// 当成本域。
+		parent := soaOwner(r)
+		if parent == "" || sameDNSName(parent, candidate) || labelCount(parent) < 2 {
+			continue
+		}
+		if !dns.IsSubDomain(parent, normalizeDNSName(fqdn)) {
+			continue
+		}
+		soaReply := query(parent, dns.TypeNS)
+		if soaReply == nil {
+			return nil, failure
+		}
+		for _, ans := range soaReply.Answer {
+			ns, ok := ans.(*dns.NS)
+			if !ok || !sameDNSName(ns.Hdr.Name, parent) {
+				continue
+			}
+			nsNames = append(nsNames, normalizeDNSName(ns.Ns))
+		}
+		if len(nsNames) > 0 {
+			zone = parent
+			break
+		}
+	}
+	if len(nsNames) == 0 {
+		if failure == "" {
+			failure = fmt.Sprintf("%s 的权威 NS 未解析出来", fqdn)
+		}
+		return nil, failure
+	}
+	// 区后缀校验：发现的区必须是 fqdn 的后缀，否则应答来自
+	// 与本挑战无关的区（污染/错误应答），其服务器不可能持有记录。
+	// NS 主机名本身不做 fqdn 后缀约束：权威服务器合法地部署在区外
+	// （如 *.ns.cloudflare.com），按后缀丢弃会把大量真实域名的快路径砍掉；
+	// 防止误走父域由「owner 等于被查询名」「顶级域拒绝」「SOA 停止」共同保证。
+	if !dns.IsSubDomain(zone, normalizeDNSName(fqdn)) {
+		return nil, fmt.Sprintf("发现的区 %s 不是 %s 的后缀", zone, fqdn)
 	}
 
 	// Resolve addresses of each name server.
@@ -974,5 +1097,46 @@ func resolveAuthoritativeNS(ctx context.Context, fqdn, bootstrap string) []strin
 			}
 		}
 	}
-	return servers
+	if len(servers) == 0 {
+		// 区与 NS 都找到了、地址却一台都没解析出来：同样是「快路径静默关闭」，
+		// 必须留痕（此前只在调用方表现为权威清单为空）。
+		return nil, fmt.Sprintf("权威区 %s 的 NS（%s）地址解析全部失败", zone, strings.Join(nsNames, ", "))
+	}
+	return servers, ""
+}
+
+// normalizeDNSName 统一 FQDN 形态（去空白、小写、补末尾点）：DNS 名字大小写
+// 不敏感，而应答里的 owner 大小写不可控，比较前必须归一。
+func normalizeDNSName(name string) string {
+	return strings.ToLower(dns.Fqdn(strings.TrimSpace(name)))
+}
+
+// sameDNSName 归一后比较两个 DNS 名字。
+func sameDNSName(a, b string) bool {
+	return normalizeDNSName(a) == normalizeDNSName(b)
+}
+
+// labelCount 返回 DNS 名的标签数（去掉末尾点后按 "." 切分；空名计 0）。
+func labelCount(name string) int {
+	trimmed := strings.TrimSuffix(normalizeDNSName(name), ".")
+	if trimmed == "" {
+		return 1
+	}
+	return strings.Count(trimmed, ".") + 1
+}
+
+// soaOwner 返回应答里 SOA 记录的 owner（Answer 优先，其次 Authority 段）：
+// 递归解析器对「不是委托点」的 NS 查询返回 NOERROR/NODATA + 所属区的 SOA。
+func soaOwner(msg *dns.Msg) string {
+	if msg == nil {
+		return ""
+	}
+	for _, section := range [][]dns.RR{msg.Answer, msg.Ns} {
+		for _, rr := range section {
+			if soa, ok := rr.(*dns.SOA); ok {
+				return normalizeDNSName(soa.Hdr.Name)
+			}
+		}
+	}
+	return ""
 }

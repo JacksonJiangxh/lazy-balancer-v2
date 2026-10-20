@@ -110,7 +110,7 @@ var tools = []toolSpec{
 	{"update_security_policy", "更新指定安全策略", http.MethodPut, "/security/policies/{id}", []string{"id"}, nil, bodySchemaWithID("策略 ID")},
 	{"delete_security_policy", "删除指定安全策略", http.MethodDelete, "/security/policies/{id}", []string{"id"}, nil, idSchema("id", "策略 ID", "integer")},
 	{"bind_security_policy", "将安全策略绑定到指定规则", http.MethodPost, "/security/policies/{id}/bind", []string{"id"}, nil, bodySchemaWithID("策略 ID")},
-	// McpB-2(历史问题):DELETE 请求体恒被后端丢弃——bodySchema(任意字段放行)会误导
+	// 历史修复(历史问题):DELETE 请求体恒被后端丢弃——bodySchema(任意字段放行)会误导
 	// Agent 构造无效 body;换成路径参数契约形态(required id+caddy_id,
 	// forward 按 pathArgs 从 arguments 取值)。
 	{"unbind_security_policy", "解除安全策略与规则的绑定", http.MethodDelete, "/security/policies/{id}/bind/{caddy_id}", []string{"id", "caddy_id"}, nil, `{"type":"object","required":["id","caddy_id"],"properties":{"id":{"type":"integer","description":"策略 ID"},"caddy_id":{"type":"string","description":"规则 Caddy ID"}},"additionalProperties":false}`},
@@ -125,7 +125,7 @@ var tools = []toolSpec{
 	{"delete_block_page", "删除指定拦截页面", http.MethodDelete, "/security/block-pages/{id}", []string{"id"}, nil, idSchema("id", "页面 ID", "integer")},
 	{"list_ip_lists", "列出全部 IP 地址列表", http.MethodGet, "/security/ip-lists", nil, nil, emptySchema},
 	// 历史问题（历史）：v2.3.2 名单瘦身后 list_ip_lists 仅含 entry_count，
-	// 读条目唯一通道是 GET /security/ip-lists/:id——补工具覆盖，免豁免。
+	// 读条目唯一通道是 GET /security/历史修复/:id——补工具覆盖，免豁免。
 	{"get_ip_list", "获取指定 IP 地址列表详情（含全部条目）", http.MethodGet, "/security/ip-lists/{id}", []string{"id"}, nil, idSchema("id", "列表 ID", "integer")},
 	{"create_ip_list", "创建 IP 地址列表", http.MethodPost, "/security/ip-lists", nil, nil, bodySchema},
 	{"update_ip_list", "更新指定 IP 地址列表", http.MethodPut, "/security/ip-lists/{id}", []string{"id"}, nil, bodySchemaWithID("列表 ID")},
@@ -216,7 +216,19 @@ const bodySchema = `{"type":"object","additionalProperties":true}`
 const maxResponseSize = 4 << 20
 const InternalAuthHeader = "X-Lazy-Balancer-Internal-MCP-Auth"
 
-// 历史 K-1：MCP 工具调用经本机回环转发到内部 REST（源地址恒为
+// noPaginationToolHints 是「整份返回、无分页参数」的工具在响应超限时的专用
+// 指引。通用「改用分页或专用导出工具」对它们是死路：既没有分页参数，也没有
+// 可直接换用的导出工具——必须给该工具真能走通的路径。
+//   - export_config：lbbak 二进制包，MCP 通道本就不支持二进制下载；
+//   - get_caddy_config：Caddy 完整 JSON，单条规则片段有 get_rule_caddy_config。
+//
+// 新增此类工具时必须在此登记，否则会退回不可执行的通用文案。
+var noPaginationToolHints = map[string]string{
+	"export_config":    "配置过大：MCP 通道响应上限 4 MiB，请由管理员经管理面板或 REST /config/export 下载备份",
+	"get_caddy_config": "Caddy 完整配置超过 MCP 通道 4 MiB 上限：请在管理面板查看/导出，或改用 get_rule_caddy_config 按规则逐个查询",
+}
+
+// 历史 MCP 工具调用经本机回环转发到内部 REST（源地址恒为
 // 127.0.0.1），审计/安全记录会把全部 MCP 操作记成回环 IP。网关层把真实客户端
 // IP 注入请求 context（WithClientIP），forward 再转写为内部头；接收端仅在内部
 // 认证密钥匹配时采信该头（外部请求无法伪造审计源 IP）。
@@ -283,8 +295,8 @@ const updateRuleSchema = `{"type":"object","required":["caddy_id"],"properties":
 const issueCertificateSchema = `{"type":"object","properties":{"caddy_id":{"type":"string"},"domain":{"type":"string"},"all":{"type":"boolean","enum":[true]}},"oneOf":[{"required":["all"]},{"required":["caddy_id"]}],"additionalProperties":false}`
 const auditLogsSchema = `{"type":"object","properties":{"page":{"type":"integer","minimum":1,"default":1},"page_size":{"type":"integer","minimum":1,"maximum":100,"default":20},"username":{"type":"string","description":"操作人模糊筛选"},"action":{"type":"string","description":"操作模糊筛选"},"resource":{"type":"string","description":"对象模糊筛选"},"ip":{"type":"string","description":"IP 模糊筛选"},"keyword":{"type":"string","description":"详情关键词"},"start_time":{"type":"string","description":"开始时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"},"end_time":{"type":"string","description":"结束时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"}},"additionalProperties":false}`
 
-// 历史问题 B-F2（APIMCP45-2 更正如实描述）：schema 必须覆盖 queryArgs 声明的全部
-// 参数——运行时未启用 WithInputSchemaValidation（mcp-go v0.58.0 实证：不启用
+// 历史问题 历史修复（历史修复 更正如实描述）：schema 必须覆盖 queryArgs 声明的全部
+// 参数——运行时未启用 WithInputSchemaValidation（历史修复 v0.58.0 实证：不启用
 // 则 inputValidator 为 nil，参数不校验、也不会产生 -32602），input_schema 仅
 // 是 Agent 侧契约文档：Agent 按 tools/list 的 schema 构参，漏声明的参数（如
 // page/page_size）在 schema 上不可见，Agent 只能漏传或凭工具描述臆测。刻意
@@ -306,11 +318,11 @@ const setRuleSecurityPoliciesSchema = `{"type":"object","required":["caddy_id","
 // 避免工具层出现后端会拒绝或静默回退的取值。
 const ruleMetricsHistorySchema = `{"type":"object","required":["caddy_id"],"properties":{"caddy_id":{"type":"string","description":"规则 Caddy ID"},"range":{"type":"string","enum":["1h","6h","24h","7d"],"default":"24h","description":"时间范围，默认 24h"}},"additionalProperties":false}`
 
-// McpA-6(历史问题):dns_provider/dns_credentials 是全局配置遗留字段——证书签发链
+// 历史修复(历史问题):dns_provider/dns_credentials 是全局配置遗留字段——证书签发链
 // 实际消费 certificate_configs 表的 DNS 凭证,标注防 Agent 误把凭证写进全局配置。
 const updateConfigSchema = `{"type":"object","properties":{"source":{"type":"string"},"dns_provider":{"type":"string","description":"遗留字段，签发链不消费；DNS 凭证配置请用 certificate_configs 系列"},"dns_credentials":{"type":"string","description":"遗留字段，签发链不消费；DNS 凭证配置请用 certificate_configs 系列"},"acme_email":{"type":"string"},"cert_expiry_days":{"type":"integer"},"cert_renewal_days":{"type":"integer"},"cert_renewal_attempts":{"type":"integer"},"server_map_lat":{"type":"number","description":"威胁大屏本站纬度（-90~90，0=未设置）"},"server_map_lon":{"type":"number","description":"威胁大屏本站经度（-180~180，0=未设置）"},"threat_screen_mode":{"type":"string","enum":["map","globe"],"description":"威胁大屏模式：map=平面地图，globe=三维地球"},"threat_traffic_sample_n":{"type":"integer","enum":[-1,0,1],"description":"正常流量事件采样：-1=自适应，0=关闭，1=全量"},"security_events_retention_days":{"type":"integer","minimum":0,"maximum":3650,"description":"安全事件保留天数（0=自动，最大 3650）"},"security_events_row_cap":{"type":"integer","minimum":0,"maximum":100000000,"description":"安全事件最大行数（0=自动，最大 1 亿）"},"log_level":{"type":"string"},"caddy_log_level":{"type":"string"},"caddy_log_size_mb":{"type":"integer"},"request_body_max_size_mb":{"type":"integer"},"http_read_timeout":{"type":"integer"},"http_write_timeout":{"type":"integer"},"http_idle_timeout":{"type":"integer"},"upstream_keepalive_timeout":{"type":"integer"},"proxy_dial_timeout":{"type":"integer","minimum":0},"proxy_response_header_timeout":{"type":"integer","minimum":0},"proxy_read_timeout":{"type":"integer","minimum":0},"proxy_write_timeout":{"type":"integer","minimum":0},"proxy_stream_timeout":{"type":"integer","minimum":0},"proxy_flush_interval":{"type":"integer","minimum":-1},"proxy_stream_close_delay":{"type":"integer","minimum":0},"server_tokens_hidden":{"type":"boolean"},"trusted_proxy_enabled":{"type":"boolean","description":"受信代理（CDN 真实 IP 还原）总开关"},"trusted_proxy_ranges":{"type":"string","description":"受信代理网段（JSON 字符串数组文本，如 [\"203.0.113.0/24\"]；裸 IP 自动补 /32 或 /128；仅这些来源的 X-Forwarded-For 被采信）"},"trusted_proxy_range_refs":{"type":"string","description":"受信代理引用的 IP 地址列表 id（JSON 整数数组文本，如 [3,7]；与 trusted_proxy_ranges 合并生效）"},"trusted_proxy_headers":{"type":"string","description":"真实 IP 取值头（JSON 字符串数组文本，如 [\"X-Forwarded-For\",\"X-Real-IP\"]；按数组顺序取值）"},"trusted_proxy_strict":{"type":"boolean","description":"严格模式：非受信来源的伪造头一律拒绝"},"task_log_size_mb":{"type":"integer"},"runtime_log_size_mb":{"type":"integer"},"access_log_json":{"type":"boolean"},"access_log_format":{"type":"string"},"audit_retention_months":{"type":"integer"},"jwt_expire_minutes":{"type":"integer"},"timezone":{"type":"string"},"default_ca_provider_id":{"type":"integer"},"audit_log_size_mb":{"type":"integer"},"mfa_write_guard":{"type":"boolean"},"mfa_lockout_enabled":{"type":"boolean"},"github_proxy_url":{"type":"string","enum":["https://v4.gh-proxy.org/","https://axisnow.gh-proxy.org/","https://cdn.gh-proxy.org/"]},"github_token":{"type":"string","description":"可选 GITHUB_TOKEN（认证后 GitHub API 限流 60→5000 次/小时）；空串=清除已配置令牌，非空=覆盖，省略=保持现值；响应面仅以 has_github_token 显隐"}},"additionalProperties":false}`
 
-// New 无内部鉴权密钥的装配入口（APIMCP-71-1，历史裁定保留）：
+// New 无内部鉴权密钥的装配入口（API历史修复，历史裁定保留）：
 // 仅供测试夹具使用——生产装配唯一走 NewWithInternalAuth（网关注入内部
 // 鉴权密钥），生产代码不得改用本入口。
 func New(baseURL string, client *http.Client) http.Handler {
@@ -433,7 +445,7 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 	}
 	response, err := redirectlessClient.Do(request)
 	if err != nil {
-		// APIMCP44-3(历史 历史问题):超时错误补状态核对提示——回环客户端
+		// 历史修复(历史 历史问题):超时错误补状态核对提示——回环客户端
 		// 60s 超时仅说明传输层未等到响应,服务端可能已处理完毕(备份/导入/
 		// 重启等长操作),直接重试会重复执行非幂等操作。
 		var netErr net.Error
@@ -491,18 +503,22 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 		return nil, fmt.Errorf("读取内部 API 响应: %w", err)
 	}
 	if len(responseBody) > maxResponseSize {
-		// export_config 无分页参数也无其他导出工具（2026-09 审计 F15）——通用
-		// 「分页/专用导出工具」指引对它是死路，改指面板/REST 下载备份。
+		// 通用「分页/专用导出工具」指引只对能分页或已有专用读工具的工具成立。
+		// 无分页能力、也无替代读通道的整份导出类工具必须先给可执行指引——
+		// 对它们是死路：
+		//   - export_config：备份是 lbbak 二进制包，MCP 通道不支持二进制；
+		//   - get_caddy_config：返回 Caddy 完整 JSON，无分页参数，逐规则片段
+		//     要改用 get_rule_caddy_config。
 		message := "内部 API 响应超过 4 MiB 上限，请改用分页或专用导出工具"
-		if spec.name == "export_config" {
-			message = "配置过大：MCP 通道响应上限 4 MiB，请由管理员经管理面板或 REST /config/export 下载备份"
+		if hint, ok := noPaginationToolHints[spec.name]; ok {
+			message = hint
 		}
 		result := mcp.NewToolResultText(message)
 		result.IsError = true
 		return result, nil
 	}
 	// 历史问题(C5):v2.3.0 导出恒为 lbbak 二进制 tar.gz(application/gzip)。
-	// gzip 字节经 NewToolResultText 会以文本形态静默损坏(UTF-8 替换/截断),
+	// gzip 字节经 NewToolResultText 会以文本形态静默损坏(历史修复 替换/截断),
 	// 4 MiB 内也必须拒收——给可行动指引而非损坏数据。
 	if spec.name == "export_config" && !strings.HasPrefix(strings.TrimSpace(strings.ToLower(response.Header.Get("Content-Type"))), "application/json") {
 		result := mcp.NewToolResultText("配置备份为 lbbak 二进制压缩包（tar.gz），MCP 通道不支持二进制下载，请经管理面板或 REST /config/export 下载")
@@ -538,7 +554,7 @@ func generateRandomPassword(length int) (string, error) {
 
 // isReplayableRedirectStatus 判定可按原方法/原请求体重放的重定向状态码
 // （历史 历史问题-1）：面板 TLS 嗅探层对明文请求回 302，兼容 301/307/308。
-// CI87-14（历史）：集合单源化到 netutil.IsTLSUpgradeRedirect——此前 MCP
+// 历史修复（历史）：集合单源化到 netutil.IsTLSUpgradeRedirect——此前 MCP
 // 转发与 services 同主机升级客户端各写一份 301/302/307/308 字面量，一侧新增
 // 状态码即静默分叉。重放目标仍由 isLoopbackHTTPURL 约束（凭证不出回环）。
 func isReplayableRedirectStatus(code int) bool {
@@ -580,7 +596,7 @@ func idSchema(name, description, valueType string) string {
 
 // bodySchemaWithID 为「按 id 更新且 body 字段随工具而异」的工具声明路径参数：
 // 保留宽松 body（additionalProperties:true 向前兼容），同时把 id 写进
-// properties（CI87-05：此前这些工具复用 bodySchema，pathArgs 声明了 id 却无
+// properties（此前这些工具复用 bodySchema，pathArgs 声明了 id 却无
 // 任何 schema 线索，Agent 只能凭描述猜参数名）。
 func bodySchemaWithID(description string) string {
 	return fmt.Sprintf(`{"type":"object","properties":{"id":{"type":"integer","description":%q}},"additionalProperties":true}`, description)

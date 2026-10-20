@@ -488,6 +488,11 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 		if raErr := detectRateLimit(err); raErr != nil {
 			return raErr
 		}
+		// 队列暂停/节点 drain 取消在途执行：不得把取消写成终态 failed——
+		// 外层 handleExecutionCancellation 会 requeue；先 failJob 会让终态无法回退。
+		if ctx.Err() != nil {
+			return fmt.Errorf("CA provider test canceled: %w", err)
+		}
 		// 历史问题-03（复核修正）：审计报告称 from=creating_account 恒不命中，
 		// 但上方 logger.Log("creating_account", …) 已先行迁移状态（from=全部
 		// 非 disabled），原 CAS 实际可命中——报告前提证伪。改用 failJob（from=

@@ -1,6 +1,6 @@
 package services
 
-// （不再内部二次查表） / L1-05 装配暂停与 BootSync 后恢复调度的结构钉。
+// （不再内部二次查表） / 历史修复 装配暂停与 BootSync 后恢复调度的结构钉。
 
 import (
 	"errors"
@@ -30,7 +30,7 @@ func TestApplyTaskLoopPrefs_consumesProvidedSnapshot(t *testing.T) {
 	}
 }
 
-// L1-05：InitTaskEngine 装配期调度暂停、BootSync 完成后恢复——直接观察
+// InitTaskEngine 装配期调度暂停、BootSync 完成后恢复——直接观察
 // 引擎公开执行门，不再读取源码文本。暂停门与 tick 共用 schedPaused，BootSync
 // 的 startup 触发是该暂停期唯一豁免。
 func TestInitTaskEngine_pausesTickUntilBootSyncDone(t *testing.T) {
@@ -73,6 +73,13 @@ func TestInitTaskEngine_pausesTickUntilBootSyncDone(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("InitTaskEngine did not finish after BootSync release")
 	}
+	// 看门狗整轮未判定现在会返回错误（Caddy admin 不可达=未判定），
+	// 本用例断言的是「BootSync 后调度已恢复」，故注入可用的假 Caddy admin，
+	// 使 Trigger 的成功/失败只反映调度门状态。
+	server := fakeCaddyWithRoutes(t, emptyCaddyConfig)
+	oldURL := watchdogAdminURLValue
+	watchdogAdminURLValue = server.URL
+	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
 	if err := te.Trigger("config-watchdog", "manual", "test"); err != nil {
 		t.Fatalf("execution after BootSync must be resumed: %v", err)
 	}

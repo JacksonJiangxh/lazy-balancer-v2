@@ -67,7 +67,6 @@ test('A86 历史问题：start 立即补 immediate tick 并挂起全部间隔', 
   assert.equal(h.counts.collector, 1, '采集租约立即获取')
   assert.equal(h.counts.arc, 0, '弧光冲刷无 immediate')
   assert.equal(h.win.size, 3, '三个间隔全部在跑')
-  assert.equal(h.loop.running, true)
   h.win.fire()
   assert.deepEqual(h.counts, { clock: 2, arc: 1, collector: 2 })
   h.loop.stop()
@@ -80,7 +79,6 @@ test('A86 历史问题：hidden 停止全部间隔并回调 onHidden（释放租
   h.doc.dispatchVisibility()
   assert.equal(h.win.size, 0, 'hidden 后不允许任何间隔继续跑')
   assert.equal(h.hiddenCalls, 1)
-  assert.equal(h.loop.running, false)
   const snapshot = { ...h.counts }
   h.win.fire()
   assert.deepEqual(h.counts, snapshot, 'hidden 后 tick 不得再发生')
@@ -127,7 +125,7 @@ test('A86 历史问题：stop 摘除监听并清空间隔，幂等', () => {
   h.doc.dispatchVisibility()
   assert.equal(h.hiddenCalls, 0, 'stop 后事件不得再触达回调')
   h.loop.stop()
-  assert.equal(h.loop.running, false)
+  assert.equal(h.win.size, 0, '幂等 stop 后仍无间隔')
 })
 
 test('A86 历史问题：挂载即 hidden 不起间隔不取租约，恢复可见后正常启动', () => {

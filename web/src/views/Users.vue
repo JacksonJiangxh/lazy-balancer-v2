@@ -324,7 +324,10 @@ const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 const users = ref<UserListItem[]>([])
 // 历史问题-F5：列表加载失败与真实空列表不可区分 → 显性错误态 + 重试
 const loadError = ref(false)
-const mfaWriteGuard = ref(false)
+// FE-70-8 同口径：mfa_write_guard 读 authStore.fetchConfig 消费面（曾挂载单取
+// GET /config 只为一个键，与 /config 的 15s 刷新重复；store ref 响应式，
+// 挂载早于 fetchConfig 完成也会随后收敛）。首值 false = 守卫关闭的保守形态。
+const mfaWriteGuard = computed(() => authStore.mfaWriteGuard)
 const showForm = ref(false)
 
 // 只读原因文案（从节点只读/非管理员只读/加载中）——操作列禁用 tooltip 统一口径
@@ -734,14 +737,6 @@ const copyMfaRecovery = async (): Promise<void> => {
 onMounted(() => {
   fetchUsers()
   void fetchOIDCStatus()
-  void (async () => {
-    try {
-      const res = await request.get('/config')
-      mfaWriteGuard.value = !!res.data?.mfa_write_guard
-    } catch {
-      // 读取失败按守卫关闭处理——重置对话框维持原有验码形态（保守）
-    }
-  })()
 })
 </script>
 

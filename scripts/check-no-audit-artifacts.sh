@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-patterns='(^|/)docs/audit/|(^|/)(audit[0-9]+|audit_round[0-9]+|r[0-9]+|round[0-9]+)[^/]*_test\.(go|ts)$|(^|/)[^/]*_(audit[0-9]+|r[0-9]+|round[0-9]+)[^/]*_test\.(go|ts)$|(^|/)[^/]*_(r|round)[0-9]+[^/]*_test\.(go|ts)$'
+patterns='(^|/)docs/audit/|(^|/)(audit[0-9]+|audit_round[0-9]+|r[0-9]+|round[0-9]+)[^/]*(_test\.(go|ts)|\.spec\.ts)$|(^|/)[^/]*_(audit[0-9]+|r[0-9]+|round[0-9]+)[^/]*(_test\.(go|ts)|\.spec\.ts)$|(^|/)[^/]*_(r|round)[0-9]+[^/]*(_test\.(go|ts)|\.spec\.ts)$'
 bad=$(git ls-files | grep -E "$patterns" || true)
 if [[ -n "$bad" ]]; then
   echo "ERROR: 审计记录/轮次测试不得提交到公网仓库：" >&2

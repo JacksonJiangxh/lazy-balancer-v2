@@ -454,6 +454,15 @@ export const aclAssociateSides = (mode: string | undefined): { deny: boolean; al
   allow: mode === 'allow',
 })
 
+// 拦截页回落文案（i18n 单源）：渲染侧的真实回落不是「默认 403」——403/429 错误
+// 路由取**绑定链中首个「启用且有非空页」的策略**（internal/services/caddy.go
+// buildBlockPageErrorRoute / buildRateLimitErrorRoute），可能正是同链其他策略；
+// 逐策略归因由 resolveBlockPageAttribution 单源计算。行文案不得断言「回落默认」，
+// 否则多策略绑定下会显示错误目标（排障时误判用户看到哪张拦截页）。
+const BLOCK_PAGE_UNSET_403 = '未配置（跟随绑定链首个有效页，无则默认 403）'
+const BLOCK_PAGE_BROKEN_403 = '已失效（回落绑定链首个有效页）'
+const BLOCK_PAGE_BROKEN_429 = '已失效（回落绑定链首个有效页，无则默认 429）'
+
 const buildStage1Rows = (
   policy: SecurityStagePolicy | undefined,
   ipLists: readonly SecurityStageIPList[],
@@ -478,14 +487,15 @@ const buildStage1Rows = (
   if (s1PageId > 0) {
     const page = blockPages.find((p) => p.id === s1PageId)
     const broken = !page || (page.content ?? '') === ''
-    rows.push({ label: '拦截页（策略页）', detail: broken ? '已失效（回落默认 403）' : `${page?.name}（状态码 ${policy?.block_status_code || 403}）` })
+    rows.push({ label: '拦截页（策略页）', detail: broken ? BLOCK_PAGE_BROKEN_403 : `${page?.name}（状态码 ${policy?.block_status_code || 403}）` })
   }
   // 规则级阶段页覆盖行（v2.3.1 逐策略归因默认层 = 403）：
-  // 已配 → 规则覆盖；页已删/内容空 → 失效（回落跟随策略）；未配 → 跟随默认 403。
+  // 已配 → 规则覆盖；页已删/内容空 → 失效（回落跟随策略）；未配 → 回落绑定链
+  // 首个有效页（无则默认 403，见 BLOCK_PAGE_UNSET_403）。
   // 仅携带于有能力行的策略组——空能力不虚增阶段 1 组（未启用判定不受影响）
   if (rows.length > 0) {
     const override = resolveStageOverride(stagePages?.block_page_stage1_id, stagePages?.block_page_stage1_status, blockPages)
-    if (override === null) rows.push({ label: '拦截页', detail: '未配置（跟随默认 403）' })
+    if (override === null) rows.push({ label: '拦截页', detail: BLOCK_PAGE_UNSET_403 })
     else if (override.broken) rows.push({ label: '拦截页', detail: '已失效（回落跟随策略）' })
     else rows.push({ label: '拦截页', detail: `规则覆盖：${override.pageName}（状态码 ${override.status}）` })
   }
@@ -517,13 +527,14 @@ const buildStage3Rows = (
   // 「拦截页」行（v2.3.1 归因口径）：规则级覆盖与策略级页并存展示，措辞区分——
   // 规则覆盖已配 → 「拦截页（规则覆盖）：页名（状态码 X）」（渲染语义=覆盖优先）；
   // 覆盖页已删/内容空 → 已失效（回落跟随策略 = 下方策略级行生效）；
-  // 未配 → 仅现有策略级行（binding.block_page_id → 页名 / 未配置（跟随默认 403）/ 已失效回落首策略）；
+  // 未配 → 仅现有策略级行（binding.block_page_id → 页名 / BLOCK_PAGE_UNSET_403 /
+  // BLOCK_PAGE_BROKEN_403——真实回落目标由绑定链决定，见 BLOCK_PAGE_* 注释）；
   // 未配置措辞与阶段 1 统一（2026-09-21 用户裁定），失效措辞保留差异：回落目标不同（首策略 vs 跟随策略）
   const pageId = binding.block_page_id ?? 0
   const page = pageId > 0 ? blockPages.find((p) => p.id === pageId) : undefined
   const pageBroken = pageId > 0 && (!page || (page.content ?? '') === '')
-  const policyPageDetail = pageId <= 0 ? '未配置（跟随默认 403）'
-    : pageBroken ? '已失效（回落首策略）'
+  const policyPageDetail = pageId <= 0 ? BLOCK_PAGE_UNSET_403
+    : pageBroken ? BLOCK_PAGE_BROKEN_403
     : `${page?.name}（状态码 ${binding.block_status_code || 403}）`
   const ruleOverride = resolveStageOverride(stagePages?.block_page_stage3_id, stagePages?.block_page_stage3_status, blockPages)
   if (ruleOverride === null) {
@@ -569,11 +580,12 @@ export const buildStageModel = (
       if (s2PageId > 0) {
         const page = blockPages.find((p) => p.id === s2PageId)
         // 历史问题-08：与阶段 1/3 同口径——页已删/内容空不得静默省略，须显示
-        // 「已失效（回落默认 429）」，否则用户看不到回落目标（与同抽屉其余阶段分裂）。
+        // 失效文案（BLOCK_PAGE_BROKEN_429），否则用户看不到回落目标（与同抽屉
+        // 其余阶段分裂）。
         const broken = !page || (page.content ?? '') === ''
         s2rows.push({
           label: '拦截页（策略页）',
-          detail: broken ? '已失效（回落默认 429）' : `${page.name}（429 时渲染）`,
+          detail: broken ? BLOCK_PAGE_BROKEN_429 : `${page.name}（429 时渲染）`,
         })
       }
       stage2Groups.push({ ...base, rows: s2rows })

@@ -19,7 +19,11 @@ func TestCopyDirTransactional_renameFailureCleansTmp(t *testing.T) {
 	writeTestFile(t, filepath.Join(src, "a.conf"), "SecRule 1")
 	writeTestFile(t, filepath.Join(dst, "occupant"), "block rename")
 
-	// When 事务化拷贝执行到最后一步 rename
+	// When 事务化拷贝执行到最后一步 rename（用 seam 强制失败，避免依赖
+	// 目标目录非空的旧假设——历史修复 后旧 dst 会在 rename 前被清理）
+	oldRename := copyDirRename
+	copyDirRename = func(string, string) error { return errors.New("rename blocked") }
+	defer func() { copyDirRename = oldRename }()
 	err := copyDirTransactional(src, dst)
 
 	// Then 返回错误且 tmp 暂存树被清理
@@ -120,7 +124,7 @@ func TestSeedCRSRules_partialLiveTreeIsReseeded(t *testing.T) {
 }
 
 // TestIP2RegionUpdateRun_failOpenMessageCarriesRollbackCause 验证 历史修复 B-#6：
-// 回滚升级链全部失败走 fail-open 时，DB message 必须携带回滚失败根因——
+// 回滚升级链全部失败走 历史修复 时，DB message 必须携带回滚失败根因——
 // 仅进组件日志会让运维把磁盘/DB 状态误判为纯重载问题。
 func TestIP2RegionUpdateRun_failOpenMessageCarriesRollbackCause(t *testing.T) {
 	// Given 全部回滚基线失败：reloader 首次失败时将 live 换成目录，此后
@@ -155,7 +159,7 @@ func TestIP2RegionUpdateRun_failOpenMessageCarriesRollbackCause(t *testing.T) {
 	// When 安装成功但 reloader 持续失败、且全部回滚基线均失败
 	m.run("manual", nil)
 
-	// Then U02-F07：live 被换成目录（非新工件普通文件）→ fail-open 被拒绝，
+	// Then live 被换成目录（非新工件普通文件）→ 历史修复 被拒绝，
 	// 落 failed+旧版本；不得把未验证的目录形态认成「已生效」。
 	_, status, message, _, _, _, _ := ip2RegionVersionRow(t)
 	if status != "failed" {

@@ -1441,7 +1441,9 @@ onBeforeUnmount(() => {
 .type-legend .cnt { margin-left: auto; font-weight: 700; font-size: 16px; font-variant-numeric: tabular-nums; color: #e2ecff; }
 
 /* ---------- 底部双图 ---------- */
-.chart-box { flex: 1; min-height: 0; padding: 6px 14px 4px; display: flex; flex-direction: column; }
+/* position:relative 为 .traffic-legend 的定位锚点：无定位时绝对定位元素上溯到
+   .panel（hud），top:8px 会压住 .panel-head 的 .meta 文字。 */
+.chart-box { position: relative; flex: 1; min-height: 0; padding: 6px 14px 4px; display: flex; flex-direction: column; }
 .timeline-svg, .normal-spark { width: 100%; flex: 1; min-height: 0; display: block; }
 .timeline-stroke { fill: none; stroke: #ff7a2f; stroke-width: 1.6; vector-effect: non-scaling-stroke; filter: drop-shadow(0 0 4px rgba(255, 122, 47, 0.5)); }
 .timeline-fill { fill: rgba(255, 122, 47, 0.12); }

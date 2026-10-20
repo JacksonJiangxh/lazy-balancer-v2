@@ -114,7 +114,7 @@ func TestIP2RegionRegionTree_scan(t *testing.T) {
 		}
 	}
 
-	// 历史修复：UEruemqi 段回收——新疆/乌鲁木齐市 必须在位（此前整段被丢）；
+	// UEruemqi 段回收——新疆/乌鲁木齐市 必须在位（此前整段被丢）；
 	// revision 机制保证旧缓存自动重建。
 	if tree.Revision != treeCacheRevision {
 		t.Fatalf("tree revision=%q, want %q", tree.Revision, treeCacheRevision)

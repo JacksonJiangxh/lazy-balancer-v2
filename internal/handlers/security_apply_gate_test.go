@@ -1,9 +1,9 @@
 package handlers
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -165,35 +165,86 @@ func TestSecurityWrites_serializeWithRuleWrites(t *testing.T) {
 	}
 }
 
-func TestSecurityWriteBodies_bindBeforeCaddyOpLock(t *testing.T) {
-	tests := []struct {
-		file      string
-		functions []string
+// 历史修复（源码文本断言退役）：绑定必须先于 caddyOpMu——可观察契约是
+// 「请求体尚未到齐时不得持共享锁」。以阻塞 body 证明：处理器读完 body 之后才
+// 触碰 caddyOpMu，慢客户端不会把规则域/安全域的全部写操作串行化在锁上。
+func TestSecurityWrite_parsesBodyBeforeCaddyOpLock(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(fakeCaddy.Close)
+	h := &Handlers{caddyService: services.NewCaddyService(fakeCaddy.URL)}
+	router := gin.New()
+	router.POST("/security/custom-rules", h.CreateSecurityCustomRule)
+	router.POST("/security/ip-lists", h.CreateIPList)
+
+	cases := []struct {
+		name string
+		path string
+		body string
 	}{
-		{"security.go", []string{"CreateSecurityCustomRule", "UpdateSecurityCustomRule", "CreateSecurityBlockPage", "UpdateSecurityBlockPage", "CreateSecurityPolicy", "UpdateSecurityPolicy", "BindRuleToPolicy", "SetRuleSecurityPolicies", "BulkUpdatePolicyBindings", "BatchBindSecurityPolicies"}},
-		{"securityiplists.go", []string{"CreateIPList", "UpdateIPList", "AddIPToList", "RemoveIPFromList"}},
+		{"custom rule", "/security/custom-rules", `{"name":"慢体规则","conditions":[{"target":"uri","operator":"contains","pattern":"/x"}],"action":"block","score":5,"enabled":true}`},
+		{"ip list", "/security/ip-lists", `{"name":"慢体名单","category":"测试","entries":[]}`},
 	}
-	for _, tc := range tests {
-		raw, err := os.ReadFile(tc.file)
-		if err != nil {
-			t.Fatalf("read %s: %v", tc.file, err)
-		}
-		source := string(raw)
-		for _, name := range tc.functions {
-			start := strings.Index(source, "func (h *Handlers) "+name+"(")
-			if start < 0 {
-				t.Errorf("%s: %s not found", tc.file, name)
-				continue
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := newGatedRequestBody(tc.body)
+			req := httptest.NewRequest(http.MethodPost, tc.path, body)
+			req.Header.Set("Content-Type", "application/json")
+			done := make(chan struct{})
+			go func() {
+				router.ServeHTTP(httptest.NewRecorder(), req)
+				close(done)
+			}()
+
+			// body 已被读取（处理器已进入绑定阶段，仍阻塞在 body 上）
+			select {
+			case <-body.started:
+			case <-time.After(5 * time.Second):
+				close(body.release)
+				t.Fatal("处理器未开始读取请求体")
 			}
-			body := source[start:]
-			if end := strings.Index(body, "\nfunc "); end > 0 {
-				body = body[:end]
+			// 此刻共享锁必须空闲：绑定先于加锁
+			if !h.caddyOpMu.TryLock() {
+				close(body.release)
+				t.Fatalf("%s: 请求体未到齐即持有 caddyOpMu（绑定被锁串行化）", tc.name)
 			}
-			bind := strings.Index(body, "c.ShouldBindJSON")
-			lock := strings.Index(body, "h.caddyOpMu.Lock()")
-			if bind < 0 || lock < 0 || bind > lock {
-				t.Errorf("%s.%s: request body must be bound before caddyOpMu (bind=%d lock=%d)", tc.file, name, bind, lock)
+			h.caddyOpMu.Unlock()
+
+			close(body.release)
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s: body 放行后请求未完成", tc.name)
 			}
-		}
+		})
 	}
+}
+
+// gatedRequestBody 在首次 Read 时通知 started，随后阻塞到 release 关闭才交付
+// 完整 JSON（模拟慢客户端）。
+type gatedRequestBody struct {
+	payload []byte
+	offset  int
+	started chan struct{}
+	release chan struct{}
+}
+
+func newGatedRequestBody(payload string) *gatedRequestBody {
+	return &gatedRequestBody{payload: []byte(payload), started: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+func (b *gatedRequestBody) Read(p []byte) (int, error) {
+	select {
+	case b.started <- struct{}{}:
+	default:
+	}
+	<-b.release
+	if b.offset >= len(b.payload) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.payload[b.offset:])
+	b.offset += n
+	return n, nil
 }

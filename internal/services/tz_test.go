@@ -3,6 +3,8 @@ package services
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"log"
 	"strings"
 	"testing"
@@ -51,7 +53,7 @@ func TestTimezoneRefresh_stops_and_waits_when_context_is_canceled(t *testing.T) 
 	cancel()
 
 	// Then: <-done 返回即证明循环已停止且等待闭合（阻塞则测试超时失败；
-	// SYS-T3 历史：原 <-done 之后的 select-default 分支恒不可达，已删）。
+	// 历史修复 历史：原 <-done 之后的 历史修复 分支恒不可达，已删）。
 	<-done
 
 	t.Cleanup(func() { StartTimezoneRefresh(context.Background()) })
@@ -91,7 +93,7 @@ func TestApplicationLogWriterFiltersRawStandardLogsAtConfiguredThreshold(t *test
 	t.Cleanup(func() { _ = ConfigureLogLevel("info") })
 }
 
-// U7b-F2（历史）：DB 初始化完成点即时刷新时区——init 期 worker 首查时
+// 历史修复（历史）：DB 初始化完成点即时刷新时区——init 期 worker 首查时
 // DB 未就绪恒空转，配置时区此前最长要等 30s ticker 才生效（FixedZone+8 占位
 // 窗口）。ApplyLogLevel 是 main 在 db.Initialize 完成后的首个 services 装配点
 // （亦为集群导入 users 节后的调用点），在此追加一次即时 refreshLocation。
@@ -123,7 +125,7 @@ func TestApplyLogLevel_refreshesTimezoneImmediately(t *testing.T) {
 	}
 }
 
-// U7b-F5（历史）：applicationLogWriter 透传 sink 的真实返回值——短写
+// 历史修复（历史）：applicationLogWriter 透传 sink 的真实返回值——短写
 // 返回 len(p) 偏离 io.Writer 契约（装饰器不得替 sink 谎报写入量）。
 func TestApplicationLogWriter_writeReturnsSinkWrittenCount(t *testing.T) {
 	oldLevel := CurrentLogLevel()
@@ -142,6 +144,43 @@ func TestApplicationLogWriter_writeReturnsSinkWrittenCount(t *testing.T) {
 	if n != 3 {
 		t.Fatalf("Write returned %d, want sink's 3（短写必须如实返回 written）", n)
 	}
+}
+
+// 多行 payload 被逐行过滤后 out 短于 p 时，必须返回
+// (len(p), nil)——sink 已写满被保留内容即代表入参全部被消费。旧实现返回
+// sink 的 written(<len(p)) 且 err=nil，违反 io.Writer 契约（短写敏感消费者
+// 会当成截断）。sink 自身短写则按契约报 io.ErrShortWrite。
+func TestApplicationLogWriter_multilineFilterHonorsWriterContract(t *testing.T) {
+	oldLevel := CurrentLogLevel()
+	t.Cleanup(func() { _ = ConfigureLogLevel(oldLevel) })
+	if err := ConfigureLogLevel("warn"); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("WARNING: kept\nordinary dropped\nERROR: kept too\n")
+
+	t.Run("filtered payload reports full consumption", func(t *testing.T) {
+		var output bytes.Buffer
+		n, err := NewApplicationLogWriter(&output).Write(payload)
+		if err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if n != len(payload) {
+			t.Fatalf("Write returned %d, want len(p)=%d（过滤掉的行也算已消费）", n, len(payload))
+		}
+		if got, want := output.String(), "WARNING: kept\nERROR: kept too\n"; got != want {
+			t.Fatalf("output=%q, want %q", got, want)
+		}
+	})
+
+	t.Run("sink short write surfaces io.ErrShortWrite", func(t *testing.T) {
+		n, err := NewApplicationLogWriter(&shortWriteSink{n: 3}).Write(payload)
+		if !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("err=%v, want io.ErrShortWrite", err)
+		}
+		if n != 0 {
+			t.Fatalf("n=%d, want 0（无法映射回入参字节）", n)
+		}
+	})
 }
 
 // shortWriteSink 恒短写返回 (n, nil) 的 sink。

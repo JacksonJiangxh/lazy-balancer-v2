@@ -193,7 +193,7 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	}
 	// 主节点为各从节点独立配置的大屏站点坐标：只取本地 registration_id 对应的
 	// 一项写入本机 global_config；不触碰其他节点，也不参与通用 global_config
-	// 同步列/触发器的版本传播（node-local 字段）。
+	// 同步列/触发器的版本传播（历史修复 字段）。
 	if len(snapshot.NodeSites) > 0 {
 		var registrationID int
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(registration_id,0) FROM global_config WHERE id=1`).Scan(&registrationID); err != nil {
@@ -205,7 +205,7 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 			}
 		}
 	}
-	// 历史问题 A-N5：证书文件轴（删旧+写新）与 cert_jobs 替换同门于 rules 开关——
+	// 历史问题 证书文件轴（删旧+写新）与 cert_jobs 替换同门于 rules 开关——
 	// 开关关闭时从节点本地 acme_dns 规则保留，其证书行/文件不得按主节点快照删改。
 	// F-历史问题-01：证书轴差异（删/增/内容变更）是末段条件重载的强制信号——证书
 	// 文件路径确定性意味着内容变化时渲染 JSON 字节不变，不强制则 Caddy 内存
@@ -280,11 +280,11 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 		// 同步校验/应用只写应用日志与审计，不写其他任务的三库日志。
 		bundle, ferr := s.fetchWafFiles(ctx, snapshot.WafFiles)
 		// 历史问题-历史问题（历史）：调用点持 WafFileLock——与 lbbak 导入
-		// （config_backup_lbbak.go caller-side 持锁）、三库更新器（内锁）与
+		// （config_backup_lbbak.go 历史修复 持锁）、三库更新器（内锁）与
 		// BuildWafFileBundle 读相位（内锁）串行，杜绝同步落盘与导入/更新交错
 		// 打出混合 rules 树/撕裂 xdb。ApplyWafFileBundle 本体不可内锁（lbbak
 		// 已持锁调用，内锁=双锁死锁）。锁序：本点不持 CaddyOpLock（重载段在
-		// 下方 :253 才取），wafFileMu 叶操作，无 AB-BA。
+		// 下方 :253 才取），wafFileMu 叶操作，无 历史修复。
 		var aerr error
 		if ferr == nil {
 			WafFileLock().Lock()
@@ -332,7 +332,7 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 		}
 	}
 	// 历史问题：安全节替换 security_ip_lists 后重建爬虫运行快照（插件只读
-	// /app/data/crawler-ip-lists.json，不从 DB 派生；无此钩子时从节点/升主/
+	// /app/data/历史修复.json，不从 DB 派生；无此钩子时从节点/升主/
 	// 导入后执行面停在旧代或缺失，爬虫豁免/伪装判定与主节点分裂）。快照写
 	// 失败不回滚已提交快照——留痕后由下次更新/重启收敛。
 	if switches.Security && !skip.skip("security") {
@@ -342,7 +342,7 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	}
 	// Caddy 重载必须在事务提交之后：buildWafHandler 等安全配置读取走 db.DB，
 	// 提交前的事务内生成看不到本次写入的 security_* 表。重载失败仅记录，
-	// 不回滚已提交的快照。历史问题 二十六次 W1-1：本路径必须强制——证书文件
+	// 不回滚已提交的快照。历史问题 二十六次 本路径必须强制——证书文件
 	// （materializeSnapshotCerts）与 WAF 数据（ApplyWafFileBundle）在生成前已
 	// 落盘，生成期内容比对相等 → 快照为空 → 自动强制不触发；而「仅数据文件
 	// 变化、JSON 字节相同」正是 errSameConfig 短路让从节点插件内存停留旧库的
@@ -542,7 +542,7 @@ func (s *SyncService) materializeSnapshotDNSOwnership(acme *models.ClusterACMESt
 			return err
 		}
 	}
-	// 与 DNS-01 签发共用 ownership 包的单源原子写与 fileMu：apply 期间即使
+	// 与 历史修复 签发共用 ownership 包的单源原子写与 fileMu：apply 期间即使
 	// 退役队列的 zombie 执行仍在 Add/Remove，也不会与整文件替换交错。锁只在
 	// Replace 内覆盖文件 I/O；调用方事务/其他锁不会在 fileMu 内被反向获取。
 	return ownership.Replace(dataDir, acme.DNSOwnership)
@@ -601,7 +601,7 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 	// cert_jobs 存主节点下发的证书（从节点自身不签发），与 ca_providers/certificate_configs
 	// 同为全量替换，不纳入 rules 节哈希跳过：rules 节命中哈希跳过后证书 INSERT 仍会重放，
 	// 残留旧行会撞 (rule_id,domain) 唯一索引，导致同步永久失败。
-	// 历史问题 A-N5：仅哈希跳过（unchanged）保持上述全量回放；rules 开关关闭（disabled）时
+	// 历史问题 仅哈希跳过（unchanged）保持上述全量回放；rules 开关关闭（disabled）时
 	// 证书轴必须联动跳过——证书行/文件是规则轴的派生数据：开关关闭时从节点保留本地
 	// 规则（含 enabled=1 的 acme_dns 规则），若仍清空 cert_jobs 并按主节点快照删本地
 	// 证书文件，从节点该规则的 TLS 会静默永久丢失（渲染侧无证书即不入 TLS 连接策略，
@@ -612,17 +612,23 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 			return err
 		}
 	}
-	// SC-4：login_failed_attempts/login_locked_until 是从节点登录端点写入的本地
+	// login_failed_attempts/login_locked_until 是从节点登录端点写入的本地
 	// 记账（不随快照同步）。users 节清表前读出，回插后回写（见
 	// restoreLocalLoginLockouts），避免主节点无关的 users 变更意外解锁从节点
 	// 被锁账户。
 	var localLoginLockouts map[string]loginLockoutState
+	var localAPIKeyLastUsed map[int]sql.NullString
 	if !skip.skip("users") {
 		preserved, err := readLocalLoginLockouts(ctx, tx)
 		if err != nil {
 			return err
 		}
 		localLoginLockouts = preserved
+		preservedKeys, err := readLocalAPIKeyLastUsed(ctx, tx)
+		if err != nil {
+			return err
+		}
+		localAPIKeyLastUsed = preservedKeys
 		if err := clearSyncTables(ctx, tx, "api_keys", "users"); err != nil {
 			return err
 		}
@@ -630,7 +636,7 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 	// D2-历史问题：ACME 配置/CA 提供商与 cert_jobs 同门——rules 开关关闭时从节点
 	// 保留本地规则（含本地 acme_dns 规则），若 ACME 表仍按主节点快照全量替换：
 	// ①本地规则的 acme_config_id 悬空；②主端同 id 配置覆盖后可能绑定到错误
-	// DNS 账号（promote 后按错误账号签发/续期）。历史问题 A-N5 只给 cert_jobs 加了
+	// DNS 账号（promote 后按错误账号签发/续期）。历史问题 历史修复 只给 cert_jobs 加了
 	// 精确 disabled 门，引用目标必须同门。
 	var statements []string
 	if snapshot.ACME != nil && !skip.disabled["rules"] {
@@ -643,7 +649,7 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 	}
 	if snapshot.ACME != nil && !skip.disabled["rules"] {
 		for _, provider := range snapshot.ACME.CAProviders {
-			// CL-1（历史）：从端全部时间列统一平面格式（nullableTimeFlat/
+			// 历史修复（历史）：从端全部时间列统一平面格式（nullableTimeFlat/
 			// UTC 直写），消除驱动序列化 '+00:00'/RFC3339 后缀形态与主端三态并存。
 			if _, err := tx.ExecContext(ctx, `INSERT INTO ca_providers (id,name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`, provider.ID, provider.Name, provider.Provider, provider.DirectoryURL, nullableString(provider.Credentials), provider.MaxConcurrent, provider.MinIntervalMS, provider.Enabled, provider.CreatedAt.UTC().Format(crsTimeLayout), provider.UpdatedAt.UTC().Format(crsTimeLayout)); err != nil {
 				return fmt.Errorf("写入快照 CA 提供商 %d: %w", provider.ID, err)
@@ -667,8 +673,11 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 		if err := restoreLocalLoginLockouts(ctx, tx, localLoginLockouts); err != nil {
 			return err
 		}
+		if err := restoreLocalAPIKeyLastUsed(ctx, tx, localAPIKeyLastUsed); err != nil {
+			return err
+		}
 	}
-	// 历史问题 A-N5：证书回插与清空同门（见上方 cert_jobs 清空处注释）。
+	// 历史问题 证书回插与清空同门（见上方 cert_jobs 清空处注释）。
 	if !skip.disabled["rules"] {
 		for _, cert := range snapshot.Certs {
 			message := "从主节点同步"
@@ -717,7 +726,7 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 			return err
 		}
 	}
-	// SC-4 修订：主节点活跃登录锁在 users 节处理（重放+本地记账回写）之后应用，
+	// 历史修复 修订：主节点活跃登录锁在 users 节处理（重放+本地记账回写）之后应用，
 	// 且不受 users 节哈希跳过门控——锁变更不改变 users 节哈希（login_* 不在节
 	// 载荷内），典型路径恰是「users 节跳过、仅 locked_users 变化」。
 	if err := applyLockedUsers(ctx, tx, snapshot.LockedUsers); err != nil {
@@ -765,12 +774,16 @@ func insertSnapshotUsersAndKeys(ctx context.Context, tx *sql.Tx, snapshot models
 }
 
 // loginLockoutState 是 users 表从节点本地登录记账（login_failed_attempts/
-// login_locked_until）的读出快照：登录端点写入、不随集群快照同步（SC-4）。
+// login_locked_until）的读出快照：登录端点写入、不随集群快照同步。
 type loginLockoutState struct {
 	failedAttempts int
 	lockedUntil    sql.NullString
 	// 历史修复-新1:mfa_last_timestep 本地态(TOTP 重放防护依据),重放后取 MAX 保留。
 	mfaLastTimestep int64
+	// last_login 是节点本地记账（登录端点写入，快照 canonical
+	// 载荷将其清零），v3 信封化后从端拿到的就是清零值；users 节重放若不
+	// 回写本地值，从节点用户页“最后登录”每次同步都会变成空。
+	lastLogin sql.NullString
 }
 
 // readLocalLoginLockouts 在 users 节清表前读出存量 username → 登录记账。
@@ -779,7 +792,7 @@ func readLocalLoginLockouts(ctx context.Context, tx *sql.Tx) (map[string]loginLo
 	// 历史修复-新1(历史):同时读出 mfa_last_timestep——users 节重放若用
 	// 主节点旧值覆盖,从节点已消费的 TOTP 码在 ±1 容差窗内重新可用,击穿
 	// 重放防护;回写侧取 MAX 保留(见 restoreLocalLoginLockouts)。
-	rows, err := tx.QueryContext(ctx, "SELECT username, COALESCE(login_failed_attempts,0), login_locked_until, COALESCE(mfa_last_timestep,0) FROM users")
+	rows, err := tx.QueryContext(ctx, "SELECT username, COALESCE(login_failed_attempts,0), login_locked_until, COALESCE(mfa_last_timestep,0), last_login FROM users")
 	if err != nil {
 		return nil, fmt.Errorf("读取本地登录锁定记账: %w", err)
 	}
@@ -788,12 +801,49 @@ func readLocalLoginLockouts(ctx context.Context, tx *sql.Tx) (map[string]loginLo
 	for rows.Next() {
 		var username string
 		var state loginLockoutState
-		if err := rows.Scan(&username, &state.failedAttempts, &state.lockedUntil, &state.mfaLastTimestep); err != nil {
+		if err := rows.Scan(&username, &state.failedAttempts, &state.lockedUntil, &state.mfaLastTimestep, &state.lastLogin); err != nil {
 			return nil, fmt.Errorf("扫描本地登录锁定记账: %w", err)
 		}
 		lockouts[username] = state
 	}
 	return lockouts, rows.Err()
+}
+
+// readLocalAPIKeyLastUsed 在 api_keys 清表前读出存量 id → last_used（本地
+// 调用记账，快照 canonical 清零）。历史修复 同族：不回写会让从节点 API Key
+// “最后使用”在每次 users 节重放后清空。
+func readLocalAPIKeyLastUsed(ctx context.Context, tx *sql.Tx) (map[int]sql.NullString, error) {
+	rows, err := tx.QueryContext(ctx, "SELECT id, last_used FROM api_keys")
+	if err != nil {
+		return nil, fmt.Errorf("读取本地 API Key 使用记账: %w", err)
+	}
+	defer rows.Close()
+	used := make(map[int]sql.NullString)
+	for rows.Next() {
+		var id int
+		var lastUsed sql.NullString
+		if err := rows.Scan(&id, &lastUsed); err != nil {
+			return nil, fmt.Errorf("扫描本地 API Key 使用记账: %w", err)
+		}
+		used[id] = lastUsed
+	}
+	return used, rows.Err()
+}
+
+// restoreLocalAPIKeyLastUsed 在 api_keys 重插后按 id 回写本地 last_used：
+// 取本地与快照中较晚者（快照通常为空，等价于保留本地值）；主节点已删除的
+// Key UPDATE 命中 0 行，删除语义仍由快照回放保持。
+func restoreLocalAPIKeyLastUsed(ctx context.Context, tx *sql.Tx, used map[int]sql.NullString) error {
+	for id, lastUsed := range used {
+		if _, err := tx.ExecContext(ctx, `UPDATE api_keys SET last_used=CASE
+			WHEN ? IS NULL THEN last_used
+			WHEN last_used IS NULL THEN ?
+			WHEN last_used < ? THEN ?
+			ELSE last_used END WHERE id=?`, lastUsed, lastUsed, lastUsed, lastUsed, id); err != nil {
+			return fmt.Errorf("回写 API Key %d 的本地使用记账: %w", id, err)
+		}
+	}
+	return nil
 }
 
 // restoreLocalLoginLockouts 在 users 节重插完成后按 username 回写本地登录记账。
@@ -804,19 +854,21 @@ func restoreLocalLoginLockouts(ctx context.Context, tx *sql.Tx, lockouts map[str
 		// 历史修复-新1:mfa_last_timestep 取 MAX(本地, 快照值)——timestep 随墙钟
 		// 单调,取 max 不产生锁死(禁用/重置置 0 时旧值 < 未来码 step,安全);
 		// 重放防护窗不再被主节点旧值重开。
-		if _, err := tx.ExecContext(ctx, "UPDATE users SET login_failed_attempts=?, login_locked_until=?, mfa_last_timestep=MAX(COALESCE(mfa_last_timestep,0),?) WHERE username=?", state.failedAttempts, state.lockedUntil, state.mfaLastTimestep, username); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET login_failed_attempts=?, login_locked_until=?, mfa_last_timestep=MAX(COALESCE(mfa_last_timestep,0),?),
+			last_login=CASE WHEN ? IS NULL THEN last_login WHEN last_login IS NULL THEN ? WHEN last_login < ? THEN ? ELSE last_login END
+			WHERE username=?`, state.failedAttempts, state.lockedUntil, state.mfaLastTimestep, state.lastLogin, state.lastLogin, state.lastLogin, state.lastLogin, username); err != nil {
 			return fmt.Errorf("回写用户 %s 的本地登录锁定记账: %w", username, err)
 		}
 	}
 	return nil
 }
 
-// applyLockedUsers 把主节点活跃登录锁合并进从节点本地 users 表（SC-4 修订）。
+// applyLockedUsers 把主节点活跃登录锁合并进从节点本地 users 表（历史修复 修订）。
 // 只延长、绝不缩短/清除、绝不动 login_failed_attempts：现有值为空或早于入参才
 // 更新——固定格式 UTC 时间串的字典序即时间序（与 auth recordLoginFailure 写入、
 // loginLockedNow 判定同口径），主从/本地锁取更晚者。陌生用户名（主端新锁用户
-// 尚未随 users 节下发等）UPDATE 命中 0 行，安全落空；载荷 nil（旧主端）no-op，
-// 绝不清除本地锁。主端解锁不传播（从端锁自然过期）——fail-closed 设计。
+// 尚未随 users 节下发等）UPDATE 命中 0 行，安全落空；载荷 nil（旧主端）历史修复，
+// 绝不清除本地锁。主端解锁不传播（从端锁自然过期）——历史修复 设计。
 func applyLockedUsers(ctx context.Context, tx *sql.Tx, locked []models.ClusterLockedUser) error {
 	for _, entry := range locked {
 		if _, err := tx.ExecContext(ctx, `UPDATE users SET login_locked_until=? WHERE username=? AND (login_locked_until IS NULL OR login_locked_until < ?)`,
@@ -1027,7 +1079,7 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 		// 与主节点启动回填同口径）；rate_limit_burst<0→0（类型②省略型规范值，
 		// 负值仅带外可达）；block_status_code 枚举外→403（默认拦截状态码，与
 		// 启动归一/导入门同口径）。rate_limit_rps 有意不归一：无默认可归，镜像
-		// 语义下主从渲染同报错（fail-visible，buildRateLimitHandler）。
+		// 语义下主从渲染同报错（历史修复，buildRateLimitHandler）。
 		if toFloat64(p["anomaly_threshold"]) <= 0 {
 			p["anomaly_threshold"] = int64(5)
 		}
@@ -1096,7 +1148,7 @@ func snapshotJSONText(value interface{}) interface{} {
 
 func applySecurityCustomRules(ctx context.Context, tx *sql.Tx, rules []models.SecurityCustomRule) error {
 	// 只读预检：主节点下发的规则若含尾部反斜杠/空条件/非法 target 或 operator，
-	// 发射侧会整条跳过它们（safe no-op），此处仅记录一条告警，不阻断忠实复制
+	// 发射侧会整条跳过它们（safe 历史修复），此处仅记录一条告警，不阻断忠实复制
 	// （从节点与主节点保持一致）。
 	invalid := false
 	for _, rule := range rules {
@@ -1148,7 +1200,7 @@ func applySecurityBlockPages(ctx context.Context, tx *sql.Tx, pages []models.Sec
 	if _, err := tx.ExecContext(ctx, `UPDATE security_block_pages SET is_default=0 WHERE is_default=1 AND id != (SELECT MIN(id) FROM security_block_pages WHERE is_default=1)`); err != nil {
 		return fmt.Errorf("降级多余的默认拦截页: %w", err)
 	}
-	// 历史问题 B42-2: 保留行内容可能为种子库存而用户定制内容在被降级行上。内容提升
+	// 历史问题 保留行内容可能为种子库存而用户定制内容在被降级行上。内容提升
 	// 只在主节点导入路径做（config_backup.go 可渲染 branding 判定「库存」内容）；
 	// 从节点无 branding 渲染可用，且须与主节点内容忠实一致，此处不做提升——
 	// 主节点修复后随后续同步自愈。
@@ -1194,7 +1246,7 @@ func applySecurityIP2RegionVersion(ctx context.Context, tx *sql.Tx, versions []m
 
 func validateSnapshotACMEState(snapshot models.ClusterSnapshot) error {
 	if snapshot.ACME == nil {
-		// 历史问题 S-4：生产仅 v3 快照可达此处（verifiedSnapshotIntegrity 已按
+		// 历史问题 生产仅 v3 快照可达此处（verifiedSnapshotIntegrity 已按
 		// SchemaVersion==CurrentSnapshotSchema 拒掉过旧/过新），旧 v2 放行
 		// 分支不可达，缺 ACME 区段统一硬拒。
 		return errors.New("schema v3 快照缺少必需的 ACME 区段")
@@ -1210,7 +1262,7 @@ func validateSnapshotACMEState(snapshot models.ClusterSnapshot) error {
 		if provider.ID <= 0 || provider.Name == "" || provider.Provider == "" || provider.DirectoryURL == "" {
 			// 历史问题-1：行级坏数据（仅 v1 导入残留/直改库可达）整包拒绝会让
 			// rules/users 等无关节同步一并瘫痪——与 历史问题 发现3/历史问题 N3 同型
-			// fail-open：逐行 warn+continue，坏行照常镜像落库（空串不违反
+			// 逐行 warn+continue，坏行照常镜像落库（空串不违反
 			// NOT NULL），该行名下签发由主节点按单任务失败承担，修复后自愈。
 			Logf("warn", "快照 CA 提供商 %d 字段不完整（单行损坏，跳过该校验，该行名下签发将按单任务失败），需人工修复", provider.ID)
 			continue
@@ -1232,7 +1284,7 @@ func validateSnapshotACMEState(snapshot models.ClusterSnapshot) error {
 		// 历史问题 发现3：acme_config_id=0 / 悬挂配置引用在主节点是「单规则损坏」
 		// 状态（issuer 按单任务失败，写入侧已被三层校验+事务内应用
 		// 拦截，仅导入残留/直改库可达）。整包拒绝会让一条坏规则瘫痪全部从
-		// 节点同步——对齐 verifySnapshotConsistency 的 fail-open 哲学，逐条
+		// 节点同步——对齐 verifySnapshotConsistency 的 历史修复 哲学，逐条
 		// 跳过+warn，主节点修复后随后续同步自愈。
 		if rule.ACMEConfigID == 0 {
 			Logf("warn", "快照规则 %s 未设置证书配置（单规则损坏，跳过该校验，签发将按单任务失败），需人工修复", rule.CaddyID)
@@ -1246,7 +1298,7 @@ func validateSnapshotACMEState(snapshot models.ClusterSnapshot) error {
 			if _, exists := providers[rule.CAProviderID]; exists {
 				continue
 			}
-			// 历史问题 N3/历史问题：悬挂 CA 提供商引用与 acme_config_id 轴同型 fail-open
+			// 历史问题 N3/历史问题：悬挂 CA 提供商引用与 acme_config_id 轴同型 历史修复
 			// （历史问题 发现3）——整包拒绝会让一条坏规则瘫痪全部从节点同步；签发
 			// 仅主节点，按单任务失败/回退，主节点修复后随后续同步自愈。
 			Logf("warn", "快照规则 %s 引用了不存在的 CA 提供商 %d（单规则损坏，跳过该校验，签发将按单任务失败），需人工修复", rule.CaddyID, rule.CAProviderID)
@@ -1258,7 +1310,7 @@ func validateSnapshotACMEState(snapshot models.ClusterSnapshot) error {
 			continue
 		}
 		if _, exists := providers[cert.CAProviderID]; !exists {
-			// 历史问题 N3：证书行的悬挂 CA 引用同样 fail-open——证书文件由
+			// 历史问题 N3：证书行的悬挂 CA 引用同样 历史修复——证书文件由
 			// materializeSnapshotCerts 同步、签发仅主节点，整包拒绝会让
 			// 全部从节点永久 degraded（ValidationFailed 每周期重试但永不收敛）。
 			Logf("warn", "快照证书 %s 引用了不存在的 CA 提供商 %d（单证书损坏，跳过该校验），需人工修复", cert.RuleID, cert.CAProviderID)
@@ -1275,8 +1327,8 @@ func insertSnapshotRules(ctx context.Context, tx *sql.Tx, rules []models.LbRule)
 	statement := LbRuleInsertSQL(columns)
 	for _, rule := range rules {
 		// 传输归一（单一事实源，2026-10-11）：与主端 snapshotRules 导出共用
-		// normalizeRuleForTransport（body 钳制[历史问题 C-F1]/TCP+TLS 死形态[历史问题 A-N1]/
-		// TCP 七字段[LBH-A-U1]）——三面（导出/从端落库/备份导入）同构是 rules
+		// normalizeRuleForTransport（body 钳制[历史问题 历史修复]/TCP+TLS 死形态[历史问题 历史修复]/
+		// TCP 七字段[历史修复]）——三面（导出/从端落库/备份导入）同构是 rules
 		// 节哈希主从相等的不变量基础。历史两处平行手写块改一侧漏另一侧即
 		// 本次「分区滞后」永不自愈事故的根因。
 		normalizeRuleForTransport(&rule)
@@ -1295,7 +1347,7 @@ func insertSnapshotRules(ctx context.Context, tx *sql.Tx, rules []models.LbRule)
 	return nil
 }
 
-// CL-B1（历史）：本函数与 nullableTimeFlat 的时间戳布局统一引用
+// 历史修复（历史）：本函数与 nullableTimeFlat 的时间戳布局统一引用
 // crsTimeLayout 常量（此前字面量与常量双拼法并存）。
 func insertSnapshotPathRules(ctx context.Context, tx *sql.Tx, ruleID string, pathRules []models.PathRule) error {
 	for _, pathRule := range pathRules {
@@ -1415,7 +1467,7 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	}
 	if snapshot.CaddyConfig != nil {
 		addBase("caddy_config", *snapshot.CaddyConfig)
-		// 历史问题 A-N1：仅归一「在场但非法」的值；nil 是旧主端缺席，跳过而非补默认。
+		// 历史问题 仅归一「在场但非法」的值；nil 是旧主端缺席，跳过而非补默认。
 		if settings.RequestBodyMaxSizeMB != nil {
 			normalized := *settings.RequestBodyMaxSizeMB
 			if normalized <= 0 {
@@ -1646,8 +1698,8 @@ func snapshotNullableDatetime(value interface{}) any {
 	return nullableString(s)
 }
 
-// nullableTimeFlat（2026-10-11 时间戳格式统一；CL-1 历史收口全部写点）：
-// 从端落库时间统一 SQLite 平面格式 'YYYY-MM-DD HH:MM:SS'（UTC）——此前直写
+// nullableTimeFlat（2026-10-11 时间戳格式统一；历史修复 历史收口全部写点）：
+// 从端落库时间统一 SQLite 平面格式 '历史修复 HH:MM:SS'（UTC）——此前直写
 // time.Time 由驱动序列化为带时区后缀格式，与主端 datetime('now') 平面格式
 // 三态并存（时间戳同构迁移的写入侧终结点）；空值路径保持 NULL 语义。
 func nullableTimeFlat(value sql.NullTime) any {

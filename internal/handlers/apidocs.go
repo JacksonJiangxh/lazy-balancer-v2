@@ -531,7 +531,7 @@ func operationDescription(route apiDocRoute) string {
 		// APIMCP42-1:幂等追加——条目已存在时返回 added=false,不重复落行。
 		retry = "可安全重试：重复追加同一条目返回 added=false，不产生重复数据。"
 	case "DELETE /settings/oidc":
-		// APIMCP-6(C7):OIDC 删除为幂等清空——重复调用保持配置为已删除状态
+		// API历史修复(C7):OIDC 删除为幂等清空——重复调用保持配置为已删除状态
 		// 并返回成功(与资源型 DELETE 的 404 语义不同)。
 		retry = "可安全重试：重复调用保持 OIDC 配置为已删除状态并返回成功。"
 	case "DELETE /security/policies/:id/bind/:caddy_id":

@@ -4,7 +4,7 @@
 //
 // 验证语义（防 UA 伪造，2026-10-17 用户裁定方案 B）：
 //  1. UA 正则命中引擎 → 2. PTR 反查客户端 IP 且后缀属该引擎域 →
-//  3. 正向回验 PTR 域名解析包含客户端 IP。任一失败 = fail-closed（维持拦截）。
+//  3. 正向回验 PTR 域名解析包含客户端 IP。任一失败 = 历史修复（维持拦截）。
 package geoipnames
 
 import (
@@ -17,15 +17,15 @@ import (
 // gptbot.json、Anthropic claude.com/crawling/bots.json、Perplexity
 // perplexity.ai/perplexitybot.json、字节 zhanzhang.toutiao.com（PTR=*.byted.org）、
 // 360 so.com/help/spider_ip.html（官方声明不支持 nslookup→IP 段验证）、
-// Kimi kimi.ai/policies/kimi-crawlers）。无官方爬虫页的厂商（DeepSeek/
+// Kimi kimi.ai/policies/历史修复）。无官方爬虫页的厂商（DeepSeek/
 // PetalBot）按厂商域名验证并在 Name 标注「观察级」。
 type CrawlerEngine struct {
-	// ID 引擎标识（X-LB-Crawler-Verified 头值 + 规则 @streq 消费值；
+	// ID 引擎标识（历史修复 头值 + 规则 @streq 消费值；
 	// 稳定字符串，勿改动——已入库策略的 geoip_crawler_engines 引用此值）。
 	ID string
 	// Name 中文展示名（策略向导勾选组）。
 	Name string
-	// UARegex User-Agent 匹配（预编译，大小写不敏感）。
+	// UARegex 历史修复 匹配（预编译，大小写不敏感）。
 	UARegex *regexp.Regexp
 	// VerifyMethod 验证方式：ptr（默认，双跳反查）/ iprange（官方声明
 	// 不支持 nslookup 的厂商，如 360，用官方公布 IP 段）。
@@ -33,7 +33,7 @@ type CrawlerEngine struct {
 	// PTRSuffixes 该引擎官方爬虫出口 IP 的 PTR 域名后缀（小写）。
 	PTRSuffixes []string
 	// IPRanges 该引擎官方公布的 CIDR 段（历史问题 Ruling：保留为**唯一权威
-	// 数据源**——运行期 360 验证走 crawler-ip-lists.json 快照，而快照内容由
+	// 数据源**——运行期 360 验证走 历史修复.json 快照，而快照内容由
 	// crawler_seed_parity_test 断言必须落在本字段声明的段内，二者不得分叉）。
 	IPRanges []string
 }
@@ -160,8 +160,33 @@ func CrawlerEngines() []CrawlerEngine {
 	return out
 }
 
+// crawlerUAPrefilter 是全部引擎 UA 正则的合并交替式（init 时由注册表**单源**
+// 派生）：非爬虫 UA 一次匹配即可短路，免去逐引擎 N 次 MatchString。它只回答
+// 「是否有任一引擎可能命中」，命中后仍走逐引擎顺序匹配取引擎 ID（首个命中
+// 语义不变，与逐条匹配逐字节等价）。
+//
+// 不能用字面子串预筛（bot|spider|crawl 之类）：注册表里有裸 DeepSeek、
+// 历史修复、历史修复/历史修复、历史修复、历史修复 等不含
+// spider/bot 字样的标记，字面预筛会把这些引擎整族漏掉。
+var crawlerUAPrefilter = buildCrawlerUAPrefilter()
+
+// buildCrawlerUAPrefilter 从注册表派生合并交替式：每条引擎正则自带 (?i)，
+// 这里整体再包一层 (?i) 并逐条加非捕获组，保证交替式与逐条匹配同语义
+// （注册表是唯一数据源，新增引擎自动进入预筛）。
+func buildCrawlerUAPrefilter() *regexp.Regexp {
+	patterns := make([]string, 0, len(crawlerEngines))
+	for i := range crawlerEngines {
+		patterns = append(patterns, "(?:"+crawlerEngines[i].UARegex.String()+")")
+	}
+	return regexp.MustCompile("(?i)" + strings.Join(patterns, "|"))
+}
+
 // MatchCrawlerEngine UA → 引擎 ID（未命中返回空串）。
 func MatchCrawlerEngine(userAgent string) string {
+	// 预筛：绝大多数流量不是爬虫，单次合并匹配即可判定未命中。
+	if !crawlerUAPrefilter.MatchString(userAgent) {
+		return ""
+	}
 	for _, e := range crawlerEngines {
 		if e.UARegex.MatchString(userAgent) {
 			return e.ID

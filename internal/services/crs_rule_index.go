@@ -2,7 +2,7 @@ package services
 
 // 结构化 CRS 规则索引：解析 /app/waf/crs/rules/*.conf 中每条 SecRule 的
 // id + msg，供三处消费——
-//   1. GET /security/crs/rule-index（handlers.GetCRSRuleIndex）；
+//   1. GET /security/crs/历史修复（handlers.GetCRSRuleIndex）；
 //   2. BuildCorazaDirectives 的 crs_rule_groups 混合展开（6 位 ID → 父文件
 //      Include + 补删）与 crs_excluded_rules 作用域展开（组号 → 逐 ID
 //      ctl:ruleRemoveById）及陈旧过滤（ruleId 不在本地索引 → 跳过发射）；
@@ -57,7 +57,7 @@ func (idx *CRSRuleIndex) Has(ruleID string) bool {
 }
 
 // Find 返回 ruleID 的索引条目（id 升序线性扫描）；不存在返回 nil。
-// Find 线性扫描返回首个同 id 条目（切片升序即最低 id）。历史 F56B1-4
+// Find 线性扫描返回首个同 id 条目（切片升序即最低 id）。历史 历史修复
 // 评估过集合化：需把 ids 集合值改为切片下标，收益在每条目 µs 级——裁定保留
 // 现实现（调用点为配置构建/预览路径，非请求热路径），注释声明为有意取舍。
 func (idx *CRSRuleIndex) Find(ruleID string) *CRSRuleIndexEntry {
@@ -237,6 +237,79 @@ func extractCRSRuleMsg(chunk string) string {
 	return strings.TrimSpace(content.String())
 }
 
+// crsRuleIDSearchSpace 从指令块文本中取出「id: 可出现的区段」：指令的最后一个
+// 引号字面量（动作串；SecRule/SecAction 的动作列表恒为末位引号参数），并剥离
+// 其内部使用另一种引号嵌套的 msg/tag 内容。找不到引号字面量时退回整段文本
+// （兼容非标准但历史上可解析的形态）。
+func crsRuleIDSearchSpace(chunk string) string {
+	literal, outer := lastCRSQuotedLiteral(chunk)
+	if literal == "" {
+		return chunk
+	}
+	return stripCRSNestedQuotes(literal, outer)
+}
+
+// lastCRSQuotedLiteral 返回最后一个引号字面量的内容与其引号字符。
+// 引号内的反斜杠转义（' / "）不结束字面量。
+func lastCRSQuotedLiteral(s string) (string, byte) {
+	var last string
+	var outer byte
+	var quote byte
+	start := -1
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		switch {
+		case quote == 0:
+			if ch == '\'' || ch == '"' {
+				quote = ch
+				start = i + 1
+			}
+		case ch == '\\' && i+1 < len(s):
+			i++
+		case ch == quote:
+			last = s[start:i]
+			outer = quote
+			quote = 0
+			start = -1
+		}
+	}
+	if quote != 0 && start >= 0 {
+		// 未闭合字面量：取到结尾（宽松解析，保持历史行为）
+		return s[start:], quote
+	}
+	return last, outer
+}
+
+// stripCRSNestedQuotes 移除 literal 内部的「另一种引号」字面量内容，
+// 保留外层引号对应的顶层文本。
+func stripCRSNestedQuotes(literal string, outer byte) string {
+	nested := byte('\'')
+	if outer == '\'' {
+		nested = '"'
+	}
+	var b strings.Builder
+	inNested := false
+	for i := 0; i < len(literal); i++ {
+		ch := literal[i]
+		if inNested {
+			if ch == '\\' && i+1 < len(literal) {
+				i++
+				continue
+			}
+			if ch == nested {
+				inNested = false
+			}
+			continue
+		}
+		if ch == nested {
+			inNested = true
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return b.String()
+}
+
 // parseCRSRuleFileContent 把单个 conf 文件解析为 (id, msg) 序列。
 // 按指令分块：行首 SecRule/SecAction/... 开块，反斜杠续行直到不续的行收块；
 // 注释行（# 开头）整体剔除，防注释里的 id:/msg: 假条目进入索引。msg 捕获
@@ -252,7 +325,10 @@ func parseCRSRuleFileContent(content string) []CRSRuleIndexEntry {
 		text := chunk.String()
 		chunk.Reset()
 		chunkOpen = false
-		idMatch := crsRuleIDPattern.FindStringSubmatch(text)
+		// 只在动作串（最后一个引号字面量）里取 id，并剥离其内部
+		// msg/tag 单引号内容——整段匹配会把数据操作数 / msg / tag 文本里的
+		// "id:9xxxxx" 当规则 ID（幻影 ID 会放行不存在规则的保存）。
+		idMatch := crsRuleIDPattern.FindStringSubmatch(crsRuleIDSearchSpace(text))
 		if idMatch == nil {
 			return
 		}
@@ -373,7 +449,7 @@ func buildCRSRuleIndex() *CRSRuleIndex {
 // 并发生成若选中已被移除的文件，coraza 加载失败→/load 被拒，运行配置保持
 // 上一代（不发布半代）；③交换完成后引用键（目录条目数/尺寸/最大 mtime）必然
 // 变化，窗口内缓存的空索引不会被后续渲染复用。禁止让渲染持 wafFileMu：导入
-// 路径持锁序为 CaddyOpLock→wafFileMu，反向嵌套即 AB-BA 死锁。
+// 路径持锁序为 CaddyOpLock→wafFileMu，反向嵌套即 历史修复 死锁。
 func GetCRSRuleIndex() *CRSRuleIndex {
 	key := crsRuleIndexCacheKey(crsRuleIndexVersion())
 	crsRuleIndexMu.Lock()

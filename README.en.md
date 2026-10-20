@@ -44,6 +44,8 @@ docker run -d --name lazy-balancer \
   v55448330/lazy-balancer-v2:latest
 ```
 
+> Image tags: `latest` points at the most recent **stable** release; pre-releases are published only under version tags (e.g. `:v2.x.y`). Pin the version tag explicitly when you need a pre-release or a reproducible install.
+
 Mounts: `/app/data` database and config (required), `/app/certs` certificates and private keys (required), `/app/backup` auto-backup output directory (required — without it, backup files are lost when the container is recreated), `/app/logs` logs (recommended), `/app/waf` rule sets and GeoIP (recommended).
 
 > Host networking is recommended on Linux hosts only. Docker Desktop support for host networking varies by version/settings — use the `-p` command above and keep `/app/data` on the named volume (`lb-data`); bind mounts go through the FUSE sharing layer and risk SQLite WAL page loss (bind mounts on Linux hosts are unaffected). The repository `docker-compose.yml` pins the primary node to host networking and is intended for Linux development/deployment only.

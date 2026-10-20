@@ -71,7 +71,7 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 		sources = append(sources, s)
 		totalEntries += s.EntryCount
 	}
-	// SEC-C-N1（历史 历史问题·家族漏收敛）：迭代错误（rows.Err）不得以
+	// 历史修复（历史 历史问题·家族漏收敛）：迭代错误（rows.Err）不得以
 	// 「部分/空列表 + 200」返回——与 历史问题/历史问题 在总览/事件列表建立的
 	// 「残缺列表不得以 200」口径对齐（Scan 失败分支同响应形）。
 	if err := rows.Err(); err != nil {
@@ -182,7 +182,8 @@ func (h *Handlers) UpdateThreatSourceFlags(c *gin.Context) {
 		return
 	}
 	var name string
-	if err := db.DB.QueryRow(`SELECT name FROM security_threat_sources WHERE id=?`, id).Scan(&name); err != nil {
+	var wasEnabled int
+	if err := db.DB.QueryRow(`SELECT name, COALESCE(update_enabled,0) FROM security_threat_sources WHERE id=?`, id).Scan(&name, &wasEnabled); err != nil {
 		// 历史问题：DB 故障不得误报 404——缺行=404，其余=500（与
 		// security_overview 的 ErrNoRows→404 同族契约）。
 		if errors.Is(err, sql.ErrNoRows) {
@@ -193,7 +194,15 @@ func (h *Handlers) UpdateThreatSourceFlags(c *gin.Context) {
 		return
 	}
 	if *body.UpdateEnabled {
-		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=1, message='', updated_at=datetime('now') WHERE id=?`, id); err != nil {
+		// 启用分支必须与禁用分支同口径收敛状态机——仅在「由关闭转为启用」
+		// 时清失败态（update_status=idle + 空文案 + 失败计数清零）；已启用源重复提交
+		// 不改运行态（此前只清 message，留下「failed + 空失败文案」且计数与实际
+		// 状态脱节）。
+		query := `UPDATE security_threat_sources SET update_enabled=1, updated_at=datetime('now') WHERE id=?`
+		if wasEnabled == 0 {
+			query = `UPDATE security_threat_sources SET update_enabled=1, update_status='idle', message='', consecutive_failures=0, updated_at=datetime('now') WHERE id=?`
+		}
+		if _, err := db.DB.Exec(query, id); err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
 			return
 		}

@@ -59,7 +59,7 @@ func runWithInTaskRetry(ctx context.Context, op func() error, onWait func(nextAt
 // 与三库起点角色复查同一 SQL 口径（COALESCE(is_master,1)；查询失败按非主
 // 节点→跳过语义，宁停勿写）。
 func updateRunStillMaster() bool {
-	// 历史问题：与同族 B1-8 口径一致——nil 库 fail-closed（按非主节点）。
+	// 历史问题：与同族 历史修复 口径一致——nil 库 历史修复（按非主节点）。
 	if db.DB == nil {
 		return false
 	}
@@ -69,11 +69,26 @@ func updateRunStillMaster() bool {
 	return true
 }
 
+// updateRunRoleAtCancel 取消归因用的角色三态：(是否主节点, 角色是否
+// 已判定)。角色读故障必须是「不可判定」而非并入 demote——否则 DB 瞬断会把手动
+// 取消报成「节点已降级」，源行终态与审计失真。已知从节点仍按 demote 处理
+// （宁停勿写不变）。
+func updateRunRoleAtCancel() (bool, bool) {
+	if db.DB == nil {
+		return false, false
+	}
+	isMaster, err := RoleOf(context.Background(), db.DB)
+	if err != nil {
+		return false, false
+	}
+	return isMaster, true
+}
+
 // taskRunStartedAt 取任务引擎预插行的 started_at（配置时区墙钟）并归一
 // 为 UTC 存储；前端 formatDate 再按配置时区显示，与任务监控展示同一时刻。
 // 直接调用（rc=nil/RunID=0）或行不可读时回退当前 UTC。
 func taskRunStartedAt(rc *taskengine.RunContext) string {
-	// 历史问题：与同族 B1-8 口径一致——nil 库直接回退当前 UTC（不 panic）。
+	// 历史问题：与同族 历史修复 口径一致——nil 库直接回退当前 UTC（不 panic）。
 	if db.DB == nil {
 		return time.Now().UTC().Format(crsTimeLayout)
 	}

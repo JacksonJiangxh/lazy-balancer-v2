@@ -1256,8 +1256,9 @@ interface AdminTlsForm {
 }
 
 const mfaScopeVisible = ref(false)
-// WS-05：与 middleware.go 的 admin/business 组写路由逐族对齐（清单层由
-// audit87Settings.spec.ts 反向钉住缺失项——新增写端点族必须同步本清单）。
+// WS-05：与 middleware.go 的 admin/business 组写路由逐族对齐——本清单是 MFA
+// 弹框「受保护操作范围」的唯一事实源：新增写端点族必须同步入列（否则弹框会
+// 低估受保护范围），测试按清单反查缺失项。
 const mfaScopeGroups = [
   { title: '负载规则', items: ['创建', '编辑', '删除', '启用', '禁用', '复制'] },
   { title: '证书与 DNS', items: ['DNS 配置增删改', '证书配置增删改', 'DNS 凭证连通性测试', 'CA 提供商修改/测试', '触发证书签发', '证书任务重试/删除'] },

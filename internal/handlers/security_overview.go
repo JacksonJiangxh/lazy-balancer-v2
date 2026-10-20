@@ -105,7 +105,7 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 
 	var domain string
 	if err := db.DB.QueryRow(`SELECT COALESCE(domain,'') FROM lb_rules WHERE caddy_id=?`, ruleCaddyID).Scan(&domain); err != nil {
-		// APIMCP45-3：ErrNoRows（规则不存在）与真实 DB 故障分判——前者归 404
+		// ErrNoRows（规则不存在）与真实 DB 故障分判——前者归 404
 		// not_found，后者保持 500 且 message 归位查询失败（不再借「规则不存在」
 		// 文案）。前端对非 200 一律 stats=null，404 化不改变前端表现。
 		if errors.Is(err, sql.ErrNoRows) {
@@ -140,25 +140,10 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 	// WAF 段只使用非预检事件的正 duration_us。两个分桶共用
 	// Stage1PrecheckSegmentSQL，避免 SQL 选值与 Go 分组谓词分叉；升级前
 	// precheck_us=0 的存量行不进入任何均值样本。
-	preAvg, preCnt, wafAvg, wafCnt := 0.0, 0, 0.0, 0
-	stageTimingSQL := fmt.Sprintf(`SELECT
-		AVG(CASE WHEN precheck_us > 0 THEN precheck_us END),
-		SUM(CASE WHEN precheck_us > 0 THEN 1 ELSE 0 END),
-		AVG(CASE WHEN duration_us > 0 THEN CASE WHEN %s THEN NULL ELSE duration_us END END),
-		SUM(CASE WHEN duration_us > 0 THEN CASE WHEN %s THEN 0 ELSE 1 END ELSE 0 END)
-		FROM security_events
-		WHERE rule_caddy_id=? AND event_time >= datetime('now','-1 day')`, services.Stage1PrecheckSegmentSQL, services.Stage1PrecheckSegmentSQL)
-	var preAverage, wafAverage sql.NullFloat64
-	if terr := db.MetricsDB.QueryRow(stageTimingSQL, ruleCaddyID).Scan(&preAverage, &preCnt, &wafAverage, &wafCnt); terr != nil {
+	preAvg, preCnt, wafAvg, wafCnt, terr := queryRuleStageTimings(ruleCaddyID)
+	if terr != nil {
 		// 耗时为增强信息：查询失败留 warn，响应仍返回其余已取数据。
 		services.Logf("warn", "stage-stats timing query failed for %s: %v", ruleCaddyID, terr)
-	} else {
-		if preAverage.Valid {
-			preAvg = preAverage.Float64
-		}
-		if wafAverage.Valid {
-			wafAvg = wafAverage.Float64
-		}
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
 		"stage1_blocked_24h":      stage1,
@@ -169,6 +154,31 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 		"waf_avg_us":              wafAvg,
 		"waf_samples":             wafCnt,
 	}})
+}
+
+// queryRuleStageTimings 分段平均处理耗时聚合（预检段 / WAF 段）。
+// SUM 在空窗口上返回 SQL NULL——计数列必须 COALESCE，否则正常空窗口
+// 会被扫描失败误报成「查询故障」（安静规则每次轮询刷一条 warn）。
+// AVG 在空窗口本就是 NULL，扫进 sql.NullFloat64 后归零。
+func queryRuleStageTimings(ruleCaddyID string) (preAvg float64, preCnt int, wafAvg float64, wafCnt int, err error) {
+	stageTimingSQL := fmt.Sprintf(`SELECT
+		AVG(CASE WHEN precheck_us > 0 THEN precheck_us END),
+		COALESCE(SUM(CASE WHEN precheck_us > 0 THEN 1 ELSE 0 END),0),
+		AVG(CASE WHEN duration_us > 0 THEN CASE WHEN %s THEN NULL ELSE duration_us END END),
+		COALESCE(SUM(CASE WHEN duration_us > 0 THEN CASE WHEN %s THEN 0 ELSE 1 END ELSE 0 END),0)
+		FROM security_events
+		WHERE rule_caddy_id=? AND event_time >= datetime('now','-1 day')`, services.Stage1PrecheckSegmentSQL, services.Stage1PrecheckSegmentSQL)
+	var preAverage, wafAverage sql.NullFloat64
+	if err = db.MetricsDB.QueryRow(stageTimingSQL, ruleCaddyID).Scan(&preAverage, &preCnt, &wafAverage, &wafCnt); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	if preAverage.Valid {
+		preAvg = preAverage.Float64
+	}
+	if wafAverage.Valid {
+		wafAvg = wafAverage.Float64
+	}
+	return preAvg, preCnt, wafAvg, wafCnt, nil
 }
 
 // 历史问题-11（历史）：安全总览的近 7 天聚合（趋势/Top10 IP/攻击族）此前
@@ -225,6 +235,8 @@ type securityOverviewResponse struct {
 
 // loadSecurityOverviewAggregates 计算（或命中缓存）近 7 天聚合。错误不缓存、
 // 由调用方聚合成 500（与既有「任一查询失败显式报错」口径一致）。
+// tzModifier 仅用于缓存键区分时区形态；窗口/日桶一律由 today 携带
+// 的时区逐日构造（DST 正确），不再把单一偏移套到整周 SQL date() 上。
 func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todayStartUTC, tzModifier string) (securityOverviewAggregates, error) {
 	key := securityOverviewAggCacheKey{metrics: metricsDB, todayStart: todayStartUTC, tzModifier: tzModifier}
 	now := time.Now()
@@ -242,23 +254,27 @@ func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todaySta
 			firstErr = err
 		}
 	}
-	trendByDate := map[string]models.SecurityTrendPoint{}
-	trendRows, err := metricsDB.Query(`SELECT date(event_time, ?) as d, SUM(CASE WHEN action='blocked' THEN 1 ELSE 0 END) as b, SUM(CASE WHEN action='logged' THEN 1 ELSE 0 END) as l FROM security_events WHERE event_time >= datetime(?, '-6 days') GROUP BY d`, tzModifier, todayStartUTC)
-	track(err)
-	for trendRows != nil && trendRows.Next() {
-		var t models.SecurityTrendPoint
-		track(trendRows.Scan(&t.Date, &t.Blocked, &t.Detected))
-		trendByDate[t.Date] = t
+	// 趋势日桶必须用**逐日本地边界**，不得用单一当前时区偏移——
+	// DST 周界（如 America/New_York 3 月/11 月切换）单偏移会让切换前一日的
+	// 边界错 1h，事件跨到相邻日桶（默认 Asia/Shanghai 无 DST，故此前未暴露）。
+	// 边界按 today 携带的配置时区逐日构造（today 由调用方 time.Now().In(loc)
+	// 传入），窗口下界同步用 dayStarts[0]，其余 7 天聚合与趋势同窗口。
+	const eventTimeLayout = "2006-01-02 15:04:05"
+	dayStarts := make([]time.Time, 8)
+	for i := range dayStarts {
+		d := today.AddDate(0, 0, i-6)
+		dayStarts[i] = time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, today.Location())
 	}
-	if trendRows != nil {
-		track(trendRows.Err())
-		trendRows.Close()
-	}
+	windowStartUTC := dayStarts[0].UTC().Format(eventTimeLayout)
 	trend := make([]models.SecurityTrendPoint, 0, 7)
-	for i := 6; i >= 0; i-- {
-		day := today.AddDate(0, 0, -i).Format("2006-01-02")
-		point := trendByDate[day]
-		point.Date = day
+	for i := range 7 {
+		point := models.SecurityTrendPoint{Date: dayStarts[i].In(today.Location()).Format("2006-01-02")}
+		err := metricsDB.QueryRow(`SELECT COALESCE(SUM(CASE WHEN action='blocked' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN action='logged' THEN 1 ELSE 0 END),0)
+			FROM security_events WHERE event_time >= ? AND event_time < ?`,
+			dayStarts[i].UTC().Format(eventTimeLayout), dayStarts[i+1].UTC().Format(eventTimeLayout)).
+			Scan(&point.Blocked, &point.Detected)
+		track(err)
 		trend = append(trend, point)
 	}
 
@@ -268,7 +284,7 @@ func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todaySta
 		lastTime          string
 	}
 	var topRows []topIPRow
-	ipRows, err := metricsDB.Query(`SELECT client_ip, SUM(CASE WHEN action='blocked' THEN 1 ELSE 0 END) as b, SUM(CASE WHEN action='logged' THEN 1 ELSE 0 END) as l, MAX(event_time) as last_time FROM security_events WHERE event_time >= datetime(?, '-6 days') GROUP BY client_ip ORDER BY b + l DESC LIMIT 10`, todayStartUTC)
+	ipRows, err := metricsDB.Query(`SELECT client_ip, SUM(CASE WHEN action='blocked' THEN 1 ELSE 0 END) as b, SUM(CASE WHEN action='logged' THEN 1 ELSE 0 END) as l, MAX(event_time) as last_time FROM security_events WHERE event_time >= ? GROUP BY client_ip ORDER BY b + l DESC LIMIT 10`, windowStartUTC)
 	track(err)
 	for ipRows != nil && ipRows.Next() {
 		var row topIPRow
@@ -284,12 +300,12 @@ func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todaySta
 	if len(topRows) > 0 {
 		placeholders := make([]string, len(topRows))
 		famArgs := make([]interface{}, 0, len(topRows)+1)
-		famArgs = append(famArgs, todayStartUTC)
+		famArgs = append(famArgs, windowStartUTC)
 		for i, row := range topRows {
 			placeholders[i] = "?"
 			famArgs = append(famArgs, row.ip)
 		}
-		famRows, ferr := metricsDB.Query(fmt.Sprintf(`SELECT client_ip, COALESCE(rule_triggered,''), COALESCE(rule_msg,''), COUNT(*) as cnt FROM security_events WHERE event_time >= datetime(?, '-6 days') AND client_ip IN (%s) GROUP BY client_ip, rule_triggered, rule_msg`, strings.Join(placeholders, ",")), famArgs...)
+		famRows, ferr := metricsDB.Query(fmt.Sprintf(`SELECT client_ip, COALESCE(rule_triggered,''), COALESCE(rule_msg,''), COUNT(*) as cnt FROM security_events WHERE event_time >= ? AND client_ip IN (%s) GROUP BY client_ip, rule_triggered, rule_msg`, strings.Join(placeholders, ",")), famArgs...)
 		track(ferr)
 		for famRows != nil && famRows.Next() {
 			var ip, ruleTriggered, ruleMsg string
@@ -326,7 +342,7 @@ func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todaySta
 		})
 	}
 
-	typeRows, err := metricsDB.Query(`SELECT COALESCE(rule_triggered,''), COALESCE(rule_msg,''), COUNT(*) as cnt FROM security_events WHERE event_time >= datetime(?, '-6 days') GROUP BY rule_triggered, rule_msg`, todayStartUTC)
+	typeRows, err := metricsDB.Query(`SELECT COALESCE(rule_triggered,''), COALESCE(rule_msg,''), COUNT(*) as cnt FROM security_events WHERE event_time >= ? GROUP BY rule_triggered, rule_msg`, windowStartUTC)
 	track(err)
 	familyCounts := map[string]int{}
 	stageCounts := map[string]int{}

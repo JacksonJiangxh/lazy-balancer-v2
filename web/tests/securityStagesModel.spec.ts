@@ -61,13 +61,13 @@ test('历史问题-08 阶段 2：拦截页已删/内容空时显性给出失效�
   const deleted = stageRows(bindingOf({ block_page_id: 9 }), policy, [], 2)
   assert.deepEqual(deleted.find((row) => row.label === '拦截页（策略页）'), {
     label: '拦截页（策略页）',
-    detail: '已失效（回落默认 429）',
+    detail: '已失效（回落绑定链首个有效页，无则默认 429）',
   })
   // 内容为空：同样视为失效
   const empty = stageRows(bindingOf({ block_page_id: 9 }), policy, [{ id: 9, name: '限流页', content: '' }], 2)
   assert.deepEqual(empty.find((row) => row.label === '拦截页（策略页）'), {
     label: '拦截页（策略页）',
-    detail: '已失效（回落默认 429）',
+    detail: '已失效（回落绑定链首个有效页，无则默认 429）',
   })
   // 有效页：保留页名 + 429 语义
   const valid = stageRows(bindingOf({ block_page_id: 9 }), policy, [{ id: 9, name: '限流页', content: '<p>x</p>' }], 2)
@@ -162,4 +162,19 @@ test('事件详情预取：无属主策略时仅取信任 refs；去重保序并
   assert.deepEqual(eventDetailRefIds(null, [{ ip_whitelist_refs: '[7]' }, { ip_whitelist_refs: '[7,8]' }]), [7, 8])
   assert.deepEqual(eventDetailRefIds({ ip_acl_list_refs: '[0,6,6,2]', ip_whitelist_refs: '[]' }, []), [6, 2])
   assert.deepEqual(eventDetailRefIds(null, []), [])
+})
+
+test('拦截页回落文案：失效策略页不得断言「回落默认 403」（真实回落取绑定链首个有效页）', () => {
+  const stage1 = stageRows(bindingOf(), policyOf({ block_page_id: 9 }), [], 1)
+  assert.deepEqual(stage1.find((row) => row.label === '拦截页（策略页）'), {
+    label: '拦截页（策略页）',
+    detail: '已失效（回落绑定链首个有效页）',
+  })
+  // 阶段 3 同口径：逐策略合成码，页失效时回落同为绑定链首个有效页
+  // （无规则级覆盖时行标签为「拦截页」）
+  const stage3 = stageRows(bindingOf({ block_page_id: 9 }), policyOf({ mode: 'blocking' }), [], 3)
+  assert.equal(stage3.find((row) => row.label === '拦截页')?.detail, '已失效（回落绑定链首个有效页）')
+  // 未配置：跟随绑定链首个有效页，无则默认 403
+  const unset = stageRows(bindingOf({ block_page_id: 0 }), policyOf({ mode: 'blocking' }), [], 3)
+  assert.equal(unset.find((row) => row.label === '拦截页')?.detail, '未配置（跟随绑定链首个有效页，无则默认 403）')
 })

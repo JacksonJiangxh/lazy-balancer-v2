@@ -51,8 +51,10 @@ func TestCreateSecurityPolicy_geoipColumnsRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCreateSecurityPolicy_geoipDefaults verifies that omitted geoip fields
-// default to an empty list and deny mode.
+// TestCreateSecurityPolicy_geoipDefaults：省略 geoip 字段时名单落空、mode 落 off
+// （P1 历史修复 门：非 off + 空名单 = 「宣称启用但零强制」→ 400；缺省未显式
+// 启用地域控制的创建因此归 off，与渲染端「条目非空才发射」等价）。
+// 下方 TestCreateSecurityPolicy_geoipEnabledWithEmptyListRejected 钉住显式形态 400。
 func TestCreateSecurityPolicy_geoipDefaults(t *testing.T) {
 	// Given a fresh database and a policy payload without geoip fields
 	setupSecurityPolicyTestDB(t)
@@ -75,8 +77,26 @@ func TestCreateSecurityPolicy_geoipDefaults(t *testing.T) {
 	if got := resp.Data.Policy["geoip_countries"]; got != "[]" {
 		t.Fatalf("geoip_countries=%q, want []", got)
 	}
-	if got := resp.Data.Policy["geoip_mode"]; got != "deny" {
-		t.Fatalf("geoip_mode=%q, want deny", got)
+	if got := resp.Data.Policy["geoip_mode"]; got != "off" {
+		t.Fatalf("geoip_mode=%q, want off（空名单缺省不得宣称启用）", got)
+	}
+}
+
+// TestCreateSecurityPolicy_geoipEnabledWithEmptyListRejected：显式 deny/allow +
+// 空名单必须 400（历史修复 形态：落库后宣称仅允许所选地域但零发射）。
+func TestCreateSecurityPolicy_geoipEnabledWithEmptyListRejected(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityRouter(t)
+	recorder := postJSON(t, router, "/security/policies", map[string]any{
+		"name":            "空名单策略",
+		"geoip_mode":      "allow",
+		"geoip_countries": "[]",
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("mode=allow status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "区域名单不能为空") {
+		t.Fatalf("mode=allow body=%s, want 空名单门文案", recorder.Body.String())
 	}
 }
 

@@ -153,7 +153,7 @@ func TestCertTicks_skipAndRecoveryLinesTransitionOnce(t *testing.T) {
 	}
 }
 
-// 历史问题-11（cert-waiting-ca 形态）+ 历史问题 收敛：门控放行（有非终态任务）但服务
+// 历史问题-11（历史修复 形态）+ 历史问题 收敛：门控放行（有非终态任务）但服务
 // 未运行时记一次跳过行（状态门新文案）；门控拦截（全部终态）时保持静默
 // （2026-09-29 裁定的零扫描门控不得被空转日志破坏）。
 func TestCertWaitingCATickOnce_skipLineGatedOnActiveJobs(t *testing.T) {
@@ -181,5 +181,105 @@ func TestCertWaitingCATickOnce_skipLineGatedOnActiveJobs(t *testing.T) {
 	}
 	if got := strings.Count(string(data), "证书服务未运行，跳过本轮"); got != 1 {
 		t.Fatalf("skip lines=%d, want 1（全终态时门控静默，不得追加空转行）", got)
+	}
+}
+
+// 证书周期任务体此前把扫描/对账错误吞成日志（Once 无返回
+// 值、Run 恒 return nil），DB 抖动时任务监控显示 success；reconcileMissingCertFiles
+// 查询失败后摘要还报「状态对账完成 0」。修复后：读失败上抛 + 失败轮摘要写
+// 「状态对账失败」而非「完成」。
+func TestCertReconcileOnce_propagates_read_failure(t *testing.T) {
+	useCertSweepTickTestEnv(t)
+	// Given：cert_jobs 读故障（表缺失=迁移中断/库损坏形态）
+	if _, err := db.DB.Exec(`DROP TABLE cert_jobs`); err != nil {
+		t.Fatalf("drop cert_jobs: %v", err)
+	}
+
+	// When
+	err := CertReconcileOnce()
+
+	// Then 1：读失败上抛（Run 随之返回 error → task_runs 失败终态）
+	if err == nil {
+		t.Fatal("CertReconcileOnce err=nil, want 对账读故障上抛（fail-visible）")
+	}
+	// Then 2：失败轮摘要不得写「完成」
+	data, readErr := os.ReadFile(taskengine.TaskLogPath("cert-reconcile"))
+	if readErr != nil {
+		t.Fatalf("read task log: %v", readErr)
+	}
+	if strings.Contains(string(data), "状态对账完成") {
+		t.Fatalf("失败轮摘要谎报完成: %q", string(data))
+	}
+	if !strings.Contains(string(data), "状态对账失败") {
+		t.Fatalf("失败轮摘要缺失「状态对账失败」: %q", string(data))
+	}
+}
+
+// 回归形状：健康库上对账轮必须返回 nil 且照常写「完成」摘要——上抛改造不得把
+// 正常轮次变成失败轮。
+func TestCertReconcileOnce_healthy_round_reports_completion(t *testing.T) {
+	useCertSweepTickTestEnv(t)
+
+	if err := CertReconcileOnce(); err != nil {
+		t.Fatalf("CertReconcileOnce err=%v, want nil", err)
+	}
+	data, err := os.ReadFile(taskengine.TaskLogPath("cert-reconcile"))
+	if err != nil {
+		t.Fatalf("read task log: %v", err)
+	}
+	if !strings.Contains(string(data), "状态对账完成") {
+		t.Fatalf("健康轮摘要缺失「状态对账完成」: %q", string(data))
+	}
+}
+
+// 续期扫描的候选查询/遍历失败必须上抛（此前只落任务日志，Run 恒 nil）。
+func TestCertRenewalScanOnce_propagates_scan_failure(t *testing.T) {
+	useCertSweepTickTestEnv(t)
+	resetCertificateServiceForTest(t)
+	SetActiveCertificateService(NewCertificateService())
+	t.Cleanup(func() { SetActiveCertificateService(nil) })
+	// Given：cert_jobs 读故障（CheckExpiration 候选查询失败）
+	if _, err := db.DB.Exec(`DROP TABLE cert_jobs`); err != nil {
+		t.Fatalf("drop cert_jobs: %v", err)
+	}
+
+	// When
+	err := CertRenewalScanOnce()
+
+	// Then：扫描失败上抛，且摘要不得写「扫描完成」
+	if err == nil {
+		t.Fatal("CertRenewalScanOnce err=nil, want 扫描读故障上抛（fail-visible）")
+	}
+	if data, readErr := os.ReadFile(taskengine.TaskLogPath("cert-renewal-scan")); readErr == nil && strings.Contains(string(data), "扫描完成") {
+		t.Fatalf("失败轮摘要谎报完成: %q", string(data))
+	}
+}
+
+// 回归形状：服务缺失跳过不是失败（Run 返回 nil，任务不进入失败终态）。
+func TestCertRenewalScanOnce_service_missing_is_not_a_failure(t *testing.T) {
+	useCertSweepTickTestEnv(t)
+
+	if err := CertRenewalScanOnce(); err != nil {
+		t.Fatalf("err=%v, want nil（服务未运行=跳过，不是失败）", err)
+	}
+}
+
+// Run 体必须上抛 Once 的失败——task_runs 终态与任务监控依赖该返回值。
+func TestTaskEngineWire_certTasksPropagateRunFailures(t *testing.T) {
+	te := newWireTestEngine(t)
+	resetCertificateServiceForTest(t)
+	SetActiveCertificateService(NewCertificateService())
+	t.Cleanup(func() { SetActiveCertificateService(nil) })
+	// Given：cert_jobs 读故障（上述两条 Read 路径必然失败；task_runs 写入不受影响）
+	if _, err := db.DB.Exec(`DROP TABLE cert_jobs`); err != nil {
+		t.Fatalf("drop cert_jobs: %v", err)
+	}
+
+	// Then：两个周期任务的 Run 都必须返回 error
+	if err := te.Trigger("cert-reconcile", "manual", ""); err == nil {
+		t.Fatal("cert-reconcile Run 未上抛对账读失败（任务监控会显示 success）")
+	}
+	if err := te.Trigger("cert-renewal-scan", "manual", ""); err == nil {
+		t.Fatal("cert-renewal-scan Run 未上抛扫描失败（任务监控会显示 success）")
 	}
 }

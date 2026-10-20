@@ -41,14 +41,7 @@ func mfaSetupTestRouter(h *Handlers) *gin.Engine {
 
 func seedMfaRulingUser(t *testing.T) string {
 	t.Helper()
-	// setupAuthTestDB 的精简 users 无 mfa_secret 列，补齐本组用例所需列
-	for _, col := range []string{"mfa_secret TEXT DEFAULT ''", "mfa_pending_secret TEXT DEFAULT ''", "mfa_pending_fails INTEGER DEFAULT 0", "mfa_recovery_codes TEXT DEFAULT '[]'", "mfa_last_timestep INTEGER DEFAULT 0"} {
-		if _, err := db.DB.Exec("ALTER TABLE users ADD COLUMN " + col); err != nil {
-			if !strings.Contains(err.Error(), "duplicate column") {
-				t.Fatalf("add column %s: %v", col, err)
-			}
-		}
-	}
+	// MFA 列/挑战表统一由 ensureMFATestSchema 单源提供（历史修复；重复调用安全）
 	hash, err := bcrypt.GenerateFromPassword([]byte("irrelevant"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("hash password: %v", err)

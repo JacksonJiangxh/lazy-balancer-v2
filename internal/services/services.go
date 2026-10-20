@@ -63,7 +63,7 @@ func (m *MetricsService) Start() {
 	defer ticker.Stop()
 	defer cleanupTicker.Stop()
 	m.cleanupHistory()
-	// LBS-B-历史问题（历史）：启动即采集一轮——曾首 collect 等首个 interval
+	// 历史修复-历史问题（历史）：启动即采集一轮——曾首 collect 等首个 interval
 	// （默认 30s），重启后面板首屏 30s 全零；与 cleanupHistory 同点对称。
 	m.collect()
 
@@ -89,7 +89,7 @@ func (m *MetricsService) Stop() {
 // （warn）、fail→ok 恢复记一次（info）、持续同一状态静默。状态按失败类别
 // （key）独立跟踪：前置类别失败（如 Get 失败）不评估后续类别，其恢复标记
 // 只在后续 tick 实际通过该检查时才落，避免「仍失败却记恢复」。map 有界：
-// 生产类别集固定 7 个（N+11 D3-F4 增补 body 中段读取失败类别——原枚举漏掉的
+// 生产类别集固定 7 个（N+11 历史修复 增补 body 中段读取失败类别——原枚举漏掉的
 // 唯一零信号成员），清扫上限（历史问题 同模式）仅为防御动态键场景——超上限整体
 // 重置，各类别至多重复放行一条，无数据影响。
 var (
@@ -144,7 +144,45 @@ const (
 	metricsFailureStorePerHost = "store-per-host"
 )
 
+// geoipPassSeriesMarker geoip 透传路由（buildGeoipPassRoute）的 Prometheus
+// 序列片段——该路由无 reverse_proxy，其序列不含任何上游语义。
+const geoipPassSeriesMarker = `handler="http.handlers.geoip2region"`
+
+// filterGeoipPassSeries 剔除 geoip 透传路由注入的序列行（历史修复 单源纯函数）。
+// geoip 规则的请求先过独立透传路由再过主/路径路由，两条路由各自注入 metrics
+// ——同一请求的请求数/状态码/字节量在全局与 历史修复 全部翻倍。
+// 历史修复-历史问题（历史）：Builder 逐行条件写入单副本（曾 Split+Join——行切片
+// ~24B/行 + 16MB 拼接副本，与「拷贝只做一次」口径矛盾）。分隔符仅在保留行
+// 之间落盘：输出与「按 \n 切分后丢弃命中行、再用 \n 连接」逐字节等价，
+// 含尾部空行（"a\n" → 保留行的切分为 ["a",""]）与被删末行两形态。
+func filterGeoipPassSeries(text string) string {
+	var b strings.Builder
+	b.Grow(len(text))
+	wrote := false
+	start := 0
+	for i := 0; i <= len(text); i++ {
+		if i < len(text) && text[i] != '\n' {
+			continue
+		}
+		line := text[start:i]
+		start = i + 1
+		if strings.Contains(line, geoipPassSeriesMarker) {
+			continue
+		}
+		if wrote {
+			b.WriteByte('\n')
+		}
+		b.WriteString(line)
+		wrote = true
+	}
+	return b.String()
+}
+
 func (m *MetricsService) collect() {
+	// 三项 DB 派生指标先于 /metrics 采集刷新——Caddy 未就绪或
+	// /metrics 不可达时它们仍然准确，只有流量样本受影响。
+	m.refreshDBOverviewMetrics()
+
 	resp, err := m.client.Get(m.metricsURL)
 	if err != nil {
 		if logMetricsStateTransition(metricsFailureCollect, true) != "" {
@@ -166,12 +204,12 @@ func (m *MetricsService) collect() {
 		Logf("info", "metrics endpoint recovered")
 	}
 
-	// 历史问题 二十六次 W3-2：读取上限对齐 overviewmetrics 的 16MB 探测模式
+	// 历史问题 二十六次 读取上限对齐 overviewmetrics 的 16MB 探测模式
 	//（历史问题 H 同类）——规则数×状态码×host 序列的基数爆炸在 30s 采集周期里
 	// 可分配大块内存，超限按解析失败跳过本样本。
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20+1))
 	if err != nil {
-		// N+11 D3-F4：body 中段读取错误此前裸 return——失败族中唯一零信号成员
+		// N+11 body 中段读取错误此前裸 return——失败族中唯一零信号成员
 		// （52fdb0f7 枚举未覆盖）。现与其他类别同口径走状态转换日志。
 		if logMetricsStateTransition(metricsFailureRead, true) != "" {
 			Logf("warn", "Failed to read metrics body: %v", err)
@@ -191,38 +229,15 @@ func (m *MetricsService) collect() {
 		Logf("info", "metrics endpoint body back under 16MB cap")
 	}
 
-	// N+11 D3-F3：string 拷贝只做一次——parse 与 per-host store 共用同一
+	// N+11 string 拷贝只做一次——parse 与 历史修复 store 共用同一
 	// text，此前两次 string(body) 最坏双拷贝 32MB（16MB body ×2）。
 	text := string(body)
 	// geoip 规则的请求先过独立透传路由（首处理器 http.handlers.geoip2region，
 	// buildGeoipPassRoute）再过主/路径路由，两条路由各自注入 metrics——同一
-	// 请求的请求数/状态码/字节量在全局与 per-host 全部翻倍。透传路由无
+	// 请求的请求数/状态码/字节量在全局与 历史修复 全部翻倍。透传路由无
 	// reverse_proxy，其序列不含任何上游语义，整条剔除即恢复真实计数。
-	if strings.Contains(text, `handler="http.handlers.geoip2region"`) {
-		// LBS-B-历史问题（历史）：Builder 逐行条件写入单副本（曾 Split+Join——
-		// 行切片 ~24B/行 + 16MB 拼接副本，与上方「拷贝只做一次」口径矛盾）。
-		// 分隔符仅在保留行之间落盘，与 Split+Join 输出逐字节等价（含尾部
-		// 空行与被删末行两形态）。
-		var b strings.Builder
-		b.Grow(len(text))
-		wrote := false
-		start := 0
-		for i := 0; i <= len(text); i++ {
-			if i < len(text) && text[i] != '\n' {
-				continue
-			}
-			line := text[start:i]
-			start = i + 1
-			if strings.Contains(line, `handler="http.handlers.geoip2region"`) {
-				continue
-			}
-			if wrote {
-				b.WriteByte('\n')
-			}
-			b.WriteString(line)
-			wrote = true
-		}
-		text = b.String()
+	if strings.Contains(text, geoipPassSeriesMarker) {
+		text = filterGeoipPassSeries(text)
 	}
 	metrics, err := m.parsePrometheusMetrics(text)
 	if err != nil {
@@ -411,7 +426,7 @@ func estimateLatencyPercentiles(text string) (int, int, int, error) {
 	// histogram_quantile 桶内线性插值（2026-10-09 用户裁定）：观察值在落桶
 	// 内按均匀分布估计——旧实现恒返回 le 桶边（值永远落在 5/10/25/50/2500ms
 	// 桶边上「太整齐」）。与 Prometheus histogram_quantile 同算法：
-	// rank=q×total，落桶后 value=lower+(upper-lower)×(rank-prevCum)/bucketCount。
+	// rank=q×total，落桶后 value=lower+×/bucketCount。
 	percentile := func(q float64) int {
 		if total <= 0 {
 			return 0
@@ -519,7 +534,7 @@ func parseRuleLabelMetrics(text string) (map[string]*ruleLabelAggregate, error) 
 // storePerHostMetrics 按 rule label(lazybalancer_*)写规则级历史行——
 // 2026-09-15 用户裁定:caddy_id 直接匹配替代域名/host 匹配(通配符/大小写/
 // IDNA/多域名/空域名全部天然正确,且不再有静默 continue 失配)。
-// TCP 规则无行(caddy-l4 无规则级流量计数器)。
+// TCP 规则无行(历史修复 无规则级流量计数器)。
 func (m *MetricsService) storePerHostMetrics(text string) error {
 	byRule, err := parseRuleLabelMetrics(text)
 	if err != nil {
@@ -543,7 +558,7 @@ func (m *MetricsService) storePerHostMetrics(text string) error {
 }
 
 func (m *MetricsService) cleanupHistory() {
-	// 2026-09-15 用户裁定:指标历史固定保留最近 7 天(覆盖 S-7 复用「日志
+	// 2026-09-15 用户裁定:指标历史固定保留最近 7 天(覆盖 历史修复 复用「日志
 	// 保留」的裁定——用户明确指标类数据独立于日志保留配置);实时接口
 	// (/metrics/*)不受影响,仅历史图窗口收敛到 7 天。
 	const retentionDays = 7
@@ -568,52 +583,59 @@ func (m *MetricsService) storeMetrics(metrics parsedMetrics) error {
 	return err
 }
 
-func (m *MetricsService) updateOverview(metrics parsedMetrics) {
-	// D1-历史问题：三条查询（含 nodes 的 datetime 统计）必须在读锁之外执行——
-	// 原实现持写锁查库，DB busy/慢 IO 会阻塞 GetOverview 及全部读方（采集
-	// 周期 30s）。前值只在读锁内快照一次，查询失败沿用该快照。
+// refreshDBOverviewMetrics 独立刷新三项纯 DB 派生指标（启用规则/规则总数/
+// 在线节点）。此前三条查询写在 updateOverview 内，而
+// updateOverview 只在 /metrics 采集成功的末尾调用——Caddy 未就绪或 /metrics
+// 不可达期间（含空库启动、运维最需要节点状态的时刻）三项指标永久冻结在 0。
+// 现在它们随每个采集周期独立刷新，只有流量样本受 /metrics 可用性影响。
+func (m *MetricsService) refreshDBOverviewMetrics() {
+	database := db.DB
+	if database == nil {
+		return
+	}
 	m.mu.RLock()
-	previousOverview := m.overview
+	activeRules, totalRules, onlineNodes := m.overview.ActiveRules, m.overview.TotalRules, m.overview.OnlineNodes
 	m.mu.RUnlock()
 
-	// Get active rules count (fast read-only query)
 	// 历史 B3: 错误必须显式处理，否则 DB 故障时 overview 三项指标静默归零。
-	// 查询失败时保留既有 overview 行中的前值（与 onlineNodes 分支同口径）：
-	// 此前变量零值初始化，日志声称 "keeping previous value" 实际写入 0。
-	activeRules, totalRules := previousOverview.ActiveRules, previousOverview.TotalRules
-	onlineNodes := previousOverview.OnlineNodes
-	database := db.DB
-	if database != nil {
-		if err := database.QueryRow("SELECT COUNT(*) FROM lb_rules WHERE enabled = 1").Scan(&activeRules); err != nil {
-			Logf("error", "updateOverview: query active rules failed: %v (keeping previous value=%d)", err, previousOverview.ActiveRules)
-			activeRules = previousOverview.ActiveRules
-		}
-		if err := database.QueryRow("SELECT COUNT(*) FROM lb_rules").Scan(&totalRules); err != nil {
-			Logf("error", "updateOverview: query total rules failed: %v (keeping previous value=%d)", err, previousOverview.TotalRules)
-			totalRules = previousOverview.TotalRules
-		}
+	// 查询失败时保留既有 overview 行中的前值（与 onlineNodes 分支同口径）。
+	if err := database.QueryRow("SELECT COUNT(*) FROM lb_rules WHERE enabled = 1").Scan(&activeRules); err != nil {
+		Logf("error", "updateOverview: query active rules failed: %v (keeping previous value=%d)", err, activeRules)
+	}
+	if err := database.QueryRow("SELECT COUNT(*) FROM lb_rules").Scan(&totalRules); err != nil {
+		Logf("error", "updateOverview: query total rules failed: %v (keeping previous value=%d)", err, totalRules)
+	}
 
-		// 在线节点数口径与 ComputeNodeStatus 统一：nodes.status 只在注册/上报时写入、
-		// 从不回写为 'offline'，按 status 字段统计会拿到陈旧值，改为动态判定——
-		// 已批准且 last_seen 未超过离线阈值秒数（倍率常量 nodeOfflineMultiplier 共用）。
-		// 阈值=max(2×sync_interval, 120s 下限)，与 nodeOfflineThreshold 同口径
-		// （F-历史问题-02：此前仅 2×clamp，sync_interval∈[10,59] 时与巡检分叉）。
-		// 边界语义与 ComputeNodeStatus 对齐：ComputeNodeStatus 仅在 now.Sub(lastSeen) > N 时判离线，
-		// 即恰好 N 秒整的节点仍算在线，故这里用 >= 把「等于 N 秒」归入在线，避免口径漂移。
-		// sync_interval 脏值（存量库可能残留 0/负数或 1-9s，历史问题 前无下限校验）与
-		// ComputeNodeStatus/从节点 run loop 同口径按 60s 计：从节点实际以 60s 上报，
-		// 10s/20s 阈值会把两次上报之间的正常节点误判离线（历史问题 A-1、历史问题）。
-		if err := database.QueryRow(`
+	// 在线节点数口径与 ComputeNodeStatus 统一：nodes.status 只在注册/上报时写入、
+	// 从不回写为 'offline'，按 status 字段统计会拿到陈旧值，改为动态判定——
+	// 已批准且 last_seen 未超过离线阈值秒数（倍率常量 nodeOfflineMultiplier 共用）。
+	// 阈值不再在 SQL 里另写一套
+	// （MIN(86400, MAX(?*COALESCE(...),120))）——那套口径把阈值硬顶在 24h，
+	// 而 Go 侧 nodeOfflineThreshold 的上限是 2×86400=48h，sync_interval∈(43200,86400]
+	// 时节点列表判「在线」而总览判离线。现在统一由 Go 侧算出秒数后作为参数传入。
+	// 边界语义与 ComputeNodeStatus 对齐：ComputeNodeStatus 仅在 now.Sub(lastSeen) > N 时判离线，
+	// 即恰好 N 秒整的节点仍算在线，故这里用 >= 把「等于 N 秒」归入在线，避免口径漂移。
+	offlineThresholdSeconds := nodeOfflineThresholdSeconds(database)
+	if err := database.QueryRow(`
 		SELECT COUNT(*) FROM nodes
 		WHERE is_approved = 1
 		  AND last_seen IS NOT NULL
-		  AND datetime(last_seen) >= datetime('now', printf('-%d seconds', MIN(86400, MAX(? * COALESCE((SELECT CASE WHEN sync_interval < 10 THEN 60 ELSE sync_interval END FROM global_config WHERE id=1), 60), 120))))
-	`, nodeOfflineMultiplier).Scan(&onlineNodes); err != nil {
-			Logf("error", "updateOverview: query online nodes failed: %v (keeping previous value=%d)", err, previousOverview.OnlineNodes)
-			onlineNodes = previousOverview.OnlineNodes
-		}
+		  AND datetime(last_seen) >= datetime('now', printf('-%d seconds', ?))
+	`, offlineThresholdSeconds).Scan(&onlineNodes); err != nil {
+		Logf("error", "updateOverview: query online nodes failed: %v (keeping previous value=%d)", err, onlineNodes)
 	}
 
+	m.mu.Lock()
+	m.overview.ActiveRules = activeRules
+	m.overview.TotalRules = totalRules
+	m.overview.OnlineNodes = onlineNodes
+	m.mu.Unlock()
+}
+
+func (m *MetricsService) updateOverview(metrics parsedMetrics) {
+	// 兼容直接调用方（测试/非 collect 路径）：DB 派生三项在覆盖流量样本前刷新。
+	// collect 也会先刷新一次；重复查询仅 30s 周期，可接受。
+	m.refreshDBOverviewMetrics()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var rps float64
@@ -627,6 +649,9 @@ func (m *MetricsService) updateOverview(metrics parsedMetrics) {
 	m.lastSampleAt = now
 	m.hasLastSample = true
 
+	// DB 派生三项由 refreshDBOverviewMetrics 每个采集周期独立维护，
+	// 这里只覆盖流量样本，三项原样保留。
+	activeRules, totalRules, onlineNodes := m.overview.ActiveRules, m.overview.TotalRules, m.overview.OnlineNodes
 	m.overview = models.MetricsOverview{
 		TotalRequests:  metrics.requestsTotal,
 		RequestsPerSec: rps,

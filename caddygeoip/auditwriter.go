@@ -5,9 +5,9 @@ package caddygeoip
 // coraza 以 `SecAuditLogType lbfile` 选用本插件（security.go 渲染层发射）。
 // 与退役的 serial 直写相比的两个职责：
 //
-//  1. timing 注入：进程内 per-request 计时注册表（auditTiming*，写点=
+//  1. timing 注入：进程内 历史修复 计时注册表（auditTiming*，写点=
 //     blocked_counter / SecurityTimingPre / SecurityTimingEnd，键=blocked_counter
-//     注入的 X-Lb-Security-Timing-Id 头值——审计 JSON 的 request.headers 天然
+//     注入的 历史修复 头值——审计 JSON 的 request.headers 天然
 //     收录该头，Write 无需解析正文即可取得关联键）在刷盘前注入审计 JSON 顶层
 //     lb_timing 字段：{"pre_us":N,"end_us":M}（缺席分段省略）。读侧
 //     （internal/services/securityevents.go）直接从审计行取值，
@@ -18,15 +18,24 @@ package caddygeoip
 //     开销，防 tx.Close 归还 sync.Pool 后的 live 引用污染），专职 drain goroutine
 //     用注册 formatter 格式化、限时等待计时终态、注入 lb_timing、bufio 批量刷盘
 //     （阈值/周期双触发）。入队阻塞式（零丢弃；队列满时请求路径阻塞等 drain
-//     消化，退化价=退役前 serial 同步写）；管线已关（重载窗口在途写入）时回退
-//     同步直写（短生命周期 fd O_APPEND 单行追加+计时同步短等注入），同样零丢弃。
+//     消化，退化价=退役前 serial 同步写）。管线是**进程级单例**：同一 target
+//     的 fd/drain goroutine 进程内只建一次，不随 reload 重建、也不回收（见
+//     acquireAuditPipeline）；写路径因此恒有活 drain 消费，不存在「管线已关」
+//     的同步回退分支——上游从不调 AuditLogWriter.Close（见 FlushAuditPipelines）。
 //
-// 时序契约（为什么注入在 drain 侧而非 Write 侧）：coraza-caddy 在 WAF 中间件
-// 退出时 defer tx.ProcessLogging()——审计 Write 严格早于 blocked_counter（外层
-// 包装）恢复执行与 SecurityTimingEnd（下游收点）执行，此刻该请求的分段耗时
-// 尚未产生。drain goroutine 对每条审计行限时等待注册表终态（closed），等待
-// 发生在请求路径之外；耗时数值在决策点测得（time.Since 决策瞬间），入队/
-// 队列等待/刷盘延迟永不进入数值——「决策→计时→入队」的顺序保证降级模式下
+// 时序契约（为什么注入在 drain 侧而非 Write 侧）：历史修复 v2.6.2 在 WAF
+// 处理函数入口即 defer tx.ProcessLogging()+tx.Close()，这两个调用在处理函数
+// 返回时才执行——即审计 Write 发生在 coraza 中间件返回前的一刻：请求要么已
+// 跑完下游链，要么已被中断（下游链未执行）。据此两类事件的到场状态不同：
+//   - logged/放行事件：SecurityTimingPre 与 SecurityTimingEnd 都在链内、先于
+//     ProcessLogging 执行，Write 时 pre/end 两段已经写好；
+//   - 拦截事件（WAF/GeoIP/IP ACL/限流）：链在下游收点之前中断，拦截分段
+//     （pre 或 end）与终态标记由链最外层 blocked_counter 的 历史修复 写入
+//     注册表——严格晚于该 Write（coraza 的 defer 先于外层包装恢复执行）。
+//
+// 因此注入必须留在 drain 侧：drain goroutine 对每条审计行限时等待注册表终态
+// （closed），等待发生在请求路径之外；耗时数值在决策点测得（time.Since 决策
+// 瞬间），入队/队列等待/刷盘延迟永不进入数值——「决策→计时→入队」的顺序保证
 // 耗时数字不受污染。
 //
 // 轮转兼容（auditlog_rotation.go 核对）：轮转 = copytruncate（复制后截断，
@@ -83,14 +92,10 @@ var (
 	// auditTimingWaitLimit drain 对「条目在场但未终态」分段的限时等待：正常形态
 	// （blocked_counter 是链最外层收点，紧随 coraza 中间件 defer）等待 <1ms；
 	// 上限仅兜底异常形态（计时写点缺失），超时按已到场分段注入。未知 tid
-	// （注册表无条目）不进本等待——auditTimingWait 首轮查表未命中即返（AUD-1，
+	// （注册表无条目）不进本等待——auditTimingWait 首轮查表未命中即返（历史修复，
 	// 历史：单 drain goroutine 逐行满等=无背压阀下的 drain 沉陷）。
 	auditTimingWaitLimit = 2 * time.Second
 	auditTimingPollStep  = 200 * time.Microsecond
-	// auditSyncTimingWaitLimit 同步回退写（管线已关的重载窗口在途行）的计时
-	// 短等上限：等待发生在请求路径，正常形态 µs 级置位终态；上限只兜底异常
-	// 形态，超限按已到场分段落盘（行不丢、缺段省略）。
-	auditSyncTimingWaitLimit = 5 * time.Millisecond
 	// auditTimingEntryTTLNs 注册表条目存活上限（纳秒）：条目由周期性清扫回收
 	// （消费不删——同一请求可产多条审计行[预检+策略引擎]，共享同一注册表条目）。
 	// 以 atomic.Int64 纳秒存储而非普通 time.Duration：常驻 sweeper goroutine
@@ -108,10 +113,10 @@ var (
 	auditTimingSweepIntervalNs atomic.Int64
 )
 
-// —— per-request 计时注册表 ——
+// —— 历史修复 计时注册表 ——
 // 写点：SecurityTimingPre(:pre)/SecurityTimingEnd(:end)/blocked_counter(:pre 或
 // :end + 终态 close)。读点：audit drain goroutine（限时等待终态后注入）。
-// 键=X-Lb-Security-Timing-Id 头值（16 字符随机 hex，进程内唯一；coraza tx ID
+// 键=历史修复 头值（16 字符随机 hex，进程内唯一；coraza tx ID
 // 每引擎独立生成，一个请求多个引擎多个 tx ID，不能作请求级键）。
 
 type auditTimingEntry struct {
@@ -120,7 +125,7 @@ type auditTimingEntry struct {
 	endUs  int64
 	preSet bool
 	endSet bool
-	// closed 终态标记：链最外层收点（blocked_counter post-next）在全部分段
+	// closed 终态标记：链最外层收点（blocked_counter 历史修复）在全部分段
 	// 写点完成后的空值写法（guard）下置位——drain 见 closed 即注入并停止等待。
 	closed  bool
 	created time.Time
@@ -232,8 +237,8 @@ func startAuditTimingSweeperForTest() {
 }
 
 // auditTimingClose 标记该请求的全部分段已写完（终态）。由链最外层收点
-// （blocked_counter post-next）调用——此刻整个安全链已返回，不会再有分段写点。
-// 条目不存在时直接返回（E81-历史问题）：drain 对未知 tid 首轮即返（AUD-1），
+// （blocked_counter 历史修复）调用——此刻整个安全链已返回，不会再有分段写点。
+// 条目不存在时直接返回（E81-历史问题）：drain 对未知 tid 首轮即返，
 // close 建条没有收益——它只会给「零分段写点」的请求额外占一个 TTL 条目。
 func auditTimingClose(id string) {
 	if id == "" {
@@ -293,14 +298,14 @@ func auditTimingSweepLocked(now time.Time) {
 // 缺段省略）。id 为空（无 timing 头的审计行）或首轮查表无条目（未知 tid）立即
 // 返回空快照。
 //
-// AUD-1（历史）：未知 tid 首轮即返，不轮询到超时。「条目暂未创建」的唯一
+// 历史修复（历史）：未知 tid 首轮即返，不轮询到超时。「条目暂未创建」的唯一
 // 合法窗口是同一请求 goroutine 内 Write（coraza defer ProcessLogging）→
 // blocked_counter 收点置位终态之间的微秒级间隙，而 drain 侧先格式化（整行
 // json.Marshal）再查表，恒晚于该间隙——首轮未命中只可能是陈旧行（队列积压超
 // TTL，条目已被清扫）或写点缺失的异常行，分段数据永不到场。旧行为对未知 tid
 // 轮询满超时：单 drain goroutine × 逐行满等 2s × 入队阻塞式零丢弃（无背压阀）
 // = 积压行批量到场时 drain 沉陷、请求路径被拖住。代价：预检拦行的终态由
-// blocked_counter post-next 在 Write 后微秒级补写，首轮恰落在该间隙内的行
+// blocked_counter 历史修复 在 Write 后微秒级补写，首轮恰落在该间隙内的行
 // （drain 抢先完成格式化的极小竞态窗）不注入 lb_timing——耗时是增强信息，
 // 展示层报「—」，可接受。
 func auditTimingWait(id string, timeout time.Duration) auditTimingSnapshot {
@@ -479,7 +484,7 @@ func (t *auditSnapshotTransaction) HasRequest() bool {
 	return t != nil && t.Request_ != nil
 }
 
-// Request 缺席时返回 nil 接口（比 coraza 的 typed-nil 更保守：formatter 侧的
+// Request 缺席时返回 nil 接口（比 coraza 的 历史修复 更保守：formatter 侧的
 // != nil 哨兵在此语义下成立）。
 func (t *auditSnapshotTransaction) Request() plugintypes.AuditLogTransactionRequest {
 	if t == nil || t.Request_ == nil {
@@ -524,7 +529,7 @@ func (t *auditSnapshotTransaction) IsInterrupted() bool {
 // 格式化器一致：args 恒 {} 空对象）。
 //
 // E81-历史问题：嵌入值不是事务活对象，而是 frozenArgsRequest(req) 返回的同动态类型
-// typed-nil 指针——只保留 Args() 的接口契约，不引用事务变量集合。旧实现嵌入 live
+// 历史修复 指针——只保留 Args() 的接口契约，不引用事务变量集合。旧实现嵌入 live
 // 请求，注释声称「tx.Close 后为空读」与 coraza 实现不符（ConcatKeyed 持有事务
 // argsGet/argsPost 的长期引用，tx 回池复用后 Args() 会读到下一请求的参数，而
 // drain 侧格式化恒晚于 tx.Close）。
@@ -733,8 +738,8 @@ func snapshotAuditBody(body string) (string, bool) {
 	return prefix, true
 }
 
-// snapshotAuditLog 把 live AuditLog 拷贝为自持快照。接口 nil 检查穿透 typed-nil
-// （coraza 的 Response()/Producer() 返回 typed-nil 指针——接口非 nil 但底层为
+// snapshotAuditLog 把 live AuditLog 拷贝为自持快照。接口 nil 检查穿透 历史修复
+// （coraza 的 Response()/Producer() 返回 历史修复 指针——接口非 nil 但底层为
 // nil，按缺失处理保持 JSON 信封一致：response/producer omitempty）。
 func snapshotAuditLog(al plugintypes.AuditLog) *auditSnapshot {
 	s := &auditSnapshot{Parts_: append(types.AuditLogParts(nil), al.Parts()...)}
@@ -818,7 +823,7 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 
 // frozenArgsRequest 返回不再引用 coraza 事务活对象的请求接口值，仅用于满足
 // AuditLogTransactionRequest 的 Args() 方法（返回类型不可命名，外部包只能经
-// 接口提升实现）。做法：取该请求动态类型的零值（typed-nil 指针）——coraza 的
+// 接口提升实现）。做法：取该请求动态类型的零值（历史修复 指针）——coraza 的
 // *auditlog.TransactionRequest.Args() 在 nil 接收者上返回全新的空 ConcatKeyed
 // （internal/auditlog/auditlog.go，nil 分支），因此任何迟到的 Args() 读取得到
 // 「空」而不是复用事务里下一请求的参数。
@@ -863,7 +868,7 @@ func argsNilSafe(t reflect.Type, req plugintypes.AuditLogTransactionRequest) boo
 	return safe
 }
 
-// isNilInterface 判定接口值为 nil 或持 typed-nil 指针。
+// isNilInterface 判定接口值为 nil 或持 历史修复 指针。
 func isNilInterface(v any) bool {
 	if v == nil {
 		return true
@@ -879,7 +884,7 @@ func isNilInterface(v any) bool {
 // —— 审计写插件与共享管线 ——
 
 // lbAuditItem 是队列元素：审计快照 + 注册格式化器 + 计时关联键（空=无计时）。
-// 格式化已移出请求路径——Write 只构建快照，drain/同步回退侧用随行 formatter
+// 格式化已移出请求路径——Write 只构建快照，drain 侧用随行 formatter
 // 格式化（同一 target 的 writer 同构，但保守以 Write 时点的 formatter 为准）。
 type lbAuditItem struct {
 	snap      *auditSnapshot
@@ -889,23 +894,21 @@ type lbAuditItem struct {
 
 // auditPipeline 是按目标路径共享的落盘管线（单 drain goroutine + 单 fd +
 // bufio）。多个 coraza WAF 实例（预检+各策略引擎，各自 NewWAF→独立 writer
-// 实例）追加同一审计文件时共享一条管线，避免 reload 池换血累积 goroutine/fd。
+// 实例）追加同一审计文件时共享一条管线。
+//
+// 生命周期=进程级单例（用户可感知的持久性取舍见 acquireAuditPipeline）：
+// target/queue/done/mode 创建后只读——queue 恒非 nil 且写侧永不关闭它，故
+// 入队无需锁；done 在 drain 退出时关闭（进程运行期恒不闭合，仅测试收尾观测）。
 type auditPipeline struct {
-	// mu 保护生命周期字段（queue/done/refs/closed）：enqueue 全程持 RLock 发送
-	// （发送完成前 release 的 Lock 排队等待），release 持 Lock 置 queue=nil 并
-	// close——close(q) 与发送严格定序，不会 send-on-closed。
-	mu     sync.RWMutex
 	target string
 	queue  chan lbAuditItem
 	done   chan struct{}
-	refs   int
-	closed bool
-	// ioMu 保护 fd/bufio（仅 drain goroutine 触碰，独立于 mu 防止请求路径
-	// enqueue 的 RLock 与刷盘互斥）。target/mode 创建后只读，无锁读。
+	mode   os.FileMode
+	// ioMu 保护 fd/bufio（仅 drain goroutine 触碰，独立于注册表锁，防止请求
+	// 路径 enqueue 与刷盘互斥）。
 	ioMu sync.Mutex
 	fd   *os.File
 	bw   *bufio.Writer
-	mode os.FileMode
 	// ioErrMu 保护 IO 错误节流状态（drain 与其关闭路径并发可见）。
 	ioErrMu      sync.Mutex
 	lastIOErrLog time.Time
@@ -998,16 +1001,22 @@ var (
 	auditPipelines   = map[string]*auditPipeline{}
 )
 
-// acquireAuditPipeline 取目标路径的共享管线（不存在则创建：打开 fd + 启动
-// drain）。fd 打开失败返回错误——coraza NewWAF 会把 Init 错误上抛为配置拒绝
-// （/load fail-fast，与退役前 serial writer 同语义）。
+// acquireAuditPipeline 取目标路径的进程级共享管线（不存在则创建：打开 fd +
+// 启动 drain）。fd 打开失败返回错误——coraza NewWAF 会把 Init 错误上抛为配置
+// 拒绝（/load 历史修复，与退役前 serial writer 同语义）。
+//
+// 为什么是进程级单例（不回收、不随 reload 换血）：上游从不调
+// AuditLogWriter.Close（coraza v3.8.1 的 WAF.Close 与 历史修复 的 Destruct
+// 都不触碰审计写插件，见 FlushAuditPipelines），因此引用计数与「最后一个引用
+// 释放即关队列」的 teardown 在进程内不可能被触发——保留它们只会让写路径依赖
+// 一条永不发生的生命周期事件。这里改为：同一 target 恒返回同一管线，fd 与
+// drain goroutine 活到进程退出。代价是渲染目标 auditLogPath 变更时旧路径的
+// fd/goroutine 不再回收（每个历史 target 一条，进程重启归零）；收益是写路径
+// 恒有活 drain 消费——审计事件不会因任何 teardown 竞态被丢弃或转同步直写。
 func acquireAuditPipeline(target string, mode os.FileMode) (*auditPipeline, error) {
 	auditPipelinesMu.Lock()
 	defer auditPipelinesMu.Unlock()
-	if p, ok := auditPipelines[target]; ok && !p.isClosed() {
-		p.mu.Lock()
-		p.refs++
-		p.mu.Unlock()
+	if p, ok := auditPipelines[target]; ok {
 		return p, nil
 	}
 	p := &auditPipeline{
@@ -1019,16 +1028,9 @@ func acquireAuditPipeline(target string, mode os.FileMode) (*auditPipeline, erro
 	if err := p.openFile(mode); err != nil {
 		return nil, err
 	}
-	p.refs = 1
 	auditPipelines[target] = p
 	go p.drain()
 	return p, nil
-}
-
-func (p *auditPipeline) isClosed() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.closed
 }
 
 // openFile 打开目标文件（O_APPEND——copytruncate 轮转下 fd 恒有效）。
@@ -1045,99 +1047,18 @@ func (p *auditPipeline) openFile(mode os.FileMode) error {
 }
 
 // enqueue 阻塞式入队（零丢弃）：队列满时等待 drain 消化——退化价=退役前
-// serial 同步写。发送持 RLock 全程（release 的 Lock 排队等到发送完成），与
-// release 的 close(q) 定序互斥，不会 send-on-closed。管线已关（refs 归零后的
-// 重载窗口在途写入，closed=true）或 done 已闭时回退同步直写——同样零丢弃。
+// serial 同步写。queue 创建后只读且永不关闭（进程级单例，见
+// acquireAuditPipeline），因此发送无需锁、也不存在 历史修复。
 func (p *auditPipeline) enqueue(item lbAuditItem) error {
-	p.mu.RLock()
-	q, done, closed := p.queue, p.done, p.closed
-	if closed || q == nil {
-		p.mu.RUnlock()
-		return p.syncWrite(item)
-	}
-	// done 只在 drain 退出（晚于 release 的 Lock→close(q)）时闭合，而 close(q)
-	// 需要写锁、被本 RLock 排除——done 分支为防御性保留（未来重构若放宽锁序，
-	// 此处仍走零丢弃回退而非静默丢行）。
-	select {
-	case q <- item:
-		p.mu.RUnlock()
-		return nil
-	case <-done:
-		p.mu.RUnlock()
-		return p.syncWrite(item)
-	}
-}
-
-// syncWrite 是管线关闭后（重载窗口在途写入）的零丢弃回退：短生命周期 fd
-// O_APPEND 直写该行。与 drain 残余 bufio 批量写按行粒度交错——摄取按行解码+
-// transaction_id 幂等去重，乱序无影响。计时注入同步完成（短等终态：重载窗口
-// 内 blocked_counter 紧随 ProcessLogging，µs 级置位；上限只兜底异常形态，避免
-// 请求路径长等）。
-func (p *auditPipeline) syncWrite(item lbAuditItem) error {
-	if item.snap == nil || item.formatter == nil {
-		return nil
-	}
-	body, err := item.formatter.Format(item.snap)
-	if err != nil {
-		return err
-	}
-	if len(body) == 0 {
-		return nil
-	}
-	if item.tid != "" {
-		snap := auditTimingWait(item.tid, auditSyncTimingWaitLimit)
-		body = injectAuditTiming(body, snap)
-	}
-	fd, err := os.OpenFile(p.target, os.O_CREATE|os.O_WRONLY|os.O_APPEND, p.mode)
-	if err != nil {
-		return err
-	}
-	defer fd.Close()
-	_, err = fd.Write(append(body, '\n'))
-	return err
-}
-
-// release 递减引用；最后一个引用释放时关闭队列——drain 排空余量、刷盘、关
-// fd 后退出（close 与 enqueue 的互斥见 mu 注释）。
-func (p *auditPipeline) release() {
-	waitDrain := false
-	auditPipelinesMu.Lock()
-	p.mu.Lock()
-	if p.refs > 0 {
-		p.refs--
-	}
-	if p.refs == 0 && !p.closed {
-		p.closed = true
-		q := p.queue
-		waitDrain = true
-		delete(auditPipelines, p.target)
-		close(q)
-	}
-	p.mu.Unlock()
-	auditPipelinesMu.Unlock()
-	// 历史问题（历史）：等待 drain 退出（fd 关闭确认）不得持注册表锁——
-	// 旧实现持 auditPipelinesMu 阻塞在 <-p.done，drain 排空期间所有
-	// acquireAuditPipeline（新 WAF/重载）被卡住。删除+close 已在锁内完成，
-	// 新的同路径管线可并发创建（各自独立 fd，O_APPEND 追加安全）。
-	if waitDrain {
-		<-p.done
-	}
+	p.queue <- item
+	return nil
 }
 
 // drain 专职落盘 goroutine：注入 timing → bufio 批量写 → 阈值/周期双触发刷盘。
-// 队列关闭后排空余量再退出（零丢弃语义覆盖 teardown 路径）。队列句柄创建后
-// 保持不变，release 只关闭 channel 不清字段；因此 drain 即使在 release 后
-// 才首次运行，也仍能取得同一 channel 并排空。后续 enqueue 由 closed 门控转
-// 同步直写，不会向已关闭 channel 发送。
+// 队列关闭后排空余量再退出、刷盘、关 fd（零丢弃语义覆盖队列收尾）。
 func (p *auditPipeline) drain() {
 	defer close(p.done)
-	p.mu.RLock()
 	q := p.queue
-	p.mu.RUnlock()
-	if q == nil {
-		p.closeFile()
-		return
-	}
 	ticker := time.NewTicker(auditFlushInterval)
 	defer ticker.Stop()
 	for {
@@ -1202,6 +1123,7 @@ func (p *auditPipeline) flush() {
 
 // FlushAuditPipelines 冲刷全部存活管线；Caddy 模块 Cleanup（reload/优雅停机）
 // 调用，弥补上游从不调用 AuditLogWriter.Close 导致的尾部丢失（历史 E-历史问题）。
+// 只刷盘不关闭：管线是进程级单例，fd/drain 的生命周期与进程一致。
 func FlushAuditPipelines() {
 	auditPipelinesMu.Lock()
 	pipelines := make([]*auditPipeline, 0, len(auditPipelines))
@@ -1230,13 +1152,13 @@ func (p *auditPipeline) closeFile() {
 }
 
 // lbAuditWriter 是 coraza 审计写插件实例（每个 coraza WAF 一个；多实例共享
-// 按路径的落盘管线）。Write 只构建审计快照入队（formatter.Format 已移出请求
-// 路径——黑名单预检计时窗内只剩快照拷贝，memcpy 级），格式化/计时等待/落盘
-// 全部后置到 drain（或管线关闭时的同步回退直写）。
+// 按路径的进程级落盘管线）。Write 只构建审计快照入队（formatter.Format 已移出
+// 请求路径——黑名单预检计时窗内只剩快照拷贝，memcpy 级），格式化/计时等待/
+// 落盘全部后置到 drain。
 type lbAuditWriter struct {
 	formatter plugintypes.AuditLogFormatter
 	pipeline  *auditPipeline
-	// failed 标记 Init 失败（fd 打不开）：后续 Write 静默 no-op——与 coraza
+	// failed 标记 Init 失败（fd 打不开）：后续 Write 静默 历史修复——与 coraza
 	// serial writer Init 失败后 Write 短路同形态（coraza 已在 Init 错误点
 	// 上抛/记日志，配置加载被拒）。
 	failed bool
@@ -1267,10 +1189,12 @@ func (w *lbAuditWriter) Write(al plugintypes.AuditLog) error {
 	return w.pipeline.enqueue(lbAuditItem{snap: snapshotAuditLog(al), formatter: w.formatter, tid: tid})
 }
 
+// Close 满足 plugintypes.AuditLogWriter 接口（coraza v3.8.1 实际从不调用它）。
+// 只刷盘、不拆管线：管线是进程级单例，拆除会让写侧失去恒活的 drain（见
+// acquireAuditPipeline）；真被上游调用时此处的语义是「尽力把已入队行刷出」。
 func (w *lbAuditWriter) Close() error {
 	if w.pipeline != nil {
-		w.pipeline.release()
-		w.pipeline = nil
+		w.pipeline.flush()
 	}
 	return nil
 }

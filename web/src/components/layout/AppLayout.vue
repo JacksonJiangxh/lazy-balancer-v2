@@ -20,7 +20,6 @@
         background-color="#ffffff"
         text-color="#6b7280"
         active-text-color="#3b82f6"
-       
       >
         <el-menu-item index="dashboard" @click="goPage('dashboard')">
           <el-icon><DataAnalysis /></el-icon>
@@ -224,6 +223,7 @@ import AppLogo from '@/components/AppLogo.vue'
 import { appName, footerHtml } from '@/utils/branding'
 import { restartServiceWithFeedback } from '@/utils/restart'
 import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
+import { SETTINGS_BREADCRUMB_PARENT, SETTINGS_TAB_IDS, SETTINGS_TAB_TITLES } from '@/utils/settingsPages'
 
 const authStore = useAuthStore()
 const collapsed = ref(false)
@@ -245,22 +245,24 @@ const hasCustomDisplayName = computed(() => {
   return displayName !== '' && displayName !== authStore.user?.username
 })
 
+// 系统设置五个分页标题与 Settings.vue 页头同源（utils/settingsPages）——原两处
+// 各持一份同构映射，改名必然漏改其一。
+const settingsPageTitles: Record<string, string> = Object.fromEntries(
+  SETTINGS_TAB_IDS.map((tab) => [`settings-${tab}`, `${SETTINGS_BREADCRUMB_PARENT} / ${SETTINGS_TAB_TITLES[tab]}`]),
+)
+
 const pageTitle: Record<string, string> = {
   dashboard: '仪表盘',
   rules: '负载均衡',
   caddy: '配置预览',
   users: '系统设置 / 用户认证',
   'audit-log': '操作日志',
-  'settings-basic': '系统设置 / 基础设置',
-  'settings-tasks': '系统设置 / 任务监控',
-  'settings-cluster': '系统设置 / 集群管理',
-  'settings-certificates': '系统设置 / 免费证书',
-  'settings-apikeys': '系统设置 / API 密钥',
   'security-overview': '安全防护 / 安全总览',
   'security-events': '安全防护 / 事件日志',
   'security-policies': '安全防护 / 安全策略',
   'security-rules': '安全防护 / 规则集',
   'security-block-pages': '安全防护 / 拦截页面',
+  ...settingsPageTitles,
 }
 
 const profileForm = ref({

@@ -1,6 +1,6 @@
 package handlers
 
-// 历史问题(历史修复)：TCP 三字段（tcp_health_check_port/tcp_try_duration/
+// 历史问题：TCP 三字段（tcp_health_check_port/tcp_try_duration/
 // tcp_try_interval）此前无负值校验，渲染侧静默钳制（caddy.go 3503-3522）——
 // 保存前拒绝显式负值。代理超时族的 -1 哨兵（proxy_flush_interval=-1=立即刷新）
 // 仅属 http 侧，TCP 三字段无哨兵语义，负值一律拒。

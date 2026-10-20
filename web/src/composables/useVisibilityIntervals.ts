@@ -41,8 +41,6 @@ export interface VisibilityIntervals {
   start: () => void
   /** 摘监听并清全部间隔；幂等。不触发 onHidden（卸载收尾由调用方自行释放资源） */
   stop: () => void
-  /** 间隔组当前是否在跑 */
-  readonly running: boolean
 }
 
 export function createVisibilityIntervals(options: VisibilityIntervalsOptions): VisibilityIntervals {
@@ -98,9 +96,6 @@ export function createVisibilityIntervals(options: VisibilityIntervalsOptions): 
       started = false
       doc?.removeEventListener('visibilitychange', onVisibilityChange)
       stopTimers()
-    },
-    get running() {
-      return running
     },
   }
 }

@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -45,8 +46,8 @@ type RunContext struct {
 	Ctx context.Context
 	// Trigger 触发值（开放字符串，调用方声明；task_runs.trigger 列原样落库）：
 	// 引擎内建 manual（Trigger/RunSync 手动）、auto（Periodic tick/Daemon）、
-	// startup（BootSync）；调用方自声明形态有 caddy-restart（Caddy 崩溃自愈
-	// watcher）、schedule（auto-backup 执行器）。前端按值映射展示标签。
+	// startup（BootSync）；调用方自声明形态有 历史修复（Caddy 崩溃自愈
+	// watcher）、schedule（历史修复 执行器）。前端按值映射展示标签。
 	Trigger  string
 	Operator string // 手动操作者（审计归人）
 	RunID    int64  // 引擎预插行 ID
@@ -84,13 +85,13 @@ type Descriptor struct {
 	BootSync   bool
 	StatusFn   func() string // 状态镜像
 	Cancelable bool
-	// RunsOn 角色门唯一事实源（TASK-1 历史：MasterOnly bool 双机制已
+	// RunsOn 角色门唯一事实源（历史修复 历史：MasterOnly bool 双机制已
 	// 收敛删除——调度面 tick 与 Trigger/RunSync 守卫统一走 roleAllows）。
 	RunsOn Role
 	// RestartOnRoleFlip：Run 体按角色分流时置位（2026-10-03 裁定，
-	// cluster-sync 引入）——角色真实翻转即换代重启（旧代 Run 体持旧分支，
+	// 历史修复 引入）——角色真实翻转即换代重启（旧代 Run 体持旧分支，
 	// 不换代则分支与角色脱钩）。未置位的 RoleAny 常驻（如
-	// security-events-ingestion）翻转不重启，无换代噪音。
+	// 历史修复）翻转不重启，无换代噪音。
 	RestartOnRoleFlip bool
 }
 
@@ -113,13 +114,19 @@ type RunRecord struct {
 var ErrAlreadyRunning = errors.New("taskengine: 任务运行中")
 var ErrSchedulingPaused = errors.New("taskengine: 调度已暂停")
 
-// ErrTaskSkipped 任务跳过哨兵（TASK-L5，历史 历史问题）：demote 中止等「非故障
+// ErrTaskSkipped 任务跳过哨兵（历史修复，历史 历史问题）：demote 中止等「非故障
 // 放弃」语义由 Run 体返回该哨兵，terminalStatus 映射为 task_runs skipped 终态
 // （CHECK 约束内既有值，此前零写入方）。
 var ErrTaskSkipped = errors.New("taskengine: 任务跳过")
 var ErrNotFound = errors.New("taskengine: 任务未注册")
 var ErrEngineStopped = errors.New("taskengine: 引擎已停止")
 var ErrNotMaster = errors.New("taskengine: 该操作仅允许在主节点执行")
+
+// errDaemonManualUnsupported 常驻任务手动触发拒绝哨兵（唯一错误源）：
+// Trigger/RunSync 入口与 reserveRunInternal 第二道防线同口径——常驻任务仅
+// 引擎调度（StartLoop/StopLoop 启停即可），直跑会绕过 startDaemon 生命周期
+// 挂钩与常驻循环双跑。
+var errDaemonManualUnsupported = errors.New("taskengine: 常驻任务不支持手动触发（启停即可）")
 var errPeriodicLoopDisabled = errors.New("taskengine: 周期调度已停止")
 
 // 历史问题-18（历史）：Scheduled admission 同族收口的拒绝哨兵——
@@ -231,8 +238,8 @@ func (e *Engine) StartedAt() time.Time { return e.startedAt }
 func (e *Engine) IsStopped() bool { return e.stopped.Load() }
 
 // engineStopDrainTimeout 是 Stop 等待在途 Run/daemon 的兜底上限（历史问题-2）：
-// cert 四 tick / log-cleanup / audit-retention 等 Run 体不消费 rc.Ctx，
-// 取消等价 no-op——无界 Wait 会被单个长跑清理任务拖到容器 grace 期结束
+// cert 四 tick / 历史修复 / 历史修复 等 Run 体不消费 rc.Ctx，
+// 取消等价 历史修复——无界 Wait 会被单个长跑清理任务拖到容器 grace 期结束
 // 后 SIGKILL，审计/日志尾部丢失。
 const engineStopDrainTimeout = 30 * time.Second
 
@@ -320,12 +327,12 @@ func (e *Engine) SetRole(isMaster bool) {
 	flipped := e.role != isMaster
 	e.role = isMaster
 	e.roleMu.Unlock()
-	// Daemon 生命周期随角色翻转：master-only daemon 在 demote 时停止、
+	// Daemon 生命周期随角色翻转：历史修复 daemon 在 demote 时停止、
 	// promote 时拉起（loopEnabled 保持用户调度开关语义）。SetRole 重申
 	// （生产启动/翻转期为三连调用）不是重启意图——tryStartDaemon 传
 	// false，不再误栽 pendingRestart（历史问题-01）。Periodic 不启停：角色真实
 	// 获得时置零节拍使下一 tick 即到期（历史问题-02：原置零分支位于仅收集
-	// Daemon 的切片内不可达）；角色不符时中止在途 Run（X-3 历史，与
+	// Daemon 的切片内不可达）；角色不符时中止在途 Run（历史修复 历史，与
 	// Scheduled 同型）。F-历史问题-01（历史）：Scheduled/Oneshot 在途 Run
 	// 随角色不符中止——demote 后继续跑完会让从节点写版本行/名单/规则树，打破
 	// 只读不变量；取消经 rc.Ctx 传播，三库 Run 体据此落 skipped（与起点
@@ -341,7 +348,7 @@ func (e *Engine) SetRole(isMaster bool) {
 	e.mu.RUnlock()
 	for _, r := range targets {
 		if r.desc.Kind == KindPeriodic {
-			// X-3（历史）：角色不符（demote/重申从节点）时取消在途 Run——
+			// 历史修复（历史）：角色不符（demote/重申从节点）时取消在途 Run——
 			// 与下方 Scheduled 分支同型（F-历史问题-01 同族）。Periodic 在途 Run
 			// （tick/手动触发）跑完会让从节点写库，打破只读不变量；取消经
 			// rc.Ctx 传播，Run 体据此落 skipped。loopEnabled 保留——promote 后
@@ -428,7 +435,7 @@ func (e *Engine) isMaster() bool {
 }
 
 // IsMaster 当前角色（导出——Run 体按角色分流需与角色门同源读取；
-// 2026-10-03 cluster-sync 主从分支裁定引入）。
+// 2026-10-03 历史修复 主从分支裁定引入）。
 func (e *Engine) IsMaster() bool { return e.isMaster() }
 
 // tryStartDaemon daemon 空闲且调度开时原子启动（锁内 CAS——并发调用方
@@ -443,7 +450,7 @@ func (e *Engine) tryStartDaemon(r *registration, restartIntent bool) {
 	// 历史问题（历史）：角色门内化进 CAS 临界区（锁序 e.mu→roleMu→r.mu，
 	// 与 runNow 的 roleMu→r.mu 同向）——此前角色只是调用方预检，预检与
 	// running 占位之间存在窗口：demote 在预检后完成 SetRole 的 cancel 遍历、
-	// 未及本次登记，master-only daemon 即在 slave 上存活。现角色复查与
+	// 未及本次登记，历史修复 daemon 即在 slave 上存活。现角色复查与
 	// cancel 登记同属一个 roleMu 读临界区：SetRole 写锁要么先于本门
 	// （role=false 直接拒绝启动），要么后于登记（demote 的 cancel 遍历
 	// 必命中本次登记的 cancel）。
@@ -513,7 +520,7 @@ func (e *Engine) Register(d Descriptor) error {
 	if d.BootSync && d.Kind != KindOneshot {
 		return fmt.Errorf("taskengine: %s 为 BootSync 任务，Kind 必须为 Oneshot", d.ID)
 	}
-	// TASK-L2（历史 历史问题）：Kind 与 Fn 配套校验——Periodic 缺 IntervalFn 会在
+	// 历史修复（历史 历史问题）：Kind 与 Fn 配套校验——Periodic 缺 IntervalFn 会在
 	// tick 处 nil 调用 panic（scheduleLoop goroutine 崩→进程退出），Scheduled 缺
 	// NextSlotFn 则永不到期静默停摆。注册期响亮拒绝。
 	if d.Kind == KindPeriodic && d.IntervalFn == nil {
@@ -522,9 +529,9 @@ func (e *Engine) Register(d Descriptor) error {
 	if d.Kind == KindScheduled && d.NextSlotFn == nil {
 		return fmt.Errorf("taskengine: %s 为 Scheduled 任务，必须提供 NextSlotFn", d.ID)
 	}
-	// B1-6（历史）：Daemon 不进周期 tick——EnabledFn 在调度面永不消费
+	// 历史修复（历史）：Daemon 不进周期 tick——EnabledFn 在调度面永不消费
 	//（静默忽略）。挂 EnabledFn 会让注册方误以为业务门生效，注册期响亮拒绝；
-	// 常驻业务门归 Run 体首行（autoban 形态，见 docs/task-engine-standard.md §4）。
+	// 常驻业务门归 Run 体首行（autoban 形态，见 docs/历史修复.md §4）。
 	if d.Kind == KindDaemon && d.EnabledFn != nil {
 		return fmt.Errorf("taskengine: %s 为常驻任务，EnabledFn 不参与调度（Daemon 不进 tick，静默忽略）——业务门须内置到 Run 体", d.ID)
 	}
@@ -550,10 +557,10 @@ func (e *Engine) Trigger(id, trigger, operator string) error {
 	// 历史问题-09 纵深：常驻族不暴露手动触发（启停即可）——handler CanTrigger 门
 	// 之外的第二道防线；此前 Trigger 可直跑 daemon Run 绕过真实生命周期挂钩。
 	if r.desc.Kind == KindDaemon {
-		return errors.New("taskengine: 常驻任务不支持手动触发（启停即可）")
+		return errDaemonManualUnsupported
 	}
-	// TASK-1（历史）：角色门收敛为 roleAllows(RunsOn) 单机制——与调度面
-	// tick 同函数；原 MasterOnly bool 双机制下 cert 族/auto-backup（仅声明
+	// 历史修复（历史）：角色门收敛为 roleAllows(RunsOn) 单机制——与调度面
+	// tick 同函数；原 MasterOnly bool 双机制下 cert 族/历史修复（仅声明
 	// RunsOn）的手动触发门在从节点形同虚设。
 	if !e.roleAllows(r.desc.RunsOn) {
 		return ErrNotMaster
@@ -577,7 +584,7 @@ func (e *Engine) RunSync(id, trigger, operator string) (int64, error) {
 	// RunSync 直调会绕过 startDaemon 生命周期挂钩与常驻循环双跑（防御缺口：
 	// 当前调用面未触达，B 批裁定语义=常驻任务仅引擎调度）。
 	if r.desc.Kind == KindDaemon {
-		return 0, errors.New("taskengine: 常驻任务不支持手动触发（启停即可）")
+		return 0, errDaemonManualUnsupported
 	}
 	if !e.roleAllows(r.desc.RunsOn) {
 		return 0, ErrNotMaster
@@ -607,7 +614,7 @@ func (e *Engine) RunBootSyncTasks() {
 	for _, it := range items {
 		// R3（历史）：与 Trigger/RunSync/tick 同款角色门（纵深防御——
 		// 注册期已拒绝 BootSync∧RunsOn≠RoleAny，此处拦绕过 Register 的直注
-		// 形态）。RoleAny 恒真，现行唯一 BootSync 任务（startup:config-load，
+		// 形态）。RoleAny 恒真，现行唯一 BootSync 任务（startup:历史修复，
 		// RunsOn=RoleAny）行为不变。
 		if !e.roleAllows(it.r.desc.RunsOn) {
 			continue
@@ -648,7 +655,7 @@ func (e *Engine) Cancel(id string) bool {
 // CancelInFlightRuns 取消全部在途 Scheduled/Periodic/Oneshot Run（历史问题，
 // 历史）：配置导入/还原全量替换的前置排空——证书队列 PauseAndDrain
 // 之外的其余任务族在途执行会在导入提交后把旧库状态写回新库
-// （last-writer-wins）。Run 体经 rc.Ctx 收到取消，按既有语义落
+// 。Run 体经 rc.Ctx 收到取消，按既有语义落
 // cancelled/skipped 终态。Daemon 不在此列（常驻族取消即停摆、需显式
 // 拉起，生命周期归角色门/启停管理）。返回本次取消的在途 Run 数。
 func (e *Engine) CancelInFlightRuns() int {
@@ -697,8 +704,8 @@ func (e *Engine) PauseScheduling() {
 //	...导入事务...
 //	engine.ResumeScheduling()         // 成功/失败都必须恢复
 //
-// 注意：Run 体不消费 rc.Ctx 的族（cert 四 tick / log-cleanup / audit-retention
-// 等）取消等价 no-op，等待会跑满其单轮时长——因此 ctx deadline 是必需的
+// 注意：Run 体不消费 rc.Ctx 的族（cert 四 tick / 历史修复 / 历史修复
+// 等）取消等价 历史修复，等待会跑满其单轮时长——因此 ctx deadline 是必需的
 // 兜底（建议与证书队列 PauseAndDrain 同量级 30s）。实现为计数轮询
 // （runWG 无取消语义；暂停后计数单调递减，无伪排空窗口）。
 func (e *Engine) WaitInFlightRuns(ctx context.Context) bool {
@@ -759,7 +766,7 @@ func (e *Engine) StartLoop(id string) {
 // 两种调用形态（历史问题）：
 //   - 无实参（服务就绪形态，证书服务注入等）：仅当调度已开启时重置节拍，
 //     不改变 loopEnabled——不得覆盖用户明确停止的调度。
-//   - 携带 hasWork（业务唤醒形态，cert-waiting-ca 等入队唤醒）：hasWork=false
+//   - 携带 hasWork（业务唤醒形态，历史修复 等入队唤醒）：hasWork=false
 //     零动作；hasWork=true 表示确有新工作待消费——越过「已停止」态恢复调度
 //     并立即补跑（新工作必须有消费通道）。越过即打开 loopEnabled，后续仍以
 //     loopEnabled 为唯一调度事实（跨重启的停止来源语义由 task_loop_prefs 承担，
@@ -795,7 +802,12 @@ func (e *Engine) RearmLoop(id string, hasWork ...bool) {
 	isDaemon := r.desc.Kind == KindDaemon
 	r.mu.Unlock()
 	if isDaemon && e.roleAllows(r.desc.RunsOn) {
-		e.tryStartDaemon(r, true)
+		// 残留调用方=常驻族尚未接入 RearmLoop，
+		// 但入口语义必须与 tryStartDaemon 契约一致——restartIntent 仅在
+		// StartLoop 的关→开真实重启过渡时为 true。此处恒 false：运行中的
+		// daemon 不再被栽 pendingRestart（避免其正常退出后被误换代=多一条
+		// 启动行+服务重启），空闲时仍经 CAS 正常拉起。
+		e.tryStartDaemon(r, false)
 	}
 }
 
@@ -884,7 +896,7 @@ func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, ca
 			if r.loopEnabled && !abnormal && !stopped && allows {
 				// 历史问题（历史）：换代不再在本临界区内联登记 cancel——
 				// 快照 allows 与登记之间 demote 可插入（SetRole 的 cancel
-				// 遍历未及新登记），master-only daemon 会在 slave 上存活。
+				// 遍历未及新登记），历史修复 daemon 会在 slave 上存活。
 				// 改为锁外经 tryStartDaemon 统一 CAS 入口重拉（角色门已
 				// 内化进其 CAS 临界区，以新鲜角色复核）。
 				relaunchIntent = true
@@ -996,7 +1008,7 @@ func runGuarded(run func(RunContext) error, rc RunContext) (err error) {
 // ---- 调度函数隔离（历史问题）----
 // EnabledFn/NextSlotFn/IntervalFn 是装配方闭包（生产为 DB 直读），tick 曾
 // 裸调——任一 panic 直接杀死调度 goroutine（引擎永久静默）。三个包装统一
-// recover 并 fail-closed 返回零值：
+// recover 并 历史修复 返回零值：
 //
 //	safeBool     → false（业务门关闭，整分支跳过）
 //	safeSlot     → zero（无槽，不投递）
@@ -1046,7 +1058,7 @@ func safeInterval(kind string, fn func() time.Duration) (v time.Duration) {
 	return fn()
 }
 
-// safeString（历史问题，历史）：StatusFn 同族隔离——fail-closed 返回空串
+// safeString（历史问题，历史）：StatusFn 同族隔离——历史修复 返回空串
 // （状态镜像缺失，视图降级为无镜像，不得让单任务闭包 panic 杀死
 // Lookup/DescribeAll 整页）。
 func safeString(kind string, fn func() string) (v string) {
@@ -1081,14 +1093,14 @@ func (e *Engine) History(id string, limit int) []RunRecord {
 	for rows.Next() {
 		var r RunRecord
 		if err := rows.Scan(&r.ID, &r.TaskID, &r.Family, &r.Trigger, &r.Operator, &r.Status, &r.StartedAt, &r.FinishedAt, &r.DurationMs, &r.Message); err != nil {
-			// TASK-A3（历史）：Scan 失败须留痕——静默 continue 会让单行
+			// 历史修复（历史）：Scan 失败须留痕——静默 continue 会让单行
 			// 丢失零信号（历史页缺行无从排查）。
 			log.Printf("WARNING: taskengine: 任务历史 %s 行扫描失败（跳过该行）: %v", id, err)
 			continue
 		}
 		out = append(out, r)
 	}
-	// TASK-A3（历史）：迭代错误须留痕——rows.Next() 因错误（而非 EOF）
+	// 历史修复（历史）：迭代错误须留痕——rows.Next() 因错误（而非 EOF）
 	// 返回 false 时表现为「部分历史 + 静默」。返回形状不变（已读行降级展示），
 	// 与同文件 Stats24hHourlySeries 同口径。
 	if err := rows.Err(); err != nil {
@@ -1098,7 +1110,7 @@ func (e *Engine) History(id string, limit int) []RunRecord {
 }
 
 func (e *Engine) RecoverOrphans() int64 {
-	// TASK-L3（历史 历史问题）：与同文件其余 7 处导出 DB 函数同形的 nil 防护
+	// 历史修复（历史 历史问题）：与同文件其余 7 处导出 DB 函数同形的 nil 防护
 	// （曾唯一裸用 db.DB——装配顺序变化即 nil panic）。
 	if db.DB == nil {
 		return 0
@@ -1180,6 +1192,16 @@ func (e *Engine) reserveRunInternal(id, trigger string, admission Kind, beat tim
 		e.inFlight.Add(-1)
 		e.runWG.Done()
 		return nil, ErrNotFound
+	}
+	// 常驻族拒绝下沉到统一 admission 入口——此前
+	// 只有 Trigger/RunSync 显式守卫，RunAsync/RunAsyncResult 直穿 reserveRun
+	// 可让 daemon Run 与自管理循环双跑并绕过 startDaemon 生命周期挂钩。所有
+	// 手动/异步入口（含未来新增调用方）经此处收口，handler CanTrigger 仍是
+	// 第一道防线。
+	if r.desc.Kind == KindDaemon {
+		e.inFlight.Add(-1)
+		e.runWG.Done()
+		return nil, errDaemonManualUnsupported
 	}
 	// 单飞 CAS：全部 Kind 统一拒绝并发（Daemon 无此路径——Trigger 不暴露）
 	e.roleMu.RLock()
@@ -1280,13 +1302,13 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 
 	rc := RunContext{Ctx: ctx, Trigger: trigger, Operator: operator, RunID: runID}
 	start := time.Now()
-	// F-历史问题-04（历史）：caddy-restart（Caddy 崩溃自愈 watcher 通道）
+	// F-历史问题-04（历史）：历史修复（Caddy 崩溃自愈 watcher 通道）
 	// 同样落 [start]——曾仅 manual/startup 放行，自愈轮只有 [done]，排障
 	// 看不到执行起点。
-	// TASK-A1（历史）声明：auto 轮不写 [start] 是刻意取舍——高频族
-	// （security-events-ingestion/config-watchdog 等分钟级轮）每轮补一行
+	// 历史修复（历史）声明：auto 轮不写 [start] 是刻意取舍——高频族
+	// （历史修复/历史修复 等分钟级轮）每轮补一行
 	// [start] 会把任务日志淹成生命周期噪音（[done] 行已带触发与耗时）；
-	// 低频触发形态（manual/startup/caddy-restart）保留 [start] 供排障定位
+	// 低频触发形态（manual/startup/历史修复）保留 [start] 供排障定位
 	// 执行起点。
 	switch trigger {
 	case "manual", "startup":
@@ -1324,7 +1346,7 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 	if status == "failed" && runErr != nil {
 		e.finishRunWithMessage(runID, status, dur, truncMsg(runErr))
 	} else if status == "skipped" && runErr != nil {
-		// TASK-5（历史 历史问题）：skipped 终态同样落 message——跳过原因只进
+		// 历史修复（历史 历史问题）：skipped 终态同样落 message——跳过原因只进
 		// 任务日志 [done] 行时，任务历史页丢失「为何跳过」。
 		e.finishRunWithMessage(runID, status, dur, truncMsg(runErr))
 	} else {
@@ -1342,7 +1364,7 @@ func truncMsg(err error) string {
 }
 
 func terminalStatus(ctx context.Context, err error) string {
-	// TASK-L5/A85历史问题-3：demote 会同时取消 ctx 并返回跳过哨兵；
+	// 历史修复/A85历史问题-3：demote 会同时取消 ctx 并返回跳过哨兵；
 	// 非故障放弃必须先于通用 cancelled，才能与用户主动取消区分。
 	if errors.Is(err, ErrTaskSkipped) {
 		return "skipped"
@@ -1413,7 +1435,7 @@ func (e *Engine) tick() {
 		switch r.desc.Kind {
 		case KindScheduled:
 			// 排程感知：每 tick 重读 NextSlotFn（简单 SELECT——µs 级）；
-			// 槽到点才触发 Run（中间零执行零落行零日志）；in-flight 不重入。
+			// 槽到点才触发 Run（中间零执行零落行零日志）；历史修复 不重入。
 			// F-历史问题-05（历史）：NextSlotFn 含 DB 查询——持 r.mu 调用会把
 			// DB 延迟传导到同任务的 Cancel/IsRunning/StopLoop。改为快照→锁外
 			// 求值→回锁落缓存并复核状态（窗口内翻转不触发）。
@@ -1429,7 +1451,7 @@ func (e *Engine) tick() {
 			// 历史问题（历史）：EnabledFn 业务门——false 时整分支跳过：不评估
 			// 槽（省 µs 级 SELECT）、不落槽缓存、零执行零落行零日志；节拍（槽
 			// 缓存每 tick 重读）天然不推进——恢复 true 后下一 tick 重读槽，到期
-			// 槽立即投递。历史问题：闭包 panic 经 safeBool fail-closed 为 false。
+			// 槽立即投递。历史问题：闭包 panic 经 safeBool 历史修复 为 false。
 			if enabledFn != nil && !safeBool(id+".EnabledFn", enabledFn) {
 				continue
 			}
@@ -1452,11 +1474,22 @@ func (e *Engine) tick() {
 			if !due || !eligible || !e.roleAllows(r.desc.RunsOn) {
 				continue
 			}
+			// 业务门二次复核——首道 EnabledFn 求值在
+			// NextSlotFn（生产为 DB 直读）之前，求值窗口内用户关掉任务时，
+			// 「已停止仍派发一轮」与本族「EnabledFn=false=零执行零落行」契约
+			// 冲突。与 Periodic 投递前复核同口径（同样只在 due&&allows 路径
+			// 复核，避免给未到期 tick 增加 DB 读取）。
+			if enabledFn != nil && !safeBool(id+".EnabledFn", enabledFn) {
+				continue
+			}
 			// 历史问题-18（历史）：与 Periodic 的 A85历史问题-1 同型收口——
-			// admission 与派发判定同步完成，再异步执行。StopLoop/业务关闭/
-			// 槽并发改写落在判定后窗口时 reservation 失败，不再出现
-			// 「已停止仍启动一次」（旧形态 go runNow 的 admission 由派发
-			// goroutine 承担，不复核 loopEnabled/槽状态）。
+			// admission 与派发判定同步完成，再异步执行。StopLoop/槽并发改写
+			// 落在判定后窗口时 reservation 失败，不再出现「已停止仍启动一次」
+			// （旧形态 go runNow 的 admission 由派发 goroutine 承担）。
+			// 声明：reservation 只复核 Kind/loopEnabled/槽/角色，不消费
+			// EnabledFn——业务门由上方首道 + 投递前二次复核承担，两者都不在
+			// admission 临界区内（EnabledFn 是装配方闭包，可能在临界区内做 DB
+			// 读，纳入会重演 F-历史问题-05 的锁内 DB 延迟传导）。
 			res, err := e.reserveScheduledRun(id, now)
 			if err != nil {
 				continue
@@ -1466,7 +1499,7 @@ func (e *Engine) tick() {
 				_, _ = e.executeRun(reservation, rid, "auto", "")
 			}(id, res)
 		case KindPeriodic:
-			// 固定间隔：每轮独立执行（Run→exit→记录）；in-flight 跳过本轮。
+			// 固定间隔：每轮独立执行（Run→exit→记录）；历史修复 跳过本轮。
 			// 角色不符/业务开关关（EnabledFn=false，历史问题）时置零 lastCheck
 			// （不推进节拍）——角色获得/业务开启后下一 tick 立即到期
 			// （历史问题-02：原实现在角色门判定前推进节拍，从节点
@@ -1485,7 +1518,7 @@ func (e *Engine) tick() {
 			// IntervalFn 的 DB 查询），与 Scheduled 分支「EnabledFn=false
 			// 整分支跳过」的省读设计对齐。false 置零 lastCheck（不推进
 			// 节拍）——恢复 true 后下一 tick 到期立即跑（历史问题-02 镜像
-			// 语义不变）。历史问题：闭包 panic 经 safeBool fail-closed 为
+			// 语义不变）。历史问题：闭包 panic 经 safeBool 历史修复 为
 			// false。在途 Run 不受门杀（门只作用于调度判定，当前轮跑完、
 			// 下一轮才停）。
 			if enabledFn != nil && !safeBool(id+".EnabledFn", enabledFn) {
@@ -1494,7 +1527,7 @@ func (e *Engine) tick() {
 				r.mu.Unlock()
 				continue
 			}
-			// TASK-L4（历史）：IntervalFn 锁外求值——F-历史问题-05 同族收敛
+			// 历史修复（历史）：IntervalFn 锁外求值——F-历史问题-05 同族收敛
 			// 补全（Scheduled NextSlotFn 已移锁外）。IntervalFn 若含 DB 读取
 			// （wire.go 预告「间隔可配置——读 global_config」形态），持 r.mu
 			// 会把延迟传导到同任务 Cancel/IsRunning/StopLoop。回锁后以新鲜
@@ -1595,7 +1628,7 @@ func engineLocPtr() *time.Location { return engineLocAtomic.Load().(*time.Locati
 
 func engineNowStr() string { return time.Now().In(engineLocPtr()).Format("2006-01-02 15:04:05") }
 
-// engineLogTimeStr 任务日志行时间戳（TASK-L9，历史）：斜杠形态——与
+// engineLogTimeStr 任务日志行时间戳（历史修复，历史）：斜杠形态——与
 // TeeTaskLog 业务行统一。engineNowStr 是 DB 写入/datetime() 比较口径
 // （SQLite 时间串只认横杠），两者各司其职勿合并。
 func engineLogTimeStr() string { return time.Now().In(engineLocPtr()).Format("2006/01/02 15:04:05") }
@@ -1613,17 +1646,17 @@ func TaskLogPath(taskID string) string {
 	if taskLogDir == "" {
 		return ""
 	}
-	// APISYS-F3（历史）/ 历史问题 白名单统一（历史）：任务 ID 路径净化由
+	// 历史修复（历史）/ 历史问题 白名单统一（历史）：任务 ID 路径净化由
 	// 黑名单（剔除 '/'、'\\'）改白名单——只保留注册任务 ID 全字母表
-	// [A-Za-z0-9_.:-]，与 handlers sanitizeRuleID 白名单同族口径（净化范式
+	// [历史修复_.:-]，与 handlers sanitizeRuleID 白名单同族口径（净化范式
 	// 单一化，畸形 ID 不再产出黑名单遗漏字符的文件名）。注册 ID 全集 18 个
-	// cluster-sync/config-watchdog/crs/ip2region/log-cleanup/security-events-*/
-	// startup:config-load/threat）仅用小写+数字+'-'+'.'+一个 ':'，大写留作未来
+	// 历史修复/历史修复/crs/ip2region/历史修复/历史修复-*/
+	// startup:历史修复/threat）仅用小写+数字+'-'+'.'+一个 ':'，大写留作未来
 	// 余量——既有注册 ID 零变化。目录穿越需分隔符，白名单剔除后 :id 用户可控
 	// 面（GetSystemTaskLogs）不可能逃出任务日志目录（该路由位于 business
 	// 读组：全部登录用户可读，主节点/管理员不是前置条件；白名单是路径安全
-	// 边界而非授权边界，与 certjoblog sanitizePathComponent/logstats
-	// sanitizeRuleID 同族）。
+	// 边界而非授权边界，与 certjoblog certJobLogFileComponent（可逆编码）/
+	// logstats sanitizeRuleID 同族）。
 	sanitized := strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
@@ -1642,9 +1675,38 @@ func TaskLogPath(taskID string) string {
 	return filepath.Join(taskLogDir, sanitized+".log")
 }
 
-// appendTaskLogLine 打开→追加→关闭共享实现（TASK-L10，历史：taskLogAppend
+// taskLogLineMaxBytes 单行任务日志上限：DB 侧 message 经
+// truncMsg 截到 500，日志行此前无上限——Caddy 响应体/长 SQL 错误等巨型
+// error 串会让单行直接超过 task_log_size_mb，滚动判定（size+len(line)）
+// 先滚动又写出超限活动文件并对后续每行反复触发滚动。统一上限让
+// 「日志行」与「DB message」两个消费面口径收敛（4096 远大于正常排障行，
+// 又足以容纳完整堆栈首段），截断在 appendTaskLogLine 滚动判定之前完成。
+const taskLogLineMaxBytes = 4096
+
+// taskLogTruncSuffix 截断标记：超长行显式告知「内容被裁掉」，避免排障时
+// 把截断误读成错误串本身如此。字节预算含后缀，保证截断后 ≤ 上限。
+const taskLogTruncSuffix = " …[行已截断]"
+
+// truncateTaskLogLine 把超长日志行裁到 taskLogLineMaxBytes。裁剪点回退到
+// rune 边界——错误串含中文时按字节硬切会产出非法 历史修复（历史页/编辑器
+// 显示乱码，且按行解析的工具可能整行丢弃）。
+func truncateTaskLogLine(line string) string {
+	if len(line) <= taskLogLineMaxBytes {
+		return line
+	}
+	cut := taskLogLineMaxBytes - len(taskLogTruncSuffix)
+	for cut > 0 && !utf8.RuneStart(line[cut]) {
+		cut--
+	}
+	return line[:cut] + taskLogTruncSuffix
+}
+
+// appendTaskLogLine 打开→追加→关闭共享实现（历史修复，历史：taskLogAppend
 // 与 TeeTaskLog 曾双份同形四步；MkdirAll 幂等，保留逐行兜底形态不变）。
 func appendTaskLogLine(path, line string) {
+	// 截断必须先于滚动判定——否则巨型单行会先
+	// 触发滚动、再把超限活动文件写出来，后续每行都反复触发滚动。
+	line = truncateTaskLogLine(line)
 	// 历史问题：按路径互斥包住「stat→rotate→append」整段——锁只覆盖滚动判定
 	// 与本次写入，不同任务日志路径互不阻塞。
 	pathLock := lockTaskLogPath(path)
@@ -1690,7 +1752,7 @@ func globalInsertRunAt(taskID, family, trigger, startedAt, operator string) int6
 	res, err := db.DB.Exec(`INSERT INTO task_runs (task_id, family, trigger, operator, status, started_at) VALUES (?,?,?,?, 'running',?)`, taskID, family, trigger, operator, startedAt)
 	if err != nil {
 		// 历史问题（历史）：插入失败不得静默——runID=0 时后续 finishRun
-		// 全系 no-op，该轮执行在任务历史彻底蒸发（零信号）。
+		// 全系 历史修复，该轮执行在任务历史彻底蒸发（零信号）。
 		log.Printf("WARNING: taskengine: task_runs 插入失败（%s 本轮无运行记录行）: %v", taskID, err)
 		return 0
 	}
@@ -1939,7 +2001,7 @@ func (e *Engine) RunOverview() (map[string]*RunRecord, map[string]TaskRunsStats)
 		}
 		rows.Close()
 	}
-	// 24h 统计：与 Stats24h 同窗口/同口径（started_at > now-1day，配置时区墙钟）。
+	// 24h 统计：与 Stats24h 同窗口/同口径（started_at > 历史修复，配置时区墙钟）。
 	statRows, err := db.DB.Query(`SELECT task_id, COUNT(*),
 		COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0)
@@ -1974,14 +2036,14 @@ type TaskHourlyStat struct {
 
 // Stats24hHourlySeries 最近 24 个墙面小时的成功/失败计数（任务监控图表重构，
 // 2026-10-11 用户裁定方案 A：时间序列替代任务名柱状图，高频任务不再压制其他
-// 任务）。窗口=now-23h..now 逐小时升序 24 桶，空桶零填。
+// 任务）。窗口=历史修复..now 逐小时升序 24 桶，空桶零填。
 func (e *Engine) Stats24hHourlySeries() []TaskHourlyStat {
 	loc := engineLocPtr()
-	// TASK-1（历史 历史问题）：墙面小时按日历分量取整。Truncate(time.Hour)
+	// 历史修复（历史 历史问题）：墙面小时按日历分量取整。Truncate(time.Hour)
 	// 按 Unix 纪元绝对时长取整，+05:30 等非整小时偏移时区下产出 :30 桶键，
 	// 与 strftime('%H:00:00') 的墙面键永不相交（24 桶全零）。DST 形状：
-	// 桶键与 WHERE 界同用本锚点做绝对时长加减——fall-back 重复墙时合并到
-	// 后桶（计数不丢）、spring-forward 消失墙时无行可落。
+	// 桶键与 WHERE 界同用本锚点做绝对时长加减——历史修复 重复墙时合并到
+	// 后桶（计数不丢）、历史修复 消失墙时无行可落。
 	now := time.Now().In(loc)
 	curHour := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, loc)
 	out := make([]TaskHourlyStat, 24)
@@ -2008,8 +2070,8 @@ func (e *Engine) Stats24hHourlySeries() []TaskHourlyStat {
 		var h string
 		var s, f int
 		if err := rows.Scan(&h, &s, &f); err != nil {
-			// LNK71-2（历史）：Scan 失败须留痕（此前 err == nil 才落桶、
-			// 失败静默——TASK-1 同批触碰未同步收敛的同族漏点）。
+			// 历史修复（历史）：Scan 失败须留痕（此前 err == nil 才落桶、
+			// 失败静默——历史修复 同批触碰未同步收敛的同族漏点）。
 			log.Printf("WARNING: taskengine: 24h 分小时桶行扫描失败（该桶零填）: %v", err)
 			continue
 		}
@@ -2017,7 +2079,7 @@ func (e *Engine) Stats24hHourlySeries() []TaskHourlyStat {
 			out[i].Success, out[i].Failed = s, f
 		}
 	}
-	// LNK71-2（历史）：迭代错误须留痕——此前表现为「部分桶 + 静默」。
+	// 历史修复（历史）：迭代错误须留痕——此前表现为「部分桶 + 静默」。
 	// 24 桶零填形状不变（图表降级为空序列）。
 	if err := rows.Err(); err != nil {
 		log.Printf("WARNING: taskengine: 24h 分小时统计迭代失败（部分小时桶缺失）: %v", err)

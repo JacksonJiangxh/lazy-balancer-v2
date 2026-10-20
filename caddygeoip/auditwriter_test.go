@@ -73,7 +73,7 @@ func (f *blockingFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
 
 func (*blockingFormatter) MIME() string { return "application/json" }
 
-// lbfenceFormatter AUD-1（历史）测试同步栅栏：Format 阻塞至 release 关闭，
+// lbfenceFormatter 历史修复（历史）测试同步栅栏：Format 阻塞至 release 关闭，
 // 放行后按 json.Marshal 直出（信封与内置 JSON 格式化器一致，见 auditSnapshot
 // 注释）。经 plugins.RegisterAuditLogFormatter 注册为专用格式名 lbfence、由
 // 被测指令 SecAuditLogFormat lbfence 装入 coraza 写路径——drain 侧 process
@@ -104,11 +104,11 @@ func (cannedFormatter) MIME() string { return "application/json" }
 // 审计写插件（lbfile）测试：入队/刷盘/轮转重开兼容/阻塞零丢/timing 注入。
 // 写侧契约（历史）：决策→计时（请求路径，纯评估口径）→终态标记；审计
 // Write 只格式化+入队（阻塞式有界队列，零丢弃）；专职 drain goroutine 等待
-// per-tx 计时终态后注入 lb_timing 顶层字段并 bufio 批量刷盘。
+// 历史修复 计时终态后注入 lb_timing 顶层字段并 bufio 批量刷盘。
 
 // useTestAuditPipeline 把默认管线参数收窄到测试量级并隔离全局注册表。
-// 清理顺序（t.Cleanup LIFO）：先注册「恢复全局参数」，后注册「释放全部
-// 管线」——执行时 drain 先退出（release 等 p.done），再恢复
+// 清理顺序（t.Cleanup LIFO）：先注册「恢复全局参数」，后注册「收尾全部
+// 管线」——执行时 drain 先退出（closeTestAuditPipelines 等 p.done），再恢复
 // auditFlushThreshold/auditTiming* 全局值；逆序会在 drain 仍读这些变量时
 // 写入（-race 实测：cleanup 恢复 vs appendLine/process 读，A85PLG 验证期暴露）。
 func useTestAuditPipeline(t *testing.T) {
@@ -133,7 +133,7 @@ func useTestAuditPipeline(t *testing.T) {
 		resetAuditTimingRegistryLockedForTest()
 		auditTimingMu.Unlock()
 	})
-	releaseAllAuditPipelines(t)
+	closeTestAuditPipelines(t)
 }
 
 // resetAuditTimingRegistryLockedForTest 清空计时注册表全部状态（调用方持
@@ -182,7 +182,7 @@ func waitAuditLine(t *testing.T, path string) string {
 // Given: SecAuditLogType lbfile + phase:1 deny 的 coraza WAF，请求携带 timing ID 头
 // When: 事务中断 + ProcessLogging（audit Write 入队）之后才 record+close timing
 //
-//	——复刻生产时序（coraza-caddy 在 WAF handler 退出时 defer ProcessLogging，
+//	——复刻生产时序（历史修复 在 WAF handler 退出时 defer ProcessLogging，
 //	blocked_counter 在其之后才写分段）
 //
 // Then: 审计行含 lb_timing.end_us=42（写 goroutine 等待迟到分段后注入，零丢弃）
@@ -191,10 +191,10 @@ func TestAuditWriter_registeredAndInjectsLateTiming(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
 
-	// AUD-1（历史）同步栅栏：drain 侧 Format 点阻塞至主 goroutine 完成
+	// 历史修复（历史）同步栅栏：drain 侧 Format 点阻塞至主 goroutine 完成
 	// 「迟到分段 record+close」后放行——生产时序（Write 入队严格早于计时写点，
 	// coraza defer ProcessLogging 契约）原样保持，drain 查表被定序在写点之后，
-	// 断言不再依赖调度序。已知取舍窗口（与 auditTimingWait 的 AUD-1 注释同源，
+	// 断言不再依赖调度序。已知取舍窗口（与 auditTimingWait 的 历史修复 注释同源，
 	// 此处钉明）：生产中 drain 抢先完成格式化并首轮查表的极小竞态窗内的行不
 	// 注入 lb_timing（耗时属增强信息，展示层报「—」，可接受）；本钉测锚定的
 	// 契约是「行到 drain 时终态已置位 → 必注入」，栅栏使该契约确定性成立。
@@ -263,8 +263,11 @@ func TestAuditWriter_registeredAndInjectsLateTiming(t *testing.T) {
 	}
 }
 
-// useTestAuditPipeline 追加：用例结束时排空全部测试管线（drain 退出、fd 关闭）。
-func releaseAllAuditPipelines(t *testing.T) {
+// useTestAuditPipeline 追加：用例结束时收尾全部测试管线（drain 退出、fd 关闭）。
+// 生产路径没有这条通道（管线是进程级单例，见 acquireAuditPipeline）；测试侧
+// 先把管线摘出注册表再关队列，保证收尾之后不再有新生产者（writer.Close 只刷盘
+// 不拆管线）。
+func closeTestAuditPipelines(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
 		auditPipelinesMu.Lock()
@@ -272,9 +275,11 @@ func releaseAllAuditPipelines(t *testing.T) {
 		for _, p := range auditPipelines {
 			pipelines = append(pipelines, p)
 		}
+		auditPipelines = map[string]*auditPipeline{}
 		auditPipelinesMu.Unlock()
 		for _, p := range pipelines {
-			p.release()
+			close(p.queue)
+			<-p.done
 		}
 	})
 }
@@ -311,7 +316,7 @@ func TestAuditWriter_noTimingHeaderOmitsField(t *testing.T) {
 	tx.ProcessLogging()
 
 	line := waitAuditLine(t, logPath)
-	// U80 E-CM-06：零轮询钉替代挂钟阈值——无计时头行 id 为空，auditTimingWait
+	// U80 零轮询钉替代挂钟阈值——无计时头行 id 为空，auditTimingWait
 	// 短路返回，drain 全程零轮询（旧轮询实现此处恒 >0）。
 	if n := auditTimingPollCountForTest.Load(); n != 0 {
 		t.Fatalf("no timing header must skip wait entirely: drain polled %d times", n)
@@ -328,7 +333,7 @@ func TestAuditWriter_noTimingHeaderOmitsField(t *testing.T) {
 // When: 事务入队（ProcessLogging）→ drain 侧处理
 // Then: 行落盘且 drain 全程零轮询（旧行为轮询满上限 200ms/步 1ms 恒约 200 次，
 //
-//	零轮询钉对其必红），且不注入 lb_timing——AUD-1 钉：未知 tid 不阻塞单
+//	零轮询钉对其必红），且不注入 lb_timing——历史修复 钉：未知 tid 不阻塞单
 //	drain goroutine（积压行批量到场时逐行满等=无背压阀下的 drain 沉陷，
 //	请求路径被入队阻塞拖住）
 func TestAuditPipeline_unknownTidDoesNotBlockDrain(t *testing.T) {
@@ -353,7 +358,7 @@ func TestAuditPipeline_unknownTidDoesNotBlockDrain(t *testing.T) {
 	auditTimingPollCountForTest.Store(0)
 	driveProbeTx(t, waf, orphanTID)
 	line := waitAuditLine(t, logPath)
-	// U80 E-CM-06：零轮询钉替代挂钟阈值——行落盘时 drain 的等待已完成，
+	// U80 零轮询钉替代挂钟阈值——行落盘时 drain 的等待已完成，
 	// 未知 tid 首轮查表未命中即返（零轮询）；旧行为轮询满 200ms 上限
 	// （poll step 1ms → 恒约 200 次），本断言对旧实现必红。
 	if n := auditTimingPollCountForTest.Load(); n != 0 {
@@ -389,7 +394,7 @@ func waitAuditLines(t *testing.T, path string, n int) []string {
 	return nil
 }
 
-// driveProbeTx 驱动一次 phase:1 deny 事务（X-Probe=hit 规则），复刻生产时序：
+// driveProbeTx 驱动一次 phase:1 deny 事务（历史修复=hit 规则），复刻生产时序：
 // ProcessLogging（审计 Write）先于调用方计时写点。返回事务 ID。
 func driveProbeTx(t *testing.T, waf coraza.WAF, timingID string) string {
 	t.Helper()
@@ -584,7 +589,7 @@ func TestSnapshotAuditBody_capAndBoundaries(t *testing.T) {
 		// 目标形状：超限文本 = 前缀 64KiB + 显式截断标记（写侧与读侧上限相等，
 		// 读侧无法凭长度判断截断——E-历史问题 契约，标记 15 字节超出上限部分）。
 		{name: "over limit truncated", body: strings.Repeat("x", auditBodyMaxBytes+1), wantLen: auditBodyMaxBytes + len("\n...[TRUNCATED]"), truncated: true, marker: true},
-		// 畸形形状：前缀含非法 UTF-8 时不追加标记（会破坏读侧 base64 判定），
+		// 畸形形状：前缀含非法 历史修复 时不追加标记（会破坏读侧 base64 判定），
 		// 只保留 64KiB 前缀。
 		{name: "over limit binary no marker", body: strings.Repeat("x", 100) + "\xff" + strings.Repeat("y", auditBodyMaxBytes), wantLen: auditBodyMaxBytes, truncated: true},
 	}
@@ -689,7 +694,7 @@ func TestAuditWriter_requestBodyCapAndTruncationMarker(t *testing.T) {
 }
 
 // A85PLG 历史问题：审计响应体快照与请求体同上限（64KiB 前缀 + 显式截断标记 +
-// body_truncated 标记位，JSON 契约对称）。check-response 策略形态
+// body_truncated 标记位，JSON 契约对称）。历史修复 策略形态
 // （SecResponseBodyAccess On + SecAuditLogParts 恒含 E）下 coraza 默认
 // SecResponseBodyLimit=512KiB，无快照侧硬限时单条审计行可携带约 512KiB
 // 响应体——2048 深队列内存放大 + 落盘放大。真实 coraza phase:4 命中验证。
@@ -793,7 +798,7 @@ func TestAuditWriter_responseBodyCapAndTruncationMarker(t *testing.T) {
 }
 
 // E81-历史问题：审计快照的 Args() 提升源必须是「冻结」接口值（同动态类型
-// typed-nil），不得引用 coraza 事务活对象——drain 侧格式化恒晚于 tx.Close，
+// 历史修复），不得引用 coraza 事务活对象——drain 侧格式化恒晚于 tx.Close，
 // 活引用在事务回池复用后会读到下一请求的参数。冻结后 Args() 返回空集合。
 func TestAuditSnapshotRequest_argsFrozen(t *testing.T) {
 	useTestAuditPipeline(t)
@@ -869,12 +874,11 @@ func TestAuditSnapshotRequest_argsFrozen(t *testing.T) {
 	}
 }
 
-// Given: 管线已 release（重载窗口：旧 WAF release、在途事务仍 Write）
-// When: 关闭态入队
-// Then: 同步回退直写该行（短生命周期 fd O_APPEND），零丢弃；计时同步短等注入
-//
-//	（先行终态立即注入；无计时头的行照常落盘且无 lb_timing）。
-func TestAuditPipeline_releasedPipelineSyncWritesRow(t *testing.T) {
+// Given: writer.Close() 被调用（coraza v3.8.1 实际从不调用它）
+// When: 之后继续 Write
+// Then: 管线不拆——同 target 仍返回同一实例、drain 仍在跑，行照常经 drain
+// 注入计时后落盘（审计事件不因收尾语义丢失，也不退化为同步直写）。
+func TestAuditWriter_closeKeepsProcessSingletonPipeline(t *testing.T) {
 	useTestAuditPipeline(t)
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
@@ -885,6 +889,7 @@ func TestAuditPipeline_releasedPipelineSyncWritesRow(t *testing.T) {
 	if err := w.Init(cfg); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
+	pipeline := w.pipeline
 	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives(strings.Join([]string{
 		"SecRuleEngine On",
 		"SecAuditEngine RelevantOnly",
@@ -907,103 +912,44 @@ func TestAuditPipeline_releasedPipelineSyncWritesRow(t *testing.T) {
 		t.Fatalf("first row = %s", lines[0])
 	}
 
-	// 重载窗口：管线 release（drain 退出、fd 关闭、队列置 nil），writer 仍持引用。
-	w.pipeline.release()
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
-	// 关闭态写入 #1：timing 先置终态 → 同步短等立即注入。
+	// Then：同 target 再取仍是同一实例，drain 未退出（进程级单例）。
+	again, err := acquireAuditPipeline(logPath, cfg.FileMode)
+	if err != nil {
+		t.Fatalf("acquire after Close: %v", err)
+	}
+	if again != pipeline {
+		t.Fatal("Close must not tear down the process-level pipeline")
+	}
+	select {
+	case <-pipeline.done:
+		t.Fatal("drain goroutine exited after Close")
+	default:
+	}
+
+	// 关闭后写入：仍由活 drain 消费并注入计时（注入在 drain 侧等待终态）。
 	auditTimingRecord(id2, "end", 7)
 	auditTimingClose(id2)
 	id2Tx := driveProbeTx(t, waf, id2)
-
-	// 关闭态写入 #2：无计时头 → 同步直写，零丢弃且不注入。
-	id3Tx := driveProbeTx(t, waf, "")
-
 	if err := w.Write(nil); err != nil {
 		t.Fatalf("Write(nil) must be no-op, got %v", err)
 	}
 
-	lines = waitAuditLines(t, logPath, 3)
-	var sawID2Timing, sawID3 bool
+	lines = waitAuditLines(t, logPath, 2)
+	var sawID2Timing bool
 	for _, line := range lines {
-		switch {
-		case strings.Contains(line, id2Tx):
+		if strings.Contains(line, id2Tx) {
 			if !strings.Contains(line, `"end_us":7`) {
-				t.Fatalf("sync-written row missing injected timing: %s", line)
+				t.Fatalf("row after Close missing injected timing: %s", line)
 			}
 			sawID2Timing = true
-		case strings.Contains(line, id3Tx):
-			if strings.Contains(line, "lb_timing") {
-				t.Fatalf("no-timing row must omit lb_timing: %s", line)
-			}
-			sawID3 = true
 		}
 	}
-	if !sawID2Timing || !sawID3 {
-		t.Fatalf("sync fallback rows missing (zero-drop violated): %v", lines)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-}
-
-// 历史问题-04：drain 尚未抢到首把锁时 release 关闭队列，仍必须排空
-// 已入队行、刷盘并关闭 fd；不得因启动竞态静默丢行或泄漏文件。
-func TestAuditPipeline_releaseBeforeDrainStartFlushesAndCloses(t *testing.T) {
-	useTestAuditPipeline(t)
-	target := filepath.Join(t.TempDir(), "audit-race.log")
-	p := &auditPipeline{
-		target: target,
-		mode:   0o644,
-		queue:  make(chan lbAuditItem, 1),
-		done:   make(chan struct{}),
-		refs:   1,
-	}
-	if err := p.openFile(p.mode); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(p.closeFile)
-	if err := p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"race":1}`)}}); err != nil {
-		t.Fatalf("enqueue: %v", err)
-	}
-
-	released := make(chan struct{})
-	go func() {
-		p.release()
-		close(released)
-	}()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		p.mu.RLock()
-		closed := p.closed
-		p.mu.RUnlock()
-		if closed {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("release did not close the pipeline")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	// 强制复现「release 完成后 drain 才首次运行」的竞态形状。
-	go p.drain()
-	select {
-	case <-released:
-	case <-time.After(2 * time.Second):
-		t.Fatal("release blocked waiting for drain")
-	}
-
-	data, err := os.ReadFile(target)
-	if err != nil {
-		t.Fatalf("read audit target: %v", err)
-	}
-	p.ioMu.Lock()
-	fdStillOpen := p.fd != nil
-	p.ioMu.Unlock()
-	if !strings.Contains(string(data), `"race":1`) {
-		t.Fatalf("queued audit row was dropped during drain startup race: %q", data)
-	}
-	if fdStillOpen {
-		t.Fatal("drain startup race left the audit fd open")
+	if !sawID2Timing {
+		t.Fatalf("row written after Close was dropped: %v", lines)
 	}
 }
 
@@ -1044,7 +990,9 @@ func TestAuditPipeline_enqueueBlocksWhenFullZeroDrop(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("blocked enqueue never completed after drain started")
 	}
-	p.release()
+	// 测试收尾：关闭队列让 drain 排空后退出（生产路径无此通道）。
+	close(p.queue)
+	<-p.done
 }
 
 // Given: 管线持有长生命周期 fd
@@ -1092,7 +1040,7 @@ func TestAuditPipeline_copytruncateCompatible(t *testing.T) {
 
 // Given: 目标路径目录缺失
 // When: Init
-// Then: 返回错误（/load 拒收，与 serial writer 同 fail-fast 语义），后续 Write 零 panic
+// Then: 返回错误（/load 拒收，与 serial writer 同 历史修复 语义），后续 Write 零 panic
 func TestAuditWriter_initFailureFailsFast(t *testing.T) {
 	useTestAuditPipeline(t)
 	w := &lbAuditWriter{}
@@ -1161,10 +1109,10 @@ func TestAuditTimingRegistry_recordWaitClose(t *testing.T) {
 	useTestAuditPipeline(t)
 	const id = "0123456789abcdef"
 
-	// AUD-1（历史）：未知 tid（注册表无条目）首轮即返空快照——不轮询到超时
+	// 历史修复（历史）：未知 tid（注册表无条目）首轮即返空快照——不轮询到超时
 	// （旧行为本断言必红：轮询走满超时）。条目稍后创建也不追加等待（预检拦行
 	// 的微秒级建条窗口由 drain 侧格式化先行吸收，见 auditTimingWait 注释）。
-	// U80 E-CM-06：零轮询钉替代挂钟阈值（CI 负载抖动下挂钟断言会假红）。
+	// U80 零轮询钉替代挂钟阈值（CI 负载抖动下挂钟断言会假红）。
 	auditTimingPollCountForTest.Store(0)
 	snap := auditTimingWait(id, 30*time.Millisecond)
 	if n := auditTimingPollCountForTest.Load(); n != 0 {
@@ -1392,49 +1340,39 @@ func TestAuditDrain_ioErrorSurfacedAndReopens(t *testing.T) {
 	p.closeFile()
 }
 
-func TestAuditPipelineRelease_doesNotHoldRegistryLockWhileDraining(t *testing.T) {
+// 管线是进程级单例：同 target 的并发 acquire 恒返回同一实例（不重建 fd/
+// drain，也不做引用计数—上游从不调 AuditLogWriter.Close，refs 计数无消费方）。
+func TestAcquireAuditPipeline_processSingleton(t *testing.T) {
+	useTestAuditPipeline(t)
 	target := filepath.Join(t.TempDir(), "audit.log")
-	p := &auditPipeline{target: target, mode: 0o644, queue: make(chan lbAuditItem, 1), done: make(chan struct{}), refs: 1}
-	if err := p.openFile(p.mode); err != nil {
-		t.Fatal(err)
-	}
-	auditPipelinesMu.Lock()
-	auditPipelines[target] = p
-	auditPipelinesMu.Unlock()
-
-	released := make(chan struct{})
-	go func() {
-		p.release()
-		close(released)
-	}()
-	// 等待 release 进入 <-p.done（延迟 20ms 足够覆盖删表动作）。
-	time.Sleep(20 * time.Millisecond)
-	select {
-	case <-released:
-		t.Fatal("release must wait for the drain goroutine")
-	default:
+	first, err := acquireAuditPipeline(target, 0o644)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
 	}
 
-	acquired := make(chan *auditPipeline, 1)
-	go func() {
-		np, err := acquireAuditPipeline(target, 0o644)
-		if err != nil {
-			acquired <- nil
-			return
-		}
-		acquired <- np
-	}()
-	select {
-	case np := <-acquired:
-		if np == nil {
-			t.Fatal("acquire failed")
-		}
-		np.release()
-	case <-time.After(2 * time.Second):
-		t.Fatal("acquire blocked on the registry lock while release waited for drain (历史问题)")
+	const workers = 16
+	results := make([]*auditPipeline, workers)
+	var wg sync.WaitGroup
+	for i := range workers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			p, err := acquireAuditPipeline(target, 0o644)
+			if err != nil {
+				return
+			}
+			results[i] = p
+		}(i)
 	}
-	close(p.done) // 放行 release
-	<-released
+	wg.Wait()
+	for i, p := range results {
+		if p == nil {
+			t.Fatalf("worker %d acquire failed", i)
+		}
+		if p != first {
+			t.Fatalf("worker %d got a distinct pipeline for the same target (fd/drain rebuild)", i)
+		}
+	}
 }
 
 // 历史修复 历史问题（历史）：注册表条目硬上限——无 counter 路由时代理层校验

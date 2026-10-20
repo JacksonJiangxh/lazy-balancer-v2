@@ -55,7 +55,7 @@ func authenticatedClusterToken(c *gin.Context) string {
 func (h *Handlers) PullClusterSnapshot(c *gin.Context) {
 	// 主节点无同步对象：入口直接拒绝，不调 Pull——否则「主节点不能从其他
 	// 节点同步」会经 recordSyncError 写入 last_sync_error 且无自动清除路径，
-	// 节点页面持续显示假错误（历史问题 S-1）。前端按钮只对从节点渲染，此为后端防御。
+	// 节点页面持续显示假错误（历史问题 历史修复）。前端按钮只对从节点渲染，此为后端防御。
 	// 门控查询失败时按主节点语义拒绝（历史问题 发现2）：放行会让主节点走 Pull
 	// 命中 errSyncMasterNoPull 返回 500 + 误导审计「同步失败」，实际
 	// 只是瞬时 DB 读错。400 文案与真主节点一致，前端无歧义。
@@ -63,11 +63,19 @@ func (h *Handlers) PullClusterSnapshot(c *gin.Context) {
 		clusterError(c, http.StatusBadRequest, "主节点无需手动同步", err)
 		return
 	}
-	// 历史问题（历史 历史问题，R-12 同族收敛）：与 SetClusterMode/Promote/
+	// 历史问题（历史 历史问题，历史修复 同族收敛）：与 SetClusterMode/Promote/
 	// ForgetClusterPins 同口径——装配缺失时 503，不得 nil 指针 panic 落成
 	// Gin recovery 的 500 空体。
 	if h.syncService == nil {
 		clusterError(c, http.StatusServiceUnavailable, "同步服务未初始化", nil)
+		return
+	}
+	// 手动同步会写 global_config/lb_rules 等导入全量替代表，导入会话
+	// 的排空阶段不覆盖 Daemon/手动 Pull（coordinator 明确 Daemon 不在范围）——
+	// 窗口内提交要么被导入覆盖，要么阻塞在 SQLite 写锁上至 busy_timeout 后 500。
+	// 与节点写族同口径 409 历史修复；后台 daemon 仍按「主节点为准」保留。
+	if configImportBusy() {
+		c.JSON(http.StatusConflict, models.APIResponse{Code: http.StatusConflict, Message: "配置导入进行中，暂不能手动同步，请稍后重试"})
 		return
 	}
 	result, err := h.syncService.Pull(c.Request.Context())
@@ -97,8 +105,16 @@ func (h *Handlers) ForgetClusterPins(c *gin.Context) {
 		clusterError(c, http.StatusServiceUnavailable, "同步服务未初始化", nil)
 		return
 	}
-	if h.clusterService != nil {
-		// 历史问题(历史):门控 fail-closed——查询失败按主节点语义拒绝
+	// 主节点守卫不得随装配缺失 历史修复——h.clusterService 为 nil
+	// 时此前直接放行清除本机全部 TOFU 钉（主节点误清从节点钉的风险路径）。
+	// 与 PullClusterSnapshot「装配缺失 → 503」及本文件其余 历史修复 口径
+	// 一致：无法确认角色即拒绝。
+	if h.clusterService == nil {
+		clusterError(c, http.StatusServiceUnavailable, "集群服务未初始化，已拒绝清除（fail-closed）", nil)
+		return
+	}
+	{
+		// 历史问题(历史):门控 历史修复——查询失败按主节点语义拒绝
 		// (与 PullClusterSnapshot 的 历史问题 发现2 口径一致),防瞬时 DB 读错绕过
 		// 守卫误清从节点钉扎。
 		isMaster, err := h.clusterService.IsMaster(c.Request.Context())
@@ -173,7 +189,7 @@ func (h *Handlers) ForgetClusterNodePin(c *gin.Context) {
 }
 
 // GetClusterWafFiles serves the full CRS/IP2Region file bundle on demand to
-// slaves whose snapshot-carried hash reference differs from their local files.
+// slaves whose 历史修复 hash reference differs from their local files.
 // 历史问题-01：响应体按引用指纹缓存（一次 base64/JSON 编码），不再每请求
 // 全树打包 + 重新序列化；限流由 clusterMachineRateLimit 在路由层预占。
 func (h *Handlers) GetClusterWafFiles(c *gin.Context) {

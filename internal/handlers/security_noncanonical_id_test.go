@@ -13,7 +13,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 非规范数字 ID 家族门（R-12）：策略/自定义规则更新、策略解绑与删除路径
+// 非规范数字 ID 家族门：策略/自定义规则更新、策略解绑与删除路径
 // 同口径 400，不得让 SQLite INTEGER 亲和（'5.0'→5）命中并改写真实行。
 func TestSecurityWritePaths_rejectNoncanonicalIDs(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -32,7 +32,7 @@ func TestSecurityWritePaths_rejectNoncanonicalIDs(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,mode,enabled) VALUES (5,'policy','off',1)`); err != nil {
 		t.Fatal(err)
 	}
-	// HC-03（历史）：拆分端点此前缺规范 ID 门——用 mixed 策略做哨兵：
+	// 历史修复（历史）：拆分端点此前缺规范 ID 门——用 mixed 策略做哨兵：
 	// 无门时 "6.0" 会被 SQLite 亲和命中并真正进入拆分（生成子策略），有门则
 	// 在查库前 400。
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,mode,policy_type,enabled) VALUES (6,'mixed-sentinel','blocking','mixed',1)`); err != nil {
@@ -101,5 +101,35 @@ func TestSecurityWritePaths_rejectNoncanonicalIDs(t *testing.T) {
 	}
 	if policies != baselinePolicies {
 		t.Fatalf("security_policies count=%d, want %d（split 不得因非规范 ID 生成子策略）", policies, baselinePolicies)
+	}
+}
+
+// 策略详情读路径同属非规范数字 ID 家族门。SQLite 数值亲和会让
+// '5.0' 命中 id=5 并返回详情，与全部写路径（parsePositiveNumericID → 400）
+// 口径分叉。
+func TestGetSecurityPolicy_rejectsNoncanonicalID(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/policies/:id", h.GetSecurityPolicy)
+
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,mode,enabled) VALUES (5,'policy','off',1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// 规范 ID 仍正常返回
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/security/policies/5", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("canonical id status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+
+	for _, bad := range []string{"5.0", "0x5", "%205", "5e0"} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/security/policies/"+bad, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("id=%q status=%d body=%s, want 400（读路径须与写路径同门）", bad, rec.Code, rec.Body.String())
+		}
 	}
 }

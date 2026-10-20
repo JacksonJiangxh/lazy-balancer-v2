@@ -107,7 +107,7 @@ func TestGetClusterSnapshot_auditFallsBackToNodeID(t *testing.T) {
 }
 
 func TestPullClusterSnapshot_master_rejected_without_sync_error(t *testing.T) {
-	// 历史问题 S-1 回归：主节点调手动同步端点必须入口直接 400（不调 Pull），
+	// 历史问题 历史修复 回归：主节点调手动同步端点必须入口直接 400（不调 Pull），
 	// 且 last_sync_error 保持为空——不得让节点页面显示无自愈路径的假错误。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -160,7 +160,7 @@ func TestAuthenticatedClusterToken_prefers_middleware_context(t *testing.T) {
 	}
 }
 
-// D2-S3：降级主节点不得再拉取 WAF 数据包——快照端点有 requireMaster 设防，
+// 降级主节点不得再拉取 WAF 数据包——快照端点有 requireMaster 设防，
 // WAF 数据包端点必须对称，否则残留已审批的从节点令牌可继续拉取安全数据包。
 func TestGetClusterWafFiles_demotedMasterForbidden(t *testing.T) {
 	// Given
@@ -191,7 +191,7 @@ func TestGetClusterWafFiles_demotedMasterForbidden(t *testing.T) {
 	}
 }
 
-// 历史问题（历史 历史问题，R-12 同族收敛）：PullClusterSnapshot 曾直接调用
+// 历史问题（历史 历史问题，历史修复 同族收敛）：PullClusterSnapshot 曾直接调用
 // h.syncService.Pull/Resume 而无 nil 判定——同族（SetClusterMode/Promote/
 // ForgetClusterPins）均以 503「同步服务未初始化」前置。装配缺失或测试注入
 // nil 时，从节点手动同步会 nil 指针 panic（Gin recovery → 500 空体），
@@ -213,5 +213,45 @@ func TestPullClusterSnapshot_missingSyncServiceReturnsUnavailable(t *testing.T) 
 	}
 	if !strings.Contains(response.Body.String(), "同步服务未初始化") {
 		t.Fatalf("body=%s, want 同步服务未初始化", response.Body.String())
+	}
+}
+
+// 集群服务装配缺失时 ForgetClusterPins 必须 历史修复——此前
+// `if h.clusterService != nil` 包裹主节点守卫，nil 时直接放行清除本机全部
+// TOFU 钉（主节点误清从节点钉的风险路径）。
+func TestForgetClusterPins_missingClusterServiceFailsClosed(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	h.clusterService = nil
+	h.syncService = &services.SyncService{}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(gin.Recovery())
+	router.POST("/cluster/sync/forget-pins", h.ForgetClusterPins)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/cluster/sync/forget-pins", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s, want 503（无法确认角色不得放行）", response.Code, response.Body.String())
+	}
+}
+
+// 配置导入窗口内手动同步必须 409 历史修复——Pull 会写
+// global_config/lb_rules 等导入全量替代表，窗口内提交会被静默覆盖或阻塞至
+// busy_timeout 后 500；后台 daemon 仍按「主节点为准」保留。
+func TestPullClusterSnapshot_conflictsWhileImportInProgress(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	h.syncService = &services.SyncService{}
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	configImportBeginMu.Lock()
+	defer configImportBeginMu.Unlock()
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(gin.Recovery())
+	router.POST("/cluster/sync/pull", h.PullClusterSnapshot)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/cluster/sync/pull", nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409（导入窗口内手动同步）", response.Code, response.Body.String())
 	}
 }

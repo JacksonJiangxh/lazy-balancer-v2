@@ -15,7 +15,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// S-1：轮转/摄取失败日志限流。轮转路径由 2s tick 驱动，持久性失败（pending
+// 轮转/摄取失败日志限流。轮转路径由 2s tick 驱动，持久性失败（pending
 // delta 补采持续失败、copy 失败、目录缺失等）若无限流会每 tick 刷一条。
 // 同一归一化消息 60s 内仅首条放行；不同消息各自计时、立即放行。
 // 历史问题：限流 map 有界增长——每次放行时清扫已过期（≥60s）条目，仍超上限则
@@ -28,7 +28,7 @@ var (
 	auditFailureLogClock = time.Now
 )
 
-// auditFailureLogWindow 是同一消息的放行窗口（60s，历史 I-B 确立口径）。
+// auditFailureLogWindow 是同一消息的放行窗口（60s，历史 历史修复 确立口径）。
 const auditFailureLogWindow = 60 * time.Second
 
 // auditFailureLogEvictCap 是限流 map 的键数上限：清扫后仍超此值即整体重置
@@ -84,8 +84,8 @@ func throttledAuditFailureLogf(format string, args ...any) {
 }
 
 // auditLogPath 是 Coraza 审计日志的路径；定义为变量以便测试注入临时目录
-// （生产环境为 /app/logs/waf-audit/audit.log,2026-09-14 从 /app/waf/audit 迁入）。轮转检查由事件摄取的 2s tick 驱动
-// （securityevents.go StartSecurityEventsIngestion，历史问题 B-S3 移除从未被引用的
+// （生产环境为 /app/logs/历史修复/audit.log,2026-09-14 从 /app/waf/audit 迁入）。轮转检查由事件摄取的 2s tick 驱动
+// （securityevents.go StartSecurityEventsIngestion，历史问题 历史修复 移除从未被引用的
 // auditLogCheckInterval 死常量）。
 var auditLogPath = "/app/logs/waf-audit/audit.log"
 
@@ -130,7 +130,7 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 	pending, pendingErr := securityEventsReadPendingDelta()
 	if pendingErr != nil {
 		// 标记是否存在及其补采责任未知时不得 shift/覆盖任何归档；保留现场，
-		// 下轮读恢复后先重试补采。与其他轮转 I/O 错误同走 fail-closed。
+		// 下轮读恢复后先重试补采。与其他轮转 I/O 错误同走 历史修复。
 		return total, fmt.Errorf("read pending delta marker: %w", pendingErr)
 	}
 	if pending != nil {
@@ -271,7 +271,7 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 }
 
 // securityEventsBackscanDocumentStart 后向扫描 [0, from) 内最近一个文档头 "\n{"
-// （pretty-print 格式中下一个顶层文档的起始 `{`），返回该 `{` 的字节位置；
+// （历史修复 格式中下一个顶层文档的起始 `{`），返回该 `{` 的字节位置；
 // 未找到（超大事务/畸形区）或打开失败时回退 from 本身。用于确定活文件补采起点：
 // copy 末次读可能截断在事务中部，从截断点直接解码会跳过该事务。回扫取全量区间
 // 而非固定窗口——回扫时活文件仍完好，from（归档大小）有界于轮转阈值（默认
@@ -366,7 +366,7 @@ func auditLogBaseName() string {
 }
 
 // securityEventsPendingDelta 记录一次失败的归档补采：内容为待补采的归档路径 +
-// 起始偏移 + 归档大小，持久化为 <auditlog>.delta-pending 标记文件。下次轮转
+// 起始偏移 + 归档大小，持久化为 <auditlog>.历史修复 标记文件。下次轮转
 // shift 前先重试补采（成功才删除标记），防止 .1 被 shift 覆盖后事件永久丢失。
 type securityEventsPendingDelta struct {
 	Path   string `json:"path"`
@@ -393,8 +393,11 @@ func securityEventsWritePendingDelta(p securityEventsPendingDelta) error {
 }
 
 // securityEventsReadPendingDelta 读取待补采标记；不存在返回 (nil,nil)。损坏标记
-// 留 WARN 并清除，避免被静默当作无标记后继续轮转；其他读取错误返回给调用方，
-// 由轮转入口中止本轮，绝不在补采责任未知时移位归档。
+// （半写/解析失败/路径缺失）与读错误同口径返回 error 并由轮转入口中止本轮：
+// 旧实现清除标记后返回 (nil,nil)，恰好等于「无标记」，调用方继续 .1→.2 移位，
+// 该轮转窗口的事件再无补采依据。标记保留在盘上供下轮重试与人工
+// 诊断——不得在补采责任未知时静默丢弃。其他读取错误同样返回给调用方，绝不
+// 在补采责任未知时移位归档。
 func securityEventsReadPendingDelta() (*securityEventsPendingDelta, error) {
 	path := securityEventsPendingDeltaPath()
 	data, err := os.ReadFile(path)
@@ -407,26 +410,25 @@ func securityEventsReadPendingDelta() (*securityEventsPendingDelta, error) {
 	}
 	var p securityEventsPendingDelta
 	if err := json.Unmarshal(data, &p); err != nil || p.Path == "" {
-		throttledAuditFailureLogf("audit log rotation: pending delta marker corrupt, dropping: %s", path)
-		_ = os.Remove(path)
-		return nil, nil
+		throttledAuditFailureLogf("audit log rotation: pending delta marker corrupt (rotation deferred, marker kept): %s", path)
+		return nil, fmt.Errorf("pending delta marker corrupt: %s", path)
 	}
 	return &p, nil
 }
 
-// auditLogSizeCacheTTL 是轮转阈值的缓存窗口（N+11 D3-F5b）：2s 轮转 tick 在
+// auditLogSizeCacheTTL 是轮转阈值的缓存窗口（N+11 历史修复）：2s 轮转 tick 在
 // 日志非空时此前每轮都查主库取阈值，稳态每 2s 一条主库查询。阈值是管理端偶尔
 // 修改的常量，60s 生效延迟对按大小轮转无实际影响；缓存后稳态每 tick 仅一次
 // stat、零 DB 查询。主库读失败不缓存：回退 10MB 当轮生效、下一 tick 重试，
 // 不把瞬时故障的回退值钉死整个窗口。
 const auditLogSizeCacheTTL = 60 * time.Second
 
-// 审计轮转阈值缓存（V87-TO-06：缓存机制单源 dbValueCache，「读库失败不缓存」
+// 审计轮转阈值缓存（缓存机制单源 dbValueCache，「读库失败不缓存」
 // 语义与任务日志侧统一——此前两套实现易单侧漏改）。
 var auditLogSizeValueCache = dbValueCache{ttl: auditLogSizeCacheTTL}
 
 func getAuditLogSizeBytes() int64 {
-	// SVC-F2（历史）：未初始化库回退默认 10MB，不得 nil deref（当前
+	// 历史修复（历史）：未初始化库回退默认 10MB，不得 nil deref（当前
 	// 不可达；与同包多数配置读取 helper 的 db.DB==nil 守卫口径一致）。
 	if db.DB == nil {
 		return 10 * 1024 * 1024

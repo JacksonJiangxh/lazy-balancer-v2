@@ -1,6 +1,6 @@
 package handlers
 
-// 历史问题(历史修复)：阶段页 4 列（block_page_stage1_id/status、
+// 历史问题：阶段页 4 列（block_page_stage1_id/status、
 // block_page_stage3_id/status）仅 http 渲染消费，但多条写路径可把非零值
 // 写进 TCP 规则行成为永不消费的死数据。本组测试钉住：
 //   - UpdateRule 协议切换 http→tcp：4 列归零；tcp 编辑显式携带 → 归一 0

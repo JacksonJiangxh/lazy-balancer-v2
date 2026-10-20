@@ -37,7 +37,7 @@ var (
 	configDriftHeartbeatSkipped int  // 自上次心跳以来的跳过轮数：仅用于心跳文案，与状态字段窗口分离。
 	configDriftQueryWarned      bool // 规则数据读取失败首报留痕
 	configDriftReadWarned       bool // 运行配置读取失败首报留痕
-	// LBS-B-D1（历史）：configWatchdogMu/Cancel/Done 三个引擎化前残留
+	// 历史修复（历史）：configWatchdogMu/Cancel/Done 三个引擎化前残留
 	// 死变量已删（StartConfigWatchdog/StopConfigWatchdog 随 M2 退役，零消费方）。
 )
 
@@ -69,7 +69,7 @@ func CurrentConfigDrift() ConfigDriftStatus {
 // 经系统日志 + 操作日志 + GetCaddyStatus（前端全局横幅）三通道告知，连续两轮不一致
 // 才置状态（防配置应用窗口的瞬时误报）。从节点不运行——同步链路已有 drift 检测与
 // 重载失败标记自愈覆盖。恢复由用户手动重启完成（横幅入口），不做自动重应用。
-// LBS-B-D1（历史）引擎化口径：60s 节拍由任务引擎 config-watchdog 族驱动
+// 历史修复（历史）引擎化口径：60s 节拍由任务引擎 历史修复 族驱动
 // （taskengine_wire.go 注册），停止随 StopTaskEngine 统一收尾；admin 地址由
 // InitTaskEngine 装配时注入下方包级变量。
 var watchdogAdminURLValue string
@@ -79,9 +79,15 @@ var watchdogAdminURLValue string
 // 历史问题-2（历史）：主节点专属检测——从节点整轮短路（循环保持存活，
 // 升主后自动生效；COALESCE(is_master,1) 口径与全仓一致）。此前从节点每轮
 // 空跑簿记：心跳计数累积并逐小时发「配置一致」假心跳（从未真实检查）。
-func WatchdogCheckOnce() {
+//
+// 整轮未判定（规则/运行配置读取失败、Caddy 不可达）
+// 返回错误并写业务摘要行——此前 checkConfigConsistency 的 (checked, err) 被
+// 丢弃，本轮零业务日志且 task_runs 恒 success，任务监控无法区分「真实检查且
+// 一致」与「整轮没查」（与同文件「跳过轮不构成一致证据」口径冲突）。引擎
+// 通用行为不变：只有 Run 返回 error 才落 failed。
+func WatchdogCheckOnce() (runErr error) {
 	if db.DB == nil {
-		return
+		return nil
 	}
 	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
 		if err != nil {
@@ -89,61 +95,76 @@ func WatchdogCheckOnce() {
 			// 静默吞错会掩盖 DB 异常）。
 			Logf("warn", "配置看门狗: 读取集群角色失败，本轮跳过: %v", err)
 		}
-		return
+		return nil
 	}
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				Logf("error", "配置一致性看门狗：检查 panic: %v", r)
-				TaskLogf("config-watchdog", "check", "检查异常（panic 已拦，明细见运行日志）")
-			}
-		}()
-		checked, _ := checkConfigConsistency(watchdogAdminURLValue)
-		// 历史问题 日志收敛（2026-10-03 裁定，历史问题「日志只记真实执行」延伸）：一致轮
-		// 零逐轮行，每 configWatchdogHeartbeatRounds 轮（60s×60≈1h）一条心跳；
-		// 漂移期逐轮漂移行与恢复事件照旧（task_runs 维持失败留痕不膨胀）。
-		// 历史问题：只有真实完成的检查轮才累加干净轮——整轮跳过（规则/运行配置
-		// 读取失败、Caddy 不可达）不构成「一致」证据，此前会把跳过轮计入干净轮
-		// 并发出「配置一致」假心跳。跳过轮单独计数并附在心跳文案里。
-		configDriftMu.Lock()
-		if !checked {
-			configDriftSkipped++
-			configDriftHeartbeatSkipped++
-		} else if configDriftStatus.Consistent {
-			configDriftCleanRounds++
-			configDriftSkipped = 0 // 字段口径为「自上次真实检查以来」；真实检查成功即开启新窗口。
-		} else {
-			configDriftCleanRounds = 0
-			configDriftSkipped = 0 // 漂移证据丢弃本窗口（恢复后重新累计）
-			configDriftHeartbeatSkipped = 0
-		}
-		rounds := configDriftCleanRounds
-		skipped := configDriftHeartbeatSkipped
-		heartbeat := checked && configDriftStatus.Consistent && rounds%configWatchdogHeartbeatRounds == 0
-		if heartbeat {
-			configDriftSkipped = 0 // 窗口关闭：跳过轮计数随心跳归零
-			configDriftHeartbeatSkipped = 0
-		}
-		configDriftStatus.SkippedRounds = configDriftSkipped
-		status := configDriftStatus
-		status.Missing = append([]string(nil), configDriftStatus.Missing...)
-		status.Extra = append([]string(nil), configDriftStatus.Extra...)
-		configDriftMu.Unlock()
-		switch {
-		case !checked:
-			return // 跳过轮不输出「一致」结论
-		case heartbeat:
-			if skipped > 0 {
-				TaskLogf("config-watchdog", "check", "配置一致（心跳，近 60 轮有效检查无漂移；期间跳过 %d 轮未判定）", skipped)
-			} else {
-				TaskLogf("config-watchdog", "check", "配置一致（心跳，近 60 轮无漂移）")
-			}
-		case status.Consistent:
-			return
-		default:
-			TaskLogf("config-watchdog", "check", "配置漂移：缺失 %d 条 / 多余 %d 条（自 %s）", len(status.Missing), len(status.Extra), status.Since)
+	defer func() {
+		if r := recover(); r != nil {
+			Logf("error", "配置一致性看门狗：检查 panic: %v", r)
+			TaskLogfWarn("config-watchdog", "check", "检查异常（panic 已拦，明细见运行日志）")
+			// panic 同样意味着本轮没有完成判定：按失败上报（历史修复 同口径）。
+			runErr = fmt.Errorf("配置一致性检查 panic: %v", r)
 		}
 	}()
+	checked, checkErr := checkConfigConsistency(watchdogAdminURLValue)
+	// 历史问题 日志收敛（2026-10-03 裁定，历史问题「日志只记真实执行」延伸）：一致轮
+	// 零逐轮行，每 configWatchdogHeartbeatRounds 轮（60s×60≈1h）一条心跳；
+	// 漂移期逐轮漂移行与恢复事件照旧（task_runs 维持失败留痕不膨胀）。
+	// 历史问题：只有真实完成的检查轮才累加干净轮——整轮跳过（规则/运行配置
+	// 读取失败、Caddy 不可达）不构成「一致」证据，此前会把跳过轮计入干净轮
+	// 并发出「配置一致」假心跳。跳过轮单独计数并附在心跳文案里。
+	configDriftMu.Lock()
+	driftInProgress := configDriftStreak > 0
+	if !checked {
+		configDriftSkipped++
+		configDriftHeartbeatSkipped++
+	} else if configDriftStatus.Consistent && !driftInProgress {
+		configDriftCleanRounds++
+		configDriftSkipped = 0 // 字段口径为「自上次真实检查以来」；真实检查成功即开启新窗口。
+	} else if !configDriftStatus.Consistent {
+		configDriftCleanRounds = 0
+		configDriftSkipped = 0 // 漂移证据丢弃本窗口（恢复后重新累计）
+		configDriftHeartbeatSkipped = 0
+	}
+	// 防抖轮（streak=1，状态仍为 Consistent）不是
+	// 「一致」证据——它已经观测到一轮不一致。既不累加干净轮，也不得触发
+	// 心跳，否则漂移起点恰落在第 60 个检查周期时会写出「配置一致」的反事实结论。
+	rounds := configDriftCleanRounds
+	skipped := configDriftHeartbeatSkipped
+	heartbeat := checked && configDriftStatus.Consistent && !driftInProgress && rounds%configWatchdogHeartbeatRounds == 0
+	if heartbeat {
+		configDriftSkipped = 0 // 窗口关闭：跳过轮计数随心跳归零
+		configDriftHeartbeatSkipped = 0
+	}
+	configDriftStatus.SkippedRounds = configDriftSkipped
+	status := configDriftStatus
+	status.Missing = append([]string(nil), configDriftStatus.Missing...)
+	status.Extra = append([]string(nil), configDriftStatus.Extra...)
+	configDriftMu.Unlock()
+	switch {
+	case !checked:
+		// 跳过轮：不输出「一致」结论，也不再隐瞒「整轮没查」——写业务摘要行
+		// 并按失败返回，让 task_runs 与任务监控可见。
+		reason := "本轮未完成判定"
+		if checkErr != nil {
+			reason = checkErr.Error()
+		}
+		TaskLogfWarn("config-watchdog", "skipped", "配置检查未完成：%s（本轮未判定，不计入一致轮）", reason)
+		if checkErr != nil {
+			return fmt.Errorf("配置一致性检查未完成: %w", checkErr)
+		}
+		return errors.New("配置一致性检查未完成: " + reason)
+	case heartbeat:
+		if skipped > 0 {
+			TaskLogf("config-watchdog", "check", "配置一致（心跳，近 60 轮有效检查无漂移；期间跳过 %d 轮未判定）", skipped)
+		} else {
+			TaskLogf("config-watchdog", "check", "配置一致（心跳，近 60 轮无漂移）")
+		}
+	case status.Consistent:
+		return nil
+	default:
+		TaskLogf("config-watchdog", "check", "配置漂移：缺失 %d 条 / 多余 %d 条（自 %s）", len(status.Missing), len(status.Extra), status.Since)
+	}
+	return nil
 }
 
 // checkConfigConsistency 单轮真实比对，返回本轮是否真正完成判定（checked）：
@@ -153,7 +174,7 @@ func checkConfigConsistency(adminURL string) (checked bool, err error) {
 	if db.DB == nil {
 		return false, nil
 	}
-	// LBS-B-R1（历史）：角色门单层化——内层「非主节点跳过」门删除，
+	// 历史修复（历史）：角色门单层化——内层「非主节点跳过」门删除，
 	// 由唯一生产调用方 WatchdogCheckOnce 外层门承担短路+簿记语义（双层
 	// 背靠背同一句 is_master 查询曾每轮白打一次主库；外层若删会双条 warn）。
 	expected, err := expectedRenderedRules()
@@ -195,7 +216,7 @@ func checkConfigConsistency(adminURL string) (checked bool, err error) {
 // 并排除渲染侧有意跳过的三类，否则会被误报为「缺失」：
 //   - TCP+动态 DNS 逐规则跳过、同端口多 TCP 整组拒绝（历史问题 历史问题，与 caddy.go 同口径）；
 //   - A85历史问题-2：HTTP+TLS 规则在 caddy.go 渲染门因「无可用证书（manual 材料缺失 /
-//     ACME 无域匹配且未过期证书）」整条 fail-closed 跳过。看门狗必须消费同一判据，
+//     ACME 无域匹配且未过期证书）」整条 历史修复 跳过。看门狗必须消费同一判据，
 //     否则 ACME 首签窗口（或证书过期窗口）连续两轮即误报配置漂移、全局横幅常亮。
 //
 // 返回 caddy_id → 规则名称。
@@ -280,7 +301,7 @@ func expectedRenderedRules() (map[string]string, error) {
 			return ok
 		default:
 			// 渲染层 availableCerts 只认 manual/acme_dns；其他形态无证可载，
-			// 同 caddy.go 门一并跳过（fail-closed）。
+			// 同 caddy.go 门一并跳过。
 			return false
 		}
 	}
@@ -343,7 +364,7 @@ func runningRuleRouteIDs(adminURL string) (map[string]bool, error) {
 		servers, _ := app["servers"].(map[string]interface{})
 		for _, srv := range servers {
 			// 历史问题：形状异常（带外 /load 或版本漂移）不得 panic——一律
-			// comma-ok 断言跳过。
+			// 历史修复 断言跳过。
 			srvObj, ok := srv.(map[string]interface{})
 			if !ok {
 				continue
@@ -436,8 +457,7 @@ func diffRunningExtra(expected map[string]string, running map[string]bool) []str
 	claimed := claimedRoutePrefixes(expected)
 	for routeID := range running {
 		// 子路由（lb_x_redirect / lb_x_path_0 等，caddy.go tagRuleRoute 系）属于其
-		// 主规则——仅当没有任何期望规则认领该 @id 时才计为多余（历史问题 WD-1：
-		// 精确匹配会把每条 HTTPS 跳转/路径规则的子路由误报为多余）。
+		// 主规则——仅当没有任何期望规则认领该 @id 时才计为多余（历史问题 		// 精确匹配会把每条 HTTPS 跳转/路径规则的子路由误报为多余）。
 		if !routeClaimedByAny(routeID, claimed) {
 			extra = append(extra, routeID)
 		}
@@ -446,7 +466,7 @@ func diffRunningExtra(expected map[string]string, running map[string]bool) []str
 	return extra
 }
 
-// claimedRoutePrefixes（SVC-C1，历史）预建路由认领前缀集合：每个期望
+// claimedRoutePrefixes（历史修复，历史）预建路由认领前缀集合：每个期望
 // @id 收录其自身与 "<id>_" 两种形态，供 routeClaimedByAny 单次 O(1)/O(len)
 // 判定——替代原先每 routeID 全量扫描期望集合的 O(running×expected)。行为
 // 等价于 `routeID == caddyID || strings.HasPrefix(routeID, caddyID+"_")`。
@@ -461,7 +481,7 @@ func claimedRoutePrefixes(expected map[string]string) map[string]struct{} {
 
 // routeClaimedByAny 判定 routeID 是否被某个期望 @id 认领：精确命中集合，或
 // routeID 以某期望 @id+"_" 为前缀（子路由归属主规则）。claimed 由
-// claimedRoutePrefixes 预建（SVC-C1）。
+// claimedRoutePrefixes 预建。
 func routeClaimedByAny(routeID string, claimed map[string]struct{}) bool {
 	if _, ok := claimed[routeID]; ok {
 		return true

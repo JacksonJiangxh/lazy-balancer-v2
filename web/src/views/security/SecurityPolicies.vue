@@ -3173,6 +3173,8 @@ const handleSave = async () => {
     // 在策略落库后逐规则 PUT（lb_rules 上的独立资源，无法与策略保存同一事务）；
     // 任一失败即列出规则名并保持对话框打开以便重试（与绑定同步失败同款处理）。
     const pendingOverrides = pendingOverrideRules.value
+    // 成功提示只弹一条（见下方 showSaveResult 合并调用）——先记下真正写入的条数
+    let syncedCount = 0
     if (pendingOverrides.length > 0) {
       // 历史 历史问题：按 4 字段覆盖值分组，改调已发布
       // POST /rules/batch-block-pages（单事务一次渲染）。原实现逐规则整对象
@@ -3240,10 +3242,16 @@ const handleSave = async () => {
         // 成功计数只数真正写入的规则（不得把 skipped 计入「已同步」）。
         ElMessage.warning(`部分规则未写入阶段拦截页覆盖：${skippedNotes.join('；')}；这些规则保持待保存，可重试`)
       }
-      const syncedCount = pendingOverrides.length - skippedNotes.length
-      if (syncedCount > 0) mfaAwareSuccess(`已同步 ${syncedCount} 条规则的阶段拦截页覆盖`)
+      syncedCount = pendingOverrides.length - skippedNotes.length
     }
-    showSaveResult(saveRes, '保存成功')
+    // 保存成功与阶段拦截页覆盖同步数合并为一条提示（原为两条 toast 叠加）。
+    // 服务端 message 优先（可能携带 Caddy 应用失败后缀——suffix 追加在其后，
+    // showSaveResult 的 includes 判定不受影响）。
+    const saveMessage = saveRes?.message || '保存成功'
+    showSaveResult(
+      { message: syncedCount > 0 ? `${saveMessage}，已同步 ${syncedCount} 条规则的阶段拦截页覆盖` : saveMessage },
+      '保存成功',
+    )
     // 2026-09-08 审计 FE1：bind/unbind 的退化 200+后缀也需可见（有后缀才弹，
     // 无后缀不重复 toast）；历史问题：汇总全部分片而非末片。
     const mergedBind = mergeBulkResults(bindResponses)

@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,7 +9,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 )
@@ -58,7 +56,7 @@ const (
 )
 
 // credentialAuditStateFor 判定凭证载荷的审计/变更语义。全星号为保留占位
-// 契约（mask-sentinel）：只有整串星号视为占位，不参与落库比较。
+// 契约：只有整串星号视为占位，不参与落库比较。
 func credentialAuditStateFor(newCredentials, oldCredentials string) credentialAuditState {
 	trimmed := strings.TrimSpace(newCredentials)
 	if trimmed == "" {
@@ -78,6 +76,10 @@ func credentialAuditStateFor(newCredentials, oldCredentials string) credentialAu
 }
 
 func (h *Handlers) UpdateCAProvider(c *gin.Context) {
+	// ca_providers 在导入全量替代表清单内。
+	if rejectWriteDuringImport(c, "保存 CA 提供商（配置导入进行中）") {
+		return
+	}
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的 ID 参数"})
@@ -90,8 +92,8 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
 	var req models.UpdateCAProviderRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		// B1-03（历史）：MaxBytesReader 超限映射 413，与导入/
-		// PutCaddyConfig/admin-tls 同口径（此前并入 400）。
+		// 历史修复（历史）：MaxBytesReader 超限映射 413，与导入/
+		// PutCaddyConfig/历史修复 同口径（此前并入 400）。
 		if isRequestBodyTooLarge(err) {
 			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
 			return
@@ -142,7 +144,7 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 		}
 		return
 	}
-	// CERT-N1（历史）：changed 清单的比对基线改为服务层返回的事务内旧行，
+	// 历史修复（历史）：changed 清单的比对基线改为服务层返回的事务内旧行，
 	// 消除「事务外预读 → 事务提交」窗口内并发写入导致的清单失真（基于陈旧
 	// 旧值漏记/多记变更字段）。
 	changed := []string{}
@@ -193,9 +195,11 @@ func (h *Handlers) TestCAProvider(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的 ID 参数"})
 		return
 	}
-	var providerName string
-	if err := db.DB.QueryRow("SELECT name FROM ca_providers WHERE id=?", id).Scan(&providerName); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+	// 复用服务层单源查询（含 ErrCAProviderNotFound 分类），不再在
+	// handler 里另写一份 SELECT——单源分叉风险与审计名称口径漂移都由此消除。
+	provider, err := h.caProviderService.GetCAProvider(id)
+	if err != nil {
+		if errors.Is(err, services.ErrCAProviderNotFound) {
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "CA provider not found"})
 			return
 		}
@@ -203,6 +207,7 @@ func (h *Handlers) TestCAProvider(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询 CA 提供商失败"})
 		return
 	}
+	providerName := provider.Name
 
 	if err := h.caProviderService.TestCAProviderWithContext(c.Request.Context(), id); err != nil {
 		result := "provider_error"

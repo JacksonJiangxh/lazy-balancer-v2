@@ -4,7 +4,7 @@
 // 机制：security_crawler_sources 源表（Google/OpenAI/Bing/360 官方 JSON/表）
 // 独立排程（默认每天 04:00）+ 手动触发下载 → 通用 CIDR 提取（JSON/HTML 通用解析）→
 // security_ip_lists 系统名单（name=CrawlerIPListName(engine)，system=1）原子快照
-// 写入；失败保留上次快照（fail-safe，绝不以更新失败破坏既有豁免）。
+// 写入；失败保留上次快照（历史修复，绝不以更新失败破坏既有豁免）。
 // 验证器（caddygeoip.VerifyCrawler）按 IP 段命中即豁免（方法 C 与方法 B
 // PTR 双跳并行），名单投影与既有安全_ip_lists 同表复用。
 package services
@@ -13,7 +13,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/netip"
+	"sort"
 	"time"
 
 	"lazy-balancer-v2/geoipnames"
@@ -30,13 +32,15 @@ type CrawlerUpdateManager struct{}
 // 字段白名单由 parseCrawlerCIDRsForFormat 承担，本门承担段集一致性）：
 //  1. 子集门：每条解析结果必须 ⊆ 某官方段（off.Bits()<=prefix.Bits() 且
 //     包含首地址）——历史修复 历史问题 前为「交集」判定，0.0.0.0/0、10.0.0.0/8 等
-//     覆盖官方段的超网会被放行，写入即对启用爬虫豁免的策略整体 fail-open；
-//  2. 覆盖门：每个官方段至少被一条保留条目命中——截断页/仅一条官方段内 IP
-//     的错误页不得整体替换豁免名单（与 crawler_seed_parity_test.go 的
-//     「⊆ + 覆盖」双条件同口径）。
+//     覆盖官方段的超网会被放行，写入即对启用爬虫豁免的策略整体 历史修复；
+//  2. 覆盖门：每个官方段至少被保留条目覆盖 1/8 地址空间（历史修复 起为
+//     地址空间覆盖率口径，不再是「任一更具体条目命中」；阈值依据见函数内
+//     360 官方页实测）——截断页/仅一条官方段内 IP 的错误页、以及「每段一个
+//     单 IP」的占位形状都不得整体替换豁免名单（与 crawler_seed_parity_test.go
+//     的「⊆ + 覆盖」双条件同口径）。
 //
 // 引擎未声明官方段时无可对照口径，原样放行（收缩门 crawlerSnapshotShrinkGuard
-// 仍兜底条数塌缩）。
+// 与扩张门 crawlerSnapshotGrowthGuard 仍兜底条数塌缩/膨胀）。
 func validateCrawlerEntriesSanity(engineID string, entries []string) ([]string, error) {
 	if len(entries) == 0 {
 		return nil, errors.New("解析无产出（疑似错误页/限流页），保留上次快照")
@@ -74,20 +78,88 @@ func validateCrawlerEntriesSanity(engineID string, entries []string) ([]string, 
 	if len(filtered) == 0 {
 		return nil, fmt.Errorf("解析结果（%d 条）未落在 %s 声明的官方 IP 段内（疑似错误页/版本串污染），保留上次快照", len(entries), engineID)
 	}
-	// 覆盖门：每个官方段至少一条 ⊆ 条目，缺一即视为截断/部分名单。
+	// 覆盖门：按地址空间覆盖率判定——每个官方段至少被保留条目
+	// 覆盖 1/8 地址空间（等价于「至少一条窄于官方段 3 位的前缀证据」）。旧实现
+	// 「任一更具体条目命中即算覆盖」：一条 /32 就能让官方 /24 算「已覆盖」，
+	// 页面给出每段一个单 IP（5×/32）即可整体替换 5 个官方段的豁免名单（收缩门
+	// 5*2<5 不命中）。地址空间口径下 /32 对 /24 仅 1/256、对 /21 仅 1/2048。
+	//
+	// 阈值为何是 1/8 而不是官方段的一半（实测证据，2026-10-20）：
+	// 360 官方页（so.com/help/spider_ip.html）在 42.236.8.0/21 内只公布
+	// 42.236.10.* / 42.236.12.* 两个 /24（= 该摘要段的 1/4），而引擎 IPRanges
+	// 的 /21 是「42.236.10-15.x 归纳」的摘要段。以 50% 为门会把**真实官方页**
+	// 永久判为截断（源每轮失败、名单永不更新）；1/8 既容纳官方页的发布粒度，
+	// 也把「单 IP/极小段占位」挡在门外（单 IP 远低于 1/8）。
 	for _, off := range official {
-		covered := false
-		for _, prefix := range filteredPrefixes {
-			if off.Bits() <= prefix.Bits() && off.Contains(prefix.Addr()) {
-				covered = true
-				break
-			}
-		}
-		if !covered {
-			return nil, fmt.Errorf("解析结果（%d 条）未覆盖 %s 官方段 %s（疑似截断页/部分名单），保留上次快照", len(filtered), engineID, off)
+		if !crawlerPrefixCoverageSufficient(off, filteredPrefixes) {
+			return nil, fmt.Errorf("解析结果（%d 条）对 %s 官方段 %s 的地址覆盖不足 1/8（疑似截断页/部分名单/单 IP 占位），保留上次快照", len(filtered), engineID, off)
 		}
 	}
 	return filtered, nil
+}
+
+// crawlerPrefixCoverageSufficient 判断 retained（已经过子集门，可能来自其它
+// 官方段）对官方段 off 的地址空间并集覆盖率是否 ≥1/8。
+// 用 netip 位运算取各条目区间 [start, start+2^)，与 off 求交后
+// 排序合并求并集大小：并集口径允许「多条 /24 合并成 /22」这类合法形态，
+// 单 IP/极小段无法凑出 1/8 地址空间。条目量级为单源名单（百级），big.Int
+// 开销可忽略且只在更新任务（日级）里执行。
+func crawlerPrefixCoverageSufficient(off netip.Prefix, retained []netip.Prefix) bool {
+	addrBits := off.Addr().BitLen()
+	total := new(big.Int).Lsh(big.NewInt(1), uint(addrBits-off.Bits()))
+	type span struct{ start, end *big.Int }
+	spans := make([]span, 0, len(retained))
+	for _, prefix := range retained {
+		if prefix.Addr().BitLen() != addrBits {
+			continue // 地址族不同，不可能 ⊆ 本官方段
+		}
+		if off.Bits() > prefix.Bits() || !off.Contains(prefix.Masked().Addr()) {
+			continue // 非本段子集（属于其它官方段）
+		}
+		addr16 := prefix.Masked().Addr().As16()
+		start := new(big.Int).SetBytes(addr16[:])
+		size := new(big.Int).Lsh(big.NewInt(1), uint(addrBits-prefix.Bits()))
+		spans = append(spans, span{start: start, end: new(big.Int).Add(start, size)})
+	}
+	if len(spans) == 0 {
+		return false
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start.Cmp(spans[j].start) < 0 })
+	covered := new(big.Int)
+	curStart, curEnd := spans[0].start, spans[0].end
+	for _, s := range spans[1:] {
+		if s.start.Cmp(curEnd) <= 0 { // 相邻或重叠 → 合并
+			if s.end.Cmp(curEnd) > 0 {
+				curEnd = s.end
+			}
+			continue
+		}
+		covered.Add(covered, new(big.Int).Sub(curEnd, curStart))
+		curStart, curEnd = s.start, s.end
+	}
+	covered.Add(covered, new(big.Int).Sub(curEnd, curStart))
+	// covered*8 >= total（阈值含等号：恰好 1/8 算覆盖）
+	return covered.Lsh(covered, 3).Cmp(total) >= 0
+}
+
+// crawlerSnapshotBaseline 当前快照条数与「有可对照口径」标志：DB 行优先
+// （运行期唯一真相），无行回退内置首版（首轮更新也受门），两者皆无 → known=false
+// （无可对照口径，条数门放行）。基线读取失败按失败处理（保留上次快照，方向安全）。
+func crawlerSnapshotBaseline(engineID string) (count int, known bool, err error) {
+	if entries, ok := crawlerBuiltinSnapshot[engineID]; ok {
+		count, known = len(entries), true
+	}
+	if db.DB == nil {
+		return count, known, nil
+	}
+	all, err := loadCrawlerIPListsFromDB()
+	if err != nil {
+		return 0, false, err
+	}
+	if current, ok := all[engineID]; ok {
+		return len(current), true, nil
+	}
+	return count, known, nil
 }
 
 // crawlerSnapshotShrinkGuard 条数收缩门（历史修复 历史问题）：新名单条数较当前快照
@@ -96,18 +168,45 @@ func validateCrawlerEntriesSanity(engineID string, entries []string) ([]string, 
 // （首轮更新也受门），两者皆无则放行（无可对照口径）。基线读取失败按
 // 失败处理（保留上次快照，方向安全）。
 func crawlerSnapshotShrinkGuard(engineID string, newCount int) error {
-	baseline := len(crawlerBuiltinSnapshot[engineID])
-	if db.DB != nil {
-		all, err := loadCrawlerIPListsFromDB()
-		if err != nil {
-			return fmt.Errorf("读取爬虫名单基线失败: %w", err)
-		}
-		if current, ok := all[engineID]; ok {
-			baseline = len(current)
-		}
+	baseline, known, err := crawlerSnapshotBaseline(engineID)
+	if err != nil {
+		return fmt.Errorf("读取爬虫名单基线失败: %w", err)
+	}
+	if !known {
+		return nil
 	}
 	if baseline >= 2 && newCount*2 < baseline {
 		return fmt.Errorf("解析条数 %d 较当前快照 %d 收缩超过一半（疑似错误页/劫持），保留上次快照", newCount, baseline)
+	}
+	return nil
+}
+
+// CrawlerIPListEntryCap 爬虫系统名单条目绝对上限。与产品口径
+// handlers/securityiplists.go 的 ipListMaxEntries=2000 同义（services 不能
+// import handlers，故此处单源声明并注明同义；两值漂移会让任务写入越过管理面
+// 上限，与 AutobanListEntryCap 同型的跨包契约）。
+const CrawlerIPListEntryCap = 2000
+
+// crawlerSnapshotGrowthGuard 条数扩张门（历史修复，与收缩门对称）：源响应上限
+// 16MB，通用 CIDR 提取后可产出数十万条，此前只有收缩门（防塌缩），膨胀会直接
+// 放大 DB 行、历史修复.json、插件每 10min 重载的前缀表与渲染期内存，
+// 并绕过产品 2000 条口径。两道门：
+//  1. 绝对上限 CrawlerIPListEntryCap（无对照基线的引擎同样受约束）；
+//  2. 相对上限：较当前快照膨胀一倍以上（官方名单规模稳定，翻倍即视为劫持/
+//     污染），无对照基线时不适用。
+//
+// 拒绝时保留上次快照；调用方按源失败留痕（任务日志 ERROR + 源状态 failed +
+// 运行审计「更新失败」），不在此重复记录。
+func crawlerSnapshotGrowthGuard(engineID string, newCount int) error {
+	if newCount > CrawlerIPListEntryCap {
+		return fmt.Errorf("解析条数 %d 超过系统名单上限 %d 条，拒绝写入（保留上次快照）", newCount, CrawlerIPListEntryCap)
+	}
+	baseline, known, err := crawlerSnapshotBaseline(engineID)
+	if err != nil {
+		return fmt.Errorf("读取爬虫名单基线失败: %w", err)
+	}
+	if known && baseline > 0 && newCount > baseline*2 {
+		return fmt.Errorf("解析条数 %d 较当前快照 %d 膨胀超过一倍（疑似劫持/污染），拒绝写入（保留上次快照）", newCount, baseline)
 	}
 	return nil
 }
@@ -240,6 +339,11 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 			// 历史修复 历史问题：条数收缩门——较当前快照（DB/内置首版）收缩过半拒绝写入。
 			perr = crawlerSnapshotShrinkGuard(src.Name, len(entries))
 		}
+		if perr == nil {
+			// 条数扩张门——绝对 2000 条上限 + 较当前快照翻倍拒绝
+			// （源响应可达 16MB，无上限会绕过产品口径放大系统名单）。
+			perr = crawlerSnapshotGrowthGuard(src.Name, len(entries))
+		}
 		if perr != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("源 %s 解析失败: %w", src.Name, perr)
@@ -302,7 +406,7 @@ func convergeIPListProjectionAfterMutation(task string) {
 		TaskLogfWarn(task, "reloading", "重载回调未注册，引用方渲染由下次配置变更收敛")
 		return
 	}
-	// SSA-87-03：真实 /load 与同族（threat_update/autoban/crs/ip2region）同口径
+	// 真实 /load 与同族（threat_update/autoban/crs/ip2region）同口径
 	// 留系统重载审计——此前爬虫路径只写应用日志，审计中心无记录。
 	rerr := threatReloader()
 	recordSystemReloadAudit("crawlerbot_update", rerr)

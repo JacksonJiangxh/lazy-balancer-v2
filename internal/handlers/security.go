@@ -64,7 +64,7 @@ func (h *Handlers) ListSecurityCustomRules(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 			return
 		}
-		// 历史问题 B-N2：解析失败与下方 rows.Err 同口径显式 500（历史问题 F2「残缺列表不得
+		// 历史问题 解析失败与下方 rows.Err 同口径显式 500（历史问题 F2「残缺列表不得
 		// 以 200 返回」）——零值形态混入 200 会让该行在 UI 呈现「无条件规则」且
 		// 不可编辑保存，发射端又整条跳过，等于一条规则被静默停用。
 		if err := json.Unmarshal([]byte(conditionsJSON), &r.Conditions); err != nil {
@@ -111,7 +111,7 @@ func validateSecurityCustomRule(rule *models.SecurityCustomRule) error {
 	if utf8.RuneCountInString(rule.Name) > securityNameMaxRunes {
 		return fmt.Errorf("规则名称不能超过 100 字符")
 	}
-	// SEC-U1（历史）：description 补封顶（历史问题-4 家族漏收敛点）——
+	// 历史修复（历史）：description 补封顶（历史问题-4 家族漏收敛点）——
 	// 对齐策略描述 500 rune 口径；DB 列无长度约束，超长串随列表响应/审计
 	// 详情放大。本函数是 Create/Update/导入三路径的单一收口点。
 	if utf8.RuneCountInString(rule.Description) > securityDescriptionMaxRunes {
@@ -148,7 +148,7 @@ func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
-	// HC-06（历史）：省略 enabled = 启用（零值陷阱家族 B1-历史问题）——
+	// 历史修复（历史）：省略 enabled = 启用（零值陷阱家族 B1-历史问题）——
 	// MCP/API 无需感知默认值，也不得因省略而创建静默禁用的 WAF 规则。
 	rule := models.SecurityCustomRule{
 		Name:        req.Name,
@@ -176,7 +176,7 @@ func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 	defer tx.Rollback()
 	// 历史问题（历史）：全局数量上限（对齐 IP 名单 ipListMaxGlobalCount=200
 	// 双限额口径——曾无上限）。历史问题（历史）：计数移入 BEGIN IMMEDIATE
-	// 事务内与插入同锁（消除计数-插入间并发窗口），计数查询失败 fail-closed
+	// 事务内与插入同锁（消除计数-插入间并发窗口），计数查询失败 历史修复
 	// 拒绝——此前 `err == nil &&` 判定使 DB 故障静默跳过上限继续创建。
 	var ruleCount int
 	if err := tx.QueryRowContext(c.Request.Context(), "SELECT COUNT(*) FROM security_custom_rules").Scan(&ruleCount); err != nil {
@@ -218,11 +218,11 @@ func (h *Handlers) UpdateSecurityCustomRule(c *gin.Context) {
 	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
-	// 历史问题 B-N1：省略即保持现值（与 UpdateSecurityPolicy 同口径）——enabled 是本
+	// 历史问题 省略即保持现值（与 UpdateSecurityPolicy 同口径）——enabled 是本
 	// 端点唯一「零值语义恰为禁用」的字段，MCP 无约束 body 的部分更新此前会把
 	// 零值 false 直写落库，WAF 静默少一条拦截规则且审计无痕迹。先读现值合并为
 	// 有效形态再过统一校验（校验规则不变，只是输入从「绑定零值」改为「现值」）。
-	// 历史问题 B69-N2：读-合并-写包进事务（DSN _txlock=immediate 使首个读即持写锁，
+	// 历史问题 读-合并-写包进事务（DSN _txlock=immediate 使首个读即持写锁，
 	// 与 UpdateSecurityPolicy 同机制）——此前裸连接读后合并再全列写，两个并发
 	// 部分更新会互相静默覆盖（丢 enabled 翻转 = WAF 规则静默启/禁用）。
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
@@ -243,9 +243,9 @@ func (h *Handlers) UpdateSecurityCustomRule(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则失败: " + err.Error()})
 		return
 	}
-	// 历史问题 B69-N1：存量条件「非空但解析失败」与「用户漏传条件」是不同故障——
+	// 历史问题 存量条件「非空但解析失败」与「用户漏传条件」是不同故障——
 	// 吞错会使损坏行走到「至少需要一个匹配条件」400，被误归因为用户输入
-	//（与 历史问题 B-F5 / 历史问题 B-N2 的 storage_corrupted 口径对齐）。
+	//（与 历史问题 历史修复 / 历史问题 历史修复 的 storage_corrupted 口径对齐）。
 	if existingConditionsJSON != "" {
 		if uerr := json.Unmarshal([]byte(existingConditionsJSON), &existing.Conditions); uerr != nil {
 			recordAudit(c, "更新失败", "自定义规则", services.FormatAuditDetail(fmt.Sprintf("规则 #%s", id), services.AuditResultPart("storage_corrupted")))
@@ -427,7 +427,7 @@ func (h *Handlers) CreateSecurityBlockPage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面名称不能为空"})
 		return
 	}
-	// SEC-A-2（历史）：name/description 补 rune 封顶（历史问题-4 家族漏收敛
+	// 历史修复（历史）：name/description 补 rune 封顶（历史问题-4 家族漏收敛
 	// 点——策略/自定义规则同口径 100/500；DB 列无长度约束，超长串随列表响应/
 	// 审计详情放大）。
 	if utf8.RuneCountInString(req.Name) > securityNameMaxRunes {
@@ -447,7 +447,7 @@ func (h *Handlers) CreateSecurityBlockPage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面内容不能超过 64KB"})
 		return
 	}
-	// Content-Type 白名单（2026-09-25 用户裁定）：空=默认 html。
+	// 历史修复 白名单（2026-09-25 用户裁定）：空=默认 html。
 	if req.ContentType == "" {
 		req.ContentType = models.DefaultBlockPageContentType
 	}
@@ -503,7 +503,7 @@ func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面名称不能为空"})
 		return
 	}
-	// SEC-A-2（历史）：name/description rune 封顶（与创建同口径）。
+	// 历史修复（历史）：name/description rune 封顶（与创建同口径）。
 	if utf8.RuneCountInString(req.Name) > securityNameMaxRunes {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面名称不能超过 100 字符"})
 		return
@@ -521,7 +521,7 @@ func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面内容不能超过 64KB"})
 		return
 	}
-	// Content-Type 白名单（2026-09-25 用户裁定，与创建同口径）：空=默认 html。
+	// 历史修复 白名单（2026-09-25 用户裁定，与创建同口径）：空=默认 html。
 	if req.ContentType == "" {
 		req.ContentType = models.DefaultBlockPageContentType
 	}
@@ -658,12 +658,12 @@ func (h *Handlers) DeleteSecurityBlockPage(c *gin.Context) {
 //  1. 多 COALESCE(updated_by,0)（第 20 位）：PolicySummary/详情响应需要该列，
 //     生成投影不含；
 //  2. enabled 用 COALESCE(enabled,1)（schema 默认 TRUE）：List/Get 无 enabled
-//     WHERE 过滤，NULL-enabled 行须按 schema 默认呈现启用态；生成路径以
+//     WHERE 过滤，历史修复 行须按 schema 默认呈现启用态；生成路径以
 //     WHERE enabled=1 守卫，NULL 行本就被过滤，故裸列即可。
 //  3. 库值唯一真相（批 3）刻意第三差异：anomaly_threshold 此处保留
 //     COALESCE(...,5)（展示层对带外 NULL 行按 Create 默认呈现，容忍遗留脏
 //     行）；services 两条生成投影已改 COALESCE(...,0) 无效哨兵——NULL/<=0
-//     在渲染层 fail-visible（BuildCorazaDirectives 显性报错），展示层不做
+//     在渲染层 历史修复（BuildCorazaDirectives 显性报错），展示层不做
 //     行为消费，无需同口径。
 const securityPolicySelectColumns = `id, name, COALESCE(description,''), COALESCE(mode,'off'), COALESCE(anomaly_threshold,5), COALESCE(ip_acl_mode,''), COALESCE(ip_acl_list,'[]'), COALESCE(ip_acl_enabled,0), COALESCE(ip_whitelist_enabled,1), COALESCE(ip_whitelist,'[]'), COALESCE(ip_blacklist,'[]'),
 	COALESCE(rate_limit_enabled,0), COALESCE(rate_limit_rps,0), COALESCE(rate_limit_burst,0), COALESCE(crs_rule_groups,'[]'), COALESCE(crs_excluded_rules,'[]'), COALESCE(custom_rules,'[]'), COALESCE(block_page_id,0), COALESCE(block_status_code,0), COALESCE(enabled,1), COALESCE(updated_by,0), COALESCE(created_at,''), COALESCE(updated_at,''), COALESCE(geoip_countries,'[]'), COALESCE(geoip_mode,'off'), COALESCE(geoip_crawler_exempt,0), COALESCE(geoip_crawler_engines,'[]'), COALESCE(waf_check_response,0), COALESCE(log_request_body,0), COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_refs,'[]'), COALESCE(policy_type,''), COALESCE(trust_detection,0)`
@@ -830,6 +830,12 @@ func (h *Handlers) ListSecurityPolicies(c *gin.Context) {
 
 func (h *Handlers) GetSecurityPolicy(c *gin.Context) {
 	id := c.Param("id")
+	// 读路径补齐非规范数字 ID 家族门（SQLite 数值亲和使 '5.0' 命中
+	// id=5）——与 Update/Delete/Split/Bind/Unbind 全部写路径同口径 400。
+	if _, ok := parsePositiveNumericID(id); !ok {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略 ID 无效"})
+		return
+	}
 	var p models.SecurityPolicy
 	err := scanSecurityPolicyRow(db.DB.QueryRow(`SELECT `+securityPolicySelectColumns+` FROM security_policies WHERE id=?`, id), &p)
 	if err == sql.ErrNoRows {
@@ -939,7 +945,7 @@ func validateSecurityPolicyReferences(q policyQueryRower, blockPageID int, custo
 			unique = append(unique, id)
 		}
 		// S历史问题-O1:32766 绑定变量上限分块(与 validateIPListRefsExistence 同型;
-		// fail-closed——分块查询失败整体 500)。
+		// 历史修复——分块查询失败整体 500)。
 		const chunkLimit = 500
 		found := make(map[int]struct{}, len(unique))
 		for start := 0; start < len(unique); start += chunkLimit {
@@ -1053,7 +1059,15 @@ func (h *Handlers) CreateSecurityPolicy(c *gin.Context) {
 		req.IPWhitelistRefs = "[]"
 	}
 	if req.GeoIPMode == "" {
-		req.GeoIPMode = "deny"
+		// P1 历史修复 门（services.ValidateGeoIPCountries：非 off + 空名单 =
+		// 「宣称启用但零强制」→ 400）下的缺省归一：未显式启用地域控制且名单为空
+		// 时落 off（与渲染端 PolicyHasGeoIP「条目非空才发射」等价，行为不变）；
+		// 带名单时沿用 deny 缺省（历史口径）。
+		if geoIPCountriesEmpty(req.GeoIPCountries) {
+			req.GeoIPMode = "off"
+		} else {
+			req.GeoIPMode = "deny"
+		}
 	}
 	// ip_acl_mode 与 geoip_mode 同口径归一（历史问题 B-#1）：启用态 ACL 携带空模式
 	// 落库后，发射端仅 allow/deny 分支产出规则——零 ACL 生效而 UI 宣称已启用。
@@ -1104,12 +1118,12 @@ func (h *Handlers) CreateSecurityPolicy(c *gin.Context) {
 		return
 	}
 	// S1(2026-09-10 审计):allow 模式+空生效名单——发射端 len>0 门静默跳过
-	// (「其余一律拒绝」实际全放行 fail-open)。写入侧 400(与 UI 守卫同口径,
+	// (「其余一律拒绝」实际全放行 历史修复)。写入侧 400(与 UI 守卫同口径,
 	// 历史问题/历史问题 同型先例)。历史问题：判定口径从「内联∪引用个数」改为
 	// 「内联∪引用名单**实际条目**并集」——引用一个空名单同样是空生效集合。
 	// A81A-历史问题：门控读必须位于 BEGIN IMMEDIATE 事务内（此前在事务外，
 	// ImportConfigBackup 不持 caddyOpMu，可在门与 INSERT 之间清空所引用名单，
-	// 落 allow+启用+空生效集 fail-open）——与 Update 的 SH6-1 同口径。
+	// 落 allow+启用+空生效集 历史修复）——与 Update 的 历史修复 同口径。
 	if err := services.ValidateCustomRulesJSON(req.CustomRules); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
@@ -1230,9 +1244,36 @@ func geoipEntriesEqual(a, b string) bool {
 	return true
 }
 
+// validateCRSLegacyEntryCharset 旧 []string 载荷的单条基础校验（历史修复 单源）：
+// 空条目与字符集白名单（字母/数字/. /_/-）在 crs_rule_groups 与
+// crs_excluded_rules 完全一致——此前两处循环逐字重复，新增字符规则需双改且
+// 漏改即校验分叉。返回 trim 后的值供调用方做形态检查。
+func validateCRSLegacyEntryCharset(fieldLabel, entry string) (string, error) {
+	trimmed := strings.TrimSpace(entry)
+	if trimmed == "" {
+		return "", fmt.Errorf("%s 条目不能为空", fieldLabel)
+	}
+	for _, r := range trimmed {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-' {
+			continue
+		}
+		return "", fmt.Errorf("%s 条目含非法字符（仅允许字母、数字、.、_、-）: %q", fieldLabel, entry)
+	}
+	return trimmed, nil
+}
+
+// validateCRSLegacyEntryNoSurroundingSpace 首尾空白校验（历史修复 单源）：
+// 调用方在形态检查之后调用，保持「942 」仍先报组号形态错误的既有报错优先级。
+func validateCRSLegacyEntryNoSurroundingSpace(fieldLabel, entry, trimmed string) error {
+	if trimmed != entry {
+		return fmt.Errorf("%s 条目不能包含首尾空白: %q", fieldLabel, entry)
+	}
+	return nil
+}
+
 // validateAndNormalizeCRSField 统一 Create/Update 两条路径的 crs_* 形状校验：
 // 空串按归一为 "[]"，非空必须是合法载荷（防发射端解析失败静默置空）。
-// crs_rule_groups：两位组号（进入 Include glob REQUEST-9<code>-*.conf）∪ 6 位
+// crs_rule_groups：两位组号（进入 Include glob 历史修复<code>-*.conf）∪ 6 位
 // CRS 规则 ID（须存在于本地规则索引，陈旧 → 400）。crs_excluded_rules：双格式
 // ——旧 []string 沿用既有门（现状兼容，不加索引校验），新 []对象走
 // validateCRSExcludedRulesPayload（组号/ID 存在性、scope 互斥字段、≤50 条）。
@@ -1256,19 +1297,13 @@ func validateAndNormalizeCRSField(name string, val *string, checkIndices bool) e
 	}
 	var index *services.CRSRuleIndex
 	for _, entry := range entries {
-		trimmed := strings.TrimSpace(entry)
-		if trimmed == "" {
-			return fmt.Errorf("%s 条目不能为空", name)
+		trimmed, err := validateCRSLegacyEntryCharset(name, entry)
+		if err != nil {
+			return err
 		}
-		for _, r := range trimmed {
-			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-' {
-				continue
-			}
-			return fmt.Errorf("%s 条目含非法字符（仅允许字母、数字、.、_、-）: %q", name, entry)
-		}
-		// 历史问题 B-F2 / 混合选择：组号恒为两位数字（发射端拼接 REQUEST-9<code>-*.conf）
+		// 历史问题 历史修复 / 混合选择：组号恒为两位数字（发射端拼接 历史修复<code>-*.conf）
 		// 或 6 位 CRS 规则 ID（经本地索引定位父文件 Include + 补删）。"941"、
-		// "REQUEST-942" 这类写法会 glob 零匹配——coraza 对空 Include 静默接受，
+		// "历史修复" 这类写法会 glob 零匹配——coraza 对空 Include 静默接受，
 		// blocking 模式将无任何 CRS 规则生效且无任何报错。
 		if name == "crs_rule_groups" && !services.IsCRSGroupCode(trimmed) {
 			if !services.IsCRSRuleIDTarget(trimmed) {
@@ -1286,8 +1321,8 @@ func validateAndNormalizeCRSField(name string, val *string, checkIndices bool) e
 		// 历史问题 B-#1：首尾空白条目（" 42"/"\t42"）trim 后能通过以上检查，但发射端
 		// 拼接 glob 用原始值会产生零匹配——校验与发射必须对同一形态达成一致。
 		// 放在形态检查之后："942 " 这类条目仍报组号形态错误（历史问题 口径）。
-		if trimmed != entry {
-			return fmt.Errorf("%s 条目不能包含首尾空白: %q", name, entry)
+		if err := validateCRSLegacyEntryNoSurroundingSpace(name, entry, trimmed); err != nil {
+			return err
 		}
 		if name == "crs_rule_groups" && services.IsCRSGroupCode(trimmed) && !services.IsCRSInfraGroupCode(trimmed) && checkIndices {
 			if index == nil {
@@ -1330,22 +1365,16 @@ func validateCRSExcludedRulesPayload(val *string, checkIndices bool) error {
 	var legacy []string
 	if err := json.Unmarshal([]byte(raw), &legacy); err == nil {
 		for _, entry := range legacy {
-			trimmed := strings.TrimSpace(entry)
-			if trimmed == "" {
-				return fmt.Errorf("crs_excluded_rules 条目不能为空")
+			trimmed, err := validateCRSLegacyEntryCharset("crs_excluded_rules", entry)
+			if err != nil {
+				return err
 			}
-			for _, r := range trimmed {
-				if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-' {
-					continue
-				}
-				return fmt.Errorf("crs_excluded_rules 条目含非法字符（仅允许字母、数字、.、_、-）: %q", entry)
-			}
-			// 历史问题 B-N2 → 历史问题 二十六次 W3-6 收紧：排除项必须是发射端实际会发射的
+			// 历史问题 历史修复 → 历史问题 二十六次 历史修复 收紧：排除项必须是发射端实际会发射的
 			// 形态（services.CRSExcludedEntryEffective——CRS 规则 ID「纯数字/
-			// 数字-数字，900000-999999」或 CRS 文件名「REQUEST-9XX-*.conf」，文件
+			// 数字-数字，900000-999999」或 CRS 文件名「历史修复-*.conf」，文件
 			// 名经 crsFilenameToRuleIDRange 映射为 ID 区间）。
-			if trimmed != entry {
-				return fmt.Errorf("crs_excluded_rules 条目不能包含首尾空白: %q", entry)
+			if err := validateCRSLegacyEntryNoSurroundingSpace("crs_excluded_rules", entry, trimmed); err != nil {
+				return err
 			}
 			if !services.CRSExcludedEntryEffective(entry) {
 				return fmt.Errorf("crs_excluded_rules 条目必须是 CRS 规则 ID（如 \"942100\"）或规则文件名（如 \"REQUEST-942-APPLICATION-ATTACK-SQLI.conf\"）: %q", entry)
@@ -1530,61 +1559,11 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 	// 字段指针强制设为类型零值（UPDATE 随之落零）；显式 mixed 拒绝；非法值
 	// 拒绝。nil=按合并后内容重推断（Exec 后读合并行回写）。
 	if req.PolicyType != nil {
-		emptyArr := "[]"
-		offMode := "off"
-		zeroInt := 0
-		falseVal := false
 		switch *req.PolicyType {
-		case models.PolicyTypeStage0:
-			req.Mode = &offMode
-			req.CRSRuleGroups, req.CRSExcludedRules, req.CustomRules = &emptyArr, &emptyArr, &emptyArr
-			req.RateLimitEnabled, req.RateLimitRPS, req.RateLimitBurst = &falseVal, &zeroInt, &zeroInt
-			req.WAFCheckResponse, req.LogRequestBody = &falseVal, &falseVal
-			req.IPACLEnabled = &falseVal
-			req.IPACLList, req.IPACLListRefs = &emptyArr, &emptyArr
-			req.IPBlacklist = &emptyArr
-			req.GeoIPMode, req.GeoIPCountries = &offMode, &emptyArr
-			req.GeoIPCrawlerExempt, req.GeoIPCrawlerEngines = &falseVal, &emptyArr
-			req.BlockPageID, req.BlockStatusCode = &zeroInt, &zeroInt
-		case models.PolicyTypeStage1:
-			req.Mode = &offMode
-			req.CRSRuleGroups, req.CRSExcludedRules, req.CustomRules = &emptyArr, &emptyArr, &emptyArr
-			req.RateLimitEnabled, req.RateLimitRPS, req.RateLimitBurst = &falseVal, &zeroInt, &zeroInt
-			req.WAFCheckResponse, req.LogRequestBody = &falseVal, &falseVal
-			req.IPWhitelistEnabled = &falseVal
-			req.IPWhitelist, req.IPWhitelistRefs = &emptyArr, &emptyArr
-			// 历史问题（历史）：trust_detection 是 stage0 专属——非 stage0
-			// 显式类型提交恒写 0（同阶段外字段指针归一口径）。
-			req.TrustDetection = &falseVal
-		case models.PolicyTypeStage2:
-			req.Mode = &offMode
-			req.CRSRuleGroups, req.CRSExcludedRules, req.CustomRules = &emptyArr, &emptyArr, &emptyArr
-			req.WAFCheckResponse, req.LogRequestBody = &falseVal, &falseVal
-			req.IPACLEnabled = &falseVal
-			req.IPACLList, req.IPACLListRefs = &emptyArr, &emptyArr
-			req.IPWhitelistEnabled = &falseVal
-			req.IPWhitelist, req.IPWhitelistRefs = &emptyArr, &emptyArr
-			req.IPBlacklist = &emptyArr
-			req.GeoIPMode, req.GeoIPCountries = &offMode, &emptyArr
-			// 历史问题：爬虫豁免同属阶段外字段——类型往返后不得静默复活。
-			req.GeoIPCrawlerExempt, req.GeoIPCrawlerEngines = &falseVal, &emptyArr
-			// 2026-09-25 用户裁定：stage2 允许配置拦截页（429 路由按其取页渲染）；
-			// 状态码仍归一 0——限流拦截恒 429（指标单独计量），页面由用户选。
-			req.BlockStatusCode = &zeroInt
-			// 历史问题（历史）：trust_detection 是 stage0 专属，同上归 0。
-			req.TrustDetection = &falseVal
-		case models.PolicyTypeStage3:
-			req.IPACLEnabled = &falseVal
-			req.IPACLList, req.IPACLListRefs = &emptyArr, &emptyArr
-			req.IPWhitelistEnabled = &falseVal
-			req.IPWhitelist, req.IPWhitelistRefs = &emptyArr, &emptyArr
-			req.IPBlacklist = &emptyArr
-			req.GeoIPMode, req.GeoIPCountries = &offMode, &emptyArr
-			// 历史问题：爬虫豁免同属阶段外字段——类型往返后不得静默复活。
-			req.GeoIPCrawlerExempt, req.GeoIPCrawlerEngines = &falseVal, &emptyArr
-			req.RateLimitEnabled, req.RateLimitRPS, req.RateLimitBurst = &falseVal, &zeroInt, &zeroInt
-			// 历史问题（历史）：trust_detection 是 stage0 专属，同上归 0。
-			req.TrustDetection = &falseVal
+		case models.PolicyTypeStage0, models.PolicyTypeStage1, models.PolicyTypeStage2, models.PolicyTypeStage3:
+			// 阶段外字段归零矩阵单源（outOfStageZeroFamilies）——
+			// Create/Update 共用同一份描述，逐字段赋值见 applyStageZerosToUpdate。
+			applyStageZerosToUpdate(&req, *req.PolicyType)
 		case models.PolicyTypeMixed:
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "混合策略为存量兼容形态，不可显式设置"})
 			return
@@ -1658,10 +1637,10 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
-	// SH6-1(历史):下方三处门控读(限流/S1 allow/GeoIP)原以裸连接
+	// 历史修复(历史):下方三处门控读(限流/S1 allow/GeoIP)原以裸连接
 	// db.DB 读取,位于 BeginTx 之前——与同函数 历史问题 事务内读的标准漂移;
 	// ImportConfigBackup 不持 caddyOpMu,构成并发写者,S1 窗口可落
-	// allow+启用+空名单(fail-open)。三读移入 BEGIN IMMEDIATE 事务内,
+	// allow+启用+空名单。三读移入 BEGIN IMMEDIATE 事务内,
 	// 校验 SELECT 即持写锁,消除 TOCTOU(同 历史问题 三-3 镜像方向)。
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
 	if err != nil {
@@ -1674,7 +1653,7 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 	{
 		var storedRLEnabled bool
 		var storedRPS, storedBurst int
-		// S历史问题-7:对齐 历史问题 B-S1 三分支——不存在 404/其余 500(此前吞错落
+		// S历史问题-7:对齐 历史问题 历史修复 三分支——不存在 404/其余 500(此前吞错落
 		// 零值,不存在策略被误报 400)。
 		if err := tx.QueryRow("SELECT COALESCE(rate_limit_enabled,0), COALESCE(rate_limit_rps,0), COALESCE(rate_limit_burst,0) FROM security_policies WHERE id=?", id).Scan(&storedRLEnabled, &storedRPS, &storedBurst); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -1700,7 +1679,7 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 		}
 	}
 	// S1(2026-09-10 审计):同 Create——生效配置(请求值缺失回落存量)为
-	// allow+启用+空合并名单时 400,防 fail-open 形态落库。
+	// allow+启用+空合并名单时 400,防 历史修复 形态落库。
 	{
 		var storedEnabled bool
 		var storedMode, storedList, storedRefs string
@@ -1746,7 +1725,7 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 	// 且「只改 mode 不带条目」的更新同样要过 GeoIP 可用性门。
 	var storedGeoIP, storedGeoIPMode, storedCrawlerEngines string
 	var storedCrawlerExempt bool
-	// 历史问题-3(历史):读错误三分支(对齐同函数 历史问题 B-S1 口径)——
+	// 历史问题-3(历史):读错误三分支(对齐同函数 历史问题 历史修复 口径)——
 	// 此前吞错使 storedGeoIPMode 落空串,GeoIP off 的可用性门判定漂移。
 	if err := tx.QueryRow("SELECT geoip_countries, geoip_mode, COALESCE(geoip_crawler_exempt,0), COALESCE(geoip_crawler_engines,'[]') FROM security_policies WHERE id=?", id).Scan(&storedGeoIP, &storedGeoIPMode, &storedCrawlerExempt, &storedCrawlerEngines); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1768,7 +1747,7 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 	if !modeFlippedOn && req.GeoIPCountries != nil {
 		// 历史问题 二十九次 M1:地域条目与存量完全相同的更新跳过 live 校验——N5 裁决
 		// 语义是「缺库时不得启用」而非「缺库时不得编辑未变更字段」;条目真正变化
-		// 时才落 fail-closed 门(缺库时改描述/开关不再 400)。
+		// 时才落 历史修复 门(缺库时改描述/开关不再 400)。
 		skipGeoIPValidation = geoipEntriesEqual(*req.GeoIPCountries, storedGeoIP)
 	}
 	if !skipGeoIPValidation && (req.GeoIPCountries != nil || modeFlippedOn) {
@@ -1836,7 +1815,7 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: msg})
 		return
 	}
-	// 历史问题 B-N1：重启用悬空引用门——仅含 {enabled:true} 的部分更新（REST 文档明示
+	// 历史问题 重启用悬空引用门——仅含 {enabled:true} 的部分更新（REST 文档明示
 	// 「只提交需要修改的字段」）不携带 block_page_id/custom_rules，derefInt/derefStr
 	// 零值使上面的校验整体短路；禁用期间被删除的规则/拦截页（删除门只拦 enabled=1
 	// 的策略）会随重启用静默激活：发射端仅 warn 跳过、WAF 规则静默丢失、拦截页
@@ -1846,7 +1825,7 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 		var storedBlockPageID int
 		var storedCustomRules, storedACLRefs, storedWLRefs, storedCRSExcluded string
 		if err := tx.QueryRow("SELECT COALESCE(block_page_id,0), COALESCE(custom_rules,'[]'), COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_refs,'[]'), COALESCE(crs_excluded_rules,'[]') FROM security_policies WHERE id=?", id).Scan(&storedBlockPageID, &storedCustomRules, &storedACLRefs, &storedWLRefs, &storedCRSExcluded); err != nil {
-			// 历史问题 B-S1：策略不存在时归因 404（与下方 RowsAffected 分支同语义），
+			// 历史问题 策略不存在时归因 404（与下方 RowsAffected 分支同语义），
 			// 其余读取错误保持 500——否则调用方无法区分「应停止重试」与「应重试」。
 			if errors.Is(err, sql.ErrNoRows) {
 				c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "策略不存在"})
@@ -1995,7 +1974,7 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 	}
 	// 审计真 delta 的存量基准（2026-09-25 用户裁定 A 方案）：UPDATE 前事务内读
 	// 一次现值（写锁已持、与写入零竞态）——changedFields 只记「提交值≠存量值」。
-	// ErrNoRows 放行由下方 RowsAffected=0 统一 404；其余读取失败 fail-closed
+	// ErrNoRows 放行由下方 RowsAffected=0 统一 404；其余读取失败 历史修复
 	// （审计完整性优先于一次写入）。
 	var stored models.SecurityPolicy
 	storedFound := true
@@ -2305,13 +2284,13 @@ func (h *Handlers) DeleteSecurityPolicy(c *gin.Context) {
 // maxBindingsPerRule 单规则安全策略绑定上限（2026-09-21 用户裁定 5→8）：所有写
 // 路径同源此常量——BindRuleToPolicy additive、SetRuleSecurityPolicies 原子替换、
 // BatchBindSecurityPolicies 提交集与 merge 合并、SplitSecurityPolicy 重映射、
-// BulkUpdatePolicyBindings 的 bind 侧（历史 NEW-1 补齐——此前 bulk 缺此门）。
+// BulkUpdatePolicyBindings 的 bind 侧（历史 历史修复 补齐——此前 bulk 缺此门）。
 // 前端 SecurityBindingEditor/SecurityPolicies 的 MAX_POLICY_BINDINGS 与
 // mcpserver schema maxItems 为镜像口径，调整时须同步。
 const maxBindingsPerRule = 8
 
-// maxBatchBindRules 批量绑定端点（POST /security/policies/batch-bind）单次规则
-// 数上限（历史 HC-01）：与 BulkUpdatePolicyBindings 的 100 同口径，
+// maxBatchBindRules 批量绑定端点（POST /security/policies/历史修复）单次规则
+// 数上限（历史 历史修复）：与 BulkUpdatePolicyBindings 的 100 同口径，
 // 前端 SECURITY_BULK_LIMITS.policyBindings 为其镜像。判据按 normalizeRuleIDs
 // 归一后集合计数（空白/重复 id 不占额度），超限 400 整体拒绝——不得带着写锁
 // （BEGIN IMMEDIATE + caddyOpMu）逐规则执行 N×3~4 次查询。
@@ -2394,7 +2373,7 @@ func (h *Handlers) BindRuleToPolicy(c *gin.Context) {
 	// 合并判断会把故障误报为「规则不存在」400，客户端无法区分重试与真 400。
 	var ruleExists int
 	var ruleProtocol string
-	// 历史问题 B-#3：取 protocol 同行校验——TCP 规则走 caddy-l4 构建链（buildTCPServer），
+	// 历史问题 B-#3：取 protocol 同行校验——TCP 规则走 历史修复 构建链（buildTCPServer），
 	// 该链从不消费安全策略，绑定成立即「UI 宣称受保护、实际零强制」的稳态漂移。
 	if err := tx.QueryRowContext(c.Request.Context(), "SELECT COUNT(*), COALESCE(MAX(protocol),'') FROM lb_rules WHERE caddy_id=?", req.RuleCaddyID).Scan(&ruleExists, &ruleProtocol); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
@@ -2408,7 +2387,7 @@ func (h *Handlers) BindRuleToPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "安全策略仅支持绑定 HTTP 规则（TCP 规则不经过 WAF/IP 访问控制/限流链）"})
 		return
 	}
-	// 上限守卫（B-I1）：POST additive 与 PUT 同上限——一规则最多绑定
+	// 上限守卫：POST additive 与 PUT 同上限——一规则最多绑定
 	// maxBindingsPerRule 条策略。重绑已存在的 (rule,policy) 对保持幂等 200
 	// （INSERT OR IGNORE 不产生新行），仅当该对尚未绑定且兄弟绑定已达上限时
 	// 拒绝；COUNT 与 INSERT 同事务（写锁由 _txlock=immediate 在 BEGIN 处获取），
@@ -2445,7 +2424,7 @@ func (h *Handlers) BindRuleToPolicy(c *gin.Context) {
 
 // SetRuleSecurityPolicies（v2.2.0 T2）：PUT /security/rules/:caddy_id/policies
 // 原子替换一规则的全部策略绑定。校验与替换核心在 setRulePoliciesInTx
-// （历史与批量端点 /security/rules/policies/batch 同源——R-12 单实现）。
+// （历史与批量端点 /security/rules/policies/batch 同源——历史修复 单实现）。
 func (h *Handlers) SetRuleSecurityPolicies(c *gin.Context) {
 	ruleCaddyID := c.Param("caddy_id")
 	var req struct {
@@ -2466,12 +2445,12 @@ func (h *Handlers) SetRuleSecurityPolicies(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
-	// HC-07（历史）：审计串与写入共用同一归一集合——此前审计用原始
+	// 历史修复（历史）：审计串与写入共用同一归一集合——此前审计用原始
 	// req.PolicyIDs（重复项保留），提交 [1,1,2] 时审计记 [1,1,2] 而库内为
 	// [1,2]，取证时无法从审计还原最终绑定集。
 	policyIDs := normalizePolicyIDs(req.PolicyIDs)
 	if msg, err := setRulePoliciesInTx(c.Request.Context(), tx, ruleCaddyID, policyIDs); err != nil {
-		// DB 故障（锁/IO）映射 500 而非 400 裸串外泄（历史 NEW-2）。
+		// DB 故障（锁/IO）映射 500 而非 400 裸串外泄（历史 历史修复）。
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取/写入策略绑定失败"})
 		return
 	} else if msg != "" {
@@ -2493,7 +2472,7 @@ func (h *Handlers) SetRuleSecurityPolicies(c *gin.Context) {
 	})
 }
 
-// normalizePolicyIDs 策略 ID 去重（保序）单实现（历史 HC-07/R-12）：
+// normalizePolicyIDs 策略 ID 去重（保序）单实现（历史 历史修复/历史修复）：
 // 绑定上限判定、存在性校验、写入与审计串必须共用归一后集合——上限按原始长度
 // 判定会让 [1,1,…] 重复项被误判超限，审计按原始数组判定则与库内终态分叉。
 func normalizePolicyIDs(ids []int) []int {
@@ -2510,14 +2489,14 @@ func normalizePolicyIDs(ids []int) []int {
 }
 
 // setRulePoliciesInTx 校验并原子替换单规则的策略绑定集（DELETE+按去重序
-// INSERT OR IGNORE），供单条端点 SetRuleSecurityPolicies 使用（历史 R-12
+// INSERT OR IGNORE），供单条端点 SetRuleSecurityPolicies 使用（历史 历史修复
 // 单实现）。返回 (userMsg, err)：userMsg 非空=面向用户的 400 校验消息；err
 // 非 nil=数据库错误（调用方映射 500「读取/写入策略绑定失败」，不得把 DB
-// 故障裸串当 400 外泄——历史 NEW-2）。
+// 故障裸串当 400 外泄——历史 历史修复）。
 // 校验族：规则存在且 HTTP、去重后 ≤maxBindingsPerRule、策略全部存在、
 // 不含 mixed、stage2 至多一条。
 func setRulePoliciesInTx(ctx context.Context, tx *sql.Tx, ruleCaddyID string, policyIDs []int) (string, error) {
-	// 上限判定须先去重（B-I2）：[1,1,2,3,4,5] 为 5 条唯一策略，不得因原始数组
+	// 上限判定须先去重：[1,1,2,3,4,5] 为 5 条唯一策略，不得因原始数组
 	// 长度 6 误判超限。去重同时避免同一 id 重复计数导致存在性校验误判
 	// （INSERT OR IGNORE 本来就会去重，但 COUNT 必须与去重后的集合对齐）。
 	uniqueIDs := normalizePolicyIDs(policyIDs)
@@ -2583,7 +2562,7 @@ func setRulePoliciesInTx(ctx context.Context, tx *sql.Tx, ruleCaddyID string, po
 }
 
 // normalizeRuleIDs 归一规则 id 列表：TrimSpace + 去重 + 丢弃空串（历史
-// NEW-3）。bulk 绑定端点的 bind/unbind 列表经此归一后再进入校验与写入——
+// 历史修复）。bulk 绑定端点的 bind/unbind 列表经此归一后再进入校验与写入——
 // 空白/重复 id 不得逐字进入 SQL 或审计计数。
 func normalizeRuleIDs(ids []string) []string {
 	if len(ids) == 0 {
@@ -2612,8 +2591,8 @@ func normalizeRuleIDs(ids []string) []string {
 // 兄弟绑定（历史并发安全语义：additive/精确删除），全程恰好一次
 // finishTxApply（单渲染）。任一规则校验失败=400 整体拒绝且事务回滚；
 // bind+unbind 合计上限 100；幂等（重复 bind/未绑定的 unbind 均无害）。
-// bind 侧与单条 bind/batch-bind 端点同源两道规则级门：maxBindingsPerRule 上限、
-// stage2 唯一绑定（历史 NEW-1，批量化预取避免逐规则查询）。
+// bind 侧与单条 bind/历史修复 端点同源两道规则级门：maxBindingsPerRule 上限、
+// stage2 唯一绑定（历史 历史修复，批量化预取避免逐规则查询）。
 func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 	policyID, err := strconv.Atoi(c.Param("id"))
 	if err != nil || policyID <= 0 {
@@ -2634,7 +2613,7 @@ func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
-	// 规则 id 归一（TrimSpace）+ 去重（历史 NEW-3）：空白/重复 id 不得进入
+	// 规则 id 归一（TrimSpace）+ 去重（历史 历史修复）：空白/重复 id 不得进入
 	// 校验与写入；去重后的集合同时作为两道规则级门与写入的输入。
 	bindIDs := normalizeRuleIDs(req.Bind)
 	unbindIDs := normalizeRuleIDs(req.Unbind)
@@ -2681,7 +2660,7 @@ func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: *msg})
 		return
 	}
-	// NEW-1（历史）：bind 侧补齐单条 bind / batch-bind 端点同源的两道规则级
+	// 历史修复（历史）：bind 侧补齐单条 bind / 历史修复 端点同源的两道规则级
 	// 门——(a) 该规则现有绑定数（不含本策略）≥maxBindingsPerRule；(b) 本策略为
 	// stage2 且该规则已绑其他 stage2。批量化预取：一次 IN 查询取全部涉及规则的
 	// 「不含本策略」绑定计数，本策略为 stage2 时再一次 IN 查询取「已含其他
@@ -2744,10 +2723,10 @@ func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 		}
 	}
 	// 审计计数以「实变行数」（INSERT/DELETE affected 汇总）为准，而非请求原始
-	// 长度——重复 bind / 未绑定 unbind 不产生变化即不计入（历史 NEW-3）。
+	// 长度——重复 bind / 未绑定 unbind 不产生变化即不计入（历史 历史修复）。
 	boundChanged, unboundChanged := 0, 0
 	// 逐规则校验存在且 HTTP（单条 bind 端点同口径），并即时执行增删。返回
-	// (userMsg, err)：DB 故障→500，校验失败→400（历史 NEW-2）。
+	// (userMsg, err)：DB 故障→500，校验失败→400（历史 历史修复）。
 	applyOne := func(ruleCaddyID string, bind bool) (string, error) {
 		var ruleExists int
 		var ruleProtocol string
@@ -2829,8 +2808,8 @@ func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 // DELETE（replace 或绑定变化时）+INSERT OR IGNORE；全程一次 finishTxApply
 // （单渲染——批量绑定的成本模型与逐条调 PUT /security/rules/:id/policies
 // N 次渲染对齐）。响应 {bound:n, skipped:[{rule_id,reason}]}。
-// 历史 HC-01：rule_ids 归一后上限 maxBatchBindRules（100），超限 400
-// 整体拒绝——同族 BulkUpdatePolicyBindings / batch-block-pages 均有上限。
+// 历史 rule_ids 归一后上限 maxBatchBindRules（100），超限 400
+// 整体拒绝——同族 BulkUpdatePolicyBindings / 历史修复 均有上限。
 func (h *Handlers) BatchBindSecurityPolicies(c *gin.Context) {
 	var req struct {
 		RuleIDs   []string `json:"rule_ids"`
@@ -2858,13 +2837,13 @@ func (h *Handlers) BatchBindSecurityPolicies(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "rule_ids 不能为空"})
 		return
 	}
-	// HC-01（历史）：单次规则数上限与兄弟批量端点同口径（归一后计数）
+	// 历史修复（历史）：单次规则数上限与兄弟批量端点同口径（归一后计数）
 	// ——无上限时数万条 rule_ids 会在写锁内逐规则查询/写入，阻塞全部主库配置写。
 	if len(req.RuleIDs) > maxBatchBindRules {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("单次最多提交 %d 条规则（去重后计数）", maxBatchBindRules)})
 		return
 	}
-	// 去重后上限判定（同 SetRuleSecurityPolicies 的 B-I2 口径）
+	// 去重后上限判定（同 SetRuleSecurityPolicies 的 历史修复 口径）
 	uniqueIDs := normalizePolicyIDs(req.PolicyIDs)
 	if len(uniqueIDs) > maxBindingsPerRule {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("每条规则最多绑定 %d 条策略", maxBindingsPerRule)})
@@ -3040,7 +3019,7 @@ func (h *Handlers) BatchBindSecurityPolicies(c *gin.Context) {
 // 标记）。单事务一次
 // finishTxApply（单渲染）。
 func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
-	// HC-03（历史）：非规范数字 ID 家族门——SQLite INTEGER 亲和会让
+	// 历史修复（历史）：非规范数字 ID 家族门——SQLite INTEGER 亲和会让
 	// "5.0" 命中行 5，使本端点绕过同族一致的输入门（Delete/Unbind/更新端点
 	// 均在此 400）。
 	if _, ok := parsePositiveNumericID(c.Param("id")); !ok {
@@ -3306,8 +3285,8 @@ func (h *Handlers) GetSecurityPolicyBindings(c *gin.Context) {
 	policies := make([]models.SecurityPolicy, 0, len(policyIDs))
 	for _, policyID := range policyIDs {
 		var p models.SecurityPolicy
-		// C5 SUG-1：与 securityPolicySelectColumns 同 33 列同序投影（COALESCE 默认值），
-		// 任一可空列 NULL 不再使整接口 500；WHERE enabled=1 语义不变（NULL-enabled
+		// C5 与 securityPolicySelectColumns 同 33 列同序投影（COALESCE 默认值），
+		// 任一可空列 NULL 不再使整接口 500；WHERE enabled=1 语义不变（历史修复
 		// 仍被 SQL 过滤）。
 		if err := scanSecurityPolicyRow(db.DB.QueryRow(`SELECT `+securityPolicySelectColumns+`
 			FROM security_policies WHERE id=? AND enabled=1`, policyID), &p); err != nil {
@@ -3357,7 +3336,7 @@ func formatIP2RegionLocation(region string) string {
 		// 海外精确化(2026-09-13 用户裁定):与国内同构拼接非 0 段
 		// 国家·省州·城市·ISP(IDC)——弹框展示完整精度;列表仍由前端
 		// compactLocation 精简(海外取首段即国家)。国家段中文化
-		// (v2.3.7 修正):仅展示层翻译,X-LB-GeoIP-Loc 发射链不动。
+		// (v2.3.7 修正):仅展示层翻译,历史修复 发射链不动。
 		parts := []string{geoipnames.CountryChinese(fields[0])}
 		for _, f := range fields[1:4] {
 			if f != "" && f != "0" {
@@ -3451,7 +3430,7 @@ var ruleTriggeredFamilyPrefixes = map[string][]string{
 }
 
 // customRuleFamilyCondition 自定义规则族的 ID 形态条件——与 attackFamilyClassOf
-// 的自定义判定（SEC-R1 收敛单一事实源，两个 Go 视图函数共用）严格同口径：5 位任意
+// 的自定义判定（历史修复 收敛单一事实源，两个 Go 视图函数共用）严格同口径：5 位任意
 // 数字 ID（emit=crID+10000，10000-789999：5 位任意数字与 6 位 1xxxxx-
 // 7xxxxx 均在可达范围）或 ≥7 位且以 1 开头（无 id 规则的合成 ID 1000000+）。
 // 8xxxxx/9xxxxx 由地域爬虫与 CRS 段独占，不归本族。
@@ -3677,24 +3656,55 @@ func (h *Handlers) GetIPEventCount(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]int{"count": count}})
 }
 
+// geoIPCountriesEmpty 报告 geoip_countries 载荷是否为空名单（非法 JSON 视为空，
+// 形状错误随后由 ValidateGeoIPCountries 显式 400）。
+func geoIPCountriesEmpty(raw string) bool {
+	var entries []string
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return true
+	}
+	return len(entries) == 0
+}
+
+// parseSecurityEventPagination 严格解析事件列表分页参数：缺省或
+// 数值 <1 时沿用默认值（既有契约）；给出但非整数时按同端点时间参数的 400 口径
+// 拒绝——此前 fmt.Sscanf 静默回落，调用方拼写错误完全无信号。超上限钳到 cap
+// （防 *pageSize 溢出为负致 SQLite OFFSET 报错）。
+func parseSecurityEventPagination(c *gin.Context, name string, def, cap int) (int, bool) {
+	raw := strings.TrimSpace(c.Query(name))
+	if raw == "" {
+		return def, true
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "分页参数无效"})
+		return 0, false
+	}
+	if v < 1 {
+		return def, true
+	}
+	if v > cap {
+		v = cap
+	}
+	return v, true
+}
+
 func (h *Handlers) ListSecurityEvents(c *gin.Context) {
-	page := 1
-	pageSize := 20
-	fmt.Sscanf(c.DefaultQuery("page", "1"), "%d", &page)
-	fmt.Sscanf(c.DefaultQuery("page_size", "20"), "%d", &pageSize)
+	page, ok := parseSecurityEventPagination(c, "page", 1, 100000)
+	if !ok {
+		return
+	}
+	pageSize, ok := parseSecurityEventPagination(c, "page_size", 20, 100)
+	if !ok {
+		return
+	}
 	if page < 1 {
 		page = 1
 	}
-	// clamp 上限防 (page-1)*pageSize 整数溢出为负 → SQLite OFFSET 报错 500（历史问题 F7）
-	if page > 100000 {
-		page = 100000
-	}
 	// 历史问题:超上限钳到上限(此前回落默认 20——显式要 150 条拿到 20 条);
-	// 低于 1 回默认。
+	// 低于 1 回默认（既有契约，见 TestListSecurityEvents_pageSizeClampsToCap）。
 	if pageSize < 1 {
 		pageSize = 20
-	} else if pageSize > 100 {
-		pageSize = 100
 	}
 	offset := (page - 1) * pageSize
 
@@ -3786,7 +3796,7 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]any{"events": []any{}, "total": 0, "page": 1, "page_size": 20, "ingestion": services.SecurityEventsIngestionHealthSnapshot()}})
 		return
 	}
-	// event_time 恒为 'YYYY-MM-DD HH:MM:SS' UTC 字符串，参数同形 —— 直接字符串比较
+	// event_time 恒为 '历史修复 HH:MM:SS' UTC 字符串，参数同形 —— 直接字符串比较
 	// 即可走 idx_security_events_time 索引；两侧包 datetime() 会使索引失效（历史修复 修复）。
 	if hasStart {
 		where += " AND event_time >= ?"
@@ -3808,7 +3818,7 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 	// 历史问题（历史）：事件表这些列 schema 可空（仅 DEFAULT、无 NOT NULL），
 	// 带外/异常写入显式 NULL 会让整页 500——列表投影统一 COALESCE，与策略/拦截页/
 	// 自定义规则的 NULL 容忍口径一致（security_null_coalesce_test.go）。
-	// HC-10（历史）：request_headers/request_body 在 SQL 侧只取截断上限
+	// 历史修复（历史）：request_headers/request_body 在 SQL 侧只取截断上限
 	//（+1 探针）——此前整列（上行落库上限 64KB/字段）取回再在 Go 侧截到 16KB，
 	// 100 行 × 2 字段最多传输 ~12.8MB 只为返回 ≤1.6MB；列表弹框只消费截断内容。
 	rows, err := db.MetricsDB.Query(`SELECT e.id, e.event_time, COALESCE(e.rule_caddy_id,''), COALESCE(e.policy_id,0), COALESCE(e.client_ip,''), COALESCE(e.method,''), COALESCE(e.uri,''), COALESCE(e.event_type,''), COALESCE(e.rule_triggered,''), COALESCE(e.rule_msg,''), COALESCE(e.action,''), COALESCE(e.anomaly_score, 0),
@@ -3856,9 +3866,9 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 const securityEventListFieldCap = 16 * 1024
 
 // securityEventListFieldSQL 事件列表的大字段投影：SQL 侧只取截断上限 +1 个
-// **字符**（SQLite SUBSTR 按字符计，天然不切断 UTF-8）。+1 是超限探针——
+// **字符**（SQLite SUBSTR 按字符计，天然不切断 历史修复）。+1 是超限探针——
 // truncateEventListField 据此判定「原值更长」并追加截断标记，响应字节与
-// 此前「整列取回再截断」完全一致（HC-10 历史）。
+// 此前「整列取回再截断」完全一致（历史修复 历史）。
 func securityEventListFieldSQL(column string) string {
 	return "COALESCE(SUBSTR(" + column + ",1," + strconv.Itoa(securityEventListFieldCap+1) + "),'')"
 }
@@ -3875,11 +3885,21 @@ func truncateEventListField(value string) string {
 }
 
 // securityEventSensitiveHeaderNames 与前端 CTX_SENSITIVE_HEADERS 同源。
+// 名单覆盖常见第三方凭据头（API Key/访问令牌/CSRF/上游透传令牌）——
+// 仅 4 个经典头会让被拦请求携带的上游凭据对非管理员与只读 API Key 原样可读。
 var securityEventSensitiveHeaderNames = map[string]struct{}{
-	"cookie":              {},
-	"authorization":       {},
-	"set-cookie":          {},
-	"proxy-authorization": {},
+	"cookie":                    {},
+	"authorization":             {},
+	"set-cookie":                {},
+	"proxy-authorization":       {},
+	"x-api-key":                 {},
+	"x-auth-token":              {},
+	"x-csrf-token":              {},
+	"x-xsrf-token":              {},
+	"x-forwarded-access-token":  {},
+	"x-amz-security-token":      {},
+	"x-goog-api-key":            {},
+	"x-ms-authentication-token": {},
 }
 
 // maskSecurityEventRequestContextIfNeeded 服务端脱敏（历史问题-05）：非管理员会话
@@ -3897,7 +3917,7 @@ func maskSecurityEventRequestContextIfNeeded(c *gin.Context, e *models.SecurityE
 	}
 	var headers map[string]any
 	if err := json.Unmarshal([]byte(e.RequestHeaders), &headers); err != nil {
-		// 不可解析时不返回原文（防御性 fail-closed）。
+		// 不可解析时不返回原文（防御性 历史修复）。
 		e.RequestHeaders = "{}"
 		return
 	}
@@ -3915,7 +3935,7 @@ func maskSecurityEventRequestContextIfNeeded(c *gin.Context, e *models.SecurityE
 	e.RequestHeaders = string(masked)
 }
 
-// attackFamilyClass 攻击族 ID 形态分类——SEC-R1（历史）收敛的单一事实源：
+// attackFamilyClass 攻击族 ID 形态分类——历史修复（历史）收敛的单一事实源：
 // categorizeAttack（概览具体分类）与 stageCategorizeAttack（阶段五桶）此前各
 // 复写同一组形态谓词（5 位自定义/≥7 位 1 开头合成/11/14/8/2/4/5/7/3/12/msg
 // 关键词门），判定顺序分叉已出过一次事故（历史 历史问题 msg 门与信任分支先后）。
@@ -3925,7 +3945,7 @@ func maskSecurityEventRequestContextIfNeeded(c *gin.Context, e *models.SecurityE
 // 判定顺序即两视图既有同构顺序：5 位自定义先行（防 9 前缀遮蔽，N5）→ ≥7 位
 // 1 开头合成 → 精确 id/msg 族（msg 门先于信任分支，历史 历史问题）。9 开头 CRS
 // 段不在此判定——概览视图需按 3 位前缀细分（crsAttackLabel）且未列名前缀须
-// 继续落 msg/id 门（fall-through），由调用侧承载（语义钉见
+// 继续落 msg/id 门，由调用侧承载（语义钉见
 // TestCategorizeAttack_familyMapping / TestStageCategorizeAttack_buckets 的
 // 960100 用例对）。
 type attackFamilyClass int
@@ -3941,23 +3961,23 @@ const (
 	attackFamilyTrust                         // id 3/12 信任名单
 )
 
-// attackFamilyClassOf 共享形态谓词（SEC-R1）——两个 Go 视图函数的唯一分类入口。
+// attackFamilyClassOf 共享形态谓词——两个 Go 视图函数的唯一分类入口。
 func attackFamilyClassOf(ruleTriggered, ruleMsg string) attackFamilyClass {
 	switch {
 	case len(ruleTriggered) == 5:
 		// N5(历史):5 位 ID 恒为自定义规则(发射 id=crID+10000 落 10000-99999;
 		// CRS 恒 6 位)——先于 9 前缀判定,crID≥82000 发射 92000-99999 时不再被
-		// 遮蔽误标;与 customRuleFamilyCondition(SC-3)长度判据同口径。
+		// 遮蔽误标;与 customRuleFamilyCondition长度判据同口径。
 		return attackFamilyCustomRule
 	case len(ruleTriggered) == 6 && ruleTriggered[0] >= '1' && ruleTriggered[0] <= '7':
-		// DB 自定义规则 id 10000-789999 发射为 id+10000，6 位 1xxxxx-7xxxxx
+		// DB 自定义规则 id 10000-789999 发射为 id+10000，6 位 1历史修复
 		// 是真实可达形态；8xxxxx/9xxxxx 分别由地域爬虫与 CRS 分支独占。
 		return attackFamilyCustomRule
 	case strings.HasPrefix(ruleTriggered, "1") && len(ruleTriggered) >= 7:
 		// 自定义规则触发 id 的第二种形状：历史问题 起无 id 规则的合成 id 1000000+n
 		// （7 位，1000000-1999999）。6 位自定义 ID 已由上方分支覆盖；本分支
 		// 仅判无 id 规则的合成 ID。本口径是「自定义规则」ID 形态的
-		// 权威（SC-3）：SQL 筛选族 customRuleFamilyCondition 与前端
+		// 权威：SQL 筛选族 customRuleFamilyCondition 与前端
 		// triggeredLabel 须与本分支保持一致。
 		return attackFamilyCustomRule
 	case ruleTriggered == "11":
@@ -3988,7 +4008,7 @@ func attackFamilyClassOf(ruleTriggered, ruleMsg string) attackFamilyClass {
 }
 
 // crsAttackLabel CRS 段按 3 位规则组前缀的具体分类标签；未列名前缀返回 ""
-// （调用侧继续走共享形态门——概览视图 fall-through 语义）。调用前须先排除
+// （调用侧继续走共享形态门——概览视图 历史修复 语义）。调用前须先排除
 // 5 位自定义 ID（categorizeAttack 的 len==5 先行分支）。
 func crsAttackLabel(ruleTriggered string) string {
 	switch {
@@ -4012,7 +4032,7 @@ func crsAttackLabel(ruleTriggered string) string {
 		return "协议攻击"
 	case strings.HasPrefix(ruleTriggered, "922"):
 		// F-历史问题-02（历史）：已装 CRS v4 组补具体分类——
-		// REQUEST-922-MULTIPART-ATTACK（922100/922110 等，waf/crs/rules/ 实证），
+		// 历史修复（922100/922110 等，waf/crs/rules/ 实证），
 		// 此前落兜底「其他」。
 		return "Multipart 攻击"
 	case strings.HasPrefix(ruleTriggered, "911"):
@@ -4034,8 +4054,8 @@ func crsAttackLabel(ruleTriggered string) string {
 	case strings.HasPrefix(ruleTriggered, "951"):
 		return "响应 SQL 泄露"
 	// F-历史问题-02（历史）：已装 CRS v4 响应侧四组补具体分类——
-	// RESPONSE-952/954/956 DATA-LEAKAGES（952011/954012/956011 等）与
-	// RESPONSE-955-WEB-SHELLS（955011 等），waf/crs/rules/ 目录实证，
+	// 历史修复/954/956 历史修复（952011/954012/956011 等）与
+	// 历史修复（955011 等），waf/crs/rules/ 目录实证，
 	// 此前均落兜底「其他」。
 	case strings.HasPrefix(ruleTriggered, "952"):
 		return "响应 Java 泄露"
@@ -4065,8 +4085,8 @@ func categorizeAttack(ruleTriggered, ruleMsg string) string {
 	if label := crsAttackLabel(ruleTriggered); label != "" {
 		return label
 	}
-	// 9 开头但未列名 3 位前缀的 CRS 段：继续走共享形态门（SEC-R1 收敛前
-	// fall-through 同口径——历史脏数据 msg 命中 IP 黑白名单仍归 IP 访问控制）。
+	// 9 开头但未列名 3 位前缀的 CRS 段：继续走共享形态门（历史修复 收敛前
+	// 历史修复 同口径——历史脏数据 msg 命中 IP 黑白名单仍归 IP 访问控制）。
 	switch attackFamilyClassOf(ruleTriggered, ruleMsg) {
 	case attackFamilyCustomRule:
 		return "自定义规则"
@@ -4094,15 +4114,15 @@ func categorizeAttack(ruleTriggered, ruleMsg string) string {
 //	威胁库 14/msg）/ WAF（CRS 9xxxxx + 自定义 5 位与 1 开头 ≥7 位合成）/
 //	请求体异常（id 11）/ 其他。
 //
-// SEC-R1（历史）：ID 形态判定收敛至 attackFamilyClassOf 单一事实源，
+// 历史修复（历史）：ID 形态判定收敛至 attackFamilyClassOf 单一事实源，
 // 本函数只做类→桶映射。与概览视图的唯一有意分叉：9 开头 CRS 段整段归 WAF
-// （含未列名前缀，不 fall-through 到 msg 门）；概览视图未列名前缀继续走
+// （含未列名前缀，不 历史修复 到 msg 门）；概览视图未列名前缀继续走
 // msg/id 门。与 family 筛选表（ruleTriggeredFamilyPrefixes/
 // customRuleFamilyCondition/geoipFamilyCondition）SQL 侧口径同步义务不变。
 func stageCategorizeAttack(ruleTriggered, ruleMsg string) string {
 	class := attackFamilyClassOf(ruleTriggered, ruleMsg)
 	// WAF=自定义规则类+CRS 9 前缀段（categorizeAttack 的 crsAttackLabel 细分段
-	// 此处整段归一）。msg 门命中的 9 开头形态同样归 WAF（不 fall-through）。
+	// 此处整段归一）。msg 门命中的 9 开头形态同样归 WAF（不 历史修复）。
 	if class == attackFamilyCustomRule || strings.HasPrefix(ruleTriggered, "9") {
 		return "WAF"
 	}
@@ -4118,7 +4138,7 @@ func stageCategorizeAttack(ruleTriggered, ruleMsg string) string {
 	}
 }
 
-// joinDistinctFamilies renders a per-IP attack_type: distinct families ordered by
+// joinDistinctFamilies renders a 历史修复 attack_type: distinct families ordered by
 // frequency desc (name asc on ties), joined by 、. An empty map (no events) yields "".
 func joinDistinctFamilies(counts map[string]int) string {
 	families := make([]string, 0, len(counts))
@@ -4183,7 +4203,7 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 		for policyRows.Next() {
 			var p models.SecurityPolicy
 			if err := scanSecurityPolicy(policyRows, &p); err != nil {
-				// SEC-B-F3（历史）：行 scan 失败不得静默跳行——计入
+				// 历史修复（历史）：行 scan 失败不得静默跳行——计入
 				// firstErr 走 历史问题 D2 显式报错口径（全零面板与「无攻击」不可区分）。
 				trackErr(err)
 				continue
@@ -4201,7 +4221,7 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 	overview.CRSVersion = services.CRSBundledVersion
 	overview.UpdateStatus = "idle"
 	var crsVersion, crsUpdateStatus string
-	// SC-11：查询失败纳入 trackErr（对齐 ActivePolicies 口径与本函数 历史问题 D2
+	// 查询失败纳入 trackErr（对齐 ActivePolicies 口径与本函数 历史问题 D2
 	// 自述标准「任一查询失败都必须显式报错」）。无行（ErrNoRows）是全新安装的
 	// 合法状态，保持 200 捆绑版本回落（fallsBackToBundledCRSVersion 钉住），
 	// 不计入故障。
@@ -4220,7 +4240,7 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 	}
 	overview.UpdateStatus = overlayCRSOverviewUpdateStatus(overview.UpdateStatus, crsSnapshot)
 
-	// 7-day trend: always the full today-6 … today slice (local dates), zero-filled.
+	// 7-day trend: always the full 历史修复 … today slice (local dates), 历史修复.
 	// 时区偏移在 Go 侧拼好（负偏移如 America/New_York 为 "-240 minutes"）；SQLite 的
 	// MetricsDB 未装配：主库字段（活跃策略/库状态）照常返回，metrics 面板零值
 	// 200 而非 panic（历史 历史问题，对齐 历史问题 家族：ListSecurityEvents/
@@ -4273,7 +4293,7 @@ func (h *Handlers) GetCRSInfo(c *gin.Context) {
 		AutoUpdate:    true,
 		Available:     crsOK,
 		// N2(历史):默认 nil=未知(latest 缓存未知/版本解析失败时三态化,
-		// 不再 fail-open 宣称「已是最新」)。
+		// 不再 历史修复 宣称「已是最新」)。
 		UpdateStatus: "idle",
 	}
 	var stored struct {
@@ -4285,7 +4305,7 @@ func (h *Handlers) GetCRSInfo(c *gin.Context) {
 		FROM security_crs_version WHERE id=1`).
 		Scan(&stored.version, &stored.updatedAt, &stored.updateStatus, &stored.message,
 			&stored.nextUpdate, &stored.lastChecked, &stored.trigger, &stored.autoUpdate)
-	// S历史问题(SC-11 口径):仅行缺失(新安装)合法回落默认;真实 DB 故障 500
+	// S历史问题(历史修复 口径):仅行缺失(新安装)合法回落默认;真实 DB 故障 500
 	// 可见——此前一律吞错,用户看到假默认值。
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 CRS 版本信息失败"})
@@ -4342,7 +4362,7 @@ func (h *Handlers) UpdateCRSAutoUpdate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
-	// 历史问题 B-#4：与 StartCRSUpdate 同口径主节点门（历史问题 B-F3）——从节点版本行
+	// 历史问题 B-#4：与 StartCRSUpdate 同口径主节点门（历史问题 历史修复）——从节点版本行
 	// 在同步段内，本地写会被下次快照覆盖。
 	if !requireMasterNode(c) {
 		return
@@ -4417,10 +4437,10 @@ func (h *Handlers) UpdateCRSSchedule(c *gin.Context) {
 }
 
 func (h *Handlers) StartCRSUpdate(c *gin.Context) {
-	// 历史问题 B-F3：手动更新仅限主节点（镜像 历史问题 A 域手动同步门控的直查口径，
+	// 历史问题 手动更新仅限主节点（镜像 历史问题 A 域手动同步门控的直查口径，
 	// 门控查询失败按非主节点拒绝）。从节点本地更新会造成磁盘/DB 分叉：主节点
 	// 下次集群同步把 version 行覆盖回主节点口径，而从节点的启动对账是
-	// master-only，分叉长期残留。
+	// 历史修复，分叉长期残留。
 	if !requireMasterNode(c) {
 		return
 	}
@@ -4484,9 +4504,10 @@ func (h *Handlers) GetCRSUpdateLogs(c *gin.Context) {
 
 func (h *Handlers) GetIP2RegionInfo(c *gin.Context) {
 	_, ipOK := services.SecurityLibraryStatus()
+	ipVersion, _ := services.GetIP2RegionVersion()
 	info := models.IP2RegionInfo{
 		Available: ipOK,
-		Version:   services.GetIP2RegionVersion(),
+		Version:   ipVersion,
 		DbSize:    services.GetIP2RegionEntryCount(),
 		// 历史问题 二十六次 D2：行缺失兜底与 schema/种子默认对齐（TRUE）。
 		AutoUpdate:   true,
@@ -4495,7 +4516,7 @@ func (h *Handlers) GetIP2RegionInfo(c *gin.Context) {
 	err := db.DB.QueryRow(`SELECT COALESCE(updated_at,''), COALESCE(update_status,'idle'), COALESCE(message,''), COALESCE(trigger,''), COALESCE(last_checked,''), COALESCE(next_update,''), auto_update
 		FROM security_ip2region_version WHERE id=1`).
 		Scan(&info.UpdatedAt, &info.UpdateStatus, &info.Message, &info.Trigger, &info.LastChecked, &info.NextUpdate, &info.AutoUpdate)
-	// S历史问题(SC-11 口径):同 GetCRSInfo——真实 DB 故障 500,仅缺行回落。
+	// S历史问题(历史修复 口径):同 GetCRSInfo——真实 DB 故障 500,仅缺行回落。
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 IP2Region 版本信息失败"})
 		return
@@ -4585,7 +4606,7 @@ func (h *Handlers) UpdateIP2RegionSchedule(c *gin.Context) {
 }
 
 func (h *Handlers) StartIP2RegionUpdate(c *gin.Context) {
-	// 历史问题 B-F3：同 StartCRSUpdate——手动更新仅限主节点，从节点直接 403。
+	// 历史问题 同 StartCRSUpdate——手动更新仅限主节点，从节点直接 403。
 	if !requireMasterNode(c) {
 		return
 	}
@@ -4651,7 +4672,7 @@ func (h *Handlers) GetAllSecurityBindings(c *gin.Context) {
 		return
 	}
 	defer rows.Close()
-	// block_page_id（D-I1）：前端据此计算「首个启用且配置了拦截页面的策略」，
+	// block_page_id：前端据此计算「首个启用且配置了拦截页面的策略」，
 	// 与后端生成口径（首个 enabled 且 block_page_id>0）一致。block_status_code
 	//（拦截页归因）：前端冲突提示与 Rules 页锁形弹框展示「页名(状态码)」，
 	// NULL/0 归一 403（CASE WHEN，非 COALESCE——库存未设置为 0 非 NULL）与
@@ -4812,7 +4833,7 @@ func validateRateLimitShape(name string, enabled bool, rps, burst int) error {
 	if burst < 0 {
 		return fmt.Errorf("策略 %q：启用限流时 rate_limit_burst 不能为负（当前 %d）", name, burst)
 	}
-	// 历史问题 C-N2：渲染侧 buildRateLimitHandler 的 min-zone 用 rps*60、sec-zone 用
+	// 历史问题 渲染侧 buildRateLimitHandler 的 历史修复 用 rps*60、历史修复 用
 	// rps+burst（int64 运算）——与 request_body_max_size_mb 钳制（历史问题 历史问题）同型的
 	// 溢出防线：上界 1e9 使任何算术组合远离 int64 回绕。
 	if rps > 1_000_000_000 {
@@ -4900,57 +4921,126 @@ func resolveCreatePolicyType(req *models.CreateSecurityPolicyRequest) (string, e
 // stage3 保留 WAF+拦截页。
 // mode 归 off（阶段 0/1/2 策略无 WAF 引擎面）。
 func normalizeOutOfStageFields(req *models.CreateSecurityPolicyRequest, policyType string) {
-	falseVal := false
-	// SEC-B-F2（历史）：stage1/2/3 的 IPWhitelistEnabled 归 &falseVal
-	// 而非 nil——nil 经 policyWhitelistDefault 落默认 1，与 Update 路径
-	// （&falseVal → 0）形状漂移；显式 false 与 Update 同形落 0。
+	applyStageZerosToCreate(req, policyType)
+}
+
+// stageZeroFamily 是「阶段外字段归零」矩阵的元素（历史修复 单源）。Create 与
+// Update 两条写路径共用同一份矩阵描述，字段族的具体赋值由各自 applier 完成——
+// 新增阶段字段只需在族定义与该族 applier 落一处，不再维护两份逐字段 switch
+// （历史 历史修复 的 IPWhitelistEnabled nil/false 漂移即双份实现产物）。
+type stageZeroFamily int
+
+const (
+	stageZeroModeOff         stageZeroFamily = iota // mode → off（阶段 0/1/2 无 WAF 引擎面）
+	stageZeroCRSText                                // crs_rule_groups / crs_excluded_rules / custom_rules
+	stageZeroRateLimit                              // rate_limit_enabled / rps / burst
+	stageZeroWAFFlags                               // waf_check_response / log_request_body
+	stageZeroIPACL                                  // ip_acl_enabled / list / list_refs
+	stageZeroIPWhitelist                            // ip_whitelist_enabled / list / refs
+	stageZeroIPBlacklist                            // ip_blacklist
+	stageZeroGeoIP                                  // geoip_mode / geoip_countries
+	stageZeroGeoIPCrawler                           // geoip_crawler_exempt / geoip_crawler_engines
+	stageZeroBlockPageAll                           // block_page_id + block_status_code
+	stageZeroBlockStatusCode                        // 仅 block_status_code（stage2 限流恒 429）
+	stageZeroTrustDetection                         // trust_detection（stage0 专属）
+)
+
+// outOfStageZeroFamilies 返回该阶段必须归零的字段族——矩阵唯一出处：
+// stage0 仅保留信任名单 + trust_detection（直通/保留检测，无拦截页）；
+// stage1 保留 IP ACL/黑名单/GeoIP/爬虫豁免/拦截页（信任已归属阶段 0）；
+// stage2 仅保留限流 + 拦截页（2026-09-25 用户裁定：页面可配、状态码恒 429）；
+// stage3 保留 WAF + 拦截页。
+func outOfStageZeroFamilies(policyType string) []stageZeroFamily {
 	switch policyType {
 	case models.PolicyTypeStage0:
-		req.Mode = "off"
-		req.CRSRuleGroups, req.CRSExcludedRules, req.CustomRules = "[]", "[]", "[]"
-		req.RateLimitEnabled, req.RateLimitRPS, req.RateLimitBurst = false, 0, 0
-		req.WAFCheckResponse, req.LogRequestBody = false, false
-		req.IPACLEnabled = false
-		req.IPACLList, req.IPACLListRefs = "[]", "[]"
-		req.IPBlacklist = "[]"
-		req.GeoIPMode, req.GeoIPCountries = "off", "[]"
-		req.BlockPageID, req.BlockStatusCode = 0, 0
+		return []stageZeroFamily{stageZeroModeOff, stageZeroCRSText, stageZeroRateLimit, stageZeroWAFFlags, stageZeroIPACL, stageZeroIPBlacklist, stageZeroGeoIP, stageZeroGeoIPCrawler, stageZeroBlockPageAll}
 	case models.PolicyTypeStage1:
-		req.Mode = "off"
-		req.CRSRuleGroups, req.CRSExcludedRules, req.CustomRules = "[]", "[]", "[]"
-		req.RateLimitEnabled, req.RateLimitRPS, req.RateLimitBurst = false, 0, 0
-		req.WAFCheckResponse, req.LogRequestBody = false, false
-		req.IPWhitelistEnabled = &falseVal
-		req.IPWhitelist, req.IPWhitelistRefs = "[]", "[]"
+		return []stageZeroFamily{stageZeroModeOff, stageZeroCRSText, stageZeroRateLimit, stageZeroWAFFlags, stageZeroIPWhitelist, stageZeroTrustDetection}
 	case models.PolicyTypeStage2:
-		req.Mode = "off"
-		req.CRSRuleGroups, req.CRSExcludedRules, req.CustomRules = "[]", "[]", "[]"
-		req.WAFCheckResponse, req.LogRequestBody = false, false
-		req.IPACLEnabled = false
-		req.IPACLList, req.IPACLListRefs = "[]", "[]"
-		req.IPWhitelistEnabled = &falseVal
-		req.IPWhitelist, req.IPWhitelistRefs = "[]", "[]"
-		req.IPBlacklist = "[]"
-		req.GeoIPMode, req.GeoIPCountries = "off", "[]"
-		// 2026-09-25 用户裁定：stage2 允许配置拦截页（同 UPDATE 路径口径）。
-		req.BlockStatusCode = 0
+		return []stageZeroFamily{stageZeroModeOff, stageZeroCRSText, stageZeroWAFFlags, stageZeroIPACL, stageZeroIPWhitelist, stageZeroIPBlacklist, stageZeroGeoIP, stageZeroGeoIPCrawler, stageZeroBlockStatusCode, stageZeroTrustDetection}
 	case models.PolicyTypeStage3:
-		req.IPACLEnabled = false
-		req.IPACLList, req.IPACLListRefs = "[]", "[]"
-		req.IPWhitelistEnabled = &falseVal
-		req.IPWhitelist, req.IPWhitelistRefs = "[]", "[]"
-		req.IPBlacklist = "[]"
-		req.GeoIPMode, req.GeoIPCountries = "off", "[]"
-		req.RateLimitEnabled, req.RateLimitRPS, req.RateLimitBurst = false, 0, 0
+		return []stageZeroFamily{stageZeroIPACL, stageZeroIPWhitelist, stageZeroIPBlacklist, stageZeroGeoIP, stageZeroGeoIPCrawler, stageZeroRateLimit, stageZeroTrustDetection}
 	}
-	if policyType != models.PolicyTypeStage1 {
-		// 爬虫豁免只属于 stage1；与 Update 显式类型分支同口径静默归零。
-		req.GeoIPCrawlerExempt = false
-		req.GeoIPCrawlerEngines = "[]"
+	return nil
+}
+
+// applyStageZerosToCreate 按矩阵把创建请求的阶段外字段赋为类型零值。
+// 历史修复（历史）：IPWhitelistEnabled 赋 &falseVal 而非 nil——nil 经
+// policyWhitelistDefault 落默认 1，与 Update 路径（false → 0）形状漂移。
+func applyStageZerosToCreate(req *models.CreateSecurityPolicyRequest, policyType string) {
+	falseVal := false
+	for _, family := range outOfStageZeroFamilies(policyType) {
+		switch family {
+		case stageZeroModeOff:
+			req.Mode = "off"
+		case stageZeroCRSText:
+			req.CRSRuleGroups, req.CRSExcludedRules, req.CustomRules = "[]", "[]", "[]"
+		case stageZeroRateLimit:
+			req.RateLimitEnabled, req.RateLimitRPS, req.RateLimitBurst = false, 0, 0
+		case stageZeroWAFFlags:
+			req.WAFCheckResponse, req.LogRequestBody = false, false
+		case stageZeroIPACL:
+			req.IPACLEnabled = false
+			req.IPACLList, req.IPACLListRefs = "[]", "[]"
+		case stageZeroIPWhitelist:
+			req.IPWhitelistEnabled = &falseVal
+			req.IPWhitelist, req.IPWhitelistRefs = "[]", "[]"
+		case stageZeroIPBlacklist:
+			req.IPBlacklist = "[]"
+		case stageZeroGeoIP:
+			req.GeoIPMode, req.GeoIPCountries = "off", "[]"
+		case stageZeroGeoIPCrawler:
+			req.GeoIPCrawlerExempt, req.GeoIPCrawlerEngines = false, "[]"
+		case stageZeroBlockPageAll:
+			req.BlockPageID, req.BlockStatusCode = 0, 0
+		case stageZeroBlockStatusCode:
+			req.BlockStatusCode = 0
+		case stageZeroTrustDetection:
+			req.TrustDetection = false
+		}
 	}
 	if policyType != models.PolicyTypeStage2 && req.BlockPageID == 0 {
 		// 无自定义页面时状态码不被渲染消费；写侧归一，避免 UI 宣称生效。
 		req.BlockStatusCode = 0
+	}
+}
+
+// applyStageZerosToUpdate 按同一矩阵把更新请求的阶段外字段指针赋为零值
+// （UPDATE 随之落零）。只有矩阵描述的族被触碰，未列字段保持调用方原值。
+func applyStageZerosToUpdate(req *models.UpdateSecurityPolicyRequest, policyType string) {
+	emptyArr := "[]"
+	offMode := "off"
+	zeroInt := 0
+	falseVal := false
+	for _, family := range outOfStageZeroFamilies(policyType) {
+		switch family {
+		case stageZeroModeOff:
+			req.Mode = &offMode
+		case stageZeroCRSText:
+			req.CRSRuleGroups, req.CRSExcludedRules, req.CustomRules = &emptyArr, &emptyArr, &emptyArr
+		case stageZeroRateLimit:
+			req.RateLimitEnabled, req.RateLimitRPS, req.RateLimitBurst = &falseVal, &zeroInt, &zeroInt
+		case stageZeroWAFFlags:
+			req.WAFCheckResponse, req.LogRequestBody = &falseVal, &falseVal
+		case stageZeroIPACL:
+			req.IPACLEnabled = &falseVal
+			req.IPACLList, req.IPACLListRefs = &emptyArr, &emptyArr
+		case stageZeroIPWhitelist:
+			req.IPWhitelistEnabled = &falseVal
+			req.IPWhitelist, req.IPWhitelistRefs = &emptyArr, &emptyArr
+		case stageZeroIPBlacklist:
+			req.IPBlacklist = &emptyArr
+		case stageZeroGeoIP:
+			req.GeoIPMode, req.GeoIPCountries = &offMode, &emptyArr
+		case stageZeroGeoIPCrawler:
+			req.GeoIPCrawlerExempt, req.GeoIPCrawlerEngines = &falseVal, &emptyArr
+		case stageZeroBlockPageAll:
+			req.BlockPageID, req.BlockStatusCode = &zeroInt, &zeroInt
+		case stageZeroBlockStatusCode:
+			req.BlockStatusCode = &zeroInt
+		case stageZeroTrustDetection:
+			req.TrustDetection = &falseVal
+		}
 	}
 }
 
@@ -5004,14 +5094,14 @@ func validIPOrCIDR(entry string) bool {
 	return err == nil && addr.Zone() == ""
 }
 
-// 历史问题(历史):user-id 三 helper 已合一为 rule_features.go 的
+// 历史问题(历史):历史修复 三 helper 已合一为 rule_features.go 的
 // contextUserID(int64)——原 getContextUserIDInt(→int)/getContextUserID
 // (→string) 删除,调用点按需 int()/strconv.FormatInt 型转换。
 
 func (h *Handlers) ListCRSRules(c *gin.Context) {
 	entries, err := os.ReadDir(crsRulesDirPath())
 	if err != nil {
-		// SH-1(历史):降级空列表 200 与「确实无规则」不可区分——
+		// 历史修复(历史):降级空列表 200 与「确实无规则」不可区分——
 		// 同域标准(历史问题 D2 全零面板必须报错)对齐,改 500。
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "CRS 规则目录不可读: " + err.Error()})
 		return
@@ -5025,7 +5115,7 @@ func (h *Handlers) ListCRSRules(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	// clamp 上限防 (page-1)*pageSize 整数溢出为负 → 切片越界 panic（历史问题 F7）
+	// clamp 上限防 *pageSize 整数溢出为负 → 切片越界 panic（历史问题 F7）
 	if page > 100000 {
 		page = 100000
 	}
@@ -5108,7 +5198,7 @@ func (h *Handlers) GetCRSRuleContent(c *gin.Context) {
 		return
 	}
 	defer f.Close()
-	// 历史问题 B-N3：对齐 GetCRSSetupConfig 的 413 口径（历史问题 B-NEW-3）——超限显式
+	// 历史问题 对齐 GetCRSSetupConfig 的 413 口径（历史问题 历史修复）——超限显式
 	// 拒绝而非静默截断，防消费方（UI 预览/MCP 抓取）把残缺内容当完整规则使用。
 	// 只读查看端点：rules/*.conf 带外手改不受支持（W1 裁定，见 GetCRSSetupConfig
 	// 注释），规则变更须经 CRS 更新流程。
@@ -5125,12 +5215,12 @@ func (h *Handlers) GetCRSRuleContent(c *gin.Context) {
 }
 
 func (h *Handlers) GetCRSSetupConfig(c *gin.Context) {
-	// 历史问题 B-NEW-3：对齐同域读端点的尺寸口径（GetCRSRuleContent 1MB、更新日志 128KB），
+	// 历史问题 对齐同域读端点的尺寸口径（GetCRSRuleContent 1MB、更新日志 128KB），
 	// 超限时显式 413 拒绝而非静默截断——避免调用方把截断内容当作完整配置使用。
-	// W1（2026-09 用户裁定）：带外手改 crs-setup.conf / rules/*.conf 不受支持——
+	// W1（2026-09 用户裁定）：带外手改 历史修复.conf / rules/*.conf 不受支持——
 	// coraza 池指纹（crsPoolFingerprint，internal/services/security.go）只覆盖
-	// 「CRS 版本行 + zz-user-overrides.conf 的 mtime+size」两类变化向量，不含
-	// crs-setup.conf / rules/*.conf；带外手改后池键不变、新配置 Provision 复用
+	// 「CRS 版本行 + 历史修复.conf 的 mtime+size」两类变化向量，不含
+	// 历史修复.conf / rules/*.conf；带外手改后池键不变、新配置 Provision 复用
 	// 旧 WAF，手改静默不生效（直到进程重启或下一次 CRS 版本变更）。CRS 配置
 	// 变更必须经 CRS 更新流程；本端点仅为只读查看。
 	f, err := os.Open(crsSetupConfPath())
@@ -5156,7 +5246,7 @@ func parsePositiveNumericID(raw string) (int64, bool) {
 	return id, err == nil && id > 0
 }
 
-// rowsAffectedOrRespond 统一写后存在性判定（历史 HC-08）：RowsAffected
+// rowsAffectedOrRespond 统一写后存在性判定（历史 历史修复）：RowsAffected
 // 返回错误时必须显式 500——此前 8 处 `if rows, _ := result.RowsAffected(); rows
 // == 0` 把驱动层错误吞成「0 行」，真实故障被误报为 404（重试语义误导）。
 // 返回 false 表示已写出响应，调用方直接 return。
@@ -5205,7 +5295,7 @@ func crawlerExemptBool(exempt bool, geoipActive bool) bool {
 }
 
 // validatePolicyCrawlerExemption（v2.3.8）：爬虫豁免字段校验——豁免开启时
-// geoip 须为启用形态、engines 逐项 geoipnames 注册表白名单（fail-visible）。
+// geoip 须为启用形态、engines 逐项 geoipnames 注册表白名单。
 func validatePolicyCrawlerExemption(exempt bool, engines string, geoipMode string) error {
 	if exempt && (geoipMode == "" || geoipMode == "off") {
 		return fmt.Errorf("开启爬虫豁免要求地域拦截为启用形态（当前 geoip_mode=%q）", geoipMode)

@@ -1643,13 +1643,13 @@ const retryCertInfo = (): void => {
   void fetchCertInfo()
 }
 
-const fetchCertJobs = async (): Promise<void> => {
+const fetchCertJobs = async (roundSignal?: AbortSignal): Promise<void> => {
   if (disposed) return
   const requestedRuleIds = pagedRules.value.map((rule) => rule.caddy_id)
   const requestedRuleIdSet = new Set(requestedRuleIds)
   const res = await request.post<APIResponse<Record<string, CertJob | null>>>('/certificates/jobs/current', {
     rule_ids: requestedRuleIds,
-  }, { signal: certJobsPolling.signal, silent: true })
+  }, { signal: roundSignal ?? certJobsPolling.signal, silent: true })
   if (!res.data) throw new TypeError('当前证书任务响应缺少 data')
   if (disposed) return
   const nextMap = { ...certJobMap.value }
@@ -1897,10 +1897,10 @@ const formatUpdatedTime = (updatedAt: Rule['updated_at']): string => {
   return formatDate(updatedAt) || '-'
 }
 
-const fetchHealthStatus = async () => {
+const fetchHealthStatus = async (roundSignal?: AbortSignal) => {
   if (disposed) return
   try {
-    const res = await request.get<APIResponse<UpstreamHealthResponse>>('/config/health', { signal: healthPolling.signal, silent: true })
+    const res = await request.get<APIResponse<UpstreamHealthResponse>>('/config/health', { signal: roundSignal ?? healthPolling.signal, silent: true })
     if (disposed) return
     const healthData = res.data || {}
     // 历史问题-F13：扁平索引（host:port → detail）一次构建——原 probeUpstream 对每个
@@ -3490,7 +3490,26 @@ const ruleLogStats = ref<RuleLogStats | null>(null)
 const ruleLogStatsLoading = ref(false)
 const ruleLogStatsError = ref('')
 const logStatsOffset = ref(0)
-const logStatsMaps = ref<{ ip: Record<string, number>; ua: Record<string, number>; uri: Record<string, number>; total: number; startedAt: string } | null>(null)
+// 统计桶：keyCounts 记各映射当前键数，使上限判定为 O(1)——Object.keys(map).length
+// 在每次新增键时都要遍历整表（500 键上限下全量摄入会重复分配数百次）。
+interface LogStatBuckets {
+  ip: Record<string, number>
+  ua: Record<string, number>
+  uri: Record<string, number>
+  total: number
+  keyCounts: Record<'ip' | 'ua' | 'uri', number>
+}
+interface LogStatMaps extends LogStatBuckets {
+  startedAt: string
+}
+const createLogStatBuckets = (): LogStatBuckets => ({
+  ip: {},
+  ua: {},
+  uri: {},
+  total: 0,
+  keyCounts: { ip: 0, ua: 0, uri: 0 },
+})
+const logStatsMaps = ref<LogStatMaps | null>(null)
 const logStatsInFlight = ref(false)
 const MAX_LOG_STAT_KEYS = 500
 const OTHER_LOG_STAT_KEY = '其他'
@@ -3526,7 +3545,7 @@ const generalizeUA = (ua: string): string => {
   return osName ? `${client}${ver} / ${osName}` : `${client}${ver}`
 }
 
-const consumeLogLine = (maps: { ip: Record<string, number>; ua: Record<string, number>; uri: Record<string, number>; total: number }, line: string) => {
+const consumeLogLine = (maps: LogStatBuckets, line: string) => {
   let entry: CaddyLogEntry
   try {
     entry = JSON.parse(line)
@@ -3537,23 +3556,23 @@ const consumeLogLine = (maps: { ip: Record<string, number>; ua: Record<string, n
   if (!req) return
   maps.total++
   const ip = req.client_ip || req.src_ip || req.src || req.remote_ip || '-'
-  incrementCappedStat(maps.ip, ip)
+  incrementCappedStat(maps, 'ip', ip)
   let uri = req.uri || req.uri_path || '-'
   const qi = uri.indexOf('?')
   if (qi >= 0) uri = uri.slice(0, qi)
-  incrementCappedStat(maps.uri, uri)
+  incrementCappedStat(maps, 'uri', uri)
   let ua = req.user_agent || ''
   if (!ua && req.headers) {
     const list = req.headers['User-Agent']
     if (Array.isArray(list) && list.length) ua = list[0]
   }
   const g = generalizeUA(ua)
-  incrementCappedStat(maps.ua, g)
+  incrementCappedStat(maps, 'ua', g)
 }
 
 const consumeLogLinesChunked = async (
   lines: readonly string[],
-  maps: { ip: Record<string, number>; ua: Record<string, number>; uri: Record<string, number>; total: number },
+  maps: LogStatBuckets,
   isCurrent: () => boolean,
 ): Promise<boolean> => {
   for (let start = 0; start < lines.length; start += LOG_STAT_CHUNK_SIZE) {
@@ -3571,13 +3590,15 @@ const consumeLogLinesChunked = async (
   return isCurrent()
 }
 
-const incrementCappedStat = (map: Record<string, number>, key: string): void => {
+const incrementCappedStat = (buckets: LogStatBuckets, bucket: 'ip' | 'ua' | 'uri', key: string): void => {
+  const map = buckets[bucket]
   if (Object.prototype.hasOwnProperty.call(map, key)) {
     map[key] += 1
     return
   }
-  if (Object.keys(map).length < MAX_LOG_STAT_KEYS - 1) {
+  if (buckets.keyCounts[bucket] < MAX_LOG_STAT_KEYS - 1) {
     map[key] = 1
+    buckets.keyCounts[bucket] += 1
     return
   }
   map[OTHER_LOG_STAT_KEY] = (map[OTHER_LOG_STAT_KEY] || 0) + 1
@@ -3588,7 +3609,7 @@ const topN = (m: Record<string, number>, n: number) =>
     .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value))
     .slice(0, n)
 
-const rebuildStatsView = (m: { ip: Record<string, number>; ua: Record<string, number>; uri: Record<string, number>; total: number; startedAt: string }) => {
+const rebuildStatsView = (m: LogStatMaps) => {
   ruleLogStats.value = {
     total: m.total,
     started_at: m.startedAt,
@@ -3637,7 +3658,7 @@ const startLogStats = async () => {
   const requestSeq = ++ruleLogRequestSeq
   // 历史问题：统计起始时间走 formatDate（配置时区口径），与页面其他时间戳一致，
   // 不再用浏览器本地时区的 toLocaleString（started_at 为直接渲染的预格式化文本）
-  const maps = { ip: {}, ua: {}, uri: {}, total: 0, startedAt: formatDate(new Date().toISOString()) }
+  const maps: LogStatMaps = { ...createLogStatBuckets(), startedAt: formatDate(new Date().toISOString()) }
   logStatsMaps.value = maps
   ruleLogStats.value = null
   ruleLogStatsLoading.value = true
@@ -3755,12 +3776,12 @@ watch(ruleLogAutoRefresh, (val) => {
 // 历史问题-F4：健康轮询错误态（复用 usePollingErrorState，与证书任务轮询同口径）——
 // 原实现仅 console，/config/health 失败时健康列回落「-」且无任何提示。
 const healthPollingError = usePollingErrorState()
-const healthPolling = usePollingTask(async () => {
+const healthPolling = usePollingTask(async (task) => {
   // A85WA-历史问题：接入退避门（与 certJobsPolling 同口径）——横幅「自动重试已退避」
   // 与实际轮询一致；fetchHealthStatus 内部捕获并 recordError 不抛出，
   // 原轮询错误回调永不可达（死代码已删除）。
   if (!healthPollingError.canRun()) return
-  await fetchHealthStatus()
+  await fetchHealthStatus(task.signal)
 }, {
   interval: 15000,
 })
@@ -3781,10 +3802,10 @@ const certPollingErrorDescription = computed(() => {
     ? `最后错误：${lastError}；契约响应异常，自动重试已退避至 ${retryAt}`
     : `最后错误：${lastError}`
 })
-const certJobsPolling = usePollingTask(async () => {
+const certJobsPolling = usePollingTask(async (task) => {
   if (!certPollingError.canRun()) return
   if (rules.value.some((rule) => rule.tls_source === 'acme_dns') || pendingCertInfoRefresh.size > 0) {
-    await fetchCertJobs()
+    await fetchCertJobs(task.signal)
   }
   certPollingError.clear()
 }, {

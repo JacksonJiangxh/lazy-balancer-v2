@@ -81,7 +81,7 @@ func TestSyncService_recordSyncError_applyFailurePreservesReloadMarker(t *testin
 	}
 }
 
-// 2026-09-05 集群审计 SC-4：login_failed_attempts/login_locked_until 是从节点登录
+// 2026-09-05 集群审计 login_failed_attempts/login_locked_until 是从节点登录
 // 端点写入的本地记账（不随快照同步）。users 节重放（清表+回插）不得把从节点被锁
 // 账户意外解锁；主节点已删除的用户不得因回写复活。
 func TestSyncService_applySnapshot_preservesLocalLoginLockoutState(t *testing.T) {
@@ -148,7 +148,7 @@ func TestSyncService_applySnapshot_preservesLocalLoginLockoutState(t *testing.T)
 }
 
 // 2026-09-06 二轮 历史问题（W10 复核结论）：IsMaster 对历史 NULL 行的口径必须与
-// readonly 写闸（COALESCE(is_master,1) fail-open）一致——NULL 视为主节点。
+// readonly 写闸（COALESCE(is_master,1) 历史修复）一致——NULL 视为主节点。
 // 历史问题 迁移（db.go）已回填存量 NULL 使稳态不可达，此处为纵深防御一致性。
 func TestClusterService_IsMaster_nullIsMasterFailsOpenAsMaster(t *testing.T) {
 	// Given：历史脏数据 is_master=NULL
@@ -161,7 +161,7 @@ func TestClusterService_IsMaster_nullIsMasterFailsOpenAsMaster(t *testing.T) {
 	// When
 	isMaster, err := service.IsMaster(context.Background())
 
-	// Then：NULL 按主节点处理（fail-open），不产生读取错误
+	// Then：NULL 按主节点处理，不产生读取错误
 	if err != nil {
 		t.Fatalf("IsMaster err=%v, want nil（NULL 应回退为主节点而非 Scan 失败）", err)
 	}
@@ -232,13 +232,13 @@ func TestClusterService_ForgetNodePin_removesOnlyTargetNodePin(t *testing.T) {
 	}
 }
 
-// 2026-09-06 LB-04 连带：集群快照的 health_check_timeout NULL 回退口径必须与
+// 2026-09-06 历史修复 连带：集群快照的 health_check_timeout NULL 回退口径必须与
 // 渲染/写侧（rule_features/caddy.go、UpdateRule 存量读取，已统一为 2）一致——
 // 快照仍导 5 会让主节点实际行为（2）与下发值（5）分叉，且从节点回放后把 5
 // 物化为非 NULL 值，永久固化错误口径。
 func TestSnapshot_rulesInvalidHealthColumns_normalizedByTransportGate(t *testing.T) {
 	// 库值唯一真相批 1+2：健康检查族为 NOT NULL 值型列（fresh DDL），NULL 行
-	// 结构上不可达（原 LB-04 NULL→2 导出回退随之退役）；带外 0 脏行由传输归一
+	// 结构上不可达（原 历史修复 NULL→2 导出回退随之退役）；带外 0 脏行由传输归一
 	// 门 normalizeRuleForTransport 在导出侧归治理默认——三面（导出/落库/导入）
 	// 同构，渲染层零兜底。
 	cluster, database := newClusterTestService(t)
@@ -276,7 +276,7 @@ func loginLockTimestamp(offset time.Duration) string {
 	return time.Now().UTC().Add(offset).Format("2006-01-02 15:04:05")
 }
 
-// SC-4 修订：主节点活跃登录锁经快照独立顶层载荷 locked_users 下发——只带
+// 历史修复 修订：主节点活跃登录锁经快照独立顶层载荷 locked_users 下发——只带
 // 未来时间的活跃锁（与 loginLockedNow 同口径的字符串比较），自然过期后条目
 // 自动消失；不进 users 节列/节哈希（避免每次登录失败触发全量重放与漂移循环）。
 func TestSnapshot_lockedUsers_carriesActiveLocksOnly(t *testing.T) {
@@ -310,7 +310,7 @@ func TestSnapshot_lockedUsers_carriesActiveLocksOnly(t *testing.T) {
 	}
 }
 
-// SC-4 修订：从端应用 locked_users——空锁延长、更早本地锁延长、更晚本地锁
+// 历史修复 修订：从端应用 locked_users——空锁延长、更早本地锁延长、更晚本地锁
 // 不缩短、login_failed_attempts 不被触碰、载荷中的陌生用户名安全落空。
 func TestSyncService_applySnapshot_lockedUsersExtendButNeverShorten(t *testing.T) {
 	// Given：本地（从节点）三个用户——a 无锁、b 本地锁更早、c 本地锁更晚
@@ -344,7 +344,7 @@ func TestSyncService_applySnapshot_lockedUsersExtendButNeverShorten(t *testing.T
 	defer caddyServer.Close()
 	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
 
-	// When：应用快照（users 节重放 + SC-4 本地记账回写后应用 locked_users）
+	// When：应用快照（users 节重放 + 历史修复 本地记账回写后应用 locked_users）
 	if err := syncService.applySnapshot(context.Background(), incoming); err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +387,7 @@ func TestSyncService_applySnapshot_lockedUsersExtendButNeverShorten(t *testing.T
 	assertLock("a", laterLock, 1)
 }
 
-// SC-4 修订：旧主端形态（载荷缺失/nil）必须 no-op——不得清从节点本地锁与计数。
+// 历史修复 修订：旧主端形态（载荷缺失/nil）必须 历史修复——不得清从节点本地锁与计数。
 func TestSyncService_applySnapshot_nilLockedUsersPayloadIsNoOp(t *testing.T) {
 	// Given：本地用户带活跃锁与失败计数；快照不带 locked_users（模拟旧主端）
 	cluster, database := newClusterTestService(t)
@@ -448,7 +448,9 @@ func TestSyncService_applySnapshot_preservesLocalTOTPTimestep(t *testing.T) {
 		t.Fatalf("local timestep=%d after replay, want 900 preserved (replay window must not reopen)", got)
 	}
 
-	// 主节点更新(快照 1200 > 本地 900)→ 覆盖
+	// 主节点更新（手造快照 1200 > 本地 900）→ MAX 取 1200。注意生产 canonical
+	// 会把 mfa_last_timestep 清零（sanitizeUsersForHash），该分支仅为手造/旧版
+	// 载荷的纵深防御，不是可达的生产路径（历史修复 注释如实化）。
 	snapshot2 := models.ClusterSnapshot{
 		Version: 3,
 		Users:   []models.ClusterUser{{ID: 1, Username: "u", PasswordHash: "h", Role: "admin", IsEnabled: true, MFALastTimestep: 1200}},
@@ -460,5 +462,45 @@ func TestSyncService_applySnapshot_preservesLocalTOTPTimestep(t *testing.T) {
 	database.QueryRow(`SELECT COALESCE(mfa_last_timestep,0) FROM users WHERE id=1`).Scan(&got)
 	if got != 1200 {
 		t.Fatalf("timestep=%d after master update, want 1200", got)
+	}
+}
+
+// v3 信封化后从端拿到的 users/api_keys 载荷是清零后的 canonical
+// （sanitizeUsersForHash/sanitizeAPIKeysForHash），users 节重放必须回写节点
+// 本地的 last_login / last_used，否则从节点用户页与 API Key 页的“最后登录/
+// 最后使用”每次同步都被清空。
+func TestSyncService_applySnapshot_preservesLocalLastLoginAndAPIKeyLastUsed(t *testing.T) {
+	_, database := newClusterTestService(t)
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer caddyServer.Close()
+	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
+
+	const localLogin = "2026-01-02T03:04:05Z"
+	if _, err := database.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,last_login) VALUES (1,'u','h','admin',1,?)`, localLogin); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO api_keys (id,name,key_hash,key_prefix,created_by,last_used) VALUES (1,'k','h','p',1,?)`, localLogin); err != nil {
+		t.Fatal(err)
+	}
+	// 生产 canonical 中 last_login / last_used 恒为空（节点本地记账）。
+	snapshot := models.ClusterSnapshot{
+		Version: 2,
+		Users:   []models.ClusterUser{{ID: 1, Username: "u", PasswordHash: "h", Role: "admin", IsEnabled: true}},
+		APIKeys: []models.ClusterAPIKey{{ID: 1, Name: "k", KeyHash: "h", KeyPrefix: "p", CreatedBy: 1, IsEnabled: true}},
+	}
+	snapshot.SectionHashes = ComputeSnapshotSectionHashes(&snapshot)
+	if err := syncService.applySnapshot(context.Background(), snapshot); err != nil {
+		t.Fatal(err)
+	}
+	var gotLogin, gotKeyUsed sql.NullString
+	database.QueryRow(`SELECT last_login FROM users WHERE id=1`).Scan(&gotLogin)
+	database.QueryRow(`SELECT last_used FROM api_keys WHERE id=1`).Scan(&gotKeyUsed)
+	if !gotLogin.Valid || gotLogin.String != localLogin {
+		t.Fatalf("last_login=%v after replay, want %q preserved", gotLogin, localLogin)
+	}
+	if !gotKeyUsed.Valid || gotKeyUsed.String != localLogin {
+		t.Fatalf("last_used=%v after replay, want %q preserved", gotKeyUsed, localLogin)
 	}
 }

@@ -25,13 +25,13 @@ type syncSection struct {
 
 var syncSections = []syncSection{
 	// 系统数据排第一(2026-09-11 裁定):恒同步不可禁用,含用户/密钥/ACME
-	// 与全局配置(证书任务行与文件随 rules 开关,历史问题 A-N5)。
+	// 与全局配置(证书任务行与文件随 rules 开关,历史问题 历史修复)。
 	{Key: "users", NewLabel: "系统数据"},
 	{Key: "rules", NewLabel: "负载均衡规则"},
 	{Key: "security", NewLabel: "安全防护"},
 }
 
-// ComputeSnapshotSectionHashes derives a stable SHA-256 per section from the
+// ComputeSnapshotSectionHashes derives a stable 历史修复 per section from the
 // snapshot payload itself, so master and slave agree without extra DB reads.
 func ComputeSnapshotSectionHashes(s *models.ClusterSnapshot) map[string]string {
 	if s == nil {
@@ -49,8 +49,8 @@ func ComputeSnapshotSectionHashes(s *models.ClusterSnapshot) map[string]string {
 	return hashes
 }
 
-// sectionPayloadFor returns the JSON-marshaled payload a section hash is derived
-// from. Extracted so the full-snapshot hashing (ComputeSnapshotSectionHashes) and
+// sectionPayloadFor returns the 历史修复 payload a section hash is derived
+// from. Extracted so the 历史修复 hashing (ComputeSnapshotSectionHashes) and
 // the lightweight drift guard (driftGuardSectionHashes) share ONE canonical payload
 // definition — the hash parity invariant between the two depends on it.
 func sectionPayloadFor(key string, s *models.ClusterSnapshot) interface{} {
@@ -102,13 +102,14 @@ func sectionPayloadFor(key string, s *models.ClusterSnapshot) interface{} {
 }
 
 // sanitizeUsersForHash 返回用于 users 节哈希计算的用户副本：清零 last_login（登录时间）
-// 与 mfa_last_timestep（从节点本地登录推进）。清零仅为哈希稳定（避免从端本地登录
-// 触发漂移重拉）；apply 侧 users 节重放会以主端值覆盖从端显示（全量镜像语义，
-// 历史问题 历史问题）。mfa_failed_attempts/mfa_locked_until 死列已于 2026-09-10
-// 物理删除(db.go migrateDropDeadMFALockColumns),快照不再搬运该二值。
+// 与 mfa_last_timestep（从节点本地登录推进）。清零有两个作用：哈希稳定（避免从端
+// 本地登录触发漂移重拉），以及 v3 信封化后 canonical 即唯一下发载荷时避免把节点
+// 本地的登录时间镜像到对端。apply 侧重放会先以快照值落库，再由
+// restoreLocalLoginLockouts 回写本地 last_login/login_* 记账——从端
+// “最后登录”保持本节点事实。
 // login_failed_attempts / login_locked_until 是从节点本地登录锁定记账（登录
 // 端点写入，不进快照与节哈希）：users 节重放时由 replaceSnapshotTx 读出并在
-// 回插后回写保留（SC-4），重放不会解锁从节点被锁账户。
+// 回插后回写保留，重放不会解锁从节点被锁账户。
 // 注意：mfa_enabled/mfa_secret/mfa_recovery_codes 是主节点权威字段，不清零
 // （其漂移检测配合 历史问题 历史问题 的触发器补列，保证管理员重置等安全操作正常传播）。
 func sanitizeUsersForHash(users []models.ClusterUser) []models.ClusterUser {
@@ -159,9 +160,9 @@ func (sw SyncSwitches) sectionEnabled(key string) bool {
 	return true
 }
 
-// readSyncSwitches reads the node-local sync switches (defaults all-on for
-// missing columns/rows, e.g. pre-migration databases). ctx 由调用方直传
-// （LBS/LBH-2 历史：不再内部 context.Background()，保持本包 ctx 透传约定
+// readSyncSwitches reads the 历史修复 sync switches (defaults 历史修复 for
+// missing columns/rows, e.g. 历史修复 databases). ctx 由调用方直传
+// （LBS/历史修复 历史：不再内部 context.Background()，保持本包 ctx 透传约定
 // ——快照构建可随调用方取消）。
 func readSyncSwitches(ctx context.Context, dbh interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
@@ -336,8 +337,14 @@ func recordAppliedSectionHashes(dbh *sql.DB, snapshot models.ClusterSnapshot, sk
 			continue
 		}
 		if sk.unchanged[sec.Key] {
-			if _, err := dbh.Exec(`UPDATE cluster_applied_sections SET applied_version=?, applied_at=datetime('now') WHERE section=?`, snapshot.Version, sec.Key); err == nil {
-				continue
+			// UPDATE 命中 0 行（行被并发清理/Role flip 清表）
+			// 时 err==nil 仍 continue，会静默不记账 → 下一次 304 多一轮漂移重放。
+			// 只有真正更新到行才跳过落哈希。
+			result, err := dbh.Exec(`UPDATE cluster_applied_sections SET applied_version=?, applied_at=datetime('now') WHERE section=?`, snapshot.Version, sec.Key)
+			if err == nil {
+				if n, rowsErr := result.RowsAffected(); rowsErr == nil && n > 0 {
+					continue
+				}
 			}
 		}
 		// 漂移节已被强制重放、本地数据镜像主节点：落本地重建口径哈希作为
@@ -374,7 +381,7 @@ func recordAppliedSectionHashes(dbh *sql.DB, snapshot models.ClusterSnapshot, sk
 	}
 }
 
-// logSyncSwitchGuards surfaces cross-section drift: security-switch-off nodes
+// logSyncSwitchGuards surfaces 历史修复 drift: 历史修复 nodes
 // whose master references newer CRS/IP2Region files (file state follows the
 // security switch after the 3-category merge).
 func logSyncSwitchGuards(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *sectionSkips, switches SyncSwitches) {

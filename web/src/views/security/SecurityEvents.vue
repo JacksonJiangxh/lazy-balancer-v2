@@ -660,7 +660,23 @@ const ctxEvent = ref<SecurityEvent | null>(null)
 // 敏感头逐行显示状态（key = 小写头名）：默认掩码 ••••••，眼睛图标点击切换
 const ctxRevealed = ref<Set<string>>(new Set())
 
-const CTX_SENSITIVE_HEADERS = new Set(['cookie', 'authorization', 'set-cookie', 'proxy-authorization'])
+// 敏感头名单与后端 securityEventSensitiveHeaderNames（internal/handlers/security.go）
+// 同源：后端是权威（非管理员/只读 Key 的响应已在服务端掩码），此处只决定管理员
+// 查看时默认掩码哪些头。两边任何一侧新增都必须同步——契约测试按两处字面量对表。
+const CTX_SENSITIVE_HEADERS = new Set([
+  'cookie',
+  'authorization',
+  'set-cookie',
+  'proxy-authorization',
+  'x-api-key',
+  'x-auth-token',
+  'x-csrf-token',
+  'x-xsrf-token',
+  'x-forwarded-access-token',
+  'x-amz-security-token',
+  'x-goog-api-key',
+  'x-ms-authentication-token',
+])
 const CTX_TRUNCATED_SUFFIX = '\n...[TRUNCATED]'
 const CTX_UTF8_PREFIX = 'utf8:'
 const CTX_B64_TRUNCATED_PREFIX = 'base64-truncated:'

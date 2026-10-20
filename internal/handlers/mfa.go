@@ -38,7 +38,7 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 		WHERE ch.token=? AND ch.expires_at > datetime('now')`, req.MFAToken).
 		Scan(&userID, &passwordVersion, &challengeVersion, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &user.AuthProvider)
 	if err != nil {
-		// F-SYS-1（历史）：DB 故障与无效挑战分判——基础设施错误 500，
+		// 历史修复（历史）：DB 故障与无效挑战分判——基础设施错误 500，
 		// 不再伪装成 401（挑战无效不泄露具体原因的口径仅适用于 ErrNoRows）。
 		if !errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
@@ -57,7 +57,7 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 	}
 	user.ID = userID
 
-	// U04c-02：挑战绑定签发时的密码版本——签发后密码被改（自助/管理员重置），
+	// 挑战绑定签发时的密码版本——签发后密码被改（自助/管理员重置），
 	// 旧挑战即使持有有效第二因子也不得换取携带新 pwd_ver 的 JWT；顺带删除。
 	if challengeVersion != passwordVersion {
 		_, _ = db.DB.Exec("DELETE FROM mfa_challenges WHERE token=?", req.MFAToken)
@@ -69,7 +69,7 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 	// 登录失败锁定（2026-09 用户裁定）：MFA 验证码失败与密码失败同计一个
 	// 账户级计数（login_*），受「登录失败锁定」开关控制；锁定期间验证步直接
 	// 429，不再消耗挑战次数。
-	// U04c-04：锁定状态/开关读取失败必须 fail-closed（500，不消费挑战）——
+	// 锁定状态/开关读取失败必须 历史修复（500，不消费挑战）——
 	// 旧实现把 DB 错误静默当作「未锁定」。
 	var loginLockedUntil sql.NullString
 	if err := db.DB.QueryRow("SELECT login_locked_until FROM users WHERE id=?", userID).Scan(&loginLockedUntil); err != nil {
@@ -103,7 +103,7 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 		return
 	}
 	if !consumed {
-		// H-B1-11（历史）：并发登录落败/挑战达阈值作废后的重放是爆破与
+		// 历史修复（历史）：并发登录落败/挑战达阈值作废后的重放是爆破与
 		// 外部竞态的观测面——与同函数其余拒绝分支同密度留痕（此前这是唯一
 		// 无审计的拒绝分支，事后无法区分「客户端重试」与「重放已消费挑战」）。
 		services.RecordAuditLog(user.Username, "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "挑战已被使用"), c.ClientIP())
@@ -113,7 +113,7 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 	if ok, verr := services.MFAVerifyCode(userID, req.Code, time.Now()); !ok {
 		services.MFARestoreChallenge(req.MFAToken, userID)
 		if verr != nil {
-			// U04c-05：查询/写库故障不是「验证码错误」——不审计验证码错误、
+			// 查询/写库故障不是「验证码错误」——不审计验证码错误、
 			// 不累加挑战级/账户级失败计数（否则基础设施抖动会烧掉挑战额度
 			// 并把用户锁 10 分钟）。
 			services.RecordAuditLog(user.Username, "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "验证服务故障"), c.ClientIP())
@@ -156,7 +156,7 @@ func (h *Handlers) MFAStatus(c *gin.Context) {
 // （setup 响应明文返回新 secret + URI，攻击者配好自己的 authenticator 后
 // activate 即夺取 MFA；受害者未启用场景则被强开攻击者控制的 MFA = 永久
 // 登录 DoS）。未启用用户保持无门（首次绑定的可用性优先，会话本身已过密码
-// 认证）。U04c-10：登录后不再有密码输入要求（2026-09 用户裁定），原注释
+// 认证）。登录后不再有密码输入要求（2026-09 用户裁定），原注释
 // 的「密码+验证码双重确认」已过时。
 // rejectOIDCUserMFAOperation v2.3.0 用户裁定:OIDC 用户与本地 MFA 体系完全
 // 解耦——对其禁止本地 MFA 的启用/激活/禁用/重置(身份保证在 IdP 侧)。
@@ -168,7 +168,12 @@ func rejectOIDCUserMFAOperation(c *gin.Context, targetUserID int) bool {
 	}
 	var provider string
 	if err := db.DB.QueryRow("SELECT COALESCE(auth_provider,'local') FROM users WHERE id=?", uid).Scan(&provider); err != nil {
-		// 历史问题:身份来源不可判定 → 拒绝操作(500),不按非 OIDC 放行
+		// ErrNoRows=目标用户不存在(输入错误,404);真实读故障才是 500。
+		// 两者都必须拒绝操作——身份来源不可判定时不按非 OIDC 放行。
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "用户不存在"})
+			return true
+		}
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户身份失败"})
 		return true
 	}
@@ -179,11 +184,11 @@ func rejectOIDCUserMFAOperation(c *gin.Context, targetUserID int) bool {
 	return false
 }
 
-// mfaVerifyFailureResponse 收敛「登录后验码失败」的响应与审计口径（H-B1-02，
+// mfaVerifyFailureResponse 收敛「登录后验码失败」的响应与审计口径（历史修复，
 // 历史）：verr != nil = 查询/写库故障 → 500（不把底层 SQL 错误文本透给
 // 客户端、也不写「验证码错误」误导排障）；verr == nil = 真验证码错误 → 调用方
-// 既有审计文案 + 401。四处入口（重绑/禁用/step-up/管理员重置）共用，与 Login
-// 的 U04c-05 及 MFAActivate 已确立的三态口径一致。
+// 既有审计文案 + 401。四处入口（重绑/禁用/历史修复/管理员重置）共用，与 Login
+// 的 历史修复 及 MFAActivate 已确立的三态口径一致。
 func mfaVerifyFailureResponse(c *gin.Context, verr error, failureDetail string) {
 	if verr != nil {
 		recordAudit(c, "认证拒绝", "用户认证", services.FormatAuditDetail("验证服务故障", services.AuditResultPart("failure")))
@@ -192,6 +197,15 @@ func mfaVerifyFailureResponse(c *gin.Context, verr error, failureDetail string) 
 	}
 	recordAudit(c, "认证拒绝", "用户认证", failureDetail)
 	c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "验证码错误"})
+}
+
+// mfaInternalFailure 收敛 MFA 写端点的「基础设施故障」响应：固定
+// 文案 + 服务端日志留痕，不把底层 SQL 错误文本透给客户端——与
+// mfaVerifyFailureResponse / Login 已确立的三态口径一致；业务态错误由调用方
+// 按哨兵错误映射 400，不走此路径。
+func mfaInternalFailure(c *gin.Context, op string, err error) {
+	services.Logf("error", "MFA %s 失败: %v", op, err)
+	c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 操作失败，请稍后重试"})
 }
 
 func (h *Handlers) MFASetup(c *gin.Context) {
@@ -226,7 +240,7 @@ func (h *Handlers) MFASetup(c *gin.Context) {
 			}
 		}
 	}
-	// D5-S1：otpauth 账号位用用户名（services/mfa.go 约定 accountName 即用户名；
+	// otpauth 账号位用用户名（services/mfa.go 约定 accountName 即用户名；
 	// jwtAuth/apiKeyAuth 均注入 c username）——此前用数字 ID，所有用户的
 	// Authenticator 条目都显示「LazyBalancer:1」不可区分。空值回退数字 ID 保可用。
 	username := c.GetString("username")
@@ -238,7 +252,7 @@ func (h *Handlers) MFASetup(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "生成 MFA 密钥失败"})
 		return
 	}
-	// D5-S4：单条 UPDATE 原子落库（新密钥 + 失败计数清零同生共死）——此前
+	// 单条 UPDATE 原子落库（新密钥 + 失败计数清零同生共死）——此前
 	// 两段写（先清后设）在首成次败时已返回 200+secret 而 pending 为空，用户
 	// 扫码后 activate 必报「没有待激活的 MFA 密钥」，且两语句间存在瞬时空窗。
 	if _, err := db.DB.Exec("UPDATE users SET mfa_pending_secret=?, mfa_pending_fails=0 WHERE id=?", secret, userID); err != nil {
@@ -282,7 +296,11 @@ func (h *Handlers) MFAActivate(c *gin.Context) {
 	services.MFAClearPendingFailures(userID)
 	codes, err := services.MFAActivate(userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+		if errors.Is(err, services.ErrMFANoPendingSecret) || errors.Is(err, services.ErrMFASecretChanged) {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+			return
+		}
+		mfaInternalFailure(c, "激活", err)
 		return
 	}
 	recordAudit(c, "启用", "用户认证", services.FormatAuditDetail("MFA", services.AuditResultPart("success")))
@@ -307,24 +325,24 @@ func (h *Handlers) MFADisable(c *gin.Context) {
 		return
 	}
 	// 历史问题(历史,历史问题,历史问题 同形对齐):守卫验码放行路径(标记在)跳过
-	// 本层验码——守卫/verify-step 已消费 TOTP 时间片,前端 428 重试带同码时
+	// 本层验码——守卫/历史修复 已消费 TOTP 时间片,前端 428 重试带同码时
 	// 同片重放拒绝使禁用流程结构性必 401;机器身份/守卫关(无标记)本层验码保持。
 	if !mfaStepUpVerifiedInContext(c) {
 		if ok, verr := services.MFAVerifyTOTPCode(userID, req.Code, time.Now()); !ok {
-			// B5 I-A：高敏动作的失败尝试与成功同等可审计（对齐 MFAResetByAdmin 前置验码失败留痕）。
+			// B5 高敏动作的失败尝试与成功同等可审计（对齐 MFAResetByAdmin 前置验码失败留痕）。
 			mfaVerifyFailureResponse(c, verr, services.FormatAuditDetail("禁用 MFA 前验证失败", services.AuditResultPart("failure")))
 			return
 		}
 	}
 	if err := services.MFAResetForUser(userID); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+		mfaInternalFailure(c, "禁用", err)
 		return
 	}
 	recordAudit(c, "禁用", "用户认证", services.FormatAuditDetail("MFA", services.AuditResultPart("success")))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "MFA 已禁用"})
 }
 
-// MFARecoveryCodes POST /auth/mfa/recovery-codes — 重生成恢复码（2026-09 用户
+// MFARecoveryCodes POST /auth/mfa/历史修复 — 重生成恢复码（2026-09 用户
 // 裁定：登录后不再有密码输入要求，JWT 会话即确认；会话安全为信任边界）。
 // U7a-历史问题（历史）：补 OIDC 门——五个 MFA 写入口仅此一处缺席，与
 // setup/activate/disable 同为自助端点，targetUserID=0（操作自己，从 JWT 取）。
@@ -350,16 +368,16 @@ func (h *Handlers) MFARecoveryCodes(c *gin.Context) {
 	// 原地重写（旧码全部作废）
 	codes, err := services.MFARegenerateRecoveryCodes(userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+		mfaInternalFailure(c, "重生成恢复码", err)
 		return
 	}
-	// S-8（2026-09-05 审计裁定）：恢复码重生成是纯会话门下「旧码全作废+明文
+	// 历史修复（2026-09-05 审计裁定）：恢复码重生成是纯会话门下「旧码全作废+明文
 	// 下发 10 个登录可用凭证」的高敏动作——成功留痕，与禁用/重置 MFA 同密度。
 	recordAudit(c, "生成", "恢复码", services.FormatAuditDetail("MFA", "旧恢复码全部作废", services.AuditResultPart("success")))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "恢复码已重新生成（旧码全部作废）", Data: gin.H{"recovery_codes": codes}})
 }
 
-// MFAVerifyStep POST /auth/mfa/verify-step — step-up：验证码 → 新 JWT（mfa_ts 刷新）。
+// MFAVerifyStep POST /auth/mfa/历史修复 — 验证码 → 新 JWT（mfa_ts 刷新）。
 func (h *Handlers) MFAVerifyStep(c *gin.Context) {
 	if !guardAuthJSONBody(c) {
 		return
@@ -381,9 +399,9 @@ func (h *Handlers) MFAVerifyStep(c *gin.Context) {
 	var passwordVersion int64
 	// B3-历史问题（历史）：重读用户的 DB 错误不得并入 401「用户不可用」
 	// ——基础设施故障 500；行缺失/禁用保持 401（JWT 仍有效但账号已不可用）。
-	// H-B1-03（历史）：重读列必须含 auth_provider（COALESCE 与登录路径同
-	// 口径）——漏列会让所有 step-up 响应的 auth_provider 变成 ""，且存量
-	// OIDC 行（mfa_enabled=1）在 verify-step 成功后丢掉 auth_method=oidc 声明
+	// 历史修复（历史）：重读列必须含 auth_provider（COALESCE 与登录路径同
+	// 口径）——漏列会让所有 历史修复 响应的 auth_provider 变成 ""，且存量
+	// OIDC 行（mfa_enabled=1）在 历史修复 成功后丢掉 auth_method=oidc 声明
 	// （middleware 的 MFA 门短路与集群票据直通依赖该声明）。
 	if err := db.DB.QueryRow(`SELECT id, username, role, display_name, is_enabled, created_at, last_login, password_version, COALESCE(auth_provider,'local') FROM users WHERE id=?`, userID).
 		Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &passwordVersion, &user.AuthProvider); err != nil {
@@ -437,8 +455,8 @@ func (h *Handlers) MFAResetByAdmin(c *gin.Context) {
 	// MFADisable 的双重确认同语义；无密码项：admin 路由已过 JWT + 用户管理
 	// 确认弹框承担意图确认）。
 	// 历史问题（用户裁决）：写操作守卫（mfaStepUpGuard）开启时第一层豁免——守卫已对
-	// 本写操作完成验码（60 秒窗内静默放行或 428→verify-step 刷新 mfa_ts），再验
-	// 一次会在 TOTP 重放保护下同片互斥：verify-step 消费时间片后第一层无码可用，
+	// 本写操作完成验码（60 秒窗内静默放行或 428→历史修复 刷新 mfa_ts），再验
+	// 一次会在 TOTP 重放保护下同片互斥：历史修复 消费时间片后第一层无码可用，
 	// 必 401（验证码错误→踢出登录→连续失败触发 10 分钟锁定）。
 	// mfaStepUpVerifiedInContext:守卫(开启态)验码放行路径的标记优先;开关
 	// 关闭或机器身份时守卫未运行,无标记,本层验码保持(S历史问题:消除
@@ -470,7 +488,7 @@ func (h *Handlers) MFAResetByAdmin(c *gin.Context) {
 		return
 	}
 	if err := services.MFAResetForUser(id); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+		mfaInternalFailure(c, "管理员重置", err)
 		return
 	}
 	// 历史问题：detail 同时写目标用户与操作者（username 列即操作者；本人重置时两者相同，

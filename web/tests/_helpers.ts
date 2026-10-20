@@ -1,11 +1,11 @@
-// 测试侧源码读取/限段 helper 单源（审计 87 WEBT-06）：
-// 5 个 SFC 源码钉 spec 此前各自复制 source()/section()/sectionBetween()，且实现
-// 已漂移（audit85Rules 无 end>start 检查）——缺 marker 时 indexOf 返回 -1，切片
-// 变空、断言空转（假绿）。此处统一实现并把两个边界检查都做成硬失败。
+// 测试侧 helper 单源：源码读取/限段 + 模块解析钩子（`@/` 别名与重型依赖替身）。
+// SFC 源码钉 spec 共用 source()/section()，不复刻各自的切片实现——缺 marker 时
+// indexOf 返回 -1，切片会变空或倒置、断言空转（假绿）。此处把两个边界检查都做成硬失败。
 //
 // 非 spec 文件（不以 .spec.ts 结尾），node --test tests/*.spec.ts 不会把它当用例。
 
 import { readFileSync } from 'node:fs'
+import { registerHooks } from 'node:module'
 
 /** 读取相对 `web/` 的源文件（如 `'src/views/Rules.vue'`）。 */
 export const source = (relative: string): string => readFileSync(new URL(`../${relative}`, import.meta.url), 'utf8')
@@ -20,4 +20,25 @@ export const section = (text: string, startMarker: string, endMarker: string): s
   const end = text.indexOf(endMarker, start + startMarker.length)
   if (end <= start) throw new Error(`missing end marker: ${endMarker} after ${startMarker}`)
   return text.slice(start, end)
+}
+
+const srcRoot = new URL('../src/', import.meta.url)
+
+/**
+ * 让 `node --test` 直接加载 src 模块：解析 `@/…` 别名，并把 replacements 里的
+ * 规格符替换为给定模块（测试替身 / 失败模块）。字节级依赖（element-plus 的
+ * CSS 导入、1.9MB 省界表）不进测试进程。
+ *
+ * 必须在 `await import(...)` 之前调用——静态 import 先于本模块代码执行。
+ * replacement 为函数时按次求值（可表达「首次失败、重试成功」）。
+ */
+export const registerModuleHooks = (replacements: Record<string, string | (() => string)> = {}): void => {
+  registerHooks({
+    resolve(specifier, context, nextResolve) {
+      const replacement = replacements[specifier]
+      if (replacement) return { url: typeof replacement === 'function' ? replacement() : replacement, shortCircuit: true }
+      if (specifier.startsWith('@/')) return nextResolve(new URL(`${specifier.slice(2)}.ts`, srcRoot).href, context)
+      return nextResolve(specifier, context)
+    },
+  })
 }

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +18,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 威胁大屏（threat-screen）端点钉测：聚合形状（国家计数 map/总量/拦截率/
+// 威胁大屏端点钉测：聚合形状（国家计数 map/总量/拦截率/
 // Top5）与 feed 游标（since_id 递增无重无漏）。两端点均为只读、不挂
 // requireMaster（从节点可读，与大屏展示场景一致）。
 
@@ -44,9 +43,15 @@ func newThreatMetricsServer(t *testing.T) *httptest.Server {
 
 func seedThreatScreenEvent(t *testing.T, eventTime, clientIP, ruleTriggered, ruleMsg, action string) {
 	t.Helper()
+	seedThreatScreenEventNamed(t, eventTime, clientIP, ruleTriggered, ruleMsg, action, "测试规则")
+}
+
+// seedThreatScreenEventNamed 带规则名快照的事件种子（rollup 分组键覆盖用）。
+func seedThreatScreenEventNamed(t *testing.T, eventTime, clientIP, ruleTriggered, ruleMsg, action, ruleName string) {
+	t.Helper()
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, rule_name)
-		VALUES (?, ?, 'GET', '/a', 'crs', ?, ?, ?, '测试规则')`,
-		eventTime, clientIP, ruleTriggered, ruleMsg, action); err != nil {
+		VALUES (?, ?, 'GET', '/a', 'crs', ?, ?, ?, ?)`,
+		eventTime, clientIP, ruleTriggered, ruleMsg, action, ruleName); err != nil {
 		t.Fatalf("seed event: %v", err)
 	}
 }
@@ -75,7 +80,7 @@ type threatScreenPayload struct {
 		HourlyHist         []models.SecurityAttackType `json:"hourly_hist"`
 		AttackTypeShare    []models.SecurityAttackType `json:"attack_type_share"`
 		RecentRate         float64                     `json:"recent_rate"`
-		// v2.4.x 大屏加固：logged=total-blocked（夹 >=0）、限流可用性位、
+		// v2.4.x 大屏加固：logged=历史修复（夹 >=0）、限流可用性位、
 		// 被攻击目标 Top3（name/domain/value）
 		LoggedEvents       int  `json:"logged_events"`
 		RatelimitAvailable bool `json:"ratelimit_available"`
@@ -836,29 +841,50 @@ func TestAttackFamily_sixDigitCustomIDs(t *testing.T) {
 	}
 }
 
-func TestThreatFixMinute_groupByUsesExpressions(t *testing.T) {
-	raw, err := os.ReadFile("security_threat_screen.go")
+// 历史修复（源码文本断言退役）：rollup 固化必须按归一后的规则名表达式分组——
+// 可观察契约：同 IP 同规则 ID 但 rule_name 不同（跨规则改名快照）必须落成两条
+// rollup 行；若分组退化为 select 列序号/子集，聚合会把不同规则名并成一行。
+func TestThreatFixMinute_groupsByRuleIdentityColumns(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	base := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	eventTime := base.Format("2006-01-02 15:04:05")
+	// 同 IP / 同分钟 / 同空规则 ID，但 rule_msg 不同 → 分类族不同。若分组键
+	// 退化为 select 列序号或漏掉 rule_msg/归一规则名，两行会被并成一组，
+	// 只按首行消息分类（少一个族）。
+	seedThreatScreenEventNamed(t, eventTime, "203.0.113.7", "", "IP 黑名单拦截", "blocked", "测试规则")
+	seedThreatScreenEventNamed(t, eventTime, "203.0.113.7", "", "GeoIP 区域拦截", "blocked", "测试规则")
+
+	tx, err := db.MetricsDB.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := string(raw)
-	start := strings.Index(source, "func threatFixMinuteWithMode(")
-	if start < 0 {
-		t.Fatal("threatFixMinuteWithMode not found")
+	if err := threatFixMinuteWithMode(tx, base.Truncate(time.Minute), false); err != nil {
+		t.Fatal(err)
 	}
-	body := source[start:]
-	if end := strings.Index(body, "\nfunc threatLocationParts("); end > 0 {
-		body = body[:end]
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(body, "GROUP BY client_ip, 2,") {
-		t.Fatal("rollup GROUP BY must not depend on select-list ordinals")
+
+	rows, err := db.MetricsDB.Query(`SELECT family, SUM(count) FROM security_event_rollup WHERE minute=? GROUP BY family ORDER BY family`, base.Format("2006-01-02 15:04"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(body, "GROUP BY client_ip, COALESCE(NULLIF(rule_name,''), COALESCE(rule_triggered,''))") {
-		t.Fatal("rollup GROUP BY must repeat the normalized rule-name expression")
+	defer rows.Close()
+	got := map[string]int{}
+	for rows.Next() {
+		var family string
+		var count int
+		if err := rows.Scan(&family, &count); err != nil {
+			t.Fatal(err)
+		}
+		got[family] = count
+	}
+	if len(got) != 2 || got["IP 访问控制"] != 1 || got["地域拦截"] != 1 {
+		t.Fatalf("rollup families=%v, want {IP 访问控制:1, 地域拦截:1}（分组键必须含归一规则名/消息维度）", got)
 	}
 }
 
-// ---- 历史 A 域：RG-TS-ROLLUP-WATERMARK / RG-TS-ERROR-PATH / RG-FEED-CURSOR ----
+// ---- 历史 A 域：历史修复 / 历史修复 / 历史修复 ----
 
 func installThreatClock(t *testing.T, now time.Time) {
 	t.Helper()
@@ -1326,7 +1352,7 @@ func TestGetSecurityThreatScreen_topTargetsCached(t *testing.T) {
 		return payload.Data.TopTargets[0].Value
 	}
 
-	// When/Then: 首查 value=1；缓存窗口（5min TTL）内再落 2 条事件后第二查
+	// When/Then: 首查 value=1；缓存窗口（1min TTL）内再落 2 条事件后第二查
 	// 仍返回 1（进程内缓存命中——大屏 30s 轮询不再每轮扫原始表）
 	if got := get(); got != 1 {
 		t.Fatalf("first value=%d, want 1", got)
@@ -1590,7 +1616,7 @@ func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
 	if total != 2 {
 		t.Fatalf("hourly 总计=%d, want 2", total)
 	}
-	// 72h 日桶是滚动 24h 窗口（起点 now-72h），不是自然日；按事件在窗口内
+	// 72h 日桶是滚动 24h 窗口（起点 历史修复），不是自然日；按事件在窗口内
 	// 的偏移映射到桶，避免跨午夜/自然日假设造成的假失败。
 	bucketFor := func(at time.Time) string {
 		shifted := at.UTC().Add(time.Duration(offset) * time.Second)
@@ -1640,10 +1666,11 @@ func TestThreatRollup_ingestBackfillRewindsCoverage(t *testing.T) {
 	// 目标维度就绪与归属地代际已就绪（否则 emptyCoverage 会全窗重固，掩盖前提）。
 	lastComplete := base.Add(-time.Minute).Truncate(time.Minute)
 	for key, value := range map[string]string{
-		threatRollupCoveredFromKey:     base.Add(-24 * time.Hour).Format("2006-01-02 15:04"),
-		threatRollupWatermarkKey:       lastComplete.Add(-time.Minute).Format("2006-01-02 15:04"),
-		threatRollupTargetReadyKey:     lastComplete.Format("2006-01-02 15:04"),
-		threatRollupGeoIPGenerationKey: fmt.Sprintf("%d", services.GeoIPDataGeneration()),
+		threatRollupCoveredFromKey:       base.Add(-24 * time.Hour).Format("2006-01-02 15:04"),
+		threatRollupWatermarkKey:         lastComplete.Add(-time.Minute).Format("2006-01-02 15:04"),
+		threatRollupTargetReadyKey:       lastComplete.Format("2006-01-02 15:04"),
+		threatRollupGeoIPGenerationKey:   fmt.Sprintf("%d", services.GeoIPDataGeneration()),
+		threatRollupClassifierVersionKey: threatRollupClassifierVersion,
 	} {
 		if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
 			t.Fatal(err)
@@ -1741,10 +1768,11 @@ func seedThreatRollupCoveredWindow(t *testing.T, base time.Time, hours int) time
 	t.Helper()
 	lastComplete := base.Add(-time.Minute).Truncate(time.Minute)
 	for key, value := range map[string]string{
-		threatRollupCoveredFromKey:     base.Add(-time.Duration(hours) * time.Hour).Format("2006-01-02 15:04"),
-		threatRollupWatermarkKey:       lastComplete.Add(-time.Minute).Format("2006-01-02 15:04"),
-		threatRollupTargetReadyKey:     lastComplete.Format("2006-01-02 15:04"),
-		threatRollupGeoIPGenerationKey: fmt.Sprintf("%d", services.GeoIPDataGeneration()),
+		threatRollupCoveredFromKey:       base.Add(-time.Duration(hours) * time.Hour).Format("2006-01-02 15:04"),
+		threatRollupWatermarkKey:         lastComplete.Add(-time.Minute).Format("2006-01-02 15:04"),
+		threatRollupTargetReadyKey:       lastComplete.Format("2006-01-02 15:04"),
+		threatRollupGeoIPGenerationKey:   fmt.Sprintf("%d", services.GeoIPDataGeneration()),
+		threatRollupClassifierVersionKey: threatRollupClassifierVersion,
 	} {
 		if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
 			t.Fatal(err)
@@ -1871,5 +1899,61 @@ func TestThreatFixMinute_prunedRowsAndLateEventsAreAdditive(t *testing.T) {
 	}
 	if total != 3 || len(families) != 3 {
 		t.Fatalf("rollup after prune+late=(total %d, families %v), want 3 distinct families", total, families)
+	}
+}
+
+// 分类器口径代际不一致必须触发窗口重固——rollup 固化的 family 是
+// 固化时的分类结果，分类逻辑跨版本调整后旧分钟不会重算，大屏与总览口径分裂。
+func TestThreatRollup_classifierGenerationMismatchRebuilds(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	base := time.Date(2026, 10, 18, 12, 0, 30, 0, time.UTC)
+	installThreatClock(t, base)
+	threatRollupRequestedHours.Store(0)
+	t.Cleanup(func() { threatRollupRequestedHours.Store(0) })
+	seedThreatRollupCoveredWindow(t, base, 24*7)
+
+	// 一条已固化分钟：先正确固化成「IP 访问控制」，再伪造成旧口径分类结果
+	//（2h 前：单轮重固（批数上限）覆盖范围内，对齐既有 warmer 测试口径）
+	eventTime := base.Add(-2 * time.Hour)
+	minute := eventTime.Truncate(time.Minute)
+	seedThreatScreenEventNamed(t, eventTime.Format("2006-01-02 15:04:05"), "203.0.113.7", "2", "IP 黑名单拦截", "blocked", "测试规则")
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_event_rollup (minute, country, province, family, rule, action, count) VALUES (?, '', '', '旧口径分类', '2', 'blocked', 1)`,
+		minute.Format("2006-01-02 15:04")); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟版本升级：分类器代际键缺失
+	if _, err := db.MetricsDB.Exec(`DELETE FROM metrics_state WHERE key=?`, threatRollupClassifierVersionKey); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureThreatRollup(24 * 7); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.MetricsDB.Query(`SELECT family FROM security_event_rollup WHERE minute=?`, minute.Format("2006-01-02 15:04"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	families := map[string]bool{}
+	for rows.Next() {
+		var family string
+		if err := rows.Scan(&family); err != nil {
+			t.Fatal(err)
+		}
+		families[family] = true
+	}
+	if families["旧口径分类"] {
+		t.Fatal("代际不一致时旧分钟必须按空覆盖重固（旧分类结果不得残留）")
+	}
+	if !families["IP 访问控制"] {
+		t.Fatalf("families=%v, want 含重算后的 IP 访问控制", families)
+	}
+	var version string
+	if err := db.MetricsDB.QueryRow(`SELECT value FROM metrics_state WHERE key=?`, threatRollupClassifierVersionKey).Scan(&version); err != nil {
+		t.Fatalf("分类器代际必须与固化结果同事务落库: %v", err)
+	}
+	if version != threatRollupClassifierVersion {
+		t.Fatalf("classifier version=%q, want %q", version, threatRollupClassifierVersion)
 	}
 }

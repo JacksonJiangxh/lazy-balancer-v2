@@ -141,6 +141,21 @@ export function drillCommitAllowed(seq: number, currentSeq: number, disposed: bo
   return seq === currentSeq && !disposed
 }
 
+/**
+ * 下钻态点击手势意图（两引擎单源）：下钻中命中国=当前下钻国 → 'stay'（保持），
+ * 命中他国 → 'switch'，空白 → 'world'（返回世界）；总览态命中 → 'drill'，
+ * 空白 → 'none'。
+ *
+ * 历史：地图引擎 onClick 缺 'stay' 分支——下钻后单击国境内任意处都会重新下钻
+ * （清 hover + 全量重建省点阵 + 把用户拖动后的取景拉回国土中心），与地球引擎
+ * 「本省保持」相反。手势语义必须在共享层单源，避免一侧补了一侧漏。
+ */
+export function drillClickIntent(hit: string | null, drilled: string | null): 'none' | 'drill' | 'stay' | 'switch' | 'world' {
+  if (!drilled) return hit ? 'drill' : 'none'
+  if (!hit) return 'world'
+  return hit === drilled ? 'stay' : 'switch'
+}
+
 /** 国家计数归一+合并：台湾计数并入中国，避免 hover 中国时台湾计数缺失。 */
 export function aggregateCountryCounts(entries: readonly { name: string; count: number }[]): Map<string, number> {
   const out = new Map<string, number>()

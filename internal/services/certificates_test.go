@@ -23,7 +23,7 @@ import (
 // resetCertificateServiceForTest 测试后复位 certificateService 全局单例——
 // NewCertificateService 会覆写该全局，不复位则旧 service（含其定时器与闭包
 // 通道）泄漏进后续测试，包级函数（scheduleCertificateDeploymentRetry 等）会
-// 作用在死测试的对象上（U4b-02）。
+// 作用在死测试的对象上。
 func resetCertificateServiceForTest(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
@@ -34,13 +34,13 @@ func resetCertificateServiceForTest(t *testing.T) {
 }
 
 func TestCanonicalACMEDomains_rejectsTrailingDot(t *testing.T) {
-	// The audit's trailing-dot example is not a valid alternate canonical form:
-	// the single-source helper rejects it just like the SQL revival gate does.
+	// The audit's 历史修复 example is not a valid alternate canonical form:
+	// the 历史修复 helper rejects it just like the SQL revival gate does.
 	if _, err := CanonicalACMEDomains("example.com."); err == nil {
 		t.Fatal("trailing-dot ACME domain must remain invalid")
 	}
 	// Regression: case, surrounding whitespace, and root/www ordering still
-	// canonicalize through the single-source helper.
+	// canonicalize through the 历史修复 helper.
 	got, err := CanonicalACMEDomains(" WWW.Example.COM , example.com ")
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +148,7 @@ func TestCreateOrRequeueCertJob_requeues_disabled_job_for_reenabled_rule(t *test
 
 func TestCreateOrRequeueCertJob_requeues_downloaded_job(t *testing.T) {
 	// Given：已部署（downloaded）任务——用户再次触发签发必须重新排队，
-	// 不能静默空转（历史修复 A-M1）
+	// 不能静默空转（历史修复 历史修复）
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
 		VALUES ('lb_downloaded','downloaded','downloaded.example','http',8443,1,1,'acme_dns');
@@ -284,7 +284,7 @@ func TestRequeueNonTerminalCertJobs_schedules_downloaded_deployment(t *testing.T
 }
 
 func TestRequeueNonTerminalCertJobs_skips_downloaded_job_missing_cert_material_when_paused(t *testing.T) {
-	// 历史问题 A-F1 起恢复排队走 EnqueueIfActive：暂停的队列管理器在 transition 之前
+	// 历史问题 历史修复 起恢复排队走 EnqueueIfActive：暂停的队列管理器在 transition 之前
 	// 即拒绝（与 历史问题 PauseAndDrain 门控同语义），任务保持原状态等待下次恢复，
 	// 不写库、不入队、不报错。
 	// Given
@@ -319,7 +319,7 @@ func TestRequeueNonTerminalCertJobs_skips_downloaded_job_missing_cert_material_w
 	}
 }
 
-// 历史问题 A-F1：requeueNonTerminalCertJobs 必须经 EnqueueIfActive 在途守卫——退役队列
+// 历史问题 requeueNonTerminalCertJobs 必须经 EnqueueIfActive 在途守卫——退役队列
 // 中的滞行执行（zombie）仍持有 jobID 时，恢复流程不得 transition+Enqueue，否则
 // 同 jobID 双执行（zombie 晚退 requeueCanceledJob 打回新执行状态，历史问题 同型）。
 func TestRequeueNonTerminalCertJobs_skips_job_still_active_in_retired_queue(t *testing.T) {
@@ -518,7 +518,7 @@ func TestCertificateService_cancelDeploymentRetry_waits_for_running_callback(t *
 }
 
 func TestCertificateService_cancelDeploymentRetry_boundedWaitOnStuckCallback(t *testing.T) {
-	// 历史问题 发现3：回调链条调到非 context-aware 的 caddyReloader，Caddy admin 异常
+	// 历史问题 发现3：回调链条调到非 历史修复 的 caddyReloader，Caddy admin 异常
 	// 挂起时 HTTP 调用方必须能在 cancelWaitTimeout 内返回，不能永久阻塞。
 	service := NewCertificateService()
 	resetCertificateServiceForTest(t)
@@ -645,7 +645,7 @@ func TestSetActiveCertificateService_preservesStoppedTasks(t *testing.T) {
 		te.StopLoop(id)
 	}
 
-	// When：cert-issuance 就绪触发 active 注入。
+	// When：历史修复 就绪触发 active 注入。
 	SetActiveCertificateService(NewCertificateService())
 
 	// Then：只能重置已开启任务的节拍，不得重新打开用户停止的调度或执行 Run。
@@ -812,7 +812,7 @@ func TestCertificateService_renewExpiringCertificates_usesRenewalFlowForIssuedMi
 	<-done
 }
 
-// CERT-A（历史）：已达最大重试的 issued/failed 任务每轮续签扫描都会被
+// 历史修复（历史）：已达最大重试的 issued/failed 任务每轮续签扫描都会被
 // 重复选出并入摘要后静默 continue——至少要留 warn 痕，操作者可见「仅手动
 // 重试可达」（waiting_ca 有终局转换+审计，同条件 issued/failed 零痕迹）。
 func TestCertificateService_renewExpiringCertificates_logs_capped_skip(t *testing.T) {
@@ -857,7 +857,7 @@ func TestCertificateService_renewExpiringCertificates_logs_capped_skip(t *testin
 	}
 }
 
-// CERT71-3（历史）：续期摘要分档——已达上限任务每轮仍被选出（CERT-A
+// 历史修复（历史）：续期摘要分档——已达上限任务每轮仍被选出（历史修复
 // warn 形态，自动重试不可达），摘要不得把它们无声计入「待重试」；须标注
 // 「其中 M 个已达重试上限，仅手动重签可达」。
 func TestCertificateService_renewExpiringCertificates_summaryTiersCappedJobs(t *testing.T) {
@@ -898,7 +898,7 @@ func TestCertificateService_renewExpiringCertificates_summaryTiersCappedJobs(t *
 	}
 }
 
-// CERT71-3 反向形状：全部未达上限时保持原摘要文案（不追加空分档括注）。
+// 历史修复 反向形状：全部未达上限时保持原摘要文案（不追加空分档括注）。
 func TestCertificateService_renewExpiringCertificates_summaryKeepsPlainFormWithoutCappedJobs(t *testing.T) {
 	_, database := newClusterTestService(t)
 	ResetCAQueueManagerForTest()
@@ -972,7 +972,7 @@ func TestCertificateService_waitingCALogsScanAndIterationFailures(t *testing.T) 
 }
 
 func TestCertificateService_requeueWaitingCAJobs_disables_orphaned_waiting_job(t *testing.T) {
-	// Given：waiting_ca 任务的规则已不存在（无 lb_rules 行），A-M1 守卫应按孤儿
+	// Given：waiting_ca 任务的规则已不存在（无 lb_rules 行），历史修复 守卫应按孤儿
 	// 转 disabled 而不是重排签发（与 6h 孤儿 sweep 同口径）。
 	_, database := newClusterTestService(t)
 	ResetCAQueueManagerForTest()
@@ -1004,7 +1004,7 @@ func TestCertificateService_requeueWaitingCAJobs_pause_after_scan_start_leaves_j
 	GetCAQueueManager().Start()
 	manager := GetCAQueueManager()
 	t.Cleanup(ResetCAQueueManagerForTest)
-	// 历史修复 A-M1 起 requeue 守卫要求任务仍被启用中的 acme_dns TLS 规则引用，
+	// 历史修复 历史修复 起 requeue 守卫要求任务仍被启用中的 acme_dns TLS 规则引用，
 	// 否则按孤儿转 disabled，不会进入 EnqueueIfActive 钩子路径。
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES ('lb_pause_scan','lb_pause_scan','example.com','http',8080,1,1,'acme_dns')`); err != nil {
 		t.Fatalf("seed rule: %v", err)
@@ -1138,7 +1138,7 @@ func TestRequeueNonTerminalCertJobs_continues_past_disable_transition_conflict(t
 // N+12 G1：同上——"检测到已有有效证书"转 issued 的恢复转换（第二处 return
 // 站点）同样不得因单任务 CAS 冲突中止循环。
 func TestRequeueNonTerminalCertJobs_continues_past_existing_cert_transition_conflict(t *testing.T) {
-	// Given：job 2 在途（creating_order）且携带 90 天有效证书（valid-cert 恢复
+	// Given：job 2 在途（creating_order）且携带 90 天有效证书（历史修复 恢复
 	// 优化适用）；job 1 的部署重试回调先把它并发置为 failed，job 2 转 issued
 	// 即 CAS 冲突；job 3 为冲突后的对照任务。
 	_, database := newClusterTestService(t)
@@ -1425,7 +1425,7 @@ func TestCertJobsSnapshot_restore_replaces_upserted_and_new_rows(t *testing.T) {
 }
 
 func TestRestoreCertJobs_skips_when_rule_deleted(t *testing.T) {
-	// 历史问题 A-F1：规则在补偿退避窗口内被并发删除时，restore 必须按补偿完成收尾
+	// 历史问题 规则在补偿退避窗口内被并发删除时，restore 必须按补偿完成收尾
 	// （返回 nil），且不得写入幽灵 cert_jobs 行（cert_jobs 对 lb_rules 无外键，
 	// 无条件 DELETE+INSERT 会把旧快照行插给已删除的规则）。
 	// Given：快照后规则与其任务被另一路径整体删除
@@ -1465,7 +1465,7 @@ func TestRestoreCertJobs_skips_when_rule_deleted(t *testing.T) {
 }
 
 func TestRestoreCertJobs_skips_when_rule_recreated_with_different_domain(t *testing.T) {
-	// 历史问题 A-F2：补偿退避窗口内同一 caddy_id 被重建为新域名（新化身）时，
+	// 历史问题 补偿退避窗口内同一 caddy_id 被重建为新域名（新化身）时，
 	// restore 不得摧毁新化身的 cert_jobs——其域名与快照时代不一致，必须跳过
 	// DELETE+INSERT 并按补偿完成收尾（返回 nil，调用方释放租约）。
 	// Given：快照时代规则域名为 old.example.com；删除后以同 caddy_id 重建为
@@ -1517,7 +1517,7 @@ func TestRestoreCertJobs_skips_when_rule_recreated_with_different_domain(t *test
 	}
 }
 
-// 历史问题 A-F1 放弃语义的直接覆盖（历史问题 A-N3 + 历史问题 S-4）：requeueCertJobsSnapshot 的
+// 历史问题 历史修复 放弃语义的直接覆盖（历史问题 历史修复 + 历史问题 历史修复）：requeueCertJobsSnapshot 的
 // 四个跳过分支——规则行 ErrNoRows、规则 disabled/非 acme_dns、快照任务域名与规则
 // 当前域名时代不符、规则域名不可规范化（导入产生的非法 ACME 域）——均必须按成功
 // 收尾（返回 nil）且零入队。任一退化为返回错误都会
@@ -1622,7 +1622,7 @@ func TestRequeueCertJobsSnapshot_giveUpSemantics(t *testing.T) {
 		// Given：导入产生的非法 ACME 域规则（3 域——导入校验不验 ACME 域合法性，
 		// 仅保存侧校验）。该规则本就无法重排队（createOrRequeue 同样拒绝非法域），
 		// canonicalize 失败必须与 ErrNoRows/禁用分支同为放弃语义——返回错误会把
-		// 补偿拖入永久退避循环且租约永不释放（历史问题 S-4）。
+		// 补偿拖入永久退避循环且租约永不释放（历史问题 历史修复）。
 		_, database := newClusterTestService(t)
 		const ruleID = "lb_requeue_badacme"
 		snapshot := seedRuleAndJob(t, database, ruleID, "a.example.com,b.example.com,c.example.com", 1)
@@ -1636,7 +1636,7 @@ func TestRequeueCertJobsSnapshot_giveUpSemantics(t *testing.T) {
 	})
 }
 
-// N+8 B5-S1：补偿重排队路径必须在入队前把在途快照任务落库为 'queued'。快照保留
+// N+8 补偿重排队路径必须在入队前把在途快照任务落库为 'queued'。快照保留
 // 快照时刻的在途状态（waiting_ca/creating_order/validating 等），不归一化直接入队
 // 会让 provider 失效 drain 的 queuedJobStillExists 复核因 status≠'queued' 跳过
 // failJob，任务滞留队列外直到重启。
@@ -1768,7 +1768,7 @@ func TestRequeueNonTerminalCertJobs_does_not_resurrect_failed_job(t *testing.T) 
 	// Given：failed 任务虽持有之前签发的有效证书，也不得在启动恢复时被复活；
 	// queued 任务是用户显式触发的重签请求（RetryCertJob 全量重签语义、不清
 	// cert_pem/key_pem），旧有效证书不得吞掉请求——保持 queued 重新排队，
-	// 不得迁移 issued（I-D）。
+	// 不得迁移 issued。
 	_, database := newClusterTestService(t)
 	failedCert, failedKey := certificatePairForDomains(t, time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour), "failed.example.com")
 	queuedCert, queuedKey := certificatePairForDomains(t, time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour), "queued.example.com")
@@ -1844,7 +1844,7 @@ func TestRequeueNonTerminalCertJobs_does_not_resurrect_failed_job(t *testing.T) 
 	}
 }
 
-// I-D（历史发现）：'queued' 是用户显式触发的重签请求（RetryCertJob
+// 历史修复（历史发现）：'queued' 是用户显式触发的重签请求（RetryCertJob
 // 全量重签语义，旧 cert_pem/key_pem 保留在行上），启动恢复不得以"检测到已有
 // 有效证书"将其静默转为 issued——请求必须经重新排队存活到重启之后。
 func TestRequeueNonTerminalCertJobs_requeues_queued_job_despite_valid_stored_cert(t *testing.T) {
@@ -1939,7 +1939,7 @@ func TestCertificateService_resumeDeploymentRetries_reschedulesDroppedRetries(t 
 	service.resumeDeploymentRetries()
 
 	// Then：材料齐全且规则适用的任务被重排——窗口已过的 A 以 delay=0 立即，
-	// 窗口在未来的 B 以剩余等待 delay 重排（历史问题 A-2，与启动恢复同口径，
+	// 窗口在未来的 B 以剩余等待 delay 重排（历史问题 历史修复，与启动恢复同口径，
 	// 不再静默丢弃至重启）；缺材料的 C 与规则已删除的 D 仍不重排。
 	if len(scheduled) != 2 || scheduled[0] != 1 || scheduled[1] != 2 {
 		t.Fatalf("scheduled=%v, want jobs 1 and 2", scheduled)
@@ -1985,7 +1985,7 @@ func seedRequeueMaterialFixture(t *testing.T, domain, seedStatus, certPEM, keyPE
 		active:       true,
 		blockedRules: map[string]map[RuleBlockToken]struct{}{ruleID: {1: {}}},
 	}
-	// 预置 stub 执行队列（loop 在跑、executeFn no-op）：避免真实 Issue 执行触网，
+	// 预置 stub 执行队列（loop 在跑、executeFn 历史修复）：避免真实 Issue 执行触网，
 	// 也保证执行不写库——补偿路径自身的状态转换就是被测对象。
 	queue := newCAQueue(models.CAProvider{ID: 7, MaxConcurrent: 1}, func() error { return nil })
 	queue.executeFn = func(context.Context, queueItem, models.CAProvider) error { return nil }
@@ -2036,8 +2036,8 @@ func TestRequeueCertJobsSnapshot_downloaded_with_material_stays_fast_path(t *tes
 // 只差部署——材料已落库、证书已签发（retryCertificateDeployment 从这些状态装载
 // 材料即为证）。补偿重排队必须归一化为 'downloaded' 走 Issue 快速路径重部署，
 // 不得转 'queued' 整轮重签（浪费 CA 配额并丢弃有效证书）。
-// 'queued'+材料为负对照：I-D（历史）确立 queued 是显式重签请求
-// （RetryCertJob 全量重签 BY-DESIGN，材料为上轮残留），补偿不得借材料例外吞掉。
+// 'queued'+材料为负对照：历史修复（历史）确立 queued 是显式重签请求
+// （RetryCertJob 全量重签 历史修复，材料为上轮残留），补偿不得借材料例外吞掉。
 func TestRequeueCertJobsSnapshot_deploy_stage_with_material_redeploys_not_reissues(t *testing.T) {
 	for _, tc := range []struct {
 		name, seedStatus, wantStatus string
@@ -2087,7 +2087,7 @@ func TestRequeueCertJobsSnapshot_deploy_stage_with_material_redeploys_not_reissu
 
 // N+9 历史问题：referenced CA provider 不可用（禁用/删除且无 enabled 回退）时，
 // enqueueCompensation→enqueueLocked 已同步 failJob（任务置 failed + job 日志 +
-// 审计——现有 job-status/audit 通道即最终处置）。补偿不得把该错误上抛：否则
+// 审计——现有 历史修复/audit 通道即最终处置）。补偿不得把该错误上抛：否则
 // StartRuleDeletionCompensation 的退避循环永久重试（每轮 restore 复活 failed 行
 // 再重新失败 + 问题 日志噪声），且规则租约（blockedRules）永不释放——该规则
 // 的所有证书操作（EnqueueIfActive）持续 409。语义：provider 不可用按「该任务
@@ -2140,7 +2140,7 @@ func TestCompensateRuleDeletion_provider_unavailable_fails_job_and_releases_leas
 	if manager.IsRuleBlocked(ruleID) {
 		t.Fatal("rule lease still held after compensation, want released")
 	}
-	// Then 3：任务经现有 job-status/audit 通道定局为 failed + 明确归因
+	// Then 3：任务经现有 历史修复/audit 通道定局为 failed + 明确归因
 	var status, message string
 	var attempts int
 	if err := database.QueryRow("SELECT status, COALESCE(message,''), COALESCE(renewal_attempts,0) FROM cert_jobs WHERE id=?", jobID).Scan(&status, &message, &attempts); err != nil {
@@ -2405,7 +2405,7 @@ func TestCertIssuer_deploymentFailed_persistsMaterial(t *testing.T) {
 }
 
 // 历史问题-03（历史）：续期扫描 Run 体不消费 rc.Ctx（SetRole 取消等价
-// no-op），入口角色检查只做一次——demote 落在最长 6h 扫描/多任务候选窗口时，
+// 历史修复），入口角色检查只做一次——demote 落在最长 6h 扫描/多任务候选窗口时，
 // 循环会在队列停止前继续入队（已入队签发要跑完 ACME 才被角色检查拦下，白烧
 // CA 配额）。逐任务入队前必须用同一 SQL 口径复核角色。
 func TestRenewalScanRechecksRoleBeforeEachEnqueue(t *testing.T) {
@@ -2497,5 +2497,233 @@ func TestRenewalScan_capped_waiting_ca_failure_clears_cooldown_fields(t *testing
 	}
 	if lastErrorCode != nil {
 		t.Fatalf("last_error_code=%v, want NULL（终态不得残留 429）", lastErrorCode)
+	}
+}
+
+// RestoreCertJobsForRule 是「整规则回滚 cert_jobs」，必须
+// 与同规则的部署/文件回滚事务互斥（DeployLock），且对快照之后已落库的签发/部署
+// 成果做行级 epoch 守卫——此前 历史修复 + INSERT 会把补偿窗口内刚完成的续期/
+// 部署回滚成旧快照行（PEM/状态丢失，磁盘/Caddy 与 DB 分叉）。
+func TestRestoreCertJobs_deploy_lock_and_epoch_guard(t *testing.T) {
+	_, database := newClusterTestService(t)
+	const ruleID = "lb_restore_epoch"
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES (?, 'epoch', 'epoch.example.com', 'http', 8080, 1, 1, 'acme_dns')`, ruleID); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	result, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,message,ca_provider_id) VALUES (?, 'epoch.example.com', 'creating_order', '签发中', 7)`, ruleID)
+	if err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+	jobID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("read job id: %v", err)
+	}
+	snapshot, err := SnapshotCertJobsForRule(ruleID)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	// Given：快照之后并发签发完成（材料落库、状态推进到 downloaded），并且
+	// 新增了一条带材料的新任务行（快照后新建的真实成果）
+	now := time.Now().UTC()
+	certPEM, keyPEM := certificatePairForDomains(t, now.Add(-time.Hour), now.Add(90*24*time.Hour), "epoch.example.com")
+	if _, err := database.Exec(`UPDATE cert_jobs SET status='downloaded', cert_pem=?, key_pem=?, expires_at=datetime('now','+90 days'), updated_at=datetime('now') WHERE id=?`, certPEM, keyPEM, jobID); err != nil {
+		t.Fatalf("simulate concurrent issuance: %v", err)
+	}
+	newCertPEM, newKeyPEM := certificatePairForDomains(t, now.Add(-time.Hour), now.Add(90*24*time.Hour), "epoch-new.example.com")
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem) VALUES (?, 'epoch-new.example.com', 'downloaded', ?, ?)`, ruleID, newCertPEM, newKeyPEM); err != nil {
+		t.Fatalf("seed post-snapshot row: %v", err)
+	}
+
+	// When：持有部署锁（模拟在途部署事务）时恢复必须等待
+	unlock := DeployLock(ruleID)
+	restoreDone := make(chan error, 1)
+	go func() { restoreDone <- RestoreCertJobsForRule(snapshot) }()
+	select {
+	case restoreErr := <-restoreDone:
+		unlock()
+		t.Fatalf("restore err=%v 在部署锁释放前返回——恢复未与部署事务互斥", restoreErr)
+	case <-time.After(150 * time.Millisecond):
+	}
+	unlock()
+	if err := <-restoreDone; err != nil {
+		t.Fatalf("restore err=%v, want nil", err)
+	}
+
+	// Then：快照后的签发成果不被回滚
+	var status, restoredCert string
+	var restoredKey sql.NullString
+	if err := database.QueryRow("SELECT status, COALESCE(cert_pem,''), key_pem FROM cert_jobs WHERE id=?", jobID).Scan(&status, &restoredCert, &restoredKey); err != nil {
+		t.Fatalf("read restored job: %v", err)
+	}
+	if status != "downloaded" || restoredCert != certPEM || !restoredKey.Valid {
+		t.Fatalf("status=%q certMatch=%v keyValid=%v, want downloaded + 快照后签发材料保留（行级 epoch 守卫）", status, restoredCert == certPEM, restoredKey.Valid)
+	}
+	var count int
+	if err := database.QueryRow("SELECT COUNT(*) FROM cert_jobs WHERE rule_id=? AND domain='epoch-new.example.com'", ruleID).Scan(&count); err != nil {
+		t.Fatalf("count post-snapshot row: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("post-snapshot row count=%d, want 1（带材料的新建任务属真实成果，不得清除）", count)
+	}
+}
+
+// 材料快速路径（downloaded/cleanup_* + 材料）必须把
+// deployment_available_after 推到当前时刻并落库。部署补扫
+// （rescanDroppedDeploymentRetries）只收 status='downloaded' 且该列非空的行——
+// 此前补偿保持/归一化到 downloaded 却不写该列（补偿 downloaded 快照常为 NULL），
+// 队列未激活时两条补扫通道都不收，只能等重启恢复。断言同时消费补扫 SQL 谓词与
+// 真实调度（stub deploymentRetry），避免只验字段形态。
+func TestRequeueCertJobsSnapshot_material_fast_path_opens_deployment_window(t *testing.T) {
+	for _, tc := range []struct{ name, seedStatus string }{
+		{name: "downloaded with material stays downloaded", seedStatus: "downloaded"},
+		{name: "cleanup_dns with material normalizes to downloaded", seedStatus: "cleanup_dns"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now().UTC()
+			certPEM, keyPEM := certificatePairForDomains(t, now.Add(-time.Hour), now.Add(90*24*time.Hour), "deploywindow.example.com")
+			database, snapshot, manager, jobID, _ := seedRequeueMaterialFixture(t, "deploywindow.example.com", tc.seedStatus, certPEM, keyPEM)
+			// 队列未激活：走 errCAQueueInactive 分支（不得谎称已入队/已转 queued）
+			manager.mu.Lock()
+			manager.active = false
+			manager.mu.Unlock()
+
+			// When
+			err := requeueCertJobsSnapshot(context.Background(), snapshot, manager)
+
+			// Then 1：按延后语义收敛（不把补偿拖入退避）
+			if err != nil {
+				t.Fatalf("requeue err=%v, want nil（队列未激活按延后语义收敛）", err)
+			}
+			var status, message string
+			var availableAfter sql.NullString
+			if err := database.QueryRow("SELECT status, COALESCE(message,''), deployment_available_after FROM cert_jobs WHERE id=?", jobID).
+				Scan(&status, &message, &availableAfter); err != nil {
+				t.Fatalf("read job: %v", err)
+			}
+			if status != "downloaded" {
+				t.Fatalf("status=%q, want downloaded（材料快速路径保持部署生命周期）", status)
+			}
+			if !availableAfter.Valid || availableAfter.String == "" {
+				t.Fatalf("deployment_available_after=%v, want 非空（部署补扫谓词要求非 NULL）", availableAfter)
+			}
+			if strings.Contains(message, "queued") {
+				t.Fatalf("message=%q, want 不宣称转 queued（S-CERT-5 日志/状态口径修正）", message)
+			}
+
+			// Then 2：补扫谓词实证——该行必须被 rescanDroppedDeploymentRetries 拾起并调度
+			scheduled := make(chan int, 1)
+			service := &CertificateService{deploymentRetry: func(id int, _ issuedCertificate, _ time.Duration) { scheduled <- id }}
+			service.rescanDroppedDeploymentRetries()
+			select {
+			case id := <-scheduled:
+				if id != int(jobID) {
+					t.Fatalf("scheduled job=%d, want %d", id, jobID)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("部署补扫未拾起材料快速路径任务（deployment_available_after 未落库或谓词不匹配）")
+			}
+		})
+	}
+}
+
+// provider 不可用此前经 enqueueLocked 直接 failJob——对
+// 「材料已落库、只差部署」的任务等于摘掉唯一自动恢复通道（部署重试链直接读库
+// 材料，不解析 provider；部署补扫只收 downloaded/cleanup_*）。只差部署的任务必须
+// 保持可部署态且部署窗口非空；签发生命周期任务维持既定 failJob 语义——负对照见
+// TestCompensateRuleDeletion_provider_unavailable_fails_job_and_releases_lease。
+func TestRequeueCertJobsSnapshot_provider_unavailable_keeps_deployment_only_job_deployable(t *testing.T) {
+	now := time.Now().UTC()
+	certPEM, keyPEM := certificatePairForDomains(t, now.Add(-time.Hour), now.Add(90*24*time.Hour), "providergone-deploy.example.com")
+	database, snapshot, manager, jobID, _ := seedRequeueMaterialFixture(t, "providergone-deploy.example.com", "downloaded", certPEM, keyPEM)
+	// 全部 provider 禁用：loadCAProvider(7) 无行且无 enabled 回退
+	if _, err := database.Exec(`UPDATE ca_providers SET enabled=0`); err != nil {
+		t.Fatalf("disable providers: %v", err)
+	}
+
+	// When
+	err := requeueCertJobsSnapshot(context.Background(), snapshot, manager)
+
+	// Then 1：补偿照常收敛（不进入永久退避）
+	if err != nil {
+		t.Fatalf("requeue err=%v, want nil（provider 不可用按跳过语义收敛）", err)
+	}
+	// Then 2：任务未被 failJob，仍可部署
+	var status string
+	var availableAfter sql.NullString
+	if err := database.QueryRow("SELECT status, deployment_available_after FROM cert_jobs WHERE id=?", jobID).Scan(&status, &availableAfter); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if status != "downloaded" {
+		t.Fatalf("status=%q, want downloaded（只差部署的任务不得被 provider 不可用标 failed）", status)
+	}
+	if !availableAfter.Valid || availableAfter.String == "" {
+		t.Fatalf("deployment_available_after=%v, want 非空（部署补扫接管）", availableAfter)
+	}
+	// Then 3：部署补扫确实能拾起该任务
+	scheduled := make(chan int, 1)
+	service := &CertificateService{deploymentRetry: func(id int, _ issuedCertificate, _ time.Duration) { scheduled <- id }}
+	service.rescanDroppedDeploymentRetries()
+	select {
+	case id := <-scheduled:
+		if id != int(jobID) {
+			t.Fatalf("scheduled job=%d, want %d", id, jobID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider 不可用后部署补扫未拾起只差部署的任务")
+	}
+}
+
+// 历史修复/5 联动：restore 的行级 epoch 守卫保留了快照后的签发成果（行已推进为
+// downloaded 并携带新材料），补偿重排队必须按当前行判定——仍按快照状态会把刚签发
+// 完成的任务转 'queued' 触发整轮重签（丢弃有效证书、白烧 CA 配额）。
+func TestRequeueCertJobsSnapshot_uses_live_state_for_preserved_rows(t *testing.T) {
+	_, database := newClusterTestService(t)
+	const ruleID = "lb_requeue_live"
+	const domain = "live-state.example.com"
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES (?,?,?,'http',8080,1,1,'acme_dns')`, ruleID, ruleID, domain); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	result, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_provider_id) VALUES (?,?,'creating_order',7)`, ruleID, domain)
+	if err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+	jobID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("read job id: %v", err)
+	}
+	snapshot, err := SnapshotCertJobsForRule(ruleID)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	now := time.Now().UTC()
+	certPEM, keyPEM := certificatePairForDomains(t, now.Add(-time.Hour), now.Add(90*24*time.Hour), domain)
+	if _, err := database.Exec(`UPDATE cert_jobs SET status='downloaded', cert_pem=?, key_pem=?, expires_at=datetime('now','+90 days'), updated_at=datetime('now') WHERE id=?`, certPEM, keyPEM, jobID); err != nil {
+		t.Fatalf("simulate concurrent issuance: %v", err)
+	}
+	if err := RestoreCertJobsForRule(snapshot); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	// 队列未激活：只在库内落状态，不触网络
+	manager := &CAQueueManager{
+		queues:       make(map[int]*caQueue),
+		blockedRules: map[string]map[RuleBlockToken]struct{}{ruleID: {1: {}}},
+	}
+
+	// When
+	if err := requeueCertJobsSnapshot(context.Background(), snapshot, manager); err != nil {
+		t.Fatalf("requeue err=%v, want nil", err)
+	}
+
+	// Then：保持 downloaded + 部署窗口非空，不得被转回 queued
+	var status string
+	var availableAfter sql.NullString
+	if err := database.QueryRow("SELECT status, deployment_available_after FROM cert_jobs WHERE id=?", jobID).Scan(&status, &availableAfter); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if status != "downloaded" {
+		t.Fatalf("status=%q, want downloaded（按当前行判定，保留快照后签发成果）", status)
+	}
+	if !availableAfter.Valid || availableAfter.String == "" {
+		t.Fatalf("deployment_available_after=%v, want 非空（部署补扫接管）", availableAfter)
 	}
 }

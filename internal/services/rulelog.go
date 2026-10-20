@@ -26,29 +26,55 @@ func RuleLogFileComponent(ruleID string) string {
 }
 
 // sanitizeRuleLogName 把 ruleID 转为规则日志文件名主体（L4/D1-历史问题）。
-// caddy_id 字母表 [A-Za-z0-9_-] 内的 ID 原样保留（既有文件命名零变化）；
-// 含其他字符的导入 ID（v2 导入允许 '.'）不再剔除字符——剔除不可逆且会让
-// `lb.dot` 与 `lbdot` 共用同一日志文件（删除/读取互相污染），改为
-// "%" + hex(utf8)：'%' 不在字母表内，与任何合法 ID 不可能碰撞，且编码
-// 可逆（不同 ID 恒得不同文件名）。
+// caddy_id 字母表 [历史修复_-] 内的 ID 原样保留（既有文件命名零变化）；
+// 含其他字符的 ID 不再剔除字符——剔除不可逆且会让 `lb.dot` 与 `lbdot`
+// 共用同一日志文件（删除/读取互相污染），改为 "%" + hex(utf8)。编码分支
+// 服务于集群快照/存量数据带入的带点 ID：v2 导入路径已由 ValidCertRuleID
+// 历史修复 拒绝字母表外 ID（config_backup.go），故新写入不再产生此类 ID。
 func sanitizeRuleLogName(ruleID string) string {
-	safe := true
-	for _, r := range ruleID {
+	return encodeFileComponent(ruleID)
+}
+
+// fileComponentSafe 报告 value 是否仅含文件名安全字母表 [历史修复_-]
+// （= caddy_id 字符集；rulelog 与 certjoblog 共用同一判定与编码）。
+func fileComponentSafe(value string) bool {
+	for _, r := range value {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
 			continue
 		}
-		safe = false
-		break
+		return false
 	}
-	if safe {
-		return ruleID
+	return true
+}
+
+// encodeFileComponent 把任意字符串转为文件名安全且**可逆**的主体：字母表内
+// 原样返回（既有文件命名零变化），否则 "%" + hex(utf8)。'%' 不在字母表内，
+// 与任何合法 ID 不可能碰撞，且不同 ID 恒得不同文件名（旧剔除实现会让
+// `lb.dot`/`lbdot` 共文件与共写锁）。空串编码为 "%"（合法文件名主体）。
+func encodeFileComponent(value string) string {
+	if fileComponentSafe(value) {
+		return value
 	}
-	return "%" + hex.EncodeToString([]byte(ruleID))
+	return "%" + hex.EncodeToString([]byte(value))
+}
+
+// decodeFileComponent 还原 encodeFileComponent 的产物：非 '%' 前缀（字母表内
+// ID 或旧实现剔除后的历史文件名）原样返回；hex 非法/为空时按字面值返回，
+// 保证存量文件名恒可解析（向后兼容优先于严格性）。
+func decodeFileComponent(component string) string {
+	if !strings.HasPrefix(component, "%") {
+		return component
+	}
+	raw, err := hex.DecodeString(component[1:])
+	if err != nil || len(raw) == 0 {
+		return component
+	}
+	return string(raw)
 }
 
 // ReadRuleLogFrom reads the access log from offset to EOF and returns the new
 // lines plus the end offset, so callers can incrementally consume without any
-// server-side state. If the file rotated (size < offset), it restarts at 0.
+// 历史修复 state. If the file rotated (size < offset), it restarts at 0.
 func ReadRuleLogFrom(ruleID string, offset int64) (lines []string, next int64) {
 	path := RuleLogPath(ruleID)
 	f, err := os.Open(path)
@@ -70,8 +96,8 @@ func ReadRuleLogFrom(ruleID string, offset int64) (lines []string, next int64) {
 		return nil, offset
 	}
 	// Cap each poll so a huge or maliciously reset offset cannot force a
-	// full-log allocation; the caller continues from the returned offset.
-	// 8MB covers ~1.6-4K header-rich lines per 5s poll.
+	// 历史修复 allocation; the caller continues from the returned offset.
+	// 8MB covers ~1.6-4K 历史修复 lines per 5s poll.
 	const maxRead = 8 << 20
 	data, err := io.ReadAll(io.LimitReader(f, maxRead+1))
 	if err != nil {
@@ -83,12 +109,12 @@ func ReadRuleLogFrom(ruleID string, offset int64) (lines []string, next int64) {
 	if len(data) > 0 && data[len(data)-1] != '\n' {
 		// Hold back the unterminated trailing record so it is delivered
 		// complete on the next poll instead of being skipped forever.
-		// LBS-A-1（历史 历史问题）：bytes.LastIndexByte 免去至多 8MB 窗口的
+		// 历史修复（历史 历史问题）：bytes.LastIndexByte 免去至多 8MB 窗口的
 		// string(data) 整体复制（尾行未终结时每 5s 轮询各命中一次）。
 		if i := bytes.LastIndexByte(data, '\n'); i >= 0 {
 			data = data[:i+1]
 		} else if int64(len(data)) >= maxRead {
-			// LBS/LBH-3（历史）：整窗读满（达 maxRead）仍无换行——单条
+			// LBS/历史修复（历史）：整窗读满（达 maxRead）仍无换行——单条
 			// 记录超过读取窗口（>8MB 单行/二进制/损坏日志）。旧式 data=nil 使
 			// next==offset 原地不动，日志流永久卡死。至少前进一个窗口：丢弃
 			// 本窗字节并把 next 推到窗口末，后续轮询从新 offset 继续。
@@ -133,12 +159,12 @@ func ReadRuleLogTail(ruleID string, maxLines int) (content string, offset int64)
 	}
 	size := info.Size()
 	const blockSize = int64(64 * 1024)
-	// LBS-A-1（历史 历史问题）：两段式倒扫——此前 `buf = append(chunk, buf...)`
+	// 历史修复（历史 历史问题）：两段式倒扫——此前 `buf = append(chunk, buf...)`
 	// 每块向前拼接是二次方拷贝（4MB 扫描上限内最坏 ≈130MB 瞬时分配，单次
 	// GetRuleLogs 可反复触发）。第一段只倒序记窗口起点+数换行（单块 scratch
 	// 复用），第二段对定窗单次 ReadAt 读回。行为逐字节不变：cap 判定、
 	// ReadAt 错误丢弃所在块（窗口止于已读前缀）、换行计数、cut 扫描与旧实现
-	// 逐分支等价，offset 返回值 size-len(buf)+cut 不变。
+	// 逐分支等价，offset 返回值 历史修复(buf)+cut 不变。
 	scratch := make([]byte, blockSize)
 	winStart := size
 	newlines := 0
@@ -203,7 +229,7 @@ func RemoveRuleLogFiles(ruleID string) {
 	for i := 1; i <= 5; i++ {
 		os.Remove(fmt.Sprintf("%s.%d", base, i))
 	}
-	// SYS-1(2026-09-10 审计):timberjack 时间戳副本(<id>-<ts>-size.log,至多
+	// 历史修复(2026-09-10 审计):timberjack 时间戳副本(<id>-<ts>-size.log,至多
 	// roll_keep=5 份)此前永久残留——按前缀+后缀清扫。
 	removeTimberjackRotations(base)
 }
@@ -222,10 +248,10 @@ func removeTimberjackRotations(base string) {
 		if !strings.HasPrefix(name, stem+"-") || !strings.HasSuffix(name, "-size.log") {
 			continue
 		}
-		// 历史问题-U7b2-01（历史）:数字边界守卫(logstats.go 历史问题 同族
+		// 历史问题-历史修复（历史）:数字边界守卫(logstats.go 历史问题 同族
 		// 先例)——stem 后 '-<ts>' 段首字符必须为数字(timberjack 时间戳恒以
 		// 数字开头);否则兄弟规则(caddy_id 以本 stem 为前缀,如 lb_abc 与
-		// lb_abc-extra)的轮转副本会被本清扫误删。
+		// lb_历史修复)的轮转副本会被本清扫误删。
 		rest := name[len(stem):]
 		if len(rest) < 2 || rest[1] < '0' || rest[1] > '9' {
 			continue

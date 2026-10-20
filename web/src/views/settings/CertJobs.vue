@@ -246,13 +246,13 @@ const formatCoolingTime = (iso: string): string => {
   return `${hours}小时${minutes}分钟后`
 }
 
-const fetchJobs = async () => {
+const fetchJobs = async (roundSignal?: AbortSignal) => {
   if (disposed || loading.value) return
   loading.value = true
   try {
     const jobsRes = await request.get<APIResponse<CertJobsPage<CertJob>>>('/certificates/jobs', {
       params: { page: currentPage.value, page_size: pageSize.value },
-      signal: jobsPolling.signal,
+      signal: roundSignal ?? jobsPolling.signal,
       silent: true,
     })
     if (disposed) return
@@ -338,9 +338,9 @@ const jobsPollingErrorDescription = computed(() => {
     ? `最后错误：${lastError}；契约响应异常，自动重试已退避至 ${retryAt}`
     : `最后错误：${lastError}`
 })
-const jobsPolling = usePollingTask(async () => {
+const jobsPolling = usePollingTask(async (task) => {
   if (!jobsPollingError.canRun()) return
-  await fetchJobs()
+  await fetchJobs(task.signal)
   jobsPollingError.clear()
 }, {
   interval: 5000,

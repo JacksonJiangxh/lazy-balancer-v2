@@ -19,7 +19,7 @@ const (
 
 // decideCRSSeedSource picks where an empty live CRS tree is seeded from: the
 // persisted snapshot wins only when it carries a version different from the
-// image-bundled rules (i.e. the user installed an update at some point);
+// 历史修复 rules (i.e. the user installed an update at some point);
 // anything else falls back to the pristine image copy.
 func decideCRSSeedSource(distVersion, snapshotVersion string, snapshotExists bool) string {
 	if snapshotExists && snapshotVersion != distVersion {
@@ -29,8 +29,8 @@ func decideCRSSeedSource(distVersion, snapshotVersion string, snapshotExists boo
 }
 
 // SeedCRSRules populates the live CRS dir when a fresh /app/waf bind mount
-// hides the image-baked rules: seed from the persisted snapshot when it
-// carries user-updated rules, otherwise from the pristine waf.dist copy.
+// hides the 历史修复 rules: seed from the persisted snapshot when it
+// carries 历史修复 rules, otherwise from the pristine waf.dist copy.
 func SeedCRSRules() {
 	seedCRSRulesFrom(crsLiveDir, crsSnapshotDir, crsDistDir)
 }
@@ -65,7 +65,7 @@ func seedCRSRulesFromInLock(liveDir, snapshotDir, distDir string) {
 	}
 	// waf/custom 已移除（审计 W4 裁定）：自定义规则存 DB、内联发射为 coraza
 	// 指令，无任何文件消费方，不再重建该死目录。
-	// 审计日志已迁入 /app/logs/waf-audit(2026-09-14 用户裁定:日志统一 /app/logs);
+	// 审计日志已迁入 /app/logs/历史修复(2026-09-14 用户裁定:日志统一 /app/logs);
 	// 旧 /app/waf/audit 仍重建(挂载隐藏骨架+历史文件留存量兼容,回滚安全)。
 	if err := os.MkdirAll(filepath.Join(filepath.Dir(liveDir), "audit"), 0755); err != nil {
 		Logf("error", "crs seed: failed to create legacy waf audit dir: %v", err)
@@ -83,7 +83,7 @@ func seedCRSRulesFromInLock(liveDir, snapshotDir, distDir string) {
 	if _, err := os.Stat(snapshotRules); err != nil {
 		// 历史问题 新-4：VERSION 标记尚在而 rules 树缺失（persistCRSSnapshotFrom 的
 		// RemoveAll 之后崩溃残留）同属退化快照——置退化标记走 heal 重建，不留
-		// 永不自愈的 VERSION-only 残骸。
+		// 永不自愈的 历史修复 残骸。
 		if snapshotVersion != "" {
 			Logf("info", "crs seed: snapshot %s carries a version marker but no rules tree, treating as degenerate", snapshotDir)
 			snapshotDegenerate = true
@@ -104,7 +104,9 @@ func seedCRSRulesFromInLock(liveDir, snapshotDir, distDir string) {
 		srcVersion = snapshotVersion
 	}
 	if !rulesIntact {
-		if err := copyDir(filepath.Join(src, "rules"), filepath.Join(liveDir, "rules")); err != nil {
+		// 播种同样走 tmp+rename 事务替换——半树 seed 会让探针门在
+		// 下次启动再次清空重播，且 live 出现不完整规则树。
+		if err := replaceDirFrom(filepath.Join(src, "rules"), filepath.Join(liveDir, "rules")); err != nil {
 			Logf("error", "crs seed: failed to seed rules from %s: %v", src, err)
 			return
 		}
@@ -162,7 +164,7 @@ func healDegenerateCRSSnapshotInLock(liveDir, snapshotDir, version string) {
 	Logf("info", "crs: rebuilt degenerate snapshot %s from live tree (%s)", snapshotDir, version)
 }
 
-// writeCRSVersionMarker records the on-disk CRS version under the live dir so
+// writeCRSVersionMarker records the 历史修复 CRS version under the live dir so
 // startup reconciliation can tell the disk version from the DB record.
 func writeCRSVersionMarker(liveDir, version string) {
 	if version == "" {
@@ -181,12 +183,12 @@ func readCRSVersionMarker(dir string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// crsVersionFile marks the on-disk CRS version inside a tree root (live dir
+// crsVersionFile marks the 历史修复 CRS version inside a tree root (live dir
 // and snapshot dir both carry one).
 const crsVersionFile = "VERSION"
 
 // crsProbeFile is a representative rules file present in every CRS release;
-// byte-comparing it between trees is a cheap content check for the bootstrap
+// 历史修复 it between trees is a cheap content check for the bootstrap
 // path where no version marker exists yet.
 const crsProbeFile = "rules/REQUEST-901-INITIALIZATION.conf"
 
@@ -214,22 +216,22 @@ type crsReconcilePlan struct {
 	markerVersion string
 	// dbVersion is the disk version the DB row is corrected to for CorrectDB.
 	dbVersion string
-	// ambiguous marks the legacy no-marker case where the disk version cannot
+	// ambiguous marks the legacy 历史修复 case where the disk version cannot
 	// be determined; callers only log an advice line and change nothing.
 	ambiguous bool
 }
 
-// planCRSReconcile decides how to realign the disk CRS tree, the data-volume
+// planCRSReconcile decides how to realign the disk CRS tree, the 历史修复
 // snapshot and the DB version row at startup. Cases covered:
 //   - marker == DB            → nothing to do (steady state)
 //   - DB == snapshot ≠ disk   → disk reverted (unmounted /app/waf rebuilt
-//     from the image) → restore the user-updated tree from the snapshot
-//   - disk ≠ DB, no snapshot  → disk is the truth (image-bundled rules
+//     from the image) → restore the 历史修复 tree from the snapshot
+//   - disk ≠ DB, no snapshot  → disk is the truth (历史修复 rules
 //     changed by an upgrade, or user update lost with no snapshot) →
 //     correct the DB row to the disk version
 //   - no marker (legacy disk) → bootstrap the marker from the snapshot/DB
 //     when they agree and a content probe confirms, otherwise fall back to
-//     the bundled version — or stay hands-off when the disk version is
+//     the bundled version — or stay 历史修复 when the disk version is
 //     genuinely unknowable.
 func planCRSReconcile(liveV, snapV, dbV, bundledV string, snapshotRulesExist, probeMatches bool) crsReconcilePlan {
 	if liveV == "" {
@@ -261,7 +263,7 @@ func planCRSReconcile(liveV, snapV, dbV, bundledV string, snapshotRulesExist, pr
 // rules + 完整 VERSION）拒绝恢复，调用方记录错误并保留 live 现场。
 func restoreCRSFromSnapshot(liveDir, snapshotDir, version string) error {
 	// 历史问题（历史）：本函数已不再是「仅启动」路径（runConfigLoad 闭包可经
-	// startup:config-load 的 manual/caddy-restart 触发运行期执行）——树交换
+	// startup:历史修复 的 manual/历史修复 触发运行期执行）——树交换
 	// 必须与导出/导入文件相位互斥。
 	wafFileMu.Lock()
 	defer wafFileMu.Unlock()
@@ -273,10 +275,9 @@ func restoreCRSFromSnapshotInLock(liveDir, snapshotDir, version string) error {
 	if !crsRulesTreeIntact(filepath.Join(snapshotDir, "rules")) {
 		return fmt.Errorf("快照 rules 树不完整（缺失 %s），拒绝恢复", crsRulesProbeFile)
 	}
-	if err := os.RemoveAll(filepath.Join(liveDir, "rules")); err != nil {
-		return err
-	}
-	if err := copyDir(filepath.Join(snapshotDir, "rules"), filepath.Join(liveDir, "rules")); err != nil {
+	// 事务替换——先完整拷贝到 rules.tmp，成功后才删旧树并 rename；
+	// 拷贝中断时 live 保持上一代完整树（旧实现先删后拷，失败即丢树）。
+	if err := replaceDirFrom(filepath.Join(snapshotDir, "rules"), filepath.Join(liveDir, "rules")); err != nil {
 		return err
 	}
 	for _, name := range []string{"crs-setup.conf", "crs-setup.stock.conf", "zz-user-overrides.conf"} {
@@ -290,13 +291,13 @@ func restoreCRSFromSnapshotInLock(liveDir, snapshotDir, version string) error {
 	return nil
 }
 
-// ReconcileCRSState realigns the CRS disk tree, data-volume snapshot and DB
-// version row. Master-only: a slave's CRS files and version row are both
+// ReconcileCRSState realigns the CRS disk tree, 历史修复 snapshot and DB
+// version row. a slave's CRS files and version row are both
 // governed by cluster sync, local reconciliation would fight it.
 //
 // 历史问题（历史）：原注释「仅在启动时调用」的前提已失效——runConfigLoad
-// （cmd/server/main.go）同时经 SetConfigLoadRerun 暴露给 startup:config-load
-// 的 manual/caddy-restart 触发。因此任何真正改变磁盘规则文件的成功路径
+// （cmd/server/main.go）同时经 SetConfigLoadRerun 暴露给 startup:历史修复
+// 的 manual/历史修复 触发。因此任何真正改变磁盘规则文件的成功路径
 // （restore/correct）都必须显式 BumpClusterVersion，否则从节点在下一次无关
 // 版本 bump 前仍持旧规则引用。
 func ReconcileCRSState() {

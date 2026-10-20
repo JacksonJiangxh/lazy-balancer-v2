@@ -29,7 +29,7 @@ func assertPullAdmissionOpen(t *testing.T, sync *SyncService) {
 	sync.pullWG.Done()
 }
 
-// L2-81-01：BecomeSlave 排干成功后 UPDATE 失败必须重开拉取准入——否则
+// BecomeSlave 排干成功后 UPDATE 失败必须重开拉取准入——否则
 // 「已是从节点换主」不换代，旧 daemon 后续每轮 Pull 恒 errSyncPullStopped
 // 且该哨兵不落库 → 永久静默脱同步。
 func TestBecomeSlave_reopensPullAdmissionWhenTopologyWriteFails(t *testing.T) {
@@ -50,8 +50,8 @@ func TestBecomeSlave_reopensPullAdmissionWhenTopologyWriteFails(t *testing.T) {
 	assertPullAdmissionOpen(t, sync)
 }
 
-// L2-81-02：Promote 失败路径（排干成功 + 提交失败）必须重开准入——原实现
-// 依赖「失败后重启 cluster-sync → startLocked 重开」的隐式链，当用户此前关闭
+// Promote 失败路径（排干成功 + 提交失败）必须重开准入——原实现
+// 依赖「失败后重启 历史修复 → startLocked 重开」的隐式链，当用户此前关闭
 // 调度或引擎缺失时准入永久关闭，从节点「立即同步」被静默拒绝。
 func TestPromote_reopensPullAdmissionOnCommitFailure(t *testing.T) {
 	service, database := newClusterTestService(t)
@@ -70,7 +70,7 @@ func TestPromote_reopensPullAdmissionOnCommitFailure(t *testing.T) {
 	assertPullAdmissionOpen(t, sync)
 }
 
-// L2-81-05(a)/L2-81-06：Promote 复位 last_sync（与 BecomeSlave 对称）并显式
+// 历史修复(a)/Promote 复位 last_sync（与 BecomeSlave 对称）并显式
 // 失效快照缓存（角色翻转后不得继续以旧缓存供快照）。
 func TestPromote_clearsLastSyncAndSnapshotCache(t *testing.T) {
 	service, database := newClusterTestService(t)
@@ -99,7 +99,7 @@ func TestPromote_clearsLastSyncAndSnapshotCache(t *testing.T) {
 	}
 }
 
-// L2-81-05(b)/L2-81-06：BecomeSlave 同样失效快照缓存并清空内存 TOFU pin 缓存
+// 历史修复(b)/BecomeSlave 同样失效快照缓存并清空内存 TOFU pin 缓存
 // （与 Promote handler 的 ForgetClusterPins 收尾对称）。
 func TestBecomeSlave_invalidatesSnapshotCacheAndPins(t *testing.T) {
 	service, database := newClusterTestService(t)
@@ -124,7 +124,7 @@ func TestBecomeSlave_invalidatesSnapshotCacheAndPins(t *testing.T) {
 	}
 }
 
-// L2-81-03：Wake 早于 waitDelay 注册（周期中途到达）不得丢失——原实现
+// Wake 早于 waitDelay 注册（周期中途到达）不得丢失——原实现
 // close 后替换通道，下一次等待拿到新通道，唤醒被吞，最长延迟一个 interval。
 func TestSyncService_wakeBeforeWaitIsNotLost(t *testing.T) {
 	s := &SyncService{}
@@ -187,14 +187,14 @@ func TestReadAdminConfigBody_rejectsOversize(t *testing.T) {
 	}
 }
 
-// （housekeeping 只能从文件名反解出净化值）。
+// （housekeeping 只能从文件名反解出文件名主体）。
 func TestCertJobLogLockKeyMatchesHousekeepingKey(t *testing.T) {
 	ruleID := "lb.dot.rule"
-	sanitized := sanitizePathComponent(ruleID)
-	t.Cleanup(func() { certJobLogWriteLocks.Delete(sanitized) })
+	component := certJobLogFileComponent(ruleID)
+	t.Cleanup(func() { certJobLogWriteLocks.Delete(component) })
 
 	writeLock := lockCertJobLog(ruleID)
-	parsed, ok := certJobLogRuleIDFromName("certjob-" + sanitized + ".log.1")
+	parsed, ok := certJobLogRuleIDFromName("certjob-" + component + ".log.1")
 	if !ok {
 		t.Fatal("housekeeping could not parse cert job log name")
 	}
@@ -270,8 +270,8 @@ func TestCertificateService_StopWithoutStartReturns(t *testing.T) {
 	}
 }
 
-// L4-81-01：队列活动态由 cert-issuance 守护派生——初始化即停止；未启动时
-// 入队必须是无迁移的 no-op（从节点/用户停调度后重启不得留下半启动子系统）。
+// 队列活动态由 历史修复 守护派生——初始化即停止；未启动时
+// 入队必须是无迁移的 历史修复（从节点/用户停调度后重启不得留下半启动子系统）。
 func TestCAQueueManager_inactiveUntilDaemonStarts(t *testing.T) {
 	newClusterTestService(t)
 	ResetCAQueueManagerForTest()
@@ -298,7 +298,7 @@ func TestCAQueueManager_inactiveUntilDaemonStarts(t *testing.T) {
 	}
 }
 
-// L4-81-02：部署尝试封顶后保留可部署态（慢速重试），不得落 failed 终态把
+// 部署尝试封顶后保留可部署态（慢速重试），不得落 failed 终态把
 // 材料/磁盘分叉变成无自动通道的搁浅。
 func TestDeploymentFailed_atCapKeepsDeployableState(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -340,7 +340,7 @@ func TestDeploymentFailed_atCapKeepsDeployableState(t *testing.T) {
 	}
 }
 
-// L4-81-05：读侧补上界钳制（写侧 0-90 / 1-10，导入 1-90 / 1-10）——带外直写
+// 读侧补上界钳制（写侧 0-90 / 1-10，导入 1-90 / 1-10）——带外直写
 // 大值不得造成续签风暴/超限重试。
 func TestCertRenewalConfigReadSideClampsUpperBounds(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -355,7 +355,7 @@ func TestCertRenewalConfigReadSideClampsUpperBounds(t *testing.T) {
 	}
 }
 
-// L4-81-06：手动证书到期巡检只扫启用规则（禁用规则不进入任何 TLS 策略，
+// 手动证书到期巡检只扫启用规则（禁用规则不进入任何 TLS 策略，
 // 不得产生 CRITICAL 假告警）。
 func TestCheckManualCertExpiration_skipsDisabledRules(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -467,7 +467,7 @@ func TestApplySnapshot_rulesDisabledPreservesLocalDNSOwnership(t *testing.T) {
 	}
 }
 
-// L4-81-03（证伪 + 加固钉）：预检失败必须落「CA 提供商测试失败」精确归因。
+// 历史修复（证伪 + 加固钉）：预检失败必须落「CA 提供商测试失败」精确归因。
 // 报告声称 from=creating_account 恒不命中，但 logger.Log("creating_account")
 // 已先行迁移状态；本测钉住最终 message（failJob 形态对 logger 迁移失败亦稳健）。
 func TestIssue_precheckFailureKeepsProviderAttribution(t *testing.T) {
@@ -495,7 +495,7 @@ func TestIssue_precheckFailureKeepsProviderAttribution(t *testing.T) {
 	}
 }
 
-// L4-81-04：续期扫描在队列暂停时不得静默跳过——摘要行已宣称「检测到 N 个
+// 续期扫描在队列暂停时不得静默跳过——摘要行已宣称「检测到 N 个
 // 任务」，未入队必须留痕（在途守卫形态仍静默）。
 func TestRenewalScan_logsWhenQueueInactive(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -543,8 +543,8 @@ func TestIPListTempFileName_forms(t *testing.T) {
 	}
 }
 
-// L2-81-07：角色读取单源语义——主/从/读失败（读失败返回错误，由调用方决定
-// fail-open/closed；nil 库返回错误而非 panic）。
+// 角色读取单源语义——主/从/读失败（读失败返回错误，由调用方决定
+// 历史修复/closed；nil 库返回错误而非 panic）。
 func TestRoleOf_masterSlaveAndReadFailure(t *testing.T) {
 	_, database := newClusterTestService(t)
 	if role, err := RoleOf(context.Background(), database); err != nil || !role {

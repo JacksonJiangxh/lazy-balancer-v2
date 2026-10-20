@@ -56,6 +56,7 @@ import { request } from '@/utils/api'
 import { DEFAULT_ACCESS_LOG_FORMAT } from '@/utils/caddyDefaults'
 import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
 import { displaySecurityEventsRowCap } from '@/utils/configValues'
+import { SETTINGS_TAB_DESCS, SETTINGS_TAB_TITLES, settingsTabOfPage, type SettingsTabId } from '@/utils/settingsPages'
 import { useAuthStore } from '@/stores/auth'
 import { Setting } from '@element-plus/icons-vue'
 import BasicSettings from './settings/BasicSettings.vue'
@@ -67,7 +68,7 @@ import TaskMonitor from './settings/TaskMonitor.vue'
 
 const authStore = useAuthStore()
 
-const activeTab = ref('basic')
+const activeTab = ref<SettingsTabId>('basic')
 
 // FI-05：/config 契约单一事实源迁至 types/index.ts（GlobalConfigData）——
 // 两块设置卡各持互斥子集，这里按卡片分组做派生别名，不再复制字段清单。
@@ -132,24 +133,9 @@ const global = ref<CertificateConfig>({
   dns_provider: 'dnspod',
 })
 
-const titles: Record<string, string> = {
-  basic: '基础设置',
-  cluster: '集群管理',
-  certificates: '免费证书',
-  apikeys: 'API 密钥',
-  tasks: '任务监控',
-}
-
-const descs: Record<string, string> = {
-  basic: '配置系统日志、访问日志和基础行为',
-  cluster: '配置主从节点模式和同步策略',
-  certificates: '配置 ACME 邮箱、DNS 提供商和证书签发任务',
-  apikeys: '管理 API 访问密钥',
-  tasks: '全部定时与后台任务的运行监控、手动触发与取消',
-}
-
-const pageTitle = computed(() => titles[activeTab.value] || '系统设置')
-const pageDesc = computed(() => descs[activeTab.value] || '')
+// 标题/描述/页键映射单源见 utils/settingsPages（AppLayout 面包屑共用同一份）
+const pageTitle = computed(() => SETTINGS_TAB_TITLES[activeTab.value])
+const pageDesc = computed(() => SETTINGS_TAB_DESCS[activeTab.value])
 let settingsRequestSeq = 0
 
 // Each card owns a subset of the shared `settings`/`global` objects. Apply
@@ -267,14 +253,7 @@ const handleSaveCertificates = async () => {
 }
 
 const syncActiveTabFromPage = () => {
-  const map: Record<string, string> = {
-    'settings-basic': 'basic',
-    'settings-cluster': 'cluster',
-    'settings-certificates': 'certificates',
-    'settings-apikeys': 'apikeys',
-    'settings-tasks': 'tasks',
-  }
-  activeTab.value = map[authStore.currentPage] || 'basic'
+  activeTab.value = settingsTabOfPage(authStore.currentPage) ?? 'basic'
 }
 
 watch(() => authStore.currentPage, syncActiveTabFromPage)

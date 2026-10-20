@@ -55,22 +55,10 @@ func TestLogin_responseCarriesAuthProvider(t *testing.T) {
 }
 
 func TestMFAVerifyLogin_responseCarriesAuthProvider(t *testing.T) {
-	database := setupAuthTestDB(t)
-	if _, err := database.Exec(`ALTER TABLE users ADD COLUMN mfa_secret TEXT DEFAULT '';
-		ALTER TABLE users ADD COLUMN mfa_recovery_codes TEXT DEFAULT '[]';
-		ALTER TABLE users ADD COLUMN mfa_last_timestep INTEGER DEFAULT 0;
-		CREATE TABLE IF NOT EXISTS mfa_challenges (
-			token TEXT PRIMARY KEY,
-			user_id INTEGER NOT NULL,
-			expires_at DATETIME NOT NULL,
-			consumed BOOLEAN DEFAULT 0,
-			attempts INTEGER DEFAULT 0,
-			password_version INTEGER NOT NULL DEFAULT 0,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		);
-		CREATE TABLE global_config (id INTEGER PRIMARY KEY, mfa_lockout_enabled INTEGER NOT NULL DEFAULT 0);
+	database := setupAuthTestDB(t) // 已含 MFA 列/挑战表（ensureMFATestSchema 单源）
+	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, mfa_lockout_enabled INTEGER NOT NULL DEFAULT 0);
 		INSERT INTO global_config (id) VALUES (1)`); err != nil {
-		t.Fatalf("add mfa schema: %v", err)
+		t.Fatalf("seed global config: %v", err)
 	}
 	key, err := totp.Generate(totp.GenerateOpts{
 		Issuer: "LazyBalancer", AccountName: "mfa-user",

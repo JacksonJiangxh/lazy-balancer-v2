@@ -33,7 +33,7 @@ var configBackupTables = []string{"lb_rules", "upstreams", "path_rules", "users"
 // 版本+CAS 条件删除，绝不按「导入前不存在」的无条件 DELETE 误删并发更新行。
 const importVersionSeedSentinel = "__lazy_balancer_import_seed__"
 
-// SEM44-1(历史 历史问题):迟到表容缺清单——Version=2 导出清单首发(ff632cd,
+// 历史修复(历史 历史问题):迟到表容缺清单——Version=2 导出清单首发(ff632cd,
 // v2.0.10,8 表)与安全族并入(4e46f85,v2.1.1,12 表)之后才加入导出清单的表:
 //
 //	security_crs_version / security_ip2region_version — v2.1.10(76f616a)起
@@ -221,7 +221,7 @@ var configBackupProtectedConfigKeys = map[string]bool{
 	// 会让目标节点的存量 sections 迁移状态被源节点覆盖；且该列无导入类型门，
 	// 文本形态落库后下次启动迁移 Scan int 硬失败。导出剔除+导入跳过。
 	"auto_backup_sections_version": true,
-	// R-12 同族收敛：threat_traffic_sample_unified_migrated /
+	// 历史修复 同族收敛：threat_traffic_sample_unified_migrated /
 	// security_events_retention_migrated 同型（节点本地一次性迁移标记，
 	// db.go:2285/2346 启动迁移 Scan int）——同口径纳入保护。
 	"threat_traffic_sample_unified_migrated": true,
@@ -285,12 +285,12 @@ var backupBooleanTableColumns = map[string][]string{
 	"nodes": {"is_approved", "cluster_token_delivered"},
 }
 
-// audit I-A：备份表 NULL→默认值归一映射（restoreTable 写入侧，覆盖除
+// audit 备份表 NULL→默认值归一映射（restoreTable 写入侧，覆盖除
 // security_policy_bindings 外的 16 表——绑定表为派生数据，无 NULL 归一列）。
 // 默认值与集群快照 dump 侧逐列对齐
 // （cluster_snapshot.go 各 snapshot* 的 COALESCE 表达式）——「全量替换」
 // 两条通道（备份导入/集群快照）对同一 NULL 行必须产出同一落库值。
-// 仅收录「集群 dump 侧已 COALESCE 硬化」或「NULL 命中 raw-scan 消费点」的
+// 仅收录「集群 dump 侧已 COALESCE 硬化」或「NULL 命中 历史修复 消费点」的
 // 可空列；生命周期合法可空列（cert_jobs key_pem/message/ca_available_after/
 // deployment_available_after/updated_at、users.last_login/password_changed_at、
 // api_keys.expires_at/last_used、path_rules.upstreams_json、lb_rules.updated_at、
@@ -344,7 +344,7 @@ var backupBooleanTableColumns = map[string][]string{
 //	                     收录以维持映射判据一致，NULL→0
 //	security_policies / security_custom_rules / security_block_pages /
 //	security_ip_lists（v2.3.0，entries '[]' 对齐 dump 侧 COALESCE）
-//	                     原安全表条目原样并入（C5 KNOWN-GAP-1，dump
+//	                     原安全表条目原样并入（C5 历史修复，dump
 //	                     :420/:428/:449 对齐）
 var backupTableNullDefaults = map[string]map[string]any{
 	"lb_rules": {
@@ -405,7 +405,7 @@ var backupTableNullDefaults = map[string]map[string]any{
 		"upstream_path": "",
 		// 自定义路由静态响应/301 跳转（2026-10-10，db.go path_rules DDL）：
 		// 五列 NOT NULL，response_status DEFAULT 200，其余 DEFAULT ''——
-		// NULL 行按 schema DEFAULT 逐字归一（CORE-1，历史）。
+		// NULL 行按 schema DEFAULT 逐字归一（历史修复，历史）。
 		"response_mode": "", "response_status": int64(200), "response_body": "",
 		"response_content_type": "", "redirect_to": "",
 	},
@@ -491,7 +491,7 @@ var backupBooleanConfigKeys = []string{
 	// 历史问题（历史）：自动备份开关为 INTEGER 0/1 语义列，补入配置键枚举。
 	"auto_backup_enabled",
 	// 历史问题-01（历史）：威胁库/爬虫库任务总闸同为 INTEGER 0/1 语义列——
-	// 字符串形态落库后被 Scan(&int) fail-closed 关闭，UI 却显示启用。
+	// 字符串形态落库后被 Scan(&int) 历史修复 关闭，UI 却显示启用。
 	"threat_auto_update", "crawler_auto_update",
 }
 
@@ -567,7 +567,7 @@ func validateV2BackupBooleanTypes(backup configBackup) error {
 	return nil
 }
 
-// backupTimeColumns 备份中按 time.Time / sql.NullTime 消费的时间列（B3-2-1，
+// backupTimeColumns 备份中按 time.Time / sql.NullTime 消费的时间列（历史修复，
 // 历史）：这些列的值必须是驱动可解析的时间串——空串或不可解析文本
 // 落库后不是「空值」而是每次扫描都报错（登录读取 users.created_at、规则列表
 // 读取 lb_rules.created_at、证书任务读取 cert_jobs.created_at、主节点集群
@@ -806,7 +806,7 @@ func sanitizeNodeRowsForRestore(rows []map[string]any) {
 		if hash, _ := row["cluster_token_hash"].(string); hash != "" {
 			row["cluster_token_delivered"] = 1
 		} else {
-			// D-1（历史裁定）：无令牌哈希的节点无法通过集群认证，恢复
+			// 历史修复（历史裁定）：无令牌哈希的节点无法通过集群认证，恢复
 			// 「approved 死行」只会得到一个永不在线的假节点——一律恢复为
 			// pending（重新注册语义）；同时显式清除陈旧 delivered 标记
 			// （原实现只置 1 从不清 0，手造备份可造出「已下发但无令牌」）。
@@ -856,18 +856,18 @@ func restoreTable(ctx context.Context, tx *sql.Tx, database *sql.DB, table strin
 			if isBackupBooleanColumn(table, column) {
 				value = normalizeBackupBooleanValue(value)
 			}
-			// audit I-A：全备份表可空列的 NULL 毒化归一（写入侧兜底）——布尔归一
+			// audit 全备份表可空列的 NULL 毒化归一（写入侧兜底）——布尔归一
 			// 对 nil 透传，故在布尔归一之后把仍为 nil 的列替换为 dump 侧对齐默认值
 			// （backupTableNullDefaults）：NULL 布尔列落到 schema/dump 默认（如
 			// enabled→0）而非布尔强转；created_at 等被 raw time.Time 扫描消费的
-			// 时间列归一为可解析 epoch。B3-2-1（历史）：空串/不可解析文本
+			// 时间列归一为可解析 epoch。历史修复（历史）：空串/不可解析文本
 			// 由校验侧 validateV2BackupTimestamps 整包 400 先行拦截，不会到达此处。
 			if value == nil {
 				if columnDefault, ok := backupTableNullDefaults[table][column]; ok {
 					value = columnDefault
 				}
 			}
-			// 历史修复-新3(历史):旧从节点库(pre-fix)导出的备份可携带字面量
+			// 历史修复-新3(历史):旧从节点库导出的备份可携带字面量
 			// "null" 白名单——middleware 把非空串当白名单配置(Unmarshal null 成功
 			// 但 0 CIDR)→ 主端全来源 403 直至重启迁移;导入侧归一为 ''。
 			if table == "api_keys" && column == "mcp_ip_whitelist" {
@@ -893,7 +893,7 @@ func restoreTable(ctx context.Context, tx *sql.Tx, database *sql.DB, table strin
 // tcpRuleDeadFieldsResetSQL：TCP 行 HTTP 专属死值清零（七 HTTP 专属字段 +
 // NTLM 开关 + force_http1 + TLS 三字段，共 12 列 SET）的 SQL 字面量。启动迁移
 // db.migrateTCPRuleDeadFields 持有逐字相同的第二份（跨包不可共享常量）；
-// CORE-F2（历史 历史问题）parity 钉测试（tcp_dead_fields_parity_test.go）读取
+// 历史修复（历史 历史问题）parity 钉测试（tcp_dead_fields_parity_test.go）读取
 // 两侧源码断言 SET 列集合与 WHERE 逐字一致，防双份漂移。
 const tcpRuleDeadFieldsResetSQL = `UPDATE lb_rules SET
 	host_header='', health_check_path='', enable_compress=0, compress_types='',
@@ -906,7 +906,7 @@ const tcpRuleDeadFieldsResetSQL = `UPDATE lb_rules SET
 		OR enable_tls=1
 	)`
 
-// normalizeRuleRowsForTransport（历史 CL-3/CL-4）：导入事务内的规则行
+// normalizeRuleRowsForTransport（历史 历史修复/历史修复）：导入事务内的规则行
 // 存储归一共享实现——v1 导入与 v2 备份导入两条写路径的唯一归一点：
 // ① TCP 行 HTTP 专属七字段 + TLS 三字段死值清零（WHERE 谓词与
 // normalizeRuleForTransport / db.migrateTCPRuleDeadFields 同口径——
@@ -933,7 +933,7 @@ func normalizeRuleRowsForTransport(ctx context.Context, tx *sql.Tx) (int64, erro
 	if _, err := tx.ExecContext(ctx, `UPDATE lb_rules SET acme_config_id=0 WHERE tls_source='manual' AND COALESCE(acme_config_id,0)<>0`); err != nil {
 		return 0, fmt.Errorf("规则手动 TLS 残留 ACME 引用归一失败: %w", err)
 	}
-	// B2-04/B2-05（历史）：跨模式残留归一——非 manual 源不保留证书材料
+	// 历史修复/历史修复（历史）：跨模式残留归一——非 manual 源不保留证书材料
 	// （私钥正文随导出/备份/快照放大）；非 acme_dns 源不保留 CA 提供商引用
 	// （ResolveCAProviderID 对非 0 不校验存在性，残留死引用签发期才暴露）。
 	if _, err := tx.ExecContext(ctx, `UPDATE lb_rules SET tls_cert='', tls_key=''
@@ -1126,8 +1126,8 @@ func validateBackupRuleReferences(tables map[string][]map[string]any) error {
 	upstreamsByRule := make(map[string][]models.Upstream)
 	for index, row := range tables["upstreams"] {
 		ruleID := backupString(row["rule_id"])
-		// D-3（历史裁定）：显式 weight<1 响亮拒绝，不再沿用「0→1 静默归一」
-		// 兼容语义（与保存侧 validateRuleUpstreams 的 历史修复 D-3 门同口径——该门
+		// 历史修复（历史裁定）：显式 weight<1 响亮拒绝，不再沿用「0→1 静默归一」
+		// 兼容语义（与保存侧 validateRuleUpstreams 的 历史修复 历史修复 门同口径——该门
 		// 对模型 0 值一律拒绝，故缺键/NULL 必须先归位）。缺键/NULL 按 schema
 		// DEFAULT 1 归位（backupTableNullDefaults 同值——旧库/手造备份的 NULL
 		// 形态保持可导入），显式 0/负值/非整数形态整包 400 点名行号。数值
@@ -1231,7 +1231,7 @@ func validateImportedCrawlerSources(rows []map[string]any) error {
 	return validateImportedSources(rows, services.CanonicalCrawlerSource, "爬虫地址库源")
 }
 
-// validateImportedSecurityCustomRules（历史问题 二十六次 W1-5）：导入路径复用保存侧
+// validateImportedSecurityCustomRules（历史问题 二十六次 历史修复）：导入路径复用保存侧
 // validateSecurityCustomRule 的行级约束——此前导入对 security_custom_rules 零验证，
 // 篡改/损坏备份可带入 score=-5（coraza setvar:+-5 运行时减分，异常评分静默失真）
 // 或非法 action/名称。与 历史问题 布尔门同位：结构性校验阶段拒绝，零写入。
@@ -1263,7 +1263,7 @@ func validateImportedSecurityCustomRules(rows []map[string]any) error {
 				return fmt.Errorf("security_custom_rules 第 %d 行 id=%d 越界：发射 id（+10000）将撞入 GeoIP 预检保留段，渲染侧会跳过该规则（可落库但不可发射）", i+1, id)
 			}
 		}
-		// C5 KNOWN-GAP-1：action/score 为 NULL 的可空形态按 schema/dump 默认
+		// C5 action/score 为 NULL 的可空形态按 schema/dump 默认
 		// （'block'/5，cluster_snapshot.go:428）看待通过校验；写入侧由 restoreTable
 		// 归一为同一默认值。本校验在 checksum 之前执行，不得回写行数据（回写会让
 		// 自带校验和的备份误报篡改），故只做读取侧替换。
@@ -1315,7 +1315,7 @@ func validateImportedSecurityCustomRules(rows []map[string]any) error {
 // verifyBackupIntegrity 整包完整性校验：结构/版本/导出口径、checksum（对全量
 // tables+config 计算，未选分类同样覆盖）、布尔 NULL 归一、必需表门、管理员门。
 // 在 sections 过滤之前执行。返回 usedLegacyChecksum=true 表示走了旧格式
-// （仅 tables）校验和回退——调用方应记审计警告（历史问题 F-D）；历史问题：legacy
+// （仅 tables）校验和回退——调用方应记审计警告（历史问题 历史修复）；历史问题：legacy
 // 只跳过「checksum 不匹配即拒」，其后所有行级/白名单/凭证/管理员门照常执行。
 func verifyBackupIntegrity(backup configBackup) (bool, error) {
 	usedLegacyChecksum := false
@@ -1348,7 +1348,7 @@ func verifyBackupIntegrity(backup configBackup) (bool, error) {
 		}
 		sum := sha256.Sum256(checksumPayload)
 		if hex.EncodeToString(sum[:]) != backup.Meta.Checksum {
-			// 历史问题 F-D: 旧格式（仅 tables）校验和回退仅限明确的旧格式标记
+			// 历史问题 旧格式（仅 tables）校验和回退仅限明确的旧格式标记
 			// （Version==1 且无 exported_at 的史前导出，历史问题 历史问题 收紧）；新格式文件
 			// （带 exported_at）校验和不匹配直接拒绝——否则仅篡改 Config 区
 			// （dns_credentials/acme_email/管理面板 TLS 材料）而保留 tables 的文件
@@ -1360,12 +1360,12 @@ func verifyBackupIntegrity(backup configBackup) (bool, error) {
 				if tablesOnlyMatch {
 					// 历史问题：legacy 形态是受支持路径——只跳过「checksum 不匹配
 					// 即拒」，置标志位后继续执行布尔/cert 状态/CA 白名单/凭证/
-					// 管理员门（此前 early-return 让这些门对 legacy 全失效）。
+					// 管理员门（此前 历史修复 让这些门对 legacy 全失效）。
 					usedLegacyChecksum = true
 					goto afterChecksum
 				}
 			} else if tablesOnlyMatch {
-				// 历史问题 C1: v2.1.1（及更早）导出即「tables-only 校验和 + exported_at
+				// 历史问题 C1: v2.1.1（及更早）导出即「历史修复 校验和 + exported_at
 				// 非空」形态——tables 区完整性成立，是合法旧版文件而非篡改证据；
 				// 但 Config 区不受旧校验和保护，仍须拒绝导入，仅改报兼容性提示。
 				return false, errors.New("备份由 v2.1.1 或更早版本导出，校验和格式不兼容，请使用 v2.1.2 及以上版本重新导出后再导入")
@@ -1395,7 +1395,7 @@ afterChecksum:
 			if _, exists := backup.Tables[required]; exists {
 				continue
 			}
-			// SEM44-1:迟到表容缺(见 configBackupLateTables)——Version=2 导出
+			// 迟到表容缺(见 configBackupLateTables)——Version=2 导出
 			// 清单中途新增的表,此前时代的合法全量备份不含,缺席不拒绝。
 			if _, late := configBackupLateTables[required]; late {
 				continue
@@ -1457,7 +1457,7 @@ func validateV2BackupCertJobStatuses(tables map[string][]map[string]any) error {
 //   - server_map_lat/lon：数值门 + 范围（与 validateServerMapCoordinates
 //     单源同边界：-90/90、-180/180）；
 //   - protocol：仅 http/https，空串归一为 http（schema DEFAULT 语义）；
-//   - cluster_token_hash：字符串或 NULL（NULL=待重新注册，D-1）。
+//   - cluster_token_hash：字符串或 NULL（NULL=待重新注册，历史修复）。
 //
 // 历史问题-历史问题（历史）：name 落库前走 models.NormalizeClusterNodeName
 // 单源归一（去首尾空白/剥离 历史问题 控制字符/截断 100 rune），但只静默归一
@@ -1477,6 +1477,10 @@ func validateV2BackupCertJobStatuses(tables map[string][]map[string]any) error {
 // validateV2BackupBooleanTypes 覆盖；created_at 由 validateV2BackupTimestamps
 // 覆盖。旧备份缺席 nodes 表由迟到表「缺席=保留本地」语义承接，不进本门。
 func validateV2BackupNodeRows(rows []map[string]any) error {
+	// 身份唯一性行门——nodes 有 UNIQUE(ip_address, port)，
+	// 重复身份行若只落到事务内才报错，会以 500「写入表 nodes…」整体回滚，
+	// 与「畸形输入=400 并点名行」口径不一致。
+	seenIdentity := make(map[string]int, len(rows))
 	for index, row := range rows {
 		line := fmt.Sprintf("备份校验失败：nodes 第 %d 行", index+1)
 		rawName, exists := row["name"]
@@ -1517,6 +1521,17 @@ func validateV2BackupNodeRows(rows []map[string]any) error {
 				return fmt.Errorf("%s port 必须是 1-65535 的整数", line)
 			}
 		}
+		portValue := int64(8000) // schema DEFAULT 8000
+		if raw, exists := row["port"]; exists && raw != nil {
+			if port, ok := backupInteger(raw); ok {
+				portValue = int64(port)
+			}
+		}
+		identity := fmt.Sprintf("%s:%d", ip, portValue)
+		if firstLine, dup := seenIdentity[identity]; dup {
+			return fmt.Errorf("%s 与第 %d 行身份重复（%s），nodes 表要求 (ip_address, port) 唯一", line, firstLine, identity)
+		}
+		seenIdentity[identity] = index + 1
 		if raw, exists := row["sync_interval"]; exists && raw != nil {
 			interval, ok := backupInteger(raw)
 			if !ok || interval < 1 || interval > 86400 {
@@ -1569,7 +1584,7 @@ func validateV2BackupNodeRows(rows []map[string]any) error {
 // sections 过滤之后执行（历史问题）：未选分类的坏行不误拒整包，选中分类照常
 // 严格校验。checksum 已在 verifyBackupIntegrity 对全量计算。
 func validateV2BackupRows(backup configBackup) error {
-	// 历史问题 二十六次 W1-5：自定义规则行级验证（保存侧同款约束）。
+	// 历史问题 二十六次 自定义规则行级验证（保存侧同款约束）。
 	if rows, ok := backup.Tables["security_custom_rules"]; ok {
 		if err := validateImportedSecurityCustomRules(rows); err != nil {
 			return err
@@ -1602,7 +1617,7 @@ func validateV2BackupRows(backup configBackup) error {
 	if err := validateV2BackupBooleanTypes(backup); err != nil {
 		return err
 	}
-	// B3-2-1（历史）：时间列空串/不可解析文本门——必须在写入前拦下，
+	// 历史修复（历史）：时间列空串/不可解析文本门——必须在写入前拦下，
 	// 否则导入后 users/lb_rules/cert_jobs/path_rules 的 raw time 扫描每次 500。
 	if err := validateV2BackupTimestamps(backup.Tables); err != nil {
 		return err
@@ -1619,7 +1634,7 @@ func validateV2BackupRows(backup configBackup) error {
 		if providerName == "" {
 			// legacy/占位行：无 provider 即无专属语义，保持放行。
 		} else {
-			// CERT44-1(历史 历史问题):provider 白名单与 directory_url 官方常量
+			// 历史修复(历史 历史问题):provider 白名单与 directory_url 官方常量
 			// 覆写,与保存/更新侧同口径。
 			switch providerName {
 			case services.ProviderLetsEncrypt:
@@ -1734,7 +1749,7 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 		return err
 	}
 	// B3-历史问题（历史）：阶段拦截页引用/状态码必须与保存侧同门。页存在性按
-	// 「备份携带 security_block_pages 则备份行、缺席则 live」解析（历史问题 B-N3
+	// 「备份携带 security_block_pages 则备份行、缺席则 live」解析（历史问题 历史修复
 	// 同口径）——备份行才是导入后的真实数据。
 	blockPageRows, carriedBlockPages := tables["security_block_pages"]
 	backupPageIDs := make(map[int]bool, len(blockPageRows))
@@ -1782,7 +1797,7 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 		if err := validatePort(protocol, listenPort); err != nil {
 			return fmt.Errorf("规则 #%d：%w", index+1, err)
 		}
-		// 历史问题 B-NEW-1（用户裁决：系统不支持通配符域名）：创建/更新（rules.go CanonicalDomains）、
+		// 历史问题 历史修复（用户裁决：系统不支持通配符域名）：创建/更新（rules.go CanonicalDomains）、
 		// 启用/复制（:2136/:2327 同门）、v1 导入（isValidDomain 拒绝 '*'）均拒绝通配与非法
 		// 形态，v2 导入是最后一个能把它带入运行库的门（此前仅 acme_dns 行有
 		// ValidateACMEDomains 门，manual/无 TLS 行的域名原样落库）。与保存侧 :609/:613
@@ -1808,20 +1823,20 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 		// 往返断裂（与 v1 路径自环规则软跳过口径一致），故禁用行将
 		// EnableTLS/TLSHTTPRedirect 置 false，其余字段校验保留。
 		enabled := backupRuleEnabled(rule)
-		// 历史问题 C-N2：注入 DynamicDNS + 启用上游计数——此前两者恒零值，保存侧
+		// 历史问题 注入 DynamicDNS + 启用上游计数——此前两者恒零值，保存侧
 		// validateRuleFeatures 的「动态上游单启用」门（历史 历史问题）在导入链
-		// 恒不触发：启用行延迟到 Caddy 阶段以整包 400 形态失败（fail-closed 但
+		// 恒不触发：启用行延迟到 Caddy 阶段以整包 400 形态失败（历史修复 但
 		// 与同文件逐规则点名口径不一致），禁用行入库后成「永不启用」死行。
 		// 与保存/Duplicate 链同门（DuplicateRule 为此专门 hydrate 上游计数，
 		// rule_features.go 历史问题 历史问题 注释）。
 		ruleID := backupString(rule["caddy_id"])
 		// 历史问题-07（历史）：caddy_id 必须满足证书路径字母表（非空、≤64、
 		// 仅小写字母/数字/_/-）——含点等形态会在证书物化阶段失败回滚，且与
-		// 日志文件名净化键碰撞；导入期 fail-fast 点名。
+		// 日志文件名净化键碰撞；导入期 历史修复 点名。
 		if !services.ValidCertRuleID(ruleID) {
 			return fmt.Errorf("规则 #%d：caddy_id %q 含证书路径不支持的字符（仅允许小写字母、数字、_ 与 -，长度 1-64）", index+1, ruleID)
 		}
-		// 阶段拦截页四列（仅生效 HTTP 规则；TCP 行残留属 CORE-2 已裁定豁免）。
+		// 阶段拦截页四列（仅生效 HTTP 规则；TCP 行残留属 历史修复 已裁定豁免）。
 		if enabled && (protocol == "http" || protocol == "") {
 			for _, stage := range []struct{ label, idKey, statusKey string }{
 				{"阶段 1（IP 访问控制/地域拦截）", "block_page_stage1_id", "block_page_stage1_status"},
@@ -1870,8 +1885,8 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 			// 含前导空格路径时 validateRuleFeatures 的 HasPrefix("/") 误拒绝。
 			input.PathRules = normalizePathRules(pathRules)
 		}
-		// 历史问题 C-F1：规则级 request_body_max_size_mb 导入钳制 [0,4096]（写回行
-		// 数据，restoreTable 直写不再携带越界值）——历史问题 C-N2 只钳了全局
+		// 历史问题 规则级 request_body_max_size_mb 导入钳制 [0,4096]（写回行
+		// 数据，restoreTable 直写不再携带越界值）——历史问题 历史修复 只钳了全局
 		// backup.Config，行级向量经 restoreTable 原样落库，渲染侧 MB→字节
 		// int64 乘法回绕会让该规则的 body 限制静默取消。
 		if rawBody, exists := rule["request_body_max_size_mb"]; exists {
@@ -1909,9 +1924,9 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 		if err := validateDnsServerShape(backupString(rule["dns_server"])); err != nil {
 			return fmt.Errorf("规则 #%d：%w", index+1, err)
 		}
-		// 历史问题 历史问题（历史问题 C-N1 修正）：dynamic_dns+dns_family 走与保存侧同口径的
+		// 历史问题 历史问题（历史问题 历史修复 修正）：dynamic_dns+dns_family 走与保存侧同口径的
 		// 枚举校验——此前 input 不带 DnsFamily，垃圾值原样落库后渲染端 versions
-		// 双 false 解析退化为双栈（fail-open 方向）。合法值含 "both"：UI 双选
+		// 双 false 解析退化为双栈（历史修复 方向）。合法值含 "both"：UI 双选
 		// IPv4+IPv6 时前端写 'both'（Rules.vue:2415）、渲染端 case "both" 双栈
 		// （caddy.go）——历史问题 初版漏列 both 会把启用双栈的规则导出物整包误拒，
 		// 导出→导入往返断裂。
@@ -1940,7 +1955,7 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 // 400，导入此前是唯一能放行该形态的门：”/垃圾值行两个分支都不命中、整包
 // 放行，渲染侧 availableCerts 仅认 manual/acme_dns → 无证书、无
 // tls_connection_policies → TLS 端口明文服务（与 历史问题 发现2 同类缺口）。
-// 历史问题 F-C / 历史问题 C-历史问题: 启用的手动 TLS 规则必须携带证书与私钥（镜像保存/启用侧
+// 历史问题 历史修复 / 历史问题 C-历史问题: 启用的手动 TLS 规则必须携带证书与私钥（镜像保存/启用侧
 // rule_features.go validateStoredRuleConfig 口径），拒绝时点名规则。
 // 导入此前是唯一能绕过该校验的门：无证书规则不在 availableCerts 内 → 无
 // TLS policy → TLS 端口明文服务，且 autohttps.disable_certificates 阻止
@@ -1949,7 +1964,7 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 // 零参数包装）生产零调用（生产一律 validateV2BackupTLSShapeSoft），作为第二
 // 调用链误导维护者——已移入 _test.go（既有 历史修复 用例同包消费）。
 //
-// validateV2BackupTLSShapeSoft 支持 CERT41-1 软降级:softLiveACMERefs=true
+// validateV2BackupTLSShapeSoft 支持 历史修复 软降级:softLiveACMERefs=true
 // 时,「备份不含 cert 表、按 live 解析」失败的 ACME 引用不整包 400,计入返回
 // 的悬挂数(调用方降级警告,与 历史问题 预检对称;导入/预览双路径同序)。
 // 返回 (悬挂数, 硬错误)。
@@ -1994,7 +2009,7 @@ func validateV2BackupTLSShapeSoft(tables map[string][]map[string]any, softLiveAC
 				return 0, fmt.Errorf("规则 #%d（%s）：%w", index+1, backupString(rule["name"]), err)
 			}
 			if err := acmeRefs.validate(rule); err != nil {
-				// CERT41-1:「备份不含 cert 表、按 live 解析」失败在软降级方向
+				// 「备份不含 cert 表、按 live 解析」失败在软降级方向
 				// (导规则不导系统数据、备份从未携带 cert 表)计入悬挂数,不整包 400。
 				var liveRefErr *acmeLiveRefUnresolvedError
 				if softLiveACMERefs && errors.As(err, &liveRefErr) {
@@ -2170,7 +2185,7 @@ func validateBackupIPListQuota(rows []map[string]any) error {
 // 历史问题：原始值存在且非字符串（数字/布尔/数组，null/缺省除外）直接拒绝——
 // 保存侧 JSON 绑定对同值 400，导入侧不得经 backupString 静默归一放行。
 // 历史问题 历史问题：旧版备份可能携带 "941" 式组号或含空白的条目——导入原样落库后
-// REQUEST-9<code>-*.conf glob 零匹配，blocking 模式静默无任何 CRS 规则生效。
+// 历史修复<code>-*.conf glob 零匹配，blocking 模式静默无任何 CRS 规则生效。
 // W2（v2.3.0）：security_ip_lists 随备份全量替换——先校验列表行 entries
 // 形状（JSON 数组文本）并收集 id 集，再校验策略 ip_acl_list_refs/
 // ip_whitelist_refs（整数数组 JSON 文本，逐 id 对备份内列表解析——导入为
@@ -2283,7 +2298,7 @@ func validateV2BackupSecurityPoliciesWithQuerier(ctx context.Context, tables map
 					}
 					// 历史问题-3(历史):缺/空/非 string value 同样拒绝——
 					// 非 string value(数字等)落库后渲染侧 Unmarshal 整表静默丢弃
-					// (securityiplists.go:120/177),fail-open。
+					// (securityiplists.go:120/177),历史修复。
 					value, ok := entryMap["value"].(string)
 					if !ok || value == "" {
 						return fmt.Errorf("安全 IP 列表 #%d 条目 #%d：缺 value 字段或为空/非字符串", index+1, ei+1)
@@ -2363,7 +2378,7 @@ func validateV2BackupSecurityPoliciesWithQuerier(ctx context.Context, tables map
 			}
 			policy[field] = value
 		}
-		// 历史问题 B-F1：三个枚举字段按 Create 侧口径（security.go CreateSecurityPolicy）
+		// 历史问题 三个枚举字段按 Create 侧口径（security.go CreateSecurityPolicy）
 		// 归一/校验。历史问题 前的旧备份合法携带空串（旧 Create 不归一、列默认 ''），
 		// restoreTable 原样落库后发射端仅 allow/deny/绕过 等具名分支产出规则，
 		// "" 零产出——启用态 ACL 零强制而 UI 宣称控制已启用（mode/geoip_mode 同型
@@ -2378,12 +2393,12 @@ func validateV2BackupSecurityPoliciesWithQuerier(ctx context.Context, tables map
 			}
 		}
 		// W3-历史问题(历史 W3 评审):429 已剔出保存侧白名单(历史问题)——
-		// 导入侧归一为 403,与 CERT44-1 同格(导入不宽于保存侧),修复前时代
+		// 导入侧归一为 403,与 历史修复 同格(导入不宽于保存侧),修复前时代
 		// 的合法备份不因新白名单硬拒。
 		// 库值唯一真相（批 3）：值列导入门归一——旧备份可携带治理前形态
 		//（anomaly_threshold=0/NULL/非整数、burst 负值、block_status_code 枚举
 		// 外如 429/418），在导入门写回归一值后 restoreTable 直写，库恒有效
-		//（渲染层已零兜底/fail-visible）；缺失键由 backupTableNullDefaults 的
+		//（渲染层已零兜底/历史修复）；缺失键由 backupTableNullDefaults 的
 		// NULL→默认通道承担（anomaly→5、block→0 省略型）。429 归一为 W3 既有
 		// 口径的枚举外全集特例。rate_limit_rps 不在此归一：enabled=1 时 rps<1
 		// 交由下方既有检查 400 拒绝（写侧同口径，导入不宽于保存侧）。
@@ -2438,7 +2453,7 @@ func validateV2BackupSecurityPoliciesWithQuerier(ctx context.Context, tables map
 		policy["mode"] = mode
 		policy["ip_acl_mode"] = ipACLMode
 		policy["geoip_mode"] = geoIPMode
-		// U6B-2（历史）：policy_type 值域门——显式值必须是五枚举之一
+		// 历史修复（历史）：policy_type 值域门——显式值必须是五枚举之一
 		//（models.PolicyType* 单一事实源），未知类型落库会漂移策略页分组与阶段外
 		// 字段归一判定。空串/null/缺省放行（restoreTable 导入侧对空行按内容重
 		// 推断，InferSnapshotPolicyType 单一事实源）；非字符串形态与三枚举门同
@@ -2454,7 +2469,7 @@ func validateV2BackupSecurityPoliciesWithQuerier(ctx context.Context, tables map
 				return fmt.Errorf("安全策略 #%d（%s）：policy_type 需为 stage0/stage1/stage2/stage3/mixed 之一，实际 %q", index+1, name, typeStr)
 			}
 		}
-		// 历史问题 C-N4（历史问题 B-#2 遗留）：导入侧限流形状与保存侧 validateRateLimitShape
+		// 历史问题 历史修复（历史问题 B-#2 遗留）：导入侧限流形状与保存侧 validateRateLimitShape
 		// 同口径——enabled=true 而 rps<=0 时发射分支直接跳过限流 handler，而
 		// 汇总/绑定宣称已启用；旧备份（保存侧校验前导出）可携带该形状经导入
 		// 复活。与三枚举同哲学：只做拒绝（数值语义无安全默认值可归一）。
@@ -2464,12 +2479,12 @@ func validateV2BackupSecurityPoliciesWithQuerier(ctx context.Context, tables map
 			if (rpsOK && rps < 1) || (burstOK && burst < 0) || !rpsOK {
 				return fmt.Errorf("安全策略 #%d（%s）：启用限流时 rate_limit_rps 必须 ≥1、rate_limit_burst 不能为负", index+1, name)
 			}
-			// 历史问题 C-N2：上界与保存侧同口径——渲染侧 rps*60/rps+burst 的 int64 溢出防线。
+			// 历史问题 上界与保存侧同口径——渲染侧 rps*60/rps+burst 的 int64 溢出防线。
 			if rps > 1_000_000_000 || burst > 1_000_000_000 {
 				return fmt.Errorf("安全策略 #%d（%s）：rate_limit_rps/burst 过大（上限 1000000000）", index+1, name)
 			}
 		}
-		// 历史问题 B-N3：geoip_countries 形状按保存侧 ValidateGeoIPCountries 同口径
+		// 历史问题 geoip_countries 形状按保存侧 ValidateGeoIPCountries 同口径
 		// （空串/缺省放行——与三枚举的「无值归一」一致；有值则必须是合法 JSON
 		// 数组文本且省份可判）。引用块（block_page_id）在备份缺 security_block_pages
 		// 表时校验会误拒全量替换导入（表本身可选），保留为运行时 JOIN 语义
@@ -2601,7 +2616,7 @@ func validateV2BackupSecurityPoliciesWithQuerier(ctx context.Context, tables map
 // certificate_configs / ca_providers 的 id→启用 视图（每个表最多构建一次），
 // 逐规则解析 O(1)。引用优先在备份自带表中解析——导入为全量替换（deleteOrder
 // 清光 live 的这两张表），备份行才是导入后的真实数据；备份缺该表时回退 live
-// 表一次读取（直测/非常规调用场景，及 CERT41-1 起「该 cert 表不参与本次分类
+// 表一次读取（直测/非常规调用场景，及 历史修复 起「该 cert 表不参与本次分类
 // 导入」的常规场景——sections 过滤前置后，过滤掉的表在 backup.Tables 中缺席，
 // live 回退自动等于「过滤后导入表∪live 保留表」正确口径）。配置/提供商行缺
 // enabled 键时按表默认值 TRUE 处理（backupRowEnabled 单源口径）。
@@ -2671,7 +2686,7 @@ func (acmeIndex *acmeImportRefIndex) resolveEnabled(table string, id int) (bool,
 }
 
 // validate 与 validateBackupACMEReferenceIDs 原逐规则实现同序、同文案。
-// CERT41-1：live 回退解析失败的错误包装为 acmeLiveRefUnresolvedError——分类
+// live 回退解析失败的错误包装为 acmeLiveRefUnresolvedError——分类
 // 导入「导规则不导系统数据」且备份从未携带 cert 表时，调用方按 历史问题 对称
 // 语义把它降级为悬挂警告；其余错误（备份行解析失败、acme_config_id=0、DB
 // 查询失败）维持整包 400。
@@ -2710,7 +2725,7 @@ func (acmeIndex *acmeImportRefIndex) validate(rule map[string]any) error {
 }
 
 // acmeLiveRefUnresolvedError 标记「备份不含该 cert 表、按 live 解析」失败的
-// ACME 引用错误（CERT41-1）。导入/预览在「导规则不导 cert 配置且备份从未
+// ACME 引用错误。导入/预览在「导规则不导 cert 配置且备份从未
 // 携带 cert 表」方向经 errors.As 识别并降级为悬挂警告（与 历史问题 对称，
 // 不阻断）；其余方向维持整包 400。错误文案与硬拒绝口径一致。
 type acmeLiveRefUnresolvedError struct{ inner error }
@@ -2741,7 +2756,7 @@ func validateV2BackupAdminTLS(config map[string]any) error {
 	if !carriesAdminTLSKeys {
 		return nil
 	}
-	// U04d-04：合并校验用严格 loader——读失败中止导入/预览（不得用降级默认
+	// 合并校验用严格 loader——读失败中止导入/预览（不得用降级默认
 	// 值校验，否则携带部分 admin_tls_* 键的备份可能以错误基线通过校验）。
 	merged, err := services.LoadAdminTLSConfigE()
 	if err != nil {
@@ -2774,7 +2789,7 @@ func validateV2BackupAdminTLS(config map[string]any) error {
 // security_policies mode 族「无值归一」）、非空非法与非字符串形态响亮拒绝。
 // 返回钳制/归一留痕（导入侧并入审计明细；预览侧忽略）。归一写回 backup.Config
 // 在 checksum 校验之后执行，不影响完整性判定。
-// F75C-4（历史）：三通道归一语义分歧（保存拒/导入钳/回填复位默认）的
+// 历史修复（历史）：三通道归一语义分歧（保存拒/导入钳/回填复位默认）的
 // 显式声明锚在 services.ValidateAutobanConfig 注释——本函数即「导入钳」通道。
 func validateV2BackupAutobanConfig(config map[string]any) ([]string, error) {
 	if config == nil {
@@ -2851,10 +2866,10 @@ func validateV2BackupAutobanConfig(config map[string]any) ([]string, error) {
 // validateV2BackupTrustedProxyConfig 受信代理三 TEXT 列导入门（D3，历史
 // 审计；导入/预览双路径同序调用）：trusted_proxy_ranges/range_refs/headers 为
 // TEXT 列承载 JSON 数组文本，此前导入零门——手造备份可落任意畸形文本，渲染层
-// 对畸形按未启用丢弃（fail-closed），真实 IP 还原静默失效而面板仍宣称已启用。
+// 对畸形按未启用丢弃，真实 IP 还原静默失效而面板仍宣称已启用。
 // 复用保存侧校验单一口径：形态门+归一+引用存在性+内联∪引用展开总量上限；
 // 载荷未携带的键按库内存量值参与合成判定（与保存侧 PATCH 语义一致）。
-// tables 为备份携带表：RC-2/F75C-3（历史）按「备份是否携带
+// tables 为备份携带表：历史修复/历史修复（历史）按「备份是否携带
 // security_ip_lists 表」分流——携带时 refs 存在性/条目/上限仅按备份行集合
 // 解析（W2 全量替换先例：备份行才是导入后的真实数据，指向库内但不在备份内
 // 的 id 导入后必然悬空，400 拒绝）；未携带时按库内解析（「缺席=保留本地」，
@@ -3046,7 +3061,7 @@ func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]
 	// 历史修复 历史问题（历史）：access_log_format 导入侧此前零校验——手造
 	// 备份可落库「删除 request>remote_ip/uri/headers」的格式，日志统计与 UA
 	// 统计静默失效（保存侧 caddy.go UpdateConfig 有 validateAccessLogFormat
-	// 门）。与保存侧同门：校验 + 归一强制携带 X-API-Key 脱敏行（渲染层另有
+	// 门）。与保存侧同门：校验 + 归一强制携带 历史修复 脱敏行（渲染层另有
 	// 恒等不变量兜底，导入落库值即所见）。
 	if raw, exists := config["access_log_format"]; exists && raw != nil {
 		format, ok := raw.(string)
@@ -3057,6 +3072,37 @@ func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]
 			return fmt.Errorf("备份的 access_log_format 无效: %w", err)
 		}
 		config["access_log_format"] = normalizeAccessLogRedaction(format)
+	}
+	// 上游 keepalive 导入侧缺非负门——写侧（caddy.go
+	// UpdateConfig / rules.go 创建更新）明确拒绝负值，负值落库后基础设置保存
+	// 恒 400、规则行编辑被同门卡死（同 TestImportConfigBackup_clamps_* 记录的
+	// 锁死族）。导入侧按写侧口径归零并留痕（钳制而非整包拒绝，保持导入可用）。
+	if raw, exists := config["upstream_keepalive_timeout"]; exists && raw != nil {
+		if value, ok := backupInteger(raw); !ok || value < 0 {
+			config["upstream_keepalive_timeout"] = int64(0)
+		}
+	}
+	// 全局配置区其余写侧门也必须前移到导入——
+	// github_proxy_url 写侧白名单（services.ValidateGitHubProxyURL），
+	// oidc_config 写侧「损坏即拒绝改写」（auth_oidc.go loadOIDCConfig）。
+	// 此前二者零校验：导入后 /config 回显白名单外 URL 或损坏 OIDC 使设置
+	// 端点持续 500（仅能靠另一份备份/直接改库修复）。
+	if raw, exists := config["github_proxy_url"]; exists && raw != nil {
+		if err := services.ValidateGitHubProxyURL(backupString(raw)); err != nil {
+			return fmt.Errorf("备份的 GitHub 加速代理地址无效: %w", err)
+		}
+	}
+	if raw, exists := config["oidc_config"]; exists && raw != nil {
+		text := backupString(raw)
+		if strings.TrimSpace(text) != "" {
+			var oidcCfg OIDCConfig
+			if err := json.Unmarshal([]byte(text), &oidcCfg); err != nil {
+				return fmt.Errorf("备份的 OIDC 配置不是有效 JSON: %w", err)
+			}
+			if oidcCfg.Enabled && (strings.TrimSpace(oidcCfg.Issuer) == "" || strings.TrimSpace(oidcCfg.ClientID) == "") {
+				return fmt.Errorf("备份的 OIDC 配置已启用但缺少 issuer 或 client_id")
+			}
+		}
 	}
 	return nil
 }
@@ -3077,7 +3123,7 @@ func validateAutoBackupScheduleCombination(freq string, day int) error {
 }
 
 // revalidateImportLiveDependencies 在取得 caddyOpMu 与事务之后、任何写入之前，
-// 重跑三项依赖 live 数据的合并型校验（历史 B3-历史问题，历史修复 B3-82-历史问题
+// 重跑三项依赖 live 数据的合并型校验（历史 B3-历史问题，历史修复 历史修复-历史问题
 // 同族收敛）：初检到加锁之间有秒级窗口（等 configImportBeginMu、暂停调度、
 // 30s 在途排空、等 WAF 锁），窗口内并发删除 IP 名单/保存自动备份排程/删除
 // CA 提供商会让初检结论失效。全部读取走导入事务，与后续写入同一快照。
@@ -3288,7 +3334,7 @@ func validateV2BackupAutoBackupConfig(config map[string]any) error {
 		}
 		sections = normalizeBackupSectionKeys(sections)
 		// 历史问题-01（历史）：空集必须拒绝，与保存侧同口径——否则落库
-		// "[]" 后消费侧 loadAutoBackupSectionsSetting 每轮 fail-closed，自动
+		// "[]" 后消费侧 loadAutoBackupSectionsSetting 每轮 历史修复，自动
 		// 备份持续失败（导入不得宽于保存侧）。
 		if len(sections) == 0 {
 			return fmt.Errorf("备份范围不能为空")
@@ -3334,7 +3380,7 @@ func parseBackupAutoBackupSections(raw any) ([]string, error) {
 }
 
 // trustedProxyBackupListSource 从备份 security_ip_lists 行构建名单解析源
-// （RC-2/F75C-3，历史）：表未携带=零值源（carried=false，未命中 id
+// （历史修复/历史修复，历史）：表未携带=零值源（carried=false，未命中 id
 // 按库内解析——导入后名单表保持现状，库内解析即导入后实态）；表携带=
 // carried=true，refs 存在性仅按备份行集合解析（W2 全量替换先例：备份行才是
 // 导入后的真实数据，库内命中不代表导入后存在——悬空在校验期 400 拒绝）。
@@ -3485,7 +3531,7 @@ func backupPathRulesByRule(rows []map[string]any) (map[string][]models.PathRule,
 	return byRule, nil
 }
 
-// validateCredentialsJSONObject allows empty strings but requires non-empty values to be JSON objects.
+// validateCredentialsJSONObject allows empty strings but requires 历史修复 values to be JSON objects.
 func validateCredentialsJSONObject(raw string) error {
 	if raw == "" {
 		return nil
@@ -3533,7 +3579,7 @@ func backupInteger(value any) (int, bool) {
 			return int(value), true
 		}
 	case string:
-		// 历史问题 C-F1：字符串形态数值（如 "99999999999"）——此前返回 !ok 使
+		// 历史问题 字符串形态数值（如 "99999999999"）——此前返回 !ok 使
 		// 钳制点静默跳过，SQLite INTEGER 亲和性照样落库大整数，绕过钳制的
 		// 唯一残留向量。解析后钳制点即可正常钳位；解析失败维持 !ok（由
 		// 各调用方按非法形态处理）。
@@ -3613,10 +3659,10 @@ func skipEmptyDomainHTTPRules(tables map[string][]map[string]any) []string {
 }
 
 // skipEmptyBlockPages 移除 content 为空/纯空白（含缺省与 NULL）的
-// security_block_pages 行，返回跳过警告（N+13 H2-F3，与
+// security_block_pages 行，返回跳过警告（N+13 历史修复，与
 // skipEmptyDomainHTTPRules 同款软跳过口径）：手造备份 content:"" 原样
 // 落库后，引用该页的 WAF/GeoIP/限流拦截渲染空响应体，静默退化为 Caddy
-// 原生 403。被跳过页面的悬挂 block_page_id 引用沿用 历史问题 B-N3 口径
+// 原生 403。被跳过页面的悬挂 block_page_id 引用沿用 历史问题 历史修复 口径
 // （运行时 JOIN 语义，悬挂不产出规则）；全表跳空时默认页由导入事务内
 // 重播种 + SeedDefaultBlockPage 渲染兜底（历史问题 B3）。
 func skipEmptyBlockPages(tables map[string][]map[string]any) []string {
@@ -3668,7 +3714,7 @@ func skipEmptyBlockPages(tables map[string][]map[string]any) []string {
 }
 
 // normalizeBlockPageContentTypes 把导入备份中 security_block_pages.content_type
-// 的白名单外值归一为默认 text/html; charset=utf-8（历史 历史问题，用户裁定，
+// 的白名单外值归一为默认 text/html; charset=历史修复（历史 历史问题，用户裁定，
 // 与 mode 枚举门同口径的导入侧值域收敛）——CRUD 写侧有
 // models.ValidBlockPageContentType 把守，备份导入是带外通道：手造备份可将
 // 含 CRLF 的任意字符串落库为 content_type 渲染进响应头。渲染侧
@@ -3786,12 +3832,12 @@ func clampBackupConfigInts(config map[string]any) []string {
 	return notes
 }
 
-// clearDeletedNodeStateBeforeRestore（历史修复 历史问题/D-2，历史用户裁定）：
+// clearDeletedNodeStateBeforeRestore（历史修复 历史问题/历史修复，历史用户裁定）：
 // 节点拓扑整体替换（DELETE FROM nodes + 重插备份行）之前，按 ip:port 身份
 // 找出「本地有而备份无」的将被删除节点，清除其 TOFU 指纹钉（文件+内存缓存，
 // 与 ForgetClusterNodePin 端点同口径：ForgetNodePin 解析地址删文件 +
 // ForgetNodePinCache 清内存）与分区上报缓存（ClearNodeSectionReports）。
-// 备份仍携带的节点 pin/上报一律保留（D-2 裁定：只清已删除节点）。
+// 备份仍携带的节点 pin/上报一律保留（历史修复 裁定：只清已删除节点）。
 //
 // 必须在 DELETE 之前执行：ForgetNodePin 需按现存行解析访问地址。若导入随后
 // 回滚，已清 pin 在下次服务控制按 TOFU 重新钉扎（幂等无害）；分区上报缓存
@@ -4092,13 +4138,24 @@ func (h *Handlers) ImportConfigBackup(c *gin.Context) {
 	if !limitConfigImportBody(c) {
 		return
 	}
-	if raw, rerr := io.ReadAll(c.Request.Body); rerr == nil {
-		h.importConfigBackupCore(c, raw, true, "", "导入")
+	raw, rerr := io.ReadAll(c.Request.Body)
+	if rerr != nil {
+		// 读体失败必须携带底层原因——此前以 dataOK=false
+		// 交回 core 对原（已半消费）body 走 ShouldBindJSON，transport 读失败退化为
+		// 通用「备份文件格式不正确」，排障方向被误导（validate/v1 两路径早已
+		// 显式返回「备份文件读取失败: …」/「内容为空」）。
+		if isRequestBodyTooLarge(rerr) {
+			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: configImportLimitMessage})
+			return
+		}
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件读取失败: " + rerr.Error()})
 		return
 	}
-	// 读体失败(如 MaxBytesReader 中途掐断):不替换 body,交由 core 内
-	// ShouldBindJSON 走原 413/400 判定路径(与抽取前行为一致)。
-	h.importConfigBackupCore(c, nil, false, "", "导入")
+	if len(raw) == 0 {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件内容为空"})
+		return
+	}
+	h.importConfigBackupCore(c, raw, true, "", "导入")
 }
 
 const warningPureJSONThreatSourcesPreserved = "纯 JSON 备份不携带威胁名单文件，已保留本地威胁源配置与名单"
@@ -4142,7 +4199,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	var lbbakFiles *lbbakPayload
 	var lbbakUnregisteredThreat []string
 	if dataOK {
-		// 历史问题:v2 JSON 备份带 UTF-8 BOM 时预览端点已剥(见
+		// 历史问题:v2 JSON 备份带 历史修复 BOM 时预览端点已剥(见
 		// config_import_v1.go),导入核心同口径——否则同一份备份预览通过、
 		// 导入 400。BOM(\xef\xbb\xbf)与 gzip 魔数(0x1f 0x8b)不冲突,
 		// 剥 BOM 必须在 isLbbakBytes 魔数检测之前。
@@ -4154,7 +4211,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 				return
 			}
 			lbbakFiles = payload
-			// F-B1：manifest 未登记的 threat/*.iplist 条目——老备份兼容照常
+			// manifest 未登记的 threat/*.iplist 条目——老备份兼容照常
 			// 落盘，响应/审计侧告警（内容未经 sha256 校验）。
 			lbbakUnregisteredThreat = payload.UnregisteredThreatEntries
 			c.Request.Body = io.NopCloser(bytes.NewReader(payload.ConfigJSON))
@@ -4197,11 +4254,11 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		}
 	}
 	if usedLegacyChecksum {
-		// 历史问题 F-D: 旧格式校验和仅覆盖数据表、不含全局配置区，完整性保障较弱，
+		// 历史问题 旧格式校验和仅覆盖数据表、不含全局配置区，完整性保障较弱，
 		// 显式记审计警告以便追溯（预览端点只读不落审计，避免 UI 选择文件即刷屏）。
 		recordAudit(c, action+"警告", "配置备份", "使用旧格式校验和（仅覆盖数据表，不含全局配置）验证备份完整性，建议升级后重新导出备份")
 	}
-	// CERT41-1(历史 历史问题,用户裁定):sections 过滤前置到全部形态/任务
+	// 历史修复(历史 历史问题,用户裁定):sections 过滤前置到全部形态/任务
 	// 校验之前——过滤后 backup.Tables 只剩实际导入表:
 	// ①未选分类的坏行不再误拒整包(此前 validateV2BackupRules 等对全量表执行);
 	// ②acmeImportRefIndex.validate「备份有表按备份行、缺表按 live」自动等于
@@ -4258,7 +4315,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// 规则库版本记录与文件必须同批落库:纯 JSON 备份(非 lbbak)不可能携带
 	// 数据文件,版本表恒跳过——否则记录与本地文件分叉(2026-09-18 用户裁定:
 	// 只有元数据=该类配置不应导入)。lbbak 无 waf 条目同理。
-	// CERT41-1:与过滤的相对顺序固定为「先剔除未选表,再按文件缺失跳过版本表」。
+	// 与过滤的相对顺序固定为「先剔除未选表,再按文件缺失跳过版本表」。
 	wafMetadataSkipped := false
 	wafCRSMetadataSkipped := false
 	wafXdbMetadataSkipped := false
@@ -4290,7 +4347,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// 历史 历史问题：content_type 白名单值域收敛（带外通道门，渲染侧另有双保险）。
 	normalizeBlockPageContentTypes(backup.Tables)
 	// B3-历史问题：冲突置禁用前移到逐行校验之前——将被自动禁用的规则不投入运行，
-	// 其 enabled-only 违规（80+TLS+跳转自环、http/https 上游混布等）不应整包
+	// 其 历史修复 违规（80+TLS+跳转自环、http/https 上游混布等）不应整包
 	// 400 阻断自愈。冲突键依赖规范化域名，故先做与 validateV2BackupRules 同
 	// 口径的域名归一（该步在此处幂等）。
 	canonicalizeBackupRuleDomains(backup.Tables["lb_rules"])
@@ -4314,7 +4371,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// 历史问题 历史问题：TLS 形态校验与任务不变量同在冲突置禁用之后执行——将自动禁用
 	// 的规则不投入运行，不参与运行态形态/不变量校验（导入/预览双路径同序，
 	// 见 ValidateConfigImport）。
-	// CERT41-1 反向悬挂预检:「导规则不导 cert 配置」且备份从未携带 cert 表时,
+	// 历史修复 反向悬挂预检:「导规则不导 cert 配置」且备份从未携带 cert 表时,
 	// live 配置被保留,启用 ACME 规则引用 live 缺失降级为悬挂警告(与下方
 	// 历史问题 预检对称,不阻断,进 responseWarnings+审计);备份携带 cert 表却被
 	// 分类过滤丢弃时维持硬拒绝(误放行关闭)。
@@ -4334,7 +4391,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	}
 	// 历史问题 历史问题：写全局配置前按 UpdateAdminTLS 同口径校验 admin_tls_*——坏配置
 	// 会使下次启动进程退出（崩溃循环），整包 400 保持零写入语义。
-	// CERT41-1:仅 includeGlobal 时全局配置区参与校验/钳制(未选系统数据时
+	// 仅 includeGlobal 时全局配置区参与校验/钳制(未选系统数据时
 	// backup.Config 已置 nil,本校验与下方钳制链自然短路)。
 	if err := validateV2BackupAdminTLS(backup.Config); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
@@ -4372,7 +4429,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		lo, hi      int
 		fallbackDef int
 	}{
-		// 历史问题 C-F3：非法形态回退值对齐 schema 默认（db.go cert_renewal_days=30/
+		// 历史问题 非法形态回退值对齐 schema 默认（db.go cert_renewal_days=30/
 		// cert_renewal_attempts=5/cert_expiry_days=30）与显示侧 COALESCE——
 		// 此前 3/90 与写侧校验边界一致但与默认值漂移，修复后的续签窗口/到期
 		// 提醒参数会静默偏离系统默认直至管理员重存。
@@ -4401,7 +4458,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 			}
 		}
 	}
-	// 历史问题 C-N2：request_body_max_size_mb 导入钳制（与 历史问题 历史问题 写侧三处
+	// 历史问题 request_body_max_size_mb 导入钳制（与 历史问题 历史问题 写侧三处
 	// 同边界）——溢出向量此前只堵了保存/更新，备份导入可携带天文数字绕过，
 	// 渲染侧 MB→字节 int64 乘法回绕会让 body 限制静默取消。库值唯一真相
 	//（批 1+2）：该列为类型①值型列，<=0（旧备份的渲染兜底时代残留/NULL）
@@ -4446,7 +4503,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		operatorReplaced = true
 		recordAudit(c, action+"警告", "配置备份", "备份不含当前操作账户——系统数据将被替换，"+action+"后请使用备份内的管理员账户登录")
 	}
-	// CERT41-1 反向:导规则不导 cert 配置且备份从未携带 cert 表时,上方 TLS
+	// 历史修复 反向:导规则不导 cert 配置且备份从未携带 cert 表时,上方 TLS
 	// 形态软校验已计数悬挂引用——降级警告进审计(与 历史问题 同格,不阻断)。
 	if acmeDanglingImported > 0 {
 		recordAudit(c, action+"警告", "配置备份", fmt.Sprintf(action+"后 %d 条启用 ACME 规则的提供商引用悬挂(引用未随备份导入且现有配置缺失)——下一次签发/续签将失败,请补齐 DNS 提供商配置", acmeDanglingImported))
@@ -4490,7 +4547,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	}
 	defer session.close()
 	tx := session.tx
-	// B3-82-历史问题：初检可能读取 live certificate_configs/ca_providers；从读到
+	// 历史修复-历史问题：初检可能读取 live certificate_configs/ca_providers；从读到
 	// 取得 caddyOpMu 的窗口内 DeleteCertificateConfig 可删除被引用行。此处已在
 	// 锁内，重跑引用/TLS 形态校验；若初检已有悬挂（soft 警告语义）则不改变其
 	// 既有降级口径。
@@ -4585,7 +4642,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	if lbbakFiles != nil && len(lbbakFiles.ThreatIplists) > 0 {
 		localThreatRows = captureThreatSourceRows(ctx)
 	}
-	// 历史修复 历史问题/D-2：nodes 整体替换前清理「将被删除节点」的 TOFU 指纹钉与
+	// 历史修复 历史问题/nodes 整体替换前清理「将被删除节点」的 TOFU 指纹钉与
 	// 分区上报缓存（保留备份仍携带节点的 pin）——必须赶在 DELETE FROM nodes
 	// 之前（pin 地址需按现存行解析）。
 	clearedNodeArtifacts := 0
@@ -4632,7 +4689,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 			return
 		}
 	}
-	// 规则三面同构（2026-10-11 用户裁定；历史 CL-4 收敛）：导入的规则行
+	// 规则三面同构（2026-10-11 用户裁定；历史 历史修复 收敛）：导入的规则行
 	// 在事务内做 TCP 死值清零（七字段+TLS 三字段）+ lb_rules/path_rules 时间戳
 	// 平面格式归一——与 normalizeRuleForTransport 传输归一/启动迁移同一清单
 	// （不归一则导入后主端 DB 重新回到三态并存）。此前是平行手写 SQL 归一块
@@ -4652,7 +4709,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		// 历史问题-历史问题：规则表缺席（如仅导入「安全防护」）时上面的归一不跑，
 		// 但 security_policy_bindings 被携带——指向 live TCP 规则的绑定会随
 		// 插入存活，必须在插入后清理（幂等）。绑定表也缺席的分类导入不得顺手
-		// 改写安全绑定（U04B-01 同口径）。
+		// 改写安全绑定（历史修复 同口径）。
 		droppedTCPBindings, err = pruneTCPRuleBindings(ctx, tx)
 		if err != nil {
 			err = session.abort(err)
@@ -4678,7 +4735,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		}
 	}
 
-	// U04B-01：规则或策略被整体替换而绑定表缺席时，live 绑定仍保留。
+	// 规则或策略被整体替换而绑定表缺席时，live 绑定仍保留。
 	// 在事务内按导入后视图清理两端任一悬挂的绑定；未触碰这三张表的
 	// 分类导入不得顺手改写安全绑定。
 	var prunedBindings int64
@@ -4696,7 +4753,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		prunedBindings, _ = result.RowsAffected()
 	}
 
-	// K2-历史问题(历史):四态化启动迁移只覆盖启动路径——pre-v2.2.7 备份
+	// K2-历史问题(历史):四态化启动迁移只覆盖启动路径——历史修复.2.7 备份
 	// 导入 off+启用自定义规则的策略后静默失活(旧语义 off=自定义照常发射,
 	// 新语义 off=全关),违背迁移「行为零突变」意图。导入事务内做同款归一
 	// (与 migrateSecurityPolicyCustomOnlyMode 的行级语义一致,但不走旗标门:
@@ -4723,11 +4780,11 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	// 历史问题 B1: pre-历史问题 备份可能携带 ≥2 个 is_default=1 的拦截页。restoreTable
 	// 原值插入后这些行全部成为不可编辑/删除的死行，且 branding 重渲染会覆盖
 	// 全部默认页内容。提交前降级多余默认页，仅保留 MIN(id) 一行。
-	// 历史问题 B42-2: pre-历史问题 备份中保留行（MIN id）常是未定制过的种子行，而用户真实
+	// 历史问题 pre-历史问题 备份中保留行（MIN id）常是未定制过的种子行，而用户真实
 	// 定制内容在被降级行上。保留行内容为种子库存（空或默认渲染）且存在内容不同的
 	// 被降级行时，把内容非空且非库存、id 最大的被降级行 content 提升到保留行；
 	// 失败仅记警告（内容层面问题，branding 重渲染会覆盖，不影响拦截功能）。
-	// 历史问题 B43-1: 提升先于降级执行——降级后「被降级行」与从未是默认页的自定义行
+	// 历史问题 提升先于降级执行——降级后「被降级行」与从未是默认页的自定义行
 	// 无法区分；CTE 在降级前圈定待降级行集合，提升源限定该集合且以 EXISTS 门控
 	// （未发生降级即跳过提升），单默认页+自定义页的备份不再静默改写默认页内容。
 	reseedBlockPageNeeded := false
@@ -4753,8 +4810,8 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 			if err != nil {
 				recordAudit(c, action+"警告", "配置备份", "默认拦截页面重播种失败: "+err.Error())
 			} else if affected, _ := result.RowsAffected(); affected == 0 {
-				// 历史问题 B42-1: 备份携带 id=1 的非默认行时 OR IGNORE 因 PK 冲突静默
-				// no-op，导入后仍旧零默认页且无任何 error——B3 的告警机制不会
+				// 历史问题 备份携带 id=1 的非默认行时 OR IGNORE 因 PK 冲突静默
+				// 历史修复，导入后仍旧零默认页且无任何 error——B3 的告警机制不会
 				// 触发，此处显式补记警告以便追溯。
 				recordAudit(c, action+"警告", "配置备份", "默认拦截页面重播种未生效（id=1 已存在）")
 			} else {
@@ -4814,7 +4871,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理孤儿证书任务失败，已回滚: " + err.Error()})
 			return
 		}
-		// X-1（历史 历史问题）：规则存在但已非 ACME 自动签发态（manual/未启用/TLS
+		// 历史修复（历史 历史问题）：规则存在但已非 ACME 自动签发态（manual/未启用/TLS
 		// 关闭）的 cert_jobs 行——上方孤儿清理只覆盖 rule_id 不在 lb_rules 的行，
 		// 此类「规则仍在」的失效任务会被续签扫描/任务列表当作活任务。谓词与续签
 		// 扫描（certjobs.go/caddy.go 的 ACME 规则判据）同口径。
@@ -4943,7 +5000,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 				}
 			}
 		}
-		// B3-82-历史问题：CRS 规则树实际未落盘时，早前的「按新树降级只做形状
+		// 历史修复-历史问题：CRS 规则树实际未落盘时，早前的「按新树降级只做形状
 		// 校验」不再成立——必须按仍生效的 live 索引重验策略，避免落库空 Include。
 		if crsTreeReplaced && wafApply.FailedCRS {
 			crsTreeReplaced = false
@@ -5034,7 +5091,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 			return
 		}
 	}
-	// U04B-07：branding_json 只是文件镜像。提交成功后把备份值物化到
+	// branding_json 只是文件镜像。提交成功后把备份值物化到
 	// branding.json，再刷新镜像与默认页面；否则下一次镜像会把 DB 回写成旧文件。
 	brandingWarning := ""
 	if backup.Config != nil {
@@ -5055,10 +5112,10 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 			}
 		}
 	}
-	// PM-1（历史·A77PluginMisc）：备份导入是第三条解封面——本函数对
+	// 历史修复（历史·A77PluginMisc）：备份导入是第三条解封面——本函数对
 	// security_ip_lists 全量替换（DELETE 全表+插备份行，deleteOrder/insertOrder
 	// W2 语义），commit 成功后内存 autobanWindows 若保留旧计数桶，还原旧备份后
-	// 零新流量 ≤1 tick 重封（与「删除即解封」同型撤销，AB-1 两接线点不覆盖导入
+	// 零新流量 ≤1 tick 重封（与「删除即解封」同型撤销，历史修复 两接线点不覆盖导入
 	// 面）。门控=备份实际携带该表（迟到表「缺席=保留本地」形态本地名单未动，
 	// 计数桶保留）；此时点在 session.commit 之后且仍持 caddyOpMu（beginConfigImport
 	// 取锁），与 handlers 解封清桶（同锁临界区）全序、无回滚副作用。Ruling
@@ -5082,7 +5139,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	if reseedBlockPageNeeded {
 		// 提交成功后才渲染 branding 内容：INSERT 只放空 content 占位，真实内容
 		// 由 SeedDefaultBlockPage 依据 branding.json 写入；失败不影响导入结果。
-		// 历史问题 B42-1: 返回值不再丢弃——渲染出错，或未生效且表内仍无默认页时记警告。
+		// 历史问题 返回值不再丢弃——渲染出错，或未生效且表内仍无默认页时记警告。
 		seeded, seedErr := SeedDefaultBlockPage(h.cfg.DataDir)
 		if seedErr != nil {
 			recordAudit(c, action+"警告", "配置备份", "默认拦截页面内容渲染失败: "+seedErr.Error())
@@ -5133,11 +5190,11 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	auditParts = append(auditParts, certNumericClamped...)
 	auditParts = append(auditParts, autobanClampNotes...)
 	if len(skipWarnings) > 0 {
-		// N+13 H2-F3：列表现含空域名规则与空内容拦截页两类跳过，标签泛化。
+		// N+13 列表现含空域名规则与空内容拦截页两类跳过，标签泛化。
 		auditParts = append(auditParts, "跳过警告："+strings.Join(skipWarnings, "；"))
 	}
 	if len(importCertWarnings) > 0 {
-		// CERT41-4:证书链/域名警告随成功审计留痕(不阻断)。
+		// 证书链/域名警告随成功审计留痕(不阻断)。
 		auditParts = append(auditParts, "证书警告："+strings.Join(importCertWarnings, "；"))
 	}
 	if len(disabledConflicts) > 0 {
@@ -5162,7 +5219,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	recordAudit(c, "重载", "Caddy服务", action+"配置后自动重载")
 	// 2026-09-07 审计 L4（历史修复 F2 修正）：导入成功后清除陈旧 caddy_apply_error
 	// ——但 reseed 失败时不清（reseed 的 caddyApplyNoteLocked 可能刚写入
-	// 失败标记，无条件清除会把真实失败横幅抹掉）。F-SYS-2（历史）：
+	// 失败标记，无条件清除会把真实失败横幅抹掉）。历史修复（历史）：
 	// 未走 reseed 路径时 reseedApplyFailed 恒 false（只在上方 reseed 块内置位），
 	// 故双重否定守卫等价于 !reseedApplyFailed。
 	if !reseedApplyFailed {
@@ -5193,7 +5250,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	if wafXdbMetadataSkipped {
 		responseWarnings = append(append([]string{}, responseWarnings...), warningWafXdbMetadataSkipped)
 	}
-	// F-B1（历史）：manifest 未登记的威胁库条目——不拒绝（老备份
+	// 历史修复（历史）：manifest 未登记的威胁库条目——不拒绝（老备份
 	// 兼容），但响应与审计必须可见「内容未经完整性校验」。
 	if len(lbbakUnregisteredThreat) > 0 {
 		unregisteredDetail := fmt.Sprintf("lbbak 含 manifest 未登记的威胁库条目（%s）——内容未经完整性校验，已按原样落盘；建议核实来源后重新导出备份", strings.Join(lbbakUnregisteredThreat, "、"))
@@ -5218,12 +5275,12 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	if acmeDanglingRules > 0 {
 		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf(action+"后 %d 条启用规则的 DNS 提供商配置悬挂（引用不在导入数据中）——下一次签发/续签将失败，请及时补齐", acmeDanglingRules))
 	}
-	// CERT41-1 反向悬挂警告(与上方审计同文案族;与 acmeDanglingRules 互斥,
+	// 历史修复 反向悬挂警告(与上方审计同文案族;与 acmeDanglingRules 互斥,
 	// 方向不同:此处为导入规则引用 live 缺失)。
 	if acmeDanglingImported > 0 {
 		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf(action+"后 %d 条启用规则的 DNS 提供商配置悬挂（引用未随备份导入，且现有配置中不存在或已禁用）——下一次签发/续签将失败，请及时补齐", acmeDanglingImported))
 	}
-	// CERT41-4:证书链/域名警告并入响应(行内容类警告,不阻断)。
+	// 证书链/域名警告并入响应(行内容类警告,不阻断)。
 	if len(importCertWarnings) > 0 {
 		responseWarnings = append(append([]string{}, responseWarnings...), importCertWarnings...)
 	}
@@ -5257,7 +5314,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 		}
 	}
 	services.SyncBusinessTaskDrivers()
-	// U04B-08：爬虫源或名单被替换后，caddygeoip 的运行交换文件必须立即
+	// 爬虫源或名单被替换后，caddygeoip 的运行交换文件必须立即
 	// 与 DB 收敛；专用 rebuild 不播种、不回写名单，失败仅告警不回滚已提交配置。
 	_, crawlerSourcesReplaced := backup.Tables["security_crawler_sources"]
 	_, ipListsReplaced := backup.Tables["security_ip_lists"]
@@ -5282,7 +5339,7 @@ WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALE
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: fmt.Sprintf("配置"+action+"成功：%s", strings.ReplaceAll(counts, "；", "、")), Data: gin.H{"summary": counts, "disabled_conflicts": disabledConflicts, "warnings": responseWarnings}})
 }
 
-// collectImportCertificates 待物化的手动证书材料与质量警告（CERT41-4 /
+// collectImportCertificates 待物化的手动证书材料与质量警告（历史修复 /
 // 历史问题-04 单源）：TCP 行的 TLS 字段已被 normalizeRuleRowsForTransport 在库侧
 // 清零（不终结入站 TLS）——不得用内存备份行把私钥物化到 /app/certs。
 func collectImportCertificates(rows []map[string]any) ([]importCertificate, []string) {
@@ -5295,6 +5352,16 @@ func collectImportCertificates(rows []map[string]any) ([]importCertificate, []st
 		}
 		protocol, _ := row["protocol"].(string)
 		if protocol == "tcp" {
+			continue
+		}
+		// 物化条件必须与渲染 availableCerts 同口径
+		// （enable_tls && tls_source=manual）——事务内归一已把非 manual 行的
+		// tls_cert/tls_key 清空，但内存备份行仍会把 acme_dns 行的私钥对物化到
+		// /app/certs（DB 已不引用），并产生误导性证书质量警告。
+		if tlsSource := backupString(row["tls_source"]); tlsSource != "" && tlsSource != "manual" {
+			continue
+		}
+		if enabled, ok := row["enable_tls"]; ok && enabled != nil && !backupBooleanEnabled(enabled) {
 			continue
 		}
 		certPEM, _ := row["tls_cert"].(string)

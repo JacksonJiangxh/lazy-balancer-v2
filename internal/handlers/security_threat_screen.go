@@ -99,10 +99,18 @@ const (
 	// threatRollupGeoIPGenerationKey 固化时使用的归属地库代际（历史问题）：
 	// 与当前代际不一致 → 重固窗口（库恢复后历史空归属地维度自愈）。
 	threatRollupGeoIPGenerationKey = "threat_rollup_geoip_generation"
+	// threatRollupClassifierVersionKey / threatRollupClassifierVersion 分类器口径
+	// 代际：rollup 固化的是 categorizeAttack 的分类结果，而重建触发
+	// 只覆盖目标维度（target_read/geoip 代际）——分类逻辑跨版本调整后，已固化
+	// 分钟的 family 仍是旧口径且不会重算，大屏 top_attack_types/attack_type_share
+	// 与安全总览（直读原始表、用当前分类）在同一窗口分裂。分类口径变更必须
+	// 递增 threatRollupClassifierVersion，代际不一致按空覆盖重固。
+	threatRollupClassifierVersionKey = "threat_rollup_classifier_version"
+	threatRollupClassifierVersion    = "2"
 	// threatRollupRebuildFromKey 未完成的全量重建意图起点（A83A-历史问题-01）：
 	// 目标维度就绪标记缺失 / GeoIP 代际变化的触发窗口起点。意图存在期间每次
 	// 固化都按 fullRebuild 处理并把回填下界扩到该起点，覆盖底端推进到起点后
-	// 删除——修复「单次调用最多 23h，其余分钟的增量路径无新事件即 no-op，
+	// 删除——修复「单次调用最多 23h，其余分钟的增量路径无新事件即 历史修复，
 	// 目标维度/归属地永不补算、就绪标记却已写入」的自愈中断。
 	threatRollupRebuildFromKey = "threat_rollup_rebuild_from"
 	// threatRollupStaleAfter 固化陈旧阈值（历史 历史问题）：warmer 每 60s
@@ -146,7 +154,7 @@ func loadThreatRollupRawState(database *sql.DB, key string) (string, bool, error
 // 导致每次摄取都整窗重固。
 func threatRollupRewindMinute(minute time.Time) time.Time {
 	hours := threatRollupRewindWindowHours
-	if req := int(threatRollupRequestedHours.Load()); req > hours {
+	if req := threatRollupRequestedHoursLimit(); req > hours {
 		hours = req
 	}
 	if hours > threatScreenMaxHours {
@@ -183,7 +191,7 @@ func applyPendingThreatRollupRewindInLock() {
 
 // ThreatRollupRewindTo 摄取提交后回退 rollup 覆盖水位（历史问题-1，历史）。
 // minute=本批实际插入的最旧事件分钟（UTC）。若该分钟落在已覆盖区间内（停机/
-// 升级积压、轮转补采），把 last_fixed 回退到 minute-1——下一次 ensureThreatRollup
+// 升级积压、轮转补采），把 last_fixed 回退到 历史修复——下一次 ensureThreatRollup
 // 从该分钟起重固到窗口末端（幂等）。
 // 历史问题-历史问题：不得阻塞摄取提交——warmer 批次期间 TryLock 失败时仅排队，
 // 由 ensure 的批次间隙/下一次 warmer 合并执行；窗口外目标钳制到展示下界。
@@ -287,7 +295,7 @@ func ensureThreatRollupWithYields(hours int) error {
 
 	// 覆盖区间 [coveredFrom, lastFixed]（完整分钟，持久化在 metrics_state）：
 	//   - 空覆盖 = coveredFrom 为 lastComplete（首个未来分钟）、lastFixed 为
-	//     lastComplete-1；
+	//     历史修复；
 	//   - 请求窗口 [dFrom, dTo] 中「更旧未覆盖段」与「更新未覆盖段」分别按批
 	//     补齐（历史问题：先前窄窗口（hours=1）把水位推到最新后，后续宽窗口
 	//     不得因「水位已到最新」而漏掉未回填的旧分钟）。
@@ -306,7 +314,7 @@ func ensureThreatRollupWithYields(hours int) error {
 		return err
 	}
 	// 一致性归一（历史问题 陈旧/损坏标记钳制）：coveredFrom 在窗口之后、lastFixed
-	// 在窗口之后、或 lastFixed 早于 coveredFrom-1（陈旧水位先于已覆盖底端）
+	// 在窗口之后、或 lastFixed 早于 历史修复（陈旧水位先于已覆盖底端）
 	// 一律按空覆盖处理——空覆盖区间的端点=(dTo+1, dTo)，旧侧缺口一次性覆盖到
 	// 窗口末端，回填有界且幂等。
 	validCoverage := okCovered && okFixed && !coveredFrom.After(dTo) && !lastFixed.After(dTo) &&
@@ -341,13 +349,20 @@ func ensureThreatRollupWithYields(hours int) error {
 		emptyCoverage = true
 		rebuildNeeded = true
 	}
+	// 分类器代际不一致 → 历史分钟按空覆盖重固（与目标维度/归属地同机制）。
+	if curVer, verOK, vErr := loadThreatRollupRawState(database, threatRollupClassifierVersionKey); vErr != nil {
+		return vErr
+	} else if !verOK || curVer != threatRollupClassifierVersion {
+		emptyCoverage = true
+		rebuildNeeded = true
+	}
 	if emptyCoverage {
 		coveredFrom = dTo.Add(time.Minute)
 		lastFixed = dTo
 	}
 	// A83A-历史问题-01（历史）：重建意图跨调用持久化。旧实现只在触发
 	// 那一轮把 rebuildAll 置真——单次最多回填 23h（批数上限），宽窗口其余
-	// 分钟的增量路径在「无新事件」时直接 no-op，目标维度/归属地永不补算，
+	// 分钟的增量路径在「无新事件」时直接 历史修复，目标维度/归属地永不补算，
 	// 而目标就绪标记已在首轮写入（后续调用 rebuildAll=false），自愈中断且
 	// backfill_incomplete 不再披露。持久化起点并据此扩展回填下界，使后续
 	// 任意窗口的调用都继续全量重建，直到覆盖底端到达意图起点。
@@ -507,6 +522,12 @@ func ensureThreatRollupWithYields(hours int) error {
 			tx.Rollback()
 			return err
 		}
+		// 与固化结果同事务记录分类器口径代际。
+		if _, err := tx.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+			threatRollupClassifierVersionKey, threatRollupClassifierVersion); err != nil {
+			tx.Rollback()
+			return err
+		}
 		if err := tx.Commit(); err != nil {
 			return err
 		}
@@ -543,7 +564,57 @@ var (
 
 // threatRollupRequestedHours 最近请求过的最大窗口（小时）：宽窗口请求把
 // 需求告知 warmer，后台每轮按 max(7d, 需求) 扩窗回填（历史 历史问题）。
+// 需求带**有界有效期**——大屏固定 24h 消费，hours 参数仅为后续扩展
+// 保留；一次 30d 请求若永久生效，warmer 每分钟都按 30d 回填，后台成本被
+// 单次请求永久抬升。超过 threatRollupRequestedHoursTTL 未再请求即复位。
 var threatRollupRequestedHours atomic.Int64
+
+// threatRollupRequestedHoursAt 最近一次宽窗口请求的 UnixNano（0=无需求）。
+var threatRollupRequestedHoursAt atomic.Int64
+
+// threatRollupRequestedHoursTTL 宽窗口需求有效期：需覆盖「大屏持续轮询」
+// （30s 一轮）而远小于「永久」。过期即回落到默认 7d 预热窗口。
+const threatRollupRequestedHoursTTL = 15 * time.Minute
+
+// recordThreatRollupRequestedHours 记录一次宽窗口请求（>24h 才调用）：窗口
+// 只升不降，但每次都刷新有效期；上限钳制到 threatScreenMaxHours。
+func recordThreatRollupRequestedHours(hours int) {
+	if hours <= 24 {
+		return
+	}
+	if hours > threatScreenMaxHours {
+		hours = threatScreenMaxHours
+	}
+	for {
+		cur := threatRollupRequestedHours.Load()
+		if int64(hours) > cur {
+			if !threatRollupRequestedHours.CompareAndSwap(cur, int64(hours)) {
+				continue
+			}
+		}
+		threatRollupRequestedHoursAt.Store(time.Now().UnixNano())
+		return
+	}
+}
+
+// threatRollupRequestedHoursLimit 当前有效的宽窗口需求（小时，0=无）：
+// 过期需求就地 CAS 复位（并发写入者不会被覆盖——CAS 失败重读）。
+func threatRollupRequestedHoursLimit() int {
+	for {
+		req := int(threatRollupRequestedHours.Load())
+		if req <= 0 {
+			return 0
+		}
+		seen := threatRollupRequestedHoursAt.Load()
+		if seen != 0 && time.Since(time.Unix(0, seen)) <= threatRollupRequestedHoursTTL {
+			return req
+		}
+		if threatRollupRequestedHours.CompareAndSwap(int64(req), 0) {
+			threatRollupRequestedHoursAt.CompareAndSwap(seen, 0)
+			return 0
+		}
+	}
+}
 
 // markThreatRollupSuccess 记录一次成功固化（任何路径：warmer / 请求懒固化）。
 func markThreatRollupSuccess() {
@@ -601,7 +672,7 @@ func StartThreatRollupWarmer(ctx context.Context) {
 			// 只预热 24h 会让升级后 24h–7d 区间在裁剪后永久少计
 			// （历史 历史问题-01）。单次调用按 25 批有界推进，后续轮次续做。
 			hours := threatRollupRewindWindowHours
-			if req := int(threatRollupRequestedHours.Load()); req > hours {
+			if req := threatRollupRequestedHoursLimit(); req > hours {
 				hours = req
 			}
 			if hours > threatScreenMaxHours {
@@ -636,6 +707,7 @@ func resetThreatRollupWarmerForTest() {
 	threatRollupReadyAt.Store(0)
 	threatRollupReadyDB.Store(nil)
 	threatRollupRequestedHours.Store(0)
+	threatRollupRequestedHoursAt.Store(0)
 }
 
 // queryThreatRecentBlocked 近 5 分钟 blocked 计数（大屏 recent_rate 数据源）。
@@ -854,8 +926,8 @@ func threatLocationParts(location string) (string, string) {
 	return country, province
 }
 
-// trafficCountry/trafficSnapshot Caddy admin /lb/traffic-stats 响应形状
-// （caddygeoip per-country 原子计数器，attack/normal 双桶累计）。
+// trafficCountry/trafficSnapshot Caddy admin /lb/历史修复 响应形状
+// （caddygeoip 历史修复 原子计数器，attack/normal 双桶累计）。
 type trafficCountry struct {
 	Attack uint64 `json:"attack"`
 	Normal uint64 `json:"normal"`
@@ -872,7 +944,7 @@ func threatTrafficEmptyDegrade() gin.H {
 	return gin.H{"countries": map[string]trafficCountry{}, "available": false, "sample_n": 1}
 }
 
-// ControlThreatScreenCollector POST/DELETE /security/overview/threat-screen/collector
+// ControlThreatScreenCollector POST/DELETE /security/overview/历史修复/collector
 // 代理 Caddy admin 的流量采集租约：大屏打开时申请/续租，关闭时释放；
 // 插件在无租约时跳过所有流量采集热路径（安全日志不受影响）。
 func (h *Handlers) ControlThreatScreenCollector(c *gin.Context) {
@@ -900,7 +972,7 @@ func (h *Handlers) ControlThreatScreenCollector(c *gin.Context) {
 	c.Data(resp.StatusCode, "application/json", respBody)
 }
 
-// GetThreatScreenFlowEvents GET /security/overview/threat-screen/events
+// GetThreatScreenFlowEvents GET /security/overview/历史修复/events
 // 代理 Caddy admin 逐请求正常流量环形缓冲；since_seq 增量拉取，仅大屏打开时
 // 前端轮询。响应透传 enabled/sample_n/events/next_seq。
 func (h *Handlers) GetThreatScreenFlowEvents(c *gin.Context) {
@@ -963,8 +1035,8 @@ func (h *Handlers) GetThreatScreenFlowEvents(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: payload})
 }
 
-// GetThreatScreenTraffic GET /security/overview/threat-screen/traffic
-// 大屏实时流量代理（Plan B）：读 Caddy admin 自定义端点 /lb/traffic-stats，
+// GetThreatScreenTraffic GET /security/overview/历史修复/traffic
+// 大屏实时流量代理（Plan B）：读 Caddy admin 自定义端点 /lb/历史修复，
 // 国名翻译中文（geoipnames 单源）+ Reserved/空/0 键过滤。1s TTL + singleflight
 // 进程内缓存（key=admin URL，大屏 1-2s 轮询不对 admin 放大请求；失败不缓存）。
 func (h *Handlers) GetThreatScreenTraffic(c *gin.Context) {
@@ -1053,7 +1125,7 @@ func threatHourlyBuckets(hours int, now time.Time, offset int) ([]time.Time, []m
 	return bucketStarts, hourly
 }
 
-// GetSecurityThreatScreen GET /security/overview/threat-screen?hours=24
+// GetSecurityThreatScreen GET /security/overview/历史修复?hours=24
 // 返回大屏聚合：窗口总量/拦截率/logged 数/限流拦截数（Caddy metrics 429，
 // 重载口径）/活跃攻击源（近 10min 去重）/国家计数 map（ip_location 首段，
 // 空归属跳过）/Top3 攻击国家、攻击类型与被攻击目标（top_targets，
@@ -1127,13 +1199,7 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 	//   - 宽窗口（>24h）尚未覆盖到窗口起点 → 按持久 coverage 在请求路径补做
 	//     旧侧分钟（单次有界批，后续轮询/ warmer 续做），7d 窗口不依赖恒
 	//     24h 的 warmer。
-	if hours > 24 {
-		for cur := threatRollupRequestedHours.Load(); int64(hours) > cur; cur = threatRollupRequestedHours.Load() {
-			if threatRollupRequestedHours.CompareAndSwap(cur, int64(hours)) {
-				break
-			}
-		}
-	}
+	recordThreatRollupRequestedHours(hours)
 	needsSync := !threatRollupWarmerStarted.Load() || threatRollupStale() ||
 		(hours > 24 && !threatRollupCoverageReaches(hours))
 	if needsSync {

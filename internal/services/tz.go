@@ -191,7 +191,7 @@ func Logf(level, format string, args ...any) {
 	}
 }
 
-// applicationLogWriter 按 "WARNING:"/"ERROR:" 行首前缀做级别过滤（F-SYSR-5，
+// applicationLogWriter 按 "WARNING:"/"ERROR:" 行首前缀做级别过滤（历史修复，
 // 历史·声明）——隐式依赖 main.go log.SetFlags(0)：标准 log 的时间戳/
 // 文件名前缀会顶掉级别前缀使过滤全数落空。两侧契约互指（见 main.go 同名注释）。
 // S历史问题：多行 payload（Logf 消息内嵌换行）逐行判定后重组——只看首行会把
@@ -241,9 +241,15 @@ func (writer *applicationLogWriter) Write(p []byte) (int, error) {
 	if err != nil {
 		return written, err
 	}
-	// U7b-F5（历史）：短写必须如实返回 sink 的写入量——返回 len(p) 偏离
-	// io.Writer 契约（装饰器不得替 sink 谎报）。
-	return written, nil
+	// 多行过滤后 out 短于 p，sink 写满 out 即表示入参
+	// 全部被消费——必须返回 len(p), nil（此前返回 sink 的 written<len(p) 且
+	// err=nil，违反 io.Writer「n<len(p) 必须带 error」契约，短写敏感的消费者
+	// （io.Copy/bufio）会把它当截断重试）。sink 自身短写时无法把 sink 字节
+	// 映射回入参，按契约报 io.ErrShortWrite。
+	if written < len(out) {
+		return 0, io.ErrShortWrite
+	}
+	return len(p), nil
 }
 
 // lineAllowedAtThreshold 报告单行日志是否达到配置阈值（行首级别前缀判定）。
@@ -285,7 +291,7 @@ func hasASCIIPrefixFold(value []byte, prefix string) bool {
 }
 
 // ApplyLogLevel 读取全局日志级别并应用。main 在 db.Initialize 完成后立即调用，
-// 集群配置导入（users 节）后亦调用——U7b-F2（历史）：此装配点同时执行
+// 集群配置导入（users 节）后亦调用——历史修复（历史）：此装配点同时执行
 // 一次即时 refreshLocation。init 期启动的刷新 worker 首查时 DB 未就绪恒空转，
 // 配置时区（尤其 DST 时区）此前最长要等 30s ticker 才生效，期间日志时间戳落在
 // FixedZone+8 占位时区；装配点即时刷新消除该窗口，导入新时区亦即时生效。

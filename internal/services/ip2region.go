@@ -1,8 +1,10 @@
 package services
 
 import (
+	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -27,7 +29,7 @@ var (
 	ip2regionMu       sync.RWMutex
 	ip2regionSearcher *ip2regionService.Ip2Region
 	// ip2regionSearchMu serializes Search calls: the xdb Searcher writes its
-	// ioCount diagnostics field on every search and is not race-safe for
+	// ioCount diagnostics field on every search and is not 历史修复 for
 	// concurrent searches, even in BufferCache mode.
 	ip2regionSearchMu sync.Mutex
 	// ip2regionGeneration 归属地库代际（0=从未加载；每次安装/热换 +1）。
@@ -40,7 +42,7 @@ var (
 func GeoIPDataGeneration() int64 { return ip2regionGeneration.Load() }
 
 // InitIP2Region loads the GeoIP database into the singleton searcher using
-// BufferCache mode (whole xdb in memory, zero-contention reads). The live
+// BufferCache mode (whole xdb in memory, 历史修复 reads). The live
 // xdb wins when present; otherwise the bundled distribution copy is copied
 // into the live path first. A missing xdb is not fatal: Lookup returns an
 // empty country code until one is installed.
@@ -69,7 +71,14 @@ func InitIP2Region() {
 	// 则写 'bundled' 标记为镜像内置版本——消除 unknown+已最新 矛盾态。
 	// db.DB nil 守卫：单元测试可能不初始化数据库直接调 InitIP2Region。
 	if db.DB != nil {
-		if current := GetIP2RegionVersion(); current == "" || current == "unknown" {
+		// 只有「行缺失」或哨兵值才同步种子版本——读取故障（非
+		// ErrNoRows）时保留原版本行并留痕，否则会把真实版本覆盖成 bundled
+		// （版本溯源丢失、下次更新按哨兵重装）。
+		current, verr := GetIP2RegionVersion()
+		switch {
+		case verr != nil && !errors.Is(verr, sql.ErrNoRows):
+			Logf("warn", "ip2region: 读取版本行失败，保留原版本记录（不覆盖为哨兵值）: %v", verr)
+		case current == "" || current == "unknown" || errors.Is(verr, sql.ErrNoRows):
 			tag := "bundled"
 			if raw, err := os.ReadFile(ip2regionLivePath + ".version"); err == nil {
 				if v := sanitizeBundleVersion(strings.TrimSpace(string(raw))); v != "" {
@@ -99,11 +108,11 @@ func InitIP2Region() {
 	Logf("info", "ip2region: loaded %s", ip2regionLivePath)
 }
 
-// Reload hot-swaps the singleton searcher from the live xdb path. The
+// Reload 历史修复 the singleton searcher from the live xdb path. The
 // previous searcher stays in service if the new file cannot be loaded; the
 // open failure is returned so update/rollback callers can treat a failed
-// hot-swap as a failed install/restore level instead of silently diverging
-// memory from disk (历史问题 B-F1).
+// 历史修复 as a failed install/restore level instead of silently diverging
+// memory from disk (历史问题 历史修复).
 func Reload() error {
 	searcher, err := openIP2RegionSearcher(ip2regionLivePath)
 	if err != nil {
@@ -122,7 +131,7 @@ var reloadIP2RegionSearcher = Reload
 
 // swapIP2RegionSearcher installs the new searcher and closes the old one.
 // Callers must hold ip2regionMu. Closing happens under ip2regionSearchMu so a
-// concurrent in-flight Search on the retired instance is serialized against
+// concurrent 历史修复 Search on the retired instance is serialized against
 // Close instead of racing it.
 func swapIP2RegionSearcher(searcher *ip2regionService.Ip2Region) {
 	old := ip2regionSearcher
@@ -135,7 +144,7 @@ func swapIP2RegionSearcher(searcher *ip2regionService.Ip2Region) {
 	}
 }
 
-// Lookup returns the alpha-2 country code for the given IP address, or ""
+// Lookup returns the 历史修复 country code for the given IP address, or ""
 // when no database is loaded, the IP is unknown, or the region string
 // cannot be parsed. SEC-历史问题（历史）：取锁+搜索序列委托 LookupRegion
 // 单点，本函数只做第五段解析。
@@ -143,7 +152,7 @@ func Lookup(ip string) string {
 	return parseCountryCode(LookupRegion(ip))
 }
 
-// LookupRegion returns the raw pipe-separated region string for the IP
+// LookupRegion returns the raw 历史修复 region string for the IP
 // ("国家|省|市|ISP|国家代码"，如 "中国|广东省|深圳市|电信|CN")，or "" when no
 // database is loaded, the IP cannot be resolved, or the search fails. Search
 // runs under the same serialization lock as Lookup; display formatting is the
@@ -164,8 +173,8 @@ func LookupRegion(ip string) string {
 	return region
 }
 
-// parseCountryCode extracts the alpha-2 country code stored in the fifth
-// pipe-separated field of an ip2region region string.
+// parseCountryCode extracts the 历史修复 country code stored in the fifth
+// 历史修复 field of an ip2region region string.
 func parseCountryCode(region string) string {
 	fields := strings.Split(region, "|")
 	if len(fields) < 5 {
@@ -174,20 +183,28 @@ func parseCountryCode(region string) string {
 	return fields[4]
 }
 
-// GetIP2RegionVersion returns the installed GeoIP database version, or ""
-// when the version row is unavailable.
-func GetIP2RegionVersion() string {
+// GetIP2RegionVersion returns the installed GeoIP database version.
+// 读故障与「行缺失」必须可区分——调用方（InitIP2Region）只对
+// ErrNoRows 走种子同步，真实 DB 故障不得折叠成空串后覆盖版本行。
+// db.DB 为 nil（半初始化/单测）同样视为不可读错误。
+func GetIP2RegionVersion() (string, error) {
+	if db.DB == nil {
+		return "", errors.New("数据库未初始化")
+	}
 	var version string
 	if err := db.DB.QueryRow("SELECT version FROM security_ip2region_version WHERE id=1").Scan(&version); err != nil {
-		return ""
+		return "", err
 	}
-	return version
+	return version, nil
 }
 
 // SetIP2RegionVersion records the installed GeoIP database version and caches provinces.
 func SetIP2RegionVersion(version string) {
-	if _, err := db.DB.Exec(`INSERT INTO security_ip2region_version (id, version, updated_at, auto_update)
-		VALUES (1, ?, datetime('now'), 0)
+	// 插入不写 auto_update——沿用 schema DEFAULT TRUE（与迁移播种
+	// ensureIP2RegionVersionRow 的 TRUE、D2 用户裁定一致）；硬编码 0 会让
+	// 「行缺失 + Init 先跑」形态静默关闭自动更新。
+	if _, err := db.DB.Exec(`INSERT INTO security_ip2region_version (id, version, updated_at)
+		VALUES (1, ?, datetime('now'))
 		ON CONFLICT(id) DO UPDATE SET version=excluded.version, updated_at=excluded.updated_at`, version); err != nil {
 		Logf("error", "ip2region: failed to store version %q: %v", version, err)
 	}
@@ -236,10 +253,10 @@ func openIP2RegionSearcher(path string) (*ip2regionService.Ip2Region, error) {
 func GetIP2RegionEntryCount() int {
 	ip2regionMu.RLock()
 	defer ip2regionMu.RUnlock()
-	// GEO25-1(历史):条目数从 header StartIndexPtr/EndIndexPtr 直读
+	// 历史修复(历史):条目数从 header StartIndexPtr/EndIndexPtr 直读
 	// (xdb v2 官方边界,[8:16],2 次 ReadAt)——原实现扫 65536 格 vector 推导
 	// (BufferCache 已全内存,每调用 65536 次 8B ReadAt 纯浪费;且 vector 端点
-	// 语义含末条结尾,推导 off-by-one;header 真值=(end-start)/14+1)。
+	// 语义含末条结尾,推导 历史修复;header 真值=/14+1)。
 	f, err := os.Open(ip2regionLivePath)
 	if err != nil {
 		return 0
@@ -251,7 +268,9 @@ func GetIP2RegionEntryCount() int {
 	}
 	startPtr := binary.LittleEndian.Uint32(header[8:12])
 	endPtr := binary.LittleEndian.Uint32(header[12:16])
-	if endPtr <= startPtr {
+	// 单段 xdb 的 StartIndexPtr == EndIndexPtr 是合法边界（条目数 1），
+	// 只有 end < start 才是空库/坏库。
+	if endPtr < startPtr {
 		return 0
 	}
 	const segmentIndexSize = 14 // xdb v2 段索引每条 14 字节
@@ -312,7 +331,7 @@ func GetIP2RegionProvinces() []string {
 
 // GetIP2RegionProvinceList 返回省份列表，live searcher 优先、缓存兜底：仅供
 // UI 列表端（GetIP2RegionRegions）——校验端（ValidateGeoIPCountries）历史问题 B-#1
-// 起改用 live-only 的 GetIP2RegionProvinces 判 loaded，避免 xdb 失效后缓存
+// 起改用 历史修复 的 GetIP2RegionProvinces 判 loaded，避免 xdb 失效后缓存
 // 放行而发射端静默零强制。ip2region 未加载且无缓存时仅返回 ["海外"]。
 func GetIP2RegionProvinceList() []string {
 	provinces := GetIP2RegionProvinces()
@@ -323,7 +342,7 @@ func GetIP2RegionProvinceList() []string {
 }
 
 // 省列/城市列规范化四张表（别名/台湾城市/拼音城市/自治州）单源在
-// lazy-balancer-v2/geoipnames（PLUG-N3 历史收敛——此前与 caddygeoip
+// 历史修复/geoipnames（历史修复 历史收敛——此前与 caddygeoip
 // 手工镜像双份，漂移曾致城市级地域规则静默恒不命中）。选项树与 CEL 发射
 // 变量统一用规范名，两边一致才能命中。
 // treeCacheRevision 地域树缓存修订号——规范化规则（映射/别名/结构）变更时
@@ -350,7 +369,7 @@ func normalizeIP2City(raw string) string {
 
 // IP2RegionRegionTree 地域树（历史问题 二十三次，用户裁决：区域精确到市）：省级
 // 列表 + 省→城市集映射；「海外」哨兵仍为一级条目（Provinces 末位，承载
-// 解析失败/库缺失的 fail-closed 兜底），域 G（历史）起海外已解析行细化
+// 解析失败/库缺失的 历史修复 兜底），域 G（历史）起海外已解析行细化
 // 为国家集（Countries——xdb 国家列归一后去重排序）。数据源为 xdb 段索引
 // 全量扫描（每段 14B：startIP 4 + endIP 4 + dataLen 2 + dataPtr 4），
 // region 数据按 dataPtr 去重读取（大量段共享同一 region 指针，实际读取量为
@@ -385,7 +404,8 @@ func regionTreeFromXDB(path string) *IP2RegionRegionTree {
 		minPtr = binary.LittleEndian.Uint32(header[8:12])
 		maxPtr = binary.LittleEndian.Uint32(header[12:16])
 	}
-	if maxPtr <= minPtr {
+	// 单段 xdb 的 header 两端指针相等——max < min 才判空。
+	if maxPtr < minPtr {
 		return nil
 	}
 	// 2) 遍历段索引，按 dataPtr 去重读 region。SEC-历史问题（历史）：
@@ -482,7 +502,7 @@ func regionTreeFromXDB(path string) *IP2RegionRegionTree {
 		tree.Provinces = append(tree.Provinces, prov)
 	}
 	sort.Strings(tree.Provinces)
-	// 海外哨兵仍为一级条目（域 G 保留）：固定末位——「海外」的 UTF-8 字节序
+	// 海外哨兵仍为一级条目（域 G 保留）：固定末位——「海外」的 历史修复 字节序
 	// 落在中文省名中间，参与排序会插在省份列表中间；校验端 known 集合不依赖
 	// 顺序，选项树展示与采样列表口径一致（海外恒在最后）。已解析海外行的
 	// 国家粒度由 Countries 承载（哨兵=解析失败/库缺失兜底，国家=已解析）。
@@ -504,7 +524,7 @@ func regionTreeFromXDB(path string) *IP2RegionRegionTree {
 
 // GetIP2RegionRegionTree 返回地域树：live 扫描优先，文件缓存兜底（与省份
 // 列表同口径——searcher 加载失败时 UI 仍能展示上次成功的树）。
-// N+13 H2-F2：live 扫描按 xdb 的 (path,size,mtime) 记忆化——安全策略页
+// N+13 live 扫描按 xdb 的 (path,size,mtime) 记忆化——安全策略页
 // 每次打开都调本函数，原实现每次全量扫描 ~220ms（553K+58K preads）。stat
 // 键未变即返回上次扫描结果；带外替换 xdb 改变 stat 键、触发重扫，保留
 // 替换可见性（regions.json 缓存无法做到这一点，故不直接改用它）。扫描
@@ -571,7 +591,7 @@ func staleRegionTreeCache(path string) bool {
 		return true
 	}
 	for _, prov := range tree.Provinces {
-		// CRS25-6(历史):空串条目索引越界——缓存被带外手改(非本
+		// 历史修复(历史):空串条目索引越界——缓存被带外手改(非本
 		// 进程写入)时空串可入,prov[0] panic。启动路径,崩溃即启动失败。
 		if prov == "" || (prov != "海外" && prov[0] < 0x80) {
 			return true

@@ -35,7 +35,7 @@ func newAutobanTestEnv(t *testing.T) *gin.Engine {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		// B1-07（历史）：同步复位 currentDB，后台循环不得持有已关闭测试库
+		// 历史修复（历史）：同步复位 currentDB，后台循环不得持有已关闭测试库
 		db.SetDB(oldDB)
 	})
 	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -340,7 +340,7 @@ func TestAutobanStatus_banEffectiveTruthTable(t *testing.T) {
 }
 
 // 历史问题（历史）：autobanListReferenced / autobanBanEffective 的查询失败
-// fail-closed 分支此前无测试——预置名单查询失败时必须按「已引用/已生效」处理
+// 历史修复 分支此前无测试——预置名单查询失败时必须按「已引用/已生效」处理
 // （不弹误导性黄条）。status 端点在名单表缺失时更早的 AutobanListEntries 已
 // 500，故直接钉两个判据 helper 的失败分支。
 func TestAutobanStatus_listReferencedFailClosed(t *testing.T) {
@@ -500,7 +500,7 @@ func TestAutobanListEntryCap_matchesHandlerCap(t *testing.T) {
 	}
 }
 
-// ---- AU-6（历史）：内置名单引用门提示语按名单名分流 ----
+// ---- 历史修复（历史）：内置名单引用门提示语按名单名分流 ----
 
 // Given 自动封禁预置名单（system=1，非威胁情报源）。
 // When 信任名单引用它（内置名单引用门拒绝的唯一非法形态之一）。
@@ -530,7 +530,7 @@ func TestCreatePolicy_builtinAutobanListRefMessageNamesAutoban(t *testing.T) {
 	}
 }
 
-// ---- AU-8/D5（历史）：PUT 禁用路径收尾接线 ----
+// ---- 历史修复/D5（历史）：PUT 禁用路径收尾接线 ----
 
 // Given 名单含已到期自动条目+未到期自动条目；重载回调间谍；名单无任何发射面引用。
 // When PUT enabled=false（禁用保存）。
@@ -599,7 +599,7 @@ func TestAutobanPreset_categoryDescriptionLocked(t *testing.T) {
 // Given 预置名单含一条已到期未清理的自动封禁条目（自动封禁关闭时不会清理）。
 // When 从事件页对该 IP 手动封禁（AddIPToList）。
 // Then 条目必须被覆盖为生效中的手动条目（清空 expires_at），而不是命中即
-// added:false 的静默 no-op（渲染生效集仍为空）。
+// added:false 的静默 历史修复（渲染生效集仍为空）。
 func TestAddIPToList_replacesExpiredAutobanEntry(t *testing.T) {
 	router := newAutobanTestEnv(t)
 	id := autobanPresetID(t)
@@ -641,11 +641,11 @@ func TestExportIPList_threatFileReadErrorReturns500(t *testing.T) {
 		t.Fatal(err)
 	}
 	name := db.ThreatListNameBySource("ustc")
-	res, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, entries, system) VALUES (?, '[]', 1)`, name)
-	if err != nil {
+	// system=1 名单名唯一，威胁库行由 DB 初始化播种；直接取 id。
+	var id int64
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND system=1`, name).Scan(&id); err != nil {
 		t.Fatalf("seed threat list row: %v", err)
 	}
-	id, _ := res.LastInsertId()
 
 	rec := getRequest(t, router, fmt.Sprintf("/security/ip-lists/%d/export", id))
 	if rec.Code != http.StatusInternalServerError {

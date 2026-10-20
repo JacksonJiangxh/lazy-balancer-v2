@@ -31,6 +31,12 @@ func RefreshBrandingMirrorDB(database *sql.DB, dataDir string) (changed bool, er
 	if database == nil {
 		return false, nil
 	}
+	// 空 dataDir 会把 CWD 下同名文件镜像进
+	// global_config.branding_json 并随快照下发——与写入侧
+	// applySnapshotBrandingChecked/MaterializeBranding 同款守卫。
+	if dataDir == "" {
+		return false, nil
+	}
 	content := ""
 	if raw, rerr := os.ReadFile(filepath.Join(dataDir, "branding.json")); rerr == nil {
 		content = string(raw)
@@ -217,7 +223,7 @@ func injectLandingFromBranding(content string) {
 
 // extractBrandingStringField 从 JSON 原文按字段名提取字符串值;任何解析
 // 失败回退空串。值经 json.Unmarshal 值级解析(与主节点 loadBrandingConfig
-// 同语义——含 \uXXXX/\n 等全部转义形态,SR-1 历史修复)。
+// 同语义——含 \uXXXX/\n 等全部转义形态,历史修复 历史修复)。
 func extractBrandingStringField(content, field string) string {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(content), &raw); err != nil {

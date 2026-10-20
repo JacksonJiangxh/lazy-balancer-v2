@@ -309,7 +309,7 @@ func TestResolveAPIKeyReadOnly_treatsDisabledOwnerAsNotReadOnly(t *testing.T) {
 	// When
 	readOnly, err := resolveAPIKeyReadOnly(apiKey)
 
-	// Then：所有者被禁用时按 key-not-found 处理，不视为只读
+	// Then：所有者被禁用时按 历史修复 处理，不视为只读
 	if err == nil {
 		t.Fatalf("want key-not-found err for disabled owner, got nil")
 	}
@@ -340,7 +340,7 @@ func TestResolveAPIKeyReadOnly_rejectsExpiredKey(t *testing.T) {
 	// When
 	readOnly, err := resolveAPIKeyReadOnly(apiKey)
 
-	// Then：key 已过期时按 key-not-found 处理，不视为只读
+	// Then：key 已过期时按 历史修复 处理，不视为只读
 	if err == nil {
 		t.Fatalf("want key-not-found err for expired key, got nil")
 	}
@@ -349,7 +349,7 @@ func TestResolveAPIKeyReadOnly_rejectsExpiredKey(t *testing.T) {
 	}
 }
 
-// 历史 K-1：forward 必须把网关注入 context 的真实客户端 IP 转写为内部
+// 历史 forward 必须把网关注入 context 的真实客户端 IP 转写为内部
 // 头（回环自调用下接收端 RemoteAddr 恒为 127.0.0.1，审计源 IP 依赖此头）。
 func TestForwardPropagatesClientIPFromContext(t *testing.T) {
 	var receivedIP string
@@ -727,14 +727,24 @@ func TestOversizedResponseMessageDistinguishesExportConfig(t *testing.T) {
 
 	// When
 	exportResult := callTool(t, handler, "export_config", `{}`)
+	caddyConfigResult := callTool(t, handler, "get_caddy_config", `{}`)
 	otherResult := callTool(t, handler, "issue_certificate", `{}`)
 
-	// Then：export_config 得面板/REST 指引，其余工具维持通用分页指引
+	// Then：export_config 得面板/REST 指引，get_caddy_config 得按规则查询指引，
+	// 其余工具维持通用分页指引
 	if !strings.Contains(exportResult, "配置过大") || !strings.Contains(exportResult, "/config/export") {
 		t.Fatalf("export_config result=%s, want dedicated oversized-backup message", exportResult)
 	}
 	if strings.Contains(exportResult, "请改用分页或专用导出工具") {
 		t.Fatalf("export_config result must not carry generic pagination hint: %s", exportResult)
+	}
+	if strings.Contains(caddyConfigResult, "请改用分页或专用导出工具") {
+		t.Fatalf("get_caddy_config result must not carry generic pagination hint: %s", caddyConfigResult)
+	}
+	for _, fragment := range []string{"4 MiB", "get_rule_caddy_config", "管理面板"} {
+		if !strings.Contains(caddyConfigResult, fragment) {
+			t.Fatalf("get_caddy_config result=%s, want actionable guidance containing %q", caddyConfigResult, fragment)
+		}
 	}
 	if !strings.Contains(otherResult, "请改用分页或专用导出工具") {
 		t.Fatalf("other tool result=%s, want generic oversized message retained", otherResult)
@@ -767,7 +777,7 @@ func TestAddIPToListToolForwardsValue(t *testing.T) {
 
 func TestGetIPListToolForwardsID(t *testing.T) {
 	// Given：v2.3.2 名单瘦身后 list_ip_lists 仅含 entry_count，读条目唯一通道
-	// 是 GET /security/ip-lists/:id——历史问题（历史）补 get_ip_list 工具
+	// 是 GET /security/历史修复/:id——历史问题（历史）补 get_ip_list 工具
 	// 覆盖该端点（GET 只读，id 进路径）。
 	var receivedMethod, receivedPath string
 	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -794,7 +804,7 @@ func TestGetIPListToolForwardsID(t *testing.T) {
 	// When
 	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "get_ip_list", `{"id":9}`)
 
-	// Then：转发到 GET /api/v1/security/ip-lists/9，响应原文含 entries
+	// Then：转发到 GET /api/v1/security/历史修复/9，响应原文含 entries
 	if receivedMethod != http.MethodGet || receivedPath != "/api/v1/security/ip-lists/9" {
 		t.Fatalf("request=%s %s", receivedMethod, receivedPath)
 	}
@@ -906,7 +916,7 @@ func TestGetCRSRuleIndexToolForwardsReadOnly(t *testing.T) {
 
 // 历史问题(C5):v2.3.0 起 /config/export 恒返回 lbbak 二进制(tar.gz,
 // application/gzip)——forward 把响应体喂 NewToolResultText 会把 gzip 字节
-// 静默损坏成不可读文本。非 JSON Content-Type 必须以 IsError 文本指引改走
+// 静默损坏成不可读文本。非 JSON 历史修复 必须以 IsError 文本指引改走
 // 面板/REST,不得让二进制字节进文本结果。
 func TestExportConfigToolRejectsNonJSONContentType(t *testing.T) {
 	// Given:内部 API 对 export_config 返回非 JSON(如 lbbak application/gzip)
@@ -935,7 +945,7 @@ func TestExportConfigToolRejectsNonJSONContentType(t *testing.T) {
 	}
 }
 
-// APIMCP45-1：get_rule_stage_stats 带必填路径参数却声明 emptySchema——运行时未
+// get_rule_stage_stats 带必填路径参数却声明 emptySchema——运行时未
 // 启用 WithInputSchemaValidation，input_schema 是 Agent 侧唯一的参数契约文档，
 // 缺 caddy_id 声明会让 Agent 无从得知该 GET 需要路径参数。与同族
 // get_rule_security_policy 的 idSchema 形态对齐。
@@ -986,7 +996,7 @@ func resolveAPIKeyReadOnly(apiKey string) (bool, error) {
 	return visibility.readOnly, err
 }
 
-// requestToolNames 发起 tools/list 并返回工具名集合（CI87-06 可见性测试共用）。
+// requestToolNames 发起 tools/list 并返回工具名集合（历史修复 可见性测试共用）。
 func requestToolNames(t *testing.T, handler http.Handler, apiKey string) map[string]bool {
 	t.Helper()
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
@@ -1016,7 +1026,7 @@ func requestToolNames(t *testing.T, handler http.Handler, apiKey string) map[str
 	return names
 }
 
-// CI87-06：admin 组路由对非管理员恒 403（adminOnly 先于其它守卫），tools/list
+// admin 组路由对非管理员恒 403（adminOnly 先于其它守卫），tools/list
 // 必须同口径隐藏——否则非管理员属主的 Key 反复试错恒 403 工具。管理员全权
 // Key 不受影响（get_caddy_config 等按文档仅管理员可用）。
 func TestToolsListHidesAdminOnlyToolsForNonAdminKey(t *testing.T) {

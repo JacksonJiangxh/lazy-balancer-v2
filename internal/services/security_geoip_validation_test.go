@@ -20,7 +20,7 @@ func TestValidateGeoIPCountries_rejectsUnknownProvinceWhenCacheLoaded(t *testing
 	t.Cleanup(func() { os.Remove(cachePath) })
 
 	// When/Then（历史问题 B-#1）：live 未加载时校验判据以 live 为准——缓存里的
-	// 省份（广东）与未知省份（火星）都按 fail-closed「未加载」拒绝。旧语义
+	// 省份（广东）与未知省份（火星）都按 历史修复「未加载」拒绝。旧语义
 	// 用缓存判 loaded 会放行已知省份，而发射端占位变量从未设置（CEL 恒假）
 	// → deny 地域拦截静默零强制。
 	if err := ValidateGeoIPCountries(`["火星"]`, "deny"); err == nil || !strings.Contains(err.Error(), "未加载") {
@@ -47,7 +47,7 @@ func TestValidateGeoIPCountries_rejectsUnknownProvinceWhenNothingLoaded(t *testi
 
 	// When：条目为任意非空省份名
 	err := ValidateGeoIPCountries(`["未知省"]`, "deny")
-	// Then：拒绝并提示未加载——fail-closed，避免 deny 模式地域拦截静默失效
+	// Then：拒绝并提示未加载——历史修复，避免 deny 模式地域拦截静默失效
 	if err == nil || !strings.Contains(err.Error(), "未加载") {
 		t.Fatalf("unknown province without loaded database must be rejected with 未加载, got %v", err)
 	}
@@ -97,5 +97,17 @@ func TestGetIP2RegionProvinceList_prefersLiveOverStaleCache(t *testing.T) {
 	// Then：live searcher 优先，陈旧缓存不得覆盖（校验端与 UI 端同源）
 	if len(got) < 2 || got[0] != "广东" || got[len(got)-1] != "海外" {
 		t.Fatalf("province list=%v, want live [广东 海外] (stale cache 北京 must not win)", got)
+	}
+}
+
+func TestValidateGeoIPCountries_rejectsEmptyListForEnabledModes(t *testing.T) {
+	// Given：地域控制处于 allow/deny（非 off）
+	// When/Then：空名单必须拒绝——渲染端 PolicyHasGeoIP 要求非空，
+	// 空名单落库会被整链跳过，形成「已启用但零强制」的 历史修复。
+	if err := ValidateGeoIPCountries(`[]`, "allow"); err == nil || !strings.Contains(err.Error(), "不能为空") {
+		t.Fatalf("allow 空数组必须拒绝, got %v", err)
+	}
+	if err := ValidateGeoIPCountries(``, "allow"); err == nil {
+		t.Fatal("allow 空串必须拒绝")
 	}
 }

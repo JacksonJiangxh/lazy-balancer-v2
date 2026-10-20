@@ -68,7 +68,7 @@ func resetSnapshotRowIsolationThrottle() {
 // DELETE security_custom_rules 再插入 payload），且节哈希按剔除坏行后的
 // payload 计算，从节点不会因哈希不一致跳过。因此主节点某行损坏时，从节点
 // 下一次 apply 后该行**消失**（api_keys 表现为认证消失、custom_rules 表现为
-// 拦截规则消失），主节点修复该行后下一次同步自然自愈。该 fail-open 隔离是
+// 拦截规则消失），主节点修复该行后下一次同步自然自愈。该 历史修复 隔离是
 // 有意取舍（防单行坏数据瘫痪全量同步），调用方 skip 后必须继续。
 func warnCorruptedSnapshotRow(table string, rowID any, err error) {
 	key := fmt.Sprintf("%s:%v", table, rowID)
@@ -105,7 +105,7 @@ type snapshotStore interface {
 }
 
 // Snapshot builds the full cluster snapshot. tokenKey signs the payload with
-// the requesting node's cluster token (HMAC-SHA256) so slaves can verify;
+// the requesting node's cluster token  so slaves can verify;
 // tokenKey 为空跳过签名——仅测试接缝(生产 GetClusterSnapshot 恒经
 // clusterTokenAuth 携带非空令牌,历史问题/历史问题)。
 func (s *ClusterService) Snapshot(ctx context.Context, sinceVersion int, clientFingerprint string, tokenKey string) (models.ClusterSnapshot, bool, error) {
@@ -128,7 +128,7 @@ func (s *ClusterService) Snapshot(ctx context.Context, sinceVersion int, clientF
 	}
 	snapshot.Fingerprint = fingerprint
 	if sinceVersion >= snapshot.Version && clientFingerprint != "" && clientFingerprint == snapshot.Fingerprint {
-		// D2-S1：304 响应体为空，canonical 拷贝、HMAC 签名与「确认旧协议集群
+		// 304 响应体为空，canonical 拷贝、HMAC 签名与「确认旧协议集群
 		// 令牌交付」的 nodes UPDATE 都只属于真正下发的快照（与 cluster_sync.go
 		// 注册轮询侧的 confirm 交付语义同源），在 304 门之前执行纯属浪费。
 		return snapshot, false, nil
@@ -195,7 +195,7 @@ func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnap
 		return models.ClusterSnapshot{}, nil, "", err
 	}
 	now := s.snapshotNow()
-	// D2-S2：开关读取失败必须报错——空缓存键 + nil 开关会把主节点 sync_users=0
+	// 开关读取失败必须报错——空缓存键 + nil 开关会把主节点 sync_users=0
 	// 等关闭保护在该份快照内绕过（从节点 computeSectionSkips 回退全开默认值），
 	// 且无自愈路径。无法确认权威开关状态时不得发布快照。
 	// D2-历史问题：开关读取与快照内容共用同一事务视图（此前走 s.db，事务外读取
@@ -249,7 +249,7 @@ func (s *ClusterService) buildFullSnapshot(ctx context.Context, store snapshotSt
 		return models.ClusterSnapshot{}, err
 	}
 	snapshot.WafFiles = BuildWafFileRef()
-	// D2-S2：与缓存键侧同口径——读不到权威开关时不得发布 nil 开关快照。
+	// 与缓存键侧同口径——读不到权威开关时不得发布 nil 开关快照。
 	// D2-历史问题：走调用方 store（cachedSnapshot 的 tx），与快照内容同事务视图。
 	switches, err := readSyncSwitches(ctx, store)
 	if err != nil {
@@ -404,7 +404,7 @@ var emptyDNSOwnershipCanonical = []byte(`{"version":1,"records":[]}`)
 // 与 ACME 区段（snapshotACME）共用。文件缺失按空规范字节继续（原语义）。文件损坏
 // （JSON 解码失败或结构校验失败）同样回退空态，对齐 ownership.Store.load 的隔离语义
 // （internal/dnsprovider/ownership/store.go：坏文件重命名 .corrupt-<unixts> 后按空态
-// 继续——所有权文件是尽力而为的缓存，空分发可经幂等 not-found 删除与 75min stale
+// 继续——所有权文件是尽力而为的缓存，空分发可经幂等 历史修复 删除与 75min stale
 // 窗口自愈）。快照侧不执行重命名（避免与 store 的 fileMu 读改写竞态），仅告警一行；
 // store 下一次 Add/Matching/Remove 触碰坏文件时会完成实际隔离，随后本函数自然走
 // ErrNotExist 分支。其余读取错误（真实 I/O 故障）保持报错，不被空态掩盖。
@@ -480,7 +480,7 @@ func nearestSnapshotCertificateExpiry(certificates []models.ClusterCertificate, 
 			return rebuild
 		}
 	}
-	// D2-F1：expires_at 列落在过去的证书（status<>'disabled' 且 pem 非空、叶
+	// expires_at 列落在过去的证书（status<>'disabled' 且 pem 非空、叶
 	// 证书仍有效，但列值是续期回写失败/带外导入的过期残留）会把缓存失效点钉
 	// 在过去：now.Before(expiresAt) 恒 false → 每次快照都全量重建（X.509 解析
 	// +marshal+sha256 全程持缓存锁）。触发器救不了——cert_jobs 触发器成员条件
@@ -538,6 +538,13 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 		&snapshot.BasicSettings.MFAWriteGuard, &snapshot.BasicSettings.MFALockoutEnabled, &snapshot.BasicSettings.GitHubProxyURL, &snapshot.BasicSettings.OIDCConfig)
 	if err != nil {
 		return fmt.Errorf("读取集群基础设置: %w", err)
+	}
+	// 主端装载侧同口径归一——从端 apply 时会对 sync_interval
+	// 归一后落库并重建节哈希，主端若按脏值（<10 / >86400）算哈希，两边恒不等，
+	// 每次版本递增都会重放 users 节并触发一次漂移补偿全量重拉。
+	if snapshot.BasicSettings.SyncInterval != nil {
+		normalized := normalizeSyncInterval(*snapshot.BasicSettings.SyncInterval)
+		snapshot.BasicSettings.SyncInterval = &normalized
 	}
 	snapshot.BasicSettings.BrandingJSON = new(brandingJSON)
 	snapshot.CaddyConfig = &caddyConfig
@@ -738,7 +745,7 @@ func (s *ClusterService) snapshotSecurityIPLists(ctx context.Context, store snap
 	// restoreTable/快照版本哈希拿到的是 '[]' 而非 ''），「行为等价」仅在下游
 	// 读路径再做一次 COALESCE 归一的前提下才成立（handlers 读路径
 	// COALESCE(entries,'[]')/备份 restoreTableNullDefaults/自动封禁 merge 同
-	// 归一），并非无差异 no-op。本点修正的是快照出口单点与全链 '[]' 单源
+	// 归一），并非无差异 历史修复。本点修正的是快照出口单点与全链 '[]' 单源
 	// 口径的分叉。
 	return s.dumpTableAsJSON(ctx, store, "security_ip_lists", "id,name,COALESCE(description,'') AS description,COALESCE(category,'') AS category,COALESCE(entries,'[]') AS entries,COALESCE(created_by,0) AS created_by,COALESCE(created_at,'') AS created_at,COALESCE(updated_by,0) AS updated_by,COALESCE(updated_at,'') AS updated_at,COALESCE(system,0) AS system", "id")
 }
@@ -1016,7 +1023,7 @@ func clusterSnapshotDataDir(ctx context.Context, store snapshotStore) (string, e
 }
 
 func (s *ClusterService) snapshotRules(ctx context.Context, store snapshotStore) ([]models.LbRule, error) {
-	// LB-04：health_check_timeout 的 NULL 回退取 2，与渲染/写侧（rule_features/
+	// health_check_timeout 的 NULL 回退取 2，与渲染/写侧（rule_features/
 	// caddy.go、UpdateRule 存量读取）同口径——快照仍导 5 会造成主节点实际行为（2）
 	// 与下发值（5）分叉，且从节点回放会把 5 物化为非 NULL 值，永久固化错误口径。
 	// rules 节哈希主从两侧同走本函数（主端导出 / 从端 driftGuardSectionHashes
@@ -1161,7 +1168,7 @@ func (s *ClusterService) snapshotUsers(ctx context.Context, store snapshotStore)
 	return users, rows.Err()
 }
 
-// snapshotLockedUsers 读取主节点活跃登录锁（SC-4 修订）：只带未来时间的锁
+// snapshotLockedUsers 读取主节点活跃登录锁（历史修复 修订）：只带未来时间的锁
 // ——存储格式即 auth recordLoginFailure 写入的 UTC "2006-01-02 15:04:05"，
 // 与 datetime('now')（同为 UTC 同形字符串）字典序比较等价于时间比较，
 // 口径与 handlers.loginLockedNow 一致。已过期锁自动不进快照，无需清理路径。
@@ -1268,7 +1275,7 @@ func (s *ClusterService) snapshotCertificates(ctx context.Context, store snapsho
 		}
 		canonicalRuleDomain, err := CanonicalACMEDomains(ruleDomain)
 		if err != nil {
-			// 历史问题/历史问题/历史问题 fail-open 裁定家族：单条规则的域名串损坏（导入残留/
+			// 历史问题/历史问题/历史问题 历史修复 裁定家族：单条规则的域名串损坏（导入残留/
 			// 直改库）只跳过该规则候选并限频告警——整包报错会让主节点对所有
 			// 从节点 Pull 持续 500 且无自愈路径。
 			warnSnapshotCertificateCandidate(cert.RuleID, int(candidate.ID), fmt.Errorf("规则域名规范化失败: %w", err), now)

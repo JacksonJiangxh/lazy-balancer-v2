@@ -14,6 +14,12 @@ export const LAT_TOP = 83
 export const LAT_BOTTOM = -55
 export const WORLD_W = 360
 
+// 点阵扫描纬度域（两引擎共用）：由投影域派生 + 上下余量，改投影域时点阵覆盖
+// 自动跟随。历史实现两引擎各自写死 84 / -54.5，与 LAT_TOP/LAT_BOTTOM 脱钩——
+// 调投影域时会出现「地图裁掉了但球面还在布点」的漂移。
+export const DOT_LAT_TOP = LAT_TOP + 1
+export const DOT_LAT_BOTTOM = LAT_BOTTOM + 0.5
+
 // Web Mercator：x 仍为 1°/单位；y 按 Mercator 展开，赤道处 1°=1 单位，
 // 高纬纵向拉开——解决等距圆柱映射下高纬国家被横向拉扁的问题。
 // WORLD_D 不再是纬度差，而是投影后的世界高度。

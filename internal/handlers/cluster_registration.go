@@ -19,7 +19,7 @@ import (
 // （无 JWT/API Key 认证），超大体可撑爆审计库（历史问题）。
 const registerRequestMaxBytes = 16 << 10
 
-// registerAuditField 限制写入审计详情的节点字段：截断至 128B（回退合法 UTF-8
+// registerAuditField 限制写入审计详情的节点字段：截断至 128B（回退合法 历史修复
 // 边界）并去除控制字符，防未认证请求注入超长内容或伪造日志换行（历史问题）。
 func registerAuditField(s string) string {
 	s = strings.Map(func(r rune) rune {
@@ -56,7 +56,7 @@ func (h *Handlers) GenerateClusterRegisterToken(c *gin.Context) {
 }
 
 func (h *Handlers) RegisterClusterNode(c *gin.Context) {
-	// 历史修复 历史问题：导入窗口 fast-fail（全量替换 nodes，窗口写入会被覆盖或阻塞）。
+	// 历史修复 历史问题：导入窗口 历史修复（全量替换 nodes，窗口写入会被覆盖或阻塞）。
 	if rejectNodeWriteDuringImport(c) {
 		return
 	}
@@ -119,7 +119,7 @@ func (h *Handlers) GetClusterRegistrationStatus(c *gin.Context) {
 		clusterError(c, http.StatusBadRequest, "注册编号无效", err)
 		return
 	}
-	// 历史问题-04：同族机器端点（register/confirm/snapshot/waf-files/report）均有
+	// 历史问题-04：同族机器端点（register/confirm/snapshot/历史修复/report）均有
 	// 主节点门，仅本端点缺失——降级后的主节点按 历史问题 保留 nodes 行，残留
 	// 注册行仍可被应答 approved 并重发集群令牌。权限面不扩大（令牌由 secret
 	// 确定性派生），但角色门必须一致收敛。
@@ -241,7 +241,7 @@ func (h *Handlers) UpdateClusterNodeAccessURL(c *gin.Context) {
 }
 
 func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation func(int) error) {
-	// 历史修复 历史问题：审批/拒绝/删除共用的写端点收口——导入窗口 409 fast-fail。
+	// 历史修复 历史问题：审批/拒绝/删除共用的写端点收口——导入窗口 409 历史修复。
 	if rejectNodeWriteDuringImport(c) {
 		return
 	}
@@ -266,6 +266,13 @@ func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation fu
 		if errors.Is(err, services.ErrNodeNotPending) {
 			// 历史问题-3:重复审批/已处理节点 409,与「不存在」404 分判。
 			status = http.StatusConflict
+		}
+		// 非法访问地址是客户端可修正的输入问题，
+		// 此前落默认 500「更新地址节点失败」，用户以为服务端故障且拿不到规则
+		// 说明（同族入口 RegisterClusterNode/SetClusterMode/v2 导入均已 400）。
+		if errors.Is(err, models.ErrInvalidClusterAccessURL) {
+			clusterError(c, http.StatusBadRequest, "访问地址无效", err)
+			return
 		}
 		clusterError(c, status, action+"节点失败", err)
 		return

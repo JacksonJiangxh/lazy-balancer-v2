@@ -68,7 +68,7 @@ type ThreatUpdateManager struct {
 	lastTaskOutcome string // success / failed / ""（未跑过）
 }
 
-// nil-until-init（镜像 CRS/IP2Region 管理器）：仅 main.go 初始化。角色传播
+// 历史修复（镜像 CRS/IP2Region 管理器）：仅 main.go 初始化。角色传播
 // 统一由任务引擎 SetRole 驱动（BecomeSlave/Promote 仅调用 SetRole，不再有
 // SetMasterRole 旁路）；未初始化时相关调度钩子经 nil 守卫跳过，不会把
 // 调度器（首轮即下载）带进无关测试。
@@ -140,7 +140,7 @@ func (m *ThreatUpdateManager) StatusSnapshot() ThreatTaskStatus {
 }
 
 // threatReloader 残留 /load 收敛回调（main.go 注入 caddyReloader）：仅热路径
-// 未证实收敛（发射面变化/运行配置不可读/刷新被拒）时的 fail-safe 回退使用
+// 未证实收敛（发射面变化/运行配置不可读/刷新被拒）时的 历史修复 回退使用
 // ——受信代理引用面 2026-10-15 随 tp.txt/lb_file 热路径化退役，不再有
 // 「按引用面定向重载」形态。
 var threatReloader func() error
@@ -149,10 +149,10 @@ var threatReloader func() error
 // CaddyService.RefreshIPListProjections，2026-10-15 用户裁定 threatReloader
 // 重载门退役）：被启用策略引用的名单内容变化后重写投影文件收敛（零 /load，
 // @ipListFast 匹配器 ≤1s stat 热感知）。返回 ProjectionConverged=已证实收敛
-// ——ProjectionNeedForce（本轮渲染物化了证书文件，历史 CERT-1）与
+// ——ProjectionNeedForce（本轮渲染物化了证书文件，历史 历史修复）与
 // ProjectionFallback（发射面变化/运行配置不可读）均未证实收敛，调用方回退
 // threatReloader 强制 /load 收敛（宁可一次重载，不欠引用方渲染收敛；强制
-// 形态同时满足 历史问题 W1-1）。历史问题 失败自愈标记（threatReloadPending）随之
+// 形态同时满足 历史问题 历史修复）。历史问题 失败自愈标记（threatReloadPending）随之
 // 退役：热路径无失败态（回退即当轮 /load）；残留受信代理分支的失败由配置
 // 一致性看门狗漂移横幅 + 下次任意配置变更收敛兜底。
 var threatProjectionRefresher func() (IPListProjectionOutcome, error)
@@ -175,7 +175,7 @@ func (m *ThreatUpdateManager) StartUpdate(trigger string, rc *taskengine.RunCont
 		return nil, ErrThreatUpdateRunning
 	}
 	m.running = true
-	// SSA-87-06 同族（SS87-历史问题 家族收敛，历史）：可取消 ctx 与 running
+	// 历史修复 同族（SS87-历史问题 家族收敛，历史）：可取消 ctx 与 running
 	// 在同一临界区登记——StartUpdate 返回后立刻 CancelRunning（任务引擎
 	// CancelHook／前端连点／自动化脚本）必须命中，不得因 run goroutine 尚未
 	// 执行而读到 runCancel==nil（首次）或上一轮的陈旧 cancel（非首次）静默
@@ -292,7 +292,7 @@ func threatListEmpty(source string) bool {
 }
 
 // run 同步执行（测试/内部直调路径）：自建可取消 ctx 并登记 runCancel；
-// 生产入口经 StartUpdate 预建 ctx（SSA-87-06 同族 SS87-历史问题——取消能力不得
+// 生产入口经 StartUpdate 预建 ctx（历史修复 同族 SS87-历史问题——取消能力不得
 // 晚于 StartUpdate 返回才就绪）。
 func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
@@ -376,7 +376,7 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 		if runCtx.Err() != nil {
 			// F-历史问题-01：取消源分流——demote（角色已翻转）落 skipped（与起点
 			// 角色复查同语义：从节点中止非故障）；主节点=手动取消 cancelled。
-			if !updateRunStillMaster() {
+			if master, known := updateRunRoleAtCancel(); known && !master {
 				demoted = true
 				AppendThreatUpdateLog("WARN", "skipped", "节点已降级为从节点，终止威胁情报库更新（已完成源的结果保留）")
 			} else {
@@ -386,7 +386,7 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 			break
 		}
 		changed, failed := m.updateOneSource(runCtx, source, trigger, runStartedAt)
-		// SSA-87-11（历史）：判定面只需「是否有源变化」。旧实现逐源查
+		// 历史修复（历史）：判定面只需「是否有源变化」。旧实现逐源查
 		// 一次名单 id 只被 len() 消费（元素从不读取），且 id 查询失败时该源的
 		// 变化被静默排除出收敛面——纯冗余 + 可观测性缺口，查询已删除。
 		anyChanged = anyChanged || changed
@@ -395,10 +395,10 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 	// 中止点归一（F-历史问题-01）：末源在途取消时循环自然结束（无下一轮顶部
 	// 检查）——补判一次取消源；demote 优先于源失败（中止非故障）。
 	if !demoted && !cancelled && runCtx.Err() != nil {
-		if updateRunStillMaster() {
-			cancelled = true
-		} else {
+		if master, known := updateRunRoleAtCancel(); known && !master {
 			demoted = true
+		} else {
+			cancelled = true
 		}
 	}
 	m.mu.Lock()
@@ -430,8 +430,8 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 		// 由下次任意配置变更的全量渲染收敛。
 		AppendThreatUpdateLog("WARN", "unchanged", "投影刷新器未注册，跳过热路径（引用方渲染由下次配置变更收敛）")
 	} else if hot, rerr := threatProjectionRefresher(); rerr != nil || hot != ProjectionConverged {
-		// fail-safe：投影刷新被拒（生成失败）/发射面变化/运行配置不可读/
-		// 证书材料被物化（NeedForce，历史 CERT-1——重载回调为强制形态，
+		// 投影刷新被拒（生成失败）/发射面变化/运行配置不可读/
+		// 证书材料被物化（NeedForce，历史 历史修复——重载回调为强制形态，
 		// 击穿 errSameConfig 让新证书进 Caddy 内存）→ 回退 /load 收敛——宁可
 		// 一次重载，不欠引用方渲染收敛。
 		AppendThreatUpdateLog("INFO", "reloading", "投影热路径未证实收敛（发射面变化/证书物化或刷新失败），回退重载 Caddy 配置")
@@ -462,8 +462,8 @@ func ipListsReferencedByEnabledPolicyLabeled(logPrefix string, listIDs []int) bo
 	for _, id := range listIDs {
 		want[id] = true
 	}
-	// 历史 SEC-2：引用面补全——除 ACL/信任引用外，CRS 排除 scope=ip/list
-	// 条目的 ListRefs（emitScopedCRSExclusions 投影消费，SEC-1 后同为
+	// 历史 引用面补全——除 ACL/信任引用外，CRS 排除 scope=ip/list
+	// 条目的 ListRefs（emitScopedCRSExclusions 投影消费，历史修复 后同为
 	// @ipListFast 文件热感知面）与受信代理网段引用（global_config.
 	// trusted_proxy_range_refs，tp.txt 投影消费，仅 trusted_proxy_enabled=1
 	// 时渲染）都是渲染引用方；漏查会让「仅被这两面引用」的名单在写路径被
@@ -510,7 +510,7 @@ func ipListsReferencedByEnabledPolicyLabeled(logPrefix string, listIDs []int) bo
 	}
 	if err := rows.Err(); err != nil {
 		// 历史问题-⑪（历史主审补漏）：迭代失败与查询/解析失败同口径——按被引用
-		// 处理（fail-closed），漏查会跳过名单收敛致引用方渲染不收敛。
+		// 处理，漏查会跳过名单收敛致引用方渲染不收敛。
 		Logf("error", "%s: 遍历策略引用失败（按被引用处理）: %v", logPrefix, err)
 		return true
 	}
@@ -576,12 +576,14 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 	finished := time.Now().UTC().Format(crsTimeLayout)
 	if err != nil {
 		if ctx.Err() != nil {
-			if updateRunStillMaster() {
+			if master, known := updateRunRoleAtCancel(); known && !master {
+				// demote 中止必须落源行终态（此前不写 → 源行滞留
+				// running，从节点 UI 长期「运行中」且不自愈）。
+				skipSourceRow(source.id, finished, "节点已降级为从节点，中止更新")
+				AppendThreatUpdateLog("WARN", "skipped", fmt.Sprintf("节点已降级，源 %s 更新中止", source.name))
+			} else {
 				cancelSourceRow(source.id, finished, ctx.Err())
 				AppendThreatUpdateLog("WARN", "cancelled", fmt.Sprintf("源 %s 更新已手动取消（保留上次快照）", source.name))
-			} else {
-				// demote 后从节点不写源行；任务级由 run 统一落 skipped。
-				AppendThreatUpdateLog("WARN", "skipped", fmt.Sprintf("节点已降级，源 %s 更新中止", source.name))
 			}
 			return false, false
 		}
@@ -615,7 +617,9 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 			AppendThreatUpdateLog("INFO", "unchanged", fmt.Sprintf("源 %s 名单内容未变化（原始内容哈希一致），跳过解析写入", source.name))
 			// 历史问题：内容未变化不得用本次原始解析条数覆盖源行（源行口径=
 			// 上次聚合后条数，与内置名单行数一致）。
-			markSourceSuccess(source.id, -1, finished, trigger)
+			if err := markSourceSuccess(source.id, -1, finished, trigger); err != nil {
+				return false, true
+			}
 			return false, false
 		}
 	}
@@ -636,9 +640,13 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 	// 历史问题：条数口径单源——聚合后条数（与 writeThreatSystemList 写入 .iplist
 	// 的行数一致）；此前传原始 len(entries)，后写者胜使「N 条」恒为聚合前值。
 	if rawHash != "" {
-		markSourceSuccess(source.id, len(merged), finished, trigger, rawHash)
+		if err := markSourceSuccess(source.id, len(merged), finished, trigger, rawHash); err != nil {
+			return changed, true
+		}
 	} else {
-		markSourceSuccess(source.id, len(merged), finished, trigger)
+		if err := markSourceSuccess(source.id, len(merged), finished, trigger); err != nil {
+			return changed, true
+		}
 	}
 	return changed, false
 }
@@ -647,7 +655,8 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 // 排程槽生命周期（2026-10-11 用户裁定）：仅 auto 且现存槽空/过期才推进——手动不动预约。
 // rawHash 缺省=兼容旧调用形态【不写】raw_hash 列（历史 历史问题：无条件覆写
 // 空串曾使快路径自我失效——缺省时动态剔除该列，保留上次慢路径哈希）。
-func markSourceSuccess(id int, entryCount int, finished string, trigger string, rawHash ...string) {
+// 返回成功状态落库错误（吞错会让任务终态 success 掩盖状态机不闭环）。
+func markSourceSuccess(id int, entryCount int, finished string, trigger string, rawHash ...string) error {
 	version := time.Now().UTC().Format("2006.01.02")
 	next := threatNextSlot(time.Now().UTC())
 	// 历史问题：entry_count 的唯一口径是**聚合后**条数（writeThreatSystemList 的
@@ -663,6 +672,7 @@ func markSourceSuccess(id int, entryCount int, finished string, trigger string, 
 		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', `+entrySet+`version=?, finished_at=?, `+threatSlotAdvanceSQL+`, consecutive_failures=0, raw_hash=?, updated_at=datetime('now') WHERE id=?`,
 			args...); err != nil {
 			Logf("error", "威胁情报库: 更新源成功状态失败: %v", err)
+			return err
 		}
 	} else {
 		// raw_hash 缺省（快路径内容未变）不覆写该列（历史 历史问题 修法）。
@@ -670,6 +680,7 @@ func markSourceSuccess(id int, entryCount int, finished string, trigger string, 
 		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', `+entrySet+`version=?, finished_at=?, `+threatSlotAdvanceSQL+`, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`,
 			args...); err != nil {
 			Logf("error", "威胁情报库: 更新源成功状态失败: %v", err)
+			return err
 		}
 	}
 	// 成功留痕（尾部共享，两分支同达，历史 历史问题 修法）：rawHash 分支=内容
@@ -685,6 +696,7 @@ func markSourceSuccess(id int, entryCount int, finished string, trigger string, 
 		Logf("info", "威胁情报库: 源 %s 更新成功（内容未变化，版本 %s）", name, version)
 		AppendThreatUpdateLog("INFO", "success", fmt.Sprintf("源 %s 更新成功（内容未变化，版本 %s）", name, version))
 	}
+	return nil
 }
 
 // writeThreatSystemList 把聚合条目写入源对应的内置只读名单行
@@ -779,6 +791,15 @@ func cancelSourceRow(id int, finished string, cause error) {
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='cancelled', message=?, finished_at=?, updated_at=datetime('now') WHERE id=?`,
 		cause.Error(), finished, id); err != nil {
 		Logf("error", "威胁情报库: 取消状态落库失败: %v", err)
+	}
+}
+
+// skipSourceRow 节点降级中止落库：与 cancelSourceRow 同形但不改
+// 失败计数、不推进排程槽——从节点角色门会阻止后续运行，终态用于 UI/审计可见性。
+func skipSourceRow(id int, finished string, reason string) {
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='skipped', message=?, finished_at=?, updated_at=datetime('now') WHERE id=?`,
+		reason, finished, id); err != nil {
+		Logf("error", "威胁情报库: 跳过状态落库失败: %v", err)
 	}
 }
 
@@ -951,7 +972,7 @@ func WriteThreatIplistCompiled(iplistPath string, data []byte) error {
 		return err
 	}
 	// 数据落盘后再编译/rename；掉电窗口内空 .iplist/.fast 会让拦截静默
-	// fail-open（历史 历史问题-3）。
+	// 历史修复（历史 历史问题-3）。
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		return err
@@ -1027,7 +1048,7 @@ func (m *ThreatUpdateManager) CancelRunning() bool {
 	cancel := m.runCancel
 	running := m.running
 	m.mu.Unlock()
-	// SEC-C-N3（历史）：补 running 门（对齐 CRS/IP2Region 同形）——
+	// 历史修复（历史）：补 running 门（对齐 CRS/IP2Region 同形）——
 	// runCancel 一次运行后不清空，单查 cancel 会把已结束任务误报为可取消。
 	if cancel == nil || !running {
 		return false

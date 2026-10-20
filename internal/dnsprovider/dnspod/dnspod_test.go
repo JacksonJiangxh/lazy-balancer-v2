@@ -112,7 +112,7 @@ func TestProvider_CleanUp_deletes_persisted_record_after_restart(t *testing.T) {
 
 // paginatedTransport serves Domain.List from a scripted domain list,
 // honoring the offset parameter and capping each response page at pageSize
-// entries (mimicking the DNSPod API's server-side pagination).
+// entries (mimicking the DNSPod API's 历史修复 pagination).
 type paginatedTransport struct {
 	mu       sync.Mutex
 	domains  []string
@@ -159,7 +159,7 @@ func (transport *paginatedTransport) RoundTrip(request *http.Request) (*http.Res
 }
 
 func TestProvider_getDomainID_paginates_beyond_first_page(t *testing.T) {
-	// CERT40-4:清进程内 zone 缓存——前序用例可能已缓存同名 zone。
+	// 清进程内 zone 缓存——前序用例可能已缓存同名 zone。
 	domainIDCacheMu.Lock()
 	domainIDCache = map[string]string{}
 	domainIDCacheMu.Unlock()
@@ -197,7 +197,7 @@ func TestProvider_getDomainID_paginates_beyond_first_page(t *testing.T) {
 }
 
 func TestProvider_getDomainID_paginates_large_accounts(t *testing.T) {
-	// CERT40-4:清进程内 zone 缓存——前序用例可能已缓存同名 zone。
+	// 清进程内 zone 缓存——前序用例可能已缓存同名 zone。
 	domainIDCacheMu.Lock()
 	domainIDCache = map[string]string{}
 	domainIDCacheMu.Unlock()
@@ -288,7 +288,7 @@ func (transport *flakyTransport) RoundTrip(request *http.Request) (*http.Respons
 }
 
 func TestProvider_apiCall_retries_transient_failures(t *testing.T) {
-	// Given: transient HTTP failures on the non-create Domain.List action
+	// Given: transient HTTP failures on the 历史修复 Domain.List action
 	// precede a success; the retrying transport (the provider's production
 	// wiring) must absorb them
 	testCases := []struct {
@@ -346,7 +346,7 @@ func (transport *gatewayBodyTransport) RoundTrip(request *http.Request) (*http.R
 	}, nil
 }
 
-// DNS-87-F10（历史）：网关返回 HTML/空体（502/503）时解码失败必须带
+// 历史修复（历史）：网关返回 HTML/空体（502/503）时解码失败必须带
 // HTTP 状态码与动作名——原文案只剩「decode response: invalid character '<'…」，
 // 排障只能翻 network 日志（429/5xx 已由 retry.Transport 吸收，这里是最终失败形态）。
 func TestProvider_apiCall_decodeErrorCarriesStatusAndMethod(t *testing.T) {
@@ -366,6 +366,60 @@ func TestProvider_apiCall_decodeErrorCarriesStatusAndMethod(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "HTTP 502") || !strings.Contains(err.Error(), "Record.Create") {
 		t.Fatalf("error=%q, want action name and HTTP status in the decode failure", err)
+	}
+}
+
+// HTTP 5xx 即使带回可解析 JSON 也必须按失败处理。网关兜底体
+// 或厂商错误体恰好含 {"status":{"code":"1"}} 时，原实现解码成功即 return nil，
+// 记录内 code 被当业务成功——Record.Remove 因此把「未删除」当「已删除」，
+// 所有权条目被清除而 TXT 永久残留且脱离追踪。
+func TestProvider_apiCall_rejectsHTTPErrorWithDecodableBody(t *testing.T) {
+	// Given：Record.Remove 返回 503 + 可解析 JSON（体内 code 仍是成功值）
+	transport := &gatewayBodyTransport{status: http.StatusServiceUnavailable, body: `{"status":{"code":"1","message":"ok"}}`}
+	provider := New("id,token")
+	provider.client.Transport = transport
+	var result struct {
+		Status struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"status"`
+	}
+
+	// When
+	err := provider.apiCall(t.Context(), "Record.Remove", url.Values{}, &result)
+
+	// Then：错误必须自明（动作名 + HTTP 状态 + 响应体取样），且不得把体内
+	// code 当成功
+	if err == nil {
+		t.Fatal("HTTP 503 with decodable body was accepted as success")
+	}
+	if !strings.Contains(err.Error(), "HTTP 503") || !strings.Contains(err.Error(), "Record.Remove") {
+		t.Fatalf("error=%q, want action name and HTTP status", err)
+	}
+	if !strings.Contains(err.Error(), `"code":"1"`) {
+		t.Fatalf("error=%q, want truncated body sampled for diagnostics", err)
+	}
+}
+
+// 错误体取样上限防止网关错误页（数百 KB）整读进错误文案。
+func TestProvider_apiCall_truncatesErrorBody(t *testing.T) {
+	// Given：6 KiB 的错误体
+	body := strings.Repeat("x", 6*1024)
+	provider := New("id,token")
+	provider.client.Transport = &gatewayBodyTransport{status: http.StatusBadGateway, body: body}
+
+	// When
+	err := provider.apiCall(t.Context(), "Domain.List", url.Values{}, nil)
+
+	// Then：只保留前缀（httpErrorBodyLimit 字节），不整读
+	if err == nil {
+		t.Fatal("HTTP 502 accepted as success")
+	}
+	if len(err.Error()) > httpErrorBodyLimit+128 {
+		t.Fatalf("error length=%d, want bounded near the %d-byte sample", len(err.Error()), httpErrorBodyLimit)
+	}
+	if !strings.Contains(err.Error(), strings.Repeat("x", httpErrorBodyLimit)) {
+		t.Fatal("error dropped the sampled body prefix")
 	}
 }
 
@@ -398,7 +452,7 @@ func TestProvider_Present_does_not_replay_create_on_5xx(t *testing.T) {
 }
 
 // missingRecordTransport makes Record.Remove answer with DNSPod's
-// record-ID-error body code (8) instead of deleting.
+// 历史修复 body code (8) instead of deleting.
 type missingRecordTransport struct {
 	dnsPodRecordTransport
 }
@@ -428,7 +482,7 @@ func TestProvider_CleanUp_treats_missing_record_as_success(t *testing.T) {
 	// When
 	err := provider.CleanUp(t.Context(), "example.com", "_acme-challenge.example.com.")
 
-	// Then: cleanup stays idempotent despite the not-found response
+	// Then: cleanup stays idempotent despite the 历史修复 response
 	if err != nil {
 		t.Fatalf("clean up missing record: %v", err)
 	}
@@ -477,7 +531,7 @@ func TestProvider_CleanUpValue_deletes_only_own_record(t *testing.T) {
 }
 
 func TestProvider_CleanUpValue_memory_mode_tracks_values(t *testing.T) {
-	// Given: memory-mode ownership with two same-name records of different
+	// Given: 历史修复 ownership with two 历史修复 records of different
 	// values
 	transport := &dnsPodRecordTransport{records: map[string]string{}}
 	provider := New("id,token")
@@ -513,12 +567,15 @@ func TestProvider_CleanUpValue_removes_stale_ownership_entries(t *testing.T) {
 	transport := &dnsPodRecordTransport{records: map[string]string{"100": "abandoned", "200": "beta"}}
 	provider.client.Transport = transport
 	ownershipPath := filepath.Join(dataDir, "acme_dns_ownership.json")
+	// 条目带本账户摘要——「同账户的陈旧条目由后续清理回收」
+	// 是 历史修复 的既有契约（崩溃遗留的 TXT 必须能被清掉）；账户维度只保护
+	// 无法归属当前账户的条目（见 TestProvider_CleanUpValue_dropsStaleLegacyRecordWithoutDeleting）。
 	raw := fmt.Sprintf(`{"version":1,"records":[
-		{"provider":"dnspod","zone":"example.com","fqdn":"_acme-challenge.example.com.","value":"abandoned","record_id":"100","created_at":%q},
-		{"provider":"dnspod","zone":"example.com","fqdn":"_acme-challenge.example.com.","value":"beta","record_id":"200","created_at":%q}
+		{"provider":"dnspod","zone":"example.com","fqdn":"_acme-challenge.example.com.","value":"abandoned","record_id":"100","account":%q,"created_at":%q},
+		{"provider":"dnspod","zone":"example.com","fqdn":"_acme-challenge.example.com.","value":"beta","record_id":"200","account":%q,"created_at":%q}
 	]}`,
-		time.Now().Add(-90*time.Minute).UTC().Format(time.RFC3339),
-		time.Now().UTC().Format(time.RFC3339))
+		ownership.AccountDigest("id,token"), time.Now().Add(-90*time.Minute).UTC().Format(time.RFC3339),
+		ownership.AccountDigest("id,token"), time.Now().UTC().Format(time.RFC3339))
 	if err := os.WriteFile(ownershipPath, []byte(raw), 0600); err != nil {
 		t.Fatalf("seed ownership file: %v", err)
 	}
@@ -555,7 +612,7 @@ func TestNew_client_timeout_covers_retry_envelope(t *testing.T) {
 	provider := New("id,token")
 
 	// Then: http.Client.Timeout spans the whole retry loop (3 attempts plus
-	// backoff/Retry-After waits capped at 30s each), so it must exceed that
+	// backoff/历史修复 waits capped at 30s each), so it must exceed that
 	// envelope instead of cutting it short
 	if provider.client.Timeout < 90*time.Second {
 		t.Fatalf("client timeout=%v, want >= 90s retry-envelope headroom", provider.client.Timeout)
@@ -617,7 +674,7 @@ func TestProvider_CleanUp_removes_ownership_of_independently_deleted_records(t *
 
 	// Then: the record 200 failure is reported, yet record 201 — which WAS
 	// deleted at the API — loses its ownership entry; an earlier miss must
-	// not orphan later already-deleted records
+	// not orphan later 历史修复 records
 	if err == nil {
 		t.Fatal("clean up swallowed the record 200 deletion failure")
 	}
@@ -709,7 +766,7 @@ func (transport *staleRemoveTransport) flipStaleDomain(cachedID, freshID string,
 	transport.failFreshID = failFresh
 }
 
-// 历史问题（历史）：cleanUp 侧的 CERT42-7 同族自愈——缓存的 zone→
+// 历史问题（历史）：cleanUp 侧的 历史修复 同族自愈——缓存的 zone→
 // domain_id 陈旧（域名移出账户/删除重建）时，deleteRecord 对旧 ID 报「域名
 // 不存在」类错误，须作废缓存重解析后重试一次，而非把清理失败抛给签发链。
 func TestDNSPodCleanUp_staleDomainIDInvalidatesAndRetries(t *testing.T) {
@@ -730,7 +787,7 @@ func TestDNSPodCleanUp_staleDomainIDInvalidatesAndRetries(t *testing.T) {
 	// When
 	err = provider.CleanUp(t.Context(), "example.com", "_acme-challenge.example.com.")
 
-	// Then: the stale id was invalidated, re-resolved once and the deletion
+	// Then: the stale id was invalidated, 历史修复 once and the deletion
 	// retried against the fresh id
 	if err != nil {
 		t.Fatalf("clean up with stale cached domain id: %v", err)
@@ -779,7 +836,7 @@ func TestDNSPodCleanUp_freshDomainIDDeletesOnce(t *testing.T) {
 		t.Fatalf("clean up with fresh domain id: %v", err)
 	}
 
-	// Then: exactly one deletion against the cached id, no re-resolution
+	// Then: exactly one deletion against the cached id, no 历史修复
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
 	want := [][2]string{{"1", "300"}}
@@ -793,11 +850,11 @@ func TestDNSPodCleanUp_freshDomainIDDeletesOnce(t *testing.T) {
 
 // 历史问题 回归形状二 + 历史问题 基线钉：重试仍失败照旧记 failed（不循环）——内存
 // 模式下失败记录须回到 owned 表（failed 存储的唯一消费者），供同进程后续
-// 清理重试。ADNS71-1（历史）：自愈重解析已把 domain_id 换代（1→2），
+// 清理重试。历史修复（历史）：自愈重解析已把 domain_id 换代（1→2），
 // 回填与残留条目必须落在新键——旧键条目对后续 cleanUp/Present 永不可达，
 // 「failed 回填供后续清理重试」形同虚设（旧钉测钉住了这个自相矛盾形态）。
 func TestDNSPodCleanUp_staleRetryStillFailsReappendsUnderFreshKey(t *testing.T) {
-	// Given: a stale cached id and an API that also fails the fresh-id retry
+	// Given: a stale cached id and an API that also fails the 历史修复 retry
 	seedDomainIDCache(t, "id,token", map[string]string{})
 	transport := &staleRemoveTransport{currentID: "1", records: map[string]string{}}
 	provider := New("id,token")
@@ -811,7 +868,7 @@ func TestDNSPodCleanUp_staleRetryStillFailsReappendsUnderFreshKey(t *testing.T) 
 	err := provider.CleanUp(t.Context(), "example.com", "_acme-challenge.example.com.")
 
 	// Then: exactly one invalidation+retry (no loop), the failure is reported
-	// and the record returns to the in-memory owned table under the FRESH key
+	// and the record returns to the 历史修复 owned table under the FRESH key
 	if err == nil {
 		t.Fatal("clean up swallowed the persistent deletion failure")
 	}
@@ -833,7 +890,7 @@ func TestDNSPodCleanUp_staleRetryStillFailsReappendsUnderFreshKey(t *testing.T) 
 		t.Fatal("stale-key entries must migrate to the fresh key after self-heal (ADNS71-1)")
 	}
 
-	// And：可达性——回填记录在下一轮 cleanUp 真正被重试删除（fresh-id 放行后）
+	// And：可达性——回填记录在下一轮 cleanUp 真正被重试删除（历史修复 放行后）
 	transport.flipStaleDomain("1", "2", false)
 	if err := provider.CleanUp(t.Context(), "example.com", "_acme-challenge.example.com."); err != nil {
 		t.Fatalf("retry cleanup after self-heal: %v", err)
@@ -849,7 +906,7 @@ func TestDNSPodCleanUp_staleRetryStillFailsReappendsUnderFreshKey(t *testing.T) 
 // 历史问题 回归形状三（生产形状）：ownership 模式下重试仍失败时，失败记录保留
 // ownership 条目（DNS 记录可能仍存在），后续清理可自愈。
 func TestDNSPodCleanUp_staleRetryFailureKeepsOwnershipEntry(t *testing.T) {
-	// Given: a stale cached id and an API that also fails the fresh-id retry
+	// Given: a stale cached id and an API that also fails the 历史修复 retry
 	seedDomainIDCache(t, "id,token", map[string]string{})
 	transport := &staleRemoveTransport{currentID: "1", records: map[string]string{}}
 	dataDir := t.TempDir()
@@ -893,7 +950,7 @@ func TestDNSPodCleanUp_staleRetryFailureKeepsOwnershipEntry(t *testing.T) {
 // 按值清理（CleanUpValue）的 entry.value != value 过滤会永久跳过该条目，
 // 「失败回填供后续清理重试」的意图落空。
 func TestProvider_CleanUp_memoryModeFailedValueRetriedByCleanUpValue(t *testing.T) {
-	// Given: memory-mode ownership whose only record fails to delete
+	// Given: 历史修复 ownership whose only record fails to delete
 	provider := New("id,token")
 	transport := &removeFailTransport{dnsPodRecordTransport: dnsPodRecordTransport{records: map[string]string{}}, failRecordID: "200"}
 	provider.client.Transport = transport
@@ -901,11 +958,11 @@ func TestProvider_CleanUp_memoryModeFailedValueRetriedByCleanUpValue(t *testing.
 		t.Fatalf("present record: %v", err)
 	}
 
-	// When: first by-value cleanup fails at the API
+	// When: first 历史修复 cleanup fails at the API
 	if err := provider.CleanUpValue(t.Context(), "example.com", "_acme-challenge.example.com.", "value"); err == nil {
 		t.Fatal("first cleanup swallowed the deletion failure")
 	}
-	// Then: the re-appended entry still carries the challenge value
+	// Then: the 历史修复 entry still carries the challenge value
 	provider.mu.Lock()
 	entries := append([]ownedRecord(nil), provider.owned["1|_acme-challenge"]...)
 	provider.mu.Unlock()

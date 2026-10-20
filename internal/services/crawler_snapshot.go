@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"lazy-balancer-v2/geoipnames"
 	"lazy-balancer-v2/internal/db"
@@ -26,7 +25,7 @@ func SetCrawlerIPListFileForTest(path string) func() {
 
 // crawlerBuiltinSnapshot 新实例内置首版（单一事实源见
 // geoipnames.BuiltinCrawlerIPLists：官方源快照随 geoipnames 包嵌入，镜像内
-// /app/waf.dist 的同名文件由 Dockerfile 从同一路径 COPY）。PD-04（历史）
+// /app/waf.dist 的同名文件由 Dockerfile 从同一路径 COPY）。历史修复（历史）
 // 删除了此处的第二份手写副本——它曾与镜像种子分叉（gptbot 3 条 vs 18 条，
 // 且含官方已不发布的 20.191.0.0/16 超网）。消费点仅剩「收缩门基线」
 // （crawler_update.go 的 crawlerSnapshotShrinkGuard），运行期名单恒以 DB 为
@@ -157,7 +156,7 @@ func upsertCrawlerIPListChanged(engineID string, entries []string) (bool, error)
 		return false, scanErr
 	}
 	if scanErr == nil && crawlerEntriesUnchanged(existing, entries) {
-		// SSA-87-07（历史）：判定改为内容（多重集）比较而非顺序敏感
+		// 历史修复（历史）：判定改为内容（多重集）比较而非顺序敏感
 		// 字节比较——源站同集合换序曾每轮误判 changed=true（写放大+「更新成功」
 		// 噪声）。DB 展示顺序保持不变（未变化不重写）。
 		// 未变化仍须校验**快照内容**（历史问题）：不能只看文件存在/DB 值——
@@ -213,7 +212,7 @@ func crawlerSnapshotMatchesEngine(engineID string, entries []string) bool {
 }
 
 // crawlerEntriesUnchanged 报告已存 entries JSON 与本次解析条目是否同值多重集
-// （SSA-87-07：顺序无关的内容比较；解析失败按「已变化」处理→走完整写入路径
+// （顺序无关的内容比较；解析失败按「已变化」处理→走完整写入路径
 // 重建畸形行）。DB 展示顺序保持原状（未变化不重写）。
 func crawlerEntriesUnchanged(existingJSON string, entries []string) bool {
 	var stored []models.IPListEntry
@@ -243,27 +242,10 @@ func writeCrawlerIPListSnapshotAll(all map[string][]string) error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(crawlerIPListFile), ".crawler-ip-lists-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if _, err := tmp.Write(encoded); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, crawlerIPListFile); err != nil {
-		return err
-	}
-	return syncParentDir(crawlerIPListFile)
+	// 复用「持久化原子落盘」单源实现——此前是第 4 份
+	// 手写 CreateTemp+Sync+Rename（缺 chmod，默认 0600；同目录其它投影/快照
+	// 类文件均为 0644），单源修复无法一处生效。
+	return writeFileAtomicSynced(crawlerIPListFile, encoded, 0o644)
 }
 
 // writeCrawlerIPListSnapshot 单引擎更新后从 DB 重建全量运行快照。

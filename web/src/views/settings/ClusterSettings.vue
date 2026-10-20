@@ -339,9 +339,9 @@ const isReadOnlyProp = computed(() => {
   return reason === 'non-admin' || reason === 'unknown'
 })
 const clusterModeChanging = computed(() => syncing.value || promoting.value || modeLoading.value)
-const fetchStatus = async (): Promise<ClusterStatus> => {
+const fetchStatus = async (roundSignal?: AbortSignal): Promise<ClusterStatus> => {
   const requestSeq = ++requestSequence
-  const response = await request.get<APIResponse<ClusterStatus>>('/cluster/status', { signal: clusterPolling.signal, silent: true })
+  const response = await request.get<APIResponse<ClusterStatus>>('/cluster/status', { signal: roundSignal ?? clusterPolling.signal, silent: true })
   const data = response.data
   // FE40-D1-4：协议违例用 TypeError（Error 保留给业务失败）。
   if (!data) throw new TypeError('集群状态响应缺少数据')
@@ -352,24 +352,24 @@ const fetchStatus = async (): Promise<ClusterStatus> => {
   return data
 }
 
-const fetchNodes = async (): Promise<void> => {
+const fetchNodes = async (roundSignal?: AbortSignal): Promise<void> => {
   if (disposed) return
   const requestSeq = ++nodesRequestSequence
   nodesLoading.value = true
   try {
-    const response = await request.get<APIResponse<readonly ClusterNodeWithSyncError[]>>('/cluster/nodes', { signal: clusterPolling.signal, silent: true })
+    const response = await request.get<APIResponse<readonly ClusterNodeWithSyncError[]>>('/cluster/nodes', { signal: roundSignal ?? clusterPolling.signal, silent: true })
     if (!disposed && requestSeq === nodesRequestSequence) nodes.value = response.data ?? []
   } finally {
     if (!disposed && requestSeq === nodesRequestSequence) nodesLoading.value = false
   }
 }
 
-const refreshCluster = async (): Promise<void> => {
+const refreshCluster = async (roundSignal?: AbortSignal): Promise<void> => {
   if (disposed) return
-  const currentStatus = await fetchStatus()
+  const currentStatus = await fetchStatus(roundSignal)
   if (disposed) return
   if (currentStatus.node_mode === 'master') {
-    await fetchNodes()
+    await fetchNodes(roundSignal)
   } else {
     nodes.value = []
   }
@@ -724,9 +724,9 @@ const clusterPollingErrorDescription = computed(() => {
     : `最后错误：${lastError}`
 })
 const clusterRetrying = ref(false)
-const clusterPolling = usePollingTask(async () => {
+const clusterPolling = usePollingTask(async (task) => {
   if (!clusterPollingError.canRun()) return
-  await refreshCluster()
+  await refreshCluster(task.signal)
   clusterPollingError.clear()
 }, {
   interval: 15000,

@@ -23,7 +23,7 @@ func useCertJobLogTestEnv(t *testing.T, thresholdBytes int64) {
 	oldDir := taskengine.LogDir()
 	taskengine.SetLogDir(filepath.Join(t.TempDir(), "logs", "tasks"))
 	// 阈值注入缝直接替换 taskengine 的读取函数，绕过 getTaskLogSizeBytes/缓存
-	// （V87-TO-06 后缓存内部结构不可直接写入；本注入缝已完全覆盖阈值取值）。
+	// （历史修复 后缓存内部结构不可直接写入；本注入缝已完全覆盖阈值取值）。
 	taskengine.SetTaskLogSizeBytesFn(func() int64 { return thresholdBytes })
 	t.Cleanup(func() {
 		taskengine.SetLogDir(oldDir)
@@ -45,7 +45,7 @@ func TestCertJobLogPath_followsTaskLogDir(t *testing.T) {
 	}
 }
 
-// 一次性迁移（best-effort）：pre-B3/固化期写入 {LogDir 父目录}（容器=/app/logs）
+// 一次性迁移：历史修复/固化期写入 {LogDir 父目录}（容器=/app/logs）
 // 的 certjob-*.log 搬入新目录——旧文件残留会脱离清理面；目标已存在不覆盖。
 func TestCertJobLogDir_migratesLegacyFilesOnce(t *testing.T) {
 	base := t.TempDir()
@@ -166,7 +166,7 @@ func TestCertJobFileLogger_rotation_failure_is_surfaced(t *testing.T) {
 
 // 历史问题 并发守护：每次写日志都新建实例（Issue 的 jobLogger / WriteCertJobLog* 是
 // 真实调用形态），8 实例并发写同 ruleID、阈值 1 字节使每次写都触发轮转。锁定后
-// check-rotate-append 原子化；断言全部落盘行完整无撕裂、代际集合不越界。
+// 历史修复 原子化；断言全部落盘行完整无撕裂、代际集合不越界。
 // 注：并发交错本身概率性，本测试为回归守护（配合 -race），确定性红由
 // rotation_failure_is_surfaced 承担。
 func TestCertJobFileLogger_concurrent_writers_keep_lines_intact(t *testing.T) {
@@ -243,7 +243,7 @@ func TestCertJobFileLogger_housekeepingDeletesOnlyExpiredFiles(t *testing.T) {
 		t.Fatalf("touch active log: %v", err)
 	}
 
-	// When：log-cleanup housekeeping 节拍
+	// When：历史修复 housekeeping 节拍
 	logFile := filepath.Join(filepath.Dir(taskengine.LogDir()), "lazy-balancer.log")
 	result := taskLogsHousekeeping(logFile)
 
@@ -291,7 +291,7 @@ func TestCertJobFileLogger_singleTrackRotationKeepsFiveGenerations(t *testing.T)
 		}
 		return string(data)
 	}
-	// 活动文件=GEN-7，.1-.5=GEN-6..GEN-2，GEN-1 已退役。
+	// 活动文件=历史修复，.1-.5=历史修复..历史修复，历史修复 已退役。
 	want := map[int]string{0: "GEN-7-", 1: "GEN-6-", 2: "GEN-5-", 3: "GEN-4-", 4: "GEN-3-", 5: "GEN-2-"}
 	for i, tag := range want {
 		if got := readGen(i); !strings.Contains(got, tag) {
@@ -353,3 +353,51 @@ func TestCertJobFileLogger_writeAndCloseErrorsAreSurfaced(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// 证书任务日志文件名主体必须与规则访问日志同构
+// （可逆编码）。旧实现 sanitizePathComponent 剔除非法字符：`lb.dot` 与 `lbdot`
+// 落到同一 历史修复.log 与同一写锁——签发日志跨规则混写、保留期清理互相
+// 删除（housekeeping 从文件名反推 ID 的前提在字母表外不成立）。
+func TestCertJobLogFileName_reversibleForDottedIDs(t *testing.T) {
+	useCertJobLogTestEnv(t, 1<<20)
+
+	// 共文件形状：含 '.' 的 ID 必须与剔除后的同名 ID 落不同文件
+	if dotted, plain := CertJobLogPath("lb.dot"), CertJobLogPath("lbdot"); dotted == plain {
+		t.Fatalf("lb.dot 与 lbdot 共用日志文件 %q（剔除字符不可逆）", dotted)
+	}
+
+	// 往返：路径 → 文件名 → certJobLogRuleIDFromName 必须还原原始 ID，
+	// 且 housekeeping 反推出的锁键与写侧同源（同一 mutex）。
+	for _, ruleID := range []string{"lb.dot", "lbdot", "lb_x-1", "lb.dot.rule", "lb..dot", "lb.dot中"} {
+		name := filepath.Base(CertJobLogPath(ruleID))
+		parsed, ok := certJobLogRuleIDFromName(name)
+		if !ok || parsed != ruleID {
+			t.Fatalf("roundtrip %q: parsed=%q ok=%v（文件名 %q）", ruleID, parsed, ok, name)
+		}
+		if lockCertJobLog(parsed) != lockCertJobLog(ruleID) {
+			t.Fatalf("roundtrip %q: housekeeping 与写侧锁键不同源", ruleID)
+		}
+		// 轮转代（.N/.gz）反推同样成立（taskLogsHousekeeping 扫描的形态）。
+		for _, suffix := range []string{".log.1", ".log.5", ".log.gz"} {
+			rotated, rok := certJobLogRuleIDFromName(strings.TrimSuffix(name, ".log") + suffix)
+			if !rok || rotated != ruleID {
+				t.Fatalf("roundtrip %q%s: parsed=%q ok=%v", ruleID, suffix, rotated, rok)
+			}
+		}
+	}
+
+	// 向后兼容：旧实现产出的文件名（剔除非法字符）仍可解析——存量部署的
+	// 历史文件继续参与 housekeeping 清理与写锁串行化。
+	for name, want := range map[string]string{
+		"certjob-lbdot.log":        "lbdot",
+		"certjob-lbdot.log.3":      "lbdot",
+		"certjob-lbdot.log.gz":     "lbdot",
+		"certjob-lb_x.log":         "lb_x",
+		"certjob-badrule.log.1.gz": "badrule",
+	} {
+		got, ok := certJobLogRuleIDFromName(name)
+		if !ok || got != want {
+			t.Fatalf("legacy name %q parsed=%q ok=%v, want %q", name, got, ok, want)
+		}
+	}
+}
