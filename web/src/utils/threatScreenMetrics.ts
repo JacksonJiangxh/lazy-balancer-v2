@@ -51,9 +51,10 @@ export function trafficDelta(
     const attack = typeof entry?.attack === 'number' && Number.isFinite(entry.attack) ? entry.attack : 0
     counts.set(name, { normal, attack })
     if (!prev) continue
-    const before = prev.counts.get(name)
-    // 基线中不存在的新国家不计差分：其累计值不是「本间隔内新增」
-    if (before === undefined) continue
+    // 基线中不存在的新国家按 0 起步：计数器快照只包含非零国家，
+    // 缺失即基线时刻尚无请求；其当前累计值就是本间隔新增。旧实现 continue
+    // 会丢掉每个国家/地区首次出现的请求（慢速流量统计漏计）。
+    const before = prev.counts.get(name) ?? { normal: 0, attack: 0 }
     const normalDelta = normal - before.normal
     const attackDelta = attack - before.attack
     if (normalDelta < 0 || attackDelta < 0) reset = true

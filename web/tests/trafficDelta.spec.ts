@@ -72,11 +72,11 @@ test('A3c 抽样比非法（0/负数/NaN）按 1 处理且不误触发基线重�
   }
 })
 
-test('A4 新出现国家不计差分（其累计值不是本间隔新增）', () => {
+test('A4 新出现国家从 0 起步（首次请求必须计入慢速流量统计）', () => {
   const prev = baseline({ 中国: { normal: 100 } }, 0)
-  const next = trafficDelta(prev, { 中国: { normal: 110 }, 德国: { normal: 999 } }, 1000)
-  assert.equal(next.normalTotal, 10)
-  assert.deepEqual(next.normalDeltas, [{ name: '中国', count: 10 }])
+  const next = trafficDelta(prev, { 中国: { normal: 110 }, 德国: { normal: 1 } }, 1000)
+  assert.equal(next.normalTotal, 11)
+  assert.deepEqual(next.normalDeltas, [{ name: '中国', count: 10 }, { name: '德国', count: 1 }])
 })
 
 test('A5 attack 桶独立差分（实时攻击速率不再被丢弃）', () => {
