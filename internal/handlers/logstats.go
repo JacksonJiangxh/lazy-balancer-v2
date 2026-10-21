@@ -324,9 +324,14 @@ func globalConfigInt(column string, fallback int64) int64 {
 		return fallback
 	}
 	var v int64
+	// 历史问题：读失败回退默认必须留痕（此前静默——库故障窗口阈值展示/滚动
+	// 口径失真零信号）；接 services 单源状态转换留痕（首报 warn+恢复 info，
+	// 面板轮询不刷屏）。nil 与读失败同口径回退默认值。
 	if err := db.DB.QueryRow("SELECT COALESCE("+column+",?) FROM global_config WHERE id=1", fallback).Scan(&v); err != nil {
+		services.LogConfigReadFailure("config-read-"+column, err)
 		return fallback
 	}
+	services.LogConfigReadRecovered("config-read-" + column)
 	return v
 }
 
@@ -620,6 +625,18 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	// 逐任务真实文件统计（任务监控弹框 log-key=task:<id>）：活动大小、
 	// 轮转副本与归档份数均按本任务文件计算。批量路径解析复用同一个
 	// systemTaskLogPathResolver，cert_jobs 只首批载入一次，避免 N+1。
+	// 门控：只有请求里含 task:<id> 行（或无 keys 的全量请求）才枚举任务族——
+	// 单行轮询（日志弹框只看某一行）此前仍全量 CollectSystemTasks（引擎
+	// DescribeAll + cert_jobs 查询 + task_runs 统计），纯白付。
+	wantsPerTaskRows := requested == nil
+	if !wantsPerTaskRows {
+		for key := range requested {
+			if strings.HasPrefix(key, "task:") {
+				wantsPerTaskRows = true
+				break
+			}
+		}
+	}
 	var taskLogPath systemTaskLogPathResolver
 	taskDirEntries := map[string][]os.DirEntry{}
 	readTaskDir := func(dir string) []os.DirEntry {
@@ -633,30 +650,33 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		taskDirEntries[dir] = entries
 		return entries
 	}
-	for _, task := range services.CollectSystemTasks() {
-		key := "task:" + task.ID
-		if !want(key) {
-			continue
+	if wantsPerTaskRows {
+		taskRows, _ := services.CollectSystemTasks()
+		for _, task := range taskRows {
+			key := "task:" + task.ID
+			if !want(key) {
+				continue
+			}
+			path, err := taskLogPath.resolve(task.ID)
+			if err != nil {
+				services.Logf("warn", "任务 %s 日志路径解析失败: %v", task.ID, err)
+				continue
+			}
+			if path == "" {
+				continue
+			}
+			keep := 1
+			if strings.HasPrefix(task.ID, "cert-job:") {
+				keep = logRotatedBackups
+			}
+			active, rotated, rotCount := dirBytesWithEntries(path, readTaskDir(filepath.Dir(path)))
+			infos = append(infos, LogStorageInfo{
+				Key: key, Name: task.Name + "日志",
+				SizeBytes: active, RotatedBytes: rotated, RotatedCount: rotCount,
+				LimitBytes: taskLogLimit, KeepCount: keep,
+				ConfigSource: "统一任务日志（" + filepath.Base(path) + "）",
+			})
 		}
-		path, err := taskLogPath.resolve(task.ID)
-		if err != nil {
-			services.Logf("warn", "任务 %s 日志路径解析失败: %v", task.ID, err)
-			continue
-		}
-		if path == "" {
-			continue
-		}
-		keep := 1
-		if strings.HasPrefix(task.ID, "cert-job:") {
-			keep = logRotatedBackups
-		}
-		active, rotated, rotCount := dirBytesWithEntries(path, readTaskDir(filepath.Dir(path)))
-		infos = append(infos, LogStorageInfo{
-			Key: key, Name: task.Name + "日志",
-			SizeBytes: active, RotatedBytes: rotated, RotatedCount: rotCount,
-			LimitBytes: taskLogLimit, KeepCount: keep,
-			ConfigSource: "统一任务日志（" + filepath.Base(path) + "）",
-		})
 	}
 	ruleID := strings.TrimSpace(c.Query("caddy_id"))
 	if ruleID != "" && (strings.ContainsAny(ruleID, "/\\") || ruleID == "." || ruleID == "..") {

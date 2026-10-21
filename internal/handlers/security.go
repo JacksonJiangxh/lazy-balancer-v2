@@ -489,7 +489,15 @@ func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的拦截页面 ID"})
 		return
 	}
-	var req models.SecurityBlockPage
+	// 指针合并语义（与 UpdateRule/PUT 同域口径）：省略字段保留库中原值，
+	// 显式空串才清空。旧实现用值结构体全量替换——省略 description 会静默
+	// 清空描述、省略 content_type 会把自定义类型重置为默认 text/html。
+	var req struct {
+		Name        *string `json:"name"`
+		Description *string `json:"description"`
+		Content     *string `json:"content"`
+		ContentType *string `json:"content_type"`
+	}
 	if !guardConfiguredJSONBody(c) {
 		return
 	}
@@ -499,10 +507,6 @@ func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
 	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
-	if err := validateBlockPagePayload(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
 	var isDefault, isBuiltin bool
 	// 历史问题: is_default 检查与 UPDATE 必须同事务（镜像 DeleteSecurityBlockPage
 	// 历史问题）。非事务读 + 错误丢弃的旧实现存在并发窗口：导入路径可在 SELECT 与
@@ -513,12 +517,33 @@ func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
-	if err := tx.QueryRowContext(c.Request.Context(), "SELECT COALESCE(is_default,0), COALESCE(is_builtin,0) FROM security_block_pages WHERE id=?", id).Scan(&isDefault, &isBuiltin); err != nil {
+	var page models.SecurityBlockPage
+	if err := tx.QueryRowContext(c.Request.Context(), `SELECT COALESCE(is_default,0), COALESCE(is_builtin,0), name, COALESCE(description,''), content, COALESCE(content_type,'') FROM security_block_pages WHERE id=?`, id).
+		Scan(&isDefault, &isBuiltin, &page.Name, &page.Description, &page.Content, &page.ContentType); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "拦截页面不存在"})
 		} else {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		}
+		return
+	}
+	// 合并省略字段（校验作用于合并后的终值：只传 content 的调用方不会被
+	// 「name 为空」误拒）。校验仍在默认页/内置页 403 门之前执行——旧实现
+	// 先校验后进门，载荷非法时恒 400（契约保持）。
+	if req.Name != nil {
+		page.Name = *req.Name
+	}
+	if req.Description != nil {
+		page.Description = *req.Description
+	}
+	if req.Content != nil {
+		page.Content = *req.Content
+	}
+	if req.ContentType != nil {
+		page.ContentType = *req.ContentType
+	}
+	if err := validateBlockPagePayload(&page); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
 	// 内置备选页（限流/维护）与默认页同门禁（2026-09-25 用户裁定：不可编辑/删除）
@@ -531,7 +556,7 @@ func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
 		return
 	}
 	result, err := tx.ExecContext(c.Request.Context(), `UPDATE security_block_pages SET name=?, description=?, content=?, content_type=?, updated_by=?, updated_at=datetime('now') WHERE id=?`,
-		req.Name, req.Description, req.Content, req.ContentType, int(contextUserID(c)), id)
+		page.Name, page.Description, page.Content, page.ContentType, int(contextUserID(c)), id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
@@ -541,7 +566,7 @@ func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "拦截页面", AuditAction: "更新",
-		AuditDetail: fmt.Sprintf("名称：%s（#%s）", req.Name, id),
+		AuditDetail: fmt.Sprintf("名称：%s（#%s）", page.Name, id),
 		SuccessMsg:  "拦截页面已更新",
 	})
 }
@@ -702,27 +727,14 @@ func (h *Handlers) ListSecurityPolicies(c *gin.Context) {
 	blockedCounts := map[int]int{}
 	triggerCounts := map[int]int{}
 	if db.MetricsDB != nil {
-		eventRows, err := db.MetricsDB.Query(`SELECT policy_id, SUM(action='blocked'), COUNT(*) FROM security_events WHERE action IN ('blocked','logged') AND policy_id>0 AND event_time >= datetime('now','-1 day') GROUP BY policy_id`)
+		counts, err := loadSecurityPolicy24hCounts(db.MetricsDB, time.Now())
 		if err != nil {
 			services.Logf("error", "security policies: 24h event count query failed: %v", err)
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 			return
 		}
-		for eventRows.Next() {
-			var pid, blockedCnt, totalCnt int
-			if err := eventRows.Scan(&pid, &blockedCnt, &totalCnt); err != nil {
-				eventRows.Close()
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
-				return
-			}
-			blockedCounts[pid] = blockedCnt
-			triggerCounts[pid] = totalCnt
-		}
-		eventRows.Close()
-		if err := eventRows.Err(); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
-			return
-		}
+		blockedCounts = counts.blocked
+		triggerCounts = counts.trigger
 	}
 	type policyListRow struct {
 		p                models.SecurityPolicy
@@ -3640,11 +3652,11 @@ func geoIPCountriesEmpty(raw string) bool {
 	return len(entries) == 0
 }
 
-// parseSecurityEventPagination 严格解析事件列表分页参数：缺省或
-// 数值 <1 时沿用默认值（既有契约）；给出但非整数时按同端点时间参数的 400 口径
-// 拒绝——此前 fmt.Sscanf 静默回落，调用方拼写错误完全无信号。超上限钳到 cap
-// （防 *pageSize 溢出为负致 SQLite OFFSET 报错）。
-func parseSecurityEventPagination(c *gin.Context, name string, def, cap int) (int, bool) {
+// parseStrictPaginationParam 严格解析分页参数（事件列表与 CRS 列表共用）：
+// 缺省或数值 <1 时沿用默认值（既有契约）；给出但非整数时按同端点时间参数的
+// 400 口径拒绝——此前 fmt.Sscanf 静默回落，调用方拼写错误完全无信号。超上限
+// 钳到 cap（防 *pageSize 溢出为负致 SQLite OFFSET 报错）。
+func parseStrictPaginationParam(c *gin.Context, name string, def, cap int) (int, bool) {
 	raw := strings.TrimSpace(c.Query(name))
 	if raw == "" {
 		return def, true
@@ -3664,11 +3676,11 @@ func parseSecurityEventPagination(c *gin.Context, name string, def, cap int) (in
 }
 
 func (h *Handlers) ListSecurityEvents(c *gin.Context) {
-	page, ok := parseSecurityEventPagination(c, "page", 1, 100000)
+	page, ok := parseStrictPaginationParam(c, "page", 1, 100000)
 	if !ok {
 		return
 	}
-	pageSize, ok := parseSecurityEventPagination(c, "page_size", 20, 100)
+	pageSize, ok := parseStrictPaginationParam(c, "page_size", 20, 100)
 	if !ok {
 		return
 	}
@@ -3792,11 +3804,14 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 	// 历史问题（历史）：事件表这些列 schema 可空（仅 DEFAULT、无 NOT NULL），
 	// 带外/异常写入显式 NULL 会让整页 500——列表投影统一 COALESCE，与策略/拦截页/
 	// 自定义规则的 NULL 容忍口径一致（security_null_coalesce_test.go）。
-	// 历史修复（历史）：request_headers/request_body 在 SQL 侧只取截断上限
-	//（+1 探针）——此前整列（上行落库上限 64KB/字段）取回再在 Go 侧截到 16KB，
+	// 历史修复（历史）：request_body 在 SQL 侧只取截断上限（+1 探针）——
+	// 此前整列（上行落库上限 64KB/字段）取回再在 Go 侧截到 16KB，
 	// 100 行 × 2 字段最多传输 ~12.8MB 只为返回 ≤1.6MB；列表弹框只消费截断内容。
+	// L-01：request_headers 例外取完整列——它是 map[string][]string 的 JSON
+	// 文本，SQL 侧按字符硬切会产出半截 JSON（前端解析失败、整块退化为原文）；
+	// Go 侧按条目裁剪后重序列化（见 truncateEventListHeaders）。
 	rows, err := db.MetricsDB.Query(`SELECT e.id, e.event_time, COALESCE(e.rule_caddy_id,''), COALESCE(e.policy_id,0), COALESCE(e.client_ip,''), COALESCE(e.method,''), COALESCE(e.uri,''), COALESCE(e.event_type,''), COALESCE(e.rule_triggered,''), COALESCE(e.rule_msg,''), COALESCE(e.action,''), COALESCE(e.anomaly_score, 0),
-		COALESCE(e.rule_name,''), COALESCE(e.policy_name,''), COALESCE(e.duration_us,0), COALESCE(e.precheck_us,0), `+securityEventListFieldSQL("e.request_headers")+`, `+securityEventListFieldSQL("e.request_body")+`
+		COALESCE(e.rule_name,''), COALESCE(e.policy_name,''), COALESCE(e.duration_us,0), COALESCE(e.precheck_us,0), COALESCE(e.request_headers,''), `+securityEventListFieldSQL("e.request_body")+`
 		FROM security_events e`+where+" ORDER BY e.event_time DESC, e.id DESC LIMIT ? OFFSET ?", queryArgs...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
@@ -3819,8 +3834,9 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 		e.TriggerType = triggerTypeForRule(e.RuleTriggered)
 		// 列表响应字节上限（历史问题-05）：100 行 × 64KB 头/体可 >15MB。
 		// 列表侧二次截断到 16KB/字段（详情弹框仍可看到截断标记）。
-		e.RequestHeaders = truncateEventListField(e.RequestHeaders)
-		e.RequestBody = truncateEventListField(e.RequestBody)
+		// L-01：头按条目裁剪后重序列化（保持 JSON 结构）；体按 base64 4 对齐。
+		e.RequestHeaders = truncateEventListHeaders(e.RequestHeaders)
+		e.RequestBody = truncateEventListBody(e.RequestBody)
 		// 历史问题-05：请求头/体含凭证明文（Cookie/Authorization/请求体），
 		// 此前对任意登录用户/只读 Key 原样返回，掩码仅在前端——服务端脱敏。
 		maskSecurityEventRequestContextIfNeeded(c, &e)
@@ -3856,6 +3872,144 @@ func truncateEventListField(value string) string {
 		cut--
 	}
 	return value[:cut] + "\n...[TRUNCATED]"
+}
+
+// truncateEventListHeaders 请求头列表侧截断（L-01）：request_headers 是
+// map[string][]string 的 JSON 文本，字节硬切会产出半截 JSON——前端解析失败后
+// 整块退化为 pre 原文，头表/多值/敏感掩码全部失效。这里解析后按条目裁剪
+// （每条目等额预算，值超预算时按 rune 边界裁剪并追加省略号），再重新序列化；
+// 极端多数短头导致序列化仍超限时，按体积降序丢条目并把丢弃数并入既有
+// _lb_dropped_headers 合成键（前端已按信息行渲染该键）。
+// 非 JSON 形态（带外写入/历史脏行）退回原字节截断。
+func truncateEventListHeaders(value string) string {
+	if len(value) <= securityEventListFieldCap {
+		return value
+	}
+	var headers map[string][]string
+	if err := json.Unmarshal([]byte(value), &headers); err != nil || len(headers) == 0 {
+		return truncateEventListField(value)
+	}
+	if raw, ok := fitHeadersWithinListCap(headers); ok {
+		return raw
+	}
+	// 键名开销本身超过上限：按序列化体积降序丢条目（保留最多信息量）。
+	type headerEntry struct {
+		key  string
+		size int
+	}
+	entries := make([]headerEntry, 0, len(headers))
+	for key, values := range headers {
+		keyJSON, _ := json.Marshal(key)
+		valueJSON, _ := json.Marshal(values)
+		entries = append(entries, headerEntry{key: key, size: len(keyJSON) + len(valueJSON) + 2})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].size != entries[j].size {
+			return entries[i].size > entries[j].size
+		}
+		return entries[i].key < entries[j].key
+	})
+	dropped := 0
+	if existing, ok := headers[securityEventDroppedHeadersKey]; ok && len(existing) > 0 {
+		if parsed, err := strconv.Atoi(existing[0]); err == nil && parsed > 0 {
+			dropped = parsed
+		}
+	}
+	for _, entry := range entries {
+		if entry.key == securityEventDroppedHeadersKey {
+			continue
+		}
+		delete(headers, entry.key)
+		dropped++
+		if dropped > 0 {
+			headers[securityEventDroppedHeadersKey] = []string{strconv.Itoa(dropped)}
+		}
+		if raw, err := json.Marshal(headers); err == nil && len(raw) <= securityEventListFieldCap {
+			return string(raw)
+		}
+	}
+	// 连只剩丢弃标记都超限（病态形态）：退回字节截断，至少不返回半截结构以外的空串。
+	return truncateEventListField(value)
+}
+
+// securityEventDroppedHeadersKey 与摄取侧写侧的丢弃计数合成键同源。
+const securityEventDroppedHeadersKey = "_lb_dropped_headers"
+
+// fitHeadersWithinListCap 逐条目裁剪直到序列化结果落入列表上限：每条目预算
+// 从 cap/条目数 起步，仍超限则预算减半重试（键名/引号开销也占预算）。
+func fitHeadersWithinListCap(headers map[string][]string) (string, bool) {
+	budget := securityEventListFieldCap / len(headers)
+	if budget < 1 {
+		budget = 1
+	}
+	for ; budget >= 1; budget /= 2 {
+		trimmed := make(map[string][]string, len(headers))
+		for key, values := range headers {
+			parts := make([]string, len(values))
+			for i, value := range values {
+				parts[i] = truncateRunesToBudget(value, budget)
+			}
+			trimmed[key] = parts
+		}
+		raw, err := json.Marshal(trimmed)
+		if err != nil {
+			return "", false
+		}
+		if len(raw) <= securityEventListFieldCap {
+			return string(raw), true
+		}
+		if budget == 1 {
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// truncateRunesToBudget 按 rune 边界把字符串裁到 ≤budget 字节并在裁剪时追加省略号。
+func truncateRunesToBudget(value string, budget int) string {
+	if len(value) <= budget {
+		return value
+	}
+	const ellipsis = "…"
+	limit := budget - len(ellipsis)
+	if limit <= 0 {
+		return ""
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut] + ellipsis
+}
+
+// truncateEventListBody 请求体列表侧截断（L-01）：base64/base64-truncated
+// 载荷必须按 4 字符对齐切分（否则前端 atob 抛错、正文整块退化为原文），
+// 切分后统一前缀为 base64-truncated: 让展示层渲染「已截断」横幅；文本
+// （含 utf8: 转义前缀）沿用 rune 边界截断 + 尾部标记。
+func truncateEventListBody(value string) string {
+	if len(value) <= securityEventListFieldCap {
+		return value
+	}
+	if payload, ok := strings.CutPrefix(value, "base64:"); ok {
+		return truncateEventBase64Payload(payload)
+	}
+	if payload, ok := strings.CutPrefix(value, "base64-truncated:"); ok {
+		return truncateEventBase64Payload(payload)
+	}
+	return truncateEventListField(value)
+}
+
+func truncateEventBase64Payload(payload string) string {
+	const prefix = "base64-truncated:"
+	budget := securityEventListFieldCap - len(prefix)
+	if budget < 4 {
+		budget = 4
+	}
+	cut := budget - budget%4
+	if cut > len(payload) {
+		cut = len(payload) - len(payload)%4
+	}
+	return prefix + payload[:cut]
 }
 
 // securityEventSensitiveHeaderNames 与前端 CTX_SENSITIVE_HEADERS 同源。
@@ -4135,16 +4289,22 @@ func overlayCRSOverviewUpdateStatus(stored string, snapshot *services.CRSUpdateS
 	return stored
 }
 
+// securityOverviewSevenDayStartUTC 返回近 7 天窗口起点（UTC 规范串）：
+// 覆盖判定用「本地日界逐日回退 6 天」而非「UTC 时刻 −6×24h」——DST 周界上
+// 两者差 1h，单一平移会让 backfill_incomplete（窗口前段不可重建提示）在切换
+// 周误报/漏报。与 loadSecurityOverviewAggregates 的日桶构造同口径。
+func securityOverviewSevenDayStartUTC(todayStart time.Time) string {
+	return todayStart.AddDate(0, 0, -6).UTC().Format("2006-01-02 15:04:05")
+}
+
 func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 	// 日界按配置时区计算：event_time 为 UTC，「今日」与 7 日趋势桶均以
 	// 配置时区的本地日期为准（printf modifier 将 UTC 事件时间平移到本地后取日期）。
 	loc := services.CurrentLocation()
-	_, offset := time.Now().In(loc).Zone()
-	offsetMinutes := offset / 60
 	now := time.Now().In(loc)
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	todayStartUTC := todayStart.UTC().Format("2006-01-02 15:04:05")
-	sevenDayStartUTC := todayStart.UTC().Add(-6 * 24 * time.Hour).Format("2006-01-02 15:04:05")
+	sevenDayStartUTC := securityOverviewSevenDayStartUTC(todayStart)
 	rawCoverageFrom := ""
 	backfillIncomplete := false
 
@@ -4236,11 +4396,9 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 		}})
 		return
 	}
-	// printf('+%d', -240) 会产出非法修饰符 "+-240" 使 date() 返回 NULL，导致趋势全零。
-	tzModifier := fmt.Sprintf("%+d minutes", offsetMinutes)
 	// 历史问题-11：近 7 天聚合（趋势/Top10 IP/攻击族）走 30s 进程内缓存，
 	// 避免每次 30s 轮询对原始表执行 4 趟 7 天全窗口扫描。
-	agg, aggErr := loadSecurityOverviewAggregates(db.MetricsDB, now, todayStartUTC, tzModifier)
+	agg, aggErr := loadSecurityOverviewAggregates(db.MetricsDB, now, todayStartUTC, loc.String())
 	trackErr(aggErr)
 	overview.Trend = agg.trend
 	overview.TopIPs = agg.topIPs
@@ -4345,11 +4503,7 @@ func (h *Handlers) UpdateCRSAutoUpdate(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	autoUpdateText := "关闭"
-	if *req.AutoUpdate {
-		autoUpdateText = "开启"
-	}
-	recordAudit(c, "更新", "CRS规则库", fmt.Sprintf("自动更新已%s", autoUpdateText))
+	recordAudit(c, "更新", "CRS规则库", "自动更新已"+enabledStateLabel(*req.AutoUpdate))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已更新"})
 }
 
@@ -4560,11 +4714,7 @@ func (h *Handlers) UpdateIP2RegionAutoUpdate(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	autoUpdateText := "关闭"
-	if *req.AutoUpdate {
-		autoUpdateText = "开启"
-	}
-	recordAudit(c, "更新", "IP数据库", fmt.Sprintf("自动更新已%s", autoUpdateText))
+	recordAudit(c, "更新", "IP数据库", "自动更新已"+enabledStateLabel(*req.AutoUpdate))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已更新"})
 }
 
@@ -5082,23 +5232,16 @@ func (h *Handlers) ListCRSRules(c *gin.Context) {
 	}
 
 	search := strings.ToLower(c.DefaultQuery("search", ""))
-	page := 1
-	pageSize := 50
-	fmt.Sscanf(c.DefaultQuery("page", "1"), "%d", &page)
-	fmt.Sscanf(c.DefaultQuery("page_size", "50"), "%d", &pageSize)
-	if page < 1 {
-		page = 1
+	// 分页参数与事件列表共用严格解析（非整数 400）：旧实现丢弃 fmt.Sscanf
+	// 错误静默回落第 1 页/50 条，同面板两类列表对错误输入行为不一致。
+	page, ok := parseStrictPaginationParam(c, "page", 1, 100000)
+	if !ok {
+		return
 	}
-	// clamp 上限防 *pageSize 整数溢出为负 → 切片越界 panic（历史问题）
-	if page > 100000 {
-		page = 100000
-	}
-	// 历史问题:超上限钳到上限且上限收紧 100→50(与默认页大小/前端单页渲染
-	// 边界一致);低于 1 回默认。
-	if pageSize < 1 {
-		pageSize = 50
-	} else if pageSize > 50 {
-		pageSize = 50
+	// 上限收紧 100→50（与默认页大小/前端单页渲染边界一致）；低于 1 回默认。
+	pageSize, ok := parseStrictPaginationParam(c, "page_size", 50, 50)
+	if !ok {
+		return
 	}
 
 	type CRSRule struct {

@@ -1,9 +1,7 @@
 package services
 
 // 任务引擎接线（v2.0 四类型标准）：Kind 决定调度/记录/日志——零 flag。
-// 定时(5)：NextSlotFn 排程槽驱动，Run 纯业务（无到期检查）
-// 常驻(3)：Run 阻塞自管理循环，引擎仅管生命周期
-// 循环(9)：IntervalFn 固定间隔，每轮独立执行+记录
+// 注册全集 19：定时(5)/常驻(3)/循环(10)/触发(1)——以 DescribeAll 输出为准。
 // 触发(1)：仅手动/代码触发
 // 默认调度关闭——历史修复 入队时唤醒，全部终态自动停。
 
@@ -125,7 +123,7 @@ func mustRegisterTask(te *taskengine.Engine, d taskengine.Descriptor) {
 // （coveredSlotStepPast/slotCoveredByRun/crsNextSlotAware/ip2regionNextSlotAware 已退役——
 // 排程槽生命周期 2026-10-11：失败落定落库推进，NextSlotFn 纯读库。）
 
-// InitTaskEngine 建引擎、恢复孤儿运行、注册全部 18 任务并启动默认循环。
+// InitTaskEngine 建引擎、恢复孤儿运行、注册全部 19 任务并启动默认循环。
 // 历史修复（历史）：非幂等——调用方保证单次装配；重复调用前须先
 // StopTaskEngine（否则旧 scheduleLoop goroutine 泄漏、双引擎双写 task_runs）。
 // 测试环境须先 db.Initialize。
@@ -211,8 +209,14 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Kind:        taskengine.KindPeriodic,
 		IntervalFn:  func() time.Duration { return 24 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
-			auditDeleted := CleanupAuditLogs()
-			runsDeleted := taskengine.PurgeTaskRuns(90)
+			auditDeleted, auditErr := CleanupAuditLogs()
+			runsDeleted, runsErr := taskengine.PurgeTaskRuns(90)
+			// 失败传播：两段清理任一失败都让 task_runs 落 failed，且摘要行
+			// 不得称「清理完成」（失败轮谎报完成会把排障方向带偏）。
+			if err := errors.Join(auditErr, runsErr); err != nil {
+				TaskLogfWarn("audit-retention", "cleanup", "清理未完成：审计日志已删除 %d 条、任务运行历史已删除 %d 行后中止，错误：%v", auditDeleted, runsDeleted, err)
+				return err
+			}
 			TaskLogf("audit-retention", "cleanup", "清理完成：审计日志 %d 条、任务运行历史 %d 行（无过期数据时为 0）", auditDeleted, runsDeleted)
 			return nil
 		},
@@ -342,6 +346,19 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 					return nil
 				}
 				TaskLogf("cert-waiting-ca", "idle", "证书任务全部终态，自动停止补扫")
+				// 审计项：用户显式开启该任务时，本轮自停会覆盖引擎内存
+				// loopEnabled，但 task_loop_prefs 仍记 enabled=1——重启后按偏好
+				// 复活、下一轮又因无活自停（空转）。自停即把偏好同步写回关闭，
+				// 并留一行说明；证书任务入队会经 RearmLoop(hasWork=true) 越过
+				// 停止态自动唤醒，不损失补扫能力。仅在偏好行确为开启时写
+				// （无记录=默认关闭，不新建行；业务驱动任务不适用本任务）。
+				if prefs := loadTaskLoopPrefs(); prefs["cert-waiting-ca"] {
+					if err := RecordTaskLoopPref("cert-waiting-ca", false); err != nil {
+						TaskLogfWarn("cert-waiting-ca", "idle", "写回调度偏好失败（重启后可能空转一轮）：%v", err)
+					} else {
+						TaskLogf("cert-waiting-ca", "idle", "已把用户开启的调度偏好同步回关闭：无在途证书任务；有任务入队时自动唤醒")
+					}
+				}
 				return nil
 			}
 			CertWaitingCATickOnce()
@@ -622,7 +639,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// 定时/循环/触发均可手动调度；常驻族恒不可（启停即可，启停由调度开关+重启承担）。
 
 	// 默认调度启动：
-	// - 循环 8 个全启动（cert-waiting-ca 除外——默认关闭，续期扫描唤醒；
+	// - 循环共 10 个，默认启动 8 个（cert-waiting-ca 除外——默认关闭，续期扫描唤醒；
 	//   autoban 除外——调度唯一前提=业务启用，见下）
 	// - 常驻 3 个全启动（系统启动即运行；关闭调度=启动也不运行）
 	// - 定时 4 个启动排程（threat/crs/ip2region/auto-backup——EnabledFn/

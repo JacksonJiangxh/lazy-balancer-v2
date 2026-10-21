@@ -8,28 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { createVisibilityIntervals, type VisibilityIntervals } from '../src/composables/useVisibilityIntervals.ts'
-
-class FakeDocument {
-  hidden = false
-  private readonly listeners = new Set<() => void>()
-  addEventListener(_type: 'visibilitychange', listener: () => void): void { this.listeners.add(listener) }
-  removeEventListener(_type: 'visibilitychange', listener: () => void): void { this.listeners.delete(listener) }
-  get listenerCount(): number { return this.listeners.size }
-  dispatchVisibility(): void { for (const l of [...this.listeners]) l() }
-}
-
-class FakeWindow {
-  private nextId = 1
-  private readonly timers = new Map<number, { cb: () => void; ms: number }>()
-  setInterval(cb: () => void, ms: number): number {
-    const id = this.nextId++
-    this.timers.set(id, { cb, ms })
-    return id
-  }
-  clearInterval(id: number): void { this.timers.delete(id) }
-  fire(): void { for (const t of [...this.timers.values()]) t.cb() }
-  get size(): number { return this.timers.size }
-}
+import { FakeDocument, FakeWindow } from './_helpers.ts'
 
 interface Harness {
   doc: FakeDocument
@@ -76,7 +55,7 @@ test('hidden 停止全部间隔并回调 onHidden（释放租约）', () => {
   const h = makeHarness()
   h.loop.start()
   h.doc.hidden = true
-  h.doc.dispatchVisibility()
+  h.doc.dispatch()
   assert.equal(h.win.size, 0, 'hidden 后不允许任何间隔继续跑')
   assert.equal(h.hiddenCalls, 1)
   const snapshot = { ...h.counts }
@@ -89,9 +68,9 @@ test('visible 恢复间隔、立即补 tick 并回调 onVisible', () => {
   const h = makeHarness()
   h.loop.start()
   h.doc.hidden = true
-  h.doc.dispatchVisibility()
+  h.doc.dispatch()
   h.doc.hidden = false
-  h.doc.dispatchVisibility()
+  h.doc.dispatch()
   assert.equal(h.visibleCalls, 1)
   assert.equal(h.counts.clock, 2, '恢复可见立即补一次时钟')
   assert.equal(h.counts.collector, 2, '恢复可见立即重新获取租约')
@@ -105,12 +84,12 @@ test('重复 hidden/visible 不产生叠加间隔', () => {
   const h = makeHarness()
   h.loop.start()
   h.doc.hidden = true
-  h.doc.dispatchVisibility()
-  h.doc.dispatchVisibility()
+  h.doc.dispatch()
+  h.doc.dispatch()
   assert.equal(h.win.size, 0)
   h.doc.hidden = false
-  h.doc.dispatchVisibility()
-  h.doc.dispatchVisibility()
+  h.doc.dispatch()
+  h.doc.dispatch()
   assert.equal(h.win.size, 3, '重复 visible 不得叠加第二组间隔')
   h.loop.stop()
 })
@@ -122,7 +101,7 @@ test('stop 摘除监听并清空间隔，幂等', () => {
   assert.equal(h.doc.listenerCount, 0, 'stop 后不得残留 visibilitychange 监听')
   assert.equal(h.win.size, 0)
   h.doc.hidden = true
-  h.doc.dispatchVisibility()
+  h.doc.dispatch()
   assert.equal(h.hiddenCalls, 0, 'stop 后事件不得再触达回调')
   h.loop.stop()
   assert.equal(h.win.size, 0, '幂等 stop 后仍无间隔')
@@ -135,7 +114,7 @@ test('挂载即 hidden 不起间隔不取租约，恢复可见后正常启动', 
   assert.equal(h.counts.collector, 0, 'hidden 挂载不得获取采集租约')
   assert.equal(h.hiddenCalls, 1, 'hidden 挂载按 hidden 语义处理（暂停渲染/释放租约）')
   h.doc.hidden = false
-  h.doc.dispatchVisibility()
+  h.doc.dispatch()
   assert.equal(h.win.size, 3)
   assert.equal(h.counts.collector, 1)
   h.loop.stop()

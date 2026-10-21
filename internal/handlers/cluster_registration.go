@@ -229,6 +229,15 @@ func (h *Handlers) UpdateClusterNodeSiteCoordinates(c *gin.Context) {
 }
 
 func (h *Handlers) UpdateClusterNodeAccessURL(c *gin.Context) {
+	// 门控前置（历史问题）：导入窗口 409 / 主节点 403 必须先于请求体解析——
+	// 先 bind 会让窗口内/从端请求拿到 400 解析错误而非真实门控语义。两道门
+	// 幂等无副作用，clusterNodeAction 内重复执行安全。
+	if rejectNodeWriteDuringImport(c) {
+		return
+	}
+	if !h.requireMaster(c) {
+		return
+	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
 	var req models.ClusterNodeAccessURLRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

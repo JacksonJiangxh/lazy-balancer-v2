@@ -172,20 +172,25 @@ func auditRetentionMonths() int {
 }
 
 // CleanupAuditLogs 按保留月数清理审计日志，返回删除条数（SPEC §6.5 摘要行数据源）。
-func CleanupAuditLogs() int {
+// 失败必须上抛：audit-retention 任务体据此落 failed 终态，且失败轮不得写
+// 「清理完成」（此前失败静默返回 0——任务监控全绿、摘要谎报完成）。
+func CleanupAuditLogs() (int, error) {
 	retentionMonths := auditRetentionMonths()
 	cutoff := time.Now().UTC().AddDate(0, -retentionMonths, 0).Format("2006-01-02 15:04:05")
 	if db.AuditDB == nil {
 		Logf("warn", "audit log cleanup skipped: audit database is not initialized")
-		return 0
+		return 0, fmt.Errorf("审计数据库未初始化")
 	}
 	res, err := db.AuditDB.Exec("DELETE FROM audit_log WHERE created_at < ?", cutoff)
 	if err != nil {
 		Logf("warn", "audit log cleanup failed: %v", err)
-		return 0
+		return 0, err
 	}
-	n, _ := res.RowsAffected()
-	return int(n)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取审计日志删除条数失败: %w", err)
+	}
+	return int(n), nil
 }
 
 // FormatAuditAction 中间件侧通用审计的动作映射。历史问题：仅保留 5 条 Generic

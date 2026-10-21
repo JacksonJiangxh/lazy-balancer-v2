@@ -692,6 +692,13 @@ func (m *CAQueueManager) MarkRetiredJobRunningForTest(ruleID string, jobID int) 
 func (m *CAQueueManager) IsJobActive(jobID int) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.isJobActiveLocked(jobID)
+}
+
+// isJobActiveLocked 在途判定本体（调用方必须持 m.mu）——EnqueueIfActive
+// 在锁内复用本函数，使「在途判定 → 状态迁移 → 入队」同一临界区（历史问题：
+// 锁外判定与锁内入队之间存在窗口，并发补扫/手动重试可同 jobID 双入队）。
+func (m *CAQueueManager) isJobActiveLocked(jobID int) bool {
 	// age-out 摘除后迁入 zombieJobs 的 jobID 仍视为在途（历史修复）：保护持续到
 	// 滞行执行退出（releaseZombieJob），无 executionDone 信号的永久保留。
 	if _, zombie := m.zombieJobs[jobID]; zombie {
@@ -795,17 +802,18 @@ func (m *CAQueueManager) EnqueueIfActive(providerID int, jobID int, ruleID, doma
 	if m.beforeActiveEnqueue != nil {
 		m.beforeActiveEnqueue()
 	}
-	// 在途检查必须先于 transition/入队（历史问题 发现2）：滞行执行悬挂（PauseAndDrain
+	// 在途检查在 m.mu 内先于 transition/入队（历史问题 发现2 + 锁内原子化）：
+	// 滞行执行悬挂（PauseAndDrain
 	// 超时后登记在 retiredQueues）期间，手动重试/规则重建若放行会同 jobID 双执行，
 	// 且滞行退出时 requeueCanceledJob 会把已签发状态打回 'queued'。命中按阻塞同语义
 	// 返回 changed=false，调用方走 !changed 分支（409）而非 500。
 	// 既有调用方无回归：waiting_ca/滞留扫描的任务执行已退出不在 active；
 	// requeueLifecycleStrandedJobs 已前置检查，此处为幂等二道闸。
-	if m.IsJobActive(jobID) {
-		return jobID, false, nil
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.isJobActiveLocked(jobID) {
+		return jobID, false, nil
+	}
 	if !m.active {
 		return jobID, false, nil
 	}

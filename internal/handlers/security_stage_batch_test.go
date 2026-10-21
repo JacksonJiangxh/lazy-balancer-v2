@@ -569,3 +569,102 @@ func TestBatchBindSecurityPolicies_ruleIDLimit(t *testing.T) {
 		t.Fatalf("boundary batch loads=%d, want 1", *loadCount)
 	}
 }
+
+// 拦截页 PUT 必须是指针合并（与 UpdateRule 同域口径）：省略字段保留原值，
+// 显式空串才清空。旧实现用值结构体全量替换——省略 description/content_type
+// 会静默清空描述、并把自定义内容类型重置为默认 text/html。
+func TestUpdateSecurityBlockPage_omittedFieldsPreserved(t *testing.T) {
+	h, _ := newStageBatchTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/security/block-pages/:id", h.UpdateSecurityBlockPage)
+
+	result, err := db.DB.Exec(`INSERT INTO security_block_pages (name, description, content, content_type, is_default, is_builtin) VALUES ('原名称','原描述','<h1>x</h1>','application/json; charset=utf-8','0','0')`)
+	if err != nil {
+		t.Fatalf("seed block page: %v", err)
+	}
+	id, _ := result.LastInsertId()
+
+	// 只改 content：name/description/content_type 必须保留。
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/security/block-pages/%d", id), strings.NewReader(`{"content":"<h1>new</h1>"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var name, description, content, contentType string
+	if err := db.DB.QueryRow(`SELECT name, description, content, content_type FROM security_block_pages WHERE id=?`, id).Scan(&name, &description, &content, &contentType); err != nil {
+		t.Fatalf("read page: %v", err)
+	}
+	if name != "原名称" || description != "原描述" || contentType != "application/json; charset=utf-8" || content != "<h1>new</h1>" {
+		t.Fatalf("merge semantics broken: name=%q desc=%q content=%q type=%q", name, description, content, contentType)
+	}
+
+	// 显式空串仍可清空（指针语义：省略=保留，显式零值=写入）。
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPut, fmt.Sprintf("/security/block-pages/%d", id), strings.NewReader(`{"description":""}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("clear description status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	if err := db.DB.QueryRow(`SELECT description FROM security_block_pages WHERE id=?`, id).Scan(&description); err != nil {
+		t.Fatalf("read page: %v", err)
+	}
+	if description != "" {
+		t.Fatalf("explicit empty description must clear, got %q", description)
+	}
+}
+
+// 阶段统计的非数字 triggered（空串/垃圾串/带前缀 ID）必须归「未归因」桶，
+// 不得冒充阶段 3（WAF）拦截——同域 categorizeAttack/attackFamilyClassOf 对
+// 不可判定形态一律归「其他」。响应以 stage_unattributed 披露，合计口径不变。
+func TestGetRuleStageStats_nonNumericTriggeredGoesUnattributed(t *testing.T) {
+	h, _ := newStageBatchTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/security/rules/:caddy_id/stage-stats", h.GetRuleStageStats)
+
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled) VALUES ('lb_stage_unattr','unattr','','http','',8090,'weighted_round_robin',1)`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	seed := []struct {
+		triggered string
+		count     int
+	}{
+		{"garbage", 3}, // 非数字 → 未归因
+		{"", 2},        // 空串 → 未归因
+		{"942100", 5},  // 策略引擎（阶段 3）
+		{"800005", 1},  // 地域预检精确段（阶段 1）
+		{"429", 4},     // 限流：不计入阶段 chip（既有口径）
+	}
+	for _, row := range seed {
+		for range row.count {
+			if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (rule_caddy_id, client_ip, event_type, rule_triggered, action) VALUES ('lb_stage_unattr','203.0.113.9','waf',?,'blocked')`, row.triggered); err != nil {
+				t.Fatalf("seed event %q: %v", row.triggered, err)
+			}
+		}
+	}
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/security/rules/lb_stage_unattr/stage-stats", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Stage1Blocked24h int `json:"stage1_blocked_24h"`
+			Stage3Blocked24h int `json:"stage3_blocked_24h"`
+			Unattributed     int `json:"stage_unattributed_24h"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v body=%s", err, recorder.Body.String())
+	}
+	if payload.Data.Stage1Blocked24h != 1 || payload.Data.Stage3Blocked24h != 5 || payload.Data.Unattributed != 5 {
+		t.Fatalf("stage split=%+v, want stage1=1 stage3=5 unattributed=5", payload.Data)
+	}
+	if payload.Data.Stage1Blocked24h+payload.Data.Stage3Blocked24h+payload.Data.Unattributed != 11 {
+		t.Fatalf("合计口径变化（429 仍应排除）: %+v", payload.Data)
+	}
+}

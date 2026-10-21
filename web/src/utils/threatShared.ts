@@ -2,19 +2,24 @@
 // 杜绝热力阶梯与点内判定算法双实现漂移（此前靠人工复制保持一致）。
 import { CHINA_PROVINCES } from './chinaProvinces.ts'
 import { COUNTRY_CENTROIDS, FALLBACK_CENTROID, type Centroid } from './countryCentroids.ts'
+import { parseIpLocation } from './ipLocationParts.ts'
 
 type Rgb = [number, number, number]
 
-/** 热力四段阶梯（与后端口径无关，纯前端视觉）：底色→暗红→红→亮红。 */
+/** 陆地底色（未命中/底色）：热力阶梯首色与未命中国家点阵同源——
+ *  原首色 #1b2a41 比点阵底色 #2c4260 更暗，导致「命中 1 次」比 0 次更暗。 */
+const LAND_BASE_RGB: Rgb = [44, 66, 96]
+
+/** 热力四段阶梯（与后端口径无关，纯前端视觉）：陆地底色→暗红→红→亮红。 */
 const HEAT_LADDER: Rgb[] = [
-  [27, 42, 65], // 底色 #1b2a41
+  LAND_BASE_RGB,
   [150, 74, 60], // #964a3c
   [194, 85, 61], // #c2553d
   [226, 84, 84], // #e25454
 ]
 
 // 地图/地球未命中国家点阵同色、同不透明度（用户裁定：沿用地图原透明度）。
-export const DOT_LAND = 'rgb(44,66,96)'
+export const DOT_LAND = `rgb(${LAND_BASE_RGB[0]},${LAND_BASE_RGB[1]},${LAND_BASE_RGB[2]})`
 
 /** pointy-top 六边形单位顶点（地图点阵复用；避免逐点三角函数计算）。 */
 export const POINTY_TOP_HEX_VERTICES: readonly (readonly [number, number])[] = [
@@ -179,7 +184,7 @@ export function arcEndpoints(
  *  地图/地球两引擎共用，避免省/国家查找与回退规则双实现漂移
  *  （历史问题-5）。 */
 export function arcOriginForLocation(ipLocation: string): Centroid {
-  const [country, province] = ipLocation.split('·')
+  const { country, province } = parseIpLocation(ipLocation)
   if (!country) return FALLBACK_CENTROID
   if (country === '中国' && province) {
     const pv = CHINA_PROVINCES.find((x) => x.short === province || x.name === province)

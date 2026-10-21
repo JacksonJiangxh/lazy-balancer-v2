@@ -33,6 +33,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -630,10 +631,15 @@ type autobanMergeOutcome struct {
 	Changed    bool
 }
 
+// autobanEntryTimeParses 条目时间解析调用计数（测试观测挤出路径的复杂度；
+// 生产成本=每次解析一次原子加）。
+var autobanEntryTimeParses atomic.Int64
+
 // parseAutobanEntryTime 解析条目时间戳（UTC 墙钟串）；畸形视为零值（调用方
 // 按无时间处理——到期过滤只认可解析且 <= now 的值，畸形 expires_at 保留条目
 // 不误删）。
 func parseAutobanEntryTime(s string) time.Time {
+	autobanEntryTimeParses.Add(1)
 	if s == "" {
 		return time.Time{}
 	}
@@ -738,45 +744,62 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 
 	// 3) 容量收敛：先挤「最早到期的自动条目」（永久自动条目次之），手动条目
 	//（remark≠自动封禁）不挤；仍不足丢弃剩余新封。
-	evict := func() (models.IPListEntry, bool) {
-		var victimIdx = -1
-		var victimTime time.Time
-		var victimPermanent bool
-		for i, e := range kept {
-			if e.Remark != AutobanEntryRemark {
-				continue
-			}
-			exp := parseAutobanEntryTime(e.ExpiresAt)
-			perm := exp.IsZero()
-			if victimIdx == -1 {
-				victimIdx, victimTime, victimPermanent = i, exp, perm
-				continue
-			}
-			// 挤出序：有到期时间者按到期升序先挤；永久条目排在所有有到期者之后。
-			switch {
-			case !perm && victimPermanent:
-				victimIdx, victimTime, victimPermanent = i, exp, perm
-			case !perm && !victimPermanent && exp.Before(victimTime):
-				victimIdx, victimTime, victimPermanent = i, exp, perm
-			case perm && victimPermanent:
-				// 两个永久条目：按 created_at 更早者先挤
-				if cur := parseAutobanEntryTime(e.CreatedAt); !cur.IsZero() {
-					if vk := parseAutobanEntryTime(kept[victimIdx].CreatedAt); vk.IsZero() || cur.Before(vk) {
-						victimIdx = i
-					}
-				}
-			}
+	// 挤出序**一次预计算**：此前每挤出一个都全表扫描 + 逐条重新解析时间戳
+	// （O(n²) 解析、O(n²) 比较），名单接近容量上限时一轮可达数万次
+	// time.Parse。预计算与逐次挑选的优先级逐字对齐：
+	//   有到期时间者按到期升序先挤；永久条目排在所有有到期者之后；永久条目
+	//   之间按 created_at 升序（不可解析 created_at 视为最后），同值按键序
+	//   （先出现者先挤）——与旧实现的严格 Before 比较一致。
+	type evictCandidate struct {
+		idx     int
+		exp     time.Time
+		perm    bool
+		created time.Time
+	}
+	evictQueue := make([]evictCandidate, 0, len(kept))
+	for i, e := range kept {
+		if e.Remark != AutobanEntryRemark {
+			continue
 		}
-		if victimIdx == -1 {
+		exp := parseAutobanEntryTime(e.ExpiresAt)
+		evictQueue = append(evictQueue, evictCandidate{
+			idx: i, exp: exp, perm: exp.IsZero(),
+			created: parseAutobanEntryTime(e.CreatedAt),
+		})
+	}
+	sort.SliceStable(evictQueue, func(a, b int) bool {
+		x, y := evictQueue[a], evictQueue[b]
+		if x.perm != y.perm {
+			return !x.perm
+		}
+		if !x.perm {
+			return x.exp.Before(y.exp)
+		}
+		xZero, yZero := x.created.IsZero(), y.created.IsZero()
+		if xZero != yZero {
+			return !xZero
+		}
+		if xZero {
+			return false
+		}
+		return x.created.Before(y.created)
+	})
+	evictNext := 0
+	evictedIdx := make([]bool, len(kept))
+	evict := func() (models.IPListEntry, bool) {
+		if evictNext >= len(evictQueue) {
 			return models.IPListEntry{}, false
 		}
-		victim := kept[victimIdx]
-		kept = append(kept[:victimIdx], kept[victimIdx+1:]...)
+		victim := kept[evictQueue[evictNext].idx]
+		evictedIdx[evictQueue[evictNext].idx] = true
+		evictNext++
 		return victim, true
 	}
-	for len(kept)+len(toAdd) > AutobanListEntryCap {
+	evictedCount := 0
+	for len(kept)-evictedCount+len(toAdd) > AutobanListEntryCap {
 		if victim, ok := evict(); ok {
 			out.Evicted++
+			evictedCount++
 			out.EvictedIPs = append(out.EvictedIPs, victim.Value)
 			out.Changed = true
 			continue
@@ -784,13 +807,25 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 		// 自动条目已无可挤（kept 全手动或已清空）且总量仍超限：按容量截断
 		// 新封（候选按计数降序，高计数优先保留），其余丢弃并计数入 DroppedNew
 		//（容量收敛可观测：挤出/丢弃数随本轮 WARN 行与审计行落痕）。
-		keep := AutobanListEntryCap - len(kept)
+		keep := AutobanListEntryCap - (len(kept) - evictedCount)
 		if keep < 0 {
 			keep = 0
 		}
 		out.DroppedNew = len(toAdd) - keep
 		toAdd = toAdd[:keep]
 		break
+	}
+	if evictedCount > 0 {
+		// 原地压缩：保留未被挤出条目的相对顺序（与逐次删除的最终顺序一致）。
+		write := 0
+		for i, e := range kept {
+			if evictedIdx[i] {
+				continue
+			}
+			kept[write] = e
+			write++
+		}
+		kept = kept[:write]
 	}
 
 	// 4) 落库（有变化时）。

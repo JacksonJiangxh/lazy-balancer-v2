@@ -14,6 +14,7 @@ import {
   entriesIntersect,
 } from '../src/utils/securityStages.ts'
 import { CADDY_APPLY_FAILED_MARKER, mergeBulkResults } from '../src/utils/bulkApplyResult.ts'
+import { repoSource } from './_helpers.ts'
 
 test('A1 分片：按上限切分且保持原顺序（策略绑定 100 / 批量拦截页 500）', () => {
   const bindings = Array.from({ length: 250 }, (_, i) => `lb_${i}`)
@@ -79,6 +80,11 @@ test('C3 分片响应：无退化时保持末片文案；空输入返回 undefin
   assert.ok(!(mergeBulkResults([{ message: 'ok' }])?.message ?? '').includes(CADDY_APPLY_FAILED_MARKER))
 })
 
+// 上限不得钉字面量：后端常量调整后前端镜像必须同批跟随，否则 UI 放行 9 条、
+// 后端 400 拒收（或反之静默截断）。直接读 Go 声明对表。
 test('D1 绑定上限单源：与后端 maxBindingsPerRule 同值', () => {
-  assert.equal(MAX_POLICIES_PER_RULE, 8)
+  const go = repoSource('internal/handlers/security.go')
+  const declared = /^const maxBindingsPerRule = (\d+)$/m.exec(go)
+  assert.ok(declared, '后端缺 maxBindingsPerRule 常量声明')
+  assert.equal(MAX_POLICIES_PER_RULE, Number(declared[1]), '前端 MAX_POLICIES_PER_RULE 与后端上限漂移')
 })

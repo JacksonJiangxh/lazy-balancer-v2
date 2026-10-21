@@ -57,6 +57,7 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
 			"stage1_blocked_24h":      0,
 			"stage3_blocked_24h":      0,
+			"stage_unattributed_24h":  0,
 			"ratelimit_blocks_reload": 0.0,
 			"precheck_avg_us":         0.0,
 			"precheck_samples":        0,
@@ -72,7 +73,7 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "阶段统计查询失败"})
 		return
 	}
-	stage1, stage3 := 0, 0
+	stage1, stage3, unattributed := 0, 0, 0
 	for rows.Next() {
 		var triggered string
 		var count int
@@ -91,6 +92,12 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 			continue
 		case convErr == nil && services.IsStage1PrecheckID(n): // 历史收敛：五元组单一事实源
 			stage1 += count
+		case convErr != nil:
+			// 非数字 triggered（空串/垃圾串/带前缀 ID）不是阶段 1 也不是阶段 3：
+			// 与同域 categorizeAttack/attackFamilyClassOf 的「其他/未归因」口径
+			// 一致，归独立桶披露（旧实现 default 直接计入阶段 3=WAF，把未归因
+			// 事件伪装成策略命中的错误归属）。
+			unattributed += count
 		default:
 			stage3 += count
 		}
@@ -148,6 +155,7 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
 		"stage1_blocked_24h":      stage1,
 		"stage3_blocked_24h":      stage3,
+		"stage_unattributed_24h":  unattributed,
 		"ratelimit_blocks_reload": ratelimit,
 		"precheck_avg_us":         preAvg,
 		"precheck_samples":        preCnt,
@@ -197,7 +205,10 @@ type securityOverviewAggregates struct {
 type securityOverviewAggCacheKey struct {
 	metrics    *sql.DB
 	todayStart string
-	tzModifier string
+	// tzName 是时区身份（loc.String()），不是瞬时 UTC 偏移：数据按 today 的
+	// location 逐日构造日桶，仅用偏移做键会让「同偏移不同 DST 规则」的两个
+	// 时区（或切换后偏移恰好相同的时区）在 TTL 内共用另一时区的日桶。
+	tzName string
 }
 
 type securityOverviewAggCacheEntry struct {
@@ -235,10 +246,10 @@ type securityOverviewResponse struct {
 
 // loadSecurityOverviewAggregates 计算（或命中缓存）近 7 天聚合。错误不缓存、
 // 由调用方聚合成 500（与既有「任一查询失败显式报错」口径一致）。
-// tzModifier 仅用于缓存键区分时区形态；窗口/日桶一律由 today 携带
-// 的时区逐日构造（DST 正确），不再把单一偏移套到整周 SQL date() 上。
-func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todayStartUTC, tzModifier string) (securityOverviewAggregates, error) {
-	key := securityOverviewAggCacheKey{metrics: metricsDB, todayStart: todayStartUTC, tzModifier: tzModifier}
+// tzName 仅用于缓存键区分时区身份（loc.String()）；窗口/日桶一律由 today
+// 携带的时区逐日构造（DST 正确），不把单一偏移套到整周 SQL date() 上。
+func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todayStartUTC, tzName string) (securityOverviewAggregates, error) {
+	key := securityOverviewAggCacheKey{metrics: metricsDB, todayStart: todayStartUTC, tzName: tzName}
 	now := time.Now()
 	securityOverviewAggCacheMu.Lock()
 	if entry, ok := securityOverviewAggCache[key]; ok && now.Before(entry.expiresAt) {

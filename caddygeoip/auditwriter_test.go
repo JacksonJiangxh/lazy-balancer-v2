@@ -145,6 +145,9 @@ func resetAuditTimingRegistryLockedForTest() {
 	auditTimingCreateCount = 0
 	auditTimingPollCountForTest.Store(0)
 	auditTimingSweepVisitsForTest.Store(0)
+	auditRetainedPreEntries = map[string]auditRetainedPreEntry{}
+	auditRetainedPreOrder = nil
+	auditRetainedPreHead = 0
 }
 
 // seedAuditTimingEntryForTest 以指定建条时刻直接种入条目（含 FIFO 项——
@@ -954,12 +957,23 @@ func TestAuditWriter_closeKeepsProcessSingletonPipeline(t *testing.T) {
 }
 
 // Given: 有界队列（容量 2）且 drain 未消费
-// When: 先同步填满 2 条，再异步入队第 3 条
-// Then: 第 3 条阻塞等待（零丢弃），drain 启动后完成——退化价=退役前 serial 同步写
-func TestAuditPipeline_enqueueBlocksWhenFullZeroDrop(t *testing.T) {
+// When: 先填满 2 条，再入队第 3 条
+// Then: 入队有界等待后丢弃（不再无限阻塞请求路径），丢弃计数 +1 且只丢该条；
+// drain 启动后新条目照常入队并落盘。
+func TestAuditPipeline_enqueueDropsWhenFullBeyondTimeout(t *testing.T) {
 	useTestAuditPipeline(t)
+	oldTimeout := auditEnqueueTimeout
+	auditEnqueueTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { auditEnqueueTimeout = oldTimeout })
+	oldLog := auditDropLogf
+	var dropLogs atomic.Int32
+	auditDropLogf = func(string, ...any) { dropLogs.Add(1) }
+	t.Cleanup(func() { auditDropLogf = oldLog })
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
 	p := &auditPipeline{
-		target: filepath.Join(t.TempDir(), "audit.log"),
+		target: logPath,
 		queue:  make(chan lbAuditItem, 2),
 		done:   make(chan struct{}),
 	}
@@ -971,28 +985,36 @@ func TestAuditPipeline_enqueueBlocksWhenFullZeroDrop(t *testing.T) {
 	p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"a":1}`)}})
 	p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"b":2}`)}})
 
-	// 第 3 条异步入队：队列满必须阻塞（而非丢弃/报错）
-	thirdDone := make(chan struct{})
-	go func() {
-		p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"c":3}`)}})
-		close(thirdDone)
-	}()
-	select {
-	case <-thirdDone:
-		t.Fatal("third enqueue completed while queue full; must block (zero-drop backpressure)")
-	case <-time.After(50 * time.Millisecond):
+	// 第 3 条入队：有界等待后丢弃（不得无限阻塞请求路径）
+	start := time.Now()
+	p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"c":3}`)}})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("enqueue blocked %v on full queue; must be bounded by auditEnqueueTimeout", elapsed)
+	}
+	if got := p.dropped.Load(); got != 1 {
+		t.Fatalf("dropped count=%d, want 1", got)
+	}
+	if got := dropLogs.Load(); got == 0 {
+		t.Fatal("dropped audit line must be reported via warn log")
+	}
+	if got := len(p.queue); got != 2 {
+		t.Fatalf("queue length=%d, want 2 (only the third line dropped)", got)
 	}
 
-	// drain 启动消化 → 阻塞的第三条最终入队成功（零丢弃）
+	// drain 启动后队列消化，新条目照常入队并落盘（丢弃不是永久失效）。
 	go p.drain()
-	select {
-	case <-thirdDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("blocked enqueue never completed after drain started")
-	}
-	// 测试收尾：关闭队列让 drain 排空后退出（生产路径无此通道）。
+	p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"d":4}`)}})
 	close(p.queue)
 	<-p.done
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	for _, want := range []string{`{"a":1}`, `{"b":2}`, `{"d":4}`} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("audit log missing %s after drain: %q", want, data)
+		}
+	}
 }
 
 // Given: 管线持有长生命周期 fd
@@ -1429,4 +1451,106 @@ func TestAuditTimingRegistry_periodicSweep(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("expired entry must be reaped by the periodic sweeper without new traffic")
+}
+
+// panicFormatter 首次 Format 直接 panic（模拟 formatter/快照实现的异常），
+// 其后恢复正常输出。
+type panicFormatter struct {
+	calls atomic.Int32
+}
+
+func (f *panicFormatter) Format(plugintypes.AuditLog) ([]byte, error) {
+	if f.calls.Add(1) == 1 {
+		panic("formatter exploded")
+	}
+	return []byte(`{"after":1}`), nil
+}
+
+func (*panicFormatter) MIME() string { return "application/json" }
+
+// drain 是进程级单例消费者：单条处理中的 panic 不得终止 goroutine（终止后
+// 写侧再无消费者，审计行只能靠超时丢弃）。panic 后必须继续消费后续条目。
+func TestAuditDrain_recoversFromProcessPanic(t *testing.T) {
+	useTestAuditPipeline(t)
+	oldLog := auditDropLogf
+	var recovered atomic.Int32
+	auditDropLogf = func(string, ...any) { recovered.Add(1) }
+	t.Cleanup(func() { auditDropLogf = oldLog })
+
+	logPath := filepath.Join(t.TempDir(), "audit.log")
+	p := &auditPipeline{
+		target: logPath,
+		queue:  make(chan lbAuditItem, 4),
+		done:   make(chan struct{}),
+	}
+	if err := p.openFile(0o644); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	go p.drain()
+
+	p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: &panicFormatter{}})
+	p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"after-panic":2}`)}})
+
+	line := waitAuditLine(t, logPath)
+	if !strings.Contains(line, `"after-panic":2`) {
+		t.Fatalf("drain did not survive formatter panic: %q", line)
+	}
+	if recovered.Load() == 0 {
+		t.Fatal("recovered panic must be reported via warn log")
+	}
+
+	close(p.queue)
+	<-p.done
+}
+
+// 长请求（生命周期 > 条目 TTL）不得丢预检段：条目被 TTL 清扫时把已到场的
+// pre 段转入独立的预检保留区；终态写入重建条目时回填 pre。旧实现整条丢弃，
+// 审计行 pre_us 显示「—」（慢上游/流式下载场景常见）。
+func TestAuditTimingRegistry_retainsPreAcrossEntryTTL(t *testing.T) {
+	useTestAuditPipeline(t)
+	origRetention := auditPreRetentionTTLNs.Load()
+	auditPreRetentionTTLNs.Store(int64(time.Hour))
+	t.Cleanup(func() { auditPreRetentionTTLNs.Store(origRetention) })
+
+	const id = "eeeeeeeeeeeeeeee"
+	auditTimingRecord(id, "pre", 1234)
+	// 越过条目 TTL（useTestAuditPipeline 置 50ms）后清扫：模拟长请求仍在途中。
+	time.Sleep(80 * time.Millisecond)
+	auditTimingMu.Lock()
+	auditTimingSweepLocked(time.Now())
+	_, stillThere := auditTimingEntries[id]
+	auditTimingMu.Unlock()
+	if stillThere {
+		t.Fatal("expired timing entry must be swept")
+	}
+
+	// 终态分段迟到（重建条目）：pre 必须从预检保留区回填。
+	auditTimingRecord(id, "end", 999)
+	snap := auditTimingWait(id, 20*time.Millisecond)
+	if !snap.preSet || snap.preUs != 1234 {
+		t.Fatalf("pre segment lost across entry TTL: %+v（长请求必须保留预检段）", snap)
+	}
+	if !snap.endSet || snap.endUs != 999 {
+		t.Fatalf("end segment missing: %+v", snap)
+	}
+}
+
+// 预检保留区自身必须有界：超过保留期即回收（不成为第二张无界表）。
+func TestAuditTimingRegistry_preRetentionExpires(t *testing.T) {
+	useTestAuditPipeline(t)
+	origRetention := auditPreRetentionTTLNs.Load()
+	auditPreRetentionTTLNs.Store(int64(10 * time.Millisecond))
+	t.Cleanup(func() { auditPreRetentionTTLNs.Store(origRetention) })
+
+	const id = "ffffffffffffffff"
+	auditTimingRecord(id, "pre", 7)
+	time.Sleep(80 * time.Millisecond)
+	auditTimingMu.Lock()
+	auditTimingSweepLocked(time.Now())                  // 条目过期 → pre 转保留区
+	auditTimingSweepLocked(time.Now().Add(time.Minute)) // 保留期同样过期 → 回收
+	retained := len(auditRetainedPreEntries)
+	auditTimingMu.Unlock()
+	if retained != 0 {
+		t.Fatalf("retained pre entries=%d, want 0（保留期到期必须回收）", retained)
+	}
 }

@@ -1,7 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { section, source } from './_helpers.ts'
+import {
+  BACKUP_SECTIONS,
+  LEGACY_SECTION_ALIASES,
+  normalizeBackupSectionKeys,
+} from '../src/utils/backupSections.ts'
+import { repoSource, section, source } from './_helpers.ts'
 
 // 设置页备份面回归守卫：导入入口/超大文件拒绝、lbbak Blob 直传、还原文案按分类、
 // 下次备份调度口径、立即备份的卸载收尾，以及备份四分类前后端单源一致性。
@@ -83,43 +88,19 @@ test('0 分类选择隐藏陈旧预览并把确认按钮置灰', () => {
   assert.match(button, /isReadOnly/)
 })
 
-// ---- 备份分类单源：从 BasicSettings.vue 抽取真实声明求值 ----
-interface BackupSection { key: string; label: string }
-interface BackupSectionsModule {
-  BACKUP_SECTIONS: readonly BackupSection[]
-  LEGACY_SECTION_ALIASES: Record<string, string>
-  normalizeBackupSectionKeys: (keys: string[]) => string[]
-}
-
-const loadBackupSections = (): BackupSectionsModule => {
-  const page = source('src/views/settings/BasicSettings.vue')
-  const block = section(page, 'const BACKUP_SECTIONS', 'const exportSections')
-  // 剥离 TS 类型标注后求值（形态变化会显性抛错=守卫生效，非静默漂移）
-  const js = block
-    .replace(/ as const/g, '')
-    .replace(/: Record<string, string>/g, '')
-    .replace(/\(keys: string\[\]\): string\[\]/g, '(keys)')
-    .replace(/new Set<string>\(\)/g, 'new Set()')
-    .replace(/const out: string\[\]/g, 'const out')
-  const factory = new Function(`${js}; return { BACKUP_SECTIONS, LEGACY_SECTION_ALIASES, normalizeBackupSectionKeys }`)
-  return factory() as BackupSectionsModule
-}
-
 test('备份分类恰好四键且标签与后端口径一致', () => {
-  const { BACKUP_SECTIONS } = loadBackupSections()
   assert.deepEqual(
     BACKUP_SECTIONS.map((s) => [s.key, s.label]),
     [['users', '系统数据'], ['rules', '负载规则'], ['security', '安全防护'], ['cluster', '节点拓扑']],
   )
   // 跨栈一致性：后端 configBackupSections 单源派生键/标签必须同集同序
-  const go = source('../internal/handlers/config_backup.go')
+  const go = repoSource('internal/handlers/config_backup.go')
   const goBlock = section(go, 'var configBackupSections = []struct', '\n}\n')
   const goPairs = [...goBlock.matchAll(/\{Key: "(\w+)", Label: "([^"]+)"/g)].map((m) => [m[1], m[2]])
   assert.deepEqual(BACKUP_SECTIONS.map((s) => [s.key, s.label]), goPairs, '前后端分类键/标签漂移会静默改变导出/还原覆盖面')
 })
 
 test('legacy 分类键归一行为（映射/去重/保序/未知键透传）', () => {
-  const { LEGACY_SECTION_ALIASES, normalizeBackupSectionKeys } = loadBackupSections()
   assert.deepEqual(LEGACY_SECTION_ALIASES, { global_config: 'users', waf_files: 'security' })
   assert.deepEqual(normalizeBackupSectionKeys(['global_config', 'waf_files']), ['users', 'security'], 'legacy 键读出即归一')
   assert.deepEqual(normalizeBackupSectionKeys(['users', 'global_config']), ['users'], '归一后与显式键去重')
@@ -129,7 +110,6 @@ test('legacy 分类键归一行为（映射/去重/保序/未知键透传）', (
 })
 
 test('导出/自动备份默认全选四分类，恢复路径必经归一', () => {
-  const { BACKUP_SECTIONS, normalizeBackupSectionKeys } = loadBackupSections()
   const allKeys = BACKUP_SECTIONS.map((s) => s.key)
   assert.deepEqual(normalizeBackupSectionKeys(allKeys), allKeys)
   const page = source('src/views/settings/BasicSettings.vue')

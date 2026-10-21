@@ -22,9 +22,12 @@ var runtimeLogSizeRefresh struct {
 	done   chan struct{}
 }
 
+// init 只落兜底阈值（100MB）。worker 不再随包初始化自启（历史问题：
+// init 先于 main 的 db.Initialize，首次 refresh 必撞 nil 库空转，启动后
+// 最长 30s 按兜底 100MB 滚动）——首次刷新由 main 在 db.Initialize 后
+// 显式 StartLogRotate 触发，首读即真实库值。
 func init() {
 	runtimeLogSizeMB.Store(100)
-	StartLogRotate(context.Background())
 }
 
 func StartLogRotate(ctx context.Context) <-chan struct{} {
@@ -202,6 +205,10 @@ func (w *RotatingFileWriter) Close() error {
 // RuntimeLogCleanupOnce，由任务引擎 log-cleanup 族按 24h 节拍驱动）。
 type RuntimeCleanupResult struct {
 	AppRemoved int // 应用日志过期副本删除数（app.log.*）
+	// AppCleanupError 应用日志副本清理的目录读取失败原因（空=正常）。
+	// 历史修复：目录不可读时曾静默返回 AppRemoved=0——任务日志称「删除 0 个」，
+	// 与「无过期副本」不可区分；失败原因必须随摘要行与任务日志可见。
+	AppCleanupError string
 	// RetentionMonths 本轮生效的保留月数（单一来源 auditRetentionMonths 回填，
 	// 任务日志摘要行直接展示本字段——此前 wire 处自行查库复算，
 	// 同值两实现会在默认值/钳位逻辑变更时与实际清理口径分裂）。
@@ -247,6 +254,8 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 	base := filepath.Base(logFile) + "."
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		Logf("warn", "应用日志副本清理失败：读取目录 %s 失败: %v", dir, err)
+		result.AppCleanupError = err.Error()
 		return result
 	}
 	removed := 0
@@ -283,7 +292,12 @@ func logCleanupSummaryLine(logFile string) string {
 	res := RuntimeLogCleanupOnce(logFile)
 	// 保留月数取 RuntimeCleanupResult 的单源回填值（与实际删除口径
 	// 同源），不再在本层复算。
-	summary := fmt.Sprintf("日志清理完成：应用日志副本删除 %d 个（保留 %d 月，无过期为 0）；%s", res.AppRemoved, res.RetentionMonths, res.TaskLogs.Summary())
+	appPart := fmt.Sprintf("应用日志副本删除 %d 个（保留 %d 月，无过期为 0）", res.AppRemoved, res.RetentionMonths)
+	if res.AppCleanupError != "" {
+		// 历史修复：目录不可读不得呈现为「删除 0 个」——任务日志必须留痕失败原因。
+		appPart = fmt.Sprintf("应用日志副本未清理（保留 %d 月）：读取目录失败 %s", res.RetentionMonths, res.AppCleanupError)
+	}
+	summary := "日志清理完成：" + appPart + "；" + res.TaskLogs.Summary()
 	// 历史问题-01（历史）：daemon 停机时的 waf-audit 兜底动作如实进
 	// 任务日志（2026-10-01 用户裁定：清理了哪个文件必须可见）；无动作时不加
 	// 尾段，日志行形态不变。

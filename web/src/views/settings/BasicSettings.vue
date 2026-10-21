@@ -199,18 +199,12 @@
           subtitle="管理面板（:8000）强制 HTTPS 使用的证书，保存后服务重启生效" />
       </template>
       <el-form label-width="110px">
-        <!-- 自管标签行(ClusterModeCard 范式):el-radio-group 会把组容器 DIV id
-             注册为表单输入 id,el-form-item label for 随之指向 DIV——Firefox 报
-             「Incorrect use of <label for>」;改 role=group+aria-label 语义等价 -->
-        <div class="form-radio-row" role="group" aria-label="证书来源">
-          <span class="form-radio-row-label">证书来源</span>
-          <div class="form-radio-row-content">
-            <el-radio-group v-model="adminTlsForm.mode">
-              <el-radio value="selfsigned">本地自签名证书</el-radio>
-              <el-radio value="upload">上传证书</el-radio>
-            </el-radio-group>
-          </div>
-        </div>
+        <el-form-item label="证书来源">
+          <el-radio-group v-model="adminTlsForm.mode" aria-label="证书来源">
+            <el-radio value="selfsigned">本地自签名证书</el-radio>
+            <el-radio value="upload">上传证书</el-radio>
+          </el-radio-group>
+        </el-form-item>
         <template v-if="adminTlsForm.mode === 'upload'">
           <el-form-item label="证书文件">
             <div class="tls-file-field">
@@ -375,23 +369,19 @@
           <el-switch v-model="autoBackupForm.enabled" />
           <span class="form-tip-inline">调度器仅主节点运行；主从切换后自动开始，无需重启进程</span>
         </el-form-item>
-        <!-- 自管标签行(同上 a11y 范式):radio+select 兄弟同行,role=group 收口 -->
-        <div class="form-radio-row" role="group" aria-label="频率">
-          <span class="form-radio-row-label">频率</span>
-          <div class="form-radio-row-content">
-            <el-radio-group v-model="autoBackupForm.frequency">
-              <el-radio value="daily">日</el-radio>
-              <el-radio value="weekly">周</el-radio>
-              <el-radio value="monthly">月</el-radio>
-            </el-radio-group>
-            <el-select v-if="autoBackupForm.frequency === 'weekly'" v-model="autoBackupForm.day" size="small" style="width: 110px; margin-left: 12px">
-              <el-option v-for="(label, idx) in AUTO_BACKUP_WEEKDAYS" :key="label" :value="idx + 1" :label="label" />
-            </el-select>
-            <el-select v-else-if="autoBackupForm.frequency === 'monthly'" v-model="autoBackupForm.day" size="small" style="width: 110px; margin-left: 12px">
-              <el-option v-for="d in 28" :key="d" :value="d" :label="`${d} 日`" />
-            </el-select>
-          </div>
-        </div>
+        <el-form-item label="频率">
+          <el-radio-group v-model="autoBackupForm.frequency" aria-label="频率">
+            <el-radio value="daily">日</el-radio>
+            <el-radio value="weekly">周</el-radio>
+            <el-radio value="monthly">月</el-radio>
+          </el-radio-group>
+          <el-select v-if="autoBackupForm.frequency === 'weekly'" v-model="autoBackupForm.day" size="small" style="width: 110px; margin-left: 12px">
+            <el-option v-for="(label, idx) in AUTO_BACKUP_WEEKDAYS" :key="label" :value="idx + 1" :label="label" />
+          </el-select>
+          <el-select v-else-if="autoBackupForm.frequency === 'monthly'" v-model="autoBackupForm.day" size="small" style="width: 110px; margin-left: 12px">
+            <el-option v-for="d in 28" :key="d" :value="d" :label="`${d} 日`" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="备份时间">
           <el-time-select v-model="autoBackupForm.time" start="00:00" end="23:30" step="00:30" style="width: 120px" />
           <span class="form-tip-inline">按系统配置时区执行；停机跨槽会在下次启动补跑一次</span>
@@ -483,7 +473,7 @@
          OIDC 连接测试、配置预览/备份校验、证书解析、批量查询为读语义豁免。 -->
     <div class="info-note-bar"><span class="info-note-desc">开启后，以下操作需要 1 分钟内验证过 MFA（TOTP 同片不可重用，验证后 60 秒内的连续操作免重复弹码）。配置预览、备份校验、证书解析、批量证书状态查询与 OIDC 连接测试等只读语义操作不受影响。</span></div>
     <div class="mfa-scope-list">
-      <div v-for="group in mfaScopeGroups" :key="group.title" class="mfa-scope-row">
+      <div v-for="group in MFA_SCOPE_GROUPS" :key="group.title" class="mfa-scope-row">
         <div class="mfa-scope-title">{{ group.title }}</div>
         <div class="mfa-scope-items">{{ group.items.join('、') }}</div>
       </div>
@@ -503,6 +493,8 @@ import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
 import { shouldToastQuietPollError } from '@/utils/pollErrorToast'
 import { displaySecurityEventsRowCap, securityEventsWritePayload } from '@/utils/configValues'
 import { CHINA_SITE_CHOICES, COUNTRY_SITE_CHOICES, coordsForSiteLocation, nearestSiteLocation } from '@/utils/siteLocation'
+import { BACKUP_SECTIONS, normalizeBackupSectionKeys } from '@/utils/backupSections'
+import { MFA_SCOPE_GROUPS } from '@/utils/mfaScopeGroups'
 import { Setting, InfoFilled, Check, View, Upload, Download, Timer, Lock, Document } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import type { SystemInfo } from '@/types'
@@ -570,29 +562,8 @@ watch(appLogAutoRefresh, (enabled) => {
 // 历史修复（历史）：onUnmounted 生命周期收尾移至 disposed/tlsProtocolFallbackTimer
 // 声明之后（见下方 TLS 段尾），消除「引用其后声明的 let」的脆弱形态。
 
-// 备份分类(2026-09-19 三分类合并；本轮新增节点拓扑):与集群同步节同构
-// ——全局配置并入「系统数据」、规则库并入「安全防护」。默认全选。
-const BACKUP_SECTIONS = [
-  { key: 'users', label: '系统数据' },
-  { key: 'rules', label: '负载规则' },
-  { key: 'security', label: '安全防护' },
-  { key: 'cluster', label: '节点拓扑' },
-] as const
-
-// legacy 分类键归一(与后端 normalizeBackupSectionKeys 同映射):升级前保存的
-// 自动备份范围/历史备份行可能携带 global_config/waf_files,读出即归一。
-const LEGACY_SECTION_ALIASES: Record<string, string> = { global_config: 'users', waf_files: 'security' }
-const normalizeBackupSectionKeys = (keys: string[]): string[] => {
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const key of keys) {
-    const normalized = LEGACY_SECTION_ALIASES[key] ?? key
-    if (seen.has(normalized)) continue
-    seen.add(normalized)
-    out.push(normalized)
-  }
-  return out
-}
+// 备份分类单源在 utils/backupSections（导出/自动备份/还原共用；后端
+// configBackupSections 为其镜像，默认全选）。
 const exportSections = ref<string[]>(BACKUP_SECTIONS.map((s) => s.key))
 const exportDialogVisible = ref(false)
 const toggleImportSection = (key: string): void => {
@@ -1255,17 +1226,8 @@ interface AdminTlsForm {
 }
 
 const mfaScopeVisible = ref(false)
-// 历史修复：与 middleware.go 的 admin/business 组写路由逐族对齐——本清单是 MFA
-// 弹框「受保护操作范围」的唯一事实源：新增写端点族必须同步入列（否则弹框会
-// 低估受保护范围），测试按清单反查缺失项。
-const mfaScopeGroups = [
-  { title: '负载规则', items: ['创建', '编辑', '删除', '启用', '禁用', '复制'] },
-  { title: '证书与 DNS', items: ['DNS 配置增删改', '证书配置增删改', 'DNS 凭证连通性测试', 'CA 提供商修改/测试', '触发证书签发', '证书任务重试/删除'] },
-  { title: '安全防护', items: ['安全策略增删改/绑定/拆分', '自定义规则增删改', '拦截页面增删改', 'IP 名单增删改与条目增删', 'CRS/IP 库更新与自动更新开关', '威胁情报库/爬虫库更新与开关', '自动封禁配置'] },
-  { title: '用户与密钥', items: ['用户增删改/启停/重置密码（管理员）', '个人资料修改', 'API 密钥创建/启停/删除（含自己的）', '重置 MFA（含管理员代重置）', '启用/禁用/重新生成恢复码（自己的）'] },
-  { title: '系统与服务', items: ['基础设置/Caddy 全局配置保存', '配置重载/校验', '配置导入（v1/v2）', '配置导出与自动备份（设置保存/立即备份/删除/还原/下载）', '管理 TLS 设置修改', 'OIDC 配置修改/删除', 'Caddy 服务启动/停止/重启', 'Caddyfile 手动编辑', '任务监控 运行/停止调度/取消/重启', '系统重启'] },
-  { title: '集群管理', items: ['节点审批/拒绝/删除', '访问地址修改', '节点站点坐标配置', '服务控制（启动/停止/重启 Caddy、重启应用）', '清除节点证书指纹/清空指纹钉', '注册令牌生成', '主从模式切换/提升', '手动同步', '集群同步设置', '登录从节点（票据签发，每次验证）'] },
-]
+// MFA「受保护操作范围」清单单源在 utils/mfaScopeGroups（与 middleware.go 的
+// admin/business 组写路由逐族对齐；新增写端点族必须同步入列）。
 
 const settings = defineModel<BasicSettingsConfig>('settings', { required: true })
 // 父级 /config 加载完成前禁止保存：表单此刻仍是默认值（历史问题-1）。
@@ -1788,14 +1750,9 @@ const handleSave = async () => {
 .auto-backup-scope-text { white-space: nowrap; }
 .auto-backup-list { border-top: 1px solid var(--el-border-color-lighter); padding-top: 10px; }
 
-/* 自管标签行(ClusterModeCard 范式,历史修复):复刻 EP .el-form-item__label 计算
- * 样式(右对齐/32px 行高/12px 右内边距),110px 与两弹框 label-width 一致;
- * role=group+aria-label 替代 el-form-item label,规避 el-radio-group 组容器
- * DIV 被 label for 指向的 Firefox a11y 告警 */
-.form-radio-row { display: flex; margin-bottom: 18px; }
-.auto-backup-form .form-radio-row { margin-bottom: 14px; }
-.form-radio-row-label { width: 110px; flex-shrink: 0; height: 32px; line-height: 32px; text-align: right; padding-right: 12px; box-sizing: border-box; color: var(--el-text-color-regular); font-size: var(--el-form-label-font-size, 14px); }
-.form-radio-row-content { flex: 1; min-width: 0; display: flex; align-items: center; }
+/* 自管标签行族已退役（2026-10-11 用户裁定：对齐统一走原生 el-form-item，
+ * Firefox label-for 控制台告警为 EP 上游已知形态、非用户可见）——
+ * .form-radio-row / -label / -content 死 CSS 一并删除。 */
 
 /* HTTPS 证书配置弹框（2026-09-25 用户裁定重构）：正文 20px 水平留白；
    文件选择=按钮+文件名展示；证书信息=浅底卡片行布局 */

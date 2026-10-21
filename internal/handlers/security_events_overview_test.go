@@ -1216,3 +1216,55 @@ func TestListSecurityEvents_largeFieldsCappedWithMarker(t *testing.T) {
 		t.Fatalf("request_body 截断后 len=%d > cap=%d", len(trimmed), securityEventListFieldCap)
 	}
 }
+
+// 缓存键必须是时区身份（loc.String()）而不是瞬时偏移：同样 +08:00 的两个
+// 时区（Asia/Shanghai/Asia/Taipei）日桶按各自 location 逐日构造，若键只存
+// 偏移就会在 TTL 内共用另一时区的聚合。
+func TestLoadSecurityOverviewAggregates_timezoneIdentityKeyNotOffset(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	resetSecurityOverviewAggCacheForTest()
+	t.Cleanup(resetSecurityOverviewAggCacheForTest)
+	database := db.MetricsDB
+	today := time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)
+	insertOverviewAggregateEvent(t, database, "2026-10-19 01:00:00")
+
+	if _, err := loadSecurityOverviewAggregates(database, today, "2026-10-18 16:00:00", "Asia/Shanghai"); err != nil {
+		t.Fatal(err)
+	}
+	insertOverviewAggregateEvent(t, database, "2026-10-19 01:01:00")
+	taipei, err := loadSecurityOverviewAggregates(database, today, "2026-10-18 16:00:00", "Asia/Taipei")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := overviewAggregateEventCount(taipei); got != 2 {
+		t.Fatalf("同偏移不同时区身份必须重算（got %d, want 2）", got)
+	}
+	cached, err := loadSecurityOverviewAggregates(database, today, "2026-10-18 16:00:00", "Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := overviewAggregateEventCount(cached); got != 1 {
+		t.Fatalf("原时区键快照必须保留（got %d, want 1）", got)
+	}
+}
+
+// 近 7 天覆盖判定必须按「本地日界逐日回退」而不是「UTC 时刻 −6×24h」：
+// 跨 DST 的 6 天不是 144h（这里是 145h），单一平移会让窗口起点偏 1h →
+// backfill_incomplete 误报/漏报。
+func TestSecurityOverviewSevenDayStartUTC_dstCorrect(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	// 2026-11-01 美国夏令时结束；todayStart=11-02 00:00 EST（UTC-5）。
+	todayStart := time.Date(2026, 11, 2, 0, 0, 0, 0, loc)
+	got := securityOverviewSevenDayStartUTC(todayStart)
+	// 本地 10-27 00:00 EDT（UTC-4）= 10-27 04:00 UTC。
+	want := "2026-10-27 04:00:00"
+	if got != want {
+		t.Fatalf("seven-day start=%q, want %q（逐日回退，非 -144h 平移）", got, want)
+	}
+	if naive := todayStart.UTC().Add(-6 * 24 * time.Hour).Format("2006-01-02 15:04:05"); got == naive {
+		t.Fatalf("覆盖判定仍用单一 UTC 平移（%q）", naive)
+	}
+}

@@ -1067,3 +1067,72 @@ func TestToolsListHidesAdminOnlyToolsForNonAdminKey(t *testing.T) {
 		}
 	}
 }
+
+// tools/list 可见性过滤 fail-closed：Key 属主属性解析失败时不得原样透传
+// 全量工具（旧实现 err → next 直出），改为下发空 tools 列表并保留 JSON-RPC
+// id——调用方仍能配对响应，但不会看到任何未经身份判定的工具。
+func TestToolsListFailsClosedWhenVisibilityResolutionFails(t *testing.T) {
+	handler := newWithVisibilityResolver("http://127.0.0.1/api/v1", http.DefaultClient, "",
+		func(string) (apiKeyVisibility, error) {
+			return apiKeyVisibility{}, fmt.Errorf("解析 Key 属主失败")
+		})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":42,"method":"tools/list","params":{}}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("X-API-Key", "lb_sk_visibility-broken")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("fail-closed tools/list status=%d body=%q", response.Code, response.Body.String())
+	}
+	var payload struct {
+		ID     json.RawMessage `json:"id"`
+		Result struct {
+			Tools []json.RawMessage `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("parse fail-closed response %q: %v", response.Body.String(), err)
+	}
+	if len(payload.Result.Tools) != 0 {
+		t.Fatalf("visibility resolution failure leaked %d tools (fail-open)", len(payload.Result.Tools))
+	}
+	if string(payload.ID) != "42" {
+		t.Fatalf("fail-closed response lost JSON-RPC id: %s", response.Body.String())
+	}
+}
+
+// 过滤阶段失败同样 fail-closed：上游响应无法解析时不得回退为未过滤原文。
+// 过滤在 recorder 上完成后若出错，旧实现 `filtered = recorder.body.Bytes()`
+// 把全量工具透传——与解析失败同属 fail-open。
+func TestServeWithToolVisibilityFailsClosedOnFilterError(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`not-json`))
+	})
+	resolver := func(string) (apiKeyVisibility, error) { return apiKeyVisibility{}, nil }
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":"abc","method":"tools/list","params":{}}`))
+	response := httptest.NewRecorder()
+
+	serveWithToolVisibility(response, request, next, resolver)
+
+	var payload struct {
+		ID     json.RawMessage `json:"id"`
+		Result struct {
+			Tools []json.RawMessage `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("parse fail-closed response %q: %v", response.Body.String(), err)
+	}
+	if len(payload.Result.Tools) != 0 {
+		t.Fatalf("filter failure leaked %d tools (fail-open)", len(payload.Result.Tools))
+	}
+	if string(payload.ID) != `"abc"` {
+		t.Fatalf("fail-closed response lost JSON-RPC id: %s", response.Body.String())
+	}
+}

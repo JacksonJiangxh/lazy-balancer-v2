@@ -4,7 +4,9 @@ package handlers
 // 历史修复 binding rule existence).
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -134,11 +136,26 @@ func TestBindRuleToPolicy_concurrentRuleDeleteLeavesNoDanglingBinding(t *testing
 			t.Fatalf("round %d: seed rule: %v", i, err)
 		}
 		var wg sync.WaitGroup
+		// 子 goroutine 不得调用 t.Fatalf（只允许 t.Errorf）——错误经 channel
+		// 回传主 goroutine 再判定。
+		bindErrs := make(chan error, 1)
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
 			// 绑定请求：存在性校验 + DELETE + INSERT 在同一事务内
-			postJSON(t, router, "/security/policies/"+strconv.Itoa(policyID)+"/bind", map[string]any{"rule_caddy_id": caddyID})
+			raw, err := json.Marshal(map[string]any{"rule_caddy_id": caddyID})
+			if err != nil {
+				bindErrs <- fmt.Errorf("round %d: marshal bind body: %w", i, err)
+				return
+			}
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/security/policies/"+strconv.Itoa(policyID)+"/bind", bytes.NewReader(raw))
+			request.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(recorder, request)
+			// 竞争下两态均合法：规则尚在→200 绑定成功；已被删→400 拒绝。
+			if recorder.Code != http.StatusOK && recorder.Code != http.StatusBadRequest {
+				bindErrs <- fmt.Errorf("round %d: bind status=%d body=%s", i, recorder.Code, recorder.Body.String())
+			}
 		}()
 		go func() {
 			defer wg.Done()
@@ -162,6 +179,11 @@ func TestBindRuleToPolicy_concurrentRuleDeleteLeavesNoDanglingBinding(t *testing
 			}
 		}()
 		wg.Wait()
+		select {
+		case err := <-bindErrs:
+			t.Errorf("%v", err)
+		default:
+		}
 		if n := danglingCount(); n != 0 {
 			t.Fatalf("round %d: %d dangling binding(s) after concurrent rule delete", i, n)
 		}

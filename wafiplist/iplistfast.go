@@ -188,14 +188,35 @@ func loadIPListFileFresh(path string) (*ipListFileState, error) {
 	return loadIPListFile(path, true)
 }
 
+// ipListStatCalls 读盘路径的 stat 调用计数（测试观测节流窗口边界的单飞语义）。
+var ipListStatCalls atomic.Int64
+
+// statIPListFile 是 os.Stat 的唯一调用点（计数缝；生产零额外成本）。
+func statIPListFile(path string) (os.FileInfo, error) {
+	ipListStatCalls.Add(1)
+	return os.Stat(path)
+}
+
 // resolveIPListFile 是 Evaluate 的读路径：节流命中直接返回缓存；stat 失败或
 // 重建失败且缓存存在 → fail-stale（返回旧集合）；缓存不存在 → error。
 func resolveIPListFile(path string) (*ipListFileState, error) {
 	ipListCache.RLock()
 	cached := ipListCache.states[path]
 	ipListCache.RUnlock()
-	if cached != nil && StatCheckInterval > 0 &&
-		time.Duration(monotonicNowNano()-cached.lastCheckTick.Load()) < StatCheckInterval {
+	if cached == nil || StatCheckInterval <= 0 {
+		return loadIPListFile(path, false)
+	}
+	last := cached.lastCheckTick.Load()
+	now := monotonicNowNano()
+	if time.Duration(now-last) < StatCheckInterval {
+		return cached, nil
+	}
+	// 节流窗口边界：CAS 先占本窗检查权（每窗单飞）——未抢到的并发请求直接
+	// 返回缓存，不再各自 os.Stat（窗口边界 N 个并发请求曾形成 N 次 stat 风暴）。
+	// 抢到者进入 loadIPListFile；其 stat 命中/重建路径都会回写 lastCheckTick。
+	// 语义不变：窗口内的请求本就返回缓存（陈旧上限仍是 StatCheckInterval），
+	// 文件变化在下一窗口由抢到者检出。
+	if !cached.lastCheckTick.CompareAndSwap(last, now) {
 		return cached, nil
 	}
 	return loadIPListFile(path, false)
@@ -243,7 +264,7 @@ func ResolvePrefixesNormalized(path string) ([]netip.Prefix, error) {
 // 失败时缓存存在则 fail-stale 返回旧集合（fresh=true 的构建期除外：
 // 构建期永远 fail-closed）。
 func loadIPListFile(path string, fresh bool) (state *ipListFileState, err error) {
-	info, err := os.Stat(path)
+	info, err := statIPListFile(path)
 	if err != nil {
 		return staleOrError(path, nil, fmt.Errorf("IP 名单不可读 %q: %w", path, err), fresh)
 	}
@@ -290,7 +311,11 @@ func loadIPListFile(path string, fresh bool) (state *ipListFileState, err error)
 		}
 		// 历史问题（历史）代际守卫：并发重建时缓存里已是更晚 mtime 的
 		// 新代际——本代际基于更早 stat 的解析结果不得覆盖（旧内容回流）。
-		if current.mtime.After(state.mtime) {
+		// 判定单源=SnapshotGeneration 守卫（与爬虫快照加载器共用）。
+		if StaleSnapshotGeneration(
+			SnapshotGeneration{ModTime: state.mtime, Size: state.size},
+			SnapshotGeneration{ModTime: current.mtime, Size: current.size},
+		) {
 			ipListCache.Unlock()
 			current.lastCheckTick.Store(monotonicNowNano())
 			clearStaleReport(path)

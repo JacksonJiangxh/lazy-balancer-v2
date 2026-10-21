@@ -181,12 +181,16 @@ func TestUpdateCertificateConfig_disableReferenceGuard(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		ruleEnabled int
+		enableTLS   int
 		seedRule    bool
 		wantStatus  int
 		wantEnabled bool
 	}{
-		{name: "enabled ACME reference", ruleEnabled: 1, seedRule: true, wantStatus: http.StatusConflict, wantEnabled: true},
-		{name: "disabled rule reference", ruleEnabled: 0, seedRule: true, wantStatus: http.StatusOK, wantEnabled: false},
+		{name: "enabled ACME reference", ruleEnabled: 1, enableTLS: 1, seedRule: true, wantStatus: http.StatusConflict, wantEnabled: true},
+		{name: "disabled rule reference", ruleEnabled: 0, enableTLS: 1, seedRule: true, wantStatus: http.StatusOK, wantEnabled: false},
+		// TLS 关闭的引用规则不消费 ACME 证书（签发/续期只服务 enable_tls=1）——
+		// 禁用守卫点名它属误报，必须放行（历史问题）。
+		{name: "TLS-off enabled rule reference", ruleEnabled: 1, enableTLS: 0, seedRule: true, wantStatus: http.StatusOK, wantEnabled: false},
 		{name: "unreferenced", wantStatus: http.StatusOK, wantEnabled: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -195,7 +199,7 @@ func TestUpdateCertificateConfig_disableReferenceGuard(t *testing.T) {
 				t.Fatalf("seed config: %v", err)
 			}
 			if tc.seedRule {
-				if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,enable_tls,tls_source,acme_config_id) VALUES ('lb_dns_guard','guard','','http','guard.example.test',8443,'weighted_round_robin',?,1,'acme_dns',1)`, tc.ruleEnabled); err != nil {
+				if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,enable_tls,tls_source,acme_config_id) VALUES ('lb_dns_guard','guard','','http','guard.example.test',8443,'weighted_round_robin',?,?,'acme_dns',1)`, tc.ruleEnabled, tc.enableTLS); err != nil {
 					t.Fatalf("seed rule: %v", err)
 				}
 			}

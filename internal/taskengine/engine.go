@@ -341,9 +341,9 @@ func (e *Engine) SetRole(isMaster bool) {
 	e.mu.RLock()
 	targets := make([]*registration, 0, len(e.regs))
 	for _, r := range e.regs {
-		if r.desc.Kind == KindDaemon || r.desc.Kind == KindPeriodic || r.desc.Kind == KindScheduled || r.desc.Kind == KindOneshot {
-			targets = append(targets, r)
-		}
+		// 全集遍历（历史问题：原四选 Kind 过滤是恒真条件——Kind 枚举仅
+		// Scheduled/Daemon/Periodic/Oneshot 四值且注册期校验，过滤零效果）。
+		targets = append(targets, r)
 	}
 	e.mu.RUnlock()
 	for _, r := range targets {
@@ -544,6 +544,11 @@ func (e *Engine) Register(d Descriptor) error {
 	return nil
 }
 
+// Trigger 同步触发任务（pause/角色/daemon 门 + runNow 执行）。
+// 测试专供入口（历史问题 标记）：生产手动触发一律走
+// RunAsync/RunAsyncResult（taskmonitor/库更新/备份端点经
+// services.TriggerTaskAsync 单源）；本函数生产零调用方，保留供测试
+// 同步驱动任务体。
 func (e *Engine) Trigger(id, trigger, operator string) error {
 	if e.schedPaused.Load() && trigger != "startup" {
 		return ErrSchedulingPaused
@@ -571,6 +576,19 @@ func (e *Engine) Trigger(id, trigger, operator string) error {
 
 // RunSync 同步执行一次并返回 runID（handler 直调入口——响应需要行视图）。
 func (e *Engine) RunSync(id, trigger, operator string) (int64, error) {
+	return e.runSync(id, trigger, operator, false)
+}
+
+// RunSyncQuiet 与 RunSync 同守卫/同执行语义，但不落 task_runs 行（任务日志
+// 仍留痕）。供高频自愈重试使用：连续失败的重试轮由调用方按退避与「状态变化/
+// 首次/每 N 轮」策略决定何时走 RunSync 落行，其余轮走本入口执行同一 Run 体——
+// 既保持「一切任务统一引擎调度」（不绕过引擎直调 Run 体），又避免每 2s 一条
+// 失败行把任务历史淹没。
+func (e *Engine) RunSyncQuiet(id, trigger, operator string) (int64, error) {
+	return e.runSync(id, trigger, operator, true)
+}
+
+func (e *Engine) runSync(id, trigger, operator string, quiet bool) (int64, error) {
 	if e.schedPaused.Load() && trigger != "startup" {
 		return 0, ErrSchedulingPaused
 	}
@@ -589,7 +607,13 @@ func (e *Engine) RunSync(id, trigger, operator string) (int64, error) {
 	if !e.roleAllows(r.desc.RunsOn) {
 		return 0, ErrNotMaster
 	}
-	return e.runNow(id, trigger, operator)
+	res, err := e.reserveRun(id, trigger)
+	if err != nil {
+		return 0, err
+	}
+	defer res.release()
+	res.suppressRunRow = quiet
+	return e.executeRun(res, id, trigger, operator)
 }
 
 // RunBootSyncTasks 同步执行全部 BootSync Oneshot（InitTaskEngine 尾部调用
@@ -1133,6 +1157,8 @@ type runReservation struct {
 	r      *registration
 	ctx    context.Context
 	cancel context.CancelFunc
+	// suppressRunRow 为 true 时不落 task_runs 行（RunSyncQuiet 高频重试路径）。
+	suppressRunRow bool
 }
 
 func (res *runReservation) release() {
@@ -1298,7 +1324,10 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 	ctx := res.ctx
 	// 记录策略（按 Kind，零 flag）：
 	// Scheduled/Periodic/Oneshot: 每次执行落行；Daemon: 仅 startDaemon 落行
-	runID := globalInsertRunAt(id, r.desc.Family, trigger, engineNowStr(), operator)
+	var runID int64
+	if !res.suppressRunRow {
+		runID = globalInsertRunAt(id, r.desc.Family, trigger, engineNowStr(), operator)
+	}
 
 	rc := RunContext{Ctx: ctx, Trigger: trigger, Operator: operator, RunID: runID}
 	start := time.Now()
@@ -1358,7 +1387,13 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 func truncMsg(err error) string {
 	m := err.Error()
 	if len(m) > 500 {
-		m = m[:500]
+		// 裁剪点回退到 rune 边界（与 truncateTaskLogLine 同手法）——按字节
+		// 硬切多字节 UTF-8 会产出非法串落进 task_runs.message（历史问题）。
+		cut := 500
+		for cut > 0 && !utf8.RuneStart(m[cut]) {
+			cut--
+		}
+		m = m[:cut]
 	}
 	return m
 }
@@ -1448,6 +1483,13 @@ func (e *Engine) tick() {
 			enabledFn := r.desc.EnabledFn
 			prevSlot := r.nextScheduledTime // 历史问题：求值窗口起点快照
 			r.mu.Unlock()
+			// 角色门前置（与 Periodic 分支 allows 快照同构）：从节点/角色不符时
+			// 整分支跳过——EnabledFn/NextSlotFn 是装配方闭包（生产=DB 直读），
+			// 此前每 tick 先求值再在 due 判定里筛角色，从节点白付两次 DB 读
+			// （promote 后下一 tick 自然恢复求值，无需额外状态）。
+			if !e.roleAllows(r.desc.RunsOn) {
+				continue
+			}
 			// 历史问题（历史）：EnabledFn 业务门——false 时整分支跳过：不评估
 			// 槽（省 µs 级 SELECT）、不落槽缓存、零执行零落行零日志；节拍（槽
 			// 缓存每 tick 重读）天然不推进——恢复 true 后下一 tick 重读槽，到期
@@ -1649,7 +1691,7 @@ func TaskLogPath(taskID string) string {
 	// 历史修复（历史）/ 历史问题 白名单统一（历史）：任务 ID 路径净化由
 	// 黑名单（剔除 '/'、'\\'）改白名单——只保留注册任务 ID 全字母表
 	// [A-Za-z0-9_.:-]，与 handlers sanitizeRuleID 白名单同族口径（净化范式
-	// 单一化，畸形 ID 不再产出黑名单遗漏字符的文件名）。注册 ID 全集 18 个
+	// 单一化，畸形 ID 不再产出黑名单遗漏字符的文件名）。注册 ID 全集 19 个
 	// cluster-sync/config-watchdog/crs/ip2region/log-cleanup/security-events-*/
 	// startup:config-load/threat）仅用小写+数字+'-'+'.'+一个 ':'，大写留作未来
 	// 余量——既有注册 ID 零变化。目录穿越需分隔符，白名单剔除后 :id 用户可控
@@ -1957,6 +1999,15 @@ func sortTaskMetas(metas []TaskMeta) {
 
 type TaskRunsStats struct{ Runs, Success, Fail int }
 
+// taskRunsStats24hSelect 24h 统计聚合列单源（Stats24h 逐任务与
+// RunOverview 批量共用——同窗口同口径：started_at > now-1day，配置时区
+// 墙钟 engineNowStr）。改动窗口/聚合必须只动此处。
+const taskRunsStats24hSelect = `COUNT(*),
+		COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0)`
+
+// Stats24h 逐任务 24h 统计。测试专供（历史问题 标记）：生产消费方是
+// RunOverview 的批量聚合（同 SQL 单源 taskRunsStats24hSelect）。
 func (e *Engine) Stats24h(taskID string) TaskRunsStats {
 	var st TaskRunsStats
 	if db.DB == nil {
@@ -1964,9 +2015,7 @@ func (e *Engine) Stats24h(taskID string) TaskRunsStats {
 	}
 	// 历史问题-4（历史）：Scan 错误不得静默丢弃——与同文件 History/
 	// RunOverview 同口径留痕（计数降级为零值，视图仍可用）。
-	if err := db.DB.QueryRow(`SELECT COUNT(*),
-		COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0)
+	if err := db.DB.QueryRow(`SELECT `+taskRunsStats24hSelect+`
 		FROM task_runs WHERE task_id=? AND started_at > datetime(?, '-1 day')`, taskID, engineNowStr()).Scan(&st.Runs, &st.Success, &st.Fail); err != nil {
 		log.Printf("WARNING: taskengine: 24h 统计查询失败（%s 计数降级为零）: %v", taskID, err)
 	}
@@ -2002,9 +2051,7 @@ func (e *Engine) RunOverview() (map[string]*RunRecord, map[string]TaskRunsStats)
 		rows.Close()
 	}
 	// 24h 统计：与 Stats24h 同窗口/同口径（started_at > now-1day，配置时区墙钟）。
-	statRows, err := db.DB.Query(`SELECT task_id, COUNT(*),
-		COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0)
+	statRows, err := db.DB.Query(`SELECT task_id, `+taskRunsStats24hSelect+`
 		FROM task_runs WHERE started_at > datetime(?, '-1 day') GROUP BY task_id`, engineNowStr())
 	if err != nil {
 		log.Printf("WARNING: taskengine: 24h 统计批量查询失败（计数降级为零）: %v", err)
@@ -2095,17 +2142,20 @@ func (e *Engine) LatestRun(taskID string) *RunRecord {
 	return &runs[0]
 }
 
-func PurgeTaskRuns(days int) int64 {
+func PurgeTaskRuns(days int) (int64, error) {
 	if db.DB == nil || days <= 0 {
-		return 0
+		return 0, nil
 	}
 	res, err := db.DB.Exec(`DELETE FROM task_runs WHERE started_at < datetime(?, ?)`, engineNowStr(), fmt.Sprintf("-%d days", days))
 	if err != nil {
 		log.Printf("WARNING: taskengine: 清理过期任务记录失败: %v", err)
-		return 0
+		return 0, err
 	}
-	n, _ := res.RowsAffected()
-	return n
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取任务运行历史删除行数失败: %w", err)
+	}
+	return n, nil
 }
 
 // ---- 业务侧日志 helper ----

@@ -486,20 +486,14 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 	// 历史修复 check: verify the CA provider is reachable before starting the
 	// real issuance flow. If the CA is down (e.g. ZeroSSL 504), fail fast and
 	// let the retry scheduler handle the next attempt.
-	// AutoProvisionZeroSSLEAB updates provider.Credentials in-memory so the
-	// subsequent NewClientForProvider call sees the provisioned EAB.
-	// TestCAProviderWithContext also calls it (for the standalone test button),
-	// but that updates its own local copy, not this one.
-	if provider.Provider == "zerossl" {
-		credsBefore := provider.Credentials
-		if err := AutoProvisionZeroSSLEAB(ctx, &provider); err != nil {
-			logger.Log("creating_account", fmt.Sprintf("ZeroSSL EAB 自动获取失败: %v", err))
-		} else if provider.Credentials != credsBefore {
-			logger.Log("creating_account", "ZeroSSL EAB 自动获取成功，凭证已持久化")
-		}
-	}
+	// 预检（testCAProvider）内含 ZeroSSL EAB 自动获取（10s 界、持久化）与
+	// 账户注册验证，返回的 client 携带 EAB 且账户已注册（KID 已缓存）——
+	// 下方签发直接复用，Issuer 跳过重复注册（历史问题：本路径此前自带
+	// AutoProvisionZeroSSLEAB + 预检内再 provision + 预检/签发各注册一次，
+	// 每次签发 EAB 双调用、ACME 账户双注册）。
 	logger.Log("creating_account", fmt.Sprintf("测试 CA 提供商 %s (%s) 连通性", provider.Name, provider.Provider))
-	if err := NewCAProviderService(s.dataDir).TestCAProviderWithContext(ctx, provider.ID); err != nil {
+	preCheckedClient, err := NewCAProviderService(s.dataDir).testCAProvider(ctx, provider.ID)
+	if err != nil {
 		// CA 返回 429 时进入限流冷却（waiting_ca），与签发阶段的限流处理保持一致
 		if raErr := detectRateLimit(err); raErr != nil {
 			return raErr
@@ -527,18 +521,13 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 	// Resolve ACME config for the rule.
 	var acmeConfigID int
 	// 历史问题: 使用 QueryRowContext 以响应 worker 取消信号。
-	err := db.DB.QueryRowContext(ctx, "SELECT COALESCE(acme_config_id,0) FROM lb_rules WHERE caddy_id=?", ruleID).Scan(&acmeConfigID)
+	err = db.DB.QueryRowContext(ctx, "SELECT COALESCE(acme_config_id,0) FROM lb_rules WHERE caddy_id=?", ruleID).Scan(&acmeConfigID)
 	if err != nil {
 		failJob(jobID, "读取规则 ACME 配置失败")
 		return fmt.Errorf("read rule acme config: %w", err)
 	}
 
-	// Load ACME email from global config (single source of truth).
-	var acmeEmail string
-	if err := db.DB.QueryRowContext(ctx, "SELECT COALESCE(acme_email,'') FROM global_config WHERE id=1").Scan(&acmeEmail); err != nil {
-		failJob(jobID, "读取 ACME 邮箱失败")
-		return fmt.Errorf("read global acme email: %w", err)
-	}
+	// ACME 邮箱由预检（phase=email）保证已配置——本路径不再重复读取/校验。
 
 	// Load DNS credentials from the rule's selected provider.
 	var dnsCredentialsJSON string
@@ -560,22 +549,15 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 		return err
 	}
 
-	// Create ACME client for the selected provider
-	if strings.TrimSpace(acmeEmail) == "" {
-		failJob(jobID, "ACME 邮箱未配置，请在「系统设置 / 免费证书」中填写邮箱")
-		return fmt.Errorf("ACME 邮箱未配置")
-	}
-	client, err := acme.NewClientForProvider(provider, acmeEmail, s.dataDir)
-	if err != nil {
-		failJob(jobID, err.Error())
-		return err
-	}
-
+	// ACME client 复用预检产物（已注册、KID 已缓存；ZeroSSL EAB 已随预检
+	// provision 进 DB 并重载进 client）——不再新建 client 二次注册。
+	// acmeEmail 已由预检保证非空（phase=email 先行拒绝）。
 	issuer := &acme.Issuer{
-		Client:              client,
-		Provider:            dnsProvider,
-		Logger:              logger,
-		RequireRecursiveDNS: provider.Provider == "zerossl",
+		Client:               preCheckedClient,
+		Provider:             dnsProvider,
+		Logger:               logger,
+		RequireRecursiveDNS:  provider.Provider == "zerossl",
+		AccountPreRegistered: true,
 	}
 
 	// Run the ACME issuance flow

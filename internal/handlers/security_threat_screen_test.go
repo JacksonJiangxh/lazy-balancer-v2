@@ -65,6 +65,7 @@ type threatScreenPayload struct {
 	Data struct {
 		Hours              int                         `json:"hours"`
 		WindowStart        string                      `json:"window_start"`
+		WindowStartMinute  string                      `json:"window_start_minute"`
 		RollupCoverageFrom string                      `json:"rollup_coverage_from"`
 		BackfillIncomplete bool                        `json:"backfill_incomplete"`
 		TotalEvents        int                         `json:"total_events"`
@@ -1955,5 +1956,28 @@ func TestThreatRollup_classifierGenerationMismatchRebuilds(t *testing.T) {
 	}
 	if version != threatRollupClassifierVersion {
 		t.Fatalf("classifier version=%q, want %q", version, threatRollupClassifierVersion)
+	}
+}
+
+// rollup 读取下界是分钟串：响应必须披露实际生效的分钟边界（window_start_minute），
+// 否则调用方会按秒级 window_start 推算「窗口内精确计数」（首分钟最多多计 59s）。
+func TestGetSecurityThreatScreen_disclosesMinuteGranularityWindow(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	seedThreatScreenEvent(t, utcStringAgo(10*time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
+
+	recorder := getRequest(t, router, "/security/overview/threat-screen?hours=1")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload threatScreenPayload
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Data.WindowStartMinute == "" {
+		t.Fatalf("缺 window_start_minute 披露字段: %s", recorder.Body.String())
+	}
+	if !strings.HasPrefix(payload.Data.WindowStart, payload.Data.WindowStartMinute) {
+		t.Fatalf("window_start=%q 必须与 window_start_minute=%q 同边界（分钟截断）", payload.Data.WindowStart, payload.Data.WindowStartMinute)
 	}
 }

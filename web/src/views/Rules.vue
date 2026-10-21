@@ -3503,9 +3503,13 @@ interface LogStatMaps extends LogStatBuckets {
   startedAt: string
 }
 const createLogStatBuckets = (): LogStatBuckets => ({
-  ip: {},
-  ua: {},
-  uri: {},
+  // 原型安全容器：统计键来自请求日志（攻击者可控）。普通对象上写入 __proto__
+  // 会命中原型 setter——键静默不落、keyCounts 已自增（幽灵键吃满容量），
+  // constructor/toString 只能靠 own-property 守卫侥幸正确；无原型容器让任意
+  // 字符串都是普通自有键，不依赖守卫细节。
+  ip: Object.create(null) as Record<string, number>,
+  ua: Object.create(null) as Record<string, number>,
+  uri: Object.create(null) as Record<string, number>,
   total: 0,
   keyCounts: { ip: 0, ua: 0, uri: 0 },
 })
@@ -3859,7 +3863,7 @@ onUnmounted(() => {
    总最小宽收敛进典型容器宽（消除横向滚动条）的前提项 */
 .rules-table :deep(.el-table .cell) { padding: 0 6px; }
 .search-input { width: 280px; }
-.rules-pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
+/* .rules-pagination 已收敛 styles/main.css（四处逐字重复单源化） */
 .polling-error-alert { margin-bottom: 16px; }
 /* .polling-error-title/.polling-error-meta 已收敛 main.css（历史修复） */
 /* .mode-row 自管标签行族已全量退役（2026-10-11 用户裁定：对齐统一走原生

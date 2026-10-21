@@ -2,10 +2,14 @@ package acme
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -497,5 +501,50 @@ func TestLoadOrCreateAccountKey_metadataWriteFailureDoesNotBlockIssuance(t *test
 	}
 	if !loaded.Equal(created) {
 		t.Fatal("既有密钥路径返回了不同密钥（应复用已落盘账户密钥）")
+	}
+}
+
+// 历史问题：finalizedCerts 必须有上限且失败路径可显式清理——此前无界 map，
+// finalize 后的失败/取消路径留下的证书字节永不释放。
+func TestClient_finalizedCertsCappedFIFO(t *testing.T) {
+	client := &Client{}
+	for i := 0; i < maxFinalizedCerts+5; i++ {
+		client.rememberFinalizedCert(fmt.Sprintf("http://ca.test/cert/%d", i), [][]byte{{byte(i)}})
+	}
+	client.finalizedMu.Lock()
+	n := len(client.finalizedCerts)
+	_, oldestKept := client.finalizedCerts["http://ca.test/cert/5"]
+	_, evicted := client.finalizedCerts["http://ca.test/cert/0"]
+	client.finalizedMu.Unlock()
+	if n > maxFinalizedCerts {
+		t.Fatalf("finalizedCerts size=%d exceeds cap %d", n, maxFinalizedCerts)
+	}
+	if evicted || !oldestKept {
+		t.Fatalf("FIFO eviction wrong: cert/0 present=%v, cert/5 present=%v", evicted, oldestKept)
+	}
+}
+
+func TestClient_DiscardFinalizedCert_fallsBackToNetwork(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/pem-certificate-chain")
+		_, _ = w.Write([]byte("-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n"))
+	}))
+	defer server.Close()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate account key: %v", err)
+	}
+	client := &Client{
+		acme:           &acme.Client{Key: key, HTTPClient: server.Client()},
+		finalizedCerts: map[string][][]byte{server.URL + "/cert": {{1, 2, 3}}},
+	}
+	client.DiscardFinalizedCert(server.URL + "/cert")
+	if _, err := client.FetchCert(context.Background(), server.URL+"/cert"); err != nil {
+		t.Fatalf("fetch after discard: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests=%d, want 1（丢弃缓存后回退网络下载）", requests)
 	}
 }

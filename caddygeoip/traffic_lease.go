@@ -26,6 +26,10 @@ const (
 	// 大屏标签页数（个位数）。满时拒绝新键，既有键续租照常——绝不淘汰活跃租约
 	// （淘汰会让真实标签页静默失去采集）。
 	trafficLeasesMax = 64
+	// trafficLeaseSampleNMax 逐请求事件抽样因子上限：租约申请不限身份，
+	// sample_n 不设上限时任意身份可把事件流稀释到近似 0。收敛到 [0,8]——0 保留
+	// 「关闭逐请求事件」语义，8 与流量计数保险丝抽样上限同口径。
+	trafficLeaseSampleNMax uint32 = 8
 )
 
 // 租约申请失败原因（固定文案，可直接拼进 JSON error 字段）。
@@ -68,7 +72,10 @@ func acquireTrafficLease(id string, ttl time.Duration, sampleN uint32) error {
 	if ttl > trafficLeaseTTLMax {
 		ttl = trafficLeaseTTLMax
 	}
-	// sampleN=0 表示关闭逐请求事件（仍可保留聚合计数）。
+	// sampleN=0 表示关闭逐请求事件（仍可保留聚合计数）；越界收敛到上限。
+	if sampleN > trafficLeaseSampleNMax {
+		sampleN = trafficLeaseSampleNMax
+	}
 	trafficLeasesMu.Lock()
 	// 历史问题：条目上限只拦新键——续租既有键走原路径（否则满表会让真实
 	// 标签页的心跳失败而静默断采）。

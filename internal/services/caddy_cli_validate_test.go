@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -42,6 +43,46 @@ func TestExecCaddyValidate_classifiesSuccessRejectAndUnavailable(t *testing.T) {
 		err := execCaddyValidate([]byte(`{"apps":{}}`))
 		if !errors.Is(err, ErrCLIValidatorUnavailable) {
 			t.Fatalf("missing caddy error=%v, want ErrCLIValidatorUnavailable", err)
+		}
+	})
+
+	// 阻塞形态：exec 直到超时被杀必须归为「校验器不可用」，不得被误判成
+	// 「配置被拒」——前者调用方记日志放行（事务应用仍是最终门控），后者回滚
+	// 用户写入。用可控 shell 脚本 sleep 模拟，超时注入毫秒级。
+	t.Run("timeout is unavailable not rejected", func(t *testing.T) {
+		// exec 让 shell 被 sleep 替换：超时 kill 直接命中进程本身，不必等
+		// 子进程关闭继承的 stdout/stderr 管道（生产 caddy 不派生进程）。
+		writeScript("#!/bin/sh\nexec sleep 10\n")
+		// PATH 需同时含 caddy 桩（dir，优先）与系统命令（脚本内的 sleep）。
+		t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		prev := caddyCLIValidateTimeout
+		caddyCLIValidateTimeout = 200 * time.Millisecond
+		t.Cleanup(func() { caddyCLIValidateTimeout = prev })
+
+		err := execCaddyValidate([]byte(`{"apps":{}}`))
+		if !errors.Is(err, ErrCLIValidatorUnavailable) {
+			t.Fatalf("timeout error=%v, want ErrCLIValidatorUnavailable", err)
+		}
+		if err != nil && strings.Contains(err.Error(), "拒绝配置") {
+			t.Fatalf("timeout 被误分类为配置被拒: %v", err)
+		}
+	})
+
+	// 非零退出但输出为空：仍是「配置被拒」（退出码是唯一判据），error 不得
+	// 为空/不得 panic，也不得因空输出退化成校验器不可用。
+	t.Run("nonzero exit with empty output is rejected", func(t *testing.T) {
+		writeScript("#!/bin/sh\nexit 1\n")
+		t.Setenv("PATH", dir)
+
+		err := execCaddyValidate([]byte(`{"apps":{}}`))
+		if err == nil {
+			t.Fatal("nonzero exit must not be treated as success")
+		}
+		if errors.Is(err, ErrCLIValidatorUnavailable) {
+			t.Fatalf("nonzero exit misclassified as unavailable: %v", err)
+		}
+		if !strings.Contains(err.Error(), "拒绝配置") {
+			t.Fatalf("nonzero exit error=%v, want 拒绝配置", err)
 		}
 	})
 }

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"lazy-balancer-v2/internal/models"
@@ -196,6 +197,110 @@ func seedTLSCtxRule(t *testing.T, database *sql.DB, ruleID string, port int, ena
 	if enabledUpstream == 1 {
 		if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,enabled,protocol) VALUES (?, '127.0.0.1', 9000, 1, 'http')`, ruleID); err != nil {
 			t.Fatalf("seed TLS ctx upstream %s: %v", ruleID, err)
+		}
+	}
+}
+
+// countingQueryStore 包装 caddyConfigStore 统计 Query 次数（批量判定收敛度钉）。
+type countingQueryStore struct {
+	caddyConfigStore
+	queries *int
+}
+
+func (c countingQueryStore) Query(query string, args ...any) (*sql.Rows, error) {
+	*c.queries++
+	return c.caddyConfigStore.Query(query, args...)
+}
+
+// 预览的 TLS 就绪判据必须与全量渲染同口径：已禁用规则或全部上游被禁用的
+// 规则，即使带证书也不得在预览里展示 load_files（真实配置不会加载它）。
+func TestGenerateRuleServerContext_disabledOrUpstreamlessRuleHasNoTLSFiles(t *testing.T) {
+	useTemporaryCertDir(t)
+	_, database := newClusterTestService(t)
+	// 规则级 enabled=0（单条自带证书与启用上游）。
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enabled,enable_tls,tls_source,tls_cert,tls_key)
+		VALUES ('lb_ctx_disabled','disabled','http','disabled.example.test',7443,'weighted_round_robin','',0,1,'manual','cert','key')`); err != nil {
+		t.Fatalf("seed disabled rule: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,enabled,protocol) VALUES ('lb_ctx_disabled','127.0.0.1',9000,1,'http')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+	// 规则启用但全部上游禁用。
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enabled,enable_tls,tls_source,tls_cert,tls_key)
+		VALUES ('lb_ctx_noup','noup','http','noup.example.test',7444,'weighted_round_robin','',1,1,'manual','cert','key')`); err != nil {
+		t.Fatalf("seed upstreamless rule: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,enabled,protocol) VALUES ('lb_ctx_noup','127.0.0.1',9001,0,'http')`); err != nil {
+		t.Fatalf("seed disabled upstream: %v", err)
+	}
+
+	for _, tc := range []struct {
+		id, domain string
+		port       int
+	}{
+		{"lb_ctx_disabled", "disabled.example.test", 7443},
+		{"lb_ctx_noup", "noup.example.test", 7444},
+	} {
+		cfg := GenerateRuleServerContext(tc.id, tc.port, "http", tc.domain)
+		if _, hasTLS := cfg["apps"].(map[string]interface{})["tls"].(map[string]interface{}); hasTLS {
+			t.Fatalf("%s: 不可发布规则不得在预览里生成 tls.load_files", tc.id)
+		}
+	}
+}
+
+// ACME 可用性批量判定与单条路径同语义（SelectCertificate：域名匹配 + 有效期
+// + 可解析），并覆盖「未知规则/过期证书/域名不匹配」三种否定形态。
+func TestACMECertAvailabilityForRules_matchesSingleRuleSemantics(t *testing.T) {
+	_, database := newClusterTestService(t)
+	// SelectCertificate 要求证书与私钥成对可解析（X509KeyPair）——夹具必须是
+	// 真实配对的 cert+key，否则「有效证书」前提不成立。
+	validPEM, validKey := certificatePairForDomains(t, time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour), "example.com")
+	expiredPEM, expiredKey := certificatePairForDomains(t, time.Now().Add(-48*time.Hour), time.Now().Add(-time.Hour), "example.com")
+	otherPEM, otherKey := certificatePairForDomains(t, time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour), "other.example.com")
+	for _, row := range []struct {
+		id     int
+		ruleID string
+		domain string
+		pem    string
+		key    string
+	}{
+		{101, "lb_batch_ok", "example.com", validPEM, validKey},
+		{102, "lb_batch_expired", "example.com", expiredPEM, expiredKey},
+		{103, "lb_batch_mismatch", "other.example.com", otherPEM, otherKey},
+	} {
+		if _, err := database.Exec(`INSERT INTO cert_jobs (id,rule_id,domain,status,cert_pem,key_pem,updated_at) VALUES (?,?,?,'issued',?,?,datetime('now'))`, row.id, row.ruleID, row.domain, row.pem, row.key); err != nil {
+			t.Fatalf("seed cert job %s: %v", row.ruleID, err)
+		}
+	}
+
+	// 查询次数钉：批量判定对 N 条规则只发 1 条查询（预取候选），逐规则
+	// 版本是 O(N) 往返 + O(N) 次 PEM 解析。
+	queries := 0
+	counted := countingQueryStore{caddyConfigStore: database, queries: &queries}
+	got := acmeCertAvailabilityForRules(counted, map[string]string{
+		"lb_batch_ok":       "example.com",
+		"lb_batch_expired":  "example.com",
+		"lb_batch_mismatch": "example.com",
+		"lb_batch_missing":  "example.com",
+	})
+	if queries != 1 {
+		t.Fatalf("批量判定发了 %d 条查询，want 1", queries)
+	}
+	if !got["lb_batch_ok"] {
+		t.Fatalf("valid cert must be available: %+v", got)
+	}
+	for _, id := range []string{"lb_batch_expired", "lb_batch_mismatch", "lb_batch_missing"} {
+		if got[id] {
+			t.Fatalf("%s must not be available: %+v", id, got)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("批量判定只应包含可用规则，got=%+v", got)
+	}
+	// 与单条路径逐条对齐（单一谓词语义）。
+	for ruleID, domain := range map[string]string{"lb_batch_ok": "example.com", "lb_batch_expired": "example.com", "lb_batch_mismatch": "example.com"} {
+		if single := isACMECertIssuedFromStore(database, ruleID, domain); single != got[ruleID] {
+			t.Fatalf("%s batch=%v single=%v（批量与单条判定必须一致）", ruleID, got[ruleID], single)
 		}
 	}
 }

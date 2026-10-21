@@ -284,3 +284,35 @@ func TestFastFile_ReadSizeCap(t *testing.T) {
 		t.Fatalf("exact-cap file must pass the size gate and fail on content (magic), got: %v", err)
 	}
 }
+
+// 读侧族校验必须与写侧同口径：v6 段出现 4-in-6 映射地址（::ffff:1.2.3.4）
+// 是跨进程输入的族错配形态——16 字节地址、bits 合法、掩码/升序/不相交全部
+// 通过，但该前缀永远匹配不到纯 IPv6 查询（也不会被 v4 段命中），即静默漏拦。
+func TestFastFile_4in6InV6SectionRejected(t *testing.T) {
+	dir := t.TempDir()
+
+	mapped := netip.MustParseAddr("::ffff:1.2.3.4").As16()
+	path := filepath.Join(dir, "mapped-v6.fast")
+	data := make([]byte, 0, 16+17)
+	data = append(data, []byte(fastFileMagic)...)
+	data = append(data, 0, 0, 0, 0) // v4_count=0
+	data = append(data, 0, 0, 0, 1) // v6_count=1
+	data = append(data, 0, 0, 0, 0) // 保留 4 字节
+	data = append(data, mapped[:]...)
+	data = append(data, 128)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFastFile(path); err == nil || !strings.Contains(err.Error(), "4-in-6") {
+		t.Fatalf("4-in-6 v6 entry must be rejected with a family error, got: %v", err)
+	}
+
+	// 反例：纯 v6 段照常加载（族校验不得误伤正常产物）。
+	okPath := filepath.Join(dir, "pure-v6.fast")
+	if err := WriteFastFile(okPath, nil, []netip.Prefix{netip.MustParsePrefix("2001:db8::/32")}); err != nil {
+		t.Fatalf("WriteFastFile: %v", err)
+	}
+	if _, err := ReadFastFile(okPath); err != nil {
+		t.Fatalf("pure v6 entries must load, got: %v", err)
+	}
+}

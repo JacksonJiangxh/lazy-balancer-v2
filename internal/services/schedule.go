@@ -196,6 +196,13 @@ func logScheduleReadRecovered(key string) {
 	}
 }
 
+// LogConfigReadFailure / LogConfigReadRecovered 排程/配置读失败留痕的包外
+// 入口（历史问题：与 logScheduleReadFailure 同一状态机单源）——handlers
+// 侧配置直读（如日志统计阈值读取）复用；文案以 key 区分配置项，禁止另造
+// 静默或每轮刷屏的平行实现。
+func LogConfigReadFailure(key string, err error) { logScheduleReadFailure(key, err) }
+func LogConfigReadRecovered(key string)          { logScheduleReadRecovered(key) }
+
 // versionTableNextUpdate 读版本表当前排程槽（空串=未排程）——历史修复 同批，
 // 引擎 NextSlotFn 的 DB 直读数据源（不经管理器实例）。
 func versionTableNextUpdate(table string) string {
@@ -285,7 +292,14 @@ func earliestEnabledSourceUpdate(sourceTable string) string {
 		return ""
 	}
 	var next string
-	if err := db.DB.QueryRow(`SELECT MIN(COALESCE(NULLIF(next_update,''), '9999')) FROM ` + sourceTable + ` WHERE update_enabled=1`).Scan(&next); err != nil || next == "9999" {
+	// 历史问题：读失败不得静默归零（引擎按零槽停摆）——接 logScheduleReadFailure
+	// 单源首报留痕，恢复补 info；next=="9999" 是「无启用源排程」正常形态非错误。
+	if err := db.DB.QueryRow(`SELECT MIN(COALESCE(NULLIF(next_update,''), '9999')) FROM ` + sourceTable + ` WHERE update_enabled=1`).Scan(&next); err != nil {
+		logScheduleReadFailure("schedule-earliest-"+sourceTable, err)
+		return ""
+	}
+	logScheduleReadRecovered("schedule-earliest-" + sourceTable)
+	if next == "9999" {
 		return ""
 	}
 	return next

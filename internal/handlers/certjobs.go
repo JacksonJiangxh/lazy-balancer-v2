@@ -111,16 +111,13 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 		return
 	}
 	statusRows.Close()
-	var expiryDays int
 	// 历史修复（历史）：字面量 30 → db.DefaultCertExpiryDays 绑定参数（caddy.go
 	// 历史修复 形态，库值唯一真相单源）。
-	if err := db.DB.QueryRow("SELECT COALESCE(cert_expiry_days,?) FROM global_config WHERE id=1", db.DefaultCertExpiryDays).Scan(&expiryDays); err != nil {
-		// 历史问题（2026-09-05 证书域审计裁定）：展示阈值的读取失败不得放大为整个
-		// 任务列表 500——降级治理默认并告警，对齐 历史问题 的
-		// checkManualCertExpiration 口径。
-		services.Logf("error", "ListCertJobs: read cert_expiry_days failed, using default %d: %v", db.DefaultCertExpiryDays, err)
-		expiryDays = db.DefaultCertExpiryDays
-	}
+	// 审计项：过期判定阈值改用 services.GetCertExpiryThreshold 单源边界面——
+	// 本处曾裸读 COALESCE 且不做 1-365 边界校验，库值越界（带外直写/旧快照）
+	// 会让列表「即将过期」标记与续签扫描口径分叉；单源 helper 越界时显性留痕
+	// 并降级治理默认。
+	expiryDays := services.GetCertExpiryThreshold()
 	// 历史问题(历史):cert_pem 只取首证书块——certificateIssuer 仅
 	// 解析首块,全链(LE ~6KB)全量传输纯属浪费;INSTR 定位首个 END 边界,
 	// 空串/单块形态 SUBSTR 原样返回(与全量读取行为一致)。

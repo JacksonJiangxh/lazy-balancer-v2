@@ -12,8 +12,8 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync, readdirSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { readdirSync } from 'node:fs'
+import { join, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
@@ -32,6 +32,7 @@ import {
 import { ADMIN1_PROVINCES } from '../src/utils/admin1Provinces.ts'
 import { CHINA_PROVINCES } from '../src/utils/chinaProvinces.ts'
 import { WORLD_COUNTRIES } from '../src/utils/worldBorders.ts'
+import { source } from './_helpers.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
@@ -138,8 +139,7 @@ test('④c 已退役取景辅助零生产消费方（fitDrillZoom / zoomAt）', 
       const full = join(dir, entry.name)
       if (entry.isDirectory()) { walk(full); continue }
       if (!/\.(ts|vue)$/.test(entry.name)) continue
-      const text = readFileSync(full, 'utf8')
-      if (/\b(fitDrillZoom|zoomAt)\b/.test(text)) offenders.push(full)
+      if (/\b(fitDrillZoom|zoomAt)\b/.test(source(relative(ROOT, full)))) offenders.push(full)
     }
   }
   walk(srcDir)
@@ -242,8 +242,8 @@ test('⑥b地球拾取：射线背向球面/未命中返回 null（历史修复�
 })
 
 test('⑦地图/地球引擎修复契约', () => {
-  const mapSrc = readFileSync(join(ROOT, 'src/utils/threatScene.ts'), 'utf8')
-  const globeSrc = readFileSync(join(ROOT, 'src/utils/threatGlobe.ts'), 'utf8')
+  const mapSrc = source('src/utils/threatScene.ts')
+  const globeSrc = source('src/utils/threatGlobe.ts')
   assert.match(mapSrc, /POINTY_TOP_HEX_VERTICES/, '地图点阵必须消费六边形顶点，而非圆弧')
   assert.doesNotMatch(mapSrc, /path\.arc\(x, y, r|ctx2\.arc\(x, y, r/)
   assert.match(mapSrc, /drillCountryAllowed\(opts\?\.drillCountries, country\)/, '地图必须执行下钻白名单')
@@ -377,7 +377,7 @@ test('③省板包含：10 国省级 bbox ⊆ 国家 bbox ±18°（拦截生成/
     ['src/utils/admin1Provinces.ts', /export const ADMIN1_PROVINCES: Record<string, Admin1Province\[\]> = \{/],
     ['src/utils/chinaProvinces.ts', /export const CHINA_PROVINCES: ChinaProvince\[\] = \[/],
   ] as const) {
-    const src = readFileSync(join(ROOT, relative), 'utf8')
+    const src = source(relative)
     assert.match(src, exportPattern, `${relative} 必须导出静态字面量`)
     assert.doesNotMatch(src, /\bfetch\(|XMLHttpRequest/, `${relative} 不得运行时抓取数据`)
   }
@@ -391,7 +391,7 @@ test('⑤反日界线 unwrap：俄罗斯主环 bbox 不再跨全宽', () => {
   assert.ok(span < 180, `俄罗斯主环 bbox span ${span.toFixed(1)}° 仍≈全宽（unwrap 失效）`)
 })
 test('2D 光流池满时拒绝新弧线，不淘汰已开始动画', () => {
-  const src = readFileSync(join(ROOT, 'src/utils/threatScene.ts'), 'utf8')
+  const src = source('src/utils/threatScene.ts')
   const start = src.indexOf('function spawnArc(')
   const end = src.indexOf('function spawnRipple(', start)
   assert.ok(start >= 0 && end > start, 'spawnArc 缺失')

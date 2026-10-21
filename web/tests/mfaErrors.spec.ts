@@ -7,7 +7,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { isMfaCredentialRejection } from '../src/utils/mfaErrors.ts'
-import { section, source } from './_helpers.ts'
+import { MFA_SCOPE_GROUPS } from '../src/utils/mfaScopeGroups.ts'
+import { source } from './_helpers.ts'
 
 const SESSION_EXPIRED = '未登录或登录已过期'
 
@@ -41,13 +42,11 @@ test('非 MFA 端点与其它状态码一律不豁免', () => {
 // 历史修复：写操作验证「支持的操作」清单必须与后端 mfaStepUpGuard 的拦截面同源。
 // 任务监控操作 / 节点服务控制 / 站点坐标 / 指纹补救 / 自动封禁 / 爬虫库 / IP 名单 /
 // DNS 凭证连通性测试 等族曾被漏列——用户对这些写操作被要求验码会感到意外（守卫
-// 仍生效，不构成绕过）。清单按真实声明求值，形态变化会显性抛错。
+// 仍生效，不构成绕过）。清单单源在 utils/mfaScopeGroups，测试直接 import。
 test('WS-05：MFA「支持的操作」清单覆盖 middleware 各写端点族', () => {
   const page = source('src/views/settings/BasicSettings.vue')
-  const block = section(page, 'const mfaScopeGroups = [', '\n]\n')
-  // 结束符不含 `]`——补回后求值
-  const groups = new Function(`return ${block.replace('const mfaScopeGroups =', '')}]`)() as { title: string; items: string[] }[]
-  const flat = groups.map((g) => `${g.title}｜${g.items.join('、')}`).join('\n')
+  assert.match(page, /v-for="group in MFA_SCOPE_GROUPS"/, '弹框必须直接渲染单源清单')
+  const flat = MFA_SCOPE_GROUPS.map((g) => `${g.title}｜${g.items.join('、')}`).join('\n')
   for (const anchor of ['任务监控 运行', '服务控制', '节点站点坐标', '指纹钉', '自动封禁', '爬虫库', 'IP 名单', 'DNS 凭证连通性测试']) {
     assert.ok(flat.includes(anchor), `MFA 清单缺「${anchor}」——用户对这些写操作会被要求验码`)
   }

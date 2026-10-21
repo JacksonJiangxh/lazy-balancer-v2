@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -218,34 +219,25 @@ func createAPIKeyForUser(c *gin.Context, userID int) {
 	// 开启且创建者为启用 MFA 的 JWT 用户时，特权 Key 创建按 mfaStepUpGuard 同
 	// 语义要求 60 秒内 MFA 验证（428 → 全局弹码 → 携新 JWT 重试）；API Key
 	// 机器身份豁免（与路由级守卫一致），未启用 MFA 直通。
-	// 历史修复（历史）：下方内联检查与 middleware mfaStepUpGuard 同构——
-	// 历史问题 为路由补前置守卫后，守卫开启时本层通常已被前置放行/拦截，保留
-	// 仅作纵深防御（历史问题 前守卫独扛时代的产物）。
+	// 判定单源：与 mfaStepUpGuard 共用 DecideMFAStepUp——OIDC 会话短路、只读
+	// 语义豁免等条件只有一份，不再各自漂移；本层仅保留「特权授予」覆盖面语义
+	// 与 fail-closed 口径（守卫按 SA1 裁定 fail-open）。
 	if !req.ReadOnly || req.MCPEnabled {
-		if c.GetString("auth_type") == "jwt" {
-			guardEnabled, guardErr := services.MFAWriteGuardEnabled()
-			if guardErr != nil {
-				// 历史问题：开关读取失败 fail-closed（与相邻 MFA 状态查询同口径，
-				// 历史问题）——特权 Key 创建不能因「读不到开关」静默跳过第二因子。
+		decision, derr := DecideMFAStepUp(c, true, services.MFAUserEnabled)
+		if derr != nil {
+			if errors.Is(derr, ErrMFAStepUpGuardUnreadable) {
 				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 写操作验证开关读取失败"})
 				return
 			}
-			if guardEnabled {
-				var mfaEnabled bool
-				if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", userID).Scan(&mfaEnabled); err != nil {
-					// 与 mfaStepUpGuard 同口径：MFA 状态查询失败 fail-closed（历史问题）。
-					c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 状态查询失败"})
-					return
-				}
-				if mfaEnabled {
-					mfaTs := c.GetFloat64("mfa_ts")
-					if elapsed := time.Since(time.Unix(int64(mfaTs), 0)); mfaTs > 0 && elapsed < 60*time.Second {
-						c.Header("X-Mfa-Verified-Seconds-Ago", strconv.FormatInt(int64(elapsed.Seconds()), 10))
-					} else {
-						c.JSON(http.StatusPreconditionRequired, gin.H{"code": 428, "message": "MFA_STEP_UP_REQUIRED", "detail": "此操作需要 MFA 验证"})
-						return
-					}
-				}
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 状态查询失败"})
+			return
+		}
+		if decision.Applies {
+			if decision.Verified {
+				c.Header("X-Mfa-Verified-Seconds-Ago", strconv.FormatInt(decision.SecondsAgo, 10))
+			} else {
+				c.JSON(http.StatusPreconditionRequired, gin.H{"code": 428, "message": "MFA_STEP_UP_REQUIRED", "detail": "此操作需要 MFA 验证"})
+				return
 			}
 		}
 	}

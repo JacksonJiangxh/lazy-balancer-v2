@@ -17,8 +17,9 @@ package caddygeoip
 //     已移出请求路径——快照是 headers map 深拷贝+不可变字符串持有的 memcpy 级
 //     开销，防 tx.Close 归还 sync.Pool 后的 live 引用污染），专职 drain goroutine
 //     用注册 formatter 格式化、限时等待计时终态、注入 lb_timing、bufio 批量刷盘
-//     （阈值/周期双触发）。入队阻塞式（零丢弃；队列满时请求路径阻塞等 drain
-//     消化，退化价=退役前 serial 同步写）。管线是**进程级单例**：同一 target
+//     （阈值/周期双触发）。入队有界：队列空位直接入队，满时最多等待
+//     auditEnqueueTimeout，超时丢弃该条并计数告警（不把请求路径无限期拖住）。
+//     管线是**进程级单例**：同一 target
 //     的 fd/drain goroutine 进程内只建一次，不随 reload 重建、也不回收（见
 //     acquireAuditPipeline）；写路径因此恒有活 drain 消费，不存在「管线已关」
 //     的同步回退分支——上游从不调 AuditLogWriter.Close（见 FlushAuditPipelines）。
@@ -75,6 +76,7 @@ func init() {
 	// 计时注册表清扫参数默认值（atomic 存储，见下方 var 块说明）。
 	auditTimingEntryTTLNs.Store(int64(30 * time.Second))
 	auditTimingSweepIntervalNs.Store(int64(10 * time.Second))
+	auditPreRetentionTTLNs.Store(int64(10 * time.Minute))
 	plugins.RegisterAuditLogWriter(auditWriterName, func() plugintypes.AuditLogWriter {
 		return &lbAuditWriter{}
 	})
@@ -83,12 +85,16 @@ func init() {
 // 管线参数（var 供测试收窄）。
 var (
 	// auditQueueSize 有界队列容量：2048 条 × 典型 2-8KB；part C/E 另由快照侧
-	// 64KiB 硬限。打满即请求路径阻塞（零丢弃的退化价，与退役前 serial 同步写同价）。
+	// 64KiB 硬限。打满后入队有界等待，超时丢弃并计数告警。
 	auditQueueSize = 2048
 	// auditFlushThreshold bufio 批量刷盘字节数阈值；auditFlushInterval 周期
 	// 兜底（低流量下 bufio 滞留行不超周期）。
 	auditFlushThreshold = 32 * 1024
 	auditFlushInterval  = 500 * time.Millisecond
+	// auditEnqueueTimeout 入队有界等待上限：队列满时请求路径最多等待这么久，
+	// 超时丢弃该条并计数告警——drain 沉陷时不再把请求路径无限期拖住（旧设计
+	// 阻塞式零丢弃，退化价=退役前 serial 同步写，且无背压阀时请求堆积）。
+	auditEnqueueTimeout = 2 * time.Second
 	// auditTimingWaitLimit drain 对「条目在场但未终态」分段的限时等待：正常形态
 	// （blocked_counter 是链最外层收点，紧随 coraza 中间件 defer）等待 <1ms；
 	// 上限仅兜底异常形态（计时写点缺失），超时按已到场分段注入。未知 tid
@@ -111,6 +117,30 @@ var (
 	// 由建条驱动（每 64 次建条一次），停流后过期条目永久驻留；后台 sweeper 按
 	// 本周期兜底回收，零流量下注册表同样收敛。atomic 存储原因同上。
 	auditTimingSweepIntervalNs atomic.Int64
+	// auditPreRetentionTTLNs 是预检段（pre）在条目被 TTL 清扫后的独立保留期：
+	// 长请求（慢上游/流式下载/大响应体）生命周期可远超条目 TTL，旧实现整条
+	// 丢弃 → 终态迟到时 pre 永久缺失（审计行 pre_us 显示「—」，WAF 段还退化为
+	// 全链耗时）。只保留 pre：它是链入口分段且体积恒定，跨 TTL 保留成本可控。
+	auditPreRetentionTTLNs atomic.Int64
+	// auditRetainedPreMaxEntries 是预检保留区硬上限：满则放弃保留（该请求
+	// pre 缺失，静默降级），既有条目照常到期回收——第二张表不得无界。
+	auditRetainedPreMaxEntries = 8192
+)
+
+// auditRetainedPreEntry 是条目过期后仍要保留的预检分段（键=计时 ID，
+// 进程内唯一，created=转入保留区的时刻）。
+type auditRetainedPreEntry struct {
+	id      string
+	preUs   int64
+	created time.Time
+}
+
+var (
+	// auditRetainedPreEntries/Order/Head 镜像主注册表的 FIFO 清扫模型
+	// （调用方持 auditTimingMu）。
+	auditRetainedPreEntries = map[string]auditRetainedPreEntry{}
+	auditRetainedPreOrder   []auditRetainedPreEntry
+	auditRetainedPreHead    int
 )
 
 // —— per-request 计时注册表 ——
@@ -190,6 +220,10 @@ func auditTimingRecord(id, segment string, us int64) {
 			return
 		}
 		e = &auditTimingEntry{created: now}
+		// 终态迟到（条目已被 TTL 清扫）时回填预检保留区里的 pre 段。
+		if preUs, ok := auditRetainedPreLookupLocked(id); ok {
+			e.preUs, e.preSet = preUs, true
+		}
 		auditTimingEntries[id] = e
 		auditTimingOrder = append(auditTimingOrder, auditTimingQueueEntry{id: id, created: now})
 		auditTimingSweepIfDueLocked(now)
@@ -280,15 +314,68 @@ func auditTimingSweepLocked(now time.Time) {
 			// 否则后续 close 查表必 miss，等待方只能逐行轮询到超时。
 			e.mu.Lock()
 			e.closed = true
+			preUs, preSet := e.preUs, e.preSet
 			e.mu.Unlock()
+			// 长请求跨 TTL：pre 是链入口分段，转入独立保留区等待终态迟到时
+			// 回填（整条丢弃会让审计行 pre_us 永久「—」）。
+			if preSet {
+				auditRetainPreLocked(item.id, preUs, now)
+			}
 			delete(auditTimingEntries, item.id)
 		}
 		auditTimingHead++
 	}
+	// 保留区自身按保留期回收（与主表同一次清扫，无独立 goroutine）。
+	auditRetainedPreExpireLocked(now)
 	// 已弹出前缀达到半量时压缩，避免 backing array 无界增长（摊销 O(1)）。
 	if auditTimingHead >= 1024 && auditTimingHead*2 >= len(auditTimingOrder) {
 		auditTimingOrder = append(auditTimingOrder[:0], auditTimingOrder[auditTimingHead:]...)
 		auditTimingHead = 0
+	}
+}
+
+// auditRetainPreLocked 把条目过期前的预检分段转入保留区（调用方持
+// auditTimingMu）。满员时放弃本次保留：预检段是增强信息，不值得为它引入
+// 淘汰抖动或阻塞热路径。
+func auditRetainPreLocked(id string, preUs int64, now time.Time) {
+	if id == "" {
+		return
+	}
+	if _, exists := auditRetainedPreEntries[id]; !exists && len(auditRetainedPreEntries) >= auditRetainedPreMaxEntries {
+		return
+	}
+	entry := auditRetainedPreEntry{id: id, preUs: preUs, created: now}
+	auditRetainedPreEntries[id] = entry
+	auditRetainedPreOrder = append(auditRetainedPreOrder, entry)
+}
+
+// auditRetainedPreLookupLocked 读保留区里的预检分段（调用方持 auditTimingMu）。
+func auditRetainedPreLookupLocked(id string) (int64, bool) {
+	entry, ok := auditRetainedPreEntries[id]
+	if !ok {
+		return 0, false
+	}
+	return entry.preUs, true
+}
+
+// auditRetainedPreExpireLocked 按保留期从队首弹出保留区条目（调用方持
+// auditTimingMu）。FIFO 的 created 单调不减（转入时刻递增），队首未过期即
+// 整队未过期。
+func auditRetainedPreExpireLocked(now time.Time) {
+	ttl := time.Duration(auditPreRetentionTTLNs.Load())
+	for auditRetainedPreHead < len(auditRetainedPreOrder) {
+		item := auditRetainedPreOrder[auditRetainedPreHead]
+		if now.Sub(item.created) <= ttl {
+			break
+		}
+		if current, ok := auditRetainedPreEntries[item.id]; ok && current.created.Equal(item.created) {
+			delete(auditRetainedPreEntries, item.id)
+		}
+		auditRetainedPreHead++
+	}
+	if auditRetainedPreHead >= 1024 && auditRetainedPreHead*2 >= len(auditRetainedPreOrder) {
+		auditRetainedPreOrder = append(auditRetainedPreOrder[:0], auditRetainedPreOrder[auditRetainedPreHead:]...)
+		auditRetainedPreHead = 0
 	}
 }
 
@@ -298,24 +385,35 @@ func auditTimingSweepLocked(now time.Time) {
 // 缺段省略）。id 为空（无 timing 头的审计行）或首轮查表无条目（未知 tid）立即
 // 返回空快照。
 //
-// 历史修复（历史）：未知 tid 首轮即返，不轮询到超时。「条目暂未创建」的唯一
-// 合法窗口是同一请求 goroutine 内 Write（coraza defer ProcessLogging）→
-// blocked_counter 收点置位终态之间的微秒级间隙，而 drain 侧先格式化（整行
-// json.Marshal）再查表，恒晚于该间隙——首轮未命中只可能是陈旧行（队列积压超
-// TTL，条目已被清扫）或写点缺失的异常行，分段数据永不到场。旧行为对未知 tid
-// 轮询满超时：单 drain goroutine × 逐行满等 2s × 入队阻塞式零丢弃（无背压阀）
-// = 积压行批量到场时 drain 沉陷、请求路径被拖住。代价：预检拦行的终态由
-// blocked_counter post-next 在 Write 后微秒级补写，首轮恰落在该间隙内的行
-// （drain 抢先完成格式化的极小竞态窗）不注入 lb_timing——耗时是增强信息，
-// 展示层报「—」，可接受。
+// 历史修复（历史）：未知 tid 首轮即返，不轮询到超时。drain 在**另一个
+// goroutine**里先格式化（整行 json.Marshal）再查表，与请求 goroutine 内
+// 「Write（coraza defer ProcessLogging）→ blocked_counter 收点写终态」之间
+// 没有因果序保证，只剩一个微秒级竞态窗（drain 抢先完成格式化并发起查表时，
+// 终态可能尚未写入——此时首轮未命中，本行不注入 lb_timing）。其余首轮未命中
+// 的来源：条目已被 TTL 清扫（现在 pre 转入保留区，见 auditPreRetentionTTLNs）
+// 或计时写点缺失的异常行。旧行为对未知 tid 轮询满超时：单 drain goroutine ×
+// 逐行满等 2s（入队当时无背压阀）= 积压行批量到场时 drain 沉陷；现入队已有
+// 2s 有界等待 + 超时丢弃计数（auditEnqueueTimeout），仍不让 drain 为未知 tid
+// 满等。代价：竞态窗内的行缺耗时——耗时是增强信息，展示层报「—」，可接受。
 func auditTimingWait(id string, timeout time.Duration) auditTimingSnapshot {
 	if id == "" {
 		return auditTimingSnapshot{}
 	}
 	auditTimingMu.Lock()
 	e := auditTimingEntries[id]
+	var retained *auditTimingSnapshot
+	if e == nil {
+		// 长请求的条目已被 TTL 清扫、终态尚未写入：保留区里的 pre 仍有效，
+		// 按「已到场分段」返回（否则整条 lb_timing 缺失）。
+		if preUs, ok := auditRetainedPreLookupLocked(id); ok {
+			retained = &auditTimingSnapshot{preUs: preUs, preSet: true, closed: true}
+		}
+	}
 	auditTimingMu.Unlock()
 	if e == nil {
+		if retained != nil {
+			return *retained
+		}
 		return auditTimingSnapshot{}
 	}
 	deadline := time.Now().Add(timeout)
@@ -909,6 +1007,12 @@ type auditPipeline struct {
 	ioMu sync.Mutex
 	fd   *os.File
 	bw   *bufio.Writer
+	// dropped 是入队超时丢弃的审计行累计计数（进程级管线全生命周期）。
+	dropped atomic.Uint64
+	// dropLogMu 保护丢弃告警节流状态（请求路径并发入队可见）。
+	dropLogMu    sync.Mutex
+	lastDropLog  time.Time
+	dropLogCount int
 	// ioErrMu 保护 IO 错误节流状态（drain 与其关闭路径并发可见）。
 	ioErrMu      sync.Mutex
 	lastIOErrLog time.Time
@@ -918,6 +1022,11 @@ type auditPipeline struct {
 // auditIOLogf 审计落盘错误日志缝（测试注入；缺省 caddy.Log）。
 var auditIOLogf = func(format string, args ...any) {
 	caddy.Log().Named("auditwriter").Sugar().Errorf(format, args...)
+}
+
+// auditDropLogf 审计行丢弃/消费异常告警日志缝（测试注入；缺省 caddy.Log）。
+var auditDropLogf = func(format string, args ...any) {
+	caddy.Log().Named("auditwriter").Sugar().Warnf(format, args...)
 }
 
 // reportIOError 记录落盘 IO 错误（历史问题）：首次立即记录，其后每分钟至多
@@ -1046,16 +1155,49 @@ func (p *auditPipeline) openFile(mode os.FileMode) error {
 	return nil
 }
 
-// enqueue 阻塞式入队（零丢弃）：队列满时等待 drain 消化——退化价=退役前
-// serial 同步写。queue 创建后只读且永不关闭（进程级单例，见
+// enqueue 有界入队：空位直接入队；队列满时最多等待 auditEnqueueTimeout，
+// 超时丢弃该条、累计 dropped 并按分钟节流告警——请求路径不再被 drain 沉陷
+// 无限期拖住。queue 创建后只读且永不关闭（进程级单例，见
 // acquireAuditPipeline），因此发送无需锁、也不存在竞态。
 func (p *auditPipeline) enqueue(item lbAuditItem) error {
-	p.queue <- item
-	return nil
+	select {
+	case p.queue <- item:
+		return nil
+	default:
+	}
+	timer := time.NewTimer(auditEnqueueTimeout)
+	defer timer.Stop()
+	select {
+	case p.queue <- item:
+		return nil
+	case <-timer.C:
+		p.reportDropped()
+		return nil
+	}
+}
+
+// reportDropped 累计丢弃计数并节流告警（首次立即记录，其后每分钟至多一条，
+// 携带被抑制计数与累计总数）——丢弃必须是可观测事件。
+func (p *auditPipeline) reportDropped() {
+	total := p.dropped.Add(1)
+	p.dropLogMu.Lock()
+	now := time.Now()
+	p.dropLogCount++
+	suppressed := p.dropLogCount - 1
+	logNow := p.lastDropLog.IsZero() || now.Sub(p.lastDropLog) >= time.Minute
+	if logNow {
+		p.lastDropLog = now
+		p.dropLogCount = 0
+	}
+	p.dropLogMu.Unlock()
+	if logNow {
+		auditDropLogf("audit writer: queue full for %s, dropped audit line (total dropped %d, suppressed %d since last report)", p.target, total, suppressed)
+	}
 }
 
 // drain 专职落盘 goroutine：注入 timing → bufio 批量写 → 阈值/周期双触发刷盘。
-// 队列关闭后排空余量再退出、刷盘、关 fd（零丢弃语义覆盖队列收尾）。
+// 队列关闭后排空余量再退出、刷盘、关 fd。单条处理/刷盘的 panic 均被隔离：
+// drain 是进程级单例消费者，goroutine 一旦退出写侧将再无消费者。
 func (p *auditPipeline) drain() {
 	defer close(p.done)
 	q := p.queue
@@ -1065,15 +1207,36 @@ func (p *auditPipeline) drain() {
 		select {
 		case item, ok := <-q:
 			if !ok {
-				p.flushPending()
+				p.flushPendingSafely()
 				p.closeFile()
 				return
 			}
-			p.process(item)
+			p.processSafely(item)
 		case <-ticker.C:
-			p.flushPending()
+			p.flushPendingSafely()
 		}
 	}
+}
+
+// processSafely 隔离单条审计行处理的 panic（formatter/快照实现异常）：
+// recover 后继续消费后续条目，不终止 drain。
+func (p *auditPipeline) processSafely(item lbAuditItem) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			auditDropLogf("audit writer: recovered panic while processing audit line for %s: %v", p.target, recovered)
+		}
+	}()
+	p.process(item)
+}
+
+// flushPendingSafely 隔离周期刷盘的 panic（fd/bufio 异常形态），drain 继续。
+func (p *auditPipeline) flushPendingSafely() {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			auditDropLogf("audit writer: recovered panic while flushing %s: %v", p.target, recovered)
+		}
+	}()
+	p.flushPending()
 }
 
 // process 处理单条审计行：注册 formatter 格式化快照（请求路径之外）→ 限时等待

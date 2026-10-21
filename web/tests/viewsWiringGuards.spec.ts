@@ -170,10 +170,13 @@ test('威胁地图 canvas 注册/注销 pointerleave 清理悬停态', () => {
   assert.match(section(text, 'function onPointerLeave', '\n  }'), /hoverName = null/, '离开画布必须复位悬停名')
 })
 
-test('悬停高亮 Path2D 按 hover+相机键缓存（不再每帧重建）', () => {
+test('悬停高亮路径按世界坐标缓存（不再随相机逐帧重建）', () => {
   const text = source('src/utils/threatScene.ts')
-  assert.match(text, /HoverCache|hoverPathCache/)
-  assert.match(section(text, 'function drawHoverHighlight', '// ---- 主循环 ----'), /Cache\.key !== key|cache\.key !== key/i)
+  const body = section(text, 'function drawHoverHighlight', '// ---- 主循环 ----')
+  assert.match(body, /ensureWorldDotPaths\(\)/, '悬停必须复用按国世界路径缓存')
+  assert.doesNotMatch(body, /new Path2D\(/, '悬停绘制不得逐帧重建 Path2D')
+  const cache = section(text, 'function ensureWorldDotPaths', '// ---- 静态层 ----')
+  assert.match(cache, /if \(worldDotPathByKey\) return worldDotPathByKey/, '世界路径必须构建一次后复用')
 })
 
 test('指标采集失败时规则表空态报「采集失败」', () => {

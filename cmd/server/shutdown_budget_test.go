@@ -10,6 +10,7 @@ package main
 import (
 	"log"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,17 +21,40 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
-// composeStopGracePeriod 与 docker-compose.yml 的 stop_grace_period 同值
-// （main 包不读 compose 文件；此常量仅作测试口径，改 compose 须同步）。
-const composeStopGracePeriod = 30 * time.Second
+// composeStopGracePeriod 直读 docker-compose.yml 的 stop_grace_period（单一
+// 数据源——历史问题：此前测试硬编码 30s 常量与 compose 双写易漂移）。取全部
+// 服务的最小值（任一服务 grace 收紧都必须反映到预算校验）。
+func composeStopGracePeriod(t *testing.T) time.Duration {
+	t.Helper()
+	data, err := os.ReadFile("../../docker-compose.yml")
+	if err != nil {
+		t.Fatalf("read docker-compose.yml: %v", err)
+	}
+	matches := regexp.MustCompile(`(?m)^\s*stop_grace_period:\s*(\S+)\s*$`).FindAllStringSubmatch(string(data), -1)
+	if len(matches) == 0 {
+		t.Fatal("docker-compose.yml 未声明 stop_grace_period")
+	}
+	grace := time.Duration(0)
+	for _, m := range matches {
+		d, err := time.ParseDuration(m[1])
+		if err != nil {
+			t.Fatalf("parse stop_grace_period %q: %v", m[1], err)
+		}
+		if grace == 0 || d < grace {
+			grace = d
+		}
+	}
+	return grace
+}
 
 // Given 关停预算（fake clock）。
 // When 按真实顺序消耗各段（HTTP → Caddy 排水 → 引擎排空 → metrics/时区/
 // 日志轮转等待 → ACME 收尾）。
 // Then 各段钳制正确、总和 ≤ processShutdownBudget（且 < compose grace）。
 func TestShutdownBudgetWorstCaseFitsComposeGrace(t *testing.T) {
-	if processShutdownBudget >= composeStopGracePeriod {
-		t.Fatalf("关停总预算 %s 必须小于 compose stop_grace_period %s", processShutdownBudget, composeStopGracePeriod)
+	composeGrace := composeStopGracePeriod(t)
+	if processShutdownBudget >= composeGrace {
+		t.Fatalf("关停总预算 %s 必须小于 compose stop_grace_period %s", processShutdownBudget, composeGrace)
 	}
 	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
 	b := &shutdownBudget{now: func() time.Time { return now }}
@@ -77,8 +101,8 @@ func TestShutdownBudgetWorstCaseFitsComposeGrace(t *testing.T) {
 	if total > processShutdownBudget {
 		t.Fatalf("最坏路径总和 %s 超出总预算 %s", total, processShutdownBudget)
 	}
-	if total >= composeStopGracePeriod {
-		t.Fatalf("最坏路径总和 %s 不得达到 compose grace %s（须留退出余量）", total, composeStopGracePeriod)
+	if total >= composeGrace {
+		t.Fatalf("最坏路径总和 %s 不得达到 compose grace %s（须留退出余量）", total, composeGrace)
 	}
 
 	// 预算耗尽：各段归零，引擎排空不得回落引擎默认 30s（0 会被引擎当作未指定）。

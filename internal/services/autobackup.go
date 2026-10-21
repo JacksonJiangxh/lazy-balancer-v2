@@ -252,8 +252,19 @@ func loadAutoBackupSettings() (autoBackupSettingsRow, error) {
 // nextAutoBackupSlot 计算自动备份的下一执行槽（复用 autoBackupDueSlot
 // 逐槽推进语义；禁用或参数非法返回 false）。
 func nextAutoBackupSlot(now time.Time) (time.Time, bool) {
+	// nil 库守卫与 schedule.go 各族同口径（无库脚手架形态静默零槽，不留痕）。
+	if db.DB == nil {
+		return time.Time{}, false
+	}
 	row, err := loadAutoBackupSettings()
-	if err != nil || !row.enabled {
+	// 历史问题：读失败按零槽返回但必须留痕（此前静默——库故障窗口
+	// 自动备份「静默停摆」，任务监控全绿）。成功路径补恢复 info。
+	if err != nil {
+		logScheduleReadFailure("schedule-read-auto-backup", err)
+		return time.Time{}, false
+	}
+	logScheduleReadRecovered("schedule-read-auto-backup")
+	if !row.enabled {
 		return time.Time{}, false
 	}
 	loc := CurrentLocation()

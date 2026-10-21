@@ -298,12 +298,15 @@ type GlobalConfig struct {
 
 // Upstream represents an upstream server
 type Upstream struct {
-	ID             int    `json:"id"`
-	RuleID         string `json:"rule_id"`
-	Host           string `json:"host"`
-	Port           int    `json:"port"`
-	Weight         int    `json:"weight"`
-	DynamicDNS     bool   `json:"dynamic_dns"` // 遗留死列，渲染勿消费（渲染只读规则级 DynamicDNS）
+	ID     int    `json:"id"`
+	RuleID string `json:"rule_id"`
+	Host   string `json:"host"`
+	Port   int    `json:"port"`
+	Weight int    `json:"weight"`
+	// DynamicDNS 是 upstreams 表的废弃列：渲染只读规则级 DynamicDNS，写侧
+	// 恒落 0（历史值不再传播）。保留字段仅维持 JSON 形状（导出/备份/快照
+	// 携带恒 false），新代码禁止据此做任何判定。
+	DynamicDNS     bool   `json:"dynamic_dns"`
 	Enabled        bool   `json:"enabled"`
 	Protocol       string `json:"protocol"`
 	MaxConnections int    `json:"max_connections"`

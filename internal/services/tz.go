@@ -3,10 +3,12 @@ package services
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"lazy-balancer-v2/internal/taskengine"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,7 +18,11 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-var currentLocation atomic.Value
+// currentLocation 保存当前生效时区。init() 与 ConfigureLocation 是唯一
+// 两条写入口且都写入非 nil *time.Location——改用 typed atomic.Pointer 后
+// Load 的返回值即契约（旧 atomic.Value 版本还带一个「未初始化→UTC」回落，
+// 该分支不可达，且会把「未初始化」伪装成一个合法时区，已删除）。
+var currentLocation atomic.Pointer[time.Location]
 var applicationLogLevel atomic.Int32
 
 const (
@@ -126,6 +132,20 @@ func refreshLocation() error {
 	return nil
 }
 
+// ValidateLocationName 校验时区名是否可作为 global_config.timezone 落库。
+// 空串必须显式拒绝：time.LoadLocation("") 是 Go 的合法特殊值（返回 UTC），
+// 放行后读侧 COALESCE(timezone,'Asia/Shanghai') 只兜 NULL 不兜空串，全站
+// 展示/审计窗口会静默切 UTC。写侧（设置保存/备份导入）与启动归一三处同口径。
+func ValidateLocationName(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return errors.New("时区不能为空")
+	}
+	if _, err := time.LoadLocation(name); err != nil {
+		return fmt.Errorf("无效的时区: %w", err)
+	}
+	return nil
+}
+
 func ConfigureLocation(name string) (*time.Location, error) {
 	loc, err := time.LoadLocation(name)
 	if err != nil {
@@ -136,11 +156,9 @@ func ConfigureLocation(name string) (*time.Location, error) {
 	return loc, nil
 }
 
+// CurrentLocation 返回当前生效时区（init/ConfigureLocation 保证非 nil）。
 func CurrentLocation() *time.Location {
-	if loc, ok := currentLocation.Load().(*time.Location); ok && loc != nil {
-		return loc
-	}
-	return time.UTC
+	return currentLocation.Load()
 }
 
 func ConfigureLogLevel(level string) error {

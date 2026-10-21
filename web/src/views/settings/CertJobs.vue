@@ -58,6 +58,13 @@
         <span v-else class="cell-empty">-</span>
       </template>
     </el-table-column>
+    <!-- 审计项：任务 message（失败原因/在途阶段说明/从节点材料化提示）此前只在
+         详情或日志可见；主表直接展示，截断部分可 hover 查看全文。 -->
+    <el-table-column label="消息" min-width="200" show-overflow-tooltip>
+      <template #default="{ row }">
+        <span :class="row.message ? 'cell-text' : 'cell-empty'">{{ row.message || '-' }}</span>
+      </template>
+    </el-table-column>
     <el-table-column label="剩余天数" width="90">
       <template #default="{ row }">
         <!-- 历史问题：过期证书不渲染裸负数——色弱/黑白场景下「-1 天」无文字语义 -->

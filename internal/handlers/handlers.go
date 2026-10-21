@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -854,10 +855,98 @@ func (h *Handlers) StartCaddyRestartWatcher() {
 	}()
 }
 
+// caddyRestartBackoff 是 caddy-restart 重试的退避状态（指数退避 + 落行降频）：
+// watcher 每 2s 轮询触发文件，失败时按 2s→4s→…→30s 退避（未到点静默跳过），
+// 且只有「首次 / 状态变化 / 每 N 轮」的重试走 RunSync 落 task_runs 行，其余
+// 轮走 RunSyncQuiet（执行同一 Run 体、不落行）——此前持续失败（Caddy 长期不可达）
+// 每 2s 落一条失败行，任务历史被淹没。
+const (
+	caddyRestartBackoffBase  = 2 * time.Second
+	caddyRestartBackoffMax   = 30 * time.Second
+	caddyRestartRecordEveryN = 10
+)
+
+var caddyRestartBackoff struct {
+	mu          sync.Mutex
+	attempts    int       // 连续失败轮数
+	nextAttempt time.Time // 下次允许尝试的时刻
+	lastStatus  string    // 上次结果（ok/failed）
+	triggerMod  time.Time // 退避状态对应的触发文件 mtime
+}
+
+// resetCaddyRestartBackoffForTest 测试缝：复位退避状态（生产不调用）。
+func resetCaddyRestartBackoffForTest() {
+	caddyRestartBackoff.mu.Lock()
+	caddyRestartBackoff.attempts = 0
+	caddyRestartBackoff.nextAttempt = time.Time{}
+	caddyRestartBackoff.lastStatus = ""
+	caddyRestartBackoff.triggerMod = time.Time{}
+	caddyRestartBackoff.mu.Unlock()
+}
+
+// observeCaddyRestartTrigger 以触发文件 mtime 标识「本轮重启事件」：新事件
+// （mtime 变化）重置退避——退避只约束同一事件的连续重试，新一轮 Caddy 重启
+// 必须立即尝试（否则上一轮的长退避会拖住新事故的恢复）。
+func observeCaddyRestartTrigger(mod time.Time) {
+	caddyRestartBackoff.mu.Lock()
+	if !caddyRestartBackoff.triggerMod.Equal(mod) {
+		caddyRestartBackoff.triggerMod = mod
+		caddyRestartBackoff.attempts = 0
+		caddyRestartBackoff.nextAttempt = time.Time{}
+		caddyRestartBackoff.lastStatus = ""
+	}
+	caddyRestartBackoff.mu.Unlock()
+}
+
+// caddyRestartShouldAttempt 返回本轮是否允许尝试（退避窗口内直接跳过）。
+func caddyRestartShouldAttempt(now time.Time) bool {
+	caddyRestartBackoff.mu.Lock()
+	defer caddyRestartBackoff.mu.Unlock()
+	return !now.Before(caddyRestartBackoff.nextAttempt)
+}
+
+// caddyRestartBeginAttempt 登记一次尝试并返回本轮是否落 task_runs 行
+// （首次 / 连续失败流中的状态变化 / 每 N 轮），以及当前连续失败轮数。
+func caddyRestartBeginAttempt(now time.Time) (record bool, attempts int) {
+	caddyRestartBackoff.mu.Lock()
+	defer caddyRestartBackoff.mu.Unlock()
+	caddyRestartBackoff.attempts++
+	attempts = caddyRestartBackoff.attempts
+	// 上次成功（或本轮为首次）→ 本轮结果属状态变化，必须落行；持续失败流
+	// 只每 N 轮落一行。
+	record = attempts == 1 || caddyRestartBackoff.lastStatus == "ok" || attempts%caddyRestartRecordEveryN == 0
+	return record, attempts
+}
+
+// caddyRestartEndAttempt 记录本轮结果并安排下次尝试时刻：成功清零退避、
+// 失败按指数退避（上限 30s）。状态变化（failed→ok 或 ok→failed）强制落行。
+func caddyRestartEndAttempt(ok bool, now time.Time) {
+	caddyRestartBackoff.mu.Lock()
+	defer caddyRestartBackoff.mu.Unlock()
+	status := "failed"
+	if ok {
+		status = "ok"
+		caddyRestartBackoff.attempts = 0
+		caddyRestartBackoff.nextAttempt = time.Time{}
+	} else {
+		delay := caddyRestartBackoffBase
+		for i := 1; i < caddyRestartBackoff.attempts && delay < caddyRestartBackoffMax; i++ {
+			delay *= 2
+		}
+		if delay > caddyRestartBackoffMax {
+			delay = caddyRestartBackoffMax
+		}
+		caddyRestartBackoff.nextAttempt = now.Add(delay)
+	}
+	caddyRestartBackoff.lastStatus = status
+}
+
 // caddyRestartWatcherOnce 单轮处理（历史问题-03+历史问题，历史）：
 //   - 存量文件（mtime 早于进程启动）→ 删除不执行；
 //   - 新触发 → 先 RunSync 成功后才删文件——失败保留下轮重试（曾先删后跑，
-//     重应用失败即丢重试机会）。
+//     重应用失败即丢重试机会）；
+//   - 失败按指数退避（2s→30s），且仅在首次/状态变化/每 10 轮落 task_runs 行
+//     （其余轮 RunSyncQuiet 执行同体不落行）——持续失败行数有界。
 func (h *Handlers) caddyRestartWatcherOnce(triggerFile string, processStart time.Time) {
 	st, err := os.Stat(triggerFile)
 	if err != nil {
@@ -868,20 +957,35 @@ func (h *Handlers) caddyRestartWatcherOnce(triggerFile string, processStart time
 		services.Logf("info", "检测到存量 Caddy 重启触发文件（mtime 早于进程启动），按上一进程残留清理不执行")
 		return
 	}
-	services.Logf("info", "检测到 Caddy 进程重启，经任务引擎调度配置载入（DB 渲染）")
+	now := time.Now()
+	observeCaddyRestartTrigger(st.ModTime())
+	if !caddyRestartShouldAttempt(now) {
+		return // 退避窗口内：静默跳过（不执行、不落行、不刷日志）
+	}
+	record, attempts := caddyRestartBeginAttempt(now)
+	services.Logf("info", "检测到 Caddy 进程重启，经任务引擎调度配置载入（DB 渲染；第 %d 次重试，落行=%v）", attempts, record)
 	// 历史修复（历史用户裁定）：一切任务统一引擎调度——曾直调
 	// ApplyConfigOnStartup 绕过引擎（无 task_runs/[start]/[done]/单飞，
 	// 审计+任务日志双行）。Run 体触发门已放行 caddy-restart。
+	// 落行降频：连续失败时只有首次/状态变化/每 10 轮走 RunSync（落 task_runs），
+	// 其余轮走 RunSyncQuiet 执行同一 Run 体不落行。
+	var runErr error
 	if te := services.TaskEngine(); te != nil {
-		if _, err := te.RunSync("startup:config-load", "caddy-restart", ""); err != nil {
-			services.Logf("error", "Caddy 重启后配置重应用失败（触发文件保留，下轮重试）: %v", err)
-			return
+		if record {
+			_, runErr = te.RunSync("startup:config-load", "caddy-restart", "")
+		} else {
+			_, runErr = te.RunSyncQuiet("startup:config-load", "caddy-restart", "")
 		}
-		services.Logf("info", "Caddy 重启后配置重应用完成（引擎调度，与启动流程同源）")
-	} else if err := h.ApplyConfigOnStartup(""); err != nil { // 引擎缺席（测试环境）回退
-		services.Logf("error", "Caddy 重启后配置重应用失败（触发文件保留，下轮重试）: %v", err)
+	} else { // 引擎缺席（测试环境）回退
+		runErr = h.ApplyConfigOnStartup("")
+	}
+	if runErr != nil {
+		caddyRestartEndAttempt(false, now)
+		services.Logf("error", "Caddy 重启后配置重应用失败（触发文件保留，按退避重试）: %v", runErr)
 		return
 	}
+	caddyRestartEndAttempt(true, now)
+	services.Logf("info", "Caddy 重启后配置重应用完成（引擎调度，与启动流程同源）")
 	_ = os.Remove(triggerFile)
 }
 
@@ -915,9 +1019,9 @@ func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 	retryDelay := 500 * time.Millisecond
 
 	for i := 0; i < maxRetries; i++ {
-		client := &http.Client{Timeout: 2 * time.Second}
+		// 共享客户端（Transport 复用）+ 每请求 2s 超时（context 承载）。
 		// 历史问题: 即使 err != nil，resp 也可能非 nil（如重定向），需统一关闭。
-		resp, err := client.Get(strings.TrimRight(h.cfg.CaddyAdminURL, "/") + "/config/") // 历史修复：就绪探针与 GetCaddyStatus 同源取配置地址，不再硬编码 localhost:2019
+		resp, err := caddyAdminGet(context.Background(), h.cfg.CaddyAdminURL, "/config/", 2*time.Second) // 历史修复：就绪探针与 GetCaddyStatus 同源取配置地址，不再硬编码 localhost:2019
 		if resp != nil {
 			resp.Body.Close()
 		}

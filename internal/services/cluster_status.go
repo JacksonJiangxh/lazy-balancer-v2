@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -140,6 +141,10 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	s.clearAllSectionReports()
 	// 角色翻转由引擎 SetRole 唯一驱动：master-only 任务统一停调，cluster-sync
 	// 经 RestartOnRoleFlip 换代为从节点分支；无管理器/旧调度器旁路。
+	// LINK-4：看门狗漂移状态必须先于 SetRole 复位——放末尾会在 SetRole(false)
+	// 与复位之间打开窗口，在途看门狗轮次按从节点角色对旧主节点的漂移状态
+	// 误报一次「配置漂移」。升主路径（cluster.go Promote）已是先复位后换角色。
+	ResetConfigDrift()
 	if te := TaskEngine(); te != nil {
 		te.SetRole(false)
 		// 历史问题：SetRole 只按角色启停 daemon，
@@ -332,15 +337,65 @@ func (s *ClusterService) Nodes(ctx context.Context, now time.Time) ([]models.Clu
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	attachSectionSync(ctx, s, nodes)
+	attachSectionSync(ctx, s, nodes, currentVersion)
 	return nodes, nil
+}
+
+// clusterSectionHashCache 主节点三节哈希的进程内缓存：键=(库句柄,
+// cluster_version)。与快照缓存同一失效维度——任一配置写（含登录锁/密钥
+// 使用等任意 bump）都会推进版本并让本缓存失效；同版本内的节点列表轮询
+// （默认 60s 或更高频）零重算（driftGuardSectionHashes 要跑只读事务装载
+// 三节全部输入 + 三次 JSON 序列化 + SHA-256）。
+type clusterSectionHashCacheEntry struct {
+	version int
+	hashes  map[string]string
+}
+
+var (
+	clusterSectionHashCacheMu sync.Mutex
+	clusterSectionHashCache   = map[*sql.DB]clusterSectionHashCacheEntry{}
+	// clusterSectionHashBuilds 实际重建次数（测试观测同版本零重算）。
+	clusterSectionHashBuilds atomic.Int64
+)
+
+// resetClusterSectionHashCacheForTest 测试缝：清空版本缓存（生产不调用）。
+func resetClusterSectionHashCacheForTest() {
+	clusterSectionHashCacheMu.Lock()
+	clusterSectionHashCache = map[*sql.DB]clusterSectionHashCacheEntry{}
+	clusterSectionHashCacheMu.Unlock()
+}
+
+// masterSectionHashes 返回主节点三节哈希（version=当前 cluster_version）。
+// 命中返回缓存（只读，调用方不得修改）；失败不缓存、错误上抛由调用方降级。
+func (s *ClusterService) masterSectionHashes(ctx context.Context, version int) (map[string]string, error) {
+	clusterSectionHashCacheMu.Lock()
+	entry, ok := clusterSectionHashCache[s.db]
+	clusterSectionHashCacheMu.Unlock()
+	if ok && entry.version == version {
+		return entry.hashes, nil
+	}
+	hashes, err := s.driftGuardSectionHashes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	clusterSectionHashBuilds.Add(1)
+	clusterSectionHashCacheMu.Lock()
+	// 多库进程（测试/多实例）下按句柄各留一条；条目数等于库句柄数，量级极小。
+	if len(clusterSectionHashCache) > 16 {
+		clusterSectionHashCache = map[*sql.DB]clusterSectionHashCacheEntry{}
+	}
+	clusterSectionHashCache[s.db] = clusterSectionHashCacheEntry{version: version, hashes: hashes}
+	clusterSectionHashCacheMu.Unlock()
+	return hashes, nil
 }
 
 // attachSectionSync 为已上报分区哈希的节点聚合 per-section 同步状态：主节点
 // 自身节哈希与同步开关过滤每次请求只计算一次；任一依赖读取失败时整体降级
 // （所有节点 SectionSync 保持 nil，等同旧版本从节点占位），绝不把错误上抛
 // 拖垮节点列表，也绝不展示可能失真的「全部滞后」。
-func attachSectionSync(ctx context.Context, s *ClusterService, nodes []models.ClusterNodeView) {
+// clusterVersion 由调用方（Nodes）在同一请求内读取，作为主节点哈希缓存的
+// 失效键——与快照缓存同一版本口径。
+func attachSectionSync(ctx context.Context, s *ClusterService, nodes []models.ClusterNodeView, clusterVersion int) {
 	reports := s.snapshotSectionReports()
 	hasReport := false
 	for i := range nodes {
@@ -363,8 +418,9 @@ func attachSectionSync(ctx context.Context, s *ClusterService, nodes []models.Cl
 	// 更新/导入；而任意一次 cluster_version 递增（例如一次登录锁变更）都会
 	// 让下一次节点列表轮询触发重建。driftGuardSectionHashes 与
 	// ComputeSnapshotSectionHashes 共用同一 sectionPayloadFor 口径（有奇偶
-	// 不变式钉测），只装载三节输入。
-	masterHashes, err := s.driftGuardSectionHashes(ctx)
+	// 不变式钉测），只装载三节输入——并按 cluster_version 缓存，同版本轮询
+	// 零重算。
+	masterHashes, err := s.masterSectionHashes(ctx, clusterVersion)
 	if err != nil {
 		Logf("warn", "计算主节点分区哈希失败（分区同步状态降级省略）: %v", err)
 		return

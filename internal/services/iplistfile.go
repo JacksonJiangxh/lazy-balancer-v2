@@ -112,6 +112,16 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 	if !validIPListScope(scope) {
 		return "", fmt.Errorf("IP 名单投影 scope 含非法字符或超出长度限制: %q", scope)
 	}
+	// 条目内嵌换行/回车必须在**聚合前**拒绝：投影是逐行文本协议，带换行的
+	// 条目会把一条记录拆成两行——第二行成为未经校验的独立条目（如
+	// "1.2.3.4\n0.0.0.0/0" 静默扩大名单）。聚合层 TrimSpace 会先剥掉条目首尾
+	// 的 \r/\n（尾缀换行因而查不到），校验必须落在原始输入上。
+	// 写失败经渲染错误链路上报（保存侧事务回滚）。
+	for _, entry := range merged {
+		if strings.ContainsAny(entry, "\r\n") {
+			return "", fmt.Errorf("IP 名单投影条目含换行符（scope=%s）: %q", scope, entry)
+		}
+	}
 	merged = wafiplist.AggregateIPEntries(merged)
 	// 内容先于 stat 构建：稳定命名下「同路径」不再蕴含「同内容」——字节比对
 	// 才是跳写判据（内容寻址时代的 stat 命中=同内容前提已随热路径改造失效）。

@@ -317,3 +317,51 @@ func TestTrafficAdminRoute_registerOnceAndServe(t *testing.T) {
 		t.Fatalf("body=%s", rec.Body.String())
 	}
 }
+
+// 国名键来自 GeoIP 解析结果（可能含非法 UTF-8/引号/控制字节）：快照序列化
+// 必须始终产出合法 JSON——手写转义遇非法 UTF-8 会写出裸字节使整个端点失败。
+func TestTrafficSnapshotJSON_toleratesInvalidUTF8CountryKey(t *testing.T) {
+	resetTrafficState(t)
+	rawName := "Bad\xff\"\\\x01Land"
+	trafficRecord(rawName, true)
+
+	raw := trafficSnapshotJSON()
+
+	if !json.Valid(raw) {
+		t.Fatalf("snapshot is not valid JSON: %q", raw)
+	}
+	var payload struct {
+		Countries map[string]struct {
+			Attack uint64 `json:"attack"`
+			Normal uint64 `json:"normal"`
+		} `json:"countries"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode snapshot: %v (%q)", err, raw)
+	}
+	want := "Bad\uFFFD\"\\\x01Land"
+	entry, ok := payload.Countries[want]
+	if !ok {
+		t.Fatalf("invalid UTF-8 key not normalized to replacement char: %v", payload.Countries)
+	}
+	if entry.Attack != 1 || entry.Normal != 0 {
+		t.Fatalf("entry=%+v, want attack=1 normal=0", entry)
+	}
+}
+
+// 快照形状契约：consumers（internal/handlers 的 trafficSnapshot）只解码
+// countries/sample_n；采集是否活跃由 app 侧 available 布尔表达（按 admin
+// 可达性合成），插件再发射 enabled 是零消费的死字段——发而不用的字段会
+// 误导调用方以为该端点是开关状态源。
+func TestTrafficSnapshotJSON_omitsUnconsumedEnabledField(t *testing.T) {
+	resetTrafficState(t)
+	trafficRecord("China", false)
+
+	raw := string(trafficSnapshotJSON())
+	if strings.Contains(raw, `"enabled"`) {
+		t.Fatalf("traffic snapshot must not emit the unconsumed enabled field: %s", raw)
+	}
+	if !strings.Contains(raw, `"countries"`) || !strings.Contains(raw, `"sample_n"`) {
+		t.Fatalf("snapshot lost its contract fields: %s", raw)
+	}
+}

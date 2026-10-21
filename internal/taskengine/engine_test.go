@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -170,21 +171,49 @@ func TestEngine_DynamicIntervalReread(t *testing.T) {
 
 // Given 循环任务运行中。
 // When StopLoop 后 StartLoop。
-// Then 循环停/启真实生效（IsRunning 翻转）。
+// Then 循环停/启真实生效：不仅 IsRunning 投影翻转，Run 必须真实执行→停止→
+// 再执行（只断言投影会让「停止后仍在跑」或「重启后不再跑」漏网）。
 func TestEngine_LoopStopStart(t *testing.T) {
 	e := newTestEngine(t)
+	var runs atomic.Int64
 	e.Register(Descriptor{ID: "t-loop", Family: "t", Name: "常驻", Kind: KindPeriodic, RunsOn: RoleAny,
 		IntervalFn: func() time.Duration { return 20 * time.Millisecond },
-		Run:        func(rc RunContext) error { return nil }})
+		Run:        func(rc RunContext) error { runs.Add(1); return nil }})
 	e.SetRole(true)
+
+	waitRuns := func(min int64, within time.Duration, msg string) {
+		t.Helper()
+		deadline := time.Now().Add(within)
+		for time.Now().Before(deadline) {
+			if runs.Load() >= min {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("%s: runs=%d, want >=%d", msg, runs.Load(), min)
+	}
+
 	e.StartLoop("t-loop")
 	if !e.IsRunning("t-loop") {
 		t.Fatal("启动后应 running")
 	}
+	waitRuns(1, time.Second, "启动后必须真实执行")
+
 	e.StopLoop("t-loop")
+	// 先让在途一轮收尾（running 标志在 Run 结束后才清），再判定投影与计数。
+	time.Sleep(80 * time.Millisecond)
 	if e.IsRunning("t-loop") {
 		t.Fatal("停止后应非 running")
 	}
+	// 取基线：停止后执行计数必须冻住。
+	settled := runs.Load()
+	time.Sleep(120 * time.Millisecond)
+	if after := runs.Load(); after != settled {
+		t.Fatalf("停止后仍在真实执行：settled=%d after=%d", settled, after)
+	}
+
+	e.StartLoop("t-loop")
+	waitRuns(settled+1, time.Second, "重启后必须恢复真实执行")
 }
 
 // Given 成功执行一次。
@@ -1099,5 +1128,28 @@ func TestEngine_DaemonFailureRecordsErrorMessage(t *testing.T) {
 	}
 	if !strings.Contains(latest.Message, "daemon boom") {
 		t.Fatalf("daemon failed message=%q，want 包含 daemon boom", latest.Message)
+	}
+}
+
+// 历史问题：truncMsg 截断不得切断多字节 rune（task_runs.message 落库半截
+// UTF-8 是损坏文本，面板展示/导出均受污染）。
+func TestTruncMsg_runeSafe(t *testing.T) {
+	// 构造尾部恰好多字节边界被切断的消息：499 个 ASCII + 3 字节 rune（汉）。
+	m := strings.Repeat("x", 499) + "汉字后缀"
+	got := truncMsg(errors.New(m))
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncMsg produced invalid UTF-8: %q", got[len(got)-8:])
+	}
+	if len(got) > 500 {
+		t.Fatalf("len=%d exceeds 500-byte budget", len(got))
+	}
+	// 回归：短消息原样；ASCII 长消息行为不变。
+	short := "short error"
+	if truncMsg(errors.New(short)) != short {
+		t.Fatal("short message must pass through unchanged")
+	}
+	ascii := strings.Repeat("y", 600)
+	if got := truncMsg(errors.New(ascii)); len(got) != 500 {
+		t.Fatalf("ascii truncation len=%d, want 500", len(got))
 	}
 }

@@ -16,7 +16,7 @@ export interface AuditLogFilterState {
 }
 
 /** 文本筛选键（顺序即上送顺序，保持与既有请求参数外观一致）。 */
-export const AUDIT_LOG_TEXT_FILTER_KEYS = ['username', 'action', 'resource', 'ip', 'keyword'] as const
+const AUDIT_LOG_TEXT_FILTER_KEYS = ['username', 'action', 'resource', 'ip', 'keyword'] as const
 
 export const buildAuditLogParams = (
   filters: AuditLogFilterState,

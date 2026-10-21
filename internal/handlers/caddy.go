@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,58 @@ import (
 
 var caddyRunCommand = func() *exec.Cmd {
 	return exec.Command("caddy", "run", "--config", "/app/config/Caddyfile", "--adapter", "caddyfile")
+}
+
+// caddyAdminTransport 是 admin API 探针/读取的共享 Transport：连接池跨请求
+// 复用（此前每个调用点 `&http.Client{Timeout: …}` 每请求新建客户端——Transport
+// 要么落到共享 DefaultTransport 与其他组件抢池，要么每次新建即每次新连接）。
+// 每请求超时语义由 context 承载（覆盖到 body 读取，与 client.Timeout 等价）。
+var caddyAdminTransport = func() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = 8
+	return transport
+}()
+
+var caddyAdminHTTPClient = &http.Client{Transport: caddyAdminTransport}
+
+// caddyAdminCancelBody 在 Body.Close 时释放请求 context 的超时计时器——
+// 请求超时用 context 表达后，计时器必须随响应体关闭回收（否则每个请求按
+// 最长 timeout 持有计时器）。
+type caddyAdminCancelBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *caddyAdminCancelBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
+}
+
+// caddyAdminGet 以共享客户端 GET admin API 路径，timeout 为单请求超时
+// （旧形态 client.Timeout 的等价语义）。
+func caddyAdminGet(ctx context.Context, adminURL, path string, timeout time.Duration) (*http.Response, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(adminURL, "/")+path, nil)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp, err := caddyAdminHTTPClient.Do(req)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			resp.Body = &caddyAdminCancelBody{ReadCloser: resp.Body, cancel: cancel}
+		} else {
+			cancel()
+		}
+		return resp, err
+	}
+	if resp.Body == nil {
+		cancel()
+		return resp, nil
+	}
+	resp.Body = &caddyAdminCancelBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
 }
 
 var caddyStopCommand = func(adminURL string) *exec.Cmd {
@@ -149,8 +202,7 @@ func caddyLivePID() int {
 }
 
 func caddyAdminReady(adminURL string) bool {
-	client := &http.Client{Timeout: 250 * time.Millisecond}
-	response, err := client.Get(strings.TrimRight(adminURL, "/") + "/config/")
+	response, err := caddyAdminGet(context.Background(), adminURL, "/config/", 250*time.Millisecond)
 	if err != nil {
 		return false
 	}
@@ -552,8 +604,10 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 		return errors.New("安全事件行数上限必须在 1 到 100000000 之间")
 	}
 	if req.Timezone != nil {
-		if _, err := time.LoadLocation(*req.Timezone); err != nil {
-			return errors.New("无效的时区: " + err.Error())
+		// 空串必须显式拒绝（time.LoadLocation("") 是合法特殊值=UTC）：否则
+		// 落库后读侧 COALESCE 只兜 NULL，全站展示/审计窗口静默切 UTC。
+		if err := services.ValidateLocationName(*req.Timezone); err != nil {
+			return err
 		}
 	}
 
@@ -939,18 +993,22 @@ func (h *Handlers) GetCaddyStatus(c *gin.Context) {
 	}
 	drift := services.CurrentConfigDrift()
 	pid := caddyLivePID()
+	// 审计项：后台数据类重载失败面（证书部署/CRS/IP2Region/威胁库/自动封禁）
+	// 与 handler 写路径的 caddy_apply_error 分开呈现——后者是「保存失败」，
+	// 前者是「库已更新但运行配置未收敛」。
+	backgroundApplyError := services.BackgroundApplyFailureBanner()
 	statusData := func(state string) map[string]string {
 		return map[string]string{
-			"status":             state,
-			"pid":                strconv.Itoa(pid),
-			"apply_error":        applyError,
-			"config_consistent":  strconv.FormatBool(drift.Consistent),
-			"config_drift":       driftBannerText(drift),
-			"config_drift_since": driftSinceText(drift),
+			"status":                 state,
+			"pid":                    strconv.Itoa(pid),
+			"apply_error":            applyError,
+			"background_apply_error": backgroundApplyError,
+			"config_consistent":      strconv.FormatBool(drift.Consistent),
+			"config_drift":           driftBannerText(drift),
+			"config_drift_since":     driftSinceText(drift),
 		}
 	}
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(strings.TrimRight(h.cfg.CaddyAdminURL, "/") + "/config/")
+	resp, err := caddyAdminGet(c.Request.Context(), h.cfg.CaddyAdminURL, "/config/", 2*time.Second)
 	if err == nil {
 		resp.Body.Close()
 		if resp.StatusCode < 500 {
@@ -998,10 +1056,9 @@ func (h *Handlers) GetCaddyConfig(c *gin.Context) {
 		c.JSON(http.StatusForbidden, models.APIResponse{Code: 403, Message: "仅管理员可读取原始 Caddy 配置"})
 		return
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
 	// 历史修复：与 GetCaddyStatus 同源取 cfg.CaddyAdminURL——此前硬编码
 	// localhost:2019，自定义 admin 地址的部署读到的是错误端点。
-	resp, err := client.Get(strings.TrimRight(h.cfg.CaddyAdminURL, "/") + "/config/")
+	resp, err := caddyAdminGet(c.Request.Context(), h.cfg.CaddyAdminURL, "/config/", 5*time.Second)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "连接 Caddy 失败: " + err.Error()})
 		return
@@ -1312,17 +1369,24 @@ const accessLogRedactionLine = "request>headers>X-API-Key -> delete"
 
 // normalizeAccessLogRedaction 把脱敏行归一为规范形态（历史问题）：
 // 移除任何既有的 X-API-Key 映射行（rename 会让头改道，delete 可能写在中间
-// 被后续行覆盖），再追加唯一的 delete 行——幂等。
+// 被后续行覆盖），再追加唯一的 delete 行——幂等。解析单源
+// services.ParseAccessLogFormat（按行号定位脱敏行，其余行原文保留）；
+// 非法行由写侧 validateAccessLogFormat 先行 400，本函数不重复拒绝。
 // 空白格式原样返回（默认形态：不裁剪原生字段，渲染层注入脱敏行）。
 func normalizeAccessLogRedaction(format string) string {
 	if strings.TrimSpace(format) == "" {
 		return format
 	}
 	const path = "request>headers>X-API-Key"
+	redactLines := make(map[int]bool)
+	for _, r := range services.ParseAccessLogFormat(format).Rules {
+		if r.Path == path {
+			redactLines[r.Line] = true
+		}
+	}
 	out := make([]string, 0, 8)
-	for _, line := range strings.Split(format, "\n") {
-		parts := strings.SplitN(strings.TrimSpace(line), "->", 2)
-		if len(parts) == 2 && strings.TrimSpace(parts[0]) == path {
+	for i, line := range strings.Split(format, "\n") {
+		if redactLines[i+1] {
 			continue
 		}
 		out = append(out, line)
@@ -1332,22 +1396,23 @@ func normalizeAccessLogRedaction(format string) string {
 
 // validateAccessLogFormat enforces the fields the log stats feature relies
 // on: a client IP and a request URI must survive the format (present natively
-// or renamed, never deleted).
+// or renamed, never deleted). 非法行（非 `路径 -> 动作` 形态）400 点名行号
+// ——解析单源 services.ParseAccessLogFormat，与渲染层零口径差。
 func validateAccessLogFormat(format string) error {
 	if strings.TrimSpace(format) == "" {
 		return nil
+	}
+	parsed := services.ParseAccessLogFormat(format)
+	if len(parsed.Invalid) > 0 {
+		return fmt.Errorf("日志格式第 %d 行无效：需要 `路径 -> delete/新名` 形式", parsed.Invalid[0])
 	}
 	type rule struct {
 		path   string
 		action string
 	}
 	var rules []rule
-	for _, line := range strings.Split(format, "\n") {
-		parts := strings.SplitN(strings.TrimSpace(line), "->", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		rules = append(rules, rule{strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])})
+	for _, r := range parsed.Rules {
+		rules = append(rules, rule{r.Path, r.Action})
 	}
 	fieldKept := func(paths ...string) bool {
 		for _, p := range paths {

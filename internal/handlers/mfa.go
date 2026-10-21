@@ -112,6 +112,13 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 	}
 	if ok, verr := services.MFAVerifyCode(userID, req.Code, time.Now()); !ok {
 		services.MFARestoreChallenge(req.MFAToken, userID)
+		if errors.Is(verr, services.ErrMFANotEnabled) {
+			// 业务态：签发挑战后密钥被并发清除（禁用/重置）——按业务文案 400，
+			// 不累加失败计数（不是验证码错误，也不锁账户）。
+			services.RecordAuditLog(user.Username, "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "MFA 未启用"), c.ClientIP())
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: verr.Error()})
+			return
+		}
 		if verr != nil {
 			// 查询/写库故障不是「验证码错误」——不审计验证码错误、
 			// 不累加挑战级/账户级失败计数（否则基础设施抖动会烧掉挑战额度
@@ -190,6 +197,12 @@ func rejectOIDCUserMFAOperation(c *gin.Context, targetUserID int) bool {
 // 既有审计文案 + 401。四处入口（重绑/禁用/step-up/管理员重置）共用，与 Login
 // 的 历史修复 及 MFAActivate 已确立的三态口径一致。
 func mfaVerifyFailureResponse(c *gin.Context, verr error, failureDetail string) {
+	if errors.Is(verr, services.ErrMFANotEnabled) {
+		// 业务态（用户未启用/已被并发禁用）：400 业务文案，与 MFAActivate 的
+		// 三态口径一致（哨兵→400、真码错→401、基础设施故障→500）。
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: verr.Error()})
+		return
+	}
 	if verr != nil {
 		recordAudit(c, "认证拒绝", "用户认证", services.FormatAuditDetail("验证服务故障", services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 验证服务暂时不可用，请稍后重试"})
@@ -413,6 +426,106 @@ func (h *Handlers) MFAVerifyStep(c *gin.Context) {
 		return
 	}
 	h.respondLoginWithMFA(c, user, passwordVersion, time.Now().Unix(), false)
+}
+
+// —— 写操作 step-up 判定（路由守卫与 handler 内联副本的单源）——
+
+// step-up 判定的两类基建故障：判定逻辑只有一份，失败口径由调用方按各自裁定
+// 保留（路由守卫 fail-open + warn 留痕；特权 Key 创建 fail-closed 500）。
+var (
+	ErrMFAStepUpGuardUnreadable = errors.New("MFA 写操作验证开关读取失败")
+	ErrMFAStepUpStateUnreadable = errors.New("MFA 状态查询失败")
+)
+
+// mfaStepUpGraceWindow 宽限窗：距上次验码小于该值的写操作静默放行（TOTP 同片
+// 不可重用，零窗会让相邻写操作结构性无码可用）。
+const mfaStepUpGraceWindow = 60 * time.Second
+
+// MFAStepUpDecision step-up 判定结果。
+type MFAStepUpDecision struct {
+	// Applies 请求属于 step-up 覆盖面（JWT 身份 + 守卫开 + 用户启用 MFA）。
+	Applies bool
+	// Verified 宽限窗内已验证（守卫据此置 mfa_stepup_verified 标记）。
+	Verified bool
+	// SecondsAgo 距上次验证的整秒数（响应头 X-Mfa-Verified-Seconds-Ago）。
+	SecondsAgo int64
+}
+
+// DecideMFAStepUp 判定请求是否需要 MFA step-up 及是否已在宽限窗内通过。
+// 调用方按自身路由语义给出 covered（守卫：写方法/敏感导出 GET；特权 API Key
+// 创建：固定 true），其余短路条件必须单源——任一侧漏掉 OIDC 会话短路或只读
+// 语义写路由豁免，就是 428 误弹码/二因子旁路。
+// mfaEnabledCheck 由调用方注入（守卫保留测试注入点）。
+func DecideMFAStepUp(c *gin.Context, covered bool, mfaEnabledCheck func(int) (bool, error)) (MFAStepUpDecision, error) {
+	// 非写操作/非敏感 GET，或机器身份（API Key/MCP）——无 MFA 概念。
+	if !covered || c.GetString("auth_type") != "jwt" {
+		return MFAStepUpDecision{}, nil
+	}
+	path := c.FullPath()
+	if path == "" {
+		path = c.Request.URL.Path
+	}
+	// step-up 机制本体（verify-step）与登出不得要求验码，否则 428→验码→再 428
+	// 死锁；只读语义 POST（批量查询/测试/预览）与只读 API Key 同一事实源豁免。
+	if path == "/api/v1/auth/mfa/verify-step" || path == "/api/v1/auth/logout" {
+		return MFAStepUpDecision{}, nil
+	}
+	if services.IsReadOnlyWriteRoute(c.Request.Method, path) {
+		return MFAStepUpDecision{}, nil
+	}
+	// OIDC 会话与本地 MFA 体系完全解耦（身份保证在 IdP），DB 查询前显式短路。
+	if c.GetString("auth_method") == "oidc" {
+		return MFAStepUpDecision{}, nil
+	}
+	guardEnabled, err := services.MFAWriteGuardEnabled()
+	if err != nil {
+		return MFAStepUpDecision{}, fmt.Errorf("%w: %v", ErrMFAStepUpGuardUnreadable, err)
+	}
+	if !guardEnabled {
+		return MFAStepUpDecision{}, nil
+	}
+	userID, ok := mfaStepUpUserID(c)
+	if !ok {
+		return MFAStepUpDecision{}, nil
+	}
+	mfaEnabled, err := mfaEnabledCheck(userID)
+	if err != nil {
+		return MFAStepUpDecision{}, fmt.Errorf("%w: %v", ErrMFAStepUpStateUnreadable, err)
+	}
+	if !mfaEnabled {
+		// 本地未绑 MFA 保持直通。
+		return MFAStepUpDecision{}, nil
+	}
+	mfaTs := c.GetFloat64("mfa_ts")
+	elapsed := time.Since(time.Unix(int64(mfaTs), 0))
+	if mfaTs > 0 && elapsed < mfaStepUpGraceWindow {
+		return MFAStepUpDecision{Applies: true, Verified: true, SecondsAgo: int64(elapsed.Seconds())}, nil
+	}
+	return MFAStepUpDecision{Applies: true}, nil
+}
+
+// mfaStepUpUserID 类型化读取 JWT 用户 ID（jwtAuth 存 float64；测试/MCP 路径
+// 可能存 int/int64/string）——gin GetString 对数字恒返回空串，不得用。
+func mfaStepUpUserID(c *gin.Context) (int, bool) {
+	v, exists := c.Get("user_id")
+	if !exists {
+		return 0, false
+	}
+	switch id := v.(type) {
+	case float64:
+		return int(id), true
+	case int:
+		return id, true
+	case int64:
+		return int(id), true
+	case string:
+		parsed, err := strconv.Atoi(id)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	}
+	return 0, false
 }
 
 // —— Admin 端点 ——

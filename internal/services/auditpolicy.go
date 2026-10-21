@@ -183,7 +183,7 @@ var readOnlyWriteRoutes = map[string]struct{}{
 	// mfaStepUpGuard/readOnlyGuard）对两条恢复完整写权限校验。
 	// 历史问题（历史）：ca-providers/:id/test 同步移出——ZeroSSL 提供商
 	// 缺 EAB 时 TestCAProviderWithContext 会调 AutoProvisionZeroSSLEAB 申请 EAB
-	// 并 UPDATE ca_providers.credentials（caproviders.go:342-344），原「仅探测
+	// 并 UPDATE ca_providers.credentials，原「仅探测
 	// ACME 目录/账户可达性」的豁免前提不成立；三守卫同样恢复完整写权限校验。
 	// 审计 历史问题：POST /config/validate 已移出只读豁免——该端点实际执行真实
 	// Caddy /load（?validate=true 参数被 Caddy v2.11.4 静默忽略，校验成功即

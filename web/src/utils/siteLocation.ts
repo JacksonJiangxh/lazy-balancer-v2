@@ -4,8 +4,8 @@
 import { CHINA_PROVINCES } from './chinaProvinces.ts'
 import { COUNTRY_CENTROIDS } from './countryCentroids.ts'
 
-export const CHINA_SITE_PREFIX = 'cn:'
-export const COUNTRY_SITE_PREFIX = 'country:'
+const CHINA_SITE_PREFIX = 'cn:'
+const COUNTRY_SITE_PREFIX = 'country:'
 
 export interface SiteLocationChoice {
   key: string

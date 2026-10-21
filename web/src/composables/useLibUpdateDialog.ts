@@ -48,8 +48,12 @@ export function useLibUpdateDialog<TInfo>(options: UseLibUpdateDialogOptions<TIn
   // 历史问题④:手写 setInterval → usePollingTask(后台标签页暂停/自动清理)。
   // 历史问题:弹框会话级暂停(非终态)——stop 会永久 disposed,重开弹框即失效;
   // 组件卸载的终态清理由 usePollingTask 内置 onUnmounted 兜底。
+  // 历史问题（409 重复轮询）：onOpened / confirmUpdate 都是先 await refreshStatus()
+  // 再起轮询——若 startPolling 走 resume()（start + 立即 run），同一轮 status+logs
+  // 会被立刻重复请求一次（409=任务已在跑路径每次点击都翻倍）。start() 只挂 2s
+  // 定时器，下一轮交给定时器；刚拉过的状态不重复拉。
   const polling = usePollingTask(async () => { await refreshStatus() }, { interval: 2000 })
-  const startPolling = () => { polling.resume() }
+  const startPolling = () => { polling.start() }
   const stopPolling = () => { polling.pause() }
 
   const scrollLogToBottom = async () => {

@@ -1,7 +1,8 @@
 # Caddy 配置与规则管理
 
 > 机制现状(2026-09-12 同步,S历史问题):Caddy 层校验走 `caddy validate` CLI
-> (真 validate-only)+ 事务内 `ApplyConfigFromTx` 终门;字段级校验
+> (语义=完整 provision，仅跳过 Start——见「关键函数说明」)+ 事务内
+> `ApplyConfigFromTx` 终门;字段级校验
 > (`validateRulePayloadBeforeSave`/`validateRuleFeatures`)仍活跃。v2.2.5 时代的
 > 探针/合并校验函数已撤除(见「关键函数说明」)。
 >
@@ -267,7 +268,7 @@ GeoIP 打标不在主路由的 `handle` 链内。任一绑定策略启用地域�
 
 ## 配置验证
 
-`POST /config/validate`(handlers/caddy.go):真 validate-only——2026-09-06 裁定 ④' 后主径为 **`caddy validate` CLI**(provision 不运行、不绑端口、零运行时扰动),CLI 不可用回退 历史修复的 load+回弹口径(校验后恢复原配置)。此前经 Caddy admin `/load?validate=true` 的探针已撤除——v2.11.4 的 handleLoad 无视 validate 参数,成功即真实加载。
+`POST /config/validate`(handlers/caddy.go):2026-09-06 裁定 ④' 后主径为 **`caddy validate` CLI**。语义如实：`caddy validate` 会执行**完整 provision**（加载全部模块、初始化证书加载器/provider 等），只在完成后跳过 Start——即不绑端口、不启动服务、不触碰运行中的 Caddy 实例，但并非「零副作用」（例如可能加载证书/触发 provider 初始化）。CLI 不可用回退 历史修复的 load+回弹口径(校验后恢复原配置)。此前经 Caddy admin `/load?validate=true` 的探针已撤除——v2.11.4 的 handleLoad 无视 validate 参数,成功即真实加载。
 
 写路径(创建/更新/启用规则等)的四道关卡:前端表单校验 → 后端字段校验(`validateRuleFeatures`/`validateRulePayloadBeforeSave`)→ 事务内 CLI 校验(`ValidateTxRenderViaCLI`,输入=事务视图最终渲染)→ 事务内 `ApplyConfigFromTx` 终门(拒绝即回滚,DB 零变更)。
 

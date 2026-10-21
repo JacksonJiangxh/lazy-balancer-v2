@@ -197,7 +197,8 @@ func TestCollectCertJobRows_mirrorFilterOnlyOnSlave(t *testing.T) {
 
 	visible := func() map[string]bool {
 		out := map[string]bool{}
-		for _, row := range collectCertJobRows() {
+		rows, _ := collectCertJobRows()
+		for _, row := range rows {
 			out[strings.TrimPrefix(row.Name, "ACME 签发 · ")] = true
 		}
 		return out

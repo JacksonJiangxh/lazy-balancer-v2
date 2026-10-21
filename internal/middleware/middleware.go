@@ -1281,106 +1281,39 @@ func mfaStepUpGuard() gin.HandlerFunc {
 		covered := writeMethods[c.Request.Method] ||
 			// 敏感 GET(与写操作同门)：名单与 apiKeyReadOnlyGuard 共用同一事实源
 			(c.Request.Method == http.MethodGet && sensitiveExportGetRoutes[path])
-		if !covered || c.GetString("auth_type") != "jwt" {
-			c.Next()
-			return
-		}
-		guardEnabled, guardErr := services.MFAWriteGuardEnabled()
-		if guardErr != nil {
-			// 2026-09-08 审计 SA1 裁定维持：DB 读失败时守卫关闭是
-			// 有意设计——step-up 是第二因子便利层（jwtAuth 已在前序 fail-closed
-			// 把关），DB 故障时锁死全部写操作不可取。历史问题：降级不再静默——
-			// 显式留痕（口径与 MFALockoutEnabled 的读失败显性错误一致）。
-			services.Logf("warn", "MFA 写操作验证开关读取失败，按关闭处理（fail-open，SA1 裁定）: %v", guardErr)
-			c.Next()
-			return
-		}
-		if !guardEnabled {
-			c.Next()
-			return
-		}
-		// 历史问题：step-up 机制本体必须永可达——豁免 verify-step 自身（POST，
-		// 位于本守卫之下），否则守卫生效后「弹码→verify-step→再 428」无限循环，
-		// 全员写操作死锁；/auth/logout 同理（登出不该要求验证码）。
-		// 历史修复（历史）：当前 logout 挂 v1 级不经本守卫（守卫仅挂
-		// admin/business 组级），本条为防御性豁免——若日后 logout 挪入组级，
-		// 豁免仍须在场（对齐 readonly.go 白名单同款防御条目）。
-		if path == "/api/v1/auth/mfa/verify-step" || path == "/api/v1/auth/logout" {
-			c.Next()
-			return
-		}
-		// 历史问题 十六次（用户反馈）：豁免只读语义 POST（readOnlyWriteRoutes——批量
-		// 证书状态查询 cert-info/jobs/current、测试连接、预览/解析等）——它们
-		// 用 POST 承载查询/预览载荷，语义是读，不该触发 step-up（用户打开规则
-		// 列表页就被弹码）。与只读 API Key 的写操作判定同一事实源。
-		if services.IsReadOnlyWriteRoute(c.Request.Method, path) {
-			c.Next()
-			return
-		}
-		// 历史问题（缺陷二）：jwtAuth 将 user_id 以 float64 存入（JWT JSON 数字），
-		// gin GetString 对非 string 断言失败恒返回 ""——改类型化取值（与
-		// contextUserID 同口径）。
-		var userID int
-		switch v := c.MustGet("user_id").(type) {
-		case float64:
-			userID = int(v)
-		case int:
-			userID = v
-		case int64:
-			userID = int(v)
-		case string:
-			parsed, err := strconv.Atoi(v)
-			if err != nil {
+		// 判定单源（handlers.DecideMFAStepUp）：覆盖面、机器身份、机制本体/
+		// 只读语义写路由豁免、OIDC 会话短路、开关与 MFA 状态读取、宽限窗全部
+		// 只有一份——handler 内联副本（特权 API Key 创建）共用同一实现。
+		decision, decisionErr := handlers.DecideMFAStepUp(c, covered, mfaUserEnabledCheck)
+		if decisionErr != nil {
+			if errors.Is(decisionErr, handlers.ErrMFAStepUpGuardUnreadable) {
+				// 2026-09-08 审计 SA1 裁定维持：DB 读失败时守卫关闭是
+				// 有意设计——step-up 是第二因子便利层（jwtAuth 已在前序 fail-closed
+				// 把关），DB 故障时锁死全部写操作不可取。显式留痕（口径与
+				// MFALockoutEnabled 的读失败显性错误一致）。
+				services.Logf("warn", "MFA 写操作验证开关读取失败，按关闭处理（fail-open，SA1 裁定）: %v", decisionErr)
 				c.Next()
 				return
 			}
-			userID = parsed
-		default:
-			c.Next()
-			return
-		}
-		// v2.3.0 用户裁定:OIDC 会话与本地 MFA 体系完全解耦——身份保证由 IdP 承担
-		// (其 MFA 已在登录时验证),本地写保护仅对本地用户生效。历史问题:auth_method
-		// 为 HMAC 签名 claim,在 DB 状态查询前显式短路——不再依赖「OIDC 行
-		// mfa_enabled 恒 0」的跨文件不变量(该不变量被导入/未来写路径破坏时,
-		// OIDC 用户会落入 verify-step 必败的 428 死锁)。
-		if c.GetString("auth_method") == "oidc" {
-			c.Next()
-			return
-		}
-		// 历史问题：DB 错误与「MFA 未启用」必须分判——未启用
-		// 是合理直通（该用户未启用 MFA，守卫不适用）；DB 错误必须 fail-closed
-		// （与本文件同类守卫的基建错误 500 中止同口径，如 apiKeyAuth 的白名单
-		// 解析失败）：瞬时 DB 失败落穿此处会让已启用 MFA 的用户整体绕过
-		// step-up（fail-open），等同二因子静默旁路。
-		mfaEnabled, err := mfaUserEnabledCheck(userID)
-		if err != nil {
+			// 历史问题：DB 错误与「MFA 未启用」必须分判——未启用是合理直通；
+			// DB 错误必须 fail-closed（与本文件同类守卫的基建错误 500 中止同口径，
+			// 如 apiKeyAuth 的白名单解析失败）：瞬时 DB 失败落穿此处会让已启用
+			// MFA 的用户整体绕过 step-up（fail-open），等同二因子静默旁路。
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "MFA 状态查询失败"})
 			return
 		}
-		if !mfaEnabled {
-			// 本地未绑 MFA 保持现状直通。
+		if !decision.Applies {
 			c.Next()
 			return
 		}
-		// 历史问题 五次（用户裁决：开关开启后立即生效）：宽限窗 60 秒 → 60 秒。
-		// 不能是 0——TOTP 码以 30 秒时间片为单位且重放防护拒绝同片重用：零窗
-		// 口意味着每个写操作都必须是不同的时间片（两次写操作间隔 <30s 时第二
-		// 次无码可用，必须干等下一片），向导多步连存等流程不可用。60 秒窗的
-		// 语义：距上次 MFA 验证超过 1 分钟的写操作都要求验码（「立即生效」的
-		// 观感），紧邻的连续操作（428→弹码→重试→顺手再存一步）不重复骚扰。
-		mfaTs := c.GetFloat64("mfa_ts")
-		if elapsed := time.Since(time.Unix(int64(mfaTs), 0)); mfaTs > 0 && elapsed < 60*time.Second {
-			// 历史问题:守卫验码放行路径置标记——handler(MFAResetByAdmin)采信
-			// 标记而非重读开关,消除开关在中间件后翻转的毫秒窗 TOCTOU。
-			// 历史问题-21（历史）:置位必须在**放行分支内**——此前写在窗口
-			// 判定之前,428 拒绝路径也置位（当前无行为影响：Abort 后 handler 不执行、
-			// 标记不跨请求，但为未来消费该标记的场景留下「假已验证」隐患）。
+		if decision.Verified {
+			// 守卫验码放行路径置标记——handler(MFAResetByAdmin)采信标记而非
+			// 重读开关，消除开关在中间件后翻转的毫秒窗 TOCTOU。置位必须在
+			// 放行分支内：428 拒绝路径不得留下「假已验证」标记。
 			c.Set("mfa_stepup_verified", true)
-			// 历史问题 八次（用户裁决）：宽限窗内静默放行时告知用户——响应头携带距上次
-			// 验证的秒数（TOTP 同片不可重用，窗口内的操作没有可用码也照常执行），
-			// 前端据此提示「xx 秒内已验证，本次无需验证」。
-			c.Header("X-Mfa-Verified-Seconds-Ago", strconv.FormatInt(int64(elapsed.Seconds()), 10))
+			// 宽限窗内静默放行时告知用户（TOTP 同片不可重用，窗口内的操作
+			// 没有可用码也照常执行），前端据此提示「xx 秒内已验证」。
+			c.Header("X-Mfa-Verified-Seconds-Ago", strconv.FormatInt(decision.SecondsAgo, 10))
 			c.Next()
 			return
 		}
@@ -1395,7 +1328,8 @@ func mfaStepUpGuard() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "节点角色查询失败"})
 			return
 		}
-		if isMaster, err = services.RoleOf(c.Request.Context(), database); err != nil {
+		var roleErr error
+		if isMaster, roleErr = services.RoleOf(c.Request.Context(), database); roleErr != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "节点角色查询失败"})
 			return
 		}

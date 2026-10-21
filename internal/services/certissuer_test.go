@@ -16,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1312,5 +1313,67 @@ func TestExtractRetryAfterFromError_parses_go_time_string(t *testing.T) {
 	}
 	if got > 91*time.Minute || got < 88*time.Minute {
 		t.Fatalf("extractRetryAfterFromError=%v, want ≈90m", got)
+	}
+}
+
+// 历史问题：ZeroSSL 签发链每次签发不得重复注册 ACME 账户——预检
+// （testCAProvider）已完成 RegisterAccount 的 client 必须被签发复用，
+// Issuer 跳过重复注册。钉：/account POST 恰好 1 次（旧实现=2 次）。
+func TestCertIssuer_Issue_zerosslRegistersAccountOnce(t *testing.T) {
+	jobID, ruleID := seedCertificateJob(t, "queued")
+	var serverURL string
+	var accountPosts atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Replay-Nonce", "test-nonce")
+		response.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/directory":
+			_, _ = fmt.Fprintf(response, `{"newNonce":%q,"newAccount":%q,"newOrder":%q}`, serverURL+"/nonce", serverURL+"/account", serverURL+"/order")
+		case "/nonce":
+			response.WriteHeader(http.StatusOK)
+		case "/account":
+			accountPosts.Add(1)
+			response.Header().Set("Location", serverURL+"/account/1")
+			response.WriteHeader(http.StatusCreated)
+			_, _ = response.Write([]byte(`{"status":"valid"}`))
+		default:
+			// 订单及以后一律 429：签发在预检后尽早停，聚焦注册次数断言。
+			response.Header().Set("Retry-After", "1")
+			response.WriteHeader(http.StatusTooManyRequests)
+		}
+	}))
+	defer server.Close()
+	serverURL = server.URL
+	result, err := db.DB.Exec(`INSERT INTO ca_providers (name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled) VALUES ('ZeroSSL','zerossl',?, '{"eab_kid":"kid","eab_hmac_key":"a2jtMUD2Qzl6T0dIQXdNcQ"}',1,0,1)`, serverURL+"/directory")
+	if err != nil {
+		t.Fatalf("seed CA provider: %v", err)
+	}
+	providerID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("read CA provider ID: %v", err)
+	}
+	if _, err := db.DB.Exec("UPDATE global_config SET acme_email='admin@example.com' WHERE id=1"); err != nil {
+		t.Fatalf("seed ACME email: %v", err)
+	}
+	// DNS 凭据必须就位，否则签发在「未选择可用的 DNS 提供商」提前失败，
+	// 到不了第二次注册（断言面假绿）。
+	if _, err := db.DB.Exec(`INSERT INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled) VALUES (1,'dns','dnspod','{"mode":"tencent","secret_id":"id","secret_key":"key"}',1)`); err != nil {
+		t.Fatalf("seed DNS config: %v", err)
+	}
+	if _, err := db.DB.Exec(`UPDATE lb_rules SET acme_config_id=1 WHERE caddy_id=?`, ruleID); err != nil {
+		t.Fatalf("bind DNS config: %v", err)
+	}
+	issuer := NewCertIssuer(func() error { return nil }, t.TempDir())
+
+	var provider models.CAProvider
+	if err := scanCAProvider(db.DB.QueryRow("SELECT "+caProviderColumns+" FROM ca_providers WHERE id=?", providerID), &provider); err != nil {
+		t.Fatalf("load CA provider: %v", err)
+	}
+	issueErr := issuer.Issue(context.Background(), jobID, ruleID, "example.com", provider)
+	if issueErr == nil {
+		t.Fatal("issuance must stop at the 429 order endpoint")
+	}
+	if got := accountPosts.Load(); got != 1 {
+		t.Fatalf("ACME /account POSTs=%d, want 1（预检注册后签发复用同 client，不重复注册）", got)
 	}
 }

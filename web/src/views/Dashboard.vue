@@ -49,6 +49,11 @@
                 <el-tooltip v-if="caddyApplyError" placement="bottom" :content="caddyApplyError">
                   <el-tag type="danger" size="small" effect="plain" style="margin-left: 8px">配置应用失败</el-tag>
                 </el-tooltip>
+                <!-- 审计项：后台数据类重载（证书部署/CRS/IP库/威胁库/自动封禁）失败
+                     独立横幅——库已更新但运行配置未收敛，与写路径「保存失败」区分。 -->
+                <el-tooltip v-if="caddyBackgroundApplyError" placement="bottom" :content="caddyBackgroundApplyError" :popper-style="{ maxWidth: '420px' }">
+                  <el-tag type="warning" size="small" effect="plain" style="margin-left: 8px">后台重载失败</el-tag>
+                </el-tooltip>
               </div>
               <div class="header-actions">
                 <el-tag 
@@ -59,7 +64,13 @@
                 >
                   {{ caddyStatus === 'running' ? (caddyPid !== '0' && caddyPid !== '' ? `运行中 ${caddyPid}` : '运行中') : caddyStatus === 'stopped' ? '已停止' : '未知' }}
                 </el-tag>
-                <el-tag v-if="configConsistent === 'true'" type="success" size="small" effect="plain">配置正常</el-tag>
+                <!-- 审计项：从节点不执行独立的配置一致性检查（配置由主节点快照
+                     下发），此前沿用主节点口径显示「配置正常」= 从未执行过的检查。
+                     从节点改为「主节点权威」声明，主节点保持一致性横幅。 -->
+                <el-tooltip v-if="authStore.isSlaveNode" placement="bottom" content="从节点配置由主节点快照下发，本机不执行独立一致性检查" :popper-style="{ maxWidth: '360px' }">
+                  <el-tag type="info" size="small" effect="plain">主节点权威</el-tag>
+                </el-tooltip>
+                <el-tag v-else-if="configConsistent === 'true'" type="success" size="small" effect="plain">配置正常</el-tag>
                 <el-tooltip v-else-if="configConsistent === 'false'" placement="bottom" :content="configDrift" :popper-style="{ maxWidth: '360px' }">
                   <el-tag type="danger" size="small" effect="plain">配置异常</el-tag>
                 </el-tooltip>
@@ -468,6 +479,7 @@ const systemMetrics = ref<SystemMetrics | null>(null)
 const caddyMetrics = ref<CaddyMetrics | null>(null)
 const caddyStatus = ref('unknown')
 const caddyApplyError = ref('')
+const caddyBackgroundApplyError = ref('')
 const caddyPid = ref('0')
 const configConsistent = ref('')
 const configDrift = ref('')
@@ -485,6 +497,10 @@ const ruleHealthUnavailable = ref(false)
 const hostMetrics = ref<HostMetrics[] | null>(null)
 const overview = ref<MetricsOverview | null>(null)
 const systemMetricsUnavailable = ref(false)
+// 「已落地」与「可用」分离（历史问题）：/rules 可能先于 /metrics/dashboard 落地，
+// 此时不能把「指标尚未到达」当成「采集失败」——首轮逐规则列会全部闪「采集失败」。
+// landed 只在 dashboard 响应成功/失败后置位；未落地前一律视为「无结论」。
+const dashboardMetricsLanded = ref(false)
 const caddyMetricsUnavailable = ref(false)
 const hostMetricsUnavailable = ref(false)
 const overviewUnavailable = ref(false)
@@ -848,6 +864,7 @@ const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
     }).catch(() => { if (!disposed) trafficUnavailable.value = true }),
     request.get<APIResponse<DashboardMetricsResponse>>('/metrics/dashboard', config).then((res) => {
       if (disposed) return
+      dashboardMetricsLanded.value = true
       const data = res.data
       if (!data) {
         caddyMetricsUnavailable.value = true
@@ -866,6 +883,7 @@ const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
       overviewUnavailable.value = false
     }).catch(() => {
       if (disposed) return
+      dashboardMetricsLanded.value = true
       caddyMetricsUnavailable.value = true
       hostMetricsUnavailable.value = true
       overviewUnavailable.value = true
@@ -881,12 +899,13 @@ const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
       }
       rules.value = res.data || []
       rulesUnavailable.value = false
-      // /rules 与 metrics 无序落地：无论指标成功、失败或空载荷，都以当前规则
-      // 列表重建映射；metrics 失败时启用行恒为「采集失败」。
+      // /rules 与 metrics 无序落地：只有 dashboard 已落地（成功或失败）才判定
+      // 「可用」；未落地时 metricsAvailable=false（=尚无结论，不标采集失败），
+      // 由 dashboard 自己的 then/catch 在到达后重建映射。
       ruleMetricsUnavailable.value = buildRuleMetricsUnavailable(
         rules.value,
-        ruleMetrics.value,
-        !caddyMetricsUnavailable.value,
+        dashboardMetricsLanded.value ? ruleMetrics.value : undefined,
+        dashboardMetricsLanded.value && !caddyMetricsUnavailable.value,
       )
       const version = ++rulesVersion
       const currentRules = rules.value
@@ -910,6 +929,7 @@ const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
       if (res.data) {
         caddyStatus.value = res.data.status || 'unknown'
         caddyApplyError.value = res.data.apply_error || ''
+        caddyBackgroundApplyError.value = res.data.background_apply_error || ''
         caddyPid.value = res.data.pid || '0'
         configConsistent.value = res.data.config_consistent || ''
         configDrift.value = res.data.config_drift || ''

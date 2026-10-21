@@ -423,9 +423,8 @@ func TestLogCleanupSummaryLine_disabledShape(t *testing.T) {
 // Then 按 deadline 放弃等待并返回 false（不再无界 <-done）；字段保留，
 // worker 最终退出后可再次 Stop 完成清零（可重启语义不变）。
 func TestStopLogRotateWithin_givesUpWhenWorkerStuck(t *testing.T) {
-	StopLogRotate() // 停掉 init 启动的真实 worker
-	t.Cleanup(func() { StartLogRotate(context.Background()) })
-
+	// 包 init 不再自启 worker（首次刷新改由 main 在 db.Initialize 后触发）——
+	// 本测试直接安装受控挂起的 worker 形态。
 	stuck := make(chan struct{}) // 永不关闭
 	runtimeLogSizeRefresh.Lock()
 	runtimeLogSizeRefresh.cancel = func() {}

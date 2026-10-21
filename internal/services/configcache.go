@@ -43,7 +43,11 @@ func (c *dbValueCache) get(load func() (int64, error), fallback int64) int64 {
 	return v
 }
 
-// invalidate 清空缓存（设置保存/导入后必须调用，否则最长 TTL 内仍按旧阈值）。
+// invalidate 清空缓存。是否接线由调用方的生效时效要求决定：任务日志侧在
+// 设置保存/导入/集群应用后调用（否则最长 TTL 内仍按旧阈值滚动）；审计轮转
+// 侧有意不接线——60s TTL 生效延迟对按大小轮转无实际影响（见
+// auditlog_rotation.go auditLogSizeCacheTTL 注释），调用方不得把本方法
+// 当作「保存后必须调用」的普遍契约。
 func (c *dbValueCache) invalidate() {
 	c.mu.Lock()
 	c.at = time.Time{}

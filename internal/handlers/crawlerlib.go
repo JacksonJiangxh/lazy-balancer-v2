@@ -124,7 +124,7 @@ func (h *Handlers) UpdateCrawlerAutoUpdate(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
 		return
 	}
-	recordAudit(c, "更新", "爬虫地址库", "自动更新总开关")
+	recordAudit(c, "更新", "爬虫地址库", "自动更新总开关："+enabledStateLabel(*body.AutoUpdate))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已更新"})
 }
 
@@ -216,7 +216,7 @@ func (h *Handlers) UpdateCrawlerLibFlags(c *gin.Context) {
 	if *body.UpdateEnabled {
 		services.ArmCrawlerFirstSlots()
 	}
-	recordAudit(c, "更新", "爬虫地址库", fmt.Sprintf("%s 更新开关", name))
+	recordAudit(c, "更新", "爬虫地址库", fmt.Sprintf("%s 更新开关：%s", name, enabledStateLabel(*body.UpdateEnabled)))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已更新"})
 }
 

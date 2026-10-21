@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { heatEntriesEqual, arcEndpoints, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, normalizeCountryName, adminShortName, aggregateCountryCounts, hasProvinceStats, drillCommitAllowed } from '../src/utils/threatShared.ts'
+import { heatEntriesEqual, heatCss, DOT_LAND, arcEndpoints, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, normalizeCountryName, adminShortName, aggregateCountryCounts, hasProvinceStats, drillCommitAllowed } from '../src/utils/threatShared.ts'
 
 test('六边形点阵：pointy-top 六顶点且上下尖角（历史问题）', () => {
   assert.equal(POINTY_TOP_HEX_VERTICES.length, 6)
@@ -31,6 +31,17 @@ test('弧线起点：中国精确到省，其他国家走质心，未知走兜�
   assert.ok(Math.abs(us[0] - -97) < 1 && Math.abs(us[1] - 38) < 2)
   const unknown = arcOriginForLocation('不存在国')
   assert.deepEqual(unknown, arcOriginForLocation(''))
+})
+
+test('热力阶梯首色=陆地底色：命中 1 次不得比 0 次更暗（历史问题-2）', () => {
+  const parse = (css: string): number[] => css.slice(4, -1).split(',').map(Number)
+  assert.equal(heatCss(0), DOT_LAND, 'count=0 与未命中点阵同色')
+  assert.equal(heatCss(1), DOT_LAND, 'count=1（log10=0）落在阶梯首色=底色，不得比 0 次更暗')
+  const base = parse(DOT_LAND)
+  for (const count of [2, 5, 50, 500, 5000]) {
+    const [r, g, b] = parse(heatCss(count))
+    assert.ok(r + g + b > base[0] + base[1] + base[2], `count=${count} 亮度必须高于底色`)
+  }
 })
 
 test('A 热力指纹：相同输入 true，计数/长度/重复键变化 false', () => {

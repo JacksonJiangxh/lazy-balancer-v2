@@ -65,9 +65,8 @@ func TestThreatRollup_unreadyWarmerFallsBackToLazyFixation(t *testing.T) {
 	if payload.Data.TotalEvents != 1 {
 		t.Fatalf("total_events=%d, want 1（首轮未完成时请求路径须懒固化）", payload.Data.TotalEvents)
 	}
-	if !payload.Data.RollupReady {
-		t.Fatalf("rollup_ready=false, want true（本次请求已成功固化）")
-	}
+	// 审计项：rollup_ready 字段已删除——「本次请求已成功固化」由
+	// rollup_last_success 非空断言（下方）承担。
 	if payload.Data.RollupLastOK == "" {
 		t.Fatalf("rollup_last_success 为空：须披露最近成功固化时间")
 	}

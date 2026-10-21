@@ -2956,8 +2956,10 @@ func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]
 	}
 	if raw, exists := config["timezone"]; exists && raw != nil {
 		tz := backupString(raw)
-		if _, err := time.LoadLocation(tz); err != nil {
-			return fmt.Errorf("备份包含无效的时区 %q", tz)
+		// 与保存侧共用 services.ValidateLocationName：空串/纯空白串不是合法时区
+		// （time.LoadLocation("") 会静默返回 UTC，导入后时间显示全体漂移）。
+		if err := services.ValidateLocationName(tz); err != nil {
+			return fmt.Errorf("备份包含无效的时区 %q: %w", tz, err)
 		}
 	}
 	for _, item := range []struct {
@@ -4356,9 +4358,35 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	}
 	// 历史问题:lbbak 二进制备份无法在请求体内携带 sections——分类选择经
 	// ?sections= query 传输(与导出对称);JSON 备份以体内 sections 字段为准。
+	// F-88B-5：两处同时给值时不得让 query 单向覆盖体内选择（query 选到备份
+	// 未含的分类会过滤掉全部表 → 零导入仍报成功）。改为取交集；交集为空
+	// 显式 400 点名双方选择，杜绝「什么都没导入但提示成功」。
 	if lbbakFiles != nil {
-		if sel := parseSectionsParam(c.Query("sections")); len(sel) > 0 {
-			backup.Sections = sel
+		querySections := normalizeBackupSectionKeys(parseSectionsParam(c.Query("sections")))
+		bodySections := normalizeBackupSectionKeys(backup.Sections)
+		switch {
+		case len(querySections) == 0:
+			// query 未指定：沿用体内 sections（lbbak 打包时的分类记录）。
+		case len(bodySections) == 0:
+			backup.Sections = querySections
+		default:
+			allowed := make(map[string]bool, len(bodySections))
+			for _, key := range bodySections {
+				allowed[key] = true
+			}
+			intersection := make([]string, 0, len(querySections))
+			for _, key := range querySections {
+				if allowed[key] {
+					intersection = append(intersection, key)
+				}
+			}
+			if len(intersection) == 0 {
+				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf(
+					"所选分类与备份内容无交集（请求：%s；备份：%s），未导入任何数据",
+					strings.Join(querySections, ","), strings.Join(bodySections, ","))})
+				return
+			}
+			backup.Sections = intersection
 		}
 	}
 	// 历史问题：完整性（checksum/结构/必需表/管理员门）先于 sections 过滤；行级门

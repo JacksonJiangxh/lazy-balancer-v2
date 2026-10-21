@@ -495,3 +495,122 @@ func TestGetRuleCaddyConfig_unsupportedProtocolReturnsError(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 500 unsupported protocol", response.Code, response.Body.String())
 	}
 }
+
+// caddy-config 的证书上下文与 GetRule 同敏感级口径：私钥字段（load_files 的
+// 私钥文件路径、load_pem 的 PEM 正文）不向非管理员/只读 Key 明文返回。
+// Ruling：掩码而非升 admin 组——配置查看框对所有登录用户可用，证书/策略
+// 上下文对排障有价值，唯独私钥字段对只读身份无用，掩码后置 key_redacted 供
+// 前端区分「未配置」与「已隐藏」。
+func TestGetRuleCaddyConfig_masksTLSKeyForNonPrivilegedIdentities(t *testing.T) {
+	initializeRuleFeatureTestDB(t)
+	runningConfig := `{"apps":{"http":{"servers":{"http_8443":{"listen":[":8443"],"routes":[{"@id":"lb_tlsview","handle":[]}]}}}}}`
+	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet && r.URL.Path == "/config/" {
+			_, _ = w.Write([]byte(runningConfig))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(fakeCaddy.Close)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enabled,enable_tls,tls_source,tls_cert,tls_key)
+		VALUES ('lb_tlsview','tls','http','tlsview.example.test',8443,'weighted_round_robin',1,1,'manual','CERTPEM','-----BEGIN PRIVATE KEY-----SECRET')`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	// 夹具须是「可发布」规则：预览的 TLS 就绪判据与全量渲染同口径
+	// （enabled=1 ∧ enable_tls=1 ∧ 存在启用上游），无上游的规则不会加载证书。
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,enabled,protocol) VALUES ('lb_tlsview','127.0.0.1',9000,1,'http')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+	handler := &Handlers{cfg: &config.Config{CaddyAdminURL: fakeCaddy.URL}, caddyService: services.NewCaddyService(fakeCaddy.URL)}
+
+	cases := []struct {
+		name        string
+		identity    func(*gin.Context)
+		wantVisible bool
+	}{
+		{"admin jwt", func(c *gin.Context) { c.Set("role", "admin"); c.Set("auth_type", "jwt") }, true},
+		{"non-admin jwt", func(c *gin.Context) { c.Set("role", "user"); c.Set("auth_type", "jwt") }, false},
+		{"admin read-only api key", func(c *gin.Context) {
+			c.Set("role", "admin")
+			c.Set("auth_type", "api_key")
+			c.Set("api_key_read_only", true)
+		}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			router.Use(tc.identity)
+			router.GET("/rules/:caddy_id/caddy-config", handler.GetRuleCaddyConfig)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/rules/lb_tlsview/caddy-config", nil))
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var payload struct {
+				Data struct {
+					Config struct {
+						TLSCertificates []map[string]interface{} `json:"tls_certificates"`
+					} `json:"config"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode caddy-config: %v", err)
+			}
+			certs := payload.Data.Config.TLSCertificates
+			if len(certs) == 0 {
+				t.Fatalf("tls_certificates empty for manual TLS rule: %s", response.Body.String())
+			}
+			for _, cert := range certs {
+				key, _ := cert["key"].(string)
+				if tc.wantVisible {
+					if key == "" {
+						t.Errorf("privileged identity must see certificate key field: %v", cert)
+					}
+					if _, marked := cert["key_redacted"]; marked {
+						t.Errorf("privileged identity must not get key_redacted marker: %v", cert)
+					}
+					continue
+				}
+				if key != "" {
+					t.Errorf("non-privileged identity received private key field %q", key)
+				}
+				if cert["key_redacted"] != true {
+					t.Errorf("masked certificate entry must set key_redacted=true: %v", cert)
+				}
+			}
+			if strings.Contains(response.Body.String(), "BEGIN PRIVATE KEY") {
+				t.Fatalf("response leaked private key material: %s", response.Body.String())
+			}
+		})
+	}
+}
+
+// load_pem 形态的私钥正文同样不得下发：掩码按「证书条目携带 key 字段」识别，
+// 覆盖 load_pem（PEM 正文）与 load_files（私钥文件路径）两种证书来源。
+func TestMaskRuleCaddyPrivateKeys_loadPEMBody(t *testing.T) {
+	payload := map[string]interface{}{
+		"config": map[string]interface{}{
+			"tls_certificates": []interface{}{
+				map[string]interface{}{
+					"certificate": "CERTPEM",
+					"key":         "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----",
+					"tags":        []string{"lb_tlsview"},
+				},
+			},
+		},
+	}
+	maskRuleCaddyPrivateKeys(payload)
+	config := payload["config"].(map[string]interface{})
+	cert := config["tls_certificates"].([]interface{})[0].(map[string]interface{})
+	if cert["key"] != "" {
+		t.Fatalf("load_pem private key body must be masked, got %v", cert["key"])
+	}
+	if cert["key_redacted"] != true {
+		t.Fatalf("masked load_pem entry must set key_redacted=true: %v", cert)
+	}
+	if cert["certificate"] != "CERTPEM" {
+		t.Fatalf("certificate must stay intact, got %v", cert["certificate"])
+	}
+}

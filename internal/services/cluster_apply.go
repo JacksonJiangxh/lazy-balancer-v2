@@ -355,9 +355,11 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 三节（users/rules/security，渲染的全部 DB 输入）哈希跳过 + WAF 数据文件
 	// 无变化 + 证书轴无变化（证书内容变化 JSON 字节不变，必须强制）+ 无重载
 	// 失败补偿标记（标记在=上轮重载失败，本轮是 304 补偿重拉的语义终点，必须
-	// 强制；标记由事务内「记录同步状态」清空，故在事务前捕获）。排程列/状态列
-	// 等纯簿记变更（版本行 next_update/update_status 族、sync_interval、登录锁）
-	// 不触发。last_good 兼容：渲染未变则既有 last_good 仍是当前运行配置的准确
+	// 强制；标记由事务内「记录同步状态」清空，故在事务前捕获）。版本行
+	// next_update/update_status 族、登录锁等纯簿记列不在节 payload 内，不触发；
+	// 但 sync_interval 属 users 节 basic_settings payload（参与节哈希），其变更
+	// 会翻转 users 节哈希并触发重载——注释勿再把它列入「不触发」族。
+	// last_good 兼容：渲染未变则既有 last_good 仍是当前运行配置的准确
 	// 快照，无需重写。
 	renderInputsChanged := !(skip.skip("users") && skip.skip("rules") && skip.skip("security"))
 	mustReload := renderInputsChanged || crsChanged || xdbChanged || threatChanged || certsChanged || reloadCompensation
@@ -1343,7 +1345,7 @@ func insertSnapshotRules(ctx context.Context, tx *sql.Tx, rules []models.LbRule)
 			return fmt.Errorf("写入快照规则 %s: %w", rule.CaddyID, err)
 		}
 		for _, upstream := range rule.Upstreams {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO upstreams (id,rule_id,host,port,weight,dynamic_dns,enabled,protocol,max_connections,origin_domain) VALUES (?,?,?,?,?,?,?,?,?,?)`, upstream.ID, rule.CaddyID, upstream.Host, upstream.Port, upstream.Weight, upstream.DynamicDNS, upstream.Enabled, upstream.Protocol, upstream.MaxConnections, upstream.OriginDomain); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO upstreams (id,rule_id,host,port,weight,dynamic_dns,enabled,protocol,max_connections,origin_domain) VALUES (?,?,?,?,?,?,?,?,?,?)`, upstream.ID, rule.CaddyID, upstream.Host, upstream.Port, upstream.Weight, false /* dynamic_dns 废弃列：落库恒 0 */, upstream.Enabled, upstream.Protocol, upstream.MaxConnections, upstream.OriginDomain); err != nil {
 				return fmt.Errorf("写入快照上游 %s: %w", rule.CaddyID, err)
 			}
 		}

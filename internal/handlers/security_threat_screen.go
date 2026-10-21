@@ -1182,6 +1182,7 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		return gin.H{
 			"hours":                hours,
 			"window_start":         "",
+			"window_start_minute":  "",
 			"rollup_ready":         false,
 			"rollup_stale":         threatRollupStale(),
 			"rollup_last_success":  "",
@@ -1321,21 +1322,10 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		trackErr(rollRows.Err())
 		rollRows.Close()
 	}
-	// 活跃攻击源：近 10min 去重 client_ip，保留/私网排除（与总量同口径）
-	activeSources := 0
-	if activeRows, err := db.MetricsDB.Query(`SELECT client_ip FROM security_events WHERE event_time >= ? GROUP BY client_ip`, activeSince); err != nil {
-		trackErr(err)
-	} else {
-		for activeRows.Next() {
-			var ip string
-			trackErr(activeRows.Scan(&ip))
-			if !isReservedIP(ip) {
-				activeSources++
-			}
-		}
-		trackErr(activeRows.Err())
-		activeRows.Close()
-	}
+	// 活跃攻击源：近 10min 去重 client_ip，保留/私网排除（与总量同口径）。
+	// 短 TTL（≤10s）缓存同窗口结果——大屏 30s 轮询不再每轮重扫原始表。
+	activeSources, activeErr := threatActiveSourcesCount(db.MetricsDB, activeSince, now)
+	trackErr(activeErr)
 	// top_targets：前 3 被攻击目标（历史问题：读分钟 rollup 的目标
 	// 维度，与 total/国家同窗口；原始表受保留期/行帽裁剪，不能作为旁路）
 	topTargets, terr := threatTopTargets(sinceMinute)
@@ -1387,17 +1377,22 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		logged = 0
 	}
 
-	// 窗口起点（秒级，供前端展示）；rollup 就绪/陈旧度披露（历史问题）。
-	rollupReady := threatRollupUsable()
+	// 窗口起点（秒级，供前端展示）；rollup 陈旧度披露（历史问题）。
+	// 审计项：rollup_ready 布尔位删除——前端零消费（rollup_stale 已覆盖
+	// 「更新延迟」提示），保留发射只会多一个无人读取的契约字段；就绪事实
+	// 改由 rollup_last_success 非空表达。
 	rollupLastSuccess := ""
-	if rollupReady {
+	if threatRollupUsable() {
 		rollupLastSuccess = time.Unix(0, threatRollupReadyAt.Load()).UTC().Format("2006-01-02 15:04:05")
 	}
 
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
-		"hours":               hours,
-		"window_start":        since,
-		"rollup_ready":        rollupReady,
+		"hours":        hours,
+		"window_start": since,
+		// rollup 读取下界是分钟串（sinceMinute）：窗口起点前 <60s 的分钟段会
+		// 计入总量/各维度与首柱——对外披露实际生效的分钟边界，避免调用方按
+		// 秒级 window_start 推算「窗口内精确计数」。
+		"window_start_minute": sinceMinute,
 		"rollup_stale":        threatRollupStale(),
 		"rollup_last_success": rollupLastSuccess,
 		// 历史问题-10：窗口头部覆盖披露——rollup_coverage_from 为已覆盖的最旧

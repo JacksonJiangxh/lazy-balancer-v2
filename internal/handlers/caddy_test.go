@@ -737,6 +737,9 @@ func TestPreviewConfigUpdate_matchesSaveSideValidation(t *testing.T) {
 	for _, body := range []string{
 		`{"source":"basic","log_level":"verbose"}`,
 		`{"source":"basic","timezone":"Not/AZone"}`,
+		// 空串不是合法库值：time.LoadLocation("") 返回 UTC（Go 特殊值），
+		// 放行即让全站展示/审计窗口静默切 UTC。
+		`{"source":"basic","timezone":""}`,
 		`{"source":"basic","threat_traffic_sample_n":4}`,
 		`{"source":"basic","security_events_retention_days":0}`,
 		`{"source":"basic","security_events_row_cap":0}`,

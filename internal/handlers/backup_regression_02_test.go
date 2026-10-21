@@ -592,3 +592,26 @@ func TestV1ImportQueueFailureStillConverges(t *testing.T) {
 }
 
 var errRequeueInjected = errors.New("requeue injected failure")
+
+// 历史问题：UpdateClusterNodeAccessURL 门控必须前置——导入窗口/从节点的
+// 请求体再畸形也先得 409/403 门控语义，不得先撞 JSON 解析 400（门控失真）。
+func TestUpdateClusterNodeAccessURL_importGatePrecedesBodyParse(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	h.clusterService = services.NewClusterService(db.DB, t.TempDir())
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/cluster/nodes/:id/access-url", h.UpdateClusterNodeAccessURL)
+
+	configImportBeginMu.Lock()
+	defer configImportBeginMu.Unlock()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/cluster/nodes/2/access-url", strings.NewReader(`{not-json`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409（导入窗口门控先于请求体解析）", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "配置导入进行中") {
+		t.Fatalf("body=%s, want 配置导入进行中 文案", rec.Body.String())
+	}
+}

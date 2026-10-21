@@ -9,34 +9,13 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
 
 import { drillClickIntent } from '../src/utils/threatShared.ts'
 import { LAT_TOP, LAT_BOTTOM, DOT_LAT_TOP, DOT_LAT_BOTTOM } from '../src/utils/threatProjection.ts'
+import { member, source } from './_helpers.ts'
 
-const HERE = dirname(fileURLToPath(import.meta.url))
-const ROOT = join(HERE, '..')
-const sceneSrc = readFileSync(join(ROOT, 'src/utils/threatScene.ts'), 'utf8')
-const globeSrc = readFileSync(join(ROOT, 'src/utils/threatGlobe.ts'), 'utf8')
-
-/** 截取成员体：按花括号配对（嵌套块不影响边界——固定缩进启发式会在第一个
- *  内层块收尾处截断，产生假绿）。 */
-function member(src: string, marker: string): string {
-  const start = src.indexOf(marker)
-  assert.notEqual(start, -1, `缺少成员 ${marker}`)
-  // 函数体起始 = 行尾的 `{`（返回类型里的 `{ name: ... }` 也在 marker 之后，
-  // 不能取第一个 `{`）
-  const open = src.indexOf('{\n', start)
-  assert.notEqual(open, -1, `成员 ${marker} 无函数体`)
-  let depth = 0
-  for (let i = open; i < src.length; i++) {
-    if (src[i] === '{') depth++
-    else if (src[i] === '}' && --depth === 0) return src.slice(start, i + 1)
-  }
-  assert.fail(`成员 ${marker} 花括号不配对`)
-}
+const sceneSrc = source('src/utils/threatScene.ts')
+const globeSrc = source('src/utils/threatGlobe.ts')
 
 test('下钻点击手势：命中国=当前下钻国保持、他国切换、空白返回世界、总览态下钻', () => {
   // 下钻态
@@ -136,7 +115,28 @@ test('地球聚合标签与到站脉冲跟地图同色', () => {
   assert.match(globeSrc, /syncArcLabels[\s\S]*color: a\.color/, 'labelsData 必须携带颜色')
   assert.match(globeSrc, /arc\.pulsed = true/, '一个航次只允许触发一次到站脉冲')
   assert.match(globeSrc, /spawnFlowRipple\(arc\.color\)/, '脉冲颜色必须使用弧线颜色')
-  assert.match(globeSrc, /ripple\.age \/ 1\.8/, '涟漪寿命必须与地图一致（1.8s）')
+  assert.match(globeSrc, /ripple\.age \/ FLOW_RIPPLE_SECONDS/, '涟漪寿命必须走 threatTheme 单源（1.8s）')
+})
+
+test('缓动/涟漪/浮签字色四组跨引擎重复实现收敛到 threatTheme（历史问题-7）', () => {
+  const theme = source('src/utils/threatTheme.ts')
+  // 单源定义在本文件，两引擎只导入
+  assert.match(theme, /export function easeOutCubic\(/)
+  assert.match(theme, /export const FLOW_HOVER_TIP_COLOR = '#/)
+  assert.match(theme, /export const FLOW_RIPPLE_SECONDS = 1\.8/)
+  assert.match(theme, /export const FLOW_RIPPLE_START_RADIUS = 3/)
+  assert.match(theme, /export const FLOW_RIPPLE_GROWTH_RADIUS = 26/)
+  assert.match(theme, /export const FLOW_RIPPLE_LINE_WIDTH = 1\.5/)
+  assert.match(theme, /export const FLOW_RIPPLE_ALPHA = 0\.85/)
+  for (const [src, name] of [[sceneSrc, '地图'], [globeSrc, '地球']] as const) {
+    assert.match(src, /easeOutCubic,/, `${name}引擎必须导入共享缓动`)
+    assert.doesNotMatch(src, /function easeOutCubic\(/, `${name}引擎不得再自写缓动`)
+    assert.match(src, /FLOW_RIPPLE_SECONDS/, `${name}引擎涟漪寿命必须走单源`)
+    assert.match(src, /FLOW_RIPPLE_START_RADIUS \+ t \* FLOW_RIPPLE_GROWTH_RADIUS/, `${name}引擎涟漪半径公式必须走单源常量`)
+    assert.doesNotMatch(src, /const t = ripple\.age \/ 1\.8/, `${name}引擎不得写死 1.8`)
+    assert.match(src, /FLOW_HOVER_TIP_COLOR/, `${name}引擎浮签字色必须走单源`)
+  }
+  assert.doesNotMatch(globeSrc, /color:#e2ecff/, '地球浮签不得写死字色')
 })
 
 test('帧率脚手架已删（两档恒等常量与交互时间窗不再伪装成自适应）', () => {
@@ -146,7 +146,7 @@ test('帧率脚手架已删（两档恒等常量与交互时间窗不再伪装�
 })
 
 test('拦截页回落文案不得断言「默认 403/429」（真实回落取绑定链首个有效页）', () => {
-  const stages = readFileSync(join(ROOT, 'src/utils/securityStages.ts'), 'utf8')
+  const stages = source('src/utils/securityStages.ts')
   assert.doesNotMatch(stages, /回落默认 403|跟随默认 403|已失效（回落首策略）/,
     '多策略绑定下「默认 403」是错误断言')
   assert.match(stages, /未配置（跟随绑定链首个有效页，无则默认 403）/)

@@ -1,8 +1,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { certJobRetryReady } from '../src/utils/certJobStatus.ts'
-import { section, source } from './_helpers.ts'
+import {
+  certJobRetryReady,
+  certJobStatusLabel,
+  certJobStatusTone,
+  type CertJobStatus,
+} from '../src/utils/certJobStatus.ts'
+import { repoSource, section, source } from './_helpers.ts'
 
 const now = Date.parse('2026-10-19T00:00:00Z')
 const updatedAt = '2026-10-19T00:00:00Z'
@@ -21,16 +26,33 @@ test('历史问题-04：缺失或畸形时间戳维持既有 fail-open 边界', 
   assert.equal(certJobRetryReady(120, 'not-a-date', now), true)
 })
 
-// 历史修复：状态 label/tone 全表覆盖后端 db.certJobStatuses（26 态，DB CHECK 单源）。
-// 前端枚举漂移会静默落入 unknown 分支（标签显示原始 token、tone 退 info），
-// 且无任何用例会失败——本条把两侧声明对表。
-test('WS-19：证书任务状态枚举覆盖后端 db.certJobStatuses 全 26 态', () => {
-  const go = source('../internal/db/db.go')
+// 证书任务状态 label/tone 全表覆盖后端 db.certJobStatuses（26 态，DB CHECK 单源）。
+// 前端枚举漂移会静默落入 unknown 分支（标签显示原始 token、tone 退 info），且无任何
+// 运行期用例会失败。穷尽性由生产侧两张表上的 `satisfies Record<CertJobStatus, …>`
+// 在编译期锁定（新增状态不补文案即 tsc 报错）；本条在运行期逐态验证「有专属中文
+// 标签、tone 合法」，并钉住这两条编译期约束不被悄悄删掉。
+test('证书任务状态 label/tone 覆盖后端 db.certJobStatuses 全 26 态', () => {
+  const go = repoSource('internal/db/db.go')
   const goBlock = section(go, 'var certJobStatuses = []string{', '\n}\n')
   const backend = [...goBlock.matchAll(/"([a-z_]+)"/g)].map((m) => m[1])
   const ts = source('src/utils/certJobStatus.ts')
-  const tsBlock = section(ts, 'export type CertJobStatus =', '\n\nexport const certJobStatusLabel')
+  // 类型联合紧随其后是文案表的 JSDoc——终点取它，避免把 label 表一起切进来
+  const tsBlock = section(ts, 'export type CertJobStatus =', '\n\n/**')
   const frontend = [...tsBlock.matchAll(/'([a-z_]+)'/g)].map((m) => m[1])
   assert.equal(backend.length, 26, '后端枚举应为 26 态（DB CHECK 单源）')
   assert.deepEqual([...frontend].sort(), [...backend].sort(), '证书状态前后端枚举漂移')
+
+  // 编译期穷尽性约束必须存在：删掉 satisfies 后新增状态不再被 typecheck 拦截
+  assert.match(ts, /satisfies Record<CertJobStatus, string>/, '标签表必须带 Record<CertJobStatus, string> 约束')
+  assert.match(ts, /satisfies Record<CertJobStatus, CertJobStatusTone>/, '色调表必须带 Record<CertJobStatus, CertJobStatusTone> 约束')
+
+  // 运行期逐态：每个状态都有专属中文标签（不落 unknown 分支）
+  const tones = ['success', 'danger', 'warning', 'info']
+  for (const status of backend) {
+    const label = certJobStatusLabel(status as CertJobStatus)
+    assert.notEqual(label, '未知', `${status} 未补专属文案（空值兜底分支）`)
+    assert.notEqual(label, status, `${status} 落入 unknown 分支（显示原始 token）`)
+    assert.ok(label.length > 0)
+    assert.ok(tones.includes(certJobStatusTone(status as CertJobStatus)), `${status} tone 非法`)
+  }
 })

@@ -3641,3 +3641,59 @@ func TestRunMigrations_recordsStrategyAndWeightNormalization(t *testing.T) {
 		t.Fatalf("idempotent rerun produced audits: %+v", entries)
 	}
 }
+
+// 重复 system=1 名单行去重删除整行属用户可见数据改写（重复行可能携带已入库
+// 的威胁 IP 条目）：与 cert_jobs 去重/域名归一同口径落「全操作审计」，不能只
+// 留进程 stdout（可能随日志轮转丢失）。
+func TestMigrateSystemIPListUniqueIndex_recordsAuditForDedupedRows(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	for _, name := range []string{"威胁情报库", "威胁情报库"} {
+		if _, err := database.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system) VALUES (?, '', 'threat', '["1.2.3.4"]', 1)`, name); err != nil {
+			t.Fatalf("seed system list %s: %v", name, err)
+		}
+	}
+
+	auditDB, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("open audit database: %v", err)
+	}
+	t.Cleanup(func() { _ = auditDB.Close() })
+	if _, err := auditDB.Exec(`CREATE TABLE audit_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username VARCHAR(100),
+		action VARCHAR(50) NOT NULL,
+		resource VARCHAR(100),
+		detail TEXT,
+		ip_address VARCHAR(45),
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		t.Fatalf("create audit_log: %v", err)
+	}
+	oldAuditDB := AuditDB
+	AuditDB = auditDB
+	t.Cleanup(func() { AuditDB = oldAuditDB })
+	drainSystemAuditBuffer()
+
+	if err := migrateSystemIPListUniqueIndex(); err != nil {
+		t.Fatalf("migrate system ip list unique index: %v", err)
+	}
+	flushSystemAuditLogs()
+
+	var count int
+	if err := auditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='启动迁移' AND resource='IP 名单' AND detail LIKE '%1 条%'`).Scan(&count); err != nil {
+		t.Fatalf("count audit rows: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("dedupe audit rows=%d, want 1（删除整行必须留痕）", count)
+	}
+	var remaining int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE system=1 AND name='威胁情报库'`).Scan(&remaining); err != nil {
+		t.Fatalf("count remaining rows: %v", err)
+	}
+	if remaining != 1 {
+		t.Fatalf("remaining system rows=%d, want 1", remaining)
+	}
+}

@@ -12,6 +12,7 @@ import assert from 'node:assert/strict'
 import { WORLD_COUNTRIES, THREAT_COUNTRIES } from '../src/utils/worldBorders.ts'
 import { ADMIN1_PROVINCES, COUNTRY_ALIAS } from '../src/utils/admin1Provinces.ts'
 import { CHINA_PROVINCES } from '../src/utils/chinaProvinces.ts'
+import { normalizeCountryName } from '../src/utils/threatShared.ts'
 
 test('A 威胁国家表：排除南极洲且其余国家与 worldBorders 一致', () => {
   assert.equal(WORLD_COUNTRIES.length - THREAT_COUNTRIES.length, 1)
@@ -32,27 +33,30 @@ test('A 威胁国家表：排除南极洲且其余国家与 worldBorders 一致'
 test('B 全量键集：每个威胁国家的下钻省层数据可用（中国=高精度省表）', () => {
   const missing: string[] = []
   for (const country of THREAT_COUNTRIES) {
-    if (country.name === '中国') {
+    // 下钻目标按 normalizeCountryName 归一（Taiwan → 中国，2026-10-18 用户裁定）
+    const drill = normalizeCountryName(country.name)
+    if (drill === '中国') {
       assert.ok(CHINA_PROVINCES.length >= 30, '中国高精度省表缺失')
       continue
     }
-    const rows = ADMIN1_PROVINCES[country.name]
-    if (!rows || rows.length === 0) missing.push(country.name)
+    const rows = ADMIN1_PROVINCES[drill]
+    if (!rows || rows.length === 0) missing.push(drill)
   }
   assert.deepEqual(missing, [], `以下国家无省层数据，下钻将成空洞: ${missing.join('、')}`)
 })
 
 test('B2 省层数据非空且首项含多边形（归一后仍是真实数据）', () => {
   for (const country of THREAT_COUNTRIES) {
-    if (country.name === '中国') continue
-    const rows = ADMIN1_PROVINCES[country.name]
-    assert.ok(Array.isArray(rows), `${country.name} 非数组`)
-    assert.ok(typeof rows[0].name === 'string' && rows[0].name.length > 0, `${country.name} 首项缺省名`)
-    assert.ok(Array.isArray(rows[0].polys) && rows[0].polys.length > 0, `${country.name} 首项缺多边形`)
+    const drill = normalizeCountryName(country.name)
+    if (drill === '中国') continue
+    const rows = ADMIN1_PROVINCES[drill]
+    assert.ok(Array.isArray(rows), `${drill} 非数组`)
+    assert.ok(typeof rows[0].name === 'string' && rows[0].name.length > 0, `${drill} 首项缺省名`)
+    assert.ok(Array.isArray(rows[0].polys) && rows[0].polys.length > 0, `${drill} 首项缺多边形`)
   }
 })
 
-test('C 别名表：10 个历史英文/旧名分组 + 巴勒斯坦双源/南极洲完整性', () => {
+test('C 别名表：10 个历史英文/旧名分组 + 巴勒斯坦双源；台湾/南极洲死数据已清', () => {
   const hasRows = (key: string): boolean => Array.isArray(ADMIN1_PROVINCES[key]) && ADMIN1_PROVINCES[key].length > 0
   const expected: Record<string, string> = {
     Turkey: '土耳其',
@@ -73,7 +77,7 @@ test('C 别名表：10 个历史英文/旧名分组 + 巴勒斯坦双源/南极�
     assert.ok(hasRows(alias), `别名源键 ${alias} 在 ADMIN1_PROVINCES 缺失`)
     assert.ok(hasRows(target), `别名目标键 ${target} 归一后仍缺失`)
   }
-  // 巴勒斯坦：Gaza Strip + West Bank 两源归一同一目标；南极洲仅为完整性保留
+  // 巴勒斯坦：Gaza Strip + West Bank 两源归一同一目标
   assert.equal(COUNTRY_ALIAS['Gaza Strip'], '巴勒斯坦')
   assert.equal(COUNTRY_ALIAS['West Bank'], '巴勒斯坦')
   assert.ok(hasRows('巴勒斯坦'))
@@ -85,7 +89,12 @@ test('C 别名表：10 个历史英文/旧名分组 + 巴勒斯坦双源/南极�
   assert.ok(palestineNames.includes('West Bank'), `巴勒斯坦缺少 West Bank: ${palestineNames.join('、')}`)
   assert.ok(palestine.length >= 2, `巴勒斯坦条目数应 ≥2，实际 ${palestine.length}`)
   assert.equal(new Set(palestineNames).size, palestineNames.length, '合并后省名不得重复')
-  assert.equal(COUNTRY_ALIAS.Antarctica, '南极洲')
+  // 死数据清源（历史问题-6）：南极洲永不出现在威胁国家/归属地口径（THREAT_COUNTRIES
+  // 已剔除），台湾下钻经 normalizeCountryName 归一到中国高精度省表——两键的省层
+  // 与别名均为不可达数据，删除后不得回流。
+  assert.equal(ADMIN1_PROVINCES['南极洲'], undefined, '南极洲省层为零消费数据')
+  assert.equal(COUNTRY_ALIAS.Antarctica, undefined, '南极洲别名属于死数据')
+  assert.equal(ADMIN1_PROVINCES.Taiwan, undefined, '台湾下钻走中国省表，独立 Taiwan 省层为零消费数据')
   // 每个别名目标都必须是非空省层（防「键存在但数据空」的假通过）
   for (const target of new Set(Object.values(COUNTRY_ALIAS))) {
     assert.ok(hasRows(target), `别名目标 ${target} 省层为空`)

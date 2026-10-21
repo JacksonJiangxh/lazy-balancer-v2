@@ -445,7 +445,10 @@ func regionTreeFromXDB(path string) *IP2RegionRegionTree {
 			continue
 		}
 		fields := strings.Split(string(region), "|")
-		if len(fields) < 3 {
+		// 列数门槛必须与发射侧同口径（caddygeoip handler.parseGeoIPRegion
+		// 要求 >=5）：3-4 列行在请求期被判「海外」（ok=false → 哨兵），
+		// 树侧若按 >=3 收集省/市，会生成一批永不命中的幽灵省份/城市。
+		if len(fields) < 5 {
 			continue
 		}
 		if strings.TrimSpace(fields[0]) != "中国" {

@@ -8,6 +8,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -63,33 +64,47 @@ type TaskRunInfo struct {
 	Message    string `json:"message,omitempty"`
 }
 
+// collectSystemTasksCalls 任务族聚合调用计数（测试观测单行轮询是否短路任务枚举）。
+var collectSystemTasksCalls atomic.Int64
+
+// ResetCollectSystemTasksCallsForTest 测试缝：复位任务枚举计数。
+func ResetCollectSystemTasksCallsForTest() { collectSystemTasksCalls.Store(0) }
+
+// CollectSystemTasksCallsForTest 返回任务枚举累计调用次数。
+func CollectSystemTasksCallsForTest() int64 { return collectSystemTasksCalls.Load() }
+
 // CollectSystemTasks 聚合全部任务族（终态：引擎唯一事实源——全部任务族
 // 注册于任务引擎，视图=DescribeAll 元数据+task_runs 真实运行/统计；
-// 零收集器零特化）。
-func CollectSystemTasks() []TaskInfo {
+// 零收集器零特化）。certJobsTruncated=true 表示 cert-job 动态行触达
+// 100 行上限（审计项：此前静默截断，消费方无法区分「只有 100 条」与
+// 「被截到 100 条」）。
+func CollectSystemTasks() (tasks []TaskInfo, certJobsTruncated bool) {
+	collectSystemTasksCalls.Add(1)
 	te := TaskEngine()
 	if te == nil {
-		return []TaskInfo{}
+		return []TaskInfo{}, false
 	}
-	tasks := collectEngineFamilies(te)
+	tasks = collectEngineFamilies(te)
 	// 证书签发任务动态行（实时非终态 + 24h 内终态——执行状态进任务列表，
 	// 队列卡只展示实时队列内容）
-	tasks = append(tasks, collectCertJobRows()...)
-	return tasks
+	certRows, truncated := collectCertJobRows()
+	return append(tasks, certRows...), truncated
 }
 
 // collectCertJobRows 逐签发任务行：非终态（实时队列内容）+ 24h 内终态
 // （结果可见）；id=cert-job:{jobID}，日志走 /certificates/jobs/{id}/logs。
-func collectCertJobRows() []TaskInfo {
+func collectCertJobRows() ([]TaskInfo, bool) {
 	// 历史修复（历史问题）：db.DB nil 防护——与引擎侧导出 DB 函数同形
 	// （装配顺序变化即 nil panic，曾裸用）。
 	if db.DB == nil {
-		return nil
+		return nil, false
 	}
 	// 2026-10-01 用户裁定：行存在即显示（无状态/时间过滤——曾按
 	// 「issued 超 1 天隐藏」窗口过滤致主节点签发行消失）；仅排除从节点
 	// 材料物化行（非签发任务，从节点禁签发）。LIMIT 100（历史问题-2 裁定后
 	// 收敛：20 截断「存在即显示」——100 贴近裁定原文且长周期主节点不触顶）。
+	// 审计项：多取 1 行作截断探针（LIMIT 101），触达上限时回传 truncated
+	// 标记——此前 100 行静默截断，消费方无法区分「恰好 100 条」与「被截」。
 	//
 	// 历史问题：镜像行过滤条件绑定「本节点当前为从节点」——曾无条件按 message
 	// 前缀过滤，promote 后保留下来的同主节点同步行永久不可见（它们已经是本
@@ -102,11 +117,11 @@ func collectCertJobRows() []TaskInfo {
 	rows, err := db.DB.Query(`SELECT id, rule_id, domain, status, COALESCE(message,''), COALESCE(updated_at,created_at)
 		FROM cert_jobs
 		WHERE ?=1 OR COALESCE(message,'') NOT LIKE '从主节点同步%'
-		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT 100`, isMaster)
+		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT ?`, isMaster, certJobRowsLimit+1)
 	if err != nil {
 		// 任务行读失败留痕：查询失败不再静默空列表（对照下方 rows.Err 留痕形态）。
 		Logf("warn", "cert 任务行查询失败: %v", err)
-		return nil
+		return nil, false
 	}
 	defer rows.Close()
 	var out []TaskInfo
@@ -168,8 +183,15 @@ func collectCertJobRows() []TaskInfo {
 		// 历史问题-4：迭代失败不再静默部分列表（曾 rows.Err 未查）
 		Logf("warn", "cert 任务行迭代失败: %v", err)
 	}
-	return out
+	truncated := len(out) > certJobRowsLimit
+	if truncated {
+		out = out[:certJobRowsLimit]
+	}
+	return out, truncated
 }
+
+// certJobRowsLimit 任务监控视图内 cert-job 动态行上限（探针行 +1 由查询侧承担）。
+const certJobRowsLimit = 100
 
 // collectEngineFamilies 引擎注册族统一视图（终态：零特化零收集器——
 // 元数据/开关/下一槽/状态镜像全来自 DescribeAll，最近运行与 24h 统计

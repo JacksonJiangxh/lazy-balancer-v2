@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	sqlite "github.com/glebarez/go-sqlite"
@@ -317,6 +318,11 @@ func initMetricsSchema(db *sql.DB) error {
 		requests_blocked INTEGER DEFAULT 0,
 		bytes_in BIGINT DEFAULT 0,
 		bytes_out BIGINT DEFAULT 0,
+		-- 以下三列为**废弃列**：metrics_history 的历史查询（handlers/metrics.go
+		-- 两条列清单）与前端零消费，延迟只经 live overview 暴露（内存对象，
+		-- services.estimateLatencyPercentiles）。保留列避免对既有 metrics 库做
+		-- 破坏性表重建；写侧仍写入（列成本可忽略），但新读路径禁止依赖这三列
+		-- ——「历史延迟可用」是伪契约。
 		latency_p50 INTEGER DEFAULT 0,
 		latency_p95 INTEGER DEFAULT 0,
 		latency_p99 INTEGER DEFAULT 0
@@ -422,7 +428,28 @@ func initMetricsSchema(db *sql.DB) error {
 // autoban/rollup）——改为启动期一次性去重：每个非空 transaction_id 保留
 // 最早行（MIN(id)，即首次摄取的事件），删除其余重复行后照常建索引，摄取
 // 幂等链自启动起恒成立。空串与 NULL 不属于索引约束域，不受影响。
+// securityEventsTransactionIndexScans / Skips 启动期查重路径的观测计数：
+// Scans=真正执行了全表 GROUP BY 查重的次数（每库一次），Skips=命中
+// sqlite_master 唯一索引直接跳过的次数（每次重启 +1）。仅测试消费。
+var (
+	securityEventsTransactionIndexScans atomic.Int64
+	securityEventsTransactionIndexSkips atomic.Int64
+)
+
 func ensureSecurityEventsTransactionIndex(db *sql.DB) error {
+	// 先探测索引是否已在位：唯一索引一旦建立，重复事务在写入侧即被拒绝，
+	// 全表 GROUP BY 查重（security_events 全表扫描，事件表百万行时启动白付
+	// 数秒）没有任何可发现对象——直接跳过。存量库（索引缺失）才进入查重+建
+	// 索引路径。
+	var indexSQL sql.NullString
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_security_events_transaction'`).Scan(&indexSQL); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to inspect security_events transaction index: %w", err)
+	}
+	if indexSQL.Valid && strings.Contains(strings.ToUpper(indexSQL.String), "UNIQUE") {
+		securityEventsTransactionIndexSkips.Add(1)
+		return nil
+	}
+	securityEventsTransactionIndexScans.Add(1)
 	rows, err := db.Query(`SELECT transaction_id, COUNT(*) FROM security_events
 		WHERE transaction_id != '' GROUP BY transaction_id HAVING COUNT(*)>1`)
 	if err != nil {
@@ -522,6 +549,11 @@ func migrateMetricsHistoryBlocked(db *sql.DB) error {
 		requests_blocked INTEGER DEFAULT 0,
 		bytes_in BIGINT DEFAULT 0,
 		bytes_out BIGINT DEFAULT 0,
+		-- 以下三列为**废弃列**：metrics_history 的历史查询（handlers/metrics.go
+		-- 两条列清单）与前端零消费，延迟只经 live overview 暴露（内存对象，
+		-- services.estimateLatencyPercentiles）。保留列避免对既有 metrics 库做
+		-- 破坏性表重建；写侧仍写入（列成本可忽略），但新读路径禁止依赖这三列
+		-- ——「历史延迟可用」是伪契约。
 		latency_p50 INTEGER DEFAULT 0,
 		latency_p95 INTEGER DEFAULT 0,
 		latency_p99 INTEGER DEFAULT 0

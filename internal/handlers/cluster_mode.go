@@ -221,11 +221,7 @@ func clusterSettingsChangeDetail(req models.ClusterSettingsRequest) string {
 		if t.val == nil {
 			continue
 		}
-		state := "关闭"
-		if *t.val {
-			state = "开启"
-		}
-		parts = append(parts, labels[t.key]+"："+state)
+		parts = append(parts, labels[t.key]+"："+enabledStateLabel(*t.val))
 	}
 	if req.SyncInterval != nil {
 		parts = append(parts, fmt.Sprintf("同步间隔：%d 秒", *req.SyncInterval))

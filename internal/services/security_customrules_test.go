@@ -451,10 +451,15 @@ func TestEmitCustomRules_emptyPatternSkipped(t *testing.T) {
 	if !strings.Contains(out, "id:10004") {
 		t.Fatalf("valid rule must still be emitted:\n%s", out)
 	}
-	// 合法规则渲染字节不变（回归形状）
+	// 合法规则渲染形状（回归）：必须真实产出，且含目标算子——空输出也是失败
+	// （旧断言 `!= "" && !contains` 让空输出静默通过）。
 	var sb2 strings.Builder
 	emitCustomRules(&sb2, []models.CustomRule{base(4, "/ok")}, 403)
-	if sb2.String() != "" && !strings.Contains(sb2.String(), `@contains /ok`) {
-		t.Fatalf("valid rule shape changed:\n%s", sb2.String())
+	rendered := sb2.String()
+	if rendered == "" {
+		t.Fatal("valid rule must be emitted, got empty output")
+	}
+	if !strings.Contains(rendered, `@contains /ok`) {
+		t.Fatalf("valid rule shape changed:\n%s", rendered)
 	}
 }

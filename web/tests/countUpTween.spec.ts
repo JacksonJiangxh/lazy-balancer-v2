@@ -9,15 +9,7 @@ import assert from 'node:assert/strict'
 import { nextTick, ref } from 'vue'
 
 import { useCountUp } from '../src/composables/useCountUp.ts'
-
-class FakeDocument {
-  hidden = false
-  private readonly listeners = new Set<() => void>()
-  addEventListener(_type: 'visibilitychange', listener: () => void): void { this.listeners.add(listener) }
-  removeEventListener(_type: 'visibilitychange', listener: () => void): void { this.listeners.delete(listener) }
-  dispatch(): void { for (const listener of [...this.listeners]) listener() }
-  get listenerCount(): number { return this.listeners.size }
-}
+import { FakeDocument } from './_helpers.ts'
 
 class FakeFrames {
   private nextId = 1

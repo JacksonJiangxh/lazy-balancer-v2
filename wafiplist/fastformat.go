@@ -218,7 +218,15 @@ func ReadFastFile(path string) (*FastFileState, error) {
 		if bits > 128 {
 			return nil, fmt.Errorf("fastfile: v6 entry %d bits out of range: %d", i, bits)
 		}
-		state.V6[i] = netip.PrefixFrom(netip.AddrFrom16(addr), bits)
+		entryAddr := netip.AddrFrom16(addr)
+		// 族校验与写侧同口径：v6 段只接受纯 IPv6。4-in-6 映射地址
+		// （::ffff:1.2.3.4）在 16 字节布局里完全合法，bits/掩码/升序/不相交
+		// 也都能通过，却是「可加载但永不命中」的静默漏拦形态（v4 段不含它，
+		// 纯 v6 查询也不匹配它）。读侧是跨进程输入，不能只依赖写侧自律。
+		if entryAddr.Is4In6() {
+			return nil, fmt.Errorf("fastfile: v6 entry %d is a 4-in-6 mapped address: %s", i, entryAddr)
+		}
+		state.V6[i] = netip.PrefixFrom(entryAddr, bits)
 		// 历史问题：v6 同口径——主机位未掩码即拒。
 		if state.V6[i] != state.V6[i].Masked() {
 			return nil, fmt.Errorf("fastfile: v6 entry %d host bits not masked: %s", i, state.V6[i])

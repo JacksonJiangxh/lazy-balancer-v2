@@ -187,7 +187,9 @@ func oidcProvider(issuer string) (*oidc.Provider, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	p, err := oidc.NewProvider(ctx, issuer)
+	// 出站客户端注入（discovery 与其后的 JWKS 验签同源）：初始 issuer 校验之外，
+	// 重定向也必须逐跳通过 scheme 策略。
+	p, err := oidc.NewProvider(oidc.ClientContext(ctx, oidcOutboundClient), issuer)
 	oidcProvMu.Lock()
 	if err != nil {
 		werr := fmt.Errorf("OIDC 发现失败(检查服务地址可达性与 .well-known 配置): %w", err)
@@ -639,24 +641,25 @@ func createOIDCUserWithRetry(issuer, subject, base, displayName string) (oidcIde
 // OIDCCallback GET /auth/oidc/callback——授权码换令牌→ID Token 验签→
 // 用户命中/禁用检查/JIT 开户→签发本站 JWT(与密码登录同构,auth_method=oidc)。
 func (h *Handlers) OIDCCallback(c *gin.Context) {
-	cfg, cfgErr := loadOIDCConfig()
-	if cfgErr != nil {
-		services.Logf("warn", "OIDC 回调读取配置失败: %v", cfgErr)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "OIDC 配置读取失败"})
-		return
-	}
-	if !cfg.Enabled || cfg.Issuer == "" {
-		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "OIDC 未启用"})
-		return
-	}
-	// 历史问题:回调是浏览器整页导航——失败一律 302 回前端错误页(error 经 URL
+	// 回调是浏览器整页导航——失败一律 302 回前端错误页(error 经 URL
 	// fragment 携带,不渲染裸 JSON)。审计归因用占位用户名:失败路径身份尚未
-	// 验证,不落请求方可控的用户名。
+	// 验证,不落请求方可控的用户名。fail 必须先于配置读取定义：配置读失败 /
+	// 未启用同样发生在导航链上，返回裸 JSON 会让浏览器停在一个 JSON 页面。
 	fail := func(msg, auditDetail string) {
 		if auditDetail != "" {
 			services.RecordAuditLog("oidc-user", "认证拒绝", "用户认证", services.FormatAuditDetail(auditDetail, services.AuditResultPart("failure")), c.ClientIP())
 		}
 		c.Redirect(http.StatusFound, requestOrigin(c)+"/#/oidc/callback?error="+url.QueryEscape(msg))
+	}
+	cfg, cfgErr := loadOIDCConfig()
+	if cfgErr != nil {
+		services.Logf("warn", "OIDC 回调读取配置失败: %v", cfgErr)
+		fail("OIDC 配置读取失败", "")
+		return
+	}
+	if !cfg.Enabled || cfg.Issuer == "" {
+		fail("OIDC 未启用", "")
+		return
 	}
 	// 历史问题：先验 state↔浏览器绑定，再消费 state（失败不消耗合法 state 之外
 	// 的语义：cookie 缺失/不匹配一律拒绝，不回显 token）。
@@ -705,6 +708,9 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
+	// 令牌交换同样走单源出站客户端（oauth2 消费 oidc.ClientContext 写入的同一
+	// context key）：token_endpoint 的重定向不得把 client_secret 带向非 https 地址。
+	ctx = oidc.ClientContext(ctx, oidcOutboundClient)
 	oauthCfg := oidcOAuthConfig(cfg, p, oidcCallbackURL(c))
 	oauth2Token, err := oauthCfg.Exchange(ctx, c.Query("code"),
 		oauth2.SetAuthURLParam("code_verifier", entry.verifier))
@@ -1127,8 +1133,9 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 }
 
 // oidcProbeClient 凭证探测专用客户端:出站请求必须有界(挂起的 token 端点
-// 不得挂起 handler goroutine),与 discovery 8s 口径同族。
-var oidcProbeClient = &http.Client{Timeout: 10 * time.Second}
+// 不得挂起 handler goroutine),与 discovery 8s 口径同族;重定向与
+// discovery/token 共用同一 scheme 复验策略。
+var oidcProbeClient = &http.Client{Timeout: 10 * time.Second, CheckRedirect: oidcCheckRedirect}
 
 // probeOIDCJWKS 探测 jwks_uri：HTTP 200 + 合法 JSON（keys 非空）才算通过。
 // 响应上限 1MB（密钥集远小于此），URL 与 discovery/token 同一 scheme 策略。
@@ -1292,3 +1299,22 @@ func validateOIDCIssuerURL(raw string) error {
 		return errors.New("服务地址须为 https URL")
 	}
 }
+
+// oidcCheckRedirect 出站重定向逐跳复验 scheme 策略（与 validateOIDCIssuerURL
+// 单源）：初始 URL 合规不代表重定向目标合规——跟一次 302 到 http://内网 或任意
+// 主机就能绕过「仅 https（回环例外）」，token 交换还会把 client_secret 带过去。
+// 跳数封顶与 Go 默认一致（10 跳）。
+func oidcCheckRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("OIDC 出站请求重定向次数过多")
+	}
+	if err := validateOIDCIssuerURL(req.URL.String()); err != nil {
+		return fmt.Errorf("重定向目标不合规: %w", err)
+	}
+	return nil
+}
+
+// oidcOutboundClient discovery/JWKS/令牌交换共用的出站客户端：有界超时 +
+// 逐跳重定向复验。go-oidc 通过 oidc.ClientContext 注入（同一 context key 也
+// 被 oauth2 的令牌交换消费），JWKS 验签复用 discovery 时注入的客户端。
+var oidcOutboundClient = &http.Client{Timeout: 10 * time.Second, CheckRedirect: oidcCheckRedirect}

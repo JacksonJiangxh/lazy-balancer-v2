@@ -222,3 +222,30 @@ func TestReadRuleLogFrom_newlineFileDeliversCompleteLines(t *testing.T) {
 		t.Fatalf("next=%d, want %d（仅交付完整行）", next, wantNext)
 	}
 }
+
+// 历史问题：命中回扫上限的 warn 首报留痕+节流——同一规则连续命中只报一次
+// （用户反复打开日志弹框不再每读一行 warn），恢复（读到未截断 tail）补一条
+// info。状态机复用 logStateTransition（与排程读失败/日志轮转同口径）。
+func TestReadRuleLogTail_capWarnThrottledPerRule(t *testing.T) {
+	size := 8 << 20
+	writeRuleLogFile(t, "capwarn", bytes.Repeat([]byte{0x41}, size))
+	stateKey := "rulelog-tail-cap-capwarn"
+	delete(metricsStateFailed, stateKey)
+	t.Cleanup(func() { delete(metricsStateFailed, stateKey) })
+	buf := captureLogf(t)
+
+	ReadRuleLogTail("capwarn", 100)
+	ReadRuleLogTail("capwarn", 100)
+	ReadRuleLogTail("capwarn", 100)
+
+	if warns := strings.Count(buf.String(), "backward scan cap"); warns != 1 {
+		t.Fatalf("cap warn count=%d, want 1（首报后节流）\n%s", warns, buf.String())
+	}
+
+	// 恢复形状：换成正常多行小文件后读取 → 一条恢复 info。
+	writeRuleLogFile(t, "capwarn", []byte("a\nb\nc\n"))
+	ReadRuleLogTail("capwarn", 100)
+	if !strings.Contains(buf.String(), "resumed below the backward scan cap") {
+		t.Fatalf("recovery info missing\n%s", buf.String())
+	}
+}

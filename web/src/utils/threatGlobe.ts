@@ -15,7 +15,7 @@ import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { loadAdmin1Tables, loadedAdmin1Tables } from '@/utils/admin1Loader'
 import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed, DOT_LAND, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent, provinceDotGrid } from '@/utils/threatShared'
 import type { ThreatScene, ThreatSceneOptions, CountryHeat } from '@/utils/threatScene'
-import { FLOW_ATTACK_COLOR, FLOW_NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowArcTierWidth, type FlowArcTier } from '@/utils/threatTheme'
+import { FLOW_ATTACK_COLOR, FLOW_NORMAL_COLOR, FLOW_FLIGHT_MS, FLOW_HOVER_TIP_COLOR, FLOW_RIPPLE_SECONDS, FLOW_RIPPLE_START_RADIUS, FLOW_RIPPLE_GROWTH_RADIUS, FLOW_RIPPLE_LINE_WIDTH, FLOW_RIPPLE_ALPHA, easeOutCubic, flowArcLabel, flowArcTierWidth, type FlowArcTier } from '@/utils/threatTheme'
 import { planFlowArcs } from '@/utils/threatFlowRules'
 import { sphereSurfacePoint, DOT_LAT_TOP, DOT_LAT_BOTTOM } from '@/utils/threatProjection'
 import { buildSphericalArc, SPHERICAL_ARC_SAMPLES } from '@/utils/threatArcCurve'
@@ -42,6 +42,44 @@ const MAX_ARCS = 60
 // 地图书写口径：单个航次（0.95s + 0.22s）后移除；地球叠加层使用同一寿命，
 // 确保两页光流残留时长一致。
 const ARC_TTL = 1250
+
+// 点阵贴图单例：世界/暗度/hover 三层用的是同款 32×32 白色圆点轮廓，原实现
+// 每层各建一份 canvas + CanvasTexture（3 份纹理）。改为单例 + 引用计数：
+// 多个地球实例（切换/重建）共享同一纹理，最后一个实例销毁时才真正释放。
+let sharedDotTexture: THREE.CanvasTexture | null = null
+let sharedDotTextureRefs = 0
+
+function createDotTexture(): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas')
+  canvas.width = canvas.height = 32
+  const ctx = canvas.getContext('2d')
+  if (ctx) {
+    ctx.fillStyle = '#ffffff'
+    ctx.beginPath()
+    ctx.arc(16, 16, 14, 0, Math.PI * 2)
+    ctx.fill()
+  }
+  const tex = new THREE.CanvasTexture(canvas)
+  tex.needsUpdate = true
+  return tex
+}
+
+/** 取得（必要时创建）共享点阵贴图的一次引用；引擎三层材质共用同一实例。 */
+export function acquireDotTexture(): THREE.CanvasTexture {
+  if (!sharedDotTexture) sharedDotTexture = createDotTexture()
+  sharedDotTextureRefs += 1
+  return sharedDotTexture
+}
+
+/** 释放一次引用；最后一个引用释放时销毁共享纹理。 */
+export function releaseDotTexture(): void {
+  if (sharedDotTextureRefs === 0) return
+  sharedDotTextureRefs -= 1
+  if (sharedDotTextureRefs === 0) {
+    sharedDotTexture?.dispose()
+    sharedDotTexture = null
+  }
+}
 
 /** 垂直扫描 shader（参考实现移植）：纬度带自北极向南极往返扫掠。 */
 const FRESNEL_VS = `
@@ -82,6 +120,54 @@ function flyAltitudeFor(name: string): number {
   }
   const span = Math.max(maxLat - minLat, Math.min(maxLon - minLon, 180)) / 2
   return Math.min(2.2, Math.max(0.55, span / 45 + 0.35))
+}
+
+/** 点阵坐标点（与引擎内部 WorldDot 同形；此处只需经纬度）。 */
+export interface DotLatLng {
+  lat: number
+  lng: number
+}
+
+/** 预分配点阵几何：容量固定为点集上界，切换点集只更新 position 前缀并
+ *  用 drawRange 收敛绘制范围（不再每次新建 BufferGeometry）。 */
+export function makeDotGeometry(capacity: number): THREE.BufferGeometry {
+  const geometry = new THREE.BufferGeometry()
+  const attr = new THREE.BufferAttribute(new Float32Array(capacity * 3), 3)
+  attr.setUsage(THREE.DynamicDrawUsage)
+  geometry.setAttribute('position', attr)
+  geometry.setDrawRange(0, 0)
+  return geometry
+}
+
+/** 原地写入点集：复用已有 position 属性，只上报写入区间（addUpdateRange）
+ *  并收敛 drawRange——原实现每次悬停切换都新建 BufferGeometry + 新数组。
+ *  容量不足返回 false（调用方按需扩容），此时不改动几何。 */
+export function writeDotPositions(
+  points: THREE.Points,
+  dots: readonly DotLatLng[],
+  project: (lat: number, lng: number, out: THREE.Vector3) => void,
+): boolean {
+  const attr = points.geometry.getAttribute('position') as THREE.BufferAttribute | undefined
+  if (!attr) return false
+  const array = attr.array as Float32Array
+  if (dots.length * 3 > array.length) return false
+  const v = new THREE.Vector3()
+  for (let i = 0; i < dots.length; i++) {
+    project(dots[i].lat, dots[i].lng, v)
+    array[i * 3] = v.x
+    array[i * 3 + 1] = v.y
+    array[i * 3 + 2] = v.z
+  }
+  attr.clearUpdateRanges()
+  attr.addUpdateRange(0, dots.length * 3)
+  attr.needsUpdate = true
+  points.geometry.setDrawRange(0, dots.length)
+  return true
+}
+
+/** 点阵贴图单例的引用计数（测试/诊断：归零即销毁并置 shared=false）。 */
+export function dotTextureState(): { refs: number; shared: boolean } {
+  return { refs: sharedDotTextureRefs, shared: sharedDotTexture !== null }
 }
 
 export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOptions): ThreatScene {
@@ -126,6 +212,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   let backdropDotsPoints: THREE.Points | null = null
   let hoverDotsPoints: THREE.Points | null = null
   let hoveredDotCountry: string | null = null
+  // 本实例是否持有共享点阵贴图的一次引用（dispose 时释放，最后一个实例归零销毁）。
+  let dotTextureHeld = false
   // 国家级 bbox 预筛（构造期算一次）：点阵构建 + hover/click 命中测试共用
   // （countryHit）。历史：只给 buildWorldDots 消费，hover/click 对 177 国全量
   // 射线，下钻态每 120ms 复测仍付全表成本。
@@ -158,6 +246,21 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     rendererConfig: { antialias: true, alpha: true },
     animateIn: false,
   })(container)
+  // globe.gl 的 getCoords 未在库类型里声明（经纬度→三维坐标的实现 API）。
+  // 这是唯一的坐标边界断言：点阵写入与光流投影共用，避免逐处内联未知形状。
+  const globeCoords = globe as unknown as { getCoords: (lat: number, lng: number, alt: number) => THREE.Vector3 }
+  // 画布屏幕矩形缓存：hover 拾取与浮签定位原每次 getBoundingClientRect 都会
+  // 强制同步布局（自转复测每 120ms 一次）。矩形只随容器尺寸/位置变化——
+  // syncSize（ResizeObserver/window resize/尺寸轮询）与点击时刷新。
+  let canvasRectCache: { left: number; top: number; width: number; height: number } | null = null
+  function canvasRect(): { left: number; top: number; width: number; height: number } {
+    if (!canvasRectCache) {
+      const cv = container.querySelector('canvas')
+      const r = (cv ?? container).getBoundingClientRect()
+      canvasRectCache = { left: r.left, top: r.top, width: r.width, height: r.height }
+    }
+    return canvasRectCache
+  }
   // 构造 config 的 width/height 在此库版本下不可靠（实测首帧仍按 window
   // 1600×1000 建 canvas → 球心偏右，随后 syncSize 才缩回 → 视觉「从右侧
   // 飘入」）。构造后立即显式定尺寸，且 path 层 rendererSize 同源，避免
@@ -233,7 +336,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     .customThreeObjectUpdate(() => { /* 颜色由 updateDotColors 原地更新 */ })
 
   // 海洋球面基色与地图背景同色（#030a1c），并用 Basic 材质去掉光照加成：
-  // 地图点阵透明度/基色是用户认可的口径，球面必须同样让 #1b2a41 点可见。
+  // 地图点阵透明度/基色是用户认可的口径，球面必须同样让陆地底色点可见。
   const oceanMat = new THREE.MeshBasicMaterial({ color: '#030a1c' })
   globe.globeMaterial(oceanMat)
   globe
@@ -275,9 +378,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   function screenToLatLng(px: number, py: number): { lat: number; lng: number } | null {
     const cam = globe.camera() as THREE.PerspectiveCamera
     // 用 canvas 自身矩形（而非外层 container）：canvas 是实际渲染/指针目标，
-    // 容器若有 padding/偏移会让 hover/点击整体平移。
-    const cv = container.querySelector('canvas')
-    const r = (cv ?? container).getBoundingClientRect()
+    // 容器若有 padding/偏移会让 hover/点击整体平移。矩形走缓存（见 canvasRect）。
+    const r = canvasRect()
     const ndcX = ((px - r.left) / r.width) * 2 - 1
     const ndcY = -(((py - r.top) / r.height) * 2 - 1)
     cam.updateMatrixWorld()
@@ -394,7 +496,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   // 记坐标，帧内拾取一次——原实现每个 pointermove 事件全量扫描 177 国多边形，
   // 快速移动时同帧多次射线拾取，hover 明显滞后（历史问题）。 ----
   const hoverTipEl = document.createElement('div')
-  hoverTipEl.style.cssText = 'position:absolute;z-index:6;pointer-events:none;display:none;padding:5px 10px;background:rgba(4,12,32,.92);border:1px solid rgba(80,170,255,.45);color:#e2ecff;font:12px "Noto Sans SC","PingFang SC",sans-serif;white-space:nowrap;border-radius:2px'
+  hoverTipEl.style.cssText = `position:absolute;z-index:6;pointer-events:none;display:none;padding:5px 10px;background:rgba(4,12,32,.92);border:1px solid rgba(80,170,255,.45);color:${FLOW_HOVER_TIP_COLOR};font:12px "Noto Sans SC","PingFang SC",sans-serif;white-space:nowrap;border-radius:2px`
   container.appendChild(hoverTipEl)
   let hoverKeyCache: string | null = null
   let pendingMove: { x: number; y: number } | null = null
@@ -471,8 +573,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       setHexHover(name)
     }
     if (name) {
-      const cv = container.querySelector('canvas')
-      const r = (cv ?? container).getBoundingClientRect()
+      const r = canvasRect()
       hoverTipEl.style.display = 'block'
       // 历史修复：省级统计只覆盖中国，海外下钻不得显示「该省 0 次攻击」。
       hoverTipEl.textContent = provinceHover && drilledName && !hasProvinceStats(drilledName)
@@ -496,21 +597,6 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     hoverKeyCache = null
     hoverTipEl.style.display = 'none'
     setHexHover(null)
-  }
-
-  function dotTexture(): THREE.CanvasTexture {
-    const canvas = document.createElement('canvas')
-    canvas.width = canvas.height = 32
-    const ctx = canvas.getContext('2d')
-    if (ctx) {
-      ctx.fillStyle = '#ffffff'
-      ctx.beginPath()
-      ctx.arc(16, 16, 14, 0, Math.PI * 2)
-      ctx.fill()
-    }
-    const tex = new THREE.CanvasTexture(canvas)
-    tex.needsUpdate = true
-    return tex
   }
 
   const HOVER_DOT_COLOR = new THREE.Color(0.56, 0.9, 1)
@@ -546,7 +632,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     const v = new THREE.Vector3()
     for (let i = 0; i < dots.length; i++) {
       // 以 DOT_ALTITUDE 微小抬高，避免与球面 z-fighting，又不产生悬浮感。
-      v.copy((globe as unknown as { getCoords: (lat: number, lng: number, alt: number) => THREE.Vector3 }).getCoords(dots[i].lat, dots[i].lng, DOT_ALTITUDE))
+      v.copy(globeCoords.getCoords(dots[i].lat, dots[i].lng, DOT_ALTITUDE))
       positions[i * 3] = v.x
       positions[i * 3 + 1] = v.y
       positions[i * 3 + 2] = v.z
@@ -571,13 +657,19 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     updateDotColors()
   }
 
-  /** 复用世界点阵几何生成暗度/ hover 层（单次 BufferGeometry，不重建整颗球）。 */
+  /** 暗度/ hover 层点集切换：原地更新预分配 position 属性（只上传写入区间），
+   *  不再新建 BufferGeometry + 新数组。 */
   function setPointPositions(points: THREE.Points, dots: WorldDot[]): void {
-    const geometry = new THREE.BufferGeometry()
-    geometry.setAttribute('position', new THREE.BufferAttribute(dotPositions(dots), 3))
-    const old = points.geometry
-    points.geometry = geometry
-    old.dispose()
+    const project = (lat: number, lng: number, out: THREE.Vector3): void => {
+      out.copy(globeCoords.getCoords(lat, lng, DOT_ALTITUDE))
+    }
+    if (!writeDotPositions(points, dots, project)) {
+      // 容量不足（世界点阵是点集上界，正常不触发）：扩容一次后重写。
+      const old = points.geometry
+      points.geometry = makeDotGeometry(dots.length)
+      old.dispose()
+      writeDotPositions(points, dots, project)
+    }
   }
 
   /** 下钻衬底：非下钻国家显示为 22% 透明度世界点阵（与 2D 地图一致）。 */
@@ -631,6 +723,10 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       if (list) list.push(dot)
       else worldDotsByKey.set(dot.key, [dot])
     }
+    // 贴图/几何单源：三层共用同一个圆点贴图；暗度/hover 层预分配
+    // position 容量=世界点阵规模（点集上界），切换点集原地更新只上传前缀。
+    const dotTex = acquireDotTexture()
+    dotTextureHeld = true
     // 无贴图、非透明、开启深度写入：PointsMaterial 的最轻路径。
     // 圆形/六边形都需要纹理采样 + alphaTest + 透明混合；在 1.3 万点、
     // 60fps 旋转球体上这部分是持续的每帧成本。方形点视觉上仍是点阵，
@@ -640,13 +736,13 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       vertexColors: true,
       // 圆形观感：贴图只提供 alpha 轮廓；alphaTest 丢弃轮廓外像素，
       // 保持不透明管线（不做透明混合），成本低于 transparent 圆点。
-      map: dotTexture(),
+      map: dotTex,
       alphaTest: 0.5,
       transparent: false,
       depthWrite: true,
       sizeAttenuation: false,
     })
-    dotsPoints = new THREE.Points(new THREE.BufferGeometry(), material)
+    dotsPoints = new THREE.Points(makeDotGeometry(dots.length), material)
     dotsPoints.frustumCulled = false
     dotsPoints.renderOrder = 2
     dotLayerGroup.add(dotsPoints)
@@ -657,14 +753,14 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       color: DRILL_BACKDROP_COLOR,
       transparent: true,
       opacity: DRILL_BACKDROP_OPACITY,
-      map: dotTexture(),
+      map: dotTex,
       // 低透明度材质不能沿用 0.5 alphaTest：alphaTest 在 opacity 之后判定，
       // 会把 opacity<0.5 的全部点丢弃（本次“非下钻国家不可见”的根因）。
       alphaTest: 0.05,
       depthWrite: false,
       sizeAttenuation: false,
     })
-    backdropDotsPoints = new THREE.Points(new THREE.BufferGeometry(), backdropMat)
+    backdropDotsPoints = new THREE.Points(makeDotGeometry(dots.length), backdropMat)
     backdropDotsPoints.frustumCulled = false
     backdropDotsPoints.renderOrder = 1
     backdropDotsPoints.visible = false
@@ -675,12 +771,12 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       color: DRILL_HOVER_COLOR,
       transparent: true,
       opacity: 0.9,
-      map: dotTexture(),
+      map: dotTex,
       alphaTest: 0.5,
       depthWrite: false,
       sizeAttenuation: false,
     })
-    hoverDotsPoints = new THREE.Points(new THREE.BufferGeometry(), hoverMat)
+    hoverDotsPoints = new THREE.Points(makeDotGeometry(dots.length), hoverMat)
     hoverDotsPoints.frustumCulled = false
     hoverDotsPoints.renderOrder = 3
     hoverDotsPoints.visible = false
@@ -735,6 +831,9 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   // click 处理为 async（按需加载省界）——命名包装器承担 add/removeEventListener
   // 同一引用；void 丢弃 Promise 是刻意的（内部处理全部失败分支）。
   const onCanvasClick = (ev: MouseEvent): void => {
+    // 单击是低频手势：顺手刷新拾取矩形，兜住「页面滚动/布局位移但容器尺寸
+    // 未变」的偏移（hover 路径不刷新，避免逐次读布局）。
+    canvasRectCache = null
     void handleCanvasClick(ev)
   }
   const cv = container.querySelector('canvas')
@@ -780,10 +879,6 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   }
   syncFlowSize()
 
-  function easeOutCubic(t: number): number {
-    return 1 - Math.pow(1 - Math.min(1, Math.max(0, t)), 3)
-  }
-
   /** xyz 世界坐标 → 屏幕坐标；返回是否在可见半球。
    *  背面点也会写入 flowProjected（供背面淡色弧段使用），调用方按返回值区分。 */
   function projectFlowXyz(x: number, y: number, z: number, cam: THREE.Camera): boolean {
@@ -801,12 +896,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   /** 经纬度 → 屏幕坐标；背面点返回 null。 */
   function projectFlow(lat: number, lng: number): { x: number; y: number } | null {
     const cam = globe.camera()
-    const raw = (globe as unknown as { getCoords?: (lat: number, lng: number, alt?: number) => { x: number; y: number; z: number } }).getCoords?.(
-      lat,
-      lng,
-      0.005,
-    )
-    if (!cam || !raw || !projectFlowXyz(raw.x, raw.y, raw.z, cam)) return null
+    const raw = globeCoords.getCoords(lat, lng, 0.005)
+    if (!cam || !projectFlowXyz(raw.x, raw.y, raw.z, cam)) return null
     return { x: flowProjected.x, y: flowProjected.y }
   }
 
@@ -823,17 +914,17 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     for (let i = flowRipples.length - 1; i >= 0; i--) {
       const ripple = flowRipples[i]
       ripple.age += delta
-      const t = ripple.age / 1.8
+      const t = ripple.age / FLOW_RIPPLE_SECONDS
       if (t >= 1) {
         flowRipples.splice(i, 1)
         continue
       }
-      const r = 3 + t * 26
+      const r = FLOW_RIPPLE_START_RADIUS + t * FLOW_RIPPLE_GROWTH_RADIUS
       ctx.beginPath()
       ctx.arc(site.x, site.y, r, 0, Math.PI * 2)
       ctx.strokeStyle = ripple.color
-      ctx.lineWidth = 1.5
-      ctx.globalAlpha = 0.85 * (1 - t)
+      ctx.lineWidth = FLOW_RIPPLE_LINE_WIDTH
+      ctx.globalAlpha = FLOW_RIPPLE_ALPHA * (1 - t)
       ctx.stroke()
       ctx.globalAlpha = 1
     }
@@ -979,6 +1070,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     const h = container.clientHeight
     if (w > 0 && h > 0 && (globe.width() !== w || globe.height() !== h)) globe.width(w).height(h)
     syncFlowSize()
+    // 容器尺寸/布局变化后拾取矩形缓存失效（下次拾取重新测量一次）。
+    canvasRectCache = null
   }
   let syncTries = 0
   const syncTimer = window.setInterval(() => {
@@ -1200,10 +1293,13 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
         if (!points) continue
         points.geometry.dispose()
         const pointsMaterial = points.material as THREE.PointsMaterial
-        // 历史问题：Material.dispose() 不释放贴图——dotTexture 的 CanvasTexture
-        // 必须显式释放，否则反复进出大屏累积 Canvas/GPU 资源。
-        pointsMaterial.map?.dispose()
         pointsMaterial.dispose()
+      }
+      // 共享贴图按引用计数释放：最后一次 dispose 才销毁 CanvasTexture
+      // （原实现每个材质各 dispose 自己那份纹理；单例后材质释放不碰贴图）。
+      if (dotTextureHeld) {
+        releaseDotTexture()
+        dotTextureHeld = false
       }
       dotsPoints = null
       backdropDotsPoints = null

@@ -3442,15 +3442,28 @@ func TestSecurityEventsFallbackGate_CustomFamilyTruthTable(t *testing.T) {
 		{"blocking id11 blocked", "blocking", "none", "blocked", "11", true},
 		{"blocking id11 logged", "blocking", "enabled", "logged", "11", true},
 	}
+	const truthRuleID = "lb_truth"
+	const truthPolicyID = 1
+	const boosterPolicyID = 2
 	for _, tc := range cells {
 		t.Run(tc.id+"/"+tc.name, func(t *testing.T) {
+			// 端到端归因调用（不自建「门 ∧ 能力」组合）：生产 attribute 的
+			// 能力首选层/必归属层顺序与豁免维度全部在链路内生效。
+			//
+			// 必须在目标策略之后绑定一个「能力完备」的 blocking+启用自定义
+			// 规则策略：单绑定时「必有归属层」会把不可产事件也归给目标策略，
+			// 令 want=false 的格子失去鉴别力；booster 使得能力首选层落空的
+			// 事件被它接走，从而端到端可观测「目标策略是否真的能产该事件」。
 			p := newPolicy(tc.mode, refs[tc.ref])
-			got := securityEventsFallbackCanProduce(p, tc.action, tc.id)
-			if got && securityEventsRuleIsCustomFamily(tc.id) {
-				got = securityEventsCustomRulesEventSurface(p)
-			}
+			p.ID = truthPolicyID
+			booster := newPolicy("blocking", refs["enabled"])
+			booster.ID = boosterPolicyID
+			policyByID := map[int]*models.SecurityPolicy{truthPolicyID: p, boosterPolicyID: booster}
+			bindings := map[string][]int{truthRuleID: {truthPolicyID, boosterPolicyID}}
+			pid, _ := securityEventsAttributePolicy(truthRuleID, tc.id, tc.action, "", policyByID, bindings)
+			got := pid == truthPolicyID
 			if got != tc.want {
-				t.Fatalf("attributable(mode=%s,ref=%s,%s,%s)=%v, want %v", tc.mode, tc.ref, tc.action, tc.id, got, tc.want)
+				t.Fatalf("attributable(mode=%s,ref=%s,%s,%s)=%v (pid=%d), want %v", tc.mode, tc.ref, tc.action, tc.id, got, pid, tc.want)
 			}
 		})
 	}

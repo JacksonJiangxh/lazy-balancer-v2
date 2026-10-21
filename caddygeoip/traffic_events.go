@@ -67,7 +67,16 @@ func trafficEventRecord(country, province string) {
 	trafficEventsMu.Unlock()
 }
 
+// trafficEventSnapshot 兼容形态（测试/内部两返回值消费方）：丢弃 gap 统计。
 func trafficEventSnapshot(since uint64, limit int) ([]trafficEvent, uint64) {
+	events, next, _ := trafficEventSnapshotWithGap(since, limit)
+	return events, next
+}
+
+// trafficEventSnapshotWithGap 返回本批事件、next_seq 与「因环形缓冲溢出而
+// 永久丢失」的事件数（gapSkipped>0 即存在空洞）。审计项：此前溢出后
+// 消费者只看到 seq 跳号、无任何标记——前端无法区分「抽样稀疏」与「丢事件」。
+func trafficEventSnapshotWithGap(since uint64, limit int) ([]trafficEvent, uint64, uint64) {
 	if limit <= 0 {
 		limit = 200
 	}
@@ -77,6 +86,12 @@ func trafficEventSnapshot(since uint64, limit int) ([]trafficEvent, uint64) {
 	trafficEventsMu.Lock()
 	defer trafficEventsMu.Unlock()
 	out := make([]trafficEvent, 0, limit)
+	// gap：消费者游标 before 最老保留序号 ⇒ 中间的记录已被环形缓冲覆盖。
+	// since=0（首屏）不算空洞——它本就只取最新窗口。
+	var gapSkipped uint64
+	if since > 0 && len(trafficEvents) > 0 && since+1 < trafficEvents[0].Seq {
+		gapSkipped = trafficEvents[0].Seq - since - 1
+	}
 	// since=0 首次拉取只返回最近 limit 条，避免重放整个环形缓冲。
 	start := 0
 	if since == 0 {
@@ -107,7 +122,7 @@ func trafficEventSnapshot(since uint64, limit int) ([]trafficEvent, uint64) {
 	} else if len(out) > 0 {
 		next = out[len(out)-1].Seq
 	}
-	return out, next
+	return out, next, gapSkipped
 }
 
 func serveTrafficEvents(w http.ResponseWriter, r *http.Request) error {
@@ -115,12 +130,16 @@ func serveTrafficEvents(w http.ResponseWriter, r *http.Request) error {
 	w.Header().Set("Cache-Control", "no-store")
 	since, _ := strconv.ParseUint(r.URL.Query().Get("since"), 10, 64)
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	events, next := trafficEventSnapshot(since, limit)
+	events, next, gapSkipped := trafficEventSnapshotWithGap(since, limit)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"enabled":  trafficCollectorActive(),
 		"events":   events,
 		"next_seq": next,
 		"sample_n": trafficEventSampleN.Load(),
+		// 环形缓冲溢出导致的永久空洞（>0=本批之前有事件未送达，前端应
+		// 丢弃「连续光流」假设并跳到 next_seq 继续追赶）。
+		"gap":         gapSkipped > 0,
+		"gap_skipped": gapSkipped,
 	})
 	return nil
 }

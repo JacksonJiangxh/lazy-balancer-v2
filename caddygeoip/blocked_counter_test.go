@@ -38,6 +38,7 @@ func TestSecurityBlockedCounter_ServeHTTP(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			caseBefore := testutil.ToFloat64(testCounter.WithLabelValues(rule))
 			h := &SecurityBlockedCounter{Rule: rule, metrics: testCounter}
 			next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return tc.nextErr })
 			rec := httptest.NewRecorder()
@@ -46,6 +47,12 @@ func TestSecurityBlockedCounter_ServeHTTP(t *testing.T) {
 			// 返回值必须原样透传(链语义零改动)
 			if gotErr != tc.nextErr {
 				t.Fatalf("ServeHTTP returned %v, want passthrough %v", gotErr, tc.nextErr)
+			}
+			// 逐例分类断言:聚合值在「该计的不计」与「不该计的计入」相互抵消时
+			// 仍可能相等，只有逐例增量能钉住每一格的计数语义。
+			caseDelta := testutil.ToFloat64(testCounter.WithLabelValues(rule)) - caseBefore
+			if caseDelta != tc.wantCount {
+				t.Fatalf("counter delta=%v, want %v (case=%s, err=%v)", caseDelta, tc.wantCount, tc.name, tc.nextErr)
 			}
 		})
 	}

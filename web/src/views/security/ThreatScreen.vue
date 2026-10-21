@@ -55,6 +55,7 @@
           <button type="button" class="btn error-retry" @click="mountEngine">重试</button>
         </div>
         <div v-if="trafficError" class="error-banner traffic-error">流量采集不可用（Caddy admin 不可达），曲线已保留上一帧</div>
+        <div v-if="flowError || attackFlowError" class="error-banner site-unset">光流数据加载失败，正在重试…</div>
         <div v-if="!siteConfigured" class="error-banner site-unset">未配置站点坐标，本站信标与攻击弹道已隐藏</div>
       </div>
     </div>
@@ -804,6 +805,10 @@ const toastTask = usePollingTask(async ({ signal, isCurrent }) => {
 }, { interval: FEED_POLL_MS, onError: () => { /* 弹框不可用不阻断大屏 */ } })
 
 // ============ 攻击光流：独立攻击流环形缓冲（采样只影响本流） ============
+// 光流端点可用性位（历史问题-6）：攻击流/正常流失败此前被 onError 静默吞掉，
+// 大屏只剩静态热力，运维无法区分「无流量」与「光流管线故障」——补显性横幅。
+const flowError = ref(false)
+const attackFlowError = ref(false)
 let attackFlowSince = 0
 const attackFlowTask = usePollingTask(async ({ signal, isCurrent }) => {
   const res = await request.get<APIResponse<{ enabled?: boolean; events?: AttackFlowEvent[]; next_seq?: number }>>(
@@ -811,6 +816,7 @@ const attackFlowTask = usePollingTask(async ({ signal, isCurrent }) => {
     { silent: true, signal },
   )
   if (!isCurrent()) return
+  attackFlowError.value = false
   const data = res.data
   if (!data?.enabled) {
     attackFlowSince = 0
@@ -825,7 +831,7 @@ const attackFlowTask = usePollingTask(async ({ signal, isCurrent }) => {
     threatMap?.addArcForLocation(item.region, item.weight, item.tier)
   }
   attackFlowSince = nextFlowCursor(attackFlowSince, { enabled: true, next_seq: data.next_seq })
-}, { interval: ATTACK_FLOW_POLL_MS, onError: () => { /* 攻击流不可用不阻断大屏 */ } })
+}, { interval: ATTACK_FLOW_POLL_MS, onError: () => { attackFlowError.value = true } })
 
 const statsTask = usePollingTask(async ({ signal, isCurrent }) => {
   const res = await request.get<APIResponse<ThreatScreenStats>>(`/security/overview/threat-screen?hours=${windowHours.value}`, { silent: true, signal })
@@ -855,6 +861,7 @@ const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
     { silent: true, signal },
   )
   if (!isCurrent() || cursorEpoch !== flowCursorEpoch) return
+  flowError.value = false
   const data = res.data
   if (!data?.enabled) {
     flowSince = 0
@@ -889,7 +896,7 @@ const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
       acquireCollector()
     }
   }
-}, { interval: 1000, onError: () => { /* 事件流不可用不阻断大屏 */ } })
+}, { interval: 1000, onError: () => { flowError.value = true } })
 
 // ============ 引擎装载（与配置并行，import 失败可重试） ============
 const engineError = ref(false)
@@ -917,6 +924,9 @@ async function mountEngine(): Promise<void> {
       threatMap = null
       mountedMode = null
     }
+    // 引擎重装（地图/地球切换、失败重试）后新实例从世界视角开始：复位下钻态，
+    // 否则「返回世界」按钮与 ESC 仍指向上一个引擎的下钻国（历史问题-4）。
+    zoomedName.value = null
     engineError.value = false
     const create: (host: HTMLElement, options?: ThreatSceneOptions) => ThreatScene = mode === 'globe'
       ? (await import('@/utils/threatGlobe')).createThreatGlobe
@@ -978,6 +988,9 @@ function togglePause(): void {
     toastCursor = 0
     toastInitialized = false
     toastLastPollAt = 0
+    // 暂停期间的计数器差值不能当成本间隔增量（历史问题-5）：恢复首轮只重建
+    // 基线，QPS 曲线从下一轮干净间隔开始，避免被暂停时长摊薄。
+    trafficBaseline = null
     feedTask.resume()
     toastTask.resume()
     attackFlowTask.resume()
@@ -1056,6 +1069,8 @@ const screenLoop = createVisibilityIntervals({
     flowCursorEpoch++
     flowSince = 0
     attackFlowSince = 0
+    // 后台停摆时长不参与 QPS 差分（与手动暂停恢复同口径）。
+    trafficBaseline = null
     toastCursor = 0
     toastInitialized = false
     toastLastPollAt = 0

@@ -151,3 +151,37 @@ func TestWatchdogFixturesAreValidJSON(t *testing.T) {
 		}
 	}
 }
+
+// 发布谓词钉测试（历史问题 单源化）：看门狗期望集=「启用 ∧ 存在启用上游」——
+// 与渲染侧 Go 跳过（零启用上游 warn+continue）恒等。谓词改为共享常量
+// publishableRulesSQLPredicate 后，本测试钉死两消费层语义不漂移。
+func TestExpectedRenderedRules_publishablePredicate(t *testing.T) {
+	newClusterTestService(t)
+	seed := func(stmt string, args ...any) {
+		t.Helper()
+		if _, err := db.DB.Exec(stmt, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	seed(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,enabled,enable_tls) VALUES
+		('lb_pub_yes','publishable','http',18081,1,0),
+		('lb_pub_noups','no enabled upstream','http',18082,1,0),
+		('lb_pub_disabled','disabled','http',18083,0,0)`)
+	seed(`INSERT INTO upstreams (rule_id,host,port,enabled) VALUES
+		('lb_pub_yes','127.0.0.1',9001,1),
+		('lb_pub_noups','127.0.0.1',9002,0),
+		('lb_pub_disabled','127.0.0.1',9003,1)`)
+
+	expected, err := expectedRenderedRules()
+	if err != nil {
+		t.Fatalf("expectedRenderedRules: %v", err)
+	}
+	if _, ok := expected["lb_pub_yes"]; !ok {
+		t.Fatalf("enabled rule with enabled upstream must be publishable: %v", expected)
+	}
+	for _, id := range []string{"lb_pub_noups", "lb_pub_disabled"} {
+		if _, ok := expected[id]; ok {
+			t.Fatalf("%s must not be publishable: %v", id, expected)
+		}
+	}
+}

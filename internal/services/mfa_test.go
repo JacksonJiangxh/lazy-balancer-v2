@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -402,5 +403,68 @@ func TestMFAGetStatus_reportsCorruptedRecoveryCodes(t *testing.T) {
 	}
 	if _, err := MFAGetStatus(9); err == nil {
 		t.Fatal("恢复码存储损坏必须返回错误（此前被吞为 0 个）")
+	}
+}
+
+// 未启用 MFA 的用户走任一验证入口都必须得到业务态哨兵（ErrMFANotEnabled），
+// 与查询/写库故障的可识别错误分开——handler 据此映射 400 业务文案而非 500。
+func TestMFAVerifyEntries_notEnabledSentinel(t *testing.T) {
+	mfaTestEnv(t)
+	mfaSeedUser(t, 7)
+	now := time.Now()
+
+	if ok, err := MFAVerifyCode(7, "123456", now); ok || !errors.Is(err, ErrMFANotEnabled) {
+		t.Fatalf("TOTP 通道: ok=%v err=%v, want (false, ErrMFANotEnabled)", ok, err)
+	}
+	// 恢复码通道（10-16 字符）同门：secret 为空时不得触及恢复码存储。
+	if ok, err := MFAVerifyCode(7, "RECOVERYCODE1234", now); ok || !errors.Is(err, ErrMFANotEnabled) {
+		t.Fatalf("恢复码通道: ok=%v err=%v, want (false, ErrMFANotEnabled)", ok, err)
+	}
+	if ok, err := MFAVerifyTOTPCode(7, "123456", now); ok || !errors.Is(err, ErrMFANotEnabled) {
+		t.Fatalf("仅 TOTP 入口: ok=%v err=%v, want (false, ErrMFANotEnabled)", ok, err)
+	}
+}
+
+// 并发交错的终局：失败计数已把挑战作废（consumed=1、attempts≥阈值），随后
+// 到达的归还（同一 token 另一失败尝试的 consume→restore）不得把作废状态抹回
+// 未消费——单挑战 10 次硬闸不得被并发抹平。
+func TestMFARestoreChallenge_doesNotResurrectInvalidatedChallenge(t *testing.T) {
+	mfaTestEnv(t)
+	mfaSeedUser(t, 8)
+	const token = "tok-restore-interleaved"
+	if _, err := db.DB.Exec(`INSERT INTO mfa_challenges (token, user_id, expires_at, consumed, attempts)
+		VALUES (?, 8, datetime('now','+10 minutes'), 1, ?)`, token, mfaChallengeFailThreshold); err != nil {
+		t.Fatal(err)
+	}
+
+	MFARestoreChallenge(token, 8)
+
+	var consumed bool
+	var attempts int
+	if err := db.DB.QueryRow(`SELECT COALESCE(consumed,0), COALESCE(attempts,0) FROM mfa_challenges WHERE token=?`, token).Scan(&consumed, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if !consumed {
+		t.Fatalf("达阈值的挑战被归还在 attempts=%d 下复活", attempts)
+	}
+	if ok, err := MFAConsumeChallenge(token, 8); ok || err != nil {
+		t.Fatalf("作废挑战不得再被消费: ok=%v err=%v", ok, err)
+	}
+}
+
+// 阈值以下仍须可归还：错误验证码不烧挑战的既有契约保持。
+func TestMFARestoreChallenge_belowThresholdRestores(t *testing.T) {
+	mfaTestEnv(t)
+	mfaSeedUser(t, 10)
+	const token = "tok-restore-below"
+	if _, err := db.DB.Exec(`INSERT INTO mfa_challenges (token, user_id, expires_at, consumed, attempts)
+		VALUES (?, 10, datetime('now','+10 minutes'), 1, ?)`, token, mfaChallengeFailThreshold-1); err != nil {
+		t.Fatal(err)
+	}
+
+	MFARestoreChallenge(token, 10)
+
+	if ok, err := MFAConsumeChallenge(token, 10); !ok || err != nil {
+		t.Fatalf("阈值以下的归还必须生效: ok=%v err=%v", ok, err)
 	}
 }

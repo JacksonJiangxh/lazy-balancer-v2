@@ -44,11 +44,13 @@ func TestGetCRSInfo_dbFailureReturns500(t *testing.T) {
 func TestGetIPEventCount(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	// 种子:2 条 30 天内 + 1 条 40 天前(metrics 库)
-	db.MetricsDB.Exec(`INSERT INTO security_events (event_time,action,client_ip,rule_caddy_id) VALUES
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time,action,client_ip,rule_caddy_id) VALUES
 		(datetime('now','-1 day'),'blocked','1.2.3.4','r1'),
 		(datetime('now','-2 day'),'logged','1.2.3.4','r1'),
 		(datetime('now','-40 day'),'blocked','1.2.3.4','r1'),
-		(datetime('now','-1 day'),'blocked','5.6.7.8','r1')`)
+		(datetime('now','-1 day'),'blocked','5.6.7.8','r1')`); err != nil {
+		t.Fatalf("seed security events: %v", err)
+	}
 	router := gin.New()
 	router.GET("/security/events/count", h.GetIPEventCount)
 

@@ -394,8 +394,11 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 		return wrapped
 	}
 
+	// 残留临时文件清理是卫生动作：失败降 warn 不阻断备份本体（历史问题——
+	// 此前 fail() 把整轮备份标 failed；残留文件下一轮清理重试，且两种临时
+	// 形态不参与下载/还原路径）。
 	if err := cleanupAutoBackupTempFiles(dir); err != nil {
-		return autoBackupRowView{}, fail("清理备份临时文件失败", err)
+		services.Logf("warn", "自动备份：清理残留临时文件失败（不阻断本次备份）: %v", err)
 	}
 	sections, err := loadAutoBackupSectionsSetting()
 	if err != nil {
@@ -722,17 +725,17 @@ func (h *Handlers) RunAutoBackupNow(c *gin.Context) {
 	if !h.requireAutoBackupMaster(c) {
 		return
 	}
-	operator := c.GetString("username")
-	if operator == "" {
-		operator = "system"
-	}
 	te := services.TaskEngine()
 	if te == nil {
 		respondTaskEngineUnavailable(c)
 		return
 	}
-	if err := te.RunAsync("auto-backup", "manual", operator); err != nil {
-		recordAudit(c, "触发失败", "自动备份", "手动触发备份失败: "+err.Error())
+	// 审计分类单源 services.TriggerTaskAsync（历史问题：三份手动触发分类
+	// 收敛）——ErrAlreadyRunning 并发双击静默（不再误记「触发失败」），
+	// 其余 admission/执行失败由单源补「触发失败」审计；HTTP 状态映射留本地
+	//（本端点 EngineStopped=503 等文案面向备份场景）。
+	actx := triggerAuditContext(c, "自动备份", "自动备份")
+	if err := services.TriggerTaskAsync(te, "auto-backup", actx); err != nil {
 		switch {
 		case errors.Is(err, taskengine.ErrAlreadyRunning):
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "已有备份任务正在执行（含定时备份），请稍后重试"})

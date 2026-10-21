@@ -88,3 +88,27 @@ func TestListCRSRules_pageSizeClampsToCap(t *testing.T) {
 		t.Fatalf("page_size=0 → %d, want default 50", got)
 	}
 }
+
+// 分页非法值必须 400（与事件列表同口径）：CRS 列表旧实现丢弃 fmt.Sscanf
+// 错误静默回落第 1 页/50 条——调用方拼写错误完全无信号，而同面板事件列表
+// 对同样输入返回 400。
+func TestListCRSRules_invalidPaginationRejected(t *testing.T) {
+	oldDir := crsRulesDir
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "REQUEST-901-INITIALIZATION.conf"), []byte("# stub"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	crsRulesDir = dir
+	t.Cleanup(func() { crsRulesDir = oldDir })
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/security/crs/rules", (&Handlers{}).ListCRSRules)
+
+	for _, query := range []string{"page=abc", "page_size=abc", "page=1.5", "page_size=ten"} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/security/crs/rules?"+query, nil))
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("query=%s status=%d body=%s, want 400（与事件列表同口径）", query, recorder.Code, recorder.Body.String())
+		}
+	}
+}

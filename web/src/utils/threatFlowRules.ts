@@ -1,6 +1,7 @@
 // 威胁大屏光流/弹框聚合单源（纯函数，node:test 可覆盖）。
 // 口径：攻击类型不区分，只按地域；中国精确到省；同一地区同一秒为一桶。
 import { FLOW_AGGREGATE_THRESHOLD, type FlowArcTier } from './threatTheme.ts'
+import { parseIpLocation } from './ipLocationParts.ts'
 
 export interface FlowGroup<T> {
   /** 聚合地域 key（中国精确到省，其余国家） */
@@ -27,7 +28,9 @@ export const FLOW_REALTIME_MAX_AGE_MS = 5 * 60_000
 /** 攻击只按地域聚合；中国精确到省（地图/地球同一口径）。 */
 export function flowRegionKey(ipLocation: string | undefined): string {
   if (!ipLocation) return '未知'
-  const [country, province] = ipLocation.split('·')
+  // 与弧线起点共用同一拆分规则（历史问题：两处各自 split('·')，分隔/段数
+  // 变化时「键里的省」与「端点用的省」会漂移）。
+  const { country, province } = parseIpLocation(ipLocation)
   if (!country) return '未知'
   if (country === '中国' && province) return `${country}·${province}`
   return country

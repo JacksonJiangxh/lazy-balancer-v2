@@ -25,7 +25,7 @@ func TestCollectSystemTasks_nilDBGuards(t *testing.T) {
 	db.DB = nil
 	t.Cleanup(func() { db.DB = old })
 
-	if rows := collectCertJobRows(); rows != nil {
+	if rows, _ := collectCertJobRows(); rows != nil {
 		t.Fatalf("nil DB 时 collectCertJobRows=%v, want nil", rows)
 	}
 
@@ -57,7 +57,7 @@ func TestCollectCertJobRows_disabledRowNotTriggerable(t *testing.T) {
 	seedCertJobRowForTaskMonitor(t, "lb_tm_disabled", "disabled.example.com", "disabled")
 	seedCertJobRowForTaskMonitor(t, "lb_tm_queued", "queued.example.com", "queued")
 
-	rows := collectCertJobRows()
+	rows, _ := collectCertJobRows()
 	byDomain := map[string]TaskInfo{}
 	for _, r := range rows {
 		byDomain[strings.TrimPrefix(r.Name, "ACME 签发 · ")] = r

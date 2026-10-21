@@ -467,3 +467,46 @@ func TestSecurityPoliciesRebuildSchema_matchesFreshDDL(t *testing.T) {
 		t.Fatalf("rebuilt policy values=(%q,%q,%d,%d), want preserved", countries, geoMode, wafCheck, blockStatus)
 	}
 }
+
+// global_config.timezone 的空串不是合法库值：time.LoadLocation("") 是 Go 的
+// 特殊值（返回 UTC）→ ConfigureLocation("") 静默把全站时区切成 UTC，而读侧
+// COALESCE(timezone,'Asia/Shanghai') 只兜 NULL。写侧已拒绝空串（设置保存/
+// 备份导入同一 services.ValidateLocationName），启动迁移负责收敛带外写入或
+// 旧备份恢复的存量空串/空白串。
+func TestRunMigrationsBackfillsEmptyTimezone(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config) VALUES (1,'{}')`); err != nil {
+		t.Fatalf("seed global config: %v", err)
+	}
+	if _, err := database.Exec("UPDATE global_config SET timezone='' WHERE id=1"); err != nil {
+		t.Fatalf("empty timezone: %v", err)
+	}
+
+	if err := runMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+	var tz string
+	if err := database.QueryRow("SELECT timezone FROM global_config WHERE id=1").Scan(&tz); err != nil {
+		t.Fatalf("read timezone: %v", err)
+	}
+	if tz != DefaultTimezone {
+		t.Fatalf("timezone=%q, want %q（空串必须启动归一）", tz, DefaultTimezone)
+	}
+
+	// 用户显式设置的合法时区恒不被触碰。
+	if _, err := database.Exec("UPDATE global_config SET timezone='America/New_York' WHERE id=1"); err != nil {
+		t.Fatalf("set timezone: %v", err)
+	}
+	if err := runMigrations(); err != nil {
+		t.Fatalf("run migrations second round: %v", err)
+	}
+	if err := database.QueryRow("SELECT timezone FROM global_config WHERE id=1").Scan(&tz); err != nil {
+		t.Fatalf("read timezone: %v", err)
+	}
+	if tz != "America/New_York" {
+		t.Fatalf("timezone=%q, want America/New_York（已设值不得被归一抹掉）", tz)
+	}
+}

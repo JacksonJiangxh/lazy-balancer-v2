@@ -10,24 +10,29 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
 
-const HERE = dirname(fileURLToPath(import.meta.url))
-const ROOT = join(HERE, '..')
-const globeSrc = readFileSync(join(ROOT, 'src/utils/threatGlobe.ts'), 'utf8')
+import { member, source } from './_helpers.ts'
 
-/** 截取成员体：对象方法（4 空格缩进）或闭包内函数（2 空格缩进）。 */
-function member(src: string, marker: string): string {
-  const start = src.indexOf(marker)
-  assert.notEqual(start, -1, `缺少成员 ${marker}`)
-  const objEnd = src.indexOf('\n    }', start)
-  const fnEnd = src.indexOf('\n  }', start)
-  const end = objEnd >= 0 && (fnEnd < 0 || objEnd < fnEnd) ? objEnd : fnEnd
-  assert.notEqual(end, -1, `无法截取成员体 ${marker}`)
-  return src.slice(start, end)
-}
+const globeSrc = source('src/utils/threatGlobe.ts')
+
+// member() 的可判定前置：切片必须真的包含嵌套块。缩进启发式会在函数内第一个
+// 内层块收尾处截断，块内 banned 标记的 doesNotMatch 断言会假绿——这里先证明
+// helper 对该形态取到完整函数体。
+test('member() 按花括号配对：嵌套块完整保留，块内 doesNotMatch 才有鉴别力', () => {
+  const sample = [
+    'function withNested(): void {',
+    '  if (ready) {',
+    '    banned()',
+    '  }',
+    '  allowed()',
+    '}',
+    'const after = 1',
+  ].join('\n')
+  const body = member(sample, 'function withNested(')
+  assert.match(body, /banned\(\)/, '嵌套内层块必须在切片内')
+  assert.match(body, /allowed\(\)/, '外层收尾语句必须在切片内')
+  assert.doesNotMatch(body, /const after/, '切片不得越过函数收尾')
+})
 
 test('复位/返回必须作废在途省界加载（与地图引擎同源）', () => {
   for (const name of ['zoomOut', 'resetView']) {

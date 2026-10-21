@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 // apiKeyVisibility 是 tools/list 过滤所需的 Key 属主属性。
@@ -117,15 +118,24 @@ func serveWithToolVisibility(writer http.ResponseWriter, request *http.Request, 
 	}
 	request.Body = io.NopCloser(bytes.NewReader(requestBody))
 	var rpcRequest struct {
-		Method string `json:"method"`
+		Method string          `json:"method"`
+		ID     json.RawMessage `json:"id"`
 	}
 	if json.Unmarshal(requestBody, &rpcRequest) != nil || rpcRequest.Method != "tools/list" || resolver == nil {
 		next.ServeHTTP(writer, request)
 		return
 	}
 	visibility, err := resolver(extractAPIKey(request.Header))
-	if err != nil || visibility.unknown || (visibility.admin && !visibility.readOnly) {
-		// 解析失败/无身份按原样透传（与旧行为一致）；管理员全权 Key 无需过滤。
+	if err != nil {
+		// fail-closed：无法判定 Key 属主时不再原样透传全量工具（旧行为），
+		// 改为空 tools 列表 + warn 日志——工具可见性必须由身份决定。
+		services.Logf("warn", "mcp tools/list 可见性判定失败，已按 fail-closed 拒绝下发工具列表: %v", err)
+		writeEmptyToolsList(writer, rpcRequest.ID)
+		return
+	}
+	if visibility.unknown || (visibility.admin && !visibility.readOnly) {
+		// 无身份可判定（未携带 Key / DB 未初始化，mcpserver 独立使用）与
+		// 管理员全权 Key 无需过滤。
 		next.ServeHTTP(writer, request)
 		return
 	}
@@ -145,13 +155,39 @@ func serveWithToolVisibility(writer http.ResponseWriter, request *http.Request, 
 		})
 	}
 	if err != nil {
-		filtered = recorder.body.Bytes()
+		// 过滤失败同样 fail-closed：不得回退为未过滤原文（过滤器失效的
+		// 自然后果是工具全量泄露）。
+		services.Logf("warn", "mcp tools/list 过滤失败，已按 fail-closed 拒绝下发工具列表: %v", err)
+		writeEmptyToolsList(writer, rpcRequest.ID)
+		return
 	}
 	for name, values := range recorder.header {
 		writer.Header()[name] = append([]string(nil), values...)
 	}
 	writer.WriteHeader(recorder.statusCode)
 	_, _ = writer.Write(filtered)
+}
+
+// writeEmptyToolsList 以空 tools 列表响应 tools/list（可见性判定失败时的
+// fail-closed 终态）：保留 JSON-RPC id 供调用方配对，但不暴露任何未经身份
+// 判定的工具。
+func writeEmptyToolsList(writer http.ResponseWriter, requestID json.RawMessage) {
+	if len(requestID) == 0 {
+		requestID = json.RawMessage(`null`)
+	}
+	envelope := map[string]json.RawMessage{
+		"jsonrpc": json.RawMessage(`"2.0"`),
+		"id":      requestID,
+		"result":  json.RawMessage(`{"tools":[]}`),
+	}
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		http.Error(writer, `{"jsonrpc":"2.0","id":null,"result":{"tools":[]}}`, http.StatusOK)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write(data)
 }
 
 // resolveAPIKeyVisibility 解析 Key 属主属性（只读 + 是否管理员）。历史修复：

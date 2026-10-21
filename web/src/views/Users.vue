@@ -297,6 +297,7 @@ import { ElMessageBox, ElMessage } from 'element-plus'
 import { UserFilled, User, Plus, Key, Lock, Warning } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import { useClampedPagination } from '@/composables/useClampedPagination'
+import { validatePassword, validateUsername } from '@/utils/credentials'
 import QRCode from 'qrcode'
 import type { APIResponse, UserListItem } from '@/types'
 const oidcOpen = ref(false)
@@ -384,18 +385,25 @@ const fetchUsers = async () => {
 
 const handleSubmit = async () => {
   if (isReadOnly.value || submitting.value) return
-  // 历史问题：用户名前置校验（对齐后端 CreateUser/UpdateUser 的 min=3,max=50 与 Login.vue
-  // setup 口径）——创建必填；编辑态用户名只读，非空时同口径兜底。不合法前置拦截，不发请求。
+  // 历史问题：用户名前置校验（对齐后端 CreateUser/UpdateUser 的 min=3,max=50、
+  // 字符集 ^[a-z][a-z0-9]*$ 与 Login.vue setup 口径）——创建必填；编辑态用户名
+  // 只读，非空时同口径兜底。不合法前置拦截，不发请求。
   if (!editingUser.value && !form.value.username) {
     ElMessage.warning('请输入用户名')
     return
   }
-  if (form.value.username && (form.value.username.length < 3 || form.value.username.length > 50)) {
-    ElMessage.warning('用户名长度需为 3-50 位')
+  const usernameError = validateUsername(form.value.username)
+  if (usernameError) {
+    ElMessage.warning(usernameError)
     return
   }
-  if ((!editingUser.value && !form.value.password) || (form.value.password && form.value.password.length < 8)) {
-    ElMessage.warning('密码长度8-24位，仅限数字、大小写字母和特殊字符')
+  if (!editingUser.value && !form.value.password) {
+    ElMessage.warning('请输入密码')
+    return
+  }
+  const passwordError = validatePassword(form.value.password)
+  if (passwordError) {
+    ElMessage.warning(passwordError)
     return
   }
   if (form.value.password && form.value.password !== form.value.password_confirm) {
@@ -548,8 +556,9 @@ function lbCancel() {
 function lbConfirm() {
   const mode = lbDialog.spec?.mode
   if (mode === 'reset-pwd') {
-    if (!lbDialog.newPwd || lbDialog.newPwd.length < 8) { ElMessage.error('密码长度8-24位，仅限数字、大小写字母和特殊字符'); return }
-    if (lbDialog.newPwd.length > 24) { ElMessage.error('密码长度不能超过24位'); return }
+    const passwordError = validatePassword(lbDialog.newPwd)
+    if (passwordError) { ElMessage.error(passwordError); return }
+    if (!lbDialog.newPwd) { ElMessage.error('请输入密码'); return }
     if (lbDialog.newPwd !== lbDialog.newPwd2) { ElMessage.error('两次输入的新密码不一致'); return }
   } else if (mode === 'mfa-code') {
     if (!validateMfaCodeInput(lbDialog.code)) { ElMessage.error('请输入验证码或恢复代码'); return }

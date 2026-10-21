@@ -95,16 +95,8 @@ func TestMetricsHandlers_useDedicatedCaddyMetricsURL(t *testing.T) {
 			if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_metrics_url','metrics','http','metrics.example.test',80,1)`); err != nil {
 				t.Fatal(err)
 			}
-			metricsDashboardCache.Lock()
-			metricsDashboardCache.payload = nil
-			metricsDashboardCache.expiresAt = time.Time{}
-			metricsDashboardCache.Unlock()
-			t.Cleanup(func() {
-				metricsDashboardCache.Lock()
-				metricsDashboardCache.payload = nil
-				metricsDashboardCache.expiresAt = time.Time{}
-				metricsDashboardCache.Unlock()
-			})
+			resetMetricsDashboardCacheForTest()
+			t.Cleanup(resetMetricsDashboardCacheForTest)
 			adminHits, metricsHits := 0, 0
 			admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				adminHits++
@@ -277,16 +269,8 @@ var _ driver.QueryerContext = metricsCursorErrorConn{}
 func TestGetMetricsDashboard_cachesCaddyFetchWithinTTL(t *testing.T) {
 	// Given:假 Caddy 计数 /metrics 命中
 	newMetricsTestDatabase(t)
-	metricsDashboardCache.Lock()
-	metricsDashboardCache.payload = nil
-	metricsDashboardCache.expiresAt = time.Time{}
-	metricsDashboardCache.Unlock()
-	t.Cleanup(func() {
-		metricsDashboardCache.Lock()
-		metricsDashboardCache.payload = nil
-		metricsDashboardCache.expiresAt = time.Time{}
-		metricsDashboardCache.Unlock()
-	})
+	resetMetricsDashboardCacheForTest()
+	t.Cleanup(resetMetricsDashboardCacheForTest)
 	var hits int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits++

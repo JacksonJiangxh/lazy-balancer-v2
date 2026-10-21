@@ -478,32 +478,42 @@ func maskEmail(email string) string {
 }
 
 func (s *CAProviderService) TestCAProviderWithContext(ctx context.Context, id int) error {
+	_, err := s.testCAProvider(ctx, id)
+	return err
+}
+
+// testCAProvider 预检内核：装配校验 + ZeroSSL EAB 自动获取（含独立超时界）+
+// 账户注册/复用验证，返回已注册账户的 ACME client。签发路径（certissuer）
+// 直接复用该 client——同一 client 的 KID 已缓存，Issuer 跳过重复注册
+// （历史问题：此前预检与正式签发各建 client 各 RegisterAccount 一次，
+// 每次签发 EAB 双调用、ACME 账户双注册）。
+func (s *CAProviderService) testCAProvider(ctx context.Context, id int) (*acme.Client, error) {
 	Logf("info", "Testing CA provider %d", id)
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 
 	var p models.CAProvider
 	err := scanCAProvider(db.DB.QueryRowContext(ctx, "SELECT "+caProviderColumns+" FROM ca_providers WHERE id=? AND enabled=1", id), &p)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrCAProviderNotFound
+			return nil, ErrCAProviderNotFound
 		}
-		return err
+		return nil, err
 	}
 
 	var acmeEmail string
 	if err := db.DB.QueryRowContext(ctx, "SELECT COALESCE(acme_email,'') FROM global_config WHERE id=1").Scan(&acmeEmail); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return &CAProviderTestError{Phase: "email", Err: errors.New("ACME email is not configured")}
+			return nil, &CAProviderTestError{Phase: "email", Err: errors.New("ACME email is not configured")}
 		}
-		return err
+		return nil, err
 	}
 	if acmeEmail == "" {
-		return &CAProviderTestError{Phase: "email", Err: errors.New("ACME email is not configured")}
+		return nil, &CAProviderTestError{Phase: "email", Err: errors.New("ACME email is not configured")}
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 
 	if p.Provider == ProviderZeroSSL {
@@ -515,19 +525,19 @@ func (s *CAProviderService) TestCAProviderWithContext(ctx context.Context, id in
 		eabErr := AutoProvisionZeroSSLEAB(eabCtx, &p)
 		eabCancel()
 		if eabErr != nil {
-			return &CAProviderTestError{Phase: "config", Err: fmt.Errorf("ZeroSSL EAB 自动获取失败: %w", eabErr)}
+			return nil, &CAProviderTestError{Phase: "config", Err: fmt.Errorf("ZeroSSL EAB 自动获取失败: %w", eabErr)}
 		}
 	}
 
 	client, err := acme.NewClientForProvider(p, acmeEmail, s.dataDir)
 	if err != nil {
-		return &CAProviderTestError{Phase: "config", Err: err}
+		return nil, &CAProviderTestError{Phase: "config", Err: err}
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := client.RegisterAccount(ctx); err != nil {
-		return &CAProviderTestError{Phase: "register", Err: err}
+		return nil, &CAProviderTestError{Phase: "register", Err: err}
 	}
-	return nil
+	return client, nil
 }

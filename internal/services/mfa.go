@@ -30,6 +30,9 @@ var (
 	ErrMFANoPendingSecret = errors.New("没有待激活的 MFA 密钥，请先调用 setup")
 	// ErrMFASecretChanged 验证与激活之间 pending 密钥被并发改写。
 	ErrMFASecretChanged = errors.New("激活期间密钥已变更，请重新绑定")
+	// ErrMFANotEnabled 用户尚无正式 MFA 密钥（未启用/被并发禁用）——验证类
+	// 入口据此映射 400 业务文案，不再与查询/写库故障同走 500。
+	ErrMFANotEnabled = errors.New("MFA 未启用")
 )
 
 var mfaMu sync.Mutex
@@ -215,8 +218,13 @@ func MFAConsumeChallenge(token string, userID int) (bool, error) {
 // 先消费后验码，验码失败时挑战必须恢复未消费——错误验证码不烧挑战，用户可持
 // 同一 token 重试；失败计数仍由 MFARecordChallengeFailure 负责（达阈值作废）。
 // 仅归还属主匹配的挑战；过期行恢复亦无妨（消费判定恒带 expires_at 门）。
+//
+// 前置条件 attempts < 阈值：两个失败尝试交错时，A 记倒数第 10 次失败已把挑战
+// 作废（consumed=1），B 的归还若在此后到达会把作废状态抹回未消费——单挑战
+// 10 次硬闸被并发抹平。阈值判定与写入同一条件 UPDATE，归还永不复活已作废挑战。
 func MFARestoreChallenge(token string, userID int) {
-	_, _ = db.DB.Exec("UPDATE mfa_challenges SET consumed=0 WHERE token=? AND user_id=?", token, userID)
+	_, _ = db.DB.Exec("UPDATE mfa_challenges SET consumed=0 WHERE token=? AND user_id=? AND consumed=1 AND COALESCE(attempts,0) < ?",
+		token, userID, mfaChallengeFailThreshold)
 }
 
 // —— 主验证入口 ——
@@ -237,7 +245,7 @@ func mfaVerifyTOTPLocked(userID int, code string, now time.Time) (bool, error) {
 		return false, err
 	}
 	if secret == "" {
-		return false, fmt.Errorf("用户未启用 MFA")
+		return false, ErrMFANotEnabled
 	}
 	if len(code) == 6 {
 		step, ok := mfaValidateTOTP(secret, code, now)
@@ -276,7 +284,7 @@ func MFAVerifyCode(userID int, code string, now time.Time) (bool, error) {
 			return false, err
 		}
 		if secret == "" {
-			return false, fmt.Errorf("用户未启用 MFA")
+			return false, ErrMFANotEnabled
 		}
 		consumed, err := mfaConsumeRecoveryCode(userID, code)
 		if err != nil {

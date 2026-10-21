@@ -23,11 +23,11 @@ import (
 
 // ListSystemTasks 聚合全部任务族状态（全员可见）。
 func (h *Handlers) ListSystemTasks(c *gin.Context) {
-	tasks := services.CollectSystemTasks()
+	tasks, certJobsTruncated := services.CollectSystemTasks()
 	if tasks == nil {
 		tasks = []services.TaskInfo{}
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"tasks": tasks}})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"tasks": tasks, "cert_jobs_truncated": certJobsTruncated}})
 }
 
 // requireMasterNode 主节点门（写操作镜像 StartCRSUpdate 口径）。
@@ -120,19 +120,14 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务运行中，请稍后重试"})
 				return
 			}
-			// 历史问题：触发与审计统一走 services.TriggerTaskAsync——
+			// 历史问题：触发与审计统一走 services.TriggerTaskAsync（单源）——
 			// 「触发」审计只在 Trigger 成功后记录（非自记族），并发双击败者
 			// 拿 ErrAlreadyRunning 静默、skipped 终态静默、真失败记补偿审计。
 			// gin.Context 在 handler 返回后池化复用：审计上下文必须在此预取。
 			// 同步预占位：暂停/停止/角色拒绝必须在写响应前返回 409/503，
 			// 不能先 200 再在 goroutine 里吞错（历史问题-01）。
 			actx := triggerAuditContext(c, "任务监控", m.Name)
-			if err := te.RunAsyncResult(id, "manual", actx.Operator, func(runErr error) {
-				services.RecordTaskTriggerResult(id, actx, runErr)
-			}); err != nil {
-				if !errors.Is(err, taskengine.ErrAlreadyRunning) && !errors.Is(err, taskengine.ErrSchedulingPaused) && !errors.Is(err, taskengine.ErrEngineStopped) {
-					recordAudit(c, "触发失败", "任务监控", "手动触发任务 "+m.Name+" 失败: "+err.Error())
-				}
+			if err := services.TriggerTaskAsync(te, id, actx); err != nil {
 				respondTaskTriggerAdmissionError(c, err)
 				return
 			}

@@ -146,8 +146,9 @@ func TestAutobanConverge_hotNotConfirmedFallsBack(t *testing.T) {
 func TestAutobanConverge_trustedProxyRefHotPath(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
+	// 只挂受信代理引用、不挂启用策略绑定：资格门的 tp 维度必须独立成立
+	// （同时挂策略会让本用例在 tp 维度失效时仍然绿——无鉴别力）。
 	listID := presetListID(t)
-	seedHotPathPolicy(t, listID)
 	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_enabled=1, trusted_proxy_range_refs=? WHERE id=1`,
 		"["+strconv.FormatInt(listID, 10)+"]"); err != nil {
 		t.Fatalf("seed trusted proxy refs: %v", err)

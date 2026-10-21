@@ -762,32 +762,6 @@ func assertEqual(t *testing.T, got, want interface{}) {
 	}
 }
 
-func runningDefaultRoute() map[string]interface{} {
-	return map[string]interface{}{
-		"handle": []interface{}{map[string]interface{}{
-			"handler": "static_response",
-			"body":    "Lazy Balancer V2 is running!",
-		}},
-	}
-}
-
-func testHTTPConfig(routes []interface{}) map[string]interface{} {
-	return map[string]interface{}{
-		"apps": map[string]interface{}{
-			"http": map[string]interface{}{
-				"servers": map[string]interface{}{
-					"http_80": map[string]interface{}{"routes": routes},
-				},
-			},
-		},
-	}
-}
-
-func httpRoutesFromConfig(t *testing.T, config map[string]interface{}) []interface{} {
-	t.Helper()
-	return httpRoutesFromServer(t, config, "http_80")
-}
-
 func httpRoutesFromServer(t *testing.T, config map[string]interface{}, serverName string) []interface{} {
 	t.Helper()
 	apps := mustMap(t, config["apps"], "apps")
@@ -1302,6 +1276,8 @@ func TestGenerateSingleRuleCaddyConfig_parityWithProductionBuilders(t *testing.T
 }
 
 func TestBuildWafHandler_nilMatrix(t *testing.T) {
+	// 生产链的安全段受缺库降级门控，断言渲染前先桩库可用。
+	stubSecurityLibsAvailable(t)
 	// Given
 	_, database := newClusterTestService(t)
 	seedWafRuleRow(t, database, "waf-http-blocking", "http")
@@ -1332,39 +1308,78 @@ func TestBuildWafHandler_nilMatrix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// When（历史问题: buildWafHandler 已删，协议门控在生产调用点，
-			// 测试复刻调用点语义：仅 http 规则经 WithPolicy 变体构建）
-			var protocol string
-			if err := database.QueryRow(`SELECT protocol FROM lb_rules WHERE caddy_id=?`, tc.caddyID).Scan(&protocol); err != nil || protocol != "http" {
-				protocol = "tcp"
-			}
-			handler, wafErr := buildWafHandlerWithPolicy(tc.caddyID, GetSecurityPolicyForRule(tc.caddyID), nil, "", false, 0, 0, nil)
-			if wafErr != nil {
-				t.Fatalf("buildWafHandlerWithPolicy(%q) err=%v", tc.caddyID, wafErr)
-			}
-			if protocol != "http" {
-				handler = nil
+			// When：走生产构建路径（协议门控/策略绑定/可见性判定全在生产代码里，
+			// 不在测试中复刻——此前自建门副本会掩盖生产门裂化）。
+			var handler map[string]interface{}
+			switch tc.caddyID {
+			case "waf-tcp":
+				// TCP 规则由 TCP 构建路径出配置（生产从不调用 WAF 构建器）。
+				rule := SingleRuleConfig{
+					CaddyID: "waf-tcp", Protocol: "tcp", ListenPort: 3306, Strategy: "weighted_round_robin",
+					HealthCheckInterval: 10, HealthCheckTimeout: 2,
+					HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2,
+					Upstreams: []UpstreamConfig{{Host: "10.0.0.10", Port: 3306, Weight: 2, Enabled: true}},
+				}
+				server, tcpErr := buildTCPServer(rule)
+				if tcpErr != nil {
+					t.Fatalf("buildTCPServer: %v", tcpErr)
+				}
+				raw, marshalErr := json.Marshal(server)
+				if marshalErr != nil {
+					t.Fatalf("marshal tcp server: %v", marshalErr)
+				}
+				if strings.Contains(string(raw), `"handler":"waf"`) {
+					t.Fatalf("TCP 构建路径不得发射 waf handler: %s", raw)
+				}
+				return
+			default:
+				rule := baseHTTPRule()
+				rule.CaddyID = tc.caddyID
+				chain, chainErr := buildHTTPHandleChain(rule, rule.Upstreams)
+				if chainErr != nil {
+					t.Fatalf("buildHTTPHandleChain(%q): %v", tc.caddyID, chainErr)
+				}
+				handler = findHandlerRecursive(chain, "waf")
 			}
 
 			// Then
 			if !tc.wantWaf {
 				if handler != nil {
-					t.Fatalf("buildWafHandlerWithPolicy(%q, policy)=%#v, want nil", tc.caddyID, handler)
+					t.Fatalf("生产链(%q) 发射了 waf handler，want nil: %#v", tc.caddyID, handler)
 				}
 				return
 			}
 			if handler == nil {
-				t.Fatalf("buildWafHandlerWithPolicy(%q, policy)=nil, want waf handler", tc.caddyID)
-			}
-			if handler["handler"] != "waf" {
-				t.Fatalf("handler name=%#v, want waf", handler["handler"])
+				t.Fatalf("生产链(%q) 缺 waf handler，want waf", tc.caddyID)
 			}
 			directives, _ := handler["directives"].(string)
 			if !strings.Contains(directives, tc.directive) {
-				t.Fatalf("directives=%q, want substring %q", directives, tc.directive)
+				t.Fatalf("directives 不含 %q:\n%s", tc.directive, directives)
 			}
 		})
 	}
+}
+
+// findHandlerRecursive 在构建产物（含 subroute 嵌套）中查找首个指定 handler 名。
+func findHandlerRecursive(value interface{}, name string) map[string]interface{} {
+	switch node := value.(type) {
+	case map[string]interface{}:
+		if node["handler"] == name {
+			return node
+		}
+		for _, child := range node {
+			if found := findHandlerRecursive(child, name); found != nil {
+				return found
+			}
+		}
+	case []interface{}:
+		for _, child := range node {
+			if found := findHandlerRecursive(child, name); found != nil {
+				return found
+			}
+		}
+	}
+	return nil
 }
 
 func seedBoundSecurityPolicyWithRateLimit(t *testing.T, database *sql.DB, ruleCaddyID, mode string, rps, burst int) int {
@@ -2319,5 +2334,97 @@ func TestACMECertCandidatesForRule_preparses_leaf(t *testing.T) {
 		if candidate.Leaf.Subject.CommonName != "leaf.example.test" {
 			t.Fatalf("leaf CN=%q, want leaf.example.test", candidate.Leaf.Subject.CommonName)
 		}
+	}
+}
+
+// 健康聚合单飞必须 panic 安全：聚合内部 panic 若直接冲出，healthInflight
+// 永久驻留 → 所有后续调用阻塞在 <-call.done 上（健康面板永久悬挂、无法自愈）。
+func TestUpstreamHealthSingleflight_panicDoesNotStrandInflight(t *testing.T) {
+	s := NewCaddyService("http://127.0.0.1:1")
+	defer func() {
+		if recover() == nil {
+			t.Fatal("panic 必须向首个调用方传播")
+		}
+		// panic 之后单飞槽位必须已释放：下一次调用发起新的聚合并返回值。
+		// 超时判定用 goroutine：旧实现（槽位未清）会让该调用永久阻塞，测试
+		// 必须显式失败而不是挂到全局超时。
+		type result struct {
+			health map[string]map[string]*UpstreamHealthDetail
+			err    error
+		}
+		done := make(chan result, 1)
+		go func() {
+			health, err := s.aggregateUpstreamHealthWithSingleflight(func() (map[string]map[string]*UpstreamHealthDetail, error) {
+				return map[string]map[string]*UpstreamHealthDetail{"srv": {"1.2.3.4:80": {Healthy: true}}}, nil
+			})
+			done <- result{health, err}
+		}()
+		select {
+		case got := <-done:
+			if got.err != nil {
+				t.Fatalf("post-panic call err=%v", got.err)
+			}
+			if got.health["srv"]["1.2.3.4:80"] == nil || !got.health["srv"]["1.2.3.4:80"].Healthy {
+				t.Fatalf("post-panic aggregate=%+v", got.health)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("panic 后单飞槽位仍被占用（后续调用永久阻塞）")
+		}
+	}()
+	s.aggregateUpstreamHealthWithSingleflight(func() (map[string]map[string]*UpstreamHealthDetail, error) {
+		panic("boom")
+	})
+}
+
+// 全局链钉测试（历史问题 补齐）：global_config.server_tokens_hidden=1（全局
+// TRUE）→ 全量渲染为规则发射 deferred Server 删除 headers handler。规则级
+// 覆盖（0/1/2）已有 TestGenerateSingleRuleCaddyConfig_serverTokensHidden*
+// 钉，本测试钉「全局列 → resolveRuleOverrides → handler 发射」链路本身。
+func TestGenerateCaddyConfig_globalServerTokensHiddenEmitsDeleteHandler(t *testing.T) {
+	_, database := newClusterTestService(t)
+	seedGenerationRule(t, database, "lb_server_tokens", false)
+	if _, err := database.Exec("UPDATE global_config SET server_tokens_hidden=1 WHERE id=1"); err != nil {
+		t.Fatalf("set global server_tokens_hidden: %v", err)
+	}
+
+	generated := generateCaddyConfigFromStore(database)
+	if message, failed := generated[caddyConfigGenerationErrorKey].(string); failed {
+		t.Fatalf("config generation failed: %s", message)
+	}
+
+	routes := httpRoutesFromServer(t, generated, "http_8080")
+	hasServerDelete := func(routes []interface{}) bool {
+		for _, routeValue := range routes {
+			route := mustMap(t, routeValue, "route")
+			handlers, ok := route["handle"].([]interface{})
+			if !ok {
+				continue
+			}
+			for _, handlerValue := range handlers {
+				handler := mustMap(t, handlerValue, "handler")
+				if handler["handler"] != "headers" {
+					continue
+				}
+				response := mustMap(t, handler["response"], "headers response ops")
+				if response["deferred"] == true {
+					if deletes, ok := response["delete"].([]string); ok && len(deletes) == 1 && deletes[0] == "Server" {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+	if !hasServerDelete(routes) {
+		t.Fatalf("global server_tokens_hidden=1 must emit deferred Server delete handler: %#v", routes)
+	}
+
+	// 负对照：全局关闭时不得发射该 handler（防恒真钉测）。
+	if _, err := database.Exec("UPDATE global_config SET server_tokens_hidden=0 WHERE id=1"); err != nil {
+		t.Fatalf("clear global server_tokens_hidden: %v", err)
+	}
+	generatedOff := generateCaddyConfigFromStore(database)
+	if hasServerDelete(httpRoutesFromServer(t, generatedOff, "http_8080")) {
+		t.Fatal("global server_tokens_hidden=0 must not emit Server delete handler")
 	}
 }

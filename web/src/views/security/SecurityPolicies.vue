@@ -3338,9 +3338,7 @@ onMounted(async () => {
 
 <style scoped>
 .table-toolbar { display: flex; gap: 12px; justify-content: flex-end; margin-bottom: 16px; }
-/* 分页器：与 Rules/SecurityRules/拦截页面 的 .rules-pagination 同款
-   （右对齐 + 16px 上距，2026-09-25 用户裁定——模板挂类漏定义致的左对齐修复） */
-.rules-pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
+/* .rules-pagination 已收敛 styles/main.css（四处逐字重复单源化） */
 
 .mode-radio-group :deep(.el-radio__label) { white-space: nowrap; }
 .mode-radio-group { flex-wrap: wrap; row-gap: 4px; }

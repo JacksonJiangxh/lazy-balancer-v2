@@ -26,79 +26,90 @@ export type CertJobStatus =
   | 'waiting_ca'
   | 'disabled'
 
+/**
+ * 状态 → 中文标签全表。`satisfies Record<CertJobStatus, string>` 是**编译期穷尽性**
+ * 约束：后端 db.certJobStatuses 新增一态后，此处不补文案即 tsc 报错（原先 switch
+ * 缺 case 只会静默落 unknown 分支，标签显示原始 token）。
+ */
+const CERT_JOB_STATUS_LABELS = {
+  issued: '已签发',
+  failed: '失败',
+  disabled: '已禁用',
+  queued: '排队中',
+  waiting_ca: '限流中',
+  pending: '待处理',
+  processing: '处理中',
+  creating_account: '创建账户',
+  creating_order: '创建订单',
+  order_created: '建单完成',
+  waiting_order_ready: '等待就绪',
+  order_ready: '订单就绪',
+  cleanup_dns: '清理中',
+  cleanup_warning: '清理警告',
+  presenting_dns: '配置解析',
+  waiting_propagation: '等待传播',
+  dns_propagated: '已传播',
+  accepting_challenge: '提交验证',
+  waiting_order_valid: '等待验证',
+  order_valid: '验证完成',
+  validating: '验证中',
+  validated: '验证通过',
+  finalizing: '最终化',
+  finalized: '订单完成',
+  downloading: '下载证书',
+  downloaded: '下载完成',
+} satisfies Record<CertJobStatus, string>
+
 export const certJobStatusLabel = (status: CertJobStatus): string => {
-  switch (status) {
-    case 'issued': return '已签发'
-    case 'failed': return '失败'
-    case 'disabled': return '已禁用'
-    case 'queued': return '排队中'
-    case 'waiting_ca': return '限流中'
-    case 'pending': return '待处理'
-    case 'processing': return '处理中'
-    case 'creating_account': return '创建账户'
-    case 'creating_order': return '创建订单'
-    case 'order_created': return '建单完成'
-    case 'waiting_order_ready': return '等待就绪'
-    case 'order_ready': return '订单就绪'
-    case 'cleanup_dns': return '清理中'
-    case 'cleanup_warning': return '清理警告'
-    case 'presenting_dns': return '配置解析'
-    case 'waiting_propagation': return '等待传播'
-    case 'dns_propagated': return '已传播'
-    case 'accepting_challenge': return '提交验证'
-    case 'waiting_order_valid': return '等待验证'
-    case 'order_valid': return '验证完成'
-    case 'validating': return '验证中'
-    case 'validated': return '验证通过'
-    case 'finalizing': return '最终化'
-    case 'finalized': return '订单完成'
-    case 'downloading': return '下载证书'
-    case 'downloaded': return '下载完成'
-    default:
-      // 空值/undefined 静默回退（存量行 status 空列的瞬时形态，非异常——
-      // 控制台噪音「Unknown cert job status: undefined」治理，2026-10-11）；
-      // 非空未知值仍 warn 暴露真实状态机漂移。
-      if (!status) return '未知'
-      console.warn('Unknown cert job status:', status)
-      return String(status)
-  }
+  // 空值/undefined 静默回退（存量行 status 空列的瞬时形态，非异常——
+  // 控制台噪音「Unknown cert job status: undefined」治理，2026-10-11）；
+  // 非空未知值仍 warn 暴露真实状态机漂移。
+  if (!status) return '未知'
+  const label = CERT_JOB_STATUS_LABELS[status] as string | undefined
+  if (label) return label
+  console.warn('Unknown cert job status:', status)
+  return String(status)
 }
 
-/** 证书任务状态 → Element tag 色调（与 certJobStatusLabel 同一状态机）。 */
-export const certJobStatusTone = (status: CertJobStatus): 'success' | 'danger' | 'warning' | 'info' => {
+/** 证书任务状态色调（与 certJobStatusLabel 同一状态机）。 */
+export type CertJobStatusTone = 'success' | 'danger' | 'warning' | 'info'
+
+/** 状态 → Element tag 色调全表（同样受 `satisfies Record<CertJobStatus, …>` 穷尽性约束）。 */
+const CERT_JOB_STATUS_TONES = {
+  issued: 'success',
+  failed: 'danger',
+  disabled: 'info',
+  queued: 'info',
+  waiting_ca: 'warning',
+  pending: 'warning',
+  processing: 'warning',
+  creating_account: 'warning',
+  creating_order: 'warning',
+  order_created: 'warning',
+  waiting_order_ready: 'warning',
+  order_ready: 'warning',
+  cleanup_dns: 'warning',
+  cleanup_warning: 'warning',
+  presenting_dns: 'warning',
+  waiting_propagation: 'warning',
+  dns_propagated: 'warning',
+  accepting_challenge: 'warning',
+  waiting_order_valid: 'warning',
+  order_valid: 'warning',
+  validating: 'warning',
+  validated: 'warning',
+  finalizing: 'warning',
+  finalized: 'warning',
+  downloading: 'warning',
+  downloaded: 'warning',
+} satisfies Record<CertJobStatus, CertJobStatusTone>
+
+export const certJobStatusTone = (status: CertJobStatus): CertJobStatusTone => {
   if (!status) return 'info'
-  switch (status) {
-    case 'issued': return 'success'
-    case 'failed': return 'danger'
-    case 'disabled': return 'info'
-    case 'queued': return 'info'
-    case 'waiting_ca': return 'warning'
-    case 'pending':
-    case 'processing':
-    case 'creating_account':
-    case 'creating_order':
-    case 'order_created':
-    case 'waiting_order_ready':
-    case 'order_ready':
-    case 'cleanup_dns':
-    case 'cleanup_warning':
-    case 'presenting_dns':
-    case 'waiting_propagation':
-    case 'dns_propagated':
-    case 'accepting_challenge':
-    case 'waiting_order_valid':
-    case 'order_valid':
-    case 'validating':
-    case 'validated':
-    case 'finalizing':
-    case 'finalized':
-    case 'downloading':
-    case 'downloaded':
-      return 'warning'
-    default:
-      console.warn('Unknown cert job status:', status)
-      return 'info'
-  }
+  const tone = CERT_JOB_STATUS_TONES[status] as CertJobStatusTone | undefined
+  if (tone) return tone
+  console.warn('Unknown cert job status:', status)
+  return 'info'
 }
 
 /**

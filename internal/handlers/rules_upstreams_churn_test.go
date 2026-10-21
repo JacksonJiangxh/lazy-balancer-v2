@@ -224,3 +224,44 @@ func TestUpdateRule_upstreams_originDomainOnlyChangeInPlace(t *testing.T) {
 		t.Fatalf("显式 id 变更累计触发 %d 次上游写（应 2=When1+When3 各 1 次 UPDATE）", n)
 	}
 }
+
+// 上游级 dynamic_dns 是废弃列（渲染只读规则级 DynamicDNS）：写侧必须恒落 0，
+// 不再把请求里的伪语义持久化——否则导出/备份/集群快照会持续携带一个
+// 「写过就能读回」的假状态。存量 1 行在本轮保存时归零（语义无变化）。
+func TestUpdateRule_upstreams_dynamicDNSPseudoSemanticsNotPersisted(t *testing.T) {
+	handler, _ := newRuleFeatureTestHandlersWithCapture(t)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,health_check_path,enabled,enable_compress) VALUES ('lb_dynpseudo','dynpseudo','','http','dynpseudo.example.test',8084,'weighted_round_robin','',1,1)`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+
+	// 存量伪值：直接写 1（模拟历史版本落库形态）。
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections) VALUES ('lb_dynpseudo','127.0.0.1',9001,1,1,1,'http',0)`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+	read := func() int {
+		var v int
+		if err := db.DB.QueryRow(`SELECT COALESCE(dynamic_dns,0) FROM upstreams WHERE rule_id='lb_dynpseudo' AND port=9001`).Scan(&v); err != nil {
+			t.Fatalf("read dynamic_dns: %v", err)
+		}
+		return v
+	}
+	// 请求携带 dynamic_dns=true + 一次内容变更（触发原地 UPDATE）。
+	putRuleBody(t, router, "lb_dynpseudo", `{"upstreams":[{"host":"127.0.0.1","port":9001,"weight":3,"enabled":true,"dynamic_dns":true}]}`)
+	if v := read(); v != 0 {
+		t.Fatalf("dynamic_dns=%d, want 0（写侧必须停止伪语义）", v)
+	}
+	// 新建行同样恒 0。
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,health_check_path,enabled,enable_compress) VALUES ('lb_dynpseudo2','dynpseudo2','','http','dynpseudo2.example.test',8085,'weighted_round_robin','',1,1)`); err != nil {
+		t.Fatalf("seed rule 2: %v", err)
+	}
+	putRuleBody(t, router, "lb_dynpseudo2", `{"upstreams":[{"host":"127.0.0.1","port":9002,"weight":1,"enabled":true,"dynamic_dns":true}]}`)
+	var v int
+	if err := db.DB.QueryRow(`SELECT COALESCE(dynamic_dns,0) FROM upstreams WHERE rule_id='lb_dynpseudo2'`).Scan(&v); err != nil {
+		t.Fatalf("read new row: %v", err)
+	}
+	if v != 0 {
+		t.Fatalf("new upstream dynamic_dns=%d, want 0", v)
+	}
+}

@@ -214,7 +214,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useMediaQuery } from '@vueuse/core'
 import { useAuthStore } from '@/stores/auth'
-import type { PageId } from '@/stores/auth'
+import type { PageId } from '@/utils/pageIds'
 import { request, mfaAwareSuccess, ApiRequestError } from '@/utils/api'
 import { isCurrentPasswordRejection } from '@/utils/profileUpdate'
 import {Timer,  DataAnalysis, List, Setting, Cpu, User, Connection, Lock, Key, Document, Warning, Notebook } from '@element-plus/icons-vue'
@@ -222,6 +222,7 @@ import DialogHeader from '@/components/DialogHeader.vue'
 import AppLogo from '@/components/AppLogo.vue'
 import { appName, footerHtml } from '@/utils/branding'
 import { restartServiceWithFeedback } from '@/utils/restart'
+import { validatePassword } from '@/utils/credentials'
 import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
 import { SETTINGS_BREADCRUMB_PARENT, SETTINGS_TAB_IDS, SETTINGS_TAB_TITLES } from '@/utils/settingsPages'
 
@@ -319,8 +320,9 @@ const closeProfile = (): void => {
 
 const saveProfile = async () => {
   if (isReadOnly.value || saving.value) return
-  if (profileForm.value.password && profileForm.value.password.length < 8) {
-    authStore.showToast('warning', '密码长度至少8位（8-24位，仅限数字、大小写字母和特殊字符）')
+  const passwordError = validatePassword(profileForm.value.password)
+  if (passwordError) {
+    authStore.showToast('warning', passwordError)
     return
   }
   // 历史修复：提交新密码必须携带当前密码（后端密码确认门），不改密码时不需要。

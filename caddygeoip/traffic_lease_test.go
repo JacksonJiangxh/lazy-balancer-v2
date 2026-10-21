@@ -29,6 +29,51 @@ func TestTrafficLease_enableRelease(t *testing.T) {
 	}
 }
 
+// TTL 到期自动关闭（租约核心语义）：标签页崩溃/被强关时没有 DELETE，采集
+// 必须在租约到期后自行停止。把到期时间拨到过去并重排生产清理定时器
+// （delay<=0 立即触发），驱动真实清理回调——不依赖真实等待 TTL。
+func TestTrafficLease_expiresAutomatically(t *testing.T) {
+	resetTrafficState(t)
+	trafficCollectorEnabled.Store(false)
+	if err := acquireTrafficLease("expire-1", time.Minute, 1); err != nil {
+		t.Fatal(err)
+	}
+	if !trafficCollectorActive() {
+		t.Fatal("租约生效后采集应开启")
+	}
+
+	trafficLeasesMu.Lock()
+	lease := trafficLeases["expire-1"]
+	lease.expires = time.Now().Add(-time.Second)
+	trafficLeases["expire-1"] = lease
+	scheduleTrafficLeaseCleanupLocked()
+	trafficLeasesMu.Unlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		trafficLeasesMu.Lock()
+		remaining := len(trafficLeases)
+		trafficLeasesMu.Unlock()
+		if remaining == 0 && !trafficCollectorActive() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("TTL 到期后未自动清理：remaining leases=%d enabled=%v", remaining, trafficCollectorActive())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	trafficLeasesMu.Lock()
+	timerCleared := trafficLeaseTimer == nil
+	trafficLeasesMu.Unlock()
+	if !timerCleared {
+		t.Fatal("无租约后清理定时器必须停止并清空（防泄漏）")
+	}
+	if sample := trafficEventSampleN.Load(); sample != 0 {
+		t.Fatalf("sample_n=%d, want 0 after TTL expiry", sample)
+	}
+}
+
 func TestTrafficCollectorAdmin_postGetDelete(t *testing.T) {
 	resetTrafficState(t)
 	trafficCollectorEnabled.Store(false)
@@ -227,5 +272,43 @@ func TestTrafficCollectorAdmin_rejectsNegativeSampleN(t *testing.T) {
 	}
 	if trafficCollectorActive() {
 		t.Fatal("invalid body must not enable the collector")
+	}
+}
+
+// sample_n 越界钳制：租约申请不限身份，sample_n 不设上限会把逐请求事件流
+// 稀释到近似 0（N 越大采样越稀）。Ruling：收敛而非 400——前端只发合法值，
+// 收敛保持既有契约且不新增错误分支；0 保留「关闭逐请求事件」语义。
+func TestTrafficLease_clampsSampleNToSupportedRange(t *testing.T) {
+	resetTrafficState(t)
+	trafficCollectorEnabled.Store(false)
+
+	if err := acquireTrafficLease("clamp-max", time.Minute, 1_000_000); err != nil {
+		t.Fatal(err)
+	}
+	if err := acquireTrafficLease("clamp-zero", time.Minute, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := acquireTrafficLease("clamp-ok", time.Minute, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	trafficLeasesMu.Lock()
+	gotMax := trafficLeases["clamp-max"].sampleN
+	gotZero := trafficLeases["clamp-zero"].sampleN
+	gotOK := trafficLeases["clamp-ok"].sampleN
+	trafficLeasesMu.Unlock()
+
+	if gotMax != 8 {
+		t.Fatalf("sample_n=1000000 stored as %d, want clamped to 8", gotMax)
+	}
+	if gotZero != 0 {
+		t.Fatalf("sample_n=0 stored as %d, want 0 (逐请求事件关闭语义)", gotZero)
+	}
+	if gotOK != 3 {
+		t.Fatalf("sample_n=3 stored as %d, want unchanged", gotOK)
+	}
+	// 多租约取最密采样：0(关闭) 不参与，max(8) 与 3 取 min=3。
+	if got := trafficEventSampleN.Load(); got != 3 {
+		t.Fatalf("effective sample_n=%d, want 3", got)
 	}
 }

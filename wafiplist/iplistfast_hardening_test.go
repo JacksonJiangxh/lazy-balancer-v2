@@ -11,10 +11,21 @@ import (
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
 )
 
+// disableStatThrottle 关闭 Evaluate 侧 stat 节流（默认 1s）。fail-stale 用例
+// 必须在文件变化后真正走一次 stat+重建，否则第二次 Evaluate 落在节流窗内
+// 直接返回缓存——「重建失败回退旧集合」分支根本不执行，断言恒绿。
+func disableStatThrottle(t *testing.T) {
+	t.Helper()
+	prev := StatCheckInterval
+	StatCheckInterval = 0
+	t.Cleanup(func() { StatCheckInterval = prev })
+}
+
 // 运行期韧性：文件被删/被写坏时，在役名单不清空——继续按
 // 最近一次成功加载的集合判定（原子投影器保证写入侧无半截文件；删除/损坏
 // 属运维事故，清空拒绝面比陈旧更危险）。
 func TestIPListFast_servesStaleOnRuntimeDelete(t *testing.T) {
+	disableStatThrottle(t)
 	dir := useAllowedDir(t)
 	path := writeListFile(t, dir, "stale.txt", []string{"203.0.113.7"})
 	op := newOp(t, path)
@@ -30,6 +41,7 @@ func TestIPListFast_servesStaleOnRuntimeDelete(t *testing.T) {
 }
 
 func TestIPListFast_servesStaleOnCorruptReload(t *testing.T) {
+	disableStatThrottle(t)
 	dir := useAllowedDir(t)
 	path := writeListFile(t, dir, "corrupt.txt", []string{"203.0.113.7"})
 	op := newOp(t, path)

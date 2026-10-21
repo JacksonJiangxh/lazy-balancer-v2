@@ -176,7 +176,10 @@ func TestCleanupAuditLogs_fallsBackToDefaultOnMissingConfigRow(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(oldWriter) })
 
 	// When
-	n := CleanupAuditLogs()
+	n, err := CleanupAuditLogs()
+	if err != nil {
+		t.Fatalf("CleanupAuditLogs() error=%v, want nil（默认 3 月回退后应正常清理）", err)
+	}
 
 	// Then 默认 3 月口径删除陈旧行（曾静默跳过）+ warn 留痕
 	if n != 1 {

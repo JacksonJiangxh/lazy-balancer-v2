@@ -6,16 +6,18 @@
 //
 // 运行：cd web && npm test
 
-import { test } from 'node:test'
+import { test, mock } from 'node:test'
 import assert from 'node:assert/strict'
+import { createSSRApp, h } from 'vue'
+import { renderToString } from 'vue/server-renderer'
 
-import { usePollingTask } from '../src/composables/usePollingTask.ts'
-import { source } from './_helpers.ts'
+import { usePollingTask, type PollingTask } from '../src/composables/usePollingTask.ts'
+import { FakeDocument, source } from './_helpers.ts'
 
-// onUnmounted 在无组件实例时会打印 Vue 警告——本文件只验证轮次契约，两个用例
-// 各自在 finally 里恢复 console.warn。
+// onUnmounted 在无组件实例时会打印 Vue 警告——pause 用例在 finally 里恢复
+// console.warn；stop/onError/可见性用例经 SSR 渲染提供真实组件实例，不触碰该警告。
 
-test('每轮独立 signal：pause 中止在途轮次并作废序列，resume 后新轮次不继承取消', async () => {
+test('每轮独立 signal：pause 中止在途轮次并作废序列，resume 立即补跑且不继承取消', async () => {
   const warn = console.warn
   console.warn = () => {}
   try {
@@ -40,12 +42,14 @@ test('每轮独立 signal：pause 中止在途轮次并作废序列，resume 后
     releases[0]()
     await first
 
-    const second = polling.run()
-    assert.equal(rounds.length, 2, 'pause 之后 run() 起新一轮')
+    // resume 自带「恢复即刷新」（与 visibilitychange 恢复路径同口径），不依赖调用方手动 run。
+    polling.resume()
+    assert.equal(rounds.length, 2, 'resume 必须立即补跑一轮')
     assert.notEqual(rounds[1].signal, rounds[0].signal, '每轮新 controller')
     assert.equal(rounds[1].signal.aborted, false, '新一轮 signal 不继承上一轮的取消')
     releases[1]()
-    await second
+    // resume 的 run() 承诺不外泄——等 drain 在当前帧内收尾
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
 
     polling.stop()
     assert.equal(polling.signal.aborted, true, 'stop 终止永久 signal')
@@ -55,27 +59,103 @@ test('每轮独立 signal：pause 中止在途轮次并作废序列，resume 后
   }
 })
 
-test('stop 同时中止在途轮次，drain 不再起新轮', async () => {
-  const warn = console.warn
-  console.warn = () => {}
-  try {
-    const seen: AbortSignal[] = []
-    const releases: Array<() => void> = []
-    const polling = usePollingTask((context) => new Promise<void>((resolve) => {
-      seen.push(context.signal)
-      releases.push(resolve)
-    }))
+test('usePollingTask.stop 释放：abort 在途、永久终止后续轮次', async () => {
+  const gate = Promise.withResolvers<void>()
+  let calls = 0
+  const seen: { signal?: AbortSignal } = {}
+  let polling!: PollingTask
+  await renderToString(createSSRApp({
+    setup() {
+      polling = usePollingTask(async ({ signal }) => {
+        calls++
+        seen.signal = signal
+        await gate.promise
+      })
+      return () => h('div')
+    },
+  }))
+  const running = polling.run()
+  assert.equal(calls, 1, 'run 必须立即执行任务')
+  polling.stop()
+  assert.equal(polling.isDisposed(), true)
+  assert.equal(seen.signal?.aborted, true, 'stop 必须 abort 每轮任务信号')
+  gate.resolve()
+  await running
+  await polling.run()
+  assert.equal(calls, 1, 'stop 后 run 不得再执行任务')
+})
 
-    const pending = polling.run()
-    polling.stop()
-    assert.equal(seen.length, 1)
-    assert.equal(seen[0].aborted, true, 'stop 必须中止在途轮次')
-    releases[0]()
-    await pending
+test('usePollingTask：onError 自身抛错被就地吞掉，不中断后续轮次（FI-14）', async () => {
+  const logged: unknown[][] = []
+  const originalError = console.error
+  console.error = (...args: unknown[]) => { logged.push(args) }
+  try {
+    let calls = 0
+    let polling!: PollingTask
+    await renderToString(createSSRApp({
+      setup() {
+        polling = usePollingTask(
+          async () => { calls++; throw new Error('task failed') },
+          { onError: () => { throw new Error('callback failed') } },
+        )
+        return () => h('div')
+      },
+    }))
+    // 回调异常若经 drain→run 的 Promise 拒绝逃逸，这里的 await 会抛错（unhandled rejection 形态）
     await polling.run()
-    assert.equal(seen.length, 1, 'disposed 后 run() 不得再起轮次')
+    assert.equal(calls, 1)
+    assert.equal(logged.length, 1, 'onError 回调异常必须就地 console.error')
+    await polling.run()
+    assert.equal(calls, 2, '回调异常不得中断 drain，下一轮照常执行')
+    polling.stop()
   } finally {
-    console.warn = warn
+    console.error = originalError
+  }
+})
+
+// invalidate 是 usePollingTask 的内部实现（未暴露在 PollingTask 接口上），其可观测
+// 契约由 pause()/stop() 用例覆盖（作废序列 + abort 每轮任务信号 + isCurrent 失效）。
+
+test('usePollingTask：document.hidden 停摆定时轮询，恢复可见立即补跑', async () => {
+  const doc = new FakeDocument()
+  const host = globalThis as { document?: unknown }
+  host.document = doc
+  let calls = 0
+  let polling!: PollingTask
+  const flush = (): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, 0))
+  mock.timers.enable({ apis: ['setInterval'] })
+  try {
+    await renderToString(createSSRApp({
+      setup() {
+        polling = usePollingTask(async () => { calls++ }, { interval: 50 })
+        return () => h('div')
+      },
+    }))
+    polling.start()
+    await flush()
+    assert.equal(calls, 0, '定时轮询不立即首跑')
+    mock.timers.tick(50)
+    await flush()
+    assert.equal(calls, 1, '可见时按 interval 轮询')
+    doc.hidden = true
+    doc.dispatch()
+    mock.timers.tick(150)
+    await flush()
+    assert.equal(calls, 1, 'hidden 后定时轮次必须停摆')
+    doc.hidden = false
+    doc.dispatch()
+    await flush()
+    assert.equal(calls, 2, '恢复可见立即补跑一轮')
+    mock.timers.tick(50)
+    await flush()
+    assert.equal(calls, 3, '定时器随可见性恢复')
+    assert.equal(polling.isDisposed(), false)
+    polling.stop()
+    assert.equal(doc.listenerCount, 0, 'stop 必须摘除 visibilitychange 监听')
+  } finally {
+    polling?.stop()
+    mock.timers.reset()
+    delete host.document
   }
 })
 

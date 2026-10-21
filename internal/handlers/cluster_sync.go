@@ -17,6 +17,13 @@ func (h *Handlers) GetClusterSnapshot(c *gin.Context) {
 	if !h.requireMaster(c) {
 		return
 	}
+	// F-88B-4：快照生成会内联写 nodes（注册令牌交付清空，见
+	// services/cluster_snapshot.go），与配置导入的 nodes 全量替换同表——
+	// 导入窗口内下发会让令牌交付与导入事务交错（被覆盖或阻塞至 busy_timeout）。
+	// 与节点写端点同口径 409 fast-fail；从节点下一同步周期自动重试。
+	if rejectWriteDuringImport(c, "下发集群快照（含节点令牌交付）") {
+		return
+	}
 	sinceVersion, _ := strconv.Atoi(c.Query("since_version"))
 	snapshot, changed, err := h.clusterService.Snapshot(c.Request.Context(), sinceVersion, c.Query("fingerprint"), authenticatedClusterToken(c))
 	if err != nil {

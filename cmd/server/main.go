@@ -82,6 +82,9 @@ func run() error {
 	if err := db.Initialize(cfg.DataDir); err != nil {
 		return fmt.Errorf("initialize database: %w", err)
 	}
+	// 运行日志大小刷新 worker 在库就绪后启动：首次刷新即读真实库值
+	//（此前包 init 自启，首刷必撞 nil 库空转，启动 30s 内按兜底 100MB）。
+	services.StartLogRotate(context.Background())
 	defer func() {
 		if err := db.Close(); err != nil {
 			services.Logf("error", "close databases during shutdown: %v", err)
@@ -148,10 +151,14 @@ func run() error {
 	// CaddyOpLock → DeployLock 先持 CaddyOpLock（与规则补偿恢复链同序，
 	// 消除 AB-BA），重载回调不得再自取锁（重入死锁）。CRS/IP 库/威胁库
 	// 管理器的调用点不持 CaddyOpLock，仍用自取锁的 Force 变体。
-	services.InitCAQueueManager(func() error { return caddyService.GenerateAndApplyConfigForceInLock() }, cfg.DataDir)
-	services.InitCRSUpdateManager(caddyReloader)
+	// 审计项：后台数据类重载统一经 TrackBackgroundReload 记账——失败进状态接口
+	// 与面板横幅（此前只有应用日志，caddy_apply_error 仅覆盖 handler 写路径）。
+	services.InitCAQueueManager(services.TrackBackgroundReload(services.BackgroundApplyCertDeploy, func() error {
+		return caddyService.GenerateAndApplyConfigForceInLock()
+	}), cfg.DataDir)
+	services.InitCRSUpdateManager(services.TrackBackgroundReload(services.BackgroundApplyCRS, caddyReloader))
 	services.InitIP2Region()
-	services.InitIP2RegionUpdateManager(caddyReloader)
+	services.InitIP2RegionUpdateManager(services.TrackBackgroundReload(services.BackgroundApplyIP2Region, caddyReloader))
 	metricsService := services.NewMetricsService(cfg.CaddyMetricsURL, cfg.MetricsInterval)
 	syncService := services.NewSyncService(db.DB, cfg, caddyService)
 	lifecycle := newRuntimeLifecycle(syncService, func() certificateWorker {
@@ -229,7 +236,7 @@ func run() error {
 	// InitTaskEngine 装配——引擎启动即按 due 槽调度 threat，manager nil 曾让
 	// Run 落 success（威胁库永不更新且缺陷不可见）。与 auto-backup executor
 	// 同型：任务体依赖的运行期钩子一律前置。
-	services.SetThreatReloader(caddyReloader)
+	services.SetThreatReloader(services.TrackBackgroundReload(services.BackgroundApplyThreat, caddyReloader))
 	// 投影热路径（2026-10-15 用户裁定：威胁库重载门退役）——名单内容变化的
 	// 引用面收敛改走投影重写（零 /load，@ipListFast 匹配器与受信代理网段
 	// tp.txt/lb_file ≤1s stat 热感知）；threatReloader 仅残留热路径未证实
@@ -277,7 +284,9 @@ func run() error {
 	// autobanReloader 全量重载回退（60s 节流暂存合并）。历史修复（历史）：
 	// merge 读改写+收敛全程持 CaddyOpLock，两个注入必须为 InLock 变体（自取
 	// 锁变体在临界区内重入=死锁）。
-	services.SetAutobanReloader(func() error { return caddyService.GenerateAndApplyConfigForceInLock() })
+	services.SetAutobanReloader(services.TrackBackgroundReload(services.BackgroundApplyAutoban, func() error {
+		return caddyService.GenerateAndApplyConfigForceInLock()
+	}))
 	services.SetAutobanProjectionRefresher(func() (services.IPListProjectionOutcome, error) { return caddyService.RefreshIPListProjectionsInLock() })
 	if isMaster {
 		if err := services.GetCrawlerUpdateManager().Prime(); err != nil {

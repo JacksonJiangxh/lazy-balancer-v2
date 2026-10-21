@@ -150,6 +150,7 @@ import { ApiRequestError, normalizeMfaCodeInput, request } from '@/utils/api'
 import { User, Lock, Postcard, Key, ArrowLeft } from '@element-plus/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import { appName, appVersion } from '@/utils/branding'
+import { validatePassword, validateUsername } from '@/utils/credentials'
 import type { FormInstance, FormRules, InputOtpInstance } from 'element-plus'
 
 interface SetupStatusResponse {
@@ -185,20 +186,29 @@ const rules: FormRules = {
   ],
 }
 
-const usernamePolicyRe = /^[a-z][a-z0-9]*$/
 const setupRules: FormRules = {
   username: [
     { required: true, message: '请输入管理员用户名', trigger: 'blur' },
-    { min: 3, message: '用户名至少3位', trigger: 'blur' },
-    { max: 50, message: '用户名最多50位', trigger: 'blur' },
-    { pattern: usernamePolicyRe, message: '用户名仅允许小写英文开头，字符只允许小写字母和数字', trigger: 'blur' },
+    {
+      validator: (_rule: unknown, value: string, callback: (error?: Error) => void) => {
+        const message = validateUsername(value)
+        callback(message ? new Error(message) : undefined)
+      },
+      trigger: 'blur',
+    },
   ],
   display_name: [
     { max: 50, message: '显示名最多50位', trigger: 'blur' },
   ],
   password: [
     { required: true, message: '请输入密码', trigger: 'blur' },
-    { min: 8, message: '密码至少8位', trigger: 'blur' },
+    {
+      validator: (_rule: unknown, value: string, callback: (error?: Error) => void) => {
+        const message = validatePassword(value)
+        callback(message ? new Error(message) : undefined)
+      },
+      trigger: 'blur',
+    },
   ],
   confirm: [
     { required: true, message: '请再次输入密码', trigger: 'blur' },

@@ -57,7 +57,14 @@ type Client struct {
 	eab            *acme.ExternalAccountBinding
 	finalizedMu    sync.Mutex
 	finalizedCerts map[string][][]byte
+	finalizedOrder []string // FIFO 插入序（上限逐出最旧）
 }
+
+// maxFinalizedCerts finalize 缓存上限（历史问题：此前无界——finalize 成功后
+// 走 FetchCert 之外的失败路径（wait-valid 超时/订单非 valid/下载失败/任务
+// 取消）留下的证书字节永不释放）。FIFO 逐出最旧兜底；失败路径另由
+// DiscardFinalizedCert 显式清理。
+const maxFinalizedCerts = 16
 
 // NewClientForProvider creates an ACME client based on a CA provider configuration.
 func NewClientForProvider(provider models.CAProvider, email, dataDir string) (*Client, error) {
@@ -427,13 +434,44 @@ func (c *Client) CreateCertRequest(ctx context.Context, finalizeURL string, csr 
 	if err != nil {
 		return nil, err
 	}
+	c.rememberFinalizedCert(certURL, certDER)
+	return &acme.Order{CertURL: certURL}, nil
+}
+
+// rememberFinalizedCert 记录 finalize 阶段已下载的证书（cap 内 FIFO 逐出
+// 最旧；重复 URL 原位更新不推进序）。
+func (c *Client) rememberFinalizedCert(certURL string, certDER [][]byte) {
 	c.finalizedMu.Lock()
+	defer c.finalizedMu.Unlock()
 	if c.finalizedCerts == nil {
 		c.finalizedCerts = make(map[string][][]byte)
 	}
+	if _, exists := c.finalizedCerts[certURL]; !exists {
+		c.finalizedOrder = append(c.finalizedOrder, certURL)
+	}
 	c.finalizedCerts[certURL] = certDER
-	c.finalizedMu.Unlock()
-	return &acme.Order{CertURL: certURL}, nil
+	for len(c.finalizedOrder) > maxFinalizedCerts {
+		oldest := c.finalizedOrder[0]
+		c.finalizedOrder = c.finalizedOrder[1:]
+		delete(c.finalizedCerts, oldest)
+	}
+}
+
+// DiscardFinalizedCert 显式丢弃 finalize 缓存条目——finalize 后的失败路径
+// （wait-valid/状态非 valid/下载失败）调用，不等待 FIFO 上限逐出。
+func (c *Client) DiscardFinalizedCert(certURL string) {
+	c.finalizedMu.Lock()
+	defer c.finalizedMu.Unlock()
+	if _, ok := c.finalizedCerts[certURL]; !ok {
+		return
+	}
+	delete(c.finalizedCerts, certURL)
+	for i, u := range c.finalizedOrder {
+		if u == certURL {
+			c.finalizedOrder = append(c.finalizedOrder[:i], c.finalizedOrder[i+1:]...)
+			break
+		}
+	}
 }
 
 // FetchCert downloads the certificate chain from the given URL.
@@ -442,6 +480,12 @@ func (c *Client) FetchCert(ctx context.Context, url string) ([][]byte, error) {
 	certDER, ok := c.finalizedCerts[url]
 	if ok {
 		delete(c.finalizedCerts, url)
+		for i, u := range c.finalizedOrder {
+			if u == url {
+				c.finalizedOrder = append(c.finalizedOrder[:i], c.finalizedOrder[i+1:]...)
+				break
+			}
+		}
 	}
 	c.finalizedMu.Unlock()
 	if ok {

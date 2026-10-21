@@ -31,7 +31,7 @@ interface RequestClient {
   get(url: '/metrics/realtime', config?: AxiosRequestConfig): Promise<APIResponse<RealtimeTraffic>>
   get(url: '/rules', config?: AxiosRequestConfig): Promise<APIResponse<Rule[]>>
   get(url: '/metrics/connections', config?: AxiosRequestConfig): Promise<APIResponse<ConnectionStats>>
-  get(url: '/caddy/status', config?: AxiosRequestConfig): Promise<APIResponse<{ status: string; pid?: string; apply_error?: string; config_consistent?: string; config_drift?: string; config_drift_since?: string }>>
+  get(url: '/caddy/status', config?: AxiosRequestConfig): Promise<APIResponse<{ status: string; pid?: string; apply_error?: string; background_apply_error?: string; config_consistent?: string; config_drift?: string; config_drift_since?: string }>>
   get(url: '/config', config?: AxiosRequestConfig): Promise<APIResponse<GlobalConfigData>>
   get(url: '/admin-tls', config?: AxiosRequestConfig): Promise<APIResponse<{ enabled: boolean; mode: string; cert_info?: { domain: string; issuer: string; not_after: string; days_left: number } | null }>>
   get<T = APIResponse<unknown>>(url: string, config?: AxiosRequestConfig): Promise<T>
@@ -225,7 +225,9 @@ service.interceptors.response.use(
       if (!response.config.silent) {
         ElMessage.error(res.message || '请求失败')
       }
-      return Promise.reject(new Error(res.message || '请求失败'))
+      // 业务码失败与 HTTP 失败统一错误类型（历史问题）：调用方按
+      // instanceof ApiRequestError 判别（如 409/业务码分支）时不再漏判。
+      return Promise.reject(new ApiRequestError(res.message || '请求失败', response.status))
     }
     return res
   },

@@ -19,6 +19,8 @@ import (
 	"io"
 	"net"
 	"net/netip"
+
+	"lazy-balancer-v2/wafiplist"
 	"os"
 	"sync"
 	"time"
@@ -348,12 +350,13 @@ func commitCrawlerIPRangeSnapshot(next *crawlerIPRangeSnapshot) *crawlerIPRangeS
 	defer crawlerFileCacheMu.Unlock()
 	current := crawlerFileCacheSnap
 	if current != nil {
-		newerGeneration := current.modTime.After(next.modTime) ||
-			(current.modTime.Equal(next.modTime) && current.size > next.size)
-		if current.ok && next.ok && newerGeneration {
+		// 代际/失败守卫与名单文件加载器共用单源判定（wafiplist.SnapshotGeneration）。
+		currentGen := wafiplist.SnapshotGeneration{ModTime: current.modTime, Size: current.size, CommittedAt: current.committedAt}
+		nextGen := wafiplist.SnapshotGeneration{ModTime: next.modTime, Size: next.size}
+		if current.ok && next.ok && wafiplist.StaleSnapshotGeneration(nextGen, currentGen) {
 			return current
 		}
-		if current.ok && !next.ok && current.committedAt.After(next.loadedAt) {
+		if current.ok && !next.ok && wafiplist.StaleFailureDowngrade(currentGen, next.loadedAt) {
 			return current
 		}
 	}

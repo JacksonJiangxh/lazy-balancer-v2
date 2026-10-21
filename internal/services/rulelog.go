@@ -194,8 +194,15 @@ func ReadRuleLogTail(ruleID string, maxLines int) (content string, offset int64)
 		}
 		end = start
 	}
-	if capped {
-		Logf("warn", "rule log tail for %s hit %dMB backward scan cap, returning partial tail", ruleID, maxBackwardScan>>20)
+	// 首报留痕+节流（历史问题）：命中上限逐规则只报一次 warn（用户反复打开
+	// 日志弹框不再每读一次刷一行），读到未截断 tail 时补一条恢复 info——
+	// 与排程读失败/日志轮转刷新的 logStateTransition 口径同源。
+	if lvl := logStateTransition("rulelog-tail-cap-"+ruleID, capped); lvl != "" {
+		if capped {
+			Logf(lvl, "rule log tail for %s hit %dMB backward scan cap, returning partial tail", ruleID, maxBackwardScan>>20)
+		} else {
+			Logf(lvl, "rule log tail for %s resumed below the backward scan cap", ruleID)
+		}
 	}
 	buf := make([]byte, size-winStart)
 	if n, err := f.ReadAt(buf, winStart); err != nil && n < len(buf) {

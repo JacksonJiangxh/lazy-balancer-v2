@@ -3,18 +3,10 @@
 :root {
   /* Primary Colors - Clean Blue Theme */
   --primary: #3b82f6;
-  --primary-hover: #2563eb;
-  --primary-bg: #eff6ff;
-  
+
   /* Semantic Colors */
-  --success: #10b981;
-  --success-bg: #ecfdf5;
-  --warning: #f59e0b;
-  --warning-bg: #fffbeb;
   --danger: #ef4444;
-  --danger-bg: #fef2f2;
-  --info: #6366f1;
-  
+
   /* Text Colors */
   --text-primary: #111827;
   --text-regular: #374151;
@@ -32,16 +24,10 @@
   /* Background Colors */
   --bg-primary: #ffffff;
   --bg-secondary: #f9fafb;
-  --bg-tertiary: #f3f4f6;
-  
-  /* Shadows */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
   
   /* Border Radius - Refined (less rounded) */
   --radius-sm: 4px;
   --radius-md: 6px;
-  --radius-lg: 8px;
-  --radius-xl: 10px;
 }
 
 * {
@@ -182,6 +168,10 @@ body {
    历史问题(历史):原 d5ca6f91 仅 Dashboard scoped,同根因散落
    ≥10 视图——全局化;.cell 内纯文本/ellipsis 不受影响(规则只命中含 .el-tag 的 cell)。 */
 .el-table .cell:has(.el-tag) { display: inline-flex; align-items: center; }
+
+/* 列表分页器通用形态（历史问题）：Rules / SecurityRules / SecurityPolicies /
+   SecurityBlockPages 四处逐字重复的本地定义收敛于此（右对齐 + 16px 上距）。 */
+.rules-pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
 
 /* 全局错误提示横幅统一模式（2026-09-25 用户裁定）：各页错误 alert 同垂直留白
    （12px）同行高（1.5），消除「有的高有的低」；布局 AppLayout config-drift-banner

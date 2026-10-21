@@ -22,6 +22,11 @@ type Issuer struct {
 	Provider            dnsprovider.Provider
 	Logger              Logger
 	RequireRecursiveDNS bool
+	// AccountPreRegistered 为 true 时跳过 Step 1 注册：调用方已用同一
+	// Client 完成账户注册/复用验证（KID 已缓存于该 client）——重复注册是
+	// 每次签发一次多余的 CA 往返（历史问题 双注册收敛）。KID 缓存为
+	// client 级，换 client 不得置位。
+	AccountPreRegistered bool
 }
 
 // Issue obtains a certificate for the given domains via DNS-01 challenge.
@@ -37,12 +42,17 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 		}
 	}
 
-	// Step 1: Register account
-	log("creating_account", "确认 ACME 账户（新账户注册，已注册则复用）")
-	regCtx, regCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer regCancel()
-	if err := i.Client.RegisterAccount(regCtx); err != nil {
-		return "", "", fmt.Errorf("register account: %w", err)
+	// Step 1: Register account（预检已注册同 client 时跳过——KID 缓存随
+	// client 走，重复注册纯属多余 CA 往返）
+	if i.AccountPreRegistered {
+		log("creating_account", "ACME 账户已在预检中注册，跳过重复注册")
+	} else {
+		log("creating_account", "确认 ACME 账户（新账户注册，已注册则复用）")
+		regCtx, regCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer regCancel()
+		if err := i.Client.RegisterAccount(regCtx); err != nil {
+			return "", "", fmt.Errorf("register account: %w", err)
+		}
 	}
 
 	// Step 2: Create order
@@ -226,14 +236,18 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 	log("finalized", fmt.Sprintf("订单已最终化，证书 URL: %s", finalizedOrder.CertURL))
 
 	// Step 6.5: Wait for the order to become valid after finalization.
+	// finalize 已在 client 缓存证书字节；此后的失败路径（wait-valid/状态非
+	// valid/下载失败）必须显式丢弃缓存条目，不依赖 FIFO 上限兜底（历史问题）。
 	log("waiting_order_valid", "等待订单最终完成")
 	validCtx, validCancel := context.WithTimeout(ctx, 5*time.Minute)
 	validOrder, err := i.Client.WaitOrder(validCtx, order.URI)
 	validCancel()
 	if err != nil {
+		i.Client.DiscardFinalizedCert(finalizedOrder.CertURL)
 		return "", "", fmt.Errorf("wait order valid: %w", err)
 	}
 	if validOrder.Status != "valid" {
+		i.Client.DiscardFinalizedCert(finalizedOrder.CertURL)
 		errMsg := ""
 		if validOrder.Error != nil {
 			errMsg = fmt.Sprintf(" (%d: %s)", validOrder.Error.StatusCode, validOrder.Error.Detail)
@@ -249,6 +263,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 	log("downloading", "下载证书")
 	certDER, err := i.Client.FetchCert(ctx, validOrder.CertURL)
 	if err != nil {
+		i.Client.DiscardFinalizedCert(validOrder.CertURL)
 		return "", "", fmt.Errorf("fetch cert: %w", err)
 	}
 	log("downloaded", "证书下载完成")

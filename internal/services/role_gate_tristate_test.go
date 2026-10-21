@@ -236,7 +236,7 @@ func TestTaskMonitorCertJobs_queryFailureLogsWarn(t *testing.T) {
 	}
 	buf := captureLogf(t)
 
-	if got := collectCertJobRows(); got != nil {
+	if got, _ := collectCertJobRows(); got != nil {
 		t.Fatalf("查询失败应返回空列表, got %d 行", len(got))
 	}
 	if !strings.Contains(buf.String(), "cert 任务行查询失败") {

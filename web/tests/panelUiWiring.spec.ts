@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { section, source } from './_helpers.ts'
+import { member, section, source } from './_helpers.ts'
 
 test('当前密码错误在页面本地 toast，拦截器复用精确分类', () => {
   const layout = source('src/components/layout/AppLayout.vue')
@@ -75,6 +75,11 @@ test('Dashboard 所有落地路径统一重建逐规则失败映射', () => {
     assert.match(assignment[1], /^buildRuleMetricsUnavailable\(/, `绕过 helper 的落地路径: ${assignment[0]}`)
   }
   assert.doesNotMatch(text, /if \(!caddyMetricsUnavailable\.value\) \{\s*ruleMetricsUnavailable/)
+  // 「已落地」与「可用」分离（历史问题-3）：dashboard 未到达前不得判定采集失败；
+  // 成功与失败两条落地路径都要置 landed，/rules 重建必须同时看 landed+可用。
+  assert.equal([...text.matchAll(/dashboardMetricsLanded\.value = true/g)].length, 2, 'dashboard 成功/失败两条路径都必须置「已落地」')
+  assert.match(text, /dashboardMetricsLanded\.value && !caddyMetricsUnavailable\.value/,
+    '/rules 重建必须用「已落地 && 可用」，避免首轮误标采集失败')
 })
 
 test('混合策略只读视图复用独立黑名单生效谓词', () => {
@@ -252,4 +257,53 @@ test('库状态未知时自动更新开关显示「—」而非默认开', () =>
   assert.match(text, /autoUpdateKnown: threatLibLoaded\.value && !threatLibError\.value/)
   assert.match(text, /v-if="!row\.autoUpdateKnown"/)
   assert.match(text, /<el-switch v-else :model-value="row\.autoUpdate"/)
+})
+
+// ---- 前端展示/契约批次：单源化与首轮误标 ----
+test('分页器形态收敛 main.css，四个视图不得再本地重定义', () => {
+  const main = source('src/styles/main.css')
+  assert.match(main, /\.rules-pagination \{ display: flex; justify-content: flex-end; margin-top: 16px; \}/)
+  for (const file of ['src/views/Rules.vue', 'src/views/security/SecurityRules.vue', 'src/views/security/SecurityPolicies.vue', 'src/views/security/SecurityBlockPages.vue']) {
+    assert.doesNotMatch(source(file), /^\.rules-pagination \{/m, `${file} 仍保留本地 .rules-pagination 定义`)
+  }
+})
+
+test('SecurityRules 条件列用专用 class-name，不再页级 :deep 覆盖全局表格单元格', () => {
+  const text = source('src/views/security/SecurityRules.vue')
+  assert.match(text, /<el-table-column label="条件" min-width="250" class-name="rule-cond-cell">/)
+  assert.doesNotMatch(text, /:deep\(\.el-table \.cell:has\(\.el-tag\)\)/, '页级全局覆盖必须退役')
+  assert.match(text, /\.el-table \.rule-cond-cell \.cell:has\(\.el-tag\) \{ flex-wrap: wrap; row-gap: 4px; \}/)
+})
+
+test('BasicSettings 两处 radio 行回归 el-form-item（自管标签行族已退役）', () => {
+  const text = source('src/views/settings/BasicSettings.vue')
+  assert.doesNotMatch(text, /class="form-radio-row"/, '自管标签行标记必须退役')
+  assert.doesNotMatch(text, /^\.form-radio-row/m, '自管标签行样式必须退役')
+  assert.match(text, /<el-form-item label="证书来源">/)
+  assert.match(text, /<el-form-item label="频率">/)
+})
+
+test('SecurityBindingEditor 先声明 props/emits 再派生 computed', () => {
+  const text = source('src/components/SecurityBindingEditor.vue')
+  const propsIdx = text.indexOf('const props = defineProps')
+  const emitIdx = text.indexOf('const emit = defineEmits')
+  const subtitleIdx = text.indexOf('const bindSubtitle = computed')
+  assert.ok(propsIdx > 0 && emitIdx > propsIdx, 'props/emits 声明缺失或顺序错误')
+  assert.ok(subtitleIdx > emitIdx, 'bindSubtitle 必须在 props 之后声明（不得依赖 TDZ 惰性求值）')
+})
+
+test('useLibUpdateDialog 409 路径不得重复立即轮询', () => {
+  const text = source('src/composables/useLibUpdateDialog.ts')
+  assert.match(text, /const startPolling = \(\) => \{ polling\.start\(\) \}/, '起轮询只挂定时器（refreshStatus 已拉过本轮）')
+  assert.doesNotMatch(text, /startPolling = \(\) => \{ polling\.resume\(\) \}/, 'resume 会立即 run，409/onOpened 路径产生重复请求')
+})
+
+test('大屏光流可用性位/恢复基线/重装复位（L8 前端三项）', () => {
+  const text = source('src/views/security/ThreatScreen.vue')
+  assert.match(text, /<div v-if="flowError || attackFlowError" class="error-banner site-unset">光流数据加载失败，正在重试…<\/div>/, '光流端点失败必须显性横幅')
+  assert.match(text, /interval: ATTACK_FLOW_POLL_MS, onError: \(\) => \{ attackFlowError\.value = true \}/)
+  assert.match(text, /interval: 1000, onError: \(\) => \{ flowError\.value = true \}/)
+  // 恢复首轮重建基线：手动暂停恢复 + 可见性恢复两处（原仅「不可用」一处）
+  assert.ok([...text.matchAll(/trafficBaseline = null/g)].length >= 3, '暂停/可见性恢复/不可用三处都必须重建基线')
+  assert.match(member(text, 'async function mountEngine('), /zoomedName\.value = null/, '引擎重装必须复位下钻态')
 })

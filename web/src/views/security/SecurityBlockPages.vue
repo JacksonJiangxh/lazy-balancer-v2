@@ -281,7 +281,6 @@ onMounted(fetchData)
 .block-content-editor { border: 1px solid #e4e7ed; border-radius: 6px; overflow: hidden; }
 .block-page-form .content-form-item .el-form-item__content { flex: 1; max-width: 100%; }
 
-/* 分页器：与 Rules/SecurityRules 的 .rules-pagination 同款（右对齐 + 16px 上距） */
-.rules-pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
+/* .rules-pagination 已收敛 styles/main.css（四处逐字重复单源化） */
 
 </style>

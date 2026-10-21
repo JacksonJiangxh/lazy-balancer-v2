@@ -286,11 +286,11 @@ func (s *ClusterService) clusterSnapshotForApply(ctx context.Context) (models.Cl
 	// 历史问题-02（历史）：apply 的 previous 只消费三节哈希、证书轴与
 	// ACME ownership（computeSectionSkips/recordAppliedSectionHashes 的
 	// localHashes、snapshotCertsDiffer/removeMissingSnapshotCerts、
-	// restoreSnapshotArtifacts）。此前复用 clusterSnapshotBypassingCache 全量
-	// 快照，每次 apply（含补偿重拉循环）白做一次 CRS 树 tar.gz+sha256
-	// （BuildWafFileRef）与 xdb 哈希——WafFiles 字段全程零消费。此处按消费面
-	// 装载：节 payload 输入 + 证书候选（X.509 解析是证书轴必需）+ ACME
-	// ownership；不调用 BuildWafFileRef。
+	// restoreSnapshotArtifacts）。此前复用全量快照装载，每次 apply（含补偿
+	// 重拉循环）白做一次 CRS 树 tar.gz+sha256（BuildWafFileRef）与 xdb
+	// 哈希——WafFiles 字段全程零消费。此处按消费面装载：节 payload 输入 +
+	// 证书候选（X.509 解析是证书轴必需）+ ACME ownership；不调用
+	// BuildWafFileRef。
 	if err := s.loadSectionHashInputs(ctx, tx, &previous); err != nil {
 		return models.ClusterSnapshot{}, err
 	}

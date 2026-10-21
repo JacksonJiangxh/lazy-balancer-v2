@@ -308,9 +308,11 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 
 	// 禁用会使启用中的 ACME 规则在下一次签发/续期才失败；与删除路径一样
 	// 提前 409 点名引用方。禁用规则的历史绑定不阻止停用，重新启用规则时
-	// 仍由 validateRuleACMEReferences 拒绝绑定已禁用配置。
+	// 仍由 validateRuleACMEReferences 拒绝绑定已禁用配置。守卫只点名
+	// enable_tls=1 的规则（历史问题）：TLS 关闭的规则不消费 ACME 证书
+	//（签发/续期/渲染证书门均以 enable_tls=1 为前提），点名它属误报。
 	if req.Enabled != nil && !*req.Enabled && oldEnabled {
-		refs, err := tx.QueryContext(c.Request.Context(), `SELECT caddy_id, COALESCE(domain,'') FROM lb_rules WHERE acme_config_id=? AND enabled=1 AND tls_source='acme_dns' ORDER BY caddy_id`, id)
+		refs, err := tx.QueryContext(c.Request.Context(), `SELECT caddy_id, COALESCE(domain,'') FROM lb_rules WHERE acme_config_id=? AND enabled=1 AND tls_source='acme_dns' AND IIF(enable_tls IN ('1',1),1,0)=1 ORDER BY caddy_id`, id)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to check rule references"})
 			return

@@ -7,35 +7,19 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
 
-const HERE = dirname(fileURLToPath(import.meta.url))
-const ROOT = join(HERE, '..', '..')
-
-const readSource = (relative: string): string => readFileSync(join(ROOT, relative), 'utf8')
-
-/** 截取 `marker` 之后的第一个块（到配对括号收尾），缺 marker 即硬失败。 */
-const block = (text: string, marker: string): string => {
-  const start = text.indexOf(marker)
-  assert.notEqual(start, -1, `缺少 ${marker}`)
-  const open = text.indexOf('{', start)
-  const close = text.indexOf('\n}', open)
-  assert.ok(open >= 0 && close > open, `${marker} 块边界异常`)
-  return text.slice(start, close)
-}
+import { member, repoSource } from './_helpers.ts'
 
 /** Go map 字面量里的头名（小写键）。 */
 const backendHeaders = (): string[] => {
-  const src = readSource('internal/handlers/security.go')
-  const body = block(src, 'securityEventSensitiveHeaderNames = map[string]struct{}{')
+  const src = repoSource('internal/handlers/security.go')
+  const body = member(src, 'securityEventSensitiveHeaderNames = map[string]struct{}{')
   return [...body.matchAll(/"([^"]+)":/g)].map((m) => m[1])
 }
 
 /** 前端 Set 字面量里的头名。 */
 const frontendHeaders = (): string[] => {
-  const src = readSource('web/src/views/security/SecurityEvents.vue')
+  const src = repoSource('web/src/views/security/SecurityEvents.vue')
   const start = src.indexOf('const CTX_SENSITIVE_HEADERS = new Set([')
   assert.notEqual(start, -1, '缺少 CTX_SENSITIVE_HEADERS')
   const open = src.indexOf('[', start)

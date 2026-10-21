@@ -162,6 +162,10 @@ func threatScreenAttackFlowSampleNAt(now time.Time) int {
 	return int(threatScreenAttackFlowSampleN.Load())
 }
 
+// threatScreenAttackFlowFlushCalls 环形缓冲追加批次的加锁/裁剪次数（测试观测
+// 「批内一次加锁」；生产成本=每批一次原子加）。
+var threatScreenAttackFlowFlushCalls atomic.Int64
+
 // threatScreenAttackFlowRecordBatch 在 security_events 事务提交成功后调用。
 // 采样在环形缓冲写入前完成；失败/回滚的日志批次不得进入光流。
 func threatScreenAttackFlowRecordBatch(items []threatScreenAttackFlowItem) {
@@ -172,6 +176,10 @@ func threatScreenAttackFlowRecordBatch(items []threatScreenAttackFlowItem) {
 	if n == 0 {
 		return
 	}
+	// 采样与序号分配在锁外完成（原子计数本就无锁），攒批后一次性进入环形
+	// 缓冲：一次加锁 + 批量 append + 一次裁剪。逐事件加锁会让锁往返与
+	// O(ring) 的尾部搬移按事件数放大（一次事务提交可达数百条事件）。
+	batch := make([]ThreatScreenAttackFlowEvent, 0, len(items))
 	for _, item := range items {
 		if n > 1 && threatScreenAttackFlowAttempt.Add(1)%uint64(n) != 0 {
 			continue
@@ -180,7 +188,7 @@ func threatScreenAttackFlowRecordBatch(items []threatScreenAttackFlowItem) {
 			threatScreenAttackFlowAttempt.Add(1)
 		}
 		seq := threatScreenAttackFlowSeq.Add(1)
-		ev := ThreatScreenAttackFlowEvent{
+		batch = append(batch, ThreatScreenAttackFlowEvent{
 			Seq:           seq,
 			At:            item.at.UnixMilli(),
 			ClientIP:      item.clientIP,
@@ -188,14 +196,18 @@ func threatScreenAttackFlowRecordBatch(items []threatScreenAttackFlowItem) {
 			RuleTriggered: item.ruleTriggered,
 			RuleMsg:       item.ruleMsg,
 			Weight:        uint32(n),
-		}
-		threatScreenAttackFlowMu.Lock()
-		threatScreenAttackFlowEvents = append(threatScreenAttackFlowEvents, ev)
-		if len(threatScreenAttackFlowEvents) > threatScreenAttackFlowRingMax {
-			threatScreenAttackFlowEvents = threatScreenAttackFlowEvents[len(threatScreenAttackFlowEvents)-threatScreenAttackFlowRingMax:]
-		}
-		threatScreenAttackFlowMu.Unlock()
+		})
 	}
+	if len(batch) == 0 {
+		return
+	}
+	threatScreenAttackFlowFlushCalls.Add(1)
+	threatScreenAttackFlowMu.Lock()
+	threatScreenAttackFlowEvents = append(threatScreenAttackFlowEvents, batch...)
+	if over := len(threatScreenAttackFlowEvents) - threatScreenAttackFlowRingMax; over > 0 {
+		threatScreenAttackFlowEvents = threatScreenAttackFlowEvents[over:]
+	}
+	threatScreenAttackFlowMu.Unlock()
 }
 
 // ThreatScreenAttackFlowSnapshot 返回 since 之后的攻击流事件。

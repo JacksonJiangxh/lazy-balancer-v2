@@ -426,3 +426,30 @@ func TestIPListGC_tempOwnershipBothWays(t *testing.T) {
 		t.Errorf("无关超龄 .tmp 不得被删除：%v", err)
 	}
 }
+
+// 投影落盘是逐行文本协议：条目内嵌换行/回车会把一条记录拆成两行
+// （第二行成为未校验的独立条目，形如把 "1.2.3.4\n0.0.0.0/0" 写成两条，
+// 后者静默扩大名单语义）。聚合层对不可解析条目原样透传（fail-closed 到
+// 引擎），写侧因此必须逐条拒绝换行——写失败经渲染错误链路上报（保存回滚）。
+func TestWriteIPListFile_rejectsNewlineInEntry(t *testing.T) {
+	for _, entry := range []string{"1.2.3.4\n0.0.0.0/0", "1.2.3.4\r", "5.6.7.8\n"} {
+		if _, err := writeIPListFile("nl-reject", []string{entry}); err == nil {
+			t.Fatalf("entry %q must be rejected before projection write", entry)
+		}
+	}
+	// 反例：正常条目与空集合照常落盘。
+	path, err := writeIPListFile("nl-ok", []string{"1.2.3.4", "10.0.0.0/8"})
+	if err != nil {
+		t.Fatalf("normal entries must still write: %v", err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "1.2.3.4/32\n10.0.0.0/8\n" {
+		t.Fatalf("projection content=%q", content)
+	}
+	if _, err := writeIPListFile("nl-empty", nil); err != nil {
+		t.Fatalf("empty set must still write: %v", err)
+	}
+}

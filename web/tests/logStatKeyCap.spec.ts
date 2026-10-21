@@ -25,3 +25,22 @@ test('统计键上限 O(1)：计数随新增键自增，不再数整表', () => 
   assert.match(consume, /incrementCappedStat\(maps, 'uri', uri\)/)
   assert.match(consume, /incrementCappedStat\(maps, 'ua', g\)/)
 })
+
+// 敌意键形态：统计键来自请求日志（攻击者可控）。原型链键 `__proto__` 在普通对象
+// 上赋值会命中 Object.prototype 的 setter——键静默不落库，但 keyCounts 已自增
+// （计数侵蚀：容量被幽灵键吃满），且永远不会归入「其他」。`constructor`/
+// `toString` 同样只能靠 own-property 守卫侥幸正确，容器本身必须是原型安全的
+// （Object.create(null) 或 Map）才不依赖守卫细节。
+//
+// 本钉依赖生产侧修复（跨批次依赖）：当前实现仍用 `{}` 桶，预期红；生产改为
+// 原型安全容器后转绿——不 skip，避免修复前后都"通过"。
+test('统计键：原型链敌意键不得侵蚀计数，满表回落「其他」', () => {
+  const createBuckets = section(rules, 'const createLogStatBuckets = (', '\n})')
+  const increment = section(rules, 'const incrementCappedStat = (', '\n}\n')
+  assert.match(
+    createBuckets,
+    /Object\.create\(null\)|new Map/,
+    '统计桶必须使用无原型容器，否则 __proto__/constructor/toString 会被原型链吞掉或依赖守卫细节',
+  )
+  assert.match(increment, /OTHER_LOG_STAT_KEY/, '满表必须回落「其他」，不得丢弃计数')
+})

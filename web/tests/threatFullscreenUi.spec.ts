@@ -7,6 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
+import { PAGE_IDS } from '../src/utils/pageIds.ts'
 import { section, source } from './_helpers.ts'
 
 test('大屏全屏分支不进 AppLayout（侧栏顶栏不得渲染）', () => {
@@ -21,11 +22,8 @@ test('大屏全屏分支不进 AppLayout（侧栏顶栏不得渲染）', () => {
   assert.ok(threatIdx < layoutIdx, '大屏分支必须先于 AppLayout（v-else-if 短路）')
   assert.match(template.slice(layoutIdx), /^<AppLayout v-else>/, 'AppLayout 必须是 v-else——大屏页不得套布局壳')
   assert.ok(!section(template, '<AppLayout', '</AppLayout>').includes('ThreatScreen'), '大屏不得在 AppLayout 内部渲染')
-  // 页面键唯一事实源含 threat-screen（抽取真实数组求值）
-  const auth = source('src/stores/auth.ts')
-  const pagesBlock = section(auth, 'const pages = [', '] as const').slice('const pages = ['.length)
-  const pages = new Function(`return [${pagesBlock}]`)() as string[]
-  assert.ok(pages.includes('threat-screen'), 'auth 页面键缺 threat-screen（深链/刷新恢复会失效）')
+  // 页面键唯一事实源含 threat-screen（utils/pageIds 单源，auth store 与 App 同消费）
+  assert.ok(PAGE_IDS.includes('threat-screen'), '页面键缺 threat-screen（深链/刷新恢复会失效）')
 })
 
 // ---- 组件接线钉（间隔调度行为见 visibilityIntervals.spec.ts） ----

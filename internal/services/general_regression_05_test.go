@@ -76,7 +76,7 @@ func TestCollectCertJobRows_waitingCAMappedQueued(t *testing.T) {
 	setupU05ServicesDB(t)
 	seedCertJobRowForTaskMonitor(t, "lb_tm_waiting", "waiting.example.com", "waiting_ca")
 
-	rows := collectCertJobRows()
+	rows, _ := collectCertJobRows()
 	var got *TaskInfo
 	for i := range rows {
 		if strings.HasSuffix(rows[i].Name, "waiting.example.com") {
@@ -92,7 +92,7 @@ func TestCollectCertJobRows_waitingCAMappedQueued(t *testing.T) {
 	}
 	// 回归形状：处理中阶段仍为 running
 	seedCertJobRowForTaskMonitor(t, "lb_tm_validating", "validating.example.com", "validating")
-	rows = collectCertJobRows()
+	rows, _ = collectCertJobRows()
 	for i := range rows {
 		if strings.HasSuffix(rows[i].Name, "validating.example.com") {
 			if rows[i].Status != TaskStatusRunning {

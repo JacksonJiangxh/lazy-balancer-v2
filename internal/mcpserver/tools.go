@@ -106,7 +106,7 @@ var toolUsage = map[string]string{
 	"create_ip_list":               "创建 IP 地址列表：entries 为 {value, remark} 对象数组的 JSON 文本（IP/CIDR+备注）；名称全局唯一（忽略大小写）",
 	"update_ip_list":               "更新 IP 地址列表（entries 为 {value, remark} 对象数组的 JSON 文本，全量替换；名称全局唯一）；省略的字段保持现值",
 	"delete_ip_list":               "删除 IP 地址列表；被安全策略引用时返回 409，需先解除引用",
-	"add_ip_to_list":               "向 IP 地址列表追加单条 IP/CIDR（安全事件处置用）：幂等——value 已存在时返回 added=false，新条目备注固定为「事件处置」",
+	"add_ip_to_list":               "向 IP 地址列表追加单条 IP/CIDR（安全事件处置用）：幂等——value 已存在（生效中）时返回 added=false，已到期条目原位覆盖。remark 按名单语义固定：自定义名单「事件处置」、自动封禁预置名单「手动封禁」；威胁情报内置名单只读（400）",
 	"toggle_crs_auto_update":       "开启/关闭 CRS 每日自动更新",
 	"trigger_crs_update":           "手动触发 CRS 规则库在线更新（检查→下载→安装→重载）",
 	"toggle_ip2region_auto_update": "开启/关闭 IP2Region 每日自动更新",

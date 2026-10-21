@@ -134,7 +134,7 @@
               </template>
             </el-table-column>
             <el-table-column prop="description" label="描述" min-width="200" show-overflow-tooltip />
-            <el-table-column label="条件" min-width="250">
+            <el-table-column label="条件" min-width="250" class-name="rule-cond-cell">
               <template #default="{ row }">
                 <el-tag v-for="(cond, i) in row.conditions" :key="i" size="small" effect="plain" style="margin-right: 4px;">{{ cond.target }} {{ cond.operator }} {{ cond.pattern }}</el-tag>
               </template>
@@ -1744,9 +1744,9 @@ onUnmounted(() => {
 
 <style scoped>
 /* 历史问题(历史,历史问题):全局表格居中规则(main.css inline-flex
-   nowrap+overflow hidden)把条件列多标签裁剪成单行——3/4 条件不可见。本列
-   恢复换行展示(居中保持,scoped 属性选择器特异性高于全局规则)。 */
-:deep(.el-table .cell:has(.el-tag)) { flex-wrap: wrap; row-gap: 4px; }
+   nowrap+overflow hidden)把条件列多标签裁剪成单行——3/4 条件不可见。
+   条件列挂专用 class-name（rule-cond-cell），样式下沉到非 scoped 块只命中
+   该列，不再用页级 :deep 覆盖全页含标签单元格。 */
 
 .crs-card :deep(.el-card__header) .crs-header { display: flex; justify-content: space-between; align-items: center; width: 100%; }
 .crs-card :deep(.el-card__header) .crs-header-title { display: flex; align-items: center; gap: 12px; }
@@ -1796,7 +1796,7 @@ onUnmounted(() => {
 .ip-entry-index { color: #9ca3af; font-variant-numeric: tabular-nums; }
 .entries-pagination { display: flex; justify-content: flex-end; margin-top: 8px; }
 .ip-entry-invalid :deep(.el-input__wrapper) { box-shadow: 0 0 0 1px var(--el-color-danger, #ef4444) inset; }
-.rules-pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
+/* .rules-pagination 已收敛 styles/main.css（四处逐字重复单源化） */
 /* 弹框表单右缘留白（字段贴右边距视觉失衡，2026-09-24 用户反馈） */
 .ip-list-dialog .el-form { padding-right: 20px; }
 .threat-source-url {
@@ -1835,6 +1835,11 @@ onUnmounted(() => {
 
 <!-- el-tooltip popper 挂载到 body，scoped 样式无法命中，单独非 scoped 块 -->
 <style>
+/* 条件列专用换行：class-name 落在 el-table 生成的 td 上（组件内部节点，scoped
+   属性选择器无法命中），因此下沉到非 scoped 块；只覆盖 rule-cond-cell，不再
+   页级重定义全局 .el-table .cell 形态。 */
+.el-table .rule-cond-cell .cell:has(.el-tag) { flex-wrap: wrap; row-gap: 4px; }
+/* .rules-pagination 已收敛 styles/main.css（四处逐字重复单源化） */
 .ip-list-refs-popper { line-height: 1.6; max-width: 280px; }
 /* el-dialog 的 class 落在 .el-dialog 元素上（$attrs 手动绑定，非组件根），
    scoped 选择器无法命中，与上面 popper 同放非 scoped 块。

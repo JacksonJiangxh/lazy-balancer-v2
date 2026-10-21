@@ -45,6 +45,21 @@ const (
 // 语义，未来追加规则上下文包装后特判不会静默失效。
 var ErrNoEnabledUpstreams = errors.New("no enabled upstreams")
 
+// upstreamEnabledSQLPredicate 上游「启用」的 SQL 判定单源（渲染上游装载
+// 查询与看门狗发布谓词共用——两侧各写一份 IIF 表达式易单侧漂移，历史
+// 问题）。别名约定：u=upstreams。
+const upstreamEnabledSQLPredicate = `IIF(u.enabled IN ('1',1),1,0) = 1`
+
+// publishableRulesSQLPredicate 「哪些规则会被发布到运行配置」的 SQL 谓词
+// 单源：规则启用 ∧ 至少一个启用上游。两个消费层必须恒等：
+//   - 看门狗 expectedRenderedRules 直接用本谓词把期望集收窄到发布集；
+//   - 渲染主查询只按 enabled=1 装载（端口分组/80 端口遮蔽复核/零上游跳过
+//     warn 需要全集），再在 Go 侧按 hasEnabledUpstream（同语义：存在启用
+//     上游）逐规则跳过。
+//
+// 修改任一判定（启用语义/上游过滤）必须同步另一侧对应层。
+const publishableRulesSQLPredicate = `enabled = 1 AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id = lb_rules.caddy_id AND ` + upstreamEnabledSQLPredicate + `)`
+
 // ConfigRejectedError 标记「该配置本身不可被 Caddy 接受」——admin 4xx（provision
 // /校验拒绝）或渲染生成失败，区别于传输/系统失败（Caddy 不可达、5xx、序列化
 // 失败）。家族 3 门控提交（2026-09-06 裁定 ①②：只有可渲染配置可落库）据此
@@ -507,7 +522,17 @@ func (s *CaddyService) ApplyLastKnownGood() error {
 // ApplyConfigFromTx 仍是最终门控，校验器故障不得阻断全部写入。
 var ErrCLIValidatorUnavailable = errors.New("caddy CLI validator unavailable")
 
-const caddyCLIValidateTimeout = 60 * time.Second
+// ErrCLIValidationSkipped 标记「校验器未装配」（EnableCLIValidation 未被调用 /
+// 测试未注入）——候选配置从未经过 Caddy 级预检。审计项：此前 cliValidate==nil
+// 时直接返回 nil，被上层当作「已校验」（生产不可达、测试可达，但语义错误：
+// 一旦装配路径回归，未经校验的候选会走「CLI 已通过 + 应用失败可退化提交」
+// 分支）。本哨兵包装 ErrCLIValidatorUnavailable，既有 errors.Is 判定保持
+// 「不可用→放行但记录未校验」语义，消费方可额外区分「未启用」与「故障」。
+var ErrCLIValidationSkipped = fmt.Errorf("%w: validator not enabled (EnableCLIValidation not called)", ErrCLIValidatorUnavailable)
+
+// caddyCLIValidateTimeout 是 CLI 校验子进程的超时。var 而非 const：测试需注入
+// 毫秒级超时驱动「超时=校验器不可用」分支（sleep 60s 的测试不可接受）。
+var caddyCLIValidateTimeout = 60 * time.Second
 
 // EnableCLIValidation 启用 CLI 校验层（仅 main 装配调用；测试用桩注入）。
 func (s *CaddyService) EnableCLIValidation() {
@@ -547,8 +572,17 @@ func execCaddyValidate(rendered []byte) error {
 	cmd.Stderr = output
 	err = cmd.Run()
 	if err != nil {
-		if ctx.Err() != nil || errors.Is(err, exec.ErrNotFound) {
+		// 审计项：只有「进程确实运行并以非零码退出」才是配置被拒。启动失败
+		// （二进制缺失/不可执行/权限拒绝 → *exec.Error、*fs.PathError）、超时
+		// （ctx 到期）与信号致死（崩溃/OOM）都不构成配置裁决——此前仅识别
+		// ErrNotFound/超时，其余启动失败被归为「配置被拒」（400 + 回滚），
+		// 把环境故障伪装成用户配置错误。
+		var exitErr *exec.ExitError
+		if ctx.Err() != nil || errors.Is(err, exec.ErrNotFound) || !errors.As(err, &exitErr) {
 			return fmt.Errorf("%w: %v", ErrCLIValidatorUnavailable, err)
+		}
+		if state := exitErr.ProcessState; state != nil && !state.Exited() {
+			return fmt.Errorf("%w: caddy validate 进程异常终止: %v", ErrCLIValidatorUnavailable, err)
 		}
 		// caddy validate 以非零退出码表达「配置被拒」。
 		return fmt.Errorf("caddy validate 拒绝配置: %s", string(boundedValidateDetail(output.buf.Bytes())))
@@ -605,7 +639,8 @@ func (s *CaddyService) ValidateTxRenderViaCLI(tx *sql.Tx) error {
 	validator := s.cliValidate
 	s.mu.Unlock()
 	if validator == nil {
-		return nil
+		Logf("warn", "caddy CLI 校验器未装配：本次写入未经 Caddy 级预检（事务内应用仍为最终门控）")
+		return ErrCLIValidationSkipped
 	}
 	// 渲染会写 IP 名单投影；CLI 拒绝时必须自回滚，不能依赖每个调用方
 	//（历史问题-5）。成功路径保留新投影供随后的 ApplyConfigFromTx 使用。
@@ -648,7 +683,8 @@ func (s *CaddyService) ValidateJSONViaCLI(data []byte) error {
 	validator := s.cliValidate
 	s.mu.Unlock()
 	if validator == nil {
-		return nil
+		Logf("warn", "caddy CLI 校验器未装配：本份原始配置未经 Caddy 级预检")
+		return ErrCLIValidationSkipped
 	}
 	if err := validator(data); err != nil {
 		if errors.Is(err, ErrCLIValidatorUnavailable) {
@@ -812,11 +848,20 @@ type upstreamHealthCall struct {
 // GetUpstreamHealthDetailed returns detailed health status of all upstreams from Caddy.
 // 成功结果按 5s TTL 缓存且并发单飞；每次返回深拷贝，调用方不能污染共享缓存。
 func (s *CaddyService) GetUpstreamHealthDetailed() (map[string]map[string]*UpstreamHealthDetail, error) {
+	return s.aggregateUpstreamHealthWithSingleflight(s.getUpstreamHealthDetailedUncached)
+}
+
+// aggregateUpstreamHealthWithSingleflight 是健康聚合的单飞+TTL 缓存宿主。
+// 单飞槽位与 done 通道必须在 defer 中收尾：聚合内部 panic（畸形 admin 响应
+// 解析等）若直接冲出函数，healthInflight 会永久驻留——所有后续调用阻塞在
+// <-call.done 上，健康面板永久悬挂且无法自愈。panic 仍向首个调用方传播，
+// 等待者拿到错误；下一次调用重新发起聚合。
+func (s *CaddyService) aggregateUpstreamHealthWithSingleflight(load func() (map[string]map[string]*UpstreamHealthDetail, error)) (health map[string]map[string]*UpstreamHealthDetail, err error) {
 	s.healthMu.Lock()
 	if s.healthCache != nil && time.Now().Before(s.healthCacheExpiresAt) {
-		health := cloneUpstreamHealthDetails(s.healthCache)
+		cached := cloneUpstreamHealthDetails(s.healthCache)
 		s.healthMu.Unlock()
-		return health, nil
+		return cached, nil
 	}
 	if call := s.healthInflight; call != nil {
 		s.healthMu.Unlock()
@@ -830,17 +875,35 @@ func (s *CaddyService) GetUpstreamHealthDetailed() (map[string]map[string]*Upstr
 	s.healthInflight = call
 	s.healthMu.Unlock()
 
-	health, err := s.getUpstreamHealthDetailedUncached()
-
-	s.healthMu.Lock()
-	call.health, call.err = health, err
-	s.healthInflight = nil
-	if err == nil {
-		s.healthCache = health
-		s.healthCacheExpiresAt = time.Now().Add(upstreamHealthCacheTTL)
+	finish := func() {
+		s.healthMu.Lock()
+		call.err = err
+		if err == nil && health != nil {
+			// 缓存持有独立克隆：首个调用方拿到的是函数体里的另一次克隆，
+			// 等待者再从 call.health 克隆——三者互不共享，调用方变更不会
+			// 污染共享缓存。
+			cached := cloneUpstreamHealthDetails(health)
+			call.health = cached
+			s.healthCache = cached
+			s.healthCacheExpiresAt = time.Now().Add(upstreamHealthCacheTTL)
+		} else {
+			call.health = health
+		}
+		s.healthInflight = nil
+		s.healthMu.Unlock()
+		close(call.done)
 	}
-	s.healthMu.Unlock()
-	close(call.done)
+	defer func() {
+		if p := recover(); p != nil {
+			// 等待者不能悬挂：记为错误后照常传递 panic（首个调用方看到真实栈）。
+			health, err = nil, fmt.Errorf("上游健康聚合 panic: %v", p)
+			finish()
+			panic(p)
+		}
+		finish()
+	}()
+
+	health, err = load()
 	if err != nil {
 		return nil, err
 	}
@@ -1815,7 +1878,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	upstreamRows, err := store.Query(`
 		SELECT u.rule_id, u.host, u.port, COALESCE(u.weight,1), IIF(u.enabled IN ('1',1),1,0), COALESCE(u.protocol,'http'), COALESCE(u.max_connections,0), COALESCE(u.origin_domain,'')
 		FROM upstreams u JOIN lb_rules r ON r.caddy_id = u.rule_id
-		WHERE IIF(u.enabled IN ('1',1),1,0) = 1 AND r.enabled = 1 ORDER BY u.rule_id, u.id
+		WHERE ` + upstreamEnabledSQLPredicate + ` AND r.enabled = 1 ORDER BY u.rule_id, u.id
 	`)
 	if err != nil {
 		return generationFailure("query enabled upstreams: %v", err)
@@ -2114,6 +2177,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		}
 
 		if enabledUpstreamCount == 0 {
+			// 发布谓词 publishableRulesSQLPredicate 的 Go 侧同义层（零启用上游
+			// 不发布）——看门狗期望集按同一谓词收窄，两侧判定必须恒等。
 			Logf("warn", "规则 %s 没有可用的启用上游，已跳过该规则", r.CaddyID)
 			continue
 		}
@@ -2748,26 +2813,15 @@ func buildAccessLogEncoder(accessLogJSON bool, format string) map[string]interfa
 	}
 }
 
+// parseAccessLogFormat 渲染侧 DSL 消费：解析单源 ParseAccessLogFormat
+// （非法行=写侧 400 拒绝；带外写入的存量非法行在此容忍跳过，不阻断渲染）。
 func parseAccessLogFormat(format string) map[string]interface{} {
 	fields := map[string]interface{}{}
-	for _, line := range strings.Split(format, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, "->", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		path := strings.TrimSpace(parts[0])
-		action := strings.TrimSpace(parts[1])
-		if path == "" {
-			continue
-		}
-		if action == "delete" {
-			fields[path] = map[string]interface{}{"filter": "delete"}
-		} else if action != "" {
-			fields[path] = map[string]interface{}{"filter": "rename", "name": action}
+	for _, rule := range ParseAccessLogFormat(format).Rules {
+		if rule.Action == "delete" {
+			fields[rule.Path] = map[string]interface{}{"filter": "delete"}
+		} else {
+			fields[rule.Path] = map[string]interface{}{"filter": "rename", "name": rule.Action}
 		}
 	}
 	return fields
@@ -2862,6 +2916,62 @@ func acmeCertCandidatesForRule(store caddyConfigStore, ruleID string) []Certific
 		return nil
 	}
 	return candidates
+}
+
+// acmeCertAvailabilityForRules 批量判定一组规则是否有可用于渲染的 ACME 证书：
+// 单条查询取全部候选行，再在内存内逐规则复用 SelectCertificate 谓词（域名
+// 匹配/有效期/可解析性）。预览路径此前逐规则调用 isACMECertIssuedFromStore
+// ——O(N) 次查询 + O(N) 次 PEM 读取/X.509 解析。批量化只收敛往返次数与重复
+// 解析，不改变判定（不能退化成 SQL 近似判据：有效期与 X.509 可解析性 SQL
+// 无法表达）。查询失败按「无证书」处理并留痕（与单条路径同语义）。
+func acmeCertAvailabilityForRules(store caddyConfigStore, ruleDomains map[string]string) map[string]bool {
+	available := make(map[string]bool, len(ruleDomains))
+	if len(ruleDomains) == 0 {
+		return available
+	}
+	ids := make([]string, 0, len(ruleDomains))
+	args := make([]interface{}, 0, len(ruleDomains))
+	for id := range ruleDomains {
+		ids = append(ids, "?")
+		args = append(args, id)
+	}
+	rows, err := store.Query(`
+		SELECT rule_id, id, domain, status, cert_pem, key_pem,
+		       COALESCE(julianday(COALESCE(updated_at, created_at)), 0)
+		FROM cert_jobs
+		WHERE rule_id IN (`+strings.Join(ids, ",")+`)
+		  AND cert_pem IS NOT NULL AND cert_pem <> ''
+		  AND key_pem IS NOT NULL AND key_pem <> ''
+		ORDER BY updated_at DESC, id DESC`, args...)
+	if err != nil {
+		Logf("warn", "ACME 证书候选批量查询失败（按无证书处理）: %v", err)
+		return available
+	}
+	defer rows.Close()
+	byRule := make(map[string][]CertificateCandidate, len(ruleDomains))
+	for rows.Next() {
+		var ruleID string
+		var candidate CertificateCandidate
+		if err := rows.Scan(&ruleID, &candidate.ID, &candidate.Domain, &candidate.Status, &candidate.CertPEM, &candidate.KeyPEM, &candidate.UpdatedAt); err != nil {
+			Logf("warn", "ACME 证书候选批量解析失败（按无证书处理）: %v", err)
+			return map[string]bool{}
+		}
+		if candidate.Status != "disabled" {
+			candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
+		}
+		byRule[ruleID] = append(byRule[ruleID], candidate)
+	}
+	if err := rows.Err(); err != nil {
+		Logf("warn", "ACME 证书候选批量遍历失败（按无证书处理）: %v", err)
+		return map[string]bool{}
+	}
+	now := time.Now()
+	for ruleID, domain := range ruleDomains {
+		if _, ok := SelectCertificate(byRule[ruleID], domain, now); ok {
+			available[ruleID] = true
+		}
+	}
+	return available
 }
 
 // loadACMECertificateFromStore reads the issued ACME certificate and key from
@@ -3173,14 +3283,18 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 	hasCert := false
 	if protocol == "http" {
 		var tlsSource string
-		var certPresent, keyPresent, enableTLS bool
+		var certPresent, keyPresent, enableTLS, ruleEnabled, hasEnabledUpstream bool
 		// 历史问题: 查询失败必须留痕，对话框不得静默显示"无证书"。
 		// 历史问题：仅需存在性判断，投影 COALESCE!='' 布尔，不搬运 PEM 正文。
-		if err := db.DB.QueryRow(`SELECT COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '', COALESCE(tls_key,'') != '', COALESCE(enable_tls,0) FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(&tlsSource, &certPresent, &keyPresent, &enableTLS); err != nil {
+		// TLS 就绪判据必须与全量渲染同口径（enabled=1 ∧ enable_tls=1 ∧ 存在启用
+		// 上游 ∧ 证书可用）：旧实现只看证书存在性，已禁用/全部上游被禁用的规则
+		// 在预览里仍显示 load_files，与真实运行配置相反（误导 TLS 排查）。
+		if err := db.DB.QueryRow(`SELECT COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '', COALESCE(tls_key,'') != '',
+			COALESCE(enable_tls,0), COALESCE(enabled,0),
+			EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id = lb_rules.caddy_id AND IIF(u.enabled IN ('1',1),1,0) = 1)
+			FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(&tlsSource, &certPresent, &keyPresent, &enableTLS, &ruleEnabled, &hasEnabledUpstream); err != nil {
 			Logf("error", "GenerateRuleServerContext: 读取规则 %s TLS 字段失败: %v", caddyID, err)
-		} else if enableTLS {
-			// 历史问题: 与全量渲染 availableCerts 同口径（caddy.go 全量路径
-			// 要求 EnableTLS），未开 TLS 的规则不加载证书。
+		} else if enableTLS && ruleEnabled && hasEnabledUpstream {
 			if tlsSource == "manual" && certPresent && keyPresent {
 				hasCert = true
 			} else if tlsSource == "acme_dns" {
@@ -3200,6 +3314,12 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 		if err != nil {
 			Logf("error", "GenerateRuleServerContext: 读取端口 %d TLS 策略失败: %v", listenPort, err)
 		} else {
+			type portRule struct {
+				id, domain, tlsSource string
+				hasManualCert         bool
+			}
+			var portRules []portRule
+			acmeRuleDomains := map[string]string{}
 			for rows.Next() {
 				var ruleID, ruleDomain, tlsSource string
 				var hasManualCert bool
@@ -3207,11 +3327,29 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 					Logf("error", "GenerateRuleServerContext: 扫描端口 %d 规则 TLS 字段失败", listenPort)
 					continue
 				}
-				available := (tlsSource == "manual" && hasManualCert) || (tlsSource == "acme_dns" && isACMECertIssuedFromStore(db.DB, ruleID, ruleDomain))
+				portRules = append(portRules, portRule{id: ruleID, domain: ruleDomain, tlsSource: tlsSource, hasManualCert: hasManualCert})
+				if tlsSource == "acme_dns" {
+					acmeRuleDomains[ruleID] = ruleDomain
+				}
+			}
+			// 遍历中途 DB 错误会截断 TLS 策略且此前静默（仅关行），与规则主
+			// 循环同口径显式留痕。
+			if err := rows.Err(); err != nil {
+				Logf("error", "GenerateRuleServerContext: 遍历端口 %d TLS 策略失败: %v", listenPort, err)
+			}
+			_ = rows.Close()
+			// ACME 可用性批量判定（单次查询 + 内存内同一 SelectCertificate 谓词）：
+			// 旧实现逐规则调用 isACMECertIssuedFromStore，O(N) 次查询 + O(N) 次
+			// PEM 读取/X.509 解析。判定语义与渲染路径同源（不能退化成 SQL 近似
+			// 判据——有效期/可解析性 SQL 无法表达）。
+			acmeAvailable := acmeCertAvailabilityForRules(db.DB, acmeRuleDomains)
+			for _, rule := range portRules {
+				available := (rule.tlsSource == "manual" && rule.hasManualCert) ||
+					(rule.tlsSource == "acme_dns" && acmeAvailable[rule.id])
 				if !available {
 					continue
 				}
-				domainHosts := splitAndTrim(ruleDomain)
+				domainHosts := splitAndTrim(rule.domain)
 				if len(domainHosts) == 0 {
 					continue
 				}
@@ -3220,16 +3358,10 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 						"sni": domainHosts,
 					},
 					"certificate_selection": map[string]interface{}{
-						"any_tag": []string{ruleID},
+						"any_tag": []string{rule.id},
 					},
 				})
 			}
-			// 历史问题: 遍历中途 DB 错误会截断 TLS 策略且此前静默（仅关行），
-			// 与规则主循环（:990-993）同口径显式留痕。
-			if err := rows.Err(); err != nil {
-				Logf("error", "GenerateRuleServerContext: 遍历端口 %d TLS 策略失败: %v", listenPort, err)
-			}
-			_ = rows.Close()
 		}
 		server["tls_connection_policies"] = policies
 		apps["http"] = map[string]interface{}{"servers": map[string]interface{}{serverName: server}}

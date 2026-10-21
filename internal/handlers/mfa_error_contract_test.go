@@ -39,12 +39,21 @@ func TestMFAResetByAdmin_missingTargetUser_returns404(t *testing.T) {
 	}
 }
 
-// mfaActivateFailingConnector 假 db.DB：pending 读成功、激活写注入带表名/列名
-// 的底层错误——用于断言 500 响应不泄露 SQL 错误文本。
-type mfaActivateFailingConnector struct{ secret string }
+// mfaActivateFailingConnector 假 db.DB：pending 读成功，激活写的终态由
+// activateErr / rowsAffected 指定——分别用于断言 500 不泄露 SQL 错误文本
+// （基础设施故障）与业务态哨兵不被固定 500 吞掉（0 行=CAS 未命中）。
+type mfaActivateFailingConnector struct {
+	secret       string
+	activateErr  error
+	rowsAffected int64
+}
 
 func (c mfaActivateFailingConnector) Connect(context.Context) (driver.Conn, error) {
-	return mfaActivateFailingConn{c.secret}, nil
+	return mfaActivateFailingConn{
+		secret:       c.secret,
+		activateErr:  c.activateErr,
+		rowsAffected: c.rowsAffected,
+	}, nil
 }
 
 func (c mfaActivateFailingConnector) Driver() driver.Driver { return mfaActivateFailingDriver{} }
@@ -53,7 +62,11 @@ type mfaActivateFailingDriver struct{}
 
 func (mfaActivateFailingDriver) Open(string) (driver.Conn, error) { return nil, errors.New("not used") }
 
-type mfaActivateFailingConn struct{ secret string }
+type mfaActivateFailingConn struct {
+	secret       string
+	activateErr  error
+	rowsAffected int64
+}
 
 func (mfaActivateFailingConn) Prepare(string) (driver.Stmt, error) {
 	return nil, errors.New("unexpected prepare")
@@ -75,7 +88,10 @@ func (c mfaActivateFailingConn) QueryContext(_ context.Context, query string, _ 
 
 func (c mfaActivateFailingConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
 	if strings.Contains(query, "mfa_enabled=1") {
-		return nil, errors.New("SQLITE_ERROR: no such column: users.mfa_secret_internal")
+		if c.activateErr != nil {
+			return nil, c.activateErr
+		}
+		return driver.RowsAffected(c.rowsAffected), nil
 	}
 	return nil, errors.New("unexpected exec: " + query)
 }
@@ -88,7 +104,7 @@ func TestMFAActivate_dbFailure_hidesUnderlyingError(t *testing.T) {
 	secret := "JBSWY3DPEHPK3PXP"
 	code := mfaResetCurrentCode(t, secret, time.Now())
 
-	fake := sql.OpenDB(mfaActivateFailingConnector{secret: secret})
+	fake := sql.OpenDB(mfaActivateFailingConnector{secret: secret, activateErr: errors.New("SQLITE_ERROR: no such column: users.mfa_secret_internal")})
 	t.Cleanup(func() { _ = fake.Close() })
 	orig := db.DB
 	db.DB = fake
@@ -115,14 +131,39 @@ func TestMFAActivate_dbFailure_hidesUnderlyingError(t *testing.T) {
 	}
 }
 
-// 历史修复 配套：MFA 业务态错误（无 pending 密钥/并发变更）仍以 400 + 业务文案
-// 返回，不被固定 500 文案吞掉。
-func TestMFAInternalFailure_businessErrorsStayTyped(t *testing.T) {
-	if !errors.Is(services.ErrMFANoPendingSecret, services.ErrMFANoPendingSecret) {
-		t.Fatal("sentinel must be comparable")
+// MFA 业务态错误（并发变更：激活 CAS 未命中）必须仍是 400 + 业务文案，
+// 不被固定 500 文案吞掉、也不泄露底层错误。pending 读成功且验证码有效，
+// 激活 UPDATE 的 RowsAffected=0 即 ErrMFASecretChanged 的生产触发形态。
+func TestMFAActivate_businessErrorStaysTyped(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedMfaSetupUser(t)
+	secret := "JBSWY3DPEHPK3PXP"
+	code := mfaResetCurrentCode(t, secret, time.Now())
+
+	fake := sql.OpenDB(mfaActivateFailingConnector{secret: secret}) // rowsAffected=0 → CAS 未命中
+	t.Cleanup(func() { _ = fake.Close() })
+	orig := db.DB
+	db.DB = fake
+	t.Cleanup(func() { db.DB = orig })
+
+	router := gin.New()
+	router.POST("/auth/mfa/activate", func(c *gin.Context) {
+		c.Set("user_id", 1)
+		c.Set("username", "operator")
+		c.Set("auth_type", "jwt")
+		h.MFAActivate(c)
+	})
+
+	rec := postRaw(router, "/auth/mfa/activate", `{"code":"`+code+`"}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400（业务态错误不是基础设施故障）", rec.Code, rec.Body.String())
 	}
-	if services.ErrMFANoPendingSecret.Error() == "" || services.ErrMFASecretChanged.Error() == "" {
-		t.Fatal("sentinel errors must carry user-facing text")
+	if !strings.Contains(rec.Body.String(), services.ErrMFASecretChanged.Error()) {
+		t.Fatalf("body=%s, want 业务文案「%s」", rec.Body.String(), services.ErrMFASecretChanged.Error())
+	}
+	if strings.Contains(rec.Body.String(), "MFA 操作失败") {
+		t.Fatalf("body=%s, 业务态错误被固定 500 文案吞掉", rec.Body.String())
 	}
 }
 
@@ -132,4 +173,79 @@ func postMfaResetPath(router *gin.Engine, path, body string) *httptest.ResponseR
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	return rec
+}
+
+// seedNoMfaUser 种一个未启用 MFA 的用户（id=1，auth_provider=local）。
+func seedNoMfaUser(t *testing.T) {
+	t.Helper()
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,mfa_enabled,mfa_secret)
+		VALUES (1,'nomfa','x','admin',1,0,'')`); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+}
+
+func assertMFANotEnabled400(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400（业务态未启用）", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "MFA 未启用") {
+		t.Fatalf("body=%s, want 业务文案「MFA 未启用」", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "验证码错误") {
+		t.Fatalf("body=%s, 未启用不得报成验证码错误", rec.Body.String())
+	}
+}
+
+// 未启用 MFA 的验码入口必须 400 业务文案：与 MFAActivate 已确立的三态口径
+// （业务哨兵→400 / 真码错→401 / 基础设施故障→500）一致，既不误报验证码错误，
+// 也不把业务态折叠成 500。
+func TestMFAVerifyEntries_notEnabledReturns400(t *testing.T) {
+	t.Run("禁用 MFA", func(t *testing.T) {
+		setupAuthTestDB(t)
+		seedNoMfaUser(t)
+		h := &Handlers{}
+		router := gin.New()
+		router.POST("/auth/mfa/disable", func(c *gin.Context) {
+			c.Set("user_id", 1)
+			c.Set("auth_type", "jwt")
+			h.MFADisable(c)
+		})
+		assertMFANotEnabled400(t, postMfaSelfService(router, "/auth/mfa/disable", `{"code":"123456"}`))
+	})
+
+	t.Run("verify-step", func(t *testing.T) {
+		setupAuthTestDB(t)
+		seedNoMfaUser(t)
+		h := &Handlers{}
+		assertMFANotEnabled400(t, postMfaVerifyStep(mfaVerifyStepRouter(h, "jwt"), `{"code":"123456"}`))
+	})
+
+	t.Run("登录第二步", func(t *testing.T) {
+		setupAuthTestDB(t)
+		seedNoMfaUser(t)
+		// 登录失败锁定开关读取是验证步的前置（缺 global_config 行会被判成
+		// 基础设施故障 500，与本次语义无关）。
+		if _, err := db.DB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, mfa_lockout_enabled BOOLEAN);
+			INSERT INTO global_config VALUES (1,0)`); err != nil {
+			t.Fatalf("seed global config: %v", err)
+		}
+		if _, err := db.DB.Exec(`INSERT INTO mfa_challenges (token,user_id,expires_at,consumed,password_version)
+			VALUES ('nomfa-tok', 1, datetime('now','+5 minutes'), 0, 0)`); err != nil {
+			t.Fatalf("seed challenge: %v", err)
+		}
+		h := &Handlers{}
+		router := gin.New()
+		router.POST("/auth/mfa/verify", h.MFAVerifyLogin)
+		assertMFANotEnabled400(t, postMFAVerify(t, router, "nomfa-tok", "123456"))
+
+		// 业务态不是验证码错误：挑战必须已归还（同 token 仍可重试/重登）。
+		var consumed bool
+		if err := db.DB.QueryRow("SELECT COALESCE(consumed,0) FROM mfa_challenges WHERE token='nomfa-tok'").Scan(&consumed); err != nil {
+			t.Fatalf("read challenge: %v", err)
+		}
+		if consumed {
+			t.Fatal("未启用 MFA 的验码失败不得烧掉挑战")
+		}
+	})
 }

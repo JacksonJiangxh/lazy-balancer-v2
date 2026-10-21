@@ -7,7 +7,7 @@
 | `/app/data` | 业务/审计/指标数据库、ACME 账户密钥 | **是** |
 | `/app/certs` | 证书与私钥 | **是** |
 | `/app/logs` | 应用日志、Caddy 日志、按规则访问日志 | 推荐 |
-| `/app/waf` | CRS 规则、IP2Region xdb（Coraza 审计日志在 `/app/logs/waf-audit`） | 推荐 |
+| `/app/waf` | CRS 规则树（IP2Region xdb 实际位于 `/app/data/ip2region.xdb`，随数据卷持久化；Coraza 审计日志在 `/app/logs/waf-audit`） | 推荐 |
 | `/app/backup` | 自动备份落盘目录（不挂载则容器重建后备份文件丢失） | **是** |
 | `/app/config` | 启动期最小 Caddyfile（admin 监听等）；运行配置恒由数据库渲染覆盖，手改不持久 | 可选 |
 

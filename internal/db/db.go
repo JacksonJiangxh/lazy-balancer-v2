@@ -67,6 +67,11 @@ const (
 	DefaultSecurityEventsRowCap        = 1000000
 	DefaultThreatTrafficSampleN        = -1 // -1=自适应/0=关闭（全量与固定档已废除）
 	DefaultThreatScreenMode            = "map"
+	// DefaultTimezone 是 global_config.timezone 的治理默认（fresh DDL DEFAULT
+	// 与启动归一单源）。空串不是合法库值：time.LoadLocation("") 是 Go 的
+	// 特殊值（返回 UTC），读侧 COALESCE 只兜 NULL——空串落库会让全站展示/
+	// 审计窗口静默切 UTC，故写侧拒绝、启动归一、DDL DEFAULT 三处同口径。
+	DefaultTimezone = "Asia/Shanghai"
 )
 
 // certJobStatuses 是 cert_jobs.status 的规范枚举（历史问题，历史单源化）。
@@ -972,7 +977,11 @@ func runMigrations() error {
 		// （幂等 ensureNewColumns），不再各自 pragma 探测 + ALTER。
 		"global_config.waf_mode4_migrated":     "BOOLEAN DEFAULT 0",
 		"global_config.sync_switches_migrated": "BOOLEAN DEFAULT 0",
-		"security_ip_lists.system":             "INTEGER NOT NULL DEFAULT 0",
+		// 存量自定义规则清理的一次性指纹 marker（迁移定义版本；''=未跑）。
+		// 该迁移的判据在 JSON 内容里，无法用索引探测，只能整表读+解析——marker
+		// 置位后启动零读零写。
+		"global_config.legacy_custom_rule_sanitize_fp": "TEXT NOT NULL DEFAULT ''",
+		"security_ip_lists.system":                     "INTEGER NOT NULL DEFAULT 0",
 		// MFA 登录挑战绑定签发时密码版本（历史修复）。
 		"mfa_challenges.password_version":      "INTEGER NOT NULL DEFAULT 0",
 		"path_rules.upstream_path":             "TEXT NOT NULL DEFAULT ''",
@@ -1298,6 +1307,9 @@ func runMigrations() error {
 	defaultUpdates := []string{
 		"UPDATE global_config SET jwt_expire_minutes=20 WHERE jwt_expire_minutes IS NULL OR jwt_expire_minutes<=0 OR jwt_expire_minutes>1440",
 		"UPDATE global_config SET access_log_format='' WHERE access_log_format LIKE '{%'",
+		// 空串/空白 timezone 归一（带外直写或旧备份恢复的脏行在下次启动收敛；
+		// 写侧已拒绝空串，读侧 COALESCE 只兜 NULL 不兜空串）。
+		fmt.Sprintf("UPDATE global_config SET timezone='%s' WHERE COALESCE(TRIM(timezone),'')=''", DefaultTimezone),
 		// 历史问题 三次（用户反馈）：上游长连接空闲超时旧默认 60s 主动关闭空闲连接
 		//（SSE/WebSocket/LLM 流场景 churn）——NULL 行归 0（继承 Caddy/Go
 		// Transport 默认 2 分钟）。审计 历史问题：不得命中显式 60——60 是写侧
@@ -1956,6 +1968,15 @@ const legacyHTTPSHasCertPredicate = `(
 // 幂等，重跑零命中。受影响规则记入操作日志（历史问题：迁移跑在审计库初始化之前，
 // 先缓冲、InitializeAuditDB 就绪后落库）。
 func migrateLegacyHTTPSProtocol() error {
+	// 先探测（只读、零行物化）：无 protocol='https' 行时直接返回——此前每次
+	// 启动都物化全部命中行（含 caddy_id/name/证书判定），已迁移库白付扫描。
+	var stale int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE protocol='https'`).Scan(&stale); err != nil {
+		return fmt.Errorf("failed to inspect legacy https lb_rules: %w", err)
+	}
+	if stale == 0 {
+		return nil
+	}
 	rows, err := DB.Query(`SELECT caddy_id, name,
 		CASE WHEN ` + legacyHTTPSHasCertPredicate + ` THEN 1 ELSE 0 END
 		FROM lb_rules WHERE protocol='https'`)
@@ -1986,6 +2007,7 @@ func migrateLegacyHTTPSProtocol() error {
 	if len(legacy) == 0 {
 		return nil
 	}
+	startupMigrationWriteTx.Add(1)
 	tx, err := DB.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin legacy https lb_rules migration: %w", err)
@@ -2056,6 +2078,7 @@ func migrateTCPRuleStaleDNSServer() error {
 	// 历史问题（历史）：清理与 cluster_version bump 同事务——与姊妹
 	// 迁移 migrateTCPRuleSecurityPolicyBindings 同口径。此前清字段但不 bump，
 	// 从端快照版本门永不失效（主从 canonical 分叉）。
+	startupMigrationWriteTx.Add(1)
 	tx, err := DB.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin tcp stale dns server cleanup: %w", err)
@@ -2110,7 +2133,27 @@ type canonicalDomainMigrationRow struct {
 //
 // 幂等：已禁用的行/条目保持禁用，重复执行无副作用；不可解析的 JSON 保持原样不动，
 // 绝不 brick 一条策略或一条规则。
+//
+// 一次性门（指纹 marker）：判据在 JSON 内容里，无法用索引探测——此前每次启动
+// 都整表读 security_custom_rules + security_policies 并逐条解析。marker 存
+// global_config 列（newColumns 登记），值为迁移定义指纹：条目判定规则变化时
+// 改指纹即自动重跑，不会因「已迁移」布尔旗标永久跳过新规则。
+var startupLegacySanitizeMigrations atomic.Int64 // 真正执行整表扫描的次数（测试观测）
+
+// startupMigrationWriteTx 启动迁移开启写事务的次数（测试观测二次启动零写事务）。
+var startupMigrationWriteTx atomic.Int64
+
 func sanitizeLegacyCustomRulePatterns() error {
+	return sanitizeLegacyCustomRulePatternsAt(legacyCustomRuleSanitizeFingerprint)
+}
+
+const legacyCustomRuleSanitizeFingerprint = "sanitize-v1"
+
+func sanitizeLegacyCustomRulePatternsAt(fingerprint string) error {
+	if legacyCustomRuleSanitizeApplied(fingerprint) {
+		return nil
+	}
+	startupLegacySanitizeMigrations.Add(1)
 	hasTrailingBackslash := func(conditions []models.CustomRuleCondition, legacyPattern string) bool {
 		for _, cond := range conditions {
 			if strings.HasSuffix(cond.Pattern, `\`) {
@@ -2224,7 +2267,21 @@ func sanitizeLegacyCustomRulePatterns() error {
 		log.Print(detail)
 		recordSystemAudit("启动迁移", "自定义规则", detail)
 	}
+	// 收敛完成才置 marker：执行中报错返回时不置位，下次启动重试（与 audit
+	// 侧归一 marker 同口径）。
+	if _, err := DB.Exec(`UPDATE global_config SET legacy_custom_rule_sanitize_fp=? WHERE id=1`, fingerprint); err != nil {
+		// marker 写失败不阻断启动：下次启动重跑（幂等，零副作用）。
+		log.Printf("启动迁移：自定义规则清理 marker 写入失败（下次启动将重跑）: %v", err)
+	}
 	return nil
+}
+
+// legacyCustomRuleSanitizeApplied 报告 marker 是否已按当前指纹置位。
+// 读失败（列缺失/无 global_config 行）按未迁移处理——迁移自身会重试。
+func legacyCustomRuleSanitizeApplied(fingerprint string) bool {
+	var stored string
+	err := DB.QueryRow(`SELECT COALESCE(legacy_custom_rule_sanitize_fp,'') FROM global_config WHERE id=1`).Scan(&stored)
+	return err == nil && stored == fingerprint
 }
 
 // canonicalDomainMigrationSources 归一扫描的数据源，判定门与迁移本体共用同一份
@@ -2561,7 +2618,11 @@ func migrateSystemIPListUniqueIndex() error {
 		if _, err := DB.Exec(`DELETE FROM security_ip_lists WHERE system=1 AND id NOT IN (SELECT MIN(id) FROM security_ip_lists WHERE system=1 GROUP BY name)`); err != nil {
 			return fmt.Errorf("dedupe system ip lists: %w", err)
 		}
-		log.Printf("security_ip_lists: 已删除 %d 条重复的 system=1 名单行（保留每组 MIN(id)）", duplicates)
+		detail := fmt.Sprintf("启动迁移：security_ip_lists 重复的 system=1 名单行已去重（保留每组 MIN(id)）：%d 条", duplicates)
+		log.Print(detail)
+		// 删除整行属用户可见数据改写（重复行可能携带已入库 IP 条目）：与
+		// cert_jobs 去重/域名归一同口径落「全操作审计」，不只留进程 stdout。
+		recordSystemAudit("启动迁移", "IP 名单", detail)
 	}
 	if _, err := DB.Exec("CREATE UNIQUE INDEX IF NOT EXISTS u_security_ip_lists_system_name ON security_ip_lists(name) WHERE system=1"); err != nil {
 		return fmt.Errorf("create unique system ip list index: %w", err)
@@ -3681,6 +3742,7 @@ func migrateTCPRuleSecurityPolicyBindings() error {
 	if stale == 0 {
 		return nil
 	}
+	startupMigrationWriteTx.Add(1)
 	tx, err := DB.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin TCP rule policy binding cleanup: %w", err)
@@ -3734,11 +3796,36 @@ func normalizeRuleTimestampsMigration() error {
 // 的 canonical 变化由本迁移写侧触发 cluster_version bump 随下轮同步收敛。
 // WHERE 谓词与归一函数逐字对齐：enable_tls=1 即入选（历史修复，历史——
 // 此前要求证书材料非空会漏掉「TCP+enable_tls=1+双空证书」形态的存量行）。
+// tcpDeadFieldsProbeSQL 死值探测（与下方 UPDATE 同谓词 + TCP 孤儿路径规则）：
+// 无命中时零写事务、零版本扰动。谓词必须与 UPDATE WHERE 逐字对齐（改一侧
+// 必改另一侧）。
+const tcpDeadFieldsProbeSQL = `SELECT
+		(SELECT COUNT(*) FROM lb_rules WHERE protocol='tcp' AND (
+			COALESCE(host_header,'')<>'' OR COALESCE(health_check_path,'')<>''
+			OR enable_compress=1 OR COALESCE(compress_types,'')<>''
+			OR request_body_max_size_mb<>0 OR upstream_keepalive_timeout<>0 OR server_tokens_hidden<>0 OR ntlm_compatible<>0 OR upstream_force_http1<>0
+			OR proxy_dial_timeout<>0 OR proxy_response_header_timeout<>0 OR proxy_read_timeout<>0 OR proxy_write_timeout<>0 OR proxy_stream_timeout<>0 OR proxy_flush_interval<>0 OR proxy_stream_close_delay<>0
+			OR custom_routes_enabled=1 OR dynamic_dns=1
+			OR COALESCE(strategy,'')='cookie'
+			OR enable_tls=1
+		))
+		+ (SELECT COUNT(*) FROM path_rules WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp'))`
+
 func migrateTCPRuleDeadFields() error {
 	// 历史问题（历史）：清零与 cluster_version bump 必须同事务。此前两条
 	// 独立语句：bump 失败→启动失败，但清零已提交→下次启动 WHERE 不再命中→
 	// bump 永不发生（主从 canonical 分叉不收敛）。对照 TCP 绑定清理
 	// （migrateTCPRuleSecurityPolicyBindings）已在同一事务内完成删除+bump。
+	// 先探测再开事务（与姊妹迁移同口径）：无命中时零写事务、零版本扰动——
+	// 此前每次启动都无条件开写事务（SET + DELETE 两条写语句）。
+	var stale int
+	if err := DB.QueryRow(tcpDeadFieldsProbeSQL).Scan(&stale); err != nil {
+		return fmt.Errorf("failed to inspect TCP dead fields: %w", err)
+	}
+	if stale == 0 {
+		return nil
+	}
+	startupMigrationWriteTx.Add(1)
 	tx, err := DB.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin TCP dead-field cleanup: %w", err)

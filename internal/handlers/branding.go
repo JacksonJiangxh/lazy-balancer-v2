@@ -256,20 +256,15 @@ func readBrandingFile(path string) (brandingConfig, bool, error) {
 //   - 缺字段 → 补齐缺失字段(值为空),已有值与未知键原样保留
 //   - 齐全 → 零写入(mtime 不动)
 //   - 畸形 JSON → 不动(保守:不破坏用户数据;运行时按字段级回退并日志告警)
+//
+// 落盘统一走 services.MaterializeBranding 原子写（tmp+fsync+rename+父目录
+// fsync，历史问题：此前 os.WriteFile 直写，进程崩溃可留半截 branding.json）；
+// 顺带完成 landing 文案注入（与 SyncDefaultLandingText 幂等同源）。
 func EnsureBrandingFile(dataDir string) error {
 	path := filepath.Join(dataDir, "branding.json")
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		out, err := json.MarshalIndent(map[string]string{
-			"app_name":     "",
-			"footer_text":  "",
-			"landing_text": "",
-			"version":      "",
-		}, "", "  ")
-		if err != nil {
-			return fmt.Errorf("序列化品牌配置模板: %w", err)
-		}
-		if err := os.WriteFile(path, out, 0644); err != nil {
+		if err := services.MaterializeBranding(dataDir, ""); err != nil {
 			return fmt.Errorf("写入品牌配置模板: %w", err)
 		}
 		return nil
@@ -296,7 +291,7 @@ func EnsureBrandingFile(dataDir string) error {
 	if err != nil {
 		return fmt.Errorf("序列化补齐后的品牌配置: %w", err)
 	}
-	if err := os.WriteFile(path, out, 0644); err != nil {
+	if err := services.MaterializeBranding(dataDir, string(out)); err != nil {
 		return fmt.Errorf("写入补齐后的品牌配置: %w", err)
 	}
 	return nil

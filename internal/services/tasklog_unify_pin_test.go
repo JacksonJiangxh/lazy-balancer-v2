@@ -30,7 +30,7 @@ func TestCollectCertJobRows_TerminalCounts(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r2','b.test','failed',?)`, now); err != nil {
 		t.Fatalf("seed failed row: %v", err)
 	}
-	rows := collectCertJobRows()
+	rows, _ := collectCertJobRows()
 	byDomain := map[string]TaskInfo{}
 	for _, r := range rows {
 		byDomain[strings.TrimPrefix(r.Name, "ACME 签发 · ")] = r
@@ -132,7 +132,7 @@ func TestCollectCertJobRows_excludesSyncedMaterialRows(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
 		t.Fatalf("set slave role: %v", err)
 	}
-	rows := collectCertJobRows()
+	rows, _ := collectCertJobRows()
 	for _, r := range rows {
 		if strings.Contains(r.Name, "ghost.test") {
 			t.Fatal("物化行（从主节点同步）不应出现在任务监控动态行")
@@ -167,7 +167,7 @@ func TestCollectCertJobRows_oldTerminalStillShown(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r9','old.test','issued',?)`, old); err != nil {
 		t.Fatalf("seed old row: %v", err)
 	}
-	rows := collectCertJobRows()
+	rows, _ := collectCertJobRows()
 	found := false
 	for _, r := range rows {
 		if strings.Contains(r.Name, "old.test") {

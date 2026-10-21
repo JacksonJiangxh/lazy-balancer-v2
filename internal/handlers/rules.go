@@ -94,11 +94,48 @@ func (h *Handlers) GetRule(c *gin.Context) {
 	// 历史问题（历史）：手动证书私钥与导出备份同敏感级——仅管理员 JWT
 	// 与管理员读写 Key 可回读；只读 Key/非管理员掩码为空串并置 TLSKeySet，
 	// 供编辑表单区分「未配置」与「已隐藏」（UpdateRule 空值=保留原私钥）。
-	if rule.TLSKey != "" && (c.GetString("role") != "admin" || (c.GetString("auth_type") == "api_key" && c.GetBool("api_key_read_only"))) {
+	if rule.TLSKey != "" && !canReadRuleTLSPrivateKey(c) {
 		rule.TLSKey = ""
 		rule.TLSKeySet = true
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: rule})
+}
+
+// canReadRuleTLSPrivateKey 报告当前请求身份是否可回读规则私钥字段：仅管理员
+// JWT 与管理员读写 API Key；只读 Key/非管理员恒掩码。GetRule 与
+// GetRuleCaddyConfig 共用本判据（同一敏感级的单一事实源）。
+func canReadRuleTLSPrivateKey(c *gin.Context) bool {
+	if c.GetString("role") != "admin" {
+		return false
+	}
+	return !(c.GetString("auth_type") == "api_key" && c.GetBool("api_key_read_only"))
+}
+
+// maskRuleCaddyPrivateKeys 递归掩码证书条目中的私钥字段：证书条目
+// （load_files 的私钥文件路径 / load_pem 的 PEM 正文）携带 certificate 与
+// key，非管理员/只读 Key 看到的 key 置空并标记 key_redacted——配置查看框
+// 只需证书与策略，无需私钥；与 GetRule 的 TLSKeySet 掩码口径一致。
+func maskRuleCaddyPrivateKeys(value interface{}) {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		if _, hasCertificate := typed["certificate"]; hasCertificate {
+			if key, ok := typed["key"].(string); ok && key != "" {
+				typed["key"] = ""
+				typed["key_redacted"] = true
+			}
+		}
+		for _, child := range typed {
+			maskRuleCaddyPrivateKeys(child)
+		}
+	case []interface{}:
+		for _, child := range typed {
+			maskRuleCaddyPrivateKeys(child)
+		}
+	case []map[string]interface{}:
+		for _, child := range typed {
+			maskRuleCaddyPrivateKeys(child)
+		}
+	}
 }
 
 func (h *Handlers) GetRuleCaddyConfig(c *gin.Context) {
@@ -189,6 +226,11 @@ func (h *Handlers) GetRuleCaddyConfig(c *gin.Context) {
 		"tls_connection_policies": ruleContext["tls_connection_policies"],
 	}
 	responseData["config_not_exists"] = false
+	// 规则私钥字段与 GetRule 同敏感级：非管理员/只读 Key 不下发私钥（PEM
+	// 正文或私钥文件路径），只保留证书与策略上下文。
+	if !canReadRuleTLSPrivateKey(c) {
+		maskRuleCaddyPrivateKeys(responseData)
+	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: responseData})
 }
 
@@ -1366,7 +1408,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		// 显式 400 拒绝——此处 INSERT 只写归一后的合法值。
 		_, err = tx.Exec(`INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			caddyID, u.Host, u.Port, u.Weight, u.DynamicDNS, u.Enabled, u.Protocol, u.MaxConnections, u.OriginDomain)
+			caddyID, u.Host, u.Port, u.Weight, false /* dynamic_dns 废弃列：写侧恒 0，渲染只读规则级 */, u.Enabled, u.Protocol, u.MaxConnections, u.OriginDomain)
 		if err != nil {
 			tx.Rollback()
 			services.Logf("error", "CreateRule upstream insert error: %v", err)
@@ -1667,11 +1709,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.ListenPort == 0 {
 		req.ListenPort = existingRule.ListenPort
 	}
-	// 合并后仍为 0 才走 443 默认（新建语义的兜底；存量行 listen_port
-	// NOT NULL，正常路径不会命中）。
-	if req.ListenPort == 0 && req.Protocol == "http" && req.EnableTLS != nil && *req.EnableTLS {
-		req.ListenPort = 443
-	}
+	// F10：删除「合并后仍为 0 再填 443」的兜底——existingRule.listen_port 为
+	// NOT NULL，合并后为 0 不可达（死代码）；合并后仍为 0 走下方
+	// 「监听端口必须大于 0」显性拒绝，不再静默改端口。
 	if req.Strategy == "" {
 		req.Strategy = existingRule.Strategy
 	}
@@ -2604,6 +2644,13 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		resolvedExistingCAProviderID, resolveExistingErr := services.ResolveCAProviderID(existingRule.CAProviderID)
 		if resolveErr != nil || resolveExistingErr != nil {
 			restoreErr := errors.Join(h.restoreImportRuntime(runtimeSnapshot), restoreRuleDBSnapshot())
+			// 审计项：提交后失败的更早补偿分支同样必须留痕（此前只有应用日志）。
+			detail := "解析 CA 提供商失败，已回滚更新: " + errors.Join(resolveErr, resolveExistingErr).Error()
+			if restoreErr != nil {
+				detail = "解析 CA 提供商失败且恢复失败: " + errors.Join(resolveErr, resolveExistingErr, restoreErr).Error()
+			}
+			recordAudit(c, "更新失败", "负载规则", services.FormatAuditDetail(
+				services.AuditRulePart(caddyID), detail, services.AuditResultPart("failure")))
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "解析 CA 提供商失败: " + errors.Join(resolveErr, resolveExistingErr, restoreErr).Error()})
 			return
 		}
@@ -2616,6 +2663,13 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		certJobsSnapshot, err := services.SnapshotCertJobsForRule(caddyID)
 		if err != nil {
 			restoreErr := errors.Join(h.restoreImportRuntime(runtimeSnapshot), restoreRuleDBSnapshot())
+			// 审计项：同族更早补偿分支补审计（失败/回滚结果一并留痕）。
+			detail := "备份证书任务失败，已回滚更新: " + err.Error()
+			if restoreErr != nil {
+				detail = "备份证书任务失败且恢复失败: " + errors.Join(err, restoreErr).Error()
+			}
+			recordAudit(c, "更新失败", "负载规则", services.FormatAuditDetail(
+				services.AuditRulePart(caddyID), detail, services.AuditResultPart("failure")))
 			if restoreErr != nil {
 				services.Logf("error", "问题: UpdateRule cert job snapshot failed and restore failed for caddy_id=%s: snapshot=%v restore=%v", caddyID, err, restoreErr)
 			}
@@ -3308,7 +3362,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		if _, err := tx.Exec(`
 			INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, newCaddyID, u.Host, u.Port, u.Weight, u.DynamicDNS, u.Enabled, u.Protocol, u.MaxConnections, u.OriginDomain); err != nil {
+		`, newCaddyID, u.Host, u.Port, u.Weight, false /* dynamic_dns 废弃列：复制时归 0 */, u.Enabled, u.Protocol, u.MaxConnections, u.OriginDomain); err != nil {
 			upstreamRows.Close()
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "复制上游失败，已回滚: " + err.Error()})
 			return
@@ -3429,8 +3483,11 @@ func replaceUpstreamsTx(ctx context.Context, tx *sql.Tx, ruleID string, upstream
 	consumed := make([]bool, len(existing))
 	inserts := make([]storedUpstream, 0, len(upstreams))
 	for _, u := range upstreams {
+		// 上游级 dynamic_dns 是废弃列（渲染只读规则级 DynamicDNS）：写侧恒 0，
+		// 不再把请求里的伪语义落库；存量 1 行在内容比较时与 false 不等，故本轮
+		// 保存会原地归零一次（语义无变化，列值收敛）。
 		incoming := storedUpstream{
-			host: u.Host, port: u.Port, weight: u.Weight, dynamicDNS: u.DynamicDNS,
+			host: u.Host, port: u.Port, weight: u.Weight,
 			enabled: u.Enabled, protocol: u.Protocol, maxConnections: u.MaxConnections, originDomain: u.OriginDomain,
 		}
 		// ① 显式 id 命中（前端编辑既有行回传真实 id）

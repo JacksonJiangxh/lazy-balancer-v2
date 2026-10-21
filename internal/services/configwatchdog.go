@@ -228,10 +228,11 @@ func checkConfigConsistency(adminURL string) (checked bool, err error) {
 //
 // 返回 caddy_id → 规则名称。
 func expectedRenderedRules() (map[string]string, error) {
+	// 发布谓词单源 publishableRulesSQLPredicate（caddy.go）：启用 ∧ 存在启用
+	// 上游——与渲染侧 Go 跳过（hasEnabledUpstream）恒等，禁止另写第三份。
 	rows, err := db.DB.Query(`SELECT caddy_id, name, protocol, COALESCE(dynamic_dns,0), listen_port,
 		IIF(enable_tls IN ('1',1),1,0), COALESCE(tls_source,'manual'), COALESCE(tls_cert,''), COALESCE(tls_key,''), COALESCE(domain,'')
-		FROM lb_rules WHERE enabled=1
-		AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=lb_rules.caddy_id AND IIF(u.enabled IN ('1',1),1,0)=1)`)
+		FROM lb_rules WHERE ` + publishableRulesSQLPredicate)
 	if err != nil {
 		return nil, err
 	}

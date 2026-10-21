@@ -132,7 +132,7 @@ var tools = []toolSpec{
 	{"delete_ip_list", "删除指定 IP 地址列表", http.MethodDelete, "/security/ip-lists/{id}", []string{"id"}, nil, idSchema("id", "列表 ID", "integer")},
 	// 历史问题（2026-09 审计）：安全事件处置工作流——单条追加幂等（已存在返回
 	// added=false），免去 Agent 读全表-改-全量替换的竞态路径。
-	{"add_ip_to_list", "向 IP 地址列表追加单条 IP/CIDR（安全事件处置用，幂等）", http.MethodPost, "/security/ip-lists/{id}/ips", []string{"id"}, nil, `{"type":"object","required":["id","value"],"properties":{"id":{"type":"integer","description":"列表 ID"},"value":{"type":"string","description":"IP 或 CIDR，如 203.0.113.7 或 10.0.0.0/8；新条目备注固定为「事件处置」"}},"additionalProperties":false}`},
+	{"add_ip_to_list", "向 IP 地址列表追加单条 IP/CIDR（安全事件处置用，幂等；内置威胁名单只读返回 400）", http.MethodPost, "/security/ip-lists/{id}/ips", []string{"id"}, nil, `{"type":"object","required":["id","value"],"properties":{"id":{"type":"integer","description":"列表 ID"},"value":{"type":"string","description":"IP 或 CIDR，如 203.0.113.7 或 10.0.0.0/8。remark 无需提交：自定义名单固定为「事件处置」，自动封禁预置名单固定为「手动封禁」（任务挤出豁免判据）"}},"additionalProperties":false}`},
 	{"toggle_crs_auto_update", "开关 CRS 自动更新", http.MethodPut, "/security/crs/auto-update", nil, nil, toggleAutoUpdateSchema},
 	{"trigger_crs_update", "手动触发 CRS 规则库更新", http.MethodPost, "/security/crs/update", nil, nil, emptySchema},
 	{"toggle_ip2region_auto_update", "开关 IP2Region 自动更新", http.MethodPut, "/security/ip2region/auto-update", nil, nil, toggleAutoUpdateSchema},
@@ -254,7 +254,7 @@ const serverInstructions = `Lazy Balancer V2 负载均衡管理接口。认证�
 
 权限范围：
 - 只读 Key（read_only）可调用 GET 查询类工具（export_config 除外——导出含用户/密钥哈希，与写操作同级隐藏）及 3 个读探测 POST 工具（parse_certificate/validate_import/preview_config）；其余写工具（POST/PUT/DELETE）需非只读 Key
-- 写操作需要管理员权限（API Key 所属用户角色为 admin），非管理员 Key 调用写工具返回 403
+- 写操作需要管理员权限（API Key 所属用户角色为 admin），非管理员 Key 调用写工具返回 403；tools/list 已按「read_only 轴 + admin 轴」双轴过滤——未列出的工具不是不存在，而是当前 Key 不可见/不可调用
 - 从节点上仅 /cluster/ 前缀端点可过只读门，非从节点语义的集群操作由业务层拒绝（403/400），其余变更类写工具一律 403（预览/解析/只读查询类 POST 除外）——集群运维在目标节点本身调用，不要发往主节点；所有写操作校验后即时生效（失败自动回滚），无需手动 reload
 - 配置 IP 白名单的 Key 还需来源 IP 命中白名单（MCP 内部转发不受白名单影响）
 

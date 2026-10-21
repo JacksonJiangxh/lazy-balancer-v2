@@ -85,6 +85,10 @@ func TestSecurityWrites_transportFailureDegradesToCommit(t *testing.T) {
 	closed.Close()
 	gin.SetMode(gin.TestMode)
 	h := &Handlers{caddyService: services.NewCaddyService(url)}
+	// 审计项：未装配校验器现在返回显式「未校验」信号（与生产 EnableCLIValidation
+	// 装配态对齐）——本用例验证的是「CLI 已通过 + 应用传输失败仍可退化提交」，
+	// 因此显式注入通过型校验器。
+	h.caddyService.SetCLIValidatorForTest(func([]byte) error { return nil })
 	router := gin.New()
 	router.POST("/security/custom-rules", h.CreateSecurityCustomRule)
 

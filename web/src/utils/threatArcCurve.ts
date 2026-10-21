@@ -2,9 +2,9 @@
 // 只负责几何，不依赖 three/DOM，供地球渲染层每帧零分配投影。
 // 坐标约定与 globe.gl 一致：y 轴朝北极，经度绕 y 轴。
 
-export const SPHERICAL_ARC_ALTITUDE_SCALE = 0.4
+const SPHERICAL_ARC_ALTITUDE_SCALE = 0.4
 /** 短弧最小抬升：同省/邻省弧在球面上投影过短，容易被站点/扫描带遮住。 */
-export const SPHERICAL_ARC_MIN_ALTITUDE = 0.12
+const SPHERICAL_ARC_MIN_ALTITUDE = 0.12
 export const SPHERICAL_ARC_SAMPLES = 48
 
 function toUnit(lat: number, lng: number): [number, number, number] {

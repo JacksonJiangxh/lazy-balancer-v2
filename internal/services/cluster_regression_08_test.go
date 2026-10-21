@@ -55,7 +55,7 @@ func TestSnapshot_buildIsolatesCorruptedJSONRows(t *testing.T) {
 		resetSnapshotRowIsolationThrottle()
 	})
 
-	snapshot, err := cluster.SnapshotForTest(context.Background())
+	snapshot, err := cluster.buildFullSnapshot(context.Background(), database)
 	if err != nil {
 		t.Fatalf("snapshot build failed on corrupted single rows: %v", err)
 	}

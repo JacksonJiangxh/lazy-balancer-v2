@@ -4,7 +4,7 @@ package caddygeoip
 //   - per-country 双计数器（attack=安全拦截 isSecurityBlock 同口径；normal=
 //     非 安全中断 的已处理请求）——进程级常驻内存，国名桶硬上限 512（满员
 //     只丢新键，已有键继续计数），随进程生命周期，无文件/无 goroutine。
-//   - 暴露：SecurityBlockedCounter 实现 caddy.AdminRouter——GET /lb/traffic-stats
+//   - 暴露：TrafficStatsAdmin 实现 caddy.AdminRouter——GET /lb/traffic-stats
 //     请求到达时序列化当前快照（无常驻写者/无激活信号；页面异常关闭零残留）。
 //   - QPS 保险丝：单秒请求计数超过 fuseQPSPerSecond 时进入 1/N 抽样（N=8，
 //     每 N 个请求计 1 次×N 还原），翻秒且上一秒计数低于阈值 1/4 时回落 N=1。
@@ -21,8 +21,8 @@ package caddygeoip
 //     二次注册会 panic；路由无实例状态——读全局计数器，实例无关）。
 
 import (
+	"encoding/json"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -178,10 +178,12 @@ func trafficRecord(country string, attack bool) {
 
 // trafficSnapshotJSON 序列化当前快照：{"countries":{...},"sample_n":N}——
 // countries 键=原始国名（app 侧翻译中文），值=累计计数（自进程启动）。
+// 采集是否活跃由 app 侧合成的 available 表达（按 admin 可达性判定），本快照
+// 不发射采集开关状态——发而不用的字段会误导调用方把它当开关真源。
 func trafficSnapshotJSON() []byte {
 	trafficMu.RLock()
 	defer trafficMu.RUnlock()
-	b := []byte(`{"enabled":` + strconv.FormatBool(trafficCollectorActive()) + `,"countries":{`)
+	b := []byte(`{"countries":{`)
 	first := true
 	for country, e := range trafficCountries {
 		if first {
@@ -206,21 +208,17 @@ func trafficSnapshotJSON() []byte {
 	return b
 }
 
-// appendJSONString 极简 JSON 字符串转义（国名为 xdb 国家名——仅转义引号/
-// 反斜杠/控制字符，避免 encoding/json 反射开销）。
+// appendJSONString 生成 JSON 字符串字面量的转义内容（调用方自行加两侧引号）。
+// 国名来自 GeoIP 解析结果，可能含引号/控制字节/非法 UTF-8：逐字节手写转义会
+// 把非法 UTF-8 原样写入，使整个快照端点解析失败。改用 encoding/json 统一
+// 处理（非法 UTF-8 替换为 U+FFFD，控制字节按 \u 转义）——单次快照至多
+// trafficCountryLimit 个键，序列化开销可忽略。
 func appendJSONString(dst []byte, s string) []byte {
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		if ch == '"' || ch == '\\' {
-			dst = append(dst, '\\')
-		}
-		if ch < 0x20 {
-			dst = append(dst, ' ')
-			continue
-		}
-		dst = append(dst, ch)
+	quoted, err := json.Marshal(s)
+	if err != nil || len(quoted) < 2 {
+		return dst
 	}
-	return dst
+	return append(dst, quoted[1:len(quoted)-1]...)
 }
 
 func appendUint(dst []byte, v uint64) []byte {

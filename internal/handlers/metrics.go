@@ -12,21 +12,13 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/sync/singleflight"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
 var caddyMetricsHTTPClient = &http.Client{Timeout: 10 * time.Second}
-
-// metricsDashboardCache:历史问题(历史)监控面板聚合结果缓存,5s TTL
-// (复用 helpers.go systemSampleTTL 同模式)——面板自动刷新/多开页签在同一
-// 抓取周期内复用聚合;抓取/解析/查询失败不写缓存(错误直出,下次重试)。
-var metricsDashboardCache struct {
-	sync.Mutex
-	payload   gin.H
-	expiresAt time.Time
-}
 
 func fetchCaddyMetrics(ctx context.Context, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -63,25 +55,106 @@ func (h *Handlers) GetMetricsOverview(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: overview})
 }
 
+// metricsDashboardOutcome 面板聚合结果：status=0 为成功；否则携带错误状态码
+// 与文案（负缓存需保存完整失败响应形态，命中时与真实失败一致）。
+type metricsDashboardOutcome struct {
+	payload gin.H
+	status  int
+	message string
+}
+
+var (
+	// metricsDashboardTTL 成功聚合缓存窗口（与 systemSampleTTL 同量级）。
+	metricsDashboardTTL = 5 * time.Second
+	// metricsDashboardNegativeTTL 失败负缓存窗口：失败短缓存——多页签/多客户端
+	// 在同一失败窗口内不再串行重试击穿 Caddy，到期立即重试（自愈快）。
+	metricsDashboardNegativeTTL = 2 * time.Second
+	// metricsDashboardFetch 指标抓取入口（测试缝：计数/慢响应/失败注入）。
+	metricsDashboardFetch = fetchCaddyMetrics
+	// metricsDashboardGroup 并发请求合并：同一时刻只跑一趟聚合，其余等待同一
+	// 结果（旧实现以全局锁串行整个聚合，且失败不缓存→并发请求逐个重试）。
+	metricsDashboardGroup singleflight.Group
+)
+
+var metricsDashboardState struct {
+	sync.Mutex
+	outcome   metricsDashboardOutcome
+	expiresAt time.Time
+	valid     bool
+}
+
+// resetMetricsDashboardCacheForTest 测试缝：清空面板缓存（生产不调用）。
+func resetMetricsDashboardCacheForTest() {
+	metricsDashboardState.Lock()
+	metricsDashboardState.outcome = metricsDashboardOutcome{}
+	metricsDashboardState.expiresAt = time.Time{}
+	metricsDashboardState.valid = false
+	metricsDashboardState.Unlock()
+}
+
 func (h *Handlers) GetMetricsDashboard(c *gin.Context) {
-	// 历史问题:TTL 内命中直接复用聚合结果(见 metricsDashboardCache 注释);
-	// 锁随整个聚合持有,与 helpers.go getCachedDiskUsage 同模式——并发请求
-	// 串行复用同一抓取,不会击穿到 Caddy。
-	metricsDashboardCache.Lock()
-	defer metricsDashboardCache.Unlock()
-	if time.Now().Before(metricsDashboardCache.expiresAt) {
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: metricsDashboardCache.payload})
+	outcome := h.metricsDashboardCached(c.Request.Context())
+	if outcome.status != 0 {
+		c.JSON(outcome.status, models.APIResponse{Code: outcome.status, Message: outcome.message})
 		return
 	}
-	body, err := fetchCaddyMetrics(c.Request.Context(), h.cfg.CaddyMetricsURL)
-	if err != nil {
-		caddyMetricsError(c, err)
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: outcome.payload})
+}
+
+// metricsDashboardCached TTL 命中直返；未命中经 single-flight 合并并发后聚合，
+// 成功写正缓存、失败写短负缓存（失败不长期缓存）。
+func (h *Handlers) metricsDashboardCached(ctx context.Context) metricsDashboardOutcome {
+	if outcome, ok := loadMetricsDashboardCache(time.Now()); ok {
+		return outcome
+	}
+	value, _, _ := metricsDashboardGroup.Do("dashboard", func() (any, error) {
+		if outcome, ok := loadMetricsDashboardCache(time.Now()); ok {
+			return outcome, nil
+		}
+		// 聚合脱离首个请求的取消信号（首请求断开不应让同批等待者失败），
+		// 但保留总时长上限。
+		workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		outcome := h.buildMetricsDashboard(workCtx)
+		storeMetricsDashboardOutcome(outcome, time.Now())
+		return outcome, nil
+	})
+	outcome, _ := value.(metricsDashboardOutcome)
+	return outcome
+}
+
+func loadMetricsDashboardCache(now time.Time) (metricsDashboardOutcome, bool) {
+	metricsDashboardState.Lock()
+	defer metricsDashboardState.Unlock()
+	if metricsDashboardState.valid && now.Before(metricsDashboardState.expiresAt) {
+		return metricsDashboardState.outcome, true
+	}
+	return metricsDashboardOutcome{}, false
+}
+
+func storeMetricsDashboardOutcome(outcome metricsDashboardOutcome, now time.Time) {
+	ttl := metricsDashboardTTL
+	if outcome.status != 0 {
+		ttl = metricsDashboardNegativeTTL
+	}
+	if ttl <= 0 {
 		return
+	}
+	metricsDashboardState.Lock()
+	metricsDashboardState.outcome = outcome
+	metricsDashboardState.expiresAt = now.Add(ttl)
+	metricsDashboardState.valid = true
+	metricsDashboardState.Unlock()
+}
+
+func (h *Handlers) buildMetricsDashboard(ctx context.Context) metricsDashboardOutcome {
+	body, err := metricsDashboardFetch(ctx, h.cfg.CaddyMetricsURL)
+	if err != nil {
+		return metricsDashboardOutcome{status: http.StatusBadGateway, message: "采集 Caddy 指标失败: " + err.Error()}
 	}
 	samples, err := parsePrometheusSamples(string(body))
 	if err != nil {
-		caddyMetricsError(c, err)
-		return
+		return metricsDashboardOutcome{status: http.StatusBadGateway, message: "采集 Caddy 指标失败: " + err.Error()}
 	}
 	metricsIndex := buildPrometheusMetricsIndex(samples)
 
@@ -90,48 +163,42 @@ func (h *Handlers) GetMetricsDashboard(c *gin.Context) {
 		listenPort           int
 		enableTLS, enabled   bool
 	}
-	ruleRows, err := db.DB.QueryContext(c.Request.Context(), `
+	ruleRows, err := db.DB.QueryContext(ctx, `
 		SELECT caddy_id, COALESCE(domain,''), listen_port, COALESCE(protocol,''), COALESCE(enable_tls,0), IIF(enabled IN ('1',1),1,0)
 		FROM lb_rules ORDER BY caddy_id`)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则指标配置失败"})
-		return
+		return metricsDashboardOutcome{status: http.StatusInternalServerError, message: "读取规则指标配置失败"}
 	}
 	defer ruleRows.Close()
 	rules := make([]dashboardRule, 0)
 	for ruleRows.Next() {
 		var rule dashboardRule
 		if err := ruleRows.Scan(&rule.id, &rule.domain, &rule.listenPort, &rule.protocol, &rule.enableTLS, &rule.enabled); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则指标配置失败"})
-			return
+			return metricsDashboardOutcome{status: http.StatusInternalServerError, message: "读取规则指标配置失败"}
 		}
 		rules = append(rules, rule)
 	}
 	if err := ruleRows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则指标配置失败"})
-		return
+		return metricsDashboardOutcome{status: http.StatusInternalServerError, message: "读取规则指标配置失败"}
 	}
 
-	upstreamRows, err := db.DB.QueryContext(c.Request.Context(), `
+	upstreamRows, err := db.DB.QueryContext(ctx, `
 		SELECT rule_id, COALESCE(host,''), COALESCE(port,0), COALESCE(enabled,0)
 		FROM upstreams WHERE enabled=1`)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则上游失败"})
-		return
+		return metricsDashboardOutcome{status: http.StatusInternalServerError, message: "读取规则上游失败"}
 	}
 	defer upstreamRows.Close()
 	upstreamsByRule := make(map[string][]models.Upstream)
 	for upstreamRows.Next() {
 		var upstream models.Upstream
 		if err := upstreamRows.Scan(&upstream.RuleID, &upstream.Host, &upstream.Port, &upstream.Enabled); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则上游失败"})
-			return
+			return metricsDashboardOutcome{status: http.StatusInternalServerError, message: "读取规则上游失败"}
 		}
 		upstreamsByRule[upstream.RuleID] = append(upstreamsByRule[upstream.RuleID], upstream)
 	}
 	if err := upstreamRows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则上游失败"})
-		return
+		return metricsDashboardOutcome{status: http.StatusInternalServerError, message: "读取规则上游失败"}
 	}
 
 	// Block 标签+4xx 扣除(2026-09-15 用户裁定,方案 B):blocked 来自
@@ -163,9 +230,7 @@ func (h *Handlers) GetMetricsDashboard(c *gin.Context) {
 		"overview": h.metricsService.GetOverview(),
 		"rules":    ruleMetrics,
 	}
-	metricsDashboardCache.payload = payload
-	metricsDashboardCache.expiresAt = time.Now().Add(systemSampleTTL)
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: payload})
+	return metricsDashboardOutcome{payload: payload}
 }
 
 func (h *Handlers) GetRuleMetrics(c *gin.Context) {

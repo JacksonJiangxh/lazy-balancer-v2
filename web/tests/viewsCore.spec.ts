@@ -8,30 +8,20 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
 import { nextTick, ref } from 'vue'
 
 import { copyRuleHostHeader, newRuleWizardStageOverrides, stageBlockPageOverrides } from '../src/utils/ruleWizard.ts'
 import { buildAuditLogParams } from '../src/utils/auditLogFilters.ts'
 import { normalizeCidr, serializeWhitelist } from '../src/utils/apiKeyWhitelist.ts'
 import { useClampedPagination } from '../src/composables/useClampedPagination.ts'
+import { section, source } from './_helpers.ts'
 
-const source = (relativePath: string): string => readFileSync(new URL(`../src/${relativePath}`, import.meta.url), 'utf8')
-
-const rules = source('views/Rules.vue')
-const dashboard = source('views/Dashboard.vue')
-const auditLog = source('views/AuditLog.vue')
-const caddyConfig = source('views/CaddyConfig.vue')
-const users = source('views/Users.vue')
-const keys = source('views/Keys.vue')
-
-const slice = (text: string, startMarker: string, endMarker: string): string => {
-  const start = text.indexOf(startMarker)
-  assert.ok(start >= 0, `missing start marker: ${startMarker}`)
-  const end = text.indexOf(endMarker, start + startMarker.length)
-  assert.ok(end > start, `missing end marker: ${endMarker}`)
-  return text.slice(start, end)
-}
+const rules = source('src/views/Rules.vue')
+const dashboard = source('src/views/Dashboard.vue')
+const auditLog = source('src/views/AuditLog.vue')
+const caddyConfig = source('src/views/CaddyConfig.vue')
+const users = source('src/views/Users.vue')
+const keys = source('src/views/Keys.vue')
 
 // ============ 阶段拦截页覆盖的共享键集 ============
 
@@ -61,21 +51,21 @@ test('编辑/复制水合保留源规则的阶段覆盖，缺键按 0', () => {
 })
 
 test('水合/新建/重置三处共用同一键集（双向清单，防再次分叉）', () => {
-  const hydrate = slice(rules, 'const wizardFormFromRule', 'const buildRuleConfigView')
+  const hydrate = section(rules, 'const wizardFormFromRule', 'const buildRuleConfigView')
   assert.match(hydrate, /\.\.\.stageBlockPageOverrides\(fullRule\)/)
   // 水合里不得再逐键手写（逐键手写正是与重置清单分叉的根因）
   assert.doesNotMatch(hydrate, /block_page_stage1_id: fullRule\./)
 
-  const openWizard = slice(rules, 'const openWizard = async', 'const resetWizard')
+  const openWizard = section(rules, 'const openWizard = async', 'const resetWizard')
   const newBranch = openWizard.slice(openWizard.indexOf('} else {', openWizard.indexOf('if (rule) {')))
   assert.ok(newBranch.length > 0, 'missing new-rule branch')
   assert.match(newBranch, /\.\.\.newRuleWizardStageOverrides\(\)/)
 
-  const reset = slice(rules, 'const resetWizard = () => {', 'const beforeWizardClose')
+  const reset = section(rules, 'const resetWizard = () => {', 'const beforeWizardClose')
   assert.match(reset, /Object\.assign\(wizardForm, newRuleWizardStageOverrides\(\)\)/)
 
   // 提交载荷仍显式发送四键（0=不覆盖）
-  const payload = slice(rules, 'const data: UpdateRuleRequest = {', 'request.')
+  const payload = section(rules, 'const data: UpdateRuleRequest = {', 'request.')
   for (const key of ['block_page_stage1_id', 'block_page_stage1_status', 'block_page_stage3_id', 'block_page_stage3_status']) {
     assert.match(payload, new RegExp(`${key}: wizardForm\\.${key} \\|\\| 0`), `payload must send ${key}`)
   }
@@ -91,18 +81,18 @@ test('复制载荷的 host_header 取源规则值（空/缺省→空串）', () 
 })
 
 test('复制向导从源规则取值，仅复制分支把 host_header 编入载荷', () => {
-  const copyWizard = slice(rules, 'const openCopyWizard', 'const viewConfig')
+  const copyWizard = section(rules, 'const openCopyWizard', 'const viewConfig')
   assert.match(copyWizard, /copySourceHostHeader\.value = copyRuleHostHeader\(fullRule\)/)
   assert.match(rules, /\.\.\.\(isCopyMode\.value \? \{ host_header: copySourceHostHeader\.value \} : \{\}\)/)
   // 新建/编辑不得发送该键（Update 的 nil=保留语义，新建本就无覆盖）
-  const payload = slice(rules, 'const data: UpdateRuleRequest = {', 'request.')
+  const payload = section(rules, 'const data: UpdateRuleRequest = {', 'request.')
   assert.equal((payload.match(/host_header:/g) ?? []).length, 1, 'payload must carry host_header only via the copy spread')
 })
 
 // ============ 关闭规则日志弹框即停定时器 ============
 
 test('onRuleLogDialogClosed 停本地轮询定时器（不再 5s 空转）', () => {
-  const closed = slice(rules, 'const onRuleLogDialogClosed = () => {', '// 历史修复：日志尾轮询收敛')
+  const closed = section(rules, 'const onRuleLogDialogClosed = () => {', '// 历史修复：日志尾轮询收敛')
   assert.match(closed, /stopRuleLogPolling\(\)/)
   assert.match(closed, /ruleLogTail\.stop\(\)/)
 })
@@ -117,11 +107,11 @@ test('配置预览使用 getStrategyLabel，不再直出枚举键', () => {
 // ============ 采集失败的规则行必须可见 ============
 
 test('排行榜纳入采集失败行并排在正常行之后（逐列「采集失败」可达）', () => {
-  const rank = slice(dashboard, 'const rankableRules = computed', 'const sortedRules')
+  const rank = section(dashboard, 'const rankableRules = computed', 'const sortedRules')
   assert.match(rank, /ruleMetricsUnavailable\.value\[rule\.caddy_id\] === true/, '失败行必须进入可排行集合')
   assert.match(rank, /if \(aUnavailable !== bUnavailable\) return aUnavailable \? 1 : -1/, '失败行排末尾')
   assert.match(rank, /return ruleRankValue\(b\.caddy_id\) - ruleRankValue\(a\.caddy_id\)/, '正常行仍按指标降序')
-  const sorted = slice(dashboard, 'const sortedRules = computed', 'const rulesEmptyText')
+  const sorted = section(dashboard, 'const sortedRules = computed', 'const rulesEmptyText')
   assert.match(sorted, /ranked\.slice\(0, 10\), \.\.\.failed/, '失败行不占 10 个名额，恒追加在末尾')
   // 逐列「采集失败」分支保持存在（现为可达态）
   assert.ok((dashboard.match(/ruleMetricsUnavailable\[row\.caddy_id\]/g) ?? []).length >= 5)
@@ -131,7 +121,7 @@ test('排行榜纳入采集失败行并排在正常行之后（逐列「采集�
 
 test('历史统计失败置错误态并给重试，空态文案不再代表失败', () => {
   assert.match(dashboard, /ruleHistoryError\.value = error instanceof Error \? error\.message/)
-  const dialog = slice(dashboard, '<el-dialog v-model="ruleHistoryVisible"', '</el-dialog>')
+  const dialog = section(dashboard, '<el-dialog v-model="ruleHistoryVisible"', '</el-dialog>')
   assert.match(dialog, /v-if="ruleHistoryError"/)
   assert.match(dialog, /@click="fetchRuleHistory"/)
   // 错误态分支内不得再出现「该时间范围内暂无数据」
@@ -162,7 +152,7 @@ test('caddyStatus 映射样式类，unknown→info（.status-tag.info 生效）'
 // ============ 审计日志列表错误态 ============
 
 test('审计日志加载失败显性化（横幅 + 重试 + 空态分文案）', () => {
-  const fetchLogs = slice(auditLog, 'const fetchLogs = async', 'onMounted(')
+  const fetchLogs = section(auditLog, 'const fetchLogs = async', 'onMounted(')
   assert.match(fetchLogs, /loadError\.value = false/)
   assert.match(fetchLogs, /if \(currentRequestSeq === requestSeq\) loadError\.value = true/, '仅最新请求可置错误态')
   assert.match(auditLog, /v-if="loadError"/)
@@ -198,19 +188,19 @@ test('非管理员渲染权限空态且不发请求（深链同样覆盖）', ()
 
 test('MFA 激活按钮按 6 位禁用（不再静默 no-op）', () => {
   assert.match(users, /:disabled="mfaBinding\.code\.length !== 6"/)
-  const activate = slice(users, 'const activateMfa = async', 'const copyMfaRecovery')
+  const activate = section(users, 'const activateMfa = async', 'const copyMfaRecovery')
   assert.match(activate, /isReadOnly\.value \|\| mfaBinding\.value\.code\.length !== 6/)
 })
 
 test('MFA 两个入口补函数级只读守卫（纵深防御）', () => {
-  const open = slice(users, 'const openMfaBinding = async', 'const activateMfa')
+  const open = section(users, 'const openMfaBinding = async', 'const activateMfa')
   assert.match(open, /if \(isReadOnly\.value \|\| mfaBinding\.value\.loading\) return/)
-  const activate = slice(users, 'const activateMfa = async', 'const copyMfaRecovery')
+  const activate = section(users, 'const activateMfa = async', 'const copyMfaRecovery')
   assert.match(activate, /isReadOnly\.value/)
 })
 
 test('resetPassword 删除 lbOpen 时代残留的 cancel/close 分支', () => {
-  const reset = slice(users, 'const resetPassword = async', 'const resetMfa = async')
+  const reset = section(users, 'const resetPassword = async', 'const resetMfa = async')
   assert.doesNotMatch(reset, /e === 'cancel' \|\| e === 'close'/, 'lbOpen 以 {ok:false} resolve，不会 reject 字符串')
   assert.match(reset, /if \(!r\.ok\) return/)
 })

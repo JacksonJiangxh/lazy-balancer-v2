@@ -208,7 +208,6 @@ type threatScreenR79Payload struct {
 	Data struct {
 		Hours        int    `json:"hours"`
 		TotalEvents  int    `json:"total_events"`
-		RollupReady  bool   `json:"rollup_ready"`
 		RollupStale  bool   `json:"rollup_stale"`
 		RollupLastOK string `json:"rollup_last_success"`
 		TopTargets   []struct {

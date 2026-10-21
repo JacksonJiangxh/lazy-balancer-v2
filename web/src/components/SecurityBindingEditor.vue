@@ -195,12 +195,6 @@ interface BindingEditorRule {
   block_page_stage3_status?: number
 }
 
-const bindSubtitle = computed(() =>
-  props.mode === 'rule'
-    ? `${props.rule?.name ?? ''} · 按阶段分区选择，多条策略按阶段 0→3 顺序、同阶段内按策略 ID 升序执行`
-    : `${props.policyName ?? ''} · 选择要绑定该策略的 HTTP 规则（全量重置该策略的绑定集）`
-)
-
 const props = defineProps<{
   modelValue: boolean
   mode: 'rule' | 'policy'
@@ -216,6 +210,12 @@ const emit = defineEmits<{
   'update:modelValue': [value: boolean]
   saved: []
 }>()
+
+const bindSubtitle = computed(() =>
+  props.mode === 'rule'
+    ? `${props.rule?.name ?? ''} · 按阶段分区选择，多条策略按阶段 0→3 顺序、同阶段内按策略 ID 升序执行`
+    : `${props.policyName ?? ''} · 选择要绑定该策略的 HTTP 规则（全量重置该策略的绑定集）`
+)
 
 const saving = ref(false)
 

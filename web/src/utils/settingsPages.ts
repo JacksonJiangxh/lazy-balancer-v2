@@ -2,7 +2,7 @@
 // 原各持一份同构映射（标题字符串两处、页键→分页 id 一处），新增/改名时必然漏改
 // 其中一处。此处收敛为唯一事实源，两处只做取值与拼接。
 //
-// 页键形如 `settings-basic`（stores/auth 的 PageId 与侧边栏 index 同形）。
+// 页键形如 `settings-basic`（utils/pageIds 的 PageId 与侧边栏 index 同形）。
 
 export const SETTINGS_TAB_IDS = ['basic', 'cluster', 'certificates', 'apikeys', 'tasks'] as const
 export type SettingsTabId = (typeof SETTINGS_TAB_IDS)[number]
