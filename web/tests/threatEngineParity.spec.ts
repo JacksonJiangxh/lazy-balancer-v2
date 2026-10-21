@@ -131,6 +131,14 @@ test('地球光流叠加层复用地图的像素线宽/尾迹/粒子口径', () 
   assert.doesNotMatch(globeSrc, /arcStroke\('strokeW'/, '3D tube 弧线必须退役，避免双套样式')
 })
 
+test('地球聚合标签与到站脉冲跟地图同色', () => {
+  assert.match(globeSrc, /labelColor\(\(d: object\) => \(\(d as \{ color\?: string \}\)\.color\)/, '标签必须随弧线颜色（不得固定黄）')
+  assert.match(globeSrc, /syncArcLabels[\s\S]*color: a\.color/, 'labelsData 必须携带颜色')
+  assert.match(globeSrc, /arc\.pulsed = true/, '一个航次只允许触发一次到站脉冲')
+  assert.match(globeSrc, /spawnFlowRipple\(arc\.color\)/, '脉冲颜色必须使用弧线颜色')
+  assert.match(globeSrc, /ripple\.age \/ 1\.8/, '涟漪寿命必须与地图一致（1.8s）')
+})
+
 test('帧率脚手架已删（两档恒等常量与交互时间窗不再伪装成自适应）', () => {
   assert.doesNotMatch(globeSrc, /IDLE_FRAME_INTERVAL|ACTIVE_FRAME_INTERVAL|ACTIVE_WINDOW|lastInteraction/,
     '恒等的两档帧率与交互时间窗是死脚手架')

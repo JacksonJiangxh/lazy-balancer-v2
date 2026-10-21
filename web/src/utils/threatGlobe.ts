@@ -30,6 +30,8 @@ interface ArcDatum {
   tier: FlowArcTier
   label?: string
   born: number
+  /** 到站脉冲已触发（一个航次只允许一次，与地图 spawnRipple 同语义）。 */
+  pulsed: boolean
   /** 球面大圆采样点 xyz 平铺；spawn 时生成一次，帧内只投影不重建。 */
   curve: Float32Array
 }
@@ -37,9 +39,9 @@ interface ArcDatum {
 // 世界总览相机高度：2.4 实测球体偏小；1.8 放大约 1/3。
 const WORLD_ALTITUDE = 1.63
 const MAX_ARCS = 60
-// 地图书写口径：3 个航次（3 × (0.95s + 0.22s) ≈ 3.51s）后移除；地球叠加层
-// 使用同一寿命，确保两页光流残留时长一致。
-const ARC_TTL = 1400
+// 地图书写口径：单个航次（0.95s + 0.22s）后移除；地球叠加层使用同一寿命，
+// 确保两页光流残留时长一致。
+const ARC_TTL = 1250
 
 /** 垂直扫描 shader（参考实现移植）：纬度带自北极向南极往返扫掠。 */
 const FRESNEL_VS = `
@@ -253,7 +255,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     .labelLng('lng')
     .labelText('text')
     .labelSize(0.65)
-    .labelColor(() => '#ffd166')
+    .labelColor((d: object) => ((d as { color?: string }).color) ?? '#ffd166')
     .labelDotRadius(0)
     .pointsData(siteConfigured ? [{ lat: server[1], lng: server[0], size: 0.45 }] : [])
     .pointLat('lat')
@@ -765,6 +767,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   // 曲线在 spawn 时按球面大圆预计算（buildSphericalArc）；每帧只做零分配
   // 投影并复用一块屏幕坐标标量，不创建逐段对象。3D tube/dash 已退役。
   const FLOW_PARTICLES = 12
+  const FLOW_RIPPLE_POOL = 12
   const FLOW_TRAIL_SECONDS = FLOW_FLIGHT_MS / 1000
   const FLOW_GAP_SECONDS = 0.22
   const FLOW_CYCLE_SECONDS = FLOW_TRAIL_SECONDS + FLOW_GAP_SECONDS
@@ -781,6 +784,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   const flowProjected = { x: 0, y: 0 }
   const flowScreen = new Float32Array(SPHERICAL_ARC_SAMPLES * 2)
   const flowFront = new Uint8Array(SPHERICAL_ARC_SAMPLES)
+  const flowRipples: { age: number; color: string }[] = []
 
   const syncFlowSize = (): void => {
     const w = Math.max(1, container.clientWidth || 1)
@@ -825,7 +829,36 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     return { x: flowProjected.x, y: flowProjected.y }
   }
 
-  function drawFlowOverlay(now: number): void {
+  function spawnFlowRipple(color: string): void {
+    if (flowRipples.length >= FLOW_RIPPLE_POOL) flowRipples.shift()
+    flowRipples.push({ age: 0, color })
+  }
+
+  /** 到站脉冲：与地图 spawnRipple 同参数（1.8s、半径 3→29、同色）。 */
+  function drawFlowRipples(delta: number, site: { x: number; y: number } | null): void {
+    if (!site) return
+    const ctx = flowCtx
+    if (!ctx) return
+    for (let i = flowRipples.length - 1; i >= 0; i--) {
+      const ripple = flowRipples[i]
+      ripple.age += delta
+      const t = ripple.age / 1.8
+      if (t >= 1) {
+        flowRipples.splice(i, 1)
+        continue
+      }
+      const r = 3 + t * 26
+      ctx.beginPath()
+      ctx.arc(site.x, site.y, r, 0, Math.PI * 2)
+      ctx.strokeStyle = ripple.color
+      ctx.lineWidth = 1.5
+      ctx.globalAlpha = 0.85 * (1 - t)
+      ctx.stroke()
+      ctx.globalAlpha = 1
+    }
+  }
+
+  function drawFlowOverlay(now: number, delta = 0): void {
     if (!flowCtx) return
     syncFlowSize()
     const ctx = flowCtx
@@ -841,7 +874,14 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       const elapsed = (now - arc.born) / 1000
       if (elapsed > FLOW_LIFE_SECONDS) continue
       const local = elapsed % FLOW_CYCLE_SECONDS
-      if (local >= FLOW_TRAIL_SECONDS) continue
+      if (local >= FLOW_TRAIL_SECONDS) {
+        // 头部到达终点后只触发一次同色脉冲；空档期间不再画弧，与地图同口径。
+        if (!arc.pulsed) {
+          arc.pulsed = true
+          if (site) spawnFlowRipple(arc.color)
+        }
+        continue
+      }
       const curve = arc.curve
       const samples = curve.length / 3
       if (samples < 2) continue
@@ -949,6 +989,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
         ctx.globalAlpha = 1
       }
     }
+    drawFlowRipples(delta, site)
   }
 
   // 尺寸重试同步（构造竞态：容器 0×0 时双 RAF 单次尝试会静默失败）
@@ -1008,7 +1049,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     last = now
     // hover 拾取每帧最多一次（pointermove 只记坐标——历史 历史问题）
     processHover()
-    drawFlowOverlay(now)
+    drawFlowOverlay(now, dt / 1000)
     if (!paused) {
       clock.t += dt / 1000
       if (scanMat) scanMat.uniforms.uTime.value = clock.t
@@ -1041,7 +1082,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     globe.labelsData(
       arcs
         .filter((a) => a.label)
-        .map((a) => ({ lat: a.startLat, lng: a.startLng, text: a.label })),
+        .map((a) => ({ lat: a.startLat, lng: a.startLng, text: a.label, color: a.color })),
     )
   }
 
@@ -1056,6 +1097,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       tier,
       label: flowArcLabel(weight, tier !== 'thin'),
       born: performance.now(),
+      pulsed: false,
       curve: buildSphericalArc(from[1], from[0], server[1], server[0], globe.getGlobeRadius(), SPHERICAL_ARC_SAMPLES),
     })
     syncArcLabels()
