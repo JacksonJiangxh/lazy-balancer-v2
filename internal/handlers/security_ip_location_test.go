@@ -47,7 +47,10 @@ func TestFormatIP2RegionLocation(t *testing.T) {
 
 func TestEnrichIPLocation_reservedIPs(t *testing.T) {
 	// Given: 保留/私网/回环地址(含 IPv6——xdb 仅 IPv4,靠 net.ParseIP 前置拦截)
-	for _, ip := range []string{"::1", "127.0.0.1", "192.168.1.1", "10.0.0.1", "169.254.1.1", "fe80::1", "0.0.0.0", "0.0.0.1", "100.64.0.1", "192.0.0.1", "198.18.0.1", "224.0.0.1", "240.0.0.1", "2001:db8::1", "ff02::1"} {
+	for _, ip := range []string{"::1", "127.0.0.1", "192.168.1.1", "10.0.0.1", "169.254.1.1", "fe80::1", "0.0.0.0", "0.0.0.1", "100.64.0.1", "192.0.0.1", "198.18.0.1", "224.0.0.1", "240.0.0.1", "2001:db8::1", "ff02::1",
+		// RFC 5737 文档示例段——公网不可路由，与私网同待遇（事件富化/大屏
+		// 排除/封禁建议富化/活跃源计数同源生效）。
+		"192.0.2.1", "198.51.100.1", "203.0.113.1"} {
 		// When: 归属地富化
 		got := enrichIPLocation(ip)
 		// Then: 识别为保留地址
@@ -84,7 +87,7 @@ func TestValidIPOrCIDR_rejectsZoneForm(t *testing.T) {
 func TestEnrichIPLocation_emptyWithoutDatabaseNeverErrors(t *testing.T) {
 	// Given: no xdb loaded (test process never installs one)
 	// When / Then: lookups degrade to "" instead of failing
-	if got := enrichIPLocation("192.0.2.1"); got != "" {
+	if got := enrichIPLocation("93.184.216.1"); got != "" {
 		t.Fatalf("enrichIPLocation without xdb=%q, want empty", got)
 	}
 	if got := enrichIPLocation(""); got != "" {
@@ -164,8 +167,8 @@ func TestListSecurityEvents_carriesIPLocationField(t *testing.T) {
 	if len(resp.Data.Events) != 1 {
 		t.Fatalf("events = %s", recorder.Body.String())
 	}
-	if resp.Data.Events[0].ClientIP != "192.0.2.9" || resp.Data.Events[0].IPLocation != "" {
-		t.Fatalf("event ip/ip_location = %q/%q, want 192.0.2.9/\"\" without xdb", resp.Data.Events[0].ClientIP, resp.Data.Events[0].IPLocation)
+	if resp.Data.Events[0].ClientIP != "185.199.109.9" || resp.Data.Events[0].IPLocation != "" {
+		t.Fatalf("event ip/ip_location = %q/%q, want 185.199.109.9/\"\" without xdb", resp.Data.Events[0].ClientIP, resp.Data.Events[0].IPLocation)
 	}
 }
 
@@ -197,8 +200,8 @@ func TestGetSecurityOverview_topIPsCarryIPLocationField(t *testing.T) {
 	if len(resp.Data.TopIPs) != 1 {
 		t.Fatalf("top_ips = %s", recorder.Body.String())
 	}
-	if resp.Data.TopIPs[0].IP != "192.0.2.9" || resp.Data.TopIPs[0].IPLocation != "" {
-		t.Fatalf("top ip/ip_location = %q/%q, want 192.0.2.9/\"\" without xdb", resp.Data.TopIPs[0].IP, resp.Data.TopIPs[0].IPLocation)
+	if resp.Data.TopIPs[0].IP != "185.199.109.9" || resp.Data.TopIPs[0].IPLocation != "" {
+		t.Fatalf("top ip/ip_location = %q/%q, want 185.199.109.9/\"\" without xdb", resp.Data.TopIPs[0].IP, resp.Data.TopIPs[0].IPLocation)
 	}
 }
 

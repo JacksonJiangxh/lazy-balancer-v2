@@ -437,6 +437,9 @@ export const formatAclModeDetail = (
   const total = breakdown !== '' ? `共 ${effective} 条${breakdown}` : `${effective} 条`
   if (policy.ip_acl_mode === 'allow') return `白名单模式 · ${total}${blAlive}`
   if (policy.ip_acl_mode === '绕过') return `免检测模式 · ${total}${blAlive}`
+  // 空/未知模式：名单存在但渲染侧不发射任何拒绝规则（空模式 ACL 零发射）——
+  // 如实显示「未配置模式」而非「黑名单模式」，免误导用户以为名单在拦截。
+  if (policy.ip_acl_mode !== 'deny' && aclCount > 0) return `未配置模式 · ${total}${blAlive}`
   if (aclCount > 0 && blCount > 0) return `黑名单模式 · ${effective} 条（名单 ${aclCount} + 独立 ${blCount}）`
   return `黑名单模式 · ${total}`
 }

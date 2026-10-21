@@ -95,6 +95,12 @@ func jwtSecretStrongEnough(secret string) bool { return jwtSecretWeakness(secret
 // 配置文件中的未知键逐条 log 告警后忽略；读取/解析失败同样可见（回退默认值）。
 func Load(path string) *Config {
 	// Default values
+	// APP_VERSION 未注入时兜底 "unknown"（fail-visible）——显示一个并非
+	// 当前构建的版本号会误导排障；发版链（Dockerfile ARG VERSION +
+	// buildx --build-arg）显式传参，不受兜底值影响。
+	if os.Getenv("APP_VERSION") == "" {
+		log.Printf("config: APP_VERSION 未注入，面板版本显示为 unknown（发布构建应经 Dockerfile ARG VERSION / buildx --build-arg 显式传参）")
+	}
 	cfg := &Config{
 		Port:            8000,
 		DataDir:         "/app/data",
@@ -104,7 +110,7 @@ func Load(path string) *Config {
 		MetricsInterval: 30,
 		NodeName:        getEnv("NODE_NAME", "node-1"),
 		JWTSecret:       getEnv("JWT_SECRET", ""),
-		Version:         getEnv("APP_VERSION", "v2.3.8"),
+		Version:         getEnv("APP_VERSION", "unknown"),
 		LogFile:         getEnv("LOG_FILE", defaultLogFile),
 	}
 

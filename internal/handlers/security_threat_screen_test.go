@@ -98,13 +98,17 @@ func TestGetSecurityThreatScreen_reservedIPsExcludedEverywhere(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 	// 公网：2 blocked + 1 logged，两个 IP（其一在活跃窗）
-	seedThreatScreenEvent(t, utcStringAgo(10*time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(9*time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(8*time.Minute), "198.51.100.5", "941100", "XSS", "logged")
+	seedThreatScreenEvent(t, utcStringAgo(10*time.Minute), "93.184.216.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(9*time.Minute), "93.184.216.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(8*time.Minute), "185.199.108.5", "941100", "XSS", "logged")
 	// 保留/私网：3 条（不计总量/拦截/活跃源/国家/攻击族）
 	seedThreatScreenEvent(t, utcStringAgo(7*time.Minute), "192.168.1.5", "942100", "SQL Injection", "blocked")
 	seedThreatScreenEvent(t, utcStringAgo(6*time.Minute), "10.0.0.8", "941100", "XSS", "blocked")
 	seedThreatScreenEvent(t, utcStringAgo(5*time.Minute), "::1", "932100", "RCE", "blocked")
+	// RFC 5737 文档示例段（新形状）：公网不可路由，同保留地址排除
+	seedThreatScreenEvent(t, utcStringAgo(4*time.Minute), "192.0.2.10", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(3*time.Minute), "198.51.100.10", "941100", "XSS", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(2*time.Minute), "203.0.113.10", "932100", "RCE", "blocked")
 
 	// When
 	recorder := getRequest(t, router, "/security/overview/threat-screen")
@@ -139,9 +143,10 @@ func TestGetSecurityEventFeed_reservedIPsFiltered(t *testing.T) {
 	// Given: 公网与保留事件交错落库
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
-	seedThreatScreenEvent(t, utcStringAgo(3*time.Second), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(3*time.Second), "93.184.216.7", "942100", "SQL Injection", "blocked")
 	seedThreatScreenEvent(t, utcStringAgo(2*time.Second), "192.168.1.5", "941100", "XSS", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(1*time.Second), "203.0.113.9", "941100", "XSS", "logged")
+	seedThreatScreenEvent(t, utcStringAgo(1500*time.Millisecond), "203.0.113.9", "941100", "XSS", "blocked") // RFC 5737 段同保留地址过滤
+	seedThreatScreenEvent(t, utcStringAgo(1*time.Second), "93.184.216.9", "941100", "XSS", "logged")
 
 	// When
 	recorder := getRequest(t, router, "/security/events/feed")
@@ -158,7 +163,7 @@ func TestGetSecurityEventFeed_reservedIPsFiltered(t *testing.T) {
 		t.Fatalf("events=%d, want 2（192.168.1.5 被过滤）", len(payload.Data.Events))
 	}
 	for _, ev := range payload.Data.Events {
-		if ev.ClientIP == "192.168.1.5" {
+		if ev.ClientIP == "192.168.1.5" || ev.ClientIP == "203.0.113.9" {
 			t.Fatalf("保留地址事件泄漏到事件流: %+v", ev)
 		}
 	}
@@ -170,13 +175,13 @@ func TestGetSecurityThreatScreen_aggregateShape(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 
-	seedThreatScreenEvent(t, utcStringAgo(time.Hour), "203.0.113.7", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(2*time.Hour), "203.0.113.7", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(30*time.Minute), "198.51.100.5", "941100", "XSS", "logged")
-	seedThreatScreenEvent(t, utcStringAgo(20*time.Minute), "198.51.100.5", "941100", "XSS", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(5*time.Minute), "192.0.2.9", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(8*time.Minute), "198.51.100.6", "932100", "RCE", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(49*time.Hour), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(time.Hour), "93.184.216.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(2*time.Hour), "93.184.216.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(30*time.Minute), "185.199.108.5", "941100", "XSS", "logged")
+	seedThreatScreenEvent(t, utcStringAgo(20*time.Minute), "185.199.108.5", "941100", "XSS", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(5*time.Minute), "185.199.109.9", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(8*time.Minute), "185.199.108.6", "932100", "RCE", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(49*time.Hour), "93.184.216.7", "942100", "SQL Injection", "blocked")
 
 	// When
 	recorder := getRequest(t, router, "/security/overview/threat-screen")
@@ -217,7 +222,7 @@ func TestGetSecurityThreatScreen_aggregateShape(t *testing.T) {
 	if payload.Data.LoggedEvents != 1 {
 		t.Errorf("logged_events=%d, want 1（total 6 - blocked 5）", payload.Data.LoggedEvents)
 	}
-	// 活跃源 = 近 10min 去重 client_ip：192.0.2.9 与 198.51.100.6
+	// 活跃源 = 近 10min 去重 client_ip：185.199.109.9 与 185.199.108.6
 	if payload.Data.ActiveSources != 2 {
 		t.Errorf("active_sources=%d, want 2", payload.Data.ActiveSources)
 	}
@@ -252,7 +257,7 @@ func TestGetSecurityThreatScreen_hoursParam(t *testing.T) {
 	// Given: 一条 2h 前事件
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
-	seedThreatScreenEvent(t, utcStringAgo(2*time.Hour), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(2*time.Hour), "93.184.216.7", "942100", "SQL Injection", "blocked")
 
 	// When/Then: hours=1 → 事件在窗外；缺省 → 计入；hours 非法/越界 → 回退默认 24
 	if recorder := getRequest(t, router, "/security/overview/threat-screen?hours=1"); recorder.Code != http.StatusOK {
@@ -293,7 +298,7 @@ func TestGetSecurityThreatScreen_metricsScrapeFailureDegrades(t *testing.T) {
 	// Given: Caddy metrics 不可达 + 窗口内 1 条事件
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, "http://127.0.0.1:1/metrics")
-	seedThreatScreenEvent(t, utcStringAgo(time.Hour), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(time.Hour), "93.184.216.7", "942100", "SQL Injection", "blocked")
 
 	// When/Then: 不再整卡 500——ratelimit_blocks=0、ratelimit_available=false，
 	// 其余维度照常 200（大屏 30s 轮询容忍限流指标瞬时不可达，可用性位披露）
@@ -350,7 +355,7 @@ func TestGetSecurityThreatScreen_recentRateUsesInjectedClock(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	base := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Minute)
 	installThreatClock(t, base)
-	seedThreatScreenEvent(t, base.Add(-time.Minute).Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, base.Add(-time.Minute).Format("2006-01-02 15:04:05"), "93.184.216.7", "942100", "SQL Injection", "blocked")
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 	response := getRequest(t, router, "/security/overview/threat-screen")
 	if response.Code != http.StatusOK {
@@ -377,7 +382,7 @@ func TestGetSecurityThreatScreen_histogramKeepsPreBucketPrefix(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	base := time.Date(2026, 10, 18, 12, 30, 0, 0, time.UTC)
 	installThreatClock(t, base)
-	seedThreatScreenEvent(t, "2026-10-16 14:00:10", "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, "2026-10-16 14:00:10", "93.184.216.7", "942100", "SQL Injection", "blocked")
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 	var payload threatScreenR79Payload
 	for range 3 {
@@ -467,7 +472,7 @@ func TestGetSecurityEventFeed_ascendingNoLossAndFirstScreenLatest(t *testing.T) 
 		if i == 0 {
 			triggered, msg = "941100", "XSS"
 		}
-		seedThreatScreenEvent(t, ts, fmt.Sprintf("203.0.113.%d", i%200+1), triggered, msg, "blocked")
+		seedThreatScreenEvent(t, ts, fmt.Sprintf("93.184.216.%d", i%200+1), triggered, msg, "blocked")
 	}
 
 	fetch := func(query string) feedPayload {
@@ -541,7 +546,7 @@ func TestGetSecurityEventFeed_ascendingNoLossAndFirstScreenLatest(t *testing.T) 
 
 	// 游标之后新落库的事件全部被增量拉到（无漏）
 	for i := range 3 {
-		seedThreatScreenEvent(t, utcStringAgo(0), fmt.Sprintf("198.51.100.%d", i+1), "930100", "LFI", "blocked")
+		seedThreatScreenEvent(t, utcStringAgo(0), fmt.Sprintf("185.199.108.%d", i+1), "930100", "LFI", "blocked")
 	}
 	inc := fetch("?since_id=210&limit=100")
 	if len(inc.Data.Events) != 3 || inc.Data.HasMore {
@@ -571,9 +576,9 @@ func TestGetSecurityEventFeed_defaultsAndNewEventsAfterCursor(t *testing.T) {
 	// Given: 3 条事件
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
-	seedThreatScreenEvent(t, utcStringAgo(3*time.Second), "203.0.113.7", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(2*time.Second), "203.0.113.8", "941100", "XSS", "logged")
-	seedThreatScreenEvent(t, utcStringAgo(1*time.Second), "203.0.113.9", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(3*time.Second), "93.184.216.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(2*time.Second), "93.184.216.8", "941100", "XSS", "logged")
+	seedThreatScreenEvent(t, utcStringAgo(1*time.Second), "93.184.216.9", "942100", "SQL Injection", "blocked")
 
 	// When/Then: 缺省 since_id=0/limit=50 → 全量返回
 	recorder := getRequest(t, router, "/security/events/feed")
@@ -597,7 +602,7 @@ func TestGetSecurityEventFeed_defaultsAndNewEventsAfterCursor(t *testing.T) {
 	}
 
 	// 游标之后新落库的事件可被增量拉到（不重不漏的增量语义）
-	seedThreatScreenEvent(t, utcStringAgo(0), "203.0.113.10", "930100", "LFI", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(0), "93.184.216.10", "930100", "LFI", "blocked")
 	recorder = getRequest(t, router, fmt.Sprintf("/security/events/feed?since_id=%d", maxID))
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
@@ -638,12 +643,12 @@ func TestGetSecurityThreatScreen_contentCards(t *testing.T) {
 			t.Fatalf("seed rule-named event: %v", err)
 		}
 	}
-	seedRuleNamed(30, "203.0.113.7", "SQL注入检测")
-	seedRuleNamed(29, "203.0.113.7", "SQL注入检测")
-	seedRuleNamed(28, "198.51.100.5", "SQL注入检测")
+	seedRuleNamed(30, "93.184.216.7", "SQL注入检测")
+	seedRuleNamed(29, "93.184.216.7", "SQL注入检测")
+	seedRuleNamed(28, "185.199.108.5", "SQL注入检测")
 	// rule_name 空行：rule_triggered=2 黑名单（空名回退 rule_triggered 形态）
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, rule_name)
-		VALUES (?, '203.0.113.9', 'GET', '/a', 'stage1', '2', 'IP 黑名单命中', 'blocked', '')`,
+		VALUES (?, '93.184.216.9', 'GET', '/a', 'stage1', '2', 'IP 黑名单命中', 'blocked', '')`,
 		utcStringAgo(27*time.Minute)); err != nil {
 		t.Fatalf("seed empty-name event: %v", err)
 	}
@@ -714,10 +719,10 @@ func TestGetSecurityThreatScreen_recentRate(t *testing.T) {
 	// Given: 近 5 分钟 3 条 blocked + 1 条 logged（blocked 3 条/5min = 0.6/min）
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
-	seedThreatScreenEvent(t, utcStringAgo(1*time.Minute), "203.0.113.7", "942100", "SQL 注入攻击头", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(2*time.Minute), "203.0.113.7", "942100", "SQL 注入攻击头", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(3*time.Minute), "198.51.100.5", "941100", "XSS 脚本标签探测", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(4*time.Minute), "198.51.100.5", "941100", "XSS 脚本标签探测", "logged")
+	seedThreatScreenEvent(t, utcStringAgo(1*time.Minute), "93.184.216.7", "942100", "SQL 注入攻击头", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(2*time.Minute), "93.184.216.7", "942100", "SQL 注入攻击头", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(3*time.Minute), "185.199.108.5", "941100", "XSS 脚本标签探测", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(4*time.Minute), "185.199.108.5", "941100", "XSS 脚本标签探测", "logged")
 	seedThreatScreenEvent(t, utcStringAgo(2*time.Minute), "10.0.0.8", "941100", "XSS 脚本标签探测", "blocked")
 
 	// When
@@ -739,9 +744,9 @@ func TestGetSecurityThreatScreen_recentRate(t *testing.T) {
 func TestThreatScreenRollup_fixationIdempotentAndEquivalent(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
-	seedThreatScreenEvent(t, utcStringAgo(10*time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(9*time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, utcStringAgo(8*time.Minute), "198.51.100.5", "941100", "XSS", "logged")
+	seedThreatScreenEvent(t, utcStringAgo(10*time.Minute), "93.184.216.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(9*time.Minute), "93.184.216.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(8*time.Minute), "185.199.108.5", "941100", "XSS", "logged")
 
 	first := getRequest(t, router, "/security/overview/threat-screen")
 	if first.Code != http.StatusOK {
@@ -852,8 +857,8 @@ func TestThreatFixMinute_groupsByRuleIdentityColumns(t *testing.T) {
 	// 同 IP / 同分钟 / 同空规则 ID，但 rule_msg 不同 → 分类族不同。若分组键
 	// 退化为 select 列序号或漏掉 rule_msg/归一规则名，两行会被并成一组，
 	// 只按首行消息分类（少一个族）。
-	seedThreatScreenEventNamed(t, eventTime, "203.0.113.7", "", "IP 黑名单拦截", "blocked", "测试规则")
-	seedThreatScreenEventNamed(t, eventTime, "203.0.113.7", "", "GeoIP 区域拦截", "blocked", "测试规则")
+	seedThreatScreenEventNamed(t, eventTime, "93.184.216.7", "", "IP 黑名单拦截", "blocked", "测试规则")
+	seedThreatScreenEventNamed(t, eventTime, "93.184.216.7", "", "GeoIP 区域拦截", "blocked", "测试规则")
 
 	tx, err := db.MetricsDB.Begin()
 	if err != nil {
@@ -925,7 +930,7 @@ func TestThreatRollup_previousMinuteFinalizedAfterLateWrites(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	base := time.Date(2026, 10, 18, 12, 0, 30, 0, time.UTC)
 	installThreatClock(t, base)
-	seedThreatScreenEvent(t, "2026-10-18 12:00:05", "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, "2026-10-18 12:00:05", "93.184.216.7", "942100", "SQL Injection", "blocked")
 
 	// 首次固化：当前分钟（12:00）被写入。
 	if err := ensureThreatRollup(24); err != nil {
@@ -933,7 +938,7 @@ func TestThreatRollup_previousMinuteFinalizedAfterLateWrites(t *testing.T) {
 	}
 	// 12:00 内后段迟到写入（首次固化之后到达），并推进时钟到 12:01:30：
 	// lastComplete=12:00 必须被再次终固，否则该事件永久丢失。
-	seedThreatScreenEvent(t, "2026-10-18 12:00:40", "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, "2026-10-18 12:00:40", "93.184.216.7", "942100", "SQL Injection", "blocked")
 	oldClock := threatScreenNow
 	threatScreenNow = func() time.Time { return base.Add(time.Minute) }
 	t.Cleanup(func() { threatScreenNow = oldClock })
@@ -959,7 +964,7 @@ func TestThreatRollup_watermarkAdvancesOnEmptyAndClamps(t *testing.T) {
 		setupSecurityPolicyTestDB(t)
 		installThreatClock(t, base)
 		// 3 小时前的公网事件 + 同分钟的全私网事件（私网不进 rollup）。
-		seedThreatScreenEvent(t, "2026-10-18 09:00:10", "203.0.113.7", "942100", "SQL Injection", "blocked")
+		seedThreatScreenEvent(t, "2026-10-18 09:00:10", "93.184.216.7", "942100", "SQL Injection", "blocked")
 		seedThreatScreenEvent(t, "2026-10-18 10:00:10", "10.0.0.8", "942100", "SQL Injection", "blocked")
 
 		if err := ensureThreatRollup(24); err != nil {
@@ -1028,7 +1033,7 @@ func TestThreatRollup_backfillHonorsRequestedHours(t *testing.T) {
 	t.Run("48h window backfills 36h-old events", func(t *testing.T) {
 		setupSecurityPolicyTestDB(t)
 		installThreatClock(t, base)
-		seedThreatScreenEvent(t, eventTime, "203.0.113.7", "942100", "SQL Injection", "blocked")
+		seedThreatScreenEvent(t, eventTime, "93.184.216.7", "942100", "SQL Injection", "blocked")
 		if err := ensureThreatRollup(48); err != nil {
 			t.Fatal(err)
 		}
@@ -1044,7 +1049,7 @@ func TestThreatRollup_backfillHonorsRequestedHours(t *testing.T) {
 	t.Run("24h window does not backfill older events", func(t *testing.T) {
 		setupSecurityPolicyTestDB(t)
 		installThreatClock(t, base)
-		seedThreatScreenEvent(t, eventTime, "203.0.113.7", "942100", "SQL Injection", "blocked")
+		seedThreatScreenEvent(t, eventTime, "93.184.216.7", "942100", "SQL Injection", "blocked")
 		settle(t, 24, lastCompleteMinute.Add(-24*time.Hour).Format("2006-01-02 15:04"))
 		if got := threatRollupCountForMinute(t, eventMinute); got != 0 {
 			t.Fatalf("36h-old event backfilled under 24h window (count=%d), want 0", got)
@@ -1067,7 +1072,7 @@ func TestEnsureThreatRollup_backfillBatchedNoLockStarvation(t *testing.T) {
 				return
 			default:
 			}
-			if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, rule_triggered, action) VALUES (?, '203.0.113.9', '942100', 'blocked')`, "2026-10-18 11:59:30"); err != nil && firstErr == nil {
+			if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, rule_triggered, action) VALUES (?, '93.184.216.9', '942100', 'blocked')`, "2026-10-18 11:59:30"); err != nil && firstErr == nil {
 				firstErr = err
 			}
 			time.Sleep(time.Millisecond)
@@ -1115,7 +1120,7 @@ func TestSecurityEventFeed_reservedOnlyPageAdvancesCursor(t *testing.T) {
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 	// 60 条公网（较老）+ 50 条保留地址（最新）——首页整页被过滤。
 	for i := 0; i < 60; i++ {
-		seedThreatScreenEvent(t, utcStringAgo(30*time.Minute), "203.0.113.10", "942100", "SQL Injection", "blocked")
+		seedThreatScreenEvent(t, utcStringAgo(30*time.Minute), "93.184.216.10", "942100", "SQL Injection", "blocked")
 	}
 	for i := 0; i < 50; i++ {
 		seedThreatScreenEvent(t, utcStringAgo(20*time.Minute), "10.0.0.8", "942100", "SQL Injection", "blocked")
@@ -1159,7 +1164,7 @@ func TestSecurityEventFeed_mixedPageHighWater(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 	for i := 0; i < 50; i++ {
-		seedThreatScreenEvent(t, utcStringAgo(30*time.Minute), "203.0.113.10", "942100", "SQL Injection", "blocked")
+		seedThreatScreenEvent(t, utcStringAgo(30*time.Minute), "93.184.216.10", "942100", "SQL Injection", "blocked")
 	}
 	for i := 0; i < 10; i++ {
 		seedThreatScreenEvent(t, utcStringAgo(20*time.Minute), "192.168.1.5", "942100", "SQL Injection", "blocked")
@@ -1186,7 +1191,7 @@ func TestThreatRollup_longGapDoesNotFakeContinuousCoverage(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	installThreatClock(t, base)
 	eventMinute := base.Add(-36 * time.Hour).Truncate(time.Minute).Format("2006-01-02 15:04")
-	seedThreatScreenEvent(t, base.Add(-36*time.Hour).Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, base.Add(-36*time.Hour).Format("2006-01-02 15:04:05"), "93.184.216.7", "942100", "SQL Injection", "blocked")
 
 	// 双水位均有效但停在很久以前：窗口起点与已覆盖末端之间存在长缺口。
 	covered := base.AddDate(0, 0, -30).Format("2006-01-02 15:04")
@@ -1242,13 +1247,13 @@ func TestGetSecurityThreatScreen_topTargets(t *testing.T) {
 	seedThreatLBRule(t, "lb_aaa", "API 服务", "api.example.com")
 	seedThreatLBRule(t, "lb_bbb", "官网", "www.example.com")
 	for i := 0; i < 3; i++ {
-		seedThreatRuleEvent(t, utcStringAgo(time.Duration(i+1)*time.Minute), "203.0.113.7", "lb_aaa", "blocked")
+		seedThreatRuleEvent(t, utcStringAgo(time.Duration(i+1)*time.Minute), "93.184.216.7", "lb_aaa", "blocked")
 	}
-	seedThreatRuleEvent(t, utcStringAgo(time.Minute), "203.0.113.8", "lb_bbb", "logged")
+	seedThreatRuleEvent(t, utcStringAgo(time.Minute), "93.184.216.8", "lb_bbb", "logged")
 	for i := 0; i < 2; i++ {
-		seedThreatRuleEvent(t, utcStringAgo(time.Duration(i+1)*time.Minute), "203.0.113.9", "lb_gone", "blocked")
+		seedThreatRuleEvent(t, utcStringAgo(time.Duration(i+1)*time.Minute), "93.184.216.9", "lb_gone", "blocked")
 	}
-	seedThreatScreenEvent(t, utcStringAgo(time.Minute), "203.0.113.10", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(time.Minute), "93.184.216.10", "942100", "SQL Injection", "blocked")
 
 	// When
 	recorder := getRequest(t, router, "/security/overview/threat-screen")
@@ -1280,7 +1285,7 @@ func TestGetSecurityThreatScreen_disclosesRawCoverageGap(t *testing.T) {
 	t.Cleanup(resetThreatScreenCachesForTest)
 	resetThreatRollupWarmerForTest()
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
-	seedThreatScreenEvent(t, utcStringAgo(time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(time.Minute), "93.184.216.7", "942100", "SQL Injection", "blocked")
 
 	recorder := getRequest(t, router, "/security/overview/threat-screen?hours=168")
 	if recorder.Code != http.StatusOK {
@@ -1312,7 +1317,7 @@ func TestGetSecurityThreatScreen_topTargetsLimitThree(t *testing.T) {
 		id := "lb_top" + string(rune('a'+i))
 		seedThreatLBRule(t, id, "站点"+id, id+".example.com")
 		for n := 0; n <= i; n++ {
-			seedThreatRuleEvent(t, utcStringAgo(time.Minute), "203.0.113.7", id, "blocked")
+			seedThreatRuleEvent(t, utcStringAgo(time.Minute), "93.184.216.7", id, "blocked")
 		}
 	}
 
@@ -1336,7 +1341,7 @@ func TestGetSecurityThreatScreen_topTargetsCached(t *testing.T) {
 	t.Cleanup(resetThreatScreenCachesForTest)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 	seedThreatLBRule(t, "lb_aaa", "API 服务", "api.example.com")
-	seedThreatRuleEvent(t, utcStringAgo(time.Minute), "203.0.113.7", "lb_aaa", "blocked")
+	seedThreatRuleEvent(t, utcStringAgo(time.Minute), "93.184.216.7", "lb_aaa", "blocked")
 
 	get := func() int {
 		recorder := getRequest(t, router, "/security/overview/threat-screen")
@@ -1358,8 +1363,8 @@ func TestGetSecurityThreatScreen_topTargetsCached(t *testing.T) {
 	if got := get(); got != 1 {
 		t.Fatalf("first value=%d, want 1", got)
 	}
-	seedThreatRuleEvent(t, utcStringAgo(30*time.Second), "203.0.113.7", "lb_aaa", "blocked")
-	seedThreatRuleEvent(t, utcStringAgo(20*time.Second), "203.0.113.7", "lb_aaa", "blocked")
+	seedThreatRuleEvent(t, utcStringAgo(30*time.Second), "93.184.216.7", "lb_aaa", "blocked")
+	seedThreatRuleEvent(t, utcStringAgo(20*time.Second), "93.184.216.7", "lb_aaa", "blocked")
 	if got := get(); got != 1 {
 		t.Fatalf("cached value=%d, want 1（TTL 内缓存命中）", got)
 	}
@@ -1375,7 +1380,7 @@ func TestGetSecurityThreatScreen_topTargetsQueryFailureReturns500(t *testing.T) 
 	setupSecurityPolicyTestDB(t)
 	t.Cleanup(resetThreatScreenCachesForTest)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
-	seedThreatRuleEvent(t, utcStringAgo(time.Minute), "203.0.113.7", "lb_aaa", "blocked")
+	seedThreatRuleEvent(t, utcStringAgo(time.Minute), "93.184.216.7", "lb_aaa", "blocked")
 	if _, err := db.DB.Exec(`DROP TABLE lb_rules`); err != nil {
 		t.Fatal(err)
 	}
@@ -1395,7 +1400,7 @@ func TestStartThreatRollupWarmer_takesOverFixation(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	t.Cleanup(resetThreatRollupWarmerForTest)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
-	seedThreatScreenEvent(t, utcStringAgo(5*time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(5*time.Minute), "93.184.216.7", "942100", "SQL Injection", "blocked")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 已取消：warmer 立即退出（不执行固化），仅置启动标志
 	StartThreatRollupWarmer(ctx)
@@ -1418,7 +1423,7 @@ func TestStartThreatRollupWarmer_takesOverFixation(t *testing.T) {
 	// 模拟「warmer 已成功固化且新鲜」：再落一条最新分钟事件——常规请求不再
 	// 懒固化（total 保持 1）；复位后请求懒固化重固末两分钟 → 2。
 	markThreatRollupSuccess()
-	seedThreatScreenEvent(t, utcStringAgo(10*time.Second), "203.0.113.8", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(10*time.Second), "93.184.216.8", "942100", "SQL Injection", "blocked")
 	recorder = getRequest(t, router, "/security/overview/threat-screen")
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
@@ -1442,7 +1447,7 @@ func TestStartThreatRollupWarmer_runsImmediately(t *testing.T) {
 	// Given: 窗口内 1 条事件
 	setupSecurityPolicyTestDB(t)
 	t.Cleanup(resetThreatRollupWarmerForTest)
-	seedThreatScreenEvent(t, utcStringAgo(2*time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(2*time.Minute), "93.184.216.7", "942100", "SQL Injection", "blocked")
 	ctx, cancel := context.WithCancel(context.Background())
 	// 先取消并等待协程退出，再让 DB 清理运行（cleanup LIFO：本注册晚于
 	// setupSecurityPolicyTestDB 的换库清理，故先于其执行）。
@@ -1476,8 +1481,8 @@ func TestGetSecurityThreatScreen_hourlyHistSlidingHours(t *testing.T) {
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 	event30 := base.Add(-30 * time.Minute)
 	event90 := base.Add(-90 * time.Minute)
-	seedThreatScreenEvent(t, event30.Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, event90.Format("2006-01-02 15:04:05"), "203.0.113.8", "941100", "XSS", "blocked")
+	seedThreatScreenEvent(t, event30.Format("2006-01-02 15:04:05"), "93.184.216.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, event90.Format("2006-01-02 15:04:05"), "93.184.216.8", "941100", "XSS", "blocked")
 
 	// When: hours=3
 	recorder := getRequest(t, router, "/security/overview/threat-screen?hours=3")
@@ -1537,8 +1542,8 @@ func TestGetSecurityThreatScreen_hourlyHistUsesWindowStart(t *testing.T) {
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 	// 本地 12:35（窗口起点后 1min；旧整点对齐时被钳入首桶）与
 	// 本地 13:40（旧首桶 13:00 内；新第二桶）。
-	seedThreatScreenEvent(t, base.Add(-24*time.Hour+time.Minute).Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, base.Add(-24*time.Hour+66*time.Minute).Format("2006-01-02 15:04:05"), "203.0.113.8", "941100", "XSS", "blocked")
+	seedThreatScreenEvent(t, base.Add(-24*time.Hour+time.Minute).Format("2006-01-02 15:04:05"), "93.184.216.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, base.Add(-24*time.Hour+66*time.Minute).Format("2006-01-02 15:04:05"), "93.184.216.8", "941100", "XSS", "blocked")
 
 	recorder := getRequest(t, router, "/security/overview/threat-screen?hours=24")
 	if recorder.Code != http.StatusOK {
@@ -1574,9 +1579,9 @@ func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
 	installThreatClock(t, now)
 	// 73h 前原始事件保证原始表覆盖到 72h 窗口起点之前（否则按 历史问题-01
 	// 口径应披露“窗口前段不可重建”，不能断言回填完成）。
-	seedThreatScreenEvent(t, now.UTC().Add(-73*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "203.0.113.6", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, now.UTC().Add(-30*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, now.UTC().Add(-2*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "203.0.113.8", "941100", "XSS", "blocked")
+	seedThreatScreenEvent(t, now.UTC().Add(-73*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "93.184.216.6", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, now.UTC().Add(-30*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "93.184.216.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, now.UTC().Add(-2*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "93.184.216.8", "941100", "XSS", "blocked")
 
 	// When: hours=72（rollup 回填跨多次请求续做——单请求批预算 24h）
 	var payload threatScreenPayload
@@ -1661,7 +1666,7 @@ func TestThreatRollup_ingestBackfillRewindsCoverage(t *testing.T) {
 	// Given 一条 30 分钟前的积压事件（远在 threatRollupRepairMinutes=10 之外）
 	eventTime := base.Add(-30 * time.Minute)
 	eventMinute := eventTime.Format("2006-01-02 15:04")
-	seedThreatScreenEvent(t, eventTime.Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, eventTime.Format("2006-01-02 15:04:05"), "93.184.216.7", "942100", "SQL Injection", "blocked")
 
 	// 且 warmer 已宣称整窗已覆盖（coveredFrom=24h 前、lastFixed=上一完整分钟），
 	// 目标维度就绪与归属地代际已就绪（否则 emptyCoverage 会全窗重固，掩盖前提）。
@@ -1795,7 +1800,7 @@ func TestThreatRollupRewindTo_defaultCoversSevenDays(t *testing.T) {
 
 	eventTime := base.Add(-48 * time.Hour)
 	eventMinute := eventTime.Truncate(time.Minute)
-	seedThreatScreenEvent(t, eventTime.Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, eventTime.Format("2006-01-02 15:04:05"), "93.184.216.7", "942100", "SQL Injection", "blocked")
 	if err := ensureThreatRollup(24 * 7); err != nil {
 		t.Fatal(err)
 	}
@@ -1837,7 +1842,7 @@ func TestThreatRollupRewindTo_narrowEnsureDoesNotSwallowRewind(t *testing.T) {
 
 	eventTime := base.Add(-48 * time.Hour)
 	eventMinute := eventTime.Truncate(time.Minute)
-	seedThreatScreenEvent(t, eventTime.Format("2006-01-02 15:04:05"), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, eventTime.Format("2006-01-02 15:04:05"), "93.184.216.7", "942100", "SQL Injection", "blocked")
 	ThreatRollupRewindTo(eventTime)
 
 	for range 4 {
@@ -1855,8 +1860,8 @@ func TestThreatFixMinute_prunedRowsAndLateEventsAreAdditive(t *testing.T) {
 	base := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	minute := base.Truncate(time.Minute)
 	eventTime := minute.Format("2006-01-02 15:04:05")
-	seedThreatScreenEvent(t, eventTime, "203.0.113.7", "942100", "SQL Injection", "blocked")
-	seedThreatScreenEvent(t, eventTime, "203.0.113.8", "941100", "XSS", "blocked")
+	seedThreatScreenEvent(t, eventTime, "93.184.216.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, eventTime, "93.184.216.8", "941100", "XSS", "blocked")
 	tx, err := db.MetricsDB.Begin()
 	if err != nil {
 		t.Fatal(err)
@@ -1870,7 +1875,7 @@ func TestThreatFixMinute_prunedRowsAndLateEventsAreAdditive(t *testing.T) {
 	if _, err := db.MetricsDB.Exec(`DELETE FROM security_events WHERE rule_triggered='942100'`); err != nil {
 		t.Fatal(err)
 	}
-	seedThreatScreenEvent(t, eventTime, "203.0.113.9", "930100", "LFI", "blocked")
+	seedThreatScreenEvent(t, eventTime, "93.184.216.9", "930100", "LFI", "blocked")
 
 	tx, err = db.MetricsDB.Begin()
 	if err != nil {
@@ -1917,7 +1922,7 @@ func TestThreatRollup_classifierGenerationMismatchRebuilds(t *testing.T) {
 	//（2h 前：单轮重固（批数上限）覆盖范围内，对齐既有 warmer 测试口径）
 	eventTime := base.Add(-2 * time.Hour)
 	minute := eventTime.Truncate(time.Minute)
-	seedThreatScreenEventNamed(t, eventTime.Format("2006-01-02 15:04:05"), "203.0.113.7", "2", "IP 黑名单拦截", "blocked", "测试规则")
+	seedThreatScreenEventNamed(t, eventTime.Format("2006-01-02 15:04:05"), "93.184.216.7", "2", "IP 黑名单拦截", "blocked", "测试规则")
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_event_rollup (minute, country, province, family, rule, action, count) VALUES (?, '', '', '旧口径分类', '2', 'blocked', 1)`,
 		minute.Format("2006-01-02 15:04")); err != nil {
 		t.Fatal(err)
@@ -1964,7 +1969,7 @@ func TestThreatRollup_classifierGenerationMismatchRebuilds(t *testing.T) {
 func TestGetSecurityThreatScreen_disclosesMinuteGranularityWindow(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
-	seedThreatScreenEvent(t, utcStringAgo(10*time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(10*time.Minute), "93.184.216.7", "942100", "SQL Injection", "blocked")
 
 	recorder := getRequest(t, router, "/security/overview/threat-screen?hours=1")
 	if recorder.Code != http.StatusOK {

@@ -537,6 +537,15 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(registration_id,0) FROM global_config WHERE id=1").Scan(&registrationID); err != nil {
 		return fmt.Errorf("读取注册编号: %w", err)
 	}
+	// 升主可见告警（不自动动作）：last_sync_error 在下方重置事务中被清空——
+	// 若旧集群同步残留未完成补偿标记（重载失败/品牌落盘失败/安全数据未
+	// 收敛），必须在清标记前捕获现值，提交后告警留痕（与看门狗「只报告」
+	// 口径一致，不自动触发任何补偿动作）。
+	var storedSyncError string
+	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&storedSyncError); err != nil {
+		return fmt.Errorf("读取同步错误标记: %w", err)
+	}
+	pendingCompensations := promotePendingCompensations(storedSyncError)
 	var oldToken string
 	// 历史问题（历史）：旧令牌仅用于提升成功后的脱离通知，
 	// 读取失败不阻断提升，但须留痕——与上下文显式错误处理对齐，不再静默吞错。
@@ -595,6 +604,13 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	if registrationID > 0 {
 		RecordAuditLog("system", "提升完成", "集群节点", FormatAuditDetail(fmt.Sprintf("注册编号：%d", registrationID), "本节点已脱离集群并提升为主节点", AuditResultPart("success")), "")
 	}
+	if len(pendingCompensations) > 0 {
+		// 只报告不自动动作：补偿属于旧集群拓扑，新主节点不能替旧主重放；
+		// 告警指引一次系统配置载入收敛运行态。
+		detail := fmt.Sprintf("升主完成：检测到上次同步存在未完成补偿（%s），建议执行一次系统配置载入", strings.Join(pendingCompensations, "、"))
+		Logf("warn", "Promote: %s", detail)
+		RecordAuditLog("system", "提升完成", "集群节点", FormatAuditDetail(detail, AuditResultPart("warning")), "")
+	}
 	// 自动备份：v2.0 引擎 Scheduled 驱动（RunsOn=MasterOnly 角色门）——
 	// promote 后由引擎 SetRole 使能，无需单独拉起。
 	// 角色翻转由引擎 SetRole 唯一驱动：cert-issuance/cluster-sync 经 daemon
@@ -607,8 +623,33 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	}
 	// 升主后按库实态统一恢复六个业务驱动任务，而非只恢复 autoban。
 	SyncBusinessTaskDrivers()
+	// Promote 后补重装首槽：从节点期间规则库更新任务由角色门停跑，版本行
+	// 可能残留「auto_update 开、next_update 空」形态——与引擎装配同源武装
+	// （历史问题 通道），否则空槽只能靠重启恢复，升主节点静默停更。
+	RearmSecurityLibrarySlots()
 	s.detachFromMaster(ctx, masterURL, oldToken)
 	return nil
+}
+
+// promotePendingCompensations 解析升主前 last_sync_error 现值中尚未完成的
+// 补偿标记（重载失败/品牌落盘失败/安全数据未收敛），返回人类可读清单；
+// 非补偿性质的普通同步错误（传输失败等）不纳入。
+func promotePendingCompensations(stored string) []string {
+	msg, _ := decodeSyncError(stored)
+	if msg == "" {
+		return nil
+	}
+	var pending []string
+	switch syncPostCommitMarkerPrefix(msg) {
+	case syncReloadFailureMarkerPrefix:
+		pending = append(pending, "重载失败补偿")
+	case syncBrandingFailureMarkerPrefix:
+		pending = append(pending, "品牌落盘补偿")
+	}
+	if strings.Contains(msg, wafRepullFailureMessagePrefix) {
+		pending = append(pending, "安全数据未收敛")
+	}
+	return pending
 }
 
 // detachFromMaster 复用升主/换主的旧主脱离收尾：按已知 pin 仅比对通知

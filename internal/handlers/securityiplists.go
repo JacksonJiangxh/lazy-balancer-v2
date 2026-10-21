@@ -647,6 +647,13 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 // 列表接口不再内联 entries，大名单查看/编辑不再背全表载荷）。
 func (h *Handlers) GetIPList(c *gin.Context) {
 	id := c.Param("id")
+	// 非规范数字 ID 门（与全部写路径/策略详情同口径）：SQLite 数值亲和
+	// 会让 "5.0" 命中 id=5，必须 400。例外：导出端点（ExportIPList）保留
+	// 容忍形态——文本附件下载无歧义面，且文件名已回库内行 ID。
+	if _, ok := parsePositiveNumericID(id); !ok {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的列表 ID"})
+		return
+	}
 	var row ipListRow
 	var entriesJSON string
 	if err := db.DB.QueryRow("SELECT id, name, COALESCE(description,''), COALESCE(category,''), COALESCE(entries,'[]'), COALESCE(created_by,0), COALESCE(created_at,''), COALESCE(updated_by,0), COALESCE(updated_at,''), COALESCE(system,0) FROM security_ip_lists WHERE id=?", id).
@@ -1439,6 +1446,11 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 // ，读路径全员可用（business 组）。
 func (h *Handlers) ExportIPList(c *gin.Context) {
 	id := c.Param("id")
+	// 已声明例外：本端点容忍非规范数字路由段（"5.0" 经 SQLite 亲和命中
+	// id=5）——文本附件下载无歧义面，且文件名取库内行 ID 而非路由段。
+	// 详情读路径（GetIPList）与全部写路径已统一 parsePositiveNumericID 400 门，
+	// 此处刻意不加（ExportIPList 容忍形态回归钉测：
+	// TestExportIPList_filenameUsesListRowID）。
 	var name, entriesJSON string
 	var system int
 	// 历史修复（历史）：文件名恒为「名单 ID」形态——此前以 name 非空作

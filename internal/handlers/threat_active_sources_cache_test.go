@@ -25,9 +25,10 @@ func TestThreatActiveSourcesCount_cachedWithinWindow(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	insert("203.0.113.10")
-	insert("203.0.113.11")
-	insert("10.0.0.5") // 私网/保留：不计入
+	insert("93.184.216.10")
+	insert("93.184.216.11")
+	insert("10.0.0.5")     // 私网/保留：不计入
+	insert("203.0.113.13") // RFC 5737 文档段：同保留地址排除
 
 	got, err := threatActiveSourcesCount(db.MetricsDB, since, now)
 	if err != nil {
@@ -38,7 +39,7 @@ func TestThreatActiveSourcesCount_cachedWithinWindow(t *testing.T) {
 	}
 
 	// 同窗口内新增源 IP：TTL 内必须命中缓存、不重查。
-	insert("203.0.113.12")
+	insert("93.184.216.12")
 	got, err = threatActiveSourcesCount(db.MetricsDB, since, now.Add(3*time.Second))
 	if err != nil {
 		t.Fatalf("cached count: %v", err)

@@ -199,8 +199,13 @@
                 <template v-else>—</template>
               </template>
             </el-table-column>
-            <el-table-column label="条目数" width="90" align="center">
-              <template #default="{ row }">{{ row.entry_count }}</template>
+            <el-table-column label="条目数" width="100" align="center">
+              <template #default="{ row }">
+                {{ row.entry_count }}
+                <el-tooltip v-if="row.preset_autoban" content="含已到期条目：到期即自动解封，此处为名单总条数（含待清理的到期项）" placement="top">
+                  <el-icon class="count-tip"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </template>
             </el-table-column>
             <el-table-column label="引用" width="90" align="center">
               <template #default="{ row }">
@@ -628,7 +633,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
-import { Aim, Filter, List, Location, Lock, Search, Notebook, Plus, WarningFilled, Link } from '@element-plus/icons-vue'
+import { Aim, Filter, List, Location, Lock, Search, Notebook, Plus, WarningFilled, Link, InfoFilled } from '@element-plus/icons-vue'
 import { formatDate, parseDbTimeMs } from '@/utils/date'
 import { IP_LIST_CATEGORIES, invalidateSharedEntriesCache } from '@/utils/securityStages'
 import { crsRuleCountLabel, libraryHealthTag, librarySourceHealthTag, libraryStatusLabel, libraryStatusTagType, summarizeLibrarySources } from '@/utils/securityLibraries'
@@ -641,7 +646,7 @@ import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
 import { showSaveResult } from '@/utils/saveResult'
 import { isValidCidr } from '@/utils/ruleValidation'
 import { canSaveIpList, needsEmptyListConfirm } from '@/utils/ipListSaveGuard'
-import { formatIpListEntryLine, parseIpListEntryLine } from '@/utils/ipListCsv'
+import { formatIpListEntryLine, ipListRemarkMaxLength, parseIpListEntryLine } from '@/utils/ipListCsv'
 import { popperViewportSafe } from '@/utils/popper'
 import { useAuthStore } from '@/stores/auth'
 
@@ -1233,7 +1238,7 @@ const triggerImportEntries = (): void => {
 
 // 行格式：第一列 IP/CIDR，第二列备注（可空）；支持 CSV 双引号字段与 `""`
 // 反转义（与导出单源：utils/ipListCsv，历史问题 往返一致）
-const parseEntryLine = (line: string): { value: string; remark: string } | null =>
+const parseEntryLine = (line: string): { value: string; remark: string } | { error: 'remark_too_long' } | null =>
   parseIpListEntryLine(line, isValidCidr)
 
 const onImportEntriesFileChange = (event: Event): void => {
@@ -1248,7 +1253,10 @@ const onImportEntriesFileChange = (event: Event): void => {
 }
 
 const importEntriesFromText = (text: string): void => {
-  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l !== '')
+  // 保留原始文件行号（空行占位也计数）：备注超长拒绝须按行号点名
+  const lines = text.split(/\r?\n/)
+    .map((l, idx) => ({ no: idx + 1, text: l.trim() }))
+    .filter((l) => l.text !== '')
   if (lines.length === 0) {
     ElMessage.error('文件为空或没有可解析的内容，已取消导入')
     return
@@ -1259,22 +1267,29 @@ const importEntriesFromText = (text: string): void => {
   let success = 0
   let invalid = 0
   let duplicate = 0
+  const remarkTooLongLines: number[] = []
   for (const line of lines) {
-    const parsed = parseEntryLine(line)
+    const parsed = parseEntryLine(line.text)
     if (!parsed) { invalid++; continue }
+    // 备注超长：与非法 CIDR 同策略整条拒绝（不静默截断），行号记入点名清单
+    if ('error' in parsed) { invalid++; remarkTooLongLines.push(line.no); continue }
     if (existing.has(parsed.value)) { duplicate++; continue }
     existing.add(parsed.value)
     ipListForm.value.entries.push({ value: parsed.value, remark: parsed.remark })
     success++
   }
   ipListEntryPage.value = Math.ceil(ipListForm.value.entries.length / ipListEntryPageSize)
+  const tooLongLineNos = remarkTooLongLines.slice(0, 10).join('、') + (remarkTooLongLines.length > 10 ? ' 等' : '')
+  const tooLongNote = remarkTooLongLines.length > 0
+    ? `；备注超过 ${ipListRemarkMaxLength} 字拒绝导入：第 ${tooLongLineNos} 行`
+    : ''
   if (success === 0) {
-    ElMessage.error(duplicate > 0
-      ? `没有可导入的新条目（非法 ${invalid} 条 / 重复 ${duplicate} 条）`
+    ElMessage.error(duplicate > 0 || remarkTooLongLines.length > 0
+      ? `没有可导入的新条目（非法 ${invalid} 条 / 重复 ${duplicate} 条）${tooLongNote}`
       : '文件中未解析到合法的 IP/CIDR 条目，已取消导入')
     return
   }
-  ElMessage.success(`导入完成：成功 ${success} 条，跳过 ${invalid + duplicate} 条（非法 ${invalid} / 重复 ${duplicate}）`)
+  ElMessage.success(`导入完成：成功 ${success} 条，跳过 ${invalid + duplicate} 条（非法 ${invalid} / 重复 ${duplicate}）${tooLongNote}`)
 }
 
 const exportIpListEntries = (): void => {
@@ -1743,6 +1758,7 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.count-tip { font-size: 12px; vertical-align: -1px; margin-left: 2px; color: var(--text-secondary); cursor: help; }
 /* 历史问题(历史,历史问题):全局表格居中规则(main.css inline-flex
    nowrap+overflow hidden)把条件列多标签裁剪成单行——3/4 条件不可见。
    条件列挂专用 class-name（rule-cond-cell），样式下沉到非 scoped 块只命中

@@ -1238,6 +1238,25 @@ func TestAutobanRunGate_ManualLoopWhileDisabledFailsAndStopsLoop(t *testing.T) {
 	}
 }
 
+// 未启用分支的日志文案按 trigger 二元化：auto 轮（周期 tick 投递）不得写
+// 「手动调度」——任务日志按字面归因触发来源，auto 轮写「手动调度」会让
+// 排障者误以为有人点了手动触发。
+func TestAutobanRunGate_AutoTriggerWhileDisabledLogsAutoWording(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+
+	err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"})
+	if err == nil || !strings.Contains(err.Error(), "未启用") {
+		t.Fatalf("Run 体门应拒绝未启用执行，err=%v", err)
+	}
+	log := readTaskLog(t, AutobanTaskID)
+	if strings.Contains(log, "手动调度") {
+		t.Fatalf("auto 轮日志不得写「手动调度」: %s", log)
+	}
+	if !strings.Contains(log, "定时调度") {
+		t.Fatalf("auto 轮日志应含「定时调度」行: %s", log)
+	}
+}
+
 // ---- 上限契约钉（2026-10-14 用户裁定：500→2000 设大值） ----
 
 func TestAutobanListEntryCap_raisedTo2000(t *testing.T) {

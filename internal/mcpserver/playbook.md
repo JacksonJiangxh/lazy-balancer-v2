@@ -15,7 +15,7 @@
 |---|---|
 | 只读 Key（read_only） | 可调用 GET 查询类工具（export_config 除外——导出含用户/密钥哈希，隐藏）及 3 个读探测 POST 工具（parse_certificate/validate_import/preview_config）；其余写工具返回 403（test_certificate_config 证书配置测试会写 DNS TXT 记录、test_ca_provider 缺 EAB 时会写 CA 凭据，只读 Key 均不可用） |
 | 写工具（POST/PUT/DELETE） | 需非只读 Key，且 Key 属主须为 admin 角色（非管理员 Key 调用写工具返回 403）；从节点上仅 /cluster/ 前缀端点可过只读门，非从节点语义的集群操作由业务层拒绝（403/400），其余变更类写工具一律 403（预览/解析/只读查询类 POST 除外）——集群运维在目标节点本身调用，不要发往主节点 |
-| IP 白名单 | 配了白名单的 Key，请求来源 IP 必须命中（MCP 内部转发不受影响） |
+| IP 白名单 | 配了白名单的 Key，请求来源 IP 必须命中（约束该 Key 的全部 REST 与 MCP 调用；MCP 内部转发不受影响） |
 | 生效方式 | 写操作校验后即时生效，失败自动回滚，无需手动 reload |
 
 ## 3. 工具分组速览（节选，全部百余工具以 tools/list 返回为准）

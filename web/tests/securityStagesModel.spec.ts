@@ -13,6 +13,7 @@ import {
   buildStageModel,
   entryMatchesIp,
   eventDetailRefIds,
+  formatAclModeDetail,
   hasIPACLControl,
   inferPolicyType,
   type SecurityStageBinding,
@@ -177,4 +178,25 @@ test('拦截页回落文案：失效策略页不得断言「回落默认 403」�
   // 未配置：跟随绑定链首个有效页，无则默认 403
   const unset = stageRows(bindingOf({ block_page_id: 0 }), policyOf({ mode: 'blocking' }), [], 3)
   assert.equal(unset.find((row) => row.label === '拦截页')?.detail, '未配置（跟随绑定链首个有效页，无则默认 403）')
+})
+
+test('ACL 摘要：有名单但模式为空/未知时显示「未配置模式」而非「黑名单模式」', () => {
+  const two = { ip_acl_list: '["1.1.1.1","2.2.2.2"]', ip_blacklist: '[]' }
+  // 目标形状：空模式/未知模式——名单存在但 ACL 不发射拒绝规则
+  assert.equal(formatAclModeDetail([], { ...two, ip_acl_mode: '' }), '未配置模式 · 2 条')
+  assert.equal(formatAclModeDetail([], { ...two, ip_acl_mode: 'unknown-x' }), '未配置模式 · 2 条')
+  // 畸形形状：空模式 + 独立黑名单——独立黑名单无模式门，仍须追告生效
+  assert.equal(
+    formatAclModeDetail([], { ip_acl_mode: '', ip_acl_list: '["1.1.1.1"]', ip_blacklist: '["3.3.3.3"]' }),
+    '未配置模式 · 1 条；独立黑名单 1 条仍生效',
+  )
+  // 回归形状：allow/绕过/deny 既有分支不动
+  assert.equal(formatAclModeDetail([], { ...two, ip_acl_mode: 'allow' }), '白名单模式 · 2 条')
+  assert.equal(formatAclModeDetail([], { ...two, ip_acl_mode: '绕过' }), '免检测模式 · 2 条')
+  assert.equal(formatAclModeDetail([], { ...two, ip_acl_mode: 'deny' }), '黑名单模式 · 2 条')
+  // 回归形状：deny 含独立黑名单的合并文案
+  assert.equal(
+    formatAclModeDetail([], { ip_acl_mode: 'deny', ip_acl_list: '["1.1.1.1"]', ip_blacklist: '["3.3.3.3"]' }),
+    '黑名单模式 · 2 条（名单 1 + 独立 1）',
+  )
 })

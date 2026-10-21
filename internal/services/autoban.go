@@ -1074,7 +1074,13 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 		if te := TaskEngine(); te != nil {
 			te.StopLoop(AutobanTaskID)
 		}
-		TaskLogf(AutobanTaskID, "manual", "手动调度，执行失败：未启用")
+		// 文案按 trigger 二元化：auto 轮（周期 tick）不写「手动调度」——
+		// 日志按字面归因触发来源，混写会让排障误判有人点了手动触发。
+		if rc.Trigger == "manual" {
+			TaskLogf(AutobanTaskID, "manual", "手动调度，执行失败：未启用")
+		} else {
+			TaskLogf(AutobanTaskID, "auto", "定时调度，执行失败：未启用")
+		}
 		return errors.New("自动封禁未启用，已停止调度（请先在安全事件页配置中启用）")
 	}
 	cfg := GetAutobanConfig()

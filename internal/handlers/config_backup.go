@@ -1590,6 +1590,19 @@ func validateV2BackupNodeRows(rows []map[string]any) error {
 				return fmt.Errorf("%s protocol 仅支持 http/https，实际 %q", line, protocol)
 			}
 		}
+		if raw, exists := row["mode"]; exists && raw != nil {
+			mode, ok := raw.(string)
+			if !ok {
+				return fmt.Errorf("%s mode 必须为字符串", line)
+			}
+			switch mode {
+			case "slave", "master":
+			case "":
+				row["mode"] = "slave" // schema DEFAULT 语义归一
+			default:
+				return fmt.Errorf("%s mode 仅支持 slave/master，实际 %q", line, mode)
+			}
+		}
 		if raw, exists := row["cluster_token_hash"]; exists && raw != nil {
 			if _, ok := raw.(string); !ok {
 				return fmt.Errorf("%s cluster_token_hash 必须为字符串或 null", line)

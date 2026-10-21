@@ -19,7 +19,7 @@ func TestGetSecurityEventToastSummary_groupsAllEventsSinceCursor(t *testing.T) {
 	// 基线事件用于取得 >0 的起始游标；随后 120 条必须全部计入聚合。
 	baseline, err := db.MetricsDB.Exec(`INSERT INTO security_events
 		(event_time, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, duration_us, rule_name)
-		VALUES (?, '198.51.100.9', 'GET', '/baseline', 'crs', '942100', 'SQL Injection', 'blocked', 1000, 'SQL注入')`,
+		VALUES (?, '185.199.108.9', 'GET', '/baseline', 'crs', '942100', 'SQL Injection', 'blocked', 1000, 'SQL注入')`,
 		now.Format("2006-01-02 15:04:05"))
 	if err != nil {
 		t.Fatalf("baseline: %v", err)
@@ -28,7 +28,7 @@ func TestGetSecurityEventToastSummary_groupsAllEventsSinceCursor(t *testing.T) {
 	for i := 0; i < 120; i++ {
 		_, err := db.MetricsDB.Exec(`INSERT INTO security_events
 			(event_time, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, duration_us, rule_name)
-			VALUES (?, '203.0.113.7', 'GET', '/a', 'crs', '942100', 'SQL Injection', 'blocked', 1200, 'SQL注入')`,
+			VALUES (?, '93.184.216.7', 'GET', '/a', 'crs', '942100', 'SQL Injection', 'blocked', 1200, 'SQL注入')`,
 			now.Format("2006-01-02 15:04:05"))
 		if err != nil {
 			t.Fatalf("seed: %v", err)
@@ -86,7 +86,7 @@ func TestGetSecurityEventToastSummary_capsAggregationAtDefaultBudget(t *testing.
 	now := time.Now().UTC().Truncate(time.Second).Format("2006-01-02 15:04:05")
 	baseline, err := db.MetricsDB.Exec(`INSERT INTO security_events
 		(event_time, client_ip, method, uri, event_type, rule_triggered, rule_msg, action)
-		VALUES (?, '198.51.100.9', 'GET', '/baseline', 'crs', '942100', 'SQL Injection', 'blocked')`, now)
+		VALUES (?, '185.199.108.9', 'GET', '/baseline', 'crs', '942100', 'SQL Injection', 'blocked')`, now)
 	if err != nil {
 		t.Fatalf("baseline: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestGetSecurityEventToastSummary_capsAggregationAtDefaultBudget(t *testing.
 	for i := 0; i < 1300; i++ {
 		if _, err := tx.Exec(`INSERT INTO security_events
 			(event_time, client_ip, method, uri, event_type, rule_triggered, rule_msg, action)
-			VALUES (?, '203.0.113.7', 'GET', '/a', 'crs', '942100', 'SQL Injection', 'blocked')`, now); err != nil {
+			VALUES (?, '93.184.216.7', 'GET', '/a', 'crs', '942100', 'SQL Injection', 'blocked')`, now); err != nil {
 			_ = tx.Rollback()
 			t.Fatalf("seed: %v", err)
 		}

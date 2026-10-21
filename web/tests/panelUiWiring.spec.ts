@@ -292,6 +292,17 @@ test('SecurityBindingEditor 先声明 props/emits 再派生 computed', () => {
   assert.ok(subtitleIdx > emitIdx, 'bindSubtitle 必须在 props 之后声明（不得依赖 TDZ 惰性求值）')
 })
 
+test('总览总量卡片披露含保留地址口径（includes_reserved tooltip）', () => {
+  const text = source('src/views/security/SecurityOverview.vue')
+  assert.match(text, /v-if="overview\.includes_reserved"[^>]*content="总量含私网\/保留地址事件/, '今日拦截/今日检测卡片须有总量口径 tooltip')
+  assert.ok([...text.matchAll(/overview\.includes_reserved/g)].length >= 2, '今日拦截与今日检测两处都须披露')
+})
+
+test('自动封禁预置名单条目数标注含已到期条目', () => {
+  const text = source('src/views/security/SecurityRules.vue')
+  assert.match(text, /v-if="row\.preset_autoban"[^>]*content="含已到期条目/, '预置名单条数须 tooltip 消歧')
+})
+
 test('useLibUpdateDialog 409 路径不得重复立即轮询', () => {
   const text = source('src/composables/useLibUpdateDialog.ts')
   assert.match(text, /const startPolling = \(\) => \{ polling\.start\(\) \}/, '起轮询只挂定时器（refreshStatus 已拉过本轮）')

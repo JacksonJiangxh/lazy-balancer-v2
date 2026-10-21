@@ -104,6 +104,53 @@ func TestThreatSystemListRename_renamesUserConflictAndTakesCanonicalName(t *test
 	}
 }
 
+// system=1 占名冲突：规范名已被另一 system=1 行占用时（如上一次迁移中断的
+// 残留形态），保留双方、跳过接管并告警留痕——不得撞唯一索引中止启动。
+func TestThreatSystemListRename_skipsTakeoverWhenCanonicalHeldBySystemRow(t *testing.T) {
+	// Given 旧名 system=1 行 + 另一 system=1 行已占用规范名（唯一索引在场）。
+	openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := DB.Exec("CREATE UNIQUE INDEX IF NOT EXISTS u_security_ip_lists_system_name ON security_ip_lists(name) WHERE system=1"); err != nil {
+		t.Fatalf("create unique index: %v", err)
+	}
+	newName := ThreatListNameBySource("ustc")
+	if _, err := DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at) VALUES
+		('威胁情报库-中科大黑 IP', '旧', '恶意 IP', '[]', 1, datetime('now'), datetime('now')),
+		(?, '另一 system 行', '恶意 IP', '[]', 1, datetime('now'), datetime('now'))`, newName); err != nil {
+		t.Fatal(err)
+	}
+
+	// When：不得返回错误（撞唯一索引中止启动的形态）
+	drainSystemAuditBuffer()
+	if err := migrateThreatSystemListNames(); err != nil {
+		t.Fatalf("migrate: %v（system=1 占名冲突必须跳过接管而非中止启动）", err)
+	}
+
+	// Then 双方保留：旧名行与规范名行都仍在，未发生接管
+	var legacyCount, canonicalCount int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE system=1 AND name='威胁情报库-中科大黑 IP'`).Scan(&legacyCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE system=1 AND name=?`, newName).Scan(&canonicalCount); err != nil {
+		t.Fatal(err)
+	}
+	if legacyCount != 1 || canonicalCount != 1 {
+		t.Fatalf("legacy=%d canonical=%d, want 1/1（双方保留）", legacyCount, canonicalCount)
+	}
+	// And 告警留痕一行（log + recordSystemAudit 通道）
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 1 || entries[0].resource != "IP 名单" || !strings.Contains(entries[0].detail, "跳过接管") {
+		t.Fatalf("占名冲突审计=%+v, want 一行跳过接管告警", entries)
+	}
+	// And 幂等：二次执行仍不报错、仍跳过
+	if err := migrateThreatSystemListNames(); err != nil {
+		t.Fatalf("二次执行: %v", err)
+	}
+	_ = drainSystemAuditBuffer()
+}
+
 func TestThreatSystemListRename_returnsConflictScanError(t *testing.T) {
 	// Given 真实 SQLite 中的畸形存量 schema：id 携带不可转 int64 的文本。
 	openMigrationTestDB(t)

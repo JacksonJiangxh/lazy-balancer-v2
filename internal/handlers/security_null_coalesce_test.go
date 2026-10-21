@@ -152,7 +152,7 @@ func TestListSecurityEvents_nullProjectionColumnsReturn200(t *testing.T) {
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events
 		(event_time, client_ip, method, uri, event_type, rule_triggered, action,
 		 rule_name, policy_name, duration_us, precheck_us, request_headers, request_body)
-		VALUES ('2026-10-19 10:00:00', '203.0.113.9', 'GET', '/null', 'crs', '942100', 'blocked',
+		VALUES ('2026-10-19 10:00:00', '93.184.216.9', 'GET', '/null', 'crs', '942100', 'blocked',
 		 NULL, NULL, NULL, NULL, NULL, NULL)`); err != nil {
 		t.Fatalf("seed null event: %v", err)
 	}

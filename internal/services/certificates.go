@@ -594,6 +594,45 @@ func waitDoneOrTimeout(done <-chan struct{}, timeout time.Duration, jobID int, w
 	}
 }
 
+// scheduleDelayedReload 登记一次性延迟 Caddy 重载（未来时钟证书的生效点
+// 补充重载）。复用部署重试定时器族的生命周期（服务停止/暂停即不登记、
+// 服务 ctx 取消即不执行），但不占用 deploymentTimers——该 map 承载「同
+// jobID 唯一部署」不变量，一次性重载与部署重试互不取消、互不替换。
+func (s *CertificateService) scheduleDelayedReload(jobID int, ruleID string, delay time.Duration) {
+	s.timerMu.Lock()
+	if s.stopping || s.timersPaused {
+		s.timerMu.Unlock()
+		Logf("warn", "证书任务 %d（规则 %s）：部署定时器已停止/暂停，生效后重载跳过（证书文件已部署，补扫/重启后收敛）", jobID, ruleID)
+		return
+	}
+	ctx := s.ctx
+	s.timerMu.Unlock()
+	time.AfterFunc(delay, func() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		manager := GetCAQueueManager()
+		if manager == nil {
+			return
+		}
+		manager.mu.Lock()
+		reloader := manager.reloader
+		manager.mu.Unlock()
+		if reloader == nil {
+			return
+		}
+		// reloader 为 InLock 语义（InitCAQueueManager 契约）——本回调在部署
+		// 临界区外触发，须自取 CaddyOpLock。
+		CaddyOpLock.Lock()
+		defer CaddyOpLock.Unlock()
+		if err := reloader(); err != nil {
+			Logf("error", "证书任务 %d（规则 %s）生效后重载失败: %v", jobID, ruleID, err)
+		}
+	})
+}
+
 func (s *CertificateService) scheduleDeploymentRetry(jobID int, ruleID string, delay time.Duration) error {
 	for {
 		s.timerMu.Lock()

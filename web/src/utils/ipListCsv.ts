@@ -37,15 +37,22 @@ function readQuotedField(raw: string, start: number): { text: string; next: numb
   return null
 }
 
+/** 备注长度上限（Unicode code point 计）：超长行拒绝导入，不再静默截断。 */
+export const ipListRemarkMaxLength = 100
+
 /**
  * 解析导入行：第一列可为双引号包裹的 CSV 字段（`""` 反转义），列间分隔符为
  * 半角逗号或空白（与旧行为兼容；纯文本行不带引号时按原正则切分）。
  * validate 由调用方注入（isValidCidr）——本模块不依赖校验实现。
+ *
+ * 返回：合法行 { value, remark }；备注超过 ipListRemarkMaxLength 返回
+ * { error: 'remark_too_long' }（调用方须带行号拒绝，与非法 CIDR 同策略点名）；
+ * 其余不可解析形态（空行/非法值/未闭合引号）返回 null。
  */
 export function parseIpListEntryLine(
   line: string,
   validate: (value: string) => boolean,
-): { value: string; remark: string } | null {
+): { value: string; remark: string } | { error: 'remark_too_long' } | null {
   const text = line.trim()
   if (text === '') return null
   let value: string
@@ -69,5 +76,8 @@ export function parseIpListEntryLine(
     if (!field) return null
     remark = field.text
   }
-  return { value: normalized, remark: Array.from(remark).slice(0, 100).join('') }
+  if (Array.from(remark).length > ipListRemarkMaxLength) {
+    return { error: 'remark_too_long' }
+  }
+  return { value: normalized, remark }
 }

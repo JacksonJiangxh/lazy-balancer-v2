@@ -99,6 +99,20 @@ func migrateThreatSystemListNames() error {
 			return fmt.Errorf("failed to check threat system list name conflict %s: %w", sl.Name, err)
 		}
 		if conflicts > 0 {
+			// 规范名已被另一 system=1 行占用（如上一次迁移中断的残留形态）：
+			// 改名用户行的通道解决不了该冲突——强行接管会撞
+			// u_security_ip_lists_system_name 唯一索引中止启动。保留双方、
+			// 跳过接管并告警留痕，由人工归并（种子按规范名查重，旧名行
+			// 残留不会双重存在，仅失更）。
+			var systemHeld int
+			if err := DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=? AND system=1`, sl.Name).Scan(&systemHeld); err != nil {
+				return fmt.Errorf("failed to check system-held threat list name %s: %w", sl.Name, err)
+			}
+			if systemHeld > 0 {
+				log.Printf("WARN: 内置威胁名单规范名 %q 已被另一 system=1 行占用，旧名 %q 行跳过接管（双方保留，请人工归并）", sl.Name, legacy)
+				recordSystemAudit("启动迁移", "IP 名单", fmt.Sprintf("启动迁移：内置威胁名单规范名 %q 已被另一 system=1 行占用，旧名 %q 行跳过接管（双方保留，名单可能失更，请人工归并）", sl.Name, legacy))
+				continue
+			}
 			// 新名被用户名单占用时不能跳过：旧 system 名单会永久失更。
 			// 把占用的用户行改名为带 id 的唯一名称（保 id/数据），再让
 			// system 行接管规范名（历史问题-1）。

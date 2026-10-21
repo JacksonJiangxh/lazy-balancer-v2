@@ -171,9 +171,14 @@ func auditRetentionMonths() int {
 	return months
 }
 
+// auditCleanupBatchSize 保留清理单批上限：分批 DELETE 避免长写锁阻塞
+// 审计写入（单条巨型 DELETE 在百万行库上持锁数秒）。var 供测试缩批。
+var auditCleanupBatchSize = 5000
+
 // CleanupAuditLogs 按保留月数清理审计日志，返回删除条数（SPEC §6.5 摘要行数据源）。
 // 失败必须上抛：audit-retention 任务体据此落 failed 终态，且失败轮不得写
 // 「清理完成」（此前失败静默返回 0——任务监控全绿、摘要谎报完成）。
+// 分批删除：每批至多 auditCleanupBatchSize 行循环至删净，批间释放写锁。
 func CleanupAuditLogs() (int, error) {
 	retentionMonths := auditRetentionMonths()
 	cutoff := time.Now().UTC().AddDate(0, -retentionMonths, 0).Format("2006-01-02 15:04:05")
@@ -181,16 +186,23 @@ func CleanupAuditLogs() (int, error) {
 		Logf("warn", "audit log cleanup skipped: audit database is not initialized")
 		return 0, fmt.Errorf("审计数据库未初始化")
 	}
-	res, err := db.AuditDB.Exec("DELETE FROM audit_log WHERE created_at < ?", cutoff)
-	if err != nil {
-		Logf("warn", "audit log cleanup failed: %v", err)
-		return 0, err
+	total := 0
+	for {
+		res, err := db.AuditDB.Exec("DELETE FROM audit_log WHERE id IN (SELECT id FROM audit_log WHERE created_at < ? LIMIT ?)", cutoff, auditCleanupBatchSize)
+		if err != nil {
+			Logf("warn", "audit log cleanup failed: %v", err)
+			return 0, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("读取审计日志删除条数失败: %w", err)
+		}
+		total += int(n)
+		if int(n) < auditCleanupBatchSize {
+			break
+		}
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("读取审计日志删除条数失败: %w", err)
-	}
-	return int(n), nil
+	return total, nil
 }
 
 // FormatAuditAction 中间件侧通用审计的动作映射。历史问题：仅保留 5 条 Generic

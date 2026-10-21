@@ -90,6 +90,36 @@ func TestGetIPList_returnsEntries(t *testing.T) {
 	}
 }
 
+// 名单详情读路径同属非规范数字 ID 家族门（与 GetSecurityPolicy 同口径）：
+// SQLite 数值亲和会让 '5.0' 命中 id=5 并返回详情，与全部写路径
+// （parsePositiveNumericID → 400）口径分叉。导出端点是已声明的例外
+// （容忍形态，文件名回库内行 ID），不在本门内。
+func TestGetIPList_rejectsNoncanonicalID(t *testing.T) {
+	newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (id, name, entries) VALUES (5, 'nc-list', '[]')`); err != nil {
+		t.Fatal(err)
+	}
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	router := gin.New()
+	router.GET("/security/ip-lists/:id", h.GetIPList)
+
+	// 规范 ID 仍正常返回
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/security/ip-lists/5", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("canonical id status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+
+	for _, bad := range []string{"5.0", "0x5", "%205", "5e0"} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/security/ip-lists/"+bad, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("id=%q status=%d body=%s, want 400（读路径须与写路径同门）", bad, rec.Code, rec.Body.String())
+		}
+	}
+}
+
 // 用户名单不得与内置威胁名单重名（2026-09-24 用户裁定）——内置重名走专属
 // 409 提示；同库既有通用重名校验含内置行，本测试钉住专属文案分支。
 func TestCreateIPList_rejectsBuiltinName(t *testing.T) {

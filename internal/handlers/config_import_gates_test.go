@@ -77,6 +77,44 @@ func TestValidateV2BackupNodeRows_rejectsDuplicateIdentity(t *testing.T) {
 	}
 }
 
+// nodes.mode 导入值域：仅 slave/master 合法——非法值若只落到写库才报错，
+// 与「畸形输入=400 并点名行」口径不一致；空串按 schema DEFAULT（slave）归一。
+func TestValidateV2BackupNodeRows_validatesModeEnum(t *testing.T) {
+	base := func() map[string]any {
+		return map[string]any{"name": "edge-mode", "ip_address": "10.0.0.9", "port": int64(8000)}
+	}
+	// 合法值域放行
+	for _, mode := range []string{"slave", "master"} {
+		rows := []map[string]any{base()}
+		rows[0]["mode"] = mode
+		if err := validateV2BackupNodeRows(rows); err != nil {
+			t.Fatalf("mode=%q 应放行: %v", mode, err)
+		}
+	}
+	// 空串归一为 schema DEFAULT slave（与 protocol 空串归一同口径）
+	rows := []map[string]any{base()}
+	rows[0]["mode"] = ""
+	if err := validateV2BackupNodeRows(rows); err != nil {
+		t.Fatalf("空 mode 应归一放行: %v", err)
+	}
+	if rows[0]["mode"] != "slave" {
+		t.Fatalf("空 mode 归一=%q, want slave", rows[0]["mode"])
+	}
+	// 非法值域点名拒绝
+	rows = []map[string]any{base()}
+	rows[0]["mode"] = "primary"
+	err := validateV2BackupNodeRows(rows)
+	if err == nil || !strings.Contains(err.Error(), "mode") {
+		t.Fatalf("err=%v, want mode 值域点名拒绝", err)
+	}
+	// 非字符串拒绝
+	rows = []map[string]any{base()}
+	rows[0]["mode"] = int64(1)
+	if err := validateV2BackupNodeRows(rows); err == nil || !strings.Contains(err.Error(), "mode") {
+		t.Fatalf("err=%v, want mode 类型点名拒绝", err)
+	}
+}
+
 // 证书物化只针对 manual 源——acme_dns 行不得把私钥
 // 物化到 /app/certs（DB 已不引用的残留材料）。
 func TestCollectImportCertificates_skipsNonManualTLSSource(t *testing.T) {

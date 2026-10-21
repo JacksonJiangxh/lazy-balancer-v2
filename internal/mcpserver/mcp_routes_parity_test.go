@@ -174,5 +174,8 @@ func TestMCPUncoveredRoutes_areExplicitlyExempted(t *testing.T) {
 		if _, ok := registered[key]; !ok {
 			t.Errorf("豁免清单项 %s 不是已注册路由——路由已删除/改名，清单需同步", key)
 		}
+		if _, ok := covered[key]; ok {
+			t.Errorf("豁免清单项 %s 已被 MCP 工具覆盖——豁免已失效，请从 mcpUncoveredRoutes 移除（清单只许登记未覆盖路由）", key)
+		}
 	}
 }

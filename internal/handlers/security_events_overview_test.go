@@ -37,7 +37,7 @@ func seedSecurityEvent(t *testing.T, eventTime, ruleCaddyID string, policyID any
 	db.DB.QueryRow("SELECT name FROM lb_rules WHERE caddy_id=?", ruleCaddyID).Scan(&ruleName)
 	db.DB.QueryRow("SELECT name FROM security_policies WHERE id=?", policyID).Scan(&policyName)
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, rule_name, policy_name)
-		VALUES (?, ?, ?, '192.0.2.9', 'GET', '/a', 'crs', ?, ?, 'blocked', ?, ?)`,
+		VALUES (?, ?, ?, '185.199.109.9', 'GET', '/a', 'crs', ?, ?, 'blocked', ?, ?)`,
 		eventTime, ruleCaddyID, policyID, ruleTriggered, ruleMsg, ruleName, policyName); err != nil {
 		// 种子失败必须显式失败——空错误体让未播种形态被当成功能行为
 		//（假绿/假红不可辨），聚合口径的回归保护随之失效。
@@ -119,7 +119,7 @@ func TestListSecurityEvents_excludeKeepsNullRuleTriggered(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityEventsRouter(t)
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time,client_ip,method,uri,event_type,rule_triggered,rule_msg,action) VALUES
-		('2026-08-12 10:00:01','203.0.113.7','GET','/null','crs',NULL,'other','blocked')`); err != nil {
+		('2026-08-12 10:00:01','93.184.216.7','GET','/null','crs',NULL,'other','blocked')`); err != nil {
 		t.Fatal(err)
 	}
 	recorder := getRequest(t, router, "/security/events?rule_triggered_exclude=SQL注入")
@@ -211,7 +211,7 @@ func TestListSecurityEvents_returnsSnapshotNamesAfterRuleAndPolicyChanged(t *tes
 	seedSnapshotEvent := func(eventTime, ruleCaddyID string, policyID int64, ruleName, policyName string) {
 		t.Helper()
 		if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, rule_name, policy_name)
-			VALUES (?, ?, ?, '192.0.2.9', 'GET', '/a', 'waf', '942100', 'SQL Injection', 'blocked', ?, ?)`,
+			VALUES (?, ?, ?, '185.199.109.9', 'GET', '/a', 'waf', '942100', 'SQL Injection', 'blocked', ?, ?)`,
 			eventTime, ruleCaddyID, policyID, ruleName, policyName); err != nil {
 			t.Fatalf("seed snapshot event: %v", err)
 		}
@@ -289,7 +289,7 @@ func TestListSecurityEvents_serverSideRequestContextMasking(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			setupSecurityPolicyTestDB(t)
-			if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time,client_ip,method,uri,event_type,rule_triggered,rule_msg,action,request_headers,request_body) VALUES ('2026-10-18 10:00:00','203.0.113.7','POST','/login','crs','942100','SQL Injection','blocked',?,'username=alice&password=secret')`, tc.headers); err != nil {
+			if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time,client_ip,method,uri,event_type,rule_triggered,rule_msg,action,request_headers,request_body) VALUES ('2026-10-18 10:00:00','93.184.216.7','POST','/login','crs','942100','SQL Injection','blocked',?,'username=alice&password=secret')`, tc.headers); err != nil {
 				t.Fatal(err)
 			}
 			gin.SetMode(gin.TestMode)
@@ -553,7 +553,7 @@ func TestGetSecurityOverview_trendZeroFillsSevenDays(t *testing.T) {
 	seedWithAction := func(eventTime, action string) {
 		t.Helper()
 		if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action)
-			VALUES (?, 'lb_trend', 1, '192.0.2.9', 'GET', '/a', 'crs', '942100', 'SQL Injection', ?)`, eventTime, action); err != nil {
+			VALUES (?, 'lb_trend', 1, '185.199.109.9', 'GET', '/a', 'crs', '942100', 'SQL Injection', ?)`, eventTime, action); err != nil {
 			t.Fatalf("seed trend event: %v", err)
 		}
 	}
@@ -700,7 +700,7 @@ func TestGetSecurityOverview_topIPsSharesLocalSixDayWindowWithTrend(t *testing.T
 	}
 	foundTop := false
 	for _, ip := range resp.Data.TopIPs {
-		if ip.IP == "192.0.2.9" && ip.Blocked+ip.Detected >= 1 {
+		if ip.IP == "185.199.109.9" && ip.Blocked+ip.Detected >= 1 {
 			foundTop = true
 			break
 		}
@@ -768,7 +768,7 @@ func insertOverviewAggregateEvent(t *testing.T, metrics *sql.DB, eventTime strin
 	t.Helper()
 	if _, err := metrics.Exec(`INSERT INTO security_events
 		(event_time,client_ip,rule_triggered,rule_msg,action)
-		VALUES (?,'192.0.2.9','942100','SQL Injection','blocked')`, eventTime); err != nil {
+		VALUES (?,'185.199.109.9','942100','SQL Injection','blocked')`, eventTime); err != nil {
 		t.Fatalf("seed aggregate event: %v", err)
 	}
 }
@@ -1015,7 +1015,7 @@ func TestRuleTriggeredFilter_crawlerSegmentSQL(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	rows := []string{"800007", "810016", "850003", "899999", "10001", "10091", "942100"}
 	for _, rule := range rows {
-		if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, rule_triggered) VALUES ('2026-10-18 10:00:00', '203.0.113.7', ?)`, rule); err != nil {
+		if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, rule_triggered) VALUES ('2026-10-18 10:00:00', '93.184.216.7', ?)`, rule); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1113,7 +1113,7 @@ func TestGetSecurityOverview_rawCoverageDisclosure(t *testing.T) {
 
 	t.Run("裁剪后披露缺口", func(t *testing.T) {
 		setupSecurityPolicyTestDB(t)
-		seedThreatScreenEvent(t, utcStringAgo(time.Hour), "203.0.113.7", "942100", "SQL Injection", "blocked")
+		seedThreatScreenEvent(t, utcStringAgo(time.Hour), "93.184.216.7", "942100", "SQL Injection", "blocked")
 		raw, incomplete := assertShape(t, readData(t))
 		if raw == "" || !incomplete {
 			t.Fatalf("raw=%q incomplete=%v, want 非空且 true", raw, incomplete)
@@ -1121,7 +1121,7 @@ func TestGetSecurityOverview_rawCoverageDisclosure(t *testing.T) {
 	})
 	t.Run("覆盖完整不误报", func(t *testing.T) {
 		setupSecurityPolicyTestDB(t)
-		seedThreatScreenEvent(t, utcStringAgo(8*24*time.Hour), "203.0.113.7", "942100", "SQL Injection", "blocked")
+		seedThreatScreenEvent(t, utcStringAgo(8*24*time.Hour), "93.184.216.7", "942100", "SQL Injection", "blocked")
 		raw, incomplete := assertShape(t, readData(t))
 		if raw == "" || incomplete {
 			t.Fatalf("raw=%q incomplete=%v, want 非空且 false", raw, incomplete)
@@ -1182,7 +1182,7 @@ func TestListSecurityEvents_largeFieldsCappedWithMarker(t *testing.T) {
 	ascii := strings.Repeat("a", 20*1024)
 	multibyte := strings.Repeat("中", 7000) // 21000 字节 > 16KB 上限
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, action, request_headers, request_body)
-		VALUES ('2026-10-19 10:00:00','198.51.100.9','blocked',?,?)`, ascii, multibyte); err != nil {
+		VALUES ('2026-10-19 10:00:00','185.199.108.9','blocked',?,?)`, ascii, multibyte); err != nil {
 		t.Fatalf("seed event: %v", err)
 	}
 

@@ -278,7 +278,7 @@
             @input="createWhitelistError = ''"
           />
         </el-form-item>
-        <div class="info-note-bar"><span class="info-note-desc">IP 白名单对该密钥的所有请求生效（含 MCP 与 REST API）。</span></div>
+        <div class="info-note-bar"><span class="info-note-desc">IP 白名单约束该密钥的全部 REST 与 MCP 调用。</span></div>
       </el-form>
       <template #footer>
         <el-button :disabled="creating" @click="createDialogVisible = false">取消</el-button>
@@ -323,7 +323,7 @@
             @input="featureWhitelistError = ''"
           />
         </el-form-item>
-        <div class="info-note-bar"><span class="info-note-desc">IP 白名单对该密钥的所有请求生效（含 MCP 与 REST API）。</span></div>
+        <div class="info-note-bar"><span class="info-note-desc">IP 白名单约束该密钥的全部 REST 与 MCP 调用。</span></div>
       </el-form>
       <template #footer>
         <el-button :disabled="featureSaving" @click="featureDialogVisible = false">取消</el-button>

@@ -10,6 +10,31 @@ import (
 	"testing"
 )
 
+// APP_VERSION 未注入时版本兜底为 "unknown"（fail-visible）——不得静默显示
+// 一个并非当前构建的版本号；发版链（Dockerfile ARG VERSION/buildx
+// --build-arg）显式传参，不受兜底值影响。
+func TestLoad_versionFallsBackToUnknownWhenAppVersionUnset(t *testing.T) {
+	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("APP_VERSION", "") // getEnv 视空值为未注入
+
+	loaded := Load("")
+
+	if loaded.Version != "unknown" {
+		t.Fatalf("version=%q, want unknown（APP_VERSION 未注入兜底）", loaded.Version)
+	}
+}
+
+func TestLoad_versionUsesAppVersionEnv(t *testing.T) {
+	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("APP_VERSION", "v9.9.9-test")
+
+	loaded := Load("")
+
+	if loaded.Version != "v9.9.9-test" {
+		t.Fatalf("version=%q, want v9.9.9-test", loaded.Version)
+	}
+}
+
 func TestLoad_parses_metrics_interval_with_safe_minimum(t *testing.T) {
 	t.Setenv("JWT_SECRET", "test-secret")
 	tests := []struct {

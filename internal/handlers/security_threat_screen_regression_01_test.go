@@ -23,7 +23,7 @@ func TestThreatRollup_wideWindowBackfillsUnderWarmer(t *testing.T) {
 	t.Cleanup(resetThreatScreenCachesForTest)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 	// 30h 前的事件：在 24h 常态窗口之外、7d 窗口之内。
-	seedThreatScreenEvent(t, utcStringAgo(30*time.Hour), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(30*time.Hour), "93.184.216.7", "942100", "SQL Injection", "blocked")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() {
@@ -54,7 +54,7 @@ func TestThreatRollup_unreadyWarmerFallsBackToLazyFixation(t *testing.T) {
 	t.Cleanup(resetThreatRollupWarmerForTest)
 	t.Cleanup(resetThreatScreenCachesForTest)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
-	seedThreatScreenEvent(t, utcStringAgo(5*time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(5*time.Minute), "93.184.216.7", "942100", "SQL Injection", "blocked")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // warmer 立即退出：从未完成首轮
@@ -82,14 +82,14 @@ func TestThreatRollup_staleReadinessTriggersRequestFixation(t *testing.T) {
 	t.Cleanup(resetThreatRollupWarmerForTest)
 	t.Cleanup(resetThreatScreenCachesForTest)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
-	seedThreatScreenEvent(t, utcStringAgo(5*time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(5*time.Minute), "93.184.216.7", "942100", "SQL Injection", "blocked")
 
 	if p := getThreatScreenR79(t, router, "/security/overview/threat-screen"); p.Data.TotalEvents != 1 {
 		t.Fatalf("first total_events=%d, want 1", p.Data.TotalEvents)
 	}
 	// 模拟「上次成功固化已 10 分钟前」（warmer 停摆），并落一条最新分钟事件。
 	threatRollupReadyAt.Store(time.Now().Add(-10 * time.Minute).UnixNano())
-	seedThreatScreenEvent(t, utcStringAgo(5*time.Second), "203.0.113.8", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(5*time.Second), "93.184.216.8", "942100", "SQL Injection", "blocked")
 
 	p := getThreatScreenR79(t, router, "/security/overview/threat-screen")
 	if p.Data.TotalEvents != 2 {
@@ -106,12 +106,12 @@ func TestThreatRollup_geoipGenerationChangeRefixesWindow(t *testing.T) {
 	t.Cleanup(resetThreatRollupWarmerForTest)
 	t.Cleanup(resetThreatScreenCachesForTest)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
-	seedThreatScreenEvent(t, utcStringAgo(10*time.Minute), "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(10*time.Minute), "93.184.216.7", "942100", "SQL Injection", "blocked")
 	if p := getThreatScreenR79(t, router, "/security/overview/threat-screen"); p.Data.TotalEvents != 1 {
 		t.Fatalf("first total_events=%d, want 1", p.Data.TotalEvents)
 	}
 	// 覆盖区间已固化后新增旧分钟事件（常规轮次不会重固它）。
-	seedThreatScreenEvent(t, utcStringAgo(11*time.Minute), "203.0.113.8", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, utcStringAgo(11*time.Minute), "93.184.216.8", "942100", "SQL Injection", "blocked")
 	if _, err := db.MetricsDB.Exec(`UPDATE metrics_state SET value='999999' WHERE key=?`, threatRollupGeoIPGenerationKey); err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestThreatRollup_geoGenerationPreservesTrimmedMinutes(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	base := time.Date(2026, 10, 18, 12, 0, 30, 0, time.UTC)
 	installThreatClock(t, base)
-	seedThreatScreenEvent(t, "2026-10-18 11:50:10", "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, "2026-10-18 11:50:10", "93.184.216.7", "942100", "SQL Injection", "blocked")
 	if err := ensureThreatRollup(24); err != nil {
 		t.Fatalf("first rollup: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestThreatRollup_trailingRepairBackfillsLateMinute(t *testing.T) {
 	if err := ensureThreatRollup(24); err != nil {
 		t.Fatalf("first rollup: %v", err)
 	}
-	seedThreatScreenEvent(t, "2026-10-18 12:02:10", "203.0.113.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, "2026-10-18 12:02:10", "93.184.216.7", "942100", "SQL Injection", "blocked")
 	threatScreenNow = func() time.Time { return base.Add(time.Minute) }
 	t.Cleanup(func() { threatScreenNow = func() time.Time { return base } })
 	if err := ensureThreatRollup(24); err != nil {
@@ -175,7 +175,7 @@ func TestThreatTopTargets_servedFromRollupAfterRawDeletion(t *testing.T) {
 	// 10-12 分钟前：不在「恒重固」的上一分钟/当前分钟，rollup 固化后不会被后
 	// 续重固覆盖。
 	for i := 10; i <= 12; i++ {
-		seedThreatRuleEvent(t, utcStringAgo(time.Duration(i)*time.Minute), "203.0.113.7", "lb_aaa", "blocked")
+		seedThreatRuleEvent(t, utcStringAgo(time.Duration(i)*time.Minute), "93.184.216.7", "lb_aaa", "blocked")
 	}
 
 	first := getThreatScreenR79(t, router, "/security/overview/threat-screen")
@@ -204,6 +204,7 @@ func TestThreatTopTargets_excludesReservedSourceIPs(t *testing.T) {
 	seedThreatLBRule(t, "lb_aaa", "API 服务", "api.example.com")
 	seedThreatRuleEvent(t, utcStringAgo(10*time.Minute), "192.168.1.5", "lb_aaa", "blocked")
 	seedThreatRuleEvent(t, utcStringAgo(11*time.Minute), "::1", "lb_aaa", "blocked")
+	seedThreatRuleEvent(t, utcStringAgo(12*time.Minute), "203.0.113.20", "lb_aaa", "blocked") // RFC 5737 段同保留地址排除
 
 	payload := getThreatScreenR79(t, router, "/security/overview/threat-screen")
 	if len(payload.Data.TopTargets) != 0 {
@@ -222,10 +223,10 @@ func TestThreatTopTargets_ghostRulesDoNotCrowdOutExisting(t *testing.T) {
 	for i := range 5 {
 		id := "lb_gone_" + string(rune('a'+i))
 		for n := range 10 - i {
-			seedThreatRuleEvent(t, utcStringAgo(time.Duration(10+n)*time.Minute), "203.0.113.7", id, "blocked")
+			seedThreatRuleEvent(t, utcStringAgo(time.Duration(10+n)*time.Minute), "93.184.216.7", id, "blocked")
 		}
 	}
-	seedThreatRuleEvent(t, utcStringAgo(10*time.Minute), "203.0.113.8", "lb_ok", "blocked")
+	seedThreatRuleEvent(t, utcStringAgo(10*time.Minute), "93.184.216.8", "lb_ok", "blocked")
 
 	payload := getThreatScreenR79(t, router, "/security/overview/threat-screen")
 	if len(payload.Data.TopTargets) != 1 {
@@ -376,7 +377,7 @@ func TestThreatRollup_persistedRebuildContinuesAcrossCalls(t *testing.T) {
 	eventMinute := base.Add(-26 * time.Hour).Truncate(time.Minute)
 	minuteStr := eventMinute.Format("2006-01-02 15:04")
 	seedThreatLBRule(t, "lb_rbld", "API 服务", "api.example.com")
-	seedThreatRuleEvent(t, eventMinute.Format("2006-01-02 15:04:05"), "203.0.113.7", "lb_rbld", "blocked")
+	seedThreatRuleEvent(t, eventMinute.Format("2006-01-02 15:04:05"), "93.184.216.7", "lb_rbld", "blocked")
 	// 旧版本已固化过该分钟（主 rollup 行）与分钟高水位：无新事件时增量路径
 	// 直接 no-op（不写目标维度、不重算归属地）。
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_event_rollup (minute, country, province, family, rule, action, count)

@@ -189,3 +189,64 @@ func TestCleanupAuditLogs_fallsBackToDefaultOnMissingConfigRow(t *testing.T) {
 		t.Fatalf("读取失败应 warn 留痕，日志=%q", buf.String())
 	}
 }
+
+// 保留清理分批执行：单条巨型 DELETE 会长时间持写锁阻塞审计写入。批尺寸
+// 缩到 3、种 7 条过期行（需 3 批）+1 条保留行，断言循环删净且保留行不动。
+func TestCleanupAuditLogs_deletesInBatches(t *testing.T) {
+	oldDB, oldAuditDB := db.DB, db.AuditDB
+	mainDB, err := sql.Open("sqlite", t.TempDir()+"/main.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditDB, err := sql.Open("sqlite", t.TempDir()+"/audit.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.DB, db.AuditDB = mainDB, auditDB
+	t.Cleanup(func() {
+		db.DB, db.AuditDB = oldDB, oldAuditDB
+		mainDB.Close()
+		auditDB.Close()
+	})
+	if _, err := mainDB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY CHECK (id = 1), audit_retention_months INTEGER DEFAULT 3)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mainDB.Exec(`INSERT INTO global_config (id, audit_retention_months) VALUES (1, 3)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auditDB.Exec(`CREATE TABLE audit_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username VARCHAR(100), action VARCHAR(50) NOT NULL, resource VARCHAR(100),
+		detail TEXT, ip_address VARCHAR(45), created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	// 7 条过期 + 1 条新鲜（created_at 默认当前时间）
+	if _, err := auditDB.Exec(`INSERT INTO audit_log (username, action, resource, created_at)
+		WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 7)
+		SELECT 'u', '登录', '认证', '2020-01-01 00:00:00' FROM seq`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auditDB.Exec(`INSERT INTO audit_log (username, action, resource) VALUES ('u', '登录', '认证')`); err != nil {
+		t.Fatal(err)
+	}
+
+	oldBatch := auditCleanupBatchSize
+	auditCleanupBatchSize = 3
+	t.Cleanup(func() { auditCleanupBatchSize = oldBatch })
+
+	n, err := CleanupAuditLogs()
+	if err != nil {
+		t.Fatalf("CleanupAuditLogs() error=%v, want nil", err)
+	}
+	if n != 7 {
+		t.Fatalf("CleanupAuditLogs()=%d, want 7（分批循环须删净全部过期行）", n)
+	}
+	var remaining int
+	if err := auditDB.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Fatalf("剩余行=%d, want 1（保留期内行不得被删）", remaining)
+	}
+}

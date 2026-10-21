@@ -42,7 +42,12 @@
                 <div class="stat-box__icon"><el-icon><CircleClose /></el-icon></div>
                 <div class="stat-box__body">
                   <div class="stat-box__value">{{ overview.today_blocked }}</div>
-                  <div class="stat-box__label">今日拦截</div>
+                  <div class="stat-box__label">
+                    今日拦截
+                    <el-tooltip v-if="overview.includes_reserved" content="总量含私网/保留地址事件（内网扫描、文档测试段等也会计入，与大屏排除口径不同）" placement="top">
+                      <el-icon class="stat-box__tip"><InfoFilled /></el-icon>
+                    </el-tooltip>
+                  </div>
                 </div>
               </div>
             </div>
@@ -51,7 +56,12 @@
                 <div class="stat-box__icon"><el-icon><Warning /></el-icon></div>
                 <div class="stat-box__body">
                   <div class="stat-box__value">{{ overview.today_detected }}</div>
-                  <div class="stat-box__label">今日检测</div>
+                  <div class="stat-box__label">
+                    今日检测
+                    <el-tooltip v-if="overview.includes_reserved" content="总量含私网/保留地址事件（内网扫描、文档测试段等也会计入，与大屏排除口径不同）" placement="top">
+                      <el-icon class="stat-box__tip"><InfoFilled /></el-icon>
+                    </el-tooltip>
+                  </div>
                 </div>
               </div>
             </div>
@@ -268,7 +278,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
-import { Aim, DataAnalysis, TrendCharts, PieChart, Location, Warning, Odometer, CircleClose, Lock, Files, Monitor, Link } from '@element-plus/icons-vue'
+import { Aim, DataAnalysis, TrendCharts, PieChart, Location, Warning, Odometer, CircleClose, Lock, Files, Monitor, Link, InfoFilled } from '@element-plus/icons-vue'
 import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
@@ -290,6 +300,8 @@ interface Overview {
   crs_available?: boolean; ip2region_available?: boolean; update_status?: string
   trend: TrendPoint[]; top_ips: TopIP[]; attack_types: AttackType[]; attack_types_stage: AttackType[]
   raw_coverage_from?: string; backfill_incomplete?: boolean
+  // includes_reserved：后端口径披露——总量含私网/保留地址事件（总量卡片 tooltip）
+  includes_reserved?: boolean
 }
 interface SecurityEvent { id: number; event_time: string; client_ip: string; rule_caddy_id: string; rule_name: string; policy_name: string; ip_location?: string }
 
@@ -496,6 +508,7 @@ onMounted(() => { fetchData(); fetchBlockedEvents(); fetchRateLimitBlocks(); fet
 .stat-box__body { flex: 1; min-width: 0; }
 .stat-box__value { font-size: 20px; font-weight: 700; line-height: 1.3; }
 .stat-box__label { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+.stat-box__tip { font-size: 12px; vertical-align: -1px; margin-left: 2px; color: var(--text-secondary); cursor: help; }
 
 .stat-box--danger .stat-box__icon { background: #fef0f0; color: #f56c6c; }
 .stat-box--danger .stat-box__value { color: #f56c6c; }

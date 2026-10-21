@@ -238,10 +238,13 @@ func threatRawCoverageStart(database *sql.DB) (string, error) {
 
 // securityOverviewResponse 在不改变公共 SecurityOverview 模型的前提下，为
 // 原始表直读的近 7 天卡片附带覆盖披露；nil metrics 的零面板也保持同键。
+// IncludesReserved 口径披露：today_blocked/today_detected/trend/top_ips
+// 总量不排除私网/保留地址事件（与大屏排除口径不同，前端 tooltip 消歧）。
 type securityOverviewResponse struct {
 	models.SecurityOverview
 	RawCoverageFrom    string `json:"raw_coverage_from"`
 	BackfillIncomplete bool   `json:"backfill_incomplete"`
+	IncludesReserved   bool   `json:"includes_reserved"`
 }
 
 // loadSecurityOverviewAggregates 计算（或命中缓存）近 7 天聚合。错误不缓存、

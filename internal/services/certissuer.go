@@ -709,7 +709,58 @@ func (s *CertIssuer) deployIssuedCertificate(ctx context.Context, jobID int, mat
 		// deploymentFailed 重试链（任务回 'downloaded'+退避，兼容 30s 补扫）。
 		return errors.Join(s.deploymentFailed(jobID, material, "证书部署确认失败: "+err.Error(), fmt.Errorf("finalize issued certificate: %w", err)), rollbackErr)
 	}
+	s.noteFutureNotBefore(jobID, material)
 	return nil
+}
+
+// certificateNotBeforeReloadMargin 是未来时钟证书「生效后延迟重载」的余量：
+// 证书到 NotBefore 才被客户端接受，重载刻意错开生效点少许，避免时钟面
+// 恰好压线时的边界抖动。
+const certificateNotBeforeReloadMargin = time.Minute
+
+// notBeforeReloadScheduler 生效后延迟重载登记通道（测试缝；生产=
+// scheduleCertificateNotBeforeReload）。
+var notBeforeReloadScheduler = scheduleCertificateNotBeforeReload
+
+// noteFutureNotBefore 部署完成后检查未来时钟证书：NotBefore > now 时部署
+// 本身照常生效（文件已写、已重载），但证书要被客户端接受须等到生效点——
+// 告警留痕并登记一次 NotBefore+余量时刻的延迟重载（复用证书服务既有定时器
+// 族，不新建调度器）。只告警不阻断：解析失败/服务未运行均降级为 warn 日志。
+func (s *CertIssuer) noteFutureNotBefore(jobID int, material issuedCertificate) {
+	if material.certPEM == "" {
+		return
+	}
+	notBefore, err := parseCertNotBefore(material.certPEM)
+	if err != nil {
+		Logf("warn", "证书任务 %d：解析证书生效时间失败（NotBefore 未来时钟检查跳过）: %v", jobID, err)
+		return
+	}
+	delay := time.Until(notBefore.Add(certificateNotBeforeReloadMargin))
+	if delay <= 0 {
+		return
+	}
+	effectiveAt := notBefore.UTC().Format("2006-01-02 15:04:05")
+	Logf("warn", "证书任务 %d（规则 %s）：证书尚未生效（NotBefore=%s UTC），已登记生效后重载", jobID, material.ruleID, effectiveAt)
+	RecordAuditLog("system", "警告", "证书任务", FormatAuditDetail(
+		AuditJobPart(jobID), AuditRulePart(material.ruleID),
+		fmt.Sprintf("证书尚未生效（生效时间 %s UTC），已登记生效后重载", effectiveAt)), "")
+	if notBeforeReloadScheduler != nil {
+		notBeforeReloadScheduler(jobID, material.ruleID, delay)
+	}
+}
+
+// scheduleCertificateNotBeforeReload 生产通道：经证书服务既有定时器族登记
+// 一次性生效后重载；服务未运行（队列停用/测试环境）时降级为 warn——证书文件
+// 已随本次部署生效，仅少了生效点的一次补充重载。
+func scheduleCertificateNotBeforeReload(jobID int, ruleID string, delay time.Duration) {
+	certificateServiceMu.Lock()
+	service := certificateService
+	certificateServiceMu.Unlock()
+	if service == nil {
+		Logf("warn", "证书服务未运行：任务 %d（规则 %s）的生效后重载跳过（证书文件已部署，重启/补扫后收敛）", jobID, ruleID)
+		return
+	}
+	service.scheduleDelayedReload(jobID, ruleID, delay)
 }
 
 // deploymentCommittedByConcurrentWinner 报告终态 CAS 冲突是否源于并发部署回调
@@ -963,6 +1014,19 @@ func parseCertNotAfter(certPEM string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("parse certificate: %w", err)
 	}
 	return cert.NotAfter, nil
+}
+
+// parseCertNotBefore extracts the NotBefore time from a PEM certificate chain.
+func parseCertNotBefore(certPEM string) (time.Time, error) {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return time.Time{}, fmt.Errorf("invalid certificate PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse certificate: %w", err)
+	}
+	return cert.NotBefore, nil
 }
 
 // auditFastPathReload 历史修复 修正：fast-path 重载审计带 job/rule 归因（对齐主路径粒度）。

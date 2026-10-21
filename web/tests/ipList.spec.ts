@@ -20,7 +20,7 @@ import {
   sharedEntriesCache,
   writeSharedEntries,
 } from '../src/utils/securityStages.ts'
-import { source } from './_helpers.ts'
+import { member, source } from './_helpers.ts'
 
 test('IP 快捷处置：信任命中只全扫一次，GeoIP 区域只解析一次（历史问题）', () => {
   const src = source('src/views/security/IPLocationAction.vue')
@@ -62,7 +62,7 @@ test('C2 二次往返不累积漂移', () => {
   let line = formatIpListEntryLine('192.168.1.0/24', remark)
   for (let i = 0; i < 3; i++) {
     const parsed = parseIpListEntryLine(line, isValidCidr)
-    assert.ok(parsed)
+    assert.ok(parsed && 'value' in parsed)
     assert.equal(parsed.remark, remark)
     line = formatIpListEntryLine(parsed.value, parsed.remark)
   }
@@ -109,12 +109,18 @@ test('C6 多行备注导出归一为空格——导入端按行切分，往返�
   assert.deepEqual(parsed, { value: '10.0.0.1', remark: '第一行 第二行' })
 })
 
-test('C7 备注按 Unicode code point 截断 100，不产生半个代理对（历史问题-15）', () => {
-  const parsed = parseIpListEntryLine(`10.0.0.1,${'😀'.repeat(100)}尾`, isValidCidr)
-  assert.ok(parsed)
-  assert.equal(Array.from(parsed.remark).length, 100)
-  assert.equal(parsed.remark, '😀'.repeat(100))
-  assert.equal(parsed.remark.isWellFormed(), true)
+test('C7 备注超过 100 字拒绝导入（带行号报错，不静默截断），边界恰 100 字放行（历史问题-15 治理升级）', () => {
+  // 恰 100 个 code point（全代理对）仍合法——上限口径不变
+  const atLimit = parseIpListEntryLine(`10.0.0.1,${'😀'.repeat(100)}`, isValidCidr)
+  assert.deepEqual(atLimit, { value: '10.0.0.1', remark: '😀'.repeat(100) })
+  // 101 个 code point：拒绝而非截断（旧实现静默截尾，用户无感知）
+  assert.deepEqual(parseIpListEntryLine(`10.0.0.1,${'😀'.repeat(100)}尾`, isValidCidr), { error: 'remark_too_long' })
+  assert.deepEqual(parseIpListEntryLine(`10.0.0.1,${'a'.repeat(101)}`, isValidCidr), { error: 'remark_too_long' })
+  // 导入流必须带文件行号点名拒绝（源码钉）
+  const src = source('src/views/security/SecurityRules.vue')
+  const importFlow = member(src, 'const importEntriesFromText')
+  assert.match(importFlow, /remarkTooLongLines\.push\(line\.no\)/, '导入流必须按文件行号记录备注超长拒绝')
+  assert.match(importFlow, /第 \$\{[^}]+\} 行/, '拒绝信息必须携带文件行号')
 })
 
 test('C8 JSON 字符串数组统一 trim 并丢弃空项（历史问题-17）', () => {

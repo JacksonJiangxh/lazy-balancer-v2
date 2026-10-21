@@ -46,6 +46,7 @@ var auditResultTextMap = map[string]string{
 	"sync_failed":          "同步失败",
 	"io_error":             "文件写入失败",
 	"query_failed":         "查询失败",
+	"warning":              "警告",
 	// 历史问题（历史）：证书任务「重试被阻止」终态（certificates.go 经局部
 	// auditFailure 闭包以动态实参传入，字面量扫描钉测覆盖不到——本码曾因此
 	// 渲染成英文 blocked）。

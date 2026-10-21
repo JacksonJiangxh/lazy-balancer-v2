@@ -3360,12 +3360,15 @@ func enrichIPLocation(ip string) string {
 }
 
 var reservedIPPrefixes = [...]netip.Prefix{
-	netip.MustParsePrefix("0.0.0.0/8"),     // 本网络/未指定
-	netip.MustParsePrefix("100.64.0.0/10"), // CGNAT
-	netip.MustParsePrefix("192.0.0.0/24"),  // IETF 协议分配
-	netip.MustParsePrefix("198.18.0.0/15"), // 基准测试
-	netip.MustParsePrefix("240.0.0.0/4"),   // 保留/广播
-	netip.MustParsePrefix("2001:db8::/32"), // 文档示例
+	netip.MustParsePrefix("0.0.0.0/8"),       // 本网络/未指定
+	netip.MustParsePrefix("100.64.0.0/10"),   // CGNAT
+	netip.MustParsePrefix("192.0.0.0/24"),    // IETF 协议分配
+	netip.MustParsePrefix("192.0.2.0/24"),    // RFC 5737 文档示例（TEST-NET-1，公网不可路由）
+	netip.MustParsePrefix("198.51.100.0/24"), // RFC 5737 文档示例（TEST-NET-2）
+	netip.MustParsePrefix("203.0.113.0/24"),  // RFC 5737 文档示例（TEST-NET-3）
+	netip.MustParsePrefix("198.18.0.0/15"),   // 基准测试
+	netip.MustParsePrefix("240.0.0.0/4"),     // 保留/广播
+	netip.MustParsePrefix("2001:db8::/32"),   // 文档示例
 }
 
 // isReservedIP 判定保留/私网/回环/链路本地/未指定/组播及特殊用途地址。
@@ -4393,6 +4396,7 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 			SecurityOverview:   overview,
 			RawCoverageFrom:    rawCoverageFrom,
 			BackfillIncomplete: backfillIncomplete,
+			IncludesReserved:   true,
 		}})
 		return
 	}
@@ -4414,6 +4418,7 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 		SecurityOverview:   overview,
 		RawCoverageFrom:    rawCoverageFrom,
 		BackfillIncomplete: backfillIncomplete,
+		IncludesReserved:   true,
 	}})
 }
 
