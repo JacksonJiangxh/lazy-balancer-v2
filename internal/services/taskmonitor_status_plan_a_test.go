@@ -9,9 +9,9 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
-// 方案 A（2026-10-12 用户裁定）：任务监控状态列只承载执行语义
-// （运行中/空闲/失败/排队中；cert-job 退役行「已禁用」），调度语义
-// （调度关/业务关）全部归开关列——状态列不再产出 stopped/disabled。
+// 方案 A（2026-10-12 用户裁定）：任务监控状态列只承载执行语义；2026-10-22
+// 用户裁定进一步收敛为三态（运行中/空闲/失败）——调度语义（调度关/业务关）
+// 全部归开关列，业务生命周期态（cert_jobs.status）只进业务文本位，不进状态列。
 
 func TestCollectSystemTasks_statusColumnExecutionOnly(t *testing.T) {
 	// 与 taskengine newTestEngine 同模式：临时目录全套库（task_runs 消费面）

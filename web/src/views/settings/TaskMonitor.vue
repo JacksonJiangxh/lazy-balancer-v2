@@ -149,11 +149,10 @@
         </el-table-column>
         <el-table-column label="状态" width="96">
           <template #default="{ row }">
-            <!-- 审计项：cert-job 行动态显示证书任务原始状态（限流中/等待传播…），
-                 不用服务端折叠后的 task status——折叠把 waiting_ca 与 queued
-                 都压成「排队中」，限流停车语义与配色丢失。 -->
-            <el-tag v-if="certJobLabel(row)" size="small" effect="plain" :type="certJobToneOf(row)">{{ certJobLabel(row) }}</el-tag>
-            <span v-else class="tm-status" :data-status="row.status"><span class="tm-dot"></span>{{ statusLabel(row.status) }}</span>
+            <!-- 状态列词表=引擎执行语义三态（空闲/运行中/失败，2026-10-22 用户
+                 裁定）：证书业务生命周期态（已签发/限流中…）不进状态列，
+                 由任务名称下的业务文本承载。 -->
+            <span class="tm-status" :data-status="row.status"><span class="tm-dot"></span>{{ statusLabel(row.status) }}</span>
           </template>
         </el-table-column>
         <el-table-column label="调度" width="92">
@@ -346,7 +345,7 @@ import { formatDate } from '@/utils/date'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
 import { useClampedPagination } from '@/composables/useClampedPagination'
 import { statusColor } from '@/utils/chartTheme'
-import { certJobStatusLabel, certJobStatusTone, type CertJobStatus } from '@/utils/certJobStatus'
+import { certJobStatusLabel, type CertJobStatus } from '@/utils/certJobStatus'
 import { CERT_QUEUE_VISIBLE_JOBS, certQueueHasLive, certQueueIsBusy, certQueueMoreCount } from '@/utils/certQueue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import LogStorageBar from '@/components/LogStorageBar.vue'
@@ -678,22 +677,6 @@ const detailTone = computed((): 'primary' | 'success' | 'warning' | 'danger' | u
   return undefined
 })
 const isCertJobRow = (id: string): boolean => id.startsWith('cert-job:')
-// 审计项：cert-job 行的原始证书状态（last_run.result = cert_jobs.status）。
-// 服务端 TaskStatus 把 waiting_ca 与 queued/pending 折叠为 queued，限流停车
-// 语义与配色会丢失——列表状态列直接展示原始状态。
-const certJobRawStatus = (row: TaskInfo): CertJobStatus | null => {
-  if (!isCertJobRow(row.id)) return null
-  const status = row.last_run?.result
-  return status ? (status as CertJobStatus) : null
-}
-const certJobLabel = (row: TaskInfo): string | null => {
-  const status = certJobRawStatus(row)
-  return status ? certJobStatusLabel(status) : null
-}
-const certJobToneOf = (row: TaskInfo): 'success' | 'danger' | 'warning' | 'info' => {
-  const status = certJobRawStatus(row)
-  return status ? certJobStatusTone(status) : 'info'
-}
 // cert-job 动态行无引擎运行历史——历史区域接 cert_jobs 数据源（每规则+域名
 // 单行在册，展示该签发任务当前记录）
 const historyTitle = computed(() =>
@@ -794,7 +777,9 @@ onUnmounted(closeLogs)
 const statusLabels: Record<string, string> = {
   running: '运行中', idle: '空闲', failed: '失败',
 }
-const statusLabel = (s: string) => statusLabels[s] || certJobStatusLabel(s as CertJobStatus)
+// 状态列兜底只回显原值——禁止把 cert_jobs 业务生命周期态（issued/waiting_ca…）
+// 经证书标签兜底渲染进状态列（2026-10-22 用户裁定三态词表）。
+const statusLabel = (s: string) => statusLabels[s] || s
 // v2.0 四类型：定时(蓝)/常驻(绿)/循环(青)/触发(橙)
 const kindLabels: Record<string, string> = { scheduled: '定时', daemon: '常驻', periodic: '循环', oneshot: '触发' }
 const kindLabel = (k: string) => kindLabels[k] || k

@@ -19,14 +19,12 @@ import (
 type TaskStatus string
 
 const (
-	TaskStatusRunning  TaskStatus = "running"
-	TaskStatusIdle     TaskStatus = "idle"
-	TaskStatusFailed   TaskStatus = "failed"
-	TaskStatusDisabled TaskStatus = "disabled"
-	TaskStatusQueued   TaskStatus = "queued"
-	// 方案 A（2026-10-12）：stopped 退役——状态列只承载执行语义（调度语义归
-	// 开关列 loop_on；业务驱动任务另由业务开关决定是否启动）。disabled 仅
-	// cert-job 退役行集产出。
+	TaskStatusRunning TaskStatus = "running"
+	TaskStatusIdle    TaskStatus = "idle"
+	TaskStatusFailed  TaskStatus = "failed"
+	// 状态列词表=引擎执行语义三态（2026-10-22 用户裁定，取代旧 stopped/
+	// disabled/queued 扩展值）：调度语义归开关列 loop_on；业务生命周期态
+	// （cert_jobs.status 等）只能进业务文本位，禁止进入任务状态列。
 	// 历史修复（历史）：cancelled 常量删除——零产出零消费（取消只存在于
 	// task_runs.result 字段，非 TaskStatus 状态产出）。
 )
@@ -165,17 +163,14 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 		switch status {
 		case "failed":
 			ti.Status = TaskStatusFailed
-		case "issued":
+		case "issued", "downloaded", "disabled":
+			// 状态列词表三态（2026-10-22 用户裁定）：终态成功与退役行均为空闲；
+			// 「已签发/已禁用」等证书业务态由业务文本承载，不进状态列。
 			ti.Status = TaskStatusIdle
-		case "queued", "pending", "waiting_ca":
-			// 历史问题-05：waiting_ca=CA 429 限流停车态（等 ca_available_after），
-			// 不是处理中——修复前落 default 映射为 running，与 creating_*/
-			// validating 不可区分，运维误以为签发队列在跑。
-			ti.Status = TaskStatusQueued
-		case "disabled":
-			ti.Status = TaskStatusDisabled
 		default:
-			ti.Status = TaskStatusRunning // 处理中各阶段
+			// 其余一律运行中：含 queued/pending/waiting_ca（限流停车仍是未完成
+			// 工作项——停车与处理中的区分归业务文本，状态列不引入第四态）。
+			ti.Status = TaskStatusRunning
 		}
 		out = append(out, ti)
 	}

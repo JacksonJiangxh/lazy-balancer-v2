@@ -70,9 +70,9 @@ func TestDaemonLifecycleRun_stopsAfterCtxCancel(t *testing.T) {
 	}
 }
 
-// ——修复前落 default 分支映射为 running，与真正在途（creating_*/validating）
-// 不可区分，运维误以为队列在跑。
-func TestCollectCertJobRows_waitingCAMappedQueued(t *testing.T) {
+// ——旧方案 A 曾将 waiting_ca 单列「排队中」；2026-10-22 用户裁定状态列词表
+// 收敛三态后，限流停车与处理中统一为 running（停车语义归业务文本）。
+func TestCollectCertJobRows_waitingCAMappedRunning(t *testing.T) {
 	setupU05ServicesDB(t)
 	seedCertJobRowForTaskMonitor(t, "lb_tm_waiting", "waiting.example.com", "waiting_ca")
 
@@ -87,8 +87,8 @@ func TestCollectCertJobRows_waitingCAMappedQueued(t *testing.T) {
 	if got == nil {
 		t.Fatalf("waiting_ca 行缺失: %+v", rows)
 	}
-	if got.Status != TaskStatusQueued {
-		t.Fatalf("waiting_ca 状态=%s, want queued（限流停车态不得冒充运行中）", got.Status)
+	if got.Status != TaskStatusRunning {
+		t.Fatalf("waiting_ca 状态=%s, want running（未完成工作项；停车语义归业务文本）", got.Status)
 	}
 	// 回归形状：处理中阶段仍为 running
 	seedCertJobRowForTaskMonitor(t, "lb_tm_validating", "validating.example.com", "validating")
